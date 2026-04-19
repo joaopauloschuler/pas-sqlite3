@@ -884,6 +884,11 @@ loader — *optional for v1*).
 Do not touch this phase until Phase 9 is fully green. Changes here must
 preserve byte-for-byte on-disk parity.
 
+Before trying any fix, try to use some profiling tool to discover where the time is being waisted.
+In FPC, functions with asm content can not be inlined.
+
+Use "-dAVX2 -CfAVX2 -CpCOREI -OpCOREI" to compile.
+
 - [ ] **11.1** Profile with `perf record` on the benchmark workloads. Identify
   top 10 hot functions.
 - [ ] **11.2** Aggressive `inline` on VDBE opcode helpers, varint codecs, and
