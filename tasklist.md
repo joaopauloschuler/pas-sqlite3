@@ -205,7 +205,7 @@ A driver script (`tests/diff.sh`) that, given a `.sql` file:
 
 ## Phase 0 — Infrastructure (prerequisite for everything)
 
-- [ ] **0.1** Ensure `../sqlite3/` contains the upstream split source tree
+- [X] **0.1** Ensure `../sqlite3/` contains the upstream split source tree
   (the canonical layout with `src/`, `test/`, `tool/`, `Makefile.in`,
   `configure`, `autosetup/`, `auto.def`, etc. — SQLite ≥ 3.48 uses
   **autosetup** as its build system, not classic autoconf). Confirmed
@@ -222,7 +222,7 @@ A driver script (`tests/diff.sh`) that, given a `.sql` file:
   look for them in a freshly-cloned tree. The amalgamation (`sqlite3.c`) is
   not generated and not used.
 
-- [ ] **0.2** Create `src/passqlite3.inc` with the compiler directives.
+- [X] **0.2** Create `src/passqlite3.inc` with the compiler directives.
   **Use `../pas-core-math/src/pascoremath.inc` as the canonical template** —
   copy its layout (FPC detection, mode/inline/macro directives, CPU32/CPU64
   split, non-FPC fallback) and add SQLite-specific additions (`{$GOTO ON}`,
@@ -254,7 +254,7 @@ A driver script (`tests/diff.sh`) that, given a `.sql` file:
   CRC, varint, and hash code paths. Keeping them enabled project-wide would
   spuriously crash correct code.
 
-- [ ] **0.3** Create `src/passqlite3types.pas` with SQLite's primitive aliases.
+- [X] **0.3** Create `src/passqlite3types.pas` with SQLite's primitive aliases.
   Reuse FPC's native types wherever names already exist (`Int32`, `UInt32`,
   `Int64`, `UInt64`, `Byte`, `Word`, `Pointer`, `PByte`, `PChar`). Introduce
   only the genuinely-SQLite-specific names:
@@ -278,7 +278,7 @@ A driver script (`tests/diff.sh`) that, given a `.sql` file:
   Rule: everywhere the C source says `u8`, `u16`, `u32`, `i64`, write the
   identical name in Pascal. Reads 1:1 against the reference during review.
 
-- [ ] **0.4** Declare SQLite result codes (`SQLITE_OK`, `SQLITE_ERROR`,
+- [X] **0.4** Declare SQLite result codes (`SQLITE_OK`, `SQLITE_ERROR`,
   `SQLITE_BUSY`, `SQLITE_LOCKED`, `SQLITE_NOMEM`, `SQLITE_READONLY`, `SQLITE_IOERR`,
   `SQLITE_CORRUPT`, `SQLITE_FULL`, `SQLITE_CANTOPEN`, `SQLITE_PROTOCOL`,
   `SQLITE_SCHEMA`, `SQLITE_TOOBIG`, `SQLITE_CONSTRAINT`, `SQLITE_MISMATCH`,
@@ -288,7 +288,7 @@ A driver script (`tests/diff.sh`) that, given a `.sql` file:
   `SQLITE_OPEN_READWRITE`, `SQLITE_OPEN_CREATE`, …) with the **exact** numeric
   values from `sqlite3.h`. Any off-by-one here will cascade invisibly.
 
-- [ ] **0.5** Create `src/csqlite3.pas` — external declarations of the C
+- [X] **0.5** Create `src/csqlite3.pas` — external declarations of the C
   reference API, bound to `libsqlite3.so`, with `csq_` prefixes (convention
   mirrors `cbz_` in pas-bzip2):
   ```pascal
@@ -304,12 +304,12 @@ A driver script (`tests/diff.sh`) that, given a `.sql` file:
   `libsqlite3.so` — otherwise differential testing is comparing a thing with
   itself.
 
-- [ ] **0.6** Create `install_dependencies.sh` modelled on pas-bzip2's: ensure
+- [X] **0.6** Create `install_dependencies.sh` modelled on pas-bzip2's: ensure
   `fpc`, `gcc`, `tcl` (SQLite's own tests are in Tcl), and verify that
   `../sqlite3/` is present and buildable (print a clear error if it is
   missing — do not auto-clone; the user chose the layout).
 
-- [ ] **0.7** Create `src/tests/build.sh` — **use
+- [X] **0.7** Create `src/tests/build.sh` — **use
   `../pas-core-math/src/tests/build.sh` as the canonical template** (it sets
   up `BIN_DIR` / `SRC_DIR`, handles the `-Fu` / `-Fi` / `-FE` / `-Fl` flag
   pattern, cleans up `.ppu` / `.o` artefacts, and is known-working on this
@@ -334,12 +334,12 @@ A driver script (`tests/diff.sh`) that, given a `.sql` file:
      `fpc -O3 -Fu../ -FE../../bin -Fl../`.
   3. All test binaries run with `LD_LIBRARY_PATH=src/ bin/...`.
 
-- [ ] **0.8** Write `TestSmoke.pas`: loads `libsqlite3.so` via `csqlite3.pas`,
+- [X] **0.8** Write `TestSmoke.pas`: loads `libsqlite3.so` via `csqlite3.pas`,
   prints `csq_libversion`, opens an in-memory DB, executes `SELECT 1;`, prints
   the result, closes. This is the health check for the build system — until
   this runs, no differential test can run.
 
-- [ ] **0.9** **Internal headers — progressive porting strategy.** `sqliteInt.h`
+- [X] **0.9** **Internal headers — progressive porting strategy.** `sqliteInt.h`
   (~5.9 k lines) defines the ~200 structs and typedefs that virtually every
   other source file uses (`sqlite3`, `Vdbe`, `Parse`, `Table`, `Index`,
   `Column`, `Schema`, `Select`, `Expr`, `ExprList`, `SrcList`, …). **Do not**
@@ -359,14 +359,14 @@ A driver script (`tests/diff.sh`) that, given a `.sql` file:
   - `sqliteLimit.h` (~450 lines, compile-time limits) ports **once, whole**
     into `passqlite3types.pas` as `const` values.
 
-- [ ] **0.10** Assemble `tests/vectors/`:
+- [X] **0.10** Assemble `tests/vectors/`:
   - A minimal SQL corpus: 20–50 `.sql` scripts covering DDL, DML, joins,
     subqueries, triggers, views, common pragmas.
   - Canonical `.db` files produced by the C reference for each script, used by
     `TestReferenceVectors.pas`.
   - The `dbsqlfuzz` seed corpus from `../sqlite3/test/fuzzdata*.db` (if present).
 
-- [ ] **0.11** **Generated files policy.** SQLite's C build generates four
+- [X] **0.11** **Generated files policy.** SQLite's C build generates four
   files that are not checked into `src/`; upstream produces them with
   Tcl / C helpers in `tool/`. Pick **one** policy and apply uniformly:
   - **(A) Freeze-and-port** (recommended): run upstream's `make` once; copy
@@ -396,7 +396,7 @@ A driver script (`tests/diff.sh`) that, given a `.sql` file:
     `build.sh` that greps the numeric values out of the generated
     `sqlite3.h` and confirms they match `passqlite3types.pas`.
 
-- [ ] **0.12** **Compile-time options policy.** SQLite has ~200
+- [X] **0.12** **Compile-time options policy.** SQLite has ~200
   `SQLITE_OMIT_*`, `SQLITE_ENABLE_*`, and `SQLITE_DEFAULT_*` flags that alter
   which code paths exist. Declare our target configuration up front and
   freeze it for v1. **Default policy: match upstream's default configuration**
@@ -414,7 +414,7 @@ A driver script (`tests/diff.sh`) that, given a `.sql` file:
   - Record the full flag list in `src/passqlite3.inc` as a comment block so
     future contributors can see exactly what the Pascal port implements.
 
-- [ ] **0.13** **LICENSE + README.** Match the pattern from
+- [X] **0.13** **LICENSE + README.** Match the pattern from
   `../pas-bzip2/` and `../pas-core-math/`:
   - `LICENSE` — the SQLite C code is public-domain; the Pascal port may keep
     that posture or relicense to MIT / X11 (same as pas-bzip2). Decide and
@@ -424,6 +424,24 @@ A driver script (`tests/diff.sh`) that, given a `.sql` file:
     (`./install_dependencies.sh && src/tests/build.sh`), how to run the
     differential tests, honest status ("Phase N of 12 complete"), pointer to
     `tasklist.md`.
+
+---
+
+### Phase 0 implementation notes (2026-04-20)
+
+- `../sqlite3/` is present at version **3.53.0** and builds cleanly with autosetup.
+- System has FPC 3.2.2 and gcc installed; `tclsh` present.
+- `libsqlite3.so` is built into `../sqlite3/` and symlinked to `src/libsqlite3.so`.
+  **Important**: the system `libsqlite3.so` has SONAME `libsqlite3.so.0`, so test
+  binaries compiled with `-Fl./src` need both `src/libsqlite3.so` **and**
+  `src/libsqlite3.so.0` to resolve at runtime via `LD_LIBRARY_PATH=src/`. The
+  build script creates both symlinks. 
+- `TestSmoke` passes: 3.53.0 oracle, SELECT 1 round-trip confirmed.
+- 0.10 `tests/vectors/` directory created; actual `.sql` / `.db` files are
+  populated as each phase's gating test needs them.
+- 0.11 Policy (A) adopted: generated files will be frozen from the upstream build
+  and ported manually, with the upstream commit hash noted in each file header.
+- 0.12 Compile-time flag set documented in `passqlite3.inc`.
 
 ---
 

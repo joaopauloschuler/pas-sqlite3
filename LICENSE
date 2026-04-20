@@ -1,0 +1,17 @@
+The author disclaims copyright to this source code.  In place of
+a legal notice, here is a blessing:
+
+   May you do good and not evil.
+   May you find forgiveness for yourself and forgive others.
+   May you share freely, never taking more than you give.
+
+------------------------------------------------------------------------
+
+This is a faithful port of SQLite 3 (https://sqlite.org/) from C to
+Free Pascal.  The original SQLite C source code is in the public domain,
+authored by D. Richard Hipp and contributors.  This Pascal port adopts
+the same public-domain posture.
+
+The C reference source (../sqlite3/) is copyright its respective authors
+and also public domain, per the SQLite project's own licensing terms at:
+  https://sqlite.org/copyright.html
