@@ -1784,7 +1784,13 @@ begin
 end;
 
 { os_unix.c ~7008: unixFullPathname — resolve to an absolute path.
-  Phase 1: simple getcwd + concat; does not resolve symlinks. }
+  Phase 1: getcwd (via libc) + concat; does not resolve symlinks.
+  Note: FPC's FpGetCwd on Linux returns path length (not pointer) on success
+  (the kernel getcwd syscall writes to the buffer and returns the length).
+  Use the libc getcwd directly to get the correct pointer semantics. }
+function libc_getcwd(buf: PChar; size: csize_t): PChar;
+  cdecl; external 'c' name 'getcwd';
+
 function unixFullPathname(pVfs: Psqlite3_vfs; zPath: PChar;
                           nOut: cint; zOut: PChar): cint; cdecl;
 var
@@ -1803,8 +1809,8 @@ begin
     Exit;
   end;
 
-  { Relative path — prepend current working directory }
-  cwdPtr := FpGetCwd(@cwd[0], SizeOf(cwd) - 2);
+  { Relative path — prepend current working directory via libc getcwd }
+  cwdPtr := libc_getcwd(@cwd[0], SizeOf(cwd) - 2);
   if cwdPtr = nil then begin
     Result := SQLITE_CANTOPEN;
     Exit;
