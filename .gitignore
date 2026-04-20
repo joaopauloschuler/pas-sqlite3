@@ -1,0 +1,15 @@
+# FPC compiled artifacts
+*.o
+*.ppu
+*.a
+*.so
+*.exe
+# Test binaries
+src/test_*
+# Output programs
+*.out
+# Compiled binaries
+bin/*
+backup
+*.lps
+*.compiled
