@@ -84,7 +84,7 @@ else
 fi
 
 # ---- Step 2: Compile Pascal test binaries ----
-FPC_FLAGS="-O3 -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR $@"
+FPC_FLAGS="-O3 -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm $@"
 
 compile_test() {
   local name="$1"
@@ -101,6 +101,7 @@ compile_test() {
 
 compile_test TestSmoke
 compile_test TestOSLayer
+compile_test TestUtil
 compile_test TestPagerCompat
 compile_test TestBtreeCompat
 compile_test TestVdbeTrace
@@ -121,4 +122,5 @@ echo
 echo "Run tests with LD_LIBRARY_PATH=$SRC_DIR:"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestSmoke"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestOSLayer"
+echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestUtil"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestReferenceVectors"

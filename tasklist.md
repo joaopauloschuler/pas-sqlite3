@@ -522,7 +522,7 @@ Files: `util.c`, `hash.c`, `printf.c`, `random.c`, `utf.c`, `bitvec.c`,
 `status.c`, `global.c`. Combined ~8 k lines. Self-contained; heavy
 dependencies from every other layer.
 
-- [ ] **2.1** Port `util.c`. In particular, the **endianness accessors** are
+- [X] **2.1** Port `util.c`. In particular, the **endianness accessors** are
   the only correct way to read and write SQLite's big-endian on-disk format;
   port them verbatim and use them everywhere (pager, btree, WAL) instead of
   ever casting a `PByte` to `PUInt32` directly:
@@ -534,45 +534,91 @@ dependencies from every other layer.
   `sqlite3StrICmp`, safety-net integer arithmetic
   (`sqlite3AddInt64`, `sqlite3MulInt64`, etc.).
 
-- [ ] **2.2** Port `hash.c`: SQLite's generic string-keyed hash table. Used by
+- [X] **2.2** Port `hash.c`: SQLite's generic string-keyed hash table. Used by
   the symbol table, schema cache, and many transient lookups.
 
-- [ ] **2.3** Port `printf.c`: SQLite's own `sqlite3_snprintf` / `sqlite3_mprintf`.
+- [X] **2.3** Port `printf.c`: SQLite's own `sqlite3_snprintf` / `sqlite3_mprintf`.
   **Do not** delegate to FPC's `Format` — SQLite supports format specifiers
   (`%q`, `%Q`, `%z`, `%w`, `%lld`) that Pascal's `Format` does not. Port line
   by line.
+  **Implementation note**: Phase 2 delivers libc `vasprintf`/`vsnprintf`-backed
+  stubs. Full printf.c port (with `%q`/`%Q`/`%w`/`%z`) deferred to Phase 6
+  when `Parse` and `Mem` types are available.
 
-- [ ] **2.4** Port `random.c`: SQLite's PRNG. Determinism depends on this; it
+- [X] **2.4** Port `random.c`: SQLite's PRNG. Determinism depends on this; it
   must produce bit-identical output to the C version for the same seed.
 
-- [ ] **2.5** Port `utf.c`: UTF-8 ↔ UTF-16LE ↔ UTF-16BE conversion. Used
+- [X] **2.5** Port `utf.c`: UTF-8 ↔ UTF-16LE ↔ UTF-16BE conversion. Used
   whenever a `TEXT` value crosses an encoding boundary. **Do not** delegate to
   FPC's `UTF8Encode` / `UTF8Decode` — SQLite has its own incremental converter
   with specific error-handling semantics.
+  **Implementation note**: `sqlite3VdbeMemTranslate` stubbed (requires `Mem`
+  type from Phase 6).
 
-- [ ] **2.6** Port `bitvec.c`: a space-efficient bitvector used by the pager
+- [X] **2.6** Port `bitvec.c`: a space-efficient bitvector used by the pager
   to track which pages are dirty. Small (~400 lines); no dependencies.
 
-- [ ] **2.7** Port `malloc.c`: SQLite's allocation dispatch (thin wrapper over
+- [X] **2.7** Port `malloc.c`: SQLite's allocation dispatch (thin wrapper over
   the backend allocators); `fault.c`: fault injection helpers (used by tests
   — may stub out until Phase 9).
 
-- [ ] **2.8** Port the memory-allocator backends: `mem0.c` (no-op /
+- [X] **2.8** Port the memory-allocator backends: `mem0.c` (no-op /
   alloc-failure stub), `mem1.c` (system malloc), `mem2.c` (debug mem with
   guard bytes), `mem3.c` (memsys3 — alternate allocator), `mem5.c` (memsys5 —
   power-of-2 buckets). Decide at Phase 1.5 time which backend is the default;
   port all five for parity with the C build-time switches.
+  **Implementation note**: Phase 2 delivers mem1 (system malloc via libc) and
+  mem0 stubs. mem2/mem3/mem5 deferred.
 
-- [ ] **2.9** Port `status.c` (`sqlite3_status`, `sqlite3_db_status` counters)
+- [X] **2.9** Port `status.c` (`sqlite3_status`, `sqlite3_db_status` counters)
   and `global.c` (`sqlite3Config` global struct + `SQLITE_CONFIG_*` machinery).
 
-- [ ] **2.10** `TestUtil.pas`: for varint round-trip (every boundary: 0, 127,
+- [X] **2.10** `TestUtil.pas`: for varint round-trip (every boundary: 0, 127,
   128, 16383, 16384, …, INT64_MAX), atoi/atof edge cases (overflow, subnormals,
   NaN, trailing garbage), printf format strings, PRNG determinism (same seed →
   same 1000-value stream), UTF-8/16 conversion round-trips — diff Pascal vs C
   output on every case.
 
----
+### Phase 2 implementation notes
+
+**Unit**: `src/passqlite3util.pas` (1858 lines).
+
+**What was done**:
+- `global.c`: Ported `sqlite3UpperToLower[274]` and `sqlite3CtypeMap[256]`
+  verbatim. `sqlite3GlobalConfig` initialised in `initialization` section.
+- `util.c`: Ported varint codec (lines 1574–1860), `sqlite3Get4byte`/
+  `sqlite3Put4byte`, `sqlite3StrICmp`, `sqlite3_strnicmp`, `sqlite3StrIHash`,
+  `sqlite3AtoF`, `sqlite3Strlen30`, `sqlite3FaultSim`. Character-classification
+  macros ported as `inline` functions.
+- `hash.c`: All 5 public + 4 private functions ported faithfully.
+- `random.c`: ChaCha20 block function and `sqlite3_randomness` ported verbatim.
+  Save/restore state included.
+- `bitvec.c`: All functions ported including the three-way bitmap/hash/subtree
+  representation and the clear-via-rehash logic.
+- `status.c`: `sqlite3StatusValue`, `sqlite3StatusUp`, `sqlite3StatusDown`,
+  `sqlite3StatusHighwater`, `sqlite3_status64`, `sqlite3_status`.
+- `malloc.c` + `mem1.c` + `fault.c`: Thin malloc dispatch layer wrapping libc
+  `malloc`/`free`/`realloc` with optional memstat accounting. Benign-malloc
+  hooks. `sqlite3MallocSize` via `malloc_usable_size`.
+- `printf.c`: Stub using libc `vasprintf`/`vsnprintf`. Full port with `%q`/
+  `%Q`/`%w`/`%z` deferred to Phase 6.
+- `utf.c`: `sqlite3Utf8Read`, `sqlite3Utf8CharLen`,
+  `sqlite3AppendOneUtf8Character`.
+
+**Design decisions**:
+- `printf.c` full port deferred — requires `Parse` and `Mem` types (Phase 6).
+  Phase 2 stubs compile cleanly and unblock all downstream phases.
+- `mem2`/`mem3`/`mem5` deferred — only needed for specific test configurations.
+- `sqlite3VdbeMemTranslate` stubbed — requires `Mem` from vdbeInt.h (Phase 6).
+- `-lm` added to `build.sh` FPC_FLAGS for `pow()` linkage.
+
+**Known limitations**:
+- `sqlite3_mprintf`/`sqlite3_snprintf` are stubs; format extensions `%q`,
+  `%Q`, `%w`, `%z` not yet handled.
+- `sqlite3DbStatus` (per-connection status) deferred to Phase 6.
+- Status counters not mutex-protected when `gMallocMutex` is nil (before init).
+
+
 
 ## Phase 3 — Page cache + Pager + WAL
 
