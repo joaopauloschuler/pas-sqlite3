@@ -950,9 +950,20 @@ Headers: `btree.h`, `btreeInt.h`.
 Builds on the pager. The B-tree layer implements SQLite's table and index
 storage. Correctness here is again checked by on-disk byte equality.
 
-- [ ] **4.1** Port the cell-parsing helpers (`btreeParseCellPtr`,
+- [X] **4.1** Port the cell-parsing helpers (`btreeParseCellPtr`,
   `btreeParseCell`, `cellSizePtr`, `dropCell`, `insertCell`). These manipulate
   individual records within a page; tight code.
+  - Implemented in `src/passqlite3btree.pas` (~750 lines / 1534 compiled).
+  - All types from btreeInt.h in one `type` block (FPC requires forward types
+    resolved in the same block; `const` block must precede the single type block
+    so `BTCURSOR_MAX_DEPTH` is visible for array bounds in `TBtCursor`).
+  - Pager bridge functions (sqlite3PagerIswriteable, sqlite3PagerPagenumber,
+    sqlite3PagerTempSpace) added to btree unit to avoid circular unit deps.
+  - `allocateSpace` does NOT update `nFree`; callers (insertCell/insertCellFast)
+    must subtract the allocated size from `nFree` themselves — matches C exactly.
+  - `defragmentPage`: fast path triggered when `data[hdr+7] <= nMaxFrag`; always
+    call with `nMaxFrag ≥ 0`; internal call from `allocateSpace` uses `nMaxFrag=4`.
+  - Gate: `TestBtreeCompat.pas` T1–T10 all PASS (54 checks, 2026-04-22).
 
 - [ ] **4.2** Port `BtCursor` + `sqlite3BtreeCursor`, `moveToRoot`, `moveToChild`,
   `moveToParent`, `sqlite3BtreeMovetoUnpacked`.
