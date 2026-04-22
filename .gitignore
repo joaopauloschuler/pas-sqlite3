@@ -6,6 +6,7 @@
 *.exe
 # Test binaries
 src/test_*
+src/tests/TestUtil
 # Output programs
 *.out
 # Compiled binaries
