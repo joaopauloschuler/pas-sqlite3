@@ -153,6 +153,11 @@ const
   SQLITE_BUSY_SNAPSHOT = SQLITE_BUSY or (2 shl 8);
   SQLITE_BUSY_TIMEOUT  = SQLITE_BUSY or (3 shl 8);
 
+  { _BKPT aliases — same value; used by internal C code for debugging breakpoints }
+  SQLITE_NOMEM_BKPT    = SQLITE_NOMEM;
+  SQLITE_CANTOPEN_BKPT = SQLITE_CANTOPEN;
+  SQLITE_CORRUPT_BKPT  = SQLITE_CORRUPT;
+
   { SQLITE_CANTOPEN extensions }
   SQLITE_CANTOPEN_NOTEMPDIR  = SQLITE_CANTOPEN or (1 shl 8);
   SQLITE_CANTOPEN_ISDIR      = SQLITE_CANTOPEN or (2 shl 8);

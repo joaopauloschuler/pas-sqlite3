@@ -848,11 +848,46 @@ fields, but verify with a SizeOf/offsetof check when TestPagerReadOnly is writte
     commit overwrites bytes 24-27, 92-95, 96-99 of page 1 via
     `pager_write_changecounter`. Use page 2 or higher for data integrity checks.
 
-- [ ] **3.B.3** Port `wal.c`: the write-ahead log. Sub-phases mirror 3.B.2:
-  - **3.B.3a** `sqlite3WalOpen`, `sqlite3WalBeginReadTransaction`, frame read.
-  - **3.B.3b** Frame write, commit.
-  - **3.B.3c** Checkpoint.
+- [X] **3.B.3** Port `wal.c`: the write-ahead log.
+  - [X] **3.B.3a** Full port of `wal.c` (2361 lines) to `passqlite3wal.pas`.
+    Compiles 0 errors. All types, constants, and public API ported.
+    `passqlite3pager.pas` updated: `TWal` stub removed, `passqlite3wal` added
+    to uses, `PWal` aliased from `passqlite3wal.PWal`. All prior tests pass.
+  - [ ] **3.B.3b** Wire WAL into pager: `pagerOpenWalIfPresent`, `pagerUseWal`,
+    `sqlite3PagerBeginReadTransaction`, etc. call real WAL functions.
+  - [ ] **3.B.3c** Checkpoint integration.
   Gate: `TestWalCompat.pas` — Pascal writer + C reader, and vice versa.
+
+### Phase 3.B.3a implementation notes (2026-04-22)
+
+**What was done**:
+- Created `passqlite3wal.pas` (2361 lines): full port of `wal.c` (SQLite 3.53.0).
+- All types: `TWalIndexHdr` (48B), `TWalCkptInfo` (40B), `TWalSegment`, `TWalIterator`,
+  `TWalHashLoc`, `TWalWriter`, `TWal` (full struct, replaces opaque stub in pager).
+- All public API: `sqlite3WalOpen`, `sqlite3WalClose`, `sqlite3WalBeginReadTransaction`,
+  `sqlite3WalEndReadTransaction`, `sqlite3WalFindFrame`, `sqlite3WalReadFrame`,
+  `sqlite3WalDbsize`, `sqlite3WalBeginWriteTransaction`, `sqlite3WalEndWriteTransaction`,
+  `sqlite3WalUndo`, `sqlite3WalSavepoint`, `sqlite3WalSavepointUndo`,
+  `sqlite3WalFrames`, `sqlite3WalCheckpoint`, `sqlite3WalCallback`,
+  `sqlite3WalExclusiveMode`, `sqlite3WalHeapMemory`, `sqlite3WalFile`.
+- Local stubs: `sqlite3Realloc` (realloc+free), `sqlite3_log_wal` (no-op),
+  `sqlite3SectorSize` (wraps `sqlite3OsSectorSize`).
+- `passqlite3pager.pas` updated: `TWal = record end` stub removed, `passqlite3wal`
+  added to uses clause, `PWal` aliased as `passqlite3wal.PWal`. Compiles cleanly.
+- All prior tests pass: TestPager 12/12, TestPagerCrash 10/10, TestPagerRollback 10/10,
+  TestPCache 8/8, TestOSLayer 14/14, TestSmoke PASS.
+**FPC hazards resolved**:
+- `cint` not transitively available — added `ctypes` to interface `uses`.
+- Type declarations (`PPWal`, `TxUndoCallback`, `TxBusyCallback`, `PPHtSlot`,
+  `PPWalIterator`, `PWalWriter`, `PWalHashLoc`) must precede functions that use them.
+- Goto labels (`finished`, `recovery_error`, `begin_unreliable_shm_out`,
+  `walcheckpoint_out`) require `label` declarations in each function's var section.
+- Inline `var x: T := ...` inside begin/end blocks invalid; moved to var sections.
+- `8#777` octal invalid in FPC; replaced with `$1FF` in passqlite3os.pas.
+- `ternary(cond, a, b)` has no FPC equivalent; expanded to if-then-else.
+- `^TRecord` parameter type replaced by `PRecord` (pointer type alias).
+
+---
 
 - [ ] **3.B.4** `TestPagerCompat.pas` (full gate): a SQL corpus that stresses
   journaling (big transactions, SAVEPOINTs, simulated crashes) produces

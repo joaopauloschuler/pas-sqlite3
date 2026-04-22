@@ -405,6 +405,7 @@ type
   PunixShmNode    = ^unixShmNode;
   PunixShm        = ^unixShm;
   PunixFile       = ^unixFile;
+  PPPointer       = ^PPointer;   { pointer-to-pointer-to-pointer helper }
 
   { UnixUnusedFd (os_unix.c §247) — deferred-close file descriptor }
   UnixUnusedFd = record
@@ -546,6 +547,13 @@ function  sqlite3OsFileControl(id: Psqlite3_file; op: cint; pArg: Pointer): cint
 procedure sqlite3OsFileControlHint(id: Psqlite3_file; op: cint; pArg: Pointer);
 function  sqlite3OsFetch(id: Psqlite3_file; iOff: i64; iAmt: cint; pp: PPointer): cint;
 function  sqlite3OsUnfetch(id: Psqlite3_file; iOff: i64; p: Pointer): cint;
+function  sqlite3OsShmMap(id: Psqlite3_file; iPg: cint; pgsz: cint;
+                          bExtend: cint; pp: PPointer): cint;
+function  sqlite3OsShmLock(id: Psqlite3_file; offset: cint; n: cint;
+                           flags: cint): cint;
+procedure sqlite3OsShmBarrier(id: Psqlite3_file);
+function  sqlite3OsShmUnmap(id: Psqlite3_file; deleteFlag: cint): cint;
+function  sqlite3OsSleep(pVfs: Psqlite3_vfs; nMicrosec: cint): cint;
 
 { ============================================================
   Section 13: VFS registration (os.c)
@@ -1097,6 +1105,59 @@ begin
     Result := id^.pMethods^.xUnfetch(id, iOff, p)
   else
     Result := SQLITE_OK;
+end;
+
+{ os.c: sqlite3OsShmMap }
+function sqlite3OsShmMap(id: Psqlite3_file; iPg: cint; pgsz: cint;
+                         bExtend: cint; pp: PPointer): cint;
+begin
+  if Assigned(id^.pMethods) and (id^.pMethods^.iVersion >= 2)
+    and Assigned(id^.pMethods^.xShmMap)
+  then
+    Result := id^.pMethods^.xShmMap(id, iPg, pgsz, bExtend, pp)
+  else
+  begin
+    pp^ := nil;
+    Result := SQLITE_IOERR;
+  end;
+end;
+
+{ os.c: sqlite3OsShmLock }
+function sqlite3OsShmLock(id: Psqlite3_file; offset: cint; n: cint;
+                          flags: cint): cint;
+begin
+  if Assigned(id^.pMethods) and (id^.pMethods^.iVersion >= 2)
+    and Assigned(id^.pMethods^.xShmLock)
+  then
+    Result := id^.pMethods^.xShmLock(id, offset, n, flags)
+  else
+    Result := SQLITE_OK;
+end;
+
+{ os.c: sqlite3OsShmBarrier }
+procedure sqlite3OsShmBarrier(id: Psqlite3_file);
+begin
+  if Assigned(id^.pMethods) and (id^.pMethods^.iVersion >= 2)
+    and Assigned(id^.pMethods^.xShmBarrier)
+  then
+    id^.pMethods^.xShmBarrier(id);
+end;
+
+{ os.c: sqlite3OsShmUnmap }
+function sqlite3OsShmUnmap(id: Psqlite3_file; deleteFlag: cint): cint;
+begin
+  if Assigned(id^.pMethods) and (id^.pMethods^.iVersion >= 2)
+    and Assigned(id^.pMethods^.xShmUnmap)
+  then
+    Result := id^.pMethods^.xShmUnmap(id, deleteFlag)
+  else
+    Result := SQLITE_OK;
+end;
+
+{ os.c ~284: sqlite3OsSleep }
+function sqlite3OsSleep(pVfs: Psqlite3_vfs; nMicrosec: cint): cint;
+begin
+  Result := pVfs^.xSleep(pVfs, nMicrosec);
 end;
 
 { ============================================================
@@ -1995,6 +2056,542 @@ begin
 end;
 
 { ============================================================
+  Section 15: Shared-memory (SHM) functions  (os_unix.c §4550–5550)
+  Used by the WAL module (Phase 3.B.3).
+
+  UNIX_SHM_BASE: first locking byte in the -shm file (byte offset 120).
+  UNIX_SHM_DMS : the "dead man's switch" byte (offset 128).
+  ============================================================ }
+
+const
+  UNIX_SHM_BASE = (22 + SQLITE_SHM_NLOCK) * 4;   { = 120 }
+  UNIX_SHM_DMS  = UNIX_SHM_BASE + SQLITE_SHM_NLOCK; { = 128 }
+
+{ libc getpagesize() }
+function libc_getpagesize: cint; external 'c' name 'getpagesize';
+
+{ FpMmap / FpMunmap are in BaseUnix }
+{ pwrite / pread wrappers already available as FpPWrite / FpPRead }
+
+{ os_unix.c ~4709: unixShmSystemLock
+  Apply a POSIX F_RDLCK/F_WRLCK/F_UNLCK fcntl on pShmNode->hShm.
+  ofst is the byte offset in the file; n is the span. }
+function unixShmSystemLock(pDbFd: PunixFile; lockType: cint;
+                           ofst: cint; n: cint): cint;
+var
+  pShmNode : PunixShmNode;
+  f        : FLock;
+  res      : cint;
+begin
+  pShmNode := pDbFd^.pInode^.pShmNode;
+  if pShmNode^.hShm < 0 then
+  begin
+    Result := SQLITE_OK;
+    Exit;
+  end;
+  f.l_type   := SmallInt(lockType);
+  f.l_whence := SEEK_SET;
+  f.l_start  := ofst;
+  f.l_len    := n;
+  f.l_pid    := 0;
+  res := FpFcntl(pShmNode^.hShm, F_SETLK, f);
+  if res = -1 then
+    Result := SQLITE_BUSY
+  else
+    Result := SQLITE_OK;
+end;
+
+{ os_unix.c ~4820: unixShmRegionPerMap
+  Returns the minimum number of 32KB regions per mmap() call.
+  On most systems (4K pages) this is 1; on 64K-page systems it is 2. }
+function unixShmRegionPerMap: cint;
+var
+  shmsz : cint;
+  pgsz  : cint;
+begin
+  shmsz := 32 * 1024;
+  pgsz  := libc_getpagesize;
+  if pgsz < shmsz then
+    Result := 1
+  else
+    Result := pgsz div shmsz;
+end;
+
+{ os_unix.c ~4806: unixShmPurge
+  Free a pShmNode whose nRef has dropped to 0. }
+procedure unixShmPurge(pDbFd: PunixFile);
+var
+  p          : PunixShmNode;
+  nShmPerMap : cint;
+  i          : cint;
+begin
+  p := pDbFd^.pInode^.pShmNode;
+  if p = nil then Exit;
+  if p^.nRef <> 0 then Exit;
+
+  nShmPerMap := unixShmRegionPerMap;
+  i := 0;
+  while i < p^.nRegion do
+  begin
+    if p^.hShm >= 0 then
+      fpmunmap(PPPointer(p^.apRegion)[i], p^.szRegion * nShmPerMap)
+    else
+      sqlite3_free(PPPointer(p^.apRegion)[i]);
+    Inc(i, nShmPerMap);
+  end;
+  sqlite3_free(p^.apRegion);
+  if p^.pShmMutex <> nil then
+    sqlite3_mutex_free(p^.pShmMutex);
+  if p^.hShm >= 0 then
+    FpClose(p^.hShm);
+  sqlite3_free(p^.zFilename);
+  sqlite3_free(p);
+  pDbFd^.pInode^.pShmNode := nil;
+end;
+
+{ os_unix.c ~4850: unixLockSharedMemory
+  Implements the DMS (dead-man's-switch) locking protocol for a new pShmNode.
+  Returns SQLITE_OK, SQLITE_BUSY, SQLITE_READONLY_CANTINIT, or SQLITE_IOERR_LOCK. }
+function unixLockSharedMemory(pDbFd: PunixFile; pShmNode: PunixShmNode): cint;
+var
+  lock : FLock;
+  rc   : cint;
+begin
+  rc := SQLITE_OK;
+  lock.l_whence := SEEK_SET;
+  lock.l_start  := UNIX_SHM_DMS;
+  lock.l_len    := 1;
+  lock.l_pid    := 0;
+  lock.l_type   := SmallInt(F_WRLCK);
+
+  if FpFcntl(pShmNode^.hShm, F_GETLK, lock) <> 0 then
+  begin
+    Result := SQLITE_IOERR_LOCK;
+    Exit;
+  end;
+
+  if lock.l_type = SmallInt(F_UNLCK) then
+  begin
+    { No other process holds the DMS. We are first — truncate and take exclusive. }
+    if pShmNode^.isReadonly <> 0 then
+    begin
+      pShmNode^.isUnlocked := 1;
+      Result := SQLITE_READONLY_CANTINIT;
+      Exit;
+    end;
+    rc := unixShmSystemLock(pDbFd, F_WRLCK, UNIX_SHM_DMS, 1);
+    if rc = SQLITE_OK then
+    begin
+      { Truncate to 3 bytes to signal fresh initialization }
+      if FpFtruncate(pShmNode^.hShm, 3) <> 0 then
+        rc := SQLITE_IOERR_SHMOPEN;
+    end;
+  end
+  else if lock.l_type = SmallInt(F_WRLCK) then
+  begin
+    Result := SQLITE_BUSY;
+    Exit;
+  end;
+
+  { Downgrade / take the shared DMS lock }
+  if rc = SQLITE_OK then
+    rc := unixShmSystemLock(pDbFd, F_RDLCK, UNIX_SHM_DMS, 1);
+  Result := rc;
+end;
+
+{ os_unix.c ~4953: unixOpenSharedMemory
+  Open (or attach to an existing) shared-memory segment for pDbFd.
+  Creates the -shm file alongside the database file.
+  Simplified from C: no global inode list; each pDbFd owns its own pShmNode
+  (intra-process sharing deferred — cross-process works via mmap MAP_SHARED). }
+function unixOpenSharedMemory(pDbFd: PunixFile): cint;
+var
+  p        : PunixShm;
+  pShmNode : PunixShmNode;
+  rc       : cint;
+  sb       : Stat;
+  zShm     : PChar;
+  nShm     : cint;
+  flags    : cint;
+begin
+  rc := SQLITE_OK;
+  p  := nil;
+
+  p := sqlite3_malloc(SizeOf(unixShm));
+  if p = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+  FillChar(p^, SizeOf(unixShm), 0);
+
+  { If pInode already has a pShmNode (intra-process sharing), reuse it }
+  pShmNode := pDbFd^.pInode^.pShmNode;
+  if pShmNode = nil then
+  begin
+    { Stat the database file to get permissions }
+    if FpFStat(pDbFd^.h, sb) <> 0 then
+    begin
+      sqlite3_free(p);
+      Result := SQLITE_IOERR_FSTAT;
+      Exit;
+    end;
+
+    { Build the -shm filename: zPath + "-shm\0" }
+    nShm := StrLen(pDbFd^.zPath) + 5;   { 4 for "-shm" + 1 for NUL }
+    pShmNode := sqlite3_malloc(SizeOf(unixShmNode) + nShm);
+    if pShmNode = nil then
+    begin
+      sqlite3_free(p);
+      Result := SQLITE_NOMEM_BKPT;
+      Exit;
+    end;
+    FillChar(pShmNode^, SizeOf(unixShmNode), 0);
+    { zFilename sits in the extra bytes after the struct }
+    zShm := PChar(PByte(pShmNode) + SizeOf(unixShmNode));
+    pShmNode^.zFilename := zShm;
+    StrCopy(zShm, pDbFd^.zPath);
+    StrCat(zShm, '-shm');
+
+    pShmNode^.hShm := -1;
+    pShmNode^.pInode := pDbFd^.pInode;
+    pDbFd^.pInode^.pShmNode := pShmNode;
+
+    { Allocate the mutex }
+    pShmNode^.pShmMutex := sqlite3_mutex_alloc(SQLITE_MUTEX_FAST);
+    if pShmNode^.pShmMutex = nil then
+    begin
+      unixShmPurge(pDbFd);
+      sqlite3_free(p);
+      Result := SQLITE_NOMEM_BKPT;
+      Exit;
+    end;
+
+    { Open (or create) the -shm file }
+    flags := O_RDWR or O_CREAT or O_NOFOLLOW_FLAG;
+    pShmNode^.hShm := FpOpen(pShmNode^.zFilename, flags,
+                             sb.st_mode and $1FF);
+    if pShmNode^.hShm < 0 then
+    begin
+      { Try read-only }
+      pShmNode^.hShm := FpOpen(pShmNode^.zFilename, O_RDONLY or O_NOFOLLOW_FLAG,
+                               sb.st_mode and $1FF);
+      if pShmNode^.hShm < 0 then
+      begin
+        unixShmPurge(pDbFd);
+        sqlite3_free(p);
+        Result := SQLITE_CANTOPEN_BKPT;
+        Exit;
+      end;
+      pShmNode^.isReadonly := 1;
+    end;
+
+    rc := unixLockSharedMemory(pDbFd, pShmNode);
+    if (rc <> SQLITE_OK) and (rc <> SQLITE_READONLY_CANTINIT) then
+    begin
+      unixShmPurge(pDbFd);
+      sqlite3_free(p);
+      Result := rc;
+      Exit;
+    end;
+  end;
+
+  { Attach p to pShmNode }
+  p^.pShmNode := pShmNode;
+  sqlite3_mutex_enter(pShmNode^.pShmMutex);
+  p^.pNext := pShmNode^.pFirst;
+  pShmNode^.pFirst := p;
+  Inc(pShmNode^.nRef);
+  sqlite3_mutex_leave(pShmNode^.pShmMutex);
+  pDbFd^.pShm := p;
+  Result := rc;
+end;
+
+{ os_unix.c ~5106: unixShmMap_impl — map a 32KB wal-index page into memory.
+  iPg=0 is the header page; each page is szRegion=WALINDEX_PGSZ=32768 bytes. }
+function unixShmMap_impl(fd: Psqlite3_file; iRegion: cint; szRegion: cint;
+                         bExtend: cint; pp: PPointer): cint; cdecl;
+var
+  pDbFd    : PunixFile;
+  pShmNode : PunixShmNode;
+  p        : PunixShm;
+  rc       : cint;
+  nShmPerMap : cint;
+  nReqRegion : cint;
+  sb       : Stat;
+  nByte    : cint;
+  apNew    : PPointer;
+  pMem     : Pointer;
+  nMap     : cint;
+  pgsz     : cint;
+  iPg      : cint;
+  xbuf     : array[0..0] of Byte;
+begin
+  pp^ := nil;
+  pDbFd := PunixFile(fd);
+  rc := SQLITE_OK;
+  nShmPerMap := unixShmRegionPerMap;
+
+  if pDbFd^.pShm = nil then
+  begin
+    rc := unixOpenSharedMemory(pDbFd);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+
+  p := pDbFd^.pShm;
+  pShmNode := p^.pShmNode;
+  sqlite3_mutex_enter(pShmNode^.pShmMutex);
+
+  if pShmNode^.isUnlocked <> 0 then
+  begin
+    rc := unixLockSharedMemory(pDbFd, pShmNode);
+    if rc <> SQLITE_OK then
+    begin
+      sqlite3_mutex_leave(pShmNode^.pShmMutex);
+      Result := rc;
+      Exit;
+    end;
+    pShmNode^.isUnlocked := 0;
+  end;
+
+  nReqRegion := ((iRegion + nShmPerMap) div nShmPerMap) * nShmPerMap;
+
+  if pShmNode^.nRegion < nReqRegion then
+  begin
+    nByte := nReqRegion * szRegion;
+    pShmNode^.szRegion := szRegion;
+
+    if pShmNode^.hShm >= 0 then
+    begin
+      if FpFStat(pShmNode^.hShm, sb) <> 0 then
+      begin
+        rc := SQLITE_IOERR_SHMSIZE;
+        sqlite3_mutex_leave(pShmNode^.pShmMutex);
+        Result := rc;
+        Exit;
+      end;
+
+      if sb.st_size < nByte then
+      begin
+        if bExtend = 0 then
+        begin
+          sqlite3_mutex_leave(pShmNode^.pShmMutex);
+          Result := SQLITE_OK;   { *pp stays nil }
+          Exit;
+        end;
+        { Extend: write one byte at the end of each 4096-byte page }
+        pgsz := 4096;
+        xbuf[0] := 0;
+        iPg := sb.st_size div pgsz;
+        while iPg < (nByte div pgsz) do
+        begin
+          if FpPWrite(pShmNode^.hShm, @xbuf[0], 1,
+                      i64(iPg) * pgsz + pgsz - 1) <> 1 then
+          begin
+            rc := SQLITE_IOERR_SHMSIZE;
+            sqlite3_mutex_leave(pShmNode^.pShmMutex);
+            Result := rc;
+            Exit;
+          end;
+          Inc(iPg);
+        end;
+      end;
+    end;
+
+    { Expand apRegion array }
+    apNew := sqlite3_realloc(pShmNode^.apRegion,
+                             nReqRegion * SizeOf(Pointer));
+    if apNew = nil then
+    begin
+      rc := SQLITE_NOMEM_BKPT;
+      sqlite3_mutex_leave(pShmNode^.pShmMutex);
+      Result := rc;
+      Exit;
+    end;
+    pShmNode^.apRegion := apNew;
+
+    { Map new regions }
+    while pShmNode^.nRegion < nReqRegion do
+    begin
+      nMap := szRegion * nShmPerMap;
+      if pShmNode^.hShm >= 0 then
+      begin
+        pMem := fpmmap(nil, nMap,
+            PROT_READ or PROT_WRITE,
+            MAP_SHARED,
+            pShmNode^.hShm,
+            i64(pShmNode^.nRegion) * szRegion);
+        if pMem = MAP_FAILED then
+        begin
+          rc := SQLITE_IOERR_SHMMAP;
+          sqlite3_mutex_leave(pShmNode^.pShmMutex);
+          Result := rc;
+          Exit;
+        end;
+      end
+      else
+      begin
+        pMem := sqlite3_malloc(nMap);
+        if pMem = nil then
+        begin
+          rc := SQLITE_NOMEM_BKPT;
+          sqlite3_mutex_leave(pShmNode^.pShmMutex);
+          Result := rc;
+          Exit;
+        end;
+        FillChar(pMem^, nMap, 0);
+      end;
+
+      { Store pointer for each sub-region within this mmap }
+      iPg := 0;
+      while iPg < nShmPerMap do
+      begin
+        PPPointer(pShmNode^.apRegion)[pShmNode^.nRegion + iPg] :=
+          Pointer(PByte(pMem) + szRegion * iPg);
+        Inc(iPg);
+      end;
+      Inc(pShmNode^.nRegion, nShmPerMap);
+    end;
+  end;
+
+  if pShmNode^.nRegion > iRegion then
+    pp^ := PPPointer(pShmNode^.apRegion)[iRegion];
+  { else pp^ stays nil, rc stays SQLITE_OK }
+
+  if (pShmNode^.isReadonly <> 0) and (rc = SQLITE_OK) then
+    rc := SQLITE_READONLY;
+  sqlite3_mutex_leave(pShmNode^.pShmMutex);
+  Result := rc;
+end;
+
+{ os_unix.c ~5284: unixShmLock_impl — change lock state on SHM lock slots.
+  flags: SQLITE_SHM_LOCK/UNLOCK | SQLITE_SHM_SHARED/EXCLUSIVE. }
+function unixShmLock_impl(fd: Psqlite3_file; ofst: cint; n: cint;
+                          flags: cint): cint; cdecl;
+var
+  pDbFd    : PunixFile;
+  p        : PunixShm;
+  pShmNode : PunixShmNode;
+  rc       : cint;
+  mask     : u16;
+  ii       : cint;
+  aLock    : PcInt;
+  bUnlock  : cint;
+begin
+  pDbFd := PunixFile(fd);
+  p := pDbFd^.pShm;
+  if p = nil then begin Result := SQLITE_IOERR_SHMLOCK; Exit; end;
+  pShmNode := p^.pShmNode;
+  if pShmNode = nil then begin Result := SQLITE_IOERR_SHMLOCK; Exit; end;
+  aLock := @pShmNode^.aLock[0];
+  mask  := u16(((1 shl (ofst + n)) - (1 shl ofst)));
+  rc    := SQLITE_OK;
+
+  sqlite3_mutex_enter(pShmNode^.pShmMutex);
+
+  if (flags and SQLITE_SHM_UNLOCK) <> 0 then
+  begin
+    { Unlock }
+    bUnlock := 1;
+    if (flags and SQLITE_SHM_SHARED) <> 0 then
+    begin
+      { Shared unlock: might be held by other sibling connections }
+      if aLock[ofst] > 1 then
+      begin
+        bUnlock := 0;
+        Dec(aLock[ofst]);
+        p^.sharedMask := p^.sharedMask and not mask;
+      end;
+    end;
+    if bUnlock <> 0 then
+    begin
+      rc := unixShmSystemLock(pDbFd, F_UNLCK, ofst + UNIX_SHM_BASE, n);
+      if rc = SQLITE_OK then
+      begin
+        FillChar(aLock[ofst], SizeOf(cint) * n, 0);
+        p^.sharedMask := p^.sharedMask and not mask;
+        p^.exclMask   := p^.exclMask   and not mask;
+      end;
+    end;
+  end
+  else if (flags and SQLITE_SHM_SHARED) <> 0 then
+  begin
+    { Shared lock }
+    if aLock[ofst] < 0 then
+      rc := SQLITE_BUSY
+    else if aLock[ofst] = 0 then
+      rc := unixShmSystemLock(pDbFd, F_RDLCK, ofst + UNIX_SHM_BASE, n);
+    if rc = SQLITE_OK then
+    begin
+      p^.sharedMask := p^.sharedMask or mask;
+      Inc(aLock[ofst]);
+    end;
+  end
+  else
+  begin
+    { Exclusive lock }
+    for ii := ofst to ofst + n - 1 do
+    begin
+      if aLock[ii] <> 0 then
+      begin
+        rc := SQLITE_BUSY;
+        Break;
+      end;
+    end;
+    if rc = SQLITE_OK then
+    begin
+      rc := unixShmSystemLock(pDbFd, F_WRLCK, ofst + UNIX_SHM_BASE, n);
+      if rc = SQLITE_OK then
+      begin
+        p^.exclMask := p^.exclMask or mask;
+        for ii := ofst to ofst + n - 1 do
+          aLock[ii] := -1;
+      end;
+    end;
+  end;
+
+  sqlite3_mutex_leave(pShmNode^.pShmMutex);
+  Result := rc;
+end;
+
+{ os_unix.c ~5480: unixShmBarrier_impl — memory barrier. }
+procedure unixShmBarrier_impl(fd: Psqlite3_file); cdecl;
+begin
+  { A compiler/memory barrier. On x86_64 loads/stores are ordered,
+    so this only needs to prevent compiler reordering. }
+  ReadWriteBarrier;  { FPC built-in memory barrier }
+end;
+
+{ os_unix.c ~5490: unixShmUnmap_impl — close shared-memory connection. }
+function unixShmUnmap_impl(fd: Psqlite3_file; deleteFlag: cint): cint; cdecl;
+var
+  pDbFd    : PunixFile;
+  p        : PunixShm;
+  pShmNode : PunixShmNode;
+  pp       : ^PunixShm;
+begin
+  pDbFd := PunixFile(fd);
+  p := pDbFd^.pShm;
+  if p = nil then begin Result := SQLITE_OK; Exit; end;
+  pShmNode := p^.pShmNode;
+
+  { Remove p from the pShmNode's list }
+  sqlite3_mutex_enter(pShmNode^.pShmMutex);
+  pp := @pShmNode^.pFirst;
+  while pp^ <> p do pp := @pp^^.pNext;
+  pp^ := p^.pNext;
+  sqlite3_mutex_leave(pShmNode^.pShmMutex);
+  sqlite3_free(p);
+  pDbFd^.pShm := nil;
+
+  { Decrement nRef and purge if zero }
+  Dec(pShmNode^.nRef);
+  if pShmNode^.nRef = 0 then
+  begin
+    if (deleteFlag <> 0) and (pShmNode^.hShm >= 0) then
+      FpUnlink(pShmNode^.zFilename);
+    unixShmPurge(pDbFd);
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ ============================================================
   InitUnixIoMethods — build the unixIoMethods vtable.
   Called from the initialization section once all functions are known.
   ============================================================ }
@@ -2002,7 +2599,7 @@ end;
 procedure InitUnixIoMethods;
 begin
   FillChar(unixIoMethods, SizeOf(unixIoMethods), 0);
-  unixIoMethods.iVersion             := 1;
+  unixIoMethods.iVersion             := 2;  { v2: SHM methods active for WAL }
   unixIoMethods.xClose               := @unixClose_impl;
   unixIoMethods.xRead                := @unixRead_impl;
   unixIoMethods.xWrite               := @unixWrite_impl;
@@ -2015,11 +2612,10 @@ begin
   unixIoMethods.xFileControl         := @unixFileControl_impl;
   unixIoMethods.xSectorSize          := @unixSectorSize_impl;
   unixIoMethods.xDeviceCharacteristics := @unixDeviceCharacteristics_impl;
-  { v2 / v3 methods: nil (iVersion=1, WAL/SHM/mmap out-of-scope for Phase 1) }
-  unixIoMethods.xShmMap     := nil;
-  unixIoMethods.xShmLock    := nil;
-  unixIoMethods.xShmBarrier := nil;
-  unixIoMethods.xShmUnmap   := nil;
+  unixIoMethods.xShmMap     := @unixShmMap_impl;
+  unixIoMethods.xShmLock    := @unixShmLock_impl;
+  unixIoMethods.xShmBarrier := @unixShmBarrier_impl;
+  unixIoMethods.xShmUnmap   := @unixShmUnmap_impl;
   unixIoMethods.xFetch      := nil;
   unixIoMethods.xUnfetch    := nil;
 end;

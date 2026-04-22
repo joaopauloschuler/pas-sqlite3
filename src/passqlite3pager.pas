@@ -27,6 +27,7 @@ uses
   passqlite3os,
   passqlite3util,
   passqlite3pcache,
+  passqlite3wal,
   BaseUnix,
   UnixType,
   SysUtils;
@@ -215,7 +216,7 @@ type
   { Forward declarations }
   PPager          = ^Pager;
   PPagerSavepoint = ^PagerSavepoint;
-  PWal            = ^TWal;     { wal.c -- ported in Phase 3.B.3 }
+  PWal            = passqlite3wal.PWal;  { wal.c -- fully ported in Phase 3.B.3 }
   Psqlite3_backup = Pointer;   { backup.c -- ported in Phase 8.7 }
   TDbPage         = PgHdr;     { pager.h: typedef struct PgHdr DbPage }
   PDbPage         = ^TDbPage;
@@ -231,10 +232,6 @@ type
     bTruncateOnRelease : i32;     { If stmt journal may be truncated }
     aWalData : array[0..WAL_SAVEPOINT_NDATA-1] of u32; { WAL savepoint ctx }
   end;
-
-  { TWal -- opaque WAL handle; full definition in passqlite3wal.pas (Phase 3.B.3).
-    Declared here as an opaque record so Pager can hold a pointer to it. }
-  TWal = record end;
 
   { Callback types }
   TDbPageReinit   = procedure(p: PDbPage);
