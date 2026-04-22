@@ -642,13 +642,41 @@ at the wrong moment will leave the database unrecoverable.
   `sqlite3PcacheMakeDirty`, `sqlite3PcacheMakeClean`, eviction).
 - [X] **3.A.2** Port `pcache1.c`: the default concrete backend (LRU with
   purgeable / unpinned page tracking). This is the allocator-heavy one.
-- [ ] **3.A.3** Port `memjournal.c`: the in-memory journal implementation
+- [X] **3.A.3** Port `memjournal.c`: the in-memory journal implementation
   used when `PRAGMA journal_mode=MEMORY` or during `SAVEPOINT`.
-- [ ] **3.A.4** Port `memdb.c`: the `:memory:` database backing — a VFS-shaped
+- [X] **3.A.4** Port `memdb.c`: the `:memory:` database backing — a VFS-shaped
   object over a single in-RAM buffer.
 - [X] **3.A.5** Gate: `TestPCache.pas` — scripted fetch / release / dirty /
   eviction sequences produce identical `PgHdr` state and identical
   allocation counts vs C reference. **All 8 tests pass (T1–T8).**
+
+### Phase 3.A.3+3.A.4 implementation notes (2026-04-22)
+
+**Units**: `src/passqlite3pager.pas` (~1080 lines, memjournal.c + memdb.c).
+
+**What was done**:
+- Ported all `memjournal.c` types (`FileChunk`, `FilePoint`, `MemJournal`) and functions:
+  `memjrnlRead`, `memjrnlWrite`, `memjrnlTruncate`, `memjrnlFreeChunks`,
+  `memjrnlCreateFile`, `memjrnlClose`, `memjrnlSync`, `memjrnlFileSize`,
+  plus all exported functions (`sqlite3JournalOpen`, `sqlite3MemJournalOpen`,
+  `sqlite3JournalCreate`, `sqlite3JournalIsInMemory`, `sqlite3JournalSize`).
+- Ported all `memdb.c` types (`MemStore`, `MemFile`) and functions:
+  `memdbClose`, `memdbRead`, `memdbWrite`, `memdbTruncate`, `memdbSync`,
+  `memdbFileSize`, `memdbLock`, `memdbUnlock`, `memdbFileControl`,
+  `memdbDeviceCharacteristics`, `memdbFetch`, `memdbUnfetch`, `memdbOpen`,
+  plus VFS helper functions and exported `sqlite3MemdbInit`, `sqlite3IsMemdb`.
+- `TestPager.pas` written: T1–T12 covering all major code paths.
+  All 12 pass.
+
+**Design notes**:
+- `MemJournal` and `MemFile` are both subclasses of `sqlite3_file`; the vtable
+  pointer must be the first field — preserved exactly.
+- nSpill=0 delegates directly to real VFS; nSpill<0 stays pure in-memory;
+  nSpill>0 spills when size exceeds nSpill (verified by T3).
+- `memdb_g` (global MemFS) is unit-level; shared named databases via VFS1 mutex.
+- `SQLITE_DESERIALIZE_*` constants added to interface section.
+
+---
 
 ### Phase 3.A implementation notes (2026-04-22)
 
@@ -702,9 +730,38 @@ at the wrong moment will leave the database unrecoverable.
 
 ---
 
+### Phase 3.B.1 implementation notes (2026-04-22)
+
+**Unit**: `src/passqlite3pager.pas` (expanded with Pager struct section).
+
+**What was done**:
+- Added `passqlite3pcache` to uses clause (provides `PPgHdr`, `PPCache`,
+  `PBitvec`, `PgHdr`, `PCache` needed by Pager).
+- Ported all pager.h constants: `PAGER_OMIT_JOURNAL`, `PAGER_MEMORY`,
+  `PAGER_LOCKINGMODE_*`, `PAGER_JOURNALMODE_*`, `PAGER_GET_*`,
+  `PAGER_SYNCHRONOUS_*`, `PAGER_FULLFSYNC`, `PAGER_CACHESPILL`,
+  `PAGER_FLAGS_MASK`.
+- Ported pager.c internal constants: `UNKNOWN_LOCK`, `MAX_SECTOR_SIZE`,
+  `SPILLFLAG_*`, `PAGER_STAT_*`, `WAL_SAVEPOINT_NDATA`, journal magic bytes.
+- Ported `PagerSavepoint` record (all 7 fields including aWalData[0..3]).
+- Declared `TWal` as opaque record (full definition deferred to Phase 3.B.3).
+- Declared `Psqlite3_backup` as `Pointer` (full definition deferred to Phase 8.7).
+- Ported `Pager` struct (all 42 fields, matching C struct Pager lines 619-706
+  in SQLite 3.53.0 exactly: u8 fields in same order, same Pgno/i64/u32 types).
+- Added `isWalMode` and `isOpen` inline helpers (from pager.h macros).
+- `DbPage = PgHdr` typedef added per pager.h.
+- Verified: `passqlite3pager.pas` compiles cleanly; TestPager 12/12 pass.
+
+**Critical note**: The `Pager` record has 13 leading `u8` fields before the
+first Pgno. The C struct guarantees field ordering for any later memcmp tests.
+Pascal records in `{$MODE OBJFPC}` have no hidden padding between same-size
+fields, but verify with a SizeOf/offsetof check when TestPagerReadOnly is written.
+
+---
+
 ### 3.B — Pager + WAL
 
-- [ ] **3.B.1** Port the `Pager` struct and its helper types. Field order must
+- [X] **3.B.1** Port the `Pager` struct and its helper types. Field order must
   match C exactly — tests will `memcmp`. (The `PgHdr` / `PCache` types have
   already been ported in Phase 3.A.)
 
