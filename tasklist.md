@@ -1155,7 +1155,7 @@ preserve byte-for-byte on-disk parity.
 Before trying any fix, try to use some profiling tool to discover where the time is being waisted.
 In FPC, functions with asm content can not be inlined.
 
-Use "-dAVX2 -CfAVX2 -CpCOREI -OpCOREI" to compile.
+Use "-dAVX2 -CfAVX2 -CpCOREAVX -OpCOREAVX" to compile.
 
 - [ ] **12.1** Profile with `perf record` on the benchmark workloads. Identify
   top 10 hot functions.
