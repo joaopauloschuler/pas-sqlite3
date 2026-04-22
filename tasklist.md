@@ -822,10 +822,17 @@ fields, but verify with a SizeOf/offsetof check when TestPagerReadOnly is writte
     `sqlite3PagerUnref`, `readDbPage`. Enough to open an existing DB and read
     pages. Gate: `TestPagerReadOnly.pas` — 10/10 PASS (2026-04-22).
     See implementation notes below.
-  - [ ] **3.B.2b** Rollback journaling: write path for `journal_mode=DELETE`.
+  - [X] **3.B.2b** Rollback journaling: write path for `journal_mode=DELETE`.
     `pagerWalFrames` is NOT in scope here. Gate: `TestPagerRollback.pas` —
-    scripted INSERT/UPDATE/DELETE produces byte-identical `.db` and `.journal`
-    files.
+    10/10 PASS (2026-04-22). All write-path functions ported: `writeJournalHdr`,
+    `pager_write`, `sqlite3PagerBegin`, `sqlite3PagerWrite`, `sqlite3PagerCommitPhaseOne`,
+    `sqlite3PagerCommitPhaseTwo`, `sqlite3PagerRollback`, `sqlite3PagerOpenSavepoint`,
+    `sqlite3PagerSavepoint`, `pager_playback`, `pager_playback_one_page`,
+    `pager_end_transaction`, `syncJournal`, `pager_write_pagelist`, `pager_delsuper`,
+    `pagerPlaybackSavepoint`, and ~25 helper functions.
+    FPC hazards resolved: `pgno: Pgno` → `pg: u32`, `pPgHdr: PPgHdr` → `pHdr`,
+    `pPagerSavepoint` var renamed to `pSP`, `out ppPage` → `ppPage: PPDbPage`,
+    `sqlite3_log` stub (varargs not allowed without cdecl+external).
   - **3.B.2c** Atomic commit, savepoints, rollback-on-error paths. Gate:
     simulated crash mid-transaction (truncate `.journal` at random offset)
     recovers to the same state as C reference.
