@@ -421,9 +421,201 @@ begin
   Check('T10 nFree reasonable', (tp.page.nFree >= 0) and (tp.page.nFree < PAGE_SIZE));
 end;
 
+{ ===== T11: get4byte / put4byte ============================================ }
+procedure RunT11;
+var
+  buf: array[0..3] of u8;
+begin
+  WriteLn('T11: get4byte / put4byte');
+  put4byte(@buf[0], 0);
+  Check('round-trip 0', get4byte(@buf[0]) = 0);
+
+  put4byte(@buf[0], 1);
+  Check('round-trip 1', get4byte(@buf[0]) = 1);
+
+  put4byte(@buf[0], $DEADBEEF);
+  Check('round-trip $DEADBEEF', get4byte(@buf[0]) = $DEADBEEF);
+
+  put4byte(@buf[0], $FFFFFFFF);
+  Check('round-trip $FFFFFFFF', get4byte(@buf[0]) = $FFFFFFFF);
+
+  { Verify big-endian byte order }
+  put4byte(@buf[0], $01020304);
+  Check('big-endian byte 0', buf[0] = $01);
+  Check('big-endian byte 1', buf[1] = $02);
+  Check('big-endian byte 2', buf[2] = $03);
+  Check('big-endian byte 3', buf[3] = $04);
+end;
+
+{ ===== T12: sqlite3BtreeCursorSize + sqlite3BtreeCursorZero ============== }
+procedure RunT12;
+var
+  cur : TBtCursor;
+  pBt : TBtShared;
+  pBtr: TBtree;
+begin
+  WriteLn('T12: sqlite3BtreeCursorSize / sqlite3BtreeCursorZero');
+
+  Check('cursorSize = SizeOf(TBtCursor)',
+        sqlite3BtreeCursorSize = SizeOf(TBtCursor));
+
+  { Zero entire cursor first, then set specific pre-pBt fields to non-zero }
+  FillChar(cur, SizeOf(cur), 0);
+  cur.pBt           := @pBt;
+  cur.eState        := CURSOR_VALID;
+  cur.curFlags      := BTCF_ValidOvfl;
+  cur.curPagerFlags := 1;
+  cur.skipNext      := 42;
+  cur.pBtree        := @pBtr;
+
+  sqlite3BtreeCursorZero(@cur);
+
+  { Fields before pBt must be zeroed }
+  Check('eState zeroed',        cur.eState = 0);
+  Check('curFlags zeroed',      cur.curFlags = 0);
+  Check('curPagerFlags zeroed', cur.curPagerFlags = 0);
+  Check('skipNext zeroed',      cur.skipNext = 0);
+  Check('pBtree zeroed',        cur.pBtree = nil);
+  Check('aOverflow zeroed',     cur.aOverflow = nil);
+  Check('pKey zeroed',          cur.pKey = nil);
+
+  { pBt must be UNCHANGED }
+  Check('pBt preserved', cur.pBt = @pBt);
+end;
+
+{ ===== T13: allocateTempSpace / freeTempSpace ============================= }
+procedure RunT13;
+var
+  pBt: TBtShared;
+  rc : i32;
+begin
+  WriteLn('T13: allocateTempSpace / freeTempSpace');
+  FillChar(pBt, SizeOf(pBt), 0);
+  pBt.pageSize := 4096;
+
+  rc := allocateTempSpace(@pBt);
+  Check('allocateTempSpace rc=OK', rc = SQLITE_OK);
+  Check('pTmpSpace non-nil',       pBt.pTmpSpace <> nil);
+
+  freeTempSpace(@pBt);
+  Check('pTmpSpace nil after free', pBt.pTmpSpace = nil);
+end;
+
+{ ===== T14: invalidateOverflowCache ======================================= }
+procedure RunT14;
+var
+  cur : TBtCursor;
+  ovfl: PPgno;
+begin
+  WriteLn('T14: invalidateOverflowCache');
+  FillChar(cur, SizeOf(cur), 0);
+
+  { nil aOverflow: sqlite3_free(nil) is a no-op; flag still cleared }
+  cur.aOverflow := nil;
+  cur.curFlags  := BTCF_ValidOvfl;
+  invalidateOverflowCache(@cur);
+  Check('nil: ValidOvfl cleared',  (cur.curFlags and BTCF_ValidOvfl) = 0);
+  Check('nil: aOverflow still nil', cur.aOverflow = nil);
+
+  { Heap-allocated aOverflow: freed and flag cleared }
+  ovfl := PPgno(sqlite3Malloc(4 * SizeOf(Pgno)));
+  Check('T14 ovfl alloc ok', ovfl <> nil);
+  if ovfl <> nil then begin
+    cur.aOverflow := ovfl;
+    cur.curFlags  := BTCF_ValidOvfl;
+    invalidateOverflowCache(@cur);
+    Check('heap: ValidOvfl cleared', (cur.curFlags and BTCF_ValidOvfl) = 0);
+    Check('heap: aOverflow nil',      cur.aOverflow = nil);
+  end;
+end;
+
+{ ===== T15: moveToRoot — pgnoRoot=0 path ================================== }
+procedure RunT15;
+var
+  cur: TBtCursor;
+  rc : i32;
+begin
+  WriteLn('T15: moveToRoot (pgnoRoot=0 → SQLITE_EMPTY)');
+  FillChar(cur, SizeOf(cur), 0);
+  cur.iPage    := -1;
+  cur.pgnoRoot := 0;
+
+  rc := moveToRoot(@cur);
+  Check('rc=SQLITE_EMPTY',        rc = SQLITE_EMPTY);
+  Check('eState=CURSOR_INVALID',  cur.eState = CURSOR_INVALID);
+end;
+
+{ ===== T16: moveToRoot — iPage=0 with empty leaf ========================== }
+procedure RunT16;
+var
+  cur: TBtCursor;
+  tp : TTestPage;
+  rc : i32;
+begin
+  WriteLn('T16: moveToRoot (iPage=0, empty table-leaf)');
+  FillChar(cur, SizeOf(cur), 0);
+  InitTestPage(tp, $0D);        { table-leaf, nCell=0, leaf=1, intKey=1 }
+  tp.page.isInit := 1;
+
+  cur.iPage    := 0;
+  cur.pPage    := @tp.page;
+  cur.pBt      := @tp.pBt;
+  cur.pKeyInfo := nil;          { table cursor (pKeyInfo=nil means intKey expected) }
+
+  rc := moveToRoot(@cur);
+  Check('rc=SQLITE_EMPTY',       rc = SQLITE_EMPTY);
+  Check('eState=CURSOR_INVALID', cur.eState = CURSOR_INVALID);
+  Check('ix reset to 0',         cur.ix = 0);
+end;
+
+{ ===== T17: sqlite3BtreeFirst / sqlite3BtreeLast — empty page ============= }
+procedure RunT17;
+var
+  cur : TBtCursor;
+  tp  : TTestPage;
+  rc  : i32;
+  res : i32;
+begin
+  WriteLn('T17: sqlite3BtreeFirst / sqlite3BtreeLast (empty page)');
+  FillChar(cur, SizeOf(cur), 0);
+  InitTestPage(tp, $0D);
+  tp.page.isInit := 1;
+  cur.iPage    := 0;
+  cur.pPage    := @tp.page;
+  cur.pBt      := @tp.pBt;
+  cur.pKeyInfo := nil;
+
+  res := -1;
+  rc  := sqlite3BtreeFirst(@cur, @res);
+  Check('First rc=OK',    rc  = SQLITE_OK);
+  Check('First pRes=1',   res = 1);
+
+  { Reset cursor to iPage=0 for Last test }
+  cur.iPage  := 0;
+  cur.pPage  := @tp.page;
+  cur.eState := CURSOR_INVALID;
+  res := -1;
+  rc  := sqlite3BtreeLast(@cur, @res);
+  Check('Last rc=OK',     rc  = SQLITE_OK);
+  Check('Last pRes=1',    res = 1);
+end;
+
+{ ===== T18: btreeReleaseAllCursorPages — iPage=-1 no-op ================== }
+procedure RunT18;
+var
+  cur: TBtCursor;
+begin
+  WriteLn('T18: btreeReleaseAllCursorPages (iPage=-1 → no-op)');
+  FillChar(cur, SizeOf(cur), 0);
+  cur.iPage := -1;
+  { Should not crash or access memory }
+  btreeReleaseAllCursorPages(@cur);
+  Check('survived iPage=-1', True);
+end;
+
 { ===== main ================================================================ }
 begin
-  WriteLn('=== TestBtreeCompat (Phase 4.1) ===');
+  WriteLn('=== TestBtreeCompat (Phase 4.1 + 4.2) ===');
   WriteLn;
   RunT1;
   WriteLn;
@@ -444,6 +636,22 @@ begin
   RunT9;
   WriteLn;
   RunT10;
+  WriteLn;
+  RunT11;
+  WriteLn;
+  RunT12;
+  WriteLn;
+  RunT13;
+  WriteLn;
+  RunT14;
+  WriteLn;
+  RunT15;
+  WriteLn;
+  RunT16;
+  WriteLn;
+  RunT17;
+  WriteLn;
+  RunT18;
   WriteLn;
   WriteLn('Results: ', gPass, ' passed, ', gFail, ' failed');
   if gFail > 0 then

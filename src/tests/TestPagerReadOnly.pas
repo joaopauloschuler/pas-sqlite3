@@ -122,7 +122,7 @@ begin
   rc := sqlite3PagerSharedLock(pPgr);
   if rc <> SQLITE_OK then begin Fail('T3', 'SharedLock failed'); sqlite3PagerClose(pPgr, nil); Exit; end;
 
-  rc := sqlite3PagerGet(pPgr, 1, pPage, 0);
+  rc := sqlite3PagerGet(pPgr, 1, @pPage, 0);
   if rc <> SQLITE_OK then
     Fail('T3', 'PagerGet returned ' + IntToStr(rc))
   else if pPage = nil then
@@ -146,7 +146,7 @@ begin
   if rc <> SQLITE_OK then begin Fail('T4', 'PagerOpen failed'); Exit; end;
   rc := sqlite3PagerSharedLock(pPgr);
   if rc <> SQLITE_OK then begin Fail('T4', 'SharedLock failed'); sqlite3PagerClose(pPgr, nil); Exit; end;
-  rc := sqlite3PagerGet(pPgr, 1, pPage, 0);
+  rc := sqlite3PagerGet(pPgr, 1, @pPage, 0);
   if rc <> SQLITE_OK then begin Fail('T4', 'PagerGet failed'); sqlite3PagerClose(pPgr, nil); Exit; end;
 
   pData := sqlite3PagerGetData(pPage);
@@ -170,7 +170,7 @@ begin
   if rc <> SQLITE_OK then begin Fail('T5', 'PagerOpen failed'); Exit; end;
   rc := sqlite3PagerSharedLock(pPgr);
   if rc <> SQLITE_OK then begin Fail('T5', 'SharedLock failed'); sqlite3PagerClose(pPgr, nil); Exit; end;
-  rc := sqlite3PagerGet(pPgr, 1, pPage, 0);
+  rc := sqlite3PagerGet(pPgr, 1, @pPage, 0);
   if (rc <> SQLITE_OK) or (pPage = nil) then
   begin Fail('T5', 'PagerGet failed'); sqlite3PagerClose(pPgr, nil); Exit; end;
 
@@ -247,7 +247,7 @@ begin
   if nPages <= 0 then begin Fail('T8', 'bad page count'); sqlite3PagerClose(pPgr, nil); Exit; end;
 
   { Read page size from header (bytes 16-17 of page 1, big-endian) }
-  rc := sqlite3PagerGet(pPgr, 1, pPage, 0);
+  rc := sqlite3PagerGet(pPgr, 1, @pPage, 0);
   if rc <> SQLITE_OK then begin Fail('T8', 'PagerGet(1) failed'); sqlite3PagerClose(pPgr, nil); Exit; end;
   pData := sqlite3PagerGetData(pPage);
   pgSz := (PByte(pData)[16] shl 8) or PByte(pData)[17];
@@ -267,7 +267,7 @@ begin
 
   for pg := 1 to Pgno(nPages) do
   begin
-    rc := sqlite3PagerGet(pPgr, pg, pPage, 0);
+    rc := sqlite3PagerGet(pPgr, pg, @pPage, 0);
     if (rc <> SQLITE_OK) or (pPage = nil) then
     begin
       Fail('T8', 'PagerGet(' + IntToStr(pg) + ') failed: ' + IntToStr(rc));
@@ -313,7 +313,7 @@ begin
   if rc <> SQLITE_OK then begin Fail('T9', 'PagerOpen failed'); Exit; end;
   rc := sqlite3PagerSharedLock(pPgr);
   if rc <> SQLITE_OK then begin Fail('T9', 'SharedLock failed'); sqlite3PagerClose(pPgr, nil); Exit; end;
-  rc := sqlite3PagerGet(pPgr, 1, pPage, 0);
+  rc := sqlite3PagerGet(pPgr, 1, @pPage, 0);
   if rc = SQLITE_OK then sqlite3PagerUnref(pPage);
   rc := sqlite3PagerClose(pPgr, nil);
   if rc <> SQLITE_OK then

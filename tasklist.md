@@ -965,8 +965,30 @@ storage. Correctness here is again checked by on-disk byte equality.
     call with `nMaxFrag ≥ 0`; internal call from `allocateSpace` uses `nMaxFrag=4`.
   - Gate: `TestBtreeCompat.pas` T1–T10 all PASS (54 checks, 2026-04-22).
 
-- [ ] **4.2** Port `BtCursor` + `sqlite3BtreeCursor`, `moveToRoot`, `moveToChild`,
+- [X] **4.2** Port `BtCursor` + `sqlite3BtreeCursor`, `moveToRoot`, `moveToChild`,
   `moveToParent`, `sqlite3BtreeMovetoUnpacked`.
+  - Cursor lifecycle: `btreeCursor`, `sqlite3BtreeCursor`, `sqlite3BtreeCloseCursor`,
+    `sqlite3BtreeCursorZero`, `sqlite3BtreeCursorSize`, `sqlite3BtreeClearCursor`.
+  - Page helpers: `releasePageNotNull`, `releasePage`, `releasePageOne`,
+    `unlockBtreeIfUnused`, `getAndInitPage`.
+  - Temp space: `allocateTempSpace`, `freeTempSpace`.
+  - Overflow cache: `invalidateOverflowCache`, `invalidateAllOverflowCache`.
+  - Cursor save/restore: `saveCursorKey`, `saveCursorPosition`,
+    `btreeRestoreCursorPosition`, `restoreCursorPosition`.
+  - Navigation: `moveToChild`, `moveToParent`, `moveToRoot`, `moveToLeftmost`,
+    `moveToRightmost`, `btreeReleaseAllCursorPages`.
+  - Public API: `sqlite3BtreeFirst`, `sqlite3BtreeLast`, `sqlite3BtreeTableMoveto`,
+    `sqlite3BtreeIndexMoveto`, `sqlite3BtreeNext`, `sqlite3BtreePrevious`,
+    `sqlite3BtreeEof`, `sqlite3BtreeIntegerKey`, `sqlite3BtreePayload`,
+    `sqlite3BtreePayloadSize`, `sqlite3BtreeCursorHasMoved`, `sqlite3BtreeCursorRestore`.
+  - VDBE stubs (Phase 6): `sqlite3VdbeFindCompare`, `sqlite3VdbeRecordCompare`,
+    `indexCellCompare`, `cursorOnLastPage`.
+  - FPC pitfalls fixed: `pDbPage: PDbPage` → `pDbPg` (case-insensitive conflict);
+    `pBtree: PBtree` → `pBtr`; `pgno: Pgno` → `pg`; no `begin..end` as expression;
+    `label` blocks added to `moveToRoot`, `sqlite3BtreeTableMoveto`,
+    `sqlite3BtreeIndexMoveto`.
+  - TestPagerReadOnly.pas: fixed pre-existing `PDbPage` / `PPDbPage` call mismatch.
+  - Gate: `TestBtreeCompat.pas` T1–T18 all PASS (89 checks, 2026-04-22).
 
 - [ ] **4.3** Port insert path: `sqlite3BtreeInsert`, `balance`, `balance_deeper`,
   `balance_nonroot`, `balance_quick`. The balancing logic is the most intricate

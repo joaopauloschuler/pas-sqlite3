@@ -382,6 +382,9 @@ function  sqlite3PagerFlush(pPager: PPager): i32;
 procedure sqlite3PagerTruncateImage(pPager: PPager; nPage: Pgno);
 function  sqlite3PagerCacheStat(pPager: PPager; eStat: i32; reset: i32): u64;
 function  sqlite3PagerMemUsed(pPager: PPager): i32;
+{ Memory helpers used by btree and other consumers }
+function  sqlite3Realloc(p: Pointer; n: NativeUInt): Pointer;
+
 { WAL public API (Phase 3.B.3b) }
 function  sqlite3PagerOpenWal(pPager: PPager; pbOpen: PcInt): i32;
 function  sqlite3PagerWalSupported(pPager: PPager): i32;
@@ -1403,7 +1406,6 @@ function hasHotJournal(pPager: PPager; pExists: PcInt): i32; forward;
 function readDbPage(pPg: PPgHdr): i32; forward;
 { Phase 3.B.2b forward declarations }
 function readSuperJournal(pJrnl: Psqlite3_file; zSuper: PChar; nSuper: i64): i32; forward;
-function sqlite3Realloc(p: Pointer; n: NativeUInt): Pointer; forward;
 function read32bits(fd: Psqlite3_file; offset: i64; pRes: Pu32): i32; forward;
 function write32bits(fd: Psqlite3_file; offset: i64; val: u32): i32; forward;
 function journalHdrOffset(pPager: PPager): i64; forward;
