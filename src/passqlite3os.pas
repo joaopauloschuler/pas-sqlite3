@@ -85,6 +85,7 @@ const
   SQLITE_DEFAULT_FILE_PERMISSIONS = &644;   { 0644 octal }
   MAX_PATHNAME = 512;
   SQLITE_MAX_SYMLINKS = 100;
+  SQLITE_DEFAULT_SECTOR_SIZE = 4096;
 
 { ============================================================
   Section 2: Lock-byte ranges  (from os.h)
@@ -539,6 +540,12 @@ function  sqlite3OsAccess(pVfs: Psqlite3_vfs; zPath: PChar;
 function  sqlite3OsFullPathname(pVfs: Psqlite3_vfs; zPath: PChar;
                                 nPathOut: cint; zPathOut: PChar): cint;
 function  sqlite3OsInit: cint;
+function  sqlite3OsSectorSize(id: Psqlite3_file): cint;
+function  sqlite3OsDeviceCharacteristics(id: Psqlite3_file): cint;
+function  sqlite3OsFileControl(id: Psqlite3_file; op: cint; pArg: Pointer): cint;
+procedure sqlite3OsFileControlHint(id: Psqlite3_file; op: cint; pArg: Pointer);
+function  sqlite3OsFetch(id: Psqlite3_file; iOff: i64; iAmt: cint; pp: PPointer): cint;
+function  sqlite3OsUnfetch(id: Psqlite3_file; iOff: i64; p: Pointer): cint;
 
 { ============================================================
   Section 13: VFS registration (os.c)
@@ -1031,6 +1038,65 @@ end;
 function sqlite3OsInit: cint;
 begin
   Result := sqlite3_os_init();
+end;
+
+{ os.c: sqlite3OsSectorSize }
+function sqlite3OsSectorSize(id: Psqlite3_file): cint;
+begin
+  if Assigned(id^.pMethods) and Assigned(id^.pMethods^.xSectorSize) then
+    Result := id^.pMethods^.xSectorSize(id)
+  else
+    Result := SQLITE_DEFAULT_SECTOR_SIZE;
+end;
+
+{ os.c: sqlite3OsDeviceCharacteristics }
+function sqlite3OsDeviceCharacteristics(id: Psqlite3_file): cint;
+begin
+  if Assigned(id^.pMethods) and Assigned(id^.pMethods^.xDeviceCharacteristics) then
+    Result := id^.pMethods^.xDeviceCharacteristics(id)
+  else
+    Result := 0;
+end;
+
+{ os.c: sqlite3OsFileControl }
+function sqlite3OsFileControl(id: Psqlite3_file; op: cint; pArg: Pointer): cint;
+begin
+  if Assigned(id^.pMethods) and Assigned(id^.pMethods^.xFileControl) then
+    Result := id^.pMethods^.xFileControl(id, op, pArg)
+  else
+    Result := SQLITE_NOTFOUND;
+end;
+
+{ os.c: sqlite3OsFileControlHint -- like FileControl but ignores errors }
+procedure sqlite3OsFileControlHint(id: Psqlite3_file; op: cint; pArg: Pointer);
+begin
+  if Assigned(id^.pMethods) and Assigned(id^.pMethods^.xFileControl) then
+    id^.pMethods^.xFileControl(id, op, pArg);
+end;
+
+{ os.c: sqlite3OsFetch }
+function sqlite3OsFetch(id: Psqlite3_file; iOff: i64; iAmt: cint; pp: PPointer): cint;
+begin
+  if Assigned(id^.pMethods) and (id^.pMethods^.iVersion >= 3)
+    and Assigned(id^.pMethods^.xFetch)
+  then
+    Result := id^.pMethods^.xFetch(id, iOff, iAmt, pp)
+  else
+  begin
+    pp^ := nil;
+    Result := SQLITE_OK;
+  end;
+end;
+
+{ os.c: sqlite3OsUnfetch }
+function sqlite3OsUnfetch(id: Psqlite3_file; iOff: i64; p: Pointer): cint;
+begin
+  if Assigned(id^.pMethods) and (id^.pMethods^.iVersion >= 3)
+    and Assigned(id^.pMethods^.xUnfetch)
+  then
+    Result := id^.pMethods^.xUnfetch(id, iOff, p)
+  else
+    Result := SQLITE_OK;
 end;
 
 { ============================================================

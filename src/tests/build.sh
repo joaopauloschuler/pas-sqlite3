@@ -104,6 +104,7 @@ compile_test TestOSLayer
 compile_test TestUtil
 compile_test TestPCache
 compile_test TestPager
+compile_test TestPagerReadOnly
 compile_test TestPagerCompat
 compile_test TestBtreeCompat
 compile_test TestVdbeTrace

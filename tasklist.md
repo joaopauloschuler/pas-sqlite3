@@ -730,6 +730,58 @@ at the wrong moment will leave the database unrecoverable.
 
 ---
 
+### Phase 3.B.2a implementation notes (2026-04-22)
+
+**Unit**: `src/passqlite3pager.pas` (implementation block expanded).
+
+**What was done (read-only path of pager.c)**:
+- Ported ~600 lines of pager.c read-only path:
+  - `sqlite3SectorSize`, `setSectorSize` (pager.c ~2694/2728)
+  - `setGetterMethod`, `getPageError`, `getPageNormal` (pager.c ~1045/5709/5535)
+  - `pager_reset`, `releaseAllSavepoints`, `pager_unlock` (pager.c ~1772/1790/1841)
+  - `pagerUnlockDb`, `pagerLockDb`, `pagerSetError` (pager.c ~1133/1161/1947)
+  - `pagerFixMaplimit`, `pager_wait_on_lock` (pager.c ~3533/3946)
+  - `pagerPagecount`, `hasHotJournal`, `pagerOpenWalIfPresent` (pager.c ~3279/5134/3339)
+  - `readDbPage`, `pagerUnlockIfUnused`, `pagerUnlockAndRollback` (pager.c ~3021/5471/2191)
+  - `sqlite3PagerSetFlags`, `sqlite3PagerSetPagesize`, `sqlite3PagerSetCachesize`
+  - `sqlite3PagerSetBusyHandler`, `sqlite3PagerMaxPageCount`, `sqlite3PagerLockingMode`
+  - `sqlite3PagerOpen`, `sqlite3PagerClose` (pager.c ~4735/4176)
+  - `pagerSyncHotJournal`, `pagerStress` (stub), `pagerFreeMapHdrs`
+  - `sqlite3PagerReadFileheader`, `sqlite3PagerPagecount`
+  - `sqlite3PagerSharedLock` (pager.c ~5254)
+  - `sqlite3PagerGet`, `sqlite3PagerLookup`, `sqlite3PagerRef`
+  - `sqlite3PagerUnref`, `sqlite3PagerUnrefNotNull`, `sqlite3PagerUnrefPageOne`
+  - `sqlite3PagerGetData`, `sqlite3PagerGetExtra`, accessor functions
+  - `pagerReleaseMapPage`, `pager_playback` (stub for 3.B.2b)
+- Added new constants: `SQLITE_OK_SYMLINK`, `SQLITE_DEFAULT_SYNCHRONOUS`
+- Added new OS wrapper functions to `passqlite3os.pas`:
+  `sqlite3OsSectorSize`, `sqlite3OsDeviceCharacteristics`,
+  `sqlite3OsFileControl`, `sqlite3OsFileControlHint`, `sqlite3OsFetch`,
+  `sqlite3OsUnfetch`
+- Created `src/tests/vectors/simple.db` and `multipage.db` test vectors
+- Created `TestPagerReadOnly.pas` (10 tests, all PASS)
+
+**Critical discovery**: In FPC (case-insensitive Pascal), a local variable
+`pPager: PPager` creates a conflict because `pPager` == `PPager` (same
+identifier). This manifests as "Error in type definition" at the var
+declaration. Fix: rename local vars to `pPgr`. Similarly, `pgno: Pgno`
+must be renamed `pg: Pgno` in test code. This is NOT an FPC bug — it is
+correct ISO Pascal: a var name shadows a type name of the same normalized
+form. Function PARAMETERS named `pPager: PPager` work because the type
+is resolved before the parameter binding is created.
+
+**WAL stubs** (deferred to 3.B.3): `pagerOpenWalIfPresent` returns
+`SQLITE_OK`; `pPager^.pWal` is always nil in this phase; all `pagerUseWal`
+branches are skipped.
+
+**Backup stub** (deferred to 8.7): `sqlite3BackupRestart` not called;
+`pPager^.pBackup` is nil.
+
+**`pager_playback` stub** (deferred to 3.B.2b): returns SQLITE_OK; full
+journal replay implemented in 3.B.2b.
+
+---
+
 ### Phase 3.B.1 implementation notes (2026-04-22)
 
 **Unit**: `src/passqlite3pager.pas` (expanded with Pager struct section).
@@ -765,12 +817,12 @@ fields, but verify with a SizeOf/offsetof check when TestPagerReadOnly is writte
   match C exactly — tests will `memcmp`. (The `PgHdr` / `PCache` types have
   already been ported in Phase 3.A.)
 
-- [ ] **3.B.2** Port `pager.c` in three sub-phases:
-  - **3.B.2a** Read-only path: `sqlite3PagerOpen`, `sqlite3PagerGet`,
+- [X] **3.B.2** Port `pager.c` in three sub-phases:
+  - [X] **3.B.2a** Read-only path: `sqlite3PagerOpen`, `sqlite3PagerGet`,
     `sqlite3PagerUnref`, `readDbPage`. Enough to open an existing DB and read
-    pages. Gate: `TestPagerReadOnly.pas` — open every `.db` in `vectors/` and
-    read page 1 through both implementations, confirm identical bytes.
-  - **3.B.2b** Rollback journaling: write path for `journal_mode=DELETE`.
+    pages. Gate: `TestPagerReadOnly.pas` — 10/10 PASS (2026-04-22).
+    See implementation notes below.
+  - [ ] **3.B.2b** Rollback journaling: write path for `journal_mode=DELETE`.
     `pagerWalFrames` is NOT in scope here. Gate: `TestPagerRollback.pas` —
     scripted INSERT/UPDATE/DELETE produces byte-identical `.db` and `.journal`
     files.

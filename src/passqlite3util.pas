@@ -393,6 +393,12 @@ function sqlite3AppendOneUtf8Character(zOut: PChar; v: u32): i32;
 { Config (main.c §sqlite3_config — minimal Phase 3 stub) }
 function  sqlite3_config(op: i32; pArg: Pointer): i32;
 
+{ Pragma/URI helpers (pragma.c, main.c) }
+function sqlite3GetBoolean(z: PChar; dflt: u8): u8;
+function sqlite3_uri_parameter(zFilename: PChar; zParam: PChar): PChar;
+function sqlite3_uri_boolean(zFilename: PChar; zParam: PChar; bDflt: i32): i32;
+function sqlite3Atoi(z: PChar): i32;
+
 { Alignment helpers (used by pcache and btree) }
 function ROUND8(n: SizeInt): SizeInt; inline;
 function ROUNDDOWN8(n: SizeInt): SizeInt; inline;
@@ -1870,6 +1876,107 @@ begin
   zOut[2] := Char($80 or u8((v shr 6) and $3f));
   zOut[3] := Char($80 or u8(v and $3f));
   Result := 4;
+end;
+
+{ ============================================================
+  Pragma/URI helpers (pragma.c + main.c)
+  ============================================================ }
+
+{ pragma.c ~72: getSafetyLevel -- interpret string as safety/sync level }
+function getSafetyLevel(z: PChar; omitFull: i32; dflt: u8): u8;
+const
+  zText   : PChar  = 'onoffalseyestruextrafull';
+  iOffset : array[0..7] of u8 = (0, 1, 2,  4,  9, 12, 15, 20);
+  iLength : array[0..7] of u8 = (2, 2, 3,  5,  3,  4,  5,  4);
+  iValue  : array[0..7] of u8 = (1, 0, 0,  0,  1,  1,  3,  2);
+var
+  i, n: i32;
+begin
+  if sqlite3Isdigit(u8(z^)) <> 0 then Exit(u8(sqlite3Atoi(z)));
+  n := sqlite3Strlen30(z);
+  for i := 0 to 7 do
+  begin
+    if (iLength[i] = n) and
+       (sqlite3_strnicmp(zText + iOffset[i], z, n) = 0) and
+       ((omitFull = 0) or (iValue[i] <= 1)) then
+      Exit(iValue[i]);
+  end;
+  Result := dflt;
+end;
+
+{ pragma.c ~97: sqlite3GetBoolean }
+function sqlite3GetBoolean(z: PChar; dflt: u8): u8;
+begin
+  if getSafetyLevel(z, 1, dflt) <> 0 then Result := 1 else Result := 0;
+end;
+
+{ main.c ~3306: uriParameter (internal) }
+function uriParameter(zFilename: PChar; zParam: PChar): PChar;
+begin
+  zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+  while zFilename^ <> #0 do
+  begin
+    if StrComp(zFilename, zParam) = 0 then
+    begin
+      zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+      Exit(zFilename);
+    end;
+    zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+    zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+  end;
+  Result := nil;
+end;
+
+{ main.c ~4795: databaseName (internal) -- walk back past 4-byte zero prefix }
+function databaseName(zName: PChar): PChar;
+begin
+  while (zName[-1] <> #0) or (zName[-2] <> #0) or
+        (zName[-3] <> #0) or (zName[-4] <> #0) do
+    Dec(zName);
+  Result := zName;
+end;
+
+{ main.c ~4875: sqlite3_uri_parameter }
+function sqlite3_uri_parameter(zFilename: PChar; zParam: PChar): PChar;
+begin
+  if (zFilename = nil) or (zParam = nil) then Exit(nil);
+  zFilename := databaseName(zFilename);
+  Result := uriParameter(zFilename, zParam);
+end;
+
+{ main.c ~4898: sqlite3_uri_boolean }
+function sqlite3_uri_boolean(zFilename: PChar; zParam: PChar; bDflt: i32): i32;
+var
+  z  : PChar;
+  df : u8;
+begin
+  z := sqlite3_uri_parameter(zFilename, zParam);
+  if bDflt <> 0 then df := 1 else df := 0;
+  if z <> nil then Result := sqlite3GetBoolean(z, df)
+  else Result := df;
+end;
+
+{ util.c ~1357: sqlite3Atoi -- parse integer from string }
+function sqlite3Atoi(z: PChar): i32;
+var
+  v   : i64;
+  neg : i32;
+  c   : i32;
+begin
+  v   := 0;
+  neg := 0;
+  if z = nil then Exit(0);
+  if z^ = '-' then begin neg := 1; Inc(z); end
+  else if z^ = '+' then Inc(z);
+  while sqlite3Isdigit(u8(z^)) <> 0 do
+  begin
+    c := Ord(z^) - Ord('0');
+    if v > (High(i32) - c) div 10 then begin v := High(i32); break; end;
+    v := v * 10 + c;
+    Inc(z);
+  end;
+  if neg <> 0 then v := -v;
+  Result := i32(v);
 end;
 
 { ============================================================
