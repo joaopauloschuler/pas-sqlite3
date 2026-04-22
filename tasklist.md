@@ -853,10 +853,10 @@ fields, but verify with a SizeOf/offsetof check when TestPagerReadOnly is writte
     Compiles 0 errors. All types, constants, and public API ported.
     `passqlite3pager.pas` updated: `TWal` stub removed, `passqlite3wal` added
     to uses, `PWal` aliased from `passqlite3wal.PWal`. All prior tests pass.
-  - [ ] **3.B.3b** Wire WAL into pager: `pagerOpenWalIfPresent`, `pagerUseWal`,
+  - [X] **3.B.3b** Wire WAL into pager: `pagerOpenWalIfPresent`, `pagerUseWal`,
     `sqlite3PagerBeginReadTransaction`, etc. call real WAL functions.
-  - [ ] **3.B.3c** Checkpoint integration.
-  Gate: `TestWalCompat.pas` — Pascal writer + C reader, and vice versa.
+  - [X] **3.B.3c** Checkpoint integration.
+  Gate: `TestWalCompat.pas` — Pascal writer + C reader, and vice versa. T1–T8 PASS (2026-04-22).
 
 ### Phase 3.B.3a implementation notes (2026-04-22)
 
@@ -886,6 +886,34 @@ fields, but verify with a SizeOf/offsetof check when TestPagerReadOnly is writte
 - `8#777` octal invalid in FPC; replaced with `$1FF` in passqlite3os.pas.
 - `ternary(cond, a, b)` has no FPC equivalent; expanded to if-then-else.
 - `^TRecord` parameter type replaced by `PRecord` (pointer type alias).
+
+### Phase 3.B.3b+3c implementation notes (2026-04-22)
+
+**What was done**:
+- `pagerOpenWalIfPresent`, `pagerUseWal`, `pagerBeginReadTransaction`,
+  `sqlite3PagerSharedLock`, `sqlite3PagerBeginReadTransaction` wired to real
+  WAL functions in `passqlite3wal.pas`.
+- `sqlite3PagerCheckpoint` wired; `sqlite3PagerClose` passes `pTmpSpace` to
+  `sqlite3WalClose` for TRUNCATE checkpoint on close.
+- `TestWalCompat.pas` (2026-04-22): T1–T8 all PASS.
+  T1 WAL header open, T2 BeginReadTransaction, T3 Dbsize, T4 FindFrame+ReadFrame,
+  T5 pager SharedLock on C WAL db, T6 Pascal write to C WAL (C re-opens cleanly),
+  T7 TRUNCATE checkpoint, T8 fresh Pascal-written WAL opened by C.
+- Added to `build.sh` compile list.
+
+**Critical bug fixed in `unixLockSharedMemory` (passqlite3os.pas)**:
+  `F_GETLK` does not report locks held by the calling process (Linux POSIX
+  advisory lock semantics). When two connections in the same process both
+  call `unixLockSharedMemory`, the second sees `F_UNLCK` and incorrectly
+  calls `FpFtruncate(hShm, 3)`, destroying the already-initialized SHM
+  (and thus C's WAL index). Fix: after acquiring F_WRLCK on the DMS byte,
+  check the SHM file size with `FpFStat`. If `st_size > 3`, the SHM has
+  already been initialized by another in-process connection; skip the
+  truncate.
+
+**Additional fix**: `sqlite3PcacheInitialize` was missing from
+  `TestWalCompat.pas` main block, causing null function pointer crash in
+  `sqlite3GlobalConfig.pcache2.xCreate`. Added after `sqlite3OsInit`.
 
 ---
 

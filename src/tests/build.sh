@@ -108,6 +108,7 @@ compile_test TestPagerReadOnly
 compile_test TestPagerRollback
 compile_test TestPagerCrash
 compile_test TestPagerCompat
+compile_test TestWalCompat
 compile_test TestBtreeCompat
 compile_test TestVdbeTrace
 compile_test TestExplainParity
@@ -133,4 +134,5 @@ echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestPager"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestPagerReadOnly"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestPagerRollback"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestPagerCrash"
+echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestWalCompat"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestReferenceVectors"

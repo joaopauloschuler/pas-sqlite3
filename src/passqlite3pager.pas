@@ -216,7 +216,7 @@ type
   { Forward declarations }
   PPager          = ^Pager;
   PPagerSavepoint = ^PagerSavepoint;
-  PWal            = passqlite3wal.PWal;  { wal.c -- fully ported in Phase 3.B.3 }
+  { PWal comes directly from passqlite3wal (already in uses clause) }
   Psqlite3_backup = Pointer;   { backup.c -- ported in Phase 8.7 }
   TDbPage         = PgHdr;     { pager.h: typedef struct PgHdr DbPage }
   PDbPage         = ^TDbPage;
@@ -382,6 +382,14 @@ function  sqlite3PagerFlush(pPager: PPager): i32;
 procedure sqlite3PagerTruncateImage(pPager: PPager; nPage: Pgno);
 function  sqlite3PagerCacheStat(pPager: PPager; eStat: i32; reset: i32): u64;
 function  sqlite3PagerMemUsed(pPager: PPager): i32;
+{ WAL public API (Phase 3.B.3b) }
+function  sqlite3PagerOpenWal(pPager: PPager; pbOpen: PcInt): i32;
+function  sqlite3PagerWalSupported(pPager: PPager): i32;
+function  sqlite3PagerCheckpoint(pPager: PPager; db: Pointer; eMode: i32;
+                                 xBusy: TxBusyCallback; pBusyArg: Pointer;
+                                 pnLog: PcInt; pnCkpt: PcInt): i32;
+function  sqlite3PagerWalCallback(pPager: PPager): i32;
+function  sqlite3PagerWalFile(pPager: PPager): Psqlite3_file;
 
 implementation
 
@@ -1414,6 +1422,14 @@ function subjournalPage(pPg: PPgHdr): i32; forward;
 function addToSavepointBitvecs(pPager: PPager; pgno: Pgno): i32; forward;
 function pager_delsuper(pPager: PPager; zSuper: PChar): i32; forward;
 procedure sqlite3_log(iErrCode: i32; zMsg: PChar); forward;
+{ WAL wiring forward declarations (Phase 3.B.3b) }
+function pagerUseWal(pPager: PPager): i32; forward;
+function pagerBeginReadTransaction(pPager: PPager): i32; forward;
+function pagerWalFrames(pPager: PPager; pList: PPgHdr; nTruncate: Pgno; isCommit: i32): i32; forward;
+function pagerRollbackWal(pPager: PPager): i32; forward;
+function pagerUndoCallback(pCtx: Pointer; pgno: Pgno): i32; forward;
+function pagerExclusiveLock(pPager: PPager): i32; forward;
+procedure pager_write_changecounter(pPg: PPgHdr); forward;
 { Public 3.B.2b functions declared in interface; no forward needed here }
 
 procedure setGetterMethod(pPager: PPager);
@@ -1463,8 +1479,14 @@ begin
   pPager^.pInJournal := nil;
   releaseAllSavepoints(pPager);
 
-  { WAL not yet ported; pagerUseWal always false }
-  if pPager^.exclusiveMode = 0 then
+  if pagerUseWal(pPager) <> 0 then
+  begin
+    if pPager^.eState = PAGER_ERROR then
+      sqlite3WalEndWriteTransaction(pPager^.pWal);
+    sqlite3WalEndReadTransaction(pPager^.pWal);
+    pPager^.eState := PAGER_OPEN;
+  end
+  else if pPager^.exclusiveMode = 0 then
   begin
     if isOpen(pPager^.fd) <> 0 then
       iDc := sqlite3OsDeviceCharacteristics(pPager^.fd)
@@ -1588,8 +1610,7 @@ var
   n    : i64;
   rc   : i32;
 begin
-  nPage := 0;
-  { WAL not ported: sqlite3WalDbsize would go here, returns 0 }
+  nPage := sqlite3WalDbsize(pPager^.pWal);
   if nPage = 0 then
   begin
     n := 0;
@@ -1673,11 +1694,205 @@ begin
   Result := rc;
 end;
 
-{ pager.c ~3339: pagerOpenWalIfPresent -- no-op until Phase 3.B.3 }
-function pagerOpenWalIfPresent(pPager: PPager): i32;
+{ pager.c ~7558: sqlite3PagerWalSupported }
+function sqlite3PagerWalSupported(pPager: PPager): i32;
+var
+  pMethods: Psqlite3_io_methods;
 begin
-  if pPager = nil then;
-  Result := SQLITE_OK;
+  if pPager^.noLock <> 0 then begin Result := 0; Exit; end;
+  pMethods := pPager^.fd^.pMethods;
+  if (pPager^.exclusiveMode <> 0)
+  or ((pMethods^.iVersion >= 2) and Assigned(pMethods^.xShmMap))
+  then Result := 1
+  else Result := 0;
+end;
+
+{ pager.c ~7561: pagerExclusiveLock }
+function pagerExclusiveLock(pPager: PPager): i32;
+var
+  rc         : i32;
+  eOrigLock  : u8;
+begin
+  eOrigLock := pPager^.eLock;
+  rc := pagerLockDb(pPager, EXCLUSIVE_LOCK);
+  if rc <> SQLITE_OK then
+  begin
+    rc := pagerLockDb(pPager, PENDING_LOCK);
+    if rc = SQLITE_OK then
+      pagerUnlockDb(pPager, eOrigLock);
+  end;
+  Result := rc;
+end;
+
+{ pager.c ~7581: pagerOpenWal (internal) }
+function pagerOpenWal(pPager: PPager): i32;
+var
+  rc: i32;
+begin
+  rc := SQLITE_OK;
+  if pPager^.exclusiveMode <> 0 then
+    rc := pagerExclusiveLock(pPager);
+  if rc = SQLITE_OK then
+    rc := sqlite3WalOpen(pPager^.pVfs, pPager^.fd, pPager^.zWal,
+                         pPager^.exclusiveMode, pPager^.journalSizeLimit,
+                         @pPager^.pWal);
+  pagerFixMaplimit(pPager);
+  Result := rc;
+end;
+
+{ pager.c ~7631: sqlite3PagerOpenWal }
+function sqlite3PagerOpenWal(pPager: PPager; pbOpen: PcInt): i32;
+var
+  rc: i32;
+begin
+  rc := SQLITE_OK;
+  if (pPager^.tempFile = 0) and (pPager^.pWal = nil) then
+  begin
+    if sqlite3PagerWalSupported(pPager) = 0 then Exit(SQLITE_CANTOPEN);
+    sqlite3OsClose(pPager^.jfd);
+    rc := pagerOpenWal(pPager);
+    if rc = SQLITE_OK then
+    begin
+      pPager^.journalMode := PAGER_JOURNALMODE_WAL;
+      pPager^.eState      := PAGER_OPEN;
+    end;
+  end
+  else if pbOpen <> nil then
+    pbOpen^ := 1;
+  Result := rc;
+end;
+
+{ pager.c ~3339: pagerOpenWalIfPresent }
+function pagerOpenWalIfPresent(pPager: PPager): i32;
+var
+  rc     : i32;
+  isWal  : cint;
+  nPage  : Pgno;
+begin
+  rc := SQLITE_OK;
+  if pPager^.tempFile = 0 then
+  begin
+    isWal := 0;
+    rc := sqlite3OsAccess(pPager^.pVfs, pPager^.zWal,
+                          SQLITE_ACCESS_EXISTS, @isWal);
+    if rc = SQLITE_OK then
+    begin
+      if isWal <> 0 then
+      begin
+        rc := pagerPagecount(pPager, @nPage);
+        if rc = SQLITE_OK then
+        begin
+          if nPage = 0 then
+            rc := sqlite3OsDelete(pPager^.pVfs, pPager^.zWal, 0)
+          else
+            rc := sqlite3PagerOpenWal(pPager, nil);
+        end;
+      end
+      else if pPager^.journalMode = PAGER_JOURNALMODE_WAL then
+        pPager^.journalMode := PAGER_JOURNALMODE_DELETE;
+    end;
+  end;
+  Result := rc;
+end;
+
+{ pager.c ~3250: pagerBeginReadTransaction }
+function pagerBeginReadTransaction(pPager: PPager): i32;
+var
+  rc      : i32;
+  changed : cint;
+begin
+  sqlite3WalEndReadTransaction(pPager^.pWal);
+  changed := 0;
+  rc := sqlite3WalBeginReadTransaction(pPager^.pWal, @changed);
+  if (rc <> SQLITE_OK) or (changed <> 0) then
+    pager_reset(pPager);
+  Result := rc;
+end;
+
+{ pager.c ~3098: pagerUndoCallback }
+function pagerUndoCallback(pCtx: Pointer; pgno: Pgno): i32;
+var
+  pPgr : PPager;  { renamed: pPager conflicts with type PPager }
+  pPg  : PPgHdr;
+  rc   : i32;
+begin
+  rc := SQLITE_OK;
+  pPgr := PPager(pCtx);
+  pPg := sqlite3PagerLookup(pPgr, pgno);
+  if pPg <> nil then
+  begin
+    if sqlite3PcachePageRefcount(pPg) = 1 then
+      sqlite3PcacheDrop(pPg)
+    else
+    begin
+      rc := readDbPage(pPg);
+      if (rc = SQLITE_OK) and Assigned(pPgr^.xReiniter) then
+        pPgr^.xReiniter(pPg);
+      sqlite3PagerUnrefNotNull(pPg);
+    end;
+  end;
+  Result := rc;
+end;
+
+{ pager.c ~3146: pagerRollbackWal }
+function pagerRollbackWal(pPager: PPager): i32;
+var
+  rc    : i32;
+  pList : PPgHdr;
+begin
+  pPager^.dbSize := pPager^.dbOrigSize;
+  rc := sqlite3WalUndo(pPager^.pWal, @pagerUndoCallback, pPager);
+  pList := sqlite3PcacheDirtyList(pPager^.pPCache);
+  while (pList <> nil) and (rc = SQLITE_OK) do
+  begin
+    rc := pagerUndoCallback(pPager, pList^.pgno);
+    pList := pList^.pDirty;
+  end;
+  Result := rc;
+end;
+
+{ pager.c ~3179: pagerWalFrames -- write dirty pages to WAL }
+function pagerWalFrames(pPager: PPager; pList: PPgHdr; nTruncate: Pgno;
+                        isCommit: i32): i32;
+var
+  rc      : i32;
+  nList   : i32;
+  p, pPrev: PPgHdr;
+begin
+  rc := SQLITE_OK;
+  nList := 0;
+  if isCommit <> 0 then
+  begin
+    { Remove pages with pgno > nTruncate from the dirty list }
+    pPrev := nil;
+    p := pList;
+    while p <> nil do
+    begin
+      if p^.pgno <= nTruncate then
+      begin
+        pPrev := p;
+        Inc(nList);
+        p := p^.pDirty;
+      end
+      else
+      begin
+        if pPrev <> nil then
+          pPrev^.pDirty := p^.pDirty
+        else
+          pList := p^.pDirty;
+        p := p^.pDirty;
+      end;
+    end;
+  end
+  else
+    nList := 1;
+
+  Inc(pPager^.aStat[PAGER_STAT_WRITE], nList);
+
+  if pList^.pgno = 1 then pager_write_changecounter(pList);
+  rc := sqlite3WalFrames(pPager^.pWal, pPager^.pageSize, pList,
+                         nTruncate, isCommit, pPager^.walSyncFlags);
+  Result := rc;
 end;
 
 { pager.c ~3021: readDbPage }
@@ -1687,14 +1902,29 @@ var
   rc      : i32;
   iOffset : i64;
   pDbVers : Pu8;
+  iFrame  : u32;
 begin
   pPgr := pPg^.pPager;
   rc := SQLITE_OK;
+  iFrame := 0;
 
-  { WAL not ported; always read from fd }
-  iOffset := (pPg^.pgno - 1) * i64(pPgr^.pageSize);
-  rc := sqlite3OsRead(pPgr^.fd, pPg^.pData, pPgr^.pageSize, iOffset);
-  if rc = SQLITE_IOERR_SHORT_READ then rc := SQLITE_OK;
+  if pagerUseWal(pPgr) <> 0 then
+  begin
+    rc := sqlite3WalFindFrame(pPgr^.pWal, pPg^.pgno, @iFrame);
+    if rc <> SQLITE_OK then Exit(rc);
+    if iFrame <> 0 then
+    begin
+      rc := sqlite3WalReadFrame(pPgr^.pWal, iFrame, pPgr^.pageSize,
+                                Pu8(pPg^.pData));
+      { fall through to page-1 version-byte update below }
+    end;
+  end;
+  if iFrame = 0 then
+  begin
+    iOffset := (pPg^.pgno - 1) * i64(pPgr^.pageSize);
+    rc := sqlite3OsRead(pPgr^.fd, pPg^.pData, pPgr^.pageSize, iOffset);
+    if rc = SQLITE_IOERR_SHORT_READ then rc := SQLITE_OK;
+  end;
 
   if pPg^.pgno = 1 then
   begin
@@ -1924,7 +2154,8 @@ end;
 { pager.c ~3331: sqlite3PagerLockingMode }
 function sqlite3PagerLockingMode(pPager: PPager; eMode: i32): i32;
 begin
-  if eMode >= 0 then
+  if (eMode >= 0) and (pPager^.tempFile = 0)
+  and (sqlite3WalHeapMemory(pPager^.pWal) = 0) then
     pPager^.exclusiveMode := u8(eMode);
   Result := pPager^.exclusiveMode;
 end;
@@ -2196,7 +2427,12 @@ begin
   if db = nil then;
   pagerFreeMapHdrs(pPager);
   pPager^.exclusiveMode := 0;
-  { WAL not ported: sqlite3WalClose stub }
+  if pPager^.pWal <> nil then
+  begin
+    sqlite3WalClose(pPager^.pWal, db, pPager^.walSyncFlags,
+                    pPager^.pageSize, Pu8(pPager^.pTmpSpace));
+    pPager^.pWal := nil;
+  end;
   pager_reset(pPager);
   if pPager^.memDb <> 0 then
     pager_unlock(pPager)
@@ -2375,7 +2611,8 @@ begin
     rc := pagerOpenWalIfPresent(pPager);
   end;
 
-  { WAL read transaction: pPager^.pWal is always nil in this phase }
+  if (rc = SQLITE_OK) and (pagerUseWal(pPager) <> 0) then
+    rc := pagerBeginReadTransaction(pPager);
 
   if (pPager^.tempFile = 0) and (pPager^.eState = PAGER_OPEN) and (rc = SQLITE_OK) then
     rc := pagerPagecount(pPager, @pPager^.dbSize);
@@ -2562,11 +2799,10 @@ begin
   Result := pPager^.sectorSize;
 end;
 
-{ pagerUseWal: always 0 in Phase 3.B.2b (WAL ported in 3.B.3) }
+{ pager.c ~829: pagerUseWal }
 function pagerUseWal(pPager: PPager): i32; inline;
 begin
-  Result := 0;
-  if pPager = nil then;
+  if pPager^.pWal <> nil then Result := 1 else Result := 0;
 end;
 
 { pager.c ~1099: read32bits }
@@ -3474,10 +3710,10 @@ begin
     sqlite3PcacheTruncate(pPager^.pPCache, pPager^.dbSize);
   end;
 
-  if (rc = SQLITE_OK) and (bCommit <> 0) and (pPager^.dbFileSize > pPager^.dbSize) then
-  begin
+  if pagerUseWal(pPager) <> 0 then
+    rc2 := sqlite3WalEndWriteTransaction(pPager^.pWal)
+  else if (rc = SQLITE_OK) and (bCommit <> 0) and (pPager^.dbFileSize > pPager^.dbSize) then
     rc := pager_truncate(pPager, pPager^.dbSize);
-  end;
 
   if rc = SQLITE_OK then
   begin
@@ -3485,7 +3721,9 @@ begin
     if rc = SQLITE_NOTFOUND then rc := SQLITE_OK;
   end;
 
-  if (pPager^.exclusiveMode = 0) then
+  if (pPager^.exclusiveMode = 0)
+  and ((pagerUseWal(pPager) = 0)
+       or (sqlite3WalExclusiveMode(pPager^.pWal, 0) = 0)) then
     rc2 := pagerUnlockDb(pPager, SHARED_LOCK);
 
   pPager^.eState  := PAGER_READER;
@@ -3710,9 +3948,24 @@ begin
   pPager^.subjInMemory := u8(subjInMemory);
   if pPager^.eState = PAGER_READER then
   begin
-    rc := pagerLockDb(pPager, RESERVED_LOCK);
-    if (rc = SQLITE_OK) and (exFlag <> 0) then
-      rc := pager_wait_on_lock(pPager, EXCLUSIVE_LOCK);
+    if pagerUseWal(pPager) <> 0 then
+    begin
+      if (pPager^.exclusiveMode <> 0)
+      and (sqlite3WalExclusiveMode(pPager^.pWal, -1) <> 0) then
+      begin
+        rc := pagerLockDb(pPager, EXCLUSIVE_LOCK);
+        if rc = SQLITE_OK then
+          sqlite3WalExclusiveMode(pPager^.pWal, 1);
+        if rc <> SQLITE_OK then Exit(rc);
+      end;
+      rc := sqlite3WalBeginWriteTransaction(pPager^.pWal);
+    end
+    else
+    begin
+      rc := pagerLockDb(pPager, RESERVED_LOCK);
+      if (rc = SQLITE_OK) and (exFlag <> 0) then
+        rc := pager_wait_on_lock(pPager, EXCLUSIVE_LOCK);
+    end;
 
     if rc = SQLITE_OK then
     begin
@@ -3963,43 +4216,63 @@ function sqlite3PagerCommitPhaseOne(pPager: PPager; zSuper: PChar;
 label
   commit_phase_one_exit;
 var
-  rc: i32;
-  pList: PPgHdr;
+  rc       : i32;
+  pList    : PPgHdr;
+  pPageOne : PPgHdr;
 begin
   rc := SQLITE_OK;
+  pPageOne := nil;
   if pPager^.errCode <> 0 then Exit(pPager^.errCode);
   if pPager^.eState < PAGER_WRITER_CACHEMOD then Exit(SQLITE_OK);
 
   if pagerFlushOnCommit(pPager, 1) = 0 then
   begin
-    { No pages to write; just restart any backup }
     Exit(SQLITE_OK);
   end;
 
-  { Non-WAL rollback path }
-  rc := pager_incr_changecounter(pPager, 0);
-  if rc <> SQLITE_OK then goto commit_phase_one_exit;
-
-  rc := writeSuperJournal(pPager, zSuper);
-  if rc <> SQLITE_OK then goto commit_phase_one_exit;
-
-  rc := syncJournal(pPager, 0);
-  if rc <> SQLITE_OK then goto commit_phase_one_exit;
-
-  pList := sqlite3PcacheDirtyList(pPager^.pPCache);
-  rc := pager_write_pagelist(pPager, pList);
-  if rc <> SQLITE_OK then goto commit_phase_one_exit;
-
-  sqlite3PcacheCleanAll(pPager^.pPCache);
-
-  if pPager^.dbSize > pPager^.dbFileSize then
+  if pagerUseWal(pPager) <> 0 then
   begin
-    rc := pager_truncate(pPager, pPager^.dbSize);
+    { WAL commit path }
+    pList := sqlite3PcacheDirtyList(pPager^.pPCache);
+    if pList = nil then
+    begin
+      rc := sqlite3PagerGet(pPager, 1, @pPageOne, 0);
+      pList := pPageOne;
+      if pList <> nil then pList^.pDirty := nil;
+    end;
+    if (rc = SQLITE_OK) and (pList <> nil) then
+      rc := pagerWalFrames(pPager, pList, pPager^.dbSize, 1);
+    sqlite3PagerUnref(pPageOne);
+    if rc = SQLITE_OK then
+      sqlite3PcacheCleanAll(pPager^.pPCache);
+  end
+  else
+  begin
+    { Non-WAL rollback path }
+    rc := pager_incr_changecounter(pPager, 0);
     if rc <> SQLITE_OK then goto commit_phase_one_exit;
-  end;
 
-  if noSync = 0 then
-    rc := sqlite3PagerSync(pPager, zSuper);
+    rc := writeSuperJournal(pPager, zSuper);
+    if rc <> SQLITE_OK then goto commit_phase_one_exit;
+
+    rc := syncJournal(pPager, 0);
+    if rc <> SQLITE_OK then goto commit_phase_one_exit;
+
+    pList := sqlite3PcacheDirtyList(pPager^.pPCache);
+    rc := pager_write_pagelist(pPager, pList);
+    if rc <> SQLITE_OK then goto commit_phase_one_exit;
+
+    sqlite3PcacheCleanAll(pPager^.pPCache);
+
+    if pPager^.dbSize > pPager^.dbFileSize then
+    begin
+      rc := pager_truncate(pPager, pPager^.dbSize);
+      if rc <> SQLITE_OK then goto commit_phase_one_exit;
+    end;
+
+    if noSync = 0 then
+      rc := sqlite3PagerSync(pPager, zSuper);
+  end;
 
 commit_phase_one_exit:
   if (rc = SQLITE_OK) and (pagerUseWal(pPager) = 0) then
@@ -4037,7 +4310,13 @@ begin
   if pPager^.eState = PAGER_ERROR then Exit(pPager^.errCode);
   if pPager^.eState <= PAGER_READER then Exit(SQLITE_OK);
 
-  if (isOpen(pPager^.jfd) = 0) or (pPager^.eState = PAGER_WRITER_LOCKED) then
+  if pagerUseWal(pPager) <> 0 then
+  begin
+    rc := pagerRollbackWal(pPager);
+    if rc = SQLITE_OK then
+      rc := pager_end_transaction(pPager, 0, 0);
+  end
+  else if (isOpen(pPager^.jfd) = 0) or (pPager^.eState = PAGER_WRITER_LOCKED) then
   begin
     eState := pPager^.eState;
     rc := pager_end_transaction(pPager, 0, 0);
@@ -4086,6 +4365,8 @@ begin
     p^.iSubRec := pPager^.nSubRec;
     p^.pInSavepoint := sqlite3BitvecCreate(pPager^.dbSize);
     p^.bTruncateOnRelease := 1;
+    if pagerUseWal(pPager) <> 0 then
+      sqlite3WalSavepoint(pPager^.pWal, @p^.aWalData[0]);
     if p^.pInSavepoint = nil then Exit(SQLITE_NOMEM);
     pPager^.nSavepoint := ii + 1;
     Inc(ii);
@@ -4136,13 +4417,16 @@ begin
           pPager^.nSubRec := pRel^.iSubRec;
         end;
       end
-      else if isOpen(pPager^.jfd) <> 0 then
+      else
       begin
         if nNew > 0 then
           pSavepoint := PPagerSavepoint(PByte(pPager^.aSavepoint) + (nNew - 1) * SizeOf(PagerSavepoint))
         else
           pSavepoint := nil;
-        rc := pagerPlaybackSavepoint(pPager, pSavepoint);
+        if (pSavepoint <> nil) and (pagerUseWal(pPager) <> 0) then
+          rc := sqlite3WalSavepointUndo(pPager^.pWal, @pSavepoint^.aWalData[0]);
+        if (rc = SQLITE_OK) and (isOpen(pPager^.jfd) <> 0) then
+          rc := pagerPlaybackSavepoint(pPager, pSavepoint);
       end;
     end;
   end;
@@ -4200,6 +4484,37 @@ begin
   Result := perPageSize * sqlite3PcachePagecount(pPager^.pPCache)
            + i32(sqlite3MallocSize(pPager))
            + i32(pPager^.pageSize);
+end;
+
+{ pager.c ~7518: sqlite3PagerCheckpoint }
+function sqlite3PagerCheckpoint(pPager: PPager; db: Pointer; eMode: i32;
+                                xBusy: TxBusyCallback; pBusyArg: Pointer;
+                                pnLog: PcInt; pnCkpt: PcInt): i32;
+var
+  rc: i32;
+begin
+  rc := SQLITE_OK;
+  if pPager^.pWal <> nil then
+    rc := sqlite3WalCheckpoint(pPager^.pWal, db, eMode,
+          xBusy, pBusyArg,
+          pPager^.walSyncFlags, pPager^.pageSize,
+          Pu8(pPager^.pTmpSpace), pnLog, pnCkpt);
+  Result := rc;
+end;
+
+{ pager.c ~7541: sqlite3PagerWalCallback }
+function sqlite3PagerWalCallback(pPager: PPager): i32;
+begin
+  Result := sqlite3WalCallback(pPager^.pWal);
+end;
+
+{ pager.c ~7121: sqlite3PagerWalFile }
+function sqlite3PagerWalFile(pPager: PPager): Psqlite3_file;
+begin
+  if pPager^.pWal <> nil then
+    Result := sqlite3WalFile(pPager^.pWal)
+  else
+    Result := pPager^.jfd;
 end;
 
 { updated pagerStress -- now calls syncJournal and pager_write_pagelist }

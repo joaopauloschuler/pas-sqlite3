@@ -602,8 +602,8 @@ begin
   end;
 
   ppPage^ := (pWal^.apWiData + iPage)^;
-  if (ppPage^ = nil) and (Result = SQLITE_OK) then
-    Result := SQLITE_ERROR;
+  { A nil page with SQLITE_OK is valid: SHM file too small and bExtend=0.
+    The caller (walIndexReadHdr) handles nil page via badHdr=1 path. }
 end;
 
 function walIndexPage(pWal: PWal; iPage: cint; ppPage: PPu32): cint;

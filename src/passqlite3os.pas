@@ -2144,7 +2144,8 @@ begin
     sqlite3_mutex_free(p^.pShmMutex);
   if p^.hShm >= 0 then
     FpClose(p^.hShm);
-  sqlite3_free(p^.zFilename);
+  { zFilename is NOT freed separately: it lives in the extra bytes of the
+    pShmNode allocation (see unixOpenSharedMemory). sqlite3_free(p) frees all. }
   sqlite3_free(p);
   pDbFd^.pInode^.pShmNode := nil;
 end;
@@ -2154,8 +2155,9 @@ end;
   Returns SQLITE_OK, SQLITE_BUSY, SQLITE_READONLY_CANTINIT, or SQLITE_IOERR_LOCK. }
 function unixLockSharedMemory(pDbFd: PunixFile; pShmNode: PunixShmNode): cint;
 var
-  lock : FLock;
-  rc   : cint;
+  lock    : FLock;
+  rc      : cint;
+  shmStat : Stat;
 begin
   rc := SQLITE_OK;
   lock.l_whence := SEEK_SET;
@@ -2182,9 +2184,17 @@ begin
     rc := unixShmSystemLock(pDbFd, F_WRLCK, UNIX_SHM_DMS, 1);
     if rc = SQLITE_OK then
     begin
-      { Truncate to 3 bytes to signal fresh initialization }
-      if FpFtruncate(pShmNode^.hShm, 3) <> 0 then
-        rc := SQLITE_IOERR_SHMOPEN;
+      { Only truncate when the SHM is truly empty (<= 3 bytes).
+        F_GETLK does not report locks held by the calling process
+        (Linux POSIX advisory lock semantics), so when two connections
+        in the same process race here the second one sees F_UNLCK and
+        would incorrectly truncate an already-initialized SHM.
+        Checking the file size is the reliable in-process proxy. }
+      if (FpFStat(pShmNode^.hShm, shmStat) <> 0) or (shmStat.st_size <= 3) then
+      begin
+        if FpFtruncate(pShmNode^.hShm, 3) <> 0 then
+          rc := SQLITE_IOERR_SHMOPEN;
+      end;
     end;
   end
   else if lock.l_type = SmallInt(F_WRLCK) then
