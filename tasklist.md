@@ -833,9 +833,15 @@ fields, but verify with a SizeOf/offsetof check when TestPagerReadOnly is writte
     FPC hazards resolved: `pgno: Pgno` → `pg: u32`, `pPgHdr: PPgHdr` → `pHdr`,
     `pPagerSavepoint` var renamed to `pSP`, `out ppPage` → `ppPage: PPDbPage`,
     `sqlite3_log` stub (varargs not allowed without cdecl+external).
-  - **3.B.2c** Atomic commit, savepoints, rollback-on-error paths. Gate:
-    simulated crash mid-transaction (truncate `.journal` at random offset)
-    recovers to the same state as C reference.
+  - [X] **3.B.2c** Atomic commit, savepoints, rollback-on-error paths. Gate:
+    `TestPagerCrash.pas` — 10/10 PASS (2026-04-22). Tested: multi-page commit
+    atomicity, fork-based crash recovery (hot-journal playback), savepoint
+    rollback, nested savepoint partial rollback, savepoint-release then outer
+    rollback, empty journal, multiple-commit crash, C-reference differential
+    (recovered .db opened by libsqlite3), truncated journal header, rollback-on-error.
+    **Key discovery**: do NOT use page 1 for byte-pattern verification — every
+    commit overwrites bytes 24-27, 92-95, 96-99 of page 1 via
+    `pager_write_changecounter`. Use page 2 or higher for data integrity checks.
 
 - [ ] **3.B.3** Port `wal.c`: the write-ahead log. Sub-phases mirror 3.B.2:
   - **3.B.3a** `sqlite3WalOpen`, `sqlite3WalBeginReadTransaction`, frame read.
@@ -1126,7 +1132,7 @@ loader — *optional for v1*).
 
 ---
 
-## Phase 10 — CLI tool (shell.c ~12k lines) — **very last task**
+## Phase 10 — CLI tool (shell.c ~12k lines)
 
 - [ ] **10.1** Port `shell.c` to `src/passqlite3shell.pas`. Mimic CLI flags,
   dot-commands (`.schema`, `.tables`, `.dump`, `.import`, `.mode`, …), exit
