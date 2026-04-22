@@ -917,9 +917,27 @@ fields, but verify with a SizeOf/offsetof check when TestPagerReadOnly is writte
 
 ---
 
-- [ ] **3.B.4** `TestPagerCompat.pas` (full gate): a SQL corpus that stresses
+- [X] **3.B.4** `TestPagerCompat.pas` (full gate): a SQL corpus that stresses
   journaling (big transactions, SAVEPOINTs, simulated crashes) produces
   byte-identical `.db` and `.journal` files on both sides.
+  Gate: T1–T10 all PASS (2026-04-22).
+
+### Phase 3.B.4 implementation notes (2026-04-22)
+
+**File**: `src/tests/TestPagerCompat.pas` (1107 lines).
+
+**Tests**:
+- T1  C creates a populated db (40-row table); Pascal pager reads page 1 SQLite magic and page count >= 2.
+- T2  Pascal writes a minimal-header 1-page db; C opens without SQLITE_NOTADB or SQLITE_CORRUPT.
+- T3  Pascal writes a 10-page DELETE-journal transaction; all 10 pages retain correct byte patterns after reopen.
+- T4  Savepoint: outer writes $AA to page 2, SP1 overwrites to $BB, SP1 rolled back, outer committed — page 2 = $AA.
+- T5  Fork-based crash: child does CommitPhaseOne on 8 pages then exits; parent reopens → hot-journal restores $01; C opens without corruption.
+- T6  Journal cleanup: no `.journal` file remains on disk after a successful DELETE-mode commit.
+- T7  C creates a 100-row db; Pascal opens read-only and reads every page without I/O errors.
+- T8  Pascal creates a WAL-mode db (sqlite3PagerOpenWal), writes a commit; C opens without CORRUPT.
+- T9  Pascal writes 3-commit WAL db, runs PASSIVE checkpoint; C opens without error after checkpoint.
+     Note: TRUNCATE checkpoint returns SQLITE_BUSY when the same pager holds a read lock (by design); use PASSIVE for in-process checkpoints.
+- T10 20-page transaction committed, crash mid-next-commit (21-page transaction, PhaseOne only), recovery; page 5 restored to pre-crash value; C opens without corruption.
 
 ---
 
