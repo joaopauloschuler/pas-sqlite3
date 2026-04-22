@@ -99,6 +99,42 @@ type
   end;
 
 { ============================================================
+  Section 1.5: Page cache interface types (pcache.h / sqlite3.h)
+  Added in Phase 3.A.
+  ============================================================ }
+
+const
+  SQLITE_CONFIG_PAGECACHE = 7;   { sqlite3_config(SQLITE_CONFIG_PAGECACHE, pBuf, sz, N) }
+  SQLITE_CONFIG_PCACHE2   = 14;  { sqlite3_config(SQLITE_CONFIG_PCACHE2, &methods2) }
+
+type
+  Psqlite3_pcache_page = ^sqlite3_pcache_page;
+  { sqlite3_pcache_page: base-class for a single cache line (sqlite3.h §8455) }
+  sqlite3_pcache_page = record
+    pBuf:   Pointer;   { Page data buffer — szPage bytes }
+    pExtra: Pointer;   { Extra buffer — szExtra bytes; PgHdr lives here }
+  end;
+
+  Tsqlite3_pcache_methods2 = record
+    iVersion:   i32;
+    pArg:       Pointer;
+    xInit:      function(pArg: Pointer): i32;
+    xShutdown:  procedure(pArg: Pointer);
+    xCreate:    function(szPage: i32; szExtra: i32; bPurgeable: i32): Pointer;
+    xCachesize: procedure(p: Pointer; nCachesize: i32);
+    xPagecount: function(p: Pointer): i32;
+    xFetch:     function(p: Pointer; key: u32; createFlag: i32): Psqlite3_pcache_page;
+    xUnpin:     procedure(p: Pointer; pPage: Psqlite3_pcache_page; discard: i32);
+    xRekey:     procedure(p: Pointer; pPage: Psqlite3_pcache_page; oldKey: u32; newKey: u32);
+    xTruncate:  procedure(p: Pointer; iLimit: u32);
+    xDestroy:   procedure(p: Pointer);
+    xShrink:    procedure(p: Pointer);
+  end;
+  PTsqlite3_pcache_methods2 = ^Tsqlite3_pcache_methods2;
+
+  PPsqlite3_pcache_page = ^Psqlite3_pcache_page;
+
+{ ============================================================
   Section 2: Global config record (TSqlite3Config / sqlite3Config)
   Only Phase-2-needed fields are fully ported; the rest are TBD.
   ============================================================ }
@@ -119,7 +155,7 @@ type
     nStmtSpill:       i32;    { Stmt journal spill-to-disk threshold }
     m:                Tsqlite3_mem_methods;   { Low-level memory allocator }
     mutex:            Tsqlite3_mutex_methods; { Low-level mutex interface }
-    { pcache2 — TBD Phase 3 }
+    pcache2:          Tsqlite3_pcache_methods2; { Pluggable page cache module }
     pPage:            Pointer;    { Page cache memory }
     szPage:           i32;        { Size of each page in pPage[] }
     nPage:            i32;        { Number of pages in pPage[] }
@@ -353,6 +389,20 @@ function sqlite3_snprintf(n: i32; zBuf: PChar; zFormat: PChar): PChar; cdecl;
 function sqlite3Utf8Read(pIn: PPChar): u32;
 function sqlite3Utf8CharLen(z: PChar; nByte: i32): i32;
 function sqlite3AppendOneUtf8Character(zOut: PChar; v: u32): i32;
+
+{ Config (main.c §sqlite3_config — minimal Phase 3 stub) }
+function  sqlite3_config(op: i32; pArg: Pointer): i32;
+
+{ Alignment helpers (used by pcache and btree) }
+function ROUND8(n: SizeInt): SizeInt; inline;
+function ROUNDDOWN8(n: SizeInt): SizeInt; inline;
+function SQLITE_WITHIN(p, pStart, pEnd: Pointer): Boolean; inline;
+
+{ Pcache1 mutex getter (set by pcache1Init) }
+function  sqlite3Pcache1Mutex: Psqlite3_mutex;
+
+var
+  gPcache1Mutex: Psqlite3_mutex = nil;  { set by pcache1Init — interface-visible }
 
 implementation
 
@@ -1407,10 +1457,36 @@ begin
   Result := gMallocMutex;
 end;
 
-{ Pcache1 mutex: not yet ported — return same mutex as safety fallback }
+{ Pcache1 mutex: set by pcache1Init in passqlite3pcache.pas }
 function sqlite3Pcache1Mutex: Psqlite3_mutex;
 begin
-  Result := gMallocMutex;
+  Result := gPcache1Mutex;
+end;
+
+function ROUND8(n: SizeInt): SizeInt; inline;
+begin
+  Result := (n + 7) and not 7;
+end;
+
+function ROUNDDOWN8(n: SizeInt): SizeInt; inline;
+begin
+  Result := n and not 7;
+end;
+
+function SQLITE_WITHIN(p, pStart, pEnd: Pointer): Boolean; inline;
+begin
+  Result := (PtrUInt(p) >= PtrUInt(pStart)) and (PtrUInt(p) < PtrUInt(pEnd));
+end;
+
+function sqlite3_config(op: i32; pArg: Pointer): i32;
+begin
+  Result := SQLITE_OK;
+  case op of
+    SQLITE_CONFIG_PCACHE2:
+      if pArg <> nil then
+        sqlite3GlobalConfig.pcache2 := PTsqlite3_pcache_methods2(pArg)^;
+    { All other ops silently accepted for now }
+  end;
 end;
 
 function sqlite3StatusValue(op: i32): i64;

@@ -637,18 +637,70 @@ at the wrong moment will leave the database unrecoverable.
 
 ### 3.A — Page cache (prerequisite for 3.B)
 
-- [ ] **3.A.1** Port `pcache.c`: the generic page-cache interface and the
+- [X] **3.A.1** Port `pcache.c`: the generic page-cache interface and the
   `PgHdr` lifecycle (`sqlite3PcacheFetch`, `sqlite3PcacheRelease`,
   `sqlite3PcacheMakeDirty`, `sqlite3PcacheMakeClean`, eviction).
-- [ ] **3.A.2** Port `pcache1.c`: the default concrete backend (LRU with
+- [X] **3.A.2** Port `pcache1.c`: the default concrete backend (LRU with
   purgeable / unpinned page tracking). This is the allocator-heavy one.
 - [ ] **3.A.3** Port `memjournal.c`: the in-memory journal implementation
   used when `PRAGMA journal_mode=MEMORY` or during `SAVEPOINT`.
 - [ ] **3.A.4** Port `memdb.c`: the `:memory:` database backing — a VFS-shaped
   object over a single in-RAM buffer.
-- [ ] **3.A.5** Gate: `TestPCache.pas` — scripted fetch / release / dirty /
+- [X] **3.A.5** Gate: `TestPCache.pas` — scripted fetch / release / dirty /
   eviction sequences produce identical `PgHdr` state and identical
-  allocation counts vs C reference.
+  allocation counts vs C reference. **All 8 tests pass (T1–T8).**
+
+### Phase 3.A implementation notes (2026-04-22)
+
+**Unit**: `src/passqlite3pcache.pas` (~1280 lines, pcache.c + pcache1.c).
+
+**What was done**:
+- Ported `PgHdr` / `PCache` / `PCache1` / `PGroup` / `PgHdr1` structs and all
+  public `sqlite3Pcache*` functions plus the `pcache1` backend (LRU with
+  purgeable-page tracking, resize-hash, eviction, bulk-local slab allocator).
+- `TestPCache.pas` written: T1–T8 (init+open, fetch, dirty list, ref counting,
+  MakeClean, truncate, close-with-dirty, C-reference differential). All pass.
+
+**Three bugs fixed (all Pascal-specific)**:
+
+1. **`szExtra=0` latent overflow** — C reference calls `memset(pPgHdr->pExtra,0,8)`
+   unconditionally; when `szExtra=0` there is no extra area and this writes past the
+   allocation. Added guard: `if pCache^.szExtra >= 8 then FillChar((pHdr+1)^, 8, 0)`.
+
+2. **`SizeOf(PGroup)` shadowed by local `pGroup: PPGroup` in `pcache1Create`** —
+   Pascal is case-insensitive: a local variable `pGroup: PPGroup` (pointer, 8 bytes)
+   hides the type name `PGroup` (record, 80 bytes). `SizeOf(PGroup)` inside that
+   function returned 8 instead of 80, so `sz = SizeOf(PCache1) + 8` instead of
+   `SizeOf(PCache1) + 80`, allocating only 96 bytes for a 168-byte struct.
+   Writing the full struct overflowed 72 bytes into glibc malloc metadata → crash.
+   Fix: rename local `pGroup → pGrp`.
+
+3. **`SizeOf(PgHdr)` shadowed by local `pgHdr: PPgHdr` in `pcacheFetchFinishWithInit`
+   / `sqlite3PcacheFetchFinish`** — same mechanism; `FillChar(pgHdr^, SizeOf(PgHdr), 0)`
+   only zeroed 8 bytes of the 80-byte `PgHdr` struct, leaving most fields as garbage.
+   Fix: rename local `pgHdr → pHdr`.
+
+4. **Unsigned for-loop underflow in `pcache1ResizeHash`** — C `for(i=0;i<nHash;i++)`
+   naturally skips when `nHash=0`. Pascal `for i := 0 to nHash - 1` with `i: u32`
+   computes `0 - 1 = $FFFFFFFF` (unsigned wrap), running 4 billion iterations and
+   immediately segfaulting on `nil apHash[0]`. Fix: guard the loop with
+   `if p^.nHash > 0 then`.
+
+**CRITICAL PATTERN — applies to all future phases**:
+> Any Pascal function that has a local variable of type `PFoo` (pointer) where
+> `PFoo` is also the name of a record type will silently corrupt `SizeOf(PFoo)`
+> inside that scope (returns pointer size 8 instead of the record size). Always
+> rename local pointer variables to `pFoo` / `pTmp` / anything that doesn't
+> exactly match the type name. Scan every new unit with:
+> `grep -n 'SizeOf(' src/passqlite3*.pas` and verify none of the named types have
+> a same-named local in scope.
+
+**CRITICAL PATTERN — unsigned loop bounds**:
+> Never write `for i := 0 to N - 1` when `i` or `N` is an unsigned type (`u32`).
+> If `N = 0`, the subtraction wraps to `$FFFFFFFF` and the loop runs ~4 billion
+> iterations. Always guard with `if N > 0 then` or use a signed loop variable.
+
+---
 
 ### 3.B — Pager + WAL
 
@@ -1084,6 +1136,21 @@ Apply to every function before marking it done:
     The Pascal port inherits the same model — every API entry point acquires
     the connection mutex. Do not try to port `SQLITE_THREADSAFE=0` first "for
     simplicity"; it changes too many code paths.
+
+15. **`SizeOf` shadowed by same-named pointer local (Pascal case-insensitivity).**
+    If a function has `var pGroup: PPGroup`, then `SizeOf(PGroup)` inside that
+    function returns `SizeOf(PPGroup) = 8` (pointer) instead of the record size.
+    Pascal is case-insensitive; the identifier lookup finds the local variable
+    first. **Rule**: local pointer variables must NOT share their name with any
+    type. Convention: use `pGrp`, `pTmp`, `pHdr`, never exactly `PPGroup → PGroup`.
+    After porting any function, grep for `SizeOf(P` and verify the named type has
+    no same-named local in scope.
+
+16. **Unsigned for-loop underflow.** `for i := 0 to N - 1` is safe only when N > 0.
+    When `i` or `N` is `u32` and `N = 0`, `N - 1 = $FFFFFFFF` → 4 billion
+    iterations → instant crash. In C, `for(i=0; i<N; i++)` skips cleanly.
+    **Rule**: always guard with `if N > 0 then` before such a loop, or rewrite
+    as `i := 0; while i < N do begin ... Inc(i); end`.
 
 ---
 
