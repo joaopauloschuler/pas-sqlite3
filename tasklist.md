@@ -11,6 +11,11 @@ must (a) produce byte-identical `.db` files for the same SQL input, (b) return
 identical query results, and (c) emit the same VDBE bytecode for the same SQL.
 Any deviation is a bug in the port, never an improvement.
 
+Important: At the end of this document, please find:
+* Architectural notes and known pitfalls
+* Per-function porting checklist
+* Key rules for the developer
+
 ---
 
 ## Status summary
