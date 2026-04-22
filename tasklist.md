@@ -1126,18 +1126,28 @@ loader — *optional for v1*).
 
 ---
 
-## Phase 10 — Benchmarks
+## Phase 10 — CLI tool (shell.c ~12k lines) — **very last task**
 
-- [ ] **10.1** `Benchmark.pas`: INSERT throughput (single row, batched in a
+- [ ] **10.1** Port `shell.c` to `src/passqlite3shell.pas`. Mimic CLI flags,
+  dot-commands (`.schema`, `.tables`, `.dump`, `.import`, `.mode`, …), exit
+  codes, and interactive behaviour.
+- [ ] **10.2** Integration: `bin/passqlite3 foo.db` ↔ `sqlite3 foo.db` parity
+  on a scripted corpus of dot-commands.
+
+---
+
+## Phase 11 — Benchmarks
+
+- [ ] **11.1** `Benchmark.pas`: INSERT throughput (single row, batched in a
   transaction), SELECT throughput (primary-key lookup, range scan, indexed
   join), for small (1k rows) / medium (100k) / large (10M) datasets. Compare
   Pascal vs C Mops/s and record the ratio table here.
 
-- [ ] **10.2** Any row worse than ~1.5× gets a TODO under Phase 11.
+- [ ] **11.2** Any row worse than ~1.5× gets a TODO under Phase 11.
 
 ---
 
-## Phase 11 — Performance optimisation (enter only after Phase 10)
+## Phase 12 — Performance optimisation (enter only after Phase 10)
 
 Do not touch this phase until Phase 9 is fully green. Changes here must
 preserve byte-for-byte on-disk parity.
@@ -1147,23 +1157,13 @@ In FPC, functions with asm content can not be inlined.
 
 Use "-dAVX2 -CfAVX2 -CpCOREI -OpCOREI" to compile.
 
-- [ ] **11.1** Profile with `perf record` on the benchmark workloads. Identify
+- [ ] **12.1** Profile with `perf record` on the benchmark workloads. Identify
   top 10 hot functions.
-- [ ] **11.2** Aggressive `inline` on VDBE opcode helpers, varint codecs, and
+- [ ] **12.2** Aggressive `inline` on VDBE opcode helpers, varint codecs, and
   page cell accessors.
-- [ ] **11.3** Consider replacing the VDBE's big `case` with a threaded
+- [ ] **12.3** Consider replacing the VDBE's big `case` with a threaded
   dispatch (computed-goto-style) using `{$GOTO ON}`. Only if profiling shows
   the switch is a bottleneck.
-
----
-
-## Phase 12 — CLI tool (shell.c ~12k lines) — **very last task**
-
-- [ ] **12.1** Port `shell.c` to `src/passqlite3shell.pas`. Mimic CLI flags,
-  dot-commands (`.schema`, `.tables`, `.dump`, `.import`, `.mode`, …), exit
-  codes, and interactive behaviour.
-- [ ] **12.2** Integration: `bin/passqlite3 foo.db` ↔ `sqlite3 foo.db` parity
-  on a scripted corpus of dot-commands.
 
 ---
 
