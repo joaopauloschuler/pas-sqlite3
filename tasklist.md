@@ -990,9 +990,20 @@ storage. Correctness here is again checked by on-disk byte equality.
   - TestPagerReadOnly.pas: fixed pre-existing `PDbPage` / `PPDbPage` call mismatch.
   - Gate: `TestBtreeCompat.pas` T1–T18 all PASS (89 checks, 2026-04-22).
 
-- [ ] **4.3** Port insert path: `sqlite3BtreeInsert`, `balance`, `balance_deeper`,
+- [X] **4.3** Port insert path: `sqlite3BtreeInsert`, `balance`, `balance_deeper`,
   `balance_nonroot`, `balance_quick`. The balancing logic is the most intricate
   part of SQLite — port line by line, no restructuring.
+  - Also ported: `fillInCell`, `freePage2`, `freePage`, `clearCellOverflow`,
+    `allocateBtreePage`, `btreeSetHasContent`, `btreeClearHasContent`,
+    `saveAllCursors`, `btreeOverwriteCell`, `btreeOverwriteContent`,
+    `btreeOverwriteOverflowCell`, `rebuildPage`, `editPage`, `pageInsertArray`,
+    `pageFreeArray`, `populateCellCache`, `computeCellSize`, `cachedCellSize`,
+    `balance_quick`, `copyNodeContent`, `sqlite3PagerRekey`.
+  - FPC fixes: `PPu8` ordering before `TCellArray`; `pgno: Pgno` renamed to `pg`;
+    all C ternary-as-expression idioms converted to explicit if/else; inline `var`
+    declarations moved to proper var sections; `sqlite3Free` → `sqlite3_free`;
+    `Boolean` vs `i32` arguments fixed with `ord()`.
+  - Gate: `TestBtreeCompat.pas` T1–T20 all PASS (100 checks, 2026-04-23).
 
 - [ ] **4.4** Port delete path: `sqlite3BtreeDelete`, `clearCell`, `freePage`,
   free-list management.

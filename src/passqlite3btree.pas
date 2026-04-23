@@ -344,6 +344,16 @@ const
   BTREE_AUXDELETE    = $04;        { Not the primary delete operation }
   BTREE_APPEND       = $08;        { Insert is likely an append }
   BTREE_PREFORMAT    = $80;        { Inserted data is a pre-formatted cell }
+  BTREE_BULKLOAD     = $00000001;  { Used to fill index in sorted order }
+
+  { allocateBtreePage eMode values (btree.c lines 49-51) }
+  BTALLOC_ANY   = 0;
+  BTALLOC_EXACT = 1;
+  BTALLOC_LE    = 2;
+
+  { Balance neighbor counts (btree.c lines 7504-7505) }
+  NN = 1;
+  NB = 3;
 
 { ===========================================================================
   Phase 4.2 opaque type stubs (resolved in later phases)
@@ -354,6 +364,19 @@ type
   { RecordCompare function pointer type }
   TRecordCompare  = function(nKey: i32; pKey: Pointer;
                              pRec: PUnpackedRecord): i32;
+
+  { BtreePayload — content descriptor for sqlite3BtreeInsert (btree.h:307-315) }
+  Psqlite3_value = Pointer;   { sqlite3_value stub — full def in Phase 6 }
+  TBtreePayload = record
+    pKey  : Pointer;         { Key for indexes; NULL for tables }
+    nKey  : i64;             { Key size for indexes; rowid for tables }
+    pData : Pointer;         { Row data for tables }
+    aMem  : Psqlite3_value;  { Unpacked key values (index cursors) }
+    nMem  : u16;             { Number of aMem[] values }
+    nData : i32;             { Size of pData }
+    nZero : i32;             { Extra zero bytes after pData }
+  end;
+  PBtreePayload = ^TBtreePayload;
 
 { ===========================================================================
   Phase 4.2 — page release / cursor lifecycle
@@ -433,6 +456,27 @@ function  sqlite3BtreePrevious(pCur: PBtCursor; flags: i32): i32;
 function  sqlite3VdbeFindCompare(pIdxKey: PUnpackedRecord): TRecordCompare;
 function  sqlite3VdbeRecordCompare(nKey: i32; pKey: Pointer;
                                    pIdxKey: PUnpackedRecord): i32;
+
+{ ===========================================================================
+  Phase 4.3 — Insert path public API
+  =========================================================================== }
+function  sqlite3BtreeInsert(pCur: PBtCursor; const pX: PBtreePayload;
+                              flags: i32; seekResult: i32): i32;
+
+{ Phase 4.3 internal helpers exposed for test access }
+function  saveAllCursors(pBt: PBtShared; iRoot: Pgno; pExcept: PBtCursor): i32;
+function  btreeSetHasContent(pBt: PBtShared; pgno: Pgno): i32;
+function  btreeGetHasContent(pBt: PBtShared; pgno: Pgno): Boolean;
+procedure btreeClearHasContent(pBt: PBtShared);
+function  btreeGetUnusedPage(pBt: PBtShared; pgno: Pgno;
+                              out ppPage: PMemPage; flags: i32): i32;
+function  allocateBtreePage(pBt: PBtShared; out ppPage: PMemPage;
+                             out pPgno: Pgno; nearby: Pgno; eMode: u8): i32;
+function  freePage2(pBt: PBtShared; pMemPage: PMemPage; iPage: Pgno): i32;
+procedure freePage(pPage: PMemPage; pRC: Pi32);
+
+{ sqlite3PagerRekey — wraps sqlite3PcacheMove (used by balance_nonroot) }
+procedure sqlite3PagerRekey(pPg: PDbPage; iNew: Pgno; flags: u16);
 
 implementation
 
@@ -2940,6 +2984,2052 @@ begin
   end;
   Dec(pCur^.ix);
   Result := SQLITE_OK;
+end;
+
+{ ===========================================================================
+  Phase 4.3 — Insert path implementation
+  btree.c functions: btreeSetHasContent, btreeGetHasContent, btreeClearHasContent,
+  saveCursorsOnList, saveAllCursors, invalidateIncrblobCursors, btreeGetUnusedPage,
+  allocateBtreePage, freePage2, freePage, clearCellOverflow, fillInCell,
+  CellArray helpers, rebuildPage, pageInsertArray, pageFreeArray, editPage,
+  balance_quick, copyNodeContent, balance_nonroot, balance_deeper,
+  anotherValidCursor, balance, btreeOverwriteContent, btreeOverwriteOverflowCell,
+  btreeOverwriteCell, sqlite3BtreeInsert
+  =========================================================================== }
+
+{ ---------------------------------------------------------------------------
+  Inline helpers equivalent to C macros
+  --------------------------------------------------------------------------- }
+
+{ PENDING_BYTE_PAGE(pBt) = (PENDING_BYTE / pBt^.pageSize) + 1 }
+function PENDING_BYTE_PAGE(pBt: PBtShared): Pgno; inline;
+begin
+  Result := Pgno(PENDING_BYTE div pBt^.pageSize) + 1;
+end;
+
+{ ISAUTOVACUUM — always 0 in this port (no auto-vacuum) }
+function ISAUTOVACUUM(pBt: PBtShared): Boolean; inline;
+begin
+  Result := pBt^.autoVacuum <> 0;
+end;
+
+{ SQLITE_WITHIN(P,S,E) — is pointer P in [S..E) ? }
+function SQLITE_WITHIN(P, S, E: Pointer): Boolean; inline;
+begin
+  Result := (PtrUInt(P) >= PtrUInt(S)) and (PtrUInt(P) < PtrUInt(E));
+end;
+
+{ SQLITE_OVERFLOW(P,S,E) — does [S..E) span across P? }
+function SQLITE_OVERFLOW_CHK(P, S, E: Pointer): Boolean; inline;
+begin
+  Result := (PtrUInt(S) < PtrUInt(P)) and (PtrUInt(E) > PtrUInt(P));
+end;
+
+{ putVarint32: fast path — if v < 0x80 write 1 byte, else full varint }
+function putVarint32(p: Pu8; v: u32): i32; inline;
+begin
+  if v < $80 then begin
+    p[0] := u8(v);
+    Result := 1;
+  end else
+    Result := sqlite3PutVarint(p, v);
+end;
+
+{ getVarint32: fast path — if first byte < 0x80 read 1 byte, else full }
+function getVarint32(p: Pu8; out v: u32): u8; inline;
+begin
+  if p[0] < $80 then begin
+    v := p[0];
+    Result := 1;
+  end else
+    Result := sqlite3GetVarint32(p, v);
+end;
+
+{ sqlite3StackAllocRaw / sqlite3StackFree — just heap alloc (no VdbeStack) }
+function sqlite3StackAllocRaw(db: Pointer; sz: u64): Pointer;
+begin
+  Result := sqlite3Malloc(i32(sz));
+end;
+
+procedure sqlite3StackFree(db: Pointer; p: Pointer);
+begin
+  sqlite3_free(p);
+end;
+
+{ sqlite3AbsInt32 — absolute value of i32 }
+function sqlite3AbsInt32(x: i32): i32; inline;
+begin
+  if x < 0 then Result := -x else Result := x;
+end;
+
+{ sqlite3PagerRekey — change page number in the page cache }
+procedure sqlite3PagerRekey(pPg: PDbPage; iNew: Pgno; flags: u16);
+begin
+  pPg^.flags := flags;
+  sqlite3PcacheMove(pPg, iNew);
+end;
+
+{ ---------------------------------------------------------------------------
+  Auto-vacuum stubs — ISAUTOVACUUM is always false in this port
+  --------------------------------------------------------------------------- }
+
+procedure ptrmapPut(pBt: PBtShared; key: Pgno; eType: u8; parent: Pgno;
+                    pRC: Pi32);
+begin
+  { auto-vacuum not supported in this port }
+end;
+
+function ptrmapGet(pBt: PBtShared; key: Pgno; out pEType: u8;
+                   out pPgno: Pgno): i32;
+begin
+  pEType := 0;
+  pPgno  := 0;
+  Result := SQLITE_OK;
+end;
+
+function setChildPtrmaps(pPage: PMemPage): i32;
+begin
+  Result := SQLITE_OK;
+end;
+
+{ ---------------------------------------------------------------------------
+  btreeSetHasContent / btreeGetHasContent / btreeClearHasContent
+  btree.c lines 651-685
+  --------------------------------------------------------------------------- }
+
+function btreeSetHasContent(pBt: PBtShared; pgno: Pgno): i32;
+begin
+  Result := SQLITE_OK;
+  if pBt^.pHasContent = nil then begin
+    pBt^.pHasContent := sqlite3BitvecCreate(pBt^.nPage);
+    if pBt^.pHasContent = nil then begin
+      Result := SQLITE_NOMEM_BKPT;
+      Exit;
+    end;
+  end;
+  if pgno <= sqlite3BitvecSize(pBt^.pHasContent) then
+    Result := sqlite3BitvecSet(pBt^.pHasContent, pgno);
+end;
+
+function btreeGetHasContent(pBt: PBtShared; pgno: Pgno): Boolean;
+var
+  p: PBitvec;
+begin
+  p := pBt^.pHasContent;
+  Result := (p <> nil) and
+            ((pgno > sqlite3BitvecSize(p)) or
+             (sqlite3BitvecTestNotNull(p, pgno) <> 0));
+end;
+
+procedure btreeClearHasContent(pBt: PBtShared);
+begin
+  sqlite3BitvecDestroy(pBt^.pHasContent);
+  pBt^.pHasContent := nil;
+end;
+
+{ ---------------------------------------------------------------------------
+  saveCursorsOnList / saveAllCursors
+  btree.c lines 806-843
+  --------------------------------------------------------------------------- }
+
+function saveCursorsOnList(p: PBtCursor; iRoot: Pgno;
+                            pExcept: PBtCursor): i32;
+var
+  rc: i32;
+begin
+  Result := SQLITE_OK;
+  repeat
+    if (p <> pExcept) and ((iRoot = 0) or (p^.pgnoRoot = iRoot)) then begin
+      if (p^.eState = CURSOR_VALID) or (p^.eState = CURSOR_SKIPNEXT) then begin
+        rc := saveCursorPosition(p);
+        if rc <> SQLITE_OK then begin
+          Result := rc;
+          Exit;
+        end;
+      end else
+        btreeReleaseAllCursorPages(p);
+    end;
+    p := p^.pNext;
+  until p = nil;
+end;
+
+function saveAllCursors(pBt: PBtShared; iRoot: Pgno;
+                         pExcept: PBtCursor): i32;
+var
+  p: PBtCursor;
+begin
+  p := pBt^.pCursor;
+  while p <> nil do begin
+    if (p <> pExcept) and ((iRoot = 0) or (p^.pgnoRoot = iRoot)) then
+      Break;
+    p := p^.pNext;
+  end;
+  if p <> nil then begin
+    Result := saveCursorsOnList(p, iRoot, pExcept);
+    Exit;
+  end;
+  if pExcept <> nil then
+    pExcept^.curFlags := pExcept^.curFlags and (not BTCF_Multiple);
+  Result := SQLITE_OK;
+end;
+
+{ invalidateIncrblobCursors — stub (SQLITE_OMIT_INCRBLOB) }
+procedure invalidateIncrblobCursors(p: PBtree; pgnoRoot: Pgno;
+                                    iRow: i64; isClearTable: i32);
+begin
+  { Incrblob not supported in this port }
+end;
+
+{ ---------------------------------------------------------------------------
+  btreeGetUnusedPage
+  btree.c lines 2449-2467
+  --------------------------------------------------------------------------- }
+
+function btreeGetUnusedPage(pBt: PBtShared; pgno: Pgno;
+                             out ppPage: PMemPage; flags: i32): i32;
+var
+  rc: i32;
+begin
+  rc := btreeGetPage(pBt, pgno, ppPage, flags);
+  if rc = SQLITE_OK then begin
+    if sqlite3PcachePageRefcount(ppPage^.pDbPage) > 1 then begin
+      releasePage(ppPage);
+      ppPage := nil;
+      Result := SQLITE_CORRUPT_BKPT;
+      Exit;
+    end;
+    ppPage^.isInit := 0;
+  end else
+    ppPage := nil;
+  Result := rc;
+end;
+
+{ ---------------------------------------------------------------------------
+  allocateBtreePage
+  btree.c lines 6499-6807
+  --------------------------------------------------------------------------- }
+
+function allocateBtreePage(pBt: PBtShared; out ppPage: PMemPage;
+                            out pPgno: Pgno; nearby: Pgno; eMode: u8): i32;
+var
+  pPage1   : PMemPage;
+  rc       : i32;
+  n        : u32;
+  k        : u32;
+  pTrunk   : PMemPage;
+  pPrevTrunk: PMemPage;
+  mxPage   : Pgno;
+  iTrunk   : Pgno;
+  iPage    : Pgno;
+  nSearch  : u32;
+  closest  : u32;
+  noContent: i32;
+  bNoContent: i32;
+  aData    : Pu8;
+  i        : u32;
+  dist, d2 : i32;
+  iNewTrunk: Pgno;
+  pNewTrunk: PMemPage;
+label
+  end_allocate_page;
+begin
+  pTrunk    := nil;
+  pPrevTrunk := nil;
+  ppPage    := nil;
+  pPgno     := 0;
+  pPage1    := pBt^.pPage1;
+  mxPage    := btreePagecount(pBt);
+  n := sqlite3Get4byte(@pPage1^.aData[36]);
+  if n >= mxPage then begin
+    Result := SQLITE_CORRUPT_BKPT;
+    Exit;
+  end;
+
+  rc := SQLITE_OK;
+  if n > 0 then begin
+    { Reuse a page from the freelist }
+    nSearch := 0;
+    rc := sqlite3PagerWrite(pPage1^.pDbPage);
+    if rc <> SQLITE_OK then begin
+      Result := rc;
+      Exit;
+    end;
+    sqlite3Put4byte(@pPage1^.aData[36], n - 1);
+
+    repeat
+      pPrevTrunk := pTrunk;
+      if pPrevTrunk <> nil then
+        iTrunk := sqlite3Get4byte(@pPrevTrunk^.aData[0])
+      else
+        iTrunk := sqlite3Get4byte(@pPage1^.aData[32]);
+
+      Inc(nSearch);
+      if (iTrunk > mxPage) or (nSearch > n) then begin
+        rc := SQLITE_CORRUPT_BKPT;
+      end else
+        rc := btreeGetUnusedPage(pBt, iTrunk, pTrunk, 0);
+
+      if rc <> SQLITE_OK then begin
+        pTrunk := nil;
+        goto end_allocate_page;
+      end;
+
+      k := sqlite3Get4byte(@pTrunk^.aData[4]);
+      if k = 0 then begin
+        { Trunk has no leaves — use trunk page itself }
+        rc := sqlite3PagerWrite(pTrunk^.pDbPage);
+        if rc <> SQLITE_OK then
+          goto end_allocate_page;
+        pPgno := iTrunk;
+        Move(pTrunk^.aData[0], pPage1^.aData[32], 4);
+        ppPage := pTrunk;
+        pTrunk := nil;
+      end else if k > (pBt^.usableSize div 4 - 2) then begin
+        rc := SQLITE_CORRUPT_BKPT;
+        goto end_allocate_page;
+      end else begin
+        { Extract a leaf from trunk }
+        aData := pTrunk^.aData;
+        if nearby > 0 then begin
+          closest := 0;
+          if eMode = BTALLOC_LE then begin
+            i := 0;
+            while i < k do begin
+              iPage := sqlite3Get4byte(@aData[8 + i * 4]);
+              if iPage <= nearby then begin
+                closest := i;
+                Break;
+              end;
+              Inc(i);
+            end;
+          end else begin
+            dist := sqlite3AbsInt32(i32(sqlite3Get4byte(@aData[8])) - i32(nearby));
+            i := 1;
+            while i < k do begin
+              d2 := sqlite3AbsInt32(i32(sqlite3Get4byte(@aData[8 + i * 4])) - i32(nearby));
+              if d2 < dist then begin
+                closest := i;
+                dist := d2;
+              end;
+              Inc(i);
+            end;
+          end;
+        end else
+          closest := 0;
+
+        iPage := sqlite3Get4byte(@aData[8 + closest * 4]);
+        if (iPage > mxPage) or (iPage < 2) then begin
+          rc := SQLITE_CORRUPT_BKPT;
+          goto end_allocate_page;
+        end;
+        pPgno := iPage;
+        rc := sqlite3PagerWrite(pTrunk^.pDbPage);
+        if rc <> SQLITE_OK then
+          goto end_allocate_page;
+        if closest < k - 1 then
+          Move(aData[4 + k * 4], aData[8 + closest * 4], 4);
+        sqlite3Put4byte(@aData[4], k - 1);
+        if btreeGetHasContent(pBt, pPgno) then
+          noContent := 0
+        else
+          noContent := PAGER_GET_NOCONTENT;
+        rc := btreeGetUnusedPage(pBt, pPgno, ppPage, noContent);
+        if rc = SQLITE_OK then begin
+          rc := sqlite3PagerWrite(ppPage^.pDbPage);
+          if rc <> SQLITE_OK then begin
+            releasePage(ppPage);
+            ppPage := nil;
+          end;
+        end;
+      end;
+      releasePage(pPrevTrunk);
+      pPrevTrunk := nil;
+    until True; { loop runs once when not searching; no searchList needed without autovacuum }
+  end else begin
+    { No free pages — extend the database }
+    if pBt^.bDoTruncate <> 0 then
+      bNoContent := 0
+    else
+      bNoContent := PAGER_GET_NOCONTENT;
+
+    rc := sqlite3PagerWrite(pBt^.pPage1^.pDbPage);
+    if rc <> SQLITE_OK then begin
+      Result := rc;
+      Exit;
+    end;
+    Inc(pBt^.nPage);
+    if pBt^.nPage = PENDING_BYTE_PAGE(pBt) then
+      Inc(pBt^.nPage);
+    sqlite3Put4byte(@pBt^.pPage1^.aData[28], pBt^.nPage);
+    pPgno := pBt^.nPage;
+    rc := btreeGetUnusedPage(pBt, pPgno, ppPage, bNoContent);
+    if rc <> SQLITE_OK then begin
+      Result := rc;
+      Exit;
+    end;
+    rc := sqlite3PagerWrite(ppPage^.pDbPage);
+    if rc <> SQLITE_OK then begin
+      releasePage(ppPage);
+      ppPage := nil;
+    end;
+  end;
+
+end_allocate_page:
+  releasePage(pTrunk);
+  releasePage(pPrevTrunk);
+  Result := rc;
+end;
+
+{ ---------------------------------------------------------------------------
+  freePage2 / freePage
+  btree.c lines 6821-6959
+  --------------------------------------------------------------------------- }
+
+function freePage2(pBt: PBtShared; pMemPage: PMemPage; iPage: Pgno): i32;
+var
+  pTrunk  : PMemPage;
+  iTrunk  : Pgno;
+  pPage1  : PMemPage;
+  pPage   : PMemPage;
+  rc      : i32;
+  nFree   : u32;
+  nLeaf   : u32;
+label
+  freepage_out;
+begin
+  pTrunk := nil;
+  pPage1 := pBt^.pPage1;
+  pPage  := nil;
+  rc     := SQLITE_OK;
+
+  if (iPage < 2) or (iPage > pBt^.nPage) then begin
+    Result := SQLITE_CORRUPT_BKPT;
+    Exit;
+  end;
+
+  if pMemPage <> nil then begin
+    pPage := pMemPage;
+    sqlite3PagerRef(pPage^.pDbPage);
+  end else
+    pPage := btreePageLookup(pBt, iPage);
+
+  { Increment free page count on page 1 }
+  rc := sqlite3PagerWrite(pPage1^.pDbPage);
+  if rc <> SQLITE_OK then goto freepage_out;
+  nFree := sqlite3Get4byte(@pPage1^.aData[36]);
+  sqlite3Put4byte(@pPage1^.aData[36], nFree + 1);
+
+  if (pBt^.btsFlags and BTS_SECURE_DELETE) <> 0 then begin
+    { Secure delete: zero the page }
+    if (pPage = nil) then begin
+      rc := btreeGetPage(pBt, iPage, pPage, 0);
+      if rc <> SQLITE_OK then goto freepage_out;
+    end;
+    rc := sqlite3PagerWrite(pPage^.pDbPage);
+    if rc <> SQLITE_OK then goto freepage_out;
+    FillChar(pPage^.aData^, pBt^.pageSize, 0);
+  end;
+
+  { Auto-vacuum ptrmap update (no-op in this port) }
+  if ISAUTOVACUUM(pBt) then begin
+    ptrmapPut(pBt, iPage, PTRMAP_FREEPAGE, 0, @rc);
+    if rc <> SQLITE_OK then goto freepage_out;
+  end;
+
+  { Add as leaf to existing trunk, or make a new trunk }
+  if nFree <> 0 then begin
+    iTrunk := sqlite3Get4byte(@pPage1^.aData[32]);
+    if iTrunk > btreePagecount(pBt) then begin
+      rc := SQLITE_CORRUPT_BKPT;
+      goto freepage_out;
+    end;
+    rc := btreeGetPage(pBt, iTrunk, pTrunk, 0);
+    if rc <> SQLITE_OK then goto freepage_out;
+    nLeaf := sqlite3Get4byte(@pTrunk^.aData[4]);
+    if nLeaf > (pBt^.usableSize div 4 - 2) then begin
+      rc := SQLITE_CORRUPT_BKPT;
+      goto freepage_out;
+    end;
+    if nLeaf < (pBt^.usableSize div 4 - 8) then begin
+      { Room on trunk: add as leaf }
+      rc := sqlite3PagerWrite(pTrunk^.pDbPage);
+      if rc = SQLITE_OK then begin
+        sqlite3Put4byte(@pTrunk^.aData[4], nLeaf + 1);
+        sqlite3Put4byte(@pTrunk^.aData[8 + nLeaf * 4], iPage);
+        if (pPage <> nil) and ((pBt^.btsFlags and BTS_SECURE_DELETE) = 0) then
+          sqlite3PagerDontWrite(pPage^.pDbPage);
+        rc := btreeSetHasContent(pBt, iPage);
+      end;
+      goto freepage_out;
+    end;
+  end else
+    iTrunk := 0;
+
+  { Make iPage the new trunk }
+  if pPage = nil then begin
+    rc := btreeGetPage(pBt, iPage, pPage, 0);
+    if rc <> SQLITE_OK then goto freepage_out;
+  end;
+  rc := sqlite3PagerWrite(pPage^.pDbPage);
+  if rc <> SQLITE_OK then goto freepage_out;
+  sqlite3Put4byte(@pPage^.aData[0], iTrunk);
+  sqlite3Put4byte(@pPage^.aData[4], 0);
+  sqlite3Put4byte(@pPage1^.aData[32], iPage);
+
+freepage_out:
+  if pPage <> nil then
+    pPage^.isInit := 0;
+  releasePage(pPage);
+  releasePage(pTrunk);
+  Result := rc;
+end;
+
+procedure freePage(pPage: PMemPage; pRC: Pi32);
+begin
+  if pRC^ = SQLITE_OK then
+    pRC^ := freePage2(pPage^.pBt, pPage, pPage^.pgno);
+end;
+
+{ ---------------------------------------------------------------------------
+  clearCellOverflow — free overflow pages for a cell
+  btree.c lines 6964-7030
+  --------------------------------------------------------------------------- }
+
+function clearCellOverflow(pPage: PMemPage; pCell: Pu8;
+                            pInfo: PCellInfo): i32;
+var
+  pBt         : PBtShared;
+  ovflPgno    : Pgno;
+  rc          : i32;
+  nOvfl       : i32;
+  ovflPageSize: u32;
+  iNext       : Pgno;
+  pOvfl       : PMemPage;
+begin
+  pBt := pPage^.pBt;
+  if PtrUInt(pCell + pInfo^.nSize) > PtrUInt(pPage^.aDataEnd) then begin
+    Result := CORRUPT_PAGE(pPage);
+    Exit;
+  end;
+  ovflPgno := sqlite3Get4byte(pCell + pInfo^.nSize - 4);
+  ovflPageSize := pBt^.usableSize - 4;
+  nOvfl := i32((u32(pInfo^.nPayload) - pInfo^.nLocal + ovflPageSize - 1)
+               div ovflPageSize);
+  Result := SQLITE_OK;
+  while nOvfl > 0 do begin
+    Dec(nOvfl);
+    iNext := 0;
+    pOvfl := nil;
+    if (ovflPgno < 2) or (ovflPgno > btreePagecount(pBt)) then begin
+      Result := SQLITE_CORRUPT_BKPT;
+      Exit;
+    end;
+    if nOvfl > 0 then begin
+      rc := getOverflowPage(pBt, ovflPgno, @pOvfl, @iNext);
+      if rc <> SQLITE_OK then begin
+        Result := rc;
+        Exit;
+      end;
+    end;
+
+    if pOvfl = nil then
+      pOvfl := btreePageLookup(pBt, ovflPgno);
+    if pOvfl <> nil then begin
+      if sqlite3PcachePageRefcount(pOvfl^.pDbPage) <> 1 then
+        rc := SQLITE_CORRUPT_BKPT
+      else
+        rc := freePage2(pBt, pOvfl, ovflPgno);
+    end else
+      rc := freePage2(pBt, nil, ovflPgno);
+
+    if pOvfl <> nil then
+      sqlite3PagerUnref(pOvfl^.pDbPage);
+    if rc <> SQLITE_OK then begin
+      Result := rc;
+      Exit;
+    end;
+    ovflPgno := iNext;
+  end;
+end;
+
+{ BTREE_CLEAR_CELL inline helper:
+  parse cell, if overflow call clearCellOverflow, else rc = SQLITE_OK }
+procedure BTREE_CLEAR_CELL(out rc: i32; pPage: PMemPage; pCell: Pu8;
+                            out sInfo: TCellInfo);
+begin
+  pPage^.xParseCell(pPage, pCell, @sInfo);
+  if sInfo.nLocal <> sInfo.nPayload then
+    rc := clearCellOverflow(pPage, pCell, @sInfo)
+  else
+    rc := SQLITE_OK;
+end;
+
+{ ---------------------------------------------------------------------------
+  fillInCell — fill cell buffer from a BtreePayload
+  btree.c lines 7059-7242
+  --------------------------------------------------------------------------- }
+
+function fillInCell(pPage: PMemPage; pCell: Pu8;
+                    const pX: PBtreePayload; out pnSize: i32): i32;
+var
+  nPayload   : i32;
+  pSrc       : Pu8;
+  nSrc, n    : i32;
+  rc         : i32;
+  mn         : i32;
+  spaceLeft  : i32;
+  pToRelease : PMemPage;
+  pPrior     : Pu8;
+  pPayload   : Pu8;
+  pBt        : PBtShared;
+  pgnoOvfl   : Pgno;
+  nHeader    : i32;
+  pOvfl      : PMemPage;
+begin
+  nHeader := pPage^.childPtrSize;
+  if pPage^.intKey <> 0 then begin
+    nPayload := pX^.nData + pX^.nZero;
+    pSrc     := Pu8(pX^.pData);
+    nSrc     := pX^.nData;
+    nHeader  += putVarint32(pCell + nHeader, u32(nPayload));
+    nHeader  += sqlite3PutVarint(pCell + nHeader, u64(pX^.nKey));
+  end else begin
+    nSrc     := i32(pX^.nKey);
+    nPayload := nSrc;
+    pSrc     := Pu8(pX^.pKey);
+    nHeader  += putVarint32(pCell + nHeader, u32(nPayload));
+  end;
+
+  pPayload := pCell + nHeader;
+  if nPayload <= i32(pPage^.maxLocal) then begin
+    n := nHeader + nPayload;
+    if n < 4 then begin
+      n := 4;
+      pPayload[nPayload] := 0;
+    end;
+    pnSize := n;
+    Move(pSrc^, pPayload^, nSrc);
+    FillChar((pPayload + nSrc)^, nPayload - nSrc, 0);
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  { Payload spills onto overflow pages }
+  mn        := i32(pPage^.minLocal);
+  n         := mn + (nPayload - mn) mod i32(pBt^.usableSize - 4);
+  if n > i32(pPage^.maxLocal) then n := mn;
+  spaceLeft := n;
+  pnSize    := n + nHeader + 4;
+  pPrior    := pCell + nHeader + n;
+  pToRelease := nil;
+  pgnoOvfl  := 0;
+  pBt       := pPage^.pBt;
+
+  while True do begin
+    n := nPayload;
+    if n > spaceLeft then n := spaceLeft;
+    if nSrc >= n then
+      Move(pSrc^, pPayload^, n)
+    else if nSrc > 0 then begin
+      n := nSrc;
+      Move(pSrc^, pPayload^, n);
+    end else
+      FillChar(pPayload^, n, 0);
+    Dec(nPayload, n);
+    if nPayload <= 0 then Break;
+    Inc(pPayload, n);
+    Inc(pSrc, n);
+    Dec(nSrc, n);
+    Dec(spaceLeft, n);
+    if spaceLeft = 0 then begin
+      pOvfl  := nil;
+      rc := allocateBtreePage(pBt, pOvfl, pgnoOvfl, pgnoOvfl, 0);
+      if rc <> SQLITE_OK then begin
+        releasePage(pToRelease);
+        Result := rc;
+        Exit;
+      end;
+      sqlite3Put4byte(pPrior, pgnoOvfl);
+      releasePage(pToRelease);
+      pToRelease := pOvfl;
+      pPrior     := pOvfl^.aData;
+      sqlite3Put4byte(pPrior, 0);
+      pPayload   := pOvfl^.aData + 4;
+      spaceLeft  := i32(pBt^.usableSize) - 4;
+    end;
+  end;
+  releasePage(pToRelease);
+  Result := SQLITE_OK;
+end;
+
+{ ---------------------------------------------------------------------------
+  CellArray type (implementation-only; internal to balance routines)
+  --------------------------------------------------------------------------- }
+
+type
+  PPu8 = ^Pu8;   { pointer to a Pu8 pointer }
+
+  TUnpackedRecord = record
+    pKeyInfo  : PKeyInfo;
+    aMem      : Psqlite3_value;
+    nField    : i32;
+    default_rc: i32;
+    eqSeen    : u8;
+  end;
+
+  TCellArray = record
+    nCell  : i32;                       { Number of cells }
+    pRef   : PMemPage;                  { Reference page }
+    apCell : PPu8;                      { Array of cell pointers }
+    szCell : Pu16;                      { Array of cell sizes }
+    apEnd  : array[0..NB*2-1] of Pu8;  { aDataEnd values }
+    ixNx   : array[0..NB*2-1] of i32;  { Index boundary array }
+  end;
+  PCellArray = ^TCellArray;
+
+{ ---------------------------------------------------------------------------
+  populateCellCache / computeCellSize / cachedCellSize
+  btree.c lines 7584-7614
+  --------------------------------------------------------------------------- }
+
+procedure populateCellCache(p: PCellArray; idx: i32; N: i32);
+var
+  pRef  : PMemPage;
+  szCell: Pu16;
+begin
+  pRef   := p^.pRef;
+  szCell := p^.szCell + idx;
+  while N > 0 do begin
+    if szCell^ = 0 then
+      szCell^ := pRef^.xCellSize(pRef, (p^.apCell + idx)^);
+    Inc(szCell);
+    Inc(idx);
+    Dec(N);
+  end;
+end;
+
+function computeCellSize(p: PCellArray; N: i32): u16;
+begin
+  (p^.szCell + N)^ := p^.pRef^.xCellSize(p^.pRef, (p^.apCell + N)^);
+  Result := (p^.szCell + N)^;
+end;
+
+function cachedCellSize(p: PCellArray; N: i32): u16; inline;
+begin
+  if (p^.szCell + N)^ <> 0 then
+    Result := (p^.szCell + N)^
+  else
+    Result := computeCellSize(p, N);
+end;
+
+{ ---------------------------------------------------------------------------
+  rebuildPage — rebuild page from cell array
+  btree.c lines 7629-7696
+  --------------------------------------------------------------------------- }
+
+function rebuildPage(pCArray: PCellArray; iFirst: i32; nCell: i32;
+                     pPg: PMemPage): i32;
+var
+  hdr        : i32;
+  aData      : Pu8;
+  usableSize : i32;
+  pEnd       : Pu8;
+  i, iEnd    : i32;
+  pCellptr   : Pu8;
+  pTmp       : Pu8;
+  pData      : Pu8;
+  k          : i32;
+  pSrcEnd    : Pu8;
+  pCell      : Pu8;
+  sz         : u16;
+  j          : u32;
+begin
+  hdr        := pPg^.hdrOffset;
+  aData      := pPg^.aData;
+  usableSize := i32(pPg^.pBt^.usableSize);
+  pEnd       := aData + usableSize;
+  i          := iFirst;
+  iEnd       := i + nCell;
+  pCellptr   := pPg^.aCellIdx;
+  pTmp       := Pu8(sqlite3PagerTempSpace(pPg^.pBt^.pPager));
+
+  j := get2byte(aData + hdr + 5);
+  if j > u32(usableSize) then j := 0;
+  Move((aData + j)^, (pTmp + j)^, usableSize - i32(j));
+
+  { find starting apEnd bucket }
+  k := 0;
+  while pCArray^.ixNx[k] <= i do Inc(k);
+  pSrcEnd := pCArray^.apEnd[k];
+
+  pData := pEnd;
+  while True do begin
+    pCell := (pCArray^.apCell + i)^;
+    sz    := (pCArray^.szCell + i)^;
+    if SQLITE_WITHIN(pCell, aData + j, pEnd) then begin
+      if PtrUInt(pCell + sz) > PtrUInt(pEnd) then begin
+        Result := SQLITE_CORRUPT_BKPT;
+        Exit;
+      end;
+      pCell := pTmp + (pCell - aData);
+    end else if SQLITE_OVERFLOW_CHK(pEnd, pCell, pCell + sz) then begin
+      Result := SQLITE_CORRUPT_BKPT;
+      Exit;
+    end;
+    Dec(pData, sz);
+    put2byte(pCellptr, i32(pData - aData));
+    Inc(pCellptr, 2);
+    if PtrUInt(pData) < PtrUInt(pCellptr) then begin
+      Result := SQLITE_CORRUPT_BKPT;
+      Exit;
+    end;
+    Move(pCell^, pData^, sz);
+    Inc(i);
+    if i >= iEnd then Break;
+    if pCArray^.ixNx[k] <= i then begin
+      Inc(k);
+      pSrcEnd := pCArray^.apEnd[k];
+    end;
+  end;
+
+  pPg^.nCell    := u16(nCell);
+  pPg^.nOverflow := 0;
+  put2byte(aData + hdr + 1, 0);
+  put2byte(aData + hdr + 3, i32(pPg^.nCell));
+  put2byte(aData + hdr + 5, i32(pData - aData));
+  aData[hdr + 7] := 0;
+  Result := SQLITE_OK;
+end;
+
+{ ---------------------------------------------------------------------------
+  pageInsertArray — insert cells into page
+  btree.c lines 7722-7777
+  --------------------------------------------------------------------------- }
+
+function pageInsertArray(pPg: PMemPage; pBegin: Pu8; var ppData: Pu8;
+                          pCellptr: Pu8; iFirst: i32; nCell: i32;
+                          pCArray: PCellArray): i32;
+var
+  i, iEnd, k : i32;
+  aData, pEnd : Pu8;
+  pData       : Pu8;
+  sz, rc      : i32;
+  pSlot       : Pu8;
+  pCell       : Pu8;
+begin
+  i    := iFirst;
+  aData := pPg^.aData;
+  pData := ppData;
+  iEnd := iFirst + nCell;
+  if iEnd <= iFirst then begin
+    Result := 0;
+    Exit;
+  end;
+  k := 0;
+  while pCArray^.ixNx[k] <= i do Inc(k);
+  pEnd := pCArray^.apEnd[k];
+
+  while True do begin
+    sz    := i32((pCArray^.szCell + i)^);
+    pCell := (pCArray^.apCell + i)^;
+    if (aData[1] = 0) and (aData[2] = 0) then
+      pSlot := nil
+    else
+      pSlot := pageFindSlot(pPg, sz, rc);
+    if pSlot = nil then begin
+      if (PtrUInt(pData) - PtrUInt(pBegin)) < PtrUInt(sz) then begin
+        Result := 1;
+        Exit;
+      end;
+      Dec(pData, sz);
+      pSlot := pData;
+    end;
+    if SQLITE_OVERFLOW_CHK(pEnd, pCell, pCell + sz) then begin
+      Result := 1;
+      Exit;
+    end;
+    Move(pCell^, pSlot^, sz);
+    put2byte(pCellptr, i32(pSlot - aData));
+    Inc(pCellptr, 2);
+    Inc(i);
+    if i >= iEnd then Break;
+    if pCArray^.ixNx[k] <= i then begin
+      Inc(k);
+      pEnd := pCArray^.apEnd[k];
+    end;
+  end;
+  ppData := pData;
+  Result := 0;
+end;
+
+{ ---------------------------------------------------------------------------
+  pageFreeArray — add cells from array to page free list
+  btree.c lines 7788-7844
+  --------------------------------------------------------------------------- }
+
+function pageFreeArray(pPg: PMemPage; iFirst: i32; nCell: i32;
+                        pCArray: PCellArray): i32;
+var
+  aData, pEnd, pStart : Pu8;
+  nRet, nFree         : i32;
+  i, j, iEnd          : i32;
+  pCell               : Pu8;
+  sz, iAfter, iOfst   : i32;
+  aOfst, aAfter       : array[0..9] of i32;
+begin
+  aData  := pPg^.aData;
+  pEnd   := aData + pPg^.pBt^.usableSize;
+  pStart := aData + pPg^.hdrOffset + 8 + pPg^.childPtrSize;
+  nRet   := 0;
+  nFree  := 0;
+  iEnd   := iFirst + nCell;
+
+  for i := iFirst to iEnd - 1 do begin
+    pCell := (pCArray^.apCell + i)^;
+    if SQLITE_WITHIN(pCell, pStart, pEnd) then begin
+      sz    := i32((pCArray^.szCell + i)^);
+      iOfst := i32(pCell - aData);
+      iAfter := iOfst + sz;
+      j := 0;
+      while j < nFree do begin
+        if aOfst[j] = iAfter then begin
+          aOfst[j] := iOfst;
+          Break;
+        end else if aAfter[j] = iOfst then begin
+          aAfter[j] := iAfter;
+          Break;
+        end;
+        Inc(j);
+      end;
+      if j >= nFree then begin
+        if nFree >= 10 then begin
+          for j := 0 to nFree - 1 do
+            freeSpace(pPg, aOfst[j], aAfter[j] - aOfst[j]);
+          nFree := 0;
+        end;
+        aOfst[nFree]  := iOfst;
+        aAfter[nFree] := iAfter;
+        if PtrUInt(aData + iAfter) > PtrUInt(pEnd) then begin
+          Result := 0;
+          Exit;
+        end;
+        Inc(nFree);
+      end;
+      Inc(nRet);
+    end;
+  end;
+  for j := 0 to nFree - 1 do
+    freeSpace(pPg, aOfst[j], aAfter[j] - aOfst[j]);
+  Result := nRet;
+end;
+
+{ ---------------------------------------------------------------------------
+  editPage — edit page to new cell layout
+  btree.c lines 7858-7965
+  --------------------------------------------------------------------------- }
+
+function editPage(pPg: PMemPage; iOld: i32; iNew: i32; nNew: i32;
+                  pCArray: PCellArray): i32;
+var
+  aData               : Pu8;
+  hdr                 : i32;
+  pBegin              : Pu8;
+  nCell               : i32;
+  pData, pCellptr     : Pu8;
+  i                   : i32;
+  iOldEnd, iNewEnd    : i32;
+  nShift, nTail, nAdd : i32;
+  iCell               : i32;
+label
+  editpage_fail;
+begin
+  aData   := pPg^.aData;
+  hdr     := pPg^.hdrOffset;
+  pBegin  := pPg^.aCellIdx + nNew * 2;
+  nCell   := i32(pPg^.nCell);
+  iOldEnd := iOld + i32(pPg^.nCell) + i32(pPg^.nOverflow);
+  iNewEnd := iNew + nNew;
+
+  if iOld < iNew then begin
+    nShift := pageFreeArray(pPg, iOld, iNew - iOld, pCArray);
+    if nShift > nCell then begin
+      Result := SQLITE_CORRUPT_BKPT;
+      Exit;
+    end;
+    Move(pPg^.aCellIdx[nShift * 2], pPg^.aCellIdx[0], nCell * 2);
+    Dec(nCell, nShift);
+  end;
+  if iNewEnd < iOldEnd then begin
+    nTail := pageFreeArray(pPg, iNewEnd, iOldEnd - iNewEnd, pCArray);
+    Dec(nCell, nTail);
+  end;
+
+  pData := aData + get2byte(aData + hdr + 5);
+  if PtrUInt(pData) < PtrUInt(pBegin) then goto editpage_fail;
+
+  { Add cells at start }
+  if iNew < iOld then begin
+    if iOld - iNew < nNew then
+      nAdd := iOld - iNew
+    else
+      nAdd := nNew;
+    pCellptr := pPg^.aCellIdx;
+    Move(pCellptr[0], pCellptr[nAdd * 2], nCell * 2);
+    if pageInsertArray(pPg, pBegin, pData, pCellptr,
+                       iNew, nAdd, pCArray) <> 0 then
+      goto editpage_fail;
+    Inc(nCell, nAdd);
+  end;
+
+  { Add overflow cells }
+  for i := 0 to i32(pPg^.nOverflow) - 1 do begin
+    iCell := (iOld + i32(pPg^.aiOvfl[i])) - iNew;
+    if (iCell >= 0) and (iCell < nNew) then begin
+      pCellptr := pPg^.aCellIdx + iCell * 2;
+      if nCell > iCell then
+        Move(pCellptr[0], pCellptr[2], (nCell - iCell) * 2);
+      Inc(nCell);
+      cachedCellSize(pCArray, iCell + iNew);
+      if pageInsertArray(pPg, pBegin, pData, pCellptr,
+                         iCell + iNew, 1, pCArray) <> 0 then
+        goto editpage_fail;
+    end;
+  end;
+
+  { Append cells at end }
+  pCellptr := pPg^.aCellIdx + nCell * 2;
+  if pageInsertArray(pPg, pBegin, pData, pCellptr,
+                     iNew + nCell, nNew - nCell, pCArray) <> 0 then
+    goto editpage_fail;
+
+  pPg^.nCell    := u16(nNew);
+  pPg^.nOverflow := 0;
+  put2byte(aData + hdr + 3, i32(pPg^.nCell));
+  put2byte(aData + hdr + 5, i32(pData - aData));
+  Result := SQLITE_OK;
+  Exit;
+
+editpage_fail:
+  if nNew < 1 then begin
+    Result := SQLITE_CORRUPT_BKPT;
+    Exit;
+  end;
+  populateCellCache(pCArray, iNew, nNew);
+  Result := rebuildPage(pCArray, iNew, nNew, pPg);
+end;
+
+{ ---------------------------------------------------------------------------
+  balance_quick — fast balance for right-end insert
+  btree.c lines 7992-8087
+  --------------------------------------------------------------------------- }
+
+function balance_quick(pParent: PMemPage; pPage: PMemPage;
+                        pSpace: Pu8): i32;
+var
+  pBt    : PBtShared;
+  pNew   : PMemPage;
+  rc     : i32;
+  pgnoNew: Pgno;
+  pOut   : Pu8;
+  pCell  : Pu8;
+  szCell : u16;
+  pStop  : Pu8;
+  b      : TCellArray;
+  bApCell: Pu8;
+  bSzCell: u16;
+begin
+  pBt  := pPage^.pBt;
+  pNew := nil;
+  rc   := SQLITE_OK;
+
+  if pPage^.nCell = 0 then begin
+    Result := SQLITE_CORRUPT_BKPT;
+    Exit;
+  end;
+
+  rc := allocateBtreePage(pBt, pNew, pgnoNew, 0, 0);
+  if rc <> SQLITE_OK then begin
+    Result := rc;
+    Exit;
+  end;
+
+  pOut   := pSpace + 4;
+  pCell  := pPage^.apOvfl[0];
+  szCell := pPage^.xCellSize(pPage, pCell);
+
+  zeroPage(pNew, PTF_INTKEY or PTF_LEAFDATA or PTF_LEAF);
+  FillChar(b, SizeOf(b), 0);
+  b.nCell := 1;
+  b.pRef  := pPage;
+  bApCell := pCell;
+  bSzCell := szCell;
+  b.apCell := @bApCell;
+  b.szCell := @bSzCell;
+  b.apEnd[0] := pPage^.aDataEnd;
+  b.ixNx[0]  := 2;
+  b.ixNx[NB*2-1] := $7fffffff;
+  rc := rebuildPage(@b, 0, 1, pNew);
+  if rc <> SQLITE_OK then begin
+    releasePage(pNew);
+    Result := rc;
+    Exit;
+  end;
+  pNew^.nFree := i32(pBt^.usableSize) - i32(pNew^.cellOffset) - 2 - szCell;
+
+  if ISAUTOVACUUM(pBt) then begin
+    ptrmapPut(pBt, pgnoNew, PTRMAP_BTREE, pParent^.pgno, @rc);
+    if szCell > pNew^.minLocal then
+      ptrmapPutOvflPtr(pNew, pNew, pCell, @rc);
+  end;
+
+  { Build divider cell in pSpace }
+  pCell := findCell(pPage, i32(pPage^.nCell) - 1);
+  pStop := pCell + 9;
+  while (pCell^ and $80 <> 0) and (PtrUInt(pCell) < PtrUInt(pStop)) do
+    Inc(pCell);
+  pStop := pCell + 9;
+  while True do begin
+    pOut^ := pCell^;
+    Inc(pOut);
+    Inc(pCell);
+    if (pOut[-1] and $80 = 0) or (PtrUInt(pCell) >= PtrUInt(pStop)) then
+      Break;
+  end;
+
+  if rc = SQLITE_OK then
+    rc := insertCell(pParent, i32(pParent^.nCell), pSpace,
+                     i32(pOut - pSpace), nil, pPage^.pgno);
+  put4byte(pParent^.aData + pParent^.hdrOffset + 8, pgnoNew);
+  releasePage(pNew);
+  Result := rc;
+end;
+
+{ ---------------------------------------------------------------------------
+  copyNodeContent — copy a btree node from one page to another
+  btree.c lines 8148-8188
+  --------------------------------------------------------------------------- }
+
+procedure copyNodeContent(pFrom: PMemPage; pTo: PMemPage; pRC: Pi32);
+var
+  pBt     : PBtShared;
+  aFrom   : Pu8;
+  aTo     : Pu8;
+  iFromHdr: i32;
+  iToHdr  : i32;
+  rc      : i32;
+  iData   : i32;
+begin
+  if pRC^ <> SQLITE_OK then Exit;
+  pBt     := pFrom^.pBt;
+  aFrom   := pFrom^.aData;
+  aTo     := pTo^.aData;
+  iFromHdr := i32(pFrom^.hdrOffset);
+  if pTo^.pgno = 1 then iToHdr := 100 else iToHdr := 0;
+
+  iData := get2byte(aFrom + iFromHdr + 5);
+  Move((aFrom + iData)^, (aTo + iData)^, i32(pBt^.usableSize) - iData);
+  Move((aFrom + iFromHdr)^, (aTo + iToHdr)^,
+       i32(pFrom^.cellOffset) + 2 * i32(pFrom^.nCell));
+
+  pTo^.isInit := 0;
+  rc := btreeInitPage(pTo);
+  if rc = SQLITE_OK then rc := btreeComputeFreeSpace(pTo);
+  if rc <> SQLITE_OK then begin
+    pRC^ := rc;
+    Exit;
+  end;
+
+  if ISAUTOVACUUM(pBt) then
+    pRC^ := setChildPtrmaps(pTo);
+end;
+
+{ ---------------------------------------------------------------------------
+  balance_nonroot — general balance of non-root siblings
+  btree.c lines 8230-9012
+  --------------------------------------------------------------------------- }
+
+function balance_nonroot(pParent: PMemPage; iParentIdx: i32;
+                          aOvflSpace: Pu8; isRoot: i32; bBulk: i32): i32;
+var
+  pBt          : PBtShared;
+  nMaxCells    : i32;
+  nNew, nOld   : i32;
+  i, j, k      : i32;
+  nxDiv        : i32;
+  rc           : i32;
+  leafCorrection: u16;
+  leafData     : i32;
+  usableSpace  : i32;
+  pageFlags    : i32;
+  iSpace1      : i32;
+  iOvflSpace   : i32;
+  szScratch    : u64;
+  apOld        : array[0..NB-1] of PMemPage;
+  apNew        : array[0..NB+1] of PMemPage;
+  pRight       : Pu8;
+  apDiv        : array[0..NB-2] of Pu8;
+  cntNew       : array[0..NB+1] of i32;
+  cntOld       : array[0..NB+1] of i32;
+  szNew        : array[0..NB+1] of i32;
+  aSpace1      : Pu8;
+  pg           : Pgno;
+  abDone       : array[0..NB+1] of u8;
+  aPgno        : array[0..NB+1] of Pgno;
+  b            : TCellArray;
+  pMem         : Pointer;
+  pOld         : PMemPage;
+  limit        : i32;
+  aData        : Pu8;
+  maskPage     : u16;
+  piCell       : Pu8;
+  piEnd        : Pu8;
+  sz           : u16;
+  pCell        : Pu8;
+  pTemp        : Pu8;
+  iOff         : i32;
+  iNew, iOld2  : i32;
+  iNew2, iPg   : i32;
+  nNewCell     : i32;
+  pNew         : PMemPage;
+  pSrcEnd      : Pu8;
+  r, d         : i32;
+  szRight, szLeft: i32;
+  szR, szD     : i32;
+  iB           : i32;
+  pgnoA, pgnoB, pgnoTemp: Pgno;
+  fgA, fgB     : u16;
+  cntOldNext   : i32;
+  iOldIdx      : i32;
+  key          : u32;
+  info2        : TCellInfo;
+label
+  balance_cleanup;
+begin
+  FillChar(abDone, SizeOf(abDone), 0);
+  FillChar(b, SizeOf(b) - SizeOf(b.ixNx[0]), 0);
+  b.ixNx[NB*2-1] := $7fffffff;
+  pBt := pParent^.pBt;
+  rc  := SQLITE_OK;
+
+  if aOvflSpace = nil then begin
+    Result := SQLITE_NOMEM_BKPT;
+    Exit;
+  end;
+
+  { Find sibling pages and locate divider cells }
+  i := i32(pParent^.nOverflow) + i32(pParent^.nCell);
+  if i < 2 then
+    nxDiv := 0
+  else begin
+    if iParentIdx = 0 then
+      nxDiv := 0
+    else if iParentIdx = i then
+      nxDiv := i - 2 + bBulk
+    else
+      nxDiv := iParentIdx - 1;
+    i := 2 - bBulk;
+  end;
+  nOld := i + 1;
+
+  if (i + nxDiv - i32(pParent^.nOverflow)) = i32(pParent^.nCell) then
+    pRight := pParent^.aData + pParent^.hdrOffset + 8
+  else
+    pRight := findCell(pParent, i + nxDiv - i32(pParent^.nOverflow));
+  pg := sqlite3Get4byte(pRight);
+
+  while True do begin
+    if rc = SQLITE_OK then
+      rc := getAndInitPage(pBt, pg, apOld[i], 0);
+    if rc <> SQLITE_OK then begin
+      FillChar(apOld[0], (i+1) * SizeOf(PMemPage), 0);
+      goto balance_cleanup;
+    end;
+    if apOld[i]^.nFree < 0 then begin
+      rc := btreeComputeFreeSpace(apOld[i]);
+      if rc <> SQLITE_OK then begin
+        FillChar(apOld[0], i * SizeOf(PMemPage), 0);
+        goto balance_cleanup;
+      end;
+    end;
+    Inc(nMaxCells, i32(apOld[i]^.nCell) + 4); { +4 for overflow slots }
+    if i = 0 then Break;
+    Dec(i);
+
+    if (i32(pParent^.nOverflow) > 0) and (i + nxDiv = i32(pParent^.aiOvfl[0])) then begin
+      apDiv[i] := pParent^.apOvfl[0];
+      pg       := sqlite3Get4byte(apDiv[i]);
+      szNew[i] := i32(pParent^.xCellSize(pParent, apDiv[i]));
+      pParent^.nOverflow := 0;
+    end else begin
+      apDiv[i] := findCell(pParent, i + nxDiv - i32(pParent^.nOverflow));
+      pg       := sqlite3Get4byte(apDiv[i]);
+      szNew[i] := i32(pParent^.xCellSize(pParent, apDiv[i]));
+      if (pBt^.btsFlags and BTS_FAST_SECURE) <> 0 then begin
+        iOff := i32(PtrUInt(apDiv[i]) - PtrUInt(pParent^.aData));
+        if (iOff + szNew[i]) <= i32(pBt^.usableSize) then begin
+          Move(apDiv[i]^, (aOvflSpace + iOff)^, szNew[i]);
+          apDiv[i] := aOvflSpace + (PtrUInt(apDiv[i]) - PtrUInt(pParent^.aData));
+        end;
+      end;
+      dropCell(pParent, i + nxDiv - i32(pParent^.nOverflow), szNew[i], @rc);
+    end;
+  end;
+
+  nMaxCells := (nMaxCells + 3) and (not 3);
+
+  { Allocate scratch memory }
+  szScratch := u64(nMaxCells) * (SizeOf(Pointer) + SizeOf(u16)) + pBt^.pageSize;
+  pMem := sqlite3StackAllocRaw(nil, szScratch);
+  if pMem = nil then begin
+    rc := SQLITE_NOMEM_BKPT;
+    goto balance_cleanup;
+  end;
+  b.apCell := PPu8(pMem);
+  b.szCell := Pu16(PByte(b.apCell) + nMaxCells * SizeOf(Pointer));
+  aSpace1  := PByte(b.szCell) + nMaxCells * SizeOf(u16);
+  iSpace1  := 0;
+
+  { Load cell pointers from sibling pages }
+  b.pRef       := apOld[0];
+  leafCorrection := u16(b.pRef^.leaf * 4);
+  leafData     := i32(b.pRef^.intKeyLeaf);
+  b.nCell      := 0;
+  for i := 0 to nOld - 1 do begin
+    pOld     := apOld[i];
+    limit    := i32(pOld^.nCell);
+    aData    := pOld^.aData;
+    maskPage := pOld^.maskPage;
+    piCell   := aData + pOld^.cellOffset;
+
+    if pOld^.aData[0] <> apOld[0]^.aData[0] then begin
+      rc := CORRUPT_PAGE(pOld);
+      goto balance_cleanup;
+    end;
+
+    FillChar((b.szCell + b.nCell)^, (limit + i32(pOld^.nOverflow)) * SizeOf(u16), 0);
+    if pOld^.nOverflow > 0 then begin
+      if limit < i32(pOld^.aiOvfl[0]) then begin
+        rc := CORRUPT_PAGE(pOld);
+        goto balance_cleanup;
+      end;
+      limit := i32(pOld^.aiOvfl[0]);
+      for j := 0 to limit - 1 do begin
+        (b.apCell + b.nCell)^ := aData + (maskPage and u16(get2byteAligned(piCell)));
+        Inc(piCell, 2);
+        Inc(b.nCell);
+      end;
+      for k := 0 to i32(pOld^.nOverflow) - 1 do begin
+        (b.apCell + b.nCell)^ := pOld^.apOvfl[k];
+        Inc(b.nCell);
+      end;
+    end;
+    piEnd := aData + pOld^.cellOffset + 2 * i32(pOld^.nCell);
+    while PtrUInt(piCell) < PtrUInt(piEnd) do begin
+      (b.apCell + b.nCell)^ := aData + (maskPage and u16(get2byteAligned(piCell)));
+      Inc(piCell, 2);
+      Inc(b.nCell);
+    end;
+
+    cntOld[i] := b.nCell;
+    if (i < nOld - 1) and (leafData = 0) then begin
+      sz    := u16(szNew[i]);
+      pTemp := aSpace1 + iSpace1;
+      Inc(iSpace1, szNew[i]);
+      Move(apDiv[i]^, pTemp^, szNew[i]);
+      (b.apCell + b.nCell)^ := pTemp + leafCorrection;
+      (b.szCell + b.nCell)^ := sz - leafCorrection;
+      if pOld^.leaf = 0 then
+        Move(pOld^.aData[8], (b.apCell + b.nCell)^^, 4)
+      else begin
+        while (b.szCell + b.nCell)^ < 4 do begin
+          aSpace1[iSpace1] := 0;
+          Inc(iSpace1);
+          Inc((b.szCell + b.nCell)^);
+        end;
+      end;
+      Inc(b.nCell);
+    end;
+  end;
+
+  { Figure out page distribution }
+  usableSpace := i32(pBt^.usableSize) - 12 + i32(leafCorrection);
+  k := 0;
+  for i := 0 to nOld - 1 do begin
+    pOld := apOld[i];
+    b.apEnd[k] := pOld^.aDataEnd;
+    b.ixNx[k]  := cntOld[i];
+    if (k > 0) and (b.ixNx[k] = b.ixNx[k-1]) then
+      Dec(k);
+    if leafData = 0 then begin
+      Inc(k);
+      b.apEnd[k] := pParent^.aDataEnd;
+      b.ixNx[k]  := cntOld[i] + 1;
+    end;
+    Inc(k);
+    szNew[i]  := usableSpace - i32(pOld^.nFree);
+    for j := 0 to i32(pOld^.nOverflow) - 1 do
+      Inc(szNew[i], 2 + i32(pOld^.xCellSize(pOld, pOld^.apOvfl[j])));
+    cntNew[i] := cntOld[i];
+  end;
+  k := nOld;
+  i := 0;
+  while i < k do begin
+    while szNew[i] > usableSpace do begin
+      if i + 1 >= k then begin
+        Inc(k);
+        if k > NB + 2 then begin
+          rc := SQLITE_CORRUPT_BKPT;
+          goto balance_cleanup;
+        end;
+        szNew[k-1]  := 0;
+        cntNew[k-1] := b.nCell;
+      end;
+      sz := 2 + i32(cachedCellSize(@b, cntNew[i] - 1));
+      Dec(szNew[i], sz);
+      if leafData = 0 then begin
+        if cntNew[i] < b.nCell then
+          sz := 2 + i32(cachedCellSize(@b, cntNew[i]))
+        else
+          sz := 0;
+      end;
+      Inc(szNew[i+1], sz);
+      Dec(cntNew[i]);
+    end;
+    while cntNew[i] < b.nCell do begin
+      sz := 2 + i32(cachedCellSize(@b, cntNew[i]));
+      if szNew[i] + sz > usableSpace then Break;
+      Inc(szNew[i], sz);
+      Inc(cntNew[i]);
+      if leafData = 0 then begin
+        if cntNew[i] < b.nCell then
+          sz := 2 + i32(cachedCellSize(@b, cntNew[i]))
+        else
+          sz := 0;
+      end;
+      Dec(szNew[i+1], sz);
+    end;
+    if cntNew[i] >= b.nCell then
+      k := i + 1
+    else if ((i > 0) and (cntNew[i] <= cntNew[i-1])) or
+            ((i = 0) and (cntNew[i] <= 0)) then begin
+      rc := SQLITE_CORRUPT_BKPT;
+      goto balance_cleanup;
+    end;
+    Inc(i);
+  end;
+
+  { Rebalance right-biased packing }
+  for i := k - 1 downto 1 do begin
+    szRight := szNew[i];
+    szLeft  := szNew[i-1];
+    r := cntNew[i-1] - 1;
+    d := r + 1 - leafData;
+    cachedCellSize(@b, d);
+    repeat
+      szR := i32(cachedCellSize(@b, r));
+      szD := i32((b.szCell + d)^);
+      if ((szRight <> 0) and (bBulk <> 0)) or
+         ((i = k-1) and (szRight + szD + 2 > szLeft - szR)) or
+         ((i <> k-1) and (szRight + szD + 2 > szLeft - szR - 2)) then
+        Break;
+      Inc(szRight, szD + 2);
+      Dec(szLeft, szR + 2);
+      cntNew[i-1] := r;
+      Dec(r);
+      Dec(d);
+    until r < 0;
+    szNew[i]   := szRight;
+    szNew[i-1] := szLeft;
+    if ((i > 1) and (cntNew[i-1] <= cntNew[i-2])) or
+       ((i <= 1) and (cntNew[i-1] <= 0)) then begin
+      rc := SQLITE_CORRUPT_BKPT;
+      goto balance_cleanup;
+    end;
+  end;
+
+  { Allocate k new pages }
+  pageFlags := i32(apOld[0]^.aData[0]);
+  nNew := 0;
+  for i := 0 to k - 1 do begin
+    if i < nOld then begin
+      pNew     := apOld[i];
+      apNew[i] := pNew;
+      apOld[i] := nil;
+      rc := sqlite3PagerWrite(pNew^.pDbPage);
+      Inc(nNew);
+      if rc <> SQLITE_OK then goto balance_cleanup;
+    end else begin
+      if bBulk <> 0 then
+        rc := allocateBtreePage(pBt, apNew[i], pg, 1, 0)
+      else
+        rc := allocateBtreePage(pBt, apNew[i], pg, pg, 0);
+      if rc <> SQLITE_OK then goto balance_cleanup;
+      zeroPage(apNew[i], pageFlags);
+      Inc(nNew);
+      cntOld[i] := b.nCell;
+      if ISAUTOVACUUM(pBt) then begin
+        ptrmapPut(pBt, apNew[i]^.pgno, PTRMAP_BTREE, pParent^.pgno, @rc);
+        if rc <> SQLITE_OK then goto balance_cleanup;
+      end;
+    end;
+    aPgno[i] := apNew[i]^.pgno;
+  end;
+
+  { Sort pages by page number (O(N^2), N<=5) }
+  for i := 0 to nNew - 2 do begin
+    iB := i;
+    for j := i + 1 to nNew - 1 do
+      if apNew[j]^.pgno < apNew[iB]^.pgno then iB := j;
+    if iB <> i then begin
+      pgnoA    := apNew[i]^.pgno;
+      pgnoB    := apNew[iB]^.pgno;
+      pgnoTemp := (PENDING_BYTE div pBt^.pageSize) + 1;
+      fgA      := apNew[i]^.pDbPage^.flags;
+      fgB      := apNew[iB]^.pDbPage^.flags;
+      sqlite3PagerRekey(apNew[i]^.pDbPage, pgnoTemp, fgB);
+      sqlite3PagerRekey(apNew[iB]^.pDbPage, pgnoA, fgA);
+      sqlite3PagerRekey(apNew[i]^.pDbPage, pgnoB, fgB);
+      apNew[i]^.pgno  := pgnoB;
+      apNew[iB]^.pgno := pgnoA;
+    end;
+  end;
+
+  put4byte(pRight, apNew[nNew-1]^.pgno);
+
+  { Copy right-child pointer if interior pages changed count }
+  if ((pageFlags and PTF_LEAF) = 0) and (nOld <> nNew) then begin
+    if nNew > nOld then
+      pOld := apNew[nOld-1]
+    else
+      pOld := apOld[nOld-1];
+    Move(pOld^.aData[8], apNew[nNew-1]^.aData[8], 4);
+  end;
+
+  { Auto-vacuum pointer-map updates (no-op in this port) }
+
+  { Insert divider cells into pParent }
+  iOvflSpace := 0;
+  for i := 0 to nNew - 2 do begin
+    pCell    := (b.apCell + cntNew[i])^;
+    sz       := i32((b.szCell + cntNew[i])^) + i32(leafCorrection);
+    pTemp    := aOvflSpace + iOvflSpace;
+    pNew     := apNew[i];
+    if pNew^.leaf = 0 then
+      Move(pCell^, pNew^.aData[8], 4)
+    else if leafData <> 0 then begin
+      { leaf-data: divider is key of last cell on this sibling }
+      j     := cntNew[i] - 1;
+      pNew^.xParseCell(pNew, (b.apCell + j)^, @info2);
+      pCell := pTemp;
+      sz    := 4 + sqlite3PutVarint(pCell + 4, u64(info2.nKey));
+      pTemp := nil;
+    end else begin
+      Dec(pCell, 4);
+      if (b.szCell + cntNew[i])^ = 4 then
+        sz := i32(pParent^.xCellSize(pParent, pCell));
+    end;
+    Inc(iOvflSpace, sz);
+
+    k := 0;
+    while b.ixNx[k] <= cntNew[i] do Inc(k);
+    pSrcEnd := b.apEnd[k];
+    if SQLITE_OVERFLOW_CHK(pSrcEnd, pCell, pCell + sz) then begin
+      rc := SQLITE_CORRUPT_BKPT;
+      goto balance_cleanup;
+    end;
+    rc := insertCell(pParent, nxDiv + i, pCell, sz, pTemp, pNew^.pgno);
+    if rc <> SQLITE_OK then goto balance_cleanup;
+  end;
+
+  { Update sibling pages (two-pass: down then up) }
+  for i := 1 - nNew to nNew - 1 do begin
+    if i < 0 then iPg := -i else iPg := i;
+    if abDone[iPg] <> 0 then continue;
+    if (i >= 0) or
+       (cntOld[iPg-1] >= cntNew[iPg-1]) then begin
+      if iPg = 0 then begin
+        iNew2 := 0; iOld2 := 0;
+        nNewCell := cntNew[0];
+      end else begin
+        if iPg < nOld then
+          iOld2 := cntOld[iPg-1] + (1 - leafData)
+        else
+          iOld2 := b.nCell;
+        iNew2    := cntNew[iPg-1] + (1 - leafData);
+        nNewCell := cntNew[iPg] - iNew2;
+      end;
+      rc := editPage(apNew[iPg], iOld2, iNew2, nNewCell, @b);
+      if rc <> SQLITE_OK then goto balance_cleanup;
+      abDone[iPg]      := 1;
+      apNew[iPg]^.nFree := usableSpace - szNew[iPg];
+    end;
+  end;
+
+  { Balance-shallower: root page now empty }
+  if (isRoot <> 0) and (pParent^.nCell = 0) and
+     (i32(pParent^.hdrOffset) <= apNew[0]^.nFree) then begin
+    rc := defragmentPage(apNew[0], -1);
+    copyNodeContent(apNew[0], pParent, @rc);
+    freePage(apNew[0], @rc);
+  end else if ISAUTOVACUUM(pBt) and (leafCorrection = 0) then begin
+    for i := 0 to nNew - 1 do begin
+      key := sqlite3Get4byte(apNew[i]^.aData + 8);
+      ptrmapPut(pBt, key, PTRMAP_BTREE, apNew[i]^.pgno, @rc);
+    end;
+  end;
+
+  { Free old pages not reused }
+  for i := nNew to nOld - 1 do
+    freePage(apOld[i], @rc);
+
+balance_cleanup:
+  sqlite3StackFree(nil, pMem);
+  for i := 0 to nOld - 1 do releasePage(apOld[i]);
+  for i := 0 to nNew - 1 do releasePage(apNew[i]);
+  Result := rc;
+end;
+
+{ ---------------------------------------------------------------------------
+  balance_deeper — grow tree depth when root overflows
+  btree.c lines 9034-9079
+  --------------------------------------------------------------------------- }
+
+function balance_deeper(pRoot: PMemPage; out ppChild: PMemPage): i32;
+var
+  rc        : i32;
+  pChild    : PMemPage;
+  pgnoChild : Pgno;
+  pBt       : PBtShared;
+begin
+  pChild    := nil;
+  pgnoChild := 0;
+  pBt       := pRoot^.pBt;
+  ppChild   := nil;
+
+  rc := sqlite3PagerWrite(pRoot^.pDbPage);
+  if rc = SQLITE_OK then begin
+    rc := allocateBtreePage(pBt, pChild, pgnoChild, pRoot^.pgno, 0);
+    copyNodeContent(pRoot, pChild, @rc);
+    if ISAUTOVACUUM(pBt) then
+      ptrmapPut(pBt, pgnoChild, PTRMAP_BTREE, pRoot^.pgno, @rc);
+  end;
+  if rc <> SQLITE_OK then begin
+    releasePage(pChild);
+    Exit;
+  end;
+
+  Move(pRoot^.aiOvfl[0], pChild^.aiOvfl[0],
+       pRoot^.nOverflow * SizeOf(pRoot^.aiOvfl[0]));
+  Move(pRoot^.apOvfl[0], pChild^.apOvfl[0],
+       pRoot^.nOverflow * SizeOf(pRoot^.apOvfl[0]));
+  pChild^.nOverflow := pRoot^.nOverflow;
+
+  zeroPage(pRoot, i32(pChild^.aData[0]) and (not PTF_LEAF));
+  sqlite3Put4byte(pRoot^.aData + pRoot^.hdrOffset + 8, pgnoChild);
+
+  ppChild := pChild;
+  Result  := SQLITE_OK;
+end;
+
+{ ---------------------------------------------------------------------------
+  anotherValidCursor — detect other valid cursors on same page
+  btree.c lines 9092-9103
+  --------------------------------------------------------------------------- }
+
+function anotherValidCursor(pCur: PBtCursor): i32;
+var
+  pOther: PBtCursor;
+begin
+  pOther := pCur^.pBt^.pCursor;
+  while pOther <> nil do begin
+    if (pOther <> pCur) and (pOther^.eState = CURSOR_VALID) and
+       (pOther^.pPage = pCur^.pPage) then begin
+      Result := CORRUPT_PAGE(pCur^.pPage);
+      Exit;
+    end;
+    pOther := pOther^.pNext;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ ---------------------------------------------------------------------------
+  balance — main balance dispatcher
+  btree.c lines 9115-9244
+  --------------------------------------------------------------------------- }
+
+function balance(pCur: PBtCursor): i32;
+var
+  rc                  : i32;
+  aBalanceQuickSpace  : array[0..12] of u8;
+  pFree               : Pu8;
+  iPage               : i32;
+  pPage               : PMemPage;
+  pParent             : PMemPage;
+  iIdx                : i32;
+  pSpace              : Pu8;
+begin
+  rc    := SQLITE_OK;
+  pFree := nil;
+
+  repeat
+    pPage := pCur^.pPage;
+    if (pPage^.nFree < 0) and (btreeComputeFreeSpace(pPage) <> SQLITE_OK) then
+      Break;
+    if (pPage^.nOverflow = 0) and
+       (pPage^.nFree * 3 <= i32(pCur^.pBt^.usableSize) * 2) then
+      Break
+    else begin
+      iPage := i32(pCur^.iPage);
+      if iPage = 0 then begin
+        if (pPage^.nOverflow <> 0) and
+           (anotherValidCursor(pCur) = SQLITE_OK) then begin
+          rc := balance_deeper(pPage, pCur^.apPage[1]);
+          if rc = SQLITE_OK then begin
+            pCur^.iPage     := 1;
+            pCur^.ix        := 0;
+            pCur^.aiIdx[0]  := 0;
+            pCur^.apPage[0] := pPage;
+            pCur^.pPage     := pCur^.apPage[1];
+          end;
+        end else
+          Break;
+      end else if sqlite3PcachePageRefcount(pPage^.pDbPage) > 1 then begin
+        rc := CORRUPT_PAGE(pPage);
+      end else begin
+        pParent := pCur^.apPage[iPage - 1];
+        iIdx    := i32(pCur^.aiIdx[iPage - 1]);
+        rc := sqlite3PagerWrite(pParent^.pDbPage);
+        if (rc = SQLITE_OK) and (pParent^.nFree < 0) then
+          rc := btreeComputeFreeSpace(pParent);
+        if rc = SQLITE_OK then begin
+          if pPage^.intKeyLeaf <> 0 then begin
+            if (pPage^.nOverflow = 1) and
+               (i32(pPage^.aiOvfl[0]) = i32(pPage^.nCell)) and
+               (pParent^.pgno <> 1) and
+               (i32(pParent^.nCell) = iIdx) then begin
+              rc := balance_quick(pParent, pPage, @aBalanceQuickSpace[0]);
+            end else begin
+              pSpace := Pu8(sqlite3PageMalloc(i32(pCur^.pBt^.pageSize)));
+              rc     := balance_nonroot(pParent, iIdx, pSpace, ord(iPage = 1),
+                                        i32(pCur^.hints) and BTREE_BULKLOAD);
+              if pFree <> nil then
+                sqlite3PageFree(pFree);
+              pFree := pSpace;
+            end;
+          end else begin
+            pSpace := Pu8(sqlite3PageMalloc(i32(pCur^.pBt^.pageSize)));
+            rc     := balance_nonroot(pParent, iIdx, pSpace, ord(iPage = 1),
+                                      i32(pCur^.hints) and BTREE_BULKLOAD);
+            if pFree <> nil then
+              sqlite3PageFree(pFree);
+            pFree := pSpace;
+          end;
+        end;
+
+        pPage^.nOverflow := 0;
+        releasePage(pPage);
+        Dec(pCur^.iPage);
+        pCur^.pPage := pCur^.apPage[pCur^.iPage];
+      end;
+    end;
+  until rc <> SQLITE_OK;
+
+  if pFree <> nil then
+    sqlite3PageFree(pFree);
+  Result := rc;
+end;
+
+{ ---------------------------------------------------------------------------
+  btreeOverwriteContent — overwrite cell content (no-realloc path)
+  btree.c lines 9249-9286
+  --------------------------------------------------------------------------- }
+
+function btreeOverwriteContent(pPage: PMemPage; pDest: Pu8;
+                                const pX: PBtreePayload;
+                                iOffset: i32; iAmt: i32): i32;
+var
+  nData: i32;
+  rc   : i32;
+  i    : i32;
+begin
+  nData := pX^.nData - iOffset;
+  if nData <= 0 then begin
+    { Overwriting with zeros }
+    i := 0;
+    while (i < iAmt) and (pDest[i] = 0) do Inc(i);
+    if i < iAmt then begin
+      rc := sqlite3PagerWrite(pPage^.pDbPage);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      FillChar((pDest + i)^, iAmt - i, 0);
+    end;
+  end else begin
+    if nData < iAmt then begin
+      rc := btreeOverwriteContent(pPage, pDest + nData, pX,
+                                   iOffset + nData, iAmt - nData);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      iAmt := nData;
+    end;
+    if CompareByte((pDest)^, (Pu8(pX^.pData) + iOffset)^, iAmt) <> 0 then begin
+      rc := sqlite3PagerWrite(pPage^.pDbPage);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      Move((Pu8(pX^.pData) + iOffset)^, pDest^, iAmt);
+    end;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ ---------------------------------------------------------------------------
+  btreeOverwriteOverflowCell — overwrite cell with overflow pages
+  btree.c lines 9293-9338
+  --------------------------------------------------------------------------- }
+
+function btreeOverwriteOverflowCell(pCur: PBtCursor;
+                                     const pX: PBtreePayload): i32;
+var
+  iOffset     : i32;
+  nTotal      : i32;
+  rc          : i32;
+  pPage       : PMemPage;
+  pBt         : PBtShared;
+  ovflPgno    : Pgno;
+  ovflPageSize: u32;
+begin
+  nTotal  := pX^.nData + pX^.nZero;
+  pPage   := pCur^.pPage;
+  pBt     := pPage^.pBt;
+  rc := btreeOverwriteContent(pPage, pCur^.info.pPayload, pX,
+                               0, i32(pCur^.info.nLocal));
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  iOffset     := i32(pCur^.info.nLocal);
+  ovflPgno    := sqlite3Get4byte(pCur^.info.pPayload + iOffset);
+  ovflPageSize := pBt^.usableSize - 4;
+  repeat
+    rc := btreeGetPage(pBt, ovflPgno, pPage, 0);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+    if (sqlite3PcachePageRefcount(pPage^.pDbPage) <> 1) or
+       (pPage^.isInit <> 0) then begin
+      rc := CORRUPT_PAGE(pPage);
+    end else begin
+      if u32(iOffset) + ovflPageSize < u32(nTotal) then
+        ovflPgno := sqlite3Get4byte(pPage^.aData)
+      else
+        ovflPageSize := u32(nTotal) - u32(iOffset);
+      rc := btreeOverwriteContent(pPage, pPage^.aData + 4, pX,
+                                   iOffset, i32(ovflPageSize));
+    end;
+    sqlite3PagerUnref(pPage^.pDbPage);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+    Inc(iOffset, i32(ovflPageSize));
+  until iOffset >= nTotal;
+  Result := SQLITE_OK;
+end;
+
+{ ---------------------------------------------------------------------------
+  btreeOverwriteCell — overwrite cell contents in place
+  btree.c lines 9344-9361
+  --------------------------------------------------------------------------- }
+
+function btreeOverwriteCell(pCur: PBtCursor;
+                             const pX: PBtreePayload): i32;
+var
+  nTotal: i32;
+  pPage : PMemPage;
+begin
+  nTotal := pX^.nData + pX^.nZero;
+  pPage  := pCur^.pPage;
+  if (PtrUInt(pCur^.info.pPayload + pCur^.info.nLocal) >
+      PtrUInt(pPage^.aDataEnd)) or
+     (PtrUInt(pCur^.info.pPayload) <
+      PtrUInt(pPage^.aData + pPage^.cellOffset)) then begin
+    Result := CORRUPT_PAGE(pPage);
+    Exit;
+  end;
+  if i32(pCur^.info.nLocal) = nTotal then
+    Result := btreeOverwriteContent(pPage, pCur^.info.pPayload, pX,
+                                     0, i32(pCur^.info.nLocal))
+  else
+    Result := btreeOverwriteOverflowCell(pCur, pX);
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3BtreeInsert — insert a row into the b-tree
+  btree.c lines 9394-9695
+  --------------------------------------------------------------------------- }
+
+function sqlite3BtreeInsert(pCur: PBtCursor; const pX: PBtreePayload;
+                              flags: i32; seekResult: i32): i32;
+var
+  rc      : i32;
+  loc     : i32;
+  szNew   : i32;
+  idx     : i32;
+  pPage   : PMemPage;
+  p       : PBtree;
+  oldCell : Pu8;
+  newCell : Pu8;
+  info    : TCellInfo;
+  pKeyMem : Pointer;
+  r2      : TUnpackedRecord;
+  x2      : TBtreePayload;
+label
+  end_insert;
+begin
+  rc      := SQLITE_OK;
+  loc     := seekResult;
+  szNew   := 0;
+  p       := pCur^.pBtree;
+  newCell := nil;
+  pKeyMem := nil;
+
+  if (pCur^.curFlags and BTCF_Multiple) <> 0 then begin
+    rc := saveAllCursors(p^.pBt, pCur^.pgnoRoot, pCur);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+    if (loc <> 0) and (pCur^.iPage < 0) then begin
+      Result := SQLITE_CORRUPT_BKPT;
+      Exit;
+    end;
+  end;
+
+  if pCur^.eState >= CURSOR_REQUIRESEEK then begin
+    rc := moveToRoot(pCur);
+    if (rc <> SQLITE_OK) and (rc <> SQLITE_EMPTY) then begin
+      Result := rc;
+      Exit;
+    end;
+  end;
+
+  if pCur^.pKeyInfo = nil then begin
+    { Table b-tree }
+    if p^.hasIncrblobCur <> 0 then
+      invalidateIncrblobCursors(p, pCur^.pgnoRoot, pX^.nKey, 0);
+
+    if ((pCur^.curFlags and BTCF_ValidNKey) <> 0) and
+       (pX^.nKey = pCur^.info.nKey) then begin
+      if (pCur^.info.nSize <> 0) and
+         (pCur^.info.nPayload = u32(pX^.nData + pX^.nZero)) then begin
+        Result := btreeOverwriteCell(pCur, pX);
+        Exit;
+      end;
+      loc := 0;
+    end else if loc = 0 then begin
+      rc := sqlite3BtreeTableMoveto(pCur, pX^.nKey,
+               (flags and BTREE_APPEND) shr 3, @loc);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+    end;
+  end else begin
+    { Index b-tree }
+    if (loc = 0) and ((flags and BTREE_SAVEPOSITION) = 0) then begin
+      if pX^.nMem <> 0 then begin
+        r2.pKeyInfo   := pCur^.pKeyInfo;
+        r2.aMem       := pX^.aMem;
+        r2.nField     := i32(pX^.nMem);
+        r2.default_rc := 0;
+        r2.eqSeen     := 0;
+        rc := sqlite3BtreeIndexMoveto(pCur, @r2, @loc);
+      end else
+        rc := btreeMoveto(pCur, pX^.pKey, pX^.nKey,
+                          (flags and BTREE_APPEND) shr 3, @loc);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+    end;
+    if loc = 0 then begin
+      getCellInfo(pCur);
+      if pCur^.info.nKey = pX^.nKey then begin
+        x2.pData := pX^.pKey;
+        x2.nData := i32(pX^.nKey);
+        x2.nZero := 0;
+        x2.pKey  := nil;
+        x2.nKey  := 0;
+        x2.aMem  := nil;
+        x2.nMem  := 0;
+        Result := btreeOverwriteCell(pCur, @x2);
+        Exit;
+      end;
+    end;
+  end;
+
+  pPage := pCur^.pPage;
+  if pPage^.nFree < 0 then begin
+    rc := btreeComputeFreeSpace(pPage);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+
+  newCell := p^.pBt^.pTmpSpace;
+  if (flags and BTREE_PREFORMAT) <> 0 then begin
+    szNew := p^.pBt^.nPreformatSize;
+    if szNew < 4 then begin
+      szNew       := 4;
+      newCell[3]  := 0;
+    end;
+  end else begin
+    rc := fillInCell(pPage, newCell, pX, szNew);
+    if rc <> SQLITE_OK then goto end_insert;
+  end;
+
+  idx := i32(pCur^.ix);
+  pCur^.info.nSize := 0;
+
+  if loc = 0 then begin
+    { Overwrite existing cell }
+    if idx >= i32(pPage^.nCell) then begin
+      rc := CORRUPT_PAGE(pPage);
+      goto end_insert;
+    end;
+    rc := sqlite3PagerWrite(pPage^.pDbPage);
+    if rc <> SQLITE_OK then goto end_insert;
+    oldCell := findCell(pPage, idx);
+    if pPage^.leaf = 0 then
+      Move(oldCell^, newCell^, 4);
+    BTREE_CLEAR_CELL(rc, pPage, oldCell, info);
+    invalidateOverflowCache(pCur);
+    if (info.nSize = u16(szNew)) and (info.nLocal = info.nPayload) and
+       (not ISAUTOVACUUM(p^.pBt) or (szNew < i32(pPage^.minLocal))) then begin
+      if (PtrUInt(oldCell) <
+          PtrUInt(pPage^.aData + pPage^.hdrOffset + 10)) then begin
+        rc := CORRUPT_PAGE(pPage);
+        goto end_insert;
+      end;
+      if PtrUInt(oldCell + szNew) > PtrUInt(pPage^.aDataEnd) then begin
+        rc := CORRUPT_PAGE(pPage);
+        goto end_insert;
+      end;
+      Move(newCell^, oldCell^, szNew);
+      Result := SQLITE_OK;
+      Exit;
+    end;
+    dropCell(pPage, idx, i32(info.nSize), @rc);
+    if rc <> SQLITE_OK then goto end_insert;
+  end else if (loc < 0) and (pPage^.nCell > 0) then begin
+    Inc(pCur^.ix);
+    idx := i32(pCur^.ix);
+    pCur^.curFlags := pCur^.curFlags and
+                      u8(not (BTCF_ValidNKey or BTCF_ValidOvfl));
+  end;
+
+  rc := insertCellFast(pPage, idx, newCell, szNew);
+
+  if pPage^.nOverflow <> 0 then begin
+    pCur^.curFlags := pCur^.curFlags and
+                      u8(not (BTCF_ValidNKey or BTCF_ValidOvfl));
+    rc := balance(pCur);
+    pCur^.pPage^.nOverflow := 0;
+    pCur^.eState := CURSOR_INVALID;
+    if ((flags and BTREE_SAVEPOSITION) <> 0) and (rc = SQLITE_OK) then begin
+      btreeReleaseAllCursorPages(pCur);
+      if pCur^.pKeyInfo <> nil then begin
+        pCur^.pKey := sqlite3Malloc(i32(pX^.nKey));
+        if pCur^.pKey = nil then
+          rc := SQLITE_NOMEM_BKPT
+        else
+          Move(pX^.pKey^, pCur^.pKey^, i32(pX^.nKey));
+      end;
+      pCur^.eState := CURSOR_REQUIRESEEK;
+      pCur^.nKey   := pX^.nKey;
+    end;
+  end;
+
+end_insert:
+  Result := rc;
 end;
 
 end.

@@ -613,9 +613,68 @@ begin
   Check('survived iPage=-1', True);
 end;
 
+{ ===== T19: btreeSetHasContent / btreeGetHasContent / btreeClearHasContent == }
+procedure RunT19;
+var
+  pBt : TBtShared;
+  rc  : i32;
+begin
+  WriteLn('T19: btreeSetHasContent / btreeGetHasContent / btreeClearHasContent');
+  FillChar(pBt, SizeOf(pBt), 0);
+  pBt.nPage := 200;  { bitvec will be created with this size }
+  { pHasContent starts nil — set page 5 in a bitvec }
+  rc := btreeSetHasContent(@pBt, 5);
+  Check('set pg5 rc=OK',          rc = SQLITE_OK);
+  Check('pHasContent non-nil',    pBt.pHasContent <> nil);
+  Check('get pg5=true',           btreeGetHasContent(@pBt, 5));
+  Check('get pg3=false',          not btreeGetHasContent(@pBt, 3));
+  { set another page }
+  rc := btreeSetHasContent(@pBt, 100);
+  Check('set pg100 rc=OK',        rc = SQLITE_OK);
+  Check('get pg100=true',         btreeGetHasContent(@pBt, 100));
+  Check('get pg5 still true',     btreeGetHasContent(@pBt, 5));
+  { clear destroys the bitvec }
+  btreeClearHasContent(@pBt);
+  Check('pHasContent nil after clear', pBt.pHasContent = nil);
+end;
+
+{ ===== T20: saveAllCursors — no-op when no cursors on root ================ }
+procedure RunT20;
+var
+  pBt : TBtShared;
+  cur : TBtCursor;
+  rc  : i32;
+begin
+  WriteLn('T20: saveAllCursors — no-op path');
+  FillChar(pBt, SizeOf(pBt), 0);
+  FillChar(cur, SizeOf(cur), 0);
+
+  { No cursors at all → should return SQLITE_OK }
+  pBt.pCursor := nil;
+  rc := saveAllCursors(@pBt, 1, nil);
+  Check('no cursors rc=OK', rc = SQLITE_OK);
+
+  { One cursor on a different root — should not be selected, rc=OK }
+  cur.pgnoRoot := 2;
+  cur.eState   := CURSOR_INVALID;
+  cur.iPage    := -1;   { no pages held }
+  cur.pBt      := @pBt;
+  cur.pNext    := nil;
+  pBt.pCursor  := @cur;
+  rc := saveAllCursors(@pBt, 1, nil);  { root=1, cursor is on root=2 }
+  Check('diff root rc=OK', rc = SQLITE_OK);
+
+  { Cursor on same root, CURSOR_INVALID, iPage=-1 — btreeReleaseAllCursorPages is safe }
+  cur.pgnoRoot := 1;
+  cur.eState   := CURSOR_INVALID;
+  cur.iPage    := -1;
+  rc := saveAllCursors(@pBt, 1, nil);
+  Check('invalid cursor rc=OK', rc = SQLITE_OK);
+end;
+
 { ===== main ================================================================ }
 begin
-  WriteLn('=== TestBtreeCompat (Phase 4.1 + 4.2) ===');
+  WriteLn('=== TestBtreeCompat (Phase 4.1 + 4.2 + 4.3) ===');
   WriteLn;
   RunT1;
   WriteLn;
@@ -652,6 +711,10 @@ begin
   RunT17;
   WriteLn;
   RunT18;
+  WriteLn;
+  RunT19;
+  WriteLn;
+  RunT20;
   WriteLn;
   WriteLn('Results: ', gPass, ' passed, ', gFail, ' failed');
   if gFail > 0 then
