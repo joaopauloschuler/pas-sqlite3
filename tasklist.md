@@ -1005,11 +1005,15 @@ storage. Correctness here is again checked by on-disk byte equality.
     `Boolean` vs `i32` arguments fixed with `ord()`.
   - Gate: `TestBtreeCompat.pas` T1–T20 all PASS (100 checks, 2026-04-23).
 
-- [ ] **4.4** Port delete path: `sqlite3BtreeDelete`, `clearCell`, `freePage`,
+- [X] **4.4** Port delete path: `sqlite3BtreeDelete`, `clearCell`, `freePage`,
   free-list management.
+  - Gate: `TestBtreeCompat.pas` T23 (delete mid-tree row) PASS (2026-04-23).
 
-- [ ] **4.5** Port schema/metadata: `sqlite3BtreeGetMeta`, `sqlite3BtreeUpdateMeta`,
+- [X] **4.5** Port schema/metadata: `sqlite3BtreeGetMeta`, `sqlite3BtreeUpdateMeta`,
   auto-vacuum (if enabled), incremental vacuum.
+  - Also fixed: `balance_quick` divider-key extraction bug (C post-increment
+    vs Pascal while-loop semantics for nPayload varint skip); fixes T28 seek/count.
+  - Gate: `TestBtreeCompat.pas` T1–T28 all PASS (156 checks, 2026-04-23).
 
 - [ ] **4.6** `TestBtreeCompat.pas`: a sequence of insert / update / delete /
   seek operations on a corpus of keys (random, sorted, reverse-sorted,

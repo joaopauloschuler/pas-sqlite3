@@ -23,8 +23,10 @@ program TestBtreeCompat;
 
 uses
   SysUtils,
+  BaseUnix,
   passqlite3types,
   passqlite3util,
+  passqlite3os,
   passqlite3pcache,
   passqlite3pager,
   passqlite3btree;
@@ -672,9 +674,457 @@ begin
   Check('invalid cursor rc=OK', rc = SQLITE_OK);
 end;
 
+{ ===========================================================================
+  Helper: open a btree backed by a temp file, return PBtree.
+  Returns SQLITE_OK and sets pBtr; caller must call sqlite3BtreeClose.
+  =========================================================================== }
+function OpenTempBtree(const dbPath: string; out pBtr: PBtree): i32;
+var
+  pVfs : Psqlite3_vfs;
+  flags: i32;
+begin
+  pBtr  := nil;
+  pVfs  := sqlite3_vfs_find(nil);
+  if pVfs = nil then begin Result := SQLITE_ERROR; Exit; end;
+  flags := SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE or SQLITE_OPEN_MAIN_DB;
+  Result := sqlite3BtreeOpen(pVfs, PChar(dbPath), nil, @pBtr, 0, flags);
+end;
+
+{ ===========================================================================
+  T21: sqlite3BtreeOpen / sqlite3BtreeClose — open a new DB, read header meta
+  =========================================================================== }
+procedure RunT21;
+const DB21 = '/tmp/bt_t21.db';
+var
+  pBtr : PBtree;
+  rc   : i32;
+  meta : u32;
+begin
+  WriteLn('T21: sqlite3BtreeOpen / sqlite3BtreeClose');
+  if FileExists(DB21) then DeleteFile(DB21);
+
+  rc := OpenTempBtree(DB21, pBtr);
+  Check('T21 open rc=OK', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+
+  { Begin read-only transaction so page 1 is locked }
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);  { wrflag=1 → write }
+  Check('T21 BeginTrans rc=OK', rc = SQLITE_OK);
+
+  { After newDatabase(), page 1 has valid header; read schema-version meta }
+  meta := $DEAD;
+  sqlite3BtreeGetMeta(pBtr, BTREE_SCHEMA_VERSION, @meta);
+  Check('T21 schema version = 0', meta = 0);
+
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T21 commit rc=OK', rc = SQLITE_OK);
+
+  rc := sqlite3BtreeClose(pBtr);
+  Check('T21 close rc=OK', rc = SQLITE_OK);
+
+  if FileExists(DB21) then DeleteFile(DB21);
+end;
+
+{ ===========================================================================
+  T22: sqlite3BtreeCreateTable + sqlite3BtreeInsert into real pager
+  =========================================================================== }
+procedure RunT22;
+const DB22 = '/tmp/bt_t22.db';
+var
+  pBtr    : PBtree;
+  cur     : TBtCursor;
+  rc      : i32;
+  iRoot   : Pgno;
+  pX      : TBtreePayload;
+  rowCount: i64;
+  i       : i32;
+begin
+  WriteLn('T22: sqlite3BtreeCreateTable + multi-row insert + BtreeCount');
+  if FileExists(DB22) then DeleteFile(DB22);
+  rc := OpenTempBtree(DB22, pBtr);
+  Check('T22 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+  Check('T22 begin write', rc = SQLITE_OK);
+
+  { Create a new integer-key table }
+  iRoot := 0;
+  rc := sqlite3BtreeCreateTable(pBtr, @iRoot, BTREE_INTKEY or BTREE_LEAFDATA);
+  Check('T22 createTable rc=OK', rc = SQLITE_OK);
+  Check('T22 iRoot > 0', iRoot > 0);
+
+  { Open a write cursor on the new table }
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 1{write}, nil, @cur);
+  Check('T22 cursor rc=OK', rc = SQLITE_OK);
+
+  { Insert rows 1..10 }
+  for i := 1 to 10 do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey  := i64(i);
+    pX.pData := @i;
+    pX.nData := SizeOf(i);
+    rc := sqlite3BtreeInsert(@cur, @pX, 0, 0);
+    if rc <> SQLITE_OK then break;
+  end;
+  Check('T22 insert 10 rows rc=OK', rc = SQLITE_OK);
+
+  { Count entries }
+  rc := moveToRoot(@cur);
+  rowCount := -1;
+  rc := sqlite3BtreeCount(nil, @cur, @rowCount);
+  Check('T22 count rc=OK', rc = SQLITE_OK);
+  Check('T22 count = 10', rowCount = 10);
+
+  rc := sqlite3BtreeCloseCursor(@cur);
+  Check('T22 closeCursor rc=OK', rc = SQLITE_OK);
+
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T22 commit rc=OK', rc = SQLITE_OK);
+
+  rc := sqlite3BtreeClose(pBtr);
+  Check('T22 close rc=OK', rc = SQLITE_OK);
+  if FileExists(DB22) then DeleteFile(DB22);
+end;
+
+{ ===========================================================================
+  T23: sqlite3BtreeDelete — single row delete
+  =========================================================================== }
+procedure RunT23;
+const DB23 = '/tmp/bt_t23.db';
+var
+  pBtr   : PBtree;
+  cur    : TBtCursor;
+  rc     : i32;
+  iRoot  : Pgno;
+  pX     : TBtreePayload;
+  pRes   : i32;
+  cnt    : i64;
+  i      : i32;
+begin
+  WriteLn('T23: sqlite3BtreeDelete — delete one row');
+  if FileExists(DB23) then DeleteFile(DB23);
+  rc := OpenTempBtree(DB23, pBtr);
+  Check('T23 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+  Check('T23 begin', rc = SQLITE_OK);
+
+  iRoot := 0;
+  rc := sqlite3BtreeCreateTable(pBtr, @iRoot, BTREE_INTKEY or BTREE_LEAFDATA);
+  Check('T23 create', rc = SQLITE_OK);
+
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 1, nil, @cur);
+  Check('T23 cursor', rc = SQLITE_OK);
+
+  { Insert rows 1..5 }
+  for i := 1 to 5 do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey  := i64(i);
+    pX.pData := @i;
+    pX.nData := SizeOf(i);
+    rc := sqlite3BtreeInsert(@cur, @pX, 0, 0);
+    if rc <> SQLITE_OK then break;
+  end;
+  Check('T23 insert 5', rc = SQLITE_OK);
+
+  { Seek to row 3 }
+  pRes := -1;
+  rc := sqlite3BtreeTableMoveto(@cur, 3, 0, @pRes);
+  Check('T23 seek row3 rc=OK', rc = SQLITE_OK);
+  Check('T23 seek exact', pRes = 0);
+
+  { Delete row 3 }
+  rc := sqlite3BtreeDelete(@cur, 0);
+  Check('T23 delete rc=OK', rc = SQLITE_OK);
+
+  { Count: should be 4 }
+  rc := moveToRoot(@cur);
+  cnt := -1;
+  if rc = SQLITE_OK then
+    rc := sqlite3BtreeCount(nil, @cur, @cnt);
+  Check('T23 count=4', cnt = 4);
+
+  sqlite3BtreeCloseCursor(@cur);
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T23 commit', rc = SQLITE_OK);
+  sqlite3BtreeClose(pBtr);
+  if FileExists(DB23) then DeleteFile(DB23);
+end;
+
+{ ===========================================================================
+  T24: sqlite3BtreeClearTable — remove all rows, root page stays
+  =========================================================================== }
+procedure RunT24;
+const DB24 = '/tmp/bt_t24.db';
+var
+  pBtr   : PBtree;
+  cur    : TBtCursor;
+  rc     : i32;
+  iRoot  : Pgno;
+  pX     : TBtreePayload;
+  cnt    : i64;
+  i      : i32;
+begin
+  WriteLn('T24: sqlite3BtreeClearTable');
+  if FileExists(DB24) then DeleteFile(DB24);
+  rc := OpenTempBtree(DB24, pBtr);
+  Check('T24 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+
+  iRoot := 0;
+  sqlite3BtreeCreateTable(pBtr, @iRoot, BTREE_INTKEY or BTREE_LEAFDATA);
+
+  FillChar(cur, SizeOf(cur), 0);
+  sqlite3BtreeCursor(pBtr, iRoot, 1, nil, @cur);
+  for i := 1 to 8 do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey := i64(i); pX.pData := @i; pX.nData := SizeOf(i);
+    sqlite3BtreeInsert(@cur, @pX, 0, 0);
+  end;
+  sqlite3BtreeCloseCursor(@cur);
+
+  { Clear the table }
+  rc := sqlite3BtreeClearTable(pBtr, i32(iRoot), nil);
+  Check('T24 clearTable rc=OK', rc = SQLITE_OK);
+
+  { Re-open cursor: count should be 0 }
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 1, nil, @cur);
+  Check('T24 cursor-after-clear rc=OK', rc = SQLITE_OK);
+  cnt := -1;
+  moveToRoot(@cur);
+  rc := sqlite3BtreeCount(nil, @cur, @cnt);
+  Check('T24 count=0 after clear', cnt = 0);
+  sqlite3BtreeCloseCursor(@cur);
+
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T24 commit', rc = SQLITE_OK);
+  sqlite3BtreeClose(pBtr);
+  if FileExists(DB24) then DeleteFile(DB24);
+end;
+
+{ ===========================================================================
+  T25: sqlite3BtreeDropTable — drop a table
+  =========================================================================== }
+procedure RunT25;
+const DB25 = '/tmp/bt_t25.db';
+var
+  pBtr  : PBtree;
+  cur   : TBtCursor;
+  rc    : i32;
+  iRoot : Pgno;
+  pX    : TBtreePayload;
+  iMoved: i32;
+  i     : i32;
+begin
+  WriteLn('T25: sqlite3BtreeDropTable');
+  if FileExists(DB25) then DeleteFile(DB25);
+  rc := OpenTempBtree(DB25, pBtr);
+  Check('T25 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+
+  { Create and populate a table }
+  iRoot := 0;
+  sqlite3BtreeCreateTable(pBtr, @iRoot, BTREE_INTKEY or BTREE_LEAFDATA);
+  FillChar(cur, SizeOf(cur), 0);
+  sqlite3BtreeCursor(pBtr, iRoot, 1, nil, @cur);
+  for i := 1 to 5 do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey := i64(i); pX.pData := @i; pX.nData := SizeOf(i);
+    sqlite3BtreeInsert(@cur, @pX, 0, 0);
+  end;
+  sqlite3BtreeCloseCursor(@cur);
+
+  { Drop the table }
+  iMoved := -1;
+  rc := sqlite3BtreeDropTable(pBtr, i32(iRoot), @iMoved);
+  Check('T25 drop rc=OK', rc = SQLITE_OK);
+  Check('T25 iMoved=0 (no autovacuum)', iMoved = 0);
+
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T25 commit', rc = SQLITE_OK);
+  sqlite3BtreeClose(pBtr);
+  if FileExists(DB25) then DeleteFile(DB25);
+end;
+
+{ ===========================================================================
+  T26: sqlite3BtreeGetMeta / sqlite3BtreeUpdateMeta
+  =========================================================================== }
+procedure RunT26;
+const DB26 = '/tmp/bt_t26.db';
+var
+  pBtr  : PBtree;
+  rc    : i32;
+  meta  : u32;
+begin
+  WriteLn('T26: sqlite3BtreeGetMeta / sqlite3BtreeUpdateMeta');
+  if FileExists(DB26) then DeleteFile(DB26);
+  rc := OpenTempBtree(DB26, pBtr);
+  Check('T26 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+  Check('T26 begin', rc = SQLITE_OK);
+
+  { Read initial schema version: should be 0 for new DB }
+  meta := $DEAD;
+  sqlite3BtreeGetMeta(pBtr, BTREE_SCHEMA_VERSION, @meta);
+  Check('T26 schema_ver initial=0', meta = 0);
+
+  { Write schema version = 42 }
+  rc := sqlite3BtreeUpdateMeta(pBtr, BTREE_SCHEMA_VERSION, 42);
+  Check('T26 updateMeta rc=OK', rc = SQLITE_OK);
+
+  { Read back }
+  meta := 0;
+  sqlite3BtreeGetMeta(pBtr, BTREE_SCHEMA_VERSION, @meta);
+  Check('T26 schema_ver read-back=42', meta = 42);
+
+  { Update user version }
+  rc := sqlite3BtreeUpdateMeta(pBtr, BTREE_USER_VERSION, 7);
+  Check('T26 user_ver update rc=OK', rc = SQLITE_OK);
+  meta := 0;
+  sqlite3BtreeGetMeta(pBtr, BTREE_USER_VERSION, @meta);
+  Check('T26 user_ver read-back=7', meta = 7);
+
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T26 commit', rc = SQLITE_OK);
+  sqlite3BtreeClose(pBtr);
+  if FileExists(DB26) then DeleteFile(DB26);
+end;
+
+{ ===========================================================================
+  T27: sqlite3BtreeRollback — write then rollback; data must be gone
+  =========================================================================== }
+procedure RunT27;
+const DB27 = '/tmp/bt_t27.db';
+var
+  pBtr  : PBtree;
+  cur   : TBtCursor;
+  rc    : i32;
+  iRoot : Pgno;
+  pX    : TBtreePayload;
+  pRes  : i32;
+  i     : i32;
+begin
+  WriteLn('T27: sqlite3BtreeRollback — changes discarded');
+  if FileExists(DB27) then DeleteFile(DB27);
+  rc := OpenTempBtree(DB27, pBtr);
+  Check('T27 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+
+  { First commit: create table }
+  sqlite3BtreeBeginTrans(pBtr, 1, nil);
+  iRoot := 0;
+  sqlite3BtreeCreateTable(pBtr, @iRoot, BTREE_INTKEY or BTREE_LEAFDATA);
+  sqlite3BtreeCommit(pBtr);
+
+  { Second transaction: insert 5 rows then rollback }
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+  Check('T27 begin 2nd', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  sqlite3BtreeCursor(pBtr, iRoot, 1, nil, @cur);
+  for i := 1 to 5 do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey := i64(i); pX.pData := @i; pX.nData := SizeOf(i);
+    sqlite3BtreeInsert(@cur, @pX, 0, 0);
+  end;
+  sqlite3BtreeCloseCursor(@cur);
+
+  rc := sqlite3BtreeRollback(pBtr, SQLITE_OK, 0);
+  Check('T27 rollback rc=OK', rc = SQLITE_OK);
+
+  { Re-open read transaction: table should be empty }
+  rc := sqlite3BtreeBeginTrans(pBtr, 0, nil);  { read-only }
+  Check('T27 begin read', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 0{read}, nil, @cur);
+  Check('T27 read cursor', rc = SQLITE_OK);
+  pRes := -1;
+  rc := sqlite3BtreeFirst(@cur, @pRes);
+  Check('T27 First after rollback: empty', pRes = 1);  { 1 = empty }
+  sqlite3BtreeCloseCursor(@cur);
+  sqlite3BtreeRollback(pBtr, SQLITE_OK, 0);
+
+  sqlite3BtreeClose(pBtr);
+  if FileExists(DB27) then DeleteFile(DB27);
+end;
+
+{ ===========================================================================
+  T28: sqlite3BtreeDelete in a multi-page tree (>1 page) — rebalance path
+  =========================================================================== }
+procedure RunT28;
+const DB28 = '/tmp/bt_t28.db';
+var
+  pBtr   : PBtree;
+  cur    : TBtCursor;
+  rc     : i32;
+  iRoot  : Pgno;
+  pX     : TBtreePayload;
+  cnt    : i64;
+  pRes   : i32;
+  i      : i32;
+  data   : array[0..255] of u8;
+begin
+  WriteLn('T28: delete mid-tree row in multi-page btree');
+  if FileExists(DB28) then DeleteFile(DB28);
+  rc := OpenTempBtree(DB28, pBtr);
+  Check('T28 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+  Check('T28 begin', rc = SQLITE_OK);
+
+  iRoot := 0;
+  sqlite3BtreeCreateTable(pBtr, @iRoot, BTREE_INTKEY or BTREE_LEAFDATA);
+  FillChar(cur, SizeOf(cur), 0);
+  sqlite3BtreeCursor(pBtr, iRoot, 1, nil, @cur);
+
+  { Insert 100 rows with 200-byte payload to force page splits }
+  FillChar(data, SizeOf(data), $AB);
+  for i := 1 to 100 do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey  := i64(i);
+    pX.pData := @data[0];
+    pX.nData := 200;
+    rc := sqlite3BtreeInsert(@cur, @pX, BTREE_APPEND, 0);
+    if rc <> SQLITE_OK then break;
+  end;
+  Check('T28 insert 100', rc = SQLITE_OK);
+
+  { Delete row 50 (mid-tree) }
+  pRes := -1;
+  rc := sqlite3BtreeTableMoveto(@cur, 50, 0, @pRes);
+  Check('T28 seek 50', (rc = SQLITE_OK) and (pRes = 0));
+  if (rc = SQLITE_OK) and (pRes = 0) then begin
+    rc := sqlite3BtreeDelete(@cur, 0);
+    Check('T28 delete 50 rc=OK', rc = SQLITE_OK);
+  end;
+
+  { Count: should be 99 }
+  moveToRoot(@cur);
+  cnt := -1;
+  rc := sqlite3BtreeCount(nil, @cur, @cnt);
+  Check('T28 count=99', cnt = 99);
+
+  sqlite3BtreeCloseCursor(@cur);
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T28 commit', rc = SQLITE_OK);
+  sqlite3BtreeClose(pBtr);
+  if FileExists(DB28) then DeleteFile(DB28);
+end;
+
 { ===== main ================================================================ }
 begin
-  WriteLn('=== TestBtreeCompat (Phase 4.1 + 4.2 + 4.3) ===');
+  sqlite3OsInit;
+  sqlite3PcacheInitialize;
+  WriteLn('=== TestBtreeCompat (Phase 4.1 + 4.2 + 4.3 + 4.4 + 4.5) ===');
   WriteLn;
   RunT1;
   WriteLn;
@@ -715,6 +1165,23 @@ begin
   RunT19;
   WriteLn;
   RunT20;
+  WriteLn;
+  { Phase 4.4 + 4.5: delete path, schema, metadata }
+  RunT21;
+  WriteLn;
+  RunT22;
+  WriteLn;
+  RunT23;
+  WriteLn;
+  RunT24;
+  WriteLn;
+  RunT25;
+  WriteLn;
+  RunT26;
+  WriteLn;
+  RunT27;
+  WriteLn;
+  RunT28;
   WriteLn;
   WriteLn('Results: ', gPass, ' passed, ', gFail, ' failed');
   if gFail > 0 then

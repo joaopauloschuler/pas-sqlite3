@@ -106,6 +106,18 @@ const
   BTREE_INTKEY              = 1;
   BTREE_BLOBKEY             = 2;
 
+  { btree.h lines 152-161: meta-data slot indices for GetMeta/UpdateMeta }
+  BTREE_FREE_PAGE_COUNT     = 0;
+  BTREE_SCHEMA_VERSION      = 1;
+  BTREE_FILE_FORMAT         = 2;
+  BTREE_DEFAULT_CACHE_SIZE  = 3;
+  BTREE_LARGEST_ROOT_PAGE   = 4;
+  BTREE_TEXT_ENCODING       = 5;
+  BTREE_USER_VERSION        = 6;
+  BTREE_INCR_VACUUM         = 7;
+  BTREE_APPLICATION_ID      = 8;
+  BTREE_DATA_VERSION        = 15;  { virtual meta-value: DataVersion from pager }
+
   { SQLITE_CellSizeCk (from sqliteInt.h) — enables PRAGMA cell_size_check }
   SQLITE_CellSizeCk = $00200000;
 
@@ -477,6 +489,82 @@ procedure freePage(pPage: PMemPage; pRC: Pi32);
 
 { sqlite3PagerRekey — wraps sqlite3PcacheMove (used by balance_nonroot) }
 procedure sqlite3PagerRekey(pPg: PDbPage; iNew: Pgno; flags: u16);
+
+{ ===========================================================================
+  Phase 4.4 — Pager page-refcount bridge
+  =========================================================================== }
+function  sqlite3PagerPageRefcount(pPage: PDbPage): i32;
+
+{ ===========================================================================
+  Phase 4.4 — B-tree mutex stubs (btmutex.c — SQLITE_OMIT_SHARED_CACHE path)
+  =========================================================================== }
+procedure sqlite3BtreeEnter(p: PBtree);
+procedure sqlite3BtreeLeave(p: PBtree);
+function  sqlite3BtreeHoldsMutex(p: PBtree): i32;
+procedure sqlite3BtreeEnterCursor(pCur: PBtCursor);
+procedure sqlite3BtreeLeaveCursor(pCur: PBtCursor);
+
+{ ===========================================================================
+  Phase 4.4 — B-tree open/close/lifecycle
+  =========================================================================== }
+type
+  PPBtree = ^PBtree;  { pointer-to-pointer for sqlite3BtreeOpen out-param }
+
+{ SQLite database file magic header (first 16 bytes of page 1) }
+const
+  SCHEMA_ROOT         = 1;   { Root page of sqlite_master }
+  BTREE_ZERODATA      = 2;   { Index tables have no data }
+  BTREE_LEAFDATA      = 4;   { Table b-trees have leaf data }
+
+{ pager-callback: called when a page is reloaded after a write-back }
+procedure pageReinit(pData: PDbPage);
+function  btreeInvokeBusyHandler(pArg: Pointer): i32;
+
+function  lockBtree(pBt: PBtShared): i32;
+function  newDatabase(pBt: PBtShared): i32;
+procedure btreeSetNPage(pBt: PBtShared; pPage1: PMemPage);
+function  sqlite3BtreeNewDb(p: PBtree): i32;
+
+function  sqlite3BtreeOpen(pVfs: Psqlite3_vfs; zFilename: PChar;
+                           db: Psqlite3; ppBtree: PPBtree;
+                           flags: i32; vfsFlags: i32): i32;
+function  sqlite3BtreeClose(p: PBtree): i32;
+function  sqlite3BtreePager(p: PBtree): PPager;
+
+{ ===========================================================================
+  Phase 4.4 — Transaction lifecycle
+  =========================================================================== }
+function  sqlite3BtreeTripAllCursors(pBtree: PBtree;
+                                     errCode: i32; writeOnly: i32): i32;
+procedure btreeEndTransaction(p: PBtree);
+function  btreeBeginTrans(p: PBtree; wrflag: i32; pSchemaVersion: Pi32): i32;
+function  sqlite3BtreeBeginTrans(p: PBtree; wrflag: i32;
+                                  pSchemaVersion: Pi32): i32;
+function  sqlite3BtreeCommitPhaseOne(p: PBtree; zSuperJrnl: PChar): i32;
+function  sqlite3BtreeCommitPhaseTwo(p: PBtree; bCleanup: i32): i32;
+function  sqlite3BtreeCommit(p: PBtree): i32;
+function  sqlite3BtreeRollback(p: PBtree; tripCode: i32; writeOnly: i32): i32;
+
+{ ===========================================================================
+  Phase 4.4 — Delete path
+  =========================================================================== }
+function  sqlite3BtreeDelete(pCur: PBtCursor; flags: u8): i32;
+
+{ ===========================================================================
+  Phase 4.5 — Schema / metadata
+  =========================================================================== }
+function  clearDatabasePage(pBt: PBtShared; pgno: Pgno;
+                             freePageFlag: i32; pnChange: Pi64): i32;
+function  sqlite3BtreeClearTable(p: PBtree; iTable: i32;
+                                  pnChange: Pi64): i32;
+function  sqlite3BtreeClearTableOfCursor(pCur: PBtCursor): i32;
+function  btreeDropTable(p: PBtree; iTable: Pgno; piMoved: Pi32): i32;
+function  sqlite3BtreeDropTable(p: PBtree; iTable: i32; piMoved: Pi32): i32;
+function  btreeCreateTable(p: PBtree; piTable: PPgno; createTabFlags: i32): i32;
+function  sqlite3BtreeCreateTable(p: PBtree; piTable: PPgno; flags: i32): i32;
+procedure sqlite3BtreeGetMeta(p: PBtree; idx: i32; pMeta: Pu32);
+function  sqlite3BtreeUpdateMeta(p: PBtree; idx: i32; iMeta: u32): i32;
+function  sqlite3BtreeCount(db: Pointer; pCur: PBtCursor; pnEntry: Pi64): i32;
 
 implementation
 
@@ -4087,6 +4175,7 @@ begin
   pStop := pCell + 9;
   while (pCell^ and $80 <> 0) and (PtrUInt(pCell) < PtrUInt(pStop)) do
     Inc(pCell);
+  Inc(pCell);  { advance past terminal varint byte, matching C's post-increment semantics }
   pStop := pCell + 9;
   while True do begin
     pOut^ := pCell^;
@@ -4096,9 +4185,10 @@ begin
       Break;
   end;
 
-  if rc = SQLITE_OK then
+  if rc = SQLITE_OK then begin
     rc := insertCell(pParent, i32(pParent^.nCell), pSpace,
                      i32(pOut - pSpace), nil, pPage^.pgno);
+  end;
   put4byte(pParent^.aData + pParent^.hdrOffset + 8, pgnoNew);
   releasePage(pNew);
   Result := rc;
@@ -5029,6 +5119,1004 @@ begin
   end;
 
 end_insert:
+  Result := rc;
+end;
+
+{ ===========================================================================
+  Phase 4.4 — Pager page-refcount bridge
+  =========================================================================== }
+
+{ btree.c ~2494: sqlite3PagerPageRefcount — wraps pcache refcount }
+function sqlite3PagerPageRefcount(pPage: PDbPage): i32;
+begin
+  Result := i32(sqlite3PcachePageRefcount(pPage));
+end;
+
+{ ===========================================================================
+  Phase 4.4 — B-tree mutex stubs (btmutex.c — SQLITE_OMIT_SHARED_CACHE path)
+  Shared-cache is omitted for this port.  In the non-threadsafe, non-shared
+  path the only thing sqlite3BtreeEnter does is copy p->db to p->pBt->db.
+  =========================================================================== }
+
+procedure sqlite3BtreeEnter(p: PBtree);
+begin
+  p^.pBt^.db := p^.db;
+end;
+
+procedure sqlite3BtreeLeave(p: PBtree);
+begin
+  { no-op in non-threadsafe, non-shared-cache build }
+end;
+
+function sqlite3BtreeHoldsMutex(p: PBtree): i32;
+begin
+  Result := 1;  { always true when shared-cache is omitted }
+end;
+
+procedure sqlite3BtreeEnterCursor(pCur: PBtCursor);
+begin
+  sqlite3BtreeEnter(pCur^.pBtree);
+end;
+
+procedure sqlite3BtreeLeaveCursor(pCur: PBtCursor);
+begin
+  sqlite3BtreeLeave(pCur^.pBtree);
+end;
+
+{ ===========================================================================
+  Phase 4.4 — pageReinit callback
+  btree.c lines 2478-2496
+  Called by the pager when a page is pulled from the cache and must be
+  re-initialised (e.g. after a rollback that cleared the page content).
+  =========================================================================== }
+
+procedure pageReinit(pData: PDbPage);
+var
+  pPage: PMemPage;
+begin
+  pPage := PMemPage(sqlite3PagerGetExtra(pData));
+  if pPage^.isInit <> 0 then begin
+    pPage^.isInit := 0;
+    if sqlite3PagerPageRefcount(pData) > 1 then
+      btreeInitPage(pPage);
+  end;
+end;
+
+{ btree.c lines 2500-2506: busy-handler callback registered with pager }
+function btreeInvokeBusyHandler(pArg: Pointer): i32;
+begin
+  { Without a real db->busyHandler we simply return 0 (do not retry). }
+  Result := 0;
+end;
+
+{ ===========================================================================
+  lockBtree — read page 1 and initialise BtShared fields
+  btree.c lines 3278-3501
+  =========================================================================== }
+
+const
+  { SQLite database magic header (btree.c line ~140) }
+  zMagicHeader: array[0..15] of u8 = (
+    $53,$51,$4C,$69,$74,$65,$20,$66,$6F,$72,$6D,$61,$74,$20,$33,$00);
+    { "SQLite format 3\0" }
+
+function lockBtree(pBt: PBtShared): i32;
+var
+  pPage1  : PMemPage;
+  rc      : i32;
+  nPage   : u32;
+  nPageFile: i32;
+  pageSize : u32;
+  usableSize: u32;
+  page1   : Pu8;
+  isOpen  : i32;
+  label page1_init_failed;
+begin
+  nPageFile := 0;
+  rc := sqlite3PagerSharedLock(pBt^.pPager);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  rc := btreeGetPage(pBt, 1, pPage1, 0);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  nPage := get4byte(Pu8(pPage1^.aData) + 28);
+  sqlite3PagerPagecount(pBt^.pPager, @nPageFile);
+  if (nPage = 0) or
+     (CompareMem(Pu8(pPage1^.aData) + 24, Pu8(pPage1^.aData) + 92, 4) = False) then
+    nPage := u32(nPageFile);
+
+  if nPage > 0 then begin
+    page1 := pPage1^.aData;
+    rc := SQLITE_NOTADB;
+
+    { EVIDENCE-OF: R-43737-39999 check magic header }
+    if CompareMem(page1, @zMagicHeader[0], 16) = False then
+      goto page1_init_failed;
+
+    { version write/read check }
+    if page1[18] > 2 then
+      pBt^.btsFlags := pBt^.btsFlags or BTS_READ_ONLY;
+    if page1[19] > 2 then
+      goto page1_init_failed;
+
+    { WAL mode check }
+    if (page1[19] = 2) and ((pBt^.btsFlags and BTS_NO_WAL) = 0) then begin
+      { WAL mode: open WAL and return; caller will call again }
+      isOpen := 0;
+      rc := sqlite3PagerOpenWal(pBt^.pPager, @isOpen);
+      if rc <> SQLITE_OK then goto page1_init_failed;
+      if isOpen = 0 then begin
+        releasePageOne(pPage1);
+        Result := SQLITE_OK;
+        Exit;
+      end;
+      rc := SQLITE_NOTADB;
+    end;
+
+    { payload fraction bytes must be 64/32/32 }
+    if (page1[21] <> 64) or (page1[22] <> 32) or (page1[23] <> 32) then
+      goto page1_init_failed;
+
+    pageSize    := (u32(page1[16]) shl 8) or (u32(page1[17]) shl 16);
+    if ((pageSize - 1) and pageSize) <> 0 then goto page1_init_failed;
+    if pageSize > SQLITE_MAX_PAGE_SIZE then goto page1_init_failed;
+    if pageSize <= 256 then goto page1_init_failed;
+
+    usableSize := pageSize - page1[20];
+    if pageSize <> pBt^.pageSize then begin
+      { page size mismatch: reconfigure and return OK; caller retries }
+      releasePageOne(pPage1);
+      pBt^.usableSize := usableSize;
+      pBt^.pageSize   := pageSize;
+      pBt^.btsFlags   := pBt^.btsFlags or BTS_PAGESIZE_FIXED;
+      freeTempSpace(pBt);
+      Result := sqlite3PagerSetPagesize(pBt^.pPager, @pBt^.pageSize,
+                                        i32(pageSize) - i32(usableSize));
+      Exit;
+    end;
+    if nPage > u32(nPageFile) then begin
+      { nPage in header > actual file size → treat as corrupt }
+      rc := SQLITE_CORRUPT_BKPT;
+      goto page1_init_failed;
+    end;
+    if usableSize < 480 then goto page1_init_failed;
+
+    pBt^.btsFlags   := pBt^.btsFlags or BTS_PAGESIZE_FIXED;
+    pBt^.pageSize   := pageSize;
+    pBt^.usableSize := usableSize;
+    { autovacuum flags from header meta[4] / meta[7] }
+    pBt^.autoVacuum := u8(get4byte(page1 + 36 + 4*4));
+    pBt^.incrVacuum := u8(get4byte(page1 + 36 + 7*4));
+  end;
+
+  { Recompute page-size-dependent limits }
+  pBt^.maxLocal        := u16((pBt^.usableSize - 12) * 64 div 255 - 23);
+  pBt^.minLocal        := u16((pBt^.usableSize - 12) * 32 div 255 - 23);
+  pBt^.maxLeaf         := u16(pBt^.usableSize - 35);
+  pBt^.minLeaf         := pBt^.minLocal;
+  if pBt^.maxLocal > 127 then
+    pBt^.max1bytePayload := 127
+  else
+    pBt^.max1bytePayload := u8(pBt^.maxLocal);
+
+  pBt^.pPage1 := pPage1;
+  pBt^.nPage  := nPage;
+  Result := SQLITE_OK;
+  Exit;
+
+page1_init_failed:
+  releasePageOne(pPage1);
+  pBt^.pPage1 := nil;
+  Result := rc;
+end;
+
+{ ===========================================================================
+  newDatabase — initialise an empty database (page 1 only)
+  btree.c lines 3506-3552
+  =========================================================================== }
+
+function newDatabase(pBt: PBtShared): i32;
+var
+  pP1 : PMemPage;
+  data: Pu8;
+  rc  : i32;
+begin
+  if pBt^.nPage > 0 then begin Result := SQLITE_OK; Exit; end;
+  pP1  := pBt^.pPage1;
+  data := pP1^.aData;
+  rc   := sqlite3PagerWrite(pP1^.pDbPage);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  Move(zMagicHeader[0], data^, 16);
+  data[16] := u8((pBt^.pageSize shr 8) and $FF);
+  data[17] := u8((pBt^.pageSize shr 16) and $FF);
+  data[18] := 1;
+  data[19] := 1;
+  data[20] := u8(pBt^.pageSize - pBt^.usableSize);
+  data[21] := 64;
+  data[22] := 32;
+  data[23] := 32;
+  FillChar((data + 24)^, 100 - 24, 0);
+  zeroPage(pP1, PTF_INTKEY or PTF_LEAF or PTF_LEAFDATA);
+  pBt^.btsFlags := pBt^.btsFlags or BTS_PAGESIZE_FIXED;
+  put4byte(data + 36 + 4*4, u32(pBt^.autoVacuum));
+  put4byte(data + 36 + 7*4, u32(pBt^.incrVacuum));
+  pBt^.nPage := 1;
+  data[31] := 1;
+  Result := SQLITE_OK;
+end;
+
+{ btree.c lines 4499-4505: update nPage from page 1 header }
+procedure btreeSetNPage(pBt: PBtShared; pPage1: PMemPage);
+var nPage: i32;
+begin
+  nPage := i32(get4byte(pPage1^.aData + 28));
+  if nPage = 0 then
+    sqlite3PagerPagecount(pBt^.pPager, @nPage);
+  pBt^.nPage := u32(nPage);
+end;
+
+{ btree.c ~3553: sqlite3BtreeNewDb }
+function sqlite3BtreeNewDb(p: PBtree): i32;
+var rc: i32;
+begin
+  sqlite3BtreeEnter(p);
+  p^.pBt^.nPage := 0;
+  rc := newDatabase(p^.pBt);
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ ===========================================================================
+  sqlite3BtreeOpen — open or create a B-tree database
+  btree.c lines 2528-2917 (simplified: no shared-cache, single connection)
+  =========================================================================== }
+
+function sqlite3BtreeOpen(pVfs: Psqlite3_vfs; zFilename: PChar;
+                          db: Psqlite3; ppBtree: PPBtree;
+                          flags: i32; vfsFlags: i32): i32;
+var
+  pBt       : PBtShared;
+  p         : PBtree;
+  rc        : i32;
+  zDbHdr    : array[0..99] of u8;
+  nReserve  : i32;
+  iPageSize : u32;
+  label btree_open_out;
+begin
+  pBt := nil;
+  rc  := SQLITE_OK;
+  nReserve := -1;
+
+  p := PBtree(sqlite3MallocZero(SizeOf(TBtree)));
+  if p = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+  p^.inTrans := TRANS_NONE;
+  p^.db      := db;
+
+  pBt := PBtShared(sqlite3MallocZero(SizeOf(TBtShared)));
+  if pBt = nil then begin rc := SQLITE_NOMEM_BKPT; goto btree_open_out; end;
+
+  FillChar(zDbHdr[16], 8, 0);
+
+  rc := sqlite3PagerOpen(pVfs, pBt^.pPager, zFilename,
+                         SizeOf(TMemPage), flags, vfsFlags, @pageReinit);
+  if rc = SQLITE_OK then begin
+    rc := sqlite3PagerReadFileheader(pBt^.pPager, 100, @zDbHdr[0]);
+  end;
+  if rc <> SQLITE_OK then goto btree_open_out;
+
+  pBt^.openFlags := u8(flags);
+  pBt^.db        := db;
+  sqlite3PagerSetBusyHandler(pBt^.pPager, @btreeInvokeBusyHandler, pBt);
+  p^.pBt := pBt;
+
+  if sqlite3PagerIsreadonly(pBt^.pPager) <> 0 then
+    pBt^.btsFlags := pBt^.btsFlags or BTS_READ_ONLY;
+
+  { Determine page size from header bytes 16-17 }
+  iPageSize := (u32(zDbHdr[16]) shl 8) or (u32(zDbHdr[17]) shl 16);
+  if ((iPageSize - 1) and iPageSize) <> 0 then iPageSize := 0;
+  if (iPageSize > SQLITE_MAX_PAGE_SIZE) or (iPageSize <= 256) then
+    iPageSize := 0;
+  if iPageSize = 0 then iPageSize := SQLITE_DEFAULT_PAGE_SIZE;
+
+  nReserve := i32(zDbHdr[20]);
+  pBt^.btsFlags := pBt^.btsFlags or BTS_PAGESIZE_FIXED;
+  rc := sqlite3PagerSetPagesize(pBt^.pPager, @iPageSize, nReserve);
+  if rc <> SQLITE_OK then goto btree_open_out;
+  pBt^.pageSize   := iPageSize;
+  pBt^.usableSize := iPageSize - u32(zDbHdr[20]);
+  if pBt^.usableSize < 480 then pBt^.usableSize := iPageSize;
+
+  { Compute local payload limits }
+  pBt^.maxLocal := u16((pBt^.usableSize - 12) * 64 div 255 - 23);
+  pBt^.minLocal := u16((pBt^.usableSize - 12) * 32 div 255 - 23);
+  pBt^.maxLeaf  := u16(pBt^.usableSize - 35);
+  pBt^.minLeaf  := pBt^.minLocal;
+  if pBt^.maxLocal > 127 then
+    pBt^.max1bytePayload := 127
+  else
+    pBt^.max1bytePayload := u8(pBt^.maxLocal);
+
+  rc := allocateTempSpace(pBt);
+  if rc <> SQLITE_OK then goto btree_open_out;
+
+  ppBtree^ := p;
+  Result := SQLITE_OK;
+  Exit;
+
+btree_open_out:
+  if pBt <> nil then begin
+    if pBt^.pPager <> nil then
+      sqlite3PagerClose(pBt^.pPager, db);
+    freeTempSpace(pBt);
+    sqlite3_free(pBt);
+  end;
+  sqlite3_free(p);
+  ppBtree^ := nil;
+  Result := rc;
+end;
+
+{ ===========================================================================
+  sqlite3BtreeClose
+  btree.c lines 2917-2975 (simplified: no shared-cache)
+  =========================================================================== }
+
+function sqlite3BtreeClose(p: PBtree): i32;
+var pBt: PBtShared;
+begin
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  sqlite3BtreeRollback(p, SQLITE_OK, 0);
+  sqlite3BtreeLeave(p);
+  { No shared-cache list removal needed }
+  sqlite3PagerClose(pBt^.pPager, p^.db);
+  if pBt^.xFreeSchema <> nil then
+    pBt^.xFreeSchema(pBt^.pSchema);
+  freeTempSpace(pBt);
+  sqlite3_free(pBt);
+  sqlite3_free(p);
+  Result := SQLITE_OK;
+end;
+
+{ btree.c ~10557: sqlite3BtreePager }
+function sqlite3BtreePager(p: PBtree): PPager;
+begin
+  Result := p^.pBt^.pPager;
+end;
+
+{ ===========================================================================
+  Phase 4.4 — Transaction lifecycle
+  =========================================================================== }
+
+{ btree.c lines 4467-4497: sqlite3BtreeTripAllCursors }
+function sqlite3BtreeTripAllCursors(pBtree: PBtree;
+                                    errCode: i32; writeOnly: i32): i32;
+var
+  p : PBtCursor;
+  rc: i32;
+begin
+  rc := SQLITE_OK;
+  if pBtree <> nil then begin
+    sqlite3BtreeEnter(pBtree);
+    p := pBtree^.pBt^.pCursor;
+    while p <> nil do begin
+      if (writeOnly <> 0) and ((p^.curFlags and BTCF_WriteFlag) = 0) then begin
+        if (p^.eState = CURSOR_VALID) or (p^.eState = CURSOR_SKIPNEXT) then begin
+          rc := saveCursorPosition(p);
+          if rc <> SQLITE_OK then begin
+            sqlite3BtreeTripAllCursors(pBtree, rc, 0);
+            break;
+          end;
+        end;
+      end else begin
+        sqlite3BtreeClearCursor(p);
+        p^.eState    := CURSOR_FAULT;
+        p^.skipNext  := errCode;
+      end;
+      btreeReleaseAllCursorPages(p);
+      p := p^.pNext;
+    end;
+    sqlite3BtreeLeave(pBtree);
+  end;
+  Result := rc;
+end;
+
+{ btree.c lines 4336-4371: btreeEndTransaction }
+procedure btreeEndTransaction(p: PBtree);
+var pBt: PBtShared;
+begin
+  pBt := p^.pBt;
+  { No shared-cache table-lock lists to clear (SQLITE_OMIT_SHARED_CACHE) }
+  if p^.inTrans <> TRANS_NONE then begin
+    Dec(pBt^.nTransaction);
+    if pBt^.nTransaction = 0 then
+      pBt^.inTransaction := TRANS_NONE;
+  end;
+  p^.inTrans := TRANS_NONE;
+  unlockBtreeIfUnused(pBt);
+end;
+
+{ btree.c lines 3594-3798: btreeBeginTrans (simplified: no shared-cache) }
+function btreeBeginTrans(p: PBtree; wrflag: i32; pSchemaVersion: Pi32): i32;
+var
+  pBt    : PBtShared;
+  pPgr   : PPager;
+  rc     : i32;
+  pPg1   : PMemPage;
+  label trans_begun;
+begin
+  pBt    := p^.pBt;
+  pPgr   := pBt^.pPager;
+  rc     := SQLITE_OK;
+  sqlite3BtreeEnter(p);
+
+  if (p^.inTrans = TRANS_WRITE) or
+     ((p^.inTrans = TRANS_READ) and (wrflag = 0)) then begin
+    { already in requested mode }
+    goto trans_begun;
+  end;
+
+  if (pBt^.btsFlags and BTS_READ_ONLY) <> 0 then begin
+    rc := SQLITE_READONLY;
+    goto trans_begun;
+  end;
+
+  pBt^.btsFlags := pBt^.btsFlags and not BTS_INITIALLY_EMPTY;
+  if pBt^.nPage = 0 then
+    pBt^.btsFlags := pBt^.btsFlags or BTS_INITIALLY_EMPTY;
+
+  repeat
+    { Lock: read page 1 and init BtShared if not done yet }
+    while (pBt^.pPage1 = nil) do begin
+      rc := lockBtree(pBt);
+      if rc <> SQLITE_OK then break;
+    end;
+
+    if rc = SQLITE_OK then begin
+      if wrflag <> 0 then begin
+        rc := sqlite3PagerBegin(pPgr, ord(wrflag > 1), 0);
+        if rc = SQLITE_OK then
+          rc := newDatabase(pBt);
+      end;
+    end;
+
+    if rc <> SQLITE_OK then
+      unlockBtreeIfUnused(pBt);
+  until (rc and $FF) <> SQLITE_BUSY;
+
+  if rc = SQLITE_OK then begin
+    if p^.inTrans = TRANS_NONE then
+      Inc(pBt^.nTransaction);
+    if wrflag <> 0 then
+      p^.inTrans := TRANS_WRITE
+    else
+      p^.inTrans := TRANS_READ;
+    if p^.inTrans > pBt^.inTransaction then
+      pBt^.inTransaction := p^.inTrans;
+    if wrflag <> 0 then begin
+      pPg1 := pBt^.pPage1;
+      { Sync nPage in header with pBt^.nPage }
+      if pBt^.nPage <> get4byte(pPg1^.aData + 28) then begin
+        rc := sqlite3PagerWrite(pPg1^.pDbPage);
+        if rc = SQLITE_OK then
+          put4byte(pPg1^.aData + 28, pBt^.nPage);
+      end;
+    end;
+  end;
+
+trans_begun:
+  if rc = SQLITE_OK then begin
+    if pSchemaVersion <> nil then
+      pSchemaVersion^ := i32(get4byte(pBt^.pPage1^.aData + 40));
+    if wrflag <> 0 then
+      rc := sqlite3PagerOpenSavepoint(pPgr, 0);
+  end;
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c lines 3801-3812: sqlite3BtreeBeginTrans public wrapper }
+function sqlite3BtreeBeginTrans(p: PBtree; wrflag: i32;
+                                 pSchemaVersion: Pi32): i32;
+begin
+  if (p^.inTrans = TRANS_NONE) or
+     ((p^.inTrans = TRANS_READ) and (wrflag <> 0)) then
+    Result := btreeBeginTrans(p, wrflag, pSchemaVersion)
+  else begin
+    if pSchemaVersion <> nil then
+      pSchemaVersion^ := i32(get4byte(p^.pBt^.pPage1^.aData + 40));
+    Result := SQLITE_OK;
+  end;
+end;
+
+{ btree.c lines 4309-4328: sqlite3BtreeCommitPhaseOne }
+function sqlite3BtreeCommitPhaseOne(p: PBtree; zSuperJrnl: PChar): i32;
+var rc: i32;
+begin
+  rc := SQLITE_OK;
+  if p^.inTrans = TRANS_WRITE then begin
+    sqlite3BtreeEnter(p);
+    { no autovacuum in this port }
+    rc := sqlite3PagerCommitPhaseOne(p^.pBt^.pPager, zSuperJrnl, 0);
+    sqlite3BtreeLeave(p);
+  end;
+  Result := rc;
+end;
+
+{ btree.c lines 4398-4429: sqlite3BtreeCommitPhaseTwo }
+function sqlite3BtreeCommitPhaseTwo(p: PBtree; bCleanup: i32): i32;
+var rc: i32;
+begin
+  if p^.inTrans = TRANS_NONE then begin Result := SQLITE_OK; Exit; end;
+  sqlite3BtreeEnter(p);
+  if p^.inTrans = TRANS_WRITE then begin
+    rc := sqlite3PagerCommitPhaseTwo(p^.pBt^.pPager);
+    if (rc <> SQLITE_OK) and (bCleanup = 0) then begin
+      sqlite3BtreeLeave(p);
+      Result := rc;
+      Exit;
+    end;
+    Dec(p^.iBDataVersion);   { compensate for pager DataVersion++ }
+    p^.pBt^.inTransaction := TRANS_READ;
+    btreeClearHasContent(p^.pBt);
+  end;
+  btreeEndTransaction(p);
+  sqlite3BtreeLeave(p);
+  Result := SQLITE_OK;
+end;
+
+{ btree.c lines 4430-4440: sqlite3BtreeCommit }
+function sqlite3BtreeCommit(p: PBtree): i32;
+var rc: i32;
+begin
+  sqlite3BtreeEnter(p);
+  rc := sqlite3BtreeCommitPhaseOne(p, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3BtreeCommitPhaseTwo(p, 0);
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c lines 4518-4562: sqlite3BtreeRollback }
+function sqlite3BtreeRollback(p: PBtree; tripCode: i32; writeOnly: i32): i32;
+var
+  rc    : i32;
+  rc2   : i32;
+  pBt   : PBtShared;
+  pPg1  : PMemPage;
+begin
+  rc  := SQLITE_OK;
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  if tripCode = SQLITE_OK then begin
+    rc := saveAllCursors(pBt, 0, nil);
+    if rc <> SQLITE_OK then writeOnly := 0;
+  end else
+    rc := SQLITE_OK;
+
+  if tripCode <> SQLITE_OK then begin
+    rc2 := sqlite3BtreeTripAllCursors(p, tripCode, writeOnly);
+    if rc2 <> SQLITE_OK then rc := rc2;
+  end;
+
+  if p^.inTrans = TRANS_WRITE then begin
+    rc2 := sqlite3PagerRollback(pBt^.pPager);
+    if rc2 <> SQLITE_OK then rc := rc2;
+    if btreeGetPage(pBt, 1, pPg1, 0) = SQLITE_OK then begin
+      btreeSetNPage(pBt, pPg1);
+      releasePageOne(pPg1);
+    end;
+    pBt^.inTransaction := TRANS_READ;
+    btreeClearHasContent(pBt);
+  end;
+  btreeEndTransaction(p);
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ ===========================================================================
+  Phase 4.4 — sqlite3BtreeDelete
+  btree.c lines 9826-10024
+  =========================================================================== }
+
+function sqlite3BtreeDelete(pCur: PBtCursor; flags: u8): i32;
+var
+  p          : PBtree;
+  pBt        : PBtShared;
+  rc         : i32;
+  pPage      : PMemPage;
+  pCell      : Pu8;
+  iCellIdx   : i32;
+  iCellDepth : i32;
+  info       : TCellInfo;
+  bPreserve  : u8;
+  pLeaf      : PMemPage;
+  nCell      : i32;
+  n          : Pgno;
+  pTmp       : Pu8;
+begin
+  p   := pCur^.pBtree;
+  pBt := p^.pBt;
+  rc  := SQLITE_OK;
+
+  if pCur^.eState <> CURSOR_VALID then begin
+    if pCur^.eState >= CURSOR_REQUIRESEEK then begin
+      rc := btreeRestoreCursorPosition(pCur);
+      if (rc <> SQLITE_OK) or (pCur^.eState <> CURSOR_VALID) then begin
+        Result := rc; Exit;
+      end;
+    end else begin
+      Result := SQLITE_CORRUPT_BKPT; Exit;
+    end;
+  end;
+
+  iCellDepth := i32(pCur^.iPage);
+  iCellIdx   := i32(pCur^.ix);
+  pPage      := pCur^.pPage;
+
+  if i32(pPage^.nCell) <= iCellIdx then begin
+    Result := CORRUPT_PAGE(pPage); Exit;
+  end;
+  pCell := findCell(pPage, iCellIdx);
+  if pPage^.nFree < 0 then begin
+    if btreeComputeFreeSpace(pPage) <> SQLITE_OK then begin
+      Result := CORRUPT_PAGE(pPage); Exit;
+    end;
+  end;
+  if PtrUInt(pCell) < PtrUInt(pPage^.aCellIdx + pPage^.nCell * 2) then begin
+    Result := CORRUPT_PAGE(pPage); Exit;
+  end;
+
+  { Determine if cursor position must be preserved }
+  bPreserve := flags and BTREE_SAVEPOSITION;
+  if bPreserve <> 0 then begin
+    if (pPage^.leaf = 0) or
+       (i32(pPage^.nFree) + i32(pPage^.xCellSize(pPage, pCell)) + 2 >
+        i32(pBt^.usableSize) * 2 div 3) or
+       (pPage^.nCell = 1) then begin
+      rc := saveCursorKey(pCur);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+    end else
+      bPreserve := 2;
+  end;
+
+  { If internal node: move to predecessor (largest in left sub-tree) }
+  if pPage^.leaf = 0 then begin
+    rc := sqlite3BtreePrevious(pCur, 0);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+
+  { Save other cursors on this table }
+  if (pCur^.curFlags and BTCF_Multiple) <> 0 then begin
+    rc := saveAllCursors(pBt, pCur^.pgnoRoot, pCur);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+
+  { Invalidate incrblob cursors (no-op stub in this port) }
+  if (pCur^.pKeyInfo = nil) and (p^.hasIncrblobCur <> 0) then
+    invalidateIncrblobCursors(p, pCur^.pgnoRoot, pCur^.info.nKey, 0);
+
+  { Make page writable, clear overflow pages, drop cell }
+  rc := sqlite3PagerWrite(pPage^.pDbPage);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  BTREE_CLEAR_CELL(rc, pPage, pCell, info);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  dropCell(pPage, iCellIdx, i32(info.nSize), @rc);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  { If we deleted from an internal node, move the leaf predecessor cell up }
+  if pPage^.leaf = 0 then begin
+    pLeaf := pCur^.pPage;
+    if pLeaf^.nFree < 0 then begin
+      rc := btreeComputeFreeSpace(pLeaf);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+    end;
+    if iCellDepth < i32(pCur^.iPage) - 1 then
+      n := pCur^.apPage[iCellDepth + 1]^.pgno
+    else
+      n := pCur^.pPage^.pgno;
+    pCell := findCell(pLeaf, i32(pLeaf^.nCell) - 1);
+    if PtrUInt(pCell) < PtrUInt(pLeaf^.aData + 4) then begin
+      Result := CORRUPT_PAGE(pLeaf); Exit;
+    end;
+    nCell := i32(pLeaf^.xCellSize(pLeaf, pCell));
+    pTmp  := pBt^.pTmpSpace;
+    rc := sqlite3PagerWrite(pLeaf^.pDbPage);
+    if rc = SQLITE_OK then
+      rc := insertCell(pPage, iCellIdx, pCell - 4, nCell + 4, pTmp, n);
+    dropCell(pLeaf, i32(pLeaf^.nCell) - 1, nCell, @rc);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+
+  { Rebalance.  Skip if free space is < 2/3 of usable (balance is no-op). }
+  if (i32(pCur^.pPage^.nFree) * 3) <= i32(pCur^.pBt^.usableSize) * 2 then
+    rc := SQLITE_OK
+  else
+    rc := balance(pCur);
+
+  if (rc = SQLITE_OK) and (i32(pCur^.iPage) > iCellDepth) then begin
+    releasePageNotNull(pCur^.pPage);
+    Dec(pCur^.iPage);
+    while i32(pCur^.iPage) > iCellDepth do begin
+      releasePage(pCur^.apPage[pCur^.iPage]);
+      Dec(pCur^.iPage);
+    end;
+    pCur^.pPage := pCur^.apPage[pCur^.iPage];
+    rc := balance(pCur);
+  end;
+
+  if rc = SQLITE_OK then begin
+    if bPreserve > 1 then begin
+      pCur^.eState := CURSOR_SKIPNEXT;
+      if iCellIdx >= i32(pPage^.nCell) then begin
+        pCur^.skipNext := -1;
+        pCur^.ix       := u16(pPage^.nCell - 1);
+      end else
+        pCur^.skipNext := 1;
+    end else begin
+      rc := moveToRoot(pCur);
+      if bPreserve <> 0 then begin
+        btreeReleaseAllCursorPages(pCur);
+        pCur^.eState := CURSOR_REQUIRESEEK;
+      end;
+      if rc = SQLITE_EMPTY then rc := SQLITE_OK;
+    end;
+  end;
+
+  Result := rc;
+end;
+
+{ ===========================================================================
+  Phase 4.5 — Schema / metadata helpers
+  =========================================================================== }
+
+{ btree.c lines 10228-10286: clearDatabasePage (recursive) }
+function clearDatabasePage(pBt: PBtShared; pgno: Pgno;
+                            freePageFlag: i32; pnChange: Pi64): i32;
+var
+  pPage : PMemPage;
+  rc    : i32;
+  pCell : Pu8;
+  i     : i32;
+  hdr   : i32;
+  info  : TCellInfo;
+  label cleardatabasepage_out;
+begin
+  pPage := nil;
+  rc    := SQLITE_OK;
+
+  if pgno > btreePagecount(pBt) then begin
+    Result := SQLITE_CORRUPT_BKPT; Exit;
+  end;
+  rc := getAndInitPage(pBt, pgno, pPage, 0);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  { Verify refcount (not BTREE_SINGLE: single-file db has refcount check) }
+  if (pBt^.openFlags and BTREE_SINGLE) = 0 then begin
+    if sqlite3PagerPageRefcount(pPage^.pDbPage) <>
+       i32(1 + ord(pgno = 1)) then begin
+      rc := CORRUPT_PAGE(pPage);
+      goto cleardatabasepage_out;
+    end;
+  end;
+
+  hdr := pPage^.hdrOffset;
+  for i := 0 to i32(pPage^.nCell) - 1 do begin
+    pCell := findCell(pPage, i);
+    if pPage^.leaf = 0 then begin
+      rc := clearDatabasePage(pBt, get4byte(pCell), 1, pnChange);
+      if rc <> SQLITE_OK then goto cleardatabasepage_out;
+    end;
+    BTREE_CLEAR_CELL(rc, pPage, pCell, info);
+    if rc <> SQLITE_OK then goto cleardatabasepage_out;
+  end;
+
+  if pPage^.leaf = 0 then begin
+    rc := clearDatabasePage(pBt, get4byte(pPage^.aData + hdr + 8), 1, pnChange);
+    if rc <> SQLITE_OK then goto cleardatabasepage_out;
+    if pPage^.intKey <> 0 then pnChange := nil;
+  end;
+
+  if pnChange <> nil then
+    Inc(pnChange^, pPage^.nCell);
+
+  if freePageFlag <> 0 then
+    freePage(pPage, @rc)
+  else begin
+    rc := sqlite3PagerWrite(pPage^.pDbPage);
+    if rc = SQLITE_OK then
+      zeroPage(pPage, i32(pPage^.aData[hdr]) or PTF_LEAF);
+  end;
+
+cleardatabasepage_out:
+  releasePage(pPage);
+  Result := rc;
+end;
+
+{ btree.c lines 10263-10287: sqlite3BtreeClearTable }
+function sqlite3BtreeClearTable(p: PBtree; iTable: i32; pnChange: Pi64): i32;
+var
+  rc : i32;
+  pBt: PBtShared;
+begin
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  rc := saveAllCursors(pBt, Pgno(iTable), nil);
+  if rc = SQLITE_OK then begin
+    if p^.hasIncrblobCur <> 0 then
+      invalidateIncrblobCursors(p, Pgno(iTable), 0, 1);
+    rc := clearDatabasePage(pBt, Pgno(iTable), 0, pnChange);
+  end;
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c lines 10289-10290: sqlite3BtreeClearTableOfCursor }
+function sqlite3BtreeClearTableOfCursor(pCur: PBtCursor): i32;
+begin
+  Result := sqlite3BtreeClearTable(pCur^.pBtree, i32(pCur^.pgnoRoot), nil);
+end;
+
+{ btree.c lines 10325-10397: btreeDropTable (simplified: SQLITE_OMIT_AUTOVACUUM) }
+function btreeDropTable(p: PBtree; iTable: Pgno; piMoved: Pi32): i32;
+var
+  pPage: PMemPage;
+  pBt  : PBtShared;
+  rc   : i32;
+begin
+  pPage := nil;
+  pBt   := p^.pBt;
+  rc    := SQLITE_OK;
+
+  if iTable > btreePagecount(pBt) then begin
+    Result := SQLITE_CORRUPT_BKPT; Exit;
+  end;
+  rc := sqlite3BtreeClearTable(p, i32(iTable), nil);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  rc := btreeGetPage(pBt, iTable, pPage, 0);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  piMoved^ := 0;
+  { No autovacuum: just free the page }
+  freePage(pPage, @rc);
+  releasePage(pPage);
+  Result := rc;
+end;
+
+{ btree.c lines 10398-10427: sqlite3BtreeDropTable public wrapper }
+function sqlite3BtreeDropTable(p: PBtree; iTable: i32; piMoved: Pi32): i32;
+var rc: i32;
+begin
+  sqlite3BtreeEnter(p);
+  rc := btreeDropTable(p, Pgno(iTable), piMoved);
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c lines 10039-10182: btreeCreateTable (simplified: SQLITE_OMIT_AUTOVACUUM) }
+function btreeCreateTable(p: PBtree; piTable: PPgno; createTabFlags: i32): i32;
+var
+  pBt     : PBtShared;
+  pRoot   : PMemPage;
+  pgnoRoot: Pgno;
+  rc      : i32;
+  ptfFlags: i32;
+begin
+  pBt     := p^.pBt;
+  pRoot   := nil;
+  pgnoRoot := 0;
+  rc := SQLITE_OK;
+
+  { No autovacuum: allocate page normally }
+  rc := allocateBtreePage(pBt, pRoot, pgnoRoot, 1, 0);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  rc := sqlite3PagerWrite(pRoot^.pDbPage);
+  if rc <> SQLITE_OK then begin
+    releasePage(pRoot);
+    Result := rc;
+    Exit;
+  end;
+
+  if (createTabFlags and BTREE_INTKEY) <> 0 then
+    ptfFlags := PTF_INTKEY or PTF_LEAFDATA or PTF_LEAF
+  else
+    ptfFlags := PTF_ZERODATA or PTF_LEAF;
+  zeroPage(pRoot, ptfFlags);
+  sqlite3PagerUnref(pRoot^.pDbPage);
+  piTable^ := pgnoRoot;
+  Result := SQLITE_OK;
+end;
+
+{ btree.c lines 10184-10188: sqlite3BtreeCreateTable public wrapper }
+function sqlite3BtreeCreateTable(p: PBtree; piTable: PPgno; flags: i32): i32;
+var rc: i32;
+begin
+  sqlite3BtreeEnter(p);
+  rc := btreeCreateTable(p, piTable, flags);
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c lines 10427-10455: sqlite3BtreeGetMeta }
+procedure sqlite3BtreeGetMeta(p: PBtree; idx: i32; pMeta: Pu32);
+var pBt: PBtShared;
+begin
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  if idx = BTREE_DATA_VERSION then
+    pMeta^ := sqlite3PagerDataVersion(pBt^.pPager) + p^.iBDataVersion
+  else
+    pMeta^ := get4byte(pBt^.pPage1^.aData + 36 + idx * 4);
+  sqlite3BtreeLeave(p);
+end;
+
+{ btree.c lines 10457-10480: sqlite3BtreeUpdateMeta }
+function sqlite3BtreeUpdateMeta(p: PBtree; idx: i32; iMeta: u32): i32;
+var
+  pBt : PBtShared;
+  pP1 : Pu8;
+  rc  : i32;
+begin
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  pP1 := pBt^.pPage1^.aData;
+  rc := sqlite3PagerWrite(pBt^.pPage1^.pDbPage);
+  if rc = SQLITE_OK then begin
+    put4byte(pP1 + 36 + idx * 4, iMeta);
+    if idx = BTREE_INCR_VACUUM then begin
+      pBt^.incrVacuum := u8(iMeta and 1);
+    end;
+  end;
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c lines 10481-10555: sqlite3BtreeCount }
+function sqlite3BtreeCount(db: Pointer; pCur: PBtCursor; pnEntry: Pi64): i32;
+var
+  nEntry: i64;
+  rc    : i32;
+  iIdx  : i32;
+  pPage : PMemPage;
+begin
+  nEntry := 0;
+  rc := moveToRoot(pCur);
+  if rc = SQLITE_EMPTY then begin
+    pnEntry^ := 0;
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  while rc = SQLITE_OK do begin
+    pPage := pCur^.pPage;
+    if (pPage^.leaf <> 0) or (pPage^.intKey = 0) then
+      Inc(nEntry, pPage^.nCell);
+
+    if pPage^.leaf <> 0 then begin
+      { leaf: walk back up until we find an unvisited interior cell }
+      repeat
+        if pCur^.iPage = 0 then begin
+          pnEntry^ := nEntry;
+          Result := moveToRoot(pCur);
+          Exit;
+        end;
+        moveToParent(pCur);
+      until pCur^.ix < pCur^.pPage^.nCell;
+      Inc(pCur^.ix);
+      pPage := pCur^.pPage;
+    end;
+
+    iIdx := i32(pCur^.ix);
+    if iIdx = i32(pPage^.nCell) then
+      rc := moveToChild(pCur, get4byte(pPage^.aData + pPage^.hdrOffset + 8))
+    else
+      rc := moveToChild(pCur, get4byte(findCell(pPage, iIdx)));
+  end;
+
   Result := rc;
 end;
 
