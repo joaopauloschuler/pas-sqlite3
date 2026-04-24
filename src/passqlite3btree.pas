@@ -468,6 +468,7 @@ function  sqlite3BtreeCursorIsValid(pCur: PBtCursor): i32;
   =========================================================================== }
 function  sqlite3BtreeFirst(pCur: PBtCursor; pRes: Pi32): i32;
 function  sqlite3BtreeLast(pCur: PBtCursor; pRes: Pi32): i32;
+function  sqlite3BtreeIsEmpty(pCur: PBtCursor; pRes: Pi32): i32;
 function  sqlite3BtreeTableMoveto(pCur: PBtCursor; intKey: i64;
                                    biasRight: i32; pRes: Pi32): i32;
 function  sqlite3BtreeIndexMoveto(pCur: PBtCursor; pIdxKey: PUnpackedRecord;
@@ -6196,6 +6197,14 @@ begin
     Inc(j);
   end;
   Result := est;
+end;
+
+{ btree.c — check if the b-tree table addressed by pCur is empty.
+  Sets pRes^ to 1 if empty, 0 if it contains at least one row.
+  Returns a SQLite error code. }
+function sqlite3BtreeIsEmpty(pCur: PBtCursor; pRes: Pi32): i32;
+begin
+  Result := sqlite3BtreeFirst(pCur, pRes);
 end;
 
 { btree.c:952 — return a fake cursor that is always CURSOR_VALID.

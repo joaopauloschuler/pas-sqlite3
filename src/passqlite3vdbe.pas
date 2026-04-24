@@ -6046,6 +6046,51 @@ begin
       end;
     end;
 
+    { ────── OP_Once ────── (vdbe.c:2706) }
+    { Run the body only once per VM invocation.  On second and subsequent
+      calls, jump to P2.  Uses bit in aOp[0].p1 (main frame) or aOnce[]
+      bitmask (sub-frame) to remember whether the body has been run. }
+    OP_Once: begin
+      if v^.pFrame <> nil then begin
+        pcx := i32((PByte(pOp) - PByte(aOp)) div SizeOf(TVdbeOp));
+        if (v^.pFrame^.aOnce[pcx shr 3] and u8(1 shl (pcx and 7))) <> 0 then
+          goto jump_to_p2;
+        v^.pFrame^.aOnce[pcx shr 3] :=
+          v^.pFrame^.aOnce[pcx shr 3] or u8(1 shl (pcx and 7));
+      end else begin
+        if aOp[0].p1 = pOp^.p1 then
+          goto jump_to_p2;
+      end;
+      pOp^.p1 := aOp[0].p1;
+    end;
+
+    { ────── OP_IfEmpty ────── (vdbe.c:6413) }
+    { Jump to P2 if the b-tree table pointed to by cursor P1 is empty
+      (contains zero rows).  Reports an error on I/O failure. }
+    OP_IfEmpty: begin
+      pCur  := v^.apCsr[pOp^.p1];
+      pCrsr := pCur^.uc.pCursor;
+      rc := sqlite3BtreeIsEmpty(pCrsr, @res);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+      if res <> 0 then goto jump_to_p2;
+    end;
+
+    { ────── OP_RowData ────── (vdbe.c:6104) }
+    { Write into register P2 the complete row data for the row at which
+      cursor P1 is currently pointing.  There is no interpretation of the
+      data; it is copied verbatim.  If P3 is zero the MEM_Zero flag is
+      cleared so the value is not expanded lazily. }
+    OP_RowData: begin
+      pDest := @aMem[pOp^.p2];
+      pCur  := v^.apCsr[pOp^.p1];
+      pCrsr := pCur^.uc.pCursor;
+      p2    := sqlite3BtreePayloadSize(pCrsr);
+      if p2 >= u32(db^.aLimit[0]) { SQLITE_LIMIT_LENGTH } then goto too_big;
+      if sqlite3VdbeMemFromBtreeZeroOffset(pCrsr, p2, pDest) <> 0 then goto no_mem;
+      if pOp^.p3 = 0 then
+        pDest^.flags := pDest^.flags and not MEM_Zero;
+    end;
+
     else begin
       { Unimplemented opcode }
       rc := SQLITE_ERROR;
