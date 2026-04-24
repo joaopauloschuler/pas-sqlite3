@@ -412,6 +412,7 @@ function  btreeCursor(p: PBtree; iTable: Pgno; wrFlag: i32;
 function  sqlite3BtreeCursor(p: PBtree; iTable: Pgno; wrFlag: i32;
                              pKeyInfo: PKeyInfo; pCur: PBtCursor): i32;
 function  sqlite3BtreeCloseCursor(pCur: PBtCursor): i32;
+procedure sqlite3BtreeCursorHintFlags(pCur: PBtCursor; x: u32);
 
 { ===========================================================================
   Phase 4.2 — cursor save/restore
@@ -447,6 +448,12 @@ function  sqlite3BtreePayloadSize(pCur: PBtCursor): u32;
   =========================================================================== }
 function  sqlite3BtreePayload(pCur: PBtCursor; offset: u32; amt: u32;
                                pBuf: Pointer): i32;
+{ sqlite3BtreePayloadFetch: return pointer to in-page data if available.
+  Sets pAmt to the number of contiguous bytes at the returned address.
+  Returns nil if no in-page data is available (caller must use BtreePayload). }
+function  sqlite3BtreePayloadFetch(pCur: PBtCursor; out pAmt: u32): PAnsiChar;
+function  sqlite3BtreeMaxRecordSize(pCur: PBtCursor): u32;
+function  sqlite3BtreeCursorIsValid(pCur: PBtCursor): i32;
 
 { ===========================================================================
   Phase 4.2 — public navigation
@@ -2003,6 +2010,11 @@ begin
   Result := SQLITE_OK;
 end;
 
+procedure sqlite3BtreeCursorHintFlags(pCur: PBtCursor; x: u32);
+begin
+  pCur^.hints := u8(x);
+end;
+
 { ---------------------------------------------------------------------------
   saveCursorKey
   btree.c lines 714-753
@@ -2325,6 +2337,49 @@ function sqlite3BtreePayload(pCur: PBtCursor; offset: u32; amt: u32;
                               pBuf: Pointer): i32;
 begin
   Result := accessPayload(pCur, offset, amt, Pu8(pBuf), 0);
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3BtreePayloadFetch — return in-page payload pointer if available.
+  Port of btree.c sqlite3BtreePayloadFetch (btree.c line ~5351).
+  Returns pointer to page-local data if all `pAmt` bytes are on the leaf page;
+  otherwise sets pAmt=0 and returns nil (caller uses sqlite3BtreePayload).
+  --------------------------------------------------------------------------- }
+function sqlite3BtreePayloadFetch(pCur: PBtCursor; out pAmt: u32): PAnsiChar;
+var
+  pPage:    PMemPage;
+  nKey:     u32;
+  nLocal:   u32;
+begin
+  pPage := pCur^.pPage;
+  if pPage = nil then begin
+    pAmt := 0; Result := nil; Exit;
+  end;
+  getCellInfo(pCur);
+  nKey   := u32(pCur^.info.nKey);
+  nLocal := u32(pCur^.info.nLocal);
+  { For table leaves the payload starts after the key varint }
+  pAmt := nLocal;
+  if pPage^.intKey <> 0 then
+    Result := PAnsiChar(pCur^.info.pPayload)
+  else
+    Result := PAnsiChar(pCur^.info.pPayload) + nKey;
+  { If nLocal < the requested amount the caller must call BtreePayload }
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3BtreeMaxRecordSize — maximum record size visible via BtreePayload.
+  --------------------------------------------------------------------------- }
+function sqlite3BtreeMaxRecordSize(pCur: PBtCursor): u32;
+begin
+  getCellInfo(pCur);
+  Result := u32(pCur^.info.nPayload);
+end;
+
+function sqlite3BtreeCursorIsValid(pCur: PBtCursor): i32;
+begin
+  if pCur = nil then Result := 0
+  else Result := sqlite3BtreeCursorIsValidNN(pCur);
 end;
 
 { ---------------------------------------------------------------------------

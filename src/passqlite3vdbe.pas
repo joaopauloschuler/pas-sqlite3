@@ -2581,12 +2581,661 @@ begin
   Result := sqlite3VdbeFinalize(pStmt);
 end;
 
-{ --- Execution engine stub (Phase 5.4 vdbe.c) --- }
+{ ============================================================================
+  Phase 5.4a — vdbe.c execution engine helpers + main interpreter loop
+  Opcodes ported: OP_Goto, OP_Gosub, OP_Return, OP_InitCoroutine,
+  OP_EndCoroutine, OP_Yield, OP_Halt, OP_Init, OP_Integer, OP_Int64,
+  OP_Null, OP_SoftNull, OP_Blob, OP_Move, OP_SCopy, OP_IntCopy, OP_Copy,
+  OP_ResultRow, OP_Jump, OP_If, OP_IfNot, OP_OpenRead, OP_OpenWrite,
+  OP_Close.
+  All other opcodes fall to the default case (SQLITE_ERROR).
+  ============================================================================ }
+
+{ --- out2Prerelease helpers (vdbe.c:667) --- }
+
+function out2PrereleaseWithClear(pOut: PMem): PMem;
+begin
+  sqlite3VdbeMemSetNull(pOut);
+  pOut^.flags := MEM_Int;
+  Result := pOut;
+end;
+
+function out2Prerelease(p: PVdbe; pOp: PVdbeOp): PMem; inline;
+var
+  pOut: PMem;
+begin
+  pOut := @p^.aMem[pOp^.p2];
+  if (pOut^.flags and (MEM_Agg or MEM_Dyn)) <> 0 then
+    Result := out2PrereleaseWithClear(pOut)
+  else begin
+    pOut^.flags := MEM_Int;
+    Result := pOut;
+  end;
+end;
+
+{ SZ_VDBECURSOR(N) = ROUND8(offsetof(VdbeCursor,aType)) + (N+1)*8 }
+const
+  VDBECURSOR_FIXED_SZ         = 112;
+  offsetof_VdbeCursor_pAltCursor = 112;
+
+function SZ_VDBECURSOR(nField: i32): i64; inline;
+begin
+  Result := 120 + i64(nField + 1) * 8;
+end;
+
+{ --- allocateCursor (vdbe.c:253) --- }
+
+function allocateCursor(p: PVdbe; iCur, nField: i32; eCurType: u8): PVdbeCursor;
+var
+  pMSlot: PMem;   { renamed from pMem to avoid FPC case-insensitive conflict with PMem type }
+  nByte:  i64;
+  pCx:    PVdbeCursor;
+begin
+  if iCur > 0 then pMSlot := @p^.aMem[p^.nMem - iCur]
+  else pMSlot := p^.aMem;
+
+  nByte := SZ_VDBECURSOR(nField);
+  if eCurType = CURTYPE_BTREE then
+    nByte := nByte + sqlite3BtreeCursorSize();
+
+  if p^.apCsr[iCur] <> nil then begin
+    sqlite3VdbeFreeCursorNN(p, p^.apCsr[iCur]);
+    p^.apCsr[iCur] := nil;
+  end;
+
+  if pMSlot^.szMalloc < nByte then begin
+    if pMSlot^.szMalloc > 0 then
+      sqlite3DbFreeNN(pMSlot^.db, pMSlot^.zMalloc);
+    pMSlot^.z       := sqlite3DbMallocRaw(pMSlot^.db, u64(nByte));
+    pMSlot^.zMalloc := pMSlot^.z;
+    if pMSlot^.zMalloc = nil then begin
+      pMSlot^.szMalloc := 0;
+      Result := nil;
+      Exit;
+    end;
+    pMSlot^.szMalloc := i32(nByte);
+  end;
+
+  pCx := PVdbeCursor(pMSlot^.zMalloc);
+  p^.apCsr[iCur] := pCx;
+  FillChar(pCx^, offsetof_VdbeCursor_pAltCursor, 0);
+  pCx^.eCurType := eCurType;
+  pCx^.nField   := nField;
+  pCx^.aOffset  := Pu32(Pu8(pCx) + 120 + u32(nField) * SizeOf(u32));
+  if eCurType = CURTYPE_BTREE then begin
+    pCx^.uc.pCursor := PBtCursor(Pu8(pMSlot^.z) + SZ_VDBECURSOR(nField));
+    sqlite3BtreeCursorZero(pCx^.uc.pCursor);
+  end;
+  Result := pCx;
+end;
+
+{ --- stub helpers needed by OP_Halt and abort path --- }
+
+function sqlite3ErrStr(rc: i32): PAnsiChar;
+begin
+  case rc of
+    SQLITE_OK:       Result := 'not an error';
+    SQLITE_ERROR:    Result := 'SQL logic error';
+    SQLITE_INTERNAL: Result := 'internal SQLite error';
+    SQLITE_PERM:     Result := 'access permission denied';
+    SQLITE_ABORT:    Result := 'query aborted';
+    SQLITE_BUSY:     Result := 'database is locked';
+    SQLITE_LOCKED:   Result := 'database table is locked';
+    SQLITE_NOMEM:    Result := 'out of memory';
+    SQLITE_READONLY: Result := 'attempt to write a readonly database';
+    SQLITE_INTERRUPT:Result := 'interrupted';
+    SQLITE_IOERR:    Result := 'disk I/O error';
+    SQLITE_CORRUPT:  Result := 'database disk image is malformed';
+    SQLITE_FULL:     Result := 'database or disk is full';
+    SQLITE_CANTOPEN: Result := 'unable to open database file';
+    SQLITE_PROTOCOL: Result := 'locking protocol';
+    SQLITE_SCHEMA:   Result := 'database schema has changed';
+    SQLITE_TOOBIG:   Result := 'string or blob too big';
+    SQLITE_CONSTRAINT:Result:= 'constraint failed';
+    SQLITE_MISMATCH: Result := 'datatype mismatch';
+    SQLITE_MISUSE:   Result := 'bad parameter or other API misuse';
+    SQLITE_NOLFS:    Result := 'large file support is disabled';
+    SQLITE_AUTH:     Result := 'authorization denied';
+    SQLITE_RANGE:    Result := 'column index out of range';
+    SQLITE_NOTADB:   Result := 'file is not a database';
+    SQLITE_NOTICE:   Result := 'notification message';
+    SQLITE_WARNING:  Result := 'warning message';
+    SQLITE_ROW:      Result := 'another row available';
+    SQLITE_DONE:     Result := 'no more rows available';
+  else                Result := 'unknown error';
+  end;
+end;
+
+procedure sqlite3VdbeLogAbort(p: PVdbe; rc: i32; pOp, aOp: Pointer);
+begin
+  { Stub — Phase 5.5 }
+end;
+
+procedure sqlite3VdbeSetChanges(db: Pointer; nChange: i64);
+begin
+  { Stub — Phase 6 (needs db->nChange) }
+end;
+
+procedure sqlite3SystemError(db: Pointer; rc: i32);
+begin
+  { Stub — Phase 6 }
+end;
+
+procedure sqlite3ResetOneSchema(db: Pointer; iDb: i32);
+begin
+  { Stub — Phase 6 }
+end;
+
+{ Implement sqlite3VdbeFrameRestore properly (vdbeaux.c:2812) }
+function sqlite3VdbeFrameRestoreFull(pFrame: PVdbeFrame): i32;
+var
+  v: PVdbe;
+  i: i32;
+  pC: PVdbeCursor;
+begin
+  v := pFrame^.v;
+  { Close cursors in current frame }
+  for i := 0 to v^.nCursor - 1 do begin
+    pC := v^.apCsr[i];
+    if pC <> nil then begin
+      sqlite3VdbeFreeCursorNN(v, pC);
+      v^.apCsr[i] := nil;
+    end;
+  end;
+  v^.aOp    := pFrame^.aOp;
+  v^.nOp    := pFrame^.nOp;
+  v^.aMem   := pFrame^.aMem;
+  v^.nMem   := pFrame^.nMem;
+  v^.apCsr  := pFrame^.apCsr;
+  v^.nCursor := pFrame^.nCursor;
+  { db->lastRowid and db->nChange would need PTsqlite3 cast }
+  v^.nChange := pFrame^.nChange;
+  sqlite3VdbeDeleteAuxData(v^.db, @v^.pAuxData, -1, 0);
+  v^.pAuxData := pFrame^.pAuxData;
+  pFrame^.pAuxData := nil;
+  Result := pFrame^.pc;
+end;
+
+{ ============================================================================
+  sqlite3VdbeExec — Phase 5.4a implementation
+  Source: vdbe.c sqlite3VdbeExec (SQLite 3.53.0)
+
+  Ported opcodes (5.4a):
+    OP_Init, OP_Goto, OP_Gosub, OP_Return, OP_InitCoroutine,
+    OP_EndCoroutine, OP_Yield, OP_Halt, OP_Integer, OP_Int64, OP_Null,
+    OP_SoftNull, OP_Blob, OP_Move, OP_SCopy, OP_IntCopy, OP_Copy,
+    OP_ResultRow, OP_Jump, OP_If, OP_IfNot, OP_OpenRead, OP_OpenWrite,
+    OP_Close.
+  All other opcodes: fall to default → SQLITE_ERROR abort.
+  ============================================================================ }
 
 function sqlite3VdbeExec(v: PVdbe): i32;
+label
+  jump_to_p2_and_check_for_interrupt,
+  jump_to_p2,
+  check_for_interrupt,
+  abort_due_to_error,
+  vdbe_return,
+  too_big,
+  no_mem,
+  abort_due_to_interrupt,
+  open_cursor_set_hints;
+var
+  aOp:   PVdbeOp;
+  pOp:   PVdbeOp;
+  rc:    i32;
+  db:    PTsqlite3;
+  enc:   u8;
+  iCompare: i32;
+  nVmStep: u64;
+  aMem:  PMem;
+  pIn1:  PMem;
+  pIn2:  PMem;
+  pIn3:  PMem;
+  pOut:  PMem;
+  colCacheCtr: u32;
+  resetSchemaOnFault: u8;
+  nProgressLimit: u64;
+  { locals for individual opcodes }
+  pcx:     i32;
+  pFrame:  PVdbeFrame;
+  p2:      u32;
+  iDb:     i32;
+  nField:  i32;
+  wrFlag:  i32;
+  pCur:    PVdbeCursor;
+  pDbb:    PDb;      { renamed: pDb conflicts with PDb type (FPC case-insensitive) }
+  pX:      PBtree;
+  pKInfo:  PKeyInfo; { renamed: pKeyInfo conflicts with PKeyInfo type }
+  zErr:    PAnsiChar;
+  nByte:   i32;
+  n:       i32;
+  i:       i32;
+  pDest:   PMem;
+  pSrc:    PMem;
 begin
-  { Full implementation is vdbe.c — Phase 5.4 }
-  Result := SQLITE_MISUSE;
+  aOp    := v^.aOp;
+  pOp    := @aOp[v^.pc];
+  rc     := SQLITE_OK;
+  db     := PTsqlite3(v^.db);
+  enc    := db^.enc;
+  iCompare := 0;
+  nVmStep  := 0;
+  aMem     := v^.aMem;
+  pIn1  := nil;
+  pIn2  := nil;
+  pIn3  := nil;
+  pOut  := nil;
+  colCacheCtr := 0;
+  resetSchemaOnFault := 0;
+  nProgressLimit := u64($FFFFFFFFFFFFFFFF);
+
+  { Check initial state }
+  if v^.lockMask <> 0 then  { DbMaskNonZero }
+    sqlite3VdbeEnter(v);
+
+  if db^.xProgress <> nil then begin
+    nProgressLimit := db^.nProgressOps - (v^.aCounter[SQLITE_STMTSTATUS_VM_STEP] mod db^.nProgressOps);
+  end;
+
+  if v^.rc = SQLITE_NOMEM then goto no_mem;
+  v^.rc := SQLITE_OK;
+  v^.iCurrentTime := 0;
+  db^.busyHandler.nBusy := 0;
+  if db^.u1.isInterrupted <> 0 then goto abort_due_to_interrupt;
+
+  { ── Main interpreter loop ── }
+  repeat
+    Inc(nVmStep);
+
+    { Dispatch }
+    case pOp^.opcode of
+
+    { ────── OP_Goto ────── (vdbe.c:1063) }
+    OP_Goto: begin
+      goto jump_to_p2_and_check_for_interrupt;
+    end;
+
+    { ────── OP_Gosub ────── (vdbe.c:1119) }
+    OP_Gosub: begin
+      pIn1 := @aMem[pOp^.p1];
+      pIn1^.flags := MEM_Int;
+      pIn1^.u.i   := i64(pOp - aOp);
+      goto jump_to_p2_and_check_for_interrupt;
+    end;
+
+    { ────── OP_Return ────── (vdbe.c:1152) }
+    OP_Return: begin
+      pIn1 := @aMem[pOp^.p1];
+      if (pIn1^.flags and MEM_Int) <> 0 then
+        pOp := @aOp[pIn1^.u.i]
+      { else: p3≠0 case — fall through (no jump), just break }
+    end;
+
+    { ────── OP_InitCoroutine ────── (vdbe.c:1174) }
+    OP_InitCoroutine: begin
+      pOut := @aMem[pOp^.p1];
+      pOut^.u.i   := i64(pOp^.p3 - 1);
+      pOut^.flags := MEM_Int;
+      if pOp^.p2 <> 0 then goto jump_to_p2;
+    end;
+
+    { ────── OP_EndCoroutine ────── (vdbe.c:1203) }
+    OP_EndCoroutine: begin
+      pIn1 := @aMem[pOp^.p1];
+      if (pIn1^.flags and MEM_Int) <> 0 then begin
+        pOp := @aOp[pIn1^.u.i];
+      end;
+    end;
+
+    { ────── OP_Yield ────── (vdbe.c:1229) }
+    OP_Yield: begin
+      pIn1 := @aMem[pOp^.p1];
+      if (pIn1^.flags and MEM_Int) <> 0 then begin
+        pcx := i32(pOp - aOp);
+        pOp := @aOp[pIn1^.u.i];
+        pIn1^.u.i := i64(pcx);
+      end;
+    end;
+
+    { ────── OP_Halt ────── (vdbe.c:1293) }
+    OP_Halt: begin
+      if (v^.pFrame <> nil) and (pOp^.p1 = SQLITE_OK) then begin
+        pFrame := v^.pFrame;
+        v^.pFrame  := pFrame^.pParent;
+        v^.nFrame  := v^.nFrame - 1;
+        sqlite3VdbeSetChanges(db, v^.nChange);
+        pcx := sqlite3VdbeFrameRestoreFull(pFrame);
+        if pOp^.p2 = OE_Ignore then
+          pcx := v^.aOp[pcx].p2 - 1;
+        aOp := v^.aOp;
+        aMem := v^.aMem;
+        pOp := @aOp[pcx];
+      end else begin
+        v^.rc := pOp^.p1;
+        v^.errorAction := u8(pOp^.p2);
+        if v^.rc <> 0 then begin
+          if (pOp^.p3 > 0) and (pOp^.p4type = P4_NOTUSED) then begin
+            zErr := sqlite3ValueText(@aMem[pOp^.p3], SQLITE_UTF8);
+            sqlite3VdbeError(v, zErr);
+          end else if pOp^.p5 <> 0 then begin
+            case pOp^.p5 of
+              1: sqlite3VdbeError(v, 'NOT NULL constraint failed');
+              2: sqlite3VdbeError(v, 'UNIQUE constraint failed');
+              3: sqlite3VdbeError(v, 'CHECK constraint failed');
+              4: sqlite3VdbeError(v, 'FOREIGN KEY constraint failed');
+            else sqlite3VdbeError(v, 'constraint failed');
+            end;
+            { TODO Phase 5.5: append pOp^.p4.z suffix via sqlite3MPrintf }
+          end else begin
+            sqlite3VdbeError(v, pOp^.p4.z);
+          end;
+          sqlite3VdbeLogAbort(v, pOp^.p1, pOp, aOp);
+        end;
+        rc := sqlite3VdbeHalt(v);
+        if rc = SQLITE_BUSY then begin
+          v^.rc := SQLITE_BUSY;
+        end else begin
+          if v^.rc <> 0 then rc := SQLITE_ERROR
+          else rc := SQLITE_DONE;
+        end;
+        goto vdbe_return;
+      end;
+    end;
+
+    { ────── OP_Integer ────── (vdbe.c:1371) }
+    OP_Integer: begin
+      pOut := out2Prerelease(v, pOp);
+      pOut^.u.i := i64(pOp^.p1);
+    end;
+
+    { ────── OP_Int64 ────── (vdbe.c:1383) }
+    OP_Int64: begin
+      pOut := out2Prerelease(v, pOp);
+      pOut^.u.i := pOp^.p4.pI64^;
+    end;
+
+    { ────── OP_Null / OP_BeginSubrtn ────── (vdbe.c:1511) }
+    OP_BeginSubrtn,
+    OP_Null: begin
+      n := pOp^.p3 - pOp^.p2;
+      pOut := @aMem[pOp^.p2];
+      pOut^.flags := MEM_Null;
+      if n > 0 then begin
+        i := 0;
+        while i < n do begin
+          Inc(i);
+          pDest := @aMem[pOp^.p2 + i];
+          pDest^.flags := MEM_Null;
+        end;
+      end;
+    end;
+
+    { ────── OP_SoftNull ────── (vdbe.c:1542) }
+    OP_SoftNull: begin
+      pOut := @aMem[pOp^.p1];
+      pOut^.flags := MEM_Null or MEM_Cleared;
+    end;
+
+    { ────── OP_Blob ────── (vdbe.c:1556) }
+    OP_Blob: begin
+      pOut := out2Prerelease(v, pOp);
+      nByte := pOp^.p1;
+      if nByte > SQLITE_MAX_LENGTH then goto too_big;
+      sqlite3VdbeMemSetStr(pOut, pOp^.p4.z, nByte, 0, SQLITE_TRANSIENT);
+      pOut^.enc := enc;
+      rc := sqlite3VdbeMemTooBig(pOut);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+    end;
+
+    { ────── OP_Move ────── (vdbe.c:1601) }
+    OP_Move: begin
+      n  := pOp^.p3;
+      pIn1 := @aMem[pOp^.p1];
+      pOut := @aMem[pOp^.p2];
+      i := 0;
+      while i < n do begin
+        sqlite3VdbeMemMove(pOut, pIn1);
+        pIn1^.flags := MEM_Undefined;
+        Inc(pIn1);
+        Inc(pOut);
+        Inc(i);
+      end;
+    end;
+
+    { ────── OP_Copy ────── (vdbe.c:1652) }
+    OP_Copy: begin
+      n := pOp^.p3;
+      pIn1 := @aMem[pOp^.p1];
+      pOut := @aMem[pOp^.p2];
+      i := 0;
+      while i <= n do begin
+        rc := sqlite3VdbeMemCopy(pOut, pIn1);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+        pOut^.flags := (pOut^.flags and not u16(MEM_TypeMask or MEM_Zero)) or (pOut^.flags and MEM_TypeMask);
+        Inc(pIn1);
+        Inc(pOut);
+        Inc(i);
+      end;
+    end;
+
+    { ────── OP_SCopy ────── (vdbe.c:1690) }
+    OP_SCopy: begin
+      pIn1 := @aMem[pOp^.p1];
+      pOut := @aMem[pOp^.p2];
+      sqlite3VdbeMemShallowCopy(pOut, pIn1, MEM_Ephem);
+    end;
+
+    { ────── OP_IntCopy ────── (vdbe.c:1711) }
+    OP_IntCopy: begin
+      pIn1 := @aMem[pOp^.p1];
+      pOut := @aMem[pOp^.p2];
+      pOut^.u.i   := pIn1^.u.i;
+      pOut^.flags := MEM_Int;
+    end;
+
+    { ────── OP_ResultRow ────── (vdbe.c:1746) }
+    OP_ResultRow: begin
+      { Check string/blob size }
+      pOut := @aMem[pOp^.p1];
+      n    := pOp^.p2;
+      i := 0;
+      while i < n do begin
+        if (pOut^.flags and MEM_Str) <> 0 then begin
+          if pOut^.n > SQLITE_MAX_LENGTH then goto too_big;
+        end;
+        Inc(pOut);
+        Inc(i);
+      end;
+      v^.pResultRow := @aMem[pOp^.p1];
+      v^.nResColumn := u16(pOp^.p2);
+      rc := SQLITE_ROW;
+      goto vdbe_return;
+    end;
+
+    { ────── OP_Jump ────── (vdbe.c:2561) }
+    OP_Jump: begin
+      if iCompare < 0 then
+        pOp := @aOp[pOp^.p1 - 1]
+      else if iCompare = 0 then
+        pOp := @aOp[pOp^.p2 - 1]
+      else
+        pOp := @aOp[pOp^.p3 - 1];
+    end;
+
+    { ────── OP_If ────── (vdbe.c:2733) }
+    OP_If: begin
+      if sqlite3VdbeBooleanValue(@aMem[pOp^.p1], pOp^.p3) <> 0 then
+        goto jump_to_p2;
+    end;
+
+    { ────── OP_IfNot ────── (vdbe.c:2747) }
+    OP_IfNot: begin
+      if sqlite3VdbeBooleanValue(@aMem[pOp^.p1], ord(pOp^.p3 = 0)) = 0 then
+        goto jump_to_p2;
+    end;
+
+    { ────── OP_OpenRead / OP_OpenWrite ────── (vdbe.c:4386) }
+    OP_OpenRead,
+    OP_OpenWrite: begin
+      if (v^.vdbeFlags and VDBF_EXPIRED_MASK) = 1 then begin
+        rc := SQLITE_ABORT or (1 shl 8);  { SQLITE_ABORT_ROLLBACK }
+        goto abort_due_to_error;
+      end;
+      nField   := 0;
+      pKInfo   := nil;
+      p2       := u32(pOp^.p2);
+      iDb      := pOp^.p3;
+      pDbb     := @db^.aDb[iDb];
+      pX       := PBtree(pDbb^.pBt);
+      if pOp^.opcode = OP_OpenWrite then begin
+        wrFlag := BTREE_WRCSR or (pOp^.p5 and OPFLAG_FORDELETE);
+        if pDbb^.pSchema <> nil then begin
+          if pDbb^.pSchema^.file_format < v^.minWriteFileFormat then
+            v^.minWriteFileFormat := pDbb^.pSchema^.file_format;
+        end;
+        if (pOp^.p5 and OPFLAG_P2ISREG) <> 0 then begin
+          pIn2 := @aMem[p2];
+          sqlite3VdbeMemIntegerify(pIn2);
+          p2 := u32(pIn2^.u.i);
+        end;
+      end else begin
+        wrFlag := 0;
+      end;
+      if pOp^.p4type = P4_KEYINFO then begin
+        pKInfo := pOp^.p4.pKeyInfo;
+        { nAllField is at offset 8 in KeyInfo (u32 nRef + u8 enc + pad + u16 nKeyField + u16 nAllField) }
+        nField := i32(Pu16(Pu8(pKInfo) + 8)^);
+      end else if pOp^.p4type = P4_INT32 then begin
+        nField := pOp^.p4.i;
+      end;
+      pCur := allocateCursor(v, pOp^.p1, nField, CURTYPE_BTREE);
+      if pCur = nil then goto no_mem;
+      pCur^.iDb         := iDb;
+      pCur^.nullRow     := 1;
+      pCur^.cursorFlags := pCur^.cursorFlags or VDBC_Ordered;
+      pCur^.pgnoRoot    := p2;
+      rc := sqlite3BtreeCursor(pX, p2, wrFlag, pKInfo, pCur^.uc.pCursor);
+      pCur^.pKeyInfo := pKInfo;
+      pCur^.isTable  := u8(ord(pOp^.p4type <> P4_KEYINFO));
+      goto open_cursor_set_hints;
+    end;
+
+    { ────── OP_Close ────── (vdbe.c:4707) }
+    OP_Close: begin
+      sqlite3VdbeFreeCursor(v, v^.apCsr[pOp^.p1]);
+      v^.apCsr[pOp^.p1] := nil;
+    end;
+
+    { ────── OP_Init ────── (vdbe.c:9046) }
+    OP_Init: begin
+      i := 1;
+      if pOp^.p1 >= sqlite3GlobalConfig.iOnceResetThreshold then begin
+        if pOp^.opcode = OP_Trace then begin { break equivalent — handled below }
+        end else begin
+          while i < v^.nOp do begin
+            if aOp[i].opcode = OP_Once then aOp[i].p1 := 0;
+            Inc(i);
+          end;
+          pOp^.p1 := 0;
+        end;
+      end;
+      Inc(pOp^.p1);
+      Inc(v^.aCounter[SQLITE_STMTSTATUS_RUN]);
+      goto jump_to_p2;
+    end;
+
+    else begin
+      { Unimplemented opcode }
+      rc := SQLITE_ERROR;
+      sqlite3VdbeError(v, 'unimplemented opcode');
+      goto abort_due_to_error;
+    end;
+    end; { case }
+
+    { advance to next instruction }
+    Inc(pOp);
+    continue;
+
+    { ── open_cursor_set_hints continuation ── (vdbe.c:4461) }
+    open_cursor_set_hints:
+    sqlite3BtreeCursorHintFlags(pCur^.uc.pCursor,
+                                pOp^.p5 and (OPFLAG_BULKCSR or OPFLAG_SEEKEQ));
+    if rc <> SQLITE_OK then goto abort_due_to_error;
+    Inc(pOp);
+    continue;
+
+    { ── jump_to_p2_and_check_for_interrupt ── (vdbe.c:1078) }
+    jump_to_p2_and_check_for_interrupt:
+    pOp := @aOp[pOp^.p2 - 1];
+
+    check_for_interrupt:
+    if db^.u1.isInterrupted <> 0 then goto abort_due_to_interrupt;
+    if (db^.xProgress <> nil) and (nVmStep >= nProgressLimit) then begin
+      while (nVmStep >= nProgressLimit) and (db^.xProgress <> nil) do begin
+        nProgressLimit := nProgressLimit + db^.nProgressOps;
+        if db^.xProgress(db^.pProgressArg) <> 0 then begin
+          nProgressLimit := u64($FFFFFFFFFFFFFFFF);
+          rc := SQLITE_INTERRUPT;
+          goto abort_due_to_error;
+        end;
+      end;
+    end;
+    Inc(pOp);
+    continue;
+
+    { ── jump_to_p2 ── (vdbe.c:1186) }
+    jump_to_p2:
+    pOp := @aOp[pOp^.p2 - 1];
+    Inc(pOp);
+    continue;
+
+  until False;
+
+  { ───────────────────────────────────────────────────────────── }
+
+  abort_due_to_error:
+  if db^.mallocFailed <> 0 then
+    rc := SQLITE_NOMEM_BKPT
+  else if rc = (SQLITE_IOERR or ($0B shl 8)) then  { SQLITE_IOERR_CORRUPTFS }
+    rc := SQLITE_CORRUPT_BKPT;
+  if v^.zErrMsg = nil then
+    sqlite3VdbeError(v, sqlite3ErrStr(rc));
+  v^.rc := rc;
+  sqlite3SystemError(db, rc);
+  sqlite3VdbeLogAbort(v, rc, pOp, aOp);
+  if v^.eVdbeState = VDBE_RUN_STATE then sqlite3VdbeHalt(v);
+  if rc = SQLITE_NOMEM_BKPT then sqlite3OomFault(db);
+  if (rc = SQLITE_CORRUPT) and (db^.autoCommit = 0) then
+    db^.flags := db^.flags or SQLITE_CorruptRdOnly;
+  rc := SQLITE_ERROR;
+  if resetSchemaOnFault > 0 then
+    sqlite3ResetOneSchema(db, i32(resetSchemaOnFault) - 1);
+
+  vdbe_return:
+  Inc(v^.aCounter[SQLITE_STMTSTATUS_VM_STEP], i32(nVmStep));
+  if v^.lockMask <> 0 then
+    sqlite3VdbeLeave(v);
+  Result := rc;
+  Exit;
+
+  too_big:
+  sqlite3VdbeError(v, 'string or blob too big');
+  rc := SQLITE_TOOBIG;
+  goto abort_due_to_error;
+
+  no_mem:
+  sqlite3OomFault(db);
+  sqlite3VdbeError(v, 'out of memory');
+  rc := SQLITE_NOMEM_BKPT;
+  goto abort_due_to_error;
+
+  abort_due_to_interrupt:
+  rc := SQLITE_INTERRUPT;
+  goto abort_due_to_error;
+
+  { Unreachable — Pascal requires function to return }
+  Result := rc;
 end;
 
 { ============================================================================

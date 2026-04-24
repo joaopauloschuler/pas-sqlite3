@@ -218,6 +218,291 @@ type
   PHash = ^THash;
 
 { ============================================================
+  Section 3b: sqlite3 connection struct and dependencies
+  (sqliteInt.h: BusyHandler, Lookaside, Schema, Db, Savepoint, sqlite3)
+  Added Phase 5.4 — needed by the VDBE executor.
+  Field order matches C struct exactly for correctness.
+  Opaque Pointer used for cross-unit types (PBtree, PVdbe, Parse, etc.)
+  ============================================================ }
+
+const
+  SQLITE_N_LIMIT = 13;  { SQLITE_LIMIT_PARSER_DEPTH+1 = 12+1 }
+
+  { Flags for sqlite3.flags (u64) }
+  SQLITE_WriteSchema    = u64($00000001);
+  SQLITE_LegacyFileFmt  = u64($00000002);
+  SQLITE_FullColNames   = u64($00000004);
+  SQLITE_FullFSync      = u64($00000008);
+  SQLITE_CkptFullFSync  = u64($00000010);
+  SQLITE_CacheSpill     = u64($00000020);
+  SQLITE_ShortColNames  = u64($00000040);
+  SQLITE_TrustedSchema  = u64($00000080);
+  SQLITE_NullCallback   = u64($00000100);
+  SQLITE_IgnoreChecks   = u64($00000200);
+  SQLITE_RecTriggers    = u64($00002000);
+  SQLITE_ForeignKeys    = u64($00004000);
+  SQLITE_AutoIndex      = u64($00008000);
+  SQLITE_EnableTrigger  = u64($00040000);
+  SQLITE_DeferFKs       = u64($00080000);
+  SQLITE_QueryOnly      = u64($00100000);
+  SQLITE_CellSizeCk     = u64($00200000);
+  SQLITE_CorruptRdOnly  = u64($02000000);  { internal flag }
+  SQLITE_VdbeListing    = u64($0000000100000000);
+  SQLITE_VdbeTrace      = u64($0000000200000000);
+  SQLITE_VdbeEQP        = u64($0000001000000000);
+  SQLITE_SqlTrace       = u64($0000000400000000);
+
+  { Flags for sqlite3.mDbFlags }
+  DBFLAG_SchemaChange   = $0002;
+  DBFLAG_PreferBuiltin  = $0008;
+  DBFLAG_Vacuum         = $0100;
+  DBFLAG_VacuumInto     = $0200;
+
+  { Schema flags }
+  DB_SchemaLoaded  = $0001;
+  DB_UnresetViews  = $0002;
+  DB_ResetWanted   = $0008;
+
+  { mTrace flags }
+  SQLITE_TRACE_STMT    = $01;
+  SQLITE_TRACE_PROFILE = $02;
+  SQLITE_TRACE_ROW     = $04;
+  SQLITE_TRACE_CLOSE   = $08;
+  SQLITE_TRACE_LEGACY  = $40;
+
+  { Conflict resolution actions }
+  OE_None      = 0;
+  OE_Rollback  = 1;
+  OE_Abort     = 2;
+  OE_Fail      = 3;
+  OE_Ignore    = 4;
+  OE_Replace   = 5;
+  OE_Update    = 6;
+  OE_Restrict  = 7;
+  OE_SetNull   = 8;
+  OE_SetDflt   = 9;
+  OE_Cascade   = 10;
+  OE_Default   = 11;
+
+  { OPFLAG values (vdbe.c / sqliteInt.h) }
+  OPFLAG_BULKCSR    = $01;
+  OPFLAG_SEEKEQ     = $02;
+  OPFLAG_FORDELETE  = $08;
+  OPFLAG_P2ISREG    = $10;
+  OPFLAG_NCHANGE    = $20;
+  OPFLAG_AUXDELETE  = $04;
+  OPFLAG_ISUPDATE   = $04;
+  OPFLAG_SAVEPOSITION = $02;
+
+  { BTREE cursor flags (btree.h) }
+  BTREE_WRCSR    = $00000004;
+  BTREE_BULKLOAD = $00000001;
+  BTREE_SEEK_EQ  = $00000002;
+  BTREE_FORDELETE= $00000008;
+
+type
+  { BusyHandler (sqliteInt.h:1216) }
+  TBusyHandler = record
+    xBusyHandler : function(p: Pointer; n: i32): i32; cdecl;
+    pBusyArg     : Pointer;
+    nBusy        : i32;
+  end;
+  PBusyHandler = ^TBusyHandler;
+
+  { LookasideSlot (sqliteInt.h:1606) }
+  PLookasideSlot = ^TLookasideSlot;
+  TLookasideSlot = record
+    pNext: PLookasideSlot;
+  end;
+
+  { Lookaside (sqliteInt.h:1587) }
+  TLookaside = record
+    bDisable  : u32;
+    sz        : u16;
+    szTrue    : u16;
+    bMalloced : u8;
+    nSlot     : u32;
+    anStat    : array[0..2] of u32;
+    pInit     : PLookasideSlot;
+    pFree     : PLookasideSlot;
+    pSmallInit: PLookasideSlot;
+    pSmallFree: PLookasideSlot;
+    pMiddle   : Pointer;
+    pStart    : Pointer;
+    pEnd      : Pointer;
+    pTrueEnd  : Pointer;
+  end;
+  PLookaside = ^TLookaside;
+
+  { Schema (sqliteInt.h:1499) }
+  PSchema = ^TSchema;
+  TSchema = record
+    schema_cookie : i32;
+    iGeneration   : i32;
+    tblHash       : THash;
+    idxHash       : THash;
+    trigHash      : THash;
+    fkeyHash      : THash;
+    pSeqTab       : Pointer;  { PTable — opaque until Phase 6 }
+    file_format   : u8;
+    enc           : u8;
+    schemaFlags   : u16;
+    cache_size    : i32;
+  end;
+
+  { Db (sqliteInt.h:1474) }
+  PDb = ^TDb;
+  TDb = record
+    zDbSName    : PAnsiChar;
+    pBt         : Pointer;   { PBtree — opaque (btree uses util, circular) }
+    safety_level: u8;
+    bSyncSet    : u8;
+    pSchema     : PSchema;
+  end;
+
+  { Savepoint (sqliteInt.h:2190) }
+  PSavepoint = ^TSavepoint;
+  TSavepoint = record
+    zName            : PAnsiChar;
+    nDeferredCons    : i64;
+    nDeferredImmCons : i64;
+    pNext            : PSavepoint;
+  end;
+
+  { sqlite3InitInfo sub-struct (sqliteInt.h:1700) }
+  Tsqlite3InitInfo = record
+    newTnum  : u32;   { Pgno }
+    iDb      : u8;
+    busy     : u8;
+    flags    : u8;    { orphanTrigger:1, imposterTable:2, reopenMemdb:1 packed }
+    azInit   : ^PAnsiChar;
+  end;
+
+  { sqlite3 trace union (sqliteInt.h:1716) }
+  Tsqlite3TraceUnion = record
+    case Boolean of
+      False: (xLegacy: procedure(p: Pointer; s: PAnsiChar); cdecl);
+      True:  (xV2: function(n: u32; p: Pointer; x: Pointer; y: Pointer): i32; cdecl);
+  end;
+
+  { DbClientData stub }
+  TDbClientData = record
+    pData: Pointer;
+    xDestroyData: procedure(p: Pointer); cdecl;
+    pNext: Pointer;
+  end;
+  PDbClientData = ^TDbClientData;
+
+  { Full sqlite3 connection struct (sqliteInt.h:1662)
+    Field order matches C struct for the oracle build configuration:
+      NOT SQLITE_OMIT_DEPRECATED (xProfile present)
+      NOT SQLITE_OMIT_VIRTUALTABLE (nVTrans etc. present)
+      NOT SQLITE_OMIT_WAL (xWalCallback present)
+      NOT SQLITE_OMIT_PROGRESS_CALLBACK (xProgress present)
+      NOT SQLITE_OMIT_AUTHORIZATION (xAuth present)
+      NOT SQLITE_ENABLE_PREUPDATE_HOOK (pPreUpdate NOT present)
+      NOT SQLITE_ENABLE_SETLK_TIMEOUT (setlkTimeout NOT present)
+      NOT SQLITE_ENABLE_UNLOCK_NOTIFY (pBlockingConnection NOT present) }
+  PTsqlite3 = ^Tsqlite3;
+  Tsqlite3 = record
+    pVfs           : Pointer;          { sqlite3_vfs* }
+    pVdbe          : Pointer;          { Vdbe* — opaque (circular) }
+    pDfltColl      : Pointer;          { CollSeq* — opaque }
+    mutex          : Pointer;          { sqlite3_mutex* }
+    aDb            : PDb;              { All backends (dynamic array) }
+    nDb            : i32;              { Number of backends currently in use }
+    mDbFlags       : u32;
+    flags          : u64;
+    lastRowid      : i64;
+    szMmap         : i64;
+    nSchemaLock    : u32;
+    openFlags      : u32;
+    errCode        : i32;
+    errByteOffset  : i32;
+    errMask        : i32;
+    iSysErrno      : i32;
+    dbOptFlags     : u32;
+    enc            : u8;
+    autoCommit     : u8;
+    temp_store     : u8;
+    mallocFailed   : u8;
+    bBenignMalloc  : u8;
+    dfltLockMode   : u8;
+    nextAutovac    : Int8;
+    suppressErr    : u8;
+    vtabOnConflict : u8;
+    isTransactionSavepoint : u8;
+    mTrace         : u8;
+    noSharedCache  : u8;
+    nSqlExec       : u8;
+    eOpenState     : u8;
+    nFpDigit       : u8;
+    nextPagesize   : i32;
+    nChange        : i64;
+    nTotalChange   : i64;
+    aLimit         : array[0..SQLITE_N_LIMIT-1] of i32;
+    nMaxSorterMmap : i32;
+    init           : Tsqlite3InitInfo;
+    nVdbeActive    : i32;
+    nVdbeRead      : i32;
+    nVdbeWrite     : i32;
+    nVdbeExec      : i32;
+    nVDestroy      : i32;
+    nExtension     : i32;
+    aExtension     : ^Pointer;
+    trace          : Tsqlite3TraceUnion;
+    pTraceArg      : Pointer;
+    xProfile       : Pointer;          { profiling callback }
+    pProfileArg    : Pointer;
+    pCommitArg     : Pointer;
+    xCommitCallback: function(p: Pointer): i32; cdecl;
+    pRollbackArg   : Pointer;
+    xRollbackCallback: procedure(p: Pointer); cdecl;
+    pUpdateArg     : Pointer;
+    xUpdateCallback: Pointer;
+    pAutovacPagesArg: Pointer;
+    xAutovacDestr  : procedure(p: Pointer); cdecl;
+    xAutovacPages  : Pointer;
+    pParse         : Pointer;          { PParse — opaque }
+    xWalCallback   : Pointer;
+    pWalArg        : Pointer;
+    xCollNeeded    : Pointer;
+    xCollNeeded16  : Pointer;
+    pCollNeededArg : Pointer;
+    pErr           : Pointer;          { sqlite3_value* }
+    u1             : record
+      case Boolean of
+        False: (isInterrupted: i32);   { volatile in C; i32 here }
+        True:  (notUsed1: Double);
+    end;
+    lookaside      : TLookaside;
+    xAuth          : Pointer;          { sqlite3_xauth — authorization callback }
+    pAuthArg       : Pointer;
+    xProgress      : function(p: Pointer): i32; cdecl;
+    pProgressArg   : Pointer;
+    nProgressOps   : u32;
+    nVTrans        : i32;
+    aModule        : THash;
+    pVtabCtx       : Pointer;
+    aVTrans        : ^Pointer;
+    pDisconnect    : Pointer;
+    aFunc          : THash;
+    aCollSeq       : THash;
+    busyHandler    : TBusyHandler;
+    aDbStatic      : array[0..1] of TDb;
+    pSavepoint     : PSavepoint;
+    nAnalysisLimit : i32;
+    busyTimeout    : i32;
+    nSavepoint     : i32;
+    nStatement     : i32;
+    nDeferredCons  : i64;
+    nDeferredImmCons: i64;
+    pnBytesFreed   : Pi32;
+    pDbData        : PDbClientData;
+    nSpill         : u64;
+  end;
+
+{ ============================================================
   Section 4: Bitvec type  (bitvec.c)
   ============================================================ }
 
@@ -300,11 +585,16 @@ function sqlite3Toupper(x: u8): u8; inline;
 function sqlite3Tolower(x: u8): u8; inline;
 
 { String utilities (util.c) }
+function  sqlite3HexToInt(h: i32): u8; inline;
 function  sqlite3Strlen30(z: PChar): i32;
+function  sqlite3Strlen30NN(z: PChar): i32;
 function  sqlite3StrICmp(zLeft, zRight: PChar): i32;
 function  sqlite3_strnicmp(zLeft, zRight: PChar; N: i32): i32;
 function  sqlite3StrIHash(z: PChar): u8;
 function  sqlite3AtoF(zIn: PChar; out pResult: Double): i32;
+function  sqlite3Atoi64(zNum: PChar; out pNum: i64; length: i32; enc: u8): i32;
+function  sqlite3Int64ToText(v: i64; zOut: PChar): i32;
+function  sqlite3DecOrHexToI64(z: PChar; out pOut: i64): i32;
 
 { Big-endian 4-byte accessors (util.c) }
 function  sqlite3Get4byte(p: Pu8): u32;
@@ -739,6 +1029,185 @@ after_integer:
     if z^ = 0 then Exit(mState);
   end;
   Result := i32($fffffff0) or mState;
+end;
+
+function sqlite3HexToInt(h: i32): u8; inline;
+begin
+  { ASCII: digits 0-9 add 0, letters a-f/A-F add 9 }
+  h := h + 9 * (1 and (h shr 6));
+  Result := u8(h and $F);
+end;
+
+function sqlite3Strlen30NN(z: PChar): i32;
+begin
+  Result := $3fffffff and i32(libc_strlen(z));
+end;
+
+{ compare2pow63 — helper for sqlite3Atoi64 }
+function compare2pow63(zNum: PChar; incr: i32): i32;
+const
+  pow63: PAnsiChar = '922337203685477580';
+var
+  c, i: i32;
+begin
+  c := 0;
+  i := 0;
+  while (c = 0) and (i < 18) do begin
+    c := (Ord(zNum[i*incr]) - Ord(pow63[i])) * 10;
+    Inc(i);
+  end;
+  if c = 0 then
+    c := Ord(zNum[18*incr]) - Ord('8');
+  Result := c;
+end;
+
+{ sqlite3Atoi64 — faithful port of util.c:1161.
+  Converts a string to a 64-bit signed integer.
+  Returns: -1=no digits, 0=ok, 1=extra text, 2=overflow, 3=MinInt64 special }
+function sqlite3Atoi64(zNum: PChar; out pNum: i64; length: i32; enc: u8): i32;
+var
+  incr:    i32;
+  u:       u64;
+  neg:     i32;
+  i, j:    i32;
+  c:       u32;
+  nonNum:  i32;
+  rc:      i32;
+  jj:      i32;
+  zStart:  PChar;
+  zEnd:    PChar;
+begin
+  u := 0;
+  neg := 0;
+  nonNum := 0;
+  rc := 0;
+  zEnd := zNum + length;
+  if enc = SQLITE_UTF8 then
+    incr := 1
+  else begin
+    incr := 2;
+    length := length and not 1;
+    i := 3 - i32(enc);
+    while (i < length) and (zNum[i] = #0) do Inc(i, 2);
+    if i < length then nonNum := 1;
+    zEnd := @zNum[i xor 1];
+    zNum := zNum + (enc and 1);
+  end;
+  while (zNum < zEnd) and (sqlite3Isspace(Ord(zNum^)) <> 0) do
+    Inc(zNum, incr);
+  if zNum < zEnd then begin
+    if zNum^ = '-' then begin
+      neg := 1; Inc(zNum, incr);
+    end else if zNum^ = '+' then
+      Inc(zNum, incr);
+  end;
+  zStart := zNum;
+  while (zNum < zEnd) and (zNum^ = '0') do Inc(zNum, incr);
+  i := 0;
+  while (@zNum[i] < zEnd) do begin
+    c := u32(Ord(zNum[i])) - u32(Ord('0'));
+    if c > 9 then break;
+    u := u * 10 + c;
+    Inc(i, incr);
+  end;
+  if u > u64(LARGEST_INT64) then begin
+    if neg <> 0 then pNum := SMALLEST_INT64 else pNum := LARGEST_INT64;
+  end else if neg <> 0 then
+    pNum := -i64(u)
+  else
+    pNum := i64(u);
+  if (i = 0) and (zStart = zNum) then
+    rc := -1
+  else if nonNum <> 0 then
+    rc := 1
+  else if @zNum[i] < zEnd then begin
+    jj := i;
+    repeat
+      if sqlite3Isspace(Ord(zNum[jj])) = 0 then begin
+        rc := 1; break;
+      end;
+      Inc(jj, incr);
+    until @zNum[jj] >= zEnd;
+  end;
+  if i < 19 * incr then begin
+    Result := rc; Exit;
+  end else begin
+    if i > 19 * incr then j := 1
+    else j := compare2pow63(zNum, incr);
+    if j < 0 then begin
+      Result := rc; Exit;
+    end else begin
+      if neg <> 0 then pNum := SMALLEST_INT64 else pNum := LARGEST_INT64;
+      if j > 0 then
+        Result := 2
+      else begin
+        if neg <> 0 then Result := rc else Result := 3;
+      end;
+      Exit;
+    end;
+  end;
+end;
+
+{ sqlite3Int64ToText — faithful port of util.c:1076. }
+function sqlite3Int64ToText(v: i64; zOut: PChar): i32;
+var
+  u:   u64;
+  i:   i32;
+  buf: array[0..22] of AnsiChar;
+begin
+  if v > 0 then
+    u := u64(v)
+  else if v = 0 then begin
+    zOut[0] := '0';
+    zOut[1] := #0;
+    Result := 1;
+    Exit;
+  end else begin
+    if v = SMALLEST_INT64 then
+      u := u64(1) shl 63
+    else
+      u := u64(-v);
+  end;
+  i := 21;
+  buf[i] := #0;
+  while u >= 10 do begin
+    Dec(i);
+    buf[i] := AnsiChar(Ord('0') + i32(u mod 10));
+    u := u div 10;
+  end;
+  if u > 0 then begin
+    Dec(i);
+    buf[i] := AnsiChar(Ord('0') + i32(u));
+  end;
+  if v < 0 then begin
+    Dec(i);
+    buf[i] := '-';
+  end;
+  Result := 21 - i;
+  Move(buf[i], zOut^, Result + 1);
+end;
+
+{ sqlite3DecOrHexToI64 — port of util.c:1264. }
+function sqlite3DecOrHexToI64(z: PChar; out pOut: i64): i32;
+var
+  u: u64;
+  k, i: i32;
+begin
+  if (z[0] = '0') and ((z[1] = 'x') or (z[1] = 'X')) then begin
+    u := 0;
+    i := 2;
+    while z[i] = '0' do Inc(i);
+    k := i;
+    while sqlite3Isxdigit(Ord(z[k])) <> 0 do begin
+      u := u * 16 + u64(sqlite3HexToInt(Ord(z[k])));
+      Inc(k);
+    end;
+    Move(u, pOut, 8);
+    if k - i > 16 then begin Result := 2; Exit; end;
+    if z[k] <> #0 then begin Result := 1; Exit; end;
+    Result := 0;
+  end else
+    Result := sqlite3Atoi64(z, pOut, sqlite3Strlen30(z), SQLITE_UTF8);
 end;
 
 { ============================================================

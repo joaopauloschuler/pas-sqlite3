@@ -1092,8 +1092,16 @@ estimate**.
 
 - [ ] **5.4** Port `vdbe.c` — the `sqlite3VdbeExec` loop. **~199 opcodes**.
   Port in groups:
-  - **5.4a** Flow control: `OP_Goto`, `OP_Halt`, `OP_Init`, `OP_Jump`,
-    `OP_If`, `OP_IfNot`, `OP_OpenRead`, `OP_OpenWrite`, `OP_Close`.
+  - [X] **5.4a** Exec loop skeleton + 23 opcodes: `OP_Goto`, `OP_Gosub`,
+    `OP_Return`, `OP_InitCoroutine`, `OP_EndCoroutine`, `OP_Yield`,
+    `OP_Halt`, `OP_Init`, `OP_Integer`, `OP_Int64`, `OP_Null`/`OP_BeginSubrtn`,
+    `OP_SoftNull`, `OP_Blob`, `OP_Move`, `OP_Copy`, `OP_SCopy`, `OP_IntCopy`,
+    `OP_ResultRow`, `OP_Jump`, `OP_If`, `OP_IfNot`, `OP_OpenRead`,
+    `OP_OpenWrite`, `OP_Close`.
+    Helper functions: `out2Prerelease`, `out2PrereleaseWithClear`,
+    `allocateCursor`, `sqlite3ErrStr`, `sqlite3VdbeFrameRestoreFull`, stubs.
+    `Tsqlite3` (PTsqlite3) struct added to `passqlite3util.pas` Section 3b.
+    Compiles 0 errors; TestSmoke PASS (2026-04-24).
   - **5.4b** Cursor motion: `OP_Rewind`, `OP_Next`, `OP_Prev`, `OP_Seek*`,
     `OP_Found`, `OP_NotFound`, `OP_IdxGT`, `OP_IdxLT`.
   - **5.4c** Record I/O: `OP_Column`, `OP_MakeRecord`, `OP_Insert`, `OP_Delete`.
@@ -1129,6 +1137,32 @@ estimate**.
   reference from the SQL corpus, run the program on the Pascal VDBE and on the
   C VDBE, with `PRAGMA vdbe_trace=ON`, and diff the resulting trace logs.
   **Any divergence halts the phase.**
+
+---
+
+### Phase 5.4a implementation notes (2026-04-24)
+
+**Units changed**: `src/passqlite3vdbe.pas`, `src/passqlite3util.pas`, `src/passqlite3btree.pas`.
+
+**What was done**:
+- Added `Tsqlite3` (connection struct, 144 fields) and `PTsqlite3 = ^Tsqlite3` to `passqlite3util.pas` Section 3b. Used opaque `Pointer` for cross-unit types (PBtree, PVdbe, PSchema, etc.) to avoid circular dependency. Companion types: `TBusyHandler`, `TLookaside`, `TSchema`, `TDb`, `TSavepoint`.
+- Replaced stub `sqlite3VdbeExec` with 23-opcode Phase 5.4a implementation in `passqlite3vdbe.pas`.
+- Added helper functions: `out2Prerelease`, `out2PrereleaseWithClear`, `allocateCursor`, `sqlite3ErrStr`, `sqlite3VdbeFrameRestoreFull`, stubs for `sqlite3VdbeLogAbort`, `sqlite3VdbeSetChanges`, `sqlite3SystemError`, `sqlite3ResetOneSchema`.
+- Added `sqlite3BtreeCursorHintFlags` to `passqlite3btree.pas`.
+
+**Critical FPC pitfalls discovered/fixed**:
+- `pMem: PMem` — FPC is case-insensitive; local var `pMem` conflicts with type `PMem`. Renamed to `pMSlot`.
+- `pDb: PDb` and `pKeyInfo: PKeyInfo` — same conflict. Renamed to `pDbb` and `pKInfo`.
+- Functions defined later in the implementation section cannot be called by earlier functions (no forward reference). Inlined `vdbeMemDynamic` and `memSetTypeFlag` at call sites where forward reference would be needed.
+- `aType[]` is a C flexible array NOT present in the Pascal `TVdbeCursor` record. Access via `Pu32(Pu8(pCx) + 120 + u32(nField) * SizeOf(u32))`.
+- `PKeyInfo = Pointer` (opaque). Access `nAllField` (u16 at offset 8) via pointer arithmetic: `Pu16(Pu8(pKInfo) + 8)^`.
+- `TVdbe.expired` is a C bitfield packed into `vdbeFlags: u32`; use `(v^.vdbeFlags and VDBF_EXPIRED_MASK) = 1`.
+- `TVdbeCursor.isOrdered` is a C bitfield packed into `cursorFlags: u32`; use `pCur^.cursorFlags := pCur^.cursorFlags or VDBC_Ordered`.
+- `lockMask` is a field of `TVdbe`, not `Tsqlite3`. Use `v^.lockMask`, not `db^.lockMask`.
+- `SZ_VDBECURSOR` function must be defined *before* `allocateCursor` in the implementation section.
+- `duplicate definition` if helper functions are defined twice; removed Phase 5.4a duplicates of `vdbeMemDynamic`/`memSetTypeFlag` which already existed in Phase 5.3.
+
+**Gate**: Compiles 0 errors; TestSmoke PASS (2026-04-24).
 
 ---
 
