@@ -1140,8 +1140,15 @@ estimate**.
     Bug fixed: P4_REAL pointer is freed by VdbeDelete — must be heap-allocated
     (not stack address) in test helpers.
 
-- [ ] **5.5** Port `vdbeapi.c`: public API — `sqlite3_step`, `sqlite3_column_*`,
+- [X] **5.5** Port `vdbeapi.c`: public API — `sqlite3_step`, `sqlite3_column_*`,
   `sqlite3_bind_*`, `sqlite3_reset`, `sqlite3_finalize`.
+  Implemented: sqlite3_step, sqlite3_reset, sqlite3_finalize, sqlite3_clear_bindings,
+  sqlite3_value_{type,int,int64,double,text,blob,bytes,subtype,dup,free,nochange,frombind},
+  sqlite3_column_{count,data_count,type,int,int64,double,text,blob,bytes,value,name},
+  sqlite3_bind_{int,int64,double,null,text,blob,value,parameter_count}.
+  Gate test: `TestVdbeApi.pas` T1–T13 all PASS (57/57) (2026-04-24).
+  Note: sqlite3_reset changed from procedure to function (returns i32) to match
+  the real C API; sqlite3_step does auto-reset on HALT_STATE like SQLite 3.7+.
 
 - [ ] **5.6** Port `vdbeblob.c`: incremental blob I/O API
   (`sqlite3_blob_open`, `sqlite3_blob_read`, `sqlite3_blob_write`,
