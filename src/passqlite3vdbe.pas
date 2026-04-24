@@ -3136,6 +3136,8 @@ end;
     OP_Add, OP_Subtract, OP_Multiply, OP_Divide, OP_Remainder,
     OP_BitAnd, OP_BitOr, OP_ShiftLeft, OP_ShiftRight, OP_AddImm,
     OP_Eq, OP_Ne, OP_Lt, OP_Le, OP_Gt, OP_Ge.
+  Ported opcodes (5.4e — string/blob):
+    OP_String8, OP_String, OP_Concat.
   All other opcodes: fall to default → SQLITE_ERROR abort.
   ============================================================================ }
 
@@ -3435,6 +3437,67 @@ begin
       pOut^.enc := enc;
       rc := sqlite3VdbeMemTooBig(pOut);
       if rc <> SQLITE_OK then goto abort_due_to_error;
+    end;
+
+    { ────── OP_String8 / OP_String ────── (vdbe.c:1414/1458)
+      P4.z = string literal, P1 = byte length, P2 = output register, enc = P4 enc.
+      OP_String8 converts itself to OP_String on first execution. }
+    OP_String8: begin
+      pOp^.p1 := sqlite3Strlen30(PChar(pOp^.p4.z));
+      if pOp^.p1 > db^.aLimit[0] { SQLITE_LIMIT_LENGTH } then goto too_big;
+      pOp^.opcode := OP_String;
+      { fall through to OP_String }
+      pOut := out2Prerelease(v, pOp);
+      pOut^.flags := MEM_Str or MEM_Static or MEM_Term;
+      pOut^.z     := pOp^.p4.z;
+      pOut^.n     := pOp^.p1;
+      pOut^.enc   := enc;
+    end;
+
+    OP_String: begin
+      pOut := out2Prerelease(v, pOp);
+      pOut^.flags := MEM_Str or MEM_Static or MEM_Term;
+      pOut^.z     := pOp^.p4.z;
+      pOut^.n     := pOp^.p1;
+      pOut^.enc   := enc;
+      if (pOp^.p3 > 0) and (aMem[pOp^.p3].flags and MEM_Int <> 0) and
+         (aMem[pOp^.p3].u.i = pOp^.p5) then
+        pOut^.flags := MEM_Blob or MEM_Static or MEM_Term;
+    end;
+
+    { ────── OP_Concat ────── (vdbe.c:1791)
+      P1=in1 (right), P2=in2 (left), P3=out3.  Result = r[P2] || r[P1]. }
+    OP_Concat: begin
+      pIn1 := @aMem[pOp^.p1];
+      pIn2 := @aMem[pOp^.p2];
+      pOut := @aMem[pOp^.p3];
+      if ((pIn1^.flags or pIn2^.flags) and MEM_Null) <> 0 then begin
+        sqlite3VdbeMemSetNull(pOut);
+      end else begin
+        { stringify/expand inputs if needed }
+        if (pIn1^.flags and (MEM_Str or MEM_Blob)) = 0 then begin
+          if sqlite3VdbeMemStringify(pIn1, enc, 0) <> SQLITE_OK then goto no_mem;
+        end else if (pIn1^.flags and MEM_Zero) <> 0 then begin
+          if sqlite3VdbeMemExpandBlob(pIn1) <> SQLITE_OK then goto no_mem;
+        end;
+        if (pIn2^.flags and (MEM_Str or MEM_Blob)) = 0 then begin
+          if sqlite3VdbeMemStringify(pIn2, enc, 0) <> SQLITE_OK then goto no_mem;
+        end else if (pIn2^.flags and MEM_Zero) <> 0 then begin
+          if sqlite3VdbeMemExpandBlob(pIn2) <> SQLITE_OK then goto no_mem;
+        end;
+        nByte := pIn1^.n + pIn2^.n;
+        if nByte > db^.aLimit[0] { SQLITE_LIMIT_LENGTH } then goto too_big;
+        if sqlite3VdbeMemGrow(pOut, nByte + 2, ord(pOut = pIn2)) <> SQLITE_OK then goto no_mem;
+        pOut^.flags := (pOut^.flags and not u16(MEM_TypeMask or MEM_Zero)) or MEM_Str;
+        if pOut <> pIn2 then
+          Move(pIn2^.z^, pOut^.z^, pIn2^.n);
+        Move(pIn1^.z^, PByte(pOut^.z)[pIn2^.n], pIn1^.n);
+        PByte(pOut^.z)[nByte]   := 0;
+        PByte(pOut^.z)[nByte+1] := 0;
+        pOut^.flags := pOut^.flags or MEM_Term;
+        pOut^.n   := nByte;
+        pOut^.enc := enc;
+      end;
     end;
 
     { ────── OP_Move ────── (vdbe.c:1601) }

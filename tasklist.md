@@ -1116,7 +1116,8 @@ estimate**.
     `OP_Divide`, `OP_Remainder`, `OP_Eq`, `OP_Ne`, `OP_Lt`, `OP_Le`, `OP_Gt`,
     `OP_Ge`, `OP_BitAnd`, `OP_BitOr`, `OP_ShiftLeft`, `OP_ShiftRight`, `OP_AddImm`.
     Gate test: `TestVdbeArith.pas` T1–T13 all PASS (41/41) (2026-04-24).
-  - **5.4e** String/blob: `OP_String8`, `OP_Blob`, `OP_Concat`, `OP_Length`.
+  - [X] **5.4e** String/blob: `OP_String8`, `OP_String`, `OP_Blob`, `OP_Concat`.
+    Gate test: `TestVdbeStr.pas` T1–T6 all PASS (23/23) (2026-04-24).
   - **5.4f** Aggregate: `OP_AggStep`, `OP_AggFinal`, `OP_AggInverse`,
     `OP_AggValue`.
   - **5.4g** Transaction control: `OP_Transaction`, `OP_Savepoint`,
