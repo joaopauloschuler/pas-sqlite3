@@ -284,15 +284,27 @@ const
   OE_Cascade   = 10;
   OE_Default   = 11;
 
-  { OPFLAG values (vdbe.c / sqliteInt.h) }
-  OPFLAG_BULKCSR    = $01;
-  OPFLAG_SEEKEQ     = $02;
-  OPFLAG_FORDELETE  = $08;
-  OPFLAG_P2ISREG    = $10;
-  OPFLAG_NCHANGE    = $20;
-  OPFLAG_AUXDELETE  = $04;
-  OPFLAG_ISUPDATE   = $04;
-  OPFLAG_SAVEPOSITION = $02;
+  { OPFLAG values (vdbe.c / sqliteInt.h) — exact values from sqliteInt.h }
+  OPFLAG_NCHANGE       = $01;  { OP_Insert/Delete P5/P2: update db->nChange }
+  OPFLAG_NOCHNG        = $01;  { OP_VColumn nochange for UPDATE }
+  OPFLAG_EPHEM         = $01;  { OP_Column: ephemeral output ok }
+  OPFLAG_ISUPDATE      = $04;  { OP_Insert is an SQL UPDATE }
+  OPFLAG_AUXDELETE     = $04;  { OP_Delete: index in a DELETE op }
+  OPFLAG_APPEND        = $08;  { likely to be an append }
+  OPFLAG_FORDELETE     = $08;  { OP_Open: use BTREE_FORDELETE }
+  OPFLAG_USESEEKRESULT = $10;  { try to avoid seek in BtreeInsert }
+  OPFLAG_P2ISREG       = $10;  { P2 to OP_Open** is a register number }
+  OPFLAG_LASTROWID     = $20;  { set to update db->lastRowid }
+  OPFLAG_ISNOOP        = $40;  { OP_Delete does pre-update-hook only }
+  OPFLAG_LENGTHARG     = $40;  { OP_Column only used for length() }
+  OPFLAG_TYPEOFARG     = $80;  { OP_Column only used for typeof() }
+  OPFLAG_BYTELENARG    = $C0;  { OP_Column only for octet_length() }
+  OPFLAG_BULKCSR       = $01;  { OP_Open** used to open bulk cursor }
+  OPFLAG_SEEKEQ        = $02;  { OP_Open** cursor uses EQ seek only }
+  OPFLAG_SAVEPOSITION  = $02;  { OP_Delete/Insert: save cursor pos }
+  OPFLAG_PREFORMAT     = $80;  { OP_Insert uses preformatted cell }
+  OPFLAG_NOCHNG_MAGIC  = $6D;  { OP_MakeRecord: serialtype 10 is ok }
+  OPFLAG_PERMUTE       = $01;  { OP_Compare: use the permutation }
 
   { BTREE cursor flags (btree.h) }
   BTREE_WRCSR    = $00000004;

@@ -580,6 +580,8 @@ function  sqlite3BtreeCreateTable(p: PBtree; piTable: PPgno; flags: i32): i32;
 procedure sqlite3BtreeGetMeta(p: PBtree; idx: i32; pMeta: Pu32);
 function  sqlite3BtreeUpdateMeta(p: PBtree; idx: i32; iMeta: u32): i32;
 function  sqlite3BtreeCount(db: Pointer; pCur: PBtCursor; pnEntry: Pi64): i32;
+function  sqlite3BtreeRowCountEst(pCur: PBtCursor): i64;
+function  sqlite3BtreeFakeValidCursor: PBtCursor;
 
 implementation
 
@@ -6178,6 +6180,35 @@ begin
   end;
 
   Result := rc;
+end;
+
+{ btree.c:6275 — row count estimate from current page only }
+function sqlite3BtreeRowCountEst(pCur: PBtCursor): i64;
+var
+  est: i64;
+  j:   u8;
+begin
+  if pCur^.eState <> CURSOR_VALID then begin Result := 0; Exit; end;
+  est := pCur^.pPage^.nCell;
+  j := 0;
+  while j < u8(pCur^.iPage) do begin
+    est := est * (pCur^.apPage[j]^.nCell + 1);
+    Inc(j);
+  end;
+  Result := est;
+end;
+
+{ btree.c:952 — return a fake cursor that is always CURSOR_VALID.
+  Used by NullRow to give OP_Column something to call HasMoved on. }
+var
+  gFakeCursorState: u8 = CURSOR_VALID;
+
+function sqlite3BtreeFakeValidCursor: PBtCursor;
+begin
+  { eState is the first field of TBtCursor (offset 0); we return a pointer
+    to a static byte that holds CURSOR_VALID.  Callers only call
+    sqlite3BtreeCursorHasMoved / sqlite3BtreeClearCursor on this. }
+  Result := PBtCursor(@gFakeCursorState);
 end;
 
 end.
