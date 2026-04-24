@@ -1178,9 +1178,9 @@ estimate**.
   the raw SQL, which is correct for the no-parameter case and safe otherwise.
   Gate test: `TestVdbeTrace.pas` T1–T5 all PASS (7/7) (2026-04-24).
 
-- [ ] **5.9** Port `vdbevtab.c`: VDBE-side support for virtual-table opcodes
-  (`OP_VOpen`, `OP_VFilter`, `OP_VNext`, `OP_VColumn`, `OP_VUpdate`). Depends
-  on `vtab.c` (Phase 6.bis) being ported first — reorder if needed.
+- [X] **5.9** Port `vdbevtab.c`: VDBE-side support for virtual-table opcodes.
+  `SQLITE_ENABLE_BYTECODE_VTAB` not set; `sqlite3VdbeBytecodeVtabInit` is a
+  no-op returning `SQLITE_OK`. Gate test `TestVdbeVtab`: T1–T2 all PASS (2/2).
 
 - [ ] **5.10** `TestVdbeTrace.pas`: for every VDBE program produced by the C
   reference from the SQL corpus, run the program on the Pascal VDBE and on the

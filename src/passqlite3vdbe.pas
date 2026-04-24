@@ -1344,6 +1344,9 @@ function  sqlite3_blob_reopen(pBlob: Psqlite3_blob; iRow: i64): i32;
 { --- vdbetrace.c — EXPLAIN SQL expander (Phase 5.8) --- }
 function sqlite3VdbeExpandSql(p: PVdbe; zRawSql: PAnsiChar): PAnsiChar;
 
+{ --- vdbevtab.c — bytecode virtual-table initialiser (Phase 5.9) --- }
+function sqlite3VdbeBytecodeVtabInit(db: PTsqlite3): i32;
+
 { --- vdbesort.c — external sorter (Phase 5.7) --- }
 function  sqlite3VdbeSorterInit(db: PTsqlite3; nField: i32;
                                 pCsr: PVdbeCursor): i32;
@@ -3228,6 +3231,22 @@ begin
   if z <> nil then
     Move(zRawSql^, z^, n);
   Result := z;
+end;
+
+{ ============================================================================
+  Phase 5.9 — vdbevtab.c bytecode virtual-table initialiser
+
+  In a build without SQLITE_ENABLE_BYTECODE_VTAB (which is the default and
+  our target configuration), sqlite3VdbeBytecodeVtabInit is a no-op that
+  returns SQLITE_OK.  The full bytecode()/tables_used() vtab modules require
+  the vtab framework (Phase 6.bis).
+  ============================================================================ }
+
+function sqlite3VdbeBytecodeVtabInit(db: PTsqlite3): i32;
+begin
+  {$WARN 5024 OFF}
+  Result := SQLITE_OK;
+  {$WARN 5024 ON}
 end;
 
 { ============================================================================
