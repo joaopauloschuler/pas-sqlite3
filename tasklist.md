@@ -1125,8 +1125,12 @@ estimate**.
     output (ctx.pOut=@t); accumulator (ctx.pMem=pMem) stays intact through
     xFinalize call. Real SQLite uses `sqlite3VdbeMemMove(pMem,&t)` after;
     here we do `pMem^ := t` after `sqlite3VdbeMemRelease(pMem)`.
-  - **5.4g** Transaction control: `OP_Transaction`, `OP_Savepoint`,
+  - [X] **5.4g** Transaction control: `OP_Transaction`, `OP_Savepoint`,
     `OP_AutoCommit`.
+    Gate test: `TestVdbeTxn.pas` T1–T4 all PASS (8/8) (2026-04-24).
+    Also added: `sqlite3CloseSavepoints`, `sqlite3RollbackAll` helpers.
+    Note: schema cookie check in OP_Transaction (p5≠0) is stubbed out —
+    requires PSchema.iGeneration which is not yet accessible (Phase 6 concern).
   - **5.4h** Everything else: sorter ops, virtual table ops, function calls.
 
 - [ ] **5.5** Port `vdbeapi.c`: public API — `sqlite3_step`, `sqlite3_column_*`,
