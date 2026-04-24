@@ -1102,8 +1102,13 @@ estimate**.
     `allocateCursor`, `sqlite3ErrStr`, `sqlite3VdbeFrameRestoreFull`, stubs.
     `Tsqlite3` (PTsqlite3) struct added to `passqlite3util.pas` Section 3b.
     Compiles 0 errors; TestSmoke PASS (2026-04-24).
-  - **5.4b** Cursor motion: `OP_Rewind`, `OP_Next`, `OP_Prev`, `OP_Seek*`,
-    `OP_Found`, `OP_NotFound`, `OP_IdxGT`, `OP_IdxLT`.
+  - [X] **5.4b** Cursor motion: `OP_Rewind`, `OP_Next`, `OP_Prev`,
+    `OP_SeekLT`, `OP_SeekLE`, `OP_SeekGE`, `OP_SeekGT`,
+    `OP_Found`, `OP_NotFound`, `OP_NoConflict`, `OP_IfNoHope`,
+    `OP_SeekRowid`, `OP_NotExists`,
+    `OP_IdxLE`, `OP_IdxGT`, `OP_IdxLT`, `OP_IdxGE`.
+    Helper labels: `next_tail`, `seek_not_found`, `notExistsWithKey`.
+    Gate test: `TestVdbeCursor.pas` T1–T8 all PASS (27/27) (2026-04-24).
   - **5.4c** Record I/O: `OP_Column`, `OP_MakeRecord`, `OP_Insert`, `OP_Delete`.
   - **5.4d** Arithmetic / comparison: `OP_Add`, `OP_Subtract`, `OP_Multiply`,
     `OP_Divide`, `OP_Remainder`, `OP_Eq`, `OP_Ne`, `OP_Lt`, `OP_Le`, `OP_Gt`,
@@ -1137,6 +1142,39 @@ estimate**.
   reference from the SQL corpus, run the program on the Pascal VDBE and on the
   C VDBE, with `PRAGMA vdbe_trace=ON`, and diff the resulting trace logs.
   **Any divergence halts the phase.**
+
+---
+
+### Phase 5.4b implementation notes (2026-04-24)
+
+**Units changed**: `src/passqlite3vdbe.pas`, `src/tests/TestVdbeCursor.pas`, `src/tests/build.sh`.
+
+**What was done**:
+- Added 16 cursor-motion opcodes to `sqlite3VdbeExec` in `passqlite3vdbe.pas`:
+  `OP_Rewind`, `OP_Next`, `OP_Prev`, `OP_SeekLT/LE/GE/GT`,
+  `OP_Found`, `OP_NotFound`, `OP_NoConflict`, `OP_IfNoHope`,
+  `OP_SeekRowid`, `OP_NotExists`, `OP_IdxLE/GT/LT/GE`.
+- Shared label bodies: `next_tail` (Next/Prev common tail), `seek_not_found`
+  (SeekGT/GE/LT/LE common tail), `notExistsWithKey` (SeekRowid/NotExists body).
+- Added `TestVdbeCursor.pas` (T1–T8 gate test) and wired into `build.sh`.
+
+**Critical pitfalls discovered/fixed**:
+- `jump_to_p2` semantics: `pOp := @aOp[p2-1]; Inc(pOp)` → executes `aOp[p2]`,
+  so p2 is the 0-based INDEX of the target instruction.
+- `sqlite3VdbeCreate` auto-adds `OP_Init` at index 0; test helpers must reset
+  `v^.nOp := 0` before adding their own instruction sequence.
+- `TVdbe.pc` sits at offset ~48 in the struct (before the `FillChar` at offset
+  136 in `sqlite3VdbeCreate`), so it is left uninitialized garbage by
+  `sqlite3DbMallocRawNN`. Fix: set `v^.pc := 0` in test `CreateMinVdbe`.
+  This was the root cause of T7b (skipped OP_Integer, used stale iKey=0) and
+  T8 (crash on second VDBE: pc landed in the middle of a short instruction array).
+- `allocateCursor` with iCur=0: uses `pMSlot = p^.aMem` (i.e. `aMem[0]`).
+  The cursor buffer is stored in `aMem[0].zMalloc` (a separate heap allocation);
+  does NOT corrupt adjacent `aMem[1..nMem-1]` slots.
+- In `OpenTestBtree`, inserts must use `PBtCursor` obtained from
+  `sqlite3BtreeCursor(pBt, pgno, 1, nil, @cur)`, NOT a `PBtree` pointer.
+
+**Gate**: `TestVdbeCursor` T1–T8 all PASS (27/27); TestSmoke still PASS (2026-04-24).
 
 ---
 

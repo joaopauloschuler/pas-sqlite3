@@ -288,12 +288,35 @@ const
   SQLITE_UTF16_ALIGNED = 8; { sqlite3_create_collation only }
 
 // ---------------------------------------------------------------------------
+// Destructor callback type — used by Mem.xDel and sqlite3_create_function
+// ---------------------------------------------------------------------------
+
+type
+  TxDelProc = procedure(p: Pointer); cdecl;
+
+// ---------------------------------------------------------------------------
 // Fundamental destructor constants
 // ---------------------------------------------------------------------------
 
 const
-  SQLITE_STATIC    = Pointer(0);
-  SQLITE_TRANSIENT = Pointer(-1);
+  SQLITE_STATIC    : TxDelProc = nil;   { sentinel: no destructor }
+  { SQLITE_TRANSIENT and SQLITE_DYNAMIC are vars in passqlite3vdbe.pas because
+    they hold non-nil sentinel pointer values that FPC typed const cannot encode. }
+
+// ---------------------------------------------------------------------------
+// Integer range constants (used by VDBE and util code)
+// ---------------------------------------------------------------------------
+
+const
+  SMALLEST_INT64 = Int64(-9223372036854775807) - 1;  { Low(Int64) }
+  LARGEST_INT64  = Int64(9223372036854775807);         { High(Int64) }
+
+// ---------------------------------------------------------------------------
+// Mem cell size constant (offsetof(TMem, db) = 24)
+// ---------------------------------------------------------------------------
+
+const
+  MEMCELLSIZE = 24;
 
 implementation
 

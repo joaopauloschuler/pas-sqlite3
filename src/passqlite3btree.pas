@@ -371,8 +371,15 @@ const
   Phase 4.2 opaque type stubs (resolved in later phases)
   =========================================================================== }
 type
-  { UnpackedRecord — full definition lives in vdbeInt.h (Phase 6) }
-  PUnpackedRecord = Pointer;
+  { UnpackedRecord — ported from vdbeInt.h (exposed here for btree + vdbe) }
+  TUnpackedRecord = record
+    pKeyInfo  : PKeyInfo;
+    aMem      : Pointer;    { Psqlite3_value array; Pointer here to avoid circular dep }
+    nField    : i32;
+    default_rc: i32;
+    eqSeen    : u8;
+  end;
+  PUnpackedRecord = ^TUnpackedRecord;
   { RecordCompare function pointer type }
   TRecordCompare  = function(nKey: i32; pKey: Pointer;
                              pRec: PUnpackedRecord): i32;
@@ -413,6 +420,7 @@ function  sqlite3BtreeCursor(p: PBtree; iTable: Pgno; wrFlag: i32;
                              pKeyInfo: PKeyInfo; pCur: PBtCursor): i32;
 function  sqlite3BtreeCloseCursor(pCur: PBtCursor): i32;
 procedure sqlite3BtreeCursorHintFlags(pCur: PBtCursor; x: u32);
+function  sqlite3BtreeCursorHasHint(pCur: PBtCursor; mask: u32): i32;
 
 { ===========================================================================
   Phase 4.2 — cursor save/restore
@@ -2013,6 +2021,11 @@ end;
 procedure sqlite3BtreeCursorHintFlags(pCur: PBtCursor; x: u32);
 begin
   pCur^.hints := u8(x);
+end;
+
+function sqlite3BtreeCursorHasHint(pCur: PBtCursor; mask: u32): i32;
+begin
+  Result := ord((pCur^.hints and u8(mask)) <> 0);
 end;
 
 { ---------------------------------------------------------------------------
@@ -3811,14 +3824,6 @@ end;
 
 type
   PPu8 = ^Pu8;   { pointer to a Pu8 pointer }
-
-  TUnpackedRecord = record
-    pKeyInfo  : PKeyInfo;
-    aMem      : Psqlite3_value;
-    nField    : i32;
-    default_rc: i32;
-    eqSeen    : u8;
-  end;
 
   TCellArray = record
     nCell  : i32;                       { Number of cells }

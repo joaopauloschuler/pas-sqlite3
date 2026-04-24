@@ -1205,6 +1205,9 @@ function  sqlite3_finalize(pStmt: PVdbe): i32;
 { --- vdbe.c — execution engine (Phase 5.4) --- }
 function  sqlite3VdbeExec(v: PVdbe): i32;
 
+{ --- vdbe.c Phase 5.4b helpers (exported for testing) --- }
+function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
+
 implementation
 
 { ============================================================================
@@ -2757,7 +2760,105 @@ begin
 end;
 
 { ============================================================================
-  sqlite3VdbeExec — Phase 5.4a implementation
+  Phase 5.4b helpers — ported from vdbe.c (SQLite 3.53.0)
+  ============================================================================ }
+
+{ sqlite3IsNaN — true if double is Not-a-Number.
+  SQLite is built with SQLITE_NO_ISNAN off on most platforms; use the standard
+  IEEE754 test (NaN is the only value not equal to itself). }
+function sqlite3IsNaN(x: Double): Boolean; inline;
+begin
+  Result := x <> x;
+end;
+
+{ alsoAnInt — helper for applyNumericAffinity.
+  Returns 1 if rValue can be losslessly represented as an i64 (either via
+  sqlite3RealSameAsInt or via the decimal string in pRec). }
+function alsoAnInt(pRec: PMem; rValue: Double; out piValue: i64): i32;
+var
+  iValue: i64;
+begin
+  iValue := sqlite3RealToI64(rValue);
+  if sqlite3RealSameAsInt(rValue, iValue) <> 0 then begin
+    piValue := iValue;
+    Result := 1;
+    Exit;
+  end;
+  if sqlite3Atoi64(pRec^.z, iValue, pRec^.n, pRec^.enc) = 0 then begin
+    piValue := iValue;
+    Result := 1;
+    Exit;
+  end;
+  piValue := 0;
+  Result := 0;
+end;
+
+{ applyNumericAffinity — convert a MEM_Str to numeric (Int or Real).
+  Port of vdbe.c:354. }
+procedure applyNumericAffinity(pRec: PMem; bTryForInt: i32);
+var
+  rValue: Double;
+  rcM:    i32;
+  iVal:   i64;
+begin
+  { assert: pRec^.flags has MEM_Str set (and no numeric bits) }
+  rcM := sqlite3MemRealValueRC(pRec, rValue);
+  if rcM <= 0 then Exit;
+  iVal := 0;
+  if ((rcM and 2) = 0) and (alsoAnInt(pRec, rValue, iVal) <> 0) then begin
+    pRec^.u.i := iVal;
+    pRec^.flags := pRec^.flags or u16(MEM_Int);
+  end else begin
+    pRec^.u.r := rValue;
+    pRec^.flags := pRec^.flags or u16(MEM_Real);
+    if bTryForInt <> 0 then sqlite3VdbeIntegerAffinity(pRec);
+  end;
+  pRec^.flags := pRec^.flags and not u16(MEM_Str);
+end;
+
+{ applyAffinity — apply type affinity to a Mem value.
+  Port of vdbe.c:397. }
+procedure applyAffinity(pRec: PMem; affinity: AnsiChar; enc: u8);
+begin
+  if Byte(affinity) >= SQLITE_AFF_NUMERIC then begin
+    if (pRec^.flags and MEM_Int) = 0 then begin
+      if (pRec^.flags and (MEM_Real or MEM_IntReal)) = 0 then begin
+        if (pRec^.flags and MEM_Str) <> 0 then
+          applyNumericAffinity(pRec, 1);
+      end else if Byte(affinity) <= SQLITE_AFF_REAL then
+        sqlite3VdbeIntegerAffinity(pRec);
+    end;
+  end else if Byte(affinity) = SQLITE_AFF_TEXT then begin
+    if (pRec^.flags and MEM_Str) = 0 then begin
+      if (pRec^.flags and (MEM_Real or MEM_Int or MEM_IntReal)) <> 0 then
+        sqlite3VdbeMemStringify(pRec, enc, 1);
+    end;
+    pRec^.flags := pRec^.flags and not u16(MEM_Real or MEM_Int or MEM_IntReal);
+  end;
+end;
+
+{ sqlite3IntFloatCompare — compare i64 vs double.
+  Port of vdbeaux.c:4551. Returns -1/0/+1 like memcmp. }
+function sqlite3IntFloatCompare(i: i64; r: Double): i32;
+var
+  y: i64;
+begin
+  if sqlite3IsNaN(r) then begin
+    Result := 1; { NaN treated as NULL; integers are greater than NULL }
+    Exit;
+  end;
+  if r < -9223372036854775808.0 then begin Result := 1; Exit; end;
+  if r >= 9223372036854775808.0 then begin Result := -1; Exit; end;
+  y := Trunc(r);
+  if i < y then begin Result := -1; Exit; end;
+  if i > y then begin Result := 1; Exit; end;
+  if Double(i) < r then Result := -1
+  else if Double(i) > r then Result := 1
+  else Result := 0;
+end;
+
+{ ============================================================================
+  sqlite3VdbeExec — Phase 5.4a+5.4b implementation
   Source: vdbe.c sqlite3VdbeExec (SQLite 3.53.0)
 
   Ported opcodes (5.4a):
@@ -2766,6 +2867,12 @@ end;
     OP_SoftNull, OP_Blob, OP_Move, OP_SCopy, OP_IntCopy, OP_Copy,
     OP_ResultRow, OP_Jump, OP_If, OP_IfNot, OP_OpenRead, OP_OpenWrite,
     OP_Close.
+  Ported opcodes (5.4b — cursor motion):
+    OP_Rewind, OP_Next, OP_Prev, OP_SorterNext,
+    OP_SeekLT, OP_SeekLE, OP_SeekGE, OP_SeekGT,
+    OP_Found, OP_NotFound, OP_NoConflict, OP_IfNoHope,
+    OP_SeekRowid, OP_NotExists,
+    OP_IdxLE, OP_IdxGT, OP_IdxLT, OP_IdxGE.
   All other opcodes: fall to default → SQLITE_ERROR abort.
   ============================================================================ }
 
@@ -2779,7 +2886,10 @@ label
   too_big,
   no_mem,
   abort_due_to_interrupt,
-  open_cursor_set_hints;
+  open_cursor_set_hints,
+  next_tail,
+  seek_not_found,
+  notExistsWithKey;
 var
   aOp:   PVdbeOp;
   pOp:   PVdbeOp;
@@ -2813,6 +2923,22 @@ var
   i:       i32;
   pDest:   PMem;
   pSrc:    PMem;
+  { 5.4b locals }
+  pCrsr:   PBtCursor;
+  res:     i32;
+  oc:      i32;
+  eqOnly:  i32;
+  nFld:    i32;
+  iKey:    u64;
+  flags3:  u16;
+  newType: u16;
+  c:       i32;
+  rSeek:   TUnpackedRecord;
+  pIdxKey: ^TUnpackedRecord;
+  alreadyExists: i32;
+  ii:      i32;
+  nCellKey: i64;
+  pMem5b:  TMem;
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -3049,6 +3175,8 @@ begin
       end;
       v^.pResultRow := @aMem[pOp^.p1];
       v^.nResColumn := u16(pOp^.p2);
+      if db^.mallocFailed <> 0 then goto no_mem;
+      v^.pc := i32(pOp - aOp) + 1;  { save resume point for next call }
       rc := SQLITE_ROW;
       goto vdbe_return;
     end;
@@ -3127,6 +3255,221 @@ begin
       v^.apCsr[pOp^.p1] := nil;
     end;
 
+    { ────── OP_Rewind ────── (vdbe.c:6372) }
+    OP_Rewind: begin
+      pCur := v^.apCsr[pOp^.p1];
+      res := 1;
+      pCrsr := pCur^.uc.pCursor;
+      rc := sqlite3BtreeFirst(pCrsr, @res);
+      pCur^.deferredMoveto := 0;
+      pCur^.cacheStatus   := CACHE_STALE;
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+      pCur^.nullRow := u8(res);
+      if pOp^.p2 > 0 then begin
+        if res <> 0 then goto jump_to_p2;
+      end;
+    end;
+
+    { ────── OP_Prev / OP_Next ────── (vdbe.c:6495-6524) }
+    OP_Prev: begin
+      pCur := v^.apCsr[pOp^.p1];
+      rc := sqlite3BtreePrevious(pCur^.uc.pCursor, pOp^.p3);
+      goto next_tail;
+    end;
+
+    OP_Next: begin
+      pCur := v^.apCsr[pOp^.p1];
+      rc := sqlite3BtreeNext(pCur^.uc.pCursor, pOp^.p3);
+      goto next_tail;
+    end;
+
+    { ────── OP_SeekLT / OP_SeekLE / OP_SeekGE / OP_SeekGT ────── (vdbe.c:4824) }
+    OP_SeekLT,
+    OP_SeekLE,
+    OP_SeekGE,
+    OP_SeekGT: begin
+      pCur  := v^.apCsr[pOp^.p1];
+      oc    := pOp^.opcode;
+      eqOnly := 0;
+      pCur^.nullRow      := 0;
+      pCur^.deferredMoveto := 0;
+      pCur^.cacheStatus  := CACHE_STALE;
+      if pCur^.isTable <> 0 then begin
+        { Table cursor: seek by integer rowid }
+        pIn3   := @aMem[pOp^.p3];
+        flags3 := pIn3^.flags;
+        if (flags3 and (MEM_Int or MEM_Real or MEM_IntReal or MEM_Str)) = MEM_Str then
+          applyNumericAffinity(pIn3, 0);
+        iKey := u64(sqlite3VdbeIntValue(pIn3));
+        newType := pIn3^.flags;
+        pIn3^.flags := flags3; { restore original type }
+        if (newType and (MEM_Int or MEM_IntReal)) = 0 then begin
+          { could not convert to integer }
+          c := 0;
+          if (newType and MEM_Real) = 0 then begin
+            if (newType and MEM_Null) <> 0 then begin
+              goto jump_to_p2;
+            end else if oc >= OP_SeekGE then begin
+              goto jump_to_p2;
+            end else begin
+              rc := sqlite3BtreeLast(pCur^.uc.pCursor, @res);
+              if rc <> SQLITE_OK then goto abort_due_to_error;
+              goto seek_not_found;
+            end;
+          end;
+          c := sqlite3IntFloatCompare(i64(iKey), pIn3^.u.r);
+          if c > 0 then begin
+            if (oc and 1) = (OP_SeekGT and 1) then Dec(oc);
+          end else if c < 0 then begin
+            if (oc and 1) = (OP_SeekLT and 1) then Inc(oc);
+          end;
+        end;
+        rc := sqlite3BtreeTableMoveto(pCur^.uc.pCursor, iKey, 0, @res);
+        pCur^.movetoTarget := i64(iKey);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+      end else begin
+        { Index cursor: seek by key record }
+        if sqlite3BtreeCursorHasHint(pCur^.uc.pCursor, BTREE_SEEK_EQ) <> 0 then begin
+          eqOnly := 1;
+        end;
+        nFld := pOp^.p4.i;
+        rSeek.pKeyInfo := pCur^.pKeyInfo;
+        rSeek.nField   := nFld;
+        { default_rc: +1 for SeekGE/SeekLT, -1 for SeekGT/SeekLE }
+        if (1 and (oc - OP_SeekLT)) <> 0 then rSeek.default_rc := -1
+        else rSeek.default_rc := 1;
+        rSeek.aMem   := @aMem[pOp^.p3];
+        rSeek.eqSeen := 0;
+        rc := sqlite3BtreeIndexMoveto(pCur^.uc.pCursor, @rSeek, @res);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+        if (eqOnly <> 0) and (rSeek.eqSeen = 0) then goto seek_not_found;
+      end;
+      if oc >= OP_SeekGE then begin
+        if (res < 0) or ((res = 0) and (oc = OP_SeekGT)) then begin
+          res := 0;
+          rc := sqlite3BtreeNext(pCur^.uc.pCursor, 0);
+          if rc <> SQLITE_OK then begin
+            if rc = SQLITE_DONE then begin rc := SQLITE_OK; res := 1; end
+            else goto abort_due_to_error;
+          end;
+        end else
+          res := 0;
+      end else begin
+        if (res > 0) or ((res = 0) and (oc = OP_SeekLT)) then begin
+          res := 0;
+          rc := sqlite3BtreePrevious(pCur^.uc.pCursor, 0);
+          if rc <> SQLITE_OK then begin
+            if rc = SQLITE_DONE then begin rc := SQLITE_OK; res := 1; end
+            else goto abort_due_to_error;
+          end;
+        end else
+          res := sqlite3BtreeEof(pCur^.uc.pCursor);
+      end;
+      { fall to seek_not_found }
+      goto seek_not_found;
+    end;
+
+    { ────── OP_Found / OP_NotFound / OP_NoConflict / OP_IfNoHope ────── (vdbe.c:5363) }
+    OP_NoConflict,
+    OP_NotFound,
+    OP_IfNoHope,
+    OP_Found: begin
+      pCur := v^.apCsr[pOp^.p1];
+      rSeek.aMem   := @aMem[pOp^.p3];
+      rSeek.nField := pOp^.p4.i;
+      if rSeek.nField > 0 then begin
+        rSeek.pKeyInfo  := pCur^.pKeyInfo;
+        rSeek.default_rc := 0;
+        rc := sqlite3BtreeIndexMoveto(pCur^.uc.pCursor, @rSeek, @pCur^.seekResult);
+      end else begin
+        { Composite key from OP_MakeRecord }
+        if (PMem(rSeek.aMem)^.flags and MEM_Blob) = 0 then begin rc := SQLITE_ERROR; goto abort_due_to_error; end;
+        if ((PMem(rSeek.aMem)^.flags and MEM_Zero) <> 0) and (sqlite3VdbeMemExpandBlob(PMem(rSeek.aMem)) <> SQLITE_OK) then goto no_mem;
+        pIdxKey := sqlite3VdbeAllocUnpackedRecord(pCur^.pKeyInfo);
+        if pIdxKey = nil then goto no_mem;
+        sqlite3VdbeRecordUnpack(pCur^.pKeyInfo, PMem(rSeek.aMem)^.n, PMem(rSeek.aMem)^.z, pIdxKey);
+        pIdxKey^.default_rc := 0;
+        rc := sqlite3BtreeIndexMoveto(pCur^.uc.pCursor, pIdxKey, @pCur^.seekResult);
+        sqlite3DbFreeNN(db, pIdxKey);
+      end;
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+      alreadyExists := ord(pCur^.seekResult = 0);
+      pCur^.nullRow      := u8(1 - alreadyExists);
+      pCur^.deferredMoveto := 0;
+      pCur^.cacheStatus  := CACHE_STALE;
+      if pOp^.opcode = OP_Found then begin
+        if alreadyExists <> 0 then goto jump_to_p2;
+      end else begin
+        if alreadyExists = 0 then begin
+          goto jump_to_p2;
+        end;
+        if pOp^.opcode = OP_NoConflict then begin
+          for ii := 0 to rSeek.nField - 1 do begin
+            if (PMem(rSeek.aMem)[ii].flags and MEM_Null) <> 0 then goto jump_to_p2;
+          end;
+        end;
+        if pOp^.opcode = OP_IfNoHope then
+          pCur^.seekHit := u16(pOp^.p4.i);
+      end;
+    end;
+
+    { ────── OP_SeekRowid / OP_NotExists ────── (vdbe.c:5495) }
+    OP_SeekRowid: begin
+      pIn3 := @aMem[pOp^.p3];
+      if (pIn3^.flags and (MEM_Int or MEM_IntReal)) = 0 then begin
+        { not an integer — convert with NUMERIC affinity }
+        pMem5b := pIn3^;
+        applyAffinity(@pMem5b, AnsiChar(SQLITE_AFF_NUMERIC), enc);
+        if (pMem5b.flags and MEM_Int) = 0 then goto jump_to_p2;
+        iKey := u64(pMem5b.u.i);
+        goto notExistsWithKey;
+      end;
+      { fall through into NotExists }
+      iKey := u64(pIn3^.u.i);
+      goto notExistsWithKey;
+    end;
+
+    OP_NotExists: begin
+      pIn3 := @aMem[pOp^.p3];
+      iKey := u64(pIn3^.u.i);
+      goto notExistsWithKey;
+    end;
+
+    { ────── OP_IdxLE / OP_IdxGT / OP_IdxLT / OP_IdxGE ────── (vdbe.c:6827) }
+    OP_IdxLE,
+    OP_IdxGT,
+    OP_IdxLT,
+    OP_IdxGE: begin
+      pCur := v^.apCsr[pOp^.p1];
+      rSeek.pKeyInfo  := pCur^.pKeyInfo;
+      rSeek.nField    := pOp^.p4.i;
+      if pOp^.opcode < OP_IdxLT then
+        rSeek.default_rc := -1  { OP_IdxLE or OP_IdxGT }
+      else
+        rSeek.default_rc := 0;  { OP_IdxGE or OP_IdxLT }
+      rSeek.aMem := @aMem[pOp^.p3];
+      { Inlined sqlite3VdbeIdxKeyCompare }
+      nCellKey := 0;
+      pCrsr := pCur^.uc.pCursor;
+      nCellKey := sqlite3BtreePayloadSize(pCrsr);
+      if (nCellKey <= 0) or (nCellKey > $7FFFFFFF) then begin
+        rc := SQLITE_CORRUPT_BKPT;
+        goto abort_due_to_error;
+      end;
+      sqlite3VdbeMemInit(@pMem5b, db, 0);
+      rc := sqlite3VdbeMemFromBtreeZeroOffset(pCrsr, u32(nCellKey), @pMem5b);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+      res := sqlite3VdbeRecordCompareWithSkip(pMem5b.n, pMem5b.z, @rSeek, 0);
+      sqlite3VdbeMemReleaseMalloc(@pMem5b);
+      { End inlined IdxKeyCompare }
+      { OP_IdxLE/OP_IdxLT: negate; OP_IdxGE/OP_IdxGT: increment }
+      if (pOp^.opcode and 1) = (OP_IdxLT and 1) then
+        res := -res
+      else
+        Inc(res);
+      if res > 0 then goto jump_to_p2;
+    end;
+
     { ────── OP_Init ────── (vdbe.c:9046) }
     OP_Init: begin
       i := 1;
@@ -3161,6 +3504,48 @@ begin
     open_cursor_set_hints:
     sqlite3BtreeCursorHintFlags(pCur^.uc.pCursor,
                                 pOp^.p5 and (OPFLAG_BULKCSR or OPFLAG_SEEKEQ));
+    if rc <> SQLITE_OK then goto abort_due_to_error;
+    Inc(pOp);
+    continue;
+
+    { ── next_tail ── (vdbe.c:6525) shared tail for OP_Next/OP_Prev/OP_SorterNext }
+    next_tail:
+    pCur^.cacheStatus := CACHE_STALE;
+    if rc = SQLITE_OK then begin
+      pCur^.nullRow := 0;
+      Inc(v^.aCounter[pOp^.p5]);
+      goto jump_to_p2_and_check_for_interrupt;
+    end;
+    if rc <> SQLITE_DONE then goto abort_due_to_error;
+    rc := SQLITE_OK;
+    pCur^.nullRow := 1;
+    goto check_for_interrupt;
+
+    { ── seek_not_found ── (vdbe.c:5012) shared tail for SeekGT/GE/LT/LE }
+    seek_not_found:
+    if res <> 0 then goto jump_to_p2;
+    if eqOnly <> 0 then Inc(pOp);  { eqOnly: skip OP_IdxLT/OP_IdxGT that follows }
+    Inc(pOp);
+    continue;
+
+    { ── notExistsWithKey ── (vdbe.c:5525) shared body for SeekRowid/NotExists }
+    notExistsWithKey:
+    pCur := v^.apCsr[pOp^.p1];
+    pCrsr := pCur^.uc.pCursor;
+    res := 0;
+    rc := sqlite3BtreeTableMoveto(pCrsr, iKey, 0, @res);
+    pCur^.movetoTarget := i64(iKey);
+    pCur^.nullRow        := 0;
+    pCur^.cacheStatus    := CACHE_STALE;
+    pCur^.deferredMoveto := 0;
+    pCur^.seekResult := res;
+    if res <> 0 then begin
+      if pOp^.p2 = 0 then begin
+        rc := SQLITE_CORRUPT_BKPT;
+        goto abort_due_to_error;
+      end else
+        goto jump_to_p2;
+    end;
     if rc <> SQLITE_OK then goto abort_due_to_error;
     Inc(pOp);
     continue;
