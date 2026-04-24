@@ -1051,8 +1051,20 @@ The bytecode interpreter. Big switch statement; tedious but mechanical —
 but bigger than initially scoped. Phase 5 effort roughly **2× the original
 estimate**.
 
-- [ ] **5.1** Port `Vdbe`, `VdbeOp`, `Mem`, `VdbeCursor` records. Field order
+- [X] **5.1** Port `Vdbe`, `VdbeOp`, `Mem`, `VdbeCursor` records. Field order
   must match C — tests will dump program state and diff.
+  - Created `src/passqlite3vdbe.pas` (515 lines): all types from vdbeInt.h and
+    vdbe.h (TMem, TVdbeOp, TVdbeCursor, TVdbe, TVdbeFrame, TAuxData,
+    TScanStatus, TDblquoteStr, TSubrtnSig, TSubProgram, Tsqlite3_context,
+    TValueList, TVdbeTxtBlbCache); all 192 OP_* opcodes from opcodes.h;
+    MEM_* / P4_* / CURTYPE_* / VDBE_*_STATE / OPFLG_* / VDBC_* / VDBF_*
+    constants; sqlite3OpcodeProperty[192] table; stubs for 5.2–5.5 functions.
+  - FPC struct sizes verified vs GCC x86-64 layout:
+    TMem=56, TVdbeOp=24, TVdbeCursor=120, TVdbe=304, TVdbeFrame=112.
+  - Bitfields (VdbeCursor 5-bit group, Vdbe 9-bit group) represented as u32
+    with VDBC_*/VDBF_* named bit-mask constants; FPC natural alignment produces
+    identical offsets to GCC.
+  - All 337 TestBtreeCompat + pager/WAL tests still PASS (2026-04-24).
 
 - [ ] **5.2** Port `vdbeaux.c`: program assembly (`sqlite3VdbeAddOp*`), label
   resolution, final VDBE program layout. Gate: given a hand-written VDBE
@@ -1100,6 +1112,58 @@ estimate**.
   reference from the SQL corpus, run the program on the Pascal VDBE and on the
   C VDBE, with `PRAGMA vdbe_trace=ON`, and diff the resulting trace logs.
   **Any divergence halts the phase.**
+
+---
+
+### Phase 5.1 implementation notes (2026-04-24)
+
+**Unit**: `src/passqlite3vdbe.pas` (515 lines, compiles 0 errors).
+
+**What was done**:
+- All 192 OP_* opcode constants from `opcodes.h` (SQLite 3.53.0) with exact
+  numeric values. `SQLITE_MX_JUMP_OPCODE = 66`.
+- `sqlite3OpcodeProperty[0..191]` — opcode property flag table from opcodes.h
+  (OPFLG_* bits: JUMP, IN1, IN2, IN3, OUT2, OUT3, NCYCLE, JUMP0).
+- All P4_* type tags (P4_NOTUSED=0 … P4_SUBRTNSIG=-18); P5_Constraint* codes;
+  COLNAME_* slot indices; SQLITE_PREPARE_* flags.
+- All MEM_* flags (MEM_Undefined=0 … MEM_Agg=$8000).
+- CURTYPE_*, CACHE_STALE, VDBE_*_STATE, SQLITE_FRAME_MAGIC, SQLITE_MAX_SCHEMA_RETRY.
+- VDBC_* bitfield constants for VdbeCursor.cursorFlags (5-bit packed group).
+- VDBF_* bitfield constants for Vdbe.vdbeFlags (9-bit packed group).
+- Affinity constants (SQLITE_AFF_*), comparison flags (SQLITE_JUMPIFNULL etc.),
+  KEYINFO_ORDER_* — needed by VDBE column comparison logic.
+- Types: `ynVar = i16`, `LogEst = i16`, `yDbMask = u32` (default platform sizes).
+- Opaque `Pointer` aliases for unported sqliteInt.h types: PFuncDef, PCollSeq,
+  PTable, PIndex, PExpr, PParse, PVList, PVTable, Psqlite3_vtab_cursor,
+  PVdbeSorter.
+- All VDBE record types in one `type` block (FPC forward-ref requirement):
+  TMemValue, TMem (= sqlite3_value), TVdbeTxtBlbCache, TAuxData, TScanStatus,
+  TDblquoteStr, TSubrtnSig, Tp4union, TVdbeOp, TVdbeOpList, TSubProgram,
+  TVdbeFrame, TVdbeCursorUb, TVdbeCursorUc, TVdbeCursor, Tsqlite3_context,
+  TVdbe, TValueList.
+- C flexible arrays (aType[] in VdbeCursor, argv[] in sqlite3_context) are
+  omitted from the fixed record; callers allocate extra space.
+- Phase 5.2–5.5 stubs: VdbeAddOp*, VdbeMakeLabel, VdbeResolveLabel,
+  VdbeMemInit/SetNull/SetInt64/SetDouble/SetStr/Release/Copy, VdbeIntValue,
+  VdbeRealValue, VdbeBooleanValue, sqlite3_step/reset/finalize, VdbeExec,
+  VdbeHalt, VdbeList, sqlite3OpcodeName (full opcode name table included),
+  sqlite3VdbeSerialTypeLen, sqlite3VdbeOneByteSerialTypeLen, sqlite3VdbeSerialGet.
+
+**Struct sizes verified against GCC x86-64**:
+- TMemValue = 8 B (largest member: Double/i64/pointer all = 8 B)
+- TMem = 56 B (MEMCELLSIZE = offsetof(Mem,db) = 24 B)
+- TVdbeOp = 24 B (opcode:1+p4type:1+p5:2+p1:4+p2:4+p3:4+p4:8)
+- TVdbeCursor = 120 B (without flexible aType[] array)
+- TVdbeFrame = 112 B
+- TVdbe = 304 B (includes startTime:i64 for !SQLITE_OMIT_TRACE default)
+
+**FPC pitfalls noted for 5.2+**:
+- `Psqlite3_value = PMem` redefines the stub `Psqlite3_value = Pointer` from
+  btree.pas; code in vdbe.pas uses the proper PMem type; btree.pas stubs
+  continue to use Pointer (compatible for passing purposes).
+- All type declarations in one `type` block for mutual-reference resolution.
+- Bitfield groups translated to u32 with named bit-mask constants; GCC and FPC
+  both align the u32 storage unit to 4 bytes, producing identical struct offsets.
 
 ---
 
