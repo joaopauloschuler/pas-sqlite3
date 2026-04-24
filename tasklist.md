@@ -1091,6 +1091,7 @@ estimate**.
   - Gate: TestVdbeMem T1–T23 all PASS (62/62 checks, 2026-04-24).
 
 - [ ] **5.4** Port `vdbe.c` — the `sqlite3VdbeExec` loop. **~199 opcodes**.
+  Current: 118/190 opcodes implemented (62% complete). 74 opcodes remaining.
   Port in groups:
   - [X] **5.4a** Exec loop skeleton + 23 opcodes: `OP_Goto`, `OP_Gosub`,
     `OP_Return`, `OP_InitCoroutine`, `OP_EndCoroutine`, `OP_Yield`,
@@ -1139,6 +1140,47 @@ estimate**.
     Gate test: `TestVdbeMisc.pas` T1–T13 all PASS (45/45) (2026-04-24).
     Bug fixed: P4_REAL pointer is freed by VdbeDelete — must be heap-allocated
     (not stack address) in test helpers.
+
+- [ ] **5.4i** Cursor open/close extensions: OP_OpenRead, OP_ReopenIdx,
+    OP_OpenEphemeral, OP_OpenAutoindex, OP_OpenPseudo, OP_OpenDup,
+    OP_NullRow, OP_RowData, OP_RowCell.
+    Needed for: table scans, index usage, temp tables, subqueries.
+
+- [ ] **5.4j** Seek and index comparison: OP_SeekGE, OP_SeekLE, OP_SeekLT,
+    OP_SeekScan, OP_SeekHit, OP_IdxLT, OP_IdxLE, OP_IdxGT, OP_IdxGE.
+    Needed for: range queries, index navigation, ORDER BY.
+
+- [ ] **5.4k** Control flow: OP_Once, OP_IfEmpty, OP_IfNotOpen, OP_IfNoHope,
+    OP_IfPos, OP_IfNotZero, OP_IfSizeBetween, OP_DecrJumpZero, OP_Program,
+    OP_Param, OP_ElseEq, OP_Permutation, OP_Compare.
+    Needed for: subqueries, EXISTS, IN, CASE, compound SELECT.
+
+- [ ] **5.4l** Sorter: OP_SorterOpen, OP_SorterInsert, OP_SorterSort,
+    OP_SorterData, OP_SorterCompare, OP_Sort, OP_ResetSorter.
+    Needed for: ORDER BY, GROUP BY with large result sets.
+
+- [ ] **5.4m** Schema: OP_CreateBtree, OP_ParseSchema, OP_ReadCookie,
+    OP_SetCookie, OP_TableLock, OP_LoadAnalysis.
+    Needed for: CREATE TABLE, schema changes, ANALYZE.
+
+- [ ] **5.4n** RowSet: OP_RowSetAdd, OP_RowSetRead, OP_RowSetTest.
+    Needed for: IN (subquery), EXISTS, DISTINCT.
+
+- [ ] **5.4o** Foreign keys: OP_FkCheck, OP_FkCounter, OP_FkIfZero.
+    Needed for: FOREIGN KEY enforcement.
+
+- [ ] **5.4p** Virtual table: OP_VNext, OP_VOpen, OP_VFilter, OP_VColumn,
+    OP_VUpdate, OP_VBegin, OP_VCreate, OP_VDestroy, OP_VRename, OP_VCheck,
+    OP_VInitIn.
+    Needed for: virtual tables (FTS, R-TREE, etc.).
+
+- [ ] **5.4q** Misc remaining: OP_Abortable, OP_Clear, OP_ColumnsUsed,
+    OP_CursorHint, OP_CursorLock, OP_CursorUnlock, OP_Destroy, OP_DropIndex,
+    OP_DropTable, OP_DropTrigger, OP_Expire, OP_Filter, OP_FilterAdd,
+    OP_IFindKey, OP_IncrVacuum, OP_IntegrityCk, OP_JournalMode, OP_Last,
+    OP_MaxPgcnt, OP_MemMax, OP_Offset, OP_OffsetLimit, OP_Pagecount,
+    OP_PureFunc, OP_ReleaseReg, OP_Sequence, OP_SequenceTest, OP_SqlExec,
+    OP_TypeCheck, OP_Trace, OP_Vacuum.
 
 - [X] **5.5** Port `vdbeapi.c`: public API — `sqlite3_step`, `sqlite3_column_*`,
   `sqlite3_bind_*`, `sqlite3_reset`, `sqlite3_finalize`.
