@@ -920,6 +920,35 @@ type
   end;
 
   { -----------------------------------------------------------------------
+    TFuncDef — SQL function / aggregate descriptor (sqliteInt.h FuncDef).
+    PFuncDef stays as Pointer for compatibility; cast to PTFuncDef to call
+    through the function pointers in aggregate/scalar opcodes.
+    Layout verified for x86_64 Linux (little-endian, 8-byte pointers).
+    ----------------------------------------------------------------------- }
+  TxSFuncProc  = procedure(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+  TxFinalProc  = procedure(pCtx: Psqlite3_context); cdecl;
+  TxValueProc  = procedure(pCtx: Psqlite3_context); cdecl;
+  TxInverseProc= procedure(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+
+  TFuncDef = record
+    nArg:      i8;               { offset  0: arg count, -1=unlimited }
+    pad0:      array[0..2] of Byte; { offset 1..3: align to 4 }
+    funcFlags: u32;              { offset  4: SQLITE_FUNC_* flags }
+    pUserData: Pointer;          { offset  8: user data for app-defined funcs }
+    pNext:     Pointer;          { offset 16: next FuncDef with same name }
+    xSFunc:    TxSFuncProc;      { offset 24: step (agg) or scalar function }
+    xFinalize: TxFinalProc;      { offset 32: aggregate finalizer }
+    xValue:    TxValueProc;      { offset 40: current window value }
+    xInverse:  TxInverseProc;    { offset 48: inverse step (window) }
+    zName:     PAnsiChar;        { offset 56: SQL name of the function }
+    u:         Pointer;          { offset 64: pHash or pDestructor }
+  end;
+  PTFuncDef = ^TFuncDef;
+
+  { SZ_CONTEXT(n) = ROUND8P(SizeOf(Tsqlite3_context)) + n * SizeOf(PMem)
+    = ROUND8P(44) = 48 base, plus n*8 for argv pointers. }
+
+  { -----------------------------------------------------------------------
     TVdbe — the virtual machine instance.
     vdbeInt.h struct Vdbe.
 
@@ -3163,7 +3192,8 @@ label
   arith_null,
   arith_done,
   cmp_jump,
-  cmp_done;
+  cmp_done,
+  agg_step1_body;
 var
   aOp:   PVdbeOp;
   pOp:   PVdbeOp;
@@ -3250,6 +3280,9 @@ var
   nEntry:  i64;           { OP_Count: entry count }
   rowid54: i64;           { OP_IdxRowid/DeferredSeek: rowid }
   pTabCur: PVdbeCursor;   { OP_DeferredSeek: table cursor }
+  { 5.4f locals — aggregate }
+  pCtxAgg: Psqlite3_context;  { OP_AggStep: context being set up }
+  pFdAgg:  PTFuncDef;         { OP_AggStep1: typed FuncDef pointer }
   { 5.4d locals — arithmetic / comparison }
   type1d:  u16;           { OP_Add/Sub/Mul/Div/Rem: numeric type of p1 }
   type2d:  u16;           { OP_Add/Sub/Mul/Div/Rem: numeric type of p2 }
@@ -4722,6 +4755,87 @@ begin
       cmp_done: ;
     end;
 
+    { ────── OP_AggInverse / OP_AggStep ────── (vdbe.c:7837)
+      First execution: allocate sqlite3_context + pOut Mem, convert to OP_AggStep1. }
+    OP_AggInverse,
+    OP_AggStep: begin
+      { Allocate context: SZ_CONTEXT(p5) = 48 + p5*8, plus SizeOf(TMem) for pOut }
+      n     := pOp^.p5;
+      nByte := ((SizeOf(Tsqlite3_context) + 7) and not 7) + n * SizeOf(PMem);
+      pCtxAgg := Psqlite3_context(sqlite3DbMallocRawNN(db, nByte + SizeOf(TMem)));
+      if pCtxAgg = nil then goto no_mem;
+      pCtxAgg^.pOut := PMem(PByte(pCtxAgg) + nByte);
+      sqlite3VdbeMemInit(pCtxAgg^.pOut, Psqlite3(db), MEM_Null);
+      pCtxAgg^.pMem     := nil;
+      pCtxAgg^.pFunc    := pOp^.p4.pFunc;
+      pCtxAgg^.iOp      := i32(pOp - aOp);
+      pCtxAgg^.pVdbe    := v;
+      pCtxAgg^.skipFlag  := 0;
+      pCtxAgg^.isError   := 0;
+      pCtxAgg^.enc       := enc;
+      pCtxAgg^.argc      := u16(n);
+      pOp^.p4type        := P4_FUNCCTX;
+      pOp^.p4.pCtx       := pCtxAgg;
+      if pOp^.opcode = OP_AggInverse then
+        pOp^.p1 := 1
+      else
+        pOp^.p1 := 0;
+      pOp^.opcode := OP_AggStep1;
+      { fall through to OP_AggStep1 — re-dispatch }
+      goto agg_step1_body;
+    end;
+
+    { ────── OP_AggStep1 ────── (vdbe.c:7881) }
+    OP_AggStep1: begin
+      agg_step1_body:
+      pCtxAgg := pOp^.p4.pCtx;
+      if pCtxAgg^.pMem <> @aMem[pOp^.p3] then begin
+        pCtxAgg^.pMem := @aMem[pOp^.p3];
+        { set up argv: n pointers after the context struct }
+        for ii := pCtxAgg^.argc - 1 downto 0 do
+          PPMem(PByte(pCtxAgg) + ((SizeOf(Tsqlite3_context)+7) and not 7))[ii]
+            := @aMem[pOp^.p2 + ii];
+      end;
+      Inc(aMem[pOp^.p3].n);
+      { call step or inverse }
+      pFdAgg := PTFuncDef(pCtxAgg^.pFunc);
+      if pFdAgg <> nil then begin
+        if (pOp^.p1 <> 0) and Assigned(pFdAgg^.xInverse) then
+          pFdAgg^.xInverse(pCtxAgg, pCtxAgg^.argc,
+            PPMem(PByte(pCtxAgg) + ((SizeOf(Tsqlite3_context)+7) and not 7)))
+        else if Assigned(pFdAgg^.xSFunc) then
+          pFdAgg^.xSFunc(pCtxAgg, pCtxAgg^.argc,
+            PPMem(PByte(pCtxAgg) + ((SizeOf(Tsqlite3_context)+7) and not 7)));
+      end;
+      if pCtxAgg^.isError <> 0 then begin
+        rc := pCtxAgg^.isError;
+        pCtxAgg^.isError := 0;
+        sqlite3VdbeMemRelease(pCtxAgg^.pOut);
+        pCtxAgg^.pOut^.flags := MEM_Null;
+        if rc <> 0 then goto abort_due_to_error;
+      end;
+    end;
+
+    { ────── OP_AggFinal / OP_AggValue ────── (vdbe.c:7975) }
+    OP_AggValue,
+    OP_AggFinal: begin
+      if (pOp^.opcode = OP_AggValue) and (pOp^.p3 > 0) then begin
+        rc := sqlite3VdbeMemAggValue(@aMem[pOp^.p1], @aMem[pOp^.p3], pOp^.p4.pFunc);
+        if rc <> SQLITE_OK then begin
+          sqlite3VdbeError(v, 'aggregate value error');
+          goto abort_due_to_error;
+        end;
+      end else begin
+        rc := sqlite3VdbeMemFinalize(@aMem[pOp^.p1], pOp^.p4.pFunc);
+        if rc <> SQLITE_OK then begin
+          sqlite3VdbeError(v, 'aggregate finalize error');
+          goto abort_due_to_error;
+        end;
+      end;
+      rc := sqlite3VdbeChangeEncoding(@aMem[pOp^.p1], enc);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+    end;
+
     else begin
       { Unimplemented opcode }
       rc := SQLITE_ERROR;
@@ -5237,19 +5351,57 @@ end;
   sqlite3VdbeMemFinalize — call aggregate finalizer (stub: FuncDef not ported)
   ----------------------------------------------------------------------- }
 function sqlite3VdbeMemFinalize(pMem: PMem; pFunc: PFuncDef): i32;
+var
+  pFd:  PTFuncDef;
+  ctx:  Tsqlite3_context;
+  t:    TMem;
 begin
-  { Stub: FuncDef not yet ported (Phase 6). Return OK to allow code to run. }
-  pMem^.flags := MEM_Null;
-  Result := SQLITE_OK;
+  if (pMem^.flags and MEM_Agg) <> 0 then
+    pFd := PTFuncDef(pMem^.u.pDef)
+  else
+    pFd := PTFuncDef(pFunc);
+  if (pFd <> nil) and Assigned(pFd^.xFinalize) then begin
+    FillChar(ctx, SizeOf(ctx), 0);
+    FillChar(t,   SizeOf(t),   0);
+    t.flags  := MEM_Null;
+    t.db     := pMem^.db;
+    ctx.pOut  := @t;       { separate output — accumulator stays intact }
+    ctx.pMem  := pMem;
+    ctx.pFunc := pFd;
+    pFd^.xFinalize(@ctx);
+    if ctx.isError <> 0 then begin
+      pMem^.flags := MEM_Null;
+      Result := ctx.isError;
+    end else begin
+      sqlite3VdbeMemRelease(pMem);
+      pMem^ := t;
+      Result := SQLITE_OK;
+    end;
+  end else begin
+    pMem^.flags := MEM_Null;
+    Result := SQLITE_OK;
+  end;
 end;
 
 { -----------------------------------------------------------------------
   sqlite3VdbeMemAggValue — stub (window functions, Phase 6)
   ----------------------------------------------------------------------- }
 function sqlite3VdbeMemAggValue(pAccum: PMem; pOut: PMem; pFunc: PFuncDef): i32;
+var
+  pFd:  PTFuncDef;
+  ctx:  Tsqlite3_context;
 begin
+  pFd := PTFuncDef(pFunc);
   sqlite3VdbeMemSetNull(pOut);
-  Result := SQLITE_OK;
+  if (pFd <> nil) and Assigned(pFd^.xValue) then begin
+    FillChar(ctx, SizeOf(ctx), 0);
+    ctx.pOut  := pOut;
+    ctx.pMem  := pAccum;
+    ctx.pFunc := pFd;
+    pFd^.xValue(@ctx);
+    Result := ctx.isError;
+  end else
+    Result := SQLITE_OK;
 end;
 
 { -----------------------------------------------------------------------

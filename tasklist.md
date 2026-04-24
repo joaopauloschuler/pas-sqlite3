@@ -1118,8 +1118,13 @@ estimate**.
     Gate test: `TestVdbeArith.pas` T1–T13 all PASS (41/41) (2026-04-24).
   - [X] **5.4e** String/blob: `OP_String8`, `OP_String`, `OP_Blob`, `OP_Concat`.
     Gate test: `TestVdbeStr.pas` T1–T6 all PASS (23/23) (2026-04-24).
-  - **5.4f** Aggregate: `OP_AggStep`, `OP_AggFinal`, `OP_AggInverse`,
+  - [X] **5.4f** Aggregate: `OP_AggStep`, `OP_AggFinal`, `OP_AggInverse`,
     `OP_AggValue`.
+    Gate test: `TestVdbeAgg.pas` T1–T4 all PASS (11/11) (2026-04-24).
+    Key fix: `sqlite3VdbeMemFinalize` must use a separate temp `TMem t` for
+    output (ctx.pOut=@t); accumulator (ctx.pMem=pMem) stays intact through
+    xFinalize call. Real SQLite uses `sqlite3VdbeMemMove(pMem,&t)` after;
+    here we do `pMem^ := t` after `sqlite3VdbeMemRelease(pMem)`.
   - **5.4g** Transaction control: `OP_Transaction`, `OP_Savepoint`,
     `OP_AutoCommit`.
   - **5.4h** Everything else: sorter ops, virtual table ops, function calls.
