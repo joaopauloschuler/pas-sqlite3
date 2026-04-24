@@ -120,6 +120,7 @@ compile_test TestVdbeAgg
 compile_test TestVdbeTxn
 compile_test TestVdbeMisc
 compile_test TestVdbeApi
+compile_test TestVdbeBlob
 compile_test TestVdbeTrace
 compile_test TestExplainParity
 compile_test TestSQLCorpus

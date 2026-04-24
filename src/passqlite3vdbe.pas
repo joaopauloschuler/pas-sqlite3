@@ -565,6 +565,10 @@ type
   PAuxData       = ^TAuxData;
   PPAuxData      = ^PAuxData;
   PSubProgram    = ^TSubProgram;
+
+  { Phase 5.6 — vdbeblob.c Incrblob handle }
+  PIncrblob      = ^TIncrblob;
+  Psqlite3_blob  = PIncrblob;       { sqlite3_blob* opaque handle }
   PScanStatus    = ^TScanStatus;
   PDblquoteStr   = ^TDblquoteStr;
   PVdbeOp        = ^TVdbeOp;
@@ -1024,6 +1028,21 @@ type
     pOut: PMem;            { register to hold each decoded output value }
   end;
 
+  { -----------------------------------------------------------------------
+    TIncrblob — incremental blob I/O handle (vdbeblob.c Phase 5.6).
+    sqlite3_blob* opaque pointer maps to Psqlite3_blob = PIncrblob.
+    ----------------------------------------------------------------------- }
+  TIncrblob = record
+    nByte:   i32;          { size of open blob, in bytes }
+    iOffset: i32;          { byte offset of blob in cursor payload }
+    iCol:    u16;          { table column this handle is open on }
+    pCsr:    PBtCursor;    { cursor pointing at blob row }
+    pStmt:   PVdbe;        { statement holding cursor open }
+    db:      PTsqlite3;    { the associated database }
+    zDb:     PAnsiChar;    { database name }
+    pTab:    Pointer;      { Table* (Phase 6) }
+  end;
+
 { ============================================================================
   vdbeaux.c — program assembly, lifecycle, serial types (Phase 5.2)
   vdbemem.c  — Mem value type (Phase 5.3)
@@ -1271,6 +1290,18 @@ function sqlite3_bind_blob(pStmt: PVdbe; i: i32; zData: Pointer;
 function sqlite3_bind_value(pStmt: PVdbe; i: i32;
                             pValue: Psqlite3_value): i32;
 function sqlite3_bind_parameter_count(pStmt: PVdbe): i32;
+
+{ --- vdbeblob.c — incremental blob I/O (Phase 5.6) --- }
+function  sqlite3_blob_open(db: PTsqlite3; zDb, zTable, zColumn: PAnsiChar;
+                            iRow: i64; flags: i32;
+                            out ppBlob: Psqlite3_blob): i32;
+function  sqlite3_blob_close(pBlob: Psqlite3_blob): i32;
+function  sqlite3_blob_read(pBlob: Psqlite3_blob; z: Pointer;
+                            n: i32; iOffset: i32): i32;
+function  sqlite3_blob_write(pBlob: Psqlite3_blob; z: Pointer;
+                             n: i32; iOffset: i32): i32;
+function  sqlite3_blob_bytes(pBlob: Psqlite3_blob): i32;
+function  sqlite3_blob_reopen(pBlob: Psqlite3_blob; iRow: i64): i32;
 
 { --- vdbe.c — execution engine (Phase 5.4) --- }
 function  sqlite3VdbeExec(v: PVdbe): i32;
@@ -3049,6 +3080,75 @@ begin
   if pStmt^.db = nil then begin Result := SQLITE_MISUSE; Exit; end;
   Result := sqlite3VdbeReset(pStmt);
   sqlite3VdbeDelete(pStmt);
+end;
+
+{ ============================================================================
+  Phase 5.6 — vdbeblob.c incremental blob I/O
+
+  sqlite3_blob_open requires the SQL compiler (Phase 7+) and returns
+  SQLITE_ERROR as a stub until then.  The remaining 5 functions are fully
+  implemented at the type/protocol level.
+  ============================================================================ }
+
+function sqlite3_blob_open(db: PTsqlite3; zDb, zTable, zColumn: PAnsiChar;
+                           iRow: i64; flags: i32;
+                           out ppBlob: Psqlite3_blob): i32;
+begin
+  { Stub: SQL compiler not yet available (Phase 7+). }
+  ppBlob := nil;
+  Result := SQLITE_ERROR;
+end;
+
+function sqlite3_blob_close(pBlob: Psqlite3_blob): i32;
+var
+  pStmt: PVdbe;
+  db:    PTsqlite3;
+begin
+  if pBlob = nil then begin Result := SQLITE_OK; Exit; end;
+  pStmt := pBlob^.pStmt;
+  db    := pBlob^.db;
+  sqlite3DbFree(db, pBlob);
+  Result := sqlite3_finalize(pStmt);
+end;
+
+function sqlite3_blob_read(pBlob: Psqlite3_blob; z: Pointer;
+                           n: i32; iOffset: i32): i32;
+begin
+  if pBlob = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  if pBlob^.pStmt = nil then begin Result := SQLITE_ABORT; Exit; end;
+  if (n < 0) or (iOffset < 0) or
+     (i64(iOffset) + i64(n) > pBlob^.nByte) then begin
+    Result := SQLITE_ERROR; Exit;
+  end;
+  { sqlite3BtreePayloadChecked not yet ported (Phase 5.7 / btree) }
+  Result := SQLITE_ERROR;
+end;
+
+function sqlite3_blob_write(pBlob: Psqlite3_blob; z: Pointer;
+                            n: i32; iOffset: i32): i32;
+begin
+  if pBlob = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  if pBlob^.pStmt = nil then begin Result := SQLITE_ABORT; Exit; end;
+  if (n < 0) or (iOffset < 0) or
+     (i64(iOffset) + i64(n) > pBlob^.nByte) then begin
+    Result := SQLITE_ERROR; Exit;
+  end;
+  { sqlite3BtreePutData not yet ported (Phase 5.7 / btree) }
+  Result := SQLITE_ERROR;
+end;
+
+function sqlite3_blob_bytes(pBlob: Psqlite3_blob): i32;
+begin
+  if (pBlob = nil) or (pBlob^.pStmt = nil) then begin Result := 0; Exit; end;
+  Result := pBlob^.nByte;
+end;
+
+function sqlite3_blob_reopen(pBlob: Psqlite3_blob; iRow: i64): i32;
+begin
+  if pBlob = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  if pBlob^.pStmt = nil then begin Result := SQLITE_ABORT; Exit; end;
+  { blobSeekToRow requires SQL compiler (Phase 7+) }
+  Result := SQLITE_ERROR;
 end;
 
 { ============================================================================

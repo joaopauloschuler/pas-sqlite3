@@ -1150,9 +1150,15 @@ estimate**.
   Note: sqlite3_reset changed from procedure to function (returns i32) to match
   the real C API; sqlite3_step does auto-reset on HALT_STATE like SQLite 3.7+.
 
-- [ ] **5.6** Port `vdbeblob.c`: incremental blob I/O API
+- [X] **5.6** Port `vdbeblob.c`: incremental blob I/O API
   (`sqlite3_blob_open`, `sqlite3_blob_read`, `sqlite3_blob_write`,
   `sqlite3_blob_bytes`, `sqlite3_blob_reopen`, `sqlite3_blob_close`).
+  Added TIncrblob / Psqlite3_blob types. sqlite3_blob_open is a stub
+  (returns SQLITE_ERROR) until the SQL compiler is available (Phase 7).
+  sqlite3_blob_close, bytes, and null-guard behavior are fully implemented;
+  read/write/reopen require sqlite3BtreePayloadChecked / sqlite3BtreePutData
+  (will be completed after btree Phase 4 extensions).
+  Gate test: `TestVdbeBlob.pas` T1–T11 all PASS (13/13) (2026-04-24).
 
 - [ ] **5.7** Port `vdbesort.c`: the external sorter (used for ORDER BY /
   GROUP BY on large result sets that don't fit in memory). Spills to temp
