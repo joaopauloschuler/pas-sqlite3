@@ -1112,9 +1112,10 @@ estimate**.
   - [X] **5.4c** Record I/O: `OP_Column`, `OP_MakeRecord`, `OP_Insert`, `OP_Delete`,
     `OP_Count`, `OP_Rowid`, `OP_NewRowid`.
     Gate test: `TestVdbeRecord.pas` T1–T6 all PASS (13/13) (2026-04-24).
-  - **5.4d** Arithmetic / comparison: `OP_Add`, `OP_Subtract`, `OP_Multiply`,
+  - [X] **5.4d** Arithmetic / comparison: `OP_Add`, `OP_Subtract`, `OP_Multiply`,
     `OP_Divide`, `OP_Remainder`, `OP_Eq`, `OP_Ne`, `OP_Lt`, `OP_Le`, `OP_Gt`,
-    `OP_Ge`, `OP_BitAnd`, `OP_BitOr`, `OP_ShiftLeft`, `OP_ShiftRight`.
+    `OP_Ge`, `OP_BitAnd`, `OP_BitOr`, `OP_ShiftLeft`, `OP_ShiftRight`, `OP_AddImm`.
+    Gate test: `TestVdbeArith.pas` T1–T13 all PASS (41/41) (2026-04-24).
   - **5.4e** String/blob: `OP_String8`, `OP_Blob`, `OP_Concat`, `OP_Length`.
   - **5.4f** Aggregate: `OP_AggStep`, `OP_AggFinal`, `OP_AggInverse`,
     `OP_AggValue`.
@@ -1144,6 +1145,42 @@ estimate**.
   reference from the SQL corpus, run the program on the Pascal VDBE and on the
   C VDBE, with `PRAGMA vdbe_trace=ON`, and diff the resulting trace logs.
   **Any divergence halts the phase.**
+
+---
+
+### Phase 5.4d implementation notes (2026-04-24)
+
+**Units changed**: `src/passqlite3vdbe.pas`, `src/tests/TestVdbeArith.pas`, `src/tests/build.sh`.
+
+**What was done**:
+- Added helpers before `sqlite3VdbeExec`: `sqlite3AddInt64`, `sqlite3SubInt64`,
+  `sqlite3MulInt64` (overflow-detecting), `numericType`, `sqlite3BlobCompare`,
+  `sqlite3MemCompare`.
+- Added 16 arithmetic/comparison opcodes: `OP_Add`, `OP_Subtract`, `OP_Multiply`,
+  `OP_Divide`, `OP_Remainder`, `OP_BitAnd`, `OP_BitOr`, `OP_ShiftLeft`,
+  `OP_ShiftRight`, `OP_AddImm`, `OP_Eq`, `OP_Ne`, `OP_Lt`, `OP_Le`, `OP_Gt`,
+  `OP_Ge`.
+- Arithmetic: fast int path → overflow check → fp fallback `arith_fp` label;
+  `arith_null` for divide-by-zero / NULL operand.
+- Comparison: fast int-int path; NULL path (NULLEQ / JUMPIFNULL); general path via
+  `sqlite3MemCompare`; affinity coercion for string↔numeric comparisons.
+- Added `TestVdbeArith.pas` (T1–T13 gate test).
+- Gate: `TestVdbeArith` T1–T13 all PASS (41/41); all prior tests unchanged (2026-04-24).
+
+**Critical pitfalls**:
+- `memSetTypeFlag` is defined AFTER `sqlite3VdbeExec` → not visible inside the
+  exec function. Replaced all `memSetTypeFlag(p, f)` calls with the inline form:
+  `p^.flags := (p^.flags and not u16(MEM_TypeMask or MEM_Zero)) or f`.
+- Comparison tables (`sqlite3aLTb/aEQb/aGTb` from C global.c) are implemented as
+  inline `case` statements on the opcode rather than lookup arrays, to avoid the
+  C-style append-to-upper-case-table trick that doesn't map to Pascal.
+- `OP_Add/Sub/Mul` take (P1=in1, P2=in2, P3=out3) where the result is `r[P2] op r[P1]`
+  (i.e., P1 is the RIGHT operand and P2 is the LEFT). Match C exactly:
+  `iB := pIn2^.u.i; iA := pIn1^.u.i; sqlite3AddInt64(@iB, iA)`.
+- `OP_ShiftLeft/Right`: P1=shift-amount register, P2=value register (same reversed layout).
+- `MEM_Null = 0` in zero-initialized memory → must set `flags := MEM_Null` explicitly
+  in tests that test NULL propagation, otherwise `flags=0` (actually MEM_Null=0, so
+  it works, but this is fragile — better to set explicitly).
 
 ---
 

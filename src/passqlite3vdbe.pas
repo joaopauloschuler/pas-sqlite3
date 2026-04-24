@@ -2953,7 +2953,167 @@ begin
 end;
 
 { ============================================================================
-  sqlite3VdbeExec — Phase 5.4a+5.4b+5.4c implementation
+  Phase 5.4d helpers — arithmetic, bitwise, comparison (vdbeaux.c / util.c)
+  ============================================================================ }
+
+{ sqlite3AddInt64 — add iB to *pA; return 1 on overflow, 0 on success. }
+function sqlite3AddInt64(pA: Pi64; iB: i64): i32;
+var iA: i64;
+begin
+  iA := pA^;
+  if iB >= 0 then begin
+    if (iA > 0) and (High(i64) - iA < iB) then begin Result := 1; Exit; end;
+  end else begin
+    if (iA < 0) and (-(iA + High(i64)) > iB + 1) then begin Result := 1; Exit; end;
+  end;
+  pA^ := iA + iB;
+  Result := 0;
+end;
+
+{ sqlite3SubInt64 — subtract iB from *pA; return 1 on overflow. }
+function sqlite3SubInt64(pA: Pi64; iB: i64): i32;
+begin
+  if iB = Low(i64) then begin
+    if pA^ >= 0 then begin Result := 1; Exit; end;
+    pA^ := pA^ - iB;
+    Result := 0;
+  end else
+    Result := sqlite3AddInt64(pA, -iB);
+end;
+
+{ sqlite3MulInt64 — multiply *pA by iB; return 1 on overflow. }
+function sqlite3MulInt64(pA: Pi64; iB: i64): i32;
+var iA: i64;
+begin
+  iA := pA^;
+  if iB > 0 then begin
+    if (iA > High(i64) div iB) then begin Result := 1; Exit; end;
+    if (iA < Low(i64) div iB) then begin Result := 1; Exit; end;
+  end else if iB < 0 then begin
+    if iA > 0 then begin
+      if iB < Low(i64) div iA then begin Result := 1; Exit; end;
+    end else if iA < 0 then begin
+      if iB = Low(i64) then begin Result := 1; Exit; end;
+      if iA = Low(i64) then begin Result := 1; Exit; end;
+      if -iA > High(i64) div (-iB) then begin Result := 1; Exit; end;
+    end;
+  end;
+  pA^ := iA * iB;
+  Result := 0;
+end;
+
+{ numericType — return numeric flags of pMem without modifying it.
+  Port of vdbe.c:498 (computeNumericType + numericType). }
+function numericType(pMem: PMem): u16;
+var r: Double; iVal: i64;
+begin
+  if (pMem^.flags and (MEM_Int or MEM_Real or MEM_IntReal or MEM_Null)) <> 0 then begin
+    Result := pMem^.flags and (MEM_Int or MEM_Real or MEM_IntReal or MEM_Null);
+    Exit;
+  end;
+  { Str or Blob: try numeric parse (conservative — return MEM_Real on failure) }
+  if sqlite3MemRealValueRC(pMem, r) <= 0 then begin
+    if (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) <= 1) then begin
+      pMem^.u.i := iVal;
+      Result := MEM_Int;
+    end else begin
+      pMem^.u.r := r;
+      Result := MEM_Real;
+    end;
+  end else if (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) = 0) then begin
+    pMem^.u.i := iVal;
+    Result := MEM_Int;
+  end else begin
+    pMem^.u.r := r;
+    Result := MEM_Real;
+  end;
+end;
+
+{ sqlite3BlobCompare — compare two blob/binary Mem values.
+  Port of vdbeaux.c:4508. }
+function sqlite3BlobCompare(pB1, pB2: PMem): i32;
+var n1, n2, c, nMin: i32;
+begin
+  n1 := pB1^.n;
+  n2 := pB2^.n;
+  if ((pB1^.flags or pB2^.flags) and MEM_Zero) <> 0 then begin
+    if (pB1^.flags and pB2^.flags and MEM_Zero) <> 0 then begin
+      Result := pB1^.u.nZero - pB2^.u.nZero; Exit;
+    end else if (pB1^.flags and MEM_Zero) <> 0 then begin
+      Result := -1; Exit;  { simplified: treat MEM_Zero as less }
+    end else begin
+      Result := +1; Exit;
+    end;
+  end;
+  if n1 < n2 then nMin := n1 else nMin := n2;
+  if nMin > 0 then
+    c := CompareByte(pB1^.z^, pB2^.z^, nMin)  { memcmp equivalent }
+  else
+    c := 0;
+  if c <> 0 then begin Result := c; Exit; end;
+  Result := n1 - n2;
+end;
+
+{ sqlite3MemCompare — full typed comparison of two Mem values.
+  Port of vdbeaux.c:4579. pColl=nil → memcmp for strings. }
+function sqlite3MemCompare(pMem1, pMem2: PMem; pColl: Pointer): i32;
+var f1, f2, cf: i32;
+begin
+  f1 := pMem1^.flags;
+  f2 := pMem2^.flags;
+  cf := f1 or f2;
+  { NULL: less than anything; two NULLs equal }
+  if (cf and MEM_Null) <> 0 then begin
+    Result := (f2 and MEM_Null) - (f1 and MEM_Null);
+    Exit;
+  end;
+  { At least one numeric }
+  if (cf and (MEM_Int or MEM_Real or MEM_IntReal)) <> 0 then begin
+    { Both int-like }
+    if (f1 and f2 and (MEM_Int or MEM_IntReal)) <> 0 then begin
+      if pMem1^.u.i < pMem2^.u.i then begin Result := -1; Exit; end;
+      if pMem1^.u.i > pMem2^.u.i then begin Result := +1; Exit; end;
+      Result := 0; Exit;
+    end;
+    { Both real }
+    if (f1 and f2 and MEM_Real) <> 0 then begin
+      if pMem1^.u.r < pMem2^.u.r then begin Result := -1; Exit; end;
+      if pMem1^.u.r > pMem2^.u.r then begin Result := +1; Exit; end;
+      Result := 0; Exit;
+    end;
+    { pMem1 is int, pMem2 is real }
+    if (f1 and (MEM_Int or MEM_IntReal)) <> 0 then begin
+      if (f2 and MEM_Real) <> 0 then begin
+        Result := sqlite3IntFloatCompare(pMem1^.u.i, pMem2^.u.r); Exit;
+      end else if (f2 and (MEM_Int or MEM_IntReal)) <> 0 then begin
+        if pMem1^.u.i < pMem2^.u.i then begin Result := -1; Exit; end;
+        if pMem1^.u.i > pMem2^.u.i then begin Result := +1; Exit; end;
+        Result := 0; Exit;
+      end else begin
+        Result := -1; Exit;  { number < string }
+      end;
+    end;
+    { pMem1 is real }
+    if (f1 and MEM_Real) <> 0 then begin
+      if (f2 and (MEM_Int or MEM_IntReal)) <> 0 then begin
+        Result := -sqlite3IntFloatCompare(pMem2^.u.i, pMem1^.u.r); Exit;
+      end else begin
+        Result := -1; Exit;  { number < string }
+      end;
+    end;
+    Result := +1; Exit;
+  end;
+  { String comparison }
+  if (cf and MEM_Str) <> 0 then begin
+    if (f1 and MEM_Str) = 0 then begin Result := 1; Exit; end;
+    if (f2 and MEM_Str) = 0 then begin Result := -1; Exit; end;
+    { no collation support in this port — fall through to blob compare }
+  end;
+  Result := sqlite3BlobCompare(pMem1, pMem2);
+end;
+
+{ ============================================================================
+  sqlite3VdbeExec — Phase 5.4a+5.4b+5.4c+5.4d implementation
   Source: vdbe.c sqlite3VdbeExec (SQLite 3.53.0)
 
   Ported opcodes (5.4a):
@@ -2972,6 +3132,10 @@ end;
     OP_Column, OP_MakeRecord, OP_Count, OP_Rowid, OP_NullRow, OP_SeekEnd,
     OP_NewRowid, OP_Insert, OP_Delete, OP_ResetCount,
     OP_IdxInsert, OP_IdxDelete, OP_IdxRowid, OP_DeferredSeek, OP_FinishSeek.
+  Ported opcodes (5.4d — arithmetic / comparison):
+    OP_Add, OP_Subtract, OP_Multiply, OP_Divide, OP_Remainder,
+    OP_BitAnd, OP_BitOr, OP_ShiftLeft, OP_ShiftRight, OP_AddImm,
+    OP_Eq, OP_Ne, OP_Lt, OP_Le, OP_Gt, OP_Ge.
   All other opcodes: fall to default → SQLITE_ERROR abort.
   ============================================================================ }
 
@@ -2992,7 +3156,12 @@ label
   op_column_restart,
   op_column_read_header,
   op_column_out,
-  op_column_corrupt;
+  op_column_corrupt,
+  arith_fp,
+  arith_null,
+  arith_done,
+  cmp_jump,
+  cmp_done;
 var
   aOp:   PVdbeOp;
   pOp:   PVdbeOp;
@@ -3079,6 +3248,20 @@ var
   nEntry:  i64;           { OP_Count: entry count }
   rowid54: i64;           { OP_IdxRowid/DeferredSeek: rowid }
   pTabCur: PVdbeCursor;   { OP_DeferredSeek: table cursor }
+  { 5.4d locals — arithmetic / comparison }
+  type1d:  u16;           { OP_Add/Sub/Mul/Div/Rem: numeric type of p1 }
+  type2d:  u16;           { OP_Add/Sub/Mul/Div/Rem: numeric type of p2 }
+  iAd:     i64;           { OP_Add/Sub/Mul/Div/Rem: left operand int }
+  iBd:     i64;           { OP_Add/Sub/Mul/Div/Rem: right operand int }
+  rAd:     Double;        { OP_Add/Sub/Mul/Div/Rem: left operand real }
+  rBd:     Double;        { OP_Add/Sub/Mul/Div/Rem: right operand real }
+  opBd:    u8;            { OP_ShiftLeft/Right: opcode byte }
+  uAd:     u64;           { OP_ShiftLeft/Right: unsigned intermediate }
+  flags1d: u16;           { OP_Eq/.../Ge: saved pIn1 flags }
+  flags3d: u16;           { OP_Eq/.../Ge: saved pIn3 flags }
+  resd:    i32;           { OP_Eq/.../Ge: compare result }
+  res2d:   i32;           { OP_Eq/.../Ge: jump decision }
+  affd:    u8;            { OP_Eq/.../Ge: affinity byte }
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -4200,6 +4383,280 @@ begin
         rc := sqlite3VdbeFinishMoveto(pCur);
         if rc <> SQLITE_OK then goto abort_due_to_error;
       end;
+    end;
+
+    { ────── OP_Add / OP_Subtract / OP_Multiply / OP_Divide / OP_Remainder ──
+      (vdbe.c:1891) P1=in1, P2=in2, P3=out3  (result = r[P2] op r[P1]) }
+    OP_Add,
+    OP_Subtract,
+    OP_Multiply,
+    OP_Divide,
+    OP_Remainder: begin
+      pIn1  := @aMem[pOp^.p1];
+      type1d := pIn1^.flags;
+      pIn2  := @aMem[pOp^.p2];
+      type2d := pIn2^.flags;
+      pOut  := @aMem[pOp^.p3];
+      if (type1d and type2d and MEM_Int) <> 0 then begin
+        { fast int path }
+        iAd := pIn1^.u.i;
+        iBd := pIn2^.u.i;
+        case pOp^.opcode of
+          OP_Add:       if sqlite3AddInt64(@iBd, iAd) <> 0 then goto arith_fp;
+          OP_Subtract:  if sqlite3SubInt64(@iBd, iAd) <> 0 then goto arith_fp;
+          OP_Multiply:  if sqlite3MulInt64(@iBd, iAd) <> 0 then goto arith_fp;
+          OP_Divide: begin
+            if iAd = 0 then goto arith_null;
+            if (iAd = -1) and (iBd = Low(i64)) then goto arith_fp;
+            iBd := iBd div iAd;
+          end;
+          else begin  { OP_Remainder }
+            if iAd = 0 then goto arith_null;
+            if iAd = -1 then iAd := 1;
+            iBd := iBd mod iAd;
+          end;
+        end;
+        pOut^.u.i := iBd;
+        pOut^.flags := (pOut^.flags and not u16(MEM_TypeMask or MEM_Zero)) or MEM_Int;
+      end else if ((type1d or type2d) and MEM_Null) <> 0 then
+        goto arith_null
+      else begin
+        type1d := numericType(pIn1);
+        type2d := numericType(pIn2);
+        if (type1d and type2d and MEM_Int) <> 0 then begin
+          iAd := pIn1^.u.i;
+          iBd := pIn2^.u.i;
+          case pOp^.opcode of
+            OP_Add:      if sqlite3AddInt64(@iBd, iAd) <> 0 then goto arith_fp;
+            OP_Subtract: if sqlite3SubInt64(@iBd, iAd) <> 0 then goto arith_fp;
+            OP_Multiply: if sqlite3MulInt64(@iBd, iAd) <> 0 then goto arith_fp;
+            OP_Divide: begin
+              if iAd = 0 then goto arith_null;
+              if (iAd = -1) and (iBd = Low(i64)) then goto arith_fp;
+              iBd := iBd div iAd;
+            end;
+            else begin
+              if iAd = 0 then goto arith_null;
+              if iAd = -1 then iAd := 1;
+              iBd := iBd mod iAd;
+            end;
+          end;
+          pOut^.u.i := iBd;
+          pOut^.flags := (pOut^.flags and not u16(MEM_TypeMask or MEM_Zero)) or MEM_Int;
+          goto arith_done;
+        end;
+        goto arith_fp;
+      end;
+      goto arith_done;
+
+      arith_fp:
+      rAd := sqlite3VdbeRealValue(pIn1);
+      rBd := sqlite3VdbeRealValue(pIn2);
+      case pOp^.opcode of
+        OP_Add:      rBd := rBd + rAd;
+        OP_Subtract: rBd := rBd - rAd;
+        OP_Multiply: rBd := rBd * rAd;
+        OP_Divide: begin
+          if rAd = 0.0 then goto arith_null;
+          rBd := rBd / rAd;
+        end;
+        else begin  { OP_Remainder — integer mod via real }
+          iAd := sqlite3VdbeIntValue(pIn1);
+          iBd := sqlite3VdbeIntValue(pIn2);
+          if iAd = 0 then goto arith_null;
+          if iAd = -1 then iAd := 1;
+          rBd := Double(iBd mod iAd);
+        end;
+      end;
+      if sqlite3IsNaN(rBd) then goto arith_null;
+      pOut^.u.r := rBd;
+      pOut^.flags := (pOut^.flags and not u16(MEM_TypeMask or MEM_Zero)) or MEM_Real;
+      goto arith_done;
+
+      arith_null:
+      sqlite3VdbeMemSetNull(pOut);
+
+      arith_done: ;
+    end;
+
+    { ────── OP_BitAnd / OP_BitOr / OP_ShiftLeft / OP_ShiftRight ──
+      (vdbe.c:2030) P1=in1, P2=in2, P3=out3 }
+    OP_BitAnd,
+    OP_BitOr,
+    OP_ShiftLeft,
+    OP_ShiftRight: begin
+      pIn1 := @aMem[pOp^.p1];
+      pIn2 := @aMem[pOp^.p2];
+      pOut := @aMem[pOp^.p3];
+      if ((pIn1^.flags or pIn2^.flags) and MEM_Null) <> 0 then begin
+        sqlite3VdbeMemSetNull(pOut);
+      end else begin
+        iAd := sqlite3VdbeIntValue(pIn2);  { note: pIn2 is the shifted value }
+        iBd := sqlite3VdbeIntValue(pIn1);  { pIn1 is the shift amount }
+        opBd := pOp^.opcode;
+        if opBd = OP_BitAnd then
+          iAd := iAd and iBd
+        else if opBd = OP_BitOr then
+          iAd := iAd or iBd
+        else begin
+          { ShiftLeft or ShiftRight }
+          if iBd <> 0 then begin
+            if iBd < 0 then begin
+              { negative shift: flip direction }
+              if opBd = OP_ShiftLeft then opBd := OP_ShiftRight
+              else opBd := OP_ShiftLeft;
+              if iBd > -64 then iBd := -iBd else iBd := 64;
+            end;
+            if iBd >= 64 then begin
+              if (iAd >= 0) or (opBd = OP_ShiftLeft) then iAd := 0
+              else iAd := -1;
+            end else begin
+              Move(iAd, uAd, SizeOf(uAd));
+              if opBd = OP_ShiftLeft then
+                uAd := uAd shl iBd
+              else begin
+                uAd := uAd shr iBd;
+                if iAd < 0 then
+                  uAd := uAd or (u64($FFFFFFFFFFFFFFFF) shl (64 - iBd));
+              end;
+              Move(uAd, iAd, SizeOf(iAd));
+            end;
+          end;
+        end;
+        pOut^.u.i := iAd;
+        pOut^.flags := (pOut^.flags and not u16(MEM_TypeMask or MEM_Zero)) or MEM_Int;
+      end;
+    end;
+
+    { ────── OP_AddImm ────── (vdbe.c:2090) P1=in/out reg, P2=immediate }
+    OP_AddImm: begin
+      pIn1 := @aMem[pOp^.p1];
+      sqlite3VdbeMemIntegerify(pIn1);
+      u64(pIn1^.u.i) := u64(pIn1^.u.i) + u64(pOp^.p2);
+    end;
+
+    { ────── OP_Eq / OP_Ne / OP_Lt / OP_Le / OP_Gt / OP_Ge ──
+      (vdbe.c:2273) P1=in1, P2=jump target, P3=in3, P5=flags|affinity
+      Comparison: r[P3] <op> r[P1] → jump to P2 if true.
+
+      Jump decision tables (indexed by opcode, OP_Ne=53..OP_Ge=58):
+        aLTb = [1,0,0,1,1,0]  NE,EQ,GT,LE,LT,GE — jump when compare < 0
+        aEQb = [0,1,0,1,0,1]  jump when compare = 0
+        aGTb = [1,0,1,0,0,1]  jump when compare > 0  }
+    OP_Eq,
+    OP_Ne,
+    OP_Lt,
+    OP_Le,
+    OP_Gt,
+    OP_Ge: begin
+      pIn1  := @aMem[pOp^.p1];
+      pIn3  := @aMem[pOp^.p3];
+      flags1d := pIn1^.flags;
+      flags3d := pIn3^.flags;
+
+      if (flags1d and flags3d and MEM_Int) <> 0 then begin
+        { Fast integer-vs-integer comparison }
+        if pIn3^.u.i > pIn1^.u.i then begin
+          { GT case }
+          case pOp^.opcode of
+            OP_Ne, OP_Gt, OP_Ge: goto cmp_jump;
+          else iCompare := +1;
+          end;
+        end else if pIn3^.u.i < pIn1^.u.i then begin
+          { LT case }
+          case pOp^.opcode of
+            OP_Ne, OP_Le, OP_Lt: goto cmp_jump;
+          else iCompare := -1;
+          end;
+        end else begin
+          { EQ case }
+          case pOp^.opcode of
+            OP_Eq, OP_Le, OP_Ge: goto cmp_jump;
+          else iCompare := 0;
+          end;
+        end;
+      end else if ((flags1d or flags3d) and MEM_Null) <> 0 then begin
+        { At least one NULL }
+        if (pOp^.p5 and SQLITE_NULLEQ) <> 0 then begin
+          { NULLEQ: compare NULLs as equal }
+          if (flags1d and flags3d and MEM_Null) <> 0 then
+            resd := 0  { both NULL → equal }
+          else if (flags3d and MEM_Null) <> 0 then
+            resd := -1
+          else
+            resd := +1;
+          iCompare := resd;
+          if resd = 0 then begin
+            case pOp^.opcode of
+              OP_Eq, OP_Le, OP_Ge: goto cmp_jump;
+            end;
+          end else if resd < 0 then begin
+            case pOp^.opcode of
+              OP_Ne, OP_Le, OP_Lt: goto cmp_jump;
+            end;
+          end else begin
+            case pOp^.opcode of
+              OP_Ne, OP_Gt, OP_Ge: goto cmp_jump;
+            end;
+          end;
+        end else begin
+          { NULL operand, no NULLEQ: result is NULL → jump only if JUMPIFNULL }
+          iCompare := 1;
+          if (pOp^.p5 and SQLITE_JUMPIFNULL) <> 0 then
+            goto cmp_jump;
+        end;
+      end else begin
+        { General comparison }
+        affd := pOp^.p5 and SQLITE_AFF_MASK;
+        if affd >= SQLITE_AFF_NUMERIC then begin
+          if ((flags1d or flags3d) and MEM_Str) <> 0 then begin
+            if (flags1d and (MEM_Int or MEM_IntReal or MEM_Real or MEM_Str)) = MEM_Str then begin
+              applyNumericAffinity(pIn1, 0);
+              flags3d := pIn3^.flags;
+            end;
+            if (flags3d and (MEM_Int or MEM_IntReal or MEM_Real or MEM_Str)) = MEM_Str then
+              applyNumericAffinity(pIn3, 0);
+          end;
+        end else if (affd = SQLITE_AFF_TEXT) and (((flags1d or flags3d) and MEM_Str) <> 0) then begin
+          if (flags1d and MEM_Str) <> 0 then
+            pIn1^.flags := pIn1^.flags and not u16(MEM_Int or MEM_Real or MEM_IntReal)
+          else if (flags1d and (MEM_Int or MEM_Real or MEM_IntReal)) <> 0 then begin
+            sqlite3VdbeMemStringify(pIn1, enc, 1);
+            flags1d := (pIn1^.flags and not u16(MEM_TypeMask)) or (flags1d and MEM_TypeMask);
+          end;
+          if (flags3d and MEM_Str) <> 0 then
+            pIn3^.flags := pIn3^.flags and not u16(MEM_Int or MEM_Real or MEM_IntReal)
+          else if (flags3d and (MEM_Int or MEM_Real or MEM_IntReal)) <> 0 then begin
+            sqlite3VdbeMemStringify(pIn3, enc, 1);
+            flags3d := (pIn3^.flags and not u16(MEM_TypeMask)) or (flags3d and MEM_TypeMask);
+          end;
+        end;
+        resd := sqlite3MemCompare(pIn3, pIn1, pOp^.p4.pColl);
+        iCompare := resd;
+        { Undo affinity changes }
+        pIn3^.flags := flags3d;
+        pIn1^.flags := flags1d;
+
+        if resd < 0 then begin
+          case pOp^.opcode of
+            OP_Ne, OP_Le, OP_Lt: goto cmp_jump;
+          end;
+        end else if resd = 0 then begin
+          case pOp^.opcode of
+            OP_Eq, OP_Le, OP_Ge: goto cmp_jump;
+          end;
+        end else begin
+          case pOp^.opcode of
+            OP_Ne, OP_Gt, OP_Ge: goto cmp_jump;
+          end;
+        end;
+      end;
+      goto cmp_done;
+
+      cmp_jump:
+      goto jump_to_p2;
+
+      cmp_done: ;
     end;
 
     else begin

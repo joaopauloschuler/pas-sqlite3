@@ -114,6 +114,7 @@ compile_test TestVdbeAux
 compile_test TestVdbeMem
 compile_test TestVdbeCursor
 compile_test TestVdbeRecord
+compile_test TestVdbeArith
 compile_test TestVdbeTrace
 compile_test TestExplainParity
 compile_test TestSQLCorpus
