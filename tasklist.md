@@ -1109,7 +1109,9 @@ estimate**.
     `OP_IdxLE`, `OP_IdxGT`, `OP_IdxLT`, `OP_IdxGE`.
     Helper labels: `next_tail`, `seek_not_found`, `notExistsWithKey`.
     Gate test: `TestVdbeCursor.pas` T1–T8 all PASS (27/27) (2026-04-24).
-  - **5.4c** Record I/O: `OP_Column`, `OP_MakeRecord`, `OP_Insert`, `OP_Delete`.
+  - [X] **5.4c** Record I/O: `OP_Column`, `OP_MakeRecord`, `OP_Insert`, `OP_Delete`,
+    `OP_Count`, `OP_Rowid`, `OP_NewRowid`.
+    Gate test: `TestVdbeRecord.pas` T1–T6 all PASS (13/13) (2026-04-24).
   - **5.4d** Arithmetic / comparison: `OP_Add`, `OP_Subtract`, `OP_Multiply`,
     `OP_Divide`, `OP_Remainder`, `OP_Eq`, `OP_Ne`, `OP_Lt`, `OP_Le`, `OP_Gt`,
     `OP_Ge`, `OP_BitAnd`, `OP_BitOr`, `OP_ShiftLeft`, `OP_ShiftRight`.
@@ -1142,6 +1144,39 @@ estimate**.
   reference from the SQL corpus, run the program on the Pascal VDBE and on the
   C VDBE, with `PRAGMA vdbe_trace=ON`, and diff the resulting trace logs.
   **Any divergence halts the phase.**
+
+---
+
+### Phase 5.4c implementation notes (2026-04-24)
+
+**Units changed**: `src/passqlite3vdbe.pas`, `src/tests/TestVdbeRecord.pas`, `src/tests/build.sh`.
+
+**What was done**:
+- Added 7 record I/O opcodes to `sqlite3VdbeExec`: `OP_Column`, `OP_MakeRecord`,
+  `OP_Insert`, `OP_Delete`, `OP_Count`, `OP_Rowid`, `OP_NewRowid`.
+- Added shared label `op_column_corrupt` inside the exec loop (used by `OP_Column`
+  overflow-record corrupt path).
+- Added `TestVdbeRecord.pas` (T1–T6 gate test) and wired into `build.sh`.
+
+**Critical pitfalls discovered/fixed**:
+- `op_column_corrupt` label was placed OUTSIDE `repeat..until False` loop; FPC
+  `continue` is only valid inside a loop. Fixed by moving the label inside the loop,
+  between `jump_to_p2` and `until False`.
+- Duplicate `vdbeMemDynamic` definition (once at line ~2879 as a forward copy before
+  the exec function, once at ~4458 at its canonical location). FPC treats these as
+  overloaded with identical signatures → error. Fixed by removing the later duplicate;
+  kept the earlier one so the exec function's call site can see it.
+- `CACHE_STALE = 0`: `sqlite3VdbeCreate` uses `sqlite3DbMallocRawNN` (raw, not zeroed)
+  and only zeroes bytes at offset 136+. `cacheCtr` is before offset 136 → uninitialized.
+  In tests, `cacheCtr` was 0 = `CACHE_STALE`, making `cacheStatus(0) == cacheCtr(0)` →
+  column cache falsely treated as valid → `payloadSize/szRow` never populated →
+  `OP_Column` returned NULL. Fix: set `v^.cacheCtr := 1` in test `CreateMinVdbe`.
+- `OP_OpenWrite` with `P4_INT32=1` (nField=1) is required for `OP_Column` to compute
+  `aOffset[1]` correctly; use `sqlite3VdbeAddOp4Int(v, OP_OpenWrite, 0, pgno, 0, 1)`.
+- `sqlite3BtreePayloadFetch` sets `pAmt = nLocal` (bytes in-page); `szRow` is
+  populated only when the cache-miss path runs correctly.
+
+**Gate**: `TestVdbeRecord` T1–T6 all PASS (13/13); all prior tests still PASS (2026-04-24).
 
 ---
 

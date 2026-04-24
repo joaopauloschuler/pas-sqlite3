@@ -2164,6 +2164,7 @@ end;
 
 procedure sqlite3VdbeIncrWriteCounter(p: PVdbe; pC: PVdbeCursor);
 begin
+  { vdbeaux.c:829 is SQLITE_DEBUG-only; nWrite not present in release struct }
 end;
 
 procedure sqlite3VdbeAssertAbortable(p: PVdbe);
@@ -2501,21 +2502,38 @@ end;
 { --- Cursor move helpers --- }
 
 function sqlite3VdbeFinishMoveto(p: PVdbeCursor): i32;
+{ Port of vdbeaux.c:3801 }
+var
+  resMoveto: i32;
+  rc: i32;
 begin
-  { Stub — Phase 5.4 }
+  rc := sqlite3BtreeTableMoveto(p^.uc.pCursor, u64(p^.movetoTarget), 0, @resMoveto);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  if resMoveto <> 0 then begin Result := SQLITE_CORRUPT_BKPT; Exit; end;
+  p^.deferredMoveto := 0;
+  p^.cacheStatus := CACHE_STALE;
   Result := SQLITE_OK;
 end;
 
 function sqlite3VdbeHandleMovedCursor(p: PVdbeCursor): i32;
+{ Port of vdbeaux.c:3827 }
+var
+  isDifferentRow: i32;
+  rc: i32;
 begin
-  { Stub — Phase 5.4 }
-  Result := SQLITE_OK;
+  rc := sqlite3BtreeCursorRestore(p^.uc.pCursor, @isDifferentRow);
+  p^.cacheStatus := CACHE_STALE;
+  if isDifferentRow <> 0 then p^.nullRow := 1;
+  Result := rc;
 end;
 
 function sqlite3VdbeCursorRestore(p: PVdbeCursor): i32;
+{ Port of vdbeaux.c:3842 }
 begin
-  { Stub — Phase 5.4 }
-  Result := SQLITE_OK;
+  if sqlite3BtreeCursorHasMoved(p^.uc.pCursor) <> 0 then
+    Result := sqlite3VdbeHandleMovedCursor(p)
+  else
+    Result := SQLITE_OK;
 end;
 
 { --- Misc lifecycle functions --- }
@@ -2857,8 +2875,85 @@ begin
   else Result := 0;
 end;
 
+{ vdbeMemDynamic — needs to be visible to sqlite3VdbeExec }
+function vdbeMemDynamic(p: PMem): Boolean; inline;
+begin
+  Result := (p^.flags and (MEM_Agg or MEM_Dyn)) <> 0;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeIdxRowid — extract rowid from index cursor (vdbeaux.c:5191)
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeIdxRowid(db: PTsqlite3; pCur: PBtCursor; out rowid: i64): i32;
+var
+  nCellKey: i64;
+  rc:       i32;
+  szHdr:    u32;
+  typeRowid: u32;
+  lenRowid:  u32;
+  pMem:      TMem;
+  pV:        TMem;
+begin
+  nCellKey := i64(sqlite3BtreePayloadSize(pCur));
+  sqlite3VdbeMemInit(@pMem, Psqlite3(db), 0);
+  rc := sqlite3VdbeMemFromBtreeZeroOffset(pCur, u32(nCellKey), @pMem);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  szHdr := 0;
+  sqlite3GetVarint32(Pu8(pMem.z), szHdr);
+  if (szHdr < 3) or (szHdr > u32(pMem.n)) then begin
+    sqlite3VdbeMemReleaseMalloc(@pMem);
+    Result := SQLITE_CORRUPT_BKPT; Exit;
+  end;
+  typeRowid := 0;
+  sqlite3GetVarint32(Pu8(pMem.z + szHdr - 1), typeRowid);
+  if (typeRowid < 1) or (typeRowid > 9) or (typeRowid = 7) then begin
+    sqlite3VdbeMemReleaseMalloc(@pMem);
+    Result := SQLITE_CORRUPT_BKPT; Exit;
+  end;
+  lenRowid := sqlite3VdbeSerialTypeLen(typeRowid);
+  if u32(pMem.n) < szHdr + lenRowid then begin
+    sqlite3VdbeMemReleaseMalloc(@pMem);
+    Result := SQLITE_CORRUPT_BKPT; Exit;
+  end;
+  FillChar(pV, SizeOf(TMem), 0);
+  sqlite3VdbeSerialGet(Pu8(pMem.z + pMem.n - i32(lenRowid)), typeRowid, @pV);
+  rowid := pV.u.i;
+  sqlite3VdbeMemReleaseMalloc(@pMem);
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  vdbeColumnFromOverflow — read a column value from overflow pages
+  Port of vdbe.c:719 (simplified: no RCStr cache, uses VdbeMemFromBtree)
+  ----------------------------------------------------------------------- }
+function vdbeColumnFromOverflow(pC: PVdbeCursor; iCol: i32; t: u32;
+    iOffset: i64; cacheStatus: u32; colCacheCtr: u32;
+    pDest: PMem): i32;
+var
+  db:  PTsqlite3;
+  len: i32;
+  rc:  i32;
+begin
+  db  := PTsqlite3(pDest^.db);
+  len := i32(sqlite3VdbeSerialTypeLen(t));
+  if len > i32(Pu32(Pu8(db) + 136)^) then begin
+    { SQLITE_LIMIT_LENGTH exceeded }
+    Result := SQLITE_TOOBIG; Exit;
+  end;
+  rc := sqlite3VdbeMemFromBtree(pC^.uc.pCursor, u32(iOffset), u32(len), pDest);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  sqlite3VdbeSerialGet(Pu8(pDest^.z), t, pDest);
+  if ((t and 1) <> 0) and (pDest^.enc = SQLITE_UTF8) then begin
+    if pDest^.szMalloc > pDest^.n then
+      pDest^.z[pDest^.n] := #0;
+    pDest^.flags := pDest^.flags or MEM_Term;
+  end;
+  pDest^.flags := pDest^.flags and not u16(MEM_Ephem);
+  Result := SQLITE_OK;
+end;
+
 { ============================================================================
-  sqlite3VdbeExec — Phase 5.4a+5.4b implementation
+  sqlite3VdbeExec — Phase 5.4a+5.4b+5.4c implementation
   Source: vdbe.c sqlite3VdbeExec (SQLite 3.53.0)
 
   Ported opcodes (5.4a):
@@ -2873,6 +2968,10 @@ end;
     OP_Found, OP_NotFound, OP_NoConflict, OP_IfNoHope,
     OP_SeekRowid, OP_NotExists,
     OP_IdxLE, OP_IdxGT, OP_IdxLT, OP_IdxGE.
+  Ported opcodes (5.4c — record I/O):
+    OP_Column, OP_MakeRecord, OP_Count, OP_Rowid, OP_NullRow, OP_SeekEnd,
+    OP_NewRowid, OP_Insert, OP_Delete, OP_ResetCount,
+    OP_IdxInsert, OP_IdxDelete, OP_IdxRowid, OP_DeferredSeek, OP_FinishSeek.
   All other opcodes: fall to default → SQLITE_ERROR abort.
   ============================================================================ }
 
@@ -2889,7 +2988,11 @@ label
   open_cursor_set_hints,
   next_tail,
   seek_not_found,
-  notExistsWithKey;
+  notExistsWithKey,
+  op_column_restart,
+  op_column_read_header,
+  op_column_out,
+  op_column_corrupt;
 var
   aOp:   PVdbeOp;
   pOp:   PVdbeOp;
@@ -2939,6 +3042,43 @@ var
   ii:      i32;
   nCellKey: i64;
   pMem5b:  TMem;
+  { 5.4c locals — record I/O }
+  pCol:    PVdbeCursor;   { OP_Column: cursor being read }
+  p2col:   u32;           { OP_Column: column index }
+  aOffset: Pu32;          { OP_Column: aOffset array pointer }
+  lenCol:  i32;           { OP_Column: data length }
+  zData:   Pu8;           { OP_Column: pointer into page data }
+  zHdrC:   Pu8;           { OP_Column: next unparsed header byte }
+  zEndHdr: Pu8;           { OP_Column: end of header }
+  offset64: u64;          { OP_Column: 64-bit offset accumulator }
+  tCol:    u32;           { OP_Column: serial type code }
+  pRegCol: PMem;          { OP_Column: pseudo-table register }
+  sMemCol: TMem;          { OP_Column: scratch Mem for header read }
+  pRec:    PMem;          { OP_MakeRecord: current record Mem }
+  nData:   u64;           { OP_MakeRecord: data byte count }
+  nHdr:    i32;           { OP_MakeRecord: header byte count }
+  nByteMR: i64;           { OP_MakeRecord: total byte count }
+  nZeroMR: i64;           { OP_MakeRecord: trailing zero bytes }
+  nVarint: i32;           { OP_MakeRecord: varint size }
+  serial_type: u32;       { OP_MakeRecord: current serial type }
+  pData0:  PMem;          { OP_MakeRecord: first field }
+  pLastMR: PMem;          { OP_MakeRecord: last field }
+  nFieldMR: i32;          { OP_MakeRecord: field count }
+  zAffMR:  PAnsiChar;     { OP_MakeRecord: affinity string }
+  lenMR:   u32;           { OP_MakeRecord: field length }
+  zHdrMR:  Pu8;           { OP_MakeRecord: header write pointer }
+  zPayMR:  Pu8;           { OP_MakeRecord: payload write pointer }
+  vMR:     u64;           { OP_MakeRecord: integer value bits }
+  uuMR:    u64;           { OP_MakeRecord: unsigned int for size computation }
+  ivMR:    i64;           { OP_MakeRecord: signed int for size computation }
+  seekRes: i32;           { OP_Insert: prior seek result }
+  xPay:    TBtreePayload; { OP_Insert/IdxInsert: payload descriptor }
+  opflags: i32;           { OP_Delete: opcode flags from P2 }
+  vRow:    i64;           { OP_NewRowid/OP_Rowid: rowid value }
+  cntNR:   i32;           { OP_NewRowid: retry counter }
+  nEntry:  i64;           { OP_Count: entry count }
+  rowid54: i64;           { OP_IdxRowid/DeferredSeek: rowid }
+  pTabCur: PVdbeCursor;   { OP_DeferredSeek: table cursor }
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -3488,6 +3628,580 @@ begin
       goto jump_to_p2;
     end;
 
+    { ────── OP_Column ────── (vdbe.c:2975) }
+    OP_Column: begin
+      pCol   := v^.apCsr[pOp^.p1];
+      p2col  := u32(pOp^.p2);
+      aOffset := Pu32(Pu8(pCol) + 120 + u32(pCol^.nField) * SizeOf(u32));
+      { aOffset = pCol->aType + pCol->nField }
+
+      op_column_restart:
+      if pCol^.cacheStatus <> v^.cacheCtr then begin
+        if pCol^.nullRow <> 0 then begin
+          if (pCol^.eCurType = CURTYPE_PSEUDO) and (pCol^.seekResult > 0) then begin
+            pRegCol := @aMem[pCol^.seekResult];
+            pCol^.payloadSize := u32(pRegCol^.n);
+            pCol^.szRow       := u32(pRegCol^.n);
+            pCol^.aRow        := Pu8(pRegCol^.z);
+          end else begin
+            pDest := @aMem[pOp^.p3];
+            sqlite3VdbeMemSetNull(pDest);
+            goto op_column_out;
+          end;
+        end else begin
+          pCrsr := pCol^.uc.pCursor;
+          if pCol^.deferredMoveto <> 0 then begin
+            rc := sqlite3VdbeFinishMoveto(pCol);
+            if rc <> SQLITE_OK then goto abort_due_to_error;
+          end else if sqlite3BtreeCursorHasMoved(pCrsr) <> 0 then begin
+            rc := sqlite3VdbeHandleMovedCursor(pCol);
+            if rc <> SQLITE_OK then goto abort_due_to_error;
+            goto op_column_restart;
+          end;
+          pCol^.payloadSize := sqlite3BtreePayloadSize(pCrsr);
+          pCol^.aRow := Pu8(sqlite3BtreePayloadFetch(pCrsr, pCol^.szRow));
+        end;
+        pCol^.cacheStatus := v^.cacheCtr;
+        if pCol^.aRow[0] < $80 then begin
+          aOffset[0] := pCol^.aRow[0];
+          pCol^.iHdrOffset := 1;
+        end else begin
+          pCol^.iHdrOffset := u32(sqlite3GetVarint32(pCol^.aRow, aOffset[0]));
+        end;
+        pCol^.nHdrParsed := 0;
+        if pCol^.szRow < aOffset[0] then begin
+          pCol^.aRow := nil;
+          pCol^.szRow := 0;
+          if (aOffset[0] > 98307) or (aOffset[0] > pCol^.payloadSize) then
+            goto op_column_corrupt;
+        end else begin
+          zData := pCol^.aRow;
+          goto op_column_read_header;
+        end;
+      end else if (pCol^.eCurType = CURTYPE_BTREE) and
+                  (sqlite3BtreeCursorHasMoved(pCol^.uc.pCursor) <> 0) then begin
+        rc := sqlite3VdbeHandleMovedCursor(pCol);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+        goto op_column_restart;
+      end;
+
+      if pCol^.nHdrParsed <= i32(p2col) then begin
+        if pCol^.iHdrOffset < aOffset[0] then begin
+          if pCol^.aRow = nil then begin
+            FillChar(sMemCol, SizeOf(TMem), 0);
+            rc := sqlite3VdbeMemFromBtreeZeroOffset(pCol^.uc.pCursor, aOffset[0], @sMemCol);
+            if rc <> SQLITE_OK then goto abort_due_to_error;
+            zData := Pu8(sMemCol.z);
+          end else
+            zData := pCol^.aRow;
+
+          op_column_read_header:
+          i := pCol^.nHdrParsed;
+          offset64 := aOffset[i];
+          zHdrC   := zData + pCol^.iHdrOffset;
+          zEndHdr := zData + aOffset[0];
+          repeat
+            tCol := zHdrC[0];
+            if tCol < $80 then begin
+              Inc(zHdrC);
+              offset64 := offset64 + sqlite3VdbeOneByteSerialTypeLen(u8(tCol));
+            end else begin
+              zHdrC := zHdrC + sqlite3GetVarint32(zHdrC, tCol);
+              offset64 := offset64 + sqlite3VdbeSerialTypeLen(tCol);
+            end;
+            { pCol->aType[i] = tCol; aOffset[i+1] = offset64 }
+            Pu32(Pu8(pCol) + 120)[i] := tCol;
+            Inc(i);
+            aOffset[i] := u32(offset64 and $FFFFFFFF);
+          until not ((u32(i) <= p2col) and (zHdrC < zEndHdr));
+
+          { corruption check }
+          if ((zHdrC >= zEndHdr) and
+              ((zHdrC > zEndHdr) or (offset64 <> pCol^.payloadSize))) or
+             (offset64 > pCol^.payloadSize) then begin
+            if aOffset[0] = 0 then begin
+              i := 0;
+              zHdrC := zEndHdr;
+            end else begin
+              if pCol^.aRow = nil then sqlite3VdbeMemRelease(@sMemCol);
+              goto op_column_corrupt;
+            end;
+          end;
+
+          pCol^.nHdrParsed    := i;
+          pCol^.iHdrOffset    := u32(zHdrC - zData);
+          if pCol^.aRow = nil then sqlite3VdbeMemRelease(@sMemCol);
+        end else
+          tCol := 0;
+
+        if pCol^.nHdrParsed <= i32(p2col) then begin
+          pDest := @aMem[pOp^.p3];
+          if pOp^.p4type = P4_MEM then
+            sqlite3VdbeMemShallowCopy(pDest, PMem(pOp^.p4.pMem), MEM_Static)
+          else
+            sqlite3VdbeMemSetNull(pDest);
+          goto op_column_out;
+        end;
+      end else
+        tCol := Pu32(Pu8(pCol) + 120)[p2col];  { pCol->aType[p2col] }
+
+      { Extract column value }
+      pDest := @aMem[pOp^.p3];
+      if vdbeMemDynamic(pDest) then sqlite3VdbeMemSetNull(pDest);
+      if pCol^.szRow >= aOffset[p2col + 1] then begin
+        zData := pCol^.aRow + aOffset[p2col];
+        if tCol < 12 then
+          sqlite3VdbeSerialGet(zData, tCol, pDest)
+        else begin
+          lenCol := i32((tCol - 12) div 2);
+          pDest^.n   := lenCol;
+          pDest^.enc := enc;
+          if pDest^.szMalloc < lenCol + 2 then begin
+            if lenCol > i32(Pu32(Pu8(db) + 136)^) then goto too_big;
+            pDest^.flags := MEM_Null;
+            if sqlite3VdbeMemGrow(pDest, lenCol + 2, 0) <> SQLITE_OK then goto no_mem;
+          end else
+            pDest^.z := pDest^.zMalloc;
+          Move(zData^, pDest^.z^, lenCol);
+          pDest^.z[lenCol]     := #0;
+          pDest^.z[lenCol + 1] := #0;
+          if (tCol and 1) <> 0 then pDest^.flags := MEM_Str
+          else pDest^.flags := MEM_Blob;
+        end;
+      end else begin
+        pDest^.enc := enc;
+        if ((pOp^.p5 and OPFLAG_BYTELENARG) <> 0) and
+           ((pOp^.p5 = OPFLAG_TYPEOFARG) or
+            ((tCol >= 12) and (((tCol and 1) = 0) or (pOp^.p5 = OPFLAG_BYTELENARG)))) or
+           (sqlite3VdbeSerialTypeLen(tCol) = 0) then
+          sqlite3VdbeSerialGet(Pu8(@sqlite3CtypeMap[0]), tCol, pDest)
+        else begin
+          rc := vdbeColumnFromOverflow(pCol, i32(p2col), tCol, aOffset[p2col],
+                    v^.cacheCtr, colCacheCtr, pDest);
+          if rc <> SQLITE_OK then begin
+            if rc = SQLITE_NOMEM then goto no_mem;
+            if rc = SQLITE_TOOBIG then goto too_big;
+            goto abort_due_to_error;
+          end;
+        end;
+      end;
+
+      op_column_out:
+      { UPDATE_MAX_BLOBSIZE — update db->szMalloc watermark (skip for now) }
+    end;
+
+    { ────── OP_MakeRecord ────── (vdbe.c:3469) }
+    OP_MakeRecord: begin
+      nData    := 0;
+      nHdr     := 0;
+      nZeroMR  := 0;
+      nFieldMR := pOp^.p1;
+      zAffMR   := pOp^.p4.z;
+      pData0   := @aMem[nFieldMR];
+      nFieldMR := pOp^.p2;
+      pLastMR  := pData0 + (nFieldMR - 1);
+      pOut     := @aMem[pOp^.p3];
+
+      { Apply affinity to inputs }
+      if zAffMR <> nil then begin
+        pRec := pData0;
+        while zAffMR[0] <> #0 do begin
+          applyAffinity(pRec, zAffMR[0], enc);
+          if (zAffMR[0] = AnsiChar(SQLITE_AFF_REAL)) and
+             ((pRec^.flags and MEM_Int) <> 0) then begin
+            pRec^.flags := (pRec^.flags or MEM_IntReal) and not u16(MEM_Int);
+          end;
+          Inc(zAffMR);
+          Inc(pRec);
+        end;
+      end;
+
+      { Compute sizes — iterating pData0..pLastMR }
+      pRec := pLastMR;
+      repeat
+        if (pRec^.flags and MEM_Null) <> 0 then begin
+          if (pRec^.flags and MEM_Zero) <> 0 then
+            pRec^.uTemp := 10
+          else
+            pRec^.uTemp := 0;
+          Inc(nHdr);
+        end else if (pRec^.flags and (MEM_Int or MEM_IntReal)) <> 0 then begin
+          { uu,iv declared in outer var section as uuMR, ivMR }
+          ivMR := pRec^.u.i;
+          if ivMR < 0 then uuMR := u64(not ivMR) else uuMR := u64(ivMR);
+          Inc(nHdr);
+          if uuMR <= 127 then begin
+            if ((ivMR and 1) = ivMR) and (v^.minWriteFileFormat >= 4) then
+              pRec^.uTemp := 8 + u32(uuMR)
+            else begin
+              nData := nData + 1;
+              pRec^.uTemp := 1;
+            end;
+          end else if uuMR <= 32767 then begin
+            nData := nData + 2; pRec^.uTemp := 2;
+          end else if uuMR <= 8388607 then begin
+            nData := nData + 3; pRec^.uTemp := 3;
+          end else if uuMR <= 2147483647 then begin
+            nData := nData + 4; pRec^.uTemp := 4;
+          end else if uuMR <= 140737488355327 then begin
+            nData := nData + 6; pRec^.uTemp := 5;
+          end else begin
+            nData := nData + 8;
+            if (pRec^.flags and MEM_IntReal) <> 0 then begin
+              pRec^.u.r := Double(pRec^.u.i);
+              pRec^.flags := (pRec^.flags and not u16(MEM_IntReal)) or MEM_Real;
+              pRec^.uTemp := 7;
+            end else
+              pRec^.uTemp := 6;
+          end;
+        end else if (pRec^.flags and MEM_Real) <> 0 then begin
+          Inc(nHdr);
+          nData := nData + 8;
+          pRec^.uTemp := 7;
+        end else begin
+          lenMR := u32(pRec^.n);
+          serial_type := (lenMR * 2) + 12 + u32(ord((pRec^.flags and MEM_Str) <> 0));
+          if (pRec^.flags and MEM_Zero) <> 0 then begin
+            serial_type := serial_type + u32(pRec^.u.nZero) * 2;
+            if nData <> 0 then begin
+              if sqlite3VdbeMemExpandBlob(pRec) <> SQLITE_OK then goto no_mem;
+              lenMR := lenMR + u32(pRec^.u.nZero);
+            end else
+              nZeroMR := nZeroMR + pRec^.u.nZero;
+          end;
+          nData := nData + lenMR;
+          nHdr  := nHdr + i32(sqlite3VarintLen(serial_type));
+          pRec^.uTemp := serial_type;
+        end;
+        if pRec = pData0 then break;
+        Dec(pRec);
+      until False;
+
+      { Compute header size (varint of nHdr itself) }
+      if nHdr <= 126 then
+        Inc(nHdr)
+      else begin
+        nVarint := i32(sqlite3VarintLen(u64(nHdr)));
+        nHdr := nHdr + nVarint;
+        if nVarint < i32(sqlite3VarintLen(u64(nHdr))) then Inc(nHdr);
+      end;
+      nByteMR := i64(nHdr) + i64(nData);
+
+      { Resize output register }
+      if nByteMR + nZeroMR <= i64(pOut^.szMalloc) then
+        pOut^.z := pOut^.zMalloc
+      else begin
+        if nByteMR + nZeroMR > i64(Pu32(Pu8(db) + 136)^) then goto too_big;
+        if sqlite3VdbeMemClearAndResize(pOut, i32(nByteMR)) <> SQLITE_OK then goto no_mem;
+      end;
+      pOut^.n := i32(nByteMR);
+      pOut^.flags := MEM_Blob;
+      if nZeroMR <> 0 then begin
+        pOut^.u.nZero := nZeroMR;
+        pOut^.flags := pOut^.flags or MEM_Zero;
+      end;
+      zHdrMR := Pu8(pOut^.z);
+      zPayMR := zHdrMR + nHdr;
+
+      { Write header size varint }
+      if nHdr < $80 then begin
+        zHdrMR[0] := u8(nHdr);
+        Inc(zHdrMR);
+      end else
+        zHdrMR := zHdrMR + sqlite3PutVarint(zHdrMR, u64(nHdr));
+
+      { Write records }
+      pRec := pData0;
+      while True do begin
+        serial_type := pRec^.uTemp;
+        if serial_type <= 7 then begin
+          zHdrMR[0] := u8(serial_type);
+          Inc(zHdrMR);
+          if serial_type = 0 then begin
+            { NULL — no payload }
+          end else begin
+            if serial_type = 7 then
+              Move(pRec^.u.r, vMR, 8)
+            else
+              vMR := u64(pRec^.u.i);
+            lenMR := sqlite3VdbeSerialTypeLen(serial_type);
+            case lenMR of
+              8: begin zPayMR[7] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[6] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[5] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[4] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[3] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[2] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[1] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[0] := u8(vMR and $FF); end;
+              6: begin zPayMR[5] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[4] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[3] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[2] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[1] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[0] := u8(vMR and $FF); end;
+              4: begin zPayMR[3] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[2] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[1] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[0] := u8(vMR and $FF); end;
+              3: begin zPayMR[2] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[1] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[0] := u8(vMR and $FF); end;
+              2: begin zPayMR[1] := u8(vMR and $FF); vMR := vMR shr 8;
+                       zPayMR[0] := u8(vMR and $FF); end;
+              1: zPayMR[0] := u8(vMR and $FF);
+            end;
+            zPayMR := zPayMR + lenMR;
+          end;
+        end else if serial_type < $80 then begin
+          zHdrMR[0] := u8(serial_type);
+          Inc(zHdrMR);
+          if (serial_type >= 14) and (pRec^.n > 0) then begin
+            Move(pRec^.z^, zPayMR^, pRec^.n);
+            zPayMR := zPayMR + pRec^.n;
+          end;
+        end else begin
+          zHdrMR := zHdrMR + sqlite3PutVarint(zHdrMR, serial_type);
+          if pRec^.n > 0 then begin
+            Move(pRec^.z^, zPayMR^, pRec^.n);
+            zPayMR := zPayMR + pRec^.n;
+          end;
+        end;
+        if pRec = pLastMR then break;
+        Inc(pRec);
+      end;
+    end;
+
+    { ────── OP_Count ────── (vdbe.c:3797) }
+    OP_Count: begin
+      pCrsr := v^.apCsr[pOp^.p1]^.uc.pCursor;
+      if pOp^.p3 <> 0 then
+        nEntry := sqlite3BtreeRowCountEst(pCrsr)
+      else begin
+        nEntry := 0;
+        rc := sqlite3BtreeCount(Psqlite3(db), pCrsr, @nEntry);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+      end;
+      pOut := out2Prerelease(v, pOp);
+      pOut^.u.i := nEntry;
+      goto check_for_interrupt;
+    end;
+
+    { ────── OP_Rowid ────── (vdbe.c:6154) }
+    OP_Rowid: begin
+      pOut := out2Prerelease(v, pOp);
+      pCur := v^.apCsr[pOp^.p1];
+      if pCur^.nullRow <> 0 then begin
+        pOut^.flags := MEM_Null;
+      end else if pCur^.deferredMoveto <> 0 then begin
+        pOut^.u.i := pCur^.movetoTarget;
+      end else begin
+        rc := sqlite3VdbeCursorRestore(pCur);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+        if pCur^.nullRow <> 0 then begin
+          pOut^.flags := MEM_Null;
+        end else begin
+          pOut^.u.i := sqlite3BtreeIntegerKey(pCur^.uc.pCursor);
+        end;
+      end;
+    end;
+
+    { ────── OP_NullRow ────── (vdbe.c:6204) }
+    OP_NullRow: begin
+      pCur := v^.apCsr[pOp^.p1];
+      if pCur = nil then begin
+        pCur := allocateCursor(v, pOp^.p1, 1, CURTYPE_PSEUDO);
+        if pCur = nil then goto no_mem;
+        pCur^.seekResult := 0;
+        pCur^.isTable := 1;
+        pCur^.cursorFlags := pCur^.cursorFlags or VDBC_NoReuse;
+        pCur^.uc.pCursor := sqlite3BtreeFakeValidCursor();
+      end;
+      pCur^.nullRow := 1;
+      pCur^.cacheStatus := CACHE_STALE;
+      if pCur^.eCurType = CURTYPE_BTREE then
+        sqlite3BtreeClearCursor(pCur^.uc.pCursor);
+    end;
+
+    { ────── OP_SeekEnd ────── (vdbe.c:6231) }
+    OP_SeekEnd: begin
+      pCur := v^.apCsr[pOp^.p1];
+      pCrsr := pCur^.uc.pCursor;
+      pCur^.cacheStatus := CACHE_STALE;
+      pCur^.seekResult := -1;
+      rc := sqlite3BtreeLast(pCrsr, @res);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+    end;
+
+    { ────── OP_NewRowid ────── (vdbe.c:5589) }
+    OP_NewRowid: begin
+      vRow := 0;
+      res  := 0;
+      pOut := out2Prerelease(v, pOp);
+      pCur := v^.apCsr[pOp^.p1];
+      pCrsr := pCur^.uc.pCursor;
+      if (pCur^.cursorFlags and VDBC_RandomRowid) = 0 then begin
+        rc := sqlite3BtreeLast(pCrsr, @res);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+        if res <> 0 then
+          vRow := 1
+        else begin
+          vRow := sqlite3BtreeIntegerKey(pCrsr);
+          if vRow >= i64($7FFFFFFFFFFFFFFF) then
+            pCur^.cursorFlags := pCur^.cursorFlags or VDBC_RandomRowid
+          else
+            Inc(vRow);
+        end;
+      end;
+      if (pCur^.cursorFlags and VDBC_RandomRowid) <> 0 then begin
+        cntNR := 0;
+        repeat
+          sqlite3_randomness(SizeOf(vRow), @vRow);
+          vRow := (vRow and (i64($7FFFFFFFFFFFFFFF) shr 1)) + 1;
+          res := 0;
+          rc := sqlite3BtreeTableMoveto(pCrsr, u64(vRow), 0, @res);
+          Inc(cntNR);
+        until not ((rc = SQLITE_OK) and (res = 0) and (cntNR < 100));
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+        if res = 0 then begin
+          rc := SQLITE_FULL;
+          goto abort_due_to_error;
+        end;
+      end;
+      pCur^.deferredMoveto := 0;
+      pCur^.cacheStatus    := CACHE_STALE;
+      pOut^.u.i := vRow;
+    end;
+
+    { ────── OP_Insert ────── (vdbe.c:5748) }
+    OP_Insert: begin
+      pIn2 := @aMem[pOp^.p2];
+      pCur := v^.apCsr[pOp^.p1];
+      sqlite3VdbeIncrWriteCounter(v, pCur);
+      pIn3 := @aMem[pOp^.p3];  { key register }
+      xPay.nKey := pIn3^.u.i;
+      if (pOp^.p5 and OPFLAG_NCHANGE) <> 0 then begin
+        Inc(v^.nChange);
+        if (pOp^.p5 and OPFLAG_LASTROWID) <> 0 then
+          db^.lastRowid := xPay.nKey;
+      end;
+      xPay.pData := pIn2^.z;
+      xPay.nData := pIn2^.n;
+      if (pIn2^.flags and MEM_Zero) <> 0 then
+        xPay.nZero := pIn2^.u.nZero
+      else
+        xPay.nZero := 0;
+      xPay.pKey  := nil;
+      seekRes    := 0;
+      if (pOp^.p5 and OPFLAG_USESEEKRESULT) <> 0 then
+        seekRes := pCur^.seekResult;
+      rc := sqlite3BtreeInsert(pCur^.uc.pCursor, @xPay,
+              pOp^.p5 and (OPFLAG_APPEND or OPFLAG_SAVEPOSITION or OPFLAG_PREFORMAT),
+              seekRes);
+      pCur^.deferredMoveto := 0;
+      pCur^.cacheStatus    := CACHE_STALE;
+      Inc(colCacheCtr);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+    end;
+
+    { ────── OP_Delete ────── (vdbe.c:5903) }
+    OP_Delete: begin
+      opflags := pOp^.p2;
+      pCur := v^.apCsr[pOp^.p1];
+      sqlite3VdbeIncrWriteCounter(v, pCur);
+      rc := sqlite3BtreeDelete(pCur^.uc.pCursor, u8(pOp^.p5));
+      pCur^.cacheStatus := CACHE_STALE;
+      Inc(colCacheCtr);
+      pCur^.seekResult := 0;
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+      if (opflags and OPFLAG_NCHANGE) <> 0 then
+        Inc(v^.nChange);
+    end;
+
+    { ────── OP_ResetCount ────── (vdbe.c:6011) }
+    OP_ResetCount: begin
+      sqlite3VdbeSetChanges(Psqlite3(db), v^.nChange);
+      v^.nChange := 0;
+    end;
+
+    { ────── OP_IdxInsert ────── (vdbe.c:6570) }
+    OP_IdxInsert: begin
+      pCur := v^.apCsr[pOp^.p1];
+      sqlite3VdbeIncrWriteCounter(v, pCur);
+      pIn2 := @aMem[pOp^.p2];
+      if (pOp^.p5 and OPFLAG_NCHANGE) <> 0 then Inc(v^.nChange);
+      if sqlite3VdbeMemExpandBlob(pIn2) <> SQLITE_OK then goto no_mem;
+      xPay.nKey  := pIn2^.n;
+      xPay.pKey  := pIn2^.z;
+      xPay.aMem  := @aMem[pOp^.p3];
+      xPay.nMem  := u16(pOp^.p4.i);
+      seekRes    := 0;
+      if (pOp^.p5 and OPFLAG_USESEEKRESULT) <> 0 then
+        seekRes := pCur^.seekResult;
+      rc := sqlite3BtreeInsert(pCur^.uc.pCursor, @xPay,
+              pOp^.p5 and (OPFLAG_APPEND or OPFLAG_SAVEPOSITION or OPFLAG_PREFORMAT),
+              seekRes);
+      pCur^.deferredMoveto := 0;
+      pCur^.cacheStatus    := CACHE_STALE;
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+    end;
+
+    { ────── OP_IdxDelete ────── (vdbe.c:6637) }
+    OP_IdxDelete: begin
+      pCur := v^.apCsr[pOp^.p1];
+      sqlite3VdbeIncrWriteCounter(v, pCur);
+      pCrsr := pCur^.uc.pCursor;
+      rSeek.pKeyInfo  := pCur^.pKeyInfo;
+      rSeek.nField    := u16(pOp^.p3);
+      rSeek.default_rc := 0;
+      rSeek.aMem      := @aMem[pOp^.p2];
+      rc := sqlite3BtreeIndexMoveto(pCrsr, @rSeek, @res);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+      if res = 0 then begin
+        rc := sqlite3BtreeDelete(pCrsr, BTREE_AUXDELETE);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+      end;
+      pCur^.deferredMoveto := 0;
+      pCur^.cacheStatus    := CACHE_STALE;
+      pCur^.seekResult     := 0;
+    end;
+
+    { ────── OP_DeferredSeek / OP_IdxRowid ────── (vdbe.c:6708) }
+    OP_DeferredSeek,
+    OP_IdxRowid: begin
+      pCur := v^.apCsr[pOp^.p1];
+      rc := sqlite3VdbeCursorRestore(pCur);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+      if pCur^.nullRow = 0 then begin
+        rowid54 := 0;
+        rc := sqlite3VdbeIdxRowid(db, pCur^.uc.pCursor, rowid54);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+        if pOp^.opcode = OP_DeferredSeek then begin
+          pTabCur := v^.apCsr[pOp^.p3];
+          pTabCur^.nullRow        := 0;
+          pTabCur^.movetoTarget   := rowid54;
+          pTabCur^.deferredMoveto := 1;
+          pTabCur^.cacheStatus    := CACHE_STALE;
+          pTabCur^.ub.aAltMap     := Pointer(pOp^.p4.ai);
+          pTabCur^.pAltCursor     := pCur;
+        end else begin
+          pOut := out2Prerelease(v, pOp);
+          pOut^.u.i := rowid54;
+        end;
+      end else begin
+        sqlite3VdbeMemSetNull(@aMem[pOp^.p2]);
+      end;
+    end;
+
+    { ────── OP_FinishSeek ────── (vdbe.c:6771) }
+    OP_FinishSeek: begin
+      pCur := v^.apCsr[pOp^.p1];
+      if pCur^.deferredMoveto <> 0 then begin
+        rc := sqlite3VdbeFinishMoveto(pCur);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+      end;
+    end;
+
     else begin
       { Unimplemented opcode }
       rc := SQLITE_ERROR;
@@ -3574,6 +4288,17 @@ begin
     pOp := @aOp[pOp^.p2 - 1];
     Inc(pOp);
     continue;
+
+    { ── op_column_corrupt ── shared corrupt-record handler for OP_Column }
+    op_column_corrupt:
+    if aOp[0].p3 > 0 then begin
+      pOp := @aOp[aOp[0].p3 - 1];
+      Inc(pOp);
+      continue;
+    end else begin
+      rc := SQLITE_CORRUPT_BKPT;
+      goto abort_due_to_error;
+    end;
 
   until False;
 
@@ -3727,12 +4452,6 @@ function vdbeDbLimitLength(db: Psqlite3): i32; inline;
 begin
   if db = nil then Result := SQLITE_MAX_LENGTH
   else Result := Pi32(PByte(db) + 136)^;
-end;
-
-{ VdbeMemDynamic — true if Mem has external resources (MEM_Dyn | MEM_Agg) }
-function vdbeMemDynamic(p: PMem): Boolean; inline;
-begin
-  Result := (p^.flags and (MEM_Agg or MEM_Dyn)) <> 0;
 end;
 
 { MemSetTypeFlag — set a type flag, clearing all other type bits }
