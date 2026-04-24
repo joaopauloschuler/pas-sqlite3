@@ -111,6 +111,7 @@ compile_test TestPagerCompat
 compile_test TestWalCompat
 compile_test TestBtreeCompat
 compile_test TestVdbeAux
+compile_test TestVdbeMem
 compile_test TestVdbeTrace
 compile_test TestExplainParity
 compile_test TestSQLCorpus

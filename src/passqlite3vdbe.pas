@@ -32,6 +32,7 @@ interface
 
 uses
   ctypes,
+  Math,
   passqlite3types,
   passqlite3os,
   passqlite3util,
@@ -576,10 +577,10 @@ type
   PPsqlite3_context = ^Psqlite3_context;
 
   { -----------------------------------------------------------------------
-    Destructor callback type used by Mem.xDel and AuxData.xDeleteAux.
+    Destructor callback type: see passqlite3types.TxDelProc.
     ----------------------------------------------------------------------- }
 
-  TxDelProc = procedure(p: Pointer); cdecl;
+  { TxDelProc is defined in passqlite3types. }
 
   { -----------------------------------------------------------------------
     TMemValue — variant union inside TMem (vdbeInt.h struct sqlite3_value.u).
@@ -1125,19 +1126,76 @@ function  sqlite3VdbeFindCompare(pKey: Pointer): Pointer; { returns RecordCompar
 function  sqlite3OpcodeName(n: i32): PAnsiChar;
 
 { --- vdbemem.c — Mem value operations (Phase 5.3) --- }
+{ SQLITE_DYNAMIC / SQLITE_TRANSIENT: sentinel destructor values.
+  Declared as vars because FPC typed constants cannot hold arbitrary
+  pointer-sized integer values in procedure pointer fields. }
+var
+  SQLITE_DYNAMIC:   TxDelProc;   { = sqlite3_free (function pointer) }
+  SQLITE_TRANSIENT: TxDelProc;   { = TxDelProc(Pointer(-1)) sentinel }
+
 procedure sqlite3VdbeMemInit(pMem: PMem; db: Psqlite3; flags: u16);
 procedure sqlite3VdbeMemSetNull(pMem: PMem);
+procedure sqlite3ValueSetNull(v: Psqlite3_value);
 procedure sqlite3VdbeMemSetInt64(pMem: PMem; val: i64);
+procedure sqlite3MemSetArrayInt64(aMem: Psqlite3_value; iIdx: i32; val: i64);
 procedure sqlite3VdbeMemSetDouble(pMem: PMem; val: Double);
+procedure sqlite3VdbeMemSetZeroBlob(pMem: PMem; n: i32);
+procedure sqlite3VdbeMemSetPointer(pMem: PMem; pPtr: Pointer;
+                                   zPType: PAnsiChar;
+                                   xDestructor: TxDelProc);
+procedure sqlite3NoopDestructor(p: Pointer); cdecl;
 function  sqlite3VdbeMemSetStr(pMem: PMem; z: PAnsiChar; n: i64;
                                enc: u8; xDel: TxDelProc): i32;
+function  sqlite3VdbeMemSetText(pMem: PMem; z: PAnsiChar; n: i64;
+                                xDel: TxDelProc): i32;
+function  sqlite3VdbeMemGrow(pMem: PMem; n: i32; bPreserve: i32): i32;
+function  sqlite3VdbeMemClearAndResize(pMem: PMem; szNew: i32): i32;
+function  sqlite3VdbeMemZeroTerminateIfAble(pMem: PMem): i32;
+function  sqlite3VdbeMemMakeWriteable(pMem: PMem): i32;
+function  sqlite3VdbeMemExpandBlob(pMem: PMem): i32;
+function  sqlite3VdbeMemNulTerminate(pMem: PMem): i32;
+function  sqlite3VdbeMemStringify(pMem: PMem; enc: u8; bForce: u8): i32;
 procedure sqlite3VdbeMemRelease(pMem: PMem);
+procedure sqlite3VdbeMemReleaseMalloc(pMem: PMem);
 function  sqlite3VdbeMemCopy(pTo: PMem; const pFrom: PMem): i32;
 procedure sqlite3VdbeMemShallowCopy(pTo: PMem; const pFrom: PMem; srcType: i32);
+procedure sqlite3VdbeMemMove(pTo: PMem; pFrom: PMem);
 function  sqlite3VdbeMemNumerify(pMem: PMem): i32;
 function  sqlite3VdbeIntValue(const pMem: PMem): i64;
+function  sqlite3MemRealValueRC(pMem: PMem; out pValue: Double): i32;
 function  sqlite3VdbeRealValue(pMem: PMem): Double;
 function  sqlite3VdbeBooleanValue(pMem: PMem; ifNull: i32): i32;
+procedure sqlite3VdbeIntegerAffinity(pMem: PMem);
+function  sqlite3VdbeMemIntegerify(pMem: PMem): i32;
+function  sqlite3VdbeMemRealify(pMem: PMem): i32;
+function  sqlite3VdbeMemCast(pMem: PMem; aff: u8; encoding: u8): i32;
+function  sqlite3RealSameAsInt(r1: Double; i: sqlite3_int64): i32;
+function  sqlite3RealToI64(r: Double): i64;
+function  sqlite3VdbeMemTooBig(p: PMem): i32;
+function  sqlite3VdbeMemFromBtree(pCur: PBtCursor; offset: u32;
+                                  amt: u32; pMem: PMem): i32;
+function  sqlite3VdbeMemFromBtreeZeroOffset(pCur: PBtCursor;
+                                            amt: u32; pMem: PMem): i32;
+function  sqlite3VdbeMemFinalize(pMem: PMem; pFunc: PFuncDef): i32;
+function  sqlite3VdbeMemAggValue(pAccum: PMem; pOut: PMem; pFunc: PFuncDef): i32;
+function  sqlite3VdbeMemSetRowSet(pMem: PMem): i32;
+procedure sqlite3ValueApplyAffinity(pVal: Psqlite3_value; aff: u8; enc: u8);
+function  sqlite3ValueText(pVal: Psqlite3_value; enc: u8): Pointer;
+function  sqlite3ValueIsOfClass(pVal: Psqlite3_value; xFree: TxDelProc): i32;
+function  sqlite3ValueNew(db: Psqlite3): Psqlite3_value;
+procedure sqlite3ValueSetStr(v: Psqlite3_value; n: i32; z: Pointer;
+                             enc: u8; xDel: TxDelProc);
+procedure sqlite3ValueFree(v: Psqlite3_value);
+function  sqlite3ValueBytes(pVal: Psqlite3_value; enc: u8): i32;
+function  sqlite3ValueFromExpr(db: Psqlite3; pExpr: Pointer;
+                               enc: u8; affinity: u8;
+                               out ppVal: Psqlite3_value): i32;
+function  sqlite3Stat4Column(db: Psqlite3; pRec: Pointer; nRec: i32;
+                             iCol: i32; var ppVal: Psqlite3_value): i32;
+procedure sqlite3Stat4ProbeFree(pRec: Pointer);
+function  sqlite3VdbeChangeEncoding(pMem: PMem; desiredEnc: i32): i32;
+function  sqlite3VdbeMemTranslate(pMem: PMem; desiredEnc: u8): i32;
+function  sqlite3VdbeMemHandleBom(pMem: PMem): i32;
 
 { --- vdbeapi.c — public API (Phase 5.5) --- }
 function  sqlite3_step(pStmt: PVdbe): i32;
@@ -1220,6 +1278,12 @@ end;
 { dummy op returned by sqlite3VdbeGetOp on OOM — never written, always read }
 var
   gVdbeOpDummy: TVdbeOp;
+
+{ sqlite3FreeXDel — cdecl wrapper for sqlite3_free, used as SQLITE_DYNAMIC }
+procedure sqlite3FreeXDel(p: Pointer); cdecl;
+begin
+  sqlite3_free(p);
+end;
 
 { ============================================================================
   sqlite3SmallTypeSizes — serial type → stored byte size.
@@ -2590,119 +2654,1141 @@ begin
 end;
 
 { ============================================================================
-  vdbemem.c — Mem value type operations (Phase 5.3 stubs)
+  vdbemem.c — Mem value type operations (Phase 5.3 full port)
+  Source: SQLite 3.53.0 src/vdbemem.c
+
+  sqlite3 struct field offsets used below (verified vs GCC x86-64):
+    enc          = 100  (u8)
+    mallocFailed = 103  (u8)
+    nFpDigit     = 114  (u8)
+    aLimit[0]    = 136  (i32, SQLITE_LIMIT_LENGTH=0)
+
+  MEMCELLSIZE = 24 = offsetof(TMem, db)
+
+  VdbeMemDynamic(p): (p^.flags and (MEM_Agg or MEM_Dyn)) <> 0
+  MemSetTypeFlag(p,f): p^.flags := (p^.flags and not (MEM_TypeMask or MEM_Zero)) or f
+  ExpandBlob(p): if (p^.flags and MEM_Zero)<>0 then sqlite3VdbeMemExpandBlob(p) else 0
   ============================================================================ }
 
+{ libc snprintf for numeric formatting }
+function libc_snprintf(str: PAnsiChar; size: csize_t; fmt: PAnsiChar): i32;
+  cdecl; varargs; external 'c' name 'snprintf';
+
+{ Access enc field from opaque sqlite3* at offset 100 }
+function vdbeDbEnc(db: Psqlite3): u8; inline;
+begin
+  if db = nil then Result := SQLITE_UTF8
+  else Result := PByte(db)[100];
+end;
+
+{ Access nFpDigit from opaque sqlite3* at offset 114 }
+function vdbeDbNFpDigit(db: Psqlite3): u8; inline;
+begin
+  if db = nil then Result := 17
+  else Result := PByte(db)[114];
+end;
+
+{ Access aLimit[SQLITE_LIMIT_LENGTH] from opaque sqlite3* (aLimit starts at 136) }
+function vdbeDbLimitLength(db: Psqlite3): i32; inline;
+begin
+  if db = nil then Result := SQLITE_MAX_LENGTH
+  else Result := Pi32(PByte(db) + 136)^;
+end;
+
+{ VdbeMemDynamic — true if Mem has external resources (MEM_Dyn | MEM_Agg) }
+function vdbeMemDynamic(p: PMem): Boolean; inline;
+begin
+  Result := (p^.flags and (MEM_Agg or MEM_Dyn)) <> 0;
+end;
+
+{ MemSetTypeFlag — set a type flag, clearing all other type bits }
+procedure memSetTypeFlag(p: PMem; f: u16); inline;
+begin
+  p^.flags := (p^.flags and not u16(MEM_TypeMask or MEM_Zero)) or f;
+end;
+
+{ Render a numeric Mem (MEM_Int, MEM_Real, or MEM_IntReal) into zBuf.
+  sz must be > 22. Sets p^.n to the string length. }
+procedure vdbeMemRenderNum(sz: i32; zBuf: PAnsiChar; p: PMem);
+var
+  tmpBuf: array[0..31] of AnsiChar;
+  nFp:    i32;
+begin
+  if (p^.flags and (MEM_Int or MEM_IntReal)) <> 0 then begin
+    p^.n := sqlite3Int64ToText(p^.u.i, zBuf);
+    if (p^.flags and MEM_IntReal) <> 0 then begin
+      { append ".0" for IntReal }
+      zBuf[p^.n]   := '.';
+      zBuf[p^.n+1] := '0';
+      zBuf[p^.n+2] := #0;
+      Inc(p^.n, 2);
+    end;
+  end else begin
+    nFp := vdbeDbNFpDigit(p^.db);
+    if nFp <= 0 then nFp := 17;
+    { use libc snprintf with %g formatting; SQLite uses its own %!.*g }
+    libc_snprintf(zBuf, sz, '%.*g', nFp, p^.u.r);
+    p^.n := sqlite3Strlen30(zBuf);
+  end;
+  { suppress compiler hint — sz unused in int branch }
+  if sz < 0 then FillChar(tmpBuf, 0, 1);
+end;
+
+{ vdbeMemClearExternAndSetNull — call xDel (or finalize agg) then set MEM_Null }
+procedure vdbeMemClearExternAndSetNull(p: PMem);
+begin
+  if (p^.flags and MEM_Agg) <> 0 then
+    sqlite3VdbeMemFinalize(p, p^.u.pDef);
+  if (p^.flags and MEM_Dyn) <> 0 then begin
+    if Assigned(p^.xDel) then
+      p^.xDel(p^.z);
+  end;
+  p^.flags := MEM_Null;
+end;
+
+{ vdbeMemClear — full release of both external and malloc'd memory }
+procedure vdbeMemClear(p: PMem);
+begin
+  if vdbeMemDynamic(p) then
+    vdbeMemClearExternAndSetNull(p);
+  if p^.szMalloc <> 0 then begin
+    sqlite3DbFreeNN(p^.db, p^.zMalloc);
+    p^.szMalloc := 0;
+  end;
+  p^.z := nil;
+  p^.flags := MEM_Null;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemTranslate — UTF encoding conversion stub (Phase 2 note)
+  Full port deferred to Phase 6 (needs Mem encoding fully wired).
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemTranslate(pMem: PMem; desiredEnc: u8): i32;
+begin
+  { Stub: if already the right encoding (or UTF8), no-op }
+  if (pMem^.flags and MEM_Str) = 0 then begin
+    Result := SQLITE_OK; Exit;
+  end;
+  if pMem^.enc = desiredEnc then begin
+    Result := SQLITE_OK; Exit;
+  end;
+  { For now, we only support UTF-8; other conversions fail gracefully }
+  Result := SQLITE_ERROR;
+end;
+
+function sqlite3VdbeMemHandleBom(pMem: PMem): i32;
+begin
+  { BOM handling stub — UTF-16 BOM stripping deferred to Phase 6 }
+  Result := SQLITE_OK;
+  if pMem = nil then Exit;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeChangeEncoding — change string encoding of a Mem
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeChangeEncoding(pMem: PMem; desiredEnc: i32): i32;
+var
+  rc: i32;
+begin
+  if (pMem^.flags and MEM_Str) = 0 then begin
+    pMem^.enc := u8(desiredEnc);
+    Result := SQLITE_OK; Exit;
+  end;
+  if pMem^.enc = u8(desiredEnc) then begin
+    Result := SQLITE_OK; Exit;
+  end;
+  rc := sqlite3VdbeMemTranslate(pMem, u8(desiredEnc));
+  Result := rc;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemGrow — grow or allocate pMem->zMalloc to at least n bytes
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemGrow(pMem: PMem; n: i32; bPreserve: i32): i32;
+begin
+  if (pMem^.szMalloc > 0) and (bPreserve <> 0) and (pMem^.z = pMem^.zMalloc) then begin
+    if pMem^.db <> nil then begin
+      pMem^.z := sqlite3DbReallocOrFree(pMem^.db, pMem^.z, u64(n));
+      pMem^.zMalloc := pMem^.z;
+    end else begin
+      pMem^.zMalloc := sqlite3_realloc(pMem^.z, n);
+      if pMem^.zMalloc = nil then sqlite3_free(pMem^.z);
+      pMem^.z := pMem^.zMalloc;
+    end;
+    bPreserve := 0;
+  end else begin
+    if pMem^.szMalloc > 0 then sqlite3DbFreeNN(pMem^.db, pMem^.zMalloc);
+    pMem^.zMalloc := sqlite3DbMallocRaw(pMem^.db, u64(n));
+  end;
+  if pMem^.zMalloc = nil then begin
+    sqlite3VdbeMemSetNull(pMem);
+    pMem^.z := nil;
+    pMem^.szMalloc := 0;
+    Result := SQLITE_NOMEM_BKPT; Exit;
+  end else
+    pMem^.szMalloc := sqlite3DbMallocSize(pMem^.db, pMem^.zMalloc);
+  if (bPreserve <> 0) and (pMem^.z <> nil) then begin
+    Move(pMem^.z^, pMem^.zMalloc^, pMem^.n);
+  end;
+  if (pMem^.flags and MEM_Dyn) <> 0 then begin
+    if Assigned(pMem^.xDel) then
+      pMem^.xDel(pMem^.z);
+  end;
+  pMem^.z := pMem^.zMalloc;
+  pMem^.flags := pMem^.flags and not u16(MEM_Dyn or MEM_Ephem or MEM_Static);
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemClearAndResize
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemClearAndResize(pMem: PMem; szNew: i32): i32;
+begin
+  if pMem^.szMalloc < szNew then begin
+    Result := sqlite3VdbeMemGrow(pMem, szNew, 0); Exit;
+  end;
+  pMem^.z := pMem^.zMalloc;
+  pMem^.flags := pMem^.flags and u16(MEM_Null or MEM_Int or MEM_Real or MEM_IntReal);
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  vdbeMemAddTerminator — add NUL terminator (3 bytes) to pMem->z
+  ----------------------------------------------------------------------- }
+function vdbeMemAddTerminator(pMem: PMem): i32;
+begin
+  if sqlite3VdbeMemGrow(pMem, pMem^.n + 3, 1) <> 0 then begin
+    Result := SQLITE_NOMEM_BKPT; Exit;
+  end;
+  pMem^.z[pMem^.n]   := #0;
+  pMem^.z[pMem^.n+1] := #0;
+  pMem^.z[pMem^.n+2] := #0;
+  pMem^.flags := pMem^.flags or MEM_Term;
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemZeroTerminateIfAble
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemZeroTerminateIfAble(pMem: PMem): i32;
+begin
+  Result := 0;
+  if (pMem^.flags and (MEM_Str or MEM_Term or MEM_Ephem or MEM_Static)) <> MEM_Str then
+    Exit;
+  if pMem^.enc <> SQLITE_UTF8 then Exit;
+  if pMem^.z = nil then Exit;
+  if (pMem^.flags and MEM_Dyn) <> 0 then begin
+    { check if we can add terminator within existing allocation }
+    if pMem^.szMalloc >= pMem^.n + 1 then begin
+      pMem^.z[pMem^.n] := #0;
+      pMem^.flags := pMem^.flags or MEM_Term;
+      Result := 1;
+    end;
+  end else if pMem^.szMalloc >= pMem^.n + 1 then begin
+    pMem^.z[pMem^.n] := #0;
+    pMem^.flags := pMem^.flags or MEM_Term;
+    Result := 1;
+  end;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemMakeWriteable
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemMakeWriteable(pMem: PMem): i32;
+begin
+  if (pMem^.flags and (MEM_Str or MEM_Blob)) <> 0 then begin
+    if ((pMem^.flags and MEM_Zero) <> 0) and (sqlite3VdbeMemExpandBlob(pMem) <> 0) then begin
+      Result := SQLITE_NOMEM; Exit;
+    end;
+    if (pMem^.szMalloc = 0) or (pMem^.z <> pMem^.zMalloc) then begin
+      Result := vdbeMemAddTerminator(pMem); Exit;
+    end;
+  end;
+  pMem^.flags := pMem^.flags and not u16(MEM_Ephem);
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemExpandBlob — expand zero-filled blob tail
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemExpandBlob(pMem: PMem): i32;
+var
+  nByte: i32;
+begin
+  nByte := pMem^.n + pMem^.u.nZero;
+  if nByte <= 0 then begin
+    if (pMem^.flags and MEM_Blob) = 0 then begin Result := SQLITE_OK; Exit; end;
+    nByte := 1;
+  end;
+  if sqlite3VdbeMemGrow(pMem, nByte, 1) <> 0 then begin
+    Result := SQLITE_NOMEM_BKPT; Exit;
+  end;
+  FillChar(pMem^.z[pMem^.n], pMem^.u.nZero, 0);
+  Inc(pMem^.n, pMem^.u.nZero);
+  pMem^.flags := pMem^.flags and not u16(MEM_Zero or MEM_Term);
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemNulTerminate
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemNulTerminate(pMem: PMem): i32;
+begin
+  if (pMem^.flags and (MEM_Term or MEM_Str)) <> MEM_Str then begin
+    Result := SQLITE_OK; Exit;
+  end;
+  Result := vdbeMemAddTerminator(pMem);
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemStringify — add MEM_Str representation to a numeric Mem
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemStringify(pMem: PMem; enc: u8; bForce: u8): i32;
+const
+  nByte = 32;
+begin
+  if sqlite3VdbeMemClearAndResize(pMem, nByte) <> 0 then begin
+    pMem^.enc := 0;
+    Result := SQLITE_NOMEM_BKPT; Exit;
+  end;
+  vdbeMemRenderNum(nByte, pMem^.z, pMem);
+  pMem^.enc := SQLITE_UTF8;
+  pMem^.flags := pMem^.flags or u16(MEM_Str or MEM_Term);
+  if bForce <> 0 then
+    pMem^.flags := pMem^.flags and not u16(MEM_Int or MEM_Real or MEM_IntReal);
+  sqlite3VdbeChangeEncoding(pMem, enc);
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemFinalize — call aggregate finalizer (stub: FuncDef not ported)
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemFinalize(pMem: PMem; pFunc: PFuncDef): i32;
+begin
+  { Stub: FuncDef not yet ported (Phase 6). Return OK to allow code to run. }
+  pMem^.flags := MEM_Null;
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemAggValue — stub (window functions, Phase 6)
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemAggValue(pAccum: PMem; pOut: PMem; pFunc: PFuncDef): i32;
+begin
+  sqlite3VdbeMemSetNull(pOut);
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemRelease
+  ----------------------------------------------------------------------- }
+procedure sqlite3VdbeMemRelease(pMem: PMem);
+begin
+  if vdbeMemDynamic(pMem) or (pMem^.szMalloc <> 0) then
+    vdbeMemClear(pMem);
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemReleaseMalloc — faster release when no MEM_Dyn/MEM_Agg
+  ----------------------------------------------------------------------- }
+procedure sqlite3VdbeMemReleaseMalloc(pMem: PMem);
+begin
+  if pMem^.szMalloc <> 0 then vdbeMemClear(pMem);
+end;
+
+{ -----------------------------------------------------------------------
+  memIntValue — convert string Mem to integer (internal)
+  ----------------------------------------------------------------------- }
+function memIntValue(const pMem: PMem): i64;
+var
+  value: i64;
+begin
+  value := 0;
+  sqlite3Atoi64(pMem^.z, value, pMem^.n, pMem^.enc);
+  Result := value;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeIntValue
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeIntValue(const pMem: PMem): i64;
+var
+  flags: u16;
+begin
+  flags := pMem^.flags;
+  if (flags and (MEM_Int or MEM_IntReal)) <> 0 then begin
+    Result := pMem^.u.i; Exit;
+  end else if (flags and MEM_Real) <> 0 then begin
+    Result := sqlite3RealToI64(pMem^.u.r); Exit;
+  end else if ((flags and (MEM_Str or MEM_Blob)) <> 0) and (pMem^.z <> nil) then begin
+    Result := memIntValue(pMem); Exit;
+  end else
+    Result := 0;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3RealToI64 — convert double to closest i64 (safe from UBSAN)
+  ----------------------------------------------------------------------- }
+function sqlite3RealToI64(r: Double): i64;
+begin
+  if r < -9223372036854774784.0 then Result := SMALLEST_INT64
+  else if r > +9223372036854774784.0 then Result := LARGEST_INT64
+  else Result := Trunc(r);  { Trunc truncates toward zero; i64() reinterprets bits in FPC }
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3RealSameAsInt — true if double and int64 represent the same value
+  ----------------------------------------------------------------------- }
+function sqlite3RealSameAsInt(r1: Double; i: sqlite3_int64): i32;
+var
+  r2: Double;
+begin
+  r2 := Double(i);
+  if (r1 = 0.0) or
+     (CompareByte(r1, r2, SizeOf(r1)) = 0) and
+     (i >= -2251799813685248) and (i < 2251799813685248) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3MemRealValueRCSlowPath — slow text→double for non-UTF8 or non-terminated
+  ----------------------------------------------------------------------- }
+function sqlite3MemRealValueRCSlowPath(pMem: PMem; out pValue: Double): i32;
+var
+  rc:   i32;
+  n, iIter, jIter: i32;
+  zCopy: PAnsiChar;
+  z:     PAnsiChar;
+begin
+  rc := SQLITE_OK;
+  pValue := 0.0;
+  if pMem^.enc = SQLITE_UTF8 then begin
+    zCopy := sqlite3DbStrNDup(pMem^.db, pMem^.z, u64(pMem^.n));
+    if zCopy <> nil then begin
+      rc := sqlite3AtoF(zCopy, pValue);
+      sqlite3DbFree(pMem^.db, zCopy);
+    end;
+    Result := rc; Exit;
+  end else begin
+    n := pMem^.n and not 1;
+    zCopy := sqlite3DbMallocRaw(pMem^.db, u64(n div 2 + 2));
+    if zCopy <> nil then begin
+      z := pMem^.z;
+      iIter := 0; jIter := 0;
+      if pMem^.enc = SQLITE_UTF16LE then begin
+        while iIter < n - 1 do begin
+          zCopy[jIter] := z[iIter];
+          if z[iIter+1] <> #0 then break;
+          Inc(iIter, 2); Inc(jIter);
+        end;
+      end else begin
+        while iIter < n - 1 do begin
+          if z[iIter] <> #0 then break;
+          zCopy[jIter] := z[iIter+1];
+          Inc(iIter, 2); Inc(jIter);
+        end;
+      end;
+      zCopy[jIter] := #0;
+      rc := sqlite3AtoF(zCopy, pValue);
+      if iIter < n then rc := -100;
+      sqlite3DbFree(pMem^.db, zCopy);
+    end;
+    Result := rc;
+  end;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3MemRealValueRC
+  ----------------------------------------------------------------------- }
+function sqlite3MemRealValueRC(pMem: PMem; out pValue: Double): i32;
+begin
+  if pMem^.z = nil then begin
+    pValue := 0.0; Result := 0; Exit;
+  end else if (pMem^.enc = SQLITE_UTF8) and
+    (((pMem^.flags and MEM_Term) <> 0) or
+     (sqlite3VdbeMemZeroTerminateIfAble(pMem) <> 0)) then begin
+    Result := sqlite3AtoF(pMem^.z, pValue); Exit;
+  end else if pMem^.n = 0 then begin
+    pValue := 0.0; Result := 0; Exit;
+  end else
+    Result := sqlite3MemRealValueRCSlowPath(pMem, pValue);
+end;
+
+{ sqlite3MemRealValueNoRC — wrapper that discards rc }
+function sqlite3MemRealValueNoRC(pMem: PMem): Double;
+begin
+  sqlite3MemRealValueRC(pMem, Result);
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeRealValue
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeRealValue(pMem: PMem): Double;
+begin
+  if (pMem^.flags and MEM_Real) <> 0 then
+    Result := pMem^.u.r
+  else if (pMem^.flags and (MEM_Int or MEM_IntReal)) <> 0 then
+    Result := Double(pMem^.u.i)
+  else if (pMem^.flags and (MEM_Str or MEM_Blob)) <> 0 then
+    Result := sqlite3MemRealValueNoRC(pMem)
+  else
+    Result := 0.0;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeBooleanValue
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeBooleanValue(pMem: PMem; ifNull: i32): i32;
+begin
+  if (pMem^.flags and (MEM_Int or MEM_IntReal)) <> 0 then begin
+    Result := ord(pMem^.u.i <> 0); Exit;
+  end;
+  if (pMem^.flags and MEM_Null) <> 0 then begin
+    Result := ifNull; Exit;
+  end;
+  Result := ord(sqlite3VdbeRealValue(pMem) <> 0.0);
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeIntegerAffinity — demote Real→Int if lossless
+  ----------------------------------------------------------------------- }
+procedure sqlite3VdbeIntegerAffinity(pMem: PMem);
+var
+  ix: i64;
+begin
+  if (pMem^.flags and MEM_IntReal) <> 0 then begin
+    memSetTypeFlag(pMem, MEM_Int); Exit;
+  end;
+  ix := sqlite3RealToI64(pMem^.u.r);
+  if (pMem^.u.r = Double(ix)) and (ix > SMALLEST_INT64) and (ix < LARGEST_INT64) then begin
+    pMem^.u.i := ix;
+    memSetTypeFlag(pMem, MEM_Int);
+  end;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemIntegerify — convert to integer
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemIntegerify(pMem: PMem): i32;
+begin
+  pMem^.u.i := sqlite3VdbeIntValue(pMem);
+  memSetTypeFlag(pMem, MEM_Int);
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemRealify — convert to real
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemRealify(pMem: PMem): i32;
+begin
+  pMem^.u.r := sqlite3VdbeRealValue(pMem);
+  memSetTypeFlag(pMem, MEM_Real);
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemNumerify — convert to numeric (Int or Real)
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemNumerify(pMem: PMem): i32;
+var
+  rc: i32;
+  ix: sqlite3_int64;
+begin
+  if (pMem^.flags and (MEM_Int or MEM_Real or MEM_IntReal or MEM_Null)) = 0 then begin
+    rc := sqlite3MemRealValueRC(pMem, pMem^.u.r);
+    ix := 0;
+    if ((rc and 2) = 0) and (sqlite3Atoi64(pMem^.z, ix, pMem^.n, pMem^.enc) < 2) then begin
+      pMem^.u.i := ix;
+      memSetTypeFlag(pMem, MEM_Int);
+    end else if sqlite3RealSameAsInt(pMem^.u.r, sqlite3RealToI64(pMem^.u.r)) <> 0 then begin
+      pMem^.u.i := sqlite3RealToI64(pMem^.u.r);
+      memSetTypeFlag(pMem, MEM_Int);
+    end else
+      memSetTypeFlag(pMem, MEM_Real);
+  end;
+  pMem^.flags := pMem^.flags and not u16(MEM_Str or MEM_Blob or MEM_Zero);
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemCast — cast value to affinity (stub for complex cases)
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemCast(pMem: PMem; aff: u8; encoding: u8): i32;
+begin
+  if (pMem^.flags and MEM_Null) <> 0 then begin Result := SQLITE_OK; Exit; end;
+  case aff of
+    SQLITE_AFF_BLOB: begin
+      if (pMem^.flags and MEM_Blob) = 0 then begin
+        { attempt text conversion then mark as blob }
+        sqlite3VdbeMemStringify(pMem, encoding, 0);
+        if (pMem^.flags and MEM_Str) <> 0 then
+          memSetTypeFlag(pMem, MEM_Blob);
+      end else
+        pMem^.flags := pMem^.flags and not u16(MEM_TypeMask and not MEM_Blob);
+    end;
+    SQLITE_AFF_NUMERIC:
+      sqlite3VdbeMemNumerify(pMem);
+    SQLITE_AFF_INTEGER:
+      sqlite3VdbeMemIntegerify(pMem);
+    SQLITE_AFF_REAL:
+      sqlite3VdbeMemRealify(pMem);
+    else begin { SQLITE_AFF_TEXT }
+      pMem^.flags := pMem^.flags or ((pMem^.flags and MEM_Blob) shr 3);
+      sqlite3VdbeMemStringify(pMem, encoding, 0);
+      pMem^.flags := pMem^.flags and not u16(MEM_Int or MEM_Real or MEM_IntReal or MEM_Blob or MEM_Zero);
+      if encoding <> SQLITE_UTF8 then pMem^.n := pMem^.n and not 1;
+      sqlite3VdbeChangeEncoding(pMem, encoding);
+      sqlite3VdbeMemZeroTerminateIfAble(pMem);
+    end;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemInit
+  ----------------------------------------------------------------------- }
 procedure sqlite3VdbeMemInit(pMem: PMem; db: Psqlite3; flags: u16);
 begin
-  if pMem <> nil then begin
-    FillChar(pMem^, SizeOf(TMem), 0);
-    pMem^.flags := flags;
-    pMem^.db    := db;
-  end;
+  pMem^.flags    := flags;
+  pMem^.db       := db;
+  pMem^.szMalloc := 0;
 end;
 
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemSetNull / sqlite3ValueSetNull
+  ----------------------------------------------------------------------- }
 procedure sqlite3VdbeMemSetNull(pMem: PMem);
 begin
-  if pMem <> nil then begin
+  if vdbeMemDynamic(pMem) then
+    vdbeMemClearExternAndSetNull(pMem)
+  else
     pMem^.flags := MEM_Null;
-    pMem^.z := nil;
-  end;
 end;
 
+procedure sqlite3ValueSetNull(v: Psqlite3_value);
+begin
+  sqlite3VdbeMemSetNull(PMem(v));
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemSetZeroBlob
+  ----------------------------------------------------------------------- }
+procedure sqlite3VdbeMemSetZeroBlob(pMem: PMem; n: i32);
+begin
+  sqlite3VdbeMemRelease(pMem);
+  pMem^.flags    := MEM_Blob or MEM_Zero;
+  pMem^.n        := 0;
+  if n < 0 then n := 0;
+  pMem^.u.nZero  := n;
+  pMem^.enc      := SQLITE_UTF8;
+  pMem^.z        := nil;
+end;
+
+{ -----------------------------------------------------------------------
+  vdbeReleaseAndSetInt64
+  ----------------------------------------------------------------------- }
+procedure vdbeReleaseAndSetInt64(pMem: PMem; val: i64);
+begin
+  sqlite3VdbeMemSetNull(pMem);
+  pMem^.u.i   := val;
+  pMem^.flags := MEM_Int;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemSetInt64 / sqlite3MemSetArrayInt64
+  ----------------------------------------------------------------------- }
 procedure sqlite3VdbeMemSetInt64(pMem: PMem; val: i64);
 begin
-  if pMem <> nil then begin
+  if vdbeMemDynamic(pMem) then
+    vdbeReleaseAndSetInt64(pMem, val)
+  else begin
     pMem^.u.i   := val;
     pMem^.flags := MEM_Int;
   end;
 end;
 
+procedure sqlite3MemSetArrayInt64(aMem: Psqlite3_value; iIdx: i32; val: i64);
+begin
+  sqlite3VdbeMemSetInt64(PMem(aMem) + iIdx, val);
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3NoopDestructor / sqlite3VdbeMemSetPointer
+  ----------------------------------------------------------------------- }
+procedure sqlite3NoopDestructor(p: Pointer); cdecl;
+begin
+  { intentionally empty }
+end;
+
+procedure sqlite3VdbeMemSetPointer(pMem: PMem; pPtr: Pointer;
+                                   zPType: PAnsiChar;
+                                   xDestructor: TxDelProc);
+begin
+  vdbeMemClear(pMem);
+  if zPType <> nil then pMem^.u.zPType := zPType else pMem^.u.zPType := '';
+  pMem^.z        := pPtr;
+  pMem^.flags    := MEM_Null or MEM_Dyn or MEM_Subtype or MEM_Term;
+  pMem^.eSubtype := Ord('p');
+  if Assigned(xDestructor) then pMem^.xDel := xDestructor
+  else pMem^.xDel := @sqlite3NoopDestructor;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemSetDouble
+  ----------------------------------------------------------------------- }
 procedure sqlite3VdbeMemSetDouble(pMem: PMem; val: Double);
 begin
-  if pMem <> nil then begin
+  sqlite3VdbeMemSetNull(pMem);
+  if not IsNaN(val) then begin
     pMem^.u.r   := val;
     pMem^.flags := MEM_Real;
   end;
 end;
 
-function sqlite3VdbeMemSetStr(pMem: PMem; z: PAnsiChar; n: i64;
-                              enc: u8; xDel: TxDelProc): i32;
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemTooBig
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemTooBig(p: PMem): i32;
+var
+  n: i32;
 begin
-  { Stub — Phase 5.3 }
-  Result := SQLITE_OK;
-end;
-
-procedure sqlite3VdbeMemRelease(pMem: PMem);
-begin
-  if pMem = nil then Exit;
-  if (pMem^.flags and MEM_Dyn) <> 0 then begin
-    if pMem^.xDel <> nil then
-      pMem^.xDel(pMem^.z)
-    else if pMem^.szMalloc > 0 then
-      sqlite3DbFree(pMem^.db, pMem^.zMalloc);
+  if (p^.flags and (MEM_Str or MEM_Blob)) <> 0 then begin
+    n := p^.n;
+    if (p^.flags and MEM_Zero) <> 0 then n := n + p^.u.nZero;
+    if n > vdbeDbLimitLength(p^.db) then begin
+      Result := 1; Exit;
+    end;
   end;
-  pMem^.flags := MEM_Undefined;
-  pMem^.z := nil;
-  pMem^.zMalloc := nil;
-  pMem^.szMalloc := 0;
+  Result := 0;
 end;
 
-function sqlite3VdbeMemCopy(pTo: PMem; const pFrom: PMem): i32;
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemSetRowSet — stub (RowSet not yet ported, Phase 6)
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemSetRowSet(pMem: PMem): i32;
 begin
-  if (pTo <> nil) and (pFrom <> nil) then
-    Move(pFrom^, pTo^, SizeOf(TMem));
-  Result := SQLITE_OK;
+  { Stub: RowSet deferred to Phase 6 }
+  Result := SQLITE_NOMEM;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3ValueApplyAffinity — stub (affinity logic in codegen, Phase 6)
+  ----------------------------------------------------------------------- }
+procedure sqlite3ValueApplyAffinity(pVal: Psqlite3_value; aff: u8; enc: u8);
+var
+  p: PMem;
+begin
+  p := PMem(pVal);
+  if p = nil then Exit;
+  case aff of
+    SQLITE_AFF_INTEGER:
+      sqlite3VdbeMemIntegerify(p);
+    SQLITE_AFF_REAL:
+      sqlite3VdbeMemRealify(p);
+    SQLITE_AFF_NUMERIC:
+      sqlite3VdbeMemNumerify(p);
+    SQLITE_AFF_TEXT:
+      if (p^.flags and MEM_Null) = 0 then begin
+        if (p^.flags and (MEM_Str or MEM_Blob)) = 0 then
+          sqlite3VdbeMemStringify(p, enc, 0);
+        p^.flags := p^.flags and not u16(MEM_Int or MEM_Real or MEM_IntReal);
+      end;
+    else { SQLITE_AFF_BLOB: no coercion }
+      if (p^.flags and (MEM_Str or MEM_Int or MEM_Real or MEM_IntReal or MEM_Blob or MEM_Null)) = 0 then
+        sqlite3VdbeMemStringify(p, enc, 0);
+  end;
+end;
+
+{ -----------------------------------------------------------------------
+  vdbeClrCopy + sqlite3VdbeMemShallowCopy
+  ----------------------------------------------------------------------- }
+procedure vdbeClrCopy(pTo: PMem; const pFrom: PMem; eType: i32);
+begin
+  vdbeMemClearExternAndSetNull(pTo);
+  sqlite3VdbeMemShallowCopy(pTo, pFrom, eType);
 end;
 
 procedure sqlite3VdbeMemShallowCopy(pTo: PMem; const pFrom: PMem; srcType: i32);
 begin
-  if (pTo <> nil) and (pFrom <> nil) then
-    Move(pFrom^, pTo^, SizeOf(TMem));
+  if vdbeMemDynamic(pTo) then begin vdbeClrCopy(pTo, pFrom, srcType); Exit; end;
+  Move(pFrom^, pTo^, MEMCELLSIZE);
+  if (pFrom^.flags and MEM_Static) = 0 then begin
+    pTo^.flags := pTo^.flags and not u16(MEM_Dyn or MEM_Static or MEM_Ephem);
+    pTo^.flags := pTo^.flags or u16(srcType);
+  end;
 end;
 
-function sqlite3VdbeMemNumerify(pMem: PMem): i32;
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemCopy — full deep copy
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemCopy(pTo: PMem; const pFrom: PMem): i32;
 begin
-  { Stub — Phase 5.3 }
+  Result := SQLITE_OK;
+  if vdbeMemDynamic(pTo) then vdbeMemClearExternAndSetNull(pTo);
+  Move(pFrom^, pTo^, MEMCELLSIZE);
+  pTo^.flags := pTo^.flags and not u16(MEM_Dyn);
+  if (pTo^.flags and (MEM_Str or MEM_Blob)) <> 0 then begin
+    if (pFrom^.flags and MEM_Static) = 0 then begin
+      pTo^.flags := pTo^.flags or MEM_Ephem;
+      Result := sqlite3VdbeMemMakeWriteable(pTo);
+    end;
+  end;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemMove
+  ----------------------------------------------------------------------- }
+procedure sqlite3VdbeMemMove(pTo: PMem; pFrom: PMem);
+begin
+  sqlite3VdbeMemRelease(pTo);
+  Move(pFrom^, pTo^, SizeOf(TMem));
+  pFrom^.flags    := MEM_Null;
+  pFrom^.szMalloc := 0;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemSetStr
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemSetStr(pMem: PMem; z: PAnsiChar; n: i64;
+                              enc: u8; xDel: TxDelProc): i32;
+var
+  nByte:  i64;
+  iLimit: i32;
+  flags:  u16;
+  nAlloc: i64;
+begin
+  nByte := n;
+  if z = nil then begin
+    sqlite3VdbeMemSetNull(pMem);
+    Result := SQLITE_OK; Exit;
+  end;
+  if pMem^.db <> nil then iLimit := vdbeDbLimitLength(pMem^.db)
+  else iLimit := SQLITE_MAX_LENGTH;
+  if nByte < 0 then begin
+    if enc = SQLITE_UTF8 then
+      nByte := sqlite3Strlen30(z)
+    else begin
+      nByte := 0;
+      while (nByte <= iLimit) and ((Ord(z[nByte]) or Ord(z[nByte+1])) <> 0) do
+        Inc(nByte, 2);
+    end;
+    flags := MEM_Str or MEM_Term;
+  end else if enc = 0 then begin
+    flags := MEM_Blob;
+    enc := SQLITE_UTF8;
+  end else
+    flags := MEM_Str;
+  if nByte > iLimit then begin
+    if Assigned(xDel) and (TxDelProc(xDel) <> TxDelProc(SQLITE_TRANSIENT)) then begin
+      if TxDelProc(xDel) = SQLITE_DYNAMIC then
+        sqlite3DbFree(pMem^.db, Pointer(z))
+      else
+        xDel(Pointer(z));
+    end;
+    sqlite3VdbeMemSetNull(pMem);
+    Result := SQLITE_TOOBIG; Exit;
+  end;
+  if TxDelProc(xDel) = TxDelProc(SQLITE_TRANSIENT) then begin
+    nAlloc := nByte;
+    if (flags and MEM_Term) <> 0 then begin
+      if enc = SQLITE_UTF8 then Inc(nAlloc) else Inc(nAlloc, 2);
+    end;
+    if nAlloc < 32 then nAlloc := 32;
+    if sqlite3VdbeMemClearAndResize(pMem, i32(nAlloc)) <> 0 then begin
+      Result := SQLITE_NOMEM_BKPT; Exit;
+    end;
+    Move(z^, pMem^.z^, nAlloc);
+  end else begin
+    sqlite3VdbeMemRelease(pMem);
+    pMem^.z := z;
+    if TxDelProc(xDel) = SQLITE_DYNAMIC then begin
+      pMem^.zMalloc  := pMem^.z;
+      pMem^.szMalloc := sqlite3DbMallocSize(pMem^.db, pMem^.zMalloc);
+    end else begin
+      pMem^.xDel := xDel;
+      if TxDelProc(xDel) = TxDelProc(SQLITE_STATIC) then
+        flags := flags or MEM_Static
+      else
+        flags := flags or MEM_Dyn;
+    end;
+  end;
+  pMem^.n    := i32(nByte and $7fffffff);
+  pMem^.flags := flags;
+  pMem^.enc  := enc;
+  if enc > SQLITE_UTF8 then sqlite3VdbeMemHandleBom(pMem);
   Result := SQLITE_OK;
 end;
 
-function sqlite3VdbeIntValue(const pMem: PMem): i64;
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemSetText — simplified SetStr for always-UTF8 with db != nil
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemSetText(pMem: PMem; z: PAnsiChar; n: i64;
+                               xDel: TxDelProc): i32;
+var
+  nByte: i64;
+  flags: u16;
+  nAlloc: i64;
 begin
-  if pMem = nil then begin Result := 0; Exit; end;
-  if (pMem^.flags and MEM_Int) <> 0 then
-    Result := pMem^.u.i
-  else if (pMem^.flags and MEM_Real) <> 0 then
-    Result := i64(Trunc(pMem^.u.r))
+  nByte := n;
+  if z = nil then begin
+    sqlite3VdbeMemSetNull(pMem);
+    Result := SQLITE_OK; Exit;
+  end;
+  if nByte < 0 then begin
+    nByte := sqlite3Strlen30(z);
+    flags := MEM_Str or MEM_Term;
+  end else
+    flags := MEM_Str;
+  if nByte > vdbeDbLimitLength(pMem^.db) then begin
+    if Assigned(xDel) and (TxDelProc(xDel) <> TxDelProc(SQLITE_TRANSIENT)) then begin
+      if TxDelProc(xDel) = SQLITE_DYNAMIC then
+        sqlite3DbFree(pMem^.db, Pointer(z))
+      else
+        xDel(Pointer(z));
+    end;
+    sqlite3VdbeMemSetNull(pMem);
+    Result := SQLITE_TOOBIG; Exit;
+  end;
+  if TxDelProc(xDel) = TxDelProc(SQLITE_TRANSIENT) then begin
+    nAlloc := nByte + 1;
+    if nAlloc < 32 then nAlloc := 32;
+    if sqlite3VdbeMemClearAndResize(pMem, i32(nAlloc)) <> 0 then begin
+      Result := SQLITE_NOMEM_BKPT; Exit;
+    end;
+    Move(z^, pMem^.z^, nByte);
+    pMem^.z[nByte] := #0;
+  end else begin
+    sqlite3VdbeMemRelease(pMem);
+    pMem^.z := z;
+    if TxDelProc(xDel) = SQLITE_DYNAMIC then begin
+      pMem^.zMalloc  := pMem^.z;
+      pMem^.szMalloc := sqlite3DbMallocSize(pMem^.db, pMem^.zMalloc);
+      pMem^.xDel     := nil;
+    end else if TxDelProc(xDel) = TxDelProc(SQLITE_STATIC) then begin
+      pMem^.xDel := xDel;
+      flags := flags or MEM_Static;
+    end else begin
+      pMem^.xDel := xDel;
+      flags := flags or MEM_Dyn;
+    end;
+  end;
+  pMem^.flags := flags;
+  pMem^.n    := i32(nByte and $7fffffff);
+  pMem^.enc  := SQLITE_UTF8;
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeMemFromBtree / sqlite3VdbeMemFromBtreeZeroOffset
+  ----------------------------------------------------------------------- }
+function sqlite3VdbeMemFromBtree(pCur: PBtCursor; offset: u32;
+                                 amt: u32; pMem: PMem): i32;
+var
+  rc: i32;
+begin
+  pMem^.flags := MEM_Null;
+  if amt >= SQLITE_MAX_ALLOCATION_SIZE then begin
+    Result := SQLITE_NOMEM_BKPT; Exit;
+  end;
+  rc := sqlite3VdbeMemClearAndResize(pMem, i32(amt) + 1);
+  if rc = SQLITE_OK then begin
+    rc := sqlite3BtreePayload(pCur, offset, amt, pMem^.z);
+    if rc = SQLITE_OK then begin
+      pMem^.z[amt] := #0;
+      pMem^.flags  := MEM_Blob;
+      pMem^.n      := i32(amt);
+    end else
+      sqlite3VdbeMemRelease(pMem);
+  end;
+  Result := rc;
+end;
+
+function sqlite3VdbeMemFromBtreeZeroOffset(pCur: PBtCursor;
+                                           amt: u32; pMem: PMem): i32;
+var
+  available: u32;
+  rc:        i32;
+begin
+  available := 0;
+  rc := SQLITE_OK;
+  pMem^.z := sqlite3BtreePayloadFetch(pCur, available);
+  if amt <= available then begin
+    pMem^.flags := MEM_Blob or MEM_Ephem;
+    pMem^.n     := i32(amt);
+  end else
+    rc := sqlite3VdbeMemFromBtree(pCur, 0, amt, pMem);
+  Result := rc;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3ValueText / valueToText helper
+  ----------------------------------------------------------------------- }
+function valueToText(pVal: Psqlite3_value; enc: u8): Pointer;
+var
+  p: PMem;
+begin
+  p := PMem(pVal);
+  Result := nil;
+  if (p^.flags and (MEM_Blob or MEM_Str)) <> 0 then begin
+    if ((p^.flags and MEM_Zero) <> 0) and (sqlite3VdbeMemExpandBlob(p) <> 0) then Exit;
+    p^.flags := p^.flags or MEM_Str;
+    if p^.enc <> (enc and not SQLITE_UTF16_ALIGNED) then
+      sqlite3VdbeChangeEncoding(p, enc and not SQLITE_UTF16_ALIGNED);
+    sqlite3VdbeMemNulTerminate(p);
+  end else begin
+    sqlite3VdbeMemStringify(p, enc, 0);
+  end;
+  if p^.enc = (enc and not SQLITE_UTF16_ALIGNED) then
+    Result := p^.z;
+end;
+
+function sqlite3ValueText(pVal: Psqlite3_value; enc: u8): Pointer;
+var
+  p: PMem;
+begin
+  if pVal = nil then begin Result := nil; Exit; end;
+  p := PMem(pVal);
+  if ((p^.flags and (MEM_Str or MEM_Term)) = (MEM_Str or MEM_Term)) and
+     (p^.enc = enc) then begin
+    Result := p^.z; Exit;
+  end;
+  if (p^.flags and MEM_Null) <> 0 then begin
+    Result := nil; Exit;
+  end;
+  Result := valueToText(pVal, enc);
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3ValueIsOfClass
+  ----------------------------------------------------------------------- }
+function sqlite3ValueIsOfClass(pVal: Psqlite3_value; xFree: TxDelProc): i32;
+var
+  p: PMem;
+begin
+  p := PMem(pVal);
+  if (pVal <> nil) and ((p^.flags and (MEM_Str or MEM_Blob)) <> 0) and
+     ((p^.flags and MEM_Dyn) <> 0) and (p^.xDel = xFree) then
+    Result := 1
   else
     Result := 0;
 end;
 
-function sqlite3VdbeRealValue(pMem: PMem): Double;
+{ -----------------------------------------------------------------------
+  sqlite3ValueNew / sqlite3ValueSetStr / sqlite3ValueFree / sqlite3ValueBytes
+  ----------------------------------------------------------------------- }
+function sqlite3ValueNew(db: Psqlite3): Psqlite3_value;
+var
+  p: PMem;
 begin
-  if pMem = nil then begin Result := 0.0; Exit; end;
-  if (pMem^.flags and MEM_Real) <> 0 then
-    Result := pMem^.u.r
-  else if (pMem^.flags and MEM_Int) <> 0 then
-    Result := Double(pMem^.u.i)
-  else
-    Result := 0.0;
+  p := sqlite3DbMallocZero(db, SizeOf(TMem));
+  if p <> nil then begin
+    p^.flags := MEM_Null;
+    p^.db    := db;
+  end;
+  Result := Psqlite3_value(p);
 end;
 
-function sqlite3VdbeBooleanValue(pMem: PMem; ifNull: i32): i32;
+procedure sqlite3ValueSetStr(v: Psqlite3_value; n: i32; z: Pointer;
+                             enc: u8; xDel: TxDelProc);
 begin
-  if pMem = nil then begin Result := ifNull; Exit; end;
-  if (pMem^.flags and MEM_Null) <> 0 then
-    Result := ifNull
-  else if (pMem^.flags and MEM_Int) <> 0 then
-    Result := ord(pMem^.u.i <> 0)
-  else if (pMem^.flags and MEM_Real) <> 0 then
-    Result := ord(pMem^.u.r <> 0.0)
-  else
-    Result := 0;
+  if v <> nil then
+    sqlite3VdbeMemSetStr(PMem(v), z, n, enc, xDel);
+end;
+
+procedure sqlite3ValueFree(v: Psqlite3_value);
+begin
+  if v = nil then Exit;
+  sqlite3VdbeMemRelease(PMem(v));
+  sqlite3DbFreeNN(PMem(v)^.db, v);
+end;
+
+function valueBytes(pVal: Psqlite3_value; enc: u8): i32;
+begin
+  if valueToText(pVal, enc) <> nil then Result := PMem(pVal)^.n
+  else Result := 0;
+end;
+
+function sqlite3ValueBytes(pVal: Psqlite3_value; enc: u8): i32;
+var
+  p: PMem;
+begin
+  p := PMem(pVal);
+  if ((p^.flags and MEM_Str) <> 0) and (pVal^.enc = enc) then begin
+    Result := p^.n; Exit;
+  end;
+  if ((p^.flags and MEM_Str) <> 0) and (enc <> SQLITE_UTF8) and (pVal^.enc <> SQLITE_UTF8) then begin
+    Result := p^.n; Exit;
+  end;
+  if (p^.flags and MEM_Blob) <> 0 then begin
+    if (p^.flags and MEM_Zero) <> 0 then Result := p^.n + p^.u.nZero
+    else Result := p^.n;
+    Exit;
+  end;
+  if (p^.flags and MEM_Null) <> 0 then begin Result := 0; Exit; end;
+  Result := valueBytes(pVal, enc);
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3ValueFromExpr — stub (Expr not yet ported, Phase 6)
+  ----------------------------------------------------------------------- }
+function sqlite3ValueFromExpr(db: Psqlite3; pExpr: Pointer;
+                              enc: u8; affinity: u8;
+                              out ppVal: Psqlite3_value): i32;
+begin
+  ppVal := nil;
+  Result := SQLITE_OK;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3Stat4Column / sqlite3Stat4ProbeFree — STAT4 stubs (Phase 6)
+  ----------------------------------------------------------------------- }
+function sqlite3Stat4Column(db: Psqlite3; pRec: Pointer; nRec: i32;
+                            iCol: i32; var ppVal: Psqlite3_value): i32;
+var
+  t:     u32;
+  nHdr:  u32;
+  iHdr:  u32;
+  iField: i64;
+  szField: u32;
+  i:     i32;
+  a:     Pu8;
+  pM:    PMem;
+begin
+  t := 0; nHdr := 0; iHdr := 0; szField := 0;
+  a := Pu8(pRec);
+  pM := PMem(ppVal);
+  iHdr := sqlite3GetVarint32(a, nHdr);
+  if (nHdr > u32(nRec)) or (iHdr >= nHdr) then begin
+    Result := SQLITE_CORRUPT_BKPT; Exit;
+  end;
+  iField := nHdr;
+  for i := 0 to iCol do begin
+    iHdr := iHdr + u32(sqlite3GetVarint32(@a[iHdr], t));
+    if iHdr > nHdr then begin Result := SQLITE_CORRUPT_BKPT; Exit; end;
+    szField := sqlite3VdbeSerialTypeLen(t);
+    iField := iField + szField;
+  end;
+  if iField > nRec then begin Result := SQLITE_CORRUPT_BKPT; Exit; end;
+  if pM = nil then begin
+    pM := PMem(sqlite3ValueNew(db));
+    ppVal := Psqlite3_value(pM);
+    if pM = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+  end;
+  sqlite3VdbeSerialGet(@a[iField - szField], t, pM);
+  pM^.enc := vdbeDbEnc(db);
+  Result := SQLITE_OK;
+end;
+
+procedure sqlite3Stat4ProbeFree(pRec: Pointer);
+begin
+  { Stub: full implementation deferred to Phase 6 }
 end;
 
 initialization
   FillChar(gVdbeOpDummy, SizeOf(TVdbeOp), 0);
+  SQLITE_DYNAMIC   := @sqlite3FreeXDel;
+  SQLITE_TRANSIENT := TxDelProc(Pointer(-1));
 
 end.

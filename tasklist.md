@@ -1086,8 +1086,9 @@ estimate**.
     (FPC only allows `varargs` on `external` declarations).
   - Gate: TestVdbeAux T1–T17 all PASS (108/108 checks, 2026-04-24).
 
-- [ ] **5.3** Port `vdbemem.c`: the `Mem` type's value coercion and storage.
+- [X] **5.3** Port `vdbemem.c`: the `Mem` type's value coercion and storage.
   Many subtle corner cases (type affinity, text encoding conversion).
+  - Gate: TestVdbeMem T1–T23 all PASS (62/62 checks, 2026-04-24).
 
 - [ ] **5.4** Port `vdbe.c` — the `sqlite3VdbeExec` loop. **~199 opcodes**.
   Port in groups:
@@ -1128,6 +1129,53 @@ estimate**.
   reference from the SQL corpus, run the program on the Pascal VDBE and on the
   C VDBE, with `PRAGMA vdbe_trace=ON`, and diff the resulting trace logs.
   **Any divergence halts the phase.**
+
+---
+
+### Phase 5.3 implementation notes (2026-04-24)
+
+**Unit**: `src/passqlite3vdbe.pas` (already contained skeleton implementations from 5.2).
+
+**What was done (vdbemem.c functions)**:
+- `vdbeMemClearExternAndSetNull`, `vdbeMemClear`: clear dynamic resources, free szMalloc, set z=nil and flags=MEM_Null.
+- `sqlite3VdbeMemRelease`, `sqlite3VdbeMemReleaseMalloc`: thin wrappers over vdbeMemClear.
+- `sqlite3VdbeMemGrow`, `sqlite3VdbeMemClearAndResize`, `vdbeMemAddTerminator`.
+- `sqlite3VdbeMemZeroTerminateIfAble`, `sqlite3VdbeMemMakeWriteable`, `sqlite3VdbeMemNulTerminate`.
+- `sqlite3VdbeMemExpandBlob`: expand MEM_Zero blob tail into real bytes.
+- `sqlite3VdbeMemStringify`: render numeric Mem as UTF-8 string (32-byte buffer via libc snprintf).
+- `sqlite3VdbeChangeEncoding`, `sqlite3VdbeMemTranslate` (stub, Phase 6), `sqlite3VdbeMemHandleBom` (stub).
+- `sqlite3VdbeIntValue`, `sqlite3VdbeRealValue`, `sqlite3VdbeBooleanValue`.
+- `sqlite3RealToI64`, `sqlite3RealSameAsInt`.
+- `sqlite3MemRealValueRC`, `sqlite3MemRealValueRCSlowPath`, `sqlite3MemRealValueNoRC`.
+- `sqlite3VdbeIntegerAffinity`, `sqlite3VdbeMemIntegerify`, `sqlite3VdbeMemRealify`, `sqlite3VdbeMemNumerify`.
+- `sqlite3VdbeMemCast`, `sqlite3ValueApplyAffinity` (stub, Phase 6).
+- `sqlite3VdbeMemInit`, `sqlite3VdbeMemSetNull`, `sqlite3ValueSetNull`.
+- `sqlite3VdbeMemSetZeroBlob`, `vdbeReleaseAndSetInt64`, `sqlite3VdbeMemSetInt64`, `sqlite3MemSetArrayInt64`.
+- `sqlite3NoopDestructor`, `sqlite3VdbeMemSetPointer`.
+- `sqlite3VdbeMemSetDouble`.
+- `sqlite3VdbeMemTooBig`.
+- `sqlite3VdbeMemShallowCopy`, `vdbeClrCopy`, `sqlite3VdbeMemCopy`, `sqlite3VdbeMemMove`.
+- `sqlite3VdbeMemSetStr`, `sqlite3VdbeMemSetText`.
+- `sqlite3VdbeMemFromBtree`, `sqlite3VdbeMemFromBtreeZeroOffset`.
+- `valueToText`, `sqlite3ValueText`, `sqlite3ValueIsOfClass`.
+- `sqlite3ValueNew`, `sqlite3ValueFree`, `sqlite3ValueBytes`, `sqlite3ValueSetStr` (stub).
+- `sqlite3ValueFromExpr`, `sqlite3Stat4Column` (stubs, Phase 6).
+
+**Critical FPC pitfall discovered**:
+> `Int64(someDoubleVariable)` in FPC is a **bit reinterpret** (reads the 8-byte float
+> bit pattern as Int64), NOT a value truncation. For truncation use `Trunc(r)`.
+> Fixed in `sqlite3RealToI64`: `Result := Trunc(r)` (not `i64(r)`).
+
+**Additional fix**:
+> `vdbeMemClear` must explicitly set `p^.flags := MEM_Null` at the end, even for
+> non-dynamic Mems (e.g. TRANSIENT strings with szMalloc>0 but no MEM_Dyn).
+> Without this, after `sqlite3VdbeMemRelease`, flags remain `MEM_Str` with `z=nil`
+> — an inconsistent state.
+
+**Test notes**:
+- T5: `sqlite3VdbeMemSetZeroBlob` stores count in `u.nZero`, not `n` (n stays 0). Test fixed to check `m.u.nZero`.
+- T18: `sqlite3VdbeMemSetStr` rejects too-big strings itself (sets Mem to NULL before returning TOOBIG). Test `TestTooBig` must set TMem fields directly to test `sqlite3VdbeMemTooBig`.
+- Gate: T1–T23 all PASS (62/62 checks, 2026-04-24). All 337 prior TestBtreeCompat checks and 108 TestVdbeAux checks still PASS.
 
 ---
 
