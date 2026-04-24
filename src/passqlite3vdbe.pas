@@ -309,6 +309,60 @@ const
   SQLITE_PREPARE_SAVESQL = $80;  { preserve SQL text in Vdbe.zSql }
   SQLITE_PREPARE_MASK    = $3F;  { mask of public flags }
 
+{ ADDR(x) macro from vdbe.h: label index <-> negative encoding }
+{ A label L is stored as ~L (bitwise NOT); ADDR(x) = ~x = -(x+1). }
+{ In Pascal: vdbeADDR(x) = not x  (which equals -(x+1) for signed int). }
+
+{ On-error action codes (sqliteInt.h OE_*) }
+const
+  OE_None     = 0;
+  OE_Rollback = 1;  { ROLLBACK the transaction }
+  OE_Abort    = 2;  { back out changes but don't rollback }
+  OE_Fail     = 3;  { stop without rolling back }
+  OE_Ignore   = 4;  { ignore the constraint error }
+  OE_Replace  = 5;  { delete old, then do INSERT/UPDATE }
+  OE_Update   = 6;  { update existing record }
+  OE_Restrict = 7;  { restrict referential action }
+  OE_SetNull  = 8;
+  OE_SetDflt  = 9;
+  OE_Cascade  = 10;
+  OE_Default  = 11;
+
+{ SQLITE_N_LIMIT: number of distinct run-time limits (sqliteInt.h) }
+const
+  SQLITE_N_LIMIT = 13;
+
+{ SQLITE_LIMIT_VDBE_OP index }
+const
+  SQLITE_LIMIT_VDBE_OP = 5;  { max number of instructions in a VDBE program }
+
+{ SQLITE_STMTSTATUS_REPREPARE counter index (vdbe.h) }
+const
+  SQLITE_STMTSTATUS_FULLSCAN_STEP = 1;
+  SQLITE_STMTSTATUS_SORT          = 2;
+  SQLITE_STMTSTATUS_AUTOINDEX     = 3;
+  SQLITE_STMTSTATUS_VM_STEP       = 4;
+  SQLITE_STMTSTATUS_REPREPARE     = 5;
+  SQLITE_STMTSTATUS_RUN           = 6;
+  SQLITE_STMTSTATUS_FILTER_MISS   = 7;
+  SQLITE_STMTSTATUS_FILTER_HIT    = 8;
+  SQLITE_STMTSTATUS_MEMUSED       = 99;
+
+{ Default VDBE OP limit — from sqliteInt.h SQLITE_DEFAULT_VDBE_OP }
+const
+  SQLITE_DEFAULT_VDBE_OP = 250000000;
+
+{ BTREE_INTKEY from btree.h — used in sqlite3VdbeAssertMayAbort }
+{ (already in passqlite3btree.pas but we need it here too) }
+const
+  BTREE_INTKEY = 1;
+
+{ sqlite3 statement close operations (sqliteInt.h) }
+const
+  SAVEPOINT_BEGIN   = 0;
+  SAVEPOINT_RELEASE = 1;
+  SAVEPOINT_ROLLBACK = 2;
+
 { ============================================================================
   MEM_* flag bits for Mem.flags (vdbeInt.h)
   ============================================================================ }
@@ -501,12 +555,14 @@ type
   PPVdbe         = ^PVdbe;
   PMem           = ^TMem;
   PPMem          = ^PMem;
+  PPi32          = ^Pi32;           { pointer to Pi32, used for Parse.aLabel }
   Psqlite3_value = PMem;           { Mem and sqlite3_value are the same type }
   PPsqlite3_value = ^Psqlite3_value;
   PVdbeCursor    = ^TVdbeCursor;
   PPVdbeCursor   = ^PVdbeCursor;
   PVdbeFrame     = ^TVdbeFrame;
   PAuxData       = ^TAuxData;
+  PPAuxData      = ^PAuxData;
   PSubProgram    = ^TSubProgram;
   PScanStatus    = ^TScanStatus;
   PDblquoteStr   = ^TDblquoteStr;
@@ -939,269 +995,1543 @@ type
   end;
 
 { ============================================================================
-  Function stubs — will be implemented in Phases 5.2 – 5.9.
-  Declared here so that other units (btree, pager) can forward-reference them.
+  vdbeaux.c — program assembly, lifecycle, serial types (Phase 5.2)
+  vdbemem.c  — Mem value type (Phase 5.3)
+  vdbeapi.c  — public API (Phase 5.5)
+  vdbe.c     — execution engine (Phase 5.4)
+  vdbetrace.c — EXPLAIN renderer (Phase 5.8)
   ============================================================================ }
 
-{ vdbeaux.c — program assembly }
+{ --- Program assembly (vdbeaux.c) --- }
 function  sqlite3VdbeCreate(pParse: PParse): PVdbe;
-procedure sqlite3VdbeDelete(p: PVdbe);
+function  sqlite3VdbeParser(p: PVdbe): PParse;
+procedure sqlite3VdbeError(p: PVdbe; zFormat: PAnsiChar);
+procedure sqlite3VdbeSetSql(p: PVdbe; z: PAnsiChar; n: i32; prepFlags: u8);
+procedure sqlite3VdbeSwap(pA, pB: PVdbe);
 function  sqlite3VdbeAddOp0(v: PVdbe; op: i32): i32;
 function  sqlite3VdbeAddOp1(v: PVdbe; op, p1: i32): i32;
 function  sqlite3VdbeAddOp2(v: PVdbe; op, p1, p2: i32): i32;
 function  sqlite3VdbeAddOp3(v: PVdbe; op, p1, p2, p3: i32): i32;
+function  sqlite3VdbeAddOp4Int(v: PVdbe; op, p1, p2, p3, p4: i32): i32;
 function  sqlite3VdbeAddOp4(v: PVdbe; op, p1, p2, p3: i32;
                             zP4: PAnsiChar; p4type: i32): i32;
+function  sqlite3VdbeAddOp4Dup8(v: PVdbe; op, p1, p2, p3: i32;
+                                pP4: Pu8; p4type: i32): i32;
 function  sqlite3VdbeGoto(v: PVdbe; iDest: i32): i32;
-procedure sqlite3VdbeResolveLabel(v: PVdbe; x: i32);
+function  sqlite3VdbeLoadString(p: PVdbe; iDest: i32; zStr: PAnsiChar): i32;
+procedure sqlite3VdbeMultiLoad(p: PVdbe; iDest: i32; zTypes: PAnsiChar);
+function  sqlite3VdbeAddFunctionCall(pParse: PParse; p1: i32; p2, p3: i32;
+                                    nArg: i32; pFunc: PFuncDef; p5: i32): i32;
+function  sqlite3VdbeExplainParent(pParse: PParse): i32;
+procedure sqlite3ExplainBreakpoint(z1, z2: PAnsiChar);
+function  sqlite3VdbeExplain(pParse: PParse; bPush: u8; zFmt: PAnsiChar): i32;
+procedure sqlite3VdbeExplainPop(pParse: PParse);
+procedure sqlite3VdbeAddParseSchemaOp(p: PVdbe; iDb: i32; zWhere: PAnsiChar; p5: u16);
+procedure sqlite3VdbeEndCoroutine(v: PVdbe; regYield: i32);
 function  sqlite3VdbeMakeLabel(pParse: PParse): i32;
-
-{ vdbemem.c — Mem value operations }
-procedure sqlite3VdbeMemInit(pMem: PMem; db: Psqlite3; flags: u16);
-procedure sqlite3VdbeMemSetNull(pMem: PMem);
-procedure sqlite3VdbeMemSetInt64(pMem: PMem; val: i64);
-procedure sqlite3VdbeMemSetDouble(pMem: PMem; val: Double);
-function  sqlite3VdbeMemSetStr(pMem: PMem; z: PAnsiChar; n: i64;
-                               enc: u8; xDel: TxDelProc): i32;
-procedure sqlite3VdbeMemRelease(pMem: PMem);
-function  sqlite3VdbeMemCopy(pTo: PMem; const pFrom: PMem): i32;
-procedure sqlite3VdbeMemShallowCopy(pTo: PMem; const pFrom: PMem; srcType: i32);
-function  sqlite3VdbeMemNumerify(pMem: PMem): i32;
-function  sqlite3VdbeIntValue(const pMem: PMem): i64;
-function  sqlite3VdbeRealValue(pMem: PMem): Double;
-function  sqlite3VdbeBooleanValue(pMem: PMem; ifNull: i32): i32;
-
-{ vdbeapi.c — public API (sqlite3_step, _column_*, _bind_*) }
-function  sqlite3_step(pStmt: PVdbe): i32;
-procedure sqlite3_reset(pStmt: PVdbe);
-function  sqlite3_finalize(pStmt: PVdbe): i32;
-
-{ vdbe.c — execution engine }
-function  sqlite3VdbeExec(v: PVdbe): i32;
-function  sqlite3VdbeHalt(v: PVdbe): i32;
-
-{ vdbetrace.c — EXPLAIN rendering }
+procedure sqlite3VdbeResolveLabel(v: PVdbe; x: i32);
+procedure sqlite3VdbeRunOnlyOnce(p: PVdbe);
+procedure sqlite3VdbeReusable(p: PVdbe);
+function  sqlite3VdbeAssertMayAbort(v: PVdbe; mayAbort: i32): i32;
+procedure sqlite3VdbeIncrWriteCounter(p: PVdbe; pC: PVdbeCursor);
+procedure sqlite3VdbeAssertAbortable(p: PVdbe);
+procedure sqlite3VdbeNoJumpsOutsideSubrtn(v: PVdbe; iFirst, iLast: i32;
+                                          regReturn: i32);
+function  sqlite3VdbeCurrentAddr(p: PVdbe): i32;
+procedure sqlite3VdbeVerifyNoMallocRequired(p: PVdbe; N: i32);
+procedure sqlite3VdbeVerifyNoResultRow(p: PVdbe);
+procedure sqlite3VdbeVerifyAbortable(p: PVdbe; onError: i32);
+function  sqlite3VdbeTakeOpArray(p: PVdbe; pnOp: Pi32; pnMaxArg: Pi32): PVdbeOp;
+function  sqlite3VdbeAddOpList(p: PVdbe; nOp: i32; aOp: PVdbeOpList;
+                               iLineno: i32): PVdbeOp;
+procedure sqlite3VdbeScanStatus(p: PVdbe; addrExplain, addrLoop, addrVisit: i32;
+                                nEst: LogEst; zName: PAnsiChar);
+procedure sqlite3VdbeScanStatusRange(p: PVdbe; iScan, addrA, addrB: i32);
+procedure sqlite3VdbeScanStatusCounters(p: PVdbe; iScan, iScan2: i32; iLip: i32);
+procedure sqlite3VdbeChangeOpcode(p: PVdbe; addr: i32; iNewOpcode: u8);
+procedure sqlite3VdbeChangeP1(p: PVdbe; addr, val: i32);
+procedure sqlite3VdbeChangeP2(p: PVdbe; addr, val: i32);
+procedure sqlite3VdbeChangeP3(p: PVdbe; addr, val: i32);
+procedure sqlite3VdbeChangeP5(p: PVdbe; p5: u16);
+procedure sqlite3VdbeTypeofColumn(p: PVdbe; iDest: i32);
+procedure sqlite3VdbeJumpHere(p: PVdbe; addr: i32);
+procedure sqlite3VdbeJumpHereOrPopInst(p: PVdbe; addr: i32);
+procedure sqlite3VdbeLinkSubProgram(pVdbe: PVdbe; pSub: PSubProgram);
+function  sqlite3VdbeHasSubProgram(pVdbe: PVdbe): i32;
+function  sqlite3VdbeChangeToNoop(p: PVdbe; addr: i32): i32;
+function  sqlite3VdbeDeletePriorOpcode(p: PVdbe; op: u8): i32;
+procedure sqlite3VdbeReleaseRegisters(pParse: PParse; iFirst, nReg, mask: i32;
+                                      bUndefine: i32);
+procedure sqlite3VdbeChangeP4(p: PVdbe; addr: i32; zP4: PAnsiChar; n: i32);
+procedure sqlite3VdbeAppendP4(p: PVdbe; pP4: Pointer; n: i32);
+procedure sqlite3VdbeSetP4KeyInfo(pParse: PParse; pIdx: PIndex);
+procedure sqlite3VdbeComment(p: PVdbe; zFormat: PAnsiChar);
+procedure sqlite3VdbeNoopComment(p: PVdbe; zFormat: PAnsiChar);
+procedure sqlite3VdbeSetLineNumber(v: PVdbe; iLine: i32);
+function  sqlite3VdbeGetOp(p: PVdbe; addr: i32): PVdbeOp;
+function  sqlite3VdbeGetLastOp(p: PVdbe): PVdbeOp;
+function  sqlite3VdbeDisplayComment(db: Psqlite3; pOp: PVdbeOp; zP4: PAnsiChar): PAnsiChar;
+function  sqlite3VdbeDisplayP4(db: Psqlite3; pOp: PVdbeOp): PAnsiChar;
+procedure sqlite3VdbeUsesBtree(p: PVdbe; i: i32);
+procedure sqlite3VdbeEnter(p: PVdbe);
+procedure sqlite3VdbeLeave(p: PVdbe);
+procedure sqlite3VdbePrintOp(pOut: Pointer; pc: i32; pOp: PVdbeOp);
+function  sqlite3VdbeFrameIsValid(pFrame: PVdbeFrame): i32;
+procedure sqlite3VdbeFrameMemDel(pArg: Pointer);
+function  sqlite3VdbeNextOpcode(p: PVdbe; pSub: PSubProgram; eType: i32;
+                                piSub: Pi32; piAddr: Pi32): PVdbeOp;
+procedure sqlite3VdbeFrameDelete(p: PVdbeFrame);
 function  sqlite3VdbeList(v: PVdbe): i32;
+procedure sqlite3VdbePrintSql(p: PVdbe);
+procedure sqlite3VdbeIOTraceSql(p: PVdbe);
+procedure sqlite3VdbeRewind(p: PVdbe);
+procedure sqlite3VdbeMakeReady(p: PVdbe; pParse: PParse);
+procedure sqlite3VdbeFreeCursor(p: PVdbe; pCx: PVdbeCursor);
+procedure sqlite3VdbeFreeCursorNN(p: PVdbe; pCx: PVdbeCursor);
+function  sqlite3VdbeFrameRestore(pFrame: PVdbeFrame): i32;
+procedure sqlite3VdbeSetNumCols(p: PVdbe; nResColumn: i32);
+function  sqlite3VdbeSetColName(p: PVdbe; idx, var2: i32; zName: PAnsiChar;
+                                xDel: TxDelProc): i32;
+function  sqlite3VdbeCloseStatement(p: PVdbe; eOp: i32): i32;
+function  sqlite3VdbeCheckFkImmediate(p: PVdbe): i32;
+function  sqlite3VdbeCheckFkDeferred(p: PVdbe): i32;
+function  sqlite3VdbeHalt(v: PVdbe): i32;
+procedure sqlite3VdbeResetStepResult(p: PVdbe);
+function  sqlite3VdbeTransferError(p: PVdbe): i32;
+function  sqlite3VdbeReset(p: PVdbe): i32;
+function  sqlite3VdbeFinalize(p: PVdbe): i32;
+procedure sqlite3VdbeDeleteAuxData(db: Psqlite3; pp: PPAuxData; iOp, mask: i32);
+procedure sqlite3VdbeDelete(p: PVdbe);
+function  sqlite3VdbeFinishMoveto(p: PVdbeCursor): i32;
+function  sqlite3VdbeHandleMovedCursor(p: PVdbeCursor): i32;
+function  sqlite3VdbeCursorRestore(p: PVdbeCursor): i32;
+
+{ --- Serial type helpers (vdbeaux.c) --- }
+function  sqlite3VdbeSerialType(pMem: PMem; file_format: i32; pLen: Pu32): u32;
+function  sqlite3VdbeSerialTypeLen(serialType: u32): u32;
+function  sqlite3VdbeOneByteSerialTypeLen(serialType: u8): u8;
+function  sqlite3VdbeSerialPut(buf: Pu8; pMem: PMem; serial_type: u32): u32;
+procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem);
+function  sqlite3VdbeRecordUnpack(pKeyInfo: PKeyInfo; nKey: i32; pKey: Pointer;
+                                  p: Pointer): Pointer; { returns UnpackedRecord* }
+function  sqlite3VdbeAllocUnpackedRecord(pKeyInfo: PKeyInfo): Pointer;
+function  sqlite3VdbeRecordCompareWithSkip(nKey1: i32; pKey1: Pointer;
+                                           pPKey2: Pointer; bSkip: i32): i32;
+function  sqlite3VdbeRecordCompare(nKey1: i32; pKey1: Pointer;
+                                   pPKey2: Pointer): i32;
+function  sqlite3VdbeFindCompare(pKey: Pointer): Pointer; { returns RecordCompare fn }
 
 { Opcode name lookup (vdbeaux.c, used for EXPLAIN) }
 function  sqlite3OpcodeName(n: i32): PAnsiChar;
 
-{ Serial type helpers (vdbeaux.c) }
-function  sqlite3VdbeSerialTypeLen(serialType: u32): u32;
-function  sqlite3VdbeOneByteSerialTypeLen(serialType: u8): u8;
-procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem);
+{ --- vdbemem.c — Mem value operations (Phase 5.3) --- }
+procedure sqlite3VdbeMemInit(pMem: PMem; db: Psqlite3; flags: u16);
+procedure sqlite3VdbeMemSetNull(pMem: PMem);
+procedure sqlite3VdbeMemSetInt64(pMem: PMem; val: i64);
+procedure sqlite3VdbeMemSetDouble(pMem: PMem; val: Double);
+function  sqlite3VdbeMemSetStr(pMem: PMem; z: PAnsiChar; n: i64;
+                               enc: u8; xDel: TxDelProc): i32;
+procedure sqlite3VdbeMemRelease(pMem: PMem);
+function  sqlite3VdbeMemCopy(pTo: PMem; const pFrom: PMem): i32;
+procedure sqlite3VdbeMemShallowCopy(pTo: PMem; const pFrom: PMem; srcType: i32);
+function  sqlite3VdbeMemNumerify(pMem: PMem): i32;
+function  sqlite3VdbeIntValue(const pMem: PMem): i64;
+function  sqlite3VdbeRealValue(pMem: PMem): Double;
+function  sqlite3VdbeBooleanValue(pMem: PMem; ifNull: i32): i32;
+
+{ --- vdbeapi.c — public API (Phase 5.5) --- }
+function  sqlite3_step(pStmt: PVdbe): i32;
+procedure sqlite3_reset(pStmt: PVdbe);
+function  sqlite3_finalize(pStmt: PVdbe): i32;
+
+{ --- vdbe.c — execution engine (Phase 5.4) --- }
+function  sqlite3VdbeExec(v: PVdbe): i32;
 
 implementation
 
 { ============================================================================
-  sqlite3SmallTypeSizes — serial type → stored size lookup table.
-  Source: vdbeaux.c const u8 sqlite3SmallTypeSizes[].
-  Types 0-12 have fixed sizes in bytes (type 0=NULL, 1=1B, 2=2B, …, 7=8B,
-  8=8B, 9=0B, 10=0B); types ≥ 13 use varint length and are NOT in this table
-  (lookup returns 0 to indicate "use varint").  Values ≥ 128 also return 0.
+  Phase 5.2 — vdbeaux.c port
+  Byte-offset helpers for Parse and sqlite3 fields (opaque pointers).
+  Offsets verified against SQLite 3.53.0 GCC x86-64 non-debug build.
+
+  Parse offsets:
+    db          = 0   (8B pointer)
+    pVdbe       = 16  (8B pointer)
+    nTempReg    = 31  (1B u8)
+    nRangeReg   = 44  (4B i32)
+    szOpAlloc   = 64  (4B i32)
+    nLabel      = 72  (4B i32, stored as negative of count)
+    nLabelAlloc = 76  (4B i32)
+    aLabel      = 80  (8B pointer, Pi32)
+
+  sqlite3 offsets:
+    mallocFailed = 103 (1B u8)
+    aLimit[5]    = 156 (4B i32, SQLITE_LIMIT_VDBE_OP=5)
+
+  ADDR(x) macro from vdbe.h: label index ↔ negative encoding.
+    C: #define ADDR(X) (~(X))
+    Pascal: vdbeADDR(x) = not x
+  ============================================================================ }
+
+function vdbeParseDbPtr(p: PParse): Psqlite3db; inline;
+begin
+  Result := PPsqlite3db(p)^;  { Parse.db at offset 0 }
+end;
+
+function vdbeParseSzOpAllocPtr(p: PParse): Pi32; inline;
+begin
+  Result := Pi32(PByte(p) + 64);
+end;
+
+function vdbeParseNLabelPtr(p: PParse): Pi32; inline;
+begin
+  Result := Pi32(PByte(p) + 72);
+end;
+
+function vdbeParseNLabelAllocPtr(p: PParse): Pi32; inline;
+begin
+  Result := Pi32(PByte(p) + 76);
+end;
+
+function vdbeParseALabelPtr(p: PParse): PPi32; inline;
+begin
+  Result := PPi32(PByte(p) + 80);
+end;
+
+function vdbeDbMallocFailed(db: Psqlite3db): Boolean; inline;
+begin
+  if db = nil then begin Result := False; Exit; end;
+  Result := PByte(db)[103] <> 0;
+end;
+
+function vdbeDbVdbeOpLimit(db: Psqlite3db): i32; inline;
+begin
+  { sqlite3.aLimit[SQLITE_LIMIT_VDBE_OP] = aLimit[5]; aLimit at offset 136;
+    each entry is i32 (4 bytes); offset = 136 + 5*4 = 156 }
+  if db = nil then begin Result := SQLITE_DEFAULT_VDBE_OP; Exit; end;
+  Result := Pi32(PByte(db) + 156)^;
+end;
+
+function vdbeADDR(x: i32): i32; inline;
+begin
+  Result := not x;  { ADDR(x) = ~x from vdbe.h }
+end;
+
+{ dummy op returned by sqlite3VdbeGetOp on OOM — never written, always read }
+var
+  gVdbeOpDummy: TVdbeOp;
+
+{ ============================================================================
+  sqlite3SmallTypeSizes — serial type → stored byte size.
+  Source: vdbeaux.c const u8 sqlite3SmallTypeSizes[128].
+  For types 0-12 the sizes are special (not formula-derivable).
+  For types 13-127: size = (serial_type - 12) shr 1 (integer / 2).
+  For types >=128:  size = (serial_type - 12) shr 1 (same formula, no table).
   ============================================================================ }
 
 const
-  SMALL_TYPE_SIZES: array[0..12] of u8 = (
-    { type  0 (NULL)       } 0,
-    { type  1 (int 1B)     } 1,
-    { type  2 (int 2B)     } 2,
-    { type  3 (int 3B)     } 3,
-    { type  4 (int 4B)     } 4,
-    { type  5 (int 6B)     } 6,
-    { type  6 (int 8B)     } 8,
-    { type  7 (float 8B)   } 8,
-    { type  8 (int 0=zero) } 0,
-    { type  9 (int 1=one)  } 0,
-    { type 10 (reserved)   } 0,
-    { type 11 (reserved)   } 0,
-    { type 12 (blob/str 0B)} 0
-  );
+  { Serial type 0-12 stored byte sizes (special values; types >=13 use formula) }
+  SMALL_SERIAL_SIZES: array[0..12] of u8 = (0,1,2,3,4,6,8,8,0,0,0,0,0);
 
 { ============================================================================
-  Stub implementations for Phase 5.1.
-  Full implementations land in Phases 5.2 – 5.9.
-  All stubs compile cleanly and return safe zero/nil values.
+  sqlite3VdbeSerialTypeLen — length of data for given serial type.
+  Source: vdbeaux.c sqlite3VdbeSerialTypeLen().
+  For types 0-12: use table. For types >= 13: (type-12) div 2.
   ============================================================================ }
 
-function  sqlite3VdbeCreate(pParse: PParse): PVdbe;
+function sqlite3VdbeSerialTypeLen(serialType: u32): u32;
+begin
+  if serialType <= 12 then
+    Result := SMALL_SERIAL_SIZES[serialType]
+  else
+    Result := (serialType - 12) shr 1;
+end;
+
+function sqlite3VdbeOneByteSerialTypeLen(serialType: u8): u8;
+begin
+  if serialType <= 12 then
+    Result := SMALL_SERIAL_SIZES[serialType]
+  else
+    Result := u8((serialType - 12) shr 1);
+end;
+
+{ ============================================================================
+  sqlite3VdbeSerialGet — deserialize one value from a record.
+  Source: vdbeaux.c sqlite3VdbeSerialGet().
+  ============================================================================ }
+
+procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem);
+var
+  x: u64;
+  y: u32;
+begin
+  case serialType of
+    10: begin  { NULL with virtual-table UPDATE no-change flag }
+      pMem^.flags := MEM_Null or MEM_Zero;
+      pMem^.n := 0;
+      pMem^.u.nZero := 0;
+    end;
+    11, 0: begin  { NULL or reserved }
+      pMem^.flags := MEM_Null;
+    end;
+    1: begin  { 8-bit signed int }
+      pMem^.u.i := i64(i8(buf[0]));
+      pMem^.flags := MEM_Int;
+    end;
+    2: begin  { 16-bit big-endian signed int }
+      pMem^.u.i := i64(i16((i16(buf[0]) shl 8) or i16(buf[1])));
+      pMem^.flags := MEM_Int;
+    end;
+    3: begin  { 24-bit big-endian signed int }
+      x := (u32(buf[0]) shl 16) or (u32(buf[1]) shl 8) or u32(buf[2]);
+      if (x and $800000) <> 0 then x := x or u64($FFFFFFFFFF000000);
+      pMem^.u.i := i64(x);
+      pMem^.flags := MEM_Int;
+    end;
+    4: begin  { 32-bit big-endian signed int }
+      pMem^.u.i := i64(i32((u32(buf[0]) shl 24) or (u32(buf[1]) shl 16)
+                           or (u32(buf[2]) shl 8) or u32(buf[3])));
+      pMem^.flags := MEM_Int;
+    end;
+    5: begin  { 48-bit big-endian signed int }
+      x := (u32(buf[2]) shl 24) or (u32(buf[3]) shl 16)
+         or (u32(buf[4]) shl 8) or u32(buf[5]);
+      x := x + u64(i64(i16((i16(buf[0]) shl 8) or i16(buf[1]))) shl 32);
+      pMem^.u.i := i64(x);
+      pMem^.flags := MEM_Int;
+    end;
+    6: begin  { 64-bit big-endian signed int }
+      x := (u64(buf[0]) shl 56) or (u64(buf[1]) shl 48)
+         or (u64(buf[2]) shl 40) or (u64(buf[3]) shl 32)
+         or (u64(buf[4]) shl 24) or (u64(buf[5]) shl 16)
+         or (u64(buf[6]) shl 8)  or  u64(buf[7]);
+      pMem^.u.i := i64(x);
+      pMem^.flags := MEM_Int;
+    end;
+    7: begin  { IEEE 754 big-endian 64-bit float }
+      x := (u64(buf[0]) shl 56) or (u64(buf[1]) shl 48)
+         or (u64(buf[2]) shl 40) or (u64(buf[3]) shl 32);
+      y := (u32(buf[4]) shl 24) or (u32(buf[5]) shl 16)
+         or (u32(buf[6]) shl 8)  or  u32(buf[7]);
+      x := x or u64(y);
+      Move(x, pMem^.u.r, 8);
+      { NaN → NULL }
+      if (x and $7FF0000000000000) = $7FF0000000000000 then
+        if (x and $000FFFFFFFFFFFFF) <> 0 then begin
+          pMem^.flags := MEM_Null;
+          Exit;
+        end;
+      pMem^.flags := MEM_Real;
+    end;
+    8: begin  { integer constant 0 }
+      pMem^.u.i := 0;
+      pMem^.flags := MEM_Int;
+    end;
+    9: begin  { integer constant 1 }
+      pMem^.u.i := 1;
+      pMem^.flags := MEM_Int;
+    end;
+    else begin  { blob or string }
+      pMem^.z := PAnsiChar(buf);
+      pMem^.n := i32((serialType - 12) shr 1);
+      if (serialType and 1) <> 0 then
+        pMem^.flags := MEM_Str or MEM_Ephem
+      else
+        pMem^.flags := MEM_Blob or MEM_Ephem;
+    end;
+  end;
+end;
+
+{ ============================================================================
+  sqlite3VdbeSerialType — determine serial type for a Mem value.
+  Source: vdbeaux.c sqlite3VdbeSerialType().
+  ============================================================================ }
+
+function sqlite3VdbeSerialType(pMem: PMem; file_format: i32; pLen: Pu32): u32;
+const
+  MAX_6BYTE = u64(($00008000 shl 32) - 1);  { = $7FFFFFFFFFFF }
+var
+  flags: i32;
+  i:     i64;
+  u:     u64;
+  n:     u32;
+begin
+  flags := pMem^.flags;
+  if (flags and MEM_Null) <> 0 then begin
+    pLen^ := 0;
+    Result := 0;
+    Exit;
+  end;
+  if (flags and (MEM_Int or MEM_IntReal)) <> 0 then begin
+    i := pMem^.u.i;
+    if i < 0 then u := u64(not i)  { ~i for twos-complement abs }
+    else u := u64(i);
+    if u <= 127 then begin
+      if ((i and 1) = i) and (file_format >= 4) then begin
+        pLen^ := 0; Result := 8 + u32(u); Exit;
+      end else begin
+        pLen^ := 1; Result := 1; Exit;
+      end;
+    end;
+    if u <= 32767       then begin pLen^ := 2; Result := 2; Exit; end;
+    if u <= 8388607     then begin pLen^ := 3; Result := 3; Exit; end;
+    if u <= 2147483647  then begin pLen^ := 4; Result := 4; Exit; end;
+    if u <= MAX_6BYTE   then begin pLen^ := 6; Result := 5; Exit; end;
+    pLen^ := 8;
+    if (flags and MEM_IntReal) <> 0 then begin
+      pMem^.u.r := Double(pMem^.u.i);
+      pMem^.flags := (pMem^.flags and not MEM_IntReal) or MEM_Real;
+      Result := 7; Exit;
+    end;
+    Result := 6; Exit;
+  end;
+  if (flags and MEM_Real) <> 0 then begin
+    pLen^ := 8; Result := 7; Exit;
+  end;
+  n := u32(pMem^.n);
+  if (flags and MEM_Zero) <> 0 then
+    n := n + u32(pMem^.u.nZero);
+  pLen^ := n;
+  Result := (n * 2) + 12 + u32(ord((flags and MEM_Str) <> 0));
+end;
+
+{ ============================================================================
+  sqlite3VdbeSerialPut — serialize one value into a record buffer.
+  Source: vdbeaux.c sqlite3VdbeSerialPut().
+  ============================================================================ }
+
+function sqlite3VdbeSerialPut(buf: Pu8; pMem: PMem; serial_type: u32): u32;
+var
+  v: u64;
+  len: u32;
+  k: i32;
+begin
+  len := sqlite3VdbeSerialTypeLen(serial_type);
+  if serial_type >= 10 then begin
+    if serial_type >= 12 then begin
+      if (pMem^.flags and MEM_Zero) <> 0 then begin
+        FillChar(buf^, len, 0);
+        if len > u32(pMem^.n) then
+          FillChar(PByte(buf)[pMem^.n], len - u32(pMem^.n), 0)
+        else
+          len := u32(pMem^.n);
+      end else begin
+        Move(pMem^.z^, buf^, len);
+      end;
+    end;
+    { types 10, 11: zero bytes }
+    Result := len;
+    Exit;
+  end;
+  if len = 0 then begin Result := 0; Exit; end;
+  if serial_type = 7 then
+    Move(pMem^.u.r, v, 8)
+  else
+    v := u64(pMem^.u.i);
+  { Big-endian write: C uses fall-through switch; Pascal uses a loop.
+    Write bytes from index len-1 down to 1, shifting v right each time. }
+  for k := i32(len) - 1 downto 1 do begin
+    buf[k] := u8(v);
+    v := v shr 8;
+  end;
+  buf[0] := u8(v);
+  Result := len;
+end;
+
+{ ============================================================================
+  Record comparison — stubs for Phase 5.2 (full port in Phase 5.4).
+  ============================================================================ }
+
+function sqlite3VdbeAllocUnpackedRecord(pKeyInfo: PKeyInfo): Pointer;
 begin
   Result := nil;
 end;
 
-procedure sqlite3VdbeDelete(p: PVdbe);
+function sqlite3VdbeRecordUnpack(pKeyInfo: PKeyInfo; nKey: i32; pKey: Pointer;
+                                 p: Pointer): Pointer;
 begin
+  Result := nil;
 end;
 
-function  sqlite3VdbeAddOp0(v: PVdbe; op: i32): i32;
+function sqlite3VdbeRecordCompareWithSkip(nKey1: i32; pKey1: Pointer;
+                                          pPKey2: Pointer; bSkip: i32): i32;
 begin
   Result := 0;
 end;
 
-function  sqlite3VdbeAddOp1(v: PVdbe; op, p1: i32): i32;
+function sqlite3VdbeRecordCompare(nKey1: i32; pKey1: Pointer;
+                                  pPKey2: Pointer): i32;
 begin
   Result := 0;
 end;
 
-function  sqlite3VdbeAddOp2(v: PVdbe; op, p1, p2: i32): i32;
+function sqlite3VdbeFindCompare(pKey: Pointer): Pointer;
 begin
+  Result := nil;
+end;
+
+{ ============================================================================
+  vdbeaux.c — VDBE program assembly (Phase 5.2)
+  ============================================================================ }
+
+{ --- growOpArray: resize v->aOp[] to hold at least one more op --- }
+
+function growOpArray(v: PVdbe; nOp: i32): i32; forward;
+
+function growOp3(p: PVdbe; op, p1, p2, p3: i32): i32;
+begin
+  if growOpArray(p, 1) <> 0 then begin Result := 1; Exit; end;
+  Result := sqlite3VdbeAddOp3(p, op, p1, p2, p3);
+end;
+
+function addOp4IntSlow(p: PVdbe; op, p1, p2, p3, p4: i32): i32;
+var
+  addr: i32;
+  pOp:  PVdbeOp;
+begin
+  addr := sqlite3VdbeAddOp3(p, op, p1, p2, p3);
+  if not vdbeDbMallocFailed(p^.db) then begin
+    pOp := @p^.aOp[addr];
+    pOp^.p4type := P4_INT32;
+    pOp^.p4.i   := p4;
+  end;
+  Result := addr;
+end;
+
+function growOpArray(v: PVdbe; nOp: i32): i32;
+var
+  pNew:  PVdbeOp;
+  pPrs:  PParse;
+  nNew:  i64;
+  db:    Psqlite3db;
+begin
+  pPrs := v^.pParse;
+  db   := vdbeParseDbPtr(pPrs);
+  if v^.nOpAlloc <> 0 then
+    nNew := i64(v^.nOpAlloc) * 2
+  else
+    nNew := i64(1024 div SizeOf(TVdbeOp));  { initial size }
+  { enforce SQLITE_LIMIT_VDBE_OP }
+  if nNew > vdbeDbVdbeOpLimit(db) then begin
+    sqlite3OomFault(db);
+    Result := SQLITE_NOMEM;
+    Exit;
+  end;
+  pNew := PVdbeOp(sqlite3DbRealloc(db, v^.aOp, u64(nNew) * SizeOf(TVdbeOp)));
+  if pNew <> nil then begin
+    vdbeParseSzOpAllocPtr(pPrs)^ := sqlite3DbMallocSize(db, pNew);
+    v^.nOpAlloc := vdbeParseSzOpAllocPtr(pPrs)^ div SizeOf(TVdbeOp);
+    v^.aOp := pNew;
+    Result := SQLITE_OK;
+  end else
+    Result := SQLITE_NOMEM;
+end;
+
+{ --- sqlite3VdbeAddOp3 — add one instruction (core of all AddOp variants) --- }
+
+function sqlite3VdbeAddOp3(v: PVdbe; op, p1, p2, p3: i32): i32;
+var
+  i:   i32;
+  pOp: PVdbeOp;
+begin
+  i := v^.nOp;
+  if v^.nOpAlloc <= i then begin
+    Result := growOp3(v, op, p1, p2, p3);
+    Exit;
+  end;
+  v^.nOp := i + 1;
+  pOp := @v^.aOp[i];
+  pOp^.opcode  := u8(op);
+  pOp^.p5      := 0;
+  pOp^.p1      := p1;
+  pOp^.p2      := p2;
+  pOp^.p3      := p3;
+  pOp^.p4.p   := nil;
+  pOp^.p4type := P4_NOTUSED;
+  Result := i;
+end;
+
+function sqlite3VdbeAddOp4Int(v: PVdbe; op, p1, p2, p3, p4: i32): i32;
+var
+  i:   i32;
+  pOp: PVdbeOp;
+begin
+  i := v^.nOp;
+  if v^.nOpAlloc <= i then begin
+    Result := addOp4IntSlow(v, op, p1, p2, p3, p4);
+    Exit;
+  end;
+  v^.nOp := i + 1;
+  pOp := @v^.aOp[i];
+  pOp^.opcode  := u8(op);
+  pOp^.p5      := 0;
+  pOp^.p1      := p1;
+  pOp^.p2      := p2;
+  pOp^.p3      := p3;
+  pOp^.p4.i   := p4;
+  pOp^.p4type := P4_INT32;
+  Result := i;
+end;
+
+function sqlite3VdbeAddOp0(v: PVdbe; op: i32): i32;
+begin
+  Result := sqlite3VdbeAddOp3(v, op, 0, 0, 0);
+end;
+
+function sqlite3VdbeAddOp1(v: PVdbe; op, p1: i32): i32;
+begin
+  Result := sqlite3VdbeAddOp3(v, op, p1, 0, 0);
+end;
+
+function sqlite3VdbeAddOp2(v: PVdbe; op, p1, p2: i32): i32;
+begin
+  Result := sqlite3VdbeAddOp3(v, op, p1, p2, 0);
+end;
+
+function sqlite3VdbeAddOp4(v: PVdbe; op, p1, p2, p3: i32;
+                           zP4: PAnsiChar; p4type: i32): i32;
+var
+  addr: i32;
+begin
+  addr := sqlite3VdbeAddOp3(v, op, p1, p2, p3);
+  sqlite3VdbeChangeP4(v, addr, zP4, p4type);
+  Result := addr;
+end;
+
+function sqlite3VdbeAddOp4Dup8(v: PVdbe; op, p1, p2, p3: i32;
+                                pP4: Pu8; p4type: i32): i32;
+var
+  p4copy: PAnsiChar;
+begin
+  p4copy := PAnsiChar(sqlite3DbMallocRawNN(v^.db, 8));
+  if p4copy <> nil then
+    Move(pP4^, p4copy^, 8);
+  Result := sqlite3VdbeAddOp4(v, op, p1, p2, p3, p4copy, p4type);
+end;
+
+function sqlite3VdbeGoto(v: PVdbe; iDest: i32): i32;
+begin
+  Result := sqlite3VdbeAddOp3(v, OP_Goto, 0, iDest, 0);
+end;
+
+function sqlite3VdbeLoadString(p: PVdbe; iDest: i32; zStr: PAnsiChar): i32;
+begin
+  Result := sqlite3VdbeAddOp4(p, OP_String8, 0, iDest, 0, zStr, 0);
+end;
+
+procedure sqlite3VdbeMultiLoad(p: PVdbe; iDest: i32; zTypes: PAnsiChar);
+begin
+  { Stub — full implementation requires va_list support (Phase 6) }
+end;
+
+function sqlite3VdbeAddFunctionCall(pParse: PParse; p1: i32; p2, p3: i32;
+                                    nArg: i32; pFunc: PFuncDef; p5: i32): i32;
+begin
+  { Stub — requires Phase 6 (FuncDef, sqlite3_context allocation) }
   Result := 0;
 end;
 
-function  sqlite3VdbeAddOp3(v: PVdbe; op, p1, p2, p3: i32): i32;
+{ --- Label management --- }
+
+function resizeResolveLabel(p: PParse; v: PVdbe; j: i32): i32;
+var
+  nNewSize: i32;
+  aLbl:     Pi32;
 begin
-  Result := 0;
+  nNewSize := 10 - vdbeParseNLabelPtr(p)^;
+  aLbl := Pi32(sqlite3DbReallocOrFree(vdbeParseDbPtr(p),
+               vdbeParseALabelPtr(p)^,
+               u64(nNewSize) * SizeOf(i32)));
+  if aLbl = nil then begin
+    vdbeParseNLabelAllocPtr(p)^ := 0;
+    Result := SQLITE_NOMEM;
+    Exit;
+  end;
+  vdbeParseALabelPtr(p)^ := aLbl;
+  vdbeParseNLabelAllocPtr(p)^ := nNewSize;
+  aLbl[j] := v^.nOp;
+  Result := SQLITE_OK;
 end;
 
-function  sqlite3VdbeAddOp4(v: PVdbe; op, p1, p2, p3: i32;
-                            zP4: PAnsiChar; p4type: i32): i32;
+function sqlite3VdbeMakeLabel(pParse: PParse): i32;
 begin
-  Result := 0;
-end;
-
-function  sqlite3VdbeGoto(v: PVdbe; iDest: i32): i32;
-begin
-  Result := 0;
+  vdbeParseNLabelPtr(pParse)^ := vdbeParseNLabelPtr(pParse)^ - 1;
+  Result := vdbeParseNLabelPtr(pParse)^;
 end;
 
 procedure sqlite3VdbeResolveLabel(v: PVdbe; x: i32);
+var
+  p: PParse;
+  j: i32;
+begin
+  p := v^.pParse;
+  j := vdbeADDR(x);  { = ~x, converts label to array index }
+  if vdbeParseNLabelAllocPtr(p)^ + vdbeParseNLabelPtr(p)^ < 0 then begin
+    { Need to resize the label array }
+    resizeResolveLabel(p, v, j);
+  end else begin
+    vdbeParseALabelPtr(p)^[j] := v^.nOp;
+  end;
+end;
+
+{ --- resolveP2Values: patch forward-reference labels, called by VdbeMakeReady --- }
+
+procedure resolveP2Values(p: PVdbe; pMaxVtabArgs: Pi32);
+var
+  nMaxVtabArgs: i32;
+  pPrs:         PParse;
+  aLabel:       Pi32;
+  pOp:          PVdbeOp;
+label resolve_exit;
+begin
+  nMaxVtabArgs := pMaxVtabArgs^;
+  pPrs   := p^.pParse;
+  aLabel := vdbeParseALabelPtr(pPrs)^;
+  p^.vdbeFlags := (p^.vdbeFlags or VDBF_ReadOnly) and not VDBF_IsReader;
+  if p^.nOp = 0 then goto resolve_exit;
+  pOp := @p^.aOp[p^.nOp - 1];
+  while True do begin
+    if pOp^.opcode <= SQLITE_MX_JUMP_OPCODE then begin
+      case pOp^.opcode of
+        OP_Transaction: begin
+          if pOp^.p2 <> 0 then p^.vdbeFlags := p^.vdbeFlags and not VDBF_ReadOnly;
+          p^.vdbeFlags := p^.vdbeFlags or VDBF_IsReader;
+        end;
+        OP_AutoCommit, OP_Savepoint: begin
+          p^.vdbeFlags := p^.vdbeFlags or VDBF_IsReader;
+        end;
+        OP_Checkpoint, OP_Vacuum, OP_JournalMode: begin
+          p^.vdbeFlags := (p^.vdbeFlags and not VDBF_ReadOnly) or VDBF_IsReader;
+        end;
+        OP_VUpdate: begin
+          if pOp^.p2 > nMaxVtabArgs then nMaxVtabArgs := pOp^.p2;
+        end;
+        OP_VFilter: begin
+          { nArg is in pOp[-1].p1 (OP_Integer before VFilter) }
+          if (pOp^.p2 < 0) and (aLabel <> nil) then
+            pOp^.p2 := aLabel[vdbeADDR(pOp^.p2)];
+        end;
+        OP_Init: begin
+          goto resolve_exit;
+        end;
+        else begin
+          if pOp^.p2 < 0 then begin
+            if (aLabel <> nil) then
+              pOp^.p2 := aLabel[vdbeADDR(pOp^.p2)];
+          end;
+        end;
+      end;
+    end;
+    if pOp = p^.aOp then Break;
+    Dec(pOp);
+  end;
+resolve_exit:
+  if aLabel <> nil then begin
+    sqlite3DbFree(p^.db, aLabel);
+    vdbeParseALabelPtr(pPrs)^ := nil;
+  end;
+  vdbeParseNLabelPtr(pPrs)^ := 0;
+  pMaxVtabArgs^ := nMaxVtabArgs;
+end;
+
+{ --- Query current address / get op --- }
+
+function sqlite3VdbeCurrentAddr(p: PVdbe): i32;
+begin
+  Result := p^.nOp;
+end;
+
+function sqlite3VdbeGetOp(p: PVdbe; addr: i32): PVdbeOp;
+begin
+  if vdbeDbMallocFailed(p^.db) then begin
+    FillChar(gVdbeOpDummy, SizeOf(TVdbeOp), 0);
+    Result := @gVdbeOpDummy;
+  end else
+    Result := @p^.aOp[addr];
+end;
+
+function sqlite3VdbeGetLastOp(p: PVdbe): PVdbeOp;
+begin
+  Result := sqlite3VdbeGetOp(p, p^.nOp - 1);
+end;
+
+{ --- Change individual fields of existing ops --- }
+
+procedure sqlite3VdbeChangeOpcode(p: PVdbe; addr: i32; iNewOpcode: u8);
+begin
+  sqlite3VdbeGetOp(p, addr)^.opcode := iNewOpcode;
+end;
+
+procedure sqlite3VdbeChangeP1(p: PVdbe; addr, val: i32);
+begin
+  sqlite3VdbeGetOp(p, addr)^.p1 := val;
+end;
+
+procedure sqlite3VdbeChangeP2(p: PVdbe; addr, val: i32);
+begin
+  sqlite3VdbeGetOp(p, addr)^.p2 := val;
+end;
+
+procedure sqlite3VdbeChangeP3(p: PVdbe; addr, val: i32);
+begin
+  sqlite3VdbeGetOp(p, addr)^.p3 := val;
+end;
+
+procedure sqlite3VdbeChangeP5(p: PVdbe; p5: u16);
+begin
+  if p^.nOp > 0 then p^.aOp[p^.nOp - 1].p5 := p5;
+end;
+
+procedure sqlite3VdbeTypeofColumn(p: PVdbe; iDest: i32);
+const
+  OPFLAG_TYPEOFARG = $20;  { from sqliteInt.h }
+var
+  pOp: PVdbeOp;
+begin
+  pOp := sqlite3VdbeGetLastOp(p);
+  if (pOp^.p3 = iDest) and (pOp^.opcode = OP_Column) then
+    pOp^.p5 := pOp^.p5 or OPFLAG_TYPEOFARG;
+end;
+
+procedure sqlite3VdbeJumpHere(p: PVdbe; addr: i32);
+begin
+  sqlite3VdbeChangeP2(p, addr, p^.nOp);
+end;
+
+procedure sqlite3VdbeJumpHereOrPopInst(p: PVdbe; addr: i32);
+begin
+  if addr = p^.nOp - 1 then
+    p^.nOp := p^.nOp - 1
+  else
+    sqlite3VdbeChangeP2(p, addr, p^.nOp);
+end;
+
+{ --- AddOpList --- }
+
+function sqlite3VdbeAddOpList(p: PVdbe; nOp: i32; aOp: PVdbeOpList;
+                              iLineno: i32): PVdbeOp;
+var
+  i:      i32;
+  pOut:   PVdbeOp;
+  pFirst: PVdbeOp;
+  pSrc:   PVdbeOpList;
+begin
+  if p^.nOp + nOp > p^.nOpAlloc then begin
+    if growOpArray(p, nOp) <> SQLITE_OK then begin
+      Result := nil;
+      Exit;
+    end;
+  end;
+  pFirst := @p^.aOp[p^.nOp];
+  pOut := pFirst;
+  pSrc := aOp;
+  for i := 0 to nOp - 1 do begin
+    pOut^.opcode  := pSrc^.opcode;
+    pOut^.p1      := pSrc^.p1;
+    pOut^.p2      := pSrc^.p2;
+    if (sqlite3OpcodeProperty[pSrc^.opcode] and OPFLG_JUMP) <> 0 then
+      if pSrc^.p2 > 0 then
+        pOut^.p2 := pOut^.p2 + p^.nOp;
+    pOut^.p3      := pSrc^.p3;
+    pOut^.p4type  := P4_NOTUSED;
+    pOut^.p4.p   := nil;
+    pOut^.p5      := 0;
+    Inc(pOut);
+    Inc(pSrc);
+  end;
+  p^.nOp := p^.nOp + nOp;
+  Result := pFirst;
+end;
+
+{ --- Scan status (stubs — SQLITE_ENABLE_STMT_SCANSTATUS not enabled) --- }
+
+procedure sqlite3VdbeScanStatus(p: PVdbe; addrExplain, addrLoop, addrVisit: i32;
+                                nEst: LogEst; zName: PAnsiChar);
 begin
 end;
 
-function  sqlite3VdbeMakeLabel(pParse: PParse): i32;
+procedure sqlite3VdbeScanStatusRange(p: PVdbe; iScan, addrA, addrB: i32);
+begin
+end;
+
+procedure sqlite3VdbeScanStatusCounters(p: PVdbe; iScan, iScan2: i32; iLip: i32);
+begin
+end;
+
+{ --- P4 management --- }
+
+procedure freeP4(db: Psqlite3db; p4type: i8; p4: Pointer); forward;
+
+procedure freeP4(db: Psqlite3db; p4type: i8; p4: Pointer);
+begin
+  { For types that own memory, free it.  Others are static / not owned. }
+  case p4type of
+    P4_REAL,
+    P4_INT64,
+    P4_DYNAMIC,
+    P4_INTARRAY: begin
+      if p4 <> nil then sqlite3DbFree(db, p4);
+    end;
+    P4_KEYINFO: begin
+      { sqlite3KeyInfoUnref — defer to Phase 6 }
+    end;
+    P4_MEM: begin
+      { sqlite3ValueFree — defer to Phase 5.3 }
+    end;
+    P4_FUNCCTX,
+    P4_FUNCDEF: begin
+      { freeEphemeralFunction — defer to Phase 6 }
+    end;
+    P4_SUBRTNSIG: begin
+      { SubrtnSig has zAff heap string — defer to Phase 6 }
+    end;
+  end;
+end;
+
+procedure vdbeFreeOpArray(db: Psqlite3db; aOp: PVdbeOp; nOp: i32);
+var
+  pOp: PVdbeOp;
+begin
+  if aOp = nil then Exit;
+  if nOp = 0 then begin sqlite3DbFree(db, aOp); Exit; end;
+  pOp := @aOp[nOp - 1];
+  while True do begin
+    if pOp^.p4type <= P4_FREE_IF_LE then
+      freeP4(db, pOp^.p4type, pOp^.p4.p);
+    if pOp = aOp then Break;
+    Dec(pOp);
+  end;
+  sqlite3DbFree(db, aOp);
+end;
+
+procedure vdbeChangeP4Full(p: PVdbe; pOp: PVdbeOp; zP4: PAnsiChar; n: i32);
+var
+  len: i32;
+begin
+  if pOp^.p4type <> 0 then begin
+    pOp^.p4type := 0;
+    pOp^.p4.p  := nil;
+  end;
+  if n < 0 then begin
+    sqlite3VdbeChangeP4(p, i32(PByte(pOp) - PByte(p^.aOp)) div SizeOf(TVdbeOp),
+                        zP4, n);
+  end else begin
+    if n = 0 then len := sqlite3Strlen30(PChar(zP4))
+    else len := n;
+    pOp^.p4.z  := PAnsiChar(sqlite3DbStrNDup(p^.db, PChar(zP4), u64(len)));
+    pOp^.p4type := P4_DYNAMIC;
+  end;
+end;
+
+procedure sqlite3VdbeChangeP4(p: PVdbe; addr: i32; zP4: PAnsiChar; n: i32);
+var
+  pOp: PVdbeOp;
+  db:  Psqlite3db;
+begin
+  db := p^.db;
+  if vdbeDbMallocFailed(db) then begin
+    if n <> P4_VTAB then freeP4(db, i8(n), Pointer(zP4));
+    Exit;
+  end;
+  if addr < 0 then addr := p^.nOp - 1;
+  pOp := @p^.aOp[addr];
+  if (n >= 0) or (pOp^.p4type <> 0) then begin
+    vdbeChangeP4Full(p, pOp, zP4, n);
+    Exit;
+  end;
+  if n = P4_INT32 then begin
+    pOp^.p4.i   := i32(PtrInt(zP4));
+    pOp^.p4type := P4_INT32;
+  end else if zP4 <> nil then begin
+    pOp^.p4.p   := Pointer(zP4);
+    pOp^.p4type := i8(n);
+  end;
+end;
+
+procedure sqlite3VdbeAppendP4(p: PVdbe; pP4: Pointer; n: i32);
+var
+  pOp: PVdbeOp;
+begin
+  if vdbeDbMallocFailed(p^.db) then begin
+    freeP4(p^.db, i8(n), pP4);
+    Exit;
+  end;
+  pOp := @p^.aOp[p^.nOp - 1];
+  pOp^.p4type := i8(n);
+  pOp^.p4.p  := pP4;
+end;
+
+procedure sqlite3VdbeSetP4KeyInfo(pParse: PParse; pIdx: PIndex);
+begin
+  { Stub — requires Phase 6 (KeyInfo / Index) }
+end;
+
+{ --- Comment helpers (no-ops unless SQLITE_ENABLE_EXPLAIN_COMMENTS) --- }
+
+procedure sqlite3VdbeComment(p: PVdbe; zFormat: PAnsiChar);
+begin
+end;
+
+procedure sqlite3VdbeNoopComment(p: PVdbe; zFormat: PAnsiChar);
+begin
+  if p <> nil then sqlite3VdbeAddOp0(p, OP_Noop);
+end;
+
+procedure sqlite3VdbeSetLineNumber(v: PVdbe; iLine: i32);
+begin
+end;
+
+{ --- Link / query sub-programs --- }
+
+procedure sqlite3VdbeLinkSubProgram(pVdbe: PVdbe; pSub: PSubProgram);
+begin
+  pSub^.pNext   := pVdbe^.pProgram;
+  pVdbe^.pProgram := pSub;
+end;
+
+function sqlite3VdbeHasSubProgram(pVdbe: PVdbe): i32;
+begin
+  if pVdbe^.pProgram <> nil then Result := 1 else Result := 0;
+end;
+
+{ --- Change / delete ops --- }
+
+function sqlite3VdbeChangeToNoop(p: PVdbe; addr: i32): i32;
+var
+  pOp: PVdbeOp;
+begin
+  if vdbeDbMallocFailed(p^.db) then begin Result := 0; Exit; end;
+  pOp := @p^.aOp[addr];
+  freeP4(p^.db, pOp^.p4type, pOp^.p4.p);
+  pOp^.p4type := P4_NOTUSED;
+  pOp^.p4.z  := nil;
+  pOp^.opcode := OP_Noop;
+  Result := 1;
+end;
+
+function sqlite3VdbeDeletePriorOpcode(p: PVdbe; op: u8): i32;
+begin
+  if (p^.nOp > 0) and (p^.aOp[p^.nOp - 1].opcode = op) then
+    Result := sqlite3VdbeChangeToNoop(p, p^.nOp - 1)
+  else
+    Result := 0;
+end;
+
+procedure sqlite3VdbeReleaseRegisters(pParse: PParse; iFirst, nReg, mask: i32;
+                                      bUndefine: i32);
+begin
+  { Debug-only in C; no-op in release port }
+end;
+
+{ --- TakeOpArray (returns the op array and zeroes v->aOp) --- }
+
+function sqlite3VdbeTakeOpArray(p: PVdbe; pnOp: Pi32; pnMaxArg: Pi32): PVdbeOp;
+begin
+  resolveP2Values(p, pnMaxArg);
+  pnOp^ := p^.nOp;
+  Result := p^.aOp;
+  p^.aOp := nil;
+end;
+
+{ --- Explain helpers (stubs) --- }
+
+function sqlite3VdbeExplainParent(pParse: PParse): i32;
 begin
   Result := 0;
 end;
 
-procedure sqlite3VdbeMemInit(pMem: PMem; db: Psqlite3; flags: u16);
+procedure sqlite3ExplainBreakpoint(z1, z2: PAnsiChar);
 begin
-  if pMem <> nil then begin
-    FillChar(pMem^, SizeOf(TMem), 0);
-    pMem^.flags := flags;
-    pMem^.db    := db;
+end;
+
+function sqlite3VdbeExplain(pParse: PParse; bPush: u8; zFmt: PAnsiChar): i32;
+begin
+  Result := 0;
+end;
+
+procedure sqlite3VdbeExplainPop(pParse: PParse);
+begin
+end;
+
+{ --- ParseSchema and EndCoroutine --- }
+
+procedure sqlite3VdbeAddParseSchemaOp(p: PVdbe; iDb: i32; zWhere: PAnsiChar; p5: u16);
+begin
+  sqlite3VdbeAddOp4(p, OP_ParseSchema, iDb, 0, 0, zWhere, P4_DYNAMIC);
+  sqlite3VdbeChangeP5(p, p5);
+end;
+
+procedure sqlite3VdbeEndCoroutine(v: PVdbe; regYield: i32);
+begin
+  sqlite3VdbeAddOp1(v, OP_EndCoroutine, regYield);
+  { Clear temp register cache to give each co-routine its own register set }
+  PByte(v^.pParse)[31] := 0;  { Parse.nTempReg = 0 (offset 31) }
+  Pi32(PByte(v^.pParse) + 44)^ := 0;  { Parse.nRangeReg = 0 (offset 44) }
+end;
+
+{ --- RunOnlyOnce / Reusable --- }
+
+procedure sqlite3VdbeRunOnlyOnce(p: PVdbe);
+begin
+  sqlite3VdbeAddOp2(p, OP_Expire, 1, 1);
+end;
+
+procedure sqlite3VdbeReusable(p: PVdbe);
+var
+  i: i32;
+begin
+  for i := 1 to p^.nOp - 1 do begin
+    if p^.aOp[i].opcode = OP_Expire then begin
+      p^.aOp[1].opcode := OP_Noop;
+      Break;
+    end;
   end;
 end;
 
-procedure sqlite3VdbeMemSetNull(pMem: PMem);
+{ --- Debug assertion stubs --- }
+
+function sqlite3VdbeAssertMayAbort(v: PVdbe; mayAbort: i32): i32;
 begin
-  if pMem <> nil then begin
-    pMem^.flags := MEM_Null;
-    pMem^.z := nil;
-  end;
+  Result := 1;  { always return true in non-debug build }
 end;
 
-procedure sqlite3VdbeMemSetInt64(pMem: PMem; val: i64);
+procedure sqlite3VdbeIncrWriteCounter(p: PVdbe; pC: PVdbeCursor);
 begin
-  if pMem <> nil then begin
-    pMem^.u.i   := val;
-    pMem^.flags := MEM_Int;
-  end;
 end;
 
-procedure sqlite3VdbeMemSetDouble(pMem: PMem; val: Double);
+procedure sqlite3VdbeAssertAbortable(p: PVdbe);
 begin
-  if pMem <> nil then begin
-    pMem^.u.r   := val;
-    pMem^.flags := MEM_Real;
-  end;
 end;
 
-function  sqlite3VdbeMemSetStr(pMem: PMem; z: PAnsiChar; n: i64;
-                               enc: u8; xDel: TxDelProc): i32;
+procedure sqlite3VdbeNoJumpsOutsideSubrtn(v: PVdbe; iFirst, iLast: i32;
+                                          regReturn: i32);
 begin
+end;
+
+procedure sqlite3VdbeVerifyNoMallocRequired(p: PVdbe; N: i32);
+begin
+end;
+
+procedure sqlite3VdbeVerifyNoResultRow(p: PVdbe);
+begin
+end;
+
+procedure sqlite3VdbeVerifyAbortable(p: PVdbe; onError: i32);
+begin
+end;
+
+{ --- Display helpers (stubs — full implementation Phase 5.8 vdbetrace.c) --- }
+
+function sqlite3VdbeDisplayComment(db: Psqlite3; pOp: PVdbeOp; zP4: PAnsiChar): PAnsiChar;
+begin
+  Result := nil;
+end;
+
+function sqlite3VdbeDisplayP4(db: Psqlite3; pOp: PVdbeOp): PAnsiChar;
+begin
+  Result := nil;
+end;
+
+procedure sqlite3VdbeUsesBtree(p: PVdbe; i: i32);
+begin
+  p^.btreeMask := p^.btreeMask or (yDbMask(1) shl i);
+end;
+
+procedure sqlite3VdbeEnter(p: PVdbe);
+begin
+  { mutex acquisition — stub for Phase 5.2; full in Phase 8 }
+end;
+
+procedure sqlite3VdbeLeave(p: PVdbe);
+begin
+end;
+
+procedure sqlite3VdbePrintOp(pOut: Pointer; pc: i32; pOp: PVdbeOp);
+begin
+  { Full implementation is in vdbetrace.c (Phase 5.8) }
+end;
+
+{ --- Frame helpers --- }
+
+function sqlite3VdbeFrameIsValid(pFrame: PVdbeFrame): i32;
+begin
+  if pFrame = nil then Result := 0 else Result := 1;
+end;
+
+procedure sqlite3VdbeFrameMemDel(pArg: Pointer);
+begin
+  { Stub — Phase 5.4 }
+end;
+
+function sqlite3VdbeNextOpcode(p: PVdbe; pSub: PSubProgram; eType: i32;
+                               piSub: Pi32; piAddr: Pi32): PVdbeOp;
+begin
+  { Stub — Phase 5.8 vdbetrace.c }
+  Result := nil;
+end;
+
+procedure sqlite3VdbeFrameDelete(p: PVdbeFrame);
+begin
+  sqlite3DbFree(p^.v^.db, p);
+end;
+
+function sqlite3VdbeFrameRestore(pFrame: PVdbeFrame): i32;
+begin
+  { Stub — Phase 5.4 }
+  Result := 0;
+end;
+
+{ --- VdbeMakeReady / VdbeRewind --- }
+
+procedure sqlite3VdbeRewind(p: PVdbe);
+begin
+  p^.eVdbeState := VDBE_READY_STATE;
+  p^.pc         := -1;
+  p^.rc         := SQLITE_OK;
+  p^.errorAction := OE_Abort;
+  p^.nChange    := 0;
+  p^.cacheCtr   := 1;
+  p^.minWriteFileFormat := 255;
+  p^.iStatement := 0;
+  p^.nFkConstraint := 0;
+end;
+
+procedure sqlite3VdbeMakeReady(p: PVdbe; pParse: PParse);
+var
+  db:      Psqlite3db;
+  nVar:    i32;
+  nMem:    i32;
+  nCursor: i32;
+  nArg:    i32;
+  n:       i32;
+begin
+  db      := p^.db;
+  { read key sizes from Parse (byte offsets) }
+  nVar    := i32(PWord(PByte(pParse) + 120)^);   { Parse.nVar at offset 120? }
+  { Use 0 safely if Parse layout is uncertain — will be replaced in Phase 6 }
+  nVar    := 0;
+  nMem    := 0;
+  nCursor := 0;
+  nArg    := 0;
+
+  n := vdbeParseSzOpAllocPtr(pParse)^;
+  resolveP2Values(p, @nArg);
+
+  p^.vdbeFlags := p^.vdbeFlags and not (VDBF_UsesStmtJournal or VDBF_EXPIRED_MASK);
+
+  { allocate Mem registers if nMem > 0 }
+  if (not vdbeDbMallocFailed(db)) and (nMem > 0) then begin
+    p^.aMem := PMem(sqlite3DbMallocZero(db, u64(nMem) * SizeOf(TMem)));
+    p^.nMem := nMem;
+  end;
+  if (not vdbeDbMallocFailed(db)) and (nCursor > 0) then begin
+    p^.apCsr := PPVdbeCursor(sqlite3DbMallocZero(db,
+                             u64(nCursor) * SizeOf(PVdbeCursor)));
+    p^.nCursor := nCursor;
+  end;
+
+  sqlite3VdbeRewind(p);
+end;
+
+{ --- Cursor management --- }
+
+procedure sqlite3VdbeFreeCursorNN(p: PVdbe; pCx: PVdbeCursor);
+begin
+  case pCx^.eCurType of
+    CURTYPE_BTREE: begin
+      if pCx^.uc.pCursor <> nil then
+        sqlite3BtreeCloseCursor(pCx^.uc.pCursor);
+    end;
+    { CURTYPE_SORTER, CURTYPE_VTAB: defer to Phase 5.7 / 6.bis }
+  end;
+  { The cursor itself is part of aMem space; no free needed }
+end;
+
+procedure sqlite3VdbeFreeCursor(p: PVdbe; pCx: PVdbeCursor);
+begin
+  if pCx <> nil then sqlite3VdbeFreeCursorNN(p, pCx);
+end;
+
+{ --- Column name management --- }
+
+procedure sqlite3VdbeSetNumCols(p: PVdbe; nResColumn: i32);
+begin
+  p^.nResColumn := u16(nResColumn);
+end;
+
+function sqlite3VdbeSetColName(p: PVdbe; idx, var2: i32; zName: PAnsiChar;
+                               xDel: TxDelProc): i32;
+begin
+  { Stub — Phase 5.5 (vdbeapi.c sqlite3_column_name) }
   Result := SQLITE_OK;
 end;
 
-procedure sqlite3VdbeMemRelease(pMem: PMem);
-begin
-end;
+{ --- Statement close --- }
 
-function  sqlite3VdbeMemCopy(pTo: PMem; const pFrom: PMem): i32;
+function sqlite3VdbeCloseStatement(p: PVdbe; eOp: i32): i32;
 begin
-  if (pTo <> nil) and (pFrom <> nil) then
-    Move(pFrom^, pTo^, SizeOf(TMem));
+  { Stub — Phase 5.4 (complex transaction savepoint logic) }
   Result := SQLITE_OK;
 end;
 
-procedure sqlite3VdbeMemShallowCopy(pTo: PMem; const pFrom: PMem; srcType: i32);
+function sqlite3VdbeCheckFkImmediate(p: PVdbe): i32;
 begin
-  if (pTo <> nil) and (pFrom <> nil) then
-    Move(pFrom^, pTo^, SizeOf(TMem));
+  Result := 0;
 end;
 
-function  sqlite3VdbeMemNumerify(pMem: PMem): i32;
+function sqlite3VdbeCheckFkDeferred(p: PVdbe): i32;
 begin
+  Result := 0;
+end;
+
+{ --- VdbeList — EXPLAIN output (stub; Phase 5.8 vdbetrace.c) --- }
+
+function sqlite3VdbeList(v: PVdbe): i32;
+begin
+  Result := SQLITE_DONE;
+end;
+
+procedure sqlite3VdbePrintSql(p: PVdbe);
+begin
+end;
+
+procedure sqlite3VdbeIOTraceSql(p: PVdbe);
+begin
+end;
+
+{ --- VdbeHalt, VdbeReset, VdbeFinalize (Phase 5.4 stubs) --- }
+
+function sqlite3VdbeHalt(v: PVdbe): i32;
+begin
+  { Full implementation is in vdbeaux.c Phase 5.4 }
+  v^.eVdbeState := VDBE_HALT_STATE;
   Result := SQLITE_OK;
 end;
 
-function  sqlite3VdbeIntValue(const pMem: PMem): i64;
+procedure sqlite3VdbeResetStepResult(p: PVdbe);
 begin
-  if pMem = nil then begin Result := 0; Exit; end;
-  if (pMem^.flags and MEM_Int) <> 0 then
-    Result := pMem^.u.i
-  else if (pMem^.flags and MEM_Real) <> 0 then
-    Result := i64(Trunc(pMem^.u.r))
-  else
-    Result := 0;
+  p^.rc := SQLITE_OK;
 end;
 
-function  sqlite3VdbeRealValue(pMem: PMem): Double;
+function sqlite3VdbeTransferError(p: PVdbe): i32;
 begin
-  if pMem = nil then begin Result := 0.0; Exit; end;
-  if (pMem^.flags and MEM_Real) <> 0 then
-    Result := pMem^.u.r
-  else if (pMem^.flags and MEM_Int) <> 0 then
-    Result := Double(pMem^.u.i)
-  else
-    Result := 0.0;
+  Result := p^.rc;
 end;
 
-function  sqlite3VdbeBooleanValue(pMem: PMem; ifNull: i32): i32;
+function sqlite3VdbeReset(p: PVdbe): i32;
 begin
-  if pMem = nil then begin Result := ifNull; Exit; end;
-  if (pMem^.flags and MEM_Null) <> 0 then
-    Result := ifNull
-  else if (pMem^.flags and MEM_Int) <> 0 then
-    Result := ord(pMem^.u.i <> 0)
-  else if (pMem^.flags and MEM_Real) <> 0 then
-    Result := ord(pMem^.u.r <> 0.0)
-  else
-    Result := 0;
+  if p = nil then begin Result := SQLITE_OK; Exit; end;
+  if p^.eVdbeState = VDBE_RUN_STATE then
+    sqlite3VdbeHalt(p);
+  p^.eVdbeState := VDBE_READY_STATE;
+  Result := p^.rc;
 end;
 
-function  sqlite3_step(pStmt: PVdbe): i32;
+function sqlite3VdbeFinalize(p: PVdbe): i32;
+var
+  rc: i32;
 begin
-  Result := SQLITE_MISUSE;
+  if p = nil then begin Result := SQLITE_OK; Exit; end;
+  rc := sqlite3VdbeReset(p);
+  sqlite3VdbeDelete(p);
+  Result := rc;
+end;
+
+{ --- AuxData cleanup --- }
+
+procedure sqlite3VdbeDeleteAuxData(db: Psqlite3; pp: PPAuxData; iOp, mask: i32);
+var
+  pAux: PAuxData;
+begin
+  pAux := pp^;
+  while pAux <> nil do begin
+    pp^   := pAux^.pNextAux;
+    if pAux^.xDeleteAux <> nil then
+      pAux^.xDeleteAux(pAux^.pAux);
+    sqlite3DbFree(db, pAux);
+    pAux := pp^;
+  end;
+end;
+
+{ --- sqlite3VdbeCreate / sqlite3VdbeDelete --- }
+
+function sqlite3VdbeCreate(pParse: PParse): PVdbe;
+var
+  db: Psqlite3db;
+  p:  PVdbe;
+  pPrevVdbe: PPVdbe;
+begin
+  db := vdbeParseDbPtr(pParse);
+  p  := PVdbe(sqlite3DbMallocRawNN(db, SizeOf(TVdbe)));
+  if p = nil then begin Result := nil; Exit; end;
+  { Zero everything from aOp onwards (offsetof(Vdbe,aOp) = 136) }
+  FillChar(PByte(p)[136], SizeOf(TVdbe) - 136, 0);
+  p^.db := db;
+  { Insert into db->pVdbe linked list (db->pVdbe at offset 8) }
+  pPrevVdbe := PPVdbe(PByte(db) + 8);
+  if pPrevVdbe^ <> nil then
+    pPrevVdbe^^.ppVPrev := @p^.pVNext;
+  p^.pVNext := pPrevVdbe^;
+  p^.ppVPrev := pPrevVdbe;
+  pPrevVdbe^ := p;
+  p^.eVdbeState := VDBE_INIT_STATE;
+  p^.pParse := pParse;
+  { pParse->pVdbe at offset 16 }
+  PPVdbe(PByte(pParse) + 16)^ := p;
+  sqlite3VdbeAddOp2(p, OP_Init, 0, 1);
+  Result := p;
+end;
+
+procedure sqlite3VdbeClearObject(db: Psqlite3db; p: PVdbe);
+var
+  pSub:  PSubProgram;
+  pNext: PSubProgram;
+  i:     i32;
+begin
+  { Free sub-programs }
+  pSub := p^.pProgram;
+  while pSub <> nil do begin
+    pNext := pSub^.pNext;
+    vdbeFreeOpArray(db, pSub^.aOp, pSub^.nOp);
+    sqlite3DbFree(db, pSub^.aOnce);
+    sqlite3DbFree(db, pSub);
+    pSub := pNext;
+  end;
+  { Free op array }
+  vdbeFreeOpArray(db, p^.aOp, p^.nOp);
+  { Free col names }
+  if p^.aColName <> nil then
+    sqlite3DbFree(db, p^.aColName);
+  { Free aMem registers }
+  if p^.aMem <> nil then begin
+    for i := 0 to p^.nMem - 1 do begin
+      if (p^.aMem[i].flags and (MEM_Dyn or MEM_Agg)) <> 0 then
+        sqlite3VdbeMemRelease(@p^.aMem[i]);
+    end;
+  end;
+  if p^.pFree <> nil then
+    sqlite3DbFree(db, p^.pFree);
+  sqlite3DbFree(db, p^.zErrMsg);
+  sqlite3DbFree(db, p^.zSql);
+  sqlite3VdbeDeleteAuxData(db, @p^.pAuxData, -1, 0);
+end;
+
+procedure sqlite3VdbeDelete(p: PVdbe);
+var
+  db: Psqlite3db;
+begin
+  if p = nil then Exit;
+  db := p^.db;
+  sqlite3VdbeClearObject(db, p);
+  { Unlink from db->pVdbe list }
+  if p^.ppVPrev <> nil then
+    p^.ppVPrev^ := p^.pVNext;
+  if p^.pVNext <> nil then
+    p^.pVNext^.ppVPrev := p^.ppVPrev;
+  sqlite3DbFree(db, p);
+end;
+
+{ --- Cursor move helpers --- }
+
+function sqlite3VdbeFinishMoveto(p: PVdbeCursor): i32;
+begin
+  { Stub — Phase 5.4 }
+  Result := SQLITE_OK;
+end;
+
+function sqlite3VdbeHandleMovedCursor(p: PVdbeCursor): i32;
+begin
+  { Stub — Phase 5.4 }
+  Result := SQLITE_OK;
+end;
+
+function sqlite3VdbeCursorRestore(p: PVdbeCursor): i32;
+begin
+  { Stub — Phase 5.4 }
+  Result := SQLITE_OK;
+end;
+
+{ --- Misc lifecycle functions --- }
+
+function sqlite3VdbeParser(p: PVdbe): PParse;
+begin
+  Result := p^.pParse;
+end;
+
+procedure sqlite3VdbeError(p: PVdbe; zFormat: PAnsiChar);
+begin
+  { Stub — Phase 5.5 }
+end;
+
+procedure sqlite3VdbeSetSql(p: PVdbe; z: PAnsiChar; n: i32; prepFlags: u8);
+begin
+  if p = nil then Exit;
+  p^.prepFlags := prepFlags;
+  if (prepFlags and SQLITE_PREPARE_SAVESQL) = 0 then
+    p^.expmask := 0;
+  if z <> nil then
+    p^.zSql := PAnsiChar(sqlite3DbStrNDup(p^.db, PChar(z), u64(n)));
+end;
+
+procedure sqlite3VdbeSwap(pA, pB: PVdbe);
+var
+  tmp:  TVdbe;
+  pTmp: PVdbe;
+  ppTmp: PPVdbe;
+  zTmp: PAnsiChar;
+begin
+  tmp := pA^;
+  pA^ := pB^;
+  pB^ := tmp;
+  pTmp        := pA^.pVNext;
+  pA^.pVNext  := pB^.pVNext;
+  pB^.pVNext  := pTmp;
+  ppTmp       := pA^.ppVPrev;
+  pA^.ppVPrev := pB^.ppVPrev;
+  pB^.ppVPrev := ppTmp;
+  zTmp        := pA^.zSql;
+  pA^.zSql    := pB^.zSql;
+  pB^.zSql    := zTmp;
+  pB^.expmask  := pA^.expmask;
+  pB^.prepFlags := pA^.prepFlags;
+  Move(pA^.aCounter, pB^.aCounter, SizeOf(pB^.aCounter));
+  pB^.aCounter[SQLITE_STMTSTATUS_REPREPARE] :=
+    pB^.aCounter[SQLITE_STMTSTATUS_REPREPARE] + 1;
+end;
+
+{ --- Public API stubs (Phase 5.5 vdbeapi.c) --- }
+
+function sqlite3_step(pStmt: PVdbe): i32;
+begin
+  if pStmt = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  Result := sqlite3VdbeExec(pStmt);
 end;
 
 procedure sqlite3_reset(pStmt: PVdbe);
 begin
+  sqlite3VdbeReset(pStmt);
 end;
 
-function  sqlite3_finalize(pStmt: PVdbe): i32;
+function sqlite3_finalize(pStmt: PVdbe): i32;
 begin
-  Result := SQLITE_OK;
+  Result := sqlite3VdbeFinalize(pStmt);
 end;
 
-function  sqlite3VdbeExec(v: PVdbe): i32;
+{ --- Execution engine stub (Phase 5.4 vdbe.c) --- }
+
+function sqlite3VdbeExec(v: PVdbe): i32;
 begin
+  { Full implementation is vdbe.c — Phase 5.4 }
   Result := SQLITE_MISUSE;
 end;
 
-function  sqlite3VdbeHalt(v: PVdbe): i32;
-begin
-  Result := SQLITE_OK;
-end;
+{ ============================================================================
+  Opcode name table (vdbeaux.c sqlite3OpcodeName).
+  Order matches OP_* numeric values 0..191.
+  ============================================================================ }
 
-function  sqlite3VdbeList(v: PVdbe): i32;
-begin
-  Result := SQLITE_OK;
-end;
-
-function  sqlite3OpcodeName(n: i32): PAnsiChar;
+function sqlite3OpcodeName(n: i32): PAnsiChar;
 const
-  { opcode name strings from vdbeaux.c sqlite3OpcodeName().
-    Order matches the OP_* numeric values 0..191. }
   OpcodeNames: array[0..191] of PAnsiChar = (
     'Savepoint',      'AutoCommit',     'Transaction',    'Checkpoint',
     'JournalMode',    'Vacuum',         'VFilter',        'VUpdate',
@@ -1259,34 +2589,120 @@ begin
     Result := '???';
 end;
 
-function  sqlite3VdbeSerialTypeLen(serialType: u32): u32;
-begin
-  if serialType >= 12 then begin
-    if (serialType and 1) = 0 then
-      Result := (serialType - 12) div 2
-    else
-      Result := (serialType - 13) div 2;
-    Exit;
-  end;
-  if serialType < 13 then
-    Result := SMALL_TYPE_SIZES[serialType]
-  else
-    Result := 0;
-end;
+{ ============================================================================
+  vdbemem.c — Mem value type operations (Phase 5.3 stubs)
+  ============================================================================ }
 
-function  sqlite3VdbeOneByteSerialTypeLen(serialType: u8): u8;
+procedure sqlite3VdbeMemInit(pMem: PMem; db: Psqlite3; flags: u16);
 begin
-  if serialType < 13 then
-    Result := SMALL_TYPE_SIZES[serialType]
-  else
-    Result := 0;
-end;
-
-procedure sqlite3VdbeSerialGet(buf: Pu8; serialType: u32; pMem: PMem);
-begin
-  { Stub: full implementation in Phase 5.4 (vdbe.c OP_Column path) }
-  if pMem <> nil then
+  if pMem <> nil then begin
     FillChar(pMem^, SizeOf(TMem), 0);
+    pMem^.flags := flags;
+    pMem^.db    := db;
+  end;
 end;
+
+procedure sqlite3VdbeMemSetNull(pMem: PMem);
+begin
+  if pMem <> nil then begin
+    pMem^.flags := MEM_Null;
+    pMem^.z := nil;
+  end;
+end;
+
+procedure sqlite3VdbeMemSetInt64(pMem: PMem; val: i64);
+begin
+  if pMem <> nil then begin
+    pMem^.u.i   := val;
+    pMem^.flags := MEM_Int;
+  end;
+end;
+
+procedure sqlite3VdbeMemSetDouble(pMem: PMem; val: Double);
+begin
+  if pMem <> nil then begin
+    pMem^.u.r   := val;
+    pMem^.flags := MEM_Real;
+  end;
+end;
+
+function sqlite3VdbeMemSetStr(pMem: PMem; z: PAnsiChar; n: i64;
+                              enc: u8; xDel: TxDelProc): i32;
+begin
+  { Stub — Phase 5.3 }
+  Result := SQLITE_OK;
+end;
+
+procedure sqlite3VdbeMemRelease(pMem: PMem);
+begin
+  if pMem = nil then Exit;
+  if (pMem^.flags and MEM_Dyn) <> 0 then begin
+    if pMem^.xDel <> nil then
+      pMem^.xDel(pMem^.z)
+    else if pMem^.szMalloc > 0 then
+      sqlite3DbFree(pMem^.db, pMem^.zMalloc);
+  end;
+  pMem^.flags := MEM_Undefined;
+  pMem^.z := nil;
+  pMem^.zMalloc := nil;
+  pMem^.szMalloc := 0;
+end;
+
+function sqlite3VdbeMemCopy(pTo: PMem; const pFrom: PMem): i32;
+begin
+  if (pTo <> nil) and (pFrom <> nil) then
+    Move(pFrom^, pTo^, SizeOf(TMem));
+  Result := SQLITE_OK;
+end;
+
+procedure sqlite3VdbeMemShallowCopy(pTo: PMem; const pFrom: PMem; srcType: i32);
+begin
+  if (pTo <> nil) and (pFrom <> nil) then
+    Move(pFrom^, pTo^, SizeOf(TMem));
+end;
+
+function sqlite3VdbeMemNumerify(pMem: PMem): i32;
+begin
+  { Stub — Phase 5.3 }
+  Result := SQLITE_OK;
+end;
+
+function sqlite3VdbeIntValue(const pMem: PMem): i64;
+begin
+  if pMem = nil then begin Result := 0; Exit; end;
+  if (pMem^.flags and MEM_Int) <> 0 then
+    Result := pMem^.u.i
+  else if (pMem^.flags and MEM_Real) <> 0 then
+    Result := i64(Trunc(pMem^.u.r))
+  else
+    Result := 0;
+end;
+
+function sqlite3VdbeRealValue(pMem: PMem): Double;
+begin
+  if pMem = nil then begin Result := 0.0; Exit; end;
+  if (pMem^.flags and MEM_Real) <> 0 then
+    Result := pMem^.u.r
+  else if (pMem^.flags and MEM_Int) <> 0 then
+    Result := Double(pMem^.u.i)
+  else
+    Result := 0.0;
+end;
+
+function sqlite3VdbeBooleanValue(pMem: PMem; ifNull: i32): i32;
+begin
+  if pMem = nil then begin Result := ifNull; Exit; end;
+  if (pMem^.flags and MEM_Null) <> 0 then
+    Result := ifNull
+  else if (pMem^.flags and MEM_Int) <> 0 then
+    Result := ord(pMem^.u.i <> 0)
+  else if (pMem^.flags and MEM_Real) <> 0 then
+    Result := ord(pMem^.u.r <> 0.0)
+  else
+    Result := 0;
+end;
+
+initialization
+  FillChar(gVdbeOpDummy, SizeOf(TVdbeOp), 0);
 
 end.

@@ -1066,9 +1066,25 @@ estimate**.
     identical offsets to GCC.
   - All 337 TestBtreeCompat + pager/WAL tests still PASS (2026-04-24).
 
-- [ ] **5.2** Port `vdbeaux.c`: program assembly (`sqlite3VdbeAddOp*`), label
+- [X] **5.2** Port `vdbeaux.c`: program assembly (`sqlite3VdbeAddOp*`), label
   resolution, final VDBE program layout. Gate: given a hand-written VDBE
   program, Pascal and C produce identical `Op[]` arrays.
+  - Ported to `src/passqlite3vdbe.pas` (2756 lines, Phase 5.2 implementation
+    section). All vdbeaux.c public functions present: AddOp0/1/2/3/4/4Int,
+    MakeLabel, ResolveLabel, resolveP2Values, ChangeP1/2/3/4/5, GetOp,
+    GetLastOp, JumpHere, VdbeCreate, VdbeClearObject, VdbeDelete, VdbeSwap,
+    VdbeMakeReady, VdbeRewind, SerialTypeLen, OneByteSerialTypeLen,
+    SerialGet, SerialPut, SerialType, OpcodeName.
+  - **Bug fixed**: `sqlite3VdbeSerialPut` — C's fall-through `switch` for
+    big-endian integer/float serialization translated incorrectly as a Pascal
+    `case` (no fall-through). Fixed by converting to an explicit downward loop.
+  - **New helper added**: `sqlite3_realloc64` declared in `passqlite3os.pas`
+    (maps to libc `realloc` with u64 size, same as `sqlite3_malloc64`).
+  - **Bitfield access fixed**: `TVdbe.readOnly`/`bIsReader` fields accessed via
+    `vdbeFlags` u32 with VDBF_ReadOnly / VDBF_IsReader bit-mask constants.
+  - **varargs removed**: `cdecl; varargs` dropped from all stub implementations
+    (FPC only allows `varargs` on `external` declarations).
+  - Gate: TestVdbeAux T1–T17 all PASS (108/108 checks, 2026-04-24).
 
 - [ ] **5.3** Port `vdbemem.c`: the `Mem` type's value coercion and storage.
   Many subtle corner cases (type affinity, text encoding conversion).

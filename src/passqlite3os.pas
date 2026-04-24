@@ -54,6 +54,7 @@ uses
 function  sqlite3_malloc(n: i32): Pointer; external 'c' name 'malloc';
 function  sqlite3_malloc64(n: u64): Pointer; external 'c' name 'malloc';
 function  sqlite3_realloc(p: Pointer; n: i32): Pointer; external 'c' name 'realloc';
+function  sqlite3_realloc64(p: Pointer; n: u64): Pointer; external 'c' name 'realloc';
 procedure sqlite3_free(p: Pointer); external 'c' name 'free';
 function  libc_calloc(nmemb, size: csize_t): Pointer; external 'c' name 'calloc';
 

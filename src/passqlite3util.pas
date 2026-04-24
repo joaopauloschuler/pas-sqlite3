@@ -361,6 +361,9 @@ procedure sqlite3DbFree(db: Psqlite3db; p: Pointer);
 procedure sqlite3DbFreeNN(db: Psqlite3db; p: Pointer);
 function  sqlite3DbStrDup(db: Psqlite3db; z: PChar): PChar;
 function  sqlite3DbStrNDup(db: Psqlite3db; z: PChar; n: u64): PChar;
+function  sqlite3DbRealloc(db: Psqlite3db; p: Pointer; n: u64): Pointer;
+function  sqlite3DbMallocSize(db: Psqlite3db; p: Pointer): i32;
+function  sqlite3DbReallocOrFree(db: Psqlite3db; p: Pointer; n: u64): Pointer;
 procedure sqlite3OomFault(db: Psqlite3db);
 procedure sqlite3OomClear(db: Psqlite3db);
 function  sqlite3ApiExit(db: Psqlite3db; rc: i32): i32;
@@ -1698,6 +1701,22 @@ begin
     p[n] := #0;
   end;
   Result := p;
+end;
+
+function sqlite3DbRealloc(db: Psqlite3db; p: Pointer; n: u64): Pointer;
+begin
+  Result := sqlite3_realloc64(p, n);
+end;
+
+function sqlite3DbMallocSize(db: Psqlite3db; p: Pointer): i32;
+begin
+  Result := sqlite3MallocSize(p);
+end;
+
+function sqlite3DbReallocOrFree(db: Psqlite3db; p: Pointer; n: u64): Pointer;
+begin
+  Result := sqlite3_realloc64(p, n);
+  if Result = nil then sqlite3_free(p);
 end;
 
 procedure sqlite3OomFault(db: Psqlite3db);
