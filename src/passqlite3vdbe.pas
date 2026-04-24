@@ -2465,8 +2465,21 @@ procedure sqlite3VdbeFreeCursorNN(p: PVdbe; pCx: PVdbeCursor);
 begin
   case pCx^.eCurType of
     CURTYPE_BTREE: begin
-      if pCx^.uc.pCursor <> nil then
-        sqlite3BtreeCloseCursor(pCx^.uc.pCursor);
+      if (pCx^.cursorFlags and VDBC_Ephemeral) <> 0 then begin
+        { Ephemeral table: owner cursor (noReuse=0) closes the whole Btree;
+          shared/dup cursor (noReuse=1) only closes its own BtCursor. }
+        if (pCx^.cursorFlags and VDBC_NoReuse) = 0 then begin
+          if pCx^.ub.pBtx <> nil then
+            sqlite3BtreeClose(pCx^.ub.pBtx);
+          { BtCursor closed automatically by BtreeClose }
+        end else begin
+          if pCx^.uc.pCursor <> nil then
+            sqlite3BtreeCloseCursor(pCx^.uc.pCursor);
+        end;
+      end else begin
+        if pCx^.uc.pCursor <> nil then
+          sqlite3BtreeCloseCursor(pCx^.uc.pCursor);
+      end;
     end;
     { CURTYPE_SORTER, CURTYPE_VTAB: defer to Phase 5.7 / 6.bis }
   end;
@@ -4075,6 +4088,9 @@ var
   resd:    i32;           { OP_Eq/.../Ge: compare result }
   res2d:   i32;           { OP_Eq/.../Ge: jump decision }
   affd:    u8;            { OP_Eq/.../Ge: affinity byte }
+  { 5.4i locals — ephemeral / pseudo cursor open }
+  pgnoEph: Pgno;          { OP_OpenEphemeral: CreateTable result page number }
+  pOrig:   PVdbeCursor;   { OP_OpenDup: original (source) cursor }
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -6073,6 +6089,128 @@ begin
       rc := sqlite3BtreeIsEmpty(pCrsr, @res);
       if rc <> SQLITE_OK then goto abort_due_to_error;
       if res <> 0 then goto jump_to_p2;
+    end;
+
+    { ────── OP_ReopenIdx ────── (vdbe.c:4386) }
+    { Reopen cursor P1 on index root P2 in database P3.  If the cursor is
+      already open on the correct root page, clear it and reuse it; otherwise
+      open a fresh read-only b-tree cursor (equivalent to OP_OpenRead). }
+    OP_ReopenIdx: begin
+      pCur := v^.apCsr[pOp^.p1];
+      if (pCur <> nil) and (pCur^.pgnoRoot = u32(pOp^.p2)) then begin
+        sqlite3BtreeClearCursor(pCur^.uc.pCursor);
+        pCur^.nullRow     := 1;
+        pCur^.cacheStatus := CACHE_STALE;
+        goto open_cursor_set_hints;
+      end;
+      { Root-page mismatch — open a new read cursor, mirroring OP_OpenRead }
+      nField   := 0;
+      pKInfo   := nil;
+      p2       := u32(pOp^.p2);
+      iDb      := pOp^.p3;
+      pDbb     := @db^.aDb[iDb];
+      pX       := PBtree(pDbb^.pBt);
+      if pOp^.p4type = P4_KEYINFO then begin
+        pKInfo := pOp^.p4.pKeyInfo;
+        nField := i32(Pu16(Pu8(pKInfo) + 8)^);
+      end else if pOp^.p4type = P4_INT32 then begin
+        nField := pOp^.p4.i;
+      end;
+      pCur := allocateCursor(v, pOp^.p1, nField, CURTYPE_BTREE);
+      if pCur = nil then goto no_mem;
+      pCur^.iDb         := iDb;
+      pCur^.nullRow     := 1;
+      pCur^.cursorFlags := pCur^.cursorFlags or VDBC_Ordered;
+      pCur^.pgnoRoot    := p2;
+      rc := sqlite3BtreeCursor(pX, p2, 0 { read-only }, pKInfo,
+                               pCur^.uc.pCursor);
+      pCur^.pKeyInfo := pKInfo;
+      pCur^.isTable  := u8(ord(pOp^.p4type <> P4_KEYINFO));
+      goto open_cursor_set_hints;
+    end;
+
+    { ────── OP_OpenEphemeral / OP_OpenAutoindex ────── (vdbe.c:4500) }
+    { Open a new cursor P1 pointing to a transient table (OP_OpenEphemeral)
+      or a transient auto-index (OP_OpenAutoindex).  P2 is the number of
+      fields.  P4, if present and of type P4_KEYINFO, gives the key
+      comparator for an index table; when P4 is absent the cursor is a
+      regular integer-key (rowid) table.  P5 may be 0 or BTREE_PREFORMAT. }
+    OP_OpenEphemeral,
+    OP_OpenAutoindex: begin
+      pgnoEph := 0;
+      pCur := allocateCursor(v, pOp^.p1, pOp^.p2, CURTYPE_BTREE);
+      if pCur = nil then goto no_mem;
+      pCur^.nullRow     := 1;
+      pCur^.cursorFlags := pCur^.cursorFlags or VDBC_Ephemeral;
+      pCur^.pKeyInfo    := pOp^.p4.pKeyInfo;
+      rc := sqlite3BtreeOpen(
+        Psqlite3_vfs(db^.pVfs), nil, db, @pCur^.ub.pBtx,
+        BTREE_OMIT_JOURNAL or BTREE_SINGLE or pOp^.p5,
+        SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE or
+        SQLITE_OPEN_EXCLUSIVE or SQLITE_OPEN_DELETEONCLOSE or
+        SQLITE_OPEN_TEMP_DB);
+      if rc = SQLITE_OK then
+        rc := sqlite3BtreeBeginTrans(pCur^.ub.pBtx, 1, nil);
+      if rc = SQLITE_OK then begin
+        if pCur^.pKeyInfo <> nil then begin
+          { Index table: create a BLOB-key table and open a cursor on it }
+          rc := sqlite3BtreeCreateTable(pCur^.ub.pBtx, @pgnoEph,
+                                        BTREE_BLOBKEY);
+          if rc = SQLITE_OK then begin
+            rc := sqlite3BtreeCursor(pCur^.ub.pBtx, pgnoEph, BTREE_WRCSR,
+                                     pCur^.pKeyInfo, pCur^.uc.pCursor);
+            pCur^.isTable := 0;
+          end;
+        end else begin
+          { Rowid table: use the auto-created table at SCHEMA_ROOT+1 }
+          rc := sqlite3BtreeCursor(pCur^.ub.pBtx, SCHEMA_ROOT + 1,
+                                   BTREE_WRCSR, nil, pCur^.uc.pCursor);
+          pCur^.isTable := 1;
+        end;
+      end;
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+      pCur^.pgnoRoot := pCur^.uc.pCursor^.pgnoRoot;
+    end;
+
+    { ────── OP_OpenPseudo ────── (vdbe.c:4590) }
+    { Open a new cursor P1 backed by the register P3 (which holds a serialised
+      row).  P2 is the number of fields.  When P3 is non-zero the cursor is an
+      index-format pseudo-cursor (isTable=0); when P3 is zero it is a rowid
+      pseudo-cursor (isTable=1).
+      Pascal note: seekResult stores P3 (the register index) so that
+      OP_Column can read the row with  pRegCol := @aMem[pCx^.seekResult]. }
+    OP_OpenPseudo: begin
+      pCur := allocateCursor(v, pOp^.p1, pOp^.p2, CURTYPE_PSEUDO);
+      if pCur = nil then goto no_mem;
+      pCur^.nullRow    := 1;
+      pCur^.seekResult := pOp^.p3;           { register holding the row }
+      pCur^.isTable    := u8(ord(pOp^.p3 = 0));
+    end;
+
+    { ────── OP_OpenDup ────── (vdbe.c:4600) }
+    { Open a new cursor P1 that is a duplicate of the ephemeral cursor P2.
+      Both cursors share the same underlying Btree; neither cursor "owns" the
+      Btree in the sense that neither is responsible for closing it (both have
+      VDBC_NoReuse set).  A fresh BtCursor is opened on the shared Btree so
+      that the two cursors can move independently. }
+    OP_OpenDup: begin
+      pOrig := v^.apCsr[pOp^.p2];
+      pCur  := allocateCursor(v, pOp^.p1, pOrig^.nField, CURTYPE_BTREE);
+      if pCur = nil then goto no_mem;
+      pCur^.nullRow     := 1;
+      pCur^.cursorFlags := pCur^.cursorFlags or VDBC_Ephemeral;
+      if (pOrig^.cursorFlags and VDBC_Ordered) <> 0 then
+        pCur^.cursorFlags := pCur^.cursorFlags or VDBC_Ordered;
+      pCur^.pKeyInfo    := pOrig^.pKeyInfo;
+      pCur^.isTable     := pOrig^.isTable;
+      pCur^.pgnoRoot    := pOrig^.pgnoRoot;
+      pCur^.ub.pBtx     := pOrig^.ub.pBtx;
+      { Mark both as shared so FreeCursor does not close the Btree }
+      pCur^.cursorFlags  := pCur^.cursorFlags  or VDBC_NoReuse;
+      pOrig^.cursorFlags := pOrig^.cursorFlags or VDBC_NoReuse;
+      rc := sqlite3BtreeCursor(pCur^.ub.pBtx, pCur^.pgnoRoot, BTREE_WRCSR,
+                               pCur^.pKeyInfo, pCur^.uc.pCursor);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
     end;
 
     { ────── OP_RowData ────── (vdbe.c:6104) }
