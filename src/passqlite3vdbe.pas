@@ -545,7 +545,7 @@ type
   PVList    = Pointer;  { VList (int array) — Phase 6 }
   PVTable   = Pointer;  { VTable   — Phase 6.bis (vtab.c) }
   Psqlite3_vtab_cursor = Pointer;  { vtab cursor — Phase 6.bis }
-  PVdbeSorter = Pointer;           { VdbeSorter  — Phase 5.7 (vdbesort.c) }
+  PVdbeSorter = ^TVdbeSorter;      { VdbeSorter  — Phase 5.7 (vdbesort.c) }
 
   { -----------------------------------------------------------------------
     Pointer forward declarations for VDBE types — mutual references require
@@ -1043,6 +1043,44 @@ type
     pTab:    Pointer;      { Table* (Phase 6) }
   end;
 
+  { -----------------------------------------------------------------------
+    Phase 5.7 — vdbesort.c external sorter types.
+    Full implementations of PmaReader, MergeEngine, SortSubtask, and
+    SorterRecord are deferred to Phase 7 (SQL compiler available).
+    We define TVdbeSorter with the fields needed by the stub public API.
+    ----------------------------------------------------------------------- }
+
+  TSorterFile = record
+    pFd:  Pointer;         { sqlite3_file* }
+    iEof: i64;             { bytes of data stored in pFd }
+  end;
+
+  TSorterList = record
+    pList:   Pointer;      { SorterRecord* linked list }
+    aMemory: Pu8;          { bulk memory for pList (nil if individual allocs) }
+    szPMA:   i64;          { size of pList as PMA in bytes }
+  end;
+
+  TVdbeSorter = record
+    mnPmaSize:   i32;      { minimum PMA size, in bytes }
+    mxPmaSize:   i32;      { maximum PMA size, in bytes; 0=no limit }
+    mxKeysize:   i32;      { largest serialised key seen so far }
+    pgsz:        i32;      { main database page size }
+    pReader:     Pointer;  { PmaReader* — read data after Rewind() }
+    pMerger:     Pointer;  { MergeEngine* — used when bUseThreads=0 }
+    db:          PTsqlite3; { database connection }
+    pKeyInfo:    PKeyInfo; { how to compare records }
+    pUnpacked:   Pointer;  { UnpackedRecord* — used by VdbeSorterCompare }
+    list:        TSorterList; { in-memory record list }
+    iMemory:     i32;      { offset of free space in list.aMemory }
+    nMemory:     i32;      { size of list.aMemory allocation }
+    bUsePMA:     u8;       { true if one or more PMAs created }
+    bUseThreads: u8;       { true to use background threads }
+    iPrev:       u8;       { previous thread used to flush PMA }
+    nTask:       u8;       { size of aTask array }
+    typeMask:    u8;       { SORTER_TYPE_INTEGER|TEXT mask }
+  end;
+
 { ============================================================================
   vdbeaux.c — program assembly, lifecycle, serial types (Phase 5.2)
   vdbemem.c  — Mem value type (Phase 5.3)
@@ -1302,6 +1340,22 @@ function  sqlite3_blob_write(pBlob: Psqlite3_blob; z: Pointer;
                              n: i32; iOffset: i32): i32;
 function  sqlite3_blob_bytes(pBlob: Psqlite3_blob): i32;
 function  sqlite3_blob_reopen(pBlob: Psqlite3_blob; iRow: i64): i32;
+
+{ --- vdbetrace.c — EXPLAIN SQL expander (Phase 5.8) --- }
+function sqlite3VdbeExpandSql(p: PVdbe; zRawSql: PAnsiChar): PAnsiChar;
+
+{ --- vdbesort.c — external sorter (Phase 5.7) --- }
+function  sqlite3VdbeSorterInit(db: PTsqlite3; nField: i32;
+                                pCsr: PVdbeCursor): i32;
+procedure sqlite3VdbeSorterReset(db: PTsqlite3; pSorter: PVdbeSorter);
+procedure sqlite3VdbeSorterClose(db: PTsqlite3; pCsr: PVdbeCursor);
+function  sqlite3VdbeSorterWrite(pCsr: PVdbeCursor; pVal: PMem): i32;
+function  sqlite3VdbeSorterRewind(pCsr: PVdbeCursor; out pbEof: i32): i32;
+function  sqlite3VdbeSorterNext(db: PTsqlite3; pCsr: PVdbeCursor): i32;
+function  sqlite3VdbeSorterRowkey(pCsr: PVdbeCursor; pOut: PMem): i32;
+function  sqlite3VdbeSorterCompare(pCsr: PVdbeCursor; bOmitRowid: i32;
+                                   pKey: Pointer; nKey: i32;
+                                   out pRes: i32): i32;
 
 { --- vdbe.c — execution engine (Phase 5.4) --- }
 function  sqlite3VdbeExec(v: PVdbe): i32;
@@ -3148,6 +3202,140 @@ begin
   if pBlob = nil then begin Result := SQLITE_MISUSE; Exit; end;
   if pBlob^.pStmt = nil then begin Result := SQLITE_ABORT; Exit; end;
   { blobSeekToRow requires SQL compiler (Phase 7+) }
+  Result := SQLITE_ERROR;
+end;
+
+{ ============================================================================
+  Phase 5.8 — vdbetrace.c EXPLAIN SQL expander
+
+  sqlite3VdbeExpandSql expands bound parameters in zRawSql for tracing.
+  Full implementation requires sqlite3GetToken (Phase 7 tokenizer).
+  This stub returns a heap-allocated copy of the raw SQL, which is correct
+  when there are no bound parameters (nVar=0) and is a safe degraded result
+  otherwise (the trace shows unexpanded SQL instead of crashing).
+  ============================================================================ }
+
+function sqlite3VdbeExpandSql(p: PVdbe; zRawSql: PAnsiChar): PAnsiChar;
+var
+  n:   i32;
+  db:  PTsqlite3;
+  z:   PAnsiChar;
+begin
+  if (p = nil) or (zRawSql = nil) then begin Result := nil; Exit; end;
+  db := PTsqlite3(p^.db);
+  n := sqlite3Strlen30(zRawSql);
+  z := PAnsiChar(sqlite3DbMallocZero(db, n + 1));
+  if z <> nil then
+    Move(zRawSql^, z^, n);
+  Result := z;
+end;
+
+{ ============================================================================
+  Phase 5.7 — vdbesort.c external sorter stubs
+
+  Full implementation requires KeyInfo/UnpackedRecord (Phase 6+) and the
+  PmaReader / MergeEngine / SortSubtask subsystems. The public functions
+  handle nil-guard and state-check behavior correctly; the actual sort logic
+  is deferred until ORDER BY opcodes are active (Phase 6.bis onward).
+  ============================================================================ }
+
+function sqlite3VdbeSorterInit(db: PTsqlite3; nField: i32;
+                               pCsr: PVdbeCursor): i32;
+var
+  pSorter: PVdbeSorter;
+begin
+  if pCsr = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  { Cannot sort without KeyInfo — Phase 6+ }
+  if pCsr^.pKeyInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+  pSorter := PVdbeSorter(sqlite3DbMallocZero(db, SizeOf(TVdbeSorter)));
+  if pSorter = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  pSorter^.db       := db;
+  pSorter^.pKeyInfo := pCsr^.pKeyInfo;
+  pSorter^.nTask    := 1;
+  pSorter^.pgsz     := 4096;
+  pCsr^.uc.pSorter  := pSorter;
+  Result := SQLITE_OK;
+end;
+
+procedure sqlite3VdbeSorterReset(db: PTsqlite3; pSorter: PVdbeSorter);
+var
+  pRec, pNext: Pointer;
+begin
+  if pSorter = nil then Exit;
+  { Free in-memory record list if individually allocated (aMemory=nil) }
+  if pSorter^.list.aMemory = nil then begin
+    pRec := pSorter^.list.pList;
+    while pRec <> nil do begin
+      pNext := PPointer(pRec)^;  { SorterRecord.u.pNext at offset 0 }
+      sqlite3DbFree(db, pRec);
+      pRec := pNext;
+    end;
+  end else begin
+    sqlite3DbFree(db, pSorter^.list.aMemory);
+    pSorter^.list.aMemory := nil;
+  end;
+  pSorter^.list.pList := nil;
+  pSorter^.list.szPMA := 0;
+  pSorter^.bUsePMA    := 0;
+end;
+
+procedure sqlite3VdbeSorterClose(db: PTsqlite3; pCsr: PVdbeCursor);
+var
+  pSorter: PVdbeSorter;
+begin
+  if pCsr = nil then Exit;
+  pSorter := pCsr^.uc.pSorter;
+  if pSorter <> nil then begin
+    sqlite3VdbeSorterReset(db, pSorter);
+    sqlite3DbFree(db, pSorter);
+    pCsr^.uc.pSorter := nil;
+  end;
+end;
+
+function sqlite3VdbeSorterWrite(pCsr: PVdbeCursor; pVal: PMem): i32;
+begin
+  if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  { Full in-memory insertion requires UnpackedRecord (Phase 6+) }
+  Result := SQLITE_ERROR;
+end;
+
+function sqlite3VdbeSorterRewind(pCsr: PVdbeCursor; out pbEof: i32): i32;
+begin
+  pbEof := 1;
+  if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  { Rewind requires sort + PMA merge (Phase 6+) }
+  Result := SQLITE_ERROR;
+end;
+
+function sqlite3VdbeSorterNext(db: PTsqlite3; pCsr: PVdbeCursor): i32;
+begin
+  if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  Result := SQLITE_DONE;
+end;
+
+function sqlite3VdbeSorterRowkey(pCsr: PVdbeCursor; pOut: PMem): i32;
+begin
+  if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3VdbeMemSetNull(pOut);
+  Result := SQLITE_ERROR;
+end;
+
+function sqlite3VdbeSorterCompare(pCsr: PVdbeCursor; bOmitRowid: i32;
+                                  pKey: Pointer; nKey: i32;
+                                  out pRes: i32): i32;
+begin
+  pRes := 0;
+  if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
   Result := SQLITE_ERROR;
 end;
 

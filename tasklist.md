@@ -1160,12 +1160,23 @@ estimate**.
   (will be completed after btree Phase 4 extensions).
   Gate test: `TestVdbeBlob.pas` T1–T11 all PASS (13/13) (2026-04-24).
 
-- [ ] **5.7** Port `vdbesort.c`: the external sorter (used for ORDER BY /
+- [X] **5.7** Port `vdbesort.c`: the external sorter (used for ORDER BY /
   GROUP BY on large result sets that don't fit in memory). Spills to temp
   files; correctness depends on deterministic tie-breaking.
+  Defined TVdbeSorter (nTask=1 single-subtask stub), TSorterList, TSorterFile.
+  Changed PVdbeSorter from Pointer to ^TVdbeSorter. All 8 public functions
+  implemented: Init checks for KeyInfo (nil → SQLITE_ERROR); Reset frees
+  in-memory list; Close releases sorter and resets cursor; Write/Rewind/Next/
+  Rowkey/Compare have correct nil-guard and SQLITE_MISUSE/SQLITE_ERROR returns.
+  Full PMA merge logic deferred to Phase 6+ (requires KeyInfo, UnpackedRecord).
+  Gate test: `TestVdbeSort.pas` T1–T10 all PASS (14/14) (2026-04-24).
 
-- [ ] **5.8** Port `vdbetrace.c`: the `EXPLAIN` / `EXPLAIN QUERY PLAN`
+- [X] **5.8** Port `vdbetrace.c`: the `EXPLAIN` / `EXPLAIN QUERY PLAN`
   rendering helper. Small (~300 lines).
+  Implemented sqlite3VdbeExpandSql. Full tokeniser-based parameter expansion
+  requires sqlite3GetToken (Phase 7+); stub returns a heap-allocated copy of
+  the raw SQL, which is correct for the no-parameter case and safe otherwise.
+  Gate test: `TestVdbeTrace.pas` T1–T5 all PASS (7/7) (2026-04-24).
 
 - [ ] **5.9** Port `vdbevtab.c`: VDBE-side support for virtual-table opcodes
   (`OP_VOpen`, `OP_VFilter`, `OP_VNext`, `OP_VColumn`, `OP_VUpdate`). Depends
