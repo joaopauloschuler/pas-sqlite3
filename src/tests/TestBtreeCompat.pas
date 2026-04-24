@@ -29,7 +29,8 @@ uses
   passqlite3os,
   passqlite3pcache,
   passqlite3pager,
-  passqlite3btree;
+  passqlite3btree,
+  csqlite3;
 
 { ===== helpers ============================================================= }
 
@@ -1120,11 +1121,637 @@ begin
   if FileExists(DB28) then DeleteFile(DB28);
 end;
 
+{ ===========================================================================
+  T29: sorted ascending corpus — 500 rows, write + close + reopen + scan
+  =========================================================================== }
+procedure RunT29;
+const
+  DB29 = '/tmp/bt_t29.db';
+  N    = 500;
+var
+  pBtr  : PBtree;
+  cur   : TBtCursor;
+  rc    : i32;
+  iRoot : Pgno;
+  pX    : TBtreePayload;
+  i     : i32;
+  pRes  : i32;
+  cnt   : i64;
+  lastK : i64;
+  data  : array[0..7] of u8;
+begin
+  WriteLn('T29: sorted ascending corpus (N=', N, ') write+reopen+scan');
+  if FileExists(DB29) then DeleteFile(DB29);
+
+  { --- write phase --- }
+  rc := OpenTempBtree(DB29, pBtr);
+  Check('T29 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+  Check('T29 begin-write', rc = SQLITE_OK);
+  iRoot := 0;
+  rc := sqlite3BtreeCreateTable(pBtr, @iRoot, BTREE_INTKEY or BTREE_LEAFDATA);
+  Check('T29 createTable', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 1, nil, @cur);
+  Check('T29 cursor', rc = SQLITE_OK);
+  for i := 1 to N do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey  := i64(i);
+    data[0]  := u8(i and $FF);
+    data[1]  := u8((i shr 8) and $FF);
+    pX.pData := @data[0];
+    pX.nData := 8;
+    rc := sqlite3BtreeInsert(@cur, @pX, BTREE_APPEND, 0);
+    if rc <> SQLITE_OK then begin
+      Check('T29 insert ' + IntToStr(i), False);
+      break;
+    end;
+  end;
+  if rc = SQLITE_OK then Check('T29 insert 1..N all ok', True);
+  sqlite3BtreeCloseCursor(@cur);
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T29 commit', rc = SQLITE_OK);
+  sqlite3BtreeClose(pBtr);
+
+  { --- re-read phase --- }
+  rc := OpenTempBtree(DB29, pBtr);
+  Check('T29 reopen', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then begin if FileExists(DB29) then DeleteFile(DB29); Exit; end;
+  rc := sqlite3BtreeBeginTrans(pBtr, 0, nil);
+  Check('T29 begin-read', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 0, nil, @cur);
+  Check('T29 read cursor', rc = SQLITE_OK);
+  pRes := -1;
+  rc   := sqlite3BtreeFirst(@cur, @pRes);
+  Check('T29 First rc=OK', rc = SQLITE_OK);
+  cnt   := 0;
+  lastK := 0;
+  while (rc = SQLITE_OK) and (pRes = 0) do begin
+    lastK := sqlite3BtreeIntegerKey(@cur);
+    Inc(cnt);
+    rc := sqlite3BtreeNext(@cur, 0);
+    if rc = SQLITE_DONE then begin rc := SQLITE_OK; pRes := 1; end;
+  end;
+  Check('T29 count=N', cnt = N);
+  Check('T29 last key=N', lastK = N);
+  sqlite3BtreeCloseCursor(@cur);
+  sqlite3BtreeRollback(pBtr, SQLITE_OK, 0);
+  sqlite3BtreeClose(pBtr);
+  if FileExists(DB29) then DeleteFile(DB29);
+end;
+
+{ ===========================================================================
+  T30: sorted descending corpus — 500 rows inserted 500..1, re-read in order
+  =========================================================================== }
+procedure RunT30;
+const
+  DB30 = '/tmp/bt_t30.db';
+  N    = 500;
+var
+  pBtr  : PBtree;
+  cur   : TBtCursor;
+  rc    : i32;
+  iRoot : Pgno;
+  pX    : TBtreePayload;
+  i     : i32;
+  pRes  : i32;
+  cnt   : i64;
+  firstK: i64;
+  lastK : i64;
+  data  : array[0..7] of u8;
+begin
+  WriteLn('T30: sorted descending corpus (N=', N, ') insert 500..1, re-read in order');
+  if FileExists(DB30) then DeleteFile(DB30);
+
+  rc := OpenTempBtree(DB30, pBtr);
+  Check('T30 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+  Check('T30 begin-write', rc = SQLITE_OK);
+  iRoot := 0;
+  rc := sqlite3BtreeCreateTable(pBtr, @iRoot, BTREE_INTKEY or BTREE_LEAFDATA);
+  Check('T30 createTable', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 1, nil, @cur);
+  Check('T30 cursor', rc = SQLITE_OK);
+  for i := N downto 1 do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey  := i64(i);
+    data[0]  := u8(i and $FF);
+    pX.pData := @data[0];
+    pX.nData := 8;
+    rc := sqlite3BtreeInsert(@cur, @pX, 0, 0);  { no BTREE_APPEND: reverse order }
+    if rc <> SQLITE_OK then begin
+      Check('T30 insert ' + IntToStr(i), False);
+      break;
+    end;
+  end;
+  if rc = SQLITE_OK then Check('T30 insert N..1 all ok', True);
+  sqlite3BtreeCloseCursor(@cur);
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T30 commit', rc = SQLITE_OK);
+  sqlite3BtreeClose(pBtr);
+
+  rc := OpenTempBtree(DB30, pBtr);
+  Check('T30 reopen', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then begin if FileExists(DB30) then DeleteFile(DB30); Exit; end;
+  rc := sqlite3BtreeBeginTrans(pBtr, 0, nil);
+  Check('T30 begin-read', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 0, nil, @cur);
+  Check('T30 read cursor', rc = SQLITE_OK);
+  pRes  := -1;
+  rc    := sqlite3BtreeFirst(@cur, @pRes);
+  Check('T30 First rc=OK', rc = SQLITE_OK);
+  cnt    := 0;
+  firstK := 0;
+  lastK  := 0;
+  while (rc = SQLITE_OK) and (pRes = 0) do begin
+    if cnt = 0 then firstK := sqlite3BtreeIntegerKey(@cur);
+    lastK := sqlite3BtreeIntegerKey(@cur);
+    Inc(cnt);
+    rc := sqlite3BtreeNext(@cur, 0);
+    if rc = SQLITE_DONE then begin rc := SQLITE_OK; pRes := 1; end;
+  end;
+  Check('T30 count=N', cnt = N);
+  Check('T30 first key=1', firstK = 1);
+  Check('T30 last key=N', lastK = N);
+  sqlite3BtreeCloseCursor(@cur);
+  sqlite3BtreeRollback(pBtr, SQLITE_OK, 0);
+  sqlite3BtreeClose(pBtr);
+  if FileExists(DB30) then DeleteFile(DB30);
+end;
+
+{ ===========================================================================
+  T31: random-order corpus — 200 rows shuffled, write + close + scan
+  Uses a simple LCG to produce deterministic pseudo-random insertion order.
+  =========================================================================== }
+procedure RunT31;
+const
+  DB31 = '/tmp/bt_t31.db';
+  N    = 200;
+var
+  pBtr   : PBtree;
+  cur    : TBtCursor;
+  rc     : i32;
+  iRoot  : Pgno;
+  pX     : TBtreePayload;
+  pRes   : i32;
+  cnt    : i64;
+  firstK : i64;
+  lastK  : i64;
+  data   : array[0..7] of u8;
+  order  : array[1..N] of i32;
+  tmp    : i32;
+  i, j   : i32;
+  seed   : u32;
+begin
+  WriteLn('T31: random-order corpus (N=', N, ') shuffled insert, scan in key order');
+  if FileExists(DB31) then DeleteFile(DB31);
+
+  { Build order[1..N] = 1..N, then Fisher-Yates shuffle with fixed seed }
+  for i := 1 to N do order[i] := i;
+  seed := $DEADBEEF;
+  for i := N downto 2 do begin
+    seed := seed * 1664525 + 1013904223;
+    j := i32((seed shr 16) mod u32(i)) + 1;
+    tmp := order[i]; order[i] := order[j]; order[j] := tmp;
+  end;
+
+  rc := OpenTempBtree(DB31, pBtr);
+  Check('T31 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+  Check('T31 begin-write', rc = SQLITE_OK);
+  iRoot := 0;
+  rc := sqlite3BtreeCreateTable(pBtr, @iRoot, BTREE_INTKEY or BTREE_LEAFDATA);
+  Check('T31 createTable', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 1, nil, @cur);
+  Check('T31 cursor', rc = SQLITE_OK);
+  for i := 1 to N do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey  := i64(order[i]);
+    data[0]  := u8(order[i] and $FF);
+    pX.pData := @data[0];
+    pX.nData := 8;
+    rc := sqlite3BtreeInsert(@cur, @pX, 0, 0);
+    if rc <> SQLITE_OK then begin
+      Check('T31 insert ' + IntToStr(order[i]), False);
+      break;
+    end;
+  end;
+  if rc = SQLITE_OK then Check('T31 insert all ok', True);
+  sqlite3BtreeCloseCursor(@cur);
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T31 commit', rc = SQLITE_OK);
+  sqlite3BtreeClose(pBtr);
+
+  rc := OpenTempBtree(DB31, pBtr);
+  Check('T31 reopen', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then begin if FileExists(DB31) then DeleteFile(DB31); Exit; end;
+  rc := sqlite3BtreeBeginTrans(pBtr, 0, nil);
+  Check('T31 begin-read', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 0, nil, @cur);
+  Check('T31 read cursor', rc = SQLITE_OK);
+  pRes  := -1;
+  rc    := sqlite3BtreeFirst(@cur, @pRes);
+  cnt    := 0;
+  firstK := 0;
+  lastK  := 0;
+  while (rc = SQLITE_OK) and (pRes = 0) do begin
+    if cnt = 0 then firstK := sqlite3BtreeIntegerKey(@cur);
+    lastK := sqlite3BtreeIntegerKey(@cur);
+    Inc(cnt);
+    rc := sqlite3BtreeNext(@cur, 0);
+    if rc = SQLITE_DONE then begin rc := SQLITE_OK; pRes := 1; end;
+  end;
+  Check('T31 count=N', cnt = N);
+  Check('T31 first key=1', firstK = 1);
+  Check('T31 last key=N', lastK = N);
+  sqlite3BtreeCloseCursor(@cur);
+  sqlite3BtreeRollback(pBtr, SQLITE_OK, 0);
+  sqlite3BtreeClose(pBtr);
+  if FileExists(DB31) then DeleteFile(DB31);
+end;
+
+{ ===========================================================================
+  T32: overflow page corpus — 50 rows × 2000-byte payload, write+reopen+verify
+  =========================================================================== }
+procedure RunT32;
+const
+  DB32   = '/tmp/bt_t32.db';
+  NROWS  = 50;
+  PSIZE  = 2000;
+var
+  pBtr   : PBtree;
+  cur    : TBtCursor;
+  rc     : i32;
+  iRoot  : Pgno;
+  pX     : TBtreePayload;
+  i      : i32;
+  pRes   : i32;
+  cnt    : i64;
+  key    : i64;
+  psz    : u32;
+  data   : array[0..PSIZE-1] of u8;
+  rbuf   : array[0..3] of u8;
+begin
+  WriteLn('T32: overflow-page corpus (', NROWS, ' rows × ', PSIZE, '-byte payload)');
+  if FileExists(DB32) then DeleteFile(DB32);
+
+  { Fill data with a marker pattern keyed on row number }
+  FillChar(data, SizeOf(data), $CD);
+
+  rc := OpenTempBtree(DB32, pBtr);
+  Check('T32 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+  Check('T32 begin-write', rc = SQLITE_OK);
+  iRoot := 0;
+  rc := sqlite3BtreeCreateTable(pBtr, @iRoot, BTREE_INTKEY or BTREE_LEAFDATA);
+  Check('T32 createTable', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 1, nil, @cur);
+  Check('T32 cursor', rc = SQLITE_OK);
+  for i := 1 to NROWS do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey  := i64(i);
+    data[0]  := u8(i);  { per-row marker in first byte }
+    pX.pData := @data[0];
+    pX.nData := PSIZE;
+    rc := sqlite3BtreeInsert(@cur, @pX, BTREE_APPEND, 0);
+    if rc <> SQLITE_OK then begin
+      Check('T32 insert ' + IntToStr(i), False);
+      break;
+    end;
+  end;
+  if rc = SQLITE_OK then Check('T32 insert all ok', True);
+  sqlite3BtreeCloseCursor(@cur);
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T32 commit', rc = SQLITE_OK);
+  sqlite3BtreeClose(pBtr);
+
+  rc := OpenTempBtree(DB32, pBtr);
+  Check('T32 reopen', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then begin if FileExists(DB32) then DeleteFile(DB32); Exit; end;
+  rc := sqlite3BtreeBeginTrans(pBtr, 0, nil);
+  Check('T32 begin-read', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 0, nil, @cur);
+  Check('T32 read cursor', rc = SQLITE_OK);
+  pRes := -1;
+  rc   := sqlite3BtreeFirst(@cur, @pRes);
+  cnt  := 0;
+  while (rc = SQLITE_OK) and (pRes = 0) do begin
+    key := sqlite3BtreeIntegerKey(@cur);
+    psz := sqlite3BtreePayloadSize(@cur);
+    Check('T32 row ' + IntToStr(key) + ' size', psz = PSIZE);
+    { Read first byte to verify per-row marker }
+    FillChar(rbuf, SizeOf(rbuf), $FF);
+    rc := sqlite3BtreePayload(@cur, 0, 1, @rbuf[0]);
+    Check('T32 row ' + IntToStr(key) + ' marker', rbuf[0] = u8(key));
+    Inc(cnt);
+    rc := sqlite3BtreeNext(@cur, 0);
+    if rc = SQLITE_DONE then begin rc := SQLITE_OK; pRes := 1; end;
+  end;
+  Check('T32 count=NROWS', cnt = NROWS);
+  sqlite3BtreeCloseCursor(@cur);
+  sqlite3BtreeRollback(pBtr, SQLITE_OK, 0);
+  sqlite3BtreeClose(pBtr);
+  if FileExists(DB32) then DeleteFile(DB32);
+end;
+
+{ ===========================================================================
+  T33: C creates db (50 rows via SQL), Pascal reads btree (root page 2)
+  Validates cross-compatibility: C-written btree data is readable by Pascal.
+  =========================================================================== }
+procedure RunT33;
+const
+  DB33 = '/tmp/bt_t33.db';
+  NROWS = 50;
+var
+  cdb   : Pcsq_db;
+  crc   : i32;
+  cstmt : Pcsq_stmt;
+  pBtr  : PBtree;
+  cur   : TBtCursor;
+  rc    : i32;
+  pRes  : i32;
+  cnt   : i64;
+  key   : i64;
+  zTail : PChar;
+  zErr  : PChar;
+  i     : i32;
+begin
+  WriteLn('T33: C writes ', NROWS, '-row db, Pascal reads btree (root page 2)');
+  FpUnlink(PChar(DB33));
+  cdb := nil;
+  crc := csq_open_v2(PChar(DB33), cdb,
+         SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE, nil);
+  if crc <> SQLITE_OK then begin
+    Check('T33 C open', False);
+    Exit;
+  end;
+  Check('T33 C open', True);
+
+  zErr := nil;
+  crc  := csq_exec(cdb,
+    'CREATE TABLE t(id INTEGER PRIMARY KEY);',
+    nil, nil, zErr);
+  Check('T33 C create table', crc = SQLITE_OK);
+
+  { Batch insert NROWS rows }
+  cstmt := nil; zTail := nil;
+  crc := csq_prepare_v2(cdb,
+    'INSERT INTO t(id) VALUES(?);', -1, cstmt, zTail);
+  Check('T33 C prepare', crc = SQLITE_OK);
+  if crc = SQLITE_OK then begin
+    crc := csq_exec(cdb, 'BEGIN;', nil, nil, zErr);
+    for i := 1 to NROWS do begin
+      csq_bind_int64(cstmt, 1, i64(i));
+      csq_step(cstmt);
+      csq_reset(cstmt);
+    end;
+    crc := csq_exec(cdb, 'COMMIT;', nil, nil, zErr);
+    csq_finalize(cstmt);
+    Check('T33 C insert batch', crc = SQLITE_OK);
+  end;
+  csq_close(cdb);
+
+  { Pascal opens the same file and traverses btree root page 2 }
+  rc := OpenTempBtree(DB33, pBtr);
+  Check('T33 Pascal open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then begin FpUnlink(PChar(DB33)); Exit; end;
+
+  rc := sqlite3BtreeBeginTrans(pBtr, 0, nil);
+  Check('T33 Pascal begin-read', rc = SQLITE_OK);
+
+  FillChar(cur, SizeOf(cur), 0);
+  { Root page 2 is the first user table in a freshly-created SQLite db }
+  rc := sqlite3BtreeCursor(pBtr, 2, 0, nil, @cur);
+  Check('T33 Pascal cursor p=2', rc = SQLITE_OK);
+
+  pRes := -1;
+  rc   := sqlite3BtreeFirst(@cur, @pRes);
+  Check('T33 Pascal First rc=OK', rc = SQLITE_OK);
+  cnt := 0;
+  key := 0;
+  while (rc = SQLITE_OK) and (pRes = 0) do begin
+    key := sqlite3BtreeIntegerKey(@cur);
+    Inc(cnt);
+    rc := sqlite3BtreeNext(@cur, 0);
+    if rc = SQLITE_DONE then begin rc := SQLITE_OK; pRes := 1; end;
+  end;
+  Check('T33 count=NROWS', cnt = NROWS);
+  Check('T33 last key=NROWS', key = NROWS);
+
+  sqlite3BtreeCloseCursor(@cur);
+  sqlite3BtreeRollback(pBtr, SQLITE_OK, 0);
+  sqlite3BtreeClose(pBtr);
+  FpUnlink(PChar(DB33));
+end;
+
+{ ===========================================================================
+  T34: Pascal writes 300-row db, C opens: no SQLITE_NOTADB / CORRUPT,
+       page_count > 1 confirms multi-page tree was written.
+  =========================================================================== }
+procedure RunT34;
+const
+  DB34 = '/tmp/bt_t34.db';
+  N    = 300;
+var
+  pBtr  : PBtree;
+  cur   : TBtCursor;
+  rc    : i32;
+  iRoot : Pgno;
+  pX    : TBtreePayload;
+  i     : i32;
+  data  : array[0..15] of u8;
+  cdb   : Pcsq_db;
+  crc   : i32;
+  cstmt : Pcsq_stmt;
+  pcnt  : i64;
+  zTail : PChar;
+begin
+  WriteLn('T34: Pascal writes ', N, ' rows, C opens and verifies page structure');
+  if FileExists(DB34) then DeleteFile(DB34);
+
+  rc := OpenTempBtree(DB34, pBtr);
+  Check('T34 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+  Check('T34 begin-write', rc = SQLITE_OK);
+  iRoot := 0;
+  rc := sqlite3BtreeCreateTable(pBtr, @iRoot, BTREE_INTKEY or BTREE_LEAFDATA);
+  Check('T34 createTable', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 1, nil, @cur);
+  Check('T34 cursor', rc = SQLITE_OK);
+  FillChar(data, SizeOf(data), $5A);
+  for i := 1 to N do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey  := i64(i);
+    pX.pData := @data[0];
+    pX.nData := SizeOf(data);
+    rc := sqlite3BtreeInsert(@cur, @pX, BTREE_APPEND, 0);
+    if rc <> SQLITE_OK then begin
+      Check('T34 insert ' + IntToStr(i), False);
+      break;
+    end;
+  end;
+  if rc = SQLITE_OK then Check('T34 insert all ok', True);
+  sqlite3BtreeCloseCursor(@cur);
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T34 commit', rc = SQLITE_OK);
+  sqlite3BtreeClose(pBtr);
+
+  { C opens the Pascal-written file }
+  cdb := nil;
+  crc := csq_open_v2(PChar(DB34), cdb, SQLITE_OPEN_READONLY, nil);
+  Check('T34 C open rc=OK (no CORRUPT)', crc = SQLITE_OK);
+  if crc <> SQLITE_OK then begin
+    if FileExists(DB34) then DeleteFile(DB34);
+    Exit;
+  end;
+
+  { Query page_count: must be > 1 since N=300 rows fills multiple pages }
+  cstmt := nil; zTail := nil;
+  crc := csq_prepare_v2(cdb, 'PRAGMA page_count;', -1, cstmt, zTail);
+  pcnt := 0;
+  if (crc = SQLITE_OK) and (cstmt <> nil) then begin
+    if csq_step(cstmt) = SQLITE_ROW then
+      pcnt := csq_column_int64(cstmt, 0);
+    csq_finalize(cstmt);
+  end;
+  Check('T34 C page_count > 1', pcnt > 1);
+  csq_close(cdb);
+  if FileExists(DB34) then DeleteFile(DB34);
+end;
+
+{ ===========================================================================
+  T35: insert/delete/insert cycle with verification
+  Insert 1..100, delete even keys (50 rows remain), insert 101..110,
+  close, reopen, verify count=60 and spot-check boundaries.
+  =========================================================================== }
+procedure RunT35;
+const
+  DB35 = '/tmp/bt_t35.db';
+var
+  pBtr  : PBtree;
+  cur   : TBtCursor;
+  rc    : i32;
+  iRoot : Pgno;
+  pX    : TBtreePayload;
+  i     : i32;
+  pRes  : i32;
+  cnt   : i64;
+  firstK: i64;
+  lastK : i64;
+  data  : array[0..7] of u8;
+begin
+  WriteLn('T35: insert/delete/insert cycle — 1..100, delete evens, insert 101..110');
+  if FileExists(DB35) then DeleteFile(DB35);
+
+  rc := OpenTempBtree(DB35, pBtr);
+  Check('T35 open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+  rc := sqlite3BtreeBeginTrans(pBtr, 1, nil);
+  Check('T35 begin', rc = SQLITE_OK);
+  iRoot := 0;
+  rc := sqlite3BtreeCreateTable(pBtr, @iRoot, BTREE_INTKEY or BTREE_LEAFDATA);
+  Check('T35 createTable', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 1, nil, @cur);
+  Check('T35 cursor', rc = SQLITE_OK);
+
+  { Insert 1..100 }
+  FillChar(data, SizeOf(data), $AA);
+  for i := 1 to 100 do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey  := i64(i);
+    pX.pData := @data[0];
+    pX.nData := 8;
+    rc := sqlite3BtreeInsert(@cur, @pX, BTREE_APPEND, 0);
+    if rc <> SQLITE_OK then break;
+  end;
+  Check('T35 insert 1..100', rc = SQLITE_OK);
+
+  { Delete even keys 2,4,...,100 }
+  for i := 2 to 100 do begin
+    if (i and 1) <> 0 then continue;  { skip odd }
+    pRes := -1;
+    rc := sqlite3BtreeTableMoveto(@cur, i64(i), 0, @pRes);
+    if (rc = SQLITE_OK) and (pRes = 0) then
+      rc := sqlite3BtreeDelete(@cur, 0);
+    if rc <> SQLITE_OK then break;
+  end;
+  Check('T35 delete evens', rc = SQLITE_OK);
+
+  { Insert 101..110 }
+  for i := 101 to 110 do begin
+    FillChar(pX, SizeOf(pX), 0);
+    pX.nKey  := i64(i);
+    pX.pData := @data[0];
+    pX.nData := 8;
+    rc := sqlite3BtreeInsert(@cur, @pX, BTREE_APPEND, 0);
+    if rc <> SQLITE_OK then break;
+  end;
+  Check('T35 insert 101..110', rc = SQLITE_OK);
+
+  sqlite3BtreeCloseCursor(@cur);
+  rc := sqlite3BtreeCommit(pBtr);
+  Check('T35 commit', rc = SQLITE_OK);
+  sqlite3BtreeClose(pBtr);
+
+  { Reopen and verify }
+  rc := OpenTempBtree(DB35, pBtr);
+  Check('T35 reopen', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then begin if FileExists(DB35) then DeleteFile(DB35); Exit; end;
+  rc := sqlite3BtreeBeginTrans(pBtr, 0, nil);
+  Check('T35 begin-read', rc = SQLITE_OK);
+  FillChar(cur, SizeOf(cur), 0);
+  rc := sqlite3BtreeCursor(pBtr, iRoot, 0, nil, @cur);
+  Check('T35 read cursor', rc = SQLITE_OK);
+  pRes  := -1;
+  rc    := sqlite3BtreeFirst(@cur, @pRes);
+  cnt    := 0;
+  firstK := 0;
+  lastK  := 0;
+  while (rc = SQLITE_OK) and (pRes = 0) do begin
+    if cnt = 0 then firstK := sqlite3BtreeIntegerKey(@cur);
+    lastK := sqlite3BtreeIntegerKey(@cur);
+    Inc(cnt);
+    rc := sqlite3BtreeNext(@cur, 0);
+    if rc = SQLITE_DONE then begin rc := SQLITE_OK; pRes := 1; end;
+  end;
+  { 50 odd keys (1,3,5,...,99) + 10 new keys (101..110) = 60 }
+  Check('T35 count=60', cnt = 60);
+  Check('T35 first key=1', firstK = 1);
+  Check('T35 last key=110', lastK = 110);
+
+  { Spot-check: key 2 must not exist, key 3 must exist }
+  pRes := -1;
+  rc   := sqlite3BtreeTableMoveto(@cur, 2, 0, @pRes);
+  Check('T35 key2 not found (pRes<>0)', (rc = SQLITE_OK) and (pRes <> 0));
+  pRes := -1;
+  rc   := sqlite3BtreeTableMoveto(@cur, 3, 0, @pRes);
+  Check('T35 key3 found (pRes=0)', (rc = SQLITE_OK) and (pRes = 0));
+
+  sqlite3BtreeCloseCursor(@cur);
+  sqlite3BtreeRollback(pBtr, SQLITE_OK, 0);
+  sqlite3BtreeClose(pBtr);
+  if FileExists(DB35) then DeleteFile(DB35);
+end;
+
 { ===== main ================================================================ }
 begin
   sqlite3OsInit;
   sqlite3PcacheInitialize;
-  WriteLn('=== TestBtreeCompat (Phase 4.1 + 4.2 + 4.3 + 4.4 + 4.5) ===');
+  WriteLn('=== TestBtreeCompat (Phase 4.1 + 4.2 + 4.3 + 4.4 + 4.5 + 4.6) ===');
   WriteLn;
   RunT1;
   WriteLn;
@@ -1182,6 +1809,21 @@ begin
   RunT27;
   WriteLn;
   RunT28;
+  WriteLn;
+  { Phase 4.6: extended key corpus + C cross-compat }
+  RunT29;
+  WriteLn;
+  RunT30;
+  WriteLn;
+  RunT31;
+  WriteLn;
+  RunT32;
+  WriteLn;
+  RunT33;
+  WriteLn;
+  RunT34;
+  WriteLn;
+  RunT35;
   WriteLn;
   WriteLn('Results: ', gPass, ' passed, ', gFail, ' failed');
   if gFail > 0 then

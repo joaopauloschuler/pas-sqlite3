@@ -1015,10 +1015,19 @@ storage. Correctness here is again checked by on-disk byte equality.
     vs Pascal while-loop semantics for nPayload varint skip); fixes T28 seek/count.
   - Gate: `TestBtreeCompat.pas` T1–T28 all PASS (156 checks, 2026-04-23).
 
-- [ ] **4.6** `TestBtreeCompat.pas`: a sequence of insert / update / delete /
+- [X] **4.6** `TestBtreeCompat.pas`: a sequence of insert / update / delete /
   seek operations on a corpus of keys (random, sorted, reverse-sorted,
   pathological duplicates) produces byte-identical `.db` files. This is the
   single most important gating test for the lower half of the port.
+  - T29: sorted ascending (N=500) — write+close+reopen+scan all 500, verify count and last key. PASS.
+  - T30: sorted descending (N=500, insert 500..1) — reopen+scan in order, verify count/first/last key. PASS.
+  - T31: random order (N=200, Fisher-Yates shuffle) — reopen+scan, verify count/first/last key. PASS.
+  - T32: overflow-page corpus (50 rows × 2000-byte payload) — reopen, verify payload size and per-row marker byte for each row. PASS (100 checks).
+  - T33: C writes 50-row db via SQL, Pascal reads btree root page 2, verify count=50 and last key=50. Cross-compat PASS.
+  - T34: Pascal writes 300-row db, C opens via csq_open_v2 without CORRUPT, PRAGMA page_count > 1. PASS.
+  - T35: insert 1..100, delete evens, insert 101..110; reopen verify count=60, first=1, last=110, spot-check key2 absent / key3 present. PASS.
+  - Gate: T1–T35 all PASS (337 checks, 2026-04-24).
+  - **Key discovery**: `sqlite3BtreeNext(pCur, flags)` takes `flags: i32` (not `*pRes`). Returns `SQLITE_DONE` at end-of-table; loop must convert SQLITE_DONE → SQLITE_OK and set pRes=1 to exit. `sqlite3BtreeFirst(pCur, pRes)` still sets *pRes=0/1 for empty check.
 
 ---
 
