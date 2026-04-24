@@ -1131,7 +1131,14 @@ estimate**.
     Also added: `sqlite3CloseSavepoints`, `sqlite3RollbackAll` helpers.
     Note: schema cookie check in OP_Transaction (p5≠0) is stubbed out —
     requires PSchema.iGeneration which is not yet accessible (Phase 6 concern).
-  - **5.4h** Everything else: sorter ops, virtual table ops, function calls.
+  - [X] **5.4h** Miscellaneous opcodes: OP_Real, OP_Not, OP_BitNot, OP_And,
+    OP_Or, OP_IsNull, OP_NotNull, OP_ZeroOrNull, OP_Cast, OP_Affinity,
+    OP_IsTrue, OP_HaltIfNull, OP_Noop/Explain, OP_MustBeInt, OP_RealAffinity,
+    OP_Variable, OP_CollSeq, OP_ClrSubtype, OP_GetSubtype, OP_SetSubtype,
+    OP_Function.
+    Gate test: `TestVdbeMisc.pas` T1–T13 all PASS (45/45) (2026-04-24).
+    Bug fixed: P4_REAL pointer is freed by VdbeDelete — must be heap-allocated
+    (not stack address) in test helpers.
 
 - [ ] **5.5** Port `vdbeapi.c`: public API — `sqlite3_step`, `sqlite3_column_*`,
   `sqlite3_bind_*`, `sqlite3_reset`, `sqlite3_finalize`.

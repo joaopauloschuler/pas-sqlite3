@@ -118,6 +118,7 @@ compile_test TestVdbeArith
 compile_test TestVdbeStr
 compile_test TestVdbeAgg
 compile_test TestVdbeTxn
+compile_test TestVdbeMisc
 compile_test TestVdbeTrace
 compile_test TestExplainParity
 compile_test TestSQLCorpus
