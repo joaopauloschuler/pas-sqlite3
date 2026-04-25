@@ -1090,8 +1090,8 @@ estimate**.
   Many subtle corner cases (type affinity, text encoding conversion).
   - Gate: TestVdbeMem T1–T23 all PASS (62/62 checks, 2026-04-24).
 
-- [ ] **5.4** Port `vdbe.c` — the `sqlite3VdbeExec` loop. **~199 opcodes**.
-  Current: 118/190 opcodes implemented (62% complete). 74 opcodes remaining.
+- [X] **5.4** Port `vdbe.c` — the `sqlite3VdbeExec` loop. **~199 opcodes**.
+  All sub-tasks 5.4a–5.4q complete (2026-04-25). ~190+ opcodes implemented.
   Port in groups:
   - [X] **5.4a** Exec loop skeleton + 23 opcodes: `OP_Goto`, `OP_Gosub`,
     `OP_Return`, `OP_InitCoroutine`, `OP_EndCoroutine`, `OP_Yield`,
@@ -1507,6 +1507,30 @@ reference exactly.
 
 - [ ] **6.1** Port the **expression layer** first — every other codegen unit
   calls into it: `expr.c`, `resolve.c`, `walker.c`, `treeview.c`.
+
+  **walker.c — DONE (2026-04-25)**: Ported to `passqlite3codegen.pas`.
+  All 12 walker functions implemented (sqlite3WalkExprNN, sqlite3WalkExpr,
+  sqlite3WalkExprList, sqlite3WalkSelectExpr, sqlite3WalkSelectFrom,
+  sqlite3WalkSelect, sqlite3WalkWinDefnDummyCallback,
+  sqlite3WalkerDepthIncrease/Decrease, sqlite3ExprWalkNoop,
+  sqlite3SelectWalkNoop, sqlite3SelectPopWith stub).
+
+  **Key discoveries**:
+  - All Phase 6 types MUST be in one `type` block (FPC forward-ref rule).
+    Multiple `type` blocks cause "Forward type not resolved" for TSelect, TWindow etc.
+  - TWindow sizeof=144 (not 152): trailing `_pad4: u32` was spurious; correct
+    padding after `bExprArgs` is just `_pad2: u8; _pad3: u16` (3 bytes → 144).
+  - `IN_RENAME_OBJECT` macro (walker.c) checks `pParse->eParseMode >= PARSE_MODE_RENAME`.
+    Full `Parse` struct deferred to Phase 7; accessed via `ParseGetEParseMode(pParse: Pointer)`
+    reading byte at offset 300.
+  - Function pointer comparisons require `Pointer()` cast in FPC:
+    `Pointer(pWalker^.xSelectCallback2) = Pointer(@sqlite3WalkWinDefnDummyCallback)`.
+  - `sqlite3SelectPopWith` (select.c, Phase 6.3) needs a stub in Phase 6.1
+    because walker.c compares its address at compile time.
+  - FlexArray accessors: `ExprListItems(p)` = `PExprListItem(PByte(p) + SizeOf(TExprList))`,
+    `SrcListItems(p)` = `PSrcItem(PByte(p) + SizeOf(TSrcList))`.
+  - TAggInfo has SQLITE_DEBUG-only `pSelectDbg: PSelect` at offset 64 (must be included).
+  - Gate test: `TestWalker.pas` — 40 tests, all PASS.
 
 - [ ] **6.2** Port the **query planner**: `where.c` + `wherecode.c` +
   `whereexpr.c` + `whereInt.h`. `WhereInfo`, `WhereLoop`, `WhereTerm`;

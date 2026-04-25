@@ -124,6 +124,7 @@ compile_test TestVdbeBlob
 compile_test TestVdbeSort
 compile_test TestVdbeTrace
 compile_test TestVdbeVtab
+compile_test TestWalker
 compile_test TestExplainParity
 compile_test TestSQLCorpus
 compile_test TestFuzzDiff
