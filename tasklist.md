@@ -2898,22 +2898,200 @@ loader — *optional for v1*).
 
 ## Phase 10 — CLI tool (shell.c ~12k lines)
 
-- [ ] **10.1** Port `shell.c` to `src/passqlite3shell.pas`. Mimic CLI flags,
-  dot-commands (`.schema`, `.tables`, `.dump`, `.import`, `.mode`, …), exit
-  codes, and interactive behaviour.
-- [ ] **10.2** Integration: `bin/passqlite3 foo.db` ↔ `sqlite3 foo.db` parity
-  on a scripted corpus of dot-commands.
+`shell.c` is a single ~12k-line file but breaks cleanly along functional
+seams.  Port it to `src/passqlite3shell.pas` in chunks, each with a scripted
+parity gate that diffs `bin/passqlite3` output against the upstream
+`sqlite3` binary.  Unported dot-commands must return a clear
+`Error: unknown command or invalid arguments: ".foo"` (matching upstream's
+phrasing) so partially-landed work cannot silently no-op.
+
+- [ ] **10.1a** Skeleton + arg parsing + REPL loop.  Port the program
+  entry point, command-line flag parser (`-init`, `-batch`, `-bail`,
+  `-echo`, `-readonly`, `-cmd`, `-help`, `-version`, `-A`, `-line`,
+  `-list`, `-csv`, `-html`, `-quote`, `-json`, `-markdown`, `-table`,
+  `-box`, the database-filename positional, the trailing SQL positional),
+  the `ShellState` struct, the input-line reader (readline / linenoise /
+  fallback fgets), prompt rendering (`sqlite> ` / `   ...> `), the main
+  read-eval-print loop, statement-completeness detection via
+  `sqlite3_complete`, and the exit codes.  No dot-commands wired up yet
+  — every `.foo` returns the unknown-command error.
+  Gate: `tests/cli/10a_repl/` — scripted golden-file diff covering
+  startup banner, plain SQL execution (using the default `list` mode),
+  `-init` + `-cmd` ordering, `-bail` early-exit, `-readonly` write
+  rejection, and exit codes (0 / 1 / 2).
+
+- [ ] **10.1b** Output modes + formatting controls.  `.mode`
+  (`list`, `line`, `column`, `csv`, `tabs`, `html`, `insert`, `quote`,
+  `json`, `markdown`, `table`, `box`, `tcl`, `ascii`), `.headers`,
+  `.separator`, `.nullvalue`, `.width`, `.echo`, `.changes`,
+  `.print`/`.parameter` (the formatting-only subset), Unicode-width
+  helpers, and the box-drawing renderer.
+  Gate: `tests/cli/10b_modes/` — one fixture per mode plus the
+  separator/nullvalue/width matrix.
+
+- [ ] **10.1c** Schema introspection dot-commands.  `.schema`
+  (with optional LIKE pattern + `--indent` + `--nosys`), `.tables`,
+  `.indexes`, `.databases`, `.fullschema`, `.lint fkey-indexes`,
+  `.expert` (read-only subset).
+  Gate: `tests/cli/10c_schema/` — fixtures with multi-schema
+  attached DBs, virtual tables, FTS shadow tables, system-table
+  filtering.
+
+- [ ] **10.1d** Data I/O dot-commands.  `.read` (recursive script
+  inclusion), `.dump` (with table-name filter), `.import` (CSV/ASCII
+  with `--csv`, `--ascii`, `--skip N`, `--schema`), `.output` /
+  `.once` (with `-x`/`-e` Excel/editor flags), `.save` and `.open`
+  filename handling.
+  Gate: `tests/cli/10d_io/` — round-trip dump→read, CSV import
+  with header detection, `.output` redirection to file, `.once -e`
+  (skip in CI; gate locally).
+
+- [ ] **10.1e** Meta / diagnostic dot-commands.  `.stats` on/off,
+  `.timer` on/off, `.eqp` on/off/full/trigger, `.explain`
+  on/off/auto, `.show`, `.help`, `.shell` / `.system`, `.cd`,
+  `.log`, `.trace`, `.iotrace`, `.scanstats`, `.testcase`,
+  `.testctrl`, `.selecttrace`, `.wheretrace`.
+  Gate: `tests/cli/10e_meta/` — `.eqp full` against a known plan,
+  `.timer` numeric-output presence (not value diff), `.show`
+  state dump after a sequence of mutations.
+
+- [ ] **10.1f** Long-tail / specialised dot-commands.  `.backup`,
+  `.restore`, `.clone`, `.archive` / `.ar` (the SQLite-archive
+  tar-like interface, depends on zip/zlib), `.session` (depends on
+  Phase 5.10 session extension if ported), `.recover`, `.dbinfo`,
+  `.dbconfig`, `.filectrl`, `.sha3sum`, `.crnl`, `.binary`,
+  `.connection`, `.unmodule`, `.vfsinfo`, `.vfslist`, `.vfsname`.
+  Items whose dependencies (session, archive, recover) are not in
+  the v1 scope can land as stubs that return a clear "feature not
+  compiled in" message — matches upstream's behaviour with the
+  corresponding `SQLITE_OMIT_*` build flags.
+  Gate: `tests/cli/10f_misc/` — `.backup` round-trip, `.sha3sum`
+  on a fixture DB, dbinfo header field presence.
+
+- [ ] **10.2** Integration: `bin/passqlite3 foo.db` ↔ `sqlite3 foo.db`
+  parity on a scripted corpus that unions all of 10.1a..10.1f's
+  golden files plus a handful of "kitchen-sink" sessions
+  (multi-statement scripts that mix modes, attach databases, run
+  triggers, dump+reload).  Diff stdout, stderr, and exit code; any
+  divergence is a hard failure.
 
 ---
 
 ## Phase 11 — Benchmarks
 
-- [ ] **11.1** `Benchmark.pas`: INSERT throughput (single row, batched in a
-  transaction), SELECT throughput (primary-key lookup, range scan, indexed
-  join), for small (1k rows) / medium (100k) / large (10M) datasets. Compare
-  Pascal vs C Mops/s and record the ratio table here.
+Goal: a 100% Pascal benchmark suite — Pascal client code exercising the
+Pascal port of SQLite — derived from upstream `test/speedtest1.c` (3,487
+lines).  The port lives in `src/bench/passpeedtest1.pas` and reuses
+`csqlite3.pas` as its API surface, so the same binary can swap backends
+(passqlite3 vs system libsqlite3) by toggling the `uses` clause /
+linker flag.  Output format must be byte-identical to upstream
+`speedtest1` so the existing `speedtest.tcl` diff workflow still works.
 
-- [ ] **11.2** Any row worse than ~1.5× gets a TODO under Phase 11.
+- [ ] **11.1** Harness port.  Translate `speedtest1.c` lines 1..780 to
+  `passpeedtest1.pas`: argument parser (`--size`, `--cachesize`,
+  `--exclusive`, `--explain`, `--journal`, `--lookaside`, `--memdb`,
+  `--mmap`, `--multithread`, `--nomemstat`, `--nosync`, `--notnull`,
+  `--output`, `--pagesize`, `--pcache`, `--primarykey`, `--repeat`,
+  `--reprepare`, `--reserve`, `--serialized`, `--singlethread`,
+  `--sqlonly`, `--shrink-memory`, `--stats`, `--temp N`, `--testset T`,
+  `--trace`, `--threads`, `--unicode`, `--utf16be`, `--utf16le`,
+  `--verify`, `--without-rowid`); the `g` global state record;
+  `speedtest1_begin_test` / `speedtest1_end_test` timing helpers
+  (using `passqlite3util` clock helpers, not `gettimeofday` directly);
+  the `speedtest1_random` LCG; `speedtest1_numbername` (numeric →
+  English-words helper used by every testset to build varied row
+  content); and the result-printing tail.  No testsets yet —
+  `--testset` returns "unknown testset" until 11.2+.
+  Gate: `bench/baseline/harness.txt` — reproducible run with
+  `--testset main --size 0` should print only the header / footer and
+  exit cleanly.
+
+- [ ] **11.2** `testset_main` port.  Speedtest1.c lines 781..1248 — the
+  canonical OLTP corpus, ~30 numbered cases (100 .. 990): unordered /
+  ordered INSERTs with and without indexes, SELECT BETWEEN / LIKE /
+  ORDER BY (with and without index, with and without LIMIT), CREATE
+  INDEX × 5, INSERTs with three indexes, DELETE+REFILL, VACUUM,
+  ALTER TABLE ADD COLUMN, UPDATE patterns (range, individual, whole
+  table), DELETE patterns, REPLACE, REPLACE on TEXT PK, 4-way joins,
+  subquery-in-result-set, SELECTs on IPK, SELECT DISTINCT,
+  PRAGMA integrity_check, ANALYZE.  This is the most-cited benchmark
+  in the SQLite community and is the primary regression gate.
+  Gate: `bench/baseline/testset_main.txt` — output diffs cleanly
+  against upstream `speedtest1 --testset main --size 10` modulo the
+  per-line "%.3fs" timing column (the ratio harness in 11.7 strips
+  timings before diffing).
+
+- [ ] **11.3** Small / focused testsets.  Three small ports done in
+  one chunk because each is < 200 lines of C:
+    * `testset_cte` (lines 1250..1414) — recursive CTE workouts
+      (Sudoku via `WITH RECURSIVE digits`, Mandelbrot, EXCEPT on
+      large element sets).
+    * `testset_fp` (lines 1416..1485) — floating-point arithmetic
+      inside SQL expressions.
+    * `testset_parsenumber` (lines 2875..end) — numeric-literal parse
+      stress test.
+  Gate: `bench/baseline/testset_{cte,fp,parsenumber}.txt`.
+
+- [ ] **11.4** Schema-heavy testsets.  Three larger ports (~250..600
+  lines each):
+    * `testset_star` (lines 1487..2086) — star-schema joins (fact
+      table + multiple dimension tables).
+    * `testset_orm` (lines 2272..2538) — ORM-style query patterns
+      (one-row fetch by PK, parent + children, batch lookups).
+    * `testset_trigger` (lines 2539..2740) — trigger fan-out
+      (insert into A fires triggers writing to B, C, D).
+  Gate: `bench/baseline/testset_{star,orm,trigger}.txt`.
+
+- [ ] **11.5** Optional / extension-gated testsets.  Land each only
+  after its dependency is in scope:
+    * `testset_debug1` (lines 2741..2756) — small debug sanity
+      check; lands with 11.4.
+    * `testset_json` (lines 2758..2873) — JSON1 functions; **gated
+      on Phase 6.8** (json.c port).  If 6.8 stays deferred, this
+      testset returns "json1 not compiled in" matching upstream's
+      `SQLITE_OMIT_JSON` behaviour.
+    * `testset_rtree` (lines 2088..2270) — R-tree spatial queries;
+      **gated on R-tree extension port** (not currently scheduled
+      in the task list).  Stub with the same omit-style message
+      until then.
+
+- [ ] **11.6** Differential driver — Pascal equivalent of
+  `test/speedtest.tcl`.  `bench/SpeedtestDiff.pas` runs
+  `passpeedtest1` twice (once linked against `libpassqlite3`, once
+  against the system `libsqlite3` — selectable via a `--backend`
+  flag in `passpeedtest1` itself) and emits a side-by-side ratio
+  table: testset / case-id / case-name / pas-ms / c-ms / ratio.
+  Strips wall-clock timings so the *output* of the two runs can also
+  be diffed for byte-equality (sanity check that both backends
+  computed the same thing).
+
+- [ ] **11.7** Regression gate.  Commit `bench/baseline.json` —
+  one row per (testset, case-id, dataset-size) carrying the
+  expected pas/c ratio (not absolute timing — ratios are stable
+  across machines, absolute times are not).  `bench/CheckRegression.pas`
+  re-runs the suite, compares against baseline, and exits non-zero
+  if any row regresses by > 10% relative to the baseline ratio.
+  Hooked into CI for the small/medium tiers; the large tier (10M
+  rows) stays a manual local gate because it takes minutes and
+  needs a quiet machine.
+
+- [ ] **11.8** Pragma / config matrix.  Re-run the testset_main
+  corpus across the cartesian product of:
+    * `journal_mode` ∈ { WAL, DELETE }
+    * `synchronous` ∈ { NORMAL, FULL }
+    * `page_size` ∈ { 4096, 8192, 16384 }
+    * `cache_size` ∈ { default, 10× default }
+  Emit a single matrix table.  The interesting output is *which
+  knobs move the pas/c ratio*, not the absolute numbers — large
+  ratio swings between configurations point at code paths in the
+  Pascal port that diverge from C (typical suspect: WAL writer
+  hot loop, page-cache eviction).
+
+- [ ] **11.9** Profiling hand-off to Phase 12.  Wrapper scripts that
+  run `passpeedtest1` under `perf record` and `valgrind --tool=callgrind`,
+  with a small Pascal helper that annotates the resulting reports
+  against `passqlite3*.pas` source lines.  Output of this task is
+  the input of Phase 12.1.
 
 ---
 
