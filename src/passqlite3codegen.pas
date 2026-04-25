@@ -263,6 +263,54 @@ const
 
   PARSE_EPARSE_MODE_OFFSET = 300;  { byte offset of Parse.eParseMode }
 
+  { OE_* — ON CONFLICT resolution codes (sqliteInt.h lines 2636–2647) }
+  OE_None     = 0;   { no constraint }
+  OE_Rollback = 1;   { ROLLBACK on conflict }
+  OE_Abort    = 2;   { ABORT on conflict }
+  OE_Fail     = 3;   { stop but keep prior changes }
+  OE_Ignore   = 4;   { ignore the error }
+  OE_Replace  = 5;   { DELETE existing, then INSERT }
+  OE_Update   = 6;   { DO UPDATE (upsert) }
+  OE_Restrict = 7;   { FK: IMMEDIATE=Abort, DEFERRED=Rollback }
+  OE_SetNull  = 8;   { FK: set FK value to NULL }
+  OE_SetDflt  = 9;   { FK: set FK value to default }
+  OE_Cascade  = 10;  { FK: cascade the changes }
+  OE_Default  = 11;  { do whatever the default action is }
+
+  { TRIGGER_* timing constants (sqliteInt.h line 4115-4116) }
+  TRIGGER_BEFORE = 1;
+  TRIGGER_AFTER  = 2;
+
+  { OPFLAG_* — OP_Insert / OP_Delete / OP_Column flags (sqliteInt.h ~4056) }
+  OPFLAG_NCHANGE       = $01;  { OP_Insert: update db^.nChange }
+  OPFLAG_NOCHNG        = $01;  { OP_VColumn: nochange for UPDATE }
+  OPFLAG_EPHEM         = $01;  { OP_Column: ephemeral output ok }
+  OPFLAG_LASTROWID     = $20;  { update db^.lastRowid }
+  OPFLAG_ISUPDATE      = $04;  { OP_Insert is an UPDATE }
+  OPFLAG_APPEND        = $08;  { likely to be an append }
+  OPFLAG_USESEEKRESULT = $10;  { try to avoid seek in BtreeInsert }
+  OPFLAG_ISNOOP        = $40;  { OP_Delete: pre-update hook only }
+  OPFLAG_LENGTHARG     = $40;  { OP_Column: used for length() only }
+  OPFLAG_TYPEOFARG     = $80;  { OP_Column: used for typeof() only }
+  OPFLAG_BYTELENARG    = $C0;  { OP_Column: used for octet_length() }
+  OPFLAG_BULKCSR       = $01;  { OP_Open** bulk cursor }
+  OPFLAG_SEEKEQ        = $02;  { OP_Open** EQ seek only }
+  OPFLAG_FORDELETE     = $08;  { OP_Open BTREE_FORDELETE }
+  OPFLAG_P2ISREG       = $10;  { P2 is a register number }
+  OPFLAG_PERMUTE       = $01;  { OP_Compare: use permutation }
+  OPFLAG_SAVEPOSITION  = $02;  { OP_Delete/Insert: save cursor pos }
+  OPFLAG_AUXDELETE     = $04;  { OP_Delete: index in DELETE op }
+
+  { COLTYPE_* — column type codes (typeFlags bits 3-0) }
+  COLTYPE_CUSTOM   = 0;  { use affinity only }
+  COLTYPE_ANY      = 1;
+  COLTYPE_BLOB     = 2;
+  COLTYPE_INT      = 3;
+  COLTYPE_INTEGER  = 4;
+  COLTYPE_REAL     = 5;
+  COLTYPE_TEXT     = 6;
+  COLTYPE_NUM      = 7;
+
   SRCITEM_FG_NOT_INDEXED     = u8($01);
   SRCITEM_FG_IS_INDEXED_BY   = u8($02);
   SRCITEM_FG_IS_SUBQUERY     = u8($04);
@@ -279,6 +327,8 @@ const
 //   TToken=16  TExpr=72  TExprListItem=24  TExprList=8
 //   TSelect=120  TSubquery=24  TSrcItem=72  TSrcList=8
 //   TWindow=144  TWalker=48  TNameContext=56  TAggInfo=72
+//   TUpsert=88  TAutoincInfo=24  TTriggerPrg=40
+//   TTrigger=72  TTriggerStep=88  TReturning=232
 //   TUpsert=88  TOnOrUsing=16
 // ---------------------------------------------------------------------------
 
@@ -317,7 +367,13 @@ type
   PKeyInfo2 = ^TKeyInfo;  { TKeyInfo defined below; avoids shadowing vdbe.pas PKeyInfo=Pointer }
   PUnpackedRecord2 = ^TUnpackedRecord; { TUnpackedRecord defined below }
   PCollSeq2 = Pointer;   { CollSeq — Phase 6.6 }
-  PTrigger  = Pointer;   { Trigger — Phase 6.5 }
+  { Phase 6.4: Trigger types — real definitions added below }
+  PTrigger     = ^TTrigger;
+  PPTrigger    = ^PTrigger;
+  PTriggerStep = ^TTriggerStep;
+  PAutoincInfo = ^TAutoincInfo;
+  PTriggerPrg  = ^TTriggerPrg;
+  PReturning   = ^TReturning;
   PFKey     = Pointer;   { ForeignKey — Phase 6.6 }
   PVTable   = Pointer;   { virtual table object — Phase 6.bis }
   { Where* forward pointers }
@@ -631,25 +687,90 @@ type
     pWinSelect:    PSelect;  { offset 48 }
   end;
 
-  { --- TUpsert (sizeof=88; key offsets: pNextUpsert@32, isDoUpdate@40,
-                 pToFree@48) --- }
+  { --- TUpsert (sizeof=88; verified GCC x86-64) --- }
   TUpsert = record
-    pUpsertTarget:      PExprList;
-    pUpsertTargetWhere: PExpr;
-    pUpsertSet:         PExprList;
-    pUpsertWhere:       PExpr;
-    pNextUpsert:        PUpsert;    { offset 32 }
-    isDoUpdate:         u8;         { offset 40 }
-    isDup:              u8;
-    _pad0:              u16;
-    _pad1:              u32;
-    pToFree:            Pointer;    { offset 48 }
-    pUpsertIdx:         Pointer;    { offset 56 }
-    pUpsertCols:        PIdList;    { offset 64 }
-    regData:            i32;
-    iDataCur:           i32;
-    iIdxCur:            i32;
-    _pad2:              i32;
+    pUpsertTarget:      PExprList;   { 0: optional conflict target }
+    pUpsertTargetWhere: PExpr;       { 8: WHERE for partial index targets }
+    pUpsertSet:         PExprList;   { 16: SET clause for DO UPDATE }
+    pUpsertWhere:       PExpr;       { 24: WHERE for DO UPDATE }
+    pNextUpsert:        PUpsert;     { 32: next ON CONFLICT clause }
+    isDoUpdate:         u8;          { 40: true for DO UPDATE }
+    isDup:              u8;          { 41: 2nd+ with same pUpsertIdx }
+    _pad42:             u16;
+    _pad44:             u32;
+    pToFree:            Pointer;     { 48: memory to free on delete }
+    pUpsertIdx:         PIndex2;     { 56: UNIQUE constraint index }
+    pUpsertSrc:         PSrcList;    { 64: table to update }
+    regData:            i32;         { 72: first VALUES register }
+    iDataCur:           i32;         { 76: data cursor index }
+    iIdxCur:            i32;         { 80: first index cursor }
+    _pad84:             i32;
+  end;
+
+  { --- TAutoincInfo (sizeof=24) — AUTOINCREMENT tracking per table --- }
+  TAutoincInfo = record
+    pNext:  PAutoincInfo;  { 0: next in list }
+    pTab:   PTable2;       { 8: table with AUTOINCREMENT }
+    iDb:    i32;           { 16: database index }
+    regCtr: i32;           { 20: register holding rowid counter }
+  end;
+
+  { --- TTriggerPrg (sizeof=40) — compiled trigger program --- }
+  TTriggerPrg = record
+    pTrigger:  PTrigger;      { 0: trigger this was coded from }
+    pNext:     PTriggerPrg;   { 8: next in Parse.pTriggerPrg list }
+    pProgram:  Pointer;       { 16: SubProgram implementing trigger }
+    orconf:    i32;           { 24: default ON CONFLICT policy }
+    aColmask:  array[0..1] of u32;  { 28: old/new column masks }
+  end;
+
+  { --- TTrigger (sizeof=72) — trigger definition --- }
+  TTrigger = record
+    zName:      PAnsiChar;    { 0: trigger name }
+    table:      PAnsiChar;    { 8: table or view name }
+    op:         u8;           { 16: TK_DELETE/UPDATE/INSERT }
+    tr_tm:      u8;           { 17: TRIGGER_BEFORE or TRIGGER_AFTER }
+    bReturning: u8;           { 18: implements RETURNING clause }
+    _pad19:     u8;
+    _pad20:     u32;
+    pWhen:      PExpr;        { 24: WHEN clause (may be nil) }
+    pColumns:   PIdList;      { 32: UPDATE OF column list }
+    pSchema:    PSchema;      { 40: schema containing trigger }
+    pTabSchema: PSchema;      { 48: schema containing the table }
+    step_list:  PTriggerStep; { 56: linked list of trigger steps }
+    pNext:      PTrigger;     { 64: next trigger for same table }
+  end;
+
+  { --- TTriggerStep (sizeof=88) — one step in a trigger program --- }
+  TTriggerStep = record
+    op:          u8;          { 0: TK_DELETE/UPDATE/INSERT/SELECT/RETURNING }
+    orconf:      u8;          { 1: OE_Rollback etc. }
+    _pad2:       u16;
+    _pad4:       u32;
+    pTrig:       PTrigger;    { 8: owning trigger }
+    pSelect:     PSelect;     { 16: SELECT or RHS of INSERT }
+    pSrc:        PSrcList;    { 24: table to insert/update/delete }
+    pWhere:      PExpr;       { 32: WHERE clause }
+    pExprList:   PExprList;   { 40: SET for UPDATE / RETURNING exprs }
+    pIdList:     PIdList;     { 48: column names for INSERT }
+    pUpsert:     PUpsert;     { 56: ON CONFLICT clauses }
+    zSpan:       PAnsiChar;   { 64: original SQL text }
+    pNext:       PTriggerStep;{ 72: next step in trigger }
+    pLast:       PTriggerStep;{ 80: last step (valid for 1st only) }
+  end;
+
+  { --- TReturning (sizeof=232) — RETURNING clause state --- }
+  TReturning = record
+    pParse:     PParse;       { 0: parse that includes RETURNING }
+    pReturnEL:  PExprList;    { 8: list of expressions to return }
+    retTrig:    TTrigger;     { 16: transient trigger (72 bytes) → ends at 88 }
+    retTStep:   TTriggerStep; { 88: trigger step (88 bytes) → ends at 176 }
+    iRetCur:    i32;          { 176: temp table cursor }
+    nRetCol:    i32;          { 180: number of columns after expand }
+    iRetReg:    i32;          { 184: register array for row }
+    { zName at offset 188; no extra pad between iRetReg and zName }
+    zName:      array[0..39] of AnsiChar;  { 188: "sqlite_returning_%p" }
+    _pad228:    array[0..3] of u8;  { trailing padding to align to 8: total=232 }
   end;
 
   { --- TWalker (sizeof=48) --- }
@@ -708,7 +829,7 @@ type
   TParseU1 = record  { union u1 at offset 248, sizeof=32 }
     case Integer of
       0: (cr:         TParseU1Cr);
-      1: (pReturning: Pointer);
+      1: (pReturning: PReturning);
       2: (_pad:       array[0..31] of u8);
   end;
 
@@ -750,10 +871,10 @@ type
     nProgressSteps:  u32;           { 128: xProgress steps }
     nTableLock:      i32;           { 132: shared-cache table lock count }
     aTableLock:      Pointer;       { 136: shared-cache table locks }
-    pAinc:           Pointer;       { 144: AUTOINCREMENT info }
+    pAinc:           PAutoincInfo;  { 144: AUTOINCREMENT info }
     pToplevel:       PParse;        { 152: top-level parse (or nil) }
     pTriggerTab:     PTable2;       { 160: table being triggered }
-    pTriggerPrg:     Pointer;       { 168: coded triggers list }
+    pTriggerPrg:     PTriggerPrg;  { 168: coded triggers list }
     pCleanup:        Pointer;       { 176: cleanup operations }
     aTempReg:        array[0..7] of i32;  { 184: temp register holding area }
     pOuterParse:     PParse;        { 216: outer parse object }
@@ -775,8 +896,8 @@ type
     pReprepare:      PVdbe;         { 328: VM being reprepared }
     zTail:           PAnsiChar;     { 336: SQL text past last semicolon }
     pNewTable:       PTable2;       { 344: table being CREATE'd }
-    pNewIndex:       Pointer;       { 352: index being CREATE INDEX'd }
-    pNewTrigger:     Pointer;       { 360: trigger under construction }
+    pNewIndex:       PIndex2;       { 352: index being CREATE INDEX'd }
+    pNewTrigger:     PTrigger;      { 360: trigger under construction }
     zAuthContext:    PAnsiChar;     { 368: 6th param to xAuth callbacks }
     sArg:            TToken;        { 376: vtab module argument text }
     apVtabLock:      Pointer;       { 392: vtabs needing locking }
@@ -1621,6 +1742,115 @@ function ExprUseXList(pExpr: PExpr): Boolean; inline;
 function ParseGetEParseMode(pParse: Pointer): u8; inline;
 function SrcItemIsSubquery(const fg: TSrcItemFg): Boolean; inline;
 function SrcItemIsTabFunc(const fg: TSrcItemFg): Boolean; inline;
+
+// ---------------------------------------------------------------------------
+// Phase 6.4 public API — upsert.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3UpsertDelete(db: PTsqlite3; p: PUpsert);
+function  sqlite3UpsertDup(db: PTsqlite3; p: PUpsert): PUpsert;
+function  sqlite3UpsertNew(db: PTsqlite3; pTarget: PExprList;
+  pTargetWhere: PExpr; pSet: PExprList; pWhere: PExpr;
+  pNext: PUpsert): PUpsert;
+function  sqlite3UpsertAnalyzeTarget(pParse: PParse; pTabList: PSrcList;
+  pUpsert: PUpsert; pIdx: PIndex2): i32;
+function  sqlite3UpsertNextIsIPK(pUpsert: PUpsert): i32;
+function  sqlite3UpsertOfIndex(pUpsert: PUpsert; pIdx: PIndex2): PUpsert;
+procedure sqlite3UpsertDoUpdate(pParse: PParse; pUpsert: PUpsert;
+  pTab: PTable2; pIdx: PIndex2; iCur: i32);
+
+// ---------------------------------------------------------------------------
+// Phase 6.4 public API — trigger.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3DeleteTriggerStep(db: PTsqlite3; pStep: PTriggerStep);
+function  sqlite3TriggerList(pParse: PParse; pTab: PTable2): PTrigger;
+procedure sqlite3BeginTrigger(pParse: PParse; const pName1: PToken;
+  const pName2: PToken; tr_tm: i32; op: i32; pColumns: PIdList;
+  pTableName: PSrcList; pWhen: PExpr; isTemp: i32; noErr: i32);
+procedure sqlite3FinishTrigger(pParse: PParse; pStepList: PTriggerStep;
+  const pAll: PToken);
+procedure sqlite3DropTrigger(pParse: PParse; pName: PSrcList; noErr: i32);
+procedure sqlite3DropTriggerPtr(pParse: PParse; pTrigger: PTrigger);
+procedure sqlite3UnlinkAndDeleteTrigger(db: PTsqlite3; iDb: i32;
+  zName: PAnsiChar);
+procedure sqlite3DeleteTrigger(db: PTsqlite3; pTrigger: PTrigger);
+function  sqlite3TriggersExist(pParse: PParse; pTab: PTable2; op: i32;
+  pChanges: PExprList; pMask: Pu32): PTrigger;
+procedure sqlite3CodeRowTriggerDirect(pParse: PParse; pTrigger: PTrigger;
+  pTab: PTable2; reg: i32; orconf: i32; ignoreJump: i32);
+procedure sqlite3CodeRowTrigger(pParse: PParse; pTrigger: PTrigger;
+  op: i32; pChanges: PExprList; tr_tm: i32; pTab: PTable2;
+  reg: i32; orconf: i32; ignoreJump: i32);
+function  sqlite3TriggerStepSrc(pParse: PParse;
+  pStep: PTriggerStep): PSrcList;
+function  sqlite3TriggerColmask(pParse: PParse; pTrigger: PTrigger;
+  pChanges: PExprList; isNew: i32; tr_tm: i32; pTab: PTable2;
+  orconf: i32): u32;
+
+// ---------------------------------------------------------------------------
+// Phase 6.4 public API — delete.c
+// ---------------------------------------------------------------------------
+
+function  sqlite3SrcListLookup(pParse: PParse; pSrc: PSrcList): PTable2;
+procedure sqlite3CodeChangeCount(v: PVdbe; regCounter: i32;
+  zColName: PAnsiChar);
+function  sqlite3IsReadOnly(pParse: PParse; pTab: PTable2;
+  pTrigger: PTrigger): i32;
+procedure sqlite3MaterializeView(pParse: PParse; pView: PTable2;
+  pWhere: PExpr; pOrderBy: PExprList; pLimit: PExpr; iCur: i32);
+function  sqlite3LimitWhere(pParse: PParse; pSrc: PSrcList; pWhere: PExpr;
+  pOrderBy: PExprList; pLimit: PExpr; zStmtType: PAnsiChar): PExpr;
+procedure sqlite3DeleteFrom(pParse: PParse; pTabList: PSrcList;
+  pWhere: PExpr; pOrderBy: PExprList; pLimit: PExpr);
+procedure sqlite3GenerateRowDelete(pParse: PParse; pTab: PTable2;
+  pTrigger: PTrigger; iDataCur: i32; iIdxCur: i32; iPk: i32;
+  nPk: i16; count: u8; onconf: u8; eMode: u8; iIdxNoSeek: i32);
+procedure sqlite3GenerateRowIndexDelete(pParse: PParse; pTab: PTable2;
+  iDataCur: i32; iIdxCur: i32; aRegIdx: Pi32; iIdxSkip: i32);
+function  sqlite3GenerateIndexKey(pParse: PParse; pIdx: PIndex2;
+  iDataCur: i32; regOut: i32; prefixOnly: i32; piPartIdxLabel: Pi32;
+  pPrior: PIndex2; regPrior: i32): i32;
+procedure sqlite3ResolvePartIdxLabel(pParse: PParse; iLabel: i32);
+
+// ---------------------------------------------------------------------------
+// Phase 6.4 public API — update.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3ColumnDefault(v: PVdbe; pTab: PTable2; i: i32; iReg: i32);
+procedure sqlite3Update(pParse: PParse; pTabList: PSrcList;
+  pChanges: PExprList; pWhere: PExpr; onError: i32;
+  pOrderBy: PExprList; pLimit: PExpr; pUpsert: PUpsert);
+
+// ---------------------------------------------------------------------------
+// Phase 6.4 public API — insert.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3OpenTable(pParse: PParse; iCur: i32; iDb: i32;
+  pTab: PTable2; opcode: i32);
+procedure sqlite3TableAffinity(v: PVdbe; pTab: PTable2; iReg: i32);
+procedure sqlite3ComputeGeneratedColumns(pParse: PParse; iRegStore: i32;
+  pTab: PTable2);
+procedure sqlite3AutoincrementBegin(pParse: PParse);
+procedure sqlite3AutoincrementEnd(pParse: PParse);
+procedure sqlite3MultiValuesEnd(pParse: PParse; pVal: PSelect);
+function  sqlite3MultiValues(pParse: PParse; pLeft: PSelect;
+  pRow: PExprList): PSelect;
+procedure sqlite3Insert(pParse: PParse; pTabList: PSrcList; pSelect: PSelect;
+  pColumn: PIdList; onError: i32; pUpsert: PUpsert);
+function  sqlite3ExprReferencesUpdatedColumn(pExpr: PExpr; aiChng: Pi32;
+  chngRowid: i32): i32;
+procedure sqlite3GenerateConstraintChecks(pParse: PParse; pTab: PTable2;
+  aRegIdx: Pi32; iDataCur: i32; iIdxCur: i32; regNewData: i32;
+  regOldData: i32; pkChng: u8; overrideError: u8; ignoreDest: i32;
+  pbMayReplace: PBoolean; aiChng: Pi32; pUpsert: PUpsert);
+procedure sqlite3SetMakeRecordP5(v: PVdbe; pTab: PTable2);
+procedure sqlite3CompleteInsertion(pParse: PParse; pTab: PTable2;
+  iDataCur: i32; iIdxCur: i32; regNewData: i32; aRegIdx: Pi32;
+  update_flags: i32; appendBias: i32; useSeekResult: i32);
+function  sqlite3OpenTableAndIndices(pParse: PParse; pTab: PTable2;
+  op: i32; p5: u8; iBase: i32; aToOpen: Pu8; piDataCur: Pi32;
+  piIdxCur: Pi32): i32;
 
 implementation
 
@@ -4258,6 +4488,429 @@ end;
 procedure sqlite3ProgressCheck(pParse: PParse);
 begin
   { Phase 8 stub }
+end;
+
+// ===========================================================================
+// Phase 6.4 — upsert.c
+// ===========================================================================
+
+{ sqlite3UpsertDelete — free a chain of Upsert objects }
+procedure sqlite3UpsertDelete(db: PTsqlite3; p: PUpsert);
+var pNext: PUpsert;
+begin
+  while p <> nil do
+  begin
+    pNext := p^.pNextUpsert;
+    sqlite3ExprListDelete(db, p^.pUpsertTarget);
+    sqlite3ExprDelete(db, p^.pUpsertTargetWhere);
+    sqlite3ExprListDelete(db, p^.pUpsertSet);
+    sqlite3ExprDelete(db, p^.pUpsertWhere);
+    sqlite3DbFree(db, p^.pToFree);
+    sqlite3DbFree(db, p);
+    p := pNext;
+  end;
+end;
+
+{ sqlite3UpsertDup — deep-copy an Upsert chain }
+function sqlite3UpsertDup(db: PTsqlite3; p: PUpsert): PUpsert;
+var pRet: PUpsert;
+begin
+  if p = nil then begin Result := nil; Exit; end;
+  pRet := sqlite3DbMallocRawNN(db, SizeOf(TUpsert));
+  if pRet = nil then begin Result := nil; Exit; end;
+  pRet^ := p^;
+  pRet^.pUpsertTarget      := sqlite3ExprListDup(db, p^.pUpsertTarget, 0);
+  pRet^.pUpsertTargetWhere := sqlite3ExprDup(db, p^.pUpsertTargetWhere, 0);
+  pRet^.pUpsertSet         := sqlite3ExprListDup(db, p^.pUpsertSet, 0);
+  pRet^.pUpsertWhere       := sqlite3ExprDup(db, p^.pUpsertWhere, 0);
+  pRet^.pNextUpsert        := sqlite3UpsertDup(db, p^.pNextUpsert);
+  pRet^.pToFree            := nil;  { owned by original }
+  Result := pRet;
+end;
+
+{ sqlite3UpsertNew — allocate and initialise an Upsert object }
+function sqlite3UpsertNew(db: PTsqlite3; pTarget: PExprList;
+  pTargetWhere: PExpr; pSet: PExprList; pWhere: PExpr;
+  pNext: PUpsert): PUpsert;
+var p: PUpsert;
+begin
+  p := sqlite3DbMallocZero(db, SizeOf(TUpsert));
+  if p = nil then
+  begin
+    sqlite3ExprListDelete(db, pTarget);
+    sqlite3ExprDelete(db, pTargetWhere);
+    sqlite3ExprListDelete(db, pSet);
+    sqlite3ExprDelete(db, pWhere);
+    sqlite3UpsertDelete(db, pNext);
+    Result := nil; Exit;
+  end;
+  p^.pUpsertTarget      := pTarget;
+  p^.pUpsertTargetWhere := pTargetWhere;
+  p^.pUpsertSet         := pSet;
+  p^.pUpsertWhere       := pWhere;
+  p^.pNextUpsert        := pNext;
+  if pSet <> nil then
+    p^.isDoUpdate := 1
+  else
+    p^.isDoUpdate := 0;
+  Result := p;
+end;
+
+{ sqlite3UpsertAnalyzeTarget — match ON CONFLICT target to an index
+  (Phase 6.4 stub — full implementation requires schema lookup) }
+function sqlite3UpsertAnalyzeTarget(pParse: PParse; pTabList: PSrcList;
+  pUpsert: PUpsert; pIdx: PIndex2): i32;
+begin
+  Result := SQLITE_OK; { Phase 6.5 will complete this }
+end;
+
+{ sqlite3UpsertNextIsIPK — true if next upsert clause targets the IPK }
+function sqlite3UpsertNextIsIPK(pUpsert: PUpsert): i32;
+var pNext: PUpsert;
+begin
+  pNext := pUpsert^.pNextUpsert;
+  if pNext = nil then begin Result := 0; Exit; end;
+  if pNext^.pUpsertIdx <> nil then begin Result := 0; Exit; end;
+  Result := 1;
+end;
+
+{ sqlite3UpsertOfIndex — return upsert clause that targets pIdx }
+function sqlite3UpsertOfIndex(pUpsert: PUpsert; pIdx: PIndex2): PUpsert;
+begin
+  while pUpsert <> nil do
+  begin
+    if pUpsert^.pUpsertIdx = pIdx then begin Result := pUpsert; Exit; end;
+    pUpsert := pUpsert^.pNextUpsert;
+  end;
+  Result := nil;
+end;
+
+{ sqlite3UpsertDoUpdate — generate VDBE for DO UPDATE clause (Phase 6.4 stub) }
+procedure sqlite3UpsertDoUpdate(pParse: PParse; pUpsert: PUpsert;
+  pTab: PTable2; pIdx: PIndex2; iCur: i32);
+begin
+  { Full implementation requires WhereBegin / code gen — Phase 6.5+ }
+end;
+
+// ===========================================================================
+// Phase 6.4 — trigger.c
+// ===========================================================================
+
+{ sqlite3DeleteTriggerStep — free a TriggerStep chain }
+procedure sqlite3DeleteTriggerStep(db: PTsqlite3; pStep: PTriggerStep);
+var pTmp: PTriggerStep;
+begin
+  while pStep <> nil do
+  begin
+    pTmp := pStep;
+    pStep := pStep^.pNext;
+    sqlite3ExprDelete(db, pTmp^.pWhere);
+    sqlite3ExprListDelete(db, pTmp^.pExprList);
+    sqlite3SelectDelete(db, pTmp^.pSelect);
+    sqlite3IdListDelete(db, pTmp^.pIdList);
+    sqlite3SrcListDelete(db, pTmp^.pSrc);
+    sqlite3UpsertDelete(db, pTmp^.pUpsert);
+    sqlite3DbFree(db, pTmp^.zSpan);
+    sqlite3DbFree(db, pTmp);
+  end;
+end;
+
+{ sqlite3DeleteTrigger — free a single Trigger object }
+procedure sqlite3DeleteTrigger(db: PTsqlite3; pTrigger: PTrigger);
+begin
+  if pTrigger = nil then Exit;
+  sqlite3DeleteTriggerStep(db, pTrigger^.step_list);
+  sqlite3DbFree(db, pTrigger^.zName);
+  sqlite3DbFree(db, pTrigger^.table);
+  sqlite3ExprDelete(db, pTrigger^.pWhen);
+  sqlite3IdListDelete(db, pTrigger^.pColumns);
+  sqlite3DbFree(db, pTrigger);
+end;
+
+{ sqlite3TriggerList — return list of triggers on table (Phase 6.4 stub) }
+function sqlite3TriggerList(pParse: PParse; pTab: PTable2): PTrigger;
+begin
+  { Full trigger-schema lookup deferred to Phase 6.5 }
+  Result := nil;
+end;
+
+{ sqlite3BeginTrigger — parse CREATE TRIGGER header (Phase 6.4 stub) }
+procedure sqlite3BeginTrigger(pParse: PParse; const pName1: PToken;
+  const pName2: PToken; tr_tm: i32; op: i32; pColumns: PIdList;
+  pTableName: PSrcList; pWhen: PExpr; isTemp: i32; noErr: i32);
+begin
+  { schema writes deferred to Phase 6.5 }
+  sqlite3IdListDelete(pParse^.db, pColumns);
+  sqlite3SrcListDelete(pParse^.db, pTableName);
+  sqlite3ExprDelete(pParse^.db, pWhen);
+end;
+
+{ sqlite3FinishTrigger — finish CREATE TRIGGER (Phase 6.4 stub) }
+procedure sqlite3FinishTrigger(pParse: PParse; pStepList: PTriggerStep;
+  const pAll: PToken);
+begin
+  { schema writes deferred to Phase 6.5 }
+  sqlite3DeleteTriggerStep(pParse^.db, pStepList);
+end;
+
+{ sqlite3DropTrigger — DROP TRIGGER statement (Phase 6.4 stub) }
+procedure sqlite3DropTrigger(pParse: PParse; pName: PSrcList; noErr: i32);
+begin
+  sqlite3SrcListDelete(pParse^.db, pName);
+end;
+
+{ sqlite3DropTriggerPtr — DROP TRIGGER by pointer (Phase 6.4 stub) }
+procedure sqlite3DropTriggerPtr(pParse: PParse; pTrigger: PTrigger);
+begin
+  { Phase 6.5: generate OP_DropTrigger VDBE instruction }
+end;
+
+{ sqlite3UnlinkAndDeleteTrigger — remove trigger from schema hash (Phase 6.4 stub) }
+procedure sqlite3UnlinkAndDeleteTrigger(db: PTsqlite3; iDb: i32;
+  zName: PAnsiChar);
+begin
+  { Phase 6.5: schema hash removal }
+end;
+
+{ sqlite3TriggersExist — check for triggers on table (Phase 6.4 stub) }
+function sqlite3TriggersExist(pParse: PParse; pTab: PTable2; op: i32;
+  pChanges: PExprList; pMask: Pu32): PTrigger;
+begin
+  if pMask <> nil then pMask^ := 0;
+  Result := nil;
+end;
+
+{ sqlite3CodeRowTriggerDirect — emit VDBE for a specific trigger (Phase 6.4 stub) }
+procedure sqlite3CodeRowTriggerDirect(pParse: PParse; pTrigger: PTrigger;
+  pTab: PTable2; reg: i32; orconf: i32; ignoreJump: i32);
+begin
+  { Phase 6.5+ }
+end;
+
+{ sqlite3CodeRowTrigger — emit VDBE for matching triggers (Phase 6.4 stub) }
+procedure sqlite3CodeRowTrigger(pParse: PParse; pTrigger: PTrigger;
+  op: i32; pChanges: PExprList; tr_tm: i32; pTab: PTable2;
+  reg: i32; orconf: i32; ignoreJump: i32);
+begin
+  { Phase 6.5+ }
+end;
+
+{ sqlite3TriggerStepSrc — build a SrcList for a trigger step (Phase 6.4 stub) }
+function sqlite3TriggerStepSrc(pParse: PParse;
+  pStep: PTriggerStep): PSrcList;
+begin
+  Result := nil; { Phase 6.5 }
+end;
+
+{ sqlite3TriggerColmask — mask of columns accessed by triggers (Phase 6.4 stub) }
+function sqlite3TriggerColmask(pParse: PParse; pTrigger: PTrigger;
+  pChanges: PExprList; isNew: i32; tr_tm: i32; pTab: PTable2;
+  orconf: i32): u32;
+begin
+  Result := 0; { Phase 6.5 }
+end;
+
+// ===========================================================================
+// Phase 6.4 — delete.c
+// ===========================================================================
+
+{ sqlite3SrcListLookup — find Table* for first entry in SrcList (Phase 6.4 stub) }
+function sqlite3SrcListLookup(pParse: PParse; pSrc: PSrcList): PTable2;
+begin
+  Result := nil; { Phase 6.5: schema lookup }
+end;
+
+{ sqlite3CodeChangeCount — emit OP_MemMax to track changes (Phase 6.4 stub) }
+procedure sqlite3CodeChangeCount(v: PVdbe; regCounter: i32;
+  zColName: PAnsiChar);
+begin
+  { Phase 6.5 }
+end;
+
+{ sqlite3IsReadOnly — return 1 if pTab is read-only (Phase 6.4 stub) }
+function sqlite3IsReadOnly(pParse: PParse; pTab: PTable2;
+  pTrigger: PTrigger): i32;
+begin
+  Result := 0; { Phase 6.5 }
+end;
+
+{ sqlite3MaterializeView — store view into a temp table (Phase 6.4 stub) }
+procedure sqlite3MaterializeView(pParse: PParse; pView: PTable2;
+  pWhere: PExpr; pOrderBy: PExprList; pLimit: PExpr; iCur: i32);
+begin
+  { Phase 6.5 }
+end;
+
+{ sqlite3LimitWhere — rewrite WHERE for DELETE/UPDATE with LIMIT (Phase 6.4 stub) }
+function sqlite3LimitWhere(pParse: PParse; pSrc: PSrcList; pWhere: PExpr;
+  pOrderBy: PExprList; pLimit: PExpr; zStmtType: PAnsiChar): PExpr;
+begin
+  Result := pWhere; { Phase 6.5 }
+end;
+
+{ sqlite3DeleteFrom — generate DELETE FROM VDBE (Phase 6.4 stub) }
+procedure sqlite3DeleteFrom(pParse: PParse; pTabList: PSrcList;
+  pWhere: PExpr; pOrderBy: PExprList; pLimit: PExpr);
+begin
+  { Phase 6.5 }
+  sqlite3SrcListDelete(pParse^.db, pTabList);
+  sqlite3ExprDelete(pParse^.db, pWhere);
+  sqlite3ExprListDelete(pParse^.db, pOrderBy);
+  sqlite3ExprDelete(pParse^.db, pLimit);
+end;
+
+{ sqlite3GenerateRowDelete — emit row-deletion VDBE (Phase 6.4 stub) }
+procedure sqlite3GenerateRowDelete(pParse: PParse; pTab: PTable2;
+  pTrigger: PTrigger; iDataCur: i32; iIdxCur: i32; iPk: i32;
+  nPk: i16; count: u8; onconf: u8; eMode: u8; iIdxNoSeek: i32);
+begin
+  { Phase 6.5 }
+end;
+
+{ sqlite3GenerateRowIndexDelete — delete all index entries for a row (Phase 6.4 stub) }
+procedure sqlite3GenerateRowIndexDelete(pParse: PParse; pTab: PTable2;
+  iDataCur: i32; iIdxCur: i32; aRegIdx: Pi32; iIdxSkip: i32);
+begin
+  { Phase 6.5 }
+end;
+
+{ sqlite3GenerateIndexKey — emit VDBE to form an index key (Phase 6.4 stub) }
+function sqlite3GenerateIndexKey(pParse: PParse; pIdx: PIndex2;
+  iDataCur: i32; regOut: i32; prefixOnly: i32; piPartIdxLabel: Pi32;
+  pPrior: PIndex2; regPrior: i32): i32;
+begin
+  Result := 0; { Phase 6.5 }
+end;
+
+{ sqlite3ResolvePartIdxLabel — resolve partial-index skip label (Phase 6.4 stub) }
+procedure sqlite3ResolvePartIdxLabel(pParse: PParse; iLabel: i32);
+begin
+  { Phase 6.5 }
+end;
+
+// ===========================================================================
+// Phase 6.4 — update.c
+// ===========================================================================
+
+{ sqlite3ColumnDefault — emit OP_Column default value code (Phase 6.4 stub) }
+procedure sqlite3ColumnDefault(v: PVdbe; pTab: PTable2; i: i32; iReg: i32);
+begin
+  { Phase 6.5: emit OP_Null or OP_SCopy for default expression }
+end;
+
+{ sqlite3Update — generate UPDATE statement VDBE (Phase 6.4 stub) }
+procedure sqlite3Update(pParse: PParse; pTabList: PSrcList;
+  pChanges: PExprList; pWhere: PExpr; onError: i32;
+  pOrderBy: PExprList; pLimit: PExpr; pUpsert: PUpsert);
+begin
+  { Phase 6.5 }
+  sqlite3SrcListDelete(pParse^.db, pTabList);
+  sqlite3ExprListDelete(pParse^.db, pChanges);
+  sqlite3ExprDelete(pParse^.db, pWhere);
+  sqlite3ExprListDelete(pParse^.db, pOrderBy);
+  sqlite3ExprDelete(pParse^.db, pLimit);
+  sqlite3UpsertDelete(pParse^.db, pUpsert);
+end;
+
+// ===========================================================================
+// Phase 6.4 — insert.c
+// ===========================================================================
+
+{ sqlite3OpenTable — emit OP_Open* to open a table cursor (Phase 6.4 stub) }
+procedure sqlite3OpenTable(pParse: PParse; iCur: i32; iDb: i32;
+  pTab: PTable2; opcode: i32);
+begin
+  { Phase 6.5: emit OP_OpenRead or OP_OpenWrite for pTab }
+end;
+
+{ sqlite3TableAffinity — emit OP_Affinity for INSERT values (Phase 6.4 stub) }
+procedure sqlite3TableAffinity(v: PVdbe; pTab: PTable2; iReg: i32);
+begin
+  { Phase 6.5 }
+end;
+
+{ sqlite3ComputeGeneratedColumns — emit VDBE for generated cols (Phase 6.4 stub) }
+procedure sqlite3ComputeGeneratedColumns(pParse: PParse; iRegStore: i32;
+  pTab: PTable2);
+begin
+  { Phase 6.5 }
+end;
+
+{ sqlite3AutoincrementBegin — emit AUTOINCREMENT init code (Phase 6.4 stub) }
+procedure sqlite3AutoincrementBegin(pParse: PParse);
+begin
+  { Phase 6.5 }
+end;
+
+{ sqlite3AutoincrementEnd — emit AUTOINCREMENT finalisation code (Phase 6.4 stub) }
+procedure sqlite3AutoincrementEnd(pParse: PParse);
+begin
+  { Phase 6.5 }
+end;
+
+{ sqlite3MultiValuesEnd — finish multi-row VALUES construction (Phase 6.4 stub) }
+procedure sqlite3MultiValuesEnd(pParse: PParse; pVal: PSelect);
+begin
+  { Phase 6.5 }
+end;
+
+{ sqlite3MultiValues — accumulate multi-row VALUES SELECT (Phase 6.4 stub) }
+function sqlite3MultiValues(pParse: PParse; pLeft: PSelect;
+  pRow: PExprList): PSelect;
+begin
+  sqlite3ExprListDelete(pParse^.db, pRow);
+  Result := pLeft; { Phase 6.5 }
+end;
+
+{ sqlite3Insert — generate INSERT VDBE (Phase 6.4 stub) }
+procedure sqlite3Insert(pParse: PParse; pTabList: PSrcList; pSelect: PSelect;
+  pColumn: PIdList; onError: i32; pUpsert: PUpsert);
+begin
+  { Phase 6.5 }
+  sqlite3SrcListDelete(pParse^.db, pTabList);
+  sqlite3SelectDelete(pParse^.db, pSelect);
+  sqlite3IdListDelete(pParse^.db, pColumn);
+  sqlite3UpsertDelete(pParse^.db, pUpsert);
+end;
+
+{ sqlite3ExprReferencesUpdatedColumn — check if expr refs any changed col (Phase 6.4 stub) }
+function sqlite3ExprReferencesUpdatedColumn(pExpr: PExpr; aiChng: Pi32;
+  chngRowid: i32): i32;
+begin
+  Result := 0; { Phase 6.5 }
+end;
+
+{ sqlite3GenerateConstraintChecks — emit constraint-checking VDBE (Phase 6.4 stub) }
+procedure sqlite3GenerateConstraintChecks(pParse: PParse; pTab: PTable2;
+  aRegIdx: Pi32; iDataCur: i32; iIdxCur: i32; regNewData: i32;
+  regOldData: i32; pkChng: u8; overrideError: u8; ignoreDest: i32;
+  pbMayReplace: PBoolean; aiChng: Pi32; pUpsert: PUpsert);
+begin
+  { Phase 6.5 }
+end;
+
+{ sqlite3SetMakeRecordP5 — set P5 of OP_MakeRecord for WITHOUT ROWID (Phase 6.4 stub) }
+procedure sqlite3SetMakeRecordP5(v: PVdbe; pTab: PTable2);
+begin
+  { Phase 6.5 }
+end;
+
+{ sqlite3CompleteInsertion — emit final OP_Insert/OP_IdxInsert (Phase 6.4 stub) }
+procedure sqlite3CompleteInsertion(pParse: PParse; pTab: PTable2;
+  iDataCur: i32; iIdxCur: i32; regNewData: i32; aRegIdx: Pi32;
+  update_flags: i32; appendBias: i32; useSeekResult: i32);
+begin
+  { Phase 6.5 }
+end;
+
+{ sqlite3OpenTableAndIndices — open table + index cursors (Phase 6.4 stub) }
+function sqlite3OpenTableAndIndices(pParse: PParse; pTab: PTable2;
+  op: i32; p5: u8; iBase: i32; aToOpen: Pu8; piDataCur: Pi32;
+  piIdxCur: Pi32): i32;
+begin
+  if piDataCur <> nil then piDataCur^ := iBase;
+  if piIdxCur  <> nil then piIdxCur^  := iBase + 1;
+  Result := 0; { Phase 6.5 }
 end;
 
 end.

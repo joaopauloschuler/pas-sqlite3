@@ -128,6 +128,7 @@ compile_test TestWalker
 compile_test TestExprBasic
 compile_test TestWhereBasic
 compile_test TestSelectBasic
+compile_test TestDMLBasic
 compile_test TestExplainParity
 compile_test TestSQLCorpus
 compile_test TestFuzzDiff
@@ -152,4 +153,5 @@ echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestPagerReadOnly"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestPagerRollback"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestPagerCrash"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestWalCompat"
+echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestDMLBasic"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestReferenceVectors"
