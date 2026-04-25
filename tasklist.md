@@ -20,6 +20,31 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-25 — Phase 8.6 sqlite3_exec / get_table.**  New entry points
+    in `src/passqlite3main.pas`: `sqlite3_exec` (legacy.c full port),
+    `sqlite3_get_table` / `sqlite3_get_table_cb` / `sqlite3_free_table`
+    (table.c full port), and a minimal `sqlite3_errmsg` that returns
+    `sqlite3ErrStr(errCode and errMask)` — main.c's fallback path when
+    `db^.pErr` is nil, which is currently always the case in the port
+    (codegen `sqlite3ErrorWithMsg` stores only the code).  Promoted
+    `sqlite3ErrStr` to the `passqlite3vdbe` interface so main.pas
+    reaches it.  Read the SQLITE_NullCallback bit unshifted (matches
+    the unshifted constants in passqlite3util); the existing shift-by-32
+    writes for SQLITE_ShortColNames in openDatabase look wrong, flagged
+    for a future flag-bit audit.  Gate `src/tests/TestExecGetTable.pas`
+    23/23 PASS; no regressions in TestOpenClose / TestPrepareBasic /
+    TestRegistration / TestConfigHooks / TestInitShutdown / TestSchemaBasic
+    / TestParser / TestParserSmoke / TestAuthBuiltins.
+
+    Phase 8.6 scope notes (deferred):
+      * `sqlite3_errmsg` is fallback-only — promote to the full
+        pErr-consulting main.c version once codegen wires
+        `sqlite3ErrorWithMsg` to populate `db^.pErr` (printf machinery).
+      * Real row results require finishing the Phase 6/7 codegen
+        stubs (sqlite3Select / sqlite3FinishTable / etc.).  The gate
+        tests focus on surface API contract until then.
+      * UTF-16 wrappers (`sqlite3_exec16`) deferred with UTF-16.
+
   - **2026-04-25 — Phase 8.5 initialize / shutdown.**  New entry points in
     `src/passqlite3main.pas`: `sqlite3_initialize` (main.c:190) and
     `sqlite3_shutdown` (main.c:372).  Faithful port of the two-stage
@@ -2855,8 +2880,49 @@ loader — *optional for v1*).
       redundant when callers explicitly initialize first; harmless, but
       flagged for a future cleanup pass.
 
-- [ ] **8.6** Port `legacy.c`: `sqlite3_exec` and the one-shot callback-style
+- [X] **8.6** Port `legacy.c`: `sqlite3_exec` and the one-shot callback-style
   wrappers; `table.c`: `sqlite3_get_table` / `sqlite3_free_table`.
+
+  DONE 2026-04-25.  Faithful port of all of `legacy.c` (sqlite3_exec) and
+  `table.c` (sqlite3_get_table / sqlite3_get_table_cb / sqlite3_free_table)
+  appended to `src/passqlite3main.pas`.  Also added a minimal
+  `sqlite3_errmsg` (returns `sqlite3ErrStr(db^.errCode)` — main.c's
+  fallback when `db^.pErr` is nil; the port's codegen does not yet
+  populate pErr, so this is byte-correct for that path).
+  `sqlite3ErrStr` was promoted to the `passqlite3vdbe` interface so
+  passqlite3main can reach it.
+
+  Concrete changes:
+    * `src/passqlite3main.pas` — new public entry points
+      `sqlite3_exec`, `sqlite3_get_table`, `sqlite3_free_table`,
+      `sqlite3_errmsg`; new types `Tsqlite3_callback`, `PPPAnsiChar`,
+      `TTabResult`; static helper `sqlite3_get_table_cb` (cdecl).
+    * `src/passqlite3vdbe.pas` — exposes `sqlite3ErrStr` in interface.
+    * `src/tests/TestExecGetTable.pas` — new gate test (23/23 PASS).
+    * `src/tests/build.sh` — registers TestExecGetTable.
+
+  Phase 8.6 scope notes (deferred / known limits):
+    * `sqlite3_errmsg` returns the static `sqlite3ErrStr` text only
+      (no formatted message).  Once codegen wires `db^.pErr` from
+      `sqlite3ErrorWithMsg`, swap to the full main.c version that
+      consults `sqlite3_value_text(pErr)` first.
+    * `db->flags` SQLITE_NullCallback bit is read at the canonical
+      bit position (`u64($00000100)`), not shifted by 32 like the
+      existing `SQLITE_ShortColNames` writes in openDatabase — those
+      shifts look incorrect (the in-port flag constants in
+      passqlite3util are unshifted).  Pre-existing inconsistency,
+      not introduced here, but worth flagging for a future flag-bit
+      audit pass.
+    * Because most non-trivial top-level codegen entry points still
+      stub out (Phase 6/7), `sqlite3_exec` of a real CREATE/INSERT/
+      SELECT typically prepares to `ppStmt = nil` and returns rc=OK
+      without actually mutating the database.  TestExecGetTable
+      therefore exercises the surface API contract (empty SQL,
+      whitespace-only SQL, syntax-error SQL, MISUSE paths,
+      free_table round-trip) rather than full row results — those
+      light up automatically once codegen is finished.
+    * UTF-16 entry points (`sqlite3_exec16`, etc.) deferred with
+      the rest of UTF-16 support.
 
 - [ ] **8.7** Port `backup.c`: the online-backup API. Self-contained, small
   (~800 lines), useful early for verifying end-to-end operation.

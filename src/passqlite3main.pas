@@ -182,6 +182,31 @@ function sqlite3_config(op: i32; arg: i32): i32; overload;
 function sqlite3_initialize: i32;
 function sqlite3_shutdown:   i32;
 
+{ Phase 8.6 — legacy.c (sqlite3_exec) + table.c (get_table / free_table). }
+
+type
+  Tsqlite3_callback = function(pArg: Pointer; nCol: i32;
+                               argv: PPAnsiChar;
+                               colv: PPAnsiChar): i32; cdecl;
+  PPPAnsiChar = ^PPAnsiChar;
+
+{ sqlite3_errmsg — minimal port: returns the textual form of db^.errCode.
+  The full main.c version consults db^.pErr (a sqlite3_value), which is not
+  populated by our codegen yet (sqlite3ErrorWithMsg only stores the code).
+  Returning sqlite3ErrStr(errCode) is what main.c falls back to when
+  pErr is nil, so this is byte-correct for that path. }
+function sqlite3_errmsg(db: PTsqlite3): PAnsiChar;
+
+function sqlite3_exec(db: PTsqlite3; zSql: PAnsiChar;
+                      xCallback: Tsqlite3_callback; pArg: Pointer;
+                      pzErrMsg: PPAnsiChar): i32;
+
+function sqlite3_get_table(db: PTsqlite3; zSql: PAnsiChar;
+                           pazResult: PPPAnsiChar;
+                           pnRow: Pi32; pnColumn: Pi32;
+                           pzErrMsg: PPAnsiChar): i32;
+procedure sqlite3_free_table(azResult: PPAnsiChar);
+
 implementation
 
 { ----------------------------------------------------------------------
@@ -1354,6 +1379,317 @@ begin
     sqlite3GlobalConfig.isMutexInit := 0;
   end;
   Result := SQLITE_OK;
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 8.6 — sqlite3_exec / sqlite3_get_table / sqlite3_free_table
+  Faithful port of legacy.c (entire file) and table.c.
+  ---------------------------------------------------------------------- }
+
+function sqlite3_errmsg(db: PTsqlite3): PAnsiChar;
+begin
+  if db = nil then begin Result := sqlite3ErrStr(SQLITE_NOMEM); Exit; end;
+  if sqlite3SafetyCheckSickOrOk(db) = 0 then begin
+    Result := sqlite3ErrStr(SQLITE_MISUSE); Exit;
+  end;
+  if db^.mallocFailed <> 0 then begin
+    Result := sqlite3ErrStr(SQLITE_NOMEM); Exit;
+  end;
+  Result := sqlite3ErrStr(db^.errCode and db^.errMask);
+end;
+
+type
+  PPPAnsiCharLocal = ^PPAnsiChar;
+
+  PTabResult = ^TTabResult;
+  TTabResult = record
+    azResult: PPAnsiChar;   { Accumulated output }
+    zErrMsg:  PAnsiChar;    { Error message text, if an error occurs }
+    nAlloc:   u32;          { Slots allocated for azResult[] }
+    nRow:     u32;          { Number of rows in the result }
+    nColumn:  u32;          { Number of columns in the result }
+    nData:    u32;          { Slots used in azResult[].  (nRow+1)*nColumn }
+    rc:       i32;          { Return code from sqlite3_exec() }
+  end;
+
+function sqlite3_exec(db: PTsqlite3; zSql: PAnsiChar;
+                      xCallback: Tsqlite3_callback; pArg: Pointer;
+                      pzErrMsg: PPAnsiChar): i32;
+label
+  exec_out;
+var
+  rc:        i32;
+  zLeftover: PAnsiChar;
+  pStmt:     PVdbe;
+  pStmtP:    Pointer;
+  azCols:    PPAnsiChar;
+  azVals:    PPAnsiChar;
+  callbackIsInit: Boolean;
+  nCol, i:   i32;
+  src, dst:  PAnsiChar;
+  errSrc:    PAnsiChar;
+  n:         PtrUInt;
+begin
+  rc     := SQLITE_OK;
+  pStmt  := nil;
+  azCols := nil;
+
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  if zSql = nil then zSql := '';
+
+  sqlite3_mutex_enter(db^.mutex);
+  sqlite3Error(db, SQLITE_OK);
+  while (rc = SQLITE_OK) and (zSql[0] <> #0) do begin
+    nCol  := 0;
+    azVals := nil;
+
+    pStmtP := nil;
+    rc := sqlite3_prepare_v2(db, zSql, -1, @pStmtP, @zLeftover);
+    pStmt := PVdbe(pStmtP);
+    Assert((rc = SQLITE_OK) or (pStmt = nil));
+    if rc <> SQLITE_OK then continue;
+    if pStmt = nil then begin
+      { whitespace / comment-only statement }
+      zSql := zLeftover;
+      continue;
+    end;
+    callbackIsInit := False;
+
+    while True do begin
+      rc := sqlite3_step(pStmt);
+
+      { Invoke the callback function if required. }
+      if (xCallback <> nil) and
+         ((rc = SQLITE_ROW) or
+          ((rc = SQLITE_DONE) and (not callbackIsInit) and
+           ((db^.flags and SQLITE_NullCallback) <> 0))) then
+      begin
+        if not callbackIsInit then begin
+          nCol := sqlite3_column_count(pStmt);
+          azCols := PPAnsiChar(sqlite3DbMallocRaw(db,
+                       u64((2 * nCol + 1) * SizeOf(PAnsiChar))));
+          if azCols = nil then goto exec_out;
+          for i := 0 to nCol - 1 do begin
+            (azCols + i)^ := sqlite3_column_name(pStmt, i);
+            Assert((azCols + i)^ <> nil);
+          end;
+          callbackIsInit := True;
+        end;
+        if rc = SQLITE_ROW then begin
+          azVals := PPAnsiChar(azCols + nCol);
+          for i := 0 to nCol - 1 do begin
+            (azVals + i)^ := PAnsiChar(sqlite3_column_text(pStmt, i));
+            if ((azVals + i)^ = nil) and
+               (sqlite3_column_type(pStmt, i) <> SQLITE_NULL) then
+            begin
+              sqlite3OomFault(db);
+              goto exec_out;
+            end;
+          end;
+          (azVals + nCol)^ := nil;
+        end;
+        if xCallback(pArg, nCol, azVals, azCols) <> 0 then begin
+          rc := SQLITE_ABORT;
+          sqlite3VdbeFinalize(pStmt);
+          pStmt := nil;
+          sqlite3Error(db, SQLITE_ABORT);
+          goto exec_out;
+        end;
+      end;
+
+      if rc <> SQLITE_ROW then begin
+        rc := sqlite3VdbeFinalize(pStmt);
+        pStmt := nil;
+        zSql := zLeftover;
+        while sqlite3Isspace(u8(zSql[0])) <> 0 do Inc(zSql);
+        Break;
+      end;
+    end;
+
+    sqlite3DbFree(db, azCols);
+    azCols := nil;
+  end;
+
+exec_out:
+  if pStmt <> nil then sqlite3VdbeFinalize(pStmt);
+  sqlite3DbFree(db, azCols);
+
+  rc := sqlite3ApiExit(db, rc);
+  if (rc <> SQLITE_OK) and (pzErrMsg <> nil) then begin
+    errSrc := sqlite3_errmsg(db);
+    if errSrc = nil then errSrc := '';
+    n := PtrUInt(sqlite3Strlen30(errSrc));
+    dst := PAnsiChar(sqlite3_malloc64(u64(n + 1)));
+    pzErrMsg^ := dst;
+    if dst = nil then begin
+      rc := SQLITE_NOMEM;
+      sqlite3Error(db, SQLITE_NOMEM);
+    end else begin
+      src := errSrc;
+      Move(src^, dst^, n);
+      (dst + n)^ := #0;
+    end;
+  end else if pzErrMsg <> nil then
+    pzErrMsg^ := nil;
+
+  Assert((rc and db^.errMask) = rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+{ ----------------------------------------------------------------------
+  table.c — sqlite3_get_table / sqlite3_get_table_cb / sqlite3_free_table
+  ---------------------------------------------------------------------- }
+
+function sqlite3_get_table_cb(pArg: Pointer; nCol: i32;
+                              argv: PPAnsiChar;
+                              colv: PPAnsiChar): i32; cdecl;
+label
+  malloc_failed;
+var
+  p:    PTabResult;
+  need: i32;
+  i, n: i32;
+  z:    PAnsiChar;
+  azNew: PPAnsiChar;
+  src:  PAnsiChar;
+begin
+  p := PTabResult(pArg);
+
+  if (p^.nRow = 0) and (argv <> nil) then
+    need := nCol * 2
+  else
+    need := nCol;
+  if (p^.nData + u32(need)) > p^.nAlloc then begin
+    p^.nAlloc := p^.nAlloc * 2 + u32(need);
+    azNew := PPAnsiChar(sqlite3Realloc(p^.azResult,
+                                       NativeUInt(SizeOf(PAnsiChar) * p^.nAlloc)));
+    if azNew = nil then goto malloc_failed;
+    p^.azResult := azNew;
+  end;
+
+  { First row: emit the column names. }
+  if p^.nRow = 0 then begin
+    p^.nColumn := u32(nCol);
+    for i := 0 to nCol - 1 do begin
+      src := (colv + i)^;
+      if src = nil then n := 0 else n := sqlite3Strlen30(src);
+      z := PAnsiChar(sqlite3_malloc64(u64(n + 1)));
+      if z = nil then goto malloc_failed;
+      if n > 0 then Move(src^, z^, n);
+      z[n] := #0;
+      (p^.azResult + p^.nData)^ := z;
+      Inc(p^.nData);
+    end;
+  end else if i32(p^.nColumn) <> nCol then begin
+    sqlite3_free(p^.zErrMsg);
+    p^.zErrMsg := PAnsiChar(sqlite3StrDup(
+      'sqlite3_get_table() called with two or more incompatible queries'));
+    p^.rc := SQLITE_ERROR;
+    Result := 1; Exit;
+  end;
+
+  { Copy over the row data. }
+  if argv <> nil then begin
+    for i := 0 to nCol - 1 do begin
+      src := (argv + i)^;
+      if src = nil then begin
+        z := nil;
+      end else begin
+        n := sqlite3Strlen30(src) + 1;
+        z := PAnsiChar(sqlite3_malloc64(u64(n)));
+        if z = nil then goto malloc_failed;
+        Move(src^, z^, n);
+      end;
+      (p^.azResult + p^.nData)^ := z;
+      Inc(p^.nData);
+    end;
+    Inc(p^.nRow);
+  end;
+  Result := 0;
+  Exit;
+
+malloc_failed:
+  p^.rc := SQLITE_NOMEM;
+  Result := 1;
+end;
+
+function sqlite3_get_table(db: PTsqlite3; zSql: PAnsiChar;
+                           pazResult: PPPAnsiChar;
+                           pnRow: Pi32; pnColumn: Pi32;
+                           pzErrMsg: PPAnsiChar): i32;
+var
+  rc:    i32;
+  res:   TTabResult;
+  azNew: PPAnsiChar;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (pazResult = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  pazResult^ := nil;
+  if pnColumn <> nil then pnColumn^ := 0;
+  if pnRow    <> nil then pnRow^    := 0;
+  if pzErrMsg <> nil then pzErrMsg^ := nil;
+  res.zErrMsg := nil;
+  res.nRow    := 0;
+  res.nColumn := 0;
+  res.nData   := 1;
+  res.nAlloc  := 20;
+  res.rc      := SQLITE_OK;
+  res.azResult := PPAnsiChar(sqlite3_malloc64(SizeOf(PAnsiChar) * res.nAlloc));
+  if res.azResult = nil then begin
+    db^.errCode := SQLITE_NOMEM;
+    Result := SQLITE_NOMEM; Exit;
+  end;
+  (res.azResult + 0)^ := nil;
+  rc := sqlite3_exec(db, zSql, @sqlite3_get_table_cb, @res, pzErrMsg);
+  { Stash nData in slot 0 so sqlite3_free_table knows the array length. }
+  (res.azResult + 0)^ := PAnsiChar(PtrUInt(res.nData));
+  if (rc and $FF) = SQLITE_ABORT then begin
+    sqlite3_free_table(PPAnsiChar(res.azResult + 1));
+    if res.zErrMsg <> nil then begin
+      if pzErrMsg <> nil then begin
+        sqlite3_free(pzErrMsg^);
+        pzErrMsg^ := PAnsiChar(sqlite3StrDup(res.zErrMsg));
+      end;
+      sqlite3_free(res.zErrMsg);
+    end;
+    db^.errCode := res.rc;
+    Result := res.rc; Exit;
+  end;
+  sqlite3_free(res.zErrMsg);
+  if rc <> SQLITE_OK then begin
+    sqlite3_free_table(PPAnsiChar(res.azResult + 1));
+    Result := rc; Exit;
+  end;
+  if res.nAlloc > res.nData then begin
+    azNew := PPAnsiChar(sqlite3Realloc(res.azResult,
+                                       NativeUInt(SizeOf(PAnsiChar) * res.nData)));
+    if azNew = nil then begin
+      sqlite3_free_table(PPAnsiChar(res.azResult + 1));
+      db^.errCode := SQLITE_NOMEM;
+      Result := SQLITE_NOMEM; Exit;
+    end;
+    res.azResult := azNew;
+  end;
+  pazResult^ := PPAnsiChar(res.azResult + 1);
+  if pnColumn <> nil then pnColumn^ := i32(res.nColumn);
+  if pnRow    <> nil then pnRow^    := i32(res.nRow);
+  Result := rc;
+end;
+
+procedure sqlite3_free_table(azResult: PPAnsiChar);
+var
+  i, n: i32;
+  base: PPAnsiChar;
+begin
+  if azResult <> nil then begin
+    base := PPAnsiChar(PtrUInt(azResult) - SizeOf(PAnsiChar));
+    n := i32(PtrUInt((base + 0)^));
+    for i := 1 to n - 1 do
+      if (base + i)^ <> nil then sqlite3_free((base + i)^);
+    sqlite3_free(base);
+  end;
 end;
 
 end.

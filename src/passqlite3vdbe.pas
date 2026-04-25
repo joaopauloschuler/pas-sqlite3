@@ -1461,6 +1461,7 @@ function  sqlite3_step(pStmt: PVdbe): i32;
 function  sqlite3_reset(pStmt: PVdbe): i32;
 function  sqlite3_finalize(pStmt: PVdbe): i32;
 function  sqlite3_clear_bindings(pStmt: PVdbe): i32;
+function  sqlite3ErrStr(rc: i32): PAnsiChar;
 
 { sqlite3_value_* accessors }
 function sqlite3_value_type(pVal: Psqlite3_value): i32;
