@@ -1658,12 +1658,51 @@ reference exactly.
   `fkey.c` (foreign-key enforcement), `rowset.c`.
   Gate test: `TestAuthBuiltins.pas` — **34/34 PASS** (2026-04-25).
 
-- [ ] **6.7** Port `window.c`: SQL window functions (`OVER`, `PARTITION BY`,
+- [X] **6.7** Port `window.c`: SQL window functions (`OVER`, `PARTITION BY`,
   `ROWS BETWEEN`, …). Intersects with `select.c` — port last within the
   codegen phase so `select.c` is stable when window integration starts.
 
 - [ ] **6.8** (Optional, defer-able) Port `json.c`: JSON1 scalar functions,
   `json_each`, `json_tree`. Only if users need it in v1.
+
+### Phase 6.7 implementation notes (2026-04-25)
+
+**Unit modified**: `src/passqlite3codegen.pas` (~9600 lines after phase).
+
+**New public API** (all exported in interface):
+- Window lifecycle: `sqlite3WindowDelete`, `sqlite3WindowListDelete`,
+  `sqlite3WindowDup`, `sqlite3WindowListDup`, `sqlite3WindowLink`,
+  `sqlite3WindowUnlinkFromSelect`.
+- Allocation/assembly: `sqlite3WindowAlloc`, `sqlite3WindowAssemble`,
+  `sqlite3WindowChain`, `sqlite3WindowAttach`.
+- Comparison/update: `sqlite3WindowCompare`, `sqlite3WindowUpdate`.
+- Rewrite (stub): `sqlite3WindowRewrite` — marks `SF_WinRewrite`; full rewrite
+  deferred to Phase 7 when the Lemon parser and full SELECT engine exist.
+- Code-gen stubs: `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep`.
+- Built-in registration: `sqlite3WindowFunctions` — installs all 10 built-in
+  window functions (row_number, rank, dense_rank, percent_rank, cume_dist,
+  ntile, lead, lag, first_value, last_value, nth_value) via `TFuncDef` array.
+- Expr comparison helpers: `sqlite3ExprCompare`, `sqlite3ExprListCompare`
+  (ported from expr.c:6544/6646).
+
+**Private types** (implementation section only):
+- `TCallCount`, `TNthValueCtx`, `TNtileCtx`, `TLastValueCtx` (window agg ctxs).
+- `TWindowRewrite` (walker context for `selectWindowRewriteExprCb`).
+
+**FPC pitfalls hit**:
+- `var pParse: PParse` inside a function body is a circular self-reference
+  (FPC is case-insensitive; `pParse` ≡ `PParse`). Fix: rename local to `pPrs`.
+  This is the same pattern as `pPager: PPager`; always rename the local.
+- `type TFoo = record ... end; const aFoo: array[...] of TFoo = (...)` inside
+  a procedure body fails if any record field is `PAnsiChar` (pointer). Fix:
+  remove the pointer field (it was unused) so all fields are integer types,
+  which FPC's typed-const initialiser accepts inside procedure bodies.
+- Walker callbacks used as `TExprCallback`/`TSelectCallback` must be `cdecl`.
+- `TWalkerU.pRewrite` does not exist in the Pascal union; use `ptr: Pointer`
+  (case 0) instead and cast at use sites.
+- `sqlite3ErrorMsg` stub is 2-arg only; format via AnsiString concatenation.
+
+**Gate test**: `src/tests/TestWindowBasic.pas` — 34/34 PASS.
 
 ### Phase 6.6 implementation notes (2026-04-25)
 

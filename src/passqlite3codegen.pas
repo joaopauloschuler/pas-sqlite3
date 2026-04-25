@@ -1575,8 +1575,7 @@ function  sqlite3Select(pParse: PParse; p: PSelect;
 procedure sqlite3DeleteTable(db: PTsqlite3; pTab: PTable2);
 procedure sqlite3WithDelete(db: PTsqlite3; pWth: PWith);
 procedure sqlite3WithDeleteGeneric(db: PTsqlite3; p: Pointer);
-procedure sqlite3WindowListDelete(db: PTsqlite3; p: PWindow);
-procedure sqlite3WindowUnlinkFromSelect(p: PWindow);
+{ sqlite3WindowListDelete and sqlite3WindowUnlinkFromSelect declared in Phase 6.7 block below }
 function  sqlite3OomFault(db: PTsqlite3): Pointer;
 function  sqlite3ExprNNCollSeq(pParse: PParse; pE: PExpr): Pointer;
 function  sqlite3ExprCollSeq(pParse: PParse; pE: PExpr): Pointer;
@@ -1714,12 +1713,33 @@ procedure sqlite3RenameTokenMap(pParse: PParse; pPtr: Pointer;
 procedure sqlite3VdbeAddDblquoteStr(db: PTsqlite3; pVdbe: PVdbe;
   z: PAnsiChar);
 
-{ Window stubs (Phase 6.7) }
+{ Phase 6.7 — window.c public API }
 procedure sqlite3WindowDelete(db: PTsqlite3; p: PWindow);
+procedure sqlite3WindowListDelete(db: PTsqlite3; p: PWindow);
 function  sqlite3WindowDup(db: PTsqlite3; pOwner: PExpr;
   p: PWindow): PWindow;
-procedure sqlite3WindowLink(pSel: PSelect; pWin: PWindow);
 function  sqlite3WindowListDup(db: PTsqlite3; p: PWindow): PWindow;
+procedure sqlite3WindowLink(pSel: PSelect; pWin: PWindow);
+procedure sqlite3WindowUnlinkFromSelect(p: PWindow);
+function  sqlite3WindowAlloc(pParse: PParse; eType: i32; eStart: i32;
+  pStart: PExpr; eEnd: i32; pEnd: PExpr; eExclude: u8): PWindow;
+function  sqlite3WindowAssemble(pParse: PParse; pWin: PWindow;
+  pPartition: PExprList; pOrderBy: PExprList; pBase: PToken): PWindow;
+procedure sqlite3WindowChain(pParse: PParse; pWin: PWindow; pList: PWindow);
+procedure sqlite3WindowAttach(pParse: PParse; p: PExpr; pWin: PWindow);
+function  sqlite3WindowCompare(pParse: PParse; p1: PWindow; p2: PWindow;
+  bFilter: i32): i32;
+procedure sqlite3WindowUpdate(pParse: PParse; pList: PWindow;
+  pWin: PWindow; pFunc: Pointer);
+function  sqlite3WindowRewrite(pParse: PParse; p: PSelect): i32;
+procedure sqlite3WindowCodeInit(pParse: PParse; pSelect: PSelect);
+procedure sqlite3WindowCodeStep(pParse: PParse; p: PSelect;
+  pWInfo: Pointer; regGosub: i32; addrGosub: i32);
+procedure sqlite3WindowFunctions;
+function  sqlite3ExprCompare(pParse: PParse; pA: PExpr; pB: PExpr;
+  iTab: i32): i32;
+function  sqlite3ExprListCompare(pA: PExprList; pB: PExprList;
+  iTab: i32): i32;
 
 // ---------------------------------------------------------------------------
 // Phase 6.1 public API — resolve.c (stubs for now)
@@ -2438,18 +2458,7 @@ begin
   Result := pAllocated;
 end;
 
-{ Stubs for window functions (Phase 6.7) }
-procedure sqlite3WindowDelete(db: PTsqlite3; p: PWindow);
-begin { Phase 6.7 stub } end;
-
-function sqlite3WindowDup(db: PTsqlite3; pOwner: PExpr; p: PWindow): PWindow;
-begin Result := nil; end;
-
-procedure sqlite3WindowLink(pSel: PSelect; pWin: PWindow);
-begin { Phase 6.7 stub } end;
-
-function sqlite3WindowListDup(db: PTsqlite3; p: PWindow): PWindow;
-begin Result := nil; end;
+{ Phase 6.7 window stubs — real implementations follow at end of file }
 
 { Stubs for rename/auth/cleanup (Phase 6.5/6.6) }
 function sqlite3AffinityType(zIn: PAnsiChar; pColl: Pointer): AnsiChar;
@@ -4820,15 +4829,7 @@ begin
   sqlite3WithDelete(db, PWith(p));
 end;
 
-{ sqlite3WindowListDelete — free a list of Window objects (Phase 6.7 stub) }
-procedure sqlite3WindowListDelete(db: PTsqlite3; p: PWindow);
-begin { Phase 6.7 stub — window list freeing deferred } end;
-
-{ sqlite3WindowUnlinkFromSelect — unlink a window from its Select }
-procedure sqlite3WindowUnlinkFromSelect(p: PWindow);
-begin
-  if p^.ppThis <> nil then p^.ppThis^ := p^.pNextWin;
-end;
+{ Phase 6.7 implementations are at the end of the file }
 
 { sqlite3OomFault — mark OOM condition on db and return nil }
 function sqlite3OomFault(db: PTsqlite3): Pointer;
@@ -8424,6 +8425,1131 @@ begin
   end;
   while p^ = Ord('%') do Inc(p);
   if (p^ = 0) and (s^ = 0) then Result := 0 else Result := 1;
+end;
+
+
+// ===========================================================================
+// Phase 6.7 — window.c port
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Context structs for built-in window function callbacks
+// ---------------------------------------------------------------------------
+type
+  TCallCount = record
+    nValue: i64;
+    nStep:  i64;
+    nTotal: i64;
+  end;
+  PCallCount = ^TCallCount;
+
+  TNthValueCtx = record
+    nStep:  i64;
+    pValue: Psqlite3_value;
+  end;
+  PNthValueCtx = ^TNthValueCtx;
+
+  TNtileCtx = record
+    nTotal: i64;
+    nParam: i64;
+    iRow:   i64;
+  end;
+  PNtileCtx = ^TNtileCtx;
+
+  TLastValueCtx = record
+    pVal: Psqlite3_value;
+    nVal: i32;
+  end;
+  PLastValueCtx = ^TLastValueCtx;
+
+  { WindowRewrite context for selectWindowRewriteExprCb walker }
+  TWindowRewrite = record
+    pWin:       PWindow;
+    pSrc:       PSrcList;
+    pSub:       PExprList;
+    pTab:       PTable2;
+    pSubSelect: PSelect;
+  end;
+  PWindowRewrite = ^TWindowRewrite;
+
+// ---------------------------------------------------------------------------
+// row_number()
+// ---------------------------------------------------------------------------
+procedure row_numberStepFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var p: ^i64;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(i64));
+  if p <> nil then Inc(p^);
+end;
+
+procedure row_numberValueFunc(pCtx: Psqlite3_context); cdecl;
+var p: ^i64;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(i64));
+  if p <> nil then sqlite3_result_int64(pCtx, p^)
+  else sqlite3_result_int64(pCtx, 0);
+end;
+
+// ---------------------------------------------------------------------------
+// dense_rank()
+// ---------------------------------------------------------------------------
+procedure dense_rankStepFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var p: PCallCount;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TCallCount));
+  if p <> nil then p^.nStep := 1;
+end;
+
+procedure dense_rankValueFunc(pCtx: Psqlite3_context); cdecl;
+var p: PCallCount;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TCallCount));
+  if p <> nil then begin
+    if p^.nStep <> 0 then begin
+      Inc(p^.nValue);
+      p^.nStep := 0;
+    end;
+    sqlite3_result_int64(pCtx, p^.nValue);
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// rank()
+// ---------------------------------------------------------------------------
+procedure rankStepFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var p: PCallCount;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TCallCount));
+  if p <> nil then begin
+    Inc(p^.nStep);
+    if p^.nValue = 0 then p^.nValue := p^.nStep;
+  end;
+end;
+
+procedure rankValueFunc(pCtx: Psqlite3_context); cdecl;
+var p: PCallCount;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TCallCount));
+  if p <> nil then begin
+    sqlite3_result_int64(pCtx, p^.nValue);
+    p^.nValue := 0;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// percent_rank()
+// ---------------------------------------------------------------------------
+procedure percent_rankStepFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var p: PCallCount;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TCallCount));
+  if p <> nil then Inc(p^.nTotal);
+end;
+
+procedure percent_rankInvFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var p: PCallCount;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TCallCount));
+  if p <> nil then Inc(p^.nStep);
+end;
+
+procedure percent_rankValueFunc(pCtx: Psqlite3_context); cdecl;
+var p: PCallCount;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TCallCount));
+  if p <> nil then begin
+    p^.nValue := p^.nStep;
+    if p^.nTotal > 1 then
+      sqlite3_result_double(pCtx, Double(p^.nValue) / Double(p^.nTotal - 1))
+    else
+      sqlite3_result_double(pCtx, 0.0);
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// cume_dist()
+// ---------------------------------------------------------------------------
+procedure cume_distStepFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var p: PCallCount;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TCallCount));
+  if p <> nil then Inc(p^.nTotal);
+end;
+
+procedure cume_distInvFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var p: PCallCount;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TCallCount));
+  if p <> nil then Inc(p^.nStep);
+end;
+
+procedure cume_distValueFunc(pCtx: Psqlite3_context); cdecl;
+var p: PCallCount;
+begin
+  p := sqlite3_aggregate_context(pCtx, 0);
+  if p <> nil then
+    sqlite3_result_double(pCtx, Double(p^.nStep) / Double(p^.nTotal));
+end;
+
+// ---------------------------------------------------------------------------
+// ntile(N)
+// ---------------------------------------------------------------------------
+procedure ntileStepFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var p: PNtileCtx;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TNtileCtx));
+  if p <> nil then begin
+    if p^.nTotal = 0 then begin
+      p^.nParam := sqlite3_value_int64(Psqlite3_value(apArg^));
+      if p^.nParam <= 0 then
+        sqlite3_result_error(pCtx,
+          'argument of ntile must be a positive integer', -1);
+    end;
+    Inc(p^.nTotal);
+  end;
+end;
+
+procedure ntileInvFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var p: PNtileCtx;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TNtileCtx));
+  if p <> nil then Inc(p^.iRow);
+end;
+
+procedure ntileValueFunc(pCtx: Psqlite3_context); cdecl;
+var
+  p: PNtileCtx;
+  nSize, nLarge, iSmall, iRow: i64;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TNtileCtx));
+  if (p <> nil) and (p^.nParam > 0) then begin
+    nSize := p^.nTotal div p^.nParam;
+    if nSize = 0 then begin
+      sqlite3_result_int64(pCtx, p^.iRow + 1);
+    end else begin
+      nLarge := p^.nTotal - p^.nParam * nSize;
+      iSmall := nLarge * (nSize + 1);
+      iRow   := p^.iRow;
+      if iRow < iSmall then
+        sqlite3_result_int64(pCtx, 1 + iRow div (nSize + 1))
+      else
+        sqlite3_result_int64(pCtx, 1 + nLarge + (iRow - iSmall) div nSize);
+    end;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// last_value(X)
+// ---------------------------------------------------------------------------
+procedure last_valueStepFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var p: PLastValueCtx;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TLastValueCtx));
+  if p <> nil then begin
+    sqlite3_value_free(p^.pVal);
+    p^.pVal := sqlite3_value_dup(Psqlite3_value(apArg^));
+    if p^.pVal = nil then sqlite3_result_error_nomem(pCtx)
+    else Inc(p^.nVal);
+  end;
+end;
+
+procedure last_valueInvFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var p: PLastValueCtx;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TLastValueCtx));
+  if p <> nil then begin
+    Dec(p^.nVal);
+    if p^.nVal = 0 then begin
+      sqlite3_value_free(p^.pVal);
+      p^.pVal := nil;
+    end;
+  end;
+end;
+
+procedure last_valueValueFunc(pCtx: Psqlite3_context); cdecl;
+var p: PLastValueCtx;
+begin
+  p := sqlite3_aggregate_context(pCtx, 0);
+  if (p <> nil) and (p^.pVal <> nil) then
+    sqlite3_result_value(pCtx, p^.pVal);
+end;
+
+procedure last_valueFinalizeFunc(pCtx: Psqlite3_context); cdecl;
+var p: PLastValueCtx;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TLastValueCtx));
+  if (p <> nil) and (p^.pVal <> nil) then begin
+    sqlite3_result_value(pCtx, p^.pVal);
+    sqlite3_value_free(p^.pVal);
+    p^.pVal := nil;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// nth_value(X, N)
+// ---------------------------------------------------------------------------
+procedure nth_valueStepFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var
+  p:    PNthValueCtx;
+  iVal: i64;
+  fVal: Double;
+  typ:  i32;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TNthValueCtx));
+  if p <> nil then begin
+    typ := sqlite3_value_type(Psqlite3_value((apArg + 1)^));
+    case typ of
+      SQLITE_INTEGER:
+        iVal := sqlite3_value_int64(Psqlite3_value((apArg + 1)^));
+      SQLITE_FLOAT: begin
+        fVal := sqlite3_value_double(Psqlite3_value((apArg + 1)^));
+        iVal := Trunc(fVal);
+        if Double(iVal) <> fVal then begin
+          sqlite3_result_error(pCtx,
+            'second argument to nth_value must be a positive integer', -1);
+          Exit;
+        end;
+      end;
+    else begin
+      sqlite3_result_error(pCtx,
+        'second argument to nth_value must be a positive integer', -1);
+      Exit;
+    end;
+    end;
+    if iVal <= 0 then begin
+      sqlite3_result_error(pCtx,
+        'second argument to nth_value must be a positive integer', -1);
+      Exit;
+    end;
+    Inc(p^.nStep);
+    if iVal = p^.nStep then begin
+      p^.pValue := sqlite3_value_dup(Psqlite3_value(apArg^));
+      if p^.pValue = nil then sqlite3_result_error_nomem(pCtx);
+    end;
+  end;
+end;
+
+procedure nth_valueFinalizeFunc(pCtx: Psqlite3_context); cdecl;
+var p: PNthValueCtx;
+begin
+  p := sqlite3_aggregate_context(pCtx, 0);
+  if (p <> nil) and (p^.pValue <> nil) then begin
+    sqlite3_result_value(pCtx, p^.pValue);
+    sqlite3_value_free(p^.pValue);
+    p^.pValue := nil;
+  end;
+end;
+
+procedure noopWindowStepFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+begin end;
+
+procedure noopWindowValueFunc(pCtx: Psqlite3_context); cdecl;
+begin end;
+
+// ---------------------------------------------------------------------------
+// first_value(X)
+// ---------------------------------------------------------------------------
+procedure first_valueStepFunc(pCtx: Psqlite3_context; nArg: i32;
+  apArg: PPMem); cdecl;
+var p: PNthValueCtx;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TNthValueCtx));
+  if (p <> nil) and (p^.pValue = nil) then begin
+    p^.pValue := sqlite3_value_dup(Psqlite3_value(apArg^));
+    if p^.pValue = nil then sqlite3_result_error_nomem(pCtx);
+  end;
+end;
+
+procedure first_valueFinalizeFunc(pCtx: Psqlite3_context); cdecl;
+var p: PNthValueCtx;
+begin
+  p := sqlite3_aggregate_context(pCtx, SizeOf(TNthValueCtx));
+  if (p <> nil) and (p^.pValue <> nil) then begin
+    sqlite3_result_value(pCtx, p^.pValue);
+    sqlite3_value_free(p^.pValue);
+    p^.pValue := nil;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// Static window function name literals (pointer identity used in comparisons)
+// ---------------------------------------------------------------------------
+const
+  row_numberName:   PAnsiChar = 'row_number';
+  dense_rankName:   PAnsiChar = 'dense_rank';
+  rankName:         PAnsiChar = 'rank';
+  percent_rankName: PAnsiChar = 'percent_rank';
+  cume_distName:    PAnsiChar = 'cume_dist';
+  ntileName:        PAnsiChar = 'ntile';
+  last_valueName:   PAnsiChar = 'last_value';
+  nth_valueName:    PAnsiChar = 'nth_value';
+  first_valueName:  PAnsiChar = 'first_value';
+  leadName:         PAnsiChar = 'lead';
+  lagName:          PAnsiChar = 'lag';
+
+// ---------------------------------------------------------------------------
+// sqlite3WindowFunctions — register built-in window functions
+// window.c:610
+// ---------------------------------------------------------------------------
+var
+  aWindowFuncs: array[0..14] of TFuncDef;
+
+procedure InitWindowFuncs;
+const WIN_ENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_WINDOW;
+procedure MakeWinX(var fd: TFuncDef; n: i16;
+  stepP: TxSFuncProc; valP: TxFinalProc; nm: PAnsiChar); inline;
+begin
+  FillChar(fd, SizeOf(fd), 0);
+  fd.nArg      := n;
+  fd.funcFlags := WIN_ENC;
+  fd.xSFunc    := stepP;
+  fd.xFinalize := valP;
+  fd.xValue    := valP;
+  fd.xInverse  := TxInverseProc(@noopWindowStepFunc);
+  fd.zName     := nm;
+end;
+procedure MakeWinAll(var fd: TFuncDef; n: i16;
+  stepP: TxSFuncProc; finalP: TxFinalProc; valP: TxFinalProc;
+  invP: TxInverseProc; nm: PAnsiChar); inline;
+begin
+  FillChar(fd, SizeOf(fd), 0);
+  fd.nArg      := n;
+  fd.funcFlags := WIN_ENC;
+  fd.xSFunc    := stepP;
+  fd.xFinalize := finalP;
+  fd.xValue    := valP;
+  fd.xInverse  := invP;
+  fd.zName     := nm;
+end;
+procedure MakeWinNoop(var fd: TFuncDef; n: i16; nm: PAnsiChar); inline;
+begin
+  FillChar(fd, SizeOf(fd), 0);
+  fd.nArg      := n;
+  fd.funcFlags := WIN_ENC;
+  fd.xSFunc    := TxSFuncProc(@noopWindowStepFunc);
+  fd.xFinalize := TxFinalProc(@noopWindowValueFunc);
+  fd.xValue    := TxFinalProc(@noopWindowValueFunc);
+  fd.xInverse  := TxInverseProc(@noopWindowStepFunc);
+  fd.zName     := nm;
+end;
+begin
+  MakeWinX(aWindowFuncs[0],  0, @row_numberStepFunc,   @row_numberValueFunc,   row_numberName);
+  MakeWinX(aWindowFuncs[1],  0, @dense_rankStepFunc,   @dense_rankValueFunc,   dense_rankName);
+  MakeWinX(aWindowFuncs[2],  0, @rankStepFunc,         @rankValueFunc,         rankName);
+  MakeWinAll(aWindowFuncs[3], 0, @percent_rankStepFunc,
+    TxFinalProc(@percent_rankValueFunc), TxFinalProc(@percent_rankValueFunc),
+    @percent_rankInvFunc, percent_rankName);
+  MakeWinAll(aWindowFuncs[4], 0, @cume_distStepFunc,
+    TxFinalProc(@cume_distValueFunc), TxFinalProc(@cume_distValueFunc),
+    @cume_distInvFunc, cume_distName);
+  MakeWinAll(aWindowFuncs[5], 1, @ntileStepFunc,
+    TxFinalProc(@ntileValueFunc), TxFinalProc(@ntileValueFunc),
+    @ntileInvFunc, ntileName);
+  MakeWinAll(aWindowFuncs[6], 1, @last_valueStepFunc,
+    @last_valueFinalizeFunc, TxFinalProc(@last_valueValueFunc),
+    @last_valueInvFunc, last_valueName);
+  MakeWinAll(aWindowFuncs[7], 2, @nth_valueStepFunc,
+    @nth_valueFinalizeFunc, TxFinalProc(@noopWindowValueFunc),
+    TxInverseProc(@noopWindowStepFunc), nth_valueName);
+  MakeWinAll(aWindowFuncs[8], 1, @first_valueStepFunc,
+    @first_valueFinalizeFunc, TxFinalProc(@noopWindowValueFunc),
+    TxInverseProc(@noopWindowStepFunc), first_valueName);
+  MakeWinNoop(aWindowFuncs[9],  1, leadName);
+  MakeWinNoop(aWindowFuncs[10], 2, leadName);
+  MakeWinNoop(aWindowFuncs[11], 3, leadName);
+  MakeWinNoop(aWindowFuncs[12], 1, lagName);
+  MakeWinNoop(aWindowFuncs[13], 2, lagName);
+  MakeWinNoop(aWindowFuncs[14], 3, lagName);
+end;
+
+procedure sqlite3WindowFunctions;
+begin
+  InitWindowFuncs;
+  sqlite3InsertBuiltinFuncs(@aWindowFuncs, Length(aWindowFuncs));
+end;
+
+// ---------------------------------------------------------------------------
+// sqlite3ExprCompare — compare two expressions (expr.c:6544)
+// Returns 0 if identical, 1 if certainly different, 2 if indeterminate.
+// ---------------------------------------------------------------------------
+function sqlite3ExprCompare(pParse: PParse; pA: PExpr; pB: PExpr;
+  iTab: i32): i32;
+var
+  combinedFlags: u32;
+begin
+  if (pA = nil) or (pB = nil) then begin
+    if pA = pB then Result := 0 else Result := 2;
+    Exit;
+  end;
+  combinedFlags := pA^.flags or pB^.flags;
+  if (combinedFlags and EP_IntValue) <> 0 then begin
+    if ((pA^.flags and pB^.flags and EP_IntValue) <> 0) and
+       (pA^.u.iValue = pB^.u.iValue) then
+      Result := 0
+    else
+      Result := 2;
+    Exit;
+  end;
+  if pA^.op <> pB^.op then begin
+    { TK_COLLATE with matching left → 1, not 2 }
+    if (pA^.op = TK_COLLATE) and
+       (sqlite3ExprCompare(pParse, pA^.pLeft, pB, iTab) < 2) then begin
+      Result := 1; Exit;
+    end;
+    if (pB^.op = TK_COLLATE) and
+       (sqlite3ExprCompare(pParse, pA, pB^.pLeft, iTab) < 2) then begin
+      Result := 1; Exit;
+    end;
+    if not ((pA^.op = TK_AGG_COLUMN) and (pB^.op = TK_COLUMN) and
+            (pB^.iTable < 0) and (pA^.iTable = iTab)) then begin
+      Result := 2; Exit;
+    end;
+  end;
+  { Check token string }
+  if pA^.u.zToken <> nil then begin
+    if (pA^.op = TK_FUNCTION) or (pA^.op = TK_AGG_FUNCTION) then begin
+      if sqlite3StrICmp(pA^.u.zToken, pB^.u.zToken) <> 0 then begin
+        Result := 2; Exit;
+      end;
+    end else if pA^.op = TK_NULL then begin
+      Result := 0; Exit;
+    end else if pA^.op = TK_COLLATE then begin
+      if sqlite3StrICmp(pA^.u.zToken, pB^.u.zToken) <> 0 then begin
+        Result := 2; Exit;
+      end;
+    end else if (pB^.u.zToken <> nil) and
+                (pA^.op <> TK_COLUMN) and (pA^.op <> TK_AGG_COLUMN) and
+                (StrComp(pA^.u.zToken, pB^.u.zToken) <> 0) then begin
+      Result := 2; Exit;
+    end;
+  end;
+  if ((pA^.flags xor pB^.flags) and (EP_Distinct or EP_Commuted)) <> 0 then begin
+    Result := 2; Exit;
+  end;
+  if (combinedFlags and EP_TokenOnly) = 0 then begin
+    if (combinedFlags and EP_xIsSelect) <> 0 then begin Result := 2; Exit; end;
+    if (combinedFlags and EP_FixedCol) = 0 then begin
+      if sqlite3ExprCompare(pParse, pA^.pLeft, pB^.pLeft, iTab) <> 0 then begin
+        Result := 2; Exit;
+      end;
+    end;
+    if sqlite3ExprCompare(pParse, pA^.pRight, pB^.pRight, iTab) <> 0 then begin
+      Result := 2; Exit;
+    end;
+    if sqlite3ExprListCompare(pA^.x.pList, pB^.x.pList, iTab) <> 0 then begin
+      Result := 2; Exit;
+    end;
+    if (pA^.op <> TK_STRING) and (pA^.op <> TK_TRUEFALSE) and
+       ((combinedFlags and EP_Reduced) = 0) then begin
+      if pA^.iColumn <> pB^.iColumn then begin Result := 2; Exit; end;
+      if (pA^.op2 <> pB^.op2) and (pA^.op = TK_TRUTH) then begin
+        Result := 2; Exit;
+      end;
+      if (pA^.op <> TK_IN) and (pA^.iTable <> pB^.iTable) and
+         (pA^.iTable <> iTab) then begin
+        Result := 2; Exit;
+      end;
+    end;
+  end;
+  Result := 0;
+end;
+
+// ---------------------------------------------------------------------------
+// sqlite3ExprListCompare — compare two ExprList objects (expr.c:6646)
+// ---------------------------------------------------------------------------
+function sqlite3ExprListCompare(pA: PExprList; pB: PExprList;
+  iTab: i32): i32;
+var
+  i:    i32;
+  res:  i32;
+  aA:   PExprListItem;
+  aB:   PExprListItem;
+begin
+  if (pA = nil) and (pB = nil) then begin Result := 0; Exit; end;
+  if (pA = nil) or (pB = nil) then begin Result := 1; Exit; end;
+  if pA^.nExpr <> pB^.nExpr then begin Result := 1; Exit; end;
+  aA := ExprListItems(pA);
+  aB := ExprListItems(pB);
+  for i := 0 to pA^.nExpr - 1 do begin
+    if aA[i].fg.sortFlags <> aB[i].fg.sortFlags then begin Result := 1; Exit; end;
+    res := sqlite3ExprCompare(nil, aA[i].pExpr, aB[i].pExpr, iTab);
+    if res <> 0 then begin Result := res; Exit; end;
+  end;
+  Result := 0;
+end;
+
+// ---------------------------------------------------------------------------
+// Window lifecycle — window.c:1120–1154
+// ---------------------------------------------------------------------------
+
+procedure sqlite3WindowUnlinkFromSelect(p: PWindow);
+begin
+  if p^.ppThis <> nil then begin
+    p^.ppThis^ := p^.pNextWin;
+    if p^.pNextWin <> nil then p^.pNextWin^.ppThis := p^.ppThis;
+    p^.ppThis := nil;
+  end;
+end;
+
+procedure sqlite3WindowDelete(db: PTsqlite3; p: PWindow);
+begin
+  if p <> nil then begin
+    sqlite3WindowUnlinkFromSelect(p);
+    sqlite3ExprDelete(db, p^.pFilter);
+    sqlite3ExprListDelete(db, p^.pPartition);
+    sqlite3ExprListDelete(db, p^.pOrderBy);
+    sqlite3ExprDelete(db, p^.pEnd);
+    sqlite3ExprDelete(db, p^.pStart);
+    sqlite3DbFree(db, p^.zName);
+    sqlite3DbFree(db, p^.zBase);
+    sqlite3DbFree(db, p);
+  end;
+end;
+
+procedure sqlite3WindowListDelete(db: PTsqlite3; p: PWindow);
+var pNext: PWindow;
+begin
+  while p <> nil do begin
+    pNext := p^.pNextWin;
+    sqlite3WindowDelete(db, p);
+    p := pNext;
+  end;
+end;
+
+function sqlite3WindowDup(db: PTsqlite3; pOwner: PExpr;
+  p: PWindow): PWindow;
+var pNew: PWindow;
+begin
+  if p = nil then begin Result := nil; Exit; end;
+  pNew := PWindow(sqlite3DbMallocZero(db, SizeOf(TWindow)));
+  if pNew = nil then begin Result := nil; Exit; end;
+  pNew^.zName      := sqlite3DbStrDup(db, p^.zName);
+  pNew^.zBase      := sqlite3DbStrDup(db, p^.zBase);
+  pNew^.pPartition := sqlite3ExprListDup(db, p^.pPartition, 0);
+  pNew^.pOrderBy   := sqlite3ExprListDup(db, p^.pOrderBy, 0);
+  pNew^.eFrmType   := p^.eFrmType;
+  pNew^.eStart     := p^.eStart;
+  pNew^.eEnd       := p^.eEnd;
+  pNew^.eExclude   := p^.eExclude;
+  pNew^.bImplicitFrame := p^.bImplicitFrame;
+  pNew^.pStart     := sqlite3ExprDup(db, p^.pStart, 0);
+  pNew^.pEnd       := sqlite3ExprDup(db, p^.pEnd, 0);
+  pNew^.pFilter    := sqlite3ExprDup(db, p^.pFilter, 0);
+  pNew^.pWFunc     := p^.pWFunc;
+  pNew^.pOwner     := pOwner;
+  Result := pNew;
+end;
+
+function sqlite3WindowListDup(db: PTsqlite3; p: PWindow): PWindow;
+var
+  pRet:   PWindow;
+  pp:     PPWindow;
+  pWin:   PWindow;
+begin
+  pRet := nil;
+  pp   := @pRet;
+  pWin := p;
+  while pWin <> nil do begin
+    pp^    := sqlite3WindowDup(db, nil, pWin);
+    if pp^ = nil then begin Result := pRet; Exit; end;
+    pp := @(pp^^.pNextWin);
+    pWin := pWin^.pNextWin;
+  end;
+  Result := pRet;
+end;
+
+// ---------------------------------------------------------------------------
+// windowFind — look up a named window in a list (window.c:631, static)
+// ---------------------------------------------------------------------------
+function windowFind(pParse: PParse; pList: PWindow;
+  zName: PAnsiChar): PWindow;
+var p: PWindow;
+begin
+  p := pList;
+  while p <> nil do begin
+    if sqlite3StrICmp(p^.zName, zName) = 0 then begin
+      Result := p; Exit;
+    end;
+    p := p^.pNextWin;
+  end;
+  sqlite3ErrorMsg(pParse, PAnsiChar(AnsiString('no such window: ') + AnsiString(zName)));
+  Result := nil;
+end;
+
+// ---------------------------------------------------------------------------
+// sqlite3WindowAlloc — allocate and initialise a Window (window.c:1175)
+// ---------------------------------------------------------------------------
+function sqlite3WindowAlloc(pParse: PParse; eType: i32; eStart: i32;
+  pStart: PExpr; eEnd: i32; pEnd: PExpr; eExclude: u8): PWindow;
+var
+  pWin:          PWindow;
+  bImplicitFrame: i32;
+begin
+  Result := nil;
+  if pParse = nil then Exit;
+  pWin := nil;
+  bImplicitFrame := 0;
+  if eType = 0 then begin
+    bImplicitFrame := 1;
+    eType := TK_RANGE;
+  end;
+  { Validate start/end ordering }
+  if ((eStart = TK_CURRENT) and (eEnd = TK_PRECEDING)) or
+     ((eStart = TK_FOLLOWING) and
+      ((eEnd = TK_PRECEDING) or (eEnd = TK_CURRENT))) then begin
+    sqlite3ErrorMsg(pParse, 'unsupported frame specification');
+    sqlite3ExprDelete(pParse^.db, pEnd);
+    sqlite3ExprDelete(pParse^.db, pStart);
+    Result := nil;
+    Exit;
+  end;
+  pWin := PWindow(sqlite3DbMallocZero(pParse^.db, SizeOf(TWindow)));
+  if pWin = nil then begin
+    sqlite3ExprDelete(pParse^.db, pEnd);
+    sqlite3ExprDelete(pParse^.db, pStart);
+    Result := nil;
+    Exit;
+  end;
+  pWin^.eFrmType      := u8(eType);
+  pWin^.eStart        := u8(eStart);
+  pWin^.eEnd          := u8(eEnd);
+  pWin^.eExclude      := eExclude;
+  pWin^.bImplicitFrame:= u8(bImplicitFrame);
+  { sqlite3WindowOffsetExpr: if not constant, replace with NULL }
+  if (pEnd <> nil) and (sqlite3ExprIsConstant(nil, pEnd) = 0) then begin
+    sqlite3ExprDelete(pParse^.db, pEnd);
+    pEnd := sqlite3ExprAlloc(pParse^.db, TK_NULL, nil, 0);
+  end;
+  if (pStart <> nil) and (sqlite3ExprIsConstant(nil, pStart) = 0) then begin
+    sqlite3ExprDelete(pParse^.db, pStart);
+    pStart := sqlite3ExprAlloc(pParse^.db, TK_NULL, nil, 0);
+  end;
+  pWin^.pEnd   := pEnd;
+  pWin^.pStart := pStart;
+  Result := pWin;
+end;
+
+// ---------------------------------------------------------------------------
+// sqlite3WindowAssemble — attach PARTITION/ORDER BY to window (window.c:1247)
+// ---------------------------------------------------------------------------
+function sqlite3WindowAssemble(pParse: PParse; pWin: PWindow;
+  pPartition: PExprList; pOrderBy: PExprList; pBase: PToken): PWindow;
+begin
+  if pWin <> nil then begin
+    pWin^.pPartition := pPartition;
+    pWin^.pOrderBy   := pOrderBy;
+    if pBase <> nil then
+      pWin^.zBase := sqlite3DbStrNDup(pParse^.db, pBase^.z, u64(pBase^.n));
+  end else begin
+    sqlite3ExprListDelete(pParse^.db, pPartition);
+    sqlite3ExprListDelete(pParse^.db, pOrderBy);
+  end;
+  Result := pWin;
+end;
+
+// ---------------------------------------------------------------------------
+// sqlite3WindowChain — validate and chain a named window (window.c:1274)
+// ---------------------------------------------------------------------------
+procedure sqlite3WindowChain(pParse: PParse; pWin: PWindow; pList: PWindow);
+var
+  db:     PTsqlite3;
+  pExist: PWindow;
+  zErr:   PAnsiChar;
+begin
+  if pWin^.zBase <> nil then begin
+    db := pParse^.db;
+    pExist := windowFind(pParse, pList, pWin^.zBase);
+    if pExist <> nil then begin
+      zErr := nil;
+      if pWin^.pPartition <> nil then
+        zErr := 'PARTITION clause'
+      else if (pExist^.pOrderBy <> nil) and (pWin^.pOrderBy <> nil) then
+        zErr := 'ORDER BY clause'
+      else if pExist^.bImplicitFrame = 0 then
+        zErr := 'frame specification';
+      if zErr <> nil then begin
+        sqlite3ErrorMsg(pParse,
+          PAnsiChar(AnsiString('cannot override ') + AnsiString(zErr) +
+                    AnsiString(' of window: ') + AnsiString(pWin^.zBase)));
+      end else begin
+        pWin^.pPartition := sqlite3ExprListDup(db, pExist^.pPartition, 0);
+        if pExist^.pOrderBy <> nil then
+          pWin^.pOrderBy := sqlite3ExprListDup(db, pExist^.pOrderBy, 0);
+        sqlite3DbFree(db, pWin^.zBase);
+        pWin^.zBase := nil;
+      end;
+    end;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// sqlite3WindowAttach — attach a Window to an expression (window.c:1308)
+// ---------------------------------------------------------------------------
+procedure sqlite3WindowAttach(pParse: PParse; p: PExpr; pWin: PWindow);
+begin
+  if p <> nil then begin
+    p^.y.pWin := pWin;
+    p^.flags  := p^.flags or (EP_WinFunc or EP_FullSize);
+    pWin^.pOwner := p;
+    if ((p^.flags and EP_Distinct) <> 0) and (pWin^.eFrmType <> TK_FILTER) then
+      sqlite3ErrorMsg(pParse,
+        'DISTINCT is not supported for window functions');
+  end else begin
+    sqlite3WindowDelete(pParse^.db, pWin);
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// sqlite3WindowLink — link a window into a Select (window.c:1332)
+// ---------------------------------------------------------------------------
+procedure sqlite3WindowLink(pSel: PSelect; pWin: PWindow);
+begin
+  if pSel <> nil then begin
+    if (pSel^.pWin = nil) or
+       (sqlite3WindowCompare(nil, pSel^.pWin, pWin, 0) = 0) then begin
+      pWin^.pNextWin := pSel^.pWin;
+      if pSel^.pWin <> nil then
+        pSel^.pWin^.ppThis := @pWin^.pNextWin;
+      pSel^.pWin  := pWin;
+      pWin^.ppThis := @pSel^.pWin;
+    end else begin
+      if sqlite3ExprListCompare(pWin^.pPartition,
+                                pSel^.pWin^.pPartition, -1) <> 0 then
+        pSel^.selFlags := pSel^.selFlags or SF_MultiPart;
+    end;
+  end;
+end;
+
+// ---------------------------------------------------------------------------
+// sqlite3WindowCompare — compare two windows (window.c:1354)
+// Returns 0 identical, 1 different, 2 indeterminate.
+// ---------------------------------------------------------------------------
+function sqlite3WindowCompare(pParse: PParse; p1: PWindow; p2: PWindow;
+  bFilter: i32): i32;
+var res: i32;
+begin
+  if (p1 = nil) or (p2 = nil) then begin Result := 1; Exit; end;
+  if p1^.eFrmType  <> p2^.eFrmType  then begin Result := 1; Exit; end;
+  if p1^.eStart    <> p2^.eStart    then begin Result := 1; Exit; end;
+  if p1^.eEnd      <> p2^.eEnd      then begin Result := 1; Exit; end;
+  if p1^.eExclude  <> p2^.eExclude  then begin Result := 1; Exit; end;
+  if sqlite3ExprCompare(pParse, p1^.pStart, p2^.pStart, -1) <> 0 then begin
+    Result := 1; Exit;
+  end;
+  if sqlite3ExprCompare(pParse, p1^.pEnd, p2^.pEnd, -1) <> 0 then begin
+    Result := 1; Exit;
+  end;
+  res := sqlite3ExprListCompare(p1^.pPartition, p2^.pPartition, -1);
+  if res <> 0 then begin Result := res; Exit; end;
+  res := sqlite3ExprListCompare(p1^.pOrderBy, p2^.pOrderBy, -1);
+  if res <> 0 then begin Result := res; Exit; end;
+  if bFilter <> 0 then begin
+    res := sqlite3ExprCompare(pParse, p1^.pFilter, p2^.pFilter, -1);
+    if res <> 0 then begin Result := res; Exit; end;
+  end;
+  Result := 0;
+end;
+
+// ---------------------------------------------------------------------------
+// sqlite3WindowUpdate — update window definition for a built-in (window.c:659)
+// ---------------------------------------------------------------------------
+procedure sqlite3WindowUpdate(pParse: PParse; pList: PWindow;
+  pWin: PWindow; pFunc: Pointer);
+type
+  TWindowUpdate = record
+    eFrmType: i32;
+    eStart:   i32;
+    eEnd:     i32;
+  end;
+const
+  aUp: array[0..7] of TWindowUpdate = (
+    (eFrmType: TK_ROWS;   eStart: TK_UNBOUNDED; eEnd: TK_CURRENT),   { row_number }
+    (eFrmType: TK_RANGE;  eStart: TK_UNBOUNDED; eEnd: TK_CURRENT),   { dense_rank }
+    (eFrmType: TK_RANGE;  eStart: TK_UNBOUNDED; eEnd: TK_CURRENT),   { rank }
+    (eFrmType: TK_GROUPS; eStart: TK_CURRENT;   eEnd: TK_UNBOUNDED), { percent_rank }
+    (eFrmType: TK_GROUPS; eStart: TK_FOLLOWING; eEnd: TK_UNBOUNDED), { cume_dist }
+    (eFrmType: TK_ROWS;   eStart: TK_CURRENT;   eEnd: TK_UNBOUNDED), { ntile }
+    (eFrmType: TK_ROWS;   eStart: TK_UNBOUNDED; eEnd: TK_UNBOUNDED), { lead }
+    (eFrmType: TK_ROWS;   eStart: TK_UNBOUNDED; eEnd: TK_CURRENT)    { lag }
+  );
+var
+  pFD:  PTFuncDef;
+  db:   PTsqlite3;
+  i:    i32;
+  pExist: PWindow;
+begin
+  pFD := PTFuncDef(pFunc);
+  if pWin^.zName <> nil then begin
+    { Named window — copy definition from pList }
+    if pWin^.eFrmType = 0 then begin
+      pExist := windowFind(pParse, pList, pWin^.zName);
+      if pExist = nil then begin
+        pWin^.pWFunc := PFuncDef2(pFunc); Exit;
+      end;
+      db := pParse^.db;
+      pWin^.pPartition := sqlite3ExprListDup(db, pExist^.pPartition, 0);
+      pWin^.pOrderBy   := sqlite3ExprListDup(db, pExist^.pOrderBy, 0);
+      pWin^.pStart     := sqlite3ExprDup(db, pExist^.pStart, 0);
+      pWin^.pEnd       := sqlite3ExprDup(db, pExist^.pEnd, 0);
+      pWin^.eStart     := pExist^.eStart;
+      pWin^.eEnd       := pExist^.eEnd;
+      pWin^.eFrmType   := pExist^.eFrmType;
+      pWin^.eExclude   := pExist^.eExclude;
+    end else begin
+      sqlite3WindowChain(pParse, pWin, pList);
+    end;
+  end else begin
+    sqlite3WindowChain(pParse, pWin, pList);
+  end;
+  { Validate RANGE with offset }
+  if (pWin^.eFrmType = TK_RANGE) and
+     ((pWin^.pStart <> nil) or (pWin^.pEnd <> nil)) and
+     ((pWin^.pOrderBy = nil) or (pWin^.pOrderBy^.nExpr <> 1)) then begin
+    sqlite3ErrorMsg(pParse,
+      'RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression');
+  end else if (pFD <> nil) and
+              ((pFD^.funcFlags and SQLITE_FUNC_WINDOW) <> 0) then begin
+    db := pParse^.db;
+    if pWin^.pFilter <> nil then begin
+      sqlite3ErrorMsg(pParse,
+        'FILTER clause may only be used with aggregate window functions');
+    end else begin
+      { Patch built-in window function frame spec }
+      { zFunc fields set at init time; compare by pointer identity }
+      for i := 0 to 7 do begin
+        case i of
+          0: if pFD^.zName <> row_numberName   then continue;
+          1: if pFD^.zName <> dense_rankName   then continue;
+          2: if pFD^.zName <> rankName         then continue;
+          3: if pFD^.zName <> percent_rankName then continue;
+          4: if pFD^.zName <> cume_distName    then continue;
+          5: if pFD^.zName <> ntileName        then continue;
+          6: if pFD^.zName <> leadName         then continue;
+          7: if pFD^.zName <> lagName          then continue;
+        end;
+        sqlite3ExprDelete(db, pWin^.pStart);
+        sqlite3ExprDelete(db, pWin^.pEnd);
+        pWin^.pEnd     := nil;
+        pWin^.pStart   := nil;
+        pWin^.eFrmType := u8(aUp[i].eFrmType);
+        pWin^.eStart   := u8(aUp[i].eStart);
+        pWin^.eEnd     := u8(aUp[i].eEnd);
+        pWin^.eExclude := 0;
+        if pWin^.eStart = TK_FOLLOWING then
+          pWin^.pStart := sqlite3ExprInt32(db, 1);
+        break;
+      end;
+    end;
+  end;
+  pWin^.pWFunc := PFuncDef2(pFunc);
+end;
+
+// ---------------------------------------------------------------------------
+// selectWindowRewriteExprCb — walker callback for window rewrite (window.c:748)
+// ---------------------------------------------------------------------------
+function selectWindowRewriteExprCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  p:        PWindowRewrite;
+  pPrs:     PParse;
+  pWin:     PWindow;
+  iCol:     i32;
+  i:        i32;
+  nSrc:     i32;
+  pDup:     PExpr;
+  aItems:   PExprListItem;
+  bHandleCol: Boolean;
+begin
+  p := PWindowRewrite(pWalker^.u.ptr);
+  pPrs := pWalker^.pParse;
+  bHandleCol := False;
+  { Inside a scalar sub-select: only process TK_COLUMN for outer cursor }
+  if p^.pSubSelect <> nil then begin
+    if pExpr^.op <> TK_COLUMN then begin
+      Result := WRC_Continue; Exit;
+    end else begin
+      nSrc := p^.pSrc^.nSrc;
+      i := 0;
+      while i < nSrc do begin
+        if pExpr^.iTable = SrcListItems(p^.pSrc)[i].iCursor then break;
+        Inc(i);
+      end;
+      if i = nSrc then begin Result := WRC_Continue; Exit; end;
+    end;
+  end;
+  case pExpr^.op of
+    TK_FUNCTION: begin
+      if (pExpr^.flags and EP_WinFunc) = 0 then begin
+        Result := WRC_Continue; Exit;
+      end else begin
+        pWin := p^.pWin;
+        while pWin <> nil do begin
+          if pExpr^.y.pWin = pWin then begin
+            Result := WRC_Prune; Exit;
+          end;
+          pWin := pWin^.pNextWin;
+        end;
+        { Not in pWin list — fall through to column-rewrite logic }
+        bHandleCol := True;
+      end;
+    end;
+    TK_IF_NULL_ROW,
+    TK_AGG_FUNCTION,
+    TK_COLUMN: bHandleCol := True;
+  else begin
+    Result := WRC_Continue; Exit;
+  end;
+  end;
+  if not bHandleCol then begin Result := WRC_Continue; Exit; end;
+  iCol := -1;
+  if pPrs^.db^.mallocFailed <> 0 then begin
+    Result := WRC_Abort; Exit;
+  end;
+  if p^.pSub <> nil then begin
+    aItems := ExprListItems(p^.pSub);
+    i := 0;
+    while i < p^.pSub^.nExpr do begin
+      if sqlite3ExprCompare(nil, aItems[i].pExpr, pExpr, -1) = 0 then begin
+        iCol := i; break;
+      end;
+      Inc(i);
+    end;
+  end;
+  if iCol < 0 then begin
+    pDup := sqlite3ExprDup(pPrs^.db, pExpr, 0);
+    if (pDup <> nil) and (pDup^.op = TK_AGG_FUNCTION) then pDup^.op := TK_FUNCTION;
+    p^.pSub := sqlite3ExprListAppend(pPrs, p^.pSub, pDup);
+  end;
+  if p^.pSub <> nil then begin
+    pExpr^.flags := pExpr^.flags or EP_Static;
+    sqlite3ExprDelete(pPrs^.db, pExpr);
+    pExpr^.flags := pExpr^.flags and not EP_Static;
+    FillChar(pExpr^, SizeOf(TExpr), 0);
+    pExpr^.op     := TK_COLUMN;
+    if iCol < 0 then pExpr^.iColumn := i16(p^.pSub^.nExpr - 1)
+    else pExpr^.iColumn := i16(iCol);
+    pExpr^.iTable := p^.pWin^.iEphCsr;
+    pExpr^.y.pTab := p^.pTab;
+  end;
+  if pPrs^.db^.mallocFailed <> 0 then begin
+    Result := WRC_Abort; Exit;
+  end;
+  Result := WRC_Continue;
+end;
+
+function selectWindowRewriteSelectCb(pWalker: PWalker; pSel: PSelect): i32; cdecl;
+var
+  p:     PWindowRewrite;
+  pSave: PSelect;
+begin
+  p := PWindowRewrite(pWalker^.u.ptr);
+  pSave := p^.pSubSelect;
+  if pSave = pSel then begin
+    Result := WRC_Continue; Exit;
+  end else begin
+    p^.pSubSelect := pSel;
+    sqlite3WalkSelect(pWalker, pSel);
+    p^.pSubSelect := pSave;
+  end;
+  Result := WRC_Prune;
+end;
+
+procedure selectWindowRewriteEList(pParse: PParse; pWin: PWindow;
+  pSrc: PSrcList; pEList: PExprList; pTab: PTable2;
+  var ppSub: PExprList);
+var
+  sWalker:  TWalker;
+  sRewrite: TWindowRewrite;
+begin
+  FillChar(sWalker,  SizeOf(sWalker),  0);
+  FillChar(sRewrite, SizeOf(sRewrite), 0);
+  sRewrite.pSub := ppSub;
+  sRewrite.pWin := pWin;
+  sRewrite.pSrc := pSrc;
+  sRewrite.pTab := pTab;
+  sWalker.pParse          := pParse;
+  sWalker.xExprCallback   := @selectWindowRewriteExprCb;
+  sWalker.xSelectCallback := @selectWindowRewriteSelectCb;
+  sWalker.u.ptr      := @sRewrite;
+  sqlite3WalkExprList(@sWalker, pEList);
+  ppSub := sRewrite.pSub;
+end;
+
+{ exprListAppendList — append duplicates of pAppend to pList (window.c:892) }
+function exprListAppendList(pParse: PParse; pList: PExprList;
+  pAppend: PExprList; bIntToNull: i32): PExprList;
+var
+  i:     i32;
+  db:    PTsqlite3;
+  pDup:  PExpr;
+  aItem: PExprListItem;
+begin
+  Result := pList;
+  if pAppend <> nil then begin
+    db := pParse^.db;
+    aItem := ExprListItems(pAppend);
+    for i := 0 to pAppend^.nExpr - 1 do begin
+      pDup := sqlite3ExprDup(db, aItem[i].pExpr, 0);
+      if (bIntToNull <> 0) and (pDup <> nil) then begin
+        if pDup^.op = TK_INTEGER then begin
+          sqlite3ExprDelete(db, pDup);
+          pDup := sqlite3ExprAlloc(db, TK_NULL, nil, 0);
+        end;
+      end;
+      Result := sqlite3ExprListAppend(pParse, Result, pDup);
+    end;
+  end;
+end;
+
+{ Noop walker expr callback for agg-info persist pass }
+function aggInfoNoopExprCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+begin Result := WRC_Continue; end;
+
+// ---------------------------------------------------------------------------
+// sqlite3WindowRewrite — rewrite SELECT for window functions (window.c:958)
+// Full rewrite logic deferred to Phase 7+ (requires complete SELECT engine).
+// Marks SF_WinRewrite so the caller knows we processed it.
+// ---------------------------------------------------------------------------
+function sqlite3WindowRewrite(pParse: PParse; p: PSelect): i32;
+begin
+  Result := SQLITE_OK;
+  if p = nil then Exit;
+  if (p^.pWin = nil) or (p^.pPrior <> nil) or
+     ((p^.selFlags and SF_WinRewrite) <> 0) then Exit;
+  { Mark as rewritten to avoid infinite re-entry; full implementation
+    deferred to Phase 7 when the Lemon parser and full SELECT engine exist. }
+  p^.selFlags := p^.selFlags or SF_WinRewrite;
+end;
+
+// ---------------------------------------------------------------------------
+// sqlite3WindowCodeInit — init VDBE for window processing (window.c:1388)
+// Stub: requires full SELECT engine (Phase 7+).
+// ---------------------------------------------------------------------------
+procedure sqlite3WindowCodeInit(pParse: PParse; pSelect: PSelect);
+begin
+  { Phase 6.7 stub — full VDBE window code generation deferred to Phase 7+ }
+end;
+
+// ---------------------------------------------------------------------------
+// sqlite3WindowCodeStep — generate VDBE for one window step (window.c:2784)
+// Stub: requires full SELECT engine (Phase 7+).
+// ---------------------------------------------------------------------------
+procedure sqlite3WindowCodeStep(pParse: PParse; p: PSelect;
+  pWInfo: Pointer; regGosub: i32; addrGosub: i32);
+begin
+  { Phase 6.7 stub — full VDBE window code generation deferred to Phase 7+ }
 end;
 
 end.
