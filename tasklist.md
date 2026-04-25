@@ -1939,10 +1939,21 @@ statement is syntactically complete — used by the CLI and REPLs).
     Tokenizer gate test still PASS (127/127 — tables unused so far,
     serves as a regression check that the unit still compiles).
 
-  - [ ] **7.2c** Port the fallback table (`yyFallback`, parse.c lines
+  - [X] **7.2c** Port the fallback table (`yyFallback`, parse.c lines
     1398–1588) and the rule-info tables (`yyRuleInfoLhs`, `yyRuleInfoNRhs`,
     parse.c lines 2960–3791). These are also mechanical translations.
     Implement `sqlite3ParserFallback` to return `yyFallback[iToken]`.
+    DONE 2026-04-25.  Tables appended to `passqlite3parsertables.inc`
+    (lines 691+) — counts: `yyFallbackTab[187]` = YYNTOKEN, `yyRuleInfoLhs[412]`
+    = YYNRULE, `yyRuleInfoNRhs[412]` = YYNRULE.  Note: the C name `yyFallback`
+    collides case-insensitively with the `YYFALLBACK` enabling constant under
+    FPC (per the recurring var/type-conflict feedback); the Pascal table is
+    therefore named **`yyFallbackTab`**, while the constant `YYFALLBACK = 1`
+    keeps its upstream spelling.  `sqlite3ParserFallback` now indexes
+    `yyFallbackTab` directly with bounds-check on `YYNTOKEN`.  Tokenizer gate
+    test still PASS (127/127 — tables not yet exercised, regression check
+    that the unit still compiles).  `yyRuleInfoNRhs` declared as
+    `array of ShortInt` (signed 8-bit, matches C `signed char`).
 
   - [ ] **7.2d** Port the parser engine (lempar.c logic that ends up at
     parse.c lines 3792–6313): `yy_find_shift_action`, `yy_find_reduce_action`,

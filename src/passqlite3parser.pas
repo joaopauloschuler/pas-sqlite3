@@ -1090,9 +1090,13 @@ end;
 
 function sqlite3ParserFallback(iToken: i32): i32;
 begin
-  { Phase 7.2c will index into the yyFallback[] table.  Until then there is
-    no fallback for any token.                                                }
-  Result := 0;
+  { Phase 7.2c — index into the yyFallback[] table.  Returns the token
+    iToken falls back to (e.g. most non-reserved keywords fall back to
+    TK_ID), or 0 if there is no fallback.                                     }
+  if (iToken >= 0) and (iToken < YYNTOKEN) then
+    Result := yyFallbackTab[iToken]
+  else
+    Result := 0;
 end;
 
 function sqlite3ParserStackPeak(p: PyyParser): i32;
