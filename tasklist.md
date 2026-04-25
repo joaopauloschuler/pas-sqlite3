@@ -1955,13 +1955,33 @@ statement is syntactically complete — used by the CLI and REPLs).
     that the unit still compiles).  `yyRuleInfoNRhs` declared as
     `array of ShortInt` (signed 8-bit, matches C `signed char`).
 
-  - [ ] **7.2d** Port the parser engine (lempar.c logic that ends up at
+  - [X] **7.2d** Port the parser engine (lempar.c logic that ends up at
     parse.c lines 3792–6313): `yy_find_shift_action`, `yy_find_reduce_action`,
     `yy_shift`, `yy_pop_parser_stack`, `yy_destructor`, the main `sqlite3Parser`
     driver with its grow-on-demand stack (`parserStackRealloc` /
     `parserStackFree`). Use the same algorithm as the C engine. Skip the
     optional tracing functions for now (port only `yyTraceFILE` declarations
     so signatures match).
+    DONE 2026-04-25.  Engine bodies live in `passqlite3parser.pas` lines
+    1057–1330 (forward declarations + `parserStackRealloc`, `yy_destructor`
+    stub, `yy_pop_parser_stack`, `yyStackOverflow`, `yy_find_shift_action`,
+    `yy_find_reduce_action`, `yy_shift`, `yy_accept`/`yy_parse_failed`/
+    `yy_syntax_error`, `yy_reduce` framework, full `sqlite3Parser` driver,
+    rewritten `sqlite3ParserAlloc`/`Free`).  `yy_destructor` and the rule
+    switch inside `yy_reduce` are intentionally empty bodies — Phase 7.2e
+    fills them by porting parse.c:2542–2657 and 3829–5993 respectively.
+    Until reduce actions exist, yy_shift only ever stores a TToken in
+    `minor.yy0` so empty destructors are correct.  The dropped
+    yyerrcnt/`YYERRORSYMBOL` recovery path is fine: parse.y does not define
+    an error token, so the C engine takes the same fall-through (report +
+    discard token, fail at end-of-input).  Tracing (`yyTraceFILE`,
+    `yycoverage`, `yyTokenName`/`yyRuleName`) was skipped per spec.
+    Pitfall: `var pParse: PParse` triggers FPC's case-insensitive name
+    collision (per memory `feedback_fpc_vartype_conflict`); the engine
+    uses local name `pPse` everywhere it needs a `PParse` cast.
+    Tokenizer gate test still PASS (127/127 — full unit compiles, parser
+    engine not yet exercised end-to-end since `sqlite3RunParser` remains
+    stubbed pending 7.2e + 7.2f).
 
   - [ ] **7.2e** Port the **reduce actions** — the giant switch statement at
     parse.c lines 3829–5993. This is the only sub-phase that is non-mechanical:

@@ -1047,52 +1047,307 @@ begin
 end;
 
 { =========================================================================== }
-{ Phase 7.2a — Lemon parser entry-point stubs                                 }
+{ Phase 7.2d — Lemon LALR(1) parser engine (parse.c lines 2419–6313)          }
 {                                                                             }
-{ Real bodies will be filled in by phases 7.2b–7.2f.  These stubs exist so    }
-{ that callers from passqlite3codegen / passqlite3vdbe can link against the   }
-{ final API surface today.                                                    }
+{ Algorithmically equivalent to lempar.c.  yy_destructor and yy_reduce have   }
+{ empty per-symbol / per-rule case bodies — Phase 7.2e fills those in by      }
+{ porting the giant switch statements at parse.c:2530–2658 (destructors)     }
+{ and parse.c:3820–5993 (reduce actions).  The engine itself is complete     }
+{ and exercised the moment those bodies are populated.                        }
 { =========================================================================== }
 
+{ Forward declarations }
+function  yy_find_shift_action(iLookAhead: YYCODETYPE; stateno: YYACTIONTYPE): YYACTIONTYPE; forward;
+function  yy_find_reduce_action(stateno: YYACTIONTYPE; iLookAhead: YYCODETYPE): YYACTIONTYPE; forward;
+procedure yy_shift(yypParser: PyyParser; yyNewState: YYACTIONTYPE;
+                   yyMajor: YYCODETYPE; const yyMinor: TToken); forward;
+procedure yy_pop_parser_stack(pParser: PyyParser); forward;
+procedure yy_destructor(yypParser: PyyParser; yymajor: YYCODETYPE;
+                        yypminor: PYYMINORTYPE); forward;
+function  yy_reduce(yypParser: PyyParser; yyruleno: u32;
+                    yyLookahead: i32; const yyLookaheadToken: TToken): YYACTIONTYPE; forward;
+procedure yy_accept(yypParser: PyyParser); forward;
+procedure yy_parse_failed(yypParser: PyyParser); forward;
+procedure yy_syntax_error(yypParser: PyyParser; yymajor: i32;
+                          const yyminor: TToken); forward;
+procedure yyStackOverflow(yypParser: PyyParser); forward;
+function  parserStackRealloc(p: PyyParser): i32; forward;
+
+{ ---- parserStackRealloc — grow stack on demand (yyGrowStack equivalent) -- }
+function parserStackRealloc(p: PyyParser): i32;
+var
+  oldSize, newSize, idx: i32;
+  pNew: PyyStackEntry;
+begin
+  oldSize := 1 + i32(p^.yystackEnd - p^.yystack);
+  newSize := oldSize * 2 + 100;
+  idx := i32(p^.yytos - p^.yystack);
+  if p^.yystack = @p^.yystk0[0] then begin
+    GetMem(pNew, newSize * SizeOf(yyStackEntry));
+    if pNew = nil then begin Result := 1; Exit; end;
+    Move(p^.yystack^, pNew^, oldSize * SizeOf(yyStackEntry));
+  end else begin
+    ReAllocMem(p^.yystack, newSize * SizeOf(yyStackEntry));
+    pNew := p^.yystack;
+    if pNew = nil then begin Result := 1; Exit; end;
+  end;
+  p^.yystack    := pNew;
+  p^.yytos      := @p^.yystack[idx];
+  p^.yystackEnd := @p^.yystack[newSize - 1];
+  Result := 0;
+end;
+
+{ ---- yy_destructor — release semantic value when popping a stack entry --- }
+{ Phase 7.2d: empty switch.  Phase 7.2e will fill in the per-symbol cases    }
+{ (parse.c lines 2542–2657) so that pops during error recovery and          }
+{ ParserFinalize free any owned Expr / Select / List memory.  Until reduce  }
+{ actions exist no entry owns anything heavier than a TToken, so an empty   }
+{ body is safe.                                                              }
+procedure yy_destructor(yypParser: PyyParser; yymajor: YYCODETYPE;
+                        yypminor: PYYMINORTYPE);
+begin
+  { Suppress unused-parameter warnings — Phase 7.2e turns this into a switch. }
+  if (yypParser = nil) or (yymajor = 0) or (yypminor = nil) then ;
+end;
+
+{ ---- yy_pop_parser_stack — pop one stack entry and run its destructor ---- }
+procedure yy_pop_parser_stack(pParser: PyyParser);
+var
+  yytos: PyyStackEntry;
+begin
+  yytos := pParser^.yytos;
+  Dec(pParser^.yytos);
+  yy_destructor(pParser, yytos^.major, @yytos^.minor);
+end;
+
+{ ---- yyStackOverflow ---------------------------------------------------- }
+procedure yyStackOverflow(yypParser: PyyParser);
+var
+  pPse: PParse;
+begin
+  while yypParser^.yytos > yypParser^.yystack do
+    yy_pop_parser_stack(yypParser);
+  pPse := PParse(yypParser^.pParse);
+  if (pPse <> nil) and (pPse^.nErr = 0) then
+    sqlite3ErrorMsg(pPse, 'Recursion limit');
+end;
+
+{ ---- yy_find_shift_action (parse.c:2786) -------------------------------- }
+function yy_find_shift_action(iLookAhead: YYCODETYPE; stateno: YYACTIONTYPE): YYACTIONTYPE;
+var
+  i, j: i32;
+  iFallback: YYCODETYPE;
+begin
+  if stateno > YY_MAX_SHIFT then begin Result := stateno; Exit; end;
+  while True do begin
+    i := yy_shift_ofst[stateno];
+    i := i + iLookAhead;
+    if yy_lookahead[i] <> iLookAhead then begin
+      { Try fallback }
+      if (iLookAhead < YYNTOKEN) then begin
+        iFallback := yyFallbackTab[iLookAhead];
+        if iFallback <> 0 then begin
+          iLookAhead := iFallback;
+          continue;
+        end;
+      end;
+      { Try wildcard }
+      j := i - i32(iLookAhead) + YYWILDCARD;
+      if (j >= 0) and (j < i32(YY_NLOOKAHEAD)) and
+         (yy_lookahead[j] = YYWILDCARD) and (iLookAhead > 0) then begin
+        Result := yy_action[j]; Exit;
+      end;
+      Result := yy_default[stateno]; Exit;
+    end else begin
+      Result := yy_action[i]; Exit;
+    end;
+  end;
+end;
+
+{ ---- yy_find_reduce_action (parse.c:2851) ------------------------------- }
+function yy_find_reduce_action(stateno: YYACTIONTYPE; iLookAhead: YYCODETYPE): YYACTIONTYPE;
+var
+  i: i32;
+begin
+  i := yy_reduce_ofst[stateno];
+  i := i + iLookAhead;
+  Result := yy_action[i];
+end;
+
+{ ---- yy_shift (parse.c:2925) -------------------------------------------- }
+procedure yy_shift(yypParser: PyyParser; yyNewState: YYACTIONTYPE;
+                   yyMajor: YYCODETYPE; const yyMinor: TToken);
+var
+  yytos: PyyStackEntry;
+begin
+  Inc(yypParser^.yytos);
+  yytos := yypParser^.yytos;
+  if yytos > yypParser^.yystackEnd then begin
+    if parserStackRealloc(yypParser) <> 0 then begin
+      Dec(yypParser^.yytos);
+      yyStackOverflow(yypParser);
+      Exit;
+    end;
+    yytos := yypParser^.yytos;
+  end;
+  if yyNewState > YY_MAX_SHIFT then
+    yyNewState := yyNewState + (YY_MIN_REDUCE - YY_MIN_SHIFTREDUCE);
+  yytos^.stateno  := yyNewState;
+  yytos^.major    := yyMajor;
+  yytos^.minor.yy0 := yyMinor;
+end;
+
+{ ---- yy_accept / yy_parse_failed / yy_syntax_error stubs ---------------- }
+procedure yy_accept(yypParser: PyyParser);
+begin
+  { %parse_accept code is empty in parse.y. }
+  if yypParser = nil then ;
+end;
+
+procedure yy_parse_failed(yypParser: PyyParser);
+begin
+  while yypParser^.yytos > yypParser^.yystack do
+    yy_pop_parser_stack(yypParser);
+  { %parse_failure block is empty in parse.y. }
+end;
+
+procedure yy_syntax_error(yypParser: PyyParser; yymajor: i32;
+                          const yyminor: TToken);
+var
+  pPse: PParse;
+begin
+  pPse := PParse(yypParser^.pParse);
+  if pPse = nil then Exit;
+  if (yyminor.z <> nil) and (yyminor.z^ <> #0) then
+    sqlite3ErrorMsg(pPse, 'near "%T": syntax error')
+  else
+    sqlite3ErrorMsg(pPse, 'incomplete input');
+  if yymajor = 0 then ;
+end;
+
+{ ---- yy_reduce — engine framework (parse.c:3804) ------------------------ }
+{ Phase 7.2d: rule-action switch is empty.  Phase 7.2e fills in cases for   }
+{ rules 0..411 from parse.c:3829–5993.  The framework that runs after the  }
+{ switch is fully ported and exercises yyRuleInfoLhs / yyRuleInfoNRhs +    }
+{ yy_find_reduce_action correctly the moment any rule body materialises a  }
+{ value.                                                                     }
+function yy_reduce(yypParser: PyyParser; yyruleno: u32;
+                   yyLookahead: i32; const yyLookaheadToken: TToken): YYACTIONTYPE;
+var
+  yygoto: i32;
+  yyact:  YYACTIONTYPE;
+  yymsp:  PyyStackEntry;
+  yysize: i32;
+begin
+  yymsp := yypParser^.yytos;
+
+  { ============================================================ }
+  { Phase 7.2e: per-rule reduce-action cases go here.            }
+  {   case yyruleno of                                           }
+  {     0: { explain ::= EXPLAIN } ...                           }
+  {     ...                                                      }
+  {   end;                                                       }
+  { ============================================================ }
+  if yyLookahead = 0 then ;  { suppress unused warnings until 7.2e }
+  if yyLookaheadToken.n = 0 then ;
+
+  yygoto := yyRuleInfoLhs[yyruleno];
+  yysize := yyRuleInfoNRhs[yyruleno];
+  yyact  := yy_find_reduce_action(yymsp[yysize].stateno, YYCODETYPE(yygoto));
+
+  yymsp := yymsp + (yysize + 1);
+  yypParser^.yytos := yymsp;
+  yymsp^.stateno := yyact;
+  yymsp^.major   := YYCODETYPE(yygoto);
+  Result := yyact;
+end;
+
+{ ---- sqlite3ParserAlloc / Init (parse.c:2475) --------------------------- }
 function sqlite3ParserAlloc(mallocProc: Pointer; pParse: Pointer): PyyParser;
 var
   p: PyyParser;
 begin
+  if mallocProc = nil then ;
   New(p);
   FillChar(p^, SizeOf(yyParser), 0);
   p^.pParse     := pParse;
   p^.yystack    := @p^.yystk0[0];
-  p^.yystackEnd := @p^.yystk0[YYSTACKDEPTH-1];
+  p^.yystackEnd := @p^.yystk0[YYSTACKDEPTH - 1];
   p^.yytos      := p^.yystack;
-  { state 0 is the initial state }
   p^.yytos^.stateno := 0;
   p^.yytos^.major   := 0;
   Result := p;
 end;
 
+{ ---- sqlite3ParserFinalize / Free (parse.c:2687, 2723) ------------------ }
 procedure sqlite3ParserFree(p: PyyParser; freeProc: Pointer);
+var
+  yytos: PyyStackEntry;
 begin
+  if freeProc = nil then ;
   if p = nil then Exit;
-  { Phase 7.2d will pop the remaining stack here, calling yy_destructor for
-    each entry that owns memory.  Until reduce actions are wired we cannot
-    own anything, so a plain Dispose is safe.                                 }
+  { Inline sqlite3ParserFinalize: pop every owned entry. }
+  yytos := p^.yytos;
+  while yytos > p^.yystack do begin
+    if yytos^.major >= YY_MIN_DSTRCTR then
+      yy_destructor(p, yytos^.major, @yytos^.minor);
+    Dec(yytos);
+  end;
   if p^.yystack <> @p^.yystk0[0] then
-    FreeMem(p^.yystack);  { extended (heap-grown) stack — Phase 7.2d }
+    FreeMem(p^.yystack);
   Dispose(p);
 end;
 
+{ ---- sqlite3Parser — main driver (parse.c:6109) ------------------------- }
 procedure sqlite3Parser(yyp: PyyParser; yymajor: i32; yyminor: TToken);
+var
+  yyminorunion: YYMINORTYPE;
+  yyact:        YYACTIONTYPE;
+  yyendofinput: i32;
+  yypParser:    PyyParser;
+  yyruleno:     u32;
 begin
-  { Phase 7.2d will implement the LALR engine here.  Until then we silently
-    discard the token; sqlite3RunParser still returns SQLITE_ERROR via the
-    7.1 stub above, so no caller observes the no-op.                          }
+  yypParser    := yyp;
+  yyendofinput := Ord(yymajor = 0);
+  yyact := yypParser^.yytos^.stateno;
+
+  while True do begin
+    yyact := yy_find_shift_action(YYCODETYPE(yymajor), yyact);
+    if yyact >= YY_MIN_REDUCE then begin
+      yyruleno := yyact - YY_MIN_REDUCE;
+      { Make sure the stack has room for the LHS push when RHS is empty. }
+      if yyRuleInfoNRhs[yyruleno] = 0 then begin
+        if yypParser^.yytos >= yypParser^.yystackEnd then begin
+          if parserStackRealloc(yypParser) <> 0 then begin
+            yyStackOverflow(yypParser);
+            Break;
+          end;
+        end;
+      end;
+      yyact := yy_reduce(yypParser, yyruleno, yymajor, yyminor);
+    end else if yyact <= YY_MAX_SHIFTREDUCE then begin
+      yy_shift(yypParser, yyact, YYCODETYPE(yymajor), yyminor);
+      Break;
+    end else if yyact = YY_ACCEPT_ACTION then begin
+      Dec(yypParser^.yytos);
+      yy_accept(yypParser);
+      Exit;
+    end else begin
+      { YY_ERROR_ACTION — no error symbol in grammar, no recovery beyond
+        reporting and discarding the token. }
+      yyminorunion.yy0 := yyminor;
+      if True then  { yyerrcnt tracking elided — we don't recover }
+        yy_syntax_error(yypParser, yymajor, yyminor);
+      yy_destructor(yypParser, YYCODETYPE(yymajor), @yyminorunion);
+      if yyendofinput <> 0 then
+        yy_parse_failed(yypParser);
+      Break;
+    end;
+  end;
 end;
 
 function sqlite3ParserFallback(iToken: i32): i32;
 begin
-  { Phase 7.2c — index into the yyFallback[] table.  Returns the token
-    iToken falls back to (e.g. most non-reserved keywords fall back to
-    TK_ID), or 0 if there is no fallback.                                     }
   if (iToken >= 0) and (iToken < YYNTOKEN) then
     Result := yyFallbackTab[iToken]
   else
@@ -1101,6 +1356,7 @@ end;
 
 function sqlite3ParserStackPeak(p: PyyParser): i32;
 begin
+  if p = nil then ;
   Result := 0;  { YYTRACKMAXSTACKDEPTH not enabled }
 end;
 
