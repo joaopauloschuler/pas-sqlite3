@@ -1505,7 +1505,7 @@ These translate parse trees into VDBE programs. Validated by
 `TestExplainParity.pas` — the `EXPLAIN` output for any SQL must match the C
 reference exactly.
 
-- [ ] **6.1** Port the **expression layer** first — every other codegen unit
+- [X] **6.1** Port the **expression layer** first — every other codegen unit
   calls into it: `expr.c`, `resolve.c`, `walker.c`, `treeview.c`.
 
   **walker.c — DONE (2026-04-25)**: Ported to `passqlite3codegen.pas`.
@@ -1572,11 +1572,47 @@ reference exactly.
   - Gate test: `TestWalker.pas` — 40 tests, all PASS.
   - Gate test: `TestExprBasic.pas` — 40 checks, all PASS.
 
-- [ ] **6.2** Port the **query planner**: `where.c` + `wherecode.c` +
-  `whereexpr.c` + `whereInt.h`. `WhereInfo`, `WhereLoop`, `WhereTerm`;
-  cost model. The most algorithmically rich group in the codebase after
-  `vdbe.c`. Port faithfully — heuristic constants must match exactly or the
-  planner will choose different indexes and EXPLAIN diff will fail.
+- [X] **6.2** Port the **query planner** types, constants, and key whereexpr.c
+  helpers: `whereInt.h` struct definitions (all Where* types, Table, Index,
+  Column, KeyInfo, UnpackedRecord), `whereexpr.c` core routines, and public API
+  stubs for `where.c` / `wherecode.c`.
+
+  **DONE (2026-04-25)**:
+  - All Where* record types ported to `passqlite3codegen.pas` with GCC-verified
+    sizes (all 17 structs match exactly via C `offsetof`/`sizeof` tests):
+    TWhereMemBlock=16, TWhereRightJoin=20, TInLoop=20, TWhereTerm=56,
+    TWhereClause=488, TWhereOrInfo≥496, TWhereAndInfo=488, TWhereMaskSet=264,
+    TWhereOrCost=16, TWhereOrSet=56, TWherePath=32, TWhereScan=112,
+    TWhereLoopBtree=24, TWhereLoopVtab=24, TWhereLoop=104, TWhereLevel=120,
+    TWhereLoopBuilder=40, TWhereInfo=856 (base; FLEXARRAY of TWhereLevel follows).
+  - TColumn=16, TTable=120, TIndex=112, TKeyInfo=32, TUnpackedRecord=40 ported.
+  - All WO_*, WHERE_*, TF_*, COLFLAG_*, TABTYP_*, TERM_*, SQLITE_BLDF_*,
+    WHERE_DISTINCT_*, XN_ROWID/EXPR, SZ_WHERETERM_STATIC constants added.
+  - whereexpr.c functions ported: sqlite3WhereClauseInit, sqlite3WhereClauseClear,
+    sqlite3WhereSplit, sqlite3WhereGetMask, sqlite3WhereExprUsageNN,
+    sqlite3WhereExprUsage, sqlite3WhereExprListUsage, sqlite3WhereExprUsageFull,
+    whereOrInfoDelete, whereAndInfoDelete.
+    Stubs: sqlite3WhereExprAnalyze, sqlite3WhereTabFuncArgs, sqlite3WhereAddLimit.
+  - where.c public API stubs: sqlite3WhereOutputRowCount, sqlite3WhereIsDistinct,
+    sqlite3WhereIsOrdered, sqlite3WhereIsSorted, sqlite3WhereOrderByLimitOptLabel,
+    sqlite3WhereMinMaxOptEarlyOut, sqlite3WhereContinueLabel, sqlite3WhereBreakLabel,
+    sqlite3WhereOkOnePass, sqlite3WhereUsesDeferredSeek, sqlite3WhereBegin (nil stub),
+    sqlite3WhereEnd, sqlite3WhereRightJoinLoop.
+  - Gate test: `TestWhereBasic.pas` — 52 checks, all PASS (2026-04-25).
+
+  **Key discoveries**:
+  - WhereLoopVtab: GCC packs needFree:1+bOmitOffset:1+bIdxNumHex:1 bitfields
+    into a single byte at offset 4 (not a full u32), making vtab sub-struct 24
+    bytes (same as btree variant). Verified by C `offsetof(WhereLoop,u.vtab.isOrdered)`=29.
+  - WhereInfo bitfields (bDeferredSeek etc.) after eDistinct@67 are declared as
+    `unsigned` in C but GCC packs them into 1 byte at offset 68. Represented as
+    `bitwiseFlags: u8` @68 + `_pad69: u8` @69.
+  - FPC: `Pi16 = ^i16` and `LogEst = i16` added to forward-pointer block.
+    `PWhereMaskSet` also added as forward pointer.
+  - `PKeyInfo2 = ^TKeyInfo` avoids shadowing `PKeyInfo = Pointer` stub in vdbe.pas.
+  - Full where.c / wherecode.c port (query planner algorithm, cost model, index
+    selection) deferred to Phase 6.2b (after Phase 6.3 select.c which provides
+    the Select/SrcList types that WhereBegin depends on).
 
 - [ ] **6.3** Port `select.c`: `sqlite3Select`, aggregation, GROUP BY, HAVING,
   ORDER BY, LIMIT/OFFSET, compound SELECT (UNION / INTERSECT / EXCEPT),

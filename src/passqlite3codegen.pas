@@ -303,9 +303,41 @@ type
   PWith        = ^TWith;
   PExprListItem = ^TExprListItem;
 
-  { Opaque stubs deferred to later phases }
-  PTable2   = Pointer;   { Table  — Phase 6.5 }
-  PIndex2   = Pointer;   { Index  — Phase 6.5 }
+  { Phase 6.2 primitive aliases }
+  Pi16  = ^i16;
+  LogEst = i16;   { SQLite logarithmic estimate: 1.5*log2(N) }
+
+  { Forward pointers for Phase 6.2 types (defined later in this type block) }
+  PWhereMaskSet = ^TWhereMaskSet;
+  PTable2   = ^TTable;   { upgraded from Pointer stub — TTable defined below }
+  PIndex2   = ^TIndex;   { upgraded from Pointer stub — TIndex defined below }
+  PColumn   = ^TColumn;
+  PPColumn  = ^PColumn;
+  PKeyInfo2 = ^TKeyInfo;  { TKeyInfo defined below; avoids shadowing vdbe.pas PKeyInfo=Pointer }
+  PUnpackedRecord2 = ^TUnpackedRecord; { TUnpackedRecord defined below }
+  PCollSeq2 = Pointer;   { CollSeq — Phase 6.6 }
+  PTrigger  = Pointer;   { Trigger — Phase 6.5 }
+  PFKey     = Pointer;   { ForeignKey — Phase 6.6 }
+  PVTable   = Pointer;   { virtual table object — Phase 6.bis }
+  { Where* forward pointers }
+  PWhereMemBlock    = ^TWhereMemBlock;
+  PWhereRightJoin   = ^TWhereRightJoin;
+  PWhereLevel       = ^TWhereLevel;
+  PWhereLoop        = ^TWhereLoop;
+  PPWhereLoop       = ^PWhereLoop;
+  PWherePath        = ^TWherePath;
+  PWhereTerm        = ^TWhereTerm;
+  PPWhereTerm       = ^PWhereTerm;
+  PWhereClause      = ^TWhereClause;
+  PWhereOrInfo      = ^TWhereOrInfo;
+  PWhereAndInfo     = ^TWhereAndInfo;
+  PWhereInfo        = ^TWhereInfo;
+  PWhereLoopBuilder = ^TWhereLoopBuilder;
+  PWhereScan        = ^TWhereScan;
+  PWhereOrCost      = ^TWhereOrCost;
+  PWhereOrSet       = ^TWhereOrSet;
+  PInLoop           = ^TInLoop;
+  { Remaining opaque stubs }
   PFuncDef2 = Pointer;   { FuncDef — Phase 6.6 }
   PIdList   = ^TIdList;  { IdList — defined below }
   PCteUse   = Pointer;   { CteUse — Phase 6.5 }
@@ -764,6 +796,372 @@ type
     _rest: array[0..63] of u8;
   end;
 
+  // -----------------------------------------------------------------------
+  // Phase 6.2: Schema / Table / Index types (from sqliteInt.h)
+  // All sizes and offsets verified against GCC x86-64 with -DSQLITE_THREADSAFE=1
+  // (no SQLITE_DEBUG, no SQLITE_ENABLE_COSTMULT, no SQLITE_ENABLE_STAT4)
+  // -----------------------------------------------------------------------
+
+  { --- TColumn (sizeof=16, colFlags@14) --- }
+  TColumn = record
+    zCnName:   PAnsiChar;   { 8 bytes @ 0 }
+    typeFlags: u8;          { 1 byte  @ 8: notNull:4 + eCType:4 bitfields }
+    affinity:  AnsiChar;    { 1 byte  @ 9 }
+    szEst:     u8;          { 1 byte  @ 10 }
+    hName:     u8;          { 1 byte  @ 11 }
+    iDflt:     u16;         { 2 bytes @ 12 }
+    colFlags:  u16;         { 2 bytes @ 14 }
+  end;
+
+  { --- TTable (sizeof=120) --- }
+  { Union u: tab(24) | view(24) | vtab(24) @ offset 64 }
+  TTableUTab = record
+    addColOffset: i32;      { 4 bytes @ 0 within union }
+    _pad:         i32;      { 4 bytes @ 4 }
+    pFKey:        PFKey;    { 8 bytes @ 8 }
+    pDfltList:    PExprList;{ 8 bytes @ 16 }
+  end;
+  TTableUVtab = record
+    nArg:  i32;             { 4 bytes @ 0 }
+    _pad:  i32;             { 4 bytes @ 4 }
+    azArg: Pointer;         { 8 bytes @ 8: char** }
+    p:     PVTable;         { 8 bytes @ 16 }
+  end;
+  TTableU = record
+    case Integer of
+      0: (tab:  TTableUTab);
+      1: (view_pSelect: PSelect; _view_pad: array[0..15] of u8);
+      2: (vtab: TTableUVtab);
+  end;
+  TTable = record
+    zName:      PAnsiChar;          { 8 bytes @ 0 }
+    aCol:       PColumn;            { 8 bytes @ 8 }
+    pIndex:     PIndex2;            { 8 bytes @ 16 }
+    zColAff:    PAnsiChar;          { 8 bytes @ 24 }
+    pCheck:     PExprList;          { 8 bytes @ 32 }
+    tnum:       u32;                { 4 bytes @ 40 (Pgno) }
+    nTabRef:    u32;                { 4 bytes @ 44 }
+    tabFlags:   u32;                { 4 bytes @ 48 }
+    iPKey:      i16;                { 2 bytes @ 52 }
+    nCol:       i16;                { 2 bytes @ 54 }
+    nNVCol:     i16;                { 2 bytes @ 56 }
+    nRowLogEst: i16;                { 2 bytes @ 58 (LogEst) }
+    szTabRow:   i16;                { 2 bytes @ 60 (LogEst) }
+    keyConf:    u8;                 { 1 byte  @ 62 }
+    eTabType:   u8;                 { 1 byte  @ 63 }
+    u:          TTableU;            { 24 bytes @ 64 }
+    pTrigger:   PTrigger;           { 8 bytes @ 88 }
+    pSchema:    PSchema;            { 8 bytes @ 96 }
+    aHx:        array[0..15] of u8; { 16 bytes @ 104 }
+  end;
+
+  { --- TIndex (sizeof=112) --- }
+  { Bitfield group at offset 100 (4-byte bitfield storage unit):
+    idxType(2)+bUnordered(1)+uniqNotNull(1)+isResized(1)+isCovering(1)+
+    noSkipScan(1)+hasStat1(1)+bNoQuery(1)+bAscKeyBug(1)+bHasVCol(1)+bHasExpr(1) }
+  TIndex = record
+    zName:         PAnsiChar;   { 8 bytes @ 0 }
+    aiColumn:      Pi16;        { 8 bytes @ 8 }
+    aiRowLogEst:   Pi16;        { 8 bytes @ 16 }
+    pTable:        PTable2;     { 8 bytes @ 24 }
+    zColAff:       PAnsiChar;   { 8 bytes @ 32 }
+    pNext:         PIndex2;     { 8 bytes @ 40 }
+    pSchema:       PSchema;     { 8 bytes @ 48 }
+    aSortOrder:    Pu8;         { 8 bytes @ 56 }
+    azColl:        Pointer;     { 8 bytes @ 64: const char** }
+    pPartIdxWhere: PExpr;       { 8 bytes @ 72 }
+    aColExpr:      PExprList;   { 8 bytes @ 80 }
+    tnum:          u32;         { 4 bytes @ 88 (Pgno) }
+    szIdxRow:      i16;         { 2 bytes @ 92 (LogEst) }
+    nKeyCol:       u16;         { 2 bytes @ 94 }
+    nColumn:       u16;         { 2 bytes @ 96 }
+    onError:       u8;          { 1 byte  @ 98 }
+    _pad99:        u8;          { 1 byte  @ 99 (padding before bitfield unit) }
+    idxFlags:      u32;         { 4 bytes @ 100: packed bitfields }
+    colNotIdxed:   Bitmask;     { 8 bytes @ 104 }
+  end;
+
+  { --- TKeyInfo (sizeof=32; aColl[FLEXARRAY] follows) --- }
+  TKeyInfo = record
+    nRef:       u32;                    { 4 bytes @ 0 }
+    enc:        u8;                     { 1 byte  @ 4 }
+    _pad5:      u8;                     { 1 byte  @ 5 }
+    nKeyField:  u16;                    { 2 bytes @ 6 }
+    nAllField:  u16;                    { 2 bytes @ 8 }
+    _pad10:     array[0..5] of u8;      { 6 bytes @ 10 }
+    db:         PTsqlite3;              { 8 bytes @ 16 }
+    aSortFlags: Pu8;                    { 8 bytes @ 24 }
+    { CollSeq *aColl[FLEXARRAY] follows at offset 32 }
+  end;
+
+  { --- TUnpackedRecord (sizeof=40) --- }
+  TUnpackedRecordU = record
+    case Integer of
+      0: (z: PAnsiChar);
+      1: (i: i64);
+  end;
+  TUnpackedRecord = record
+    pKeyInfo:   PKeyInfo2;            { 8 bytes @ 0 }
+    aMem:       PMem;                 { 8 bytes @ 8 }
+    u:          TUnpackedRecordU;     { 8 bytes @ 16 }
+    n:          i32;                  { 4 bytes @ 24 }
+    nField:     u16;                  { 2 bytes @ 28 }
+    default_rc: i8;                   { 1 byte  @ 30 }
+    errCode:    u8;                   { 1 byte  @ 31 }
+    r1:         i8;                   { 1 byte  @ 32 }
+    r2:         i8;                   { 1 byte  @ 33 }
+    eqSeen:     u8;                   { 1 byte  @ 34 }
+    _pad35:     array[0..4] of u8;    { 5 bytes @ 35 }
+  end;
+
+  // -----------------------------------------------------------------------
+  // Phase 6.2: whereInt.h types
+  // All sizes and offsets verified against GCC x86-64 (no debug flags)
+  // -----------------------------------------------------------------------
+
+  { --- TWhereMemBlock (sizeof=16) --- }
+  TWhereMemBlock = record
+    pNext: PWhereMemBlock;   { 8 bytes @ 0 }
+    sz:    u64;              { 8 bytes @ 8 }
+  end;
+
+  { --- TWhereRightJoin (sizeof=20) --- }
+  TWhereRightJoin = record
+    iMatch:     i32;   { 4 bytes @ 0 }
+    regBloom:   i32;   { 4 bytes @ 4 }
+    regReturn:  i32;   { 4 bytes @ 8 }
+    addrSubrtn: i32;   { 4 bytes @ 12 }
+    endSubrtn:  i32;   { 4 bytes @ 16 }
+  end;
+
+  { --- TInLoop (sizeof=20) --- }
+  TInLoop = record
+    iCur:       i32;              { 4 bytes @ 0 }
+    addrInTop:  i32;              { 4 bytes @ 4 }
+    iBase:      i32;              { 4 bytes @ 8 }
+    nPrefix:    i32;              { 4 bytes @ 12 }
+    eEndLoopOp: u8;               { 1 byte  @ 16 }
+    _pad:       array[0..2] of u8;{ 3 bytes @ 17 }
+  end;
+
+  { --- TWhereTerm (sizeof=56; no SQLITE_DEBUG) --- }
+  TWhereTerm = record
+    pExpr:      PExpr;        { 8 bytes @ 0 }
+    pWC:        PWhereClause; { 8 bytes @ 8 }
+    truthProb:  i16;          { 2 bytes @ 16 (LogEst) }
+    wtFlags:    u16;          { 2 bytes @ 18 }
+    eOperator:  u16;          { 2 bytes @ 20 }
+    nChild:     u8;           { 1 byte  @ 22 }
+    eMatchOp:   u8;           { 1 byte  @ 23 }
+    iParent:    i32;          { 4 bytes @ 24 }
+    leftCursor: i32;          { 4 bytes @ 28 }
+    u: record                 { 8 bytes @ 32 }
+      case Integer of
+        0: (leftColumn: i32; iField: i32);
+        1: (pOrInfo:  PWhereOrInfo);
+        2: (pAndInfo: PWhereAndInfo);
+    end;
+    prereqRight: Bitmask;     { 8 bytes @ 40 }
+    prereqAll:   Bitmask;     { 8 bytes @ 48 }
+  end;
+
+  { --- TWhereClause (sizeof=488) --- }
+  TWhereClause = record
+    pWInfo:  PWhereInfo;                 { 8 bytes @ 0 }
+    pOuter:  PWhereClause;               { 8 bytes @ 8 }
+    op:      u8;                         { 1 byte  @ 16 }
+    hasOr:   u8;                         { 1 byte  @ 17 }
+    _pad18:  u16;                        { 2 bytes @ 18 }
+    nTerm:   i32;                        { 4 bytes @ 20 }
+    nSlot:   i32;                        { 4 bytes @ 24 }
+    nBase:   i32;                        { 4 bytes @ 28 }
+    a:       PWhereTerm;                 { 8 bytes @ 32 }
+    aStatic: array[0..7] of TWhereTerm;  { 448 bytes @ 40 }
+  end;
+
+  { --- TWhereOrInfo, TWhereAndInfo --- }
+  TWhereOrInfo = record
+    wc:        TWhereClause;   { 488 bytes }
+    indexable: Bitmask;        { 8 bytes }
+  end;
+  TWhereAndInfo = record
+    wc: TWhereClause;
+  end;
+
+  { --- TWhereMaskSet (sizeof=264) --- }
+  TWhereMaskSet = record
+    bVarSelect: i32;                  { 4 bytes @ 0 }
+    n:          i32;                  { 4 bytes @ 4 }
+    ix:         array[0..63] of i32;  { 256 bytes @ 8 }
+  end;
+
+  { --- TWhereOrCost (sizeof=16) --- }
+  TWhereOrCost = record
+    prereq: Bitmask;  { 8 bytes @ 0 }
+    rRun:   i16;      { 2 bytes @ 8 (LogEst) }
+    nOut:   i16;      { 2 bytes @ 10 (LogEst) }
+    _pad:   i32;      { 4 bytes @ 12 }
+  end;
+
+  { --- TWhereOrSet (sizeof=56; N_OR_COST=3) --- }
+  TWhereOrSet = record
+    n:    u16;                         { 2 bytes @ 0 }
+    _pad: array[0..5] of u8;           { 6 bytes @ 2 (pad to 8 for Bitmask alignment) }
+    a:    array[0..2] of TWhereOrCost; { 48 bytes @ 8 }
+  end;
+
+  { --- TWherePath (sizeof=32) --- }
+  TWherePath = record
+    maskLoop:  Bitmask;      { 8 bytes @ 0 }
+    revLoop:   Bitmask;      { 8 bytes @ 8 }
+    nRow:      i16;          { 2 bytes @ 16 (LogEst) }
+    rCost:     i16;          { 2 bytes @ 18 (LogEst) }
+    rUnsort:   i16;          { 2 bytes @ 20 (LogEst) }
+    isOrdered: i8;           { 1 byte  @ 22 }
+    _pad23:    u8;           { 1 byte  @ 23 }
+    aLoop:     PPWhereLoop;  { 8 bytes @ 24 }
+  end;
+
+  { --- TWhereScan (sizeof=112) --- }
+  TWhereScan = record
+    pOrigWC:   PWhereClause;            { 8 bytes @ 0 }
+    pWC:       PWhereClause;            { 8 bytes @ 8 }
+    zCollName: PAnsiChar;               { 8 bytes @ 16 }
+    pIdxExpr:  PExpr;                   { 8 bytes @ 24 }
+    k:         i32;                     { 4 bytes @ 32 }
+    opMask:    u32;                     { 4 bytes @ 36 }
+    idxaff:    AnsiChar;                { 1 byte  @ 40 }
+    iEquiv:    u8;                      { 1 byte  @ 41 }
+    nEquiv:    u8;                      { 1 byte  @ 42 }
+    _pad43:    u8;                      { 1 byte  @ 43 }
+    aiCur:     array[0..10] of i32;     { 44 bytes @ 44 }
+    aiColumn:  array[0..10] of i16;     { 22 bytes @ 88 }
+    _pad110:   u16;                     { 2 bytes @ 110 }
+  end;
+
+  { --- TWhereLoopBtree + TWhereLoopVtab + TWhereLoop (sizeof=104) --- }
+  TWhereLoopBtree = record
+    nEq:          u16;        { 2 bytes @ 0 }
+    nBtm:         u16;        { 2 bytes @ 2 }
+    nTop:         u16;        { 2 bytes @ 4 }
+    nDistinctCol: u16;        { 2 bytes @ 6 }
+    pIndex:       PIndex2;    { 8 bytes @ 8 }
+    pOrderBy:     PExprList;  { 8 bytes @ 16 }
+  end;
+  { GCC packs needFree:1+bOmitOffset:1+bIdxNumHex:1 into 1 byte at offset 4
+    (isOrdered immediately follows at 5, omitMask at 6, idxStr at 8) }
+  TWhereLoopVtab = record
+    idxNum:    i32;        { 4 bytes @ 0 }
+    bFlags:    u8;         { 1 byte  @ 4: needFree(bit0),bOmitOffset(bit1),bIdxNumHex(bit2) }
+    isOrdered: i8;         { 1 byte  @ 5 }
+    omitMask:  u16;        { 2 bytes @ 6 }
+    idxStr:    PAnsiChar;  { 8 bytes @ 8 }
+    mHandleIn: u32;        { 4 bytes @ 16 }
+    _pad20:    u32;        { 4 bytes @ 20 (total = 24 to match btree) }
+  end;
+  TWhereLoopU = record
+    case Integer of
+      0: (btree: TWhereLoopBtree);
+      1: (vtab:  TWhereLoopVtab);
+  end;
+  TWhereLoop = record
+    prereq:      Bitmask;    { 8 bytes @ 0 }
+    maskSelf:    Bitmask;    { 8 bytes @ 8 }
+    iTab:        u8;         { 1 byte  @ 16 }
+    iSortIdx:    u8;         { 1 byte  @ 17 }
+    rSetup:      i16;        { 2 bytes @ 18 (LogEst) }
+    rRun:        i16;        { 2 bytes @ 20 (LogEst) }
+    nOut:        i16;        { 2 bytes @ 22 (LogEst) }
+    u:           TWhereLoopU;{ 24 bytes @ 24 }
+    wsFlags:     u32;        { 4 bytes @ 48 }
+    nLTerm:      u16;        { 2 bytes @ 52 }
+    nSkip:       u16;        { 2 bytes @ 54 }
+    nLSlot:      u16;        { 2 bytes @ 56 }
+    _pad58:      array[0..5] of u8; { 6 bytes @ 58 (pad to 64 for pointer) }
+    aLTerm:      PPWhereTerm; { 8 bytes @ 64 }
+    pNextLoop:   PWhereLoop;  { 8 bytes @ 72 }
+    aLTermSpace: array[0..2] of PWhereTerm; { 24 bytes @ 80 }
+  end;
+
+  { --- TWhereLevel (sizeof=120) --- }
+  TWhereLevelU = record
+    case Integer of
+      0: (in_nIn: i32; _in_pad: i32; in_aInLoop: PInLoop);
+      1: (pCoveringIdx: PIndex2);
+  end;
+  TWhereLevel = record
+    iLeftJoin:   i32;    { 4 bytes @ 0 }
+    iTabCur:     i32;    { 4 bytes @ 4 }
+    iIdxCur:     i32;    { 4 bytes @ 8 }
+    addrBrk:     i32;    { 4 bytes @ 12 }
+    addrHalt:    i32;    { 4 bytes @ 16 }
+    addrNxt:     i32;    { 4 bytes @ 20 }
+    addrSkip:    i32;    { 4 bytes @ 24 }
+    addrCont:    i32;    { 4 bytes @ 28 }
+    addrFirst:   i32;    { 4 bytes @ 32 }
+    addrBody:    i32;    { 4 bytes @ 36 }
+    regBignull:  i32;    { 4 bytes @ 40 }
+    addrBignull: i32;    { 4 bytes @ 44 }
+    iLikeRepCntr: u32;   { 4 bytes @ 48 }
+    addrLikeRep: i32;    { 4 bytes @ 52 }
+    regFilter:   i32;    { 4 bytes @ 56 }
+    _pad60:      i32;    { 4 bytes @ 60 (pad for 8-byte aligned pRJ) }
+    pRJ:         PWhereRightJoin; { 8 bytes @ 64 }
+    iFrom:       u8;     { 1 byte  @ 72 }
+    op:          u8;     { 1 byte  @ 73 }
+    p3:          u8;     { 1 byte  @ 74 }
+    p5:          u8;     { 1 byte  @ 75 }
+    p1:          i32;    { 4 bytes @ 76 }
+    p2:          i32;    { 4 bytes @ 80 }
+    _pad84:      i32;    { 4 bytes @ 84 (pad to 88 for union) }
+    u:           TWhereLevelU; { 16 bytes @ 88 }
+    pWLoop:      PWhereLoop;   { 8 bytes @ 104 }
+    notReady:    Bitmask;      { 8 bytes @ 112 }
+  end;
+
+  { --- TWhereLoopBuilder (sizeof=40) --- }
+  TWhereLoopBuilder = record
+    pWInfo:     PWhereInfo;    { 8 bytes @ 0 }
+    pWC:        PWhereClause;  { 8 bytes @ 8 }
+    pNew:       PWhereLoop;    { 8 bytes @ 16 }
+    pOrSet:     PWhereOrSet;   { 8 bytes @ 24 }
+    bldFlags1:  u8;            { 1 byte  @ 32 }
+    bldFlags2:  u8;            { 1 byte  @ 33 }
+    _pad34:     u16;           { 2 bytes @ 34 }
+    iPlanLimit: u32;           { 4 bytes @ 36 }
+  end;
+
+  { --- TWhereInfo (sizeof=856 base; a[FLEXARRAY] of TWhereLevel follows) --- }
+  TWhereInfo = record
+    pParse:          PParse;        { 8 bytes @ 0 }
+    pTabList:        PSrcList;      { 8 bytes @ 8 }
+    pOrderBy:        PExprList;     { 8 bytes @ 16 }
+    pResultSet:      PExprList;     { 8 bytes @ 24 }
+    pSelect:         PSelect;       { 8 bytes @ 32 }
+    aiCurOnePass:    array[0..1] of i32; { 8 bytes @ 40 }
+    iContinue:       i32;           { 4 bytes @ 48 }
+    iBreak:          i32;           { 4 bytes @ 52 }
+    savedNQueryLoop: i32;           { 4 bytes @ 56 }
+    wctrlFlags:      u16;           { 2 bytes @ 60 }
+    iLimit:          i16;           { 2 bytes @ 62 (LogEst) }
+    nLevel:          u8;            { 1 byte  @ 64 }
+    nOBSat:          i8;            { 1 byte  @ 65 }
+    eOnePass:        u8;            { 1 byte  @ 66 }
+    eDistinct:       u8;            { 1 byte  @ 67 }
+    bitwiseFlags:    u8;            { 1 byte  @ 68: bDeferredSeek(0),untestedTerms(1),
+                                       bOrderedInnerLoop(2),sorted(3),bStarDone(4),bStarUsed(5) }
+    _pad69:          u8;            { 1 byte  @ 69 }
+    nRowOut:         i16;           { 2 bytes @ 70 (LogEst) }
+    iTop:            i32;           { 4 bytes @ 72 }
+    iEndWhere:       i32;           { 4 bytes @ 76 }
+    pLoops:          PWhereLoop;    { 8 bytes @ 80 }
+    pMemToFree:      PWhereMemBlock;{ 8 bytes @ 88 }
+    revMask:         Bitmask;       { 8 bytes @ 96 }
+    sWC:             TWhereClause;  { 488 bytes @ 104 }
+    sMaskSet:        TWhereMaskSet; { 264 bytes @ 592 }
+    { a[FLEXARRAY] of TWhereLevel follows @ 856 }
+  end;
+
 // ---------------------------------------------------------------------------
 // Flexible-array accessor helpers (outside type block)
 // ---------------------------------------------------------------------------
@@ -786,6 +1184,186 @@ const
   PARSEFLAG_BHasWith        = u32(1 shl 6);
   PARSEFLAG_OkConstFactor   = u32(1 shl 7);
   PARSEFLAG_CheckSchema     = u32(1 shl 8);
+
+// ---------------------------------------------------------------------------
+// Phase 6.2 constants — whereInt.h / sqliteInt.h
+// ---------------------------------------------------------------------------
+
+const
+  { WO_* operator masks (WhereTerm.eOperator) }
+  WO_IN     = u32($0001);
+  WO_EQ     = u32($0002);
+  WO_LT     = u32(WO_EQ shl (TK_LT - TK_EQ));   { = $0010 }
+  WO_LE     = u32(WO_EQ shl (TK_LE - TK_EQ));   { = $0008 }
+  WO_GT_WO  = u32(WO_EQ shl (TK_GT_TK - TK_EQ)); { = $0004 }
+  WO_GE     = u32(WO_EQ shl (TK_GE - TK_EQ));   { = $0020 }
+  WO_AUX    = u32($0040);
+  WO_IS     = u32($0080);
+  WO_ISNULL = u32($0100);
+  WO_OR     = u32($0200);
+  WO_AND    = u32($0400);
+  WO_EQUIV  = u32($0800);
+  WO_NOOP   = u32($1000);
+  WO_ROWVAL = u32($2000);
+  WO_ALL    = u32($3FFF);
+  WO_SINGLE = u32($01FF);
+
+  { WHERE_COLUMN_* / WHERE_* wsFlags }
+  WHERE_COLUMN_EQ    = u32($00000001);
+  WHERE_COLUMN_RANGE = u32($00000002);
+  WHERE_COLUMN_IN    = u32($00000004);
+  WHERE_COLUMN_NULL  = u32($00000008);
+  WHERE_CONSTRAINT   = u32($0000000F);
+  WHERE_TOP_LIMIT    = u32($00000010);
+  WHERE_BTM_LIMIT    = u32($00000020);
+  WHERE_BOTH_LIMIT   = u32($00000030);
+  WHERE_IDX_ONLY     = u32($00000040);
+  WHERE_IPK          = u32($00000100);
+  WHERE_INDEXED      = u32($00000200);
+  WHERE_VIRTUALTABLE = u32($00000400);
+  WHERE_IN_ABLE      = u32($00000800);
+  WHERE_ONEROW       = u32($00001000);
+  WHERE_MULTI_OR     = u32($00002000);
+  WHERE_AUTO_INDEX   = u32($00004000);
+  WHERE_SKIPSCAN     = u32($00008000);
+  WHERE_UNQ_WANTED   = u32($00010000);
+  WHERE_PARTIALIDX   = u32($00020000);
+  WHERE_IN_EARLYOUT  = u32($00040000);
+  WHERE_BIGNULL_SORT = u32($00080000);
+  WHERE_IN_SEEKSCAN  = u32($00100000);
+  WHERE_TRANSCONS    = u32($00200000);
+  WHERE_BLOOMFILTER  = u32($00400000);
+  WHERE_SELFCULL     = u32($00800000);
+  WHERE_OMIT_OFFSET  = u32($01000000);
+  WHERE_COROUTINE    = u32($02000000);
+  WHERE_EXPRIDX      = u32($04000000);
+
+  { WHERE_ORDERBY_* flags (passed to sqlite3WhereBegin wctrlFlags) }
+  WHERE_ORDERBY_NORMAL  = u16($0000);
+  WHERE_ORDERBY_MIN     = u16($0001);
+  WHERE_ORDERBY_MAX     = u16($0002);
+  WHERE_GROUPBY         = u16($0040);
+  WHERE_DISTINCTBY      = u16($0080);
+  WHERE_WANT_DISTINCT   = u16($0100);
+  WHERE_SORTBYGROUP     = u16($0200);
+  WHERE_ORDERBY_LIMIT   = u16($0800);
+  WHERE_RIGHT_JOIN      = u16($1000);
+
+  { WHERE_DISTINCT_* values returned by sqlite3WhereIsDistinct }
+  WHERE_DISTINCT_NOOP      = 0;
+  WHERE_DISTINCT_UNIQUE    = 1;
+  WHERE_DISTINCT_ORDERED   = 2;
+  WHERE_DISTINCT_UNORDERED = 3;
+
+  { TERM_* flags (WhereTerm.wtFlags) }
+  TERM_DYNAMIC   = u16($0001);
+  TERM_VIRTUAL   = u16($0002);
+  TERM_CODED     = u16($0004);
+  TERM_COPIED    = u16($0008);
+  TERM_ORINFO    = u16($0010);
+  TERM_ANDINFO   = u16($0020);
+  TERM_OK        = u16($0040);
+  TERM_VNULL     = u16($0080);
+  TERM_LIKEOPT   = u16($0100);
+  TERM_LIKECOND  = u16($0200);
+  TERM_LIKE      = u16($0400);
+  TERM_IS        = u16($0800);
+  TERM_VARSELECT = u16($1000);
+  TERM_HEURTRUTH = u16($2000);
+  TERM_SLICE     = u16($8000);
+
+  { SQLITE_BLDF* (WhereLoopBuilder bldFlags) }
+  SQLITE_BLDF1_INDEXED = u32($0001);
+  SQLITE_BLDF1_UNIQUE  = u32($0002);
+  SQLITE_BLDF2_2NDPASS = u32($0004);
+
+  { TF_* (Table.tabFlags) }
+  TF_Readonly       = u32($00000001);
+  TF_HasHidden      = u32($00000002);
+  TF_HasPrimaryKey  = u32($00000004);
+  TF_Autoincrement  = u32($00000008);
+  TF_HasStat1       = u32($00000010);
+  TF_HasVirtual     = u32($00000020);
+  TF_HasStored      = u32($00000040);
+  TF_HasGenerated   = u32($00000060);
+  TF_WithoutRowid   = u32($00000080);
+  TF_MaybeReanalyze = u32($00000100);
+  TF_NoVisibleRowid = u32($00000200);
+  TF_OOOHidden      = u32($00000400);
+  TF_HasNotNull     = u32($00000800);
+  TF_Shadow         = u32($00001000);
+  TF_HasStat4       = u32($00002000);
+  TF_Ephemeral      = u32($00004000);
+  TF_Eponymous      = u32($00008000);
+
+  { COLFLAG_* (Column.colFlags) }
+  COLFLAG_PRIMKEY   = u16($0001);
+  COLFLAG_HIDDEN    = u16($0002);
+  COLFLAG_HASTYPE   = u16($0004);
+  COLFLAG_UNIQUE    = u16($0008);
+  COLFLAG_SORTERREF = u16($0010);
+  COLFLAG_VIRTUAL   = u16($0020);
+  COLFLAG_STORED    = u16($0040);
+  COLFLAG_NOTAVAIL  = u16($0080);
+  COLFLAG_BUSY      = u16($0100);
+  COLFLAG_HASCOLL   = u16($0200);
+  COLFLAG_NOEXPAND  = u16($0400);
+  COLFLAG_GENERATED = u16($0060);
+  COLFLAG_NOINSERT  = u16($0062);
+
+  { TABTYP_* (Table.eTabType) }
+  TABTYP_NORM = 0;
+  TABTYP_VTAB = 1;
+  TABTYP_VIEW = 2;
+
+  { XN_* special column index values }
+  XN_ROWID = i32(-1);
+  XN_EXPR  = i32(-2);
+
+  { N_OR_COST (WhereOrSet.a[] capacity) }
+  N_OR_COST = 3;
+
+  { SQLITE_QUERY_PLANNER_LIMIT }
+  SQLITE_QUERY_PLANNER_LIMIT = i32(20000);
+
+  { SZ_WHERETERM_STATIC: number of static WhereTerm slots in TWhereClause.aStatic }
+  SZ_WHERETERM_STATIC = 8;
+
+// ---------------------------------------------------------------------------
+// Phase 6.2 public API — whereexpr.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3WhereClauseInit(pWC: PWhereClause; pWInfo: PWhereInfo);
+procedure sqlite3WhereClauseClear(pWC: PWhereClause);
+procedure sqlite3WhereSplit(pWC: PWhereClause; pExpr: PExpr; op: u8);
+function  sqlite3WhereGetMask(pMaskSet: PWhereMaskSet; iCursor: i32): Bitmask;
+function  sqlite3WhereExprUsageNN(pMaskSet: PWhereMaskSet; p: PExpr): Bitmask;
+function  sqlite3WhereExprUsage(pMaskSet: PWhereMaskSet; p: PExpr): Bitmask;
+function  sqlite3WhereExprListUsage(pMaskSet: PWhereMaskSet; pList: PExprList): Bitmask;
+procedure sqlite3WhereExprAnalyze(pTabList: PSrcList; pWC: PWhereClause);
+procedure sqlite3WhereTabFuncArgs(pParse: PParse; pItem: PSrcItem; pWC: PWhereClause);
+procedure sqlite3WhereAddLimit(pWC: PWhereClause; p: PSelect);
+
+// ---------------------------------------------------------------------------
+// Phase 6.2 public API — where.c
+// ---------------------------------------------------------------------------
+
+function  sqlite3WhereOutputRowCount(pWInfo: PWhereInfo): LogEst;
+function  sqlite3WhereIsDistinct(pWInfo: PWhereInfo): i32;
+function  sqlite3WhereIsOrdered(pWInfo: PWhereInfo): i32;
+function  sqlite3WhereIsSorted(pWInfo: PWhereInfo): i32;
+function  sqlite3WhereOrderByLimitOptLabel(pWInfo: PWhereInfo): i32;
+procedure sqlite3WhereMinMaxOptEarlyOut(v: Pointer; pWInfo: PWhereInfo);
+function  sqlite3WhereContinueLabel(pWInfo: PWhereInfo): i32;
+function  sqlite3WhereBreakLabel(pWInfo: PWhereInfo): i32;
+function  sqlite3WhereOkOnePass(pWInfo: PWhereInfo; aiCur: Pi32): i32;
+function  sqlite3WhereUsesDeferredSeek(pWInfo: PWhereInfo): i32;
+function  sqlite3WhereBegin(pParse: PParse; pTabList: PSrcList; pWhere: PExpr;
+  pOrderBy: PExprList; pDistinctSet: PExprList; wctrlFlags: u16;
+  iAuxArg: i32): PWhereInfo;
+procedure sqlite3WhereEnd(pWInfo: PWhereInfo);
+procedure sqlite3WhereRightJoinLoop(pWInfo: PWhereInfo; iLevel: i32;
+  pLevel: PWhereLevel);
 
 // ---------------------------------------------------------------------------
 // Phase 6.1 public API — walker.c
@@ -2546,6 +3124,253 @@ end;
 procedure sqlite3SelectPopWith(pWalker: PWalker; pSel: PSelect); cdecl;
 begin
   { Phase 6.3 stub }
+end;
+
+// ---------------------------------------------------------------------------
+// Phase 6.2 — whereexpr.c port (SQLite 3.53.0)
+// ---------------------------------------------------------------------------
+
+procedure sqlite3WhereClauseInit(pWC: PWhereClause; pWInfo: PWhereInfo);
+begin
+  pWC^.pWInfo  := pWInfo;
+  pWC^.hasOr   := 0;
+  pWC^.pOuter  := nil;
+  pWC^.nTerm   := 0;
+  pWC^.nBase   := 0;
+  pWC^.nSlot   := SZ_WHERETERM_STATIC;
+  pWC^.a       := @pWC^.aStatic[0];
+end;
+
+procedure whereOrInfoDelete(db: PTsqlite3; pOrInfo: PWhereOrInfo); forward;
+procedure whereAndInfoDelete(db: PTsqlite3; pAndInfo: PWhereAndInfo); forward;
+
+procedure sqlite3WhereClauseClear(pWC: PWhereClause);
+var
+  db:    PTsqlite3;
+  a:     PWhereTerm;
+  aLast: PWhereTerm;
+  i:     i32;
+begin
+  db := pWC^.pWInfo^.pParse^.db;
+  if pWC^.nTerm > 0 then
+  begin
+    a     := pWC^.a;
+    aLast := @pWC^.a[pWC^.nTerm - 1];
+    while True do
+    begin
+      if (a^.wtFlags and TERM_DYNAMIC) <> 0 then
+        sqlite3ExprDelete(db, a^.pExpr);
+      if (a^.wtFlags and (TERM_ORINFO or TERM_ANDINFO)) <> 0 then
+      begin
+        if (a^.wtFlags and TERM_ORINFO) <> 0 then
+          whereOrInfoDelete(db, a^.u.pOrInfo)
+        else
+          whereAndInfoDelete(db, a^.u.pAndInfo);
+      end;
+      if a = aLast then Break;
+      Inc(a);
+    end;
+  end;
+  if pWC^.a <> @pWC^.aStatic[0] then
+    sqlite3DbFree(db, pWC^.a);
+end;
+
+procedure whereOrInfoDelete(db: PTsqlite3; pOrInfo: PWhereOrInfo);
+begin
+  if pOrInfo = nil then Exit;
+  sqlite3WhereClauseClear(@pOrInfo^.wc);
+  sqlite3DbFree(db, pOrInfo);
+end;
+
+procedure whereAndInfoDelete(db: PTsqlite3; pAndInfo: PWhereAndInfo);
+begin
+  if pAndInfo = nil then Exit;
+  sqlite3WhereClauseClear(@pAndInfo^.wc);
+  sqlite3DbFree(db, pAndInfo);
+end;
+
+procedure sqlite3WhereSplit(pWC: PWhereClause; pExpr: PExpr; op: u8);
+var
+  e: PExpr;
+begin
+  if pExpr = nil then Exit;
+  e := pExpr;
+  if u8(e^.op) <> op then
+  begin
+    { whereTerm growth is deferred to Phase 6.2 full port; basic split }
+    { For now: grow aStatic array to nSlot if needed, then append term }
+    if pWC^.nTerm >= pWC^.nSlot then Exit; { overflow guard }
+    pWC^.a[pWC^.nTerm].pExpr    := pExpr;
+    pWC^.a[pWC^.nTerm].wtFlags  := 0;
+    pWC^.a[pWC^.nTerm].eOperator:= 0;
+    pWC^.a[pWC^.nTerm].iParent  := -1;
+    Inc(pWC^.nTerm);
+    Inc(pWC^.nBase);
+  end else
+  begin
+    sqlite3WhereSplit(pWC, e^.pLeft,  op);
+    sqlite3WhereSplit(pWC, e^.pRight, op);
+  end;
+end;
+
+function sqlite3WhereGetMask(pMaskSet: PWhereMaskSet; iCursor: i32): Bitmask;
+var
+  i: i32;
+begin
+  for i := 0 to pMaskSet^.n - 1 do
+    if pMaskSet^.ix[i] = iCursor then
+      Exit(Bitmask(1) shl i);
+  Result := 0;
+end;
+
+function sqlite3WhereExprUsageFull(pMaskSet: PWhereMaskSet; p: PExpr): Bitmask;
+  forward;
+
+function sqlite3WhereExprUsageNN(pMaskSet: PWhereMaskSet; p: PExpr): Bitmask;
+begin
+  if (p^.op = TK_COLUMN) and not ExprHasProperty(p, EP_FixedCol) then
+    Exit(sqlite3WhereGetMask(pMaskSet, p^.iTable));
+  if ExprHasProperty(p, EP_TokenOnly or EP_Leaf) then
+    Exit(0);
+  Result := sqlite3WhereExprUsageFull(pMaskSet, p);
+end;
+
+function sqlite3WhereExprUsage(pMaskSet: PWhereMaskSet; p: PExpr): Bitmask;
+begin
+  if p <> nil then Result := sqlite3WhereExprUsageNN(pMaskSet, p)
+  else Result := 0;
+end;
+
+function sqlite3WhereExprListUsage(pMaskSet: PWhereMaskSet;
+  pList: PExprList): Bitmask;
+var
+  i:    i32;
+  mask: Bitmask;
+  items: PExprListItem;
+begin
+  mask := 0;
+  if pList <> nil then
+  begin
+    items := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+      mask := mask or sqlite3WhereExprUsage(pMaskSet, items[i].pExpr);
+  end;
+  Result := mask;
+end;
+
+function sqlite3WhereExprUsageFull(pMaskSet: PWhereMaskSet; p: PExpr): Bitmask;
+var
+  mask: Bitmask;
+begin
+  mask := 0;
+  if p^.op = TK_IF_NULL_ROW then
+    mask := sqlite3WhereGetMask(pMaskSet, p^.iTable);
+  if p^.pLeft <> nil then
+    mask := mask or sqlite3WhereExprUsageNN(pMaskSet, p^.pLeft);
+  if p^.pRight <> nil then
+    mask := mask or sqlite3WhereExprUsageNN(pMaskSet, p^.pRight)
+  else if ExprUseXSelect(p) then
+  begin
+    if ExprHasProperty(p, EP_VarSelect) then
+      pMaskSet^.bVarSelect := 1;
+    { exprSelectUsage deferred to Phase 6.3 — return 0 for subqueries }
+  end else if ExprUseXList(p) and (p^.x.pList <> nil) then
+    mask := mask or sqlite3WhereExprListUsage(pMaskSet, p^.x.pList);
+  Result := mask;
+end;
+
+procedure sqlite3WhereExprAnalyze(pTabList: PSrcList; pWC: PWhereClause);
+begin
+  { Phase 6.2 stub — full exprAnalyze() loop deferred to full where.c port }
+end;
+
+procedure sqlite3WhereTabFuncArgs(pParse: PParse; pItem: PSrcItem;
+  pWC: PWhereClause);
+begin
+  { Phase 6.2 stub }
+end;
+
+procedure sqlite3WhereAddLimit(pWC: PWhereClause; p: PSelect);
+begin
+  { Phase 6.2 stub }
+end;
+
+// ---------------------------------------------------------------------------
+// Phase 6.2 — where.c public API stubs (SQLite 3.53.0)
+// ---------------------------------------------------------------------------
+
+function sqlite3WhereOutputRowCount(pWInfo: PWhereInfo): LogEst;
+begin
+  Result := pWInfo^.nRowOut;
+end;
+
+function sqlite3WhereIsDistinct(pWInfo: PWhereInfo): i32;
+begin
+  Result := pWInfo^.eDistinct;
+end;
+
+function sqlite3WhereIsOrdered(pWInfo: PWhereInfo): i32;
+begin
+  Result := pWInfo^.nOBSat;
+end;
+
+function sqlite3WhereIsSorted(pWInfo: PWhereInfo): i32;
+begin
+  if (pWInfo^.wctrlFlags and (WHERE_GROUPBY or WHERE_DISTINCTBY)) <> 0 then
+    Result := 0
+  else
+    Result := pWInfo^.nOBSat;
+end;
+
+function sqlite3WhereOrderByLimitOptLabel(pWInfo: PWhereInfo): i32;
+begin
+  Result := pWInfo^.iBreak;
+end;
+
+procedure sqlite3WhereMinMaxOptEarlyOut(v: Pointer; pWInfo: PWhereInfo);
+begin
+  { Phase 6.2 stub }
+end;
+
+function sqlite3WhereContinueLabel(pWInfo: PWhereInfo): i32;
+begin
+  Result := pWInfo^.iContinue;
+end;
+
+function sqlite3WhereBreakLabel(pWInfo: PWhereInfo): i32;
+begin
+  Result := pWInfo^.iBreak;
+end;
+
+function sqlite3WhereOkOnePass(pWInfo: PWhereInfo; aiCur: Pi32): i32;
+begin
+  aiCur[0] := pWInfo^.aiCurOnePass[0];
+  aiCur[1] := pWInfo^.aiCurOnePass[1];
+  Result := pWInfo^.eOnePass;
+end;
+
+function sqlite3WhereUsesDeferredSeek(pWInfo: PWhereInfo): i32;
+begin
+  Result := (pWInfo^.bitwiseFlags shr 0) and 1; { bit 0 = bDeferredSeek }
+end;
+
+function sqlite3WhereBegin(pParse: PParse; pTabList: PSrcList; pWhere: PExpr;
+  pOrderBy: PExprList; pDistinctSet: PExprList; wctrlFlags: u16;
+  iAuxArg: i32): PWhereInfo;
+begin
+  { Phase 6.2 stub — full where.c implementation deferred to Phase 6.2 full port }
+  Result := nil;
+end;
+
+procedure sqlite3WhereEnd(pWInfo: PWhereInfo);
+begin
+  { Phase 6.2 stub }
+end;
+
+procedure sqlite3WhereRightJoinLoop(pWInfo: PWhereInfo; iLevel: i32;
+  pLevel: PWhereLevel);
+begin
+  { Phase 6.2 stub }
 end;
 
 end.
