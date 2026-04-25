@@ -136,6 +136,7 @@ compile_test TestDMLBasic
 compile_test TestSchemaBasic
 compile_test TestWindowBasic
 compile_test TestOpenClose
+compile_test TestPrepareBasic
 compile_test TestExplainParity
 compile_test TestSQLCorpus
 compile_test TestFuzzDiff

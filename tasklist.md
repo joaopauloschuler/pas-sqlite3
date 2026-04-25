@@ -20,6 +20,20 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-25 — Phase 8.2 sqlite3_prepare family.** New entry points
+    `sqlite3_prepare`, `sqlite3_prepare_v2`, `sqlite3_prepare_v3` in
+    `src/passqlite3main.pas`, with `sqlite3LockAndPrepare` +
+    `sqlite3Prepare` ported from `prepare.c`.  `sqlite3ErrorMsg` in
+    codegen now sets `pParse^.rc := SQLITE_ERROR` on the first error
+    (matches C and lets parse failures surface through the prepare
+    path).  Gate `src/tests/TestPrepareBasic.pas` 20/20 PASS; no
+    regressions in TestParser, TestParserSmoke, TestSchemaBasic,
+    TestOpenClose, or any of the existing Vdbe gates.  Key constraint
+    for Phase 8.3+: until codegen finishes wiring `sqlite3FinishTable`
+    / `sqlite3Select` / `sqlite3PragmaParse` etc., a successful prepare
+    usually produces `*ppStmt = nil` (rc still OK) — the byte-for-byte
+    VDBE differential remains Phase 7.4b / 6.x.
+
   - **2026-04-25 — Phase 8.1 connection lifecycle scaffold.** New
     `src/passqlite3main.pas` exposes `sqlite3_open[_v2]` and
     `sqlite3_close[_v2]`, with simplified `openDatabase` and
@@ -2585,8 +2599,63 @@ loader — *optional for v1*).
     * `connectionIsBusy` only checks `db->pVdbe`; the backup-API leg
       (`sqlite3BtreeIsInBackup`) waits for Phase 8.7.
 
-- [ ] **8.2** Port `sqlite3_prepare_v2` / `sqlite3_prepare_v3` — the entry
+- [X] **8.2** Port `sqlite3_prepare_v2` / `sqlite3_prepare_v3` — the entry
   point that wires parser → codegen → VDBE.
+
+  DONE 2026-04-25.  `sqlite3_prepare`, `sqlite3_prepare_v2`, and
+  `sqlite3_prepare_v3` are now defined in `src/passqlite3main.pas`,
+  along with internal helpers `sqlite3LockAndPrepare` and
+  `sqlite3Prepare` ported from `prepare.c:836` and `prepare.c:682`.
+
+  Concrete changes:
+    * `src/passqlite3main.pas` — adds `passqlite3parser` to uses (so
+      the real `sqlite3RunParser` from Phase 7.2f resolves); adds
+      `sqlite3Prepare`, `sqlite3LockAndPrepare`, and the three public
+      entry points; defines local SQLITE_PREPARE_PERSISTENT/_NORMALIZE/
+      _NO_VTAB constants.
+    * `src/passqlite3codegen.pas` — removes the legacy stubs of
+      `sqlite3_prepare`, `_v2`, `_v3` from interface and implementation
+      (UTF-16 entry points `_prepare16*` remain stubbed pending UTF-16
+      support); also tightens `sqlite3ErrorMsg` to set
+      `pParse^.rc := SQLITE_ERROR` like the C version, so syntax errors
+      surface through the prepare path even while the formatted message
+      is still a Phase 6.5 stub.
+    * `src/tests/TestPrepareBasic.pas` — new gate test (20/20 PASS);
+      covers blank text, lone `;`, syntax error, MISUSE on
+      db=nil/zSql=nil/ppStmt=nil, pzTail end-of-string, explicit
+      nBytes long-statement copy path, prepare_v3 prepFlags=0
+      equivalence, and multi-statement pzTail advance.
+    * `src/tests/build.sh` — registers TestPrepareBasic.
+
+  Phase 8.2 scope notes (what is *not* yet wired — to be addressed in
+  later sub-phases or in Phase 6.x codegen completion):
+    * **No real Vdbe is emitted yet for most top-level statements.**
+      Several codegen entry points reachable from CREATE/SELECT/PRAGMA/
+      BEGIN are still Phase 6/7 stubs (`sqlite3FinishTable`,
+      `sqlite3Select`, `sqlite3PragmaParse`, etc.), so successful
+      preparations typically yield `rc = SQLITE_OK` with `*ppStmt = nil`
+      — same surface API behaviour SQLite gives for whitespace-only
+      statements.  The byte-for-byte VDBE differential (Phase 7.4b /
+      6.x) is what unblocks step-able statements.
+    * **Schema retry loop disabled.** `sqlite3LockAndPrepare`'s
+      `do { ... } while (rc==SQLITE_SCHEMA && cnt==1)` loop is reduced
+      to a single attempt because `sqlite3ResetOneSchema` is not yet
+      ported and the schema-cookie subsystem has no state to reset.
+      Re-enable when shared-cache / schema-cookie machinery lands.
+    * **schemaIsValid path skipped on parse-error tear-down.** Same
+      reason — no schema cookies yet.
+    * **No vtab unlock list call** (`sqlite3VtabUnlockList`); no vtabs
+      registered.
+    * **BtreeEnterAll/LeaveAll go to codegen no-op stubs** — fine for
+      single-threaded use.
+    * **`sqlite3SafetyCheckOk` accepts the legacy "1" placeholder** in
+      addition to SQLITE_STATE_OPEN, because Phase 6/7 test scaffolds
+      (TestParser/TestParserSmoke MakeDb) still synthesise a fake db
+      with eOpenState=1.
+    * **`sqlite3ErrorMsg` formatting still ignores `zFormat` printf
+      arguments.** Error messages stored in db->pErr will be empty
+      until the printf machinery lands (tracked under Phase 6/8 errmsg
+      TODOs).
 
 - [ ] **8.3** Port registration APIs: `sqlite3_create_function`,
   `sqlite3_create_collation`, `sqlite3_create_module` (virtual tables).

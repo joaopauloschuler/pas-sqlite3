@@ -42,7 +42,8 @@ uses
   passqlite3pager,
   passqlite3btree,
   passqlite3vdbe,
-  passqlite3codegen;
+  passqlite3codegen,
+  passqlite3parser;  { Phase 8.2 — real sqlite3RunParser }
 
 type
   PPTsqlite3 = ^PTsqlite3;
@@ -67,6 +68,15 @@ function sqlite3_open_v2(zFilename: PAnsiChar; ppDb: PPTsqlite3;
                           flags: i32; zVfs: PAnsiChar): i32;
 function sqlite3_close(db: PTsqlite3): i32;
 function sqlite3_close_v2(db: PTsqlite3): i32;
+
+{ Phase 8.2 — sqlite3_prepare family (prepare.c). }
+function sqlite3_prepare(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+                         ppStmt: PPointer; pzTail: PPAnsiChar): i32;
+function sqlite3_prepare_v2(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+                            ppStmt: PPointer; pzTail: PPAnsiChar): i32;
+function sqlite3_prepare_v3(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+                            prepFlags: u32; ppStmt: PPointer;
+                            pzTail: PPAnsiChar): i32;
 
 implementation
 
@@ -358,6 +368,195 @@ end;
 function sqlite3_close_v2(db: PTsqlite3): i32;
 begin
   Result := sqlite3Close(db, 1);
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 8.2 — sqlite3_prepare / sqlite3_prepare_v2 / sqlite3_prepare_v3
+  Ported from prepare.c:682 (sqlite3Prepare), :836 (sqlite3LockAndPrepare),
+  :925 (sqlite3_prepare), :937 (sqlite3_prepare_v2), :955 (sqlite3_prepare_v3).
+
+  Scope of this Phase 8.2 port:
+    * Single-attempt compile.  The C version retries on SQLITE_SCHEMA via
+      sqlite3ResetOneSchema, but the schema-cookie subsystem is not yet
+      ported — there is no schema state to reset, so the retry loop is
+      reduced to one pass.
+    * Schema-locked check (BtreeSchemaLocked) skipped — the codegen stub
+      always returns 0 and there is no shared cache.
+    * Vtab unlock list skipped (no vtabs registered).
+    * Btree mutex enter/leave still goes via the codegen stubs (no-op).
+    * Long-statement copy (when the caller passes a non-NUL-terminated
+      buffer with explicit nBytes) is faithfully reproduced — we duplicate
+      the SQL into a NUL-terminated buffer before handing it to the
+      parser, then translate the parser's zTail back into the caller's
+      buffer offset.
+  ---------------------------------------------------------------------- }
+
+const
+  SQLITE_MAX_PREPARE_RETRY    = 25;
+  SQLITE_PREPARE_PERSISTENT   = $01;  { sqlite3.h public flag bit }
+  SQLITE_PREPARE_NORMALIZE    = $02;
+  SQLITE_PREPARE_NO_VTAB      = $04;
+
+function sqlite3Prepare(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+                        prepFlags: u32; pReprepare: PVdbe;
+                        ppStmt: PPointer; pzTail: PPAnsiChar): i32;
+var
+  rc:       i32;
+  sParse:   TParse;
+  zSqlCopy: PAnsiChar;
+  mxLen:    i32;
+  nDup:     i32;
+  pT:       PTriggerPrg;
+  label end_prepare;
+begin
+  rc := SQLITE_OK;
+
+  { Inline sqlite3ParseObjectInit + zero the rest of TParse (PARSE_TAIL). }
+  FillChar(sParse, SizeOf(sParse), 0);
+  sParse.pOuterParse := db^.pParse;
+  db^.pParse         := @sParse;
+  sParse.db          := db;
+  if pReprepare <> nil then begin
+    sParse.pReprepare := pReprepare;
+    sParse.explain    := u8(sqlite3_stmt_isexplain(Pointer(pReprepare)));
+  end;
+
+  Assert((ppStmt <> nil) and (ppStmt^ = nil));
+  if db^.mallocFailed <> 0 then begin
+    sqlite3ErrorMsg(@sParse, 'out of memory');
+    db^.errCode := SQLITE_NOMEM;
+    rc          := SQLITE_NOMEM;
+    goto end_prepare;
+  end;
+
+  { Long-term prepared statements bypass lookaside. }
+  if (prepFlags and SQLITE_PREPARE_PERSISTENT) <> 0 then begin
+    Inc(sParse.disableLookaside);
+    Inc(db^.lookaside.bDisable);
+    db^.lookaside.sz := 0;
+  end;
+  sParse.prepFlags := u8(prepFlags and $FF);
+
+  { Schema-locked check: codegen stub always returns 0; left as a
+    documented no-op until shared-cache lands. }
+
+  if (nBytes >= 0) and ((nBytes = 0) or (zSql[nBytes - 1] <> #0)) then begin
+    mxLen := db^.aLimit[SQLITE_LIMIT_SQL_LENGTH];
+    if nBytes > mxLen then begin
+      sqlite3ErrorWithMsg(db, SQLITE_TOOBIG, 'statement too long');
+      rc := sqlite3ApiExit(db, SQLITE_TOOBIG);
+      goto end_prepare;
+    end;
+    nDup     := nBytes;
+    zSqlCopy := PAnsiChar(sqlite3DbStrNDup(db, PChar(zSql), u64(nDup)));
+    if zSqlCopy <> nil then begin
+      sqlite3RunParser(@sParse, zSqlCopy);
+      { Translate zTail back from copy-relative to caller-relative. }
+      sParse.zTail := zSql + (PtrUInt(sParse.zTail) - PtrUInt(zSqlCopy));
+      sqlite3DbFree(db, zSqlCopy);
+    end else begin
+      sParse.zTail := zSql + nBytes;
+    end;
+  end else begin
+    sqlite3RunParser(@sParse, zSql);
+  end;
+  Assert(sParse.nQueryLoop = 0);
+
+  if pzTail <> nil then
+    pzTail^ := sParse.zTail;
+
+  if (db^.init.busy = 0) and (sParse.pVdbe <> nil) then
+    sqlite3VdbeSetSql(sParse.pVdbe, zSql,
+                      i32(PtrUInt(sParse.zTail) - PtrUInt(zSql)),
+                      u8(prepFlags and $FF));
+
+  if db^.mallocFailed <> 0 then begin
+    sParse.rc := SQLITE_NOMEM;
+    sParse.parseFlags := sParse.parseFlags and (not u32($200)); { clear checkSchema }
+  end;
+
+  if (sParse.rc <> SQLITE_OK) and (sParse.rc <> SQLITE_DONE) then begin
+    { schemaIsValid path skipped — no schema-cookie machinery yet. }
+    if sParse.pVdbe <> nil then
+      sqlite3VdbeFinalize(sParse.pVdbe);
+    Assert(ppStmt^ = nil);
+    rc := sParse.rc;
+    if sParse.zErrMsg <> nil then begin
+      sqlite3ErrorWithMsg(db, rc, PAnsiChar(sParse.zErrMsg));
+      sqlite3DbFree(db, sParse.zErrMsg);
+      sParse.zErrMsg := nil;
+    end else begin
+      sqlite3Error(db, rc);
+    end;
+  end else begin
+    Assert(sParse.zErrMsg = nil);
+    ppStmt^ := Pointer(sParse.pVdbe);
+    rc      := SQLITE_OK;
+    sqlite3ErrorClear(db);
+  end;
+
+  { Free any TriggerPrg structures allocated by the parser. }
+  while sParse.pTriggerPrg <> nil do begin
+    pT := sParse.pTriggerPrg;
+    sParse.pTriggerPrg := pT^.pNext;
+    sqlite3DbFree(db, pT);
+  end;
+
+end_prepare:
+  sqlite3ParseObjectReset(@sParse);
+  Result := rc;
+end;
+
+function sqlite3LockAndPrepare(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+                               prepFlags: u32; pOld: PVdbe;
+                               ppStmt: PPointer; pzTail: PPAnsiChar): i32;
+var
+  rc, cnt: i32;
+begin
+  if ppStmt = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  ppStmt^ := nil;
+  if (sqlite3SafetyCheckOk(db) = 0) or (zSql = nil) then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  cnt := 0;
+  sqlite3BtreeEnterAll(db);
+  repeat
+    rc := sqlite3Prepare(db, zSql, nBytes, prepFlags, pOld, ppStmt, pzTail);
+    Assert((rc = SQLITE_OK) or (ppStmt^ = nil));
+    if (rc = SQLITE_OK) or (db^.mallocFailed <> 0) then Break;
+    Inc(cnt);
+    { sqlite3ResetOneSchema not yet ported — bail after one retry on
+      SQLITE_ERROR_RETRY only. }
+    if (rc <> SQLITE_ERROR_RETRY) or (cnt > SQLITE_MAX_PREPARE_RETRY) then
+      Break;
+  until False;
+  sqlite3BtreeLeaveAll(db);
+  rc := sqlite3ApiExit(db, rc);
+  db^.busyHandler.nBusy := 0;
+  Result := rc;
+end;
+
+function sqlite3_prepare(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+                         ppStmt: PPointer; pzTail: PPAnsiChar): i32;
+begin
+  Result := sqlite3LockAndPrepare(db, zSql, nBytes, 0, nil, ppStmt, pzTail);
+end;
+
+function sqlite3_prepare_v2(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+                            ppStmt: PPointer; pzTail: PPAnsiChar): i32;
+begin
+  Result := sqlite3LockAndPrepare(db, zSql, nBytes,
+                                  SQLITE_PREPARE_SAVESQL, nil, ppStmt, pzTail);
+end;
+
+function sqlite3_prepare_v3(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+                            prepFlags: u32; ppStmt: PPointer;
+                            pzTail: PPAnsiChar): i32;
+begin
+  Result := sqlite3LockAndPrepare(db, zSql, nBytes,
+              (prepFlags and SQLITE_PREPARE_MASK) or SQLITE_PREPARE_SAVESQL,
+              nil, ppStmt, pzTail);
 end;
 
 end.
