@@ -2327,9 +2327,44 @@ statement is syntactically complete — used by the CLI and REPLs).
         cast.
       * Six new locals in `yy_reduce`'s var block: `pWin_318/319/343/345`,
         `zCheckStart_300`, `nCheck_300`.
-    - [ ] **7.2e.8** Rules 350..411 — windows (WINDOW/OVER/FILTER, frame,
-      window definition tail), VIRTUAL TABLE, table-valued functions,
-      remaining tail rules.
+    - [X] **7.2e.8** Rules 348..411 — all in Lemon's `default:` branch.
+      Verified against parse.c:5927..5993: every rule in 348..411 is either
+      tagged `OPTIMIZED OUT` (Lemon emitted no reduce action — the value
+      copy is folded into the parse table via SHIFTREDUCE / aliased %type)
+      or has an empty action body (only `yytestcase()` for coverage —
+      semantically a no-op).  No new explicit `case` arms are required:
+      the existing `else` branch in `yy_reduce` already provides a no-op
+      and the unconditional goto/state-update logic that follows the
+      `case` correctly pushes the LHS for these rules too.  Spot-list of
+      what falls into this bucket: cmdlist/ecmd plumbing (348..353),
+      trans_opt / savepoint_opt (354..358), create_table glue (359),
+      table_option_set tail (360), columnlist tail (361..362),
+      nm/typetoken/typename/signed (363..368), carglist/ccons tail
+      (369..373), conslist/tconscomma/defer_subclause/resolvetype
+      (374..379), selectnowith/oneselect/sclp/as/indexed_opt/returning
+      (380..385), expr/likeop/case_operand/exprlist (386..389), nmnum /
+      plus_num (390..395), foreach_clause / tridxby (396..398),
+      database_kw_opt / kwcolumn_opt (399..402), vtabarglist / vtabarg
+      (403..405), anylist (406..408), with (409), windowdefn_list (410),
+      window (411).  DONE 2026-04-25.
+
+      Notes for next chunks:
+      * **No new helpers / locals / constants** were added in this chunk
+        — the Pascal driver already covers the no-op semantics.  This
+        completes the 7.2e family; the entire reduce-action switch is
+        now feature-complete relative to upstream.
+      * **OPTIMIZED OUT marker meaning**: Lemon detects that an LHS
+        non-terminal has the same union slot as its single RHS symbol
+        and that the action is a pure copy.  Rather than emit a reduce
+        case, it folds the copy into the parse-table state transitions
+        (SHIFTREDUCE actions on the RHS terminal).  Because we ported
+        `yy_action` / `yy_lookahead` / `yy_shift_ofst` / `yy_reduce_ofst`
+        verbatim from parse.c in 7.2b, those folded copies already
+        execute correctly without a Pascal-side reduce arm.
+      * **`yytestcase` is coverage instrumentation, not action code**
+        — it expands to `if(x){}` in normal builds.  Rules whose only
+        body is `yytestcase(yyruleno==N);` therefore have no semantic
+        effect and the Pascal `else` branch matches that exactly.
 
     Per-chunk approach (refined 2026-04-25 during 7.2e.1):
 

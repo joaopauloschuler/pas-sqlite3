@@ -3404,10 +3404,12 @@ begin
          yymsp[0].minor.yy454 := yylhsminor.yy454;
        end;
   else
-    { Phase 7.2e in progress: rules 50..411 not yet ported.  Until ported,
-      they fall through to the goto/state-update logic below — this is
-      semantically equivalent to a no-op grammar action (correct for any
-      rule whose action exists only to copy or ignore minors). }
+    { Phase 7.2e complete (rules 0..347 ported explicitly above).
+      Rules 348..411 land here intentionally: every one of them is
+      tagged "OPTIMIZED OUT" by Lemon (the value-copy is folded into
+      SHIFTREDUCE table entries — see parse.c:5927..5993) or has an
+      empty action body.  Falling through to the goto/state-update
+      logic below is therefore the correct semantics. }
     ;
   end;
 
