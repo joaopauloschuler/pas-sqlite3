@@ -911,7 +911,7 @@ begin
   while (N > 0) and (a^ <> 0) and (sqlite3UpperToLower[a^] = sqlite3UpperToLower[b^]) do begin
     Inc(a); Inc(b); Dec(N);
   end;
-  if N < 0 then Exit(0);
+  if N <= 0 then Exit(0);
   Result := i32(sqlite3UpperToLower[a^]) - i32(sqlite3UpperToLower[b^]);
 end;
 

@@ -124,6 +124,7 @@ compile_test TestVdbeBlob
 compile_test TestVdbeSort
 compile_test TestVdbeTrace
 compile_test TestVdbeVtab
+compile_test TestTokenizer
 compile_test TestWalker
 compile_test TestExprBasic
 compile_test TestWhereBasic
@@ -158,4 +159,5 @@ echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestPagerCrash"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestWalCompat"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestDMLBasic"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestSchemaBasic"
-echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestReferenceVectors"
+echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestReferenceVectors
+  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestTokenizer"

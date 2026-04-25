@@ -1252,6 +1252,10 @@ estimate**.
   reference from the SQL corpus, run the program on the Pascal VDBE and on the
   C VDBE, with `PRAGMA vdbe_trace=ON`, and diff the resulting trace logs.
   **Any divergence halts the phase.**
+  **DEFERRED** — requires the SQL parser (Phase 7.2) to generate VDBE programs
+  automatically from SQL strings. The existing stub `TestVdbeTrace.pas` (T1–T5)
+  tests only the `sqlite3VdbeExpandSql` API and already passes; the differential
+  trace test cannot be fully written until Phase 7.2 is done.
 
 ---
 
@@ -1891,10 +1895,13 @@ which generates `parse.c` at build time), `complete.c` (the
 `sqlite3_complete` / `sqlite3_complete16` helpers for detecting when a SQL
 statement is syntactically complete — used by the CLI and REPLs).
 
-- [ ] **7.1** Port `tokenize.c` (the lexer) to `passqlite3parser.pas`. Hand
+- [X] **7.1** Port `tokenize.c` (the lexer) to `passqlite3parser.pas`. Hand
   port — it is a single function (`sqlite3GetToken`) of ~400 lines driven by
   character classification tables. `complete.c` is a small companion
   (~280 lines) and ports in the same unit.
+  Gate test `TestTokenizer.pas`: T1–T18 all PASS (127/127).
+  Also fixed an off-by-one bug in `sqlite3_strnicmp` (`N < 0` → `N <= 0`)
+  that caused keyword comparison to always fail when all N chars matched.
 
 - [ ] **7.2** **Strategy for `parse.y`:** *regenerate* with Lemon targeting
   Pascal, rather than hand-porting the generated `parse.c` (which is ~6k lines
