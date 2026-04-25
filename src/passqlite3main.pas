@@ -178,6 +178,10 @@ function sqlite3_db_config_int(db: PTsqlite3; op: i32;
   int-shape used by SQLITE_CONFIG_MEMSTATUS / SINGLETHREAD / etc. }
 function sqlite3_config(op: i32; arg: i32): i32; overload;
 
+{ Phase 8.5 — library-wide initialize / shutdown (main.c:190 / :372). }
+function sqlite3_initialize: i32;
+function sqlite3_shutdown:   i32;
+
 implementation
 
 { ----------------------------------------------------------------------
@@ -1227,6 +1231,129 @@ begin
   else
     Result := SQLITE_MISUSE;
   end;
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 8.5 — sqlite3_initialize / sqlite3_shutdown.
+  Ported from main.c:190 (sqlite3_initialize) and main.c:372 (sqlite3_shutdown).
+
+  Scope notes:
+    * SQLITE_EXTRA_INIT / SQLITE_OMIT_WSD / SQLITE_ENABLE_SQLLOG branches
+      are compile-time gated in C and not relevant here.
+    * sqlite3_reset_auto_extension is not ported (auto-extension subsystem
+      not present); shutdown therefore omits the call.  Re-add with that
+      subsystem in a later phase.
+    * sqlite3_data_directory / sqlite3_temp_directory globals are not
+      ported either, so the post-MallocEnd zeroing block is skipped.
+    * The NDEBUG NaN sanity check is omitted.
+  ---------------------------------------------------------------------- }
+
+function sqlite3_initialize: i32;
+var
+  pMainMtx : Psqlite3_mutex;
+  rc       : i32;
+begin
+  { If SQLite is already completely initialized, this is a no-op. }
+  if sqlite3GlobalConfig.isInit <> 0 then begin
+    sqlite3MemoryBarrier;
+    Result := SQLITE_OK;
+    Exit;
+  end;
+
+  { Make sure the mutex subsystem is initialized. }
+  rc := sqlite3MutexInit;
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  { Initialize malloc + the recursive pInitMutex under STATIC_MAIN. }
+  pMainMtx := sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN);
+  sqlite3_mutex_enter(pMainMtx);
+  sqlite3GlobalConfig.isMutexInit := 1;
+  if sqlite3GlobalConfig.isMallocInit = 0 then
+    rc := sqlite3MallocInit;
+  if rc = SQLITE_OK then begin
+    sqlite3GlobalConfig.isMallocInit := 1;
+    if sqlite3GlobalConfig.pInitMutex = nil then begin
+      sqlite3GlobalConfig.pInitMutex :=
+        sqlite3MutexAlloc(SQLITE_MUTEX_RECURSIVE);
+      if (sqlite3GlobalConfig.bCoreMutex <> 0)
+         and (sqlite3GlobalConfig.pInitMutex = nil) then
+        rc := SQLITE_NOMEM;
+    end;
+  end;
+  if rc = SQLITE_OK then
+    Inc(sqlite3GlobalConfig.nRefInitMutex);
+  sqlite3_mutex_leave(pMainMtx);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  { Recursive-mutex section: do the rest of the work serialized via
+    pInitMutex so re-entrant calls (typically through sqlite3_os_init →
+    sqlite3_vfs_register) don't deadlock. }
+  sqlite3_mutex_enter(sqlite3GlobalConfig.pInitMutex);
+  if (sqlite3GlobalConfig.isInit = 0)
+     and (sqlite3GlobalConfig.inProgress = 0) then begin
+    sqlite3GlobalConfig.inProgress := 1;
+
+    { Reset the global builtin-functions hash and re-populate. }
+    FillChar(sqlite3BuiltinFunctions, SizeOf(sqlite3BuiltinFunctions), 0);
+    sqlite3RegisterBuiltinFunctions;
+
+    if sqlite3GlobalConfig.isPCacheInit = 0 then
+      rc := sqlite3PcacheInitialize;
+    if rc = SQLITE_OK then begin
+      sqlite3GlobalConfig.isPCacheInit := 1;
+      rc := sqlite3OsInit;
+    end;
+    if rc = SQLITE_OK then
+      rc := sqlite3MemdbInit;
+    if rc = SQLITE_OK then begin
+      sqlite3PCacheBufferSetup(
+        sqlite3GlobalConfig.pPage,
+        sqlite3GlobalConfig.szPage,
+        sqlite3GlobalConfig.nPage);
+    end;
+    if rc = SQLITE_OK then begin
+      sqlite3MemoryBarrier;
+      sqlite3GlobalConfig.isInit := 1;
+    end;
+    sqlite3GlobalConfig.inProgress := 0;
+  end;
+  sqlite3_mutex_leave(sqlite3GlobalConfig.pInitMutex);
+
+  { Tear down the recursive pInitMutex once the last in-flight caller
+    leaves, to prevent a resource leak across repeated init/shutdown. }
+  sqlite3_mutex_enter(pMainMtx);
+  Dec(sqlite3GlobalConfig.nRefInitMutex);
+  if sqlite3GlobalConfig.nRefInitMutex <= 0 then begin
+    Assert(sqlite3GlobalConfig.nRefInitMutex = 0);
+    sqlite3_mutex_free(sqlite3GlobalConfig.pInitMutex);
+    sqlite3GlobalConfig.pInitMutex := nil;
+  end;
+  sqlite3_mutex_leave(pMainMtx);
+
+  Result := rc;
+end;
+
+function sqlite3_shutdown: i32;
+begin
+  if sqlite3GlobalConfig.isInit <> 0 then begin
+    sqlite3_os_end;
+    { sqlite3_reset_auto_extension — auto-extension subsystem not ported. }
+    sqlite3GlobalConfig.isInit := 0;
+  end;
+  if sqlite3GlobalConfig.isPCacheInit <> 0 then begin
+    sqlite3PcacheShutdown;
+    sqlite3GlobalConfig.isPCacheInit := 0;
+  end;
+  if sqlite3GlobalConfig.isMallocInit <> 0 then begin
+    sqlite3MallocEnd;
+    sqlite3GlobalConfig.isMallocInit := 0;
+    { sqlite3_data_directory / sqlite3_temp_directory globals not ported. }
+  end;
+  if sqlite3GlobalConfig.isMutexInit <> 0 then begin
+    sqlite3MutexEnd;
+    sqlite3GlobalConfig.isMutexInit := 0;
+  end;
+  Result := SQLITE_OK;
 end;
 
 end.

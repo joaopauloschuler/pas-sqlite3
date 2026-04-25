@@ -20,6 +20,42 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-25 — Phase 8.5 initialize / shutdown.**  New entry points in
+    `src/passqlite3main.pas`: `sqlite3_initialize` (main.c:190) and
+    `sqlite3_shutdown` (main.c:372).  Faithful port of the two-stage
+    initialize: STATIC_MAIN-mutex protected malloc + pInitMutex setup,
+    then recursive-mutex protected `sqlite3RegisterBuiltinFunctions` →
+    `sqlite3PcacheInitialize` → `sqlite3OsInit` → `sqlite3MemdbInit` →
+    `sqlite3PCacheBufferSetup`, finishing by tearing down the recursive
+    pInitMutex via the nRefInitMutex counter.  Shutdown clears
+    isInit/isPCacheInit/isMallocInit/isMutexInit in the same C-order
+    (sqlite3_os_end → sqlite3PcacheShutdown → sqlite3MallocEnd →
+    sqlite3MutexEnd) and is idempotent.  Gate
+    `src/tests/TestInitShutdown.pas` 27/27 PASS; no regressions in
+    TestOpenClose / TestPrepareBasic / TestRegistration / TestConfigHooks
+    / TestSchemaBasic / TestParser / TestParserSmoke.
+
+    Phase 8.5 scope notes (deferred):
+      * `sqlite3_reset_auto_extension` — auto-extension subsystem
+        (`loadext.c`) not ported; shutdown skips the call.  Restore when
+        Phase 8.9 lands, even if it stays a stub.
+      * `sqlite3_data_directory` / `sqlite3_temp_directory` globals — set
+        by `sqlite3_config(SQLITE_CONFIG_DATA_DIRECTORY, ...)`, which is
+        not in the typed `sqlite3_config` overloads.  Add together with
+        the C-varargs trampoline.
+      * `SQLITE_EXTRA_INIT` / `SQLITE_OMIT_WSD` / `SQLITE_ENABLE_SQLLOG`
+        compile-time hooks intentionally omitted (not part of our build).
+      * NDEBUG NaN sanity check omitted.
+      * `sqlite3_progress_handler` (deferred from Phase 8.4) **still not
+        ported** — covers the same surface area as a public-API hook
+        but is independent of init/shutdown; wire it next time we revisit
+        configuration hooks (good fit for an 8.4-fixup or 8.6 prelude).
+      * Note for future audits: `openDatabase` still has its lazy
+        `sqlite3_os_init` / `sqlite3PcacheInitialize` calls — harmless
+        now that `sqlite3_initialize` exists, but redundant once callers
+        consistently initialize before opening.  Consider removing in a
+        future cleanup pass.
+
   - **2026-04-25 — Phase 8.4 configuration and hooks.**  New entry points
     in `src/passqlite3main.pas`: `sqlite3_busy_handler`,
     `sqlite3_busy_timeout`, `sqlite3_commit_hook`, `sqlite3_rollback_hook`,
@@ -2795,7 +2831,29 @@ loader — *optional for v1*).
       registration is wired.  Audit + wiring belongs with Phase 6.4
       (DML hooks) and Phase 5.4 trace ops.
 
-- [ ] **8.5** Port `sqlite3_initialize` / `sqlite3_shutdown`.
+- [X] **8.5** Port `sqlite3_initialize` / `sqlite3_shutdown`.
+
+  DONE 2026-04-25.  See "Most recent activity" above.  New entry points
+  `sqlite3_initialize` and `sqlite3_shutdown` in `src/passqlite3main.pas`,
+  faithful to main.c:190 / :372 (mutex/malloc/pcache/os/memdb staged
+  init under STATIC_MAIN + recursive pInitMutex; shutdown tears them
+  down in C-order and is idempotent).
+
+  Concrete changes:
+    * `src/passqlite3main.pas` — adds `sqlite3_initialize` and
+      `sqlite3_shutdown` (plus interface declarations).
+    * `src/tests/TestInitShutdown.pas` — new gate test (27/27 PASS).
+    * `src/tests/build.sh` — registers TestInitShutdown.
+
+  Phase 8.5 scope notes (deferred):
+    * `sqlite3_reset_auto_extension` — defer with Phase 8.9 (loadext.c).
+    * `sqlite3_data_directory` / `sqlite3_temp_directory` zeroing —
+      defer with the C-varargs `sqlite3_config` trampoline.
+    * `sqlite3_progress_handler` — independent hook, wire next time we
+      revisit Phase 8.4 territory.
+    * `openDatabase`'s lazy os_init / pcache_init calls are now
+      redundant when callers explicitly initialize first; harmless, but
+      flagged for a future cleanup pass.
 
 - [ ] **8.6** Port `legacy.c`: `sqlite3_exec` and the one-shot callback-style
   wrappers; `table.c`: `sqlite3_get_table` / `sqlite3_free_table`.
