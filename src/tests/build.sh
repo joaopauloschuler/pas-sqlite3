@@ -126,6 +126,7 @@ compile_test TestVdbeTrace
 compile_test TestVdbeVtab
 compile_test TestTokenizer
 compile_test TestParserSmoke
+compile_test TestParser
 compile_test TestWalker
 compile_test TestExprBasic
 compile_test TestWhereBasic

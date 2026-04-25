@@ -2473,9 +2473,41 @@ statement is syntactically complete — used by the CLI and REPLs).
     * `COMMIT` / `ROLLBACK` / `PRAGMA` reach codegen paths that touch
       live db internals (transaction state, pragma dispatch).
 
-- [ ] **7.4** Gate: `TestParser.pas` — for the SQL corpus, tokenise + parse
-  with both implementations, dump the resulting VDBE program via the codegen
-  from Phase 6, diff byte-for-byte.
+- [X] **7.4a** Gate (parse-validity scope): `TestParser.pas` — for an
+  inline 45-statement SQL corpus, tokenise + parse with both
+  implementations and require agreement on syntactic validity
+  (csq_prepare_v2 rc=SQLITE_OK iff Pascal sqlite3RunParser nErr=0).
+
+  DONE 2026-04-25.  45 corpus rows: trivial/empty (5), DDL (17), DML
+  (11), transactions/savepoints (6), pure syntax errors (6).  Both
+  implementations agree on every row.  C reference shares one in-memory
+  db opened on `:memory:` with a fixture schema (`t(a,b,c)`,
+  `s(x,y,z)`, `u(p PRIMARY KEY,q)`); the Pascal parser keeps using a
+  fresh stub Sqlite3 record per row (it does not consult schema during
+  parse).
+
+  Concrete changes:
+    * src/tests/TestParser.pas  — new (Phase 7.4a gate).
+    * src/tests/build.sh        — register TestParser after TestParserSmoke.
+
+  Corpus exclusions (deferred to 7.4b):
+    * SELECT statements (top-level `cmd ::= select` reaches sqlite3Select
+      which crashes against a stub db);
+    * CTE-bearing DML, INSERT/UPDATE that pass through sqlite3Select;
+    * COMMIT / ROLLBACK / PRAGMA / EXPLAIN / ANALYZE / VACUUM / REINDEX
+      (codegen helpers touch live db internals — schema, transaction
+      state, pragma dispatch).
+    These are the same forms that TestParserSmoke flags as Phase 7.4
+    coverage; both gate tests will fold them back in once Phase 8.1/8.2
+    deliver real `sqlite3_open_v2` + `sqlite3_prepare_v2`.
+
+- [ ] **7.4b** Gate (bytecode-diff scope): once Phase 8.2 wires Pascal
+  `sqlite3_prepare_v2` into the parser + codegen + Vdbe pipeline, extend
+  `TestParser.pas` to also dump and diff the resulting VDBE program
+  (opcode + p1 + p2 + p3 + p4 + p5) byte-for-byte against
+  `csq_prepare_v2`.  Uses the already-staged corpus from 7.4a plus the
+  currently-excluded SELECT / pragma / explain / commit / rollback /
+  analyze / vacuum / reindex statements.
 
 ---
 
