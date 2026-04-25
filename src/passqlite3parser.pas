@@ -1123,6 +1123,11 @@ const
   SAVEPOINT_BEGIN    = 0;
   SAVEPOINT_RELEASE  = 1;
   SAVEPOINT_ROLLBACK = 2;
+  { DBFLAG_EncodingFixed (sqliteInt.h:1892) — set once the per-connection text
+    encoding can no longer be changed.  Used by rule 84 (cmd ::= select) to
+    decide whether sqlite3ReadSchema needs to run.  Redeclared locally
+    because passqlite3codegen does not yet export it. }
+  DBFLAG_EncodingFixed = u32($0040);
 
 { ---- disableLookaside (parse.y:132) ------------------------------------- }
 { Increment Parse.disableLookaside (used by createkw to suppress lookaside  }
@@ -1288,6 +1293,61 @@ begin
   if yymajor = 0 then ;
 end;
 
+{ ---- parserDoubleLinkSelect (parse.y:131) ------------------------------- }
+{ Walks the prior-chain of a compound SELECT, sets pNext on each link, marks
+  every link with SF_Compound, and emits an error if ORDER BY / LIMIT appears
+  before the tail of the chain.  Also enforces SQLITE_LIMIT_COMPOUND_SELECT. }
+procedure parserDoubleLinkSelect(pPse: PParse; p: PSelect);
+var
+  pNxt, pLoop: PSelect;
+  mxSelect, cnt: i32;
+begin
+  if p = nil then Exit;
+  if p^.pPrior <> nil then begin
+    pNxt := nil;
+    pLoop := p;
+    cnt := 1;
+    while True do begin
+      pLoop^.pNext := pNxt;
+      pLoop^.selFlags := pLoop^.selFlags or SF_Compound;
+      pNxt := pLoop;
+      pLoop := pLoop^.pPrior;
+      if pLoop = nil then Break;
+      Inc(cnt);
+      if (pLoop^.pOrderBy <> nil) or (pLoop^.pLimit <> nil) then begin
+        { sqlite3ErrorMsg in this codebase is non-varargs; drop the operator
+          name from the message for now (TODO Phase 8: restore once printf-
+          style formatting lands).  This matches the convention used by
+          rules 23/24 in chunk 7.2e.1. }
+        if pLoop^.pOrderBy <> nil then
+          sqlite3ErrorMsg(pPse,
+            'ORDER BY clause should come after compound operator')
+        else
+          sqlite3ErrorMsg(pPse,
+            'LIMIT clause should come after compound operator');
+        Break;
+      end;
+    end;
+    if ((p^.selFlags and (SF_MultiValue or SF_Values)) = 0) then begin
+      mxSelect := pPse^.db^.aLimit[SQLITE_LIMIT_COMPOUND_SELECT];
+      if (mxSelect > 0) and (cnt > mxSelect) then
+        sqlite3ErrorMsg(pPse, 'too many terms in compound SELECT');
+    end;
+  end;
+end;
+
+{ ---- attachWithToSelect (parse.y:162) ----------------------------------- }
+function attachWithToSelect(pPse: PParse; pSel: PSelect; pWth: PWith): PSelect;
+begin
+  if pSel <> nil then begin
+    pSel^.pWith := pWth;
+    parserDoubleLinkSelect(pPse, pSel);
+  end else begin
+    sqlite3WithDelete(pPse^.db, pWth);
+  end;
+  Result := pSel;
+end;
+
 { ---- yy_reduce — engine framework (parse.c:3804) ------------------------ }
 { Phase 7.2d: rule-action switch is empty.  Phase 7.2e fills in cases for   }
 { rules 0..411 from parse.c:3829–5993.  The framework that runs after the  }
@@ -1304,6 +1364,14 @@ var
   pPse:       PParse;
   yylhsminor: YYMINORTYPE;
   pTmp:       PExpr;
+  { Phase 7.2e.2 locals — declared here so they are reusable across rules. }
+  dest_84:    TSelectDest;
+  pSel_87:    PSelect;
+  pSel_93:    PSelect;
+  pLhs_88:    PSelect;
+  pRhs_88:    PSelect;
+  pFrom_88:   PSrcList;
+  x_88:       TToken;
 begin
   yymsp := yypParser^.yytos;
   pPse  := PParse(yypParser^.pParse);
@@ -1457,6 +1525,186 @@ begin
        yymsp[0].minor.yy144 := 1;
     49: { refargs ::= }
        yymsp[1].minor.yy144 := OE_None * $0101;
+    { ---------- Phase 7.2e.2 : rules 50..99 ---------------------- }
+    50: { refargs ::= refargs refarg }
+       yymsp[-1].minor.yy144 :=
+         (yymsp[-1].minor.yy144 and not yymsp[0].minor.yy383.mask)
+         or yymsp[0].minor.yy383.value;
+    51: { refarg ::= MATCH nm }
+       begin
+         yymsp[-1].minor.yy383.value := 0;
+         yymsp[-1].minor.yy383.mask  := $000000;
+       end;
+    52: { refarg ::= ON INSERT refact }
+       begin
+         yymsp[-2].minor.yy383.value := 0;
+         yymsp[-2].minor.yy383.mask  := $000000;
+       end;
+    53: { refarg ::= ON DELETE refact }
+       begin
+         yymsp[-2].minor.yy383.value := yymsp[0].minor.yy144;
+         yymsp[-2].minor.yy383.mask  := $0000ff;
+       end;
+    54: { refarg ::= ON UPDATE refact }
+       begin
+         yymsp[-2].minor.yy383.value := yymsp[0].minor.yy144 shl 8;
+         yymsp[-2].minor.yy383.mask  := $00ff00;
+       end;
+    55: { refact ::= SET NULL }
+       yymsp[-1].minor.yy144 := OE_SetNull;
+    56: { refact ::= SET DEFAULT }
+       yymsp[-1].minor.yy144 := OE_SetDflt;
+    57: { refact ::= CASCADE }
+       yymsp[0].minor.yy144 := OE_Cascade;
+    58: { refact ::= RESTRICT }
+       yymsp[0].minor.yy144 := OE_Restrict;
+    59: { refact ::= NO ACTION }
+       yymsp[-1].minor.yy144 := OE_None;
+    60: { defer_subclause ::= NOT DEFERRABLE init_deferred_pred_opt }
+       yymsp[-2].minor.yy144 := 0;
+    61, 76, 173:
+       { defer_subclause ::= DEFERRABLE init_deferred_pred_opt;
+         orconf ::= OR resolvetype;  insert_cmd ::= INSERT orconf }
+       yymsp[-1].minor.yy144 := yymsp[0].minor.yy144;
+    63, 80, 219, 222, 247:
+       { init_deferred_pred_opt ::= INITIALLY DEFERRED;
+         ifexists ::= IF EXISTS;  between_op ::= NOT BETWEEN;
+         in_op ::= NOT IN;        collate ::= COLLATE ID|STRING }
+       yymsp[-1].minor.yy144 := 1;
+    64: { init_deferred_pred_opt ::= INITIALLY IMMEDIATE }
+       yymsp[-1].minor.yy144 := 0;
+    66: { tconscomma ::= COMMA }
+       pPse^.u1.cr.constraintName.n := 0;
+    68: { tcons ::= PRIMARY KEY LP sortlist autoinc RP onconf }
+       sqlite3AddPrimaryKey(pPse, PExprList(yymsp[-3].minor.yy14),
+         yymsp[0].minor.yy144, yymsp[-2].minor.yy144, 0);
+    69: { tcons ::= UNIQUE LP sortlist RP onconf }
+       sqlite3CreateIndex(pPse, nil, nil, nil, PExprList(yymsp[-2].minor.yy14),
+         yymsp[0].minor.yy144, nil, nil, 0, 0, SQLITE_IDXTYPE_UNIQUE);
+    70: { tcons ::= CHECK LP expr RP onconf }
+       sqlite3AddCheckConstraint(pPse, PExpr(yymsp[-2].minor.yy454),
+         yymsp[-3].minor.yy0.z, yymsp[-1].minor.yy0.z);
+    71: { tcons ::= FOREIGN KEY LP eidlist RP REFERENCES nm eidlist_opt
+            refargs defer_subclause_opt }
+       begin
+         sqlite3CreateForeignKey(pPse, PExprList(yymsp[-6].minor.yy14),
+           @yymsp[-3].minor.yy0, PExprList(yymsp[-2].minor.yy14),
+           yymsp[-1].minor.yy144);
+         sqlite3DeferForeignKey(pPse, yymsp[0].minor.yy144);
+       end;
+    73, 75: { onconf ::=;  orconf ::= }
+       yymsp[1].minor.yy144 := OE_Default;
+    74: { onconf ::= ON CONFLICT resolvetype }
+       yymsp[-2].minor.yy144 := yymsp[0].minor.yy144;
+    77: { resolvetype ::= IGNORE }
+       yymsp[0].minor.yy144 := OE_Ignore;
+    78, 174: { resolvetype ::= REPLACE;  insert_cmd ::= REPLACE }
+       yymsp[0].minor.yy144 := OE_Replace;
+    79: { cmd ::= DROP TABLE ifexists fullname }
+       sqlite3DropTable(pPse, PSrcList(yymsp[0].minor.yy203), 0,
+                        yymsp[-1].minor.yy144);
+    82: { cmd ::= createkw temp VIEW ifnotexists nm dbnm eidlist_opt AS select }
+       sqlite3CreateView(pPse, @yymsp[-8].minor.yy0, @yymsp[-4].minor.yy0,
+         @yymsp[-3].minor.yy0, PExprList(yymsp[-2].minor.yy14),
+         PSelect(yymsp[0].minor.yy555), yymsp[-7].minor.yy144,
+         yymsp[-5].minor.yy144);
+    83: { cmd ::= DROP VIEW ifexists fullname }
+       sqlite3DropTable(pPse, PSrcList(yymsp[0].minor.yy203), 1,
+                        yymsp[-1].minor.yy144);
+    84: { cmd ::= select }
+       begin
+         sqlite3SelectDestInit(@dest_84, SRT_Output, 0);
+         if ((pPse^.db^.mDbFlags and DBFLAG_EncodingFixed) <> 0)
+            or (sqlite3ReadSchema(pPse) = SQLITE_OK) then begin
+           sqlite3Select(pPse, PSelect(yymsp[0].minor.yy555), @dest_84);
+         end;
+         sqlite3SelectDelete(pPse^.db, PSelect(yymsp[0].minor.yy555));
+       end;
+    85: { select ::= WITH wqlist selectnowith }
+       yymsp[-2].minor.yy555 := attachWithToSelect(pPse,
+         PSelect(yymsp[0].minor.yy555), PWith(yymsp[-1].minor.yy59));
+    86: { select ::= WITH RECURSIVE wqlist selectnowith }
+       yymsp[-3].minor.yy555 := attachWithToSelect(pPse,
+         PSelect(yymsp[0].minor.yy555), PWith(yymsp[-1].minor.yy59));
+    87: { select ::= selectnowith }
+       begin
+         pSel_87 := PSelect(yymsp[0].minor.yy555);
+         if pSel_87 <> nil then
+           parserDoubleLinkSelect(pPse, pSel_87);
+       end;
+    88: { selectnowith ::= selectnowith multiselect_op oneselect }
+       begin
+         pRhs_88 := PSelect(yymsp[0].minor.yy555);
+         pLhs_88 := PSelect(yymsp[-2].minor.yy555);
+         if (pRhs_88 <> nil) and (pRhs_88^.pPrior <> nil) then begin
+           x_88.n := 0;
+           x_88.z := nil;
+           parserDoubleLinkSelect(pPse, pRhs_88);
+           pFrom_88 := sqlite3SrcListAppendFromTerm(pPse, nil, nil, nil,
+             @x_88, pRhs_88, nil, nil);
+           pRhs_88 := sqlite3SelectNew(pPse, nil, pFrom_88, nil, nil, nil,
+             nil, 0, nil);
+         end;
+         if pRhs_88 <> nil then begin
+           pRhs_88^.op := u8(yymsp[-1].minor.yy144);
+           pRhs_88^.pPrior := pLhs_88;
+           if pLhs_88 <> nil then
+             pLhs_88^.selFlags := pLhs_88^.selFlags and not SF_MultiValue;
+           pRhs_88^.selFlags := pRhs_88^.selFlags and not SF_MultiValue;
+           if yymsp[-1].minor.yy144 <> TK_ALL then
+             pPse^.parseFlags := pPse^.parseFlags or PARSEFLAG_HasCompound;
+         end else begin
+           sqlite3SelectDelete(pPse^.db, pLhs_88);
+         end;
+         yymsp[-2].minor.yy555 := pRhs_88;
+       end;
+    89, 91: { multiselect_op ::= UNION;  multiselect_op ::= EXCEPT|INTERSECT }
+       yymsp[0].minor.yy144 := i32(yymsp[0].major);
+    90: { multiselect_op ::= UNION ALL }
+       yymsp[-1].minor.yy144 := TK_ALL;
+    92: { oneselect ::= SELECT distinct selcollist from where_opt
+            groupby_opt having_opt orderby_opt limit_opt }
+       yymsp[-8].minor.yy555 := sqlite3SelectNew(pPse,
+         PExprList(yymsp[-6].minor.yy14),
+         PSrcList (yymsp[-5].minor.yy203),
+         PExpr    (yymsp[-4].minor.yy454),
+         PExprList(yymsp[-3].minor.yy14),
+         PExpr    (yymsp[-2].minor.yy454),
+         PExprList(yymsp[-1].minor.yy14),
+         u32(yymsp[-7].minor.yy144),
+         PExpr    (yymsp[0].minor.yy454));
+    93: { oneselect ::= SELECT distinct selcollist from where_opt
+            groupby_opt having_opt window_clause orderby_opt limit_opt }
+       begin
+         yymsp[-9].minor.yy555 := sqlite3SelectNew(pPse,
+           PExprList(yymsp[-7].minor.yy14),
+           PSrcList (yymsp[-6].minor.yy203),
+           PExpr    (yymsp[-5].minor.yy454),
+           PExprList(yymsp[-4].minor.yy14),
+           PExpr    (yymsp[-3].minor.yy454),
+           PExprList(yymsp[-1].minor.yy14),
+           u32(yymsp[-8].minor.yy144),
+           PExpr    (yymsp[0].minor.yy454));
+         pSel_93 := PSelect(yymsp[-9].minor.yy555);
+         if pSel_93 <> nil then
+           pSel_93^.pWinDefn := PWindow(yymsp[-2].minor.yy211)
+         else
+           sqlite3WindowListDelete(pPse^.db, PWindow(yymsp[-2].minor.yy211));
+       end;
+    94: { values ::= VALUES LP nexprlist RP }
+       yymsp[-3].minor.yy555 := sqlite3SelectNew(pPse,
+         PExprList(yymsp[-1].minor.yy14), nil, nil, nil, nil, nil,
+         SF_Values, nil);
+    95: { oneselect ::= mvalues }
+       sqlite3MultiValuesEnd(pPse, PSelect(yymsp[0].minor.yy555));
+    96, 97: { mvalues ::= values COMMA LP nexprlist RP;
+              mvalues ::= mvalues COMMA LP nexprlist RP }
+       yymsp[-4].minor.yy555 := sqlite3MultiValues(pPse,
+         PSelect(yymsp[-4].minor.yy555), PExprList(yymsp[-1].minor.yy14));
+    98: { distinct ::= DISTINCT }
+       yymsp[0].minor.yy144 := i32(SF_Distinct);
+    99: { distinct ::= ALL }
+       yymsp[0].minor.yy144 := i32(SF_All);
   else
     { Phase 7.2e in progress: rules 50..411 not yet ported.  Until ported,
       they fall through to the goto/state-update logic below — this is

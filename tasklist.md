@@ -1995,9 +1995,53 @@ statement is syntactically complete — used by the CLI and REPLs).
       CREATE TABLE start/end, table options, column constraints (DEFAULT/
       NOT NULL/PRIMARY KEY/UNIQUE/CHECK/REFERENCES/COLLATE/GENERATED),
       autoinc, initial refargs.  DONE 2026-04-25.
-    - [ ] **7.2e.2** Rules 50..99 — refargs/refact (FK actions),
+    - [X] **7.2e.2** Rules 50..99 — refargs/refact (FK actions),
       defer_subclause, conslist, idxlist, sortlist, eidlist, columnlist
-      tail.
+      tail; tcons (PRIMARY KEY/UNIQUE/CHECK/FOREIGN KEY); onconf/orconf;
+      DROP TABLE/VIEW; CREATE VIEW; cmd ::= select; SELECT core (WITH,
+      compound, oneselect, VALUES, mvalues, distinct).  DONE 2026-04-25.
+
+      Notes for next chunks:
+      * Helper static functions `parserDoubleLinkSelect` and
+        `attachWithToSelect` (parse.y:131/162) ported as nested helpers
+        in `passqlite3parser.pas` directly above `yy_reduce`.  Both call
+        only existing exports (`sqlite3SelectOpName`,
+        `sqlite3WithDelete`, `aLimit[SQLITE_LIMIT_COMPOUND_SELECT]`,
+        plus `SF_Compound` / `SF_MultiValue` / `SF_Values` from codegen).
+      * `DBFLAG_EncodingFixed` (sqliteInt.h:1892, value $0040) was not
+        previously declared in any unit — added as a local const inside
+        `passqlite3parser` next to the SAVEPOINT_* block.  When Phase 8
+        wires up the public API and ports `prepare.c`, move it to
+        `passqlite3codegen` alongside `DBFLAG_SchemaKnownOk`.
+      * `Parse.hasCompound` is a C bitfield; in our layout it lives in
+        `parseFlags`, bit `PARSEFLAG_HasCompound` (1 shl 2).  Rule 88
+        sets that bit instead of dereferencing a non-existent
+        `pPse^.hasCompound` field.
+      * `sqlite3ErrorMsg` still has no varargs — rule body for
+        `parserDoubleLinkSelect` therefore uses static "ORDER BY clause
+        should come after compound operator" / "LIMIT ..." messages
+        (parse.y dynamically inserted the operator name).  Same TODO
+        as 7.2e.1 rules 23/24: revisit when printf-style formatting
+        lands.
+      * `sqlite3SrcListAppendFromTerm` in our port takes
+        `(pOn, pUsing)` instead of `OnOrUsing*` — rule 88 splits the
+        single C arg into two Pascal args by passing `nil, nil` for the
+        synthetic FROM-term.  Rules 111-115 (chunk 7.2e.3) will need
+        the same split: pass
+        `PExpr(yymsp[k].minor.yy269.pOn), PIdList(yymsp[k].minor.yy269.pUsing)`.
+      * Rules 89/91 cast `yymsp[0].major` (YYCODETYPE = u16) directly to
+        i32 — equivalent to the C `/*A-overwrites-OP*/` convention.
+      * Rules 96/97 share a body and must remain in the same case label
+        list because both produce `yymsp[-4].minor.yy555` from the same
+        expression (Lemon's yytestcase de-duplication preserved).
+      * Rule 71 (FOREIGN KEY): `sqlite3CreateForeignKey` Pascal
+        signature is `(pParse, pFromCol: PExprList, pTo: PToken,
+        pToCol: PExprList, flags: i32)` — same arity as C.  Rule 42
+        in 7.2e.1 already uses it correctly.
+      * Local var `dest_84: TSelectDest` and `x_88: TToken` were added
+        to `yy_reduce`'s var block.  As more chunks land, additional
+        locals will accumulate there (one-off scratch space per rule
+        family); accept that var block growth as a normal porting cost.
     - [ ] **7.2e.3** Rules 100..149 — SELECT core (selectnowith, oneselect,
       values, distinct, sclp, selcollist, FROM/USING/ON, JOIN, jointype,
       indexed_opt, on_using, where_opt, groupby_opt, having_opt, orderby_opt,
