@@ -18,6 +18,18 @@ Important: At the end of this document, please find:
 
 ---
 
+## Most recent activity
+
+  - **2026-04-25 — Phase 8.1 connection lifecycle scaffold.** New
+    `src/passqlite3main.pas` exposes `sqlite3_open[_v2]` and
+    `sqlite3_close[_v2]`, with simplified `openDatabase` and
+    `sqlite3LeaveMutexAndCloseZombie`.  Gate test
+    `src/tests/TestOpenClose.pas` covers `:memory:` + on-disk paths,
+    re-open, NULL handling, invalid flags (17/17 PASS).  Gaps for
+    Phase 8.2/8.3+: URI parsing, mutex alloc, lookaside, shared cache,
+    real `sqlite3SetTextEncoding`, `sqlite3BtreeSchema` fetch, vtab list,
+    extension list — all listed in the 8.1 task entry below.
+
 ## Status summary
 
 - Target platform: x86_64 Linux, FPC 3.2.2+.
@@ -2520,8 +2532,58 @@ API: `sqlite3_backup_init/step/finish/remaining/pagecount`), `notify.c`
 (the `sqlite3_unlock_notify` machinery), `loadext.c` (dynamic-extension
 loader — *optional for v1*).
 
-- [ ] **8.1** Port `sqlite3_open_v2`, `sqlite3_close`, `sqlite3_close_v2`,
+- [X] **8.1** Port `sqlite3_open_v2`, `sqlite3_close`, `sqlite3_close_v2`,
   connection lifecycle (from `main.c`).
+
+  DONE 2026-04-25.  Initial scaffold landed in `src/passqlite3main.pas`:
+    * `sqlite3_open`, `sqlite3_open_v2` (entry points)
+    * `sqlite3_close`, `sqlite3_close_v2` (entry points)
+    * `openDatabase` (main.c:3324 simplified)
+    * `sqlite3Close` + `sqlite3LeaveMutexAndCloseZombie` (main.c:1254/1363)
+    * `connectionIsBusy` (main.c:1240 — `pVdbe`-only check)
+
+  Gate: `src/tests/TestOpenClose.pas` — 17/17 PASS:
+    * T1–T3: open/close on `:memory:` via both `_v2` and legacy entry points
+    * T4–T5: open/close + reopen of an on-disk temp .db file
+    * T6:    `close(nil)` and `close_v2(nil)` are harmless no-ops
+    * T7:    invalid flags (no R/W bits) → SQLITE_MISUSE
+    * T8:    `ppDb = nil` → SQLITE_MISUSE
+    No regressions in TestParser / TestParserSmoke / TestSchemaBasic.
+
+  Concrete changes:
+    * src/passqlite3main.pas             — new (Phase 8.1)
+    * src/passqlite3vdbe.pas             — export `sqlite3RollbackAll`,
+      `sqlite3CloseSavepoints` in the interface section
+    * src/passqlite3codegen.pas          — `sqlite3SafetyCheck{Ok,SickOrOk}`
+      now accept the real SQLITE_STATE_OPEN ($76) / _SICK ($BA) magic
+      values used by the new openDatabase, while still accepting the
+      legacy "1"/"2" placeholder used by Phase 6/7 test scaffolds
+    * src/tests/TestOpenClose.pas        — new gate test
+    * src/tests/build.sh                 — register TestOpenClose
+
+  Phase 8.1 scope notes (what is *not* yet wired — to be addressed in
+  later 8.x sub-phases):
+    * sqlite3ParseUri — zFilename is passed straight to BtreeOpen; URI
+      filenames (`file:foo.db?mode=ro&cache=shared`) are not parsed.
+    * No mutex allocation — db^.mutex stays nil (single-threaded only).
+      Remove when Phase 8.4 adds threading config.
+    * No lookaside (db^.lookaside.bDisable = 1, sz = 0).
+    * No shared-cache list, no virtual-table list, no extension list.
+    * Schemas for slot 0 / 1 are allocated via `sqlite3SchemaGet(db, nil)`
+      rather than fetched from the BtShared (`sqlite3BtreeSchema` is not
+      yet ported).  This is *correct* for Phase 8.2 prepare_v2, since
+      schema population happens at the first SQL statement, not at open.
+    * `sqlite3SetTextEncoding` is replaced by a direct `db^.enc :=
+      SQLITE_UTF8` assignment — the full helper consults collation
+      tables that require Phase 8.3 (`sqlite3_create_collation`).
+    * `sqlite3_initialize` / `sqlite3_shutdown` (Phase 8.5) are not
+      ported; openDatabase lazily calls `sqlite3_os_init` +
+      `sqlite3PcacheInitialize` if no VFS is registered yet.
+    * `disconnectAllVtab`, `sqlite3VtabRollback`,
+      `sqlite3CloseExtensions`, `setupLookaside` are stubbed by simply
+      not being called (their subsystems are not ported).
+    * `connectionIsBusy` only checks `db->pVdbe`; the backup-API leg
+      (`sqlite3BtreeIsInBackup`) waits for Phase 8.7.
 
 - [ ] **8.2** Port `sqlite3_prepare_v2` / `sqlite3_prepare_v3` — the entry
   point that wires parser → codegen → VDBE.

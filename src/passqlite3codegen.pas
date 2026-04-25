@@ -6300,18 +6300,25 @@ begin
   pParse^.rc := SQLITE_ERROR;
 end;
 
-{ sqlite3SafetyCheckOk — verify db is in a usable state }
+{ sqlite3SafetyCheckOk — verify db is in a usable state.
+  Accepts the real SQLITE_STATE_OPEN ($76) magic value used by Phase 8
+  openDatabase, plus the legacy "1" placeholder still used by Phase 6/7
+  test scaffolds (MakeDb in TestParser/TestParserSmoke/TestSchemaBasic). }
 function sqlite3SafetyCheckOk(db: PTsqlite3): i32;
 begin
   if db = nil then begin Result := 0; Exit; end;
-  if db^.eOpenState <> 1 then begin Result := 0; Exit; end;
+  if (db^.eOpenState <> $76) and (db^.eOpenState <> 1) then
+    begin Result := 0; Exit; end;
   Result := 1;
 end;
 
 function sqlite3SafetyCheckSickOrOk(db: PTsqlite3): i32;
 begin
   if db = nil then begin Result := 0; Exit; end;
-  if (db^.eOpenState <> 1) and (db^.eOpenState <> 2) then
+  if (db^.eOpenState <> $76)    { SQLITE_STATE_OPEN }
+     and (db^.eOpenState <> $BA){ SQLITE_STATE_SICK }
+     and (db^.eOpenState <> 1)  { legacy placeholder — see note above }
+     and (db^.eOpenState <> 2) then
     begin Result := 0; Exit; end;
   Result := 1;
 end;

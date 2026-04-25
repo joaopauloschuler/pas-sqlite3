@@ -1434,6 +1434,8 @@ procedure sqlite3RootPageMoved(db: PTsqlite3; iDb: i32; iFrom: i32; iTo: i32);
 procedure sqlite3FkClearTriggerCache(db: PTsqlite3; iDb: i32);
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
+procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
+procedure sqlite3RollbackAll(pDb: PTsqlite3; tripCode: i32);
 function  sqlite3LogEst(n: u64): i16;
 
 procedure sqlite3ValueApplyAffinity(pVal: Psqlite3_value; aff: u8; enc: u8);
