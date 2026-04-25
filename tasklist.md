@@ -1903,15 +1903,60 @@ statement is syntactically complete — used by the CLI and REPLs).
   Also fixed an off-by-one bug in `sqlite3_strnicmp` (`N < 0` → `N <= 0`)
   that caused keyword comparison to always fail when all N chars matched.
 
-- [ ] **7.2** **Strategy for `parse.y`:** *regenerate* with Lemon targeting
-  Pascal, rather than hand-porting the generated `parse.c` (which is ~6k lines
-  of Lemon-emitted boilerplate). This requires:
-  - A Pascal code-emitter for Lemon (`tool/lempar.c` equivalent in Pascal),
-    patched into the `lemon` tool itself.
-  - The grammar file `parse.y` is used unchanged.
-  Fallback if Pascal-Lemon is too expensive: hand-port `parse.c` as a one-time
-  transliteration; it is auto-generated so as long as the grammar doesn't
-  change it won't need re-porting.
+- [ ] **7.2** **Strategy decision (2026-04-25):** Patching Lemon to emit Pascal
+  is a multi-week undertaking (lemon.c is 6075 lines of intricate code-emitter
+  C). Hand-porting `parse.c` (6327 lines, generated, deterministic structure)
+  is the pragmatic path. Since `parse.c` is regenerated only when `parse.y`
+  changes and the grammar is stable upstream, a one-time transliteration
+  carries acceptable maintenance cost. Split into sub-phases:
+
+  - [X] **7.2a** Port the YY control constants (YYNOCODE, YYNSTATE, YYNRULE,
+    YYNTOKEN, YY_MAX_SHIFT, YY_MIN_SHIFTREDUCE, YY_MAX_SHIFTREDUCE,
+    YY_ERROR_ACTION, YY_ACCEPT_ACTION, YY_NO_ACTION, YY_MIN_REDUCE,
+    YY_MAX_REDUCE, YY_MIN_DSTRCTR, YY_MAX_DSTRCTR, YYWILDCARD, YYFALLBACK,
+    YYSTACKDEPTH). Define the `YYMINORTYPE` Pascal record (no unions in
+    Pascal — use a variant record), the `yyStackEntry` and `yyParser`
+    record types. Declare public parser entry points (`sqlite3ParserAlloc`,
+    `sqlite3ParserFree`, `sqlite3Parser`, `sqlite3ParserFallback`,
+    `sqlite3ParserStackPeak`) as forward stubs. Goal: scaffolding compiles.
+    Reference: `../sqlite3/parse.c` lines 305–625 (token codes, control
+    defines, YYMINORTYPE union) and lines 1589–1630 (parser structs).
+
+  - [ ] **7.2b** Port the action / lookahead / shift-offset / reduce-offset
+    / default tables (`yy_action`, `yy_lookahead`, `yy_shift_ofst`,
+    `yy_reduce_ofst`, `yy_default`) verbatim from `parse.c` lines 706–1380.
+    These are large `const` arrays (~700 lines, ~2500 entries each) that
+    encode the LALR state machine. They translate mechanically: each row
+    becomes a Pascal array literal element. Verify YY_NLOOKAHEAD compiles to
+    the same value as in C.
+
+  - [ ] **7.2c** Port the fallback table (`yyFallback`, parse.c lines
+    1398–1588) and the rule-info tables (`yyRuleInfoLhs`, `yyRuleInfoNRhs`,
+    parse.c lines 2960–3791). These are also mechanical translations.
+    Implement `sqlite3ParserFallback` to return `yyFallback[iToken]`.
+
+  - [ ] **7.2d** Port the parser engine (lempar.c logic that ends up at
+    parse.c lines 3792–6313): `yy_find_shift_action`, `yy_find_reduce_action`,
+    `yy_shift`, `yy_pop_parser_stack`, `yy_destructor`, the main `sqlite3Parser`
+    driver with its grow-on-demand stack (`parserStackRealloc` /
+    `parserStackFree`). Use the same algorithm as the C engine. Skip the
+    optional tracing functions for now (port only `yyTraceFILE` declarations
+    so signatures match).
+
+  - [ ] **7.2e** Port the **reduce actions** — the giant switch statement at
+    parse.c lines 3829–5993. This is the only sub-phase that is non-mechanical:
+    each `case YYRULE_n:` body contains hand-written grammar action C code from
+    `parse.y` that calls `sqlite3*` codegen routines from Phase 6. Many of the
+    callees may need additional wrapper exports from Phase 6 units. Port in
+    chunks of ~50 rules, build-checking after each.
+
+  - [ ] **7.2f** Wire `sqlite3RunParser` to drive the lexer through the new
+    parser engine (replaces the current Phase 7.1 stub). Implement the
+    fallback / wildcard handling, FILTER/OVER/WINDOW context tracking that
+    `getNextToken` already detects, and propagate parse errors into
+    `pParse^.zErrMsg`. Mark Phase 7.2 itself complete when 7.2a–7.2f all pass.
+
+  Fallback if 7.2 grows untenable: revisit Lemon-Pascal emitter in 7.2g.
 
 - [ ] **7.3** Port parse-tree action routines that Lemon calls (these live in
   `build.c` and friends from Phase 6, so they are already available).
