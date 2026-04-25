@@ -1903,7 +1903,7 @@ statement is syntactically complete — used by the CLI and REPLs).
   Also fixed an off-by-one bug in `sqlite3_strnicmp` (`N < 0` → `N <= 0`)
   that caused keyword comparison to always fail when all N chars matched.
 
-- [ ] **7.2** **Strategy decision (2026-04-25):** Patching Lemon to emit Pascal
+- [X] **7.2** **Strategy decision (2026-04-25):** Patching Lemon to emit Pascal
   is a multi-week undertaking (lemon.c is 6075 lines of intricate code-emitter
   C). Hand-porting `parse.c` (6327 lines, generated, deterministic structure)
   is the pragmatic path. Since `parse.c` is regenerated only when `parse.y`
@@ -2394,11 +2394,48 @@ statement is syntactically complete — used by the CLI and REPLs).
       PRIMARYKEY/IPK were added to passqlite3codegen alongside the
       existing TF_* / OE_* groups.
 
-  - [ ] **7.2f** Wire `sqlite3RunParser` to drive the lexer through the new
+  - [X] **7.2f** Wire `sqlite3RunParser` to drive the lexer through the new
     parser engine (replaces the current Phase 7.1 stub). Implement the
     fallback / wildcard handling, FILTER/OVER/WINDOW context tracking that
     `getNextToken` already detects, and propagate parse errors into
     `pParse^.zErrMsg`. Mark Phase 7.2 itself complete when 7.2a–7.2f all pass.
+
+    DONE 2026-04-25.  passqlite3parser.pas:1110 — sqlite3RunParser now mirrors
+    tokenize.c:600 byte-for-byte: TK_SPACE skip, TK_COMMENT swallowing under
+    init.busy or SQLITE_Comments, TK_WINDOW/TK_OVER/TK_FILTER context
+    promotion via the existing analyze*Keyword helpers, isInterrupted poll,
+    SQLITE_LIMIT_SQL_LENGTH guard, SQLITE_TOOBIG / SQLITE_INTERRUPT /
+    SQLITE_NOMEM_BKPT propagation, end-of-input TK_SEMI+0 flush, and the
+    pNewTable / pNewTrigger / pVList cleanup tail.  Build (TestTokenizer
+    127/127) PASS.
+
+    Notes for next chunks:
+    * `inRenameObject` was already defined later in the file (parser-local
+      re-export) — added a forward declaration just above sqlite3RunParser
+      so the cleanup tail can call it.
+    * Constant `SQLITE_Comments = u64($00040) shl 32` declared locally in
+      the implementation section (HI() macro from sqliteInt.h:1819).  Move
+      to passqlite3util / passqlite3codegen alongside the other SQLITE_*
+      flag bits when one of them needs it too.
+    * Untyped `Pointer` → `PParse` is assigned directly (no cast) — FPC
+      flagged `PParse(p)` cast-syntax with a "; expected" error in this
+      block; direct assignment compiles cleanly because Pascal allows
+      untyped Pointer → typed pointer assignment without an explicit cast.
+    * Three C-side facilities are intentionally NOT ported here and remain
+      tracked as TODOs for Phase 8 (public-API phase):
+        - `sqlite3_log(rc, "%s in \"%s\"", zErrMsg, zTail)`  — pager unit
+          owns sqlite3_log today and is not on the parser's uses path.
+        - The `pParse->zErrMsg = sqlite3DbStrDup(db, sqlite3ErrStr(rc))`
+          fallback that synthesises a default message when a non-OK rc has
+          no zErrMsg — sqlite3ErrStr lives in passqlite3vdbe; pulling vdbe
+          into the parser uses-clause would create a cycle.  nErr is still
+          incremented when rc != OK so callers see the failure.
+        - SQLITE_ParserTrace / `sqlite3ParserTrace(stdout, …)` — no debug
+          tracing target in the Pascal port.
+    * apVtabLock is not freed here because the Phase 6.bis vtable branch
+      never assigns it.  Revisit when 6.bis lands.
+    * Ready for Phase 7.4 (TestParser differential test) once the parser
+      action routines that build AST nodes are exercised end-to-end.
 
   Fallback if 7.2 grows untenable: revisit Lemon-Pascal emitter in 7.2g.
 
