@@ -2145,9 +2145,66 @@ statement is syntactically complete — used by the CLI and REPLs).
       * Rules **173/174** were already covered by chunks 7.2e.1/7.2e.2
         (merged with 61/76 and 78 respectively) — they are intentionally
         absent from chunk 7.2e.4's new cases.
-    - [ ] **7.2e.5** Rules 200..249 — expressions: expr/term, literals,
+    - [X] **7.2e.5** Rules 200..249 — expressions: expr/term, literals,
       bind params, names, function call, subqueries, CASE, CAST, COLLATE,
       LIKE/GLOB/REGEXP/MATCH, BETWEEN, IN, IS, NULL/NOTNULL, unary ops.
+      DONE 2026-04-25.
+
+      Notes for next chunks:
+      * Rules **200..204** were merged into the existing **198/199** case
+        (sqlite3PExpr with `i32(yymsp[-1].major)` as the operator).  The
+        chunk-7.2e.4 note flagged this fold-in; it is now done.
+      * Rules **234, 237, 242** (`exprlist ::=`, `paren_exprlist ::=`,
+        `eidlist_opt ::=` — all three set `yy14 := nil`) were merged into
+        the existing **101/134/144** case rather than adding a duplicate.
+        Same pattern: when downstream chunks port a rule whose body is
+        already covered by an earlier merged case, prefer adding to the
+        existing label list.
+      * Rule **281** (`raisetype ::= ABORT`, `yy144 := OE_Abort`) shares its
+        body with rule **240** (`uniqueflag ::= UNIQUE`).  240 is currently
+        a standalone case — chunk **7.2e.6** must add 281 to it as a merged
+        label.
+      * Four new local helpers were added to `passqlite3parser.pas` directly
+        above `yy_reduce` (continuing the chunk-7.2e.3/4 pattern):
+        - **`sqlite3PExprIsNull`** — full port of parse.y:1383 (TK_ISNULL/
+          TK_NOTNULL with literal-folding to TK_TRUEFALSE via
+          `sqlite3ExprInt32` + `sqlite3ExprDeferredDelete`, both already in
+          codegen).
+        - **`sqlite3PExprIs`** — full port of parse.y:1390.  Uses
+          `sqlite3PExprIsNull` plus `sqlite3ExprDeferredDelete`.
+        - **`parserAddExprIdListTerm`** — port of parse.y:1654.  Uses
+          `sqlite3ExprListAppend` (with `nil` value) + `sqlite3ExprListSetName`.
+          Note: the C source builds the error message via `%.*s` formatting
+          on `pIdToken`; our `sqlite3ErrorMsg` still lacks varargs (the
+          recurring TODO from 7.2e.1/.2/.4), so the message is the static
+          "syntax error after column name" without the column text.  Phase 8
+          must restore the dynamic name once formatting lands.
+        - **`sqlite3ExprListToValues`** — port of expr.c:1098.  Used by
+          rule 223's TK_VECTOR/multi-row VALUES branch.  Walks `pEList` via
+          `ExprListItems(p)` + index, just like other list iterations.
+          The error messages for "wrong-arity" elements use static text
+          (same varargs TODO).  Phase 8 should move this to expr.c proper.
+      * **`var pExpr: PExpr`** triggers FPC's case-insensitive var/type
+        collision (per `feedback_fpc_vartype_conflict`); the helper
+        `sqlite3ExprListToValues` uses the local name **`pExp`** instead.
+        Same pitfall as `pPager → pPgr`, `pgno → pg`, `pParse → pPse`.
+      * Rule 223 walks `pInRhs_223` (`PExprList`) via `ExprListItems(p)`
+        and reads `[0]` directly — the C code does `pInRhs_223->a[0].pExpr`
+        which is identical to our `ExprListItems(pInRhs_223)^.pExpr`.
+        Setting `[0].pExpr := nil` to detach is also done via the accessor.
+      * Rule 217 (`expr ::= expr PTR expr`) writes `yylhsminor.yy454` and
+        then publishes `yymsp[-2].minor.yy454 := yylhsminor.yy454` — same
+        Lemon convention as rules 181/182/189–195.
+      * Rule 220 (`BETWEEN`): the new TK_BETWEEN node owns `pList_206` via
+        `^.x.pList`.  If `sqlite3PExpr` returns nil, we free the list with
+        `sqlite3ExprListDelete` to avoid a leak — matches the C body.
+      * Rule 226 (`expr in_op nm dbnm paren_exprlist`): C calls
+        `sqlite3SrcListFuncArgs(pParse, pSelect ? pSrc : 0, ...)` — a
+        ternary inside the call.  Pascal lacks the ternary so the body
+        splits the call into two branches.
+      * Rule 239 (`CREATE INDEX`): `sqlite3CreateIndex` already exported
+        with the matching signature (chunk 7.2e.4 confirmed).  Uses
+        `pPse^.pNewIndex^.zName` for the rename-token-map lookup.
     - [ ] **7.2e.6** Rules 250..299 — DROP, CREATE INDEX, indexed_by,
       ALTER (rename/add column/drop/rename column), VACUUM, PRAGMA,
       ATTACH/DETACH, ANALYZE, REINDEX.
