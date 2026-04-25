@@ -1141,46 +1141,70 @@ estimate**.
     Bug fixed: P4_REAL pointer is freed by VdbeDelete — must be heap-allocated
     (not stack address) in test helpers.
 
-- [ ] **5.4i** Cursor open/close extensions: OP_OpenRead, OP_ReopenIdx,
+- [X] **5.4i** Cursor open/close extensions: OP_OpenRead, OP_ReopenIdx,
     OP_OpenEphemeral, OP_OpenAutoindex, OP_OpenPseudo, OP_OpenDup,
     OP_NullRow, OP_RowData, OP_RowCell.
     Needed for: table scans, index usage, temp tables, subqueries.
 
-- [ ] **5.4j** Seek and index comparison: OP_SeekGE, OP_SeekLE, OP_SeekLT,
+- [X] **5.4j** Seek and index comparison: OP_SeekGE, OP_SeekLE, OP_SeekLT,
     OP_SeekScan, OP_SeekHit, OP_IdxLT, OP_IdxLE, OP_IdxGT, OP_IdxGE.
     Needed for: range queries, index navigation, ORDER BY.
+    Implemented 2026-04-25: OP_SeekScan inlines sqlite3VdbeIdxKeyCompare via
+    pMem5b/sqlite3VdbeRecordCompareWithSkip; OP_SeekHit clamps cursor seekHit.
+    OP_SeekGE/LE/LT/GT/IdxLT/LE/GT/GE were already implemented in 5.4i.
 
-- [ ] **5.4k** Control flow: OP_Once, OP_IfEmpty, OP_IfNotOpen, OP_IfNoHope,
+- [X] **5.4k** Control flow: OP_Once, OP_IfEmpty, OP_IfNotOpen, OP_IfNoHope,
     OP_IfPos, OP_IfNotZero, OP_IfSizeBetween, OP_DecrJumpZero, OP_Program,
     OP_Param, OP_ElseEq, OP_Permutation, OP_Compare.
     Needed for: subqueries, EXISTS, IN, CASE, compound SELECT.
+    Implemented 2026-04-25. OP_Program creates a VdbeFrame sub-execution context;
+    OP_Compare uses pointer arithmetic to access KeyInfo (PKeyInfo=Pointer in Phase 5).
+    OP_IfSizeBetween uses inline sqlite3LogEst. OP_Permutation is a no-op marker.
 
-- [ ] **5.4l** Sorter: OP_SorterOpen, OP_SorterInsert, OP_SorterSort,
+- [X] **5.4l** Sorter: OP_SorterOpen, OP_SorterInsert, OP_SorterSort,
     OP_SorterData, OP_SorterCompare, OP_Sort, OP_ResetSorter.
     Needed for: ORDER BY, GROUP BY with large result sets.
+    Implemented 2026-04-25. OP_SorterCompare: signature is (pCsr; bOmitRowid; pVal; nKeyCol; out iResult).
+    OP_SorterSort/Sort increment SQLITE_STMTSTATUS_SORT counter.
 
-- [ ] **5.4m** Schema: OP_CreateBtree, OP_ParseSchema, OP_ReadCookie,
+- [X] **5.4m** Schema: OP_CreateBtree, OP_ParseSchema, OP_ReadCookie,
     OP_SetCookie, OP_TableLock, OP_LoadAnalysis.
     Needed for: CREATE TABLE, schema changes, ANALYZE.
+    Implemented 2026-04-25. OP_ParseSchema is a stub (Phase 6). OP_ReadCookie uses
+    idx:u32 temp var (cannot take @u32(i64)). OP_TableLock simplified (no shared cache).
+    OP_SetCookie updates schema_cookie and calls sqlite3FkClearTriggerCache.
 
-- [ ] **5.4n** RowSet: OP_RowSetAdd, OP_RowSetRead, OP_RowSetTest.
+- [X] **5.4n** RowSet: OP_RowSetAdd, OP_RowSetRead, OP_RowSetTest.
     Needed for: IN (subquery), EXISTS, DISTINCT.
+    Implemented 2026-04-25. Full rowset.c port (~300 lines): TRowSetEntry/TRowSetChunk/TRowSet,
+    rowSetEntryAlloc, rowSetEntryListMerge, rowSetNDeepTree, rowSetListToTree,
+    rowSetTreeToList, rowSetSort; public: sqlite3RowSetAlloc/Clear/Delete/Insert/Test/Next.
+    PPRowSetEntry = ^PRowSetEntry added to support recursive tree functions.
 
-- [ ] **5.4o** Foreign keys: OP_FkCheck, OP_FkCounter, OP_FkIfZero.
+- [X] **5.4o** Foreign keys: OP_FkCheck, OP_FkCounter, OP_FkIfZero.
     Needed for: FOREIGN KEY enforcement.
+    Implemented 2026-04-25. OP_FkCheck is a stub. OP_FkCounter increments
+    db^.nDeferredCons or db^.nDeferredImmCons. OP_FkIfZero jumps if counter=0.
 
-- [ ] **5.4p** Virtual table: OP_VNext, OP_VOpen, OP_VFilter, OP_VColumn,
+- [X] **5.4p** Virtual table: OP_VNext, OP_VOpen, OP_VFilter, OP_VColumn,
     OP_VUpdate, OP_VBegin, OP_VCreate, OP_VDestroy, OP_VRename, OP_VCheck,
     OP_VInitIn.
     Needed for: virtual tables (FTS, R-TREE, etc.).
+    Implemented 2026-04-25 as stubs returning SQLITE_ERROR (virtual table engine
+    not ported in Phase 5; full implementation deferred to Phase 7).
 
-- [ ] **5.4q** Misc remaining: OP_Abortable, OP_Clear, OP_ColumnsUsed,
+- [X] **5.4q** Misc remaining: OP_Abortable, OP_Clear, OP_ColumnsUsed,
     OP_CursorHint, OP_CursorLock, OP_CursorUnlock, OP_Destroy, OP_DropIndex,
     OP_DropTable, OP_DropTrigger, OP_Expire, OP_Filter, OP_FilterAdd,
     OP_IFindKey, OP_IncrVacuum, OP_IntegrityCk, OP_JournalMode, OP_Last,
     OP_MaxPgcnt, OP_MemMax, OP_Offset, OP_OffsetLimit, OP_Pagecount,
     OP_PureFunc, OP_ReleaseReg, OP_Sequence, OP_SequenceTest, OP_SqlExec,
     OP_TypeCheck, OP_Trace, OP_Vacuum.
+    Implemented 2026-04-25. OP_PureFunc reuses OP_Function body via goto.
+    OP_Filter/FilterAdd are stubs (bloom filter deferred). OP_Abortable/ReleaseReg
+    are no-ops in release builds. OP_Checkpoint/Vacuum/JournalMode return SQLITE_OK stubs.
+    Btree helpers added: sqlite3BtreeLastPage, sqlite3BtreeMaxPageCount,
+    sqlite3BtreeLockTable (stub), sqlite3BtreeCursorPin/Unpin (BTCF_Pinned).
 
 - [X] **5.5** Port `vdbeapi.c`: public API — `sqlite3_step`, `sqlite3_column_*`,
   `sqlite3_bind_*`, `sqlite3_reset`, `sqlite3_finalize`.

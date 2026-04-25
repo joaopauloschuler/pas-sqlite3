@@ -583,11 +583,25 @@ function  sqlite3BtreeUpdateMeta(p: PBtree; idx: i32; iMeta: u32): i32;
 function  sqlite3BtreeCount(db: Pointer; pCur: PBtCursor; pnEntry: Pi64): i32;
 function  sqlite3BtreeRowCountEst(pCur: PBtCursor): i64;
 function  sqlite3BtreeFakeValidCursor: PBtCursor;
+function  sqlite3BtreeTransferRow(pDest, pSrc: PBtCursor; iKey: i64): i32;
+
+{ ===========================================================================
+  Phase 5.4 — Additional btree helpers needed by VDBE opcodes
+  =========================================================================== }
+{ btree.c:2367 — last page number (= page count) of this B-tree }
+function  sqlite3BtreeLastPage(p: PBtree): Pgno;
+{ btree.c:3151 — get/set the pager max page count; returns new limit }
+function  sqlite3BtreeMaxPageCount(p: PBtree; mxPage: Pgno): Pgno;
+{ btree.c:11400 — lock a table (no-op when shared cache disabled) }
+function  sqlite3BtreeLockTable(p: PBtree; iTab: i32; isWriteLock: u8): i32;
+{ btree.c:4928/4932 — pin/unpin a cursor (set/clear BTCF_Pinned) }
+procedure sqlite3BtreeCursorPin(pCur: PBtCursor);
+procedure sqlite3BtreeCursorUnpin(pCur: PBtCursor);
 
 implementation
 
 uses
-  BaseUnix, UnixType;
+  BaseUnix, UnixType, passqlite3internal;
 
 { ===========================================================================
   Inline pager helpers
@@ -6218,6 +6232,175 @@ begin
     to a static byte that holds CURSOR_VALID.  Callers only call
     sqlite3BtreeCursorHasMoved / sqlite3BtreeClearCursor on this. }
   Result := PBtCursor(@gFakeCursorState);
+end;
+
+
+{ btree.c:9712 — transfer a row from source to destination cursor.
+  Used by OP_RowCell to efficiently copy a row from one B-tree to another.
+  This function pre-formats the cell in pBt^.pTmpSpace and sets nPreformatSize. }
+function sqlite3BtreeTransferRow(pDest, pSrc: PBtCursor; iKey: i64): i32;
+var
+  pBt: PBtShared;
+  aOut: Pu8;
+  aIn: Pu8;
+  nIn: u32;
+  nRem: u32;
+  nOut: u32;
+  rc: i32;
+  pSrcPager: PPager;
+  pPgnoOut: Pu8;
+  ovflIn: Pgno;
+  pPageIn: PDbPage;
+  pPageOut: PMemPage;
+  pNew: PMemPage;
+  pgnoNew: Pgno;
+  nCopy: i32;
+begin
+  pBt := pDest^.pBt;
+  aOut := pBt^.pTmpSpace;
+  rc := SQLITE_OK;
+  pPageIn := nil;
+  pPageOut := nil;
+
+  getCellInfo(pSrc);
+  
+  { Write payload size varint }
+  if pSrc^.info.nPayload < $80 then begin
+    aOut^ := u8(pSrc^.info.nPayload);
+    Inc(aOut);
+  end else begin
+    Inc(aOut, sqlite3PutVarint(aOut, u64(pSrc^.info.nPayload)));
+  end;
+  
+  { Write rowid for table B-trees (not index B-trees) }
+  if pDest^.pKeyInfo = nil then
+    Inc(aOut, sqlite3PutVarint(aOut, u64(iKey)));
+  
+  nIn := pSrc^.info.nLocal;
+  aIn := pSrc^.info.pPayload;
+  
+  { Corruption check }
+  if Pu8(aIn + nIn) > pSrc^.pPage^.aDataEnd then begin
+    Result := CORRUPT_PAGE(pSrc^.pPage);
+    Exit;
+  end;
+  
+  nRem := pSrc^.info.nPayload;
+  
+  { Simple case: all payload fits locally in destination }
+  if (nIn = nRem) and (nIn < u32(pDest^.pPage^.maxLocal)) then begin
+    Move(aIn^, aOut^, nIn);
+    pBt^.nPreformatSize := i32(nIn) + i32(aOut - pBt^.pTmpSpace);
+    Result := SQLITE_OK;
+    Exit;
+  end;
+  
+  { Complex case: overflow pages involved }
+  pSrcPager := pSrc^.pBt^.pPager;
+  pPgnoOut := nil;
+  ovflIn := 0;
+  
+  nOut := u32(btreePayloadToLocal(pDest^.pPage, pSrc^.info.nPayload));
+  pBt^.nPreformatSize := i32(nOut) + i32(aOut - pBt^.pTmpSpace);
+  
+  if nOut < u32(pSrc^.info.nPayload) then begin
+    pPgnoOut := @aOut[nOut];
+    Inc(pBt^.nPreformatSize, 4);
+  end;
+  
+  if nRem > nIn then begin
+    if Pu8(aIn + nIn + 4) > pSrc^.pPage^.aDataEnd then begin
+      Result := CORRUPT_PAGE(pSrc^.pPage);
+      Exit;
+    end;
+    ovflIn := get4byte(@pSrc^.info.pPayload[nIn]);
+  end;
+  
+  { Main copy loop }
+  while (nRem > 0) and (rc = SQLITE_OK) do begin
+    Dec(nRem, nOut);
+    
+    { Copy data to output buffer }
+    while (nOut > 0) and (rc = SQLITE_OK) do begin
+      if nIn > 0 then begin
+        nCopy := i32(sqlite3_min(i64(nOut), i64(nIn)));
+        Move(aIn^, aOut^, nCopy);
+        Dec(nOut, nCopy);
+        Dec(nIn, nCopy);
+        Inc(aOut, nCopy);
+        Inc(aIn, nCopy);
+      end;
+      
+      if nOut > 0 then begin
+        sqlite3PagerUnref(pPageIn);
+        pPageIn := nil;
+        rc := sqlite3PagerGet(pSrcPager, ovflIn, PPDbPage(@pPageIn), PAGER_GET_READONLY);
+        if rc = SQLITE_OK then begin
+          aIn := sqlite3PagerGetData(pPageIn);
+          ovflIn := get4byte(aIn);
+          Inc(aIn, 4);
+          nIn := pSrc^.pBt^.usableSize - 4;
+        end;
+      end;
+    end;
+    
+    { Allocate overflow page if needed }
+    if (rc = SQLITE_OK) and (nRem > 0) and (pPgnoOut <> nil) then begin
+      rc := allocateBtreePage(pBt, pNew, pgnoNew, 0, 0);
+      put4byte(pPgnoOut, pgnoNew);
+      if ISAUTOVACUUM(pBt) and (pPageOut <> nil) then
+        ptrmapPut(pBt, pgnoNew, PTRMAP_OVERFLOW2, pPageOut^.pgno, @rc);
+      releasePage(pPageOut);
+      pPageOut := pNew;
+      if pPageOut <> nil then begin
+        pPgnoOut := pPageOut^.aData;
+        put4byte(pPgnoOut, 0);
+        aOut := @pPgnoOut[4];
+        nOut := u32(sqlite3_min(i64(pBt^.usableSize - 4), i64(nRem)));
+      end;
+    end;
+  end;
+  
+  releasePage(pPageOut);
+  sqlite3PagerUnref(pPageIn);
+  Result := rc;
+end;
+
+{ ===========================================================================
+  Phase 5.4 — Additional btree helpers
+  =========================================================================== }
+
+{ btree.c:2367 }
+function sqlite3BtreeLastPage(p: PBtree): Pgno;
+begin
+  Result := btreePagecount(p^.pBt);
+end;
+
+{ btree.c:3151 }
+function sqlite3BtreeMaxPageCount(p: PBtree; mxPage: Pgno): Pgno;
+begin
+  sqlite3BtreeEnter(p);
+  Result := sqlite3PagerMaxPageCount(p^.pBt^.pPager, mxPage);
+  sqlite3BtreeLeave(p);
+end;
+
+{ btree.c:11400 — shared-cache lock; no-op when SQLITE_OMIT_SHARED_CACHE }
+function sqlite3BtreeLockTable(p: PBtree; iTab: i32; isWriteLock: u8): i32;
+begin
+  Result := SQLITE_OK;
+  { shared-cache table locking not implemented in this port }
+end;
+
+{ btree.c:4928 }
+procedure sqlite3BtreeCursorPin(pCur: PBtCursor);
+begin
+  pCur^.curFlags := pCur^.curFlags or BTCF_Pinned;
+end;
+
+{ btree.c:4932 }
+procedure sqlite3BtreeCursorUnpin(pCur: PBtCursor);
+begin
+  pCur^.curFlags := pCur^.curFlags and not u8(BTCF_Pinned);
 end;
 
 end.
