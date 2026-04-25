@@ -709,6 +709,12 @@ function ROUND8(n: SizeInt): SizeInt; inline;
 function ROUNDDOWN8(n: SizeInt): SizeInt; inline;
 function SQLITE_WITHIN(p, pStart, pEnd: Pointer): Boolean; inline;
 
+{ String helpers (util.c) }
+procedure sqlite3Dequote(z: PAnsiChar);
+function  sqlite3DbSpanDup(db: Psqlite3db; zStart: PAnsiChar; zEnd: PAnsiChar): PAnsiChar;
+procedure sqlite3DbNNFreeNN(db: Psqlite3db; p: Pointer);
+function  sqlite3GetInt32(zNum: PAnsiChar; pValue: Pi32): i32;
+
 { Pcache1 mutex getter (set by pcache1Init) }
 function  sqlite3Pcache1Mutex: Psqlite3_mutex;
 
@@ -2477,6 +2483,91 @@ begin
   end;
   if neg <> 0 then v := -v;
   Result := i32(v);
+end;
+
+{ ============================================================
+  String helpers (util.c)
+  ============================================================ }
+
+{ util.c ~298: sqlite3Dequote — remove surrounding quotes in-place }
+procedure sqlite3Dequote(z: PAnsiChar);
+var
+  quote: AnsiChar;
+  i, j: i32;
+begin
+  if z = nil then Exit;
+  quote := z[0];
+  if (quote <> '"') and (quote <> '''') and (quote <> '[') and (quote <> '`') then Exit;
+  if quote = '[' then quote := ']';
+  j := 0;
+  i := 1;
+  while True do
+  begin
+    if z[i] = #0 then Break;
+    if z[i] = quote then
+    begin
+      if z[i+1] = quote then
+      begin
+        z[j] := quote;
+        Inc(j);
+        Inc(i, 2);
+      end else
+        Break;
+    end else
+    begin
+      z[j] := z[i];
+      Inc(j);
+      Inc(i);
+    end;
+  end;
+  z[j] := #0;
+end;
+
+{ util.c equivalent: duplicate string from zStart up to (not including) zEnd }
+function sqlite3DbSpanDup(db: Psqlite3db; zStart: PAnsiChar; zEnd: PAnsiChar): PAnsiChar;
+var n: i32;
+begin
+  if zStart = nil then begin Result := nil; Exit; end;
+  if zEnd = nil then
+    n := sqlite3Strlen30(zStart)
+  else
+    n := zEnd - zStart;
+  Result := sqlite3DbStrNDup(db, zStart, u64(n));
+end;
+
+{ malloc.c ~458: sqlite3DbNNFreeNN — free; both db and p guaranteed non-nil }
+procedure sqlite3DbNNFreeNN(db: Psqlite3db; p: Pointer);
+begin
+  sqlite3DbFreeNN(db, p);
+end;
+
+{ util.c: sqlite3GetInt32 — parse a decimal integer string into *pValue.
+  Returns 1 on success (fits in i32), 0 on failure. }
+function sqlite3GetInt32(zNum: PAnsiChar; pValue: Pi32): i32;
+var
+  v:    i64;
+  neg:  Boolean;
+  p:    PAnsiChar;
+begin
+  Result := 0;
+  if zNum = nil then Exit;
+  p   := zNum;
+  neg := False;
+  if p^ = '-' then begin neg := True; Inc(p); end
+  else if p^ = '+' then Inc(p);
+  if not (p^ in ['0'..'9']) then Exit;
+  v := 0;
+  while p^ in ['0'..'9'] do
+  begin
+    v := v * 10 + (Ord(p^) - Ord('0'));
+    if v > $80000000 then Exit;
+    Inc(p);
+  end;
+  if p^ <> #0 then Exit;
+  if neg then v := -v;
+  if (v < Low(i32)) or (v > High(i32)) then Exit;
+  if pValue <> nil then pValue^ := i32(v);
+  Result := 1;
 end;
 
 { ============================================================
