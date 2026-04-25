@@ -2094,8 +2094,57 @@ statement is syntactically complete — used by the CLI and REPLs).
         labels (153/155/232/233/252 join 146; 154/156/231/251 join 147).
         Either re-merge the labels at that time or keep as duplicate
         bodies — pick the cleaner one.
-    - [ ] **7.2e.4** Rules 150..199 — DML: DELETE, UPDATE, INSERT/REPLACE,
-      upsert, returning, RAISE, conflict, idlist, insert_cmd, expr_or_select.
+    - [X] **7.2e.4** Rules 150..199 — DML: DELETE, UPDATE, INSERT/REPLACE,
+      upsert, returning, conflict, idlist, insert_cmd, plus expression-tail
+      rules 179..199 (LP/RP, ID DOT ID, term, function call, COLLATE, CAST,
+      filter_over, LP nexprlist COMMA expr RP, AND/OR/comparison).
+      DONE 2026-04-25.
+
+      Notes for next chunks:
+      * Five new local helpers were added to passqlite3parser.pas above
+        `yy_reduce` (same pattern as 7.2e.3's `sqlite3NameFromToken`):
+        - **`parserSyntaxError`** — emits a static "near token: syntax error"
+          message; full `%T` formatting deferred until sqlite3ErrorMsg gains
+          varargs (Phase 8).
+        - **`sqlite3ExprFunction`** — full port of expr.c:1169.  Uses
+          `sqlite3ExprAlloc`, `sqlite3ExprSetHeightAndFlags` (both already in
+          passqlite3codegen).  Phase 8 should move it to expr.c proper.
+        - **`sqlite3ExprAddFunctionOrderBy`** — full port of expr.c:1219.
+          Uses `sqlite3ExprListDeleteGeneric` + `sqlite3ParserAddCleanup`
+          (both already exported).  Move to expr.c in Phase 8.
+        - **`sqlite3ExprAssignVarNumber`** — *simplified* port: `?`, `?N`,
+          and `:/$/@aaa` are all assigned a fresh slot via `++pParse.nVar`.
+          The `pVList`-based dedupe of named bind params is **not** wired
+          up (util.c's `sqlite3VListAdd/NameToNum/NumToName` are not yet
+          ported).  This means two occurrences of `:foo` currently get
+          *different* parameter numbers — incorrect for binding but
+          harmless for parser-only tests.  Phase 8 must port the VList
+          machinery and replace this stub.
+        - **`sqlite3ExprListAppendVector`** — *stub*: emits an error
+          ("vector assignment not yet supported (Phase 8 TODO)") and frees
+          its inputs.  Vector assignment `(a,b)=(...)` in UPDATE setlists
+          and the corresponding rules 161/163 will not work until Phase 8
+          ports `sqlite3ExprForVectorField` (expr.c:1893).
+      * **`yylhsminor.yy454` is `Pointer`** in the YYMINORTYPE variant
+        record (see line ~314).  When dereferencing for `^.w.iOfst` etc.,
+        cast to `PExpr(yylhsminor.yy454)^.w.iOfst`.  Same pattern applies
+        when reading `^.flags`, `^.x.pList`, and so on.  See rule 185 for
+        a worked example — direct `yylhsminor.yy454^.…` triggers FPC's
+        "Illegal qualifier" error.
+      * Rules **153/155/232/233/252** share the body `yymsp[1].yy454 := nil`
+        and were merged with rule 148 in C.  Our switch already had 148
+        as a separate case (no-arg) — chunk 7.2e.4 added 153/155/232/233/252
+        as a new combined case to keep the body distinct (148 uses
+        `yymsp[1]`, the merged group also uses `yymsp[1]`, so the bodies
+        are identical and could be merged in a future cleanup).  Same for
+        154/156/231/251 (paired with 147).  Decision deferred to chunk
+        7.2e.5 — pick the cleaner merge once those rule numbers materialise.
+      * Rules **198/199** were merged in our switch but the C code further
+        merges 200..204 into the same body.  Chunk 7.2e.5 must fold
+        200..204 into the existing 198/199 case.
+      * Rules **173/174** were already covered by chunks 7.2e.1/7.2e.2
+        (merged with 61/76 and 78 respectively) — they are intentionally
+        absent from chunk 7.2e.4's new cases.
     - [ ] **7.2e.5** Rules 200..249 — expressions: expr/term, literals,
       bind params, names, function call, subqueries, CASE, CAST, COLLATE,
       LIKE/GLOB/REGEXP/MATCH, BETWEEN, IN, IS, NULL/NOTNULL, unary ops.

@@ -1393,6 +1393,149 @@ begin
     Result := nil;
 end;
 
+{ ---- parserSyntaxError (parse.y:85) ------------------------------------- }
+{ Tiny helper used by rule 186 when a "#N" register reference appears        }
+{ outside a nested parse.  C body: sqlite3ErrorMsg(pParse,                   }
+{ "near \"%T\": syntax error", p);  Our sqlite3ErrorMsg currently lacks the  }
+{ printf-style %T specifier (see chunk 7.2e.1 notes), so we emit a static    }
+{ message and accept reduced fidelity until Phase 8 wires up varargs.        }
+procedure parserSyntaxError(pPse: PParse; const p: PToken);
+begin
+  sqlite3ErrorMsg(pPse, 'near token: syntax error');
+end;
+
+{ ---- sqlite3ExprFunction (expr.c:1169) ----------------------------------- }
+{ Construct a TK_FUNCTION expression with arg list pList and name pToken.    }
+{ Local copy until Phase 8 ports expr.c's function-creation helpers proper.  }
+function sqlite3ExprFunction(pPse: PParse; pList: PExprList;
+                             pToken: PToken; eDistinct: i32): PExpr;
+var
+  db:   PTsqlite3;
+  pNew: PExpr;
+begin
+  db := pPse^.db;
+  pNew := sqlite3ExprAlloc(db, TK_FUNCTION, pToken, 1);
+  if pNew = nil then begin
+    sqlite3ExprListDelete(db, pList);
+    Result := nil;
+    Exit;
+  end;
+  pNew^.w.iOfst := i32(PtrUInt(pToken^.z) - PtrUInt(pPse^.zTail));
+  if (pList <> nil)
+     and (pList^.nExpr > db^.aLimit[SQLITE_LIMIT_FUNCTION_ARG])
+     and (pPse^.nested = 0) then
+    sqlite3ErrorMsg(pPse, 'too many arguments on function');
+  pNew^.x.pList := pList;
+  pNew^.flags := pNew^.flags or EP_HasFunc;
+  sqlite3ExprSetHeightAndFlags(pPse, pNew);
+  if eDistinct = i32(SF_Distinct) then
+    pNew^.flags := pNew^.flags or EP_Distinct;
+  Result := pNew;
+end;
+
+{ ---- sqlite3ExprAddFunctionOrderBy (expr.c:1219) ------------------------- }
+{ Attach an ORDER BY clause to a (non-window, non-aggregate) function call. }
+procedure sqlite3ExprAddFunctionOrderBy(pPse: PParse; pExpr: PExpr;
+                                        pOrderBy: PExprList);
+var
+  db:  PTsqlite3;
+  pOB: PExpr;
+begin
+  db := pPse^.db;
+  if pOrderBy = nil then Exit;
+  if pExpr = nil then begin
+    sqlite3ExprListDelete(db, pOrderBy);
+    Exit;
+  end;
+  if (pExpr^.x.pList = nil) or (pExpr^.x.pList^.nExpr = 0) then begin
+    sqlite3ParserAddCleanup(pPse, @sqlite3ExprListDeleteGeneric, pOrderBy);
+    Exit;
+  end;
+  if (pExpr^.flags and EP_WinFunc) <> 0 then begin
+    sqlite3ErrorMsg(pPse,
+      'ORDER BY may not be used with non-aggregate function');
+    sqlite3ExprListDelete(db, pOrderBy);
+    Exit;
+  end;
+  if pOrderBy^.nExpr > db^.aLimit[SQLITE_LIMIT_COLUMN] then begin
+    sqlite3ErrorMsg(pPse, 'too many terms in ORDER BY clause');
+    sqlite3ExprListDelete(db, pOrderBy);
+    Exit;
+  end;
+  pOB := sqlite3ExprAlloc(db, TK_ORDER, nil, 0);
+  if pOB = nil then begin
+    sqlite3ExprListDelete(db, pOrderBy);
+    Exit;
+  end;
+  pOB^.x.pList := pOrderBy;
+  pExpr^.pLeft := pOB;
+  pOB^.flags := pOB^.flags or EP_FullSize;
+end;
+
+{ ---- sqlite3ExprAssignVarNumber (expr.c:1317) ---------------------------- }
+{ Assign a wildcard variable number.  Phase 7.2e.4 simplified port — handles }
+{ "?", "?N", and ":/@/$aaa".  Does NOT yet maintain pParse.pVList (which     }
+{ supports `sqlite3_bind_parameter_name`); de-duplication of named bind      }
+{ params is therefore disabled here — each occurrence gets a fresh slot.     }
+{ Phase 8 will replace this with the full util.c VList machinery.            }
+procedure sqlite3ExprAssignVarNumber(pPse: PParse; pExpr: PExpr; n: u32);
+var
+  db: PTsqlite3;
+  z:  PAnsiChar;
+  x:  i32;
+  ok: i32;
+  i:  i64;
+begin
+  if pExpr = nil then Exit;
+  db := pPse^.db;
+  z := pExpr^.u.zToken;
+  if (z = nil) or (z[0] = #0) then Exit;
+  if z[1] = #0 then begin
+    Inc(pPse^.nVar);
+    x := pPse^.nVar;
+  end else if z[0] = '?' then begin
+    if n = 2 then begin
+      i := Ord(z[1]) - Ord('0');
+      ok := 1;
+    end else begin
+      ok := i32(Ord(sqlite3Atoi64(@z[1], i, i32(n) - 1, SQLITE_UTF8) = 0));
+    end;
+    if (ok = 0) or (i < 1) or (i > db^.aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]) then
+    begin
+      sqlite3ErrorMsg(pPse, 'variable number out of range');
+      sqlite3RecordErrorOffsetOfExpr(db, pExpr);
+      Exit;
+    end;
+    x := i32(i);
+    if x > pPse^.nVar then pPse^.nVar := x;
+  end else begin
+    { ":aaa", "$aaa", "@aaa" — simplified: always allocate a new slot. }
+    Inc(pPse^.nVar);
+    x := pPse^.nVar;
+  end;
+  pExpr^.iColumn := i16(x);
+  if x > db^.aLimit[SQLITE_LIMIT_VARIABLE_NUMBER] then begin
+    sqlite3ErrorMsg(pPse, 'too many SQL variables');
+    sqlite3RecordErrorOffsetOfExpr(db, pExpr);
+  end;
+end;
+
+{ ---- sqlite3ExprListAppendVector (expr.c:2093) --------------------------- }
+{ Append the LHS columns of a vector assignment "(a,b,c) = (...)" as new    }
+{ ExprList items.  Phase 7.2e.4 stub: full port requires                    }
+{ sqlite3ExprForVectorField (expr.c:1893) which has not yet been ported.    }
+{ For now we simply free pColumns / pExpr and report an error if invoked —  }
+{ vector UPDATEs (`SET (a,b)=...`) are uncommon in our gated test corpus.   }
+{ Phase 8 will port the full implementation.                                }
+function sqlite3ExprListAppendVector(pPse: PParse; pList: PExprList;
+                                     pColumns: PIdList; pExpr: PExpr): PExprList;
+begin
+  sqlite3ErrorMsg(pPse, 'vector assignment not yet supported (Phase 8 TODO)');
+  sqlite3ExprDelete(pPse^.db, pExpr);
+  sqlite3IdListDelete(pPse^.db, pColumns);
+  Result := pList;
+end;
+
 { ---- yy_reduce — engine framework (parse.c:3804) ------------------------ }
 { Phase 7.2d: rule-action switch is empty.  Phase 7.2e fills in cases for   }
 { rules 0..411 from parse.c:3829–5993.  The framework that runs after the  }
@@ -1429,6 +1572,18 @@ var
   pLhs_115:   PSrcList;
   pRhs_115:   PSrcList;
   pSubquery_115: PSelect;
+  { Phase 7.2e.4 locals (rules 150..199). }
+  pFromCl_159: PSrcList;
+  pSubq_159:   PSelect;
+  as_159:      TToken;
+  iVal_185:    i32;
+  t_186:       TToken;
+  n_186:       u32;
+  pList_196:   PExprList;
+  temp1_181:   PExpr;
+  temp2_181:   PExpr;
+  temp3_182:   PExpr;
+  temp4_182:   PExpr;
 begin
   yymsp := yypParser^.yytos;
   pPse  := PParse(yypParser^.pParse);
@@ -2033,6 +2188,279 @@ begin
     149: { limit_opt ::= LIMIT expr }
        yymsp[-1].minor.yy454 := sqlite3PExpr(pPse, TK_LIMIT,
          PExpr(yymsp[0].minor.yy454), nil);
+    { ---------- Phase 7.2e.4 : rules 150..199 -------------------- }
+    150: { limit_opt ::= LIMIT expr OFFSET expr }
+       yymsp[-3].minor.yy454 := sqlite3PExpr(pPse, TK_LIMIT,
+         PExpr(yymsp[-2].minor.yy454), PExpr(yymsp[0].minor.yy454));
+    151: { limit_opt ::= LIMIT expr COMMA expr }
+       yymsp[-3].minor.yy454 := sqlite3PExpr(pPse, TK_LIMIT,
+         PExpr(yymsp[0].minor.yy454), PExpr(yymsp[-2].minor.yy454));
+    152: { cmd ::= with DELETE FROM xfullname indexed_opt where_opt_ret }
+       begin
+         sqlite3SrcListIndexedBy(pPse, PSrcList(yymsp[-2].minor.yy203),
+           @yymsp[-1].minor.yy0);
+         sqlite3DeleteFrom(pPse, PSrcList(yymsp[-2].minor.yy203),
+           PExpr(yymsp[0].minor.yy454), nil, nil);
+       end;
+    153, 155, 232, 233, 252:
+       { where_opt ::=;  where_opt_ret ::=;  case_else ::=;
+         case_operand ::=;  vinto ::= }
+       yymsp[1].minor.yy454 := nil;
+    154, 156, 231, 251:
+       { where_opt ::= WHERE expr;  where_opt_ret ::= WHERE expr;
+         case_else ::= ELSE expr;  vinto ::= INTO expr }
+       yymsp[-1].minor.yy454 := yymsp[0].minor.yy454;
+    157: { where_opt_ret ::= RETURNING selcollist }
+       begin
+         sqlite3AddReturning(pPse, PExprList(yymsp[0].minor.yy14));
+         yymsp[-1].minor.yy454 := nil;
+       end;
+    158: { where_opt_ret ::= WHERE expr RETURNING selcollist }
+       begin
+         sqlite3AddReturning(pPse, PExprList(yymsp[0].minor.yy14));
+         yymsp[-3].minor.yy454 := yymsp[-2].minor.yy454;
+       end;
+    159: { cmd ::= with UPDATE orconf xfullname indexed_opt SET setlist from where_opt_ret }
+       begin
+         sqlite3SrcListIndexedBy(pPse, PSrcList(yymsp[-5].minor.yy203),
+           @yymsp[-4].minor.yy0);
+         sqlite3ExprListCheckLength(pPse, PExprList(yymsp[-2].minor.yy14),
+           'set list');
+         pFromCl_159 := PSrcList(yymsp[-1].minor.yy203);
+         if pFromCl_159 <> nil then begin
+           if pFromCl_159^.nSrc > 1 then begin
+             pSubq_159 := sqlite3SelectNew(pPse, nil, pFromCl_159, nil, nil,
+               nil, nil, SF_NestedFrom, nil);
+             as_159.n := 0;
+             as_159.z := nil;
+             pFromCl_159 := sqlite3SrcListAppendFromTerm(pPse, nil, nil, nil,
+               @as_159, pSubq_159, nil, nil);
+           end;
+           yymsp[-5].minor.yy203 := sqlite3SrcListAppendList(pPse,
+             PSrcList(yymsp[-5].minor.yy203), pFromCl_159);
+         end;
+         sqlite3Update(pPse, PSrcList(yymsp[-5].minor.yy203),
+           PExprList(yymsp[-2].minor.yy14), PExpr(yymsp[0].minor.yy454),
+           yymsp[-6].minor.yy144, nil, nil, nil);
+       end;
+    160: { setlist ::= setlist COMMA nm EQ expr }
+       begin
+         yymsp[-4].minor.yy14 := sqlite3ExprListAppend(pPse,
+           PExprList(yymsp[-4].minor.yy14), PExpr(yymsp[0].minor.yy454));
+         sqlite3ExprListSetName(pPse, PExprList(yymsp[-4].minor.yy14),
+           @yymsp[-2].minor.yy0, 1);
+       end;
+    161: { setlist ::= setlist COMMA LP idlist RP EQ expr }
+       yymsp[-6].minor.yy14 := sqlite3ExprListAppendVector(pPse,
+         PExprList(yymsp[-6].minor.yy14), PIdList(yymsp[-3].minor.yy132),
+         PExpr(yymsp[0].minor.yy454));
+    162: { setlist ::= nm EQ expr }
+       begin
+         yylhsminor.yy14 := sqlite3ExprListAppend(pPse, nil,
+           PExpr(yymsp[0].minor.yy454));
+         sqlite3ExprListSetName(pPse, PExprList(yylhsminor.yy14),
+           @yymsp[-2].minor.yy0, 1);
+         yymsp[-2].minor.yy14 := yylhsminor.yy14;
+       end;
+    163: { setlist ::= LP idlist RP EQ expr }
+       yymsp[-4].minor.yy14 := sqlite3ExprListAppendVector(pPse, nil,
+         PIdList(yymsp[-3].minor.yy132), PExpr(yymsp[0].minor.yy454));
+    164: { cmd ::= with insert_cmd INTO xfullname idlist_opt select upsert }
+       sqlite3Insert(pPse, PSrcList(yymsp[-3].minor.yy203),
+         PSelect(yymsp[-1].minor.yy555), PIdList(yymsp[-2].minor.yy132),
+         yymsp[-5].minor.yy144, PUpsert(yymsp[0].minor.yy122));
+    165: { cmd ::= with insert_cmd INTO xfullname idlist_opt DEFAULT VALUES returning }
+       sqlite3Insert(pPse, PSrcList(yymsp[-4].minor.yy203), nil,
+         PIdList(yymsp[-3].minor.yy132), yymsp[-6].minor.yy144, nil);
+    166: { upsert ::= }
+       yymsp[1].minor.yy122 := nil;
+    167: { upsert ::= RETURNING selcollist }
+       begin
+         yymsp[-1].minor.yy122 := nil;
+         sqlite3AddReturning(pPse, PExprList(yymsp[0].minor.yy14));
+       end;
+    168: { upsert ::= ON CONFLICT LP sortlist RP where_opt DO UPDATE SET setlist where_opt upsert }
+       yymsp[-11].minor.yy122 := sqlite3UpsertNew(pPse^.db,
+         PExprList(yymsp[-8].minor.yy14), PExpr(yymsp[-6].minor.yy454),
+         PExprList(yymsp[-2].minor.yy14), PExpr(yymsp[-1].minor.yy454),
+         PUpsert(yymsp[0].minor.yy122));
+    169: { upsert ::= ON CONFLICT LP sortlist RP where_opt DO NOTHING upsert }
+       yymsp[-8].minor.yy122 := sqlite3UpsertNew(pPse^.db,
+         PExprList(yymsp[-5].minor.yy14), PExpr(yymsp[-3].minor.yy454),
+         nil, nil, PUpsert(yymsp[0].minor.yy122));
+    170: { upsert ::= ON CONFLICT DO NOTHING returning }
+       yymsp[-4].minor.yy122 := sqlite3UpsertNew(pPse^.db, nil, nil,
+         nil, nil, nil);
+    171: { upsert ::= ON CONFLICT DO UPDATE SET setlist where_opt returning }
+       yymsp[-7].minor.yy122 := sqlite3UpsertNew(pPse^.db, nil, nil,
+         PExprList(yymsp[-2].minor.yy14), PExpr(yymsp[-1].minor.yy454), nil);
+    172: { returning ::= RETURNING selcollist }
+       sqlite3AddReturning(pPse, PExprList(yymsp[0].minor.yy14));
+    175: { idlist_opt ::= }
+       yymsp[1].minor.yy132 := nil;
+    176: { idlist_opt ::= LP idlist RP }
+       yymsp[-2].minor.yy132 := yymsp[-1].minor.yy132;
+    177: { idlist ::= idlist COMMA nm }
+       yymsp[-2].minor.yy132 := sqlite3IdListAppend(pPse,
+         PIdList(yymsp[-2].minor.yy132), @yymsp[0].minor.yy0);
+    178: { idlist ::= nm }
+       yymsp[0].minor.yy132 := sqlite3IdListAppend(pPse, nil,
+         @yymsp[0].minor.yy0);
+    179: { expr ::= LP expr RP }
+       yymsp[-2].minor.yy454 := yymsp[-1].minor.yy454;
+    180: { expr ::= ID|INDEXED|JOIN_KW }
+       yymsp[0].minor.yy454 := sqlite3ExprAlloc(pPse^.db, TK_ID,
+         @yymsp[0].minor.yy0, 0);
+    181: { expr ::= nm DOT nm }
+       begin
+         temp1_181 := sqlite3ExprAlloc(pPse^.db, TK_ID,
+           @yymsp[-2].minor.yy0, 0);
+         temp2_181 := sqlite3ExprAlloc(pPse^.db, TK_ID,
+           @yymsp[0].minor.yy0, 0);
+         yylhsminor.yy454 := sqlite3PExpr(pPse, TK_DOT, temp1_181, temp2_181);
+         yymsp[-2].minor.yy454 := yylhsminor.yy454;
+       end;
+    182: { expr ::= nm DOT nm DOT nm }
+       begin
+         temp1_181 := sqlite3ExprAlloc(pPse^.db, TK_ID,
+           @yymsp[-4].minor.yy0, 0);
+         temp2_181 := sqlite3ExprAlloc(pPse^.db, TK_ID,
+           @yymsp[-2].minor.yy0, 0);
+         temp3_182 := sqlite3ExprAlloc(pPse^.db, TK_ID,
+           @yymsp[0].minor.yy0, 0);
+         temp4_182 := sqlite3PExpr(pPse, TK_DOT, temp2_181, temp3_182);
+         if InRenameObject(pPse) then
+           sqlite3RenameTokenRemap(pPse, nil, temp1_181);
+         yylhsminor.yy454 := sqlite3PExpr(pPse, TK_DOT, temp1_181, temp4_182);
+         yymsp[-4].minor.yy454 := yylhsminor.yy454;
+       end;
+    183, 184: { term ::= NULL|FLOAT|BLOB;  term ::= STRING }
+       yymsp[0].minor.yy454 := sqlite3ExprAlloc(pPse^.db,
+         i32(yymsp[0].major), @yymsp[0].minor.yy0, 1);
+    185: { term ::= INTEGER }
+       begin
+         if sqlite3GetInt32(yymsp[0].minor.yy0.z, @iVal_185) = 0 then
+           yylhsminor.yy454 := sqlite3ExprAlloc(pPse^.db, TK_INTEGER,
+             @yymsp[0].minor.yy0, 0)
+         else
+           yylhsminor.yy454 := sqlite3ExprInt32(pPse^.db, iVal_185);
+         if yylhsminor.yy454 <> nil then
+           PExpr(yylhsminor.yy454)^.w.iOfst :=
+             i32(PtrUInt(yymsp[0].minor.yy0.z) - PtrUInt(pPse^.zTail));
+         yymsp[0].minor.yy454 := yylhsminor.yy454;
+       end;
+    186: { expr ::= VARIABLE }
+       begin
+         if not ((yymsp[0].minor.yy0.z[0] = '#')
+                 and (yymsp[0].minor.yy0.z[1] >= '0')
+                 and (yymsp[0].minor.yy0.z[1] <= '9')) then begin
+           n_186 := u32(yymsp[0].minor.yy0.n);
+           yymsp[0].minor.yy454 := sqlite3ExprAlloc(pPse^.db, TK_VARIABLE,
+             @yymsp[0].minor.yy0, 1);
+           sqlite3ExprAssignVarNumber(pPse, PExpr(yymsp[0].minor.yy454),
+             n_186);
+         end else begin
+           t_186 := yymsp[0].minor.yy0;
+           if pPse^.nested = 0 then begin
+             parserSyntaxError(pPse, @t_186);
+             yymsp[0].minor.yy454 := nil;
+           end else begin
+             yymsp[0].minor.yy454 := sqlite3PExpr(pPse, TK_REGISTER, nil, nil);
+             if yymsp[0].minor.yy454 <> nil then
+               sqlite3GetInt32(@t_186.z[1],
+                 @PExpr(yymsp[0].minor.yy454)^.iTable);
+           end;
+         end;
+       end;
+    187: { expr ::= expr COLLATE ID|STRING }
+       yymsp[-2].minor.yy454 := sqlite3ExprAddCollateToken(pPse,
+         PExpr(yymsp[-2].minor.yy454), @yymsp[0].minor.yy0, 1);
+    188: { expr ::= CAST LP expr AS typetoken RP }
+       begin
+         yymsp[-5].minor.yy454 := sqlite3ExprAlloc(pPse^.db, TK_CAST,
+           @yymsp[-1].minor.yy0, 1);
+         sqlite3ExprAttachSubtrees(pPse^.db, PExpr(yymsp[-5].minor.yy454),
+           PExpr(yymsp[-3].minor.yy454), nil);
+       end;
+    189: { expr ::= ID|INDEXED|JOIN_KW LP distinct exprlist RP }
+       begin
+         yylhsminor.yy454 := sqlite3ExprFunction(pPse,
+           PExprList(yymsp[-1].minor.yy14), @yymsp[-4].minor.yy0,
+           yymsp[-2].minor.yy144);
+         yymsp[-4].minor.yy454 := yylhsminor.yy454;
+       end;
+    190: { expr ::= ID|INDEXED|JOIN_KW LP distinct exprlist ORDER BY sortlist RP }
+       begin
+         yylhsminor.yy454 := sqlite3ExprFunction(pPse,
+           PExprList(yymsp[-4].minor.yy14), @yymsp[-7].minor.yy0,
+           yymsp[-5].minor.yy144);
+         sqlite3ExprAddFunctionOrderBy(pPse, PExpr(yylhsminor.yy454),
+           PExprList(yymsp[-1].minor.yy14));
+         yymsp[-7].minor.yy454 := yylhsminor.yy454;
+       end;
+    191: { expr ::= ID|INDEXED|JOIN_KW LP STAR RP }
+       begin
+         yylhsminor.yy454 := sqlite3ExprFunction(pPse, nil,
+           @yymsp[-3].minor.yy0, 0);
+         yymsp[-3].minor.yy454 := yylhsminor.yy454;
+       end;
+    192: { expr ::= ID|INDEXED|JOIN_KW LP distinct exprlist RP filter_over }
+       begin
+         yylhsminor.yy454 := sqlite3ExprFunction(pPse,
+           PExprList(yymsp[-2].minor.yy14), @yymsp[-5].minor.yy0,
+           yymsp[-3].minor.yy144);
+         sqlite3WindowAttach(pPse, PExpr(yylhsminor.yy454),
+           PWindow(yymsp[0].minor.yy211));
+         yymsp[-5].minor.yy454 := yylhsminor.yy454;
+       end;
+    193: { expr ::= ID|INDEXED|JOIN_KW LP distinct exprlist ORDER BY sortlist RP filter_over }
+       begin
+         yylhsminor.yy454 := sqlite3ExprFunction(pPse,
+           PExprList(yymsp[-5].minor.yy14), @yymsp[-8].minor.yy0,
+           yymsp[-6].minor.yy144);
+         sqlite3WindowAttach(pPse, PExpr(yylhsminor.yy454),
+           PWindow(yymsp[0].minor.yy211));
+         sqlite3ExprAddFunctionOrderBy(pPse, PExpr(yylhsminor.yy454),
+           PExprList(yymsp[-2].minor.yy14));
+         yymsp[-8].minor.yy454 := yylhsminor.yy454;
+       end;
+    194: { expr ::= ID|INDEXED|JOIN_KW LP STAR RP filter_over }
+       begin
+         yylhsminor.yy454 := sqlite3ExprFunction(pPse, nil,
+           @yymsp[-4].minor.yy0, 0);
+         sqlite3WindowAttach(pPse, PExpr(yylhsminor.yy454),
+           PWindow(yymsp[0].minor.yy211));
+         yymsp[-4].minor.yy454 := yylhsminor.yy454;
+       end;
+    195: { term ::= CTIME_KW }
+       begin
+         yylhsminor.yy454 := sqlite3ExprFunction(pPse, nil,
+           @yymsp[0].minor.yy0, 0);
+         yymsp[0].minor.yy454 := yylhsminor.yy454;
+       end;
+    196: { expr ::= LP nexprlist COMMA expr RP }
+       begin
+         pList_196 := sqlite3ExprListAppend(pPse,
+           PExprList(yymsp[-3].minor.yy14), PExpr(yymsp[-1].minor.yy454));
+         yymsp[-4].minor.yy454 := sqlite3PExpr(pPse, TK_VECTOR, nil, nil);
+         if yymsp[-4].minor.yy454 <> nil then begin
+           PExpr(yymsp[-4].minor.yy454)^.x.pList := pList_196;
+           if (pList_196 <> nil) and (pList_196^.nExpr > 0) then
+             PExpr(yymsp[-4].minor.yy454)^.flags :=
+               PExpr(yymsp[-4].minor.yy454)^.flags
+               or (ExprListItems(pList_196)^.pExpr^.flags and EP_Propagate);
+         end else begin
+           sqlite3ExprListDelete(pPse^.db, pList_196);
+         end;
+       end;
+    197: { expr ::= expr AND expr }
+       yymsp[-2].minor.yy454 := sqlite3ExprAnd(pPse,
+         PExpr(yymsp[-2].minor.yy454), PExpr(yymsp[0].minor.yy454));
+    198, 199: { expr ::= expr OR expr;
+                expr ::= expr LT|GT|GE|LE expr  (200..204 added in chunk 5) }
+       yymsp[-2].minor.yy454 := sqlite3PExpr(pPse,
+         i32(yymsp[-1].major), PExpr(yymsp[-2].minor.yy454),
+         PExpr(yymsp[0].minor.yy454));
   else
     { Phase 7.2e in progress: rules 50..411 not yet ported.  Until ported,
       they fall through to the goto/state-update logic below — this is
