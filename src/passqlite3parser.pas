@@ -1128,6 +1128,9 @@ const
     decide whether sqlite3ReadSchema needs to run.  Redeclared locally
     because passqlite3codegen does not yet export it. }
   DBFLAG_EncodingFixed = u32($0040);
+  { Bit positions inside TSrcItemFg.fgBits2 (sqliteInt.h SrcItem layout).      }
+  { Used by rule 115 to mark the synthesised FROM-clause subquery as nested. }
+  SRCITEM_FG2_IS_NESTED_FROM = u8($40);
 
 { ---- disableLookaside (parse.y:132) ------------------------------------- }
 { Increment Parse.disableLookaside (used by createkw to suppress lookaside  }
@@ -1348,6 +1351,48 @@ begin
   Result := pSel;
 end;
 
+{ ---- sqlite3ExprListSetSpan (expr.c:2228) ------------------------------- }
+{ Tag the most recently appended ExprList item with the literal span         }
+{ [zStart, zEnd) for AS-less aliasing.  The C export is not yet exposed by  }
+{ passqlite3codegen, so we inline a local equivalent here.  Phase 8 will   }
+{ move it to expr.c proper.                                                 }
+procedure sqlite3ExprListSetSpan(pParse: PParse; pList: PExprList;
+                                 zStart, zEnd: PAnsiChar);
+var
+  pItem: PExprListItem;
+begin
+  if pList = nil then Exit;
+  if pList^.nExpr <= 0 then Exit;
+  pItem := ExprListItems(pList);
+  Inc(pItem, pList^.nExpr - 1);
+  if pItem^.zEName = nil then begin
+    pItem^.zEName := sqlite3DbSpanDup(pParse^.db, zStart, zEnd);
+    { fg.eBits low two bits = eEName.  Clear them then OR in ENAME_SPAN. }
+    pItem^.fg.eBits := (pItem^.fg.eBits and not u8($03)) or u8(ENAME_SPAN);
+  end;
+end;
+
+{ ---- inRenameObject — local re-export (codegen has it implementation-only) }
+function inRenameObject(pPse: PParse): Boolean; inline;
+begin
+  if pPse = nil then Result := False
+  else Result := pPse^.eParseMode >= PARSE_MODE_RENAME;
+end;
+
+{ ---- sqlite3NameFromToken (build.c) ------------------------------------- }
+{ Allocate a NUL-terminated, dequoted copy of pName.  Returns nil if pName is }
+{ nil; otherwise db owns the result.  Used by rules 122 and 123 (xfullname    }
+{ ::= ... AS nm) and is destined to live in passqlite3codegen once Phase 8    }
+{ ports build.c.                                                              }
+function sqlite3NameFromToken(db: PTsqlite3; pName: PToken): PAnsiChar;
+begin
+  if pName <> nil then begin
+    Result := sqlite3DbStrNDup(db, pName^.z, u64(pName^.n));
+    sqlite3Dequote(Result);
+  end else
+    Result := nil;
+end;
+
 { ---- yy_reduce — engine framework (parse.c:3804) ------------------------ }
 { Phase 7.2d: rule-action switch is empty.  Phase 7.2e fills in cases for   }
 { rules 0..411 from parse.c:3829–5993.  The framework that runs after the  }
@@ -1372,6 +1417,18 @@ var
   pRhs_88:    PSelect;
   pFrom_88:   PSrcList;
   x_88:       TToken;
+  { Phase 7.2e.3 locals (rules 100..149). }
+  pE_103:     PExpr;
+  pRight_104: PExpr;
+  pLeft_104:  PExpr;
+  pDot_104:   PExpr;
+  pItem_109:  PSrcItem;
+  pNew_115:   PSrcItem;
+  pOld_115:   PSrcItem;
+  pSubSel_115: PSelect;
+  pLhs_115:   PSrcList;
+  pRhs_115:   PSrcList;
+  pSubquery_115: PSelect;
 begin
   yymsp := yypParser^.yytos;
   pPse  := PParse(yypParser^.pParse);
@@ -1409,9 +1466,9 @@ begin
                          yymsp[-4].minor.yy144, 0, 0, yymsp[-2].minor.yy144);
     14: { createkw ::= CREATE }
        disableLookaside(pPse);
-    15, 18, 47, 62, 72, 81, 100, 246:
+    15, 18, 47, 62, 72, 81, 246:
        { ifnotexists ::=; temp ::=; autoinc ::=; init_deferred_pred_opt ::=;
-         defer_subclause_opt ::=; ifexists ::=; distinct ::=; collate ::= }
+         defer_subclause_opt ::=; ifexists ::=; collate ::= }
        yymsp[1].minor.yy144 := 0;
     16: { ifnotexists ::= IF NOT EXISTS }
        yymsp[-2].minor.yy144 := 1;
@@ -1455,8 +1512,8 @@ begin
        end;
     25: { columnname ::= nm typetoken }
        sqlite3AddColumn(pPse, yymsp[-1].minor.yy0, yymsp[0].minor.yy0);
-    26, 65, 106:
-       { typetoken ::=;  conslist_opt ::=;  as ::= }
+    26, 65:
+       { typetoken ::=;  conslist_opt ::= }
        begin
          yymsp[1].minor.yy0.n := 0;
          yymsp[1].minor.yy0.z := nil;
@@ -1705,6 +1762,277 @@ begin
        yymsp[0].minor.yy144 := i32(SF_Distinct);
     99: { distinct ::= ALL }
        yymsp[0].minor.yy144 := i32(SF_All);
+    { ---------- Phase 7.2e.3 : rules 100..149 -------------------- }
+    100: { distinct ::= }
+       yymsp[1].minor.yy144 := 0;
+    101, 134, 144:
+       { sclp ::=;  orderby_opt ::=;  groupby_opt ::= }
+       yymsp[1].minor.yy14 := nil;
+    102: { selcollist ::= sclp scanpt expr scanpt as }
+       begin
+         yymsp[-4].minor.yy14 := sqlite3ExprListAppend(pPse,
+           PExprList(yymsp[-4].minor.yy14), PExpr(yymsp[-2].minor.yy454));
+         if yymsp[0].minor.yy0.n > 0 then
+           sqlite3ExprListSetName(pPse, PExprList(yymsp[-4].minor.yy14),
+             @yymsp[0].minor.yy0, 1);
+         sqlite3ExprListSetSpan(pPse, PExprList(yymsp[-4].minor.yy14),
+           yymsp[-3].minor.yy168, yymsp[-1].minor.yy168);
+       end;
+    103: { selcollist ::= sclp scanpt STAR }
+       begin
+         pE_103 := sqlite3Expr(pPse^.db, TK_ASTERISK, nil);
+         sqlite3ExprSetErrorOffset(pE_103,
+           i32(PtrUInt(yymsp[0].minor.yy0.z) - PtrUInt(pPse^.zTail)));
+         yymsp[-2].minor.yy14 := sqlite3ExprListAppend(pPse,
+           PExprList(yymsp[-2].minor.yy14), pE_103);
+       end;
+    104: { selcollist ::= sclp scanpt nm DOT STAR }
+       begin
+         pRight_104 := sqlite3PExpr(pPse, TK_ASTERISK, nil, nil);
+         sqlite3ExprSetErrorOffset(pRight_104,
+           i32(PtrUInt(yymsp[0].minor.yy0.z) - PtrUInt(pPse^.zTail)));
+         pLeft_104 := sqlite3ExprAlloc(pPse^.db, TK_ID,
+           @yymsp[-2].minor.yy0, 0);
+         pDot_104  := sqlite3PExpr(pPse, TK_DOT, pLeft_104, pRight_104);
+         yymsp[-4].minor.yy14 := sqlite3ExprListAppend(pPse,
+           PExprList(yymsp[-4].minor.yy14), pDot_104);
+       end;
+    105, 106, 117:
+       { as ::= AS nm;  as ::= ;  dbnm ::= DOT nm }
+       yymsp[-1].minor.yy0 := yymsp[0].minor.yy0;
+    107, 110: { from ::=;  stl_prefix ::= }
+       yymsp[1].minor.yy203 := nil;
+    108: { from ::= FROM seltablist }
+       begin
+         yymsp[-1].minor.yy203 := yymsp[0].minor.yy203;
+         sqlite3SrcListShiftJoinType(pPse, PSrcList(yymsp[-1].minor.yy203));
+       end;
+    109: { stl_prefix ::= seltablist joinop }
+       begin
+         pLhs_115 := PSrcList(yymsp[-1].minor.yy203);
+         if (pLhs_115 <> nil) and (pLhs_115^.nSrc > 0) then begin
+           pItem_109 := SrcListItems(pLhs_115);
+           Inc(pItem_109, pLhs_115^.nSrc - 1);
+           pItem_109^.fg.jointype := u8(yymsp[0].minor.yy144);
+         end;
+       end;
+    111: { seltablist ::= stl_prefix nm dbnm as on_using }
+       yymsp[-4].minor.yy203 := sqlite3SrcListAppendFromTerm(pPse,
+         PSrcList(yymsp[-4].minor.yy203),
+         @yymsp[-3].minor.yy0, @yymsp[-2].minor.yy0,
+         @yymsp[-1].minor.yy0, nil,
+         PExpr(yymsp[0].minor.yy269.pOn),
+         PIdList(yymsp[0].minor.yy269.pUsing));
+    112: { seltablist ::= stl_prefix nm dbnm as indexed_by on_using }
+       begin
+         yymsp[-5].minor.yy203 := sqlite3SrcListAppendFromTerm(pPse,
+           PSrcList(yymsp[-5].minor.yy203),
+           @yymsp[-4].minor.yy0, @yymsp[-3].minor.yy0,
+           @yymsp[-2].minor.yy0, nil,
+           PExpr(yymsp[0].minor.yy269.pOn),
+           PIdList(yymsp[0].minor.yy269.pUsing));
+         sqlite3SrcListIndexedBy(pPse, PSrcList(yymsp[-5].minor.yy203),
+           @yymsp[-1].minor.yy0);
+       end;
+    113: { seltablist ::= stl_prefix nm dbnm LP exprlist RP as on_using }
+       begin
+         yymsp[-7].minor.yy203 := sqlite3SrcListAppendFromTerm(pPse,
+           PSrcList(yymsp[-7].minor.yy203),
+           @yymsp[-6].minor.yy0, @yymsp[-5].minor.yy0,
+           @yymsp[-1].minor.yy0, nil,
+           PExpr(yymsp[0].minor.yy269.pOn),
+           PIdList(yymsp[0].minor.yy269.pUsing));
+         sqlite3SrcListFuncArgs(pPse, PSrcList(yymsp[-7].minor.yy203),
+           PExprList(yymsp[-3].minor.yy14));
+       end;
+    114: { seltablist ::= stl_prefix LP select RP as on_using }
+       yymsp[-5].minor.yy203 := sqlite3SrcListAppendFromTerm(pPse,
+         PSrcList(yymsp[-5].minor.yy203), nil, nil,
+         @yymsp[-1].minor.yy0, PSelect(yymsp[-3].minor.yy555),
+         PExpr(yymsp[0].minor.yy269.pOn),
+         PIdList(yymsp[0].minor.yy269.pUsing));
+    115: { seltablist ::= stl_prefix LP seltablist RP as on_using }
+       begin
+         pLhs_115 := PSrcList(yymsp[-5].minor.yy203);
+         pRhs_115 := PSrcList(yymsp[-3].minor.yy203);
+         if (pLhs_115 = nil) and (yymsp[-1].minor.yy0.n = 0)
+            and (yymsp[0].minor.yy269.pOn = nil)
+            and (yymsp[0].minor.yy269.pUsing = nil) then begin
+           yymsp[-5].minor.yy203 := pRhs_115;
+         end else if (pRhs_115 <> nil) and (pRhs_115^.nSrc = 1) then begin
+           yymsp[-5].minor.yy203 := sqlite3SrcListAppendFromTerm(pPse,
+             pLhs_115, nil, nil, @yymsp[-1].minor.yy0, nil,
+             PExpr(yymsp[0].minor.yy269.pOn),
+             PIdList(yymsp[0].minor.yy269.pUsing));
+           if yymsp[-5].minor.yy203 <> nil then begin
+             pNew_115 := SrcListItems(PSrcList(yymsp[-5].minor.yy203));
+             Inc(pNew_115, PSrcList(yymsp[-5].minor.yy203)^.nSrc - 1);
+             pOld_115 := SrcListItems(pRhs_115);
+             pNew_115^.zName := pOld_115^.zName;
+             if (pOld_115^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0 then
+             begin
+               pNew_115^.fg.fgBits := pNew_115^.fg.fgBits
+                 or SRCITEM_FG_IS_SUBQUERY;
+               pNew_115^.u4.pSubq  := pOld_115^.u4.pSubq;
+               pOld_115^.u4.pSubq  := nil;
+               pOld_115^.fg.fgBits := pOld_115^.fg.fgBits
+                 and not SRCITEM_FG_IS_SUBQUERY;
+               pSubSel_115 := pNew_115^.u4.pSubq^.pSelect;
+               if (pSubSel_115 <> nil) and
+                  ((pSubSel_115^.selFlags and SF_NestedFrom) <> 0) then
+                 pNew_115^.fg.fgBits2 := pNew_115^.fg.fgBits2
+                   or SRCITEM_FG2_IS_NESTED_FROM;
+             end else begin
+               pNew_115^.u4.zDatabase := pOld_115^.u4.zDatabase;
+               pOld_115^.u4.zDatabase := nil;
+             end;
+             if (pOld_115^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0 then
+             begin
+               pNew_115^.u1.pFuncArg := pOld_115^.u1.pFuncArg;
+               pOld_115^.u1.pFuncArg := nil;
+               pOld_115^.fg.fgBits   := pOld_115^.fg.fgBits
+                 and not SRCITEM_FG_IS_TABFUNC;
+               pNew_115^.fg.fgBits   := pNew_115^.fg.fgBits
+                 or SRCITEM_FG_IS_TABFUNC;
+             end;
+             pOld_115^.zName := nil;
+           end;
+           sqlite3SrcListDelete(pPse^.db, pRhs_115);
+         end else begin
+           sqlite3SrcListShiftJoinType(pPse, pRhs_115);
+           pSubquery_115 := sqlite3SelectNew(pPse, nil, pRhs_115, nil, nil,
+             nil, nil, SF_NestedFrom, nil);
+           yymsp[-5].minor.yy203 := sqlite3SrcListAppendFromTerm(pPse,
+             pLhs_115, nil, nil, @yymsp[-1].minor.yy0, pSubquery_115,
+             PExpr(yymsp[0].minor.yy269.pOn),
+             PIdList(yymsp[0].minor.yy269.pUsing));
+         end;
+       end;
+    116, 131: { dbnm ::= ;  indexed_opt ::= }
+       begin
+         yymsp[1].minor.yy0.z := nil;
+         yymsp[1].minor.yy0.n := 0;
+       end;
+    118, 120: { fullname ::= nm;  xfullname ::= nm }
+       begin
+         yylhsminor.yy203 := sqlite3SrcListAppend(pPse, nil,
+           @yymsp[0].minor.yy0, nil);
+         if InRenameObject(pPse) and (yylhsminor.yy203 <> nil) then
+           sqlite3RenameTokenMap(pPse,
+             SrcListItems(PSrcList(yylhsminor.yy203))^.zName,
+             @yymsp[0].minor.yy0);
+         yymsp[0].minor.yy203 := yylhsminor.yy203;
+       end;
+    119, 121: { fullname ::= nm DOT nm;  xfullname ::= nm DOT nm }
+       begin
+         yylhsminor.yy203 := sqlite3SrcListAppend(pPse, nil,
+           @yymsp[-2].minor.yy0, @yymsp[0].minor.yy0);
+         if InRenameObject(pPse) and (yylhsminor.yy203 <> nil) then
+           sqlite3RenameTokenMap(pPse,
+             SrcListItems(PSrcList(yylhsminor.yy203))^.zName,
+             @yymsp[0].minor.yy0);
+         yymsp[-2].minor.yy203 := yylhsminor.yy203;
+       end;
+    122: { xfullname ::= nm AS nm }
+       begin
+         yylhsminor.yy203 := sqlite3SrcListAppend(pPse, nil,
+           @yymsp[-2].minor.yy0, nil);
+         if yylhsminor.yy203 <> nil then begin
+           if InRenameObject(pPse) then
+             sqlite3RenameTokenMap(pPse,
+               SrcListItems(PSrcList(yylhsminor.yy203))^.zName,
+               @yymsp[-2].minor.yy0)
+           else
+             SrcListItems(PSrcList(yylhsminor.yy203))^.zAlias :=
+               sqlite3NameFromToken(pPse^.db, @yymsp[0].minor.yy0);
+         end;
+         yymsp[-2].minor.yy203 := yylhsminor.yy203;
+       end;
+    123: { xfullname ::= nm DOT nm AS nm }
+       begin
+         yylhsminor.yy203 := sqlite3SrcListAppend(pPse, nil,
+           @yymsp[-4].minor.yy0, @yymsp[-2].minor.yy0);
+         if yylhsminor.yy203 <> nil then begin
+           if InRenameObject(pPse) then
+             sqlite3RenameTokenMap(pPse,
+               SrcListItems(PSrcList(yylhsminor.yy203))^.zName,
+               @yymsp[-2].minor.yy0)
+           else
+             SrcListItems(PSrcList(yylhsminor.yy203))^.zAlias :=
+               sqlite3NameFromToken(pPse^.db, @yymsp[0].minor.yy0);
+         end;
+         yymsp[-4].minor.yy203 := yylhsminor.yy203;
+       end;
+    124: { joinop ::= COMMA|JOIN }
+       yymsp[0].minor.yy144 := JT_INNER;
+    125: { joinop ::= JOIN_KW JOIN }
+       yymsp[-1].minor.yy144 := sqlite3JoinType(pPse,
+         @yymsp[-1].minor.yy0, nil, nil);
+    126: { joinop ::= JOIN_KW nm JOIN }
+       yymsp[-2].minor.yy144 := sqlite3JoinType(pPse,
+         @yymsp[-2].minor.yy0, @yymsp[-1].minor.yy0, nil);
+    127: { joinop ::= JOIN_KW nm nm JOIN }
+       yymsp[-3].minor.yy144 := sqlite3JoinType(pPse,
+         @yymsp[-3].minor.yy0, @yymsp[-2].minor.yy0,
+         @yymsp[-1].minor.yy0);
+    128: { on_using ::= ON expr }
+       begin
+         yymsp[-1].minor.yy269.pOn    := PExpr(yymsp[0].minor.yy454);
+         yymsp[-1].minor.yy269.pUsing := nil;
+       end;
+    129: { on_using ::= USING LP idlist RP }
+       begin
+         yymsp[-3].minor.yy269.pOn    := nil;
+         yymsp[-3].minor.yy269.pUsing := PIdList(yymsp[-1].minor.yy132);
+       end;
+    130: { on_using ::= }
+       begin
+         yymsp[1].minor.yy269.pOn    := nil;
+         yymsp[1].minor.yy269.pUsing := nil;
+       end;
+    132: { indexed_by ::= INDEXED BY nm }
+       yymsp[-2].minor.yy0 := yymsp[0].minor.yy0;
+    133: { indexed_by ::= NOT INDEXED }
+       begin
+         yymsp[-1].minor.yy0.z := nil;
+         yymsp[-1].minor.yy0.n := 1;
+       end;
+    135, 145: { orderby_opt ::= ORDER BY sortlist;
+                groupby_opt ::= GROUP BY nexprlist }
+       yymsp[-2].minor.yy14 := yymsp[0].minor.yy14;
+    136: { sortlist ::= sortlist COMMA expr sortorder nulls }
+       begin
+         yymsp[-4].minor.yy14 := sqlite3ExprListAppend(pPse,
+           PExprList(yymsp[-4].minor.yy14), PExpr(yymsp[-2].minor.yy454));
+         sqlite3ExprListSetSortOrder(PExprList(yymsp[-4].minor.yy14),
+           yymsp[-1].minor.yy144, yymsp[0].minor.yy144);
+       end;
+    137: { sortlist ::= expr sortorder nulls }
+       begin
+         yymsp[-2].minor.yy14 := sqlite3ExprListAppend(pPse, nil,
+           PExpr(yymsp[-2].minor.yy454));
+         sqlite3ExprListSetSortOrder(PExprList(yymsp[-2].minor.yy14),
+           yymsp[-1].minor.yy144, yymsp[0].minor.yy144);
+       end;
+    138: { sortorder ::= ASC }
+       yymsp[0].minor.yy144 := SQLITE_SO_ASC;
+    139: { sortorder ::= DESC }
+       yymsp[0].minor.yy144 := SQLITE_SO_DESC;
+    140, 143: { sortorder ::= ;  nulls ::= }
+       yymsp[1].minor.yy144 := SQLITE_SO_UNDEFINED;
+    141: { nulls ::= NULLS FIRST }
+       yymsp[-1].minor.yy144 := SQLITE_SO_ASC;
+    142: { nulls ::= NULLS LAST }
+       yymsp[-1].minor.yy144 := SQLITE_SO_DESC;
+    146: { having_opt ::= }
+       yymsp[1].minor.yy454 := nil;
+    147: { having_opt ::= HAVING expr }
+       yymsp[-1].minor.yy454 := yymsp[0].minor.yy454;
+    148: { limit_opt ::= }
+       yymsp[1].minor.yy454 := nil;
+    149: { limit_opt ::= LIMIT expr }
+       yymsp[-1].minor.yy454 := sqlite3PExpr(pPse, TK_LIMIT,
+         PExpr(yymsp[0].minor.yy454), nil);
   else
     { Phase 7.2e in progress: rules 50..411 not yet ported.  Until ported,
       they fall through to the goto/state-update logic below — this is

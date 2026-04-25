@@ -2042,10 +2042,58 @@ statement is syntactically complete — used by the CLI and REPLs).
         to `yy_reduce`'s var block.  As more chunks land, additional
         locals will accumulate there (one-off scratch space per rule
         family); accept that var block growth as a normal porting cost.
-    - [ ] **7.2e.3** Rules 100..149 — SELECT core (selectnowith, oneselect,
+    - [X] **7.2e.3** Rules 100..149 — SELECT core (selectnowith, oneselect,
       values, distinct, sclp, selcollist, FROM/USING/ON, JOIN, jointype,
       indexed_opt, on_using, where_opt, groupby_opt, having_opt, orderby_opt,
-      sortlist, nulls, limit_opt).
+      sortlist, nulls, limit_opt).  DONE 2026-04-25.
+
+      Notes for next chunks:
+      * **`sqlite3NameFromToken`** (build.c) and **`sqlite3ExprListSetSpan`**
+        (expr.c:2228) were not yet exported by `passqlite3codegen` /
+        equivalent.  Both are now ported as nested helpers in
+        `passqlite3parser.pas` directly above `yy_reduce`.  When Phase 8
+        ports `build.c` and the expression helpers, move them to the
+        proper unit and remove the local copies.
+      * **`InRenameObject`** is defined in `passqlite3codegen` but only in
+        the implementation block — it is not exported via the interface.
+        For now, `passqlite3parser` defines a local `inRenameObject` clone
+        (case-insensitive, but Pascal will resolve to the local one inside
+        this unit).  Either add a forward declaration in the codegen
+        interface, or keep the duplicate; both are acceptable.
+      * **SrcItem flag bits in `fgBits2`** — sqliteInt.h enumerates
+        fromDDL(0), isCte(1), notCte(2), isUsing(3), isOn(4), isSynthUsing(5),
+        **isNestedFrom(6)**, rowidUsed(7).  A new constant
+        `SRCITEM_FG2_IS_NESTED_FROM = $40` was added to
+        `passqlite3parser`'s local const block; existing `passqlite3codegen`
+        uses raw `$08` / `$10` literals for `isUsing` / `isOn` (with
+        comments).  Note: codegen.pas line 4243 has a stale comment that
+        reads "isNestedFrom" but tests `fgBits and $08` — that is actually
+        `isTabFunc`.  Pre-existing tech debt; flagged here so it can be
+        reviewed during Phase 8 audit but **not** changed in this chunk
+        (out of scope).
+      * **`yy454` is `Pointer`** in our `YYMINORTYPE` (line 314).  Direct
+        assignment from a `PExpr` works without explicit cast; do *not*
+        wrap calls in `PtrInt(...)`.  Same for `yy14` (`PExprList`) and
+        `yy203` (`PSrcList`).
+      * **Rule 109 / 115 access `pSrcList^.a[N-1]`** in C.  Our `TSrcList`
+        is the 8-byte header only; items live just past it via the
+        existing `SrcListItems(p)` accessor.  Walk to entry N-1 with
+        `pItem := SrcListItems(p); Inc(pItem, p^.nSrc - 1);`.
+      * **Rule 115's `if (rhs->nSrc==1)` branch** is the trickiest: it
+        moves the single source item from a temporary SrcList into the
+        new term, transferring ownership of `u4.pSubq`,
+        `u4.zDatabase`, `u1.pFuncArg`, and `zName`.  The flag bits live
+        in `fgBits` (SRCITEM_FG_IS_SUBQUERY/IS_TABFUNC) and `fgBits2`
+        (SRCITEM_FG2_IS_NESTED_FROM).  Be careful that the *new* item's
+        flags are accumulated AFTER `sqlite3SrcListAppendFromTerm` adds
+        the entry: that function may zero `fg`.  Manual verification of
+        both `fgBits` and `fgBits2` ORs against an oracle run is on the
+        agenda for Phase 7.4 once `sqlite3RunParser` is wired up.
+      * Rules 146/147/148 are `having_opt`/`limit_opt` only for now;
+        chunks 7.2e.4/7.2e.5 will share the same body via merged case
+        labels (153/155/232/233/252 join 146; 154/156/231/251 join 147).
+        Either re-merge the labels at that time or keep as duplicate
+        bodies — pick the cleaner one.
     - [ ] **7.2e.4** Rules 150..199 — DML: DELETE, UPDATE, INSERT/REPLACE,
       upsert, returning, RAISE, conflict, idlist, insert_cmd, expr_or_select.
     - [ ] **7.2e.5** Rules 200..249 — expressions: expr/term, literals,
