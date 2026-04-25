@@ -352,6 +352,8 @@ function  sqlite3_complete(zSql: PAnsiChar): i32;
 
 implementation
 
+{$INCLUDE passqlite3parsertables.inc}
+
 { =========================================================================== }
 { Character-class table for the tokenizer switch  (tokenize.c lines 29–100)  }
 { =========================================================================== }

@@ -1922,13 +1922,22 @@ statement is syntactically complete — used by the CLI and REPLs).
     Reference: `../sqlite3/parse.c` lines 305–625 (token codes, control
     defines, YYMINORTYPE union) and lines 1589–1630 (parser structs).
 
-  - [ ] **7.2b** Port the action / lookahead / shift-offset / reduce-offset
+  - [X] **7.2b** Port the action / lookahead / shift-offset / reduce-offset
     / default tables (`yy_action`, `yy_lookahead`, `yy_shift_ofst`,
     `yy_reduce_ofst`, `yy_default`) verbatim from `parse.c` lines 706–1380.
-    These are large `const` arrays (~700 lines, ~2500 entries each) that
-    encode the LALR state machine. They translate mechanically: each row
-    becomes a Pascal array literal element. Verify YY_NLOOKAHEAD compiles to
-    the same value as in C.
+    Tables live in `src/passqlite3parsertables.inc` (689 lines, included
+    from `passqlite3parser.pas` at the top of the implementation section).
+    Sizes verified by entry count:
+      * `yy_action[2379]`     (YY_ACTTAB_COUNT  = 2379)
+      * `yy_lookahead[2566]`  (YY_NLOOKAHEAD    = 2566)
+      * `yy_shift_ofst[600]`  (YY_SHIFT_COUNT   = 599, +1)
+      * `yy_reduce_ofst[424]` (YY_REDUCE_COUNT  = 423, +1)
+      * `yy_default[600]`     (YYNSTATE         = 600)
+    Generation was mechanical: `/*` → `{`, `*/` → `}`, `{` → `(` for the
+    array literal, `};` → `);`, trailing comma stripped (FPC rejects).
+    YY_NLOOKAHEAD constant (2566) matches the C source verbatim.
+    Tokenizer gate test still PASS (127/127 — tables unused so far,
+    serves as a regression check that the unit still compiles).
 
   - [ ] **7.2c** Port the fallback table (`yyFallback`, parse.c lines
     1398–1588) and the rule-info tables (`yyRuleInfoLhs`, `yyRuleInfoNRhs`,
