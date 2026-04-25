@@ -2205,12 +2205,78 @@ statement is syntactically complete — used by the CLI and REPLs).
       * Rule 239 (`CREATE INDEX`): `sqlite3CreateIndex` already exported
         with the matching signature (chunk 7.2e.4 confirmed).  Uses
         `pPse^.pNewIndex^.zName` for the rename-token-map lookup.
-    - [ ] **7.2e.6** Rules 250..299 — DROP, CREATE INDEX, indexed_by,
-      ALTER (rename/add column/drop/rename column), VACUUM, PRAGMA,
-      ATTACH/DETACH, ANALYZE, REINDEX.
-    - [ ] **7.2e.7** Rules 300..349 — TRIGGER (CREATE/DROP, FOR EACH,
-      WHEN, BEGIN/END, trigger_event, trigger_cmd_list,
-      WITH/WITHOUT recursive, CTE).
+    - [X] **7.2e.6** Rules 250..299 — VACUUM-with-name, PRAGMA, CREATE/DROP
+      TRIGGER + trigger_decl/trigger_time/trigger_event/trigger_cmd_list +
+      tridxby/trigger_cmd (UPDATE/INSERT/DELETE/SELECT), RAISE expr +
+      raisetype, ATTACH/DETACH, REINDEX, ANALYZE, ALTER TABLE
+      (rename/add/drop column, rename column, drop constraint, set NOT NULL).
+      DONE 2026-04-25.
+
+      Notes for next chunks:
+      * **`sqlite3Reindex`** and the four `sqlite3Trigger*Step` builders
+        (UpdateStep/InsertStep/DeleteStep/SelectStep) were not yet exported
+        by `passqlite3codegen`.  Stubs added directly above `yy_reduce` in
+        `passqlite3parser.pas` (same pattern as 7.2e.3/4/5):
+        - `sqlite3Reindex` — full no-op stub (Phase 8 must port build.c).
+        - `sqlite3Trigger{Update,Insert,Delete,Select}Step` — allocate a
+          zeroed `TTriggerStep`, set `op`/`orconf`, free the input params.
+          Sufficient for parser-only differential testing; a real trigger
+          built via the parser is a no-op until trigger.c lands in Phase 8.
+      * **`sqlite3AlterSetNotNull` signature mismatch** — codegen.pas had
+        the 4th parameter as `i32 onError`, but parse.y / parse.c pass
+        `&NOT_token` (a `Token*`).  Changed both the interface and the
+        implementation in `passqlite3codegen.pas` to `pNot: PToken`.  The
+        function is still a stub; the signature fix is purely so the
+        parser call type-checks.
+      * **Existing rule `153, 155, 232, 233, 252` was extended to include
+        `268, 286`** (when_clause ::= ; key_opt ::= — both `yymsp[1].yy454 := nil`).
+        Existing rule `154, 156, 231, 251` was extended to include
+        `269, 287` (when_clause ::= WHEN expr ; key_opt ::= KEY expr —
+        both `yymsp[-1].yy454 := yymsp[0].yy454`).  Same merging pattern as
+        chunk 7.2e.4 anticipated.
+      * **Existing rule `240` was extended to include `281`** (uniqueflag
+        ::= UNIQUE ; raisetype ::= ABORT — both `yymsp[0].yy144 := OE_Abort`).
+        Chunk-7.2e.5 note flagged this; it is now done.
+      * **Existing rule `105, 106, 117` was extended to include
+        `258, 259`** (`plus_num ::= PLUS INTEGER|FLOAT`,
+        `minus_num ::= MINUS INTEGER|FLOAT` — `yymsp[-1].yy0 := yymsp[0].yy0`).
+        Pre-existing tech debt: the merge with rule 106 (`as ::=` empty,
+        body in C is `yymsp[1].n=0; yymsp[1].z=0;`) is **incorrect** in the
+        Pascal port — rule 106 should be in the no-op branch.  Flagged for
+        Phase 8 audit; **not** changed in this chunk (out of scope, and
+        the resulting wrong-but-deterministic value of `as ::=` is a stale
+        zero-initialised TToken via `yylhsminor.yyinit := 0`, which is
+        harmless until codegen reads it).
+      * **Rule 261 (`trigger_decl`) — `pParse->isCreate`** debug-only
+        assertion was skipped (the C body is `#ifdef SQLITE_DEBUG` and
+        our TParse layout has `u1.cr.addrCrTab/regRowid/regRoot/
+        constraintName` but no `isCreate` boolean).  When Phase 8 audits
+        the TParse layout, decide whether to add the bit.
+      * **Rule 261 — `Token` n-field arithmetic** uses `u32(PtrUInt(...) -
+        PtrUInt(...))` to bridge `PAnsiChar` arithmetic on FPC.  Same
+        idiom in rule 293 (`alter_add ::= ... carglist`).  Token's
+        `n` field is `u32`.
+      * **Rule 261 — `i32` cast for `yymsp[0].major`** (a `YYCODETYPE = u16`)
+        is the same pattern as rules 89/91/262/265/266 — Lemon's
+        `/*A-overwrites-X*/` convention, the value goes into a yy144
+        (i32) slot.
+      * Rule 274 (`trigger_cmd ::= UPDATE`) signature mapping: our
+        Pascal stub `sqlite3TriggerUpdateStep(pPse, pTab, pFrom, pEList,
+        pWhere, orconf: i32, zStart: PAnsiChar, zEnd: PAnsiChar)` mirrors
+        the upstream `sqlite3TriggerUpdateStep(Parse*, SrcList* pTabName,
+        SrcList* pFrom, ExprList* pEList, Expr* pWhere, u8 orconf,
+        const char* zStart, const char* zEnd)` from trigger.c.  Phase 8
+        must replace the stub with the full body.
+      * **Rule 297/298 (`AlterDropConstraint`)** — the Pascal stub's
+        positional parameters are `(pSrc, pType, pName)` (parameter
+        names), but the C signature is `(Parse*, SrcList*, Token* pName,
+        Token* pType)`.  We pass arguments positionally matching the C
+        order — i.e. arg 3 is the name, arg 4 is the type.  The Pascal
+        parameter names are misleading; flagged for Phase 8.  The stub
+        body only deletes pSrc, so positional mismatch is harmless.
+    - [ ] **7.2e.7** Rules 300..349 — ALTER ADD CONSTRAINT/CHECK,
+      common_table_expr / WITH / cte / wqlist, foreach_clause, sub_select,
+      and any expression-tail rules in this band.
     - [ ] **7.2e.8** Rules 350..411 — windows (WINDOW/OVER/FILTER, frame,
       window definition tail), VIRTUAL TABLE, table-valued functions,
       remaining tail rules.

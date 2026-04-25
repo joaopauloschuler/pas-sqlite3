@@ -2145,7 +2145,7 @@ procedure sqlite3AlterDropColumn(pParse: PParse; pSrc: PSrcList;
 procedure sqlite3AlterDropConstraint(pParse: PParse; pSrc: PSrcList;
   pType: PToken; pName: PToken);
 procedure sqlite3AlterSetNotNull(pParse: PParse; pSrc: PSrcList;
-  pName: PToken; onError: i32);
+  pName: PToken; pNot: PToken);
 procedure sqlite3AlterAddConstraint(pParse: PParse; pSrc: PSrcList;
   pType: PToken);
 procedure sqlite3AlterFunctions;
@@ -6479,7 +6479,7 @@ begin
 end;
 
 procedure sqlite3AlterSetNotNull(pParse: PParse; pSrc: PSrcList;
-  pName: PToken; onError: i32);
+  pName: PToken; pNot: PToken);
 begin
   sqlite3SrcListDelete(pParse^.db, pSrc);
 end;

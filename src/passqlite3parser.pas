@@ -1641,6 +1641,80 @@ begin
   Result := pRet;
 end;
 
+{ ---- sqlite3Reindex (analyze.c / build.c) -------------------------------- }
+{ Phase 7.2e.6 stub.  The full body lives in build.c (REINDEX statement      }
+{ codegen).  Until Phase 8 ports build.c's reindex helper, this is a no-op   }
+{ — sufficient for parser-only differential testing, since the gate test    }
+{ does not yet execute REINDEX statements end-to-end.                        }
+procedure sqlite3Reindex(pPse: PParse; pName1: PToken; pName2: PToken);
+begin
+  { TODO Phase 8: port build.c reindex codegen. }
+end;
+
+{ ---- sqlite3TriggerUpdateStep / InsertStep / DeleteStep / SelectStep ----- }
+{ Phase 7.2e.6 stubs.  These live in trigger.c.  Until Phase 8 ports        }
+{ trigger.c's step-builders, the stubs allocate a TTriggerStep and return  }
+{ it so that the parser can chain steps via pNext/pLast (rules 270/271).   }
+{ The structural fields used by trigger.c's codegen (pSelect, pIdList, ...)}
+{ are zeroed — running a trigger built via the parser will be a no-op until }
+{ the real builders land.                                                     }
+function sqlite3TriggerUpdateStep(pPse: PParse; pTableName: PSrcList;
+                                  pFrom: PSrcList; pEList: PExprList;
+                                  pWhere: PExpr; orconf: i32;
+                                  zStart: PAnsiChar;
+                                  zEnd: PAnsiChar): PTriggerStep;
+begin
+  Result := PTriggerStep(sqlite3DbMallocZero(pPse^.db, SizeOf(TTriggerStep)));
+  if Result <> nil then begin
+    Result^.op := TK_UPDATE;
+    Result^.orconf := u8(orconf);
+  end;
+  sqlite3SrcListDelete(pPse^.db, pTableName);
+  sqlite3SrcListDelete(pPse^.db, pFrom);
+  sqlite3ExprListDelete(pPse^.db, pEList);
+  sqlite3ExprDelete(pPse^.db, pWhere);
+end;
+
+function sqlite3TriggerInsertStep(pPse: PParse; pTableName: PSrcList;
+                                  pColumn: PIdList; pSelect: PSelect;
+                                  orconf: i32; pUpsert: PUpsert;
+                                  zStart: PAnsiChar;
+                                  zEnd: PAnsiChar): PTriggerStep;
+begin
+  Result := PTriggerStep(sqlite3DbMallocZero(pPse^.db, SizeOf(TTriggerStep)));
+  if Result <> nil then begin
+    Result^.op := TK_INSERT;
+    Result^.orconf := u8(orconf);
+  end;
+  sqlite3SrcListDelete(pPse^.db, pTableName);
+  sqlite3IdListDelete(pPse^.db, pColumn);
+  sqlite3SelectDelete(pPse^.db, pSelect);
+  sqlite3UpsertDelete(pPse^.db, pUpsert);
+end;
+
+function sqlite3TriggerDeleteStep(pPse: PParse; pTableName: PSrcList;
+                                  pWhere: PExpr; zStart: PAnsiChar;
+                                  zEnd: PAnsiChar): PTriggerStep;
+begin
+  Result := PTriggerStep(sqlite3DbMallocZero(pPse^.db, SizeOf(TTriggerStep)));
+  if Result <> nil then begin
+    Result^.op := TK_DELETE;
+  end;
+  sqlite3SrcListDelete(pPse^.db, pTableName);
+  sqlite3ExprDelete(pPse^.db, pWhere);
+end;
+
+function sqlite3TriggerSelectStep(db: PTsqlite3; pSelect: PSelect;
+                                  zStart: PAnsiChar;
+                                  zEnd: PAnsiChar): PTriggerStep;
+begin
+  Result := PTriggerStep(sqlite3DbMallocZero(db, SizeOf(TTriggerStep)));
+  if Result <> nil then begin
+    Result^.op := TK_SELECT;
+  end;
+  sqlite3SelectDelete(db, pSelect);
+end;
+
 { ---- yy_reduce — engine framework (parse.c:3804) ------------------------ }
 { Phase 7.2d: rule-action switch is empty.  Phase 7.2e fills in cases for   }
 { rules 0..411 from parse.c:3829–5993.  The framework that runs after the  }
@@ -1702,6 +1776,10 @@ var
   pSelectRhs_223: PSelect;
   pSrc_226:    PSrcList;
   pSelect_226: PSelect;
+  { Phase 7.2e.6 locals (rules 250..299). }
+  all_260:     TToken;
+  pE_278:      PExpr;
+  pE_279:      PExpr;
 begin
   yymsp := yypParser^.yytos;
   pPse  := PParse(yypParser^.pParse);
@@ -2071,8 +2149,10 @@ begin
          yymsp[-4].minor.yy14 := sqlite3ExprListAppend(pPse,
            PExprList(yymsp[-4].minor.yy14), pDot_104);
        end;
-    105, 106, 117:
-       { as ::= AS nm;  as ::= ;  dbnm ::= DOT nm }
+    105, 106, 117, 258, 259:
+       { as ::= AS nm;  as ::= ;  dbnm ::= DOT nm;
+         plus_num ::= PLUS INTEGER|FLOAT;
+         minus_num ::= MINUS INTEGER|FLOAT }
        yymsp[-1].minor.yy0 := yymsp[0].minor.yy0;
     107, 110: { from ::=;  stl_prefix ::= }
        yymsp[1].minor.yy203 := nil;
@@ -2321,13 +2401,14 @@ begin
          sqlite3DeleteFrom(pPse, PSrcList(yymsp[-2].minor.yy203),
            PExpr(yymsp[0].minor.yy454), nil, nil);
        end;
-    153, 155, 232, 233, 252:
+    153, 155, 232, 233, 252, 268, 286:
        { where_opt ::=;  where_opt_ret ::=;  case_else ::=;
-         case_operand ::=;  vinto ::= }
+         case_operand ::=;  vinto ::=;  when_clause ::=;  key_opt ::= }
        yymsp[1].minor.yy454 := nil;
-    154, 156, 231, 251:
+    154, 156, 231, 251, 269, 287:
        { where_opt ::= WHERE expr;  where_opt_ret ::= WHERE expr;
-         case_else ::= ELSE expr;  vinto ::= INTO expr }
+         case_else ::= ELSE expr;  vinto ::= INTO expr;
+         when_clause ::= WHEN expr;  key_opt ::= KEY expr }
        yymsp[-1].minor.yy454 := yymsp[0].minor.yy454;
     157: { where_opt_ret ::= RETURNING selcollist }
        begin
@@ -2853,7 +2934,7 @@ begin
            sqlite3RenameTokenMap(pPse, pPse^.pNewIndex^.zName,
              @yymsp[-4].minor.yy0);
        end;
-    240: { uniqueflag ::= UNIQUE }
+    240, 281: { uniqueflag ::= UNIQUE;  raisetype ::= ABORT }
        yymsp[0].minor.yy144 := OE_Abort;
     241: { uniqueflag ::= }
        yymsp[1].minor.yy144 := OE_None;
@@ -2870,6 +2951,187 @@ begin
          yymsp[-1].minor.yy144);
     249: { cmd ::= VACUUM vinto }
        sqlite3Vacuum(pPse, nil, PExpr(yymsp[0].minor.yy454));
+    { ---------- Phase 7.2e.6 : rules 250..299 -------------------- }
+    250: { cmd ::= VACUUM nm vinto }
+       sqlite3Vacuum(pPse, @yymsp[-1].minor.yy0, PExpr(yymsp[0].minor.yy454));
+    253: { cmd ::= PRAGMA nm dbnm }
+       sqlite3Pragma(pPse, @yymsp[-1].minor.yy0, @yymsp[0].minor.yy0, nil, 0);
+    254: { cmd ::= PRAGMA nm dbnm EQ nmnum }
+       sqlite3Pragma(pPse, @yymsp[-3].minor.yy0, @yymsp[-2].minor.yy0,
+         @yymsp[0].minor.yy0, 0);
+    255: { cmd ::= PRAGMA nm dbnm LP nmnum RP }
+       sqlite3Pragma(pPse, @yymsp[-4].minor.yy0, @yymsp[-3].minor.yy0,
+         @yymsp[-1].minor.yy0, 0);
+    256: { cmd ::= PRAGMA nm dbnm EQ minus_num }
+       sqlite3Pragma(pPse, @yymsp[-3].minor.yy0, @yymsp[-2].minor.yy0,
+         @yymsp[0].minor.yy0, 1);
+    257: { cmd ::= PRAGMA nm dbnm LP minus_num RP }
+       sqlite3Pragma(pPse, @yymsp[-4].minor.yy0, @yymsp[-3].minor.yy0,
+         @yymsp[-1].minor.yy0, 1);
+    260: { cmd ::= createkw trigger_decl BEGIN trigger_cmd_list END }
+       begin
+         all_260.z := yymsp[-3].minor.yy0.z;
+         all_260.n := u32(PtrUInt(yymsp[0].minor.yy0.z) -
+                          PtrUInt(yymsp[-3].minor.yy0.z)) + yymsp[0].minor.yy0.n;
+         all_260._pad := 0;
+         sqlite3FinishTrigger(pPse, PTriggerStep(yymsp[-1].minor.yy427), @all_260);
+       end;
+    261: { trigger_decl ::= temp TRIGGER ifnotexists nm dbnm trigger_time
+            trigger_event ON fullname foreach_clause when_clause }
+       begin
+         sqlite3BeginTrigger(pPse, @yymsp[-7].minor.yy0, @yymsp[-6].minor.yy0,
+           yymsp[-5].minor.yy144, yymsp[-4].minor.yy286.a,
+           PIdList(yymsp[-4].minor.yy286.b), PSrcList(yymsp[-2].minor.yy203),
+           PExpr(yymsp[0].minor.yy454),
+           yymsp[-10].minor.yy144, yymsp[-8].minor.yy144);
+         if yymsp[-6].minor.yy0.n = 0 then
+           yymsp[-10].minor.yy0 := yymsp[-7].minor.yy0
+         else
+           yymsp[-10].minor.yy0 := yymsp[-6].minor.yy0;
+         { /* A-overwrites-T */ }
+       end;
+    262: { trigger_time ::= BEFORE|AFTER }
+       yymsp[0].minor.yy144 := i32(yymsp[0].major); { /* A-overwrites-X */ }
+    263: { trigger_time ::= INSTEAD OF }
+       yymsp[-1].minor.yy144 := TK_INSTEAD;
+    264: { trigger_time ::= }
+       yymsp[1].minor.yy144 := TK_BEFORE;
+    265, 266: { trigger_event ::= DELETE|INSERT;  trigger_event ::= UPDATE }
+       begin
+         yymsp[0].minor.yy286.a := i32(yymsp[0].major); { /* A-overwrites-X */ }
+         yymsp[0].minor.yy286.b := nil;
+       end;
+    267: { trigger_event ::= UPDATE OF idlist }
+       begin
+         yymsp[-2].minor.yy286.a := TK_UPDATE;
+         yymsp[-2].minor.yy286.b := yymsp[0].minor.yy132;
+       end;
+    270: { trigger_cmd_list ::= trigger_cmd_list trigger_cmd SEMI }
+       begin
+         PTriggerStep(yymsp[-2].minor.yy427)^.pLast^.pNext :=
+           PTriggerStep(yymsp[-1].minor.yy427);
+         PTriggerStep(yymsp[-2].minor.yy427)^.pLast :=
+           PTriggerStep(yymsp[-1].minor.yy427);
+       end;
+    271: { trigger_cmd_list ::= trigger_cmd SEMI }
+       PTriggerStep(yymsp[-1].minor.yy427)^.pLast :=
+         PTriggerStep(yymsp[-1].minor.yy427);
+    272: { tridxby ::= INDEXED BY nm }
+       sqlite3ErrorMsg(pPse,
+         'the INDEXED BY clause is not allowed on UPDATE or DELETE statements within triggers');
+    273: { tridxby ::= NOT INDEXED }
+       sqlite3ErrorMsg(pPse,
+         'the NOT INDEXED clause is not allowed on UPDATE or DELETE statements within triggers');
+    274: { trigger_cmd ::= UPDATE orconf xfullname tridxby SET setlist from
+            where_opt scanpt }
+       begin
+         yylhsminor.yy427 := sqlite3TriggerUpdateStep(pPse,
+           PSrcList(yymsp[-6].minor.yy203),
+           PSrcList(yymsp[-2].minor.yy203),
+           PExprList(yymsp[-3].minor.yy14),
+           PExpr(yymsp[-1].minor.yy454),
+           yymsp[-7].minor.yy144,
+           yymsp[-8].minor.yy0.z,
+           yymsp[0].minor.yy168);
+         yymsp[-8].minor.yy427 := yylhsminor.yy427;
+       end;
+    275: { trigger_cmd ::= scanpt insert_cmd INTO xfullname idlist_opt select
+            upsert scanpt }
+       begin
+         yylhsminor.yy427 := sqlite3TriggerInsertStep(pPse,
+           PSrcList(yymsp[-4].minor.yy203),
+           PIdList(yymsp[-3].minor.yy132),
+           PSelect(yymsp[-2].minor.yy555),
+           yymsp[-6].minor.yy144,
+           PUpsert(yymsp[-1].minor.yy122),
+           yymsp[-7].minor.yy168,
+           yymsp[0].minor.yy168);
+         yymsp[-7].minor.yy427 := yylhsminor.yy427;
+       end;
+    276: { trigger_cmd ::= DELETE FROM xfullname tridxby where_opt scanpt }
+       begin
+         yylhsminor.yy427 := sqlite3TriggerDeleteStep(pPse,
+           PSrcList(yymsp[-3].minor.yy203),
+           PExpr(yymsp[-1].minor.yy454),
+           yymsp[-5].minor.yy0.z,
+           yymsp[0].minor.yy168);
+         yymsp[-5].minor.yy427 := yylhsminor.yy427;
+       end;
+    277: { trigger_cmd ::= scanpt select scanpt }
+       begin
+         yylhsminor.yy427 := sqlite3TriggerSelectStep(pPse^.db,
+           PSelect(yymsp[-1].minor.yy555),
+           yymsp[-2].minor.yy168,
+           yymsp[0].minor.yy168);
+         yymsp[-2].minor.yy427 := yylhsminor.yy427;
+       end;
+    278: { expr ::= RAISE LP IGNORE RP }
+       begin
+         pE_278 := sqlite3PExpr(pPse, TK_RAISE, nil, nil);
+         yymsp[-3].minor.yy454 := pE_278;
+         if pE_278 <> nil then
+           pE_278^.affExpr := AnsiChar(OE_Ignore);
+       end;
+    279: { expr ::= RAISE LP raisetype COMMA expr RP }
+       begin
+         pE_279 := sqlite3PExpr(pPse, TK_RAISE,
+           PExpr(yymsp[-1].minor.yy454), nil);
+         yymsp[-5].minor.yy454 := pE_279;
+         if pE_279 <> nil then
+           pE_279^.affExpr := AnsiChar(yymsp[-3].minor.yy144);
+       end;
+    280: { raisetype ::= ROLLBACK }
+       yymsp[0].minor.yy144 := OE_Rollback;
+    282: { raisetype ::= FAIL }
+       yymsp[0].minor.yy144 := OE_Fail;
+    283: { cmd ::= DROP TRIGGER ifexists fullname }
+       sqlite3DropTrigger(pPse, PSrcList(yymsp[0].minor.yy203),
+         yymsp[-1].minor.yy144);
+    284: { cmd ::= ATTACH database_kw_opt expr AS expr key_opt }
+       sqlite3Attach(pPse, PExpr(yymsp[-3].minor.yy454),
+         PExpr(yymsp[-1].minor.yy454), PExpr(yymsp[0].minor.yy454));
+    285: { cmd ::= DETACH database_kw_opt expr }
+       sqlite3Detach(pPse, PExpr(yymsp[0].minor.yy454));
+    288: { cmd ::= REINDEX }
+       sqlite3Reindex(pPse, nil, nil);
+    289: { cmd ::= REINDEX nm dbnm }
+       sqlite3Reindex(pPse, @yymsp[-1].minor.yy0, @yymsp[0].minor.yy0);
+    290: { cmd ::= ANALYZE }
+       sqlite3Analyze(pPse, nil, nil);
+    291: { cmd ::= ANALYZE nm dbnm }
+       sqlite3Analyze(pPse, @yymsp[-1].minor.yy0, @yymsp[0].minor.yy0);
+    292: { cmd ::= ALTER TABLE fullname RENAME TO nm }
+       sqlite3AlterRenameTable(pPse, PSrcList(yymsp[-3].minor.yy203),
+         @yymsp[0].minor.yy0);
+    293: { cmd ::= alter_add carglist }
+       begin
+         yymsp[-1].minor.yy0.n :=
+           u32(PtrUInt(pPse^.sLastToken.z) - PtrUInt(yymsp[-1].minor.yy0.z))
+           + pPse^.sLastToken.n;
+         sqlite3AlterFinishAddColumn(pPse, @yymsp[-1].minor.yy0);
+       end;
+    294: { alter_add ::= ALTER TABLE fullname ADD kwcolumn_opt nm typetoken }
+       begin
+         disableLookaside(pPse);
+         sqlite3AlterBeginAddColumn(pPse, PSrcList(yymsp[-4].minor.yy203));
+         sqlite3AddColumn(pPse, yymsp[-1].minor.yy0, yymsp[0].minor.yy0);
+         yymsp[-6].minor.yy0 := yymsp[-1].minor.yy0;
+       end;
+    295: { cmd ::= ALTER TABLE fullname DROP kwcolumn_opt nm }
+       sqlite3AlterDropColumn(pPse, PSrcList(yymsp[-3].minor.yy203),
+         @yymsp[0].minor.yy0);
+    296: { cmd ::= ALTER TABLE fullname RENAME kwcolumn_opt nm TO nm }
+       sqlite3AlterRenameColumn(pPse, PSrcList(yymsp[-5].minor.yy203),
+         @yymsp[-2].minor.yy0, @yymsp[0].minor.yy0);
+    297: { cmd ::= ALTER TABLE fullname DROP CONSTRAINT nm }
+       sqlite3AlterDropConstraint(pPse, PSrcList(yymsp[-3].minor.yy203),
+         @yymsp[0].minor.yy0, nil);
+    298: { cmd ::= ALTER TABLE fullname ALTER kwcolumn_opt nm DROP NOT NULL }
+       sqlite3AlterDropConstraint(pPse, PSrcList(yymsp[-6].minor.yy203),
+         nil, @yymsp[-3].minor.yy0);
+    299: { cmd ::= ALTER TABLE fullname ALTER kwcolumn_opt nm SET NOT NULL onconf }
+       sqlite3AlterSetNotNull(pPse, PSrcList(yymsp[-7].minor.yy203),
+         @yymsp[-4].minor.yy0, @yymsp[-2].minor.yy0);
   else
     { Phase 7.2e in progress: rules 50..411 not yet ported.  Until ported,
       they fall through to the goto/state-update logic below — this is
