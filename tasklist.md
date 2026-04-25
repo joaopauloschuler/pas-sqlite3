@@ -1509,11 +1509,30 @@ reference exactly.
   calls into it: `expr.c`, `resolve.c`, `walker.c`, `treeview.c`.
 
   **walker.c — DONE (2026-04-25)**: Ported to `passqlite3codegen.pas`.
-  All 12 walker functions implemented (sqlite3WalkExprNN, sqlite3WalkExpr,
-  sqlite3WalkExprList, sqlite3WalkSelectExpr, sqlite3WalkSelectFrom,
-  sqlite3WalkSelect, sqlite3WalkWinDefnDummyCallback,
-  sqlite3WalkerDepthIncrease/Decrease, sqlite3ExprWalkNoop,
-  sqlite3SelectWalkNoop, sqlite3SelectPopWith stub).
+  All 12 walker functions implemented. Gate: `TestWalker.pas` — 40 tests, all PASS.
+
+  **expr.c / treeview.c / resolve.c — DONE (2026-04-25)**:
+  Ported to `passqlite3codegen.pas` (~2600 lines total).
+  - `treeview.c`: 4 no-op stubs (debug-only, SQLITE_DEBUG not enabled in production).
+  - `expr.c`: Full port — allocation (sqlite3ExprAlloc, sqlite3Expr, sqlite3ExprInt32,
+    sqlite3ExprAttachSubtrees, sqlite3PExpr, sqlite3ExprAnd), deletion
+    (sqlite3ExprDeleteNN, sqlite3ExprDelete, sqlite3IdListDelete, sqlite3SrcListDelete,
+    sqlite3ExprListDelete), duplication (exprDup_, sqlite3ExprDup, sqlite3ExprListDup,
+    sqlite3SrcListDup, sqlite3IdListDup, sqlite3SelectDup), list management
+    (sqlite3ExprListAppend, sqlite3ExprListSetSortOrder, sqlite3ExprListSetName,
+    sqlite3ExprListCheckLength, sqlite3ExprListFlags), affinity
+    (sqlite3ExprAffinity, sqlite3ExprDataType, sqlite3AffinityType,
+    sqlite3TableColumnAffinity stub), collation (sqlite3ExprSkipCollate,
+    sqlite3ExprSkipCollateAndLikely, sqlite3ExprAddCollateToken,
+    sqlite3ExprAddCollateString), height helpers (exprSetHeight_,
+    sqlite3ExprCheckHeight, sqlite3ExprSetHeightAndFlags), identity/type helpers
+    (sqlite3ExprIsVector, sqlite3ExprVectorSize, sqlite3IsTrueOrFalse,
+    sqlite3ExprIdToTrueFalse, sqlite3ExprTruthValue, sqlite3IsRowid,
+    sqlite3ExprIsInteger, sqlite3ExprIsConstant), dequote helpers
+    (sqlite3DequoteExpr).
+  - `resolve.c`: 7 stubs (sqlite3ResolveExprNames etc.) — full resolve.c
+    implementation deferred to Phase 6.5 when Table/Column types are available.
+  - Gate: `TestExprBasic.pas` — 40 tests (28 named checks), all PASS.
 
   **Key discoveries**:
   - All Phase 6 types MUST be in one `type` block (FPC forward-ref rule).
@@ -1522,15 +1541,36 @@ reference exactly.
     padding after `bExprArgs` is just `_pad2: u8; _pad3: u16` (3 bytes → 144).
   - `IN_RENAME_OBJECT` macro (walker.c) checks `pParse->eParseMode >= PARSE_MODE_RENAME`.
     Full `Parse` struct deferred to Phase 7; accessed via `ParseGetEParseMode(pParse: Pointer)`
-    reading byte at offset 300.
+    reading byte at offset 300 via `PByte` arithmetic (FPC typecast `PParse(ptr)` fails
+    in inline functions for obscure syntactic reasons).
   - Function pointer comparisons require `Pointer()` cast in FPC:
     `Pointer(pWalker^.xSelectCallback2) = Pointer(@sqlite3WalkWinDefnDummyCallback)`.
   - `sqlite3SelectPopWith` (select.c, Phase 6.3) needs a stub in Phase 6.1
     because walker.c compares its address at compile time.
   - FlexArray accessors: `ExprListItems(p)` = `PExprListItem(PByte(p) + SizeOf(TExprList))`,
     `SrcListItems(p)` = `PSrcItem(PByte(p) + SizeOf(TSrcList))`.
+    **CRITICAL: `IdListItems(p)` must use `SZ_IDLIST_HEADER = 8`, NOT SizeOf(TIdList) = 4.**
+    The C `offsetof(IdList, a)` = 8 (4 bytes nId + 4 bytes alignment padding for pointer array).
+    `TIdList` needs a `_pad: i32` field to make SizeOf(TIdList) = 8.
   - TAggInfo has SQLITE_DEBUG-only `pSelectDbg: PSelect` at offset 64 (must be included).
+  - `TParse` struct is 416 bytes (GCC x86-64); all offsets verified by GCC offsetof test.
+    `eParseMode: u8` is at byte offset 300.
+  - `TIdList` header size is 8 bytes (nId + 4-byte padding) even though nId is 4 bytes —
+    the FLEXARRAY element (pointer) requires 8-byte alignment.
+  - `POnOrUsing` and `PSchema` pointer types must be declared in the type block
+    (`PSchema = Pointer` deferred stub is sufficient for Phase 6.1).
+  - Local variable `pExpr: PExpr` in a function that uses `TExprListItem.pExpr` field
+    causes FPC's case-insensitive name conflict — "Error in type definition" at the `;`.
+    Solution: eliminate the local variable or rename it.
+  - `sqlite3ErrorMsg` cannot have `varargs` modifier in FPC unless marked `external`.
+    Use a fixed 2-arg signature for the stub; full printf-style implementation in Phase 6.5.
+  - `sqlite3GetInt32` added to passqlite3util.pas (parses decimal string to i32).
+  - TK_COLLATE nodes always have `EP_Skip` set; `sqlite3ExprSkipCollate` only descends
+    when `ExprHasProperty(expr, EP_Skip or EP_IfNullRow)` is true.
+  - `sqlite3ExprAffinity` returns `p^.affExpr` as the default fallback — NOT
+    `SQLITE_AFF_BLOB`. For uninitialized exprs, this returns 0 (= SQLITE_AFF_NONE).
   - Gate test: `TestWalker.pas` — 40 tests, all PASS.
+  - Gate test: `TestExprBasic.pas` — 40 checks, all PASS.
 
 - [ ] **6.2** Port the **query planner**: `where.c` + `wherecode.c` +
   `whereexpr.c` + `whereInt.h`. `WhereInfo`, `WhereLoop`, `WhereTerm`;

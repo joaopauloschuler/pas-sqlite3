@@ -654,7 +654,8 @@ type
   PIdListItem = ^TIdListItem;
 
   TIdList = record
-    nId: i32;
+    nId:  i32;
+    _pad: i32;  { alignment padding to 8 = offsetof(IdList, a) on x86-64 }
     { a[FLEXARRAY] follows — accessed via IdListItems() }
   end;
 
@@ -972,7 +973,7 @@ end;
 
 function IdListItems(p: PIdList): PIdListItem; inline;
 begin
-  Result := PIdListItem(PByte(p) + SizeOf(TIdList));
+  Result := PIdListItem(PByte(p) + SZ_IDLIST_HEADER);
 end;
 
 function ExprHasProperty(pExpr: PExpr; prop: u32): Boolean; inline;
