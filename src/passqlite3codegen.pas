@@ -398,7 +398,7 @@ type
   PFuncDef2 = Pointer;   { FuncDef — Phase 6.6 }
   PIdList   = ^TIdList;  { IdList — defined below }
   PCteUse   = Pointer;   { CteUse — Phase 6.5 }
-  PSchema   = Pointer;   { Schema — Phase 6.5 }
+  PSchema   = Pointer;   { Schema — opaque stub; use PSchemaTyped in implementation }
 
   { Phase 6.1: TParse forward pointer }
   PParse    = ^TParse;
@@ -919,12 +919,19 @@ type
   end;
   PSelectDest = ^TSelectDest;
 
-  { --- TDbFixer (partial stub) --- }
+  { --- TDbFixer (attach.c) --- }
   TDbFixer = record
-    pParse: PParse;
-    w:      TWalker;
-    _rest:  array[0..47] of u8;
+    pParse   : PParse;
+    pSchema  : PSchema;
+    bVarOnly : u8;
+    _pad1    : array[0..2] of u8;
+    zDb      : PAnsiChar;
+    zType    : PAnsiChar;
+    pName    : PToken;
   end;
+
+  { Pointer-to-pointer token type }
+  PPToken = ^PToken;
 
   { --- TWith (opaque stub — full in Phase 6.5) --- }
   TWith = record
@@ -1852,6 +1859,344 @@ function  sqlite3OpenTableAndIndices(pParse: PParse; pTab: PTable2;
   op: i32; p5: u8; iBase: i32; aToOpen: Pu8; piDataCur: Pi32;
   piIdxCur: Pi32): i32;
 
+// ===========================================================================
+// Phase 6.5 public API — build.c, prepare.c, alter.c, attach.c,
+//                        analyze.c, pragma.c, vacuum.c, callback.c, func.c
+// ===========================================================================
+
+const
+  { DBFLAG_ constants (sqliteInt.h ~1886) — supplement those in util }
+  DBFLAG_SchemaKnownOk  = u32($0010);
+
+  { LOCATE_* flags for sqlite3LocateTable (sqliteInt.h ~5140) }
+  LOCATE_VIEW  = u32($01);
+  LOCATE_NOERR = u32($02);
+
+  { OMIT_TEMPDB — 0 when SQLITE_OMIT_TEMPDB not defined }
+  OMIT_TEMPDB = 0;
+
+  { Canonical schema-table names }
+  LEGACY_SCHEMA_TABLE         = 'sqlite_master';
+  PREFERRED_SCHEMA_TABLE      = 'sqlite_schema';
+  LEGACY_TEMP_SCHEMA_TABLE    = 'sqlite_temp_master';
+  PREFERRED_TEMP_SCHEMA_TABLE = 'sqlite_temp_schema';
+
+  { PARSE_HDR / PARSE_TAIL offsets (must match TParse layout) }
+  PARSE_HDR_OFFSET = 8;   { offsetof(TParse, zErrMsg) }
+  PARSE_HDR_SZ     = 176; { offsetof(TParse,aTempReg) - offsetof(TParse,zErrMsg) }
+  PARSE_RECURSE_SZ = 280; { offsetof(TParse, sLastToken) }
+  PARSE_TAIL_SZ    = 136; { sizeof(TParse) - PARSE_RECURSE_SZ = 416-280 }
+
+  { sqlite3ReadSchema flags }
+  INITFLAG_AlterRename    = $01;
+  INITFLAG_AlterDrop      = $02;
+  INITFLAG_AlterAddColumn = $04;
+
+type
+  { ParseCleanup — prepare.c:3853 }
+  TParseCleanup = record
+    pNext    : Pointer;         { ^TParseCleanup }
+    pPtr     : Pointer;
+    xCleanup : procedure(db: PTsqlite3; p: Pointer); cdecl;
+  end;
+  PParseCleanup = ^TParseCleanup;
+
+  { Function pointer type for cleanup callbacks }
+  TParseCleanupFn = procedure(db: PTsqlite3; p: Pointer); cdecl;
+
+  { Pointer to pointer to AnsiChar (used in prepare API) }
+  PPAnsiChar = ^PAnsiChar;
+
+  { LogEst pointer (LogEst = i16 already declared in vdbe) }
+  PLogEst = ^LogEst;
+
+// ---------------------------------------------------------------------------
+// Phase 6.5 public API — build.c (schema management)
+// ---------------------------------------------------------------------------
+
+{ Schema index / table lookup }
+function  sqlite3SchemaToIndex(db: PTsqlite3; pSchema: PSchema): i32;
+function  sqlite3FindTable(db: PTsqlite3; zName: PAnsiChar;
+  zDatabase: PAnsiChar): PTable2;
+function  sqlite3LocateTable(pParse: PParse; flags: u32;
+  zName: PAnsiChar; zDbase: PAnsiChar): PTable2;
+function  sqlite3LocateTableItem(pParse: PParse; flags: u32;
+  p: PSrcItem): PTable2;
+function  sqlite3FindIndex(db: PTsqlite3; zName: PAnsiChar;
+  zDb: PAnsiChar): PIndex2;
+function  sqlite3FindDbName(db: PTsqlite3; zName: PAnsiChar): i32;
+function  sqlite3FindDb(db: PTsqlite3; pName: PToken): i32;
+function  sqlite3TwoPartName(pParse: PParse; const pName1: PToken;
+  const pName2: PToken; pUnqual: PPToken): i32;
+function  sqlite3WritableSchema(db: PTsqlite3): i32;
+function  sqlite3CheckObjectName(pParse: PParse; zName: PAnsiChar;
+  zType: PAnsiChar; zTblName: PAnsiChar): i32;
+function  sqlite3PrimaryKeyIndex(pTab: PTable2): PIndex2;
+function  sqlite3TableColumnToIndex(pIdx: PIndex2; iCol: i16): i32;
+function  sqlite3DbIsNamed(db: PTsqlite3; iDb: i32; zName: PAnsiChar): i32;
+function  sqlite3PreferredTableName(zName: PAnsiChar): PAnsiChar;
+function  sqlite3DbMaskAllZero(m: u32): i32;
+
+{ Index helpers }
+procedure sqlite3FreeIndex(db: PTsqlite3; p: PIndex2);
+procedure sqlite3UnlinkAndDeleteIndex(db: PTsqlite3; iDb: i32;
+  zIdxName: PAnsiChar);
+function  sqlite3AllocateIndexObject(db: PTsqlite3; nCol: i16;
+  nExtra: i32; ppExtra: PPAnsiChar): PIndex2;
+function  sqlite3HasExplicitNulls(pParse: PParse; pList: PExprList): i32;
+procedure sqlite3DefaultRowEst(pIdx: PIndex2);
+
+{ Schema reset }
+procedure sqlite3CollapseDatabaseArray(db: PTsqlite3);
+procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
+procedure sqlite3CommitInternalChanges(db: PTsqlite3);
+
+{ Table lifecycle }
+procedure sqlite3DeleteTableGeneric(db: PTsqlite3; pTable: Pointer);
+procedure sqlite3UnlinkAndDeleteTable(db: PTsqlite3; iDb: i32;
+  zTabName: PAnsiChar);
+
+{ Schema table helpers }
+procedure sqlite3OpenSchemaTable(p: PParse; iDb: i32);
+function  sqlite3IsShadowTableOf(db: PTsqlite3; pTab: PTable2;
+  zName: PAnsiChar): i32;
+procedure sqlite3MarkAllShadowTablesOf(db: PTsqlite3; pTab: PTable2);
+function  sqlite3ShadowTableName(db: PTsqlite3; zName: PAnsiChar): i32;
+function  sqlite3ReadOnlyShadowTables(db: PTsqlite3): i32;
+
+{ CREATE TABLE }
+procedure sqlite3StartTable(pParse: PParse; const pName1: PToken;
+  const pName2: PToken; isTemp: i32; isView: i32; isVirtual: i32;
+  noErr: i32);
+procedure sqlite3AddReturning(pParse: PParse; pList: PExprList);
+procedure sqlite3AddColumn(pParse: PParse; sName: TToken; sType: TToken);
+procedure sqlite3AddNotNull(pParse: PParse; onError: i32);
+procedure sqlite3AddDefaultValue(pParse: PParse; pExpr: PExpr;
+  zStart: PAnsiChar; zEnd: PAnsiChar);
+procedure sqlite3AddPrimaryKey(pParse: PParse; pList: PExprList;
+  onError: i32; autoInc: i32; sortOrder: i32);
+procedure sqlite3AddCheckConstraint(pParse: PParse; pCheckExpr: PExpr;
+  zStart: PAnsiChar; zEnd: PAnsiChar);
+procedure sqlite3AddCollateType(pParse: PParse; pToken: PToken);
+procedure sqlite3AddGenerated(pParse: PParse; pExpr: PExpr;
+  pType: PToken);
+procedure sqlite3ChangeCookie(pParse: PParse; iDb: i32);
+procedure sqlite3EndTable(pParse: PParse; const pCons: PToken;
+  const pEnd: PToken; tabOpts: u32; pSelect: PSelect);
+
+{ CREATE VIEW }
+procedure sqlite3CreateView(pParse: PParse; const pBegin: PToken;
+  const pName1: PToken; const pName2: PToken; pCNames: PExprList;
+  pSelect: PSelect; isTemp: i32; noErr: i32);
+function  sqlite3ViewGetColumnNames(pParse: PParse; pTable: PTable2): i32;
+
+{ DROP TABLE / INDEX }
+procedure sqlite3RootPageMoved(db: PTsqlite3; iDb: i32; iFrom: u32;
+  iTo: u32);
+procedure sqlite3CodeDropTable(pParse: PParse; pTab: PTable2;
+  iDb: i32; isView: i32);
+procedure sqlite3DropTable(pParse: PParse; pName: PSrcList;
+  isView: i32; noErr: i32);
+procedure sqlite3DropIndex(pParse: PParse; pName: PSrcList; ifExists: i32);
+
+{ Foreign keys }
+procedure sqlite3CreateForeignKey(pParse: PParse; pFromCol: PExprList;
+  pTo: PToken; pToCol: PExprList; flags: i32);
+procedure sqlite3DeferForeignKey(pParse: PParse; isDeferred: i32);
+
+{ CREATE INDEX }
+procedure sqlite3CreateIndex(pParse: PParse; const pName1: PToken;
+  const pName2: PToken; pTblName: PSrcList; pList: PExprList;
+  onError: i32; const pStart: PToken; pPIWhere: PExpr;
+  sortOrder: i32; ifNotExist: i32; idxType: u8);
+
+{ SrcList extensions }
+function  sqlite3SrcListEnlarge(pParse: PParse; pSrc: PSrcList;
+  nExtra: i32; iStart: i32): PSrcList;
+function  sqlite3SrcListAppend(pParse: PParse; pList: PSrcList;
+  const pTable: PToken; const pDatabase: PToken): PSrcList;
+procedure sqlite3SrcListAssignCursors(pParse: PParse; pList: PSrcList);
+procedure sqlite3SubqueryDelete(db: PTsqlite3; pSubq: Pointer);
+function  sqlite3SrcItemAttachSubquery(pParse: PParse; p: PSrcItem;
+  pSubquery: PSelect; isSub: i32): i32;
+function  sqlite3SrcListAppendFromTerm(pParse: PParse; p: PSrcList;
+  pTable: PToken; pDatabase: PToken; pAlias: PToken; pSubquery: PSelect;
+  pOn: PExpr; pUsing: PIdList): PSrcList;
+procedure sqlite3SrcListIndexedBy(pParse: PParse; p: PSrcList;
+  pIndexedBy: PToken);
+function  sqlite3SrcListAppendList(pParse: PParse; p1: PSrcList;
+  p2: PSrcList): PSrcList;
+procedure sqlite3SrcListFuncArgs(pParse: PParse; p: PSrcList;
+  pList: PExprList);
+procedure sqlite3SrcListShiftJoinType(pParse: PParse; p: PSrcList);
+
+{ IdList extensions (from build.c) }
+function  sqlite3IdListAppend(pParse: PParse; pList: PIdList;
+  pToken: PToken): PIdList;
+
+{ Transaction / savepoint }
+procedure sqlite3BeginTransaction(pParse: PParse; type_: i32);
+procedure sqlite3EndTransaction(pParse: PParse; eType: i32);
+procedure sqlite3Savepoint(pParse: PParse; op: i32; pName: PToken);
+
+{ Schema verification }
+function  sqlite3OpenTempDatabase(pParse: PParse): i32;
+procedure sqlite3CodeVerifySchema(pParse: PParse; iDb: i32);
+procedure sqlite3CodeVerifyNamedSchema(pParse: PParse; zDb: PAnsiChar);
+procedure sqlite3BeginWriteOperation(pParse: PParse;
+  setStatement: i32; iDb: i32);
+procedure sqlite3MultiWrite(pParse: PParse);
+procedure sqlite3MayAbort(pParse: PParse);
+procedure sqlite3HaltConstraint(pParse: PParse; errCode: i32;
+  onError: i32; p4: PAnsiChar; p4type: i8; p5: u8);
+procedure sqlite3UniqueConstraint(pParse: PParse; onError: i32;
+  pIdx: PIndex2);
+procedure sqlite3RowidConstraint(pParse: PParse; onError: i32;
+  pTab: PTable2);
+procedure sqlite3FinishCoding(pParse: PParse);
+procedure sqlite3NestedParse(pParse: PParse; zFormat: PAnsiChar);
+
+{ Column helper from build.c }
+function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
+
+// ---------------------------------------------------------------------------
+// Phase 6.5 public API — prepare.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3ParseObjectInit(pParse: PParse; db: PTsqlite3);
+procedure sqlite3ParseObjectReset(pParse: PParse);
+function  sqlite3ReadSchema(pParse: PParse): i32;
+function  sqlite3Reprepare(p: PVdbe): i32;
+function  sqlite3_prepare(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPAnsiChar): i32;
+function  sqlite3_prepare_v2(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPAnsiChar): i32;
+function  sqlite3_prepare_v3(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+  prepFlags: u32; ppStmt: PPointer; pzTail: PPAnsiChar): i32;
+function  sqlite3_prepare16(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPointer): i32;
+function  sqlite3_prepare16_v2(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPointer): i32;
+function  sqlite3_prepare16_v3(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  prepFlags: u32; ppStmt: PPointer; pzTail: PPointer): i32;
+
+{ Stubs needed by vdbeaux.c / main.c callers }
+procedure sqlite3RunParser(pParse: PParse; zSql: PAnsiChar);
+function  sqlite3SafetyCheckOk(db: PTsqlite3): i32;
+function  sqlite3SafetyCheckSickOrOk(db: PTsqlite3): i32;
+procedure sqlite3Error(db: PTsqlite3; err_code: i32);
+procedure sqlite3ErrorWithMsg(db: PTsqlite3; err_code: i32;
+  zFmt: PAnsiChar);
+procedure sqlite3ErrorClear(db: PTsqlite3);
+procedure sqlite3SystemError(db: PTsqlite3; rc: i32);
+function  sqlite3TransferBindings(pFromStmt: Pointer;
+  pToStmt: Pointer): i32;
+procedure sqlite3BtreeEnterAll(db: PTsqlite3);
+procedure sqlite3BtreeLeaveAll(db: PTsqlite3);
+function  sqlite3BtreeSchemaLocked(pBt: Pointer): i32;
+function  sqlite3BtreeHoldsAllMutexes(db: PTsqlite3): i32;
+procedure sqlite3OomFaultGeneric(db: PTsqlite3);
+function  sqlite3VdbeSetSql(v: PVdbe; z: PAnsiChar; n: i32;
+  prepFlags: u32): i32;
+function  sqlite3VdbeDb(v: PVdbe): PTsqlite3;
+function  sqlite3VdbePrepareFlags(v: PVdbe): u8;
+function  sqlite3VdbeResetStepResult(v: PVdbe): i32;
+function  sqlite3_stmt_isexplain(pStmt: Pointer): i32;
+
+// ---------------------------------------------------------------------------
+// Phase 6.5 public API — alter.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3AlterRenameTable(pParse: PParse; pSrc: PSrcList;
+  const pName: PToken);
+procedure sqlite3AlterFinishAddColumn(pParse: PParse; pColDef: PToken);
+procedure sqlite3AlterBeginAddColumn(pParse: PParse; pSrc: PSrcList);
+procedure sqlite3AlterRenameColumn(pParse: PParse; pSrc: PSrcList;
+  const pOld: PToken; const pNew: PToken);
+procedure sqlite3AlterDropColumn(pParse: PParse; pSrc: PSrcList;
+  const pName: PToken);
+procedure sqlite3AlterDropConstraint(pParse: PParse; pSrc: PSrcList;
+  pType: PToken; pName: PToken);
+procedure sqlite3AlterSetNotNull(pParse: PParse; pSrc: PSrcList;
+  pName: PToken; onError: i32);
+procedure sqlite3AlterAddConstraint(pParse: PParse; pSrc: PSrcList;
+  pType: PToken);
+procedure sqlite3AlterFunctions;
+procedure sqlite3RenameTokenRemap(pParse: PParse; pTo: Pointer;
+  pFrom: Pointer);
+procedure sqlite3RenameExprlistUnmap(pParse: PParse; pEList: PExprList);
+
+// ---------------------------------------------------------------------------
+// Phase 6.5 public API — attach.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3Detach(pParse: PParse; pDbname: PExpr);
+procedure sqlite3Attach(pParse: PParse; p: PExpr; pDbname: PExpr;
+  pKey: PExpr);
+procedure sqlite3FixInit(pFix: PDbFixer; pParse: PParse; iDb: i32;
+  zType: PAnsiChar; const pName: PToken);
+function  sqlite3FixSrcList(pFix: PDbFixer; pList: PSrcList): i32;
+function  sqlite3FixSelect(pFix: PDbFixer; pSelect: PSelect): i32;
+function  sqlite3FixExpr(pFix: PDbFixer; pExpr: PExpr): i32;
+function  sqlite3FixTriggerStep(pFix: PDbFixer;
+  pStep: PTriggerStep): i32;
+
+// ---------------------------------------------------------------------------
+// Phase 6.5 public API — analyze.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3Analyze(pParse: PParse; pName1: PToken; pName2: PToken);
+procedure sqlite3DeleteIndexSamples(db: PTsqlite3; pIdx: PIndex2);
+function  sqlite3AnalysisLoad(db: PTsqlite3; iDb: i32): i32;
+
+// ---------------------------------------------------------------------------
+// Phase 6.5 public API — pragma.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3Pragma(pParse: PParse; const pId1: PToken;
+  const pId2: PToken; pValue: PToken; minusFlag: i32);
+function  sqlite3PragmaVtabRegister(db: PTsqlite3;
+  zName: PAnsiChar): Pointer;
+
+// ---------------------------------------------------------------------------
+// Phase 6.5 public API — vacuum.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3Vacuum(pParse: PParse; pNm: PToken; pInto: PExpr);
+
+// ---------------------------------------------------------------------------
+// Phase 6.5 public API — callback.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3SchemaClear(p: Pointer);
+function  sqlite3SchemaGet(db: PTsqlite3; pBt: Pointer): PSchema;
+procedure sqlite3SetTextEncoding(db: PTsqlite3; enc: u8);
+procedure sqlite3InsertBuiltinFuncs(aFunc: Pointer; nFunc: i32);
+function  sqlite3CheckCollSeq(pParse: PParse; pColl: Pointer): i32;
+function  sqlite3FindCollSeq(db: PTsqlite3; enc: u8;
+  zName: PAnsiChar; create: i32): Pointer;
+function  sqlite3LocateCollSeq(pParse: PParse; zName: PAnsiChar): Pointer;
+procedure sqlite3AutoLoadExtensions(db: PTsqlite3);
+function  sqlite3CreateFunc(db: PTsqlite3; zFunctionName: PAnsiChar;
+  nArg: i32; enc: i32; pUserData: Pointer; xSFunc: Pointer;
+  xStep: Pointer; xFinal: Pointer; xValue: Pointer; xInverse: Pointer;
+  pDestructor: Pointer): i32;
+
+// ---------------------------------------------------------------------------
+// Phase 6.5 public API — func.c (built-in scalars)
+// ---------------------------------------------------------------------------
+
+procedure sqlite3RegisterBuiltinFunctions;
+procedure sqlite3RegisterPerConnectionBuiltinFunctions(db: PTsqlite3);
+procedure sqlite3RegisterLikeFunctions(db: PTsqlite3;
+  caseSensitive: i32);
+function  sqlite3IsLikeFunction(db: PTsqlite3; pExpr: PExpr;
+  pIsNocase: Pi32; aWc: PAnsiChar): i32;
+function  sqlite3_strglob(zGlobPattern: PAnsiChar;
+  zString: PAnsiChar): i32;
+function  sqlite3_strlike(zPattern: PAnsiChar; zStr: PAnsiChar;
+  esc: u32): i32;
+
 implementation
 
 function ExprListItems(p: PExprList): PExprListItem; inline;
@@ -2051,12 +2396,7 @@ begin
   end;
 end;
 
-function sqlite3ParserAddCleanup(pParse: PParse; xCleanup: Pointer;
-  pPtr: Pointer): Pointer;
-begin
-  { Phase 7 stub — for now just return non-nil to signal success }
-  Result := pPtr;
-end;
+{ sqlite3ParserAddCleanup implemented in Phase 6.5 section below }
 
 procedure sqlite3RenameExprUnmap(pParse: PParse; pExpr: PExpr);
 begin { Phase 6.5 stub } end;
@@ -4910,7 +5250,1434 @@ function sqlite3OpenTableAndIndices(pParse: PParse; pTab: PTable2;
 begin
   if piDataCur <> nil then piDataCur^ := iBase;
   if piIdxCur  <> nil then piIdxCur^  := iBase + 1;
-  Result := 0; { Phase 6.5 }
+  Result := 0;
+end;
+
+// ===========================================================================
+// Phase 6.5 — build.c: schema lookup (real implementations)
+// ===========================================================================
+
+{ sqlite3SchemaToIndex — return aDb[] index whose pSchema matches (build.c:542) }
+function sqlite3SchemaToIndex(db: PTsqlite3; pSchema: PSchema): i32;
+var
+  i: i32;
+begin
+  Result := -1;
+  if pSchema <> nil then begin
+    i := db^.nDb - 1;
+    while i >= 0 do begin
+      if db^.aDb[i].pSchema = pSchema then begin
+        Result := i;
+        Exit;
+      end;
+      Dec(i);
+    end;
+  end;
+end;
+
+{ Inner alias — same as sqlite3SchemaToIndex (used internally) }
+function sqlite3SchemaToIndexInner(db: PTsqlite3; pSchema: PSchema): i32;
+begin
+  Result := sqlite3SchemaToIndex(db, pSchema);
+end;
+
+{ sqlite3DbMaskAllZero — return 1 if all bits in yDbMask are zero (build.c:124) }
+function sqlite3DbMaskAllZero(m: u32): i32;
+begin
+  if m = 0 then Result := 1 else Result := 0;
+end;
+
+{ sqlite3DbIsNamed — return 1 if db.aDb[iDb] has name zName (attach.c:52) }
+function sqlite3DbIsNamed(db: PTsqlite3; iDb: i32; zName: PAnsiChar): i32;
+begin
+  if (db^.aDb[iDb].zDbSName <> nil) and
+     (sqlite3StrICmp(PChar(db^.aDb[iDb].zDbSName), PChar(zName)) = 0) then
+    Result := 1
+  else if (sqlite3StrICmp(PChar(zName), 'main') = 0) and (iDb = 0) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ sqlite3FindDbName — find the index of database named zName (build.c:931) }
+function sqlite3FindDbName(db: PTsqlite3; zName: PAnsiChar): i32;
+var
+  i: i32;
+begin
+  Result := -1;
+  if zName <> nil then begin
+    for i := 0 to db^.nDb - 1 do begin
+      if (db^.aDb[i].zDbSName <> nil) and
+         (sqlite3StrICmp(PChar(db^.aDb[i].zDbSName), PChar(zName)) = 0) then begin
+        Result := i;
+        Exit;
+      end;
+    end;
+    { Legacy: always accept "main" for schema 0 }
+    if (Result < 0) and (sqlite3StrICmp(PChar(zName), 'main') = 0) then
+      Result := 0;
+  end;
+end;
+
+{ sqlite3FindDb — find db index by Token name (build.c:951) }
+function sqlite3FindDb(db: PTsqlite3; pName: PToken): i32;
+var
+  zName: PAnsiChar;
+begin
+  Result := -1;
+  if pName = nil then Exit;
+  if pName^.n = 0 then Exit;
+  { Token may not be null-terminated — make a temporary string }
+  zName := sqlite3DbStrNDup(db, PChar(pName^.z), pName^.n);
+  if zName = nil then Exit;
+  Result := sqlite3FindDbName(db, zName);
+  sqlite3DbFree(db, zName);
+end;
+
+{ sqlite3PreferredTableName — translate legacy schema table names (build.c:502) }
+function sqlite3PreferredTableName(zName: PAnsiChar): PAnsiChar;
+begin
+  if (sqlite3_strnicmp(PChar(zName), 'sqlite_', 7) = 0) then begin
+    if sqlite3StrICmp(PChar(zName + 7),
+        PChar(LEGACY_SCHEMA_TABLE) + 7) = 0 then begin
+      Result := PREFERRED_SCHEMA_TABLE;
+      Exit;
+    end;
+    if sqlite3StrICmp(PChar(zName + 7),
+        PChar(LEGACY_TEMP_SCHEMA_TABLE) + 7) = 0 then begin
+      Result := PREFERRED_TEMP_SCHEMA_TABLE;
+      Exit;
+    end;
+  end;
+  Result := zName;
+end;
+
+{ sqlite3FindTable — find table by name; nil if not found (build.c:337) }
+function sqlite3FindTable(db: PTsqlite3; zName: PAnsiChar;
+  zDatabase: PAnsiChar): PTable2;
+var
+  p: PTable2;
+  i: i32;
+  pSchema: passqlite3util.PSchema;
+begin
+  Result := nil;
+  if zDatabase <> nil then begin
+    { Search the named database }
+    i := sqlite3FindDbName(db, zDatabase);
+    if i < 0 then Exit;
+    pSchema := db^.aDb[i].pSchema;
+    if pSchema = nil then Exit;
+    p := PTable2(sqlite3HashFind(@pSchema^.tblHash, PChar(zName)));
+    { Translate legacy sqlite_master → sqlite_schema synonyms }
+    if (p = nil) and (sqlite3_strnicmp(PChar(zName), 'sqlite_', 7) = 0) then begin
+      if i = 1 then begin
+        if (sqlite3StrICmp(PChar(zName + 7),
+            PChar(PREFERRED_TEMP_SCHEMA_TABLE) + 7) = 0) or
+           (sqlite3StrICmp(PChar(zName + 7),
+            PChar(PREFERRED_SCHEMA_TABLE) + 7) = 0) or
+           (sqlite3StrICmp(PChar(zName + 7),
+            PChar(LEGACY_SCHEMA_TABLE) + 7) = 0) then
+          p := PTable2(sqlite3HashFind(@db^.aDb[1].pSchema^.tblHash,
+                                       LEGACY_TEMP_SCHEMA_TABLE));
+      end else begin
+        if sqlite3StrICmp(PChar(zName + 7),
+            PChar(PREFERRED_SCHEMA_TABLE) + 7) = 0 then
+          p := PTable2(sqlite3HashFind(@db^.aDb[i].pSchema^.tblHash,
+                                       LEGACY_SCHEMA_TABLE));
+      end;
+    end;
+    Result := p;
+  end else begin
+    { No database specified — search temp, then main, then attached }
+    if (OMIT_TEMPDB = 0) and (db^.nDb > 1) and
+       (db^.aDb[1].pSchema <> nil) then begin
+      p := PTable2(sqlite3HashFind(@db^.aDb[1].pSchema^.tblHash,
+                                    PChar(zName)));
+      if p <> nil then begin Result := p; Exit; end;
+    end;
+    if db^.aDb[0].pSchema <> nil then begin
+      p := PTable2(sqlite3HashFind(@db^.aDb[0].pSchema^.tblHash,
+                                    PChar(zName)));
+      if p <> nil then begin Result := p; Exit; end;
+    end;
+    i := 2;
+    while i < db^.nDb do begin
+      if db^.aDb[i].pSchema <> nil then begin
+        p := PTable2(sqlite3HashFind(@db^.aDb[i].pSchema^.tblHash,
+                                      PChar(zName)));
+        if p <> nil then begin Result := p; Exit; end;
+      end;
+      Inc(i);
+    end;
+    { Translate legacy schema-table synonyms }
+    if sqlite3_strnicmp(PChar(zName), 'sqlite_', 7) = 0 then begin
+      if sqlite3StrICmp(PChar(zName + 7),
+          PChar(PREFERRED_SCHEMA_TABLE) + 7) = 0 then begin
+        if db^.aDb[0].pSchema <> nil then
+          Result := PTable2(sqlite3HashFind(
+              @db^.aDb[0].pSchema^.tblHash, LEGACY_SCHEMA_TABLE));
+        Exit;
+      end;
+      if sqlite3StrICmp(PChar(zName + 7),
+          PChar(PREFERRED_TEMP_SCHEMA_TABLE) + 7) = 0 then begin
+        if (OMIT_TEMPDB = 0) and (db^.nDb > 1) and
+           (db^.aDb[1].pSchema <> nil) then
+          Result := PTable2(sqlite3HashFind(
+              @db^.aDb[1].pSchema^.tblHash, LEGACY_TEMP_SCHEMA_TABLE));
+        Exit;
+      end;
+    end;
+  end;
+end;
+
+{ sqlite3ReadSchema — ensure schema is loaded; stub returns SQLITE_OK (prepare.c:470) }
+function sqlite3ReadSchema(pParse: PParse): i32;
+begin
+  { Phase 7 will implement full schema initialisation from sqlite_master.
+    For now assume schema is already valid (test infrastructure pre-populates). }
+  Result := SQLITE_OK;
+end;
+
+{ sqlite3LocateTable — find table, reporting error if not found (build.c:408) }
+function sqlite3LocateTable(pParse: PParse; flags: u32;
+  zName: PAnsiChar; zDbase: PAnsiChar): PTable2;
+var
+  db: PTsqlite3;
+  p: PTable2;
+  zMsg: PAnsiChar;
+begin
+  db := pParse^.db;
+  if (db^.mDbFlags and DBFLAG_SchemaKnownOk) = 0 then begin
+    if sqlite3ReadSchema(pParse) <> SQLITE_OK then begin
+      Result := nil; Exit;
+    end;
+  end;
+  p := sqlite3FindTable(db, zName, zDbase);
+  if p = nil then begin
+    if (flags and LOCATE_NOERR) <> 0 then begin
+      Result := nil; Exit;
+    end;
+    pParse^.parseFlags := pParse^.parseFlags or $200; { checkSchema bit }
+    if (flags and LOCATE_VIEW) <> 0 then
+      zMsg := 'no such view'
+    else
+      zMsg := 'no such table';
+    if zDbase <> nil then
+      sqlite3ErrorMsg(pParse,
+          PAnsiChar(AnsiString(zMsg) + ': ' + AnsiString(zDbase) +
+                    '.' + AnsiString(zName)))
+    else
+      sqlite3ErrorMsg(pParse,
+          PAnsiChar(AnsiString(zMsg) + ': ' + AnsiString(zName)));
+  end;
+  Result := p;
+end;
+
+{ sqlite3LocateTableItem — locate table for a SrcItem (build.c:481) }
+function sqlite3LocateTableItem(pParse: PParse; flags: u32;
+  p: PSrcItem): PTable2;
+var
+  zDb: PAnsiChar;
+  iDb: i32;
+begin
+  if (p^.fg.fgBits3 and $01) <> 0 then begin
+    iDb := sqlite3SchemaToIndex(pParse^.db, PSchema(p^.u4.pSchema));
+    if (iDb >= 0) and (iDb < pParse^.db^.nDb) then
+      zDb := pParse^.db^.aDb[iDb].zDbSName
+    else
+      zDb := nil;
+  end else
+    zDb := p^.u4.zDatabase;
+  Result := sqlite3LocateTable(pParse, flags, p^.zName, zDb);
+end;
+
+{ sqlite3FindIndex — find an index by name (build.c:526) }
+function sqlite3FindIndex(db: PTsqlite3; zName: PAnsiChar;
+  zDb: PAnsiChar): PIndex2;
+var
+  p: PIndex2;
+  i, j: i32;
+  pSchema: passqlite3util.PSchema;
+begin
+  Result := nil;
+  i := OMIT_TEMPDB;
+  while i < db^.nDb do begin
+    { Search TEMP before MAIN when i < 2 }
+    if i < 2 then j := i xor 1 else j := i;
+    if j >= db^.nDb then begin Inc(i); continue; end;
+    pSchema := db^.aDb[j].pSchema;
+    if pSchema = nil then begin Inc(i); continue; end;
+    if (zDb <> nil) and (sqlite3DbIsNamed(db, j, zDb) = 0) then begin
+      Inc(i); continue;
+    end;
+    p := PIndex2(sqlite3HashFind(@pSchema^.idxHash, PChar(zName)));
+    if p <> nil then begin
+      Result := p; Exit;
+    end;
+    Inc(i);
+  end;
+end;
+
+{ sqlite3PrimaryKeyIndex — return the PRIMARY KEY index of a table (build.c:1069) }
+function sqlite3PrimaryKeyIndex(pTab: PTable2): PIndex2;
+var
+  p: PIndex2;
+begin
+  { Walk the index list; the first WITH_ROWID table has no PK index,
+    WITHOUT ROWID tables have pIndex pointing to the PK.
+    As a stub: return pTab^.pIndex (first index). }
+  p := pTab^.pIndex;
+  while p <> nil do begin
+    if (p^.idxFlags and $03) = 2 then begin  { SQLITE_IDXTYPE_PRIMARYKEY = 2 }
+      Result := p; Exit;
+    end;
+    p := p^.pNext;
+  end;
+  Result := nil;
+end;
+
+{ sqlite3TableColumnToIndex — find iCol in index column list (build.c:1081) }
+function sqlite3TableColumnToIndex(pIdx: PIndex2; iCol: i16): i32;
+var
+  i: i32;
+begin
+  for i := 0 to pIdx^.nColumn - 1 do
+    if pIdx^.aiColumn[i] = iCol then begin Result := i; Exit; end;
+  Result := -1;
+end;
+
+{ sqlite3TwoPartName — resolve two-part name, return db index (build.c:976) }
+function sqlite3TwoPartName(pParse: PParse; const pName1: PToken;
+  const pName2: PToken; pUnqual: PPToken): i32;
+var
+  iDb: i32;
+  db: PTsqlite3;
+begin
+  db := pParse^.db;
+  if (pName2 <> nil) and (pName2^.n > 0) then begin
+    { Two-part name: pName1 is the database, pName2 is the object }
+    pUnqual^ := pName2;
+    iDb := sqlite3FindDb(db, pName1);
+    if iDb < 0 then begin
+      sqlite3ErrorMsg(pParse,
+        PAnsiChar('unknown database ' + AnsiString(pName1^.z)));
+      Result := -1; Exit;
+    end;
+  end else begin
+    { One-part name }
+    pUnqual^ := pName1;
+    iDb := 0;
+  end;
+  Result := iDb;
+end;
+
+{ sqlite3WritableSchema — return 1 if PRAGMA writable_schema is on (build.c:1009) }
+function sqlite3WritableSchema(db: PTsqlite3): i32;
+begin
+  { Check SQLITE_WriteSchema flag (bit 0x00000020 of db.flags) }
+  if (db^.flags and u64($00000020)) <> 0 then Result := 1 else Result := 0;
+end;
+
+{ sqlite3CheckObjectName — validate object name (build.c:1031) stub }
+function sqlite3CheckObjectName(pParse: PParse; zName: PAnsiChar;
+  zType: PAnsiChar; zTblName: PAnsiChar): i32;
+begin
+  Result := SQLITE_OK;
+end;
+
+// ===========================================================================
+// Phase 6.5 — build.c: index & table management stubs
+// ===========================================================================
+
+procedure sqlite3FreeIndex(db: PTsqlite3; p: PIndex2);
+begin
+  { Phase 7 }
+  if p <> nil then sqlite3DbFree(db, p);
+end;
+
+procedure sqlite3UnlinkAndDeleteIndex(db: PTsqlite3; iDb: i32;
+  zIdxName: PAnsiChar);
+begin
+  { Phase 7 }
+end;
+
+function sqlite3AllocateIndexObject(db: PTsqlite3; nCol: i16;
+  nExtra: i32; ppExtra: PPAnsiChar): PIndex2;
+var
+  nBase: u64;
+  nByte: u64;
+  p: PIndex2;
+  pExtra: PByte;
+begin
+  { C layout after struct: azColl (8*nCol), aiRowLogEst (2*(nCol+1)), aiColumn (2*nCol), aSortOrder (nCol) }
+  nBase := u64(SizeOf(TIndex)) +
+           u64(nCol) * 8 +           { azColl: pointer per column }
+           u64(nCol + 1) * 2 +       { aiRowLogEst: LogEst per col + 1 }
+           u64(nCol) * 2 +           { aiColumn: i16 per col }
+           u64(nCol);                 { aSortOrder: u8 per col }
+  { Round nBase up to 8 bytes }
+  nBase := (nBase + 7) and not u64(7);
+  nByte := nBase + u64(nExtra);
+  p := PIndex2(sqlite3DbMallocZero(db, nByte));
+  if p <> nil then begin
+    p^.nColumn  := nCol;
+    p^.nKeyCol  := nCol;
+    pExtra := PByte(p) + SizeOf(TIndex);
+    p^.azColl        := pExtra;                    Inc(pExtra, u64(nCol) * 8);
+    p^.aiRowLogEst   := Pi16(pExtra);              Inc(pExtra, u64(nCol + 1) * 2);
+    p^.aiColumn      := Pi16(pExtra);              Inc(pExtra, u64(nCol) * 2);
+    p^.aSortOrder    := pExtra;
+    if ppExtra <> nil then
+      ppExtra^ := PAnsiChar(PByte(p) + nBase);
+  end;
+  Result := p;
+end;
+
+function sqlite3HasExplicitNulls(pParse: PParse; pList: PExprList): i32;
+begin
+  Result := 0;
+end;
+
+procedure sqlite3DefaultRowEst(pIdx: PIndex2);
+var
+  aRowEst: PLogEst;
+  i: i32;
+begin
+  { Assign default LogEst row estimates for new index }
+  aRowEst := pIdx^.aiRowLogEst;
+  if aRowEst = nil then Exit;
+  aRowEst[0] := 210;
+  i := 1;
+  while i <= pIdx^.nColumn do begin
+    aRowEst[i] := 33;
+    Inc(i);
+  end;
+end;
+
+procedure sqlite3CollapseDatabaseArray(db: PTsqlite3);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
+var
+  i: i32;
+begin
+  for i := 0 to db^.nDb - 1 do begin
+    if db^.aDb[i].pSchema <> nil then
+      sqlite3SchemaClear(db^.aDb[i].pSchema);
+  end;
+  db^.mDbFlags := db^.mDbFlags and not DBFLAG_SchemaKnownOk;
+end;
+
+procedure sqlite3CommitInternalChanges(db: PTsqlite3);
+begin
+  db^.mDbFlags := db^.mDbFlags and not u32(DBFLAG_SchemaChange);
+end;
+
+procedure sqlite3DeleteTableGeneric(db: PTsqlite3; pTable: Pointer);
+begin
+  sqlite3DeleteTable(db, PTable2(pTable));
+end;
+
+procedure sqlite3UnlinkAndDeleteTable(db: PTsqlite3; iDb: i32;
+  zTabName: PAnsiChar);
+var
+  pTab: PTable2;
+  pSchema: passqlite3util.PSchema;
+begin
+  if (iDb >= 0) and (iDb < db^.nDb) and
+     (db^.aDb[iDb].pSchema <> nil) then begin
+    pSchema := db^.aDb[iDb].pSchema;
+    pTab := PTable2(sqlite3HashInsert(@pSchema^.tblHash, PChar(zTabName), nil));
+    sqlite3DeleteTable(db, pTab);
+  end;
+end;
+
+procedure sqlite3OpenSchemaTable(p: PParse; iDb: i32);
+begin
+  { Phase 7 — emit OP_OpenRead on the schema table }
+end;
+
+function sqlite3IsShadowTableOf(db: PTsqlite3; pTab: PTable2;
+  zName: PAnsiChar): i32;
+begin
+  Result := 0;
+end;
+
+procedure sqlite3MarkAllShadowTablesOf(db: PTsqlite3; pTab: PTable2);
+begin
+end;
+
+function sqlite3ShadowTableName(db: PTsqlite3; zName: PAnsiChar): i32;
+begin
+  Result := 0;
+end;
+
+function sqlite3ReadOnlyShadowTables(db: PTsqlite3): i32;
+begin
+  Result := 0;
+end;
+
+// ===========================================================================
+// Phase 6.5 — build.c: CREATE TABLE / DDL stubs
+// ===========================================================================
+
+procedure sqlite3StartTable(pParse: PParse; const pName1: PToken;
+  const pName2: PToken; isTemp: i32; isView: i32; isVirtual: i32;
+  noErr: i32);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3AddReturning(pParse: PParse; pList: PExprList);
+begin
+  sqlite3ExprListDelete(pParse^.db, pList);
+end;
+
+procedure sqlite3AddColumn(pParse: PParse; sName: TToken; sType: TToken);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3AddNotNull(pParse: PParse; onError: i32);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3AddDefaultValue(pParse: PParse; pExpr: PExpr;
+  zStart: PAnsiChar; zEnd: PAnsiChar);
+begin
+  sqlite3ExprDelete(pParse^.db, pExpr);
+end;
+
+procedure sqlite3AddPrimaryKey(pParse: PParse; pList: PExprList;
+  onError: i32; autoInc: i32; sortOrder: i32);
+begin
+  sqlite3ExprListDelete(pParse^.db, pList);
+end;
+
+procedure sqlite3AddCheckConstraint(pParse: PParse; pCheckExpr: PExpr;
+  zStart: PAnsiChar; zEnd: PAnsiChar);
+begin
+  sqlite3ExprDelete(pParse^.db, pCheckExpr);
+end;
+
+procedure sqlite3AddCollateType(pParse: PParse; pToken: PToken);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3AddGenerated(pParse: PParse; pExpr: PExpr; pType: PToken);
+begin
+  sqlite3ExprDelete(pParse^.db, pExpr);
+end;
+
+procedure sqlite3ChangeCookie(pParse: PParse; iDb: i32);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3EndTable(pParse: PParse; const pCons: PToken;
+  const pEnd: PToken; tabOpts: u32; pSelect: PSelect);
+begin
+  sqlite3SelectDelete(pParse^.db, pSelect);
+end;
+
+procedure sqlite3CreateView(pParse: PParse; const pBegin: PToken;
+  const pName1: PToken; const pName2: PToken; pCNames: PExprList;
+  pSelect: PSelect; isTemp: i32; noErr: i32);
+begin
+  sqlite3ExprListDelete(pParse^.db, pCNames);
+  sqlite3SelectDelete(pParse^.db, pSelect);
+end;
+
+function sqlite3ViewGetColumnNames(pParse: PParse; pTable: PTable2): i32;
+begin
+  Result := SQLITE_OK;
+end;
+
+procedure sqlite3RootPageMoved(db: PTsqlite3; iDb: i32; iFrom: u32; iTo: u32);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3CodeDropTable(pParse: PParse; pTab: PTable2; iDb: i32; isView: i32);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3DropTable(pParse: PParse; pName: PSrcList; isView: i32; noErr: i32);
+begin
+  sqlite3SrcListDelete(pParse^.db, pName);
+end;
+
+procedure sqlite3DropIndex(pParse: PParse; pName: PSrcList; ifExists: i32);
+begin
+  sqlite3SrcListDelete(pParse^.db, pName);
+end;
+
+procedure sqlite3CreateForeignKey(pParse: PParse; pFromCol: PExprList;
+  pTo: PToken; pToCol: PExprList; flags: i32);
+begin
+  sqlite3ExprListDelete(pParse^.db, pFromCol);
+  sqlite3ExprListDelete(pParse^.db, pToCol);
+end;
+
+procedure sqlite3DeferForeignKey(pParse: PParse; isDeferred: i32);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3CreateIndex(pParse: PParse; const pName1: PToken;
+  const pName2: PToken; pTblName: PSrcList; pList: PExprList;
+  onError: i32; const pStart: PToken; pPIWhere: PExpr;
+  sortOrder: i32; ifNotExist: i32; idxType: u8);
+begin
+  sqlite3SrcListDelete(pParse^.db, pTblName);
+  sqlite3ExprListDelete(pParse^.db, pList);
+  sqlite3ExprDelete(pParse^.db, pPIWhere);
+end;
+
+// ===========================================================================
+// Phase 6.5 — build.c: SrcList / IdList extensions
+// ===========================================================================
+
+function sqlite3SrcListEnlarge(pParse: PParse; pSrc: PSrcList;
+  nExtra: i32; iStart: i32): PSrcList;
+var
+  db: PTsqlite3;
+  nNew: i32;
+  pNew: PSrcList;
+begin
+  db := pParse^.db;
+  nNew := pSrc^.nSrc + nExtra;
+  { Pascal TSrcList header is 8 bytes with no items; all slots allocated separately }
+  pNew := PSrcList(sqlite3DbMallocRaw(db,
+    u64(SizeOf(TSrcList)) + u64(nNew) * SizeOf(TSrcItem)));
+  if pNew = nil then begin
+    Result := pSrc; Exit;
+  end;
+  pNew^.nSrc := pSrc^.nSrc + nExtra;
+  pNew^.nAlloc := nNew;
+  { Copy items before iStart }
+  if iStart > 0 then
+    Move(SrcListItems(pSrc)^, SrcListItems(pNew)^,
+         i32(iStart) * SizeOf(TSrcItem));
+  { Zero the new slots }
+  FillChar(PSrcItem(PByte(SrcListItems(pNew)) + iStart * SizeOf(TSrcItem))^,
+           nExtra * SizeOf(TSrcItem), 0);
+  { Copy items after iStart }
+  if iStart < pSrc^.nSrc then
+    Move(PSrcItem(PByte(SrcListItems(pSrc)) + iStart * SizeOf(TSrcItem))^,
+         PSrcItem(PByte(SrcListItems(pNew)) +
+           (iStart + nExtra) * SizeOf(TSrcItem))^,
+         (pSrc^.nSrc - iStart) * SizeOf(TSrcItem));
+  sqlite3DbFree(db, pSrc);
+  Result := pNew;
+end;
+
+function sqlite3SrcListAppend(pParse: PParse; pList: PSrcList;
+  const pTable: PToken; const pDatabase: PToken): PSrcList;
+var
+  db: PTsqlite3;
+  pItem: PSrcItem;
+begin
+  db := pParse^.db;
+  if pList = nil then begin
+    { C: allocates just the header; Enlarge handles actual slot allocation }
+    pList := PSrcList(sqlite3DbMallocZero(db, u64(SizeOf(TSrcList))));
+    if pList = nil then begin Result := nil; Exit; end;
+    pList^.nAlloc := 0;
+    pList^.nSrc   := 0;
+  end;
+  { Always call Enlarge to append one slot at the end (matches C exactly) }
+  pList := sqlite3SrcListEnlarge(pParse, pList, 1, pList^.nSrc);
+  if pList = nil then begin Result := nil; Exit; end;
+  if pList^.nSrc = 0 then begin Result := pList; Exit; end;
+  { Enlarge already incremented nSrc; the new item is at index nSrc-1 }
+  pItem := PSrcItem(PByte(SrcListItems(pList)) +
+    (pList^.nSrc - 1) * SizeOf(TSrcItem));
+  if pTable <> nil then
+    pItem^.zName := sqlite3DbStrNDup(db, PChar(pTable^.z), pTable^.n);
+  if (pDatabase <> nil) and (pDatabase^.n > 0) then
+    pItem^.u4.zDatabase :=
+      sqlite3DbStrNDup(db, PChar(pDatabase^.z), pDatabase^.n);
+  Result := pList;
+end;
+
+procedure sqlite3SrcListAssignCursors(pParse: PParse; pList: PSrcList);
+var
+  i: i32;
+  pItem: PSrcItem;
+begin
+  if pList = nil then Exit;
+  for i := 0 to pList^.nSrc - 1 do begin
+    pItem := PSrcItem(PByte(SrcListItems(pList)) + i * SizeOf(TSrcItem));
+    if pItem^.iCursor < 0 then begin
+      pItem^.iCursor := pParse^.nTab;
+      Inc(pParse^.nTab);
+    end;
+  end;
+end;
+
+procedure sqlite3SubqueryDelete(db: PTsqlite3; pSubq: Pointer);
+begin
+  { Phase 7 }
+end;
+
+function sqlite3SrcItemAttachSubquery(pParse: PParse; p: PSrcItem;
+  pSubquery: PSelect; isSub: i32): i32;
+begin
+  { Phase 7 }
+  sqlite3SelectDelete(pParse^.db, pSubquery);
+  Result := 0;
+end;
+
+function sqlite3SrcListAppendFromTerm(pParse: PParse; p: PSrcList;
+  pTable: PToken; pDatabase: PToken; pAlias: PToken; pSubquery: PSelect;
+  pOn: PExpr; pUsing: PIdList): PSrcList;
+var
+  db: PTsqlite3;
+  pItem: PSrcItem;
+begin
+  db := pParse^.db;
+  if pSubquery <> nil then begin
+    { Subquery — just delete it for now }
+    sqlite3SelectDelete(db, pSubquery);
+  end;
+  p := sqlite3SrcListAppend(pParse, p, pTable, pDatabase);
+  if p <> nil then begin
+    pItem := PSrcItem(PByte(SrcListItems(p)) +
+      (p^.nSrc - 1) * SizeOf(TSrcItem));
+    if (pAlias <> nil) and (pAlias^.n > 0) then
+      pItem^.zAlias :=
+        sqlite3DbStrNDup(db, PChar(pAlias^.z), pAlias^.n);
+    if pOn <> nil then begin
+      pItem^.u3.pOn := pOn;
+      pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $10;  { isOn bit }
+    end;
+    if pUsing <> nil then begin
+      pItem^.u3.pUsing := pUsing;
+      pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $08;  { isUsing bit }
+    end;
+  end else begin
+    sqlite3ExprDelete(db, pOn);
+    sqlite3IdListDelete(db, pUsing);
+  end;
+  Result := p;
+end;
+
+procedure sqlite3SrcListIndexedBy(pParse: PParse; p: PSrcList;
+  pIndexedBy: PToken);
+var
+  pItem: PSrcItem;
+begin
+  if (p = nil) or (p^.nSrc = 0) then Exit;
+  pItem := PSrcItem(PByte(SrcListItems(p)) +
+    (p^.nSrc - 1) * SizeOf(TSrcItem));
+  if pIndexedBy <> nil then begin
+    pItem^.fg.fgBits := pItem^.fg.fgBits or SRCITEM_FG_IS_INDEXED_BY;
+    pItem^.u1.zIndexedBy :=
+      sqlite3DbStrNDup(pParse^.db, PChar(pIndexedBy^.z), pIndexedBy^.n);
+  end;
+end;
+
+function sqlite3SrcListAppendList(pParse: PParse; p1: PSrcList;
+  p2: PSrcList): PSrcList;
+var
+  db: PTsqlite3;
+  i: i32;
+  pSrc: PSrcList;
+  pItem: PSrcItem;
+begin
+  db := pParse^.db;
+  if p2 = nil then begin Result := p1; Exit; end;
+  if p1 = nil then begin Result := p2; Exit; end;
+  pSrc := PSrcList(sqlite3DbMallocZero(db,
+    u64(SizeOf(TSrcList)) + u64(p1^.nSrc + p2^.nSrc) * SizeOf(TSrcItem)));
+  if pSrc = nil then begin
+    sqlite3SrcListDelete(db, p1);
+    sqlite3SrcListDelete(db, p2);
+    Result := nil; Exit;
+  end;
+  pSrc^.nSrc := p1^.nSrc + p2^.nSrc;
+  pSrc^.nAlloc := p1^.nSrc + p2^.nSrc;
+  if p1^.nSrc > 0 then
+    Move(SrcListItems(p1)^, SrcListItems(pSrc)^,
+         p1^.nSrc * SizeOf(TSrcItem));
+  if p2^.nSrc > 0 then
+    Move(SrcListItems(p2)^,
+         PSrcItem(PByte(SrcListItems(pSrc)) + p1^.nSrc * SizeOf(TSrcItem))^,
+         p2^.nSrc * SizeOf(TSrcItem));
+  sqlite3DbFree(db, p1);
+  sqlite3DbFree(db, p2);
+  Result := pSrc;
+end;
+
+procedure sqlite3SrcListFuncArgs(pParse: PParse; p: PSrcList;
+  pList: PExprList);
+begin
+  { Phase 7 }
+  sqlite3ExprListDelete(pParse^.db, pList);
+end;
+
+procedure sqlite3SrcListShiftJoinType(pParse: PParse; p: PSrcList);
+var
+  i: i32;
+  pItem: PSrcItem;
+begin
+  { Rotate jointype from current last item to next item's fg.jointype }
+  if (p = nil) or (p^.nSrc <= 1) then Exit;
+  for i := p^.nSrc - 1 downto 1 do begin
+    pItem := PSrcItem(PByte(SrcListItems(p)) + i * SizeOf(TSrcItem));
+    { shift: clear each item's jointype (set from parser later) }
+    pItem^.fg.jointype := 0;
+  end;
+end;
+
+function sqlite3IdListAppend(pParse: PParse; pList: PIdList;
+  pToken: PToken): PIdList;
+var
+  db: PTsqlite3;
+  nNew: i32;
+  pNew: PIdList;
+  pItem: PIdListItem;
+begin
+  db := pParse^.db;
+  if pList = nil then begin
+    pNew := PIdList(sqlite3DbMallocZero(db,
+      u64(SZ_IDLIST_HEADER) + SizeOf(TIdListItem)));
+    if pNew = nil then begin Result := nil; Exit; end;
+    pNew^.nId := 0;
+  end else
+    pNew := pList;
+  nNew := pNew^.nId + 1;
+  { Resize if needed (simple doubling) }
+  pNew := PIdList(sqlite3DbReallocOrFree(db, pNew,
+    u64(SZ_IDLIST_HEADER) + u64(nNew) * SizeOf(TIdListItem)));
+  if pNew = nil then begin Result := nil; Exit; end;
+  pItem := PIdListItem(PByte(IdListItems(pNew)) +
+    pNew^.nId * SizeOf(TIdListItem));
+  pItem^.zName := sqlite3DbStrNDup(db, PChar(pToken^.z), pToken^.n);
+  Inc(pNew^.nId);
+  Result := pNew;
+end;
+
+// ===========================================================================
+// Phase 6.5 — build.c: Transaction / verify stubs
+// ===========================================================================
+
+procedure sqlite3BeginTransaction(pParse: PParse; type_: i32);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3EndTransaction(pParse: PParse; eType: i32);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3Savepoint(pParse: PParse; op: i32; pName: PToken);
+begin
+  { Phase 7 }
+end;
+
+function sqlite3OpenTempDatabase(pParse: PParse): i32;
+begin
+  Result := SQLITE_OK;
+end;
+
+procedure sqlite3CodeVerifySchema(pParse: PParse; iDb: i32);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3CodeVerifyNamedSchema(pParse: PParse; zDb: PAnsiChar);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3BeginWriteOperation(pParse: PParse; setStatement: i32; iDb: i32);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3MultiWrite(pParse: PParse);
+begin
+  pParse^.isMultiWrite := 1;
+end;
+
+procedure sqlite3MayAbort(pParse: PParse);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3HaltConstraint(pParse: PParse; errCode: i32; onError: i32;
+  p4: PAnsiChar; p4type: i8; p5: u8);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3UniqueConstraint(pParse: PParse; onError: i32; pIdx: PIndex2);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3RowidConstraint(pParse: PParse; onError: i32; pTab: PTable2);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3FinishCoding(pParse: PParse);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3NestedParse(pParse: PParse; zFormat: PAnsiChar);
+begin
+  { Phase 7 }
+end;
+
+function sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
+begin
+  Result := nil; { Phase 7 }
+end;
+
+// ===========================================================================
+// Phase 6.5 — prepare.c (real implementations)
+// ===========================================================================
+
+{ sqlite3ParseObjectInit — initialise a Parse object (prepare.c:661) }
+procedure sqlite3ParseObjectInit(pParse: PParse; db: PTsqlite3);
+begin
+  { Zero the "header" portion: from zErrMsg (offset 8) for PARSE_HDR_SZ bytes }
+  FillChar((PByte(pParse) + PARSE_HDR_OFFSET)^, PARSE_HDR_SZ, 0);
+  { Zero the "tail" portion: from sLastToken (offset 280) for PARSE_TAIL_SZ bytes }
+  FillChar((PByte(pParse) + PARSE_RECURSE_SZ)^, PARSE_TAIL_SZ, 0);
+  pParse^.pOuterParse := db^.pParse;
+  db^.pParse := pParse;
+  pParse^.db := db;
+  if db^.mallocFailed <> 0 then
+    sqlite3ErrorMsg(pParse, 'out of memory');
+end;
+
+{ sqlite3ParseObjectReset — free all resources in a Parse, unlink from db (prepare.c:572) }
+procedure sqlite3ParseObjectReset(pParse: PParse);
+var
+  db: PTsqlite3;
+  pCleanup: PParseCleanup;
+  pNext: Pointer;
+begin
+  db := pParse^.db;
+  { Run cleanup list }
+  while pParse^.pCleanup <> nil do begin
+    pCleanup := PParseCleanup(pParse^.pCleanup);
+    pParse^.pCleanup := pCleanup^.pNext;
+    pCleanup^.xCleanup(db, pCleanup^.pPtr);
+    sqlite3DbFree(db, pCleanup);
+  end;
+  { Free label array }
+  if pParse^.aLabel <> nil then
+    sqlite3DbFree(db, pParse^.aLabel);
+  { Free const expressions }
+  if pParse^.pConstExpr <> nil then
+    sqlite3ExprListDelete(db, pParse^.pConstExpr);
+  { Adjust lookaside }
+  db^.lookaside.bDisable :=
+    db^.lookaside.bDisable - pParse^.disableLookaside;
+  if db^.lookaside.bDisable <> 0 then
+    db^.lookaside.sz := 0
+  else
+    db^.lookaside.sz := db^.lookaside.szTrue;
+  { Unlink from db chain }
+  db^.pParse := pParse^.pOuterParse;
+end;
+
+{ sqlite3ParserAddCleanup — register a cleanup to run when Parse is reset (prepare.c:625) }
+function sqlite3ParserAddCleanup(pParse: PParse; xCleanup: Pointer;
+  pPtr: Pointer): Pointer;
+var
+  pCleanup: PParseCleanup;
+begin
+  pCleanup := PParseCleanup(sqlite3DbMallocRaw(pParse^.db,
+    SizeOf(TParseCleanup)));
+  if pCleanup <> nil then begin
+    pCleanup^.pNext := pParse^.pCleanup;
+    pParse^.pCleanup := pCleanup;
+    pCleanup^.pPtr := pPtr;
+    pCleanup^.xCleanup := TParseCleanupFn(xCleanup);
+    Result := pPtr;
+  end else begin
+    TParseCleanupFn(xCleanup)(pParse^.db, pPtr);
+    Result := nil;
+  end;
+end;
+
+{ sqlite3RunParser — stub; Phase 7 will call the real Lemon-generated parser }
+procedure sqlite3RunParser(pParse: PParse; zSql: PAnsiChar);
+begin
+  { Phase 7: invoke sqlite3Parser (Lemon-generated) and tokenizer }
+  sqlite3ErrorMsg(pParse, 'parser not yet implemented (Phase 7)');
+  pParse^.rc := SQLITE_ERROR;
+end;
+
+{ sqlite3SafetyCheckOk — verify db is in a usable state }
+function sqlite3SafetyCheckOk(db: PTsqlite3): i32;
+begin
+  if db = nil then begin Result := 0; Exit; end;
+  if db^.eOpenState <> 1 then begin Result := 0; Exit; end;
+  Result := 1;
+end;
+
+function sqlite3SafetyCheckSickOrOk(db: PTsqlite3): i32;
+begin
+  if db = nil then begin Result := 0; Exit; end;
+  if (db^.eOpenState <> 1) and (db^.eOpenState <> 2) then
+    begin Result := 0; Exit; end;
+  Result := 1;
+end;
+
+procedure sqlite3Error(db: PTsqlite3; err_code: i32);
+begin
+  db^.errCode := err_code;
+end;
+
+procedure sqlite3ErrorWithMsg(db: PTsqlite3; err_code: i32; zFmt: PAnsiChar);
+begin
+  db^.errCode := err_code;
+  { Phase 7: store formatted error in db^.pErr }
+end;
+
+procedure sqlite3ErrorClear(db: PTsqlite3);
+begin
+  db^.errCode := SQLITE_OK;
+end;
+
+procedure sqlite3SystemError(db: PTsqlite3; rc: i32);
+begin
+  db^.iSysErrno := rc;
+end;
+
+function sqlite3TransferBindings(pFromStmt: Pointer; pToStmt: Pointer): i32;
+begin
+  Result := SQLITE_OK; { Phase 7 }
+end;
+
+procedure sqlite3BtreeEnterAll(db: PTsqlite3);
+begin
+  { Phase 7 — acquire btree mutexes }
+end;
+
+procedure sqlite3BtreeLeaveAll(db: PTsqlite3);
+begin
+  { Phase 7 }
+end;
+
+function sqlite3BtreeSchemaLocked(pBt: Pointer): i32;
+begin
+  Result := 0; { Phase 7 }
+end;
+
+function sqlite3BtreeHoldsAllMutexes(db: PTsqlite3): i32;
+begin
+  Result := 1; { stub: assume always true }
+end;
+
+procedure sqlite3OomFaultGeneric(db: PTsqlite3);
+begin
+  db^.mallocFailed := 1;
+end;
+
+function sqlite3VdbeSetSql(v: PVdbe; z: PAnsiChar; n: i32; prepFlags: u32): i32;
+begin
+  { Phase 7 — store SQL text in Vdbe }
+  Result := SQLITE_OK;
+end;
+
+function sqlite3VdbeDb(v: PVdbe): PTsqlite3;
+begin
+  Result := v^.db;
+end;
+
+function sqlite3VdbePrepareFlags(v: PVdbe): u8;
+begin
+  Result := v^.prepFlags;
+end;
+
+function sqlite3VdbeResetStepResult(v: PVdbe): i32;
+begin
+  v^.pc := -1;
+  Result := SQLITE_OK;
+end;
+
+function sqlite3_stmt_isexplain(pStmt: Pointer): i32;
+begin
+  if pStmt = nil then begin Result := 0; Exit; end;
+  Result := i32((PVdbe(pStmt)^.vdbeFlags and VDBF_EXPLAIN_MASK) shr 2);
+end;
+
+{ sqlite3_prepare — stub; real implementation requires Phase 7 parser }
+function sqlite3_prepare(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPAnsiChar): i32;
+begin
+  if ppStmt <> nil then ppStmt^ := nil;
+  if pzTail <> nil then pzTail^ := zSql;
+  Result := SQLITE_ERROR; { Phase 7 }
+end;
+
+function sqlite3_prepare_v2(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPAnsiChar): i32;
+begin
+  Result := sqlite3_prepare(db, zSql, nBytes, ppStmt, pzTail);
+end;
+
+function sqlite3_prepare_v3(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+  prepFlags: u32; ppStmt: PPointer; pzTail: PPAnsiChar): i32;
+begin
+  Result := sqlite3_prepare(db, zSql, nBytes, ppStmt, pzTail);
+end;
+
+function sqlite3_prepare16(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPointer): i32;
+begin
+  if ppStmt <> nil then ppStmt^ := nil;
+  Result := SQLITE_ERROR; { Phase 7 }
+end;
+
+function sqlite3_prepare16_v2(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPointer): i32;
+begin
+  Result := sqlite3_prepare16(db, zSql, nBytes, ppStmt, pzTail);
+end;
+
+function sqlite3_prepare16_v3(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  prepFlags: u32; ppStmt: PPointer; pzTail: PPointer): i32;
+begin
+  Result := sqlite3_prepare16(db, zSql, nBytes, ppStmt, pzTail);
+end;
+
+function sqlite3Reprepare(p: PVdbe): i32;
+begin
+  Result := SQLITE_OK; { Phase 7 }
+end;
+
+// ===========================================================================
+// Phase 6.5 — alter.c stubs
+// ===========================================================================
+
+procedure sqlite3AlterRenameTable(pParse: PParse; pSrc: PSrcList;
+  const pName: PToken);
+begin
+  sqlite3SrcListDelete(pParse^.db, pSrc);
+end;
+
+procedure sqlite3AlterFinishAddColumn(pParse: PParse; pColDef: PToken);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3AlterBeginAddColumn(pParse: PParse; pSrc: PSrcList);
+begin
+  sqlite3SrcListDelete(pParse^.db, pSrc);
+end;
+
+procedure sqlite3AlterRenameColumn(pParse: PParse; pSrc: PSrcList;
+  const pOld: PToken; const pNew: PToken);
+begin
+  sqlite3SrcListDelete(pParse^.db, pSrc);
+end;
+
+procedure sqlite3AlterDropColumn(pParse: PParse; pSrc: PSrcList;
+  const pName: PToken);
+begin
+  sqlite3SrcListDelete(pParse^.db, pSrc);
+end;
+
+procedure sqlite3AlterDropConstraint(pParse: PParse; pSrc: PSrcList;
+  pType: PToken; pName: PToken);
+begin
+  sqlite3SrcListDelete(pParse^.db, pSrc);
+end;
+
+procedure sqlite3AlterSetNotNull(pParse: PParse; pSrc: PSrcList;
+  pName: PToken; onError: i32);
+begin
+  sqlite3SrcListDelete(pParse^.db, pSrc);
+end;
+
+procedure sqlite3AlterAddConstraint(pParse: PParse; pSrc: PSrcList;
+  pType: PToken);
+begin
+  sqlite3SrcListDelete(pParse^.db, pSrc);
+end;
+
+procedure sqlite3AlterFunctions;
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3RenameTokenRemap(pParse: PParse; pTo: Pointer;
+  pFrom: Pointer);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3RenameExprlistUnmap(pParse: PParse; pEList: PExprList);
+begin
+  { Phase 7 }
+end;
+
+// ===========================================================================
+// Phase 6.5 — attach.c stubs
+// ===========================================================================
+
+procedure sqlite3Detach(pParse: PParse; pDbname: PExpr);
+begin
+  sqlite3ExprDelete(pParse^.db, pDbname);
+end;
+
+procedure sqlite3Attach(pParse: PParse; p: PExpr; pDbname: PExpr; pKey: PExpr);
+begin
+  sqlite3ExprDelete(pParse^.db, p);
+  sqlite3ExprDelete(pParse^.db, pDbname);
+  sqlite3ExprDelete(pParse^.db, pKey);
+end;
+
+procedure sqlite3FixInit(pFix: PDbFixer; pParse: PParse; iDb: i32;
+  zType: PAnsiChar; const pName: PToken);
+begin
+  FillChar(pFix^, SizeOf(TDbFixer), 0);
+  pFix^.pParse := pParse;
+  pFix^.zDb := pParse^.db^.aDb[iDb].zDbSName;
+  pFix^.zType := zType;
+  pFix^.pName := pName;
+  pFix^.pSchema := pParse^.db^.aDb[iDb].pSchema;
+end;
+
+function sqlite3FixSrcList(pFix: PDbFixer; pList: PSrcList): i32;
+begin
+  Result := SQLITE_OK;
+end;
+
+function sqlite3FixSelect(pFix: PDbFixer; pSelect: PSelect): i32;
+begin
+  Result := SQLITE_OK;
+end;
+
+function sqlite3FixExpr(pFix: PDbFixer; pExpr: PExpr): i32;
+begin
+  Result := SQLITE_OK;
+end;
+
+function sqlite3FixTriggerStep(pFix: PDbFixer; pStep: PTriggerStep): i32;
+begin
+  Result := SQLITE_OK;
+end;
+
+// ===========================================================================
+// Phase 6.5 — analyze.c stubs
+// ===========================================================================
+
+procedure sqlite3Analyze(pParse: PParse; pName1: PToken; pName2: PToken);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3DeleteIndexSamples(db: PTsqlite3; pIdx: PIndex2);
+begin
+  { Phase 7 }
+end;
+
+function sqlite3AnalysisLoad(db: PTsqlite3; iDb: i32): i32;
+begin
+  Result := SQLITE_OK;
+end;
+
+// ===========================================================================
+// Phase 6.5 — pragma.c stubs
+// ===========================================================================
+
+procedure sqlite3Pragma(pParse: PParse; const pId1: PToken;
+  const pId2: PToken; pValue: PToken; minusFlag: i32);
+begin
+  { Phase 7 }
+end;
+
+function sqlite3PragmaVtabRegister(db: PTsqlite3; zName: PAnsiChar): Pointer;
+begin
+  Result := nil;
+end;
+
+// ===========================================================================
+// Phase 6.5 — vacuum.c stub
+// ===========================================================================
+
+procedure sqlite3Vacuum(pParse: PParse; pNm: PToken; pInto: PExpr);
+begin
+  sqlite3ExprDelete(pParse^.db, pInto);
+end;
+
+// ===========================================================================
+// Phase 6.5 — callback.c stubs
+// ===========================================================================
+
+procedure sqlite3SchemaClear(p: Pointer);
+var
+  pSchema: passqlite3util.PSchema;
+begin
+  pSchema := passqlite3util.PSchema(p);
+  if pSchema = nil then Exit;
+  sqlite3HashClear(@pSchema^.tblHash);
+  sqlite3HashClear(@pSchema^.idxHash);
+  sqlite3HashClear(@pSchema^.trigHash);
+  sqlite3HashClear(@pSchema^.fkeyHash);
+  pSchema^.pSeqTab := nil;
+end;
+
+function sqlite3SchemaGet(db: PTsqlite3; pBt: Pointer): PSchema;
+var
+  p: passqlite3util.PSchema;
+begin
+  if pBt = nil then begin
+    p := passqlite3util.PSchema(sqlite3DbMallocZero(db, SizeOf(TSchema)));
+    if p <> nil then begin
+      sqlite3HashInit(@p^.tblHash);
+      sqlite3HashInit(@p^.idxHash);
+      sqlite3HashInit(@p^.trigHash);
+      sqlite3HashInit(@p^.fkeyHash);
+      p^.enc := SQLITE_UTF8;
+    end;
+    Result := p;
+  end else
+    Result := nil; { Phase 7: look up schema from btree }
+end;
+
+procedure sqlite3SetTextEncoding(db: PTsqlite3; enc: u8);
+begin
+  db^.enc := enc;
+end;
+
+procedure sqlite3InsertBuiltinFuncs(aFunc: Pointer; nFunc: i32);
+begin
+  { Phase 7 }
+end;
+
+function sqlite3CheckCollSeq(pParse: PParse; pColl: Pointer): i32;
+begin
+  Result := SQLITE_OK;
+end;
+
+function sqlite3FindCollSeq(db: PTsqlite3; enc: u8; zName: PAnsiChar;
+  create: i32): Pointer;
+begin
+  Result := nil; { Phase 7 }
+end;
+
+function sqlite3LocateCollSeq(pParse: PParse; zName: PAnsiChar): Pointer;
+begin
+  Result := nil; { Phase 7 }
+end;
+
+procedure sqlite3AutoLoadExtensions(db: PTsqlite3);
+begin
+  { Phase 7/8 }
+end;
+
+function sqlite3CreateFunc(db: PTsqlite3; zFunctionName: PAnsiChar;
+  nArg: i32; enc: i32; pUserData: Pointer; xSFunc: Pointer;
+  xStep: Pointer; xFinal: Pointer; xValue: Pointer; xInverse: Pointer;
+  pDestructor: Pointer): i32;
+begin
+  Result := SQLITE_OK; { Phase 7 }
+end;
+
+// ===========================================================================
+// Phase 6.5 — func.c stubs
+// ===========================================================================
+
+procedure sqlite3RegisterBuiltinFunctions;
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3RegisterPerConnectionBuiltinFunctions(db: PTsqlite3);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3RegisterLikeFunctions(db: PTsqlite3; caseSensitive: i32);
+begin
+  { Phase 7 }
+end;
+
+function sqlite3IsLikeFunction(db: PTsqlite3; pExpr: PExpr;
+  pIsNocase: Pi32; aWc: PAnsiChar): i32;
+begin
+  Result := 0;
+end;
+
+function sqlite3_strglob(zGlobPattern: PAnsiChar; zString: PAnsiChar): i32;
+var
+  p, s: PByte;
+begin
+  { Simple glob: * matches any sequence, ? matches one char }
+  p := PByte(zGlobPattern);
+  s := PByte(zString);
+  while (p^ <> 0) and (s^ <> 0) do begin
+    if p^ = Ord('*') then begin
+      Inc(p);
+      if p^ = 0 then begin Result := 0; Exit; end;
+      while s^ <> 0 do begin
+        if sqlite3_strglob(PAnsiChar(p), PAnsiChar(s)) = 0 then begin
+          Result := 0; Exit;
+        end;
+        Inc(s);
+      end;
+      Result := 1; Exit;
+    end else if (p^ = Ord('?')) or (p^ = s^) then begin
+      Inc(p); Inc(s);
+    end else begin
+      Result := 1; Exit;
+    end;
+  end;
+  while p^ = Ord('*') do Inc(p);
+  if (p^ = 0) and (s^ = 0) then Result := 0 else Result := 1;
+end;
+
+function sqlite3_strlike(zPattern: PAnsiChar; zStr: PAnsiChar; esc: u32): i32;
+var
+  p, s: PByte;
+  c, cs: u32;
+begin
+  p := PByte(zPattern);
+  s := PByte(zStr);
+  while (p^ <> 0) and (s^ <> 0) do begin
+    c := sqlite3UpperToLower[p^];
+    if (esc <> 0) and (c = esc) then begin
+      Inc(p);
+      c := sqlite3UpperToLower[p^];
+      cs := sqlite3UpperToLower[s^];
+      if c <> cs then begin Result := 1; Exit; end;
+      Inc(p); Inc(s);
+    end else if c = Ord('%') then begin
+      Inc(p);
+      if p^ = 0 then begin Result := 0; Exit; end;
+      while s^ <> 0 do begin
+        if sqlite3_strlike(PAnsiChar(p), PAnsiChar(s), esc) = 0 then begin
+          Result := 0; Exit;
+        end;
+        Inc(s);
+      end;
+      Result := 1; Exit;
+    end else if (c = Ord('_')) or (c = sqlite3UpperToLower[s^]) then begin
+      Inc(p); Inc(s);
+    end else begin
+      Result := 1; Exit;
+    end;
+  end;
+  while p^ = Ord('%') do Inc(p);
+  if (p^ = 0) and (s^ = 0) then Result := 0 else Result := 1;
 end;
 
 end.

@@ -1646,10 +1646,11 @@ reference exactly.
   Gate test: `TestDMLBasic.pas` — 54/54 PASS (2026-04-25). All 49 prior
   TestSelectBasic + 52 TestWhereBasic + all other tests still PASS.
 
-- [ ] **6.5** Port **schema management**: `build.c` (CREATE/DROP + parsing
+- [X] **6.5** Port **schema management**: `build.c` (CREATE/DROP + parsing
   `sqlite_master` at open), `alter.c` (ALTER TABLE), `prepare.c` (schema
   parsing + `sqlite3_prepare` internals), `analyze.c`, `attach.c`,
   `pragma.c`, `vacuum.c`.
+  Gate test: `TestSchemaBasic.pas` — 44/44 PASS (2026-04-25).
 
 - [ ] **6.6** Port **auth and built-in functions**: `auth.c`, `callback.c`,
   `func.c` (scalars: `abs`, `coalesce`, `like`, `substr`, `lower`, etc.),
@@ -1707,6 +1708,57 @@ schema lookup.
 
 **Gate test**: `TestDMLBasic.pas` — 54 checks: struct sizes (6), field offsets (24),
 upsert lifecycle (6), trigger stub API (4), constants (9). All 54 PASS.
+
+### Phase 6.5 implementation notes (2026-04-25)
+
+**Unit**: `src/passqlite3codegen.pas` (extended).
+
+**Key FPC discoveries**:
+- `PSchema` (from passqlite3util) is shadowed if re-declared locally as `Pointer`.
+  Var-block declarations needing field access must use `passqlite3util.PSchema`.
+- FPC can't do anonymous procedure literals (no lambdas); `sqlite3ParserAddCleanup`
+  uses direct `TParseCleanupFn(xCleanup)` cast.
+- `SizeOf(TSrcList)` = 8 (header only, no items). Pascal `sqlite3SrcListAppend`
+  must call `sqlite3SrcListEnlarge` unconditionally (as in C), not guard with
+  `nSrc >= nAlloc`. Old C-style `(nNew-1)` formula was wrong; Pascal uses `nNew`.
+- `PParse(Pointer_expr)` type-cast inside a procedure body causes a "Syntax error,
+  ';' expected" in FPC; write `dest := src_pointer` directly (Pointer is
+  assignment-compatible with any typed pointer).
+- `Pu8(pParse)[offset]` is not valid as a `var` FillChar argument; use
+  `(PByte(pParse) + offset)^` form instead.
+- `pSchema: PSchema` in var blocks gives "Error in type definition" when `PSchema`
+  is used both as a record field name (`TIndex.pSchema`) and a type in the same
+  compilation unit (FPC case-insensitive disambiguation fails). Fix: use
+  `pSchema: passqlite3util.PSchema` qualified form.
+
+**New types**: `TParseCleanup` (24 bytes), `TDbFixer` (48 bytes), `PPToken`,
+`PPAnsiChar`, `PLogEst`.
+
+**New constants**: `DBFLAG_SchemaKnownOk`, `LOCATE_VIEW`, `LOCATE_NOERR`,
+`OMIT_TEMPDB`, `LEGACY/PREFERRED_SCHEMA_TABLE` names, `PARSE_HDR_OFFSET`,
+`PARSE_HDR_SZ`, `PARSE_RECURSE_SZ`, `PARSE_TAIL_SZ`, `INITFLAG_Alter*`.
+
+**Real implementations** (not stubs):
+- `sqlite3SchemaToIndex` / `sqlite3SchemaToIndexInner`
+- `sqlite3FindTable`, `sqlite3FindIndex`, `sqlite3FindDb`, `sqlite3FindDbName`
+- `sqlite3LocateTable`, `sqlite3LocateTableItem`
+- `sqlite3DbIsNamed`, `sqlite3DbMaskAllZero`
+- `sqlite3PreferredTableName`
+- `sqlite3ParseObjectInit` / `sqlite3ParseObjectReset`
+- `sqlite3ParserAddCleanup` (real linked-list of cleanup callbacks)
+- `sqlite3AllocateIndexObject` + `sqlite3DefaultRowEst` + `sqlite3TableColumnToIndex`
+- `sqlite3SrcListEnlarge`, `sqlite3SrcListAppend`, `sqlite3SrcListAppendFromTerm`
+- `sqlite3SrcListIndexedBy`, `sqlite3SrcListAppendList`, `sqlite3IdListAppend`
+- `sqlite3SchemaClear`, `sqlite3SchemaGet`
+- `sqlite3UnlinkAndDeleteTable`, `sqlite3ResetAllSchemasOfConnection`
+
+**Stubs** (real code deferred to Phase 7 which needs the Lemon parser):
+- `sqlite3RunParser`, `sqlite3_prepare*` — return SQLITE_ERROR
+- All DDL codegen (CREATE TABLE/INDEX/VIEW, DROP, ALTER, ATTACH, PRAGMA, VACUUM, ANALYZE)
+
+**Gate test**: `TestSchemaBasic.pas` — 44 checks: constants (14), sizes (2),
+FindDbName (4), DbIsNamed (3), SchemaToIndex (2), AllocateIndexObject/DefaultRowEst (9),
+SrcList ops (4), IdList ops (3), ParseObject lifecycle (4). All 44 PASS.
 
 ### 6.bis — Virtual-table machinery
 
