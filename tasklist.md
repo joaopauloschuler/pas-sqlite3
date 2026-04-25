@@ -2274,9 +2274,59 @@ statement is syntactically complete — used by the CLI and REPLs).
         order — i.e. arg 3 is the name, arg 4 is the type.  The Pascal
         parameter names are misleading; flagged for Phase 8.  The stub
         body only deletes pSrc, so positional mismatch is harmless.
-    - [ ] **7.2e.7** Rules 300..349 — ALTER ADD CONSTRAINT/CHECK,
-      common_table_expr / WITH / cte / wqlist, foreach_clause, sub_select,
-      and any expression-tail rules in this band.
+    - [X] **7.2e.7** Rules 300..347 — ALTER ADD CONSTRAINT/CHECK (300/301),
+      create_vtab + vtabarg/vtabargtoken/lp (302..308), WITH / wqas / wqitem
+      / withnm / wqlist (309..317), windowdefn_list / windowdefn / window /
+      frame_opt / frame_bound[_s|_e] / frame_exclude[_opt] / window_clause /
+      filter_over / over_clause / filter_clause (318..346), term ::= QNUMBER
+      (347).  Rules 348+ remain in the default no-op branch (Lemon optimised
+      most of them out — see parse.c lines 5927..5993).  DONE 2026-04-25.
+
+      Notes for next chunks:
+      * **`sqlite3AlterAddConstraint` signature corrected** in
+        `passqlite3codegen.pas` — was a 3-arg stub `(pParse, pSrc, pType)`,
+        upstream is `(Parse*, SrcList*, Token* pCons, Token* pName,
+        const char* zCheck, int nCheck)`.  Body is still a stub that drops
+        the SrcList; Phase 8 must port alter.c's full body.
+      * **Six new local helpers** were added directly above `yy_reduce` in
+        `passqlite3parser.pas` (continuing the 7.2e.3..6 pattern):
+        - `sqlite3VtabBeginParse / FinishParse / ArgInit / ArgExtend` —
+          full no-op stubs.  CREATE VIRTUAL TABLE parses cleanly but
+          produces no schema entry until Phase 6.bis ports vtab.c.
+        - `sqlite3CteNew` — stub returns nil and frees the inputs
+          (`pArglist` via `sqlite3ExprListDelete`, `pQuery` via
+          `sqlite3SelectDelete`).  Real body lives at sqlite3.c:131988
+          (build.c).
+        - `sqlite3WithAdd` — stub returns the existing With pointer
+          unchanged.  Cte-leak path is acceptable for parser-only tests
+          since `sqlite3CteNew` already returns nil; Phase 8 must wire
+          this up against a real `Cte` type.
+        - `sqlite3DequoteNumber` — no-op stub.  QNUMBER is a rare lexer
+          token (quoted-numeric literal); skipping the dequote is harmless
+          for parser-only tests.
+      * **`M10d_Yes/Any/No` constants** (sqliteInt.h:21461..21463) added as
+        a local `const` block immediately above the helper stubs.  Once
+        Phase 8 ports build.c's CTE machinery these should move into the
+        codegen interface alongside `OE_*`/`TF_*`.
+      * **`pPse^.bHasWith := 1`** (rule 315 in C) maps to
+        `parseFlags := parseFlags or PARSEFLAG_BHasWith` — flag already
+        defined in passqlite3codegen at bit 6.
+      * **`yy509` is `TYYFrameBound`** (eType: i32; pExpr: Pointer).
+        Rules 326/327/333 read `.eType` directly and cast `.pExpr` to
+        `PExpr` when handing to `sqlite3WindowAlloc`.  The trivial pass-
+        through rules 329/331 do an explicit `yylhsminor.yy509 :=
+        yymsp[0].minor.yy509; yymsp[0].minor.yy509 := yylhsminor.yy509;`
+        round-trip — semantically a no-op, kept for symmetry with C.
+      * **`yymsp[-3].minor.yy0.z + 1`** (C pointer arithmetic on PAnsiChar)
+        — rules 300/301 cast through `PAnsiChar(...) + 1`.  The byte
+        length is computed via `PtrUInt(end.z) - PtrUInt(start.z) - 1`.
+      * **Window allocation in rules 343/345** uses
+        `sqlite3DbMallocZero(db, u64(SizeOf(TWindow)))` (TWindow is 144
+        bytes per the verified offset-table comment in passqlite3codegen).
+        `eFrmType` is `u8`, so `TK_FILTER` requires an explicit `u8(...)`
+        cast.
+      * Six new locals in `yy_reduce`'s var block: `pWin_318/319/343/345`,
+        `zCheckStart_300`, `nCheck_300`.
     - [ ] **7.2e.8** Rules 350..411 — windows (WINDOW/OVER/FILTER, frame,
       window definition tail), VIRTUAL TABLE, table-valued functions,
       remaining tail rules.

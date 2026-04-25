@@ -2147,7 +2147,7 @@ procedure sqlite3AlterDropConstraint(pParse: PParse; pSrc: PSrcList;
 procedure sqlite3AlterSetNotNull(pParse: PParse; pSrc: PSrcList;
   pName: PToken; pNot: PToken);
 procedure sqlite3AlterAddConstraint(pParse: PParse; pSrc: PSrcList;
-  pType: PToken);
+  pCons: PToken; pName: PToken; zCheck: PAnsiChar; nCheck: i32);
 procedure sqlite3AlterFunctions;
 procedure sqlite3RenameTokenRemap(pParse: PParse; pTo: Pointer;
   pFrom: Pointer);
@@ -6485,8 +6485,10 @@ begin
 end;
 
 procedure sqlite3AlterAddConstraint(pParse: PParse; pSrc: PSrcList;
-  pType: PToken);
+  pCons: PToken; pName: PToken; zCheck: PAnsiChar; nCheck: i32);
 begin
+  { Phase 7.2e.7 stub — full body lives in alter.c.  Until Phase 8 ports
+    the ALTER TABLE ADD CONSTRAINT path, drop the SrcList and return. }
   sqlite3SrcListDelete(pParse^.db, pSrc);
 end;
 

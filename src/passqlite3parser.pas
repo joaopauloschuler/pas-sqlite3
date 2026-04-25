@@ -1715,6 +1715,67 @@ begin
   sqlite3SelectDelete(db, pSelect);
 end;
 
+{ ---- Phase 7.2e.7 helpers (rules 300..347) ------------------------------ }
+{ M10d_* — CTE materialisation hint (sqliteInt.h:21461..21463).             }
+const
+  M10d_Yes = u8(0); { AS MATERIALIZED                                       }
+  M10d_Any = u8(1); { Not specified — query planner's choice                }
+  M10d_No  = u8(2); { AS NOT MATERIALIZED                                   }
+
+{ Virtual-table parser hooks (vtab.c:161979..162135).  The real bodies live }
+{ in vtab.c which is part of Phase 6.bis.  Stubs here are sufficient for    }
+{ parser-only differential testing — CREATE VIRTUAL TABLE merely succeeds  }
+{ at parse time without producing VDBE code.                                 }
+procedure sqlite3VtabBeginParse(pPse: PParse; pName1: PToken; pName2: PToken;
+                                pModuleName: PToken; ifNotExists: i32);
+begin
+  { TODO Phase 6.bis: port vtab.c virtual-table machinery. }
+end;
+
+procedure sqlite3VtabFinishParse(pPse: PParse; pEnd: PToken);
+begin
+  { TODO Phase 6.bis: port vtab.c virtual-table machinery. }
+end;
+
+procedure sqlite3VtabArgInit(pPse: PParse);
+begin
+  { TODO Phase 6.bis: port vtab.c virtual-table machinery. }
+end;
+
+procedure sqlite3VtabArgExtend(pPse: PParse; p: PToken);
+begin
+  { TODO Phase 6.bis: port vtab.c virtual-table machinery. }
+end;
+
+{ sqlite3CteNew — allocate a Cte node (build.c:131988).  Phase 7.2e.7 stub }
+{ returns nil and frees its inputs.  Once build.c's CTE helpers are ported }
+{ in Phase 8, replace this with the full body.                              }
+function sqlite3CteNew(pPse: PParse; pName: PToken; pArglist: PExprList;
+                       pQuery: PSelect; eM10d: u8): Pointer;
+begin
+  Result := nil;
+  sqlite3ExprListDelete(pPse^.db, pArglist);
+  sqlite3SelectDelete(pPse^.db, pQuery);
+end;
+
+{ sqlite3WithAdd — append a Cte to a With list (build.c:132039).            }
+{ Stub: returns the existing With pointer unchanged and frees the Cte.     }
+{ Sufficient for parser-only flow; Phase 8 must port the real body.        }
+function sqlite3WithAdd(pPse: PParse; pWith: Pointer; pCte: Pointer): Pointer;
+begin
+  Result := pWith;
+  { pCte is opaque here (no PCte type yet); leak-free path is Phase 8's. }
+  if pCte = nil then ;
+end;
+
+{ sqlite3DequoteNumber — strip surrounding quotes from a QNUMBER literal   }
+{ (util.c:36666).  Stub: leaves the Expr unchanged; the QNUMBER token type }
+{ is only produced by the lexer for quoted-numeric literals (rare).        }
+procedure sqlite3DequoteNumber(pPse: PParse; pExpr: PExpr);
+begin
+  { TODO Phase 8: port util.c sqlite3DequoteNumber. }
+end;
+
 { ---- yy_reduce — engine framework (parse.c:3804) ------------------------ }
 { Phase 7.2d: rule-action switch is empty.  Phase 7.2e fills in cases for   }
 { rules 0..411 from parse.c:3829–5993.  The framework that runs after the  }
@@ -1780,6 +1841,13 @@ var
   all_260:     TToken;
   pE_278:      PExpr;
   pE_279:      PExpr;
+  { Phase 7.2e.7 locals (rules 300..347). }
+  pWin_318:    PWindow;
+  pWin_319:    PWindow;
+  pWin_343:    PWindow;
+  pWin_345:    PWindow;
+  zCheckStart_300: PAnsiChar;
+  nCheck_300:  i32;
 begin
   yymsp := yypParser^.yytos;
   pPse  := PParse(yypParser^.pParse);
@@ -3132,6 +3200,209 @@ begin
     299: { cmd ::= ALTER TABLE fullname ALTER kwcolumn_opt nm SET NOT NULL onconf }
        sqlite3AlterSetNotNull(pPse, PSrcList(yymsp[-7].minor.yy203),
          @yymsp[-4].minor.yy0, @yymsp[-2].minor.yy0);
+    300: { cmd ::= ALTER TABLE fullname ADD CONSTRAINT nm CHECK LP expr RP onconf }
+       begin
+         zCheckStart_300 := PAnsiChar(yymsp[-3].minor.yy0.z) + 1;
+         nCheck_300 := i32(PtrUInt(yymsp[-1].minor.yy0.z)
+                       - PtrUInt(yymsp[-3].minor.yy0.z) - 1);
+         sqlite3AlterAddConstraint(pPse, PSrcList(yymsp[-8].minor.yy203),
+           @yymsp[-6].minor.yy0, @yymsp[-5].minor.yy0,
+           zCheckStart_300, nCheck_300);
+       end;
+    301: { cmd ::= ALTER TABLE fullname ADD CHECK LP expr RP onconf }
+       begin
+         zCheckStart_300 := PAnsiChar(yymsp[-3].minor.yy0.z) + 1;
+         nCheck_300 := i32(PtrUInt(yymsp[-1].minor.yy0.z)
+                       - PtrUInt(yymsp[-3].minor.yy0.z) - 1);
+         sqlite3AlterAddConstraint(pPse, PSrcList(yymsp[-6].minor.yy203),
+           @yymsp[-4].minor.yy0, nil, zCheckStart_300, nCheck_300);
+       end;
+    302: { cmd ::= create_vtab }
+       sqlite3VtabFinishParse(pPse, nil);
+    303: { cmd ::= create_vtab LP vtabarglist RP }
+       sqlite3VtabFinishParse(pPse, @yymsp[0].minor.yy0);
+    304: { create_vtab ::= createkw VIRTUAL TABLE ifnotexists nm dbnm USING nm }
+       sqlite3VtabBeginParse(pPse, @yymsp[-3].minor.yy0,
+         @yymsp[-2].minor.yy0, @yymsp[0].minor.yy0,
+         yymsp[-4].minor.yy144);
+    305: { vtabarg ::= }
+       sqlite3VtabArgInit(pPse);
+    306, 307, 308:
+       { vtabargtoken ::= ANY ; vtabargtoken ::= lp anylist RP ; lp ::= LP }
+       sqlite3VtabArgExtend(pPse, @yymsp[0].minor.yy0);
+    309, 310:
+       { with ::= WITH wqlist ; with ::= WITH RECURSIVE wqlist }
+       sqlite3WithPush(pPse, PWith(yymsp[0].minor.yy59), 1);
+    311: { wqas ::= AS }
+       yymsp[0].minor.yy462 := M10d_Any;
+    312: { wqas ::= AS MATERIALIZED }
+       yymsp[-1].minor.yy462 := M10d_Yes;
+    313: { wqas ::= AS NOT MATERIALIZED }
+       yymsp[-2].minor.yy462 := M10d_No;
+    314: { wqitem ::= withnm eidlist_opt wqas LP select RP }
+       yymsp[-5].minor.yy67 := sqlite3CteNew(pPse,
+         @yymsp[-5].minor.yy0, PExprList(yymsp[-4].minor.yy14),
+         PSelect(yymsp[-1].minor.yy555), yymsp[-3].minor.yy462);
+    315: { withnm ::= nm }
+       pPse^.parseFlags := pPse^.parseFlags or PARSEFLAG_BHasWith;
+    316: { wqlist ::= wqitem }
+       yymsp[0].minor.yy59 := sqlite3WithAdd(pPse, nil, yymsp[0].minor.yy67);
+    317: { wqlist ::= wqlist COMMA wqitem }
+       yymsp[-2].minor.yy59 := sqlite3WithAdd(pPse,
+         yymsp[-2].minor.yy59, yymsp[0].minor.yy67);
+    318: { windowdefn_list ::= windowdefn_list COMMA windowdefn }
+       begin
+         pWin_318 := PWindow(yymsp[0].minor.yy211);
+         sqlite3WindowChain(pPse, pWin_318, PWindow(yymsp[-2].minor.yy211));
+         if pWin_318 <> nil then
+           pWin_318^.pNextWin := PWindow(yymsp[-2].minor.yy211);
+         yylhsminor.yy211 := yymsp[0].minor.yy211;
+         yymsp[-2].minor.yy211 := yylhsminor.yy211;
+       end;
+    319: { windowdefn ::= nm AS LP window RP }
+       begin
+         pWin_319 := PWindow(yymsp[-1].minor.yy211);
+         if pWin_319 <> nil then
+           pWin_319^.zName := sqlite3DbStrNDup(pPse^.db,
+             PChar(yymsp[-4].minor.yy0.z), u64(yymsp[-4].minor.yy0.n));
+         yylhsminor.yy211 := yymsp[-1].minor.yy211;
+         yymsp[-4].minor.yy211 := yylhsminor.yy211;
+       end;
+    320: { window ::= PARTITION BY nexprlist orderby_opt frame_opt }
+       yymsp[-4].minor.yy211 := sqlite3WindowAssemble(pPse,
+         PWindow(yymsp[0].minor.yy211),
+         PExprList(yymsp[-2].minor.yy14),
+         PExprList(yymsp[-1].minor.yy14), nil);
+    321: { window ::= nm PARTITION BY nexprlist orderby_opt frame_opt }
+       begin
+         yylhsminor.yy211 := sqlite3WindowAssemble(pPse,
+           PWindow(yymsp[0].minor.yy211),
+           PExprList(yymsp[-2].minor.yy14),
+           PExprList(yymsp[-1].minor.yy14),
+           @yymsp[-5].minor.yy0);
+         yymsp[-5].minor.yy211 := yylhsminor.yy211;
+       end;
+    322: { window ::= ORDER BY sortlist frame_opt }
+       yymsp[-3].minor.yy211 := sqlite3WindowAssemble(pPse,
+         PWindow(yymsp[0].minor.yy211), nil,
+         PExprList(yymsp[-1].minor.yy14), nil);
+    323: { window ::= nm ORDER BY sortlist frame_opt }
+       begin
+         yylhsminor.yy211 := sqlite3WindowAssemble(pPse,
+           PWindow(yymsp[0].minor.yy211), nil,
+           PExprList(yymsp[-1].minor.yy14),
+           @yymsp[-4].minor.yy0);
+         yymsp[-4].minor.yy211 := yylhsminor.yy211;
+       end;
+    324: { window ::= nm frame_opt }
+       begin
+         yylhsminor.yy211 := sqlite3WindowAssemble(pPse,
+           PWindow(yymsp[0].minor.yy211), nil, nil,
+           @yymsp[-1].minor.yy0);
+         yymsp[-1].minor.yy211 := yylhsminor.yy211;
+       end;
+    325: { frame_opt ::= }
+       yymsp[1].minor.yy211 := sqlite3WindowAlloc(pPse, 0,
+         TK_UNBOUNDED, nil, TK_CURRENT, nil, 0);
+    326: { frame_opt ::= range_or_rows frame_bound_s frame_exclude_opt }
+       begin
+         yylhsminor.yy211 := sqlite3WindowAlloc(pPse,
+           yymsp[-2].minor.yy144,
+           yymsp[-1].minor.yy509.eType,
+           PExpr(yymsp[-1].minor.yy509.pExpr),
+           TK_CURRENT, nil, yymsp[0].minor.yy462);
+         yymsp[-2].minor.yy211 := yylhsminor.yy211;
+       end;
+    327: { frame_opt ::= range_or_rows BETWEEN frame_bound_s AND frame_bound_e frame_exclude_opt }
+       begin
+         yylhsminor.yy211 := sqlite3WindowAlloc(pPse,
+           yymsp[-5].minor.yy144,
+           yymsp[-3].minor.yy509.eType,
+           PExpr(yymsp[-3].minor.yy509.pExpr),
+           yymsp[-1].minor.yy509.eType,
+           PExpr(yymsp[-1].minor.yy509.pExpr),
+           yymsp[0].minor.yy462);
+         yymsp[-5].minor.yy211 := yylhsminor.yy211;
+       end;
+    329, 331:
+       { frame_bound_s ::= frame_bound ; frame_bound_e ::= frame_bound }
+       begin
+         yylhsminor.yy509 := yymsp[0].minor.yy509;
+         yymsp[0].minor.yy509 := yylhsminor.yy509;
+       end;
+    330, 332, 334:
+       { frame_bound_s ::= UNBOUNDED PRECEDING ;
+         frame_bound_e ::= UNBOUNDED FOLLOWING ;
+         frame_bound  ::= CURRENT ROW }
+       begin
+         yylhsminor.yy509.eType := i32(yymsp[-1].major);
+         yylhsminor.yy509.pExpr := nil;
+         yymsp[-1].minor.yy509 := yylhsminor.yy509;
+       end;
+    333: { frame_bound ::= expr PRECEDING|FOLLOWING }
+       begin
+         yylhsminor.yy509.eType := i32(yymsp[0].major);
+         yylhsminor.yy509.pExpr := yymsp[-1].minor.yy454;
+         yymsp[-1].minor.yy509 := yylhsminor.yy509;
+       end;
+    335: { frame_exclude_opt ::= }
+       yymsp[1].minor.yy462 := 0;
+    336: { frame_exclude_opt ::= EXCLUDE frame_exclude }
+       yymsp[-1].minor.yy462 := yymsp[0].minor.yy462;
+    337, 338:
+       { frame_exclude ::= NO OTHERS ; frame_exclude ::= CURRENT ROW }
+       yymsp[-1].minor.yy462 := u8(yymsp[-1].major);
+    339: { frame_exclude ::= GROUP|TIES }
+       yymsp[0].minor.yy462 := u8(yymsp[0].major);
+    340: { window_clause ::= WINDOW windowdefn_list }
+       yymsp[-1].minor.yy211 := yymsp[0].minor.yy211;
+    341: { filter_over ::= filter_clause over_clause }
+       begin
+         if yymsp[0].minor.yy211 <> nil then
+           PWindow(yymsp[0].minor.yy211)^.pFilter :=
+             PExpr(yymsp[-1].minor.yy454)
+         else
+           sqlite3ExprDelete(pPse^.db, PExpr(yymsp[-1].minor.yy454));
+         yylhsminor.yy211 := yymsp[0].minor.yy211;
+         yymsp[-1].minor.yy211 := yylhsminor.yy211;
+       end;
+    342: { filter_over ::= over_clause }
+       begin
+         yylhsminor.yy211 := yymsp[0].minor.yy211;
+         yymsp[0].minor.yy211 := yylhsminor.yy211;
+       end;
+    343: { filter_over ::= filter_clause }
+       begin
+         pWin_343 := PWindow(sqlite3DbMallocZero(pPse^.db,
+           u64(SizeOf(TWindow))));
+         yylhsminor.yy211 := pWin_343;
+         if pWin_343 <> nil then begin
+           pWin_343^.eFrmType := u8(TK_FILTER);
+           pWin_343^.pFilter := PExpr(yymsp[0].minor.yy454);
+         end else
+           sqlite3ExprDelete(pPse^.db, PExpr(yymsp[0].minor.yy454));
+         yymsp[0].minor.yy211 := yylhsminor.yy211;
+       end;
+    344: { over_clause ::= OVER LP window RP }
+       yymsp[-3].minor.yy211 := yymsp[-1].minor.yy211;
+    345: { over_clause ::= OVER nm }
+       begin
+         pWin_345 := PWindow(sqlite3DbMallocZero(pPse^.db,
+           u64(SizeOf(TWindow))));
+         yymsp[-1].minor.yy211 := pWin_345;
+         if pWin_345 <> nil then
+           pWin_345^.zName := sqlite3DbStrNDup(pPse^.db,
+             PChar(yymsp[0].minor.yy0.z), u64(yymsp[0].minor.yy0.n));
+       end;
+    346: { filter_clause ::= FILTER LP WHERE expr RP }
+       yymsp[-4].minor.yy454 := yymsp[-1].minor.yy454;
+    347: { term ::= QNUMBER }
+       begin
+         yylhsminor.yy454 := sqlite3ExprAlloc(pPse^.db,
+           i32(yymsp[0].major), @yymsp[0].minor.yy0, 0);
+         sqlite3DequoteNumber(pPse, PExpr(yylhsminor.yy454));
+         yymsp[0].minor.yy454 := yylhsminor.yy454;
+       end;
   else
     { Phase 7.2e in progress: rules 50..411 not yet ported.  Until ported,
       they fall through to the goto/state-update logic below — this is
