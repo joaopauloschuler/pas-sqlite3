@@ -78,6 +78,31 @@ function sqlite3_prepare_v3(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
                             prepFlags: u32; ppStmt: PPointer;
                             pzTail: PPAnsiChar): i32;
 
+{ Phase 8.3 — registration APIs (main.c, vtab.c). }
+function sqlite3_create_function(db: PTsqlite3; zFunc: PAnsiChar;
+  nArg: i32; enc: i32; pUserData: Pointer;
+  xSFunc: Pointer; xStep: Pointer; xFinal: Pointer): i32;
+function sqlite3_create_function_v2(db: PTsqlite3; zFunc: PAnsiChar;
+  nArg: i32; enc: i32; pUserData: Pointer;
+  xSFunc: Pointer; xStep: Pointer; xFinal: Pointer;
+  xDestroy: Pointer): i32;
+function sqlite3_create_window_function(db: PTsqlite3; zFunc: PAnsiChar;
+  nArg: i32; enc: i32; pUserData: Pointer;
+  xStep: Pointer; xFinal: Pointer; xValue: Pointer; xInverse: Pointer;
+  xDestroy: Pointer): i32;
+
+function sqlite3_create_collation(db: PTsqlite3; zName: PAnsiChar;
+  enc: i32; pCtx: Pointer; xCompare: Pointer): i32;
+function sqlite3_create_collation_v2(db: PTsqlite3; zName: PAnsiChar;
+  enc: i32; pCtx: Pointer; xCompare: Pointer; xDel: Pointer): i32;
+function sqlite3_collation_needed(db: PTsqlite3;
+  pCollNeededArg: Pointer; xCollNeeded: Pointer): i32;
+
+function sqlite3_create_module(db: PTsqlite3; zName: PAnsiChar;
+  pModule: Pointer; pAux: Pointer): i32;
+function sqlite3_create_module_v2(db: PTsqlite3; zName: PAnsiChar;
+  pModule: Pointer; pAux: Pointer; xDestroy: Pointer): i32;
+
 implementation
 
 { ----------------------------------------------------------------------
@@ -557,6 +582,257 @@ begin
   Result := sqlite3LockAndPrepare(db, zSql, nBytes,
               (prepFlags and SQLITE_PREPARE_MASK) or SQLITE_PREPARE_SAVESQL,
               nil, ppStmt, pzTail);
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 8.3 — Registration APIs.
+  Ported from main.c:1931..2230 (functions), main.c:2852..3848 (collations),
+  vtab.c:39..134 (modules).
+
+  Scope of this Phase 8.3 port:
+    * sqlite3_create_function / _v2 / _create_window_function delegate to
+      createFunctionApi → sqlite3CreateFunc (already present in codegen).
+    * sqlite3_create_collation / _v2 implement the createCollation flow
+      directly (replace check + ExpirePreparedStatements + FindCollSeq(create=1)).
+    * sqlite3_create_module / _v2 inline a minimal sqlite3VtabCreateModule
+      replacement: alloc Module struct, hash insert into db^.aModule.
+      Vtab eponymous-table cleanup is skipped — no vtabs are registered
+      yet (Phase 6.bis.1 not done), so the replace path can only happen
+      if the same module name is registered twice in the same connection.
+    * UTF-16 entry points (_create_function16, _create_collation16,
+      _collation_needed16) are deferred until UTF-16 lands.
+  ---------------------------------------------------------------------- }
+
+const
+  SQLITE_FUNC_ENCMASK = $03;
+
+type
+  TxCollCmpReg   = function(p: Pointer; n1: i32; z1: Pointer;
+                            n2: i32; z2: Pointer): i32; cdecl;
+  TxCollDelReg   = procedure(p: Pointer); cdecl;
+
+{ createFunctionApi — main.c:2066 }
+function createFunctionApi(db: PTsqlite3; zFunc: PAnsiChar; nArg: i32;
+  enc: i32; p: Pointer; xSFunc, xStep, xFinal, xValue, xInverse,
+  xDestroy: Pointer): i32;
+var
+  rc:   i32;
+  pArg: PTFuncDestructor;
+  label out_lbl;
+begin
+  rc   := SQLITE_ERROR;
+  pArg := nil;
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  if xDestroy <> nil then begin
+    pArg := PTFuncDestructor(sqlite3Malloc(SizeOf(TFuncDestructor)));
+    if pArg = nil then begin
+      sqlite3OomFault(db);
+      TxFuncDestroy(xDestroy)(p);
+      goto out_lbl;
+    end;
+    pArg^.nRef     := 0;
+    pArg^.xDestroy := TxFuncDestroy(xDestroy);
+    pArg^.pUserData := p;
+  end;
+  rc := sqlite3CreateFunc(db, zFunc, nArg, enc, p,
+          xSFunc, xStep, xFinal, xValue, xInverse, pArg);
+  if (pArg <> nil) and (pArg^.nRef = 0) then begin
+    TxFuncDestroy(xDestroy)(p);
+    sqlite3_free(pArg);
+  end;
+out_lbl:
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+function sqlite3_create_function(db: PTsqlite3; zFunc: PAnsiChar;
+  nArg: i32; enc: i32; pUserData: Pointer;
+  xSFunc: Pointer; xStep: Pointer; xFinal: Pointer): i32;
+begin
+  Result := createFunctionApi(db, zFunc, nArg, enc, pUserData,
+              xSFunc, xStep, xFinal, nil, nil, nil);
+end;
+
+function sqlite3_create_function_v2(db: PTsqlite3; zFunc: PAnsiChar;
+  nArg: i32; enc: i32; pUserData: Pointer;
+  xSFunc: Pointer; xStep: Pointer; xFinal: Pointer;
+  xDestroy: Pointer): i32;
+begin
+  Result := createFunctionApi(db, zFunc, nArg, enc, pUserData,
+              xSFunc, xStep, xFinal, nil, nil, xDestroy);
+end;
+
+function sqlite3_create_window_function(db: PTsqlite3; zFunc: PAnsiChar;
+  nArg: i32; enc: i32; pUserData: Pointer;
+  xStep: Pointer; xFinal: Pointer; xValue: Pointer; xInverse: Pointer;
+  xDestroy: Pointer): i32;
+begin
+  Result := createFunctionApi(db, zFunc, nArg, enc, pUserData,
+              nil, xStep, xFinal, xValue, xInverse, xDestroy);
+end;
+
+{ createCollation — main.c:2852.  Performs the replace-or-create flow that
+  the codegen-side sqlite3FindCollSeq(create=1) cannot do on its own. }
+function createCollation(db: PTsqlite3; zName: PAnsiChar; enc: u8;
+  pCtx: Pointer; xCompare: Pointer; xDel: Pointer): i32;
+var
+  pColl: PTCollSeq;
+  enc2:  i32;
+begin
+  enc2 := enc;
+  if (enc2 = SQLITE_UTF16) or (enc2 = SQLITE_UTF16_ALIGNED) then
+    enc2 := SQLITE_UTF16LE;  { native LE on x86_64 }
+  if (enc2 < SQLITE_UTF8) or (enc2 > SQLITE_UTF16BE) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+
+  pColl := PTCollSeq(sqlite3FindCollSeq(db, u8(enc2), zName, 0));
+  if (pColl <> nil) and (pColl^.xCmp <> nil) then begin
+    if db^.nVdbeActive <> 0 then begin
+      sqlite3ErrorWithMsg(db, SQLITE_BUSY,
+        'unable to delete/modify collation sequence due to active statements');
+      Result := SQLITE_BUSY; Exit;
+    end;
+    sqlite3ExpirePreparedStatements(db, 0);
+  end;
+
+  pColl := PTCollSeq(sqlite3FindCollSeq(db, u8(enc2), zName, 1));
+  if pColl = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  pColl^.xCmp  := TxCollCmpReg(xCompare);
+  pColl^.pUser := pCtx;
+  pColl^.xDel  := TxCollDelReg(xDel);
+  pColl^.enc   := u8(enc2 or (enc and SQLITE_UTF16_ALIGNED));
+  sqlite3Error(db, SQLITE_OK);
+  Result := SQLITE_OK;
+end;
+
+function sqlite3_create_collation_v2(db: PTsqlite3; zName: PAnsiChar;
+  enc: i32; pCtx: Pointer; xCompare: Pointer; xDel: Pointer): i32;
+var
+  rc: i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (zName = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  rc := createCollation(db, zName, u8(enc), pCtx, xCompare, xDel);
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+function sqlite3_create_collation(db: PTsqlite3; zName: PAnsiChar;
+  enc: i32; pCtx: Pointer; xCompare: Pointer): i32;
+begin
+  Result := sqlite3_create_collation_v2(db, zName, enc, pCtx, xCompare, nil);
+end;
+
+function sqlite3_collation_needed(db: PTsqlite3;
+  pCollNeededArg: Pointer; xCollNeeded: Pointer): i32;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  db^.xCollNeeded    := xCollNeeded;
+  db^.xCollNeeded16  := nil;
+  db^.pCollNeededArg := pCollNeededArg;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+{ ----------------------------------------------------------------------
+  sqlite3_create_module / _v2 — minimal createModule.
+
+  Local Module record, mirroring sqliteInt.h:2211.  Allocated as a single
+  block: SizeOf(TModule) + Length(zName) + 1 (the name is copied just past
+  the struct, like sqlite3VtabCreateModule does).
+  ---------------------------------------------------------------------- }
+type
+  TxModuleDestroy = procedure(p: Pointer); cdecl;
+  TModule = record
+    pModule:    Pointer;       { const sqlite3_module* }
+    zName:      PAnsiChar;
+    nRefModule: i32;
+    _pad:       i32;
+    pAux:       Pointer;
+    xDestroy:   TxModuleDestroy;
+    pEpoTab:    Pointer;       { Eponymous table — unused in Phase 8.3 }
+  end;
+  PTModule = ^TModule;
+
+function createModule(db: PTsqlite3; zName: PAnsiChar; pModule: Pointer;
+  pAux: Pointer; xDestroy: Pointer): i32;
+var
+  pMod, pDel: PTModule;
+  zCopy:      PAnsiChar;
+  nName:      i32;
+  rc:         i32;
+begin
+  rc := SQLITE_OK;
+  sqlite3_mutex_enter(db^.mutex);
+  if pModule = nil then begin
+    zCopy := zName;
+    pMod  := nil;
+  end else begin
+    nName := sqlite3Strlen30(PChar(zName));
+    pMod  := PTModule(sqlite3Malloc(SizeOf(TModule) + nName + 1));
+    if pMod = nil then begin
+      sqlite3OomFault(db);
+      rc := sqlite3ApiExit(db, SQLITE_OK);
+      sqlite3_mutex_leave(db^.mutex);
+      if xDestroy <> nil then TxModuleDestroy(xDestroy)(pAux);
+      Result := rc; Exit;
+    end;
+    zCopy := PAnsiChar(PByte(pMod) + SizeOf(TModule));
+    Move(zName^, zCopy^, nName + 1);
+    pMod^.zName      := zCopy;
+    pMod^.pModule    := pModule;
+    pMod^.pAux       := pAux;
+    pMod^.xDestroy   := TxModuleDestroy(xDestroy);
+    pMod^.pEpoTab    := nil;
+    pMod^.nRefModule := 1;
+  end;
+  pDel := PTModule(sqlite3HashInsert(@db^.aModule, PChar(zCopy), pMod));
+  if pDel <> nil then begin
+    if pDel = pMod then begin
+      { hash insert failed (OOM): Module is still in our hands. }
+      sqlite3OomFault(db);
+      sqlite3DbFree(Psqlite3db(db), pDel);
+      pMod := nil;
+    end else begin
+      { Replaced an existing module of the same name.  Phase 8.3:
+        no eponymous-table cleanup (vtab.c not ported); just call its
+        destructor and free it. }
+      if (pDel^.xDestroy <> nil) and (pDel^.pAux <> nil) then
+        pDel^.xDestroy(pDel^.pAux);
+      sqlite3_free(pDel);
+    end;
+  end;
+  rc := sqlite3ApiExit(db, rc);
+  if (rc <> SQLITE_OK) and (xDestroy <> nil) then
+    TxModuleDestroy(xDestroy)(pAux);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+  if pMod = nil then ; { silence unused warning — pMod is observed via hash }
+end;
+
+function sqlite3_create_module(db: PTsqlite3; zName: PAnsiChar;
+  pModule: Pointer; pAux: Pointer): i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (zName = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  Result := createModule(db, zName, pModule, pAux, nil);
+end;
+
+function sqlite3_create_module_v2(db: PTsqlite3; zName: PAnsiChar;
+  pModule: Pointer; pAux: Pointer; xDestroy: Pointer): i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (zName = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  Result := createModule(db, zName, pModule, pAux, xDestroy);
 end;
 
 end.

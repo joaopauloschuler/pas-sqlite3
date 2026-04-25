@@ -20,6 +20,21 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-25 — Phase 8.3 registration APIs.**  New entry points in
+    `src/passqlite3main.pas`: `sqlite3_create_function[_v2]`,
+    `sqlite3_create_window_function`, `sqlite3_create_collation[_v2]`,
+    `sqlite3_collation_needed`, `sqlite3_create_module[_v2]`.  Functions
+    delegate to the codegen-side `sqlite3CreateFunc`; collations
+    re-implement `createCollation` from main.c:2852 (replace check +
+    expire prepared statements + `FindCollSeq(create=1)`); modules use a
+    minimal inline `createModule` since vtab.c is not yet ported (Phase
+    6.bis.1).  Gate `src/tests/TestRegistration.pas` 19/19 PASS; no
+    regressions in TestOpenClose / TestPrepareBasic / TestParser /
+    TestParserSmoke / TestSchemaBasic / TestAuthBuiltins.  UTF-16
+    entry points (`_create_function16`, `_create_collation16`,
+    `_collation_needed16`) and `SQLITE_ANY` triple-registration are
+    deferred until UTF-16 transcoding lands.
+
   - **2026-04-25 — Phase 8.2 sqlite3_prepare family.** New entry points
     `sqlite3_prepare`, `sqlite3_prepare_v2`, `sqlite3_prepare_v3` in
     `src/passqlite3main.pas`, with `sqlite3LockAndPrepare` +
@@ -2657,8 +2672,52 @@ loader — *optional for v1*).
       until the printf machinery lands (tracked under Phase 6/8 errmsg
       TODOs).
 
-- [ ] **8.3** Port registration APIs: `sqlite3_create_function`,
+- [X] **8.3** Port registration APIs: `sqlite3_create_function`,
   `sqlite3_create_collation`, `sqlite3_create_module` (virtual tables).
+
+  DONE 2026-04-25.  New entry points in `src/passqlite3main.pas`:
+    * `sqlite3_create_function`, `_v2`, `sqlite3_create_window_function`
+      — delegate to a local `createFunctionApi` (main.c:2066) that allocs
+      a `TFuncDestructor`, calls the codegen-side `sqlite3CreateFunc`,
+      and frees the destructor on failure.
+    * `sqlite3_create_collation`, `_v2` — local `createCollation`
+      (main.c:2852) implements the replace-or-create flow:
+      `sqlite3FindCollSeq(create=0)` → BUSY-on-active-vms /
+      `sqlite3ExpirePreparedStatements` → `FindCollSeq(create=1)`.
+    * `sqlite3_collation_needed` — sets `db^.xCollNeeded` /
+      `pCollNeededArg`, clears `xCollNeeded16`.
+    * `sqlite3_create_module`, `_v2` — minimal inline `createModule`
+      (vtab.c:39) since `sqlite3VtabCreateModule` is not yet ported.
+      Allocates a local `TModule` (mirrors `sqliteInt.h:2211`) +
+      name copy in the same block, hash-inserts into `db^.aModule`.
+      Replace path simply frees the previous record (no eponymous-table
+      cleanup — vtab.c is Phase 6.bis.1).
+
+  Gate: `src/tests/TestRegistration.pas` — 19/19 PASS:
+    * T2/T3   create_function ok / bad nArg → MISUSE
+    * T4/T5   _v2 with destructor; replacement fires destructor exactly once
+    * T6      nil db → MISUSE
+    * T7..T10 create_collation ok / replace / bad enc / nil name
+    * T11     collation_needed
+    * T12..T15 create_module ok / _v2 replace / replace again / nil name
+
+  Concrete changes:
+    * `src/passqlite3main.pas` — adds Phase 8.3 entry points + helpers
+    * `src/tests/TestRegistration.pas` — new gate test
+    * `src/tests/build.sh` — registers TestRegistration
+
+  Phase 8.3 scope notes (deferred to later sub-phases):
+    * UTF-16 entry points (`_create_function16`, `_create_collation16`,
+      `_collation_needed16`) — wait on UTF-16 transcoding support.
+    * `SQLITE_ANY` triple-registration (UTF8+LE+BE) is handled by the
+      codegen `sqlite3CreateFunc` mask only; not the `case SQLITE_ANY`
+      recursion path from main.c:1984.  Honest UTF-16 port pending.
+    * `sqlite3_overload_function` — defer until vtab.c lands (uses
+      `sqlite3FindFunction` to insert a builtin overload marker).
+    * Module replace path skips `sqlite3VtabEponymousTableClear` and
+      `sqlite3VtabModuleUnref`; safe today because no vtab is ever
+      instantiated.  Phase 6.bis.1 will need to revisit.
+    * `sqlite3_drop_modules` not ported (vtab.c only API caller).
 
 - [ ] **8.4** Port configuration and hooks: `sqlite3_config`, `sqlite3_db_config`,
   `sqlite3_commit_hook`, `sqlite3_rollback_hook`, `sqlite3_update_hook`,
