@@ -1438,6 +1438,13 @@ const
   TF_HasStat4       = u32($00002000);
   TF_Ephemeral      = u32($00004000);
   TF_Eponymous      = u32($00008000);
+  TF_Strict         = u32($00010000);  { STRICT mode (sqliteInt.h:2498) }
+
+  { SQLITE_IDXTYPE_* (Index.idxType) — sqliteInt.h:2834–2837 }
+  SQLITE_IDXTYPE_APPDEF      = 0;  { CREATE INDEX }
+  SQLITE_IDXTYPE_UNIQUE      = 1;  { UNIQUE constraint }
+  SQLITE_IDXTYPE_PRIMARYKEY  = 2;  { PRIMARY KEY }
+  SQLITE_IDXTYPE_IPK         = 3;  { INTEGER PRIMARY KEY }
 
   { COLFLAG_* (Column.colFlags) }
   COLFLAG_PRIMKEY   = u16($0001);

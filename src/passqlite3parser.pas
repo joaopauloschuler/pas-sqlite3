@@ -265,18 +265,61 @@ type
     16 bytes).  Maximum size is sizeof(TToken)=16 OR sizeof(OnOrUsing)=16 OR
     sizeof(FrameBound)=16, whichever is largest.  Using a fixed 24-byte
     payload to leave room for any reasonable future expansion. }
+  { Phase 7.2e: per-rule grammar-action minor types.  The C union from
+    parse.c:562–583 has 19 named members; we expose them all so reduce
+    bodies port mechanically.  Pointer-typed minors share storage via
+    the variant record. }
+  TYYRefArg = record  { yy383: { int value; int mask; } }
+    value: i32;
+    mask:  i32;
+  end;
+
+  TYYOnOrUsing = record  { yy269: struct OnOrUsing }
+    pOn:    Pointer;     { Expr* }
+    pUsing: Pointer;     { IdList* }
+  end;
+
+  TYYTrigEvent = record  { yy286: struct TrigEvent }
+    a: i32;              { event op (TK_INSERT/UPDATE/DELETE) }
+    b: Pointer;          { IdList* — optional column list for UPDATE OF }
+  end;
+
+  TYYFrameBound = record { yy509: struct FrameBound }
+    eType: i32;          { TK_FOLLOWING / TK_PRECEDING / TK_CURRENT / TK_UNBOUNDED }
+    pExpr: Pointer;      { Expr* — bound offset, NULL for CURRENT/UNBOUNDED }
+  end;
+
   YYMINORTYPE = record
     case Int32 of
       0:  (yyinit:  i32);
       1:  (yy0:     TToken);
-      { Pointer-sized minors stored as Pointer for forward compatibility;
-        the reduce-action code casts as needed (Phase 7.2e). }
+      { Generic pointer cell — reduce-action bodies may cast through this
+        when a more specific named alias is unavailable. }
       2:  (yyptr:   Pointer);
       3:  (yy144:   i32);
       4:  (yy391:   u32);
       5:  (yy462:   u8);
-      { Padding to ensure record is at least 24 bytes (struct OnOrUsing
-        and FrameBound in C take 16 bytes; TToken is 16 bytes). }
+      { Pointer-sized minors (overlap yyptr).  Pascal needs explicit
+        forward type names: opaque Pointer keeps unit dependencies low —
+        reduce code casts to PExpr / PSelect / etc. inline. }
+      6:  (yy14:    Pointer);   { ExprList* }
+      7:  (yy59:    Pointer);   { With* }
+      8:  (yy67:    Pointer);   { Cte* }
+      9:  (yy122:   Pointer);   { Upsert* }
+      10: (yy132:   Pointer);   { IdList* }
+      11: (yy168:   PAnsiChar); { const char* }
+      12: (yy203:   Pointer);   { SrcList* }
+      13: (yy211:   Pointer);   { Window* }
+      14: (yy427:   Pointer);   { TriggerStep* }
+      15: (yy454:   Pointer);   { Expr* }
+      16: (yy555:   Pointer);   { Select* }
+      { 8/16-byte struct minors. }
+      17: (yy269:   TYYOnOrUsing);
+      18: (yy286:   TYYTrigEvent);
+      19: (yy383:   TYYRefArg);
+      20: (yy509:   TYYFrameBound);
+      { Padding to ensure record is at least 24 bytes (TToken=16,
+        OnOrUsing=16, FrameBound=16). }
       99: (raw:     array[0..23] of u8);
   end;
   PYYMINORTYPE = ^YYMINORTYPE;
@@ -1072,6 +1115,26 @@ procedure yy_syntax_error(yypParser: PyyParser; yymajor: i32;
                           const yyminor: TToken); forward;
 procedure yyStackOverflow(yypParser: PyyParser); forward;
 function  parserStackRealloc(p: PyyParser): i32; forward;
+procedure disableLookaside(pPse: PParse); forward;
+
+{ SAVEPOINT_* (sqliteInt.h) — also defined in passqlite3pager but that unit  }
+{ is not in our uses clause; redeclare here.                                 }
+const
+  SAVEPOINT_BEGIN    = 0;
+  SAVEPOINT_RELEASE  = 1;
+  SAVEPOINT_ROLLBACK = 2;
+
+{ ---- disableLookaside (parse.y:132) ------------------------------------- }
+{ Increment Parse.disableLookaside (used by createkw to suppress lookaside  }
+{ during DDL parsing, since DDL allocations live longer than a single SQL  }
+{ statement).  Also resets the u1.cr group to a known-zero state.           }
+procedure disableLookaside(pPse: PParse);
+begin
+  Inc(pPse^.disableLookaside);
+  Inc(pPse^.db^.lookaside.bDisable);
+  pPse^.db^.lookaside.sz := 0;
+  FillChar(pPse^.u1.cr, SizeOf(pPse^.u1.cr), 0);
+end;
 
 { ---- parserStackRealloc — grow stack on demand (yyGrowStack equivalent) -- }
 function parserStackRealloc(p: PyyParser): i32;
@@ -1234,22 +1297,173 @@ end;
 function yy_reduce(yypParser: PyyParser; yyruleno: u32;
                    yyLookahead: i32; const yyLookaheadToken: TToken): YYACTIONTYPE;
 var
-  yygoto: i32;
-  yyact:  YYACTIONTYPE;
-  yymsp:  PyyStackEntry;
-  yysize: i32;
+  yygoto:     i32;
+  yyact:      YYACTIONTYPE;
+  yymsp:      PyyStackEntry;
+  yysize:     i32;
+  pPse:       PParse;
+  yylhsminor: YYMINORTYPE;
+  pTmp:       PExpr;
 begin
   yymsp := yypParser^.yytos;
+  pPse  := PParse(yypParser^.pParse);
+  yylhsminor.yyinit := 0;
 
   { ============================================================ }
-  { Phase 7.2e: per-rule reduce-action cases go here.            }
-  {   case yyruleno of                                           }
-  {     0: { explain ::= EXPLAIN } ...                           }
-  {     ...                                                      }
-  {   end;                                                       }
+  { Phase 7.2e — per-rule reduce actions (parse.c:3829-5993).    }
+  { Chunk 1 (rules 0-49) ported here.  Subsequent chunks fill    }
+  { in remaining rules in subsequent commits.                    }
   { ============================================================ }
-  if yyLookahead = 0 then ;  { suppress unused warnings until 7.2e }
-  if yyLookaheadToken.n = 0 then ;
+  case yyruleno of
+    0: { explain ::= EXPLAIN }
+       if pPse^.pReprepare = nil then pPse^.explain := 1;
+    1: { explain ::= EXPLAIN QUERY PLAN }
+       if pPse^.pReprepare = nil then pPse^.explain := 2;
+    2: { cmdx ::= cmd }
+       sqlite3FinishCoding(pPse);
+    3: { cmd ::= BEGIN transtype trans_opt }
+       sqlite3BeginTransaction(pPse, yymsp[-1].minor.yy144);
+    4: { transtype ::= }
+       yymsp[1].minor.yy144 := TK_DEFERRED;
+    5, 6, 7, 328:
+       { transtype ::= DEFERRED|IMMEDIATE|EXCLUSIVE; range_or_rows ::= ... }
+       yymsp[0].minor.yy144 := i32(yymsp[0].major);
+    8, 9: { cmd ::= COMMIT|END trans_opt;  cmd ::= ROLLBACK trans_opt }
+       sqlite3EndTransaction(pPse, i32(yymsp[-1].major));
+    10: { cmd ::= SAVEPOINT nm }
+       sqlite3Savepoint(pPse, SAVEPOINT_BEGIN, @yymsp[0].minor.yy0);
+    11: { cmd ::= RELEASE savepoint_opt nm }
+       sqlite3Savepoint(pPse, SAVEPOINT_RELEASE, @yymsp[0].minor.yy0);
+    12: { cmd ::= ROLLBACK trans_opt TO savepoint_opt nm }
+       sqlite3Savepoint(pPse, SAVEPOINT_ROLLBACK, @yymsp[0].minor.yy0);
+    13: { create_table ::= createkw temp TABLE ifnotexists nm dbnm }
+       sqlite3StartTable(pPse, @yymsp[-1].minor.yy0, @yymsp[0].minor.yy0,
+                         yymsp[-4].minor.yy144, 0, 0, yymsp[-2].minor.yy144);
+    14: { createkw ::= CREATE }
+       disableLookaside(pPse);
+    15, 18, 47, 62, 72, 81, 100, 246:
+       { ifnotexists ::=; temp ::=; autoinc ::=; init_deferred_pred_opt ::=;
+         defer_subclause_opt ::=; ifexists ::=; distinct ::=; collate ::= }
+       yymsp[1].minor.yy144 := 0;
+    16: { ifnotexists ::= IF NOT EXISTS }
+       yymsp[-2].minor.yy144 := 1;
+    17: { temp ::= TEMP }
+       yymsp[0].minor.yy144 := i32(Ord(pPse^.db^.init.busy = 0));
+    19: { create_table_args ::= LP columnlist conslist_opt RP table_option_set }
+       sqlite3EndTable(pPse, @yymsp[-2].minor.yy0, @yymsp[-1].minor.yy0,
+                       yymsp[0].minor.yy391, nil);
+    20: { create_table_args ::= AS select }
+       begin
+         sqlite3EndTable(pPse, nil, nil, 0, PSelect(yymsp[0].minor.yy555));
+         sqlite3SelectDelete(pPse^.db, PSelect(yymsp[0].minor.yy555));
+       end;
+    21: { table_option_set ::= }
+       yymsp[1].minor.yy391 := 0;
+    22: { table_option_set ::= table_option_set COMMA table_option }
+       begin
+         yylhsminor.yy391 := yymsp[-2].minor.yy391 or yymsp[0].minor.yy391;
+         yymsp[-2].minor.yy391 := yylhsminor.yy391;
+       end;
+    23: { table_option ::= WITHOUT nm }
+       begin
+         if (yymsp[0].minor.yy0.n = 5) and
+            (sqlite3_strnicmp(yymsp[0].minor.yy0.z, 'rowid', 5) = 0) then
+           yymsp[-1].minor.yy391 := TF_WithoutRowid or TF_NoVisibleRowid
+         else begin
+           yymsp[-1].minor.yy391 := 0;
+           sqlite3ErrorMsg(pPse, 'unknown table option');
+         end;
+       end;
+    24: { table_option ::= nm }
+       begin
+         if (yymsp[0].minor.yy0.n = 6) and
+            (sqlite3_strnicmp(yymsp[0].minor.yy0.z, 'strict', 6) = 0) then
+           yylhsminor.yy391 := TF_Strict
+         else begin
+           yylhsminor.yy391 := 0;
+           sqlite3ErrorMsg(pPse, 'unknown table option');
+         end;
+         yymsp[0].minor.yy391 := yylhsminor.yy391;
+       end;
+    25: { columnname ::= nm typetoken }
+       sqlite3AddColumn(pPse, yymsp[-1].minor.yy0, yymsp[0].minor.yy0);
+    26, 65, 106:
+       { typetoken ::=;  conslist_opt ::=;  as ::= }
+       begin
+         yymsp[1].minor.yy0.n := 0;
+         yymsp[1].minor.yy0.z := nil;
+       end;
+    27: { typetoken ::= typename LP signed RP }
+       yymsp[-3].minor.yy0.n := i32(PtrUInt(yymsp[0].minor.yy0.z + yymsp[0].minor.yy0.n)
+                                   - PtrUInt(yymsp[-3].minor.yy0.z));
+    28: { typetoken ::= typename LP signed COMMA signed RP }
+       yymsp[-5].minor.yy0.n := i32(PtrUInt(yymsp[0].minor.yy0.z + yymsp[0].minor.yy0.n)
+                                   - PtrUInt(yymsp[-5].minor.yy0.z));
+    29: { typename ::= typename ID|STRING }
+       yymsp[-1].minor.yy0.n := yymsp[0].minor.yy0.n
+         + i32(PtrUInt(yymsp[0].minor.yy0.z) - PtrUInt(yymsp[-1].minor.yy0.z));
+    30: { scanpt ::= }
+       yymsp[1].minor.yy168 := yyLookaheadToken.z;
+    31: { scantok ::= }
+       yymsp[1].minor.yy0   := yyLookaheadToken;
+    32, 67: { ccons ::= CONSTRAINT nm; tcons ::= CONSTRAINT nm }
+       pPse^.u1.cr.constraintName := yymsp[0].minor.yy0;
+    33: { ccons ::= DEFAULT scantok term }
+       sqlite3AddDefaultValue(pPse, PExpr(yymsp[0].minor.yy454),
+         yymsp[-1].minor.yy0.z, yymsp[-1].minor.yy0.z + yymsp[-1].minor.yy0.n);
+    34: { ccons ::= DEFAULT LP expr RP }
+       sqlite3AddDefaultValue(pPse, PExpr(yymsp[-1].minor.yy454),
+         yymsp[-2].minor.yy0.z + 1, yymsp[0].minor.yy0.z);
+    35: { ccons ::= DEFAULT PLUS scantok term }
+       sqlite3AddDefaultValue(pPse, PExpr(yymsp[0].minor.yy454),
+         yymsp[-2].minor.yy0.z, yymsp[-1].minor.yy0.z + yymsp[-1].minor.yy0.n);
+    36: { ccons ::= DEFAULT MINUS scantok term }
+       begin
+         pTmp := sqlite3PExpr(pPse, TK_UMINUS, PExpr(yymsp[0].minor.yy454), nil);
+         sqlite3AddDefaultValue(pPse, pTmp, yymsp[-2].minor.yy0.z,
+           yymsp[-1].minor.yy0.z + yymsp[-1].minor.yy0.n);
+       end;
+    37: { ccons ::= DEFAULT scantok ID|INDEXED }
+       begin
+         pTmp := sqlite3ExprAlloc(pPse^.db, TK_STRING, @yymsp[0].minor.yy0, 0);
+         if pTmp <> nil then
+           sqlite3ExprIdToTrueFalse(pTmp);
+         sqlite3AddDefaultValue(pPse, pTmp, yymsp[0].minor.yy0.z,
+           yymsp[0].minor.yy0.z + yymsp[0].minor.yy0.n);
+       end;
+    38: { ccons ::= NOT NULL onconf }
+       sqlite3AddNotNull(pPse, yymsp[0].minor.yy144);
+    39: { ccons ::= PRIMARY KEY sortorder onconf autoinc }
+       sqlite3AddPrimaryKey(pPse, nil, yymsp[-1].minor.yy144,
+         yymsp[0].minor.yy144, yymsp[-2].minor.yy144);
+    40: { ccons ::= UNIQUE onconf }
+       sqlite3CreateIndex(pPse, nil, nil, nil, nil, yymsp[0].minor.yy144,
+         nil, nil, 0, 0, SQLITE_IDXTYPE_UNIQUE);
+    41: { ccons ::= CHECK LP expr RP }
+       sqlite3AddCheckConstraint(pPse, PExpr(yymsp[-1].minor.yy454),
+         yymsp[-2].minor.yy0.z, yymsp[0].minor.yy0.z);
+    42: { ccons ::= REFERENCES nm eidlist_opt refargs }
+       sqlite3CreateForeignKey(pPse, nil, @yymsp[-2].minor.yy0,
+         PExprList(yymsp[-1].minor.yy14), yymsp[0].minor.yy144);
+    43: { ccons ::= defer_subclause }
+       sqlite3DeferForeignKey(pPse, yymsp[0].minor.yy144);
+    44: { ccons ::= COLLATE ID|STRING }
+       sqlite3AddCollateType(pPse, @yymsp[0].minor.yy0);
+    45: { generated ::= LP expr RP }
+       sqlite3AddGenerated(pPse, PExpr(yymsp[-1].minor.yy454), nil);
+    46: { generated ::= LP expr RP ID }
+       sqlite3AddGenerated(pPse, PExpr(yymsp[-2].minor.yy454), @yymsp[0].minor.yy0);
+    48: { autoinc ::= AUTOINCR }
+       yymsp[0].minor.yy144 := 1;
+    49: { refargs ::= }
+       yymsp[1].minor.yy144 := OE_None * $0101;
+  else
+    { Phase 7.2e in progress: rules 50..411 not yet ported.  Until ported,
+      they fall through to the goto/state-update logic below — this is
+      semantically equivalent to a no-op grammar action (correct for any
+      rule whose action exists only to copy or ignore minors). }
+    ;
+  end;
 
   yygoto := yyRuleInfoLhs[yyruleno];
   yysize := yyRuleInfoNRhs[yyruleno];

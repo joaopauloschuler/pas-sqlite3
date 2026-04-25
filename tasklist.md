@@ -1990,6 +1990,61 @@ statement is syntactically complete — used by the CLI and REPLs).
     callees may need additional wrapper exports from Phase 6 units. Port in
     chunks of ~50 rules, build-checking after each.
 
+    Sub-tasks (chunks of ~50 rules each, 412 rules total):
+    - [X] **7.2e.1** Rules 0..49 — explain, transactions, savepoints,
+      CREATE TABLE start/end, table options, column constraints (DEFAULT/
+      NOT NULL/PRIMARY KEY/UNIQUE/CHECK/REFERENCES/COLLATE/GENERATED),
+      autoinc, initial refargs.  DONE 2026-04-25.
+    - [ ] **7.2e.2** Rules 50..99 — refargs/refact (FK actions),
+      defer_subclause, conslist, idxlist, sortlist, eidlist, columnlist
+      tail.
+    - [ ] **7.2e.3** Rules 100..149 — SELECT core (selectnowith, oneselect,
+      values, distinct, sclp, selcollist, FROM/USING/ON, JOIN, jointype,
+      indexed_opt, on_using, where_opt, groupby_opt, having_opt, orderby_opt,
+      sortlist, nulls, limit_opt).
+    - [ ] **7.2e.4** Rules 150..199 — DML: DELETE, UPDATE, INSERT/REPLACE,
+      upsert, returning, RAISE, conflict, idlist, insert_cmd, expr_or_select.
+    - [ ] **7.2e.5** Rules 200..249 — expressions: expr/term, literals,
+      bind params, names, function call, subqueries, CASE, CAST, COLLATE,
+      LIKE/GLOB/REGEXP/MATCH, BETWEEN, IN, IS, NULL/NOTNULL, unary ops.
+    - [ ] **7.2e.6** Rules 250..299 — DROP, CREATE INDEX, indexed_by,
+      ALTER (rename/add column/drop/rename column), VACUUM, PRAGMA,
+      ATTACH/DETACH, ANALYZE, REINDEX.
+    - [ ] **7.2e.7** Rules 300..349 — TRIGGER (CREATE/DROP, FOR EACH,
+      WHEN, BEGIN/END, trigger_event, trigger_cmd_list,
+      WITH/WITHOUT recursive, CTE).
+    - [ ] **7.2e.8** Rules 350..411 — windows (WINDOW/OVER/FILTER, frame,
+      window definition tail), VIRTUAL TABLE, table-valued functions,
+      remaining tail rules.
+
+    Per-chunk approach (refined 2026-04-25 during 7.2e.1):
+
+    * YYMINORTYPE was extended to expose all 19 named C union members
+      (yy0/yy14/yy59/yy67/yy122/yy132/yy144/yy168/yy203/yy211/yy269/yy286/
+       yy383/yy391/yy427/yy454/yy462/yy509/yy555).  Pointer-typed minors
+      share a single 8-byte cell via the variant record; reduce code casts
+      to the concrete type (PExpr / PSelect / PSrcList / etc.) inline.
+    * yy_reduce holds a `case yyruleno of … else end` switch.  Rules whose
+      body is `;` (pure no-ops) and rules not yet ported share the `else`
+      branch — semantically a no-op, which is correct as long as the
+      grammar action does not produce a value.  Rules that DO produce a
+      value MUST have an explicit case once ported.
+    * Helper `disableLookaside(pPse: PParse)` is defined locally at the top
+      of the engine block (parse.y:132 equivalent).
+    * `tokenExpr` is replaced by a direct call to `sqlite3ExprAlloc(db,
+      op, &tok, 0)` — that helper is the moral equivalent and already
+      exported by passqlite3codegen (Phase 6.1).
+    * SAVEPOINT_BEGIN/RELEASE/ROLLBACK constants redeclared locally in
+      passqlite3parser; passqlite3pager (the original site) is not in our
+      uses clause.
+    * `sqlite3ErrorMsg` in this codebase is plain (no varargs); rule 23/24
+      drop the `%.*s` formatting in the error message and pass a static
+      literal.  TODO: when sqlite3ErrorMsg gets printf-style formatting
+      (Phase 8 / public-API phase), revisit and restore the dynamic text.
+    * Constants TF_Strict (0x00010000) and SQLITE_IDXTYPE_APPDEF/UNIQUE/
+      PRIMARYKEY/IPK were added to passqlite3codegen alongside the
+      existing TF_* / OE_* groups.
+
   - [ ] **7.2f** Wire `sqlite3RunParser` to drive the lexer through the new
     parser engine (replaces the current Phase 7.1 stub). Implement the
     fallback / wildcard handling, FILTER/OVER/WINDOW context tracking that
