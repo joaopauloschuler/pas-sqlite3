@@ -1614,9 +1614,19 @@ reference exactly.
     selection) deferred to Phase 6.2b (after Phase 6.3 select.c which provides
     the Select/SrcList types that WhereBegin depends on).
 
-- [ ] **6.3** Port `select.c`: `sqlite3Select`, aggregation, GROUP BY, HAVING,
-  ORDER BY, LIMIT/OFFSET, compound SELECT (UNION / INTERSECT / EXCEPT),
-  common table expressions, recursive queries.
+- [X] **6.3** Port `select.c` public API and helper functions: `TSelectDest`,
+  `SRT_*` / `JT_*` constants, `sqlite3SelectDestInit`, `sqlite3SelectNew`,
+  `sqlite3SelectDelete`, `sqlite3JoinType`, `sqlite3ColumnIndex`,
+  `sqlite3KeyInfoAlloc/Ref/Unref/FromExprList`, `sqlite3SelectOpName`,
+  `sqlite3GenerateColumnNames`, `sqlite3ColumnsFromExprList`,
+  `sqlite3SubqueryColumnTypes`, `sqlite3ResultSetOfSelect`, `sqlite3WithPush`,
+  `sqlite3ExpandSubquery`, `sqlite3IndexedByLookup`, `sqlite3SelectPrep`,
+  `sqlite3Select` (stub). Gate test: TestSelectBasic (49/49 PASS).
+  Full `sqlite3Select` engine (aggregation, GROUP BY, compound SELECT,
+  CTEs, recursive queries) deferred to Phase 6.3b.
+  FPC pitfalls: duplicate sqlite3LogEst removed from codegen (vdbe version
+  is authoritative); nil-db guard added to sqlite3KeyInfoAlloc (db^.enc
+  read only when db <> nil).
 
 - [ ] **6.4** Port **DML**: `insert.c`, `update.c`, `delete.c`, `upsert.c`,
   `trigger.c`. Each is ~1–2 k lines.

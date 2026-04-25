@@ -8349,30 +8349,25 @@ begin { Stub: schema reset requires Phase 6 } end;
 function sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 begin Result := 1; end;  { Always held in single-connection mode }
 
-{ rowset.c does not define sqlite3LogEst but it is used by IfSizeBetween }
-{ util.c:sqlite3LogEst — compute 10*log2(N), return LogEst (i16) }
+{ util.c:sqlite3LogEst — compute approx 10*log2(x) as LogEst (i16) }
 function sqlite3LogEst(n: u64): i16;
 const
-  { Precomputed table: a[i] = 10*log2(1.0 + i/16.0) for i=0..15 }
-  a: array[0..7] of u16 = (0, 2, 3, 5, 6, 7, 8, 9);
+  a: array[0..7] of i16 = (0, 2, 3, 5, 6, 7, 8, 9);
 var
-  x: i16;
-  t: u64;
+  y: i16;
+  x: u64;
 begin
-  if n <= 1 then begin Result := 0; Exit; end;
-  x := 40;
-  if n < 8 then begin
-    x := 10;
-    t := n;
-    while t > 1 do begin Inc(x, 10); t := t shr 1; end;
-    Dec(x, 10);
+  x := n;
+  y := 40;
+  if x < 8 then
+  begin
+    if x < 2 then begin Result := 0; Exit; end;
+    while x < 8 do begin Dec(y, 10); x := x shl 1; end;
   end else begin
-    t := n;
-    while t >= 128 do begin Inc(x, 40); t := t shr 4; end;
-    while t >= 16  do begin Inc(x, 10); t := t shr 1; end;
-    Inc(x, a[t - 8]);
+    while x > 255 do begin Inc(y, 40); x := x shr 4; end;
+    while x > 15  do begin Inc(y, 10); x := x shr 1; end;
   end;
-  Result := x;
+  Result := a[x and 7] + y - 10;
 end;
 
 { -----------------------------------------------------------------------
