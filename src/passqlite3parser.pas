@@ -1906,12 +1906,53 @@ begin
   if pCte = nil then ;
 end;
 
-{ sqlite3DequoteNumber — strip surrounding quotes from a QNUMBER literal   }
-{ (util.c:36666).  Stub: leaves the Expr unchanged; the QNUMBER token type }
-{ is only produced by the lexer for quoted-numeric literals (rare).        }
+{ sqlite3DequoteNumber — strip digit-separator '_' from a QNUMBER literal,  }
+{ promoting the Expr op to TK_INTEGER or TK_FLOAT.  Mirrors util.c:332.     }
+{ When the resulting integer fits in 32 bits we set EP_IntValue + iValue    }
+{ (tag-20240227-a in upstream).                                             }
+const
+  SQLITE_DIGIT_SEPARATOR = '_';
+
 procedure sqlite3DequoteNumber(pPse: PParse; pExpr: PExpr);
+var
+  pIn, pOut: PAnsiChar;
+  bHex:      Boolean;
+  iValue:    i32;
+  c, prev, next: AnsiChar;
 begin
-  { TODO Phase 8: port util.c sqlite3DequoteNumber. }
+  Assert((pExpr <> nil) or (pPse^.db^.mallocFailed <> 0));
+  if pExpr = nil then Exit;
+  pIn  := pExpr^.u.zToken;
+  pOut := pExpr^.u.zToken;
+  bHex := (pIn[0] = '0') and ((pIn[1] = 'x') or (pIn[1] = 'X'));
+  Assert(pExpr^.op = TK_QNUMBER);
+  pExpr^.op := TK_INTEGER;
+  repeat
+    c := pIn^;
+    if c <> SQLITE_DIGIT_SEPARATOR then begin
+      pOut^ := c;
+      Inc(pOut);
+      if (c = 'e') or (c = 'E') or (c = '.') then pExpr^.op := TK_FLOAT;
+    end else begin
+      { '_' must lie between two digits (or hex digits when bHex). }
+      prev := (pIn - 1)^;
+      next := (pIn + 1)^;
+      if (not bHex) and ((sqlite3Isdigit(u8(prev)) = 0)
+                         or (sqlite3Isdigit(u8(next)) = 0)) then
+        sqlite3ErrorMsg(pPse, 'unrecognized token')
+      else if bHex and ((sqlite3Isxdigit(u8(prev)) = 0)
+                         or (sqlite3Isxdigit(u8(next)) = 0)) then
+        sqlite3ErrorMsg(pPse, 'unrecognized token');
+    end;
+    Inc(pIn);
+  until c = #0;
+  if bHex then pExpr^.op := TK_INTEGER;
+  { tag-20240227-a: if it fits in 32 bits, promote to EP_IntValue. }
+  if (pExpr^.op = TK_INTEGER)
+     and (sqlite3GetInt32(pExpr^.u.zToken, @iValue) <> 0) then begin
+    pExpr^.u.iValue := iValue;
+    pExpr^.flags := pExpr^.flags or EP_IntValue;
+  end;
 end;
 
 { ---- yy_reduce — engine framework (parse.c:3804) ------------------------ }

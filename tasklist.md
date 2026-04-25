@@ -2439,8 +2439,39 @@ statement is syntactically complete — used by the CLI and REPLs).
 
   Fallback if 7.2 grows untenable: revisit Lemon-Pascal emitter in 7.2g.
 
-- [ ] **7.3** Port parse-tree action routines that Lemon calls (these live in
+- [X] **7.3** Port parse-tree action routines that Lemon calls (these live in
   `build.c` and friends from Phase 6, so they are already available).
+
+  DONE 2026-04-25.  All action routines that Phase 7.2e's reduce switch
+  references are wired through to passqlite3codegen (Phase 6) or to local
+  parser-unit helpers.  The unit links cleanly and a new smoke gate
+  `src/tests/TestParserSmoke.pas` drives `sqlite3RunParser` end-to-end on
+  20 representative SQL fragments (DDL, DML, savepoints, comment handling,
+  and two negative syntax-error cases) — all 20 pass.
+
+  Concrete changes in this chunk:
+    * passqlite3parser.pas — replace the `sqlite3DequoteNumber` stub with
+      the full util.c:332 port (digit-separator '_' stripped, op promoted
+      to TK_INTEGER/TK_FLOAT, EP_IntValue tag-20240227-a fast path).
+    * src/tests/TestParserSmoke.pas — new (Phase 7.3 gate).
+    * src/tests/build.sh — register TestParserSmoke.
+
+  Stubs deliberately left in place (each tagged for the appropriate later
+  phase, none of which is in 7.3's scope):
+    * sqlite3VtabBeginParse / FinishParse / ArgInit / ArgExtend  — Phase 6.bis
+    * sqlite3CteNew / sqlite3WithAdd                             — Phase 8 (build.c CTE)
+    * sqlite3Reindex                                              — Phase 8 (build.c REINDEX)
+    * sqlite3TriggerUpdateStep / InsertStep / DeleteStep / SelectStep
+                                                                  — Phase 8 (trigger.c)
+    * sqlite3ExprListAppendVector                                 — Phase 8 (expr.c vector UPDATE)
+
+  Smoke-test limitations (each documented in TestParserSmoke.pas):
+    * top-level `cmd ::= select` triggers `sqlite3Select` codegen which
+      requires a live `Vdbe` + open db backend — tested in Phase 7.4.
+    * `CREATE VIEW` reaches `sqlite3CreateView` which dereferences
+      `db^.aDb[0].pSchema` — also a Phase 7.4 concern.
+    * `COMMIT` / `ROLLBACK` / `PRAGMA` reach codegen paths that touch
+      live db internals (transaction state, pragma dispatch).
 
 - [ ] **7.4** Gate: `TestParser.pas` — for the SQL corpus, tokenise + parse
   with both implementations, dump the resulting VDBE program via the codegen
