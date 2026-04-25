@@ -696,7 +696,7 @@ function sqlite3Utf8CharLen(z: PChar; nByte: i32): i32;
 function sqlite3AppendOneUtf8Character(zOut: PChar; v: u32): i32;
 
 { Config (main.c §sqlite3_config — minimal Phase 3 stub) }
-function  sqlite3_config(op: i32; pArg: Pointer): i32;
+function  sqlite3_config(op: i32; pArg: Pointer): i32; overload;
 
 { Pragma/URI helpers (pragma.c, main.c) }
 function sqlite3GetBoolean(z: PChar; dflt: u8): u8;
@@ -1974,7 +1974,7 @@ begin
   Result := (PtrUInt(p) >= PtrUInt(pStart)) and (PtrUInt(p) < PtrUInt(pEnd));
 end;
 
-function sqlite3_config(op: i32; pArg: Pointer): i32;
+function sqlite3_config(op: i32; pArg: Pointer): i32; overload;
 begin
   Result := SQLITE_OK;
   case op of

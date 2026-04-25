@@ -60,6 +60,46 @@ const
   SQLITE_STATE_ZOMBIE = $A7;  { Close with last statement close }
 
 { ----------------------------------------------------------------------
+  Phase 8.4 — public sqlite3.h DBCONFIG / CONFIG opcode values.
+  ---------------------------------------------------------------------- }
+const
+  SQLITE_DBCONFIG_MAINDBNAME            = 1000;
+  SQLITE_DBCONFIG_LOOKASIDE             = 1001;
+  SQLITE_DBCONFIG_ENABLE_FKEY           = 1002;
+  SQLITE_DBCONFIG_ENABLE_TRIGGER        = 1003;
+  SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER = 1004;
+  SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION = 1005;
+  SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE      = 1006;
+  SQLITE_DBCONFIG_ENABLE_QPSG           = 1007;
+  SQLITE_DBCONFIG_TRIGGER_EQP           = 1008;
+  SQLITE_DBCONFIG_RESET_DATABASE        = 1009;
+  SQLITE_DBCONFIG_DEFENSIVE             = 1010;
+  SQLITE_DBCONFIG_WRITABLE_SCHEMA       = 1011;
+  SQLITE_DBCONFIG_LEGACY_ALTER_TABLE    = 1012;
+  SQLITE_DBCONFIG_DQS_DML               = 1013;
+  SQLITE_DBCONFIG_DQS_DDL               = 1014;
+  SQLITE_DBCONFIG_ENABLE_VIEW           = 1015;
+  SQLITE_DBCONFIG_LEGACY_FILE_FORMAT    = 1016;
+  SQLITE_DBCONFIG_TRUSTED_SCHEMA        = 1017;
+  SQLITE_DBCONFIG_STMT_SCANSTATUS       = 1018;
+  SQLITE_DBCONFIG_REVERSE_SCANORDER     = 1019;
+  SQLITE_DBCONFIG_ENABLE_ATTACH_CREATE  = 1020;
+  SQLITE_DBCONFIG_ENABLE_ATTACH_WRITE   = 1021;
+  SQLITE_DBCONFIG_ENABLE_COMMENTS       = 1022;
+  SQLITE_DBCONFIG_FP_DIGITS             = 1023;
+
+  SQLITE_CONFIG_SINGLETHREAD = 1;
+  SQLITE_CONFIG_MULTITHREAD  = 2;
+  SQLITE_CONFIG_SERIALIZED   = 3;
+  SQLITE_CONFIG_MEMSTATUS    = 9;
+  SQLITE_CONFIG_URI          = 17;
+  SQLITE_CONFIG_COVERING_INDEX_SCAN = 20;
+  SQLITE_CONFIG_STMTJRNL_SPILL = 26;
+  SQLITE_CONFIG_SMALL_MALLOC = 27;
+  SQLITE_CONFIG_SORTERREF_SIZE = 28;
+  SQLITE_CONFIG_MEMDB_MAXSIZE  = 29;
+
+{ ----------------------------------------------------------------------
   Public API
   ---------------------------------------------------------------------- }
 
@@ -102,6 +142,41 @@ function sqlite3_create_module(db: PTsqlite3; zName: PAnsiChar;
   pModule: Pointer; pAux: Pointer): i32;
 function sqlite3_create_module_v2(db: PTsqlite3; zName: PAnsiChar;
   pModule: Pointer; pAux: Pointer; xDestroy: Pointer): i32;
+
+{ Phase 8.4 — configuration and hooks (main.c). }
+
+{ Busy handler / timeout. }
+function sqlite3_busy_handler(db: PTsqlite3;
+  xBusy: Pointer; pArg: Pointer): i32;
+function sqlite3_busy_timeout(db: PTsqlite3; ms: i32): i32;
+
+{ Hooks: each returns the previously-installed pArg (or nil). }
+function sqlite3_commit_hook(db: PTsqlite3;
+  xCallback: Pointer; pArg: Pointer): Pointer;
+function sqlite3_rollback_hook(db: PTsqlite3;
+  xCallback: Pointer; pArg: Pointer): Pointer;
+function sqlite3_update_hook(db: PTsqlite3;
+  xCallback: Pointer; pArg: Pointer): Pointer;
+
+{ Trace v2.  Combinations of SQLITE_TRACE_STMT/PROFILE/ROW/CLOSE. }
+function sqlite3_trace_v2(db: PTsqlite3; mTrace: u32;
+  xTrace: Pointer; pArg: Pointer): i32;
+
+{ db_config — Pascal-friendly typed entry points (no C varargs).
+  The varargs C signature collapses into three argument shapes; we expose
+  one entry point per shape.  Phase 8.4 covers MAINDBNAME / FP_DIGITS /
+  LOOKASIDE / all flag-toggle ops in main.c:982. }
+function sqlite3_db_config_text(db: PTsqlite3; op: i32;
+  zName: PAnsiChar): i32;
+function sqlite3_db_config_lookaside(db: PTsqlite3; op: i32;
+  pBuf: Pointer; sz: i32; cnt: i32): i32;
+function sqlite3_db_config_int(db: PTsqlite3; op: i32;
+  onoff: i32; pRes: Pi32): i32;
+
+{ config — int-shape entry point.  passqlite3util already provides the
+  pointer-shape sqlite3_config(op, pArg) (overloaded); this adds the
+  int-shape used by SQLITE_CONFIG_MEMSTATUS / SINGLETHREAD / etc. }
+function sqlite3_config(op: i32; arg: i32): i32; overload;
 
 implementation
 
@@ -833,6 +908,325 @@ begin
     Result := SQLITE_MISUSE; Exit;
   end;
   Result := createModule(db, zName, pModule, pAux, xDestroy);
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 8.4 — Configuration and hooks.
+  Ported from main.c:
+    426  sqlite3_config         (varargs — exposed here as int-shape overload)
+    950  sqlite3_db_config      (varargs — exposed as three typed entry points)
+   1718  sqliteDefaultBusyCallback
+   1786  sqlite3_busy_handler
+   1843  sqlite3_busy_timeout
+   2277  sqlite3_trace_v2
+   2337  sqlite3_commit_hook
+   2362  sqlite3_update_hook
+   2387  sqlite3_rollback_hook
+
+  Scope of this Phase 8.4 port:
+    * No C-ABI varargs.  sqlite3_config and sqlite3_db_config are split
+      into typed entry points (one per argument shape).  Pascal callers
+      are the v1 audience; a future ABI-compat layer can wrap these
+      under a varargs trampoline.
+    * setupLookaside is stubbed: lookaside slot allocation is not wired
+      (Phase 8.1 already set bDisable=1, sz=0).  We record sz / nSlot
+      / pBuf for future use but never actually serve allocations from
+      the buffer.  If cnt <= 0 the subsystem is forcibly disabled.
+    * sqlite3_progress_handler is intentionally NOT exported (gated by
+      SQLITE_OMIT_PROGRESS_CALLBACK conventions; deferred to Phase 8.5+).
+    * SETLK_TIMEOUT (compile-time gated in C) is not built in.
+    * Db-config flags that reference codegen state we have not yet
+      wired (e.g. SQLITE_DqsDDL parser-side enforcement, SQLITE_Defensive
+      vdbe checks) still flip the flag bit; their *behaviour* engages
+      only when the consumer subsystem honours the bit, which is a
+      separate concern.
+  ---------------------------------------------------------------------- }
+
+const
+  { sqlite3.flags bits not previously declared in passqlite3util.SQLITE_*. }
+  SQLITE_StmtScanStatus_Bit = u64($00000400);
+  SQLITE_NoCkptOnClose_Bit  = u64($00000800);
+  SQLITE_ReverseOrder_Bit   = u64($00001000);
+  SQLITE_LoadExtension_Bit  = u64($00010000);
+  SQLITE_Fts3Tokenizer_Bit  = u64($00400000);
+  SQLITE_EnableQPSG_Bit     = u64($00800000);
+  SQLITE_TriggerEQP_Bit     = u64($01000000);
+  SQLITE_ResetDatabase_Bit  = u64($02000000);
+  SQLITE_LegacyAlter_Bit    = u64($04000000);
+  SQLITE_NoSchemaError_Bit  = u64($08000000);
+  SQLITE_Defensive_Bit      = u64($10000000);
+  SQLITE_DqsDDL_Bit         = u64($20000000);
+  SQLITE_DqsDML_Bit         = u64($40000000);
+  SQLITE_EnableView_Bit     = u64($80000000);
+  SQLITE_AttachCreate_Bit   = u64($00010) shl 32;
+  SQLITE_AttachWrite_Bit    = u64($00020) shl 32;
+  SQLITE_Comments_Bit       = u64($00040) shl 32;
+
+type
+  TBusyCallbackFn   = function(p: Pointer; n: i32): i32; cdecl;
+  TCommitCallbackFn = function(p: Pointer): i32; cdecl;
+  TRollbackCallbackFn = procedure(p: Pointer); cdecl;
+  TTraceV2Fn        = function(n: u32; p, x, y: Pointer): i32; cdecl;
+
+{ sqliteDefaultBusyCallback — main.c:1718.  Faithful port of the
+  delays/totals nanosleep variant.  HAVE_NANOSLEEP is assumed (Linux). }
+function sqliteDefaultBusyCallback(ptr: Pointer; count: i32): i32; cdecl;
+const
+  delays: array[0..11] of u8 = ( 1, 2, 5, 10, 15, 20, 25, 25,  25,  50,  50, 100);
+  totals: array[0..11] of u8 = ( 0, 1, 3,  8, 18, 33, 53, 78, 103, 128, 178, 228);
+  NDELAY = 12;
+var
+  db: PTsqlite3;
+  tmout, delay, prior: i32;
+begin
+  db    := PTsqlite3(ptr);
+  tmout := db^.busyTimeout;
+  if count < NDELAY then begin
+    delay := delays[count];
+    prior := totals[count];
+  end else begin
+    delay := delays[NDELAY - 1];
+    prior := totals[NDELAY - 1] + delay * (count - (NDELAY - 1));
+  end;
+  if (prior + delay) > tmout then begin
+    delay := tmout - prior;
+    if delay <= 0 then begin Result := 0; Exit; end;
+  end;
+  sqlite3OsSleep(Psqlite3_vfs(db^.pVfs), delay * 1000);
+  Result := 1;
+end;
+
+function sqlite3_busy_handler(db: PTsqlite3;
+  xBusy: Pointer; pArg: Pointer): i32;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  db^.busyHandler.xBusyHandler := TBusyCallbackFn(xBusy);
+  db^.busyHandler.pBusyArg     := pArg;
+  db^.busyHandler.nBusy        := 0;
+  db^.busyTimeout              := 0;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+function sqlite3_busy_timeout(db: PTsqlite3; ms: i32): i32;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  if ms > 0 then begin
+    sqlite3_busy_handler(db, @sqliteDefaultBusyCallback, Pointer(db));
+    db^.busyTimeout := ms;
+  end else begin
+    sqlite3_busy_handler(db, nil, nil);
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ Hooks — main.c:2337/2362/2387. }
+function sqlite3_commit_hook(db: PTsqlite3;
+  xCallback: Pointer; pArg: Pointer): Pointer;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := nil; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  Result               := db^.pCommitArg;
+  db^.xCommitCallback  := TCommitCallbackFn(xCallback);
+  db^.pCommitArg       := pArg;
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+function sqlite3_rollback_hook(db: PTsqlite3;
+  xCallback: Pointer; pArg: Pointer): Pointer;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := nil; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  Result                 := db^.pRollbackArg;
+  db^.xRollbackCallback  := TRollbackCallbackFn(xCallback);
+  db^.pRollbackArg       := pArg;
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+function sqlite3_update_hook(db: PTsqlite3;
+  xCallback: Pointer; pArg: Pointer): Pointer;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := nil; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  Result               := db^.pUpdateArg;
+  db^.xUpdateCallback  := xCallback;
+  db^.pUpdateArg       := pArg;
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+function sqlite3_trace_v2(db: PTsqlite3; mTrace: u32;
+  xTrace: Pointer; pArg: Pointer): i32;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  if mTrace = 0 then xTrace := nil;
+  if xTrace = nil then mTrace := 0;
+  db^.mTrace      := u8(mTrace and $FF);
+  db^.trace.xV2   := TTraceV2Fn(xTrace);
+  db^.pTraceArg   := pArg;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+{ ----------------------------------------------------------------------
+  setupLookaside — main.c:776 (greatly simplified for Phase 8.4).
+
+  We do not implement slot allocation; the lookaside subsystem stays
+  disabled (bDisable=1) as it has been since Phase 8.1.  This stub
+  exists so SQLITE_DBCONFIG_LOOKASIDE callers get well-defined
+  behaviour: SQLITE_OK is returned, the caller's request is recorded
+  in the (non-functional) sz / nSlot fields, and the bDisable flag
+  reflects the request.
+  ---------------------------------------------------------------------- }
+function setupLookaside(db: PTsqlite3; pBuf: Pointer; sz, cnt: i32): i32;
+begin
+  if pBuf <> nil then ;  { silence unused warning }
+  if (sz <= 0) or (cnt <= 0) then begin
+    db^.lookaside.bDisable := 1;
+    db^.lookaside.sz       := 0;
+    db^.lookaside.nSlot    := 0;
+  end else begin
+    { Round sz down to a multiple of 8.  Mirrors C: sz = ROUNDDOWN8(sz). }
+    sz := sz and (not 7);
+    db^.lookaside.bDisable := 1;        { still no real allocation }
+    db^.lookaside.sz       := u16(sz);
+    db^.lookaside.nSlot    := u32(cnt);
+  end;
+  Result := SQLITE_OK;
+end;
+
+type
+  TFlagOpEntry = record
+    op:   i32;
+    mask: u64;
+  end;
+const
+  { Mirrors aFlagOp[] in main.c:986. }
+  aFlagOp: array[0..20] of TFlagOpEntry = (
+    (op: SQLITE_DBCONFIG_ENABLE_FKEY;           mask: SQLITE_ForeignKeys),
+    (op: SQLITE_DBCONFIG_ENABLE_TRIGGER;        mask: SQLITE_EnableTrigger),
+    (op: SQLITE_DBCONFIG_ENABLE_VIEW;           mask: SQLITE_EnableView_Bit),
+    (op: SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER; mask: SQLITE_Fts3Tokenizer_Bit),
+    (op: SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION; mask: SQLITE_LoadExtension_Bit),
+    (op: SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE;      mask: SQLITE_NoCkptOnClose_Bit),
+    (op: SQLITE_DBCONFIG_ENABLE_QPSG;           mask: SQLITE_EnableQPSG_Bit),
+    (op: SQLITE_DBCONFIG_TRIGGER_EQP;           mask: SQLITE_TriggerEQP_Bit),
+    (op: SQLITE_DBCONFIG_RESET_DATABASE;        mask: SQLITE_ResetDatabase_Bit),
+    (op: SQLITE_DBCONFIG_DEFENSIVE;             mask: SQLITE_Defensive_Bit),
+    (op: SQLITE_DBCONFIG_WRITABLE_SCHEMA;       mask: SQLITE_WriteSchema or SQLITE_NoSchemaError_Bit),
+    (op: SQLITE_DBCONFIG_LEGACY_ALTER_TABLE;    mask: SQLITE_LegacyAlter_Bit),
+    (op: SQLITE_DBCONFIG_DQS_DDL;               mask: SQLITE_DqsDDL_Bit),
+    (op: SQLITE_DBCONFIG_DQS_DML;               mask: SQLITE_DqsDML_Bit),
+    (op: SQLITE_DBCONFIG_LEGACY_FILE_FORMAT;    mask: SQLITE_LegacyFileFmt),
+    (op: SQLITE_DBCONFIG_TRUSTED_SCHEMA;        mask: SQLITE_TrustedSchema),
+    (op: SQLITE_DBCONFIG_STMT_SCANSTATUS;       mask: SQLITE_StmtScanStatus_Bit),
+    (op: SQLITE_DBCONFIG_REVERSE_SCANORDER;     mask: SQLITE_ReverseOrder_Bit),
+    (op: SQLITE_DBCONFIG_ENABLE_ATTACH_CREATE;  mask: SQLITE_AttachCreate_Bit),
+    (op: SQLITE_DBCONFIG_ENABLE_ATTACH_WRITE;   mask: SQLITE_AttachWrite_Bit),
+    (op: SQLITE_DBCONFIG_ENABLE_COMMENTS;       mask: SQLITE_Comments_Bit)
+  );
+
+{ Common flag-op handler. }
+function dbConfigFlagOp(db: PTsqlite3; op: i32;
+  onoff: i32; pRes: Pi32): i32;
+var
+  i: i32;
+  oldFlags: u64;
+begin
+  for i := 0 to High(aFlagOp) do begin
+    if aFlagOp[i].op = op then begin
+      oldFlags := db^.flags;
+      if onoff > 0 then
+        db^.flags := db^.flags or aFlagOp[i].mask
+      else if onoff = 0 then
+        db^.flags := db^.flags and (not aFlagOp[i].mask);
+      if oldFlags <> db^.flags then
+        sqlite3ExpirePreparedStatements(db, 0);
+      if pRes <> nil then begin
+        if (db^.flags and aFlagOp[i].mask) <> 0 then pRes^ := 1 else pRes^ := 0;
+      end;
+      Result := SQLITE_OK;
+      Exit;
+    end;
+  end;
+  Result := SQLITE_ERROR;
+end;
+
+function sqlite3_db_config_text(db: PTsqlite3; op: i32;
+  zName: PAnsiChar): i32;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  if op = SQLITE_DBCONFIG_MAINDBNAME then begin
+    db^.aDb[0].zDbSName := zName;
+    Result := SQLITE_OK;
+  end else
+    Result := SQLITE_ERROR;
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+function sqlite3_db_config_lookaside(db: PTsqlite3; op: i32;
+  pBuf: Pointer; sz: i32; cnt: i32): i32;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  if op = SQLITE_DBCONFIG_LOOKASIDE then
+    Result := setupLookaside(db, pBuf, sz, cnt)
+  else
+    Result := SQLITE_ERROR;
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+function sqlite3_db_config_int(db: PTsqlite3; op: i32;
+  onoff: i32; pRes: Pi32): i32;
+var
+  rc: i32;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  if op = SQLITE_DBCONFIG_FP_DIGITS then begin
+    if (onoff > 3) and (onoff < 24) then db^.nFpDigit := u8(onoff);
+    if pRes <> nil then pRes^ := db^.nFpDigit;
+    rc := SQLITE_OK;
+  end else
+    rc := dbConfigFlagOp(db, op, onoff, pRes);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+{ sqlite3_config(int).  Mirrors the int-shape branches of main.c:426. }
+function sqlite3_config(op: i32; arg: i32): i32; overload;
+begin
+  if sqlite3GlobalConfig.isInit <> 0 then begin
+    { Only LOG / PCACHE_HDRSZ are anytime-config; neither uses int shape. }
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  Result := SQLITE_OK;
+  case op of
+    SQLITE_CONFIG_SINGLETHREAD: begin
+      sqlite3GlobalConfig.bCoreMutex := 0;
+      sqlite3GlobalConfig.bFullMutex := 0;
+    end;
+    SQLITE_CONFIG_MULTITHREAD: begin
+      sqlite3GlobalConfig.bCoreMutex := 1;
+      sqlite3GlobalConfig.bFullMutex := 0;
+    end;
+    SQLITE_CONFIG_SERIALIZED: begin
+      sqlite3GlobalConfig.bCoreMutex := 1;
+      sqlite3GlobalConfig.bFullMutex := 1;
+    end;
+    SQLITE_CONFIG_MEMSTATUS:    sqlite3GlobalConfig.bMemstat    := arg;
+    SQLITE_CONFIG_SMALL_MALLOC: sqlite3GlobalConfig.bSmallMalloc := arg;
+    SQLITE_CONFIG_URI:          sqlite3GlobalConfig.bOpenUri    := arg;
+    SQLITE_CONFIG_COVERING_INDEX_SCAN: sqlite3GlobalConfig.bUseCis := arg;
+    SQLITE_CONFIG_STMTJRNL_SPILL: sqlite3GlobalConfig.nStmtSpill := arg;
+    SQLITE_CONFIG_SORTERREF_SIZE: sqlite3GlobalConfig.szSorterRef := u32(arg);
+    SQLITE_CONFIG_MEMDB_MAXSIZE:  sqlite3GlobalConfig.mxMemdbSize := arg;
+  else
+    Result := SQLITE_MISUSE;
+  end;
 end;
 
 end.

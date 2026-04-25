@@ -20,6 +20,47 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-25 — Phase 8.4 configuration and hooks.**  New entry points
+    in `src/passqlite3main.pas`: `sqlite3_busy_handler`,
+    `sqlite3_busy_timeout`, `sqlite3_commit_hook`, `sqlite3_rollback_hook`,
+    `sqlite3_update_hook`, `sqlite3_trace_v2`, plus typed entry points for
+    the C-varargs `sqlite3_db_config` and `sqlite3_config`.  Because FPC
+    cannot cleanly implement C-style varargs in Pascal, both varargs
+    APIs are split per argument shape:
+      * `sqlite3_db_config_text(db, op, zName)` — MAINDBNAME.
+      * `sqlite3_db_config_lookaside(db, op, pBuf, sz, cnt)` — LOOKASIDE.
+      * `sqlite3_db_config_int(db, op, onoff, pRes)` — every flag-toggle
+        op + FP_DIGITS.  Probe with onoff<0 leaves the flag unchanged.
+      * `sqlite3_config(op, arg: i32)` (overloaded with the existing
+        `sqlite3_config(op, pArg: Pointer)` from passqlite3util) covers
+        SINGLETHREAD/MULTITHREAD/SERIALIZED/MEMSTATUS/URI/SMALL_MALLOC/
+        COVERING_INDEX_SCAN/STMTJRNL_SPILL/SORTERREF_SIZE/MEMDB_MAXSIZE.
+    Faithful port of `sqliteDefaultBusyCallback` from main.c:1718 with
+    the delays/totals nanosleep table; `setupLookaside` is a recording
+    stub (no real slot allocation — bDisable stays 1, sz/nSlot are
+    written but never honoured by the allocator).  All 21 db-config
+    flag bits (`SQLITE_StmtScanStatus`, `SQLITE_NoCkptOnClose`,
+    `SQLITE_ReverseOrder`, `SQLITE_LoadExtension`, `SQLITE_Fts3Tokenizer`,
+    `SQLITE_EnableQPSG`, `SQLITE_TriggerEQP`, `SQLITE_ResetDatabase`,
+    `SQLITE_LegacyAlter`, `SQLITE_NoSchemaError`, `SQLITE_Defensive`,
+    `SQLITE_DqsDDL/DML`, `SQLITE_EnableView`, `SQLITE_AttachCreate/Write`,
+    `SQLITE_Comments`) are declared locally as `*_Bit` constants —
+    public re-export pending a future flag-bit cleanup pass that
+    consolidates them with passqlite3util's existing SQLITE_* table.
+    Gate `src/tests/TestConfigHooks.pas` 54/54 PASS; no regressions in
+    TestRegistration / TestPrepareBasic / TestOpenClose.
+
+    Phase 8.4 scope notes (deferred):
+      * C-ABI varargs trampolines (`sqlite3_db_config(db, op, ...)` /
+        `sqlite3_config(op, ...)` with FPC `varargs` modifier accessing
+        the platform va_list) — needed only for direct C-from-Pascal
+        callers; defer to ABI-compat phase.
+      * `sqlite3_progress_handler` (gated by SQLITE_OMIT_PROGRESS_CALLBACK
+        idioms) — port alongside Phase 8.5 (initialize/shutdown).
+      * Real lookaside slot allocator — wait for ENABLE_MEMSYS5 work.
+      * UTF-16 hook variants (`sqlite3_trace_v2` already takes UTF-8
+        zSql per spec; nothing to add).
+
   - **2026-04-25 — Phase 8.3 registration APIs.**  New entry points in
     `src/passqlite3main.pas`: `sqlite3_create_function[_v2]`,
     `sqlite3_create_window_function`, `sqlite3_create_collation[_v2]`,
@@ -2719,9 +2760,40 @@ loader — *optional for v1*).
       instantiated.  Phase 6.bis.1 will need to revisit.
     * `sqlite3_drop_modules` not ported (vtab.c only API caller).
 
-- [ ] **8.4** Port configuration and hooks: `sqlite3_config`, `sqlite3_db_config`,
+- [X] **8.4** Port configuration and hooks: `sqlite3_config`, `sqlite3_db_config`,
   `sqlite3_commit_hook`, `sqlite3_rollback_hook`, `sqlite3_update_hook`,
   `sqlite3_trace_v2`, `sqlite3_busy_handler`.
+
+  DONE 2026-04-25.  See "Most recent activity" above for the full
+  changelog.  Brief recap:
+    * Direct ports: `sqlite3_busy_handler`, `sqlite3_busy_timeout` (+
+      `sqliteDefaultBusyCallback`), `sqlite3_commit_hook`,
+      `sqlite3_rollback_hook`, `sqlite3_update_hook`, `sqlite3_trace_v2`.
+    * Varargs C entry points (`sqlite3_db_config`, `sqlite3_config`)
+      split into typed Pascal entry points: `sqlite3_db_config_text`,
+      `sqlite3_db_config_lookaside`, `sqlite3_db_config_int`, and an
+      `sqlite3_config(op, arg: i32)` overload alongside the existing
+      `sqlite3_config(op, pArg: Pointer)` from passqlite3util.  C-ABI
+      varargs trampolines are deferred to a future ABI-compat phase.
+    * Gate: `src/tests/TestConfigHooks.pas` — 54/54 PASS.
+    * Concrete changes:
+        - `src/passqlite3main.pas` — new entry points, types,
+          `aFlagOp[]`, `setupLookaside` stub.
+        - `src/passqlite3util.pas` — added `overload` directive on
+          existing `sqlite3_config(op, pArg: Pointer)`.
+        - `src/tests/TestConfigHooks.pas` — new gate test.
+        - `src/tests/build.sh` — registers TestConfigHooks.
+
+  Phase 8.4 scope notes (deferred to later sub-phases):
+    * Real lookaside slot allocator (Phase 8.5+ memsys work).
+    * `sqlite3_progress_handler` (defer with Phase 8.5
+      initialize/shutdown).
+    * C-ABI varargs trampolines (defer to ABI-compat phase).
+    * Hook *invocation* paths: the codegen / vdbe / pager paths that
+      should fire `xCommitCallback`, `xRollbackCallback`,
+      `xUpdateCallback`, `xV2` are NOT audited in this phase — only
+      registration is wired.  Audit + wiring belongs with Phase 6.4
+      (DML hooks) and Phase 5.4 trace ops.
 
 - [ ] **8.5** Port `sqlite3_initialize` / `sqlite3_shutdown`.
 
