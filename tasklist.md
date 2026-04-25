@@ -1652,10 +1652,11 @@ reference exactly.
   `pragma.c`, `vacuum.c`.
   Gate test: `TestSchemaBasic.pas` — 44/44 PASS (2026-04-25).
 
-- [ ] **6.6** Port **auth and built-in functions**: `auth.c`, `callback.c`,
+- [X] **6.6** Port **auth and built-in functions**: `auth.c`, `callback.c`,
   `func.c` (scalars: `abs`, `coalesce`, `like`, `substr`, `lower`, etc.),
   `date.c` (`date()`, `time()`, `julianday()`, `strftime()`, `datetime()`),
   `fkey.c` (foreign-key enforcement), `rowset.c`.
+  Gate test: `TestAuthBuiltins.pas` — **34/34 PASS** (2026-04-25).
 
 - [ ] **6.7** Port `window.c`: SQL window functions (`OVER`, `PARTITION BY`,
   `ROWS BETWEEN`, …). Intersects with `select.c` — port last within the
@@ -1663,6 +1664,70 @@ reference exactly.
 
 - [ ] **6.8** (Optional, defer-able) Port `json.c`: JSON1 scalar functions,
   `json_each`, `json_tree`. Only if users need it in v1.
+
+### Phase 6.6 implementation notes (2026-04-25)
+
+**Units modified**: `src/passqlite3codegen.pas`, `src/passqlite3vdbe.pas`,
+`src/passqlite3types.pas`.
+
+**New types** (all sizes verified against FPC x86-64):
+- `TCollSeq=40`: zName:8+enc:1+pad:7+pUser:8+xCmp:8+xDel:8.
+- `TFuncDestructor=24`: nRef:4+pad:4+xDestroy:8+pUserData:8.
+- `TFuncDefHash=184`: 23×8 PTFuncDef slots.
+- `TFuncDef.nArg` corrected from `i8` to `i16` (C struct uses `i16`).
+
+**New constants**:
+- Auth action codes: `SQLITE_CREATE_INDEX=1` … `SQLITE_RECURSIVE_AUTH=33`
+  (suffixed `_AUTH` for DELETE/INSERT/SELECT/UPDATE/ATTACH/DETACH/FUNCTION to
+  avoid clashing with result-code constants of the same name).
+- `SQLITE_FUNC_*` flags: ENCMASK, LIKE, CASE, EPHEM, NEEDCOLL, LENGTH,
+  TYPEOF, BYTELEN, COUNT, UNLIKELY, CONSTANT, MINMAX, SLOCHNG, TEST,
+  RUNONLY, WINDOW, INTERNAL, DIRECT, UNSAFE, INLINE, BUILTIN, ANYORDER.
+- `SQLITE_FUNC_HASH_SZ=23`.
+- Public API function flags: `SQLITE_DETERMINISTIC=$800`, `SQLITE_DIRECTONLY=$80000`,
+  `SQLITE_SUBTYPE=$100000`, `SQLITE_INNOCUOUS=$200000`.
+- `SQLITE_DENY=1`, `SQLITE_IGNORE=2` (added to passqlite3types.pas).
+- `SQLITE_REAL=2` alias for `SQLITE_FLOAT`.
+
+**Exported from passqlite3vdbe.pas interface**: `sqlite3MemCompare`,
+`sqlite3AddInt64`.
+
+**Known FPC pitfalls hit**:
+- `const X = val` inside function bodies → illegal in OBJFPC; move to function
+  const section or module const block.
+- Inline `var x: T := val` inside `begin..end` blocks → illegal; move to var
+  section above `begin`.
+- `type TAcc = ...` inside function bodies → duplicate identifier if repeated
+  in adjacent functions; moved to module-level type block with unique names
+  (TSumAcc/PSumAcc, TAvgAcc/PAvgAcc).
+- `pMem: PMem` → FPC case-insensitive clash with type `PMem`; renamed to
+  `pAgg`, `pCount`, etc.
+- `uses DateUtils, SysUtils` → must appear immediately after `implementation`
+  keyword, not inside the body.
+- `sqlite3_snprintf(n, buf, fmt, args)` → our declaration is variadic-argless;
+  replaced with `snpFmt(n, buf, fmt, args)` helper using SysUtils.Format.
+- `TDateTime2` fields: `Y, M, D, h, m` where `M` and `m` are same to FPC;
+  renamed to `yr, mo, dy, hr, mi`.
+- `sqlite3Toupper` is a function, not an array; call as `sqlite3Toupper(x)`.
+
+**Date functions**: implemented using Julian Day arithmetic (same formula as
+SQLite's `date.c`). `currentJD` uses `SysUtils.Now` + `DateUtils.DecodeDateTime`.
+
+**Functions implemented**: auth.c (sqlite3_set_authorizer, sqlite3AuthReadCol,
+sqlite3AuthRead, sqlite3AuthCheck, sqlite3AuthContextPush/Pop); callback.c
+(findCollSeqEntry, sqlite3FindCollSeq, synthCollSeq, sqlite3GetCollSeq,
+sqlite3CheckCollSeq, sqlite3IsBinary, sqlite3LocateCollSeq,
+sqlite3SetTextEncoding, matchQuality, sqlite3FunctionSearch,
+sqlite3InsertBuiltinFuncs, sqlite3FindFunction, sqlite3CreateFunc,
+sqlite3SchemaClear, sqlite3SchemaGet, sqlite3RegisterBuiltinFunctions,
+sqlite3RegisterPerConnectionBuiltinFunctions, sqlite3RegisterLikeFunctions,
+sqlite3IsLikeFunction); 30+ scalar functions (abs, typeof, octetLength, length,
+substr, upper, lower, hex, unhex, zeroblob, nullif, version, sourceid, errlog,
+random, randomBlob, lastInsertRowid, changes, totalChanges, round, trim, ltrim,
+rtrim, replace, like, glob, coalesce, ifnull, iif, unicode, char, quote);
+aggregates (count, sum, total, avg, min, max, group_concat);
+date/time functions (date, time, datetime, julianday, unixepoch, strftime);
+fkey.c stubs (all 7 functions).
 
 ### Phase 6.4 implementation notes (2026-04-25)
 

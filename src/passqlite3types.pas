@@ -93,6 +93,10 @@ const
   SQLITE_ROW          = 100; { sqlite3_step() has another row ready }
   SQLITE_DONE         = 101; { sqlite3_step() has finished executing }
 
+  { Authorizer return codes (sqlite3.h §3.7) }
+  SQLITE_DENY         = 1;   { Abort the SQL statement with an error }
+  SQLITE_IGNORE       = 2;   { Don't allow access, but don't generate error }
+
 // ---------------------------------------------------------------------------
 // Extended result codes  (sqlite3.h §2)
 // ---------------------------------------------------------------------------
@@ -270,6 +274,7 @@ const
 const
   SQLITE_INTEGER = 1;
   SQLITE_FLOAT   = 2;
+  SQLITE_REAL    = 2; { alias for SQLITE_FLOAT }
   SQLITE_BLOB    = 4;
   SQLITE_NULL    = 5;
   SQLITE_TEXT    = 3;
@@ -286,6 +291,16 @@ const
   SQLITE_UTF16    = 4; { Use native byte order — SQLITE_UTF16NATIVE below }
   SQLITE_ANY      = 5; { Deprecated }
   SQLITE_UTF16_ALIGNED = 8; { sqlite3_create_collation only }
+
+// ---------------------------------------------------------------------------
+// sqlite3_create_function flags (sqlite3.h §4.8)
+// ---------------------------------------------------------------------------
+
+const
+  SQLITE_DETERMINISTIC = $00000800; { function always returns same result for same inputs }
+  SQLITE_DIRECTONLY    = $00080000; { may only be called from top-level SQL, not triggers/views }
+  SQLITE_SUBTYPE       = $00100000; { function may call sqlite3_value_subtype() }
+  SQLITE_INNOCUOUS     = $00200000; { function is unlikely to cause problems }
 
 // ---------------------------------------------------------------------------
 // Destructor callback type — used by Mem.xDel and sqlite3_create_function

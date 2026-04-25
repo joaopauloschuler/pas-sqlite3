@@ -473,6 +473,74 @@ const
   SQLITE_NOTNULL     = $90;
 
 { ============================================================================
+  SQLITE_FUNC_* flags (sqliteInt.h — FuncDef.funcFlags)
+  ============================================================================ }
+
+const
+  SQLITE_FUNC_ENCMASK  = $0003;
+  SQLITE_FUNC_LIKE     = $0004;
+  SQLITE_FUNC_CASE     = $0008;
+  SQLITE_FUNC_EPHEM    = $0010;
+  SQLITE_FUNC_NEEDCOLL = $0020;
+  SQLITE_FUNC_LENGTH   = $0040;
+  SQLITE_FUNC_TYPEOF   = $0080;
+  SQLITE_FUNC_BYTELEN  = $00C0;
+  SQLITE_FUNC_COUNT    = $0100;
+  SQLITE_FUNC_UNLIKELY = $0400;
+  SQLITE_FUNC_CONSTANT = $0800;
+  SQLITE_FUNC_MINMAX   = $1000;
+  SQLITE_FUNC_SLOCHNG  = $2000;
+  SQLITE_FUNC_TEST     = $4000;
+  SQLITE_FUNC_RUNONLY  = $8000;
+  SQLITE_FUNC_WINDOW   = $00010000;
+  SQLITE_FUNC_INTERNAL = $00040000;
+  SQLITE_FUNC_DIRECT   = $00080000;
+  SQLITE_FUNC_UNSAFE   = $00200000;
+  SQLITE_FUNC_INLINE   = $00400000;
+  SQLITE_FUNC_BUILTIN  = $00800000;
+  SQLITE_FUNC_ANYORDER = $08000000;
+
+  SQLITE_FUNC_HASH_SZ  = 23;
+
+{ ============================================================================
+  Auth action codes (sqlite3.h — for sqlite3_set_authorizer)
+  ============================================================================ }
+
+  SQLITE_CREATE_INDEX      = 1;
+  SQLITE_CREATE_TABLE      = 2;
+  SQLITE_CREATE_TEMP_INDEX = 3;
+  SQLITE_CREATE_TEMP_TABLE = 4;
+  SQLITE_CREATE_TEMP_TRIGGER = 5;
+  SQLITE_CREATE_TEMP_VIEW  = 6;
+  SQLITE_CREATE_TRIGGER    = 7;
+  SQLITE_CREATE_VIEW       = 8;
+  SQLITE_DELETE_AUTH       = 9;   { = SQLITE_DELETE but avoid clash with SQLITE_DELETE result code }
+  SQLITE_DROP_INDEX        = 10;
+  SQLITE_DROP_TABLE        = 11;
+  SQLITE_DROP_TEMP_INDEX   = 12;
+  SQLITE_DROP_TEMP_TABLE   = 13;
+  SQLITE_DROP_TEMP_TRIGGER = 14;
+  SQLITE_DROP_TEMP_VIEW    = 15;
+  SQLITE_DROP_TRIGGER      = 16;
+  SQLITE_DROP_VIEW         = 17;
+  SQLITE_INSERT_AUTH       = 18;  { = SQLITE_INSERT }
+  SQLITE_PRAGMA_AUTH       = 19;
+  SQLITE_READ_AUTH         = 20;
+  SQLITE_SELECT_AUTH       = 21;
+  SQLITE_TRANSACTION_AUTH  = 22;
+  SQLITE_UPDATE_AUTH       = 23;
+  SQLITE_ATTACH_AUTH       = 24;
+  SQLITE_DETACH_AUTH       = 25;
+  SQLITE_ALTER_TABLE_AUTH  = 26;
+  SQLITE_REINDEX_AUTH      = 27;
+  SQLITE_ANALYZE_AUTH      = 28;
+  SQLITE_CREATE_VTABLE     = 29;
+  SQLITE_DROP_VTABLE       = 30;
+  SQLITE_FUNCTION_AUTH     = 31;
+  SQLITE_SAVEPOINT_AUTH    = 32;
+  SQLITE_RECURSIVE_AUTH    = 33;
+
+{ ============================================================================
   KEY INFO sort flags (sqliteInt.h KEYINFO_ORDER_*)
   ============================================================================ }
 
@@ -537,8 +605,8 @@ type
     corresponding phases land (Phase 6 for most, Phase 7 for Parse).
     ----------------------------------------------------------------------- }
 
-  PFuncDef  = Pointer;  { FuncDef  — Phase 6 (callback.c / func.c) }
-  PCollSeq  = Pointer;  { CollSeq  — Phase 6 }
+  PFuncDef  = Pointer;  { FuncDef  — kept as opaque for OP_ param compat }
+  PCollSeq  = Pointer;  { CollSeq  — opaque alias for OP_CollSeq param compat }
   PTable    = Pointer;  { Table    — Phase 6 (build.c) }
   PIndex    = Pointer;  { Index    — Phase 6 }
   PExpr     = Pointer;  { Expr     — Phase 6 (expr.c) }
@@ -936,8 +1004,8 @@ type
   TxInverseProc= procedure(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 
   TFuncDef = record
-    nArg:      i8;               { offset  0: arg count, -1=unlimited }
-    pad0:      array[0..2] of Byte; { offset 1..3: align to 4 }
+    nArg:      i16;              { offset  0: arg count (-1=unlimited); C uses i16 }
+    _pad0:     u16;              { offset  2: pad to align funcFlags }
     funcFlags: u32;              { offset  4: SQLITE_FUNC_* flags }
     pUserData: Pointer;          { offset  8: user data for app-defined funcs }
     pNext:     Pointer;          { offset 16: next FuncDef with same name }
@@ -947,8 +1015,41 @@ type
     xInverse:  TxInverseProc;    { offset 48: inverse step (window) }
     zName:     PAnsiChar;        { offset 56: SQL name of the function }
     u:         Pointer;          { offset 64: pHash or pDestructor }
-  end;
+  end;                           { SizeOf = 72 bytes (GCC x86-64 verified) }
   PTFuncDef = ^TFuncDef;
+
+  { TCollSeq — collating-sequence descriptor (sqliteInt.h CollSeq).
+    GCC x86-64 layout: zName(8) + enc(1) + pad(7) + pUser(8) + xCmp(8) + xDel(8) = 40 bytes. }
+  TxCollCmp  = function(pUser: Pointer; nA: i32; pA: Pointer;
+                        nB: i32; pB: Pointer): i32; cdecl;
+  TxCollDel  = procedure(pUser: Pointer); cdecl;
+  TCollSeq = record
+    zName:   PAnsiChar;    { offset  0: UTF-8 name }
+    enc:     u8;           { offset  8: SQLITE_UTF8/UTF16LE/UTF16BE }
+    _pad:    array[0..6] of Byte;  { offset 9..15: alignment }
+    pUser:   Pointer;      { offset 16: first arg to xCmp }
+    xCmp:    TxCollCmp;    { offset 24: comparison function }
+    xDel:    TxCollDel;    { offset 32: destructor for pUser }
+  end;                     { SizeOf = 40 bytes }
+  PTCollSeq = ^TCollSeq;
+
+  { TFuncDestructor — reference-counted destructor for user-defined functions.
+    GCC x86-64: nRef(4) + pad(4) + xDestroy(8) + pUserData(8) = 24 bytes. }
+  TxFuncDestroy = procedure(p: Pointer); cdecl;
+  TFuncDestructor = record
+    nRef:      i32;        { offset 0: reference count }
+    _pad1:     u32;        { offset 4: alignment }
+    xDestroy:  TxFuncDestroy; { offset 8 }
+    pUserData: Pointer;    { offset 16 }
+  end;                     { SizeOf = 24 bytes }
+  PTFuncDestructor = ^TFuncDestructor;
+
+  { TFuncDefHash — built-in function hash table (SQLITE_FUNC_HASH_SZ=23 slots). }
+  SQLITE_FUNC_HASH_SZ_t = array[0..22] of PTFuncDef;
+  TFuncDefHash = record
+    a: SQLITE_FUNC_HASH_SZ_t;  { 23 * 8 = 184 bytes }
+  end;
+  PTFuncDefHash = ^TFuncDefHash;
 
   { SZ_CONTEXT(n) = ROUND8P(SizeOf(Tsqlite3_context)) + n * SizeOf(PMem)
     = ROUND8P(44) = 48 base, plus n*8 for argv pointers. }
@@ -1252,6 +1353,11 @@ function  sqlite3VdbeFindCompare(pKey: Pointer): Pointer; { returns RecordCompar
 { Opcode name lookup (vdbeaux.c, used for EXPLAIN) }
 function  sqlite3OpcodeName(n: i32): PAnsiChar;
 
+{ sqlite3BuiltinFunctions — global table of built-in SQL functions (callback.c).
+  Initialized by sqlite3RegisterBuiltinFunctions. }
+var
+  sqlite3BuiltinFunctions: TFuncDefHash;
+
 { --- vdbemem.c — Mem value operations (Phase 5.3) --- }
 { SQLITE_DYNAMIC / SQLITE_TRANSIENT: sentinel destructor values.
   Declared as vars because FPC typed constants cannot hold arbitrary
@@ -1305,6 +1411,8 @@ function  sqlite3VdbeMemFromBtreeZeroOffset(pCur: PBtCursor;
                                             amt: u32; pMem: PMem): i32;
 function  sqlite3VdbeMemFinalize(pMem: PMem; pFunc: PFuncDef): i32;
 function  sqlite3VdbeMemAggValue(pAccum: PMem; pOut: PMem; pFunc: PFuncDef): i32;
+function  sqlite3MemCompare(pMem1, pMem2: PMem; pColl: Pointer): i32;
+function  sqlite3AddInt64(pA: Pi64; iB: i64): i32;
 function  sqlite3VdbeMemSetRowSet(pMem: PMem): i32;
 function  sqlite3VdbeMemIsRowSet(pMem: PMem): i32;
 
@@ -1391,6 +1499,23 @@ function sqlite3_bind_blob(pStmt: PVdbe; i: i32; zData: Pointer;
 function sqlite3_bind_value(pStmt: PVdbe; i: i32;
                             pValue: Psqlite3_value): i32;
 function sqlite3_bind_parameter_count(pStmt: PVdbe): i32;
+
+{ --- vdbeapi.c — sqlite3_result_* context-result setters (Phase 6.6) --- }
+procedure sqlite3_result_null(pCtx: Psqlite3_context);
+procedure sqlite3_result_int(pCtx: Psqlite3_context; iVal: i32);
+procedure sqlite3_result_int64(pCtx: Psqlite3_context; iVal: i64);
+procedure sqlite3_result_double(pCtx: Psqlite3_context; rVal: Double);
+procedure sqlite3_result_text(pCtx: Psqlite3_context; z: PAnsiChar;
+  n: i32; xDel: TxDelProc);
+procedure sqlite3_result_blob(pCtx: Psqlite3_context; z: Pointer;
+  n: i32; xDel: TxDelProc);
+procedure sqlite3_result_value(pCtx: Psqlite3_context; pVal: Psqlite3_value);
+procedure sqlite3_result_error(pCtx: Psqlite3_context; z: PAnsiChar; n: i32);
+procedure sqlite3_result_error_nomem(pCtx: Psqlite3_context);
+procedure sqlite3_result_error_toobig(pCtx: Psqlite3_context);
+function  sqlite3_result_zeroblob64(pCtx: Psqlite3_context; n: u64): i32;
+function  sqlite3_aggregate_context(pCtx: Psqlite3_context;
+  nByte: i32): Pointer;
 
 { --- vdbeblob.c — incremental blob I/O (Phase 5.6) --- }
 function  sqlite3_blob_open(db: PTsqlite3; zDb, zTable, zColumn: PAnsiChar;
@@ -3213,6 +3338,116 @@ begin
   if pStmt^.db = nil then begin Result := SQLITE_MISUSE; Exit; end;
   Result := sqlite3VdbeReset(pStmt);
   sqlite3VdbeDelete(pStmt);
+end;
+
+{ ============================================================================
+  Phase 6.6 — vdbeapi.c sqlite3_result_* context setters
+  ============================================================================ }
+
+procedure sqlite3_result_null(pCtx: Psqlite3_context);
+begin
+  if pCtx = nil then Exit;
+  sqlite3VdbeMemSetNull(pCtx^.pOut);
+end;
+
+procedure sqlite3_result_int(pCtx: Psqlite3_context; iVal: i32);
+begin
+  if pCtx = nil then Exit;
+  sqlite3VdbeMemSetInt64(pCtx^.pOut, i64(iVal));
+end;
+
+procedure sqlite3_result_int64(pCtx: Psqlite3_context; iVal: i64);
+begin
+  if pCtx = nil then Exit;
+  sqlite3VdbeMemSetInt64(pCtx^.pOut, iVal);
+end;
+
+procedure sqlite3_result_double(pCtx: Psqlite3_context; rVal: Double);
+begin
+  if pCtx = nil then Exit;
+  sqlite3VdbeMemSetDouble(pCtx^.pOut, rVal);
+end;
+
+procedure sqlite3_result_text(pCtx: Psqlite3_context; z: PAnsiChar;
+  n: i32; xDel: TxDelProc);
+begin
+  if pCtx = nil then Exit;
+  sqlite3VdbeMemSetStr(pCtx^.pOut, z, n, SQLITE_UTF8, xDel);
+end;
+
+procedure sqlite3_result_blob(pCtx: Psqlite3_context; z: Pointer;
+  n: i32; xDel: TxDelProc);
+begin
+  if pCtx = nil then Exit;
+  sqlite3VdbeMemSetStr(pCtx^.pOut, z, n, 0, xDel);
+end;
+
+procedure sqlite3_result_value(pCtx: Psqlite3_context; pVal: Psqlite3_value);
+var
+  pOut: PMem;
+begin
+  if (pCtx = nil) or (pVal = nil) then Exit;
+  pOut := pCtx^.pOut;
+  sqlite3VdbeMemCopy(pOut, PMem(pVal));
+  sqlite3VdbeChangeEncoding(pOut, SQLITE_UTF8);
+  if sqlite3VdbeMemTooBig(pOut) <> 0 then
+    sqlite3_result_error_toobig(pCtx);
+end;
+
+procedure sqlite3_result_error(pCtx: Psqlite3_context; z: PAnsiChar; n: i32);
+begin
+  if pCtx = nil then Exit;
+  pCtx^.isError := SQLITE_ERROR;
+  sqlite3VdbeMemSetStr(pCtx^.pOut, z, n, SQLITE_UTF8, SQLITE_TRANSIENT);
+end;
+
+procedure sqlite3_result_error_nomem(pCtx: Psqlite3_context);
+begin
+  if pCtx = nil then Exit;
+  sqlite3VdbeMemSetNull(pCtx^.pOut);
+  pCtx^.isError := SQLITE_NOMEM_BKPT;
+  if pCtx^.pOut^.db <> nil then
+    sqlite3OomFault(pCtx^.pOut^.db);
+end;
+
+procedure sqlite3_result_error_toobig(pCtx: Psqlite3_context);
+begin
+  if pCtx = nil then Exit;
+  pCtx^.isError := SQLITE_TOOBIG;
+  sqlite3VdbeMemSetStr(pCtx^.pOut, 'string or blob too big', -1,
+    SQLITE_UTF8, SQLITE_STATIC);
+end;
+
+function sqlite3_result_zeroblob64(pCtx: Psqlite3_context; n: u64): i32;
+begin
+  if pCtx = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  if n > u64(SQLITE_MAX_LENGTH) then begin
+    sqlite3_result_error_toobig(pCtx);
+    Result := SQLITE_TOOBIG; Exit;
+  end;
+  sqlite3VdbeMemSetZeroBlob(pCtx^.pOut, i32(n));
+  Result := SQLITE_OK;
+end;
+
+function sqlite3_aggregate_context(pCtx: Psqlite3_context;
+  nByte: i32): Pointer;
+var
+  pAggMem: PMem;
+begin
+  if pCtx = nil then begin Result := nil; Exit; end;
+  pAggMem := pCtx^.pMem;
+  if (pAggMem^.flags and MEM_Agg) = 0 then begin
+    if nByte = 0 then begin Result := nil; Exit; end;
+    sqlite3VdbeMemClearAndResize(pAggMem, nByte);
+    if pAggMem^.szMalloc > 0 then begin
+      FillChar(pAggMem^.z^, nByte, 0);
+      pAggMem^.flags := MEM_Agg or MEM_Dyn;
+    end else begin
+      sqlite3OomFault(pAggMem^.db);
+      Result := nil; Exit;
+    end;
+  end;
+  Result := pAggMem^.z;
 end;
 
 { ============================================================================

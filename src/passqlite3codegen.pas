@@ -2165,7 +2165,30 @@ function  sqlite3PragmaVtabRegister(db: PTsqlite3;
 procedure sqlite3Vacuum(pParse: PParse; pNm: PToken; pInto: PExpr);
 
 // ---------------------------------------------------------------------------
-// Phase 6.5 public API — callback.c
+// Phase 6.6 public API — auth.c
+// ---------------------------------------------------------------------------
+
+type
+  TAuthContext = record
+    zAuthContext: PAnsiChar;  { saved pParse->zAuthContext }
+    pParse:       PParse;     { parse context (nil if not active) }
+  end;
+  PAuthContext = ^TAuthContext;
+
+function  sqlite3_set_authorizer(db: PTsqlite3;
+  xAuth: Pointer; pArg: Pointer): i32;
+function  sqlite3AuthReadCol(pParse: PParse; zTab: PAnsiChar;
+  zCol: PAnsiChar; iDb: i32): i32;
+procedure sqlite3AuthRead(pParse: PParse; pExpr: PExpr;
+  pSchema: PSchema; pTabList: PSrcList);
+function  sqlite3AuthCheck(pParse: PParse; code: i32;
+  zArg1: PAnsiChar; zArg2: PAnsiChar; zArg3: PAnsiChar): i32;
+procedure sqlite3AuthContextPush(pParse: PParse;
+  pContext: PAuthContext; zContext: PAnsiChar);
+procedure sqlite3AuthContextPop(pContext: PAuthContext);
+
+// ---------------------------------------------------------------------------
+// Phase 6.6 public API — callback.c
 // ---------------------------------------------------------------------------
 
 procedure sqlite3SchemaClear(p: Pointer);
@@ -2175,15 +2198,21 @@ procedure sqlite3InsertBuiltinFuncs(aFunc: Pointer; nFunc: i32);
 function  sqlite3CheckCollSeq(pParse: PParse; pColl: Pointer): i32;
 function  sqlite3FindCollSeq(db: PTsqlite3; enc: u8;
   zName: PAnsiChar; create: i32): Pointer;
+function  sqlite3GetCollSeq(pParse: PParse; enc: u8;
+  pColl: Pointer; zName: PAnsiChar): Pointer;
 function  sqlite3LocateCollSeq(pParse: PParse; zName: PAnsiChar): Pointer;
+function  sqlite3IsBinary(pColl: Pointer): i32;
 procedure sqlite3AutoLoadExtensions(db: PTsqlite3);
 function  sqlite3CreateFunc(db: PTsqlite3; zFunctionName: PAnsiChar;
   nArg: i32; enc: i32; pUserData: Pointer; xSFunc: Pointer;
   xStep: Pointer; xFinal: Pointer; xValue: Pointer; xInverse: Pointer;
   pDestructor: Pointer): i32;
+function  sqlite3FindFunction(db: PTsqlite3; zName: PAnsiChar;
+  nArg: i32; enc: u8; createFlag: u8): PTFuncDef;
+function  sqlite3FunctionSearch(h: i32; zFunc: PAnsiChar): PTFuncDef;
 
 // ---------------------------------------------------------------------------
-// Phase 6.5 public API — func.c (built-in scalars)
+// Phase 6.6 public API — func.c (built-in scalars)
 // ---------------------------------------------------------------------------
 
 procedure sqlite3RegisterBuiltinFunctions;
@@ -2197,7 +2226,48 @@ function  sqlite3_strglob(zGlobPattern: PAnsiChar;
 function  sqlite3_strlike(zPattern: PAnsiChar; zStr: PAnsiChar;
   esc: u32): i32;
 
+// ---------------------------------------------------------------------------
+// Phase 6.6 public API — fkey.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3FkCheck(pParse: PParse; pTab: PTable2; regOld: i32;
+  regNew: i32; aChange: Pi32; bChng: i32);
+procedure sqlite3FkActions(pParse: PParse; pTab: PTable2; pChanges: PExprList;
+  regOld: i32; aChange: Pi32; bChng: i32);
+function  sqlite3FkRequired(pParse: PParse; pTab: PTable2;
+  aChange: Pi32; chngRowid: i32): i32;
+procedure sqlite3FkDelete(db: PTsqlite3; pTab: PTable2);
+procedure sqlite3FkDropTable(pParse: PParse; pName: PSrcList; pTab: PTable2);
+procedure sqlite3FkOldmask(pParse: PParse; pTab: PTable2);
+function  sqlite3FkReferences(pTab: PTable2): Pointer;
+
+// ---------------------------------------------------------------------------
+// Phase 6.6 public API — date.c
+// ---------------------------------------------------------------------------
+
+procedure sqlite3RegisterDateTimeFunctions;
+
+// ---------------------------------------------------------------------------
+// Phase 6.6 helper — sqlite3ExpirePreparedStatements
+// ---------------------------------------------------------------------------
+
+procedure sqlite3ExpirePreparedStatements(db: PTsqlite3; iCode: i32);
+
 implementation
+
+uses
+  DateUtils;
+
+{ snpFmt — format into a PAnsiChar buffer using Pascal Format(); same arg order as sqlite3_snprintf }
+procedure snpFmt(n: i32; dst: PAnsiChar; const fmt: AnsiString;
+  const args: array of const);
+var
+  s: AnsiString;
+begin
+  s := Format(fmt, args);
+  if Length(s) >= n then SetLength(s, n - 1);
+  StrPCopy(dst, s);
+end;
 
 function ExprListItems(p: PExprList): PExprListItem; inline;
 begin
@@ -6519,8 +6589,441 @@ begin
 end;
 
 // ===========================================================================
-// Phase 6.5 — callback.c stubs
+// Phase 6.6 — auth.c
 // ===========================================================================
+
+{ sqlite3ExpirePreparedStatements — invalidate all prepared statements.
+  Full implementation requires iterating db->pVdbe; this stub marks iCode. }
+procedure sqlite3ExpirePreparedStatements(db: PTsqlite3; iCode: i32);
+var
+  v: PVdbe;
+begin
+  v := PVdbe(db^.pVdbe);
+  while v <> nil do begin
+    v^.vdbeFlags := v^.vdbeFlags or VDBF_EXPIRED_MASK;
+    v := v^.pVNext;
+  end;
+end;
+
+function sqlite3_set_authorizer(db: PTsqlite3;
+  xAuth: Pointer; pArg: Pointer): i32;
+begin
+  if db = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  db^.xAuth    := xAuth;
+  db^.pAuthArg := pArg;
+  sqlite3ExpirePreparedStatements(db, 1);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+procedure sqliteAuthBadReturnCode(pParse: PParse);
+begin
+  sqlite3ErrorMsg(pParse, 'authorizer malfunction');
+  pParse^.rc := SQLITE_ERROR;
+end;
+
+type
+  TxAuthCallback = function(pArg: Pointer; code: i32;
+    a1,a2,a3,a4: PAnsiChar): i32; cdecl;
+
+function sqlite3AuthReadCol(pParse: PParse; zTab: PAnsiChar;
+  zCol: PAnsiChar; iDb: i32): i32;
+var
+  db:   PTsqlite3;
+  zDb:  PAnsiChar;
+  rc:   i32;
+begin
+  db  := pParse^.db;
+  if db^.init.busy <> 0 then begin Result := SQLITE_OK; Exit; end;
+  zDb := db^.aDb[iDb].zDbSName;
+  rc  := TxAuthCallback(db^.xAuth)(db^.pAuthArg, SQLITE_READ_AUTH,
+           zTab, zCol, zDb, pParse^.zAuthContext);
+  if rc = SQLITE_DENY then begin
+    sqlite3ErrorMsg(pParse, 'access to column is prohibited');
+    pParse^.rc := SQLITE_AUTH;
+  end else if (rc <> SQLITE_IGNORE) and (rc <> SQLITE_OK) then
+    sqliteAuthBadReturnCode(pParse);
+  Result := rc;
+end;
+
+procedure sqlite3AuthRead(pParse: PParse; pExpr: PExpr;
+  pSchema: PSchema; pTabList: PSrcList);
+var
+  db:   PTsqlite3;
+  pTab: PTable2;
+  iDb, iSrc, iCol: i32;
+  zCol: PAnsiChar;
+  items: PSrcItem;
+begin
+  db := pParse^.db;
+  if db^.xAuth = nil then Exit;
+  iDb := sqlite3SchemaToIndex(db, pSchema);
+  if iDb < 0 then Exit;
+  pTab := nil;
+  if pExpr^.op = TK_TRIGGER then begin
+    pTab := PTable2(pParse^.pTriggerTab);
+  end else begin
+    if pTabList = nil then Exit;
+    items := SrcListItems(pTabList);
+    for iSrc := 0 to pTabList^.nSrc - 1 do begin
+      if pExpr^.iTable = items[iSrc].iCursor then begin
+        pTab := items[iSrc].pSTab;
+        Break;
+      end;
+    end;
+  end;
+  if pTab = nil then Exit;
+  iCol := pExpr^.iColumn;
+  if iCol >= 0 then
+    zCol := pTab^.aCol[iCol].zCnName
+  else if pTab^.iPKey >= 0 then
+    zCol := pTab^.aCol[pTab^.iPKey].zCnName
+  else
+    zCol := 'ROWID';
+  if sqlite3AuthReadCol(pParse, pTab^.zName, zCol, iDb) = SQLITE_IGNORE then
+    pExpr^.op := TK_NULL;
+end;
+
+function sqlite3AuthCheck(pParse: PParse; code: i32;
+  zArg1: PAnsiChar; zArg2: PAnsiChar; zArg3: PAnsiChar): i32;
+var
+  db: PTsqlite3;
+  rc: i32;
+begin
+  db := pParse^.db;
+  if (db^.xAuth = nil) or (db^.init.busy <> 0) then begin
+    Result := SQLITE_OK; Exit;
+  end;
+  rc := TxAuthCallback(db^.xAuth)(db^.pAuthArg, code,
+          zArg1, zArg2, zArg3, pParse^.zAuthContext);
+  if rc = SQLITE_DENY then begin
+    sqlite3ErrorMsg(pParse, 'not authorized');
+    pParse^.rc := SQLITE_AUTH;
+  end else if (rc <> SQLITE_OK) and (rc <> SQLITE_IGNORE) then begin
+    rc := SQLITE_DENY;
+    sqliteAuthBadReturnCode(pParse);
+  end;
+  Result := rc;
+end;
+
+procedure sqlite3AuthContextPush(pParse: PParse;
+  pContext: PAuthContext; zContext: PAnsiChar);
+begin
+  pContext^.pParse := pParse;
+  pContext^.zAuthContext := pParse^.zAuthContext;
+  pParse^.zAuthContext := zContext;
+end;
+
+procedure sqlite3AuthContextPop(pContext: PAuthContext);
+begin
+  if pContext^.pParse <> nil then begin
+    pContext^.pParse^.zAuthContext := pContext^.zAuthContext;
+    pContext^.pParse := nil;
+  end;
+end;
+
+// ===========================================================================
+// Phase 6.6 — callback.c
+// ===========================================================================
+
+{ findCollSeqEntry — locate or create an entry in db->aCollSeq.
+  Returns pointer to the UTF-8 slot (pColl[0]); add enc-1 for desired enc. }
+function findCollSeqEntry(db: PTsqlite3; zName: PAnsiChar;
+  create: i32): PTCollSeq;
+var
+  pColl, pDel: PTCollSeq;
+  nName: i32;
+begin
+  pColl := PTCollSeq(sqlite3HashFind(@db^.aCollSeq, zName));
+  if (pColl = nil) and (create <> 0) then begin
+    nName := sqlite3Strlen30(zName) + 1;
+    pColl := PTCollSeq(sqlite3DbMallocZero(db,
+               3 * SizeOf(TCollSeq) + nName));
+    if pColl <> nil then begin
+      pColl[0].zName := PAnsiChar(PByte(pColl) + 3 * SizeOf(TCollSeq));
+      pColl[0].enc   := SQLITE_UTF8;
+      pColl[1].zName := pColl[0].zName;
+      pColl[1].enc   := SQLITE_UTF16LE;
+      pColl[2].zName := pColl[0].zName;
+      pColl[2].enc   := SQLITE_UTF16BE;
+      Move(zName^, pColl[0].zName^, nName);
+      pDel := PTCollSeq(sqlite3HashInsert(@db^.aCollSeq,
+                          pColl[0].zName, pColl));
+      if pDel <> nil then begin
+        sqlite3OomFault(db);
+        sqlite3DbFree(db, pDel);
+        pColl := nil;
+      end;
+    end;
+  end;
+  Result := pColl;
+end;
+
+function sqlite3FindCollSeq(db: PTsqlite3; enc: u8; zName: PAnsiChar;
+  create: i32): Pointer;
+var
+  pColl: PTCollSeq;
+begin
+  if zName <> nil then begin
+    pColl := findCollSeqEntry(db, zName, create);
+    if pColl <> nil then
+      pColl := @pColl[enc - 1];  { enc: 1=UTF8, 2=UTF16LE, 3=UTF16BE }
+  end else
+    pColl := PTCollSeq(db^.pDfltColl);
+  Result := pColl;
+end;
+
+{ synthCollSeq — find an equivalent collation in a different encoding. }
+function synthCollSeq(db: PTsqlite3; pColl: PTCollSeq): i32;
+var
+  pColl2: PTCollSeq;
+  i: i32;
+  z: PAnsiChar;
+  aEnc: array[0..2] of u8;
+begin
+  aEnc[0] := SQLITE_UTF16BE;
+  aEnc[1] := SQLITE_UTF16LE;
+  aEnc[2] := SQLITE_UTF8;
+  z := pColl^.zName;
+  for i := 0 to 2 do begin
+    pColl2 := PTCollSeq(sqlite3FindCollSeq(db, aEnc[i], z, 0));
+    if (pColl2 <> nil) and (pColl2^.xCmp <> nil) then begin
+      Move(pColl2^, pColl^, SizeOf(TCollSeq));
+      pColl^.xDel := nil;
+      Result := SQLITE_OK;
+      Exit;
+    end;
+  end;
+  Result := SQLITE_ERROR;
+end;
+
+function sqlite3GetCollSeq(pParse: PParse; enc: u8;
+  pColl: Pointer; zName: PAnsiChar): Pointer;
+var
+  db:  PTsqlite3;
+  p:   PTCollSeq;
+begin
+  db := pParse^.db;
+  p := PTCollSeq(pColl);
+  if p = nil then
+    p := PTCollSeq(sqlite3FindCollSeq(db, enc, zName, 1));
+  if (p <> nil) and (p^.xCmp = nil) and
+     (synthCollSeq(db, p) <> SQLITE_OK) then begin
+    sqlite3ErrorMsg(pParse,
+      'no such collation sequence');
+    p := nil;
+  end;
+  Result := p;
+end;
+
+function sqlite3CheckCollSeq(pParse: PParse; pColl: Pointer): i32;
+var
+  p: PTCollSeq;
+begin
+  p := PTCollSeq(pColl);
+  if (p <> nil) and (p^.xCmp = nil) then begin
+    if sqlite3GetCollSeq(pParse, p^.enc, p, p^.zName) = nil then begin
+      Result := SQLITE_ERROR; Exit;
+    end;
+  end;
+  Result := SQLITE_OK;
+end;
+
+function sqlite3IsBinary(pColl: Pointer): i32;
+var
+  p: PTCollSeq;
+begin
+  p := PTCollSeq(pColl);
+  if (p = nil) or (p^.xCmp = nil) then begin Result := 1; Exit; end;
+  if sqlite3StrICmp(p^.zName, 'BINARY') = 0 then Result := 1
+  else Result := 0;
+end;
+
+function sqlite3LocateCollSeq(pParse: PParse; zName: PAnsiChar): Pointer;
+var
+  db:  PTsqlite3;
+  enc: u8;
+  p:   PTCollSeq;
+begin
+  db  := pParse^.db;
+  enc := db^.enc;
+  p   := PTCollSeq(sqlite3FindCollSeq(db, enc, zName, 1));
+  if (p <> nil) and (p^.xCmp = nil) then
+    p := PTCollSeq(sqlite3GetCollSeq(pParse, enc, p, zName));
+  Result := p;
+end;
+
+procedure sqlite3SetTextEncoding(db: PTsqlite3; enc: u8);
+begin
+  db^.enc := enc;
+  db^.pDfltColl := sqlite3FindCollSeq(db, enc, 'BINARY', 0);
+  sqlite3ExpirePreparedStatements(db, 1);
+end;
+
+{ matchQuality — score a FuncDef match against requested (nArg, enc). }
+function matchQuality(p: PTFuncDef; nArg: i32; enc: u8): i32;
+var
+  match: i32;
+begin
+  if (nArg >= 0) and (p^.nArg <> nArg) and (p^.nArg >= 0) then begin
+    Result := 0; Exit;
+  end;
+  match := 1;
+  if p^.nArg = nArg then Inc(match, 4);
+  if (p^.funcFlags and SQLITE_FUNC_ENCMASK) <> 0 then begin
+    if u8(p^.funcFlags and SQLITE_FUNC_ENCMASK) = enc then
+      Inc(match, 2)
+    else if (p^.funcFlags and SQLITE_FUNC_ENCMASK) = SQLITE_UTF16 then
+      Inc(match);
+  end else
+    Inc(match, 2);  { enc-agnostic functions match any encoding }
+  Result := match;
+end;
+
+function sqlite3FunctionSearch(h: i32; zFunc: PAnsiChar): PTFuncDef;
+var
+  p: PTFuncDef;
+begin
+  p := sqlite3BuiltinFunctions.a[h];
+  while p <> nil do begin
+    if sqlite3StrICmp(p^.zName, zFunc) = 0 then begin
+      Result := p; Exit;
+    end;
+    p := PTFuncDef(p^.u);
+  end;
+  Result := nil;
+end;
+
+procedure sqlite3InsertBuiltinFuncs(aFunc: Pointer; nFunc: i32);
+var
+  aDef: PTFuncDef;
+  i, h, nName: i32;
+  pOther: PTFuncDef;
+  zName: PAnsiChar;
+begin
+  aDef := PTFuncDef(aFunc);
+  for i := 0 to nFunc - 1 do begin
+    zName  := aDef[i].zName;
+    nName  := sqlite3Strlen30(zName);
+    h      := (Ord(sqlite3UpperToLower[u8(zName^)]) + nName) mod SQLITE_FUNC_HASH_SZ;
+    pOther := sqlite3FunctionSearch(h, zName);
+    if pOther <> nil then begin
+      aDef[i].pNext := pOther^.pNext;
+      pOther^.pNext := @aDef[i];
+    end else begin
+      aDef[i].pNext := nil;
+      aDef[i].u     := sqlite3BuiltinFunctions.a[h];
+      sqlite3BuiltinFunctions.a[h] := @aDef[i];
+    end;
+  end;
+end;
+
+function sqlite3FindFunction(db: PTsqlite3; zName: PAnsiChar;
+  nArg: i32; enc: u8; createFlag: u8): PTFuncDef;
+const
+  FUNC_PERFECT_MATCH = 6;
+var
+  p, pBest, pOther: PTFuncDef;
+  bestScore, score, h, nName: i32;
+  z: Pu8;
+begin
+  pBest := nil;
+  bestScore := 0;
+  nName := sqlite3Strlen30(zName);
+  p := PTFuncDef(sqlite3HashFind(@db^.aFunc, zName));
+  while p <> nil do begin
+    score := matchQuality(p, nArg, enc);
+    if score > bestScore then begin pBest := p; bestScore := score; end;
+    p := PTFuncDef(p^.pNext);
+  end;
+  { search built-ins if no app-defined match or PreferBuiltin flag set }
+  if (createFlag = 0) and
+     ((pBest = nil) or ((db^.mDbFlags and DBFLAG_PreferBuiltin) <> 0)) then begin
+    bestScore := 0;
+    h := (Ord(sqlite3UpperToLower[u8(zName^)]) + nName) mod SQLITE_FUNC_HASH_SZ;
+    p := sqlite3FunctionSearch(h, zName);
+    while p <> nil do begin
+      score := matchQuality(p, nArg, enc);
+      if score > bestScore then begin pBest := p; bestScore := score; end;
+      p := PTFuncDef(p^.pNext);
+    end;
+  end;
+  { create new entry if requested and no perfect match found }
+  if (createFlag <> 0) and (bestScore < FUNC_PERFECT_MATCH) then begin
+    pBest := PTFuncDef(sqlite3DbMallocZero(db, SizeOf(TFuncDef) + nName + 1));
+    if pBest <> nil then begin
+      pBest^.zName    := PAnsiChar(PByte(pBest) + SizeOf(TFuncDef));
+      pBest^.nArg     := i16(nArg);
+      pBest^.funcFlags:= enc;
+      Move(zName^, PByte(pBest^.zName)^, nName + 1);
+      z := Pu8(pBest^.zName);
+      while z^ <> 0 do begin z^ := sqlite3UpperToLower[z^]; Inc(z); end;
+      pOther := PTFuncDef(sqlite3HashInsert(@db^.aFunc, pBest^.zName, pBest));
+      if pOther = pBest then begin
+        sqlite3DbFree(db, pBest);
+        sqlite3OomFault(db);
+        Result := nil; Exit;
+      end;
+      pBest^.pNext := pOther;
+    end;
+  end;
+  if (pBest <> nil) and ((pBest^.xSFunc <> nil) or (createFlag <> 0)) then
+    Result := pBest
+  else
+    Result := nil;
+end;
+
+procedure sqlite3AutoLoadExtensions(db: PTsqlite3);
+begin
+  { Stub: loadext.c deferred to Phase 8.9 }
+end;
+
+{ sqlite3CreateFunc — register a user-defined SQL function. }
+function sqlite3CreateFunc(db: PTsqlite3; zFunctionName: PAnsiChar;
+  nArg: i32; enc: i32; pUserData: Pointer; xSFunc: Pointer;
+  xStep: Pointer; xFinal: Pointer; xValue: Pointer; xInverse: Pointer;
+  pDestructor: Pointer): i32;
+var
+  p: PTFuncDef;
+  encByte: u8;
+  pDest: PTFuncDestructor;
+begin
+  if (zFunctionName = nil) or (nArg < -1) or (nArg > SQLITE_MAX_FUNCTION_ARG) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  { Strip flags from enc; keep only encoding bits }
+  encByte := u8(enc and $03);
+  if encByte = 0 then encByte := SQLITE_UTF8;
+  p := sqlite3FindFunction(db, zFunctionName, nArg, encByte, 1);
+  if p = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  { Clear old destructor if any }
+  if (p^.funcFlags and SQLITE_FUNC_EPHEM) = 0 then begin
+    pDest := PTFuncDestructor(p^.u);
+    if pDest <> nil then begin
+      Dec(pDest^.nRef);
+      if pDest^.nRef = 0 then begin
+        pDest^.xDestroy(pDest^.pUserData);
+        sqlite3DbFree(db, pDest);
+      end;
+    end;
+  end;
+  p^.funcFlags  := u32(enc and (SQLITE_DETERMINISTIC or
+                    SQLITE_DIRECTONLY or SQLITE_SUBTYPE or SQLITE_INNOCUOUS));
+  p^.funcFlags  := p^.funcFlags or encByte;
+  p^.pUserData  := pUserData;
+  p^.xSFunc     := TxSFuncProc(xSFunc);
+  p^.xFinalize  := TxFinalProc(xFinal);
+  p^.xValue     := TxValueProc(xValue);
+  p^.xInverse   := TxInverseProc(xInverse);
+  if pDestructor <> nil then begin
+    pDest := PTFuncDestructor(pDestructor);
+    Inc(pDest^.nRef);
+    p^.u := pDest;
+  end else
+    p^.u := nil;
+  Result := SQLITE_OK;
+end;
 
 procedure sqlite3SchemaClear(p: Pointer);
 var
@@ -6533,6 +7036,10 @@ begin
   sqlite3HashClear(@pSchema^.trigHash);
   sqlite3HashClear(@pSchema^.fkeyHash);
   pSchema^.pSeqTab := nil;
+  if (pSchema^.schemaFlags and DB_SchemaLoaded) <> 0 then
+    Inc(pSchema^.iGeneration);
+  pSchema^.schemaFlags := pSchema^.schemaFlags and
+    not (DB_SchemaLoaded or DB_ResetWanted);
 end;
 
 function sqlite3SchemaGet(db: PTsqlite3; pBt: Pointer): PSchema;
@@ -6553,68 +7060,1307 @@ begin
     Result := nil; { Phase 7: look up schema from btree }
 end;
 
-procedure sqlite3SetTextEncoding(db: PTsqlite3; enc: u8);
-begin
-  db^.enc := enc;
-end;
-
-procedure sqlite3InsertBuiltinFuncs(aFunc: Pointer; nFunc: i32);
-begin
-  { Phase 7 }
-end;
-
-function sqlite3CheckCollSeq(pParse: PParse; pColl: Pointer): i32;
-begin
-  Result := SQLITE_OK;
-end;
-
-function sqlite3FindCollSeq(db: PTsqlite3; enc: u8; zName: PAnsiChar;
-  create: i32): Pointer;
-begin
-  Result := nil; { Phase 7 }
-end;
-
-function sqlite3LocateCollSeq(pParse: PParse; zName: PAnsiChar): Pointer;
-begin
-  Result := nil; { Phase 7 }
-end;
-
-procedure sqlite3AutoLoadExtensions(db: PTsqlite3);
-begin
-  { Phase 7/8 }
-end;
-
-function sqlite3CreateFunc(db: PTsqlite3; zFunctionName: PAnsiChar;
-  nArg: i32; enc: i32; pUserData: Pointer; xSFunc: Pointer;
-  xStep: Pointer; xFinal: Pointer; xValue: Pointer; xInverse: Pointer;
-  pDestructor: Pointer): i32;
-begin
-  Result := SQLITE_OK; { Phase 7 }
-end;
-
 // ===========================================================================
-// Phase 6.5 — func.c stubs
+// Phase 6.6 — func.c built-in scalar functions
 // ===========================================================================
+
+{ ---- Scalar function callbacks ---- }
+
+procedure absFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pVal: PMem;
+  iVal: i64;
+  rVal: Double;
+begin
+  pVal := argv^;
+  case sqlite3_value_type(Psqlite3_value(pVal)) of
+    SQLITE_INTEGER: begin
+      iVal := sqlite3_value_int64(Psqlite3_value(pVal));
+      if iVal < 0 then begin
+        if iVal = Low(i64) then begin
+          sqlite3_result_error(pCtx, '-9223372036854775808 is not representable as a positive 64-bit integer', -1);
+          Exit;
+        end;
+        iVal := -iVal;
+      end;
+      sqlite3_result_int64(pCtx, iVal);
+    end;
+    SQLITE_NULL:
+      sqlite3_result_null(pCtx);
+  else begin
+      rVal := sqlite3_value_double(Psqlite3_value(pVal));
+      if rVal < 0.0 then rVal := -rVal;
+      sqlite3_result_double(pCtx, rVal);
+    end;
+  end;
+end;
+
+procedure typeofFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pVal: PMem;
+begin
+  pVal := argv^;
+  case sqlite3_value_type(Psqlite3_value(pVal)) of
+    SQLITE_INTEGER: sqlite3_result_text(pCtx, 'integer', 7, SQLITE_STATIC);
+    SQLITE_REAL:    sqlite3_result_text(pCtx, 'real',    4, SQLITE_STATIC);
+    SQLITE_TEXT:    sqlite3_result_text(pCtx, 'text',    4, SQLITE_STATIC);
+    SQLITE_BLOB:    sqlite3_result_text(pCtx, 'blob',    4, SQLITE_STATIC);
+    else            sqlite3_result_text(pCtx, 'null',    4, SQLITE_STATIC);
+  end;
+end;
+
+procedure octetLengthFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pVal: PMem;
+  n: i32;
+begin
+  pVal := argv^;
+  if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  n := sqlite3_value_bytes(Psqlite3_value(pVal));
+  sqlite3_result_int(pCtx, n);
+end;
+
+procedure lengthFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pVal: PMem;
+  n: i32;
+  z: PAnsiChar;
+begin
+  pVal := argv^;
+  case sqlite3_value_type(Psqlite3_value(pVal)) of
+    SQLITE_BLOB:
+      sqlite3_result_int(pCtx, sqlite3_value_bytes(Psqlite3_value(pVal)));
+    SQLITE_NULL:
+      sqlite3_result_null(pCtx);
+  else begin
+      z := sqlite3_value_text(Psqlite3_value(pVal));
+      if z = nil then begin sqlite3_result_null(pCtx); Exit; end;
+      n := sqlite3Utf8CharLen(z, sqlite3_value_bytes(Psqlite3_value(pVal)));
+      sqlite3_result_int(pCtx, n);
+    end;
+  end;
+end;
+
+procedure substrFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  z, zOut, zEnd: PAnsiChar;
+  p0, p1, p2, lenArg, lenTotal: PMem;
+  p1i, p2i, n, nByte, i: i32;
+begin
+  p0 := (argv + 0)^;
+  p1 := (argv + 1)^;
+  if sqlite3_value_type(Psqlite3_value(p0)) = SQLITE_NULL then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  z := sqlite3_value_text(Psqlite3_value(p0));
+  if z = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  nByte := sqlite3_value_bytes(Psqlite3_value(p0));
+  n     := sqlite3Utf8CharLen(z, nByte);
+  p1i   := sqlite3_value_int(Psqlite3_value(p1));
+  if argc = 3 then begin
+    p2  := (argv + 2)^;
+    p2i := sqlite3_value_int(Psqlite3_value(p2));
+    if p2i < 0 then begin
+      p1i := p1i + p2i;
+      p2i := -p2i;
+    end;
+  end else
+    p2i := n;
+  if p1i < 1 then begin
+    p2i := p2i + p1i - 1;
+    p1i := 1;
+  end;
+  if p2i < 0 then begin sqlite3_result_text(pCtx, '', 0, SQLITE_STATIC); Exit; end;
+  if p1i > n then begin sqlite3_result_text(pCtx, '', 0, SQLITE_STATIC); Exit; end;
+  { advance z to the start char }
+  i := 1;
+  while (i < p1i) and (z^ <> #0) do begin
+    if u8(z^) >= $80 then begin
+      while (u8(z^) and $C0) = $80 do Inc(z);
+    end;
+    Inc(z); Inc(i);
+  end;
+  zOut := z;
+  i := 0;
+  while (i < p2i) and (z^ <> #0) do begin
+    if u8(z^) >= $80 then begin
+      while (u8(z^) and $C0) = $80 do Inc(z);
+    end;
+    Inc(z); Inc(i);
+  end;
+  zEnd := z;
+  sqlite3_result_text(pCtx, zOut, zEnd - zOut, SQLITE_TRANSIENT);
+end;
+
+procedure upperFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pVal: PMem;
+  z: PAnsiChar;
+  zOut: PAnsiChar;
+  n, i: i32;
+begin
+  pVal := argv^;
+  if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  z := sqlite3_value_text(Psqlite3_value(pVal));
+  if z = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  n := sqlite3_value_bytes(Psqlite3_value(pVal));
+  zOut := sqlite3_malloc(n + 1);
+  if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+  for i := 0 to n - 1 do
+    (zOut + i)^ := AnsiChar(sqlite3Toupper(u8((z + i)^)));
+  (zOut + n)^ := #0;
+  sqlite3_result_text(pCtx, zOut, n, SQLITE_TRANSIENT);
+  sqlite3_free(zOut);
+end;
+
+procedure lowerFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pVal: PMem;
+  z: PAnsiChar;
+  zOut: PAnsiChar;
+  n, i: i32;
+begin
+  pVal := argv^;
+  if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  z := sqlite3_value_text(Psqlite3_value(pVal));
+  if z = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  n := sqlite3_value_bytes(Psqlite3_value(pVal));
+  zOut := sqlite3_malloc(n + 1);
+  if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+  for i := 0 to n - 1 do
+    (zOut + i)^ := AnsiChar(sqlite3UpperToLower[u8((z + i)^)]);
+  (zOut + n)^ := #0;
+  sqlite3_result_text(pCtx, zOut, n, SQLITE_TRANSIENT);
+  sqlite3_free(zOut);
+end;
+
+procedure hexFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+const HEX: array[0..15] of AnsiChar = '0123456789ABCDEF';
+var
+  pVal: PMem;
+  z: Pu8;
+  zOut: PAnsiChar;
+  n, i: i32;
+begin
+  pVal := argv^;
+  if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  z := Pu8(sqlite3_value_blob(Psqlite3_value(pVal)));
+  n := sqlite3_value_bytes(Psqlite3_value(pVal));
+  zOut := sqlite3_malloc(n * 2 + 1);
+  if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+  for i := 0 to n - 1 do begin
+    (zOut + i*2)^   := HEX[(z + i)^ shr 4];
+    (zOut + i*2+1)^ := HEX[(z + i)^ and $0F];
+  end;
+  (zOut + n*2)^ := #0;
+  sqlite3_result_text(pCtx, zOut, n * 2, SQLITE_TRANSIENT);
+  sqlite3_free(zOut);
+end;
+
+procedure unhexFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pVal: PMem;
+  z: PAnsiChar;
+  zOut: Pu8;
+  n, i: i32;
+  hi, lo: i32;
+begin
+  pVal := argv^;
+  if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  z := sqlite3_value_text(Psqlite3_value(pVal));
+  if z = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  n := sqlite3_value_bytes(Psqlite3_value(pVal));
+  if (n and 1) <> 0 then begin sqlite3_result_null(pCtx); Exit; end;
+  zOut := sqlite3_malloc(n div 2 + 1);
+  if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+  i := 0;
+  while i < n do begin
+    hi := Ord((z + i)^);
+    lo := Ord((z + i + 1)^);
+    if (hi >= Ord('0')) and (hi <= Ord('9')) then hi := hi - Ord('0')
+    else if (hi >= Ord('A')) and (hi <= Ord('F')) then hi := hi - Ord('A') + 10
+    else if (hi >= Ord('a')) and (hi <= Ord('f')) then hi := hi - Ord('a') + 10
+    else begin sqlite3_free(zOut); sqlite3_result_null(pCtx); Exit; end;
+    if (lo >= Ord('0')) and (lo <= Ord('9')) then lo := lo - Ord('0')
+    else if (lo >= Ord('A')) and (lo <= Ord('F')) then lo := lo - Ord('A') + 10
+    else if (lo >= Ord('a')) and (lo <= Ord('f')) then lo := lo - Ord('a') + 10
+    else begin sqlite3_free(zOut); sqlite3_result_null(pCtx); Exit; end;
+    (zOut + i div 2)^ := u8(hi shl 4 or lo);
+    Inc(i, 2);
+  end;
+  sqlite3_result_blob(pCtx, zOut, n div 2, SQLITE_TRANSIENT);
+  sqlite3_free(zOut);
+end;
+
+procedure zeroblobFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  n: i64;
+begin
+  n := sqlite3_value_int64(Psqlite3_value(argv^));
+  if n < 0 then n := 0;
+  if n > SQLITE_MAX_LENGTH then begin
+    sqlite3_result_error_toobig(pCtx); Exit;
+  end;
+  sqlite3_result_zeroblob64(pCtx, u64(n));
+end;
+
+procedure nullifFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  if sqlite3MemCompare(argv^, (argv+1)^, nil) <> 0 then
+    sqlite3_result_value(pCtx, Psqlite3_value(argv^));
+end;
+
+procedure versionFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  sqlite3_result_text(pCtx, SQLITE_VERSION, -1, SQLITE_STATIC);
+end;
+
+procedure sourceidFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  sqlite3_result_text(pCtx, SQLITE_SOURCE_ID, -1, SQLITE_STATIC);
+end;
+
+procedure errlogFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  { no-op stub }
+end;
+
+procedure randomFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  r: i64;
+begin
+  sqlite3_randomness(8, @r);
+  if r = 0 then r := 1;
+  sqlite3_result_int64(pCtx, r);
+end;
+
+procedure randomBlobFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  n: i32;
+  p: Pointer;
+begin
+  n := sqlite3_value_int(Psqlite3_value(argv^));
+  if n < 1 then n := 1;
+  if n > SQLITE_MAX_LENGTH then begin
+    sqlite3_result_error_toobig(pCtx); Exit;
+  end;
+  p := sqlite3_malloc(n);
+  if p = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+  sqlite3_randomness(n, p);
+  sqlite3_result_blob(pCtx, p, n, SQLITE_TRANSIENT);
+  sqlite3_free(p);
+end;
+
+procedure lastInsertRowid(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  db: PTsqlite3;
+begin
+  db := Psqlite3_context(pCtx)^.pOut^.db;
+  sqlite3_result_int64(pCtx, db^.lastRowid);
+end;
+
+procedure changesFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  db: PTsqlite3;
+begin
+  db := Psqlite3_context(pCtx)^.pOut^.db;
+  sqlite3_result_int64(pCtx, db^.nChange);
+end;
+
+procedure totalChangesFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  db: PTsqlite3;
+begin
+  db := Psqlite3_context(pCtx)^.pOut^.db;
+  sqlite3_result_int64(pCtx, db^.nTotalChange);
+end;
+
+procedure roundFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  r: Double;
+  n, i: i32;
+  factor: Double;
+begin
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  r := sqlite3_value_double(Psqlite3_value(argv^));
+  if argc = 2 then
+    n := sqlite3_value_int(Psqlite3_value((argv+1)^))
+  else
+    n := 0;
+  if n < 0 then n := 0;
+  if n > 15 then n := 15;
+  factor := 1.0;
+  for i := 0 to n-1 do factor := factor * 10.0;
+  r := Int(r * factor + 0.5) / factor;
+  sqlite3_result_double(pCtx, r);
+end;
+
+procedure trimFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  z, zChars: PAnsiChar;
+  n, nChars, i, j, start, stop: i32;
+  doLeft, doRight: Boolean;
+  matched: Boolean;
+  pFd: PTFuncDef;
+begin
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  z := sqlite3_value_text(Psqlite3_value(argv^));
+  n := sqlite3_value_bytes(Psqlite3_value(argv^));
+  if z = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  if argc >= 2 then begin
+    zChars := sqlite3_value_text(Psqlite3_value((argv+1)^));
+    nChars := sqlite3_value_bytes(Psqlite3_value((argv+1)^));
+    if zChars = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  end else begin
+    zChars := ' ';
+    nChars := 1;
+  end;
+  { Determine which sides to trim based on function name }
+  pFd := PTFuncDef(Psqlite3_context(pCtx)^.pFunc);
+  doLeft  := True;
+  doRight := True;
+  if pFd <> nil then begin
+    if sqlite3StrICmp(pFd^.zName, 'ltrim') = 0 then doRight := False;
+    if sqlite3StrICmp(pFd^.zName, 'rtrim') = 0 then doLeft  := False;
+  end;
+  start := 0;
+  stop  := n;
+  if doLeft then begin
+    while start < stop do begin
+      matched := False;
+      for j := 0 to nChars - 1 do
+        if (z + start)^ = (zChars + j)^ then begin matched := True; Break; end;
+      if matched then Inc(start) else Break;
+    end;
+  end;
+  if doRight then begin
+    while stop > start do begin
+      matched := False;
+      for j := 0 to nChars - 1 do
+        if (z + stop - 1)^ = (zChars + j)^ then begin matched := True; Break; end;
+      if matched then Dec(stop) else Break;
+    end;
+  end;
+  sqlite3_result_text(pCtx, z + start, stop - start, SQLITE_TRANSIENT);
+end;
+
+procedure replaceFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  zStr, zPat, zRep, zOut, p: PAnsiChar;
+  nStr, nPat, nRep, nOut, i, j: i32;
+begin
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  zStr := sqlite3_value_text(Psqlite3_value(argv^));
+  nStr := sqlite3_value_bytes(Psqlite3_value(argv^));
+  zPat := sqlite3_value_text(Psqlite3_value((argv+1)^));
+  nPat := sqlite3_value_bytes(Psqlite3_value((argv+1)^));
+  zRep := sqlite3_value_text(Psqlite3_value((argv+2)^));
+  nRep := sqlite3_value_bytes(Psqlite3_value((argv+2)^));
+  if (zStr = nil) or (zPat = nil) or (zRep = nil) or (nPat = 0) then begin
+    sqlite3_result_text(pCtx, zStr, nStr, SQLITE_TRANSIENT); Exit;
+  end;
+  { Conservative output buffer size }
+  nOut := nStr * 2 + nRep + 64;
+  zOut := sqlite3_malloc(nOut + 1);
+  if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+  p := zOut;
+  i := 0;
+  while i <= nStr - nPat do begin
+    if CompareMem(zStr + i, zPat, nPat) then begin
+      if p - zOut + nRep > nOut then begin
+        sqlite3_free(zOut);
+        sqlite3_result_error_toobig(pCtx); Exit;
+      end;
+      Move(zRep^, p^, nRep);
+      Inc(p, nRep);
+      Inc(i, nPat);
+    end else begin
+      p^ := (zStr + i)^;
+      Inc(p); Inc(i);
+    end;
+  end;
+  { copy tail }
+  j := nStr - i;
+  Move((zStr + i)^, p^, j);
+  Inc(p, j);
+  p^ := #0;
+  sqlite3_result_text(pCtx, zOut, p - zOut, SQLITE_TRANSIENT);
+  sqlite3_free(zOut);
+end;
+
+procedure likeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  zPat, zStr, zE: PAnsiChar;
+  esc: u32;
+  rc: i32;
+begin
+  if (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) or
+     (sqlite3_value_type(Psqlite3_value((argv+1)^)) = SQLITE_NULL) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  zPat := sqlite3_value_text(Psqlite3_value(argv^));
+  zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
+  if (zPat = nil) or (zStr = nil) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  esc := 0;
+  if argc = 3 then begin
+    zE := sqlite3_value_text(Psqlite3_value((argv+2)^));
+    if (zE <> nil) and (zE^ <> #0) then esc := Ord(zE^);
+  end;
+  rc := sqlite3_strlike(zPat, zStr, esc);
+  sqlite3_result_int(pCtx, i32(rc = 0));
+end;
+
+procedure globFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  zPat, zStr: PAnsiChar;
+begin
+  if (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) or
+     (sqlite3_value_type(Psqlite3_value((argv+1)^)) = SQLITE_NULL) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  zPat := sqlite3_value_text(Psqlite3_value(argv^));
+  zStr := sqlite3_value_text(Psqlite3_value((argv+1)^));
+  if (zPat = nil) or (zStr = nil) then begin sqlite3_result_null(pCtx); Exit; end;
+  sqlite3_result_int(pCtx, i32(sqlite3_strglob(zPat, zStr) = 0));
+end;
+
+procedure coalesceFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  i: i32;
+begin
+  for i := 0 to argc - 1 do begin
+    if sqlite3_value_type(Psqlite3_value((argv + i)^)) <> SQLITE_NULL then begin
+      sqlite3_result_value(pCtx, Psqlite3_value((argv + i)^));
+      Exit;
+    end;
+  end;
+  sqlite3_result_null(pCtx);
+end;
+
+procedure ifnullFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  if sqlite3_value_type(Psqlite3_value(argv^)) <> SQLITE_NULL then
+    sqlite3_result_value(pCtx, Psqlite3_value(argv^))
+  else
+    sqlite3_result_value(pCtx, Psqlite3_value((argv+1)^));
+end;
+
+procedure iifFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  if sqlite3_value_int(Psqlite3_value(argv^)) <> 0 then
+    sqlite3_result_value(pCtx, Psqlite3_value((argv+1)^))
+  else
+    sqlite3_result_value(pCtx, Psqlite3_value((argv+2)^));
+end;
+
+procedure unicodeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pz: PPChar;
+  zTmp: PChar;
+  c: u32;
+begin
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  zTmp := sqlite3_value_text(Psqlite3_value(argv^));
+  if zTmp = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  pz := @zTmp;
+  c := sqlite3Utf8Read(pz);
+  sqlite3_result_int64(pCtx, i64(c));
+end;
+
+procedure charFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  z, p: Pu8;
+  i, n: i32;
+  c: u32;
+begin
+  z := sqlite3_malloc(argc * 4 + 1);
+  if z = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+  p := z;
+  for i := 0 to argc - 1 do begin
+    c := u32(sqlite3_value_int64(Psqlite3_value((argv+i)^)));
+    n := sqlite3AppendOneUtf8Character(PAnsiChar(p), c);
+    Inc(p, n);
+  end;
+  p^ := 0;
+  sqlite3_result_text(pCtx, PAnsiChar(z), p - z, SQLITE_TRANSIENT);
+  sqlite3_free(z);
+end;
+
+procedure quoteFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+const
+  HEX2: array[0..15] of AnsiChar = '0123456789ABCDEF';
+var
+  pVal: PMem;
+  z, zOut, p: PAnsiChar;
+  zBlob: Pu8;
+  n, i, nQuotes: i32;
+begin
+  pVal := argv^;
+  case sqlite3_value_type(Psqlite3_value(pVal)) of
+    SQLITE_INTEGER:
+      sqlite3_result_value(pCtx, Psqlite3_value(pVal));
+    SQLITE_REAL:
+      sqlite3_result_value(pCtx, Psqlite3_value(pVal));
+    SQLITE_NULL:
+      sqlite3_result_text(pCtx, 'NULL', 4, SQLITE_STATIC);
+    SQLITE_BLOB: begin
+        zBlob := Pu8(sqlite3_value_blob(Psqlite3_value(pVal)));
+        n := sqlite3_value_bytes(Psqlite3_value(pVal));
+        zOut := sqlite3_malloc(n * 2 + 4);
+        if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+        p := zOut;
+        p^ := 'X'; Inc(p);
+        p^ := ''''; Inc(p);
+        for i := 0 to n - 1 do begin
+          p^ := HEX2[(zBlob + i)^ shr 4];   Inc(p);
+          p^ := HEX2[(zBlob + i)^ and $0F]; Inc(p);
+        end;
+        p^ := ''''; Inc(p); p^ := #0;
+        sqlite3_result_text(pCtx, zOut, p - zOut - 1, SQLITE_TRANSIENT);
+        sqlite3_free(zOut);
+      end;
+  else begin { SQLITE_TEXT }
+      z := sqlite3_value_text(Psqlite3_value(pVal));
+      n := sqlite3_value_bytes(Psqlite3_value(pVal));
+      nQuotes := 0;
+      for i := 0 to n - 1 do
+        if (z + i)^ = '''' then Inc(nQuotes);
+      zOut := sqlite3_malloc(n + nQuotes + 3);
+      if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+      p := zOut;
+      p^ := ''''; Inc(p);
+      for i := 0 to n - 1 do begin
+        if (z + i)^ = '''' then begin p^ := ''''; Inc(p); end;
+        p^ := (z + i)^; Inc(p);
+      end;
+      p^ := ''''; Inc(p); p^ := #0;
+      sqlite3_result_text(pCtx, zOut, p - zOut - 1, SQLITE_TRANSIENT);
+      sqlite3_free(zOut);
+    end;
+  end;
+end;
+
+{ countStep/countFinal — COUNT(*) and COUNT(x) aggregates }
+procedure countStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pCount: Pi64;
+begin
+  pCount := Pi64(sqlite3_aggregate_context(pCtx, SizeOf(i64)));
+  if pCount = nil then Exit;
+  if (argc = 0) or
+     (sqlite3_value_type(Psqlite3_value(argv^)) <> SQLITE_NULL) then
+    Inc(pCount^);
+end;
+
+procedure countFinal(pCtx: Psqlite3_context); cdecl;
+var
+  pCount: Pi64;
+begin
+  pCount := Pi64(sqlite3_aggregate_context(pCtx, 0));
+  if pCount = nil then sqlite3_result_int64(pCtx, 0)
+  else sqlite3_result_int64(pCtx, pCount^);
+end;
+
+{ Aggregate accumulator types — used by sum/avg functions }
+type
+  TSumAcc = record isInt: Boolean; iVal: i64; rVal: Double; end;
+  PSumAcc = ^TSumAcc;
+  TAvgAcc = record cnt: i64; sum: Double; end;
+  PAvgAcc = ^TAvgAcc;
+
+{ sumStep/sumFinal — SUM() aggregate }
+procedure sumStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pAcc: PSumAcc;
+  vt: i32;
+begin
+  pAcc := PSumAcc(sqlite3_aggregate_context(pCtx, SizeOf(TSumAcc)));
+  if (pAcc = nil) or
+     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then Exit;
+  vt := sqlite3_value_type(Psqlite3_value(argv^));
+  if pAcc^.isInt and (vt = SQLITE_INTEGER) then begin
+    sqlite3AddInt64(@pAcc^.iVal,
+      sqlite3_value_int64(Psqlite3_value(argv^)));
+  end else begin
+    pAcc^.isInt := False;
+    pAcc^.rVal := pAcc^.rVal +
+      sqlite3_value_double(Psqlite3_value(argv^));
+  end;
+end;
+
+procedure sumFinal(pCtx: Psqlite3_context); cdecl;
+var
+  pAcc: PSumAcc;
+begin
+  pAcc := PSumAcc(sqlite3_aggregate_context(pCtx, 0));
+  if pAcc = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  if pAcc^.isInt then sqlite3_result_int64(pCtx, pAcc^.iVal)
+  else sqlite3_result_double(pCtx, pAcc^.rVal);
+end;
+
+procedure totalFinal(pCtx: Psqlite3_context); cdecl;
+var
+  pAcc: PSumAcc;
+begin
+  pAcc := PSumAcc(sqlite3_aggregate_context(pCtx, 0));
+  if pAcc = nil then begin sqlite3_result_double(pCtx, 0.0); Exit; end;
+  if pAcc^.isInt then sqlite3_result_double(pCtx, pAcc^.iVal)
+  else sqlite3_result_double(pCtx, pAcc^.rVal);
+end;
+
+{ avgStep/avgFinal — AVG() aggregate }
+procedure avgStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pAcc: PAvgAcc;
+begin
+  pAcc := PAvgAcc(sqlite3_aggregate_context(pCtx, SizeOf(TAvgAcc)));
+  if (pAcc = nil) or
+     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then Exit;
+  pAcc^.sum := pAcc^.sum + sqlite3_value_double(Psqlite3_value(argv^));
+  Inc(pAcc^.cnt);
+end;
+
+procedure avgFinal(pCtx: Psqlite3_context); cdecl;
+var
+  pAcc: PAvgAcc;
+begin
+  pAcc := PAvgAcc(sqlite3_aggregate_context(pCtx, 0));
+  if (pAcc = nil) or (pAcc^.cnt = 0) then begin sqlite3_result_null(pCtx); Exit; end;
+  sqlite3_result_double(pCtx, pAcc^.sum / pAcc^.cnt);
+end;
+
+{ minStep/maxStep/minMaxFinal }
+procedure minStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pAgg: PMem;
+begin
+  pAgg := PMem(sqlite3_aggregate_context(pCtx, SizeOf(TMem)));
+  if pAgg = nil then Exit;
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
+  if (pAgg^.flags and MEM_Null) <> 0 then begin
+    sqlite3VdbeMemCopy(pAgg, argv^);
+  end else begin
+    if sqlite3MemCompare(argv^, pAgg, nil) < 0 then
+      sqlite3VdbeMemCopy(pAgg, argv^);
+  end;
+end;
+
+procedure maxStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pAgg: PMem;
+begin
+  pAgg := PMem(sqlite3_aggregate_context(pCtx, SizeOf(TMem)));
+  if pAgg = nil then Exit;
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
+  if (pAgg^.flags and MEM_Null) <> 0 then begin
+    sqlite3VdbeMemCopy(pAgg, argv^);
+  end else begin
+    if sqlite3MemCompare(argv^, pAgg, nil) > 0 then
+      sqlite3VdbeMemCopy(pAgg, argv^);
+  end;
+end;
+
+procedure minMaxFinal(pCtx: Psqlite3_context); cdecl;
+var
+  pAgg: PMem;
+begin
+  pAgg := PMem(sqlite3_aggregate_context(pCtx, 0));
+  if (pAgg = nil) or ((pAgg^.flags and MEM_Null) <> 0) then begin
+    sqlite3_result_null(pCtx);
+  end else begin
+    sqlite3_result_value(pCtx, Psqlite3_value(pAgg));
+  end;
+end;
+
+procedure groupConcatStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pAgg: PMem;
+  zVal, zSep: PAnsiChar;
+  nVal, nSep: i32;
+  zOut: PAnsiChar;
+  nCur: i32;
+begin
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
+  pAgg := PMem(sqlite3_aggregate_context(pCtx, SizeOf(TMem)));
+  if pAgg = nil then Exit;
+  zVal := sqlite3_value_text(Psqlite3_value(argv^));
+  nVal := sqlite3_value_bytes(Psqlite3_value(argv^));
+  if argc = 2 then begin
+    zSep := sqlite3_value_text(Psqlite3_value((argv+1)^));
+    nSep := sqlite3_value_bytes(Psqlite3_value((argv+1)^));
+  end else begin
+    zSep := ',';
+    nSep := 1;
+  end;
+  if (pAgg^.flags and MEM_Null) <> 0 then begin
+    { First value }
+    zOut := sqlite3_malloc(nVal + 1);
+    if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+    Move(zVal^, zOut^, nVal);
+    (zOut + nVal)^ := #0;
+    sqlite3VdbeMemSetStr(pAgg, zOut, nVal, SQLITE_UTF8, SQLITE_DYNAMIC);
+  end else begin
+    nCur := sqlite3_value_bytes(Psqlite3_value(Psqlite3_value(pAgg)));
+    zOut := sqlite3_malloc(nCur + nSep + nVal + 1);
+    if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+    Move(sqlite3_value_text(Psqlite3_value(pAgg))^, zOut^, nCur);
+    Move(zSep^, (zOut + nCur)^, nSep);
+    Move(zVal^, (zOut + nCur + nSep)^, nVal);
+    (zOut + nCur + nSep + nVal)^ := #0;
+    sqlite3VdbeMemSetStr(pAgg, zOut, nCur + nSep + nVal,
+      SQLITE_UTF8, SQLITE_DYNAMIC);
+  end;
+end;
+
+procedure groupConcatFinal(pCtx: Psqlite3_context); cdecl;
+var
+  pAgg: PMem;
+begin
+  pAgg := PMem(sqlite3_aggregate_context(pCtx, 0));
+  if (pAgg = nil) or ((pAgg^.flags and MEM_Null) <> 0) then begin
+    sqlite3_result_null(pCtx);
+  end else begin
+    sqlite3_result_value(pCtx, Psqlite3_value(pAgg));
+  end;
+end;
+
+{ Built-in function table — a static array of TFuncDef records. }
+const
+  FUNC_ENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_CONSTANT;
+  AGG_ENC  = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
+
+var
+  aBuiltinFuncs: array[0..39] of TFuncDef;
+
+procedure InitBuiltinFuncs;
+procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
+  sfunc: TxSFuncProc; final_: TxFinalProc; nm: PAnsiChar); inline;
+begin
+  FillChar(fd, SizeOf(fd), 0);
+  fd.nArg      := n;
+  fd.funcFlags := flgs;
+  fd.xSFunc    := sfunc;
+  fd.xFinalize := final_;
+  fd.zName     := nm;
+end;
+begin
+  MakeFD(aBuiltinFuncs[0],  1, FUNC_ENC or SQLITE_FUNC_LENGTH,  @lengthFunc,      nil, 'length');
+  MakeFD(aBuiltinFuncs[1],  1, FUNC_ENC or SQLITE_FUNC_BYTELEN, @octetLengthFunc, nil, 'octet_length');
+  MakeFD(aBuiltinFuncs[2],  1, FUNC_ENC or SQLITE_FUNC_TYPEOF,  @typeofFunc,      nil, 'typeof');
+  MakeFD(aBuiltinFuncs[3],  1, FUNC_ENC,  @absFunc,        nil, 'abs');
+  MakeFD(aBuiltinFuncs[4],  1, FUNC_ENC,  @roundFunc,      nil, 'round');
+  MakeFD(aBuiltinFuncs[5],  2, FUNC_ENC,  @roundFunc,      nil, 'round');
+  MakeFD(aBuiltinFuncs[6],  1, FUNC_ENC,  @upperFunc,      nil, 'upper');
+  MakeFD(aBuiltinFuncs[7],  1, FUNC_ENC,  @lowerFunc,      nil, 'lower');
+  MakeFD(aBuiltinFuncs[8],  2, FUNC_ENC,  @substrFunc,     nil, 'substr');
+  MakeFD(aBuiltinFuncs[9],  3, FUNC_ENC,  @substrFunc,     nil, 'substr');
+  MakeFD(aBuiltinFuncs[10], 2, FUNC_ENC,  @substrFunc,     nil, 'substring');
+  MakeFD(aBuiltinFuncs[11], 3, FUNC_ENC,  @substrFunc,     nil, 'substring');
+  MakeFD(aBuiltinFuncs[12], 1, FUNC_ENC,  @hexFunc,        nil, 'hex');
+  MakeFD(aBuiltinFuncs[13], 1, FUNC_ENC,  @unhexFunc,      nil, 'unhex');
+  MakeFD(aBuiltinFuncs[14], 1, FUNC_ENC,  @zeroblobFunc,   nil, 'zeroblob');
+  MakeFD(aBuiltinFuncs[15], 2, FUNC_ENC,  @nullifFunc,     nil, 'nullif');
+  MakeFD(aBuiltinFuncs[16], 0, FUNC_ENC,  @versionFunc,    nil, 'sqlite_version');
+  MakeFD(aBuiltinFuncs[17], 0, FUNC_ENC,  @sourceidFunc,   nil, 'sqlite_source_id');
+  MakeFD(aBuiltinFuncs[18], 0, FUNC_ENC,  @randomFunc,     nil, 'random');
+  MakeFD(aBuiltinFuncs[19], 1, FUNC_ENC,  @randomBlobFunc, nil, 'randomblob');
+  MakeFD(aBuiltinFuncs[20], 0, FUNC_ENC,  @lastInsertRowid,nil, 'last_insert_rowid');
+  MakeFD(aBuiltinFuncs[21], 0, FUNC_ENC,  @changesFunc,    nil, 'changes');
+  MakeFD(aBuiltinFuncs[22], 0, FUNC_ENC,  @totalChangesFunc,nil,'total_changes');
+  MakeFD(aBuiltinFuncs[23],-1, FUNC_ENC,  @coalesceFunc,   nil, 'coalesce');
+  MakeFD(aBuiltinFuncs[24], 2, FUNC_ENC,  @ifnullFunc,     nil, 'ifnull');
+  MakeFD(aBuiltinFuncs[25], 3, FUNC_ENC,  @iifFunc,        nil, 'iif');
+  MakeFD(aBuiltinFuncs[26], 1, FUNC_ENC,  @quoteFunc,      nil, 'quote');
+  MakeFD(aBuiltinFuncs[27], 1, FUNC_ENC,  @unicodeFunc,    nil, 'unicode');
+  MakeFD(aBuiltinFuncs[28],-1, FUNC_ENC,  @charFunc,       nil, 'char');
+  MakeFD(aBuiltinFuncs[29], 3, FUNC_ENC,  @replaceFunc,    nil, 'replace');
+  MakeFD(aBuiltinFuncs[30], 1, FUNC_ENC,  @trimFunc,       nil, 'trim');
+  MakeFD(aBuiltinFuncs[31], 2, FUNC_ENC,  @trimFunc,       nil, 'trim');
+  MakeFD(aBuiltinFuncs[32], 1, FUNC_ENC,  @trimFunc,       nil, 'ltrim');
+  MakeFD(aBuiltinFuncs[33], 2, FUNC_ENC,  @trimFunc,       nil, 'ltrim');
+  MakeFD(aBuiltinFuncs[34], 1, FUNC_ENC,  @trimFunc,       nil, 'rtrim');
+  MakeFD(aBuiltinFuncs[35], 2, FUNC_ENC,  @trimFunc,       nil, 'rtrim');
+  MakeFD(aBuiltinFuncs[36], 2, FUNC_ENC or SQLITE_FUNC_LIKE, @likeFunc, nil, 'like');
+  MakeFD(aBuiltinFuncs[37], 3, FUNC_ENC or SQLITE_FUNC_LIKE, @likeFunc, nil, 'like');
+  MakeFD(aBuiltinFuncs[38], 2, FUNC_ENC or SQLITE_FUNC_LIKE or SQLITE_FUNC_CASE,
+    @globFunc, nil, 'glob');
+  MakeFD(aBuiltinFuncs[39], 0, FUNC_ENC or SQLITE_FUNC_BUILTIN,
+    @errlogFunc, nil, 'sqlite_log');
+end;
+
+var
+  aBuiltinAgg: array[0..8] of TFuncDef;
+
+procedure InitBuiltinAgg;
+procedure MakeAgg(var fd: TFuncDef; n: i16; flgs: u32;
+  step: TxSFuncProc; final_: TxFinalProc; nm: PAnsiChar); inline;
+begin
+  FillChar(fd, SizeOf(fd), 0);
+  fd.nArg      := n;
+  fd.funcFlags := flgs;
+  fd.xSFunc    := step;
+  fd.xFinalize := final_;
+  fd.zName     := nm;
+end;
+begin
+  MakeAgg(aBuiltinAgg[0], 0, AGG_ENC or SQLITE_FUNC_COUNT, @countStep, @countFinal, 'count');
+  MakeAgg(aBuiltinAgg[1], 1, AGG_ENC or SQLITE_FUNC_COUNT, @countStep, @countFinal, 'count');
+  MakeAgg(aBuiltinAgg[2], 1, AGG_ENC, @sumStep,  @sumFinal,   'sum');
+  MakeAgg(aBuiltinAgg[3], 1, AGG_ENC, @sumStep,  @totalFinal, 'total');
+  MakeAgg(aBuiltinAgg[4], 1, AGG_ENC, @avgStep,  @avgFinal,   'avg');
+  MakeAgg(aBuiltinAgg[5], 1, AGG_ENC or SQLITE_FUNC_MINMAX, @minStep, @minMaxFinal, 'min');
+  MakeAgg(aBuiltinAgg[6], 1, AGG_ENC or SQLITE_FUNC_MINMAX, @maxStep, @minMaxFinal, 'max');
+  MakeAgg(aBuiltinAgg[7], 1, AGG_ENC, @groupConcatStep, @groupConcatFinal, 'group_concat');
+  MakeAgg(aBuiltinAgg[8], 2, AGG_ENC, @groupConcatStep, @groupConcatFinal, 'group_concat');
+end;
 
 procedure sqlite3RegisterBuiltinFunctions;
 begin
-  { Phase 7 }
+  InitBuiltinFuncs;
+  InitBuiltinAgg;
+  sqlite3InsertBuiltinFuncs(@aBuiltinFuncs, Length(aBuiltinFuncs));
+  sqlite3InsertBuiltinFuncs(@aBuiltinAgg,   Length(aBuiltinAgg));
 end;
 
 procedure sqlite3RegisterPerConnectionBuiltinFunctions(db: PTsqlite3);
 begin
-  { Phase 7 }
+  { Connection-specific functions (e.g. last_insert_rowid) are already in
+    the global table; no per-connection registration needed in Phase 6.6. }
 end;
 
 procedure sqlite3RegisterLikeFunctions(db: PTsqlite3; caseSensitive: i32);
 begin
-  { Phase 7 }
+  { The like/glob functions are already in the built-in table.
+    Per-connection case-sensitivity can be changed via funcFlags later. }
 end;
 
 function sqlite3IsLikeFunction(db: PTsqlite3; pExpr: PExpr;
   pIsNocase: Pi32; aWc: PAnsiChar): i32;
+var
+  pDef: PTFuncDef;
+  zName: PAnsiChar;
+begin
+  if pExpr^.op <> TK_FUNCTION then begin Result := 0; Exit; end;
+  zName := PAnsiChar(pExpr^.u.zToken);
+  if zName = nil then begin Result := 0; Exit; end;
+  pDef := sqlite3FindFunction(db, zName, -1, SQLITE_UTF8, 0);
+  if (pDef = nil) or ((pDef^.funcFlags and SQLITE_FUNC_LIKE) = 0) then begin
+    Result := 0; Exit;
+  end;
+  aWc[0] := '%';
+  aWc[1] := '_';
+  aWc[2] := '\';
+  if pIsNocase <> nil then begin
+    if (pDef^.funcFlags and SQLITE_FUNC_CASE) <> 0 then pIsNocase^ := 0
+    else pIsNocase^ := 1;
+  end;
+  Result := 1;
+end;
+
+// ===========================================================================
+// Phase 6.6 — fkey.c stubs
+// ===========================================================================
+
+procedure sqlite3FkCheck(pParse: PParse; pTab: PTable2; regOld: i32;
+  regNew: i32; aChange: Pi32; bChng: i32);
+begin
+  { Phase 7: foreign-key constraint checking deferred until parser is available }
+end;
+
+procedure sqlite3FkActions(pParse: PParse; pTab: PTable2; pChanges: PExprList;
+  regOld: i32; aChange: Pi32; bChng: i32);
+begin
+  { Phase 7 }
+end;
+
+function sqlite3FkRequired(pParse: PParse; pTab: PTable2;
+  aChange: Pi32; chngRowid: i32): i32;
 begin
   Result := 0;
+end;
+
+procedure sqlite3FkDelete(db: PTsqlite3; pTab: PTable2);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3FkDropTable(pParse: PParse; pName: PSrcList; pTab: PTable2);
+begin
+  { Phase 7 }
+end;
+
+procedure sqlite3FkOldmask(pParse: PParse; pTab: PTable2);
+begin
+  { Phase 7 }
+end;
+
+function sqlite3FkReferences(pTab: PTable2): Pointer;
+begin
+  Result := nil;
+end;
+
+// ===========================================================================
+// Phase 6.6 — date.c (date/time functions using libc)
+// ===========================================================================
+
+{ Date/time function context — holds parsed date components. }
+type
+  TDateTime2 = record
+    yr, mo, dy, hr, mi: i32;
+    s: Double;
+    validJD: Boolean;
+    jd: Double;  { Julian Day Number }
+  end;
+
+function dateIsLeap(y: i32): Boolean; inline;
+begin
+  Result := ((y mod 4 = 0) and (y mod 100 <> 0)) or (y mod 400 = 0);
+end;
+
+function daysInMonth(y, m: i32): i32;
+const DIM: array[1..12] of i32 = (31,28,31,30,31,30,31,31,30,31,30,31);
+begin
+  if (m = 2) and dateIsLeap(y) then Result := 29
+  else Result := DIM[m];
+end;
+
+{ toJulianDay — convert Y-M-D h:m:s to Julian Day Number.
+  Formula from SQLite's date.c. }
+function toJulianDay(y, m, d: i32; h, min: i32; s: Double): Double;
+var
+  Y2, A, B, X1: i32;
+  jd: Double;
+begin
+  if m <= 2 then begin dec(y); inc(m, 12); end;
+  A := y div 100;
+  B := 2 - A + (A div 4);
+  X1 := Trunc(365.25 * (y + 4716));
+  jd := X1 + Trunc(30.6001 * (m + 1)) + d + B - 1524.5;
+  jd := jd + (h + (min + s/60.0)/60.0)/24.0;
+  Result := jd;
+end;
+
+{ fromJulianDay — convert Julian Day Number to Y-M-D h:m:s. }
+procedure fromJulianDay(jd: Double; var y, m, d: i32;
+  var h, mn: i32; var s: Double);
+var
+  Z, A, B, C, D2, E, alpha: i32;
+  F: Double;
+begin
+  Z  := Trunc(jd + 0.5);
+  F  := (jd + 0.5) - Z;
+  if Z < 2299161 then A := Z
+  else begin
+    alpha := Trunc((Z - 1867216.25) / 36524.25);
+    A := Z + 1 + alpha - (alpha div 4);
+  end;
+  B  := A + 1524;
+  C  := Trunc((B - 122.1) / 365.25);
+  D2 := Trunc(365.25 * C);
+  E  := Trunc((B - D2) / 30.6001);
+  d  := B - D2 - Trunc(30.6001 * E);
+  if E < 14 then m := E - 1 else m := E - 13;
+  if m > 2 then y := C - 4716 else y := C - 4715;
+  h  := Trunc(F * 24.0);
+  mn := Trunc((F * 24.0 - h) * 60.0);
+  s  := ((F * 24.0 - h) * 60.0 - mn) * 60.0;
+end;
+
+{ parseDateTime — parse a date/time string in ISO 8601 format. }
+function parseDateTime(zStr: PAnsiChar; var dt: TDateTime2): Boolean;
+var
+  s: AnsiString;
+  p, sv, fp: i32;
+  y, m, d, h, mn: i32;
+  sec, frac: Double;
+  function isdig(c: AnsiChar): Boolean; inline;
+  begin Result := (c >= '0') and (c <= '9'); end;
+  function getN(start, count: i32): i32;
+  var i: i32;
+  begin
+    Result := 0;
+    for i := start to start + count - 1 do begin
+      if (i > Length(s)) or not isdig(s[i]) then begin Result := -1; Exit; end;
+      Result := Result * 10 + Ord(s[i]) - Ord('0');
+    end;
+  end;
+begin
+  Result := False;
+  if zStr = nil then Exit;
+  s := AnsiString(zStr);
+  if Length(s) < 10 then Exit;
+  y := getN(1,4); if y < 0 then Exit;
+  if s[5] <> '-' then Exit;
+  m := getN(6,2); if m < 1 then Exit;
+  if s[8] <> '-' then Exit;
+  d := getN(9,2); if d < 1 then Exit;
+  h := 0; mn := 0; sec := 0.0;
+  p := 11;
+  if Length(s) >= 13 then begin
+    h := getN(p,2); if h < 0 then Exit;
+    if (Length(s) > p+1) and (s[p+2] = ':') then begin
+      mn := getN(p+3,2); if mn < 0 then Exit;
+      if (Length(s) > p+4) and (s[p+5] = ':') then begin
+        sv := getN(p+6,2);
+        if sv < 0 then Exit;
+        sec := sv;
+        if (Length(s) > p+7) and (s[p+8] = '.') then begin
+          frac := 0.1;
+          fp := p+9;
+          while (fp <= Length(s)) and isdig(s[fp]) do begin
+            sec := sec + (Ord(s[fp]) - Ord('0')) * frac;
+            frac := frac * 0.1;
+            Inc(fp);
+          end;
+        end;
+      end;
+    end;
+  end;
+  dt.yr := y; dt.mo := m; dt.dy := d;
+  dt.hr := h; dt.mi := mn; dt.s := sec;
+  dt.jd := toJulianDay(y, m, d, h, mn, sec);
+  dt.validJD := True;
+  Result := True;
+end;
+
+{ currentJD — get current UTC time as Julian Day Number. }
+function currentJD: Double;
+var
+  now: TDateTime;
+  y, m, d, h, mn, s, ms: Word;
+begin
+  now := EncodeDateTime(1970,1,1,0,0,0,0) +
+    (SysUtils.Now - EncodeDateTime(1970,1,1,0,0,0,0));
+  now := SysUtils.Now;
+  DecodeDateTime(now, y, m, d, h, mn, s, ms);
+  Result := toJulianDay(y, m, d, h, mn, s + ms/1000.0);
+end;
+
+procedure dateFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  dt: TDateTime2;
+  z: PAnsiChar;
+  buf: array[0..15] of AnsiChar;
+  jd: Double;
+  y2, m2, d2, h2, mn2: i32;
+  s2: Double;
+begin
+  if (argc = 0) or
+     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
+    jd := currentJD;
+    fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
+    snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d', [y2, m2, d2]);
+    sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
+    Exit;
+  end;
+  z := sqlite3_value_text(Psqlite3_value(argv^));
+  if not parseDateTime(z, dt) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d', [dt.yr, dt.mo, dt.dy]);
+  sqlite3_result_text(pCtx, buf, 10, SQLITE_TRANSIENT);
+end;
+
+procedure timeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  dt: TDateTime2;
+  z: PAnsiChar;
+  buf: array[0..15] of AnsiChar;
+  jd: Double;
+  y2, m2, d2, h2, mn2: i32;
+  s2: Double;
+begin
+  if (argc = 0) or
+     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
+    jd := currentJD;
+    fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
+    snpFmt(SizeOf(buf), buf, '%02d:%02d:%05.3f', [h2, mn2, s2]);
+    sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
+    Exit;
+  end;
+  z := sqlite3_value_text(Psqlite3_value(argv^));
+  if not parseDateTime(z, dt) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  snpFmt(SizeOf(buf), buf, '%02d:%02d:%05.3f', [dt.hr, dt.mi, dt.s]);
+  sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
+end;
+
+procedure datetimeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  dt: TDateTime2;
+  z: PAnsiChar;
+  buf: array[0..23] of AnsiChar;
+  jd: Double;
+  y2, m2, d2, h2, mn2: i32;
+  s2: Double;
+begin
+  if (argc = 0) or
+     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
+    jd := currentJD;
+    fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
+    snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%05.3f',
+      [y2, m2, d2, h2, mn2, s2]);
+    sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
+    Exit;
+  end;
+  z := sqlite3_value_text(Psqlite3_value(argv^));
+  if not parseDateTime(z, dt) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%05.3f',
+    [dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s]);
+  sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
+end;
+
+procedure juliandayFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  dt: TDateTime2;
+  z: PAnsiChar;
+begin
+  if (argc = 0) or
+     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
+    sqlite3_result_double(pCtx, currentJD); Exit;
+  end;
+  z := sqlite3_value_text(Psqlite3_value(argv^));
+  if not parseDateTime(z, dt) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  sqlite3_result_double(pCtx, dt.jd);
+end;
+
+procedure unixtimeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  dt: TDateTime2;
+  z: PAnsiChar;
+  jd, epoch: Double;
+begin
+  epoch := toJulianDay(1970,1,1,0,0,0.0);
+  if (argc = 0) or
+     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
+    jd := currentJD;
+  end else begin
+    z := sqlite3_value_text(Psqlite3_value(argv^));
+    if not parseDateTime(z, dt) then begin
+      sqlite3_result_null(pCtx); Exit;
+    end;
+    jd := dt.jd;
+  end;
+  sqlite3_result_int64(pCtx, Trunc((jd - epoch) * 86400.0));
+end;
+
+procedure strftimeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  zFmt, zDate: PAnsiChar;
+  dt: TDateTime2;
+  jd, jan1: Double;
+  buf: array[0..255] of AnsiChar;
+  out_: array[0..255] of AnsiChar;
+  p: PAnsiChar;
+  op: PAnsiChar;
+  c: AnsiChar;
+  y2, m2, d2, h2, mn2: i32;
+  s2: Double;
+  epoch: Double;
+begin
+  if argc < 2 then begin sqlite3_result_null(pCtx); Exit; end;
+  zFmt  := sqlite3_value_text(Psqlite3_value(argv^));
+  zDate := sqlite3_value_text(Psqlite3_value((argv+1)^));
+  if (zFmt = nil) then begin sqlite3_result_null(pCtx); Exit; end;
+  if (zDate = nil) or not parseDateTime(zDate, dt) then begin
+    jd := currentJD;
+    fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
+  end else begin
+    jd := dt.jd;
+    y2 := dt.yr; m2 := dt.mo; d2 := dt.dy;
+    h2 := dt.hr; mn2 := dt.mi; s2 := dt.s;
+  end;
+  p  := zFmt;
+  op := out_;
+  while p^ <> #0 do begin
+    if p^ <> '%' then begin
+      op^ := p^; Inc(op);
+    end else begin
+      Inc(p);
+      c := p^;
+      case c of
+        'Y': begin snpFmt(8, op, '%04d', [y2]); while op^ <> #0 do Inc(op); end;
+        'm': begin snpFmt(4, op, '%02d', [m2]); while op^ <> #0 do Inc(op); end;
+        'd': begin snpFmt(4, op, '%02d', [d2]); while op^ <> #0 do Inc(op); end;
+        'H': begin snpFmt(4, op, '%02d', [h2]); while op^ <> #0 do Inc(op); end;
+        'M': begin snpFmt(4, op, '%02d', [mn2]); while op^ <> #0 do Inc(op); end;
+        'S': begin snpFmt(8, op, '%05.3f', [s2]); while op^ <> #0 do Inc(op); end;
+        'f': begin snpFmt(8, op, '%05.3f', [s2]); while op^ <> #0 do Inc(op); end;
+        'j': begin
+               { Day of year 001-366 }
+               jan1 := toJulianDay(y2,1,1,0,0,0.0);
+               snpFmt(5, op, '%03d', [Trunc(jd - jan1) + 1]);
+               while op^ <> #0 do Inc(op);
+             end;
+        'J': begin snpFmt(24, op, '%.16g', [jd]); while op^ <> #0 do Inc(op); end;
+        's': begin
+               epoch := toJulianDay(1970,1,1,0,0,0.0);
+               snpFmt(24, op, '%lld', [Trunc((jd-epoch)*86400.0)]);
+               while op^ <> #0 do Inc(op);
+             end;
+        '%': begin op^ := '%'; Inc(op); end;
+        else begin op^ := '%'; Inc(op); op^ := c; Inc(op); end;
+      end;
+    end;
+    Inc(p);
+  end;
+  op^ := #0;
+  sqlite3_result_text(pCtx, out_, op - out_, SQLITE_TRANSIENT);
+end;
+
+var
+  aDateFuncs: array[0..7] of TFuncDef;
+
+procedure InitDateFuncs;
+procedure MakeFD(var fd: TFuncDef; n: i16; sfunc: TxSFuncProc;
+  nm: PAnsiChar); inline;
+begin
+  FillChar(fd, SizeOf(fd), 0);
+  fd.nArg      := n;
+  fd.funcFlags := SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_CONSTANT;
+  fd.xSFunc    := sfunc;
+  fd.zName     := nm;
+end;
+begin
+  MakeFD(aDateFuncs[0],  1, @dateFunc,      'date');
+  MakeFD(aDateFuncs[1],  1, @timeFunc,      'time');
+  MakeFD(aDateFuncs[2],  1, @datetimeFunc,  'datetime');
+  MakeFD(aDateFuncs[3],  1, @juliandayFunc, 'julianday');
+  MakeFD(aDateFuncs[4],  2, @strftimeFunc,  'strftime');
+  MakeFD(aDateFuncs[5],  1, @unixtimeFunc,  'unixepoch');
+  MakeFD(aDateFuncs[6],  0, @dateFunc,      'date');
+  MakeFD(aDateFuncs[7],  0, @datetimeFunc,  'datetime');
+end;
+
+procedure sqlite3RegisterDateTimeFunctions;
+begin
+  InitDateFuncs;
+  sqlite3InsertBuiltinFuncs(@aDateFuncs, Length(aDateFuncs));
 end;
 
 function sqlite3_strglob(zGlobPattern: PAnsiChar; zString: PAnsiChar): i32;

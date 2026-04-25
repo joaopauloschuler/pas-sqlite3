@@ -128,6 +128,7 @@ compile_test TestWalker
 compile_test TestExprBasic
 compile_test TestWhereBasic
 compile_test TestSelectBasic
+compile_test TestAuthBuiltins
 compile_test TestDMLBasic
 compile_test TestSchemaBasic
 compile_test TestExplainParity
