@@ -77,6 +77,9 @@ var
   expr:      PExpr;
   i:         i32;
   pCol, pInt, pEq, pNew: PExpr;
+  pBet, pLo, pHi, pNN, pColNN: PExpr;
+  pBList: PExprList;
+  iBetIdx, iNNIdx: i32;
 
 begin
   WriteLn('=== TestWhereExpr — Phase 6.9-bis 11g.2.c whereexpr helpers ===');
@@ -208,9 +211,77 @@ begin
   Check('T6d original Expr LHS is now the column',
         (pEq^.pLeft <> nil) and (pEq^.pLeft^.op = TK_COLUMN));
 
-  sqlite3WhereClauseClear(pWC);
-  sqlite3DbFree(db, pWInfo);
-  sqlite3DbFree(db, pSrcBuf);
+  { ---- T7: BETWEEN virtual-term synthesis (whereexpr.c:1291..1312).
+            "rowid BETWEEN 3 AND 7" must produce two TERM_VIRTUAL|TERM_DYNAMIC
+            children (a>=3 and a<=7), each linked via iParent to the BETWEEN
+            term, with eOperator = WO_GE / WO_LE respectively. ---- }
+  iBetIdx := pWC^.nTerm;
+  pCol := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol^.iTable := 0; pCol^.iColumn := -1;
+  pLo := sqlite3ExprInt32(db, 3);
+  pHi := sqlite3ExprInt32(db, 7);
+  pBList := sqlite3ExprListAppend(@parse, nil, pLo);
+  pBList := sqlite3ExprListAppend(@parse, pBList, pHi);
+  pBet := sqlite3PExpr(@parse, TK_BETWEEN, pCol, nil);
+  pBet^.x.pList := pBList;
+  whereClauseInsert(pWC, pBet, 0);
+  exprAnalyze(pSrc, pWC, iBetIdx);
+  Check('T7a BETWEEN spawned 2 children',
+        pWC^.nTerm = iBetIdx + 3);
+  Check('T7b child 0 is TK_GE',
+        pWC^.a[iBetIdx + 1].pExpr^.op = TK_GE);
+  Check('T7c child 1 is TK_LE',
+        pWC^.a[iBetIdx + 2].pExpr^.op = TK_LE);
+  Check('T7d child 0 wtFlags has VIRTUAL|DYNAMIC',
+        (pWC^.a[iBetIdx + 1].wtFlags
+         and (TERM_VIRTUAL or TERM_DYNAMIC))
+        = (TERM_VIRTUAL or TERM_DYNAMIC));
+  Check('T7e child 0 iParent = BETWEEN idx',
+        pWC^.a[iBetIdx + 1].iParent = iBetIdx);
+  Check('T7f child 1 iParent = BETWEEN idx',
+        pWC^.a[iBetIdx + 2].iParent = iBetIdx);
+  Check('T7g BETWEEN nChild = 2',
+        pWC^.a[iBetIdx].nChild = 2);
+  Check('T7h child 0 has WO_GE on rowid cursor 0',
+        (pWC^.a[iBetIdx + 1].eOperator and WO_GE) <> 0);
+  Check('T7i child 1 has WO_LE on rowid cursor 0',
+        (pWC^.a[iBetIdx + 2].eOperator and WO_LE) <> 0);
+  Check('T7j child 0 leftCursor = 0',
+        pWC^.a[iBetIdx + 1].leftCursor = 0);
+  Check('T7k child 1 leftCursor = 0',
+        pWC^.a[iBetIdx + 2].leftCursor = 0);
+
+  { ---- T8: TK_NOTNULL virtual-term synthesis (whereexpr.c:1331..1359).
+            "col0 NOTNULL" with column 0 (not rowid) must add one virtual
+            term tagged TERM_VNULL whose eOperator = WO_GT. The original
+            NOTNULL term gets TERM_COPIED. ---- }
+  iNNIdx := pWC^.nTerm;
+  pColNN := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColNN^.iTable := 0; pColNN^.iColumn := 0;     { column 0, not rowid }
+  pNN := sqlite3PExpr(@parse, TK_NOTNULL, pColNN, nil);
+  whereClauseInsert(pWC, pNN, 0);
+  exprAnalyze(pSrc, pWC, iNNIdx);
+  Check('T8a NOTNULL spawned 1 child',
+        pWC^.nTerm = iNNIdx + 2);
+  Check('T8b child wtFlags has VNULL',
+        (pWC^.a[iNNIdx + 1].wtFlags and TERM_VNULL) <> 0);
+  Check('T8c child eOperator = WO_GT',
+        (pWC^.a[iNNIdx + 1].eOperator and WO_GT_WO) <> 0);
+  Check('T8d child leftCursor = 0',
+        pWC^.a[iNNIdx + 1].leftCursor = 0);
+  Check('T8e child u.leftColumn = 0',
+        pWC^.a[iNNIdx + 1].u.leftColumn = 0);
+  Check('T8f original NOTNULL has TERM_COPIED',
+        (pWC^.a[iNNIdx].wtFlags and TERM_COPIED) <> 0);
+  Check('T8g child iParent links back',
+        pWC^.a[iNNIdx + 1].iParent = iNNIdx);
+
+  { Skip sqlite3WhereClauseClear / sqlite3DbFree for the synthetic
+    WhereInfo: pWC^.a was allocated through sqlite3WhereMalloc and is
+    threaded on pWInfo^.pMemToFree, so a manual sqlite3DbFree(pWC^.a)
+    would corrupt the lookaside arena.  whereInfoFree's full chain-walk
+    is the C-faithful release path, but it requires more state than
+    this test sets up.  The OS reclaims the leaked allocations at exit. }
   sqlite3_close(db);
 
   WriteLn;

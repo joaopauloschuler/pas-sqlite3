@@ -1547,6 +1547,7 @@ function  sqlite3WhereExprUsage(pMaskSet: PWhereMaskSet; p: PExpr): Bitmask;
 function  sqlite3WhereExprListUsage(pMaskSet: PWhereMaskSet; pList: PExprList): Bitmask;
 function  sqlite3WhereFindTerm(pWC: PWhereClause; iCur: i32; iColumn: i32;
   notReady: Bitmask; op: u32; pIdx: PIndex2): PWhereTerm;
+procedure exprAnalyze(pSrc: PSrcList; pWC: PWhereClause; idxTerm: i32);
 procedure sqlite3WhereExprAnalyze(pTabList: PSrcList; pWC: PWhereClause);
 procedure sqlite3WhereTabFuncArgs(pParse: PParse; pItem: PSrcItem; pWC: PWhereClause);
 procedure sqlite3WhereAddLimit(pWC: PWhereClause; p: PSelect);
@@ -6086,9 +6087,14 @@ var
   pRgtSC:     PExpr;           { renamed from pRight }
   opMask:     u16;
   pNew:       PWhereTerm;
+  pNewTerm:   PWhereTerm;
   pDup:       PExpr;
   idxNew:     i32;
   eExtraOp:   u16;
+  pList:      PExprList;       { BETWEEN: x.pList of length 2 }
+  pBLeft:     PExpr;           { NOTNULL: alias for pX^.pLeft }
+  pNewExpr:   PExpr;
+  iBet:       i32;
 begin
   { whereexpr.c:1122.. — trimmed body; see banner above for what is and is
     not covered.  Comments cite C source line numbers. }
@@ -6233,10 +6239,75 @@ begin
       pTerm^.prereqAll := 0;
       pTerm^.eOperator := 0;
     end;
+  end
+
+  { BETWEEN virtual-term synthesis (whereexpr.c:1275..1313).
+    "a BETWEEN b AND c" → (a BETWEEN b AND c) AND (a>=b) AND (a<=c).
+    The two synthesized comparison terms are inserted as TERM_VIRTUAL |
+    TERM_DYNAMIC children of the BETWEEN; if either is satisfied by an
+    index the BETWEEN is skipped, and vice versa. }
+  else if (pX^.op = TK_BETWEEN) and (pWC^.op = TK_AND) then
+  begin
+    Assert(ExprUseXList(pX));
+    pList := pX^.x.pList;
+    Assert(pList <> nil);
+    Assert(pList^.nExpr = 2);
+    for iBet := 0 to 1 do
+    begin
+      if iBet = 0 then op := TK_GE else op := TK_LE;
+      pNewExpr := sqlite3PExpr(pPrs, op,
+                    sqlite3ExprDup(db, pX^.pLeft, 0),
+                    sqlite3ExprDup(db,
+                      ExprListItems(pList)[iBet].pExpr, 0));
+      transferJoinMarkings(pNewExpr, pX);
+      idxNew := whereClauseInsert(pWC, pNewExpr,
+                                  TERM_VIRTUAL or TERM_DYNAMIC);
+      exprAnalyze(pSrc, pWC, idxNew);
+      pTerm := @pWC^.a[idxTerm];
+      markTermAsChild(pWC, idxNew, idxTerm);
+    end;
+  end
+
+  { TK_OR (whereexpr.c:1315..1324) deferred — needs exprAnalyzeOrTerm. }
+
+  { TK_NOTNULL virtual-term synthesis (whereexpr.c:1331..1359).
+    "x IS NOT NULL" on a column that is not the integer primary key gets
+    a virtual "x > NULL" companion (tagged TERM_VNULL).  The original
+    NOTNULL term is marked TERM_COPIED so disable propagation works. }
+  else if pX^.op = TK_NOTNULL then
+  begin
+    if (pX^.pLeft <> nil)
+       and (pX^.pLeft^.op = TK_COLUMN)
+       and (pX^.pLeft^.iColumn >= 0)
+       and (not ExprHasProperty(pX, EP_OuterON)) then
+    begin
+      pBLeft := pX^.pLeft;
+      pNewExpr := sqlite3PExpr(pPrs, TK_GT_TK,
+                    sqlite3ExprDup(db, pBLeft, 0),
+                    sqlite3ExprAlloc(db, TK_NULL, nil, 0));
+      idxNew := whereClauseInsert(pWC, pNewExpr,
+                  TERM_VIRTUAL or TERM_DYNAMIC or TERM_VNULL);
+      if idxNew <> 0 then
+      begin
+        pNewTerm := @pWC^.a[idxNew];
+        pNewTerm^.prereqRight := 0;
+        pNewTerm^.leftCursor  := pBLeft^.iTable;
+        pNewTerm^.u.leftColumn:= pBLeft^.iColumn;
+        pNewTerm^.eOperator   := WO_GT_WO;
+        markTermAsChild(pWC, idxNew, idxTerm);
+        pTerm := @pWC^.a[idxTerm];
+        pTerm^.wtFlags := pTerm^.wtFlags or TERM_COPIED;
+        pNewTerm^.prereqAll := pTerm^.prereqAll;
+      end;
+    end;
   end;
 
-  { BETWEEN / OR / NOTNULL / LIKE virtual-term synthesis blocks
-    (whereexpr.c:1275..1530) deferred to 11g.2.c. }
+  { TK_FUNCTION LIKE/GLOB optimisation (whereexpr.c:1362..1455) deferred —
+    needs isLikeOrGlob, sqlite3ExprAddCollateString, ICU collation tables. }
+
+  { Vector == / IS expansion (whereexpr.c:1467..1489) and vector IN expansion
+    (whereexpr.c:1500..1518) deferred — vector predicates are out of scope
+    for the rowid-EQ corpus exercised today. }
 
   { isAuxiliaryVtabOperator / WO_AUX vtab path (whereexpr.c:1531..1567)
     deferred — vtab corpus is not exercised today. }

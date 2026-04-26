@@ -68,10 +68,20 @@ Important: At the end of this document, please find:
       `exprAnalyze` extended with the right-side commute path
       (whereexpr.c:1222..1261) and the TK_ISNULL→TK_TRUEFALSE rewrite
       (whereexpr.c:1262..1272).  Gate: `TestWhereExpr.pas` (22/22).
-    - [ ] BETWEEN / OR / NOTNULL / LIKE virtual-term synthesis
-      (whereexpr.c:1275..1530), `whereCombineDisjuncts`,
-      `whereNthSubterm`, `isLikeOrGlob`, `whereCommuteOperator`,
-      `exprAnalyzeOrTerm`, `termIsEquivalence` — still deferred.
+    - [X] BETWEEN virtual-term synthesis (whereexpr.c:1291..1313) —
+      "a BETWEEN b AND c" → (a>=b) AND (a<=c) virtual children with
+      TERM_VIRTUAL|TERM_DYNAMIC and recursive exprAnalyze on each new
+      term.  Gate: `TestWhereExpr.pas` T7a..T7k (33/33).
+    - [X] NOTNULL virtual-term synthesis (whereexpr.c:1331..1359) —
+      "x IS NOT NULL" on a non-rowid column gets a virtual "x>NULL"
+      companion tagged TERM_VNULL with WO_GT.  Gate:
+      `TestWhereExpr.pas` T8a..T8g (40/40).
+    - [ ] OR / LIKE virtual-term synthesis (whereexpr.c:1315..1455),
+      `whereCombineDisjuncts`, `whereNthSubterm`, `isLikeOrGlob`,
+      `whereCommuteOperator`, `exprAnalyzeOrTerm`, `termIsEquivalence`
+      — still deferred (`isLikeOrGlob` needs `sqlite3ExprAddCollateString`
+      + ICU collation tables; `termIsEquivalence` needs
+      `sqlite3ExprCollSeqMatch` + `SQLITE_Transitive`).
 
 - [ ] **6.9-bis 11g.2.d** Port the planner core in `where.c`
     (~5000 lines): `whereLoopAddBtree`, `whereLoopAddBtreeIndex`,
