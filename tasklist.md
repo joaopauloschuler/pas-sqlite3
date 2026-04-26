@@ -21,6 +21,91 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    sqlite3ExprCodeTemp + TK_NULL / TK_CAST / TK_NOT / TK_BITNOT /
+    TK_ISNULL / TK_NOTNULL / TK_TRUTH arms.**  Lands the leaf
+    helper `sqlite3ExprCodeTemp` (expr.c:5856..5877) and bolts six
+    new arms onto `sqlite3ExprCodeTarget`'s dispatch loop.  Every arm
+    flagged "easy unblocked" in the previous sub-progress' next-step
+    notes now has a productive path.
+
+      * **`sqlite3ExprCodeTemp`** — code an expression into a
+        temporary register; on return, *pReg holds the temp register
+        number to release later, or 0 if the result lives in a register
+        the caller does not own (constant factored into the init
+        section, or a TK_REGISTER alias).  Constant-factor short-circuit
+        delegates to `sqlite3ExprCodeRunJustOnce` when
+        `parseFlags & PARSEFLAG_OkConstFactor` AND
+        `sqlite3ExprIsConstantNotJoin` AND `pX^.op != TK_REGISTER`.
+        Otherwise allocates via `sqlite3GetTempReg`, codes via
+        `sqlite3ExprCodeTarget`, and releases the temp if the target
+        register was overridden (e.g. TK_REGISTER aliased to the
+        underlying iTable register).
+      * **TK_NULL arm** (expr.c:5187..5192 default-arm folding) —
+        emits `OP_Null(0, target)`.  Identical emission to the default
+        arm but explicit so the default arm can document its reduced
+        responsibility (TK_ERROR + mallocFailed only).
+      * **TK_CAST arm** (expr.c:5151..5159) — codes `pLeft` into
+        `target` then emits `OP_Cast(target, affinity)` where the
+        affinity byte comes from `sqlite3AffinityType(zToken, nil)`.
+      * **TK_BITNOT, TK_NOT arms** (expr.c:5348..5355) —
+        `r1 := sqlite3ExprCodeTemp(pLeft); OP_BitNot/OP_Not(r1, target);
+        sqlite3ReleaseTempReg(regFree1)`.  The opcode-value-equals-
+        token-value identity (TK_BITNOT == OP_BitNot == 115,
+        TK_NOT == OP_Not == 19) is asserted at runtime.
+      * **TK_TRUTH arm** (expr.c:5357..5367) — IS [NOT] {TRUE|FALSE}.
+        Encodes via `OP_IsTrue(r1, target, !isTrue, isTrue XOR bNormal)`
+        where `bNormal := (op2 == TK_IS)`.
+      * **TK_ISNULL, TK_NOTNULL arms** (expr.c:5369..5383) —
+        `OP_Integer(1, target); r1 := codeTemp(pLeft);
+        addr := OP_IsNull/OP_NotNull(r1); OP_Integer(0, target);
+        JumpHere(addr)`.  Same opcode-value-equals-token-value identity.
+
+    Concrete changes:
+      * `passqlite3codegen.pas:1736..` — public forward decl for
+        `sqlite3ExprCodeTemp` next to `sqlite3ExprCodeRunJustOnce`.
+      * `passqlite3codegen.pas:3693..` — `sqlite3ExprCodeTarget` body
+        gets six new locals (`r1`, `regFree1`, `addr`, `isTrue`,
+        `bNormal`) plus the six new arms above.  Default-arm comment
+        trimmed (TK_CAST and the unary cluster no longer mentioned).
+      * `passqlite3codegen.pas:4438..` — body of `sqlite3ExprCodeTemp`
+        immediately after `sqlite3ExprCodeRunJustOnce`.
+
+    Why this is safe to land alone: none of the new arms appear in the
+    productive call paths the corpus currently exercises (the schema-row
+    INSERT/UPDATE/DELETE rows emitted by `sqlite3NestedParse`).  Verified
+    by build and full regression sweep — TestWhereBasic 52/52,
+    TestWhereStructs 148/148, TestPrepareBasic 20/20, TestParser 45/45,
+    TestSchemaBasic 44/44, TestVdbeApi 57/57, TestDMLBasic 54/54,
+    TestSelectBasic 49/49, TestExprBasic 40/40, TestInitCallback 29/29,
+    TestExplainParity unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **`Pi32` (= ^i32) is the right shape for `pReg`-style
+        out-parameters.**  Already declared in passqlite3types.pas;
+        no new pointer-type aliases needed.  Same convention any
+        future `int*`-out-param port can follow.
+      * **The TK_BITNOT/TK_NOT/TK_ISNULL/TK_NOTNULL arms rely on the
+        TK_<op> == OP_<op> identity.**  Verified at build time by the
+        existing parser/vdbe constant tables.  Asserts at runtime as
+        belt-and-braces; if a future SQLite minor bump shifts a TK_/OP_
+        constant, the assert fires immediately.
+      * **`sqlite3ExprCodeTemp` is the gating helper for the comparison
+        cluster (TK_LT..TK_EQ) and the arithmetic cluster (TK_PLUS..
+        TK_CONCAT).**  Both of those need `exprComputeOperands` (still
+        unported) and `codeCompare` (already landed).  Realistic next
+        sub-progress: port `exprComputeOperands` (expr.c:5066..5095) +
+        the shared `regFree2`/`r2` plumbing, then land TK_EQ/TK_NE/…/
+        TK_LE as a single arm.  After that, the TK_PLUS/TK_MINUS/…
+        cluster shares a structurally identical body modulo the `op==`
+        value, and finally the AND/OR cluster via `exprCodeTargetAndOr`
+        is a separate self-contained helper.
+      * **TK_IF_NULL_ROW arm still gated on AggInfo plumbing.**  Even
+        the non-aggregate path requires flipping `pParse^.okConstFactor`
+        — and the Pascal port models `okConstFactor` as a bit on
+        `parseFlags`.  Land separately once the AggInfo branch's
+        column-cache scaffolding is in place.
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     sqlite3ExprCodeTarget — TK_COLLATE / TK_SPAN / TK_UPLUS unary
     delegate arms + expr_code_doover dispatch loop.**  Continues the
     vertical-slice walk through `sqlite3ExprCodeTarget`'s arms.  Lands

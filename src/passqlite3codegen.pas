@@ -1735,6 +1735,8 @@ function  sqlite3ExprIsInteger(const p: PExpr; pValue: Pi32;
 function  sqlite3ExprIsConstant(pParse: PParse; p: PExpr): i32;
 function  sqlite3ExprCodeRunJustOnce(pParse: PParse; pExpr: PExpr;
   regDest: i32): i32;
+function  sqlite3ExprCodeTemp(pParse: PParse; pExpr: PExpr;
+  pReg: Pi32): i32;
 
 { Dequoting }
 procedure sqlite3DequoteExpr(p: PExpr);
@@ -3693,15 +3695,22 @@ end;
 function sqlite3ExprCodeTarget(pParse: PParse; pExpr: PExpr;
   target: i32): i32;
 var
-  v:     PVdbe;
-  op:    u8;
-  z:     PAnsiChar;
-  zBlob: PAnsiChar;
-  n:     i32;
-  done:  Boolean;
+  v:        PVdbe;
+  op:       u8;
+  z:        PAnsiChar;
+  zBlob:    PAnsiChar;
+  n:        i32;
+  done:     Boolean;
+  r1:       i32;
+  regFree1: i32;
+  addr:     i32;
+  isTrue:   i32;
+  bNormal:  i32;
 begin
   Result := target;
   v := pParse^.pVdbe;
+  r1 := 0;
+  regFree1 := 0;
 
   { expr_code_doover dispatch loop — mirrors the C label/goto pattern
     in expr.c:4930.  The TK_COLLATE (with EP_Collate) and TK_SPAN /
@@ -3795,12 +3804,80 @@ begin
           pExpr := pExpr^.pLeft;
           { fall through to next loop iteration — re-dispatch }
         end;
+      TK_NULL:
+        begin
+          { Faithful port of expr.c default arm (5187..5192) when op==TK_NULL.
+            Made explicit here so the default arm can tighten its assert. }
+          sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+          done := True;
+        end;
+      TK_CAST:
+        begin
+          { Faithful port of expr.c:5151..5159 (CAST(pLeft AS token)).
+            Code pLeft into target, then emit OP_Cast with the affinity
+            byte derived from the type-token. }
+          sqlite3ExprCode(pParse, pExpr^.pLeft, target);
+          Assert(not ExprHasProperty(pExpr, EP_IntValue));
+          sqlite3VdbeAddOp2(v, OP_Cast, target,
+            i32(Ord(sqlite3AffinityType(pExpr^.u.zToken, nil))));
+          done := True;
+        end;
+      TK_BITNOT, TK_NOT:
+        begin
+          { Faithful port of expr.c:5348..5355.  TK_BITNOT==OP_BitNot,
+            TK_NOT==OP_Not — opcode value reused as the case selector
+            (verified at unit-load by SizeOf checks).  Codegen: code
+            pLeft into a temp, emit op into target, release temp. }
+          Assert(TK_BITNOT = OP_BitNot);
+          Assert(TK_NOT    = OP_Not);
+          r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft, @regFree1);
+          sqlite3VdbeAddOp2(v, op, r1, target);
+          if regFree1 <> 0 then
+            sqlite3ReleaseTempReg(pParse, regFree1);
+          done := True;
+        end;
+      TK_TRUTH:
+        begin
+          { Faithful port of expr.c:5357..5367.  IS [NOT] {TRUE|FALSE}.
+            isTrue := truth-value of pRight; bNormal := (op2==TK_IS).
+            OP_IsTrue P1 P2 P3 P4 evaluates: P2 := IsTrue(reg[P1])
+              then if (P3) flip, then if (P4) negate result.
+            Encoding: jump-tag (P3) is `not isTrue`, P4 is `isTrue XOR bNormal`. }
+          r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft, @regFree1);
+          isTrue  := sqlite3ExprTruthValue(pExpr^.pRight);
+          if pExpr^.op2 = TK_IS then bNormal := 1 else bNormal := 0;
+          sqlite3VdbeAddOp4Int(v, OP_IsTrue, r1, target,
+            i32(Ord(isTrue = 0)), isTrue xor bNormal);
+          if regFree1 <> 0 then
+            sqlite3ReleaseTempReg(pParse, regFree1);
+          done := True;
+        end;
+      TK_ISNULL, TK_NOTNULL:
+        begin
+          { Faithful port of expr.c:5369..5383.  TK_ISNULL==OP_IsNull,
+            TK_NOTNULL==OP_NotNull — opcode value reused as the case
+            selector.  Result := 1; if pLeft IS [NOT] NULL: jump over
+            the next op (which sets Result := 0). }
+          Assert(TK_ISNULL  = OP_IsNull);
+          Assert(TK_NOTNULL = OP_NotNull);
+          sqlite3VdbeAddOp2(v, OP_Integer, 1, target);
+          r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft, @regFree1);
+          addr := sqlite3VdbeAddOp1(v, op, r1);
+          sqlite3VdbeAddOp2(v, OP_Integer, 0, target);
+          sqlite3VdbeJumpHere(v, addr);
+          if regFree1 <> 0 then
+            sqlite3ReleaseTempReg(pParse, regFree1);
+          done := True;
+        end;
     else
-      { TODO(Phase 6.9-bis): TK_COLUMN, TK_AGG_COLUMN, TK_CAST,
+      { TODO(Phase 6.9-bis): TK_COLUMN, TK_AGG_COLUMN,
         TK_LT…TK_GT comparison cluster, TK_AND/TK_OR, TK_PLUS/TK_MINUS/…,
-        TK_FUNCTION, TK_CASE, TK_IN, TK_EXISTS, TK_SELECT, … — land in
-        subsequent vertical-slice sub-progress.  For now use the C
-        default arm: emit OP_Null so an unsupported op cannot crash. }
+        TK_FUNCTION, TK_CASE, TK_IN, TK_EXISTS, TK_SELECT,
+        TK_IF_NULL_ROW, … — land in subsequent vertical-slice
+        sub-progresses.  C default arm semantics: assert
+        (op==TK_NULL || op==TK_ERROR || mallocFailed) then emit OP_Null.
+        TK_NULL is now its own arm above; TK_ERROR is rare;
+        mallocFailed is a hard error path. }
       sqlite3VdbeAddOp2(v, OP_Null, 0, target);
       done := True;
     end;
@@ -4433,6 +4510,42 @@ begin
     pParse^.pConstExpr := p;
   end;
   Result := regDest;
+end;
+
+{ sqlite3ExprCodeTemp — port of expr.c:5856..5877.  Code an expression
+  into a temporary register; on return, *pReg holds the temp register
+  number to release later, or 0 if the result lives in a register the
+  caller does not own (constant factored into init section, or a
+  TK_REGISTER alias).  Constant-factor short-circuit goes via
+  sqlite3ExprCodeRunJustOnce. }
+function sqlite3ExprCodeTemp(pParse: PParse; pExpr: PExpr;
+  pReg: Pi32): i32;
+var
+  r1, r2: i32;
+  pX:     PExpr;
+begin
+  pX := sqlite3ExprSkipCollateAndLikely(pExpr);
+  if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
+     and (pX <> nil)
+     and (pX^.op <> TK_REGISTER)
+     and (sqlite3ExprIsConstantNotJoin(pParse, pX) <> 0) then
+  begin
+    pReg^ := 0;
+    r2 := sqlite3ExprCodeRunJustOnce(pParse, pX, -1);
+  end
+  else
+  begin
+    r1 := sqlite3GetTempReg(pParse);
+    r2 := sqlite3ExprCodeTarget(pParse, pExpr, r1);
+    if r2 = r1 then
+      pReg^ := r1
+    else
+    begin
+      sqlite3ReleaseTempReg(pParse, r1);
+      pReg^ := 0;
+    end;
+  end;
+  Result := r2;
 end;
 
 // ---------------------------------------------------------------------------
