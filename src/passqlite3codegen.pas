@@ -3067,6 +3067,13 @@ type TEdupBuf = record zAlloc: PByte; end;
 function exprDup_(db: PTsqlite3; const p: PExpr; dupFlags: i32;
   pEdupBuf: Pointer): PExpr; forward;
 
+{ Forward decls for file-private codegen helpers used by
+  sqlite3ExprCodeTarget but defined further down in the unit. }
+function exprComputeOperands(pParse: PParse; pExpr: PExpr;
+  pR1, pR2, pFree1, pFree2: Pi32): i32; forward;
+function codeCompare(pParse: PParse; pLeft, pRight: PExpr;
+  opcode, in1, in2, dest, jumpIfNull, isCommuted: i32): i32; forward;
+
 function exprDup_(db: PTsqlite3; const p: PExpr; dupFlags: i32;
   pEdupBuf: Pointer): PExpr;
 var
@@ -3695,22 +3702,28 @@ end;
 function sqlite3ExprCodeTarget(pParse: PParse; pExpr: PExpr;
   target: i32): i32;
 var
-  v:        PVdbe;
-  op:       u8;
-  z:        PAnsiChar;
-  zBlob:    PAnsiChar;
-  n:        i32;
-  done:     Boolean;
-  r1:       i32;
-  regFree1: i32;
-  addr:     i32;
-  isTrue:   i32;
-  bNormal:  i32;
+  v:          PVdbe;
+  op:         u8;
+  z:          PAnsiChar;
+  zBlob:      PAnsiChar;
+  n:          i32;
+  done:       Boolean;
+  r1, r2:     i32;
+  regFree1:   i32;
+  regFree2:   i32;
+  addr:       i32;
+  addrIsNull: i32;
+  isTrue:     i32;
+  bNormal:    i32;
+  p5:         i32;
+  pLeft:      PExpr;
 begin
   Result := target;
   v := pParse^.pVdbe;
   r1 := 0;
+  r2 := 0;
   regFree1 := 0;
+  regFree2 := 0;
 
   { expr_code_doover dispatch loop — mirrors the C label/goto pattern
     in expr.c:4930.  The TK_COLLATE (with EP_Collate) and TK_SPAN /
@@ -3852,6 +3865,121 @@ begin
             sqlite3ReleaseTempReg(pParse, regFree1);
           done := True;
         end;
+      TK_IS, TK_ISNOT,
+      TK_LT, TK_LE, TK_GT_TK, TK_GE, TK_NE, TK_EQ:
+        begin
+          { Faithful port of expr.c:5161..5208.  TK_IS / TK_ISNOT fold
+            into TK_EQ / TK_NE with p5=SQLITE_NULLEQ ("NULLs compare
+            equal").  All other arms keep p5=0.  The vector-compare
+            fast path (codeVectorCompare) is not yet ported; once
+            sqlite3ExprIsVector returns true here the arm degrades to
+            OP_Null — vector EQ inside a non-row-value WHERE clause
+            does not arise on the corpus this slice gates on.
+
+            Sub-select short-circuit: when EP_Subquery is set and we are
+            *not* in NULLEQ mode, exprComputeOperands codes the cheaper
+            operand first and returns the address of an OP_IsNull jump
+            that bypasses the expensive operand if the cheap one is NULL.
+            The +2 displacement on codeCompare's dest argument lands the
+            short-circuit two instructions past the comparison — over
+            the OP_ZeroOrNull / OP_Integer that produces the result. }
+          if op = TK_IS then
+          begin op := TK_EQ; p5 := i32(SQLITE_NULLEQ); end
+          else if op = TK_ISNOT then
+          begin op := TK_NE; p5 := i32(SQLITE_NULLEQ); end
+          else
+            p5 := 0;
+          pLeft := pExpr^.pLeft;
+          addrIsNull := 0;
+          if sqlite3ExprIsVector(pLeft) <> 0 then
+          begin
+            { TODO(11g.2.b): port codeVectorCompare; for now degrade
+              to OP_Null so the dispatch is total. }
+            sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+          end
+          else
+          begin
+            if ExprHasProperty(pExpr, EP_Subquery)
+               and (p5 <> i32(SQLITE_NULLEQ)) then
+              addrIsNull := exprComputeOperands(pParse, pExpr,
+                              @r1, @r2, @regFree1, @regFree2)
+            else
+            begin
+              r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft, @regFree1);
+              r2 := sqlite3ExprCodeTemp(pParse, pExpr^.pRight, @regFree2);
+            end;
+            sqlite3VdbeAddOp2(v, OP_Integer, 1, target);
+            Assert(TK_LT = OP_Lt); Assert(TK_LE = OP_Le);
+            Assert(TK_GT_TK = OP_Gt); Assert(TK_GE = OP_Ge);
+            Assert(TK_EQ = OP_Eq); Assert(TK_NE = OP_Ne);
+            if ExprHasProperty(pExpr, EP_Commuted) then
+              codeCompare(pParse, pLeft, pExpr^.pRight, op, r1, r2,
+                          sqlite3VdbeCurrentAddr(v) + 2, p5, 1)
+            else
+              codeCompare(pParse, pLeft, pExpr^.pRight, op, r1, r2,
+                          sqlite3VdbeCurrentAddr(v) + 2, p5, 0);
+            if p5 = i32(SQLITE_NULLEQ) then
+              sqlite3VdbeAddOp2(v, OP_Integer, 0, target)
+            else
+            begin
+              sqlite3VdbeAddOp3(v, OP_ZeroOrNull, r1, target, r2);
+              if addrIsNull <> 0 then
+              begin
+                sqlite3VdbeAddOp2(v, OP_Goto, 0,
+                                  sqlite3VdbeCurrentAddr(v) + 2);
+                sqlite3VdbeJumpHere(v, addrIsNull);
+                sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+              end;
+            end;
+          end;
+          if regFree1 <> 0 then
+          begin sqlite3ReleaseTempReg(pParse, regFree1); regFree1 := 0; end;
+          if regFree2 <> 0 then
+          begin sqlite3ReleaseTempReg(pParse, regFree2); regFree2 := 0; end;
+          done := True;
+        end;
+      TK_PLUS,  TK_STAR,   TK_MINUS, TK_REM,
+      TK_BITAND, TK_BITOR, TK_SLASH, TK_LSHIFT, TK_RSHIFT,
+      TK_CONCAT:
+        begin
+          { Faithful port of expr.c:5210..5246.  Token values for the
+            binary arithmetic / bitwise / concat operators line up with
+            the corresponding VDBE opcodes (TK_PLUS==OP_Add and so on),
+            so `op` is reused directly as the OP3 selector.  Sub-select
+            short-circuit mirrors the comparison cluster but emits an
+            OP_Null tail instead of OP_Integer 0. }
+          Assert(TK_PLUS    = OP_Add);
+          Assert(TK_MINUS   = OP_Subtract);
+          Assert(TK_REM     = OP_Remainder);
+          Assert(TK_BITAND  = OP_BitAnd);
+          Assert(TK_BITOR   = OP_BitOr);
+          Assert(TK_SLASH   = OP_Divide);
+          Assert(TK_LSHIFT  = OP_ShiftLeft);
+          Assert(TK_RSHIFT  = OP_ShiftRight);
+          Assert(TK_CONCAT  = OP_Concat);
+          if ExprHasProperty(pExpr, EP_Subquery) then
+            addrIsNull := exprComputeOperands(pParse, pExpr,
+                            @r1, @r2, @regFree1, @regFree2)
+          else
+          begin
+            r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft,  @regFree1);
+            r2 := sqlite3ExprCodeTemp(pParse, pExpr^.pRight, @regFree2);
+            addrIsNull := 0;
+          end;
+          sqlite3VdbeAddOp3(v, op, r2, r1, target);
+          if addrIsNull <> 0 then
+          begin
+            sqlite3VdbeAddOp2(v, OP_Goto, 0,
+                              sqlite3VdbeCurrentAddr(v) + 2);
+            sqlite3VdbeJumpHere(v, addrIsNull);
+            sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+          end;
+          if regFree1 <> 0 then
+          begin sqlite3ReleaseTempReg(pParse, regFree1); regFree1 := 0; end;
+          if regFree2 <> 0 then
+          begin sqlite3ReleaseTempReg(pParse, regFree2); regFree2 := 0; end;
+          done := True;
+        end;
       TK_ISNULL, TK_NOTNULL:
         begin
           { Faithful port of expr.c:5369..5383.  TK_ISNULL==OP_IsNull,
@@ -3871,7 +3999,7 @@ begin
         end;
     else
       { TODO(Phase 6.9-bis): TK_COLUMN, TK_AGG_COLUMN,
-        TK_LT…TK_GT comparison cluster, TK_AND/TK_OR, TK_PLUS/TK_MINUS/…,
+        TK_AND/TK_OR,
         TK_FUNCTION, TK_CASE, TK_IN, TK_EXISTS, TK_SELECT,
         TK_IF_NULL_ROW, … — land in subsequent vertical-slice
         sub-progresses.  C default arm semantics: assert
@@ -4019,6 +4147,52 @@ begin
     Result := 1
   else
     Result := 0;
+end;
+
+{ exprComputeOperands — port of expr.c:2417..2464.  File-private helper
+  for the binary-operator code paths in sqlite3ExprCodeTarget.  Computes
+  the two operands of a binary expression into pR1^/pR2^ (with their
+  free-temp registers pFree1^/pFree2^) and returns the address of an
+  OP_IsNull short-circuit jump if a sub-select short-circuit was set
+  up, else 0.  Mirrors the C exactly: when the LHS holds a (possibly
+  expensive) sub-select and the RHS does not, code the RHS first and
+  jump over the LHS if it is NULL.  After coding the LHS, optionally
+  also short-circuit on RHS being a sub-select and the LHS being NULL.
+
+  Caller is responsible for emitting the OP_Goto/OP_Null tail when the
+  returned address is non-zero (see comparison / arithmetic arms). }
+function exprComputeOperands(pParse: PParse; pExpr: PExpr;
+  pR1, pR2, pFree1, pFree2: Pi32): i32;
+var
+  v:          PVdbe;
+  r1, r2:     i32;
+  addrIsNull: i32;
+begin
+  v := pParse^.pVdbe;
+  Assert(v <> nil);
+
+  if (exprEvalRhsFirst(pExpr) <> 0)
+     and (sqlite3ExprCanBeNull(pExpr^.pRight) <> 0) then
+  begin
+    r2 := sqlite3ExprCodeTemp(pParse, pExpr^.pRight, pFree2);
+    addrIsNull := sqlite3VdbeAddOp1(v, OP_IsNull, r2);
+  end
+  else
+  begin
+    r2 := 0;
+    addrIsNull := 0;
+  end;
+  r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft, pFree1);
+  if addrIsNull = 0 then
+  begin
+    if ExprHasProperty(pExpr^.pRight, EP_Subquery)
+       and (sqlite3ExprCanBeNull(pExpr^.pLeft) <> 0) then
+      addrIsNull := sqlite3VdbeAddOp1(v, OP_IsNull, r1);
+    r2 := sqlite3ExprCodeTemp(pParse, pExpr^.pRight, pFree2);
+  end;
+  pR1^ := r1;
+  pR2^ := r2;
+  Result := addrIsNull;
 end;
 
 function sqlite3IsRowid(z: PAnsiChar): i32;

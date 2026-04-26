@@ -51,10 +51,18 @@ remains `history.md`.  This file is the punch list.
     sqlite3ExprCanBeNull, sqlite3ExprCodeTemp + 6 unary arms,
     TK_COLLATE/TK_SPAN/TK_UPLUS arms) are already landed.
     Outstanding sub-progress before this slice closes:
-    - [ ] Port `exprComputeOperands` (expr.c:5066..5095) and
-      `exprCodeBetween`; then land the comparison cluster
-      (TK_LT..TK_EQ) and arithmetic cluster (TK_PLUS..TK_CONCAT) in
-      `sqlite3ExprCodeTarget`.
+    - [X] Port `exprComputeOperands` (expr.c:2417..2464) and land
+      the comparison cluster (TK_IS/TK_ISNOT/TK_LT..TK_EQ) plus the
+      arithmetic cluster (TK_PLUS..TK_CONCAT, incl. TK_STAR/TK_REM/
+      TK_BITAND/TK_BITOR/TK_SLASH/TK_LSHIFT/TK_RSHIFT) in
+      `sqlite3ExprCodeTarget`.  (Done — codegen.pas:3859..3979.)
+      Note: `exprCodeBetween` deferred — depends on the still-unported
+      `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` recursive jump pair;
+      track separately under the IfTrue/IfFalse sub-bullet below.
+      Also note: vector-comparison fast path (`codeVectorCompare`)
+      stubbed to OP_Null inside the comparison arm — vector EQ inside
+      a non-row-value WHERE clause does not arise on the corpus this
+      slice gates on, so the stub is acceptable until 11g.2.e.
     - [ ] Port the recursive jump pair `sqlite3ExprIfTrue` /
       `sqlite3ExprIfFalse` (expr.c:6100..6500-ish, ~400 lines).
     - [ ] Port the False-WHERE-Term-Bypass loop in `sqlite3WhereBegin`
