@@ -192,8 +192,50 @@ begin
           'argument 3rd is invalid');
 end;
 
+{ Phase 6.bis.4b.2c — %f / %e / %E / %g / %G float conversions.  Each
+  expected value below was produced by sqlite3_mprintf(fmt, val) running
+  against the C reference build (libsqlite3.so) — these are *canonical*
+  SQLite outputs, not libc snprintf outputs.  They differ from libc in a
+  few places (notably "%.0f" of 2.5 → "3" via round-half-up vs libc's
+  banker rounding "2"). }
+procedure TestFloat;
 begin
-  WriteLn('=== TestPrintf — Phase 6.bis.4a printf engine ===');
+  CheckEq('T58 %f 3.14',         sqlite3FormatStr('%f', [3.14]),       '3.140000');
+  CheckEq('T59 %f 0.0',          sqlite3FormatStr('%f', [0.0]),        '0.000000');
+  CheckEq('T60 %f -3.14',        sqlite3FormatStr('%f', [-3.14]),      '-3.140000');
+  CheckEq('T61 %.2f 3.14159',    sqlite3FormatStr('%.2f', [3.14159]),  '3.14');
+  CheckEq('T62 %10.2f',          sqlite3FormatStr('%10.2f', [3.14]),   '      3.14');
+  CheckEq('T63 %-10.2f',         sqlite3FormatStr('%-10.2f', [3.14]),  '3.14      ');
+  CheckEq('T64 %010.2f',         sqlite3FormatStr('%010.2f', [3.14]),  '0000003.14');
+  CheckEq('T65 %+.2f',           sqlite3FormatStr('%+.2f', [3.14]),    '+3.14');
+  CheckEq('T66 %e 314.0',        sqlite3FormatStr('%e', [314.0]),      '3.140000e+02');
+  CheckEq('T67 %E 314.0',        sqlite3FormatStr('%E', [314.0]),      '3.140000E+02');
+  CheckEq('T68 %.2e 314.159',    sqlite3FormatStr('%.2e', [314.159]),  '3.14e+02');
+  CheckEq('T69 %g 314.0',        sqlite3FormatStr('%g', [314.0]),      '314');
+  CheckEq('T70 %g 0.0001',       sqlite3FormatStr('%g', [0.0001]),     '0.0001');
+  CheckEq('T71 %g 0.00001',      sqlite3FormatStr('%g', [0.00001]),    '1e-05');
+  CheckEq('T72 %g 1e10',         sqlite3FormatStr('%g', [1e10]),       '1e+10');
+  CheckEq('T73 %.3g 314.159',    sqlite3FormatStr('%.3g', [314.159]),  '314');
+  CheckEq('T74 %.6g 1.5',        sqlite3FormatStr('%.6g', [1.5]),      '1.5');
+  CheckEq('T75 %f 0.1',          sqlite3FormatStr('%f', [0.1]),        '0.100000');
+  CheckEq('T76 %f 1.5',          sqlite3FormatStr('%f', [1.5]),        '1.500000');
+  { Round-half-up — SQLite-specific (libc does banker rounding here). }
+  CheckEq('T77 %.0f 2.5 → 3',    sqlite3FormatStr('%.0f', [2.5]),      '3');
+  CheckEq('T78 %.0f 1.5 → 2',    sqlite3FormatStr('%.0f', [1.5]),      '2');
+  CheckEq('T79 %f -0.5',         sqlite3FormatStr('%f', [-0.5]),       '-0.500000');
+  CheckEq('T80 %f 1e-10',        sqlite3FormatStr('%f', [1e-10]),      '0.000000');
+  CheckEq('T81 %g 1e-5',         sqlite3FormatStr('%g', [1e-5]),       '1e-05');
+  CheckEq('T82 %e 1.0',          sqlite3FormatStr('%e', [1.0]),        '1.000000e+00');
+  CheckEq('T83 %e 1234567890.0', sqlite3FormatStr('%e', [1234567890.0]), '1.234568e+09');
+  CheckEq('T84 %.20f 0.1',       sqlite3FormatStr('%.20f', [0.1]),     '0.10000000000000000000');
+  CheckEq('T85 %g 1.0',          sqlite3FormatStr('%g', [1.0]),        '1');
+  CheckEq('T86 %f 100.0',        sqlite3FormatStr('%f', [100.0]),      '100.000000');
+  CheckEq('T87 %.4f 0.0',        sqlite3FormatStr('%.4f', [0.0]),      '0.0000');
+  CheckEq('T88 %g 0.0',          sqlite3FormatStr('%g', [0.0]),        '0');
+end;
+
+begin
+  WriteLn('=== TestPrintf — Phase 6.bis.4a/b printf engine ===');
   TestBasics;
   TestWidthPrecision;
   TestRadix;
@@ -205,6 +247,7 @@ begin
   TestHeapWrappers;
   TestSWidth;
   TestOrdinal;
+  TestFloat;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);

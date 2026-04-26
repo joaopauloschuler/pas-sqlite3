@@ -20,6 +20,99 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.4b.2c float conversions.**  Lands the
+    bulk of the remaining 6.bis.4b work — `%f` / `%e` / `%E` / `%g` /
+    `%G` are now wired into the printf engine.  Faithful port of
+    `sqlite3FpDecode` (util.c:1380) plus its dependencies, so float
+    output matches the C reference's bespoke decimal renderer
+    byte-for-byte instead of falling back to libc snprintf.
+
+    New machinery in `src/passqlite3printf.pas` (~330 lines added):
+      * `multiply128` — 64x64→128 unsigned multiply, pure-Pascal
+        version of util.c's non-intrinsic fallback (FPC has no native
+        u128 type).
+      * `multiply160` — 96x64→160 multiply used by `powerOfTen` for
+        |p| > 26.
+      * `powerOfTen` (-348..+347) — copies the three big tables
+        verbatim (`aBase[27]`, `aScale[26]`, `aScaleLo[26]`).
+      * `pwr10to2` / `pwr2to10` — uses `SarLongint` for arithmetic
+        right shift on signed inputs (FPC's `shr` is logical, but the
+        C reference relies on signed-arithmetic-shift semantics).
+      * `countLeadingZeros` — pure-Pascal bit-test fallback.
+      * `fp2Convert10` — m*pow(2,e) → d*pow(10,p).
+      * `fpDecode` — the entry point.  Mirrors util.c exactly modulo
+        the iRound==17 round-trip optimization noted below.
+      * `renderFloat` — port of the etFLOAT/etEXP/etGENERIC branch
+        from printf.c:528..738.  Handles `flag_dp` / `flag_rtz`
+        (remove trailing zeros), generic→float/exp dispatch on
+        magnitude, `e±NN` exponent suffix.
+
+    Wiring in the conversion switch (`'f'`, `'e'`, `'E'`, `'g'`, `'G'`
+    arms): default precision 6, Inf/NaN special handling (`-Inf` /
+    `+Inf` / ` Inf`, `NaN` (or `null` under zeropad-Inf)), the
+    `#` + zero-display sign-suppression rule from printf.c:579..597,
+    and `emitField`-driven width / zero-pad / left-align so the
+    pre-existing flag handling stays consistent across conversions.
+    The `!` (altform2) flag now also propagates — adds a 20-digit
+    precision ceiling instead of the default 16.
+
+    Skipped (deliberately, with a comment in the header):
+      * The iRound==17 round-trip optimization that uses
+        `sqlite3Fp10Convert2` to find the *shortest* representation
+        for `%!.17g` / altform2 paths.  FpDecode without it is still
+        faithful — it just doesn't try to shave trailing 9s/0s back
+        to a shorter round-trip value.  Affects only `%!.17g`-style
+        rendering of certain doubles; `.dump` does not exercise it.
+        Easy follow-up if a future callsite needs it; the renderer
+        signature is already wired.
+
+    Concrete changes:
+      * `src/passqlite3printf.pas` — new section "Floating-point
+        decode" before the core renderer.  Header doc-comment
+        rewritten to list the float conversions and re-scope the
+        deferred items.
+      * `src/tests/TestPrintf.pas` — adds `TestFloat` with T58..T88
+        (31 new asserts).  Expected values are *canonical SQLite*
+        outputs (built via `sqlite3_mprintf` against the oracle
+        `libsqlite3.so`), not libc snprintf — so e.g. T77 expects
+        `%.0f` of 2.5 → `3` (round-half-up, SQLite-specific) rather
+        than libc's banker-rounded `2`.  **92/92 PASS** (was 61/61).
+      * Full regression spot check: TestVtab 216/216, TestCarray
+        66/66, TestDbpage 68/68, TestDbstat 83/83, TestVdbeVtabExec
+        50/50 — all green, no regressions.
+
+    Discoveries / next-step notes:
+      * FPC quirk worth memoising: `Dec(precision)` on a value
+        parameter inside a procedure with nested sub-procedures hits
+        a parser error ("Illegal expression"); rewrote as
+        `precision := precision - 1`.  Plain assignment is the
+        portable form when the parameter is referenced by inner
+        scopes.
+      * FPC `shr` on signed types is logical (zero-fill), not
+        arithmetic (sign-fill).  C's `>>` on signed `int` is
+        implementation-defined but on x86 GCC is arithmetic.  The
+        `pwr10to2` / `pwr2to10` ratios depend on arithmetic shift
+        for negative inputs.  `SarLongint(value, bits)` (in `system`)
+        is the right primitive — produced bit-identical results.
+      * Real-literal constants like `1.0/3.0` in `array of const`
+        appear to box as `vtExtended` but the *constant evaluation*
+        happens at Single precision under default OBJFPC mode (the
+        `1.0/3.0` literal in test code yields `3.33333343...e-1`,
+        which is a Single value re-widened).  Doesn't affect printf
+        correctness — the engine renders whatever Double it
+        receives — but it bit users writing tests that pass
+        compile-time real expressions.  Pass through a typed `Double`
+        local to avoid the surprise.
+      * `multiply160` is only exercised when `|p| > 26` in
+        `powerOfTen`, which corresponds to extreme-magnitude doubles
+        (≈ ±1e26 and beyond).  The T72 (`%g 1e10`) test sits below
+        that threshold.  Added T-block coverage at 1.23456789e20 /
+        1.23456789e-20 in spot tests (off-tree) — both round-trip
+        cleanly.
+      * Remaining 6.bis.4b items: only **6.bis.4b.2b** (`%S` SrcItem)
+        stays open, blocked by Phase 7's `TSrcItem` layout.  Trivial
+        ~10-line addition once that lands.
+
   - **2026-04-26 — Phase 6.bis.4b.2a `%r` ordinal conversion.**  Lands
     the first follow-up half of 6.bis.4b.2 (the part the prior slice
     flagged as ship-able independently of the float work).  Faithful
@@ -3872,15 +3965,21 @@ Phase 5.9 depends on this being done first.
     block at line 120..124).  Trivial 10-line addition once the
     layout is stable; no float dependency.
 
-  - [ ] **6.bis.4b.2c** Float conversions (`%f %e %E %g %G`).  Float
-    printing must round-trip SQLite's bespoke `sqlite3FpDecode` /
-    `sqlite3Fp2Convert10` rendering (`util.c:1380` + `printf.c:528..738`)
-    — *not* plain libc snprintf — to keep `.dump` byte-identical
-    with the C reference.  Substantial port: needs
-    `sqlite3Multiply128` (util.c), `powerOfTen` table, `pwr10to2` /
-    `pwr2to10` helpers, `countLeadingZeros`, plus the etFLOAT/etEXP/
-    etGENERIC ~210-line renderer.  Ship as its own slice with float
-    round-trip vectors.
+  - [X] **6.bis.4b.2c** Float conversions (`%f %e %E %g %G`).  DONE
+    2026-04-26.  Faithful port of `sqlite3FpDecode` (util.c:1380) +
+    deps (`multiply128` / `multiply160` / `powerOfTen` 3-table set /
+    `pwr10to2` / `pwr2to10` / `countLeadingZeros` / `fp2Convert10`)
+    plus the etFLOAT/etEXP/etGENERIC renderer (`renderFloat`).  `%f`
+    `%e` `%E` `%g` `%G` wired into the conversion switch with
+    Inf/NaN special handling and altform2 (`!`) for 20-digit
+    precision.  `passqlite3printf.pas` grew by ~330 lines.
+    `TestPrintf` extended with T58..T88 (31 asserts) against
+    canonical SQLite reference output — **92/92 PASS** (was 61/61).
+    Skipped: iRound==17 round-trip optimization (only affects
+    `%!.17g`-style rendering — see header comment in
+    passqlite3printf.pas).  No regressions across TestVtab 216/216,
+    TestCarray 66/66, TestDbpage 68/68, TestDbstat 83/83,
+    TestVdbeVtabExec 50/50.
 
 - [ ] **6.9** `TestExplainParity.pas`: for the full SQL corpus, `EXPLAIN` each
   statement via Pascal and via C; diff the opcode listings. This is the single
