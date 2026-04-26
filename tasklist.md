@@ -20,6 +20,109 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 8): sqlite3CreateIndex
+    structural port (build.c:3941).**  Replaces the 3-line free-only
+    stub at `passqlite3codegen.pas:6633` with a faithful structural
+    port of the CREATE [UNIQUE] INDEX [IF NOT EXISTS] codegen path.
+
+    Concrete changes:
+      * `src/passqlite3codegen.pas`:
+        - `sqlite3CreateIndex` (was a 3-line free stub): full
+          structural port of build.c:3941..4531.  Reachable arms
+          today: nErr / IN_DECLARE_VTAB / ReadSchema /
+          HasExplicitNulls early outs; pTblName != nil →
+          TwoPartName / SrcListLookup / FixInit / FixSrcList /
+          LocateTableItem; sqlite_-prefix / view / vtab guards;
+          name-from-token + dequote + CheckObjectName; collision
+          checks against FindTable + FindIndex (IF NOT EXISTS arm
+          lights up CodeVerifySchema + ForceNotReadOnly); auth
+          (SQLITE_INSERT_AUTH on schema table → SQLITE_CREATE_INDEX
+          / SQLITE_CREATE_TEMP_INDEX); Index allocation via
+          `sqlite3AllocateIndexObject` with minimal population
+          (zName, pTable, onError, idxFlags, pSchema,
+          pPartIdxWhere); `sqlite3DefaultRowEst`; codegen block:
+          BeginWriteOperation, OP_Noop saved into `pIndex^.tnum`,
+          OP_CreateBtree (BLOBKEY=2), structural NestedParse for
+          the schema-row INSERT, ChangeCookie, OP_ParseSchema,
+          OP_Expire, JumpHere on Noop; index-list link
+          (`db^.init.busy != 0` or `pTblName=nil` → push onto
+          `pTab^.pIndex` chain); IN_RENAME_OBJECT pNewIndex pin.
+          Same `eOpenState <> $76` test-scaffold gate as
+          DropIndex / DropTable / StartTable / EndTable.
+        - `passqlite3printf` added to `implementation uses` clause
+          (codegen now needs `sqlite3MPrintf` for the auto-name +
+          schema-row CREATE-INDEX statement text).
+
+    **Deferred branches** (gated on still-stub helpers; documented
+    in the function banner):
+      * Auto-name from PRIMARY KEY / UNIQUE — uses placeholder
+        `sqlite_autoindex_<tab>_1` instead of walking pTab^.pIndex
+        and counting; doesn't matter today since AddColumn /
+        AddPrimaryKey are stubs so the implicit-index path is
+        unreachable.
+      * Column iteration loop (build.c:4152..4272) — needs real
+        columns from AddColumn + `sqlite3StringToId` +
+        `sqlite3ColumnColl` (the latter two missing entirely).
+      * pPk / WITHOUT ROWID column extension (build.c:4278).
+      * Covering-index detection + `recomputeColumnsNotIndexed`.
+      * Equivalent-constraint dedup loop (build.c:4337) — only
+        fires on CREATE TABLE … UNIQUE.
+      * `sqlite3RefillIndex` — not yet ported; no-op here means
+        new btree won't actually be filled until that helper lands.
+      * `sqlite3IndexHasDuplicateRootPage` on init.busy path.
+      * Schema-row INSERT NestedParse — structural call lands now;
+        will fire automatically once NestedParse is real.
+      * REPLACE-index reorder loop (build.c:4498..4525).
+
+    Tests: full build clean.  TestExplainParity: **2 PASS / 8
+    DIVERGE / 0 ERROR** (unchanged from step 7).  CREATE INDEX
+    rows now report "Pascal prepare returned nil Vdbe" (was "op
+    count: C=37 Pas=3") because `sqlite3LocateTableItem("t")`
+    fails — the seed CREATE TABLEs never publish to `tblHash`
+    (NestedParse-driven schema-row UPDATE is still a stub, so
+    OP_ParseSchema reads only the nullRow blob).  This is the
+    *honest* status: until NestedParse is real, the new structural
+    body cannot reach its codegen block.  Both pre and post are
+    DIVERGE; the structural port is groundwork for the
+    NestedParse landing.  Regression spot check (2026-04-26):
+    TestPrepareBasic 20/20, TestParser 45/45, TestParserSmoke
+    20/20, TestSchemaBasic 44/44, TestVdbeApi 57/57, TestDMLBasic
+    54/54, TestSelectBasic 49/49, TestExprBasic 40/40, TestVdbeTxn
+    8/8, TestAuthBuiltins 34/34, TestOpenClose 17/17, TestSmoke +
+    TestUtil clean, TestJson 434/434, TestJsonEach 50/50,
+    TestJsonRegister 48/48, TestPrintf 105/105, TestVtab 216/216.
+
+    Discoveries / next-step notes:
+      * **`PDb` from `passqlite3util` requires explicit qualification**
+        in codegen var blocks: `pDb: passqlite3util.PDb` (bare `PDb`
+        is rejected with "Identifier not found" because codegen has
+        no PDb forward declaration of its own — same idiom as the
+        existing `pSchemaT: passqlite3util.PSchema` pattern in
+        StartTable / EndTable).
+      * **`sqlite3StrNICmp` does not exist** — the canonical FPC
+        spelling is `sqlite3_strnicmp` (with underscores, in
+        `passqlite3util`).  Watch for this when porting StartTable's
+        sibling routines (CreateView, CreateTrigger, Analyze, etc.
+        all share the `if (sqlite3_strnicmp(zName,"sqlite_",7)==0)`
+        guard).
+      * **`passqlite3printf` is new in codegen's implementation
+        uses.**  Phase 6 codegen had been getting away without it
+        because all prior emitters either bypassed printf entirely
+        or routed through `snpFmt` (FPC RTL Format).  CreateIndex
+        is the first emitter that needs the SQLite-flavour
+        `%Q`/`%s`/`%d` format for the schema-row CREATE INDEX
+        statement text.  Future ports of Insert / Update / Delete
+        codegen will benefit from this being already wired.
+      * **Next 6.9-bis target: `sqlite3NestedParse` structural
+        port.**  Highest-leverage move: flips multiple DIVERGE
+        rows to PASS at once because every CREATE TABLE / CREATE
+        INDEX / DROP TABLE row currently has a ~13-op gap exactly
+        equal to the schema-row UPDATE/INSERT sub-statement that
+        NestedParse emits.  After NestedParse, the
+        `sqlite3StringToId` + `sqlite3ColumnColl` +
+        `sqlite3RefillIndex` trio becomes the next gate to filling
+        the column iteration loop here.
+
   - **2026-04-26 — Phase 6.9-bis (step 7): sqlite3EndTable port
     (build.c:2637).**  Replaces the trivial `{ Phase 7 }` stub at
     `passqlite3codegen.pas:6081` with a structural port of the CREATE
@@ -6277,7 +6380,9 @@ Phase 5.9 depends on this being done first.
   ~~`sqlite3EndTable`~~ done 2026-04-26 (structural port; STRICT /
   GENERATED / CHECK / pSelect / convertToWithoutRowidTable arms
   deferred — see step 7 notes),
-  `sqlite3CreateIndex`,
+  ~~`sqlite3CreateIndex`~~ done 2026-04-26 (structural port; column
+  iteration / pPk extension / RefillIndex / IndexHasDuplicateRootPage /
+  REPLACE-reorder arms deferred — see step 8 notes),
   found-index DropIndex arm helpers `sqlite3NestedParse` (still
   a stub — its real port flips many DELETE/UPDATE sub-statements
   on at once))
@@ -6287,14 +6392,15 @@ Phase 5.9 depends on this being done first.
   (`CREATE TABLE typed`, `CREATE TABLE WITHOUT ROWID`).  Once all
   ten current rows PASS, expand corpus to DML / SELECT / pragma /
   trigger forms (the same exclusion list as TestParser).
-  Status (2026-04-26 step 7): **2 PASS / 8 DIVERGE / 0 ERROR.**
-  DROP INDEX IF EXISTS PASSes (schema_cookie now bumped by the
-  seed CREATE TABLEs via EndTable's ChangeCookie).  CREATE TABLE
-  rows hold at op-count Pascal=17 / C=32–43; the gap is the
-  NestedParse-driven schema-row UPDATE sub-statement (~13 ops).
-  Earlier history: 1/7/2 (step 5) → 1/7/2 (step 6, both ERROR
-  rows flipped to DIVERGE via the MakeReady aMem fix) → 1/9/0
-  (step 6) → 2/8/0 (step 7).
+  Status (2026-04-26 step 8): **2 PASS / 8 DIVERGE / 0 ERROR.**
+  CREATE INDEX rows now report "nil Vdbe" (was "C=37 Pas=3") —
+  honest reflection that LocateTableItem fails because the seed
+  CREATE TABLEs never publish to tblHash (NestedParse stub).
+  CREATE TABLE rows hold at op-count Pascal=17 / C=32–43; the
+  gap is the NestedParse-driven schema-row UPDATE sub-statement
+  (~13 ops).  Earlier history: 1/7/2 (step 5) → 1/7/2 (step 6,
+  both ERROR rows flipped to DIVERGE via the MakeReady aMem fix)
+  → 1/9/0 (step 6) → 2/8/0 (step 7) → 2/8/0 (step 8).
 
 ---
 

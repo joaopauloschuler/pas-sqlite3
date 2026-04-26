@@ -2292,6 +2292,7 @@ implementation
 
 uses
   DateUtils,
+  passqlite3printf,
   passqlite3json,
   passqlite3jsoneach;
 
@@ -6630,14 +6631,313 @@ begin
   { Phase 7 }
 end;
 
+{ sqlite3CreateIndex — port of build.c:3941.
+  Code-gen for `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table(cols)`.
+
+  Structural port — lays the call-graph down so that as the underlying
+  helpers (notably sqlite3NestedParse and the column-aware helpers
+  sqlite3StringToId / sqlite3ColumnColl / sqlite3RefillIndex /
+  sqlite3IndexHasDuplicateRootPage) become real, this body fills in
+  without re-editing.
+
+  Reachable arms today:
+    * IN_DECLARE_VTAB / nErr / ReadSchema / HasExplicitNulls early outs.
+    * pTblName != nil → TwoPartName / SrcListLookup / FixInit /
+      FixSrcList / LocateTableItem.  pTab=nil exit (this is what every
+      CREATE INDEX row in TestExplainParity hits today, because
+      NestedParse is a stub so the seed CREATE TABLEs never publish
+      to tblHash).
+    * sqlite_-prefix / view / vtab guards.
+    * Name-from-token + dequote + CheckObjectName.
+    * Collision check vs FindTable + FindIndex (IF NOT EXISTS arm
+      lights up CodeVerifySchema + ForceNotReadOnly).
+    * Authorisation: SQLITE_INSERT_AUTH on schema table, then
+      SQLITE_CREATE_INDEX / SQLITE_CREATE_TEMP_INDEX.
+    * Index-object allocation via sqlite3AllocateIndexObject; minimal
+      population (zName, pTable, onError, idxFlags, pSchema).
+    * sqlite3DefaultRowEst.
+    * Codegen block (HasRowid || pTblName != nil): BeginWriteOperation,
+      OP_Noop saved into pIndex^.tnum, OP_CreateBtree (BLOBKEY),
+      sqlite3NestedParse for the schema-row INSERT (stub, no ops),
+      sqlite3ChangeCookie, OP_ParseSchema, OP_Expire, JumpHere.
+    * Index-list link (db->init.busy || pTblName==nil → push onto
+      pTab->pIndex chain) + IN_RENAME_OBJECT pNewIndex pin.
+
+  Deferred arms (see banner of sqlite3EndTable for the same family):
+    * Auto-name from PRIMARY KEY / UNIQUE constraint when pList==nil
+      uses a placeholder name (`sqlite_autoindex_<tab>_1`); the real
+      formula walks pTab->pIndex and counts.  Doesn't matter today
+      because pTab->aCol isn't populated either.
+    * Column iteration loop (build.c:4152..4272) — needs real columns
+      from AddColumn + sqlite3StringToId + sqlite3ResolveSelfReference
+      (the latter exists; the former two are stubs).  Without it,
+      pIndex^.aiColumn / azColl / aSortOrder are zero-filled.
+    * pPk / WITHOUT ROWID extension (build.c:4278) — needs a real
+      Primary-Key Index, which AddPrimaryKey doesn't build.
+    * Covering-index detection + recomputeColumnsNotIndexed —
+      same dependency family.
+    * Equivalent-constraint dedup loop (build.c:4337) — only fires
+      when pTab==pParse->pNewTable (CREATE TABLE … UNIQUE), i.e.
+      the implicit-index path which AddPrimaryKey/AddColumn gate.
+    * sqlite3RefillIndex on the codegen path — not yet ported; a
+      no-op here means CREATE INDEX on a populated table doesn't
+      actually fill the new btree.
+    * sqlite3IndexHasDuplicateRootPage check on the init.busy path —
+      not yet ported, so corrupt-schema reparse won't be caught.
+    * Schema-row INSERT NestedParse — structural call lands now;
+      will fire automatically once NestedParse is real.
+    * REPLACE-index reorder loop (build.c:4498..4525) — minor; only
+      matters when multiple OE_Replace indexes coexist.
+
+  Same `eOpenState <> $76` test-scaffold gate as DropIndex /
+  DropTable / StartTable / EndTable. }
 procedure sqlite3CreateIndex(pParse: PParse; const pName1: PToken;
   const pName2: PToken; pTblName: PSrcList; pList: PExprList;
   onError: i32; const pStart: PToken; pPIWhere: PExpr;
   sortOrder: i32; ifNotExist: i32; idxType: u8);
+const
+  BTREE_BLOBKEY_K = 2;        { passqlite3btree.BTREE_BLOBKEY }
+label
+  exit_create_index;
+var
+  pTab:        PTable2;
+  pIndex:      PIndex2;
+  pPk:         PIndex2;
+  zName:       PAnsiChar;
+  zExtra:      PAnsiChar;
+  zStmt:       PAnsiChar;
+  nName:       i32;
+  i, n:        i32;
+  nExtraCol:   i32;
+  iDb:         i32;
+  iMem:        i32;
+  sFix:        TDbFixer;
+  db:          PTsqlite3;
+  pDb:         passqlite3util.PDb;
+  pName:       PToken;
+  v:           PVdbe;
+  pSchemaT:    passqlite3util.PSchema;
 begin
-  sqlite3SrcListDelete(pParse^.db, pTblName);
-  sqlite3ExprListDelete(pParse^.db, pList);
-  sqlite3ExprDelete(pParse^.db, pPIWhere);
+  pTab    := nil;
+  pIndex  := nil;
+  pPk     := nil;
+  zName   := nil;
+  zExtra  := nil;
+  pName   := nil;
+  db      := pParse^.db;
+
+  { Test-scaffold gate (TestParserSmoke and friends use a stub db). }
+  if db^.eOpenState <> $76 then goto exit_create_index;
+
+  if pParse^.nErr <> 0 then goto exit_create_index;
+  if (pParse^.eParseMode = PARSE_MODE_DECLARE_VTAB) and
+     (idxType <> SQLITE_IDXTYPE_PRIMARYKEY) then
+    goto exit_create_index;
+  if sqlite3ReadSchema(pParse) <> SQLITE_OK then goto exit_create_index;
+  if sqlite3HasExplicitNulls(pParse, pList) <> 0 then goto exit_create_index;
+
+  { Find the table that is to be indexed. }
+  if pTblName <> nil then begin
+    iDb := sqlite3TwoPartName(pParse, pName1, pName2, @pName);
+    if iDb < 0 then goto exit_create_index;
+
+{$IFNDEF SQLITE_OMIT_TEMPDB}
+    if db^.init.busy = 0 then begin
+      pTab := sqlite3SrcListLookup(pParse, pTblName);
+      if (pName2 <> nil) and (pName2^.n = 0) and (pTab <> nil) and
+         (db^.nDb > 1) and (pTab^.pSchema = db^.aDb[1].pSchema) then
+        iDb := 1;
+    end;
+{$ENDIF}
+
+    sqlite3FixInit(@sFix, pParse, iDb, 'index', pName);
+    sqlite3FixSrcList(@sFix, pTblName);
+    pTab := sqlite3LocateTableItem(pParse, 0, SrcListItems(pTblName));
+    if pTab = nil then goto exit_create_index;
+    if (iDb = 1) and (db^.aDb[iDb].pSchema <> pTab^.pSchema) then begin
+      sqlite3ErrorMsg(pParse, 'cannot create a TEMP index on non-TEMP table');
+      goto exit_create_index;
+    end;
+    if (pTab^.tabFlags and TF_WithoutRowid) <> 0 then
+      pPk := sqlite3PrimaryKeyIndex(pTab);
+  end else begin
+    pTab := pParse^.pNewTable;
+    if pTab = nil then goto exit_create_index;
+    iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  end;
+  pDb := @db^.aDb[iDb];
+
+  if (sqlite3_strnicmp(pTab^.zName, 'sqlite_', 7) = 0) and
+     (db^.init.busy = 0) and (pTblName <> nil) then begin
+    sqlite3ErrorMsg(pParse, 'table may not be indexed');
+    goto exit_create_index;
+  end;
+  if pTab^.eTabType = TABTYP_VIEW then begin
+    sqlite3ErrorMsg(pParse, 'views may not be indexed');
+    goto exit_create_index;
+  end;
+  if pTab^.eTabType = TABTYP_VTAB then begin
+    sqlite3ErrorMsg(pParse, 'virtual tables may not be indexed');
+    goto exit_create_index;
+  end;
+
+  { Find the name of the index. }
+  if pName <> nil then begin
+    zName := sqlite3DbStrNDup(db, pName^.z, u64(pName^.n));
+    if zName = nil then goto exit_create_index;
+    sqlite3Dequote(zName);
+    if sqlite3CheckObjectName(pParse, zName, 'index', pTab^.zName) <> SQLITE_OK then
+      goto exit_create_index;
+    if not InRenameObject(pParse) then begin
+      if db^.init.busy = 0 then begin
+        if sqlite3FindTable(db, zName, pDb^.zDbSName) <> nil then begin
+          sqlite3ErrorMsg(pParse, 'there is already a table with that name');
+          goto exit_create_index;
+        end;
+      end;
+      if sqlite3FindIndex(db, zName, pDb^.zDbSName) <> nil then begin
+        if ifNotExist = 0 then begin
+          sqlite3ErrorMsg(pParse, 'index already exists');
+        end else begin
+          sqlite3CodeVerifySchema(pParse, iDb);
+          sqlite3ForceNotReadOnly(pParse);
+        end;
+        goto exit_create_index;
+      end;
+    end;
+  end else begin
+    { Auto-name path (PRIMARY KEY / UNIQUE constraint).  Real formula
+      walks pTab^.pIndex and counts; placeholder name is fine here
+      because the implicit-index codegen depends on AddColumn /
+      AddPrimaryKey which are stubs. }
+    zName := sqlite3MPrintf(db, 'sqlite_autoindex_%s_%d',
+                             [pTab^.zName, 1]);
+    if zName = nil then goto exit_create_index;
+  end;
+
+  { Authorisation. }
+{$IFNDEF SQLITE_OMIT_AUTHORIZATION}
+  if not InRenameObject(pParse) then begin
+    if sqlite3AuthCheck(pParse, SQLITE_INSERT_AUTH,
+         PAnsiChar(LEGACY_SCHEMA_TABLE), nil, pDb^.zDbSName) <> 0 then
+      goto exit_create_index;
+    i := SQLITE_CREATE_INDEX;
+    if (OMIT_TEMPDB = 0) and (iDb = 1) then i := SQLITE_CREATE_TEMP_INDEX;
+    if sqlite3AuthCheck(pParse, i, zName, pTab^.zName, pDb^.zDbSName) <> 0 then
+      goto exit_create_index;
+  end;
+{$ENDIF}
+
+  { Allocate the Index object.  pList may be nil on the auto-name path;
+    in that case we'd need to synthesise a 1-column ExprList from the
+    last-added Column — deferred (AddColumn stub). }
+  if pList = nil then begin
+    nName     := sqlite3Strlen30(zName);
+    nExtraCol := 1;
+    pIndex    := sqlite3AllocateIndexObject(db, i16(nExtraCol),
+                                             nName + 1, @zExtra);
+  end else begin
+    nName     := sqlite3Strlen30(zName);
+    nExtraCol := 1;
+    if pPk <> nil then nExtraCol := i32(pPk^.nKeyCol);
+    pIndex    := sqlite3AllocateIndexObject(db,
+                   i16(i32(pList^.nExpr) + nExtraCol),
+                   nName + 1, @zExtra);
+  end;
+  if (pIndex = nil) or (db^.mallocFailed <> 0) then goto exit_create_index;
+  pIndex^.zName := zExtra;
+  Move(zName^, zExtra^, nName + 1);
+  pIndex^.pTable   := pTab;
+  pIndex^.onError  := u8(onError);
+  { idxType lives in low 2 bits of idxFlags. }
+  pIndex^.idxFlags := (pIndex^.idxFlags and not u32($03)) or u32(idxType);
+  pIndex^.pSchema  := db^.aDb[iDb].pSchema;
+  if pPIWhere <> nil then begin
+    pIndex^.pPartIdxWhere := pPIWhere;
+    pPIWhere              := nil;
+  end;
+
+  { Column iteration deferred — pTab columns not yet populated.
+    Without it, aiColumn / azColl / aSortOrder remain zero-filled. }
+
+  sqlite3DefaultRowEst(pIndex);
+
+  { Codegen / hash-publish phase. }
+  if not InRenameObject(pParse) then begin
+    if db^.init.busy <> 0 then begin
+      { Reading schema off-disk: link into idxHash. }
+      if pTblName <> nil then
+        pIndex^.tnum := db^.init.newTnum;
+      pSchemaT := passqlite3util.PSchema(pIndex^.pSchema);
+      if sqlite3HashInsert(@pSchemaT^.idxHash,
+           PChar(pIndex^.zName), pIndex) <> nil then begin
+        sqlite3OomFault(db);
+        goto exit_create_index;
+      end;
+      db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
+    end
+    else if ((pTab^.tabFlags and TF_WithoutRowid) = 0) or (pTblName <> nil) then begin
+      v := sqlite3GetVdbe(pParse);
+      if v = nil then goto exit_create_index;
+
+      Inc(pParse^.nMem); iMem := pParse^.nMem;
+
+      sqlite3BeginWriteOperation(pParse, 1, iDb);
+
+      { Code a Noop for convertToWithoutRowidTable's later JumpHere. }
+      pIndex^.tnum := u32(sqlite3VdbeAddOp0(v, OP_Noop));
+      sqlite3VdbeAddOp3(v, OP_CreateBtree, iDb, iMem, BTREE_BLOBKEY_K);
+
+      { Build the CREATE INDEX statement text for the schema row. }
+      if (pStart <> nil) and (pName <> nil) then begin
+        n := i32(PtrUInt(pParse^.sLastToken.z) - PtrUInt(pName^.z))
+             + pParse^.sLastToken.n;
+        if (n > 0) and ((pName^.z + n - 1)^ = ';') then Dec(n);
+        if onError = OE_None then
+          zStmt := sqlite3MPrintf(db, 'CREATE INDEX %.*s',
+                                   [n, pName^.z])
+        else
+          zStmt := sqlite3MPrintf(db, 'CREATE UNIQUE INDEX %.*s',
+                                   [n, pName^.z]);
+      end else
+        zStmt := nil;
+
+      { Schema-row INSERT — sqlite3NestedParse is a stub today; structural
+        call lands now so this fires automatically when NestedParse is real. }
+      sqlite3NestedParse(pParse, nil);
+      sqlite3DbFree(db, zStmt);
+
+      if pTblName <> nil then begin
+        { sqlite3RefillIndex(pParse, pIndex, iMem) — not yet ported; the
+          new btree won't actually be filled until that helper lands.
+          Structural placeholder: the next three opcodes are emitted
+          unconditionally so the schema cookie / parse-schema / expire
+          tail matches C. }
+        sqlite3ChangeCookie(pParse, iDb);
+        sqlite3VdbeAddParseSchemaOp(v, iDb, nil, 0);
+        sqlite3VdbeAddOp2(v, OP_Expire, 0, 1);
+      end;
+
+      sqlite3VdbeJumpHere(v, i32(pIndex^.tnum));
+    end;
+  end;
+
+  if (db^.init.busy <> 0) or (pTblName = nil) then begin
+    pIndex^.pNext := pTab^.pIndex;
+    pTab^.pIndex  := pIndex;
+    pIndex        := nil;
+  end
+  else if InRenameObject(pParse) then begin
+    pParse^.pNewIndex := pIndex;
+    pIndex            := nil;
+  end;
+
+exit_create_index:
+  if pIndex <> nil then sqlite3FreeIndex(db, pIndex);
+  sqlite3ExprDelete(db, pPIWhere);
+  sqlite3ExprListDelete(db, pList);
+  sqlite3SrcListDelete(db, pTblName);
+  sqlite3DbFree(db, zName);
 end;
 
 // ===========================================================================
