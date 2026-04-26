@@ -15,6 +15,7 @@ uses
   passqlite3types,
   passqlite3os,
   passqlite3util,
+  passqlite3vdbe,
   passqlite3json;
 
 var
@@ -1281,8 +1282,165 @@ begin
   FreeParse(p);
 end;
 
+{ ----- Phase 6.8.g — JSON cache + jsonParseFuncArg ----- }
+
+procedure SetupTextValue(var v: TMem; z: PAnsiChar; n: i32);
 begin
-  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e/f JSON port ===');
+  FillChar(v, SizeOf(v), 0);
+  v.z     := z;
+  v.n     := n;
+  v.enc   := SQLITE_UTF8;
+  v.flags := MEM_Str or MEM_Term;
+end;
+
+procedure SetupBlobValue(var v: TMem; p: Pointer; n: i32);
+begin
+  FillChar(v, SizeOf(v), 0);
+  v.z     := PAnsiChar(p);
+  v.n     := n;
+  v.enc   := SQLITE_UTF8;
+  v.flags := MEM_Blob;
+end;
+
+procedure SetupCtx(var ctx: Tsqlite3_context; var vm: TVdbe; var pOut: TMem);
+begin
+  FillChar(ctx,  SizeOf(ctx),  0);
+  FillChar(vm,   SizeOf(vm),   0);
+  FillChar(pOut, SizeOf(pOut), 0);
+  ctx.pOut  := @pOut;
+  ctx.pVdbe := @vm;
+  ctx.iOp   := 0;
+  { vm.db = nil; sqlite3DbFree degrades to sqlite3_free → safe. }
+end;
+
+procedure TestJsonParseFreeRefcount;
+var
+  p: PJsonParse;
+begin
+  p := PJsonParse(sqlite3_malloc(SizeOf(TJsonParse)));
+  FillChar(p^, SizeOf(TJsonParse), 0);
+  p^.nJPRef := 2;
+  jsonParseFree(p);
+  CheckEqI('T333 jsonParseFree dec refcount',
+           i64(p^.nJPRef), 1);
+  jsonParseFree(p);
+  CheckTrue('T334 jsonParseFree last ref freed (no crash)', True);
+end;
+
+procedure TestJsonArgIsJsonbBlob;
+var
+  p: TJsonParse;
+  v: TMem;
+  blob: array[0..1] of Byte;
+begin
+  { Header byte = (payload size 1 << 4) | JSONB_INT, payload is ASCII '5'. }
+  blob[0] := (1 shl 4) or JSONB_INT;
+  blob[1] := Ord('5');
+  FillChar(p, SizeOf(p), 0);
+  SetupBlobValue(v, @blob[0], 2);
+  CheckEqI('T335 jsonArgIsJsonb int recognised',
+           jsonArgIsJsonb(@v, @p), 1);
+  CheckEqI('T336 nBlob = 2',  i64(p.nBlob), 2);
+  CheckTrue('T337 aBlob points at supplied buffer', p.aBlob = @blob[0]);
+
+  { Garbage header: nibble 0x0F > JSONB_OBJECT → reject. }
+  blob[0] := $FF;
+  FillChar(p, SizeOf(p), 0);
+  CheckEqI('T338 jsonArgIsJsonb invalid nibble rejected',
+           jsonArgIsJsonb(@v, @p), 0);
+  CheckEqI('T339 nBlob cleared after reject',
+           i64(p.nBlob), 0);
+  CheckTrue('T340 aBlob nil after reject', p.aBlob = nil);
+
+  { Non-blob input → 0 immediately. }
+  v.flags := MEM_Str or MEM_Term;
+  FillChar(p, SizeOf(p), 0);
+  CheckEqI('T341 jsonArgIsJsonb non-blob → 0',
+           jsonArgIsJsonb(@v, @p), 0);
+end;
+
+procedure TestJsonCacheSearchEmpty;
+var
+  ctx:  Tsqlite3_context;
+  vm:   TVdbe;
+  pOut: TMem;
+  v:    TMem;
+  zJ:   AnsiString;
+begin
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{"a":1}';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  CheckTrue('T342 cacheSearch empty cache → nil',
+            jsonCacheSearch(@ctx, @v) = nil);
+  CheckTrue('T343 cacheSearch leaves auxdata untouched',
+            sqlite3_get_auxdata(@ctx, JSON_CACHE_ID) = nil);
+end;
+
+procedure TestJsonParseFuncArgRoundtrip;
+var
+  ctx:    Tsqlite3_context;
+  vm:     TVdbe;
+  pOut:   TMem;
+  v, v2:  TMem;
+  zJ, z2: AnsiString;
+  p, q:   PJsonParse;
+  pCache: PJsonCache;
+begin
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{"x":42}';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  p := jsonParseFuncArg(@ctx, @v, 0);
+  CheckTrue('T344 jsonParseFuncArg returns non-nil', p <> nil);
+  if p = nil then Exit;
+  CheckTrue('T345 zJson copied into RCStr-marked buffer',
+            (p^.bJsonIsRCStr = 1) and (p^.zJson <> nil));
+  CheckEqI('T346 nJson preserved', i64(p^.nJson), Length(zJ));
+  CheckTrue('T347 nBlob populated by ConvertTextToBlob', p^.nBlob > 0);
+  pCache := PJsonCache(sqlite3_get_auxdata(@ctx, JSON_CACHE_ID));
+  CheckTrue('T348 cache attached to ctx as auxdata', pCache <> nil);
+  if pCache <> nil then
+    CheckEqI('T349 cache nUsed = 1', pCache^.nUsed, 1);
+
+  { Re-parse same text via a different value: should hit the cache and
+    return the same JsonParse instance with refcount bumped. }
+  z2 := zJ;  { distinct AnsiString → distinct buffer pointer }
+  UniqueString(z2);
+  SetupTextValue(v2, PAnsiChar(z2), Length(z2));
+  q := jsonParseFuncArg(@ctx, @v2, 0);
+  CheckTrue('T350 second parse → same cached object',
+            (q <> nil) and (q = p));
+  { Refcount accounting: 1 from initial parse, +1 from jsonCacheInsert
+    (cache itself), +1 from cache-hit Inc → 3 total outstanding. }
+  CheckEqI('T351 refcount bumped on cache hit',
+           i64(p^.nJPRef), 3);
+
+  { Drop the two outstanding references: the cache itself still owns one. }
+  jsonParseFree(p);
+  jsonParseFree(q);
+  CheckEqI('T352 cache-owned refcount = 1',
+           i64(pCache^.a[0]^.nJPRef), 1);
+
+  { Tear down: free auxdata via the registered destructor. }
+  sqlite3_set_auxdata(@ctx, JSON_CACHE_ID, nil, nil);
+  CheckTrue('T353 auxdata cleared', sqlite3_get_auxdata(@ctx, JSON_CACHE_ID) = nil);
+end;
+
+procedure TestJsonParseFuncArgNullSqlNull;
+var
+  ctx:  Tsqlite3_context;
+  vm:   TVdbe;
+  pOut: TMem;
+  v:    TMem;
+begin
+  SetupCtx(ctx, vm, pOut);
+  FillChar(v, SizeOf(v), 0);
+  v.flags := MEM_Null;
+  CheckTrue('T354 jsonParseFuncArg(NULL) → nil',
+            jsonParseFuncArg(@ctx, @v, 0) = nil);
+end;
+
+begin
+  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e/f/g JSON port ===');
   TestTypeNames;
   TestIsspace;
   TestSpacesString;
@@ -1332,6 +1490,11 @@ begin
   TestLookupPath;
   TestLookupEdit;
   TestCreateEditSubstructure;
+  TestJsonParseFreeRefcount;
+  TestJsonArgIsJsonbBlob;
+  TestJsonCacheSearchEmpty;
+  TestJsonParseFuncArgRoundtrip;
+  TestJsonParseFuncArgNullSqlNull;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);

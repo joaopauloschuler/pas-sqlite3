@@ -478,7 +478,36 @@ function jsonLookupStep(pParse: PJsonParse; iRoot: u32; zPath: PAnsiChar;
 function jsonCreateEditSubstructure(pParse: PJsonParse; pIns: PJsonParse;
                                     zTail: PAnsiChar): u32;
 
+{ ===========================================================================
+  Function-arg cache + jsonParseFuncArg (Phase 6.8.g)
+
+  Faithful port of json.c:421 (jsonCacheDelete), 428 (jsonCacheDeleteGeneric),
+  439 (jsonCacheInsert), 483 (jsonCacheSearch), 926 (jsonParseFree),
+  3619 (jsonArgIsJsonb), 3658 (jsonParseFuncArg).
+
+  pCtx and pArg are kept as opaque Pointers in the interface (consistent
+  with jsonStringInit's existing convention) — the implementation casts to
+  Psqlite3_context / Psqlite3_value via passqlite3vdbe in the implementation
+  uses clause.
+
+  Caveat: sqlite3RCStr is not yet ported.  jsonParseFuncArg therefore
+  copies the JSON text into a fresh sqlite3_malloc'd buffer (set
+  bJsonIsRCStr=1 to mark "owned by libc malloc"); jsonParseReset frees it
+  via sqlite3_free.  When 6.8.h lands sqlite3RCStr proper, swap the
+  malloc/copy/free triple for sqlite3RCStrNew/Ref/Unref — every other
+  cache invariant is identical.
+  =========================================================================== }
+
+procedure jsonParseFree(pParse: PJsonParse);
+function  jsonArgIsJsonb(pArg: Pointer; p: PJsonParse): i32;
+function  jsonCacheInsert(pCtx: Pointer; pParse: PJsonParse): i32;
+function  jsonCacheSearch(pCtx: Pointer; pArg: Pointer): PJsonParse;
+function  jsonParseFuncArg(pCtx: Pointer; pArg: Pointer; flgs: u32): PJsonParse;
+
 implementation
+
+uses
+  passqlite3vdbe;
 
 function jsonIsspace(c: AnsiChar): i32; inline;
 begin
@@ -1243,12 +1272,13 @@ end;
 
 procedure jsonParseReset(pParse: PJsonParse);
 begin
-  { RCStr branch deferred (sqlite3RCStrUnref not yet ported).  zJson
-    ownership for non-RCStr inputs is the caller's; we only release the
-    JSONB allocation here. }
+  { Phase 6.8.g — RCStr proper not yet ported; the cache-bearing branch
+    (jsonParseFuncArg) heap-copies zJson with sqlite3_malloc and sets
+    bJsonIsRCStr=1 to mark it as owned-libc-malloc.  Free here.  For
+    non-cached parses bJsonIsRCStr stays 0 and zJson is borrowed. }
   if pParse^.bJsonIsRCStr <> 0 then
   begin
-    { TODO 6.8.h: sqlite3RCStrUnref(pParse^.zJson) when RCStr lands. }
+    if pParse^.zJson <> nil then sqlite3_free(pParse^.zJson);
     pParse^.zJson := nil;
     pParse^.nJson := 0;
     pParse^.bJsonIsRCStr := 0;
@@ -3149,6 +3179,279 @@ begin
     Exit;
   end;
   Result := JSON_LOOKUP_NOTFOUND;
+end;
+
+{ ===========================================================================
+  Phase 6.8.g implementation
+  =========================================================================== }
+
+procedure jsonParseFree(pParse: PJsonParse);
+begin
+  if pParse = nil then Exit;
+  if pParse^.nJPRef > 1 then
+    Dec(pParse^.nJPRef)
+  else
+  begin
+    jsonParseReset(pParse);
+    sqlite3DbFree(pParse^.db, pParse);
+  end;
+end;
+
+procedure jsonCacheDelete(p: PJsonCache);
+var
+  i: i32;
+begin
+  for i := 0 to p^.nUsed - 1 do
+    jsonParseFree(p^.a[i]);
+  sqlite3DbFree(p^.db, p);
+end;
+
+procedure jsonCacheDeleteGeneric(p: Pointer); cdecl;
+begin
+  jsonCacheDelete(PJsonCache(p));
+end;
+
+function jsonArgIsJsonb(pArg: Pointer; p: PJsonParse): i32;
+var
+  n, sz: u32;
+  c: u8;
+begin
+  if sqlite3_value_type(Psqlite3_value(pArg)) <> SQLITE_BLOB then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  p^.aBlob := PByte(sqlite3_value_blob(Psqlite3_value(pArg)));
+  p^.nBlob := u32(sqlite3_value_bytes(Psqlite3_value(pArg)));
+  sz := 0;
+  if (p^.nBlob > 0) and (p^.aBlob <> nil) then
+  begin
+    c := p^.aBlob[0];
+    if (c and $0F) <= JSONB_OBJECT then
+    begin
+      n := jsonbPayloadSize(p, 0, sz);
+      if (n > 0) and ((sz + n) = p^.nBlob)
+         and (((c and $0F) > JSONB_FALSE) or (sz = 0))
+         and ((sz > 7)
+              or ((c <> $7B) and (c <> $5B) and (sqlite3Isdigit(c) = 0))
+              or (jsonbValidityCheck(p, 0, p^.nBlob, 1) = 0)) then
+      begin
+        Result := 1;
+        Exit;
+      end;
+    end;
+  end;
+  p^.aBlob := nil;
+  p^.nBlob := 0;
+  Result := 0;
+end;
+
+function jsonCacheInsert(pCtx: Pointer; pParse: PJsonParse): i32;
+var
+  p:  PJsonCache;
+  db: Pointer;
+begin
+  p := PJsonCache(sqlite3_get_auxdata(Psqlite3_context(pCtx), JSON_CACHE_ID));
+  if p = nil then
+  begin
+    db := sqlite3_context_db_handle(Psqlite3_context(pCtx));
+    p := PJsonCache(sqlite3DbMallocZero(db, SizeOf(TJsonCache)));
+    if p = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    p^.db := db;
+    sqlite3_set_auxdata(Psqlite3_context(pCtx), JSON_CACHE_ID, p,
+                        @jsonCacheDeleteGeneric);
+    p := PJsonCache(sqlite3_get_auxdata(Psqlite3_context(pCtx), JSON_CACHE_ID));
+    if p = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  end;
+  if p^.nUsed >= JSON_CACHE_SIZE then
+  begin
+    jsonParseFree(p^.a[0]);
+    Move(p^.a[1], p^.a[0], (JSON_CACHE_SIZE - 1) * SizeOf(PJsonParse));
+    p^.nUsed := JSON_CACHE_SIZE - 1;
+  end;
+  pParse^.eEdit := 0;
+  Inc(pParse^.nJPRef);
+  pParse^.bReadOnly := 1;
+  p^.a[p^.nUsed] := pParse;
+  Inc(p^.nUsed);
+  Result := SQLITE_OK;
+end;
+
+function jsonCacheSearch(pCtx: Pointer; pArg: Pointer): PJsonParse;
+var
+  p:     PJsonCache;
+  i:     i32;
+  zJson: PAnsiChar;
+  nJson: i32;
+  tmp:   PJsonParse;
+begin
+  if sqlite3_value_type(Psqlite3_value(pArg)) <> SQLITE_TEXT then
+  begin
+    Result := nil;
+    Exit;
+  end;
+  zJson := PAnsiChar(sqlite3_value_text(Psqlite3_value(pArg)));
+  if zJson = nil then begin Result := nil; Exit; end;
+  nJson := sqlite3_value_bytes(Psqlite3_value(pArg));
+
+  p := PJsonCache(sqlite3_get_auxdata(Psqlite3_context(pCtx), JSON_CACHE_ID));
+  if p = nil then begin Result := nil; Exit; end;
+
+  { First pass: pointer equality (fast path for repeated identical args). }
+  i := 0;
+  while i < p^.nUsed do
+  begin
+    if p^.a[i]^.zJson = zJson then Break;
+    Inc(i);
+  end;
+  if i >= p^.nUsed then
+  begin
+    { Second pass: byte-compare. }
+    i := 0;
+    while i < p^.nUsed do
+    begin
+      if (p^.a[i]^.nJson = nJson)
+         and (CompareByte(p^.a[i]^.zJson^, zJson^, nJson) = 0) then
+        Break;
+      Inc(i);
+    end;
+  end;
+  if i < p^.nUsed then
+  begin
+    if i < p^.nUsed - 1 then
+    begin
+      { Promote matched entry to most-recently-used (end of array). }
+      tmp := p^.a[i];
+      Move(p^.a[i + 1], p^.a[i], (p^.nUsed - i - 1) * SizeOf(PJsonParse));
+      p^.a[p^.nUsed - 1] := tmp;
+      i := p^.nUsed - 1;
+    end;
+    Result := p^.a[i];
+  end
+  else
+    Result := nil;
+end;
+
+function jsonParseFuncArg(pCtx: Pointer; pArg: Pointer;
+                          flgs: u32): PJsonParse;
+label
+  rebuild_from_cache, json_pfa_oom, json_pfa_malformed;
+var
+  eType:      i32;
+  p, pCache:  PJsonParse;
+  db:         Pointer;
+  nBlob:      u32;
+  zNew:       PAnsiChar;
+  rc:         i32;
+begin
+  p := nil;
+  pCache := nil;
+  eType := sqlite3_value_type(Psqlite3_value(pArg));
+  if eType = SQLITE_NULL then begin Result := nil; Exit; end;
+  pCache := jsonCacheSearch(pCtx, pArg);
+  if pCache <> nil then
+  begin
+    Inc(pCache^.nJPRef);
+    if (flgs and JSON_EDITABLE) = 0 then
+    begin
+      Result := pCache;
+      Exit;
+    end;
+  end;
+  db := sqlite3_context_db_handle(Psqlite3_context(pCtx));
+rebuild_from_cache:
+  p := PJsonParse(sqlite3DbMallocZero(db, SizeOf(TJsonParse)));
+  if p = nil then goto json_pfa_oom;
+  p^.db := db;
+  p^.nJPRef := 1;
+  if pCache <> nil then
+  begin
+    nBlob := pCache^.nBlob;
+    p^.aBlob := PByte(sqlite3DbMallocRaw(db, nBlob));
+    if p^.aBlob = nil then goto json_pfa_oom;
+    Move(pCache^.aBlob^, p^.aBlob^, nBlob);
+    p^.nBlobAlloc := nBlob;
+    p^.nBlob := nBlob;
+    p^.hasNonstd := pCache^.hasNonstd;
+    jsonParseFree(pCache);
+    Result := p;
+    Exit;
+  end;
+  if eType = SQLITE_BLOB then
+  begin
+    if jsonArgIsJsonb(pArg, p) <> 0 then
+    begin
+      if ((flgs and JSON_EDITABLE) <> 0)
+         and (jsonBlobMakeEditable(p, 0) = 0) then
+        goto json_pfa_oom;
+      Result := p;
+      Exit;
+    end;
+    { Not valid JSONB — fall through and try the bytes as JSON text
+      (tag-20240123-a in json.c). }
+  end;
+  p^.zJson := PAnsiChar(sqlite3_value_text(Psqlite3_value(pArg)));
+  p^.nJson := sqlite3_value_bytes(Psqlite3_value(pArg));
+  if p^.nJson = 0 then goto json_pfa_malformed;
+  if p^.zJson = nil then goto json_pfa_oom;
+  if jsonConvertTextToBlob(p, pCtx) <> 0 then
+  begin
+    if (flgs and JSON_KEEPERROR) <> 0 then
+    begin
+      p^.nErr := 1;
+      Result := p;
+      Exit;
+    end
+    else
+    begin
+      jsonParseFree(p);
+      Result := nil;
+      Exit;
+    end;
+  end
+  else
+  begin
+    { No RCStr yet — heap-copy zJson into a libc-malloc'd buffer so the
+      cache outlives the SQL value.  bJsonIsRCStr=1 marks the copy as
+      owned-by-malloc; jsonParseReset frees it via sqlite3_free. }
+    zNew := PAnsiChar(sqlite3_malloc(p^.nJson + 1));
+    if zNew = nil then goto json_pfa_oom;
+    Move(p^.zJson^, zNew^, p^.nJson);
+    zNew[p^.nJson] := #0;
+    p^.zJson := zNew;
+    p^.bJsonIsRCStr := 1;
+    rc := jsonCacheInsert(pCtx, p);
+    if rc = SQLITE_NOMEM then goto json_pfa_oom;
+    if (flgs and JSON_EDITABLE) <> 0 then
+    begin
+      pCache := p;
+      p := nil;
+      goto rebuild_from_cache;
+    end;
+  end;
+  Result := p;
+  Exit;
+
+json_pfa_malformed:
+  if (flgs and JSON_KEEPERROR) <> 0 then
+  begin
+    p^.nErr := 1;
+    Result := p;
+    Exit;
+  end
+  else
+  begin
+    jsonParseFree(p);
+    { sqlite3_result_error("malformed JSON",-1) deferred to 6.8.h. }
+    Result := nil;
+    Exit;
+  end;
+
+json_pfa_oom:
+  jsonParseFree(pCache);
+  jsonParseFree(p);
+  { sqlite3_result_error_nomem(ctx) deferred to 6.8.h. }
+  Result := nil;
 end;
 
 end.

@@ -1331,6 +1331,12 @@ function  sqlite3VdbeReset(p: PVdbe): i32;
 function  sqlite3VdbeFinalize(p: PVdbe): i32;
 procedure sqlite3VdbeDeleteAuxData(db: Psqlite3; pp: PPAuxData; iOp, mask: i32);
 procedure sqlite3VdbeDelete(p: PVdbe);
+
+{ --- vdbeapi.c — sqlite3_context introspection + auxdata (Phase 6.8.g) --- }
+function  sqlite3_context_db_handle(p: Psqlite3_context): Psqlite3;
+function  sqlite3_get_auxdata(pCtx: Psqlite3_context; iArg: i32): Pointer;
+procedure sqlite3_set_auxdata(pCtx: Psqlite3_context; iArg: i32;
+                              pAux: Pointer; xDelete: TxDelProc);
 function  sqlite3VdbeFinishMoveto(p: PVdbeCursor): i32;
 function  sqlite3VdbeHandleMovedCursor(p: PVdbeCursor): i32;
 function  sqlite3VdbeCursorRestore(p: PVdbeCursor): i32;
@@ -2824,6 +2830,80 @@ begin
     sqlite3DbFree(db, pAux);
     pAux := pp^;
   end;
+end;
+
+{ --- vdbeapi.c — sqlite3_context_db_handle / sqlite3_get_auxdata /
+      sqlite3_set_auxdata (Phase 6.8.g) --- }
+
+function sqlite3_context_db_handle(p: Psqlite3_context): Psqlite3;
+begin
+  if p = nil then begin Result := nil; Exit; end;
+  Result := p^.pOut^.db;
+end;
+
+function sqlite3_get_auxdata(pCtx: Psqlite3_context; iArg: i32): Pointer;
+var
+  pAux: PAuxData;
+begin
+  if (pCtx = nil) or (pCtx^.pVdbe = nil) then
+  begin
+    Result := nil;
+    Exit;
+  end;
+  pAux := pCtx^.pVdbe^.pAuxData;
+  while pAux <> nil do
+  begin
+    if (pAux^.iAuxArg = iArg)
+       and ((pAux^.iAuxOp = pCtx^.iOp) or (iArg < 0)) then
+    begin
+      Result := pAux^.pAux;
+      Exit;
+    end;
+    pAux := pAux^.pNextAux;
+  end;
+  Result := nil;
+end;
+
+procedure sqlite3_set_auxdata(pCtx: Psqlite3_context; iArg: i32;
+                              pAux: Pointer; xDelete: TxDelProc);
+var
+  pAd:   PAuxData;
+  pVm:   PVdbe;
+begin
+  if pCtx = nil then Exit;
+  pVm := pCtx^.pVdbe;
+  if pVm = nil then
+  begin
+    if Assigned(xDelete) then xDelete(pAux);
+    Exit;
+  end;
+  pAd := pVm^.pAuxData;
+  while pAd <> nil do
+  begin
+    if (pAd^.iAuxArg = iArg)
+       and ((pAd^.iAuxOp = pCtx^.iOp) or (iArg < 0)) then
+      Break;
+    pAd := pAd^.pNextAux;
+  end;
+  if pAd = nil then
+  begin
+    pAd := PAuxData(sqlite3DbMallocZero(pVm^.db, SizeOf(TAuxData)));
+    if pAd = nil then
+    begin
+      if Assigned(xDelete) then xDelete(pAux);
+      if pCtx^.isError = 0 then pCtx^.isError := SQLITE_NOMEM;
+      Exit;
+    end;
+    pAd^.iAuxOp   := pCtx^.iOp;
+    pAd^.iAuxArg  := iArg;
+    pAd^.pNextAux := pVm^.pAuxData;
+    pVm^.pAuxData := pAd;
+    if pCtx^.isError = 0 then pCtx^.isError := -1;
+  end
+  else if Assigned(pAd^.xDeleteAux) then
+    pAd^.xDeleteAux(pAd^.pAux);
+  pAd^.pAux       := pAux;
+  pAd^.xDeleteAux := xDelete;
 end;
 
 { --- sqlite3VdbeCreate / sqlite3VdbeDelete --- }
