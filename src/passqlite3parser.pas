@@ -404,6 +404,10 @@ procedure sqlite3VtabFinishParse(pPse: PParse; pEnd: PToken);
 procedure sqlite3VtabArgInit(pPse: PParse);
 procedure sqlite3VtabArgExtend(pPse: PParse; p: PToken);
 
+{ Exposed in Phase 6.bis.1f so passqlite3vtab.sqlite3VtabEponymousTableInit
+  can append the three module-arg slots without duplicating the helper. }
+procedure addModuleArgument(pPse: PParse; pTable: PTable2; zArg: PAnsiChar);
+
 { =========================================================================== }
 
 implementation

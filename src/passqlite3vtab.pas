@@ -201,8 +201,8 @@ procedure sqlite3VtabUnlockList(db: PTsqlite3);
 { Tear down all vtab state on a Table about to be deleted.  vtab.c:340. }
 procedure sqlite3VtabClear(db: PTsqlite3; pTab: Pointer);
 
-{ Eponymous-table cleanup.  Stub for 6.bis.1a — full body in 6.bis.1f.
-  Until then, no eponymous tables are ever created, so this is correct. }
+{ Eponymous-table cleanup (vtab.c:1298).  Marks pMod^.pEpoTab as Ephemeral
+  (so sqlite3DeleteTable knows it is not in the schema) and frees it. }
 procedure sqlite3VtabEponymousTableClear(db: PTsqlite3; pMod: PVtabModule);
 
 { ============================================================
@@ -282,6 +282,31 @@ function sqlite3_vtab_on_conflict(db: PTsqlite3): i32; cdecl;
   three valueless ops ignore intArg).  Must be called from inside an
   xCreate / xConnect callback (i.e. while db^.pVtabCtx is non-nil). }
 function sqlite3_vtab_config(db: PTsqlite3; op: i32; intArg: i32): i32; cdecl;
+
+{ ============================================================
+  Phase 6.bis.1f — function overload + writable + eponymous tables
+  (vtab.c:1153..1308)
+  ============================================================ }
+
+{ vtab.c:1153 — give the virtual-table implementation a chance to overload
+  pDef when its first argument is a column belonging to that vtab.  Returns
+  pDef unchanged if no overload happens, otherwise an SQLITE_FUNC_EPHEM
+  FuncDef carved out of db. }
+function sqlite3VtabOverloadFunction(db: PTsqlite3;
+  pDef: passqlite3vdbe.PTFuncDef; nArg: i32;
+  pExpr: passqlite3codegen.PExpr): passqlite3vdbe.PTFuncDef;
+
+{ vtab.c:1223 — ensure pTab appears in pParse->pToplevel->apVtabLock so
+  an OP_VBegin gets emitted for it.  No-op if already present. }
+procedure sqlite3VtabMakeWritable(pParse: passqlite3codegen.PParse;
+  pTab: passqlite3codegen.PTable2);
+
+{ vtab.c:1257 — instantiate an eponymous virtual-table for module pMod
+  (i.e. one whose name == module name; no CREATE VIRTUAL TABLE needed).
+  Returns 1 on success or on attempted-but-failed; 0 if the module does
+  not support eponymity (xCreate != xConnect when xCreate is non-nil). }
+function sqlite3VtabEponymousTableInit(pParse: passqlite3codegen.PParse;
+  pMd: PVtabModule): i32;
 
 implementation
 
@@ -1049,15 +1074,184 @@ begin
   Result := rc;
 end;
 
+{ vtab.c:1298 — full body for Phase 6.bis.1f. }
 procedure sqlite3VtabEponymousTableClear(db: PTsqlite3; pMod: PVtabModule);
+var
+  pTab: passqlite3codegen.PTable2;
 begin
-  { Stub for Phase 6.bis.1a.  Full version in 6.bis.1f will:
-      * Look at pMod^.pEpoTab (Table*); if non-nil, delete its columns,
-        free the Table struct, and clear pMod^.pEpoTab.
-    Until 6.bis.1c lands the constructor lifecycle, no eponymous table
-    is ever attached, so pEpoTab is always nil and there is nothing to do. }
-  Assert(pMod^.pEpoTab = nil,
-    'sqlite3VtabEponymousTableClear: pEpoTab unexpectedly non-nil before 6.bis.1f');
+  pTab := passqlite3codegen.PTable2(pMod^.pEpoTab);
+  if pTab <> nil then begin
+    { Mark Ephemeral so sqlite3DeleteTable does not look for it in the
+      schema (which it never lived in). }
+    pTab^.tabFlags := pTab^.tabFlags or passqlite3codegen.TF_Ephemeral;
+    passqlite3codegen.sqlite3DeleteTable(db, pTab);
+    pMod^.pEpoTab := nil;
+  end;
+end;
+
+{ ============================================================
+  Phase 6.bis.1f — function overload + writable + eponymous tables
+  (vtab.c:1153..1308)
+  ============================================================ }
+
+type
+  { xFindFunction(pVtab, nArg, zName, &xSFunc, &pArg) — returns 0 if no
+    overload, non-zero otherwise.  Mirrors sqlite.h:7986. }
+  TVtabFindFn = function(pVtab: PSqlite3Vtab; nArg: i32; zName: PAnsiChar;
+                         pxFunc: Pointer; ppArg: PPointer): i32; cdecl;
+
+function sqlite3VtabOverloadFunction(db: PTsqlite3;
+  pDef: passqlite3vdbe.PTFuncDef; nArg: i32;
+  pExpr: passqlite3codegen.PExpr): passqlite3vdbe.PTFuncDef;
+var
+  pTab:    passqlite3codegen.PTable2;
+  pVtab:   PSqlite3Vtab;
+  pMd:     PSqlite3Module;
+  xSFunc:  Pointer;
+  pArg:    Pointer;
+  pNew:    passqlite3vdbe.PTFuncDef;
+  rc:      i32;
+  nName:   i32;
+  xFind:   TVtabFindFn;
+  pVT:     PVTable;
+begin
+  xSFunc := nil;
+  pArg   := nil;
+  rc     := 0;
+
+  { Check that pExpr->op==TK_COLUMN and the column belongs to a vtab. }
+  if pExpr = nil then begin Result := pDef; Exit; end;
+  if pExpr^.op <> u8(passqlite3codegen.TK_COLUMN) then begin
+    Result := pDef; Exit;
+  end;
+  pTab := passqlite3codegen.PTable2(pExpr^.y.pTab);
+  if pTab = nil then begin Result := pDef; Exit; end;
+  if pTab^.eTabType <> passqlite3codegen.TABTYP_VTAB then begin
+    Result := pDef; Exit;
+  end;
+  pVT := sqlite3GetVTable(db, pTab);
+  Assert(pVT <> nil, 'sqlite3VtabOverloadFunction: VTable nil');
+  pVtab := pVT^.pVtab;
+  Assert(pVtab <> nil, 'sqlite3VtabOverloadFunction: pVtab nil');
+  Assert(pVtab^.pModule <> nil, 'sqlite3VtabOverloadFunction: pModule nil');
+  pMd := pVtab^.pModule;
+  if pMd^.xFindFunction = nil then begin
+    Result := pDef; Exit;
+  end;
+
+  { Invoke xFindFunction. }
+  xFind := TVtabFindFn(pMd^.xFindFunction);
+  rc := xFind(pVtab, nArg, pDef^.zName, @xSFunc, @pArg);
+  if rc = 0 then begin
+    Result := pDef; Exit;
+  end;
+
+  { Carve out a fresh ephemeral FuncDef.  The name is appended after the
+    record (vtab.c:1209..1210). }
+  nName := sqlite3Strlen30(PChar(pDef^.zName));
+  pNew  := passqlite3vdbe.PTFuncDef(
+             sqlite3DbMallocZero(Psqlite3db(db),
+               u64(SizeOf(passqlite3vdbe.TFuncDef) + nName + 1)));
+  if pNew = nil then begin
+    Result := pDef; Exit;
+  end;
+  pNew^ := pDef^;
+  pNew^.zName := PAnsiChar(PByte(pNew) + SizeOf(passqlite3vdbe.TFuncDef));
+  Move(pDef^.zName^, (PByte(pNew) + SizeOf(passqlite3vdbe.TFuncDef))^,
+       nName + 1);
+  pNew^.xSFunc    := passqlite3vdbe.TxSFuncProc(xSFunc);
+  pNew^.pUserData := pArg;
+  pNew^.funcFlags := pNew^.funcFlags or passqlite3vdbe.SQLITE_FUNC_EPHEM;
+  Result := pNew;
+end;
+
+procedure sqlite3VtabMakeWritable(pParse: passqlite3codegen.PParse;
+  pTab: passqlite3codegen.PTable2);
+var
+  pTop:        passqlite3codegen.PParse;
+  i, n:        i32;
+  apOld, apNew: PPointer;
+begin
+  Assert(pTab^.eTabType = passqlite3codegen.TABTYP_VTAB,
+    'sqlite3VtabMakeWritable: not a vtab');
+  if pParse^.pToplevel <> nil then
+    pTop := pParse^.pToplevel
+  else
+    pTop := pParse;
+
+  apOld := PPointer(pTop^.apVtabLock);
+  for i := 0 to pTop^.nVtabLock - 1 do begin
+    if Pointer(pTab) = apOld[i] then Exit;
+  end;
+  n := (pTop^.nVtabLock + 1) * SizeOf(Pointer);
+  apNew := PPointer(sqlite3_realloc64(apOld, u64(n)));
+  if apNew <> nil then begin
+    pTop^.apVtabLock := Pointer(apNew);
+    apNew[pTop^.nVtabLock] := Pointer(pTab);
+    Inc(pTop^.nVtabLock);
+  end else
+    sqlite3OomFault(Psqlite3db(pTop^.db));
+end;
+
+function sqlite3VtabEponymousTableInit(pParse: passqlite3codegen.PParse;
+  pMd: PVtabModule): i32;
+var
+  pModule: PSqlite3Module;
+  pTab:    passqlite3codegen.PTable2;
+  zErr:    PAnsiChar;
+  rc:      i32;
+  db:      PTsqlite3;
+begin
+  pModule := pMd^.pModule;
+  zErr    := nil;
+  db      := pParse^.db;
+
+  if pMd^.pEpoTab <> nil then begin Result := 1; Exit; end;
+  { An eponymous module is one where xCreate is nil OR equals xConnect. }
+  if (pModule^.xCreate <> nil)
+     and (pModule^.xCreate <> pModule^.xConnect) then begin
+    Result := 0; Exit;
+  end;
+
+  pTab := passqlite3codegen.PTable2(
+            sqlite3DbMallocZero(Psqlite3db(db),
+              SizeOf(passqlite3codegen.TTable)));
+  if pTab = nil then begin Result := 0; Exit; end;
+  pTab^.zName := sqlite3DbStrDup(Psqlite3db(db), PChar(pMd^.zName));
+  if pTab^.zName = nil then begin
+    sqlite3DbFree(Psqlite3db(db), pTab);
+    Result := 0; Exit;
+  end;
+  pMd^.pEpoTab     := pTab;
+  pTab^.nTabRef    := 1;
+  pTab^.eTabType   := passqlite3codegen.TABTYP_VTAB;
+  pTab^.pSchema    := passqlite3codegen.PSchema(db^.aDb[0].pSchema);
+  Assert(pTab^.u.vtab.nArg = 0,
+    'sqlite3VtabEponymousTableInit: nArg non-zero');
+  pTab^.iPKey      := -1;
+  pTab^.tabFlags   := pTab^.tabFlags or passqlite3codegen.TF_Eponymous;
+  passqlite3parser.addModuleArgument(pParse, pTab,
+    sqlite3DbStrDup(Psqlite3db(db), PChar(pTab^.zName)));
+  passqlite3parser.addModuleArgument(pParse, pTab, nil);
+  passqlite3parser.addModuleArgument(pParse, pTab,
+    sqlite3DbStrDup(Psqlite3db(db), PChar(pTab^.zName)));
+  Inc(db^.nSchemaLock);
+  rc := vtabCallConstructor(db, pTab, pMd,
+                            Tsqlite3_vtab_construct(pModule^.xConnect),
+                            @zErr);
+  Dec(db^.nSchemaLock);
+  if rc <> SQLITE_OK then begin
+    { Upstream uses sqlite3ErrorMsg(p, "%s", zErr) — our port's
+      sqlite3ErrorMsg has no varargs, so pass zErr directly.  Until a
+      printf sub-phase lands sqlite3MPrintf, this drops % escapes if any
+      slipped into a constructor's error message.  Tracked alongside the
+      6.bis.1c vtabFmtMsg shim. }
+    passqlite3codegen.sqlite3ErrorMsg(pParse, zErr);
+    pParse^.rc := rc;
+    sqlite3DbFree(Psqlite3db(db), zErr);
+    sqlite3VtabEponymousTableClear(db, pMd);
+  end;
+  Result := 1;
 end;
 
 { ============================================================

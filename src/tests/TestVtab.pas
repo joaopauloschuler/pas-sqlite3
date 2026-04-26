@@ -20,6 +20,7 @@ uses
   SysUtils,
   passqlite3types,
   passqlite3util,
+  passqlite3os,
   passqlite3codegen,
   passqlite3parser,
   passqlite3vdbe,
@@ -825,6 +826,271 @@ begin
   sqlite3DbFree(db, pParse);
 end;
 
+{ ===== Phase 6.bis.1f — overload + makewritable + eponymous ============== }
+
+var
+  gOverloadCount:    i32;
+  gOverloadReturn:   i32;       { what xFindFunction returns: 0=no, 1=yes }
+  gOverloadXSFunc:   Pointer;
+  gOverloadPArg:     Pointer;
+  gOverloadSeenName: AnsiString;
+
+procedure FakeOverloadFn(pCtx: Pointer; argc: i32; argv: Pointer); cdecl;
+begin
+  { Sentinel — never actually invoked by the gate; we only check pointer
+    identity inside the carved-out FuncDef. }
+end;
+
+function FindFunctionXxx(pVtab: PSqlite3Vtab; nArg: i32; zName: PAnsiChar;
+  pxFunc: Pointer; ppArg: PPointer): i32; cdecl;
+type PProc = ^Pointer;
+begin
+  Inc(gOverloadCount);
+  gOverloadSeenName := AnsiString(zName);
+  if gOverloadReturn <> 0 then begin
+    PProc(pxFunc)^ := gOverloadXSFunc;
+    ppArg^         := gOverloadPArg;
+  end;
+  Result := gOverloadReturn;
+end;
+
+procedure TestVtabOverload_Run(db: PTsqlite3);
+var
+  m:        Tsqlite3_module;
+  pMod:     PVtabModule;
+  pParse:   TCgPParse;
+  pTab:     TCgPTable;
+  pVT:      PVTable;
+  pDef:     passqlite3vdbe.PTFuncDef;
+  pNew:     passqlite3vdbe.PTFuncDef;
+  pE:       passqlite3codegen.PExpr;
+  rc:       i32;
+  zFn:      AnsiString;
+const
+  cName = 'ovl_a';
+  cMod  = 'ovlmod';
+begin
+  WriteLn('TestVtab — Phase 6.bis.1f gate (Overload)');
+
+  FillChar(m, SizeOf(m), 0);
+  m.iVersion      := 1;
+  m.xCreate       := @CtorXConnect;     { reuse }
+  m.xConnect      := @CtorXConnect;
+  m.xDestroy      := @CtorXDestroy;
+  m.xDisconnect   := @CtorXDisconnect;
+  m.xFindFunction := @FindFunctionXxx;
+  pMod := sqlite3VtabCreateModule(db, PChar(AnsiString(cMod)), @m, nil, nil);
+  Expect(pMod <> nil, 'T71 register ovlmod');
+
+  pParse := TCgPParse(sqlite3MallocZero64(SizeOf(TCgTParse)));
+  pParse^.db := db;
+  pTab := CtorMakeTable(db, cName, cMod);
+  rc := sqlite3VtabCallConnect(pParse, pTab);
+  ExpectEq(rc, SQLITE_OK, 'T71b connect ovl_a');
+  pVT := sqlite3GetVTable(db, pTab);
+  Expect(pVT <> nil, 'T71c VTable attached');
+
+  zFn := 'match';
+  pDef := passqlite3vdbe.PTFuncDef(
+    sqlite3DbMallocZero(db, u64(SizeOf(passqlite3vdbe.TFuncDef))));
+  pDef^.zName     := PAnsiChar(zFn);
+  pDef^.nArg      := 2;
+  pDef^.funcFlags := 0;
+
+  { Build a fabricated TExpr of op=TK_COLUMN whose y.pTab == pTab. }
+  pE := passqlite3codegen.PExpr(
+    sqlite3MallocZero64(SizeOf(passqlite3codegen.TExpr)));
+  pE^.op    := u8(passqlite3codegen.TK_COLUMN);
+  pE^.y.pTab := pTab;
+
+  { Case A: xFindFunction returns 0 → pDef returned unchanged. }
+  gOverloadCount  := 0;
+  gOverloadReturn := 0;
+  pNew := sqlite3VtabOverloadFunction(db, pDef, 2, pE);
+  ExpectEq(gOverloadCount, 1, 'T72 xFindFunction invoked');
+  Expect(pNew = pDef, 'T72b returns pDef when xFindFunction = 0');
+
+  { Case B: xFindFunction returns 1 with overrides → carved-out ephemeral. }
+  gOverloadCount  := 0;
+  gOverloadReturn := 1;
+  gOverloadXSFunc := @FakeOverloadFn;
+  gOverloadPArg   := Pointer(PtrUInt($DEADBEEF));
+  pNew := sqlite3VtabOverloadFunction(db, pDef, 2, pE);
+  ExpectEq(gOverloadCount, 1, 'T73 xFindFunction invoked second time');
+  Expect(pNew <> pDef, 'T73b returns NEW FuncDef when xFindFunction = 1');
+  Expect((pNew^.funcFlags and passqlite3vdbe.SQLITE_FUNC_EPHEM) <> 0,
+    'T73c new FuncDef carries SQLITE_FUNC_EPHEM');
+  Expect(Pointer(pNew^.xSFunc) = Pointer(@FakeOverloadFn),
+    'T73d xSFunc replaced');
+  Expect(pNew^.pUserData = Pointer(PtrUInt($DEADBEEF)),
+    'T73e pUserData replaced');
+  Expect(StrComp(pNew^.zName, PChar(zFn)) = 0, 'T73f zName preserved');
+  sqlite3DbFree(db, pNew);
+
+  { Case C: pExpr=nil → pDef returned untouched. }
+  gOverloadCount := 0;
+  pNew := sqlite3VtabOverloadFunction(db, pDef, 2, nil);
+  Expect(pNew = pDef, 'T74 pExpr=nil → pDef');
+  ExpectEq(gOverloadCount, 0, 'T74b xFindFunction NOT invoked');
+
+  { Case D: pExpr.op != TK_COLUMN → pDef returned untouched. }
+  pE^.op := u8(passqlite3codegen.TK_COLUMN) + 1;
+  gOverloadCount := 0;
+  pNew := sqlite3VtabOverloadFunction(db, pDef, 2, pE);
+  Expect(pNew = pDef, 'T75 op != TK_COLUMN → pDef');
+  ExpectEq(gOverloadCount, 0, 'T75b xFindFunction NOT invoked');
+  pE^.op := u8(passqlite3codegen.TK_COLUMN);
+
+  { Case E: a module without xFindFunction → pDef returned untouched. }
+  m.xFindFunction := nil;
+  gOverloadCount := 0;
+  pNew := sqlite3VtabOverloadFunction(db, pDef, 2, pE);
+  Expect(pNew = pDef, 'T76 module xFindFunction=nil → pDef');
+
+  passqlite3os.sqlite3_free(pE);
+  sqlite3DbFree(db, pDef);
+
+  rc := sqlite3VtabCallDestroy(db, 0, cName);
+  ExpectEq(rc, SQLITE_OK, 'T77 destroy ovl_a');
+  rc := sqlite3_drop_modules(db, nil);
+  ExpectEq(rc, SQLITE_OK, 'T77b drop ovlmod');
+
+  sqlite3DbFree(db, pParse);
+end;
+
+procedure TestVtabMakeWritable_Run(db: PTsqlite3);
+var
+  pParse, pTopP: TCgPParse;
+  pTab1, pTab2:  TCgPTable;
+  pSchemaT:      TUtilPSchema;
+  apv:           PPointer;
+begin
+  WriteLn('TestVtab — Phase 6.bis.1f gate (MakeWritable)');
+  pSchemaT := TUtilPSchema(db^.aDb[0].pSchema);
+
+  pParse := TCgPParse(sqlite3MallocZero64(SizeOf(TCgTParse)));
+  pParse^.db := db;
+
+  pTab1 := TCgPTable(sqlite3MallocZero64(SizeOf(passqlite3codegen.TTable)));
+  pTab1^.eTabType := passqlite3codegen.TABTYP_VTAB;
+  pTab1^.pSchema  := passqlite3codegen.PSchema(pSchemaT);
+  pTab2 := TCgPTable(sqlite3MallocZero64(SizeOf(passqlite3codegen.TTable)));
+  pTab2^.eTabType := passqlite3codegen.TABTYP_VTAB;
+  pTab2^.pSchema  := passqlite3codegen.PSchema(pSchemaT);
+
+  { No pToplevel → MakeWritable should manipulate pParse itself. }
+  ExpectEq(pParse^.nVtabLock, 0, 'T78 initial nVtabLock=0');
+  sqlite3VtabMakeWritable(pParse, pTab1);
+  ExpectEq(pParse^.nVtabLock, 1, 'T78b after first add → 1');
+
+  { Re-adding the same pTab → no-op. }
+  sqlite3VtabMakeWritable(pParse, pTab1);
+  ExpectEq(pParse^.nVtabLock, 1, 'T79 duplicate add is no-op');
+
+  { Add a second distinct pTab → grows array. }
+  sqlite3VtabMakeWritable(pParse, pTab2);
+  ExpectEq(pParse^.nVtabLock, 2, 'T80 distinct add → 2');
+  apv := PPointer(pParse^.apVtabLock);
+  Expect((apv[0] = Pointer(pTab1)) and (apv[1] = Pointer(pTab2)),
+    'T80b array contents in insertion order');
+
+  { With pToplevel set, additions go to the top-level Parse. }
+  pTopP := TCgPParse(sqlite3MallocZero64(SizeOf(TCgTParse)));
+  pTopP^.db := db;
+  pParse^.pToplevel := pTopP;
+  sqlite3VtabMakeWritable(pParse, pTab1);
+  ExpectEq(pTopP^.nVtabLock, 1, 'T81 add via inner Parse lands in toplevel');
+  ExpectEq(pParse^.nVtabLock, 2, 'T81b inner Parse untouched');
+
+  { Cleanup: realloc'd via libc realloc → free with libc free. }
+  passqlite3os.sqlite3_free(pParse^.apVtabLock);
+  passqlite3os.sqlite3_free(pTopP^.apVtabLock);
+  passqlite3os.sqlite3_free(pTab1);
+  passqlite3os.sqlite3_free(pTab2);
+  sqlite3DbFree(db, pParse);
+  sqlite3DbFree(db, pTopP);
+end;
+
+procedure TestVtabEponymous_Run(db: PTsqlite3);
+var
+  m:        Tsqlite3_module;
+  pMod:     PVtabModule;
+  pParse:   TCgPParse;
+  rc:       i32;
+  pTab:     TCgPTable;
+const
+  cMod = 'epomod';
+begin
+  WriteLn('TestVtab — Phase 6.bis.1f gate (Eponymous)');
+
+  { Module with xCreate==xConnect → eponymous-eligible. }
+  FillChar(m, SizeOf(m), 0);
+  m.iVersion    := 1;
+  m.xCreate     := @CtorXConnect;
+  m.xConnect    := @CtorXConnect;
+  m.xDestroy    := @CtorXDestroy;
+  m.xDisconnect := @CtorXDisconnect;
+  pMod := sqlite3VtabCreateModule(db, PChar(AnsiString(cMod)), @m, nil, nil);
+  Expect(pMod <> nil, 'T82 register epomod');
+
+  pParse := TCgPParse(sqlite3MallocZero64(SizeOf(TCgTParse)));
+  pParse^.db := db;
+  db^.pVtabCtx := nil;
+
+  { Make sure declare_vtab passes during the constructor. }
+  gFailNextConnect := 0;
+  rc := sqlite3VtabEponymousTableInit(pParse, pMod);
+  ExpectEq(rc, 1, 'T82b EponymousTableInit returns 1 (success)');
+  Expect(pMod^.pEpoTab <> nil, 'T82c pEpoTab populated');
+  pTab := TCgPTable(pMod^.pEpoTab);
+  Expect((pTab^.tabFlags and passqlite3codegen.TF_Eponymous) <> 0,
+    'T83 TF_Eponymous flag set on pEpoTab');
+  ExpectEq(pTab^.iPKey, -1, 'T83b iPKey = -1');
+  ExpectEq(pTab^.u.vtab.nArg, 3,
+    'T83c azArg has [name, schema, name] = 3 entries');
+
+  { Second call is a no-op (returns 1, pEpoTab unchanged). }
+  rc := sqlite3VtabEponymousTableInit(pParse, pMod);
+  ExpectEq(rc, 1, 'T84 second EponymousTableInit returns 1');
+  Expect(TCgPTable(pMod^.pEpoTab) = pTab,
+    'T84b pEpoTab pointer unchanged on second call');
+
+  { ---- T85: Clear marks Ephemeral, calls sqlite3DeleteTable, resets
+    pEpoTab.  Note: passqlite3codegen.sqlite3DeleteTable today does NOT
+    cascade through sqlite3VtabClear (it just frees aCol+zName+the table),
+    so xDisconnect is NOT invoked at this layer.  When build.c's
+    DeleteTable port lands and chains into sqlite3VtabClear, T85b should
+    flip to expect gDisconnectCount=1.  Tracked in tasklist.md. ---- }
+  gDisconnectCount := 0;
+  sqlite3VtabEponymousTableClear(db, pMod);
+  Expect(pMod^.pEpoTab = nil, 'T85 pEpoTab cleared');
+  ExpectEq(gDisconnectCount, 0,
+    'T85b xDisconnect NOT yet fired (DeleteTable->VtabClear unported)');
+
+  { ---- T86: a module whose xCreate != xConnect (and xCreate != nil) is
+    NOT eponymous-eligible; Init returns 0 without touching pEpoTab. ---- }
+  m.xCreate  := @CtorXCreate;        { distinct from xConnect }
+  m.xConnect := @CtorXConnect;
+  rc := sqlite3VtabEponymousTableInit(pParse, pMod);
+  ExpectEq(rc, 0, 'T86 non-eponymous module → 0');
+  Expect(pMod^.pEpoTab = nil, 'T86b pEpoTab still nil');
+
+  { ---- T87: a module with xCreate=nil (connect-only) IS eponymous. ---- }
+  m.xCreate  := nil;
+  m.xConnect := @CtorXConnect;
+  rc := sqlite3VtabEponymousTableInit(pParse, pMod);
+  ExpectEq(rc, 1, 'T87 xCreate=nil eponymous module → 1');
+  Expect(pMod^.pEpoTab <> nil, 'T87b pEpoTab populated');
+
+  { Cleanup: drop modules will run sqlite3VtabModuleUnref which asserts
+    pEpoTab=nil — clear it first. }
+  sqlite3VtabEponymousTableClear(db, pMod);
+  rc := sqlite3_drop_modules(db, nil);
+  ExpectEq(rc, SQLITE_OK, 'T88 drop epomod');
+
+  sqlite3DbFree(db, pParse);
+end;
+
 var
   db: PTsqlite3;
   rc: i32;
@@ -965,6 +1231,11 @@ begin
 
   { ---- Phase 6.bis.1e — public API entry points ---- }
   TestVtabApi_Run(db);
+
+  { ---- Phase 6.bis.1f — overload + writable + eponymous tables ---- }
+  TestVtabOverload_Run(db);
+  TestVtabMakeWritable_Run(db);
+  TestVtabEponymous_Run(db);
 
   rc := sqlite3_close_v2(db);
   ExpectEq(rc, SQLITE_OK, 'T16 close_v2');

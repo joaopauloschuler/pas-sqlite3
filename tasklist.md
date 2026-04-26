@@ -20,6 +20,42 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.1f vtab.c overload + writable + eponymous
+    tables.**  Faithful ports of `sqlite3VtabOverloadFunction`
+    (vtab.c:1153..1215), `sqlite3VtabMakeWritable` (vtab.c:1223..1240),
+    `sqlite3VtabEponymousTableInit` (vtab.c:1257..1292), and the full
+    body of `sqlite3VtabEponymousTableClear` (vtab.c:1298..1308) now
+    live in `src/passqlite3vtab.pas`, replacing the 6.bis.1a stub for
+    Clear.  `addModuleArgument` was promoted to the `passqlite3parser`
+    interface so EponymousTableInit can invoke the helper without
+    duplicating its body.
+
+    Implementation notes worth memoising:
+      * `sqlite3VtabMakeWritable` reaches `passqlite3os.sqlite3_realloc64`
+        directly — `sqlite3Realloc` is not exposed cross-unit from
+        `passqlite3pager`, and `apVtabLock` is libc-malloc'd anyway.
+      * `sqlite3VtabOverloadFunction` casts `pModule^.xFindFunction`
+        (declared `Pointer` for the 24-slot module record) through a
+        local `TVtabFindFn = function(...)` typedef.  Worth keeping the
+        local typedef pattern in mind for future module-pointer-slot
+        invocation paths (xBestIndex, xFilter, xColumn, xRowid).
+      * `sqlite3ErrorMsg("%s", zErr)` collapses to `sqlite3ErrorMsg(zErr)`
+        in the EponymousTableInit error path — same trade as 6.bis.1c's
+        `vtabFmtMsg` shim, awaits the `sqlite3MPrintf` sub-phase.
+      * Pascal naming pitfall (recurring): `pModule` parameter collides
+        modulo case with `PModule` type; renamed to `pMd`.
+
+    Wiring caveat carried over to Phase 7 build.c work:
+      * Our `passqlite3codegen.sqlite3DeleteTable` is a pre-vtab stub
+        — it frees aCol+zName+the table itself but does NOT cascade
+        through `sqlite3VtabClear` to disconnect attached VTables.
+        Gate T85b therefore asserts `gDisconnectCount = 0` after
+        `sqlite3VtabEponymousTableClear`; flip to 1 once
+        `sqlite3DeleteTable` chains into `sqlite3VtabClear`.
+
+    Gate `src/tests/TestVtab.pas` extended with T71..T88 — **181/181
+    PASS** (was 141/141).  No regressions across the 41 other gates.
+
   - **2026-04-26 — Phase 6.bis.1e vtab.c public API entry points.**
     Faithful ports of `sqlite3_declare_vtab` (vtab.c:811..917),
     `sqlite3_vtab_on_conflict` (vtab.c:1317..1328), and
@@ -2656,11 +2692,55 @@ Phase 5.9 depends on this being done first.
         the only way to drive the function from a unit test without
         a working xUpdate path.
 
-  - [ ] **6.bis.1f** Function overload + writable + eponymous tables:
-    sqlite3VtabOverloadFunction (vtab.c:1153), sqlite3VtabMakeWritable
-    (vtab.c:1223), sqlite3VtabEponymousTableInit/Clear (vtab.c:1257..
-    1316).  At this point sqlite3VtabEponymousTableClear's stub in
-    6.bis.1a can be replaced with the real body.
+  - [X] **6.bis.1f** Function overload + writable + eponymous tables
+    (vtab.c:1153..1316).  DONE 2026-04-26.  Faithful ports of
+    `sqlite3VtabOverloadFunction`, `sqlite3VtabMakeWritable`,
+    `sqlite3VtabEponymousTableInit`, and the full body of
+    `sqlite3VtabEponymousTableClear` (replacing the 6.bis.1a stub) now
+    live in `src/passqlite3vtab.pas`.  `addModuleArgument` was promoted
+    to the `passqlite3parser` interface so EponymousTableInit can append
+    the three module-arg slots without duplicating the helper.  Gate
+    `src/tests/TestVtab.pas` extended with T71..T88 — **181/181 PASS**
+    (was 141/141).  No regressions across the 41 other gates.
+
+    Pascal/cross-language deltas worth memoising:
+      * `sqlite3Realloc` (libc realloc, no db) is not exposed from
+        `passqlite3pager` to other units.  `sqlite3VtabMakeWritable`
+        therefore calls `passqlite3os.sqlite3_realloc64` directly.  This
+        is allocator-faithful (apVtabLock is freed by libc free in the
+        Parse cleanup path) but the cross-unit mismatch is worth a note
+        for any future code that reaches for sqlite3Realloc.
+      * `sqlite3ErrorMsg` in our port is single-arg (no varargs); upstream
+        `sqlite3ErrorMsg(p, "%s", zErr)` is collapsed to just
+        `sqlite3ErrorMsg(p, zErr)`.  This drops `%`-escapes if any
+        slipped into the constructor's error message — same trade as the
+        6.bis.1c `vtabFmtMsg` shim.  Lifts when the printf sub-phase
+        ports `sqlite3MPrintf`.
+      * Pascal naming pitfall: the `pModule` parameter in
+        EponymousTableInit collides modulo case with the unit-level
+        `PModule = ^Tsqlite3_module`.  Renamed to `pMd` (mirroring the
+        `TVtabModule` rename from 6.bis.1a).
+      * `xFindFunction` slot in `Tsqlite3_module` is `Pointer`; the
+        Phase 6.bis.1a record left it untyped to avoid having to redeclare
+        all 24 callbacks as forward types.  Overload casts via a local
+        `TVtabFindFn = function(...)` typedef to invoke it.
+      * Test-side `Pointer(pNew^.xSFunc) = Pointer(@FakeFn)` works in
+        FPC objfpc mode for procedural-typed values; `@var^.xSFunc` would
+        compare addresses-of-the-slot, which is wrong.
+
+    Wiring caveats (carry-over for next sub-phases):
+      * `passqlite3codegen.sqlite3DeleteTable` today only frees aCol +
+        zName + the table struct — it does NOT cascade through
+        `sqlite3VtabClear` to disconnect attached VTables.  Test T85b
+        therefore expects `gDisconnectCount = 0` after
+        `sqlite3VtabEponymousTableClear`; flip to expect 1 once the
+        build.c port lands and DeleteTable chains into VtabClear.  Same
+        gap blocks full eponymous-vtab teardown from being observably
+        leak-free (the VTable + sqlite3_vtab + module nRefModule are
+        not unwound at clear time).
+      * `sqlite3VtabMakeWritable` is now callable but no codegen path
+        invokes it yet — `OP_VBegin` emission is gated on the same
+        Phase-7 build.c work.  Tracked under 6.bis.1d's wiring caveat.
 - [ ] **6.bis.2** Port the three in-tree virtual tables:
   - `dbpage.c` — the built-in `sqlite_dbpage` vtab (exposes raw DB pages).
   - `dbstat.c` — the built-in `dbstat` vtab (B-tree statistics).
