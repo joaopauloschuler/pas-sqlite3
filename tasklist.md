@@ -20,6 +20,60 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.8.h.5 json_each / json_tree vtabs.**  Lands
+    the four-spelling read-only virtual table module
+    (`json_each` / `json_tree` / `jsonb_each` / `jsonb_tree`) plus the
+    `sqlite3JsonVtabRegister(db, zName)` entry point that 6.8.h.6 will
+    wire into `sqlite3RegisterBuiltinFunctions`.  The full Connect /
+    Disconnect / Open / Close / Filter / Next / Eof / Column / Rowid /
+    BestIndex callback set is faithfully ported from json.c:5020..5680.
+
+    Concrete changes:
+      * `src/passqlite3jsoneach.pas` — **new unit** (~600 lines).
+        Exports `jsonEachModule`, `sqlite3JsonVtabRegister`, the
+        `JEACH_*` column-ordinal constants, and the `TJsonParent`
+        / `TJsonEachConnection` / `TJsonEachCursor` records.
+        `uses passqlite3vtab + passqlite3json + passqlite3vdbe`.
+      * `src/tests/TestJsonEach.pas` — **new gate**.  50 asserts:
+        4-spelling registration + case-insensitive lookup,
+        15-slot module layout, 5-case BestIndex dispatch (empty /
+        JSON only / JSON+ROOT / unusable JSON → CONSTRAINT /
+        non-hidden ignored), 10 column-ordinal constants pin.
+        **50/50 PASS.**
+      * `src/tests/build.sh` — adds `compile_test TestJsonEach`.
+      * Regression spot check: TestJson 434/434, TestPrintf 105/105,
+        TestVtab 216/216, TestParser 45/45, TestSchemaBasic 44/44,
+        TestVdbeApi 57/57, TestCarray 66/66.
+
+    Discoveries / next-step notes:
+      * **`jsonPrintf` stays private; jsonAppendPathName uses three
+        local stand-ins** (jeAppendInt64 / jeFmtArrayKey /
+        jeFmtObjectKey[Quoted]).  Promoting jsonPrintf to interface
+        would re-export the JsonString printf machinery for one
+        five-character format chunk.  Switch back when a future
+        chunk needs it publicly.
+      * **`'$'` to PAnsiChar coercion is unsafe.**  FPC parses a
+        single-quoted single character as `AnsiChar`, not as a
+        string literal; passing `'$'` directly to a `PAnsiChar`
+        parameter is rejected.  Fix: declare a local
+        `cDollar: AnsiChar` and pass `@cDollar`.  Same trap any
+        future single-byte path-anchor write will hit.
+      * **`PPsqlite3_value` indexes directly: `argv[0]`, `argv[1]`.**
+        No need for the `^Psqlite3_value` aliasing trick — FPC's
+        subscript operator on `^T` (where `T = ^U`) yields a `^U`
+        (i.e. `Psqlite3_value`).  Same convention as carray.
+      * **`malformed JSON` error string flows through
+        `sqlite3VtabFmtMsg1Libc`.**  C uses `sqlite3_mprintf(...)`;
+        the Pascal port routes through the libc-allocated helper so
+        `sqlite3_free(pVtab^.zErrMsg)` clears it uniformly.
+      * **xColumn / full Filter+Next walk gated end-to-end deferred
+        to 6.8.h.6.**  xColumn needs a live `Tsqlite3_context`; full
+        `jsonEachFilter` end-to-end needs a `Psqlite3_value` shaped
+        like a real SQL value plus `jsonConvertTextToBlob`'s
+        diagnostic plumbing.  6.8.h.5 pins the stable, dep-free
+        surface (module shape + BestIndex); SQL-level coverage rides
+        registration in 6.8.h.6.
+
   - **2026-04-26 — Phase 6.8.h.4 JSON aggregates.**  Lands the
     `json_group_array` / `json_group_object` aggregate SQL surface,
     closing the deferred 6.8.h.4 slot.  Seven new public cdecl entry
@@ -4145,10 +4199,87 @@ reference exactly.
           mirrors C's `(pStr->nUsed>1 && z!=0)` separator guard plus
           the `if (z!=0)` wrap around the name/colon/value triple.
           T433 covers the mid-aggregate skip case.
-    - [ ] **6.8.h.5** Virtual tables — `json_each`, `json_tree`
+    - [X] **6.8.h.5** Virtual tables — `json_each`, `json_tree`
       (xConnect/Disconnect/Open/Close/Filter/Next/Eof/Column/Rowid
-      /BestIndex).  Big chunk; needs vtab module shape from earlier
-      phases.
+      /BestIndex).
+      DONE 2026-04-26.  Lands the four-spelling read-only vtab module
+      (`json_each` / `json_tree` / `jsonb_each` / `jsonb_tree`) and the
+      `sqlite3JsonVtabRegister(db, zName)` entry point that 6.8.h.6
+      will wire into `sqlite3RegisterBuiltinFunctions`.  Gate
+      `TestJsonEach.pas` 50/50 PASS.  Regression spot check: TestJson
+      434/434, TestPrintf 105/105, TestVtab 216/216, TestParser 45/45,
+      TestSchemaBasic 44/44, TestVdbeApi 57/57, TestCarray 66/66.
+
+      Concrete changes:
+        * `src/passqlite3jsoneach.pas` — **new unit** (~600 lines).
+          Faithful port of json.c:5020..5680 (json_each/json_tree).
+          Exposes `jsonEachModule`, `sqlite3JsonVtabRegister`, the
+          `JEACH_*` column-ordinal constants, and the `TJsonParent`
+          / `TJsonEachConnection` / `TJsonEachCursor` records.
+        * `src/tests/TestJsonEach.pas` — **new gate**.  Module
+          registration (4 spellings + unknown spelling → nil +
+          case-insensitive), module slot layout (15 slots),
+          BestIndex constraint dispatch (5 cases: empty / JSON
+          only / JSON+ROOT / unusable JSON / non-hidden ignored),
+          column-ordinal pin (10).  50 asserts.
+        * `src/tests/build.sh` — adds `compile_test TestJsonEach`.
+
+      Discoveries / next-step notes:
+        * **Kept in a separate unit (passqlite3jsoneach) rather than
+          appended to passqlite3json.**  passqlite3json.pas is already
+          5061 lines; the json_each port pulls in `passqlite3vtab`
+          (sqlite3_module / sqlite3_vtab_cursor / declare_vtab /
+          vtab_config / VtabCreateModule).  Following the same
+          pattern as `passqlite3carray` / `passqlite3dbpage` /
+          `passqlite3dbstat`, which also live as separate units that
+          `uses passqlite3vtab`.  Avoids dragging the parser/codegen
+          chain into the JSON core.
+        * **`jsonPrintf` stayed private; jsonAppendPathName uses three
+          local stand-ins.**  json.c reuses its private `jsonPrintf`
+          for `[%lld]`, `."%.*s"`, `.%.*s`.  Promoting it to interface
+          would re-export the entire JsonString-formatter machinery.
+          Wrote `jeAppendInt64` + `jeFmtArrayKey` + `jeFmtObjectKey` /
+          `jeFmtObjectKeyQuoted` instead — three 4-line helpers that
+          drive `jsonAppendRaw`.  If a future chunk (e.g. when the
+          full json5 number formatter lands) needs jsonPrintf publicly,
+          remove these stand-ins and switch back.
+        * **`'$'` to PAnsiChar coercion is unsafe.**  FPC parses a
+          single-quoted single character as `AnsiChar`, not as a
+          string literal — passing `'$'` directly to a `PAnsiChar`
+          parameter is rejected.  Fix: declare a local `cDollar:
+          AnsiChar` and pass `@cDollar`.  Same trap any future
+          single-byte path-anchor write will hit; flagged in the
+          porting-rule list.
+        * **`PPsqlite3_value` indexes directly: `argv[0]`, `argv[1]`.**
+          No need for the `^Psqlite3_value` aliasing trick — FPC's
+          subscript operator on `^T` (where `T = ^U`) yields a `^U`
+          (i.e. `Psqlite3_value`) directly.  Same convention as carray.
+        * **`malformed JSON` error string flows through
+          `sqlite3VtabFmtMsg1Libc`.**  C uses
+          `sqlite3_mprintf("malformed JSON")`; the Pascal port routes
+          through the libc-allocated VtabFmtMsg1 helper so
+          `sqlite3_free(pVtab^.zErrMsg)` clears it uniformly.  Same
+          two-call pattern as `passqlite3carray`'s unknown-datatype
+          branch.
+        * **Cursor allocation is libc when `pTab^.db = nil`.**  Tests
+          that fabricate a cursor without a live DB connection rely
+          on `sqlite3DbMallocZero(nil, ...)` falling through to libc
+          malloc — same convention as the 6.8.h.4 aggregate context
+          plumbing.  Production callers always pass a live db.
+        * **Column tests deferred.**  The xColumn callback is wired
+          but exercising it requires a live `Tsqlite3_context` *and*
+          a populated `TJsonParse`.  Pinning xColumn end-to-end
+          (key/value/type/atom/path/fullkey) belongs with 6.8.h.6
+          when the registration layer wires the vtab into the SQL
+          parser; meanwhile, structurally identical to C and gated
+          by xBestIndex/xFilter compile-time success.
+        * **Cursor walk via `jsonEachFilter` is also deferred from
+          this gate** — `jsonEachFilter` requires a `Psqlite3_value`
+          shaped like a real SQL value (text bytes + nJson length),
+          and `jsonConvertTextToBlob` writes diagnostics into the
+          parser's `pCtx`.  Module-shape + BestIndex coverage is the
+          stable surface for 6.8.h.5; full filter/next/column
+          coverage rides 6.8.h.6.
     - [ ] **6.8.h.6** Registration — `sqlite3RegisterJsonFunctions`
       and `sqlite3JsonVtabRegister`; wire into
       `sqlite3RegisterBuiltinFunctions` so the `json_*` SQL surface
