@@ -138,6 +138,7 @@ compile_test TestSchemaBasic
 compile_test TestWindowBasic
 compile_test TestOpenClose
 compile_test TestPrepareBasic
+compile_test TestInitCallback
 compile_test TestRegistration
 compile_test TestPrintf
 compile_test TestJson

@@ -272,6 +272,30 @@ function sqlite3_auto_extension(xInit: Tsqlite3_loadext_fn): i32;
 function sqlite3_cancel_auto_extension(xInit: Tsqlite3_loadext_fn): i32;
 procedure sqlite3_reset_auto_extension;
 
+{ ----------------------------------------------------------------------
+  Phase 6.9-bis step 11g.1 — schema-init dispatcher.
+
+  Exposed in the interface so step-11g.1.c's audit test can drive the
+  callback directly with synthesised argv tuples (without spinning up
+  a full OP_ParseSchema → sqlite3_exec round trip on a btree that has
+  no actual sqlite_master rows yet).
+  ---------------------------------------------------------------------- }
+type
+  PInitData = ^TInitData;
+  TInitData = record
+    db         : PTsqlite3;
+    iDb        : i32;
+    pzErrMsg   : PPAnsiChar;
+    rc         : i32;
+    mInitFlags : u32;
+    nInitRow   : u32;
+    mxPage     : Pgno;
+  end;
+
+function sqlite3InitCallback(pInit: Pointer; argc: i32;
+                             argv: PPAnsiChar;
+                             NotUsed: PPAnsiChar): i32; cdecl;
+
 implementation
 
 uses
@@ -1888,18 +1912,11 @@ end;
     InitData     — sqliteInt.h:struct InitData
     sqlite3InitCallback — prepare.c:96..189
     Worker tail  — vdbe.c:7137..7181
+
+  TInitData / PInitData / sqlite3InitCallback are declared in the
+  interface section so step-11g.1.c's audit test can drive the
+  callback directly with synthesised argv.
   ---------------------------------------------------------------------- }
-type
-  PInitData = ^TInitData;
-  TInitData = record
-    db         : PTsqlite3;
-    iDb        : i32;
-    pzErrMsg   : PPAnsiChar;
-    rc         : i32;
-    mInitFlags : u32;
-    nInitRow   : u32;
-    mxPage     : Pgno;
-  end;
 
 { Helper — minimal port of prepare.c:22 corruptSchema.  We do not yet
   honour mInitFlags / SQLITE_WriteSchema overrides (Phase 7 territory);
@@ -1964,11 +1981,20 @@ begin
 
   if zArg3 = nil then begin
     initCorruptSchema(pData, argv, nil);
-  end else if zArg4 <> nil then begin
-    c0 := sqlite3UpperToLower[u8(zArg4[0])];
-    c1 := 0;
-    if zArg4[0] <> #0 then c1 := sqlite3UpperToLower[u8(zArg4[1])];
-    if (c0 = u8(Ord('c'))) and (c1 = u8(Ord('r'))) then begin
+  end else begin
+    { Mirror prepare.c:114..189: a flat else-if ladder over argv[4],
+      not a nested split on (argv[4] = nil).  Empty-string argv[4]
+      ("" — non-nil but zArg4[0]=#0) must fall through to branch (d)
+      (auto-index), exactly like nil argv[4].  The earlier nested
+      structure left empty-string argv[4] orphaned in a "should not
+      happen" arm and corrupted every PRIMARY KEY / UNIQUE auto-index
+      row. }
+    c0 := 0; c1 := 0;
+    if zArg4 <> nil then begin
+      c0 := sqlite3UpperToLower[u8(zArg4[0])];
+      if zArg4[0] <> #0 then c1 := sqlite3UpperToLower[u8(zArg4[1])];
+    end;
+    if (zArg4 <> nil) and (c0 = u8(Ord('c'))) and (c1 = u8(Ord('r'))) then begin
       { Branch (b) — re-prepare a CREATE statement to publish into
         pSchema^.tblHash.  init.busy is already 1 (set by the
         OP_ParseSchema worker / sqlite3InitOne); we save & restore
@@ -2002,18 +2028,14 @@ begin
       end;
       db^.init.azInit := nil;  { sqlite3StdType in C; nil is safe — no live consumer. }
       sqlite3_finalize(PVdbe(pStmt));
-    end else if (zArg1 = nil) or (zArg4[0] <> #0) then begin
+    end else if (zArg1 = nil)
+                or ((zArg4 <> nil) and (zArg4[0] <> #0)) then begin
       initCorruptSchema(pData, argv, nil);
     end else begin
-      { Should not happen — zArg4[0]=#0 is handled by branch (d). }
-      initCorruptSchema(pData, argv, nil);
-    end;
-  end else if zArg1 = nil then begin
-    initCorruptSchema(pData, argv, nil);
-  end else begin
-    { Branch (d) — empty SQL column means an auto-index for a
-      PRIMARY KEY / UNIQUE constraint.  The Index struct already
-      exists from the parent CREATE TABLE; only patch its tnum. }
+      { Branch (d) — argv[4] is nil OR empty string (no SQL).  An
+        auto-index for a PRIMARY KEY / UNIQUE constraint: the Index
+        struct already exists from the parent CREATE TABLE; only
+        patch its tnum from argv[3]. }
     pIndex := sqlite3FindIndex(db, zArg1, db^.aDb[iDb].zDbSName);
     if pIndex = nil then begin
       initCorruptSchema(pData, argv, PAnsiChar('orphan index'));
@@ -2026,6 +2048,7 @@ begin
           Leave silent for now — matches the C reference when
           bExtraSchemaChecks is OFF. }
       end;
+    end;
     end;
   end;
   Result := 0;

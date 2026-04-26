@@ -20,6 +20,106 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 11g.1.c): audit init.busy=1
+    publication arms via live sqlite3InitCallback + fix empty-string
+    argv[4] bug.**  Closes the third and last sub-task of step 11g.1.
+    Adds a dedicated unit test (`TestInitCallback.pas`, 4 cases / 29
+    PASS) that drives `sqlite3InitCallback` directly with synthesised
+    5-element argv tuples — bypassing OP_ParseSchema's SELECT against
+    sqlite_master (which returns 0 rows today because step 11e's
+    sqlite3Insert is still a structural skeleton).  This is the first
+    end-to-end exercise of `sqlite3EndTable`'s init.busy=1 arm
+    (`codegen.pas:6892..6904`) and `sqlite3CreateIndex`'s
+    (`codegen.pas:7562..7572`) under the *parser-driven* path
+    (sqlite3Prepare from sqlite3InitCallback), as opposed to the
+    sqlite3InstallSchemaTable bootstrap that openDatabase uses for
+    sqlite_master.
+    [X]
+
+    Concrete changes:
+      * `src/passqlite3main.pas` interface section (~line 275) — promote
+        `TInitData` / `PInitData` types and `sqlite3InitCallback` into
+        the interface so the audit test can drive the dispatcher with
+        synthesised argv.  Removed the duplicate type decl from the
+        implementation section; behaviour is unchanged.
+      * `src/passqlite3main.pas:1982..2052` — restructure the argv[4]
+        ladder into a flat else-if chain matching prepare.c:114..189
+        exactly.  The previous nested form (`if zArg4 <> nil then …
+        else if zArg1 = nil then … else { branch (d) }`) made branch
+        (d) — the auto-index tnum patch — unreachable when
+        `argv[4] = ""` (empty string but non-nil), because empty
+        argv[4] entered the inner zArg4-non-nil arm and fell through
+        to a "should not happen" `initCorruptSchema` call.  C's
+        prepare.c:114..189 reaches branch (d) for *both* nil argv[4]
+        and empty-string argv[4]; the new ladder follows that contract.
+      * `src/tests/TestInitCallback.pas` — new test program with four
+        cases:
+          T1 CREATE TABLE via callback → pTab in main.tblHash, tnum=2,
+             pSchema = aDb[0].pSchema, zName = "foo".  Also asserts
+             absence under "temp" (correct iDb dispatch).
+          T2 CREATE INDEX via callback → pIdx in main.idxHash, tnum=3,
+             pSchema = aDb[0].pSchema.
+          T3 Auto-index branch (empty SQL) → pre-stages a 1-col
+             Index in idxHash with tnum=0, then drives the callback
+             with argv[4]="" and asserts pIdx^.tnum is patched to 5.
+             This is the case the empty-string bug was hiding.
+          T4 Corrupt-schema branches (a) and (c) — argv[3]=nil and
+             non-c-r argv[4] both set initData.rc = SQLITE_CORRUPT.
+      * `src/tests/build.sh` — register TestInitCallback in the
+        compile_test list.
+
+    Test status:
+      * TestInitCallback: **29 PASS / 0 FAIL** across 4 cases.
+      * Regression sweep (2026-04-26): TestPrepareBasic 20/20,
+        TestParser 45/45, TestParserSmoke 20/20, TestSchemaBasic
+        44/44, TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic
+        49/49, TestExprBasic 40/40, TestVdbeTxn 8/8,
+        TestAuthBuiltins 34/34, TestOpenClose 17/17, TestSmoke /
+        TestUtil clean, TestExplainParity unchanged at
+        **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **Empty-string argv[4] bug.**  The structural-skeleton
+        landing of step 11g.1.b silently corrupted every PRIMARY KEY /
+        UNIQUE auto-index row.  In SQLite's sqlite_master schema, the
+        sql column for an auto-index is the empty string (not NULL),
+        because the parser synthesises the index without source SQL.
+        The previous nested ladder routed empty-string argv[4] into
+        the c-r-branch fall-through, hitting `initCorruptSchema` and
+        propagating SQLITE_CORRUPT out through OP_ParseSchema.  The
+        bug was latent because step 11e's sqlite3Insert emits zero
+        ops, so OP_ParseSchema's SELECT never returned an auto-index
+        row in the live build.  The audit test surfaced it on T3
+        (`got 11, expected 0`).  Fix matches prepare.c:114 exactly:
+        `if argv[4] && argv[4][0]=='c' && [1]=='r'` is one arm; the
+        else-if for SQLITE_CORRUPT is `argv[1]==0 || (argv[4] &&
+        argv[4][0])`; default is the auto-index branch.
+      * **init.busy=1 arms verified end-to-end.**  Both
+        `codegen.pas:6892..6904` (table) and `:7562..7572` (index)
+        now have a regression-protected run through the
+        sqlite3Prepare→parser path, not just sqlite3InstallSchemaTable.
+        Hash-key zName lifetime, pSchema selection (iDb-correct), and
+        tnum patching all survive the inner statement's
+        sqlite3_finalize.  No latent bugs surfaced beyond the
+        empty-argv[4] one above.
+      * **TestExplainParity count still didn't move — expected.**
+        Same blocker as 11g.1.b: until step 11e's sqlite3Insert
+        actually writes schema rows, the SELECT against sqlite_master
+        returns 0 rows and the live OP_ParseSchema → callback chain
+        is dead-loop.  TestInitCallback bypasses that dead loop by
+        synthesising argv directly; it cannot flip TestExplainParity.
+      * **Step 11g.1 fully complete.**  All three sub-tasks
+        (11g.1.a structural skeleton, 11g.1.b productive callback,
+        11g.1.c codegen-arm audit) are now [X].  The remaining gap
+        in TestExplainParity is owned by step 11e (sqlite3Insert
+        productive emission) and step 11g.2 (sqlite3WhereBegin), not
+        by anything in 11g.1.
+      * **Next 6.9-bis target: step 11g.2 — sqlite3WhereBegin /
+        WhereOkOnePass / WhereEnd.**  Planner-core port; required by
+        sqlite3DeleteFrom / sqlite3Update productive emission tails
+        (codegen.pas:5460..5471, 5660..5670, currently TODO).  Largest
+        single piece of remaining work for this sub-phase.
+
   - **2026-04-26 — Phase 6.9-bis (step 11g.1.b): productive
     sqlite3InitCallback — c-r prepare branch + auto-index tnum
     branch.**  Replaces the minimal "bump nInitRow only" stub at
@@ -7528,13 +7628,16 @@ Phase 5.9 depends on this being done first.
 
   Sub-tasks formalised from step 11f's discoveries:
 
-  - [~] **6.9-bis step 11g.1** Port `OP_ParseSchema` in
-    `passqlite3vdbe.pas:7134` (currently a no-op stub).
-    *Partial:* sub-step 11g.1.a (structural skeleton + dispatch hook
-    + sqlite3_exec-driven worker + minimal sqlite3InitCallback) landed
-    2026-04-26.  Sub-steps 11g.1.b (re-prepare argv[4] / no-SQL index
-    branch) and 11g.1.c (init.busy=1 codegen-arm audit) still
-    outstanding — see "Most recent activity" for the full split.  Required
+  - [X] **6.9-bis step 11g.1** Port `OP_ParseSchema` in
+    `passqlite3vdbe.pas:7134` (originally a no-op stub).
+    *Complete (2026-04-26):* all three sub-steps shipped —
+    11g.1.a (structural skeleton + dispatch hook + sqlite3_exec
+    worker + minimal sqlite3InitCallback), 11g.1.b (productive
+    callback: c-r re-prepare branch + auto-index tnum branch +
+    initCorruptSchema), and 11g.1.c (codegen-arm audit via
+    TestInitCallback; surfaced + fixed empty-string argv[4] ladder
+    bug that left the auto-index branch unreachable).  See
+    "Most recent activity" for the per-sub-step writeups.  Required
     so user tables created by `CREATE TABLE t(...)` get published to
     `db^.aDb[iDb].pSchema^.tblHash` after EndTable's emission tail
     runs; without it, `CREATE INDEX i1 ON t(a)` and `DROP TABLE t`
