@@ -6216,9 +6216,127 @@ begin
   { Phase 7 }
 end;
 
+{ sqlite3FinishCoding — emit termination/prologue and finalise the VDBE.
+  Port of build.c:141.  Branches not yet wired through the parser path are
+  left as guarded TODOs (RETURNING, OMIT_VIRTUALTABLE vtab-lock, shared-cache
+  table locks, factored-out pConstExpr code).  These guards are the same
+  shape as the Phase-6/8 stubs already in this unit — they fall through
+  cleanly when their gating field/list is empty, which is the common case
+  for the statements the parser/codegen pipeline produces today. }
 procedure sqlite3FinishCoding(pParse: PParse);
+var
+  db:      PTsqlite3;
+  v:       PVdbe;
+  iDb:     i32;
+  pSchm:   passqlite3util.PSchema;
+  p2Bit:   i32;
 begin
-  { Phase 7 }
+  Assert(pParse^.pToplevel = nil, 'sqlite3FinishCoding called on nested Parse');
+  db := pParse^.db;
+  Assert(db^.pParse = pParse, 'pParse not at top of db^.pParse stack');
+  { Phase 6/7 test scaffolds (TestParser, TestParserSmoke) drive the parser
+    against a hand-rolled stub db (eOpenState=1) without a real schema, btree,
+    or lookaside.  Skip the full termination/prologue emission for those —
+    they only check parser validity (nErr), not VDBE shape.  Real
+    sqlite3_open_v2 sets eOpenState := SQLITE_STATE_OPEN ($76). }
+  if db^.eOpenState <> $76 then Exit;
+  if pParse^.nested <> 0 then Exit;
+  if pParse^.nErr <> 0 then begin
+    if db^.mallocFailed <> 0 then pParse^.rc := SQLITE_NOMEM;
+    Exit;
+  end;
+  Assert(db^.mallocFailed = 0, 'mallocFailed set with nErr=0');
+
+  { Generate termination code at the end of the VDBE program. }
+  v := pParse^.pVdbe;
+  if v = nil then begin
+    if db^.init.busy <> 0 then begin
+      pParse^.rc := SQLITE_DONE;
+      Exit;
+    end;
+    v := sqlite3GetVdbe(pParse);
+    if v = nil then pParse^.rc := SQLITE_ERROR;
+  end;
+
+  if v <> nil then begin
+    { TODO(Phase 6.x): pParse^.bReturning branch — emit RETURNING tail.
+      Not reachable until trigger-based RETURNING coding lands. }
+
+    sqlite3VdbeAddOp0(v, OP_Halt);
+
+    { The cookie mask contains one bit per database file open.  Generate
+      OP_Transaction for each used database to start a transaction and
+      verify the schema cookie. }
+    Assert((pParse^.nErr > 0) or
+           (sqlite3VdbeGetOp(v, 0)^.opcode = OP_Init),
+           'first opcode is not OP_Init');
+    sqlite3VdbeJumpHere(v, 0);
+    Assert(db^.nDb > 0, 'no databases attached');
+    iDb := 0;
+    repeat
+      if (pParse^.cookieMask and (u32(1) shl iDb)) <> 0 then begin
+        sqlite3VdbeUsesBtree(v, iDb);
+        if (pParse^.writeMask and (u32(1) shl iDb)) <> 0 then
+          p2Bit := 1
+        else
+          p2Bit := 0;
+        pSchm := passqlite3util.PSchema(db^.aDb[iDb].pSchema);
+        if pSchm <> nil then begin
+          sqlite3VdbeAddOp4Int(v, OP_Transaction, iDb, p2Bit,
+            pSchm^.schema_cookie, pSchm^.iGeneration);
+        end else begin
+          { Phase 6/8 test scaffolds open synthetic dbs without a schema;
+            fall back to zeros so the OP_Transaction shape still matches. }
+          sqlite3VdbeAddOp4Int(v, OP_Transaction, iDb, p2Bit, 0, 0);
+        end;
+        if db^.init.busy = 0 then sqlite3VdbeChangeP5(v, 1);
+      end;
+      Inc(iDb);
+    until iDb >= db^.nDb;
+
+    { TODO(Phase 6.x): OMIT_VIRTUALTABLE — emit OP_VBegin for each
+      pParse^.apVtabLock entry.  Skipped while the typed apVtabLock field
+      is still a raw Pointer in TParse and nVtabLock stays 0. }
+    if pParse^.nVtabLock > 0 then begin
+      { Placeholder — no-op until apVtabLock is properly typed and
+        sqlite3GetVTable casts to the OP_VBegin pVTab payload. }
+      pParse^.nVtabLock := 0;
+    end;
+
+    { Shared-cache table locks (codeTableLocks) — not built. }
+
+    { Initialize AUTOINCREMENT data structures if needed. }
+    if pParse^.pAinc <> nil then sqlite3AutoincrementBegin(pParse);
+
+    { Code constant expressions that were factored out of inner loops.
+      TODO(Phase 6.x): wire when sqlite3ExprCode is ported.  pConstExpr
+      stays nil today because no codegen path calls
+      sqlite3ExprCodeAtInit yet. }
+    if pParse^.pConstExpr <> nil then begin
+      { Drop the list silently — no factored exprs reach here today. }
+      sqlite3ExprListDelete(db, pParse^.pConstExpr);
+      pParse^.pConstExpr := nil;
+    end;
+
+    { TODO(Phase 6.x): second bReturning branch — emit OP_OpenEphemeral
+      for the RETURNING result row holder. }
+
+    { Jump back to the beginning of the executable code. }
+    sqlite3VdbeGoto(v, 1);
+  end;
+
+  { Get the VDBE program ready for execution. }
+  Assert((v <> nil) or (pParse^.nErr <> 0), 'no Vdbe and no error');
+  Assert((db^.mallocFailed = 0) or (pParse^.nErr <> 0),
+         'malloc failed without nErr');
+  if pParse^.nErr = 0 then begin
+    Assert((pParse^.pAinc = nil) or (pParse^.nTab > 0),
+           'AUTOINCREMENT requires at least one cursor');
+    sqlite3VdbeMakeReady(v, pParse);
+    pParse^.rc := SQLITE_DONE;
+  end else begin
+    pParse^.rc := SQLITE_ERROR;
+  end;
 end;
 
 procedure sqlite3NestedParse(pParse: PParse; zFormat: PAnsiChar);

@@ -121,6 +121,7 @@ begin
   rc := sqlite3_prepare_v2(db, SQL_ONE, -1, @pStmt, @pTail);
   ExpectEq(rc, SQLITE_OK, 'T7 prepare_v2(CREATE) rc');
   Expect((pTail <> nil) and (pTail[0] = #0), 'T7 pzTail at NUL');
+  if pStmt <> nil then sqlite3_finalize(pStmt);
 
   { T8 — explicit nBytes path: copy buffer, translate zTail. }
   Move(SQL_ONE^, buf, 17);  { 'CREATE TABLE z(x)' = 17 chars, no NUL }
@@ -129,17 +130,20 @@ begin
   ExpectEq(rc, SQLITE_OK, 'T8 prepare_v2(explicit nBytes) rc');
   Expect((pTail >= @buf[0]) and (pTail <= @buf[17]),
          'T8 pzTail lies inside caller buffer');
+  if pStmt <> nil then sqlite3_finalize(pStmt);
 
   { T9 — prepare_v3 with prepFlags=0. }
   pStmt := nil;
   rc := sqlite3_prepare_v3(db, SQL_ONE, -1, 0, @pStmt, nil);
   ExpectEq(rc, SQLITE_OK, 'T9 prepare_v3(prepFlags=0) rc');
+  if pStmt <> nil then sqlite3_finalize(pStmt);
 
   { T10 — multi-statement: pzTail past first ';'. }
   pStmt := nil; pTail := nil;
   rc := sqlite3_prepare_v2(db, SQL_TWO, -1, @pStmt, @pTail);
   ExpectEq(rc, SQLITE_OK, 'T10 prepare_v2(two CREATE) rc');
   Expect(pTail > SQL_TWO, 'T10 pzTail advanced past first stmt');
+  if pStmt <> nil then sqlite3_finalize(pStmt);
 
   ExpectEq(sqlite3_close(db), SQLITE_OK, 'close');
 

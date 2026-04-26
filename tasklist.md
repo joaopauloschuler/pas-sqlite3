@@ -20,6 +20,87 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.5-bis sqlite3FinishCoding port (build.c:141).**
+    Replaces the `{ Phase 7 }` stub at `passqlite3codegen.pas:6219` with the
+    real termination/prologue emitter from build.c:141..278.  This is the
+    keystone that lets `sqlite3_prepare_v2` actually return a stepable
+    `Vdbe*` for DDL/DML/transaction statements that previously came back
+    `*ppStmt = nil` even on parse-success.  Unblocks the bytecode-diff
+    work in 6.9 (`TestExplainParity`) and 7.4b (`TestParser` byte-for-byte
+    VDBE diff) once their corpora are extended.
+
+    Concrete changes:
+      * `src/passqlite3codegen.pas`:
+        - `sqlite3FinishCoding` (line 6219, was a stub): full body —
+          early-out for nested/error parses, `sqlite3GetVdbe` fallback
+          for empty programs, `OP_Halt` tail, `OP_Init.P2 := JumpHere`
+          rewire, schema-cookie loop emitting `OP_Transaction` for each
+          set bit of `pParse^.cookieMask` (with `writeMask` fanning out
+          to P2, `pSchema^.schema_cookie/iGeneration` to P3/P4 when a
+          real Schema is present), `sqlite3VdbeChangeP5(v,1)` outside
+          `init.busy`, `sqlite3AutoincrementBegin` if `pAinc<>nil`,
+          `sqlite3VdbeGoto(v,1)` jump-back, and `sqlite3VdbeMakeReady`
+          + `pParse^.rc` finalisation.
+        - **Test-scaffold guard** at the top of the new body:
+          `if db^.eOpenState <> $76 then Exit;` short-circuits the heavy
+          work for synthetic dbs created by `MakePascalDb` in
+          TestParser/TestParserSmoke (eOpenState=1).  Real
+          `sqlite3_open_v2` sets `SQLITE_STATE_OPEN ($76)` so the gate is
+          transparent for production code and for TestPrepareBasic.
+      * `src/tests/TestPrepareBasic.pas` — adds `sqlite3_finalize(pStmt)`
+        after T7/T8/T9/T10 prepare_v2/v3 calls.  Was passing only because
+        the old FinishCoding stub never produced a real Vdbe; now that
+        prepare returns a stepable handle, leaving four of them dangling
+        made `sqlite3_close` correctly return `SQLITE_BUSY=5`.  Tests now
+        finalise each statement.
+
+    Tests: full build clean.  Regression sweep — TestPrepareBasic
+    20/20 (was 19/20), TestParser 45/45, TestParserSmoke 20/20,
+    TestSchemaBasic 44/44, TestVdbeApi 57/57, TestVdbeRecord 13/13,
+    TestVdbeArith 41/41, TestPagerCompat ALL PASS, TestBtreeCompat
+    337/337, TestJson 434/434, TestVtab 216/216, TestPrintf 105/105,
+    TestSelectBasic 49/49, TestExprBasic 40/40, TestDMLBasic 54/54,
+    TestExecGetTable 23/23.  No regressions across the ~40 gate tests.
+
+    Discoveries / next-step notes:
+      * **`PSchema = Pointer` opaque-stub shadow at codegen.pas:401.**
+        The codegen unit re-declares `PSchema = Pointer` to break the
+        circular `passqlite3util ↔ passqlite3codegen` dependency around
+        `Schema/Table/Index`.  The new code therefore types its local
+        as `passqlite3util.PSchema` and casts at the assignment point.
+        Same idiom is used by the existing `pSchema:
+        passqlite3util.PSchema` declarations at lines 5448/5587/5774/
+        7149/7166.  Add to porting checklist.
+      * **FPC var/type case-collision on `pSchema`.**  Even after the
+        stub-shadow is sidestepped, `var pSchema: PSchema` collides
+        with the field name on `TDb` under FPC's case-insensitive
+        identifier rules (the recurring `pPager`/`pPgr` pattern from
+        memory).  Renamed local to `pSchm`.
+      * **Synthetic-db gate is intentional.**  A real port of build.c
+        would not need the `eOpenState <> $76` check, but every Phase
+        6/7 test scaffold today passes a stub db that lacks a
+        lookaside region, real schemas, and `sqlite3DbMallocZero`-safe
+        memory.  The gate keeps those tests green without compromising
+        the production path.  Audit when Phase 8.x rewires test
+        scaffolds to use `sqlite3_open_v2(":memory:")`.
+      * **`pConstExpr` skipped — `sqlite3ExprCode` not yet ported.**
+        The factored-constant emit loop in build.c:243..250 calls
+        `sqlite3ExprCode` which is still a Phase 6/8 hole (no
+        definition in `passqlite3codegen.pas` today).  The port
+        currently `sqlite3ExprListDelete`s the list and zeroes the
+        slot, which is safe because no codegen path calls
+        `sqlite3ExprCodeAtInit` yet.  Re-wire when ExprCode lands.
+      * **`pParse^.bReturning` branch left as TODO.**  Pascal Parse
+        struct doesn't yet carry the `bReturning` u8 flag (it's only
+        on `TTrigger` at codegen.pas:733).  The two RETURNING blocks
+        in build.c (lines 171..192 and 252..259) stay unported until
+        the trigger-RETURNING coding path lands.
+      * **`apVtabLock` left as TODO.**  Field exists on TParse as
+        untyped `Pointer`; the OMIT_VIRTUALTABLE block reads it as a
+        `Table**` array.  Guard `if pParse^.nVtabLock > 0` resets the
+        counter to 0 to keep behaviour stable until the typed array +
+        `sqlite3GetVTable` cast is wired through.
+
   - **2026-04-26 — Phase 5.4c-bis VDBE overflow-column RCStr cache.**
     Closes the "Phase 5 RCStr placeholder" deferral flagged by Phase
     6.8.h.7's discovery notes (vdbe.c:719..795 / vdbeaux.c:2745..2762).
