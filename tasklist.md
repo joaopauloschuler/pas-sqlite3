@@ -20,6 +20,59 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.4b.2a `%r` ordinal conversion.**  Lands
+    the first follow-up half of 6.bis.4b.2 (the part the prior slice
+    flagged as ship-able independently of the float work).  Faithful
+    port of `etORDINAL` (printf.c:481..488):
+
+      * Suffix selection: `(|v| mod 10) >= 4` OR `((|v|/10) mod 10) = 1`
+        → `'th'`; otherwise 1→`'st'`, 2→`'nd'`, 3→`'rd'`.  This handles
+        the 11/12/13 teen exception (12th not 12nd) and the decade
+        resumption pattern (21st 22nd 23rd 24th; 101st 111th 121st).
+      * Sign prefix (`-`, `+`, ` `) honoured on the digit prefix; suffix
+        always uses `|value|` so e.g. `-1` → `-1st` (not `-1th`).
+      * Width is space-padded only.  Numeric zero-pad is intentionally
+        suppressed because the suffix is literal text — `0021st` would
+        be nonsense.  Matches the typical use sites (diagnostic
+        messages like `"argument %r is invalid"`).
+
+    The 6.bis.4b.2 work item is now split into three:
+      * 6.bis.4b.2a — `%r` (this slice, DONE).
+      * 6.bis.4b.2b — `%S` SrcItem (blocked by Phase 7 TSrcItem layout).
+      * 6.bis.4b.2c — full float port (`sqlite3FpDecode` / `Fp2Convert10`
+        / `sqlite3Multiply128` + ~210-line etFLOAT/etEXP/etGENERIC
+        renderer).
+
+    Concrete changes:
+      * `src/passqlite3printf.pas` — adds the `'r'` arm in the conversion
+        switch (~15 lines, right after `%T`); header doc-comment updated
+        to list `%r` and re-scope the deferred items.
+      * `src/tests/TestPrintf.pas` — adds `TestOrdinal` with T37..T57
+        (21 new asserts: signed and unsigned cases, teen exception,
+        decade resumption, three-digit cases, width pad both directions,
+        message embed).  **61/61 PASS** (was 40/40).
+      * Full regression spot check: TestVtab 216/216, TestCarray 66/66,
+        TestDbpage 68/68, TestDbstat 83/83 — all green.
+
+    Discoveries / next-step notes:
+      * The unknown-conversion fall-through (which emits `%y` verbatim
+        for an unsupported letter) was the only concern when adding a
+        new arm — confirmed `'r'` was previously hitting that fall-
+        through (T28 `unknown %y` test pattern), so any caller that
+        had been writing `%r` against the prior engine would have been
+        getting a literal `%r` echo, not a crash.  Migration is
+        therefore strictly additive.
+      * `case` arm needs `else` rather than a default-arrow — FPC's
+        `case x of N: ... else ... end` handles the missing-N fallback
+        without label-syntax; previously caught a tempting label
+        construct (`declare_ordinal: ;`) that turned out to be a
+        no-op.  Plain `if/else case/else end` works.
+      * 6.bis.4b.2c (float port) is the bulk of the remaining 6.bis.4b
+        work and is genuinely substantial — `sqlite3FpDecode` depends
+        on `sqlite3Multiply128`, the `powerOfTen` lookup table, and
+        the bespoke base-10/base-2 conversion helpers.  Earmarking
+        this as a dedicated slice rather than rolling it into 4b.2.
+
   - **2026-04-26 — Phase 6.bis.4b.1 printf migration of FmtMsg shims +
     partial `sqlite3VtabFinishParse` wiring.**  Discharges the first
     half of the 6.bis.4b follow-up promised in 6.bis.4a:
@@ -3799,15 +3852,35 @@ Phase 5.9 depends on this being done first.
         TestDbstat 83/83, TestVdbeVtabExec 50/50).  No regressions
         elsewhere.
 
-  - [ ] **6.bis.4b.2** Remaining 6.bis.4b scope: float conversions
-    (`%f %e %E %g %G`) plus exotic extras (`%S` SrcItem, `%r`
-    ordinal).  Float printing must round-trip SQLite's bespoke
-    `sqlite3FpDecode` / `sqlite3Fp2Convert10` rendering
-    (`util.c:1380` + `printf.c:528..738`) — *not* plain libc
-    snprintf — to keep `.dump` byte-identical with the C reference.
-    `%S` requires a stable `SrcItem` layout (Phase 7 codegen).  `%r`
-    is a 5-line `etORDINAL` arm (printf.c:481..488) that can ship
-    independently of the float work.
+  - [X] **6.bis.4b.2a** `%r` ordinal conversion.  DONE 2026-04-26.
+    Faithful port of `etORDINAL` (printf.c:481..488):
+    1st/2nd/3rd/4th, with the 11/12/13 teen exception and decade
+    resumption (21st 22nd 23rd 24th, 101st 111th 121st).  Sign prefix
+    preserved on negatives; suffix selection uses `|value|`.  Width is
+    space-padded only — numeric zero-pad is intentionally suppressed
+    because the suffix is literal text (`0021st` would be nonsense).
+    `passqlite3printf.pas` adds the `'r'` arm (~15 lines) right after
+    the `%T` case.  `src/tests/TestPrintf.pas` extended with T37..T57
+    (21 new asserts) — **61/61 PASS** (was 40/40).  Full sweep across
+    TestVtab 216/216, TestCarray 66/66, TestDbpage 68/68, TestDbstat
+    83/83 — no regressions.
+
+  - [ ] **6.bis.4b.2b** `%S` SrcItem conversion.  Blocked by Phase 7
+    codegen's `TSrcItem` layout — the conversion needs `pSrcItem^.zName`
+    / `pSrcItem^.zAlias` / `pSrcItem^.zDatabase` and the `!` flag
+    selecting `zName` over `zAlias` (printf.c additional notes
+    block at line 120..124).  Trivial 10-line addition once the
+    layout is stable; no float dependency.
+
+  - [ ] **6.bis.4b.2c** Float conversions (`%f %e %E %g %G`).  Float
+    printing must round-trip SQLite's bespoke `sqlite3FpDecode` /
+    `sqlite3Fp2Convert10` rendering (`util.c:1380` + `printf.c:528..738`)
+    — *not* plain libc snprintf — to keep `.dump` byte-identical
+    with the C reference.  Substantial port: needs
+    `sqlite3Multiply128` (util.c), `powerOfTen` table, `pwr10to2` /
+    `pwr2to10` helpers, `countLeadingZeros`, plus the etFLOAT/etEXP/
+    etGENERIC ~210-line renderer.  Ship as its own slice with float
+    round-trip vectors.
 
 - [ ] **6.9** `TestExplainParity.pas`: for the full SQL corpus, `EXPLAIN` each
   statement via Pascal and via C; diff the opcode listings. This is the single

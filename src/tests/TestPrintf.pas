@@ -159,6 +159,39 @@ begin
   CheckEq('T36 %*d',        sqlite3FormatStr('%*d', [6, 42]), '    42');
 end;
 
+procedure TestOrdinal;
+begin
+  { Phase 6.bis.4b.2a — %r (etORDINAL).  Mirrors printf.c:481..488. }
+  CheckEq('T37 %r 1',   sqlite3FormatStr('%r', [1]),   '1st');
+  CheckEq('T38 %r 2',   sqlite3FormatStr('%r', [2]),   '2nd');
+  CheckEq('T39 %r 3',   sqlite3FormatStr('%r', [3]),   '3rd');
+  CheckEq('T40 %r 4',   sqlite3FormatStr('%r', [4]),   '4th');
+  CheckEq('T41 %r 0',   sqlite3FormatStr('%r', [0]),   '0th');
+  { Teen exception: 11..13 are *th not *st/*nd/*rd. }
+  CheckEq('T42 %r 11',  sqlite3FormatStr('%r', [11]),  '11th');
+  CheckEq('T43 %r 12',  sqlite3FormatStr('%r', [12]),  '12th');
+  CheckEq('T44 %r 13',  sqlite3FormatStr('%r', [13]),  '13th');
+  CheckEq('T45 %r 14',  sqlite3FormatStr('%r', [14]),  '14th');
+  { Decade resumption: 21st 22nd 23rd 24th, 101st 111th 112th 121st. }
+  CheckEq('T46 %r 21',  sqlite3FormatStr('%r', [21]),  '21st');
+  CheckEq('T47 %r 22',  sqlite3FormatStr('%r', [22]),  '22nd');
+  CheckEq('T48 %r 23',  sqlite3FormatStr('%r', [23]),  '23rd');
+  CheckEq('T49 %r 101', sqlite3FormatStr('%r', [101]), '101st');
+  CheckEq('T50 %r 111', sqlite3FormatStr('%r', [111]), '111th');
+  CheckEq('T51 %r 112', sqlite3FormatStr('%r', [112]), '112th');
+  CheckEq('T52 %r 121', sqlite3FormatStr('%r', [121]), '121st');
+  { Width pad — spaces, not zeros (suffix is text, not a digit). }
+  CheckEq('T53 %6r',    sqlite3FormatStr('|%6r|', [21]), '|  21st|');
+  CheckEq('T54 %-6r',   sqlite3FormatStr('|%-6r|', [21]), '|21st  |');
+  { Negative ordinals — sign prefix preserved, suffix uses |value|. }
+  CheckEq('T55 %r -1',  sqlite3FormatStr('%r', [-1]),  '-1st');
+  CheckEq('T56 %r -11', sqlite3FormatStr('%r', [-11]), '-11th');
+  { Diagnostic-message use site (the typical SQLite call pattern). }
+  CheckEq('T57 message',
+          sqlite3FormatStr('argument %r is invalid', [3]),
+          'argument 3rd is invalid');
+end;
+
 begin
   WriteLn('=== TestPrintf — Phase 6.bis.4a printf engine ===');
   TestBasics;
@@ -171,6 +204,7 @@ begin
   TestUnknownConv;
   TestHeapWrappers;
   TestSWidth;
+  TestOrdinal;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);

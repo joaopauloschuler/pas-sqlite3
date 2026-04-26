@@ -31,12 +31,16 @@ unit passqlite3printf;
     %Q   SQL string escape, wrapped in single quotes; nil → "NULL"
     %w   SQL identifier escape (double quotes doubled)
     %T   pointer to TToken — emits .n bytes from .z
+    %r   English ordinal suffix on signed integer (1st 2nd 3rd 4th ... 11th
+         12th 13th ... 21st 22nd 23rd 24th ...).  Mirrors etORDINAL in
+         printf.c:481..488.
 
   Width / precision / left-align / zero-pad / +/space sign flags supported
   for the integer and string conversions.  Floating-point (%f, %e, %g) and
-  the unusual SQLite extras (%S = SrcItem, %r = ordinal) are intentionally
-  deferred — they are unused by current call sites.  When a future slice
-  needs them, this unit adds them; signatures stay stable.
+  the SrcItem extra (%S) remain deferred to 6.bis.4b.2b/c — they require
+  the Phase-7 SrcItem layout and the FpDecode/Fp2Convert10 mini-port
+  respectively, both substantial enough to ship independently.  Signatures
+  stay stable when those land.
 
   Allocation contract:
 
@@ -549,6 +553,41 @@ begin
           NextArgPtr(Pointer(uv));
           body := emitToken(Pointer(uv));
           emitField(a, body, '', width, prec, leftAlign, False, True);
+          Inc(p);
+        end;
+      'r':
+        begin
+          { etORDINAL — printf.c:481..488.  Render the integer in decimal,
+            tack on the two-letter English ordinal suffix.  Suffix selection:
+              x := abs(value) mod 10
+              if x>=4 OR (abs(value)/10) mod 10 == 1 then x := 0  ('th')
+              else x in {1,2,3} → 'st','nd','rd' }
+          NextArgI64(iv);
+          isNeg := iv < 0;
+          if isNeg then uv := u64(-iv) else uv := u64(iv);
+          body := renderUint(uv, 10, False);
+          if isNeg then prefix := '-'
+          else if plusFlag then prefix := '+'
+          else if spaceFlag then prefix := ' '
+          else prefix := '';
+          { Append the ordinal suffix to the digit body so width applies
+            to the combined text.  The C reference prepends the suffix
+            into the same reverse buffer used for digits, so the output
+            ordering is identical. }
+          if ((uv mod 10) >= 4) or (((uv div 10) mod 10) = 1) then
+            body := body + 'th'
+          else case uv mod 10 of
+            1: body := body + 'st';
+            2: body := body + 'nd';
+            3: body := body + 'rd';
+          else
+            body := body + 'th';
+          end;
+          { Treat as string for width/pad purposes — the suffix is literal
+            text, not a digit, so numeric zero-pad would produce nonsense
+            like "0021st".  Spaces-only padding matches the typical use
+            sites (diagnostic messages like "argument %r ..."). }
+          emitField(a, body, prefix, width, -1, leftAlign, False, True);
           Inc(p);
         end;
     else
