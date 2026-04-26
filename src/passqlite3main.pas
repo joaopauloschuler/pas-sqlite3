@@ -43,7 +43,8 @@ uses
   passqlite3btree,
   passqlite3vdbe,
   passqlite3codegen,
-  passqlite3parser;  { Phase 8.2 — real sqlite3RunParser }
+  passqlite3parser,  { Phase 8.2 — real sqlite3RunParser }
+  passqlite3vtab;    { Phase 6.bis.1a — module/VTable lifecycle }
 
 type
   PPTsqlite3 = ^PTsqlite3;
@@ -910,79 +911,27 @@ begin
 end;
 
 { ----------------------------------------------------------------------
-  sqlite3_create_module / _v2 — minimal createModule.
+  sqlite3_create_module / _v2 — vtab.c:108..134.
 
-  Local Module record, mirroring sqliteInt.h:2211.  Allocated as a single
-  block: SizeOf(TModule) + Length(zName) + 1 (the name is copied just past
-  the struct, like sqlite3VtabCreateModule does).
+  The internal Module record + sqlite3VtabCreateModule live in
+  passqlite3vtab (Phase 6.bis.1a).  These public entry points are the
+  thin createModule() wrapper from vtab.c:87-101: enter the db mutex,
+  call sqlite3VtabCreateModule, ApiExit, and on failure invoke the
+  caller-supplied destructor exactly once.
   ---------------------------------------------------------------------- }
-type
-  TxModuleDestroy = procedure(p: Pointer); cdecl;
-  TModule = record
-    pModule:    Pointer;       { const sqlite3_module* }
-    zName:      PAnsiChar;
-    nRefModule: i32;
-    _pad:       i32;
-    pAux:       Pointer;
-    xDestroy:   TxModuleDestroy;
-    pEpoTab:    Pointer;       { Eponymous table — unused in Phase 8.3 }
-  end;
-  PTModule = ^TModule;
 
-function createModule(db: PTsqlite3; zName: PAnsiChar; pModule: Pointer;
-  pAux: Pointer; xDestroy: Pointer): i32;
+function _api_create_module(db: PTsqlite3; zName: PAnsiChar;
+  pModule: PSqlite3Module; pAux: Pointer; xDestroy: TxModuleDestroy): i32;
 var
-  pMod, pDel: PTModule;
-  zCopy:      PAnsiChar;
-  nName:      i32;
-  rc:         i32;
+  rc: i32;
 begin
   rc := SQLITE_OK;
   sqlite3_mutex_enter(db^.mutex);
-  if pModule = nil then begin
-    zCopy := zName;
-    pMod  := nil;
-  end else begin
-    nName := sqlite3Strlen30(PChar(zName));
-    pMod  := PTModule(sqlite3Malloc(SizeOf(TModule) + nName + 1));
-    if pMod = nil then begin
-      sqlite3OomFault(db);
-      rc := sqlite3ApiExit(db, SQLITE_OK);
-      sqlite3_mutex_leave(db^.mutex);
-      if xDestroy <> nil then TxModuleDestroy(xDestroy)(pAux);
-      Result := rc; Exit;
-    end;
-    zCopy := PAnsiChar(PByte(pMod) + SizeOf(TModule));
-    Move(zName^, zCopy^, nName + 1);
-    pMod^.zName      := zCopy;
-    pMod^.pModule    := pModule;
-    pMod^.pAux       := pAux;
-    pMod^.xDestroy   := TxModuleDestroy(xDestroy);
-    pMod^.pEpoTab    := nil;
-    pMod^.nRefModule := 1;
-  end;
-  pDel := PTModule(sqlite3HashInsert(@db^.aModule, PChar(zCopy), pMod));
-  if pDel <> nil then begin
-    if pDel = pMod then begin
-      { hash insert failed (OOM): Module is still in our hands. }
-      sqlite3OomFault(db);
-      sqlite3DbFree(Psqlite3db(db), pDel);
-      pMod := nil;
-    end else begin
-      { Replaced an existing module of the same name.  Phase 8.3:
-        no eponymous-table cleanup (vtab.c not ported); just call its
-        destructor and free it. }
-      if (pDel^.xDestroy <> nil) and (pDel^.pAux <> nil) then
-        pDel^.xDestroy(pDel^.pAux);
-      sqlite3_free(pDel);
-    end;
-  end;
+  sqlite3VtabCreateModule(db, zName, pModule, pAux, xDestroy);
   rc := sqlite3ApiExit(db, rc);
-  if (rc <> SQLITE_OK) and (xDestroy <> nil) then
-    TxModuleDestroy(xDestroy)(pAux);
+  if (rc <> SQLITE_OK) and Assigned(xDestroy) then xDestroy(pAux);
   sqlite3_mutex_leave(db^.mutex);
   Result := rc;
-  if pMod = nil then ; { silence unused warning — pMod is observed via hash }
 end;
 
 function sqlite3_create_module(db: PTsqlite3; zName: PAnsiChar;
@@ -991,7 +940,7 @@ begin
   if (sqlite3SafetyCheckOk(db) = 0) or (zName = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
-  Result := createModule(db, zName, pModule, pAux, nil);
+  Result := _api_create_module(db, zName, PSqlite3Module(pModule), pAux, nil);
 end;
 
 function sqlite3_create_module_v2(db: PTsqlite3; zName: PAnsiChar;
@@ -1000,7 +949,8 @@ begin
   if (sqlite3SafetyCheckOk(db) = 0) or (zName = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
-  Result := createModule(db, zName, pModule, pAux, xDestroy);
+  Result := _api_create_module(db, zName, PSqlite3Module(pModule), pAux,
+                               TxModuleDestroy(xDestroy));
 end;
 
 { ----------------------------------------------------------------------

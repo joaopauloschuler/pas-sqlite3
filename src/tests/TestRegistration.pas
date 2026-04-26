@@ -119,14 +119,15 @@ begin
   rc := sqlite3_create_module_v2(db, 'mymod', @dummyModule, nil, @DummyDestroy);
   ExpectEq(rc, SQLITE_OK, 'T13 create_module_v2 replace');
 
-  { Re-register same name a third time: this should call the previous
-    destructor — but our previous registration had pAux=nil, so the
-    inline createModule's "if (pDel^.xDestroy<>nil) and (pDel^.pAux<>nil)"
-    guard skips the call.  Verify destructor count stays 0. }
+  { Re-register same name a third time: the previous module's xDestroy
+    is invoked exactly once with pAux (=nil here).  Phase 6.bis.1a swaps
+    the inline pAux-guarded stub for the faithful sqlite3VtabModuleUnref
+    path, which always calls xDestroy regardless of pAux.  DummyDestroy
+    increments gDestroyCallCount unconditionally. }
   rc := sqlite3_create_module(db, 'mymod', @dummyModule, nil);
   ExpectEq(rc, SQLITE_OK, 'T14 create_module replace v2 entry');
-  ExpectEq(gDestroyCallCount, 0,
-    'T14b destructor not called (pAux was nil)');
+  ExpectEq(gDestroyCallCount, 1,
+    'T14b destructor called once (faithful vtab.c behaviour)');
 
   { create_module nil name → MISUSE. }
   rc := sqlite3_create_module(db, nil, @dummyModule, nil);

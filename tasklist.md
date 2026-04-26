@@ -20,6 +20,67 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-25 — Phase 6.bis.1a vtab.c types + module-registry leaf
+    helpers.** New unit `src/passqlite3vtab.pas` (525 lines) hosts the
+    full Pascal port of vtab.c's leaf surface:
+      * Public types matching sqlite.h byte-for-byte: `Tsqlite3_module`
+        (24 fn-pointer slots + iVersion across v1..v4), `Tsqlite3_vtab`,
+        `Tsqlite3_vtab_cursor`.
+      * Internal types from sqliteInt.h: `TVTable` (per-connection vtab
+        instance), `TVtabModule` (module registry entry; named
+        `TVtabModule` to avoid clashing with the `pModule` parameter
+        name — Pascal is case-insensitive), `TVtabCtx`.
+      * Functions ported faithfully from vtab.c:
+          - `sqlite3VtabCreateModule`         (vtab.c:39)
+          - `sqlite3VtabModuleUnref`          (vtab.c:162)
+          - `sqlite3VtabLock`                 (vtab.c:182)
+          - `sqlite3GetVTable`                (vtab.c:192)
+          - `sqlite3VtabUnlock`               (vtab.c:203)
+          - `vtabDisconnectAll` (internal)    (vtab.c:229)
+          - `sqlite3VtabDisconnect`           (vtab.c:272)
+          - `sqlite3VtabUnlockList`           (vtab.c:310)
+          - `sqlite3VtabClear`                (vtab.c:340)
+          - `sqlite3_drop_modules`            (vtab.c:140)
+      * `sqlite3VtabEponymousTableClear` is a stub that asserts
+        `pEpoTab=nil` (correct until 6.bis.1c lands the constructor
+        lifecycle that could ever attach an eponymous table).
+
+    `src/passqlite3main.pas` now imports `passqlite3vtab` and reduces
+    `sqlite3_create_module / _v2` to thin wrappers around
+    `sqlite3VtabCreateModule` (mirroring vtab.c's `createModule()` —
+    mutex_enter → CreateModule → ApiExit → mutex_leave + xDestroy on
+    failure).  The Phase 8.3 inline TModule + createModule are gone.
+
+    Behaviour change for the registry replace path: the Phase 8.3 stub
+    only invoked the previous module's `xDestroy` when both `xDestroy`
+    AND `pAux` were non-nil.  The faithful port (via
+    `sqlite3VtabModuleUnref`) calls `xDestroy(pAux)` regardless.
+    `TestRegistration.T14b` was updated to expect the destructor count
+    of 1 (was 0); see new TestVtab.T4 for an explicit assertion.
+
+    Gate: `src/tests/TestVtab.pas` — **27/27 PASS**.  No regressions
+    across the full suite (43 tests total green).
+
+    Phase 6.bis.1a scope notes (deferred):
+      * Parser-side hooks (`sqlite3VtabBeginParse`, `_FinishParse`,
+        `_ArgInit`, `_ArgExtend`) remain stubs in passqlite3parser —
+        full bodies land with **6.bis.1b**.
+      * Constructor lifecycle (`vtabCallConstructor`,
+        `sqlite3VtabCallCreate`, `sqlite3VtabCallConnect`,
+        `sqlite3VtabCallDestroy`, `growVTrans`, `addToVTrans`) — **6.bis.1c**.
+      * Per-statement hooks (`sqlite3VtabSync/Rollback/Commit/Begin/
+        Savepoint`, `callFinaliser`) — **6.bis.1d**.
+      * `sqlite3_declare_vtab`, `sqlite3_vtab_on_conflict`,
+        `sqlite3_vtab_config` — **6.bis.1e**.
+      * `sqlite3VtabOverloadFunction`, `sqlite3VtabMakeWritable`,
+        `sqlite3VtabEponymousTableInit/Clear` (full body) — **6.bis.1f**.
+
+    Pitfall captured for future sub-phases: Pascal identifier shadowing.
+    `pModule` parameter and `PModule` type alias collide (case-
+    insensitive); local var `pVTable` collides with `PVTable` type.
+    Renaming workarounds applied (PVtabModule, pVT) — keep this in mind
+    when porting the constructor lifecycle.
+
   - **2026-04-25 — Phase 8.9 loadext.c (extension-loader shims).**
     Build configuration sets `SQLITE_OMIT_LOAD_EXTENSION`, so upstream's
     loadext.c emits *only* the auto-extension surface; the dlopen path
@@ -2159,9 +2220,60 @@ SrcList ops (4), IdList ops (3), ParseObject lifecycle (4). All 44 PASS.
 Parallel mini-phase (can be slotted between 6.6 and 6.7). `vdbevtab.c` from
 Phase 5.9 depends on this being done first.
 
-- [ ] **6.bis.1** Port `vtab.c`: the virtual-table plumbing
+- **6.bis.1** Port `vtab.c`: the virtual-table plumbing
   (`sqlite3_create_module`, `xBestIndex`, `xFilter`, `xNext`, `xColumn`,
-  `xRowid`, `xUpdate`, `xSync`, `xCommit`, `xRollback`).
+  `xRowid`, `xUpdate`, `xSync`, `xCommit`, `xRollback`).  Broken into
+  sub-phases — vtab.c is ~1380 C lines and depends on a number of
+  cross-cutting helpers (Table u.vtab union, schema dispatch, VDBE
+  opcodes), so each sub-phase lands a self-contained slice with its own
+  gate test.
+
+  - [X] **6.bis.1a** Types + module registry + VTable lifecycle.
+    DONE 2026-04-25.  New unit `src/passqlite3vtab.pas` defines
+    `Tsqlite3_module / _vtab / _vtab_cursor`, `TVTable`, `TVtabModule`
+    (renamed from `TModule` — Pascal-case-insensitive collision with
+    the `pModule` parameter name), `TVtabCtx`.  Faithful ports:
+    `sqlite3VtabCreateModule`, `sqlite3VtabModuleUnref`, `sqlite3VtabLock`,
+    `sqlite3GetVTable`, `sqlite3VtabUnlock`, `vtabDisconnectAll`
+    (internal), `sqlite3VtabDisconnect`, `sqlite3VtabUnlockList`,
+    `sqlite3VtabClear`, `sqlite3_drop_modules`.
+    `passqlite3main.pas` — sqlite3_create_module / _v2 now delegate to
+    sqlite3VtabCreateModule (replacing the inline Phase 8.3 stub).
+    Gate: `src/tests/TestVtab.pas` — 27/27 PASS.  See "Most recent
+    activity" for the deferred-scope and pitfall notes.
+
+  - [ ] **6.bis.1b** Parser-side hooks: replace the stubs in
+    `passqlite3parser.pas` (sqlite3VtabBeginParse, sqlite3VtabFinishParse,
+    sqlite3VtabArgInit, sqlite3VtabArgExtend, addModuleArgument,
+    addArgumentToVtab) with the full bodies from vtab.c:359..550.
+    Requires sqlite3StartTable + sqlite3NameFromToken + sqlite3DbStrDup +
+    sqlite3MayAbort + sqlite3NestedParse + sqlite3VdbeAddOp* — all
+    already ported.  No new public API; the gate is a parser-level
+    check that `CREATE VIRTUAL TABLE foo USING mymod(...)` populates
+    `pNewTable->u.vtab.azArg` correctly and (with init.busy=1) inserts
+    the table into the schema.
+
+  - [ ] **6.bis.1c** Constructor lifecycle: vtabCallConstructor,
+    sqlite3VtabCallCreate, sqlite3VtabCallConnect, sqlite3VtabCallDestroy,
+    growVTrans, addToVTrans (vtab.c:557..968).  Adds the missing
+    transaction-list machinery (`db^.aVTrans`, `db^.nVTrans`).
+
+  - [ ] **6.bis.1d** Per-statement hooks: sqlite3VtabSync, _Rollback,
+    _Commit, _Begin, _Savepoint, callFinaliser (vtab.c:970..1151).
+    Wires the codegen / vdbe `OP_VBegin`, `OP_VSync` etc. into the
+    per-statement transaction lifecycle.
+
+  - [ ] **6.bis.1e** API entry points: sqlite3_declare_vtab,
+    sqlite3_vtab_on_conflict, sqlite3_vtab_config (vtab.c:811..1374).
+    declare_vtab parses CREATE TABLE text via the existing parser;
+    vtab_config takes varargs (split into typed Pascal entry points,
+    same approach as Phase 8.4 db_config).
+
+  - [ ] **6.bis.1f** Function overload + writable + eponymous tables:
+    sqlite3VtabOverloadFunction (vtab.c:1153), sqlite3VtabMakeWritable
+    (vtab.c:1223), sqlite3VtabEponymousTableInit/Clear (vtab.c:1257..
+    1316).  At this point sqlite3VtabEponymousTableClear's stub in
+    6.bis.1a can be replaced with the real body.
 - [ ] **6.bis.2** Port the three in-tree virtual tables:
   - `dbpage.c` — the built-in `sqlite_dbpage` vtab (exposes raw DB pages).
   - `dbstat.c` — the built-in `dbstat` vtab (B-tree statistics).
