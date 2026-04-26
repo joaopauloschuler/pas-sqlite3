@@ -2640,12 +2640,11 @@ var
   n:       i32;
 begin
   db      := p^.db;
-  { read key sizes from Parse (byte offsets) }
-  nVar    := i32(PWord(PByte(pParse) + 120)^);   { Parse.nVar at offset 120? }
-  { Use 0 safely if Parse layout is uncertain — will be replaced in Phase 6 }
-  nVar    := 0;
-  nMem    := 0;
-  nCursor := 0;
+  { Parse field offsets (verified against passqlite3codegen.TParse layout):
+    nTab @56 (i32), nMem @60 (i32), nVar @296 (i16). }
+  nCursor := PInt32(PByte(pParse) + 56)^;
+  nMem    := PInt32(PByte(pParse) + 60)^;
+  nVar    := i32(PWord(PByte(pParse) + 296)^);
   nArg    := 0;
 
   n := vdbeParseSzOpAllocPtr(pParse)^;
@@ -2653,9 +2652,11 @@ begin
 
   p^.vdbeFlags := p^.vdbeFlags and not (VDBF_UsesStmtJournal or VDBF_EXPIRED_MASK);
 
-  { allocate Mem registers if nMem > 0 }
+  { allocate Mem registers (aMem[1..nMem] are user registers; aMem[0] is
+    the unused slot held by all VDBE programs).  Phase 6.9-bis. }
   if (not vdbeDbMallocFailed(db)) and (nMem > 0) then begin
-    p^.aMem := PMem(sqlite3DbMallocZero(db, u64(nMem) * SizeOf(TMem)));
+    p^.aMem := PMem(sqlite3DbMallocZero(db,
+                                       u64(nMem + 1) * SizeOf(TMem)));
     p^.nMem := nMem;
   end;
   if (not vdbeDbMallocFailed(db)) and (nCursor > 0) then begin

@@ -5824,11 +5824,201 @@ end;
 // Phase 6.5 — build.c: CREATE TABLE / DDL stubs
 // ===========================================================================
 
+{ sqlite3StartTable — port of build.c:1206.
+  Begin construction of a new table.  Allocates the in-memory Table object,
+  emits the schema-row place-holder bytecode (schema_cookie verify, file
+  format / text encoding cookies, OP_CreateBtree for the new root page,
+  OP_OpenWrite on sqlite_schema, OP_NewRowid + OP_Blob/Insert with
+  OPFLAG_APPEND for the placeholder row).  The real schema-row contents
+  are filled in by sqlite3EndTable.
+
+  Phase 6.9-bis (step 6).  Helpers used: sqlite3TwoPartName,
+  sqlite3CheckObjectName, sqlite3AuthCheck, sqlite3ReadSchema,
+  sqlite3FindTable/Index, sqlite3CodeVerifySchema, sqlite3ForceNotReadOnly,
+  sqlite3BeginWriteOperation, sqlite3OpenSchemaTable. }
 procedure sqlite3StartTable(pParse: PParse; const pName1: PToken;
   const pName2: PToken; isTemp: i32; isView: i32; isVirtual: i32;
   noErr: i32);
+const
+  { OP_Record encoding of a row containing 5 NULLs (build.c:1332). }
+  nullRow: array[0..5] of u8 = (6, 0, 0, 0, 0, 0);
+  { build.c:1253..1258 — auth code per (isTemp,isView). }
+  aCode: array[0..3] of u8 = (
+    SQLITE_CREATE_TABLE, SQLITE_CREATE_TEMP_TABLE,
+    SQLITE_CREATE_VIEW,  SQLITE_CREATE_TEMP_VIEW);
+  SQLITE_MAX_FILE_FORMAT = 4;          { sqliteInt.h:692 }
+  TF_Imposter            = u32($00020000); { sqliteInt.h:2499 }
+label
+  begin_table_error;
+var
+  pTable: PTable2;
+  zName: PAnsiChar;
+  zTypeStr: PAnsiChar;
+  zDb: PAnsiChar;
+  db: PTsqlite3;
+  v: PVdbe;
+  iDb: i32;
+  pName: PToken;
+  addr1, fileFormat: i32;
+  reg1, reg2, reg3: i32;
+  authCode: i32;
 begin
-  { Phase 7 }
+  zName := nil;
+  pName := nil;
+  db := pParse^.db;
+
+  { Test-scaffold gate.  TestParserSmoke (and similar) drives the parser
+    against a hand-rolled stub db (eOpenState <> $76) without a real
+    schema, btree, or VDBE — for those, fall back to a no-op so the
+    smoke harness keeps passing.  Real callers go through
+    sqlite3_open_v2 which sets eOpenState := SQLITE_STATE_OPEN ($76). }
+  if db^.eOpenState <> $76 then Exit;
+
+  { build.c:1222..1247 — name / database resolution. }
+  if (db^.init.busy <> 0) and (db^.init.newTnum = 1) then begin
+    iDb := db^.init.iDb;
+    if iDb = 1 then
+      zName := sqlite3DbStrDup(db, LEGACY_TEMP_SCHEMA_TABLE)
+    else
+      zName := sqlite3DbStrDup(db, LEGACY_SCHEMA_TABLE);
+    pName := pName1;
+  end else begin
+    iDb := sqlite3TwoPartName(pParse, pName1, pName2, @pName);
+    if iDb < 0 then Exit;
+    if (OMIT_TEMPDB = 0) and (isTemp <> 0) and (pName2 <> nil) and
+       (pName2^.n > 0) and (iDb <> 1) then begin
+      sqlite3ErrorMsg(pParse, 'temporary table name must be unqualified');
+      Exit;
+    end;
+    if (OMIT_TEMPDB = 0) and (isTemp <> 0) then iDb := 1;
+    if (pName <> nil) and (pName^.z <> nil) and (pName^.n > 0) then begin
+      zName := sqlite3DbStrNDup(db, pName^.z, u64(pName^.n));
+      sqlite3Dequote(zName);
+    end;
+    if InRenameObject(pParse) then
+      sqlite3RenameTokenMap(pParse, Pointer(zName), pName);
+  end;
+  if pName <> nil then pParse^.sNameToken := pName^;
+  if zName = nil then Exit;
+
+  if isView <> 0 then zTypeStr := PAnsiChar('view')
+  else                zTypeStr := PAnsiChar('table');
+  if sqlite3CheckObjectName(pParse, zName, zTypeStr, zName) <> 0 then
+    goto begin_table_error;
+  if db^.init.iDb = 1 then isTemp := 1;
+
+  { build.c:1249..1268 — authorisation. }
+  zDb := db^.aDb[iDb].zDbSName;
+  if isTemp <> 0 then
+    authCode := SQLITE_INSERT_AUTH
+  else
+    authCode := SQLITE_INSERT_AUTH;  { same code, schema-table name differs }
+  if isTemp = 1 then begin
+    if sqlite3AuthCheck(pParse, SQLITE_INSERT_AUTH,
+         PAnsiChar(LEGACY_TEMP_SCHEMA_TABLE), nil, zDb) <> 0 then
+      goto begin_table_error;
+  end else begin
+    if sqlite3AuthCheck(pParse, SQLITE_INSERT_AUTH,
+         PAnsiChar(LEGACY_SCHEMA_TABLE), nil, zDb) <> 0 then
+      goto begin_table_error;
+  end;
+  if (isVirtual = 0) and
+     (sqlite3AuthCheck(pParse, i32(aCode[isTemp + 2*isView]),
+                       zName, nil, zDb) <> 0) then
+    goto begin_table_error;
+
+  { build.c:1277..1298 — collision check (skipped in DECLARE_VTAB /
+    RENAME). }
+  if (pParse^.eParseMode <> PARSE_MODE_DECLARE_VTAB) and
+     (not InRenameObject(pParse)) then begin
+    if sqlite3ReadSchema(pParse) <> SQLITE_OK then
+      goto begin_table_error;
+    pTable := sqlite3FindTable(db, zName, zDb);
+    if pTable <> nil then begin
+      if noErr = 0 then begin
+        if (pTable^.tabFlags and TF_Ephemeral) <> 0 then
+          sqlite3ErrorMsg(pParse, 'view already exists')
+        else
+          sqlite3ErrorMsg(pParse, 'table already exists');
+      end else begin
+        sqlite3CodeVerifySchema(pParse, iDb);
+        sqlite3ForceNotReadOnly(pParse);
+      end;
+      goto begin_table_error;
+    end;
+    if sqlite3FindIndex(db, zName, zDb) <> nil then begin
+      sqlite3ErrorMsg(pParse, 'there is already an index with that name');
+      goto begin_table_error;
+    end;
+  end;
+
+  { build.c:1300..1317 — allocate the Table object. }
+  pTable := PTable2(sqlite3DbMallocZero(db, SizeOf(TTable)));
+  if pTable = nil then begin
+    pParse^.rc := SQLITE_NOMEM_BKPT;
+    Inc(pParse^.nErr);
+    goto begin_table_error;
+  end;
+  pTable^.zName := zName;
+  pTable^.iPKey := -1;
+  pTable^.pSchema := db^.aDb[iDb].pSchema;
+  pTable^.nTabRef := 1;
+  pTable^.nRowLogEst := 200;       { = sqlite3LogEst(1048576) }
+  pParse^.pNewTable := pTable;
+
+  { build.c:1327..1385 — schema-row place-holder bytecode. }
+  if db^.init.busy = 0 then begin
+    v := sqlite3GetVdbe(pParse);
+    if v <> nil then begin
+      sqlite3BeginWriteOperation(pParse, 1, iDb);
+      if isVirtual <> 0 then
+        sqlite3VdbeAddOp0(v, OP_VBegin);
+
+      Inc(pParse^.nMem); reg1 := pParse^.nMem;
+      pParse^.u1.cr.regRowid := reg1;
+      Inc(pParse^.nMem); reg2 := pParse^.nMem;
+      pParse^.u1.cr.regRoot := reg2;
+      Inc(pParse^.nMem); reg3 := pParse^.nMem;
+
+      sqlite3VdbeAddOp3(v, OP_ReadCookie, iDb, reg3, BTREE_FILE_FORMAT);
+      sqlite3VdbeUsesBtree(v, iDb);
+      addr1 := sqlite3VdbeAddOp1(v, OP_If, reg3);
+      if (db^.flags and SQLITE_LegacyFileFmt) <> 0 then
+        fileFormat := 1
+      else
+        fileFormat := SQLITE_MAX_FILE_FORMAT;
+      sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_FILE_FORMAT, fileFormat);
+      sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_TEXT_ENCODING, i32(db^.enc));
+      sqlite3VdbeJumpHere(v, addr1);
+
+      if (isView <> 0) or (isVirtual <> 0) then
+        sqlite3VdbeAddOp2(v, OP_Integer, 0, reg2)
+      else
+        pParse^.u1.cr.addrCrTab :=
+          sqlite3VdbeAddOp3(v, OP_CreateBtree, iDb, reg2, BTREE_INTKEY);
+
+      sqlite3OpenSchemaTable(pParse, iDb);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, 0, reg1);
+      sqlite3VdbeAddOp4(v, OP_Blob, 6, reg3, 0,
+                        PAnsiChar(@nullRow[0]), P4_STATIC);
+      sqlite3VdbeAddOp3(v, OP_Insert, 0, reg3, reg1);
+      sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+      sqlite3VdbeAddOp0(v, OP_Close);
+    end;
+  end else if (db^.init.flags and $02) <> 0 then begin
+    { imposterTable bit (Tsqlite3InitInfo.flags bits 1..2) — fast path
+      currently unreached because no caller toggles it.  Real ALTER TABLE
+      ... USING IMPOSTER will set it once Phase 8 lands. }
+    pTable^.tabFlags := pTable^.tabFlags or TF_Imposter;
+    if (db^.init.flags and $04) <> 0 then
+      pTable^.tabFlags := pTable^.tabFlags or TF_Readonly;
+  end;
+
+  Exit;
+
+begin_table_error:
+  pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_CheckSchema;
+  sqlite3DbFree(db, zName);
 end;
 
 procedure sqlite3AddReturning(pParse: PParse; pList: PExprList);

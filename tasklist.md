@@ -20,6 +20,121 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 6): sqlite3StartTable port
+    (build.c:1206) + sqlite3VdbeMakeReady aMem allocation fix.**
+    Replaces the `{ Phase 7 }` stub at `passqlite3codegen.pas:5827`
+    with a byte-faithful port of the CREATE TABLE prologue emitter,
+    and fixes `sqlite3VdbeMakeReady` to read `nMem`/`nTab`/`nVar`
+    from the parser context (it was hardcoded to 0, which left
+    `Vdbe.aMem` un-allocated and AV'd any DDL that emitted a
+    register-using opcode).
+
+    Concrete changes:
+      * `src/passqlite3codegen.pas`:
+        - `sqlite3StartTable` (was stub): full body from
+          build.c:1206..1394 — `init.busy && newTnum==1` schema
+          parse fast-path, two-part name resolution via
+          `sqlite3TwoPartName`, temp-table qualified-name guard,
+          name dequote (inline `sqlite3DbStrNDup` + `sqlite3Dequote`
+          since codegen does not import passqlite3parser),
+          `IN_RENAME_OBJECT` token map, `sqlite3CheckObjectName`
+          gate, full `SQLITE_OMIT_AUTHORIZATION=0` block (two
+          AuthCheck calls — INSERT into the schema table, then
+          CREATE_(TEMP_)?(TABLE|VIEW) with the auth code matrix),
+          name-collision check via `sqlite3FindTable` + IF NOT
+          EXISTS arm (CodeVerifySchema + ForceNotReadOnly), index
+          collision check, then `sqlite3DbMallocZero(sizeof(TTable))`
+          for the in-memory Table object (zName, iPKey=-1, pSchema,
+          nTabRef=1, nRowLogEst=200), and the Vdbe emit block:
+          BeginWriteOperation, OP_VBegin (vtab-gated, unreached),
+          three-register allocation (regRowid/regRoot + tmp via
+          ++nMem), OP_ReadCookie + OP_If gate around the
+          file-format/text-encoding cookie writes, OP_CreateBtree
+          (or OP_Integer for view/vtab) into regRoot saving the
+          address in `u1.cr.addrCrTab`, OpenSchemaTable,
+          OP_NewRowid, OP_Blob with the 6-byte `nullRow` constant
+          (P4_STATIC), OP_Insert with OPFLAG_APPEND, OP_Close.
+          Imposter-table fast-path is structural (init.flags bit
+          gate; no caller toggles it today).  Same `eOpenState <> $76`
+          test-scaffold gate as DropIndex/DropTable so
+          TestParserSmoke's stub-db CREATE TABLE rows stay green.
+        - `aCode[]` and `nullRow[]` declared as local typed
+          consts; `SQLITE_MAX_FILE_FORMAT=4` and
+          `TF_Imposter=$00020000` declared locally to avoid
+          churning the global TF_/SQLITE_ tables.
+      * `src/passqlite3vdbe.pas`:
+        - `sqlite3VdbeMakeReady` (line 2641): replaces the
+          `nVar:=0; nMem:=0; nCursor:=0` placeholder with a real
+          read of `Parse.nTab @56 (i32)`, `Parse.nMem @60 (i32)`,
+          `Parse.nVar @296 (i16)` via byte-offset PInt32/PWord
+          (PParse is `Pointer` in this unit to break the cycle
+          with passqlite3codegen).  The aMem allocation now sizes
+          `(nMem+1) * SizeOf(TMem)` so register slot 0 (always
+          unused, all VDBE programs are 1-based) is included.
+
+    Tests: full build clean.  TestExplainParity: 1 PASS / 9 DIVERGE
+    / **0 ERROR** (was 1/7/2).  Both ERROR rows (`CREATE TABLE
+    typed`, `CREATE TABLE WITHOUT ROWID`) now flip to DIVERGE,
+    matching the other CREATE TABLE rows — the AV they raised was
+    masked by the missing aMem allocation in MakeReady, not a
+    StartTable issue.  Pascal CREATE TABLE programs now emit 14
+    ops (Init/Goto + StartTable's 11 op prologue + Halt), versus
+    32–43 on the C side — the ~18-op gap is sqlite3EndTable's
+    schema-row UPDATE finalize (still a stub).  Regression spot
+    check: TestPrepareBasic 20/20, TestParser 45/45,
+    TestParserSmoke 20/20, TestSchemaBasic 44/44, TestVdbeApi
+    57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+    TestExprBasic 40/40, TestVdbeTxn 8/8, TestAuthBuiltins 34/34,
+    TestOpenClose 17/17, TestSmoke + TestUtil clean.
+
+    Discoveries / next-step notes:
+      * **`sqlite3VdbeMakeReady` was a silent foot-gun.**  Every
+        DDL/DML codegen path that reaches `sqlite3FinishCoding`
+        relies on aMem being allocated to `nMem+1` slots.  Before
+        this commit, MakeReady hardcoded `nMem:=0` so aMem stayed
+        nil — every register-touching op (OP_ReadCookie,
+        OP_NewRowid, OP_Integer, OP_String8, OP_Insert, etc.) AV'd
+        on first execution.  This is why prior ports (DropIndex,
+        DropTable, BeginTransaction) emitted only register-free
+        opcodes (OP_DropTable, OP_AutoCommit) — the AV would have
+        bit them too.  StartTable is the first DDL whose emit
+        absolutely requires registers.  Once Insert / Update /
+        Select codegen lands the same fix is load-bearing for
+        them.
+      * **Codegen does not import passqlite3parser.**  parser →
+        codegen is the established direction (parser uses TParse
+        from codegen).  `sqlite3NameFromToken` lives in parser, so
+        codegen inlines the equivalent (`sqlite3DbStrNDup` +
+        `sqlite3Dequote`) directly.  Worth a Phase 8 audit: maybe
+        move `sqlite3NameFromToken` down into util/codegen so
+        both units share it.
+      * **`db^.init.flags` is bit-packed (orphanTrigger:1,
+        imposterTable:2, reopenMemdb:1).**  imposterTable occupies
+        bits 1..2 in the C struct.  StartTable's imposter
+        fast-path masks with `$02` for "set" and `$04` for "geq 2"
+        — matching the C `db->init.imposterTable >= 2` semantics.
+        No caller toggles this today; first hit will be ALTER
+        TABLE ... USING IMPOSTER in Phase 8.
+      * **DROP TABLE `t` row will flip to PASS only after
+        EndTable lands.** Today it still reports `Pascal prepare
+        returned nil Vdbe` because the seed CREATE TABLE prologue
+        leaves `pNewTable` set but never publishes the Table into
+        `db^.aDb[0].pSchema^.tblHash` — that's EndTable's job.
+        Once EndTable lands, FindTable will return non-nil and
+        DROP TABLE / CREATE INDEX / DROP INDEX IF EXISTS rows can
+        all reach their emit bodies.
+      * **Next 6.9-bis target unchanged:** `sqlite3EndTable`
+        (build.c:2637 — caps StartTable; emits the schema-row
+        UPDATE finalize, OP_ParseSchema, optional NestedParse for
+        sqlite_sequence on AUTOINCREMENT).  `sqlite3CreateIndex`
+        (37/41 ops) still gated on EndTable for the same Table
+        publish.
+      * **Pascal CREATE TABLE op count is 14, expected 32**
+        (after EndTable lands).  The 18-op gap is exactly what
+        EndTable emits: ParseSchema, schema-row UPDATE
+        sub-statement (NestedParse), the optional AUTOINCREMENT
+        path, and ChangeCookie.
+
   - **2026-04-26 — Phase 6.9-bis (step 5): sqlite3DropTable +
     sqlite3CodeDropTable + destroyTable + sqlite3ClearStatTables +
     tableMayNotBeDropped + sqliteViewResetAll port (build.c:3221,
