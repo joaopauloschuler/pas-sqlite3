@@ -87,9 +87,27 @@ remains `history.md`.  This file is the punch list.
       tears down and returns nil at the end; this only becomes
       observable once the trimmed planner pick + OP_NotExists emission
       lands in the next sub-bullet.
-    - [ ] Implement the trimmed planner pick + `OP_NotExists` emission
+    - [~] Implement the trimmed planner pick + `OP_NotExists` emission
       for the rowid-EQ shape (hard-code the cost selection; defer
       `whereLoopAddBtree` etc.).
+      Sub-progress 2026-04-26: ported `OptimizationEnabled` /
+      `OptimizationDisabled` (sqliteInt.h:1938..1939) plus the
+      dbOptFlags constants the where engine consults
+      (`SQLITE_DistinctOpt`, `SQLITE_OmitNoopJoin`, `SQLITE_BloomFilter`,
+      `SQLITE_OnePass`, `SQLITE_QueryFlattener`); ported
+      `isDistinctRedundant` (where.c:629..685) — full IPK column
+      fast-path; the UNIQUE-index loop body is deferred to 11g.2.c
+      because it needs `sqlite3WhereFindTerm` / `findIndexCol` /
+      `indexColumnNotNull` (all whereexpr.c).  Wired the
+      `WHERE_WANT_DISTINCT` block (where.c:7039..7053) into
+      `sqlite3WhereBegin` immediately after the False-WHERE-Term-Bypass
+      loop, and replaced the eDistinct TODO inside the `nTabList==0`
+      branch with the real `OptimizationEnabled(SQLITE_DistinctOpt)` →
+      `WHERE_DISTINCT_UNIQUE` rule.  No corpus delta yet (DISTINCT is
+      not exercised by the 10-row gate; the prologue still tears down
+      and returns nil at the end).  Outstanding inside this sub-bullet:
+      planner pick proper (whereShortCut shape probe), per-loop
+      codegen, OP_NotExists emission.
     - [ ] Implement the loop-tail half of `sqlite3WhereEnd`
       (Goto continue + Resolve break label + cursor close).
     - [ ] Re-enable productive tails in `sqlite3DeleteFrom`
@@ -357,3 +375,156 @@ the port unless a user requests them after Phases 0–9 are green:
 - [ ] `assert()` calls retained; `AssertH` logs file/line and halts.
 - [ ] Compiles `-O3` clean (no warnings in new code).
 - [ ] A differential test exercises the function's layer.
+
+---
+
+## Design decisions
+
+1. **Prefix convention.** Pascal port keeps `sqlite3_*` for public API
+   (drop-in readable for anyone who knows the C API); C reference in
+   `csqlite3.pas` is declared as `csq_*`. Tests are the only code that uses
+   `csq_*`.
+
+2. **No C-callable `.so` produced by the port.** Pascal consumers only. If
+   someone later wants an ABI-compatible `.so`, revisit — it would constrain
+   record layout and force `cdecl` / `export` everywhere for no current user
+   demand.
+
+3. **Split sources as the single source of truth.** `../sqlite3/src/*.c` is
+   the authoritative reference **and** the oracle build input. The
+   amalgamation is not generated, not checked in, not referenced. Reasons:
+   (a) our Pascal unit split mirrors the C file split 1:1, so "port
+   `btree.c` lines 2400–2600" is a natural commit unit; (b) grep in a 5 k-line
+   file beats grep in a 250 k-line one; (c) upstream patches land in specific
+   files — tracking what needs re-porting is trivial with split, painful with
+   amalgamation; (d) using upstream's own `./configure && make` to build the
+   oracle means compile flags, generated headers, and link order all stay
+   correct by construction, without a bespoke gcc invocation that would drift.
+
+4. **`{$MODE OBJFPC}`, not `{$MODE DELPHI}`.** Matches pas-core-math and
+   pas-bzip2. Enables `inline`, operator overloading, and modern syntax.
+
+5. **`{$GOTO ON}` project-wide.** Enabled in `passqlite3.inc`. Used (if at
+   all) by the parser and possibly the VDBE dispatch. Enabling unit-by-unit
+   adds noise.
+
+6. **Differential testing is a first-class deliverable, not a QA afterthought.**
+   The test harness is built before any non-trivial porting. See "The
+   differential-testing foundation" above.
+
+7. **The per-function checklist doubles as a PR template** (same convention
+   as pas-core-math and pas-bzip2 — copy into each PR description).
+
+---
+
+## Key rules for the developer
+
+1. **Do not change the algorithm.** This is a faithful port. The C source in
+   `../sqlite3/` is the specification. If a `.db` file differs by one byte, it
+   is a bug in the Pascal port, never an improvement.
+
+2. **Port line-by-line.** Resist refactoring while porting. Refactor in a
+   separate pass, after on-disk parity is proven.
+
+3. **Every phase ends with a test that passes.** Do not advance to the next
+   phase until the gating test (1.6, 2.10, 3.A.5, 3.B.4, 4.6, 5.10, 6.9, 7.4, 9.1–9.4)
+   is green.
+
+4. **Work sequentially within each phase.** Ordering is deliberate. Phase 3
+   gates Phase 4 which gates Phase 5 which gates Phase 6.
+
+5. **`libsqlite3.so` is the oracle, not a dependency.** The Pascal library
+   does not link against it. Only the test binaries do, to compare outputs.
+
+6. **No Pascal `Boolean` inside this port.** Use `Int32` or `u8`.
+
+7. **Commit per function or per task.** Small commits with clear messages make
+   bisecting an on-disk parity regression tractable.
+
+8. **A faithful port is a multi-year effort.** The existing FPC bindings
+   (`sqlite3dyn`, `sqlite3conn`) cover 99% of what most users need. This port
+   is a learning and hardening exercise — scope accordingly.
+
+---
+
+## Architectural notes and known pitfalls
+
+1. **No Pascal `Boolean`.** SQLite uses `int` or `u8` for flags. Pascal's
+   `Boolean` is 1 byte but its canonical `True` is 255 on x86 — incompatible
+   with C's `1`. Always use `Int32` or `u8` with explicit `0`/`1` literals.
+
+2. **Overflow wrap is required.** Varint codec, hash functions, CRC, random
+   number generation — all rely on unsigned 32-bit wrap. Keep `{$Q-}` and
+   `{$R-}` on project-wide.
+
+3. **Pointer arithmetic is everywhere.** Every page, cell, record, and varint
+   is navigated via `u8*`. `{$POINTERMATH ON}` is required. `*p++` becomes
+   `tmp := p^; Inc(p);`.
+
+4. **UTF-8 vs UTF-16.** SQLite supports both internally. The encoding is a
+   per-column property (text affinity) and a per-connection setting
+   (`PRAGMA encoding`). Port the full encoding machinery; do not shortcut to
+   UTF-8-only.
+
+5. **Float formatting differs.** `printf("%g", x)` and FPC's `FloatToStr` can
+   produce different strings for the same double (e.g. `1e-5` vs `0.00001`).
+   Port SQLite's own `sqlite3_snprintf` (Phase 2.3) and use it; never use
+   FPC's `Format`.
+
+6. **Endianness.** SQLite stores multi-byte integers on disk in big-endian.
+   FPC on x86_64 is little-endian. The varint codec handles this, but any
+   direct cast `PInt32(p)^` is a portability bug on a big-endian target.
+   Always go through the helpers.
+
+7. **`longjmp` / `setjmp` absence.** SQLite does not use them. Good.
+
+8. **Function pointers need `cdecl`.** The `sqlite3_vfs`, `sqlite3_io_methods`,
+   `sqlite3_module` (virtual tables), and application-registered
+   `sqlite3_create_function` / `sqlite3_create_collation` callbacks all need
+   `cdecl` on their Pascal procedural types, so a C user of the port (if we
+   ever ship one) can pass a C callback.
+
+9. **`.db` header mtime.** Bytes 24–27 of the SQLite database file are a
+   "change counter" updated on every write. Two binary-identical DBs from
+   independent runs can differ in this field. The diff harness must
+   normalise these bytes before comparing, OR (better) both runs must perform
+   exactly the same number of writes, in which case the counters will match.
+
+10. **Schema-cookie mismatch will cascade.** Bytes 40–59 of the header (the
+    "schema cookie", "user version", "application ID", "text encoding", etc.)
+    must be written in exactly the same order and with the same default values
+    on connection open. A one-byte diff here invalidates every subsequent
+    parity check.
+
+11. **`sqlite3_randomness()` determinism.** Many corpora rely on random values
+    (ROWID assignment, temp table names). The oracle must seed both the
+    Pascal and C PRNGs identically for differential output to match.
+
+12. **Algorithmic determinism is load-bearing.** Query-plan choice depends on
+    `ANALYZE` statistics and on tie-breaking constants in `where.c`. If those
+    constants differ by even 1%, the planner can pick a different index and
+    every downstream EXPLAIN diff fails even though the result sets are
+    correct. **Port the constants exactly.**
+
+13. **Large records must be heap-allocated.** `sqlite3` (the connection),
+    `Vdbe`, `Pager`, and `BtShared` are multi-KB records. Never stack-allocate.
+
+14. **Thread safety.** Default SQLite build is serialized (full mutex).
+    The Pascal port inherits the same model — every API entry point acquires
+    the connection mutex. Do not try to port `SQLITE_THREADSAFE=0` first "for
+    simplicity"; it changes too many code paths.
+
+15. **`SizeOf` shadowed by same-named pointer local (Pascal case-insensitivity).**
+    If a function has `var pGroup: PPGroup`, then `SizeOf(PGroup)` inside that
+    function returns `SizeOf(PPGroup) = 8` (pointer) instead of the record size.
+    Pascal is case-insensitive; the identifier lookup finds the local variable
+    first. **Rule**: local pointer variables must NOT share their name with any
+    type. Convention: use `pGrp`, `pTmp`, `pHdr`, never exactly `PPGroup → PGroup`.
+    After porting any function, grep for `SizeOf(P` and verify the named type has
+    no same-named local in scope.
+
+16. **Unsigned for-loop underflow.** `for i := 0 to N - 1` is safe only when N > 0.
+    When `i` or `N` is `u32` and `N = 0`, `N - 1 = $FFFFFFFF` → 4 billion
+    iterations → instant crash. In C, `for(i=0; i<N; i++)` skips cleanly.
+    **Rule**: always guard with `if N > 0 then` before such a loop, or rewrite
+    as `i := 0; while i < N do begin ... Inc(i); end`.

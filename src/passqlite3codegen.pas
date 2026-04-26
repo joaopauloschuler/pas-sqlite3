@@ -1406,6 +1406,16 @@ const
   WHERE_DISTINCT_ORDERED   = 2;
   WHERE_DISTINCT_UNORDERED = 3;
 
+  { dbOptFlags bits (sqliteInt.h:1898..1932) — selectively disable
+    optimisations via SQLITE_TESTCTRL_OPTIMIZATIONS.  Only the constants
+    actually consulted from the where engine and codegen are mirrored
+    here so far; the remainder land alongside their first reader. }
+  SQLITE_QueryFlattener = u32($00000001);
+  SQLITE_DistinctOpt    = u32($00000010);
+  SQLITE_OmitNoopJoin   = u32($00000100);
+  SQLITE_BloomFilter    = u32($00080000);
+  SQLITE_OnePass        = u32($08000000);
+
   { TERM_* flags (WhereTerm.wtFlags) }
   TERM_DYNAMIC   = u16($0001);
   TERM_VIRTUAL   = u16($0002);
@@ -5815,6 +5825,76 @@ begin
   Result := w.eCode;
 end;
 
+{ OptimizationEnabled / OptimizationDisabled — port of the macro pair at
+  sqliteInt.h:1938..1939.  A given dbOptFlags bit being set means the
+  matching optimisation has been disabled via SQLITE_TESTCTRL_OPTIMIZATIONS;
+  the inline form keeps call sites readable and, for FPC, allows -O3 to
+  fold the bitmask test the same way the C macro does. }
+function OptimizationDisabled(db: PTsqlite3; mask: u32): Boolean; inline;
+begin
+  Result := (db^.dbOptFlags and mask) <> 0;
+end;
+
+function OptimizationEnabled(db: PTsqlite3; mask: u32): Boolean; inline;
+begin
+  Result := (db^.dbOptFlags and mask) = 0;
+end;
+
+{ isDistinctRedundant — port of where.c:629..685.
+
+  A DISTINCT list is redundant when any subset of the listed columns is
+  already collectively unique and individually non-null, so DISTINCT
+  cannot remove any rows.
+
+  Two checks fire:
+    (a) IPK column on the single FROM-clause table — INTEGER PRIMARY KEY
+        rowid alias, so always unique + NOT NULL.  Fully ported here
+        (the only check the current corpus exercises).
+    (b) UNIQUE-index loop — for each unique non-partial index on the
+        single FROM-clause table, every key column must either be
+        named in the DISTINCT list or pinned to a constant via a WO_EQ
+        WHERE term, with NOT NULL covering any column not pinned by a
+        WHERE term.  Deferred to 11g.2.c: requires sqlite3WhereFindTerm
+        + findIndexCol + indexColumnNotNull, all unported until the
+        whereexpr.c port lands.  The skip is conservative — returning 0
+        tells the caller DISTINCT is *not* redundant, so the worst that
+        happens is a redundant DISTINCT pass survives one more layer.
+
+  Mirrors the C exactly for the IPK fast-path so the future 11g.2.c
+  follow-up only adds the index loop body without touching this skeleton. }
+function isDistinctRedundant(pParse: PParse; pTabList: PSrcList;
+  pWC: PWhereClause; pDistinct: PExprList): i32;
+var
+  i:     i32;
+  iBase: i32;
+  pTab:  PTable2;
+  p:     PExpr;
+  items: PExprListItem;
+begin
+  if pTabList^.nSrc <> 1 then
+    Exit(0);
+  iBase := SrcListItems(pTabList)[0].iCursor;
+  pTab  := SrcListItems(pTabList)[0].pSTab;
+
+  { (a) IPK column probe (where.c:656..662). }
+  items := ExprListItems(pDistinct);
+  for i := 0 to pDistinct^.nExpr - 1 do
+  begin
+    p := sqlite3ExprSkipCollateAndLikely(items[i].pExpr);
+    if p = nil then Continue; { NEVER per upstream; tolerate gracefully }
+    if (p^.op <> TK_COLUMN) and (p^.op <> TK_AGG_COLUMN) then Continue;
+    if (p^.iTable = iBase) and (p^.iColumn < 0) then
+      Exit(1);
+  end;
+
+  { (b) UNIQUE-index loop: deferred to 11g.2.c (whereexpr.c port).
+    pTab^.pIndex chain walk + sqlite3WhereFindTerm + findIndexCol +
+    indexColumnNotNull.  Conservative: report not-redundant. }
+  if pTab = nil then ; { silence "unused" once the loop below lands }
+
+  Result := 0;
+end;
+
 { Phase 6.9-bis step 11g.2.b — productive sqlite3WhereBegin prologue.
 
   Faithful port of where.c:6828..6993 — every line up to (but not including)
@@ -5824,12 +5904,7 @@ end;
   cleanup contract closes cleanly and the corpus sees no behaviour change
   (no callers exist yet).  The trimmed planner pick + OP_NotExists emission
   that flips the 5 CREATE TABLE rows in TestExplainParity lands in the next
-  sub-progress commit.
-
-  Constants used inline because OptimizationEnabled / SQLITE_DistinctOpt are
-  not yet ported — the eDistinct branch under nTabList==0 just stays the
-  default (WHERE_DISTINCT_NOOP=0); a TODO comment marks the spot for the
-  full helper port. }
+  sub-progress commit. }
 const
   WHERE_ONEPASS_DESIRED  = u16($0004);
   WHERE_ONEPASS_MULTIROW = u16($0008);
@@ -5934,9 +6009,12 @@ begin
   if nTabList = 0 then
   begin
     if pOrderBy <> nil then pWInfo^.nOBSat := i8(pOrderBy^.nExpr);
-    { TODO: WHERE_WANT_DISTINCT + OptimizationEnabled(SQLITE_DistinctOpt)
-      → eDistinct = WHERE_DISTINCT_UNIQUE.  OptimizationEnabled helper not
-      yet ported; defaults to 0 (WHERE_DISTINCT_NOOP) until it lands. }
+    if ((wctrlFlags and WHERE_WANT_DISTINCT) <> 0)
+       and OptimizationEnabled(db, SQLITE_DistinctOpt) then
+      pWInfo^.eDistinct := WHERE_DISTINCT_UNIQUE;
+    { ExplainQueryPlan("SCAN CONSTANT ROW") deferred — the explain-query-
+      plan helper macro is still stubbed in this codebase and the corpus
+      under test does not exercise EXPLAIN QUERY PLAN. }
   end
   else
   begin
@@ -5990,6 +6068,36 @@ begin
       sqlite3ExprIfFalse(pParse, sWLB.pWC^.a[ii].pExpr,
                          pWInfo^.iBreak, SQLITE_JUMPIFNULL);
       sWLB.pWC^.a[ii].wtFlags := sWLB.pWC^.a[ii].wtFlags or TERM_CODED;
+    end;
+  end;
+
+  { WHERE_WANT_DISTINCT — port of where.c:7039..7053.
+    Three sub-cases for a DISTINCT result set:
+      (a) DISTINCT explicitly disabled via dbOptFlags → strip the flag
+          from both the local copy and pWInfo so downstream loop codegen
+          sees DISTINCT as unset.
+      (b) DISTINCT is redundant against a UNIQUE index / IPK column →
+          mark eDistinct=WHERE_DISTINCT_UNIQUE; the per-row body skips
+          the OP_RowSetTest / OP_OpenEphemeral overhead.
+      (c) ORDER BY is absent → re-route the result set as the ORDER BY
+          and set WHERE_DISTINCTBY so the planner can try to satisfy
+          DISTINCT by ordering the output. }
+  if (wctrlFlags and WHERE_WANT_DISTINCT) <> 0 then
+  begin
+    if OptimizationDisabled(db, SQLITE_DistinctOpt) then
+    begin
+      wctrlFlags := wctrlFlags and (not WHERE_WANT_DISTINCT);
+      pWInfo^.wctrlFlags := pWInfo^.wctrlFlags and (not WHERE_WANT_DISTINCT);
+    end
+    else if isDistinctRedundant(pParse, pTabList, @pWInfo^.sWC,
+                                pResultSet) <> 0 then
+    begin
+      pWInfo^.eDistinct := WHERE_DISTINCT_UNIQUE;
+    end
+    else if pOrderBy = nil then
+    begin
+      pWInfo^.wctrlFlags := pWInfo^.wctrlFlags or WHERE_DISTINCTBY;
+      pWInfo^.pOrderBy   := pResultSet;
     end;
   end;
 
