@@ -7328,6 +7328,39 @@ Phase 5.9 depends on this being done first.
   both ERROR rows flipped to DIVERGE via the MakeReady aMem fix)
   → 1/9/0 (step 6) → 2/8/0 (step 7) → 2/8/0 (step 8).
 
+  Sub-tasks formalised from step 11f's discoveries:
+
+  - [ ] **6.9-bis step 11g.1** Port `OP_ParseSchema` in
+    `passqlite3vdbe.pas:7134` (currently a no-op stub).  Required
+    so user tables created by `CREATE TABLE t(...)` get published to
+    `db^.aDb[iDb].pSchema^.tblHash` after EndTable's emission tail
+    runs; without it, `CREATE INDEX i1 ON t(a)` and `DROP TABLE t`
+    in TestExplainParity fail at `sqlite3SrcListLookup(t)` with
+    "nil Vdbe".  Faithful port of vdbe.c:7114..7183: requires
+    `sqlite3InitOne` (init.c:818, ALTER branch) and the non-ALTER
+    branch's `sqlite3MPrintf("SELECT*FROM\"%w\".%s WHERE %s ORDER
+    BY rowid", db.aDb[iDb].zDbSName, LEGACY_SCHEMA_TABLE, p4.z)` +
+    `sqlite3_exec(db, zSql, sqlite3InitCallback, &initData, 0)`.
+    Minimal viable port may stub `sqlite3InitOne` and only handle
+    the common case (P4 != nil → non-NULL WHERE clause).  Blocks
+    flipping the 3 nil-Vdbe rows in TestExplainParity (CREATE
+    INDEX × 2, DROP TABLE × 1).  Independent of step 11g.2.
+
+  - [ ] **6.9-bis step 11g.2** Port `sqlite3WhereBegin` /
+    `sqlite3WhereOkOnePass` / `sqlite3WhereEnd` (where.c — Phase 7
+    territory; the planner core).  Required by the productive
+    emission tail of `sqlite3DeleteFrom` and `sqlite3Update`
+    (codegen.pas:5460..5471, 5660..5670 — currently TODO comments).
+    With a real WhereBegin, the schema-row UPDATE / DELETE
+    statements emitted by `sqlite3NestedParse` from
+    `sqlite3EndTable` / `sqlite3CodeDropTable` can wire their
+    where-loop arms and emit the ~13-op NestedParse sub-statement
+    that's currently missing from the 5 CREATE TABLE rows.
+    Removes the step-11f skeleton-only error-state guard
+    (codegen.pas:5401..5410, 5577..5599) once any productive opcode
+    is emitted.  Largest single piece of remaining work for this
+    sub-phase; may need to split further (where.c is ~7900 lines).
+
 ---
 
 ## Phase 7 — Parser
