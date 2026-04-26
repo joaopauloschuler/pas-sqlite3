@@ -3985,4 +3985,13 @@ begin
   if state = 1 then Result := 1 else Result := 0;
 end;
 
+initialization
+  { Phase 6.9-bis (step 9): wire the codegen NestedParse → real parser
+    dispatch.  passqlite3parser depends on passqlite3codegen, so we
+    register the hook from the downstream side at unit-init time.
+    Codegen-only test programs that don't pull this unit in keep the
+    nil hook and NestedParse becomes a no-op after formatting. }
+  passqlite3codegen.gNestedRunParser :=
+    passqlite3codegen.TNestedRunParserFn(@sqlite3RunParser);
+
 end.

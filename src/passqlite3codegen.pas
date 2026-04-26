@@ -2084,7 +2084,17 @@ procedure sqlite3UniqueConstraint(pParse: PParse; onError: i32;
 procedure sqlite3RowidConstraint(pParse: PParse; onError: i32;
   pTab: PTable2);
 procedure sqlite3FinishCoding(pParse: PParse);
-procedure sqlite3NestedParse(pParse: PParse; zFormat: PAnsiChar);
+procedure sqlite3NestedParse(pParse: PParse; zFormat: PAnsiChar;
+  const args: array of const);
+
+{ Hook installed by passqlite3parser to dispatch the recursive parse.
+  Until the parser unit's initialization runs, this stays nil and
+  sqlite3NestedParse becomes a no-op once it has formatted the SQL.
+  The signature mirrors the parser's real sqlite3RunParser. }
+type
+  TNestedRunParserFn = function(pParse: Pointer; zSql: PAnsiChar): i32;
+var
+  gNestedRunParser: TNestedRunParserFn;
 
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
@@ -6184,7 +6194,7 @@ begin
     { sqlite3NestedParse(...) UPDATE sqlite_schema SET ... — currently a
       no-op stub; structural call lands now so this fires automatically
       when NestedParse is real. }
-    sqlite3NestedParse(pParse, nil);
+    sqlite3NestedParse(pParse, nil, []);
 
     sqlite3ChangeCookie(pParse, iDb);
 
@@ -6290,7 +6300,7 @@ begin
     the C reference build), so the NestedParse fires here.  sqlite3NestedParse
     is currently a no-op stub — once it is real, the
     `UPDATE sqlite_schema SET rootpage=...` sub-statement will actually emit. }
-  sqlite3NestedParse(pParse, nil);
+  sqlite3NestedParse(pParse, nil, []);
   sqlite3ReleaseTempReg(pParse, r1);
 end;
 
@@ -6325,7 +6335,7 @@ begin
   for i := 1 to 4 do begin
     snpFmt(SizeOf(zTab), @zTab[0], 'sqlite_stat%d', [i]);
     if sqlite3FindTable(pParse^.db, @zTab[0], zDbName) <> nil then
-      sqlite3NestedParse(pParse, nil);
+      sqlite3NestedParse(pParse, nil, []);
   end;
 end;
 
@@ -6391,12 +6401,12 @@ begin
   { Remove sqlite_sequence rows for an autoinc table.  NestedParse is a
     stub so this currently emits no ops; structural port lands now. }
   if (pTab^.tabFlags and TF_Autoincrement) <> 0 then
-    sqlite3NestedParse(pParse, nil);
+    sqlite3NestedParse(pParse, nil, []);
 
   { Delete the schema-table rows for this object.  NestedParse stub: no
     ops emitted yet — placeholder call kept so the call graph is correct
     for when NestedParse becomes real. }
-  sqlite3NestedParse(pParse, nil);
+  sqlite3NestedParse(pParse, nil, []);
 
   if (isView = 0) and (not isVtab) then
     destroyTable(pParse, pTab);
@@ -6608,7 +6618,7 @@ begin
     { TODO(Phase 6.x): once sqlite3NestedParse is real, emit the
       `DELETE FROM <db>.sqlite_master WHERE name=<idx> AND type='index'`
       sub-statement that the C reference produces here. }
-    sqlite3NestedParse(pParse, nil);
+    sqlite3NestedParse(pParse, nil, []);
     { TODO(Phase 6.x): sqlite3ClearStatTables(pParse, iDb, 'idx', pIndex^.zName); }
     sqlite3ChangeCookie(pParse, iDb);
     destroyRootPage(pParse, i32(pIndex^.tnum), iDb);
@@ -6904,7 +6914,7 @@ begin
 
       { Schema-row INSERT — sqlite3NestedParse is a stub today; structural
         call lands now so this fires automatically when NestedParse is real. }
-      sqlite3NestedParse(pParse, nil);
+      sqlite3NestedParse(pParse, nil, []);
       sqlite3DbFree(db, zStmt);
 
       if pTblName <> nil then begin
@@ -7491,9 +7501,61 @@ begin
   end;
 end;
 
-procedure sqlite3NestedParse(pParse: PParse; zFormat: PAnsiChar);
+{ sqlite3NestedParse — port of build.c:293.
+
+  Recursively run the parser on a formatted SQL string, appending the
+  resulting code to the VDBE program currently under construction in
+  pParse.  Used by the DDL helpers (sqlite3EndTable, sqlite3CreateIndex,
+  sqlite3CodeDropTable, sqlite3DropIndex, sqlite3ClearStatTables,
+  destroyRootPage's autovacuum arm) to emit the schema-row UPDATE /
+  INSERT / DELETE sub-statements.
+
+  Phase 6.9-bis (step 9) structural port: implements the C control flow
+  byte-for-byte against build.c:293..323 — early-out on nErr / eParseMode,
+  format SQL via sqlite3VMPrintf, save/restore PARSE_TAIL, set
+  DBFLAG_PreferBuiltin, dispatch to the real sqlite3RunParser via the
+  gNestedRunParser hook (registered by passqlite3parser at init).  When
+  the hook is nil (codegen-only test programs that don't link the parser
+  unit), the formatted SQL is simply discarded — same observable result
+  as the previous full-stub.  When zFormat is nil, the function returns
+  early without touching the parse state — call sites that haven't been
+  wired with real format strings yet pass nil + [] to keep the call
+  graph correct without producing spurious sub-statements. }
+procedure sqlite3NestedParse(pParse: PParse; zFormat: PAnsiChar;
+  const args: array of const);
+var
+  db:           PTsqlite3;
+  savedDbFlags: u32;
+  saveBuf:      array[0..PARSE_TAIL_SZ - 1] of Byte;
+  zSql:         PAnsiChar;
 begin
-  { Phase 7 }
+  if pParse^.nErr <> 0 then Exit;
+  if pParse^.eParseMode <> 0 then Exit;
+  if zFormat = nil then Exit;
+
+  db := pParse^.db;
+  savedDbFlags := db^.mDbFlags;
+  Assert(pParse^.nested < 10, 'NestedParse depth > 10');
+
+  zSql := sqlite3VMPrintf(db, zFormat, args);
+  if zSql = nil then begin
+    if db^.mallocFailed = 0 then pParse^.rc := SQLITE_TOOBIG;
+    Inc(pParse^.nErr);
+    Exit;
+  end;
+
+  Inc(pParse^.nested);
+  Move((PByte(pParse) + PARSE_RECURSE_SZ)^, saveBuf[0], PARSE_TAIL_SZ);
+  FillChar((PByte(pParse) + PARSE_RECURSE_SZ)^, PARSE_TAIL_SZ, 0);
+  db^.mDbFlags := db^.mDbFlags or DBFLAG_PreferBuiltin;
+
+  if gNestedRunParser <> nil then
+    gNestedRunParser(pParse, zSql);
+
+  db^.mDbFlags := savedDbFlags;
+  sqlite3DbFree(db, zSql);
+  Move(saveBuf[0], (PByte(pParse) + PARSE_RECURSE_SZ)^, PARSE_TAIL_SZ);
+  Dec(pParse^.nested);
 end;
 
 function sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;

@@ -20,6 +20,125 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 9): sqlite3NestedParse
+    structural port (build.c:293) + parser-dispatch hook.**  Replaces
+    the 3-line `{ Phase 7 }` stub at `passqlite3codegen.pas:7494`
+    with a faithful structural port of the recursive-parse helper
+    that the DDL emitters (sqlite3EndTable, sqlite3CreateIndex,
+    sqlite3CodeDropTable, sqlite3DropIndex, sqlite3ClearStatTables,
+    destroyRootPage's autovacuum arm) invoke to build their schema-
+    row UPDATE / INSERT / DELETE sub-statements.
+
+    Concrete changes:
+      * `src/passqlite3codegen.pas`:
+        - `sqlite3NestedParse` signature widened from
+          `(pParse; zFormat: PAnsiChar)` to
+          `(pParse; zFormat: PAnsiChar; const args: array of const)`
+          to match C's varargs (printf.c-style).  All 7 internal
+          call sites updated to pass `[]` (current placeholders
+          still hand `nil` zFormat — see Discoveries).
+        - Body now ports build.c:293..323 byte-for-byte: early-out
+          on `nErr` / `eParseMode` / nil zFormat; format SQL via
+          `sqlite3VMPrintf`; on nil result set `pParse^.rc :=
+          SQLITE_TOOBIG` + bump nErr; bump `nested`; save the 136-
+          byte `PARSE_TAIL` block, zero it; OR `DBFLAG_PreferBuiltin`
+          into `db^.mDbFlags`; dispatch to the real parser via the
+          new `gNestedRunParser` hook; restore mDbFlags; free zSql;
+          restore PARSE_TAIL; decrement nested.
+        - New interface symbols: type `TNestedRunParserFn = function
+          (pParse: Pointer; zSql: PAnsiChar): i32;` and `var
+          gNestedRunParser: TNestedRunParserFn`.  The hook is nil
+          by default (codegen-only test programs that don't link
+          the parser unit retain the no-op behaviour exactly).
+      * `src/passqlite3parser.pas` initialization block: wires the
+        hook by assigning `passqlite3codegen.gNestedRunParser :=
+        TNestedRunParserFn(@sqlite3RunParser)` so any program that
+        pulls in passqlite3parser (including passqlite3main, which
+        TestExplainParity uses) gets the real recursive-parse path
+        end-to-end at unit-init time.
+
+    **Deferred:** the actual format strings + args at the 7 call
+    sites are still placeholders (zFormat=nil + []).  Wiring them
+    is the next sub-step and will require:
+      * `sqlite3EndTable`: build zStmt via sqlite3MPrintf("CREATE
+        %s ...") and pass the C UPDATE-schema format string with
+        `db^.aDb[iDb].zDbSName, zType, p^.zName, p^.zName,
+         pParse^.u1.cr.regRoot, zStmt, pParse^.u1.cr.regRowid`.
+      * `sqlite3CreateIndex`: pass the INSERT-schema format with
+        the existing zStmt + the 5-tuple (iDb, idxName, tabName,
+        regRoot, zStmt).
+      * `sqlite3CodeDropTable`: pass DELETE / sqlite_sequence
+        clean-up format strings.
+      * `sqlite3DropIndex`: pass DELETE format + `zDbSName,
+         pIndex^.zName`.
+      * `sqlite3ClearStatTables`: per-stat-N DELETE format string.
+      * `destroyRootPage` autovacuum arm: rootpage rewrite UPDATE.
+      Each one is a one-liner once the surrounding helper has the
+      values it needs in scope.
+
+    Tests: full build clean.  TestExplainParity: **2 PASS / 8
+    DIVERGE / 0 ERROR** (unchanged — placeholders are still nil
+    zFormat, so the productive body never executes).  Regression
+    spot check (2026-04-26): TestPrepareBasic 20/20, TestParser
+    45/45, TestParserSmoke 20/20, TestSchemaBasic 44/44,
+    TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+    TestExprBasic 40/40, TestVdbeTxn 8/8, TestAuthBuiltins 34/34,
+    TestOpenClose 17/17, TestSmoke + TestUtil clean, TestJson
+    434/434, TestJsonEach 50/50, TestJsonRegister 48/48,
+    TestPrintf 105/105, TestVtab 216/216.
+
+    Discoveries / next-step notes:
+      * **The structural port deliberately does *not* flip the
+        DIVERGE rows yet.**  This is the same incremental pattern
+        as steps 1..8: land the C-shaped helper first, wire the
+        actual format strings + arg lists in a follow-up.  Doing
+        both in one commit would have entangled three concerns
+        (signature change, dispatch infra, and 7 separate
+        emitter-by-emitter format-string ports — each of which
+        wants its own structural review against the C ref).
+      * **DML codegen is still stubbed.**  `sqlite3Insert`,
+        `sqlite3Update`, `sqlite3DeleteFrom` in codegen still just
+        free their inputs.  Wiring real format strings means
+        NestedParse → RunParser → Lemon-built INSERT/UPDATE/DELETE
+        codegen — but those handlers are no-ops today, so even
+        with full call-site wiring the schema-row sub-statements
+        won't emit ops until DML codegen is real.  Step 10 is
+        therefore *both* "wire the format strings" *and* "ensure
+        at least UPDATE-schema-row through DML lights up far
+        enough to emit OP_OpenWrite / OP_String8 / OP_MakeRecord /
+        OP_Insert against the schema btree."  See Phase 6.4 stubs
+        for the exact list.
+      * **The hook indirection avoids a circular `uses`.**
+        `passqlite3parser` already `uses passqlite3codegen` (parser
+        feeds AST nodes into codegen helpers).  Adding `uses
+        passqlite3parser` from codegen would deadlock the unit
+        graph.  The hook variable lets parser register the
+        callback at init time without codegen having to know about
+        parser.  Same idiom Phase 8 used for VDBE→OS callbacks.
+      * **`Move` instead of `memcpy`.**  FPC's `Move(src, dst,
+        count)` is the equivalent — argument *order* is `(src,
+        dst, count)`, opposite of `memcpy(dst, src, count)`.  Easy
+        trap; double-check before committing.
+      * **`array of const` is FPC's variadic.**  Empty arg list is
+        `[]` (square-bracket open-array literal), not `nil`.
+        Passing `nil` to `array of const` will not compile.  All 7
+        internal placeholders use `[]`.
+      * **`pParse^.rc := SQLITE_TOOBIG`** when sqlite3VMPrintf
+        returns nil and `db^.mallocFailed = 0` mirrors C exactly;
+        also bumps `pParse^.nErr`.
+      * **No new tests added.**  TestExplainParity already exists
+        as the gate for step 9; the structural infra here is
+        validated by "no regression in 17 existing test programs"
+        plus TestExplainParity holding at 2/8/0.  When step 10
+        wires real format strings, each call site flip-to-PASS in
+        TestExplainParity becomes the gate.
+      * **Next 6.9-bis target: step 10 — wire real format strings
+        + args at the 7 NestedParse call sites.**  Highest-leverage
+        sub-target is `sqlite3EndTable` (the schema-row UPDATE)
+        because it shares its format with the CREATE TABLE epilogue
+        — any progress there immediately reduces the ~13-op gap on
+        every `CREATE TABLE` row in TestExplainParity.
+
   - **2026-04-26 — Phase 6.9-bis (step 8): sqlite3CreateIndex
     structural port (build.c:3941).**  Replaces the 3-line free-only
     stub at `passqlite3codegen.pas:6633` with a faithful structural
@@ -6383,16 +6502,20 @@ Phase 5.9 depends on this being done first.
   ~~`sqlite3CreateIndex`~~ done 2026-04-26 (structural port; column
   iteration / pPk extension / RefillIndex / IndexHasDuplicateRootPage /
   REPLACE-reorder arms deferred — see step 8 notes),
-  found-index DropIndex arm helpers `sqlite3NestedParse` (still
-  a stub — its real port flips many DELETE/UPDATE sub-statements
-  on at once))
+  ~~`sqlite3NestedParse`~~ done 2026-04-26 (step 9: structural port +
+  parser-dispatch hook; the 7 internal call sites still pass nil
+  zFormat — wiring real format strings + args is step 10, which is
+  what actually flips DIVERGE rows because it produces the schema-row
+  UPDATE/INSERT/DELETE sub-statements))
   to byte-identical opcode emission against C.  Each helper landed
   flips one row from DIVERGE → PASS in TestExplainParity; an extra
   diagnostic-only column-list AV must also be triaged
   (`CREATE TABLE typed`, `CREATE TABLE WITHOUT ROWID`).  Once all
   ten current rows PASS, expand corpus to DML / SELECT / pragma /
   trigger forms (the same exclusion list as TestParser).
-  Status (2026-04-26 step 8): **2 PASS / 8 DIVERGE / 0 ERROR.**
+  Status (2026-04-26 step 9): **2 PASS / 8 DIVERGE / 0 ERROR**
+  (unchanged from step 8 — step 9 lands NestedParse infra without
+  yet wiring real format strings; step 10 will flip rows).
   CREATE INDEX rows now report "nil Vdbe" (was "C=37 Pas=3") —
   honest reflection that LocateTableItem fails because the seed
   CREATE TABLEs never publish to tblHash (NestedParse stub).
