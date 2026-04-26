@@ -1337,6 +1337,12 @@ function  sqlite3_context_db_handle(p: Psqlite3_context): Psqlite3;
 function  sqlite3_get_auxdata(pCtx: Psqlite3_context; iArg: i32): Pointer;
 procedure sqlite3_set_auxdata(pCtx: Psqlite3_context; iArg: i32;
                               pAux: Pointer; xDelete: TxDelProc);
+
+{ --- vdbeapi.c — additional context API (Phase 6.8.h.1) --- }
+function  sqlite3_user_data(pCtx: Psqlite3_context): Pointer;
+procedure sqlite3_result_subtype(pCtx: Psqlite3_context; eSubtype: u32);
+procedure sqlite3_result_text64(pCtx: Psqlite3_context; z: PAnsiChar;
+                                n: u64; xDel: TxDelProc; enc: u8);
 function  sqlite3VdbeFinishMoveto(p: PVdbeCursor): i32;
 function  sqlite3VdbeHandleMovedCursor(p: PVdbeCursor): i32;
 function  sqlite3VdbeCursorRestore(p: PVdbeCursor): i32;
@@ -2904,6 +2910,42 @@ begin
     pAd^.xDeleteAux(pAd^.pAux);
   pAd^.pAux       := pAux;
   pAd^.xDeleteAux := xDelete;
+end;
+
+{ --- vdbeapi.c — sqlite3_user_data, result_subtype, result_text64
+      (Phase 6.8.h.1) --- }
+
+{ vdbeapi.c:837 — return the pUserData slot of the function definition. }
+function sqlite3_user_data(pCtx: Psqlite3_context): Pointer;
+begin
+  if (pCtx = nil) or (pCtx^.pFunc = nil) then begin Result := nil; Exit; end;
+  Result := PTFuncDef(pCtx^.pFunc)^.pUserData;
+end;
+
+{ vdbeapi.c:1014 — set the result subtype byte on pCtx^.pOut. }
+procedure sqlite3_result_subtype(pCtx: Psqlite3_context; eSubtype: u32);
+var
+  pOut: PMem;
+begin
+  if pCtx = nil then Exit;
+  pOut := pCtx^.pOut;
+  pOut^.eSubtype := u8(eSubtype and $FF);
+  pOut^.flags := pOut^.flags or MEM_Subtype;
+end;
+
+{ vdbeapi.c:889 — wide-length text result.  Behaviour matches
+  sqlite3_result_text but accepts a u64 length so JSON outputs > 2GB
+  are at least representable.  enc selects UTF-8/16. }
+procedure sqlite3_result_text64(pCtx: Psqlite3_context; z: PAnsiChar;
+                                n: u64; xDel: TxDelProc; enc: u8);
+begin
+  if pCtx = nil then Exit;
+  if n > $7FFFFFFF then
+  begin
+    sqlite3_result_error_toobig(pCtx);
+    Exit;
+  end;
+  sqlite3VdbeMemSetStr(pCtx^.pOut, z, i64(n), enc, xDel);
 end;
 
 { --- sqlite3VdbeCreate / sqlite3VdbeDelete --- }

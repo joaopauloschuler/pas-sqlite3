@@ -20,6 +20,77 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.8.h.1 JSON SQL-result helpers.**  First
+    slice of the 6.8.h dispatch chunk.  Lands the deferred
+    "return-to-SQL" surface that earlier 6.8.* chunks repeatedly
+    deferred to avoid the passqlite3vdbe dep cycle: nine new public
+    functions in `passqlite3json.pas` — `jsonAppendSqlValue`,
+    `jsonReturnString`, `jsonReturnStringAsBlob`,
+    `jsonReturnTextJsonFromBlob`, `jsonReturnFromBlob` (the big
+    13-arm BLOB→SQL switch incl. INT5 hex→i64 with overflow→double
+    promotion, FLOAT5 leading-dot, TEXTJ/TEXT5 escape replay into
+    UTF-8, ARRAY/OBJECT eMode dispatch), `jsonReturnParse`,
+    `jsonWrongNumArgs`, `jsonBadPathError`, `jsonFunctionArgToBlob`.
+    Plus three new helpers in `passqlite3vdbe.pas` —
+    `sqlite3_user_data` (returns `pCtx^.pFunc^.pUserData`),
+    `sqlite3_result_subtype` (sets `pOut^.eSubtype` + `MEM_Subtype`),
+    `sqlite3_result_text64` (u64-length wrapper around
+    `sqlite3VdbeMemSetStr`).
+
+    Concrete changes:
+      * `src/passqlite3vdbe.pas` — adds the 3 funcs in interface
+        + ~30 lines of impl just after `sqlite3_set_auxdata`.
+      * `src/passqlite3json.pas` — adds the 9 funcs in interface
+        (~440 lines impl) + adds `SysUtils` to the implementation
+        uses for `FloatToStr`.
+      * `src/tests/TestJson.pas` — adds T355..T376 (22 new asserts).
+        **375/375 PASS** (was 353/353).
+      * Regression spot check: TestPrintf 105/105, TestVtab 216/216,
+        TestParser 45/45, TestSchemaBasic 44/44, TestVdbeApi 57/57.
+
+    Discoveries / next-step notes:
+      * **`sqlite3IsNaN` is impl-section-only in passqlite3vdbe.**
+        Inlined the trivial `r <> r` test in `jsonFunctionArgToBlob`
+        rather than promote the function to vdbe's interface (would
+        ripple through several units).  If 6.8.h.x or later phases
+        need IsNaN repeatedly, lift it into `passqlite3util` (it has
+        no FPC-internal deps).
+      * **No `sqlite3RCStr` still.**  `jsonReturnString` therefore
+        always copies the result string via `SQLITE_TRANSIENT` rather
+        than ref-sharing it into the function-arg cache.  The
+        cache-insert path (json.c:872..886 — the
+        `bJsonIsRCStr==0 && nBlobAlloc>0` branch) is **not** exercised
+        in 6.8.h.1.  When 6.8.h.x lands `sqlite3RCStrNew/Ref/Unref`,
+        rewire the non-static branch to mirror C exactly: ref into
+        zJson, set `bJsonIsRCStr=1`, call `jsonCacheInsert`, then
+        ref again into the SQL value with `sqlite3RCStrUnref` as the
+        destructor.  Two-site change; comment marker placed above the
+        non-static branch.
+      * **`jsonAppendSqlValue` FLOAT path uses `FloatToStr`,** not
+        the SQLite-flavoured `%!0.15g` from `jsonPrintf`.  Good
+        enough until 6.8.h.x ports the json-flavour printf wrapper;
+        differs from C in trailing-zero formatting (e.g. `1.5e10`
+        vs `15000000000.0`).  Tests don't yet exercise this branch
+        on a SQL surface; flag for revisit when `json_extract` lands.
+      * **`sqlite3_result_text64` u64→i32 narrowing.**  C uses a u64
+        for the length to allow > 2GB strings; our wrapper rejects
+        n > $7FFFFFFF with `SQLITE_TOOBIG`.  Sufficient for JSON
+        bodies but worth lifting if blob/streaming use-cases appear.
+      * **`jsonReturnFromBlob` `to_double:` label.**  Pascal `goto`
+        targets must be in the same scope.  The label sits inside
+        the `JSONB_FLOAT5/FLOAT` arm and is jumped to from the
+        `JSONB_INT5/INT` arm's "consumed-too-many-bytes" recovery
+        path — works because both arms compile to a single procedure
+        body (no `try` boundary).  Same structural pattern as the C
+        original.
+      * **`jsonBadPathError` standalone-message branch** allocates
+        with `StrAlloc` (FPC RTL) when `pCtx = nil`.  C uses
+        `sqlite3_mprintf` and the caller frees with `sqlite3_free`.
+        When 6.8.h.x ports `sqlite3_mprintf`'s libc-malloc'd return,
+        swap `StrAlloc` → `sqlite3_mprintf` so the caller's
+        `sqlite3_free` works uniformly.  Only one caller exists in
+        json.c and it's inside `jsonInsertIntoBlob` (deferred).
+
   - **2026-04-26 — Phase 6.8.g JSON function-arg cache.**  Lands the
     auxdata-backed JsonParse cache that makes repeated `json_*` calls
     on the same SQL value reuse the parsed JSONB blob instead of
@@ -3799,6 +3870,41 @@ reference exactly.
     tables, plus `sqlite3RegisterJsonFunctions` registration entry
     point.  This is the chunk that lights up SQL-visible behaviour;
     earlier chunks land as untested (in SQL terms) library code.
+
+    Sub-chunks (mark each as it lands):
+    - [X] **6.8.h.1** SQL-result helpers — `jsonAppendSqlValue`,
+      `jsonReturnString`, `jsonReturnStringAsBlob`,
+      `jsonReturnTextJsonFromBlob`, `jsonReturnFromBlob`,
+      `jsonReturnParse`, `jsonWrongNumArgs`, `jsonBadPathError`,
+      `jsonFunctionArgToBlob`.  Plus `sqlite3_user_data`,
+      `sqlite3_result_subtype`, `sqlite3_result_text64` in
+      `passqlite3vdbe.pas`.  DONE 2026-04-26.  Gate `TestJson.pas`
+      375/375 PASS (was 353/353).  RCStr cache-insert branch in
+      `jsonReturnString` deferred until sqlite3RCStr lands;
+      currently always copies via SQLITE_TRANSIENT (correct, just
+      one extra copy).  Float formatter uses RTL `FloatToStr`
+      pending json-flavour `jsonPrintf` (see notes).
+    - [ ] **6.8.h.2** Simple scalar SQL functions — `json_quote`,
+      `json_type`, `json_valid`, `json_error_position`,
+      `json_array_length`, `json_pretty` (delegates to
+      `jsonTranslateBlobToPrettyText` from 6.8.e).  All small
+      bodies; the JSON-text dispatch is `jsonReturnParse` from .h.1.
+      Plus `jsonAllAlphanum` helper (json.c:4044).
+    - [ ] **6.8.h.3** Path-driven scalars — `json_extract`,
+      `json_set`, `json_replace`, `json_insert`, `json_remove`,
+      `json_patch`.  Drives `jsonLookupStep` (6.8.f) +
+      `jsonInsertIntoBlob` + `jsonMergePatch`.
+    - [ ] **6.8.h.4** Aggregates — `json_group_array`,
+      `json_group_object` (step / value / final / inverse).
+    - [ ] **6.8.h.5** Virtual tables — `json_each`, `json_tree`
+      (xConnect/Disconnect/Open/Close/Filter/Next/Eof/Column/Rowid
+      /BestIndex).  Big chunk; needs vtab module shape from earlier
+      phases.
+    - [ ] **6.8.h.6** Registration — `sqlite3RegisterJsonFunctions`
+      and `sqlite3JsonVtabRegister`; wire into
+      `sqlite3RegisterBuiltinFunctions` so the `json_*` SQL surface
+      becomes live.  Optionally port `sqlite3RCStr` here so the
+      cache-insert branch in `jsonReturnString` can match C exactly.
 
 ### Phase 6.7 implementation notes (2026-04-25)
 

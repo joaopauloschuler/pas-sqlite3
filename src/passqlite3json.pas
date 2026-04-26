@@ -504,9 +504,48 @@ function  jsonCacheInsert(pCtx: Pointer; pParse: PJsonParse): i32;
 function  jsonCacheSearch(pCtx: Pointer; pArg: Pointer): PJsonParse;
 function  jsonParseFuncArg(pCtx: Pointer; pArg: Pointer; flgs: u32): PJsonParse;
 
+{ ===========================================================================
+  SQL-result helpers (Phase 6.8.h.1)
+
+  Faithful port of the json.c routines that translate JSON state into
+  sqlite3_result_* on the surrounding function context:
+    json.c:803  jsonAppendSqlValue
+    json.c:856  jsonReturnString
+    json.c:1134 jsonWrongNumArgs
+    json.c:2100 jsonReturnStringAsBlob
+    json.c:3191 jsonReturnTextJsonFromBlob
+    json.c:3224 jsonReturnFromBlob
+    json.c:3411 jsonFunctionArgToBlob
+    json.c:3500 jsonBadPathError
+    json.c:3775 jsonReturnParse
+
+  pCtx is the opaque (Psqlite3_context) from the surrounding SQL function
+  call, kept as Pointer in the interface for the same dep-cycle reasons as
+  jsonStringInit / jsonParseFuncArg.
+
+  RCStr is still unported, so jsonReturnString currently uses
+  SQLITE_TRANSIENT for the non-static heap case — the result text is
+  copied once and then jsonStringReset frees the original.  When 6.8.h.x
+  lands sqlite3RCStr, swap to the sqlite3RCStrRef/Unref ownership pair
+  per json.c:884.
+  =========================================================================== }
+
+procedure jsonAppendSqlValue(p: PJsonString; pValue: Pointer);
+procedure jsonReturnString(p: PJsonString; pParse: PJsonParse; pCtx: Pointer);
+procedure jsonReturnStringAsBlob(pStr: PJsonString);
+procedure jsonReturnTextJsonFromBlob(pCtx: Pointer; aBlob: PByte; nBlob: u32);
+procedure jsonReturnFromBlob(pParse: PJsonParse; i: u32; pCtx: Pointer;
+                             eMode: i32);
+procedure jsonReturnParse(pCtx: Pointer; p: PJsonParse);
+procedure jsonWrongNumArgs(pCtx: Pointer; zFuncName: PAnsiChar);
+function  jsonBadPathError(pCtx: Pointer; zPath: PAnsiChar; rc: i32): PAnsiChar;
+function  jsonFunctionArgToBlob(pCtx: Pointer; pArg: Pointer;
+                                pParse: PJsonParse): i32;
+
 implementation
 
 uses
+  SysUtils,
   passqlite3vdbe;
 
 function jsonIsspace(c: AnsiChar): i32; inline;
@@ -3452,6 +3491,495 @@ json_pfa_oom:
   jsonParseFree(p);
   { sqlite3_result_error_nomem(ctx) deferred to 6.8.h. }
   Result := nil;
+end;
+
+{ ===========================================================================
+  SQL-result helpers — Phase 6.8.h.1 implementation
+  =========================================================================== }
+
+{ json.c:803 — append an sqlite3_value to the JSON string under construction. }
+procedure jsonAppendSqlValue(p: PJsonString; pValue: Pointer);
+var
+  pVal: Psqlite3_value;
+  z:    PAnsiChar;
+  n:    u32;
+  px:   TJsonParse;
+begin
+  pVal := Psqlite3_value(pValue);
+  case sqlite3_value_type(pVal) of
+    SQLITE_NULL:
+      jsonAppendRawNZ(p, PAnsiChar('null'), 4);
+    SQLITE_FLOAT:
+      begin
+        { json.c uses jsonPrintf(100, p, "%!0.15g", …); RealStr is good
+          enough until 6.8.h.x ports the json-flavoured printf. }
+        z := PAnsiChar(AnsiString(FloatToStr(sqlite3_value_double(pVal))));
+        jsonAppendRaw(p, z, u32(StrLen(z)));
+      end;
+    SQLITE_INTEGER:
+      begin
+        z := PAnsiChar(sqlite3_value_text(pVal));
+        n := u32(sqlite3_value_bytes(pVal));
+        jsonAppendRaw(p, z, n);
+      end;
+    SQLITE_TEXT:
+      begin
+        z := PAnsiChar(sqlite3_value_text(pVal));
+        n := u32(sqlite3_value_bytes(pVal));
+        if sqlite3_value_subtype(pVal) = JSON_SUBTYPE then
+          jsonAppendRaw(p, z, n)
+        else
+          jsonAppendString(p, z, n);
+      end;
+    else
+      begin
+        FillChar(px, SizeOf(px), 0);
+        if jsonArgIsJsonb(pValue, @px) <> 0 then
+          jsonTranslateBlobToText(@px, 0, p)
+        else if p^.eErr = 0 then
+        begin
+          sqlite3_result_error(Psqlite3_context(p^.pCtx),
+            'JSON cannot hold BLOB values', -1);
+          p^.eErr := p^.eErr or JSTRING_ERR;
+          jsonStringReset(p);
+        end;
+      end;
+  end;
+end;
+
+{ json.c:856 — finalise a JSON string and return it as the SQL result. }
+procedure jsonReturnString(p: PJsonString; pParse: PJsonParse; pCtx: Pointer);
+var
+  ctx:   Psqlite3_context;
+  flags: PtrInt;
+begin
+  ctx := Psqlite3_context(pCtx);
+  Assert((pParse <> nil) = (ctx <> nil));
+  Assert((ctx = nil) or (Pointer(ctx) = p^.pCtx));
+  jsonStringTerminate(p);
+  if p^.eErr = 0 then
+  begin
+    flags := PtrInt(sqlite3_user_data(Psqlite3_context(p^.pCtx)));
+    if (flags and JSON_BLOB) <> 0 then
+      jsonReturnStringAsBlob(p)
+    else if p^.bStatic <> 0 then
+      sqlite3_result_text64(Psqlite3_context(p^.pCtx),
+        p^.zBuf, p^.nUsed, SQLITE_TRANSIENT, SQLITE_UTF8)
+    else
+    begin
+      { Without sqlite3RCStr we cannot share zBuf into both the cache
+        and the SQL value at zero copy.  Copy the result into the SQL
+        value (TRANSIENT) and let jsonStringReset free the original.
+        Cache-insert path therefore deferred until 6.8.h.x ports RCStr. }
+      sqlite3_result_text64(Psqlite3_context(p^.pCtx),
+        p^.zBuf, p^.nUsed, SQLITE_TRANSIENT, SQLITE_UTF8);
+    end;
+  end
+  else if (p^.eErr and JSTRING_OOM) <> 0 then
+    sqlite3_result_error_nomem(Psqlite3_context(p^.pCtx))
+  else if (p^.eErr and JSTRING_TOODEEP) <> 0 then
+    { error already in p^.pCtx }
+  else if (p^.eErr and JSTRING_MALFORMED) <> 0 then
+    sqlite3_result_error(Psqlite3_context(p^.pCtx),
+      PAnsiChar('malformed JSON'), -1);
+  jsonStringReset(p);
+end;
+
+{ json.c:2100 — convert a (text) JsonString back into JSONB and return that. }
+procedure jsonReturnStringAsBlob(pStr: PJsonString);
+var
+  px: TJsonParse;
+begin
+  Assert(pStr^.eErr = 0);
+  FillChar(px, SizeOf(px), 0);
+  px.zJson := pStr^.zBuf;
+  px.nJson := u32(pStr^.nUsed);
+  px.db    := sqlite3_context_db_handle(Psqlite3_context(pStr^.pCtx));
+  jsonTranslateTextToBlob(@px, 0);
+  if px.oom <> 0 then
+  begin
+    sqlite3DbFree(Psqlite3db(px.db), px.aBlob);
+    sqlite3_result_error_nomem(Psqlite3_context(pStr^.pCtx));
+  end
+  else
+  begin
+    Assert(px.nBlobAlloc > 0);
+    Assert(px.bReadOnly = 0);
+    sqlite3_result_blob(Psqlite3_context(pStr^.pCtx),
+      px.aBlob, i32(px.nBlob), TxDelProc(SQLITE_DYNAMIC));
+  end;
+end;
+
+{ json.c:3191 — convert a JSON BLOB to text and return as SQL value. }
+procedure jsonReturnTextJsonFromBlob(pCtx: Pointer; aBlob: PByte; nBlob: u32);
+var
+  x: TJsonParse;
+  s: TJsonString;
+begin
+  if aBlob = nil then Exit;
+  FillChar(x, SizeOf(x), 0);
+  x.aBlob := aBlob;
+  x.nBlob := nBlob;
+  jsonStringInit(@s, pCtx);
+  jsonTranslateBlobToText(@x, 0, @s);
+  jsonReturnString(@s, nil, nil);
+end;
+
+{ json.c:3224 — return a single BLOB node as an SQL value.
+  eMode:
+    0 → JSONB if JSON_BLOB user flag, else text (containers only)
+    1 → text
+    2 → JSONB }
+procedure jsonReturnFromBlob(pParse: PJsonParse; i: u32; pCtx: Pointer;
+                             eMode: i32);
+label
+  to_double, returnfromblob_oom, returnfromblob_malformed;
+var
+  ctx:    Psqlite3_context;
+  db:     Psqlite3db;
+  n, sz:  u32;
+  rc:     i32;
+  iRes:   i64;
+  z, zOut:PAnsiChar;
+  bNeg:   i32;
+  x:      AnsiChar;
+  r:      Double;
+  iIn,iOut,nOut,v,szEsc: u32;
+  c:      AnsiChar;
+  flags:  PtrInt;
+begin
+  ctx := Psqlite3_context(pCtx);
+  Assert((eMode >= 0) and (eMode <= 2));
+  db := sqlite3_context_db_handle(ctx);
+  n := jsonbPayloadSize(pParse, i, sz);
+  if n = 0 then
+  begin
+    sqlite3_result_error(ctx, PAnsiChar('malformed JSON'), -1);
+    Exit;
+  end;
+  case pParse^.aBlob[i] and $0F of
+    JSONB_NULL:
+      begin
+        if sz <> 0 then goto returnfromblob_malformed;
+        sqlite3_result_null(ctx);
+      end;
+    JSONB_TRUE:
+      begin
+        if sz <> 0 then goto returnfromblob_malformed;
+        sqlite3_result_int(ctx, 1);
+      end;
+    JSONB_FALSE:
+      begin
+        if sz <> 0 then goto returnfromblob_malformed;
+        sqlite3_result_int(ctx, 0);
+      end;
+    JSONB_INT5, JSONB_INT:
+      begin
+        iRes := 0;
+        bNeg := 0;
+        if sz = 0 then goto returnfromblob_malformed;
+        x := AnsiChar(pParse^.aBlob[i + n]);
+        if x = '-' then
+        begin
+          if sz < 2 then goto returnfromblob_malformed;
+          Inc(n); Dec(sz);
+          bNeg := 1;
+        end;
+        z := sqlite3DbStrNDup(db, PChar(@pParse^.aBlob[i + n]), u64(sz));
+        if z = nil then goto returnfromblob_oom;
+        rc := sqlite3DecOrHexToI64(z, iRes);
+        sqlite3DbFree(db, z);
+        if rc = 0 then
+        begin
+          if iRes < 0 then
+          begin
+            { 16-digit hex with high bit set → positive in JSON, too
+              large for i64 so promote to double. }
+            r := Double(u64(iRes));
+            if bNeg <> 0 then r := -r;
+            sqlite3_result_double(ctx, r);
+          end
+          else
+          begin
+            if bNeg <> 0 then iRes := -iRes;
+            sqlite3_result_int64(ctx, iRes);
+          end;
+        end
+        else if (rc = 3) and (bNeg <> 0) then
+          sqlite3_result_int64(ctx, SMALLEST_INT64)
+        else if rc = 1 then
+          goto returnfromblob_malformed
+        else
+        begin
+          if bNeg <> 0 then begin Dec(n); Inc(sz); end;
+          goto to_double;
+        end;
+      end;
+    JSONB_FLOAT5, JSONB_FLOAT:
+      begin
+        if sz = 0 then goto returnfromblob_malformed;
+to_double:
+        z := sqlite3DbStrNDup(db, PChar(@pParse^.aBlob[i + n]), u64(sz));
+        if z = nil then goto returnfromblob_oom;
+        rc := sqlite3AtoF(z, r);
+        sqlite3DbFree(db, z);
+        if rc <= 0 then goto returnfromblob_malformed;
+        sqlite3_result_double(ctx, r);
+      end;
+    JSONB_TEXTRAW, JSONB_TEXT:
+      sqlite3_result_text(ctx, PAnsiChar(@pParse^.aBlob[i + n]),
+        i32(sz), TxDelProc(SQLITE_TRANSIENT));
+    JSONB_TEXT5, JSONB_TEXTJ:
+      begin
+        nOut := sz;
+        z    := PAnsiChar(@pParse^.aBlob[i + n]);
+        zOut := PAnsiChar(sqlite3DbMallocRaw(db, u64(nOut) + 1));
+        if zOut = nil then goto returnfromblob_oom;
+        iIn  := 0;
+        iOut := 0;
+        while iIn < sz do
+        begin
+          c := z[iIn];
+          if c = '\' then
+          begin
+            szEsc := jsonUnescapeOneChar(@z[iIn], sz - iIn, v);
+            if v <= $7F then
+            begin
+              zOut[iOut] := AnsiChar(v);
+              Inc(iOut);
+            end
+            else if v <= $7FF then
+            begin
+              Assert(szEsc >= 2);
+              zOut[iOut]     := AnsiChar($C0 or (v shr 6));
+              zOut[iOut + 1] := AnsiChar($80 or (v and $3F));
+              Inc(iOut, 2);
+            end
+            else if v < $10000 then
+            begin
+              Assert(szEsc >= 3);
+              zOut[iOut]     := AnsiChar($E0 or (v shr 12));
+              zOut[iOut + 1] := AnsiChar($80 or ((v shr 6) and $3F));
+              zOut[iOut + 2] := AnsiChar($80 or (v and $3F));
+              Inc(iOut, 3);
+            end
+            else if v = JSON_INVALID_CHAR then
+              { silently drop illegal codepoint }
+            else
+            begin
+              Assert(szEsc >= 4);
+              zOut[iOut]     := AnsiChar($F0 or (v shr 18));
+              zOut[iOut + 1] := AnsiChar($80 or ((v shr 12) and $3F));
+              zOut[iOut + 2] := AnsiChar($80 or ((v shr 6) and $3F));
+              zOut[iOut + 3] := AnsiChar($80 or (v and $3F));
+              Inc(iOut, 4);
+            end;
+            Inc(iIn, szEsc - 1);
+          end
+          else
+          begin
+            zOut[iOut] := c;
+            Inc(iOut);
+          end;
+          Inc(iIn);
+        end;
+        Assert(iOut <= nOut);
+        zOut[iOut] := #0;
+        sqlite3_result_text(ctx, zOut, i32(iOut), TxDelProc(SQLITE_DYNAMIC));
+      end;
+    JSONB_ARRAY, JSONB_OBJECT:
+      begin
+        if eMode = 0 then
+        begin
+          flags := PtrInt(sqlite3_user_data(ctx));
+          if (flags and JSON_BLOB) <> 0 then eMode := 2 else eMode := 1;
+        end;
+        if eMode = 2 then
+          sqlite3_result_blob(ctx, @pParse^.aBlob[i], i32(sz + n),
+            TxDelProc(SQLITE_TRANSIENT))
+        else
+          jsonReturnTextJsonFromBlob(pCtx, @pParse^.aBlob[i], sz + n);
+      end;
+    else
+      goto returnfromblob_malformed;
+  end;
+  Exit;
+
+returnfromblob_oom:
+  sqlite3_result_error_nomem(ctx);
+  Exit;
+
+returnfromblob_malformed:
+  sqlite3_result_error(ctx, PAnsiChar('malformed JSON'), -1);
+end;
+
+{ json.c:3775 — return a JsonParse as the SQL result.  Honours the
+  JSON_BLOB user flag: BLOB output skips the text translator entirely. }
+procedure jsonReturnParse(pCtx: Pointer; p: PJsonParse);
+var
+  ctx:   Psqlite3_context;
+  flgs:  PtrInt;
+  s:     TJsonString;
+begin
+  ctx := Psqlite3_context(pCtx);
+  if p^.oom <> 0 then
+  begin
+    sqlite3_result_error_nomem(ctx);
+    Exit;
+  end;
+  flgs := PtrInt(sqlite3_user_data(ctx));
+  if (flgs and JSON_BLOB) <> 0 then
+  begin
+    if (p^.nBlobAlloc > 0) and (p^.bReadOnly = 0) then
+    begin
+      sqlite3_result_blob(ctx, p^.aBlob, i32(p^.nBlob),
+        TxDelProc(SQLITE_DYNAMIC));
+      p^.nBlobAlloc := 0;
+    end
+    else
+      sqlite3_result_blob(ctx, p^.aBlob, i32(p^.nBlob),
+        TxDelProc(SQLITE_TRANSIENT));
+  end
+  else
+  begin
+    jsonStringInit(@s, pCtx);
+    p^.delta := 0;
+    jsonTranslateBlobToText(p, 0, @s);
+    jsonReturnString(@s, p, pCtx);
+    sqlite3_result_subtype(ctx, JSON_SUBTYPE);
+  end;
+end;
+
+{ json.c:1134 — odd-arg-count error on json_insert/replace/set. }
+procedure jsonWrongNumArgs(pCtx: Pointer; zFuncName: PAnsiChar);
+var
+  msg: AnsiString;
+begin
+  msg := AnsiString('json_') + AnsiString(zFuncName) +
+    AnsiString('() needs an odd number of arguments');
+  sqlite3_result_error(Psqlite3_context(pCtx), PAnsiChar(msg), -1);
+end;
+
+{ json.c:3500 — JSON-path lookup error → SQL error or returned message.
+  rc is one of JSON_LOOKUP_NOTARRAY / ERROR / TOODEEP, anything else is
+  treated as "bad JSON path". }
+function jsonBadPathError(pCtx: Pointer; zPath: PAnsiChar; rc: i32): PAnsiChar;
+var
+  msg: AnsiString;
+  ctx: Psqlite3_context;
+begin
+  ctx := Psqlite3_context(pCtx);
+  if u32(rc) = JSON_LOOKUP_NOTARRAY then
+    msg := 'not an array element: ' + AnsiString(zPath)
+  else if u32(rc) = JSON_LOOKUP_ERROR then
+    msg := 'malformed JSON'
+  else if u32(rc) = JSON_LOOKUP_TOODEEP then
+    msg := 'JSON path too deep'
+  else
+    msg := 'bad JSON path: ' + AnsiString(zPath);
+  if ctx = nil then
+  begin
+    Result := PAnsiChar(StrAlloc(Length(msg) + 1));
+    if Result <> nil then StrPCopy(Result, msg);
+    Exit;
+  end;
+  sqlite3_result_error(ctx, PAnsiChar(msg), -1);
+  Result := nil;
+end;
+
+{ json.c:3411 — encode a function arg as JSONB inside pParse.
+  Returns 0 on success, 1 on error (with a result-error already pushed). }
+function jsonFunctionArgToBlob(pCtx: Pointer; pArg: Pointer;
+                               pParse: PJsonParse): i32;
+const
+  aNull: array[0..0] of u8 = (0);
+var
+  ctx:   Psqlite3_context;
+  pVal:  Psqlite3_value;
+  eType: i32;
+  zJson: PAnsiChar;
+  nJson: i32;
+  r:     Double;
+  z:     PAnsiChar;
+  n:     i32;
+begin
+  ctx   := Psqlite3_context(pCtx);
+  pVal  := Psqlite3_value(pArg);
+  eType := sqlite3_value_type(pVal);
+  FillChar(pParse^, SizeOf(pParse^), 0);
+  pParse^.db := sqlite3_context_db_handle(ctx);
+  case eType of
+    SQLITE_BLOB:
+      begin
+        if jsonArgIsJsonb(pArg, pParse) = 0 then
+        begin
+          sqlite3_result_error(ctx,
+            PAnsiChar('JSON cannot hold BLOB values'), -1);
+          Result := 1;
+          Exit;
+        end;
+      end;
+    SQLITE_TEXT:
+      begin
+        zJson := PAnsiChar(sqlite3_value_text(pVal));
+        nJson := sqlite3_value_bytes(pVal);
+        if zJson = nil then begin Result := 1; Exit; end;
+        if sqlite3_value_subtype(pVal) = JSON_SUBTYPE then
+        begin
+          pParse^.zJson := zJson;
+          pParse^.nJson := nJson;
+          if jsonConvertTextToBlob(pParse, pCtx) <> 0 then
+          begin
+            sqlite3_result_error(ctx, PAnsiChar('malformed JSON'), -1);
+            sqlite3DbFree(Psqlite3db(pParse^.db), pParse^.aBlob);
+            FillChar(pParse^, SizeOf(pParse^), 0);
+            Result := 1;
+            Exit;
+          end;
+        end
+        else
+          jsonBlobAppendNode(pParse, JSONB_TEXTRAW, u64(nJson), zJson);
+      end;
+    SQLITE_FLOAT:
+      begin
+        r := sqlite3_value_double(pVal);
+        if r <> r then
+          jsonBlobAppendNode(pParse, JSONB_NULL, 0, nil)
+        else
+        begin
+          n := sqlite3_value_bytes(pVal);
+          z := PAnsiChar(sqlite3_value_text(pVal));
+          if z = nil then begin Result := 1; Exit; end;
+          if z[0] = 'I' then
+            jsonBlobAppendNode(pParse, JSONB_FLOAT, 5, PAnsiChar('9e999'))
+          else if (z[0] = '-') and (z[1] = 'I') then
+            jsonBlobAppendNode(pParse, JSONB_FLOAT, 6, PAnsiChar('-9e999'))
+          else
+            jsonBlobAppendNode(pParse, JSONB_FLOAT, u64(n), z);
+        end;
+      end;
+    SQLITE_INTEGER:
+      begin
+        n := sqlite3_value_bytes(pVal);
+        z := PAnsiChar(sqlite3_value_text(pVal));
+        if z = nil then begin Result := 1; Exit; end;
+        jsonBlobAppendNode(pParse, JSONB_INT, u64(n), z);
+      end;
+    else
+      begin
+        pParse^.aBlob := @aNull[0];
+        pParse^.nBlob := 1;
+        Result := 0;
+        Exit;
+      end;
+  end;
+  if pParse^.oom <> 0 then
+  begin
+    sqlite3_result_error_nomem(ctx);
+    Result := 1;
+  end
+  else
+    Result := 0;
 end;
 
 end.

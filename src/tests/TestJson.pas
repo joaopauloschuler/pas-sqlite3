@@ -1439,8 +1439,219 @@ begin
             jsonParseFuncArg(@ctx, @v, 0) = nil);
 end;
 
+{ ----- Phase 6.8.h.1 — SQL-result helpers ----- }
+
+function MemString(const m: TMem): AnsiString;
+var
+  buf: AnsiString;
 begin
-  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e/f/g JSON port ===');
+  if (m.z = nil) or (m.n = 0) then begin Result := ''; Exit; end;
+  SetLength(buf, m.n);
+  Move(m.z^, buf[1], m.n);
+  Result := buf;
+end;
+
+procedure TestReturnFromBlob_Primitives;
+var
+  ctx: Tsqlite3_context; vm: TVdbe; pOut: TMem;
+  p:   TJsonParse;
+  blob: array[0..7] of Byte;
+begin
+  SetupCtx(ctx, vm, pOut);
+  FillChar(p, SizeOf(p), 0);
+  { JSONB_NULL: header = 0, payload size 0. }
+  blob[0] := JSONB_NULL;
+  p.aBlob := @blob[0]; p.nBlob := 1;
+  jsonReturnFromBlob(@p, 0, @ctx, 0);
+  CheckTrue('T355 returnFromBlob NULL → MEM_Null',
+            (pOut.flags and MEM_Null) <> 0);
+
+  SetupCtx(ctx, vm, pOut);
+  blob[0] := JSONB_TRUE;
+  p.aBlob := @blob[0]; p.nBlob := 1;
+  jsonReturnFromBlob(@p, 0, @ctx, 0);
+  CheckEqI('T356 returnFromBlob TRUE → int 1', pOut.u.i, 1);
+
+  SetupCtx(ctx, vm, pOut);
+  blob[0] := JSONB_FALSE;
+  p.aBlob := @blob[0]; p.nBlob := 1;
+  jsonReturnFromBlob(@p, 0, @ctx, 0);
+  CheckEqI('T357 returnFromBlob FALSE → int 0', pOut.u.i, 0);
+end;
+
+procedure TestReturnFromBlob_Int;
+var
+  ctx: Tsqlite3_context; vm: TVdbe; pOut: TMem;
+  p:   TJsonParse;
+  blob: array[0..3] of Byte;
+begin
+  SetupCtx(ctx, vm, pOut);
+  FillChar(p, SizeOf(p), 0);
+  { Header: payload size 2 << 4 | JSONB_INT, payload "42". }
+  blob[0] := (2 shl 4) or JSONB_INT;
+  blob[1] := Ord('4'); blob[2] := Ord('2');
+  p.aBlob := @blob[0]; p.nBlob := 3;
+  jsonReturnFromBlob(@p, 0, @ctx, 0);
+  CheckEqI('T358 returnFromBlob INT 42', pOut.u.i, 42);
+end;
+
+procedure TestReturnFromBlob_Text;
+var
+  ctx: Tsqlite3_context; vm: TVdbe; pOut: TMem;
+  p:   TJsonParse;
+  blob: array[0..4] of Byte;
+begin
+  SetupCtx(ctx, vm, pOut);
+  FillChar(p, SizeOf(p), 0);
+  blob[0] := (3 shl 4) or JSONB_TEXT;
+  blob[1] := Ord('a'); blob[2] := Ord('b'); blob[3] := Ord('c');
+  p.aBlob := @blob[0]; p.nBlob := 4;
+  jsonReturnFromBlob(@p, 0, @ctx, 0);
+  CheckEqS('T359 returnFromBlob TEXT abc', MemString(pOut), 'abc');
+end;
+
+procedure TestReturnFromBlob_Malformed;
+var
+  ctx: Tsqlite3_context; vm: TVdbe; pOut: TMem;
+  p:   TJsonParse;
+  blob: array[0..1] of Byte;
+begin
+  SetupCtx(ctx, vm, pOut);
+  FillChar(p, SizeOf(p), 0);
+  { JSONB_NULL with non-zero payload → malformed. }
+  blob[0] := (1 shl 4) or JSONB_NULL;
+  blob[1] := 0;
+  p.aBlob := @blob[0]; p.nBlob := 2;
+  jsonReturnFromBlob(@p, 0, @ctx, 0);
+  CheckTrue('T360 returnFromBlob malformed NULL → isError set',
+            ctx.isError <> 0);
+end;
+
+procedure TestReturnTextJsonFromBlob;
+var
+  ctx: Tsqlite3_context; vm: TVdbe; pOut: TMem;
+  blob: array[0..0] of Byte;
+begin
+  SetupCtx(ctx, vm, pOut);
+  blob[0] := JSONB_TRUE;
+  jsonReturnTextJsonFromBlob(@ctx, @blob[0], 1);
+  CheckEqS('T361 jsonReturnTextJsonFromBlob TRUE → "true"',
+           MemString(pOut), 'true');
+end;
+
+procedure TestAppendSqlValue;
+var
+  s:  TJsonString;
+  v:  TMem;
+  z:  AnsiString;
+begin
+  jsonStringInit(@s, nil);
+  FillChar(v, SizeOf(v), 0); v.flags := MEM_Null;
+  jsonAppendSqlValue(@s, @v);
+  jsonStringTerminate(@s);
+  SetLength(z, s.nUsed);
+  if s.nUsed > 0 then Move(s.zBuf^, z[1], s.nUsed);
+  CheckEqS('T362 appendSqlValue NULL → "null"', z, 'null');
+  jsonStringReset(@s);
+
+  jsonStringInit(@s, nil);
+  SetupTextValue(v, PAnsiChar('hi'), 2);
+  jsonAppendSqlValue(@s, @v);
+  jsonStringTerminate(@s);
+  SetLength(z, s.nUsed);
+  if s.nUsed > 0 then Move(s.zBuf^, z[1], s.nUsed);
+  CheckEqS('T363 appendSqlValue TEXT → quoted', z, '"hi"');
+  jsonStringReset(@s);
+end;
+
+procedure TestReturnString;
+var
+  ctx: Tsqlite3_context; vm: TVdbe; pOut: TMem;
+  func: TFuncDef;
+  s:    TJsonString;
+begin
+  SetupCtx(ctx, vm, pOut);
+  FillChar(func, SizeOf(func), 0);
+  func.pUserData := nil;       { no JSON_BLOB → text path }
+  ctx.pFunc := @func;
+  jsonStringInit(@s, @ctx);
+  jsonAppendRawNZ(@s, PAnsiChar('null'), 4);
+  jsonReturnString(@s, nil, nil);
+  CheckEqS('T364 jsonReturnString text-out "null"',
+           MemString(pOut), 'null');
+end;
+
+procedure TestWrongNumArgs;
+var
+  ctx: Tsqlite3_context; vm: TVdbe; pOut: TMem;
+begin
+  SetupCtx(ctx, vm, pOut);
+  jsonWrongNumArgs(@ctx, PAnsiChar('set'));
+  CheckTrue('T365 wrongNumArgs sets isError', ctx.isError <> 0);
+  CheckEqS('T366 wrongNumArgs message',
+           MemString(pOut),
+           'json_set() needs an odd number of arguments');
+end;
+
+procedure TestBadPathError;
+var
+  ctx: Tsqlite3_context; vm: TVdbe; pOut: TMem;
+begin
+  SetupCtx(ctx, vm, pOut);
+  jsonBadPathError(@ctx, PAnsiChar('$.x'),
+                   i32(JSON_LOOKUP_NOTARRAY));
+  CheckEqS('T367 badPathError NOTARRAY message',
+           MemString(pOut), 'not an array element: $.x');
+
+  SetupCtx(ctx, vm, pOut);
+  jsonBadPathError(@ctx, PAnsiChar('$.x'),
+                   i32(JSON_LOOKUP_TOODEEP));
+  CheckEqS('T368 badPathError TOODEEP message',
+           MemString(pOut), 'JSON path too deep');
+
+  SetupCtx(ctx, vm, pOut);
+  jsonBadPathError(@ctx, PAnsiChar('$.x'),
+                   i32(JSON_LOOKUP_ERROR));
+  CheckEqS('T369 badPathError ERROR message',
+           MemString(pOut), 'malformed JSON');
+
+  SetupCtx(ctx, vm, pOut);
+  jsonBadPathError(@ctx, PAnsiChar('$.x'), 0);
+  CheckEqS('T370 badPathError default → "bad JSON path:"',
+           MemString(pOut), 'bad JSON path: $.x');
+end;
+
+procedure TestFunctionArgToBlob;
+var
+  ctx: Tsqlite3_context; vm: TVdbe; pOut: TMem;
+  v:   TMem;
+  p:   TJsonParse;
+  zJ:  AnsiString;
+begin
+  SetupCtx(ctx, vm, pOut);
+  FillChar(v, SizeOf(v), 0); v.flags := MEM_Null;
+  CheckEqI('T371 fnArgToBlob NULL → 0',
+           jsonFunctionArgToBlob(@ctx, @v, @p), 0);
+  CheckEqI('T372 fnArgToBlob NULL nBlob = 1',
+           i64(p.nBlob), 1);
+  CheckEqI('T373 fnArgToBlob NULL aBlob[0] = JSONB_NULL',
+           p.aBlob[0], JSONB_NULL);
+
+  SetupCtx(ctx, vm, pOut);
+  zJ := 'plain text';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  FillChar(p, SizeOf(p), 0);
+  CheckEqI('T374 fnArgToBlob TEXTRAW → 0',
+           jsonFunctionArgToBlob(@ctx, @v, @p), 0);
+  CheckTrue('T375 fnArgToBlob TEXTRAW nBlob > 0', p.nBlob > 0);
+  if p.nBlob > 0 then
+    CheckEqI('T376 fnArgToBlob TEXTRAW first nibble = JSONB_TEXTRAW',
+             p.aBlob[0] and $0F, JSONB_TEXTRAW);
+  if p.nBlobAlloc > 0 then sqlite3DbFree(Psqlite3db(p.db), p.aBlob);
+end;
+
+begin
+  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e/f/g/h.1 JSON port ===');
   TestTypeNames;
   TestIsspace;
   TestSpacesString;
@@ -1495,6 +1706,16 @@ begin
   TestJsonCacheSearchEmpty;
   TestJsonParseFuncArgRoundtrip;
   TestJsonParseFuncArgNullSqlNull;
+  TestReturnFromBlob_Primitives;
+  TestReturnFromBlob_Int;
+  TestReturnFromBlob_Text;
+  TestReturnFromBlob_Malformed;
+  TestReturnTextJsonFromBlob;
+  TestAppendSqlValue;
+  TestReturnString;
+  TestWrongNumArgs;
+  TestBadPathError;
+  TestFunctionArgToBlob;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);
