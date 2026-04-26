@@ -21,6 +21,43 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    sqlite3WhereBegin signature alignment with C source.**  Closed
+    the signature-drift discovery flagged in the previous sub-progress
+    note.  Pascal's `sqlite3WhereBegin` was missing the `Select* pSelect`
+    parameter (slot #6 in C, between `pResultSet` and `wctrlFlags`) and
+    its `pResultSet` slot was misnamed `pDistinctSet`.  Both fixed; the
+    declaration + definition now match `where.c:6828..6837` /
+    `sqliteInt.h:5100` byte-for-byte (8 params, same order, same names).
+    Body remains a stub returning nil — pure contract change.
+
+    Concrete changes:
+      * `passqlite3codegen.pas:1537..1539` — declaration: 7→8 params,
+        `pDistinctSet`→`pResultSet`, inserted `pSelect: PSelect`.
+      * `passqlite3codegen.pas:4404..4418` — definition: same signature
+        change; header comment updated to document the alignment with
+        the C source and the prologue's reliance on the `pSelect` slot.
+
+    Why this lands alone: no callers exist (only the declaration, the
+    stub body, and a TODO comment), so the rename + insertion is
+    mechanical.  Once the productive prologue port lands (next
+    11g.2.b sub-progress), it can write `pWInfo^.pSelect := pSelect`
+    directly without further signature surgery.
+
+    Test status: full build clean (no new warnings), regression sweep
+    all green — TestWhereBasic 52/52, TestWhereStructs 148/148,
+    TestPrepareBasic 20/20, TestParser 45/45, TestSchemaBasic 44/44,
+    TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+    TestExprBasic 40/40, TestInitCallback 29/29, TestExplainParity
+    unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Next 6.9-bis target (still 11g.2.b): productive `sqlite3WhereBegin`
+    prologue for the single-table rowid-EQ shape — allocate WhereInfo
+    (nLevel=1), init iEndWhere / iContinue / iBreak labels, init the
+    WhereLoopBuilder, init the WhereMaskSet, install the table cursor
+    mask, walk pTabList capping at BMS, then fall into the trimmed
+    planner pick.
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     productive sqlite3WhereEnd cleanup contract.**  Second sub-progress
     landing inside step 11g.2.b.  Replaces the empty `sqlite3WhereEnd`
     stub at `passqlite3codegen.pas:4360..4365` with the productive
@@ -8022,18 +8059,26 @@ Phase 5.9 depends on this being done first.
       `sqlite3WhereSplit`, mask-set init, builder init) exists and is
       tested.
 
-      **Discovery (signature drift to fix in next increment).**  Pascal's
-      `sqlite3WhereBegin` declaration at `passqlite3codegen.pas:1535` /
-      :4351 has 7 parameters (pParse, pTabList, pWhere, pOrderBy,
-      pDistinctSet, wctrlFlags, iAuxArg); upstream C
-      (`sqliteInt.h:5100`) has 8 — the missing parameter is `Select*
-      pSelect` between `pResultSet` and `wctrlFlags`.  Pascal's
-      `pDistinctSet` is also misnamed — it's the same slot as C's
-      `pResultSet`.  No callers exist yet (only declaration + stub +
-      one TODO comment at codegen.pas:5618), so rename and insertion
-      are mechanical.  Block this on the productive prologue port: the
-      port writes `pWInfo^.pSelect = pSelect`, so the parameter must
-      be present.
+      **Sub-progress (landed 2026-04-26 — signature alignment with C).**
+      Closed the previously-flagged signature-drift discovery.
+      `sqlite3WhereBegin` declaration at `passqlite3codegen.pas:1537` and
+      definition at :4404 now match upstream C (`where.c:6828..6837`,
+      `sqliteInt.h:5100`) byte-for-byte: 8 parameters in order
+      (Parse*, SrcList*, Expr* pWhere, ExprList* pOrderBy,
+      ExprList* pResultSet, Select* pSelect, u16 wctrlFlags, int iAuxArg).
+      Pascal's misnamed `pDistinctSet` was renamed to `pResultSet`, and
+      the missing `pSelect: PSelect` slot was inserted between
+      `pResultSet` and `wctrlFlags`.  The body remains a stub returning
+      nil — this is purely a contract change, no behaviour change in the
+      corpus.  No callers existed (only the declaration, definition, and
+      a TODO comment at codegen.pas:5666), so the change was mechanical.
+      Full regression sweep stays green (TestWhereBasic 52/52,
+      TestWhereStructs 148/148, TestPrepareBasic 20/20, TestParser 45/45,
+      TestSchemaBasic 44/44, TestVdbeApi 57/57, TestDMLBasic 54/54,
+      TestSelectBasic 49/49, TestExprBasic 40/40, TestInitCallback 29/29,
+      TestExplainParity unchanged at 2 PASS / 8 DIVERGE / 0 ERROR).
+      Now unblocks the productive prologue port, which writes
+      `pWInfo^.pSelect = pSelect` directly.
 
       **Remaining sub-task:** the actual productive WhereBegin
       single-table, single-rowid-EQ-predicate case + WhereEnd's

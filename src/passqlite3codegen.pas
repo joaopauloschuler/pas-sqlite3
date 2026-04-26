@@ -1535,8 +1535,8 @@ function  sqlite3WhereBreakLabel(pWInfo: PWhereInfo): i32;
 function  sqlite3WhereOkOnePass(pWInfo: PWhereInfo; aiCur: Pi32): i32;
 function  sqlite3WhereUsesDeferredSeek(pWInfo: PWhereInfo): i32;
 function  sqlite3WhereBegin(pParse: PParse; pTabList: PSrcList; pWhere: PExpr;
-  pOrderBy: PExprList; pDistinctSet: PExprList; wctrlFlags: u16;
-  iAuxArg: i32): PWhereInfo;
+  pOrderBy: PExprList; pResultSet: PExprList; pSelect: PSelect;
+  wctrlFlags: u16; iAuxArg: i32): PWhereInfo;
 procedure sqlite3WhereEnd(pWInfo: PWhereInfo);
 procedure sqlite3WhereRightJoinLoop(pWInfo: PWhereInfo; iLevel: i32;
   pLevel: PWhereLevel);
@@ -4402,11 +4402,17 @@ begin
 end;
 
 function sqlite3WhereBegin(pParse: PParse; pTabList: PSrcList; pWhere: PExpr;
-  pOrderBy: PExprList; pDistinctSet: PExprList; wctrlFlags: u16;
-  iAuxArg: i32): PWhereInfo;
+  pOrderBy: PExprList; pResultSet: PExprList; pSelect: PSelect;
+  wctrlFlags: u16; iAuxArg: i32): PWhereInfo;
 begin
   { Phase 6.2 stub — full where.c implementation deferred to Phase 6.9-bis
-    step 11g.2.b productive vertical slice. }
+    step 11g.2.b productive vertical slice.
+
+    Signature aligned with C source where.c:6828..6837 — 8 parameters in the
+    same order: (Parse*, SrcList*, Expr* pWhere, ExprList* pOrderBy,
+    ExprList* pResultSet, Select* pSelect, u16 wctrlFlags, int iAuxArg).
+    The productive prologue port writes pWInfo^.pSelect = pSelect, so the
+    parameter must be in place before the prologue can land. }
   Result := nil;
 end;
 
