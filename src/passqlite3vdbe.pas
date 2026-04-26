@@ -1559,6 +1559,10 @@ function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
 
 implementation
 
+uses
+  passqlite3vtab;  { Phase 6.bis.3a: VTable + sqlite3VtabBegin/CallCreate/CallDestroy/ImportErrmsg
+                     — implementation-only to break the interface-side cycle (vtab uses vdbe). }
+
 { ============================================================================
   Phase 5.2 — vdbeaux.c port
   Byte-offset helpers for Parse and sqlite3 fields (opaque pointers).
@@ -4424,6 +4428,10 @@ var
   xLim:     i64;              { OP_OffsetLimit: combined limit }
   newMax:   Pgno;             { OP_MaxPgcnt: new max page count }
   pBtArg:   PBtree;           { OP_MaxPgcnt/Pagecount: btree }
+  { 6.bis.3a locals — vtab opcode wiring }
+  pVTabRef:    passqlite3vtab.PVTable;  { OP_VBegin/VCreate/VDestroy: VTable* from p4 }
+  sMemVCreate: TMem;                    { OP_VCreate: scratch Mem for table-name copy }
+  zVTabName:   PAnsiChar;               { OP_VCreate: text of table name }
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -7258,13 +7266,43 @@ begin
       goto op_function_body;
     end;
 
-    { ────── OP_VBegin, OP_VCreate, OP_VDestroy, OP_VOpen, OP_VFilter,
-             OP_VColumn, OP_VUpdate, OP_VNext, OP_VCheck, OP_VInitIn,
-             OP_VRename ────── — virtual table ops (Phase 5.4p stubs) }
-    OP_VBegin, OP_VCreate, OP_VDestroy, OP_VOpen,
-    OP_VFilter, OP_VColumn, OP_VUpdate, OP_VNext,
+    { ────── OP_VBegin (vdbe.c:8294) ────── Phase 6.bis.3a }
+    OP_VBegin: begin
+      pVTabRef := passqlite3vtab.PVTable(pOp^.p4.pVtab);
+      rc := passqlite3vtab.sqlite3VtabBegin(db, pVTabRef);
+      if pVTabRef <> nil then
+        passqlite3vtab.sqlite3VtabImportErrmsg(v, pVTabRef^.pVtab);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+    end;
+
+    { ────── OP_VCreate (vdbe.c:8310) ────── Phase 6.bis.3a }
+    OP_VCreate: begin
+      FillChar(sMemVCreate, SizeOf(sMemVCreate), 0);
+      sMemVCreate.db := db;
+      { aMem[p2] is always a static string per the opcode contract — copy is
+        guaranteed not to fail, but we still funnel rc through to be faithful. }
+      rc := sqlite3VdbeMemCopy(@sMemVCreate, @aMem[pOp^.p2]);
+      zVTabName := sqlite3_value_text(@sMemVCreate);
+      if zVTabName <> nil then
+        rc := passqlite3vtab.sqlite3VtabCallCreate(db, pOp^.p1, zVTabName,
+                                                   @v^.zErrMsg);
+      sqlite3VdbeMemRelease(@sMemVCreate);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+    end;
+
+    { ────── OP_VDestroy (vdbe.c:8339) ────── Phase 6.bis.3a }
+    OP_VDestroy: begin
+      Inc(db^.nVDestroy);
+      rc := passqlite3vtab.sqlite3VtabCallDestroy(db, pOp^.p1, pOp^.p4.z);
+      Dec(db^.nVDestroy);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+    end;
+
+    { ────── OP_VOpen, OP_VFilter, OP_VColumn, OP_VUpdate, OP_VNext,
+             OP_VCheck, OP_VInitIn, OP_VRename ────── — Phase 6.bis.3b stubs }
+    OP_VOpen, OP_VFilter, OP_VColumn, OP_VUpdate, OP_VNext,
     OP_VCheck, OP_VInitIn, OP_VRename: begin
-      { Stub: virtual table opcodes deferred to Phase 6 / Phase 5.4p }
+      { Stub: cursor-bearing vtab opcodes deferred to Phase 6.bis.3b }
       rc := SQLITE_ERROR;
       sqlite3VdbeError(v, 'virtual table not supported');
       goto abort_due_to_error;

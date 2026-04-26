@@ -124,6 +124,7 @@ compile_test TestVdbeBlob
 compile_test TestVdbeSort
 compile_test TestVdbeTrace
 compile_test TestVdbeVtab
+compile_test TestVdbeVtabExec
 compile_test TestTokenizer
 compile_test TestParserSmoke
 compile_test TestParser

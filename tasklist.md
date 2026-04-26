@@ -20,6 +20,95 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.3a VDBE wiring of OP_VBegin/VCreate/VDestroy.**
+    Replaced the lumped "virtual table not supported" stub in
+    `passqlite3vdbe.pas`'s exec switch with three faithful arms
+    matching `vdbe.c:8294/8310/8339`:
+      * **OP_VBegin** — derefs `pOp^.p4.pVtab` (`PVTable`), calls
+        `passqlite3vtab.sqlite3VtabBegin`, then `sqlite3VtabImportErrmsg`
+        when the VTable is non-nil; aborts on any non-OK rc.
+      * **OP_VCreate** — copies `aMem[p2]` into a scratch `TMem`,
+        extracts the table-name text via `sqlite3_value_text`, calls
+        `passqlite3vtab.sqlite3VtabCallCreate(db, p1, zName, @v^.zErrMsg)`,
+        releases the scratch Mem.
+      * **OP_VDestroy** — increments `db^.nVDestroy`, calls
+        `passqlite3vtab.sqlite3VtabCallDestroy(db, p1, p4.z)`, decrements.
+    The remaining vtab opcodes (OP_VOpen / OP_VFilter / OP_VColumn /
+    OP_VUpdate / OP_VNext / OP_VCheck / OP_VInitIn / OP_VRename) stay
+    in the unified error-stub for **Phase 6.bis.3b** — they all need
+    cursor-bearing infrastructure (`allocateCursor` with
+    `CURTYPE_VTAB`, vtab-cursor cleanup in `sqlite3VdbeFreeCursorNN`,
+    plus a simplified `sqlite3_context` for OP_VColumn).
+
+    **Cycle break.**  `passqlite3vtab` already uses `passqlite3vdbe` in
+    its interface; we therefore added `passqlite3vtab` to vdbe's
+    *implementation* `uses` clause (not interface), which Pascal allows
+    even when the interface-side cycle would not compile.  All vtab
+    references in the new opcode arms qualify the unit name explicitly
+    (e.g. `passqlite3vtab.PVTable`, `passqlite3vtab.sqlite3VtabBegin`)
+    so the `PVTable = Pointer` opaque alias declared in vdbe's interface
+    keeps coexisting with the real type from the vtab unit without
+    ambiguity.
+
+    Gate `src/tests/TestVdbeVtabExec.pas` (new) — **11/11 PASS**.
+    Drives sqlite3VdbeExec on a hand-built mini Vdbe (mirrors the
+    TestVdbeArith pattern) with a mock module that owns `xBegin`:
+      * T1  OP_VBegin valid VTable → xBegin fires once, nVTrans=1.
+      * T2  OP_VBegin nil pVtab → no-op (sqlite3VtabBegin returns OK).
+      * T3  OP_VBegin twice on same VTable → xBegin fires exactly once
+            (sqlite3VtabBegin's iSavepoint short-circuit).
+      * T4  xBegin → SQLITE_BUSY: function rc rewritten to SQLITE_ERROR
+            by `abort_due_to_error`, but `v^.rc` preserves the original
+            BUSY (faithful to vdbe.c — SQLite C does the same rewrite).
+
+    Discoveries / dependencies for next sub-phases:
+
+      * **`abort_due_to_error` rewrites the function's return rc to
+        SQLITE_ERROR.**  Both upstream and our port do this — the
+        original rc lives on `v^.rc` for `sqlite3_errcode()`.  Tests
+        targeting non-OK paths in opcodes that go through
+        abort_due_to_error must assert `v^.rc`, not the rc returned by
+        sqlite3VdbeExec.  Save in memory for any future opcode-test
+        author.
+      * **OP_VCreate / OP_VDestroy gate is blocked on a populated
+        schema** — `sqlite3VtabCallCreate / Destroy` walk
+        `db^.aDb[iDb].pSchema^.tblHash` via `sqlite3FindTable`, which
+        crashes against a fake `Tsqlite3` with `nDb=0`.  End-to-end
+        coverage of those two arms must wait for Phase 8.x's CREATE
+        VIRTUAL TABLE pipeline (the parser side already lands the
+        OP_VCreate emission via `sqlite3VtabFinishParse`'s
+        nested-parse path — also Phase 8.x).
+      * **`P4_VTAB` round-trips a `PVTable`**, not a `PSqlite3Vtab`.
+        The dispatch arm derefs `pOp^.p4.pVtab^.pVtab` to get the
+        `sqlite3_vtab*` for sqlite3VtabImportErrmsg (matches
+        vdbe.c:8298).  Worth memoising for 6.bis.3b — the same
+        pattern applies for OP_VOpen / OP_VRename / OP_VUpdate, all
+        of which take `P4_VTAB` and need to walk through the VTable
+        wrapper to reach the module's function-pointer slots.
+      * **Mock vtab cursor allocator must use libc malloc**, not FPC
+        GetMem, when the module's xDisconnect calls `sqlite3_free`
+        (= libc free) on its own state — same trade-off the 6.bis.1d
+        TestVtab gate flagged for `pVtab^.zErrMsg`.  Our test
+        mock currently FreeMem's its sqlite3_vtab from a Pascal
+        xDisconnect, which is allocator-symmetric, so this is only
+        a heads-up for future tests where the module's own xClose /
+        xDisconnect goes through `sqlite3_free`.
+
+    Concrete changes:
+      * `src/passqlite3vdbe.pas` — adds `passqlite3vtab` to
+        implementation `uses`; three new `var`-block locals
+        (`pVTabRef`, `sMemVCreate`, `zVTabName`); replaces the
+        lumped vtab-opcode stub with three explicit arms + a
+        smaller residual stub for the remaining 8 vtab opcodes.
+      * `src/tests/TestVdbeVtabExec.pas` — new gate test (T1–T4).
+      * `src/tests/build.sh` — registers TestVdbeVtabExec
+        immediately after TestVdbeVtab.
+
+    Full 50-binary test sweep: all green (TestVtab 216/216,
+    TestCarray 66/66, TestDbpage 68/68, TestDbstat 83/83,
+    TestVdbeVtabExec 11/11, no regressions in the other 45
+    binaries).
+
   - **2026-04-26 — Phase 6.bis.2d dbstat.c port.**  New unit
     `src/passqlite3dbstat.pas` (~770 lines) hosts faithful Pascal ports
     of all 11 static module callbacks (statConnect / statDisconnect /
@@ -3146,6 +3235,50 @@ Phase 5.9 depends on this being done first.
     paths (xFilter / xColumn / statNext page-walk) deferred to 6.9:
     require a real Btree and the sqlite3_prepare_v2 path through the
     parser.  No regressions across the 47-gate matrix.
+
+- **6.bis.3** VDBE wiring of vtab opcodes.  The 6.bis.1d/1f and 6.bis.2a..d
+  carry-over notes all flag the same gap: `OP_VBegin / VCreate / VDestroy /
+  VOpen / VFilter / VColumn / VNext / VUpdate / VRename` exist as opcode
+  numbers in `passqlite3vdbe.pas` but their dispatch arms returned a single
+  "virtual table not supported" error.  Until those arms call the real vtab
+  callbacks, end-to-end SQL `SELECT * FROM carray(...)` /
+  `SELECT * FROM sqlite_dbpage` / `SELECT * FROM dbstat` cannot reach
+  xFilter / xColumn / xNext, so the in-tree vtab gates ported in 6.bis.2b/c/d
+  exercise the module-pointer slots directly rather than the SQL path.
+  Broken into:
+
+  - [X] **6.bis.3a** Wire OP_VBegin, OP_VCreate, OP_VDestroy.  These three
+    do not need cursor-bearing state; they delegate to existing entry
+    points already exported by `passqlite3vtab`
+    (`sqlite3VtabBegin / sqlite3VtabCallCreate / sqlite3VtabCallDestroy`
+    plus `sqlite3VtabImportErrmsg`).  DONE 2026-04-26.  See "Most recent
+    activity" above for the full changelog and discoveries.  Gate
+    `src/tests/TestVdbeVtabExec.pas` — **11/11 PASS** (T1..T4 covering
+    valid VTable / nil VTable / idempotent VBegin / xBegin returning
+    SQLITE_BUSY).  No regressions across the 50-binary matrix.
+
+  - [ ] **6.bis.3b** Wire the cursor-bearing vtab opcodes: OP_VOpen,
+    OP_VFilter, OP_VColumn, OP_VNext, OP_VUpdate, OP_VRename, OP_VCheck,
+    OP_VInitIn.  Requires:
+      * `allocateCursor(...,CURTYPE_VTAB)` integration — already supported
+        by the existing `allocateCursor` (just not yet exercised with
+        CURTYPE_VTAB by any opcode).
+      * Extend `sqlite3VdbeFreeCursorNN`'s deferred CURTYPE_VTAB branch
+        (line ~2675) to call `pCx^.uc.pVCur^.pVtab^.pModule^.xClose`
+        and decrement `pVtab->nRef`.
+      * Build a minimal `Tsqlite3_context` on the stack for OP_VColumn
+        — same shape as the one allocated in `sqlite3VdbeMemRelease`'s
+        callsite for application-defined functions; the Phase-5 codegen
+        already has a partial `sqlite3_context` plumbed via OP_Function.
+      * `OP_Rowid` already has a curType branch in vdbe.c:6175 that
+        invokes `pModule->xRowid`; check whether our port's OP_Rowid
+        already covers CURTYPE_VTAB — if not, fold in here.
+      * Extend TestVdbeVtabExec with T5..T15 covering xOpen → xFilter →
+        xEof → xColumn → xNext → xClose.  Mock module from 6.bis.3a is
+        already in place; just add the missing callback slots.
+    The "rowid" handling lives in OP_Rowid (no separate OP_VRowid in
+    SQLite 3.53), so 6.bis.3b should also audit our OP_Rowid
+    implementation for the CURTYPE_VTAB branch.
 
 - [ ] **6.9** `TestExplainParity.pas`: for the full SQL corpus, `EXPLAIN` each
   statement via Pascal and via C; diff the opcode listings. This is the single
