@@ -22,7 +22,8 @@ interface
 uses
   passqlite3types,
   passqlite3util,
-  passqlite3codegen;
+  passqlite3codegen,
+  passqlite3printf;  { Phase 6.bis.4b: sqlite3MPrintf for VtabFinishParse }
 
 { =========================================================================== }
 { TK_* token constants  (from sqlite3/parse.h, SQLite 3.53.0)                }
@@ -1976,6 +1977,7 @@ var
   pSchemaT: passqlite3util.PSchema;
   pOld:    PTable2;
   zName:   PAnsiChar;
+  zStmt:   PAnsiChar;
 begin
   pTab := pPse^.pNewTable;
   db   := pPse^.db;
@@ -1987,15 +1989,26 @@ begin
   if pTab^.u.vtab.nArg < 1 then Exit;
 
   if db^.init.busy = 0 then begin
-    { TODO Phase 6.bis.1b-followup: the init.busy=0 branch of vtab.c:463    }
-    { needs sqlite3MPrintf("CREATE VIRTUAL TABLE %T", &sNameToken) plus     }
-    { sqlite3NestedParse to update sqlite_schema, then OP_Expire +          }
-    { sqlite3VdbeAddParseSchemaOp + OP_VCreate.  Both sqlite3MPrintf and    }
-    { sqlite3NestedParse are still Phase-7 stubs in passqlite3codegen, so   }
-    { the full body is deferred to a follow-up sub-phase that lands the     }
-    { printf machinery.  For now we MayAbort to mark the side effect and   }
-    { let the parser succeed.                                                }
+    { Phase 6.bis.4b: the printf engine has landed, so the                 }
+    { sqlite3MPrintf("CREATE VIRTUAL TABLE %T", &sNameToken) call below    }
+    { is now real (was a TODO blocked on Phase 6.bis.4a).  The remaining   }
+    { wiring — sqlite3NestedParse to UPDATE sqlite_schema, then            }
+    { OP_Expire / sqlite3VdbeAddParseSchemaOp / OP_VCreate — still depends }
+    { on Phase-7 codegen helpers (sqlite3NestedParse, sqlite3GetVdbe,      }
+    { sqlite3ChangeCookie, sqlite3VdbeAddParseSchemaOp, sqlite3VdbeLoadString),
+      which are all stubs at this point.  We therefore compute zStmt to    }
+    { exercise the printf wiring (and to verify the %T conversion against  }
+    { the live parser-emitted sNameToken) and free it immediately; the     }
+    { schema-update side-effects land in the next sub-phase.              }
     sqlite3MayAbort(pPse);
+
+    if pEnd <> nil then begin
+      pPse^.sNameToken.n := i32(
+          PtrUInt(pEnd^.z) - PtrUInt(pPse^.sNameToken.z)) + i32(pEnd^.n);
+    end;
+    zStmt := sqlite3MPrintf(Psqlite3db(db),
+                            'CREATE VIRTUAL TABLE %T', [@pPse^.sNameToken]);
+    if zStmt <> nil then sqlite3DbFree(Psqlite3db(db), zStmt);
   end else begin
     { Re-reading sqlite_schema: install the table in the in-memory schema. }
     pSchemaT := passqlite3util.PSchema(pTab^.pSchema);

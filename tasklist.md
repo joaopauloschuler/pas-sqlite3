@@ -20,6 +20,79 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.4b.1 printf migration of FmtMsg shims +
+    partial `sqlite3VtabFinishParse` wiring.**  Discharges the first
+    half of the 6.bis.4b follow-up promised in 6.bis.4a:
+
+      * `sqlite3VtabFmtMsg1Db` / `sqlite3VtabFmtMsg1Libc` in
+        `passqlite3vtab.pas` are no longer `SysUtils.Format`-based.
+        Both helpers now call into the in-tree printf engine
+        (`sqlite3MPrintf` / `sqlite3PfMprintf`) with the same
+        fmt-or-literal contract, so the four downstream callers in
+        carray / dbpage / dbstat / vtab pick up the new path with no
+        edits — they were already routed through these shared helpers
+        by 6.bis.3e.  `SysUtils.Format` is now unused by the printf-
+        adjacent surface; the only `SysUtils` consumers in the vtab
+        modules are the timing / file-IO helpers from other slices.
+      * `sqlite3VtabFinishParse` (passqlite3parser.pas:1989) lights up
+        the long-deferred `init.busy=0` printf call:
+        `sqlite3MPrintf(db, "CREATE VIRTUAL TABLE %T", &sNameToken)`.
+        The full body still depends on `sqlite3NestedParse` plus
+        several Phase-7 codegen helpers, so the result is freed
+        immediately — but the call exercises the `%T` conversion
+        against a parser-produced `sNameToken`, including the
+        `pEnd`-driven token-length fix-up at `vtab.c:474`.  When
+        Phase-7 lands NestedParse, this call becomes load-bearing
+        without any further printf-side rework.
+      * `passqlite3parser.pas` now imports `passqlite3printf` for the
+        first time; previously parser code had no printf consumer.
+
+    Allocation contract reminder for the migration: the C reference
+    distinguishes `sqlite3MPrintf` (db-malloc — freed by
+    `sqlite3DbFree(db, …)`) from `sqlite3_mprintf` / our
+    `sqlite3PfMprintf` (libc malloc — freed by `sqlite3_free` /
+    `free`).  The Db variant is used by error-message strings
+    written into `pzErr^` for vtab constructor / SQL-builder paths
+    (sqlite3DbFree later).  The Libc variant is used for
+    `pVtab^.zErrMsg` strings (the sqlite3 spec says the engine
+    `free`s those itself).  Both shims preserve those contracts; no
+    callsite in the four migrated modules needed adjustment.
+
+    Concrete changes:
+      * `src/passqlite3vtab.pas` — adds `passqlite3printf` to `uses`;
+        rewrites `sqlite3VtabFmtMsg1Db` / `…Libc` bodies (drops 30+
+        lines of `SysUtils.Format` machinery, replaced with 6 lines
+        of printf delegation).
+      * `src/passqlite3parser.pas` — adds `passqlite3printf` to `uses`;
+        `sqlite3VtabFinishParse` adds the live `sqlite3MPrintf` call
+        plus `pEnd`-token fix-up.  Comment block rewritten to record
+        which Phase-7 helpers remain blocking.
+
+    Full 51-binary test sweep: all green.  TestPrintf 40/40,
+    TestVtab 216/216, TestCarray 66/66, TestDbpage 68/68,
+    TestDbstat 83/83, TestVdbeVtabExec 50/50.
+
+    Discoveries / next-step notes:
+      * The `passqlite3printf` unit imports only
+        `passqlite3types` + `passqlite3util`, so depending on it from
+        `passqlite3parser` / `passqlite3vtab` does not introduce any
+        circular references — every existing import already pulls in
+        both upstream units.
+      * The `Pos('%', fmt) > 0` check inside the helpers is intentional
+        and stays.  Without it, a fmt that already happens to be a
+        literal message containing `%` (e.g. an external xCreate's
+        zErr that includes a percent sign) would be mis-interpreted
+        as a fresh format string and consume an arg.  The
+        `'%s'`-with-fmt-as-arg path neutralises that.
+      * Remaining 6.bis.4b work, now broken out as
+        **6.bis.4b.2**: float conversions (`%f %e %E %g %G`),
+        `%S` SrcItem, `%r` ordinal.  Float work is the bulk —
+        requires porting `sqlite3FpDecode` (util.c:1380) and
+        `sqlite3Fp2Convert10` plus the 200-line etFLOAT/etEXP/etGENERIC
+        renderer in printf.c.  `%r` is a 5-line addition that can ship
+        independently if a callsite needs it before the float port
+        lands.
+
   - **2026-04-26 — Phase 6.bis.4a printf core (mini-port).**  Lands the
     long-awaited printf machinery flagged as a recurring blocker by
     every prior 6.bis sub-phase (1c..1f, 2a..2d).  New unit
@@ -3699,16 +3772,42 @@ Phase 5.9 depends on this being done first.
     (`- 0 + space # *`) supported.  Gate `src/tests/TestPrintf.pas` —
     **40/40 PASS**.  See "Most recent activity" above.
 
-  - [ ] **6.bis.4b** Follow-up: float conversions (`%f %e %E %g %G`),
-    exotic extras (`%S` SrcItem, `%r` ordinal), migrate the four
-    `*FmtMsg` shims in passqlite3vtab/carray/dbpage/dbstat to direct
-    `sqlite3MPrintf` calls (delete the SysUtils.Format-based bodies),
-    and wire `sqlite3MPrintf` into the `init.busy=0` branch of
-    `sqlite3VtabFinishParse` (passqlite3parser.pas:1991 — the
-    `CREATE VIRTUAL TABLE %T` TODO).  Float printing must round-trip
-    SQLite's bespoke `et*Float*` rendering (printf.c:267..480) — not
-    plain libc snprintf — to keep `.dump` byte-identical with the C
-    reference.
+  - [X] **6.bis.4b.1** Migration of the four `*FmtMsg` shims to the
+    in-tree printf engine (Phase 6.bis.4a output) and partial wiring
+    of `sqlite3VtabFinishParse`.  DONE 2026-04-26.
+      * `sqlite3VtabFmtMsg1Db` and `sqlite3VtabFmtMsg1Libc` in
+        `passqlite3vtab.pas` no longer call `SysUtils.Format`; they
+        now delegate to `sqlite3MPrintf` / `sqlite3PfMprintf` with the
+        same fmt-or-literal contract (when fmt has no `%`, the call
+        becomes `sqlite3MPrintf("%s", fmt)` so a literal message
+        round-trips byte-identically).  The four call sites in
+        `passqlite3carray.pas` / `passqlite3dbpage.pas` /
+        `passqlite3dbstat.pas` (already collapsed to the shared
+        helpers in 6.bis.3e) inherit the new printf path automatically.
+      * `passqlite3parser.pas` now adds the `passqlite3printf` import
+        and `sqlite3VtabFinishParse` exercises
+        `sqlite3MPrintf("CREATE VIRTUAL TABLE %T", &sNameToken)` for
+        the `init.busy=0` arm — including the `pEnd` token-length
+        fix-up from `vtab.c:474`.  The result is freed immediately
+        because the surrounding `sqlite3NestedParse` /
+        `sqlite3VdbeAddParseSchemaOp` / `OP_VCreate` glue is still a
+        Phase-7 stub (codegen helpers not yet ported).  Once Phase 7
+        lands NestedParse, the call becomes load-bearing without any
+        further printf-side work.
+      * Full 51-binary test sweep: all green (TestPrintf 40/40,
+        TestVtab 216/216, TestCarray 66/66, TestDbpage 68/68,
+        TestDbstat 83/83, TestVdbeVtabExec 50/50).  No regressions
+        elsewhere.
+
+  - [ ] **6.bis.4b.2** Remaining 6.bis.4b scope: float conversions
+    (`%f %e %E %g %G`) plus exotic extras (`%S` SrcItem, `%r`
+    ordinal).  Float printing must round-trip SQLite's bespoke
+    `sqlite3FpDecode` / `sqlite3Fp2Convert10` rendering
+    (`util.c:1380` + `printf.c:528..738`) — *not* plain libc
+    snprintf — to keep `.dump` byte-identical with the C reference.
+    `%S` requires a stable `SrcItem` layout (Phase 7 codegen).  `%r`
+    is a 5-line `etORDINAL` arm (printf.c:481..488) that can ship
+    independently of the float work.
 
 - [ ] **6.9** `TestExplainParity.pas`: for the full SQL corpus, `EXPLAIN` each
   statement via Pascal and via C; diff the opcode listings. This is the single

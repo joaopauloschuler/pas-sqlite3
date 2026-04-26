@@ -59,7 +59,8 @@ uses
   passqlite3os,
   passqlite3vdbe,
   passqlite3codegen,
-  passqlite3parser;  { Phase 6.bis.1e: sqlite3GetToken + TK_* + sqlite3RunParser }
+  passqlite3parser,  { Phase 6.bis.1e: sqlite3GetToken + TK_* + sqlite3RunParser }
+  passqlite3printf;  { Phase 6.bis.4b: sqlite3MPrintf + sqlite3PfMprintf }
 
 type
   { ----- sqlite.h:7663..7666 — opaque-by-name types ----- }
@@ -703,44 +704,28 @@ type
     argc: i32; argv: PPAnsiChar; ppVtab: PPSqlite3Vtab;
     pzErr: PPAnsiChar): i32; cdecl;
 
-{ Build an error message via SysUtils.Format and return as a sqlite3DbMalloc
-  string.  Replacement for sqlite3MPrintf in the Phase 6.bis.1c code paths
-  (the printf-machinery sub-phase will replace these calls when it lands). }
+{ Build an error message via the ported sqlite3MPrintf / sqlite3PfMprintf
+  helpers (Phase 6.bis.4a) and return the result.  The fmt argument is
+  forwarded verbatim when it contains no `%`, matching the legacy
+  Phase 6.bis.1c..3e behaviour where callers pass either a literal
+  message or a `%s`-style template.  Phase 6.bis.4b: the SysUtils.Format
+  fallback is gone — the in-tree printf engine now handles every
+  conversion these shims emit. }
 function sqlite3VtabFmtMsg1Db(db: PTsqlite3;
   const fmt, arg: AnsiString): PAnsiChar;
-var
-  s: AnsiString;
-  n: i32;
-  z: PAnsiChar;
 begin
   if Pos('%', fmt) > 0 then
-    s := SysUtils.Format(string(fmt), [string(arg)])
+    Result := sqlite3MPrintf(Psqlite3db(db), PAnsiChar(fmt), [PAnsiChar(arg)])
   else
-    s := fmt;
-  n := Length(s);
-  z := PAnsiChar(sqlite3DbMalloc(Psqlite3db(db), n + 1));
-  if z = nil then begin Result := nil; Exit; end;
-  if n > 0 then Move(PAnsiChar(s)^, z^, n);
-  z[n] := #0;
-  Result := z;
+    Result := sqlite3MPrintf(Psqlite3db(db), '%s', [PAnsiChar(fmt)]);
 end;
 
 function sqlite3VtabFmtMsg1Libc(const fmt, arg: AnsiString): PAnsiChar;
-var
-  s: AnsiString;
-  n: i32;
-  z: PAnsiChar;
 begin
   if Pos('%', fmt) > 0 then
-    s := SysUtils.Format(string(fmt), [string(arg)])
+    Result := sqlite3PfMprintf(PAnsiChar(fmt), [PAnsiChar(arg)])
   else
-    s := fmt;
-  n := Length(s);
-  z := PAnsiChar(sqlite3Malloc(n + 1));
-  if z = nil then begin Result := nil; Exit; end;
-  if n > 0 then Move(PAnsiChar(s)^, z^, n);
-  z[n] := #0;
-  Result := z;
+    Result := sqlite3PfMprintf('%s', [PAnsiChar(fmt)]);
 end;
 
 { Back-compat alias for in-unit callers that used the older private name. }
