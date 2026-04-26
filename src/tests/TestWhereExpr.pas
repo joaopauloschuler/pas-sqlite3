@@ -102,6 +102,13 @@ var
   pLikeList2: PExprList;
   iLikeIdx2: i32;
   nTermBeforeLike: i32;
+  { T16: TK_VARIABLE LIKE pattern (bound parameter). }
+  pLikeFn3, pLikeCol3, pLikeVar3: PExpr;
+  pLikeList3: PExprList;
+  iLikeIdx3: i32;
+  vBound: PVdbe;
+  pLikeVarRhs3: PExpr;
+  tokVar: TToken;
 
 begin
   WriteLn('=== TestWhereExpr — Phase 6.9-bis 11g.2.c whereexpr helpers ===');
@@ -539,6 +546,69 @@ begin
         pWC^.nTerm = nTermBeforeLike + 1);
   Check('T15b numeric-prefix LIKE term not flagged TERM_LIKE',
         (pWC^.a[iLikeIdx2].wtFlags and TERM_LIKE) = 0);
+
+  { ---- T16: TK_VARIABLE LIKE pattern (whereexpr.c:208..216, 316..334).
+            "x LIKE ?1" with ?1 currently bound to TEXT 'aBc%' must drive
+            isLikeOrGlob through the bound-parameter arm: read the current
+            value via sqlite3VdbeGetBoundValue, synthesize the same
+            range-scan virtual children as the literal-string path, and
+            set the expmask bit on parse.pVdbe so reoptimize() reprepares
+            on rebind. ---- }
+  vBound := sqlite3VdbeCreate(@parse);
+  if vBound = nil then begin Check('T16 vbound', False); end
+  else
+  begin
+    vBound^.nVar := 1;
+    vBound^.aVar := PMem(sqlite3DbMallocZero(db, SizeOf(TMem)));
+    vBound^.aVar^.flags := MEM_Null;
+    vBound^.eVdbeState := VDBE_READY_STATE;
+    Check('T16 setup bind_text rc=OK',
+          sqlite3_bind_text(vBound, 1, 'aBc%', 4, SQLITE_STATIC) = SQLITE_OK);
+    parse.pVdbe      := vBound;
+    parse.pReprepare := vBound;
+
+    pLikeCol3 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+    pLikeCol3^.iTable := 0; pLikeCol3^.iColumn := -1;
+
+    tokVar.z := PChar('?'); tokVar.n := 1;
+    pLikeVar3 := sqlite3ExprAlloc(db, TK_VARIABLE, @tokVar, 0);
+    pLikeVar3^.iColumn := 1;     { bound-parameter index }
+
+    pLikeList3 := sqlite3ExprListAppend(@parse, nil, pLikeVar3);
+    pLikeList3 := sqlite3ExprListAppend(@parse, pLikeList3, pLikeCol3);
+
+    tokLike.z := PChar('like'); tokLike.n := 4;
+    pLikeFn3  := sqlite3ExprAlloc(db, TK_FUNCTION, @tokLike, 0);
+    pLikeFn3^.x.pList := pLikeList3;
+
+    iLikeIdx3 := pWC^.nTerm;
+    whereClauseInsert(pWC, pLikeFn3, 0);
+    exprAnalyze(pSrc, pWC, iLikeIdx3);
+
+    Check('T16a TK_VARIABLE LIKE flagged TERM_LIKE',
+          (pWC^.a[iLikeIdx3].wtFlags and TERM_LIKE) <> 0);
+    Check('T16b TK_VARIABLE LIKE spawned 2 children',
+          pWC^.nTerm = iLikeIdx3 + 3);
+    Check('T16c child 0 op = TK_GE',
+          (pWC^.nTerm > iLikeIdx3 + 1) and
+          (pWC^.a[iLikeIdx3 + 1].pExpr^.op = TK_GE));
+    Check('T16d child 1 op = TK_LT',
+          (pWC^.nTerm > iLikeIdx3 + 2) and
+          (pWC^.a[iLikeIdx3 + 2].pExpr^.op = TK_LT));
+    pLikeVarRhs3 := pWC^.a[iLikeIdx3 + 1].pExpr^.pRight;
+    Check('T16e child 0 RHS = "ABC" (uppercased lower bound from bound value)',
+          (pLikeVarRhs3 <> nil) and (pLikeVarRhs3^.op = TK_STRING)
+          and (StrComp(pLikeVarRhs3^.u.zToken, 'ABC') = 0));
+    pLikeVarRhs3 := pWC^.a[iLikeIdx3 + 2].pExpr^.pRight;
+    Check('T16f child 1 RHS = "abd" (incremented upper bound)',
+          (pLikeVarRhs3 <> nil) and (pLikeVarRhs3^.op = TK_STRING)
+          and (StrComp(pLikeVarRhs3^.u.zToken, 'abd') = 0));
+    Check('T16g pVdbe.expmask bit 0 set on iColumn=1 binding',
+          (vBound^.expmask and 1) = 1);
+
+    parse.pVdbe      := nil;
+    parse.pReprepare := nil;
+  end;
 
   { Skip sqlite3WhereClauseClear / sqlite3DbFree for the synthetic
     WhereInfo: pWC^.a was allocated through sqlite3WhereMalloc and is

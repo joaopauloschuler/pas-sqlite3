@@ -96,16 +96,27 @@ Important: At the end of this document, please find:
       TERM_LIKEOPT|TERM_VIRTUAL|TERM_DYNAMIC children — `x>='ABC'` (TK_GE)
       and `x<'abd'` (TK_LT) — so the pattern can be served by an index
       range scan; original LIKE term gets TERM_LIKE when noCase, plus
-      isComplete-gated parent/child links.  Bound-parameter (TK_VARIABLE)
-      RHS path is conservatively skipped — needs `sqlite3VdbeGetBoundValue`
-      + `sqlite3VdbeSetVarmask` which are not yet ported.  The unmodified
-      LIKE call still runs; only the range-scan companions are forgone.
+      isComplete-gated parent/child links.
       `termIsEquivalence` (still deferred) needs `sqlite3ExprCollSeqMatch`
       + `SQLITE_Transitive` and only affects join-graph WO_EQUIV
       propagation, never correctness.  `whereCommuteOperator` is the
       C-side `exprCommute`, already landed in 11g.2.b sub-progress.
       Gate: `TestWhereExpr.pas` T14a..T14l (LIKE on rowid → range scan
       synthesis), T15a..T15b (numeric-prefix bailout).  76/76.
+    - [X] TK_VARIABLE bound-parameter LIKE path
+      (whereexpr.c:208..216, 316..334).  `sqlite3VdbeSetVarmask` and
+      `sqlite3VdbeGetBoundValue` ported in `passqlite3vdbe.pas`
+      (vdbeaux.c:5366..5398).  `isLikeOrGlob` consults the current bound
+      TEXT value of `?N` via `pParse^.pReprepare`, runs the prefix /
+      numeric / wildcard scan against it, and synthesizes the same
+      range-scan virtual children as the literal-string path; rebinding
+      the parameter triggers reoptimize() reprepare via the expmask bit
+      set on `pParse^.pVdbe`.  The QPSG gate (`SQLITE_EnableQPSG`) is
+      respected — when the connection has Query-Planner Stability
+      Guarantee enabled, the optimization is skipped (matches C).
+      Gate: `TestWhereExpr.pas` T16a..T16g (`x LIKE ?1` with ?1 bound to
+      'aBc%' synthesizes `>='ABC'` and `<'abd'` children, expmask bit 0
+      set on rebind).  84/84.
 
 - [ ] **6.9-bis 11g.2.d** Port the planner core in `where.c`
     (~5000 lines): `whereLoopAddBtree`, `whereLoopAddBtreeIndex`,

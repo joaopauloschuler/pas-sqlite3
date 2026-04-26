@@ -5705,10 +5705,11 @@ function allowedOp(op: i32): i32; forward;
   carrying the (escape-stripped) prefix; *pisComplete is 1 iff the only
   wildcard is a trailing '%'; *pnoCase is 1 iff the call is case-insensitive.
 
-  Bound-parameter (TK_VARIABLE) RHS is conservatively skipped — porting the
-  reprepare path needs sqlite3VdbeGetBoundValue + sqlite3VdbeSetVarmask which
-  are not yet ported.  The unmodified LIKE call itself still runs; only the
-  range-scan virtual companions are forgone. }
+  Bound-parameter (TK_VARIABLE) RHS: when QPSG is disabled the current bound
+  value is consulted via sqlite3VdbeGetBoundValue / sqlite3VdbeSetVarmask so
+  the LIKE optimization can fire on prepared statements that bind a literal
+  prefix (e.g. ?1 = 'aBc%'); rebinding to a different value triggers
+  reprepare via the expmask bit. }
 function isLikeOrGlob(pPrs: PParse; pExpr: PExpr; ppPrefix: PPExpr;
   pisComplete: Pi32; pnoCase: Pi32): i32;
 var
@@ -5729,12 +5730,18 @@ var
   utfCh:    u32;
   pTab:     PTable2;
   zTmp:     PChar;
+  pVal:     Psqlite3_value;
+  pReprepare: PVdbe;
+  iCol:     i32;
+  v:        PVdbe;
+  r1:       i32;
 begin
   Result := 0;
   db := pPrs^.db;
   z := nil;
   c := 0;
   cnt := 0;
+  pVal := nil;
 
   wc[3] := #0;  { sqlite3IsLikeFunction sets wc[0..2] only; clear wc[3] (escape). }
   if sqlite3IsLikeFunction(db, pExpr, pnoCase, @wc[0]) = 0 then Exit;
@@ -5744,9 +5751,15 @@ begin
 
   pRight := sqlite3ExprSkipCollate(ExprListItems(pList)[0].pExpr);
   op := pRight^.op;
-  if op = TK_VARIABLE then
+  if (op = TK_VARIABLE) and ((db^.flags and u64($00800000)) = 0) then  { SQLITE_EnableQPSG }
   begin
-    Exit;
+    pReprepare := pPrs^.pReprepare;
+    iCol := pRight^.iColumn;
+    pVal := sqlite3VdbeGetBoundValue(pReprepare, iCol, SQLITE_AFF_BLOB);
+    if (pVal <> nil) and (sqlite3_value_type(pVal) = SQLITE_TEXT) then
+      z := Pu8(sqlite3_value_text(pVal));
+    sqlite3VdbeSetVarmask(pPrs^.pVdbe, iCol);
+    Assert((pRight^.op = TK_VARIABLE) or (pRight^.op = TK_REGISTER));
   end
   else if op = TK_STRING then
   begin
@@ -5832,17 +5845,39 @@ begin
           if isNum > 0 then
           begin
             sqlite3ExprDelete(db, pPrefix);
+            sqlite3ValueFree(pVal);
             Exit;
           end;
         end;
       end;
       ppPrefix^ := pPrefix;
+
+      { whereexpr.c:316..334 — bound-parameter reprepare arrangements.
+        If the rhs of the LIKE expression is a variable, set the varmask
+        bit so reoptimize() reprepares on rebind.  When the pattern is a
+        complete match (trailing '%') and the variable token is non-empty,
+        emit a dummy OP_Variable so sqlite3_bind_parameter_name() keeps
+        working for the unused parameter. }
+      if op = TK_VARIABLE then
+      begin
+        v := pPrs^.pVdbe;
+        sqlite3VdbeSetVarmask(v, pRight^.iColumn);
+        Assert((pRight^.flags and EP_IntValue) = 0);
+        if (pisComplete^ <> 0) and (pRight^.u.zToken[1] <> #0) then
+        begin
+          r1 := sqlite3GetTempReg(pPrs);
+          sqlite3ExprCodeTarget(pPrs, pRight, r1);
+          sqlite3VdbeChangeP3(v, sqlite3VdbeCurrentAddr(v) - 1, 0);
+          sqlite3ReleaseTempReg(pPrs, r1);
+        end;
+      end;
     end
     else
       z := nil;
   end;
 
   if z <> nil then Result := 1;
+  sqlite3ValueFree(pVal);
 end;
 
 procedure exprAnalyzeOrTerm(pSrc: PSrcList; pWC: PWhereClause; idxTerm: i32);

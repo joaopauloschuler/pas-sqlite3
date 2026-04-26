@@ -1283,6 +1283,8 @@ procedure sqlite3VdbeChangeP1(p: PVdbe; addr, val: i32);
 procedure sqlite3VdbeChangeP2(p: PVdbe; addr, val: i32);
 procedure sqlite3VdbeChangeP3(p: PVdbe; addr, val: i32);
 procedure sqlite3VdbeChangeP5(p: PVdbe; p5: u16);
+procedure sqlite3VdbeSetVarmask(v: PVdbe; iVar: i32);
+function  sqlite3VdbeGetBoundValue(v: PVdbe; iVar: i32; aff: u8): Psqlite3_value;
 procedure sqlite3VdbeTypeofColumn(p: PVdbe; iDest: i32);
 procedure sqlite3VdbeJumpHere(p: PVdbe; addr: i32);
 procedure sqlite3VdbeJumpHereOrPopInst(p: PVdbe; addr: i32);
@@ -2242,6 +2244,45 @@ end;
 procedure sqlite3VdbeChangeP5(p: PVdbe; p5: u16);
 begin
   if p^.nOp > 0 then p^.aOp[p^.nOp - 1].p5 := p5;
+end;
+
+{ Faithful port of sqlite3VdbeSetVarmask (vdbeaux.c:5389..5398).  Configure
+  SQL variable iVar so that binding a new value to it signals to
+  sqlite3_reoptimize() that re-preparing the statement may yield a better
+  query plan. }
+procedure sqlite3VdbeSetVarmask(v: PVdbe; iVar: i32);
+begin
+  Assert(iVar > 0);
+  if iVar >= 32 then
+    v^.expmask := v^.expmask or u32($80000000)
+  else
+    v^.expmask := v^.expmask or (u32(1) shl (iVar - 1));
+end;
+
+{ Faithful port of sqlite3VdbeGetBoundValue (vdbeaux.c:5366..5382).  Return
+  a fresh sqlite3_value carrying the value bound to parameter iVar of VM v,
+  with affinity aff applied.  Returns nil if v is nil or the bound value is
+  SQL NULL.  The returned value must be freed by the caller via
+  sqlite3ValueFree(). }
+function sqlite3VdbeGetBoundValue(v: PVdbe; iVar: i32; aff: u8): Psqlite3_value;
+var
+  pBound: PMem;
+  pRet:   Psqlite3_value;
+begin
+  Assert(iVar > 0);
+  Result := nil;
+  if v = nil then Exit;
+  pBound := v^.aVar + (iVar - 1);
+  if (pBound^.flags and MEM_Null) = 0 then
+  begin
+    pRet := sqlite3ValueNew(v^.db);
+    if pRet <> nil then
+    begin
+      sqlite3VdbeMemCopy(PMem(pRet), pBound);
+      sqlite3ValueApplyAffinity(pRet, aff, SQLITE_UTF8);
+    end;
+    Result := pRet;
+  end;
 end;
 
 procedure sqlite3VdbeTypeofColumn(p: PVdbe; iDest: i32);
