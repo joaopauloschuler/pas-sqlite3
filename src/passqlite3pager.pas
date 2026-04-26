@@ -394,6 +394,16 @@ function  sqlite3PagerCheckpoint(pPager: PPager; db: Pointer; eMode: i32;
 function  sqlite3PagerWalCallback(pPager: PPager): i32;
 function  sqlite3PagerWalFile(pPager: PPager): Psqlite3_file;
 
+{ ===========================================================================
+  Phase 8.7 — accessors required by backup.c
+  =========================================================================== }
+{ pager.c:1497 — return the current journal mode (PAGER_JOURNALMODE_*). }
+function  sqlite3PagerGetJournalMode(pPager: PPager): i32;
+{ pager.c:7838 — &pPager->pBackup, used to thread sqlite3_backup objects. }
+function  sqlite3PagerBackupPtr(pPager: PPager): PPointer;
+{ pager.c:6857 — drop every page out of the page cache. }
+procedure sqlite3PagerClearCache(pPager: PPager);
+
 implementation
 
 { ============================================================
@@ -4521,6 +4531,31 @@ end;
 
 { updated pagerStress -- now calls syncJournal and pager_write_pagelist }
 { NOTE: the stub above is replaced by this full implementation; forward-declared above }
+
+{ ===========================================================================
+  Phase 8.7 — accessors required by backup.c
+  =========================================================================== }
+
+{ pager.c:1497 }
+function sqlite3PagerGetJournalMode(pPager: PPager): i32;
+begin
+  Result := i32(pPager^.journalMode);
+end;
+
+{ pager.c:7838 — &pPager->pBackup }
+function sqlite3PagerBackupPtr(pPager: PPager): PPointer;
+begin
+  Result := PPointer(@pPager^.pBackup);
+end;
+
+{ pager.c:6857 — drop every page from the cache.  Used after a failed
+  copy in sqlite3BtreeCopyFile to discard any half-copied destination
+  pages so a future query re-reads from disk. }
+procedure sqlite3PagerClearCache(pPager: PPager);
+begin
+  if pPager^.pPCache <> nil then
+    sqlite3PcacheClear(pPager^.pPCache);
+end;
 
 { ============================================================
   Unit initialization: set up the MemJournal methods vtable.

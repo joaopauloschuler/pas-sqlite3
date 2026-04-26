@@ -20,6 +20,50 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-25 — Phase 8.7 backup.c.**  New unit
+    `src/passqlite3backup.pas` (~470 lines) ports the entire backup.c
+    public API: `sqlite3_backup_init` / `_step` / `_finish` /
+    `_remaining` / `_pagecount`, plus the pager-side
+    `sqlite3BackupUpdate` / `sqlite3BackupRestart` callbacks and the
+    VACUUM-side `sqlite3BtreeCopyFile` wrapper.  Field order in
+    `TSqlite3Backup` matches the C struct exactly.  Added five missing
+    btree accessors (`sqlite3BtreeGetPageSize`,
+    `sqlite3BtreeSetPageSize`, `sqlite3BtreeTxnState`,
+    `sqlite3BtreeGetReserveNoMutex`, `sqlite3BtreeSetVersion` — plus
+    the public `SQLITE_TXN_*` constants) and three pager accessors
+    (`sqlite3PagerGetJournalMode`, `sqlite3PagerBackupPtr`,
+    `sqlite3PagerClearCache`).  `sqlite3BtreeSetVersion` writes
+    bytes 18+19 of page 1 directly via `sqlite3PagerGet` →
+    `sqlite3PagerWrite`, since the file-format-version slot is not
+    part of the GetMeta/UpdateMeta surface.  Gate
+    `src/tests/TestBackup.pas` 20/20 PASS; no regressions in the rest
+    of the build.
+
+    Phase 8.7 scope notes (deferred):
+      * **Pager hook wiring.**  The pager's write path does not yet
+        invoke `sqlite3BackupUpdate` / `sqlite3BackupRestart` on the
+        list rooted at `Pager.pBackup`.  An idle source therefore
+        copies cleanly, but a writer that mutates a copied page
+        between two `_step` calls would not propagate the new content
+        to the destination.  Wire from `pager_write_pagelist` /
+        invalidate paths in Phase 9 (acceptance).
+      * **Zombie close on backup_finish.**  C's
+        `sqlite3LeaveMutexAndCloseZombie` is not invoked on the
+        destination handle when finish() runs while the destination
+        is in `SQLITE_STATE_ZOMBIE`; we fall back to a plain
+        `sqlite3BtreeRollback` + `sqlite3Error`.  Acceptable until
+        the close-during-backup race is exercised.
+      * **`findBtree` temp-database open.**  The C source calls
+        `sqlite3OpenTempDatabase` for the magic name "temp".  Our
+        `openDatabase` already populates `aDb[1]` eagerly so the
+        branch is dead code, but it should be re-added if temp-db
+        lazy initialisation lands.
+      * **Codegen-driven vectors.**  `TestBackup` exercises the
+        surface-API contract on freshly-opened :memory: handles
+        (zero-page source → step returns DONE).  A copy-with-content
+        gate becomes possible once Phase 6/7 codegen wires
+        CREATE/INSERT and we can populate the source from SQL.
+
   - **2026-04-25 — Phase 8.6 sqlite3_exec / get_table.**  New entry points
     in `src/passqlite3main.pas`: `sqlite3_exec` (legacy.c full port),
     `sqlite3_get_table` / `sqlite3_get_table_cb` / `sqlite3_free_table`
@@ -2924,8 +2968,11 @@ loader — *optional for v1*).
     * UTF-16 entry points (`sqlite3_exec16`, etc.) deferred with
       the rest of UTF-16 support.
 
-- [ ] **8.7** Port `backup.c`: the online-backup API. Self-contained, small
+- [X] **8.7** Port `backup.c`: the online-backup API. Self-contained, small
   (~800 lines), useful early for verifying end-to-end operation.
+  *Done 2026-04-25.*  See "Most recent activity" entry above for the
+  full scope notes (pager hook wiring + zombie-close + content gate
+  intentionally deferred).
 
 - [ ] **8.8** Port `notify.c`: `sqlite3_unlock_notify` (rarely used; port if
   our threading story requires it, otherwise stub).

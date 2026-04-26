@@ -598,6 +598,28 @@ function  sqlite3BtreeLockTable(p: PBtree; iTab: i32; isWriteLock: u8): i32;
 procedure sqlite3BtreeCursorPin(pCur: PBtCursor);
 procedure sqlite3BtreeCursorUnpin(pCur: PBtCursor);
 
+{ ===========================================================================
+  Phase 8.7 — accessors required by backup.c
+  =========================================================================== }
+
+const
+  { sqlite3.h SQLITE_TXN_* — public values returned by sqlite3BtreeTxnState }
+  SQLITE_TXN_NONE  = 0;
+  SQLITE_TXN_READ  = 1;
+  SQLITE_TXN_WRITE = 2;
+
+{ btree.c:3236 — return the current page size of the database. }
+function  sqlite3BtreeGetPageSize(p: PBtree): i32;
+{ btree.c:3185 — set page size + reserved-bytes; iFix locks pageSize. }
+function  sqlite3BtreeSetPageSize(p: PBtree; iPageSize: i32;
+                                  nReserve: i32; iFix: i32): i32;
+{ btree.c:3296 — current Btree transaction state (TRANS_NONE/READ/WRITE). }
+function  sqlite3BtreeTxnState(p: PBtree): i32;
+{ btree.c:3257 — number of bytes of unused space at the end of every page. }
+function  sqlite3BtreeGetReserveNoMutex(p: PBtree): i32;
+{ btree.c:7046 — set the database file format version (1 or 2 = WAL). }
+function  sqlite3BtreeSetVersion(p: PBtree; iVersion: i32): i32;
+
 implementation
 
 uses
@@ -6401,6 +6423,86 @@ end;
 procedure sqlite3BtreeCursorUnpin(pCur: PBtCursor);
 begin
   pCur^.curFlags := pCur^.curFlags and not u8(BTCF_Pinned);
+end;
+
+{ ===========================================================================
+  Phase 8.7 — accessors required by backup.c
+  =========================================================================== }
+
+{ btree.c:3236 }
+function sqlite3BtreeGetPageSize(p: PBtree): i32;
+begin
+  Result := i32(p^.pBt^.pageSize);
+end;
+
+{ btree.c:3185 — simplified: only honours the call when iFix is non-zero
+  or BTS_PAGESIZE_FIXED is not yet set.  nReserve<0 means "leave unchanged". }
+function sqlite3BtreeSetPageSize(p: PBtree; iPageSize: i32;
+                                 nReserve: i32; iFix: i32): i32;
+var
+  pBt    : PBtShared;
+  rc     : i32;
+  uPgsz  : u32;
+begin
+  pBt := p^.pBt;
+  rc  := SQLITE_OK;
+  sqlite3BtreeEnter(p);
+  if (pBt^.btsFlags and BTS_PAGESIZE_FIXED) <> 0 then begin
+    sqlite3BtreeLeave(p);
+    if i32(pBt^.pageSize) = iPageSize then Result := SQLITE_OK
+    else                                  Result := SQLITE_READONLY;
+    Exit;
+  end;
+  if nReserve < 0 then
+    nReserve := i32(pBt^.pageSize - pBt^.usableSize);
+  if (iPageSize >= 512) and (iPageSize <= SQLITE_MAX_PAGE_SIZE)
+     and (((iPageSize - 1) and iPageSize) = 0) then
+  begin
+    uPgsz := u32(iPageSize);
+    rc := sqlite3PagerSetPagesize(pBt^.pPager, @uPgsz, nReserve);
+    pBt^.pageSize   := uPgsz;
+    pBt^.usableSize := uPgsz - u32(nReserve);
+  end;
+  if iFix <> 0 then
+    pBt^.btsFlags := pBt^.btsFlags or BTS_PAGESIZE_FIXED;
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c:3296 }
+function sqlite3BtreeTxnState(p: PBtree): i32;
+begin
+  if p = nil then Result := SQLITE_TXN_NONE
+  else            Result := i32(p^.inTrans);
+end;
+
+{ btree.c:3257 }
+function sqlite3BtreeGetReserveNoMutex(p: PBtree): i32;
+begin
+  Result := i32(p^.pBt^.pageSize - p^.pBt^.usableSize);
+end;
+
+{ btree.c:7046 — set page-1 byte 18 (file-format-write) and byte 19
+  (file-format-read).  Both are clamped to MIN(2,iVersion).  Implemented as
+  a direct page-1 write so it works without an open transaction layer. }
+function sqlite3BtreeSetVersion(p: PBtree; iVersion: i32): i32;
+var
+  pBt    : PBtShared;
+  rc     : i32;
+  pPage1 : PDbPage;
+  zData  : Pu8;
+begin
+  pBt := p^.pBt;
+  rc  := sqlite3PagerGet(pBt^.pPager, 1, @pPage1, 0);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  rc := sqlite3PagerWrite(pPage1);
+  if rc = SQLITE_OK then begin
+    zData := Pu8(sqlite3PagerGetData(pPage1));
+    zData[18] := u8(iVersion);
+    zData[19] := u8(iVersion);
+  end;
+  sqlite3PagerUnref(pPage1);
+  Result := rc;
 end;
 
 end.
