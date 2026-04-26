@@ -20,6 +20,92 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 4): destroyRootPage +
+    sqlite3RootPageMoved + temp-reg helpers
+    (build.c:3255/3285, expr.c:7580/7591).**  Replaces three more
+    `{ Phase 7 }` stubs in `passqlite3codegen.pas` with
+    byte-faithful ports, and wires `destroyRootPage` into the
+    found-index arm of `sqlite3DropIndex` (replacing the
+    `TODO(Phase 6.x): destroyRootPage(...)` placeholder).  These
+    helpers are the on-ramp for `sqlite3CodeDropTable` /
+    `destroyTable` and for any DDL helper that needs an
+    auto-vacuum-aware OP_Destroy emit (DROP TABLE, DROP INDEX
+    found-arm, REINDEX, etc.).
+
+    Concrete changes:
+      * `src/passqlite3codegen.pas`:
+        - `sqlite3GetTempReg` (interface + body): single-register
+          allocator out of the parser-scoped 8-slot pool
+          (`pParse^.aTempReg[]` / `nTempReg`); falls back to
+          `++pParse^.nMem` when the pool is empty.  Mirrors
+          expr.c:7580 exactly.
+        - `sqlite3ReleaseTempReg` (interface + body): companion
+          deallocator.  Calls `sqlite3VdbeReleaseRegisters` (the
+          existing release-port no-op) before recycling the slot.
+          `Length(pParse^.aTempReg)` resolves to 8 at compile time
+          via FPC's static-array length.
+        - `sqlite3RootPageMoved` (was stub): walks
+          `db^.aDb[iDb].pSchema^.tblHash` and `idxHash` via the
+          doubly-linked `first/next` chain (`PHashElem`) and
+          retargets any `Table.tnum` / `Index.tnum` whose value
+          equals `iFrom` to `iTo`.  Used by autovacuum-triggered
+          page moves so the in-memory schema stays consistent
+          with on-disk root-page numbers.
+        - new `destroyRootPage` (build.c:3285, static helper):
+          GetVdbe + GetTempReg(r1), `iTable<2 → "corrupt schema"`
+          guard, `OP_Destroy iTable,r1,iDb`, MayAbort, then the
+          AUTOVACUUM-on NestedParse'd
+          `UPDATE %Q.sqlite_schema SET rootpage=%d WHERE #%d AND
+           rootpage=#%d` sub-statement (currently a no-op via the
+          NestedParse stub; will fire once 7.2/7.3 wire NestedParse
+          to a real RunParser call).  Defined just before
+          `sqlite3CodeDropTable` so DropIndex's later call resolves
+          without a forward decl.
+        - `sqlite3DropIndex` (build.c:4595): replaces the
+          `TODO(Phase 6.x): destroyRootPage(...)` placeholder with
+          a real `destroyRootPage(pParse, i32(pIndex^.tnum), iDb)`
+          call.  `pIndex^.tnum` is `Pgno` (u32) so the cast to i32
+          matches the C signature.
+
+    Tests: full build clean.  TestExplainParity score unchanged at
+    1 PASS / 7 DIVERGE / 2 ERROR — expected, because the corpus
+    only drives the **not-found** DropIndex arm (`DROP INDEX i`),
+    so the new found-arm OP_Destroy emit is not exercised yet.
+    Regression spot check: TestPrepareBasic 20/20, TestParser 45/45,
+    TestParserSmoke 20/20, TestSchemaBasic 44/44, TestVdbeApi 57/57,
+    TestDMLBasic 54/54, TestSelectBasic 49/49, TestExprBasic 40/40,
+    TestVdbeTxn 8/8, TestAuthBuiltins 34/34, TestOpenClose 17/17.
+
+    Discoveries / next-step notes:
+      * **`pParse^.aTempReg` is a fixed `array[0..7] of i32`.**  C
+        uses `ArraySize(...)` (= 8); Pascal port uses
+        `Length(pParse^.aTempReg)` which FPC resolves at compile
+        time for static arrays.  Both yield 8.  Add to porting
+        checklist as the canonical idiom for static-array sizes.
+      * **AUTOVACUUM gating.**  Upstream wraps the destroyRootPage
+        NestedParse call in `#ifndef SQLITE_OMIT_AUTOVACUUM`.  The
+        btree port already advertises itself as
+        "simplified: SQLITE_OMIT_AUTOVACUUM" but the codegen path
+        still keeps the NestedParse call live (matching the
+        reference C build with autovacuum on).  Once a real
+        decision is made about the autovacuum gate, this call may
+        need conditional compilation — track in 6.x audit.
+      * **`sqlite3NestedParse` is still a no-op stub.**  The
+        destroyRootPage NestedParse-driven UPDATE sub-statement
+        therefore won't actually emit ops yet; only the OP_Destroy
+        + MayAbort fire.  This is acceptable for the current corpus
+        (the not-found DropIndex arm doesn't reach it).  Real
+        NestedParse needs `sqlite3VMPrintf`, `sqlite3RunParser`,
+        and `PARSE_TAIL` save/restore — a larger port that
+        belongs alongside StartTable/EndTable since they're its
+        first heavy users.
+      * **Next 6.9-bis target unchanged:** `sqlite3StartTable` /
+        `sqlite3EndTable` (32–43 ops, biggest surface, the highest-
+        leverage port).  After that: `sqlite3CreateIndex` (37/41 ops),
+        `sqlite3DropTable` (49 ops; needs `destroyTable` + the
+        `sqlite3CodeDropTable` body, both of which now have their
+        destroyRootPage dependency met).
+
   - **2026-04-26 — Phase 6.9-bis (step 3): foundational helpers
     sqlite3OpenSchemaTable + sqlite3ChangeCookie +
     sqlite3BeginWriteOperation port (build.c:916, 2047, 5403).**

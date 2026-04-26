@@ -2075,6 +2075,8 @@ procedure sqlite3BeginWriteOperation(pParse: PParse;
   setStatement: i32; iDb: i32);
 procedure sqlite3MultiWrite(pParse: PParse);
 procedure sqlite3MayAbort(pParse: PParse);
+function  sqlite3GetTempReg(pParse: PParse): i32;
+procedure sqlite3ReleaseTempReg(pParse: PParse; iReg: i32);
 procedure sqlite3HaltConstraint(pParse: PParse; errCode: i32;
   onError: i32; p4: PAnsiChar; p4type: i8; p5: u8);
 procedure sqlite3UniqueConstraint(pParse: PParse; onError: i32;
@@ -5905,9 +5907,57 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ sqlite3RootPageMoved — port of build.c:3255.
+  After OP_Destroy moves a root page (under autovacuum), patch the in-memory
+  schema so any Table/Index still referring to iFrom is retargeted to iTo.
+  Walks both tblHash and idxHash via the doubly-linked `first/next` chain. }
 procedure sqlite3RootPageMoved(db: PTsqlite3; iDb: i32; iFrom: u32; iTo: u32);
+var
+  pElem: PHashElem;
+  pTab:  PTable2;
+  pIdx:  PIndex2;
 begin
-  { Phase 7 }
+  pElem := db^.aDb[iDb].pSchema^.tblHash.first;
+  while pElem <> nil do
+  begin
+    pTab := PTable2(pElem^.data);
+    if pTab^.tnum = iFrom then
+      pTab^.tnum := iTo;
+    pElem := PHashElem(pElem^.next);
+  end;
+  pElem := db^.aDb[iDb].pSchema^.idxHash.first;
+  while pElem <> nil do
+  begin
+    pIdx := PIndex2(pElem^.data);
+    if pIdx^.tnum = iFrom then
+      pIdx^.tnum := iTo;
+    pElem := PHashElem(pElem^.next);
+  end;
+end;
+
+{ destroyRootPage — port of build.c:3285.
+  Static helper.  Emits OP_Destroy on iTable; under autovacuum, follows up
+  with a NestedParse'd UPDATE to sqlite_schema reflecting any move OP_Destroy
+  performed (the moved-page row number is returned by OP_Destroy in r1, and
+  the special "#NNN" SQL token resolves to register NNN at parse time). }
+procedure destroyRootPage(pParse: PParse; iTable: i32; iDb: i32);
+var
+  v:  PVdbe;
+  r1: i32;
+begin
+  v  := sqlite3GetVdbe(pParse);
+  r1 := sqlite3GetTempReg(pParse);
+  if iTable < 2 then
+    sqlite3ErrorMsg(pParse, 'corrupt schema');
+  sqlite3VdbeAddOp3(v, OP_Destroy, iTable, r1, iDb);
+  sqlite3MayAbort(pParse);
+  { OMIT_AUTOVACUUM gating: in C the next call is wrapped in
+    `#ifndef SQLITE_OMIT_AUTOVACUUM`.  This port keeps autovacuum on (matching
+    the C reference build), so the NestedParse fires here.  sqlite3NestedParse
+    is currently a no-op stub — once it is real, the
+    `UPDATE sqlite_schema SET rootpage=...` sub-statement will actually emit. }
+  sqlite3NestedParse(pParse, nil);
+  sqlite3ReleaseTempReg(pParse, r1);
 end;
 
 procedure sqlite3CodeDropTable(pParse: PParse; pTab: PTable2; iDb: i32; isView: i32);
@@ -5999,7 +6049,7 @@ begin
     sqlite3NestedParse(pParse, nil);
     { TODO(Phase 6.x): sqlite3ClearStatTables(pParse, iDb, 'idx', pIndex^.zName); }
     sqlite3ChangeCookie(pParse, iDb);
-    { TODO(Phase 6.x): destroyRootPage(pParse, pIndex^.tnum, iDb); }
+    destroyRootPage(pParse, i32(pIndex^.tnum), iDb);
     sqlite3VdbeAddOp4(v, OP_DropIndex, iDb, 0, 0, pIndex^.zName, 0);
   end;
 
@@ -6410,6 +6460,35 @@ end;
 procedure sqlite3MayAbort(pParse: PParse);
 begin
   { Phase 7 }
+end;
+
+{ sqlite3GetTempReg / sqlite3ReleaseTempReg — port of expr.c:7580/7591.
+  Allocate / recycle a single register in the parser-scoped temp pool. }
+function sqlite3GetTempReg(pParse: PParse): i32;
+begin
+  if pParse^.nTempReg = 0 then
+  begin
+    Inc(pParse^.nMem);
+    Result := pParse^.nMem;
+  end
+  else
+  begin
+    Dec(pParse^.nTempReg);
+    Result := pParse^.aTempReg[pParse^.nTempReg];
+  end;
+end;
+
+procedure sqlite3ReleaseTempReg(pParse: PParse; iReg: i32);
+begin
+  if iReg <> 0 then
+  begin
+    sqlite3VdbeReleaseRegisters(pParse, iReg, 1, 0, 0);
+    if pParse^.nTempReg < Length(pParse^.aTempReg) then
+    begin
+      pParse^.aTempReg[pParse^.nTempReg] := iReg;
+      Inc(pParse^.nTempReg);
+    end;
+  end;
 end;
 
 procedure sqlite3HaltConstraint(pParse: PParse; errCode: i32; onError: i32;
