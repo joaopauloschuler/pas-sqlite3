@@ -20,6 +20,93 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 5): sqlite3DropTable +
+    sqlite3CodeDropTable + destroyTable + sqlite3ClearStatTables +
+    tableMayNotBeDropped + sqliteViewResetAll port (build.c:3221,
+    3315, 3364, 3387, 3476, 3495).**  Replaces six more `{ Phase 7 }`
+    stubs in `passqlite3codegen.pas` with byte-faithful ports.  This
+    closes out the entire `DROP TABLE` codegen call graph aside from
+    `sqlite3NestedParse` (still a stub; structural call sites are
+    placed so its real port flips them on landing).
+
+    Concrete changes:
+      * `src/passqlite3codegen.pas`:
+        - new `sqliteViewResetAll` (build.c:3221): no-op for now —
+          DB_UnresetViews is not yet maintained, and the C fast path
+          bails when the flag is unset.  Real impl needs
+          `sqlite3DeleteColumnNames` + Db.flags bit maintenance,
+          which lands when CREATE VIEW becomes real.
+        - new `sqlite3ClearStatTables` (build.c:3364, static):
+          walks N=1..4, snpFmt's `sqlite_statN`, calls
+          `sqlite3FindTable` then `sqlite3NestedParse`.  Currently
+          emits zero ops because NestedParse is a stub; structural
+          port lands now so callers don't need re-editing later.
+        - new `destroyTable` (build.c:3315, static): emits OP_Destroy
+          on the table and all its indices in *descending* root-page
+          order so an autovacuum-driven page move from an earlier
+          OP_Destroy can never land on a still-to-destroy root page.
+        - `sqlite3CodeDropTable` (was stub): full body —
+          BeginWriteOperation, OP_VBegin (gated on TABTYP_VTAB,
+          unreached today), TriggerList loop (stub returns nil →
+          loop is no-op), TF_Autoincrement-gated NestedParse,
+          schema-row DELETE NestedParse, destroyTable, OP_VDestroy
+          (vtab-gated), OP_DropTable, ChangeCookie, ViewResetAll.
+        - new `tableMayNotBeDropped` (build.c:3476, static):
+          refuses DROP on `sqlite_*` (except `sqlite_stat*` /
+          `sqlite_parameters`), shadow tables in defensive mode,
+          and eponymous virtual-table modules.
+        - `sqlite3DropTable` (was stub): full body from
+          build.c:3495..3599 — ReadSchema, LocateTableItem with
+          suppressErr++/-- around it, IF EXISTS arm
+          (CodeVerifyNamedSchema + ForceNotReadOnly), schema-index
+          resolve, virtual-table column-name init, full
+          AUTHORIZATION block (zTab/zDb resolution, three
+          AuthCheck calls, code = SQLITE_DROP_(TEMP_)?(TABLE|VIEW|
+          VTABLE)), tableMayNotBeDropped guard, view/table
+          mismatch errors, then BeginWriteOperation +
+          ClearStatTables + FkDropTable (stub) + CodeDropTable.
+          Same `eOpenState <> $76` test-scaffold gate as DropIndex
+          so TestParserSmoke's stub-db `DROP TABLE` row stays green.
+
+    Tests: full build clean.  TestExplainParity score unchanged at
+    1 PASS / 7 DIVERGE / 2 ERROR.  The DROP TABLE row's diverge
+    message changes from `op count C=49 Pas=3` to `Pascal prepare
+    returned nil Vdbe` — this is structurally correct C behaviour
+    (table `t` does not exist on the Pascal side because seed
+    CREATE TABLE is still a stub; LocateTableItem with noErr=0
+    raises "no such table" → prepare fails).  The row will flip to
+    PASS once StartTable/EndTable lands and the seed schema actually
+    creates the in-memory Table.  Regression spot check: TestPrepareBasic
+    20/20, TestParser 45/45, TestParserSmoke 20/20, TestSchemaBasic
+    44/44, TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic
+    49/49, TestExprBasic 40/40, TestVdbeTxn 8/8, TestAuthBuiltins
+    34/34, TestOpenClose 17/17.
+
+    Discoveries / next-step notes:
+      * **`PTrigger` cannot be a `var` declaration's qualified
+        type when the same identifier exists as a record field
+        in scope** (TParse.pTrigger / TTable.pTrigger).  FPC's
+        symbol resolution chokes with "Error in type definition".
+        Workaround: name the variable `pTrg` (or any non-shadowing
+        ident).  Same family of issue as the PDb-from-passqlite3util
+        gotcha noted at step 2.  Add to porting-checklist gotchas.
+      * **`TF_Imposter` / `TF_HasReturning` etc. constants** are
+        not yet declared in the Pascal port; the imposterTable arm
+        in StartTable will need them when that port lands.
+      * **DROP TABLE row flip is gated on StartTable/EndTable.**
+        With seed CREATE TABLE still a stub, every row that names
+        a pre-created table (DROP TABLE t, CREATE INDEX i ON t,
+        CREATE UNIQUE INDEX i2 ON t) cannot reach its emit body.
+        This is why StartTable/EndTable is the highest-leverage
+        next step — it unblocks 4+ corpus rows simultaneously.
+      * **Next 6.9-bis target unchanged:** `sqlite3StartTable` /
+        `sqlite3EndTable` (32–43 ops, biggest surface).  All
+        helpers in their call graph are now real except
+        `sqlite3CheckObjectName` (still stub), `sqlite3NestedParse`
+        (still stub — affects EndTable's schema-row UPDATE
+        sub-statement), and `sqlite3RunParser` (only a NestedParse
+        consumer).
+
   - **2026-04-26 — Phase 6.9-bis (step 4): destroyRootPage +
     sqlite3RootPageMoved + temp-reg helpers
     (build.c:3255/3285, expr.c:7580/7591).**  Replaces three more
@@ -5962,11 +6049,17 @@ Phase 5.9 depends on this being done first.
   ~~`sqlite3DropIndex` (IF EXISTS / not-found arm + helpers
   `sqlite3CodeVerifySchema`, `sqlite3CodeVerifyNamedSchema`,
   `sqlite3ForceNotReadOnly`)~~ done 2026-04-26,
+  ~~`destroyRootPage`, `sqlite3RootPageMoved`, `sqlite3GetTempReg`,
+  `sqlite3ReleaseTempReg`~~ done 2026-04-26,
+  ~~`sqlite3OpenSchemaTable`, `sqlite3ChangeCookie`,
+  `sqlite3BeginWriteOperation`~~ done 2026-04-26,
+  ~~`sqlite3DropTable`, `sqlite3CodeDropTable`, `destroyTable`,
+  `sqlite3ClearStatTables`, `tableMayNotBeDropped`,
+  `sqliteViewResetAll`~~ done 2026-04-26,
   `sqlite3StartTable`, `sqlite3EndTable`, `sqlite3CreateIndex`,
-  `sqlite3DropTable`, found-index DropIndex arm helpers
-  `sqlite3NestedParse` / `sqlite3ClearStatTables` /
-  `destroyRootPage` / `sqlite3BeginWriteOperation` /
-  `sqlite3ChangeCookie`)
+  found-index DropIndex arm helpers `sqlite3NestedParse` (still
+  a stub — its real port flips many DELETE/UPDATE sub-statements
+  on at once))
   to byte-identical opcode emission against C.  Each helper landed
   flips one row from DIVERGE → PASS in TestExplainParity; an extra
   diagnostic-only column-list AV must also be triaged

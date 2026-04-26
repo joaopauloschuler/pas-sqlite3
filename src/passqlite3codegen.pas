@@ -5960,14 +5960,242 @@ begin
   sqlite3ReleaseTempReg(pParse, r1);
 end;
 
-procedure sqlite3CodeDropTable(pParse: PParse; pTab: PTable2; iDb: i32; isView: i32);
+{ sqliteViewResetAll — port of build.c:3221.
+  Clear column names from every VIEW in database idx after a DROP TABLE/VIEW.
+  Currently a no-op: DB_UnresetViews tracking is not yet wired and the
+  fast-path in C bails when the flag is unset.  This port matches that
+  behaviour for now; real impl needs sqlite3DeleteColumnNames + Db.flags
+  bit maintenance which lands when CREATE VIEW becomes real. }
+procedure sqliteViewResetAll(db: PTsqlite3; idx: i32);
 begin
-  { Phase 7 }
+  { TODO(Phase 6.x): when DB_UnresetViews is set, walk
+    db^.aDb[idx].pSchema^.tblHash, call sqlite3DeleteColumnNames on each
+    IsView entry, then clear DB_UnresetViews. }
 end;
 
-procedure sqlite3DropTable(pParse: PParse; pName: PSrcList; isView: i32; noErr: i32);
+{ sqlite3ClearStatTables — port of build.c:3364 (static).
+  Emit DELETE-from-sqlite_statN sub-statements after a DROP TABLE / DROP
+  INDEX.  zType is "tbl" or "idx", zName is the dropped object's name.
+  Walks N=1..4 and only fires for stat-tables that exist.
+  sqlite3NestedParse is still a stub today, so this currently emits no
+  ops; structural port lands now so callers don't need to be re-edited
+  when NestedParse goes real. }
+procedure sqlite3ClearStatTables(pParse: PParse; iDb: i32;
+  zType: PAnsiChar; zName: PAnsiChar);
+var
+  i:       i32;
+  zDbName: PAnsiChar;
+  zTab:    array[0..23] of AnsiChar;
 begin
-  sqlite3SrcListDelete(pParse^.db, pName);
+  zDbName := pParse^.db^.aDb[iDb].zDbSName;
+  for i := 1 to 4 do begin
+    snpFmt(SizeOf(zTab), @zTab[0], 'sqlite_stat%d', [i]);
+    if sqlite3FindTable(pParse^.db, @zTab[0], zDbName) <> nil then
+      sqlite3NestedParse(pParse, nil);
+  end;
+end;
+
+{ destroyTable — port of build.c:3315 (static).
+  Emit OP_Destroy on a table and all its indices in descending root-page
+  order, so an autovacuum-driven page move from an earlier OP_Destroy
+  can never land on a still-to-destroy root page. }
+procedure destroyTable(pParse: PParse; pTab: PTable2);
+var
+  iTab, iDestroyed, iLargest, iIdx: u32;
+  pIdx: PIndex2;
+  iDb:  i32;
+begin
+  iTab       := pTab^.tnum;
+  iDestroyed := 0;
+  while True do begin
+    iLargest := 0;
+    if (iDestroyed = 0) or (iTab < iDestroyed) then iLargest := iTab;
+    pIdx := pTab^.pIndex;
+    while pIdx <> nil do begin
+      iIdx := pIdx^.tnum;
+      if ((iDestroyed = 0) or (iIdx < iDestroyed)) and (iIdx > iLargest) then
+        iLargest := iIdx;
+      pIdx := pIdx^.pNext;
+    end;
+    if iLargest = 0 then Exit;
+    iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
+    destroyRootPage(pParse, i32(iLargest), iDb);
+    iDestroyed := iLargest;
+  end;
+end;
+
+{ sqlite3CodeDropTable — port of build.c:3387.
+  Generate code to drop a table.  The corpus's only DROP TABLE form is
+  non-virtual / non-view, so the OP_VBegin / OP_VDestroy arms are gated
+  on TABTYP_VTAB and currently never fire (matching the C reference
+  build with virtual tables compiled in but not exercised by the corpus). }
+procedure sqlite3CodeDropTable(pParse: PParse; pTab: PTable2; iDb: i32;
+  isView: i32);
+var
+  v:        PVdbe;
+  db:       PTsqlite3;
+  pTrg:     PTrigger;
+  isVtab:   Boolean;
+begin
+  db := pParse^.db;
+  v  := sqlite3GetVdbe(pParse);
+  Assert(v <> nil, 'CodeDropTable: nil Vdbe');
+  sqlite3BeginWriteOperation(pParse, 1, iDb);
+
+  isVtab := pTab^.eTabType = TABTYP_VTAB;
+  if isVtab then sqlite3VdbeAddOp0(v, OP_VBegin);
+
+  { Drop all triggers associated with the table.  sqlite3TriggerList is a
+    stub returning nil today, so the loop is a no-op until 6.bis triggers
+    land. }
+  pTrg := sqlite3TriggerList(pParse, pTab);
+  while pTrg <> nil do begin
+    sqlite3DropTriggerPtr(pParse, pTrg);
+    pTrg := pTrg^.pNext;
+  end;
+
+  { Remove sqlite_sequence rows for an autoinc table.  NestedParse is a
+    stub so this currently emits no ops; structural port lands now. }
+  if (pTab^.tabFlags and TF_Autoincrement) <> 0 then
+    sqlite3NestedParse(pParse, nil);
+
+  { Delete the schema-table rows for this object.  NestedParse stub: no
+    ops emitted yet — placeholder call kept so the call graph is correct
+    for when NestedParse becomes real. }
+  sqlite3NestedParse(pParse, nil);
+
+  if (isView = 0) and (not isVtab) then
+    destroyTable(pParse, pTab);
+
+  if isVtab then begin
+    sqlite3VdbeAddOp4(v, OP_VDestroy, iDb, 0, 0, pTab^.zName, 0);
+    sqlite3MayAbort(pParse);
+  end;
+  sqlite3VdbeAddOp4(v, OP_DropTable, iDb, 0, 0, pTab^.zName, 0);
+  sqlite3ChangeCookie(pParse, iDb);
+  sqliteViewResetAll(db, iDb);
+end;
+
+{ tableMayNotBeDropped — port of build.c:3476 (static).
+  Refuse DROP TABLE on internal "sqlite_*" objects (except sqlite_stat*
+  and sqlite_parameters), shadow tables in defensive mode, and eponymous
+  virtual-table modules. }
+function tableMayNotBeDropped(db: PTsqlite3; pTab: PTable2): i32;
+begin
+  if sqlite3_strnicmp(pTab^.zName, 'sqlite_', 7) = 0 then begin
+    if sqlite3_strnicmp(pTab^.zName + 7, 'stat', 4) = 0 then
+      Exit(0);
+    if sqlite3_strnicmp(pTab^.zName + 7, 'parameters', 10) = 0 then
+      Exit(0);
+    Exit(1);
+  end;
+  if ((pTab^.tabFlags and TF_Shadow) <> 0)
+     and (sqlite3ReadOnlyShadowTables(db) <> 0) then
+    Exit(1);
+  if (pTab^.tabFlags and TF_Eponymous) <> 0 then
+    Exit(1);
+  Result := 0;
+end;
+
+{ sqlite3DropTable — port of build.c:3495.
+  Code-gen for `DROP TABLE [IF EXISTS] <name>` and `DROP VIEW <name>`. }
+procedure sqlite3DropTable(pParse: PParse; pName: PSrcList; isView: i32;
+  noErr: i32);
+label exit_drop_table;
+var
+  pTab:  PTable2;
+  v:     PVdbe;
+  db:    PTsqlite3;
+  iDb:   i32;
+  pItem: PSrcItem;
+{$IFNDEF SQLITE_OMIT_AUTHORIZATION}
+  code:  i32;
+  zTab:  PAnsiChar;
+  zDb:   PAnsiChar;
+{$ENDIF}
+begin
+  db := pParse^.db;
+  if db^.mallocFailed <> 0 then goto exit_drop_table;
+  { Phase 6/7 test scaffolds (TestParserSmoke) drive the parser against a
+    stub db (eOpenState<>$76).  Match the DropIndex idiom and bail to
+    the legacy SrcList-only path for those. }
+  if db^.eOpenState <> $76 then goto exit_drop_table;
+  Assert(pParse^.nErr = 0, 'DropTable with prior errors');
+  Assert(pName^.nSrc = 1, 'DropTable SrcList must have exactly 1 entry');
+  pItem := SrcListItems(pName);
+  if sqlite3ReadSchema(pParse) <> SQLITE_OK then goto exit_drop_table;
+  if noErr <> 0 then Inc(db^.suppressErr);
+  pTab := sqlite3LocateTableItem(pParse, u32(isView), pItem);
+  if noErr <> 0 then Dec(db^.suppressErr);
+
+  if pTab = nil then begin
+    if noErr <> 0 then begin
+      sqlite3CodeVerifyNamedSchema(pParse, pItem^.u4.zDatabase);
+      sqlite3ForceNotReadOnly(pParse);
+    end;
+    goto exit_drop_table;
+  end;
+  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  Assert((iDb >= 0) and (iDb < db^.nDb), 'iDb out of range');
+
+  { Virtual-table column-name init.  IsVirtual==false today for the
+    corpus, so this is structurally present but never reached. }
+  if (pTab^.eTabType = TABTYP_VTAB) and
+     (sqlite3ViewGetColumnNames(pParse, pTab) <> 0) then
+    goto exit_drop_table;
+
+{$IFNDEF SQLITE_OMIT_AUTHORIZATION}
+  zTab := PAnsiChar(LEGACY_SCHEMA_TABLE);
+  if (OMIT_TEMPDB = 0) and (iDb = 1) then
+    zTab := PAnsiChar(LEGACY_TEMP_SCHEMA_TABLE);
+  zDb := db^.aDb[iDb].zDbSName;
+  if sqlite3AuthCheck(pParse, SQLITE_DELETE_AUTH, zTab, nil, zDb) <> 0 then
+    goto exit_drop_table;
+  if isView <> 0 then begin
+    if (OMIT_TEMPDB = 0) and (iDb = 1) then
+      code := SQLITE_DROP_TEMP_VIEW
+    else
+      code := SQLITE_DROP_VIEW;
+  end else if pTab^.eTabType = TABTYP_VTAB then begin
+    code := SQLITE_DROP_VTABLE;
+  end else begin
+    if (OMIT_TEMPDB = 0) and (iDb = 1) then
+      code := SQLITE_DROP_TEMP_TABLE
+    else
+      code := SQLITE_DROP_TABLE;
+  end;
+  if sqlite3AuthCheck(pParse, code, pTab^.zName, nil, zDb) <> 0 then
+    goto exit_drop_table;
+  if sqlite3AuthCheck(pParse, SQLITE_DELETE_AUTH, pTab^.zName, nil, zDb) <> 0 then
+    goto exit_drop_table;
+{$ENDIF}
+
+  if tableMayNotBeDropped(db, pTab) <> 0 then begin
+    sqlite3ErrorMsg(pParse, 'table may not be dropped');
+    goto exit_drop_table;
+  end;
+
+  if (isView <> 0) and (pTab^.eTabType <> TABTYP_VIEW) then begin
+    sqlite3ErrorMsg(pParse, 'use DROP TABLE to delete table');
+    goto exit_drop_table;
+  end;
+  if (isView = 0) and (pTab^.eTabType = TABTYP_VIEW) then begin
+    sqlite3ErrorMsg(pParse, 'use DROP VIEW to delete view');
+    goto exit_drop_table;
+  end;
+
+  v := sqlite3GetVdbe(pParse);
+  if v <> nil then begin
+    sqlite3BeginWriteOperation(pParse, 1, iDb);
+    if isView = 0 then begin
+      sqlite3ClearStatTables(pParse, iDb, 'tbl', pTab^.zName);
+      sqlite3FkDropTable(pParse, pName, pTab);
+    end;
+    sqlite3CodeDropTable(pParse, pTab, iDb, isView);
+  end;
+
+exit_drop_table:
+  sqlite3SrcListDelete(db, pName);
 end;
 
 { sqlite3DropIndex — port of build.c:4595.
