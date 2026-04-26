@@ -2,7 +2,8 @@
 unit passqlite3json;
 
 {
-  Phase 6.8.a — JSON foundation (port of sqlite3/src/json.c).
+  Phase 6.8.a/b — JSON foundation + JsonString accumulator
+  (port of sqlite3/src/json.c).
 
   This is the first chunk of the optional `json.c` port flagged as 6.8 in
   the project task list.  json.c is ~5680 lines of C; the port lands in
@@ -43,6 +44,7 @@ interface
 
 uses
   passqlite3types,
+  passqlite3os,
   passqlite3util;
 
 { ===========================================================================
@@ -319,6 +321,43 @@ function jsonIs4Hex(z: PAnsiChar): i32;
 }
 function json5Whitespace(zIn: PAnsiChar): i32;
 
+{ ===========================================================================
+  JsonString accumulator (Phase 6.8.b)
+
+  Append-only string builder backed by an inline 100-byte zSpace[] buffer
+  with libc-malloc spill on overflow.  All writes are gated on eErr — once
+  any error bit is set, further append calls become no-ops.
+
+  Spill memory is allocated with sqlite3_malloc/realloc/free (libc), not
+  sqlite3RCStr*, since RCStr is not yet ported.  When 6.8.h lands, the
+  spill buffer can be lifted to RCStr if jsonReturnString needs to hand a
+  shared reference into a result_text64 callback chain.
+
+  Error sinking: jsonStringOom and jsonStringTooDeep set eErr but do *not*
+  call sqlite3_result_error_nomem / sqlite3_result_error.  Pulling
+  passqlite3vdbe in here would create a heavy dep cycle with codegen; the
+  6.8.h dispatch chunk will surface the eErr bits to the SQL caller when
+  it wires up jsonReturnString.  Within json.c-internals, eErr is the
+  authoritative signal and downstream callers all check it.
+  =========================================================================== }
+
+procedure jsonStringZero(p: PJsonString);
+procedure jsonStringInit(p: PJsonString; pCtx: Pointer);
+procedure jsonStringReset(p: PJsonString);
+procedure jsonStringOom(p: PJsonString);
+procedure jsonStringTooDeep(p: PJsonString);
+function  jsonStringGrow(p: PJsonString; N: u32): i32;
+procedure jsonStringExpandAndAppend(p: PJsonString; zIn: PAnsiChar; N: u32);
+procedure jsonAppendRaw(p: PJsonString; zIn: PAnsiChar; N: u32);
+procedure jsonAppendRawNZ(p: PJsonString; zIn: PAnsiChar; N: u32);
+procedure jsonAppendCharExpand(p: PJsonString; c: AnsiChar);
+procedure jsonAppendChar(p: PJsonString; c: AnsiChar);
+procedure jsonStringTrimOneChar(p: PJsonString);
+function  jsonStringTerminate(p: PJsonString): i32;
+procedure jsonAppendSeparator(p: PJsonString);
+procedure jsonAppendControlChar(p: PJsonString; c: u8);
+procedure jsonAppendString(p: PJsonString; zIn: PAnsiChar; N: u32);
+
 implementation
 
 function jsonIsspace(c: AnsiChar): i32; inline;
@@ -465,6 +504,262 @@ begin
     end;
   end;
   Result := n;
+end;
+
+{ ===========================================================================
+  JsonString accumulator implementation
+  =========================================================================== }
+
+procedure jsonStringZero(p: PJsonString);
+begin
+  p^.zBuf    := @p^.zSpace[0];
+  p^.nAlloc  := SizeOf(p^.zSpace);
+  p^.nUsed   := 0;
+  p^.bStatic := 1;
+end;
+
+procedure jsonStringInit(p: PJsonString; pCtx: Pointer);
+begin
+  p^.pCtx := pCtx;
+  p^.eErr := 0;
+  jsonStringZero(p);
+end;
+
+procedure jsonStringReset(p: PJsonString);
+begin
+  if p^.bStatic = 0 then
+    sqlite3_free(p^.zBuf);
+  jsonStringZero(p);
+end;
+
+procedure jsonStringOom(p: PJsonString);
+begin
+  p^.eErr := p^.eErr or JSTRING_OOM;
+  { Result-error sinking deferred to 6.8.h dispatch (see header note). }
+  jsonStringReset(p);
+end;
+
+procedure jsonStringTooDeep(p: PJsonString);
+begin
+  p^.eErr := p^.eErr or JSTRING_TOODEEP;
+  { Result-error sinking deferred to 6.8.h dispatch (see header note). }
+  jsonStringReset(p);
+end;
+
+function jsonStringGrow(p: PJsonString; N: u32): i32;
+var
+  nTotal : u64;
+  zNew   : PAnsiChar;
+begin
+  if N < p^.nAlloc then
+    nTotal := p^.nAlloc * 2
+  else
+    nTotal := p^.nAlloc + N + 10;
+  if p^.bStatic <> 0 then
+  begin
+    if p^.eErr <> 0 then
+    begin
+      Result := 1;
+      Exit;
+    end;
+    zNew := PAnsiChar(sqlite3_malloc64(nTotal));
+    if zNew = nil then
+    begin
+      jsonStringOom(p);
+      Result := SQLITE_NOMEM;
+      Exit;
+    end;
+    if p^.nUsed > 0 then
+      Move(p^.zBuf^, zNew^, p^.nUsed);
+    p^.zBuf    := zNew;
+    p^.bStatic := 0;
+  end
+  else
+  begin
+    p^.zBuf := PAnsiChar(sqlite3_realloc64(p^.zBuf, nTotal));
+    if p^.zBuf = nil then
+    begin
+      p^.eErr := p^.eErr or JSTRING_OOM;
+      jsonStringZero(p);
+      Result := SQLITE_NOMEM;
+      Exit;
+    end;
+  end;
+  p^.nAlloc := nTotal;
+  Result := SQLITE_OK;
+end;
+
+procedure jsonStringExpandAndAppend(p: PJsonString; zIn: PAnsiChar; N: u32);
+begin
+  if jsonStringGrow(p, N) <> 0 then Exit;
+  Move(zIn^, (p^.zBuf + p^.nUsed)^, N);
+  p^.nUsed := p^.nUsed + N;
+end;
+
+procedure jsonAppendRaw(p: PJsonString; zIn: PAnsiChar; N: u32);
+begin
+  if N = 0 then Exit;
+  if N + p^.nUsed >= p^.nAlloc then
+    jsonStringExpandAndAppend(p, zIn, N)
+  else
+  begin
+    Move(zIn^, (p^.zBuf + p^.nUsed)^, N);
+    p^.nUsed := p^.nUsed + N;
+  end;
+end;
+
+procedure jsonAppendRawNZ(p: PJsonString; zIn: PAnsiChar; N: u32);
+begin
+  if N + p^.nUsed >= p^.nAlloc then
+    jsonStringExpandAndAppend(p, zIn, N)
+  else
+  begin
+    Move(zIn^, (p^.zBuf + p^.nUsed)^, N);
+    p^.nUsed := p^.nUsed + N;
+  end;
+end;
+
+procedure jsonAppendCharExpand(p: PJsonString; c: AnsiChar);
+begin
+  if jsonStringGrow(p, 1) <> 0 then Exit;
+  p^.zBuf[p^.nUsed] := c;
+  p^.nUsed := p^.nUsed + 1;
+end;
+
+procedure jsonAppendChar(p: PJsonString; c: AnsiChar);
+begin
+  if p^.nUsed >= p^.nAlloc then
+    jsonAppendCharExpand(p, c)
+  else
+  begin
+    p^.zBuf[p^.nUsed] := c;
+    p^.nUsed := p^.nUsed + 1;
+  end;
+end;
+
+procedure jsonStringTrimOneChar(p: PJsonString);
+begin
+  if p^.eErr = 0 then
+    p^.nUsed := p^.nUsed - 1;
+end;
+
+function jsonStringTerminate(p: PJsonString): i32;
+begin
+  jsonAppendChar(p, #0);
+  jsonStringTrimOneChar(p);
+  if p^.eErr = 0 then Result := 1 else Result := 0;
+end;
+
+procedure jsonAppendSeparator(p: PJsonString);
+var c: AnsiChar;
+begin
+  if p^.nUsed = 0 then Exit;
+  c := p^.zBuf[p^.nUsed - 1];
+  if (c = '[') or (c = '{') then Exit;
+  jsonAppendChar(p, ',');
+end;
+
+const
+  { Mirror of json.c:697 aSpecial[] — \b\t\n\f\r short escapes for
+    control bytes 0x08, 0x09, 0x0a, 0x0c, 0x0d. }
+  jsonCtrlSpecial: array[0..31] of AnsiChar = (
+    #0, #0, #0, #0, #0, #0, #0, #0, 'b', 't', 'n', #0, 'f', 'r', #0, #0,
+    #0, #0, #0, #0, #0, #0, #0, #0, #0,  #0,  #0,  #0, #0,  #0,  #0, #0
+  );
+  jsonHexDigits: array[0..15] of AnsiChar = '0123456789abcdef';
+
+procedure jsonAppendControlChar(p: PJsonString; c: u8);
+var s: AnsiChar;
+begin
+  s := jsonCtrlSpecial[c];
+  if s <> #0 then
+  begin
+    p^.zBuf[p^.nUsed]     := '\';
+    p^.zBuf[p^.nUsed + 1] := s;
+    p^.nUsed := p^.nUsed + 2;
+  end
+  else
+  begin
+    p^.zBuf[p^.nUsed]     := '\';
+    p^.zBuf[p^.nUsed + 1] := 'u';
+    p^.zBuf[p^.nUsed + 2] := '0';
+    p^.zBuf[p^.nUsed + 3] := '0';
+    p^.zBuf[p^.nUsed + 4] := jsonHexDigits[c shr 4];
+    p^.zBuf[p^.nUsed + 5] := jsonHexDigits[c and $0F];
+    p^.nUsed := p^.nUsed + 6;
+  end;
+end;
+
+procedure jsonAppendString(p: PJsonString; zIn: PAnsiChar; N: u32);
+var
+  k    : u32;
+  c    : u8;
+  z    : PByte;
+begin
+  z := PByte(zIn);
+  if z = nil then Exit;
+  if (N + p^.nUsed + 2 >= p^.nAlloc)
+     and (jsonStringGrow(p, N + 2) <> 0) then Exit;
+  p^.zBuf[p^.nUsed] := '"';
+  p^.nUsed := p^.nUsed + 1;
+  while True do
+  begin
+    k := 0;
+    { 4-way unwound equivalent of: while k<N and jsonIsOk[z[k]] do Inc(k). }
+    while True do
+    begin
+      if k + 3 >= N then
+      begin
+        while (k < N) and (jsonIsOk[z[k]] <> 0) do Inc(k);
+        Break;
+      end;
+      if jsonIsOk[z[k]] = 0 then Break;
+      if jsonIsOk[z[k + 1]] = 0 then begin Inc(k); Break; end;
+      if jsonIsOk[z[k + 2]] = 0 then begin k := k + 2; Break; end;
+      if jsonIsOk[z[k + 3]] = 0 then begin k := k + 3; Break; end;
+      k := k + 4;
+    end;
+    if k >= N then
+    begin
+      if k > 0 then
+      begin
+        Move(z^, (p^.zBuf + p^.nUsed)^, k);
+        p^.nUsed := p^.nUsed + k;
+      end;
+      Break;
+    end;
+    if k > 0 then
+    begin
+      Move(z^, (p^.zBuf + p^.nUsed)^, k);
+      p^.nUsed := p^.nUsed + k;
+      z := z + k;
+      N := N - k;
+    end;
+    c := z[0];
+    if (c = Ord('"')) or (c = Ord('\')) then
+    begin
+      if (p^.nUsed + N + 3 > p^.nAlloc)
+         and (jsonStringGrow(p, N + 3) <> 0) then Exit;
+      p^.zBuf[p^.nUsed]     := '\';
+      p^.zBuf[p^.nUsed + 1] := AnsiChar(c);
+      p^.nUsed := p^.nUsed + 2;
+    end
+    else if c = Ord('''') then
+    begin
+      p^.zBuf[p^.nUsed] := AnsiChar(c);
+      p^.nUsed := p^.nUsed + 1;
+    end
+    else
+    begin
+      if (p^.nUsed + N + 7 > p^.nAlloc)
+         and (jsonStringGrow(p, N + 7) <> 0) then Exit;
+      jsonAppendControlChar(p, c);
+    end;
+    z := z + 1;
+    N := N - 1;
+  end;
+  p^.zBuf[p^.nUsed] := '"';
+  p^.nUsed := p^.nUsed + 1;
 end;
 
 end.

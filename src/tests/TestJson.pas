@@ -239,8 +239,197 @@ begin
     (SizeOf(TJsonCache) >= 40) and (SizeOf(TJsonCache) <= 64));
 end;
 
+{ ------------ Phase 6.8.b — JsonString accumulator ------------ }
+
+function StrFromJS(p: PJsonString): AnsiString;
 begin
-  WriteLn('=== TestJson — Phase 6.8.a JSON foundation ===');
+  SetString(Result, p^.zBuf, p^.nUsed);
+end;
+
+procedure TestStringInit;
+var s: TJsonString;
+begin
+  jsonStringInit(@s, nil);
+  CheckTrue('T99 init bStatic',  s.bStatic = 1);
+  CheckTrue('T100 init nUsed=0', s.nUsed = 0);
+  CheckTrue('T101 init nAlloc=100', s.nAlloc = 100);
+  CheckTrue('T102 init eErr=0', s.eErr = 0);
+  CheckTrue('T103 init zBuf=zSpace', s.zBuf = @s.zSpace[0]);
+  jsonStringReset(@s);
+  CheckTrue('T104 reset bStatic', s.bStatic = 1);
+  CheckTrue('T105 reset nUsed=0', s.nUsed = 0);
+end;
+
+procedure TestAppendBasic;
+var s: TJsonString;
+begin
+  jsonStringInit(@s, nil);
+  jsonAppendRaw(@s, 'hello', 5);
+  CheckEqS('T106 append hello',   StrFromJS(@s), 'hello');
+  jsonAppendRaw(@s, ' world', 6);
+  CheckEqS('T107 append world',   StrFromJS(@s), 'hello world');
+  jsonAppendChar(@s, '!');
+  CheckEqS('T108 append char',    StrFromJS(@s), 'hello world!');
+  jsonStringReset(@s);
+  CheckEqS('T109 reset empties',  StrFromJS(@s), '');
+end;
+
+procedure TestAppendSpill;
+var
+  s: TJsonString;
+  i: i32;
+  big: AnsiString;
+begin
+  jsonStringInit(@s, nil);
+  big := '';
+  for i := 1 to 50 do big := big + 'abcdefghij'; { 500 bytes — spills }
+  jsonAppendRaw(@s, PAnsiChar(big), Length(big));
+  CheckEqS('T110 spill content', StrFromJS(@s), big);
+  CheckTrue('T111 spill bStatic=0', s.bStatic = 0);
+  CheckTrue('T112 spill nAlloc grew', s.nAlloc >= 500);
+  CheckTrue('T113 spill nUsed=500', s.nUsed = 500);
+  jsonStringReset(@s);
+  CheckTrue('T114 after-reset bStatic=1', s.bStatic = 1);
+  CheckTrue('T115 after-reset nAlloc=100', s.nAlloc = 100);
+end;
+
+procedure TestAppendCharGrow;
+var
+  s: TJsonString;
+  i: i32;
+begin
+  jsonStringInit(@s, nil);
+  for i := 1 to 250 do jsonAppendChar(@s, 'x');
+  CheckTrue('T116 char-grow nUsed=250', s.nUsed = 250);
+  CheckTrue('T117 char-grow spilled', s.bStatic = 0);
+  for i := 0 to 249 do
+    if s.zBuf[i] <> 'x' then
+    begin
+      WriteLn('  FAIL T118 char-grow content');
+      Inc(gFail);
+      jsonStringReset(@s);
+      Exit;
+    end;
+  WriteLn('  PASS T118 char-grow content');
+  Inc(gPass);
+  jsonStringReset(@s);
+end;
+
+procedure TestSeparator;
+var s: TJsonString;
+begin
+  jsonStringInit(@s, nil);
+  jsonAppendSeparator(@s);
+  CheckEqS('T119 sep on empty no-op', StrFromJS(@s), '');
+  jsonAppendChar(@s, '[');
+  jsonAppendSeparator(@s);
+  CheckEqS('T120 sep after [',  StrFromJS(@s), '[');
+  jsonAppendChar(@s, '1');
+  jsonAppendSeparator(@s);
+  CheckEqS('T121 sep after 1',  StrFromJS(@s), '[1,');
+  jsonStringReset(@s);
+  jsonAppendChar(@s, '{');
+  jsonAppendSeparator(@s);
+  CheckEqS('T122 sep after {',  StrFromJS(@s), '{');
+  jsonStringReset(@s);
+end;
+
+procedure TestTrimAndTerminate;
+var
+  s: TJsonString;
+  rc: i32;
+begin
+  jsonStringInit(@s, nil);
+  jsonAppendRaw(@s, 'abc', 3);
+  jsonStringTrimOneChar(@s);
+  CheckEqS('T123 trim',       StrFromJS(@s), 'ab');
+  rc := jsonStringTerminate(@s);
+  CheckEqI('T124 terminate ok',  rc, 1);
+  CheckEqS('T125 nUsed unchanged', StrFromJS(@s), 'ab');
+  CheckTrue('T126 nul placed', s.zBuf[s.nUsed] = #0);
+  jsonStringReset(@s);
+end;
+
+procedure TestControlChar;
+var s: TJsonString;
+begin
+  jsonStringInit(@s, nil);
+  { Caller must reserve 7 bytes per spec.  100 inline is enough for 5 calls. }
+  jsonAppendControlChar(@s, $08);  { \b }
+  jsonAppendControlChar(@s, $09);  { \t }
+  jsonAppendControlChar(@s, $0A);  { \n }
+  jsonAppendControlChar(@s, $0C);  { \f }
+  jsonAppendControlChar(@s, $0D);  { \r }
+  CheckEqS('T127 short escapes', StrFromJS(@s), '\b\t\n\f\r');
+  jsonStringReset(@s);
+  jsonAppendControlChar(@s, $00);  {   }
+  jsonAppendControlChar(@s, $01);  {  }
+  jsonAppendControlChar(@s, $1F);  {  }
+  CheckEqS('T128 long escapes',  StrFromJS(@s), '\u0000\u0001\u001f');
+  jsonStringReset(@s);
+end;
+
+procedure TestAppendString;
+var s: TJsonString;
+begin
+  jsonStringInit(@s, nil);
+  jsonAppendString(@s, 'hello', 5);
+  CheckEqS('T129 plain',         StrFromJS(@s), '"hello"');
+  jsonStringReset(@s);
+  jsonAppendString(@s, 'a"b', 3);
+  CheckEqS('T130 dquote escape', StrFromJS(@s), '"a\"b"');
+  jsonStringReset(@s);
+  jsonAppendString(@s, 'a\b', 3);
+  CheckEqS('T131 bslash escape', StrFromJS(@s), '"a\\b"');
+  jsonStringReset(@s);
+  jsonAppendString(@s, 'a'#10'b', 3);
+  CheckEqS('T132 newline esc',   StrFromJS(@s), '"a\nb"');
+  jsonStringReset(@s);
+  jsonAppendString(@s, 'a'#1'b', 3);
+  CheckEqS('T133 ctl esc',       StrFromJS(@s), '"a\u0001b"');
+  jsonStringReset(@s);
+  jsonAppendString(@s, '', 0);
+  CheckEqS('T134 empty quoted',  StrFromJS(@s), '""');
+  jsonStringReset(@s);
+  { JSON5 single quote inside string is passed through unescaped per
+    json.c:786-788 special case. }
+  jsonAppendString(@s, 'it''s', 4);
+  CheckEqS('T135 single quote', StrFromJS(@s), '"it''s"');
+  jsonStringReset(@s);
+  { 4-way unwound fast path covers k+3<N: ensure 8-byte plain run works. }
+  jsonAppendString(@s, '01234567', 8);
+  CheckEqS('T136 fast-path 8B', StrFromJS(@s), '"01234567"');
+  jsonStringReset(@s);
+end;
+
+procedure TestStringSpill;
+var
+  s: TJsonString;
+  i: i32;
+  big: AnsiString;
+  expected: AnsiString;
+begin
+  jsonStringInit(@s, nil);
+  big := '';
+  for i := 1 to 30 do big := big + 'abcdefghij'; { 300 bytes }
+  jsonAppendString(@s, PAnsiChar(big), Length(big));
+  expected := '"' + big + '"';
+  CheckEqS('T137 string spill', StrFromJS(@s), expected);
+  CheckTrue('T138 string spill bStatic=0', s.bStatic = 0);
+  jsonStringReset(@s);
+end;
+
+procedure TestStringNil;
+var s: TJsonString;
+begin
+  jsonStringInit(@s, nil);
+  jsonAppendString(@s, nil, 0);
+  CheckEqS('T139 nil ptr no-op', StrFromJS(@s), '');
+  jsonStringReset(@s);
+end;
+
+begin
+  WriteLn('=== TestJson — Phase 6.8.a/b JSON foundation + accumulator ===');
   TestTypeNames;
   TestIsspace;
   TestSpacesString;
@@ -249,6 +438,16 @@ begin
   TestJson5WS;
   TestNanInf;
   TestSizes;
+  TestStringInit;
+  TestAppendBasic;
+  TestAppendSpill;
+  TestAppendCharGrow;
+  TestSeparator;
+  TestTrimAndTerminate;
+  TestControlChar;
+  TestAppendString;
+  TestStringSpill;
+  TestStringNil;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);

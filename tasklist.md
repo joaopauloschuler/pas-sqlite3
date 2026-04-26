@@ -20,6 +20,59 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.8.b JsonString accumulator.**  Lands the
+    string-builder layer of the JSON port: `jsonStringInit/Zero/Reset/
+    Oom/TooDeep/Grow/ExpandAndAppend`, `jsonAppendRaw/RawNZ/Char/
+    CharExpand/Separator/ControlChar/String`, `jsonStringTrimOneChar`,
+    `jsonStringTerminate`.  Append-only builder with the 100-byte
+    inline `zSpace[]` and libc-malloc spill on overflow.  Faithful
+    1:1 transliteration of json.c:534..797.
+
+    Concrete changes:
+      * `src/passqlite3json.pas` — adds the accumulator (interface
+        signatures + ~210 lines of implementation); pulls
+        `passqlite3os` into the uses clause for `sqlite3_malloc64` /
+        `sqlite3_realloc64` / `sqlite3_free`.
+      * `src/tests/TestJson.pas` — adds T99..T139 (41 new asserts:
+        init/reset, basic append, inline→spill transition,
+        per-char growth, separator commas, trim+terminate, control-char
+        short and \uXXXX escapes, jsonAppendString plain/escape/empty/
+        nil/JSON5-squote/fast-path-8B, large spill).
+        **139/139 PASS** (was 98/98).
+      * Regression spot check: TestPrintf 105/105, TestVtab 216/216,
+        TestParser 45/45, TestSchemaBasic 44/44 — all green.
+
+    Discoveries / next-step notes:
+      * **RCStr stays deferred.**  json.c spills onto an RCStr-backed
+        buffer so `jsonReturnString` can hand the same buffer to
+        `sqlite3_result_text64` with `sqlite3RCStrUnref` as the destructor.
+        The accumulator itself does not need RCStr semantics — plain
+        libc-malloc round-trips cleanly through `Reset`.  When 6.8.h
+        wires `jsonReturnString`, the spill type can be lifted to RCStr
+        (or `jsonReturnString` can `sqlite3_malloc64`-copy with
+        `SQLITE_DYNAMIC` destructor — also valid).  Decision deferred
+        to 6.8.h.
+      * **OOM/TooDeep error sinking deferred.**  C calls
+        `sqlite3_result_error_nomem` / `sqlite3_result_error` from
+        `jsonStringOom` / `jsonStringTooDeep`.  The Pascal port records
+        the bit in `eErr` only — pulling `passqlite3vdbe` into the JSON
+        unit would create a heavy dep cycle with codegen.  6.8.h will
+        surface `eErr` to the SQL caller via `jsonReturnString` (which
+        is the only callsite where `pCtx` is actually a real
+        `sqlite3_context`, not nil — until then, all internal callers
+        check `eErr` directly and abort cleanly).
+      * **`jsonAppendSqlValue` deferred to 6.8.h.**  It needs
+        `sqlite3_value_type/double/text/bytes/subtype` (vdbe), plus
+        `jsonArgIsJsonb` and `jsonTranslateBlobToText` from later
+        chunks.  Listed it under 6.8.h's surface in the chunk-list
+        re-spelling.
+      * **JSON5 single-quote pass-through verified.**  json.c:786..788
+        emits `'` as a literal byte inside a quoted string (it is *not*
+        in `jsonIsOk` because the JSON5 surface escape handler treats
+        it as a marker, but inside a quoted JSON output we emit it raw
+        — JSON RFC-8259 doesn't require it escaped, only `"` and `\`).
+        T135 covers this.
+
   - **2026-04-26 — Phase 6.8.a JSON foundation.**  Opens the optional
     `json.c` port (5680 lines of C, ~6 sub-chunks planned) with the
     foundation slice: types, constants, byte-classification lookup
@@ -3225,12 +3278,19 @@ reference exactly.
     `jsonHexToInt4`, `jsonIs2Hex`, `jsonIs4Hex`, `json5Whitespace`).
     DONE 2026-04-26.  Gate `TestJson.pas` 98/98 PASS.  See "Most
     recent activity" entry.
-  - [ ] **6.8.b** JsonString accumulator — `jsonStringInit/Reset/Zero/
+  - [X] **6.8.b** JsonString accumulator — `jsonStringInit/Reset/Zero/
     Oom/TooDeep/Grow/ExpandAndAppend`, `jsonAppendRaw/RawNZ/Char(Expand)/
-    Separator/ControlChar/String/SqlValue`, `jsonStringTerminate`,
-    `jsonReturnString`, `jsonReturnStringAsBlob`.  Requires
-    `sqlite3RCStr*` (not yet ported) — either add as a util stub or
-    spill to plain libc-malloc.
+    Separator/ControlChar/String`, `jsonStringTrimOneChar`,
+    `jsonStringTerminate`.  DONE 2026-04-26.  Gate `TestJson.pas`
+    139/139 PASS (was 98/98).  Spilled to plain libc malloc/realloc/free
+    via `sqlite3_malloc64` / `sqlite3_realloc64` / `sqlite3_free`
+    (passqlite3os) since `sqlite3RCStr*` is still unported — swap to
+    RCStr in 6.8.h if jsonReturnString needs shared-ref semantics for
+    `result_text64` callbacks.  Deferred to 6.8.h: `jsonAppendSqlValue`
+    (needs `sqlite3_value_*` + jsonTranslateBlobToText), `jsonReturnString`,
+    `jsonReturnStringAsBlob` (need vdbe `sqlite3_result_*` and the
+    text↔blob translators from 6.8.d/e).  See "Most recent activity"
+    entry.
   - [ ] **6.8.c** JsonParse blob primitives — `jsonBlobExpand`,
     `jsonBlobMakeEditable`, `jsonBlobAppendOneByte`,
     `jsonBlobAppendNode`, `jsonBlobChangePayloadSize`,
