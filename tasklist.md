@@ -20,6 +20,71 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.4a printf core (mini-port).**  Lands the
+    long-awaited printf machinery flagged as a recurring blocker by
+    every prior 6.bis sub-phase (1c..1f, 2a..2d).  New unit
+    `src/passqlite3printf.pas` (~470 lines) hosts a self-contained
+    `sqlite3FormatStr(fmt, args: array of const): AnsiString` core plus
+    heap wrappers (`sqlite3PfMprintf`, `sqlite3PfSnprintf`,
+    `sqlite3MPrintf`, `sqlite3VMPrintf`, `sqlite3MAppendf`).
+
+    Conversions implemented this slice:
+      * Standard: `%s %d %u %x %X %o %c %p %lld %ld %% %z`
+      * SQL extensions: `%q` (escape `'` → `''`), `%Q` (wrap in `''` +
+        nil → `NULL`), `%w` (escape `"` → `""`), `%T` (TToken pointer:
+        emit `.n` bytes from `.z`).
+      * Width/precision/flags: `-` left-align, `0` zero-pad, `+`/space
+        signed, `#` alt form, `*` star-width, `*` star-precision.
+
+    Deliberately deferred to 6.bis.4b (next slice — covers what
+    Phase 7 codegen actually emits today):
+      * Float conversions: `%f %e %E %g %G`.
+      * Exotic SQLite extras: `%S` (SrcItem), `%r` (English ordinal).
+      * Replacing the four `*FmtMsg` shims in passqlite3vtab/carray/
+        dbpage/dbstat with direct `sqlite3MPrintf` calls — current
+        shims keep working untouched (their bodies still use
+        SysUtils.Format).  Migration is mechanical once 4b lands.
+      * Wiring `sqlite3MPrintf` into the `init.busy=0` branch of
+        `sqlite3VtabFinishParse` (the `CREATE VIRTUAL TABLE %T` TODO
+        in passqlite3parser.pas:1991) — also deferred to 4b because
+        the surrounding `sqlite3NestedParse` is a separate Phase-7
+        stub that needs porting alongside.
+
+    Naming pitfall worth memoising: SQLite's `%z` (string-with-free
+    extension) collides with C99's `z` length modifier (`size_t`).
+    SQLite's printf gives `%z` priority — the engine's length-
+    modifier strip therefore consumes `h`/`j`/`t` only (NOT `z`),
+    matching upstream printf.c.  Initial implementation accidentally
+    swallowed `z` as a length modifier and the `%z` test failed
+    accordingly; flagged here so any future revision keeps the
+    SQL-extension precedence.
+
+    FPC pitfalls discovered:
+      * `array of const` literal `[4294967295]` triggers a range-check
+        warning (i32 overflow); test wraps the value in `Int64(...)`.
+      * Inline `var` declarations inside `begin..end` blocks are not
+        OBJFPC-mode syntax (Delphi 10.3+ feature).  Test uses sub-
+        procedures with classic top-of-block `var` blocks instead.
+      * `sqlite3_free` lives in `passqlite3os` (`external 'c' name 'free'`),
+        NOT in `passqlite3util`.  Tests that release `sqlite3PfMprintf`
+        results must list `passqlite3os` in their `uses` clause.
+
+    Allocation contract:
+      * `sqlite3PfMprintf` / `sqlite3PfSnprintf` → libc-malloc memory
+        (release with `sqlite3_free`).
+      * `sqlite3MPrintf(db, ...)` → `sqlite3DbMalloc(db, ...)` memory
+        (release with `sqlite3DbFree(db, ...)`).  When `db = nil`,
+        falls back to libc malloc.
+      * `sqlite3MAppendf(db, zOld, fmt, ...)` frees `zOld` via
+        `sqlite3DbFree(db, zOld)` and returns a fresh
+        `sqlite3DbMalloc`-backed concat result.
+
+    Concrete changes:
+      * `src/passqlite3printf.pas`         — new (Phase 6.bis.4a).
+      * `src/tests/TestPrintf.pas`         — new gate test (40/40 PASS).
+      * `src/tests/build.sh`               — registers TestPrintf
+        ahead of TestVtab.
+
   - **2026-04-26 — Phase 6.bis.3e printf-shim consolidation.**  Cleanup
     follow-up: collapsed the four duplicate `*FmtMsg` shims into a
     single shared pair in `passqlite3vtab`'s interface:
@@ -3618,6 +3683,32 @@ Phase 5.9 depends on this being done first.
     a SQLITE_DYNAMIC text.  Gate `src/tests/TestVdbeVtabExec.pas` T12
     (a..d) — **50/50 PASS**.  Full sweep green.  See "Most recent
     activity" above.
+
+- **6.bis.4** Printf machinery — the long-awaited port of `printf.c`
+  (the recurring blocker called out by every prior 6.bis sub-phase).
+  Broken into two slices:
+
+  - [X] **6.bis.4a** Core engine + standard conversions + SQL extensions
+    (no float, no `%S`/`%r`, shims left intact).  DONE 2026-04-26.
+    New unit `src/passqlite3printf.pas` exports `sqlite3FormatStr`
+    (the AnsiString core), libc wrappers (`sqlite3PfMprintf`,
+    `sqlite3PfSnprintf`), and db-aware wrappers (`sqlite3MPrintf`,
+    `sqlite3VMPrintf`, `sqlite3MAppendf`).  Conversions implemented:
+    `%s %d %u %x %X %o %c %p %lld %% %z` (standard) plus
+    `%q %Q %w %T` (SQLite extensions).  Width/precision/flags
+    (`- 0 + space # *`) supported.  Gate `src/tests/TestPrintf.pas` —
+    **40/40 PASS**.  See "Most recent activity" above.
+
+  - [ ] **6.bis.4b** Follow-up: float conversions (`%f %e %E %g %G`),
+    exotic extras (`%S` SrcItem, `%r` ordinal), migrate the four
+    `*FmtMsg` shims in passqlite3vtab/carray/dbpage/dbstat to direct
+    `sqlite3MPrintf` calls (delete the SysUtils.Format-based bodies),
+    and wire `sqlite3MPrintf` into the `init.busy=0` branch of
+    `sqlite3VtabFinishParse` (passqlite3parser.pas:1991 — the
+    `CREATE VIRTUAL TABLE %T` TODO).  Float printing must round-trip
+    SQLite's bespoke `et*Float*` rendering (printf.c:267..480) — not
+    plain libc snprintf — to keep `.dump` byte-identical with the C
+    reference.
 
 - [ ] **6.9** `TestExplainParity.pas`: for the full SQL corpus, `EXPLAIN` each
   statement via Pascal and via C; diff the opcode listings. This is the single
