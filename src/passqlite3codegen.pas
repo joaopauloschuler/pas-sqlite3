@@ -2235,6 +2235,7 @@ procedure sqlite3AuthContextPop(pContext: PAuthContext);
 
 procedure sqlite3SchemaClear(p: Pointer);
 function  sqlite3SchemaGet(db: PTsqlite3; pBt: Pointer): PSchema;
+procedure sqlite3InstallSchemaTable(db: PTsqlite3; iDb: i32);
 procedure sqlite3SetTextEncoding(db: PTsqlite3; enc: u8);
 procedure sqlite3InsertBuiltinFuncs(aFunc: Pointer; nFunc: i32);
 function  sqlite3CheckCollSeq(pParse: PParse; pColl: Pointer): i32;
@@ -9085,6 +9086,87 @@ begin
     Result := p;
   end else
     Result := nil; { Phase 7: look up schema from btree }
+end;
+
+{ sqlite3InstallSchemaTable — bootstrap sqlite_master into pSchema^.tblHash for
+  database iDb (0=main / 1=temp).  Phase 6.x — nested-parse schema visibility:
+  mirrors the side-effect of sqlite3InitOne (init.c:199) running the built-in
+  'CREATE TABLE x(type text,name text,tbl_name text,rootpage int,sql text)'
+  via sqlite3InitCallback.  Without this, sqlite3FindTable("sqlite_master",...)
+  returns nil during nested parses fired by sqlite3EndTable / sqlite3CreateIndex /
+  sqlite3CodeDropTable, blocking sqlite3SrcListLookup -> sqlite3LocateTableItem
+  in the productive prologues of sqlite3DeleteFrom / sqlite3Update / sqlite3Insert.
+
+  Real on-disk schema initialisation (read sqlite_master rows, reconstruct
+  user tables / indexes / triggers, set schema_cookie etc.) lands with the
+  Phase 7 sqlite3InitOne port; this helper only installs the system table
+  itself, which is enough to unblock NestedParse'd schema-row DML. }
+procedure sqlite3InstallSchemaTable(db: PTsqlite3; iDb: i32);
+const
+  COL_NAMES: array[0..4] of PAnsiChar =
+    ('type', 'name', 'tbl_name', 'rootpage', 'sql');
+  COL_AFFIN: array[0..4] of u8 = (
+    SQLITE_AFF_TEXT, SQLITE_AFF_TEXT, SQLITE_AFF_TEXT,
+    SQLITE_AFF_INTEGER, SQLITE_AFF_TEXT);
+var
+  pSchema: passqlite3util.PSchema;
+  pTab:    PTable2;
+  pCol:    PColumn;
+  zName:   PAnsiChar;
+  i:       i32;
+begin
+  if (db = nil) or (iDb < 0) or (iDb >= db^.nDb) then Exit;
+  pSchema := db^.aDb[iDb].pSchema;
+  if pSchema = nil then Exit;
+
+  { Idempotent: skip if already installed (e.g. re-entry after schema reset). }
+  if iDb = 1 then
+    zName := PAnsiChar(LEGACY_TEMP_SCHEMA_TABLE)
+  else
+    zName := PAnsiChar(LEGACY_SCHEMA_TABLE);
+  if sqlite3HashFind(@pSchema^.tblHash, PChar(zName)) <> nil then Exit;
+
+  zName := sqlite3DbStrDup(db, zName);
+  if zName = nil then Exit;
+
+  pTab := PTable2(sqlite3DbMallocZero(db, SizeOf(TTable)));
+  if pTab = nil then begin
+    sqlite3DbFree(db, zName);
+    Exit;
+  end;
+
+  pCol := PColumn(sqlite3DbMallocZero(db, SizeOf(TColumn) * 5));
+  if pCol = nil then begin
+    sqlite3DbFree(db, zName);
+    sqlite3DbFree(db, pTab);
+    Exit;
+  end;
+
+  for i := 0 to 4 do begin
+    pCol[i].zCnName  := sqlite3DbStrDup(db, COL_NAMES[i]);
+    pCol[i].hName    := sqlite3StrIHash(pCol[i].zCnName);
+    pCol[i].affinity := AnsiChar(COL_AFFIN[i]);
+    pCol[i].szEst    := 1;
+  end;
+
+  pTab^.zName      := zName;
+  pTab^.aCol       := pCol;
+  pTab^.nCol       := 5;
+  pTab^.nNVCol     := 5;
+  pTab^.iPKey      := -1;
+  pTab^.tnum       := 1;            { SCHEMA_ROOT — sqlite_master is rootpage 1 }
+  pTab^.tabFlags   := TF_Readonly;  { writes only allowed via PreferBuiltin / nested }
+  pTab^.nTabRef    := 1;
+  pTab^.nRowLogEst := 200;          { sqlite3LogEst(1048576) }
+  pTab^.szTabRow   := 100;
+  pTab^.pSchema    := pSchema;
+  pTab^.eTabType   := TABTYP_NORM;
+
+  if sqlite3HashInsert(@pSchema^.tblHash, PChar(zName), pTab) <> nil then begin
+    { Collision shouldn't happen — we tested above — but keep the OOM-style
+      cleanup symmetric with sqlite3VtabFinishParse / sqlite3EndTable. }
+    sqlite3OomFault(db);
+  end;
 end;
 
 // ===========================================================================

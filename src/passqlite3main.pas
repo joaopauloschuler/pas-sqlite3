@@ -516,6 +516,16 @@ begin
   db^.aDb[1].zDbSName     := 'temp';
   db^.aDb[1].safety_level := 1;     { OFF }
 
+  { Phase 6.x — nested-parse schema visibility: bootstrap sqlite_master /
+    sqlite_temp_master into the in-memory schema so the schema-row UPDATE /
+    INSERT / DELETE statements emitted by sqlite3NestedParse (from
+    sqlite3EndTable, sqlite3CreateIndex, sqlite3CodeDropTable, etc.) can
+    resolve their target via sqlite3SrcListLookup -> sqlite3LocateTableItem.
+    Real on-disk schema initialisation (sqlite3InitOne port) lands in
+    Phase 7. }
+  sqlite3InstallSchemaTable(db, 0);
+  sqlite3InstallSchemaTable(db, 1);
+
   { sqlite3SetTextEncoding consults collation tables, which require the full
     Phase 8.3 registration APIs.  Set the encoding directly for now. }
   db^.enc := SQLITE_UTF8;

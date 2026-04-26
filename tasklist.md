@@ -20,6 +20,130 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.x — nested-parse schema visibility:
+    bootstrap `sqlite_master` into `db^.aDb[*].pSchema^.tblHash` at
+    `openDatabase` time.**  Resolves the first prerequisite of
+    Phase 6.9-bis step 11g flagged in step 11f's discoveries
+    (`tasklist.md:79..91`).  Without this fix, schema-row UPDATE /
+    INSERT / DELETE statements emitted by `sqlite3NestedParse` (from
+    `sqlite3EndTable`, `sqlite3CreateIndex`, `sqlite3CodeDropTable`,
+    `destroyRootPage`'s autovacuum arm) failed at the very first hop
+    of their productive prologue: `sqlite3SrcListLookup` ->
+    `sqlite3LocateTableItem` -> `sqlite3LocateTable` ->
+    `sqlite3FindTable("sqlite_master", ...)` returned nil because no
+    code path had ever inserted the system table into `tblHash`
+    (`sqlite3SchemaGet` allocates the empty hash; the C reference
+    populates it via `sqlite3InitOne` -> `sqlite3InitCallback`, which
+    is still a Phase 7 stub here).  Step 11f sidestepped the issue
+    with a skeleton-only error-state guard so the outer parse stays
+    no-op until step 11g; this commit makes the lookup succeed
+    productively.
+    [X]
+
+    Concrete changes:
+      * `passqlite3codegen.pas:2238` — interface declaration for
+        new helper `sqlite3InstallSchemaTable(db, iDb)`.
+      * `passqlite3codegen.pas:9090..9165` — body of
+        `sqlite3InstallSchemaTable`.  Allocates a `TTable` + 5-entry
+        `TColumn` array via `sqlite3DbMallocZero`, populates:
+          - `zName` = `sqlite_master` (iDb=0) or `sqlite_temp_master`
+            (iDb=1), heap-dup'd via `sqlite3DbStrDup` so
+            `sqlite3DeleteTable` can free it later;
+          - `aCol[0..4].zCnName` = `'type','name','tbl_name',
+            'rootpage','sql'` (heap-dup'd);
+          - `aCol[i].hName` = `sqlite3StrIHash(zCnName)` so
+            `sqlite3ColumnIndex`'s fast-path lookup works (the linear
+            fallback would too, but matching the C invariant is free);
+          - affinities `TEXT/TEXT/TEXT/INTEGER/TEXT` per the built-in
+            `CREATE TABLE x(type text,name text,tbl_name text,
+            rootpage int,sql text)` schema in `init.c:230`;
+          - `nCol = nNVCol = 5`, `iPKey = -1`, `tnum = 1`
+            (SCHEMA_ROOT — sqlite_master always lives at rootpage 1),
+            `tabFlags = TF_Readonly`, `nTabRef = 1`,
+            `nRowLogEst = 200`, `pSchema = pSchema`,
+            `eTabType = TABTYP_NORM`.
+        Idempotent: returns early if the table is already in
+        `tblHash` (e.g. on schema-reset re-entry).
+      * `passqlite3main.pas:519..527` — call
+        `sqlite3InstallSchemaTable(db, 0)` and `(db, 1)` from
+        `openDatabase`, immediately after the pSchema slots are
+        allocated and the zDbSName / safety_level fields are set.
+        Placed before `eOpenState := SQLITE_STATE_OPEN` so the table
+        is ready by the time any prepare/exec runs.
+
+    Why `TF_Readonly` is correct (and doesn't break NestedParse-emitted
+    writes): `tabIsReadOnly` (`codegen.pas:5274`) returns 1 only when
+    `sqlite3WritableSchema(db) = 0` AND `pParse^.nested = 0`.  The
+    schema-row UPDATE / INSERT / DELETE statements from `EndTable` /
+    `CreateIndex` / `CodeDropTable` are all fired through
+    `sqlite3NestedParse`, which bumps `pParse^.nested` before
+    invoking the parser — so the gate evaluates to 0 and writes are
+    permitted, exactly as in the C reference.
+
+    Tests: full build clean (one pre-existing comment-level warning
+    in `passqlite3.inc` carries over; not introduced here).
+    Regression sweep (2026-04-26):
+    TestPrepareBasic 20/20, TestParser 45/45, TestParserSmoke 20/20,
+    TestSchemaBasic 44/44, TestVdbeApi 57/57, TestDMLBasic 54/54,
+    TestSelectBasic 49/49, TestExprBasic 40/40, TestVdbeTxn 8/8,
+    TestAuthBuiltins 34/34, TestOpenClose 17/17, TestSmoke +
+    TestUtil clean, TestJson 434/434, TestJsonEach 50/50,
+    TestJsonRegister 48/48, TestPrintf 105/105, TestVtab 216/216.
+    TestExplainParity unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**
+    (see Discoveries — the divergences are blocked further upstream,
+    not by this lookup).
+
+    Discoveries / next-step notes:
+      * **TestExplainParity count didn't move.**  Expected.  The fix
+        unblocks the *first* of step 11g's two prerequisites; the
+        productive emission tail in `sqlite3DeleteFrom` /
+        `sqlite3Update` is still gated by step 11f's skeleton guard
+        AND by the missing `sqlite3WhereBegin` port (Phase 7).  Until
+        step 11g ships those, the CREATE TABLE rows still emit only
+        the StartTable prologue (17 ops vs C's 32), and CREATE INDEX
+        / DROP TABLE still error out for unrelated reasons (see
+        below).  But sqlite3LocateTableItem("sqlite_master", ...) now
+        returns a real PTable2 — verifiable by removing step 11f's
+        guard locally and running `TestPrepareBasic` (no longer
+        regresses on T7..T10).
+      * **CREATE INDEX `t(a)` still fails the table lookup for `t`.**
+        Different problem: user tables created during the test
+        fixture (`CREATE TABLE t(a,b,c)`) are NOT published into
+        `tblHash` because `sqlite3EndTable`'s publication arm
+        (`codegen.pas:6892`) is gated on `db^.init.busy <> 0`.  In
+        the user-driven prepare/exec path, `init.busy = 0` and the
+        publication is supposed to happen later via `OP_ParseSchema`
+        — which is still a stub at `passqlite3vdbe.pas:7135`.  This
+        is **Phase 6.x — OP_ParseSchema port** (separate task; not
+        a step 11g prerequisite, only matters for non-schema tables).
+        Until that lands, CREATE INDEX over a user table fails at
+        `sqlite3SrcListLookup(pTblName)` regardless of step 11g
+        progress.
+      * **DROP TABLE `t` fails for the same reason** — `t` is not
+        in tblHash, so the resolve in `sqlite3DropTable` errors out
+        before reaching `sqlite3CodeDropTable`'s NestedParse.  Same
+        OP_ParseSchema dependency as CREATE INDEX.
+      * **`sqlite_temp_master` is bootstrapped too** even though no
+        current corpus uses it — symmetric with C's `sqlite3InitOne`
+        loop (`prepare.c:449..456`) and cheap (one Table + one
+        column array).  Lets attached / TEMP DDL paths Just Work
+        once the rest of step 11g lands.
+      * **Real on-disk schema initialisation is still deferred.**
+        `sqlite3InitOne` reads sqlite_master rows to reconstruct
+        user objects.  This helper only installs the *system* table,
+        which is sufficient for nested-parse emit.  Reconstruction
+        of user tables / indexes / triggers from on-disk meta data
+        belongs to the Phase 7 prepare.c port.
+      * **Next 6.9-bis target: step 11g still requires `sqlite3WhereBegin`
+        / `sqlite3WhereOkOnePass` / `sqlite3WhereEnd`** (Phase 7
+        territory).  With *those* in place, the productive emission
+        tail of `sqlite3DeleteFrom` / `sqlite3Update` can fire and
+        flip the 5 CREATE TABLE rows of TestExplainParity from
+        DIVERGE -> closer to PASS (or at least raise the op count
+        from 17 toward 32).  CREATE INDEX / DROP TABLE need the
+        OP_ParseSchema port (separate task) before they'll prepare
+        non-nil.
+
   - **2026-04-26 — Phase 6.9-bis (step 11f): structural skeleton of
     `sqlite3DeleteFrom` (delete.c:288) and `sqlite3Update` (update.c:285).**
     Replaces the two Phase-6.4 stubs at `passqlite3codegen.pas:5345`
