@@ -3692,8 +3692,11 @@ end;
 function sqlite3ExprCodeTarget(pParse: PParse; pExpr: PExpr;
   target: i32): i32;
 var
-  v:  PVdbe;
-  op: u8;
+  v:     PVdbe;
+  op:    u8;
+  z:     PAnsiChar;
+  zBlob: PAnsiChar;
+  n:     i32;
 begin
   v := pParse^.pVdbe;
   if pExpr = nil then op := TK_NULL
@@ -3734,8 +3737,26 @@ begin
       end;
     TK_REGISTER:
       Result := pExpr^.iTable;
+    TK_BLOB:
+      begin
+        { Faithful port of expr.c:5125..5138 — emit OP_Blob with the
+          decoded binary value of an x'…' literal as P4_DYNAMIC payload.
+          The token is "x'hhhh…'" (or "X'hhhh…'") with the trailing
+          quote still attached, so we skip the first two bytes and pass
+          the remaining length (which still includes the trailing
+          quote byte — sqlite3HexToBlob consumes it via Dec(n)). }
+        Assert(not ExprHasProperty(pExpr, EP_IntValue));
+        Assert((pExpr^.u.zToken[0] = 'x') or (pExpr^.u.zToken[0] = 'X'));
+        Assert(pExpr^.u.zToken[1] = '''');
+        z := pExpr^.u.zToken + 2;
+        n := sqlite3Strlen30(z) - 1;
+        Assert(z[n] = '''');
+        zBlob := PAnsiChar(sqlite3HexToBlob(sqlite3VdbeDb(v), z, n));
+        sqlite3VdbeAddOp4(v, OP_Blob, n div 2, target, 0, zBlob, P4_DYNAMIC);
+        Result := target;
+      end;
   else
-    { TODO(Phase 6.9-bis): TK_COLUMN, TK_AGG_COLUMN, TK_BLOB, TK_CAST,
+    { TODO(Phase 6.9-bis): TK_COLUMN, TK_AGG_COLUMN, TK_CAST,
       TK_LT…TK_GT comparison cluster, TK_AND/TK_OR, TK_PLUS/TK_MINUS/…,
       TK_FUNCTION, TK_CASE, TK_IN, TK_EXISTS, TK_SELECT, … — land in
       subsequent vertical-slice sub-progress.  For now use the C

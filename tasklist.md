@@ -21,6 +21,73 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    sqlite3ExprCodeTarget — TK_BLOB arm + sqlite3HexToBlob util port.**
+    Continues the vertical-slice walk through `sqlite3ExprCodeTarget`'s
+    leaf arms.  Lands the second-easiest unblocked arm flagged in the
+    previous sub-progress' discovery notes (the easiest still-blocked
+    one being TK_COLUMN, which needs the column-cache scaffolding):
+
+      * **`sqlite3HexToBlob`** (util.c:1892..1905) — faithful port to
+        `passqlite3util.pas` next to the existing `sqlite3HexToInt`.
+        Allocates `n/2 + 1` bytes via `sqlite3DbMallocRawNN`, then packs
+        each pair of hex bytes into one output byte.  Caller passes the
+        body of an `x'…'` literal *with* the trailing `'` byte still in
+        the count — `Dec(n)` strips it before the loop.  Trailing NUL
+        terminator written for parity with C even though P4_DYNAMIC
+        consumers ignore it.  Public; declared in the util.pas
+        interface block alongside `sqlite3HexToInt`.
+      * **TK_BLOB arm in `sqlite3ExprCodeTarget`** (expr.c:5125..5138)
+        — emits `OP_Blob(n div 2, target, 0, zBlob, P4_DYNAMIC)` with
+        the decoded binary value as a malloc'd payload.  Mirrors the
+        C asserts on `not EP_IntValue`, `zToken[0] in {'x','X'}`,
+        `zToken[1] = quote`, and `z[n] = quote` byte-for-byte.
+
+    Concrete changes:
+      * `passqlite3util.pas:601` — public forward decl for
+        `sqlite3HexToBlob`.
+      * `passqlite3util.pas:1071..` — body of `sqlite3HexToBlob`
+        immediately after `sqlite3HexToInt`.
+      * `passqlite3codegen.pas:3694..3700` — three new locals on
+        `sqlite3ExprCodeTarget` (`z`, `zBlob: PAnsiChar`, `n: i32`).
+      * `passqlite3codegen.pas:3737..` — TK_BLOB case arm inserted
+        before the default arm; default arm's TODO comment trimmed
+        (no longer mentions TK_BLOB).
+
+    Why this is safe to land alone: TK_BLOB is currently unreachable
+    via productive call paths (no SELECT codegen wired, no
+    sqlite3NestedParse-emitted INSERT writes a blob literal), so the
+    new arm is verified by build only.  Pre-wires the case for when
+    the SELECT layer (or future PRAGMA emitting hex literals) lands.
+    Full regression sweep all green — TestWhereBasic 52/52,
+    TestWhereStructs 148/148, TestPrepareBasic 20/20, TestParser 45/45,
+    TestSchemaBasic 44/44, TestVdbeApi 57/57, TestDMLBasic 54/54,
+    TestSelectBasic 49/49, TestExprBasic 40/40, TestInitCallback 29/29,
+    TestExplainParity unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **`sqlite3HexToBlob` length-arg contract preserved.**  C source
+        passes `n = sqlite3Strlen30(z) - 1` (still includes the trailing
+        `'`) and the helper internally `n--`s before the loop.  The
+        Pascal port keeps that idiom verbatim — callers must mirror the
+        C `n - 1` adjustment, not the `n - 2` they might naively expect.
+      * **No corpus regression test for the TK_BLOB arm yet.**  Same as
+        TK_FLOAT — needs a public API path that reaches
+        `sqlite3ExprCode(parse, BlobLiteral, target)`.  Add a
+        TestExprBasic case once SELECT codegen lands and `INSERT INTO
+        t VALUES(x'deadbeef')` reaches the wrapper.
+      * **Realistic next sub-progress: TK_COLUMN arm (still gated).**
+        Needs the column-cache scaffolding (`pParse.aColCache` ring +
+        `sqlite3ExprCacheStore` / `sqlite3ExprCachePush` /
+        `sqlite3ExprCachePop`) plus `sqlite3TableColumnToStorage`
+        plus `sqlite3ExprCodeGetColumn` (expr.c:4775..).  Land the
+        column-cache scaffolding first as a separate sub-progress, then
+        bolt the TK_COLUMN arm on top.  Alternatively, the TK_TYPEOF /
+        TK_PURE_FUNCTION / TK_COLLATE / TK_UPLUS arms (all simple
+        delegations to `sqlite3ExprCodeTarget` on `pLeft` modulo a
+        flag-flip) are unblocked and could land as a small follow-up
+        sub-progress before tackling TK_COLUMN.
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     sqlite3ExprCodeTarget — first vertical slice (literal/leaf arms) +
     codeInteger / codeReal helpers.**  Lifts `sqlite3ExprCode` from a
     flat literal-only stub into the productive C wrapper from

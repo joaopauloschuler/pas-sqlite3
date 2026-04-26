@@ -598,6 +598,7 @@ function sqlite3Tolower(x: u8): u8; inline;
 
 { String utilities (util.c) }
 function  sqlite3HexToInt(h: i32): u8; inline;
+function  sqlite3HexToBlob(db: Psqlite3db; z: PAnsiChar; n: i32): Pointer;
 function  sqlite3Strlen30(z: PChar): i32;
 function  sqlite3Strlen30NN(z: PChar): i32;
 function  sqlite3StrICmp(zLeft, zRight: PChar): i32;
@@ -1066,6 +1067,33 @@ begin
   { ASCII: digits 0-9 add 0, letters a-f/A-F add 9 }
   h := h + 9 * (1 and (h shr 6));
   Result := u8(h and $F);
+end;
+
+function sqlite3HexToBlob(db: Psqlite3db; z: PAnsiChar; n: i32): Pointer;
+{ Faithful port of util.c:1892..1905 — caller passes the body of an
+  x'…' BLOB literal (without the leading "x'" but with the trailing "'"
+  byte still counted).  Allocates n/2+1 bytes via sqlite3DbMallocRawNN
+  and packs each pair of hex bytes into one output byte; the trailing
+  byte is the contract NUL terminator (P4_DYNAMIC consumers ignore it,
+  but SQLite always writes it). }
+var
+  zBlob: PAnsiChar;
+  i:     i32;
+begin
+  zBlob := PAnsiChar(sqlite3DbMallocRawNN(db, u64(n div 2 + 1)));
+  Dec(n);
+  if zBlob <> nil then
+  begin
+    i := 0;
+    while i < n do
+    begin
+      zBlob[i div 2] := AnsiChar(
+        (sqlite3HexToInt(Ord(z[i])) shl 4) or sqlite3HexToInt(Ord(z[i + 1])));
+      Inc(i, 2);
+    end;
+    zBlob[i div 2] := #0;
+  end;
+  Result := zBlob;
 end;
 
 function sqlite3Strlen30NN(z: PChar): i32;
