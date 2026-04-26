@@ -21,6 +21,59 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    BMS constant + SZ_WHEREINFO + whereInfoLevels flexarray accessor.**
+    Scaffolding sub-progress preparing the `sqlite3WhereBegin` productive
+    prologue (where.c:6862..6940).  Adds the three structural primitives
+    the prologue's allocation + cap-check arms call directly:
+      * `BMS = i32(SizeOf(Bitmask) * 8)` = 64.  Mirrors `sqliteInt.h`'s
+        BMS macro — used to (a) cap `pTabList^.nSrc` so every FROM-table
+        gets a unique bit in the mask-set, and (b) cap `pOrderBy^.nExpr`
+        before zeroing `pOrderBy` and disabling omit-noop-join.
+      * `SZ_WHEREINFO(nLevel)` inline — faithful port of the
+        `whereInt.h:514` macro: `ROUND8(offsetof(WhereInfo,a) +
+        N*sizeof(WhereLevel))`.  Pascal computes
+        `ROUND8(SizeOf(TWhereInfo) + nLevel*SizeOf(TWhereLevel))` —
+        SizeOf(TWhereInfo) = 856 = offsetof(WhereInfo,a) in C, locked by
+        TestWhereStructs' offset sentinel.  The 8-byte rounding lets the
+        prologue append a `TWhereLoop` block right after the level array
+        (where.c:6929 `sWLB.pNew = (WhereLoop*)((char*)pWInfo+nByteWInfo)`).
+      * `whereInfoLevels(p): PWhereLevel` flexarray accessor — points at
+        the trailing TWhereLevel a[] array (immediately after the 856-byte
+        TWhereInfo header).  Mirrors C's `pWInfo->a[i]`.
+
+    No body changes to `sqlite3WhereBegin`; productive prologue lands in
+    the next sub-progress commit.
+
+    Concrete changes:
+      * `passqlite3codegen.pas:1384` — `BMS = 64` constant inserted in the
+        Phase 6.2 const block, immediately before WHERE_ORDERBY_*.
+      * `passqlite3codegen.pas:1315..1316` — forward decls for
+        `whereInfoLevels` / `SZ_WHEREINFO`.
+      * `passqlite3codegen.pas:2348..2375` — bodies, alongside
+        `ExprListItems` / `SrcListItems` / `IdListItems`.
+
+    Test status: full build clean, regression sweep all green —
+    TestWhereBasic 52/52, TestWhereStructs 148/148, TestPrepareBasic 20/20,
+    TestParser 45/45, TestSchemaBasic 44/44, TestVdbeApi 57/57,
+    TestDMLBasic 54/54, TestSelectBasic 49/49, TestExprBasic 40/40,
+    TestInitCallback 29/29, TestExplainParity unchanged at
+    **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Next 6.9-bis target (still 11g.2.b): productive `sqlite3WhereBegin`
+    prologue body — variable init, BMS cap-check, single-allocation
+    (TWhereInfo + nLevel*TWhereLevel + tail TWhereLoop), field
+    initialisation (pParse, pTabList, pOrderBy, pResultSet, pSelect,
+    aiCurOnePass, nLevel, iBreak/iContinue labels, wctrlFlags, iLimit,
+    savedNQueryLoop), MaskSet init with `ix[0]=-99`, sWLB setup
+    (whereLoopInit on tail block), `sqlite3WhereClauseInit` +
+    `sqlite3WhereSplit`, then the `nTabList==0` special case and the
+    nTabList>0 createMask + sqlite3WhereTabFuncArgs walk.  Stops short
+    of the False-WHERE-Term-Bypass loop (lines 6995..7027) and the
+    planner core — those land in subsequent sub-progress commits, with
+    the trimmed planner pick + OP_NotExists emission flipping the 5
+    CREATE TABLE rows in TestExplainParity.
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     sqlite3WhereBegin signature alignment with C source.**  Closed
     the signature-drift discovery flagged in the previous sub-progress
     note.  Pascal's `sqlite3WhereBegin` was missing the `Select* pSelect`
@@ -8079,6 +8132,18 @@ Phase 5.9 depends on this being done first.
       TestExplainParity unchanged at 2 PASS / 8 DIVERGE / 0 ERROR).
       Now unblocks the productive prologue port, which writes
       `pWInfo^.pSelect = pSelect` directly.
+
+      **Sub-progress (landed 2026-04-26 — BMS / SZ_WHEREINFO /
+      whereInfoLevels scaffolding).**  Added three structural primitives
+      the productive prologue calls directly:
+        * `BMS = i32(SizeOf(Bitmask) * 8)` = 64 (caps FROM-clause /
+          ORDER BY width — sqliteInt.h BMS macro).
+        * `SZ_WHEREINFO(nLevel)` inline (whereInt.h:514 macro) —
+          `ROUND8(SizeOf(TWhereInfo) + nLevel*SizeOf(TWhereLevel))`.
+        * `whereInfoLevels(p): PWhereLevel` flexarray accessor for
+          `pWInfo->a[i]`.
+      No body change in `sqlite3WhereBegin`; full regression sweep stays
+      green.  Unblocks the productive prologue port (next sub-progress).
 
       **Remaining sub-task:** the actual productive WhereBegin
       single-table, single-rowid-EQ-predicate case + WhereEnd's

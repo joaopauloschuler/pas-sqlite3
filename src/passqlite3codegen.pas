@@ -1312,6 +1312,8 @@ type
 function ExprListItems(p: PExprList): PExprListItem; inline;
 function SrcListItems(p: PSrcList): PSrcItem; inline;
 function IdListItems(p: PIdList): PIdListItem; inline;
+function whereInfoLevels(p: PWhereInfo): PWhereLevel; inline;
+function SZ_WHEREINFO(nLevel: i32): SizeInt; inline;
 
 // ---------------------------------------------------------------------------
 // Parse field bitflag constants (parseFlags at offset 40)
@@ -1380,6 +1382,12 @@ const
   WHERE_OMIT_OFFSET  = u32($01000000);
   WHERE_COROUTINE    = u32($02000000);
   WHERE_EXPRIDX      = u32($04000000);
+
+  { BMS — number of bits in a Bitmask (sqliteInt.h:14869).  Caps the number
+    of tables that can participate in a single FROM clause, and the number
+    of terms that can appear in an ORDER/GROUP BY clause optimised by
+    where.c.  Used by the sqlite3WhereBegin prologue. }
+  BMS = i32(SizeOf(Bitmask) * 8);  { = 64 on a u64 Bitmask }
 
   { WHERE_ORDERBY_* flags (passed to sqlite3WhereBegin wctrlFlags) }
   WHERE_ORDERBY_NORMAL  = u16($0000);
@@ -2339,6 +2347,24 @@ end;
 function IdListItems(p: PIdList): PIdListItem; inline;
 begin
   Result := PIdListItem(PByte(p) + SZ_IDLIST_HEADER);
+end;
+
+{ Flexarray accessor for the trailing TWhereLevel a[] field of TWhereInfo.
+  Mirrors C's `pWInfo->a[i]` access — the levels start immediately after the
+  TWhereInfo base (sizeof = 856 bytes); see TestWhereStructs for the lock. }
+function whereInfoLevels(p: PWhereInfo): PWhereLevel; inline;
+begin
+  Result := PWhereLevel(PByte(p) + SizeOf(TWhereInfo));
+end;
+
+{ SZ_WHEREINFO — total byte size needed for a TWhereInfo header + nLevel
+  TWhereLevel entries, rounded up to an 8-byte boundary so a TWhereLoop tail
+  block can be appended after it (where.c:6897/6929 trick).  Mirrors the C
+  macro in whereInt.h:514:
+      #define SZ_WHEREINFO(N) ROUND8(offsetof(WhereInfo,a)+(N)*sizeof(WhereLevel)) }
+function SZ_WHEREINFO(nLevel: i32): SizeInt; inline;
+begin
+  Result := ROUND8(SizeOf(TWhereInfo) + SizeInt(nLevel) * SizeOf(TWhereLevel));
 end;
 
 function ExprHasProperty(pExpr: PExpr; prop: u32): Boolean; inline;
