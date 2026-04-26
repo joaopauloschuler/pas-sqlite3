@@ -628,6 +628,203 @@ begin
   sqlite3DbFree(db, pParse);
 end;
 
+{ ============================================================
+  Phase 6.bis.1e — public API entry points: sqlite3_declare_vtab,
+  sqlite3_vtab_on_conflict, sqlite3_vtab_config.
+  ============================================================ }
+
+var
+  gApiCtxBDeclared: i32;        { observed pCtx^.bDeclared inside xConnect }
+  gApiConfigRc:     i32;        { observed sqlite3_vtab_config return inside xConnect }
+  gApiConfigOp:     i32;        { which op to call sqlite3_vtab_config with }
+
+function ApiXConnect(db: PTsqlite3; pAux: Pointer;
+  argc: i32; argv: PPAnsiChar; ppVtab: PPSqlite3Vtab;
+  pzErr: PPAnsiChar): i32; cdecl;
+var
+  v:    PSqlite3Vtab;
+  pCtx: PVtabCtx;
+begin
+  GetMem(v, SizeOf(Tsqlite3_vtab));
+  FillChar(v^, SizeOf(Tsqlite3_vtab), 0);
+  ppVtab^ := v;
+
+  { sqlite3_declare_vtab is the canonical way to flip bDeclared.  Use a
+    minimal but real CREATE TABLE statement to drive the keyword check. }
+  Inc(gConnectCount);
+  Result := sqlite3_declare_vtab(db, 'CREATE TABLE x(a)');
+  if Result <> SQLITE_OK then begin
+    FreeMem(v);
+    ppVtab^ := nil;
+    Exit;
+  end;
+
+  pCtx := PVtabCtx(db^.pVtabCtx);
+  if pCtx <> nil then gApiCtxBDeclared := pCtx^.bDeclared;
+
+  { Probe sqlite3_vtab_config from inside the constructor. }
+  if gApiConfigOp <> 0 then
+    gApiConfigRc := sqlite3_vtab_config(db, gApiConfigOp, 1)
+  else
+    gApiConfigRc := -1;
+
+  Result := SQLITE_OK;
+end;
+
+procedure TestVtabApi_Run(db: PTsqlite3);
+var
+  m:        Tsqlite3_module;
+  pMod:     PVtabModule;
+  pTab:     TCgPTable;
+  rc:       i32;
+  pParse:   TCgPParse;
+  pVT:      PVTable;
+  pSchemaT: TUtilPSchema;
+  sCtx:     TVtabCtx;
+begin
+  WriteLn('TestVtab — Phase 6.bis.1e gate (declare_vtab / on_conflict / vtab_config)');
+  pSchemaT := TUtilPSchema(db^.aDb[0].pSchema);
+
+  { ---- T51..T56: sqlite3_declare_vtab misuse / keyword checks ---- }
+
+  { T51: nil db → MISUSE.  No pCtx involvement. }
+  rc := sqlite3_declare_vtab(nil, 'CREATE TABLE x(a)');
+  ExpectEq(rc, SQLITE_MISUSE, 'T51 declare_vtab(nil db) → MISUSE');
+
+  { T52: nil zCreateTable → MISUSE. }
+  rc := sqlite3_declare_vtab(db, nil);
+  ExpectEq(rc, SQLITE_MISUSE, 'T52 declare_vtab(nil sql) → MISUSE');
+
+  { T53: bad first keyword → ERROR. }
+  rc := sqlite3_declare_vtab(db, 'DROP TABLE x');
+  ExpectEq(rc, SQLITE_ERROR, 'T53 non-CREATE leading keyword → ERROR');
+
+  { T54: bad second keyword → ERROR. }
+  rc := sqlite3_declare_vtab(db, 'CREATE INDEX x');
+  ExpectEq(rc, SQLITE_ERROR, 'T54 CREATE without TABLE → ERROR');
+
+  { T55: leading whitespace + comments still passes the keyword scan; with
+    no active VtabCtx, it then falls through to MISUSE. }
+  rc := sqlite3_declare_vtab(db,
+    '  /* hi */  CREATE  -- line comment'#10'TABLE x(a)');
+  ExpectEq(rc, SQLITE_MISUSE,
+    'T55 spaces/comments OK, then no pVtabCtx → MISUSE');
+
+  { ---- T56..T57: drive declare_vtab through a real xConnect callback. ---- }
+  FillChar(m, SizeOf(m), 0);
+  m.iVersion    := 1;
+  m.xCreate     := @ApiXConnect;     { reuse to satisfy CallCreate }
+  m.xConnect    := @ApiXConnect;
+  m.xDestroy    := @CtorXDestroy;
+  m.xDisconnect := @CtorXDisconnect;
+  pMod := sqlite3VtabCreateModule(db, 'apimod', @m, nil, nil);
+  Expect(pMod <> nil, 'T56a register apimod');
+
+  pParse := TCgPParse(sqlite3MallocZero64(SizeOf(TCgTParse)));
+  pParse^.db := db;
+
+  pTab := CtorMakeTable(db, 'api_a', 'apimod');
+  gConnectCount    := 0;
+  gApiCtxBDeclared := -1;
+  gApiConfigOp     := 0;
+  rc := sqlite3VtabCallConnect(pParse, pTab);
+  ExpectEq(rc, SQLITE_OK, 'T56 declare_vtab inside xConnect → OK');
+  ExpectEq(gApiCtxBDeclared, 1,
+    'T57 pCtx^.bDeclared=1 after sqlite3_declare_vtab');
+  pVT := sqlite3GetVTable(db, pTab);
+  Expect(pVT <> nil, 'T57b VTable attached after declare_vtab');
+
+  { ---- T58: bDeclared already set → second declare_vtab → MISUSE. ---- }
+  { Re-fabricate a manual VtabCtx with bDeclared=1 to exercise the path. }
+  FillChar(sCtx, SizeOf(sCtx), 0);
+  sCtx.pTab      := pTab;
+  sCtx.pVTbl     := pVT;
+  sCtx.bDeclared := 1;
+  db^.pVtabCtx := @sCtx;
+  rc := sqlite3_declare_vtab(db, 'CREATE TABLE x(a)');
+  db^.pVtabCtx := nil;
+  ExpectEq(rc, SQLITE_MISUSE,
+    'T58 declare_vtab when bDeclared already set → MISUSE');
+
+  { ---- Cleanup the connected vtab so close_v2 doesn't trip. ---- }
+  rc := sqlite3VtabCallDestroy(db, 0, 'api_a');
+  ExpectEq(rc, SQLITE_OK, 'T58b cleanup api_a');
+
+  { ---- T59..T63: sqlite3_vtab_on_conflict ---- }
+  db^.vtabOnConflict := 1;  { OE_Rollback }
+  ExpectEq(sqlite3_vtab_on_conflict(db), 1,
+    'T59 on_conflict OE_Rollback → SQLITE_ROLLBACK(1)');
+  db^.vtabOnConflict := 2;  { OE_Abort }
+  ExpectEq(sqlite3_vtab_on_conflict(db), 4,
+    'T60 on_conflict OE_Abort → SQLITE_ABORT(4)');
+  db^.vtabOnConflict := 3;  { OE_Fail }
+  ExpectEq(sqlite3_vtab_on_conflict(db), 3,
+    'T61 on_conflict OE_Fail → SQLITE_FAIL(3)');
+  db^.vtabOnConflict := 4;  { OE_Ignore }
+  ExpectEq(sqlite3_vtab_on_conflict(db), 2,
+    'T62 on_conflict OE_Ignore → SQLITE_IGNORE(2)');
+  db^.vtabOnConflict := 5;  { OE_Replace }
+  ExpectEq(sqlite3_vtab_on_conflict(db), 5,
+    'T63 on_conflict OE_Replace → SQLITE_REPLACE(5)');
+
+  { ---- T64: sqlite3_vtab_config without an active VtabCtx → MISUSE. ---- }
+  rc := sqlite3_vtab_config(db, SQLITE_VTAB_CONSTRAINT_SUPPORT, 1);
+  ExpectEq(rc, SQLITE_MISUSE,
+    'T64 vtab_config without pVtabCtx → MISUSE');
+
+  { ---- T65..T68: drive vtab_config through ApiXConnect's gApiConfigOp ---- }
+  pTab := CtorMakeTable(db, 'api_b', 'apimod');
+  gApiConfigOp := SQLITE_VTAB_CONSTRAINT_SUPPORT;
+  rc := sqlite3VtabCallConnect(pParse, pTab);
+  ExpectEq(rc, SQLITE_OK, 'T65 vtab_config(CONSTRAINT_SUPPORT) ok');
+  ExpectEq(gApiConfigRc, SQLITE_OK, 'T65b returned OK');
+  pVT := sqlite3GetVTable(db, pTab);
+  Expect((pVT <> nil) and (pVT^.bConstraint = 1),
+    'T65c bConstraint=1');
+  rc := sqlite3VtabCallDestroy(db, 0, 'api_b');
+
+  pTab := CtorMakeTable(db, 'api_c', 'apimod');
+  gApiConfigOp := SQLITE_VTAB_INNOCUOUS;
+  rc := sqlite3VtabCallConnect(pParse, pTab);
+  ExpectEq(rc, SQLITE_OK, 'T66 vtab_config(INNOCUOUS) ok');
+  pVT := sqlite3GetVTable(db, pTab);
+  Expect((pVT <> nil) and (pVT^.eVtabRisk = SQLITE_VTABRISK_Low),
+    'T66b eVtabRisk=Low');
+  rc := sqlite3VtabCallDestroy(db, 0, 'api_c');
+
+  pTab := CtorMakeTable(db, 'api_d', 'apimod');
+  gApiConfigOp := SQLITE_VTAB_DIRECTONLY;
+  rc := sqlite3VtabCallConnect(pParse, pTab);
+  ExpectEq(rc, SQLITE_OK, 'T67 vtab_config(DIRECTONLY) ok');
+  pVT := sqlite3GetVTable(db, pTab);
+  Expect((pVT <> nil) and (pVT^.eVtabRisk = SQLITE_VTABRISK_High),
+    'T67b eVtabRisk=High');
+  rc := sqlite3VtabCallDestroy(db, 0, 'api_d');
+
+  pTab := CtorMakeTable(db, 'api_e', 'apimod');
+  gApiConfigOp := SQLITE_VTAB_USES_ALL_SCHEMAS;
+  rc := sqlite3VtabCallConnect(pParse, pTab);
+  ExpectEq(rc, SQLITE_OK, 'T68 vtab_config(USES_ALL_SCHEMAS) ok');
+  pVT := sqlite3GetVTable(db, pTab);
+  Expect((pVT <> nil) and (pVT^.bAllSchemas = 1),
+    'T68b bAllSchemas=1');
+  rc := sqlite3VtabCallDestroy(db, 0, 'api_e');
+
+  pTab := CtorMakeTable(db, 'api_f', 'apimod');
+  gApiConfigOp := 9999;  { invalid op }
+  rc := sqlite3VtabCallConnect(pParse, pTab);
+  { Connect itself succeeds; the bad-op probe stashed MISUSE in gApiConfigRc. }
+  ExpectEq(gApiConfigRc, SQLITE_MISUSE,
+    'T69 vtab_config(invalid op) → MISUSE');
+  rc := sqlite3VtabCallDestroy(db, 0, 'api_f');
+
+  { Drop the API module before close. }
+  rc := sqlite3_drop_modules(db, nil);
+  ExpectEq(rc, SQLITE_OK, 'T70 drop apimod');
+
+  sqlite3DbFree(db, pParse);
+end;
+
 var
   db: PTsqlite3;
   rc: i32;
@@ -765,6 +962,9 @@ begin
 
   { ---- Phase 6.bis.1d — per-statement transaction hooks ---- }
   TestVtabHooks_Run(db);
+
+  { ---- Phase 6.bis.1e — public API entry points ---- }
+  TestVtabApi_Run(db);
 
   rc := sqlite3_close_v2(db);
   ExpectEq(rc, SQLITE_OK, 'T16 close_v2');

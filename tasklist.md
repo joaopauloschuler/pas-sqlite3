@@ -20,6 +20,46 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.1e vtab.c public API entry points.**
+    Faithful ports of `sqlite3_declare_vtab` (vtab.c:811..917),
+    `sqlite3_vtab_on_conflict` (vtab.c:1317..1328), and
+    `sqlite3_vtab_config` (vtab.c:1335..1378) now live in
+    `src/passqlite3vtab.pas`.  Four new SQLITE_VTAB_* constants
+    (CONSTRAINT_SUPPORT/INNOCUOUS/DIRECTONLY/USES_ALL_SCHEMAS) added.
+    `passqlite3parser` joined `passqlite3vtab`'s uses clause to pull
+    in `sqlite3GetToken` + `TK_CREATE/TK_TABLE/TK_SPACE/TK_COMMENT`
+    + `sqlite3RunParser`; no cycle (parser → codegen, vtab → parser
+    → codegen).
+
+    `sqlite3_vtab_config` exposed as a single typed entry point
+    `(db, op, intArg)` instead of C varargs — same flavour as Phase
+    8.4's `sqlite3_db_config_int`.  Only CONSTRAINT_SUPPORT consumes
+    intArg; the three valueless ops ignore it.
+
+    `sqlite3_declare_vtab`'s column-graft branch is structurally
+    complete (mirrors vtab.c:869..896) but currently dormant: with
+    `sqlite3StartTable / AddColumn / EndTable` still Phase-7 stubs,
+    parsing `CREATE TABLE x(...)` lands `sParse.pNewTable=nil` and
+    we take a fallback path that flips `pCtx^.bDeclared:=1` without
+    populating `pTab^.aCol`.  When build.c ports land, the graft
+    branch lights up unchanged.  The hidden-column type-string scan
+    in vtab.c:653..682 (gated under 6.bis.1c) remains blocked on
+    the same dependency.
+
+    Pascal/cross-language deltas worth memoising:
+      * `TParse` has no top-level `disableTriggers` field — that bit
+        sits inside the packed `parseFlags: u32` (offset 40).  Use
+        `sParse.parseFlags := sParse.parseFlags or
+        PARSEFLAG_DisableTriggers`.
+      * `SQLITE_ROLLBACK / _FAIL / _REPLACE` are not re-exported from
+        `passqlite3types`; the `aMap` in `sqlite3_vtab_on_conflict`
+        inlines literal bytes (1, 4, 3, 2, 5) with a comment pointer
+        to sqlite.h:1133.  Replace with named constants once the
+        conflict-resolution codes get a clean home.
+
+    Gate `src/tests/TestVtab.pas` extended with T51..T70 — **141/141
+    PASS** (was 113/113).  No regressions across the 41 other gates.
+
   - **2026-04-25 — Phase 6.bis.1d vtab.c per-statement transaction hooks.**
     Faithful ports of vtab.c:970..1138 now live in
     `src/passqlite3vtab.pas`: `sqlite3VtabSync`, `sqlite3VtabRollback`,
@@ -2560,11 +2600,61 @@ Phase 5.9 depends on this being done first.
         `SQLITE_Defensive_Bit` to the central util/types unit, this
         local can collapse to a re-export.
 
-  - [ ] **6.bis.1e** API entry points: sqlite3_declare_vtab,
+  - [X] **6.bis.1e** API entry points: sqlite3_declare_vtab,
     sqlite3_vtab_on_conflict, sqlite3_vtab_config (vtab.c:811..1374).
-    declare_vtab parses CREATE TABLE text via the existing parser;
-    vtab_config takes varargs (split into typed Pascal entry points,
-    same approach as Phase 8.4 db_config).
+    DONE 2026-04-26.  All three live in `src/passqlite3vtab.pas`.
+    `sqlite3_vtab_config` exposed as a single typed entry point
+    `(db, op, intArg)` rather than C varargs (mirrors the Phase 8.4
+    `sqlite3_db_config_int` shape — only CONSTRAINT_SUPPORT actually
+    consumes intArg; the three valueless ops ignore it).
+    `passqlite3parser` added to `passqlite3vtab`'s uses clause for
+    `sqlite3GetToken` + `TK_CREATE/TK_TABLE/TK_SPACE/TK_COMMENT` +
+    `sqlite3RunParser`.  No cycle: parser → codegen, vtab → parser →
+    codegen.  Gate `src/tests/TestVtab.pas` extended with T51..T70 —
+    **141/141 PASS** (was 113/113).  No regressions across the 41
+    other gates.
+
+    Discoveries / dependencies:
+
+      * `sqlite3_declare_vtab`'s column-graft branch (vtab.c:869..896)
+        is structurally complete but currently dormant: parsing
+        `CREATE TABLE x(...)` produces `sParse.pNewTable=nil` because
+        `sqlite3StartTable / AddColumn / EndTable` in
+        `passqlite3codegen` are still Phase-7 stubs.  The function
+        therefore takes the `pNewTable=nil` fallback path which still
+        flips `pCtx^.bDeclared:=1` (so `vtabCallConstructor`'s "did
+        not declare schema" check passes) but does **not** populate
+        `pTab^.aCol`.  When the build.c ports land, the existing
+        graft branch lights up unchanged.  This is the same blocker
+        flagged by 6.bis.1c's hidden-column type-string scan
+        (vtab.c:653..682).
+
+      * Pascal naming pitfall: `TParse` does not have a top-level
+        `disableTriggers` field — it is one bit inside the packed
+        `parseFlags: u32` bitfield (offset 40).  Use
+        `sParse.parseFlags := sParse.parseFlags or
+        passqlite3codegen.PARSEFLAG_DisableTriggers` rather than
+        `sParse.disableTriggers := 1` (which is what vtab.c writes
+        in C and fails to compile in the Pascal port).
+
+      * Conflict-resolution constants gotcha: `SQLITE_ROLLBACK`,
+        `SQLITE_FAIL`, `SQLITE_REPLACE` are not (yet) re-exported
+        from `passqlite3types`.  `SQLITE_ABORT (4)` and
+        `SQLITE_IGNORE (2)` are present, but they are the *result-
+        code* / *auth-code* duplicates and just happen to share the
+        same numeric value as the conflict-resolution codes.  The
+        `aMap` in `sqlite3_vtab_on_conflict` inlines the literal
+        bytes (1, 4, 3, 2, 5) with a comment pointing back to
+        sqlite.h:1133 to avoid the ambiguity.  When the conflict-
+        resolution constants get a clean home in `passqlite3types`,
+        replace the literal bytes with the named constants.
+
+      * `sqlite3_vtab_on_conflict` does **not** acquire the db
+        mutex (vtab.c:1317 doesn't either; it only enters via the
+        `assert(db->vtabOnConflict ...)` invariant).  Tests T59..T63
+        write `db^.vtabOnConflict` directly between calls — that's
+        the only way to drive the function from a unit test without
+        a working xUpdate path.
 
   - [ ] **6.bis.1f** Function overload + writable + eponymous tables:
     sqlite3VtabOverloadFunction (vtab.c:1153), sqlite3VtabMakeWritable

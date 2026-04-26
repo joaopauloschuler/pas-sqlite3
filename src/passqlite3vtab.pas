@@ -58,7 +58,8 @@ uses
   passqlite3util,
   passqlite3os,
   passqlite3vdbe,
-  passqlite3codegen;
+  passqlite3codegen,
+  passqlite3parser;  { Phase 6.bis.1e: sqlite3GetToken + TK_* + sqlite3RunParser }
 
 type
   { ----- sqlite.h:7663..7666 — opaque-by-name types ----- }
@@ -156,6 +157,12 @@ const
   SQLITE_VTABRISK_Normal = 1;
   SQLITE_VTABRISK_High   = 2;
 
+  { sqlite.h:10273 — sqlite3_vtab_config op codes }
+  SQLITE_VTAB_CONSTRAINT_SUPPORT = 1;
+  SQLITE_VTAB_INNOCUOUS          = 2;
+  SQLITE_VTAB_DIRECTONLY         = 3;
+  SQLITE_VTAB_USES_ALL_SCHEMAS   = 4;
+
 { ============================================================
   Module registry
   ============================================================ }
@@ -243,6 +250,38 @@ function sqlite3VtabSavepoint(db: PTsqlite3; op, iSavepoint: i32): i32;
   the previous contents on both sides.  Exposed so 6.bis.2 in-tree vtabs
   can use the same wiring. }
 procedure sqlite3VtabImportErrmsg(pV: PVdbe; pVtab: PSqlite3Vtab);
+
+{ ============================================================
+  Phase 6.bis.1e — public API entry points (vtab.c:811..1374)
+  ============================================================ }
+
+{ vtab.c:811 — sqlite3_declare_vtab.  Called by an xCreate/xConnect
+  callback to specify the column layout of a virtual table.  The
+  zCreateTable string is parsed as a CREATE TABLE statement and the
+  resulting column list is grafted onto the active VtabCtx's pTab.
+
+  IMPORTANT: full column-list grafting requires sqlite3StartTable /
+  sqlite3AddColumn / sqlite3EndTable in passqlite3codegen, which are
+  still Phase-7 stubs.  Until those land, the parser produces a nil
+  sParse.pNewTable for "CREATE TABLE x(...)" and this function falls
+  back to flipping pCtx^.bDeclared (so vtabCallConstructor's "did not
+  declare schema" check passes) without populating pTab^.aCol.  The
+  hidden-column type-string scan (vtab.c:653..682) referenced from
+  6.bis.1c remains gated on pTab^.aCol being non-nil.  Tracked under
+  6.bis.1e in tasklist.md. }
+function sqlite3_declare_vtab(db: PTsqlite3; zCreateTable: PAnsiChar): i32; cdecl;
+
+{ vtab.c:1317 — return the ON CONFLICT resolution mode in effect for
+  an in-progress xUpdate.  Maps db^.vtabOnConflict (1..5) to one of
+  SQLITE_ROLLBACK / _ABORT / _FAIL / _IGNORE / _REPLACE. }
+function sqlite3_vtab_on_conflict(db: PTsqlite3): i32; cdecl;
+
+{ vtab.c:1335 — sqlite3_vtab_config.  C uses varargs; we follow the
+  Phase 8.4 db_config approach and expose a single function carrying
+  the int payload (only CONSTRAINT_SUPPORT actually consumes it; the
+  three valueless ops ignore intArg).  Must be called from inside an
+  xCreate / xConnect callback (i.e. while db^.pVtabCtx is non-nil). }
+function sqlite3_vtab_config(db: PTsqlite3; op: i32; intArg: i32): i32; cdecl;
 
 implementation
 
@@ -1019,6 +1058,185 @@ begin
     is ever attached, so pEpoTab is always nil and there is nothing to do. }
   Assert(pMod^.pEpoTab = nil,
     'sqlite3VtabEponymousTableClear: pEpoTab unexpectedly non-nil before 6.bis.1f');
+end;
+
+{ ============================================================
+  Phase 6.bis.1e — public API entry points (vtab.c:811..1374)
+  ============================================================ }
+
+function sqlite3_declare_vtab(db: PTsqlite3; zCreateTable: PAnsiChar): i32; cdecl;
+const
+  { vtab.c:819 — first two non-trivia tokens must be CREATE then TABLE. }
+  aKeyword: array[0..1] of u8 = (TK_CREATE, TK_TABLE);
+var
+  pCtx:    PVtabCtx;
+  rc:      i32;
+  pTab:    passqlite3codegen.PTable2;
+  sParse:  passqlite3codegen.TParse;
+  initBusy: i32;
+  i:       i32;
+  z:       PByte;
+  tokenType: i32;
+  pNew:    passqlite3codegen.PTable2;
+begin
+  rc := SQLITE_OK;
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if (sqlite3SafetyCheckOk(db) = 0) or (zCreateTable = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+{$ELSE}
+  if (db = nil) or (zCreateTable = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+{$ENDIF}
+
+  { Verify CREATE TABLE prefix (vtab.c:827..841). }
+  z := PByte(zCreateTable);
+  for i := 0 to High(aKeyword) do begin
+    repeat
+      tokenType := 0;
+      Inc(z, sqlite3GetToken(z, @tokenType));
+    until (tokenType <> TK_SPACE) and (tokenType <> TK_COMMENT);
+    if tokenType <> aKeyword[i] then begin
+      sqlite3ErrorWithMsg(db, SQLITE_ERROR, 'syntax error');
+      Result := SQLITE_ERROR; Exit;
+    end;
+  end;
+
+  sqlite3_mutex_enter(db^.mutex);
+  pCtx := PVtabCtx(db^.pVtabCtx);
+  if (pCtx = nil) or (pCtx^.bDeclared <> 0) then begin
+    sqlite3Error(db, SQLITE_MISUSE);
+    sqlite3_mutex_leave(db^.mutex);
+    Result := SQLITE_MISUSE; Exit;
+  end;
+
+  pTab := passqlite3codegen.PTable2(pCtx^.pTab);
+  Assert((pTab <> nil)
+    and (pTab^.eTabType = passqlite3codegen.TABTYP_VTAB),
+    'sqlite3_declare_vtab: pCtx^.pTab is not a vtab');
+
+  { Initialise a Parse object and run the parser in DECLARE_VTAB mode. }
+  FillChar(sParse, SizeOf(sParse), 0);
+  sParse.db          := db;
+  sParse.pOuterParse := db^.pParse;
+  db^.pParse         := @sParse;
+  sParse.eParseMode  := passqlite3codegen.PARSE_MODE_DECLARE_VTAB;
+  sParse.parseFlags  := sParse.parseFlags
+                       or passqlite3codegen.PARSEFLAG_DisableTriggers;
+  Assert(db^.init.busy = 0,
+    'sqlite3_declare_vtab: re-entered while loading the schema');
+  initBusy := db^.init.busy;
+  db^.init.busy := 0;
+  sParse.nQueryLoop := 1;
+
+  if passqlite3parser.sqlite3RunParser(@sParse, zCreateTable) = SQLITE_OK then begin
+    pNew := sParse.pNewTable;
+    if pNew = nil then begin
+      { CREATE TABLE parsing produces no Table object until the build.c
+        ports (sqlite3StartTable / AddColumn / EndTable) land in Phase 7.
+        Treat this as a successful bDeclared flip so vtabCallConstructor
+        accepts the constructor; column metadata grafting waits on Phase 7.
+        Tracked in tasklist.md under 6.bis.1e. }
+      pCtx^.bDeclared := 1;
+    end else begin
+      { Faithful column-graft branch (vtab.c:869..896).  Once
+        sqlite3StartTable populates pNewTable this branch becomes hot. }
+      if pTab^.aCol = nil then begin
+        pTab^.aCol     := pNew^.aCol;
+        pTab^.nCol     := pNew^.nCol;
+        pTab^.nNVCol   := pNew^.nCol;
+        pTab^.tabFlags := pTab^.tabFlags
+                         or (pNew^.tabFlags
+                             and (passqlite3codegen.TF_WithoutRowid
+                                  or passqlite3codegen.TF_NoVisibleRowid));
+        pNew^.nCol := 0;
+        pNew^.aCol := nil;
+        if pNew^.pIndex <> nil then begin
+          pTab^.pIndex := pNew^.pIndex;
+          pNew^.pIndex := nil;
+          pTab^.pIndex^.pTable := pTab;
+        end;
+      end;
+      pCtx^.bDeclared := 1;
+    end;
+  end else begin
+    sqlite3ErrorWithMsg(db, SQLITE_ERROR, sParse.zErrMsg);
+    sqlite3DbFree(db, sParse.zErrMsg);
+    sParse.zErrMsg := nil;
+    rc := SQLITE_ERROR;
+  end;
+  sParse.eParseMode := passqlite3codegen.PARSE_MODE_NORMAL;
+
+  if sParse.pVdbe <> nil then
+    passqlite3vdbe.sqlite3VdbeFinalize(sParse.pVdbe);
+  passqlite3codegen.sqlite3DeleteTable(db, sParse.pNewTable);
+  passqlite3codegen.sqlite3ParseObjectReset(@sParse);
+  db^.init.busy := initBusy;
+
+  Assert((rc and $FF) = rc, 'sqlite3_declare_vtab: rc has high bits set');
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+function sqlite3_vtab_on_conflict(db: PTsqlite3): i32; cdecl;
+const
+  { vtab.c:1318 — OE_Rollback..OE_Replace map to the public SQLITE_*
+    constants from sqlite.h:1133.  Inlined as bytes here because the
+    SQLITE_FAIL/_REPLACE/_ROLLBACK constants are not (yet) re-exported
+    from passqlite3types — these are the conflict-resolution codes,
+    distinct from the result codes of the same name.  Values match
+    sqlite.h: ROLLBACK=1, IGNORE=2, FAIL=3, ABORT=4, REPLACE=5. }
+  aMap: array[0..4] of u8 = (1, 4, 3, 2, 5);
+begin
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+{$ENDIF}
+  Assert((db^.vtabOnConflict >= 1) and (db^.vtabOnConflict <= 5),
+    'sqlite3_vtab_on_conflict: vtabOnConflict out of range');
+  Result := i32(aMap[db^.vtabOnConflict - 1]);
+end;
+
+function sqlite3_vtab_config(db: PTsqlite3; op: i32; intArg: i32): i32; cdecl;
+var
+  rc: i32;
+  p:  PVtabCtx;
+begin
+  rc := SQLITE_OK;
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+{$ENDIF}
+  sqlite3_mutex_enter(db^.mutex);
+  p := PVtabCtx(db^.pVtabCtx);
+  if p = nil then begin
+    rc := SQLITE_MISUSE;
+  end else begin
+    Assert((p^.pTab = nil)
+      or (passqlite3codegen.PTable2(p^.pTab)^.eTabType
+          = passqlite3codegen.TABTYP_VTAB),
+      'sqlite3_vtab_config: p^.pTab is not a vtab');
+    case op of
+      SQLITE_VTAB_CONSTRAINT_SUPPORT:
+        p^.pVTbl^.bConstraint := u8(intArg);
+      SQLITE_VTAB_INNOCUOUS:
+        p^.pVTbl^.eVtabRisk := SQLITE_VTABRISK_Low;
+      SQLITE_VTAB_DIRECTONLY:
+        p^.pVTbl^.eVtabRisk := SQLITE_VTABRISK_High;
+      SQLITE_VTAB_USES_ALL_SCHEMAS:
+        p^.pVTbl^.bAllSchemas := 1;
+    else
+      rc := SQLITE_MISUSE;
+    end;
+  end;
+
+  if rc <> SQLITE_OK then sqlite3Error(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
 end;
 
 end.
