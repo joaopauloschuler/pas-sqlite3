@@ -304,6 +304,250 @@ begin
   Check('ADJ2 tpl nOut adjusted down',       tpl.nOut <= 4);
 end;
 
+{ ----- estLog (where.c:700) ----- }
+
+procedure TestEstLog;
+begin
+  Check('EL1 estLog(0)=0',          estLog(0) = 0);
+  Check('EL2 estLog(10)=0',         estLog(10) = 0);
+  Check('EL3 estLog(11)>0',         estLog(11) > 0);
+  Check('EL4 estLog(100) sane',     estLog(100) >= 30);  { LogEst(100)-33 ≈ 33 }
+end;
+
+{ ----- sqlite3ExprIsLikeOperator + estLikePatternLength
+        (whereexpr.c:353, where.c:2988) ----- }
+
+procedure TestExprIsLikeOperator;
+var
+  e:        TExpr;
+  zLike:    array[0..7] of AnsiChar;
+  zGlob:    array[0..7] of AnsiChar;
+  zMatch:   array[0..7] of AnsiChar;
+  zRegexp:  array[0..7] of AnsiChar;
+  zFoo:     array[0..7] of AnsiChar;
+begin
+  StrCopy(zLike,   'like');
+  StrCopy(zGlob,   'GLOB');     { case-insensitive }
+  StrCopy(zMatch,  'match');
+  StrCopy(zRegexp, 'regexp');
+  StrCopy(zFoo,    'foo');
+
+  FillChar(e, SizeOf(e), 0);
+  e.op    := TK_FUNCTION;
+  e.flags := 0;     { no EP_IntValue }
+  e.u.zToken := zLike;
+  Check('LO1 like  → 65', sqlite3ExprIsLikeOperator(@e) = 65);
+
+  e.u.zToken := zGlob;
+  Check('LO2 GLOB  → 66', sqlite3ExprIsLikeOperator(@e) = 66);
+
+  e.u.zToken := zMatch;
+  Check('LO3 match → 64', sqlite3ExprIsLikeOperator(@e) = 64);
+
+  e.u.zToken := zRegexp;
+  Check('LO4 regexp → 67', sqlite3ExprIsLikeOperator(@e) = 67);
+
+  e.u.zToken := zFoo;
+  Check('LO5 other → 0',  sqlite3ExprIsLikeOperator(@e) = 0);
+end;
+
+procedure TestEstLikePatternLength;
+var
+  e:        TExpr;
+  zPlain:   array[0..15] of AnsiChar;
+  zLikePat: array[0..15] of AnsiChar;
+  zGlobPat: array[0..15] of AnsiChar;
+  zClass:   array[0..15] of AnsiChar;
+begin
+  StrCopy(zPlain,   'hello');         { 5 literal chars, no wildcards }
+  StrCopy(zLikePat, 'ab_cd%');        { LIKE: 'ab','cd' = 4 literal chars }
+  StrCopy(zGlobPat, 'ab*cd?ef');      { GLOB: 'ab','cd','ef' = 6 literal chars }
+  StrCopy(zClass,   'a[xy]z');        { GLOB: 'a' + ']' + 'z' literals = 3
+                                        (mirrors C: pattern walker counts the
+                                        terminating ']' once it leaves the class) }
+
+  FillChar(e, SizeOf(e), 0);
+  e.op := TK_STRING;
+  e.u.zToken := zPlain;
+  Check('LP1 plain LIKE',   estLikePatternLength(@e, 1) = 5);
+  Check('LP2 plain GLOB',   estLikePatternLength(@e, 0) = 5);
+
+  e.u.zToken := zLikePat;
+  Check('LP3 LIKE wildcards', estLikePatternLength(@e, 1) = 4);
+
+  e.u.zToken := zGlobPat;
+  Check('LP4 GLOB wildcards', estLikePatternLength(@e, 0) = 6);
+
+  e.u.zToken := zClass;
+  Check('LP5 GLOB char class', estLikePatternLength(@e, 0) = 3);
+end;
+
+{ ----- whereLoopOutputAdjust (where.c:3037) -----
+
+  Build a minimal pWInfo + pWC + pTabList with one TSrcItem and a small
+  array of WhereTerms allocated in a local buffer.  Drive the function
+  end-to-end and assert nOut/wsFlags/wtFlags transitions. }
+
+type
+  TSrcListBuf = record
+    hdr:  TSrcList;
+    item: TSrcItem;
+  end;
+
+procedure SeedTermBase(pT: PWhereTerm; mask: Bitmask);
+begin
+  FillChar(pT^, SizeOf(TWhereTerm), 0);
+  pT^.iParent    := -1;
+  pT^.prereqAll  := mask;
+  pT^.truthProb  := 1;          { positive: heuristic path }
+  pT^.eOperator  := 0;
+  pT^.wtFlags    := 0;
+end;
+
+procedure TestOutputAdjust;
+var
+  db:       PTsqlite3;
+  rc:       i32;
+  parse:    TParse;
+  wInfoBuf: array[0..1023] of u8;
+  pWInfo:   PWhereInfo;
+  src:      TSrcListBuf;
+  pWC:      PWhereClause;
+  loop:     TWhereLoop;
+  terms:    array[0..3] of TWhereTerm;
+  pRight:   TExpr;
+  pTermExp: TExpr;
+  pNullExp: TExpr;       { generic non-nil pExpr for terms that should
+                           hit only the H1 (-1) path }
+  before:   i16;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('OUT open', rc = SQLITE_OK);
+
+  FillChar(parse,    SizeOf(parse),    0);
+  parse.db := db;
+
+  FillChar(wInfoBuf, SizeOf(wInfoBuf), 0);
+  pWInfo := PWhereInfo(@wInfoBuf[0]);
+  pWInfo^.pParse := @parse;
+
+  FillChar(src, SizeOf(src), 0);
+  src.hdr.nSrc        := 1;
+  src.item.fg.jointype := 0;     { plain INNER }
+  pWInfo^.pTabList    := @src.hdr;
+
+  pWC := @pWInfo^.sWC;
+  pWC^.pWInfo := pWInfo;
+  pWC^.a      := @pWC^.aStatic[0];
+  pWC^.nTerm  := 1;
+  pWC^.nBase  := 1;
+
+  { Generic pExpr for H1-only terms (op=TK_NULL → no H2 / H3 fallthrough). }
+  FillChar(pNullExp, SizeOf(pNullExp), 0);
+  pNullExp.op    := TK_NULL;
+  pNullExp.flags := 0;
+
+  { Test OUT1 — generic predicate not served by index → nOut -= 1.
+    Term independent of every other table; truthProb=1 forces heuristic path. }
+  FillChar(loop, SizeOf(loop), 0);
+  whereLoopInit(@loop);
+  loop.iTab     := 0;
+  loop.maskSelf := $0001;
+  loop.prereq   := $0000;
+  loop.wsFlags  := 0;
+  loop.nOut     := 20;
+  loop.nLTerm   := 0;            { nothing in aLTerm[] }
+
+  SeedTermBase(@terms[0], $0001); { prereqAll = maskSelf so the term hits us }
+  terms[0].pExpr := @pNullExp;
+  pWC^.a      := @terms[0];
+  before := loop.nOut;
+  whereLoopOutputAdjust(pWC, @loop, 100);
+  Check('OUT1 H1 generic -1',     loop.nOut = before - 1);
+  { Self-cull also fires: prereqAll == maskSelf, eOperator=0, jointype=0. }
+  Check('OUT1 SELFCULL set',      (loop.wsFlags and WHERE_SELFCULL) <> 0);
+
+  { Test OUT2 — TERM_VIRTUAL skipped entirely. }
+  FillChar(loop, SizeOf(loop), 0);
+  whereLoopInit(@loop);
+  loop.iTab     := 0;
+  loop.maskSelf := $0001;
+  loop.nOut     := 20;
+  SeedTermBase(@terms[0], $0001);
+  terms[0].wtFlags := TERM_VIRTUAL;
+  before := loop.nOut;
+  whereLoopOutputAdjust(pWC, @loop, 100);
+  Check('OUT2 virtual skipped',   loop.nOut = before);
+
+  { Test OUT3 — H2 small-constant equality:
+    eOperator=WO_EQ, pRight is integer 0  → iReduce=10,
+    nOut capped at nRow - iReduce = 100 - 10 = 90, TERM_HEURTRUTH set. }
+  FillChar(loop, SizeOf(loop), 0);
+  whereLoopInit(@loop);
+  loop.iTab     := 0;
+  loop.maskSelf := $0001;
+  loop.nOut     := 200;          { force the cap to bite }
+
+  FillChar(pRight,   SizeOf(pRight),   0);
+  pRight.op    := TK_INTEGER;
+  pRight.flags := EP_IntValue;
+  pRight.u.iValue := 0;          { in {-1,0,1} → small bucket }
+
+  FillChar(pTermExp, SizeOf(pTermExp), 0);
+  pTermExp.op    := TK_EQ;
+  pTermExp.pRight := @pRight;
+
+  SeedTermBase(@terms[0], $0001);
+  terms[0].eOperator := WO_EQ;
+  terms[0].pExpr     := @pTermExp;
+  whereLoopOutputAdjust(pWC, @loop, 100);
+  Check('OUT3 H2 small-const cap',  loop.nOut = 100 - 10);
+  Check('OUT3 TERM_HEURTRUTH set',  (terms[0].wtFlags and TERM_HEURTRUTH) <> 0);
+
+  { Test OUT4 — H2 large constant (k=42) → iReduce=20. }
+  FillChar(loop, SizeOf(loop), 0);
+  whereLoopInit(@loop);
+  loop.iTab     := 0;
+  loop.maskSelf := $0001;
+  loop.nOut     := 200;
+  pRight.u.iValue := 42;
+  SeedTermBase(@terms[0], $0001);
+  terms[0].eOperator := WO_EQ;
+  terms[0].pExpr     := @pTermExp;
+  whereLoopOutputAdjust(pWC, @loop, 100);
+  Check('OUT4 H2 large-const cap',  loop.nOut = 100 - 20);
+
+  { Test OUT5 — term IS served by index (in aLTerm) → not adjusted. }
+  FillChar(loop, SizeOf(loop), 0);
+  whereLoopInit(@loop);
+  loop.iTab     := 0;
+  loop.maskSelf := $0001;
+  loop.nOut     := 25;
+  SeedTermBase(@terms[0], $0001);
+  terms[0].pExpr := @pNullExp;
+  loop.aLTerm[0] := @terms[0];
+  loop.nLTerm    := 1;
+  before := loop.nOut;
+  whereLoopOutputAdjust(pWC, @loop, 100);
+  Check('OUT5 served-by-index untouched', loop.nOut = before);
+
+  { Test OUT6 — application-supplied likelihood() (truthProb<=0):
+    nOut += truthProb (negative) instead of -1 heuristic. }
+  FillChar(loop, SizeOf(loop), 0);
+  whereLoopInit(@loop);
+  loop.iTab     := 0;
+  loop.maskSelf := $0001;
+  loop.nOut     := 50;
+  SeedTermBase(@terms[0], $0001);
+  terms[0].pExpr := @pNullExp;
+  terms[0].truthProb := -7;
+  before := loop.nOut;
+  whereLoopOutputAdjust(pWC, @loop, 100);
+  Check('OUT6 app-truthProb',    loop.nOut = before + (-7));
+
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -311,6 +555,10 @@ begin
   TestFindLesser;
   TestInsert;
   TestAdjustCost;
+  TestEstLog;
+  TestExprIsLikeOperator;
+  TestEstLikePatternLength;
+  TestOutputAdjust;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

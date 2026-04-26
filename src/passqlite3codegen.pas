@@ -1592,6 +1592,15 @@ procedure whereLoopInit(p: PWhereLoop);
 procedure whereLoopClear(db: PTsqlite3; p: PWhereLoop);
 procedure whereLoopDelete(db: PTsqlite3; p: PWhereLoop);
 
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — output-row count adjustment +
+  helpers (where.c:700, 2951..3126, whereexpr.c:353).  Pure cost / pattern-
+  length arithmetic; no codegen. }
+function  estLog(N: i16): i16; inline;
+function  estLikePatternLength(p: PExpr; eCode: u16): i32;
+function  sqlite3ExprIsLikeOperator(const pExpr: PExpr): i32;
+procedure whereLoopOutputAdjust(pWC: PWhereClause; pLoop: PWhereLoop;
+                                nRow: i16);
+
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
 // ---------------------------------------------------------------------------
@@ -7507,6 +7516,230 @@ begin
       p^.u.btree.pIndex := nil;
   end;
   Result := rc;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.d sub-progress) — output-row count adjustment.
+
+  Faithful port of where.c:700 (estLog), where.c:2951..2998
+  (exprNodePatternLengthEst + estLikePatternLength), whereexpr.c:353..372
+  (sqlite3ExprIsLikeOperator), and where.c:3037..3126 (whereLoopOutputAdjust).
+
+  whereLoopOutputAdjust runs once per template loop, after the loop's WHERE
+  terms have been bound by an index, to discount nOut for every WHERE-clause
+  predicate the chosen index does NOT serve.  Three heuristics fire (verbatim
+  from upstream):
+
+    H1 — generic predicate: nOut -= 1 (≈93.75%) per leftover term unless the
+         application supplied an explicit truthProb via likelihood().
+    H2 — `x==EXPR`: cap iReduce at 10 (boolean / -1/0/1 literal) or 20 (other
+         constant); flag the term TERM_HEURTRUTH so it is not double-counted.
+    H3 — LIKE/GLOB/MATCH/REGEXP: subtract 2*pattern-length LogEst points.
+         estLikePatternLength walks the pattern once and remembers the longest
+         literal run between wildcards; longer literals → tighter selectivity.
+
+  No interaction with codegen — purely the planner's nOut book-keeping ahead of
+  whereLoopAddBtreeIndex (step 11g.2.d-iii) and wherePathSolver (step 11g.2.d-x).
+
+  TERM_HIGHTRUTH is compiled out (the project does not enable
+  SQLITE_ENABLE_STAT4) so the `tag-20200224-1` guard collapses to a no-op —
+  matching upstream behaviour for non-STAT4 builds.
+  =========================================================================== }
+
+{ where.c:700.  N≤10 → 0; otherwise sqlite3LogEst(N) - 33 (== logest(N/10)). }
+function estLog(N: i16): i16; inline;
+begin
+  if N <= 10 then Exit(0);
+  Result := i16(sqlite3LogEst(u64(N)) - 33);
+end;
+
+{ where.c:2951..2977.  Walker callback: longest TK_STRING literal run, ignoring
+  wildcards.  eCode == 1 ⇒ LIKE (% / _); eCode == 0 ⇒ GLOB (* / ? / [...]).
+  Stored in pWalker^.u.sz (max across the whole walk). }
+function exprNodePatternLengthEst(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  sz:           i32;
+  z:            PByte;
+  c, c1, c2, c3: u8;
+begin
+  if pExpr^.op = TK_STRING then
+  begin
+    sz := 0;
+    z  := PByte(pExpr^.u.zToken);
+    if pWalker^.eCode <> 0 then
+    begin
+      c1 := u8(Ord('%'));
+      c2 := u8(Ord('_'));
+      c3 := 0;
+    end else begin
+      c1 := u8(Ord('*'));
+      c2 := u8(Ord('?'));
+      c3 := u8(Ord('['));
+    end;
+    if z <> nil then
+    begin
+      while True do
+      begin
+        c := z^;
+        if c = 0 then Break;
+        Inc(z);
+        if c = c3 then
+        begin
+          if z^ <> 0 then Inc(z);
+          while (z^ <> 0) and (z^ <> u8(Ord(']'))) do Inc(z);
+        end
+        else if (c <> c1) and (c <> c2) then
+          Inc(sz);
+      end;
+    end;
+    if sz > pWalker^.u.sz then pWalker^.u.sz := sz;
+  end;
+  Result := WRC_Continue;
+end;
+
+{ where.c:2988..2998.  Walk p, return the maximum literal run length.
+  eCode encodes pattern dialect (0=GLOB, 1=LIKE). }
+function estLikePatternLength(p: PExpr; eCode: u16): i32;
+var
+  w: TWalker;
+begin
+  FillChar(w, SizeOf(w), 0);
+  w.u.sz            := 0;
+  w.eCode           := eCode;
+  w.xExprCallback   := @exprNodePatternLengthEst;
+  w.xSelectCallback := @sqlite3SelectWalkFail;
+  { xSelectCallback2 stays nil — only used in SQLITE_DEBUG builds, harmless. }
+  sqlite3WalkExpr(@w, p);
+  Result := w.u.sz;
+end;
+
+{ whereexpr.c:353..372.  TK_FUNCTION whose name is one of MATCH/GLOB/LIKE/REGEXP
+  ⇒ return the corresponding SQLITE_INDEX_CONSTRAINT_xxx; else 0. }
+function sqlite3ExprIsLikeOperator(const pExpr: PExpr): i32;
+begin
+  Assert(pExpr^.op = TK_FUNCTION);
+  Assert(not ExprHasProperty(pExpr, EP_IntValue));
+  if sqlite3StrICmp(pExpr^.u.zToken, 'match')  = 0 then Exit(64); { MATCH  }
+  if sqlite3StrICmp(pExpr^.u.zToken, 'glob')   = 0 then Exit(66); { GLOB   }
+  if sqlite3StrICmp(pExpr^.u.zToken, 'like')   = 0 then Exit(65); { LIKE   }
+  if sqlite3StrICmp(pExpr^.u.zToken, 'regexp') = 0 then Exit(67); { REGEXP }
+  Result := 0;
+end;
+
+{ where.c:3037..3126.  See banner above for the heuristic catalogue. }
+procedure whereLoopOutputAdjust(pWC: PWhereClause; pLoop: PWhereLoop;
+                                nRow: i16);
+label NextTerm;
+var
+  pTerm, pX:    PWhereTerm;
+  notAllowed:   Bitmask;
+  i, j:         i32;
+  iReduce:      i16;     { LogEst }
+  pOpExpr:      PExpr;
+  pRight:       PExpr;
+  pRHS:         PExpr;
+  k:            i32;
+  eOp:          i32;
+  szPattern:    i32;
+  jt:           u8;
+begin
+  notAllowed := not (pLoop^.prereq or pLoop^.maskSelf);
+  iReduce    := 0;
+  Assert((pLoop^.wsFlags and WHERE_AUTO_INDEX) = 0);
+
+  i := pWC^.nBase;
+  pTerm := pWC^.a;
+  while i > 0 do
+  begin
+    Assert(pTerm <> nil);
+    if (pTerm^.prereqAll and notAllowed)        <> 0 then goto NextTerm;
+    if (pTerm^.prereqAll and pLoop^.maskSelf)   =  0 then goto NextTerm;
+    if (pTerm^.wtFlags   and TERM_VIRTUAL)      <> 0 then goto NextTerm;
+
+    { Is pTerm one of the index-served terms?  Walk pLoop^.aLTerm[]. }
+    j := i32(pLoop^.nLTerm) - 1;
+    while j >= 0 do
+    begin
+      pX := pLoop^.aLTerm[j];
+      if pX <> nil then
+      begin
+        if pX = pTerm then Break;
+        if (pX^.iParent >= 0)
+          and (@(pWC^.a[pX^.iParent]) = pTerm) then Break;
+      end;
+      Dec(j);
+    end;
+
+    if j < 0 then
+    begin
+      sqlite3ProgressCheck(pWC^.pWInfo^.pParse);
+
+      { Self-cull marker: every prereq served by this very table, AND the
+        leftover term either is a direct comparison op (low 6 bits of
+        eOperator non-zero) OR the table is not on the dangling side of an
+        outer join (JT_LEFT|JT_LTORJ both clear). }
+      if pLoop^.maskSelf = pTerm^.prereqAll then
+      begin
+        jt := SrcListItems(pWC^.pWInfo^.pTabList)[pLoop^.iTab].fg.jointype;
+        if ((pTerm^.eOperator and $3F) <> 0)
+          or ((jt and (JT_LEFT or JT_LTORJ)) = 0) then
+        begin
+          pLoop^.wsFlags := pLoop^.wsFlags or WHERE_SELFCULL;
+        end;
+      end;
+
+      if pTerm^.truthProb <= 0 then
+      begin
+        { Application-provided likelihood() hint. }
+        pLoop^.nOut := i16(pLoop^.nOut + pTerm^.truthProb);
+      end else begin
+        pOpExpr := pTerm^.pExpr;
+        pLoop^.nOut := i16(pLoop^.nOut - 1);             { H1: -1 LogEst }
+
+        if ((pTerm^.eOperator and (WO_EQ or WO_IS)) <> 0)
+          and ((pTerm^.wtFlags and TERM_HEURTRUTH) = 0) { TERM_HIGHTRUTH=0 here }
+        then begin
+          pRight := pOpExpr^.pRight;
+          k := 0;
+          if (sqlite3ExprIsInteger(pRight, @k, nil) <> 0)
+            and (k >= -1) and (k <= 1) then
+          begin
+            k := 10;
+          end else begin
+            k := 20;
+          end;
+          if iReduce < k then
+          begin
+            pTerm^.wtFlags := pTerm^.wtFlags or TERM_HEURTRUTH;
+            iReduce := i16(k);
+          end;
+        end
+        else if ExprHasProperty(pOpExpr, EP_InfixFunc)
+            and (pOpExpr^.op = TK_FUNCTION) then
+        begin
+          Assert(ExprUseXList(pOpExpr));
+          Assert(pOpExpr^.x.pList^.nExpr >= 2);
+          eOp := sqlite3ExprIsLikeOperator(pOpExpr);
+          if eOp > 0 then
+          begin
+            pRHS := ExprListItems(pOpExpr^.x.pList)[0].pExpr;
+            { eCode = 1 (LIKE) iff op == SQLITE_INDEX_CONSTRAINT_LIKE (65). }
+            if eOp = 65 then eOp := 1 else eOp := 0;
+            szPattern := estLikePatternLength(pRHS, u16(eOp));
+            if szPattern > 0 then
+              pLoop^.nOut := i16(pLoop^.nOut - szPattern * 2);
+          end;
+        end;
+      end;
+    end;
+
+    NextTerm:
+    Inc(pTerm);
+    Dec(i);
+  end;
+
+  if pLoop^.nOut > nRow - iReduce then
+    pLoop^.nOut := i16(nRow - iReduce);
 end;
 
 { Helper for exprIsDeterministic (where.c:6445).  TK_FUNCTION nodes without

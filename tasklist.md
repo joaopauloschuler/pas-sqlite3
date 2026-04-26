@@ -143,6 +143,29 @@ Important: At the end of this document, please find:
     sub-splitting once 11g.2.a..c reveal field-shape requirements.
     Defer `xBestIndex`-style virtual-table costing until vtab corpus
     is exercised.
+    - [X] Output-row count adjustment — `estLog` (where.c:700),
+      `exprNodePatternLengthEst` + `estLikePatternLength`
+      (where.c:2951..2998), `sqlite3ExprIsLikeOperator`
+      (whereexpr.c:353..372), and the main `whereLoopOutputAdjust`
+      (where.c:3037..3126).  Pure cost arithmetic — runs once per
+      template loop to discount nOut for the leftover WHERE-clause
+      predicates that the chosen index does NOT serve.  Three
+      heuristics fire verbatim from upstream: H1 generic (-1 LogEst),
+      H2 `x==EXPR` cap (iReduce ≤ 10 for boolean / -1/0/1 literal,
+      ≤ 20 otherwise; tags TERM_HEURTRUTH), H3 LIKE/GLOB/MATCH/REGEXP
+      pattern-length discount (-2*length LogEst).  TERM_HIGHTRUTH
+      collapses to 0 (project does not enable SQLITE_ENABLE_STAT4).
+      Self-culling marker (WHERE_SELFCULL) lit when every prereq is
+      served by the loop's own table and the predicate is a
+      comparison op (or the table is on the inner side of any outer
+      join).  Gate: `TestWherePlanner.pas` (71/71): EL1..EL4 (estLog
+      thresholds), LO1..LO5 (case-insensitive LIKE/GLOB/MATCH/REGEXP
+      → SQLITE_INDEX_CONSTRAINT_xxx), LP1..LP5 (literal-run length
+      across LIKE / GLOB wildcards including the GLOB `[...]` class
+      that mirrors the C walker counting the closing `]`),
+      OUT1..OUT6 (H1 generic -1 + SELFCULL, TERM_VIRTUAL skipped, H2
+      small-const → cap at nRow-10, H2 large-const → cap at nRow-20,
+      term in aLTerm[] not adjusted, app-supplied truthProb path).
     - [X] Leaf bookkeeping helpers — `whereOrMove`, `whereOrInsert`
       (where.c:196..239), `whereLoopCheaperProperSubset`,
       `whereLoopAdjustCost`, `whereLoopFindLesser`, `whereLoopInsert`
