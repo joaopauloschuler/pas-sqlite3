@@ -105,9 +105,31 @@ remains `history.md`.  This file is the punch list.
       branch with the real `OptimizationEnabled(SQLITE_DistinctOpt)` →
       `WHERE_DISTINCT_UNIQUE` rule.  No corpus delta yet (DISTINCT is
       not exercised by the 10-row gate; the prologue still tears down
-      and returns nil at the end).  Outstanding inside this sub-bullet:
+      and returns nil at the end).
+      Sub-progress 2026-04-26 (cont): ported the WHERE-scanner trio
+      `whereScanInit` / `whereScanInitIndexExpr` / `whereScanNext`
+      (where.c:351..522) and the public `sqlite3WhereFindTerm`
+      (where.c:549..574).  Lives in codegen.pas immediately before
+      `sqlite3WhereExprAnalyze`.  Faithful 1:1 port of the C control
+      flow, including the multi-level WhereClause walk via `pOuter`
+      and the WO_EQUIV transitivity chain.  Four helpers consumed
+      but not yet ported are stubbed with explicit gates documented
+      in the banner: `whereRightSubexprIsColumn` (only reached via
+      WO_EQUIV — exprAnalyze never sets it today),
+      `sqlite3ExprCompareSkip` (only reached for XN_EXPR-indexed
+      columns), `sqlite3IndexAffinityOk` (only when zCollName<>nil,
+      i.e. pIdx<>nil), `indexInAffinityOk` (only for WO_IN terms).
+      Unblocks `whereShortCut` and the per-loop scanner consumers
+      (~6 call sites in where.c) once exprAnalyze starts populating
+      WhereTerm fields.  No corpus delta — until
+      `sqlite3WhereExprAnalyze` populates eOperator / leftCursor /
+      u.x.leftColumn / prereqRight, the scanner returns nil for every
+      term.  TestExplainParity remains 2 PASS / 8 DIVERGE / 0 ERROR.
+      Outstanding inside this sub-bullet:
       planner pick proper (whereShortCut shape probe), per-loop
-      codegen, OP_NotExists emission.
+      codegen, OP_NotExists emission, plus a pre-req minimal
+      `exprAnalyze` body for TK_EQ rowid terms (folded into
+      11g.2.c work).
     - [ ] Implement the loop-tail half of `sqlite3WhereEnd`
       (Goto continue + Resolve break label + cursor close).
     - [ ] Re-enable productive tails in `sqlite3DeleteFrom`

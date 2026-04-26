@@ -1541,6 +1541,8 @@ function  sqlite3WhereRealloc(pWInfo: PWhereInfo; pOld: Pointer; nByte: u64): Po
 function  sqlite3WhereExprUsageNN(pMaskSet: PWhereMaskSet; p: PExpr): Bitmask;
 function  sqlite3WhereExprUsage(pMaskSet: PWhereMaskSet; p: PExpr): Bitmask;
 function  sqlite3WhereExprListUsage(pMaskSet: PWhereMaskSet; pList: PExprList): Bitmask;
+function  sqlite3WhereFindTerm(pWC: PWhereClause; iCur: i32; iColumn: i32;
+  notReady: Bitmask; op: u32; pIdx: PIndex2): PWhereTerm;
 procedure sqlite3WhereExprAnalyze(pTabList: PSrcList; pWC: PWhereClause);
 procedure sqlite3WhereTabFuncArgs(pParse: PParse; pItem: PSrcItem; pWC: PWhereClause);
 procedure sqlite3WhereAddLimit(pWC: PWhereClause; p: PSelect);
@@ -5542,6 +5544,283 @@ begin
   end else if ExprUseXList(p) and (p^.x.pList <> nil) then
     mask := mask or sqlite3WhereExprListUsage(pMaskSet, p^.x.pList);
   Result := mask;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.b sub-progress) — whereScanInit / whereScanNext /
+  sqlite3WhereFindTerm.
+
+  Faithful port of where.c:351..574.  The scanner walks a WhereClause looking
+  for terms of shape "X <op> <expr>" against (iCur, iColumn) — used by the
+  whereShortCut planner shortcut and by the main loop builder when probing
+  for usable equality / range constraints.
+
+  Helpers consumed but not yet ported (the call sites are gated so the rowid-
+  EQ shape this slice gates on never reaches them):
+    * sqlite3IndexAffinityOk — only invoked when pScan^.zCollName <> nil,
+      which requires pIdx <> nil.  whereShortCut's first call passes
+      pIdx=nil, so zCollName stays nil and this guard never fires.
+    * indexInAffinityOk — only invoked when (eOperator and WO_IN) <> 0;
+      WO_IN is not produced by sqlite3WhereSplit's current minimal body
+      (terms are tagged eOperator=0 today; full population lands with
+      exprAnalyze in 11g.2.c).
+    * sqlite3ExprCompareSkip — only invoked when iColumn=XN_EXPR (index on
+      expression); not exercised by the rowid-EQ shape.
+    * whereRightSubexprIsColumn — used to grow the WO_EQUIV transitivity
+      chain.  exprAnalyze never sets WO_EQUIV today, so the chain stays at
+      length 1 and this branch is unreachable.
+
+  Stubs are provided for these so the port type-checks and compiles.  When
+  exprAnalyze starts populating eOperator / leftCursor / u.x.leftColumn /
+  prereqRight (11g.2.c), the scanner becomes productive automatically. }
+
+function whereRightSubexprIsColumn(p: PExpr): PExpr; forward;
+function sqlite3ExprCompareSkip(pA: PExpr; pB: PExpr; iTab: i32): i32; forward;
+function sqlite3IndexAffinityOk(pX: PExpr; idxaff: AnsiChar): i32; forward;
+function indexInAffinityOk(pParse: PParse; pTerm: PWhereTerm;
+  idxaff: AnsiChar): PAnsiChar; forward;
+
+const
+  WhereStrBINARY: PAnsiChar = 'BINARY';
+
+function whereScanNext(pScan: PWhereScan): PWhereTerm;
+var
+  iCur:      i32;
+  iColumn:   i16;
+  pX:        PExpr;
+  pWC:       PWhereClause;
+  pTerm:     PWhereTerm;
+  pTermArr:  PWhereTerm;
+  k:         i32;
+  j:         i32;
+  zCollName: PAnsiChar;
+  pPrs:      PParse;
+  pColl:     Pointer;
+begin
+  k := pScan^.k;
+  Assert(pScan^.iEquiv <= pScan^.nEquiv);
+  pWC := pScan^.pWC;
+  while True do
+  begin
+    iColumn := pScan^.aiColumn[pScan^.iEquiv - 1];
+    iCur    := pScan^.aiCur[pScan^.iEquiv - 1];
+    Assert(pWC <> nil);
+    Assert(iCur >= 0);
+    repeat
+      pTermArr := pWC^.a;
+      while k < pWC^.nTerm do
+      begin
+        pTerm := @pTermArr[k];
+        Assert(((pTerm^.eOperator and (WO_OR or WO_AND)) = 0)
+               or (pTerm^.leftCursor < 0));
+        if (pTerm^.leftCursor = iCur)
+           and (pTerm^.u.leftColumn = i32(iColumn))
+           and ((iColumn <> XN_EXPR)
+                or (sqlite3ExprCompareSkip(pTerm^.pExpr^.pLeft,
+                                            pScan^.pIdxExpr, iCur) = 0))
+           and ((pScan^.iEquiv <= 1)
+                or (not ExprHasProperty(pTerm^.pExpr, EP_OuterON))) then
+        begin
+          if ((pTerm^.eOperator and WO_EQUIV) <> 0)
+             and (pScan^.nEquiv < Length(pScan^.aiCur)) then
+          begin
+            pX := whereRightSubexprIsColumn(pTerm^.pExpr);
+            if pX <> nil then
+            begin
+              j := 0;
+              while j < pScan^.nEquiv do
+              begin
+                if (pScan^.aiCur[j] = pX^.iTable)
+                   and (pScan^.aiColumn[j] = pX^.iColumn) then
+                  Break;
+                Inc(j);
+              end;
+              if j = pScan^.nEquiv then
+              begin
+                pScan^.aiCur[j]    := pX^.iTable;
+                pScan^.aiColumn[j] := pX^.iColumn;
+                Inc(pScan^.nEquiv);
+              end;
+            end;
+          end;
+          if (pTerm^.eOperator and pScan^.opMask) <> 0 then
+          begin
+            { Verify affinity / collating sequence (rowid path skips both). }
+            if (pScan^.zCollName <> nil)
+               and ((pTerm^.eOperator and WO_ISNULL) = 0) then
+            begin
+              pPrs := pWC^.pWInfo^.pParse;
+              pX   := pTerm^.pExpr;
+              if (pTerm^.eOperator and WO_IN) <> 0 then
+              begin
+                zCollName := indexInAffinityOk(pPrs, pTerm, pScan^.idxaff);
+                if zCollName = nil then
+                begin
+                  Inc(k);
+                  Continue;
+                end;
+              end
+              else
+              begin
+                if sqlite3IndexAffinityOk(pX, pScan^.idxaff) = 0 then
+                begin
+                  Inc(k);
+                  Continue;
+                end;
+                Assert(pX^.pLeft <> nil);
+                pColl := sqlite3ExprCompareCollSeq(pPrs, pX);
+                if pColl <> nil then
+                  zCollName := PTCollSeq(pColl)^.zName
+                else
+                  zCollName := WhereStrBINARY;
+              end;
+              if sqlite3StrICmp(zCollName, pScan^.zCollName) <> 0 then
+              begin
+                Inc(k);
+                Continue;
+              end;
+            end;
+            { Skip "X = Y" form when both sides reference the same column —
+              this is the {iCur,iColumn}=={iCur,iColumn} self-equality case
+              that exprAnalyze emits as a transitivity placeholder. }
+            if ((pTerm^.eOperator and (WO_EQ or WO_IS)) <> 0) then
+            begin
+              pX := pTerm^.pExpr^.pRight;
+              if (pX <> nil) and (pX^.op = TK_COLUMN)
+                 and (pX^.iTable = pScan^.aiCur[0])
+                 and (pX^.iColumn = pScan^.aiColumn[0]) then
+              begin
+                Inc(k);
+                Continue;
+              end;
+            end;
+            pScan^.pWC := pWC;
+            pScan^.k   := k + 1;
+            Exit(pTerm);
+          end;
+        end;
+        Inc(k);
+      end;
+      pWC := pWC^.pOuter;
+      k := 0;
+    until pWC = nil;
+    if pScan^.iEquiv >= pScan^.nEquiv then Break;
+    pWC := pScan^.pOrigWC;
+    k := 0;
+    Inc(pScan^.iEquiv);
+  end;
+  Result := nil;
+end;
+
+function whereScanInitIndexExpr(pScan: PWhereScan): PWhereTerm;
+begin
+  pScan^.idxaff := sqlite3ExprAffinity(pScan^.pIdxExpr);
+  Result := whereScanNext(pScan);
+end;
+
+function whereScanInit(pScan: PWhereScan; pWC: PWhereClause; iCur: i32;
+  iColumn: i32; opMask: u32; pIdx: PIndex2): PWhereTerm;
+var
+  j:    i32;
+  cols: Pi16;
+  azC:  PPAnsiChar;
+begin
+  pScan^.pOrigWC   := pWC;
+  pScan^.pWC       := pWC;
+  pScan^.pIdxExpr  := nil;
+  pScan^.idxaff    := #0;
+  pScan^.zCollName := nil;
+  pScan^.opMask    := opMask;
+  pScan^.k         := 0;
+  pScan^.aiCur[0]  := iCur;
+  pScan^.nEquiv    := 1;
+  pScan^.iEquiv    := 1;
+  if pIdx <> nil then
+  begin
+    j        := iColumn;
+    cols     := pIdx^.aiColumn;
+    iColumn  := i32(cols[j]);
+    if i16(iColumn) = pIdx^.pTable^.iPKey then
+      iColumn := XN_ROWID
+    else if iColumn >= 0 then
+    begin
+      pScan^.idxaff := PColumn(PByte(pIdx^.pTable^.aCol)
+                       + SizeOf(TColumn) * iColumn)^.affinity;
+      azC := PPAnsiChar(pIdx^.azColl);
+      pScan^.zCollName := azC[j];
+    end
+    else if iColumn = XN_EXPR then
+    begin
+      pScan^.pIdxExpr   := ExprListItems(pIdx^.aColExpr)[j].pExpr;
+      azC := PPAnsiChar(pIdx^.azColl);
+      pScan^.zCollName  := azC[j];
+      pScan^.aiColumn[0] := XN_EXPR;
+      Exit(whereScanInitIndexExpr(pScan));
+    end;
+  end
+  else if iColumn = XN_EXPR then
+    Exit(nil);
+  pScan^.aiColumn[0] := i16(iColumn);
+  Result := whereScanNext(pScan);
+end;
+
+function sqlite3WhereFindTerm(pWC: PWhereClause; iCur: i32; iColumn: i32;
+  notReady: Bitmask; op: u32; pIdx: PIndex2): PWhereTerm;
+var
+  pResult: PWhereTerm;
+  p:       PWhereTerm;
+  scan:    TWhereScan;
+begin
+  pResult := nil;
+  p := whereScanInit(@scan, pWC, iCur, iColumn, op, pIdx);
+  op := op and (WO_EQ or WO_IS);
+  while p <> nil do
+  begin
+    if (p^.prereqRight and notReady) = 0 then
+    begin
+      if (p^.prereqRight = 0) and ((p^.eOperator and op) <> 0) then
+        Exit(p);
+      if pResult = nil then pResult := p;
+    end;
+    p := whereScanNext(@scan);
+  end;
+  Result := pResult;
+end;
+
+{ Stubs for helpers consumed by the scanner.  See the banner above for the
+  gates that keep the rowid-EQ shape from reaching any of them. }
+
+function whereRightSubexprIsColumn(p: PExpr): PExpr;
+begin
+  { Real impl walks p^.pRight stripping TK_COLLATE; returns nil when the
+    final expression is not TK_COLUMN.  Until exprAnalyze sets WO_EQUIV,
+    the only caller bypasses this anyway. }
+  Result := nil;
+end;
+
+function sqlite3ExprCompareSkip(pA: PExpr; pB: PExpr; iTab: i32): i32;
+begin
+  { 0 = "expressions match" (i.e. don't skip).  Real impl is in expr.c
+    (sqlite3ExprCompare with iTab translation).  Only invoked for
+    XN_EXPR-indexed columns, which the rowid-EQ shape never produces. }
+  Result := 0;
+end;
+
+function sqlite3IndexAffinityOk(pX: PExpr; idxaff: AnsiChar): i32;
+begin
+  { Real impl in expr.c — checks that the expression's affinity is
+    compatible with the index column affinity.  For rowid-EQ scans
+    pIdx is nil, so zCollName is nil and the caller never reaches here. }
+  Result := 1;
+end;
+
+function indexInAffinityOk(pParse: PParse; pTerm: PWhereTerm;
+  idxaff: AnsiChar): PAnsiChar;
+begin
+  { Real impl checks each LHS of an "x IN (...)" RHS against the index
+    column affinity, returning the collation name or nil.  WO_IN is not
+    produced by the current minimal sqlite3WhereSplit body. }
+  Result := nil;
 end;
 
 procedure sqlite3WhereExprAnalyze(pTabList: PSrcList; pWC: PWhereClause);
