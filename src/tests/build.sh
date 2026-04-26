@@ -133,6 +133,7 @@ compile_test TestExprBasic
 compile_test TestWhereBasic
 compile_test TestWhereStructs
 compile_test TestWhereSimple
+compile_test TestWhereExpr
 compile_test TestSelectBasic
 compile_test TestAuthBuiltins
 compile_test TestDMLBasic

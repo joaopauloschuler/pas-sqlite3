@@ -62,6 +62,16 @@ Important: At the end of this document, please find:
     `transferJoinMarkings`, `isLikeOrGlob`, `whereCommuteOperator`.
     Gate: extend `TestWhereSimple.pas` with multi-term cases
     (a=1 AND b=2, a IN (1,2,3), a BETWEEN 1 AND 5).
+    - [X] `whereClauseInsert` (heap-grow term array beyond aStatic),
+      `markTermAsChild`, `transferJoinMarkings`, `exprCommute` ported;
+      `sqlite3WhereSplit` rewritten to use `whereClauseInsert`;
+      `exprAnalyze` extended with the right-side commute path
+      (whereexpr.c:1222..1261) and the TK_ISNULL→TK_TRUEFALSE rewrite
+      (whereexpr.c:1262..1272).  Gate: `TestWhereExpr.pas` (22/22).
+    - [ ] BETWEEN / OR / NOTNULL / LIKE virtual-term synthesis
+      (whereexpr.c:1275..1530), `whereCombineDisjuncts`,
+      `whereNthSubterm`, `isLikeOrGlob`, `whereCommuteOperator`,
+      `exprAnalyzeOrTerm`, `termIsEquivalence` — still deferred.
 
 - [ ] **6.9-bis 11g.2.d** Port the planner core in `where.c`
     (~5000 lines): `whereLoopAddBtree`, `whereLoopAddBtreeIndex`,

@@ -1535,6 +1535,10 @@ const
 procedure sqlite3WhereClauseInit(pWC: PWhereClause; pWInfo: PWhereInfo);
 procedure sqlite3WhereClauseClear(pWC: PWhereClause);
 procedure sqlite3WhereSplit(pWC: PWhereClause; pExpr: PExpr; op: u8);
+function  whereClauseInsert(pWC: PWhereClause; p: PExpr; wtFlags: u16): i32;
+procedure markTermAsChild(pWC: PWhereClause; iChild: i32; iParent: i32);
+procedure transferJoinMarkings(pDerived: PExpr; pBase: PExpr);
+function  exprCommute(pPrs: PParse; pX: PExpr): u16;
 function  sqlite3WhereGetMask(pMaskSet: PWhereMaskSet; iCursor: i32): Bitmask;
 function  sqlite3WhereMalloc(pWInfo: PWhereInfo; nByte: u64): Pointer;
 function  sqlite3WhereRealloc(pWInfo: PWhereInfo; pOld: Pointer; nByte: u64): Pointer;
@@ -5456,27 +5460,133 @@ begin
   sqlite3DbFree(db, pAndInfo);
 end;
 
+{ Add a single new WhereTerm entry to the WhereClause object pWC.  The new
+  WhereTerm is constructed from Expr p with wtFlags.  The index in pWC^.a[]
+  of the new WhereTerm is returned on success; 0 is returned on OOM (the
+  failure is recorded in db^.mallocFailed).  Grows pWC^.a[] from the static
+  slot pool (aStatic) onto the heap when nTerm reaches nSlot.
+
+  If wtFlags includes TERM_DYNAMIC, ownership of p transfers to pWC even on
+  failure.
+
+  Faithful port of whereexpr.c:60..92.  WARNING: pWC^.a may be reallocated;
+  any cached PWhereTerm pointers are invalidated. }
+function whereClauseInsert(pWC: PWhereClause; p: PExpr; wtFlags: u16): i32;
+var
+  pTerm: PWhereTerm;
+  pOld:  PWhereTerm;
+  db:    PTsqlite3;
+  idx:   i32;
+begin
+  if pWC^.nTerm >= pWC^.nSlot then
+  begin
+    pOld := pWC^.a;
+    db   := pWC^.pWInfo^.pParse^.db;
+    pWC^.a := PWhereTerm(sqlite3WhereMalloc(pWC^.pWInfo,
+                u64(SizeOf(TWhereTerm)) * u64(pWC^.nSlot) * 2));
+    if pWC^.a = nil then
+    begin
+      if (wtFlags and TERM_DYNAMIC) <> 0 then
+        sqlite3ExprDelete(db, p);
+      pWC^.a := pOld;
+      Exit(0);
+    end;
+    Move(pOld^, pWC^.a^, SizeOf(TWhereTerm) * pWC^.nTerm);
+    pWC^.nSlot := pWC^.nSlot * 2;
+  end;
+  idx := pWC^.nTerm;
+  pTerm := @pWC^.a[idx];
+  Inc(pWC^.nTerm);
+  if (wtFlags and TERM_VIRTUAL) = 0 then pWC^.nBase := pWC^.nTerm;
+  if (p <> nil) and ExprHasProperty(p, EP_Unlikely) then
+    pTerm^.truthProb := sqlite3LogEst(u64(p^.iTable)) - 270
+  else
+    pTerm^.truthProb := 1;
+  pTerm^.pExpr   := sqlite3ExprSkipCollateAndLikely(p);
+  pTerm^.wtFlags := wtFlags;
+  pTerm^.pWC     := pWC;
+  pTerm^.iParent := -1;
+  { Zero the trailing fields (eOperator..prereqAll) — equivalent to the C
+    memset(&pTerm->eOperator, 0, sizeof(WhereTerm)-offsetof(eOperator)). }
+  pTerm^.eOperator   := 0;
+  pTerm^.nChild      := 0;
+  pTerm^.eMatchOp    := 0;
+  pTerm^.leftCursor  := 0;
+  pTerm^.u.leftColumn:= 0;
+  pTerm^.u.iField    := 0;
+  pTerm^.prereqRight := 0;
+  pTerm^.prereqAll   := 0;
+  Result := idx;
+end;
+
+{ Mark term iChild as being a child of term iParent.  whereexpr.c:515..519. }
+procedure markTermAsChild(pWC: PWhereClause; iChild: i32; iParent: i32);
+begin
+  pWC^.a[iChild].iParent   := iParent;
+  pWC^.a[iChild].truthProb := pWC^.a[iParent].truthProb;
+  Inc(pWC^.a[iParent].nChild);
+end;
+
+{ If pBase originated in the ON or USING clause of a join, transfer the
+  EP_OuterON / EP_InnerON markings (and the join-cursor index) over to the
+  derived expression pDerived.  whereexpr.c:505..510. }
+procedure transferJoinMarkings(pDerived: PExpr; pBase: PExpr);
+begin
+  if (pDerived <> nil)
+     and ExprHasProperty(pBase, EP_OuterON or EP_InnerON) then
+  begin
+    pDerived^.flags := pDerived^.flags
+                       or (pBase^.flags and (EP_OuterON or EP_InnerON));
+    pDerived^.w.iJoin := pBase^.w.iJoin;
+  end;
+end;
+
+{ Commute a comparison operator: convert "X op Y" → "Y op X".  When LHS or
+  RHS is a TK_VECTOR — or when the binary collating sequence is asymmetric —
+  toggle EP_Commuted so the sweeper can detect it later.
+  whereexpr.c:116..134. }
+function exprCommute(pPrs: PParse; pX: PExpr): u16;
+var
+  tmp: PExpr;
+begin
+  if (pX^.pLeft^.op = TK_VECTOR)
+     or (pX^.pRight^.op = TK_VECTOR)
+     or (sqlite3BinaryCompareCollSeq(pPrs, pX^.pLeft, pX^.pRight)
+         <> sqlite3BinaryCompareCollSeq(pPrs, pX^.pRight, pX^.pLeft)) then
+    pX^.flags := pX^.flags xor EP_Commuted;
+  tmp := pX^.pLeft;
+  pX^.pLeft := pX^.pRight;
+  pX^.pRight := tmp;
+  if pX^.op >= TK_GT_TK then
+  begin
+    Assert(TK_LT = TK_GT_TK + 2);
+    Assert(TK_GE = TK_LE + 2);
+    Assert(TK_GT_TK > TK_EQ);
+    Assert(TK_GT_TK < TK_LE);
+    Assert((pX^.op >= TK_GT_TK) and (pX^.op <= TK_GE));
+    pX^.op := u8(((pX^.op - TK_GT_TK) xor 2) + TK_GT_TK);
+  end;
+  Result := 0;
+end;
+
 procedure sqlite3WhereSplit(pWC: PWhereClause; pExpr: PExpr; op: u8);
 var
-  e: PExpr;
+  pE2: PExpr;
 begin
-  if pExpr = nil then Exit;
-  e := pExpr;
-  if u8(e^.op) <> op then
+  { whereexpr.c:1571..1581 — recurse into the AND/OR tree, calling
+    whereClauseInsert on every leaf that is not itself an "op" connective.
+    The skipCollate/Likely peel matches the C source so the leaf ends up
+    in canonical form. }
+  pE2 := sqlite3ExprSkipCollateAndLikely(pExpr);
+  pWC^.op := op;
+  Assert((pE2 <> nil) or (pExpr = nil));
+  if pE2 = nil then Exit;
+  if u8(pE2^.op) <> op then
+    whereClauseInsert(pWC, pExpr, 0)
+  else
   begin
-    { whereTerm growth is deferred to Phase 6.2 full port; basic split }
-    { For now: grow aStatic array to nSlot if needed, then append term }
-    if pWC^.nTerm >= pWC^.nSlot then Exit; { overflow guard }
-    pWC^.a[pWC^.nTerm].pExpr    := pExpr;
-    pWC^.a[pWC^.nTerm].wtFlags  := 0;
-    pWC^.a[pWC^.nTerm].eOperator:= 0;
-    pWC^.a[pWC^.nTerm].iParent  := -1;
-    Inc(pWC^.nTerm);
-    Inc(pWC^.nBase);
-  end else
-  begin
-    sqlite3WhereSplit(pWC, e^.pLeft,  op);
-    sqlite3WhereSplit(pWC, e^.pRight, op);
+    sqlite3WhereSplit(pWC, pE2^.pLeft,  op);
+    sqlite3WhereSplit(pWC, pE2^.pRight, op);
   end;
 end;
 
@@ -5973,7 +6083,12 @@ var
   xMask:      Bitmask;
   aiCurCol:   array[0..1] of i32;
   pLftSC:     PExpr;           { renamed from pLeftSC }
+  pRgtSC:     PExpr;           { renamed from pRight }
   opMask:     u16;
+  pNew:       PWhereTerm;
+  pDup:       PExpr;
+  idxNew:     i32;
+  eExtraOp:   u16;
 begin
   { whereexpr.c:1122.. — trimmed body; see banner above for what is and is
     not covered.  Comments cite C source line numbers. }
@@ -6036,7 +6151,7 @@ begin
   if allowedOp(op) <> 0 then
   begin
     pLftSC := sqlite3ExprSkipCollate(pX^.pLeft);
-    { pRight is unused on this trimmed path (right-side commute deferred). }
+    pRgtSC := sqlite3ExprSkipCollate(pX^.pRight);
     if (pTerm^.prereqRight and prereqLeft) = 0 then
       opMask := u16(WO_ALL)
     else
@@ -6059,9 +6174,65 @@ begin
     end;
     if op = TK_IS then pTerm^.wtFlags := pTerm^.wtFlags or TERM_IS;
 
-    { Right-side commute (whereexpr.c:1222..1261) deferred to 11g.2.c.
-      TK_ISNULL → TK_TRUEFALSE rewrite (whereexpr.c:1262..1272) deferred
-      to 11g.2.c — neither is needed for the rowid/IPK-EQ shape today. }
+    { Right-side commute (whereexpr.c:1222..1261).  When the RHS is also a
+      column and is not a fixed-collation rewrite, synthesize a virtual
+      "Y op X" mirror of the original "X op Y".  termIsEquivalence (which
+      sets WO_EQUIV for transitive propagation through join graphs) is
+      deferred — it is only consulted on multi-table joins and the loss is
+      a planning-quality issue, never a correctness one. }
+    if (pRgtSC <> nil)
+       and (exprMightBeIndexed(pSrc, @aiCurCol[0], pRgtSC, op) <> 0)
+       and (not ExprHasProperty(pRgtSC, EP_FixedCol)) then
+    begin
+      eExtraOp := 0;
+      Assert(pTerm^.u.iField = 0);
+      if pTerm^.leftCursor >= 0 then
+      begin
+        pDup := sqlite3ExprDup(db, pX, 0);
+        if db^.mallocFailed <> 0 then
+        begin
+          sqlite3ExprDelete(db, pDup);
+          Exit;
+        end;
+        idxNew := whereClauseInsert(pWC, pDup,
+                    TERM_VIRTUAL or TERM_DYNAMIC);
+        if idxNew = 0 then Exit;
+        pNew := @pWC^.a[idxNew];
+        markTermAsChild(pWC, idxNew, idxTerm);
+        if op = TK_IS then pNew^.wtFlags := pNew^.wtFlags or TERM_IS;
+        { whereClauseInsert may have realloc'd pWC^.a — re-derive pTerm. }
+        pTerm := @pWC^.a[idxTerm];
+        pTerm^.wtFlags := pTerm^.wtFlags or TERM_COPIED;
+        { termIsEquivalence (whereexpr.c:1245..1248) deferred.  Without
+          it eExtraOp stays 0, which is the conservative pick — the
+          virtual mirror is still a usable equality term. }
+      end
+      else
+      begin
+        pDup := pX;
+        pNew := pTerm;
+      end;
+      pNew^.wtFlags := pNew^.wtFlags or exprCommute(pPrs, pDup);
+      pNew^.leftCursor := aiCurCol[0];
+      Assert((pTerm^.eOperator and (WO_OR or WO_AND)) = 0);
+      pNew^.u.leftColumn := aiCurCol[1];
+      pNew^.prereqRight := prereqLeft or extraRight;
+      pNew^.prereqAll   := prereqAll;
+      pNew^.eOperator   := (operatorMask(pDup^.op) + eExtraOp) and opMask;
+    end
+    else if (op = TK_ISNULL)
+            and (not ExprHasProperty(pX, EP_OuterON))
+            and (sqlite3ExprCanBeNull(pLftSC) = 0) then
+    begin
+      { whereexpr.c:1262..1272 — "x IS NULL" where x cannot be NULL is
+        rewritten to the constant FALSE (tag-20230504-1). }
+      Assert(not ExprHasProperty(pX, EP_IntValue));
+      pX^.op := TK_TRUEFALSE;
+      pX^.u.zToken := PAnsiChar('false');
+      ExprSetProperty(pX, EP_IsFalse);
+      pTerm^.prereqAll := 0;
+      pTerm^.eOperator := 0;
+    end;
   end;
 
   { BETWEEN / OR / NOTNULL / LIKE virtual-term synthesis blocks
