@@ -676,6 +676,16 @@ function  sqlite3MallocMutex: Psqlite3_mutex;
 function  sqlite3_memory_used: i64;
 function  sqlite3HeapNearlyFull: i32;
 
+{ Reference-counted string/blob (RCStr) — printf.c.
+  An RCStr is a libc-malloc'd buffer prefixed by an 8-byte refcount header.
+  The pointer returned to the caller addresses the payload (header is at
+  z - SizeOf(TRCStr)).  sqlite3RCStrUnref is cdecl so it can be passed
+  directly to sqlite3_result_text* as the xDel destructor. }
+function  sqlite3RCStrNew(N: u64): PAnsiChar;
+function  sqlite3RCStrRef(z: PAnsiChar): PAnsiChar;
+procedure sqlite3RCStrUnref(z: Pointer); cdecl;
+function  sqlite3RCStrResize(z: PAnsiChar; N: u64): PAnsiChar;
+
 { Fault / benign malloc hooks (fault.c) }
 procedure sqlite3BenignMallocHooks(xBegin, xEnd: Pointer);
 procedure sqlite3BeginBenignMalloc;
@@ -2232,6 +2242,70 @@ end;
 function sqlite3HeapNearlyFull: i32;
 begin
   Result := gNearlyFull;
+end;
+
+{ ============================================================
+  Section: Reference-counted string/blob (RCStr)  (printf.c)
+  ============================================================ }
+
+type
+  PRCStr = ^TRCStr;
+  TRCStr = record
+    nRCRef: u64;  { reference count; total header size kept at 8 bytes }
+  end;
+
+function sqlite3RCStrNew(N: u64): PAnsiChar;
+var
+  p: PRCStr;
+begin
+  p := PRCStr(sqlite3_malloc64(N + SizeOf(TRCStr) + 1));
+  if p = nil then
+  begin
+    Result := nil;
+    Exit;
+  end;
+  p^.nRCRef := 1;
+  Result := PAnsiChar(PByte(p) + SizeOf(TRCStr));
+end;
+
+function sqlite3RCStrRef(z: PAnsiChar): PAnsiChar;
+var
+  p: PRCStr;
+begin
+  Assert(z <> nil);
+  p := PRCStr(PByte(z) - SizeOf(TRCStr));
+  Inc(p^.nRCRef);
+  Result := z;
+end;
+
+procedure sqlite3RCStrUnref(z: Pointer); cdecl;
+var
+  p: PRCStr;
+begin
+  Assert(z <> nil);
+  p := PRCStr(PByte(z) - SizeOf(TRCStr));
+  Assert(p^.nRCRef > 0);
+  if p^.nRCRef >= 2 then
+    Dec(p^.nRCRef)
+  else
+    sqlite3_free(p);
+end;
+
+function sqlite3RCStrResize(z: PAnsiChar; N: u64): PAnsiChar;
+var
+  p, pNew: PRCStr;
+begin
+  Assert(z <> nil);
+  p := PRCStr(PByte(z) - SizeOf(TRCStr));
+  Assert(p^.nRCRef = 1);
+  pNew := PRCStr(sqlite3_realloc64(p, N + SizeOf(TRCStr) + 1));
+  if pNew = nil then
+  begin
+    sqlite3_free(p);
+    Result := nil;
+    Exit;
+  end;
+  Result := PAnsiChar(PByte(pNew) + SizeOf(TRCStr));
 end;
 
 { ============================================================

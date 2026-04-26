@@ -791,7 +791,7 @@ end;
 procedure jsonStringReset(p: PJsonString);
 begin
   if p^.bStatic = 0 then
-    sqlite3_free(p^.zBuf);
+    sqlite3RCStrUnref(p^.zBuf);
   jsonStringZero(p);
 end;
 
@@ -825,7 +825,7 @@ begin
       Result := 1;
       Exit;
     end;
-    zNew := PAnsiChar(sqlite3_malloc64(nTotal));
+    zNew := sqlite3RCStrNew(nTotal);
     if zNew = nil then
     begin
       jsonStringOom(p);
@@ -839,7 +839,7 @@ begin
   end
   else
   begin
-    p^.zBuf := PAnsiChar(sqlite3_realloc64(p^.zBuf, nTotal));
+    p^.zBuf := sqlite3RCStrResize(p^.zBuf, nTotal);
     if p^.zBuf = nil then
     begin
       p^.eErr := p^.eErr or JSTRING_OOM;
@@ -1386,13 +1386,13 @@ end;
 
 procedure jsonParseReset(pParse: PJsonParse);
 begin
-  { Phase 6.8.g — RCStr proper not yet ported; the cache-bearing branch
-    (jsonParseFuncArg) heap-copies zJson with sqlite3_malloc and sets
-    bJsonIsRCStr=1 to mark it as owned-libc-malloc.  Free here.  For
-    non-cached parses bJsonIsRCStr stays 0 and zJson is borrowed. }
+  { json.c:906 — when bJsonIsRCStr=1, zJson is shared via RCStr (the cache
+    holds one ref, every consumer holds another).  Drop our reference via
+    sqlite3RCStrUnref; the buffer is freed once the last consumer drops it.
+    For non-cached parses bJsonIsRCStr stays 0 and zJson is borrowed. }
   if pParse^.bJsonIsRCStr <> 0 then
   begin
-    if pParse^.zJson <> nil then sqlite3_free(pParse^.zJson);
+    if pParse^.zJson <> nil then sqlite3RCStrUnref(pParse^.zJson);
     pParse^.zJson := nil;
     pParse^.nJson := 0;
     pParse^.bJsonIsRCStr := 0;
@@ -3525,10 +3525,10 @@ rebuild_from_cache:
   end
   else
   begin
-    { No RCStr yet — heap-copy zJson into a libc-malloc'd buffer so the
-      cache outlives the SQL value.  bJsonIsRCStr=1 marks the copy as
-      owned-by-malloc; jsonParseReset frees it via sqlite3_free. }
-    zNew := PAnsiChar(sqlite3_malloc(p^.nJson + 1));
+    { Heap-copy zJson into a fresh RCStr so the cache outlives the SQL
+      value.  bJsonIsRCStr=1 marks the copy as RCStr-owned; jsonParseReset
+      drops the reference via sqlite3RCStrUnref. }
+    zNew := sqlite3RCStrNew(p^.nJson);
     if zNew = nil then goto json_pfa_oom;
     Move(p^.zJson^, zNew^, p^.nJson);
     zNew[p^.nJson] := #0;
@@ -3642,12 +3642,29 @@ begin
         p^.zBuf, p^.nUsed, SQLITE_TRANSIENT, SQLITE_UTF8)
     else
     begin
-      { Without sqlite3RCStr we cannot share zBuf into both the cache
-        and the SQL value at zero copy.  Copy the result into the SQL
-        value (TRANSIENT) and let jsonStringReset free the original.
-        Cache-insert path therefore deferred until 6.8.h.x ports RCStr. }
+      { json.c:872 — if the source JsonParse has a JSONB blob (nBlobAlloc>0)
+        but no cached text yet (bJsonIsRCStr=0), publish the freshly built
+        zBuf into the cache via RCStr-Ref so subsequent calls on the same
+        ctx hit the cache.  Then hand the buffer to the SQL value with a
+        second Ref + sqlite3RCStrUnref destructor (zero-copy ownership
+        transfer). }
+      if (pParse <> nil)
+         and (pParse^.bJsonIsRCStr = 0)
+         and (pParse^.nBlobAlloc > 0) then
+      begin
+        pParse^.zJson := sqlite3RCStrRef(p^.zBuf);
+        pParse^.nJson := p^.nUsed;
+        pParse^.bJsonIsRCStr := 1;
+        if jsonCacheInsert(ctx, pParse) = SQLITE_NOMEM then
+        begin
+          sqlite3_result_error_nomem(Psqlite3_context(p^.pCtx));
+          jsonStringReset(p);
+          Exit;
+        end;
+      end;
       sqlite3_result_text64(Psqlite3_context(p^.pCtx),
-        p^.zBuf, p^.nUsed, SQLITE_TRANSIENT, SQLITE_UTF8);
+        sqlite3RCStrRef(p^.zBuf), p^.nUsed,
+        TxDelProc(@sqlite3RCStrUnref), SQLITE_UTF8);
     end;
   end
   else if (p^.eErr and JSTRING_OOM) <> 0 then
@@ -4939,7 +4956,7 @@ begin
       if isFinal <> 0 then
       begin
         if pStr^.bStatic = 0 then
-          sqlite3_free(pStr^.zBuf);
+          sqlite3RCStrUnref(pStr^.zBuf);
       end
       else
         jsonStringTrimOneChar(pStr);
@@ -4947,8 +4964,12 @@ begin
     end
     else if isFinal <> 0 then
     begin
-      sqlite3_result_text(pCtx, pStr^.zBuf, i32(pStr^.nUsed), SQLITE_TRANSIENT);
-      jsonStringReset(pStr);
+      if pStr^.bStatic <> 0 then
+        sqlite3_result_text(pCtx, pStr^.zBuf, i32(pStr^.nUsed), SQLITE_TRANSIENT)
+      else
+        sqlite3_result_text(pCtx, pStr^.zBuf, i32(pStr^.nUsed),
+          TxDelProc(@sqlite3RCStrUnref));
+      pStr^.bStatic := 1;  { ownership transferred — don't double-free }
     end
     else
     begin
@@ -5084,7 +5105,7 @@ begin
       if isFinal <> 0 then
       begin
         if pStr^.bStatic = 0 then
-          sqlite3_free(pStr^.zBuf);
+          sqlite3RCStrUnref(pStr^.zBuf);
       end
       else
         jsonStringTrimOneChar(pStr);
@@ -5092,8 +5113,12 @@ begin
     end
     else if isFinal <> 0 then
     begin
-      sqlite3_result_text(pCtx, pStr^.zBuf, i32(pStr^.nUsed), SQLITE_TRANSIENT);
-      jsonStringReset(pStr);
+      if pStr^.bStatic <> 0 then
+        sqlite3_result_text(pCtx, pStr^.zBuf, i32(pStr^.nUsed), SQLITE_TRANSIENT)
+      else
+        sqlite3_result_text(pCtx, pStr^.zBuf, i32(pStr^.nUsed),
+          TxDelProc(@sqlite3RCStrUnref));
+      pStr^.bStatic := 1;  { ownership transferred — don't double-free }
     end
     else
     begin

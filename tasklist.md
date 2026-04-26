@@ -20,6 +20,76 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.8.h.7 sqlite3RCStr port + JSON ownership-transfer.**
+    Closes the `sqlite3RCStr*` deferral threaded through 6.8.b /
+    6.8.g / 6.8.h.1 / 6.8.h.4.  Ports the four-function reference-counted
+    string/blob primitive from `printf.c:1557..1614` into
+    `passqlite3util.pas` and rewires every JSON spill / cache / result
+    site that used `sqlite3_malloc / sqlite3_realloc / sqlite3_free` as a
+    stand-in.
+
+    Concrete changes:
+      * `src/passqlite3util.pas` — adds `sqlite3RCStrNew`,
+        `sqlite3RCStrRef`, `sqlite3RCStrUnref` (cdecl, so it can be
+        passed as a `TxDelProc` destructor), `sqlite3RCStrResize`.
+        New `TRCStr` record (8-byte header) before the payload; pointer
+        arithmetic via `PByte` ± `SizeOf(TRCStr)` matches C's `(RCStr*)z - 1`.
+      * `src/passqlite3json.pas` — six fix-sites swapped:
+        - `jsonStringReset` — `sqlite3_free` → `sqlite3RCStrUnref`.
+        - `jsonStringGrow` — both spill paths use `sqlite3RCStrNew` /
+          `sqlite3RCStrResize` (matches json.c:582/591).
+        - `jsonReturnString` — implements the json.c:872 cache-insert +
+          ownership-transfer branch: when `pParse` carries a JSONB blob
+          (`nBlobAlloc>0`) and no cached text yet (`bJsonIsRCStr=0`),
+          publish the freshly built `zBuf` into the auxdata cache via
+          `sqlite3RCStrRef` + `jsonCacheInsert`, then hand a second Ref
+          to `sqlite3_result_text64` with `sqlite3RCStrUnref` as the
+          destructor.  Replaces the TRANSIENT-copy fallback.
+        - `jsonArrayCompute` / `jsonObjectCompute` (h.4) — final-isFinal
+          path now hands `pStr^.zBuf` to `sqlite3_result_text` with
+          `sqlite3RCStrUnref` (zero-copy ownership transfer); sets
+          `pStr^.bStatic := 1` so the post-call `jsonStringReset` in
+          the caller does not double-free.  JSON_BLOB final arm uses
+          `sqlite3RCStrUnref` to drop the spilled buffer.
+        - `jsonParseFuncArg` cache-store (g) — `sqlite3_malloc + Move`
+          replaced with `sqlite3RCStrNew + Move`; `bJsonIsRCStr=1` now
+          means "RCStr-owned" again (matches C semantics exactly).
+        - `jsonParseReset` (g) — drops the cache reference via
+          `sqlite3RCStrUnref` instead of `sqlite3_free`.
+
+    Tests / regression spot check (no new gate; existing JSON gates
+    cover the rewired paths):
+      * TestJson 434/434 PASS, TestJsonEach 50/50 PASS,
+        TestJsonRegister 48/48 PASS.
+      * TestUtil ALL PASS, TestPrintf 105/105, TestVtab 216/216,
+        TestVdbeApi 57/57.
+
+    Discoveries / next-step notes:
+      * **`sqlite3RCStrUnref` must be `cdecl`**.  It is passed as a
+        `TxDelProc` (`procedure(p: Pointer); cdecl`) into
+        `sqlite3_result_text` / `sqlite3_result_text64`.  Without
+        `cdecl` the calling convention diverges from the SQLite C ABI
+        for destructor callbacks.  Same convention as
+        `sqlite3FreeXDel` already in vdbe.
+      * **Header size = 8 bytes (one u64 refcount).**  Payload pointer
+        is `PByte(p) + SizeOf(TRCStr)`.  C's `(RCStr*)&p[1]` and
+        `p--` translate to `PByte(z) ± SizeOf(TRCStr)` in Pascal under
+        `{$POINTERMATH ON}`.
+      * **`pStr^.bStatic := 1` after ownership transfer** prevents the
+        aggregate-Final caller's safety `jsonStringReset` from
+        double-freeing the buffer SQLite now owns.  Mirrors C
+        json.c:4871/4996 exactly.
+      * **VDBE / vdbeaux RCStr fix-sites still pending.**  C uses
+        `sqlite3RCStrNew/Ref/Unref` in `vdbe.c:759..782` (function
+        result-text caching) and `vdbeaux.c:2759` (auxdata cleanup).
+        Those are part of the VDBE port, not JSON, and remain on the
+        Phase 8.x agenda.  The helper itself is now available; only
+        the call-site swaps are deferred.
+      * **`sqlite3_result_error_nomem` on `jsonCacheInsert` failure.**
+        New jsonReturnString branch correctly calls
+        `sqlite3_result_error_nomem` + `jsonStringReset` and exits
+        without firing `sqlite3_result_text*`.  Mirrors C json.c:879.
+
   - **2026-04-26 — Phase 6.8.h.6 JSON SQL function registration.**
     Lands `sqlite3RegisterJsonFunctions` in `passqlite3codegen.pas`,
     wiring the full json_* / jsonb_* SQL surface (32 scalars + 4
@@ -3945,8 +4015,10 @@ reference exactly.
   `ROWS BETWEEN`, …). Intersects with `select.c` — port last within the
   codegen phase so `select.c` is stable when window integration starts.
 
-- [ ] **6.8** (Optional, defer-able) Port `json.c`: JSON1 scalar functions,
+- [X] **6.8** (Optional, defer-able) Port `json.c`: JSON1 scalar functions,
   `json_each`, `json_tree`. Only if users need it in v1.
+  DONE 2026-04-26 (all sub-chunks 6.8.a..6.8.h closed; 6.8.h.7
+  ports the RCStr deferral).
 
   Sub-tasks (chunks; mark each as it lands):
   - [X] **6.8.a** Foundation — types (`TJsonCache`, `TJsonString`,
@@ -4109,7 +4181,7 @@ reference exactly.
         `Inc(pCache^.nJPRef)`.  T351 documents this with a comment;
         worth re-checking when 6.8.h composes cache-hit + EDITABLE
         rebuild paths.
-  - [ ] **6.8.h** SQL-function dispatch + registration —
+  - [X] **6.8.h** SQL-function dispatch + registration —
     `jsonFunc`, `jsonbFunc`, `json_array`/`_object`/`_extract`/
     `_set`/`_replace`/`_insert`/`_remove`/`_patch`/`_valid`/
     `_type`/`_quote`/`_array_length`/`_pretty`/`_error_position`/
@@ -4412,6 +4484,33 @@ reference exactly.
           `jsonSetFunc` / `jsonExtractFunc` / etc. that h.3 and h.4
           flagged as untested-because-fabricated-ctx all fire when
           `sqlite3FindFunction` resolves a registered name.
+    - [X] **6.8.h.7** sqlite3RCStr port + JSON ownership-transfer.
+      Closes the deferral threaded through 6.8.b / 6.8.g / 6.8.h.1 /
+      6.8.h.4 / 6.8.h.6.  Adds `sqlite3RCStrNew/Ref/Unref/Resize` to
+      `passqlite3util.pas` (printf.c:1557..1614 — the helper conceptually
+      lives in printf.c but is independent of the printf machinery, so
+      the util unit is the dep-clean home).  Rewires six JSON fix-sites
+      in `passqlite3json.pas` to use RCStr for spill / cache / SQL-result
+      ownership transfer (jsonStringReset, jsonStringGrow,
+      jsonReturnString cache-insert path, jsonArrayCompute /
+      jsonObjectCompute final-isFinal arms, jsonParseFuncArg cache
+      store, jsonParseReset).  Result-text path now zero-copy via
+      `sqlite3RCStrUnref` destructor; matches C json.c byte-for-byte.
+      DONE 2026-04-26.  Gate `TestJson.pas` 434/434 PASS,
+      `TestJsonRegister.pas` 48/48 PASS, `TestJsonEach.pas` 50/50 PASS.
+      Regression: TestUtil ALL PASS, TestPrintf 105/105, TestVtab 216/216,
+      TestVdbeApi 57/57.  See "Most recent activity" entry for details.
+
+      Discoveries / next-step notes:
+        * **RCStr is now available for the VDBE port.**  vdbe.c:759..782
+          (function result-text caching) and vdbeaux.c:2759 (auxdata
+          cleanup) still use `sqlite3_malloc`/`sqlite3_free` placeholders
+          per the existing Phase 5 port.  Swap them to RCStr when those
+          paths get touched in Phase 8.x.
+        * **`sqlite3RCStrUnref` is `cdecl`** — required so it can be
+          passed as `TxDelProc` (the SQLite C destructor calling
+          convention).  Same shape as `sqlite3FreeXDel` already in
+          `passqlite3vdbe.pas`.
 
 ### Phase 6.7 implementation notes (2026-04-25)
 
