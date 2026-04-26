@@ -16,9 +16,6 @@ Important: At the end of this document, please find:
 * Per-function porting checklist
 * Key rules for the developer
 
-Source of truth for definitions, scope notes, gates, and discoveries
-remains `history.md`.  This file is the punch list.
-
 ---
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
