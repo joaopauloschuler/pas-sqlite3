@@ -21,6 +21,83 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    sqlite3ExprToRegister + ExprSetProperty/ExprClearProperty inline
+    macros.**  Third leaf helper of step 11g.2.b's pre-IfTrue/IfFalse
+    cluster (after `sqlite3ExprCanBeNull` and the codeCompare cluster).
+    Faithful translation of expr.c:4502..4518 — converts a scalar
+    expression node to a TK_REGISTER reference into a caller-supplied
+    register, preserving the original opcode in `op2` and clearing
+    `EP_Skip` so the rewritten node is no longer hidden from
+    `sqlite3ExprSkipCollate*`.  Skips through any TK_COLLATE / EP_Unlikely
+    outer wrappers via the existing `sqlite3ExprSkipCollateAndLikely`.
+
+    Two sqliteInt.h-level inline macros added at the same time because
+    the new helper (and the looming `exprCodeBetween` /
+    `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` ports) both touch
+    `Expr.flags` directly:
+
+      * `ExprSetProperty(p, prop)`   — `flags := flags or prop`.
+      * `ExprClearProperty(p, prop)` — `flags := flags and (not prop)`.
+
+    Both placed at `passqlite3codegen.pas:2386..` immediately after the
+    existing `ExprHasProperty` / `ExprHasAllProperty` inlines, mirroring
+    sqliteInt.h's grouping.
+
+    Concrete changes:
+      * `passqlite3codegen.pas:1724` — public forward decl for
+        `sqlite3ExprToRegister`.
+      * `passqlite3codegen.pas:2391..2406` — inline `ExprSetProperty` /
+        `ExprClearProperty`.
+      * `passqlite3codegen.pas:3946..3974` — body of
+        `sqlite3ExprToRegister`, just before `sqlite3ExprIsInteger`.
+
+    Why this is safe to land alone: no productive callers yet
+    (`exprCodeBetween` / `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` still
+    unported; the False-WHERE-Term-Bypass loop is still unported) — pure
+    scaffolding sub-progress, no observable behaviour change in the
+    corpus.  Full regression sweep all green — TestWhereBasic 52/52,
+    TestWhereStructs 148/148, TestPrepareBasic 20/20, TestParser 45/45,
+    TestSchemaBasic 44/44, TestVdbeApi 57/57, TestDMLBasic 54/54,
+    TestSelectBasic 49/49, TestExprBasic 40/40, TestInitCallback 29/29,
+    TestExplainParity unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **`exprCodeVector` and `sqlite3ExprCodeTarget` remain the actual
+        wall.**  `exprCodeBetween` (expr.c:6058) calls
+        `sqlite3ExprToRegister(pDel, exprCodeVector(pParse, pDel,
+        &regFree1))` and then optionally `sqlite3ExprCodeTarget(pParse,
+        &exprAnd, dest)`; neither helper is in the Pascal codebase yet
+        (only a literal-only stub of the public `sqlite3ExprCode` is
+        present at `passqlite3codegen.pas:3612`).  `exprCodeVector`'s
+        single-result branch dispatches to `sqlite3ExprCodeTemp`
+        (expr.c:5856) which itself dispatches to
+        `sqlite3ExprCodeRunJustOnce` *or* `sqlite3ExprCodeTarget`
+        depending on `ConstFactorOk` + `sqlite3ExprIsConstantNotJoin`.
+        Realistic order of porting therefore:
+          1. `sqlite3ExprIsConstantNotJoin` (Walker-based, not too long
+             — needs `exprNodeIsConstant` callback).
+          2. `sqlite3ExprCodeRunJustOnce` (factor-out helper; small).
+          3. `sqlite3ExprCodeTarget` — the *big* recursive dispatch
+             (expr.c:5040..5807, ~770 lines, dozens of TK_* arms).  Best
+             landed in vertical slices: arm-by-arm or grouped clusters
+             (literals already done; columns + temp-ref cluster next;
+             arithmetic; comparison; CASE; FUNCTION; etc.).
+          4. `sqlite3ExprCodeTemp` once Target is sufficient.
+          5. `exprCodeVector` once Temp is in.
+          6. `exprCodeBetween` + `exprComputeOperands` (now both
+             unblocked).
+          7. `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` (mutually
+             recursive) — depend on most of the above.
+          8. False-WHERE-Term-Bypass loop body in `sqlite3WhereBegin`.
+        Each step in this chain is now a candidate for a stand-alone
+        sub-progress commit.
+      * **op2 byte already present on TExpr** at
+        `passqlite3codegen.pas:490`.  No struct-layout work needed.
+      * **EP_Skip flag value `$002000`** matches the C constant; same
+        bit layout already locked in by existing
+        `sqlite3ExprSkipCollate*` consumers.
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     codeCompare + comparison-affinity / collation leaf helpers.**
     Second of the four missing leaf helpers gating the eventual
     `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` port.  Five faithful

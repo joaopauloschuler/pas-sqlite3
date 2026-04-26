@@ -1721,6 +1721,7 @@ function  sqlite3ExprCanBeNull(const p: PExpr): i32;
 function  sqlite3CompareAffinity(const pExpr: PExpr; aff2: AnsiChar): AnsiChar;
 function  sqlite3BinaryCompareCollSeq(pParse: PParse; const pLeft, pRight: PExpr): Pointer;
 function  sqlite3ExprCompareCollSeq(pParse: PParse; const p: PExpr): Pointer;
+procedure sqlite3ExprToRegister(pExpr: PExpr; iReg: i32);
 function  sqlite3ExprIsInteger(const p: PExpr; pValue: Pi32;
   pParse: PParse): i32;
 function  sqlite3ExprIsConstant(pParse: PParse; p: PExpr): i32;
@@ -2381,6 +2382,19 @@ end;
 function ExprHasAllProperty(pExpr: PExpr; prop: u32): Boolean; inline;
 begin
   Result := (pExpr^.flags and prop) = prop;
+end;
+
+{ ExprSetProperty / ExprClearProperty — sqliteInt.h macro counterparts.
+  Direct one-line bit-twiddles on the Expr.flags u32; matched here as
+  inline procedures so the call sites read like the C original. }
+procedure ExprSetProperty(pExpr: PExpr; prop: u32); inline;
+begin
+  pExpr^.flags := pExpr^.flags or prop;
+end;
+
+procedure ExprClearProperty(pExpr: PExpr; prop: u32); inline;
+begin
+  pExpr^.flags := pExpr^.flags and (not prop);
 end;
 
 function ExprUseXSelect(pExpr: PExpr): Boolean; inline;
@@ -3923,6 +3937,37 @@ begin
                             PAnsiChar(p4), P4_COLLSEQ);
   sqlite3VdbeChangeP5(pParse^.pVdbe, u16(p5));
   Result := addr;
+end;
+
+{ sqlite3ExprToRegister (expr.c:4502..4518) — convert a scalar expression
+  node to a TK_REGISTER reference into register iReg.  The caller must
+  have already arranged for iReg to hold the evaluated value.  Skips
+  through any TK_COLLATE / EP_Unlikely outer wrappers via
+  sqlite3ExprSkipCollateAndLikely, then either confirms the node already
+  references the same register (debug-assert path) or rewrites the node:
+  the original opcode is preserved in op2 (so consumers of TK_REGISTER
+  can recover the source operator), op becomes TK_REGISTER, iTable is
+  set to the register, and EP_Skip is cleared so the rewritten node will
+  no longer be hidden by sqlite3ExprSkipCollate.
+
+  Leaf helper for exprCodeBetween (expr.c:6058) and the future port of
+  the IN-comparison codegen path.  No productive callers in the Pascal
+  port yet — pure scaffolding. }
+procedure sqlite3ExprToRegister(pExpr: PExpr; iReg: i32);
+var p: PExpr;
+begin
+  p := sqlite3ExprSkipCollateAndLikely(pExpr);
+  if p = nil then Exit;            { mirrors NEVER(p==0) }
+  if p^.op = TK_REGISTER then
+  begin
+    Assert(p^.iTable = iReg);
+  end else
+  begin
+    p^.op2   := p^.op;
+    p^.op    := TK_REGISTER;
+    p^.iTable := iReg;
+    ExprClearProperty(p, EP_Skip);
+  end;
 end;
 
 function sqlite3ExprIsInteger(const p: PExpr; pValue: Pi32;
