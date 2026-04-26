@@ -20,6 +20,79 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.8.a JSON foundation.**  Opens the optional
+    `json.c` port (5680 lines of C, ~6 sub-chunks planned) with the
+    foundation slice: types, constants, byte-classification lookup
+    tables, and pure helpers.  No external dependencies beyond
+    `passqlite3types` + `passqlite3util`, so the unit compiles cleanly
+    and lays groundwork for the next slices without forcing them to
+    block on each other.
+
+    New unit `src/passqlite3json.pas` (~370 lines):
+      * **Types**: `TJsonCache`, `TJsonString`, `TJsonParse`,
+        `TNanInfName` (struct shapes mirror json.c:289..374; Pascal
+        `Pointer` stand-ins for `sqlite3*` / `sqlite3_context*` to
+        avoid pulling vdbe into the uses clause this early).
+      * **Constants**: `JSONB_*` (NULL..OBJECT = 0..12),
+        `JSTRING_*` (OOM/MALFORMED/TOODEEP/ERR), `JEDIT_*`
+        (DEL/REPL/INS/SET/AINS), `JSON_JSON`/`SQL`/`ABPATH`/`ISSET`/
+        `AINS`/`BLOB` flag bits, `JSON_SUBTYPE = 74` ("J"),
+        `JSON_CACHE_ID = -429938`, `JSON_CACHE_SIZE = 4`,
+        `JSON_INVALID_CHAR = $99999`, `JSON_MAX_DEPTH = 1000`,
+        `JSON_EDITABLE` / `JSON_KEEPERROR`.
+      * **Lookup tables**: `aJsonIsSpace[256]` (RFC-8259 strict ws
+        set: HT/LF/CR/SPACE), `jsonSpaces` (`#$09#$0A#$0D#$20`),
+        `jsonIsOk[256]` (string-body-safe bytes; gates 0..0x1f, `"`,
+        `'`, `\`, and the 0xE0 marker reserved for upstream's UTF-8
+        sentinel logic), `jsonbType[17]` (human-readable type names
+        with the 13..16 reserved-slot zero-fill preserved),
+        `aNanInfName[5]` (the JSON5 NaN/Infinity literal substitution
+        table: inf, infinity, NaN, QNaN, SNaN).
+      * **Helpers** (pure / no DB deps): `jsonIsspace`,
+        `jsonHexToInt`, `jsonHexToInt4`, `jsonIs2Hex`, `jsonIs4Hex`,
+        `json5Whitespace`.  `json5Whitespace` is the most involved —
+        a faithful translation of json.c:1019..1108 covering ASCII
+        ws (HT/LF/VT/FF/CR/SP), `/* … */` and `// … EOL` comments
+        (including the U+2028 / U+2029 line-separator EOL trigger
+        inside line comments), and the multi-byte Unicode space set
+        (NBSP, ogham, en/em quads, three/four/six-per-em, figure,
+        punctuation, thin, hair, line/paragraph separators, NNBSP,
+        MMSP, ideographic, BOM).
+
+    Concrete changes:
+      * `src/passqlite3json.pas`           — new (Phase 6.8.a).
+      * `src/tests/TestJson.pas`           — new gate test.
+        **98/98 PASS**.
+      * `src/tests/build.sh`               — register TestJson after
+        TestPrintf.
+
+    Discoveries / next-step notes:
+      * **FPC case-insensitivity bites again.**  `jsonIsSpace` (the
+        table) and `jsonIsspace` (the inline function — keeps the C
+        macro name) collide because FPC sees `IsSpace` and `Isspace`
+        as the same identifier.  Renamed the table to `aJsonIsSpace`
+        (matches the existing `aFlagOp` / `aBase` / `aScale` naming
+        used elsewhere in the port for static lookup tables) and kept
+        the function's lower-case name to mirror json.c:196's
+        `jsonIsspace(x)` macro.  Same family of issue as the recurring
+        `pPager: PPager` feedback (memory:
+        `feedback_fpc_vartype_conflict`) — extending the rule:
+        **lookup tables that share a base name with their
+        accessor function should be `a`-prefixed**.
+      * `aNanInfName` uses Pascal record literal syntax with field
+        names; FPC accepts this for typed const arrays at unit
+        scope.  Keep an eye on this if 6.8.h needs to embed it inside
+        a procedure body — typed-const-in-procedure with pointer
+        fields has historically tripped the parser (per Phase 6.7
+        pitfall on `TFoo` records with `PAnsiChar` fields).
+      * Subsequent 6.8 chunks (6.8.b..h) are sequenced in the
+        unit-header doc-comment; 6.8.b (JsonString accumulator)
+        unblocks the rest because every subsequent slice needs string
+        building.  6.8.b's main external dep is `sqlite3RCStr*` —
+        not yet ported; either add an RCStr stub in `passqlite3util`
+        or have JsonString fall back to plain libc-malloc strings
+        for the spill path (lossy but functional).
+
   - **2026-04-26 — Phase 6.bis.4b.2b `%S` SrcItem conversion.**  Closes
     out the last open 6.bis.4b sub-task by porting the
     `etSRCITEM` arm from printf.c:975..1008.  Four-way cascade:
@@ -3142,6 +3215,46 @@ reference exactly.
 
 - [ ] **6.8** (Optional, defer-able) Port `json.c`: JSON1 scalar functions,
   `json_each`, `json_tree`. Only if users need it in v1.
+
+  Sub-tasks (chunks; mark each as it lands):
+  - [X] **6.8.a** Foundation — types (`TJsonCache`, `TJsonString`,
+    `TJsonParse`, `TNanInfName`), constants (`JSONB_*`, `JSTRING_*`,
+    `JEDIT_*`, `JSON_*` flags, `JSON_MAX_DEPTH`, etc.), lookup tables
+    (`aJsonIsSpace`, `jsonSpaces`, `jsonIsOk`, `jsonbType`,
+    `aNanInfName`), and pure helpers (`jsonIsspace`, `jsonHexToInt`,
+    `jsonHexToInt4`, `jsonIs2Hex`, `jsonIs4Hex`, `json5Whitespace`).
+    DONE 2026-04-26.  Gate `TestJson.pas` 98/98 PASS.  See "Most
+    recent activity" entry.
+  - [ ] **6.8.b** JsonString accumulator — `jsonStringInit/Reset/Zero/
+    Oom/TooDeep/Grow/ExpandAndAppend`, `jsonAppendRaw/RawNZ/Char(Expand)/
+    Separator/ControlChar/String/SqlValue`, `jsonStringTerminate`,
+    `jsonReturnString`, `jsonReturnStringAsBlob`.  Requires
+    `sqlite3RCStr*` (not yet ported) — either add as a util stub or
+    spill to plain libc-malloc.
+  - [ ] **6.8.c** JsonParse blob primitives — `jsonBlobExpand`,
+    `jsonBlobMakeEditable`, `jsonBlobAppendOneByte`,
+    `jsonBlobAppendNode`, `jsonBlobChangePayloadSize`,
+    `jsonbValidityCheck`, `jsonbPayloadSize`, `jsonBlobOverwrite`,
+    `jsonBlobEdit`, `jsonAfterEditSizeAdjust`, `jsonbArrayCount`.
+  - [ ] **6.8.d** Text→blob translator — `jsonTranslateTextToBlob`,
+    `jsonConvertTextToBlob`, `jsonAppendControlChar`,
+    `jsonUnescapeOneChar`, `jsonBytesToBypass`, `jsonLabelCompare(d)`.
+  - [ ] **6.8.e** Blob→text + pretty — `jsonTranslateBlobToText`,
+    `jsonPrettyIndent`, `jsonTranslateBlobToPrettyText`,
+    `jsonReturnTextJsonFromBlob`, `jsonReturnParse`.
+  - [ ] **6.8.f** Path lookup + edit — `jsonLookupStep`,
+    `jsonCreateEditSubstructure`.
+  - [ ] **6.8.g** Function-arg cache — `jsonCacheInsert`,
+    `jsonCacheSearch`, `jsonCacheDelete(Generic)`, `jsonParseFuncArg`.
+    Requires `sqlite3_get_auxdata` / `sqlite3_set_auxdata`.
+  - [ ] **6.8.h** SQL-function dispatch + registration —
+    `jsonFunc`, `jsonbFunc`, `json_array`/`_object`/`_extract`/
+    `_set`/`_replace`/`_insert`/`_remove`/`_patch`/`_valid`/
+    `_type`/`_quote`/`_array_length`/`_pretty`/`_error_position`/
+    `_group_array`/`_group_object`, `json_each` + `json_tree` virtual
+    tables, plus `sqlite3RegisterJsonFunctions` registration entry
+    point.  This is the chunk that lights up SQL-visible behaviour;
+    earlier chunks land as untested (in SQL terms) library code.
 
 ### Phase 6.7 implementation notes (2026-04-25)
 

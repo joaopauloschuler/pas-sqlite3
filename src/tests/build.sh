@@ -140,6 +140,7 @@ compile_test TestOpenClose
 compile_test TestPrepareBasic
 compile_test TestRegistration
 compile_test TestPrintf
+compile_test TestJson
 compile_test TestVtab
 compile_test TestCarray
 compile_test TestDbpage
