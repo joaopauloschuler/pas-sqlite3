@@ -91,13 +91,21 @@ Important: At the end of this document, please find:
       OR-arm.  Gate: `TestWhereExpr.pas` T12a..T12k (case-1 IN
       synthesis on rowid OR), T13a..T13c (column-mismatched OR keeps
       ORINFO but skips the IN promotion).  62/62.
-    - [ ] LIKE / GLOB virtual-term synthesis (whereexpr.c:1362..1455),
-      `isLikeOrGlob`, `termIsEquivalence` — still deferred
-      (`isLikeOrGlob` needs `sqlite3ExprAddCollateString` + ICU
-      collation tables; `termIsEquivalence` needs
-      `sqlite3ExprCollSeqMatch` + `SQLITE_Transitive`).
-      `whereCommuteOperator` is the C-side `exprCommute`, already landed
-      in 11g.2.b sub-progress.
+    - [X] LIKE / GLOB virtual-term synthesis (whereexpr.c:1362..1455) +
+      `isLikeOrGlob` (whereexpr.c:178..343).  "x LIKE 'aBc%'" gets two
+      TERM_LIKEOPT|TERM_VIRTUAL|TERM_DYNAMIC children — `x>='ABC'` (TK_GE)
+      and `x<'abd'` (TK_LT) — so the pattern can be served by an index
+      range scan; original LIKE term gets TERM_LIKE when noCase, plus
+      isComplete-gated parent/child links.  Bound-parameter (TK_VARIABLE)
+      RHS path is conservatively skipped — needs `sqlite3VdbeGetBoundValue`
+      + `sqlite3VdbeSetVarmask` which are not yet ported.  The unmodified
+      LIKE call still runs; only the range-scan companions are forgone.
+      `termIsEquivalence` (still deferred) needs `sqlite3ExprCollSeqMatch`
+      + `SQLITE_Transitive` and only affects join-graph WO_EQUIV
+      propagation, never correctness.  `whereCommuteOperator` is the
+      C-side `exprCommute`, already landed in 11g.2.b sub-progress.
+      Gate: `TestWhereExpr.pas` T14a..T14l (LIKE on rowid → range scan
+      synthesis), T15a..T15b (numeric-prefix bailout).  76/76.
 
 - [ ] **6.9-bis 11g.2.d** Port the planner core in `where.c`
     (~5000 lines): `whereLoopAddBtree`, `whereLoopAddBtreeIndex`,

@@ -17,6 +17,7 @@ program TestWhereExpr;
 }
 
 uses
+  SysUtils,
   passqlite3types,
   passqlite3internal,
   passqlite3os,
@@ -89,10 +90,29 @@ var
   pOrInfo3: PWhereOrInfo;
   pColC, pColD, pIntC, pIntD, pEqC, pEqD, pOr2: PExpr;
   iOrIdx2: i32;
+  { T14: LIKE optimization. }
+  pLikeFn, pLikeCol, pLikePat: PExpr;
+  pLikeList: PExprList;
+  iLikeIdx: i32;
+  tokLike: TToken;
+  pLikePatRight, pLikeGeRhs, pLikeLtRhs: PExpr;
+  pSc: PExpr;
+  { T15: numeric prefix bails out. }
+  pLikeFn2, pLikeCol2, pLikePat2: PExpr;
+  pLikeList2: PExprList;
+  iLikeIdx2: i32;
+  nTermBeforeLike: i32;
 
 begin
   WriteLn('=== TestWhereExpr — Phase 6.9-bis 11g.2.c whereexpr helpers ===');
   WriteLn;
+
+  { sqlite3_initialize populates the global builtin-function hash table —
+    required before isLikeOrGlob can resolve "like" via sqlite3FindFunction. }
+  rc := sqlite3_initialize;
+  if rc <> SQLITE_OK then begin
+    WriteLn('FATAL: sqlite3_initialize rc=', rc); Halt(2);
+  end;
 
   db := nil;
   rc := sqlite3_open(':memory:', @db);
@@ -434,6 +454,91 @@ begin
         (pWC^.a[iOrIdx2].eOperator and WO_OR) <> 0);
   Check('T13c no virtual TK_IN appended for column-mismatched OR',
         pWC^.nTerm = nTermBefore + 1);
+
+  { ---- T14: LIKE virtual-term synthesis (whereexpr.c:1362..1455).
+            "x LIKE 'aBc%'" must synthesize two TERM_LIKEOPT|TERM_VIRTUAL|
+            TERM_DYNAMIC children: x>='ABC' (TK_GE) and x<'abd' (TK_LT).
+            Default LIKE is case-insensitive so the original LIKE term gets
+            TERM_LIKE; isComplete=1 so both children are linked as parents
+            of the LIKE term. ---- }
+  pLikeCol := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pLikeCol^.iTable := 0; pLikeCol^.iColumn := -1;
+
+  tokLike.z := PChar('aBc%'); tokLike.n := 4;
+  pLikePat  := sqlite3ExprAlloc(db, TK_STRING, @tokLike, 0);
+
+  pLikeList := sqlite3ExprListAppend(@parse, nil, pLikePat);
+  pLikeList := sqlite3ExprListAppend(@parse, pLikeList, pLikeCol);
+
+  tokLike.z := PChar('like'); tokLike.n := 4;
+  pLikeFn   := sqlite3ExprAlloc(db, TK_FUNCTION, @tokLike, 0);
+  pLikeFn^.x.pList := pLikeList;
+
+  iLikeIdx := pWC^.nTerm;
+  whereClauseInsert(pWC, pLikeFn, 0);
+  exprAnalyze(pSrc, pWC, iLikeIdx);
+
+  Check('T14a LIKE term flagged TERM_LIKE',
+        (pWC^.a[iLikeIdx].wtFlags and TERM_LIKE) <> 0);
+  Check('T14b LIKE spawned 2 children',
+        pWC^.nTerm = iLikeIdx + 3);
+  Check('T14c child 0 op = TK_GE',
+        (pWC^.nTerm > iLikeIdx + 1) and
+        (pWC^.a[iLikeIdx + 1].pExpr^.op = TK_GE));
+  Check('T14d child 1 op = TK_LT',
+        (pWC^.nTerm > iLikeIdx + 2) and
+        (pWC^.a[iLikeIdx + 2].pExpr^.op = TK_LT));
+  Check('T14e child 0 wtFlags has LIKEOPT|VIRTUAL|DYNAMIC',
+        (pWC^.a[iLikeIdx + 1].wtFlags
+         and (TERM_LIKEOPT or TERM_VIRTUAL or TERM_DYNAMIC))
+        = (TERM_LIKEOPT or TERM_VIRTUAL or TERM_DYNAMIC));
+  Check('T14f child 1 wtFlags has LIKEOPT|VIRTUAL|DYNAMIC',
+        (pWC^.a[iLikeIdx + 2].wtFlags
+         and (TERM_LIKEOPT or TERM_VIRTUAL or TERM_DYNAMIC))
+        = (TERM_LIKEOPT or TERM_VIRTUAL or TERM_DYNAMIC));
+  Check('T14g child 0 iParent = LIKE idx (isComplete)',
+        pWC^.a[iLikeIdx + 1].iParent = iLikeIdx);
+  Check('T14h child 1 iParent = LIKE idx (isComplete)',
+        pWC^.a[iLikeIdx + 2].iParent = iLikeIdx);
+  Check('T14i LIKE nChild = 2',
+        pWC^.a[iLikeIdx].nChild = 2);
+  pLikeGeRhs := pWC^.a[iLikeIdx + 1].pExpr^.pRight;
+  pLikeLtRhs := pWC^.a[iLikeIdx + 2].pExpr^.pRight;
+  Check('T14j child 0 RHS = "ABC" (uppercased lower bound)',
+        (pLikeGeRhs <> nil) and (pLikeGeRhs^.op = TK_STRING)
+        and (StrComp(pLikeGeRhs^.u.zToken, 'ABC') = 0));
+  Check('T14k child 1 RHS = "abd" (incremented lower bound)',
+        (pLikeLtRhs <> nil) and (pLikeLtRhs^.op = TK_STRING)
+        and (StrComp(pLikeLtRhs^.u.zToken, 'abd') = 0));
+  pSc := pWC^.a[iLikeIdx + 1].pExpr^.pLeft;
+  Check('T14l child 0 LHS wraps a TK_COLLATE node',
+        (pSc <> nil) and (pSc^.op = TK_COLLATE));
+
+  { ---- T15: LIKE numeric-prefix bailout — "rowid LIKE '12%'"  is
+            rejected because pLeft is non-TEXT-affinity and "12" parses
+            as a number; whereexpr.c:1376..1378 returns rc=0, no virtual
+            children. ---- }
+  pLikeCol2 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pLikeCol2^.iTable := 0; pLikeCol2^.iColumn := -1;
+
+  tokLike.z := PChar('12%'); tokLike.n := 3;
+  pLikePat2 := sqlite3ExprAlloc(db, TK_STRING, @tokLike, 0);
+
+  pLikeList2 := sqlite3ExprListAppend(@parse, nil, pLikePat2);
+  pLikeList2 := sqlite3ExprListAppend(@parse, pLikeList2, pLikeCol2);
+
+  tokLike.z := PChar('like'); tokLike.n := 4;
+  pLikeFn2  := sqlite3ExprAlloc(db, TK_FUNCTION, @tokLike, 0);
+  pLikeFn2^.x.pList := pLikeList2;
+
+  iLikeIdx2       := pWC^.nTerm;
+  nTermBeforeLike := pWC^.nTerm;
+  whereClauseInsert(pWC, pLikeFn2, 0);
+  exprAnalyze(pSrc, pWC, iLikeIdx2);
+  Check('T15a numeric-prefix LIKE adds no virtual child',
+        pWC^.nTerm = nTermBeforeLike + 1);
+  Check('T15b numeric-prefix LIKE term not flagged TERM_LIKE',
+        (pWC^.a[iLikeIdx2].wtFlags and TERM_LIKE) = 0);
 
   { Skip sqlite3WhereClauseClear / sqlite3DbFree for the synthetic
     WhereInfo: pWC^.a was allocated through sqlite3WhereMalloc and is

@@ -1539,6 +1539,8 @@ function  whereClauseInsert(pWC: PWhereClause; p: PExpr; wtFlags: u16): i32;
 procedure markTermAsChild(pWC: PWhereClause; iChild: i32; iParent: i32);
 procedure transferJoinMarkings(pDerived: PExpr; pBase: PExpr);
 function  exprCommute(pPrs: PParse; pX: PExpr): u16;
+function  isLikeOrGlob(pPrs: PParse; pExpr: PExpr; ppPrefix: PPExpr;
+  pisComplete: Pi32; pnoCase: Pi32): i32;
 function  whereNthSubterm(pTerm: PWhereTerm; N: i32): PWhereTerm;
 procedure whereCombineDisjuncts(pSrc: PSrcList; pWC: PWhereClause;
   pOne: PWhereTerm; pTwo: PWhereTerm);
@@ -5696,6 +5698,153 @@ end;
     Possibly inserts a virtual TK_IN term at the tail of pWC. }
 function allowedOp(op: i32): i32; forward;
 
+{ isLikeOrGlob — faithful port of whereexpr.c:178..343 (sqlite3 3.53.0).
+  Returns 1 iff pExpr is a LIKE/GLOB call whose pattern has a non-wildcard
+  prefix that admits the LIKE optimization "x LIKE 'aBc%'" → range scan.
+  On success *ppPrefix receives a freshly allocated TK_STRING expression
+  carrying the (escape-stripped) prefix; *pisComplete is 1 iff the only
+  wildcard is a trailing '%'; *pnoCase is 1 iff the call is case-insensitive.
+
+  Bound-parameter (TK_VARIABLE) RHS is conservatively skipped — porting the
+  reprepare path needs sqlite3VdbeGetBoundValue + sqlite3VdbeSetVarmask which
+  are not yet ported.  The unmodified LIKE call itself still runs; only the
+  range-scan virtual companions are forgone. }
+function isLikeOrGlob(pPrs: PParse; pExpr: PExpr; ppPrefix: PPExpr;
+  pisComplete: Pi32; pnoCase: Pi32): i32;
+var
+  z:        Pu8;
+  pRight, pLeft: PExpr;
+  pList:    PExprList;
+  c:        u8;
+  cnt:      i32;
+  wc:       array[0..3] of AnsiChar;
+  db:       PTsqlite3;
+  op:       i32;
+  pPrefix:  PExpr;
+  iFrom, iTo: i32;
+  zNew:     PAnsiChar;
+  isNum:    i32;
+  rDummy:   Double;
+  z2:       Pu8;
+  utfCh:    u32;
+  pTab:     PTable2;
+  zTmp:     PChar;
+begin
+  Result := 0;
+  db := pPrs^.db;
+  z := nil;
+  c := 0;
+  cnt := 0;
+
+  wc[3] := #0;  { sqlite3IsLikeFunction sets wc[0..2] only; clear wc[3] (escape). }
+  if sqlite3IsLikeFunction(db, pExpr, pnoCase, @wc[0]) = 0 then Exit;
+  Assert(ExprUseXList(pExpr));
+  pList := pExpr^.x.pList;
+  pLeft := ExprListItems(pList)[1].pExpr;
+
+  pRight := sqlite3ExprSkipCollate(ExprListItems(pList)[0].pExpr);
+  op := pRight^.op;
+  if op = TK_VARIABLE then
+  begin
+    Exit;
+  end
+  else if op = TK_STRING then
+  begin
+    Assert((pRight^.flags and EP_IntValue) = 0);
+    z := Pu8(pRight^.u.zToken);
+  end;
+
+  if z <> nil then
+  begin
+    cnt := 0;
+    while True do
+    begin
+      c := z[cnt];
+      if (c = 0) or (c = u8(wc[0])) or (c = u8(wc[1])) or (c = u8(wc[2])) then
+        Break;
+      Inc(cnt);
+      if (c = u8(wc[3])) and (z[cnt] > 0) and (z[cnt] < $80) then
+      begin
+        Inc(cnt);
+      end
+      else if c >= $80 then
+      begin
+        z2 := z + cnt - 1;
+        zTmp := PChar(z2);
+        utfCh := sqlite3Utf8Read(@zTmp);
+        z2 := Pu8(zTmp);
+        if (c = $FF) or (utfCh = $FFFD)
+           or (db^.enc = SQLITE_UTF16LE) then
+        begin
+          Dec(cnt);
+          Break;
+        end
+        else
+          cnt := i32(PtrUInt(z2) - PtrUInt(z));
+      end;
+    end;
+
+    if ((cnt > 1) or ((cnt > 0) and (z[0] <> u8(wc[3])))) and (z[cnt - 1] <> $FF) then
+    begin
+      if (c = u8(wc[0])) and (z[cnt + 1] = 0) and (db^.enc <> SQLITE_UTF16LE) then
+        pisComplete^ := 1
+      else
+        pisComplete^ := 0;
+
+      pPrefix := sqlite3Expr(db, TK_STRING, PAnsiChar(z));
+      if pPrefix <> nil then
+      begin
+        Assert((pPrefix^.flags and EP_IntValue) = 0);
+        zNew := pPrefix^.u.zToken;
+        zNew[cnt] := #0;
+        iFrom := 0;
+        iTo := 0;
+        while iFrom < cnt do
+        begin
+          if zNew[iFrom] = wc[3] then Inc(iFrom);
+          zNew[iTo] := zNew[iFrom];
+          Inc(iTo);
+          Inc(iFrom);
+        end;
+        zNew[iTo] := #0;
+        Assert(iTo > 0);
+
+        if pLeft^.op = TK_COLUMN then
+          pTab := PTable2(pLeft^.y.pTab)
+        else
+          pTab := nil;
+        if (pLeft^.op <> TK_COLUMN)
+           or (Byte(sqlite3ExprAffinity(pLeft)) <> SQLITE_AFF_TEXT)
+           or ((pTab <> nil) and (pTab^.eTabType = TABTYP_VTAB)) then
+        begin
+          isNum := sqlite3AtoF(zNew, rDummy);
+          if isNum <= 0 then
+          begin
+            if (iTo = 1) and (zNew[0] = '-') then
+              isNum := 1
+            else
+            begin
+              Inc(zNew[iTo - 1]);
+              isNum := sqlite3AtoF(zNew, rDummy);
+              Dec(zNew[iTo - 1]);
+            end;
+          end;
+          if isNum > 0 then
+          begin
+            sqlite3ExprDelete(db, pPrefix);
+            Exit;
+          end;
+        end;
+      end;
+      ppPrefix^ := pPrefix;
+    end
+    else
+      z := nil;
+  end;
+
+  if z <> nil then Result := 1;
+end;
+
 procedure exprAnalyzeOrTerm(pSrc: PSrcList; pWC: PWhereClause; idxTerm: i32);
 var
   pWInfo:    PWhereInfo;
@@ -6471,6 +6620,18 @@ var
   pBLeft:     PExpr;           { NOTNULL: alias for pX^.pLeft }
   pNewExpr:   PExpr;
   iBet:       i32;
+  { LIKE/GLOB synthesis locals (whereexpr.c:1376..1453). }
+  pStr1, pStr2: PExpr;
+  pLikeLeft:    PExpr;
+  pNewExpr1, pNewExpr2: PExpr;
+  idxNew1, idxNew2: i32;
+  isComplete, noCase: i32;
+  pC:           Pu8;
+  nLen:         i32;
+  cLk:          AnsiChar;
+  iLk:          i32;
+  zCollSeqName: PAnsiChar;
+  wtLikeFlags:  u16;
 begin
   { whereexpr.c:1122.. — trimmed body; see banner above for what is and is
     not covered.  Comments cite C source line numbers. }
@@ -6680,10 +6841,88 @@ begin
         pNewTerm^.prereqAll := pTerm^.prereqAll;
       end;
     end;
-  end;
+  end
 
-  { TK_FUNCTION LIKE/GLOB optimisation (whereexpr.c:1362..1455) deferred —
-    needs isLikeOrGlob, sqlite3ExprAddCollateString, ICU collation tables. }
+  { TK_FUNCTION LIKE/GLOB optimisation (whereexpr.c:1362..1455).
+    "x LIKE 'aBc%'" → x>='ABC' AND x<'abd' AND x LIKE 'aBc%'.  The two
+    range bounds are inserted as TERM_LIKEOPT|TERM_VIRTUAL|TERM_DYNAMIC
+    children of the LIKE term; if the wildcard tail is the only wildcard
+    (isComplete=1) the original LIKE term is also marked as parent of the
+    two new terms so disable propagation can skip the LIKE itself once
+    the range bounds are satisfied by an index. }
+  else if (pX^.op = TK_FUNCTION) and (pWC^.op = TK_AND) then
+  begin
+    pStr1 := nil;
+    isComplete := 0;
+    noCase := 0;
+    if isLikeOrGlob(pPrs, pX, @pStr1, @isComplete, @noCase) <> 0 then
+    begin
+      Assert(ExprUseXList(pX));
+      pLikeLeft := ExprListItems(pX^.x.pList)[1].pExpr;
+      pStr2 := sqlite3ExprDup(db, pStr1, 0);
+
+      { Convert lower bound to upper-case, upper bound to lower-case so
+        the range constraints work for BLOBs (whereexpr.c:1396..1408). }
+      if (noCase <> 0) and (db^.mallocFailed = 0) then
+      begin
+        pTerm := @pWC^.a[idxTerm];
+        pTerm^.wtFlags := pTerm^.wtFlags or TERM_LIKE;
+        iLk := 0;
+        while pStr1^.u.zToken[iLk] <> #0 do
+        begin
+          cLk := pStr1^.u.zToken[iLk];
+          pStr1^.u.zToken[iLk] := AnsiChar(sqlite3Toupper(u8(cLk)));
+          pStr2^.u.zToken[iLk] := AnsiChar(sqlite3Tolower(u8(cLk)));
+          Inc(iLk);
+        end;
+      end;
+
+      if db^.mallocFailed = 0 then
+      begin
+        nLen := sqlite3Strlen30(pStr2^.u.zToken);
+        pC := Pu8(pStr2^.u.zToken) + (nLen - 1);
+        if noCase <> 0 then
+        begin
+          if pC^ = u8(Ord('A') - 1) then isComplete := 0;
+          pC^ := sqlite3UpperToLower[pC^];
+        end;
+        while (pC^ = $BF) and (PtrUInt(pC) > PtrUInt(pStr2^.u.zToken)) do
+        begin
+          pC^ := $80;
+          Dec(pC);
+        end;
+        Assert(pC^ <> $FF);
+        Inc(pC^);
+      end;
+
+      if noCase <> 0 then zCollSeqName := PAnsiChar('NOCASE')
+      else zCollSeqName := PAnsiChar('BINARY');
+      wtLikeFlags := TERM_LIKEOPT or TERM_VIRTUAL or TERM_DYNAMIC;
+
+      pNewExpr1 := sqlite3ExprDup(db, pLikeLeft, 0);
+      pNewExpr1 := sqlite3PExpr(pPrs, TK_GE,
+                     sqlite3ExprAddCollateString(pPrs, pNewExpr1, zCollSeqName),
+                     pStr1);
+      transferJoinMarkings(pNewExpr1, pX);
+      idxNew1 := whereClauseInsert(pWC, pNewExpr1, wtLikeFlags);
+
+      pNewExpr2 := sqlite3ExprDup(db, pLikeLeft, 0);
+      pNewExpr2 := sqlite3PExpr(pPrs, TK_LT,
+                     sqlite3ExprAddCollateString(pPrs, pNewExpr2, zCollSeqName),
+                     pStr2);
+      transferJoinMarkings(pNewExpr2, pX);
+      idxNew2 := whereClauseInsert(pWC, pNewExpr2, wtLikeFlags);
+
+      exprAnalyze(pSrc, pWC, idxNew1);
+      exprAnalyze(pSrc, pWC, idxNew2);
+      pTerm := @pWC^.a[idxTerm];
+      if isComplete <> 0 then
+      begin
+        markTermAsChild(pWC, idxNew1, idxTerm);
+        markTermAsChild(pWC, idxNew2, idxTerm);
+      end;
+    end;
+  end;
 
   { Vector == / IS expansion (whereexpr.c:1467..1489) and vector IN expansion
     (whereexpr.c:1500..1518) deferred — vector predicates are out of scope
