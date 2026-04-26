@@ -20,6 +20,98 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 10): wire real format strings
+    + args at the 7 sqlite3NestedParse call sites.**  Fills in the
+    placeholders left by step 9 — every `sqlite3NestedParse(pParse,
+    nil, [])` in `passqlite3codegen.pas` now passes its real C-side
+    format string and argument list (all ported byte-for-byte from
+    `../sqlite3/src/build.c`).  Also wires the two adjacent
+    `sqlite3VdbeAddParseSchemaOp` filter strings (CREATE TABLE
+    `tbl_name='%q' AND type!='trigger'` and CREATE INDEX
+    `name='%q' AND type='index'`).
+
+    Concrete changes (all in `src/passqlite3codegen.pas`):
+      * `sqlite3EndTable` (build.c:2903) — now computes `zType`
+        ("table"/"view") + `zType2` ("TABLE"/"view"), builds `zStmt`
+        via `sqlite3MPrintf('CREATE %s %.*s', [zType2, n,
+        sNameToken.z])`, then dispatches the `UPDATE %Q.sqlite_master
+        SET type='%s', name=%Q, tbl_name=%Q, rootpage=#%d, sql=%Q
+        WHERE rowid=#%d` schema-row update with the seven-tuple
+        (zDbSName, zType, zName, zName, regRoot, zStmt, regRowid).
+        Also computes the `tbl_name='%q' AND type!='trigger'`
+        reparse filter and passes it to `AddParseSchemaOp`.
+        Adds local vars `zType / zType2 / zStmt / zReparse`.
+      * `destroyRootPage` (build.c:3301) — autovacuum-arm UPDATE
+        wired with `(zDbSName, iTable, r1, r1)`.
+      * `sqlite3ClearStatTables` (build.c:3376) — per-stat-N DELETE
+        wired with `(zDbName, &zTab[0], zType, zName)`.
+      * `sqlite3CodeDropTable` (build.c:3422+3436) — both calls
+        wired: AUTOINCREMENT-arm `DELETE FROM %Q.sqlite_sequence
+        WHERE name=%Q` + main-arm `DELETE FROM %Q.sqlite_master
+        WHERE tbl_name=%Q and type!='trigger'`.
+      * `sqlite3DropIndex` (build.c:4649) — schema-row DELETE wired
+        with `(zDbSName, pIndex^.zName)`; the previously stubbed
+        `sqlite3ClearStatTables` call is now uncommented (it
+        already exists as a real procedure).
+      * `sqlite3CreateIndex` (build.c:4460) — schema-row INSERT
+        wired with the five-tuple `(zDbSName, pIndex^.zName,
+        pTab^.zName, iMem, zStmt)`; reparse-filter `name='%q' AND
+        type='index'` computed and passed to `AddParseSchemaOp`.
+        Adds local var `zStmtReparse`.
+
+    Tests: full build clean.  TestExplainParity: **2 PASS / 8
+    DIVERGE / 0 ERROR** (unchanged from step 9 — see Discoveries).
+    Regression spot check (2026-04-26): TestPrepareBasic 20/20,
+    TestParser 45/45, TestParserSmoke 20/20, TestSchemaBasic
+    44/44, TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic
+    49/49, TestExprBasic 40/40, TestVdbeTxn 8/8, TestAuthBuiltins
+    34/34, TestOpenClose 17/17, TestSmoke + TestUtil clean,
+    TestJson 434/434, TestJsonEach 50/50, TestJsonRegister 48/48,
+    TestPrintf 105/105, TestVtab 216/216.
+
+    Discoveries / next-step notes:
+      * **Why TestExplainParity didn't move yet.**  The format
+        strings now produce real SQL like `UPDATE main.sqlite_master
+        SET type='table', name='t', ...` and `sqlite3RunParser`
+        does dispatch via the step-9 hook, but the inner UPDATE /
+        INSERT / DELETE statements land in `sqlite3Update`,
+        `sqlite3Insert`, `sqlite3DeleteFrom` — all of which are
+        Phase 6.4 stubs that simply free their inputs and emit no
+        ops.  So the schema-row sub-statements parse cleanly and
+        emit zero opcodes, leaving the gap exactly where step 9
+        left it.  Next gate (the actual DIVERGE-flipper) is to
+        port `sqlite3Insert` / `sqlite3Update` / `sqlite3Delete`
+        far enough to emit `OP_OpenWrite / OP_String8 /
+        OP_MakeRecord / OP_Insert` against `sqlite_master`.
+      * **`pEnd2 = tabOpts ? &sLastToken : pEnd`** is a 3-pointer
+        comparison in C; in Pascal the `@pParse^.sLastToken`
+        address-of yields a PToken safely (sLastToken is a
+        `TToken` field, not a pointer).  Confirmed `tabOpts` is
+        a u32 here, not the `Token *` it is at parse-time, so the
+        ternary maps cleanly to Pascal `if tabOpts <> 0`.
+      * **`pEnd2^.z[0] <> ';'` is guarded by `pEnd2^.z <> nil`.**
+        The C reference dereferences unconditionally because the
+        parse epilogue never reaches `sqlite3EndTable` with a nil
+        `pEnd->z`; the explicit nil-check here is defensive
+        Pascal-style.
+      * **`%w` not yet used.**  All seven call sites use `%Q`
+        (SQL-quoted, NULL-tolerant) for identifiers because that
+        matches the C source verbatim — `%w` would only be
+        needed for the `RENAME` path in Phase 7.  Confirmed
+        `passqlite3printf` already supports `%Q` / `%q` / `%s` /
+        `%d` per the 6.bis.4b series.
+      * **`sqlite3ClearStatTables` was already a real procedure**
+        from step 5 (DropTable family).  The `TODO` comment on
+        the DropIndex side was stale; the call is now uncommented
+        and routes correctly through the real body which itself
+        now emits the real DELETE-from-sqlite_statN sub-statements.
+      * **Next 6.9-bis target: step 11 — `sqlite3Insert` /
+        `sqlite3Update` / `sqlite3DeleteFrom` codegen** (or at
+        minimum a path that recognises `tbl_name=sqlite_master`
+        and emits OpenWrite + String8 + MakeRecord + Insert/Delete).
+        That is the actual DIVERGE-flipper for the ~13-op gap on
+        every CREATE TABLE / DROP TABLE / CREATE INDEX row.
+
   - **2026-04-26 — Phase 6.9-bis (step 9): sqlite3NestedParse
     structural port (build.c:293) + parser-dispatch hook.**  Replaces
     the 3-line `{ Phase 7 }` stub at `passqlite3codegen.pas:7494`
@@ -6506,16 +6598,24 @@ Phase 5.9 depends on this being done first.
   parser-dispatch hook; the 7 internal call sites still pass nil
   zFormat — wiring real format strings + args is step 10, which is
   what actually flips DIVERGE rows because it produces the schema-row
-  UPDATE/INSERT/DELETE sub-statements))
+  UPDATE/INSERT/DELETE sub-statements),
+  ~~step 10: real format strings + args at all 7 NestedParse call
+  sites~~ done 2026-04-26 (formats + arg lists ported byte-for-byte
+  from build.c; rows still DIVERGE because the schema-row
+  UPDATE/INSERT/DELETE inner statements land in the still-stubbed
+  sqlite3Insert / sqlite3Update / sqlite3DeleteFrom — that is now
+  the next gate))
   to byte-identical opcode emission against C.  Each helper landed
   flips one row from DIVERGE → PASS in TestExplainParity; an extra
   diagnostic-only column-list AV must also be triaged
   (`CREATE TABLE typed`, `CREATE TABLE WITHOUT ROWID`).  Once all
   ten current rows PASS, expand corpus to DML / SELECT / pragma /
   trigger forms (the same exclusion list as TestParser).
-  Status (2026-04-26 step 9): **2 PASS / 8 DIVERGE / 0 ERROR**
-  (unchanged from step 8 — step 9 lands NestedParse infra without
-  yet wiring real format strings; step 10 will flip rows).
+  Status (2026-04-26 step 10): **2 PASS / 8 DIVERGE / 0 ERROR**
+  (unchanged from step 9 — step 10 wires real format strings, but
+  the resulting inner UPDATE/INSERT/DELETE recurse through stubbed
+  DML codegen which emits zero ops; flipping requires step 11
+  (sqlite3Insert / sqlite3Update / sqlite3DeleteFrom)).
   CREATE INDEX rows now report "nil Vdbe" (was "C=37 Pas=3") —
   honest reflection that LocateTableItem fails because the seed
   CREATE TABLEs never publish to tblHash (NestedParse stub).

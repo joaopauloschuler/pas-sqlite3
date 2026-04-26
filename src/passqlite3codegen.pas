@@ -6116,6 +6116,10 @@ var
   v:       PVdbe;
   pEnd2:   PToken;
   n:       i32;
+  zType:   PAnsiChar;
+  zType2:  PAnsiChar;
+  zStmt:   PAnsiChar;
+  zReparse: PAnsiChar;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -6191,10 +6195,41 @@ begin
       pSelect := nil;
     end;
 
-    { sqlite3NestedParse(...) UPDATE sqlite_schema SET ... — currently a
-      no-op stub; structural call lands now so this fires automatically
-      when NestedParse is real. }
-    sqlite3NestedParse(pParse, nil, []);
+    { Determine zType / zType2 (build.c:2811..2820): regular table vs view. }
+    if pTab^.eTabType = TABTYP_NORM then begin
+      zType  := PAnsiChar('table');
+      zType2 := PAnsiChar('TABLE');
+    end else begin
+      zType  := PAnsiChar('view');
+      zType2 := PAnsiChar('view'); { unreachable today: VIEW emits via sqlite3CreateView }
+    end;
+
+    { Compute the complete text of the CREATE statement (build.c:2886..2896). }
+    if pSelect <> nil then begin
+      { CREATE TABLE AS SELECT — createTableStmt() not yet ported. }
+      zStmt := nil;
+    end else begin
+      pEnd2 := pEnd;
+      if tabOpts <> 0 then pEnd2 := @pParse^.sLastToken;
+      n := i32(PtrUInt(pEnd2^.z) - PtrUInt(pParse^.sNameToken.z));
+      if (pEnd2^.z <> nil) and (pEnd2^.z[0] <> ';') then n := n + i32(pEnd2^.n);
+      zStmt := sqlite3MPrintf(db, 'CREATE %s %.*s',
+                              [zType2, n, pParse^.sNameToken.z]);
+    end;
+
+    { Schema-row UPDATE — port of build.c:2903..2914. }
+    sqlite3NestedParse(pParse,
+      'UPDATE %Q.' + LEGACY_SCHEMA_TABLE +
+      ' SET type=''%s'', name=%Q, tbl_name=%Q, rootpage=#%d, sql=%Q' +
+      ' WHERE rowid=#%d',
+      [db^.aDb[iDb].zDbSName,
+       zType,
+       pTab^.zName,
+       pTab^.zName,
+       pParse^.u1.cr.regRoot,
+       zStmt,
+       pParse^.u1.cr.regRowid]);
+    sqlite3DbFree(db, zStmt);
 
     sqlite3ChangeCookie(pParse, iDb);
 
@@ -6202,11 +6237,10 @@ begin
       never set today (parser stub), so this block is unreachable.
       Structural placeholder kept as a comment for future wiring. }
 
-    { Reparse the table we just wrote. }
-    sqlite3VdbeAddParseSchemaOp(v, iDb, nil, 0);
-    { TODO(Phase 6.x): once sqlite3MPrintf-format support for the
-      "tbl_name='%q' AND type!='trigger'" filter is wired, replace the
-      nil zWhere above with the real filter string. }
+    { Reparse the table we just wrote (build.c:2935..2936). }
+    zReparse := sqlite3MPrintf(db, 'tbl_name=''%q'' AND type!=''trigger''',
+                                [pTab^.zName]);
+    sqlite3VdbeAddParseSchemaOp(v, iDb, zReparse, 0);
 
     { TF_HasGenerated post-emit check (OP_SqlExec) deferred. }
   end;
@@ -6296,11 +6330,12 @@ begin
   sqlite3VdbeAddOp3(v, OP_Destroy, iTable, r1, iDb);
   sqlite3MayAbort(pParse);
   { OMIT_AUTOVACUUM gating: in C the next call is wrapped in
-    `#ifndef SQLITE_OMIT_AUTOVACUUM`.  This port keeps autovacuum on (matching
-    the C reference build), so the NestedParse fires here.  sqlite3NestedParse
-    is currently a no-op stub — once it is real, the
-    `UPDATE sqlite_schema SET rootpage=...` sub-statement will actually emit. }
-  sqlite3NestedParse(pParse, nil, []);
+    `#ifndef SQLITE_OMIT_AUTOVACUUM`.  This port keeps autovacuum on
+    (matching the C reference build).  Format ported from build.c:3301. }
+  sqlite3NestedParse(pParse,
+    'UPDATE %Q.' + LEGACY_SCHEMA_TABLE +
+    ' SET rootpage=%d WHERE #%d AND rootpage=#%d',
+    [pParse^.db^.aDb[iDb].zDbSName, iTable, r1, r1]);
   sqlite3ReleaseTempReg(pParse, r1);
 end;
 
@@ -6335,7 +6370,9 @@ begin
   for i := 1 to 4 do begin
     snpFmt(SizeOf(zTab), @zTab[0], 'sqlite_stat%d', [i]);
     if sqlite3FindTable(pParse^.db, @zTab[0], zDbName) <> nil then
-      sqlite3NestedParse(pParse, nil, []);
+      sqlite3NestedParse(pParse,
+        'DELETE FROM %Q.%s WHERE %s=%Q',
+        [zDbName, PAnsiChar(@zTab[0]), zType, zName]);
   end;
 end;
 
@@ -6398,15 +6435,17 @@ begin
     pTrg := pTrg^.pNext;
   end;
 
-  { Remove sqlite_sequence rows for an autoinc table.  NestedParse is a
-    stub so this currently emits no ops; structural port lands now. }
+  { Remove sqlite_sequence rows for an autoinc table (build.c:3422). }
   if (pTab^.tabFlags and TF_Autoincrement) <> 0 then
-    sqlite3NestedParse(pParse, nil, []);
+    sqlite3NestedParse(pParse,
+      'DELETE FROM %Q.sqlite_sequence WHERE name=%Q',
+      [db^.aDb[iDb].zDbSName, pTab^.zName]);
 
-  { Delete the schema-table rows for this object.  NestedParse stub: no
-    ops emitted yet — placeholder call kept so the call graph is correct
-    for when NestedParse becomes real. }
-  sqlite3NestedParse(pParse, nil, []);
+  { Delete the schema-table rows for this object (build.c:3436). }
+  sqlite3NestedParse(pParse,
+    'DELETE FROM %Q.' + LEGACY_SCHEMA_TABLE +
+    ' WHERE tbl_name=%Q and type!=''trigger''',
+    [db^.aDb[iDb].zDbSName, pTab^.zName]);
 
   if (isView = 0) and (not isVtab) then
     destroyTable(pParse, pTab);
@@ -6615,11 +6654,12 @@ begin
   v := sqlite3GetVdbe(pParse);
   if v <> nil then begin
     sqlite3BeginWriteOperation(pParse, 1, iDb);
-    { TODO(Phase 6.x): once sqlite3NestedParse is real, emit the
-      `DELETE FROM <db>.sqlite_master WHERE name=<idx> AND type='index'`
-      sub-statement that the C reference produces here. }
-    sqlite3NestedParse(pParse, nil, []);
-    { TODO(Phase 6.x): sqlite3ClearStatTables(pParse, iDb, 'idx', pIndex^.zName); }
+    { Schema-row DELETE — build.c:4649. }
+    sqlite3NestedParse(pParse,
+      'DELETE FROM %Q.' + LEGACY_SCHEMA_TABLE +
+      ' WHERE name=%Q AND type=''index''',
+      [db^.aDb[iDb].zDbSName, pIndex^.zName]);
+    sqlite3ClearStatTables(pParse, iDb, PAnsiChar('idx'), pIndex^.zName);
     sqlite3ChangeCookie(pParse, iDb);
     destroyRootPage(pParse, i32(pIndex^.tnum), iDb);
     sqlite3VdbeAddOp4(v, OP_DropIndex, iDb, 0, 0, pIndex^.zName, 0);
@@ -6716,6 +6756,7 @@ var
   zName:       PAnsiChar;
   zExtra:      PAnsiChar;
   zStmt:       PAnsiChar;
+  zStmtReparse: PAnsiChar;
   nName:       i32;
   i, n:        i32;
   nExtraCol:   i32;
@@ -6912,9 +6953,11 @@ begin
       end else
         zStmt := nil;
 
-      { Schema-row INSERT — sqlite3NestedParse is a stub today; structural
-        call lands now so this fires automatically when NestedParse is real. }
-      sqlite3NestedParse(pParse, nil, []);
+      { Schema-row INSERT — build.c:4460. }
+      sqlite3NestedParse(pParse,
+        'INSERT INTO %Q.' + LEGACY_SCHEMA_TABLE +
+        ' VALUES(''index'',%Q,%Q,#%d,%Q);',
+        [db^.aDb[iDb].zDbSName, pIndex^.zName, pTab^.zName, iMem, zStmt]);
       sqlite3DbFree(db, zStmt);
 
       if pTblName <> nil then begin
@@ -6924,7 +6967,9 @@ begin
           unconditionally so the schema cookie / parse-schema / expire
           tail matches C. }
         sqlite3ChangeCookie(pParse, iDb);
-        sqlite3VdbeAddParseSchemaOp(v, iDb, nil, 0);
+        zStmtReparse := sqlite3MPrintf(db,
+          'name=''%q'' AND type=''index''', [pIndex^.zName]);
+        sqlite3VdbeAddParseSchemaOp(v, iDb, zStmtReparse, 0);
         sqlite3VdbeAddOp2(v, OP_Expire, 0, 1);
       end;
 
