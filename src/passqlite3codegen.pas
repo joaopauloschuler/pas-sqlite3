@@ -1390,15 +1390,20 @@ const
   BMS = i32(SizeOf(Bitmask) * 8);  { = 64 on a u64 Bitmask }
 
   { WHERE_ORDERBY_* flags (passed to sqlite3WhereBegin wctrlFlags) }
-  WHERE_ORDERBY_NORMAL  = u16($0000);
-  WHERE_ORDERBY_MIN     = u16($0001);
-  WHERE_ORDERBY_MAX     = u16($0002);
-  WHERE_GROUPBY         = u16($0040);
-  WHERE_DISTINCTBY      = u16($0080);
-  WHERE_WANT_DISTINCT   = u16($0100);
-  WHERE_SORTBYGROUP     = u16($0200);
-  WHERE_ORDERBY_LIMIT   = u16($0800);
-  WHERE_RIGHT_JOIN      = u16($1000);
+  WHERE_ORDERBY_NORMAL   = u16($0000);
+  WHERE_ORDERBY_MIN      = u16($0001);
+  WHERE_ORDERBY_MAX      = u16($0002);
+  WHERE_ONEPASS_DESIRED  = u16($0004);
+  WHERE_ONEPASS_MULTIROW = u16($0008);
+  WHERE_OR_SUBCLAUSE     = u16($0020);
+  WHERE_GROUPBY          = u16($0040);
+  WHERE_DISTINCTBY       = u16($0080);
+  WHERE_WANT_DISTINCT    = u16($0100);
+  WHERE_SORTBYGROUP      = u16($0200);
+  WHERE_ORDERBY_LIMIT    = u16($0800);
+  WHERE_RIGHT_JOIN       = u16($1000);
+  WHERE_KEEP_ALL_JOINS   = u16($2000);
+  WHERE_USE_LIMIT        = u16($4000);
 
   { WHERE_DISTINCT_* values returned by sqlite3WhereIsDistinct }
   WHERE_DISTINCT_NOOP      = 0;
@@ -5905,13 +5910,6 @@ end;
   (no callers exist yet).  The trimmed planner pick + OP_NotExists emission
   that flips the 5 CREATE TABLE rows in TestExplainParity lands in the next
   sub-progress commit. }
-const
-  WHERE_ONEPASS_DESIRED  = u16($0004);
-  WHERE_ONEPASS_MULTIROW = u16($0008);
-  WHERE_OR_SUBCLAUSE_C   = u16($0020);
-  WHERE_KEEP_ALL_JOINS_C = u16($2000);
-  WHERE_USE_LIMIT_C      = u16($4000);
-
 function sqlite3WhereBegin(pParse: PParse; pTabList: PSrcList; pWhere: PExpr;
   pOrderBy: PExprList; pResultSet: PExprList; pSelect: PSelect;
   wctrlFlags: u16; iAuxArg: i32): PWhereInfo;
@@ -5926,9 +5924,9 @@ var
 begin
   Assert(((wctrlFlags and WHERE_ONEPASS_MULTIROW) = 0)
       or (((wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0)
-          and ((wctrlFlags and WHERE_OR_SUBCLAUSE_C) = 0)));
-  Assert(((wctrlFlags and WHERE_OR_SUBCLAUSE_C) = 0)
-      or ((wctrlFlags and WHERE_USE_LIMIT_C) = 0));
+          and ((wctrlFlags and WHERE_OR_SUBCLAUSE) = 0)));
+  Assert(((wctrlFlags and WHERE_OR_SUBCLAUSE) = 0)
+      or ((wctrlFlags and WHERE_USE_LIMIT) = 0));
 
   { Variable initialization (where.c:6863..6864) }
   db := pParse^.db;
@@ -5940,7 +5938,7 @@ begin
   begin
     pOrderBy   := nil;
     wctrlFlags := wctrlFlags and (not WHERE_WANT_DISTINCT);
-    wctrlFlags := wctrlFlags or WHERE_KEEP_ALL_JOINS_C;
+    wctrlFlags := wctrlFlags or WHERE_KEEP_ALL_JOINS;
   end;
 
   { The number of tables in the FROM clause is capped at BMS (where.c:6873..
@@ -5952,7 +5950,7 @@ begin
   end;
 
   { WHERE_OR_SUBCLAUSE collapses nTabList to 1 (where.c:6885). }
-  if (wctrlFlags and WHERE_OR_SUBCLAUSE_C) <> 0 then
+  if (wctrlFlags and WHERE_OR_SUBCLAUSE) <> 0 then
     nTabList := 1
   else
     nTabList := pTabList^.nSrc;

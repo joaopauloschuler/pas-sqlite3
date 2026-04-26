@@ -114,13 +114,23 @@ remains `history.md`.  This file is the punch list.
       (codegen.pas:5460..5471) and `sqlite3Update`
       (codegen.pas:5660..5670); drop the step-11f skeleton-only
       error-state guard at codegen.pas:5401..5410 + 5577..5599.
-    - [ ] Promote the five `WHERE_*` `_C`-suffixed file-private flag
+    - [X] Promote the five `WHERE_*` `_C`-suffixed file-private flag
       constants (ONEPASS_DESIRED, ONEPASS_MULTIROW, OR_SUBCLAUSE,
       KEEP_ALL_JOINS, USE_LIMIT) to the public const block
       (codegen.pas:1392..1407) and drop the `_C` suffix.
-    - [ ] Land the eDistinct=WHERE_DISTINCT_UNIQUE branch (currently
+      Done — codegen.pas:1392..1408.  All five now sit in the public
+      WHERE_ORDERBY_* block in numerical order (matches sqliteInt.h
+      ordering) and the file-private const block above
+      `sqlite3WhereBegin` is removed.  No corpus delta (TestExplainParity
+      still 2 PASS / 8 DIVERGE / 0 ERROR — these flags are wctrlFlags
+      consumed inside the prologue, never reached by the current corpus).
+    - [X] Land the eDistinct=WHERE_DISTINCT_UNIQUE branch (currently
       TODO defaulting to WHERE_DISTINCT_NOOP) once
       `OptimizationEnabled` / `SQLITE_DistinctOpt` is ported.
+      Done — folded into the WHERE_WANT_DISTINCT block commit
+      (codegen.pas:6010..6012).  The `nTabList==0` arm now applies the
+      real `OptimizationEnabled(SQLITE_DistinctOpt)` →
+      `WHERE_DISTINCT_UNIQUE` rule from where.c:6948..6951.
     - [ ] New gate `TestWhereSimple.pas` — hand-built SrcList +
       rowid-EQ Expr; assert OP_NotExists / OP_Goto / labels emitted
       in expected order.
