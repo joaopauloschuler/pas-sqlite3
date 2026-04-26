@@ -1,11 +1,20 @@
 # pas-sqlite3 — Remaining Task List
 
-Forward-looking work to finish the project.  Derived from `history.md`
-(snapshot 2026-04-26).  Phases 0–5 (infra / OS / utils / pcache / pager /
-WAL / B-tree / VDBE) are green; Phases 6.1–6.8, 6.bis, 7.1–7.4a, and
-8.1–8.9 are green.  Items below are everything that is still `[ ]` or
-`[~]` in `history.md`, plus the explicit sub-task fan-outs already
-spelled out there.
+Port of **SQLite 3** (D. Richard Hipp et al., public domain) from C to Free Pascal.
+Source of truth: `../sqlite3/` (the original C reference — the upstream split
+source tree under `../sqlite3/src/*.c`). The amalgamation is **not used** by
+this project, neither as a porting reference nor as an oracle build input.
+Inspiration for structure, tone, and workflow: `../pas-core-math/`, `../pas-bzip2/`.
+
+Goal: **behavioural and on-disk parity with the C reference.** The Pascal build
+must (a) produce byte-identical `.db` files for the same SQL input, (b) return
+identical query results, and (c) emit the same VDBE bytecode for the same SQL.
+Any deviation is a bug in the port, never an improvement.
+
+Important: At the end of this document, please find:
+* Architectural notes and known pitfalls
+* Per-function porting checklist
+* Key rules for the developer
 
 Source of truth for definitions, scope notes, gates, and discoveries
 remains `history.md`.  This file is the punch list.
