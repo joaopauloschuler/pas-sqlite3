@@ -1715,6 +1715,7 @@ function  sqlite3ExprVectorSize(const pExpr: PExpr): i32;
 function  sqlite3IsTrueOrFalse(zIn: PAnsiChar): u32;
 function  sqlite3ExprIdToTrueFalse(pExpr: PExpr): i32;
 function  sqlite3ExprTruthValue(const pExpr: PExpr): i32;
+function  sqlite3ExprSimplifiedAndOr(pExpr: PExpr): PExpr;
 function  sqlite3IsRowid(z: PAnsiChar): i32;
 function  sqlite3ExprIsInteger(const p: PExpr; pValue: Pi32;
   pParse: PParse): i32;
@@ -2386,6 +2387,21 @@ end;
 function ExprUseXList(pExpr: PExpr): Boolean; inline;
 begin
   Result := (pExpr^.flags and EP_xIsSelect) = 0;
+end;
+
+{ ExprAlwaysTrue / ExprAlwaysFalse — sqliteInt.h:3147..3148.  An expression
+  is unconditionally true (resp. false) iff its EP_IsTrue (resp. EP_IsFalse)
+  flag is set AND it does not carry an EP_OuterON marker (LEFT/FULL JOIN ON
+  clause guard — those still need runtime evaluation against the null-row
+  side). }
+function ExprAlwaysTrue(pExpr: PExpr): Boolean; inline;
+begin
+  Result := (pExpr^.flags and (EP_OuterON or EP_IsTrue)) = EP_IsTrue;
+end;
+
+function ExprAlwaysFalse(pExpr: PExpr): Boolean; inline;
+begin
+  Result := (pExpr^.flags and (EP_OuterON or EP_IsFalse)) = EP_IsFalse;
 end;
 
 function ParseGetEParseMode(pParse: Pointer): u8; inline;
@@ -3705,6 +3721,52 @@ function sqlite3ExprTruthValue(const pExpr: PExpr): i32;
 begin
   if ExprHasProperty(pExpr, EP_IsTrue) then Result := 1
   else Result := 0;
+end;
+
+{ sqlite3ExprSimplifiedAndOr — expr.c:2373..2385.  Walks an AND/OR tree
+  and folds out unconditionally true/false subexpressions.  Mirrors the
+  C identities documented above the C source:
+      (x<10) AND true       => (x<10)
+      (x<10) AND false      => false
+      (y=22) OR true        => true
+  Recursion is on AND/OR sub-trees only — leaf operators are returned
+  as-is.  Used by sqlite3ExprIfTrue / sqlite3ExprIfFalse (still to be
+  ported) to skip dead branches before emitting jump bytecode. }
+function sqlite3ExprSimplifiedAndOr(pExpr: PExpr): PExpr;
+var
+  pLeft, pRight: PExpr;
+begin
+  Assert(pExpr <> nil);
+  if (pExpr^.op = TK_AND) or (pExpr^.op = TK_OR) then
+  begin
+    pRight := sqlite3ExprSimplifiedAndOr(pExpr^.pRight);
+    pLeft  := sqlite3ExprSimplifiedAndOr(pExpr^.pLeft);
+    if ExprAlwaysTrue(pLeft) or ExprAlwaysFalse(pRight) then
+    begin
+      if pExpr^.op = TK_AND then pExpr := pRight
+      else                       pExpr := pLeft;
+    end else if ExprAlwaysTrue(pRight) or ExprAlwaysFalse(pLeft) then
+    begin
+      if pExpr^.op = TK_AND then pExpr := pLeft
+      else                       pExpr := pRight;
+    end;
+  end;
+  Result := pExpr;
+end;
+
+{ exprEvalRhsFirst — expr.c:2395..2403.  Returns true iff the right
+  operand of a binary expression contains no sub-select while the left
+  operand does — in that case the expression coder may evaluate the
+  RHS first to short-circuit out of the more expensive sub-select on
+  the LHS when the RHS already determines the result.  File-private in
+  C; kept file-private in Pascal too (no forward decl). }
+function exprEvalRhsFirst(pExpr: PExpr): i32;
+begin
+  if ExprHasProperty(pExpr^.pLeft, EP_Subquery)
+     and (not ExprHasProperty(pExpr^.pRight, EP_Subquery)) then
+    Result := 1
+  else
+    Result := 0;
 end;
 
 function sqlite3IsRowid(z: PAnsiChar): i32;

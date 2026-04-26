@@ -21,6 +21,80 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    sqlite3ExprSimplifiedAndOr + exprEvalRhsFirst + ExprAlwaysTrue/False
+    macros.**  Foundation helpers required by the eventual port of
+    `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` (expr.c:6100..) — those
+    in turn gate the False-WHERE-Term-Bypass loop at where.c:6995..7036
+    inside the `sqlite3WhereBegin` prologue.  This sub-progress lands
+    only the small, leaf-level pre-requisites; the bigger jump-emission
+    routines come next.
+
+      * `ExprAlwaysTrue` / `ExprAlwaysFalse` (sqliteInt.h:3147..3148)
+        added next to `ExprHasAllProperty` in
+        `passqlite3codegen.pas:2392..` as inline functions.  Mirror the
+        C macros byte-for-byte: `(flags & (EP_OuterON|EP_IsTrue))
+        == EP_IsTrue` and equivalent for IsFalse.  The `EP_OuterON`
+        gate is the key wrinkle — even a literal `TRUE` becomes
+        conditionally false on the null-row side of a LEFT/FULL JOIN
+        ON clause, so the macros refuse to fold those.
+      * `sqlite3ExprSimplifiedAndOr` (expr.c:2373..2385) — public
+        helper that walks an AND/OR sub-tree and returns the simplified
+        equivalent (`(x<10) AND true => (x<10)`, `(y=22) OR true =>
+        true`, etc.).  Recursive on AND/OR only; leaf operators are
+        returned unchanged.  Forward-declared in the public block
+        alongside `sqlite3ExprTruthValue`.
+      * `exprEvalRhsFirst` (expr.c:2395..2403) — file-private
+        predicate; returns 1 iff the LHS of a binary expression
+        contains a sub-select while the RHS does not (a hint for the
+        coder to short-circuit out of the expensive sub-select when
+        the cheap RHS already determines the result).  Kept file-
+        private; no forward decl.
+
+    Why this is safe to land alone: none of the new helpers are called
+    by productive code yet (sqlite3ExprIfTrue / sqlite3ExprIfFalse are
+    still unported; the False-WHERE-Term-Bypass loop is still
+    unported).  Pure scaffolding sub-progress — no observable behaviour
+    change in the corpus.
+
+    Concrete changes:
+      * `passqlite3codegen.pas:2392..2406` — `ExprAlwaysTrue` /
+        `ExprAlwaysFalse` inline helpers.
+      * `passqlite3codegen.pas:1717..1718` — public forward decl for
+        `sqlite3ExprSimplifiedAndOr`.
+      * `passqlite3codegen.pas:3710..` — bodies of
+        `sqlite3ExprSimplifiedAndOr` and `exprEvalRhsFirst`,
+        immediately after `sqlite3ExprTruthValue`.
+
+    Test status: full build clean (no new warnings), regression sweep
+    all green — TestWhereBasic 52/52, TestWhereStructs 148/148,
+    TestPrepareBasic 20/20, TestParser 45/45, TestSchemaBasic 44/44,
+    TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+    TestExprBasic 40/40, TestInitCallback 29/29, TestExplainParity
+    unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **Next 6.9-bis target (still 11g.2.b): port sqlite3ExprIfTrue /
+        sqlite3ExprIfFalse (expr.c:6100..6500-ish — mutually
+        recursive).**  These are the largest single helper block
+        gating the False-WHERE-Term-Bypass loop.  Many sub-helpers
+        they call are already present in the Pascal codebase
+        (`sqlite3ExprIsVector`, `sqlite3ExprTruthValue`,
+        `sqlite3ExprCodeTemp`, `sqlite3VdbeMakeLabel`,
+        `sqlite3VdbeResolveLabel`, etc.); a few are not yet
+        (`codeCompare`, `exprComputeOperands`, `exprCodeBetween`,
+        `sqlite3ExprCanBeNull`).  The port likely needs to land in
+        2-3 sub-progress chunks: first the missing leaf helpers
+        (codeCompare etc.), then the recursive ExprIfTrue/False pair,
+        then the False-WHERE-Term-Bypass loop body in WhereBegin.
+      * **TK_AND / TK_OR token values** — already present at
+        `passqlite3codegen.pas:135` (TK_OR=43, TK_AND=44).  No new
+        tokens needed for this sub-progress.
+      * **EP_Subquery / EP_IsTrue / EP_IsFalse / EP_OuterON** — all
+        flags already present in the public const block at
+        `passqlite3codegen.pas:44..76`.  No new flag definitions
+        needed.
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     productive sqlite3WhereBegin prologue body.**  Replaced the bare
     `Result := nil` stub of `sqlite3WhereBegin`
     (`passqlite3codegen.pas:4430`) with a faithful port of the where.c:
@@ -8343,6 +8417,40 @@ Phase 5.9 depends on this being done first.
       (Phase-6 codegen helper from expr.c — emits a JUMPIFNULL-style
       branch when an expression evaluates falsy), which is the next
       logical sub-progress chunk.
+
+      **Sub-progress (landed 2026-04-26 — sqlite3ExprSimplifiedAndOr +
+      exprEvalRhsFirst + ExprAlwaysTrue/False).**  Pre-requisite leaf
+      helpers for the eventual `sqlite3ExprIfTrue` /
+      `sqlite3ExprIfFalse` port:
+
+        * `ExprAlwaysTrue` / `ExprAlwaysFalse` (sqliteInt.h:3147..3148)
+          inline functions — `(flags & (EP_OuterON|EP_IsTrue)) ==
+          EP_IsTrue` etc.  EP_OuterON gate keeps LEFT/FULL JOIN ON-
+          clause literals out of the fold.
+        * `sqlite3ExprSimplifiedAndOr` (expr.c:2373..2385) — public
+          helper that folds AND/OR sub-trees containing
+          unconditionally-true/false sub-expressions.  Forward-decl in
+          the public block.
+        * `exprEvalRhsFirst` (expr.c:2395..2403) — file-private
+          predicate hinting the coder to evaluate RHS first when LHS
+          contains a sub-select.
+
+      None of these helpers called by productive code yet — pure
+      scaffolding.  Full regression sweep stays green (TestWhereBasic
+      52/52, TestWhereStructs 148/148, TestPrepareBasic 20/20,
+      TestParser 45/45, TestSchemaBasic 44/44, TestVdbeApi 57/57,
+      TestDMLBasic 54/54, TestSelectBasic 49/49, TestExprBasic 40/40,
+      TestInitCallback 29/29, TestExplainParity unchanged at 2 PASS /
+      8 DIVERGE / 0 ERROR).  Next logical sub-progress chunk:
+      `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` themselves
+      (mutually recursive ~400-line block in expr.c:6100..6500-ish).
+      Many of their sub-helpers are already present
+      (`sqlite3ExprIsVector`, `sqlite3ExprTruthValue`,
+      `sqlite3ExprCodeTemp`, `sqlite3VdbeMakeLabel`); the missing ones
+      are `codeCompare`, `exprComputeOperands`, `exprCodeBetween`, and
+      `sqlite3ExprCanBeNull` — they should land first as a separate
+      leaf-helper sub-progress, then the recursive jump pair, then the
+      False-WHERE-Term-Bypass loop body in WhereBegin.
 
       **Remaining sub-task:** the actual productive WhereBegin
       single-table, single-rowid-EQ-predicate case + WhereEnd's
