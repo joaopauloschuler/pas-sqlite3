@@ -1718,6 +1718,9 @@ function  sqlite3ExprTruthValue(const pExpr: PExpr): i32;
 function  sqlite3ExprSimplifiedAndOr(pExpr: PExpr): PExpr;
 function  sqlite3IsRowid(z: PAnsiChar): i32;
 function  sqlite3ExprCanBeNull(const p: PExpr): i32;
+function  sqlite3CompareAffinity(const pExpr: PExpr; aff2: AnsiChar): AnsiChar;
+function  sqlite3BinaryCompareCollSeq(pParse: PParse; const pLeft, pRight: PExpr): Pointer;
+function  sqlite3ExprCompareCollSeq(pParse: PParse; const p: PExpr): Pointer;
 function  sqlite3ExprIsInteger(const p: PExpr; pValue: Pi32;
   pParse: PParse): i32;
 function  sqlite3ExprIsConstant(pParse: PParse; p: PExpr): i32;
@@ -3827,6 +3830,99 @@ begin
   else
     Result := 1;
   end;
+end;
+
+{ sqlite3CompareAffinity (expr.c:342..358) — pExpr is one operand of a
+  comparison; aff2 is the affinity of the other.  Returns the affinity that
+  should be used for the comparison.  When both sides are columns, picks
+  NUMERIC if either is numeric else BLOB.  When only one side is a column,
+  returns that column's affinity ORed with SQLITE_AFF_NONE (i.e. the macro
+  sqlite3IsNumericAffinity sees it correctly while the bitwise OR keeps
+  SQLITE_AFF_NONE distinguishable). }
+function sqlite3CompareAffinity(const pExpr: PExpr; aff2: AnsiChar): AnsiChar;
+var
+  aff1: AnsiChar;
+begin
+  aff1 := sqlite3ExprAffinity(pExpr);
+  if (Byte(aff1) > SQLITE_AFF_NONE) and (Byte(aff2) > SQLITE_AFF_NONE) then
+  begin
+    if (Byte(aff1) >= SQLITE_AFF_NUMERIC) or (Byte(aff2) >= SQLITE_AFF_NUMERIC) then
+      Result := AnsiChar(SQLITE_AFF_NUMERIC)
+    else
+      Result := AnsiChar(SQLITE_AFF_BLOB);
+  end else
+  begin
+    Assert((Byte(aff1) <= SQLITE_AFF_NONE) or (Byte(aff2) <= SQLITE_AFF_NONE));
+    if Byte(aff1) <= SQLITE_AFF_NONE then
+      Result := AnsiChar(Byte(aff2) or SQLITE_AFF_NONE)
+    else
+      Result := AnsiChar(Byte(aff1) or SQLITE_AFF_NONE);
+  end;
+end;
+
+{ binaryCompareP5 (expr.c:402..410) — file-private helper that returns the
+  P5 byte for a binary comparison opcode.  Combines the comparison
+  affinity with caller-supplied jumpIfNull flags. }
+function binaryCompareP5(const pExpr1, pExpr2: PExpr; jumpIfNull: i32): u8;
+var
+  aff: AnsiChar;
+begin
+  aff := AnsiChar(sqlite3ExprAffinity(pExpr2));
+  aff := sqlite3CompareAffinity(pExpr1, aff);
+  Result := u8(Byte(aff) or u8(jumpIfNull));
+end;
+
+{ sqlite3BinaryCompareCollSeq (expr.c:424..442) — pick the collation
+  sequence to use for a binary comparison.  Left operand wins if it has
+  EP_Collate; else right operand if it has EP_Collate; else left's
+  inherited; else right's.  pRight may be nil. }
+function sqlite3BinaryCompareCollSeq(pParse: PParse; const pLeft, pRight: PExpr): Pointer;
+begin
+  Assert(pLeft <> nil);
+  if (pLeft^.flags and EP_Collate) <> 0 then
+    Result := sqlite3ExprCollSeq(pParse, pLeft)
+  else if (pRight <> nil) and ((pRight^.flags and EP_Collate) <> 0) then
+    Result := sqlite3ExprCollSeq(pParse, pRight)
+  else
+  begin
+    Result := sqlite3ExprCollSeq(pParse, pLeft);
+    if Result = nil then
+      Result := sqlite3ExprCollSeq(pParse, pRight);
+  end;
+end;
+
+{ sqlite3ExprCompareCollSeq (expr.c:452..458) — collation for the operands
+  of a comparison expression.  Honours EP_Commuted by reversing operand
+  order before delegating to sqlite3BinaryCompareCollSeq. }
+function sqlite3ExprCompareCollSeq(pParse: PParse; const p: PExpr): Pointer;
+begin
+  if ExprHasProperty(p, EP_Commuted) then
+    Result := sqlite3BinaryCompareCollSeq(pParse, p^.pRight, p^.pLeft)
+  else
+    Result := sqlite3BinaryCompareCollSeq(pParse, p^.pLeft, p^.pRight);
+end;
+
+{ codeCompare (expr.c:463..488) — file-private.  Generates code for a
+  comparison operator: emits OP_Eq/Ne/Lt/Le/Gt/Ge with P4=collation and
+  P5=affinity|jumpIfNull.  Returns the address of the emitted instruction
+  (0 if pParse already errored). }
+function codeCompare(pParse: PParse; pLeft, pRight: PExpr;
+  opcode, in1, in2, dest, jumpIfNull, isCommuted: i32): i32;
+var
+  p5:   i32;
+  addr: i32;
+  p4:   Pointer;
+begin
+  if pParse^.nErr <> 0 then Exit(0);
+  if isCommuted <> 0 then
+    p4 := sqlite3BinaryCompareCollSeq(pParse, pRight, pLeft)
+  else
+    p4 := sqlite3BinaryCompareCollSeq(pParse, pLeft, pRight);
+  p5 := i32(binaryCompareP5(pLeft, pRight, jumpIfNull));
+  addr := sqlite3VdbeAddOp4(pParse^.pVdbe, opcode, in2, dest, in1,
+                            PAnsiChar(p4), P4_COLLSEQ);
+  sqlite3VdbeChangeP5(pParse^.pVdbe, u16(p5));
+  Result := addr;
 end;
 
 function sqlite3ExprIsInteger(const p: PExpr; pValue: Pi32;

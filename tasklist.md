@@ -21,6 +21,86 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    codeCompare + comparison-affinity / collation leaf helpers.**
+    Second of the four missing leaf helpers gating the eventual
+    `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` port.  Five faithful
+    translations of expr.c:342..488 land together because they form a
+    minimal closed dependency cluster — `codeCompare` calls
+    `sqlite3BinaryCompareCollSeq` + `binaryCompareP5`; the latter calls
+    `sqlite3CompareAffinity`; `sqlite3ExprCompareCollSeq` is the
+    EP_Commuted-aware wrapper that productive call sites
+    (`whereexpr.c:980`, `expr.c:3351`, `expr.c:3752`) reach for first.
+
+      * `sqlite3CompareAffinity` (expr.c:342..358) — picks the
+        comparison affinity given one operand and the other's affinity.
+        Both-columns case: NUMERIC if either side is numeric, else
+        BLOB.  Mixed case: `(non-column-side or SQLITE_AFF_NONE)`
+        keeping `sqlite3IsNumericAffinity` correct via the `>=` macro.
+        Public — many call sites in expr.c, where.c, whereexpr.c.
+      * `binaryCompareP5` (expr.c:402..410) — file-private; combines
+        the comparison affinity with caller-supplied jumpIfNull flags
+        into the P5 byte for OP_Eq/Ne/Lt/Le/Gt/Ge.
+      * `sqlite3BinaryCompareCollSeq` (expr.c:424..442) — collation
+        picker: left wins on EP_Collate, then right on EP_Collate, else
+        left's inherited then right's.  pRight may be nil (callers
+        like KeyInfo construction pass nil for unbound side).  Public.
+      * `sqlite3ExprCompareCollSeq` (expr.c:452..458) — public
+        EP_Commuted-aware wrapper around the above.  Reverses operand
+        order when the parser has already commuted the comparison so
+        the planner/codegen sees the original-typing collation.
+      * `codeCompare` (expr.c:463..488) — file-private opcode emitter.
+        Skips emission cleanly when `pParse^.nErr <> 0` (returns 0).
+        Picks the collation through BinaryCompareCollSeq (with the
+        isCommuted reversal mirroring sqlite3ExprCompareCollSeq), then
+        emits `OP_<opcode>` with `(in2, dest, in1, p4=collseq,
+        P4_COLLSEQ)` and changes P5 to the affinity|jumpIfNull byte.
+        Returns the addr of the emitted instruction.  Will be called
+        directly by the recursive `sqlite3ExprIfTrue` /
+        `sqlite3ExprIfFalse` jump-emission pair (next sub-progress).
+
+    Concrete changes:
+      * `passqlite3codegen.pas:1721..1723` — public forward decls for
+        `sqlite3CompareAffinity`, `sqlite3BinaryCompareCollSeq`,
+        `sqlite3ExprCompareCollSeq`.
+      * `passqlite3codegen.pas:3832..` — bodies of the five helpers,
+        immediately after `sqlite3ExprCanBeNull`.
+
+    Why this is safe to land alone: no productive callers yet
+    (`sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` still unported, the
+    OP_Eq emission inside the WHERE planner / wherecode.c is not
+    productive yet either) — pure scaffolding sub-progress, no
+    observable behaviour change in the corpus.  Full regression sweep
+    all green — TestWhereBasic 52/52, TestWhereStructs 148/148,
+    TestPrepareBasic 20/20, TestParser 45/45, TestSchemaBasic 44/44,
+    TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+    TestExprBasic 40/40, TestInitCallback 29/29, TestExplainParity
+    unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **sqlite3VdbeAddOp4 zP4 typed PAnsiChar in the Pascal port,
+        not Pointer.**  The C signature takes `const char*` so the
+        Pascal mirror types it as `PAnsiChar`.  Callers passing
+        non-string P4 payloads (CollSeq*, KeyInfo*, etc.) must cast:
+        `PAnsiChar(p4)`.  The `p4type` arg disambiguates at the
+        consumer; the cast is purely for type checking.  Locked in
+        codegen.pas (this sub-progress' codeCompare passes
+        `PAnsiChar(p4)` for a CollSeq* with `P4_COLLSEQ`).
+      * **EP_Commuted vs OP_Commuted.**  `EP_Commuted` (expr flags,
+        u32, value $400) marks an expression node whose operands have
+        been swapped by the parser.  Distinct from `OPFLAG_COMMUTED`
+        (a P5 hint on the actual VDBE opcode).  Both already present
+        in our codegen.pas (lines 53..76 const block).
+      * **Next leaf helpers (still 11g.2.b):**
+        `exprComputeOperands` (expr.c:2417), `exprCodeBetween`
+        (expr.c:6028).  Both depend on `sqlite3ExprDup`,
+        `sqlite3ExprToRegister`, `sqlite3ReleaseTempReg`,
+        `sqlite3ExprCodeTarget`, `sqlite3ExprDelete`,
+        `exprCodeVector` — audit each before landing.  After those
+        two: port the recursive `sqlite3ExprIfTrue` /
+        `sqlite3ExprIfFalse` pair (~400 lines), then the False-WHERE-
+        Term-Bypass loop body in WhereBegin.
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     sqlite3ExprCanBeNull leaf helper.**  First of the four missing leaf
     helpers identified by the previous sub-progress as gating the
     eventual `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` port (the others
@@ -8497,6 +8577,19 @@ Phase 5.9 depends on this being done first.
       `sqlite3ExprCanBeNull` — they should land first as a separate
       leaf-helper sub-progress, then the recursive jump pair, then the
       False-WHERE-Term-Bypass loop body in WhereBegin.
+
+      **Sub-progress (landed 2026-04-26 — sqlite3ExprCanBeNull).**
+      First missing leaf — see Most-recent-activity entry above.
+
+      **Sub-progress (landed 2026-04-26 — codeCompare cluster).**
+      Second missing leaf, but landed as a 5-helper bundle because of
+      the closed dependency cluster (codeCompare ⇒
+      sqlite3BinaryCompareCollSeq + binaryCompareP5; binaryCompareP5
+      ⇒ sqlite3CompareAffinity; sqlite3ExprCompareCollSeq is the
+      EP_Commuted-aware wrapper most productive call sites reach for
+      first).  See Most-recent-activity entry above for the full
+      breakdown.  Two leaves remain (`exprComputeOperands`,
+      `exprCodeBetween`) before the recursive jump-emission pair.
 
       **Remaining sub-task:** the actual productive WhereBegin
       single-table, single-rowid-EQ-predicate case + WhereEnd's
