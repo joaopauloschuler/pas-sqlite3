@@ -207,6 +207,33 @@ function sqlite3_get_table(db: PTsqlite3; zSql: PAnsiChar;
                            pzErrMsg: PPAnsiChar): i32;
 procedure sqlite3_free_table(azResult: PPAnsiChar);
 
+{ ----------------------------------------------------------------------
+  Phase 8.8 — sqlite3_unlock_notify (notify.c).
+
+  Upstream's notify.c is wrapped in `#ifdef SQLITE_ENABLE_UNLOCK_NOTIFY`,
+  and our build configuration leaves that macro off (see passqlite3util's
+  Tsqlite3 record: pBlockingConnection / pUnlockConnection / xUnlockNotify
+  fields are intentionally omitted).  In that build mode the C library
+  does not emit notify.c at all; SQLite consumers that need the symbol
+  must compile with the macro on.
+
+  We expose the symbol anyway as a tiny shim because: (1) the unlock-
+  notify semantics on a single connection / no-shared-cache port are
+  trivial — there can never be a blocking peer connection in this
+  environment, so the callback is always safe to fire immediately;
+  (2) consumers that always link `sqlite3_unlock_notify` (e.g. a Pascal
+  wrapper that mirrors the public API verbatim) keep working without
+  conditional compilation on their side.  This matches the documented
+  fast-path in notify.c:167 ("0==db->pBlockingConnection → invoke the
+  notify callback immediately").
+  ---------------------------------------------------------------------- }
+type
+  Tsqlite3_unlock_notify_cb = procedure(apArg: PPointer; nArg: i32); cdecl;
+
+function sqlite3_unlock_notify(db: PTsqlite3;
+                               xNotify: Tsqlite3_unlock_notify_cb;
+                               pArg: Pointer): i32;
+
 implementation
 
 { ----------------------------------------------------------------------
@@ -1690,6 +1717,33 @@ begin
       if (base + i)^ <> nil then sqlite3_free((base + i)^);
     sqlite3_free(base);
   end;
+end;
+
+{ Phase 8.8 — sqlite3_unlock_notify shim.
+
+  Mirrors notify.c:148 in the trivial degenerate case enforced by our
+  build configuration:
+    * No shared-cache → the port never sets pBlockingConnection on any
+      connection.  The C path at notify.c:167 (`0==db->pBlockingConnection`)
+      is therefore the only branch reachable here, which fires xNotify
+      immediately with a one-element argument array and returns OK.
+    * xNotify=nil clears prior registrations — but with no per-connection
+      state to clear, this is also a pure no-op returning OK.
+    * db=nil → SQLITE_MISUSE_BKPT, matching the API_ARMOR guard. }
+function sqlite3_unlock_notify(db: PTsqlite3;
+                               xNotify: Tsqlite3_unlock_notify_cb;
+                               pArg: Pointer): i32;
+var
+  arg: Pointer;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  if Assigned(xNotify) then begin
+    arg := pArg;
+    xNotify(@arg, 1);
+  end;
+  Result := SQLITE_OK;
 end;
 
 end.

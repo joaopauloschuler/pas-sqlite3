@@ -20,6 +20,44 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-25 — Phase 8.8 sqlite3_unlock_notify (notify.c shim).**
+    Build configuration leaves `SQLITE_ENABLE_UNLOCK_NOTIFY` off, so the
+    upstream notify.c is not compiled at all in the C reference; the
+    `Tsqlite3` record in `passqlite3util.pas:417` already reflects this
+    by omitting `pBlockingConnection` / `pUnlockConnection` /
+    `xUnlockNotify` / `pNextBlocked` / `pUnlockArg`.  Added a tiny
+    behaviour-correct shim in `src/passqlite3main.pas`:
+      * MISUSE on db=nil (matches API_ARMOR guard).
+      * No-op (OK) on xNotify=nil — clearing prior registrations is a
+        no-op because the port keeps no per-connection unlock state.
+      * Otherwise fires `xNotify(@pArg, 1)` immediately.  This is the
+        only branch reachable in a no-shared-cache build (notify.c:167
+        — "0 == db->pBlockingConnection → invoke immediately").
+    Gate `src/tests/TestUnlockNotify.pas` — 14/14 PASS:
+      * T1/T2 db=nil → MISUSE (and xNotify must not fire on MISUSE)
+      * T3    xNotify=nil clears
+      * T4    fires once with apArg^=&tag, nArg=1
+      * T5    second call fires again (no deferred queue in the shim)
+    No regressions in TestOpenClose / TestPrepareBasic / TestRegistration
+    / TestConfigHooks / TestInitShutdown / TestExecGetTable / TestBackup.
+
+    Concrete changes:
+      * `src/passqlite3main.pas` — adds `Tsqlite3_unlock_notify_cb`
+        callback type and `sqlite3_unlock_notify` (interface + impl).
+      * `src/tests/TestUnlockNotify.pas` — new gate test.
+      * `src/tests/build.sh` — registers TestUnlockNotify.
+
+    Phase 8.8 scope notes (intentional, matches build config):
+      * Real shared-cache blocking-list semantics are out of scope for
+        v1 (no shared cache, no `pBlockingConnection` field).  If a
+        future phase enables `SQLITE_ENABLE_UNLOCK_NOTIFY`, replace the
+        shim with a faithful port of notify.c (sqlite3BlockedList +
+        addToBlockedList / removeFromBlockedList + checkListProperties
+        + sqlite3ConnectionBlocked / Unlocked / Closed) and extend
+        `Tsqlite3` with the five omitted fields.
+      * The shim is independent of the STATIC_MAIN mutex — there is no
+        global state to guard.
+
   - **2026-04-25 — Phase 8.7 backup.c.**  New unit
     `src/passqlite3backup.pas` (~470 lines) ports the entire backup.c
     public API: `sqlite3_backup_init` / `_step` / `_finish` /
@@ -2974,8 +3012,16 @@ loader — *optional for v1*).
   full scope notes (pager hook wiring + zombie-close + content gate
   intentionally deferred).
 
-- [ ] **8.8** Port `notify.c`: `sqlite3_unlock_notify` (rarely used; port if
+- [X] **8.8** Port `notify.c`: `sqlite3_unlock_notify` (rarely used; port if
   our threading story requires it, otherwise stub).
+
+  DONE 2026-04-25.  Stubbed (build config has SQLITE_ENABLE_UNLOCK_NOTIFY
+  off, so upstream's notify.c is not compiled either).  Behaviour-correct
+  shim added in `src/passqlite3main.pas`: MISUSE on db=nil; no-op on
+  xNotify=nil; otherwise fires `xNotify(@pArg, 1)` immediately (the only
+  branch reachable in a no-shared-cache build, matching notify.c:167).
+  See "Most recent activity" above for the full changelog and deferred-
+  scope notes.  Gate: `src/tests/TestUnlockNotify.pas` — 14/14 PASS.
 
 - [ ] **8.9** (Optional) Port `loadext.c`: dynamic extension loader. Requires
   `dlopen`/`dlsym`; can be safely stubbed for v1 if no Pascal consumer
