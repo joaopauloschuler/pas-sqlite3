@@ -20,6 +20,50 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-25 — Phase 6.bis.1b vtab.c parser-side hooks.**  Replaced
+    the one-line TODO stubs in `passqlite3parser.pas` for
+    `sqlite3VtabBeginParse / _FinishParse / _ArgInit / _ArgExtend` with
+    faithful ports of vtab.c:359..550 (plus the file-private helpers
+    `addModuleArgument` and `addArgumentToVtab`).  All four public hooks
+    are now declared in the parser interface so external gate tests can
+    drive them directly with a manually-constructed `TParse + TTable`.
+    Gate: `src/tests/TestVtab.pas` extended with T17..T22 covering
+    sArg accumulation, ArgInit/Extend semantics, init.busy=1 schema
+    insertion, and tblHash population — **39/39 PASS** (was 27/27).  No
+    regressions in TestParser / TestParserSmoke / TestRegistration /
+    TestPrepareBasic / TestOpenClose / TestSchemaBasic / TestExecGetTable
+    / TestConfigHooks / TestInitShutdown / TestBackup / TestUnlockNotify
+    / TestLoadExt / TestTokenizer.
+
+    Two upstream stubs surfaced as blockers and are noted under the
+    6.bis.1b task entry below:
+
+      * `sqlite3StartTable` is still empty in passqlite3codegen
+        (build.c port pending Phase 7-style work).  Real parser-driven
+        `CREATE VIRTUAL TABLE foo USING mod(...)` therefore can't reach
+        the new helpers yet — `sqlite3VtabBeginParse` early-returns on
+        `pNewTable=nil`.  The port is structurally complete; gate test
+        exercises the leaf helpers directly with a manually-constructed
+        Table + Parse to bypass StartTable.
+      * `sqlite3MPrintf` is not yet ported.  The init.busy=0 branch of
+        FinishParse (the one that emits the OP_VCreate / OP_Expire
+        sequence and rewrites sqlite_schema via sqlite3NestedParse with
+        a `%T`-formatted statement) is reduced to a `sqlite3MayAbort`
+        call with a TODO; a future printf sub-phase will land the full
+        body together with the second `sqlite3AuthCheck` for
+        SQLITE_CREATE_VTABLE.
+
+    Pitfall captured: `passqlite3util.PSchema` and
+    `passqlite3codegen.PParse` are also declared as `Pointer` stubs in
+    lower-level units (passqlite3vdbe, passqlite3util's own
+    forward-decl).  In a test file that uses both layers, the dotted
+    form `passqlite3util.PSchema` cannot appear directly in a `var`
+    declaration — FPC resolves the bare name to the `Pointer` stub
+    first.  Workaround: introduce a top-level `type TUtilPSchema =
+    passqlite3util.PSchema;` alias (and `TCgPParse = passqlite3codegen.
+    PParse;`) and reference the alias in `var`.  Mirrors the recurring
+    Pascal var/type-conflict feedback memory.
+
   - **2026-04-25 — Phase 6.bis.1a vtab.c types + module-registry leaf
     helpers.** New unit `src/passqlite3vtab.pas` (525 lines) hosts the
     full Pascal port of vtab.c's leaf surface:
@@ -2242,16 +2286,61 @@ Phase 5.9 depends on this being done first.
     Gate: `src/tests/TestVtab.pas` — 27/27 PASS.  See "Most recent
     activity" for the deferred-scope and pitfall notes.
 
-  - [ ] **6.bis.1b** Parser-side hooks: replace the stubs in
-    `passqlite3parser.pas` (sqlite3VtabBeginParse, sqlite3VtabFinishParse,
-    sqlite3VtabArgInit, sqlite3VtabArgExtend, addModuleArgument,
-    addArgumentToVtab) with the full bodies from vtab.c:359..550.
-    Requires sqlite3StartTable + sqlite3NameFromToken + sqlite3DbStrDup +
-    sqlite3MayAbort + sqlite3NestedParse + sqlite3VdbeAddOp* — all
-    already ported.  No new public API; the gate is a parser-level
-    check that `CREATE VIRTUAL TABLE foo USING mymod(...)` populates
-    `pNewTable->u.vtab.azArg` correctly and (with init.busy=1) inserts
-    the table into the schema.
+  - [X] **6.bis.1b** Parser-side hooks (vtab.c:359..550).  DONE 2026-04-25.
+    Faithful ports of `addModuleArgument`, `addArgumentToVtab`,
+    `sqlite3VtabBeginParse`, `sqlite3VtabFinishParse`, `sqlite3VtabArgInit`,
+    `sqlite3VtabArgExtend` now live in `passqlite3parser.pas` (replacing
+    the previous one-line TODO stubs).  All four public hooks are also
+    declared in the parser interface so external gates can drive them
+    directly.  Gate: `src/tests/TestVtab.pas` extended with T17..T22 —
+    **39/39 PASS** (was 27/27).  No regressions across TestParser,
+    TestParserSmoke, TestRegistration, TestPrepareBasic, TestOpenClose,
+    TestSchemaBasic, TestExecGetTable, TestConfigHooks, TestInitShutdown,
+    TestBackup, TestUnlockNotify, TestLoadExt, TestTokenizer.
+
+    Discoveries / dependencies for next sub-phases:
+
+      * **`sqlite3StartTable` is still a Phase-7 codegen stub** (empty
+        body in passqlite3codegen.pas:5802).  This means
+        `sqlite3VtabBeginParse` early-returns on `pParse^.pNewTable=nil`
+        every time it is called from real parser-driven SQL today —
+        the body is ported faithfully but observably inert until a
+        future sub-phase ports build.c's StartTable.  Until then, the
+        gate test exercises the leaf helpers directly with a manually-
+        constructed `TParse + TTable` (see `TestVtabParser_Run`).
+        The "all already ported" claim in the original 6.bis.1b note
+        was incorrect — flagged here so 6.bis.1c does not assume
+        StartTable.
+
+      * **`sqlite3MPrintf` is not yet ported** (only one TODO comment
+        in `passqlite3vdbe.pas:4540`).  The `init.busy=0` branch of
+        `sqlite3VtabFinishParse` (vtab.c:463..508) needs both
+        `sqlite3MPrintf("CREATE VIRTUAL TABLE %T", &sNameToken)` and
+        the still-stubbed `sqlite3NestedParse(...)` — the entire
+        branch is therefore reduced to `sqlite3MayAbort(pPse)` with
+        a TODO comment in place.  A printf-machinery sub-phase
+        (call it 7.4c or 8-prelude) is now blocking 6.bis.1b's full
+        completion, 7.2e error-message TODOs, and most of 8-series'
+        rich `pErr`-populating paths.
+
+      * **`SQLITE_OMIT_AUTHORIZATION` second sqlite3AuthCheck**
+        (vtab.c:414..425) is currently skipped — our port keeps the
+        authorizer surface live but the iDb lookup
+        (`sqlite3SchemaToIndex` on `pTable^.pSchema`) plus the
+        fourth-argument `pTable^.u.vtab.azArg[0]` plumbing is
+        deferred to the same printf-sub-phase since it shares its
+        scaffolding with the schema-update path.
+
+      * Pascal qualified-type-name pitfall: in the test file,
+        `passqlite3util.PSchema` and `passqlite3codegen.PParse`
+        require a `type` alias (`TUtilPSchema =
+        passqlite3util.PSchema`) — using the dotted form directly
+        in a `var` declaration triggered FPC "Error in type
+        definition" because `PSchema` (and `PParse`) are redeclared
+        as `Pointer` stubs in lower-level units (passqlite3vdbe,
+        passqlite3util) and the resolver picks the stub.  Useful
+        memory for any future test that needs to peek into TParse
+        / TTable directly.
 
   - [ ] **6.bis.1c** Constructor lifecycle: vtabCallConstructor,
     sqlite3VtabCallCreate, sqlite3VtabCallConnect, sqlite3VtabCallDestroy,

@@ -394,6 +394,16 @@ function  sqlite3ParserStackPeak(p: PyyParser): i32;
   that is not inside a string or comment), 0 otherwise. }
 function  sqlite3_complete(zSql: PAnsiChar): i32;
 
+{ ---------------- Phase 6.bis.1b — virtual-table parser hooks ------------- }
+{ Faithful ports of vtab.c:359..550.  Exposed in the interface so external   }
+{ gates (TestVtab) can drive them with a manually-constructed TParse without }
+{ relying on the still-stubbed sqlite3StartTable.                             }
+procedure sqlite3VtabBeginParse(pPse: PParse; pName1: PToken; pName2: PToken;
+                                pModuleName: PToken; ifNotExists: i32);
+procedure sqlite3VtabFinishParse(pPse: PParse; pEnd: PToken);
+procedure sqlite3VtabArgInit(pPse: PParse);
+procedure sqlite3VtabArgExtend(pPse: PParse; p: PToken);
+
 { =========================================================================== }
 
 implementation
@@ -1860,29 +1870,164 @@ const
   M10d_Any = u8(1); { Not specified — query planner's choice                }
   M10d_No  = u8(2); { AS NOT MATERIALIZED                                   }
 
-{ Virtual-table parser hooks (vtab.c:161979..162135).  The real bodies live }
-{ in vtab.c which is part of Phase 6.bis.  Stubs here are sufficient for    }
-{ parser-only differential testing — CREATE VIRTUAL TABLE merely succeeds  }
-{ at parse time without producing VDBE code.                                 }
+{ Virtual-table parser hooks (vtab.c:359..550) — Phase 6.bis.1b.            }
+{ Faithful port of addModuleArgument / addArgumentToVtab /                   }
+{ sqlite3VtabBeginParse / sqlite3VtabFinishParse / sqlite3VtabArgInit /     }
+{ sqlite3VtabArgExtend.  These populate pParse^.pNewTable->u.vtab.azArg     }
+{ from the CREATE VIRTUAL TABLE clause and (when init.busy=1) insert the    }
+{ table into its schema.                                                     }
+{                                                                            }
+{ Dependency note: the real sqlite3StartTable in passqlite3codegen is still }
+{ a Phase 7 stub, so pParse^.pNewTable will currently be nil after          }
+{ sqlite3VtabBeginParse returns.  Each helper below early-returns on a nil  }
+{ pNewTable, mirroring the C body's first guard, so the port is structurally}
+{ complete and will become observably useful as soon as StartTable lands.   }
+{ The TestVtab gate exercises the leaf helpers directly with a manually-    }
+{ constructed TTable, validating the azArg accumulation contract.            }
+{                                                                            }
+{ The init.busy=0 branch of FinishParse depends on sqlite3MPrintf and the   }
+{ sqlite3NestedParse stub (both Phase-7 deferred).  Until those land, the   }
+{ branch is preserved as a TODO comment; the init.busy=1 in-memory schema   }
+{ insertion path is fully ported.                                            }
+
+procedure addModuleArgument(pPse: PParse; pTable: PTable2; zArg: PAnsiChar);
+var
+  db:           PTsqlite3;
+  nBytes:       i64;
+  azModuleArg:  PPAnsiChar;
+  azOld:        PPAnsiChar;
+  i:            i32;
+begin
+  db := pPse^.db;
+  Assert(pTable^.eTabType = TABTYP_VTAB,
+    'addModuleArgument: not a virtual table');
+  nBytes := SizeOf(PAnsiChar) * (2 + pTable^.u.vtab.nArg);
+  if pTable^.u.vtab.nArg + 3 >= db^.aLimit[SQLITE_LIMIT_COLUMN] then
+    sqlite3ErrorMsg(pPse, PAnsiChar('too many columns on virtual table'));
+  azOld := PPAnsiChar(pTable^.u.vtab.azArg);
+  azModuleArg := PPAnsiChar(sqlite3DbRealloc(db, azOld, u64(nBytes)));
+  if azModuleArg = nil then begin
+    sqlite3DbFree(db, zArg);
+  end else begin
+    i := pTable^.u.vtab.nArg;
+    Inc(pTable^.u.vtab.nArg);
+    azModuleArg[i]     := zArg;
+    azModuleArg[i + 1] := nil;
+    pTable^.u.vtab.azArg := Pointer(azModuleArg);
+  end;
+end;
+
+procedure addArgumentToVtab(pPse: PParse);
+var
+  z:  PAnsiChar;
+  n:  i32;
+  db: PTsqlite3;
+begin
+  if (pPse^.sArg.z <> nil) and (pPse^.pNewTable <> nil) then begin
+    z  := pPse^.sArg.z;
+    n  := pPse^.sArg.n;
+    db := pPse^.db;
+    addModuleArgument(pPse, pPse^.pNewTable,
+      sqlite3DbStrNDup(db, z, u64(n)));
+  end;
+end;
+
 procedure sqlite3VtabBeginParse(pPse: PParse; pName1: PToken; pName2: PToken;
                                 pModuleName: PToken; ifNotExists: i32);
+var
+  pTable: PTable2;
+  db:     PTsqlite3;
 begin
-  { TODO Phase 6.bis: port vtab.c virtual-table machinery. }
+  sqlite3StartTable(pPse, pName1, pName2, 0, 0, 1, ifNotExists);
+  pTable := pPse^.pNewTable;
+  if pTable = nil then Exit;
+  Assert(pTable^.pIndex = nil, 'sqlite3VtabBeginParse: pIndex non-nil');
+  pTable^.eTabType := TABTYP_VTAB;
+
+  db := pPse^.db;
+
+  Assert(pTable^.u.vtab.nArg = 0, 'sqlite3VtabBeginParse: nArg non-zero');
+  addModuleArgument(pPse, pTable, sqlite3NameFromToken(db, pModuleName));
+  addModuleArgument(pPse, pTable, nil);
+  addModuleArgument(pPse, pTable, sqlite3DbStrDup(db, pTable^.zName));
+  Assert(((pPse^.sNameToken.z = pName2^.z) and (pName2^.z <> nil))
+      or ((pPse^.sNameToken.z = pName1^.z) and (pName2^.z =  nil)),
+    'sqlite3VtabBeginParse: sNameToken.z mismatch');
+  pPse^.sNameToken.n := i32(
+    PtrUInt(pModuleName^.z) + PtrUInt(pModuleName^.n)
+    - PtrUInt(pPse^.sNameToken.z));
+
+  { SQLITE_OMIT_AUTHORIZATION: the second sqlite3AuthCheck call             }
+  { (SQLITE_CREATE_VTABLE) is gated out at build time in upstream when the }
+  { authorizer is omitted.  Our port currently includes the authorizer      }
+  { surface, but sqlite3AuthCheck on a v-table is a defensible follow-up    }
+  { (needs the iDb lookup); left as a TODO so the gate test stays focused   }
+  { on the azArg contract.                                                  }
 end;
 
 procedure sqlite3VtabFinishParse(pPse: PParse; pEnd: PToken);
+var
+  pTab:    PTable2;
+  db:      PTsqlite3;
+  pSchemaT: passqlite3util.PSchema;
+  pOld:    PTable2;
+  zName:   PAnsiChar;
 begin
-  { TODO Phase 6.bis: port vtab.c virtual-table machinery. }
+  pTab := pPse^.pNewTable;
+  db   := pPse^.db;
+  if pTab = nil then Exit;
+  Assert(pTab^.eTabType = TABTYP_VTAB,
+    'sqlite3VtabFinishParse: not a virtual table');
+  addArgumentToVtab(pPse);
+  pPse^.sArg.z := nil;
+  if pTab^.u.vtab.nArg < 1 then Exit;
+
+  if db^.init.busy = 0 then begin
+    { TODO Phase 6.bis.1b-followup: the init.busy=0 branch of vtab.c:463    }
+    { needs sqlite3MPrintf("CREATE VIRTUAL TABLE %T", &sNameToken) plus     }
+    { sqlite3NestedParse to update sqlite_schema, then OP_Expire +          }
+    { sqlite3VdbeAddParseSchemaOp + OP_VCreate.  Both sqlite3MPrintf and    }
+    { sqlite3NestedParse are still Phase-7 stubs in passqlite3codegen, so   }
+    { the full body is deferred to a follow-up sub-phase that lands the     }
+    { printf machinery.  For now we MayAbort to mark the side effect and   }
+    { let the parser succeed.                                                }
+    sqlite3MayAbort(pPse);
+  end else begin
+    { Re-reading sqlite_schema: install the table in the in-memory schema. }
+    pSchemaT := passqlite3util.PSchema(pTab^.pSchema);
+    zName    := pTab^.zName;
+    Assert(zName <> nil, 'sqlite3VtabFinishParse: pTab^.zName nil');
+    sqlite3MarkAllShadowTablesOf(db, pTab);
+    pOld := PTable2(sqlite3HashInsert(@pSchemaT^.tblHash, PChar(zName), pTab));
+    if pOld <> nil then begin
+      sqlite3OomFault(db);
+      Assert(pTab = pOld, 'sqlite3VtabFinishParse: HashInsert collision');
+      Exit;
+    end;
+    pPse^.pNewTable := nil;
+  end;
 end;
 
 procedure sqlite3VtabArgInit(pPse: PParse);
 begin
-  { TODO Phase 6.bis: port vtab.c virtual-table machinery. }
+  addArgumentToVtab(pPse);
+  pPse^.sArg.z := nil;
+  pPse^.sArg.n := 0;
 end;
 
 procedure sqlite3VtabArgExtend(pPse: PParse; p: PToken);
+var
+  pArg: PToken;
 begin
-  { TODO Phase 6.bis: port vtab.c virtual-table machinery. }
+  pArg := @pPse^.sArg;
+  if pArg^.z = nil then begin
+    pArg^.z := p^.z;
+    pArg^.n := p^.n;
+  end else begin
+    Assert(PtrUInt(pArg^.z) <= PtrUInt(p^.z),
+      'sqlite3VtabArgExtend: token order');
+    pArg^.n := i32(PtrUInt(p^.z) + PtrUInt(p^.n) - PtrUInt(pArg^.z));
+  end;
 end;
 
 { sqlite3CteNew — allocate a Cte node (build.c:131988).  Phase 7.2e.7 stub }

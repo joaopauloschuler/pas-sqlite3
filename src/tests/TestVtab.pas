@@ -20,6 +20,8 @@ uses
   SysUtils,
   passqlite3types,
   passqlite3util,
+  passqlite3codegen,
+  passqlite3parser,
   passqlite3vdbe,
   passqlite3main,
   passqlite3vtab;
@@ -47,6 +49,118 @@ function DummyDisconnect(p: PSqlite3Vtab): i32; cdecl;
 begin
   Inc(gDisconnectCount);
   Result := SQLITE_OK;
+end;
+
+{ Manually construct a TParse + TTable to drive the Phase 6.bis.1b parser
+  hooks without the still-stubbed sqlite3StartTable.  Pins the azArg
+  accumulation contract: ArgExtend builds up sArg, ArgInit flushes one
+  argument, FinishParse flushes the trailing one and (on init.busy=1)
+  installs the table into the schema. }
+type
+  TUtilPSchema = passqlite3util.PSchema;
+  TCgPTable    = passqlite3codegen.PTable2;
+  TCgPParse    = passqlite3codegen.PParse;
+  TCgTParse    = passqlite3codegen.TParse;
+
+procedure TestVtabParser_Run(db: PTsqlite3);
+var
+  pParse:    TCgPParse;
+  pTab:      TCgPTable;
+  pSchemaT:  TUtilPSchema;
+  tName:     TToken;
+  tArg1:     TToken;
+  tArg2a:    TToken;
+  tArg2b:    TToken;
+  azArg:     PPAnsiChar;
+  pHashed:   TCgPTable;
+  zN, zArg1, zArg2: AnsiString;
+const
+  cName  = 'mvtab';
+  cArg1  = 'foo';
+  cArg2a = 'bar';
+  cArg2b = 'baz';
+begin
+  zN    := cName;  { keep the strings live for sArg.z borrowing }
+  zArg1 := cArg1;
+  zArg2 := cArg2a + ' ' + cArg2b;
+
+  pParse := TCgPParse(sqlite3MallocZero64(SizeOf(TCgTParse)));
+  Expect(pParse <> nil, 'T17 alloc Parse');
+  pParse^.db := db;
+
+  pTab := TCgPTable(
+    sqlite3MallocZero64(SizeOf(passqlite3codegen.TTable)));
+  Expect(pTab <> nil, 'T17b alloc Table');
+  pTab^.zName    := PAnsiChar(zN);
+  pTab^.eTabType := passqlite3codegen.TABTYP_VTAB;
+  { aDb[0].pSchema is allocated by openDatabase; reuse it. }
+  pSchemaT := TUtilPSchema(db^.aDb[0].pSchema);
+  pTab^.pSchema  := passqlite3codegen.PSchema(pSchemaT);
+  pParse^.pNewTable := pTab;
+
+  { Extend a single token's worth of sArg state, then ArgInit flushes it.   }
+  tArg1.z := PAnsiChar(zArg1);
+  tArg1.n := Length(zArg1);
+  sqlite3VtabArgExtend(pParse, @tArg1);
+  ExpectEq(pParse^.sArg.n, Length(zArg1), 'T18 ArgExtend sets sArg.n');
+  Expect(pParse^.sArg.z = PAnsiChar(zArg1), 'T18b ArgExtend sets sArg.z');
+
+  sqlite3VtabArgInit(pParse);
+  ExpectEq(pTab^.u.vtab.nArg, 1, 'T19 ArgInit appends argument');
+  Expect(pParse^.sArg.z = nil, 'T19b ArgInit clears sArg.z');
+  ExpectEq(pParse^.sArg.n, 0,   'T19c ArgInit clears sArg.n');
+
+  azArg := PPAnsiChar(pTab^.u.vtab.azArg);
+  Expect(StrComp(azArg[0], PAnsiChar(zArg1)) = 0,
+    'T19d argument 0 == "foo"');
+
+  { Two ArgExtend calls in sequence span both tokens via address arithmetic. }
+  tArg2a.z := PAnsiChar(zArg2);
+  tArg2a.n := Length(cArg2a);
+  tArg2b.z := PAnsiChar(zArg2) + Length(cArg2a) + 1;  { skip space }
+  tArg2b.n := Length(cArg2b);
+  sqlite3VtabArgExtend(pParse, @tArg2a);
+  sqlite3VtabArgExtend(pParse, @tArg2b);
+  ExpectEq(pParse^.sArg.n,
+    Length(cArg2a) + 1 + Length(cArg2b),
+    'T20 ArgExtend spans two tokens');
+
+  { FinishParse with init.busy=1: flushes pending sArg and installs pTab in
+    the schema.  We can't easily exercise the init.busy=0 branch yet —
+    sqlite3MPrintf and sqlite3NestedParse are still Phase-7 stubs. }
+  tName.z := PAnsiChar(zN);
+  tName.n := Length(zN);
+  pParse^.sNameToken := tName;
+  db^.init.busy := 1;
+  try
+    sqlite3VtabFinishParse(pParse, nil);
+  finally
+    db^.init.busy := 0;
+  end;
+  ExpectEq(pTab^.u.vtab.nArg, 2,
+    'T21 FinishParse flushes trailing argument');
+  Expect(pParse^.pNewTable = nil,
+    'T21b init.busy=1 path nulls pNewTable on success');
+
+  pHashed := TCgPTable(
+    sqlite3HashFind(@pSchemaT^.tblHash, PChar(zN)));
+  Expect(pHashed = pTab,
+    'T22 table installed in schema tblHash under zName');
+
+  { Cleanup: yank from hash so sqlite3_close_v2 on db doesn't double-free.   }
+  sqlite3HashInsert(@pSchemaT^.tblHash, PChar(zN), nil);
+  azArg := PPAnsiChar(pTab^.u.vtab.azArg);
+  if azArg <> nil then begin
+    sqlite3DbFree(db, azArg[0]);
+    sqlite3DbFree(db, azArg[2]);
+    { slot 1 is the borrowed schema name (nil here) }
+    sqlite3DbFree(db, azArg);
+  end;
+  sqlite3DbFree(db, pTab);
+  sqlite3DbFree(db, pParse);
+
+  { Note: T18..T22 leave T1..T17 numbering intact for the gate counter so
+    the "27/27 PASS" headline grows naturally to the new count. }
 end;
 
 var
@@ -177,6 +291,9 @@ begin
   gDestroyCount := 0;
   rc := sqlite3_drop_modules(db, nil);
   ExpectEq(rc, SQLITE_OK, 'T15 drop registry before close');
+
+  { ---- Phase 6.bis.1b — parser-hook leaf helpers ---- }
+  TestVtabParser_Run(db);
 
   rc := sqlite3_close_v2(db);
   ExpectEq(rc, SQLITE_OK, 'T16 close_v2');
