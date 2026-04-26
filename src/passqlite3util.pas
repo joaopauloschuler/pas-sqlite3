@@ -725,6 +725,7 @@ procedure sqlite3Dequote(z: PAnsiChar);
 function  sqlite3DbSpanDup(db: Psqlite3db; zStart: PAnsiChar; zEnd: PAnsiChar): PAnsiChar;
 procedure sqlite3DbNNFreeNN(db: Psqlite3db; p: Pointer);
 function  sqlite3GetInt32(zNum: PAnsiChar; pValue: Pi32): i32;
+function  sqlite3GetUInt32(z: PAnsiChar; pI: Pu32): i32;
 
 { Pcache1 mutex getter (set by pcache1Init) }
 function  sqlite3Pcache1Mutex: Psqlite3_mutex;
@@ -2661,6 +2662,39 @@ begin
   if neg then v := -v;
   if (v < Low(i32)) or (v > High(i32)) then Exit;
   if pValue <> nil then pValue^ := i32(v);
+  Result := 1;
+end;
+
+{ Decimal-only u32 parser, mirrors util.c:1533 sqlite3GetUInt32.
+  Returns 1 on success and stores the parsed value in pI^; returns 0
+  on failure (non-digit, empty, overflow, trailing garbage) and sets
+  pI^ := 0 in the failure cases that the C reference also clears. }
+function sqlite3GetUInt32(z: PAnsiChar; pI: Pu32): i32;
+var
+  v: u64;
+  p: PAnsiChar;
+  i: i32;
+begin
+  v := 0;
+  i := 0;
+  if z = nil then begin
+    if pI <> nil then pI^ := 0;
+    Result := 0; Exit;
+  end;
+  p := z;
+  while p^ in ['0'..'9'] do begin
+    v := v * 10 + u64(Ord(p^) - Ord('0'));
+    if v > u64($100000000) then begin   { > 2^32, matching C's 4294967296LL gate }
+      if pI <> nil then pI^ := 0;
+      Result := 0; Exit;
+    end;
+    Inc(p); Inc(i);
+  end;
+  if (i = 0) or (p^ <> #0) then begin
+    if pI <> nil then pI^ := 0;
+    Result := 0; Exit;
+  end;
+  if pI <> nil then pI^ := u32(v);
   Result := 1;
 end;
 

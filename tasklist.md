@@ -20,6 +20,101 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 11g.1.b): productive
+    sqlite3InitCallback — c-r prepare branch + auto-index tnum
+    branch.**  Replaces the minimal "bump nInitRow only" stub at
+    `passqlite3main.pas:1904` with a faithful port of
+    `prepare.c:96..189`.  Three productive arms now run end-to-end:
+    (a) `argv[3] = nil` → `initCorruptSchema`; (b) argv[4] starts
+    with case-insensitive `c-r` → re-prepare the CREATE statement
+    under `init.busy = 1` with `db^.init.{iDb, newTnum, azInit}`
+    populated per prepare.c:128..163, then `sqlite3_finalize`;
+    (d) empty SQL with non-nil name → `sqlite3FindIndex` and patch
+    `pIndex^.tnum` from `argv[3]` via the new `sqlite3GetUInt32`
+    helper (prepare.c:166..186).
+    [X]
+
+    Concrete changes:
+      * `passqlite3util.pas:728` (interface) + `:2667..2700`
+        (implementation) — new `sqlite3GetUInt32(z, pI): i32`
+        decimal-only u32 parser, mirrors `util.c:1533`.  Returns 1
+        on success, 0 on empty / non-digit / overflow / trailing
+        garbage; sets `pI^ := 0` in the documented failure cases.
+      * `passqlite3main.pas:1904..1940` — new helper
+        `initCorruptSchema(pData, argv, zExtra)`.  Minimal port of
+        `prepare.c:22 corruptSchema`: sets `pData^.rc` to
+        `SQLITE_NOMEM` (on `mallocFailed`) or `SQLITE_CORRUPT`
+        otherwise.  The full mInitFlags / SQLITE_WriteSchema /
+        sqlite3MPrintf'd error message paths are deferred to
+        Phase 7 alongside the rest of `sqlite3InitOne`.
+      * `passqlite3main.pas:1942..2050` — full body of
+        `sqlite3InitCallback` rewritten.  Local
+        `db^.mDbFlags |= DBFLAG_EncodingFixed` (constant
+        redeclared inline as `u32($0040)` because passqlite3parser
+        scopes it to its implementation section).  c-r branch
+        saves & restores `db^.init.iDb`, clears `init.flags` bit 0
+        (orphanTrigger), sets `init.azInit := PPAnsiChar(argv)`,
+        calls `sqlite3Prepare(db, argv[4], -1, 0, nil, @pStmt, nil)`,
+        reads `db^.errCode` for the result, then routes
+        `SQLITE_NOMEM` → `sqlite3OomFault`, `SQLITE_INTERRUPT` /
+        `SQLITE_LOCKED` → silent, anything else →
+        `initCorruptSchema(... sqlite3_errmsg(db))`, exactly per
+        `prepare.c:150..160`.  Always finalises the inner stmt.
+        Auto-index branch returns silently when `tnum < 2` /
+        `> mxPage` / GetUInt32 fails — the
+        `sqlite3IndexHasDuplicateRootPage` check + the
+        `bExtraSchemaChecks` gate are deferred (see Discoveries).
+
+    Test status:
+      * Full build clean (one pre-existing comment-level warning
+        in `passqlite3.inc` carries through; not introduced here).
+      * Regression sweep (2026-04-26): TestPrepareBasic 20/20,
+        TestParser 45/45, TestParserSmoke 20/20, TestSchemaBasic
+        44/44, TestVdbeApi 57/57, TestDMLBasic 54/54,
+        TestSelectBasic 49/49, TestExprBasic 40/40, TestVdbeTxn
+        8/8, TestAuthBuiltins 34/34, TestOpenClose 17/17,
+        TestSmoke + TestUtil clean, TestJson 434/434, TestJsonEach
+        50/50, TestJsonRegister 48/48, TestPrintf 105/105,
+        TestVtab 216/216.  TestExplainParity unchanged at
+        **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **TestExplainParity count didn't move — expected.**  The
+        callback is now fully wired, but the productive payload
+        (re-preparing argv[4] to publish a Table/Index into
+        `pSchema^.tblHash`) only fires when OP_ParseSchema's
+        `SELECT*FROM sqlite_master WHERE %s` actually returns rows.
+        That requires `sqlite3Insert` (step 11e) to write real
+        schema rows — currently it emits 0 ops.  The wiring is
+        observable end-to-end at the Pascal level (verifiable by
+        manually pre-loading sqlite_master and re-running), just
+        not yet through the test corpus.
+      * **`nInitRow == 0 → SQLITE_CORRUPT` check stays
+        disabled.**  Re-enabling it now would regress every
+        CREATE TABLE in the corpus for the same reason: the SELECT
+        legitimately finds 0 rows because the prior INSERT is a
+        no-op skeleton.  Promote the disabled `if` block at
+        `passqlite3main.pas:~1995` to active code the moment step
+        11e starts emitting real bytecode for the schema-row
+        INSERT.
+      * **`sqlite3IndexHasDuplicateRootPage` /
+        `bExtraSchemaChecks` are still deferred.**  The auto-index
+        branch silently accepts any `tnum >= 2 && tnum <= mxPage`,
+        which matches the C reference under
+        `bExtraSchemaChecks = 0` (the default).  Once Phase 7
+        wires `sqlite3Config.bExtraSchemaChecks`, plumb both
+        checks back in (see codegen.pas:7379 for the existing
+        TODO marker on the index-build side).
+      * **Next 6.9-bis target: step 11g.1.c** — audit
+        `sqlite3EndTable` / `sqlite3CreateIndex`'s init.busy=1
+        publication arms (`codegen.pas:6892`, `:7562`) under the
+        new live callback.  The arms already exist but have only
+        been exercised via `sqlite3InstallSchemaTable`'s direct
+        bootstrap; running them through `sqlite3Prepare` from
+        `sqlite3InitCallback` is a different driver and may surface
+        latent bugs (e.g. zName lifetime, hash placement on
+        lookaside, `pSchema` selection across attached DBs).
+
   - **2026-04-26 — Phase 6.9-bis (step 11g.1, structural skeleton):
     OP_ParseSchema dispatch hook + sqlite3_exec-driven worker.**
     Replaces the `OP_ParseSchema` no-op stub at
@@ -93,16 +188,22 @@ Important: At the end of this document, please find:
       * **Step 11g.1 sub-task split (revised):**
         - **11g.1.a** ✅ done 2026-04-26 — structural skeleton + hook
           (this commit).
-        - [ ] **11g.1.b** Wire `sqlite3InitCallback`'s c-r branch:
-          for argv[4] starting with C/c R/r, call
-          `sqlite3_prepare_v2(db, argv[4], -1, ...)` under
-          `db^.init.busy = 1`, with `db^.init.iDb := iDb` /
-          `db^.init.azInit := argv` set per prepare.c:134..145.
-          Also wire the no-SQL index branch (prepare.c:166..186):
-          when argv[4] is empty, call `sqlite3FindIndex` and patch
-          `pIndex^.tnum` from `argv[3]` via `sqlite3GetUInt32`.
-          Re-enable the nInitRow corruption check in the worker once
-          this lands.
+        - [X] **11g.1.b** ✅ done 2026-04-26 — wired
+          `sqlite3InitCallback`'s c-r branch (re-prepare argv[4] under
+          `init.busy = 1`, with init.iDb / init.newTnum / init.azInit
+          populated per prepare.c:128..163), the no-SQL index branch
+          (sqlite3FindIndex + tnum patch via the new
+          `sqlite3GetUInt32` helper, prepare.c:166..186), and a
+          minimal `initCorruptSchema` helper.  **nInitRow corruption
+          check stays disabled** — re-enabling it now would convert
+          every CREATE TABLE in the corpus to SQLITE_CORRUPT because
+          `sqlite3Insert` (step 11e) is still a structural skeleton
+          that emits zero ops, so OP_ParseSchema's SELECT against
+          sqlite_master legitimately returns 0 rows in the current
+          build.  Re-enable the check once step 11e starts writing
+          schema rows.  TestExplainParity unchanged at 2/8/0 — the
+          callback is wired but its observable effect is gated behind
+          the same INSERT-emission tail.
         - [ ] **11g.1.c** Audit `sqlite3EndTable` /
           `sqlite3CreateIndex` init.busy=1 paths against the
           re-prepare flow — verify the in-memory publication in

@@ -1901,20 +1901,133 @@ type
     mxPage     : Pgno;
   end;
 
+{ Helper — minimal port of prepare.c:22 corruptSchema.  We do not yet
+  honour mInitFlags / SQLITE_WriteSchema overrides (Phase 7 territory);
+  for now any caller-side error simply sets pData^.rc to a corruption
+  code, which is exactly what the surrounding sqlite3InitCallback
+  branches need to ferry the failure out through OP_ParseSchema. }
+procedure initCorruptSchema(pData: PInitData; {%H-}argv: PPAnsiChar;
+                            {%H-}zExtra: PAnsiChar);
+begin
+  if pData^.db^.mallocFailed <> 0 then
+    pData^.rc := SQLITE_NOMEM
+  else
+    pData^.rc := SQLITE_CORRUPT;
+end;
+
+{ Faithful port of prepare.c:96 sqlite3InitCallback.
+
+  Three productive branches mirror the C reference:
+    (a) argv[3] = nil                            → corruptSchema
+    (b) argv[4] starts with 'c'/'C' then 'r'/'R' → re-prepare CREATE
+        under init.busy=1, populating db^.init.{iDb,newTnum,azInit}
+        per prepare.c:128..163.  This is what publishes a table /
+        index / view into pSchema^.tblHash without re-emitting any
+        VDBE bytecode — the parser builds the in-memory structures
+        and bails out before codegen because init.busy is set.
+    (c) argv[1] = nil, or argv[4] is non-empty   → corruptSchema
+    (d) otherwise (PRIMARY KEY / UNIQUE auto-index with empty SQL):
+        sqlite3FindIndex + patch pIndex^.tnum from argv[3].
+}
 function sqlite3InitCallback(pInit: Pointer; argc: i32;
                              argv: PPAnsiChar;
                              {%H-}NotUsed: PPAnsiChar): i32; cdecl;
 var
-  pData: PInitData;
+  pData     : PInitData;
+  db        : PTsqlite3;
+  iDb       : i32;
+  rc        : i32;
+  saved_iDb : u8;
+  pStmt     : Pointer;
+  zArg1, zArg3, zArg4 : PAnsiChar;
+  c0, c1    : u8;
+  pIndex    : PIndex2;
 begin
   pData := PInitData(pInit);
+  db    := pData^.db;
+  iDb   := pData^.iDb;
+  Assert(argc = 5);
+  { DBFLAG_EncodingFixed (sqliteInt.h:1892) — redeclared locally here
+    because passqlite3parser scopes it to its implementation section. }
+  db^.mDbFlags := db^.mDbFlags or u32($0040);
   if argv = nil then begin Result := 0; Exit; end;
   Inc(pData^.nInitRow);
-  { Step 11g.1 minimal: counting the row keeps the OP_ParseSchema
-    nInitRow==0 → SQLITE_CORRUPT check honest.  Re-preparing argv[4]
-    under init.busy=1 to publish the table/index into pSchema^.tblHash
-    is the next sub-step — it lights up the 3 nil-Vdbe rows in
-    TestExplainParity (CREATE INDEX × 2, DROP TABLE × 1). }
+  if db^.mallocFailed <> 0 then begin
+    initCorruptSchema(pData, argv, nil);
+    Result := 1; Exit;
+  end;
+  Assert((iDb >= 0) and (iDb < db^.nDb));
+
+  zArg1 := (argv + 1)^;
+  zArg3 := (argv + 3)^;
+  zArg4 := (argv + 4)^;
+
+  if zArg3 = nil then begin
+    initCorruptSchema(pData, argv, nil);
+  end else if zArg4 <> nil then begin
+    c0 := sqlite3UpperToLower[u8(zArg4[0])];
+    c1 := 0;
+    if zArg4[0] <> #0 then c1 := sqlite3UpperToLower[u8(zArg4[1])];
+    if (c0 = u8(Ord('c'))) and (c1 = u8(Ord('r'))) then begin
+      { Branch (b) — re-prepare a CREATE statement to publish into
+        pSchema^.tblHash.  init.busy is already 1 (set by the
+        OP_ParseSchema worker / sqlite3InitOne); we save & restore
+        only init.iDb so nested attaches don't clobber it. }
+      Assert(db^.init.busy <> 0);
+      saved_iDb     := db^.init.iDb;
+      db^.init.iDb  := u8(iDb);
+      if (sqlite3GetUInt32(zArg3, @db^.init.newTnum) = 0)
+         or ((db^.init.newTnum > pData^.mxPage) and (pData^.mxPage > 0)) then begin
+        { bExtraSchemaChecks gate omitted — sqlite3Config.bExtraSchemaChecks
+          isn't wired yet; following the reference's safe default of OFF. }
+      end;
+      { Clear the orphanTrigger flag (bit 0 of init.flags). }
+      db^.init.flags := db^.init.flags and (not u8($01));
+      db^.init.azInit := PPAnsiChar(argv);
+      pStmt := nil;
+      rc := sqlite3Prepare(db, zArg4, -1, 0, nil, @pStmt, nil);
+      rc := db^.errCode;
+      db^.init.iDb := saved_iDb;
+      if rc <> SQLITE_OK then begin
+        if (db^.init.flags and u8($01)) <> 0 then begin
+          { orphanTrigger — only valid for TEMP. }
+          Assert(iDb = 1);
+        end else begin
+          if rc > pData^.rc then pData^.rc := rc;
+          if rc = SQLITE_NOMEM then
+            sqlite3OomFault(db)
+          else if (rc <> SQLITE_INTERRUPT) and ((rc and $FF) <> SQLITE_LOCKED) then
+            initCorruptSchema(pData, argv, sqlite3_errmsg(db));
+        end;
+      end;
+      db^.init.azInit := nil;  { sqlite3StdType in C; nil is safe — no live consumer. }
+      sqlite3_finalize(PVdbe(pStmt));
+    end else if (zArg1 = nil) or (zArg4[0] <> #0) then begin
+      initCorruptSchema(pData, argv, nil);
+    end else begin
+      { Should not happen — zArg4[0]=#0 is handled by branch (d). }
+      initCorruptSchema(pData, argv, nil);
+    end;
+  end else if zArg1 = nil then begin
+    initCorruptSchema(pData, argv, nil);
+  end else begin
+    { Branch (d) — empty SQL column means an auto-index for a
+      PRIMARY KEY / UNIQUE constraint.  The Index struct already
+      exists from the parent CREATE TABLE; only patch its tnum. }
+    pIndex := sqlite3FindIndex(db, zArg1, db^.aDb[iDb].zDbSName);
+    if pIndex = nil then begin
+      initCorruptSchema(pData, argv, PAnsiChar('orphan index'));
+    end else begin
+      if (sqlite3GetUInt32(zArg3, @pIndex^.tnum) = 0)
+         or (pIndex^.tnum < 2)
+         or (pIndex^.tnum > pData^.mxPage) then begin
+        { sqlite3IndexHasDuplicateRootPage check + bExtraSchemaChecks
+          gate are still pending (see passqlite3codegen.pas:7379).
+          Leave silent for now — matches the C reference when
+          bExtraSchemaChecks is OFF. }
+      end;
+    end;
+  end;
   Result := 0;
 end;
 
