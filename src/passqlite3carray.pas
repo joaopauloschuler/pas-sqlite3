@@ -263,24 +263,8 @@ begin
   Result := nil;
 end;
 
-{ Tiny mprintf replacement for the unknown-datatype error path.  Mirrors
-  the vtabFmtMsg shim used by passqlite3vtab in 6.bis.1c.  Allocated via
-  sqlite3Malloc so the caller can release it with sqlite3_free (libc
-  free), matching the allocator contract documented in 6.bis.1d. }
-function carrayFmtMsg(const fmt, arg: AnsiString): PAnsiChar;
-var
-  s: AnsiString;
-  z: PAnsiChar;
-  n: i32;
-begin
-  s := SysUtils.Format(string(fmt), [string(arg)]);
-  n := Length(s);
-  z := PAnsiChar(sqlite3Malloc(n + 1));
-  if z = nil then begin Result := nil; Exit; end;
-  if n > 0 then Move(PAnsiChar(s)^, z^, n);
-  z[n] := #0;
-  Result := z;
-end;
+{ Phase 6.bis follow-up (2026-04-26): unknown-datatype error path now
+  delegates to the shared sqlite3VtabFmtMsg1Libc helper in passqlite3vtab. }
 
 { carray.c:253 — xFilter. }
 function carrayFilter(cur: PSqlite3VtabCursor;
@@ -326,7 +310,7 @@ begin
         if not found then begin
           { vtab.c:283 — pVtab^.zErrMsg uses sqlite3_mprintf; we mirror
             with a libc-allocated buffer so sqlite3_free clears it. }
-          cur^.pVtab^.zErrMsg := carrayFmtMsg('unknown datatype: %s',
+          cur^.pVtab^.zErrMsg := sqlite3VtabFmtMsg1Libc('unknown datatype: %s',
             AnsiString(zType));
           Result := SQLITE_ERROR; Exit;
         end;

@@ -105,26 +105,8 @@ implementation
   Local shims
   ============================================================ }
 
-{ Tiny mprintf replacement for the xUpdate error path.  Mirrors
-  carrayFmtMsg (6.bis.2b).  Allocated via sqlite3Malloc so the caller
-  can release it with sqlite3_free. }
-function dbpageFmtMsg(const fmt: AnsiString; const arg: AnsiString): PAnsiChar;
-var
-  s: AnsiString;
-  z: PAnsiChar;
-  n: i32;
-begin
-  if Pos('%', fmt) > 0 then
-    s := SysUtils.Format(string(fmt), [string(arg)])
-  else
-    s := fmt;
-  n := Length(s);
-  z := PAnsiChar(sqlite3Malloc(n + 1));
-  if z = nil then begin Result := nil; Exit; end;
-  if n > 0 then Move(PAnsiChar(s)^, z^, n);
-  z[n] := #0;
-  Result := z;
-end;
+{ Phase 6.bis follow-up (2026-04-26): xUpdate error path now delegates
+  to the shared sqlite3VtabFmtMsg1Libc helper in passqlite3vtab. }
 
 { ============================================================
   Static module callbacks
@@ -493,7 +475,7 @@ begin
 update_fail:
   pTab^.pgnoTrunc := 0;
   sqlite3_free(pVtab^.zErrMsg);
-  pVtab^.zErrMsg := dbpageFmtMsg('%s', zErr);
+  pVtab^.zErrMsg := sqlite3VtabFmtMsg1Libc('%s', zErr);
   Result := SQLITE_ERROR;
 end;
 

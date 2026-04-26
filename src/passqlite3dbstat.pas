@@ -186,25 +186,8 @@ const
   Local shims — printf-family and SQL-builder
   ============================================================ }
 
-{ Mirror of the carray/dbpage `*FmtMsg` shim.  One %s substitution,
-  libc-malloc'd so sqlite3_free can release it. }
-function statFmtMsg(const fmt, arg: AnsiString): PAnsiChar;
-var
-  s: AnsiString;
-  z: PAnsiChar;
-  n: i32;
-begin
-  if Pos('%', fmt) > 0 then
-    s := SysUtils.Format(string(fmt), [string(arg)])
-  else
-    s := fmt;
-  n := Length(s);
-  z := PAnsiChar(sqlite3Malloc(n + 1));
-  if z = nil then begin Result := nil; Exit; end;
-  if n > 0 then Move(PAnsiChar(s)^, z^, n);
-  z[n] := #0;
-  Result := z;
-end;
+{ Phase 6.bis follow-up (2026-04-26): error-message %s shim now delegates
+  to the shared sqlite3VtabFmtMsg1Libc helper in passqlite3vtab. }
 
 { Build "/<3hex>/" or "/<3hex>+<6hex>" path strings (dbstat.c:599, 670, 707).
   Returns sqlite3Malloc'd PAnsiChar; nil on OOM. }
@@ -365,7 +348,7 @@ begin
     zDb := (argvArr + 3)^;
     iDb := sqlite3FindDbName(db, zDb);
     if iDb < 0 then begin
-      pzErr^ := statFmtMsg('no such database: %s', AnsiString(zDb));
+      pzErr^ := sqlite3VtabFmtMsg1Libc('no such database: %s', AnsiString(zDb));
       Result := SQLITE_ERROR; Exit;
     end;
   end else begin

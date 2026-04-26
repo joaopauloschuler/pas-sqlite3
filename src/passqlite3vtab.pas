@@ -400,6 +400,25 @@ function tabVtabPP(pTab: Pointer): PPVTable;
 { pTab^.zName — table or view name. }
 function tabZName(pTab: Pointer): PAnsiChar; inline;
 
+{ ============================================================
+  Shared printf-shim helpers (Phase 6.bis follow-up: collapse the
+  four duplicate *FmtMsg copies in passqlite3vtab/carray/dbpage/
+  dbstat into a single pair).  Both implement the one-%s
+  substitution pattern that the four call sites need today;
+  full sqlite3MPrintf-format support waits on the printf sub-phase.
+  ============================================================ }
+
+{ One-%s formatter.  Allocated via sqlite3DbMalloc(db, ...) — caller
+  releases with sqlite3DbFree.  fmt without '%' is returned verbatim. }
+function sqlite3VtabFmtMsg1Db(db: PTsqlite3;
+  const fmt, arg: AnsiString): PAnsiChar;
+
+{ One-%s formatter.  Allocated via sqlite3Malloc (libc malloc) so the
+  caller can release it with sqlite3_free — matches the allocator
+  contract for sqlite3_vtab.zErrMsg.  fmt without '%' is returned
+  verbatim. }
+function sqlite3VtabFmtMsg1Libc(const fmt, arg: AnsiString): PAnsiChar;
+
 implementation
 
 { ----------------------------------------------------------------------
@@ -687,20 +706,47 @@ type
 { Build an error message via SysUtils.Format and return as a sqlite3DbMalloc
   string.  Replacement for sqlite3MPrintf in the Phase 6.bis.1c code paths
   (the printf-machinery sub-phase will replace these calls when it lands). }
-function vtabFmtMsg(db: PTsqlite3; const fmt: AnsiString;
-  const arg: AnsiString): PAnsiChar;
+function sqlite3VtabFmtMsg1Db(db: PTsqlite3;
+  const fmt, arg: AnsiString): PAnsiChar;
 var
   s: AnsiString;
   n: i32;
   z: PAnsiChar;
 begin
-  s := SysUtils.Format(string(fmt), [string(arg)]);
+  if Pos('%', fmt) > 0 then
+    s := SysUtils.Format(string(fmt), [string(arg)])
+  else
+    s := fmt;
   n := Length(s);
   z := PAnsiChar(sqlite3DbMalloc(Psqlite3db(db), n + 1));
   if z = nil then begin Result := nil; Exit; end;
   if n > 0 then Move(PAnsiChar(s)^, z^, n);
   z[n] := #0;
   Result := z;
+end;
+
+function sqlite3VtabFmtMsg1Libc(const fmt, arg: AnsiString): PAnsiChar;
+var
+  s: AnsiString;
+  n: i32;
+  z: PAnsiChar;
+begin
+  if Pos('%', fmt) > 0 then
+    s := SysUtils.Format(string(fmt), [string(arg)])
+  else
+    s := fmt;
+  n := Length(s);
+  z := PAnsiChar(sqlite3Malloc(n + 1));
+  if z = nil then begin Result := nil; Exit; end;
+  if n > 0 then Move(PAnsiChar(s)^, z^, n);
+  z[n] := #0;
+  Result := z;
+end;
+
+{ Back-compat alias for in-unit callers that used the older private name. }
+function vtabFmtMsg(db: PTsqlite3; const fmt, arg: AnsiString): PAnsiChar; inline;
+begin
+  Result := sqlite3VtabFmtMsg1Db(db, fmt, arg);
 end;
 
 { vtab.c:557 — invoke xCreate or xConnect on pTab.  *pzErr is heap-allocated

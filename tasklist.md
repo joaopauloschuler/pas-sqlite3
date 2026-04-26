@@ -20,6 +20,39 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.3e printf-shim consolidation.**  Cleanup
+    follow-up: collapsed the four duplicate `*FmtMsg` shims into a
+    single shared pair in `passqlite3vtab`'s interface:
+      * `sqlite3VtabFmtMsg1Db(db, fmt, arg)` — sqlite3DbMalloc-allocated.
+      * `sqlite3VtabFmtMsg1Libc(fmt, arg)`  — sqlite3Malloc-allocated
+        (for `pVtab^.zErrMsg`, freed via libc `free`).
+    Both accept fmt with or without `%`; without `%`, fmt is returned
+    verbatim (so the legacy single-arg `'%s'` callsites are byte-
+    identical and the caller can also pass a literal message).
+    `vtabFmtMsg` is kept as an in-unit alias to `sqlite3VtabFmtMsg1Db`
+    so the existing 6 callers in passqlite3vtab don't need touching.
+
+    Concrete changes:
+      * `src/passqlite3vtab.pas` — promotes `vtabFmtMsg` body to
+        `sqlite3VtabFmtMsg1Db`, adds `sqlite3VtabFmtMsg1Libc`, both
+        in interface; old name retained as inline alias.
+      * `src/passqlite3carray.pas` — drops `carrayFmtMsg`; one call
+        site now uses `sqlite3VtabFmtMsg1Libc` directly.
+      * `src/passqlite3dbpage.pas` — drops `dbpageFmtMsg`; one call
+        site converted.
+      * `src/passqlite3dbstat.pas` — drops `statFmtMsg`; one call
+        site converted.  `statFmtPath` left in place (different
+        signature: takes int args; will fold into the printf sub-
+        phase proper, not this cleanup).
+
+    Full 49-binary test sweep: all green (TestVtab 216/216, TestCarray
+    66/66, TestDbpage 68/68, TestDbstat 83/83, TestVdbeVtabExec 50/50,
+    no regressions elsewhere).  The remaining `sqlite3MPrintf` blocker
+    (full printf.c port with %q/%Q/%w/%z) is unaffected — this is a
+    cleanup, not the long-awaited printf sub-phase itself.  Once that
+    phase lands, both new helpers become thin wrappers over the real
+    `sqlite3_mprintf("%s", arg)` and `sqlite3MPrintf(db, "%s", arg)`.
+
   - **2026-04-26 — Phase 6.bis.3d OP_VCheck wiring.**  Replaced the
     pre-3d stub (set register p2 to NULL, period) with the faithful
     vdbe.c:8409 port:
@@ -3559,6 +3592,19 @@ Phase 5.9 depends on this being done first.
     clear) stays in Phase 8.x — no codepath in the port currently
     builds frames or auxdata, so cursor cleanup alone closes the
     immediate vtab-leak gap.
+
+  - [X] **6.bis.3e** Printf-shim consolidation (cleanup follow-up).
+    Collapsed the four duplicate `*FmtMsg` shims (vtabFmtMsg /
+    carrayFmtMsg / dbpageFmtMsg / statFmtMsg) into a single shared
+    pair in `passqlite3vtab`'s interface: `sqlite3VtabFmtMsg1Db` (for
+    `pzErr` slots that are sqlite3DbFree'd) and `sqlite3VtabFmtMsg1Libc`
+    (for `pVtab^.zErrMsg` slots that are libc-free'd).  carray /
+    dbpage / dbstat now call the shared helper directly; the in-unit
+    `vtabFmtMsg` name is retained as an inline alias so the six
+    existing call sites in passqlite3vtab don't need touching.
+    DONE 2026-04-26.  Full 49-binary sweep green.  `statFmtPath`
+    deliberately left in place — different signature, will fold into
+    the printf sub-phase proper rather than this cleanup.
 
   - [X] **6.bis.3d** Wire OP_VCheck (vdbe.c:8409) — the integrity-check
     opcode that fires `xIntegrity` on a virtual table.  Was a stub left
