@@ -20,6 +20,109 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 11e): wire `sqlite3ExprCode`
+    + the productive VALUES emission tail into `sqlite3Insert`.**
+    Replaces the TODO block at `passqlite3codegen.pas:5616..5626`
+    with a hand-rolled inline of the schema-row INSERT path used by
+    `sqlite3NestedParse` (CREATE INDEX / DROP INDEX / DROP TABLE /
+    sqlite_statN cleanup).  Mirrors the C reference's "no triggers,
+    no IDLIST, no view, no UPSERT, HasRowid" shape but skips the
+    full `sqlite3GenerateConstraintChecks` /
+    `sqlite3CompleteInsertion` path (still stubs) — emits the
+    OpenWrite / column-eval / NewRowid / MakeRecord / Insert
+    sequence directly.
+    [X]
+
+    Concrete changes (all in `src/passqlite3codegen.pas`):
+      * `sqlite3Insert`: new locals `i: i32`, `regOut: i32`,
+        `pListItems: PExprListItem`.
+      * Body now emits:
+        - `sqlite3OpenTable(pParse, 0, iDb, pTab, OP_OpenWrite)`
+          guarded by `not isView` (the C `if(!isView)` arm at
+          insert.c:1273);
+        - `for i := 0 to nColumn-1 do sqlite3ExprCode(pParse,
+           pListItems[i].pExpr, regData+i)` — ports the simplest
+          arm of insert.c:1429..1436's `sqlite3ExprCodeTarget +
+          OP_Copy/OP_SCopy` loop, leaning on the literal-only
+          `sqlite3ExprCode` from step 11d (which already emits
+          OP_Copy / OP_SCopy itself for TK_REGISTER fall-through);
+        - `OP_NewRowid 0, regRowid, regAutoinc` — matches
+          insert.c:1539 verbatim;
+        - `regOut := sqlite3GetTempReg(pParse)` then
+          `OP_MakeRecord regData, pTab^.nCol, regOut` +
+          `sqlite3SetMakeRecordP5(v, pTab)` — matches
+          insert.c:2714..2715;
+        - `OP_Insert 0, regOut, regRowid` +
+          `sqlite3VdbeChangeP5(v, OPFLAG_NCHANGE or
+           OPFLAG_LASTROWID or OPFLAG_APPEND or
+           OPFLAG_USESEEKRESULT)` — matches the standard
+          schema-row P5 set, including the OPFLAG_USESEEKRESULT
+          variant used by sqlite3CompleteInsertion (insert.c:
+          2818/2833 + 2842);
+        - `sqlite3ReleaseTempReg(pParse, regOut)` to balance
+          the GetTempReg (good citizen even though no current
+          caller cares about temp-register reuse here).
+
+    Tests: full build clean.  TestExplainParity unchanged at
+    **2 PASS / 8 DIVERGE / 0 ERROR** (see Discoveries).
+    Regression spot check (2026-04-26): TestPrepareBasic 20/20,
+    TestParser 45/45, TestParserSmoke 20/20, TestSchemaBasic
+    44/44, TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic
+    49/49, TestExprBasic 40/40, TestVdbeTxn 8/8, TestAuthBuiltins
+    34/34, TestOpenClose 17/17, TestSmoke + TestUtil clean,
+    TestJson 434/434, TestJsonEach 50/50, TestJsonRegister 48/48,
+    TestPrintf 105/105, TestVtab 216/216.
+
+    Discoveries / next-step notes:
+      * **TestExplainParity didn't move yet — root cause is
+        upstream of `sqlite3Insert`.**  CREATE TABLE and DROP
+        TABLE rows go through `sqlite3Update` / `sqlite3DeleteFrom`
+        (still Phase 6.4 stubs), not `sqlite3Insert`, because
+        `sqlite3EndTable` emits `UPDATE sqlite_master ...` and
+        `sqlite3CodeDropTable` emits `DELETE FROM sqlite_master
+        ...`.  The CREATE INDEX rows *would* hit `sqlite3Insert`
+        (INSERT INTO sqlite_master), but `TestExplainParity` reports
+        "Pascal prepare returned nil Vdbe" for those — meaning
+        `sqlite3CreateIndex` errors out *before* reaching the
+        `sqlite3NestedParse` call (likely an nErr trip in the
+        structural scaffolding from step 8, or schema not loaded
+        for ephemeral parses).  The productive Insert tail is
+        now in place; flipping CREATE INDEX to PASS requires
+        unblocking sqlite3CreateIndex's own pipeline first.
+      * **`sqlite3SetMakeRecordP5` is still a Phase-6.4 stub** —
+        kept the call site so wiring real P5 setting becomes a
+        body-only edit later.  No observable effect today since
+        sqlite_master is HasRowid (not WITHOUT ROWID) and the
+        stub no-op matches the C reference's behaviour for that
+        case (P5 only matters for WITHOUT ROWID + STRICT).
+      * **`OPFLAG_NCHANGE | OPFLAG_LASTROWID | OPFLAG_APPEND |
+        OPFLAG_USESEEKRESULT`** is the documented P5 set for the
+        schema-row INSERT.  USESEEKRESULT is technically only safe
+        when no REPLACE constraints + no triggers can fire; for
+        a fresh INSERT into sqlite_master both conditions hold
+        trivially.  Mirrors `sqlite3CompleteInsertion` insert.c:
+        2818..2842 for that case.
+      * **No constraint-checks / FK-checks emitted.**  C reference
+        runs `sqlite3GenerateConstraintChecks` + `sqlite3FkCheck`
+        before `sqlite3CompleteInsertion` (insert.c:1567..1574).
+        Both are Phase 6.4 stubs in this port.  Schema-row INSERTs
+        from `sqlite3NestedParse` don't define any UNIQUE/CHECK/FK
+        constraints over sqlite_master in user-visible code, so
+        the omission is structurally safe today.  A real Phase 6.x
+        port of those helpers will slot in *between* the column-
+        eval loop and the OP_NewRowid call without disturbing the
+        rest of the tail.
+      * **Next 6.9-bis target: step 11f — structural skeleton of
+        `sqlite3Update` / `sqlite3DeleteFrom`.**  The actual
+        DIVERGE-flippers for CREATE TABLE and DROP TABLE rows
+        live in Update / DeleteFrom (which receive
+        `UPDATE/DELETE FROM sqlite_master ...` from
+        `sqlite3NestedParse`).  Same pattern as step 11c: port
+        the C-shaped prologue first, then wire the productive
+        emission tail.  Once those two are real, the
+        sqlite3CreateIndex nil-Vdbe issue is the only remaining
+        block to flipping all 8 DIVERGE rows.
+
   - **2026-04-26 — Phase 6.9-bis (step 11d): literal-only
     `sqlite3ExprCode` port (expr.c:5884).**  Adds the four-arm
     `sqlite3ExprCode(pParse, pExpr, target)` helper covering exactly

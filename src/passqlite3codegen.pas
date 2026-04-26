@@ -5519,6 +5519,9 @@ var
   aTabColMap:     Pi32;
   bIdListInOrder: u8;
   nColumn:        i32;
+  i:              i32;
+  regOut:         i32;
+  pListItems:     PExprListItem;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -5613,19 +5616,45 @@ begin
     pList above and handled below. }
   if pSelect <> nil then goto insert_cleanup;
 
-  { TODO(Phase 6.x): VALUES emission loop + OP_NewRowid / OP_MakeRecord /
-    OP_Insert against the table cursor.  Requires:
-      - sqlite3ExprCode(pParse, pList^.a[i].pExpr, regData+i) for each col
-        (a literal-only stub is sub-step 11d);
-      - sqlite3OpenTable(pParse, 0, iDb, pTab, OP_OpenWrite) for the cursor;
-      - OP_NewRowid -> regRowid;
-      - OP_MakeRecord(regData, pTab^.nCol, regOut) + sqlite3SetMakeRecordP5;
-      - OP_Insert with regRowid + regOut + table cursor.
-    Until then, single-row VALUES INSERTs from sqlite3NestedParse parse
-    cleanly and emit no productive ops, leaving TestExplainParity at the
-    same diverge baseline as step 11b. }
+  { Single-row VALUES productive emission (Phase 6.9-bis step 11e).
+    Hand-rolled inline of the schema-row INSERT path used by sqlite3NestedParse
+    (CREATE INDEX / DROP INDEX / DROP TABLE / sqlite_statN cleanup).  Mirrors
+    the C reference's "no triggers, no IDLIST, no view, no UPSERT, HasRowid"
+    shape but skips the full sqlite3GenerateConstraintChecks /
+    sqlite3CompleteInsertion path (those still stubs) — emits the four-op
+    OpenWrite / column-eval / NewRowid / MakeRecord / Insert sequence
+    directly. }
   Assert(pList <> nil, 'pList nil at sqlite3Insert single-row path');
   nColumn := pList^.nExpr;
+
+  if not (isView <> 0) then
+    sqlite3OpenTable(pParse, 0, iDb, pTab, OP_OpenWrite);
+
+  { Evaluate VALUES into regData..regData+nColumn-1.  Schema-row INSERTs from
+    sqlite3NestedParse always provide a value for every column (no IDLIST,
+    no defaults), so iterate up to nColumn — items beyond pTab^.nCol are
+    impossible on the productive path because the parser already validated
+    column count in C-side ExprListAppend / sqlite3SrcListLookup. }
+  pListItems := ExprListItems(pList);
+  for i := 0 to nColumn - 1 do
+    sqlite3ExprCode(pParse, pListItems[i].pExpr, regData + i);
+
+  { OP_NewRowid -> regRowid (cursor 0).  C reference passes regAutoinc as P3;
+    today's stub returns 0 so this is structurally a no-op for AUTOINCREMENT
+    until that lands. }
+  sqlite3VdbeAddOp3(v, OP_NewRowid, 0, regRowid, regAutoinc);
+
+  { Pack the per-column regData block into a single record register. }
+  regOut := sqlite3GetTempReg(pParse);
+  sqlite3VdbeAddOp3(v, OP_MakeRecord, regData, i32(pTab^.nCol), regOut);
+  sqlite3SetMakeRecordP5(v, pTab);
+
+  { OP_Insert: cursor 0, record, rowid; P5 = standard insert-flag set used
+    by sqlite3NestedParse-emitted schema-row writes. }
+  sqlite3VdbeAddOp3(v, OP_Insert, 0, regOut, regRowid);
+  sqlite3VdbeChangeP5(v,
+    OPFLAG_NCHANGE or OPFLAG_LASTROWID or OPFLAG_APPEND or OPFLAG_USESEEKRESULT);
+  sqlite3ReleaseTempReg(pParse, regOut);
 
   if (pParse^.nested = 0) and (regRowCount <> 0) then
     sqlite3CodeChangeCount(v, regRowCount, 'rows inserted');
