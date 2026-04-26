@@ -30,7 +30,8 @@ uses
 // ---------------------------------------------------------------------------
 
 type
-  Bitmask = u64;
+  Bitmask  = u64;
+  PBitmask = ^Bitmask;
 
 // ---------------------------------------------------------------------------
 // Constants from sqliteInt.h needed by Phase 6
@@ -1182,6 +1183,30 @@ type
     _pad110:   u16;                     { 2 bytes @ 110 }
   end;
 
+  { --- TIndexedExpr (sqliteInt.h:3835..3846; SQLITE_ENABLE_EXPLAIN_COMMENTS off) --- }
+  PIndexedExpr  = ^TIndexedExpr;
+  PPIndexedExpr = ^PIndexedExpr;
+  TIndexedExpr = record
+    pExpr:         PExpr;        { 8 bytes @ 0  — the indexed expression }
+    iDataCur:      i32;          { 4 bytes @ 8  — cursor for the table }
+    iIdxCur:       i32;          { 4 bytes @ 12 — cursor for the index }
+    iIdxCol:       i32;          { 4 bytes @ 16 — column in the index }
+    bMaybeNullRow: u8;           { 1 byte  @ 20 — needs OP_IfNullRow }
+    aff:           u8;           { 1 byte  @ 21 — affinity of pExpr }
+    _pad22:        u16;          { 2 bytes @ 22 — pad to 8 for pIENext }
+    pIENext:       PIndexedExpr; { 8 bytes @ 24 — next in list }
+  end;
+
+  { --- TCoveringIndexCheck (where.c:3753..3759) --- }
+  PCoveringIndexCheck = ^TCoveringIndexCheck;
+  TCoveringIndexCheck = record
+    pIdx:    PIndex2;  { 8 bytes @ 0 — the index under test }
+    iTabCur: i32;      { 4 bytes @ 8 — cursor for the table }
+    bExpr:   u8;       { 1 byte  @ 12 — uses an indexed expression }
+    bUnidx:  u8;       { 1 byte  @ 13 — uses an unindexed column }
+    _pad14:  u16;      { 2 bytes @ 14 — pad to 16 }
+  end;
+
   { --- TWhereLoopBtree + TWhereLoopVtab + TWhereLoop (sizeof=104) --- }
   TWhereLoopBtree = record
     nEq:          u16;        { 2 bytes @ 0 }
@@ -1617,6 +1642,22 @@ procedure whereInterstageHeuristic(pWInfo: PWhereInfo);
   whereLoopAddBtreeIndex, where this routine lands in a later sub-progress. }
 function  whereRangeVectorLen(pParse: PParse; iCur: i32; pIdx: PIndex2;
   nEq: i32; pTerm: PWhereTerm): i32;
+
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — index-helper cluster fed to
+  whereLoopAddBtree (where.c:3663..3964).  All pure analysis helpers; no
+  codegen.  whereUsablePartialIndex (where.c:3699) is deferred until
+  sqlite3ExprImpliesExpr lands. }
+function  indexMightHelpWithOrderBy(pBuilder: PWhereLoopBuilder;
+  pIndex: PIndex2; iCursor: i32): i32;
+function  exprIsCoveredByIndex(const pExpr: PExpr; const pIdx: PIndex2;
+  iTabCur: i32): i32;
+function  whereIsCoveringIndexWalkCallback(pWalk: PWalker;
+  pExpr: PExpr): i32; cdecl;
+function  whereIsCoveringIndex(pWInfo: PWhereInfo; pIdx: PIndex2;
+  iTabCur: i32): u32;
+procedure whereIndexedExprCleanup(db: PTsqlite3; pObject: Pointer); cdecl;
+procedure wherePartIdxExpr(pParse: PParse; pIdx: PIndex2; pPart: PExpr;
+  pMask: PBitmask; iIdxCur: i32; pItem: PSrcItem);
 
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
@@ -7887,6 +7928,277 @@ begin
     Inc(i);
   end;
   Result := i;
+end;
+
+{ ===========================================================================
+  Phase 6.9-bis (step 11g.2.d sub-progress) — index-helper cluster fed to
+  whereLoopAddBtree.
+
+  Faithful port of:
+    * indexMightHelpWithOrderBy   (where.c:3663..3694)
+    * exprIsCoveredByIndex        (where.c:3734..3748)
+    * whereIsCoveringIndexWalkCallback (where.c:3778..3804)
+    * whereIsCoveringIndex        (where.c:3830..3871)
+    * whereIndexedExprCleanup     (where.c:3877..3885)
+    * wherePartIdxExpr            (where.c:3914..3964)
+
+  whereUsablePartialIndex (where.c:3699..3728) is deferred — it depends on
+  sqlite3ExprImpliesExpr, still unported.
+
+  The bUnordered / bHasExpr bits live in TIndex.idxFlags at bit positions 2
+  and 11 respectively (see codegen.pas:1003..1004 layout block).
+  =========================================================================== }
+
+{ Read-only accessor for TIndex.bUnordered (idxFlags bit 2). }
+function indexBUnordered(pIdx: PIndex2): i32; inline;
+begin
+  Result := i32((pIdx^.idxFlags shr 2) and 1);
+end;
+
+{ Read-only accessor for TIndex.bHasExpr (idxFlags bit 11). }
+function indexBHasExpr(pIdx: PIndex2): i32; inline;
+begin
+  Result := i32((pIdx^.idxFlags shr 11) and 1);
+end;
+
+{ Return TRUE if pIndex might be useful in satisfying ORDER BY for the
+  query whose builder is pBuilder.  Faithful port of where.c:3663..3694.
+
+  Walks each ORDER BY expression and returns 1 as soon as one of:
+    (a) the expression is a column / agg-column reference into iCursor and
+        either targets the rowid (iColumn<0) or matches one of the index
+        key columns; OR
+    (b) the index has aColExpr (XN_EXPR slots) and one of those expressions
+        compares equal under sqlite3ExprCompareSkip.
+  Indices marked bUnordered short-circuit to 0. }
+function indexMightHelpWithOrderBy(pBuilder: PWhereLoopBuilder;
+  pIndex: PIndex2; iCursor: i32): i32;
+var
+  pOB:      PExprList;
+  aColExpr: PExprList;
+  ii, jj:   i32;
+  pE:       PExpr;
+  obItems:  PExprListItem;
+  ceItems:  PExprListItem;
+begin
+  if indexBUnordered(pIndex) <> 0 then Exit(0);
+  pOB := pBuilder^.pWInfo^.pOrderBy;
+  if pOB = nil then Exit(0);
+  obItems := ExprListItems(pOB);
+  for ii := 0 to pOB^.nExpr - 1 do
+  begin
+    pE := sqlite3ExprSkipCollateAndLikely(obItems[ii].pExpr);
+    if pE = nil then Continue; { NEVER per upstream }
+    if ((pE^.op = TK_COLUMN) or (pE^.op = TK_AGG_COLUMN))
+       and (pE^.iTable = iCursor) then
+    begin
+      if pE^.iColumn < 0 then Exit(1);
+      for jj := 0 to i32(pIndex^.nKeyCol) - 1 do
+        if pE^.iColumn = pIndex^.aiColumn[jj] then Exit(1);
+    end
+    else
+    begin
+      aColExpr := pIndex^.aColExpr;
+      if aColExpr <> nil then
+      begin
+        ceItems := ExprListItems(aColExpr);
+        for jj := 0 to i32(pIndex^.nKeyCol) - 1 do
+        begin
+          if pIndex^.aiColumn[jj] <> XN_EXPR then Continue;
+          if sqlite3ExprCompareSkip(pE, ceItems[jj].pExpr, iCursor) = 0
+          then Exit(1);
+        end;
+      end;
+    end;
+  end;
+  Result := 0;
+end;
+
+{ Return TRUE if any XN_EXPR-indexed column of pIdx matches pExpr.
+  where.c:3734..3748. }
+function exprIsCoveredByIndex(const pExpr: PExpr; const pIdx: PIndex2;
+  iTabCur: i32): i32;
+var
+  i:     i32;
+  items: PExprListItem;
+begin
+  if pIdx^.aColExpr = nil then Exit(0);
+  items := ExprListItems(pIdx^.aColExpr);
+  for i := 0 to i32(pIdx^.nColumn) - 1 do
+    if (pIdx^.aiColumn[i] = XN_EXPR)
+       and (sqlite3ExprCompare(nil, pExpr, items[i].pExpr, iTabCur) = 0)
+    then Exit(1);
+  Result := 0;
+end;
+
+{ Walker callback for whereIsCoveringIndex.  where.c:3778..3804.
+
+  pWalk^.u.ptr aliases pCovIdxCk.  When pExpr is a column reference into
+  the table being indexed, walk the index column list looking for a match;
+  if missing, set bUnidx=1 and abort.  When pExpr does not match a column
+  but the index has indexed expressions and one of those covers pExpr,
+  set bExpr=1 and prune (so we do not walk into pExpr's children). }
+function whereIsCoveringIndexWalkCallback(pWalk: PWalker;
+  pExpr: PExpr): i32; cdecl;
+var
+  i:        i32;
+  pIdx:     PIndex2;
+  aiColumn: Pi16;
+  nColumn:  u16;
+  pCk:      PCoveringIndexCheck;
+begin
+  pCk  := PCoveringIndexCheck(pWalk^.u.ptr);
+  pIdx := pCk^.pIdx;
+  if (pExpr^.op = TK_COLUMN) or (pExpr^.op = TK_AGG_COLUMN) then
+  begin
+    if pExpr^.iTable <> pCk^.iTabCur then begin Result := WRC_Continue; Exit; end;
+    pIdx     := PCoveringIndexCheck(pWalk^.u.ptr)^.pIdx;
+    aiColumn := pIdx^.aiColumn;
+    nColumn  := pIdx^.nColumn;
+    for i := 0 to i32(nColumn) - 1 do
+      if aiColumn[i] = pExpr^.iColumn then begin Result := WRC_Continue; Exit; end;
+    pCk^.bUnidx := 1;
+    Result := WRC_Abort;
+    Exit;
+  end
+  else if (indexBHasExpr(pIdx) <> 0)
+       and (exprIsCoveredByIndex(pExpr, pIdx,
+              PCoveringIndexCheck(pWalk^.u.ptr)^.iTabCur) <> 0) then
+  begin
+    pCk^.bExpr := 1;
+    Result := WRC_Prune;
+    Exit;
+  end;
+  Result := WRC_Continue;
+end;
+
+{ Probe whether pIdx is a covering index for the query in pWInfo.
+  where.c:3830..3871.
+
+  Returns one of:
+    0              — definitely not a covering index;
+    WHERE_IDX_ONLY — definitely covering;
+    WHERE_EXPRIDX  — likely covering via indexed expression(s); the data
+                     cursor must remain open as a fallback. }
+function whereIsCoveringIndex(pWInfo: PWhereInfo; pIdx: PIndex2;
+  iTabCur: i32): u32;
+var
+  i, rc: i32;
+  ck:    TCoveringIndexCheck;
+  w:     TWalker;
+begin
+  if pWInfo^.pSelect = nil then Exit(0);
+  if indexBHasExpr(pIdx) = 0 then
+  begin
+    i := 0;
+    while i < i32(pIdx^.nColumn) do
+    begin
+      if pIdx^.aiColumn[i] >= i16(BMS - 1) then Break;
+      Inc(i);
+    end;
+    if i >= i32(pIdx^.nColumn) then Exit(0);
+  end;
+  ck.pIdx    := pIdx;
+  ck.iTabCur := iTabCur;
+  ck.bExpr   := 0;
+  ck.bUnidx  := 0;
+  FillChar(w, SizeOf(w), 0);
+  w.xExprCallback   := @whereIsCoveringIndexWalkCallback;
+  w.xSelectCallback := @sqlite3SelectWalkNoop;
+  w.u.ptr           := @ck;
+  sqlite3WalkSelect(@w, pWInfo^.pSelect);
+  if ck.bUnidx <> 0 then
+    rc := 0
+  else if ck.bExpr <> 0 then
+    rc := i32(WHERE_EXPRIDX)
+  else
+    rc := i32(WHERE_IDX_ONLY);
+  Result := u32(rc);
+end;
+
+{ sqlite3ParserAddCleanup callback that frees the IndexedExpr list rooted
+  at *pp.  where.c:3877..3885. }
+procedure whereIndexedExprCleanup(db: PTsqlite3; pObject: Pointer); cdecl;
+var
+  pp: PPIndexedExpr;
+  p:  PIndexedExpr;
+begin
+  pp := PPIndexedExpr(pObject);
+  while pp^ <> nil do
+  begin
+    p   := pp^;
+    pp^ := p^.pIENext;
+    sqlite3ExprDelete(db, p^.pExpr);
+    sqlite3DbFreeNN(db, p);
+  end;
+end;
+
+{ Process the WHERE clause of a partial index, looking for `col = constant`
+  arms whose collation is BINARY and whose column has a TEXT/NUMERIC/INTEGER/
+  REAL affinity (>= SQLITE_AFF_TEXT).  where.c:3914..3964.
+
+  Two callers:
+    * pItem != nil, pMask = nil  → coding a loop that uses pIdx; each match
+      adds an IndexedExpr to pParse^.pIdxPartExpr (cleanup registered when
+      the list grows from empty to non-empty).
+    * pItem = nil, pMask != nil  → covering-index probe; clear matched
+      column bit (positions < BMS-1) in *pMask. }
+procedure wherePartIdxExpr(pParse: PParse; pIdx: PIndex2; pPart: PExpr;
+  pMask: PBitmask; iIdxCur: i32; pItem: PSrcItem);
+var
+  pLeft, pRight: PExpr;
+  aff:           u8;
+  db:            PTsqlite3;
+  p:             PIndexedExpr;
+  bNullRow:      i32;
+begin
+  Assert((pItem = nil) or ((pItem^.fg.jointype and JT_RIGHT) = 0));
+  Assert(((pItem = nil) and (pMask <> nil))
+         or ((pItem <> nil) and (pMask = nil)));
+
+  if pPart^.op = TK_AND then
+  begin
+    wherePartIdxExpr(pParse, pIdx, pPart^.pRight, pMask, iIdxCur, pItem);
+    pPart := pPart^.pLeft;
+  end;
+
+  if (pPart^.op <> TK_EQ) and (pPart^.op <> TK_IS) then Exit;
+  pLeft  := pPart^.pLeft;
+  pRight := pPart^.pRight;
+  if pLeft^.op <> TK_COLUMN then Exit;
+  if sqlite3ExprIsConstant(nil, pRight) = 0 then Exit;
+  if sqlite3IsBinary(sqlite3ExprCompareCollSeq(pParse, pPart)) = 0 then Exit;
+  if pLeft^.iColumn < 0 then Exit;
+  aff := u8(pIdx^.pTable^.aCol[pLeft^.iColumn].affinity);
+  if aff < SQLITE_AFF_TEXT then Exit;
+
+  if pItem <> nil then
+  begin
+    db := pParse^.db;
+    p  := PIndexedExpr(sqlite3DbMallocRaw(db, u64(SizeOf(TIndexedExpr))));
+    if p <> nil then
+    begin
+      if (pItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+        bNullRow := 1
+      else
+        bNullRow := 0;
+      p^.pExpr         := sqlite3ExprDup(db, pRight, 0);
+      p^.iDataCur      := pItem^.iCursor;
+      p^.iIdxCur       := iIdxCur;
+      p^.iIdxCol       := pLeft^.iColumn;
+      p^.bMaybeNullRow := u8(bNullRow);
+      p^.pIENext       := PIndexedExpr(pParse^.pIdxPartExpr);
+      p^.aff           := aff;
+      pParse^.pIdxPartExpr := p;
+      if p^.pIENext = nil then
+        sqlite3ParserAddCleanup(pParse, @whereIndexedExprCleanup,
+                                @pParse^.pIdxPartExpr);
+    end;
+  end
+  else if pLeft^.iColumn < (BMS - 1) then
+  begin
+    pMask^ := pMask^ and (not (Bitmask(1) shl pLeft^.iColumn));
+  end;
 end;
 
 { Helper for exprIsDeterministic (where.c:6445).  TK_FUNCTION nodes without

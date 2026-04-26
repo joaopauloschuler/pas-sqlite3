@@ -803,6 +803,222 @@ begin
   Check('RV4 vector — cap by (nColumn - nEq) → 1', rc = 1);
 end;
 
+{ ----- indexMightHelpWithOrderBy + exprIsCoveredByIndex ----- }
+
+procedure TestIndexHelpers;
+var
+  wInfo:    TWhereInfo;
+  builder:  TWhereLoopBuilder;
+  idx:      TIndex;
+  aiCols:   array[0..2] of i16;
+  obBuf:    array[0 .. SizeOf(TExprList) + 2*SizeOf(TExprListItem) - 1] of Byte;
+  aceBuf:   array[0 .. SizeOf(TExprList) + 2*SizeOf(TExprListItem) - 1] of Byte;
+  pOB:      PExprList;
+  pAce:     PExprList;
+  obItems:  PExprListItem;
+  aceItems: PExprListItem;
+  obE0,obE1: TExpr;
+  aceE0:    TExpr;
+  rc:       i32;
+begin
+  FillChar(wInfo,   SizeOf(wInfo), 0);
+  FillChar(builder, SizeOf(builder), 0);
+  FillChar(idx,     SizeOf(idx),   0);
+  FillChar(obBuf,   SizeOf(obBuf), 0);
+  FillChar(aceBuf,  SizeOf(aceBuf), 0);
+  FillChar(obE0, SizeOf(obE0), 0); FillChar(obE1, SizeOf(obE1), 0);
+  FillChar(aceE0, SizeOf(aceE0), 0);
+
+  builder.pWInfo := @wInfo;
+  aiCols[0] := 0; aiCols[1] := 5; aiCols[2] := XN_EXPR;
+  idx.aiColumn := @aiCols[0];
+  idx.nKeyCol  := 3;
+  idx.nColumn  := 3;
+
+  { ----- IMHO1: pOrderBy = nil → 0. ----- }
+  wInfo.pOrderBy := nil;
+  rc := indexMightHelpWithOrderBy(@builder, @idx, 7);
+  Check('IMHO1 pOrderBy nil returns 0', rc = 0);
+
+  { ----- IMHO2: bUnordered=1 → 0 even with matching ORDER BY. ----- }
+  pOB := PExprList(@obBuf[0]);
+  pOB^.nExpr := 1;
+  obItems := ExprListItems(pOB);
+  obE0.op := TK_COLUMN; obE0.iTable := 7; obE0.iColumn := -1; { rowid }
+  obItems[0].pExpr := @obE0;
+  wInfo.pOrderBy := pOB;
+  idx.idxFlags := idx.idxFlags or u32(1) shl 2; { bUnordered }
+  rc := indexMightHelpWithOrderBy(@builder, @idx, 7);
+  Check('IMHO2 bUnordered short-circuits', rc = 0);
+  idx.idxFlags := idx.idxFlags and (not (u32(1) shl 2));
+
+  { ----- IMHO3: ORDER BY rowid (iColumn<0) on the right cursor → 1. ----- }
+  rc := indexMightHelpWithOrderBy(@builder, @idx, 7);
+  Check('IMHO3 ORDER BY rowid returns 1', rc = 1);
+
+  { ----- IMHO4: ORDER BY column matches a key column (5). ----- }
+  obE0.iColumn := 5;
+  rc := indexMightHelpWithOrderBy(@builder, @idx, 7);
+  Check('IMHO4 ORDER BY key-col returns 1', rc = 1);
+
+  { ----- IMHO5: ORDER BY column does not match any key column → 0. ----- }
+  obE0.iColumn := 9;  { not in {0,5,XN_EXPR} }
+  rc := indexMightHelpWithOrderBy(@builder, @idx, 7);
+  Check('IMHO5 ORDER BY unrelated col returns 0', rc = 0);
+
+  { ----- IMHO6: ORDER BY column on a different cursor → 0. ----- }
+  obE0.iColumn := 0; obE0.iTable := 99;
+  rc := indexMightHelpWithOrderBy(@builder, @idx, 7);
+  Check('IMHO6 wrong cursor returns 0', rc = 0);
+
+  { ----- ECI1: aColExpr = nil → 0. ----- }
+  rc := exprIsCoveredByIndex(@obE0, @idx, 7);
+  Check('ECI1 aColExpr nil returns 0', rc = 0);
+
+  { ----- ECI2: aColExpr supplied, slot 2 is XN_EXPR and matches the
+    expression node by reference (sqlite3ExprCompare returns 0 for the
+    same node).  Returns 1. ----- }
+  pAce := PExprList(@aceBuf[0]);
+  pAce^.nExpr := 3;
+  aceItems := ExprListItems(pAce);
+  aceItems[0].pExpr := nil;
+  aceItems[1].pExpr := nil;
+  aceE0.op := TK_COLUMN; aceE0.iTable := 7; aceE0.iColumn := 4;
+  aceItems[2].pExpr := @aceE0;
+  idx.aColExpr := pAce;
+  rc := exprIsCoveredByIndex(@aceE0, @idx, 7);
+  Check('ECI2 XN_EXPR slot matches → 1', rc = 1);
+
+  { ----- ECI3: aColExpr supplied but no slot is XN_EXPR → 0. ----- }
+  aiCols[0] := 0; aiCols[1] := 5; aiCols[2] := 7;  { no XN_EXPR }
+  rc := exprIsCoveredByIndex(@aceE0, @idx, 7);
+  Check('ECI3 no XN_EXPR slot returns 0', rc = 0);
+  aiCols[2] := XN_EXPR;
+end;
+
+{ ----- whereIsCoveringIndex ----- }
+
+procedure TestWhereIsCoveringIndex;
+var
+  wInfo:   TWhereInfo;
+  idx:     TIndex;
+  aiCols:  array[0..2] of i16;
+  sel:     TSelect;
+  rc:      u32;
+begin
+  FillChar(wInfo, SizeOf(wInfo), 0);
+  FillChar(idx,   SizeOf(idx),   0);
+  FillChar(sel,   SizeOf(sel),   0);
+
+  aiCols[0] := 0; aiCols[1] := 1; aiCols[2] := 2;
+  idx.aiColumn := @aiCols[0];
+  idx.nColumn  := 3;
+
+  { ----- WIC1: pSelect = nil → 0 (cannot determine coverage). ----- }
+  wInfo.pSelect := nil;
+  rc := whereIsCoveringIndex(@wInfo, @idx, 4);
+  Check('WIC1 pSelect=nil returns 0', rc = 0);
+
+  { ----- WIC2: bHasExpr=0 and every aiColumn[i] < BMS-1 → 0
+    (loop runs to completion with no aiColumn[i] >= BMS-1). ----- }
+  wInfo.pSelect := @sel;
+  rc := whereIsCoveringIndex(@wInfo, @idx, 4);
+  Check('WIC2 no high-column slot returns 0', rc = 0);
+
+  { ----- WIC3: at least one aiColumn[i] >= BMS-1 lets us proceed.  Empty
+    select walks cleanly → no column refs → bUnidx=0, bExpr=0 → returns
+    WHERE_IDX_ONLY. ----- }
+  aiCols[1] := i16(BMS - 1);
+  rc := whereIsCoveringIndex(@wInfo, @idx, 4);
+  Check('WIC3 empty select → WHERE_IDX_ONLY', rc = WHERE_IDX_ONLY);
+end;
+
+{ ----- whereIndexedExprCleanup ----- }
+
+procedure TestIndexedExprCleanup;
+var
+  e1, e2, e3: PIndexedExpr;
+  pHead: PIndexedExpr;
+begin
+  { Heap-alloc the nodes — sqlite3DbFreeNN(nil, ...) routes to sqlite3_free
+    and so requires sqlite3_malloc'd storage.  pExpr stays nil so the
+    sqlite3ExprDelete arm is a no-op. }
+  e1 := PIndexedExpr(sqlite3_malloc(SizeOf(TIndexedExpr)));
+  e2 := PIndexedExpr(sqlite3_malloc(SizeOf(TIndexedExpr)));
+  e3 := PIndexedExpr(sqlite3_malloc(SizeOf(TIndexedExpr)));
+  FillChar(e1^, SizeOf(TIndexedExpr), 0);
+  FillChar(e2^, SizeOf(TIndexedExpr), 0);
+  FillChar(e3^, SizeOf(TIndexedExpr), 0);
+  e1^.pIENext := e2;
+  e2^.pIENext := e3;
+  e3^.pIENext := nil;
+  pHead := e1;
+  whereIndexedExprCleanup(nil, @pHead);
+  Check('WIEC list head emptied', pHead = nil);
+end;
+
+{ ----- wherePartIdxExpr (mask path) ----- }
+
+procedure TestPartIdxExprMask;
+var
+  idx:     TIndex;
+  aff:     TColumn;
+  cols:    array[0..3] of TColumn;
+  tab:     TTable;
+  exEq:    TExpr;
+  exLeft:  TExpr;
+  exRight: TExpr;
+  exRoot:  TExpr;
+  mask:    Bitmask;
+begin
+  FillChar(idx,    SizeOf(idx),    0);
+  FillChar(aff,    SizeOf(aff),    0);
+  FillChar(cols,   SizeOf(cols),   0);
+  FillChar(tab,    SizeOf(tab),    0);
+  FillChar(exEq,   SizeOf(exEq),   0);
+  FillChar(exLeft, SizeOf(exLeft), 0);
+  FillChar(exRight,SizeOf(exRight),0);
+  FillChar(exRoot, SizeOf(exRoot), 0);
+
+  { ----- WPIE1: non-EQ root pPart is a no-op.  mask preserved. ----- }
+  exRoot.op := TK_COLUMN;
+  mask := $00FF;
+  wherePartIdxExpr(nil, @idx, @exRoot, @mask, 1, nil);
+  Check('WPIE1 non-EQ no-op', mask = $00FF);
+
+  { ----- WPIE2: TK_EQ + non-column LHS → no-op. ----- }
+  exRoot.op := TK_EQ; exRoot.pLeft := @exLeft; exRoot.pRight := @exRight;
+  exLeft.op := TK_INTEGER;
+  exRight.op := TK_INTEGER;
+  wherePartIdxExpr(nil, @idx, @exRoot, @mask, 1, nil);
+  Check('WPIE2 non-column LHS no-op', mask = $00FF);
+
+  { ----- WPIE3: pLeft^.iColumn < 0 (rowid) → no-op even with TK_COLUMN. ----- }
+  exLeft.op := TK_COLUMN; exLeft.iColumn := -1;
+  wherePartIdxExpr(nil, @idx, @exRoot, @mask, 1, nil);
+  Check('WPIE3 iColumn<0 no-op', mask = $00FF);
+
+  { ----- WPIE4: TK_AND walk — left-side TK_EQ still fires under same
+    no-op conditions; right is pPart^.pRight set to a fresh TK_COLUMN-LHS
+    branch.  Just verify that TK_AND doesn't crash and mask is preserved
+    when both sides are no-ops. ----- }
+  exEq.op := TK_AND; exEq.pLeft := @exRoot; exEq.pRight := @exRoot;
+  wherePartIdxExpr(nil, @idx, @exEq, @mask, 1, nil);
+  Check('WPIE4 TK_AND walk preserves mask', mask = $00FF);
+
+  { ----- WPIE5: column LHS with affinity = TEXT, rhs constant integer,
+    coll = nil (BINARY).  iColumn=3 < BMS-1 → bit 3 cleared. ----- }
+  cols[3].affinity := AnsiChar(SQLITE_AFF_TEXT);
+  tab.aCol  := @cols[0];
+  idx.pTable := @tab;
+  exLeft.op := TK_COLUMN; exLeft.iColumn := 3;
+  exRight.op := TK_INTEGER; { sqlite3ExprIsConstant TK_INTEGER → 1 }
+  exRoot.op := TK_EQ;
+  mask := Bitmask($FF);
+  wherePartIdxExpr(nil, @idx, @exRoot, @mask, 1, nil);
+  Check('WPIE5 mask bit 3 cleared', mask = (Bitmask($FF) and not (Bitmask(1) shl 3)));
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -816,6 +1032,10 @@ begin
   TestOutputAdjust;
   TestInterstageHeuristic;
   TestRangeVectorLen;
+  TestIndexHelpers;
+  TestWhereIsCoveringIndex;
+  TestIndexedExprCleanup;
+  TestPartIdxExprMask;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

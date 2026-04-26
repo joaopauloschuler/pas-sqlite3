@@ -200,6 +200,26 @@ Important: At the end of this document, please find:
       (WHERE_COLUMN_RANGE-only inner level breaks the walk yet outer
       EQ still disables its iTab=0 rival), IH4 (WHERE_COLUMN_IN trips
       the disable arm), IH5 (WHERE_COLUMN_NULL trips it too).
+    - [X] Index-helper cluster fed to `whereLoopAddBtree` —
+      `indexMightHelpWithOrderBy` (where.c:3663..3694),
+      `exprIsCoveredByIndex` (where.c:3734..3748),
+      `whereIsCoveringIndexWalkCallback` (where.c:3778..3804),
+      `whereIsCoveringIndex` (where.c:3830..3871),
+      `whereIndexedExprCleanup` (where.c:3877..3885), and
+      `wherePartIdxExpr` (where.c:3914..3964).  Pure analysis helpers,
+      no codegen.  `TIndexedExpr` and `TCoveringIndexCheck` records
+      lifted from sqliteInt.h:3835 / where.c:3753.  bUnordered
+      (idxFlags bit 2) and bHasExpr (idxFlags bit 11) decoded via
+      inline accessors.  `whereUsablePartialIndex` deferred until
+      `sqlite3ExprImpliesExpr` lands.  Gate: `TestWherePlanner.pas`
+      (103/103): IMHO1..IMHO6 (pOrderBy=nil; bUnordered short-circuit;
+      ORDER BY rowid match; ORDER BY key-col match; non-matching col;
+      wrong cursor), ECI1..ECI3 (aColExpr=nil; XN_EXPR slot match; no
+      XN_EXPR slot), WIC1..WIC3 (pSelect=nil; all aiColumn<BMS-1
+      bypass; high-column slot + empty select → WHERE_IDX_ONLY),
+      WIEC (cleanup empties heap-allocated list), WPIE1..WPIE5
+      (non-EQ no-op; non-column LHS; iColumn<0; TK_AND walk preserves
+      mask; TEXT-affinity column → mask bit cleared).
     - [X] `whereRangeVectorLen` (where.c:3145..3196) — vector range
       constraint width probe.  Given a vector inequality term such as
       "(a,b,c) > (?,?,?)" being matched against an index, returns the
