@@ -20,6 +20,36 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9 scaffold: TestExplainParity.pas.**
+    Lands `src/tests/TestExplainParity.pas` — the bytecode-diff gate
+    enabled by Phase 6.5-bis (sqlite3FinishCoding).  Drives both the
+    C reference (`EXPLAIN <sql>` via `csq_prepare_v2` + `csq_step`)
+    and the Pascal port (`sqlite3_prepare_v2` + walk `PVdbe^.aOp[]`),
+    then diffs on (opcode-name, p1, p2, p3, p5).  Report-only in this
+    cut — exit 0 on bytecode divergence, exit 1 only on
+    C-side prepare failure or runtime exception.
+
+    Corpus: 10 DDL / transaction rows (CREATE TABLE / CREATE INDEX /
+    DROP TABLE / DROP INDEX / BEGIN).  First run on a clean tree:
+    0 PASS / 8 DIVERGE / 2 ERROR.  Every Pascal program emits exactly
+    3 opcodes (the `Init/Goto/Halt` skeleton from `sqlite3FinishCoding`
+    when no schema-write ops were emitted) versus 5–49 ops on the C
+    side — confirms that `sqlite3StartTable / EndTable /
+    CreateIndex / DropTable / DropIndex / BeginTransaction` are still
+    stubs.  Two AVs flag a column-decltype / WITHOUT-ROWID partial
+    codegen path that needs triage.  Tracked as Phase 6.9-bis.
+
+    Concrete changes:
+      * `src/tests/TestExplainParity.pas` — new (Phase 6.9 scaffold).
+      * `src/tests/build.sh` — already had the entry; this commit
+        flips it from SKIP to a real binary.
+      * `tasklist.md` — 6.9 marked `[~]` (scaffold landed); new
+        Phase 6.9-bis lists the remaining work.
+
+    Tests: full build clean.  Regression spot check:
+    TestPrepareBasic 20/20, TestParser 45/45, TestParserSmoke 20/20,
+    TestSchemaBasic 44/44, TestVdbeApi 57/57, TestOpenClose 17/17.
+
   - **2026-04-26 — Phase 6.5-bis sqlite3FinishCoding port (build.c:141).**
     Replaces the `{ Phase 7 }` stub at `passqlite3codegen.pas:6219` with the
     real termination/prologue emitter from build.c:141..278.  This is the
@@ -5585,9 +5615,55 @@ Phase 5.9 depends on this being done first.
     TestCarray 66/66, TestDbpage 68/68, TestDbstat 83/83,
     TestVdbeVtabExec 50/50.
 
-- [ ] **6.9** `TestExplainParity.pas`: for the full SQL corpus, `EXPLAIN` each
+- [~] **6.9** `TestExplainParity.pas`: for the full SQL corpus, `EXPLAIN` each
   statement via Pascal and via C; diff the opcode listings. This is the single
   most important gating test for the upper half of the port.
+
+  **Scaffold landed 2026-04-26** (`src/tests/TestExplainParity.pas`).  The
+  test prepares each corpus row on both sides:
+    * C side — runs `EXPLAIN <sql>` via `csq_prepare_v2` and steps the
+      explain rows; collects (opcode, p1, p2, p3, p5) per row.
+    * Pascal side — runs `sqlite3_prepare_v2(<sql>)` and walks the
+      returned `PVdbe^.aOp[0..nOp-1]` directly (the Pascal
+      `sqlite3VdbeList` stub does not yet drive `OP_Explain`).
+  Diffs (opcode-name, p1, p2, p3, p5).  P4 / comment columns are out of
+  scope until KeyInfo / Func / Coll heap layouts are byte-stable.
+
+  Corpus is intentionally small (10 DDL/transaction rows) — these are
+  the forms that today actually return a stepable Vdbe via
+  `sqlite3FinishCoding` (Phase 6.5-bis).  The harness is **report-only**
+  in this cut: prepare-failure on the C side or runtime exception
+  raises gErr (exit 1); op-count or per-op divergence is logged as
+  DIVERGE but tolerated (exit 0).  The scaffold is the diff-finder for
+  Phase 6.x bytecode-alignment work, not a hard gate yet.
+
+  **First-run findings (2026-04-26):** every Pascal program emits
+  exactly 3 opcodes (`Init / Goto / Halt`-equivalent — the trivial
+  termination from `sqlite3FinishCoding` when no schema-write ops have
+  been emitted) versus 5–49 opcodes on the C side.  Concrete numbers
+  (corpus=10): 0 pass / 8 diverge / 2 error.  The 8 DIVERGE rows
+  confirm that the `CREATE TABLE / CREATE INDEX / DROP TABLE / DROP
+  INDEX / BEGIN` codegen helpers (`sqlite3StartTable`,
+  `sqlite3EndTable`, `sqlite3CreateIndex`, `sqlite3DropTable`,
+  `sqlite3DropIndex`, `sqlite3BeginTransaction`) are still Phase 6.x
+  stubs that parse fine but never emit a real opcode stream.  The 2
+  ERROR rows (`CREATE TABLE typed`, `CREATE TABLE WITHOUT ROWID`)
+  raise `EAccessViolation` mid-prepare — the codegen path partially
+  fires for column-with-decltype / `WITHOUT ROWID` and dereferences a
+  non-allocated Schema/Table field.  Both classes of failure are the
+  next concrete porting targets for the upper half (Phase 6.x).
+  Run with: `LD_LIBRARY_PATH=src bin/TestExplainParity`.
+
+- [ ] **6.9-bis** Drive the diverge/error counts in TestExplainParity to
+  zero by porting the remaining DDL codegen helpers
+  (`sqlite3StartTable`, `sqlite3EndTable`, `sqlite3CreateIndex`,
+  `sqlite3DropTable`, `sqlite3DropIndex`, `sqlite3BeginTransaction`)
+  to byte-identical opcode emission against C.  Each helper landed
+  flips one row from DIVERGE → PASS in TestExplainParity; an extra
+  diagnostic-only column-list AV must also be triaged
+  (`CREATE TABLE typed`, `CREATE TABLE WITHOUT ROWID`).  Once all
+  ten current rows PASS, expand corpus to DML / SELECT / pragma /
+  trigger forms (the same exclusion list as TestParser).
 
 ---
 

@@ -1,0 +1,314 @@
+{$I ../passqlite3.inc}
+{
+  TestExplainParity.pas — Phase 6.9 differential bytecode-diff gate.
+
+  For every SQL statement in the inline corpus, prepare it on both:
+    * the C reference (csq_prepare_v2 with the literal SQL); the C-side
+      bytecode listing comes from `EXPLAIN <sql>` stepped row by row;
+    * the Pascal port (sqlite3_prepare_v2); the Pascal listing comes from
+      walking the returned PVdbe.aOp[0..nOp-1] array directly (the
+      Pascal sqlite3VdbeList stub does not yet drive OP_Explain).
+
+  The two listings are diffed on (opcode-name, p1, p2, p3, p5).  P4 and
+  comment columns are excluded for now — P4 string formatting depends on
+  KeyInfo / Func / Coll heap layouts that are not byte-stable yet, and
+  comments are SQLITE_ENABLE_EXPLAIN_COMMENTS-only chatter.
+
+  Scope note (2026-04-26): this lands the scaffold and a small DDL-only
+  corpus — the most reliable surface today, given that
+  Phase 6.5-bis (sqlite3FinishCoding) was the keystone that lets DDL
+  prepare_v2 actually return a stepable Vdbe.  SELECT / DML / pragma /
+  trigger forms remain Phase 7.4b territory (TestParser corpus exclusion
+  list) and should be folded back in as their codegen helpers come up.
+
+  This is the diff-finder, not a "must-pass" gate yet — the test reports
+  per-row PASS / DIVERGE and exits non-zero only on outright errors
+  (prepare failure on the C side, runtime crashes).  Bytecode divergence
+  is reported but tolerated; the running tally is the actionable signal
+  for Phase 6.x bytecode-alignment work.
+}
+
+program TestExplainParity;
+
+uses
+  SysUtils,
+  csqlite3,
+  passqlite3types,
+  passqlite3util,
+  passqlite3vdbe,
+  passqlite3codegen,
+  passqlite3main;
+
+const
+  FIXTURE_SCHEMA: PAnsiChar =
+    'CREATE TABLE t(a, b, c);' +
+    'CREATE TABLE s(x, y, z);' +
+    'CREATE TABLE u(p PRIMARY KEY, q);';
+
+type
+  TCorpusRow = record
+    label_:   AnsiString;
+    sql:      AnsiString;
+  end;
+
+  TOpRow = record
+    opcode: AnsiString;
+    p1, p2, p3: i32;
+    p5: i32;
+  end;
+
+  TOpList = array of TOpRow;
+
+var
+  gPass, gDiverge, gErr: i32;
+  gCDb:    Pcsq_db;
+  gPasDb:  PTsqlite3;
+
+{ -------------------------------------------------------------------------- }
+{ Corpus.                                                                    }
+{ -------------------------------------------------------------------------- }
+
+const
+  N_CORPUS = 10;
+
+var
+  CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
+
+procedure InitCorpus;
+  procedure Add(i: Int32; const lbl, sql: AnsiString);
+  begin
+    CORPUS[i].label_ := lbl;
+    CORPUS[i].sql    := sql;
+  end;
+var i: Int32;
+begin
+  i := 0;
+  Add(i, 'CREATE TABLE simple',         'CREATE TABLE z1(a,b);');             Inc(i);
+  Add(i, 'CREATE TABLE typed',          'CREATE TABLE z2(a INTEGER PRIMARY KEY, b TEXT);'); Inc(i);
+  Add(i, 'CREATE TABLE IF NOT EXISTS',  'CREATE TABLE IF NOT EXISTS z3(x);'); Inc(i);
+  Add(i, 'CREATE TABLE composite PK',   'CREATE TABLE z7(a,b, PRIMARY KEY(a,b));'); Inc(i);
+  Add(i, 'CREATE TABLE WITHOUT ROWID',  'CREATE TABLE z8(a PRIMARY KEY, b) WITHOUT ROWID;'); Inc(i);
+  Add(i, 'CREATE INDEX',                'CREATE INDEX i1 ON t(a);');          Inc(i);
+  Add(i, 'CREATE UNIQUE INDEX',         'CREATE UNIQUE INDEX i2 ON t(b);');   Inc(i);
+  Add(i, 'DROP TABLE',                  'DROP TABLE t;');                     Inc(i);
+  Add(i, 'DROP INDEX IF EXISTS',        'DROP INDEX IF EXISTS i_nope;');      Inc(i);
+  Add(i, 'BEGIN',                       'BEGIN;');                            Inc(i);
+
+  if i <> N_CORPUS then begin
+    WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
+    Halt(2);
+  end;
+end;
+
+{ -------------------------------------------------------------------------- }
+{ C side — drive `EXPLAIN <sql>` and collect rows.                           }
+{ -------------------------------------------------------------------------- }
+
+function CExplain(zSql: PAnsiChar; out ops: TOpList): Boolean;
+var
+  zExp:   AnsiString;
+  pStmt:  Pcsq_stmt;
+  pzTail: PChar;
+  rc:     i32;
+  n:      i32;
+  txt:    PChar;
+  row:    TOpRow;
+begin
+  ops := nil;
+  zExp := 'EXPLAIN ' + AnsiString(zSql);
+  pStmt := nil; pzTail := nil;
+  rc := csq_prepare_v2(gCDb, PChar(zExp), -1, pStmt, pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then csq_finalize(pStmt);
+    Result := False;
+    Exit;
+  end;
+
+  n := 0;
+  while csq_step(pStmt) = SQLITE_ROW do begin
+    SetLength(ops, n + 1);
+    txt := csq_column_text(pStmt, 1);
+    if txt <> nil then row.opcode := AnsiString(txt) else row.opcode := '';
+    row.p1 := csq_column_int(pStmt, 2);
+    row.p2 := csq_column_int(pStmt, 3);
+    row.p3 := csq_column_int(pStmt, 4);
+    row.p5 := csq_column_int(pStmt, 6);
+    ops[n] := row;
+    Inc(n);
+  end;
+  csq_finalize(pStmt);
+  Result := True;
+end;
+
+{ -------------------------------------------------------------------------- }
+{ Pascal side — prepare and walk Vdbe.aOp[].                                 }
+{ -------------------------------------------------------------------------- }
+
+function PasExplain(zSql: PAnsiChar; out ops: TOpList): Boolean;
+var
+  pStmtP: Pointer;
+  pTail:  PAnsiChar;
+  rc:     i32;
+  v:      PVdbe;
+  i:      i32;
+  pop:    PVdbeOp;
+  nm:     PAnsiChar;
+begin
+  ops := nil;
+  pStmtP := nil;
+  pTail  := nil;
+  rc := sqlite3_prepare_v2(gPasDb, zSql, -1, @pStmtP, @pTail);
+  v := PVdbe(pStmtP);
+  if (rc <> SQLITE_OK) or (v = nil) then begin
+    if v <> nil then sqlite3_finalize(v);
+    Result := False;
+    Exit;
+  end;
+
+  SetLength(ops, v^.nOp);
+  for i := 0 to v^.nOp - 1 do begin
+    pop := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    nm  := sqlite3OpcodeName(pop^.opcode);
+    if nm <> nil then ops[i].opcode := AnsiString(nm) else ops[i].opcode := '?';
+    ops[i].p1 := pop^.p1;
+    ops[i].p2 := pop^.p2;
+    ops[i].p3 := pop^.p3;
+    ops[i].p5 := pop^.p5;
+  end;
+  sqlite3_finalize(v);
+  Result := True;
+end;
+
+{ -------------------------------------------------------------------------- }
+{ Diff + report.                                                             }
+{ -------------------------------------------------------------------------- }
+
+function OpEq(const a, b: TOpRow): Boolean;
+begin
+  Result := (a.opcode = b.opcode) and (a.p1 = b.p1) and
+            (a.p2 = b.p2) and (a.p3 = b.p3) and (a.p5 = b.p5);
+end;
+
+procedure DumpOp(side: AnsiString; addr: i32; const r: TOpRow);
+begin
+  WriteLn('       ', side, ' [', addr, '] ', r.opcode,
+          ' p1=', r.p1, ' p2=', r.p2, ' p3=', r.p3, ' p5=', r.p5);
+end;
+
+procedure CheckRow(const row: TCorpusRow);
+var
+  cOps, pOps: TOpList;
+  cOk, pOk:   Boolean;
+  i, n:       i32;
+  firstDiff:  i32;
+begin
+  cOps := nil; pOps := nil;
+  cOk := CExplain(PAnsiChar(row.sql), cOps);
+  pOk := PasExplain(PAnsiChar(row.sql), pOps);
+
+  if not cOk then begin
+    Inc(gErr);
+    WriteLn('  ERROR ', row.label_, ' — C-side EXPLAIN prepare failed');
+    WriteLn('       SQL: ', row.sql);
+    WriteLn('       errmsg: ', AnsiString(csq_errmsg(gCDb)));
+    Exit;
+  end;
+
+  if not pOk then begin
+    Inc(gDiverge);
+    WriteLn('  DIVERGE ', row.label_, ' — Pascal prepare returned nil Vdbe (codegen stub or error)');
+    WriteLn('       SQL: ', row.sql);
+    WriteLn('       C ops: ', Length(cOps));
+    Exit;
+  end;
+
+  if Length(cOps) <> Length(pOps) then begin
+    Inc(gDiverge);
+    WriteLn('  DIVERGE ', row.label_, ' — op count: C=', Length(cOps),
+            ' Pas=', Length(pOps));
+    n := Length(cOps); if Length(pOps) < n then n := Length(pOps);
+    if n > 0 then begin
+      DumpOp('C  ', 0, cOps[0]);
+      DumpOp('Pas', 0, pOps[0]);
+    end;
+    Exit;
+  end;
+
+  firstDiff := -1;
+  for i := 0 to Length(cOps) - 1 do
+    if not OpEq(cOps[i], pOps[i]) then begin
+      firstDiff := i;
+      Break;
+    end;
+
+  if firstDiff < 0 then begin
+    Inc(gPass);
+    WriteLn('  PASS ', row.label_, '  (', Length(cOps), ' ops)');
+  end else begin
+    Inc(gDiverge);
+    WriteLn('  DIVERGE ', row.label_, ' at op[', firstDiff, ']/', Length(cOps));
+    DumpOp('C  ', firstDiff, cOps[firstDiff]);
+    DumpOp('Pas', firstDiff, pOps[firstDiff]);
+  end;
+end;
+
+{ -------------------------------------------------------------------------- }
+
+var
+  i:        Int32;
+  cRc:      i32;
+  pRc:      i32;
+  pzErrMsg: PChar;
+  pasErr:   PAnsiChar;
+
+begin
+  WriteLn('=== TestExplainParity — Phase 6.9 bytecode-diff gate (scaffold) ===');
+  WriteLn;
+
+  { C reference. }
+  pzErrMsg := nil;
+  cRc := csq_open(':memory:', gCDb);
+  if cRc <> SQLITE_OK then begin
+    WriteLn('FATAL: csq_open failed rc=', cRc); Halt(2);
+  end;
+  cRc := csq_exec(gCDb, FIXTURE_SCHEMA, nil, nil, pzErrMsg);
+  if cRc <> SQLITE_OK then begin
+    WriteLn('FATAL: csq_exec(fixture) failed rc=', cRc,
+            ' err=', AnsiString(pzErrMsg)); Halt(2);
+  end;
+
+  { Pascal port. }
+  gPasDb := nil;
+  pRc := sqlite3_open(':memory:', @gPasDb);
+  if (pRc <> SQLITE_OK) or (gPasDb = nil) then begin
+    WriteLn('FATAL: Pascal sqlite3_open failed rc=', pRc); Halt(2);
+  end;
+  pasErr := nil;
+  pRc := sqlite3_exec(gPasDb, FIXTURE_SCHEMA, nil, nil, @pasErr);
+  if pRc <> SQLITE_OK then begin
+    WriteLn('FATAL: Pascal sqlite3_exec(fixture) rc=', pRc);
+    if pasErr <> nil then WriteLn('       err: ', AnsiString(pasErr));
+    Halt(2);
+  end;
+
+  InitCorpus;
+  for i := 0 to N_CORPUS - 1 do begin
+    try
+      CheckRow(CORPUS[i]);
+    except
+      on e: Exception do begin
+        Inc(gErr);
+        WriteLn('  ERROR ', CORPUS[i].label_, ' — exception: ',
+                e.ClassName, ' ', e.Message);
+      end;
+    end;
+  end;
+
+  csq_close(gCDb);
+  sqlite3_close(gPasDb);
+
+  WriteLn;
+  WriteLn(Format('Results: %d pass, %d diverge, %d error (corpus = %d)',
+    [gPass, gDiverge, gErr, N_CORPUS]));
+  if gErr > 0 then Halt(1) else Halt(0);
+end.
