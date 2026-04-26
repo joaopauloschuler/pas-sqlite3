@@ -21,6 +21,79 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    allowedOp + operatorMask + exprMightBeIndexed + minimal-viable
+    exprAnalyze body.**  Lands the analysis cluster that turns the
+    `sqlite3WhereExprAnalyze` stub into a productive walker.  Faithful
+    1:1 port of `whereexpr.c:99..162` (allowedOp / operatorMask),
+    `whereexpr.c:1067..1101` (exprMightBeIndexed; the indexed-expression
+    fallthrough `exprMightBeIndexed2` deferred — only matters for
+    `Index.aColExpr<>nil` shapes), and a trimmed `exprAnalyze`
+    (`whereexpr.c:1122..`) covering only the analysis paths the
+    single-table rowid/IPK-EQ vertical slice needs.
+
+      * **`allowedOp`** — direct port; asserts on TK_GT_TK / TK_LE / TK_LT /
+        TK_GE / TK_IN / TK_IS / TK_ISNULL ordering (memory note: TK_GT
+        is renamed `TK_GT_TK` in this codebase to avoid collision with
+        the WO_GT bitmask).
+      * **`operatorMask`** — direct port; asserts on the `op<->WO_*`
+        identity for every supported operator.
+      * **`exprMightBeIndexed`** — TK_VECTOR unwrap for `>=TK_GT_TK`,
+        TK_COLUMN fast path; the indexed-expression fallthrough returns 0
+        with an in-line `TODO 11g.2.c` (no corpus shape exercises it).
+      * **`exprAnalyze` (private)** — prereqLeft/prereqRight/prereqAll
+        computation, EP_OuterON/EP_InnerON dependency rebase, baseline
+        WhereTerm reset (leftCursor=-1, iParent=-1, eOperator=0),
+        allowedOp branch with `exprMightBeIndexed` LHS lookup +
+        `operatorMask & opMask` eOperator population, `TK_IS → TERM_IS`.
+      * **`sqlite3WhereExprAnalyze`** — stub replaced by an ascending
+        walk over `pWC^.a[0..nBase-1]` calling `exprAnalyze`.  Order
+        does not matter today; 11g.2.c switches to the C source's
+        descending walk once virtual-term synthesis lands.
+
+    Concrete changes:
+      * `passqlite3codegen.pas:5827..` — banner block + four new bodies
+        (`allowedOp`, `operatorMask`, `exprMightBeIndexed`,
+        `exprAnalyze`) + productive `sqlite3WhereExprAnalyze` body.
+
+    Why this is safe to land alone: no productive caller of
+    `sqlite3WhereBegin` exists yet (DELETE/UPDATE skeleton's
+    `sqlite3WhereBegin` invocation was disabled in step 11f), so the
+    end-to-end behaviour for the corpus is unchanged even though
+    `whereShortCut` will now return non-zero for the rowid-EQ shape.
+    Verified by full regression sweep — TestWhereBasic 52/52,
+    TestWhereStructs 148/148, TestPrepareBasic 20/20, TestParser 45/45,
+    TestSchemaBasic 44/44, TestVdbeApi 57/57, TestDMLBasic 54/54,
+    TestSelectBasic 49/49, TestExprBasic 40/40, TestInitCallback 29/29,
+    TestExplainParity unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **The FPC case-insensitive var/type collision (memory note) bit
+        again.**  `var pExpr: PExpr;` fails with "Error in type
+        definition" — same root cause as `var pPager: PPager`.  Existing
+        code uses `pExpr` only as a parameter (which is allowed) or as a
+        record field; this is the first attempted local-variable
+        declaration of that shape.  Renamed the locals to `pX`,
+        `pPrs`, `pLftSC`, `xMask` per the convention already used by
+        whereScanNext / whereShortCut.
+      * **Deferred to 11g.2.c (each call site flagged in-line):**
+        right-side commute that inserts a virtual term
+        (whereexpr.c:1222..1261), `TK_ISNULL → TK_TRUEFALSE` rewrite
+        (1262..1272), BETWEEN / OR / NOTNULL / LIKE virtual-term
+        synthesis (1275..1530), `isAuxiliaryVtabOperator` / WO_AUX
+        vtab path (1531..1567), `exprMightBeIndexed2` indexed-expression
+        match (1039..1066).
+      * **`whereShortCut` is now productive.**  For a rowid-EQ predicate
+        on a single-table FROM, the shortcut populates
+        `pBuilder^.pNew` with `wsFlags = WHERE_COLUMN_EQ | WHERE_IPK |
+        WHERE_ONEROW`, `aLTerm[0]` pointing at the WhereTerm, `nLTerm=1`,
+        `nEq=1`, `rRun=33` (sqlite3LogEst(10)).  Realistic next sub-progress:
+        wire `whereShortCut` into `sqlite3WhereBegin` after the
+        WHERE_WANT_DISTINCT block, then emit the `OP_NotExists` body +
+        per-loop tail in the `sqlite3WhereEnd` half (where.c:6995..7036
+        skipped the False-WHERE-Term-Bypass loop is already landed; the
+        planner pick + per-row body is the remaining gap).
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     sqlite3ExprCodeTemp + TK_NULL / TK_CAST / TK_NOT / TK_BITNOT /
     TK_ISNULL / TK_NOTNULL / TK_TRUTH arms.**  Lands the leaf
     helper `sqlite3ExprCodeTemp` (expr.c:5856..5877) and bolts six

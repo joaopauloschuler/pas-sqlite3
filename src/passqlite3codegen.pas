@@ -5823,9 +5823,266 @@ begin
   Result := nil;
 end;
 
-procedure sqlite3WhereExprAnalyze(pTabList: PSrcList; pWC: PWhereClause);
+{ ===========================================================================
+  Phase 6.9-bis (step 11g.2.b sub-progress) — minimal-viable exprAnalyze
+  cluster: allowedOp + operatorMask + exprMightBeIndexed + exprAnalyze body.
+
+  Faithful 1:1 port of whereexpr.c:99..162 (allowedOp / operatorMask),
+  whereexpr.c:1067..1101 (exprMightBeIndexed; the indexed-expression
+  fallthrough exprMightBeIndexed2 is deferred — it only fires for indices
+  declared on expressions, which the rowid-EQ shape never reaches), and a
+  trimmed exprAnalyze (whereexpr.c:1122..) covering only the analysis paths
+  that the single-table rowid/IPK-EQ vertical slice (11g.2.b) needs.
+
+  Subset ported:
+    * prereqLeft / prereqRight / prereqAll computation (whereexpr.c:1156..1177)
+    * EP_OuterON / EP_InnerON dependency rebase (whereexpr.c:1188..1197)
+    * pTerm baseline (leftCursor=-1, iParent=-1, eOperator=0)
+    * allowedOp branch — populate leftCursor / u.x.leftColumn / eOperator via
+      exprMightBeIndexed on the LHS (whereexpr.c:1202..1220)
+    * TK_IS → wtFlags |= TERM_IS (whereexpr.c:1221)
+
+  Deliberately deferred to 11g.2.c (each call site flagged in-line):
+    * Right-side commute that inserts a virtual term — needs exprCommute,
+      whereClauseInsert, markTermAsChild, sqlite3ExprDup (whereexpr.c:1222..1261)
+    * TK_ISNULL → TK_TRUEFALSE rewrite when LHS cannot be NULL
+      (whereexpr.c:1262..1272)
+    * BETWEEN / OR / NOTNULL / LIKE virtual-term synthesis
+      (whereexpr.c:1275..1530)
+    * isAuxiliaryVtabOperator / WO_AUX vtab path (whereexpr.c:1531..1567)
+
+  Today this body fires for every WhereTerm split out by sqlite3WhereSplit
+  — the rowid-EQ shape (single-table SELECT/UPDATE/DELETE) gets eOperator
+  populated, which is exactly what whereShortCut needs to return a non-zero
+  pick.  No productive caller of sqlite3WhereBegin reaches the post-shortcut
+  emission path yet, so end-to-end behaviour is unchanged for the corpus.
+  =========================================================================== }
+
+function allowedOp(op: i32): i32; inline;
 begin
-  { Phase 6.2 stub — full exprAnalyze() loop deferred to full where.c port }
+  { whereexpr.c:99..110.  Asserts on TK_GT_TK / TK_LE / TK_LT / TK_GE
+    relative ordering match the C asserts (TK_GT_TK = TK_GT in C). }
+  Assert((TK_GT_TK > TK_EQ) and (TK_GT_TK < TK_GE));
+  Assert((TK_LT > TK_EQ) and (TK_LT < TK_GE));
+  Assert((TK_LE > TK_EQ) and (TK_LE < TK_GE));
+  Assert(TK_GE = TK_EQ + 4);
+  Assert(TK_IN < TK_EQ);
+  Assert(TK_IS < TK_EQ);
+  Assert(TK_ISNULL < TK_EQ);
+  if op > TK_GE then Exit(0);
+  if op >= TK_EQ then Exit(1);
+  if (op = TK_IN) or (op = TK_ISNULL) or (op = TK_IS) then Exit(1);
+  Result := 0;
+end;
+
+function operatorMask(op: i32): u16;
+var
+  c: u16;
+begin
+  { whereexpr.c:139..162.  Translate TK_xx → WO_xx bitmask. }
+  Assert(allowedOp(op) <> 0);
+  if op >= TK_EQ then
+  begin
+    Assert((u32(WO_EQ) shl (op - TK_EQ)) < $7FFF);
+    c := u16(u32(WO_EQ) shl (op - TK_EQ));
+  end
+  else if op = TK_IN then
+    c := u16(WO_IN)
+  else if op = TK_ISNULL then
+    c := u16(WO_ISNULL)
+  else
+  begin
+    Assert(op = TK_IS);
+    c := u16(WO_IS);
+  end;
+  Assert((op <> TK_ISNULL) or (c = u16(WO_ISNULL)));
+  Assert((op <> TK_IN)     or (c = u16(WO_IN)));
+  Assert((op <> TK_EQ)     or (c = u16(WO_EQ)));
+  Assert((op <> TK_LT)     or (c = u16(WO_LT)));
+  Assert((op <> TK_LE)     or (c = u16(WO_LE)));
+  Assert((op <> TK_GT_TK)  or (c = u16(WO_GT_WO)));
+  Assert((op <> TK_GE)     or (c = u16(WO_GE)));
+  Assert((op <> TK_IS)     or (c = u16(WO_IS)));
+  Result := c;
+end;
+
+function exprMightBeIndexed(pFrom: PSrcList; aiCurCol: Pi32; pX: PExpr;
+  op: i32): i32;
+var
+  i:    i32;
+  pIdx: PIndex2;
+  it:   PSrcItem;
+begin
+  { whereexpr.c:1067..1101.  Pre-screens whether pX could match an
+    indexed column of any FROM-clause table.  TK_VECTOR unwrapping for
+    inequality operators (TK_GT..TK_GE) matches the C assert ordering.
+    Param renamed pExpr→pX to avoid the FPC case-insensitive var/type
+    collision (memory note). }
+  Assert((TK_GT_TK + 1 = TK_LE) and (TK_GT_TK + 2 = TK_LT)
+         and (TK_GT_TK + 3 = TK_GE));
+  Assert((TK_IS < TK_GE) and (TK_ISNULL < TK_GE) and (TK_IN < TK_GE));
+  Assert(op <= TK_GE);
+  if (pX^.op = TK_VECTOR) and (op >= TK_GT_TK) and (op <= TK_GE) then
+  begin
+    Assert(ExprUseXList(pX));
+    pX := ExprListItems(pX^.x.pList)[0].pExpr;
+  end;
+
+  if pX^.op = TK_COLUMN then
+  begin
+    aiCurCol[0] := pX^.iTable;
+    aiCurCol[1] := i32(pX^.iColumn);
+    Exit(1);
+  end;
+
+  { Indexed-expression fallthrough (whereexpr.c:1092..1099).  Deferred:
+    the rowid/IPK-EQ vertical slice never reaches an index whose
+    aColExpr<>nil.  When 11g.2.c lands the indexed-expression port,
+    the body will mirror exprMightBeIndexed2 here. }
+  for i := 0 to pFrom^.nSrc - 1 do
+  begin
+    it := @SrcListItems(pFrom)[i];
+    pIdx := it^.pSTab^.pIndex;
+    while pIdx <> nil do
+    begin
+      if pIdx^.aColExpr <> nil then
+      begin
+        { TODO 11g.2.c: port exprMightBeIndexed2.  Returning 0 is safe
+          for the corpus today (no indexed-expression coverage). }
+        Exit(0);
+      end;
+      pIdx := pIdx^.pNext;
+    end;
+  end;
+  Result := 0;
+end;
+
+procedure exprAnalyze(pSrc: PSrcList; pWC: PWhereClause; idxTerm: i32);
+var
+  pWInfo:     PWhereInfo;
+  pTerm:      PWhereTerm;
+  pMaskSet:   PWhereMaskSet;
+  pX:         PExpr;          { renamed from pExpr — see memory note on
+                                FPC case-insensitive var/type collision }
+  prereqLeft: Bitmask;
+  prereqAll:  Bitmask;
+  extraRight: Bitmask;
+  op:         i32;
+  pPrs:       PParse;          { renamed from pParse }
+  db:         PTsqlite3;
+  xMask:      Bitmask;
+  aiCurCol:   array[0..1] of i32;
+  pLftSC:     PExpr;           { renamed from pLeftSC }
+  opMask:     u16;
+begin
+  { whereexpr.c:1122.. — trimmed body; see banner above for what is and is
+    not covered.  Comments cite C source line numbers. }
+  pWInfo   := pWC^.pWInfo;
+  pPrs     := pWInfo^.pParse;
+  db       := pPrs^.db;
+  if db^.mallocFailed <> 0 then Exit;
+  Assert(pWC^.nTerm > idxTerm);
+  pTerm    := @pWC^.a[idxTerm];
+  pMaskSet := @pWInfo^.sMaskSet;
+  pX       := pTerm^.pExpr;
+  Assert(pX <> nil);
+  Assert((pX^.op <> TK_AS) and (pX^.op <> TK_COLLATE));
+  pMaskSet^.bVarSelect := 0;
+  prereqLeft := sqlite3WhereExprUsage(pMaskSet, pX^.pLeft);
+  op := pX^.op;
+  extraRight := 0;
+  if op = TK_IN then
+  begin
+    Assert(pX^.pRight = nil);
+    { sqlite3ExprCheckIN deferred to 11g.2.c — the rowid-EQ shape never
+      generates a TK_IN predicate.  Skip the check, fall through to the
+      usage walk so prereqRight is still populated correctly. }
+    if ExprUseXSelect(pX) then
+      pTerm^.prereqRight := sqlite3WhereExprListUsage(pMaskSet, nil)
+    else
+      pTerm^.prereqRight := sqlite3WhereExprListUsage(pMaskSet, pX^.x.pList);
+    prereqAll := prereqLeft or pTerm^.prereqRight;
+  end
+  else
+  begin
+    pTerm^.prereqRight := sqlite3WhereExprUsage(pMaskSet, pX^.pRight);
+    if (pX^.pLeft = nil)
+       or ((pX^.flags and (EP_xIsSelect or EP_IfNullRow)) <> 0)
+       or (pX^.x.pList <> nil) then
+      prereqAll := sqlite3WhereExprUsageNN(pMaskSet, pX)
+    else
+      prereqAll := prereqLeft or pTerm^.prereqRight;
+  end;
+  if pMaskSet^.bVarSelect <> 0 then
+    pTerm^.wtFlags := pTerm^.wtFlags or TERM_VARSELECT;
+
+  if (pX^.flags and (EP_OuterON or EP_InnerON)) <> 0 then
+  begin
+    xMask := sqlite3WhereGetMask(pMaskSet, pX^.w.iJoin);
+    if (pX^.flags and EP_OuterON) <> 0 then
+    begin
+      prereqAll  := prereqAll or xMask;
+      extraRight := xMask - 1; { Ticket #3015 }
+    end
+    else if (prereqAll shr 1) >= xMask then
+    begin
+      pX^.flags := pX^.flags and (not EP_InnerON);
+    end;
+  end;
+  pTerm^.prereqAll  := prereqAll;
+  pTerm^.leftCursor := -1;
+  pTerm^.iParent    := -1;
+  pTerm^.eOperator  := 0;
+  if allowedOp(op) <> 0 then
+  begin
+    pLftSC := sqlite3ExprSkipCollate(pX^.pLeft);
+    { pRight is unused on this trimmed path (right-side commute deferred). }
+    if (pTerm^.prereqRight and prereqLeft) = 0 then
+      opMask := u16(WO_ALL)
+    else
+      opMask := u16(WO_EQUIV);
+
+    if pTerm^.u.iField > 0 then
+    begin
+      Assert(op = TK_IN);
+      Assert(pLftSC^.op = TK_VECTOR);
+      Assert(ExprUseXList(pLftSC));
+      pLftSC := ExprListItems(pLftSC^.x.pList)[pTerm^.u.iField - 1].pExpr;
+    end;
+
+    if exprMightBeIndexed(pSrc, @aiCurCol[0], pLftSC, op) <> 0 then
+    begin
+      pTerm^.leftCursor   := aiCurCol[0];
+      Assert((pTerm^.eOperator and (WO_OR or WO_AND)) = 0);
+      pTerm^.u.leftColumn := aiCurCol[1];
+      pTerm^.eOperator    := operatorMask(op) and opMask;
+    end;
+    if op = TK_IS then pTerm^.wtFlags := pTerm^.wtFlags or TERM_IS;
+
+    { Right-side commute (whereexpr.c:1222..1261) deferred to 11g.2.c.
+      TK_ISNULL → TK_TRUEFALSE rewrite (whereexpr.c:1262..1272) deferred
+      to 11g.2.c — neither is needed for the rowid/IPK-EQ shape today. }
+  end;
+
+  { BETWEEN / OR / NOTNULL / LIKE virtual-term synthesis blocks
+    (whereexpr.c:1275..1530) deferred to 11g.2.c. }
+
+  { isAuxiliaryVtabOperator / WO_AUX vtab path (whereexpr.c:1531..1567)
+    deferred — vtab corpus is not exercised today. }
+end;
+
+procedure sqlite3WhereExprAnalyze(pTabList: PSrcList; pWC: PWhereClause);
+var
+  i: i32;
+begin
+  { whereexpr.c:1882..1893 — straight loop walks every base term in the
+    WhereClause and runs exprAnalyze.  The C source iterates from the tail
+    so newly-inserted virtual terms can be skipped; until the BETWEEN/OR/
+    NOTNULL/LIKE virtual-term synthesis lands (11g.2.c), iteration order
+    does not matter, so the simpler ascending walk is used here. }
+  if pWC^.nTerm <= 0 then Exit;
+  for i := 0 to pWC^.nBase - 1 do
+    exprAnalyze(pTabList, pWC, i);
 end;
 
 procedure sqlite3WhereTabFuncArgs(pParse: PParse; pItem: PSrcItem;

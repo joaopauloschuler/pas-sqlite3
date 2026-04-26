@@ -25,10 +25,14 @@ Important: At the end of this document, please find:
     single-rowid-EQ-predicate case.  Bookkeeping primitives, prologue,
     cleanup contract, and several leaf helpers (codeCompare cluster,
     sqlite3ExprCanBeNull, sqlite3ExprCodeTemp + 6 unary arms,
-    TK_COLLATE/TK_SPAN/TK_UPLUS arms) are already landed.
+    TK_COLLATE/TK_SPAN/TK_UPLUS arms, whereShortCut, allowedOp +
+    operatorMask + exprMightBeIndexed + minimal-viable exprAnalyze)
+    are already landed.
     - Implement the trimmed planner pick + `OP_NotExists` emission
       for the rowid-EQ shape (hard-code the cost selection; defer
-      `whereLoopAddBtree` etc.).
+      `whereLoopAddBtree` etc.).  whereShortCut is now wired to a
+      productive exprAnalyze, so the planner pick can drop straight
+      into `sqlite3WhereBegin` after the WHERE_WANT_DISTINCT block.
     - Implement the loop-tail half of `sqlite3WhereEnd`
       (Goto continue + Resolve break label + cursor close).
     - Re-enable productive tails in `sqlite3DeleteFrom`
