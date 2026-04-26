@@ -20,6 +20,111 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 11f): structural skeleton of
+    `sqlite3DeleteFrom` (delete.c:288) and `sqlite3Update` (update.c:285).**
+    Replaces the two Phase-6.4 stubs at `passqlite3codegen.pas:5345`
+    and `:5395` with C-shaped prologues mirroring step 11c's pattern
+    for `sqlite3Insert`.  Both now run the productive lookup chain
+    (SrcListLookup -> TriggersExist -> isView -> ViewGetColumnNames
+    -> IsReadOnly -> SchemaToIndex -> AuthCheck -> cursor allocation
+    -> GetVdbe; DeleteFrom additionally fires VdbeCountChanges +
+    BeginWriteOperation) and bail with TODOs before the WHERE-loop
+    / GenerateRowDelete / GenerateConstraintChecks / CompleteInsertion
+    emission tail (those helpers are still Phase 6.4 stubs).
+    [X]
+
+    Concrete changes (all in `src/passqlite3codegen.pas`):
+      * `sqlite3DeleteFrom` (codegen.pas:5357..5478): label-driven
+        port with locals `db, pTab, v, iDb, iTabCur, nIdx, pIdx,
+        pTrg, isView, bComplex, rcauth, memCnt, sContext`.  Mirrors
+        delete.c:288..422 verbatim through the cursor-loop and
+        BeginWriteOperation, then drops to `delete_from_cleanup`.
+      * `sqlite3Update` (codegen.pas:5524..5654): label-driven port
+        with locals `db, pTab, v, iDb, iBaseCur, iDataCur, iIdxCur,
+        nIdx, pIdx, pPk, pTrg, isView, tmask, nChangeFrom,
+        sContext`.  Mirrors update.c:285..458 through cursor
+        allocation + GetVdbe.  Skips aXRef/aRegIdx/aToOpen
+        allocation (consumed only by the WHERE-loop which is
+        deferred).  No BeginWriteOperation yet — the C reference
+        defers it until after the column-resolution loop, and
+        emitting it here without the rest would dirty the VDBE.
+      * **Skeleton-only error-state guard (both functions).**
+        Snapshot `pParse^.nErr / rc / zErrMsg` after the eOpenState
+        gate; restore them at the cleanup label gated on a
+        `skelEntered: Boolean` flag.  Reason: the productive
+        prologue calls `sqlite3SrcListLookup`, which calls
+        `sqlite3LocateTableItem` and CAN set `pParse^.nErr` when
+        the schema isn't yet loaded for the target.  Concretely,
+        the nested UPDATE on `sqlite_master` fired by
+        `sqlite3EndTable` was failing the lookup (pParse^.nErr=1,
+        pTab=nil) — this caused TestPrepareBasic T7..T10 (CREATE
+        TABLE prepare) to fail with rc=1 (SQL logic error).  The
+        guard makes the skeleton a true no-op for outer parser
+        state until the productive emission tail lands in step
+        11g.  The guard is removed once any productive opcode is
+        emitted (because nErr would then represent real failure
+        downstream of GetVdbe).
+
+    Tests: full build clean.  Regression sweep (2026-04-26):
+    TestExplainParity 2 PASS / 8 DIVERGE / 0 ERROR (unchanged),
+    TestPrepareBasic 20/20 (was 16/4 mid-port — fixed by the
+    error-state guard), TestParser 45/45, TestParserSmoke 20/20,
+    TestSchemaBasic 44/44, TestVdbeApi 57/57, TestDMLBasic 54/54,
+    TestSelectBasic 49/49, TestExprBasic 40/40, TestVdbeTxn 8/8,
+    TestAuthBuiltins 34/34, TestOpenClose 17/17, TestSmoke +
+    TestUtil clean, TestJson 434/434, TestJsonEach 50/50,
+    TestJsonRegister 48/48, TestPrintf 105/105, TestVtab 216/216.
+
+    Discoveries / next-step notes:
+      * **Schema lookup of sqlite_master fails during nested
+        parse.**  `sqlite3LocateTableItem` returns nil with
+        nErr=1 when `sqlite3NestedParse` re-parses
+        `UPDATE sqlite_master SET ...` from `sqlite3EndTable`.
+        sqlite_master IS bootstrapped into `db^.aDb[0].pSchema^.tblHash`
+        per `passqlite3codegen.pas:6110`, so the failure is
+        somewhere in the resolution chain (likely
+        `sqlite3FindTableInDb` or the database-name handling in
+        `sqlite3LocateTable`).  The skeleton's guard sidesteps
+        this entirely; tracking the real fix as **Phase 6.x —
+        nested-parse schema visibility**.  This will need to be
+        resolved before step 11g can emit productive code that
+        relies on the lookup result actually being non-nil.
+      * **`sqlite3Insert` step 11c..11e was unaffected** because
+        the productive INSERT path through it for CREATE INDEX
+        rows is gated upstream by `sqlite3CreateIndex` errors
+        (per the discoveries note in step 11e).  So Insert never
+        reached SrcListLookup productively to expose this issue.
+        DeleteFrom + Update DO reach it productively via
+        sqlite3EndTable / sqlite3CodeDropTable, hence the guard.
+      * **`sqlite3LimitWhere` call shape skipped.**  The C
+        reference wraps the `sqlite3LimitWhere(...)` call in
+        `#ifdef SQLITE_ENABLE_UPDATE_DELETE_LIMIT`.  The Pascal
+        port keeps the helper as a no-op stub (codegen.pas:5340)
+        and the call is omitted from the skeleton — adding it
+        would be a one-line change once the helper is real.
+      * **Update skeleton omits BeginWriteOperation** (unlike
+        DeleteFrom which has it).  Mirrors the C reference where
+        the call appears at update.c:710, after the bulk of the
+        column-resolution and cursor-opening logic.  Adding it
+        here would emit OP_Transaction before any productive
+        write, leaving stray cursors un-opened.  Lands with
+        step 11g.
+      * **Next 6.9-bis target: step 11g — wire the productive
+        emission tail.**  Two prerequisites:
+          1. Resolve the nested-parse sqlite_master lookup
+             failure (see first discovery above).
+          2. Port `sqlite3WhereBegin` / `sqlite3WhereOkOnePass`
+             / `sqlite3WhereEnd` (Phase 7 territory).
+        With those in place, DeleteFrom can wire the WHERE-loop +
+        OP_Delete tail, and Update can wire the column-resolution
+        loop + OP_Insert tail using
+        `sqlite3GenerateConstraintChecks` +
+        `sqlite3CompleteInsertion` (still Phase 6.4 stubs, but
+        only schema-row callers need them today and those callers
+        don't define UNIQUE/CHECK/FK over sqlite_master).
+        Flipping the 8 DIVERGE rows in TestExplainParity remains
+        the gate.
+
   - **2026-04-26 — Phase 6.9-bis (step 11e): wire `sqlite3ExprCode`
     + the productive VALUES emission tail into `sqlite3Insert`.**
     Replaces the TODO block at `passqlite3codegen.pas:5616..5626`

@@ -5341,11 +5341,142 @@ begin
   Result := pWhere; { Phase 6.5 }
 end;
 
-{ sqlite3DeleteFrom — generate DELETE FROM VDBE (Phase 6.4 stub) }
+{ sqlite3DeleteFrom — port of delete.c:288 (structural skeleton).
+
+  Phase 6.9-bis step 11f.  Lays down the C-shaped prologue: nErr / eOpenState
+  gates, SrcListLookup -> TriggersExist -> isView -> FkRequired/bComplex ->
+  ViewGetColumnNames -> IsReadOnly -> SchemaToIndex -> AuthCheck ->
+  AuthContextPush -> cursor allocation -> GetVdbe -> CountChanges ->
+  BeginWriteOperation.  The productive emission tail (truncate optimization,
+  sqlite3WhereBegin loop, sqlite3GenerateRowDelete) remains a TODO — those
+  helpers are still Phase 6.4 stubs (codegen.pas:5355..5382).
+
+  Once those helpers (and sqlite3WhereBegin proper) become real, this
+  function flips DROP TABLE / DELETE FROM sqlite_stat* rows in
+  TestExplainParity from DIVERGE to PASS without disturbing the prologue. }
 procedure sqlite3DeleteFrom(pParse: PParse; pTabList: PSrcList;
   pWhere: PExpr; pOrderBy: PExprList; pLimit: PExpr);
+label
+  delete_from_cleanup;
+var
+  db:        PTsqlite3;
+  pTab:      PTable2;
+  v:         PVdbe;
+  iDb:       i32;
+  iTabCur:   i32;
+  nIdx:      i32;
+  pIdx:      PIndex2;
+  pTrg:      PTrigger;
+  isView:    i32;
+  bComplex:  i32;
+  rcauth:    i32;
+  memCnt:    i32;
+  sContext:  TAuthContext;
+  saveNErr:    i32;
+  saveRc:      i32;
+  saveErrMsg:  PAnsiChar;
+  skelEntered: Boolean;
 begin
-  { Phase 6.5 }
+  pTab     := nil;
+  v        := nil;
+  pTrg     := nil;
+  isView   := 0;
+  bComplex := 0;
+  memCnt   := 0;
+  iTabCur  := 0;
+  FillChar(sContext, SizeOf(sContext), 0);
+  skelEntered := False;
+  saveNErr   := 0;
+  saveRc     := 0;
+  saveErrMsg := nil;
+
+  db := pParse^.db;
+  if pParse^.nErr <> 0 then goto delete_from_cleanup;
+  { Test-scaffold gate (TestParser, TestParserSmoke) drive the parser against
+    a hand-rolled stub db (eOpenState <> $76) without a real schema, so
+    sqlite3SrcListLookup -> sqlite3LocateTableItem would set nErr.  Match the
+    DropIndex / DropTable / sqlite3Insert idiom and free-and-exit early. }
+  if db^.eOpenState <> $76 then goto delete_from_cleanup;
+  { Phase 6.9-bis step 11f skeleton-only error-state guard — same rationale
+    as sqlite3Update.  Snapshot nErr / rc / zErrMsg so any productively-set
+    error from sqlite3SrcListLookup / sqlite3IsReadOnly / sqlite3AuthCheck
+    in the prologue does not propagate while the productive emission tail
+    (truncate / where-loop) is still a TODO.  Removed in step 11g. }
+  saveNErr   := pParse^.nErr;
+  saveRc     := pParse^.rc;
+  saveErrMsg := pParse^.zErrMsg;
+  pParse^.zErrMsg := nil;
+  skelEntered := True;
+
+  { Locate the target table (delete.c:345). }
+  pTab := sqlite3SrcListLookup(pParse, pTabList);
+  if pTab = nil then goto delete_from_cleanup;
+
+  { Trigger detection — sqlite3TriggersExist is a stub returning nil today;
+    the call shape matches delete.c:352 verbatim. }
+  pTrg := sqlite3TriggersExist(pParse, pTab, TK_DELETE, nil, nil);
+  if pTab^.eTabType = TABTYP_VIEW then isView := 1 else isView := 0;
+  if (pTrg <> nil) or (sqlite3FkRequired(pParse, pTab, nil, 0) <> 0) then
+    bComplex := 1
+  else
+    bComplex := 0;
+
+  { TODO(Phase 6.x): sqlite3LimitWhere call (delete.c:374) — DELETE/UPDATE
+    LIMIT support.  Productive path doesn't touch LIMIT for schema-row
+    DELETEs from sqlite3NestedParse, and the helper is a no-op stub today. }
+
+  if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then goto delete_from_cleanup;
+
+  if sqlite3IsReadOnly(pParse, pTab, pTrg) <> 0 then goto delete_from_cleanup;
+
+  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  rcauth := sqlite3AuthCheck(pParse, SQLITE_DELETE_AUTH, pTab^.zName, nil,
+                             db^.aDb[iDb].zDbSName);
+  if rcauth = SQLITE_DENY then goto delete_from_cleanup;
+
+  { Assign cursor numbers to the table and all its indices. }
+  iTabCur := pParse^.nTab;
+  Inc(pParse^.nTab);
+  SrcListItems(pTabList)[0].iCursor := iTabCur;
+  nIdx := 0;
+  pIdx := pTab^.pIndex;
+  while pIdx <> nil do begin
+    Inc(pParse^.nTab);
+    Inc(nIdx);
+    pIdx := pIdx^.pNext;
+  end;
+
+  { View context. }
+  if isView <> 0 then
+    sqlite3AuthContextPush(pParse, @sContext, pTab^.zName);
+
+  { Begin generating code. }
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then goto delete_from_cleanup;
+  if pParse^.nested = 0 then sqlite3VdbeCountChanges(v);
+  sqlite3BeginWriteOperation(pParse, bComplex, iDb);
+
+  { TODO(Phase 6.9-bis step 11g): productive emission tail.  Requires:
+      - sqlite3MaterializeView (view-realize, codegen.pas:5331 stub),
+      - sqlite3ResolveExprNames over pWhere with NameContext setup,
+      - SQLITE_CountRows memCnt allocation + OP_Integer init,
+      - truncate-optimization path (OP_Clear) when pWhere=nil,!bComplex,
+      - sqlite3WhereBegin / sqlite3WhereOkOnePass / sqlite3WhereEnd loop
+        feeding sqlite3GenerateRowDelete (codegen.pas:5355 stub).
+    The schema-row DELETE FROM "main".sqlite_master WHERE name=...
+    statements emitted by sqlite3NestedParse for DROP TABLE / DROP INDEX
+    take the where-loop arm; flipping their TestExplainParity rows
+    requires real sqlite3WhereBegin (Phase 7 territory) plus
+    sqlite3GenerateRowDelete (Phase 6.5). }
+
+delete_from_cleanup:
+  if skelEntered then begin
+    if pParse^.zErrMsg <> nil then sqlite3DbFree(db, pParse^.zErrMsg);
+    pParse^.zErrMsg := saveErrMsg;
+    pParse^.nErr    := saveNErr;
+    pParse^.rc      := saveRc;
+  end;
+  sqlite3AuthContextPop(@sContext);
   sqlite3SrcListDelete(pParse^.db, pTabList);
   sqlite3ExprDelete(pParse^.db, pWhere);
   sqlite3ExprListDelete(pParse^.db, pOrderBy);
@@ -5391,12 +5522,157 @@ begin
   { Phase 6.5: emit OP_Null or OP_SCopy for default expression }
 end;
 
-{ sqlite3Update — generate UPDATE statement VDBE (Phase 6.4 stub) }
+{ sqlite3Update — port of update.c:285 (structural skeleton).
+
+  Phase 6.9-bis step 11f.  Lays down the C-shaped prologue: nErr / eOpenState
+  gates, SrcListLookup -> SchemaToIndex -> TriggersExist -> isView ->
+  nChangeFrom -> ViewGetColumnNames -> IsReadOnly -> cursor allocation ->
+  GetVdbe.  The productive emission tail (column resolution loop,
+  sqlite3ResolveExprNames over pChanges + pWhere, sqlite3WhereBegin,
+  sqlite3GenerateConstraintChecks, sqlite3CompleteInsertion) remains a TODO
+  — those helpers are still Phase 6.4 stubs.
+
+  Note: the C reference allocates aXRef / aRegIdx / aToOpen via
+  sqlite3DbMallocRawNN; the skeleton skips that allocation because no
+  productive code path consumes those arrays yet.  Wiring will land alongside
+  the WHERE-loop port (next sub-step). }
 procedure sqlite3Update(pParse: PParse; pTabList: PSrcList;
   pChanges: PExprList; pWhere: PExpr; onError: i32;
   pOrderBy: PExprList; pLimit: PExpr; pUpsert: PUpsert);
+label
+  update_cleanup;
+var
+  db:           PTsqlite3;
+  pTab:         PTable2;
+  v:            PVdbe;
+  iDb:          i32;
+  iBaseCur:     i32;
+  iDataCur:     i32;
+  iIdxCur:      i32;
+  nIdx:         i32;
+  pIdx:         PIndex2;
+  pPk:          PIndex2;
+  pTrg:         PTrigger;
+  isView:       i32;
+  tmask:        u32;
+  nChangeFrom:  i32;
+  sContext:     TAuthContext;
+  saveNErr:     i32;
+  saveRc:       i32;
+  saveErrMsg:   PAnsiChar;
+  skelEntered:  Boolean;
 begin
-  { Phase 6.5 }
+  pTab        := nil;
+  v           := nil;
+  pTrg        := nil;
+  isView      := 0;
+  tmask       := 0;
+  nChangeFrom := 0;
+  iBaseCur    := 0;
+  iDataCur    := 0;
+  iIdxCur     := 0;
+  nIdx        := 0;
+  pPk         := nil;
+  FillChar(sContext, SizeOf(sContext), 0);
+  skelEntered := False;
+  saveNErr   := 0;
+  saveRc     := 0;
+  saveErrMsg := nil;
+
+  db := pParse^.db;
+  if pParse^.nErr <> 0 then goto update_cleanup;
+  { Test-scaffold gate (TestParser, TestParserSmoke). }
+  if db^.eOpenState <> $76 then goto update_cleanup;
+  { Phase 6.9-bis step 11f: skeleton-only.  The prologue calls
+    sqlite3SrcListLookup -> sqlite3LocateTableItem productively, which can
+    set pParse^.nErr if schema isn't yet loaded for the target (e.g., the
+    nested UPDATE on sqlite_master fired by sqlite3EndTable).  Since this
+    step does NOT yet emit productive code, snapshot nErr / nested error
+    state on entry and restore at cleanup so the skeleton remains a true
+    no-op for outer parser state.  When the productive emission tail lands
+    in step 11g, this guard goes away. }
+  saveNErr   := pParse^.nErr;
+  saveRc     := pParse^.rc;
+  saveErrMsg := pParse^.zErrMsg;
+  pParse^.zErrMsg := nil;
+  skelEntered := True;
+
+  { Locate target table (update.c:362). }
+  pTab := sqlite3SrcListLookup(pParse, pTabList);
+  if pTab = nil then goto update_cleanup;
+  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+
+  { Trigger detection — sqlite3TriggersExist is a stub returning nil today;
+    call shape matches update.c:370. }
+  pTrg := sqlite3TriggersExist(pParse, pTab, TK_UPDATE, pChanges, @tmask);
+  if pTab^.eTabType = TABTYP_VIEW then isView := 1 else isView := 0;
+
+  { FROM clause detection.  pTabList^.nSrc > 1 implies UPDATE ... FROM,
+    in which case nChangeFrom = pChanges^.nExpr.  Schema-row UPDATEs from
+    sqlite3NestedParse never have a FROM clause, so nChangeFrom stays 0
+    on the productive path. }
+  if (pTabList <> nil) and (pTabList^.nSrc > 1) and (pChanges <> nil) then
+    nChangeFrom := pChanges^.nExpr
+  else
+    nChangeFrom := 0;
+
+  { TODO(Phase 6.x): sqlite3LimitWhere call (update.c:399) — UPDATE LIMIT
+    support.  Helper is a no-op stub today; productive path never has LIMIT. }
+
+  if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then goto update_cleanup;
+
+  if sqlite3IsReadOnly(pParse, pTab, pTrg) <> 0 then goto update_cleanup;
+
+  { Allocate cursors for the main table and all indices (update.c:420). }
+  iBaseCur := pParse^.nTab;
+  iDataCur := iBaseCur;
+  Inc(pParse^.nTab);
+  iIdxCur := iDataCur + 1;
+  if (pTab^.tabFlags and TF_WithoutRowid) = 0 then
+    pPk := nil
+  else
+    pPk := sqlite3PrimaryKeyIndex(pTab);
+  pIdx := pTab^.pIndex;
+  while pIdx <> nil do begin
+    if pPk = pIdx then
+      iDataCur := pParse^.nTab;
+    Inc(pParse^.nTab);
+    Inc(nIdx);
+    pIdx := pIdx^.pNext;
+  end;
+  if pUpsert <> nil then begin
+    { On an UPSERT, reuse the cursors already opened by INSERT. }
+    iDataCur := pUpsert^.iDataCur;
+    iIdxCur  := pUpsert^.iIdxCur;
+    pParse^.nTab := iBaseCur;
+  end;
+  SrcListItems(pTabList)[0].iCursor := iDataCur;
+
+  { Begin generating code. }
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then goto update_cleanup;
+
+  { TODO(Phase 6.9-bis step 11g): productive emission tail.  Requires:
+      - aXRef / aRegIdx / aToOpen allocation (update.c:441),
+      - column-resolution loop over pChanges + sqlite3ResolveExprNames,
+      - chngRowid / chngPk detection,
+      - SQLITE_CountRows regRowCount allocation,
+      - sqlite3VdbeCountChanges + sqlite3BeginWriteOperation,
+      - sqlite3WhereBegin / per-row update emission feeding
+        sqlite3GenerateConstraintChecks + sqlite3CompleteInsertion.
+    The schema-row UPDATE "main".sqlite_master SET ... statements emitted by
+    sqlite3NestedParse for CREATE TABLE / CREATE INDEX flow through this
+    path productively. }
+
+update_cleanup:
+  { Restore parser error state — see snapshot comment above. }
+  if skelEntered then begin
+    if pParse^.zErrMsg <> nil then sqlite3DbFree(db, pParse^.zErrMsg);
+    pParse^.zErrMsg := saveErrMsg;
+    pParse^.nErr    := saveNErr;
+    pParse^.rc      := saveRc;
+  end;
+  sqlite3AuthContextPop(@sContext);
   sqlite3SrcListDelete(pParse^.db, pTabList);
   sqlite3ExprListDelete(pParse^.db, pChanges);
   sqlite3ExprDelete(pParse^.db, pWhere);
