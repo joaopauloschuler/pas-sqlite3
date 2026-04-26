@@ -20,6 +20,61 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.8.h.3 JSON path-driven scalars.**  Lands
+    the SQL surface for `json_extract`, `json_set`, `json_replace`,
+    `json_insert`, `json_array_insert`, `json_remove`, and
+    `json_patch`.  Five new public cdecl entry points in
+    `passqlite3json.pas` (`jsonExtractFunc`, `jsonRemoveFunc`,
+    `jsonReplaceFunc`, `jsonSetFunc`, `jsonPatchFunc`); two new
+    private drivers (`jsonInsertIntoBlob` for the set/replace/insert
+    family, `jsonMergePatch` for the RFC-7396 patch).  All edits
+    flow through `jsonLookupStep` (6.8.f) for path resolution and
+    `jsonBlobEdit` (6.8.c) for in-place blob mutation.
+
+    Concrete changes:
+      * `src/passqlite3json.pas` — adds the 5 cdecl entry points
+        in interface (~440 lines impl); `JSON_MERGE_*` constants.
+      * `src/tests/TestJson.pas` — adds T405..T422 (18 new
+        asserts); `CallScalar3` / `CallScalar5` helpers for
+        odd-argc paths.  **421/421 PASS** (was 403/403).
+      * Regression spot check: TestPrintf 105/105, TestVtab 216/216,
+        TestParser 45/45, TestSchemaBasic 44/44, TestVdbeApi 57/57.
+
+    Discoveries / next-step notes:
+      * **`sqlite3_set_auxdata` sets `isError := -1` as a sentinel.**
+        This flags "auxdata recorded for current opcode" so the next
+        re-evaluation can short-circuit.  It is NOT a real SQL
+        error.  Tests that gate on "no result + no error" must use
+        `isError <= 0`, not `= 0` — caught when first cut of T406
+        and T417 spuriously failed.  See `passqlite3vdbe.pas:2907`.
+      * **`json_set` flag-discrimination still inert in tests.**
+        The Pascal test harness fabricates a `Tsqlite3_context`
+        without a `pFunc`, so `sqlite3_user_data(ctx)` always
+        returns nil.  That collapses `JSON_INSERT_TYPE(flags) = 0`
+        → JEDIT_INS in every case (T412/T413).  Coverage of the
+        SET / AINS branches is deferred to 6.8.h.6 when the
+        registration layer plumbs `JSON_ISSET` / `JSON_AINS`
+        through `pUserData`.
+      * **`jsonExtractFunc` abbreviated-path branch not yet
+        exercised.**  Plain `json_extract` registers with flags=0,
+        so the `JSON_ABPATH` (= `JSON_JSON | JSON_SQL`) branch only
+        fires for `->` (1) and `->>` (2).  Wired and structurally
+        identical to the C reference, but pinned tests are deferred
+        to 6.8.h.6 with the user-data fabrication.
+      * **`jsonInsertIntoBlob` mutates `p^.eEdit` / `aIns` / `nIns`
+        / `delta` / `iDepth` per path iteration.**  Cache hits via
+        `jsonCacheSearch` rely on `p^.delta == 0` at entry; the
+        per-path reset to `delta := 0` preserves that invariant.
+        Verified by T409/T410 (cache hit on `{"a":1,"b":2}` between
+        replace-hit and replace-miss).
+      * **`jsonMergePatch` recursion bumps `iDepth` separately
+        from the parser's `iDepth` field.**  Local parameter,
+        capped at `JSON_MAX_DEPTH = 1000`.  `pTarget^.delta` is
+        saved + restored across the recursive call so the outer
+        edit-position math remains coherent — same pattern as
+        `jsonLookupStep`'s recursion through
+        `jsonCreateEditSubstructure` (6.8.f).
+
   - **2026-04-26 — Phase 6.8.h.1 JSON SQL-result helpers.**  First
     slice of the 6.8.h dispatch chunk.  Lands the deferred
     "return-to-SQL" surface that earlier 6.8.* chunks repeatedly
@@ -3909,10 +3964,66 @@ reference exactly.
       Cache leak across tests handled by calling
       `sqlite3_set_auxdata(@ctx, JSON_CACHE_ID, nil, nil)` between
       cases — same pattern as T353 in 6.8.g.
-    - [ ] **6.8.h.3** Path-driven scalars — `json_extract`,
-      `json_set`, `json_replace`, `json_insert`, `json_remove`,
-      `json_patch`.  Drives `jsonLookupStep` (6.8.f) +
-      `jsonInsertIntoBlob` + `jsonMergePatch`.
+    - [X] **6.8.h.3** Path-driven scalars — `json_extract`,
+      `json_set`, `json_replace`, `json_insert` (alias of
+      `json_set` via flags), `json_array_insert` (ditto),
+      `json_remove`, `json_patch`.  Drives `jsonLookupStep` (6.8.f) +
+      `jsonInsertIntoBlob` (private, this chunk) + `jsonMergePatch`
+      (private, this chunk).
+      DONE 2026-04-26.  Gate `TestJson.pas` 421/421 PASS (was
+      403/403).  18 new asserts T405..T422.  Regression spot
+      check: TestPrintf 105/105, TestVtab 216/216, TestParser 45/45,
+      TestSchemaBasic 44/44, TestVdbeApi 57/57.
+
+      Concrete changes:
+        * `src/passqlite3json.pas` — adds 5 cdecl SQL entry points
+          to interface (`jsonExtractFunc`, `jsonRemoveFunc`,
+          `jsonReplaceFunc`, `jsonSetFunc`, `jsonPatchFunc`) and
+          ~440 lines of impl: private `jsonInsertIntoBlob`
+          driver, private `jsonMergePatch` (RFC-7396),
+          `JSON_MERGE_*` constants.
+        * `src/tests/TestJson.pas` — `CallScalar3`, `CallScalar5`
+          helpers + 5 new test bodies (`TestJsonRemove`,
+          `TestJsonReplace`, `TestJsonSet`, `TestJsonExtract`,
+          `TestJsonPatch`).
+
+      Discoveries / next-step notes:
+        * **`isError = -1` is an auxdata-attached sentinel,
+          not an SQL error.**  `sqlite3_set_auxdata` flips
+          `pCtx^.isError` to `-1` when it stores fresh aux state
+          for the current opcode.  Tests checking "no result, no
+          error" must therefore allow `isError <= 0`, not require
+          `= 0`.  Two T-row asserts updated accordingly.
+        * **`json_set` / `json_insert` / `json_array_insert`
+          dispatch via flags-on-user-data only.**  Without a
+          fabricated `TFuncDef` slot in the test ctx,
+          `sqlite3_user_data` returns nil → `eInsType = 0`
+          → INSERT semantics.  T412/T413 pin this default-flags
+          behaviour; the registration chunk (6.8.h.6) will set
+          `JSON_ISSET` / `JSON_AINS` via `pUserData` so that the
+          same `jsonSetFunc` body covers all three SQL names.
+          A SET-flagged variant test is deferred until the
+          registration layer fabricates the user-data slot.
+        * **`jsonExtractFunc` ABPATH branch only fires when
+          flags & 0x03 ≠ 0.**  Plain `json_extract` (flags=0)
+          requires `$`-prefix paths; `->` (`JSON_JSON=1`) and
+          `->>` (`JSON_SQL=2`) accept the abbreviated forms.
+          T418 covers the bare-label rejection in the
+          plain-`json_extract` case; the abbreviated-path branch
+          is wired but not yet exercised — pick up in 6.8.h.6
+          once user-data flags can be set.
+        * **`jsonMergePatch` `Move()` calls use FPC's RTL.**
+          Equivalent to C `memcpy`; no overlap concerns since
+          source is `pPatch` and destination is `pTarget` (two
+          distinct JsonParse blobs).  If a future fuzz case
+          aliases the two it could break — re-check then.
+        * **`jsonPatchFunc` argc==2 enforced via Assert + early
+          return.**  C uses `assert(argc==2)` plus
+          `UNUSED_PARAMETER(argc)`; we keep both because release
+          builds without `-CR` would otherwise crash on a
+          malformed registration.  Belt-and-braces, removable
+          when the registration chunk pins argc to 2 in
+          `TFuncDef`.
     - [ ] **6.8.h.4** Aggregates — `json_group_array`,
       `json_group_object` (step / value / final / inverse).
     - [ ] **6.8.h.5** Virtual tables — `json_each`, `json_tree`

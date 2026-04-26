@@ -569,6 +569,25 @@ procedure jsonPrettyFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 procedure jsonValidFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 procedure jsonErrorFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 
+{ ===========================================================================
+  Phase 6.8.h.3 — Path-driven scalar SQL functions.
+
+  json_extract / json_set / json_replace / json_insert /
+  json_array_insert / json_remove / json_patch.  All exported with the
+  TxSFuncProc cdecl shape so 6.8.h.6 can drop them straight into
+  TFuncDef tables.
+
+  json_set / json_replace / json_insert / json_array_insert all share a
+  single private driver (jsonInsertIntoBlob — implementation-only).
+  json_patch uses jsonMergePatch (also implementation-only).
+  =========================================================================== }
+
+procedure jsonExtractFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+procedure jsonRemoveFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+procedure jsonReplaceFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+procedure jsonSetFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+procedure jsonPatchFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+
 implementation
 
 uses
@@ -4273,6 +4292,501 @@ begin
     sqlite3_result_error_nomem(pCtx)
   else
     sqlite3_result_int64(pCtx, iErrPos);
+end;
+
+{ ===========================================================================
+  Phase 6.8.h.3 — Path-driven scalar SQL functions.
+  =========================================================================== }
+
+const
+  { json.c:4181..4187 — return codes for jsonMergePatch. }
+  JSON_MERGE_OK        = 0;
+  JSON_MERGE_BADTARGET = 1;
+  JSON_MERGE_BADPATCH  = 2;
+  JSON_MERGE_OOM       = 3;
+  JSON_MERGE_TOODEEP   = 4;
+
+{ json.c:3533 — driver for json_set/_replace/_insert/_array_insert.
+  Iterates path/value pairs, applies the requested edit on each, and
+  hands the resulting JsonParse to jsonReturnParse for SQL output. }
+procedure jsonInsertIntoBlob(pCtx: Psqlite3_context; argc: i32;
+                             argv: PPMem; eEdit: i32);
+label
+  patherror;
+var
+  i:    i32;
+  rc:   u32;
+  zPath: PAnsiChar;
+  flgs: i32;
+  p:    PJsonParse;
+  ax:   TJsonParse;
+begin
+  Assert((argc and 1) = 1);
+  zPath := nil;
+  rc    := 0;
+  if argc = 1 then flgs := 0 else flgs := JSON_EDITABLE;
+  p := jsonParseFuncArg(pCtx, argv[0], u32(flgs));
+  if p = nil then Exit;
+  i := 1;
+  while i < argc - 1 do
+  begin
+    if sqlite3_value_type(argv[i]) = SQLITE_NULL then
+    begin
+      Inc(i, 2);
+      Continue;
+    end;
+    zPath := PAnsiChar(sqlite3_value_text(argv[i]));
+    if zPath = nil then
+    begin
+      sqlite3_result_error_nomem(pCtx);
+      jsonParseFree(p);
+      Exit;
+    end;
+    if zPath[0] <> '$' then goto patherror;
+    FillChar(ax, SizeOf(ax), 0);
+    if jsonFunctionArgToBlob(pCtx, argv[i + 1], @ax) <> 0 then
+    begin
+      jsonParseReset(@ax);
+      jsonParseFree(p);
+      Exit;
+    end;
+    if zPath[1] = #0 then
+    begin
+      if (eEdit = JEDIT_REPL) or (eEdit = JEDIT_SET) then
+        jsonBlobEdit(p, 0, p^.nBlob, ax.aBlob, ax.nBlob);
+      rc := 0;
+    end
+    else
+    begin
+      p^.eEdit  := u8(eEdit);
+      p^.nIns   := ax.nBlob;
+      p^.aIns   := ax.aBlob;
+      p^.delta  := 0;
+      p^.iDepth := 0;
+      rc := jsonLookupStep(p, 0, zPath + 1, 0);
+    end;
+    jsonParseReset(@ax);
+    if rc = JSON_LOOKUP_NOTFOUND then
+    begin
+      Inc(i, 2);
+      Continue;
+    end;
+    if jsonLookupIsError(rc) then goto patherror;
+    Inc(i, 2);
+  end;
+  jsonReturnParse(pCtx, p);
+  jsonParseFree(p);
+  Exit;
+
+patherror:
+  jsonParseFree(p);
+  jsonBadPathError(pCtx, zPath, i32(rc));
+end;
+
+{ json.c:4070 — json_extract(JSON, PATH, ...).  Multi-path returns a
+  JSON array of the lookups; single-path returns the value itself with
+  flag-controlled JSON-vs-SQL rendering for -> / ->>. }
+procedure jsonExtractFunc(pCtx: Psqlite3_context; argc: i32;
+                          argv: PPMem); cdecl;
+label
+  json_extract_error;
+var
+  p:     PJsonParse;
+  flags: PtrInt;
+  i:     i32;
+  jx:    TJsonString;
+  zPath: PAnsiChar;
+  nPath: i32;
+  j:     u32;
+begin
+  if argc < 2 then Exit;
+  p := jsonParseFuncArg(pCtx, argv[0], 0);
+  if p = nil then Exit;
+  flags := PtrInt(sqlite3_user_data(pCtx));
+  jsonStringInit(@jx, pCtx);
+  if argc > 2 then jsonAppendChar(@jx, '[');
+  for i := 1 to argc - 1 do
+  begin
+    zPath := PAnsiChar(sqlite3_value_text(argv[i]));
+    if zPath = nil then goto json_extract_error;
+    nPath := i32(StrLen(zPath));
+    if zPath[0] = '$' then
+      j := jsonLookupStep(p, 0, zPath + 1, 0)
+    else if (flags and JSON_ABPATH) <> 0 then
+    begin
+      { Abbreviated path forms used by -> / ->>. }
+      jsonStringInit(@jx, pCtx);
+      if sqlite3_value_type(argv[i]) = SQLITE_INTEGER then
+      begin
+        jsonAppendRawNZ(@jx, PAnsiChar('['), 1);
+        if zPath[0] = '-' then jsonAppendRawNZ(@jx, PAnsiChar('#'), 1);
+        jsonAppendRaw(@jx, zPath, u32(nPath));
+        jsonAppendRawNZ(@jx, PAnsiChar(']'), 2);
+      end
+      else if jsonAllAlphanum(zPath, nPath) <> 0 then
+      begin
+        jsonAppendRawNZ(@jx, PAnsiChar('.'), 1);
+        jsonAppendRaw(@jx, zPath, u32(nPath));
+      end
+      else if (zPath[0] = '[') and (nPath >= 3) and (zPath[nPath - 1] = ']') then
+        jsonAppendRaw(@jx, zPath, u32(nPath))
+      else
+      begin
+        jsonAppendRawNZ(@jx, PAnsiChar('."'), 2);
+        jsonAppendRaw(@jx, zPath, u32(nPath));
+        jsonAppendRawNZ(@jx, PAnsiChar('"'), 1);
+      end;
+      jsonStringTerminate(@jx);
+      j := jsonLookupStep(p, 0, jx.zBuf, 0);
+      jsonStringReset(@jx);
+    end
+    else
+    begin
+      jsonBadPathError(pCtx, zPath, 0);
+      goto json_extract_error;
+    end;
+    if j < p^.nBlob then
+    begin
+      if argc = 2 then
+      begin
+        if (flags and JSON_JSON) <> 0 then
+        begin
+          jsonStringInit(@jx, pCtx);
+          jsonTranslateBlobToText(p, j, @jx);
+          jsonReturnString(@jx, nil, nil);
+          jsonStringReset(@jx);
+          Assert((flags and JSON_BLOB) = 0);
+          sqlite3_result_subtype(pCtx, JSON_SUBTYPE);
+        end
+        else
+        begin
+          jsonReturnFromBlob(p, j, pCtx, 0);
+          if ((flags and (JSON_SQL or JSON_BLOB)) = 0)
+             and ((p^.aBlob[j] and $0F) >= JSONB_ARRAY) then
+            sqlite3_result_subtype(pCtx, JSON_SUBTYPE);
+        end;
+      end
+      else
+      begin
+        jsonAppendSeparator(@jx);
+        jsonTranslateBlobToText(p, j, @jx);
+      end;
+    end
+    else if j = JSON_LOOKUP_NOTFOUND then
+    begin
+      if argc = 2 then
+        goto json_extract_error
+      else
+      begin
+        jsonAppendSeparator(@jx);
+        jsonAppendRawNZ(@jx, PAnsiChar('null'), 4);
+      end;
+    end
+    else
+    begin
+      jsonBadPathError(pCtx, zPath, i32(j));
+      goto json_extract_error;
+    end;
+  end;
+  if argc > 2 then
+  begin
+    jsonAppendChar(@jx, ']');
+    jsonReturnString(@jx, nil, nil);
+    if (flags and JSON_BLOB) = 0 then
+      sqlite3_result_subtype(pCtx, JSON_SUBTYPE);
+  end;
+json_extract_error:
+  jsonStringReset(@jx);
+  jsonParseFree(p);
+end;
+
+{ json.c:4466 — json_remove(JSON, PATH, ...).  Each PATH is removed
+  in-place; missing paths are silent no-ops. }
+procedure jsonRemoveFunc(pCtx: Psqlite3_context; argc: i32;
+                         argv: PPMem); cdecl;
+label
+  json_remove_patherror, json_remove_done;
+var
+  p:     PJsonParse;
+  zPath: PAnsiChar;
+  i:     i32;
+  rc:    u32;
+  flgs:  u32;
+begin
+  if argc < 1 then Exit;
+  zPath := nil;
+  if argc > 1 then flgs := JSON_EDITABLE else flgs := 0;
+  p := jsonParseFuncArg(pCtx, argv[0], flgs);
+  if p = nil then Exit;
+  i := 1;
+  while i < argc do
+  begin
+    zPath := PAnsiChar(sqlite3_value_text(argv[i]));
+    if zPath = nil then goto json_remove_done;
+    if zPath[0] <> '$' then goto json_remove_patherror;
+    if zPath[1] = #0 then
+    begin
+      { json_remove(j,'$') returns NULL. }
+      goto json_remove_done;
+    end;
+    p^.eEdit := JEDIT_DEL;
+    p^.delta := 0;
+    rc := jsonLookupStep(p, 0, zPath + 1, 0);
+    if jsonLookupIsError(rc) then
+    begin
+      if rc = JSON_LOOKUP_NOTFOUND then
+      begin
+        Inc(i);
+        Continue;
+      end
+      else
+        jsonBadPathError(pCtx, zPath, i32(rc));
+      goto json_remove_done;
+    end;
+    Inc(i);
+  end;
+  jsonReturnParse(pCtx, p);
+  jsonParseFree(p);
+  Exit;
+
+json_remove_patherror:
+  jsonBadPathError(pCtx, zPath, 0);
+
+json_remove_done:
+  jsonParseFree(p);
+end;
+
+{ json.c:4521 — json_replace(JSON, PATH, VALUE, ...).  Thin dispatcher. }
+procedure jsonReplaceFunc(pCtx: Psqlite3_context; argc: i32;
+                          argv: PPMem); cdecl;
+begin
+  if argc < 1 then Exit;
+  if (argc and 1) = 0 then
+  begin
+    jsonWrongNumArgs(pCtx, PAnsiChar('replace'));
+    Exit;
+  end;
+  jsonInsertIntoBlob(pCtx, argc, argv, JEDIT_REPL);
+end;
+
+{ json.c:4547 — json_set / json_insert / json_array_insert dispatcher.
+  The discrimination comes from sqlite3_user_data flags. }
+procedure jsonSetFunc(pCtx: Psqlite3_context; argc: i32;
+                      argv: PPMem); cdecl;
+const
+  azInsType: array[0..2] of PAnsiChar = ('insert', 'set', 'array_insert');
+  aEditType: array[0..2] of u8        = (JEDIT_INS, JEDIT_SET, JEDIT_AINS);
+var
+  flags:    PtrInt;
+  eInsType: i32;
+begin
+  flags    := PtrInt(sqlite3_user_data(pCtx));
+  eInsType := (i32(flags) and $0C) shr 2;   { JSON_INSERT_TYPE(flags) }
+  if argc < 1 then Exit;
+  Assert((eInsType >= 0) and (eInsType <= 2));
+  if (argc and 1) = 0 then
+  begin
+    jsonWrongNumArgs(pCtx, azInsType[eInsType]);
+    Exit;
+  end;
+  jsonInsertIntoBlob(pCtx, argc, argv, aEditType[eInsType]);
+end;
+
+{ json.c:4235 — RFC-7396 MergePatch over two JSONB blobs.  pTarget is
+  edited in-place; pPatch is read-only.  See the algorithm comment in
+  the C reference for the line-numbered structure mirrored below. }
+function jsonMergePatch(pTarget: PJsonParse; iTarget: u32;
+                        pPatch: PJsonParse; iPatch: u32;
+                        iDepth: u32): i32;
+var
+  x:        u8;
+  n, sz:    u32;
+  iTCursor: u32;
+  iTStart:  u32;
+  iTEndBE:  u32;
+  iTEnd:    u32;
+  eTLabel:  u8;
+  iTLabel, nTLabel, szTLabel: u32;
+  iTValue, nTValue, szTValue: u32;
+  iPCursor, iPEnd: u32;
+  ePLabel: u8;
+  iPLabel, nPLabel, szPLabel: u32;
+  iPValue, nPValue, szPValue: u32;
+  szPatch, szTarget: u32;
+  isEqual: i32;
+  rc, savedDelta: i32;
+  szNew: u32;
+begin
+  Assert(iTarget < pTarget^.nBlob);
+  Assert(iPatch  < pPatch^.nBlob);
+  sz := 0;
+  x := pPatch^.aBlob[iPatch] and $0F;
+  if x <> JSONB_OBJECT then
+  begin
+    { Algorithm line 02 / 03 — patch is not an Object: replace target. }
+    n := jsonbPayloadSize(pPatch, iPatch, sz);
+    szPatch := n + sz;
+    sz := 0;
+    n := jsonbPayloadSize(pTarget, iTarget, sz);
+    szTarget := n + sz;
+    jsonBlobEdit(pTarget, iTarget, szTarget,
+                 PByte(pPatch^.aBlob) + iPatch, szPatch);
+    if pTarget^.oom <> 0 then Result := JSON_MERGE_OOM
+    else                     Result := JSON_MERGE_OK;
+    Exit;
+  end;
+  x := pTarget^.aBlob[iTarget] and $0F;
+  if x <> JSONB_OBJECT then
+  begin
+    { Algorithm line 05 — coerce target to {}. }
+    n := jsonbPayloadSize(pTarget, iTarget, sz);
+    jsonBlobEdit(pTarget, iTarget + n, sz, nil, 0);
+    x := pTarget^.aBlob[iTarget];
+    pTarget^.aBlob[iTarget] := (x and $F0) or JSONB_OBJECT;
+  end;
+  n := jsonbPayloadSize(pPatch, iPatch, sz);
+  if n = 0 then begin Result := JSON_MERGE_BADPATCH; Exit; end;
+  iPCursor := iPatch + n;
+  iPEnd    := iPCursor + sz;
+  n := jsonbPayloadSize(pTarget, iTarget, sz);
+  if n = 0 then begin Result := JSON_MERGE_BADTARGET; Exit; end;
+  iTStart  := iTarget + n;
+  iTEndBE  := iTStart + sz;
+
+  while iPCursor < iPEnd do
+  begin
+    iPLabel := iPCursor;
+    ePLabel := pPatch^.aBlob[iPCursor] and $0F;
+    if (ePLabel < JSONB_TEXT) or (ePLabel > JSONB_TEXTRAW) then
+    begin Result := JSON_MERGE_BADPATCH; Exit; end;
+    nPLabel := jsonbPayloadSize(pPatch, iPCursor, szPLabel);
+    if nPLabel = 0 then begin Result := JSON_MERGE_BADPATCH; Exit; end;
+    iPValue := iPCursor + nPLabel + szPLabel;
+    if iPValue >= iPEnd then begin Result := JSON_MERGE_BADPATCH; Exit; end;
+    nPValue := jsonbPayloadSize(pPatch, iPValue, szPValue);
+    if nPValue = 0 then begin Result := JSON_MERGE_BADPATCH; Exit; end;
+    iPCursor := iPValue + nPValue + szPValue;
+    if iPCursor > iPEnd then begin Result := JSON_MERGE_BADPATCH; Exit; end;
+
+    iTCursor := iTStart;
+    iTEnd    := iTEndBE + u32(pTarget^.delta);
+    iTLabel  := 0; nTLabel := 0; szTLabel := 0;
+    iTValue  := 0; nTValue := 0; szTValue := 0;
+    eTLabel  := 0;
+    isEqual  := 0;
+    while iTCursor < iTEnd do
+    begin
+      iTLabel := iTCursor;
+      eTLabel := pTarget^.aBlob[iTCursor] and $0F;
+      if (eTLabel < JSONB_TEXT) or (eTLabel > JSONB_TEXTRAW) then
+      begin Result := JSON_MERGE_BADTARGET; Exit; end;
+      nTLabel := jsonbPayloadSize(pTarget, iTCursor, szTLabel);
+      if nTLabel = 0 then begin Result := JSON_MERGE_BADTARGET; Exit; end;
+      iTValue := iTLabel + nTLabel + szTLabel;
+      if iTValue >= iTEnd then
+      begin Result := JSON_MERGE_BADTARGET; Exit; end;
+      nTValue := jsonbPayloadSize(pTarget, iTValue, szTValue);
+      if nTValue = 0 then begin Result := JSON_MERGE_BADTARGET; Exit; end;
+      if iTValue + nTValue + szTValue > iTEnd then
+      begin Result := JSON_MERGE_BADTARGET; Exit; end;
+      isEqual := jsonLabelCompare(
+        PAnsiChar(PByte(pPatch^.aBlob) + iPLabel + nPLabel),
+        szPLabel,
+        Ord((ePLabel = JSONB_TEXT) or (ePLabel = JSONB_TEXTRAW)),
+        PAnsiChar(PByte(pTarget^.aBlob) + iTLabel + nTLabel),
+        szTLabel,
+        Ord((eTLabel = JSONB_TEXT) or (eTLabel = JSONB_TEXTRAW)));
+      if isEqual <> 0 then Break;
+      iTCursor := iTValue + nTValue + szTValue;
+    end;
+    x := pPatch^.aBlob[iPValue] and $0F;
+    if iTCursor < iTEnd then
+    begin
+      { Match found — algorithm line 08. }
+      if x = 0 then
+      begin
+        { Patch value is null — algorithm line 09 — delete the pair. }
+        jsonBlobEdit(pTarget, iTLabel,
+                     nTLabel + szTLabel + nTValue + szTValue, nil, 0);
+        if pTarget^.oom <> 0 then begin Result := JSON_MERGE_OOM; Exit; end;
+      end
+      else
+      begin
+        { Algorithm line 12 — recurse on the existing value. }
+        savedDelta := pTarget^.delta;
+        pTarget^.delta := 0;
+        if iDepth >= JSON_MAX_DEPTH then
+        begin Result := JSON_MERGE_TOODEEP; Exit; end;
+        rc := jsonMergePatch(pTarget, iTValue, pPatch, iPValue, iDepth + 1);
+        if rc <> 0 then begin Result := rc; Exit; end;
+        pTarget^.delta := pTarget^.delta + savedDelta;
+      end;
+    end
+    else if x > 0 then
+    begin
+      { Algorithm line 13 — no match and value not null. }
+      szNew := szPLabel + nPLabel;
+      if (pPatch^.aBlob[iPValue] and $0F) <> JSONB_OBJECT then
+      begin
+        { Line 14 — append label + non-object value. }
+        jsonBlobEdit(pTarget, iTEnd, 0, nil, szPValue + nPValue + szNew);
+        if pTarget^.oom <> 0 then begin Result := JSON_MERGE_OOM; Exit; end;
+        Move((PByte(pPatch^.aBlob) + iPLabel)^,
+             (PByte(pTarget^.aBlob) + iTEnd)^, szNew);
+        Move((PByte(pPatch^.aBlob) + iPValue)^,
+             (PByte(pTarget^.aBlob) + iTEnd + szNew)^,
+             szPValue + nPValue);
+      end
+      else
+      begin
+        { Line 17 — append label + empty {} placeholder, then recurse. }
+        jsonBlobEdit(pTarget, iTEnd, 0, nil, szNew + 1);
+        if pTarget^.oom <> 0 then begin Result := JSON_MERGE_OOM; Exit; end;
+        Move((PByte(pPatch^.aBlob) + iPLabel)^,
+             (PByte(pTarget^.aBlob) + iTEnd)^, szNew);
+        pTarget^.aBlob[iTEnd + szNew] := $00;
+        savedDelta := pTarget^.delta;
+        pTarget^.delta := 0;
+        if iDepth >= JSON_MAX_DEPTH then
+        begin Result := JSON_MERGE_TOODEEP; Exit; end;
+        rc := jsonMergePatch(pTarget, iTEnd + szNew, pPatch, iPValue,
+                             iDepth + 1);
+        if rc <> 0 then begin Result := rc; Exit; end;
+        pTarget^.delta := pTarget^.delta + savedDelta;
+      end;
+    end;
+  end;
+  if pTarget^.delta <> 0 then jsonAfterEditSizeAdjust(pTarget, iTarget);
+  if pTarget^.oom <> 0 then Result := JSON_MERGE_OOM
+  else                     Result := JSON_MERGE_OK;
+end;
+
+{ json.c:4388 — json_patch(TARGET, PATCH).  RFC-7396 wrapper. }
+procedure jsonPatchFunc(pCtx: Psqlite3_context; argc: i32;
+                        argv: PPMem); cdecl;
+var
+  pTarget, pPatch: PJsonParse;
+  rc:              i32;
+begin
+  Assert(argc = 2);
+  if argc <> 2 then Exit;
+  pTarget := jsonParseFuncArg(pCtx, argv[0], JSON_EDITABLE);
+  if pTarget = nil then Exit;
+  pPatch := jsonParseFuncArg(pCtx, argv[1], 0);
+  if pPatch <> nil then
+  begin
+    rc := jsonMergePatch(pTarget, 0, pPatch, 0, 0);
+    if rc = JSON_MERGE_OK then
+      jsonReturnParse(pCtx, pTarget)
+    else if rc = JSON_MERGE_OOM then
+      sqlite3_result_error_nomem(pCtx)
+    else if rc = JSON_MERGE_TOODEEP then
+      sqlite3_result_error(pCtx, PAnsiChar('JSON nested too deep'), -1)
+    else
+      sqlite3_result_error(pCtx, PAnsiChar('malformed JSON'), -1);
+    jsonParseFree(pPatch);
+  end;
+  jsonParseFree(pTarget);
 end;
 
 end.

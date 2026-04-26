@@ -1678,6 +1678,30 @@ begin
   proc(@ctx, 2, PPMem(@arr[0]));
 end;
 
+procedure CallScalar3(proc: TxSFuncProc;
+  var ctx: Tsqlite3_context; var v0, v1, v2: TMem);
+var
+  arr: array[0..2] of PMem;
+begin
+  arr[0] := @v0;
+  arr[1] := @v1;
+  arr[2] := @v2;
+  proc(@ctx, 3, PPMem(@arr[0]));
+end;
+
+procedure CallScalar5(proc: TxSFuncProc;
+  var ctx: Tsqlite3_context; var v0, v1, v2, v3, v4: TMem);
+var
+  arr: array[0..4] of PMem;
+begin
+  arr[0] := @v0;
+  arr[1] := @v1;
+  arr[2] := @v2;
+  arr[3] := @v3;
+  arr[4] := @v4;
+  proc(@ctx, 5, PPMem(@arr[0]));
+end;
+
 procedure ClearAuxCache(var ctx: Tsqlite3_context);
 begin
   sqlite3_set_auxdata(@ctx, JSON_CACHE_ID, nil, nil);
@@ -1921,8 +1945,252 @@ begin
             (pOut.flags = 0) and (ctx.isError = 0));
 end;
 
+{ ----- Phase 6.8.h.3 — Path-driven scalar SQL functions ----- }
+
+procedure TestJsonRemove;
+var
+  ctx:    Tsqlite3_context;
+  vm:     TVdbe;
+  pOut:   TMem;
+  v, p:   TMem;
+  zJ, zP: AnsiString;
+  s:      AnsiString;
 begin
-  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e/f/g/h.1/h.2 JSON port ===');
+  { Single key removal. }
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{"a":1,"b":2}';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.a';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonRemoveFunc, ctx, v, p);
+  s := MemString(pOut);
+  CheckEqS('T405 json_remove($.a) → {"b":2}', s, '{"b":2}');
+  ClearAuxCache(ctx);
+
+  { json_remove(j,'$') returns NULL — no result, pOut untouched. }
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonRemoveFunc, ctx, v, p);
+  { isError = -1 is the auxdata-attached sentinel, not a real error. }
+  CheckTrue('T406 json_remove($) → no result',
+            (pOut.flags = 0) and (ctx.isError <= 0));
+  ClearAuxCache(ctx);
+
+  { Missing path is a silent no-op → original is returned. }
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.zzz';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonRemoveFunc, ctx, v, p);
+  s := MemString(pOut);
+  CheckEqS('T407 json_remove($.zzz) → original', s, '{"a":1,"b":2}');
+  ClearAuxCache(ctx);
+
+  { Bad path → SQL error. }
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := 'a';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonRemoveFunc, ctx, v, p);
+  CheckTrue('T408 json_remove bad path → error', ctx.isError <> 0);
+  ClearAuxCache(ctx);
+end;
+
+procedure TestJsonReplace;
+var
+  ctx:        Tsqlite3_context;
+  vm:         TVdbe;
+  pOut:       TMem;
+  v, p, w:    TMem;
+  zJ, zP:     AnsiString;
+  s:          AnsiString;
+begin
+  { Replace existing key. }
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{"a":1,"b":2}';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.a';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  SetupIntValue(w, 99);
+  CallScalar3(@jsonReplaceFunc, ctx, v, p, w);
+  s := MemString(pOut);
+  CheckEqS('T409 json_replace($.a,99) → {"a":99,"b":2}', s, '{"a":99,"b":2}');
+  ClearAuxCache(ctx);
+
+  { Replace on a missing key is a no-op. }
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.zzz';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  SetupIntValue(w, 9);
+  CallScalar3(@jsonReplaceFunc, ctx, v, p, w);
+  s := MemString(pOut);
+  CheckEqS('T410 json_replace miss → original', s, '{"a":1,"b":2}');
+  ClearAuxCache(ctx);
+
+  { Even argc → wrong-num-args error. }
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  SetupTextValue(p, PAnsiChar('$.a'), 3);
+  CallScalar2(@jsonReplaceFunc, ctx, v, p);
+  CheckTrue('T411 json_replace even-args → error', ctx.isError <> 0);
+  ClearAuxCache(ctx);
+end;
+
+procedure TestJsonSet;
+var
+  ctx:        Tsqlite3_context;
+  vm:         TVdbe;
+  pOut:       TMem;
+  v, p, w:    TMem;
+  zJ, zP:     AnsiString;
+  s:          AnsiString;
+begin
+  { json_set with default flags=0 ⇒ INSERT semantics. }
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{"a":1}';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.b';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  SetupIntValue(w, 2);
+  CallScalar3(@jsonSetFunc, ctx, v, p, w);
+  s := MemString(pOut);
+  CheckEqS('T412 json_set (insert new) → {"a":1,"b":2}', s, '{"a":1,"b":2}');
+  ClearAuxCache(ctx);
+
+  { json_set with default flags=0: INSERT-only ⇒ existing key untouched. }
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.a';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  SetupIntValue(w, 99);
+  CallScalar3(@jsonSetFunc, ctx, v, p, w);
+  s := MemString(pOut);
+  CheckEqS('T413 json_set existing without ISSET flag → no-op',
+           s, '{"a":1}');
+  ClearAuxCache(ctx);
+end;
+
+procedure TestJsonExtract;
+var
+  ctx:    Tsqlite3_context;
+  vm:     TVdbe;
+  pOut:   TMem;
+  v, p, q: TMem;
+  zJ, zP, zQ: AnsiString;
+  s: AnsiString;
+begin
+  { Single-path extract of a number → SQL int. }
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{"a":1,"b":[10,20,30]}';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.a';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonExtractFunc, ctx, v, p);
+  CheckEqI('T414 json_extract($.a) = 1', pOut.u.i, 1);
+  ClearAuxCache(ctx);
+
+  { Single-path extract of an array → JSON text. }
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.b';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonExtractFunc, ctx, v, p);
+  s := MemString(pOut);
+  CheckEqS('T415 json_extract($.b) = "[10,20,30]"', s, '[10,20,30]');
+  ClearAuxCache(ctx);
+
+  { Two-path extract → JSON array of results. }
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.a';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  zQ := '$.b[1]';
+  SetupTextValue(q, PAnsiChar(zQ), Length(zQ));
+  CallScalar3(@jsonExtractFunc, ctx, v, p, q);
+  s := MemString(pOut);
+  CheckEqS('T416 json_extract multi → "[1,20]"', s, '[1,20]');
+  ClearAuxCache(ctx);
+
+  { Single-path miss → NULL (no result). }
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.zzz';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonExtractFunc, ctx, v, p);
+  CheckTrue('T417 json_extract($.miss) → no result',
+            (pOut.flags = 0) and (ctx.isError <= 0));
+  ClearAuxCache(ctx);
+
+  { Bad path (no leading $, flags=0) → error. }
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := 'a';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonExtractFunc, ctx, v, p);
+  CheckTrue('T418 json_extract bad path → error', ctx.isError <> 0);
+  ClearAuxCache(ctx);
+end;
+
+procedure TestJsonPatch;
+var
+  ctx:     Tsqlite3_context;
+  vm:      TVdbe;
+  pOut:    TMem;
+  v, w:    TMem;
+  zT, zP:  AnsiString;
+  s:       AnsiString;
+begin
+  { Plain key add. }
+  SetupCtx(ctx, vm, pOut);
+  zT := '{"a":1}';
+  zP := '{"b":2}';
+  SetupTextValue(v, PAnsiChar(zT), Length(zT));
+  SetupTextValue(w, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonPatchFunc, ctx, v, w);
+  s := MemString(pOut);
+  CheckEqS('T419 json_patch add key → {"a":1,"b":2}', s, '{"a":1,"b":2}');
+  ClearAuxCache(ctx);
+
+  { Replace key. }
+  SetupCtx(ctx, vm, pOut);
+  zT := '{"a":1,"b":2}';
+  zP := '{"a":99}';
+  SetupTextValue(v, PAnsiChar(zT), Length(zT));
+  SetupTextValue(w, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonPatchFunc, ctx, v, w);
+  s := MemString(pOut);
+  CheckEqS('T420 json_patch replace → {"a":99,"b":2}', s, '{"a":99,"b":2}');
+  ClearAuxCache(ctx);
+
+  { RFC-7396 null deletes. }
+  SetupCtx(ctx, vm, pOut);
+  zT := '{"a":1,"b":2}';
+  zP := '{"a":null}';
+  SetupTextValue(v, PAnsiChar(zT), Length(zT));
+  SetupTextValue(w, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonPatchFunc, ctx, v, w);
+  s := MemString(pOut);
+  CheckEqS('T421 json_patch null deletes → {"b":2}', s, '{"b":2}');
+  ClearAuxCache(ctx);
+
+  { Patch is not an object — replaces target wholesale. }
+  SetupCtx(ctx, vm, pOut);
+  zT := '{"a":1}';
+  zP := '[1,2,3]';
+  SetupTextValue(v, PAnsiChar(zT), Length(zT));
+  SetupTextValue(w, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonPatchFunc, ctx, v, w);
+  s := MemString(pOut);
+  CheckEqS('T422 json_patch non-object patch replaces target',
+           s, '[1,2,3]');
+  ClearAuxCache(ctx);
+end;
+
+begin
+  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e/f/g/h.1/h.2/h.3 JSON port ===');
   TestTypeNames;
   TestIsspace;
   TestSpacesString;
@@ -1994,6 +2262,11 @@ begin
   TestJsonPretty;
   TestJsonValid;
   TestJsonErrorPosition;
+  TestJsonRemove;
+  TestJsonReplace;
+  TestJsonSet;
+  TestJsonExtract;
+  TestJsonPatch;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);
