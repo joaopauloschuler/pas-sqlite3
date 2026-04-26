@@ -182,6 +182,24 @@ Important: At the end of this document, please find:
       INS1..INS6 (first insert / worse-discard / better-overwrite /
       distinct-iTab append / OrSet path / plan-limit DONE),
       ADJ1..ADJ2 (no-op when not indexed, downward adjust on subset).
+    - [X] `whereInterstageHeuristic` (where.c:6301..6337) — interstage
+      planner heuristic that sits between the two `wherePathSolver()`
+      passes.  Walks the chosen plan from outer to inner level; for any
+      level using an EQ / IN / NULL index constraint it lights every
+      bit in the prereq mask (ALLBITS = `(Bitmask)-1`) of every rival
+      WhereLoop on the same FROM-clause table that is NOT itself index-
+      constrained or auto-indexed.  This forbids the second (ORDER-BY-
+      aware) solver pass from regressing an index search to a full scan
+      just to satisfy ORDER BY.  Walk stops at the first virtual-table
+      or unconstrained outer loop (the second pass is allowed to swap
+      such an outer scan for a different one).  Pure mask arithmetic;
+      no codegen.  Gate: `TestWherePlanner.pas` (81/81): IH1 (rival
+      full-scan disabled, constrained / auto-index rivals kept, wrong-
+      table rival untouched, chosen loop's prereq unchanged), IH2 (vtab
+      outer breaks the walk so inner-level rival untouched), IH3
+      (WHERE_COLUMN_RANGE-only inner level breaks the walk yet outer
+      EQ still disables its iTab=0 rival), IH4 (WHERE_COLUMN_IN trips
+      the disable arm), IH5 (WHERE_COLUMN_NULL trips it too).
 
 - [ ] **6.9-bis 11g.2.e** Port `wherecode.c` (~2945 lines) —
     per-loop inner-body codegen.  Public surface:

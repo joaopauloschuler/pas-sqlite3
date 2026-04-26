@@ -1601,6 +1601,13 @@ function  sqlite3ExprIsLikeOperator(const pExpr: PExpr): i32;
 procedure whereLoopOutputAdjust(pWC: PWhereClause; pLoop: PWhereLoop;
                                 nRow: i16);
 
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — interstage planner heuristic
+  (where.c:6301..6337).  Disables full-scan loops on tables that the first
+  wherePathSolver() pass already chose to access via an index on equality
+  constraints, so the second (ORDER BY) solver pass cannot regress to a
+  full scan just to satisfy ordering. }
+procedure whereInterstageHeuristic(pWInfo: PWhereInfo);
+
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
 // ---------------------------------------------------------------------------
@@ -7740,6 +7747,62 @@ begin
 
   if pLoop^.nOut > nRow - iReduce then
     pLoop^.nOut := i16(nRow - iReduce);
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.d sub-progress) — interstage planner heuristic.
+
+  Faithful port of where.c:6301..6337.  Called between the two
+  wherePathSolver() passes.  The first pass picks a plan ignoring ORDER BY;
+  this routine then walks the chosen plan from outer to inner level and,
+  for each level whose loop uses an equality / IN / NULL index constraint,
+  forbids the second (ORDER-BY-aware) pass from picking any rival
+  full-scan loop on that same FROM-clause table by lighting every bit in
+  its prereq mask (ALLBITS).  Index-constrained or auto-index alternatives
+  are left intact.  The walk stops at the first virtual-table or
+  unconstrained loop because the second pass is allowed to swap such an
+  outer scan for a different one to satisfy ORDER BY.
+
+  ALLBITS is `(Bitmask)-1` (sqliteInt.h:1413).  Pure mask arithmetic — no
+  codegen, no pointer mutation outside the prereq field. =========== }
+procedure whereInterstageHeuristic(pWInfo: PWhereInfo);
+var
+  i:     i32;
+  iTab:  u8;
+  p:     PWhereLoop;
+  pLoop: PWhereLoop;
+begin
+  for i := 0 to pWInfo^.nLevel - 1 do
+  begin
+    p := whereInfoLevels(pWInfo)[i].pWLoop;
+    if p = nil then Break;
+    if (p^.wsFlags and WHERE_VIRTUALTABLE) <> 0 then
+    begin
+      { Treat a vtab scan as similar to a full-table scan. }
+      Break;
+    end;
+    if (p^.wsFlags and (WHERE_COLUMN_EQ or WHERE_COLUMN_NULL or WHERE_COLUMN_IN)) <> 0 then
+    begin
+      iTab  := p^.iTab;
+      pLoop := pWInfo^.pLoops;
+      while pLoop <> nil do
+      begin
+        if pLoop^.iTab = iTab then
+        begin
+          if (pLoop^.wsFlags and (WHERE_CONSTRAINT or WHERE_AUTO_INDEX)) = 0 then
+          begin
+            { Prevent 2nd solver() from using this one. }
+            pLoop^.prereq := not Bitmask(0);
+          end;
+        end;
+        pLoop := pLoop^.pNextLoop;
+      end;
+    end
+    else
+    begin
+      Break;
+    end;
+  end;
 end;
 
 { Helper for exprIsDeterministic (where.c:6445).  TK_FUNCTION nodes without

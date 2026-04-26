@@ -548,6 +548,160 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- whereInterstageHeuristic ----- }
+
+procedure TestInterstageHeuristic;
+const
+  N_LEVEL = 3;
+var
+  buf:    array of Byte;
+  pWInfo: PWhereInfo;
+  loops:  array[0..5] of TWhereLoop;
+  i:      i32;
+  ALL:    Bitmask;
+begin
+  ALL := not Bitmask(0);
+
+  { ----- T1: outer EQ on iTab=0 disables full-scan rival on iTab=0;
+    constrained rival left intact. ----- }
+  for i := 0 to High(loops) do
+    FillChar(loops[i], SizeOf(TWhereLoop), 0);
+
+  { Chosen plan: level 0 → loops[0] (WHERE_COLUMN_EQ, iTab=0). }
+  loops[0].wsFlags := WHERE_COLUMN_EQ;
+  loops[0].iTab    := 0;
+  loops[0].prereq  := 0;
+
+  { Rivals on the pLoops chain. }
+  loops[1].wsFlags := 0;          { full scan on iTab=0 — should be disabled }
+  loops[1].iTab    := 0;
+  loops[1].prereq  := 0;
+  loops[2].wsFlags := WHERE_COLUMN_RANGE; { WHERE_CONSTRAINT subset → kept }
+  loops[2].iTab    := 0;
+  loops[2].prereq  := 0;
+  loops[3].wsFlags := WHERE_AUTO_INDEX;   { auto-index → kept }
+  loops[3].iTab    := 0;
+  loops[3].prereq  := 0;
+  loops[4].wsFlags := 0;          { full scan on iTab=1 — wrong table, untouched }
+  loops[4].iTab    := 1;
+  loops[4].prereq  := 0;
+
+  loops[0].pNextLoop := @loops[1];
+  loops[1].pNextLoop := @loops[2];
+  loops[2].pNextLoop := @loops[3];
+  loops[3].pNextLoop := @loops[4];
+  loops[4].pNextLoop := nil;
+
+  SetLength(buf, SZ_WHEREINFO(N_LEVEL));
+  FillChar(buf[0], Length(buf), 0);
+  pWInfo := PWhereInfo(@buf[0]);
+  pWInfo^.nLevel := N_LEVEL;
+  pWInfo^.pLoops := @loops[0];
+  whereInfoLevels(pWInfo)[0].pWLoop := @loops[0];
+  whereInfoLevels(pWInfo)[1].pWLoop := nil; { cuts walk }
+  whereInfoLevels(pWInfo)[2].pWLoop := nil;
+
+  whereInterstageHeuristic(pWInfo);
+
+  Check('IH1 chosen loop unchanged',           loops[0].prereq = 0);
+  Check('IH1 rival full-scan disabled',        loops[1].prereq = ALL);
+  Check('IH1 constrained rival kept',          loops[2].prereq = 0);
+  Check('IH1 auto-index rival kept',           loops[3].prereq = 0);
+  Check('IH1 wrong-table rival untouched',     loops[4].prereq = 0);
+
+  { ----- T2: walk stops at virtual-table outer loop. ----- }
+  for i := 0 to High(loops) do
+    FillChar(loops[i], SizeOf(TWhereLoop), 0);
+
+  loops[0].wsFlags := WHERE_VIRTUALTABLE;
+  loops[0].iTab    := 0;
+  loops[1].wsFlags := WHERE_COLUMN_EQ;     { would fire if reached }
+  loops[1].iTab    := 1;
+  loops[2].wsFlags := 0;                   { rival on iTab=1 — must NOT be disabled }
+  loops[2].iTab    := 1;
+
+  loops[0].pNextLoop := @loops[2];
+  loops[2].pNextLoop := nil;
+
+  pWInfo^.pLoops := @loops[0];
+  whereInfoLevels(pWInfo)[0].pWLoop := @loops[0];
+  whereInfoLevels(pWInfo)[1].pWLoop := @loops[1];
+  whereInfoLevels(pWInfo)[2].pWLoop := nil;
+
+  whereInterstageHeuristic(pWInfo);
+
+  Check('IH2 vtab break — inner level not processed', loops[2].prereq = 0);
+
+  { ----- T3: walk stops at unconstrained loop (no EQ/IN/NULL). ----- }
+  for i := 0 to High(loops) do
+    FillChar(loops[i], SizeOf(TWhereLoop), 0);
+
+  loops[0].wsFlags := WHERE_COLUMN_EQ;
+  loops[0].iTab    := 0;
+  loops[1].wsFlags := WHERE_COLUMN_RANGE;  { not EQ/IN/NULL → break }
+  loops[1].iTab    := 1;
+  loops[2].wsFlags := 0;                   { rival on iTab=2 }
+  loops[2].iTab    := 2;
+  loops[3].wsFlags := 0;                   { rival on iTab=0 — should be disabled }
+  loops[3].iTab    := 0;
+
+  loops[0].pNextLoop := @loops[3];
+  loops[3].pNextLoop := @loops[2];
+  loops[2].pNextLoop := nil;
+
+  pWInfo^.pLoops := @loops[0];
+  whereInfoLevels(pWInfo)[0].pWLoop := @loops[0];
+  whereInfoLevels(pWInfo)[1].pWLoop := @loops[1];
+  whereInfoLevels(pWInfo)[2].pWLoop := @loops[2];
+
+  whereInterstageHeuristic(pWInfo);
+
+  Check('IH3 outer EQ disabled rival on iTab=0',   loops[3].prereq = ALL);
+  Check('IH3 inner-level break — iTab=2 untouched', loops[2].prereq = 0);
+
+  { ----- T4: nil pWLoop terminates walk early. ----- }
+  for i := 0 to High(loops) do
+    FillChar(loops[i], SizeOf(TWhereLoop), 0);
+
+  loops[0].wsFlags := WHERE_COLUMN_IN;
+  loops[0].iTab    := 0;
+  loops[1].wsFlags := 0;
+  loops[1].iTab    := 0;
+
+  loops[0].pNextLoop := @loops[1];
+  loops[1].pNextLoop := nil;
+
+  pWInfo^.pLoops := @loops[0];
+  whereInfoLevels(pWInfo)[0].pWLoop := @loops[0];
+  whereInfoLevels(pWInfo)[1].pWLoop := nil; { stops walk after level 0 }
+  whereInfoLevels(pWInfo)[2].pWLoop := nil;
+
+  whereInterstageHeuristic(pWInfo);
+
+  Check('IH4 WHERE_COLUMN_IN trips disable',  loops[1].prereq = ALL);
+
+  { ----- T5: WHERE_COLUMN_NULL trips disable too. ----- }
+  for i := 0 to High(loops) do
+    FillChar(loops[i], SizeOf(TWhereLoop), 0);
+
+  loops[0].wsFlags := WHERE_COLUMN_NULL;
+  loops[0].iTab    := 7;
+  loops[1].wsFlags := 0;
+  loops[1].iTab    := 7;
+
+  loops[0].pNextLoop := @loops[1];
+  loops[1].pNextLoop := nil;
+
+  pWInfo^.pLoops := @loops[0];
+  whereInfoLevels(pWInfo)[0].pWLoop := @loops[0];
+  whereInfoLevels(pWInfo)[1].pWLoop := nil;
+  whereInfoLevels(pWInfo)[2].pWLoop := nil;
+
+  whereInterstageHeuristic(pWInfo);
+
+  Check('IH5 WHERE_COLUMN_NULL trips disable', loops[1].prereq = ALL);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -559,6 +713,7 @@ begin
   TestExprIsLikeOperator;
   TestEstLikePatternLength;
   TestOutputAdjust;
+  TestInterstageHeuristic;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.
