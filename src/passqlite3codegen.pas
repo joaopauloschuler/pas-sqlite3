@@ -1511,6 +1511,8 @@ procedure sqlite3WhereClauseInit(pWC: PWhereClause; pWInfo: PWhereInfo);
 procedure sqlite3WhereClauseClear(pWC: PWhereClause);
 procedure sqlite3WhereSplit(pWC: PWhereClause; pExpr: PExpr; op: u8);
 function  sqlite3WhereGetMask(pMaskSet: PWhereMaskSet; iCursor: i32): Bitmask;
+function  sqlite3WhereMalloc(pWInfo: PWhereInfo; nByte: u64): Pointer;
+function  sqlite3WhereRealloc(pWInfo: PWhereInfo; pOld: Pointer; nByte: u64): Pointer;
 function  sqlite3WhereExprUsageNN(pMaskSet: PWhereMaskSet; p: PExpr): Bitmask;
 function  sqlite3WhereExprUsage(pMaskSet: PWhereMaskSet; p: PExpr): Bitmask;
 function  sqlite3WhereExprListUsage(pMaskSet: PWhereMaskSet; pList: PExprList): Bitmask;
@@ -4324,6 +4326,57 @@ procedure whereLoopDelete(db: PTsqlite3; p: PWhereLoop);
 begin
   whereLoopClear(db, p);
   sqlite3DbNNFreeNN(db, p);
+end;
+
+{ Allocate memory that is automatically freed when pWInfo is freed.  Each
+  block is prefixed with a TWhereMemBlock header threading it onto
+  pWInfo^.pMemToFree; whereInfoFree walks the list and releases every block.
+  where.c:261..273.  Returns nil on OOM. }
+function sqlite3WhereMalloc(pWInfo: PWhereInfo; nByte: u64): Pointer;
+var
+  pBlock: PWhereMemBlock;
+begin
+  pBlock := PWhereMemBlock(sqlite3DbMallocRawNN(pWInfo^.pParse^.db,
+    nByte + u64(SizeOf(TWhereMemBlock))));
+  if pBlock <> nil then
+  begin
+    pBlock^.pNext := pWInfo^.pMemToFree;
+    pBlock^.sz    := nByte;
+    pWInfo^.pMemToFree := pBlock;
+    Inc(pBlock); { skip past header — caller sees user payload only }
+    Exit(Pointer(pBlock));
+  end;
+  Result := nil;
+end;
+
+{ Reallocate a sqlite3WhereMalloc-tracked block.  Faithful to the C source:
+  always allocates fresh and copies; the old block stays threaded on
+  pMemToFree (it will be released wholesale by whereInfoFree).
+  where.c:274..283. }
+function sqlite3WhereRealloc(pWInfo: PWhereInfo; pOld: Pointer; nByte: u64): Pointer;
+var
+  pNew:    Pointer;
+  pOldBlk: PWhereMemBlock;
+begin
+  pNew := sqlite3WhereMalloc(pWInfo, nByte);
+  if (pNew <> nil) and (pOld <> nil) then
+  begin
+    pOldBlk := PWhereMemBlock(pOld);
+    Dec(pOldBlk); { recover header that precedes the user payload }
+    Assert(pOldBlk^.sz < nByte);
+    Move(PByte(pOld)^, PByte(pNew)^, pOldBlk^.sz);
+  end;
+  Result := pNew;
+end;
+
+{ Create a new mask for cursor iCursor.  There is one cursor per table in
+  the FROM clause; the WhereBegin prologue caps pTabList^.nSrc at BMS so
+  pMaskSet^.ix[] never overflows.  where.c:285..296. }
+procedure createMask(pMaskSet: PWhereMaskSet; iCursor: i32); inline;
+begin
+  Assert(pMaskSet^.n < Length(pMaskSet^.ix));
+  pMaskSet^.ix[pMaskSet^.n] := iCursor;
+  Inc(pMaskSet^.n);
 end;
 
 { Free a WhereInfo structure.  where.c:2615. }

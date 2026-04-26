@@ -7985,6 +7985,56 @@ Phase 5.9 depends on this being done first.
       fixup) still needs to land alongside the productive WhereBegin
       below / the 11g.2.e `wherecode.c` port.
 
+      **Sub-progress (landed 2026-04-26 — pMemToFree allocator + cursor
+      mask creator):** ported the remaining bookkeeping primitives from
+      where.c that the productive WhereBegin prologue calls before any
+      planner work runs:
+
+        * `sqlite3WhereMalloc` (where.c:261..273) — `pWInfo`-tracked
+          allocation.  Each block is prefixed with a `TWhereMemBlock`
+          header threading it onto `pWInfo^.pMemToFree`; on OOM returns
+          nil (not a fatal error — caller checks).  Pairs with
+          `whereInfoFree`'s pMemToFree-walk that's already in place.
+        * `sqlite3WhereRealloc` (where.c:274..283) — sister realloc.
+          Faithful to C: always allocates fresh and copies; the old
+          block stays threaded on pMemToFree (released wholesale when
+          WhereInfo is freed).
+        * `createMask` (where.c:285..296) — file-private cursor-mask
+          creator.  Inline; the cap on `pMaskSet^.ix[]` is enforced by
+          the WhereBegin prologue's `pTabList^.nSrc <= BMS` check
+          (still to land), so the assert here matches the C contract
+          exactly.
+
+      Public API forward decls added for the two `sqlite3WhereMalloc/
+      Realloc` entry points; `createMask` stays static (file-private).
+      None of these helpers are called by productive code yet
+      (WhereBegin still returns nil), so no observable behaviour change
+      in the corpus — full regression sweep stays green
+      (TestWhereBasic 52/52, TestWhereStructs 148/148,
+      TestPrepareBasic 20/20, TestParser 45/45, TestSchemaBasic 44/44,
+      TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+      TestExprBasic 40/40, TestInitCallback 29/29, TestExplainParity
+      unchanged at 2 PASS / 8 DIVERGE / 0 ERROR).  Together with the
+      WhereLoop primitives and the productive WhereEnd cleanup contract,
+      the prologue of `sqlite3WhereBegin` (where.c:6862..6940) can now
+      be ported as a faithful translation — every helper it calls
+      directly (`whereLoopInit`, `sqlite3WhereClauseInit`,
+      `sqlite3WhereSplit`, mask-set init, builder init) exists and is
+      tested.
+
+      **Discovery (signature drift to fix in next increment).**  Pascal's
+      `sqlite3WhereBegin` declaration at `passqlite3codegen.pas:1535` /
+      :4351 has 7 parameters (pParse, pTabList, pWhere, pOrderBy,
+      pDistinctSet, wctrlFlags, iAuxArg); upstream C
+      (`sqliteInt.h:5100`) has 8 — the missing parameter is `Select*
+      pSelect` between `pResultSet` and `wctrlFlags`.  Pascal's
+      `pDistinctSet` is also misnamed — it's the same slot as C's
+      `pResultSet`.  No callers exist yet (only declaration + stub +
+      one TODO comment at codegen.pas:5618), so rename and insertion
+      are mechanical.  Block this on the productive prologue port: the
+      port writes `pWInfo^.pSelect = pSelect`, so the parameter must
+      be present.
+
       **Remaining sub-task:** the actual productive WhereBegin
       single-table, single-rowid-EQ-predicate case + WhereEnd's
       loop-termination opcode emission (full description below).
