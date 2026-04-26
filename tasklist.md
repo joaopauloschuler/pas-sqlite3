@@ -20,6 +20,113 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 11b): port the three delete.c
+    DML-foundation helpers — `sqlite3SrcListLookup`,
+    `sqlite3CodeChangeCount`, `sqlite3IsReadOnly` (delete.c:31, 51,
+    119), plus the file-static `tabIsReadOnly` (delete.c:98).**
+    Replaces the `Phase 6.4 stub` bodies at
+    `passqlite3codegen.pas:5158..5176` with faithful structural ports.
+    Foundation for the structural `sqlite3Insert` / `sqlite3Update` /
+    `sqlite3DeleteFrom` ports that come next: every DML codegen
+    starts by calling `sqlite3SrcListLookup` to attach a real
+    `pSTab` + bump nTabRef, then calls `sqlite3IsReadOnly` to gate
+    writes, then (after VDBE setup) emits `sqlite3CodeChangeCount`
+    when `pParse->nested == 0`.
+
+    Concrete changes (all in `src/passqlite3codegen.pas`):
+      * `sqlite3SrcListLookup` — body uses `SrcListItems(pSrc)` to
+        get `pSrc^.a[0]`, calls existing `sqlite3LocateTableItem`
+        (with `flags=0` per C), frees any prior `pSTab` via
+        `sqlite3DeleteTable`, attaches the new `pTab`, sets
+        `fg.notCte`, bumps `nTabRef`, and runs the existing
+        `sqlite3IndexedByLookup` if `fg.isIndexedBy` is set.
+      * `sqlite3CodeChangeCount` — emits the byte-identical 4-op
+        sequence `OP_FkCheck` + `OP_ResultRow(regCounter, 1)` +
+        `sqlite3VdbeSetNumCols(v, 1)` +
+        `sqlite3VdbeSetColName(v, 0, COLNAME_NAME, zColName, SQLITE_STATIC)`.
+      * `tabIsReadOnly` (new file-static helper) — vtab arm is a
+        no-op TODO (see Discoveries); non-vtab path checks
+        `(tabFlags & (TF_Readonly | TF_Shadow))`, then for `TF_Readonly`
+        gates on `sqlite3WritableSchema(db) == 0 && pParse^.nested == 0`,
+        and for `TF_Shadow` returns `sqlite3ReadOnlyShadowTables(db)`.
+      * `sqlite3IsReadOnly` — calls `tabIsReadOnly` and emits the
+        verbatim error message `"table %s may not be modified"`,
+        then handles the `IsView(pTab)` arm (`eTabType = TABTYP_VIEW`)
+        with the verbatim `"cannot modify %s because it is a view"`
+        message, gated on `(pTrigger == nil) ||
+        ((pTrigger^.bReturning <> 0) && (pTrigger^.pNext = nil))`.
+
+    SrcItem fg-bit accessors (the C bitfield maps to four u8 sub-bytes
+    in `TSrcItemFg` — see codegen.pas:572):
+      * `fg.notIndexed`   = bit 0 of `fgBits`   (mask `$01`).
+      * `fg.isIndexedBy`  = bit 1 of `fgBits`   (mask `$02`).
+      * `fg.fromDDL`      = bit 0 of `fgBits2`  (mask `$01`).
+      * `fg.isCte`        = bit 1 of `fgBits2`  (mask `$02`).
+      * `fg.notCte`       = bit 2 of `fgBits2`  (mask `$04`).
+      * `fg.fixedSchema`  = bit 0 of `fgBits3`  (mask `$01`).
+
+    Tests: full build clean.  TestExplainParity unchanged at
+    **2 PASS / 8 DIVERGE / 0 ERROR** (expected — these helpers are
+    foundational scaffolding; nothing yet *calls* them productively
+    because `sqlite3Insert` / `sqlite3Update` / `sqlite3DeleteFrom`
+    are still Phase 6.4 stubs).  Verified by stash/build/diff
+    against pre-change baseline — identical per-row diverge output.
+    Regression spot check (2026-04-26): TestPrepareBasic 20/20,
+    TestParser 45/45, TestParserSmoke 20/20, TestSchemaBasic 44/44,
+    TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+    TestExprBasic 40/40, TestVdbeTxn 8/8, TestAuthBuiltins 34/34,
+    TestOpenClose 17/17, TestSmoke + TestUtil clean, TestJson
+    434/434, TestJsonEach 50/50, TestJsonRegister 48/48,
+    TestPrintf 105/105, TestVtab 216/216.
+
+    Discoveries / next-step notes:
+      * **Why three helpers in one sub-step.**  Each is a 4..15
+        line C body and they are all on the *same* call-path: the
+        first three lines of every DML codegen are
+        `sqlite3SrcListLookup` → `sqlite3IsReadOnly` →
+        `sqlite3BeginWriteOperation`.  Bundling them keeps the
+        commit reviewable while removing all three foundational
+        stubs in one pass.
+      * **vtab arm of `tabIsReadOnly` deferred.**  C `vtabIsReadOnly`
+        needs `sqlite3GetVTable(db, pTab)->pMod->pModule->xUpdate`
+        and the `eVtabRisk` / `SQLITE_TrustedSchema` gating.  Pulling
+        `passqlite3vtab` into codegen's implementation block was
+        explicitly avoided in step 11a (`tabIsVirtual` deferral
+        for the same reason).  Treated here as `Result := 0`
+        (writable) with a TODO; vtab DML is not exercised by the
+        current test corpus.
+      * **`fg.notCte = 1` written via raw bit-OR.**  The Pascal
+        `TSrcItemFg` is four `u8` fields; the C bitfield's bit-2
+        position inside `fgBits2` is documented above and matches
+        the order in the C `struct` declaration (sqliteInt.h:3360
+        — `notIndexed, isIndexedBy, ..., fromDDL, isCte, notCte,
+        ...`).  No existing call site cares about `notCte` yet
+        (it only matters for CTE matching during `pSelect`
+        resolution, Phase 7), so the OR is structurally correct
+        but observably inert today.
+      * **`sqlite3ErrorMsg` has no varargs in this port.**  The C
+        helper takes a printf-style format; the Pascal helper at
+        `passqlite3codegen.pas:2520` takes a single `PAnsiChar`.
+        The two error messages here use `AnsiString` concatenation
+        to substitute `pTab^.zName`, matching the existing pattern
+        from `sqlite3IndexedByLookup` (codegen:4752) and
+        `sqlite3CreateIndex` (codegen:5970/5972).  Switching to a
+        printf-style helper is a separate Phase 6.x cleanup and is
+        not required by any current test.
+      * **Next 6.9-bis target: step 11c — structural `sqlite3Insert`.**
+        With the three delete.c helpers in place, the next sub-step
+        is the structural skeleton of `sqlite3Insert` (insert.c:894)
+        covering only the simplest path: single-row VALUES, no
+        triggers, no view, no UPSERT, no IDLIST, no XFER opt.
+        Required upstream pieces: `sqlite3ExprCode` for VALUES
+        evaluation (still TODO per codegen:7538 — may need a
+        scoped/stub variant first that handles the literal cases
+        used by `sqlite3NestedParse` only), `OP_NewRowid`,
+        `OP_MakeRecord`, `OP_Insert`, plus the existing
+        `sqlite3OpenTable` + `sqlite3CodeChangeCount`.  This is
+        the actual DIVERGE-flipper for the CREATE TABLE / DROP
+        TABLE / CREATE INDEX rows in TestExplainParity.
+
   - **2026-04-26 — Phase 6.9-bis (step 11a): port `sqlite3OpenTable`
     (insert.c:26).**  Replaces the `Phase 6.4 stub` body at
     `passqlite3codegen.pas:5260` with a faithful structural port of

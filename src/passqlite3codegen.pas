@@ -5155,24 +5155,104 @@ end;
 // Phase 6.4 — delete.c
 // ===========================================================================
 
-{ sqlite3SrcListLookup — find Table* for first entry in SrcList (Phase 6.4 stub) }
+{ sqlite3SrcListLookup — port of delete.c:31.
+  Locate the Table* for the first entry of pSrc, attach it to pSrc->a[0].pSTab,
+  and bump its nTabRef.  Used by every DML codegen (INSERT/UPDATE/DELETE) to
+  resolve the target table after the parser has built a one-element SrcList. }
 function sqlite3SrcListLookup(pParse: PParse; pSrc: PSrcList): PTable2;
+var
+  pItem: PSrcItem;
+  pTab:  PTable2;
 begin
-  Result := nil; { Phase 6.5: schema lookup }
+  pItem := SrcListItems(pSrc);
+  pTab  := sqlite3LocateTableItem(pParse, 0, pItem);
+  if pItem^.pSTab <> nil then
+    sqlite3DeleteTable(pParse^.db, pItem^.pSTab);
+  pItem^.pSTab := pTab;
+  { fg.notCte = bit 2 of fgBits2 (after fromDDL=0, isCte=1). }
+  pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $04;
+  if pTab <> nil then begin
+    Inc(pTab^.nTabRef);
+    { fg.isIndexedBy = bit 1 of fgBits (after notIndexed=0). }
+    if ((pItem^.fg.fgBits and $02) <> 0)
+       and (sqlite3IndexedByLookup(pParse, pItem) <> 0) then
+      pTab := nil;
+  end;
+  Result := pTab;
 end;
 
-{ sqlite3CodeChangeCount — emit OP_MemMax to track changes (Phase 6.4 stub) }
+{ sqlite3CodeChangeCount — port of delete.c:51.
+  Emit byte-code that reports the number of rows modified by an
+  INSERT / UPDATE / DELETE statement.  Used by sqlite3Insert, sqlite3Update,
+  and sqlite3DeleteFrom when pParse->nested == 0 and ChangeCount tracking is on. }
 procedure sqlite3CodeChangeCount(v: PVdbe; regCounter: i32;
   zColName: PAnsiChar);
 begin
-  { Phase 6.5 }
+  sqlite3VdbeAddOp0(v, OP_FkCheck);
+  sqlite3VdbeAddOp2(v, OP_ResultRow, regCounter, 1);
+  sqlite3VdbeSetNumCols(v, 1);
+  sqlite3VdbeSetColName(v, 0, COLNAME_NAME, zColName, SQLITE_STATIC);
 end;
 
-{ sqlite3IsReadOnly — return 1 if pTab is read-only (Phase 6.4 stub) }
+{ tabIsReadOnly — port of delete.c:98 (file-static helper).
+  Returns 1 if pTab is a read-only system / shadow table for the current parse,
+  0 otherwise.  Virtual-table arm omitted in this port — vtab xUpdate gating
+  lands with the broader vtab DML path; for non-virtual tables (the common
+  case) the C semantics are reproduced byte-for-byte. }
+function tabIsReadOnly(pParse: PParse; pTab: PTable2): i32;
+var
+  db: PTsqlite3;
+begin
+  if pTab^.eTabType = TABTYP_VTAB then begin
+    { TODO(Phase 6.x): vtabIsReadOnly — needs sqlite3GetVTable + vtab risk
+      check (delete.c:77).  Treat as writable for now; vtab DML is not
+      exercised in the current corpus.  Avoids dragging passqlite3vtab into
+      codegen's implementation uses (same choice as step 11a's IsVirtual
+      assertion deferral). }
+    Result := 0;
+    Exit;
+  end;
+  if (pTab^.tabFlags and (TF_Readonly or TF_Shadow)) = 0 then begin
+    Result := 0;
+    Exit;
+  end;
+  db := pParse^.db;
+  if (pTab^.tabFlags and TF_Readonly) <> 0 then begin
+    if (sqlite3WritableSchema(db) = 0) and (pParse^.nested = 0) then
+      Result := 1
+    else
+      Result := 0;
+    Exit;
+  end;
+  { TF_Shadow path. }
+  Result := sqlite3ReadOnlyShadowTables(db);
+end;
+
+{ sqlite3IsReadOnly — port of delete.c:119.
+  Check that pTab is writable from the current parse.  Returns 1 (and emits an
+  error message) if pTab is a system / shadow / view target the caller may not
+  modify; returns 0 otherwise. }
 function sqlite3IsReadOnly(pParse: PParse; pTab: PTable2;
   pTrigger: PTrigger): i32;
 begin
-  Result := 0; { Phase 6.5 }
+  if tabIsReadOnly(pParse, pTab) <> 0 then begin
+    sqlite3ErrorMsg(pParse,
+      PAnsiChar(AnsiString('table ') + AnsiString(pTab^.zName) +
+                ' may not be modified'));
+    Result := 1;
+    Exit;
+  end;
+  if (pTab^.eTabType = TABTYP_VIEW)
+     and ((pTrigger = nil)
+          or ((pTrigger^.bReturning <> 0) and (pTrigger^.pNext = nil))) then
+  begin
+    sqlite3ErrorMsg(pParse,
+      PAnsiChar('cannot modify ' + AnsiString(pTab^.zName) +
+                ' because it is a view'));
+    Result := 1;
+    Exit;
+  end;
+  Result := 0;
 end;
 
 { sqlite3MaterializeView — store view into a temp table (Phase 6.4 stub) }
