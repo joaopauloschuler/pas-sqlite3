@@ -163,6 +163,262 @@ begin
     the "27/27 PASS" headline grows naturally to the new count. }
 end;
 
+{ ============================================================
+  Phase 6.bis.1c — constructor lifecycle (vtabCallConstructor +
+  sqlite3VtabCallConnect / _Create / _Destroy + growVTrans/addToVTrans).
+  ============================================================ }
+
+var
+  gConnectCount: i32;
+  gCreateCount:  i32;
+  gXDestroyCount: i32;     { distinct from Module's xDestroy = gDestroyCount }
+  gAllocVtabs:   array[0..15] of PSqlite3Vtab;
+  gAllocVtabN:   i32;
+  gFailNextConnect: i32;   { if 1, the next xConnect returns ERROR }
+  gSkipDeclare:  i32;      { if 1, the next xConnect skips bDeclared:=1 }
+
+procedure CtorTrackVtab(p: PSqlite3Vtab);
+begin
+  gAllocVtabs[gAllocVtabN] := p;
+  Inc(gAllocVtabN);
+end;
+
+function CtorXConnect(db: PTsqlite3; pAux: Pointer;
+  argc: i32; argv: PPAnsiChar; ppVtab: PPSqlite3Vtab;
+  pzErr: PPAnsiChar): i32; cdecl;
+var
+  v:    PSqlite3Vtab;
+  pCtx: PVtabCtx;
+begin
+  Inc(gConnectCount);
+  if gFailNextConnect = 1 then begin
+    gFailNextConnect := 0;
+    pzErr^ := nil;     { let the constructor synthesise a default message }
+    Result := SQLITE_ERROR;
+    Exit;
+  end;
+  GetMem(v, SizeOf(Tsqlite3_vtab));
+  FillChar(v^, SizeOf(Tsqlite3_vtab), 0);
+  CtorTrackVtab(v);
+  ppVtab^ := v;
+
+  if gSkipDeclare = 0 then begin
+    { Mirror sqlite3_declare_vtab's only side effect that Phase 6.bis.1c
+      actually depends on: flip the active VtabCtx's bDeclared bit so the
+      constructor doesn't reject us with "did not declare schema". }
+    pCtx := PVtabCtx(db^.pVtabCtx);
+    if pCtx <> nil then pCtx^.bDeclared := 1;
+  end else begin
+    gSkipDeclare := 0;
+  end;
+  Result := SQLITE_OK;
+end;
+
+function CtorXCreate(db: PTsqlite3; pAux: Pointer;
+  argc: i32; argv: PPAnsiChar; ppVtab: PPSqlite3Vtab;
+  pzErr: PPAnsiChar): i32; cdecl;
+begin
+  Inc(gCreateCount);
+  Result := CtorXConnect(db, pAux, argc, argv, ppVtab, pzErr);
+end;
+
+function CtorXDestroy(p: PSqlite3Vtab): i32; cdecl;
+begin
+  Inc(gXDestroyCount);
+  FreeMem(p);
+  Result := SQLITE_OK;
+end;
+
+function CtorXDisconnect(p: PSqlite3Vtab): i32; cdecl;
+begin
+  Inc(gDisconnectCount);
+  FreeMem(p);
+  Result := SQLITE_OK;
+end;
+
+{ Build a heap-allocated TTable in TABTYP_VTAB shape, install it into the
+  default schema's tblHash, and return it.  Caller is responsible for
+  removing it from the hash before close (vtabDisconnectAll deals with the
+  VTable chain; the Table itself is freed via sqlite3DeleteTable). }
+function CtorMakeTable(db: PTsqlite3;
+  const zName, zMod: AnsiString): TCgPTable;
+var
+  pTab:    TCgPTable;
+  azArg:   PPAnsiChar;
+  pSchemaT: TUtilPSchema;
+begin
+  pTab := TCgPTable(sqlite3MallocZero64(
+            SizeOf(passqlite3codegen.TTable)));
+  pTab^.zName    := sqlite3DbStrDup(db, PChar(zName));
+  pTab^.eTabType := passqlite3codegen.TABTYP_VTAB;
+  pTab^.nTabRef  := 1;
+  pSchemaT := TUtilPSchema(db^.aDb[0].pSchema);
+  pTab^.pSchema  := passqlite3codegen.PSchema(pSchemaT);
+
+  { azArg layout: [0]=module name, [1]=schema name (filled by ctor),
+                  [2]=table name. nArg=3. }
+  azArg := PPAnsiChar(sqlite3MallocZero64(SizeOf(Pointer) * 3));
+  azArg[0] := sqlite3DbStrDup(db, PChar(zMod));
+  azArg[1] := nil;
+  azArg[2] := sqlite3DbStrDup(db, PChar(zName));
+  pTab^.u.vtab.azArg := Pointer(azArg);
+  pTab^.u.vtab.nArg  := 3;
+
+  sqlite3HashInsert(@pSchemaT^.tblHash, PChar(pTab^.zName), pTab);
+  Result := pTab;
+end;
+
+procedure TestVtabCtor_Run(db: PTsqlite3);
+var
+  m:        Tsqlite3_module;
+  pMod:     PVtabModule;
+  pParse:   TCgPParse;
+  pTabA:    TCgPTable;
+  pTabB:    TCgPTable;
+  pVT:      PVTable;
+  rc:       i32;
+  zErr:     PAnsiChar;
+  pSchemaT: TUtilPSchema;
+  i:        i32;
+begin
+  WriteLn('TestVtab — Phase 6.bis.1c gate');
+  pSchemaT := TUtilPSchema(db^.aDb[0].pSchema);
+
+  { Module with all four constructor/destructor slots populated. }
+  FillChar(m, SizeOf(m), 0);
+  m.iVersion    := 1;
+  m.xCreate     := @CtorXCreate;
+  m.xConnect    := @CtorXConnect;
+  m.xDestroy    := @CtorXDestroy;
+  m.xDisconnect := @CtorXDisconnect;
+  pMod := sqlite3VtabCreateModule(db, 'ctormod', @m, nil, nil);
+  Expect(pMod <> nil, 'T23 register ctormod');
+
+  pParse := TCgPParse(sqlite3MallocZero64(SizeOf(TCgTParse)));
+  pParse^.db := db;
+
+  { ---- T24: sqlite3VtabCallConnect happy path ---- }
+  pTabA := CtorMakeTable(db, 'ct_a', 'ctormod');
+  gConnectCount := 0;
+  rc := sqlite3VtabCallConnect(pParse, pTabA);
+  ExpectEq(rc, SQLITE_OK, 'T24 VtabCallConnect ok');
+  ExpectEq(gConnectCount, 1, 'T24b xConnect fired once');
+  pVT := sqlite3GetVTable(db, pTabA);
+  Expect(pVT <> nil, 'T24c VTable linked into pTab');
+  if pVT <> nil then begin
+    ExpectEq(pVT^.nRef, 1, 'T24d nRef=1 after connect');
+    Expect(pVT^.pVtab <> nil, 'T24e pVtab non-nil');
+  end;
+  ExpectEq(db^.nVTrans, 0,
+    'T24f Connect path does NOT touch aVTrans (only Create does)');
+
+  { Calling Connect a second time on the same pTab is a no-op (returns OK
+    immediately because sqlite3GetVTable already finds it). }
+  gConnectCount := 0;
+  rc := sqlite3VtabCallConnect(pParse, pTabA);
+  ExpectEq(rc, SQLITE_OK, 'T25 second Connect = OK');
+  ExpectEq(gConnectCount, 0, 'T25b xConnect NOT re-fired');
+
+  { ---- T26: missing module → SQLITE_ERROR ---- }
+  pTabB := CtorMakeTable(db, 'ct_missing', 'no_such_module');
+  rc := sqlite3VtabCallConnect(pParse, pTabB);
+  ExpectEq(rc, SQLITE_ERROR, 'T26 missing module → ERROR');
+  Expect(sqlite3GetVTable(db, pTabB) = nil, 'T26b no VTable attached');
+  { Cleanup pTabB manually: yank from hash and free Table }
+  sqlite3HashInsert(@pSchemaT^.tblHash, PChar(pTabB^.zName), nil);
+  sqlite3VtabClear(db, pTabB);
+  sqlite3DbFree(db, pTabB^.zName);
+  sqlite3DbFree(db, pTabB);
+
+  { ---- T27: xConnect returns ERROR ---- }
+  pTabB := CtorMakeTable(db, 'ct_fail', 'ctormod');
+  zErr := nil;
+  gFailNextConnect := 1;
+  rc := sqlite3VtabCallConnect(pParse, pTabB);
+  ExpectEq(rc, SQLITE_ERROR, 'T27 xConnect ERROR propagates');
+  Expect(sqlite3GetVTable(db, pTabB) = nil,
+    'T27b error path leaves pTab^.u.vtab.p nil');
+  sqlite3HashInsert(@pSchemaT^.tblHash, PChar(pTabB^.zName), nil);
+  sqlite3VtabClear(db, pTabB);
+  sqlite3DbFree(db, pTabB^.zName);
+  sqlite3DbFree(db, pTabB);
+
+  { ---- T28: xConnect succeeds but does not declare schema ---- }
+  pTabB := CtorMakeTable(db, 'ct_nodecl', 'ctormod');
+  gSkipDeclare := 1;
+  rc := sqlite3VtabCallConnect(pParse, pTabB);
+  ExpectEq(rc, SQLITE_ERROR, 'T28 missing declare → ERROR');
+  Expect(sqlite3GetVTable(db, pTabB) = nil,
+    'T28b VTable unlocked when bDeclared stays 0');
+  sqlite3HashInsert(@pSchemaT^.tblHash, PChar(pTabB^.zName), nil);
+  sqlite3VtabClear(db, pTabB);
+  sqlite3DbFree(db, pTabB^.zName);
+  sqlite3DbFree(db, pTabB);
+
+  { ---- T29: sqlite3VtabCallCreate adds to aVTrans ---- }
+  CtorMakeTable(db, 'ct_cr1', 'ctormod');
+  zErr := nil;
+  rc := sqlite3VtabCallCreate(db, 0, 'ct_cr1', @zErr);
+  ExpectEq(rc, SQLITE_OK, 'T29 CallCreate ok');
+  ExpectEq(db^.nVTrans, 1, 'T29b aVTrans grown to 1');
+  Expect(db^.aVTrans <> nil, 'T29c aVTrans allocated');
+
+  { Add 6 more so we cross the ARRAY_INCR=5 boundary. }
+  for i := 2 to 7 do begin
+    CtorMakeTable(db, 'ct_cr' + AnsiString(IntToStr(i)), 'ctormod');
+    zErr := nil;
+    rc := sqlite3VtabCallCreate(db, 0,
+            PAnsiChar('ct_cr' + AnsiString(IntToStr(i))), @zErr);
+    ExpectEq(rc, SQLITE_OK,
+      'T30 CallCreate batch (' + AnsiString(IntToStr(i)) + ')');
+  end;
+  ExpectEq(db^.nVTrans, 7, 'T30b nVTrans = 7 after batch');
+
+  { ---- T31: sqlite3VtabCallDestroy on first-created table ---- }
+  gXDestroyCount := 0;
+  rc := sqlite3VtabCallDestroy(db, 0, 'ct_cr1');
+  ExpectEq(rc, SQLITE_OK, 'T31 CallDestroy ok');
+  ExpectEq(gXDestroyCount, 1, 'T31b xDestroy fired once');
+
+  { sqlite3VtabCallDestroy disconnects but leaves the Table in the schema
+    hash; DROP TABLE codegen is responsible for removing it (Phase 7).  We
+    only assert pTab^.u.vtab.p is now nil (the VTable was unlocked). }
+  pTabB := passqlite3codegen.sqlite3FindTable(db, 'ct_cr1', 'main');
+  Expect(pTabB <> nil, 'T31c Table still in schema (codegen removes it)');
+  if pTabB <> nil then
+    Expect(pTabB^.u.vtab.p = nil,
+      'T31d pTab^.u.vtab.p cleared after destroy');
+
+  { ---- Cleanup remaining tables and module before close ---- }
+  for i := 2 to 7 do begin
+    rc := sqlite3VtabCallDestroy(db, 0,
+            PAnsiChar('ct_cr' + AnsiString(IntToStr(i))));
+    ExpectEq(rc, SQLITE_OK,
+      'T32 cleanup destroy ' + AnsiString(IntToStr(i)));
+  end;
+  rc := sqlite3VtabCallDestroy(db, 0, 'ct_a');
+  { ct_a was Connect-only (not in aVTrans), but vtabDisconnectAll handles
+    that fine: it pops the lone VTable off pTab^.u.vtab.p, fires xDestroy. }
+  ExpectEq(rc, SQLITE_OK, 'T33 cleanup destroy ct_a');
+
+  { aVTrans bookkeeping is not auto-pruned by VtabCallDestroy — it just
+    drops the VTable from pTab; the slot in aVTrans still contains a
+    pointer to the freed VTable.  Per upstream this is cleaned up by
+    sqlite3VtabCommit/Rollback (Phase 6.bis.1d) which iterates aVTrans
+    after a transaction.  For this gate we accept the leaked slots and
+    zero db^.nVTrans manually so close() doesn't trip. }
+  db^.nVTrans := 0;
+  if db^.aVTrans <> nil then begin
+    sqlite3DbFree(db, db^.aVTrans);
+    db^.aVTrans := nil;
+  end;
+
+  rc := sqlite3_drop_modules(db, nil);
+  ExpectEq(rc, SQLITE_OK, 'T34 drop modules');
+
+  sqlite3DbFree(db, pParse);
+end;
+
 var
   db: PTsqlite3;
   rc: i32;
@@ -294,6 +550,9 @@ begin
 
   { ---- Phase 6.bis.1b — parser-hook leaf helpers ---- }
   TestVtabParser_Run(db);
+
+  { ---- Phase 6.bis.1c — constructor lifecycle ---- }
+  TestVtabCtor_Run(db);
 
   rc := sqlite3_close_v2(db);
   ExpectEq(rc, SQLITE_OK, 'T16 close_v2');

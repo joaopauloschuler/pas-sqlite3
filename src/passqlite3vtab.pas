@@ -52,13 +52,16 @@ unit passqlite3vtab;
 interface
 
 uses
+  SysUtils,
   Strings,
   passqlite3types,
-  passqlite3util;
+  passqlite3util,
+  passqlite3codegen;
 
 type
   { ----- sqlite.h:7663..7666 — opaque-by-name types ----- }
   PSqlite3Vtab        = ^Tsqlite3_vtab;
+  PPSqlite3Vtab       = ^PSqlite3Vtab;
   PSqlite3VtabCursor  = ^Tsqlite3_vtab_cursor;
   PSqlite3Module      = ^Tsqlite3_module;
   PSqlite3IndexInfo   = Pointer;       { full type lands with 6.bis.1c }
@@ -139,7 +142,7 @@ type
   { ----- vtab.c:24 — VtabCtx ----- }
   PVtabCtx = ^TVtabCtx;
   TVtabCtx = record
-    pVTable   : PVTable;
+    pVTbl   : PVTable;
     pTab      : Pointer;       { Table* — opaque here }
     pPrior    : PVtabCtx;
     bDeclared : i32;
@@ -192,6 +195,23 @@ procedure sqlite3VtabClear(db: PTsqlite3; pTab: Pointer);
 { Eponymous-table cleanup.  Stub for 6.bis.1a — full body in 6.bis.1f.
   Until then, no eponymous tables are ever created, so this is correct. }
 procedure sqlite3VtabEponymousTableClear(db: PTsqlite3; pMod: PVtabModule);
+
+{ ============================================================
+  Constructor lifecycle (Phase 6.bis.1c — vtab.c:557..968)
+  ============================================================ }
+
+{ Invoked by the parser to call the xConnect() method of pTab. (vtab.c:697) }
+function sqlite3VtabCallConnect(pParse: PParse; pTab: passqlite3codegen.PTable2): i32;
+
+{ Invoked by the VDBE to call xCreate of zTab in db. *pzErr returns an
+  English-language description on error.  Caller must sqlite3DbFree pzErr.
+  (vtab.c:770) }
+function sqlite3VtabCallCreate(db: PTsqlite3; iDb: i32; zTab: PAnsiChar;
+  pzErr: PPAnsiChar): i32;
+
+{ Invoked by the VDBE to call xDestroy on a DROP TABLE.  No-op if zTab is
+  not a virtual table.  (vtab.c:926) }
+function sqlite3VtabCallDestroy(db: PTsqlite3; iDb: i32; zTab: PAnsiChar): i32;
 
 implementation
 
@@ -461,6 +481,296 @@ begin
     end;
     sqlite3DbFree(Psqlite3db(db), azArg);
   end;
+end;
+
+{ ============================================================
+  Phase 6.bis.1c — Constructor lifecycle (vtab.c:557..968)
+  ============================================================ }
+
+type
+  { Faithful Pascal type for vtab.c:557 xConstruct callback. }
+  Tsqlite3_vtab_construct = function(db: PTsqlite3; pAux: Pointer;
+    argc: i32; argv: PPAnsiChar; ppVtab: PPSqlite3Vtab;
+    pzErr: PPAnsiChar): i32; cdecl;
+
+{ Build an error message via SysUtils.Format and return as a sqlite3DbMalloc
+  string.  Replacement for sqlite3MPrintf in the Phase 6.bis.1c code paths
+  (the printf-machinery sub-phase will replace these calls when it lands). }
+function vtabFmtMsg(db: PTsqlite3; const fmt: AnsiString;
+  const arg: AnsiString): PAnsiChar;
+var
+  s: AnsiString;
+  n: i32;
+  z: PAnsiChar;
+begin
+  s := SysUtils.Format(string(fmt), [string(arg)]);
+  n := Length(s);
+  z := PAnsiChar(sqlite3DbMalloc(Psqlite3db(db), n + 1));
+  if z = nil then begin Result := nil; Exit; end;
+  if n > 0 then Move(PAnsiChar(s)^, z^, n);
+  z[n] := #0;
+  Result := z;
+end;
+
+{ vtab.c:557 — invoke xCreate or xConnect on pTab.  *pzErr is heap-allocated
+  on error and the caller must sqlite3DbFree it. }
+function vtabCallConstructor(db: PTsqlite3; pTab: passqlite3codegen.PTable2;
+  pMod: PVtabModule;
+  xConstruct: Tsqlite3_vtab_construct;
+  pzErr: PPAnsiChar): i32;
+var
+  sCtx:        TVtabCtx;
+  pCtx:        PVtabCtx;
+  pVTbl:     PVTable;
+  rc, iDb:     i32;
+  azArg:       PPAnsiChar;
+  nArg:        i32;
+  zErr:        PAnsiChar;
+  zModuleName: PAnsiChar;
+begin
+  Assert(pTab <> nil, 'vtabCallConstructor pTab nil');
+  Assert(pTab^.eTabType = passqlite3codegen.TABTYP_VTAB,
+    'vtabCallConstructor: not a vtab');
+  azArg := PPAnsiChar(pTab^.u.vtab.azArg);
+  nArg  := pTab^.u.vtab.nArg;
+  zErr  := nil;
+
+  { Recursion guard (vtab.c:578) }
+  pCtx := PVtabCtx(db^.pVtabCtx);
+  while pCtx <> nil do begin
+    if PtrUInt(pCtx^.pTab) = PtrUInt(pTab) then begin
+      pzErr^ := vtabFmtMsg(db, 'vtable constructor called recursively: %s',
+                           AnsiString(pTab^.zName));
+      Result := SQLITE_LOCKED;
+      Exit;
+    end;
+    pCtx := pCtx^.pPrior;
+  end;
+
+  zModuleName := sqlite3DbStrDup(Psqlite3db(db), PChar(pTab^.zName));
+  if zModuleName = nil then begin
+    Result := SQLITE_NOMEM;
+    Exit;
+  end;
+
+  pVTbl := PVTable(sqlite3MallocZero64(SizeOf(TVTable)));
+  if pVTbl = nil then begin
+    sqlite3OomFault(Psqlite3db(db));
+    sqlite3DbFree(Psqlite3db(db), zModuleName);
+    Result := SQLITE_NOMEM;
+    Exit;
+  end;
+  pVTbl^.db        := db;
+  pVTbl^.pMod      := pMod;
+  pVTbl^.eVtabRisk := SQLITE_VTABRISK_Normal;
+
+  iDb := passqlite3codegen.sqlite3SchemaToIndex(db, pTab^.pSchema);
+  azArg[1] := db^.aDb[iDb].zDbSName;
+
+  { Push a new VtabCtx on db^.pVtabCtx and call the constructor. }
+  Assert(@xConstruct <> nil, 'vtabCallConstructor xConstruct nil');
+  sCtx.pTab      := pTab;
+  sCtx.pVTbl   := pVTbl;
+  sCtx.pPrior    := PVtabCtx(db^.pVtabCtx);
+  sCtx.bDeclared := 0;
+  db^.pVtabCtx   := @sCtx;
+  Inc(pTab^.nTabRef);
+  rc := xConstruct(db, pMod^.pAux, nArg, azArg, @pVTbl^.pVtab, @zErr);
+  Assert(pTab <> nil, 'vtab pTab vanished');
+  Assert((pTab^.nTabRef > 1) or (rc <> SQLITE_OK),
+         'vtabCallConstructor nTabRef invariant');
+  passqlite3codegen.sqlite3DeleteTable(db, pTab);
+  db^.pVtabCtx := sCtx.pPrior;
+  if rc = SQLITE_NOMEM then sqlite3OomFault(Psqlite3db(db));
+  Assert(sCtx.pTab = pTab, 'sCtx.pTab corrupt');
+
+  if rc <> SQLITE_OK then begin
+    if zErr = nil then
+      pzErr^ := vtabFmtMsg(db, 'vtable constructor failed: %s',
+                           AnsiString(zModuleName))
+    else begin
+      pzErr^ := vtabFmtMsg(db, '%s', AnsiString(zErr));
+      sqlite3DbFree(Psqlite3db(db), zErr);
+    end;
+    sqlite3DbFree(Psqlite3db(db), pVTbl);
+  end else if pVTbl^.pVtab <> nil then begin
+    { Successful construct: zero the sqlite3_vtab[0], link onto the chain,
+      bump module nRefModule and pVTbl nRef. }
+    FillChar(pVTbl^.pVtab^, SizeOf(Tsqlite3_vtab), 0);
+    pVTbl^.pVtab^.pModule := pMod^.pModule;
+    Inc(pMod^.nRefModule);
+    pVTbl^.nRef := 1;
+    if sCtx.bDeclared = 0 then begin
+      pzErr^ := vtabFmtMsg(db,
+        'vtable constructor did not declare schema: %s',
+        AnsiString(zModuleName));
+      sqlite3VtabUnlock(pVTbl);
+      rc := SQLITE_ERROR;
+    end else begin
+      { Link the new VTable into pTab^.u.vtab.p (head insertion). }
+      pVTbl^.pNext   := pTab^.u.vtab.p;
+      pTab^.u.vtab.p   := pVTbl;
+      { vtab.c:653..682 hidden-column scan: skipped here.  pTab^.aCol is
+        normally populated only after sqlite3_declare_vtab() has run; the
+        declare-vtab path lands with 6.bis.1e and re-introduces the scan
+        when the printf machinery is wired.  For non-declared schemas
+        (nCol=0) the upstream loop is a no-op anyway. }
+    end;
+  end;
+
+  sqlite3DbFree(Psqlite3db(db), zModuleName);
+  Result := rc;
+end;
+
+function sqlite3VtabCallConnect(pParse: PParse;
+  pTab: passqlite3codegen.PTable2): i32;
+var
+  db:    PTsqlite3;
+  zMod:  PAnsiChar;
+  pMod:  PVtabModule;
+  rc:    i32;
+  zErr:  PAnsiChar;
+  azArg: PPAnsiChar;
+begin
+  db := pParse^.db;
+  Assert(pTab <> nil, 'sqlite3VtabCallConnect pTab nil');
+  Assert(pTab^.eTabType = passqlite3codegen.TABTYP_VTAB,
+    'sqlite3VtabCallConnect: not a vtab');
+  if sqlite3GetVTable(db, pTab) <> nil then begin
+    Result := SQLITE_OK; Exit;
+  end;
+
+  azArg := PPAnsiChar(pTab^.u.vtab.azArg);
+  zMod  := azArg[0];
+  pMod  := PVtabModule(sqlite3HashFind(@db^.aModule, PChar(zMod)));
+
+  if pMod = nil then begin
+    sqlite3ErrorMsg(pParse, PAnsiChar(AnsiString('no such module')));
+    rc := SQLITE_ERROR;
+  end else begin
+    zErr := nil;
+    rc := vtabCallConstructor(db, pTab, pMod,
+            Tsqlite3_vtab_construct(pMod^.pModule^.xConnect), @zErr);
+    if rc <> SQLITE_OK then begin
+      sqlite3ErrorMsg(pParse, PAnsiChar(AnsiString('vtable connect failed')));
+      pParse^.rc := rc;
+    end;
+    sqlite3DbFree(Psqlite3db(db), zErr);
+  end;
+  Result := rc;
+end;
+
+{ vtab.c:733 — grow db^.aVTrans by ARRAY_INCR slots when full. }
+function growVTrans(db: PTsqlite3): i32;
+const
+  ARRAY_INCR = 5;
+var
+  nBytes:  i64;
+  aVTrans: ^Pointer;
+begin
+  if (db^.nVTrans mod ARRAY_INCR) = 0 then begin
+    nBytes := i64(SizeOf(Pointer)) * (i64(db^.nVTrans) + ARRAY_INCR);
+    aVTrans := sqlite3DbRealloc(Psqlite3db(db), db^.aVTrans, u64(nBytes));
+    if aVTrans = nil then begin
+      Result := SQLITE_NOMEM; Exit;
+    end;
+    FillChar((PByte(aVTrans) + i64(SizeOf(Pointer)) * db^.nVTrans)^,
+             SizeOf(Pointer) * ARRAY_INCR, 0);
+    db^.aVTrans := aVTrans;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ vtab.c:756 — append pVTab to db^.aVTrans (caller has growVTrans'd). }
+procedure addToVTrans(db: PTsqlite3; pVTab: PVTable);
+var
+  slot: PPointer;
+begin
+  slot := PPointer(PByte(db^.aVTrans) + i64(SizeOf(Pointer)) * db^.nVTrans);
+  slot^ := pVTab;
+  Inc(db^.nVTrans);
+  sqlite3VtabLock(pVTab);
+end;
+
+function sqlite3VtabCallCreate(db: PTsqlite3; iDb: i32; zTab: PAnsiChar;
+  pzErr: PPAnsiChar): i32;
+var
+  rc:   i32;
+  pTab: passqlite3codegen.PTable2;
+  pMod: PVtabModule;
+  zMod: PAnsiChar;
+  pVT:  PVTable;
+begin
+  rc   := SQLITE_OK;
+  pTab := passqlite3codegen.sqlite3FindTable(db, zTab,
+            db^.aDb[iDb].zDbSName);
+  Assert((pTab <> nil) and (pTab^.eTabType = passqlite3codegen.TABTYP_VTAB)
+    and (pTab^.u.vtab.p = nil),
+    'sqlite3VtabCallCreate preconditions violated');
+
+  zMod := PPAnsiChar(pTab^.u.vtab.azArg)[0];
+  pMod := PVtabModule(sqlite3HashFind(@db^.aModule, PChar(zMod)));
+
+  if (pMod = nil) or (pMod^.pModule^.xCreate = nil)
+     or (not Assigned(pMod^.pModule^.xDestroy)) then begin
+    pzErr^ := vtabFmtMsg(db, 'no such module: %s', AnsiString(zMod));
+    rc := SQLITE_ERROR;
+  end else begin
+    rc := vtabCallConstructor(db, pTab, pMod,
+            Tsqlite3_vtab_construct(pMod^.pModule^.xCreate), pzErr);
+  end;
+
+  if rc = SQLITE_OK then begin
+    pVT := sqlite3GetVTable(db, pTab);
+    if pVT <> nil then begin
+      rc := growVTrans(db);
+      if rc = SQLITE_OK then addToVTrans(db, pVT);
+    end;
+  end;
+  Result := rc;
+end;
+
+function sqlite3VtabCallDestroy(db: PTsqlite3; iDb: i32; zTab: PAnsiChar): i32;
+var
+  rc:       i32;
+  pTab:     passqlite3codegen.PTable2;
+  p:        PVTable;
+  xDestroy: function(p: PSqlite3Vtab): i32; cdecl;
+begin
+  rc   := SQLITE_OK;
+  pTab := passqlite3codegen.sqlite3FindTable(db, zTab,
+            db^.aDb[iDb].zDbSName);
+  if (pTab <> nil)
+     and (pTab^.eTabType = passqlite3codegen.TABTYP_VTAB)
+     and (pTab^.u.vtab.p <> nil)
+  then begin
+    { No outstanding cursors? }
+    p := pTab^.u.vtab.p;
+    while p <> nil do begin
+      Assert(p^.pVtab <> nil, 'VTable.pVtab nil');
+      if p^.pVtab^.nRef > 0 then begin
+        Result := SQLITE_LOCKED; Exit;
+      end;
+      p := p^.pNext;
+    end;
+
+    p        := vtabDisconnectAll(db, pTab);
+    xDestroy := PVtabModule(p^.pMod)^.pModule^.xDestroy;
+    if not Assigned(xDestroy) then
+      xDestroy := PVtabModule(p^.pMod)^.pModule^.xDisconnect;
+    Assert(Assigned(xDestroy), 'sqlite3VtabCallDestroy xDestroy nil');
+    Inc(pTab^.nTabRef);
+    rc := xDestroy(p^.pVtab);
+    if rc = SQLITE_OK then begin
+      Assert((pTab^.u.vtab.p = p) and (p^.pNext = nil),
+        'sqlite3VtabCallDestroy chain invariant');
+      p^.pVtab     := nil;
+      pTab^.u.vtab.p := nil;
+      sqlite3VtabUnlock(p);
+    end;
+    passqlite3codegen.sqlite3DeleteTable(db, pTab);
+  end;
+  Result := rc;
 end;
 
 procedure sqlite3VtabEponymousTableClear(db: PTsqlite3; pMod: PVtabModule);

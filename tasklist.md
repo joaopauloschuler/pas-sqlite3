@@ -20,6 +20,47 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-25 — Phase 6.bis.1c vtab.c constructor lifecycle.**
+    Replaced the deferred constructor-lifecycle TODOs in
+    `passqlite3vtab.pas` with faithful ports of vtab.c:557..968:
+    `vtabCallConstructor` (static), `sqlite3VtabCallConnect`,
+    `sqlite3VtabCallCreate`, `sqlite3VtabCallDestroy`, `growVTrans`
+    (static), `addToVTrans` (static).  Wires through the existing
+    `db^.aVTrans / nVTrans` slots in `Tsqlite3` (already there since
+    Phase 8.1).  A local `vtabFmtMsg` shim stands in for the still-
+    unported `sqlite3MPrintf` — uses `SysUtils.Format` to build error
+    strings and returns a `sqlite3DbMalloc`'d copy.  Gate
+    `src/tests/TestVtab.pas` extended with T23..T34 covering happy-
+    path Connect, repeat-Connect no-op, missing module, xConnect
+    error, missing schema declaration, Create+aVTrans growth across
+    the ARRAY_INCR=5 boundary (7 tables), and Destroy-disconnects-
+    but-leaves-Table-in-schema.  **76/76 PASS** (was 39/39).  No
+    regressions in the other 40 gates (TestSmoke, TestOSLayer, TestUtil,
+    TestPCache, TestPagerCompat, TestBtreeCompat, TestVdbe* ×14,
+    TestTokenizer, TestParserSmoke, TestParser, TestWalker,
+    TestExprBasic, TestWhereBasic, TestSelectBasic, TestAuthBuiltins,
+    TestDMLBasic, TestSchemaBasic, TestWindowBasic, TestOpenClose,
+    TestPrepareBasic, TestRegistration, TestConfigHooks,
+    TestInitShutdown, TestExecGetTable, TestBackup, TestUnlockNotify,
+    TestLoadExt).
+
+    Discoveries / dependencies (full list in the 6.bis.1c task entry
+    below):
+      * `sqlite3MPrintf` blocker remains — a printf sub-phase will
+        replace `vtabFmtMsg` here, in 6.bis.1b's `init.busy=0`
+        branch, in 7.2e error-message TODOs, and in `sqlite3_errmsg`
+        promotion (Phase 8.6 deferred note).
+      * Hidden-column type-string scan (vtab.c:653..682) is skipped
+        until `sqlite3_declare_vtab` (6.bis.1e) populates pTab^.aCol.
+        For our nCol=0 gate this is a no-op, but the scan must be
+        restored when 6.bis.1e lands.
+      * `aVTrans` pruning is sqlite3VtabSync/Commit/Rollback's job
+        (6.bis.1d): VtabCallDestroy intentionally leaves stale slots.
+      * Pitfall: `pVTable` local-var name collides with the unit's
+        `PVTable` type (case-insensitive).  Rename to `pVTbl`; mirror
+        the same rename for the field `TVtabCtx.pVTable` (no external
+        users).
+
   - **2026-04-25 — Phase 6.bis.1b vtab.c parser-side hooks.**  Replaced
     the one-line TODO stubs in `passqlite3parser.pas` for
     `sqlite3VtabBeginParse / _FinishParse / _ArgInit / _ArgExtend` with
@@ -2342,10 +2383,76 @@ Phase 5.9 depends on this being done first.
         memory for any future test that needs to peek into TParse
         / TTable directly.
 
-  - [ ] **6.bis.1c** Constructor lifecycle: vtabCallConstructor,
+  - [X] **6.bis.1c** Constructor lifecycle: vtabCallConstructor,
     sqlite3VtabCallCreate, sqlite3VtabCallConnect, sqlite3VtabCallDestroy,
-    growVTrans, addToVTrans (vtab.c:557..968).  Adds the missing
-    transaction-list machinery (`db^.aVTrans`, `db^.nVTrans`).
+    growVTrans, addToVTrans (vtab.c:557..968).  DONE 2026-04-25.
+    All five entry points now live in `src/passqlite3vtab.pas` (interface
+    extended; static helpers `vtabCallConstructor / growVTrans /
+    addToVTrans` + `vtabFmtMsg` printf-shim live in the implementation
+    section).  `growVTrans` / `addToVTrans` use the existing
+    `db^.nVTrans / aVTrans` slots in `Tsqlite3` (already declared in
+    `passqlite3util.pas:496..499`).  Gate `src/tests/TestVtab.pas`
+    extended with T23..T34 — **76/76 PASS** (was 39/39).  No regressions
+    across the 41 other gates listed in build.sh.
+
+    Discoveries / dependencies for next sub-phases:
+
+      * **`sqlite3MPrintf` is still not ported** (Phase-7-ish printf
+        sub-phase).  This sub-phase needs it for four error-message
+        slots: "vtable constructor called recursively: %s",
+        "vtable constructor failed: %s", "%s" passthrough, and "vtable
+        constructor did not declare schema: %s".  Workaround: a
+        local `vtabFmtMsg` helper using `SysUtils.Format` returns a
+        `sqlite3DbMalloc`'d copy.  Replace with sqlite3MPrintf when
+        the printf machinery lands.
+
+      * **Hidden-column post-scan (vtab.c:653..682)** — the loop that
+        rewrites column types containing the literal `hidden` token —
+        is intentionally skipped.  pTab^.aCol is normally only
+        populated by the parser via `sqlite3_declare_vtab`, which is
+        Phase 6.bis.1e.  When that lands, restore the scan and add a
+        gate.  For nCol=0 (the case our gate exercises) the upstream
+        loop is a no-op, so the omission is observably correct today.
+
+      * **Test pattern: bDeclared shim**.  `sqlite3_declare_vtab` is
+        Phase 6.bis.1e but the constructor refuses to attach a VTable
+        unless `sCtx.bDeclared = 1`.  TestVtabCtor's xConnect therefore
+        flips the bit directly via `db^.pVtabCtx^.bDeclared := 1` —
+        equivalent to what declare_vtab does.  When 6.bis.1e lands,
+        switch this to a real declare_vtab call.
+
+      * **aVTrans pruning is the next sub-phase's job**.
+        sqlite3VtabCallDestroy disconnects the VTable from the Table
+        but does NOT remove the corresponding slot in `db^.aVTrans`.
+        Per upstream, that slot is repaired only when sqlite3VtabSync
+        / Commit / Rollback (6.bis.1d) iterates aVTrans after a
+        transaction.  Gate manually zeros nVTrans + frees aVTrans
+        before close to avoid a stale-pointer trip in close_v2.
+
+      * **sqlite3VtabCallDestroy does not remove pTab from the
+        schema hash**.  Confirmed: vtab.c:956 only does
+        `sqlite3DeleteTable(db, pTab)` (decrements nTabRef from 2→1
+        in our flow; 1→0 happens in DROP TABLE codegen which calls
+        sqlite3DeleteTable a second time after unlinking from the
+        hash).  Gate T31c was originally wrong (expected the table
+        gone); now asserts pTab^.u.vtab.p is nil and the Table
+        remains in the schema — matching upstream.
+
+      * **Pascal pitfall: var name vs type name.** A local
+        `pVTable: PVTable` triggers FPC "Error in type definition"
+        because the parameter and type are the same identifier
+        modulo case.  Workaround in this unit: rename to `pVTbl`
+        (and update `TVtabCtx.pVTable` field accordingly — no
+        external users today).  Mirrors the recurring memory
+        feedback for vtab.c-area work.
+
+      * **CtorXConnect/CtorXCreate allocate sqlite3_vtab via FPC
+        GetMem**, not sqlite3_malloc.  In the test xDestroy/xDisconnect
+        FreeMem to balance.  A real vtab module must use sqlite3_malloc
+        (so the constructor's eventual sqlite3DbFree-of-the-VTable
+        doesn't double-free) — the test's pattern is intentional and
+        matches what dbpage.c / dbstat.c / carray.c will do in
+        6.bis.2.
 
   - [ ] **6.bis.1d** Per-statement hooks: sqlite3VtabSync, _Rollback,
     _Commit, _Begin, _Savepoint, callFinaliser (vtab.c:970..1151).
