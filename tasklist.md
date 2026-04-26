@@ -20,6 +20,62 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.8.h.4 JSON aggregates.**  Lands the
+    `json_group_array` / `json_group_object` aggregate SQL surface,
+    closing the deferred 6.8.h.4 slot.  Seven new public cdecl entry
+    points in `passqlite3json.pas` (`jsonArrayStep`, `jsonArrayValue`,
+    `jsonArrayFinal`, `jsonObjectStep`, `jsonObjectValue`,
+    `jsonObjectFinal`, `jsonGroupInverse`) plus two private drivers
+    (`jsonArrayCompute`, `jsonObjectCompute`) that share the
+    Final/Value branching.  All four entry points hang off the existing
+    `sqlite3_aggregate_context` plumbing in `passqlite3vdbe`; the
+    aggregate state is a `TJsonString` accumulator that records the
+    comma-separated body and is closed/trimmed on Final/Value.
+
+    Concrete changes:
+      * `src/passqlite3json.pas` — adds 7 cdecl entries in interface
+        + ~210 lines of impl.
+      * `src/tests/TestJson.pas` — adds `SetupAggCtx` helper, two
+        small `CallStep1/2` invokers, and three test bodies
+        (`TestJsonGroupArray`, `TestJsonGroupInverse`,
+        `TestJsonGroupObject`).  T423..T435 (13 new asserts).
+        **434/434 PASS** (was 421/421).
+      * Regression spot check: TestPrintf 105/105, TestVtab 216/216,
+        TestParser 45/45, TestSchemaBasic 44/44, TestVdbeApi 57/57.
+
+    Discoveries / next-step notes:
+      * **`{...}` doc comments containing literal `{` / `}` chars
+        confuse FPC's nested-comment tracker.**  `'{'` inside a
+        `{ ... }` block opens level-2; the matching `'}'` closes it,
+        leaving the outer comment unterminated until the next `}` —
+        which can be many lines later, swallowing real code.
+        Switched the affected doc comments to `(* ... *)`.  Same
+        risk surfaces anywhere a future port wants to embed JSON
+        bracket characters in a doc comment — porting-rule below.
+      * **Aggregate test fabrication needs `ctx.pMem`.**  Added
+        `SetupAggCtx` that wires a separate `TMem` into `ctx.pMem`
+        so `sqlite3_aggregate_context` can clear-and-resize it via
+        `sqlite3DbMallocRaw(nil, ...)` (which falls through to libc
+        in this port).  Generalisation of the Phase 6.8.g `SetupCtx`
+        helper.
+      * **Pascal `'\'` is an unterminated string literal** — use
+        `#$5C` for a backslash byte (in `jsonGroupInverse`'s skip-
+        escape branch).  Same family as 6.8.d / 6.8.e escape traps;
+        already in the porting-rule list.
+      * **No RCStr means TRANSIENT-copy on text result.**  Same
+        two-site fix as 6.8.h.1 / 6.8.g — when sqlite3RCStr lands
+        in 6.8.h.6, swap `sqlite3_result_text(..., TRANSIENT)` and
+        the `sqlite3_free(pStr^.zBuf)` cleanup back to
+        `sqlite3RCStrUnref` ownership transfer.
+      * **`pUserData` JSON_BLOB flag still inert in tests.**  The
+        fabricated context has no TFuncDef, so `sqlite3_user_data`
+        returns nil → flags=0 → text path always taken.  Both
+        BLOB arms in `jsonArrayCompute` / `jsonObjectCompute` are
+        wired and structurally identical to C; coverage deferred
+        to 6.8.h.6 with the registration-layer pUserData wiring
+        (same deferral rationale as 6.8.h.3's `JSON_ISSET` /
+        `JSON_AINS`).
+
   - **2026-04-26 — Phase 6.8.h.3 JSON path-driven scalars.**  Lands
     the SQL surface for `json_extract`, `json_set`, `json_replace`,
     `json_insert`, `json_array_insert`, `json_remove`, and
@@ -4024,8 +4080,71 @@ reference exactly.
           malformed registration.  Belt-and-braces, removable
           when the registration chunk pins argc to 2 in
           `TFuncDef`.
-    - [ ] **6.8.h.4** Aggregates — `json_group_array`,
+    - [X] **6.8.h.4** Aggregates — `json_group_array`,
       `json_group_object` (step / value / final / inverse).
+      DONE 2026-04-26.  Gate `TestJson.pas` 434/434 PASS (was
+      421/421).  13 new asserts T423..T435.  Regression spot check:
+      TestPrintf 105/105, TestVtab 216/216, TestParser 45/45,
+      TestSchemaBasic 44/44, TestVdbeApi 57/57.
+
+      Concrete changes:
+        * `src/passqlite3json.pas` — adds 7 cdecl entry points to
+          interface (`jsonArrayStep`, `jsonArrayValue`,
+          `jsonArrayFinal`, `jsonObjectStep`, `jsonObjectValue`,
+          `jsonObjectFinal`, `jsonGroupInverse`).  Implementation
+          ~210 lines: shared `jsonArrayCompute` / `jsonObjectCompute`
+          drivers, `jsonGroupInverse` first-element trimmer.
+        * `src/tests/TestJson.pas` — adds `SetupAggCtx` helper plus
+          `CallStep1` / `CallStep2` invokers; three new test bodies
+          (`TestJsonGroupArray`, `TestJsonGroupInverse`,
+          `TestJsonGroupObject`).
+
+      Discoveries / next-step notes:
+        * **Aggregate context buffer is allocated by
+          `sqlite3_aggregate_context` into `pCtx^.pMem^.z`** via
+          `sqlite3VdbeMemClearAndResize` → `sqlite3DbMallocRaw`.
+          With `pMem^.db = nil` the malloc falls through to libc;
+          tests rely on this to fabricate aggregate state without a
+          live VM.  The buffer is zeroed on first allocation, so
+          `pStr^.zBuf == nil` cleanly distinguishes the first Step
+          from subsequent ones (mirrors C).
+        * **`jsonStringInit` plants `pStr^.zBuf := @pStr^.zSpace[0]`**
+          — that pointer is *into* the aggregate-owned buffer.  As
+          long as the buffer never moves (sqlite3_aggregate_context
+          only ever allocates once), the pointer stays valid across
+          Step calls.  If a future RCStr-aware spill grows zBuf onto
+          the heap, the inline pointer is replaced — also fine.  The
+          dangerous case would be re-running `sqlite3VdbeMemGrow` on
+          `pAggMem` between Steps; sqlite3_aggregate_context never
+          does that, but worth flagging if 6.8.h.5/h.6 plumb a
+          different aggregator path.
+        * **No sqlite3RCStr means non-static spill is freed with
+          `sqlite3_free`, not `sqlite3RCStrUnref`.**  The C `if
+          (!pStr->bStatic) sqlite3RCStrUnref(pStr->zBuf)` in the
+          JSON_BLOB final arm becomes `if pStr^.bStatic = 0 then
+          sqlite3_free(pStr^.zBuf)`.  Same two-site swap as 6.8.h.1
+          / 6.8.g — flip both back to RCStr when 6.8.h.6 ports it.
+        * **Result text emitted as TRANSIENT (extra copy).**  C
+          hands ownership to `sqlite3_result_text` with an
+          `sqlite3RCStrUnref` destructor; absent that, the Pascal
+          port copies via TRANSIENT and calls `jsonStringReset` to
+          free the spill.  Only meaningful for huge groups —
+          functionally identical, costs one extra memcpy of the
+          finalised body.  Same rationale and fix-site as
+          `jsonReturnString` (6.8.h.1).
+        * **`jsonStringTrimOneChar` is the resume invariant.**  The
+          C `Value` path appends `'}'` / `']'`, returns text, then
+          re-trims so the next `Step` sees the body sans terminator.
+          T426/T427 and T434/T435 pin this end-to-end (Value mid-
+          stream, then a fresh Step extends the same accumulator).
+        * **`jsonGroupInverse` `\` skip uses `#$5C`.**  Pascal's
+          `'\'` is an unterminated string literal; emit the
+          backslash byte via `#$5C` instead.  Same family as the
+          escape-decoding traps in 6.8.d/e.
+        * **NULL-key in `jsonObjectStep` skips the row entirely** —
+          mirrors C's `(pStr->nUsed>1 && z!=0)` separator guard plus
+          the `if (z!=0)` wrap around the name/colon/value triple.
+          T433 covers the mid-aggregate skip case.
     - [ ] **6.8.h.5** Virtual tables — `json_each`, `json_tree`
       (xConnect/Disconnect/Open/Close/Filter/Next/Eof/Column/Rowid
       /BestIndex).  Big chunk; needs vtab module shape from earlier

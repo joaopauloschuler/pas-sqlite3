@@ -588,6 +588,34 @@ procedure jsonReplaceFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl
 procedure jsonSetFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 procedure jsonPatchFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 
+{ ===========================================================================
+  Phase 6.8.h.4 — Aggregate SQL functions
+
+    json_group_array(VALUE)        — JSON array of all stepped values.
+    json_group_object(NAME, VALUE) — JSON object of all stepped name/value
+                                     pairs.
+
+  All four entry points (Step / Final / Value / Inverse) share an
+  aggregate context allocated via sqlite3_aggregate_context; that
+  context is a TJsonString accumulator that records the comma-separated
+  body up to (but not including) the final closing bracket.
+  Final/Value closes the bracket, terminates, and emits the result;
+  Value preserves the trailing-bracket-trim invariant so the next
+  Step can resume.
+  Inverse strips the first element by scanning forward to the first
+  comma not inside a string or sub-container.
+
+  flags from sqlite3_user_data: JSON_BLOB switches the result to JSONB.
+  =========================================================================== }
+
+procedure jsonArrayStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+procedure jsonArrayValue(pCtx: Psqlite3_context); cdecl;
+procedure jsonArrayFinal(pCtx: Psqlite3_context); cdecl;
+procedure jsonObjectStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+procedure jsonObjectValue(pCtx: Psqlite3_context); cdecl;
+procedure jsonObjectFinal(pCtx: Psqlite3_context); cdecl;
+procedure jsonGroupInverse(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+
 implementation
 
 uses
@@ -4787,6 +4815,247 @@ begin
     jsonParseFree(pPatch);
   end;
   jsonParseFree(pTarget);
+end;
+
+{ ===========================================================================
+  Phase 6.8.h.4 — Aggregate SQL function implementations
+  =========================================================================== }
+
+{ json.c:4829 — json_group_array(VALUE) Step.
+
+  The aggregate context is a zero-initialised TJsonString.  On the first
+  call zBuf is nil so we run jsonStringInit (which points zBuf at the
+  inline zSpace[]) and seed the buffer with '['.  On every subsequent
+  call we drop a ',' separator (provided we already have payload past
+  the leading '[' — i.e. nUsed>1) before appending the new value. }
+procedure jsonArrayStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pStr: PJsonString;
+begin
+  pStr := PJsonString(sqlite3_aggregate_context(pCtx, SizeOf(TJsonString)));
+  if pStr = nil then Exit;
+  if pStr^.zBuf = nil then
+  begin
+    jsonStringInit(pStr, pCtx);
+    jsonAppendChar(pStr, '[');
+  end
+  else if pStr^.nUsed > 1 then
+    jsonAppendChar(pStr, ',');
+  pStr^.pCtx := pCtx;
+  jsonAppendSqlValue(pStr, argv[0]);
+end;
+
+{ json.c:4848 — json_group_array Compute (shared by Value/Final).
+
+  Closes the array with ']' and trims to terminate.  isFinal=0 (Value)
+  preserves the un-bracketed accumulator state so the next Step can
+  resume; isFinal=1 (Final) hands ownership to the SQL value.
+  Without sqlite3RCStr we always emit TRANSIENT and let jsonStringReset
+  free the spill buffer (jsonReturnString uses the same convention). }
+procedure jsonArrayCompute(pCtx: Psqlite3_context; isFinal: i32);
+var
+  pStr  : PJsonString;
+  flags : PtrInt;
+  emptyArr : array[0..0] of u8;
+begin
+  flags := PtrInt(sqlite3_user_data(pCtx));
+  pStr := PJsonString(sqlite3_aggregate_context(pCtx, 0));
+  if pStr <> nil then
+  begin
+    pStr^.pCtx := pCtx;
+    jsonAppendRawNZ(pStr, PAnsiChar(']'), 2);
+    jsonStringTrimOneChar(pStr);
+    if pStr^.eErr <> 0 then
+    begin
+      jsonReturnString(pStr, nil, nil);
+      Exit;
+    end
+    else if (flags and JSON_BLOB) <> 0 then
+    begin
+      jsonReturnStringAsBlob(pStr);
+      if isFinal <> 0 then
+      begin
+        if pStr^.bStatic = 0 then
+          sqlite3_free(pStr^.zBuf);
+      end
+      else
+        jsonStringTrimOneChar(pStr);
+      Exit;
+    end
+    else if isFinal <> 0 then
+    begin
+      sqlite3_result_text(pCtx, pStr^.zBuf, i32(pStr^.nUsed), SQLITE_TRANSIENT);
+      jsonStringReset(pStr);
+    end
+    else
+    begin
+      sqlite3_result_text(pCtx, pStr^.zBuf, i32(pStr^.nUsed), SQLITE_TRANSIENT);
+      jsonStringTrimOneChar(pStr);
+    end;
+  end
+  else if (flags and JSON_BLOB) <> 0 then
+  begin
+    emptyArr[0] := $0B;  { JSONB_ARRAY, payload size 0 }
+    sqlite3_result_blob(pCtx, @emptyArr[0], 1, SQLITE_TRANSIENT);
+  end
+  else
+    sqlite3_result_text(pCtx, PAnsiChar('[]'), 2, SQLITE_STATIC);
+  sqlite3_result_subtype(pCtx, JSON_SUBTYPE);
+end;
+
+procedure jsonArrayValue(pCtx: Psqlite3_context); cdecl;
+begin
+  jsonArrayCompute(pCtx, 0);
+end;
+
+procedure jsonArrayFinal(pCtx: Psqlite3_context); cdecl;
+begin
+  jsonArrayCompute(pCtx, 1);
+end;
+
+(* json.c:4898 — jsonGroupInverse: drop the first stepped element.
+
+  Walks forward from the leading '[' / '{' (zBuf[0]) until it finds an
+  unquoted, top-level comma, then memmoves the tail back over it.
+  When the search runs off the end the entire body is empty so we
+  collapse nUsed back to 1 (just the leading bracket). *)
+procedure jsonGroupInverse(pCtx: Psqlite3_context;
+                           argc: i32; argv: PPMem); cdecl;
+var
+  pStr  : PJsonString;
+  i     : u32;
+  inStr : i32;
+  nNest : i32;
+  z     : PAnsiChar;
+  c     : AnsiChar;
+begin
+  pStr := PJsonString(sqlite3_aggregate_context(pCtx, 0));
+  if pStr = nil then Exit;
+  z := pStr^.zBuf;
+  inStr := 0;
+  nNest := 0;
+  i := 1;
+  while i < pStr^.nUsed do
+  begin
+    c := z[i];
+    if (c = ',') and (inStr = 0) and (nNest = 0) then Break;
+    if c = '"' then
+      inStr := 1 - inStr
+    else if c = #$5C then  { backslash — skip the escaped byte }
+      Inc(i)
+    else if inStr = 0 then
+    begin
+      if (c = '{') or (c = '[') then Inc(nNest);
+      if (c = '}') or (c = ']') then Dec(nNest);
+    end;
+    Inc(i);
+  end;
+  if i < pStr^.nUsed then
+  begin
+    pStr^.nUsed := pStr^.nUsed - i;
+    Move(z[i + 1], z[1], pStr^.nUsed - 1);
+    z[pStr^.nUsed] := #0;
+  end
+  else
+    pStr^.nUsed := 1;
+end;
+
+(* json.c:4946 — json_group_object(NAME, VALUE) Step.
+
+  Same pattern as jsonArrayStep, but seeds with brace-open instead of
+  bracket-open and appends NAME (escaped JSON string), ':', then VALUE.
+  When NAME is SQL NULL (z=nil from sqlite3_value_text) we silently
+  skip the row — matches C, which only ever appends ',' before
+  observing the NAME value.  Note: C still drops a stray ',' even
+  when z=nil; we mirror that exactly. *)
+procedure jsonObjectStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pStr : PJsonString;
+  z    : PAnsiChar;
+  n    : u32;
+begin
+  pStr := PJsonString(sqlite3_aggregate_context(pCtx, SizeOf(TJsonString)));
+  if pStr = nil then Exit;
+  z := PAnsiChar(sqlite3_value_text(Psqlite3_value(argv[0])));
+  if z <> nil then
+    n := u32(StrLen(z))
+  else
+    n := 0;
+  if pStr^.zBuf = nil then
+  begin
+    jsonStringInit(pStr, pCtx);
+    jsonAppendChar(pStr, '{');
+  end
+  else if (pStr^.nUsed > 1) and (z <> nil) then
+    jsonAppendChar(pStr, ',');
+  pStr^.pCtx := pCtx;
+  if z <> nil then
+  begin
+    jsonAppendString(pStr, z, n);
+    jsonAppendChar(pStr, ':');
+    jsonAppendSqlValue(pStr, argv[1]);
+  end;
+end;
+
+procedure jsonObjectCompute(pCtx: Psqlite3_context; isFinal: i32);
+var
+  pStr  : PJsonString;
+  flags : PtrInt;
+  emptyObj : array[0..0] of u8;
+begin
+  flags := PtrInt(sqlite3_user_data(pCtx));
+  pStr := PJsonString(sqlite3_aggregate_context(pCtx, 0));
+  if pStr <> nil then
+  begin
+    jsonAppendRawNZ(pStr, PAnsiChar('}'), 2);
+    jsonStringTrimOneChar(pStr);
+    pStr^.pCtx := pCtx;
+    if pStr^.eErr <> 0 then
+    begin
+      jsonReturnString(pStr, nil, nil);
+      Exit;
+    end
+    else if (flags and JSON_BLOB) <> 0 then
+    begin
+      jsonReturnStringAsBlob(pStr);
+      if isFinal <> 0 then
+      begin
+        if pStr^.bStatic = 0 then
+          sqlite3_free(pStr^.zBuf);
+      end
+      else
+        jsonStringTrimOneChar(pStr);
+      Exit;
+    end
+    else if isFinal <> 0 then
+    begin
+      sqlite3_result_text(pCtx, pStr^.zBuf, i32(pStr^.nUsed), SQLITE_TRANSIENT);
+      jsonStringReset(pStr);
+    end
+    else
+    begin
+      sqlite3_result_text(pCtx, pStr^.zBuf, i32(pStr^.nUsed), SQLITE_TRANSIENT);
+      jsonStringTrimOneChar(pStr);
+    end;
+  end
+  else if (flags and JSON_BLOB) <> 0 then
+  begin
+    emptyObj[0] := $0C;  { JSONB_OBJECT, payload size 0 }
+    sqlite3_result_blob(pCtx, @emptyObj[0], 1, SQLITE_TRANSIENT);
+  end
+  else
+    sqlite3_result_text(pCtx, PAnsiChar('{}'), 2, SQLITE_STATIC);
+  sqlite3_result_subtype(pCtx, JSON_SUBTYPE);
+end;
+
+procedure jsonObjectValue(pCtx: Psqlite3_context); cdecl;
+begin
+  jsonObjectCompute(pCtx, 0);
+end;
+
+procedure jsonObjectFinal(pCtx: Psqlite3_context); cdecl;
+begin
+  jsonObjectCompute(pCtx, 1);
 end;
 
 end.

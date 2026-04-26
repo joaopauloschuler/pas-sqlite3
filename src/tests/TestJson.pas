@@ -2189,8 +2189,165 @@ begin
   ClearAuxCache(ctx);
 end;
 
+{ ----- Phase 6.8.h.4 — aggregate SQL functions ----- }
+
+{ Wires up ctx.pMem so sqlite3_aggregate_context can allocate the
+  shared accumulator into pAggMem^.z.  Mem.db left nil → fall through
+  to libc malloc inside sqlite3DbMallocRaw. }
+procedure SetupAggCtx(var ctx: Tsqlite3_context; var vm: TVdbe;
+                      var pOut, pAgg: TMem);
 begin
-  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e/f/g/h.1/h.2/h.3 JSON port ===');
+  SetupCtx(ctx, vm, pOut);
+  FillChar(pAgg, SizeOf(pAgg), 0);
+  ctx.pMem := @pAgg;
+end;
+
+procedure CallStep1(proc: TxSFuncProc; var ctx: Tsqlite3_context; var v: TMem);
+var arr: array[0..0] of PMem;
+begin arr[0] := @v; proc(@ctx, 1, PPMem(@arr[0])); end;
+
+procedure CallStep2(proc: TxSFuncProc; var ctx: Tsqlite3_context;
+                    var v0, v1: TMem);
+var arr: array[0..1] of PMem;
+begin arr[0] := @v0; arr[1] := @v1; proc(@ctx, 2, PPMem(@arr[0])); end;
+
+procedure TestJsonGroupArray;
+var
+  ctx:        Tsqlite3_context;
+  vm:         TVdbe;
+  pOut, pAgg: TMem;
+  v:          TMem;
+  s:          AnsiString;
+begin
+  { Empty aggregate (no Step calls): Final returns "[]". }
+  SetupAggCtx(ctx, vm, pOut, pAgg);
+  jsonArrayFinal(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T423 json_group_array empty → []', s, '[]');
+
+  { Three integer steps. }
+  SetupAggCtx(ctx, vm, pOut, pAgg);
+  SetupIntValue(v, 1); CallStep1(@jsonArrayStep, ctx, v);
+  SetupIntValue(v, 2); CallStep1(@jsonArrayStep, ctx, v);
+  SetupIntValue(v, 3); CallStep1(@jsonArrayStep, ctx, v);
+  jsonArrayFinal(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T424 json_group_array(1,2,3) → [1,2,3]', s, '[1,2,3]');
+
+  { Mixed text + null. }
+  SetupAggCtx(ctx, vm, pOut, pAgg);
+  SetupTextValue(v, PAnsiChar('hi'), 2); CallStep1(@jsonArrayStep, ctx, v);
+  FillChar(v, SizeOf(v), 0); v.flags := MEM_Null;
+  CallStep1(@jsonArrayStep, ctx, v);
+  jsonArrayFinal(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T425 json_group_array("hi", NULL) → ["hi",null]',
+           s, '["hi",null]');
+
+  { Value (xValue) preserves accumulator across continued steps. }
+  SetupAggCtx(ctx, vm, pOut, pAgg);
+  SetupIntValue(v, 7); CallStep1(@jsonArrayStep, ctx, v);
+  SetupIntValue(v, 8); CallStep1(@jsonArrayStep, ctx, v);
+  jsonArrayValue(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T426 json_group_array Value mid-stream → [7,8]', s, '[7,8]');
+  SetupIntValue(v, 9); CallStep1(@jsonArrayStep, ctx, v);
+  jsonArrayFinal(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T427 json_group_array continues after Value → [7,8,9]',
+           s, '[7,8,9]');
+end;
+
+procedure TestJsonGroupInverse;
+var
+  ctx:        Tsqlite3_context;
+  vm:         TVdbe;
+  pOut, pAgg: TMem;
+  v:          TMem;
+  s:          AnsiString;
+begin
+  { Step three rows then drop the first via Inverse. }
+  SetupAggCtx(ctx, vm, pOut, pAgg);
+  SetupIntValue(v, 11); CallStep1(@jsonArrayStep, ctx, v);
+  SetupIntValue(v, 22); CallStep1(@jsonArrayStep, ctx, v);
+  SetupIntValue(v, 33); CallStep1(@jsonArrayStep, ctx, v);
+  jsonGroupInverse(@ctx, 0, nil);
+  jsonArrayFinal(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T428 jsonGroupInverse drops first → [22,33]', s, '[22,33]');
+
+  { Inverse handles strings that contain commas without breaking. }
+  SetupAggCtx(ctx, vm, pOut, pAgg);
+  SetupTextValue(v, PAnsiChar('a,b'), 3); CallStep1(@jsonArrayStep, ctx, v);
+  SetupIntValue(v, 5); CallStep1(@jsonArrayStep, ctx, v);
+  jsonGroupInverse(@ctx, 0, nil);
+  jsonArrayFinal(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T429 jsonGroupInverse skips comma inside string → [5]', s, '[5]');
+
+  { Inverse on a single-element accumulator empties it. }
+  SetupAggCtx(ctx, vm, pOut, pAgg);
+  SetupIntValue(v, 99); CallStep1(@jsonArrayStep, ctx, v);
+  jsonGroupInverse(@ctx, 0, nil);
+  jsonArrayFinal(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T430 jsonGroupInverse single → []', s, '[]');
+end;
+
+procedure TestJsonGroupObject;
+var
+  ctx:        Tsqlite3_context;
+  vm:         TVdbe;
+  pOut, pAgg: TMem;
+  v0, v1:     TMem;
+  s:          AnsiString;
+begin
+  { Empty → "{}". }
+  SetupAggCtx(ctx, vm, pOut, pAgg);
+  jsonObjectFinal(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T431 json_group_object empty → {}', s, '{}');
+
+  { Two key/value pairs. }
+  SetupAggCtx(ctx, vm, pOut, pAgg);
+  SetupTextValue(v0, PAnsiChar('a'), 1); SetupIntValue(v1, 1);
+  CallStep2(@jsonObjectStep, ctx, v0, v1);
+  SetupTextValue(v0, PAnsiChar('b'), 1); SetupIntValue(v1, 2);
+  CallStep2(@jsonObjectStep, ctx, v0, v1);
+  jsonObjectFinal(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T432 json_group_object(a:1,b:2) → {"a":1,"b":2}',
+           s, '{"a":1,"b":2}');
+
+  { NULL key skips the row entirely. }
+  SetupAggCtx(ctx, vm, pOut, pAgg);
+  SetupTextValue(v0, PAnsiChar('x'), 1); SetupIntValue(v1, 7);
+  CallStep2(@jsonObjectStep, ctx, v0, v1);
+  FillChar(v0, SizeOf(v0), 0); v0.flags := MEM_Null;
+  SetupIntValue(v1, 99);
+  CallStep2(@jsonObjectStep, ctx, v0, v1);
+  jsonObjectFinal(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T433 json_group_object NULL-key skipped → {"x":7}',
+           s, '{"x":7}');
+
+  { Value preserves state across continued steps. }
+  SetupAggCtx(ctx, vm, pOut, pAgg);
+  SetupTextValue(v0, PAnsiChar('k'), 1); SetupIntValue(v1, 1);
+  CallStep2(@jsonObjectStep, ctx, v0, v1);
+  jsonObjectValue(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T434 json_group_object Value → {"k":1}', s, '{"k":1}');
+  SetupTextValue(v0, PAnsiChar('m'), 1); SetupIntValue(v1, 2);
+  CallStep2(@jsonObjectStep, ctx, v0, v1);
+  jsonObjectFinal(@ctx);
+  s := MemString(pOut);
+  CheckEqS('T435 json_group_object continues after Value → {"k":1,"m":2}',
+           s, '{"k":1,"m":2}');
+end;
+
+begin
+  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e/f/g/h.1/h.2/h.3/h.4 JSON port ===');
   TestTypeNames;
   TestIsspace;
   TestSpacesString;
@@ -2267,6 +2424,9 @@ begin
   TestJsonSet;
   TestJsonExtract;
   TestJsonPatch;
+  TestJsonGroupArray;
+  TestJsonGroupInverse;
+  TestJsonGroupObject;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);
