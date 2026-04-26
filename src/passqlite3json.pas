@@ -449,6 +449,35 @@ function  jsonTranslateBlobToText(pParse: PJsonParse; i: u32;
 procedure jsonPrettyIndent(pPretty: PJsonPretty);
 function  jsonTranslateBlobToPrettyText(pPretty: PJsonPretty; i: u32): u32;
 
+{ ===========================================================================
+  Path lookup + edit (Phase 6.8.f)
+
+  Faithful port of json.c:2977 (jsonLookupStep) and 2928
+  (jsonCreateEditSubstructure).  Walks a `$.a.b[3]`-style path against a
+  JSONB blob held in pParse^.aBlob[]; if pParse^.eEdit is non-zero the
+  matched element is mutated in place via jsonBlobEdit.
+
+  Sentinel return codes (any value >= JSON_LOOKUP_PATHERROR is an error):
+    JSON_LOOKUP_ERROR     — malformed JSONB
+    JSON_LOOKUP_NOTFOUND  — path did not match
+    JSON_LOOKUP_NOTARRAY  — JEDIT_AINS used on a non-array path
+    JSON_LOOKUP_TOODEEP   — exceeded JSON_MAX_DEPTH
+    JSON_LOOKUP_PATHERROR — malformed path string
+  =========================================================================== }
+
+const
+  JSON_LOOKUP_ERROR     : u32 = $FFFFFFFF;
+  JSON_LOOKUP_NOTFOUND  : u32 = $FFFFFFFE;
+  JSON_LOOKUP_NOTARRAY  : u32 = $FFFFFFFD;
+  JSON_LOOKUP_TOODEEP   : u32 = $FFFFFFFC;
+  JSON_LOOKUP_PATHERROR : u32 = $FFFFFFFB;
+
+function jsonLookupIsError(x: u32): Boolean; inline;
+function jsonLookupStep(pParse: PJsonParse; iRoot: u32; zPath: PAnsiChar;
+                        iLabel: u32): u32;
+function jsonCreateEditSubstructure(pParse: PJsonParse; pIns: PJsonParse;
+                                    zTail: PAnsiChar): u32;
+
 implementation
 
 function jsonIsspace(c: AnsiChar): i32; inline;
@@ -2738,6 +2767,388 @@ begin
     i := jsonTranslateBlobToText(pParse, i, pOut);
   end;
   Result := i;
+end;
+
+{ ===========================================================================
+  Phase 6.8.f implementation — path lookup + edit
+  =========================================================================== }
+
+function jsonLookupIsError(x: u32): Boolean; inline;
+begin
+  Result := x >= JSON_LOOKUP_PATHERROR;
+end;
+
+{ Helper: returns 1 if the NUL-terminated zTail ends with ']', else 0.
+  Stand-in for json.c's `sqlite3_strglob("*]", zTail)==0` test.  Empty
+  tail is not a match. }
+function jsonPathTailIsBracket(zTail: PAnsiChar): i32;
+var
+  p, last: PAnsiChar;
+begin
+  if (zTail = nil) or (zTail[0] = #0) then begin Result := 0; Exit; end;
+  last := zTail;
+  p := zTail;
+  while p^ <> #0 do begin last := p; Inc(p); end;
+  if last^ = ']' then Result := 1 else Result := 0;
+end;
+
+function jsonCreateEditSubstructure(pParse: PJsonParse; pIns: PJsonParse;
+                                    zTail: PAnsiChar): u32;
+const
+  emptyObject: array[0..1] of u8 = (JSONB_ARRAY, JSONB_OBJECT);
+var
+  rc  : u32;
+  idx : i32;
+begin
+  FillChar(pIns^, SizeOf(pIns^), 0);
+  pIns^.db := pParse^.db;
+  if zTail[0] = #0 then
+  begin
+    { No substructure.  Just insert what is given in pParse. }
+    pIns^.aBlob := pParse^.aIns;
+    pIns^.nBlob := pParse^.nIns;
+    rc := 0;
+  end
+  else
+  begin
+    { Construct the binary substructure: a singleton header byte that
+      starts an empty ARRAY (for "[..." tails) or an empty OBJECT (for
+      ".xxx" tails).  Recursive jsonLookupStep then fills it in. }
+    pIns^.nBlob := 1;
+    if zTail[0] = '.' then idx := 1 else idx := 0;
+    pIns^.aBlob := PByte(@emptyObject[idx]);
+    pIns^.eEdit := pParse^.eEdit;
+    pIns^.nIns  := pParse^.nIns;
+    pIns^.aIns  := pParse^.aIns;
+    pIns^.iDepth := pParse^.iDepth + 1;
+    if pIns^.iDepth >= JSON_MAX_DEPTH then
+    begin
+      Result := JSON_LOOKUP_TOODEEP;
+      Exit;
+    end;
+    rc := jsonLookupStep(pIns, 0, zTail, 0);
+    pParse^.iDepth := pParse^.iDepth - 1;
+    pParse^.oom := pParse^.oom or pIns^.oom;
+  end;
+  Result := rc;
+end;
+
+function jsonLookupStep(pParse: PJsonParse; iRoot: u32; zPath: PAnsiChar;
+                        iLabel: u32): u32;
+var
+  i, j, k, nKey, sz, n, iEnd, rc : u32;
+  zKey                           : PAnsiChar;
+  x                              : u8;
+  rawKey, rawLabel               : i32;
+  kk, nn                         : u64;
+  zLabel                         : PAnsiChar;
+  v                              : u32;
+  nIns                           : u32;
+  vSub, ix                       : TJsonParse;
+begin
+  if zPath[0] = #0 then
+  begin
+    if (pParse^.eEdit <> 0)
+       and (jsonBlobMakeEditable(pParse, pParse^.nIns) <> 0) then
+    begin
+      n := jsonbPayloadSize(pParse, iRoot, sz);
+      sz := sz + n;
+      if pParse^.eEdit = JEDIT_DEL then
+      begin
+        if iLabel > 0 then
+        begin
+          sz := sz + (iRoot - iLabel);
+          iRoot := iLabel;
+        end;
+        jsonBlobEdit(pParse, iRoot, sz, nil, 0);
+      end
+      else if pParse^.eEdit = JEDIT_INS then
+      begin
+        { Already exists: json_insert() is a no-op. }
+      end
+      else if pParse^.eEdit = JEDIT_AINS then
+      begin
+        { json_array_insert() — only legal if the path landed via "[N]". }
+        if (zPath - 1)^ <> ']' then
+        begin
+          Result := JSON_LOOKUP_NOTARRAY;
+          Exit;
+        end
+        else
+        begin
+          jsonBlobEdit(pParse, iRoot, 0, pParse^.aIns, pParse^.nIns);
+        end;
+      end
+      else
+      begin
+        { json_set() or json_replace() }
+        jsonBlobEdit(pParse, iRoot, sz, pParse^.aIns, pParse^.nIns);
+      end;
+    end;
+    pParse^.iLabel := iLabel;
+    Result := iRoot;
+    Exit;
+  end;
+
+  if zPath[0] = '.' then
+  begin
+    { ----- Object key lookup ----- }
+    rawKey := 1;
+    x := pParse^.aBlob[iRoot];
+    Inc(zPath);
+    if zPath[0] = '"' then
+    begin
+      zKey := zPath + 1;
+      i := 1;
+      while (zPath[i] <> #0) and (zPath[i] <> '"') do
+      begin
+        if (zPath[i] = '\') and (zPath[i + 1] <> #0) then Inc(i);
+        Inc(i);
+      end;
+      nKey := i - 1;
+      if zPath[i] <> #0 then
+        Inc(i)
+      else
+      begin
+        Result := JSON_LOOKUP_PATHERROR;
+        Exit;
+      end;
+      { rawKey = 1 iff there is no '\' in the first nKey bytes }
+      rawKey := 1;
+      j := 0;
+      while j < nKey do
+      begin
+        if zKey[j] = '\' then begin rawKey := 0; Break; end;
+        Inc(j);
+      end;
+    end
+    else
+    begin
+      zKey := zPath;
+      i := 0;
+      while (zPath[i] <> #0) and (zPath[i] <> '.') and (zPath[i] <> '[') do
+        Inc(i);
+      nKey := i;
+      if nKey = 0 then
+      begin
+        Result := JSON_LOOKUP_PATHERROR;
+        Exit;
+      end;
+    end;
+
+    if (x and $0F) <> JSONB_OBJECT then
+    begin
+      Result := JSON_LOOKUP_NOTFOUND;
+      Exit;
+    end;
+
+    n := jsonbPayloadSize(pParse, iRoot, sz);
+    j := iRoot + n;       { j is the index of a label }
+    iEnd := j + sz;
+    while j < iEnd do
+    begin
+      x := pParse^.aBlob[j] and $0F;
+      if (x < JSONB_TEXT) or (x > JSONB_TEXTRAW) then
+      begin
+        Result := JSON_LOOKUP_ERROR;
+        Exit;
+      end;
+      n := jsonbPayloadSize(pParse, j, sz);
+      if n = 0 then begin Result := JSON_LOOKUP_ERROR; Exit; end;
+      k := j + n;          { k is the index of the label text }
+      if k + sz >= iEnd then begin Result := JSON_LOOKUP_ERROR; Exit; end;
+      zLabel := PAnsiChar(@pParse^.aBlob[k]);
+      if (x = JSONB_TEXT) or (x = JSONB_TEXTRAW) then
+        rawLabel := 1
+      else
+        rawLabel := 0;
+      if jsonLabelCompare(zKey, nKey, rawKey, zLabel, sz, rawLabel) <> 0 then
+      begin
+        v := k + sz;        { v is the index of the value }
+        if (pParse^.aBlob[v] and $0F) > JSONB_OBJECT then
+        begin
+          Result := JSON_LOOKUP_ERROR;
+          Exit;
+        end;
+        n := jsonbPayloadSize(pParse, v, sz);
+        if (n = 0) or (v + n + sz > iEnd) then
+        begin
+          Result := JSON_LOOKUP_ERROR;
+          Exit;
+        end;
+        Inc(pParse^.iDepth);
+        if pParse^.iDepth >= JSON_MAX_DEPTH then
+        begin
+          Result := JSON_LOOKUP_TOODEEP;
+          Exit;
+        end;
+        rc := jsonLookupStep(pParse, v, zPath + i, j);
+        pParse^.iDepth := pParse^.iDepth - 1;
+        if pParse^.delta <> 0 then jsonAfterEditSizeAdjust(pParse, iRoot);
+        Result := rc;
+        Exit;
+      end;
+      j := k + sz;
+      if (pParse^.aBlob[j] and $0F) > JSONB_OBJECT then
+      begin
+        Result := JSON_LOOKUP_ERROR;
+        Exit;
+      end;
+      n := jsonbPayloadSize(pParse, j, sz);
+      if n = 0 then begin Result := JSON_LOOKUP_ERROR; Exit; end;
+      j := j + n + sz;
+    end;
+    if j > iEnd then
+    begin
+      Result := JSON_LOOKUP_ERROR;
+      Exit;
+    end;
+    if pParse^.eEdit >= JEDIT_INS then
+    begin
+      if (pParse^.eEdit = JEDIT_AINS)
+         and (jsonPathTailIsBracket(zPath + i) = 0) then
+      begin
+        Result := JSON_LOOKUP_NOTARRAY;
+        Exit;
+      end;
+      FillChar(ix, SizeOf(ix), 0);
+      ix.db := pParse^.db;
+      if rawKey <> 0 then
+        jsonBlobAppendNode(@ix, JSONB_TEXTRAW, nKey, nil)
+      else
+        jsonBlobAppendNode(@ix, JSONB_TEXT5, nKey, nil);
+      pParse^.oom := pParse^.oom or ix.oom;
+      rc := jsonCreateEditSubstructure(pParse, @vSub, zPath + i);
+      if (not jsonLookupIsError(rc))
+         and (jsonBlobMakeEditable(pParse, ix.nBlob + nKey + vSub.nBlob) <> 0) then
+      begin
+        nIns := ix.nBlob + nKey + vSub.nBlob;
+        jsonBlobEdit(pParse, j, 0, nil, nIns);
+        if pParse^.oom = 0 then
+        begin
+          Move(ix.aBlob^, pParse^.aBlob[j], ix.nBlob);
+          k := j + ix.nBlob;
+          Move(zKey^, pParse^.aBlob[k], nKey);
+          k := k + nKey;
+          Move(vSub.aBlob^, pParse^.aBlob[k], vSub.nBlob);
+          if pParse^.delta <> 0 then jsonAfterEditSizeAdjust(pParse, iRoot);
+        end;
+      end;
+      jsonParseReset(@vSub);
+      jsonParseReset(@ix);
+      Result := rc;
+      Exit;
+    end;
+  end
+  else if zPath[0] = '[' then
+  begin
+    { ----- Array index lookup ----- }
+    kk := 0;
+    x := pParse^.aBlob[iRoot] and $0F;
+    if x <> JSONB_ARRAY then
+    begin
+      Result := JSON_LOOKUP_NOTFOUND;
+      Exit;
+    end;
+    n := jsonbPayloadSize(pParse, iRoot, sz);
+    i := 1;
+    while sqlite3Isdigit(u8(zPath[i])) <> 0 do
+    begin
+      if kk < $FFFFFFFF then
+        kk := kk * 10 + (u64(Ord(zPath[i])) - Ord('0'));
+      Inc(i);
+    end;
+    if (i < 2) or (zPath[i] <> ']') then
+    begin
+      if zPath[1] = '#' then
+      begin
+        kk := jsonbArrayCount(pParse, iRoot);
+        i := 2;
+        if (zPath[2] = '-') and (sqlite3Isdigit(u8(zPath[3])) <> 0) then
+        begin
+          nn := 0;
+          i := 3;
+          repeat
+            if nn < $FFFFFFFF then
+              nn := nn * 10 + (u64(Ord(zPath[i])) - Ord('0'));
+            Inc(i);
+          until sqlite3Isdigit(u8(zPath[i])) = 0;
+          if nn > kk then
+          begin
+            Result := JSON_LOOKUP_NOTFOUND;
+            Exit;
+          end;
+          kk := kk - nn;
+        end;
+        if zPath[i] <> ']' then
+        begin
+          Result := JSON_LOOKUP_PATHERROR;
+          Exit;
+        end;
+      end
+      else
+      begin
+        Result := JSON_LOOKUP_PATHERROR;
+        Exit;
+      end;
+    end;
+    j := iRoot + n;
+    iEnd := j + sz;
+    while j < iEnd do
+    begin
+      if kk = 0 then
+      begin
+        Inc(pParse^.iDepth);
+        if pParse^.iDepth >= JSON_MAX_DEPTH then
+        begin
+          Result := JSON_LOOKUP_TOODEEP;
+          Exit;
+        end;
+        rc := jsonLookupStep(pParse, j, zPath + i + 1, 0);
+        pParse^.iDepth := pParse^.iDepth - 1;
+        if pParse^.delta <> 0 then jsonAfterEditSizeAdjust(pParse, iRoot);
+        Result := rc;
+        Exit;
+      end;
+      Dec(kk);
+      n := jsonbPayloadSize(pParse, j, sz);
+      if n = 0 then
+      begin
+        Result := JSON_LOOKUP_ERROR;
+        Exit;
+      end;
+      j := j + n + sz;
+    end;
+    if j > iEnd then
+    begin
+      Result := JSON_LOOKUP_ERROR;
+      Exit;
+    end;
+    if kk > 0 then
+    begin
+      Result := JSON_LOOKUP_NOTFOUND;
+      Exit;
+    end;
+    if pParse^.eEdit >= JEDIT_INS then
+    begin
+      rc := jsonCreateEditSubstructure(pParse, @vSub, zPath + i + 1);
+      if (not jsonLookupIsError(rc))
+         and (jsonBlobMakeEditable(pParse, vSub.nBlob) <> 0) then
+      begin
+        jsonBlobEdit(pParse, j, 0, vSub.aBlob, vSub.nBlob);
+      end;
+      jsonParseReset(@vSub);
+      if pParse^.delta <> 0 then jsonAfterEditSizeAdjust(pParse, iRoot);
+      Result := rc;
+      Exit;
+    end;
+  end
+  else
+  begin
+    Result := JSON_LOOKUP_PATHERROR;
+    Exit;
+  end;
+  Result := JSON_LOOKUP_NOTFOUND;
 end;
 
 end.

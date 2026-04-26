@@ -1089,8 +1089,200 @@ begin
   FreeParse(p);
 end;
 
+{ ----- Phase 6.8.f path lookup + edit tests ----- }
+
+{ Build JSONB for {"a":1,"b":2}: OBJECT(sz=10) + TEXTRAW("a") + INT(1) +
+  TEXTRAW("b") + INT(2).  Each label/int = 2 bytes (1B hdr + 1B payload),
+  so payload size is 8.  Wait — sizing: textraw "a" is hdr(JSONB_TEXTRAW,
+  sz=1) → small-form 1-byte hdr (since sz<=11) + 1 payload = 2 bytes.
+  Ditto INT(1).  So 4 entries * 2 = 8.  Object hdr is 1 byte for sz=8. }
+procedure BuildSimpleObject(out p: TJsonParse);
 begin
-  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e JSON port ===');
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_OBJECT,  8, nil);
+  jsonBlobAppendNode(@p, JSONB_TEXTRAW, 1, PAnsiChar('a'));
+  jsonBlobAppendNode(@p, JSONB_INT,     1, PAnsiChar('1'));
+  jsonBlobAppendNode(@p, JSONB_TEXTRAW, 1, PAnsiChar('b'));
+  jsonBlobAppendNode(@p, JSONB_INT,     1, PAnsiChar('2'));
+end;
+
+{ Build JSONB for [10,20,30]. }
+procedure BuildSimpleArray(out p: TJsonParse);
+begin
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_ARRAY, 9,  nil);
+  jsonBlobAppendNode(@p, JSONB_INT,   2, PAnsiChar('10'));
+  jsonBlobAppendNode(@p, JSONB_INT,   2, PAnsiChar('20'));
+  jsonBlobAppendNode(@p, JSONB_INT,   2, PAnsiChar('30'));
+end;
+
+procedure TestLookupPath;
+var
+  p  : TJsonParse;
+  rc : u32;
+begin
+  { Object key '.a' lookup → returns index of value (3rd byte: hdr1=at 1
+    "a"label hdr; payload at 2; next is value INT hdr at 3). }
+  BuildSimpleObject(p);
+  rc := jsonLookupStep(@p, 0, '.a', 0);
+  CheckEqI('T302 obj .a found', i64(rc), 3);
+  CheckTrue('T303 obj .a is INT', (p.aBlob[rc] and $0F) = JSONB_INT);
+  FreeParse(p);
+
+  { Object key '.b' lookup. }
+  BuildSimpleObject(p);
+  rc := jsonLookupStep(@p, 0, '.b', 0);
+  CheckEqI('T304 obj .b found', i64(rc), 7);
+  FreeParse(p);
+
+  { Object miss. }
+  BuildSimpleObject(p);
+  rc := jsonLookupStep(@p, 0, '.zzz', 0);
+  CheckEqI('T305 obj miss = NOTFOUND', i64(rc), i64(JSON_LOOKUP_NOTFOUND));
+  FreeParse(p);
+
+  { Object: empty path returns iRoot. }
+  BuildSimpleObject(p);
+  rc := jsonLookupStep(@p, 0, '', 0);
+  CheckEqI('T306 empty path returns iRoot', i64(rc), 0);
+  FreeParse(p);
+
+  { Object key '.' alone is a path error. }
+  BuildSimpleObject(p);
+  rc := jsonLookupStep(@p, 0, '.', 0);
+  CheckEqI('T307 lone . is PATHERROR',
+           i64(rc), i64(JSON_LOOKUP_PATHERROR));
+  FreeParse(p);
+
+  { Object key '."a"' (quoted form). }
+  BuildSimpleObject(p);
+  rc := jsonLookupStep(@p, 0, '."a"', 0);
+  CheckEqI('T308 obj quoted .a found', i64(rc), 3);
+  FreeParse(p);
+
+  { Array index '[1]' on [10,20,30] → second element. }
+  BuildSimpleArray(p);
+  rc := jsonLookupStep(@p, 0, '[1]', 0);
+  CheckTrue('T309 arr [1] found',
+            (rc <> JSON_LOOKUP_NOTFOUND) and (rc < $FFFFFFF0));
+  CheckTrue('T310 arr [1] type=INT', (p.aBlob[rc] and $0F) = JSONB_INT);
+  CheckTrue('T311 arr [1] payload=2',
+            (p.aBlob[rc + 1] = Ord('2')) and (p.aBlob[rc + 2] = Ord('0')));
+  FreeParse(p);
+
+  { Array index '[0]'. }
+  BuildSimpleArray(p);
+  rc := jsonLookupStep(@p, 0, '[0]', 0);
+  CheckTrue('T312 arr [0] found', rc < $FFFFFFF0);
+  CheckTrue('T313 arr [0] payload=1',
+            (p.aBlob[rc + 1] = Ord('1')) and (p.aBlob[rc + 2] = Ord('0')));
+  FreeParse(p);
+
+  { Array index out of range. }
+  BuildSimpleArray(p);
+  rc := jsonLookupStep(@p, 0, '[99]', 0);
+  CheckEqI('T314 arr [99] NOTFOUND',
+           i64(rc), i64(JSON_LOOKUP_NOTFOUND));
+  FreeParse(p);
+
+  { Array '[#-1]' = last element of N-element array. }
+  BuildSimpleArray(p);
+  rc := jsonLookupStep(@p, 0, '[#-1]', 0);
+  CheckTrue('T315 arr [#-1] found', rc < $FFFFFFF0);
+  CheckTrue('T316 arr [#-1] is 30',
+            (p.aBlob[rc + 1] = Ord('3')) and (p.aBlob[rc + 2] = Ord('0')));
+  FreeParse(p);
+
+  { Array path on object → NOTFOUND. }
+  BuildSimpleObject(p);
+  rc := jsonLookupStep(@p, 0, '[0]', 0);
+  CheckEqI('T317 [0] on object NOTFOUND',
+           i64(rc), i64(JSON_LOOKUP_NOTFOUND));
+  FreeParse(p);
+
+  { Object path on array → NOTFOUND. }
+  BuildSimpleArray(p);
+  rc := jsonLookupStep(@p, 0, '.x', 0);
+  CheckEqI('T318 .x on array NOTFOUND',
+           i64(rc), i64(JSON_LOOKUP_NOTFOUND));
+  FreeParse(p);
+
+  { Bare path (no $ stripped here) → PATHERROR. }
+  BuildSimpleObject(p);
+  rc := jsonLookupStep(@p, 0, 'a', 0);
+  CheckEqI('T319 bare label PATHERROR',
+           i64(rc), i64(JSON_LOOKUP_PATHERROR));
+  FreeParse(p);
+end;
+
+procedure TestLookupEdit;
+var
+  p  : TJsonParse;
+  rc : u32;
+  insBuf : array[0..1] of u8 = (JSONB_INT or (1 shl 4), Ord('9'));
+begin
+  { JEDIT_DEL on object key '.a': should remove "a":1 leaving {"b":2}.
+    The remaining payload size is 4 bytes (label+value for "b").  After
+    the edit, root header sz field updates to 4. }
+  BuildSimpleObject(p);
+  { Force aBlob ownership so jsonBlobMakeEditable is a no-op accept. }
+  jsonBlobMakeEditable(@p, 8);  { 8 = pParse^.nIns guard, ignored on owned blob }
+  p.eEdit := JEDIT_DEL;
+  rc := jsonLookupStep(@p, 0, '.a', 0);
+  CheckTrue('T320 del .a no error', rc < $FFFFFFF0);
+  CheckEqI('T321 del .a delta=-4', p.delta, -4);
+  CheckEqI('T322 del .a new nBlob', p.nBlob, 5);
+  { Root header now reports payload sz = 4 ("b"+2). }
+  CheckTrue('T323 del .a hdr is OBJECT',
+            (p.aBlob[0] and $0F) = JSONB_OBJECT);
+  CheckEqI('T324 del .a hdr sz nibble=4',
+            (p.aBlob[0] shr 4), 4);
+  FreeParse(p);
+
+  { JEDIT_REPL on '.b' replacing INT(2) with INT(9). }
+  BuildSimpleObject(p);
+  jsonBlobMakeEditable(@p, 4);
+  p.eEdit := JEDIT_REPL;
+  p.aIns := @insBuf[0];
+  p.nIns := 2;
+  rc := jsonLookupStep(@p, 0, '.b', 0);
+  CheckTrue('T325 repl .b no error', rc < $FFFFFFF0);
+  { Old "b" value INT(2) was 2 bytes; new INT(9) is 2 bytes; same size. }
+  CheckEqI('T326 repl .b delta=0', p.delta, 0);
+  CheckTrue('T327 repl .b new payload',
+            p.aBlob[p.nBlob - 1] = Ord('9'));
+  FreeParse(p);
+
+  { JEDIT_DEL miss → returns NOTFOUND, blob untouched. }
+  BuildSimpleObject(p);
+  jsonBlobMakeEditable(@p, 0);
+  p.eEdit := JEDIT_DEL;
+  rc := jsonLookupStep(@p, 0, '.zzz', 0);
+  CheckEqI('T328 del miss NOTFOUND',
+           i64(rc), i64(JSON_LOOKUP_NOTFOUND));
+  CheckEqI('T329 del miss delta=0', p.delta, 0);
+  FreeParse(p);
+end;
+
+procedure TestCreateEditSubstructure;
+var
+  p, ins : TJsonParse;
+  rc     : u32;
+  insBuf : array[0..1] of u8 = (JSONB_INT or (1 shl 4), Ord('5'));
+begin
+  { Empty tail: pIns just mirrors pParse->aIns. }
+  InitParse(p);
+  p.aIns := @insBuf[0];
+  p.nIns := 2;
+  rc := jsonCreateEditSubstructure(@p, @ins, '');
+  CheckEqI('T330 cesub empty rc=0', i64(rc), 0);
+  CheckTrue('T331 cesub empty aBlob=aIns', ins.aBlob = p.aIns);
+  CheckEqI('T332 cesub empty nBlob=2', ins.nBlob, 2);
+  FreeParse(p);
+end;
+
+begin
+  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e/f JSON port ===');
   TestTypeNames;
   TestIsspace;
   TestSpacesString;
@@ -1137,6 +1329,9 @@ begin
   TestPrettyArray;
   TestPrettyObject;
   TestPrettyEmpty;
+  TestLookupPath;
+  TestLookupEdit;
+  TestCreateEditSubstructure;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);
