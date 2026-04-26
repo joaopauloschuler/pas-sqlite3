@@ -4217,17 +4217,151 @@ begin
   Result := (pWInfo^.bitwiseFlags shr 0) and 1; { bit 0 = bDeferredSeek }
 end;
 
+{ ===========================================================================
+  Phase 6.9-bis step 11g.2.b — WhereLoop / WhereInfo bookkeeping primitives.
+
+  Faithful port of where.c:2527..2629 (whereLoopInit, whereLoopClearUnion,
+  whereLoopClear, whereLoopResize, whereLoopXfer, whereLoopDelete,
+  whereInfoFree).  These are pure plumbing — no policy logic.  They run only
+  when sqlite3WhereBegin allocates a WhereLoop / WhereInfo and feeds them
+  through the planner's add/transfer/delete chain; until step 11g.2.b's
+  WhereBegin productive port lands, none of these helpers are called from
+  productive code paths, so adding them here is a no-op for current corpus
+  bytecode emission.  TestWhereBookkeeping.pas exercises them directly.
+  =========================================================================== }
+
+{ Convert bulk memory into a valid WhereLoop that can be passed to
+  whereLoopClear harmlessly.  where.c:2527. }
+procedure whereLoopInit(p: PWhereLoop);
+begin
+  p^.aLTerm  := PPWhereTerm(@p^.aLTermSpace[0]);
+  p^.nLTerm  := 0;
+  p^.nLSlot  := Length(p^.aLTermSpace);
+  p^.wsFlags := 0;
+end;
+
+{ Clear the WhereLoop.u union.  Leaves WhereLoop.aLTerm intact.
+  where.c:2537. }
+procedure whereLoopClearUnion(db: PTsqlite3; p: PWhereLoop);
+begin
+  if (p^.wsFlags and (WHERE_VIRTUALTABLE or WHERE_AUTO_INDEX)) <> 0 then
+  begin
+    if ((p^.wsFlags and WHERE_VIRTUALTABLE) <> 0)
+       and ((p^.u.vtab.bFlags and 1) <> 0) { needFree (bit 0) }
+    then begin
+      sqlite3_free(p^.u.vtab.idxStr);
+      p^.u.vtab.bFlags := p^.u.vtab.bFlags and not u8(1);
+      p^.u.vtab.idxStr := nil;
+    end else if ((p^.wsFlags and WHERE_AUTO_INDEX) <> 0)
+              and (p^.u.btree.pIndex <> nil)
+    then begin
+      sqlite3DbFree(db, p^.u.btree.pIndex^.zColAff);
+      sqlite3DbFreeNN(db, p^.u.btree.pIndex);
+      p^.u.btree.pIndex := nil;
+    end;
+  end;
+end;
+
+{ Deallocate internal memory used by a WhereLoop object.  Leaves the object
+  in an initialized state, as if it had been newly allocated.
+  where.c:2555. }
+procedure whereLoopClear(db: PTsqlite3; p: PWhereLoop);
+begin
+  if p^.aLTerm <> PPWhereTerm(@p^.aLTermSpace[0]) then
+  begin
+    sqlite3DbFreeNN(db, p^.aLTerm);
+    p^.aLTerm := PPWhereTerm(@p^.aLTermSpace[0]);
+    p^.nLSlot := Length(p^.aLTermSpace);
+  end;
+  whereLoopClearUnion(db, p);
+  p^.nLTerm  := 0;
+  p^.wsFlags := 0;
+end;
+
+{ Increase the memory allocation for pLoop->aLTerm[] to be at least n.
+  where.c:2569. }
+function whereLoopResize(db: PTsqlite3; p: PWhereLoop; n: i32): i32;
+var
+  paNew: PPWhereTerm;
+  nRound: i32;
+begin
+  if p^.nLSlot >= n then Exit(SQLITE_OK);
+  nRound := (n + 7) and (not 7);
+  paNew := PPWhereTerm(sqlite3DbMallocRawNN(db, u64(SizeOf(PWhereTerm)) * u64(nRound)));
+  if paNew = nil then Exit(SQLITE_NOMEM);
+  Move(p^.aLTerm^, paNew^, SizeOf(PWhereTerm) * p^.nLSlot);
+  if p^.aLTerm <> PPWhereTerm(@p^.aLTermSpace[0]) then
+    sqlite3DbFreeNN(db, p^.aLTerm);
+  p^.aLTerm := paNew;
+  p^.nLSlot := u16(nRound);
+  Result := SQLITE_OK;
+end;
+
+{ Transfer content from the second pLoop into the first.  where.c:2585.
+  WHERE_LOOP_XFER_SZ = offsetof(WhereLoop, nLSlot) = 56. }
+function whereLoopXfer(db: PTsqlite3; pTo: PWhereLoop; pFrom: PWhereLoop): i32;
+const
+  WHERE_LOOP_XFER_SZ = 56; { offsetof(TWhereLoop, nLSlot); locked by TestWhereStructs }
+begin
+  whereLoopClearUnion(db, pTo);
+  if (pFrom^.nLTerm > pTo^.nLSlot)
+     and (whereLoopResize(db, pTo, pFrom^.nLTerm) <> SQLITE_OK)
+  then begin
+    FillChar(pTo^, WHERE_LOOP_XFER_SZ, 0);
+    Exit(SQLITE_NOMEM);
+  end;
+  Move(pFrom^, pTo^, WHERE_LOOP_XFER_SZ);
+  Move(pFrom^.aLTerm^, pTo^.aLTerm^, pTo^.nLTerm * SizeOf(PWhereTerm));
+  if (pFrom^.wsFlags and WHERE_VIRTUALTABLE) <> 0 then
+    pFrom^.u.vtab.bFlags := pFrom^.u.vtab.bFlags and not u8(1) { clear needFree }
+  else if (pFrom^.wsFlags and WHERE_AUTO_INDEX) <> 0 then
+    pFrom^.u.btree.pIndex := nil;
+  Result := SQLITE_OK;
+end;
+
+{ Delete a WhereLoop object.  where.c:2606. }
+procedure whereLoopDelete(db: PTsqlite3; p: PWhereLoop);
+begin
+  whereLoopClear(db, p);
+  sqlite3DbNNFreeNN(db, p);
+end;
+
+{ Free a WhereInfo structure.  where.c:2615. }
+procedure whereInfoFree(db: PTsqlite3; pWInfo: PWhereInfo);
+var
+  p:     PWhereLoop;
+  pNext: PWhereMemBlock;
+begin
+  sqlite3WhereClauseClear(@pWInfo^.sWC);
+  while pWInfo^.pLoops <> nil do
+  begin
+    p := pWInfo^.pLoops;
+    pWInfo^.pLoops := p^.pNextLoop;
+    whereLoopDelete(db, p);
+  end;
+  while pWInfo^.pMemToFree <> nil do
+  begin
+    pNext := pWInfo^.pMemToFree^.pNext;
+    sqlite3DbNNFreeNN(db, pWInfo^.pMemToFree);
+    pWInfo^.pMemToFree := pNext;
+  end;
+  sqlite3DbNNFreeNN(db, pWInfo);
+end;
+
 function sqlite3WhereBegin(pParse: PParse; pTabList: PSrcList; pWhere: PExpr;
   pOrderBy: PExprList; pDistinctSet: PExprList; wctrlFlags: u16;
   iAuxArg: i32): PWhereInfo;
 begin
-  { Phase 6.2 stub — full where.c implementation deferred to Phase 6.2 full port }
+  { Phase 6.2 stub — full where.c implementation deferred to Phase 6.9-bis
+    step 11g.2.b productive vertical slice. }
   Result := nil;
 end;
 
 procedure sqlite3WhereEnd(pWInfo: PWhereInfo);
 begin
-  { Phase 6.2 stub }
+  { Phase 6.2 stub — pairs with sqlite3WhereBegin.  When 11g.2.b lands its
+    productive WhereBegin, this body becomes:
+      if pWInfo <> nil then whereInfoFree(pWInfo^.pParse^.db, pWInfo); }
 end;
 
 procedure sqlite3WhereRightJoinLoop(pWInfo: PWhereInfo; iLevel: i32;

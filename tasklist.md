@@ -20,6 +20,68 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    WhereLoop / WhereInfo bookkeeping primitives.**  First productive
+    landing inside step 11g.2.b — the bookkeeping plumbing the rest of
+    the vertical slice will hang off.  Faithful port of where.c:2527..
+    2629 (`whereLoopInit`, `whereLoopClearUnion`, `whereLoopClear`,
+    `whereLoopResize`, `whereLoopXfer`, `whereLoopDelete`,
+    `whereInfoFree`) into `passqlite3codegen.pas`, immediately above
+    the `sqlite3WhereBegin` stub.  No behavioural change in the
+    corpus: helpers are file-private, callable only from the
+    `sqlite3WhereBegin` body which is still a stub returning nil.
+    Step 11g.2.b stays `[ ]` because the productive WhereBegin / End
+    bodies and the OP_NotExists-pattern emission still need to land.
+
+    Concrete changes:
+      * `passqlite3codegen.pas` (right above `sqlite3WhereBegin`):
+        seven new helpers, ~115 lines total.  Faithful translations
+        including:
+          - WHERE_VIRTUALTABLE `needFree` (bit 0 of `u.vtab.bFlags`)
+            clear-and-`sqlite3_free(idxStr)` path;
+          - WHERE_AUTO_INDEX `u.btree.pIndex^.zColAff` +
+            `u.btree.pIndex` `sqlite3DbFree` / `sqlite3DbFreeNN` path;
+          - `whereLoopResize`'s round-up-to-multiple-of-8 + alloc +
+            copy + free-old-if-not-static dance;
+          - `whereLoopXfer`'s `WHERE_LOOP_XFER_SZ`-sized memcpy +
+            aLTerm copy + needFree/auto-index ownership transfer;
+          - `whereInfoFree`'s pLoops walk + pMemToFree walk +
+            `sqlite3WhereClauseClear`.
+      * `WHERE_LOOP_XFER_SZ` modelled as a local `const = 56`
+        (= `offsetof(TWhereLoop, nLSlot)`); locked by
+        TestWhereStructs's offset sentinel.
+      * `sqlite3WhereEnd`'s body kept as a stub but with a comment
+        documenting what it becomes once 11g.2.b ships:
+        `if pWInfo <> nil then whereInfoFree(pWInfo^.pParse^.db, pWInfo);`.
+
+    Test status: full build clean, regression sweep all green —
+    TestWhereBasic 52/52, TestWhereStructs 148/148,
+    TestPrepareBasic 20/20, TestParser 45/45, TestSchemaBasic 44/44,
+    TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+    TestExprBasic 40/40, TestInitCallback 29/29, TestExplainParity
+    unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **Helpers stay file-private.**  Mirrors the C `static`
+        modifier — they're called only from where.c internals, never
+        from outside the unit.  Keeps the interface surface unchanged
+        and avoids name-collision risk with future ports.
+      * **No dedicated unit test landed.**  Helpers are private; their
+        behaviour will be exercised transitively by the productive
+        WhereBegin port + TestExplainParity.  Adding a friend-test
+        would require exposing them — preferable to defer until
+        WhereBegin lands its productive body and we can drive the
+        full chain from a black-box harness.
+      * **Next 6.9-bis target: 11g.2.b productive WhereBegin/End
+        bodies.**  With bookkeeping in place, the WhereBegin port
+        (single-table rowid-EQ vertical slice) can allocate WhereInfo
+        + WhereLoop, call `whereLoopInit`, run the trimmed planner
+        pick, and rely on `whereInfoFree` to clean up on every error
+        path.  Then re-enable the productive tails in
+        `sqlite3DeleteFrom` (codegen.pas:5460..5471) and
+        `sqlite3Update` (codegen.pas:5660..5670), and drop the step-11f
+        skeleton-only error-state guards.
+
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.a): structural records
     audit + field-offset sentinel.**  Closes the first sub-task of
     step 11g.2.  Diffed every record in `passqlite3codegen.pas:1066..
@@ -422,13 +484,17 @@ Important: At the end of this document, please find:
           schema rows.  TestExplainParity unchanged at 2/8/0 — the
           callback is wired but its observable effect is gated behind
           the same INSERT-emission tail.
-        - [ ] **11g.1.c** Audit `sqlite3EndTable` /
-          `sqlite3CreateIndex` init.busy=1 paths against the
-          re-prepare flow — verify the in-memory publication in
-          codegen.pas:6893 / 7562 actually fires when the parser is
-          driven by sqlite3InitCallback (not just by direct
-          sqlite3InstallSchemaTable bootstrap).  Likely needs a
-          dedicated unit test.
+        - [X] **11g.1.c** ✅ done 2026-04-26 — audit landed via new
+          `TestInitCallback.pas` (4 cases / 29 PASS) driving
+          `sqlite3InitCallback` directly with synthesised argv tuples;
+          verified `sqlite3EndTable`/`sqlite3CreateIndex` init.busy=1
+          publication arms (`codegen.pas:6892..6904`, `:7562..7572`)
+          fire correctly under the parser-driven path, not only via
+          `sqlite3InstallSchemaTable` bootstrap.  Also fixed an
+          empty-string `argv[4]` ladder bug in
+          `sqlite3InitCallback` that misrouted auto-index rows into
+          `initCorruptSchema` (latent because step 11e's Insert is
+          still skeletal, but observable via the audit test).
       * **Next 6.9-bis target: step 11g.1.b — sqlite3InitCallback
         c-r branch.**  Until that lands, the 3 nil-Vdbe rows in
         TestExplainParity (CREATE INDEX × 2, DROP TABLE × 1) cannot
@@ -7822,7 +7888,38 @@ Phase 5.9 depends on this being done first.
 
     - [ ] **11g.2.b** Vertical slice — minimal-viable
       `sqlite3WhereBegin` / `sqlite3WhereEnd` that handles **only** the
-      single-table, single-rowid-EQ-predicate case (no joins, no
+      single-table, single-rowid-EQ-predicate case.
+
+      **Sub-progress (landed 2026-04-26 — bookkeeping primitives):**
+      ported `whereLoopInit` / `whereLoopClearUnion` / `whereLoopClear`
+      / `whereLoopResize` / `whereLoopXfer` / `whereLoopDelete` /
+      `whereInfoFree` (where.c:2527..2629) into
+      `passqlite3codegen.pas` immediately above the `sqlite3WhereBegin`
+      stub.  Faithful translations including the WHERE_VIRTUALTABLE
+      `needFree` (bit 0 of `u.vtab.bFlags`) clear-and-free path and the
+      WHERE_AUTO_INDEX `u.btree.pIndex^.zColAff` free path.
+      `WHERE_LOOP_XFER_SZ` = `offsetof(TWhereLoop, nLSlot)` = 56,
+      locked by TestWhereStructs's offset sentinel.  Helpers are file-
+      private; they aren't called by productive code yet (WhereBegin is
+      still a stub returning nil), so no observable behaviour change in
+      the corpus — full regression sweep stays green
+      (TestWhereBasic 52/52, TestWhereStructs 148/148,
+      TestPrepareBasic 20/20, TestParser 45/45, TestSchemaBasic 44/44,
+      TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+      TestExprBasic 40/40, TestInitCallback 29/29, TestExplainParity
+      unchanged at 2 PASS / 8 DIVERGE / 0 ERROR).  This unblocks the
+      productive `sqlite3WhereBegin` port: WhereInfo + WhereLoop
+      allocation can now `whereInfoFree` cleanly on every error path,
+      and per-loop transfer/delete during planner walk has the
+      bookkeeping it needs.
+
+      **Remaining sub-task:** the actual productive WhereBegin / End
+      single-table, single-rowid-EQ-predicate case (full description below).
+
+      ----
+
+      **Original task description.**  Single-table, single-rowid-EQ
+      predicate (no joins, no
       ORDER BY, no index selection, no virtual tables, no OR-terms).
       Emits the `OP_NotExists` (or `OP_NoConflict` for non-rowid PK)
       seek + body + jump-back-to-Next pattern that schema-row UPDATE /
