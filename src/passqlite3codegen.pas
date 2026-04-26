@@ -1738,6 +1738,16 @@ function  sqlite3ExprCodeRunJustOnce(pParse: PParse; pExpr: PExpr;
 function  sqlite3ExprCodeTemp(pParse: PParse; pExpr: PExpr;
   pReg: Pi32): i32;
 
+{ sqlite3ExprIfTrue / sqlite3ExprIfFalse / sqlite3ExprIfFalseDup —
+  expr.c:6100..6469.  Generate code that jumps to dest depending on
+  the truth value of pExpr; jumpIfNull controls behaviour on NULL. }
+procedure sqlite3ExprIfTrue(pParse: PParse; pExpr: PExpr;
+  dest, jumpIfNull: i32);
+procedure sqlite3ExprIfFalse(pParse: PParse; pExpr: PExpr;
+  dest, jumpIfNull: i32);
+procedure sqlite3ExprIfFalseDup(pParse: PParse; pExpr: PExpr;
+  dest, jumpIfNull: i32);
+
 { Dequoting }
 procedure sqlite3DequoteExpr(p: PExpr);
 
@@ -4720,6 +4730,384 @@ begin
     end;
   end;
   Result := r2;
+end;
+
+{ ────────────────────────────────────────────────────────────────────
+  sqlite3ExprIfTrue / sqlite3ExprIfFalse — port of expr.c:6100..6455.
+  Recursive jump pair: emit code that branches to `dest` depending on
+  the truth value of pExpr.  jumpIfNull (= SQLITE_JUMPIFNULL or 0)
+  controls whether NULL counts as the jump-taking value.
+
+  Deviations from C:
+    * The debug-only ExprHasVVAProperty(pExpr, EP_Immutable) assertion
+      is omitted — EP_Immutable is an SQLITE_DEBUG marker not modelled
+      in this port.
+    * TK_BETWEEN and TK_IN intentionally fall through to default_expr.
+      Both depend on still-unported helpers (exprCodeBetween needs
+      exprCodeVector + careful Expr aliasing; sqlite3ExprCodeIN needs
+      the IN-codegen path from Phase 6.9-bis 11g.2.e).  Falling through
+      to the OP_If/OP_IfNot default will produce wrong bytecode for
+      these forms; the vertical slice (rowid-EQ WHERE) does not exercise
+      them.  Promote when 11g.2.e lands.
+  ──────────────────────────────────────────────────────────────────── }
+
+procedure sqlite3ExprIfTrue(pParse: PParse; pExpr: PExpr;
+  dest, jumpIfNull: i32);
+var
+  v:        PVdbe;
+  op:       i32;
+  regFree1: i32;
+  regFree2: i32;
+  r1, r2:   i32;
+  pAlt:     PExpr;
+  pFirst:   PExpr;
+  pSecond:  PExpr;
+  d2:       i32;
+  isNot:    i32;
+  isTrue:   i32;
+  addrIsNull: i32;
+  destIfFalse: i32;
+  destIfNull:  i32;
+  goDefault:   Boolean;
+begin
+  v := pParse^.pVdbe;
+  op := 0;
+  regFree1 := 0;
+  regFree2 := 0;
+  r1 := 0; r2 := 0;
+  Assert((jumpIfNull = SQLITE_JUMPIFNULL) or (jumpIfNull = 0));
+  if v = nil then Exit;          { NEVER(v==0) }
+  if pExpr = nil then Exit;      { NEVER(pExpr==0) }
+  op := pExpr^.op;
+  goDefault := False;
+  case op of
+    TK_AND, TK_OR:
+      begin
+        pAlt := sqlite3ExprSimplifiedAndOr(pExpr);
+        if pAlt <> pExpr then
+          sqlite3ExprIfTrue(pParse, pAlt, dest, jumpIfNull)
+        else
+        begin
+          if exprEvalRhsFirst(pExpr) <> 0 then
+          begin
+            pFirst  := pExpr^.pRight;
+            pSecond := pExpr^.pLeft;
+          end else
+          begin
+            pFirst  := pExpr^.pLeft;
+            pSecond := pExpr^.pRight;
+          end;
+          if op = TK_AND then
+          begin
+            d2 := sqlite3VdbeMakeLabel(pParse);
+            sqlite3ExprIfFalse(pParse, pFirst, d2,
+                               jumpIfNull xor SQLITE_JUMPIFNULL);
+            sqlite3ExprIfTrue(pParse, pSecond, dest, jumpIfNull);
+            sqlite3VdbeResolveLabel(v, d2);
+          end else
+          begin
+            sqlite3ExprIfTrue(pParse, pFirst, dest, jumpIfNull);
+            sqlite3ExprIfTrue(pParse, pSecond, dest, jumpIfNull);
+          end;
+        end;
+      end;
+    TK_NOT:
+      sqlite3ExprIfFalse(pParse, pExpr^.pLeft, dest, jumpIfNull);
+    TK_TRUTH:
+      begin
+        if pExpr^.op2 = TK_ISNOT then isNot := 1 else isNot := 0;
+        isTrue := sqlite3ExprTruthValue(pExpr^.pRight);
+        if (isTrue xor isNot) <> 0 then
+        begin
+          if isNot <> 0 then
+            sqlite3ExprIfTrue(pParse, pExpr^.pLeft, dest, SQLITE_JUMPIFNULL)
+          else
+            sqlite3ExprIfTrue(pParse, pExpr^.pLeft, dest, 0);
+        end else
+        begin
+          if isNot <> 0 then
+            sqlite3ExprIfFalse(pParse, pExpr^.pLeft, dest, SQLITE_JUMPIFNULL)
+          else
+            sqlite3ExprIfFalse(pParse, pExpr^.pLeft, dest, 0);
+        end;
+      end;
+    TK_IS, TK_ISNOT, TK_LT, TK_LE, TK_GT_TK, TK_GE, TK_NE, TK_EQ:
+      begin
+        if (op = TK_IS) or (op = TK_ISNOT) then
+        begin
+          if op = TK_IS then op := TK_EQ else op := TK_NE;
+          jumpIfNull := SQLITE_NULLEQ;
+        end;
+        if sqlite3ExprIsVector(pExpr^.pLeft) <> 0 then
+        begin
+          goDefault := True;
+        end else
+        begin
+          if ExprHasProperty(pExpr, EP_Subquery)
+             and (jumpIfNull <> SQLITE_NULLEQ) then
+            addrIsNull := exprComputeOperands(pParse, pExpr,
+                                              @r1, @r2,
+                                              @regFree1, @regFree2)
+          else
+          begin
+            r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft,  @regFree1);
+            r2 := sqlite3ExprCodeTemp(pParse, pExpr^.pRight, @regFree2);
+            addrIsNull := 0;
+          end;
+          if ExprHasProperty(pExpr, EP_Commuted) then
+            codeCompare(pParse, pExpr^.pLeft, pExpr^.pRight, op,
+                        r1, r2, dest, jumpIfNull, 1)
+          else
+            codeCompare(pParse, pExpr^.pLeft, pExpr^.pRight, op,
+                        r1, r2, dest, jumpIfNull, 0);
+          if addrIsNull <> 0 then
+          begin
+            if jumpIfNull <> 0 then
+              sqlite3VdbeChangeP2(v, addrIsNull, dest)
+            else
+              sqlite3VdbeJumpHere(v, addrIsNull);
+          end;
+        end;
+      end;
+    TK_ISNULL, TK_NOTNULL:
+      begin
+        Assert(TK_ISNULL  = OP_IsNull);
+        Assert(TK_NOTNULL = OP_NotNull);
+        r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft, @regFree1);
+        Assert((regFree1 = 0) or (regFree1 = r1));
+        if regFree1 <> 0 then sqlite3VdbeTypeofColumn(v, r1);
+        sqlite3VdbeAddOp2(v, op, r1, dest);
+      end;
+    TK_BETWEEN, TK_IN:
+      goDefault := True;
+  else
+    goDefault := True;
+  end;
+
+  if goDefault then
+  begin
+    if op = TK_IN then
+    begin
+      destIfFalse := sqlite3VdbeMakeLabel(pParse);
+      if jumpIfNull <> 0 then destIfNull := dest
+      else                    destIfNull := destIfFalse;
+      { TODO(11g.2.e): sqlite3ExprCodeIN not yet ported.  Stub: emit
+        a default OP_If on the bare TK_IN node.  Not hit on the
+        rowid-EQ vertical-slice corpus. }
+      r1 := sqlite3ExprCodeTemp(pParse, pExpr, @regFree1);
+      sqlite3VdbeAddOp3(v, OP_If, r1, dest, Ord(jumpIfNull <> 0));
+      sqlite3VdbeResolveLabel(v, destIfFalse);
+      destIfNull := destIfNull;     { silence unused-var warning }
+    end else if ExprAlwaysTrue(pExpr) then
+      sqlite3VdbeGoto(v, dest)
+    else if ExprAlwaysFalse(pExpr) then
+      { no-op }
+    else
+    begin
+      r1 := sqlite3ExprCodeTemp(pParse, pExpr, @regFree1);
+      sqlite3VdbeAddOp3(v, OP_If, r1, dest, Ord(jumpIfNull <> 0));
+    end;
+  end;
+
+  sqlite3ReleaseTempReg(pParse, regFree1);
+  sqlite3ReleaseTempReg(pParse, regFree2);
+end;
+
+procedure sqlite3ExprIfFalse(pParse: PParse; pExpr: PExpr;
+  dest, jumpIfNull: i32);
+var
+  v:        PVdbe;
+  op:       i32;
+  regFree1: i32;
+  regFree2: i32;
+  r1, r2:   i32;
+  pAlt:     PExpr;
+  pFirst:   PExpr;
+  pSecond:  PExpr;
+  d2:       i32;
+  isNot:    i32;
+  isTrue:   i32;
+  addrIsNull: i32;
+  destIfNull:  i32;
+  goDefault:   Boolean;
+begin
+  v := pParse^.pVdbe;
+  regFree1 := 0;
+  regFree2 := 0;
+  r1 := 0; r2 := 0;
+  Assert((jumpIfNull = SQLITE_JUMPIFNULL) or (jumpIfNull = 0));
+  if v = nil then Exit;          { NEVER(v==0) }
+  if pExpr = nil then Exit;
+
+  { Mapping pExpr->op → inverted op (only meaningful for the
+    NULLNESS / inequality arms — undefined otherwise):
+      TK_ISNULL→OP_NotNull, TK_NOTNULL→OP_IsNull,
+      TK_NE→OP_Eq, TK_EQ→OP_Ne,
+      TK_GT_TK→OP_Le, TK_LE→OP_Gt, TK_GE→OP_Lt, TK_LT→OP_Ge.
+    The C source computes this via a bit-twiddling identity that relies
+    on the alignment of TK_/OP_ constants. }
+  op := ((pExpr^.op + (TK_ISNULL and 1)) xor 1) - (TK_ISNULL and 1);
+
+  Assert((pExpr^.op <> TK_ISNULL)  or (op = OP_NotNull));
+  Assert((pExpr^.op <> TK_NOTNULL) or (op = OP_IsNull));
+  Assert((pExpr^.op <> TK_NE) or (op = OP_Eq));
+  Assert((pExpr^.op <> TK_EQ) or (op = OP_Ne));
+  Assert((pExpr^.op <> TK_LT) or (op = OP_Ge));
+  Assert((pExpr^.op <> TK_LE) or (op = OP_Gt));
+  Assert((pExpr^.op <> TK_GT_TK) or (op = OP_Le));
+  Assert((pExpr^.op <> TK_GE) or (op = OP_Lt));
+
+  goDefault := False;
+  case pExpr^.op of
+    TK_AND, TK_OR:
+      begin
+        pAlt := sqlite3ExprSimplifiedAndOr(pExpr);
+        if pAlt <> pExpr then
+          sqlite3ExprIfFalse(pParse, pAlt, dest, jumpIfNull)
+        else
+        begin
+          if exprEvalRhsFirst(pExpr) <> 0 then
+          begin
+            pFirst  := pExpr^.pRight;
+            pSecond := pExpr^.pLeft;
+          end else
+          begin
+            pFirst  := pExpr^.pLeft;
+            pSecond := pExpr^.pRight;
+          end;
+          if pExpr^.op = TK_AND then
+          begin
+            sqlite3ExprIfFalse(pParse, pFirst,  dest, jumpIfNull);
+            sqlite3ExprIfFalse(pParse, pSecond, dest, jumpIfNull);
+          end else
+          begin
+            d2 := sqlite3VdbeMakeLabel(pParse);
+            sqlite3ExprIfTrue(pParse, pFirst, d2,
+                              jumpIfNull xor SQLITE_JUMPIFNULL);
+            sqlite3ExprIfFalse(pParse, pSecond, dest, jumpIfNull);
+            sqlite3VdbeResolveLabel(v, d2);
+          end;
+        end;
+      end;
+    TK_NOT:
+      sqlite3ExprIfTrue(pParse, pExpr^.pLeft, dest, jumpIfNull);
+    TK_TRUTH:
+      begin
+        if pExpr^.op2 = TK_ISNOT then isNot := 1 else isNot := 0;
+        isTrue := sqlite3ExprTruthValue(pExpr^.pRight);
+        if (isTrue xor isNot) <> 0 then
+        begin
+          { IS TRUE and IS NOT FALSE }
+          if isNot <> 0 then
+            sqlite3ExprIfFalse(pParse, pExpr^.pLeft, dest, 0)
+          else
+            sqlite3ExprIfFalse(pParse, pExpr^.pLeft, dest, SQLITE_JUMPIFNULL);
+        end else
+        begin
+          { IS FALSE and IS NOT TRUE }
+          if isNot <> 0 then
+            sqlite3ExprIfTrue(pParse, pExpr^.pLeft, dest, 0)
+          else
+            sqlite3ExprIfTrue(pParse, pExpr^.pLeft, dest, SQLITE_JUMPIFNULL);
+        end;
+      end;
+    TK_IS, TK_ISNOT, TK_LT, TK_LE, TK_GT_TK, TK_GE, TK_NE, TK_EQ:
+      begin
+        if (pExpr^.op = TK_IS) or (pExpr^.op = TK_ISNOT) then
+        begin
+          if pExpr^.op = TK_IS then op := TK_NE else op := TK_EQ;
+          jumpIfNull := SQLITE_NULLEQ;
+        end;
+        if sqlite3ExprIsVector(pExpr^.pLeft) <> 0 then
+        begin
+          goDefault := True;
+        end else
+        begin
+          if ExprHasProperty(pExpr, EP_Subquery)
+             and (jumpIfNull <> SQLITE_NULLEQ) then
+            addrIsNull := exprComputeOperands(pParse, pExpr,
+                                              @r1, @r2,
+                                              @regFree1, @regFree2)
+          else
+          begin
+            r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft,  @regFree1);
+            r2 := sqlite3ExprCodeTemp(pParse, pExpr^.pRight, @regFree2);
+            addrIsNull := 0;
+          end;
+          if ExprHasProperty(pExpr, EP_Commuted) then
+            codeCompare(pParse, pExpr^.pLeft, pExpr^.pRight, op,
+                        r1, r2, dest, jumpIfNull, 1)
+          else
+            codeCompare(pParse, pExpr^.pLeft, pExpr^.pRight, op,
+                        r1, r2, dest, jumpIfNull, 0);
+          if addrIsNull <> 0 then
+          begin
+            if jumpIfNull <> 0 then
+              sqlite3VdbeChangeP2(v, addrIsNull, dest)
+            else
+              sqlite3VdbeJumpHere(v, addrIsNull);
+          end;
+        end;
+      end;
+    TK_ISNULL, TK_NOTNULL:
+      begin
+        r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft, @regFree1);
+        Assert((regFree1 = 0) or (regFree1 = r1));
+        if regFree1 <> 0 then sqlite3VdbeTypeofColumn(v, r1);
+        sqlite3VdbeAddOp2(v, op, r1, dest);
+      end;
+    TK_BETWEEN, TK_IN:
+      goDefault := True;
+  else
+    goDefault := True;
+  end;
+
+  if goDefault then
+  begin
+    if pExpr^.op = TK_IN then
+    begin
+      if jumpIfNull <> 0 then
+      begin
+        { TODO(11g.2.e): sqlite3ExprCodeIN(pParse, pExpr, dest, dest) }
+        r1 := sqlite3ExprCodeTemp(pParse, pExpr, @regFree1);
+        sqlite3VdbeAddOp3(v, OP_IfNot, r1, dest, 1);
+      end else
+      begin
+        destIfNull := sqlite3VdbeMakeLabel(pParse);
+        { TODO(11g.2.e): sqlite3ExprCodeIN(pParse, pExpr, dest, destIfNull) }
+        r1 := sqlite3ExprCodeTemp(pParse, pExpr, @regFree1);
+        sqlite3VdbeAddOp3(v, OP_IfNot, r1, dest, 0);
+        sqlite3VdbeResolveLabel(v, destIfNull);
+      end;
+    end else if ExprAlwaysFalse(pExpr) then
+      sqlite3VdbeGoto(v, dest)
+    else if ExprAlwaysTrue(pExpr) then
+      { no-op }
+    else
+    begin
+      r1 := sqlite3ExprCodeTemp(pParse, pExpr, @regFree1);
+      sqlite3VdbeAddOp3(v, OP_IfNot, r1, dest, Ord(jumpIfNull <> 0));
+    end;
+  end;
+
+  sqlite3ReleaseTempReg(pParse, regFree1);
+  sqlite3ReleaseTempReg(pParse, regFree2);
+end;
+
+{ sqlite3ExprIfFalseDup — expr.c:6462..6469.  Like sqlite3ExprIfFalse,
+  but operates on a duplicate of pExpr so the original tree is
+  preserved. }
+procedure sqlite3ExprIfFalseDup(pParse: PParse; pExpr: PExpr;
+  dest, jumpIfNull: i32);
+var
+  db:    PTsqlite3;
+  pCopy: PExpr;
+begin
+  db := pParse^.db;
+  pCopy := sqlite3ExprDup(db, pExpr, 0);
+  if db^.mallocFailed = 0 then
+    sqlite3ExprIfFalse(pParse, pCopy, dest, jumpIfNull);
+  sqlite3ExprDelete(db, pCopy);
 end;
 
 // ---------------------------------------------------------------------------

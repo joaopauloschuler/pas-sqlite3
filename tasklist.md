@@ -63,8 +63,17 @@ remains `history.md`.  This file is the punch list.
       stubbed to OP_Null inside the comparison arm — vector EQ inside
       a non-row-value WHERE clause does not arise on the corpus this
       slice gates on, so the stub is acceptable until 11g.2.e.
-    - [ ] Port the recursive jump pair `sqlite3ExprIfTrue` /
-      `sqlite3ExprIfFalse` (expr.c:6100..6500-ish, ~400 lines).
+    - [X] Port the recursive jump pair `sqlite3ExprIfTrue` /
+      `sqlite3ExprIfFalse` (expr.c:6100..6469, ~370 lines).
+      Done — codegen.pas immediately after `sqlite3ExprCodeTemp`.
+      Includes `sqlite3ExprIfFalseDup`.  Two intentional stubs:
+      TK_BETWEEN and TK_IN both fall through to the default
+      OP_If/OP_IfNot path because `exprCodeBetween` (needs
+      `exprCodeVector`) and `sqlite3ExprCodeIN` are not yet ported.
+      The vertical-slice (rowid-EQ) corpus does not exercise either
+      form; promote when 11g.2.e lands.  Note: TK_GT is named
+      `TK_GT_TK` in this codebase (collision with a Pascal type) —
+      future ports must use the `_TK` suffix for that single token.
     - [ ] Port the False-WHERE-Term-Bypass loop in `sqlite3WhereBegin`
       (where.c:6995..7036).
     - [ ] Implement the trimmed planner pick + `OP_NotExists` emission
