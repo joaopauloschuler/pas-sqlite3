@@ -20,6 +20,67 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.a): structural records
+    audit + field-offset sentinel.**  Closes the first sub-task of
+    step 11g.2.  Diffed every record in `passqlite3codegen.pas:1066..
+    1306` field-by-field against `whereInt.h` HEAD
+    (`/home/bpsa/app/sqlite3/src/whereInt.h`) and verified each layout
+    assumption against actual GCC x86-64 packing with a tiny C probe
+    (`offsetof()` checks under `gcc -O2`).  No drift found — all 14
+    records (TWhereMemBlock, TWhereRightJoin, TInLoop, TWhereTerm,
+    TWhereClause, TWhereOrInfo, TWhereAndInfo, TWhereMaskSet,
+    TWhereOrCost, TWhereOrSet, TWherePath, TWhereScan,
+    TWhereLoopBtree, TWhereLoopVtab, TWhereLoop, TWhereLevel,
+    TWhereLoopBuilder, TWhereInfo) match upstream byte-for-byte.
+    Documentation-only structural change; the productive code lands
+    in 11g.2.b.
+    [X]
+
+    Concrete changes:
+      * `src/tests/TestWhereStructs.pas` — new sentinel verifying
+        148 individual field offsets across the 14 whereInt.h record
+        types.  Complements TestWhereBasic (T1..T17 SizeOf checks)
+        with byte-precise offset-of checks so any future record-field
+        reorder, accidental pad drop, bitfield repack, or compiler
+        alignment change trips a single PASS/FAIL line.
+      * `src/tests/build.sh` — wire TestWhereStructs into the build
+        ladder (right after TestWhereBasic).
+
+    Verification:
+      * `gcc -O2` probe of the GCC layout for `WhereLoop.u.vtab` —
+        the 3 u32:1 bitfields (needFree, bOmitOffset, bIdxNumHex)
+        do collapse into a single byte at offset 4 (because the next
+        field is i8 isOrdered, GCC packs the storage unit), so the
+        Pascal `bFlags: u8 @ 4` modelling is correct, sizeof=24.
+      * `gcc -O2` probe of the WhereInfo layout — sizeof=856 base
+        (before flexarray), sWC@104, sMaskSet@592, all match Pascal.
+      * `LD_LIBRARY_PATH=src ./bin/TestWhereStructs` → 148 PASS / 0
+        FAIL (every documented offset confirmed).
+      * `LD_LIBRARY_PATH=src ./bin/TestWhereBasic` → 52 PASS / 0 FAIL
+        (existing SizeOf gate still green).
+
+    Discoveries / next-step notes:
+      * **Pascal port intentionally models the *non-debug* C layout.**
+        Upstream `WhereTerm` grows an `int iTerm` field at offset 32
+        when SQLITE_DEBUG is on (between leftCursor and union u),
+        bumping sizeof to 64.  The Pascal records do NOT carry that
+        field — they are a self-contained re-implementation, never
+        passed to/from libsqlite3.so, so the debug pad is irrelevant.
+        Documented in TestWhereStructs.pas header.
+      * **All 14 records confirmed drift-free.**  No bitfield/union/
+        flexarray rework needed.  11g.2.b can allocate WhereInfo /
+        WhereClause / WhereLoop / WhereLevel directly using
+        SizeOf(TWhereInfo) + nLevel*SizeOf(TWhereLevel) and trust the
+        layout.
+      * **Next 6.9-bis target: step 11g.2.b — vertical-slice
+        sqlite3WhereBegin / sqlite3WhereEnd for the single-table
+        rowid-EQ shape.**  Lands the bookkeeping primitives
+        (whereLoopInit/Clear/Xfer/Delete, whereInfoFree,
+        sqlite3WhereGetMask) plus the trimmed Begin/End emitting
+        OP_NotExists+body+Goto for inner DML schema-row updates.
+        Expected TestExplainParity bump 2 PASS / 8 DIVERGE → 7 PASS /
+        3 DIVERGE once paired with step 11e's productive INSERT tail.
+
   - **2026-04-26 — Phase 6.9-bis — formalise step 11g.2 sub-tasks
     (sqlite3WhereBegin / WhereOkOnePass / WhereEnd port).**  Step
     11g.1 closed in three sub-steps (a/b/c) per the precedent set
@@ -7741,18 +7802,23 @@ Phase 5.9 depends on this being done first.
 
     Sub-task split (revised 2026-04-26, mirrors step 11g.1 staging):
 
-    - [ ] **11g.2.a** Audit/expand the existing whereInt.h record
-      skeletons in `passqlite3codegen.pas:1091..1380`
-      (`TWhereTerm`, `TWhereClause`, `TWhereOrInfo`, `TWhereAndInfo`,
-      `TWhereMaskSet`, `TWhereOrSet`, `TWhereLoopBtree`,
-      `TWhereLoopVtab`, `TWhereLoopU`, `TWhereLoop`, `TWhereLevelU`,
-      `TWhereLevel`, `TWhereLoopBuilder`, `TWhereInfo`).  Diff
-      field-for-field against `whereInt.h` HEAD; resolve any
-      bitfield/union/flexarray drift; verify sizes-of match GCC layout
-      where assumed by allocators.  No behavioural change expected;
-      this is the structural foundation 11g.2.b/c/d depend on.  Add a
-      `TestWhereStructs.pas` sentinel verifying SizeOf() and field
-      offsets to lock the layout against future drift.
+    - [X] **11g.2.a** ✅ done 2026-04-26 — audited the 14 whereInt.h
+      record skeletons in `passqlite3codegen.pas:1066..1306`
+      (`TWhereMemBlock`, `TWhereRightJoin`, `TInLoop`, `TWhereTerm`,
+      `TWhereClause`, `TWhereOrInfo`, `TWhereAndInfo`, `TWhereMaskSet`,
+      `TWhereOrCost`, `TWhereOrSet`, `TWherePath`, `TWhereScan`,
+      `TWhereLoopBtree`, `TWhereLoopVtab`, `TWhereLoopU`, `TWhereLoop`,
+      `TWhereLevelU`, `TWhereLevel`, `TWhereLoopBuilder`, `TWhereInfo`).
+      Diffed field-for-field against `whereInt.h` HEAD and verified each
+      layout assumption against actual GCC x86-64 packing with a tiny C
+      probe — no drift found.  Locked the layout via new
+      `TestWhereStructs.pas` sentinel: 148 individual field-offset
+      checks across all 14 records (offsetof()-style PASS/FAIL).
+      Complements TestWhereBasic's SizeOf gate.  Result: 148 PASS / 0
+      FAIL.  Pascal port intentionally models the *non-debug* C layout
+      (no SQLITE_DEBUG `iTerm` field on WhereTerm); records are
+      self-contained Pascal data, never round-tripped through C, so
+      that's correct.
 
     - [ ] **11g.2.b** Vertical slice — minimal-viable
       `sqlite3WhereBegin` / `sqlite3WhereEnd` that handles **only** the
