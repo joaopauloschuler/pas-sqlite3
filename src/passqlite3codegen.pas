@@ -6078,10 +6078,153 @@ begin
     i32(1 + u32(db^.aDb[iDb].pSchema^.schema_cookie)));
 end;
 
+{ sqlite3EndTable — port of build.c:2637.
+  Caps the prologue emitted by sqlite3StartTable: emits OP_Close, the
+  schema-row UPDATE NestedParse (no-op while NestedParse is a stub),
+  ChangeCookie, AddParseSchemaOp; on init.busy=1, publishes the in-memory
+  Table into pSchema^.tblHash.
+
+  Skipped in this cut (gated on Phase 6.x deps that are still stubs):
+    * STRICT-mode column iteration — requires AddColumn, which is a stub,
+      so TF_Strict is never set in practice today.
+    * GENERATED-column resolve loop — same: TF_HasGenerated never set.
+    * CHECK-constraint resolve loop — pCheck is never populated by the
+      AddCheckConstraint stub.
+    * `pSelect` (CREATE TABLE AS SELECT) full body — Select codegen lives
+      in 7.x; we still call sqlite3SelectDelete on the input list.
+    * convertToWithoutRowidTable — needs a real column array; falls
+      through to the "PRIMARY KEY missing" error today since AddColumn
+      and AddPrimaryKey are stubs.
+    * AlterTable addColOffset — kept (cheap), gated on pCons<>nil. }
 procedure sqlite3EndTable(pParse: PParse; const pCons: PToken;
   const pEnd: PToken; tabOpts: u32; pSelect: PSelect);
+var
+  pTab:    PTable2;
+  db:      PTsqlite3;
+  iDb:     i32;
+  v:       PVdbe;
+  pEnd2:   PToken;
+  n:       i32;
 begin
-  sqlite3SelectDelete(pParse^.db, pSelect);
+  { Match the parse-driven sequencing of the C body: pSelect ownership
+    transfers to the codegen path on success, but on early-out we must
+    still free the input. }
+  if (pEnd = nil) and (pSelect = nil) then begin
+    sqlite3SelectDelete(pParse^.db, pSelect);
+    Exit;
+  end;
+
+  pTab := pParse^.pNewTable;
+  if pTab = nil then begin
+    sqlite3SelectDelete(pParse^.db, pSelect);
+    Exit;
+  end;
+
+  db := pParse^.db;
+
+  { Test-scaffold gate: the synthetic dbs used by TestParserSmoke /
+    TestVtab leave eOpenState=1 and have no working aDb[].pSchema /
+    sqlite3GetVdbe path.  Real sqlite3_open_v2 sets $76. }
+  if db^.eOpenState <> $76 then begin
+    sqlite3SelectDelete(db, pSelect);
+    Exit;
+  end;
+
+  if (pSelect = nil) and (sqlite3ShadowTableName(db, pTab^.zName) <> 0) then
+    pTab^.tabFlags := pTab^.tabFlags or TF_Shadow;
+
+  { Reading the schema off-disk: extract tnum from db->init.newTnum. }
+  if db^.init.busy <> 0 then begin
+    if (pSelect <> nil)
+       or ((pTab^.eTabType <> TABTYP_NORM) and (db^.init.newTnum <> 0)) then begin
+      sqlite3ErrorMsg(pParse, '');
+      sqlite3SelectDelete(db, pSelect);
+      Exit;
+    end;
+    pTab^.tnum := db^.init.newTnum;
+    if pTab^.tnum = 1 then
+      pTab^.tabFlags := pTab^.tabFlags or TF_Readonly;
+  end;
+
+  { STRICT / GENERATED / CHECK loops omitted — see banner.
+
+    WITHOUT ROWID: in C this branch errors out when PRIMARY KEY is missing
+    or AUTOINCREMENT is set, then calls convertToWithoutRowidTable.  All
+    three depend on AddColumn / AddPrimaryKey, which are stubs today, so
+    none of the TF_* preconditions are ever set.  Calling sqlite3ErrorMsg
+    here would also short-circuit sqlite3FinishCoding's epilogue and
+    leave the Vdbe half-initialised — so we *defer the entire WITHOUT
+    ROWID arm* until those parser stubs land.  Just fold the flags into
+    tabFlags so layout snapshots are correct. }
+  if (tabOpts and TF_WithoutRowid) <> 0 then
+    pTab^.tabFlags := pTab^.tabFlags or TF_WithoutRowid or TF_NoVisibleRowid;
+
+  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+
+  { CHECK / GENERATED / row-width estimates: deferred (banner). }
+
+  { Emit the schema-write epilogue when not parsing the schema-cache itself. }
+  if db^.init.busy = 0 then begin
+    v := sqlite3GetVdbe(pParse);
+    if v = nil then begin
+      sqlite3SelectDelete(db, pSelect);
+      Exit;
+    end;
+
+    sqlite3VdbeAddOp1(v, OP_Close, 0);
+
+    { CREATE TABLE ... AS SELECT body deferred to Phase 7.x.  Free the
+      input list here (the upstream branch consumes it). }
+    if pSelect <> nil then begin
+      sqlite3SelectDelete(db, pSelect);
+      pSelect := nil;
+    end;
+
+    { sqlite3NestedParse(...) UPDATE sqlite_schema SET ... — currently a
+      no-op stub; structural call lands now so this fires automatically
+      when NestedParse is real. }
+    sqlite3NestedParse(pParse, nil);
+
+    sqlite3ChangeCookie(pParse, iDb);
+
+    { sqlite_sequence creation for AUTOINCREMENT — TF_Autoincrement is
+      never set today (parser stub), so this block is unreachable.
+      Structural placeholder kept as a comment for future wiring. }
+
+    { Reparse the table we just wrote. }
+    sqlite3VdbeAddParseSchemaOp(v, iDb, nil, 0);
+    { TODO(Phase 6.x): once sqlite3MPrintf-format support for the
+      "tbl_name='%q' AND type!='trigger'" filter is wired, replace the
+      nil zWhere above with the real filter string. }
+
+    { TF_HasGenerated post-emit check (OP_SqlExec) deferred. }
+  end;
+
+  { Add the table to the in-memory representation of the database. }
+  if db^.init.busy <> 0 then begin
+    if sqlite3HashInsert(@passqlite3util.PSchema(pTab^.pSchema)^.tblHash,
+         PChar(pTab^.zName), pTab) <> nil then begin
+      sqlite3OomFault(db);
+      sqlite3SelectDelete(db, pSelect);
+      Exit;
+    end;
+    pParse^.pNewTable := nil;
+    db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
+
+    { sqlite_sequence pSeqTab pin: TF_Autoincrement never set today. }
+  end;
+
+  { ALTER TABLE addColOffset bookkeeping (build.c:2785). }
+  if (pSelect = nil) and (pTab^.eTabType = TABTYP_NORM) then begin
+    if (pCons <> nil) and (pEnd <> nil) then begin
+      pEnd2 := pCons;
+      if pEnd2^.z = nil then pEnd2 := pEnd;
+      n := i32(PtrUInt(pEnd2^.z) - PtrUInt(pParse^.sNameToken.z));
+      pTab^.u.tab.addColOffset := 13 + n;
+    end;
+  end;
+
+  sqlite3SelectDelete(db, pSelect);
 end;
 
 procedure sqlite3CreateView(pParse: PParse; const pBegin: PToken;

@@ -20,6 +20,108 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 7): sqlite3EndTable port
+    (build.c:2637).**  Replaces the trivial `{ Phase 7 }` stub at
+    `passqlite3codegen.pas:6081` with a structural port of the CREATE
+    TABLE epilogue emitter — caps the prologue laid down by
+    `sqlite3StartTable` and bumps the schema cookie so subsequent
+    DDL on the same connection sees the new generation.
+
+    Concrete changes:
+      * `src/passqlite3codegen.pas`:
+        - `sqlite3EndTable` (was a 1-line `SelectDelete` stub):
+          ports the `init.busy=0` emit path (OP_Close, the
+          schema-row UPDATE NestedParse, ChangeCookie,
+          AddParseSchemaOp), the `init.busy=1` Table-publish path
+          (`sqlite3HashInsert(@pSchema^.tblHash, ...)` + DBFLAG_
+          SchemaChange OR), and the AlterTable addColOffset
+          bookkeeping.  Same `eOpenState <> $76` test-scaffold gate
+          as StartTable / DropTable.
+        - **Deferred branches** (gated on still-stub helpers, all
+          documented in the function banner):
+            * STRICT-mode column iteration — needs AddColumn.
+            * GENERATED-column resolve loop — needs AddColumn.
+            * CHECK-constraint resolve loop — pCheck never populated.
+            * `pSelect` (CREATE TABLE AS SELECT) full body — Phase 7.
+            * `convertToWithoutRowidTable` — needs a real column
+              array; for now, just OR in TF_WithoutRowid /
+              TF_NoVisibleRowid and skip the conversion.
+            * Schema-row UPDATE NestedParse — structural call lands
+              now; will fire automatically once NestedParse is real.
+            * sqlite_sequence creation for AUTOINCREMENT — TF_
+              Autoincrement never set today (AddPrimaryKey stub).
+            * TF_HasGenerated post-emit OP_SqlExec — TF never set.
+        - **Important non-emit decision:** the WITHOUT ROWID error
+          arms ("PRIMARY KEY missing", "AUTOINCREMENT not allowed
+          on WITHOUT ROWID") are *not* honoured today.  In C they
+          fire when the column array is missing; here they would
+          fire on every WITHOUT ROWID statement (because
+          AddPrimaryKey is a stub), which trips
+          `sqlite3FinishCoding`'s `nErr>0` early-out and leaves
+          the Vdbe with un-allocated aMem → AV on finalize.  We
+          defer the entire arm until AddColumn / AddPrimaryKey
+          land — at which point TF_HasPrimaryKey will be set
+          legitimately and the C error path is correct again.
+
+    Tests: full build clean.  TestExplainParity: **2 PASS / 8
+    DIVERGE / 0 ERROR** (was 1/9/0).  DROP INDEX IF EXISTS row
+    flipped from DIVERGE → PASS — the seed CREATE TABLE rows now
+    bump the schema_cookie via ChangeCookie, matching the C-side
+    OP_Transaction p3 value exactly.  CREATE TABLE rows still
+    DIVERGE on op-count (Pascal=17, C=32–43) — the gap is the
+    NestedParse schema-row UPDATE sub-statement (~13 ops) plus
+    the TF_HasGenerated SqlExec when generated columns are real.
+    Regression spot check (2026-04-26): TestPrepareBasic 20/20,
+    TestParser 45/45, TestParserSmoke 20/20, TestSchemaBasic
+    44/44, TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic
+    49/49, TestExprBasic 40/40, TestVdbeTxn 8/8, TestAuthBuiltins
+    34/34, TestOpenClose 17/17, TestSmoke + TestUtil clean.
+
+    Discoveries / next-step notes:
+      * **Honouring C's error paths in helpers that run *before*
+        sqlite3FinishCoding's epilogue is dangerous when sibling
+        parser stubs prevent the precondition from ever being
+        validly met.**  ErrorMsg sets `pParse^.nErr++`, which
+        causes FinishCoding's early-out, which skips the aMem
+        allocation, which AVs on the next register-touching op.
+        Two safe options when porting an "if precondition fails,
+        ErrorMsg + return" arm: (a) only emit the error if the
+        underlying precondition checker is real; (b) defer the
+        entire arm with a `TODO` comment.  We took (b) here.
+        Add to porting checklist gotchas.
+      * **`@passqlite3util.PSchema(pTab^.pSchema)^.tblHash`** — codegen's
+        `PSchema` is the opaque-stub shadow (Pointer); to reach the
+        real `tblHash` field we must qualify through `passqlite3util`,
+        same idiom as the existing `pSchemaT: passqlite3util.PSchema`
+        declarations (e.g. parser.pas:2014).  Bare `PSchema(...)`
+        cast resolves to the opaque pointer and FPC rejects the
+        `^.tblHash` member access ("Illegal qualifier").
+      * **AddParseSchemaOp zWhere is currently `nil`.**  C uses
+        `sqlite3MPrintf(db, "tbl_name='%q' AND type!='trigger'", p->zName)`
+        to scope reparsing to the new table.  Pascal's
+        `sqlite3MPrintf` exists but the `%q` (SQL-quote) format
+        does not yet route through to printf.c's `xType=='q'` arm.
+        Wire it when MPrintf %q lands; until then OP_ParseSchema
+        with nil zWhere reparses the full schema (slower but
+        correct).
+      * **Next 6.9-bis target: `sqlite3CreateIndex` (build.c:4032,
+        37/41 ops).**  All non-trivial helper deps now real
+        (BeginWriteOperation, OpenSchemaTable, ChangeCookie,
+        ForceNotReadOnly, CodeVerifySchema, MayAbort, ParseSchemaOp);
+        the only remaining stubbed dep is `sqlite3NestedParse` for
+        the index-row UPDATE sub-statement (same gap as EndTable).
+        After that, the structural `sqlite3NestedParse` port itself
+        becomes the highest-leverage move — it flips multiple
+        DIVERGE rows to PASS at once by closing the ~13-op gap on
+        every CREATE TABLE / CREATE INDEX / DROP TABLE row.
+      * **DROP TABLE row still `nil Vdbe`.**  Cause: the seed
+        `CREATE TABLE t(a,b,c)` runs, OP_ParseSchema executes, but
+        the schema row was inserted with the 6-byte `nullRow` blob
+        (StartTable) and never UPDATE'd to a real `CREATE TABLE`
+        row (NestedParse stub).  ParseSchema therefore reads no
+        row → no Table installed → `LocateTableItem("t")` fails.
+        The row will flip once NestedParse is real.
+
   - **2026-04-26 — Phase 6.9-bis (step 6): sqlite3StartTable port
     (build.c:1206) + sqlite3VdbeMakeReady aMem allocation fix.**
     Replaces the `{ Phase 7 }` stub at `passqlite3codegen.pas:5827`
@@ -6171,7 +6273,11 @@ Phase 5.9 depends on this being done first.
   ~~`sqlite3DropTable`, `sqlite3CodeDropTable`, `destroyTable`,
   `sqlite3ClearStatTables`, `tableMayNotBeDropped`,
   `sqliteViewResetAll`~~ done 2026-04-26,
-  `sqlite3StartTable`, `sqlite3EndTable`, `sqlite3CreateIndex`,
+  ~~`sqlite3StartTable`~~ done 2026-04-26,
+  ~~`sqlite3EndTable`~~ done 2026-04-26 (structural port; STRICT /
+  GENERATED / CHECK / pSelect / convertToWithoutRowidTable arms
+  deferred — see step 7 notes),
+  `sqlite3CreateIndex`,
   found-index DropIndex arm helpers `sqlite3NestedParse` (still
   a stub — its real port flips many DELETE/UPDATE sub-statements
   on at once))
@@ -6181,10 +6287,14 @@ Phase 5.9 depends on this being done first.
   (`CREATE TABLE typed`, `CREATE TABLE WITHOUT ROWID`).  Once all
   ten current rows PASS, expand corpus to DML / SELECT / pragma /
   trigger forms (the same exclusion list as TestParser).
-  Status (2026-04-26): 1 PASS / 7 DIVERGE / 2 ERROR.  DROP INDEX
-  IF EXISTS row now produces 5 ops (matches C count); single p3
-  mismatch on OP_Transaction, gated on StartTable/EndTable
-  bumping the fixture's schema_cookie.
+  Status (2026-04-26 step 7): **2 PASS / 8 DIVERGE / 0 ERROR.**
+  DROP INDEX IF EXISTS PASSes (schema_cookie now bumped by the
+  seed CREATE TABLEs via EndTable's ChangeCookie).  CREATE TABLE
+  rows hold at op-count Pascal=17 / C=32–43; the gap is the
+  NestedParse-driven schema-row UPDATE sub-statement (~13 ops).
+  Earlier history: 1/7/2 (step 5) → 1/7/2 (step 6, both ERROR
+  rows flipped to DIVERGE via the MakeReady aMem fix) → 1/9/0
+  (step 6) → 2/8/0 (step 7).
 
 ---
 
