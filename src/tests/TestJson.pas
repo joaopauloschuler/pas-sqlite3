@@ -13,6 +13,7 @@ program TestJson;
 uses
   SysUtils,
   passqlite3types,
+  passqlite3os,
   passqlite3util,
   passqlite3json;
 
@@ -428,8 +429,248 @@ begin
   jsonStringReset(@s);
 end;
 
+{ ----- Phase 6.8.c blob primitive tests ----- }
+
+procedure InitParse(out p: TJsonParse);
 begin
-  WriteLn('=== TestJson — Phase 6.8.a/b JSON foundation + accumulator ===');
+  FillChar(p, SizeOf(p), 0);
+end;
+
+procedure FreeParse(var p: TJsonParse);
+begin
+  if p.aBlob <> nil then sqlite3_free(p.aBlob);
+  p.aBlob := nil;
+  p.nBlob := 0;
+  p.nBlobAlloc := 0;
+end;
+
+procedure TestBlobExpand;
+var p: TJsonParse; rc: i32;
+begin
+  InitParse(p);
+  rc := jsonBlobExpand(@p, 50);
+  CheckEqI('T140 blobExpand initial rc', rc, 0);
+  CheckEqI('T141 blobExpand alloc>=100', i64(p.nBlobAlloc), 100);
+  rc := jsonBlobExpand(@p, 200);
+  CheckEqI('T142 blobExpand grow rc', rc, 0);
+  CheckTrue('T143 blobExpand alloc>=200', p.nBlobAlloc >= 200);
+  FreeParse(p);
+end;
+
+procedure TestBlobMakeEditable;
+var
+  p: TJsonParse;
+  raw: array[0..4] of u8 = ($11, $22, $33, $44, $55);
+  rc: i32;
+begin
+  InitParse(p);
+  p.aBlob := @raw[0];
+  p.nBlob := 5;
+  p.nBlobAlloc := 0;  { external, not editable }
+  rc := jsonBlobMakeEditable(@p, 3);
+  CheckEqI('T144 makeEditable rc', rc, 1);
+  CheckTrue('T145 makeEditable alloc>=8', p.nBlobAlloc >= 8);
+  CheckTrue('T146 makeEditable copied byte0', p.aBlob[0] = $11);
+  CheckTrue('T147 makeEditable copied byte4', p.aBlob[4] = $55);
+  FreeParse(p);
+end;
+
+procedure TestBlobAppendOneByte;
+var p: TJsonParse; i: i32;
+begin
+  InitParse(p);
+  for i := 0 to 9 do
+    jsonBlobAppendOneByte(@p, u8(i + $A0));
+  CheckEqI('T148 append10 nBlob', p.nBlob, 10);
+  CheckTrue('T149 append10 byte0', p.aBlob[0] = $A0);
+  CheckTrue('T150 append10 byte9', p.aBlob[9] = $A9);
+  FreeParse(p);
+end;
+
+procedure TestBlobAppendNode;
+var p: TJsonParse;
+begin
+  InitParse(p);
+  { tiny payload (sz<=11) → 1-byte hdr }
+  jsonBlobAppendNode(@p, JSONB_INT, 3, PAnsiChar('123'));
+  CheckEqI('T151 small nBlob=4',  p.nBlob, 4);
+  CheckTrue('T152 small hdr',      p.aBlob[0] = (JSONB_INT or (3 shl 4)));
+  CheckTrue('T153 small p[0]',     p.aBlob[1] = Ord('1'));
+  FreeParse(p);
+
+  { 1-byte sz extension (12..255) }
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_TEXT, 100, nil);
+  CheckEqI('T154 mid hdr len',     p.nBlob, 2);
+  CheckTrue('T155 mid hdr0',       p.aBlob[0] = (JSONB_TEXT or $C0));
+  CheckTrue('T156 mid hdr1',       p.aBlob[1] = 100);
+  FreeParse(p);
+
+  { 2-byte sz extension (256..65535) }
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_ARRAY, 1000, nil);
+  CheckEqI('T157 d hdr len',       p.nBlob, 3);
+  CheckTrue('T158 d hdr0',         p.aBlob[0] = (JSONB_ARRAY or $D0));
+  CheckTrue('T159 d hi',           p.aBlob[1] = ((1000 shr 8) and $FF));
+  CheckTrue('T160 d lo',           p.aBlob[2] = (1000 and $FF));
+  FreeParse(p);
+
+  { 4-byte sz extension (>65535) }
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_OBJECT, 100000, nil);
+  CheckEqI('T161 e hdr len',       p.nBlob, 5);
+  CheckTrue('T162 e hdr0',         p.aBlob[0] = (JSONB_OBJECT or $E0));
+  CheckTrue('T163 e b1', p.aBlob[1] = ((100000 shr 24) and $FF));
+  CheckTrue('T164 e b2', p.aBlob[2] = ((100000 shr 16) and $FF));
+  CheckTrue('T165 e b3', p.aBlob[3] = ((100000 shr 8) and $FF));
+  CheckTrue('T166 e b4', p.aBlob[4] = (100000 and $FF));
+  FreeParse(p);
+end;
+
+procedure TestPayloadSize;
+var p: TJsonParse; sz, n: u32;
+begin
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_INT, 5, PAnsiChar('12345'));
+  n := jsonbPayloadSize(@p, 0, sz);
+  CheckEqI('T167 ps small n',  n, 1);
+  CheckEqI('T168 ps small sz', sz, 5);
+  FreeParse(p);
+
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_TEXT, 200, nil);
+  { Append 200 zero payload bytes by extending nBlob: }
+  if p.nBlobAlloc < p.nBlob + 200 then jsonBlobExpand(@p, p.nBlob + 200);
+  p.nBlob := p.nBlob + 200;
+  n := jsonbPayloadSize(@p, 0, sz);
+  CheckEqI('T169 ps mid n',  n, 2);
+  CheckEqI('T170 ps mid sz', sz, 200);
+  FreeParse(p);
+
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_ARRAY, 1000, nil);
+  if p.nBlobAlloc < p.nBlob + 1000 then jsonBlobExpand(@p, p.nBlob + 1000);
+  p.nBlob := p.nBlob + 1000;
+  n := jsonbPayloadSize(@p, 0, sz);
+  CheckEqI('T171 ps d n',  n, 3);
+  CheckEqI('T172 ps d sz', sz, 1000);
+  FreeParse(p);
+end;
+
+procedure TestChangePayloadSize;
+var p: TJsonParse; delta: i32; sz, n: u32;
+begin
+  { Grow header from 1 → 2 byte sz: append a small node, then grow it. }
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_TEXT, 5, PAnsiChar('hello'));
+  CheckEqI('T173 cps init nBlob', p.nBlob, 6);
+  delta := jsonBlobChangePayloadSize(@p, 0, 200);
+  CheckEqI('T174 cps delta=+1',   delta, 1);
+  CheckEqI('T175 cps new nBlob',  p.nBlob, 7);
+  CheckTrue('T176 cps new hdr0',  p.aBlob[0] = (JSONB_TEXT or $C0));
+  CheckTrue('T177 cps new hdr1',  p.aBlob[1] = 200);
+  { Original payload preserved at new offset }
+  CheckTrue('T178 cps payload moved', p.aBlob[2] = Ord('h'));
+
+  { Now check jsonbPayloadSize parses the new header. nBlob doesn't reflect
+    actual paylod size 200; we need to fake it via nBlobAlloc check. }
+  if p.nBlobAlloc < p.nBlob + 200 then jsonBlobExpand(@p, p.nBlob + 200);
+  p.nBlob := 2 + 200;
+  n := jsonbPayloadSize(@p, 0, sz);
+  CheckEqI('T179 cps reads sz', sz, 200);
+  CheckEqI('T180 cps reads n',  n,  2);
+  FreeParse(p);
+
+  { Shrink header: 2 → 1 byte sz }
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_TEXT, 100, nil);
+  if p.nBlobAlloc < p.nBlob + 100 then jsonBlobExpand(@p, p.nBlob + 100);
+  p.aBlob[2] := Ord('A');
+  p.nBlob := 2 + 100;
+  delta := jsonBlobChangePayloadSize(@p, 0, 5);
+  CheckEqI('T181 cps shrink delta=-1', delta, -1);
+  CheckTrue('T182 cps shrink hdr',
+            p.aBlob[0] = (JSONB_TEXT or (5 shl 4)));
+  CheckTrue('T183 cps shrink moved A',  p.aBlob[1] = Ord('A'));
+  FreeParse(p);
+end;
+
+procedure TestArrayCount;
+var p: TJsonParse; cnt, sz: u32;
+begin
+  { Build [1,2,3] in JSONB:
+    JSONB_ARRAY hdr (sz=3 small) + 3 INT entries each 1-byte hdr+1-byte payload }
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_ARRAY, 6, nil);  { sz=6: 3*(hdr+payload) }
+  jsonBlobAppendNode(@p, JSONB_INT,   1, PAnsiChar('1'));
+  jsonBlobAppendNode(@p, JSONB_INT,   1, PAnsiChar('2'));
+  jsonBlobAppendNode(@p, JSONB_INT,   1, PAnsiChar('3'));
+  cnt := jsonbArrayCount(@p, 0);
+  CheckEqI('T184 arrayCount=3', cnt, 3);
+  { sentinel: array hdr decoded ok }
+  jsonbPayloadSize(@p, 0, sz);
+  CheckEqI('T185 arrayCount sz=6', sz, 6);
+  FreeParse(p);
+end;
+
+procedure TestBlobEdit;
+var
+  p: TJsonParse;
+  payload: array[0..2] of u8 = (Ord('A'), Ord('B'), Ord('C'));
+begin
+  { Pure delete (aIns=nil bypasses overwrite-fast-path): drop bytes 1..2
+    of "hello" → "hlo". }
+  InitParse(p);
+  jsonBlobExpand(@p, 5);
+  Move(PAnsiChar('hello')^, p.aBlob^, 5);
+  p.nBlob := 5;
+  jsonBlobEdit(@p, 1, 2, nil, 0);
+  CheckEqI('T186 del nBlob',       p.nBlob, 3);
+  CheckTrue('T187 del byte0',      p.aBlob[0] = Ord('h'));
+  CheckTrue('T188 del byte1',      p.aBlob[1] = Ord('l'));
+  CheckTrue('T189 del byte2',      p.aBlob[2] = Ord('o'));
+  CheckEqI('T190 del delta=-2',    p.delta, -2);
+  FreeParse(p);
+
+  { Insert: replace 0 bytes at index 2 with 3 bytes "ABC" }
+  InitParse(p);
+  jsonBlobExpand(@p, 5);
+  Move(PAnsiChar('hello')^, p.aBlob^, 5);
+  p.nBlob := 5;
+  jsonBlobEdit(@p, 2, 0, @payload[0], 3);
+  CheckEqI('T192 ins nBlob', p.nBlob, 8);
+  CheckTrue('T193 ins b0',   p.aBlob[0] = Ord('h'));
+  CheckTrue('T194 ins b2',   p.aBlob[2] = Ord('A'));
+  CheckTrue('T195 ins b4',   p.aBlob[4] = Ord('C'));
+  CheckTrue('T196 ins b5',   p.aBlob[5] = Ord('l'));
+  CheckEqI('T197 ins delta=+3', p.delta, 3);
+  FreeParse(p);
+end;
+
+procedure TestAfterEditSizeAdjust;
+var
+  p: TJsonParse;
+  sz: u32;
+  n: u32;
+begin
+  { Build array hdr with sz=6, then simulate that an edit shrunk the
+    contents by 2 — afterEditSizeAdjust must update the header. }
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_ARRAY, 6, nil);
+  if p.nBlobAlloc < p.nBlob + 6 then jsonBlobExpand(@p, p.nBlob + 6);
+  p.nBlob := 1 + 6;
+  p.delta := -2;
+  { Pretend nBlob is post-edit (=5). }
+  p.nBlob := 5;
+  jsonAfterEditSizeAdjust(@p, 0);
+  n := jsonbPayloadSize(@p, 0, sz);
+  CheckEqI('T198 aesa sz=4',  sz, 4);
+  CheckEqI('T199 aesa n=1',   n, 1);
+  FreeParse(p);
+end;
+
+begin
+  WriteLn('=== TestJson — Phase 6.8.a/b/c JSON foundation + accumulator + blob ===');
   TestTypeNames;
   TestIsspace;
   TestSpacesString;
@@ -448,6 +689,15 @@ begin
   TestAppendString;
   TestStringSpill;
   TestStringNil;
+  TestBlobExpand;
+  TestBlobMakeEditable;
+  TestBlobAppendOneByte;
+  TestBlobAppendNode;
+  TestPayloadSize;
+  TestChangePayloadSize;
+  TestArrayCount;
+  TestBlobEdit;
+  TestAfterEditSizeAdjust;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);

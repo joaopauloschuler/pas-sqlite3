@@ -20,6 +20,63 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.8.c JsonParse blob primitives.**  Lands the
+    JSONB editing surface: byte-accurate ports of `jsonBlobExpand`,
+    `jsonBlobMakeEditable`, `jsonBlobAppendOneByte`, `jsonBlobAppendNode`
+    (+ slow-path expand-and-append), `jsonBlobChangePayloadSize`,
+    `jsonbPayloadSize`, `jsonbArrayCount`, `jsonAfterEditSizeAdjust`,
+    `jsonBlobOverwrite`, `jsonBlobEdit`.  All header-size variants
+    (1/2/3/5/9-byte sz fields) and the in-place "denormalize header to
+    avoid memmove" optimisation in `jsonBlobOverwrite` are preserved.
+
+    Concrete changes:
+      * `src/passqlite3json.pas` — adds the blob primitive surface
+        (~270 lines: 10 routines + the `aType[]` overwrite lookup).
+        Allocations route through `sqlite3DbRealloc` on `pParse^.db`;
+        OOM sets `pParse^.oom` and writes silently no-op (matches C).
+      * `src/tests/TestJson.pas` — adds T140..T199 (60 new asserts:
+        expand grow path, makeEditable copy-out, appendOneByte spill,
+        appendNode for 1/2/3/5-byte hdrs, payloadSize parse for each,
+        changePayloadSize +/- header transitions with payload move,
+        arrayCount over [1,2,3], blobEdit pure-delete and pure-insert,
+        afterEditSizeAdjust delta application).  **198/198 PASS** (was
+        139/139).
+      * Regression spot check: TestPrintf 105/105, TestVtab 216/216,
+        TestParser 45/45, TestSchemaBasic 44/44 — all green.
+
+    Discoveries / next-step notes:
+      * **`jsonbValidityCheck` deferred to 6.8.d.**  Its JSONB_TEXT5
+        escape arm calls `jsonUnescapeOneChar` (a 6.8.d helper), which
+        in turn needs `sqlite3Utf8ReadLimited` + the
+        `sqlite3Utf8Trans1[]` table — neither is in `passqlite3util`
+        yet.  Cleaner to land them as one slice in 6.8.d than to ship
+        a strictness-divergent partial validator here.  Task plan
+        amended: 6.8.c's surface no longer lists `jsonbValidityCheck`,
+        and 6.8.d's surface now lists it together with the helper
+        chain it depends on.
+      * **`jsonBlobOverwrite` is JSONB-shape-specific.**  Initial test
+        T186-T191 tried to exercise the d<0 fast path with a raw
+        "hello" buffer; it succeeded (because raw bytes happen to
+        parse as a 1-byte-header JSONB node) but produced
+        unexpected results.  Rewrote as a pure delete (aIns=nil
+        bypasses the overwrite branch outright), which exercises
+        the canonical memmove + delta-update path.  When 6.8.f tests
+        editing real JSONB structures, the overwrite fast path will
+        get exercised naturally.
+      * **Pascal `case` default is `else`.**  In `jsonBlobOverwrite`'s
+        switch on `aIns[0] shr 4`, the C `default` branch (handling
+        header sizes 0..11, i.e. all "small" payloads) is the most
+        common case.  Pascal's `case ... else` matches it exactly.
+      * **i64 widening on `delta` math.**  `jsonBlobChangePayloadSize`
+        and `jsonBlobEdit` both compute `nBlob + delta` where delta
+        can be negative.  Done explicitly via `i64()` casts before
+        re-narrowing to `u32` for the assignment to keep FPC's
+        unsigned-arithmetic semantics from biting.
+      * `jsonbPayloadSize` is now usable from the rest of json.pas;
+        6.8.d's text-to-blob translator reads it on every node it
+        consumes, and 6.8.e's blob-to-text reader is ~80% calls into
+        this single helper.
+
   - **2026-04-26 — Phase 6.8.b JsonString accumulator.**  Lands the
     string-builder layer of the JSON port: `jsonStringInit/Zero/Reset/
     Oom/TooDeep/Grow/ExpandAndAppend`, `jsonAppendRaw/RawNZ/Char/
@@ -3291,14 +3348,24 @@ reference exactly.
     `jsonReturnStringAsBlob` (need vdbe `sqlite3_result_*` and the
     text↔blob translators from 6.8.d/e).  See "Most recent activity"
     entry.
-  - [ ] **6.8.c** JsonParse blob primitives — `jsonBlobExpand`,
+  - [X] **6.8.c** JsonParse blob primitives — `jsonBlobExpand`,
     `jsonBlobMakeEditable`, `jsonBlobAppendOneByte`,
     `jsonBlobAppendNode`, `jsonBlobChangePayloadSize`,
-    `jsonbValidityCheck`, `jsonbPayloadSize`, `jsonBlobOverwrite`,
+    `jsonbPayloadSize`, `jsonBlobOverwrite`,
     `jsonBlobEdit`, `jsonAfterEditSizeAdjust`, `jsonbArrayCount`.
+    DONE 2026-04-26.  Gate `TestJson.pas` 198/198 PASS (was 139/139).
+    **`jsonbValidityCheck` deferred to 6.8.d** — the JSONB_TEXT5 escape
+    branch needs `jsonUnescapeOneChar`, which is itself a 6.8.d helper
+    (it depends on `sqlite3Utf8ReadLimited` + `sqlite3Utf8Trans1`,
+    neither yet in `passqlite3util`).  Cleaner to land both together
+    in 6.8.d than to introduce a strictness divergence here.
   - [ ] **6.8.d** Text→blob translator — `jsonTranslateTextToBlob`,
     `jsonConvertTextToBlob`, `jsonAppendControlChar`,
-    `jsonUnescapeOneChar`, `jsonBytesToBypass`, `jsonLabelCompare(d)`.
+    `jsonUnescapeOneChar`, `jsonBytesToBypass`, `jsonLabelCompare(d)`,
+    plus `jsonbValidityCheck` (deferred from 6.8.c — needs
+    `jsonUnescapeOneChar`).  Will also require porting
+    `sqlite3Utf8ReadLimited` / `sqlite3Utf8Trans1` into
+    `passqlite3util` (small, ~30 lines).
   - [ ] **6.8.e** Blob→text + pretty — `jsonTranslateBlobToText`,
     `jsonPrettyIndent`, `jsonTranslateBlobToPrettyText`,
     `jsonReturnTextJsonFromBlob`, `jsonReturnParse`.

@@ -358,6 +358,34 @@ procedure jsonAppendSeparator(p: PJsonString);
 procedure jsonAppendControlChar(p: PJsonString; c: u8);
 procedure jsonAppendString(p: PJsonString; zIn: PAnsiChar; N: u32);
 
+{ ===========================================================================
+  JsonParse blob primitives (Phase 6.8.c)
+
+  Editing primitives for the JSONB on-disk representation held in
+  TJsonParse.aBlob[].  All allocations go through sqlite3DbRealloc on
+  pParse^.db so they share the connection-bound pool with the rest of
+  the JSON unit; on OOM, pParse^.oom is set and writes silently no-op.
+
+  Note: jsonbValidityCheck deferred to 6.8.d since its JSONB_TEXT5
+  branch needs jsonUnescapeOneChar (also a 6.8.d helper). The blob
+  *editing* surface here is fully self-contained.
+  =========================================================================== }
+
+function  jsonBlobExpand(pParse: PJsonParse; N: u32): i32;
+function  jsonBlobMakeEditable(pParse: PJsonParse; nExtra: u32): i32;
+procedure jsonBlobAppendOneByte(pParse: PJsonParse; c: u8);
+procedure jsonBlobAppendNode(pParse: PJsonParse; eType: u8; szPayload: u64;
+                             aPayload: Pointer);
+function  jsonBlobChangePayloadSize(pParse: PJsonParse; i: u32;
+                                    szPayload: u32): i32;
+function  jsonbPayloadSize(pParse: PJsonParse; i: u32; out pSz: u32): u32;
+function  jsonbArrayCount(pParse: PJsonParse; iRoot: u32): u32;
+procedure jsonAfterEditSizeAdjust(pParse: PJsonParse; iRoot: u32);
+function  jsonBlobOverwrite(aOut: PByte; aIns: PByte; nIns: u32;
+                            d: u32): i32;
+procedure jsonBlobEdit(pParse: PJsonParse; iDel, nDel: u32;
+                       aIns: PByte; nIns: u32);
+
 implementation
 
 function jsonIsspace(c: AnsiChar): i32; inline;
@@ -760,6 +788,361 @@ begin
   end;
   p^.zBuf[p^.nUsed] := '"';
   p^.nUsed := p^.nUsed + 1;
+end;
+
+{ ===========================================================================
+  JsonParse blob primitives — Phase 6.8.c implementation
+  =========================================================================== }
+
+function jsonBlobExpand(pParse: PJsonParse; N: u32): i32;
+var
+  aNew : PByte;
+  t    : u64;
+begin
+  { assert N>nBlobAlloc }
+  if pParse^.nBlobAlloc = 0 then
+    t := 100
+  else
+    t := u64(pParse^.nBlobAlloc) * 2;
+  if t < N then t := u64(N) + 100;
+  aNew := PByte(sqlite3DbRealloc(pParse^.db, pParse^.aBlob, t));
+  if aNew = nil then
+  begin
+    pParse^.oom := 1;
+    Result := 1;
+    Exit;
+  end;
+  pParse^.aBlob := aNew;
+  pParse^.nBlobAlloc := u32(t);
+  Result := 0;
+end;
+
+function jsonBlobMakeEditable(pParse: PJsonParse; nExtra: u32): i32;
+var
+  aOld  : PByte;
+  nSize : u32;
+begin
+  if pParse^.oom <> 0 then begin Result := 0; Exit; end;
+  if pParse^.nBlobAlloc > 0 then begin Result := 1; Exit; end;
+  aOld := pParse^.aBlob;
+  nSize := pParse^.nBlob + nExtra;
+  pParse^.aBlob := nil;
+  if jsonBlobExpand(pParse, nSize) <> 0 then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  if pParse^.nBlob > 0 then
+    Move(aOld^, pParse^.aBlob^, pParse^.nBlob);
+  Result := 1;
+end;
+
+procedure jsonBlobAppendOneByte(pParse: PJsonParse; c: u8);
+begin
+  if pParse^.nBlob >= pParse^.nBlobAlloc then
+    if jsonBlobExpand(pParse, pParse^.nBlob + 1) <> 0 then Exit;
+  pParse^.aBlob[pParse^.nBlob] := c;
+  pParse^.nBlob := pParse^.nBlob + 1;
+end;
+
+procedure jsonBlobAppendNode(pParse: PJsonParse; eType: u8; szPayload: u64;
+                             aPayload: Pointer);
+var
+  a : PByte;
+begin
+  if u64(pParse^.nBlob) + szPayload + 9 > u64(pParse^.nBlobAlloc) then
+    if jsonBlobExpand(pParse, u32(u64(pParse^.nBlob) + szPayload + 9)) <> 0 then
+      Exit;
+  a := @pParse^.aBlob[pParse^.nBlob];
+  if szPayload <= 11 then
+  begin
+    a[0] := eType or u8(szPayload shl 4);
+    pParse^.nBlob := pParse^.nBlob + 1;
+  end
+  else if szPayload <= $FF then
+  begin
+    a[0] := eType or $C0;
+    a[1] := u8(szPayload and $FF);
+    pParse^.nBlob := pParse^.nBlob + 2;
+  end
+  else if szPayload <= $FFFF then
+  begin
+    a[0] := eType or $D0;
+    a[1] := u8((szPayload shr 8) and $FF);
+    a[2] := u8(szPayload and $FF);
+    pParse^.nBlob := pParse^.nBlob + 3;
+  end
+  else
+  begin
+    a[0] := eType or $E0;
+    a[1] := u8((szPayload shr 24) and $FF);
+    a[2] := u8((szPayload shr 16) and $FF);
+    a[3] := u8((szPayload shr 8) and $FF);
+    a[4] := u8(szPayload and $FF);
+    pParse^.nBlob := pParse^.nBlob + 5;
+  end;
+  if aPayload <> nil then
+  begin
+    pParse^.nBlob := pParse^.nBlob + u32(szPayload);
+    Move(aPayload^, pParse^.aBlob[pParse^.nBlob - u32(szPayload)],
+         szPayload);
+  end;
+end;
+
+function jsonBlobChangePayloadSize(pParse: PJsonParse; i: u32;
+                                   szPayload: u32): i32;
+var
+  a       : PByte;
+  szType  : u8;
+  nExtra  : u8;
+  nNeeded : u8;
+  delta   : i32;
+  newSize : u32;
+begin
+  if pParse^.oom <> 0 then begin Result := 0; Exit; end;
+  a := @pParse^.aBlob[i];
+  szType := a[0] shr 4;
+  if szType <= 11 then nExtra := 0
+  else if szType = 12 then nExtra := 1
+  else if szType = 13 then nExtra := 2
+  else if szType = 14 then nExtra := 4
+  else nExtra := 8;
+  if szPayload <= 11 then nNeeded := 0
+  else if szPayload <= $FF then nNeeded := 1
+  else if szPayload <= $FFFF then nNeeded := 2
+  else nNeeded := 4;
+  delta := i32(nNeeded) - i32(nExtra);
+  if delta <> 0 then
+  begin
+    newSize := u32(i64(pParse^.nBlob) + delta);
+    if delta > 0 then
+    begin
+      if (newSize > pParse^.nBlobAlloc)
+         and (jsonBlobExpand(pParse, newSize) <> 0) then
+      begin
+        Result := 0;
+        Exit;
+      end;
+      a := @pParse^.aBlob[i];
+      Move(a[1], a[1 + delta], pParse^.nBlob - (i + 1));
+    end
+    else
+    begin
+      Move(a[1 - delta], a[1], pParse^.nBlob - (i + 1 - u32(-delta)));
+    end;
+    pParse^.nBlob := newSize;
+  end;
+  if nNeeded = 0 then
+    a[0] := (a[0] and $0F) or u8(szPayload shl 4)
+  else if nNeeded = 1 then
+  begin
+    a[0] := (a[0] and $0F) or $C0;
+    a[1] := u8(szPayload and $FF);
+  end
+  else if nNeeded = 2 then
+  begin
+    a[0] := (a[0] and $0F) or $D0;
+    a[1] := u8((szPayload shr 8) and $FF);
+    a[2] := u8(szPayload and $FF);
+  end
+  else
+  begin
+    a[0] := (a[0] and $0F) or $E0;
+    a[1] := u8((szPayload shr 24) and $FF);
+    a[2] := u8((szPayload shr 16) and $FF);
+    a[3] := u8((szPayload shr 8) and $FF);
+    a[4] := u8(szPayload and $FF);
+  end;
+  Result := delta;
+end;
+
+function jsonbPayloadSize(pParse: PJsonParse; i: u32; out pSz: u32): u32;
+var
+  x  : u8;
+  sz : u32;
+  n  : u32;
+begin
+  x := pParse^.aBlob[i] shr 4;
+  if x <= 11 then
+  begin
+    sz := x;
+    n := 1;
+  end
+  else if x = 12 then
+  begin
+    if i + 1 >= pParse^.nBlob then
+    begin
+      pSz := 0;
+      Result := 0;
+      Exit;
+    end;
+    sz := pParse^.aBlob[i + 1];
+    n := 2;
+  end
+  else if x = 13 then
+  begin
+    if i + 2 >= pParse^.nBlob then
+    begin
+      pSz := 0;
+      Result := 0;
+      Exit;
+    end;
+    sz := (u32(pParse^.aBlob[i + 1]) shl 8) + pParse^.aBlob[i + 2];
+    n := 3;
+  end
+  else if x = 14 then
+  begin
+    if i + 4 >= pParse^.nBlob then
+    begin
+      pSz := 0;
+      Result := 0;
+      Exit;
+    end;
+    sz := (u32(pParse^.aBlob[i + 1]) shl 24)
+        + (u32(pParse^.aBlob[i + 2]) shl 16)
+        + (u32(pParse^.aBlob[i + 3]) shl 8)
+        +  u32(pParse^.aBlob[i + 4]);
+    n := 5;
+  end
+  else
+  begin
+    if (i + 8 >= pParse^.nBlob)
+       or (pParse^.aBlob[i + 1] <> 0)
+       or (pParse^.aBlob[i + 2] <> 0)
+       or (pParse^.aBlob[i + 3] <> 0)
+       or (pParse^.aBlob[i + 4] <> 0) then
+    begin
+      pSz := 0;
+      Result := 0;
+      Exit;
+    end;
+    sz := (u32(pParse^.aBlob[i + 5]) shl 24)
+        + (u32(pParse^.aBlob[i + 6]) shl 16)
+        + (u32(pParse^.aBlob[i + 7]) shl 8)
+        +  u32(pParse^.aBlob[i + 8]);
+    n := 9;
+  end;
+  if (i64(i) + sz + n > i64(pParse^.nBlob))
+     and (i64(i) + sz + n > i64(pParse^.nBlob) - i64(pParse^.delta)) then
+  begin
+    pSz := 0;
+    Result := 0;
+    Exit;
+  end;
+  pSz := sz;
+  Result := n;
+end;
+
+function jsonbArrayCount(pParse: PJsonParse; iRoot: u32): u32;
+var
+  n, sz, i, iEnd, k : u32;
+begin
+  k := 0;
+  sz := 0;
+  n := jsonbPayloadSize(pParse, iRoot, sz);
+  iEnd := iRoot + n + sz;
+  i := iRoot + n;
+  while (n > 0) and (i < iEnd) do
+  begin
+    n := jsonbPayloadSize(pParse, i, sz);
+    i := i + sz + n;
+    Inc(k);
+  end;
+  Result := k;
+end;
+
+procedure jsonAfterEditSizeAdjust(pParse: PJsonParse; iRoot: u32);
+var
+  sz, nBlob : u32;
+begin
+  sz := 0;
+  nBlob := pParse^.nBlob;
+  pParse^.nBlob := pParse^.nBlobAlloc;
+  jsonbPayloadSize(pParse, iRoot, sz);
+  pParse^.nBlob := nBlob;
+  sz := u32(i64(sz) + i64(pParse^.delta));
+  pParse^.delta := pParse^.delta
+                 + jsonBlobChangePayloadSize(pParse, iRoot, sz);
+end;
+
+function jsonBlobOverwrite(aOut: PByte; aIns: PByte; nIns: u32;
+                           d: u32): i32;
+const
+  aType : array[0..7] of u8 = ($C0, $D0, 0, $E0, 0, 0, 0, $F0);
+var
+  szPayload : u32;
+  i         : u32;
+  szHdr     : u8;
+begin
+  if (aIns[0] and $0F) <= 2 then begin Result := 0; Exit; end;
+  case aIns[0] shr 4 of
+    12:
+    begin
+      if ((1 shl d) and $8A) = 0 then begin Result := 0; Exit; end;
+      i := d + 2;
+      szHdr := 2;
+    end;
+    13:
+    begin
+      if (d <> 2) and (d <> 6) then begin Result := 0; Exit; end;
+      i := d + 3;
+      szHdr := 3;
+    end;
+    14:
+    begin
+      if d <> 4 then begin Result := 0; Exit; end;
+      i := 9;
+      szHdr := 5;
+    end;
+    15:
+    begin
+      Result := 0;
+      Exit;
+    end;
+  else
+    begin
+      if ((1 shl d) and $116) = 0 then begin Result := 0; Exit; end;
+      i := d + 1;
+      szHdr := 1;
+    end;
+  end;
+  aOut[0] := (aIns[0] and $0F) or aType[i - 2];
+  Move(aIns[szHdr], aOut[i], nIns - szHdr);
+  szPayload := nIns - szHdr;
+  while True do
+  begin
+    Dec(i);
+    aOut[i] := u8(szPayload and $FF);
+    if i = 1 then Break;
+    szPayload := szPayload shr 8;
+  end;
+  Result := 1;
+end;
+
+procedure jsonBlobEdit(pParse: PJsonParse; iDel, nDel: u32;
+                       aIns: PByte; nIns: u32);
+var
+  d : i64;
+begin
+  d := i64(nIns) - i64(nDel);
+  if (d < 0) and (d >= -8) and (aIns <> nil)
+     and (jsonBlobOverwrite(@pParse^.aBlob[iDel], aIns, nIns, u32(-d)) <> 0)
+  then Exit;
+  if d <> 0 then
+  begin
+    if i64(pParse^.nBlob) + d > i64(pParse^.nBlobAlloc) then
+    begin
+      jsonBlobExpand(pParse, u32(i64(pParse^.nBlob) + d));
+      if pParse^.oom <> 0 then Exit;
+    end;
+    Move(pParse^.aBlob[iDel + nDel],
+         pParse^.aBlob[iDel + nIns],
+         pParse^.nBlob - (iDel + nDel));
+    pParse^.nBlob := u32(i64(pParse^.nBlob) + d);
+    pParse^.delta := pParse^.delta + i32(d);
+  end;
+  if (nIns <> 0) and (aIns <> nil) then
+    Move(aIns^, pParse^.aBlob[iDel], nIns);
 end;
 
 end.
