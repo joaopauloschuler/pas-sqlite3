@@ -1377,6 +1377,7 @@ procedure sqlite3VdbeMemSetPointer(pMem: PMem; pPtr: Pointer;
                                    zPType: PAnsiChar;
                                    xDestructor: TxDelProc);
 procedure sqlite3NoopDestructor(p: Pointer); cdecl;
+procedure sqlite3VdbeValueListFree(p: Pointer); cdecl;
 function  sqlite3VdbeMemSetStr(pMem: PMem; z: PAnsiChar; n: i64;
                                enc: u8; xDel: TxDelProc): i32;
 function  sqlite3VdbeMemSetText(pMem: PMem; z: PAnsiChar; n: i64;
@@ -2657,6 +2658,13 @@ end;
 { --- Cursor management --- }
 
 procedure sqlite3VdbeFreeCursorNN(p: PVdbe; pCx: PVdbeCursor);
+type
+  TxCloseFn = function(pCur: passqlite3vtab.PSqlite3VtabCursor): i32; cdecl;
+var
+  pVCur:   passqlite3vtab.PSqlite3VtabCursor;
+  pVtab:   passqlite3vtab.PSqlite3Vtab;
+  pModule: passqlite3vtab.PSqlite3Module;
+  xClose:  TxCloseFn;
 begin
   case pCx^.eCurType of
     CURTYPE_BTREE: begin
@@ -2676,7 +2684,22 @@ begin
           sqlite3BtreeCloseCursor(pCx^.uc.pCursor);
       end;
     end;
-    { CURTYPE_SORTER, CURTYPE_VTAB: defer to Phase 5.7 / 6.bis }
+    { CURTYPE_VTAB — Phase 6.bis.3b — vdbeaux.c:closeCursor }
+    CURTYPE_VTAB: begin
+      pVCur := passqlite3vtab.PSqlite3VtabCursor(pCx^.uc.pVCur);
+      if pVCur <> nil then begin
+        pVtab := pVCur^.pVtab;
+        if pVtab <> nil then begin
+          pModule := pVtab^.pModule;
+          if (pModule <> nil) and (pModule^.xClose <> nil) then begin
+            xClose := TxCloseFn(pModule^.xClose);
+            xClose(pVCur);
+          end;
+          if pVtab^.nRef > 0 then Dec(pVtab^.nRef);
+        end;
+      end;
+    end;
+    { CURTYPE_SORTER: defer to Phase 5.7 }
   end;
   { The cursor itself is part of aMem space; no free needed }
 end;
@@ -4276,6 +4299,29 @@ label
   agg_step1_body,
   op_program_run,
   op_function_body;
+type
+  { 6.bis.3b — typed function-pointer aliases for vtab module callbacks.
+    The Tsqlite3_module record stores most slots as Pointer; we cast at
+    the call site to obtain the proper cdecl signature. }
+  TxOpenFnV     = function(pVtab: passqlite3vtab.PSqlite3Vtab;
+                           ppCursor: passqlite3vtab.PPSqlite3VtabCursor): i32; cdecl;
+  TxCloseFnV    = function(pCur: passqlite3vtab.PSqlite3VtabCursor): i32; cdecl;
+  TxFilterFnV   = function(pCur: passqlite3vtab.PSqlite3VtabCursor;
+                           idxNum: i32; idxStr: PAnsiChar;
+                           argc: i32; argv: PPMem): i32; cdecl;
+  TxNextFnV     = function(pCur: passqlite3vtab.PSqlite3VtabCursor): i32; cdecl;
+  TxEofFnV      = function(pCur: passqlite3vtab.PSqlite3VtabCursor): i32; cdecl;
+  TxColumnFnV   = function(pCur: passqlite3vtab.PSqlite3VtabCursor;
+                           pCtx: Psqlite3_context; iCol: i32): i32; cdecl;
+  TxRowidFnV    = function(pCur: passqlite3vtab.PSqlite3VtabCursor;
+                           pRowid: Pi64): i32; cdecl;
+  TxRenameFnV   = function(pVtab: passqlite3vtab.PSqlite3Vtab;
+                           zNew: PAnsiChar): i32; cdecl;
+  TxUpdateFnV   = function(pVtab: passqlite3vtab.PSqlite3Vtab;
+                           argc: i32; argv: PPMem; pRowid: Pi64): i32; cdecl;
+  TxIntegrityFnV= function(pVtab: passqlite3vtab.PSqlite3Vtab;
+                           zSchema, zTabName: PAnsiChar; mFlags: i32;
+                           pzErr: PPAnsiChar): i32; cdecl;
 var
   aOp:   PVdbeOp;
   pOp:   PVdbeOp;
@@ -4432,6 +4478,23 @@ var
   pVTabRef:    passqlite3vtab.PVTable;  { OP_VBegin/VCreate/VDestroy: VTable* from p4 }
   sMemVCreate: TMem;                    { OP_VCreate: scratch Mem for table-name copy }
   zVTabName:   PAnsiChar;               { OP_VCreate: text of table name }
+  { 6.bis.3b locals — cursor-bearing vtab opcodes }
+  pVCurC:      passqlite3vtab.PSqlite3VtabCursor;  { vtab cursor (uc.pVCur cast) }
+  pVtabC:      passqlite3vtab.PSqlite3Vtab;        { sqlite3_vtab* (pVCur^.pVtab) }
+  pModC:       passqlite3vtab.PSqlite3Module;      { module pointer-table }
+  sCtxV:       Tsqlite3_context;        { OP_VColumn: stack-allocated context }
+  nullFnV:     TFuncDef;                { OP_VColumn: synthetic FuncDef }
+  apArgV:      array of PMem;           { OP_VFilter/VUpdate: argv buffer }
+  iVRow:       i64;                     { OP_VUpdate: out rowid }
+  iLegacyV:    i32;                     { OP_VRename: SQLITE_LegacyAlter saved bit }
+  zErrIntV:    PAnsiChar;               { OP_VCheck: integrity error msg }
+  iQueryV:     i32;                     { OP_VFilter: idx number }
+  nArgV:       i32;                     { OP_VFilter/VUpdate: arg count }
+  resV:        i32;                     { OP_VFilter/VNext: xEof result }
+  iV:          i32;                     { vtab opcode loop var }
+  pRhsV:       PValueList;              { OP_VInitIn: ValueList object }
+  pNameMem:    PMem;                    { OP_VRename: name register }
+  pVCurNew:    passqlite3vtab.PSqlite3VtabCursor;  { OP_VOpen: xOpen out param }
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -5409,6 +5472,16 @@ begin
         pOut^.flags := MEM_Null;
       end else if pCur^.deferredMoveto <> 0 then begin
         pOut^.u.i := pCur^.movetoTarget;
+      end else if pCur^.eCurType = CURTYPE_VTAB then begin
+        { Phase 6.bis.3b — vdbe.c:6171 }
+        pVCurC := passqlite3vtab.PSqlite3VtabCursor(pCur^.uc.pVCur);
+        Assert(pVCurC <> nil, 'OP_Rowid VTAB pVCur');
+        pVtabC := pVCurC^.pVtab;
+        pModC  := pVtabC^.pModule;
+        Assert(pModC^.xRowid <> nil, 'OP_Rowid xRowid');
+        rc := TxRowidFnV(pModC^.xRowid)(pVCurC, @pOut^.u.i);
+        passqlite3vtab.sqlite3VtabImportErrmsg(v, pVtabC);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
       end else begin
         rc := sqlite3VdbeCursorRestore(pCur);
         if rc <> SQLITE_OK then goto abort_due_to_error;
@@ -7298,14 +7371,230 @@ begin
       if rc <> SQLITE_OK then goto abort_due_to_error;
     end;
 
-    { ────── OP_VOpen, OP_VFilter, OP_VColumn, OP_VUpdate, OP_VNext,
-             OP_VCheck, OP_VInitIn, OP_VRename ────── — Phase 6.bis.3b stubs }
-    OP_VOpen, OP_VFilter, OP_VColumn, OP_VUpdate, OP_VNext,
-    OP_VCheck, OP_VInitIn, OP_VRename: begin
-      { Stub: cursor-bearing vtab opcodes deferred to Phase 6.bis.3b }
-      rc := SQLITE_ERROR;
-      sqlite3VdbeError(v, 'virtual table not supported');
-      goto abort_due_to_error;
+    { ────── OP_VOpen (vdbe.c:8356) ────── Phase 6.bis.3b }
+    OP_VOpen: begin
+      pVTabRef := passqlite3vtab.PVTable(pOp^.p4.pVtab);
+      pCur     := v^.apCsr[pOp^.p1];
+      pVtabC   := nil;
+      if pVTabRef <> nil then pVtabC := pVTabRef^.pVtab;
+      { No-op if cursor is already open on the same vtab }
+      if (pCur <> nil) and (pCur^.eCurType = CURTYPE_VTAB)
+         and (pCur^.uc.pVCur <> nil)
+         and (passqlite3vtab.PSqlite3VtabCursor(pCur^.uc.pVCur)^.pVtab = pVtabC) then
+      begin
+        { already open — fall through }
+      end else begin
+        if (pVtabC = nil) or (pVtabC^.pModule = nil) then begin
+          rc := SQLITE_LOCKED;
+          goto abort_due_to_error;
+        end;
+        pModC    := pVtabC^.pModule;
+        pVCurNew := nil;
+        if pModC^.xOpen <> nil then
+          rc := TxOpenFnV(pModC^.xOpen)(pVtabC, @pVCurNew)
+        else
+          rc := SQLITE_ERROR;
+        passqlite3vtab.sqlite3VtabImportErrmsg(v, pVtabC);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+        pVCurNew^.pVtab := pVtabC;
+        pCur := allocateCursor(v, pOp^.p1, 0, CURTYPE_VTAB);
+        if pCur = nil then begin
+          if pModC^.xClose <> nil then
+            TxCloseFnV(pModC^.xClose)(pVCurNew);
+          goto no_mem;
+        end;
+        pCur^.uc.pVCur := Psqlite3_vtab_cursor(pVCurNew);
+        Inc(pVtabC^.nRef);
+      end;
+    end;
+
+    { ────── OP_VFilter (vdbe.c:8493) ────── Phase 6.bis.3b }
+    OP_VFilter: begin
+      pIn1 := @aMem[pOp^.p3];           { pQuery }
+      pIn2 := @aMem[pOp^.p3 + 1];       { pArgc }
+      pCur := v^.apCsr[pOp^.p1];
+      Assert(pCur <> nil, 'OP_VFilter cursor');
+      Assert(pCur^.eCurType = CURTYPE_VTAB, 'OP_VFilter eCurType');
+      pVCurC := passqlite3vtab.PSqlite3VtabCursor(pCur^.uc.pVCur);
+      pVtabC := pVCurC^.pVtab;
+      pModC  := pVtabC^.pModule;
+      nArgV  := i32(pIn2^.u.i);
+      iQueryV := i32(pIn1^.u.i);
+      SetLength(apArgV, nArgV);
+      for iV := 0 to nArgV - 1 do
+        apArgV[iV] := @aMem[pOp^.p3 + 2 + iV];
+      if pModC^.xFilter <> nil then begin
+        if nArgV > 0 then
+          rc := TxFilterFnV(pModC^.xFilter)(pVCurC, iQueryV, pOp^.p4.z,
+                                            nArgV, @apArgV[0])
+        else
+          rc := TxFilterFnV(pModC^.xFilter)(pVCurC, iQueryV, pOp^.p4.z,
+                                            nArgV, nil);
+      end else
+        rc := SQLITE_ERROR;
+      passqlite3vtab.sqlite3VtabImportErrmsg(v, pVtabC);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+      resV := 1;
+      if pModC^.xEof <> nil then
+        resV := TxEofFnV(pModC^.xEof)(pVCurC);
+      pCur^.nullRow := 0;
+      if resV <> 0 then goto jump_to_p2;
+    end;
+
+    { ────── OP_VColumn (vdbe.c:8554) ────── Phase 6.bis.3b }
+    OP_VColumn: begin
+      pCur := v^.apCsr[pOp^.p1];
+      Assert(pCur <> nil, 'OP_VColumn cursor');
+      pOut := @aMem[pOp^.p3];
+      if pCur^.nullRow <> 0 then begin
+        sqlite3VdbeMemSetNull(pOut);
+      end else begin
+        Assert(pCur^.eCurType = CURTYPE_VTAB, 'OP_VColumn eCurType');
+        pVCurC := passqlite3vtab.PSqlite3VtabCursor(pCur^.uc.pVCur);
+        pVtabC := pVCurC^.pVtab;
+        pModC  := pVtabC^.pModule;
+        FillChar(sCtxV,    SizeOf(sCtxV),    0);
+        FillChar(nullFnV,  SizeOf(nullFnV),  0);
+        sCtxV.pOut := pOut;
+        sCtxV.enc  := enc;
+        nullFnV.funcFlags := u32($01000000);  { SQLITE_RESULT_SUBTYPE }
+        sCtxV.pFunc := PFuncDef(@nullFnV);
+        Assert((pOp^.p5 = OPFLAG_NOCHNG) or (pOp^.p5 = 0), 'OP_VColumn p5');
+        if (pOp^.p5 and OPFLAG_NOCHNG) <> 0 then begin
+          sqlite3VdbeMemSetNull(pOut);
+          pOut^.flags := MEM_Null or MEM_Zero;
+          pOut^.u.nZero := 0;
+        end else begin
+          pOut^.flags := (pOut^.flags and not u16(MEM_TypeMask or MEM_Zero)) or MEM_Null;
+        end;
+        if pModC^.xColumn <> nil then
+          rc := TxColumnFnV(pModC^.xColumn)(pVCurC, @sCtxV, pOp^.p2)
+        else
+          rc := SQLITE_ERROR;
+        passqlite3vtab.sqlite3VtabImportErrmsg(v, pVtabC);
+        if sCtxV.isError > 0 then begin
+          sqlite3VdbeError(v, PAnsiChar(sqlite3_value_text(pOut)));
+          rc := sCtxV.isError;
+        end;
+        sqlite3VdbeChangeEncoding(pOut, enc);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+      end;
+    end;
+
+    { ────── OP_VNext (vdbe.c:8610) ────── Phase 6.bis.3b }
+    OP_VNext: begin
+      pCur := v^.apCsr[pOp^.p1];
+      Assert(pCur <> nil, 'OP_VNext cursor');
+      Assert(pCur^.eCurType = CURTYPE_VTAB, 'OP_VNext eCurType');
+      if pCur^.nullRow <> 0 then begin
+        { fall through }
+      end else begin
+        pVCurC := passqlite3vtab.PSqlite3VtabCursor(pCur^.uc.pVCur);
+        pVtabC := pVCurC^.pVtab;
+        pModC  := pVtabC^.pModule;
+        if pModC^.xNext <> nil then
+          rc := TxNextFnV(pModC^.xNext)(pVCurC)
+        else
+          rc := SQLITE_ERROR;
+        passqlite3vtab.sqlite3VtabImportErrmsg(v, pVtabC);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+        resV := 1;
+        if pModC^.xEof <> nil then
+          resV := TxEofFnV(pModC^.xEof)(pVCurC);
+        if resV = 0 then goto jump_to_p2_and_check_for_interrupt;
+        goto check_for_interrupt;
+      end;
+    end;
+
+    { ────── OP_VRename (vdbe.c:8652) ────── Phase 6.bis.3b }
+    OP_VRename: begin
+      iLegacyV := i32(db^.flags and u64($04000000));  { SQLITE_LegacyAlter }
+      db^.flags := db^.flags or u64($04000000);
+      pVTabRef := passqlite3vtab.PVTable(pOp^.p4.pVtab);
+      pVtabC   := pVTabRef^.pVtab;
+      pNameMem := @aMem[pOp^.p1];
+      Assert(pVtabC^.pModule^.xRename <> nil, 'OP_VRename xRename');
+      Assert((pNameMem^.flags and MEM_Str) <> 0, 'OP_VRename MEM_Str');
+      rc := sqlite3VdbeChangeEncoding(pNameMem, SQLITE_UTF8);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+      rc := TxRenameFnV(pVtabC^.pModule^.xRename)(pVtabC, pNameMem^.z);
+      if iLegacyV = 0 then
+        db^.flags := db^.flags and not u64($04000000);
+      passqlite3vtab.sqlite3VtabImportErrmsg(v, pVtabC);
+      v^.vdbeFlags := v^.vdbeFlags and not u32(VDBF_EXPIRED_MASK);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
+    end;
+
+    { ────── OP_VUpdate (vdbe.c:8708) ────── Phase 6.bis.3b }
+    OP_VUpdate: begin
+      Assert((pOp^.p2 = 1) or (pOp^.p5 = OE_Fail) or (pOp^.p5 = OE_Rollback)
+          or (pOp^.p5 = OE_Abort) or (pOp^.p5 = OE_Ignore)
+          or (pOp^.p5 = OE_Replace), 'OP_VUpdate p5');
+      Assert((v^.vdbeFlags and VDBF_ReadOnly) = 0, 'OP_VUpdate readOnly');
+      if vdbeDbMallocFailed(db) then goto no_mem;
+      sqlite3VdbeIncrWriteCounter(v, nil);
+      pVTabRef := passqlite3vtab.PVTable(pOp^.p4.pVtab);
+      pVtabC   := pVTabRef^.pVtab;
+      if (pVtabC = nil) or (pVtabC^.pModule = nil) then begin
+        rc := SQLITE_LOCKED;
+        goto abort_due_to_error;
+      end;
+      pModC := pVtabC^.pModule;
+      nArgV := pOp^.p2;
+      Assert(pOp^.p4type = P4_VTAB, 'OP_VUpdate p4type');
+      if pModC^.xUpdate <> nil then begin
+        SetLength(apArgV, nArgV);
+        for iV := 0 to nArgV - 1 do
+          apArgV[iV] := @aMem[pOp^.p3 + iV];
+        db^.vtabOnConflict := u8(pOp^.p5);
+        iVRow := 0;
+        if nArgV > 0 then
+          rc := TxUpdateFnV(pModC^.xUpdate)(pVtabC, nArgV, @apArgV[0], @iVRow)
+        else
+          rc := TxUpdateFnV(pModC^.xUpdate)(pVtabC, nArgV, nil, @iVRow);
+        passqlite3vtab.sqlite3VtabImportErrmsg(v, pVtabC);
+        if (rc = SQLITE_OK) and (pOp^.p1 <> 0) then
+          db^.lastRowid := iVRow;
+        if ((rc and $FF) = SQLITE_CONSTRAINT) and (pVTabRef^.bConstraint <> 0) then begin
+          if pOp^.p5 = OE_Ignore then
+            rc := SQLITE_OK
+          else begin
+            if pOp^.p5 = OE_Replace then
+              v^.errorAction := OE_Abort
+            else
+              v^.errorAction := u8(pOp^.p5);
+          end;
+        end else
+          Inc(v^.nChange);
+        if rc <> SQLITE_OK then goto abort_due_to_error;
+      end;
+    end;
+
+    { ────── OP_VCheck (vdbe.c:8409) ────── Phase 6.bis.3b — stub
+      Requires Table* layout introspection (tabVtabPP / tabZName) which
+      lives in passqlite3vtab's implementation section.  Wiring this up
+      requires either exporting those helpers or porting the full Table
+      record into vdbe — both blocked on Phase 8.x.  For now, set the
+      output register to NULL (matches the "no errors seen" path) so
+      programs that include OP_VCheck for non-vtab targets continue to
+      run.  A vtab whose xIntegrity actually flags an error will not be
+      detected — flagged for revisit when Phase 8.x lands xIntegrity. }
+    OP_VCheck: begin
+      pOut := @aMem[pOp^.p2];
+      sqlite3VdbeMemSetNull(pOut);
+    end;
+
+    { ────── OP_VInitIn (vdbe.c:8456) ────── Phase 6.bis.3b }
+    OP_VInitIn: begin
+      pCur := v^.apCsr[pOp^.p1];
+      pRhsV := PValueList(sqlite3_malloc64(SizeOf(TValueList)));
+      if pRhsV = nil then goto no_mem;
+      pRhsV^.pCsr := pCur^.uc.pCursor;
+      pRhsV^.pOut := @aMem[pOp^.p3];
+      pOut := out2Prerelease(v, pOp);
+      pOut^.flags := MEM_Null;
+      sqlite3VdbeMemSetPointer(pOut, pRhsV, 'ValueList',
+                               @sqlite3VdbeValueListFree);
     end;
 
     else begin
@@ -8230,6 +8519,16 @@ begin
   pMem^.eSubtype := Ord('p');
   if Assigned(xDestructor) then pMem^.xDel := xDestructor
   else pMem^.xDel := @sqlite3NoopDestructor;
+end;
+
+{ -----------------------------------------------------------------------
+  sqlite3VdbeValueListFree (vdbeapi.c:1024) — Phase 6.bis.3b
+  Destructor callback for ValueList objects attached to a Mem via
+  sqlite3VdbeMemSetPointer (used by OP_VInitIn / sqlite3_vtab_in_*).
+  ----------------------------------------------------------------------- }
+procedure sqlite3VdbeValueListFree(p: Pointer); cdecl;
+begin
+  sqlite3_free(p);
 end;
 
 { -----------------------------------------------------------------------

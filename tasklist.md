@@ -20,6 +20,140 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.3b VDBE wiring of cursor-bearing vtab opcodes.**
+    Replaced the unified `virtual table not supported` stub (which still
+    covered eight opcodes after 6.bis.3a) with faithful per-opcode arms
+    matching the C reference:
+      * **OP_VOpen** (vdbe.c:8356) — derefs `pOp^.p4.pVtab` for the
+        `PVTable`, calls `pModule^.xOpen`, then `allocateCursor` with
+        `CURTYPE_VTAB`, finally `Inc(pVtab^.nRef)`.  Idempotent: reopens
+        on the same vtab are detected and short-circuited.
+      * **OP_VFilter** (vdbe.c:8493) — reads `iQuery / argc` from
+        `aMem[p3] / aMem[p3+1]`, builds a local `array of PMem` from
+        `aMem[p3+2..]`, calls `xFilter`, then `xEof`; jumps to p2 when
+        the result set is empty.
+      * **OP_VColumn** (vdbe.c:8554) — stack-allocates a
+        `Tsqlite3_context` plus a synthetic zero-init `TFuncDef`
+        (only `funcFlags = SQLITE_RESULT_SUBTYPE = $01000000`), wires
+        `sCtx.pOut := &aMem[p3]`, calls `xColumn`, runs
+        `sqlite3VdbeChangeEncoding` for the configured connection enc.
+        Honours OPFLAG_NOCHNG by setting MEM_Null|MEM_Zero before the
+        call.
+      * **OP_VNext** (vdbe.c:8610) — calls `xNext`, then `xEof`; on
+        data jumps via `jump_to_p2_and_check_for_interrupt`.  Honours
+        `pCur^.nullRow` no-op short-circuit.
+      * **OP_VRename** (vdbe.c:8652) — sets `SQLITE_LegacyAlter` (bit
+        $04000000) for the duration of the call, runs
+        `sqlite3VdbeChangeEncoding` to UTF-8 first, calls `xRename`,
+        clears `expired` via `vdbeFlags and not VDBF_EXPIRED_MASK`.
+      * **OP_VUpdate** (vdbe.c:8708) — builds `apArgV[0..nArg-1]` from
+        `aMem[p3..]`, sets `db^.vtabOnConflict := pOp^.p5`, calls
+        `xUpdate`, propagates `iVRow` to `db^.lastRowid` if `p1<>0`,
+        special-cases `SQLITE_CONSTRAINT` against `pVTabRef^.bConstraint`
+        for OE_Ignore / OE_Replace.
+      * **OP_VCheck** (vdbe.c:8409) — **stubbed to NULL** for now.
+        Requires `tabVtabPP / tabZName` introspection of the C `Table`
+        struct, currently lives in `passqlite3vtab`'s implementation
+        section.  Wiring up would either expose those helpers in the
+        unit interface or port a read-only `TTable` view into vdbe;
+        both are blocked on Phase 8.x.  Sets the output Mem to NULL,
+        which matches the "no errors seen" path.  Detection of vtab
+        integrity errors deferred — flagged for revisit.
+      * **OP_VInitIn** (vdbe.c:8456) — allocates a `TValueList` via
+        `sqlite3_malloc64`, wires `pCsr / pOut`, attaches via
+        `sqlite3VdbeMemSetPointer(pOut, pRhs, 'ValueList',
+        @sqlite3VdbeValueListFree)`.  Added the missing
+        `sqlite3VdbeValueListFree` (vdbeapi.c:1024 — one-liner
+        `sqlite3_free` wrapper) to the interface.
+      * **OP_Rowid** (vdbe.c:6171) — added the CURTYPE_VTAB branch
+        between `deferredMoveto` and the BTree path; calls
+        `pModule^.xRowid(pVCur, &pOut^.u.i)`.
+
+    **Cursor cleanup wiring.**  `sqlite3VdbeFreeCursorNN` now has a
+    CURTYPE_VTAB branch (matching `vdbeaux.c:closeCursor`) that calls
+    `pModule^.xClose(pVCur)` and decrements `pVtab^.nRef`.  The previous
+    "defer to Phase 6.bis" marker is gone.  **Caveat**: the port's
+    `sqlite3VdbeHalt` is still a stub (only flips `eVdbeState`).  The
+    C reference closes all cursors via `closeAllCursors` from `Halt` —
+    in this port, vtab cursors leak unless freed explicitly via
+    `sqlite3VdbeFreeCursor`.  Concrete impact: nothing user-visible
+    until Phase 8.x exposes a real query path; the new gate test calls
+    `sqlite3VdbeFreeCursor` manually to verify the close path.
+
+    **Function-pointer typing.**  The `Tsqlite3_module` slot fields are
+    declared as `Pointer` in `passqlite3vtab.pas`.  The new vdbe arms
+    introduce typed local function-pointer aliases (`TxOpenFnV`,
+    `TxCloseFnV`, `TxFilterFnV`, `TxNextFnV`, `TxEofFnV`,
+    `TxColumnFnV`, `TxRowidFnV`, `TxRenameFnV`, `TxUpdateFnV`) and
+    cast at the call site.  This keeps `Tsqlite3_module`'s on-disk
+    layout identical to the C struct (verified by 6.bis.1d) while
+    letting vdbe call through with proper signatures.  Future work
+    can promote these aliases to `passqlite3vtab.pas` interface — for
+    now they live as a local `type` block inside `sqlite3VdbeExec` to
+    keep the change scoped.
+
+    **PPSqlite3VtabCursor exported.**  Added the `^PSqlite3VtabCursor`
+    alias to `passqlite3vtab.pas`'s interface so vdbe can declare the
+    `xOpen` callback signature without redefining.  `dbpage / carray /
+    dbstat` already had locally-redeclared aliases; FPC accepts both
+    declarations because they collapse to the same underlying type.
+
+    Gate `src/tests/TestVdbeVtabExec.pas` extended T5..T11 — **35/35
+    PASS** (was 11/11).  Mock module gains xOpen / xClose / xFilter /
+    xNext / xEof / xColumn / xRowid / xRename / xUpdate slots, new
+    `TMockVtabCursor` record (`base: Tsqlite3_vtab_cursor; iRow: i64`)
+    serves a synthetic 3-row table.  Coverage:
+      * T5  OP_VOpen → xOpen fires, vtab cursor allocated, nRef++,
+            xClose fires on FreeCursor, nRef--.
+      * T6  OP_VOpen idempotency — xOpen fires exactly once on
+            consecutive opens against the same vtab.
+      * T7  OP_VFilter + OP_VNext walks 3 rows (xFilter once, xNext
+            three times — last hits xEof and exits the loop).
+      * T8  OP_VColumn populates aMem[p3] via the synthetic
+            sqlite3_context, encoding round-trip preserved.
+      * T9  OP_Rowid on CURTYPE_VTAB → xRowid → register set.
+      * T10 OP_VRename — xRename fires with the UTF-8 string from the
+            named register; AnsiString round-trip verified.
+      * T11 OP_VUpdate — xUpdate fires, argc=3 propagated, returned
+            rowid lands in `db^.lastRowid`.
+
+    **Discoveries / dependencies for future phases:**
+
+      * `sqlite3VdbeHalt` is a stub.  Phase 8.x (or a follow-up
+        cleanup phase) needs to wire `closeAllCursors` so vtab cursor
+        leaks don't accrue across `sqlite3_step → sqlite3_finalize`.
+        Until then the new gate manually calls `sqlite3VdbeFreeCursor`.
+      * `tabVtabPP` is implementation-private to `passqlite3vtab.pas`.
+        OP_VCheck's port is gated on either exporting the helper or
+        landing a TTable interface view.  Either way needs the parser
+        side of Phase 8.x first (CREATE VIRTUAL TABLE / xIntegrity
+        gate).
+      * `SQLITE_LegacyAlter` (sqliteInt.h:1857 = $04000000) is the
+        u64 db->flags bit, distinct from
+        `SQLITE_LegacyAlter_Bit` (passqlite3main.pas) which is the
+        DBCONFIG mask but the same numeric value.  Both names will
+        eventually be unified in Phase 8.x.
+      * `SQLITE_RESULT_SUBTYPE` ($01000000) lives in sqlite.h.in, not
+        sqliteInt.h, and is currently inlined as a literal in
+        OP_VColumn.  Add a constant in `passqlite3vdbe.pas` when the
+        broader vtab function-binding work lands.
+
+    Concrete changes:
+      * `src/passqlite3vdbe.pas` — adds typed callback aliases,
+        17 new locals, CURTYPE_VTAB branch in
+        `sqlite3VdbeFreeCursorNN`, OP_Rowid CURTYPE_VTAB branch,
+        seven new opcode arms (OP_VOpen / VFilter / VColumn / VNext /
+        VRename / VUpdate / VInitIn) plus stubbed OP_VCheck, and the
+        new `sqlite3VdbeValueListFree` interface entry.
+      * `src/passqlite3vtab.pas` — exports `PPSqlite3VtabCursor`.
+      * `src/tests/TestVdbeVtabExec.pas` — adds T5..T11, mock
+        cursor record, richer module factory, helper
+        `CreateMinVdbeC` (Vdbe with allocated apCsr).
+
+    Full 50-binary test sweep: **all green**.  Notable: TestVtab
+    216/216, TestCarray 66/66, TestDbpage 68/68, TestDbstat 83/83,
+    TestVdbeVtabExec 35/35, no regressions in the other 45 binaries.
+
   - **2026-04-26 — Phase 6.bis.3a VDBE wiring of OP_VBegin/VCreate/VDestroy.**
     Replaced the lumped "virtual table not supported" stub in
     `passqlite3vdbe.pas`'s exec switch with three faithful arms
@@ -3257,9 +3391,19 @@ Phase 5.9 depends on this being done first.
     valid VTable / nil VTable / idempotent VBegin / xBegin returning
     SQLITE_BUSY).  No regressions across the 50-binary matrix.
 
-  - [ ] **6.bis.3b** Wire the cursor-bearing vtab opcodes: OP_VOpen,
+  - [X] **6.bis.3b** Wire the cursor-bearing vtab opcodes: OP_VOpen,
     OP_VFilter, OP_VColumn, OP_VNext, OP_VUpdate, OP_VRename, OP_VCheck,
-    OP_VInitIn.  Requires:
+    OP_VInitIn.  DONE 2026-04-26.  See "Most recent activity" above for
+    the full changelog and discoveries.  Gate
+    `src/tests/TestVdbeVtabExec.pas` — **35/35 PASS** (T1..T11).  No
+    regressions across the 50-binary matrix.  OP_VCheck stubbed to NULL
+    pending Phase 8.x's TTable introspection (tabVtabPP exposure).
+    OP_Rowid extended with the CURTYPE_VTAB branch (vdbe.c:6171).
+    `sqlite3VdbeFreeCursorNN` learned the CURTYPE_VTAB cleanup branch
+    (calls xClose, decrements pVtab^.nRef).  Caveat: `sqlite3VdbeHalt`
+    in this port is a stub — closeAllCursors not wired — so vtab
+    cursors leak across step→finalize until Phase 8.x.  Original
+    requirements:
       * `allocateCursor(...,CURTYPE_VTAB)` integration — already supported
         by the existing `allocateCursor` (just not yet exercised with
         CURTYPE_VTAB by any opcode).

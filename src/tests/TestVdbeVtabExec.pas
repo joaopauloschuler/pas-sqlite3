@@ -256,6 +256,159 @@ begin
   FreeMockVTable(pVTbl, pMod);
 end;
 
+{ ------------------------------------------------------------------
+  Phase 6.bis.3b — read-path mock cursor + module callbacks.
+  Mock vtab serves a fixed 3-row table; OP_VOpen / VFilter / VColumn /
+  VNext / Rowid / VRename / VUpdate are exercised via T5..T11.
+  ------------------------------------------------------------------ }
+type
+  TMockVtabCursor = record
+    base : Tsqlite3_vtab_cursor;  { must be first }
+    iRow : i64;                   { 0..2 = row index, 3 = EOF }
+  end;
+  PMockVtabCursor = ^TMockVtabCursor;
+
+var
+  gOpenCount:    i32 = 0;
+  gCloseCount:   i32 = 0;
+  gFilterCount:  i32 = 0;
+  gNextCount:    i32 = 0;
+  gColumnCount:  i32 = 0;
+  gRowidCount:   i32 = 0;
+  gRenameCount:  i32 = 0;
+  gUpdateCount:  i32 = 0;
+  gLastFilterIdx: i32 = -1;
+  gLastRenameTo: AnsiString = '';
+  gLastUpdateNArg: i32 = 0;
+
+function MockXOpen(pVtab: PSqlite3Vtab; ppCursor: PPSqlite3VtabCursor): i32; cdecl;
+var pCur: PMockVtabCursor;
+begin
+  Inc(gOpenCount);
+  GetMem(pCur, SizeOf(TMockVtabCursor));
+  FillChar(pCur^, SizeOf(TMockVtabCursor), 0);
+  ppCursor^ := PSqlite3VtabCursor(pCur);
+  Result := SQLITE_OK;
+end;
+
+function MockXClose(pCur: PSqlite3VtabCursor): i32; cdecl;
+begin
+  Inc(gCloseCount);
+  if pCur <> nil then FreeMem(pCur);
+  Result := SQLITE_OK;
+end;
+
+function MockXFilter(pCur: PSqlite3VtabCursor; idxNum: i32; idxStr: PAnsiChar;
+                     argc: i32; argv: PPMem): i32; cdecl;
+begin
+  Inc(gFilterCount);
+  gLastFilterIdx := idxNum;
+  PMockVtabCursor(pCur)^.iRow := 0;
+  Result := SQLITE_OK;
+end;
+
+function MockXNext(pCur: PSqlite3VtabCursor): i32; cdecl;
+begin
+  Inc(gNextCount);
+  Inc(PMockVtabCursor(pCur)^.iRow);
+  Result := SQLITE_OK;
+end;
+
+function MockXEof(pCur: PSqlite3VtabCursor): i32; cdecl;
+begin
+  if PMockVtabCursor(pCur)^.iRow >= 3 then Result := 1 else Result := 0;
+end;
+
+function MockXColumn(pCur: PSqlite3VtabCursor; pCtx: Psqlite3_context;
+                     iCol: i32): i32; cdecl;
+begin
+  Inc(gColumnCount);
+  { Return iRow*100 + iCol — easy to verify }
+  sqlite3_result_int64(pCtx, PMockVtabCursor(pCur)^.iRow * 100 + iCol);
+  Result := SQLITE_OK;
+end;
+
+function MockXRowid(pCur: PSqlite3VtabCursor; pRowid: Pi64): i32; cdecl;
+begin
+  Inc(gRowidCount);
+  pRowid^ := PMockVtabCursor(pCur)^.iRow + 1000;
+  Result := SQLITE_OK;
+end;
+
+function MockXRename(pVtab: PSqlite3Vtab; zNew: PAnsiChar): i32; cdecl;
+begin
+  Inc(gRenameCount);
+  if zNew <> nil then gLastRenameTo := AnsiString(zNew) else gLastRenameTo := '';
+  Result := SQLITE_OK;
+end;
+
+function MockXUpdate(pVtab: PSqlite3Vtab; argc: i32; argv: PPMem;
+                     pRowid: Pi64): i32; cdecl;
+begin
+  Inc(gUpdateCount);
+  gLastUpdateNArg := argc;
+  pRowid^ := 9999;
+  Result := SQLITE_OK;
+end;
+
+{ Build a richer mock module with the read-path callbacks wired up. }
+function MakeReadVTable(db: PTsqlite3; out pMod: PSqlite3Module): PVTable;
+var
+  pVtbl: PVTable;
+  pV   : PSqlite3Vtab;
+begin
+  GetMem(pMod, SizeOf(Tsqlite3_module));
+  FillChar(pMod^, SizeOf(Tsqlite3_module), 0);
+  pMod^.iVersion    := 2;
+  pMod^.xBegin      := @MockXBegin;
+  pMod^.xSync       := @MockXSync;
+  pMod^.xCommit     := @MockXCommit;
+  pMod^.xRollback   := @MockXRollback;
+  pMod^.xDisconnect := @MockXDisconnect;
+  pMod^.xDestroy    := @MockXDestroy;
+  pMod^.xOpen       := @MockXOpen;
+  pMod^.xClose      := @MockXClose;
+  pMod^.xFilter     := @MockXFilter;
+  pMod^.xNext       := @MockXNext;
+  pMod^.xEof        := @MockXEof;
+  pMod^.xColumn     := @MockXColumn;
+  pMod^.xRowid      := @MockXRowid;
+  pMod^.xRename     := @MockXRename;
+  pMod^.xUpdate     := @MockXUpdate;
+
+  GetMem(pV, SizeOf(Tsqlite3_vtab));
+  FillChar(pV^, SizeOf(Tsqlite3_vtab), 0);
+  pV^.pModule := pMod;
+
+  GetMem(pVtbl, SizeOf(TVTable));
+  FillChar(pVtbl^, SizeOf(TVTable), 0);
+  pVtbl^.db    := db;
+  pVtbl^.pVtab := pV;
+  pVtbl^.nRef  := 1;
+  Result := pVtbl;
+end;
+
+procedure ResetCounts;
+begin
+  gOpenCount := 0; gCloseCount := 0; gFilterCount := 0; gNextCount := 0;
+  gColumnCount := 0; gRowidCount := 0; gRenameCount := 0; gUpdateCount := 0;
+  gLastFilterIdx := -1; gLastRenameTo := ''; gLastUpdateNArg := 0;
+end;
+
+{ Helper: build a Vdbe with N cursor slots. }
+function CreateMinVdbeC(pDb: PTsqlite3; nMem, nCursor: i32): PVdbe;
+var v: PVdbe;
+begin
+  v := CreateMinVdbe(pDb, nMem);
+  if v = nil then begin Result := nil; Exit; end;
+  if nCursor > 0 then begin
+    v^.apCsr := PPVdbeCursor(sqlite3DbMallocZero(pDb,
+                  u64(nCursor) * SizeOf(PVdbeCursor)));
+    v^.nCursor := nCursor;
+  end;
+  Result := v;
+end;
+
 { ===== T4: xBegin returns SQLITE_BUSY — error propagates ===== }
 procedure T4;
 var
@@ -293,17 +446,243 @@ begin
   FreeMockVTable(pVTbl, pMod);
 end;
 
+{ ===== T5: OP_VOpen — xOpen fires, allocateCursor populates slot ===== }
+procedure T5;
+var
+  db: Tsqlite3;
+  v:  PVdbe;
+  pMod: PSqlite3Module;
+  pVTbl: PVTable;
+  rc: i32;
+  pCur: PVdbeCursor;
+begin
+  WriteLn('T5: OP_VOpen → xOpen fires, vtab cursor allocated');
+  InitDb(db);
+  ResetCounts;
+  pVTbl := MakeReadVTable(@db, pMod);
+  v := CreateMinVdbeC(@db, 4, 1);
+  if v = nil then begin Check('T5 vdbe', False); Exit; end;
+  sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
+  sqlite3VdbeAddOp4(v, OP_VOpen, 0, 0, 0, PAnsiChar(pVTbl), P4_VTAB);
+  sqlite3VdbeAddOp2(v, OP_Halt, 0, 0);
+  v^.eVdbeState := VDBE_RUN_STATE;
+  rc := sqlite3VdbeExec(v);
+  ExpectEq(rc, SQLITE_DONE, 'T5 rc=DONE');
+  ExpectEq(gOpenCount, 1, 'T5 xOpen fired');
+  pCur := v^.apCsr[0];
+  Check('T5 cursor allocated', (pCur <> nil) and (pCur^.eCurType = CURTYPE_VTAB));
+  ExpectEq(pVTbl^.pVtab^.nRef, 1, 'T5 sqlite3_vtab.nRef = 1 (incremented)');
+  { sqlite3VdbeHalt is a stub in this port (closeAllCursors not yet wired
+    to the Halt path) so cursor close fires from explicit FreeCursor. }
+  sqlite3VdbeFreeCursor(v, v^.apCsr[0]);
+  v^.apCsr[0] := nil;
+  ExpectEq(gCloseCount, 1, 'T5 xClose fired on FreeCursor');
+  ExpectEq(pVTbl^.pVtab^.nRef, 0, 'T5 nRef decremented to 0');
+  sqlite3VdbeDelete(v);
+  FreeMockVTable(pVTbl, pMod);
+end;
+
+{ ===== T6: OP_VOpen idempotent — second OP_VOpen on same cursor ===== }
+procedure T6;
+var
+  db: Tsqlite3;
+  v:  PVdbe;
+  pMod: PSqlite3Module;
+  pVTbl: PVTable;
+  rc: i32;
+begin
+  WriteLn('T6: OP_VOpen twice on same vtab → xOpen fires once');
+  InitDb(db);
+  ResetCounts;
+  pVTbl := MakeReadVTable(@db, pMod);
+  v := CreateMinVdbeC(@db, 4, 1);
+  sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
+  sqlite3VdbeAddOp4(v, OP_VOpen, 0, 0, 0, PAnsiChar(pVTbl), P4_VTAB);
+  sqlite3VdbeAddOp4(v, OP_VOpen, 0, 0, 0, PAnsiChar(pVTbl), P4_VTAB);
+  sqlite3VdbeAddOp2(v, OP_Halt, 0, 0);
+  v^.eVdbeState := VDBE_RUN_STATE;
+  rc := sqlite3VdbeExec(v);
+  ExpectEq(rc, SQLITE_DONE, 'T6 rc=DONE');
+  ExpectEq(gOpenCount, 1, 'T6 xOpen fired exactly once');
+  sqlite3VdbeDelete(v);
+  FreeMockVTable(pVTbl, pMod);
+end;
+
+{ ===== T7: OP_VFilter + xEof + OP_VNext walk through 3 rows ===== }
+procedure T7;
+var
+  db: Tsqlite3;
+  v:  PVdbe;
+  pMod: PSqlite3Module;
+  pVTbl: PVTable;
+  rc: i32;
+  addrFilter, addrNext, addrHalt: i32;
+begin
+  WriteLn('T7: OP_VFilter + OP_VNext walk 3-row result');
+  InitDb(db);
+  ResetCounts;
+  pVTbl := MakeReadVTable(@db, pMod);
+  v := CreateMinVdbeC(@db, 8, 1);
+  { aMem[2] = idxNum (Int), aMem[3] = argc (Int 0) — VFilter reads p3 / p3+1 }
+  sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
+  sqlite3VdbeAddOp2(v, OP_Integer, 0, 2);   { reg2 = idxNum=0 }
+  sqlite3VdbeAddOp2(v, OP_Integer, 0, 3);   { reg3 = argc=0 }
+  sqlite3VdbeAddOp4(v, OP_VOpen,   0, 0, 0, PAnsiChar(pVTbl), P4_VTAB);
+  addrFilter := sqlite3VdbeAddOp4(v, OP_VFilter, 0, 0, 2, nil, P4_NOTUSED);
+  if addrFilter < 0 then ;
+  addrNext := sqlite3VdbeAddOp2(v, OP_VNext,  0, 0);
+  addrHalt := sqlite3VdbeAddOp2(v, OP_Halt,   0, 0);
+  { Patch: VFilter jumps to addrHalt on empty; VNext jumps back to addrNext on data }
+  v^.aOp[addrFilter].p2 := addrHalt;
+  v^.aOp[addrNext].p2   := addrNext;  { stay in loop while xEof=0 }
+  v^.eVdbeState := VDBE_RUN_STATE;
+  rc := sqlite3VdbeExec(v);
+  ExpectEq(rc, SQLITE_DONE, 'T7 rc=DONE');
+  ExpectEq(gFilterCount, 1, 'T7 xFilter fired once');
+  ExpectEq(gNextCount, 3, 'T7 xNext fired 3 times (rows 1→2→3=eof)');
+  sqlite3VdbeDelete(v);
+  FreeMockVTable(pVTbl, pMod);
+end;
+
+{ ===== T8: OP_VColumn — xColumn populates result register ===== }
+procedure T8;
+var
+  db: Tsqlite3;
+  v:  PVdbe;
+  pMod: PSqlite3Module;
+  pVTbl: PVTable;
+  rc: i32;
+begin
+  WriteLn('T8: OP_VColumn → xColumn fills register');
+  InitDb(db);
+  ResetCounts;
+  pVTbl := MakeReadVTable(@db, pMod);
+  v := CreateMinVdbeC(@db, 8, 1);
+  sqlite3VdbeAddOp2(v, OP_Init,    0, 1);
+  sqlite3VdbeAddOp2(v, OP_Integer, 0, 2);   { idxNum=0 }
+  sqlite3VdbeAddOp2(v, OP_Integer, 0, 3);   { argc=0 }
+  sqlite3VdbeAddOp4(v, OP_VOpen,   0, 0, 0, PAnsiChar(pVTbl), P4_VTAB);
+  sqlite3VdbeAddOp4(v, OP_VFilter, 0, 99, 2, nil, P4_NOTUSED);  { p2 patched below }
+  sqlite3VdbeAddOp3(v, OP_VColumn, 0, 7, 5);  { col 7 → reg 5 }
+  sqlite3VdbeAddOp2(v, OP_Halt,    0, 0);
+  v^.aOp[4].p2 := v^.nOp - 1;  { VFilter empty → halt }
+  v^.eVdbeState := VDBE_RUN_STATE;
+  rc := sqlite3VdbeExec(v);
+  ExpectEq(rc, SQLITE_DONE, 'T8 rc=DONE');
+  ExpectEq(gColumnCount, 1, 'T8 xColumn fired once');
+  ExpectEq(i32(v^.aMem[5].u.i), 7, 'T8 reg5 = iRow*100 + iCol = 0*100+7');
+  sqlite3VdbeDelete(v);
+  FreeMockVTable(pVTbl, pMod);
+end;
+
+{ ===== T9: OP_Rowid CURTYPE_VTAB → xRowid ===== }
+procedure T9;
+var
+  db: Tsqlite3;
+  v:  PVdbe;
+  pMod: PSqlite3Module;
+  pVTbl: PVTable;
+  rc: i32;
+begin
+  WriteLn('T9: OP_Rowid on vtab cursor → xRowid');
+  InitDb(db);
+  ResetCounts;
+  pVTbl := MakeReadVTable(@db, pMod);
+  v := CreateMinVdbeC(@db, 8, 1);
+  sqlite3VdbeAddOp2(v, OP_Init,    0, 1);
+  sqlite3VdbeAddOp2(v, OP_Integer, 0, 2);
+  sqlite3VdbeAddOp2(v, OP_Integer, 0, 3);
+  sqlite3VdbeAddOp4(v, OP_VOpen,   0, 0, 0, PAnsiChar(pVTbl), P4_VTAB);
+  sqlite3VdbeAddOp4(v, OP_VFilter, 0, 99, 2, nil, P4_NOTUSED);
+  sqlite3VdbeAddOp2(v, OP_Rowid,   0, 6);
+  sqlite3VdbeAddOp2(v, OP_Halt,    0, 0);
+  v^.aOp[4].p2 := v^.nOp - 1;
+  v^.eVdbeState := VDBE_RUN_STATE;
+  rc := sqlite3VdbeExec(v);
+  ExpectEq(rc, SQLITE_DONE, 'T9 rc=DONE');
+  ExpectEq(gRowidCount, 1, 'T9 xRowid fired');
+  ExpectEq(i32(v^.aMem[6].u.i), 1000, 'T9 reg6 = iRow+1000 = 0+1000');
+  sqlite3VdbeDelete(v);
+  FreeMockVTable(pVTbl, pMod);
+end;
+
+{ ===== T10: OP_VRename — xRename fires with name from register ===== }
+procedure T10;
+var
+  db: Tsqlite3;
+  v:  PVdbe;
+  pMod: PSqlite3Module;
+  pVTbl: PVTable;
+  rc: i32;
+begin
+  WriteLn('T10: OP_VRename → xRename fires with new name');
+  InitDb(db);
+  ResetCounts;
+  pVTbl := MakeReadVTable(@db, pMod);
+  v := CreateMinVdbeC(@db, 4, 0);
+  sqlite3VdbeAddOp2(v, OP_Init,    0, 1);
+  sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, PAnsiChar('newName'), P4_STATIC);
+  sqlite3VdbeAddOp4(v, OP_VRename, 1, 0, 0, PAnsiChar(pVTbl), P4_VTAB);
+  sqlite3VdbeAddOp2(v, OP_Halt,    0, 0);
+  v^.eVdbeState := VDBE_RUN_STATE;
+  rc := sqlite3VdbeExec(v);
+  ExpectEq(rc, SQLITE_DONE, 'T10 rc=DONE');
+  ExpectEq(gRenameCount, 1, 'T10 xRename fired');
+  Check('T10 rename arg = newName', gLastRenameTo = 'newName');
+  sqlite3VdbeDelete(v);
+  FreeMockVTable(pVTbl, pMod);
+end;
+
+{ ===== T11: OP_VUpdate — xUpdate fires with argc args ===== }
+procedure T11;
+var
+  db: Tsqlite3;
+  v:  PVdbe;
+  pMod: PSqlite3Module;
+  pVTbl: PVTable;
+  rc: i32;
+begin
+  WriteLn('T11: OP_VUpdate → xUpdate fires');
+  InitDb(db);
+  ResetCounts;
+  pVTbl := MakeReadVTable(@db, pMod);
+  v := CreateMinVdbeC(@db, 8, 0);
+  { p1=1 (set lastRowid), p2=3 args, p3=2 (start register), p5=OE_Abort }
+  sqlite3VdbeAddOp2(v, OP_Init,    0, 1);
+  sqlite3VdbeAddOp2(v, OP_Null,    0, 2);    { argv[0]=NULL (no delete) }
+  sqlite3VdbeAddOp2(v, OP_Null,    0, 3);    { argv[1]=NULL (auto rowid) }
+  sqlite3VdbeAddOp2(v, OP_Integer, 42, 4);   { argv[2]=42 }
+  sqlite3VdbeAddOp4(v, OP_VUpdate, 1, 3, 2, PAnsiChar(pVTbl), P4_VTAB);
+  v^.aOp[v^.nOp - 1].p5 := OE_Abort;
+  sqlite3VdbeAddOp2(v, OP_Halt,    0, 0);
+  v^.eVdbeState := VDBE_RUN_STATE;
+  rc := sqlite3VdbeExec(v);
+  ExpectEq(rc, SQLITE_DONE, 'T11 rc=DONE');
+  ExpectEq(gUpdateCount, 1, 'T11 xUpdate fired');
+  ExpectEq(gLastUpdateNArg, 3, 'T11 argc=3');
+  ExpectEq(i64(db.lastRowid), 9999, 'T11 lastRowid set');
+  sqlite3VdbeDelete(v);
+  FreeMockVTable(pVTbl, pMod);
+end;
+
 begin
   sqlite3OsInit;
   sqlite3PcacheInitialize;
 
-  WriteLn('=== TestVdbeVtabExec — Phase 6.bis.3a gate ===');
+  WriteLn('=== TestVdbeVtabExec — Phase 6.bis.3a/3b gate ===');
   WriteLn;
 
   T1; WriteLn;
   T2; WriteLn;
   T3; WriteLn;
   T4; WriteLn;
+  T5; WriteLn;
+  T6; WriteLn;
+  T7; WriteLn;
+  T8; WriteLn;
+  T9; WriteLn;
+  T10; WriteLn;
+  T11; WriteLn;
 
   WriteLn(Format('Results: %d passed, %d failed', [gPass, gFail]));
   if gFail > 0 then Halt(1);

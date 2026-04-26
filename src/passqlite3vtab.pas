@@ -66,6 +66,7 @@ type
   PSqlite3Vtab        = ^Tsqlite3_vtab;
   PPSqlite3Vtab       = ^PSqlite3Vtab;
   PSqlite3VtabCursor  = ^Tsqlite3_vtab_cursor;
+  PPSqlite3VtabCursor = ^PSqlite3VtabCursor;
   PSqlite3Module      = ^Tsqlite3_module;
   PSqlite3IndexInfo   = ^Tsqlite3_index_info;
 
