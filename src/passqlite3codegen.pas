@@ -4008,14 +4008,177 @@ begin
   Result := rc;
 end;
 
+{ exprNodeIsConstantFunction — TK_FUNCTION node walker helper.
+  Faithful translation of expr.c:2482..2512.  Determines if a TK_FUNCTION
+  call is a constant function — all arguments must already be constant
+  (recursively walked via the supplied callback), the FuncDef must carry
+  SQLITE_FUNC_CONSTANT or SQLITE_FUNC_SLOCHNG, must not be an aggregate
+  (xFinalize=nil), and the call site must not be a window-function
+  invocation (EP_WinFunc).  On any failure clears pWalker^.eCode and
+  aborts; on success returns WRC_Prune so the caller does not re-walk
+  the argument list. }
+function exprNodeIsConstantFunction(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  n:    i32;
+  pList: PExprList;
+  pDef:  PTFuncDef;
+  db:    PTsqlite3;
+begin
+  Assert(pExpr^.op = TK_FUNCTION);
+  if ExprHasProperty(pExpr, EP_TokenOnly)
+     or (not ExprUseXList(pExpr))
+     or (pExpr^.x.pList = nil) then
+  begin
+    n := 0;
+    pList := nil;
+  end else
+  begin
+    pList := pExpr^.x.pList;
+    n := pList^.nExpr;
+    sqlite3WalkExprList(pWalker, pList);
+    if pWalker^.eCode = 0 then begin Result := WRC_Abort; Exit; end;
+  end;
+  db   := pWalker^.pParse^.db;
+  pDef := sqlite3FindFunction(db, pExpr^.u.zToken, n, db^.enc, 0);
+  if (pDef = nil)
+     or Assigned(pDef^.xFinalize)
+     or ((pDef^.funcFlags and (SQLITE_FUNC_CONSTANT or SQLITE_FUNC_SLOCHNG)) = 0)
+     or ExprHasProperty(pExpr, EP_WinFunc) then
+  begin
+    pWalker^.eCode := 0;
+    Result := WRC_Abort;
+    Exit;
+  end;
+  Result := WRC_Prune;
+end;
+
+{ exprNodeIsConstant — Walker callback shared by the constant-classifier
+  family.  Faithful translation of expr.c:2541..2617.  pWalker^.eCode
+  selects the variant:
+    1 = sqlite3ExprIsConstant         — pure constant, allows
+                                        SQLITE_FUNC_CONSTANT functions and
+                                        ON-clause-rooted nodes
+    2 = sqlite3ExprIsConstantNotJoin  — like 1 but rejects EP_OuterON
+                                        and EP_FixedCol
+    3 = sqlite3ExprIsTableConstant    — constant against a single cursor
+    4/5 = sqlite3ExprIsConstantOrFunction — DEFAULT-clause-friendly
+                                        (5 silently nulls bound params
+                                        when re-parsing schema)
+  On any failure path the callback sets eCode=0 and returns WRC_Abort. }
+function exprNodeIsConstant(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+begin
+  Assert(pWalker^.eCode > 0);
+
+  { eCode==2 disqualifies anything reached via an outer-join ON/USING clause. }
+  if (pWalker^.eCode = 2) and ExprHasProperty(pExpr, EP_OuterON) then
+  begin
+    pWalker^.eCode := 0;
+    Result := WRC_Abort;
+    Exit;
+  end;
+
+  case pExpr^.op of
+    TK_FUNCTION:
+      begin
+        if ((pWalker^.eCode >= 4) or ExprHasProperty(pExpr, EP_ConstFunc))
+           and (not ExprHasProperty(pExpr, EP_WinFunc)) then
+        begin
+          if pWalker^.eCode = 5 then ExprSetProperty(pExpr, EP_FromDDL);
+          Result := WRC_Continue;
+          Exit;
+        end else if pWalker^.pParse <> nil then
+        begin
+          Result := exprNodeIsConstantFunction(pWalker, pExpr);
+          Exit;
+        end else
+        begin
+          pWalker^.eCode := 0;
+          Result := WRC_Abort;
+          Exit;
+        end;
+      end;
+    TK_ID:
+      begin
+        { "true"/"false" in DEFAULT clauses fold to TK_TRUEFALSE — those are
+          constants.  Anything else is a column reference and disqualifies. }
+        if sqlite3ExprIdToTrueFalse(pExpr) <> 0 then
+        begin Result := WRC_Prune; Exit; end;
+        if ExprHasProperty(pExpr, EP_FixedCol) and (pWalker^.eCode <> 2) then
+        begin Result := WRC_Continue; Exit; end;
+        if (pWalker^.eCode = 3) and (pExpr^.iTable = pWalker^.u.iCur) then
+        begin Result := WRC_Continue; Exit; end;
+        pWalker^.eCode := 0;
+        Result := WRC_Abort;
+      end;
+    TK_COLUMN, TK_AGG_FUNCTION, TK_AGG_COLUMN:
+      begin
+        if ExprHasProperty(pExpr, EP_FixedCol) and (pWalker^.eCode <> 2) then
+        begin Result := WRC_Continue; Exit; end;
+        if (pWalker^.eCode = 3) and (pExpr^.iTable = pWalker^.u.iCur) then
+        begin Result := WRC_Continue; Exit; end;
+        pWalker^.eCode := 0;
+        Result := WRC_Abort;
+      end;
+    TK_IF_NULL_ROW, TK_REGISTER, TK_DOT, TK_RAISE:
+      begin
+        pWalker^.eCode := 0;
+        Result := WRC_Abort;
+      end;
+    TK_VARIABLE:
+      begin
+        if pWalker^.eCode = 5 then
+        begin
+          { Silently convert bound parameters in re-parsed sqlite_schema
+            CREATE statements into NULL — backwards compatibility for
+            databases written by older SQLite. }
+          pExpr^.op := TK_NULL;
+        end else if pWalker^.eCode = 4 then
+        begin
+          pWalker^.eCode := 0;
+          Result := WRC_Abort;
+          Exit;
+        end;
+        Result := WRC_Continue;
+      end;
+  else
+    Result := WRC_Continue;
+  end;
+end;
+
+{ exprIsConst — common Walker driver behind sqlite3ExprIsConstant /
+  sqlite3ExprIsConstantNotJoin / sqlite3ExprIsTableConstant /
+  sqlite3ExprIsConstantOrFunction.  Faithful translation of
+  expr.c:2618..2629.  initFlag selects the variant — see the table above
+  exprNodeIsConstant. }
+function exprIsConst(pParse: PParse; p: PExpr; initFlag: i32): i32;
+var
+  w: TWalker;
+begin
+  FillChar(w, SizeOf(w), 0);
+  w.eCode           := u16(initFlag);
+  w.pParse          := pParse;
+  w.xExprCallback   := @exprNodeIsConstant;
+  w.xSelectCallback := @sqlite3SelectWalkFail;
+  sqlite3WalkExpr(@w, p);
+  Result := i32(w.eCode);
+end;
+
 function sqlite3ExprIsConstant(pParse: PParse; p: PExpr): i32;
 begin
-  { Minimal implementation — full version uses walker }
-  if p = nil then begin Result := 1; Exit; end;
-  case p^.op of
-    TK_INTEGER, TK_FLOAT, TK_STRING, TK_BLOB, TK_NULL: Result := 1;
-  else Result := 0;
-  end;
+  Result := exprIsConst(pParse, p, 1);
+end;
+
+{ sqlite3ExprIsConstantNotJoin — true when p is constant AND does not
+  originate in a LEFT/FULL JOIN ON/USING clause AND contains no
+  EP_FixedCol TK_COLUMN nodes synthesised by the constant-propagation
+  optimisation.  When this returns true, p is safe to add to
+  pParse^.pConstExpr for once-at-prepare-time evaluation via
+  sqlite3ExprCodeRunJustOnce.  Faithful translation of expr.c:2662..2664.
+  File-private in C; kept file-private here too — no cross-unit callers
+  yet (sqlite3ExprCodeTarget will be the first when it lands). }
+function sqlite3ExprIsConstantNotJoin(pParse: PParse; p: PExpr): i32;
+begin
+  Result := exprIsConst(pParse, p, 2);
 end;
 
 // ---------------------------------------------------------------------------

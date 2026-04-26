@@ -21,6 +21,91 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    productive sqlite3ExprIsConstant + sqlite3ExprIsConstantNotJoin
+    (walker-based) + exprIsConst / exprNodeIsConstant /
+    exprNodeIsConstantFunction.**  First step of the discovery-note
+    chain unlocking `sqlite3ExprCodeTarget` (the 770-line recursive
+    dispatch that gates `exprCodeBetween` / `exprComputeOperands` /
+    `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse`).  Faithful translation
+    of expr.c:2466..2664 — replaces the literal-only stub of
+    `sqlite3ExprIsConstant` (codegen.pas:4011..4019) with the full
+    Walker-driven classifier and adds the file-private companion
+    `sqlite3ExprIsConstantNotJoin` (eCode==2 variant: rejects EP_OuterON
+    + EP_FixedCol).
+
+    Five C functions land together because they form a closed callback
+    cluster:
+
+      * `exprNodeIsConstantFunction` (expr.c:2482..2512) — TK_FUNCTION
+        node walker helper.  Checks all arguments via
+        `sqlite3WalkExprList`, then resolves the FuncDef via
+        `sqlite3FindFunction` and verifies SQLITE_FUNC_CONSTANT |
+        SQLITE_FUNC_SLOCHNG, no aggregate finalizer, no EP_WinFunc.
+      * `exprNodeIsConstant` (expr.c:2541..2617) — main Walker callback,
+        eCode-dispatched 1..5.  Handles every TK_* arm: TK_FUNCTION
+        (ConstFunc fast path or recursive function check), TK_ID (folds
+        true/false IDs to TK_TRUEFALSE via existing
+        `sqlite3ExprIdToTrueFalse`; otherwise treated like TK_COLUMN),
+        TK_COLUMN/TK_AGG_FUNCTION/TK_AGG_COLUMN (FixedCol+iCur table-
+        constant check), TK_IF_NULL_ROW/TK_REGISTER/TK_DOT/TK_RAISE
+        (always reject), TK_VARIABLE (eCode 4 rejects, 5 silently
+        rewrites op := TK_NULL).
+      * `exprIsConst` (expr.c:2618..2629) — common Walker driver.
+      * `sqlite3ExprIsConstant` (expr.c:2645..2647) — public, eCode==1.
+      * `sqlite3ExprIsConstantNotJoin` (expr.c:2662..2664) — file-
+        private, eCode==2 (kept file-private to match C; cross-unit
+        callers come later when sqlite3ExprCodeTarget lands).
+
+    The eCode==3 (`sqlite3ExprIsTableConstant`) and eCode==4/5
+    (`sqlite3ExprIsConstantOrFunction`) public entry points are *not*
+    wired up here — only the dispatch arms that handle them inside the
+    callback are.  Adding the public wrappers is a one-liner each when
+    the consumers (DEFAULT codegen / planner table-constant check) land.
+
+    Concrete changes:
+      * `passqlite3codegen.pas:4011..4180` — five new function bodies
+        replacing the stub `sqlite3ExprIsConstant` body.
+
+    Why this is safe to land alone: the only existing productive call
+    sites (`sqlite3WhereAddLimit` at codegen.pas:12043..12047) pass
+    eCode=1 — same semantics as before for any literal-only input, but
+    now also correctly accepts ConstFunc-flagged function calls and
+    sub-tree-constant expressions, matching what the C planner sees.
+    No new test divergences expected — `sqlite3WhereAddLimit` is gated
+    behind the still-stub WhereBegin so the broader behaviour change is
+    inert in the corpus.  Full regression sweep all green —
+    TestWhereBasic 52/52, TestWhereStructs 148/148, TestPrepareBasic
+    20/20, TestParser 45/45, TestSchemaBasic 44/44, TestVdbeApi 57/57,
+    TestDMLBasic 54/54, TestSelectBasic 49/49, TestExprBasic 40/40,
+    TestInitCallback 29/29, TestExplainParity unchanged at **2 PASS /
+    8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **Walker.eCode is u16 in the Pascal port.**  The C source uses
+        `int` for `Walker.eCode`, but our struct (codegen.pas:799) has
+        already locked it as `u16`.  The exprIsConst driver casts:
+        `w.eCode := u16(initFlag); ... Result := i32(w.eCode);`.  No
+        observable effect — initFlag is always in 1..5.
+      * **ExprUseXList guards `pExpr^.x.pList` access.**  The C
+        `pExpr->x.pList==0` check needs the `ExprUseXList` predicate in
+        Pascal to avoid mis-dereferencing the union when the node has
+        EP_xIsSelect set.  Locked in the new
+        `exprNodeIsConstantFunction`.
+      * **Realistic next sub-progress: `sqlite3ExprCodeRunJustOnce`.**
+        Small factor-out helper (expr.c around line 5860) — pre-folds
+        a constant expression into the prepared-statement init code via
+        `pParse^.pConstExpr`.  After that lands, the big
+        `sqlite3ExprCodeTarget` port begins (vertical slices: literals
+        already done; columns + temp-ref next; arithmetic; comparison;
+        CASE; FUNCTION; etc.).
+      * **Public wrappers waiting for first cross-unit caller.**
+        `sqlite3ExprIsTableConstant` (eCode==3, where.c-internal) and
+        `sqlite3ExprIsConstantOrFunction` (eCode==4/5, build.c
+        DEFAULT-clause check) are one-liners — drop them in
+        immediately above their first productive call site rather than
+        speculatively here.
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     sqlite3ExprToRegister + ExprSetProperty/ExprClearProperty inline
     macros.**  Third leaf helper of step 11g.2.b's pre-IfTrue/IfFalse
     cluster (after `sqlite3ExprCanBeNull` and the codeCompare cluster).
