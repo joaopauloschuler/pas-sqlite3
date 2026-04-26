@@ -139,6 +139,7 @@ compile_test TestOpenClose
 compile_test TestPrepareBasic
 compile_test TestRegistration
 compile_test TestVtab
+compile_test TestCarray
 compile_test TestConfigHooks
 compile_test TestInitShutdown
 compile_test TestExecGetTable

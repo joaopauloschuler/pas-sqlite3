@@ -20,6 +20,48 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.2b carray.c port.**  New unit
+    `src/passqlite3carray.pas` (~360 lines) hosts faithful Pascal ports
+    of all 10 static vtab callbacks (carrayConnect / carrayDisconnect
+    / carrayOpen / carrayClose / carrayNext / carrayColumn /
+    carrayRowid / carrayEof / carrayFilter / carrayBestIndex), the
+    public `carrayModule: Tsqlite3_module` record (v1 layout, iVersion=0,
+    eponymous-only — xCreate/xDestroy nil), and the registry-side
+    entry point `sqlite3CarrayRegister(db)` delegating to
+    `sqlite3VtabCreateModule` from 6.bis.1a.  Constants exported
+    mirror sqlite.h:11329..11343 (`CARRAY_INT32`..`CARRAY_BLOB` and
+    the `SQLITE_CARRAY_*` aliases) plus the four column ordinals.
+
+    Two blockers carry over to 6.bis.2c/d (full discussion under the
+    6.bis.2b task entry):
+
+      * `sqlite3_value_pointer` / `sqlite3_bind_pointer` still not
+        ported.  carrayFilter goes through a local
+        `sqlite3_value_pointer_stub` returning nil — the bind-pointer
+        path is structurally complete but inert until the
+        Phase-8 `MEM_Subtype` machinery lands (vdbeInt.h + vdbeapi.c:
+        1394 / 1731).  Same blocker silently gates a
+        `sqlite3_carray_bind_v2` port (omitted here).
+      * `sqlite3_mprintf` recurring blocker — bridged via a local
+        `carrayFmtMsg` shim mirroring `vtabFmtMsg` from 6.bis.1c.
+        dbstat's idxStr formatting will need the same; worth
+        promoting to a shared helper when the printf sub-phase lands.
+
+    Idiom worth memoising for 6.bis.2c/d gate writers: the
+    `Tsqlite3_module` record declares most slots as `Pointer`, so test
+    code reads them back through `Pointer(fnVar) := module.slot`
+    rather than a direct typed assignment.  Only xDisconnect /
+    xDestroy are typed function-pointer fields.
+
+    Note for dbpage / dbstat: xColumn is currently un-testable without
+    allocating a Tsqlite3_context outside a VDBE op call — TestCarray
+    exercises every callback EXCEPT xColumn.  End-to-end column
+    coverage is gated on OP_VColumn wiring (6.bis.1d wiring caveat).
+
+    Gate `src/tests/TestCarray.pas` (new) — **66/66 PASS**.  No
+    regressions across the existing 45-gate matrix (TestVtab still
+    216/216).
+
   - **2026-04-26 — Phase 6.bis.2a sqlite3_index_info types + constants.**
     Plumbing for the three in-tree vtabs (carray.c / dbpage.c /
     dbstat.c).  `passqlite3vtab.pas`'s interface section grew the four
@@ -2846,13 +2888,76 @@ Phase 5.9 depends on this being done first.
         directly via the module-pointer slots, mirroring the
         TestVtab.T35..T50 pattern from 6.bis.1d.
 
-  - [ ] **6.bis.2b** Port `carray.c` — the `carray()` table-valued
+  - [X] **6.bis.2b** Port `carray.c` — the `carray()` table-valued
     function.  Smallest of the three (558 C lines).  Provides a good
     shake-down for `Tsqlite3_index_info` round-trip, the typed
     `TxBestIndex` slot in `Tsqlite3_module`, and (once the bind-pointer
     sub-phase lands) `sqlite3_value_pointer` / `sqlite3_bind_pointer`.
     Module entry point is `sqlite3CarrayRegister(db)` returning a
     `PVtabModule` for vdbevtab.c-style auto-registration.
+
+    DONE 2026-04-26.  New unit `src/passqlite3carray.pas` (~360 lines)
+    hosts faithful Pascal ports of all 10 static vtab callbacks
+    (carrayConnect / carrayDisconnect / carrayOpen / carrayClose /
+    carrayNext / carrayColumn / carrayRowid / carrayEof / carrayFilter
+    / carrayBestIndex), the carrayBindDel destructor placeholder, and
+    the public Tsqlite3_module record `carrayModule` with the v1 slot
+    layout from carray.c:381 (iVersion=0, only xConnect populated for
+    constructors so the table is eponymous-only — xCreate/xDestroy
+    nil).  `sqlite3CarrayRegister(db)` delegates to
+    `sqlite3VtabCreateModule` from 6.bis.1a.  Constants exported:
+    CARRAY_INT32..CARRAY_BLOB and the SQLITE_-prefixed aliases
+    (sqlite.h:11329..11343), CARRAY_COLUMN_VALUE..CTYPE.
+
+    Discoveries / dependencies worth memoising for 6.bis.2c..d:
+
+      * **`sqlite3_value_pointer` / `sqlite3_bind_pointer` still not
+        ported.**  carrayFilter's idxNum=1 branch and the 2/3-arg
+        argv[0] dereference go through a local `sqlite3_value_pointer_stub`
+        in passqlite3carray that returns nil — structurally complete
+        but inert until a Phase-8 sub-phase lands the type-tagged
+        pointer machinery (`MEM_Subtype` / `eSubtype` from vdbeInt.h
+        + vdbeapi.c:1394 / vdbeapi.c:1731).  When that lands, replace
+        the local stub with the real entry point and dbpage.c +
+        dbstat.c can use the same.  Same blocker also gates
+        sqlite3_carray_bind / _v2 (intentionally omitted from this
+        sub-phase).
+
+      * **`sqlite3_mprintf` blocker (recurring).**  carray's
+        unknown-datatype error path uses it for `pVtab^.zErrMsg`.
+        Bridged here through a local `carrayFmtMsg` shim mirroring
+        the `vtabFmtMsg` pattern from 6.bis.1c.  Same shim will be
+        needed in dbstat.c (idxStr formatting) — probably worth
+        promoting to a shared helper when the printf sub-phase lands.
+
+      * **Tsqlite3_module slot pointers stay typed-as-Pointer.**
+        Most slots (xCreate, xConnect, xBestIndex, xOpen, xClose,
+        xFilter, xNext, xEof, xColumn, xRowid, etc.) are declared
+        `Pointer` in the record (only xDisconnect / xDestroy are
+        typed) so the `initialization` block can assign function
+        addresses cross-language without per-slot casts.  Test code
+        reads them back through `Pointer(fnVar) := module.slot` —
+        document this idiom for 6.bis.2c/d gates.
+
+      * **xColumn cannot be tested without a real Tsqlite3_context.**
+        Allocating one outside a VDBE op call is non-trivial (see
+        passqlite3vdbe.pas:649); the carray gate exercises every
+        callback EXCEPT xColumn directly.  The column logic will be
+        covered end-to-end once OP_VColumn wiring lands (see 6.bis.1d
+        wiring caveat).  dbpage.c has the same constraint.
+
+      * **PPSqlite3VtabCursor was not exported from passqlite3vtab.**
+        Added locally in passqlite3carray; if dbpage.c / dbstat.c need
+        the same forward decl, promote it to passqlite3vtab's
+        interface section as a tiny follow-up.
+
+    Gate `src/tests/TestCarray.pas` exercises module registration,
+    iVersion=0 + slot layout, all four xBestIndex idxNum branches
+    (0/1/2/3), the two SQLITE_CONSTRAINT failure paths, and the full
+    xOpen → xRowid → xNext → xEof → xClose state-machine cycle —
+    **66/66 PASS**.  Full 46-gate matrix re-ran in build.sh: no
+    regressions across the existing 45 gates (TestVtab still 216/216,
+    everything else green).
 
   - [ ] **6.bis.2c** Port `dbpage.c` — the built-in `sqlite_dbpage`
     vtab.  Depends on the pager/btree page-fetch helpers
