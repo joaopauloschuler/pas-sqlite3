@@ -52,7 +52,7 @@ Important: At the end of this document, please find:
       still stubs.  Folded into 11g.2.e alongside `wherecode.c`'s
       per-row body.
 
-- [ ] **6.9-bis 11g.2.c** Port `whereexpr.c` (~1944 lines) —
+- [X] **6.9-bis 11g.2.c** Port `whereexpr.c` (~1944 lines) —
     WHERE-clause term decomposition + analysis.  Public surface:
     `sqlite3WhereSplit`, `sqlite3WhereClauseInit`,
     `sqlite3WhereClauseClear`, `sqlite3WhereExprAnalyze`,
@@ -117,6 +117,20 @@ Important: At the end of this document, please find:
       Gate: `TestWhereExpr.pas` T16a..T16g (`x LIKE ?1` with ?1 bound to
       'aBc%' synthesizes `>='ABC'` and `<'abd'` children, expmask bit 0
       set on rebind).  84/84.
+    - [X] Multi-term gate extension on `TestWhereSimple.pas` — drives
+      `sqlite3WhereBegin` / `sqlite3WhereEnd` and the analysis pipeline
+      across three multi-term shapes:
+      M1 "rowid = 5 AND col = 7" (whereShortCut still picks WHERE_IPK
+      with the col=7 leaf left in `sWC` for the eventual planner;
+      OP_OpenRead + OP_SeekRowid emitted; rowid leaf TERM_CODED, col=7
+      leaf not TERM_CODED).
+      M2 "rowid IN (1,2,3)" (whereShortCut returns 0 → WhereBegin
+      returns nil cleanly; isolated `sqlite3WhereSplit` +
+      `sqlite3WhereExprAnalyze` exercise tags the term with WO_IN and
+      leftCursor/leftColumn set to rowid).
+      M3 "rowid BETWEEN 1 AND 5" (WhereBegin returns nil; analysis in
+      isolation spawns the two TERM_VIRTUAL|TERM_DYNAMIC WO_GE / WO_LE
+      children, parent nChild=2, iParent links back).  39/39.
 
 - [ ] **6.9-bis 11g.2.d** Port the planner core in `where.c`
     (~5000 lines): `whereLoopAddBtree`, `whereLoopAddBtreeIndex`,

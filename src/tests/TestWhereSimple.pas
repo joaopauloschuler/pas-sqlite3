@@ -29,6 +29,25 @@ program TestWhereSimple;
     T9  pParse.nQueryLoop restored to savedNQueryLoop after WhereEnd
 
   Gate: T1-T9 all PASS.
+
+  Phase 6.9-bis (step 11g.2.c) extension — multi-term gate.
+  Three additional sections drive sqlite3WhereBegin / sqlite3WhereEnd through
+  multi-term WHERE shapes that exercise the whereexpr.c helpers landed in
+  11g.2.c:
+
+    M1  "rowid = 5 AND col = 7"   — TK_AND chain split into two base terms;
+                                    whereShortCut still picks WHERE_IPK on
+                                    the rowid leaf, leaving the col=7 term
+                                    in the clause for the eventual planner.
+    M2  "rowid IN (1,2,3)"        — TK_IN cannot be picked by whereShortCut
+                                    (no WO_EQ).  WhereBegin returns nil; the
+                                    test verifies analysis populated the
+                                    WhereClause cleanly and pParse.nErr = 0.
+    M3  "rowid BETWEEN 1 AND 5"   — TK_BETWEEN gets virtual WO_GE / WO_LE
+                                    children synthesized by exprAnalyze.
+                                    WhereBegin returns nil (no WO_EQ on
+                                    rowid); the test asserts the 3 terms
+                                    (parent + 2 children) are present.
 }
 
 uses
@@ -77,6 +96,225 @@ end;
 function GetOp(v: PVdbe; addr: i32): PVdbeOp;
 begin
   Result := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(addr) * SizeOf(TVdbeOp));
+end;
+
+{ ---------------------------------------------------------------------------
+  BuildSrc — allocate a 1-entry SrcList referencing pTab at cursor 0.
+  Mirrors the inline construction in main; factored out so the multi-term
+  sections can share the same setup.
+  --------------------------------------------------------------------------- }
+function BuildSrc(db: PTsqlite3; pTab: PTable2): PSrcList;
+var
+  buf: Pointer;
+  it:  PSrcItem;
+begin
+  buf := sqlite3DbMallocZero(db, SZ_SRCLIST_HEADER + SizeOf(TSrcItem));
+  if buf = nil then begin WriteLn('FATAL: SrcList alloc'); Halt(2); end;
+  Result := PSrcList(buf);
+  Result^.nSrc   := 1;
+  Result^.nAlloc := 1;
+  it := @SrcListItems(Result)[0];
+  it^.pSTab   := pTab;
+  it^.iCursor := 0;
+  it^.colUsed := Bitmask(1);
+end;
+
+{ Build a fresh Parse/Vdbe pair backed by db.  The Parse record is filled
+  in-place by the caller (passed by var). }
+procedure InitParse(db: PTsqlite3; var p: TParse; out v: PVdbe);
+begin
+  FillChar(p, SizeOf(p), 0);
+  p.db        := db;
+  p.eParseMode:= 0;
+  p.nQueryLoop:= 0;
+  p.nTab      := 1;
+  v := sqlite3GetVdbe(@p);
+  if v = nil then begin WriteLn('FATAL: GetVdbe'); Halt(2); end;
+end;
+
+{ ---- M1: "rowid = 5 AND col = 7" ----------------------------------------- }
+procedure RunMultiAndTest(db: PTsqlite3; pTab: PTable2);
+var
+  parse: TParse;
+  v:     PVdbe;
+  pSrc:  PSrcList;
+  pColR, pIntR, pEqR: PExpr;
+  pColC, pIntC, pEqC: PExpr;
+  pAnd:  PExpr;
+  pWInfo: PWhereInfo;
+  pLevel: PWhereLevel;
+  pLoop:  PWhereLoop;
+  iOp:    i32;
+begin
+  WriteLn;
+  WriteLn('--- M1: rowid = 5 AND col = 7 ---');
+  InitParse(db, parse, v);
+  pSrc := BuildSrc(db, pTab);
+
+  pColR := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColR^.iTable := 0; pColR^.iColumn := -1;
+  pIntR := sqlite3ExprInt32(db, 5);
+  pEqR  := sqlite3PExpr(@parse, TK_EQ, pColR, pIntR);
+
+  pColC := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColC^.iTable := 0; pColC^.iColumn := 0;        { non-rowid column }
+  pIntC := sqlite3ExprInt32(db, 7);
+  pEqC  := sqlite3PExpr(@parse, TK_EQ, pColC, pIntC);
+
+  pAnd  := sqlite3PExpr(@parse, TK_AND, pEqR, pEqC);
+
+  pWInfo := sqlite3WhereBegin(@parse, pSrc, pAnd, nil, nil, nil, 0, 0);
+  Check('M1a WhereBegin returns non-nil for AND-chain', pWInfo <> nil);
+  if pWInfo = nil then begin sqlite3DbFree(db, pSrc); Exit; end;
+
+  pLevel := @whereInfoLevels(pWInfo)[0];
+  pLoop  := pLevel^.pWLoop;
+  Check('M1b sWC nTerm = 2 (both AND leaves split)',
+        pWInfo^.sWC.nTerm = 2);
+  Check('M1c whereShortCut still picked WHERE_IPK',
+        (pLoop^.wsFlags and WHERE_IPK) <> 0);
+  Check('M1d pLoop nLTerm = 1 (only the rowid leaf is the index key)',
+        pLoop^.nLTerm = 1);
+  Check('M1e rowid-EQ leaf is TERM_CODED',
+        (pLoop^.aLTerm[0]^.wtFlags and TERM_CODED) <> 0);
+  Check('M1f col=7 leaf is NOT TERM_CODED (deferred to per-row body)',
+        (pWInfo^.sWC.a[1].wtFlags and TERM_CODED) = 0);
+
+  iOp := FindOpcode(v, OP_OpenRead, 0);
+  Check('M1g OP_OpenRead emitted', iOp >= 0);
+  iOp := FindOpcode(v, OP_SeekRowid, 0);
+  Check('M1h OP_SeekRowid emitted', iOp >= 0);
+
+  sqlite3WhereEnd(pWInfo);
+  Check('M1i WhereEnd succeeded', True);
+
+  sqlite3DbFree(db, pSrc);
+end;
+
+{ ---- M2: "rowid IN (1,2,3)" ---------------------------------------------- }
+procedure RunInTest(db: PTsqlite3; pTab: PTable2);
+var
+  parse: TParse;
+  v:     PVdbe;
+  pSrc:  PSrcList;
+  pCol:  PExpr;
+  pInList: PExprList;
+  pIn:   PExpr;
+  pWInfo: PWhereInfo;
+  pTerm: PWhereTerm;
+  pWi2:  PWhereInfo;
+  pWC:   PWhereClause;
+begin
+  WriteLn;
+  WriteLn('--- M2: rowid IN (1,2,3) ---');
+  InitParse(db, parse, v);
+  pSrc := BuildSrc(db, pTab);
+
+  pCol := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol^.iTable := 0; pCol^.iColumn := -1;
+  pInList := sqlite3ExprListAppend(@parse, nil, sqlite3ExprInt32(db, 1));
+  pInList := sqlite3ExprListAppend(@parse, pInList, sqlite3ExprInt32(db, 2));
+  pInList := sqlite3ExprListAppend(@parse, pInList, sqlite3ExprInt32(db, 3));
+  pIn  := sqlite3PExpr(@parse, TK_IN, pCol, nil);
+  pIn^.x.pList := pInList;
+
+  pWInfo := sqlite3WhereBegin(@parse, pSrc, pIn, nil, nil, nil, 0, 0);
+
+  { whereShortCut only matches WO_EQ / WO_IS, not WO_IN, so the planner
+    short-cut returns 0 and WhereBegin returns nil.  This is the expected
+    outcome until 11g.2.d lands the IN-list scan. }
+  Check('M2a WhereBegin returns nil for IN-list (no shortcut)',
+        pWInfo = nil);
+  Check('M2b parse.nErr = 0 (graceful fall-through, not an error)',
+        parse.nErr = 0);
+
+  { Independently exercise the analysis pipeline against the same shape so
+    the regression catches breakage in sqlite3WhereSplit /
+    sqlite3WhereExprAnalyze for IN terms even before the planner can
+    consume them. }
+  pWi2 := PWhereInfo(sqlite3DbMallocZero(db, SizeOf(TWhereInfo)));
+  pWi2^.pParse   := @parse;
+  pWi2^.pTabList := pSrc;
+  pWC := @pWi2^.sWC;
+  sqlite3WhereClauseInit(pWC, pWi2);
+  sqlite3WhereSplit(pWC, pIn, TK_AND);
+  Check('M2c sqlite3WhereSplit produced 1 base term', pWC^.nTerm = 1);
+  sqlite3WhereExprAnalyze(pSrc, pWC);
+  pTerm := @pWC^.a[0];
+  Check('M2d analyzed term has WO_IN',
+        (pTerm^.eOperator and WO_IN) <> 0);
+  Check('M2e analyzed term leftCursor = 0',
+        pTerm^.leftCursor = 0);
+  Check('M2f analyzed term u.leftColumn = -1 (rowid)',
+        pTerm^.u.leftColumn = -1);
+  sqlite3WhereClauseClear(pWC);
+  sqlite3DbFree(db, pWi2);
+
+  sqlite3DbFree(db, pSrc);
+end;
+
+{ ---- M3: "rowid BETWEEN 1 AND 5" ----------------------------------------- }
+procedure RunBetweenTest(db: PTsqlite3; pTab: PTable2);
+var
+  parse: TParse;
+  v:     PVdbe;
+  pSrc:  PSrcList;
+  pCol:  PExpr;
+  pLo, pHi, pBet: PExpr;
+  pBList: PExprList;
+  pWInfo: PWhereInfo;
+  pWi2: PWhereInfo;
+  pWC: PWhereClause;
+begin
+  WriteLn;
+  WriteLn('--- M3: rowid BETWEEN 1 AND 5 ---');
+  InitParse(db, parse, v);
+  pSrc := BuildSrc(db, pTab);
+
+  pCol := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol^.iTable := 0; pCol^.iColumn := -1;
+  pLo := sqlite3ExprInt32(db, 1);
+  pHi := sqlite3ExprInt32(db, 5);
+  pBList := sqlite3ExprListAppend(@parse, nil, pLo);
+  pBList := sqlite3ExprListAppend(@parse, pBList, pHi);
+  pBet := sqlite3PExpr(@parse, TK_BETWEEN, pCol, nil);
+  pBet^.x.pList := pBList;
+
+  pWInfo := sqlite3WhereBegin(@parse, pSrc, pBet, nil, nil, nil, 0, 0);
+  Check('M3a WhereBegin returns nil for BETWEEN (no WO_EQ)',
+        pWInfo = nil);
+  Check('M3b parse.nErr = 0 (graceful fall-through)',
+        parse.nErr = 0);
+
+  { Drive analysis in isolation to verify BETWEEN spawns the two virtual
+    WO_GE / WO_LE children expected by 11g.2.d's range-scan path. }
+  pWi2 := PWhereInfo(sqlite3DbMallocZero(db, SizeOf(TWhereInfo)));
+  pWi2^.pParse   := @parse;
+  pWi2^.pTabList := pSrc;
+  pWC := @pWi2^.sWC;
+  sqlite3WhereClauseInit(pWC, pWi2);
+  sqlite3WhereSplit(pWC, pBet, TK_AND);
+  Check('M3c sqlite3WhereSplit produced 1 base term', pWC^.nTerm = 1);
+  sqlite3WhereExprAnalyze(pSrc, pWC);
+  Check('M3d analysis spawned 2 virtual children (3 terms total)',
+        pWC^.nTerm = 3);
+  Check('M3e child 0 (lower bound) op = TK_GE',
+        pWC^.a[1].pExpr^.op = TK_GE);
+  Check('M3f child 1 (upper bound) op = TK_LE',
+        pWC^.a[2].pExpr^.op = TK_LE);
+  Check('M3g child 0 wtFlags has TERM_VIRTUAL|TERM_DYNAMIC',
+        (pWC^.a[1].wtFlags and (TERM_VIRTUAL or TERM_DYNAMIC))
+        = (TERM_VIRTUAL or TERM_DYNAMIC));
+  Check('M3h child 0 iParent = BETWEEN idx',
+        pWC^.a[1].iParent = 0);
+  Check('M3i child 1 iParent = BETWEEN idx',
+        pWC^.a[2].iParent = 0);
+  Check('M3j BETWEEN parent nChild = 2',
+        pWC^.a[0].nChild = 2);
+  sqlite3WhereClauseClear(pWC);
+  sqlite3DbFree(db, pWi2);
+
+  sqlite3DbFree(db, pSrc);
 end;
 
 var
@@ -229,6 +467,11 @@ begin
   Check('T9  nQueryLoop restored to ', parse.nQueryLoop = savedNQL);
 
   sqlite3DbFree(db, pSrcBuf);
+
+  RunMultiAndTest(db, pTab);
+  RunInTest(db, pTab);
+  RunBetweenTest(db, pTab);
+
   sqlite3_close(db);
 
   WriteLn;
