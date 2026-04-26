@@ -132,6 +132,7 @@ compile_test TestWalker
 compile_test TestExprBasic
 compile_test TestWhereBasic
 compile_test TestWhereStructs
+compile_test TestWhereSimple
 compile_test TestSelectBasic
 compile_test TestAuthBuiltins
 compile_test TestDMLBasic

@@ -6590,6 +6590,15 @@ var
   pMaskSet:   PWhereMaskSet;
   ii:         i32;
   db:         PTsqlite3;
+  pLevel:      PWhereLevel;
+  pLoop:       PWhereLoop;
+  pTab:        PTable2;
+  pTabItem:    PSrcItem;
+  pTerm:       PWhereTerm;
+  iDb:         i32;
+  v:           PVdbe;
+  iReleaseReg: i32;
+  iRowidReg:   i32;
 begin
   Assert(((wctrlFlags and WHERE_ONEPASS_MULTIROW) = 0)
       or (((wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0)
@@ -6768,34 +6777,145 @@ begin
     end;
   end;
 
-  { Planner core + per-loop codegen + epilogue land in the next 11g.2.b
-    sub-progress commit.  For now: free the half-built WhereInfo (closes
-    the cleanup contract — pLoops is empty, pMemToFree is empty, sWC was
-    initialised and may carry split terms) and return nil.  No callers
-    consume the WhereInfo yet, so this is a no-op for the corpus. }
-  whereInfoFree(db, pWInfo);
-  Result := nil;
+  { -------------------------------------------------------------------------
+    Phase 6.9-bis 11g.2.b — trimmed planner pick + per-loop emission.
+
+    Vertical slice scope: a single FROM-clause table with a rowid-EQ (or
+    IPK-EQ) WHERE term — the shape whereShortCut already recognises.
+    Replaces where.c:7079..7237 (whereLoopAddAll, wherePathSolver,
+    whereOmitNoopJoin, BloomFilter, ONEPASS) and where.c:7242..7460
+    (cursor-open + WHERE_INDEXED branch) with a hand-rolled minimum.  Full
+    N-way planner + multi-shape codegen lands in 11g.2.d / 11g.2.e.
+
+    Cleanup contract: every error path frees pWInfo via whereInfoFree.
+    ------------------------------------------------------------------------ }
+  if (nTabList <> 1) or (whereShortCut(@sWLB) = 0) then
+  begin
+    { TODO 11g.2.d: full planner.  Multi-table joins, non-rowid predicates,
+      ORDER BY consumption, virtual-table xFilter, etc. }
+    whereInfoFree(db, pWInfo);
+    Exit(nil);
+  end;
+  if pParse^.nErr <> 0 then
+  begin
+    whereInfoFree(db, pWInfo);
+    Exit(nil);
+  end;
+
+  { Mirror the post-planner bookkeeping at where.c:7197 — the rowid-EQ shape
+    contributes nRowOut=1 (LogEst 0) to the parser's running query-loop count. }
+  pParse^.nQueryLoop := i16(pParse^.nQueryLoop + pWInfo^.nRowOut);
+
+  { Open the level-0 table cursor.  Trimmed port of where.c:7242..7320 — the
+    rowid-EQ shape is non-virtual + non-view + WHERE_INDEXED=0 + ONEPASS_OFF,
+    so only the OP_OpenRead arm fires.  ColumnsUsed / cursor-hint / IfEmpty
+    decorations are deferred (not exercised by the gate today). }
+  pLevel   := @whereInfoLevels(pWInfo)[0];
+  pTabItem := @SrcListItems(pTabList)[0];
+  pTab     := pTabItem^.pSTab;
+  pLoop    := pLevel^.pWLoop;
+  iDb      := sqlite3SchemaToIndex(db, pTab^.pSchema);
+
+  pLevel^.iFrom    := 0;
+  pLevel^.iTabCur  := pTabItem^.iCursor;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(pParse);
+  pLevel^.addrHalt := pLevel^.addrBrk;
+  pLevel^.addrCont := sqlite3VdbeMakeLabel(pParse);
+  pLevel^.notReady := not Bitmask(0);
+
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then
+  begin
+    whereInfoFree(db, pWInfo);
+    Exit(nil);
+  end;
+
+  sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenRead);
+  sqlite3VdbeChangeP5(v, 0);
+
+  { Per-loop body — trimmed port of wherecode.c:1684..1711 (Case 2: rowid-EQ).
+
+    Code the right-hand expression of the EQ predicate into a register, then
+    emit OP_SeekRowid to position the cursor on that single row (jumps to
+    addrNxt = addrBrk if the row is missing).  pLevel^.op stays OP_Noop —
+    the lookup is one-shot, so sqlite3WhereEnd does not emit an iteration
+    opcode for this level. }
+  pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
+  pLevel^.addrNxt  := pLevel^.addrBrk;
+  pTerm := pLoop^.aLTerm[0];
+  Assert(pTerm <> nil);
+  Assert(pTerm^.pExpr <> nil);
+
+  Inc(pParse^.nMem);
+  iReleaseReg := pParse^.nMem;
+  iRowidReg := sqlite3ExprCodeTarget(pParse, pTerm^.pExpr^.pRight, iReleaseReg);
+  if iRowidReg <> iReleaseReg then
+    sqlite3ReleaseTempReg(pParse, iReleaseReg);
+  sqlite3VdbeAddOp3(v, OP_SeekRowid, pLevel^.iTabCur, pLevel^.addrNxt,
+                    iRowidReg);
+  pLevel^.op := OP_Noop;
+
+  { Inline disableTerm — mark the rowid-EQ term TERM_CODED so the per-row
+    body code generator (when wired up) does not re-emit it.  The full C
+    disableTerm also handles transitive-equiv terms; deferred to 11g.2.e. }
+  pTerm^.wtFlags := pTerm^.wtFlags or TERM_CODED;
+
+  Result := pWInfo;
 end;
 
 procedure sqlite3WhereEnd(pWInfo: PWhereInfo);
+var
+  pPrs:   PParse;
+  v:      PVdbe;
+  i:      i32;
+  pLevel: PWhereLevel;
+  db:     PTsqlite3;
 begin
-  { Phase 6.9-bis step 11g.2.b — productive cleanup contract.
+  { Phase 6.9-bis 11g.2.b — productive loop-tail.
 
-    Stub WhereBegin still returns nil for every shape in the corpus, so this
-    is a no-op in practice today.  But the contract is now complete: once
-    WhereBegin starts allocating a WhereInfo (single-table rowid-EQ slice or
-    later), every error path and every successful pairing automatically gets
-    the proper teardown — pLoops walk + pMemToFree walk + WhereClause clear
-    + WhereInfo free, all delegated to whereInfoFree (where.c:2615).
+    Trimmed port of where.c:7519..7898.  For each level (just one, in the
+    rowid-EQ vertical slice): resolve the addrCont label, emit the iteration
+    opcode if pLevel^.op <> OP_Noop, and resolve the addrBrk label.  After
+    all levels, resolve pWInfo^.iBreak so callers can jump out of the WHERE
+    loop entirely.  Finally restore nQueryLoop and free the WhereInfo via
+    whereInfoFree (the same contract that already covered the error paths in
+    sqlite3WhereBegin).
 
-    where.c's real sqlite3WhereEnd does much more (loop-termination opcode
-    emission, SKIPAHEAD_DISTINCT seeks, IN-LOOP unwind, LEFT JOIN null-row
-    fixup, …); those land alongside the productive WhereBegin in 11g.2.b /
-    11g.2.e.  This minimal body covers only the resource-cleanup half of
-    the contract, which is what the bookkeeping primitives in step 11g.2.b
-    (sub-progress) were built to support. }
-  if pWInfo <> nil then
-    whereInfoFree(pWInfo^.pParse^.db, pWInfo);
+    Deferred (not exercised by the rowid-EQ shape and gated to 11g.2.e):
+      * RIGHT JOIN subroutine return (where.c:7539..7552, 7675..7678),
+      * SKIPAHEAD_DISTINCT seek (where.c:7555..7584, 7621..7626),
+      * EXISTS-to-JOIN break (where.c:7586..7607),
+      * IN-loop unwind (where.c:7628..7673),
+      * addrSkip / addrLikeRep (where.c:7679..7691),
+      * LEFT JOIN null-row fixup (where.c:7692..7726),
+      * Index→table column rewrite (where.c:7732..7886).
+    All of these arms are zero-cost no-ops when their gating fields stay 0,
+    which they do in the rowid-EQ slice.  The final whereInfoFree closes
+    the cleanup contract for both the productive and the no-op paths. }
+  if pWInfo = nil then Exit;
+
+  pPrs := pWInfo^.pParse;
+  v    := pPrs^.pVdbe;
+  db   := pPrs^.db;
+
+  if v <> nil then
+  begin
+    for i := pWInfo^.nLevel - 1 downto 0 do
+    begin
+      pLevel := @whereInfoLevels(pWInfo)[i];
+      sqlite3VdbeResolveLabel(v, pLevel^.addrCont);
+      if pLevel^.op <> OP_Noop then
+      begin
+        sqlite3VdbeAddOp3(v, pLevel^.op, pLevel^.p1, pLevel^.p2, pLevel^.p3);
+        sqlite3VdbeChangeP5(v, pLevel^.p5);
+      end;
+      sqlite3VdbeResolveLabel(v, pLevel^.addrBrk);
+    end;
+    sqlite3VdbeResolveLabel(v, pWInfo^.iBreak);
+  end;
+
+  pPrs^.nQueryLoop := i16(pWInfo^.savedNQueryLoop);
+  whereInfoFree(db, pWInfo);
 end;
 
 procedure sqlite3WhereRightJoinLoop(pWInfo: PWhereInfo; iLevel: i32;

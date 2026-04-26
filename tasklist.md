@@ -28,20 +28,29 @@ Important: At the end of this document, please find:
     TK_COLLATE/TK_SPAN/TK_UPLUS arms, whereShortCut, allowedOp +
     operatorMask + exprMightBeIndexed + minimal-viable exprAnalyze)
     are already landed.
-    - Implement the trimmed planner pick + `OP_NotExists` emission
-      for the rowid-EQ shape (hard-code the cost selection; defer
-      `whereLoopAddBtree` etc.).  whereShortCut is now wired to a
-      productive exprAnalyze, so the planner pick can drop straight
-      into `sqlite3WhereBegin` after the WHERE_WANT_DISTINCT block.
-    - Implement the loop-tail half of `sqlite3WhereEnd`
-      (Goto continue + Resolve break label + cursor close).
-    - Re-enable productive tails in `sqlite3DeleteFrom`
-      (codegen.pas:5460..5471) and `sqlite3Update`
-      (codegen.pas:5660..5670); drop the step-11f skeleton-only
-      error-state guard at codegen.pas:5401..5410 + 5577..5599.
-    - New gate `TestWhereSimple.pas` — hand-built SrcList +
-      rowid-EQ Expr; assert OP_NotExists / OP_Goto / labels emitted
-      in expected order.
+    - [X] Trimmed planner pick + per-loop emission for the rowid-EQ
+      shape — `whereShortCut` wired into `sqlite3WhereBegin` after
+      the WHERE_WANT_DISTINCT block; level-0 cursor open via
+      `sqlite3OpenTable(OP_OpenRead)` + Case-2 body via
+      `sqlite3ExprCodeTarget` + `OP_SeekRowid` to addrBrk.
+    - [X] Loop-tail half of `sqlite3WhereEnd` — per-level
+      ResolveLabel(addrCont) + iteration-opcode emission +
+      ResolveLabel(addrBrk), final ResolveLabel(iBreak), nQueryLoop
+      restore, then `whereInfoFree`.  Deferred arms (RIGHT JOIN,
+      SKIPAHEAD_DISTINCT, IN-loop unwind, LEFT JOIN null-row,
+      addrSkip, index→table column rewrite) gated to 11g.2.e.
+    - [X] `TestWhereSimple.pas` gate — hand-built SrcList +
+      rowid-EQ Expr; asserts `whereShortCut` populates
+      WHERE_IPK | WHERE_ONEROW, OP_OpenRead + OP_SeekRowid emit at
+      expected cursors / labels, `pLevel^.op = OP_Noop`, term
+      flagged TERM_CODED, and `pParse.nQueryLoop` is restored
+      across `WhereBegin`/`WhereEnd`.
+    - [ ] Re-enable productive tails in `sqlite3DeleteFrom` and
+      `sqlite3Update`; drop the step-11f skeleton-only error-state
+      guard.  Blocked on Phase 6.5 helpers — `sqlite3GenerateRowDelete`,
+      `sqlite3GenerateConstraintChecks`, `sqlite3CompleteInsertion` are
+      still stubs.  Folded into 11g.2.e alongside `wherecode.c`'s
+      per-row body.
 
 - [ ] **6.9-bis 11g.2.c** Port `whereexpr.c` (~1944 lines) —
     WHERE-clause term decomposition + analysis.  Public surface:
