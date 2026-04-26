@@ -56,6 +56,8 @@ uses
   Strings,
   passqlite3types,
   passqlite3util,
+  passqlite3os,
+  passqlite3vdbe,
   passqlite3codegen;
 
 type
@@ -212,6 +214,35 @@ function sqlite3VtabCallCreate(db: PTsqlite3; iDb: i32; zTab: PAnsiChar;
 { Invoked by the VDBE to call xDestroy on a DROP TABLE.  No-op if zTab is
   not a virtual table.  (vtab.c:926) }
 function sqlite3VtabCallDestroy(db: PTsqlite3; iDb: i32; zTab: PAnsiChar): i32;
+
+{ ============================================================
+  Per-statement transaction hooks (Phase 6.bis.1d — vtab.c:970..1138)
+  ============================================================ }
+
+{ vtab.c:998 — invoke xSync on every entry in db^.aVTrans.  pV is the Vdbe
+  whose zErrMsg is updated with any error message returned by xSync via
+  sqlite3VtabImportErrmsg. }
+function sqlite3VtabSync(db: PTsqlite3; pV: PVdbe): i32;
+
+{ vtab.c:1020 — invoke xRollback on every entry, then clear aVTrans. }
+function sqlite3VtabRollback(db: PTsqlite3): i32;
+
+{ vtab.c:1029 — invoke xCommit on every entry, then clear aVTrans. }
+function sqlite3VtabCommit(db: PTsqlite3): i32;
+
+{ vtab.c:1042 — open a transaction on pVTab if its module supports it and
+  one is not already open.  On success appends pVTab to db^.aVTrans. }
+function sqlite3VtabBegin(db: PTsqlite3; pVTab: PVTable): i32;
+
+{ vtab.c:1102 — invoke xSavepoint / xRollbackTo / xRelease on every entry
+  whose module is iVersion>=2.  op is one of SAVEPOINT_BEGIN /
+  SAVEPOINT_ROLLBACK / SAVEPOINT_RELEASE. }
+function sqlite3VtabSavepoint(db: PTsqlite3; op, iSavepoint: i32): i32;
+
+{ vtab.c:5673 (vdbeaux.c) — copy pVtab^.zErrMsg into pV^.zErrMsg, freeing
+  the previous contents on both sides.  Exposed so 6.bis.2 in-tree vtabs
+  can use the same wiring. }
+procedure sqlite3VtabImportErrmsg(pV: PVdbe; pVtab: PSqlite3Vtab);
 
 implementation
 
@@ -769,6 +800,212 @@ begin
       sqlite3VtabUnlock(p);
     end;
     passqlite3codegen.sqlite3DeleteTable(db, pTab);
+  end;
+  Result := rc;
+end;
+
+{ ============================================================
+  Phase 6.bis.1d — Per-statement transaction hooks (vtab.c:970..1138)
+  ============================================================ }
+
+const
+  SQLITE_Defensive = u64($10000000);  { sqliteInt.h:1859 — db.flags bit }
+
+type
+  Tsqlite3_vtab_meth1 = function(p: PSqlite3Vtab): i32; cdecl;
+  Tsqlite3_vtab_meth2 = function(p: PSqlite3Vtab; iSav: i32): i32; cdecl;
+
+procedure sqlite3VtabImportErrmsg(pV: PVdbe; pVtab: PSqlite3Vtab);
+var
+  db: PTsqlite3;
+begin
+  if pVtab^.zErrMsg <> nil then begin
+    db := PTsqlite3(pV^.db);
+    sqlite3DbFree(Psqlite3db(db), pV^.zErrMsg);
+    pV^.zErrMsg := sqlite3DbStrDup(Psqlite3db(db), PChar(pVtab^.zErrMsg));
+    sqlite3_free(pVtab^.zErrMsg);
+    pVtab^.zErrMsg := nil;
+  end;
+end;
+
+{ Method-kind enum for callFinaliser — mirrors the C offsetof() trick by
+  selecting the correct slot in the module dispatch table at call site. }
+type
+  TFinKind = (fkCommit, fkRollback);
+
+procedure callFinaliser(db: PTsqlite3; kind: TFinKind);
+var
+  i:       i32;
+  aVTrans: ^Pointer;
+  pVTab:   PVTable;
+  p:       PSqlite3Vtab;
+  x:       Tsqlite3_vtab_meth1;
+  pf:      Pointer;
+begin
+  if db^.aVTrans <> nil then begin
+    aVTrans     := db^.aVTrans;
+    db^.aVTrans := nil;
+    for i := 0 to db^.nVTrans - 1 do begin
+      pVTab := PVTable(aVTrans[i]);
+      p     := pVTab^.pVtab;
+      if p <> nil then begin
+        case kind of
+          fkCommit:   pf := p^.pModule^.xCommit;
+          fkRollback: pf := p^.pModule^.xRollback;
+        else
+          pf := nil;
+        end;
+        if pf <> nil then begin
+          x := Tsqlite3_vtab_meth1(pf);
+          x(p);
+        end;
+      end;
+      pVTab^.iSavepoint := 0;
+      sqlite3VtabUnlock(pVTab);
+    end;
+    sqlite3DbFree(Psqlite3db(db), aVTrans);
+    db^.nVTrans := 0;
+  end;
+end;
+
+function sqlite3VtabSync(db: PTsqlite3; pV: PVdbe): i32;
+var
+  i:       i32;
+  rc:      i32;
+  aVTrans: ^Pointer;
+  pVtab:   PSqlite3Vtab;
+  pf:      Pointer;
+  x:       Tsqlite3_vtab_meth1;
+begin
+  rc      := SQLITE_OK;
+  aVTrans := db^.aVTrans;
+  db^.aVTrans := nil;
+  i := 0;
+  while (rc = SQLITE_OK) and (i < db^.nVTrans) do begin
+    pVtab := PVTable(aVTrans[i])^.pVtab;
+    if pVtab <> nil then begin
+      pf := pVtab^.pModule^.xSync;
+      if pf <> nil then begin
+        x  := Tsqlite3_vtab_meth1(pf);
+        rc := x(pVtab);
+        sqlite3VtabImportErrmsg(pV, pVtab);
+      end;
+    end;
+    Inc(i);
+  end;
+  db^.aVTrans := aVTrans;
+  Result := rc;
+end;
+
+function sqlite3VtabRollback(db: PTsqlite3): i32;
+begin
+  callFinaliser(db, fkRollback);
+  Result := SQLITE_OK;
+end;
+
+function sqlite3VtabCommit(db: PTsqlite3): i32;
+begin
+  callFinaliser(db, fkCommit);
+  Result := SQLITE_OK;
+end;
+
+{ vtab.c:1051 macro — true iff a vtab module is currently inside an xSync
+  callback (callFinaliser/Sync nulled aVTrans while keeping nVTrans>0). }
+function vtabInSync(db: PTsqlite3): Boolean; inline;
+begin
+  Result := (db^.nVTrans > 0) and (db^.aVTrans = nil);
+end;
+
+function sqlite3VtabBegin(db: PTsqlite3; pVTab: PVTable): i32;
+var
+  rc:      i32;
+  pModule: PSqlite3Module;
+  i, iSvpt: i32;
+  pfBegin, pfSv: Pointer;
+  xBegin: Tsqlite3_vtab_meth1;
+  xSavepoint: Tsqlite3_vtab_meth2;
+begin
+  rc := SQLITE_OK;
+  if vtabInSync(db) then begin
+    Result := SQLITE_LOCKED; Exit;
+  end;
+  if pVTab = nil then begin
+    Result := SQLITE_OK; Exit;
+  end;
+  pModule := pVTab^.pVtab^.pModule;
+
+  pfBegin := pModule^.xBegin;
+  if pfBegin <> nil then begin
+    { Already in aVTrans?  No-op. }
+    for i := 0 to db^.nVTrans - 1 do begin
+      if PVTable(PPointer(db^.aVTrans)[i]) = pVTab then begin
+        Result := SQLITE_OK; Exit;
+      end;
+    end;
+
+    rc := growVTrans(db);
+    if rc = SQLITE_OK then begin
+      xBegin := Tsqlite3_vtab_meth1(pfBegin);
+      rc := xBegin(pVTab^.pVtab);
+      if rc = SQLITE_OK then begin
+        iSvpt := db^.nStatement + db^.nSavepoint;
+        addToVTrans(db, pVTab);
+        pfSv := pModule^.xSavepoint;
+        if (iSvpt <> 0) and (pfSv <> nil) then begin
+          pVTab^.iSavepoint := iSvpt;
+          xSavepoint := Tsqlite3_vtab_meth2(pfSv);
+          rc := xSavepoint(pVTab^.pVtab, iSvpt - 1);
+        end;
+      end;
+    end;
+  end;
+  Result := rc;
+end;
+
+function sqlite3VtabSavepoint(db: PTsqlite3; op, iSavepoint: i32): i32;
+var
+  rc:         i32;
+  i:          i32;
+  pVTab:      PVTable;
+  pMod:       PSqlite3Module;
+  pf:         Pointer;
+  xMethod:    Tsqlite3_vtab_meth2;
+  savedFlags: u64;
+begin
+  rc := SQLITE_OK;
+  Assert((op = SAVEPOINT_RELEASE) or (op = SAVEPOINT_ROLLBACK)
+         or (op = SAVEPOINT_BEGIN), 'sqlite3VtabSavepoint bad op');
+  Assert(iSavepoint >= -1, 'sqlite3VtabSavepoint bad iSavepoint');
+  if db^.aVTrans <> nil then begin
+    i := 0;
+    while (rc = SQLITE_OK) and (i < db^.nVTrans) do begin
+      pVTab := PVTable(PPointer(db^.aVTrans)[i]);
+      pMod  := PVtabModule(pVTab^.pMod)^.pModule;
+      if (pVTab^.pVtab <> nil) and (pMod^.iVersion >= 2) then begin
+        sqlite3VtabLock(pVTab);
+        pf := nil;
+        case op of
+          SAVEPOINT_BEGIN:
+            begin
+              pf := pMod^.xSavepoint;
+              pVTab^.iSavepoint := iSavepoint + 1;
+            end;
+          SAVEPOINT_ROLLBACK:
+            pf := pMod^.xRollbackTo;
+        else
+          pf := pMod^.xRelease;
+        end;
+        if (pf <> nil) and (pVTab^.iSavepoint > iSavepoint) then begin
+          savedFlags := db^.flags and SQLITE_Defensive;
+          db^.flags  := db^.flags and (not SQLITE_Defensive);
+          xMethod := Tsqlite3_vtab_meth2(pf);
+          rc := xMethod(pVTab^.pVtab, iSavepoint);
+          db^.flags := db^.flags or savedFlags;
+        end;
+        sqlite3VtabUnlock(pVTab);
+      end;
+      Inc(i);
+    end;
   end;
   Result := rc;
 end;

@@ -20,6 +20,55 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-25 — Phase 6.bis.1d vtab.c per-statement transaction hooks.**
+    Faithful ports of vtab.c:970..1138 now live in
+    `src/passqlite3vtab.pas`: `sqlite3VtabSync`, `sqlite3VtabRollback`,
+    `sqlite3VtabCommit`, `sqlite3VtabBegin`, `sqlite3VtabSavepoint`,
+    plus the static `callFinaliser` helper and the `vtabInSync`
+    inline (replacing the upstream macro).  `sqlite3VtabImportErrmsg`
+    (from vdbeaux.c:5673) is also exported here so any future caller
+    that needs to copy a vtab module's `zErrMsg` into a Vdbe can do
+    so without re-implementing the dance.
+
+    Pascal/cross-language deltas worth flagging:
+      * `callFinaliser` in C uses `offsetof(sqlite3_module, xCommit/
+        xRollback)` plus a function-pointer cast through `(char*)
+        +offset` to pick which finaliser to invoke.  We can't take
+        `offsetof` cleanly across `Pointer`-typed fields; the port
+        replaces it with a `TFinKind = (fkCommit, fkRollback)` enum
+        that selects the field at the call site.  Behaviour is
+        identical, the dispatch is just explicit.
+      * `db^.flags` SQLITE_Defensive masking around the savepoint
+        callback uses a local `SQLITE_Defensive = u64($10000000)`
+        constant (same value as `SQLITE_Defensive_Bit` in
+        passqlite3main.pas).  Will collapse to a re-export when the
+        flag set moves to a central unit.
+      * Added `passqlite3vdbe` and `passqlite3os` to `passqlite3vtab`'s
+        uses clause.  No cycle introduced — only `passqlite3main`
+        imports `passqlite3vtab`, and neither vdbe nor os
+        transitively depend on vtab.
+
+    Wiring caveat (carry-over for next sub-phases):
+      * The five entry points are callable but the codegen / VDBE
+        opcodes (`OP_VBegin`, `OP_VSync`, `OP_Savepoint`'s vtab
+        branch) still do NOT invoke them.  The Phase 5.9 stubs in
+        `passqlite3vdbe.pas` need to be replaced with real calls
+        once the surrounding parser/codegen support exists.
+        Tracked in the 6.bis.1d task notes.
+
+    Allocator-contract pitfall worth memoising:
+      * Vtab modules MUST allocate `pVtab^.zErrMsg` via libc malloc
+        (`sqlite3Malloc` in our port) — NOT FPC's `GetMem` and NOT
+        `sqlite3DbStrDup`.  `sqlite3VtabImportErrmsg` releases it
+        with `sqlite3_free` which is `external 'c' name 'free'`
+        in `passqlite3os.pas:58`.  Test `HookXSync` was bitten by
+        this with `GetMem(z,32)` (double free at runtime); fixed
+        by switching to `sqlite3Malloc(32)`.
+
+    Gate `src/tests/TestVtab.pas` extended with T35..T50 — **113/113
+    PASS** (was 76/76).  No regressions across the 41 other gates
+    in build.sh.
+
   - **2026-04-25 — Phase 6.bis.1c vtab.c constructor lifecycle.**
     Replaced the deferred constructor-lifecycle TODOs in
     `passqlite3vtab.pas` with faithful ports of vtab.c:557..968:
@@ -2454,10 +2503,62 @@ Phase 5.9 depends on this being done first.
         matches what dbpage.c / dbstat.c / carray.c will do in
         6.bis.2.
 
-  - [ ] **6.bis.1d** Per-statement hooks: sqlite3VtabSync, _Rollback,
+  - [X] **6.bis.1d** Per-statement hooks: sqlite3VtabSync, _Rollback,
     _Commit, _Begin, _Savepoint, callFinaliser (vtab.c:970..1151).
-    Wires the codegen / vdbe `OP_VBegin`, `OP_VSync` etc. into the
-    per-statement transaction lifecycle.
+    DONE 2026-04-25.  Five entry points + `callFinaliser` + the
+    `vtabInSync` macro now live in `src/passqlite3vtab.pas`
+    (interface extended; `callFinaliser` is implementation-only with
+    a `TFinKind` enum substituting for C's offsetof-into-the-module
+    trick).  `sqlite3VtabImportErrmsg` (vdbeaux.c:5673) is also
+    exported from this unit so future code paths (and 6.bis.2 in-tree
+    vtabs) can route module errors into the active Vdbe^.zErrMsg.
+    Gate `src/tests/TestVtab.pas` extended with T35..T50 — **113/113
+    PASS** (was 76/76).  No regressions across the 41 other gates
+    in build.sh.
+
+    Discoveries / dependencies for next sub-phases:
+
+      * **Allocator contract for vtab `zErrMsg` is libc malloc, not
+        sqlite3DbMalloc.**  `sqlite3VtabImportErrmsg` calls
+        `sqlite3_free(pVtab^.zErrMsg)`, which in our port is
+        `external 'c' name 'free'` (passqlite3os.pas:58).  Test
+        modules and 6.bis.2 in-tree vtabs MUST allocate
+        `pVtab^.zErrMsg` via `sqlite3Malloc` (= libc malloc), NOT
+        via `GetMem` and NOT via `sqlite3DbStrDup`.  Mismatched
+        allocators trigger "double free or corruption" at runtime.
+        Initial test got bitten by this with a `GetMem(z, 32)` —
+        switched to `sqlite3Malloc(32)`.
+
+      * **Wiring into VDBE / codegen is still pending.**  These five
+        entry points are now callable but no opcode invokes them
+        yet.  `OP_VBegin` already exists as a dispatched no-op in
+        passqlite3vdbe.pas (Phase 5.9 stub); a future sub-phase
+        (likely a small Phase-7-or-Phase-8 follow-up) needs to
+        replace the stub with `sqlite3VtabBegin(db, …)` and surface
+        Sync/Commit/Rollback hooks at end-of-statement.  Same goes
+        for `OP_Savepoint` which today does NOT call
+        `sqlite3VtabSavepoint`.  Tracked here so 6.bis.1e/1f and
+        any Phase-8 SAVEPOINT-related work picks it up.
+
+      * **Pascal pitfall: var name vs type name (recurring).**  A
+        local `pVdbe: PVdbe` triggers FPC "Error in type definition"
+        because the variable and type collide modulo case.  In
+        TestVtab the local was renamed `pVm`.  Mirrors the existing
+        memory feedback for vtab.c-area work.
+
+      * **iVersion gate on Savepoint.**  `sqlite3VtabSavepoint` is a
+        no-op for `iVersion < 2` modules — gate test uses
+        `m.iVersion := 2`.  6.bis.2 dbpage/dbstat/carray tables use
+        iVersion=1 today (no SAVEPOINT support); that is correct.
+
+      * **`db^.flags` SQLITE_Defensive bit handling**: the savepoint
+        path masks SQLITE_Defensive off around the xMethod call and
+        restores it afterwards (vtab.c:1128..1131).  We define a
+        local `SQLITE_Defensive = u64($10000000)` in passqlite3vtab
+        — same constant value as `SQLITE_Defensive_Bit` in
+        passqlite3main.pas:1000.  When/if we promote
+        `SQLITE_Defensive_Bit` to the central util/types unit, this
+        local can collapse to a re-export.
 
   - [ ] **6.bis.1e** API entry points: sqlite3_declare_vtab,
     sqlite3_vtab_on_conflict, sqlite3_vtab_config (vtab.c:811..1374).

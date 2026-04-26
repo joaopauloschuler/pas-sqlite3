@@ -419,6 +419,215 @@ begin
   sqlite3DbFree(db, pParse);
 end;
 
+{ ============================================================
+  Phase 6.bis.1d — per-statement transaction hooks.
+  ============================================================ }
+
+var
+  gBeginCount, gSyncCount, gCommitCount, gRollbackCount: i32;
+  gSavepointCount, gReleaseCount, gRollbackToCount:      i32;
+  gLastSavepointArg: i32;
+  gXSyncFails:       i32;   { if 1, next xSync returns ERROR + zErrMsg }
+
+function HookXBegin(p: PSqlite3Vtab): i32; cdecl;
+begin Inc(gBeginCount); Result := SQLITE_OK; end;
+
+function HookXSync(p: PSqlite3Vtab): i32; cdecl;
+var z: PAnsiChar;
+begin
+  Inc(gSyncCount);
+  if gXSyncFails = 1 then begin
+    gXSyncFails := 0;
+    { Allocate via sqlite3Malloc (= libc malloc) so sqlite3VtabImportErrmsg's
+      sqlite3_free (= libc free) balances the allocator. }
+    z := PAnsiChar(sqlite3Malloc(32));
+    StrPCopy(z, 'forced xSync error');
+    p^.zErrMsg := z;
+    Result := SQLITE_ERROR;
+    Exit;
+  end;
+  Result := SQLITE_OK;
+end;
+
+function HookXCommit(p: PSqlite3Vtab): i32; cdecl;
+begin Inc(gCommitCount); Result := SQLITE_OK; end;
+
+function HookXRollback(p: PSqlite3Vtab): i32; cdecl;
+begin Inc(gRollbackCount); Result := SQLITE_OK; end;
+
+function HookXSavepoint(p: PSqlite3Vtab; iSav: i32): i32; cdecl;
+begin
+  Inc(gSavepointCount); gLastSavepointArg := iSav;
+  Result := SQLITE_OK;
+end;
+
+function HookXRelease(p: PSqlite3Vtab; iSav: i32): i32; cdecl;
+begin Inc(gReleaseCount); gLastSavepointArg := iSav; Result := SQLITE_OK; end;
+
+function HookXRollbackTo(p: PSqlite3Vtab; iSav: i32): i32; cdecl;
+begin Inc(gRollbackToCount); gLastSavepointArg := iSav; Result := SQLITE_OK; end;
+
+procedure ResetHookCounters;
+begin
+  gBeginCount := 0; gSyncCount := 0; gCommitCount := 0; gRollbackCount := 0;
+  gSavepointCount := 0; gReleaseCount := 0; gRollbackToCount := 0;
+  gLastSavepointArg := -999; gXSyncFails := 0;
+end;
+
+procedure TestVtabHooks_Run(db: PTsqlite3);
+var
+  m:        Tsqlite3_module;
+  pMod:     PVtabModule;
+  pTabHk:   TCgPTable;
+  pParse:   TCgPParse;
+  pVT:      PVTable;
+  rc:       i32;
+  pSchemaT: TUtilPSchema;
+  pVm:      PVdbe;
+  origNStmt: i32;
+begin
+  WriteLn('TestVtab — Phase 6.bis.1d gate (per-statement hooks)');
+  pSchemaT := TUtilPSchema(db^.aDb[0].pSchema);
+
+  { iVersion=2 module: must be >=2 for sqlite3VtabSavepoint to dispatch. }
+  FillChar(m, SizeOf(m), 0);
+  m.iVersion    := 2;
+  m.xCreate     := @CtorXCreate;
+  m.xConnect    := @CtorXConnect;
+  m.xDestroy    := @CtorXDestroy;
+  m.xDisconnect := @CtorXDisconnect;
+  m.xBegin      := @HookXBegin;
+  m.xSync       := @HookXSync;
+  m.xCommit     := @HookXCommit;
+  m.xRollback   := @HookXRollback;
+  m.xSavepoint  := @HookXSavepoint;
+  m.xRelease    := @HookXRelease;
+  m.xRollbackTo := @HookXRollbackTo;
+  pMod := sqlite3VtabCreateModule(db, 'hookmod', @m, nil, nil);
+  Expect(pMod <> nil, 'T35 register hookmod');
+
+  { Attach via CallConnect — does NOT add to aVTrans, leaving sqlite3VtabBegin
+    a clean slate to exercise its grow-and-add path. }
+  pParse := TCgPParse(sqlite3MallocZero64(SizeOf(TCgTParse)));
+  pParse^.db := db;
+
+  pTabHk := CtorMakeTable(db, 'hk_a', 'hookmod');
+  rc := sqlite3VtabCallConnect(pParse, pTabHk);
+  ExpectEq(rc, SQLITE_OK, 'T36 CallConnect hk_a');
+  pVT := sqlite3GetVTable(db, pTabHk);
+  Expect(pVT <> nil, 'T36b VTable attached');
+  ExpectEq(db^.nVTrans, 0,
+    'T36c CallConnect path leaves aVTrans empty');
+
+  { ---- T37: sqlite3VtabBegin grows aVTrans and calls xBegin. ---- }
+  ResetHookCounters;
+  origNStmt := db^.nStatement;
+  db^.nStatement := 0;
+  rc := sqlite3VtabBegin(db, pVT);
+  db^.nStatement := origNStmt;
+  ExpectEq(rc, SQLITE_OK, 'T37 sqlite3VtabBegin ok');
+  ExpectEq(gBeginCount, 1, 'T37b xBegin fired once');
+  ExpectEq(gSavepointCount, 0,
+    'T37c xSavepoint NOT fired when iSvpt=0');
+  ExpectEq(db^.nVTrans, 1, 'T37d nVTrans=1 after first Begin');
+
+  { Idempotent: second Begin on same pVT short-circuits. }
+  ResetHookCounters;
+  rc := sqlite3VtabBegin(db, pVT);
+  ExpectEq(rc, SQLITE_OK, 'T38 second Begin ok');
+  ExpectEq(gBeginCount, 0, 'T38b second Begin = no-op (already in aVTrans)');
+
+  { Begin with nil pVTab is a no-op success (vtab.c:1054). }
+  rc := sqlite3VtabBegin(db, nil);
+  ExpectEq(rc, SQLITE_OK, 'T39 Begin(nil) = OK');
+
+  { ---- T40: sqlite3VtabSync dispatches xSync per VTable ---- }
+  ResetHookCounters;
+  pVm := PVdbe(sqlite3MallocZero64(SizeOf(TVdbe)));
+  pVm^.db := Pointer(db);
+  rc := sqlite3VtabSync(db, pVm);
+  ExpectEq(rc, SQLITE_OK, 'T40 sqlite3VtabSync ok');
+  ExpectEq(gSyncCount, db^.nVTrans, 'T40b xSync called for each VTable');
+  Expect(db^.aVTrans <> nil, 'T40c aVTrans restored after Sync');
+
+  { xSync error → propagates with zErrMsg imported into Vdbe. }
+  ResetHookCounters;
+  gXSyncFails := 1;
+  rc := sqlite3VtabSync(db, pVm);
+  ExpectEq(rc, SQLITE_ERROR, 'T41 xSync error propagates');
+  Expect(pVm^.zErrMsg <> nil, 'T41b zErrMsg imported into Vdbe');
+  if pVm^.zErrMsg <> nil then
+    Expect(StrComp(pVm^.zErrMsg, 'forced xSync error') = 0,
+      'T41c zErrMsg text matches');
+  sqlite3DbFree(db, pVm^.zErrMsg);
+  pVm^.zErrMsg := nil;
+
+  { ---- T42: sqlite3VtabSavepoint(BEGIN) dispatches xSavepoint ---- }
+  ResetHookCounters;
+  rc := sqlite3VtabSavepoint(db, SAVEPOINT_BEGIN, 3);
+  ExpectEq(rc, SQLITE_OK, 'T42 Savepoint(BEGIN, 3) ok');
+  ExpectEq(gSavepointCount, db^.nVTrans,
+    'T42b xSavepoint fired for each iVersion>=2 VTable');
+  ExpectEq(gLastSavepointArg, 3,
+    'T42c xSavepoint received iSavepoint as-is (3)');
+  Expect(pVT^.iSavepoint = 4, 'T42d pVT.iSavepoint set to iSavepoint+1');
+
+  { ROLLBACK_TO: only fires when pVTab^.iSavepoint > iSavepoint. }
+  ResetHookCounters;
+  rc := sqlite3VtabSavepoint(db, SAVEPOINT_ROLLBACK, 2);
+  ExpectEq(rc, SQLITE_OK, 'T43 Savepoint(ROLLBACK, 2) ok');
+  ExpectEq(gRollbackToCount, db^.nVTrans,
+    'T43b xRollbackTo fired (iSavepoint=4 > 2)');
+
+  { RELEASE with iSavepoint that is NOT exceeded → xRelease NOT fired. }
+  ResetHookCounters;
+  rc := sqlite3VtabSavepoint(db, SAVEPOINT_RELEASE, 99);
+  ExpectEq(rc, SQLITE_OK, 'T44 Savepoint(RELEASE, 99) ok');
+  ExpectEq(gReleaseCount, 0,
+    'T44b xRelease NOT fired (iSavepoint=4 <= 99)');
+
+  { ---- T45: sqlite3VtabCommit drains aVTrans + fires xCommit per slot ---- }
+  ResetHookCounters;
+  rc := sqlite3VtabCommit(db);
+  ExpectEq(rc, SQLITE_OK, 'T45 Commit ok');
+  ExpectEq(gCommitCount, 1, 'T45b xCommit fired once');
+  ExpectEq(db^.nVTrans, 0, 'T45c nVTrans=0 after Commit');
+  Expect(db^.aVTrans = nil, 'T45d aVTrans=nil after Commit');
+
+  { Commit unlocks each VTable in aVTrans, dropping nRef from 2→1; the
+    surviving reference (held by pTab^.u.vtab.p) keeps the VTable alive
+    until CallDestroy fires xDisconnect. }
+  rc := sqlite3VtabCallDestroy(db, 0, 'hk_a');
+  ExpectEq(rc, SQLITE_OK, 'T46 CallDestroy hk_a after Commit');
+
+  { ---- T47: sqlite3VtabRollback parallel path ---- }
+  pTabHk := CtorMakeTable(db, 'hk_b', 'hookmod');
+  rc := sqlite3VtabCallConnect(pParse, pTabHk);
+  ExpectEq(rc, SQLITE_OK, 'T47 CallConnect hk_b');
+  pVT := sqlite3GetVTable(db, pTabHk);
+  origNStmt := db^.nStatement;
+  db^.nStatement := 0;
+  rc := sqlite3VtabBegin(db, pVT);
+  db^.nStatement := origNStmt;
+  ExpectEq(rc, SQLITE_OK, 'T47b Begin hk_b');
+
+  ResetHookCounters;
+  rc := sqlite3VtabRollback(db);
+  ExpectEq(rc, SQLITE_OK, 'T48 Rollback ok');
+  ExpectEq(gRollbackCount, 1, 'T48b xRollback fired once');
+  ExpectEq(db^.nVTrans, 0, 'T48c nVTrans=0 after Rollback');
+
+  rc := sqlite3VtabCallDestroy(db, 0, 'hk_b');
+  ExpectEq(rc, SQLITE_OK, 'T49 CallDestroy hk_b');
+
+  { Cleanup: drop the module. }
+  rc := sqlite3_drop_modules(db, nil);
+  ExpectEq(rc, SQLITE_OK, 'T50 drop hookmod');
+
+  sqlite3DbFree(db, pVm);
+  sqlite3DbFree(db, pParse);
+end;
+
 var
   db: PTsqlite3;
   rc: i32;
@@ -553,6 +762,9 @@ begin
 
   { ---- Phase 6.bis.1c — constructor lifecycle ---- }
   TestVtabCtor_Run(db);
+
+  { ---- Phase 6.bis.1d — per-statement transaction hooks ---- }
+  TestVtabHooks_Run(db);
 
   rc := sqlite3_close_v2(db);
   ExpectEq(rc, SQLITE_OK, 'T16 close_v2');
