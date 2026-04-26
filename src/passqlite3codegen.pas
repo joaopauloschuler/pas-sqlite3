@@ -5402,15 +5402,182 @@ begin
   Result := pLeft; { Phase 6.5 }
 end;
 
-{ sqlite3Insert — generate INSERT VDBE (Phase 6.4 stub) }
+{ autoIncBegin — port of insert.c:159 (Phase 6.x stub).
+  C reference returns regAutoinc (memcell holding the AUTOINCREMENT counter)
+  for AUTOINCREMENT tables, 0 otherwise.  Until autoincrement codegen lands,
+  this returns 0 unconditionally — schema-row INSERTs produced by
+  sqlite3NestedParse never target AUTOINCREMENT tables. }
+function autoIncBegin(pParse: PParse; iDb: i32; pTab: PTable2): i32; forward;
+
+{ sqlite3Insert — port of insert.c:894 (structural skeleton).
+
+  This step (Phase 6.9-bis step 11c) lays down the C-shaped prologue of
+  sqlite3Insert: every early-out check, the SrcListLookup -> AuthCheck ->
+  IsReadOnly -> GetVdbe -> CountChanges -> BeginWriteOperation chain, plus
+  register allocation for the rowid + per-column data block.  The actual
+  VALUES emission loop and OP_NewRowid / OP_MakeRecord / OP_Insert tail
+  remain TODOs because they require sqlite3ExprCode (still unported — see
+  codegen:7618).  A literal-only stub of sqlite3ExprCode is the next sub-step
+  (11d) and will be the actual DIVERGE-flipper in TestExplainParity.
+
+  Restricted to the simplest path per the step plan: single-row VALUES, no
+  IDLIST (pColumn=nil), no triggers, no view, no UPSERT, no XFER opt, no
+  vtab DML.  Branches outside that envelope route directly to insert_cleanup
+  with an explicit TODO marker. }
 procedure sqlite3Insert(pParse: PParse; pTabList: PSrcList; pSelect: PSelect;
   pColumn: PIdList; onError: i32; pUpsert: PUpsert);
+label
+  insert_cleanup;
+var
+  db:             PTsqlite3;
+  pTab:           PTable2;
+  v:              PVdbe;
+  iDb:            i32;
+  withoutRowid:   u8;
+  isView:         i32;
+  pTrg:           PTrigger;
+  tmask:          u32;
+  pList:          PExprList;
+  regAutoinc:     i32;
+  regRowid:       i32;
+  regIns:         i32;
+  regData:        i32;
+  regRowCount:    i32;
+  aRegIdx:        Pi32;
+  aTabColMap:     Pi32;
+  bIdListInOrder: u8;
+  nColumn:        i32;
 begin
-  { Phase 6.5 }
-  sqlite3SrcListDelete(pParse^.db, pTabList);
-  sqlite3SelectDelete(pParse^.db, pSelect);
-  sqlite3IdListDelete(pParse^.db, pColumn);
-  sqlite3UpsertDelete(pParse^.db, pUpsert);
+  pList         := nil;
+  pTrg          := nil;
+  tmask         := 0;
+  isView        := 0;
+  regAutoinc    := 0;
+  regRowid      := 0;
+  regIns        := 0;
+  regData       := 0;
+  regRowCount   := 0;
+  aRegIdx       := nil;
+  aTabColMap    := nil;
+  nColumn       := 0;
+  withoutRowid  := 0;
+  pTab          := nil;
+  v             := nil;
+  bIdListInOrder := 0;
+
+  db := pParse^.db;
+  if pParse^.nErr <> 0 then goto insert_cleanup;
+  { Test-scaffold gate (TestParser, TestParserSmoke) drive the parser against
+    a hand-rolled stub db (eOpenState <> $76) without a real schema, so
+    sqlite3SrcListLookup -> sqlite3LocateTableItem would set nErr.  Match the
+    DropIndex / DropTable / CreateIndex idiom and free-and-exit early. }
+  if db^.eOpenState <> $76 then goto insert_cleanup;
+
+  { If pSelect is just a single-row VALUES list, capture pEList as pList and
+    discard the wrapping Select. }
+  if (pSelect <> nil)
+     and ((pSelect^.selFlags and SF_Values) <> 0)
+     and (pSelect^.pPrior = nil) then
+  begin
+    pList := pSelect^.pEList;
+    pSelect^.pEList := nil;
+    sqlite3SelectDelete(db, pSelect);
+    pSelect := nil;
+  end;
+
+  { Locate the target table. }
+  pTab := sqlite3SrcListLookup(pParse, pTabList);
+  if pTab = nil then goto insert_cleanup;
+  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  if sqlite3AuthCheck(pParse, SQLITE_INSERT_AUTH, pTab^.zName, nil,
+                      db^.aDb[iDb].zDbSName) <> 0 then
+    goto insert_cleanup;
+  if (pTab^.tabFlags and TF_WithoutRowid) = 0 then
+    withoutRowid := 0
+  else
+    withoutRowid := 1;
+
+  { Trigger detection — sqlite3TriggersExist is currently a stub returning
+    nil with tmask=0, but the call shape matches insert.c:979 verbatim so
+    that wiring real trigger lookup is a one-line change. }
+  pTrg := sqlite3TriggersExist(pParse, pTab, TK_INSERT, nil, @tmask);
+  if pTab^.eTabType = TABTYP_VIEW then isView := 1 else isView := 0;
+
+  if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then goto insert_cleanup;
+
+  if sqlite3IsReadOnly(pParse, pTab, pTrg) <> 0 then goto insert_cleanup;
+
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then goto insert_cleanup;
+  if pParse^.nested = 0 then sqlite3VdbeCountChanges(v);
+  sqlite3BeginWriteOperation(pParse,
+    i32(ord((pSelect <> nil) or (pTrg <> nil))), iDb);
+
+  { TODO(Phase 6.x): xferOptimization — INSERT INTO t1 SELECT * FROM t2.
+    Omitted until sqlite3Select / xferOptimization are real. }
+
+  regAutoinc := autoIncBegin(pParse, iDb, pTab); { stub returns 0 today }
+
+  { Allocate registers: rowid + nCol data slots. }
+  regRowid := pParse^.nMem + 1;
+  regIns   := regRowid;
+  pParse^.nMem := pParse^.nMem + i32(pTab^.nCol) + 1;
+  { TODO(Phase 6.x): IsVirtual(pTab) bumps regRowid + nMem by one extra slot
+    for the vtab argv[0]/argv[1] convention.  Vtab DML deferred (same choice
+    as step 11a's IsVirtual deferral). }
+  regData := regRowid + 1;
+
+  bIdListInOrder := u8(ord(
+    (pTab^.tabFlags and (TF_OOOHidden or TF_HasStored)) = 0));
+
+  { TODO(Phase 6.x): pColumn IDLIST resolution loop (insert.c:1077..1108).
+    The single-row schema-row INSERT cases produced by sqlite3NestedParse
+    pass IDLIST=nil, so this branch is unreachable in the productive path
+    today.  Bail out with a TODO if called with an IDLIST. }
+  if pColumn <> nil then goto insert_cleanup;
+
+  { TODO(Phase 6.x): pSelect coroutine path (insert.c:1115..) — multi-row
+    VALUES and SELECT-as-source.  Single-row VALUES path is captured into
+    pList above and handled below. }
+  if pSelect <> nil then goto insert_cleanup;
+
+  { TODO(Phase 6.x): VALUES emission loop + OP_NewRowid / OP_MakeRecord /
+    OP_Insert against the table cursor.  Requires:
+      - sqlite3ExprCode(pParse, pList^.a[i].pExpr, regData+i) for each col
+        (a literal-only stub is sub-step 11d);
+      - sqlite3OpenTable(pParse, 0, iDb, pTab, OP_OpenWrite) for the cursor;
+      - OP_NewRowid -> regRowid;
+      - OP_MakeRecord(regData, pTab^.nCol, regOut) + sqlite3SetMakeRecordP5;
+      - OP_Insert with regRowid + regOut + table cursor.
+    Until then, single-row VALUES INSERTs from sqlite3NestedParse parse
+    cleanly and emit no productive ops, leaving TestExplainParity at the
+    same diverge baseline as step 11b. }
+  Assert(pList <> nil, 'pList nil at sqlite3Insert single-row path');
+  nColumn := pList^.nExpr;
+
+  if (pParse^.nested = 0) and (regRowCount <> 0) then
+    sqlite3CodeChangeCount(v, regRowCount, 'rows inserted');
+
+insert_cleanup:
+  sqlite3SrcListDelete(db, pTabList);
+  sqlite3ExprListDelete(db, pList);
+  sqlite3UpsertDelete(db, pUpsert);
+  sqlite3SelectDelete(db, pSelect);
+  if pColumn <> nil then begin
+    sqlite3IdListDelete(db, pColumn);
+    sqlite3DbFree(db, aTabColMap);
+  end;
+  if aRegIdx <> nil then sqlite3DbNNFreeNN(db, aRegIdx);
+end;
+
+{ autoIncBegin — port of insert.c:159 (Phase 6.x stub).
+  C reference returns regAutoinc (memcell holding the AUTOINCREMENT counter)
+  for AUTOINCREMENT tables, 0 otherwise.  Until autoincrement codegen lands,
+  this returns 0 unconditionally — schema-row INSERTs produced by
+  sqlite3NestedParse never target AUTOINCREMENT tables. }
+function autoIncBegin(pParse: PParse; iDb: i32; pTab: PTable2): i32;
+begin
+  Result := 0;
 end;
 
 { sqlite3ExprReferencesUpdatedColumn — check if expr refs any changed col (Phase 6.4 stub) }

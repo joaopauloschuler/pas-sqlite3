@@ -1263,6 +1263,7 @@ procedure sqlite3VdbeRunOnlyOnce(p: PVdbe);
 procedure sqlite3VdbeReusable(p: PVdbe);
 function  sqlite3VdbeAssertMayAbort(v: PVdbe; mayAbort: i32): i32;
 procedure sqlite3VdbeIncrWriteCounter(p: PVdbe; pC: PVdbeCursor);
+procedure sqlite3VdbeCountChanges(v: PVdbe);
 procedure sqlite3VdbeAssertAbortable(p: PVdbe);
 procedure sqlite3VdbeNoJumpsOutsideSubrtn(v: PVdbe; iFirst, iLast: i32;
                                           regReturn: i32);
@@ -2531,6 +2532,14 @@ end;
 procedure sqlite3VdbeIncrWriteCounter(p: PVdbe; pC: PVdbeCursor);
 begin
   { vdbeaux.c:829 is SQLITE_DEBUG-only; nWrite not present in release struct }
+end;
+
+{ sqlite3VdbeCountChanges — port of vdbeaux.c:5315.
+  Set the changeCntOn flag so that the VDBE updates the change counter. }
+procedure sqlite3VdbeCountChanges(v: PVdbe);
+begin
+  if v <> nil then
+    v^.vdbeFlags := v^.vdbeFlags or VDBF_ChangeCntOn;
 end;
 
 procedure sqlite3VdbeAssertAbortable(p: PVdbe);

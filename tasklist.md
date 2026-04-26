@@ -20,6 +20,100 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 11c): structural skeleton of
+    `sqlite3Insert` (insert.c:894).**  Replaces the 5-line free-only
+    Phase 6.4 stub at `passqlite3codegen.pas:5405` with a faithful
+    structural port of the C function's prologue: every early-out
+    check, the `SrcListLookup` -> `AuthCheck` -> `IsReadOnly` ->
+    `GetVdbe` -> `CountChanges` -> `BeginWriteOperation` chain, plus
+    register allocation for the rowid + per-column data block.  Ports
+    `sqlite3VdbeCountChanges` (vdbeaux.c:5315) as a one-line helper
+    that sets `VDBF_ChangeCntOn`.  Also lands a Phase-6.x stub of
+    `autoIncBegin` returning 0 (insert.c:159).
+    [X]
+
+    Concrete changes:
+      * `src/passqlite3vdbe.pas`:
+        - New interface decl + impl of `sqlite3VdbeCountChanges(v: PVdbe)`
+          that ORs `VDBF_ChangeCntOn` into `v^.vdbeFlags` (one-liner port
+          of vdbeaux.c:5315).
+      * `src/passqlite3codegen.pas`:
+        - `sqlite3Insert` body replaced with the structural skeleton.
+          Local-var name follows memory-feedback rule: `pTrigger` is a
+          shadowed identifier in FPC (TParse has a `pTrigger` field), so
+          renamed to `pTrg`.
+        - Test-scaffold gate `if db^.eOpenState <> $76 then goto
+          insert_cleanup` matches the existing DropIndex / DropTable /
+          CreateIndex idiom — TestParser / TestParserSmoke drive the
+          parser against a stub db without a real schema, where
+          `sqlite3SrcListLookup` would set nErr.
+        - Branches deliberately routed to insert_cleanup with explicit
+          TODO markers: pColumn IDLIST loop (insert.c:1077..1108),
+          pSelect coroutine path (insert.c:1115..), VALUES emission +
+          OP_NewRowid / OP_MakeRecord / OP_Insert tail, xferOptimization
+          arm, IsVirtual register bump.  These are sub-step 11d+.
+        - Forward declaration of file-scope helper `autoIncBegin`
+          (Phase-6.x stub returning 0); productive AUTOINCREMENT codegen
+          is independently tracked.
+
+    Tests: full build clean.  TestExplainParity unchanged at
+    **2 PASS / 8 DIVERGE / 0 ERROR** (expected — the productive VALUES
+    emission is still a TODO; this step lands the C-shaped prologue
+    only, same incremental pattern as steps 11a/11b).  Regression spot
+    check (2026-04-26): TestPrepareBasic 20/20, TestParser 45/45,
+    TestParserSmoke 20/20, TestSchemaBasic 44/44, TestVdbeApi 57/57,
+    TestDMLBasic 54/54, TestSelectBasic 49/49, TestExprBasic 40/40,
+    TestVdbeTxn 8/8, TestAuthBuiltins 34/34, TestOpenClose 17/17,
+    TestSmoke + TestUtil clean, TestJson 434/434, TestJsonEach 50/50,
+    TestJsonRegister 48/48, TestPrintf 105/105, TestVtab 216/216.
+
+    Discoveries / next-step notes:
+      * **`pTrigger` is a shadowed identifier in FPC.**  TParse has a
+        `pTrigger` field (codegen.pas), so a local `pTrigger: PTrigger`
+        triggers an "Error in type definition".  Same trap as the
+        `pPager: PPager` issue in pager.pas.  Use `pTrg` for the local;
+        memory note already records this rule.
+      * **`autoIncBegin` left as a stub returning 0.**  AUTOINCREMENT
+        codegen has its own dependency chain (sqlite_sequence row
+        lookup, OP_MaxPgcnt, regSeqRowid) and is independent of the
+        DML-skeleton work.  Schema-row INSERTs from `sqlite3NestedParse`
+        never target AUTOINCREMENT tables, so 0 is structurally
+        correct for the productive path.
+      * **The early `eOpenState <> $76` gate is structurally redundant
+        for real db.**  C reference has no such check; a real
+        sqlite3_open_v2 always reaches the productive body.  The gate
+        only skips on the lightweight stub db used by TestParser /
+        TestParserSmoke (eOpenState = 1).  Same idiom as the existing
+        `sqlite3DropIndex` (codegen:6878), `sqlite3DropTable`
+        (codegen:6766), and `sqlite3CreateIndex` (codegen:7042) gates.
+      * **VDBE registers reserved before the cursor is opened.**
+        Matches insert.c:1049..1055 ordering: `regRowid = nMem+1`,
+        bump `nMem` by `pTab^.nCol + 1`, `regData = regRowid+1`.
+        Vtab arm (extra +1 for argv[0]) is a TODO.
+      * **`pTrg` always nil / `tmask` always 0 today** because
+        `sqlite3TriggersExist` is still the Phase 6.4 stub
+        (codegen:5117).  The structural port still calls it via the
+        full C-shaped argument list so wiring real trigger lookup is a
+        one-line change in 11d+.
+      * **Next 6.9-bis target: step 11d — minimal `sqlite3ExprCode`
+        scoped to the literal cases used by `sqlite3NestedParse`.**
+        The schema-row INSERTs produced by `sqlite3CreateIndex`
+        (codegen:7035 path) hand sqlite3MPrintf 5 values: a TK_STRING
+        ('index'), two `%Q`-quoted TK_STRING literals (idxName,
+        tabName), a `#%d` register reference (regRoot), and a `%Q`
+        zStmt.  The minimal sqlite3ExprCode needs only:
+        * TK_STRING -> OP_String8 (regOut, P4=z),
+        * TK_INTEGER -> OP_Integer,
+        * TK_NULL -> OP_Null,
+        * TK_REGISTER -> OP_SCopy from the named register.
+        With those four arms, the VALUES emission loop in the
+        sqlite3Insert TODO block becomes a four-line unrolled call,
+        and the CREATE INDEX / DROP INDEX rows in TestExplainParity
+        flip from DIVERGE to a partial-match (still missing the
+        OpenWrite + ParseSchema tail, but that is in
+        sqlite3CreateIndex itself, which already has the structural
+        scaffolding from step 8).
+
   - **2026-04-26 — Phase 6.9-bis (step 11b): port the three delete.c
     DML-foundation helpers — `sqlite3SrcListLookup`,
     `sqlite3CodeChangeCount`, `sqlite3IsReadOnly` (delete.c:31, 51,
