@@ -1619,6 +1619,7 @@ function  sqlite3WalkerDepthIncrease(pWalker: PWalker; pSel: PSelect): i32; cdec
 procedure sqlite3WalkerDepthDecrease(pWalker: PWalker; pSel: PSelect); cdecl;
 function  sqlite3ExprWalkNoop(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
 function  sqlite3SelectWalkNoop(pWalker: PWalker; pSel: PSelect): i32; cdecl;
+function  sqlite3SelectWalkFail(pWalker: PWalker; pSel: PSelect): i32; cdecl;
 procedure sqlite3SelectPopWith(pWalker: PWalker; pSel: PSelect); cdecl;
 
 // ---------------------------------------------------------------------------
@@ -4012,6 +4013,15 @@ begin
   Result := WRC_Continue;
 end;
 
+{ sqlite3SelectWalkFail — abort walk and clear pWalker^.eCode (expr.c:2308).
+  Used by every walker that wants to refuse to descend into sub-selects;
+  exprIsDeterministic() below is one such caller. }
+function sqlite3SelectWalkFail(pWalker: PWalker; pSel: PSelect): i32; cdecl;
+begin
+  pWalker^.eCode := 0;
+  Result := WRC_Abort;
+end;
+
 procedure sqlite3SelectPopWith(pWalker: PWalker; pSel: PSelect); cdecl;
 begin
   { Phase 6.3 stub }
@@ -4425,6 +4435,35 @@ begin
     pWInfo^.pMemToFree := pNext;
   end;
   sqlite3DbNNFreeNN(db, pWInfo);
+end;
+
+{ Helper for exprIsDeterministic (where.c:6445).  TK_FUNCTION nodes without
+  EP_ConstFunc are non-deterministic: clear pWalker^.eCode and abort. }
+function exprNodeIsDeterministic(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+begin
+  if (pExpr^.op = TK_FUNCTION) and ((pExpr^.flags and EP_ConstFunc) = 0) then
+  begin
+    pWalker^.eCode := 0;
+    Result := WRC_Abort;
+    Exit;
+  end;
+  Result := WRC_Continue;
+end;
+
+{ exprIsDeterministic — true iff p contains no non-deterministic SQL
+  functions outside sub-selects (where.c:6458).  Sub-selects are refused
+  by sqlite3SelectWalkFail, so anything inside them is conservatively
+  ignored — matches SQLite's legacy behaviour for `WHERE (SELECT random())>0`. }
+function exprIsDeterministic(p: PExpr): i32;
+var
+  w: TWalker;
+begin
+  FillChar(w, SizeOf(w), 0);
+  w.eCode           := 1;
+  w.xExprCallback   := @exprNodeIsDeterministic;
+  w.xSelectCallback := @sqlite3SelectWalkFail;
+  sqlite3WalkExpr(@w, p);
+  Result := w.eCode;
 end;
 
 { Phase 6.9-bis step 11g.2.b — productive sqlite3WhereBegin prologue.

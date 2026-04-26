@@ -8313,6 +8313,37 @@ Phase 5.9 depends on this being done first.
       No body change in `sqlite3WhereBegin`; full regression sweep stays
       green.  Unblocks the productive prologue port (next sub-progress).
 
+      **Sub-progress (landed 2026-04-26 — exprIsDeterministic + walker
+      fail callback).**  Ported the three foundational helpers the
+      False-WHERE-Term-Bypass loop (where.c:6995..7036) calls before any
+      planner work begins:
+
+        * `sqlite3SelectWalkFail` (expr.c:2308) — public Walker callback
+          that clears `pWalker^.eCode` and returns `WRC_Abort`.  Used by
+          every walker that wants to refuse to descend into sub-selects.
+          Forward-declared in the public block alongside
+          `sqlite3SelectWalkNoop`; lives next to it in the body.
+        * `exprNodeIsDeterministic` (where.c:6445) — file-private helper
+          that aborts the walk + clears `eCode` when it sees a
+          `TK_FUNCTION` node without `EP_ConstFunc`.
+        * `exprIsDeterministic` (where.c:6458) — file-private predicate
+          that runs a Walker over the expression with the two callbacks
+          above; returns 1 iff no non-deterministic SQL functions are
+          encountered outside sub-selects.
+
+      None of these helpers are called by productive code yet (the
+      False-WHERE-Term-Bypass loop is still unported), so no observable
+      behaviour change in the corpus — full regression sweep stays green
+      (TestWhereBasic 52/52, TestWhereStructs 148/148, TestPrepareBasic
+      20/20, TestParser 45/45, TestSchemaBasic 44/44, TestVdbeApi 57/57,
+      TestDMLBasic 54/54, TestSelectBasic 49/49, TestExprBasic 40/40,
+      TestInitCallback 29/29, TestExplainParity unchanged at 2 PASS / 8
+      DIVERGE / 0 ERROR).  Unblocks the False-WHERE-Term-Bypass loop
+      port: the only remaining missing helper is `sqlite3ExprIfFalse`
+      (Phase-6 codegen helper from expr.c — emits a JUMPIFNULL-style
+      branch when an expression evaluates falsy), which is the next
+      logical sub-progress chunk.
+
       **Remaining sub-task:** the actual productive WhereBegin
       single-table, single-rowid-EQ-predicate case + WhereEnd's
       loop-termination opcode emission (full description below).
