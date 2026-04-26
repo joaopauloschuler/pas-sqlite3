@@ -21,6 +21,52 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    sqlite3ExprCanBeNull leaf helper.**  First of the four missing leaf
+    helpers identified by the previous sub-progress as gating the
+    eventual `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` port (the others
+    being `codeCompare`, `exprComputeOperands`, `exprCodeBetween`).
+    Faithful translation of expr.c:2965..2994 — skips through TK_UPLUS /
+    TK_UMINUS unary chains, dispatches on the underlying op (consulting
+    op2 for TK_REGISTER), and consults the column's notNull bitfield via
+    `TColumn.typeFlags` low nibble.  The SQLITE_ALLOW_ROWID_IN_VIEW arm
+    (XN_ROWID + IsView) is omitted: that build option is not enabled in
+    our port.  Declared in the public block at
+    `passqlite3codegen.pas:1720` because future codeEqualityTerm logic
+    will call it across translation-unit boundaries; defined immediately
+    after `sqlite3IsRowid` at :3780.
+
+    Why this is safe to land alone: no productive callers yet
+    (`sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` still unported) — pure
+    scaffolding sub-progress, no observable behaviour change in the
+    corpus.  Full regression sweep all green — TestWhereBasic 52/52,
+    TestWhereStructs 148/148, TestPrepareBasic 20/20, TestParser 45/45,
+    TestSchemaBasic 44/44, TestVdbeApi 57/57, TestDMLBasic 54/54,
+    TestSelectBasic 49/49, TestExprBasic 40/40, TestInitCallback 29/29,
+    TestExplainParity unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **TColumn.typeFlags bitfield ordering.**  Pascal models the C
+        bitfield `notNull:4 + eCType:4` as a single u8 with notNull in
+        the low nibble (bits 0..3) — verified against existing pTab^.aCol
+        usage and the GCC x86-64 layout already locked in TestExprBasic's
+        SizeOf gate.  Mask is `typeFlags and $0F`.
+      * **Next leaf helpers (still 11g.2.b):** `codeCompare` (expr.c:463),
+        `exprComputeOperands` (expr.c:2417), `exprCodeBetween`
+        (expr.c:6028).  `codeCompare` depends on
+        `sqlite3BinaryCompareCollSeq` and `binaryCompareP5` — check those
+        first; if missing, port them as a sub-sub-progress.
+        `exprComputeOperands` depends on `sqlite3ExprCodeTemp` (already
+        in the codebase) plus the new `sqlite3ExprCanBeNull` (now
+        present) and existing `exprEvalRhsFirst`.  `exprCodeBetween`
+        depends on `sqlite3ExprDup`, `exprCodeVector`,
+        `sqlite3ExprToRegister`, `sqlite3ReleaseTempReg`,
+        `sqlite3ExprCodeTarget`, `sqlite3ExprDelete` — audit each before
+        landing.
+      * After the four leaves: port the recursive `sqlite3ExprIfTrue` /
+        `sqlite3ExprIfFalse` pair (~400 lines), then the False-WHERE-
+        Term-Bypass loop body in WhereBegin.
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     sqlite3ExprSimplifiedAndOr + exprEvalRhsFirst + ExprAlwaysTrue/False
     macros.**  Foundation helpers required by the eventual port of
     `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` (expr.c:6100..) — those

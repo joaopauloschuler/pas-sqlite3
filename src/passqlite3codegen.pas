@@ -1717,6 +1717,7 @@ function  sqlite3ExprIdToTrueFalse(pExpr: PExpr): i32;
 function  sqlite3ExprTruthValue(const pExpr: PExpr): i32;
 function  sqlite3ExprSimplifiedAndOr(pExpr: PExpr): PExpr;
 function  sqlite3IsRowid(z: PAnsiChar): i32;
+function  sqlite3ExprCanBeNull(const p: PExpr): i32;
 function  sqlite3ExprIsInteger(const p: PExpr; pValue: Pi32;
   pParse: PParse): i32;
 function  sqlite3ExprIsConstant(pParse: PParse; p: PExpr): i32;
@@ -3775,6 +3776,57 @@ begin
   if sqlite3StrICmp(z, 'ROWID')   = 0 then Exit(1);
   if sqlite3StrICmp(z, 'OID')     = 0 then Exit(1);
   Result := 0;
+end;
+
+{ sqlite3ExprCanBeNull (expr.c:2965..2994) — return FALSE if there is no
+  chance the expression can evaluate to NULL.  Used as an optimisation, so
+  a false positive (returning TRUE when in fact the expression can never
+  be NULL) only costs a redundant OP_IsNull; a false negative would be a
+  correctness bug.  When in doubt, return TRUE.
+
+  Skips through TK_UPLUS / TK_UMINUS unary chains, then dispatches on the
+  underlying operator (consulting op2 for TK_REGISTER).  Constant-token
+  arms (INTEGER/STRING/FLOAT/BLOB) are NULL-free; TK_COLUMN consults
+  EP_CanBeNull, the y.pTab back-pointer, and the column's notNull bit
+  (TColumn.typeFlags low nibble — see codegen.pas:951).  The
+  SQLITE_ALLOW_ROWID_IN_VIEW arm (XN_ROWID + IsView) is omitted: that
+  build option is not enabled in our port.  All other operators conserva-
+  tively return 1.  File-private in C; declared in the public block here
+  because sqlite3ExprIfTrue/ExprIfFalse (still unported) call it, and so
+  does this codebase's future codeEqualityTerm logic. }
+function sqlite3ExprCanBeNull(const p: PExpr): i32;
+var
+  op:  u8;
+  pp:  PExpr;
+  pTb: PTable2;
+begin
+  pp := p;
+  Assert(pp <> nil);
+  while (pp^.op = TK_UPLUS) or (pp^.op = TK_UMINUS) do
+  begin
+    pp := pp^.pLeft;
+    Assert(pp <> nil);
+  end;
+  op := pp^.op;
+  if op = TK_REGISTER then op := pp^.op2;
+  case op of
+    TK_INTEGER, TK_STRING, TK_FLOAT, TK_BLOB:
+      Result := 0;
+    TK_COLUMN:
+      begin
+        if ExprHasProperty(pp, EP_CanBeNull) then Exit(1);
+        pTb := pp^.y.pTab;
+        if pTb = nil then Exit(1);   { NEVER — index-on-expr column ref }
+        if (pp^.iColumn >= 0)
+           and (pTb^.aCol <> nil)
+           and (pp^.iColumn < pTb^.nCol)
+           and ((pTb^.aCol[pp^.iColumn].typeFlags and $0F) = 0) then
+          Exit(1);
+        Result := 0;
+      end;
+  else
+    Result := 1;
+  end;
 end;
 
 function sqlite3ExprIsInteger(const p: PExpr; pValue: Pi32;
