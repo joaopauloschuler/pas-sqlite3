@@ -20,6 +20,58 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.4b.2b `%S` SrcItem conversion.**  Closes
+    out the last open 6.bis.4b sub-task by porting the
+    `etSRCITEM` arm from printf.c:975..1008.  Four-way cascade:
+    `zAlias` (default priority); `zName` with optional `db.` prefix
+    when neither `fg.fixedSchema` nor `fg.isSubquery` is set; `zAlias`
+    fallback when `zName=nil`; or a synthetic subquery descriptor
+    (`(join-N)` / `(subquery-N)` / `N-ROW VALUES CLAUSE`) reading
+    `pSubq^.pSelect^.{selFlags,selId}` and `u1.nRow`.  The `!` flag
+    (altform2) flips priority to force `zName` over `zAlias`.
+
+    Local mirror types — `TSrcItemBlit` (72 bytes), `TSubqueryBlit`,
+    `TSelectBlit` — keep `passqlite3printf` decoupled from
+    `passqlite3codegen`, same pattern the existing `TTokenBlit`
+    established for `%T`.  Field offsets verified against
+    `passqlite3codegen.TSrcItem`.  Bit positions for the fg flags
+    derived from sqliteInt.h:3360..3378 (LSB-first within each byte):
+    `fgBits` bit 2 = isSubquery, `fgBits3` bit 0 = fixedSchema.
+
+    Original task notes flagged this as blocked by Phase 7's TSrcItem
+    layout, but codegen already stabilised the layout in 7.2/7.3 — the
+    "block" was sequencing, not a real dependency, so the work
+    transliterated cleanly with no Phase-7 follow-up.
+
+    Concrete changes:
+      * `src/passqlite3printf.pas` — adds the SrcItem mirror types,
+        `emitSrcItem`, and the `'S':` arm in the conversion switch
+        (~70 lines added, right after the `%T` block).  Header
+        doc-comment updated to list `%S` and drop the deferral note.
+      * `src/tests/TestPrintf.pas` — adds `TestSrcItem` with T89..T100
+        (13 new asserts).  **105/105 PASS** (was 92/92).
+      * Full regression spot check: TestVtab 216/216, TestCarray
+        66/66, TestDbpage 68/68, TestDbstat 83/83, TestVdbeVtabExec
+        50/50, TestParser 45/45, TestParserSmoke 20/20 — all green.
+
+    Discoveries / next-step notes:
+      * `SF_MultiValue` / `SF_NestedFrom` are re-declared locally in
+        the printf unit (`SF_MultiValueLocal` / `SF_NestedFromLocal`)
+        to avoid pulling `passqlite3codegen` into the uses clause.
+        If upstream renumbers these, both copies drift and tests
+        catch it; the constants have been stable since SQLite 3.20.
+      * The C reference gates the entire `etSRCITEM` body on
+        `printfFlags & SQLITE_PRINTF_INTERNAL` (silently returns
+        otherwise to keep external callers from probing internal
+        struct shapes).  The Pascal port mirrors the existing `%T`
+        precedent — no gate, since all current callers are internal.
+        Add the gate when an external printf surface lands.
+      * **All `printf.c` conversions are now ported.**  6.bis.4b is
+        fully closed.  Remaining open task list items: 5.10 / 6.9 /
+        7.4b / 8.10 (each blocked on later phases — SQL corpus,
+        bytecode-diff harness, or shell.c CLI), plus the optional
+        6.8 (json.c) and Phase 9+ acceptance gates.
+
   - **2026-04-26 — Phase 6.bis.4b.2c float conversions.**  Lands the
     bulk of the remaining 6.bis.4b work — `%f` / `%e` / `%E` / `%g` /
     `%G` are now wired into the printf engine.  Faithful port of
@@ -3958,12 +4010,58 @@ Phase 5.9 depends on this being done first.
     TestVtab 216/216, TestCarray 66/66, TestDbpage 68/68, TestDbstat
     83/83 — no regressions.
 
-  - [ ] **6.bis.4b.2b** `%S` SrcItem conversion.  Blocked by Phase 7
-    codegen's `TSrcItem` layout — the conversion needs `pSrcItem^.zName`
-    / `pSrcItem^.zAlias` / `pSrcItem^.zDatabase` and the `!` flag
-    selecting `zName` over `zAlias` (printf.c additional notes
-    block at line 120..124).  Trivial 10-line addition once the
-    layout is stable; no float dependency.
+  - [X] **6.bis.4b.2b** `%S` SrcItem conversion.  DONE 2026-04-26.
+    Faithful port of `etSRCITEM` (printf.c:975..1008).  Four-way cascade:
+    (1) `zAlias` takes priority unless `!` (altform2) is set;
+    (2) `zName` with optional `db.` prefix when `fg.fixedSchema=0` and
+        `fg.isSubquery=0` and `u4.zDatabase<>nil`;
+    (3) `zAlias` fallback when `zName=nil`;
+    (4) subquery descriptor — `(join-N)` / `(subquery-N)` /
+        `N-ROW VALUES CLAUSE` — when `fg.isSubquery=1` and both name
+        slots are nil (reads `pSubq^.pSelect^.{selFlags,selId}` plus
+        `u1.nRow` for the multi-value case).
+    Local mirror types (`TSrcItemBlit` / `TSubqueryBlit` / `TSelectBlit`)
+    keep `passqlite3printf` decoupled from `passqlite3codegen` — same
+    pattern as `TTokenBlit` from `%T`.  Bit positions read from the
+    `fgBits` / `fgBits3` byte fields:
+      * `fgBits  bit 2 = isSubquery`
+      * `fgBits3 bit 0 = fixedSchema`
+    (matches sqliteInt.h:3360..3378 LSB-first declaration order; verified
+    against `passqlite3codegen.TSrcItemFg` byte-layout comment.)
+    `passqlite3printf.pas` adds ~70 lines (mirror types + `emitSrcItem` +
+    case arm).  `src/tests/TestPrintf.pas` extended with T89..T100
+    (13 new asserts: alias priority, `!` flip, db prefix, fixedSchema
+    suppression, isSubquery suppression, nil item, width pad both
+    directions, three subquery-descriptor variants, empty-on-all-nil) —
+    **105/105 PASS** (was 92/92).  Regression sweep: TestVtab 216/216,
+    TestCarray 66/66, TestDbpage 68/68, TestDbstat 83/83,
+    TestVdbeVtabExec 50/50, TestParser 45/45, TestParserSmoke 20/20 —
+    all green.
+
+    Discoveries / next-step notes:
+      * Original task notes claimed this was blocked by Phase 7's
+        `TSrcItem` layout, but Phase 7.2/7.3 already stabilised
+        `passqlite3codegen.TSrcItem` (at codegen.pas:607, sizeof=72) —
+        the block was actually only a sequencing concern, not a
+        dependency one.  Implementation could have landed any time
+        after 6.bis.4b.2c.
+      * `TSrcItem` u4 union has three variants (`zDatabase` /
+        `pSchema` / `pSubq`).  The C reference uses two distinct
+        bits — `fixedSchema` and `isSubquery` — to select among them.
+        With both clear, `u4` is read as `zDatabase` (PAnsiChar).
+        Both bits cleared with a non-nil u4 ptr is the *only* shape
+        that emits the database prefix.
+      * The subquery descriptor case needs `selFlags & SF_NestedFrom`
+        (= `$0800`) and `SF_MultiValue` (= `$0400`) — these are
+        already declared in `passqlite3codegen` but the printf unit
+        re-declares them locally as `SF_*Local` to avoid the codegen
+        import.  If the upstream constants ever drift, sync both.
+      * The C version gates the entire `etSRCITEM` body on
+        `printfFlags & SQLITE_PRINTF_INTERNAL` (returns silently
+        otherwise — prevents external callers from probing internal
+        types).  Pascal port follows the `%T` precedent and skips the
+        gate; all callers are internal anyway.  Future: if/when an
+        external printf surface is added, replicate the gate.
 
   - [X] **6.bis.4b.2c** Float conversions (`%f %e %E %g %G`).  DONE
     2026-04-26.  Faithful port of `sqlite3FpDecode` (util.c:1380) +

@@ -31,6 +31,9 @@ unit passqlite3printf;
     %Q   SQL string escape, wrapped in single quotes; nil → "NULL"
     %w   SQL identifier escape (double quotes doubled)
     %T   pointer to TToken — emits .n bytes from .z
+    %S   pointer to TSrcItem — emits zAlias / zName / subquery-descriptor
+         (etSRCITEM, printf.c:975..1008).  The `!` flag (altform2)
+         suppresses the zAlias-takes-priority rule.
     %r   English ordinal suffix on signed integer (etORDINAL,
          printf.c:481..488).
     %f   fixed-point float        (etFLOAT,   printf.c:528..738)
@@ -43,9 +46,8 @@ unit passqlite3printf;
   `!` (alt-form-2: 20-digit precision instead of 16) flags supported for
   integer, string and float conversions.
 
-  The %S (SrcItem) extra remains deferred to Phase 7 — needs TSrcItem
-  layout that codegen does not yet expose.  Signature stays stable when
-  it lands.
+  All conversions referenced by the C reference's printf.c are now
+  ported; %S landed in 6.bis.4b.2b once Phase 7 stabilised TSrcItem.
 
   Allocation contract:
 
@@ -327,6 +329,104 @@ begin
   t := PTokenBlit(p);
   if (t^.z = nil) or (t^.n = 0) then begin Result := ''; Exit; end;
   SetString(Result, t^.z, t^.n);
+end;
+
+{ %S body: pointer to TSrcItem (passqlite3codegen).  Layout mirrored
+  locally — same rationale as TTokenBlit (no cyclic dep on codegen).
+  Field offsets verified against passqlite3codegen.TSrcItem (sizeof=72).
+
+  fg bit assignment (LSB-first within each byte, matches sqliteInt.h
+  bit-field declaration order):
+    fgBits  bit 2 = isSubquery
+    fgBits3 bit 0 = fixedSchema
+  See passqlite3codegen.TSrcItemFg for the full enumeration.
+
+  u4 is a union — we read it as a raw pointer; the C-side selector is
+  fg.fixedSchema / fg.isSubquery (see comment block at sqliteInt.h:3346).
+
+  TSubquery / TSelect blits read just the fields the conversion needs:
+  pSelect, then selFlags / selId / u1.nRow.  Layout from
+  passqlite3codegen.TSelect (selFlags at offset 4, selId at offset 16). }
+type
+  TSrcItemBlit = record
+    zName:   PAnsiChar;        { offset  0 }
+    zAlias:  PAnsiChar;        { offset  8 }
+    pSTab:   Pointer;          { offset 16 }
+    fg_jointype: u8;           { offset 24 }
+    fg_bits:     u8;           { offset 25 }
+    fg_bits2:    u8;           { offset 26 }
+    fg_bits3:    u8;           { offset 27 }
+    iCursor: i32;              { offset 28 }
+    colUsed: u64;              { offset 32 }
+    u1_nRow: u32;              { offset 40 — first 4 bytes of the u1 union }
+    u1_pad:  u32;              { offset 44 }
+    u2:      Pointer;          { offset 48 }
+    u3:      Pointer;          { offset 56 }
+    u4_ptr:  Pointer;          { offset 64 — zDatabase or pSubq }
+  end;
+  PSrcItemBlit = ^TSrcItemBlit;
+
+  TSubqueryBlit = record
+    pSelect: Pointer;          { offset 0 }
+  end;
+  PSubqueryBlit = ^TSubqueryBlit;
+
+  TSelectBlit = record
+    op:         u8;            { offset  0 }
+    _pad0:      u8;
+    nSelectRow: i16;
+    selFlags:   u32;           { offset  4 }
+    iLimit:     i32;
+    iOffset:    i32;
+    selId:      u32;           { offset 16 }
+  end;
+  PSelectBlit = ^TSelectBlit;
+
+const
+  SF_MultiValueLocal = u32($0000400);
+  SF_NestedFromLocal = u32($0000800);
+  FG_IS_SUBQUERY     = u8($04);  { fgBits  bit 2 }
+  FG_FIXED_SCHEMA    = u8($01);  { fgBits3 bit 0 }
+
+function emitSrcItem(p: Pointer; flagAlt2: Boolean): AnsiString;
+var
+  it: PSrcItemBlit;
+  zStr: AnsiString;
+  pSel: PSelectBlit;
+  pSubq: PSubqueryBlit;
+  isSubquery, fixedSchema: Boolean;
+begin
+  Result := '';
+  if p = nil then Exit;
+  it := PSrcItemBlit(p);
+
+  isSubquery  := (it^.fg_bits  and FG_IS_SUBQUERY) <> 0;
+  fixedSchema := (it^.fg_bits3 and FG_FIXED_SCHEMA) <> 0;
+
+  { printf.c:980..1005 — the four-way cascade. }
+  if (it^.zAlias <> nil) and (not flagAlt2) then begin
+    Result := AnsiString(it^.zAlias);
+  end else if it^.zName <> nil then begin
+    if (not fixedSchema) and (not isSubquery) and (it^.u4_ptr <> nil) then begin
+      Result := AnsiString(PAnsiChar(it^.u4_ptr)) + '.';
+    end;
+    Result := Result + AnsiString(it^.zName);
+  end else if it^.zAlias <> nil then begin
+    Result := AnsiString(it^.zAlias);
+  end else if isSubquery then begin
+    { tag-20240424-1: ALWAYS path in the C reference.  pSubq is non-nil
+      when isSubquery is set; pSel is non-nil per assert(). }
+    pSubq := PSubqueryBlit(it^.u4_ptr);
+    if (pSubq = nil) or (pSubq^.pSelect = nil) then Exit;
+    pSel := PSelectBlit(pSubq^.pSelect);
+    if (pSel^.selFlags and SF_NestedFromLocal) <> 0 then begin
+      Result := '(join-' + renderUint(pSel^.selId, 10, False) + ')';
+    end else if (pSel^.selFlags and SF_MultiValueLocal) <> 0 then begin
+      Result := renderUint(it^.u1_nRow, 10, False) + '-ROW VALUES CLAUSE';
+    end else begin
+      Result := '(subquery-' + renderUint(pSel^.selId, 10, False) + ')';
+    end;
+  end;
 end;
 
 { ============================================================
@@ -1005,6 +1105,18 @@ begin
         begin
           NextArgPtr(Pointer(uv));
           body := emitToken(Pointer(uv));
+          emitField(a, body, '', width, prec, leftAlign, False, True);
+          Inc(p);
+        end;
+      'S':
+        begin
+          { etSRCITEM — printf.c:975..1008.  Pointer to TSrcItem; emits
+            zAlias, zName (with optional database prefix), or a synthetic
+            subquery descriptor.  The `!` flag (altForm2) suppresses the
+            zAlias-takes-priority rule so callers can force the underlying
+            zName to be shown even when an alias is set. }
+          NextArgPtr(Pointer(uv));
+          body := emitSrcItem(Pointer(uv), altForm2);
           emitField(a, body, '', width, prec, leftAlign, False, True);
           Inc(p);
         end;

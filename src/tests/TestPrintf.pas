@@ -234,6 +234,133 @@ begin
   CheckEq('T88 %g 0.0',          sqlite3FormatStr('%g', [0.0]),        '0');
 end;
 
+type
+  { Mirror of passqlite3printf.TSrcItemBlit (which mirrors codegen.TSrcItem).
+    Same field layout — matches the 72-byte struct exactly so we can hand
+    the test's address to %S without dragging passqlite3codegen into the
+    test's uses clause. }
+  TSrcItemTest = record
+    zName:   PAnsiChar;
+    zAlias:  PAnsiChar;
+    pSTab:   Pointer;
+    fg_jointype: Byte;
+    fg_bits:     Byte;
+    fg_bits2:    Byte;
+    fg_bits3:    Byte;
+    iCursor: i32;
+    colUsed: u64;
+    u1_nRow: u32;
+    u1_pad:  u32;
+    u2:      Pointer;
+    u3:      Pointer;
+    u4_ptr:  Pointer;
+  end;
+
+  TSelectTest = record
+    op:         Byte;
+    _pad0:      Byte;
+    nSelectRow: i16;
+    selFlags:   u32;
+    iLimit:     i32;
+    iOffset:    i32;
+    selId:      u32;
+    _pad1:      u32;
+  end;
+
+  TSubqueryTest = record
+    pSelect:     Pointer;
+    addrFillSub: i32;
+    regReturn:   i32;
+    regResult:   i32;
+    _pad:        i32;
+  end;
+
+procedure TestSrcItem;
+const
+  SF_MultiValue = u32($0000400);
+  SF_NestedFrom = u32($0000800);
+var
+  it: TSrcItemTest;
+  sel: TSelectTest;
+  subq: TSubqueryTest;
+  zN, zA, zD: AnsiString;
+begin
+  zN := 'mytable'; zA := 'myalias'; zD := 'maindb';
+  FillChar(it, SizeOf(it), 0);
+
+  { T89 — zAlias takes priority over zName (no `!`). }
+  it.zName  := PAnsiChar(zN);
+  it.zAlias := PAnsiChar(zA);
+  CheckEq('T89 %S zAlias-priority', sqlite3FormatStr('[%S]', [@it]), '[myalias]');
+
+  { T90 — `!` (altform2) flips priority to zName. }
+  CheckEq('T90 %!S forces zName', sqlite3FormatStr('[%!S]', [@it]), '[mytable]');
+
+  { T91 — zName with database prefix (no fixedSchema, no isSubquery). }
+  it.zAlias := nil;
+  it.u4_ptr := PAnsiChar(zD);
+  CheckEq('T91 %S db.tbl', sqlite3FormatStr('[%S]', [@it]), '[maindb.mytable]');
+
+  { T92 — fixedSchema bit suppresses database prefix. }
+  it.fg_bits3 := $01;  { fixedSchema }
+  CheckEq('T92 %S fixedSchema no prefix', sqlite3FormatStr('[%S]', [@it]),
+          '[mytable]');
+
+  { T93 — isSubquery bit also suppresses database prefix.  u4_ptr in this
+    case is logically pSubq, but printf only consults it when *no*
+    suppression bits are set, so it doesn't matter what we point at. }
+  it.fg_bits3 := 0;
+  it.fg_bits  := $04;  { isSubquery }
+  CheckEq('T93 %S isSubquery no prefix', sqlite3FormatStr('[%S]', [@it]),
+          '[mytable]');
+
+  { T94 — zAlias + zName + altform2 + database — `!` exposes the database
+    prefix path because it falls into the zName branch. }
+  it.fg_bits  := 0;
+  it.zAlias   := PAnsiChar(zA);
+  it.u4_ptr   := PAnsiChar(zD);
+  CheckEq('T94 %!S db.tbl with alias', sqlite3FormatStr('[%!S]', [@it]),
+          '[maindb.mytable]');
+
+  { T95 — nil item pointer emits empty body. }
+  CheckEq('T95 %S nil', sqlite3FormatStr('[%S]', [Pointer(nil)]), '[]');
+
+  { T96 — width padding (right-align by default, left-align with `-`). }
+  it.zAlias := PAnsiChar(zA); it.zName := nil; it.u4_ptr := nil;
+  CheckEq('T96a %12S right-pad', sqlite3FormatStr('[%12S]', [@it]),
+          '[     myalias]');
+  CheckEq('T96b %-12S left-pad', sqlite3FormatStr('[%-12S]', [@it]),
+          '[myalias     ]');
+
+  { T97 — subquery descriptor (no zName, no zAlias, isSubquery). }
+  FillChar(it, SizeOf(it), 0);
+  FillChar(sel, SizeOf(sel), 0);
+  FillChar(subq, SizeOf(subq), 0);
+  sel.selId    := 7;
+  sel.selFlags := 0;
+  subq.pSelect := @sel;
+  it.fg_bits   := $04;  { isSubquery }
+  it.u4_ptr    := @subq;
+  CheckEq('T97 %S subquery descriptor', sqlite3FormatStr('[%S]', [@it]),
+          '[(subquery-7)]');
+
+  { T98 — nested-FROM descriptor. }
+  sel.selFlags := SF_NestedFrom;
+  sel.selId    := 12;
+  CheckEq('T98 %S join descriptor', sqlite3FormatStr('[%S]', [@it]),
+          '[(join-12)]');
+
+  { T99 — multi-value VALUES clause descriptor.  Reads u1.nRow, not selId. }
+  sel.selFlags := SF_MultiValue;
+  it.u1_nRow   := 5;
+  CheckEq('T99 %S multi-value', sqlite3FormatStr('[%S]', [@it]),
+          '[5-ROW VALUES CLAUSE]');
+
+  { T100 — both zName and zAlias nil and isSubquery clear → empty body. }
+  FillChar(it, SizeOf(it), 0);
+  CheckEq('T100 %S empty', sqlite3FormatStr('[%S]', [@it]), '[]');
+end;
+
 begin
   WriteLn('=== TestPrintf — Phase 6.bis.4a/b printf engine ===');
   TestBasics;
@@ -248,6 +375,7 @@ begin
   TestSWidth;
   TestOrdinal;
   TestFloat;
+  TestSrcItem;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);
