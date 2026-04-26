@@ -20,6 +20,74 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.2d dbstat.c port.**  New unit
+    `src/passqlite3dbstat.pas` (~770 lines) hosts faithful Pascal ports
+    of all 11 static module callbacks (statConnect / statDisconnect /
+    statBestIndex / statOpen / statClose / statFilter / statNext /
+    statEof / statColumn / statRowid + statDecodePage / statGetPage /
+    statSizeAndOffset helpers and the StatCell/StatPage/StatCursor/
+    StatTable record types).  `dbstatModule: Tsqlite3_module` v1
+    layout (iVersion=0; xCreate=xConnect; read-only — xUpdate /
+    xBegin / xSync etc all nil).  `sqlite3DbstatRegister(db)` delegates
+    to `sqlite3VtabCreateModule`.
+
+    Notes that future phases should heed:
+
+      * **`sqlite3_mprintf` recurring blocker — fourth copy.**
+        Local `statFmtMsg` mirrors carrayFmtMsg / dbpageFmtMsg /
+        vtabFmtMsg; `statFmtPath` handles the three path templates
+        ('/', '%s%.3x/', '%s%.3x+%.6x', '%s') used by statNext.
+        FOUR copies now — promote to a shared helper when the printf
+        sub-phase lands.
+      * **`sqlite3_str_new` / `sqlite3_str_appendf` / `sqlite3_str_finish`
+        not ported.**  statFilter builds its inner SELECT through a
+        local `statBuildSql` AnsiString concatenator with manual
+        `escIdent` (%w → double `"`) and `escLiteral` (%Q → single-
+        quote, double `'`) helpers.  Sufficient for dbstat.c:776..788
+        (one identifier substitution for the schema name, one literal
+        for the optional name= filter).  Replace with the real
+        sqlite3_str_* family when that sub-phase lands.
+      * **`sqlite3TokenInit` not exposed.**  statConnect calls
+        `sqlite3FindDbName` directly with `argv[3]` as a `PAnsiChar`.
+        Equivalent semantics for unquoted schema names; quoted-form
+        case will need the Token round-trip when sqlite3TokenInit is
+        promoted to a public helper.
+      * **`sqlite3_context_db_handle` not ported (carry-over from
+        dbpage / 6.bis.2c).**  statColumn's schema branch derives `db`
+        via `cursor^.base.pVtab^.db`.  Identical effect to the C
+        helper; switch over once the public entry point lands.
+      * **FPC pitfalls (per memory).**  Local var `pPager: PPager` →
+        `pPgr: PPager`; `pDbPage: PDbPage` → `pDbPg: PDbPage`;
+        `nPage: i32` not affected (no PPage type).  Record FIELDS
+        retain upstream spelling (e.g. StatPage.aPg, StatPage.iPgno).
+      * **C `goto` inside statDecodePage / statNext.**  Pascal labels
+        `statPageIsCorrupt` (statDecodePage) and `statNextRestart`
+        (statNext) preserve the upstream control flow exactly — the
+        tail-recursion idiom in statNext (label-restart inside the
+        else-branch) is the trickiest piece and is faithfully ported.
+      * **u8/byte-walk idioms.**  `get2byte(&aHdr[3])` becomes
+        `(i32(aHdr[3]) shl 8) or i32(aHdr[4])` since FPC has no
+        `get2byte` macro and aHdr is Pu8.
+      * **`sqlite3PagerFile` exposed by passqlite3pager** — the only
+        in-tree call site so far; statSizeAndOffset uses it to forward
+        a ZIPVFS-style file-control opcode (230440).
+      * **dbstat columns referenced by ordinal in statBestIndex.**
+        DBSTAT_COLUMN_NAME=0, _SCHEMA=10, _AGGREGATE=11 are the
+        constraint-bearing columns; switch on those exactly.
+
+    Gate `src/tests/TestDbstat.pas` (new) — **83/83 PASS**.  Exercises
+    module registration (registry slot + name + nRefModule), the full
+    v1 slot layout (M1..M21 — pinning the read-only nature: xUpdate /
+    xBegin etc all nil), nine BestIndex branches (B1..B9: empty /
+    schema= / name= / aggregate= / all-three / two ORDER BY shapes /
+    DESC-rejected / unusable→CONSTRAINT), and the cursor open/close
+    state machine (C1..C3 — including iDb propagation).  xFilter /
+    xColumn / xNext page-walk deferred to the end-to-end SQL gate
+    (6.9): they need a live Btree and a working sqlite3_prepare_v2
+    path through the parser.  No regressions across the 47-gate
+    matrix (TestVtab still 216/216, TestCarray 66/66, TestDbpage
+    68/68, all read/write paths green).
+
   - **2026-04-26 — Phase 6.bis.2c dbpage.c port.**  New unit
     `src/passqlite3dbpage.pas` (~470 lines) hosts faithful Pascal ports
     of the full v2 module callback set (dbpageConnect / dbpageDisconnect
@@ -3041,9 +3109,43 @@ Phase 5.9 depends on this being done first.
     (xColumn data column, xFilter, xUpdate, xBegin/xSync/xRollbackTo)
     deferred to 6.9 — they need a real Btree-backed connection.
 
-  - [ ] **6.bis.2d** Port `dbstat.c` — the `dbstat` vtab (B-tree
+  - [X] **6.bis.2d** Port `dbstat.c` — the `dbstat` vtab (B-tree
     statistics).  Largest of the three (906 C lines).  Heavy on
     `sqlite3_mprintf` for idxStr; depends on the printf sub-phase.
+    DONE 2026-04-26.  New unit `src/passqlite3dbstat.pas` (~770 lines)
+    hosts faithful Pascal ports of the 11 static module callbacks
+    (statConnect/Disconnect/BestIndex/Open/Close/Filter/Next/Eof/
+    Column/Rowid + the statDecodePage / statGetPage /
+    statSizeAndOffset helpers and StatCell/StatPage/StatCursor/
+    StatTable record types).  `dbstatModule` is a v1 read-only module
+    (iVersion=0; xUpdate / xBegin / xSync / xRollbackTo all nil;
+    xCreate=xConnect for both eponymous and CREATE-able use).
+    `sqlite3DbstatRegister(db)` is the public entry point.
+
+    Carry-overs:
+      * `sqlite3_mprintf` shim: 4th copy now (statFmtMsg /
+        statFmtPath; mirrors carrayFmtMsg, dbpageFmtMsg, vtabFmtMsg).
+        Promote to a shared helper when the printf sub-phase lands.
+      * `sqlite3_str_*` family (sqlite3_str_new / _appendf / _finish)
+        not ported.  statFilter builds its inner SELECT through a
+        local `statBuildSql` AnsiString concatenator with `escIdent`
+        (%w) and `escLiteral` (%Q) helpers.  Replace when the printf
+        sub-phase lands.
+      * `sqlite3TokenInit` / `sqlite3FindDb` Token-based path not
+        ported.  statConnect calls `sqlite3FindDbName` with
+        `argv[3]` directly; equivalent for unquoted schema names.
+      * `sqlite3_context_db_handle` not ported (carry-over from
+        dbpage 6.bis.2c).  statColumn derives `db` via
+        `cursor^.base.pVtab^.db`.
+
+    Gate `src/tests/TestDbstat.pas` — 83/83 PASS.  Covers module
+    registration, full v1 slot layout (read-only — xUpdate/etc nil),
+    nine xBestIndex branches (empty / schema= / name= / aggregate= /
+    all-three / two ORDER BY shapes / DESC-rejected / unusable→
+    CONSTRAINT), and the cursor open/close state machine.  Live-db
+    paths (xFilter / xColumn / statNext page-walk) deferred to 6.9:
+    require a real Btree and the sqlite3_prepare_v2 path through the
+    parser.  No regressions across the 47-gate matrix.
 
 - [ ] **6.9** `TestExplainParity.pas`: for the full SQL corpus, `EXPLAIN` each
   statement via Pascal and via C; diff the opcode listings. This is the single
