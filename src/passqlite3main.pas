@@ -234,6 +234,43 @@ function sqlite3_unlock_notify(db: PTsqlite3;
                                xNotify: Tsqlite3_unlock_notify_cb;
                                pArg: Pointer): i32;
 
+{ ----------------------------------------------------------------------
+  Phase 8.9 — loadext.c (sqlite3_load_extension family).
+
+  Build configuration sets SQLITE_OMIT_LOAD_EXTENSION (see Phase 0.12 in
+  passqlite3.inc), so upstream's loadext.c emits *only* the auto-extension
+  surface (sqlite3_auto_extension / _cancel_auto_extension /
+  _reset_auto_extension); the DLL-loading path
+  (sqlite3_load_extension / sqlite3_enable_load_extension) is `#ifndef`-
+  guarded out.  We expose the symbols anyway as thin shims:
+
+    * sqlite3_load_extension      → SQLITE_ERROR + "extension loading is
+                                    disabled" message, matching the
+                                    documented behaviour in the OMIT build.
+    * sqlite3_enable_load_extension → flips the db->flags bit faithfully,
+                                    so DBCONFIG_ENABLE_LOAD_EXTENSION
+                                    parity is preserved (a flag with no
+                                    loader behind it is harmless).
+    * sqlite3_auto_extension      → faithful port of loadext.c:808.
+    * sqlite3_cancel_auto_extension → faithful port of loadext.c:858.
+    * sqlite3_reset_auto_extension  → faithful port of loadext.c:886.
+
+  The auto-extension list is *process-global* in the C code (a static
+  WSD array protected by SQLITE_MUTEX_STATIC_MAIN).  We mirror that with
+  a `var`-level dynamic array protected by the same static main mutex.
+  ---------------------------------------------------------------------- }
+type
+  Tsqlite3_loadext_fn = procedure; cdecl;
+
+function sqlite3_load_extension(db: PTsqlite3;
+                                zFile, zProc: PAnsiChar;
+                                pzErrMsg: PPAnsiChar): i32;
+function sqlite3_enable_load_extension(db: PTsqlite3; onoff: i32): i32;
+
+function sqlite3_auto_extension(xInit: Tsqlite3_loadext_fn): i32;
+function sqlite3_cancel_auto_extension(xInit: Tsqlite3_loadext_fn): i32;
+procedure sqlite3_reset_auto_extension;
+
 implementation
 
 { ----------------------------------------------------------------------
@@ -1744,6 +1781,126 @@ begin
     xNotify(@arg, 1);
   end;
   Result := SQLITE_OK;
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 8.9 — loadext.c shims and faithful auto-extension list.
+
+  See interface block above for design notes.
+  ---------------------------------------------------------------------- }
+const
+  cExtLoadDisabledMsg: AnsiString = 'extension loading is disabled';
+
+var
+  gAutoExt   : array of Tsqlite3_loadext_fn;
+  gAutoExtN  : i32 = 0;
+
+{ sqlite3_load_extension — loadext.c:728 (with SQLITE_OMIT_LOAD_EXTENSION
+  the C code does not emit this symbol at all; we provide a shim that
+  tells the caller the obvious truth). }
+function sqlite3_load_extension(db: PTsqlite3;
+                                zFile, zProc: PAnsiChar;
+                                pzErrMsg: PPAnsiChar): i32;
+var
+  z: PAnsiChar;
+  n: PtrUInt;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  if pzErrMsg <> nil then begin
+    n := Length(cExtLoadDisabledMsg);
+    z := sqlite3_malloc(i32(n + 1));
+    if z <> nil then begin
+      Move(cExtLoadDisabledMsg[1], z^, n);
+      (z + n)^ := #0;
+    end;
+    pzErrMsg^ := z;
+  end;
+  Result := SQLITE_ERROR;
+end;
+
+{ sqlite3_enable_load_extension — loadext.c:759.  Faithful.  The
+  SQLITE_LoadExtFunc bit is shifted >32 in upstream; we don't model that
+  bit yet (it gates only the load_extension() SQL function which is not
+  ported), so toggle SQLITE_LoadExtension only. }
+function sqlite3_enable_load_extension(db: PTsqlite3; onoff: i32): i32;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  if onoff <> 0 then
+    db^.flags := db^.flags or SQLITE_LoadExtension_Bit
+  else
+    db^.flags := db^.flags and (not SQLITE_LoadExtension_Bit);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+{ sqlite3_auto_extension — loadext.c:808.  Faithful. }
+function sqlite3_auto_extension(xInit: Tsqlite3_loadext_fn): i32;
+var
+  rc      : i32;
+  i       : i32;
+  pMainMtx: Psqlite3_mutex;
+begin
+  if not Assigned(xInit) then begin Result := SQLITE_MISUSE; Exit; end;
+  rc := sqlite3_initialize;
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  pMainMtx := sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN);
+  sqlite3_mutex_enter(pMainMtx);
+  i := 0;
+  while i < gAutoExtN do begin
+    if Pointer(gAutoExt[i]) = Pointer(xInit) then break;
+    Inc(i);
+  end;
+  if i = gAutoExtN then begin
+    SetLength(gAutoExt, gAutoExtN + 1);
+    gAutoExt[gAutoExtN] := xInit;
+    Inc(gAutoExtN);
+  end;
+  sqlite3_mutex_leave(pMainMtx);
+  Result := SQLITE_OK;
+end;
+
+{ sqlite3_cancel_auto_extension — loadext.c:858.  Returns 1 if removed,
+  0 otherwise. }
+function sqlite3_cancel_auto_extension(xInit: Tsqlite3_loadext_fn): i32;
+var
+  i, n    : i32;
+  pMainMtx: Psqlite3_mutex;
+begin
+  if not Assigned(xInit) then begin Result := 0; Exit; end;
+  n := 0;
+  pMainMtx := sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN);
+  sqlite3_mutex_enter(pMainMtx);
+  i := gAutoExtN - 1;
+  while i >= 0 do begin
+    if Pointer(gAutoExt[i]) = Pointer(xInit) then begin
+      Dec(gAutoExtN);
+      gAutoExt[i] := gAutoExt[gAutoExtN];
+      Inc(n);
+      break;
+    end;
+    Dec(i);
+  end;
+  sqlite3_mutex_leave(pMainMtx);
+  Result := n;
+end;
+
+{ sqlite3_reset_auto_extension — loadext.c:886.  Faithful. }
+procedure sqlite3_reset_auto_extension;
+var
+  pMainMtx: Psqlite3_mutex;
+begin
+  if sqlite3_initialize <> SQLITE_OK then Exit;
+  pMainMtx := sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_MAIN);
+  sqlite3_mutex_enter(pMainMtx);
+  SetLength(gAutoExt, 0);
+  gAutoExtN := 0;
+  sqlite3_mutex_leave(pMainMtx);
 end;
 
 end.

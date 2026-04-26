@@ -143,6 +143,7 @@ compile_test TestInitShutdown
 compile_test TestExecGetTable
 compile_test TestBackup
 compile_test TestUnlockNotify
+compile_test TestLoadExt
 compile_test TestExplainParity
 compile_test TestSQLCorpus
 compile_test TestFuzzDiff

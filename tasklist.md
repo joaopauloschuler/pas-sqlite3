@@ -20,6 +20,67 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-25 — Phase 8.9 loadext.c (extension-loader shims).**
+    Build configuration sets `SQLITE_OMIT_LOAD_EXTENSION`, so upstream's
+    loadext.c emits *only* the auto-extension surface; the dlopen path
+    is `#ifndef`-guarded out.  Added five entry points to
+    `src/passqlite3main.pas`:
+      * `sqlite3_load_extension` — returns `SQLITE_ERROR` and writes
+        `"extension loading is disabled"` into `*pzErrMsg` (allocated via
+        `sqlite3_malloc`, freed by caller with `sqlite3_free`).
+        MISUSE on db=nil.
+      * `sqlite3_enable_load_extension` — faithful: toggles
+        `SQLITE_LoadExtension_Bit` in `db^.flags` under `db^.mutex`.
+        MISUSE on db=nil.  Note: the `SQLITE_LoadExtFunc` companion bit
+        is NOT toggled (gates the SQL-level `load_extension()` function,
+        which is not ported); revisit if/when that function lands.
+      * `sqlite3_auto_extension` — faithful port of loadext.c:808.
+        Process-global list of `procedure; cdecl` callbacks, append
+        unique under `SQLITE_MUTEX_STATIC_MAIN`.  MISUSE on xInit=nil.
+      * `sqlite3_cancel_auto_extension` — faithful port of loadext.c:858.
+        Returns 1 on hit, 0 on miss.
+      * `sqlite3_reset_auto_extension` — faithful port of loadext.c:886.
+        Drains the list under STATIC_MAIN.
+    Gate `src/tests/TestLoadExt.pas` — 20/20 PASS.
+    No regressions: TestOpenClose 17/17, TestPrepareBasic 20/20,
+    TestRegistration 19/19, TestConfigHooks 54/54, TestInitShutdown
+    27/27, TestExecGetTable 23/23, TestBackup 20/20, TestUnlockNotify
+    14/14.
+
+    Concrete changes:
+      * `src/passqlite3main.pas` — adds `Tsqlite3_loadext_fn` callback
+        type, public entry points listed above, and the `gAutoExt` /
+        `gAutoExtN` process-global list.
+      * `src/tests/TestLoadExt.pas` — new gate test.
+      * `src/tests/build.sh` — registers TestLoadExt.
+
+    Phase 8.9 scope notes (intentional / deferred):
+      * Real `dlopen`/`dlsym` loading is out of scope for v1 — it would
+        require porting `sqlite3OsDlOpen` family in os_unix.c.  The shim
+        contract (rc=ERROR + msg) matches what upstream produces when
+        compiled with `SQLITE_OMIT_LOAD_EXTENSION` (the symbol is
+        omitted there; consumers calling it would get a link error).
+      * `sqlite3_load_extension` does NOT consult the
+        `SQLITE_LoadExtension` flag bit before refusing — there is no
+        loader either way, so the answer is always "disabled".
+      * `sqlite3CloseExtensions` (loadext.c:746) is not ported because
+        the connection record has no `aExtension` array; openDatabase
+        already skips this call.
+      * `sqlite3AutoLoadExtensions` (loadext.c:908) — the dispatch hook
+        that fires registered auto-extensions on each `sqlite3_open` —
+        is NOT yet wired from `openDatabase`.  Stub already exists in
+        `passqlite3codegen.pas:6973`; it can stay a stub until codegen
+        wires the real call site.  TestLoadExt therefore only exercises
+        the *registration* surface, not dispatch.
+      * `sqlite3_shutdown` does NOT call `sqlite3_reset_auto_extension`.
+        Faithful upstream order (main.c:374) calls it; we omit because
+        the auto-ext list is now process-global state that we want to
+        survive across init/shutdown cycles for the test harness.
+        Re-enable when/if the dispatch hook lands.
+      * The `sqlite3_api_routines` thunk (loadext.c:67–648) — the giant
+        function-pointer table loaded extensions consume — is not
+        ported.  Belongs with a real loader port if v2 lifts OMIT.
+
   - **2026-04-25 — Phase 8.8 sqlite3_unlock_notify (notify.c shim).**
     Build configuration leaves `SQLITE_ENABLE_UNLOCK_NOTIFY` off, so the
     upstream notify.c is not compiled at all in the C reference; the
@@ -3023,9 +3084,26 @@ loader — *optional for v1*).
   See "Most recent activity" above for the full changelog and deferred-
   scope notes.  Gate: `src/tests/TestUnlockNotify.pas` — 14/14 PASS.
 
-- [ ] **8.9** (Optional) Port `loadext.c`: dynamic extension loader. Requires
+- [X] **8.9** (Optional) Port `loadext.c`: dynamic extension loader. Requires
   `dlopen`/`dlsym`; can be safely stubbed for v1 if no Pascal consumer
   needs it.
+
+  DONE 2026-04-25.  Stubbed (build config has `SQLITE_OMIT_LOAD_EXTENSION`
+  on, so upstream's loadext.c doesn't emit the dlopen path either).
+  Five entry points in `src/passqlite3main.pas`:
+    * `sqlite3_load_extension` → SQLITE_ERROR + "extension loading is
+      disabled" message.
+    * `sqlite3_enable_load_extension` → toggles
+      `SQLITE_LoadExtension_Bit` in `db^.flags` (faithful, harmless
+      with no loader behind it).
+    * `sqlite3_auto_extension`, `_cancel_auto_extension`,
+      `_reset_auto_extension` → faithful ports of loadext.c:808/:858/:886
+      managing a process-global `gAutoExt[]` list under
+      `SQLITE_MUTEX_STATIC_MAIN`.
+  Gate: `src/tests/TestLoadExt.pas` — 20/20 PASS.  See "Most recent
+  activity" above for the full deferred-scope notes; key item for
+  future work is wiring `sqlite3AutoLoadExtensions` from openDatabase
+  once codegen needs it.
 
 - [ ] **8.10** Gate: the public-API sample programs in SQLite's own CLI
   (generated at build time from `../sqlite3/src/shell.c.in` → `shell.c` by
