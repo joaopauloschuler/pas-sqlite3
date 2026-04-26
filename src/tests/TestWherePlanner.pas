@@ -702,6 +702,107 @@ begin
   Check('IH5 WHERE_COLUMN_NULL trips disable', loops[1].prereq = ALL);
 end;
 
+{ ----- whereRangeVectorLen ----- }
+
+procedure TestRangeVectorLen;
+var
+  exLeftScalar: TExpr;
+  exRoot:       TExpr;
+  exVecLeft:    TExpr;
+  exVecRight:   TExpr;
+  lhsBuf:       array[0 .. SizeOf(TExprList) + 2*SizeOf(TExprListItem) - 1] of Byte;
+  rhsBuf:       array[0 .. SizeOf(TExprList) + 2*SizeOf(TExprListItem) - 1] of Byte;
+  pLhsList:     PExprList;
+  pRhsList:     PExprList;
+  pLhsItems:    PExprListItem;
+  pRhsItems:    PExprListItem;
+  exLhs0,exLhs1,exRhs0,exRhs1: TExpr;
+  pTerm:        TWhereTerm;
+  idx:          TIndex;
+  aiCols:       array[0..2] of i16;
+  aSort:        array[0..2] of u8;
+  rc:           i32;
+begin
+  { ----- RV1: scalar (non-vector) pTerm — returns 1 unconditionally. ----- }
+  FillChar(exLeftScalar, SizeOf(TExpr), 0);
+  FillChar(exRoot,       SizeOf(TExpr), 0);
+  FillChar(idx,          SizeOf(TIndex), 0);
+  FillChar(pTerm,        SizeOf(TWhereTerm), 0);
+
+  exLeftScalar.op := TK_COLUMN;
+  exRoot.op       := TK_GT_TK;
+  exRoot.pLeft    := @exLeftScalar;
+  exRoot.pRight   := nil;
+  pTerm.pExpr     := @exRoot;
+
+  aiCols[0] := 0; aiCols[1] := 1; aiCols[2] := 2;
+  aSort[0]  := 0; aSort[1] := 0;  aSort[2] := 0;
+  idx.aiColumn   := @aiCols[0];
+  idx.aSortOrder := @aSort[0];
+  idx.nColumn    := 3;
+
+  rc := whereRangeVectorLen(nil, 7, @idx, 0, @pTerm);
+  Check('RV1 scalar non-vector returns 1', rc = 1);
+
+  { ----- RV2: 2-component vector LHS, but the i=1 LHS column lives on a
+    different cursor than iCur — the inner loop breaks immediately and
+    the function returns 1. ----- }
+  FillChar(exLhs0,    SizeOf(TExpr), 0);
+  FillChar(exLhs1,    SizeOf(TExpr), 0);
+  FillChar(exRhs0,    SizeOf(TExpr), 0);
+  FillChar(exRhs1,    SizeOf(TExpr), 0);
+  FillChar(exVecLeft, SizeOf(TExpr), 0);
+  FillChar(exVecRight,SizeOf(TExpr), 0);
+  FillChar(lhsBuf, SizeOf(lhsBuf), 0);
+  FillChar(rhsBuf, SizeOf(rhsBuf), 0);
+
+  exLhs0.op := TK_COLUMN; exLhs0.iTable := 7; exLhs0.iColumn := 0;
+  exLhs1.op := TK_COLUMN; exLhs1.iTable := 99; exLhs1.iColumn := 1; { wrong cursor }
+
+  pLhsList := PExprList(@lhsBuf[0]);
+  pLhsList^.nExpr := 2;
+  pLhsItems := ExprListItems(pLhsList);
+  pLhsItems[0].pExpr := @exLhs0;
+  pLhsItems[1].pExpr := @exLhs1;
+
+  exVecLeft.op := TK_VECTOR;
+  exVecLeft.flags := 0; { ExprUseXList → EP_xIsSelect must be clear }
+  exVecLeft.x.pList := pLhsList;
+
+  exRhs0.op := TK_INTEGER;
+  exRhs1.op := TK_INTEGER;
+  pRhsList := PExprList(@rhsBuf[0]);
+  pRhsList^.nExpr := 2;
+  pRhsItems := ExprListItems(pRhsList);
+  pRhsItems[0].pExpr := @exRhs0;
+  pRhsItems[1].pExpr := @exRhs1;
+  exVecRight.op    := TK_VECTOR;
+  exVecRight.flags := 0;
+  exVecRight.x.pList := pRhsList;
+
+  exRoot.pLeft  := @exVecLeft;
+  exRoot.pRight := @exVecRight;
+  pTerm.pExpr   := @exRoot;
+
+  rc := whereRangeVectorLen(nil, 7, @idx, 0, @pTerm);
+  Check('RV2 vector — wrong-cursor LHS at i=1 → 1', rc = 1);
+
+  { ----- RV3: same vector shape but the i=1 LHS sort order differs from
+    nEq=0's sort order — break at the sort-order check. ----- }
+  exLhs1.iTable  := 7;       { correct cursor now }
+  exLhs1.iColumn := 1;       { matches aiColumn[1] }
+  aSort[0] := 0;
+  aSort[1] := 1;             { mismatch with aSort[nEq=0]=0 }
+
+  rc := whereRangeVectorLen(nil, 7, @idx, 0, @pTerm);
+  Check('RV3 vector — mismatched sort order at i=1 → 1', rc = 1);
+
+  { ----- RV4: nCmp capped by (nColumn - nEq).  nColumn=3, nEq=2 → cap=1
+    so the i=1 loop iteration never starts even with valid columns. ----- }
+  rc := whereRangeVectorLen(nil, 7, @idx, 2, @pTerm);
+  Check('RV4 vector — cap by (nColumn - nEq) → 1', rc = 1);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -714,6 +815,7 @@ begin
   TestEstLikePatternLength;
   TestOutputAdjust;
   TestInterstageHeuristic;
+  TestRangeVectorLen;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

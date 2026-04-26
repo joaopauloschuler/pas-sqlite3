@@ -1608,6 +1608,16 @@ procedure whereLoopOutputAdjust(pWC: PWhereClause; pLoop: PWhereLoop;
   full scan just to satisfy ordering. }
 procedure whereInterstageHeuristic(pWInfo: PWhereInfo);
 
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — vector range constraint width
+  probe (where.c:3145..3196).  Given a vector inequality term such as
+  "(a,b,c) > (?,?,?)" being matched against an index, return the count of
+  leading vector components whose column reference, sort order, comparison
+  affinity, and collation all match the matching index column.  Drives
+  the WHERE_BTM_LIMIT / WHERE_TOP_LIMIT span computation inside
+  whereLoopAddBtreeIndex, where this routine lands in a later sub-progress. }
+function  whereRangeVectorLen(pParse: PParse; iCur: i32; pIdx: PIndex2;
+  nEq: i32; pTerm: PWhereTerm): i32;
+
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
 // ---------------------------------------------------------------------------
@@ -7803,6 +7813,80 @@ begin
       Break;
     end;
   end;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.d sub-progress) — whereRangeVectorLen.
+
+  Faithful port of where.c:3145..3196.  Given a vector inequality WHERE term
+  whose LHS is a row-value of N expressions, find the largest prefix L such
+  that:
+
+    * every component i in 0..L-1 is a TK_COLUMN reference to cursor iCur
+      and column pIdx^.aiColumn[i + nEq],
+    * sort order pIdx^.aSortOrder[i + nEq] equals pIdx^.aSortOrder[nEq],
+    * the comparison affinity (sqlite3CompareAffinity of LHS vs RHS at
+      position i) matches the index column's affinity, and
+    * the comparison collation matches pIdx^.azColl[i + nEq].
+
+  Returns L (always >= 1, since component 0 is by construction the column
+  the planner is currently extending).  The result feeds the BTM/TOP-limit
+  span fed into whereLoopAddBtreeIndex's range-scan accounting; rejecting
+  components past L preserves index orderability.
+
+  RHS shape: either a TK_VECTOR list (`(?,?,?)` literal — pRight^.x.pList)
+  or a sub-select row (`SELECT a,b,c FROM ...` — pRight^.x.pSelect^.pEList).
+  Non-vector pTerm — sqlite3ExprVectorSize(pLeft) = 1 — short-circuits the
+  loop and returns 1.
+  =========================================================================== }
+function whereRangeVectorLen(pParse: PParse; iCur: i32; pIdx: PIndex2;
+  nEq: i32; pTerm: PWhereTerm): i32;
+var
+  nCmp:     i32;
+  i:        i32;
+  cap:      i32;
+  aff:      AnsiChar;
+  idxaff:   AnsiChar;
+  pColl:    PTCollSeq;
+  pLhs:     PExpr;
+  pRhs:     PExpr;
+  pLeftVec: PExpr;
+  pRhsRoot: PExpr;
+begin
+  pLeftVec := pTerm^.pExpr^.pLeft;
+  nCmp := sqlite3ExprVectorSize(pLeftVec);
+  cap  := i32(pIdx^.nColumn) - nEq;
+  if nCmp > cap then nCmp := cap;
+  i := 1;
+  while i < nCmp do
+  begin
+    Assert(ExprUseXList(pLeftVec));
+    pLhs := ExprListItems(pLeftVec^.x.pList)[i].pExpr;
+    pRhsRoot := pTerm^.pExpr^.pRight;
+    if ExprUseXSelect(pRhsRoot) then
+      pRhs := ExprListItems(pRhsRoot^.x.pSelect^.pEList)[i].pExpr
+    else
+      pRhs := ExprListItems(pRhsRoot^.x.pList)[i].pExpr;
+
+    { LHS must be a column reference into iCur at the matching index column,
+      and the sort order at i+nEq must match the sort order at nEq. }
+    if (pLhs^.op <> TK_COLUMN)
+       or (pLhs^.iTable <> iCur)
+       or (pLhs^.iColumn <> pIdx^.aiColumn[i + nEq])
+       or (pIdx^.aSortOrder[i + nEq] <> pIdx^.aSortOrder[nEq]) then
+      Break;
+
+    aff    := sqlite3CompareAffinity(pRhs, sqlite3ExprAffinity(pLhs));
+    idxaff := sqlite3TableColumnAffinity(pIdx^.pTable, pLhs^.iColumn);
+    if aff <> idxaff then Break;
+
+    pColl := PTCollSeq(sqlite3ExprCompareCollSeq(pParse, pTerm^.pExpr));
+    if pColl = nil then Break;
+    if sqlite3StrICmp(pColl^.zName,
+                      PPAnsiChar(pIdx^.azColl)[i + nEq]) <> 0 then Break;
+    Inc(i);
+  end;
+  Result := i;
 end;
 
 { Helper for exprIsDeterministic (where.c:6445).  TK_FUNCTION nodes without

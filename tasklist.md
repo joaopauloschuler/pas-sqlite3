@@ -200,6 +200,19 @@ Important: At the end of this document, please find:
       (WHERE_COLUMN_RANGE-only inner level breaks the walk yet outer
       EQ still disables its iTab=0 rival), IH4 (WHERE_COLUMN_IN trips
       the disable arm), IH5 (WHERE_COLUMN_NULL trips it too).
+    - [X] `whereRangeVectorLen` (where.c:3145..3196) — vector range
+      constraint width probe.  Given a vector inequality term such as
+      "(a,b,c) > (?,?,?)" being matched against an index, returns the
+      count of leading vector components whose column reference, sort
+      order, comparison affinity, and collation all match the matching
+      index column.  Drives the WHERE_BTM_LIMIT / WHERE_TOP_LIMIT span
+      that whereLoopAddBtreeIndex (deferred to subsequent sub-progress)
+      threads into range-scan accounting.  Pure helper, no codegen.
+      Gate: `TestWherePlanner.pas` (85/85): RV1 scalar (non-vector)
+      term short-circuits to 1, RV2 vector with wrong-cursor LHS at
+      i=1 breaks immediately, RV3 vector with mismatched sort order
+      at i=1 breaks at the sort-order check, RV4 vector capped by
+      (nColumn - nEq) so the i=1 iteration never starts.
 
 - [ ] **6.9-bis 11g.2.e** Port `wherecode.c` (~2945 lines) —
     per-loop inner-body codegen.  Public surface:
