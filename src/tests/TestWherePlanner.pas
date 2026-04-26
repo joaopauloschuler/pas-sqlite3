@@ -1,0 +1,316 @@
+{$I ../passqlite3.inc}
+program TestWherePlanner;
+{
+  Phase 6.9-bis (step 11g.2.d sub-progress) gate test for the planner-core
+  leaf helpers landed alongside this test:
+
+    * whereOrMove                  — where.c:196..199
+    * whereOrInsert                — where.c:208..239
+    * whereLoopCheaperProperSubset — where.c:2657..2687
+    * whereLoopAdjustCost          — where.c:2703..2728
+    * whereLoopFindLesser          — where.c:2744..2806
+    * whereLoopInsert              — where.c:2832..2938
+
+  Tests build TWhereLoop / TWhereOrSet stacks directly; nothing here goes
+  through sqlite3WhereBegin.  Together these helpers are the bookkeeping
+  underneath whereLoopAddBtree / whereLoopAddOr / whereLoopAddAll, which
+  land in subsequent 11g.2.d sub-progress.
+}
+
+uses
+  SysUtils,
+  passqlite3types,
+  passqlite3internal,
+  passqlite3os,
+  passqlite3util,
+  passqlite3pcache,
+  passqlite3pager,
+  passqlite3wal,
+  passqlite3btree,
+  passqlite3vdbe,
+  passqlite3codegen,
+  passqlite3main;
+
+var
+  gPass: i32 = 0;
+  gFail: i32 = 0;
+
+procedure Check(const name: string; cond: Boolean);
+begin
+  if cond then begin Inc(gPass); WriteLn('PASS  ', name); end
+  else       begin Inc(gFail); WriteLn('FAIL  ', name); end;
+end;
+
+{ ----- whereOrMove + whereOrInsert ----- }
+
+procedure TestOrSet;
+var
+  src, dst: TWhereOrSet;
+  rc: i32;
+begin
+  FillChar(src, SizeOf(src), 0);
+  FillChar(dst, SizeOf(dst), 0);
+
+  { Empty whereOrInsert: appends entry. }
+  rc := whereOrInsert(@src, $0001, 30, 10);
+  Check('OR1 first insert returns 1',         rc = 1);
+  Check('OR1 n=1',                            src.n = 1);
+  Check('OR1 a[0].prereq=1',                  src.a[0].prereq = $0001);
+  Check('OR1 a[0].rRun=30',                   src.a[0].rRun = 30);
+  Check('OR1 a[0].nOut=10',                   src.a[0].nOut = 10);
+
+  { Same prereq, lower rRun → overwrites in place (rRun<=p->rRun + prereq subset). }
+  rc := whereOrInsert(@src, $0001, 25, 12);
+  Check('OR2 dominating insert returns 1',    rc = 1);
+  Check('OR2 still n=1',                      src.n = 1);
+  Check('OR2 rRun updated',                   src.a[0].rRun = 25);
+  Check('OR2 nOut min',                       src.a[0].nOut = 10); { min(10,12)=10 }
+
+  { Subsumed candidate (existing dominates) → return 0, no insert. }
+  rc := whereOrInsert(@src, $0003, 30, 14);
+  Check('OR3 subsumed returns 0',             rc = 0);
+  Check('OR3 still n=1',                      src.n = 1);
+
+  { Different prereq, different cost → appended. }
+  rc := whereOrInsert(@src, $0002, 28, 11);
+  Check('OR4 distinct insert returns 1',      rc = 1);
+  Check('OR4 n=2',                            src.n = 2);
+
+  { Push past N_OR_COST=3 → fills up. }
+  rc := whereOrInsert(@src, $0004, 26, 9);
+  Check('OR5 third distinct insert returns 1', rc = 1);
+  Check('OR5 n=3',                             src.n = 3);
+
+  { Now full (n=N_OR_COST).  A cheaper-than-worst entry should evict. }
+  rc := whereOrInsert(@src, $0008, 20, 7);
+  Check('OR6 eviction returns 1',              rc = 1);
+  Check('OR6 still n=3',                       src.n = 3);
+
+  { whereOrMove copy. }
+  whereOrMove(@dst, @src);
+  Check('OR7 move n',                         dst.n = src.n);
+  Check('OR7 move slot0 prereq',              dst.a[0].prereq = src.a[0].prereq);
+  Check('OR7 move slot1 rRun',                dst.a[1].rRun   = src.a[1].rRun);
+  Check('OR7 move slot2 nOut',                dst.a[2].nOut   = src.a[2].nOut);
+end;
+
+{ ----- whereLoopCheaperProperSubset ----- }
+
+procedure InitLoopBare(p: PWhereLoop);
+begin
+  FillChar(p^, SizeOf(TWhereLoop), 0);
+  whereLoopInit(p);
+end;
+
+procedure TestCheaperProperSubset;
+var
+  pX, pY: TWhereLoop;
+  tX1, tX2, tY1, tY2, tY3: TWhereTerm;
+begin
+  FillChar(tX1, SizeOf(tX1), 0); FillChar(tX2, SizeOf(tX2), 0);
+  FillChar(tY1, SizeOf(tY1), 0); FillChar(tY2, SizeOf(tY2), 0);
+  FillChar(tY3, SizeOf(tY3), 0);
+
+  { Case 2: X is proper subset of Y, X cheaper → returns 1.
+    X uses {tX1, tX2}, Y uses {tX1, tX2, tY3}. }
+  InitLoopBare(@pX);
+  InitLoopBare(@pY);
+  pX.iTab := 1; pY.iTab := 1;
+  pX.rRun := 30; pX.nOut := 10;
+  pY.rRun := 40; pY.nOut := 20;
+  pX.aLTerm[0] := @tX1; pX.aLTerm[1] := @tX2; pX.nLTerm := 2;
+  pY.aLTerm[0] := @tX1; pY.aLTerm[1] := @tX2; pY.aLTerm[2] := @tY3;
+  pY.nLTerm := 3;
+  Check('CPS1 case2 X subset of Y',          whereLoopCheaperProperSubset(@pX, @pY) = 1);
+
+  { Reverse direction — Y is not a proper subset of X. }
+  Check('CPS2 not(Y subset of X)',           whereLoopCheaperProperSubset(@pY, @pX) = 0);
+
+  { Cost guard (1d)/(2a): X both costlier than Y → return 0. }
+  pX.rRun := 50; pX.nOut := 30;
+  Check('CPS3 cost guard',                   whereLoopCheaperProperSubset(@pX, @pY) = 0);
+
+  { Same nLTerm → not proper subset. }
+  pX.rRun := 30; pX.nOut := 10;
+  pY.nLTerm := 2;
+  Check('CPS4 same nLTerm not subset',       whereLoopCheaperProperSubset(@pX, @pY) = 0);
+
+  { (2c) miss — X has term Y does not. }
+  pY.aLTerm[0] := @tY1; pY.aLTerm[1] := @tY2; pY.nLTerm := 3;
+  pY.aLTerm[2] := @tY3;
+  Check('CPS5 (2c) term mismatch',           whereLoopCheaperProperSubset(@pX, @pY) = 0);
+end;
+
+{ ----- whereLoopFindLesser + whereLoopInsert ----- }
+
+procedure TestFindLesser;
+var
+  pHead: PWhereLoop;
+  loop1: TWhereLoop;
+  template: TWhereLoop;
+  ppRet: PPWhereLoop;
+begin
+  pHead := nil;
+  InitLoopBare(@loop1);
+  loop1.iTab := 2; loop1.iSortIdx := 0;
+  loop1.prereq := $0001;
+  loop1.rRun := 20; loop1.nOut := 5;
+  pHead := @loop1;
+
+  { Empty/Append: a template that is unrelated finds the tail link slot. }
+  InitLoopBare(@template);
+  template.iTab := 9; template.iSortIdx := 0;
+  template.prereq := $0010; template.rRun := 30; template.nOut := 8;
+  ppRet := whereLoopFindLesser(@pHead, @template);
+  Check('FL1 unrelated → tail slot',         (ppRet <> nil) and (ppRet^ = nil));
+
+  { Discard: existing has fewer prereqs and lower cost. }
+  template.iTab := 2; template.prereq := $0003; template.rRun := 30; template.nOut := 10;
+  ppRet := whereLoopFindLesser(@pHead, @template);
+  Check('FL2 discard',                       ppRet = nil);
+
+  { Replace candidate: template better → returns slot pointing at loop1. }
+  template.prereq := $0001; template.rRun := 10; template.nOut := 4;
+  ppRet := whereLoopFindLesser(@pHead, @template);
+  Check('FL3 replace slot points at loop1',  (ppRet <> nil) and (ppRet^ = @loop1));
+end;
+
+procedure TestInsert;
+var
+  db:       PTsqlite3;
+  rc:       i32;
+  parse:    TParse;
+  wInfoBuf: array[0..1023] of u8;
+  pWInfo:   PWhereInfo;
+  bld:      TWhereLoopBuilder;
+  template: TWhereLoop;
+  pLoops:   PWhereLoop;
+  count:    i32;
+  p:        PWhereLoop;
+  orset:    TWhereOrSet;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('INS open',                          rc = SQLITE_OK);
+
+  FillChar(parse,    SizeOf(parse),    0);
+  parse.db := db;
+
+  FillChar(wInfoBuf, SizeOf(wInfoBuf), 0);
+  pWInfo := PWhereInfo(@wInfoBuf[0]);
+  pWInfo^.pParse := @parse;
+
+  FillChar(bld, SizeOf(bld), 0);
+  bld.pWInfo := pWInfo;
+  bld.iPlanLimit := 100;
+
+  FillChar(template, SizeOf(template), 0);
+  whereLoopInit(@template);
+  template.iTab := 1; template.iSortIdx := 0;
+  template.prereq := $0001;
+  template.rRun := 25; template.nOut := 10;
+  template.wsFlags := 0;
+
+  rc := whereLoopInsert(@bld, @template);
+  Check('INS1 first insert OK',              rc = SQLITE_OK);
+  Check('INS1 list has one loop',            (pWInfo^.pLoops <> nil)
+                                             and (pWInfo^.pLoops^.pNextLoop = nil));
+  Check('INS1 iPlanLimit decremented',       bld.iPlanLimit = 99);
+  Check('INS1 entry rRun',                   pWInfo^.pLoops^.rRun = 25);
+
+  { Identical-iTab worse template → discarded; list still has 1. }
+  template.rRun := 50; template.nOut := 20;
+  rc := whereLoopInsert(@bld, @template);
+  Check('INS2 worse discarded OK',           rc = SQLITE_OK);
+  count := 0; p := pWInfo^.pLoops;
+  while p <> nil do begin Inc(count); p := p^.pNextLoop; end;
+  Check('INS2 list still 1 entry',           count = 1);
+
+  { Better template → overwrites slot. }
+  template.rRun := 10; template.nOut := 5;
+  rc := whereLoopInsert(@bld, @template);
+  Check('INS3 better overwrites OK',         rc = SQLITE_OK);
+  count := 0; p := pWInfo^.pLoops;
+  while p <> nil do begin Inc(count); p := p^.pNextLoop; end;
+  Check('INS3 list still 1 entry',           count = 1);
+  Check('INS3 entry rRun=10',                pWInfo^.pLoops^.rRun = 10);
+
+  { Distinct iTab → appended. }
+  template.iTab := 2; template.prereq := $0002;
+  template.rRun := 18; template.nOut := 7;
+  rc := whereLoopInsert(@bld, @template);
+  Check('INS4 distinct iTab inserts OK',     rc = SQLITE_OK);
+  count := 0; p := pWInfo^.pLoops;
+  while p <> nil do begin Inc(count); p := p^.pNextLoop; end;
+  Check('INS4 list grew to 2',               count = 2);
+
+  { OrSet path: when pOrSet != nil, only OR-set updated; pLoops untouched. }
+  FillChar(orset, SizeOf(orset), 0);
+  bld.pOrSet := @orset;
+  template.iTab := 3; template.prereq := $0004;
+  template.rRun := 22; template.nOut := 8;
+  template.nLTerm := 1; { needed for whereOrInsert call }
+  rc := whereLoopInsert(@bld, @template);
+  Check('INS5 OrSet path OK',              rc = SQLITE_OK);
+  Check('INS5 OrSet recorded',             orset.n = 1);
+  Check('INS5 OrSet prereq',               orset.a[0].prereq = $0004);
+  bld.pOrSet := nil;
+
+  { Plan-limit exhaustion: setting limit to 0 yields SQLITE_DONE. }
+  bld.iPlanLimit := 0;
+  rc := whereLoopInsert(@bld, @template);
+  Check('INS6 plan-limit DONE',              rc = SQLITE_DONE);
+
+  { Cleanup: walk pLoops and delete each. }
+  pLoops := pWInfo^.pLoops;
+  while pLoops <> nil do
+  begin
+    p := pLoops; pLoops := p^.pNextLoop;
+    whereLoopDelete(db, p);
+  end;
+  pWInfo^.pLoops := nil;
+
+  sqlite3_close(db);
+end;
+
+{ ----- whereLoopAdjustCost ----- }
+
+procedure TestAdjustCost;
+var
+  p, tpl: TWhereLoop;
+  t1, t2, t3: TWhereTerm;
+  oldRRun, oldNOut: LogEst;
+begin
+  FillChar(t1, SizeOf(t1), 0); FillChar(t2, SizeOf(t2), 0); FillChar(t3, SizeOf(t3), 0);
+
+  { template not WHERE_INDEXED → no-op. }
+  InitLoopBare(@p); InitLoopBare(@tpl);
+  tpl.wsFlags := 0;
+  tpl.rRun := 50; tpl.nOut := 20;
+  oldRRun := tpl.rRun; oldNOut := tpl.nOut;
+  whereLoopAdjustCost(@p, @tpl);
+  Check('ADJ1 not-indexed unchanged',        (tpl.rRun = oldRRun) and (tpl.nOut = oldNOut));
+
+  { p is proper subset of tpl, p cheaper → tpl rRun & nOut adjusted DOWN. }
+  InitLoopBare(@p); InitLoopBare(@tpl);
+  p.iTab := 1; tpl.iTab := 1;
+  p.wsFlags := WHERE_INDEXED; tpl.wsFlags := WHERE_INDEXED;
+  p.rRun := 20; p.nOut := 5;
+  tpl.rRun := 50; tpl.nOut := 20;
+  p.aLTerm[0] := @t1; p.nLTerm := 1;
+  tpl.aLTerm[0] := @t1; tpl.aLTerm[1] := @t2; tpl.nLTerm := 2;
+  p.pNextLoop := nil;
+  whereLoopAdjustCost(@p, @tpl);
+  Check('ADJ2 tpl rRun adjusted down',       tpl.rRun = 20);
+  Check('ADJ2 tpl nOut adjusted down',       tpl.nOut <= 4);
+end;
+
+begin
+  WriteLn('---- TestWherePlanner ----');
+  TestOrSet;
+  TestCheaperProperSubset;
+  TestFindLesser;
+  TestInsert;
+  TestAdjustCost;
+  WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
+  if gFail > 0 then Halt(1);
+end.

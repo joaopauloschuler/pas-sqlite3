@@ -1578,6 +1578,20 @@ procedure sqlite3WhereEnd(pWInfo: PWhereInfo);
 procedure sqlite3WhereRightJoinLoop(pWInfo: PWhereInfo; iLevel: i32;
   pLevel: PWhereLevel);
 
+{ Phase 6.9-bis 11g.2.d sub-progress — planner-core helpers exposed for
+  the TestWherePlanner gate.  These are static in C; we promote the
+  declaration only so the gate can drive them in isolation. }
+procedure whereOrMove(pDest: PWhereOrSet; pSrc: PWhereOrSet);
+function  whereOrInsert(pSet: PWhereOrSet; prereq: Bitmask;
+                        rRun: LogEst; nOut: LogEst): i32;
+function  whereLoopCheaperProperSubset(pX: PWhereLoop; pY: PWhereLoop): i32;
+procedure whereLoopAdjustCost(p: PWhereLoop; pTemplate: PWhereLoop);
+function  whereLoopFindLesser(ppPrev: PPWhereLoop; pTemplate: PWhereLoop): PPWhereLoop;
+function  whereLoopInsert(pBuilder: PWhereLoopBuilder; pTemplate: PWhereLoop): i32;
+procedure whereLoopInit(p: PWhereLoop);
+procedure whereLoopClear(db: PTsqlite3; p: PWhereLoop);
+procedure whereLoopDelete(db: PTsqlite3; p: PWhereLoop);
+
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
 // ---------------------------------------------------------------------------
@@ -7231,6 +7245,268 @@ begin
     pWInfo^.pMemToFree := pNext;
   end;
   sqlite3DbNNFreeNN(db, pWInfo);
+end;
+
+{ ===========================================================================
+  Phase 6.9-bis step 11g.2.d sub-progress — planner-core leaf helpers.
+
+  Faithful port of where.c:196..239 (whereOrMove, whereOrInsert) and
+  where.c:2657..2938 (whereLoopCheaperProperSubset, whereLoopAdjustCost,
+  whereLoopFindLesser, whereLoopInsert).  These are pure planner
+  bookkeeping — no codegen — and run only once whereLoopAddBtree /
+  whereLoopAddOr / whereLoopAddAll start producing template loops in a
+  later 11g.2.d sub-progress.  Until then they are dead-code reachable
+  only from the gate test that exercises them in isolation.
+  =========================================================================== }
+
+{ Local LogEst min/max helpers — `LogEst` is i16. }
+function logEstMin(a, b: LogEst): LogEst; inline;
+begin
+  if a < b then Result := a else Result := b;
+end;
+
+function logEstMax(a, b: LogEst): LogEst; inline;
+begin
+  if a > b then Result := a else Result := b;
+end;
+
+{ Move the content of pSrc into pDest.  where.c:196..199. }
+procedure whereOrMove(pDest: PWhereOrSet; pSrc: PWhereOrSet);
+begin
+  pDest^.n := pSrc^.n;
+  if pDest^.n > 0 then
+    Move(pSrc^.a[0], pDest^.a[0], pDest^.n * SizeOf(TWhereOrCost));
+end;
+
+{ Try to insert a new prerequisite/cost entry into the WhereOrSet pSet.
+  The entry might overwrite an existing entry, be appended, or discarded.
+  pSet keeps the N_OR_COST best entries seen so far.  where.c:208..239. }
+function whereOrInsert(pSet: PWhereOrSet; prereq: Bitmask;
+                       rRun: LogEst; nOut: LogEst): i32;
+var
+  i: i32;
+  p: PWhereOrCost;
+  pBest: PWhereOrCost;
+  done: Boolean;
+begin
+  done := False;
+  p := @pSet^.a[0];
+  i := pSet^.n;
+  while i > 0 do
+  begin
+    if (rRun <= p^.rRun) and ((prereq and p^.prereq) = prereq) then
+    begin
+      done := True;
+      Break;
+    end;
+    if (p^.rRun <= rRun) and ((p^.prereq and prereq) = p^.prereq) then
+      Exit(0);
+    Dec(i);
+    Inc(p);
+  end;
+  if not done then
+  begin
+    if pSet^.n < N_OR_COST then
+    begin
+      p := @pSet^.a[pSet^.n];
+      Inc(pSet^.n);
+      p^.nOut := nOut;
+    end else begin
+      pBest := @pSet^.a[0];
+      for i := 1 to pSet^.n - 1 do
+        if pBest^.rRun > pSet^.a[i].rRun then pBest := @pSet^.a[i];
+      if pBest^.rRun <= rRun then Exit(0);
+      p := pBest;
+    end;
+  end;
+  p^.prereq := prereq;
+  p^.rRun   := rRun;
+  if p^.nOut > nOut then p^.nOut := nOut;
+  Result := 1;
+end;
+
+{ Return TRUE if pX is a "proper subset" of pY and pX is cheaper.  The
+  two cases match where.c:2620..2655 verbatim. }
+function whereLoopCheaperProperSubset(pX: PWhereLoop; pY: PWhereLoop): i32;
+var
+  i, j: i32;
+  found: Boolean;
+begin
+  if (pX^.rRun > pY^.rRun) and (pX^.nOut > pY^.nOut) then Exit(0); { (1d) and (2a) }
+  Assert((pX^.wsFlags and WHERE_VIRTUALTABLE) = 0);
+  Assert((pY^.wsFlags and WHERE_VIRTUALTABLE) = 0);
+  if (pX^.u.btree.nEq < pY^.u.btree.nEq)                       { (1b) }
+     and (pX^.u.btree.pIndex = pY^.u.btree.pIndex)             { (1a) }
+     and (pX^.nSkip = 0) and (pY^.nSkip = 0)                   { (1c) }
+  then
+    Exit(1); { Case 1 }
+  if (i32(pX^.nLTerm) - i32(pX^.nSkip)) >= (i32(pY^.nLTerm) - i32(pY^.nSkip)) then
+    Exit(0);                                                   { (2b) }
+  if pY^.nSkip > pX^.nSkip then Exit(0);                       { (2d) }
+  for i := i32(pX^.nLTerm) - 1 downto 0 do
+  begin
+    if pX^.aLTerm[i] = nil then Continue;
+    found := False;
+    for j := i32(pY^.nLTerm) - 1 downto 0 do
+      if pY^.aLTerm[j] = pX^.aLTerm[i] then
+      begin
+        found := True;
+        Break;
+      end;
+    if not found then Exit(0);                                 { (2c) }
+  end;
+  if ((pX^.wsFlags and WHERE_IDX_ONLY) <> 0)
+     and ((pY^.wsFlags and WHERE_IDX_ONLY) = 0) then
+    Exit(0);                                                   { (2e) }
+  Result := 1; { Case 2 }
+end;
+
+{ Adjust the cost / output of pTemplate to preserve the
+  cheaper-subset / costlier-superset invariants.  where.c:2703..2728. }
+procedure whereLoopAdjustCost(p: PWhereLoop; pTemplate: PWhereLoop);
+begin
+  if (pTemplate^.wsFlags and WHERE_INDEXED) = 0 then Exit;
+  while p <> nil do
+  begin
+    if p^.iTab = pTemplate^.iTab then
+    begin
+      if (p^.wsFlags and WHERE_INDEXED) <> 0 then
+      begin
+        if whereLoopCheaperProperSubset(p, pTemplate) <> 0 then
+        begin
+          pTemplate^.rRun := logEstMin(p^.rRun, pTemplate^.rRun);
+          pTemplate^.nOut := logEstMin(LogEst(p^.nOut - 1), pTemplate^.nOut);
+        end else if whereLoopCheaperProperSubset(pTemplate, p) <> 0 then
+        begin
+          pTemplate^.rRun := logEstMax(p^.rRun, pTemplate^.rRun);
+          pTemplate^.nOut := logEstMax(LogEst(p^.nOut + 1), pTemplate^.nOut);
+        end;
+      end;
+    end;
+    p := p^.pNextLoop;
+  end;
+end;
+
+{ Search the list at *ppPrev for an existing WhereLoop that pTemplate can
+  replace.  Returns nil if pTemplate should be discarded; otherwise the
+  link slot to update (which may dereference to nil to indicate append).
+  where.c:2744..2806. }
+function whereLoopFindLesser(ppPrev: PPWhereLoop; pTemplate: PWhereLoop): PPWhereLoop;
+var
+  p: PWhereLoop;
+  takeBreak: Boolean;
+begin
+  Result := ppPrev;
+  p := ppPrev^;
+  while p <> nil do
+  begin
+    if (p^.iTab <> pTemplate^.iTab) or (p^.iSortIdx <> pTemplate^.iSortIdx) then
+    begin
+      Result := @p^.pNextLoop;
+      p := p^.pNextLoop;
+      Continue;
+    end;
+    Assert((p^.rSetup = 0) or (pTemplate^.rSetup = 0)
+           or (p^.rSetup = pTemplate^.rSetup));
+    Assert(p^.rSetup >= pTemplate^.rSetup); { SETUP-INVARIANT }
+
+    takeBreak := False;
+    if ((p^.wsFlags and WHERE_AUTO_INDEX) <> 0)
+       and (pTemplate^.nSkip = 0)
+       and ((pTemplate^.wsFlags and WHERE_INDEXED) <> 0)
+       and ((pTemplate^.wsFlags and WHERE_COLUMN_EQ) <> 0)
+       and ((p^.prereq and pTemplate^.prereq) = pTemplate^.prereq) then
+      takeBreak := True;
+
+    if not takeBreak then
+    begin
+      if ((p^.prereq and pTemplate^.prereq) = p^.prereq)
+         and (p^.rSetup <= pTemplate^.rSetup)
+         and (p^.rRun   <= pTemplate^.rRun)
+         and (p^.nOut   <= pTemplate^.nOut)
+      then
+        Exit(nil); { discard pTemplate }
+      if ((p^.prereq and pTemplate^.prereq) = pTemplate^.prereq)
+         and (p^.rRun >= pTemplate^.rRun)
+         and (p^.nOut >= pTemplate^.nOut)
+      then begin
+        Assert(p^.rSetup >= pTemplate^.rSetup);
+        takeBreak := True;
+      end;
+    end;
+    if takeBreak then Break;
+    Result := @p^.pNextLoop;
+    p := p^.pNextLoop;
+  end;
+end;
+
+{ Insert or replace a WhereLoop using pTemplate.  where.c:2832..2938.
+  May return SQLITE_DONE when the planner search limit is exhausted. }
+function whereLoopInsert(pBuilder: PWhereLoopBuilder; pTemplate: PWhereLoop): i32;
+var
+  pWInfo:  PWhereInfo;
+  db:      PTsqlite3;
+  ppPrev:  PPWhereLoop;
+  ppTail:  PPWhereLoop;
+  p:       PWhereLoop;
+  pToDel:  PWhereLoop;
+  pIndex:  PIndex2;
+  rc:      i32;
+begin
+  pWInfo := pBuilder^.pWInfo;
+  db     := pWInfo^.pParse^.db;
+
+  if pBuilder^.iPlanLimit = 0 then
+  begin
+    if pBuilder^.pOrSet <> nil then pBuilder^.pOrSet^.n := 0;
+    Exit(SQLITE_DONE);
+  end;
+  Dec(pBuilder^.iPlanLimit);
+
+  whereLoopAdjustCost(pWInfo^.pLoops, pTemplate);
+
+  if pBuilder^.pOrSet <> nil then
+  begin
+    if pTemplate^.nLTerm <> 0 then
+      whereOrInsert(pBuilder^.pOrSet, pTemplate^.prereq,
+                    pTemplate^.rRun, pTemplate^.nOut);
+    Exit(SQLITE_OK);
+  end;
+
+  ppPrev := whereLoopFindLesser(@pWInfo^.pLoops, pTemplate);
+  if ppPrev = nil then Exit(SQLITE_OK); { existing entry better — discard }
+  p := ppPrev^;
+
+  if p = nil then
+  begin
+    p := PWhereLoop(sqlite3DbMallocRawNN(db, SizeOf(TWhereLoop)));
+    if p = nil then Exit(SQLITE_NOMEM_BKPT);
+    ppPrev^ := p;
+    whereLoopInit(p);
+    p^.pNextLoop := nil;
+  end else begin
+    { Sweep the rest of the list and remove any entries also supplanted. }
+    ppTail := @p^.pNextLoop;
+    while ppTail^ <> nil do
+    begin
+      ppTail := whereLoopFindLesser(ppTail, pTemplate);
+      if ppTail = nil then Break;
+      pToDel := ppTail^;
+      if pToDel = nil then Break;
+      ppTail^ := pToDel^.pNextLoop;
+      whereLoopDelete(db, pToDel);
+    end;
+  end;
+
+  rc := whereLoopXfer(db, p, pTemplate);
+  if (p^.wsFlags and WHERE_VIRTUALTABLE) = 0 then
+  begin
+    pIndex := p^.u.btree.pIndex;
+    { idxType lives in the low 2 bits of idxFlags (sqliteInt.h). }
+    if (pIndex <> nil) and ((pIndex^.idxFlags and 3) = SQLITE_IDXTYPE_IPK) then
+      p^.u.btree.pIndex := nil;
+  end;
+  Result := rc;
 end;
 
 { Helper for exprIsDeterministic (where.c:6445).  TK_FUNCTION nodes without

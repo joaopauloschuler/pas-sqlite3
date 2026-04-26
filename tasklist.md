@@ -143,6 +143,22 @@ Important: At the end of this document, please find:
     sub-splitting once 11g.2.a..c reveal field-shape requirements.
     Defer `xBestIndex`-style virtual-table costing until vtab corpus
     is exercised.
+    - [X] Leaf bookkeeping helpers — `whereOrMove`, `whereOrInsert`
+      (where.c:196..239), `whereLoopCheaperProperSubset`,
+      `whereLoopAdjustCost`, `whereLoopFindLesser`, `whereLoopInsert`
+      (where.c:2657..2938).  These are the planner's ranking /
+      replacement / OR-set bookkeeping primitives — pure cost & mask
+      arithmetic, no codegen.  `whereLoopInsert` honours both the
+      `pBuilder^.pOrSet` short path (used by OR-clause processing) and
+      the full `pLoops` link-walk that overwrites or supplants existing
+      WhereLoops via `whereLoopFindLesser`.  Plan-limit exhaustion
+      returns SQLITE_DONE.  Gate: `TestWherePlanner.pas` (48/48):
+      OR1..OR7 (whereOrInsert dominate / subsume / evict + whereOrMove
+      copy), CPS1..CPS5 (case-1 vs case-2, cost guard, term-mismatch),
+      FL1..FL3 (unrelated tail slot, discard, replace candidate),
+      INS1..INS6 (first insert / worse-discard / better-overwrite /
+      distinct-iTab append / OrSet path / plan-limit DONE),
+      ADJ1..ADJ2 (no-op when not indexed, downward adjust on subset).
 
 - [ ] **6.9-bis 11g.2.e** Port `wherecode.c` (~2945 lines) —
     per-loop inner-body codegen.  Public surface:
