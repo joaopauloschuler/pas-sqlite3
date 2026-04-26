@@ -1692,6 +1692,12 @@ function sqlite3ExprAddCollateToken(pParse: PParse; p: PExpr;
 function sqlite3ExprAddCollateString(pParse: PParse; p: PExpr;
   zC: PAnsiChar): PExpr;
 
+{ Expr codegen — literal-only port (Phase 6.9-bis step 11d).
+  Handles TK_INTEGER / TK_NULL / TK_STRING / TK_REGISTER — the four arms
+  exercised by sqlite3NestedParse-generated INSERTs.  Any other op falls
+  through to OP_Null with a TODO marker. }
+procedure sqlite3ExprCode(pParse: PParse; pExpr: PExpr; target: i32);
+
 { Misc expr helpers }
 function  sqlite3ExprIsVector(const pExpr: PExpr): i32;
 function  sqlite3ExprVectorSize(const pExpr: PExpr): i32;
@@ -3533,6 +3539,72 @@ begin
       Result := ExprListItems(Result^.x.pList)^.pExpr
     else
       Break;
+  end;
+end;
+
+{ sqlite3ExprCode — literal-only port of expr.c:5884 (Phase 6.9-bis step 11d).
+
+  Generates code that evaluates pExpr and stores the result in register
+  `target`.  C reference dispatches to sqlite3ExprCodeTarget which returns
+  the actual register holding the value, then OP_Copy/OP_SCopy's it into
+  `target` if they differ.  This port implements only the four expression
+  kinds reached by the schema-row INSERT/UPDATE/DELETE statements that
+  sqlite3NestedParse hands us:
+
+    * TK_INTEGER   -> OP_Integer(value, target)        (EP_IntValue path only)
+    * TK_NULL      -> OP_Null(0, target, 0)
+    * TK_STRING    -> sqlite3VdbeLoadString(target, zToken)  -> OP_String8
+    * TK_REGISTER  -> OP_Copy(iTable, target, 0)       (matches C's choice of
+                       OP_Copy because pExpr->op == TK_REGISTER)
+
+  Any other op falls through to OP_Null + TODO marker — matches the C
+  default arm (which is already a "be nice and don't crash" fallback). }
+procedure sqlite3ExprCode(pParse: PParse; pExpr: PExpr; target: i32);
+var
+  v:     PVdbe;
+  inReg: i32;
+  op:    u8;
+  pX:    PExpr;
+begin
+  v := pParse^.pVdbe;
+  if v = nil then Exit;
+  if pExpr = nil then begin
+    sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+    Exit;
+  end;
+
+  inReg := target;
+  case pExpr^.op of
+    TK_INTEGER:
+      begin
+        if (pExpr^.flags and EP_IntValue) <> 0 then
+          sqlite3VdbeAddOp2(v, OP_Integer, pExpr^.u.iValue, target)
+        else
+          { Non-EP_IntValue integer literals (oversize / hex) need
+            sqlite3DecOrHexToI64 + OP_Int64 — TODO(Phase 6.x). }
+          sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+      end;
+    TK_NULL:
+      sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+    TK_STRING:
+      sqlite3VdbeLoadString(v, target, pExpr^.u.zToken);
+    TK_REGISTER:
+      inReg := pExpr^.iTable;
+  else
+    { TODO(Phase 6.x): full sqlite3ExprCodeTarget dispatch.  For now the
+      C-default "emit Null and don't crash" behaviour. }
+    sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+  end;
+
+  if inReg <> target then
+  begin
+    pX := sqlite3ExprSkipCollateAndLikely(pExpr);
+    if (pX <> nil)
+       and (((pX^.flags and EP_Subquery) <> 0) or (pX^.op = TK_REGISTER)) then
+      op := OP_Copy
+    else
+      op := OP_SCopy;
+    sqlite3VdbeAddOp2(v, op, inReg, target);
   end;
 end;
 

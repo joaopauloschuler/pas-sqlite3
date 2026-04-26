@@ -20,6 +20,100 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 11d): literal-only
+    `sqlite3ExprCode` port (expr.c:5884).**  Adds the four-arm
+    `sqlite3ExprCode(pParse, pExpr, target)` helper covering exactly
+    the expression kinds reached by `sqlite3NestedParse`-generated
+    schema-row INSERT/UPDATE/DELETE statements: `TK_INTEGER`
+    (EP_IntValue path → `OP_Integer`), `TK_NULL` (`OP_Null`),
+    `TK_STRING` (`sqlite3VdbeLoadString` → `OP_String8`), and
+    `TK_REGISTER` (returns `pExpr^.iTable` then OP_Copy/OP_SCopy
+    into target via the post-dispatch tail).  Default arm emits the
+    C-reference "be nice and don't crash" `OP_Null` fallback.
+    [X]
+
+    Concrete changes (all in `src/passqlite3codegen.pas`):
+      * Interface: new decl `procedure sqlite3ExprCode(pParse: PParse;
+        pExpr: PExpr; target: i32)` placed alongside other Expr*
+        helpers (codegen.pas:1696 area).
+      * Implementation: literal-only body inserted after
+        `sqlite3ExprSkipCollateAndLikely` (codegen.pas:3545 area).
+        Mirrors the C dispatch shape: `inReg := target` default;
+        case on `pExpr^.op`; for TK_REGISTER bumps `inReg :=
+        pExpr^.iTable`; tail copies `inReg → target` via OP_Copy
+        when `pX^.op = TK_REGISTER` or EP_Subquery is set, else
+        OP_SCopy.  Matches `sqlite3ExprCode` (expr.c:5884) +
+        `sqlite3ExprCodeTarget` (expr.c:5089/5104/5121/5147) byte-
+        for-byte for the four-arm subset.
+
+    Tests: full build clean.  TestExplainParity unchanged at
+    **2 PASS / 8 DIVERGE / 0 ERROR** (expected — `sqlite3ExprCode`
+    is not yet *called* by anything productive: `sqlite3Insert` is
+    still the structural skeleton from step 11c that bails out
+    before the VALUES emission loop with a TODO).  Regression
+    spot check (2026-04-26): TestPrepareBasic 20/20, TestParser
+    45/45, TestParserSmoke 20/20, TestSchemaBasic 44/44,
+    TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+    TestExprBasic 40/40, TestVdbeTxn 8/8, TestAuthBuiltins 34/34,
+    TestOpenClose 17/17, TestSmoke + TestUtil clean, TestJson
+    434/434, TestJsonEach 50/50, TestJsonRegister 48/48,
+    TestPrintf 105/105, TestVtab 216/216.
+
+    Discoveries / next-step notes:
+      * **Why a 70-line port of a 22-line C function.**  The C
+        `sqlite3ExprCode` body is two layers — it calls
+        `sqlite3ExprCodeTarget` (a 700-line dispatcher) for the
+        actual codegen, then patches the result-register copy.
+        Porting `sqlite3ExprCodeTarget` whole would drag in TK_AGG_*,
+        TK_FUNCTION, TK_IN, TK_CASE, TK_SELECT and a dozen helper
+        Targets that aren't yet ported.  The four-arm inline
+        dispatch keeps the surface scoped to exactly what the
+        productive path needs today, without entangling Phase-7
+        expr semantics.
+      * **TK_REGISTER tail emits OP_Copy not OP_SCopy.**  The
+        original step-plan in 11c's notes said TK_REGISTER would
+        be OP_SCopy; verifying against expr.c:5896..5902 shows the
+        C reference picks OP_Copy when `pX^.op = TK_REGISTER`
+        (because a register source means a real value was already
+        materialised — OP_SCopy is a "shallow" copy that aliases
+        Mem.flags, dangerous for live operands).  The Pascal port
+        matches the C choice.  Plan-note in step 11c was off by one
+        opcode; the actual port follows the C reference verbatim.
+      * **EP_IntValue gate on TK_INTEGER.**  Schema-row INSERTs
+        from `sqlite3NestedParse` use `#%d` (TK_REGISTER) for
+        integer references and never embed integer literals, so
+        the EP_IntValue arm is the only one that needs to fire
+        productively.  The non-EP_IntValue path (oversized literals
+        / hex literals) is left as a TODO routed to `OP_Null` —
+        same defensive choice as the C default arm.  Wiring real
+        `OP_Int64` + `sqlite3DecOrHexToI64` is a Phase 6.x
+        cleanup; no current test exercises it.
+      * **Fall-through default emits OP_Null on purpose.**  Mirrors
+        the C reference at expr.c:5115..5123 — the comment there is
+        explicit: "Make NULL the default case so that if a bug
+        causes an illegal Expr node to be passed into this function,
+        it will be handled sanely and not crash."  Kept as-is.
+      * **Next 6.9-bis target: step 11e — wire `sqlite3ExprCode`
+        into the `sqlite3Insert` single-row VALUES path.**  With
+        the literal helper in hand, the TODO block at
+        codegen.pas:5544..5556 becomes:
+          - `sqlite3OpenTable(pParse, 0, iDb, pTab, OP_OpenWrite)`
+            for cursor 0 against the schema btree (or
+            `sqlite3OpenSchemaTable` for the iDb=ENC_TABLE case);
+          - `for i := 0 to nColumn-1 do sqlite3ExprCode(pParse,
+             ExprListItems(pList)^[i].pExpr, regData+i)`;
+          - `sqlite3VdbeAddOp2(v, OP_NewRowid, 0, regRowid)`;
+          - `sqlite3VdbeAddOp3(v, OP_MakeRecord, regData,
+             pTab^.nCol, regOut)` + `sqlite3SetMakeRecordP5`;
+          - `sqlite3VdbeAddOp3(v, OP_Insert, 0, regOut, regRowid)`
+            with P5 = `OPFLAG_NCHANGE | OPFLAG_LASTROWID |
+                      OPFLAG_APPEND | OPFLAG_USESEEKRESULT`.
+        That should flip the `CREATE INDEX` and `DROP INDEX` rows
+        in TestExplainParity from DIVERGE to a partial-match (still
+        missing the OpenWrite + ParseSchema tail emitted by
+        sqlite3CreateIndex itself, but those scaffolds are already
+        present from step 8).
+
   - **2026-04-26 — Phase 6.9-bis (step 11c): structural skeleton of
     `sqlite3Insert` (insert.c:894).**  Replaces the 5-line free-only
     Phase 6.4 stub at `passqlite3codegen.pas:5405` with a faithful
