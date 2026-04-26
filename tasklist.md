@@ -21,6 +21,62 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    productive sqlite3WhereEnd cleanup contract.**  Second sub-progress
+    landing inside step 11g.2.b.  Replaces the empty `sqlite3WhereEnd`
+    stub at `passqlite3codegen.pas:4360..4365` with the productive
+    cleanup body the prior bookkeeping-primitives commit was built to
+    support: when `pWInfo <> nil`, delegate to
+    `whereInfoFree(pWInfo^.pParse^.db, pWInfo)` (which walks pLoops,
+    walks pMemToFree, clears the WhereClause, and frees the WhereInfo
+    itself).  Step 11g.2.b stays `[ ]` because the productive
+    `sqlite3WhereBegin` body and the OP_NotExists-pattern emission
+    still need to land — those are the remaining gates for flipping
+    the 5 CREATE TABLE rows in TestExplainParity.
+
+    Concrete changes:
+      * `passqlite3codegen.pas:4360..4378` — `sqlite3WhereEnd` body
+        replaced.  Stub returned immediately; productive body now
+        guards on `pWInfo <> nil` and forwards to `whereInfoFree`.
+        Header comment documents what's still missing (the
+        loop-termination opcode emission, SKIPAHEAD_DISTINCT seeks,
+        IN-LOOP unwind, LEFT JOIN null-row fixup) and which sub-task
+        each lands in (11g.2.b productive WhereBegin / 11g.2.e
+        wherecode.c port).
+
+    Why this is safe to land alone:
+      * Stub `sqlite3WhereBegin` still returns `nil` for every shape
+        in the corpus, so the `pWInfo <> nil` guard turns every
+        existing call site into a no-op — no observable behaviour
+        change anywhere.
+      * Once productive WhereBegin starts allocating WhereInfo, every
+        error path and every successful pairing automatically gets
+        proper teardown without further WhereEnd edits.
+
+    Test status: full build clean (no new warnings), regression sweep
+    all green — TestWhereBasic 52/52, TestWhereStructs 148/148,
+    TestPrepareBasic 20/20, TestParser 45/45, TestSchemaBasic 44/44,
+    TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+    TestExprBasic 40/40, TestInitCallback 29/29, TestExplainParity
+    unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **Cleanup contract is now decoupled from emission contract.**
+        The two halves of `sqlite3WhereEnd` (resource cleanup +
+        loop-termination opcode emission) can now land independently.
+        This commit lands the cleanup half; the emission half lands
+        with the productive WhereBegin in the next 11g.2.b sub-progress
+        commit.
+      * **Next 6.9-bis target (still 11g.2.b): productive
+        `sqlite3WhereBegin` for the single-table rowid-EQ shape.**
+        Allocate WhereInfo (nLevel=1), init iEndWhere / iContinue /
+        iBreak labels, detect-and-reuse the table cursor opened by
+        the caller, emit `OP_NotExists` against the rowid expression
+        resolved out of `pWhere`, fall through to body.  Then
+        re-enable the productive tails in `sqlite3DeleteFrom`
+        (codegen.pas:5460..5471) and `sqlite3Update`
+        (codegen.pas:5660..5670).
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     WhereLoop / WhereInfo bookkeeping primitives.**  First productive
     landing inside step 11g.2.b — the bookkeeping plumbing the rest of
     the vertical slice will hang off.  Faithful port of where.c:2527..
@@ -7913,8 +7969,25 @@ Phase 5.9 depends on this being done first.
       and per-loop transfer/delete during planner walk has the
       bookkeeping it needs.
 
-      **Remaining sub-task:** the actual productive WhereBegin / End
-      single-table, single-rowid-EQ-predicate case (full description below).
+      **Sub-progress (landed 2026-04-26 — productive WhereEnd cleanup
+      contract):** replaced the empty `sqlite3WhereEnd` stub at
+      `passqlite3codegen.pas:4360..4378` with the productive teardown
+      body — `if pWInfo <> nil then whereInfoFree(pWInfo^.pParse^.db,
+      pWInfo)`.  Pairs cleanly with the still-stub WhereBegin (which
+      returns nil): the `pWInfo <> nil` guard makes this a no-op for
+      every existing call site, so no observable behaviour change in
+      the corpus, full regression sweep stays green.  Once productive
+      WhereBegin starts allocating WhereInfo, every error path and
+      every successful pairing gets proper teardown without further
+      WhereEnd edits.  The other half of where.c's real
+      `sqlite3WhereEnd` (loop-termination opcode emission,
+      SKIPAHEAD_DISTINCT seeks, IN-LOOP unwind, LEFT JOIN null-row
+      fixup) still needs to land alongside the productive WhereBegin
+      below / the 11g.2.e `wherecode.c` port.
+
+      **Remaining sub-task:** the actual productive WhereBegin
+      single-table, single-rowid-EQ-predicate case + WhereEnd's
+      loop-termination opcode emission (full description below).
 
       ----
 

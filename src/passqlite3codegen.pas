@@ -4359,9 +4359,23 @@ end;
 
 procedure sqlite3WhereEnd(pWInfo: PWhereInfo);
 begin
-  { Phase 6.2 stub — pairs with sqlite3WhereBegin.  When 11g.2.b lands its
-    productive WhereBegin, this body becomes:
-      if pWInfo <> nil then whereInfoFree(pWInfo^.pParse^.db, pWInfo); }
+  { Phase 6.9-bis step 11g.2.b — productive cleanup contract.
+
+    Stub WhereBegin still returns nil for every shape in the corpus, so this
+    is a no-op in practice today.  But the contract is now complete: once
+    WhereBegin starts allocating a WhereInfo (single-table rowid-EQ slice or
+    later), every error path and every successful pairing automatically gets
+    the proper teardown — pLoops walk + pMemToFree walk + WhereClause clear
+    + WhereInfo free, all delegated to whereInfoFree (where.c:2615).
+
+    where.c's real sqlite3WhereEnd does much more (loop-termination opcode
+    emission, SKIPAHEAD_DISTINCT seeks, IN-LOOP unwind, LEFT JOIN null-row
+    fixup, …); those land alongside the productive WhereBegin in 11g.2.b /
+    11g.2.e.  This minimal body covers only the resource-cleanup half of
+    the contract, which is what the bookkeeping primitives in step 11g.2.b
+    (sub-progress) were built to support. }
+  if pWInfo <> nil then
+    whereInfoFree(pWInfo^.pParse^.db, pWInfo);
 end;
 
 procedure sqlite3WhereRightJoinLoop(pWInfo: PWhereInfo; iLevel: i32;
