@@ -82,10 +82,19 @@ Important: At the end of this document, please find:
       Gate: `TestWhereExpr.pas` T9a..T9b (whereNthSubterm), T10a..T10e
       ("a<5 OR a=5" → virtual TK_LE term), T11a (incompatible
       "a<5 OR a>5" leaves pWC untouched). 48/48.
-    - [ ] OR / LIKE virtual-term synthesis (whereexpr.c:1315..1455),
-      `isLikeOrGlob`, `exprAnalyzeOrTerm`, `termIsEquivalence`
-      — still deferred (`isLikeOrGlob` needs `sqlite3ExprAddCollateString`
-      + ICU collation tables; `termIsEquivalence` needs
+    - [X] `exprAnalyzeOrTerm` (whereexpr.c:689..945) — TK_OR shatter
+      into disjuncts, per-disjunct AND-decomposition, indexable bitmask
+      synthesis (case 3), two-way disjunct collapse via
+      `whereCombineDisjuncts` (case 2), and case-1 conversion of
+      "col=A OR col=B …" into a virtual `col IN (A,B,…)` term tagged
+      TERM_VIRTUAL|TERM_DYNAMIC.  Wired into `exprAnalyze`'s top-level
+      OR-arm.  Gate: `TestWhereExpr.pas` T12a..T12k (case-1 IN
+      synthesis on rowid OR), T13a..T13c (column-mismatched OR keeps
+      ORINFO but skips the IN promotion).  62/62.
+    - [ ] LIKE / GLOB virtual-term synthesis (whereexpr.c:1362..1455),
+      `isLikeOrGlob`, `termIsEquivalence` — still deferred
+      (`isLikeOrGlob` needs `sqlite3ExprAddCollateString` + ICU
+      collation tables; `termIsEquivalence` needs
       `sqlite3ExprCollSeqMatch` + `SQLITE_Transitive`).
       `whereCommuteOperator` is the C-side `exprCommute`, already landed
       in 11g.2.b sub-progress.

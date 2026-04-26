@@ -84,6 +84,11 @@ var
   pTermA, pTermB: PWhereTerm;
   pSubA, pSubB, pSubC: PWhereTerm;
   iCombIdx, nTermBefore: i32;
+  pColA, pColB, pIntA, pIntB, pEqA, pEqB, pOr: PExpr;
+  iOrIdx: i32;
+  pOrInfo3: PWhereOrInfo;
+  pColC, pColD, pIntC, pIntD, pEqC, pEqD, pOr2: PExpr;
+  iOrIdx2: i32;
 
 begin
   WriteLn('=== TestWhereExpr — Phase 6.9-bis 11g.2.c whereexpr helpers ===');
@@ -351,6 +356,84 @@ begin
 
   Dispose(pTermA);
   Dispose(pTermB);
+
+  { ---- T12: exprAnalyzeOrTerm — "rowid=1 OR rowid=2" must (a) tag the
+            outer term TERM_ORINFO with eOperator=WO_OR, leftCursor=-1,
+            and (b) synthesize a virtual TK_IN child via case-1
+            (whereexpr.c:911..944).  The OR term itself is shattered
+            into two disjunct terms held inside pOrInfo^.wc. ---- }
+  pColA := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColA^.iTable := 0; pColA^.iColumn := -1;
+  pIntA := sqlite3ExprInt32(db, 1);
+  pEqA  := sqlite3PExpr(@parse, TK_EQ, pColA, pIntA);
+
+  pColB := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColB^.iTable := 0; pColB^.iColumn := -1;
+  pIntB := sqlite3ExprInt32(db, 2);
+  pEqB  := sqlite3PExpr(@parse, TK_EQ, pColB, pIntB);
+
+  pOr := sqlite3PExpr(@parse, TK_OR, pEqA, pEqB);
+  iOrIdx := pWC^.nTerm;
+  whereClauseInsert(pWC, pOr, 0);
+  exprAnalyze(pSrc, pWC, iOrIdx);
+
+  Check('T12a OR term tagged TERM_ORINFO',
+        (pWC^.a[iOrIdx].wtFlags and TERM_ORINFO) <> 0);
+  Check('T12b OR term eOperator = WO_OR',
+        (pWC^.a[iOrIdx].eOperator and WO_OR) <> 0);
+  Check('T12c OR term leftCursor = -1',
+        pWC^.a[iOrIdx].leftCursor = -1);
+  pOrInfo3 := pWC^.a[iOrIdx].u.pOrInfo;
+  Check('T12d pOrInfo allocated',
+        pOrInfo3 <> nil);
+  Check('T12e pOrInfo.wc has 2 disjunct subterms',
+        (pOrInfo3 <> nil) and (pOrInfo3^.wc.nTerm = 2));
+  Check('T12f pOrInfo.wc.op = TK_OR',
+        (pOrInfo3 <> nil) and (pOrInfo3^.wc.op = TK_OR));
+  Check('T12g pOrInfo.indexable bit 0 set (rowid cursor 0)',
+        (pOrInfo3 <> nil) and ((pOrInfo3^.indexable and 1) <> 0));
+  Check('T12h pWC^.hasOr set',
+        pWC^.hasOr = 1);
+  { Case-1 should append a virtual TK_IN term beyond the OR; iOrIdx+1
+    is the synthesized child (markTermAsChild links it back). }
+  Check('T12i virtual TK_IN child appended',
+        (pWC^.nTerm > iOrIdx + 1)
+        and (pWC^.a[iOrIdx + 1].pExpr^.op = TK_IN));
+  Check('T12j virtual term wtFlags has VIRTUAL|DYNAMIC',
+        (pWC^.nTerm > iOrIdx + 1)
+        and ((pWC^.a[iOrIdx + 1].wtFlags
+              and (TERM_VIRTUAL or TERM_DYNAMIC))
+             = (TERM_VIRTUAL or TERM_DYNAMIC)));
+  Check('T12k virtual TK_IN term iParent = OR idx',
+        (pWC^.nTerm > iOrIdx + 1)
+        and (pWC^.a[iOrIdx + 1].iParent = iOrIdx));
+
+  { ---- T13: exprAnalyzeOrTerm with mismatched columns —
+            "(c0=1) OR (rowid=2)" cannot collapse into a single IN
+            (different leftColumn), so case-1 must NOT run.  pOrInfo
+            still tags the outer term, but no virtual TK_IN child is
+            appended. ---- }
+  pColC := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColC^.iTable := 0; pColC^.iColumn := 0;          { col 0 }
+  pIntC := sqlite3ExprInt32(db, 1);
+  pEqC  := sqlite3PExpr(@parse, TK_EQ, pColC, pIntC);
+
+  pColD := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColD^.iTable := 0; pColD^.iColumn := -1;         { rowid }
+  pIntD := sqlite3ExprInt32(db, 2);
+  pEqD  := sqlite3PExpr(@parse, TK_EQ, pColD, pIntD);
+
+  pOr2 := sqlite3PExpr(@parse, TK_OR, pEqC, pEqD);
+  iOrIdx2     := pWC^.nTerm;
+  nTermBefore := pWC^.nTerm;
+  whereClauseInsert(pWC, pOr2, 0);
+  exprAnalyze(pSrc, pWC, iOrIdx2);
+  Check('T13a OR term still tagged TERM_ORINFO',
+        (pWC^.a[iOrIdx2].wtFlags and TERM_ORINFO) <> 0);
+  Check('T13b OR term still gets WO_OR',
+        (pWC^.a[iOrIdx2].eOperator and WO_OR) <> 0);
+  Check('T13c no virtual TK_IN appended for column-mismatched OR',
+        pWC^.nTerm = nTermBefore + 1);
 
   { Skip sqlite3WhereClauseClear / sqlite3DbFree for the synthetic
     WhereInfo: pWC^.a was allocated through sqlite3WhereMalloc and is

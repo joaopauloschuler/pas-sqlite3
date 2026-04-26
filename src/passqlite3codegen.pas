@@ -5665,6 +5665,308 @@ begin
   end;
 end;
 
+{ Analyze a TK_OR top-level WhereTerm.  Faithful port of whereexpr.c:689..945
+  (`exprAnalyzeOrTerm`).  The OR-clause is shattered into its constituent
+  disjuncts, each disjunct is recursively split into AND-conjuncts, every
+  leaf is run through sqlite3WhereExprAnalyze, and three independent
+  optimisations are then attempted:
+
+    case 1.  If every disjunct is "table.col == expr" against the same
+             (table, col), rewrite the OR into a virtual "col IN (...)"
+             so the planner can drive an index probe instead of a full
+             table scan.
+
+    case 2.  For two-way ORs, try whereCombineDisjuncts on every cross
+             pair so "x<5 OR x=5" collapses to the single virtual term
+             "x<=5".
+
+    case 3.  pOrInfo->indexable records the set of tables that *could*
+             satisfy the OR by indexed lookup; the planner consults this
+             bitmask when costing OR-of-AND chains.
+
+  Inputs:
+    pSrc      — FROM clause (passed through to recursive analyzers)
+    pWC       — outer WhereClause that owns idxTerm
+    idxTerm   — index of the OR term within pWC^.a[]
+
+  Side effects:
+    pTerm^.u.pOrInfo allocated, TERM_ORINFO set on pTerm^.wtFlags.
+    pTerm^.eOperator forced to WO_OR; leftCursor set to -1.
+    pWC^.hasOr set when at least one table is indexable.
+    Possibly inserts a virtual TK_IN term at the tail of pWC. }
+function allowedOp(op: i32): i32; forward;
+
+procedure exprAnalyzeOrTerm(pSrc: PSrcList; pWC: PWhereClause; idxTerm: i32);
+var
+  pWInfo:    PWhereInfo;
+  pPrs:      PParse;
+  db:        PTsqlite3;
+  pTerm:     PWhereTerm;
+  pX:        PExpr;
+  pOrWc:     PWhereClause;
+  pOrTerm:   PWhereTerm;
+  pOrInfo:   PWhereOrInfo;
+  pAndInfo:  PWhereAndInfo;
+  pAndWC:    PWhereClause;
+  pAndTerm:  PWhereTerm;
+  chngToIN:  Bitmask;
+  indexable: Bitmask;
+  b:         Bitmask;
+  pOther:    PWhereTerm;
+  i, j:      i32;
+  iOne, iTwo: i32;
+  pOne, pTwo: PWhereTerm;
+  okToChngToIN: i32;
+  iColumn:   i32;
+  iCursor:   i32;
+  pLeft:     PExpr;
+  pDup:      PExpr;
+  pNew:      PExpr;
+  pList:     PExprList;
+  affLeft, affRight: AnsiChar;
+  idxNew:    i32;
+begin
+  pWInfo := pWC^.pWInfo;
+  pPrs   := pWInfo^.pParse;
+  db     := pPrs^.db;
+  pTerm  := @pWC^.a[idxTerm];
+  pX     := pTerm^.pExpr;
+
+  { Break the OR clause into its separate subterms.  The subterms are
+    stored in a WhereClause structure attached to the OR term via the
+    newly allocated WhereOrInfo object (whereexpr.c:706..722). }
+  Assert((pTerm^.wtFlags
+          and (TERM_DYNAMIC or TERM_ORINFO or TERM_ANDINFO)) = 0);
+  Assert(pX^.op = TK_OR);
+  pOrInfo := PWhereOrInfo(sqlite3DbMallocZero(db, SizeOf(TWhereOrInfo)));
+  pTerm^.u.pOrInfo := pOrInfo;
+  if pOrInfo = nil then Exit;
+  pTerm^.wtFlags := pTerm^.wtFlags or TERM_ORINFO;
+  pOrWc := @pOrInfo^.wc;
+  FillChar(pOrWc^.aStatic, SizeOf(pOrWc^.aStatic), 0);
+  sqlite3WhereClauseInit(pOrWc, pWInfo);
+  sqlite3WhereSplit(pOrWc, pX, TK_OR);
+  sqlite3WhereExprAnalyze(pSrc, pOrWc);
+  if db^.mallocFailed <> 0 then Exit;
+  Assert(pOrWc^.nTerm >= 2);
+
+  { Compute the set of tables that might satisfy cases 1 or 3
+    (whereexpr.c:724..779). }
+  indexable := not Bitmask(0);
+  chngToIN  := not Bitmask(0);
+  i := pOrWc^.nTerm - 1;
+  pOrTerm := pOrWc^.a;
+  while (i >= 0) and (indexable <> 0) do
+  begin
+    if (pOrTerm^.eOperator and WO_SINGLE) = 0 then
+    begin
+      Assert((pOrTerm^.wtFlags and (TERM_ANDINFO or TERM_ORINFO)) = 0);
+      chngToIN := 0;
+      pAndInfo := PWhereAndInfo(sqlite3DbMallocRawNN(db,
+                    SizeOf(TWhereAndInfo)));
+      if pAndInfo <> nil then
+      begin
+        b := 0;
+        pOrTerm^.u.pAndInfo := pAndInfo;
+        pOrTerm^.wtFlags    := pOrTerm^.wtFlags or TERM_ANDINFO;
+        pOrTerm^.eOperator  := u16(WO_AND);
+        pOrTerm^.leftCursor := -1;
+        pAndWC := @pAndInfo^.wc;
+        FillChar(pAndWC^.aStatic, SizeOf(pAndWC^.aStatic), 0);
+        sqlite3WhereClauseInit(pAndWC, pWC^.pWInfo);
+        sqlite3WhereSplit(pAndWC, pOrTerm^.pExpr, TK_AND);
+        sqlite3WhereExprAnalyze(pSrc, pAndWC);
+        pAndWC^.pOuter := pWC;
+        if db^.mallocFailed = 0 then
+        begin
+          j := 0;
+          pAndTerm := pAndWC^.a;
+          while j < pAndWC^.nTerm do
+          begin
+            Assert(pAndTerm^.pExpr <> nil);
+            if (allowedOp(pAndTerm^.pExpr^.op) <> 0)
+               or (pAndTerm^.eOperator = u16(WO_AUX)) then
+              b := b or sqlite3WhereGetMask(@pWInfo^.sMaskSet,
+                                            pAndTerm^.leftCursor);
+            Inc(j);
+            Inc(pAndTerm);
+          end;
+        end;
+        indexable := indexable and b;
+      end;
+    end
+    else if (pOrTerm^.wtFlags and TERM_COPIED) <> 0 then
+    begin
+      { Skip — revisited via the corresponding TERM_VIRTUAL term. }
+    end
+    else
+    begin
+      b := sqlite3WhereGetMask(@pWInfo^.sMaskSet, pOrTerm^.leftCursor);
+      if (pOrTerm^.wtFlags and TERM_VIRTUAL) <> 0 then
+      begin
+        pOther := @pOrWc^.a[pOrTerm^.iParent];
+        b := b or sqlite3WhereGetMask(@pWInfo^.sMaskSet, pOther^.leftCursor);
+      end;
+      indexable := indexable and b;
+      if (pOrTerm^.eOperator and u16(WO_EQ)) = 0 then
+        chngToIN := 0
+      else
+        chngToIN := chngToIN and b;
+    end;
+    Dec(i);
+    Inc(pOrTerm);
+  end;
+
+  { Record the set of tables that satisfy case 3 (whereexpr.c:781..790). }
+  pOrInfo^.indexable := indexable;
+  pTerm^.eOperator   := u16(WO_OR);
+  pTerm^.leftCursor  := -1;
+  if indexable <> 0 then pWC^.hasOr := 1;
+
+  { Case 2 — two-way OR collapse via whereCombineDisjuncts
+    (whereexpr.c:792..804). }
+  if (indexable <> 0) and (pOrWc^.nTerm = 2) then
+  begin
+    iOne := 0;
+    pOne := whereNthSubterm(@pOrWc^.a[0], iOne);
+    while pOne <> nil do
+    begin
+      Inc(iOne);
+      iTwo := 0;
+      pTwo := whereNthSubterm(@pOrWc^.a[1], iTwo);
+      while pTwo <> nil do
+      begin
+        Inc(iTwo);
+        whereCombineDisjuncts(pSrc, pWC, pOne, pTwo);
+        pTwo := whereNthSubterm(@pOrWc^.a[1], iTwo);
+      end;
+      pOne := whereNthSubterm(@pOrWc^.a[0], iOne);
+    end;
+  end;
+
+  { Case 1 — try to convert the OR-of-equalities into a single IN
+    operator (whereexpr.c:806..944). }
+  if chngToIN <> 0 then
+  begin
+    okToChngToIN := 0;
+    iColumn := -1;
+    iCursor := -1;
+    j := 0;
+    while (j < 2) and (okToChngToIN = 0) do
+    begin
+      pLeft := nil;
+      pOrTerm := pOrWc^.a;
+      i := pOrWc^.nTerm - 1;
+      while i >= 0 do
+      begin
+        Assert((pOrTerm^.eOperator and u16(WO_EQ)) <> 0);
+        pOrTerm^.wtFlags := pOrTerm^.wtFlags and (not u16(TERM_OK));
+        if pOrTerm^.leftCursor = iCursor then
+        begin
+          { 2-bit case, 2nd iteration revisiting a 1st-iteration term. }
+          Assert(j = 1);
+          Dec(i); Inc(pOrTerm);
+          Continue;
+        end;
+        if (chngToIN
+            and sqlite3WhereGetMask(@pWInfo^.sMaskSet,
+                                    pOrTerm^.leftCursor)) = 0 then
+        begin
+          { t1.a==t2.b shape with t2 in chngToIN, t1 not — the inverted
+            sibling will pick it up. }
+          Assert((pOrTerm^.wtFlags and (TERM_COPIED or TERM_VIRTUAL)) <> 0);
+          Dec(i); Inc(pOrTerm);
+          Continue;
+        end;
+        Assert((pOrTerm^.eOperator and (WO_OR or WO_AND)) = 0);
+        iColumn := pOrTerm^.u.leftColumn;
+        iCursor := pOrTerm^.leftCursor;
+        pLeft   := pOrTerm^.pExpr^.pLeft;
+        Break;
+      end;
+      if i < 0 then
+      begin
+        { No candidate column found — only valid on 2nd iteration. }
+        Assert(j = 1);
+        Assert((chngToIN and (chngToIN - 1)) = 0);  { IsPowerOfTwo }
+        Assert(chngToIN = sqlite3WhereGetMask(@pWInfo^.sMaskSet, iCursor));
+        Break;
+      end;
+
+      { Verify that the candidate (cursor,column) is shared by every term. }
+      okToChngToIN := 1;
+      Dec(i); Inc(pOrTerm);
+      while (i >= 0) and (okToChngToIN <> 0) do
+      begin
+        Assert((pOrTerm^.eOperator and u16(WO_EQ)) <> 0);
+        Assert((pOrTerm^.eOperator and (WO_OR or WO_AND)) = 0);
+        if pOrTerm^.leftCursor <> iCursor then
+        begin
+          pOrTerm^.wtFlags := pOrTerm^.wtFlags and (not u16(TERM_OK));
+        end
+        else if (pOrTerm^.u.leftColumn <> iColumn)
+                or ((iColumn = XN_EXPR)
+                    and (sqlite3ExprCompare(pPrs,
+                           pOrTerm^.pExpr^.pLeft, pLeft, -1) <> 0)) then
+        begin
+          okToChngToIN := 0;
+        end
+        else
+        begin
+          { When the RHS is also a column, the affinities must align so
+            no implicit conversion is forced (Ticket #2249). }
+          affRight := AnsiChar(sqlite3ExprAffinity(pOrTerm^.pExpr^.pRight));
+          affLeft  := AnsiChar(sqlite3ExprAffinity(pOrTerm^.pExpr^.pLeft));
+          if (affRight <> #0) and (affRight <> affLeft) then
+            okToChngToIN := 0
+          else
+            pOrTerm^.wtFlags := pOrTerm^.wtFlags or u16(TERM_OK);
+        end;
+        Dec(i); Inc(pOrTerm);
+      end;
+      Inc(j);
+    end;
+
+    { Construct the virtual IN term when case 1 is satisfied. }
+    if okToChngToIN <> 0 then
+    begin
+      pList := nil;
+      pLeft := nil;
+      i := pOrWc^.nTerm - 1;
+      pOrTerm := pOrWc^.a;
+      while i >= 0 do
+      begin
+        if (pOrTerm^.wtFlags and u16(TERM_OK)) <> 0 then
+        begin
+          Assert((pOrTerm^.eOperator and u16(WO_EQ)) <> 0);
+          Assert((pOrTerm^.eOperator and (WO_OR or WO_AND)) = 0);
+          Assert(pOrTerm^.leftCursor = iCursor);
+          Assert(pOrTerm^.u.leftColumn = iColumn);
+          pDup  := sqlite3ExprDup(db, pOrTerm^.pExpr^.pRight, 0);
+          pList := sqlite3ExprListAppend(pWInfo^.pParse, pList, pDup);
+          pLeft := pOrTerm^.pExpr^.pLeft;
+        end;
+        Dec(i); Inc(pOrTerm);
+      end;
+      Assert(pLeft <> nil);
+      pDup := sqlite3ExprDup(db, pLeft, 0);
+      pNew := sqlite3PExpr(pPrs, TK_IN, pDup, nil);
+      if pNew <> nil then
+      begin
+        transferJoinMarkings(pNew, pX);
+        Assert(ExprUseXList(pNew));
+        pNew^.x.pList := pList;
+        idxNew := whereClauseInsert(pWC, pNew, TERM_VIRTUAL or TERM_DYNAMIC);
+        exprAnalyze(pSrc, pWC, idxNew);
+        { pTerm := @pWC^.a[idxTerm];  // would be needed if pTerm were reused }
+        markTermAsChild(pWC, idxNew, idxTerm);
+      end
+      else
+        sqlite3ExprListDelete(db, pList);
+    end;
+  end;
+end;
+
 function sqlite3WhereGetMask(pMaskSet: PWhereMaskSet; iCursor: i32): Bitmask;
 var
   i: i32;
@@ -6342,7 +6644,11 @@ begin
     end;
   end
 
-  { TK_OR (whereexpr.c:1315..1324) deferred — needs exprAnalyzeOrTerm. }
+  { TK_OR (whereexpr.c:1315..1324) — shatter into disjuncts via
+    exprAnalyzeOrTerm.  The LIKE/GLOB and isAuxiliaryVtabOperator arms
+    in the same switch remain deferred. }
+  else if (pX^.op = TK_OR) and (pWC^.op = TK_AND) then
+    exprAnalyzeOrTerm(pSrc, pWC, idxTerm)
 
   { TK_NOTNULL virtual-term synthesis (whereexpr.c:1331..1359).
     "x IS NOT NULL" on a column that is not the integer primary key gets
