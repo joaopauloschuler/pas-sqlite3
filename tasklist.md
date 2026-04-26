@@ -76,12 +76,19 @@ Important: At the end of this document, please find:
       "x IS NOT NULL" on a non-rowid column gets a virtual "x>NULL"
       companion tagged TERM_VNULL with WO_GT.  Gate:
       `TestWhereExpr.pas` T8a..T8g (40/40).
+    - [X] `whereNthSubterm` (whereexpr.c:521..534) and
+      `whereCombineDisjuncts` (whereexpr.c:556..599) ported as
+      collation-independent helpers for the eventual OR-term path.
+      Gate: `TestWhereExpr.pas` T9a..T9b (whereNthSubterm), T10a..T10e
+      ("a<5 OR a=5" → virtual TK_LE term), T11a (incompatible
+      "a<5 OR a>5" leaves pWC untouched). 48/48.
     - [ ] OR / LIKE virtual-term synthesis (whereexpr.c:1315..1455),
-      `whereCombineDisjuncts`, `whereNthSubterm`, `isLikeOrGlob`,
-      `whereCommuteOperator`, `exprAnalyzeOrTerm`, `termIsEquivalence`
+      `isLikeOrGlob`, `exprAnalyzeOrTerm`, `termIsEquivalence`
       — still deferred (`isLikeOrGlob` needs `sqlite3ExprAddCollateString`
       + ICU collation tables; `termIsEquivalence` needs
       `sqlite3ExprCollSeqMatch` + `SQLITE_Transitive`).
+      `whereCommuteOperator` is the C-side `exprCommute`, already landed
+      in 11g.2.b sub-progress.
 
 - [ ] **6.9-bis 11g.2.d** Port the planner core in `where.c`
     (~5000 lines): `whereLoopAddBtree`, `whereLoopAddBtreeIndex`,

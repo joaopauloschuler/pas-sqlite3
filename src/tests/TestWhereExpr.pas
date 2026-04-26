@@ -80,6 +80,10 @@ var
   pBet, pLo, pHi, pNN, pColNN: PExpr;
   pBList: PExprList;
   iBetIdx, iNNIdx: i32;
+  pCol1, pInt1, pCol2, pInt2, pLt, pEq2: PExpr;
+  pTermA, pTermB: PWhereTerm;
+  pSubA, pSubB, pSubC: PWhereTerm;
+  iCombIdx, nTermBefore: i32;
 
 begin
   WriteLn('=== TestWhereExpr — Phase 6.9-bis 11g.2.c whereexpr helpers ===');
@@ -275,6 +279,78 @@ begin
         (pWC^.a[iNNIdx].wtFlags and TERM_COPIED) <> 0);
   Check('T8g child iParent links back',
         pWC^.a[iNNIdx + 1].iParent = iNNIdx);
+
+  { ---- T9: whereNthSubterm — non-AND term acts as its own 0-th subterm,
+            requests beyond N=0 return nil. ---- }
+  pSubA := @pWC^.a[iNNIdx + 1];   { the WO_GT VNULL child from T8 }
+  pSubB := whereNthSubterm(pSubA, 0);
+  Check('T9a whereNthSubterm(non-AND, 0) = self', pSubB = pSubA);
+  pSubC := whereNthSubterm(pSubA, 1);
+  Check('T9b whereNthSubterm(non-AND, 1) = nil', pSubC = nil);
+
+  { ---- T10: whereCombineDisjuncts — "a<5 OR a=5" must synthesize the
+            virtual term "a<=5" (TK_LE) tagged TERM_VIRTUAL|TERM_DYNAMIC. ---- }
+  { Build two disjunct WhereTerm objects pointing at "a<5" and "a=5". }
+  pCol1 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol1^.iTable := 0; pCol1^.iColumn := -1;
+  pInt1 := sqlite3ExprInt32(db, 5);
+  pLt   := sqlite3PExpr(@parse, TK_LT, pCol1, pInt1);
+
+  pCol2 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol2^.iTable := 0; pCol2^.iColumn := -1;
+  pInt2 := sqlite3ExprInt32(db, 5);
+  pEq2  := sqlite3PExpr(@parse, TK_EQ, pCol2, pInt2);
+
+  { Stand-alone WhereTerm shells — not threaded through the WhereClause
+    array; whereCombineDisjuncts does not inspect pWC linkage on them. }
+  New(pTermA);  FillChar(pTermA^, SizeOf(pTermA^), 0);
+  New(pTermB);  FillChar(pTermB^, SizeOf(pTermB^), 0);
+  pTermA^.pExpr     := pLt;
+  pTermA^.eOperator := WO_LT;
+  pTermB^.pExpr     := pEq2;
+  pTermB^.eOperator := WO_EQ;
+
+  nTermBefore := pWC^.nTerm;
+  iCombIdx    := nTermBefore;
+  whereCombineDisjuncts(pSrc, pWC, pTermA, pTermB);
+  Check('T10a virtual term inserted',
+        pWC^.nTerm = nTermBefore + 1);
+  Check('T10b combined op = TK_LE',
+        pWC^.a[iCombIdx].pExpr^.op = TK_LE);
+  Check('T10c combined wtFlags has VIRTUAL|DYNAMIC',
+        (pWC^.a[iCombIdx].wtFlags
+         and (TERM_VIRTUAL or TERM_DYNAMIC))
+        = (TERM_VIRTUAL or TERM_DYNAMIC));
+  Check('T10d combined eOperator has WO_LE',
+        (pWC^.a[iCombIdx].eOperator and WO_LE) <> 0);
+  Check('T10e combined leftCursor = 0',
+        pWC^.a[iCombIdx].leftCursor = 0);
+
+  { ---- T11: whereCombineDisjuncts must reject incompatible mixes —
+            "a<5 OR a>5" cannot collapse to a single comparison term. ---- }
+  pCol1 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol1^.iTable := 0; pCol1^.iColumn := -1;
+  pInt1 := sqlite3ExprInt32(db, 5);
+  pLt   := sqlite3PExpr(@parse, TK_LT, pCol1, pInt1);
+  pCol2 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol2^.iTable := 0; pCol2^.iColumn := -1;
+  pInt2 := sqlite3ExprInt32(db, 5);
+  pEq2  := sqlite3PExpr(@parse, TK_GT_TK, pCol2, pInt2);
+
+  pTermA^.pExpr     := pLt;
+  pTermA^.eOperator := WO_LT;
+  pTermA^.wtFlags   := 0;
+  pTermB^.pExpr     := pEq2;
+  pTermB^.eOperator := WO_GT_WO;
+  pTermB^.wtFlags   := 0;
+
+  nTermBefore := pWC^.nTerm;
+  whereCombineDisjuncts(pSrc, pWC, pTermA, pTermB);
+  Check('T11a a<5 OR a>5 leaves nTerm untouched',
+        pWC^.nTerm = nTermBefore);
+
+  Dispose(pTermA);
+  Dispose(pTermB);
 
   { Skip sqlite3WhereClauseClear / sqlite3DbFree for the synthetic
     WhereInfo: pWC^.a was allocated through sqlite3WhereMalloc and is

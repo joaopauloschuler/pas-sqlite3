@@ -1539,6 +1539,9 @@ function  whereClauseInsert(pWC: PWhereClause; p: PExpr; wtFlags: u16): i32;
 procedure markTermAsChild(pWC: PWhereClause; iChild: i32; iParent: i32);
 procedure transferJoinMarkings(pDerived: PExpr; pBase: PExpr);
 function  exprCommute(pPrs: PParse; pX: PExpr): u16;
+function  whereNthSubterm(pTerm: PWhereTerm; N: i32): PWhereTerm;
+procedure whereCombineDisjuncts(pSrc: PSrcList; pWC: PWhereClause;
+  pOne: PWhereTerm; pTwo: PWhereTerm);
 function  sqlite3WhereGetMask(pMaskSet: PWhereMaskSet; iCursor: i32): Bitmask;
 function  sqlite3WhereMalloc(pWInfo: PWhereInfo; nByte: u64): Pointer;
 function  sqlite3WhereRealloc(pWInfo: PWhereInfo; pOld: Pointer; nByte: u64): Pointer;
@@ -5568,6 +5571,77 @@ begin
     pX^.op := u8(((pX^.op - TK_GT_TK) xor 2) + TK_GT_TK);
   end;
   Result := 0;
+end;
+
+{ Return the N-th AND-connected subterm of pTerm.  If pTerm is not an AND
+  conjunction, return pTerm itself when N=0; if N exceeds the available
+  subterms, return nil.  whereexpr.c:521..534. }
+function whereNthSubterm(pTerm: PWhereTerm; N: i32): PWhereTerm;
+begin
+  if pTerm^.eOperator <> WO_AND then
+  begin
+    if N = 0 then Result := pTerm else Result := nil;
+    Exit;
+  end;
+  if N < pTerm^.u.pAndInfo^.wc.nTerm then
+    Result := @pTerm^.u.pAndInfo^.wc.a[N]
+  else
+    Result := nil;
+end;
+
+{ Combine two OR-disjunct WhereTerms ("A op1 B" OR "A op2 B") into a single
+  virtual AND term when the operators are compatible.  Examples:
+     x<y OR x=y    →  x<=y
+     x=y OR x=y    →  x=y
+     x<=y OR x<y   →  x<=y
+  whereexpr.c:556..599. }
+procedure whereCombineDisjuncts(pSrc: PSrcList; pWC: PWhereClause;
+  pOne: PWhereTerm; pTwo: PWhereTerm);
+var
+  eOp:    u16;
+  db:     PTsqlite3;
+  pNew:   PExpr;
+  op:     i32;
+  idxNew: i32;
+  pA, pB: PExpr;
+begin
+  eOp := pOne^.eOperator or pTwo^.eOperator;
+  if ((pOne^.wtFlags or pTwo^.wtFlags) and TERM_VNULL) <> 0 then Exit;
+  if (pOne^.eOperator and (WO_EQ or WO_LT or WO_LE or WO_GT_WO or WO_GE)) = 0 then Exit;
+  if (pTwo^.eOperator and (WO_EQ or WO_LT or WO_LE or WO_GT_WO or WO_GE)) = 0 then Exit;
+  if ((eOp and (WO_EQ or WO_LT or WO_LE)) <> eOp)
+     and ((eOp and (WO_EQ or WO_GT_WO or WO_GE)) <> eOp) then Exit;
+  pA := pOne^.pExpr;
+  pB := pTwo^.pExpr;
+  Assert((pA^.pLeft <> nil) and (pA^.pRight <> nil));
+  Assert((pB^.pLeft <> nil) and (pB^.pRight <> nil));
+  if sqlite3ExprCompare(nil, pA^.pLeft,  pB^.pLeft,  -1) <> 0 then Exit;
+  if sqlite3ExprCompare(nil, pA^.pRight, pB^.pRight, -1) <> 0 then Exit;
+  if ExprHasProperty(pA, EP_Commuted) <> ExprHasProperty(pB, EP_Commuted) then Exit;
+  { The two subterms can be combined.  Pick the looser comparison. }
+  if (eOp and (eOp - 1)) <> 0 then
+  begin
+    if (eOp and (WO_LT or WO_LE)) <> 0 then
+      eOp := WO_LE
+    else
+    begin
+      Assert((eOp and (WO_GT_WO or WO_GE)) <> 0);
+      eOp := WO_GE;
+    end;
+  end;
+  db := pWC^.pWInfo^.pParse^.db;
+  pNew := sqlite3ExprDup(db, pA, 0);
+  if pNew = nil then Exit;
+  op := TK_EQ;
+  while eOp <> u16(WO_EQ shl (op - TK_EQ)) do
+  begin
+    Assert(op < TK_GE);
+    Inc(op);
+  end;
+  pNew^.op := u8(op);
+  idxNew := whereClauseInsert(pWC, pNew, TERM_VIRTUAL or TERM_DYNAMIC);
+  if idxNew <> 0 then
+    exprAnalyze(pSrc, pWC, idxNew);
 end;
 
 procedure sqlite3WhereSplit(pWC: PWhereClause; pExpr: PExpr; op: u8);
