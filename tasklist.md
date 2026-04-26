@@ -21,6 +21,93 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    sqlite3ExprCodeTarget — first vertical slice (literal/leaf arms) +
+    codeInteger / codeReal helpers.**  Lifts `sqlite3ExprCode` from a
+    flat literal-only stub into the productive C wrapper from
+    expr.c:5884 by introducing the recursive dispatch
+    `sqlite3ExprCodeTarget` (expr.c:4930).  This first slice ports the
+    leaf arms that need no AggInfo / Column / Index plumbing:
+      * **TK_INTEGER** — full `codeInteger` (expr.c:4321..4353): handles
+        EP_IntValue fast path, oversized literal fallthrough to
+        `codeReal`, hex-literal-too-big error, and the
+        `SMALLEST_INT64` negation edge case.  Emits `OP_Integer` /
+        `OP_Int64` with `P4_INT64` via `sqlite3VdbeAddOp4Dup8`.
+      * **TK_FLOAT** — full `codeReal` (expr.c:4303..4311): parses via
+        `sqlite3AtoF`, optionally negates, emits `OP_Real` with
+        `P4_REAL`.
+      * **TK_TRUEFALSE** — `OP_Integer(sqlite3ExprTruthValue, target)`.
+      * **TK_STRING** — `sqlite3VdbeLoadString` (unchanged from stub).
+      * **TK_NULLS** — `OP_Null(0, target, target+y.nReg-1)` to NULL a
+        contiguous register range.
+      * **TK_VARIABLE** — `OP_Variable(iColumn, target)`.
+      * **TK_REGISTER** — returns `pExpr^.iTable` directly so the
+        wrapper emits OP_Copy/OP_SCopy back into target.
+      * **default** — emits `OP_Null` so an unsupported op cannot crash
+        (matches the C "be nice, don't crash" default arm).
+      * **nil pExpr** — folded into the default arm (op := TK_NULL).
+
+    The sqlite3ExprCode wrapper now mirrors expr.c:5884 exactly —
+    delegates to `sqlite3ExprCodeTarget`, then OP_Copy (for
+    EP_Subquery/TK_REGISTER under sqlite3ExprSkipCollateAndLikely) or
+    OP_SCopy when the returned register differs from `target`.
+
+    Concrete changes:
+      * `passqlite3codegen.pas:1706..1721` — public forward decl
+        update: `sqlite3ExprCodeTarget` exposed alongside
+        `sqlite3ExprCode`.
+      * `passqlite3codegen.pas:3611..3766` — three new bodies
+        (`codeReal`, `codeInteger`, `sqlite3ExprCodeTarget`) and the
+        rewired `sqlite3ExprCode` wrapper.
+
+    Why this is safe to land alone: existing productive call-sites
+    (sqlite3NestedParse-generated INSERT/UPDATE/DELETE row codegen,
+    PRAGMA-emitted literals) only ever pass TK_INTEGER/TK_NULL/TK_STRING
+    /TK_REGISTER — exactly the arms covered before, with strict
+    semantic upgrade for non-EP_IntValue integer literals (now
+    correctly via OP_Int64) and floats (now correctly via OP_Real).
+    The TK_TRUEFALSE / TK_NULLS / TK_VARIABLE arms are inert in the
+    current corpus but pre-wire the cases the next slices' callers
+    will rely on.  Full regression sweep all green —
+    TestWhereBasic 52/52, TestWhereStructs 148/148, TestPrepareBasic
+    20/20, TestParser 45/45, TestSchemaBasic 44/44, TestVdbeApi 57/57,
+    TestDMLBasic 54/54, TestSelectBasic 49/49, TestExprBasic 40/40,
+    TestInitCallback 29/29, TestExplainParity unchanged at **2 PASS /
+    8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **`sqlite3ErrorMsg` is still single-arg in the Pascal port.**
+        codegen.pas:2599 takes only `(pParse, zFormat)` — no varargs
+        yet.  The hex-too-big path lands the literal message
+        `'hex literal too big'` rather than the C
+        `'hex literal too big: %s'` formatted form.  Fold in proper
+        formatting when the printf-style sqlite3ErrorMsg port lands
+        (depends on Phase 6 sqlite3VMPrintf wiring).
+      * **`SMALLEST_INT64` modelled as `i64($8000000000000000)`.**  No
+        existing constant — inline-cast at the two sites in
+        `codeInteger`.  Land a named const in `passqlite3int.pas`
+        when a second user appears (likely the comparison cluster).
+      * **`Expr.y.nReg` confirmed at codegen.pas:477** — the union
+        case-2 record holds `nReg: i32`, sufficient for the TK_NULLS
+        contiguous-NULL-range arm.
+      * **Realistic next sub-progress: TK_COLUMN arm.**  Needs
+        `sqlite3ExprCodeGetColumn` (expr.c:4775..) which in turn
+        depends on the column-cache helpers (`sqlite3ExprCacheStore`,
+        the `pParse.aColCache` ring) and on
+        `sqlite3TableColumnToStorage`.  Land the column-cache
+        scaffolding first as a separate sub-progress, then bolt the
+        TK_COLUMN arm on top — that unlocks every SELECT codegen path.
+      * **Subsequent slice candidates (no new dependencies):**
+        TK_BLOB needs only `sqlite3HexToBlob` (small util port);
+        TK_AGG_COLUMN's "directMode==0" fast path is one line
+        (`AggInfoColumnReg(pAggInfo, iAgg)`) but needs the AggInfo
+        record laid out — defer until Phase 6.x's aggregate work.
+      * **TK_FLOAT regression-test note.**  No corpus test currently
+        exercises a TK_FLOAT literal in a productive code path — the
+        new arm is verified by build only.  Add a TestExprBasic case
+        once `sqlite3ExprCode(parse, FloatLiteral, target)` is reachable
+        from a public API path (likely once SELECT codegen lands).
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     sqlite3ExprCodeRunJustOnce.**  Next link in the discovery-note
     chain unlocking `sqlite3ExprCodeTarget`.  Faithful translation of
     expr.c:5777..5822 — factors a constant expression out of the main

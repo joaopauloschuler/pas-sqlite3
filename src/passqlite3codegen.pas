@@ -1703,11 +1703,18 @@ function sqlite3ExprAddCollateToken(pParse: PParse; p: PExpr;
 function sqlite3ExprAddCollateString(pParse: PParse; p: PExpr;
   zC: PAnsiChar): PExpr;
 
-{ Expr codegen — literal-only port (Phase 6.9-bis step 11d).
-  Handles TK_INTEGER / TK_NULL / TK_STRING / TK_REGISTER — the four arms
-  exercised by sqlite3NestedParse-generated INSERTs.  Any other op falls
-  through to OP_Null with a TODO marker. }
+{ Expr codegen — Phase 6.9-bis step 11g.2.b.
+  sqlite3ExprCodeTarget is the recursive dispatch from expr.c:4930; the
+  port currently lands the literal/leaf arms (TK_INTEGER, TK_TRUEFALSE,
+  TK_FLOAT, TK_STRING, TK_NULLS, TK_VARIABLE, TK_REGISTER, default-NULL)
+  and routes the unported arms (TK_COLUMN, TK_AGG_*, TK_BLOB, …) through
+  the C "default" arm so callers see OP_Null instead of crashing.
+  sqlite3ExprCode is the wrapper from expr.c:5884 — guarantees the value
+  ends up in `target` via OP_Copy / OP_SCopy when ExprCodeTarget chose a
+  different register. }
 procedure sqlite3ExprCode(pParse: PParse; pExpr: PExpr; target: i32);
+function  sqlite3ExprCodeTarget(pParse: PParse; pExpr: PExpr;
+  target: i32): i32;
 
 { Misc expr helpers }
 function  sqlite3ExprIsVector(const pExpr: PExpr): i32;
@@ -3625,6 +3632,119 @@ end;
 
   Any other op falls through to OP_Null + TODO marker — matches the C
   default arm (which is already a "be nice and don't crash" fallback). }
+{ codeReal — expr.c:4303..4311.  Loads a floating-point literal from a
+  zero-terminated UTF-8 string into register iMem via OP_Real with a
+  P4_REAL operand. }
+procedure codeReal(v: PVdbe; z: PAnsiChar; negateFlag: i32; iMem: i32);
+var value: Double;
+begin
+  if z = nil then Exit;
+  sqlite3AtoF(z, value);
+  if negateFlag <> 0 then value := -value;
+  sqlite3VdbeAddOp4Dup8(v, OP_Real, 0, iMem, 0, @value, P4_REAL);
+end;
+
+{ codeInteger — expr.c:4321..4353.  Loads an integer literal from
+  pExpr->u.iValue (EP_IntValue path) or from the textual zToken via
+  sqlite3DecOrHexToI64.  Oversized values are reported via
+  sqlite3ErrorMsg or, for non-hex, demoted to a float via codeReal. }
+procedure codeInteger(pParse: PParse; pExpr: PExpr; negFlag: i32;
+                      iMem: i32);
+var
+  v:     PVdbe;
+  i:     i32;
+  c:     i32;
+  value: i64;
+  z:     PAnsiChar;
+begin
+  v := pParse^.pVdbe;
+  if (pExpr^.flags and EP_IntValue) <> 0 then
+  begin
+    i := pExpr^.u.iValue;
+    if negFlag <> 0 then i := -i;
+    sqlite3VdbeAddOp2(v, OP_Integer, i, iMem);
+  end
+  else
+  begin
+    z := pExpr^.u.zToken;
+    if z = nil then Exit;
+    c := sqlite3DecOrHexToI64(z, value);
+    if ((c = 3) and (negFlag = 0)) or (c = 2)
+       or ((negFlag <> 0) and (value = i64($8000000000000000))) then
+    begin
+      if sqlite3_strnicmp(z, '0x', 2) = 0 then
+        sqlite3ErrorMsg(pParse, 'hex literal too big')
+      else
+        codeReal(v, z, negFlag, iMem);
+    end
+    else
+    begin
+      if negFlag <> 0 then
+      begin
+        if c = 3 then value := i64($8000000000000000)
+        else value := -value;
+      end;
+      sqlite3VdbeAddOp4Dup8(v, OP_Int64, 0, iMem, 0, Pu8(@value), P4_INT64);
+    end;
+  end;
+end;
+
+function sqlite3ExprCodeTarget(pParse: PParse; pExpr: PExpr;
+  target: i32): i32;
+var
+  v:  PVdbe;
+  op: u8;
+begin
+  v := pParse^.pVdbe;
+  if pExpr = nil then op := TK_NULL
+  else op := pExpr^.op;
+
+  case op of
+    TK_INTEGER:
+      begin
+        codeInteger(pParse, pExpr, 0, target);
+        Result := target;
+      end;
+    TK_TRUEFALSE:
+      begin
+        sqlite3VdbeAddOp2(v, OP_Integer,
+                          sqlite3ExprTruthValue(pExpr), target);
+        Result := target;
+      end;
+    TK_FLOAT:
+      begin
+        codeReal(v, pExpr^.u.zToken, 0, target);
+        Result := target;
+      end;
+    TK_STRING:
+      begin
+        sqlite3VdbeLoadString(v, target, pExpr^.u.zToken);
+        Result := target;
+      end;
+    TK_NULLS:
+      begin
+        sqlite3VdbeAddOp3(v, OP_Null, 0, target,
+                          target + pExpr^.y.nReg - 1);
+        Result := target;
+      end;
+    TK_VARIABLE:
+      begin
+        sqlite3VdbeAddOp2(v, OP_Variable, pExpr^.iColumn, target);
+        Result := target;
+      end;
+    TK_REGISTER:
+      Result := pExpr^.iTable;
+  else
+    { TODO(Phase 6.9-bis): TK_COLUMN, TK_AGG_COLUMN, TK_BLOB, TK_CAST,
+      TK_LT…TK_GT comparison cluster, TK_AND/TK_OR, TK_PLUS/TK_MINUS/…,
+      TK_FUNCTION, TK_CASE, TK_IN, TK_EXISTS, TK_SELECT, … — land in
+      subsequent vertical-slice sub-progress.  For now use the C
+      default arm: emit OP_Null so an unsupported op cannot crash. }
+    sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+    Result := target;
+  end;
+end;
+
 procedure sqlite3ExprCode(pParse: PParse; pExpr: PExpr; target: i32);
 var
   v:     PVdbe;
@@ -3634,34 +3754,7 @@ var
 begin
   v := pParse^.pVdbe;
   if v = nil then Exit;
-  if pExpr = nil then begin
-    sqlite3VdbeAddOp2(v, OP_Null, 0, target);
-    Exit;
-  end;
-
-  inReg := target;
-  case pExpr^.op of
-    TK_INTEGER:
-      begin
-        if (pExpr^.flags and EP_IntValue) <> 0 then
-          sqlite3VdbeAddOp2(v, OP_Integer, pExpr^.u.iValue, target)
-        else
-          { Non-EP_IntValue integer literals (oversize / hex) need
-            sqlite3DecOrHexToI64 + OP_Int64 — TODO(Phase 6.x). }
-          sqlite3VdbeAddOp2(v, OP_Null, 0, target);
-      end;
-    TK_NULL:
-      sqlite3VdbeAddOp2(v, OP_Null, 0, target);
-    TK_STRING:
-      sqlite3VdbeLoadString(v, target, pExpr^.u.zToken);
-    TK_REGISTER:
-      inReg := pExpr^.iTable;
-  else
-    { TODO(Phase 6.x): full sqlite3ExprCodeTarget dispatch.  For now the
-      C-default "emit Null and don't crash" behaviour. }
-    sqlite3VdbeAddOp2(v, OP_Null, 0, target);
-  end;
-
+  inReg := sqlite3ExprCodeTarget(pParse, pExpr, target);
   if inReg <> target then
   begin
     pX := sqlite3ExprSkipCollateAndLikely(pExpr);
