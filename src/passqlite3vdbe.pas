@@ -1568,6 +1568,34 @@ function  sqlite3VdbeSorterCompare(pCsr: PVdbeCursor; bOmitRowid: i32;
 { --- vdbe.c — execution engine (Phase 5.4) --- }
 function  sqlite3VdbeExec(v: PVdbe): i32;
 
+{ ----------------------------------------------------------------------
+  Phase 6.9-bis step 11g.1 (structural skeleton) — OP_ParseSchema hook.
+
+  vdbe.c:7114..7183 OP_ParseSchema invokes sqlite3_exec() which lives in
+  passqlite3main.pas and would create a `uses` cycle if called directly
+  from this unit (main already uses vdbe).  We expose a function pointer
+  that main.pas assigns at unit-init time; the OP_ParseSchema body in
+  sqlite3VdbeExec dispatches through it.  When the pointer is nil (e.g.
+  during early bring-up or unit tests that link vdbe without main) the
+  opcode falls back to the legacy no-op stub.
+
+  Signature mirrors the productive part of vdbe.c:7146..7173:
+    iDb       — pOp^.p1
+    zWhere    — pOp^.p4.z (must be non-nil; ALTER-branch p4.z=0 is
+                deferred to the future sqlite3InitOne port)
+    p5        — pOp^.p5 (currently unused by callers; reserved for
+                ALTER-branch flags)
+  Returns SQLITE_OK / SQLITE_CORRUPT_BKPT / SQLITE_NOMEM_BKPT exactly
+  as the C body sets `rc` before the `if(rc) goto abort_due_to_error`
+  tail.  Caller is responsible for setting db^.errCode / triggering the
+  schema-reset on non-OK return.
+  ---------------------------------------------------------------------- }
+type
+  TVdbeParseSchemaExec = function(db: PTsqlite3; iDb: i32;
+                                  zWhere: PAnsiChar; p5: u16): i32;
+var
+  vdbeParseSchemaExec: TVdbeParseSchemaExec = nil;
+
 { --- vdbe.c Phase 5.4b helpers (exported for testing) --- }
 function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
 
@@ -7131,10 +7159,29 @@ begin
       if rc <> SQLITE_OK then goto abort_due_to_error;
     end;
 
-    { ────── OP_ParseSchema ────── (vdbe.c:7114) — stub (requires codegen) }
+    { ────── OP_ParseSchema ────── (vdbe.c:7114) }
+    { Phase 6.9-bis step 11g.1 (structural skeleton): dispatch to the
+      sqlite3_exec-driven body in passqlite3main via a settable hook.
+      When the hook is unbound (early bring-up / unit tests linking vdbe
+      without main) we retain the legacy no-op stub so all existing
+      tests remain green. }
     OP_ParseSchema: begin
-      { Stub: full schema parsing requires Phase 6 SQL compiler }
-      { In Phase 5 we simply ignore this opcode (schema already loaded) }
+      if vdbeParseSchemaExec = nil then begin
+        { Fallback stub — schema already loaded by codegen's
+          sqlite3InstallSchemaTable bootstrap (Phase 6.x). }
+      end else if pOp^.p4.z = nil then begin
+        { ALTER-branch (p4.z = NULL) — full sqlite3InitOne port lands in
+          Phase 7.  For now treat as success so callers that emit this
+          opcode shape (none, currently) don't trip an error. }
+        rc := SQLITE_OK;
+      end else begin
+        rc := vdbeParseSchemaExec(db, pOp^.p1, pOp^.p4.z, pOp^.p5);
+        if rc <> SQLITE_OK then begin
+          sqlite3ResetAllSchemasOfConnection(db);
+          if rc = SQLITE_NOMEM then goto no_mem;
+          goto abort_due_to_error;
+        end;
+      end;
     end;
 
     { ────── OP_LoadAnalysis ────── (vdbe.c:7192) }

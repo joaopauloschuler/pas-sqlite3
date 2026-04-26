@@ -20,6 +20,103 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 11g.1, structural skeleton):
+    OP_ParseSchema dispatch hook + sqlite3_exec-driven worker.**
+    Replaces the `OP_ParseSchema` no-op stub at
+    `passqlite3vdbe.pas:7134` with a settable function pointer
+    (`vdbeParseSchemaExec`) so the actual sqlite3_exec call lives in
+    `passqlite3main.pas` (sqlite3_exec already consumes vdbe — moving
+    the worker the other way would create a uses cycle).  The worker
+    `execParseSchemaImpl` is a faithful structural port of
+    `vdbe.c:7146..7173`'s productive (non-ALTER, p4.z != nil) branch:
+    builds the `SELECT*FROM"%w".sqlite_master WHERE %s ORDER BY rowid`
+    via `sqlite3MPrintf`, gates `db^.init.busy = 1` around the
+    recursive `sqlite3_exec`, dispatches each row to a minimal
+    `sqlite3InitCallback` that bumps `nInitRow` only.
+    [X]
+
+    Concrete changes:
+      * `passqlite3vdbe.pas:1571..1597` (interface) — `TVdbeParseSchemaExec`
+        function-pointer type + `vdbeParseSchemaExec` settable variable
+        defaulting to nil.  Comment block documents the cycle-avoidance
+        rationale and the iDb / zWhere / p5 contract.
+      * `passqlite3vdbe.pas:7134..7156` — `OP_ParseSchema` opcode body.
+        Three arms: (a) `vdbeParseSchemaExec = nil` → legacy no-op
+        fallback (preserves green test status when only vdbe is
+        linked); (b) `pOp^.p4.z = nil` → ALTER-branch placeholder
+        returning OK (full `sqlite3InitOne` is Phase 7); (c) productive
+        case dispatches through the hook, on non-OK calls
+        `sqlite3ResetAllSchemasOfConnection` and routes SQLITE_NOMEM →
+        `no_mem` / others → `abort_due_to_error` exactly per
+        vdbe.c:7175..7181.
+      * `passqlite3main.pas:277..278` — implementation-side `uses`
+        clause now imports `passqlite3printf` for `sqlite3MPrintf`.
+      * `passqlite3main.pas:1866..1955` — `TInitData` record
+        (sqliteInt.h struct InitData), `sqlite3InitCallback` minimal
+        cdecl dispatcher, `execParseSchemaImpl` worker, and
+        `initialization` block that wires `vdbeParseSchemaExec` at
+        unit load.
+
+    Test status:
+      * Full suite: 0 failures across all bin/Test* binaries (54
+        binaries, all rc=0).
+      * `TestExplainParity` unchanged at 2 PASS / 8 DIVERGE / 0 ERROR;
+        every CREATE TABLE / INDEX / DROP row continues to diverge but
+        for the same op-count reason as before — the hook is now
+        actively running but its productive payload is gated behind
+        sub-step 11g.1+.
+
+    Discoveries / future work:
+      * **Why the SQLITE_CORRUPT check at vdbe.c:7165..7170 is
+        commented out (not omitted):** the schema-row INSERT emitted
+        by `sqlite3NestedParse` from `sqlite3EndTable` lands in
+        `sqlite3Insert`, which is still a structural skeleton (step
+        11c..11e) emitting zero bytecode.  Therefore the row that
+        `OP_ParseSchema`'s SELECT goes hunting for is *never written*
+        in the current build, so a faithful `nInitRow == 0` →
+        `SQLITE_CORRUPT` would convert every CREATE TABLE in the
+        regression suite to a hard failure.  The check stays disabled
+        with an inline `// if ... rc := SQLITE_CORRUPT` and a
+        pointer-to-tasklist comment until `sqlite3Insert` writes real
+        rows.  Fixture `sqlite3_exec` in `TestExplainParity` returned
+        rc=11 under the strict check, confirming the guard placement.
+      * **Why `sqlite3InitCallback` does not yet re-prepare argv[4]:**
+        the C reference (prepare.c:96..189) re-prepares the SQL column
+        under `db^.init.busy = 1` and relies on the codegen-side
+        `init.busy = 1` arms in `sqlite3EndTable` /
+        `sqlite3CreateIndex` to publish the table/index into
+        `pSchema^.tblHash` *without* re-emitting bytecode.  Those arms
+        already exist (`codegen.pas:6893`, `:7562`), but until the
+        OUTER schema-row INSERT actually writes rows, the SELECT
+        returns 0 rows and the callback is never invoked — re-preparing
+        argv[4] is therefore step 11g.1+'s payload, not 11g.1.
+      * **Step 11g.1 sub-task split (revised):**
+        - **11g.1.a** ✅ done 2026-04-26 — structural skeleton + hook
+          (this commit).
+        - [ ] **11g.1.b** Wire `sqlite3InitCallback`'s c-r branch:
+          for argv[4] starting with C/c R/r, call
+          `sqlite3_prepare_v2(db, argv[4], -1, ...)` under
+          `db^.init.busy = 1`, with `db^.init.iDb := iDb` /
+          `db^.init.azInit := argv` set per prepare.c:134..145.
+          Also wire the no-SQL index branch (prepare.c:166..186):
+          when argv[4] is empty, call `sqlite3FindIndex` and patch
+          `pIndex^.tnum` from `argv[3]` via `sqlite3GetUInt32`.
+          Re-enable the nInitRow corruption check in the worker once
+          this lands.
+        - [ ] **11g.1.c** Audit `sqlite3EndTable` /
+          `sqlite3CreateIndex` init.busy=1 paths against the
+          re-prepare flow — verify the in-memory publication in
+          codegen.pas:6893 / 7562 actually fires when the parser is
+          driven by sqlite3InitCallback (not just by direct
+          sqlite3InstallSchemaTable bootstrap).  Likely needs a
+          dedicated unit test.
+      * **Next 6.9-bis target: step 11g.1.b — sqlite3InitCallback
+        c-r branch.**  Until that lands, the 3 nil-Vdbe rows in
+        TestExplainParity (CREATE INDEX × 2, DROP TABLE × 1) cannot
+        flip even after step 11g.1.a — they need the schema lookup
+        to actually find the freshly-created table, which needs the
+        callback's re-prepare to run.
+
   - **2026-04-26 — Phase 6.x — nested-parse schema visibility:
     bootstrap `sqlite_master` into `db^.aDb[*].pSchema^.tblHash` at
     `openDatabase` time.**  Resolves the first prerequisite of
@@ -7330,8 +7427,13 @@ Phase 5.9 depends on this being done first.
 
   Sub-tasks formalised from step 11f's discoveries:
 
-  - [ ] **6.9-bis step 11g.1** Port `OP_ParseSchema` in
-    `passqlite3vdbe.pas:7134` (currently a no-op stub).  Required
+  - [~] **6.9-bis step 11g.1** Port `OP_ParseSchema` in
+    `passqlite3vdbe.pas:7134` (currently a no-op stub).
+    *Partial:* sub-step 11g.1.a (structural skeleton + dispatch hook
+    + sqlite3_exec-driven worker + minimal sqlite3InitCallback) landed
+    2026-04-26.  Sub-steps 11g.1.b (re-prepare argv[4] / no-SQL index
+    branch) and 11g.1.c (init.busy=1 codegen-arm audit) still
+    outstanding — see "Most recent activity" for the full split.  Required
     so user tables created by `CREATE TABLE t(...)` get published to
     `db^.aDb[iDb].pSchema^.tblHash` after EndTable's emission tail
     runs; without it, `CREATE INDEX i1 ON t(a)` and `DROP TABLE t`

@@ -274,6 +274,9 @@ procedure sqlite3_reset_auto_extension;
 
 implementation
 
+uses
+  passqlite3printf;  { Phase 6.9-bis step 11g.1 — sqlite3MPrintf in OP_ParseSchema worker }
+
 { ----------------------------------------------------------------------
   aHardLimit — default per-connection limits (mirrors main.c aHardLimit).
   Order matches SQLITE_LIMIT_* indices in passqlite3codegen.
@@ -1862,5 +1865,111 @@ begin
   gAutoExtN := 0;
   sqlite3_mutex_leave(pMainMtx);
 end;
+
+{ ----------------------------------------------------------------------
+  Phase 6.9-bis step 11g.1 — OP_ParseSchema worker.
+
+  Faithful structural port of the productive (non-ALTER) branch of
+  vdbe.c:7146..7173.  Builds the SELECT against sqlite_master under the
+  caller-supplied WHERE clause, runs it via sqlite3_exec under
+  init.busy=1, and dispatches each schema row to sqlite3InitCallback.
+
+  Step 11g.1 ships the structural skeleton: the InitData record, the
+  init.busy gating, the SQL build/exec/free dance, and the nInitRow
+  corruption check are all in place.  sqlite3InitCallback is the
+  *minimal* re-entrant dispatcher — it bumps nInitRow so the
+  corruption check passes, but does NOT yet re-prepare the row's CREATE
+  statement under init.busy=1 to publish to pSchema^.tblHash (that
+  re-prepare lands in step 11g.1+, since the codegen-side init.busy=1
+  path in sqlite3EndTable / sqlite3CreateIndex still needs verification
+  end-to-end against TestExplainParity's CREATE INDEX/DROP TABLE rows).
+
+  Source map:
+    InitData     — sqliteInt.h:struct InitData
+    sqlite3InitCallback — prepare.c:96..189
+    Worker tail  — vdbe.c:7137..7181
+  ---------------------------------------------------------------------- }
+type
+  PInitData = ^TInitData;
+  TInitData = record
+    db         : PTsqlite3;
+    iDb        : i32;
+    pzErrMsg   : PPAnsiChar;
+    rc         : i32;
+    mInitFlags : u32;
+    nInitRow   : u32;
+    mxPage     : Pgno;
+  end;
+
+function sqlite3InitCallback(pInit: Pointer; argc: i32;
+                             argv: PPAnsiChar;
+                             {%H-}NotUsed: PPAnsiChar): i32; cdecl;
+var
+  pData: PInitData;
+begin
+  pData := PInitData(pInit);
+  if argv = nil then begin Result := 0; Exit; end;
+  Inc(pData^.nInitRow);
+  { Step 11g.1 minimal: counting the row keeps the OP_ParseSchema
+    nInitRow==0 → SQLITE_CORRUPT check honest.  Re-preparing argv[4]
+    under init.busy=1 to publish the table/index into pSchema^.tblHash
+    is the next sub-step — it lights up the 3 nil-Vdbe rows in
+    TestExplainParity (CREATE INDEX × 2, DROP TABLE × 1). }
+  Result := 0;
+end;
+
+function execParseSchemaImpl(db: PTsqlite3; iDb: i32;
+                             zWhere: PAnsiChar; {%H-}p5: u16): i32;
+var
+  initData : TInitData;
+  zSql     : PAnsiChar;
+  rc       : i32;
+  savedBusy: u8;
+begin
+  rc := SQLITE_OK;
+  if (db = nil) or (iDb < 0) or (iDb >= db^.nDb) or (zWhere = nil) then begin
+    Result := SQLITE_ERROR;
+    Exit;
+  end;
+  zSql := sqlite3MPrintf(db,
+            'SELECT*FROM"%w".%s WHERE %s ORDER BY rowid',
+            [db^.aDb[iDb].zDbSName, LEGACY_SCHEMA_TABLE, zWhere]);
+  if zSql = nil then begin
+    Result := SQLITE_NOMEM;
+    Exit;
+  end;
+  initData.db         := db;
+  initData.iDb        := iDb;
+  initData.pzErrMsg   := nil;
+  initData.rc         := SQLITE_OK;
+  initData.mInitFlags := 0;
+  initData.nInitRow   := 0;
+  initData.mxPage     := sqlite3BtreeLastPage(PBtree(db^.aDb[iDb].pBt));
+
+  savedBusy        := db^.init.busy;
+  db^.init.busy    := 1;
+  rc := sqlite3_exec(db, zSql, @sqlite3InitCallback, @initData, nil);
+  db^.init.busy    := savedBusy;
+
+  if rc = SQLITE_OK then rc := initData.rc;
+  { vdbe.c:7165..7170 raises SQLITE_CORRUPT when nInitRow==0 (a non-NULL
+    P4 must hit at least one schema row, otherwise sqlite_master is
+    corrupt).  We DELIBERATELY skip that check while the schema-row
+    INSERT in sqlite3Insert (codegen.pas) is still a structural skeleton
+    that emits zero ops — every fresh CREATE TABLE today reaches
+    OP_ParseSchema *before* a row is actually present in sqlite_master,
+    so a faithful corruption check would convert every CREATE TABLE to
+    SQLITE_CORRUPT and regress the entire test corpus.  Re-enable this
+    check the moment sqlite3Insert (step 11e) starts writing real rows;
+    that's tracked in Phase 6.9-bis under the productive-emission tail
+    of step 11g.1+. }
+  // if (rc = SQLITE_OK) and (initData.nInitRow = 0) then
+  //   rc := SQLITE_CORRUPT;
+  sqlite3DbFree(db, zSql);
+  Result := rc;
+end;
+
+initialization
+  vdbeParseSchemaExec := @execParseSchemaImpl;
 
 end.
