@@ -4427,18 +4427,162 @@ begin
   sqlite3DbNNFreeNN(db, pWInfo);
 end;
 
+{ Phase 6.9-bis step 11g.2.b — productive sqlite3WhereBegin prologue.
+
+  Faithful port of where.c:6828..6993 — every line up to (but not including)
+  the False-WHERE-Term-Bypass loop at where.c:6995..7027 and the planner core
+  that follows.  This commit lands only the prologue: the function still
+  returns nil at the end (after freeing the half-built WhereInfo), so the
+  cleanup contract closes cleanly and the corpus sees no behaviour change
+  (no callers exist yet).  The trimmed planner pick + OP_NotExists emission
+  that flips the 5 CREATE TABLE rows in TestExplainParity lands in the next
+  sub-progress commit.
+
+  Constants used inline because OptimizationEnabled / SQLITE_DistinctOpt are
+  not yet ported — the eDistinct branch under nTabList==0 just stays the
+  default (WHERE_DISTINCT_NOOP=0); a TODO comment marks the spot for the
+  full helper port. }
+const
+  WHERE_ONEPASS_DESIRED  = u16($0004);
+  WHERE_ONEPASS_MULTIROW = u16($0008);
+  WHERE_OR_SUBCLAUSE_C   = u16($0020);
+  WHERE_KEEP_ALL_JOINS_C = u16($2000);
+  WHERE_USE_LIMIT_C      = u16($4000);
+
 function sqlite3WhereBegin(pParse: PParse; pTabList: PSrcList; pWhere: PExpr;
   pOrderBy: PExprList; pResultSet: PExprList; pSelect: PSelect;
   wctrlFlags: u16; iAuxArg: i32): PWhereInfo;
+var
+  nByteWInfo: i32;
+  nTabList:   i32;
+  pWInfo:     PWhereInfo;
+  sWLB:       TWhereLoopBuilder;
+  pMaskSet:   PWhereMaskSet;
+  ii:         i32;
+  db:         PTsqlite3;
 begin
-  { Phase 6.2 stub — full where.c implementation deferred to Phase 6.9-bis
-    step 11g.2.b productive vertical slice.
+  Assert(((wctrlFlags and WHERE_ONEPASS_MULTIROW) = 0)
+      or (((wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0)
+          and ((wctrlFlags and WHERE_OR_SUBCLAUSE_C) = 0)));
+  Assert(((wctrlFlags and WHERE_OR_SUBCLAUSE_C) = 0)
+      or ((wctrlFlags and WHERE_USE_LIMIT_C) = 0));
 
-    Signature aligned with C source where.c:6828..6837 — 8 parameters in the
-    same order: (Parse*, SrcList*, Expr* pWhere, ExprList* pOrderBy,
-    ExprList* pResultSet, Select* pSelect, u16 wctrlFlags, int iAuxArg).
-    The productive prologue port writes pWInfo^.pSelect = pSelect, so the
-    parameter must be in place before the prologue can land. }
+  { Variable initialization (where.c:6863..6864) }
+  db := pParse^.db;
+  FillChar(sWLB, SizeOf(sWLB), 0);
+
+  { An ORDER/GROUP BY clause of more than 63 terms cannot be optimised
+    (where.c:6866..6871). }
+  if (pOrderBy <> nil) and (pOrderBy^.nExpr >= BMS) then
+  begin
+    pOrderBy   := nil;
+    wctrlFlags := wctrlFlags and (not WHERE_WANT_DISTINCT);
+    wctrlFlags := wctrlFlags or WHERE_KEEP_ALL_JOINS_C;
+  end;
+
+  { The number of tables in the FROM clause is capped at BMS (where.c:6873..
+    6878). }
+  if pTabList^.nSrc > BMS then
+  begin
+    sqlite3ErrorMsg(pParse, 'at most 64 tables in a join');
+    Exit(nil);
+  end;
+
+  { WHERE_OR_SUBCLAUSE collapses nTabList to 1 (where.c:6885). }
+  if (wctrlFlags and WHERE_OR_SUBCLAUSE_C) <> 0 then
+    nTabList := 1
+  else
+    nTabList := pTabList^.nSrc;
+
+  { Single allocation: WhereInfo header + a[nTabList] WhereLevel flexarray +
+    one trailing WhereLoop scratch slot for sWLB.pNew (where.c:6887..6896).
+    SZ_WHEREINFO already ROUND8s the header+a[] block so the trailing
+    WhereLoop is 8-byte aligned. }
+  nByteWInfo := SZ_WHEREINFO(nTabList);
+  pWInfo := PWhereInfo(sqlite3DbMallocRawNN(db, u64(nByteWInfo) + SizeOf(TWhereLoop)));
+  if db^.mallocFailed <> 0 then
+  begin
+    sqlite3DbFree(db, pWInfo);
+    Exit(nil);
+  end;
+  pWInfo^.pParse          := pParse;
+  pWInfo^.pTabList        := pTabList;
+  pWInfo^.pOrderBy        := pOrderBy;
+  pWInfo^.pResultSet      := pResultSet;
+  pWInfo^.aiCurOnePass[0] := -1;
+  pWInfo^.aiCurOnePass[1] := -1;
+  pWInfo^.nLevel          := u8(nTabList);
+  pWInfo^.iBreak          := sqlite3VdbeMakeLabel(pParse);
+  pWInfo^.iContinue       := pWInfo^.iBreak;
+  pWInfo^.wctrlFlags      := wctrlFlags;
+  pWInfo^.iLimit          := i16(iAuxArg);
+  pWInfo^.savedNQueryLoop := pParse^.nQueryLoop;
+  pWInfo^.pSelect         := pSelect;
+  { memset(&pWInfo->nOBSat, 0, offsetof(WhereInfo,sWC) - offsetof(WhereInfo,nOBSat));
+    nOBSat is at +65, sWC at +104 → 39 bytes (where.c:6918..6919). }
+  FillChar(pWInfo^.nOBSat, 39, 0);
+  { memset(&pWInfo->a[0], 0, sizeof(WhereLoop)+nTabList*sizeof(WhereLevel))
+    (where.c:6920) — zeros the trailing region: nTabList WhereLevels +
+    one tail WhereLoop. }
+  FillChar(whereInfoLevels(pWInfo)^, SizeOf(TWhereLoop)
+           + SizeInt(nTabList) * SizeOf(TWhereLevel), 0);
+  Assert(pWInfo^.eOnePass = 0); { ONEPASS defaults to OFF }
+  pMaskSet := @pWInfo^.sMaskSet;
+  pMaskSet^.n     := 0;
+  pMaskSet^.ix[0] := -99; { sentinel — never a valid cursor number, lets
+                            sqlite3WhereGetMask skip an n==0 test }
+  sWLB.pWInfo := pWInfo;
+  sWLB.pWC    := @pWInfo^.sWC;
+  sWLB.pNew   := PWhereLoop(PByte(pWInfo) + nByteWInfo);
+  Assert((PtrUInt(sWLB.pNew) and 7) = 0); { EIGHT_BYTE_ALIGNMENT }
+  whereLoopInit(sWLB.pNew);
+
+  { Split the WHERE clause into separate AND-connected subexpressions
+    (where.c:6936..6937). }
+  sqlite3WhereClauseInit(@pWInfo^.sWC, pWInfo);
+  sqlite3WhereSplit(@pWInfo^.sWC, pWhere, TK_AND);
+
+  { Special case: no FROM clause (where.c:6941..6953). }
+  if nTabList = 0 then
+  begin
+    if pOrderBy <> nil then pWInfo^.nOBSat := i8(pOrderBy^.nExpr);
+    { TODO: WHERE_WANT_DISTINCT + OptimizationEnabled(SQLITE_DistinctOpt)
+      → eDistinct = WHERE_DISTINCT_UNIQUE.  OptimizationEnabled helper not
+      yet ported; defaults to 0 (WHERE_DISTINCT_NOOP) until it lands. }
+  end
+  else
+  begin
+    { Assign one bitmask bit per FROM-clause table.  Bitmasks created for
+      *all* pTabList->nSrc tables (not just the first nTabList) so the
+      WHERE_OR_SUBCLAUSE truncation does not break GetMask lookups for
+      outer-loop cursors (where.c:6968..6982). }
+    ii := 0;
+    repeat
+      createMask(pMaskSet, SrcListItems(pTabList)[ii].iCursor);
+      sqlite3WhereTabFuncArgs(pParse, @SrcListItems(pTabList)[ii], @pWInfo^.sWC);
+      Inc(ii);
+    until ii >= pTabList^.nSrc;
+  end;
+
+  { Analyze all subexpressions (where.c:6986..6989).  sqlite3WhereExprAnalyze
+    and sqlite3WhereAddLimit are still stubs — the calls land here so once
+    they get productive bodies (11g.2.c) the prologue picks them up
+    automatically. }
+  sqlite3WhereExprAnalyze(pTabList, @pWInfo^.sWC);
+  if (pSelect <> nil) and (pSelect^.pLimit <> nil) then
+    sqlite3WhereAddLimit(@pWInfo^.sWC, pSelect);
+  if pParse^.nErr <> 0 then
+  begin
+    whereInfoFree(db, pWInfo);
+    Exit(nil);
+  end;
+
+  { Planner core + per-loop codegen + epilogue land in the next 11g.2.b
+    sub-progress commit.  For now: free the half-built WhereInfo (closes
+    the cleanup contract — pLoops is empty, pMemToFree is empty, sWC was
+    initialised and may carry split terms) and return nil.  No callers
+    consume the WhereInfo yet, so this is a no-op for the corpus. }
+  whereInfoFree(db, pWInfo);
   Result := nil;
 end;
 

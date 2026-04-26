@@ -21,6 +21,126 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    productive sqlite3WhereBegin prologue body.**  Replaced the bare
+    `Result := nil` stub of `sqlite3WhereBegin`
+    (`passqlite3codegen.pas:4430`) with a faithful port of the where.c:
+    6828..6993 prologue — every line up to (but not including) the
+    False-WHERE-Term-Bypass loop and the planner core.  Concretely:
+      * Two leading `Assert`s mirroring the C contract checks on
+        WHERE_ONEPASS_MULTIROW / WHERE_OR_SUBCLAUSE / WHERE_USE_LIMIT
+        flag interactions.  Pascal needed extra parens around the
+        `(x and y) = 0` clauses (operator-precedence trap — `and` and
+        `=` parse `(x and y) = 0 or (...)` as `(x and y) = (0 or ...)`).
+      * Variable init: `db := pParse^.db`; `FillChar(sWLB, ..., 0)`.
+      * ORDER BY / GROUP BY cap (>= BMS): zero pOrderBy, clear
+        WHERE_WANT_DISTINCT, set WHERE_KEEP_ALL_JOINS.
+      * FROM-clause cap (`pTabList^.nSrc > BMS`) → emit
+        sqlite3ErrorMsg + return nil.  The C variadic
+        `"at most %d tables"` substitutes BMS=64 inline since our
+        sqlite3ErrorMsg port is a fixed-string sink today.
+      * `nTabList := (WHERE_OR_SUBCLAUSE) ? 1 : pTabList^.nSrc`.
+      * Single allocation: `sqlite3DbMallocRawNN(db, SZ_WHEREINFO(nTabList)
+        + SizeOf(TWhereLoop))`.  On OOM, free + return nil.
+      * Field initialisation: pParse, pTabList, pOrderBy, pResultSet,
+        aiCurOnePass[0..1]:=-1, nLevel:=nTabList, iBreak/iContinue from
+        sqlite3VdbeMakeLabel, wctrlFlags, iLimit, savedNQueryLoop,
+        pSelect.  The `memset(&pWInfo->nOBSat, 0, offsetof(WhereInfo,sWC)
+        - offsetof(WhereInfo,nOBSat))` block becomes
+        `FillChar(pWInfo^.nOBSat, 39, 0)` — 104-65=39 bytes spanning
+        nOBSat..revMask, locked by TestWhereStructs's offset sentinel.
+      * Trailing-region zero: `FillChar(whereInfoLevels(pWInfo)^,
+        SizeOf(TWhereLoop) + nTabList*SizeOf(TWhereLevel), 0)`.
+      * MaskSet init with `ix[0]=-99` sentinel (sqlite3WhereGetMask
+        skips an n==0 test).
+      * sWLB setup: pWInfo, pWC=&pWInfo^.sWC, pNew at
+        `PByte(pWInfo)+nByteWInfo` (8-byte aligned per
+        EIGHT_BYTE_ALIGNMENT assert), then `whereLoopInit(sWLB.pNew)`.
+      * `sqlite3WhereClauseInit` + `sqlite3WhereSplit(pWhere, TK_AND)`.
+      * `nTabList==0` special case: nOBSat from pOrderBy^.nExpr; the
+        eDistinct = WHERE_DISTINCT_UNIQUE branch is left as a TODO
+        (OptimizationEnabled / SQLITE_DistinctOpt helper not ported
+        yet — defaults to WHERE_DISTINCT_NOOP=0; harmless until
+        nTabList==0 actually exercised).
+      * `nTabList>0` walk: `createMask` + `sqlite3WhereTabFuncArgs`
+        for every entry in pTabList (note: walks all `nSrc` entries,
+        not just the truncated `nTabList` — Ticket #3015 contract).
+      * `sqlite3WhereExprAnalyze` + (if pSelect^.pLimit) call to
+        `sqlite3WhereAddLimit` — both are still stubs but the calls
+        land here so 11g.2.c picks them up automatically when their
+        bodies become productive.
+      * `if pParse^.nErr <> 0` → `whereInfoFree` + return nil.
+      * Tail: since the planner core / per-loop codegen / epilogue
+        haven't been ported yet, the function `whereInfoFree`s the
+        half-built pWInfo and returns nil.  This closes the cleanup
+        contract (whereInfoFree was already productive) and makes
+        the prologue safe to land alone.
+
+    Why this is safe to land alone:
+      * No callers exist in productive code (`grep
+        sqlite3WhereBegin\(` finds only the declaration and the
+        definition — sqlite3DeleteFrom / sqlite3Update / sqlite3Select
+        all still skip the WhereBegin call site at this stage).  So
+        regardless of what the prologue does internally, no
+        observable bytecode emission changes.
+      * Every allocation is paired with a free on every return path
+        (OOM → sqlite3DbFree, error → whereInfoFree, success → final
+        whereInfoFree).  No leaks even if a future caller starts
+        invoking us before the planner core lands.
+      * sqlite3WhereSplit / sqlite3WhereExprAnalyze /
+        sqlite3WhereAddLimit / sqlite3WhereTabFuncArgs are either
+        stubs or already-productive helpers operating only on the
+        local pWInfo / pWC — they don't touch external Parse state
+        in ways that survive the whereInfoFree.
+
+    Concrete changes:
+      * `passqlite3codegen.pas:4430..` — `sqlite3WhereBegin` body
+        rewritten (~120 lines, was 1 line).  New file-private
+        `const` block immediately above (5 missing WHERE_* flag
+        constants: ONEPASS_DESIRED, ONEPASS_MULTIROW, OR_SUBCLAUSE,
+        KEEP_ALL_JOINS, USE_LIMIT — named with `_C` suffix on the
+        three not already present in the public const block to
+        avoid future merge conflicts when 11g.2.c lands the public
+        versions).
+
+    Test status: full build clean (no new warnings or errors),
+    regression sweep all green —
+    TestWhereBasic 52/52, TestWhereStructs 148/148,
+    TestPrepareBasic 20/20, TestParser 45/45, TestSchemaBasic 44/44,
+    TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+    TestExprBasic 40/40, TestInitCallback 29/29, TestExplainParity
+    unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **WHERE_OR_SUBCLAUSE / WHERE_KEEP_ALL_JOINS / WHERE_USE_LIMIT
+        / WHERE_ONEPASS_DESIRED / WHERE_ONEPASS_MULTIROW were
+        missing from the public `const` block.**  Added file-private
+        copies with `_C` suffix inside the WhereBegin function-local
+        const block so the prologue can compile.  When 11g.2.c ports
+        whereexpr.c (which references the same flags), it should
+        promote them to the public block at codegen.pas:1392..1407
+        and drop the `_C` suffix here.
+      * **OptimizationEnabled / SQLITE_DistinctOpt helper not ported.**
+        Marked with TODO in the nTabList==0 branch.  Defaults to
+        WHERE_DISTINCT_NOOP which is the conservative answer (no
+        DISTINCT optimisation kicks in).  Lands cheap when needed.
+      * **sqlite3ErrorMsg variadic loss.**  C source uses
+        `"at most %d tables in a join"` with BMS substitution; our
+        port hard-codes `"at most 64 tables in a join"` since the
+        Pascal sqlite3ErrorMsg port is a fixed-string sink.  Acceptable
+        as long as BMS stays 64 (which it must — 64-bit Bitmask).
+      * **Next 6.9-bis target (still 11g.2.b): trimmed planner pick
+        + OP_NotExists emission.**  With the prologue in place, the
+        next sub-progress lands the rowid-EQ shape detector (recognise
+        a single equality term whose LHS is `pTabList->a[0].iCursor`'s
+        rowid), hard-codes the WhereLoop pick (single-cursor,
+        OP_NotExists strategy, no IPK setup), and emits the seek +
+        Goto-back-to-Next pattern that schema-row UPDATE / DELETE
+        inner statements need.  Once paired with re-enabling the
+        productive tails in `sqlite3DeleteFrom` and `sqlite3Update`,
+        TestExplainParity should bump from 2 PASS → 7 PASS as the 5
+        CREATE TABLE rows flip.
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     BMS constant + SZ_WHEREINFO + whereInfoLevels flexarray accessor.**
     Scaffolding sub-progress preparing the `sqlite3WhereBegin` productive
     prologue (where.c:6862..6940).  Adds the three structural primitives
@@ -8132,6 +8252,54 @@ Phase 5.9 depends on this being done first.
       TestExplainParity unchanged at 2 PASS / 8 DIVERGE / 0 ERROR).
       Now unblocks the productive prologue port, which writes
       `pWInfo^.pSelect = pSelect` directly.
+
+      **Sub-progress (landed 2026-04-26 — productive prologue body).**
+      Replaced the bare `Result := nil` stub of `sqlite3WhereBegin`
+      (`passqlite3codegen.pas:4430`) with a faithful port of
+      where.c:6828..6993 — every line up to (but not including) the
+      False-WHERE-Term-Bypass loop and the planner core.  Covers: the
+      two leading flag-interaction Asserts; variable init
+      (`db := pParse^.db`, FillChar of sWLB); ORDER BY cap (>=BMS →
+      pOrderBy:=nil + clear WANT_DISTINCT + set KEEP_ALL_JOINS);
+      FROM-clause cap (>BMS → sqlite3ErrorMsg + return nil); nTabList
+      computation under WHERE_OR_SUBCLAUSE; single allocation
+      (`SZ_WHEREINFO(nTabList) + SizeOf(TWhereLoop)`) with mallocFailed
+      check; 14 field initialisations + the
+      `FillChar(pWInfo^.nOBSat, 39, 0)` block (104-65=39 bytes,
+      nOBSat..revMask, locked by TestWhereStructs); trailing-region
+      zero via whereInfoLevels accessor; MaskSet `ix[0]=-99` sentinel;
+      sWLB setup with EIGHT_BYTE_ALIGNMENT assert + `whereLoopInit`;
+      `sqlite3WhereClauseInit` + `sqlite3WhereSplit(TK_AND)`;
+      `nTabList==0` branch (nOBSat from pOrderBy, eDistinct TODO);
+      `nTabList>0` walk doing `createMask` + `sqlite3WhereTabFuncArgs`
+      for ALL `nSrc` entries (Ticket #3015 contract);
+      `sqlite3WhereExprAnalyze` + conditional `sqlite3WhereAddLimit`;
+      pParse->nErr error-path with `whereInfoFree`.  The function
+      ends by calling `whereInfoFree` and returning nil — closes the
+      cleanup contract pending the planner core, makes the prologue
+      safe to land alone since no callers consume the WhereInfo yet.
+      Five missing WHERE_* flag constants (ONEPASS_DESIRED,
+      ONEPASS_MULTIROW, OR_SUBCLAUSE, KEEP_ALL_JOINS, USE_LIMIT)
+      added as file-private constants with `_C` suffix immediately
+      above the function (TODO: 11g.2.c should promote them to the
+      public const block at codegen.pas:1392..1407 and drop the `_C`
+      suffix).  `OptimizationEnabled` / `SQLITE_DistinctOpt` helper
+      not yet ported; the eDistinct=WHERE_DISTINCT_UNIQUE branch in
+      the nTabList==0 case is left as a TODO defaulting to
+      WHERE_DISTINCT_NOOP=0 (conservative; harmless until that branch
+      is exercised).  `sqlite3ErrorMsg` variadic loss: C source uses
+      `"at most %d tables in a join"` with BMS substitution; our
+      port hard-codes `"at most 64 tables in a join"` since the
+      Pascal sqlite3ErrorMsg port is a fixed-string sink (acceptable
+      as long as BMS stays 64).  Full regression sweep all green
+      (TestWhereBasic 52/52, TestWhereStructs 148/148,
+      TestPrepareBasic 20/20, TestParser 45/45, TestSchemaBasic 44/44,
+      TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+      TestExprBasic 40/40, TestInitCallback 29/29, TestExplainParity
+      unchanged at 2 PASS / 8 DIVERGE / 0 ERROR).  Next sub-progress:
+      trimmed planner pick + OP_NotExists emission for the rowid-EQ
+      shape, then re-enable productive tails in sqlite3DeleteFrom +
+      sqlite3Update.
 
       **Sub-progress (landed 2026-04-26 — BMS / SZ_WHEREINFO /
       whereInfoLevels scaffolding).**  Added three structural primitives
