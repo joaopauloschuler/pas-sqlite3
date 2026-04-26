@@ -2070,6 +2070,7 @@ procedure sqlite3Savepoint(pParse: PParse; op: i32; pName: PToken);
 function  sqlite3OpenTempDatabase(pParse: PParse): i32;
 procedure sqlite3CodeVerifySchema(pParse: PParse; iDb: i32);
 procedure sqlite3CodeVerifyNamedSchema(pParse: PParse; zDb: PAnsiChar);
+procedure sqlite3ForceNotReadOnly(pParse: PParse);
 procedure sqlite3BeginWriteOperation(pParse: PParse;
   setStatement: i32; iDb: i32);
 procedure sqlite3MultiWrite(pParse: PParse);
@@ -5899,9 +5900,91 @@ begin
   sqlite3SrcListDelete(pParse^.db, pName);
 end;
 
+{ sqlite3DropIndex — port of build.c:4595.
+  Code-gen for `DROP INDEX [IF EXISTS] <name>`.  Two reachable arms today:
+    * index not found + IF EXISTS  → emit only sqlite3CodeVerifyNamedSchema +
+      sqlite3ForceNotReadOnly (and set checkSchema), then exit.
+    * index found + APPDEF        → emit DELETE-from-sqlite_schema +
+      ClearStat + ChangeCookie + destroyRootPage + OP_DropIndex.
+  The found-index arm depends on sqlite3NestedParse / sqlite3ClearStatTables /
+  destroyRootPage / sqlite3BeginWriteOperation / sqlite3ChangeCookie.  Several
+  of those are still Phase 7 stubs (NestedParse, BeginWriteOperation,
+  ChangeCookie); so for now the structural port lands but the OP stream for
+  the found-index path will be incomplete until those helpers are filled in.
+  TestExplainParity exercises only the IF EXISTS / not-found path today. }
 procedure sqlite3DropIndex(pParse: PParse; pName: PSrcList; ifExists: i32);
+label
+  exit_drop_index;
+var
+  pIndex: PIndex2;
+  v:      PVdbe;
+  db:     PTsqlite3;
+  iDb:    i32;
+  pItem:  PSrcItem;
+{$IFNDEF SQLITE_OMIT_AUTHORIZATION}
+  code:   i32;
+  pTab:   PTable2;
+  zDb:    PAnsiChar;
+  zTab:   PAnsiChar;
+{$ENDIF}
 begin
-  sqlite3SrcListDelete(pParse^.db, pName);
+  db := pParse^.db;
+  if db^.mallocFailed <> 0 then goto exit_drop_index;
+  { Phase 6/7 test scaffolds (TestParserSmoke) drive the parser against a
+    stub db (eOpenState<>$76) without a real schema — for those, fall back
+    to the legacy stub behaviour: just delete the SrcList. }
+  if db^.eOpenState <> $76 then goto exit_drop_index;
+  Assert(pParse^.nErr = 0, 'DropIndex with prior errors');
+  Assert(pName^.nSrc = 1, 'DropIndex SrcList must have exactly 1 entry');
+  pItem := SrcListItems(pName);
+  if sqlite3ReadSchema(pParse) <> SQLITE_OK then goto exit_drop_index;
+  pIndex := sqlite3FindIndex(db, pItem^.zName, pItem^.u4.zDatabase);
+  if pIndex = nil then begin
+    if ifExists = 0 then begin
+      sqlite3ErrorMsg(pParse, 'no such index');
+    end else begin
+      sqlite3CodeVerifyNamedSchema(pParse, pItem^.u4.zDatabase);
+      sqlite3ForceNotReadOnly(pParse);
+    end;
+    pParse^.parseFlags := pParse^.parseFlags or $200; { checkSchema bit }
+    goto exit_drop_index;
+  end;
+  if (pIndex^.idxFlags and $03) <> SQLITE_IDXTYPE_APPDEF then begin
+    sqlite3ErrorMsg(pParse,
+      'index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped');
+    goto exit_drop_index;
+  end;
+  iDb := sqlite3SchemaToIndex(db, pIndex^.pSchema);
+  Assert((iDb >= 0) and (iDb < db^.nDb), 'iDb out of range');
+{$IFNDEF SQLITE_OMIT_AUTHORIZATION}
+  code := SQLITE_DROP_INDEX;
+  pTab := pIndex^.pTable;
+  zDb  := db^.aDb[iDb].zDbSName;
+  zTab := PAnsiChar(LEGACY_SCHEMA_TABLE);
+  if (OMIT_TEMPDB = 0) and (iDb = 1) then zTab := PAnsiChar(LEGACY_TEMP_SCHEMA_TABLE);
+  if sqlite3AuthCheck(pParse, SQLITE_DELETE_AUTH, zTab, nil, zDb) <> 0 then
+    goto exit_drop_index;
+  if (OMIT_TEMPDB = 0) and (iDb = 1) then code := SQLITE_DROP_TEMP_INDEX;
+  if sqlite3AuthCheck(pParse, code, pIndex^.zName, pTab^.zName, zDb) <> 0 then
+    goto exit_drop_index;
+{$ENDIF}
+
+  { Generate code to remove the index from the schema table. }
+  v := sqlite3GetVdbe(pParse);
+  if v <> nil then begin
+    sqlite3BeginWriteOperation(pParse, 1, iDb);
+    { TODO(Phase 6.x): once sqlite3NestedParse is real, emit the
+      `DELETE FROM <db>.sqlite_master WHERE name=<idx> AND type='index'`
+      sub-statement that the C reference produces here. }
+    sqlite3NestedParse(pParse, nil);
+    { TODO(Phase 6.x): sqlite3ClearStatTables(pParse, iDb, 'idx', pIndex^.zName); }
+    sqlite3ChangeCookie(pParse, iDb);
+    { TODO(Phase 6.x): destroyRootPage(pParse, pIndex^.tnum, iDb); }
+    sqlite3VdbeAddOp4(v, OP_DropIndex, iDb, 0, 0, pIndex^.zName, 0);
+  end;
+
+exit_drop_index:
+  sqlite3SrcListDelete(db, pName);
 end;
 
 procedure sqlite3CreateForeignKey(pParse: PParse; pFromCol: PExprList;
@@ -6222,14 +6305,63 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ sqlite3CodeVerifySchema — port of build.c:5404.
+  Mark database iDb as needing a schema-cookie verification at the top of the
+  generated VDBE.  sqlite3FinishCoding walks pParse^.cookieMask and emits
+  one OP_Transaction per set bit. }
 procedure sqlite3CodeVerifySchema(pParse: PParse; iDb: i32);
+var
+  pToplevel: PParse;
+  bit: u32;
 begin
-  { Phase 7 }
+  if pParse^.pToplevel <> nil then
+    pToplevel := pParse^.pToplevel
+  else
+    pToplevel := pParse;
+  Assert((iDb >= 0) and (iDb < pParse^.db^.nDb), 'iDb out of range');
+  bit := u32(1) shl iDb;
+  if (pToplevel^.cookieMask and bit) = 0 then begin
+    pToplevel^.cookieMask := pToplevel^.cookieMask or bit;
+    if (OMIT_TEMPDB = 0) and (iDb = 1) then
+      sqlite3OpenTempDatabase(pToplevel);
+  end;
 end;
 
+{ sqlite3CodeVerifyNamedSchema — port of build.c:5418.
+  Verify the schema of every attached database whose zDbSName matches zDb
+  (or all attached dbs when zDb is nil). }
 procedure sqlite3CodeVerifyNamedSchema(pParse: PParse; zDb: PAnsiChar);
+var
+  db: PTsqlite3;
+  i: i32;
 begin
-  { Phase 7 }
+  db := pParse^.db;
+  for i := 0 to db^.nDb - 1 do begin
+    if (db^.aDb[i].pBt <> nil) and
+       ((zDb = nil) or (sqlite3StrICmp(zDb, db^.aDb[i].zDbSName) = 0)) then
+      sqlite3CodeVerifySchema(pParse, i);
+  end;
+end;
+
+{ sqlite3ForceNotReadOnly — port of build.c:1181.
+  Emit a no-op OP_JournalMode query so the generated VDBE is treated as a
+  writer.  Used by DROP INDEX / DROP TABLE IF EXISTS where the schema object
+  is missing — the statement still needs to be classified as non-readonly so
+  the prepared statement does not slip past sqlite3_stmt_readonly checks. }
+procedure sqlite3ForceNotReadOnly(pParse: PParse);
+const
+  PAGER_JOURNALMODE_QUERY = -1; { mirrors passqlite3pager const }
+var
+  iReg: i32;
+  v: PVdbe;
+begin
+  Inc(pParse^.nMem);
+  iReg := pParse^.nMem;
+  v := sqlite3GetVdbe(pParse);
+  if v <> nil then begin
+    sqlite3VdbeAddOp3(v, OP_JournalMode, 0, iReg, PAGER_JOURNALMODE_QUERY);
+    sqlite3VdbeUsesBtree(v, 0);
+  end;
 end;
 
 procedure sqlite3BeginWriteOperation(pParse: PParse; setStatement: i32; iDb: i32);

@@ -20,6 +20,105 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 2): sqlite3DropIndex +
+    schema-verify helpers port (build.c:4595, 5404, 5418, 1181).**
+    Replaces the `{ Phase 7 }` stubs for sqlite3CodeVerifySchema,
+    sqlite3CodeVerifyNamedSchema and the trivial sqlite3DropIndex
+    (which previously only deleted the SrcList) with byte-faithful
+    ports.  Also adds the small helper sqlite3ForceNotReadOnly
+    (build.c:1181, 6 ops in C).  These three helpers are the
+    on-ramp for every DDL codegen that needs to mark a database as
+    schema-cookie-verified or as a writer.
+
+    Concrete changes:
+      * `src/passqlite3codegen.pas`:
+        - forward decl `sqlite3ForceNotReadOnly` near
+          `sqlite3CodeVerify*`.
+        - `sqlite3CodeVerifySchema` (was stub):
+          `pToplevel := pParse^.pToplevel ?? pParse`; if cookieMask
+          bit not set, set it; `OMIT_TEMPDB=0 + iDb=1` →
+          `sqlite3OpenTempDatabase(pToplevel)`.
+        - `sqlite3CodeVerifyNamedSchema` (was stub): walks
+          `db^.aDb[i]`, calls VerifySchema for each `pBt<>nil`
+          whose `zDbSName` matches (or any when `zDb=nil`).  Avoids
+          a local `pDb: PDb` because `PDb` is in `passqlite3util`
+          and FPC chokes on the qualified name in some contexts —
+          inlined the array index instead.
+        - new `sqlite3ForceNotReadOnly`: bumps `nMem`,
+          `OP_JournalMode 0,iReg,PAGER_JOURNALMODE_QUERY` +
+          `sqlite3VdbeUsesBtree(v,0)`.  Defines
+          `PAGER_JOURNALMODE_QUERY = -1` locally to avoid pulling
+          `passqlite3pager` into codegen's `uses`.
+        - `sqlite3DropIndex` (was stub): full body from
+          build.c:4595..4661 — ReadSchema, FindIndex, IF EXISTS
+          handling (CodeVerifyNamedSchema + ForceNotReadOnly +
+          checkSchema bit), idxType-APPDEF check, AuthCheck, and
+          the writer-arm BeginWriteOperation/NestedParse/
+          ChangeCookie/OP_DropIndex emit.  The found-index branch
+          calls into helpers (`sqlite3NestedParse`,
+          `sqlite3ClearStatTables`, `destroyRootPage`,
+          `sqlite3BeginWriteOperation`, `sqlite3ChangeCookie`)
+          that are still stubs; structural port lands today, OP
+          stream for that arm filled in as those helpers ship.
+          `sqlite3ErrorMsg` calls drop the printf-style args (the
+          stub today ignores them anyway).
+        - Same `eOpenState <> $76` test-scaffold gate as
+          FinishCoding so TestParserSmoke's stub-db
+          `DROP INDEX i` row stays green (sqlite3FindIndex on a
+          stub db with no real schema would otherwise raise an
+          AV; legacy stub silently dropped the SrcList).
+        - `pIndex^.idxType` → `(pIndex^.idxFlags and $03)` since
+          idxType is the low 2 bits of the packed bitfield at
+          `TIndex.idxFlags` offset 100, not its own field.
+
+    Tests: full build clean.  TestExplainParity:
+    DROP INDEX IF EXISTS now emits 5 ops (was 3) matching the C
+    op-count exactly; only a single p3 mismatch remains at op[3]
+    on `OP_Transaction` because the fixture's `CREATE TABLE`s
+    can't bump schema_cookie until StartTable/EndTable land.
+    BEGIN still PASSes.  Score unchanged at 1/7/2 because the
+    DROP INDEX row hasn't yet flipped to PASS — it will once
+    `sqlite3StartTable`/`sqlite3EndTable` are real and the
+    fixture actually writes the schema cookie.
+    Regression spot check: TestPrepareBasic 20/20, TestParser
+    45/45, TestParserSmoke 20/20, TestSchemaBasic 44/44,
+    TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+    TestExprBasic 40/40, TestVdbeTxn 8/8, TestAuthBuiltins 34/34.
+
+    Discoveries / next-step notes:
+      * **`TIndex.idxType` is bitfield-packed at offset 100.**  The
+        C `pIndex->idxType` reads the low 2 bits of `idxFlags`.
+        Pascal port masks with `$03`.  `SQLITE_IDXTYPE_APPDEF=0`
+        (the most common value) means `(idxFlags & 3) == 0`.
+        Add to porting-checklist gotchas.
+      * **`PDb` qualified-from-`passqlite3util` is fragile.**
+        Declaring `var pDb: PDb;` inside a codegen procedure
+        triggered `Error in type definition` even though
+        `passqlite3util` is in `uses`.  Workaround: index
+        `db^.aDb[i]` directly instead of taking its address.
+        Possibly an FPC-quirk with the same-named record/pointer
+        types living across units.  Worth a deeper look during
+        the next codegen cleanup.
+      * **Test-scaffold gate added to `sqlite3DropIndex`.** Same
+        idiom as `sqlite3FinishCoding`: bail to the legacy
+        SrcList-only path when `db^.eOpenState <> $76`.  Without
+        it, `TestParserSmoke`'s `DROP INDEX i` row regresses
+        because the stub db has no schema and the new error path
+        sets `nErr=1`.  Audit when test scaffolds migrate to
+        `sqlite3_open_v2(":memory:")`.
+      * **Next 6.9-bis target:** `sqlite3StartTable` /
+        `sqlite3EndTable` (32–43 ops, the biggest surface, but
+        the highest-leverage — it both flips `CREATE TABLE
+        simple/IF NOT EXISTS/composite PK` rows and bumps the
+        fixture's `schema_cookie` so the existing DROP INDEX
+        IF EXISTS row finally PASSes).  After that:
+        `sqlite3CreateIndex` (37/41 ops), `sqlite3DropTable`
+        (49 ops).  Found-index DropIndex arm depends on real
+        ports of `sqlite3NestedParse`, `sqlite3ClearStatTables`,
+        `destroyRootPage`, `sqlite3BeginWriteOperation`,
+        `sqlite3ChangeCookie` — those land alongside the
+        StartTable/EndTable work since they share helpers.
+
   - **2026-04-26 — Phase 6.9-bis (step 1): sqlite3BeginTransaction +
     sqlite3EndTransaction port (build.c:5245..5297).**  Replaces the
     `{ Phase 7 }` stubs in `passqlite3codegen.pas` with byte-identical
@@ -5711,15 +5810,24 @@ Phase 5.9 depends on this being done first.
 - [~] **6.9-bis** Drive the diverge/error counts in TestExplainParity to
   zero by porting the remaining DDL codegen helpers
   (~~`sqlite3BeginTransaction`~~ done 2026-04-26,
+  ~~`sqlite3DropIndex` (IF EXISTS / not-found arm + helpers
+  `sqlite3CodeVerifySchema`, `sqlite3CodeVerifyNamedSchema`,
+  `sqlite3ForceNotReadOnly`)~~ done 2026-04-26,
   `sqlite3StartTable`, `sqlite3EndTable`, `sqlite3CreateIndex`,
-  `sqlite3DropTable`, `sqlite3DropIndex`)
+  `sqlite3DropTable`, found-index DropIndex arm helpers
+  `sqlite3NestedParse` / `sqlite3ClearStatTables` /
+  `destroyRootPage` / `sqlite3BeginWriteOperation` /
+  `sqlite3ChangeCookie`)
   to byte-identical opcode emission against C.  Each helper landed
   flips one row from DIVERGE → PASS in TestExplainParity; an extra
   diagnostic-only column-list AV must also be triaged
   (`CREATE TABLE typed`, `CREATE TABLE WITHOUT ROWID`).  Once all
   ten current rows PASS, expand corpus to DML / SELECT / pragma /
   trigger forms (the same exclusion list as TestParser).
-  Status (2026-04-26): 1 PASS / 7 DIVERGE / 2 ERROR (was 0/8/2).
+  Status (2026-04-26): 1 PASS / 7 DIVERGE / 2 ERROR.  DROP INDEX
+  IF EXISTS row now produces 5 ops (matches C count); single p3
+  mismatch on OP_Transaction, gated on StartTable/EndTable
+  bumping the fixture's schema_cookie.
 
 ---
 
