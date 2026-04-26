@@ -21,162 +21,28 @@ remains `history.md`.  This file is the punch list.
 
 ---
 
-## Phase 5 — VDBE (one item open)
-
-- [ ] **5.10** `TestVdbeTrace.pas` differential opcode-trace gate.
-  Deferred behind Phase 6.9 / 7.4b: needs SQL → VDBE end-to-end
-  through the Pascal pipeline so per-opcode traces can be diffed
-  against the C reference under `PRAGMA vdbe_trace=ON`.  Re-open
-  once 6.9-bis flips TestExplainParity to all-PASS.
-
----
-
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-- [~] **6.9** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
-  Scaffold is landed (10-row DDL/transaction corpus, report-only).
-  Status 2026-04-26: **2 PASS / 8 DIVERGE / 0 ERROR**.  Drive to
-  all-PASS, then expand corpus to DML / SELECT / pragma / trigger
-  forms (same exclusion list as TestParser).  Promote from
-  report-only to hard gate when the full corpus is green.
-
-- [~] **6.9-bis** Drive the diverge/error counts to zero.  All earlier
-  sub-steps (11a–11g.1) are in.  Remaining work is the WHERE-engine
-  port — the largest single chunk of porting still ahead.
-
-  - [~] **6.9-bis 11g.2.b** Vertical slice — minimal-viable
+- [ ] **6.9-bis 11g.2.b** Vertical slice — minimal-viable
     `sqlite3WhereBegin` / `sqlite3WhereEnd` for the single-table,
     single-rowid-EQ-predicate case.  Bookkeeping primitives, prologue,
     cleanup contract, and several leaf helpers (codeCompare cluster,
     sqlite3ExprCanBeNull, sqlite3ExprCodeTemp + 6 unary arms,
     TK_COLLATE/TK_SPAN/TK_UPLUS arms) are already landed.
-    Outstanding sub-progress before this slice closes:
-    - [X] Port `exprComputeOperands` (expr.c:2417..2464) and land
-      the comparison cluster (TK_IS/TK_ISNOT/TK_LT..TK_EQ) plus the
-      arithmetic cluster (TK_PLUS..TK_CONCAT, incl. TK_STAR/TK_REM/
-      TK_BITAND/TK_BITOR/TK_SLASH/TK_LSHIFT/TK_RSHIFT) in
-      `sqlite3ExprCodeTarget`.  (Done — codegen.pas:3859..3979.)
-      Note: `exprCodeBetween` deferred — depends on the still-unported
-      `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` recursive jump pair;
-      track separately under the IfTrue/IfFalse sub-bullet below.
-      Also note: vector-comparison fast path (`codeVectorCompare`)
-      stubbed to OP_Null inside the comparison arm — vector EQ inside
-      a non-row-value WHERE clause does not arise on the corpus this
-      slice gates on, so the stub is acceptable until 11g.2.e.
-    - [X] Port the recursive jump pair `sqlite3ExprIfTrue` /
-      `sqlite3ExprIfFalse` (expr.c:6100..6469, ~370 lines).
-      Done — codegen.pas immediately after `sqlite3ExprCodeTemp`.
-      Includes `sqlite3ExprIfFalseDup`.  Two intentional stubs:
-      TK_BETWEEN and TK_IN both fall through to the default
-      OP_If/OP_IfNot path because `exprCodeBetween` (needs
-      `exprCodeVector`) and `sqlite3ExprCodeIN` are not yet ported.
-      The vertical-slice (rowid-EQ) corpus does not exercise either
-      form; promote when 11g.2.e lands.  Note: TK_GT is named
-      `TK_GT_TK` in this codebase (collision with a Pascal type) —
-      future ports must use the `_TK` suffix for that single token.
-    - [X] Port the False-WHERE-Term-Bypass loop in `sqlite3WhereBegin`
-      (where.c:6995..7036).  Done — codegen.pas, immediately after the
-      `pParse^.nErr` short-circuit inside the productive `sqlite3WhereBegin`
-      prologue.  Walks `sWLB.pWC^.a[0..nBase-1]`, applies the four
-      conditions verbatim (TERM_VIRTUAL skip, prereqAll==0 + deterministic
-      + (no EP_InnerON ∧ JT_LTORJ-on-LHS) check), emits the
-      `sqlite3ExprIfFalse(...,iBreak,SQLITE_JUMPIFNULL)` short-circuit
-      and tags hit terms TERM_CODED.  Required adding the missing
-      `JT_LTORJ = $40` constant alongside the other JT_* flags
-      (sqliteInt.h:3441).  No corpus delta yet — the prologue still
-      tears down and returns nil at the end; this only becomes
-      observable once the trimmed planner pick + OP_NotExists emission
-      lands in the next sub-bullet.
-    - [~] Implement the trimmed planner pick + `OP_NotExists` emission
+    - Implement the trimmed planner pick + `OP_NotExists` emission
       for the rowid-EQ shape (hard-code the cost selection; defer
       `whereLoopAddBtree` etc.).
-      Sub-progress 2026-04-26: ported `OptimizationEnabled` /
-      `OptimizationDisabled` (sqliteInt.h:1938..1939) plus the
-      dbOptFlags constants the where engine consults
-      (`SQLITE_DistinctOpt`, `SQLITE_OmitNoopJoin`, `SQLITE_BloomFilter`,
-      `SQLITE_OnePass`, `SQLITE_QueryFlattener`); ported
-      `isDistinctRedundant` (where.c:629..685) — full IPK column
-      fast-path; the UNIQUE-index loop body is deferred to 11g.2.c
-      because it needs `sqlite3WhereFindTerm` / `findIndexCol` /
-      `indexColumnNotNull` (all whereexpr.c).  Wired the
-      `WHERE_WANT_DISTINCT` block (where.c:7039..7053) into
-      `sqlite3WhereBegin` immediately after the False-WHERE-Term-Bypass
-      loop, and replaced the eDistinct TODO inside the `nTabList==0`
-      branch with the real `OptimizationEnabled(SQLITE_DistinctOpt)` →
-      `WHERE_DISTINCT_UNIQUE` rule.  No corpus delta yet (DISTINCT is
-      not exercised by the 10-row gate; the prologue still tears down
-      and returns nil at the end).
-      Sub-progress 2026-04-26 (cont): ported the WHERE-scanner trio
-      `whereScanInit` / `whereScanInitIndexExpr` / `whereScanNext`
-      (where.c:351..522) and the public `sqlite3WhereFindTerm`
-      (where.c:549..574).  Lives in codegen.pas immediately before
-      `sqlite3WhereExprAnalyze`.  Faithful 1:1 port of the C control
-      flow, including the multi-level WhereClause walk via `pOuter`
-      and the WO_EQUIV transitivity chain.  Four helpers consumed
-      but not yet ported are stubbed with explicit gates documented
-      in the banner: `whereRightSubexprIsColumn` (only reached via
-      WO_EQUIV — exprAnalyze never sets it today),
-      `sqlite3ExprCompareSkip` (only reached for XN_EXPR-indexed
-      columns), `sqlite3IndexAffinityOk` (only when zCollName<>nil,
-      i.e. pIdx<>nil), `indexInAffinityOk` (only for WO_IN terms).
-      Unblocks `whereShortCut` and the per-loop scanner consumers
-      (~6 call sites in where.c) once exprAnalyze starts populating
-      WhereTerm fields.  No corpus delta — until
-      `sqlite3WhereExprAnalyze` populates eOperator / leftCursor /
-      u.x.leftColumn / prereqRight, the scanner returns nil for every
-      term.  TestExplainParity remains 2 PASS / 8 DIVERGE / 0 ERROR.
-      Sub-progress 2026-04-26 (cont): ported `whereShortCut`
-      (where.c:6334..6440, ~90 lines) — the planner shortcut that
-      detects a single-table rowid-EQ predicate (cost=33,
-      sqlite3LogEst(10)) or a UNIQUE-index full-equality predicate
-      (cost=39, sqlite3LogEst(15)).  Lives in codegen.pas immediately
-      before the productive `sqlite3WhereBegin`.  Faithful 1:1 port
-      of the C control flow, including inline
-      `IsVirtual(pTab) → eTabType=TABTYP_VTAB` and
-      `IsUniqueIndex(pIdx) → onError<>OE_None` checks plus the
-      `uniqNotNull` (idxFlags bit 3) and `isCovering` (idxFlags
-      bit 5) bitfield reads from the layout block at
-      codegen.pas:1002..1004.  Returns 0 unconditionally today
-      because `whereScanInit` finds nothing (terms still carry
-      eOperator=0 from the stub `sqlite3WhereExprAnalyze`); becomes
-      effective once the minimal exprAnalyze body lands.
-      TestExplainParity remains 2 PASS / 8 DIVERGE / 0 ERROR.
-      Outstanding inside this sub-bullet:
-      wire whereShortCut into sqlite3WhereBegin (after the
-      WANT_DISTINCT block, when nTabList=1 and not
-      WHERE_OR_SUBCLAUSE), per-loop codegen + OP_NotExists
-      emission, plus a pre-req minimal `exprAnalyze` body for
-      TK_EQ rowid terms (folded into 11g.2.c work).
-    - [ ] Implement the loop-tail half of `sqlite3WhereEnd`
+    - Implement the loop-tail half of `sqlite3WhereEnd`
       (Goto continue + Resolve break label + cursor close).
-    - [ ] Re-enable productive tails in `sqlite3DeleteFrom`
+    - Re-enable productive tails in `sqlite3DeleteFrom`
       (codegen.pas:5460..5471) and `sqlite3Update`
       (codegen.pas:5660..5670); drop the step-11f skeleton-only
       error-state guard at codegen.pas:5401..5410 + 5577..5599.
-    - [X] Promote the five `WHERE_*` `_C`-suffixed file-private flag
-      constants (ONEPASS_DESIRED, ONEPASS_MULTIROW, OR_SUBCLAUSE,
-      KEEP_ALL_JOINS, USE_LIMIT) to the public const block
-      (codegen.pas:1392..1407) and drop the `_C` suffix.
-      Done — codegen.pas:1392..1408.  All five now sit in the public
-      WHERE_ORDERBY_* block in numerical order (matches sqliteInt.h
-      ordering) and the file-private const block above
-      `sqlite3WhereBegin` is removed.  No corpus delta (TestExplainParity
-      still 2 PASS / 8 DIVERGE / 0 ERROR — these flags are wctrlFlags
-      consumed inside the prologue, never reached by the current corpus).
-    - [X] Land the eDistinct=WHERE_DISTINCT_UNIQUE branch (currently
-      TODO defaulting to WHERE_DISTINCT_NOOP) once
-      `OptimizationEnabled` / `SQLITE_DistinctOpt` is ported.
-      Done — folded into the WHERE_WANT_DISTINCT block commit
-      (codegen.pas:6010..6012).  The `nTabList==0` arm now applies the
-      real `OptimizationEnabled(SQLITE_DistinctOpt)` →
-      `WHERE_DISTINCT_UNIQUE` rule from where.c:6948..6951.
-    - [ ] New gate `TestWhereSimple.pas` — hand-built SrcList +
+    - New gate `TestWhereSimple.pas` — hand-built SrcList +
       rowid-EQ Expr; assert OP_NotExists / OP_Goto / labels emitted
       in expected order.
-    Expected TestExplainParity bump after this slice lands:
-    2 PASS / 8 DIVERGE → 7 PASS / 3 DIVERGE.
 
-  - [ ] **6.9-bis 11g.2.c** Port `whereexpr.c` (~1944 lines) —
+- [ ] **6.9-bis 11g.2.c** Port `whereexpr.c` (~1944 lines) —
     WHERE-clause term decomposition + analysis.  Public surface:
     `sqlite3WhereSplit`, `sqlite3WhereClauseInit`,
     `sqlite3WhereClauseClear`, `sqlite3WhereExprAnalyze`,
@@ -187,7 +53,7 @@ remains `history.md`.  This file is the punch list.
     Gate: extend `TestWhereSimple.pas` with multi-term cases
     (a=1 AND b=2, a IN (1,2,3), a BETWEEN 1 AND 5).
 
-  - [ ] **6.9-bis 11g.2.d** Port the planner core in `where.c`
+- [ ] **6.9-bis 11g.2.d** Port the planner core in `where.c`
     (~5000 lines): `whereLoopAddBtree`, `whereLoopAddBtreeIndex`,
     `whereLoopAddVirtual*`, `whereLoopAddOr`, `whereLoopAddAll`,
     `whereLoopOutputAdjust`, `whereLoopFindLesser`, `whereLoopInsert`,
@@ -199,7 +65,7 @@ remains `history.md`.  This file is the punch list.
     Defer `xBestIndex`-style virtual-table costing until vtab corpus
     is exercised.
 
-  - [ ] **6.9-bis 11g.2.e** Port `wherecode.c` (~2945 lines) —
+- [ ] **6.9-bis 11g.2.e** Port `wherecode.c` (~2945 lines) —
     per-loop inner-body codegen.  Public surface:
     `sqlite3WhereCodeOneLoopStart`, `sqlite3WhereRightJoinLoop`,
     `sqlite3WhereExplainOneScan`, `sqlite3WhereAddScanStatus`,
@@ -209,13 +75,20 @@ remains `history.md`.  This file is the punch list.
     11g.2.b with full index-key construction, range-scan setup,
     virtual-table xFilter glue, and per-row body dispatch.
 
-  - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
+- [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix
     (single rowid-EQ, multi-AND, OR-decomposed, LIKE, IN-subselect,
     composite index range-scan, LEFT JOIN, virtual table xFilter).
     Verify byte-identical bytecode emission against C via
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
+
+- [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
+  Scaffold is landed (10-row DDL/transaction corpus, report-only).
+  Current Status: **2 PASS / 8 DIVERGE / 0 ERROR**.  Drive to
+  all-PASS, then expand corpus to DML / SELECT / pragma / trigger
+  forms (same exclusion list as TestParser).  Promote from
+  report-only to hard gate when the full corpus is green.
 
 ---
 
@@ -228,6 +101,12 @@ remains `history.md`.  This file is the punch list.
   corpus plus the SELECT / pragma / explain / commit / rollback /
   analyze / vacuum / reindex statements currently excluded.  Becomes
   feasible once 6.9 / 6.9-bis flip the EXPLAIN parity to PASS.
+
+- [ ] **7.4c** `TestVdbeTrace.pas` differential opcode-trace gate.
+  Needs SQL → VDBE end-to-end
+  through the Pascal pipeline so per-opcode traces can be diffed
+  against the C reference under `PRAGMA vdbe_trace=ON`.  Re-open
+  once 6.9-bis flips TestExplainParity to all-PASS.
 
 ---
 
