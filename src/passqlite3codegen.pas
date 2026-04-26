@@ -1725,6 +1725,8 @@ procedure sqlite3ExprToRegister(pExpr: PExpr; iReg: i32);
 function  sqlite3ExprIsInteger(const p: PExpr; pValue: Pi32;
   pParse: PParse): i32;
 function  sqlite3ExprIsConstant(pParse: PParse; p: PExpr): i32;
+function  sqlite3ExprCodeRunJustOnce(pParse: PParse; pExpr: PExpr;
+  regDest: i32): i32;
 
 { Dequoting }
 procedure sqlite3DequoteExpr(p: PExpr);
@@ -4179,6 +4181,103 @@ end;
 function sqlite3ExprIsConstantNotJoin(pParse: PParse; p: PExpr): i32;
 begin
   Result := exprIsConst(pParse, p, 2);
+end;
+
+{ sqlite3ExprCodeRunJustOnce (expr.c:5777..5822) — factor a constant
+  expression out of the main VDBE program into the once-at-prepare-time
+  init section so its result is available in a stable register without
+  re-evaluation per row.
+
+  Two paths:
+    * Reusable path (pure constant, no functions): clone the expression,
+      append it to pParse^.pConstExpr, allocate (or reuse caller-supplied)
+      a register, and let sqlite3ExprCodeConstants emit the actual code at
+      end-of-prepare.  When regDest<0, also walk the existing list to
+      reuse an identical earlier entry — that's how `expr OR expr` with
+      identical sub-expressions code to a single register.
+    * EP_HasFunc path (constant but contains a function call — e.g.
+      sqlite3_version()): emit OP_Once now to gate a one-shot evaluation,
+      flip okConstFactor off so the inner code generator doesn't recurse
+      into the same factoring decision, sqlite3ExprCode the cloned
+      expression, restore okConstFactor, and OP_JumpHere over the body
+      on subsequent runs.
+
+  Faithful translation; semantics match C byte-for-byte.  ConstFactorOk
+  is the PARSEFLAG_OkConstFactor bit on parseFlags. }
+function sqlite3ExprCodeRunJustOnce(pParse: PParse; pExpr: PExpr;
+  regDest: i32): i32;
+var
+  p:        PExprList;
+  pItem:    PExprListItem;
+  items:    PExprListItem;
+  i:        i32;
+  v:        PVdbe;
+  addr:     i32;
+  savedOk:  u32;
+begin
+  Assert((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0,
+    'ConstFactorOk(pParse) holds');
+  Assert(regDest <> 0, 'regDest != 0');
+  p := pParse^.pConstExpr;
+  if (regDest < 0) and (p <> nil) then
+  begin
+    items := ExprListItems(p);
+    i := p^.nExpr;
+    while i > 0 do
+    begin
+      pItem := PExprListItem(PByte(items)
+        + (p^.nExpr - i) * SZ_EXPRLIST_ITEM);
+      if ((pItem^.fg.eBits and $08) <> 0)
+        and (sqlite3ExprCompare(nil, pItem^.pExpr, pExpr, -1) = 0) then
+      begin
+        Result := pItem^.u.iConstExprReg;
+        Exit;
+      end;
+      Dec(i);
+    end;
+  end;
+  pExpr := sqlite3ExprDup(pParse^.db, pExpr, 0);
+  if (pExpr <> nil) and ((pExpr^.flags and EP_HasFunc) <> 0) then
+  begin
+    v := pParse^.pVdbe;
+    Assert(v <> nil, 'Vdbe under construction');
+    addr := sqlite3VdbeAddOp0(v, OP_Once);
+    savedOk := pParse^.parseFlags and PARSEFLAG_OkConstFactor;
+    pParse^.parseFlags := pParse^.parseFlags and (not PARSEFLAG_OkConstFactor);
+    if pParse^.db^.mallocFailed = 0 then
+    begin
+      if regDest < 0 then
+      begin
+        Inc(pParse^.nMem);
+        regDest := pParse^.nMem;
+      end;
+      sqlite3ExprCode(pParse, pExpr, regDest);
+    end;
+    pParse^.parseFlags := pParse^.parseFlags or savedOk;
+    sqlite3ExprDelete(pParse^.db, pExpr);
+    sqlite3VdbeJumpHere(v, addr);
+  end
+  else
+  begin
+    p := sqlite3ExprListAppend(pParse, p, pExpr);
+    if p <> nil then
+    begin
+      pItem := PExprListItem(PByte(ExprListItems(p))
+        + (p^.nExpr - 1) * SZ_EXPRLIST_ITEM);
+      if regDest < 0 then
+        pItem^.fg.eBits := pItem^.fg.eBits or $08          { reusable=1 }
+      else
+        pItem^.fg.eBits := pItem^.fg.eBits and (not u8($08)); { reusable=0 }
+      if regDest < 0 then
+      begin
+        Inc(pParse^.nMem);
+        regDest := pParse^.nMem;
+      end;
+      pItem^.u.iConstExprReg := regDest;
+    end;
+    pParse^.pConstExpr := p;
+  end;
+  Result := regDest;
 end;
 
 // ---------------------------------------------------------------------------

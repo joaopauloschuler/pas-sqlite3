@@ -21,6 +21,80 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    sqlite3ExprCodeRunJustOnce.**  Next link in the discovery-note
+    chain unlocking `sqlite3ExprCodeTarget`.  Faithful translation of
+    expr.c:5777..5822 — factors a constant expression out of the main
+    VDBE program into the once-at-prepare-time init section so its
+    result is available in a stable register without re-evaluation per
+    row.
+
+    Two paths handled:
+      * **Reusable path** (pure constant, no functions): clones the
+        expression via `sqlite3ExprDup`, appends to
+        `pParse^.pConstExpr` via `sqlite3ExprListAppend`, allocates (or
+        accepts caller-supplied) a register, sets the `reusable` bit
+        (eBits bit 3 = $08) when regDest<0, and stores the register in
+        `pItem^.u.iConstExprReg` so a later
+        `sqlite3ExprCodeConstants` pass can emit the actual init code.
+        When `regDest<0` the function first walks the existing list to
+        reuse an identical earlier entry — that's how `expr OR expr`
+        with identical sub-expressions code to a single register.
+      * **EP_HasFunc path** (constant but contains a function call —
+        e.g. `sqlite3_version()`): emits `OP_Once` immediately to
+        gate a one-shot evaluation, flips
+        `PARSEFLAG_OkConstFactor` off so the inner `sqlite3ExprCode`
+        recursion does not re-factor, calls `sqlite3ExprCode` to emit
+        the body, restores the flag, deletes the cloned expression,
+        and resolves the OP_Once branch via `sqlite3VdbeJumpHere`.
+
+    Concrete changes:
+      * `passqlite3codegen.pas:1727..1729` — public forward decl for
+        `sqlite3ExprCodeRunJustOnce`.
+      * `passqlite3codegen.pas:4184..4274` — body of
+        `sqlite3ExprCodeRunJustOnce`, immediately after
+        `sqlite3ExprIsConstantNotJoin`.
+
+    Why this is safe to land alone: no productive callers yet
+    (`sqlite3ExprCodeTemp` / `sqlite3ExprCodeFactorable` /
+    `sqlite3ExprCodeCopy` and the DEFAULT-clause / ALTER TABLE
+    sub-paths all still stub — landing the chain in slices).  Pure
+    scaffolding, no observable behaviour change in the corpus.  Full
+    regression sweep all green — TestWhereBasic 52/52, TestWhereStructs
+    148/148, TestPrepareBasic 20/20, TestParser 45/45, TestSchemaBasic
+    44/44, TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic
+    49/49, TestExprBasic 40/40, TestInitCallback 29/29,
+    TestExplainParity unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **`ConstFactorOk` ↔ `PARSEFLAG_OkConstFactor`.**  The C macro
+        `ConstFactorOk(P) ((P)->okConstFactor)` (sqliteInt.h:1945) is
+        modelled in the Pascal port via the parseFlags bitfield bit
+        `PARSEFLAG_OkConstFactor = 1 shl 7`.  Both the assert-on-entry
+        and the inner save/clear/restore of okConstFactor are mapped
+        to AND/OR/AND-NOT on `pParse^.parseFlags`.  This is the first
+        productive Pascal helper to *write* okConstFactor (every
+        existing reference only OR-set it once at parse-init time at
+        codegen.pas:5314); the save-and-restore pattern is
+        established here for future ports of
+        `sqlite3ExprCodeFactorable` / `sqlite3ExprCodeCopy` /
+        `sqlite3ExprCodeAtInit`.
+      * **`ExprListItem.fg.eBits` bit 3 = reusable.**  Confirmed via
+        the comment at codegen.pas:509..510 and the
+        `pItem^.fg.eBits or $08` / `and not $08` patterns used here.
+      * **`sqlite3ExprCompare(nil, …)` accepts pParse=nil** — verified
+        by call sites at codegen.pas:12062 and :12498.  Used here in
+        the reusable-list scan to keep the pParse-independent
+        comparison the C source does.
+      * **Realistic next sub-progress: `sqlite3ExprCodeTarget`.**  The
+        770-line recursive dispatch — best landed in vertical slices.
+        Existing literal-only `sqlite3ExprCode` stub at
+        codegen.pas:3626..3673 already handles the four arms reached
+        by sqlite3NestedParse-generated INSERT/UPDATE/DELETE
+        (TK_INTEGER, TK_NULL, TK_STRING, TK_REGISTER); first slice
+        should add column refs (TK_COLUMN) and temp-register
+        (TK_REGISTER variants beyond the trivial copy).
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     productive sqlite3ExprIsConstant + sqlite3ExprIsConstantNotJoin
     (walker-based) + exprIsConst / exprNodeIsConstant /
     exprNodeIsConstantFunction.**  First step of the discovery-note
@@ -98,6 +172,9 @@ Important: At the end of this document, please find:
         `sqlite3ExprCodeTarget` port begins (vertical slices: literals
         already done; columns + temp-ref next; arithmetic; comparison;
         CASE; FUNCTION; etc.).
+        UPDATE 2026-04-26: `sqlite3ExprCodeRunJustOnce` ✅ landed —
+        see Most-recent-activity entry above.  Next is the big
+        `sqlite3ExprCodeTarget` vertical slice.
       * **Public wrappers waiting for first cross-unit caller.**
         `sqlite3ExprIsTableConstant` (eCode==3, where.c-internal) and
         `sqlite3ExprIsConstantOrFunction` (eCode==4/5, build.c
