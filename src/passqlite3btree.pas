@@ -451,6 +451,7 @@ function  sqlite3BtreeEof(pCur: PBtCursor): i32;
 function  sqlite3BtreeIntegerKey(pCur: PBtCursor): i64;
 function  sqlite3BtreePayloadSize(pCur: PBtCursor): u32;
 function  sqlite3BtreeOffset(pCur: PBtCursor): i64;
+function  sqlite3BtreeIsReadonly(p: PBtree): i32;
 
 { ===========================================================================
   Phase 4.2 — payload access
@@ -2235,6 +2236,18 @@ begin
   getCellInfo(pCur);
   Result := i64(pCur^.pBt^.pageSize) * (i64(pCur^.pPage^.pgno) - 1) +
             i64(PtrUInt(pCur^.info.pPayload) - PtrUInt(pCur^.pPage^.aData));
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3BtreeIsReadonly
+  btree.c lines 11528-11533
+  --------------------------------------------------------------------------- }
+function sqlite3BtreeIsReadonly(p: PBtree): i32;
+begin
+  if (p^.pBt^.btsFlags and BTS_READ_ONLY) <> 0 then
+    Result := 1
+  else
+    Result := 0;
 end;
 
 { ---------------------------------------------------------------------------

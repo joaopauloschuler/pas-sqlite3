@@ -20,6 +20,60 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 1): sqlite3BeginTransaction +
+    sqlite3EndTransaction port (build.c:5245..5297).**  Replaces the
+    `{ Phase 7 }` stubs in `passqlite3codegen.pas` with byte-identical
+    ports of the BEGIN / COMMIT / ROLLBACK codegen helpers.  First
+    DIVERGE → PASS flip in TestExplainParity (the `BEGIN;` row).
+    Adds `sqlite3BtreeIsReadonly` (btree.c:11531) to
+    `passqlite3btree.pas` since BeginTransaction needs the readonly
+    predicate per-attached-Btree, and threads `passqlite3btree` into
+    `passqlite3codegen.pas`'s uses clause (no circular dep — btree
+    does not back-import codegen).
+
+    Concrete changes:
+      * `src/passqlite3btree.pas` — adds `sqlite3BtreeIsReadonly`
+        (forward decl + body).  Body matches C verbatim:
+        `(p^.pBt^.btsFlags and BTS_READ_ONLY) <> 0`.
+      * `src/passqlite3codegen.pas`:
+        - adds `passqlite3btree` to the unit's `uses` clause.
+        - `sqlite3BeginTransaction` (line 6158, was a stub):
+          full body from build.c:5245..5274 — auth-check, GetVdbe,
+          per-aDb[i] OP_Transaction emission for non-DEFERRED with
+          eTxnType selected by readonly/EXCLUSIVE/default, then
+          OP_AutoCommit tail.  Uses `SQLITE_TRANSACTION_AUTH` (the
+          existing renamed-to-avoid-collision constant from
+          passqlite3vdbe.pas:530).
+        - `sqlite3EndTransaction` (line 6163, was a stub):
+          full body from build.c:5281..5297 — auth-check
+          (ROLLBACK/COMMIT label per eType), GetVdbe,
+          OP_AutoCommit p1=1 p2=isRollback.
+
+    Tests: full build clean.  TestExplainParity:
+    BEGIN flipped from DIVERGE → PASS (4 ops, identical to C).
+    Regression spot check: TestPrepareBasic 20/20, TestParser 45/45,
+    TestParserSmoke 20/20, TestSchemaBasic 44/44, TestVdbeApi 57/57,
+    TestDMLBasic 54/54, TestSelectBasic 49/49, TestExprBasic 40/40,
+    TestVdbeTxn 8/8, TestAuthBuiltins 34/34.
+
+    Discoveries / next-step notes:
+      * **Readonly predicate is a 1-line port.**  The C sqlite3BtreeIsReadonly
+        is just `(pBt->btsFlags & BTS_READ_ONLY) != 0`.  Pascal port needs
+        explicit `<> 0` to int-coerce since FPC has no implicit bool↔int.
+      * **`SQLITE_TRANSACTION` collides with auth-code 22.**  The port
+        renames to `SQLITE_TRANSACTION_AUTH` in passqlite3vdbe.pas:530 to
+        avoid clashing with the result-code namespace.  `sqlite3AuthCheck`
+        callers must use `_AUTH` suffix.  Same idiom as `SQLITE_DELETE_AUTH /
+        SQLITE_INSERT_AUTH`.
+      * **Next 6.9-bis targets** (in priority by simplicity):
+        sqlite3DropIndex (DROP INDEX IF EXISTS — only 5 C ops),
+        sqlite3DropTable (49 C ops), then CREATE INDEX (37/41),
+        sqlite3StartTable/EndTable (32–43 ops, biggest surface).
+        Two ERROR rows (`CREATE TABLE typed`, `CREATE TABLE WITHOUT
+        ROWID`) AV inside the partial Pascal codegen for column
+        decltypes / WITHOUT ROWID — triage when StartTable/EndTable
+        lands.
+
   - **2026-04-26 — Phase 6.9 scaffold: TestExplainParity.pas.**
     Lands `src/tests/TestExplainParity.pas` — the bytecode-diff gate
     enabled by Phase 6.5-bis (sqlite3FinishCoding).  Drives both the
@@ -5654,16 +5708,18 @@ Phase 5.9 depends on this being done first.
   next concrete porting targets for the upper half (Phase 6.x).
   Run with: `LD_LIBRARY_PATH=src bin/TestExplainParity`.
 
-- [ ] **6.9-bis** Drive the diverge/error counts in TestExplainParity to
+- [~] **6.9-bis** Drive the diverge/error counts in TestExplainParity to
   zero by porting the remaining DDL codegen helpers
-  (`sqlite3StartTable`, `sqlite3EndTable`, `sqlite3CreateIndex`,
-  `sqlite3DropTable`, `sqlite3DropIndex`, `sqlite3BeginTransaction`)
+  (~~`sqlite3BeginTransaction`~~ done 2026-04-26,
+  `sqlite3StartTable`, `sqlite3EndTable`, `sqlite3CreateIndex`,
+  `sqlite3DropTable`, `sqlite3DropIndex`)
   to byte-identical opcode emission against C.  Each helper landed
   flips one row from DIVERGE → PASS in TestExplainParity; an extra
   diagnostic-only column-list AV must also be triaged
   (`CREATE TABLE typed`, `CREATE TABLE WITHOUT ROWID`).  Once all
   ten current rows PASS, expand corpus to DML / SELECT / pragma /
   trigger forms (the same exclusion list as TestParser).
+  Status (2026-04-26): 1 PASS / 7 DIVERGE / 2 ERROR (was 0/8/2).
 
 ---
 

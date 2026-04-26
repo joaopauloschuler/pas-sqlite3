@@ -22,7 +22,7 @@ interface
 
 uses
   passqlite3types, passqlite3internal, passqlite3util, passqlite3os,
-  passqlite3vdbe,
+  passqlite3vdbe, passqlite3btree,
   SysUtils;
 
 // ---------------------------------------------------------------------------
@@ -6155,14 +6155,61 @@ end;
 // Phase 6.5 — build.c: Transaction / verify stubs
 // ===========================================================================
 
+{ sqlite3BeginTransaction — port of build.c:5245.
+  Generate VDBE code for a BEGIN statement. }
 procedure sqlite3BeginTransaction(pParse: PParse; type_: i32);
+var
+  db:       PTsqlite3;
+  v:        PVdbe;
+  i:        i32;
+  eTxnType: i32;
+  pBt:      PBtree;
 begin
-  { Phase 7 }
+  Assert(pParse <> nil);
+  db := pParse^.db;
+  Assert(db <> nil);
+  if sqlite3AuthCheck(pParse, SQLITE_TRANSACTION_AUTH, 'BEGIN', nil, nil) <> 0 then
+    Exit;
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then Exit;
+  if type_ <> TK_DEFERRED then begin
+    for i := 0 to db^.nDb - 1 do begin
+      pBt := PBtree(db^.aDb[i].pBt);
+      if (pBt <> nil) and (sqlite3BtreeIsReadonly(pBt) <> 0) then begin
+        eTxnType := 0;     { Read txn }
+      end else if type_ = TK_EXCLUSIVE then begin
+        eTxnType := 2;     { Exclusive txn }
+      end else begin
+        eTxnType := 1;     { Write txn }
+      end;
+      sqlite3VdbeAddOp2(v, OP_Transaction, i, eTxnType);
+      sqlite3VdbeUsesBtree(v, i);
+    end;
+  end;
+  sqlite3VdbeAddOp0(v, OP_AutoCommit);
 end;
 
+{ sqlite3EndTransaction — port of build.c:5281.
+  Generate VDBE code for COMMIT, END, or ROLLBACK. }
 procedure sqlite3EndTransaction(pParse: PParse; eType: i32);
+var
+  v:          PVdbe;
+  isRollback: i32;
 begin
-  { Phase 7 }
+  Assert(pParse <> nil);
+  Assert(pParse^.db <> nil);
+  Assert((eType = TK_COMMIT) or (eType = TK_END) or (eType = TK_ROLLBACK));
+  if eType = TK_ROLLBACK then isRollback := 1 else isRollback := 0;
+  if isRollback <> 0 then begin
+    if sqlite3AuthCheck(pParse, SQLITE_TRANSACTION_AUTH, 'ROLLBACK', nil, nil) <> 0 then
+      Exit;
+  end else begin
+    if sqlite3AuthCheck(pParse, SQLITE_TRANSACTION_AUTH, 'COMMIT', nil, nil) <> 0 then
+      Exit;
+  end;
+  v := sqlite3GetVdbe(pParse);
+  if v <> nil then
+    sqlite3VdbeAddOp2(v, OP_AutoCommit, 1, isRollback);
 end;
 
 procedure sqlite3Savepoint(pParse: PParse; op: i32; pName: PToken);
