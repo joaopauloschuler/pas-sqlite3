@@ -142,6 +142,7 @@ compile_test TestRegistration
 compile_test TestPrintf
 compile_test TestJson
 compile_test TestJsonEach
+compile_test TestJsonRegister
 compile_test TestVtab
 compile_test TestCarray
 compile_test TestDbpage

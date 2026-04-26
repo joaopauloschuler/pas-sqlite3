@@ -562,6 +562,8 @@ function  jsonFunctionArgToBlob(pCtx: Pointer; pArg: Pointer;
 
 function  jsonAllAlphanum(z: PAnsiChar; n: i32): i32;
 procedure jsonQuoteFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+procedure jsonArrayFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+procedure jsonObjectFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 procedure jsonArrayLengthFunc(pCtx: Psqlite3_context; argc: i32;
                               argv: PPMem); cdecl;
 procedure jsonTypeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
@@ -4080,6 +4082,67 @@ begin
   jsonStringInit(@jx, pCtx);
   jsonAppendSqlValue(@jx, argv[0]);
   jsonReturnString(@jx, nil, nil);
+  sqlite3_result_subtype(pCtx, JSON_SUBTYPE);
+end;
+
+{ json.c:3979 — json_array(VAL,...).  Build a JSON array from arbitrary
+  SQL arguments (json[b]_array; subtype on result is JSON). }
+procedure jsonArrayFunc(pCtx: Psqlite3_context; argc: i32;
+                        argv: PPMem); cdecl;
+var
+  i:  i32;
+  jx: TJsonString;
+begin
+  jsonStringInit(@jx, pCtx);
+  jsonAppendChar(@jx, '[');
+  for i := 0 to argc - 1 do
+  begin
+    jsonAppendSeparator(@jx);
+    jsonAppendSqlValue(@jx, argv[i]);
+  end;
+  jsonAppendChar(@jx, ']');
+  jsonReturnString(@jx, nil, pCtx);
+  sqlite3_result_subtype(pCtx, JSON_SUBTYPE);
+end;
+
+{ json.c:4424 — json_object(NAME,VALUE,...).  Build a JSON object from
+  alternating TEXT/value pairs.  argc must be even. }
+procedure jsonObjectFunc(pCtx: Psqlite3_context; argc: i32;
+                         argv: PPMem); cdecl;
+var
+  i:  i32;
+  jx: TJsonString;
+  z:  PAnsiChar;
+  n:  u32;
+begin
+  if (argc and 1) <> 0 then
+  begin
+    sqlite3_result_error(pCtx,
+      'json_object() requires an even number of arguments', -1);
+    Exit;
+  end;
+  jsonStringInit(@jx, pCtx);
+  jsonAppendChar(@jx, '{');
+  i := 0;
+  while i < argc do
+  begin
+    if sqlite3_value_type(Psqlite3_value(argv[i])) <> SQLITE_TEXT then
+    begin
+      sqlite3_result_error(pCtx,
+        'json_object() labels must be TEXT', -1);
+      jsonStringReset(@jx);
+      Exit;
+    end;
+    jsonAppendSeparator(@jx);
+    z := sqlite3_value_text(Psqlite3_value(argv[i]));
+    n := u32(sqlite3_value_bytes(Psqlite3_value(argv[i])));
+    jsonAppendString(@jx, z, n);
+    jsonAppendChar(@jx, ':');
+    jsonAppendSqlValue(@jx, argv[i+1]);
+    Inc(i, 2);
+  end;
+  jsonAppendChar(@jx, '}');
+  jsonReturnString(@jx, nil, pCtx);
   sqlite3_result_subtype(pCtx, JSON_SUBTYPE);
 end;
 

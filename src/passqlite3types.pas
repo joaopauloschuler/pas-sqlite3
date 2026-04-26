@@ -301,6 +301,7 @@ const
   SQLITE_DIRECTONLY    = $00080000; { may only be called from top-level SQL, not triggers/views }
   SQLITE_SUBTYPE       = $00100000; { function may call sqlite3_value_subtype() }
   SQLITE_INNOCUOUS     = $00200000; { function is unlikely to cause problems }
+  SQLITE_RESULT_SUBTYPE= $01000000; { function may call sqlite3_result_subtype() }
 
 // ---------------------------------------------------------------------------
 // Destructor callback type — used by Mem.xDel and sqlite3_create_function

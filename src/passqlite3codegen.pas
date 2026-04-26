@@ -2271,6 +2271,15 @@ function  sqlite3FkReferences(pTab: PTable2): Pointer;
 procedure sqlite3RegisterDateTimeFunctions;
 
 // ---------------------------------------------------------------------------
+// Phase 6.8.h.6 public API — json SQL functions
+// ---------------------------------------------------------------------------
+
+{ Register all json_* / jsonb_* scalar + aggregate SQL functions into the
+  global builtin-functions hash.  Idempotent: callers that re-init the
+  global table (sqlite3RegisterBuiltinFunctions) reset the hash first. }
+procedure sqlite3RegisterJsonFunctions;
+
+// ---------------------------------------------------------------------------
 // Phase 6.6 helper — sqlite3ExpirePreparedStatements
 // ---------------------------------------------------------------------------
 
@@ -2279,7 +2288,9 @@ procedure sqlite3ExpirePreparedStatements(db: PTsqlite3; iCode: i32);
 implementation
 
 uses
-  DateUtils;
+  DateUtils,
+  passqlite3json,
+  passqlite3jsoneach;
 
 { snpFmt — format into a PAnsiChar buffer using Pascal Format(); same arg order as sqlite3_snprintf }
 procedure snpFmt(n: i32; dst: PAnsiChar; const fmt: AnsiString;
@@ -7936,6 +7947,138 @@ begin
   InitBuiltinAgg;
   sqlite3InsertBuiltinFuncs(@aBuiltinFuncs, Length(aBuiltinFuncs));
   sqlite3InsertBuiltinFuncs(@aBuiltinAgg,   Length(aBuiltinAgg));
+  sqlite3RegisterJsonFunctions;
+end;
+
+{ ===========================================================================
+  Phase 6.8.h.6 — JSON SQL function registration
+
+  Wires the entire json_* / jsonb_* SQL surface into
+  sqlite3BuiltinFunctions.  Each TFuncDef entry mirrors the JFUNCTION
+  macro in sqliteInt.h:
+      flags = SQLITE_FUNC_BUILTIN | SQLITE_DETERMINISTIC | SQLITE_FUNC_CONSTANT
+            | SQLITE_UTF8 | (bUseCache?SQLITE_FUNC_RUNONLY:0)
+            | (bRS?SQLITE_SUBTYPE:0) | (bWS?SQLITE_RESULT_SUBTYPE:0)
+      pUserData = (iArg | (bJsonB?JSON_BLOB:0))   { encoded as Pointer }
+
+  Aggregates use WAGGREGATE: pUserData = arg (the JSON_BLOB switch only;
+  no JSON_ABPATH / JSON_ISSET / JSON_AINS).
+  =========================================================================== }
+
+const
+  { Keep aligned with passqlite3json's JSON_* user-data flag block. }
+  JSONREG_BLOB    = $10;
+  JSONREG_JSON    = $01;
+  JSONREG_SQL     = $02;
+  JSONREG_ISSET   = $04;
+  JSONREG_AINS    = $08;
+
+  JFUNC_BASE_FLAGS = SQLITE_FUNC_BUILTIN or SQLITE_DETERMINISTIC
+                  or SQLITE_FUNC_CONSTANT or SQLITE_UTF8;
+
+var
+  aJsonFunc: array[0..31] of TFuncDef;
+  aJsonAgg:  array[0..3]  of TFuncDef;
+
+procedure sqlite3RegisterJsonFunctions;
+
+  { Encode (iArg | bJsonB*JSON_BLOB) into pUserData. }
+  function ArgPtr(iArg: i32; bJsonB: i32): Pointer; inline;
+  begin
+    Result := Pointer(PtrUInt(iArg or (bJsonB * JSONREG_BLOB)));
+  end;
+
+  { JFUNCTION analogue. }
+  procedure JFn(var fd: TFuncDef; nm: PAnsiChar; nArg: i16;
+    bUseCache, bWS, bRS, bJsonB, iArg: i32; xFunc: TxSFuncProc); inline;
+  var
+    flags: u32;
+  begin
+    flags := JFUNC_BASE_FLAGS;
+    if bUseCache <> 0 then flags := flags or SQLITE_FUNC_RUNONLY;
+    if bRS      <> 0 then flags := flags or SQLITE_SUBTYPE;
+    if bWS      <> 0 then flags := flags or SQLITE_RESULT_SUBTYPE;
+    FillChar(fd, SizeOf(fd), 0);
+    fd.nArg      := nArg;
+    fd.funcFlags := flags;
+    fd.pUserData := ArgPtr(iArg, bJsonB);
+    fd.xSFunc    := xFunc;
+    fd.zName     := nm;
+  end;
+
+  { WAGGREGATE analogue (no NEEDCOLL: nc=0 for every JSON aggregate). }
+  procedure WAgg(var fd: TFuncDef; nm: PAnsiChar; nArg: i16; arg: i32;
+    xStep, xInverse: TxSFuncProc;
+    xFinal: TxFinalProc; xValue: TxValueProc); inline;
+  begin
+    FillChar(fd, SizeOf(fd), 0);
+    fd.nArg      := nArg;
+    fd.funcFlags := SQLITE_FUNC_BUILTIN or SQLITE_UTF8
+                 or SQLITE_SUBTYPE or SQLITE_RESULT_SUBTYPE
+                 or SQLITE_DETERMINISTIC;
+    fd.pUserData := Pointer(PtrUInt(arg));
+    fd.xSFunc    := xStep;
+    fd.xFinalize := xFinal;
+    fd.xValue    := xValue;
+    fd.xInverse  := TxInverseProc(xInverse);
+    fd.zName     := nm;
+  end;
+
+begin
+  { Mirror json.c:5601 aJsonFunc[].
+    Layout columns: nArg, bUseCache, bWS, bRS, bJsonB, iArg, xFunc. }
+  JFn(aJsonFunc[ 0], 'json',                1, 1,1, 0,0,0,            @jsonRemoveFunc);
+  JFn(aJsonFunc[ 1], 'jsonb',               1, 1,0, 0,1,0,            @jsonRemoveFunc);
+  JFn(aJsonFunc[ 2], 'json_array',         -1, 0,1, 1,0,0,            @jsonArrayFunc);
+  JFn(aJsonFunc[ 3], 'jsonb_array',        -1, 0,1, 1,1,0,            @jsonArrayFunc);
+  JFn(aJsonFunc[ 4], 'json_array_insert',  -1, 1,1, 1,0,JSONREG_AINS, @jsonSetFunc);
+  JFn(aJsonFunc[ 5], 'jsonb_array_insert', -1, 1,0, 1,1,JSONREG_AINS, @jsonSetFunc);
+  JFn(aJsonFunc[ 6], 'json_array_length',   1, 1,0, 0,0,0,            @jsonArrayLengthFunc);
+  JFn(aJsonFunc[ 7], 'json_array_length',   2, 1,0, 0,0,0,            @jsonArrayLengthFunc);
+  JFn(aJsonFunc[ 8], 'json_error_position', 1, 1,0, 0,0,0,            @jsonErrorFunc);
+  JFn(aJsonFunc[ 9], 'json_extract',       -1, 1,1, 0,0,0,            @jsonExtractFunc);
+  JFn(aJsonFunc[10], 'jsonb_extract',      -1, 1,0, 0,1,0,            @jsonExtractFunc);
+  JFn(aJsonFunc[11], '->',                  2, 1,1, 0,0,JSONREG_JSON, @jsonExtractFunc);
+  JFn(aJsonFunc[12], '->>',                 2, 1,0, 0,0,JSONREG_SQL,  @jsonExtractFunc);
+  JFn(aJsonFunc[13], 'json_insert',        -1, 1,1, 1,0,0,            @jsonSetFunc);
+  JFn(aJsonFunc[14], 'jsonb_insert',       -1, 1,0, 1,1,0,            @jsonSetFunc);
+  JFn(aJsonFunc[15], 'json_object',        -1, 0,1, 1,0,0,            @jsonObjectFunc);
+  JFn(aJsonFunc[16], 'jsonb_object',       -1, 0,1, 1,1,0,            @jsonObjectFunc);
+  JFn(aJsonFunc[17], 'json_patch',          2, 1,1, 0,0,0,            @jsonPatchFunc);
+  JFn(aJsonFunc[18], 'jsonb_patch',         2, 1,0, 0,1,0,            @jsonPatchFunc);
+  JFn(aJsonFunc[19], 'json_pretty',         1, 1,0, 0,0,0,            @jsonPrettyFunc);
+  JFn(aJsonFunc[20], 'json_pretty',         2, 1,0, 0,0,0,            @jsonPrettyFunc);
+  JFn(aJsonFunc[21], 'json_quote',          1, 0,1, 1,0,0,            @jsonQuoteFunc);
+  JFn(aJsonFunc[22], 'json_remove',        -1, 1,1, 0,0,0,            @jsonRemoveFunc);
+  JFn(aJsonFunc[23], 'jsonb_remove',       -1, 1,0, 0,1,0,            @jsonRemoveFunc);
+  JFn(aJsonFunc[24], 'json_replace',       -1, 1,1, 1,0,0,            @jsonReplaceFunc);
+  JFn(aJsonFunc[25], 'jsonb_replace',      -1, 1,0, 1,1,0,            @jsonReplaceFunc);
+  JFn(aJsonFunc[26], 'json_set',           -1, 1,1, 1,0,JSONREG_ISSET,@jsonSetFunc);
+  JFn(aJsonFunc[27], 'jsonb_set',          -1, 1,0, 1,1,JSONREG_ISSET,@jsonSetFunc);
+  JFn(aJsonFunc[28], 'json_type',           1, 1,0, 0,0,0,            @jsonTypeFunc);
+  JFn(aJsonFunc[29], 'json_type',           2, 1,0, 0,0,0,            @jsonTypeFunc);
+  JFn(aJsonFunc[30], 'json_valid',          1, 1,0, 0,0,0,            @jsonValidFunc);
+  JFn(aJsonFunc[31], 'json_valid',          2, 1,0, 0,0,0,            @jsonValidFunc);
+
+  { Aggregates — WAGGREGATE(name, nArg, arg, nc, step, final, value, inverse, flags). }
+  WAgg(aJsonAgg[0], 'json_group_array',  1, 0,
+       @jsonArrayStep,  @jsonGroupInverse, @jsonArrayFinal,  @jsonArrayValue);
+  WAgg(aJsonAgg[1], 'jsonb_group_array', 1, JSONREG_BLOB,
+       @jsonArrayStep,  @jsonGroupInverse, @jsonArrayFinal,  @jsonArrayValue);
+  WAgg(aJsonAgg[2], 'json_group_object', 2, 0,
+       @jsonObjectStep, @jsonGroupInverse, @jsonObjectFinal, @jsonObjectValue);
+  WAgg(aJsonAgg[3], 'jsonb_group_object',2, JSONREG_BLOB,
+       @jsonObjectStep, @jsonGroupInverse, @jsonObjectFinal, @jsonObjectValue);
+
+  sqlite3InsertBuiltinFuncs(@aJsonFunc, Length(aJsonFunc));
+  sqlite3InsertBuiltinFuncs(@aJsonAgg,  Length(aJsonAgg));
+
+  { Touch passqlite3jsoneach so the unit's initialization section runs
+    (it builds jsonEachModule in initialization).  No SQL surface yet —
+    sqlite3JsonVtabRegister is invoked per-connection on first use of
+    json_each / json_tree, the same lazy path C uses.  Reference
+    avoids a "unit unused" elimination by some linkers. }
+  if @sqlite3JsonVtabRegister = nil then ;  { unreachable }
 end;
 
 procedure sqlite3RegisterPerConnectionBuiltinFunctions(db: PTsqlite3);

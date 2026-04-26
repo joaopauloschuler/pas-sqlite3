@@ -20,6 +20,88 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.8.h.6 JSON SQL function registration.**
+    Lands `sqlite3RegisterJsonFunctions` in `passqlite3codegen.pas`,
+    wiring the full json_* / jsonb_* SQL surface (32 scalars + 4
+    aggregates) into `sqlite3BuiltinFunctions`.  Called from
+    `sqlite3RegisterBuiltinFunctions` so every `sqlite3_initialize`
+    sequence now exposes the JSON surface alongside the existing
+    scalar / aggregate / date built-ins.
+
+    Concrete changes:
+      * `src/passqlite3types.pas` — adds `SQLITE_RESULT_SUBTYPE =
+        $01000000` (function may call sqlite3_result_subtype).
+      * `src/passqlite3json.pas` — ports `jsonArrayFunc`
+        (json.c:3979) and `jsonObjectFunc` (json.c:4424); both
+        exported in interface so 6.8.h.6 can drop them straight
+        into the registration table.
+      * `src/passqlite3codegen.pas` — adds `sqlite3RegisterJsonFunctions`
+        (interface + implementation, ~110 lines).  Implementation
+        section adds `passqlite3json, passqlite3jsoneach` to the
+        `uses` clause.  Two TFuncDef arrays — `aJsonFunc[0..31]` for
+        scalars, `aJsonAgg[0..3]` for aggregates — populated via
+        local `JFn` (JFUNCTION analogue) and `WAgg` (WAGGREGATE
+        analogue) helpers.  `pUserData` carries
+        `iArg | (bJsonB?JSON_BLOB:0)` exactly like the C macro.
+      * `src/tests/TestJsonRegister.pas` — **new gate** (48 asserts).
+        R1..R32 lookups for every name×nArg combination; F1..F8
+        pin the pUserData encoding (json_set→ISSET, jsonb_set→
+        ISSET|BLOB, jsonb_array_insert→AINS|BLOB, ->/->>→JSON/SQL,
+        plain json_extract→0); A1..A4 verify the aggregate
+        xStep/xFinalize/xValue/xInverse slots; B1/B2 cover the
+        aggregate-blob and SQLITE_RESULT_SUBTYPE flag bits;
+        V1 reaches `sqlite3JsonVtabRegister` through the codegen
+        unit; C1 pins SQLITE_RESULT_SUBTYPE.  **48/48 PASS.**
+      * `src/tests/build.sh` — adds `compile_test TestJsonRegister`.
+      * Regression spot check: TestJson 434/434, TestJsonEach 50/50,
+        TestAuthBuiltins 34/34, TestPrintf 105/105, TestVtab
+        216/216, TestParser 45/45, TestSchemaBasic 44/44,
+        TestVdbeApi 57/57, TestCarray 66/66.
+
+    Discoveries / next-step notes:
+      * **`sqlite3JsonVtabRegister` stays per-connection / lazy.**
+        C registers `json_each` / `json_tree` / `jsonb_each` /
+        `jsonb_tree` only when the parser/VDBE first opens one of
+        them (json.c:5667 is wired via `sqlite3FindOrCreateModule`).
+        The codegen `uses` clause now references
+        `passqlite3jsoneach` so the unit's `initialization` block
+        builds `jsonEachModule`; per-connection registration belongs
+        with the SELECT/parser surface in Phase 7.  A guarded
+        `if @sqlite3JsonVtabRegister = nil` reference in
+        `sqlite3RegisterJsonFunctions` keeps the unit's symbols
+        live against linkers that strip seemingly unused units.
+      * **`pUserData` flags are now LIVE.**  The deferred 6.8.h.3 /
+        6.8.h.4 branches that gated on `sqlite3_user_data(ctx)` —
+        JSON_ISSET vs JSON_INS in `jsonSetFunc`, JSON_ABPATH in
+        `jsonExtractFunc`, JSON_BLOB across the SetXXXAsBlob
+        emitters — fire correctly when a registered function is
+        looked up via the SQL surface.  Tests that fabricate
+        contexts directly still see `pUserData=nil` (no pFunc
+        wired); all such tests remain pinned to the 0-flag default
+        path and are harmless.
+      * **No SQLite RCStr port.**  The optional sqlite3RCStr port
+        listed in the 6.8.h.6 task body was deferred again — every
+        h.* chunk continues to use TRANSIENT result text + an
+        explicit `sqlite3_free` cleanup.  Fix-sites are the same
+        two each in `jsonReturnString`, `jsonArrayCompute`,
+        `jsonObjectCompute`; flip them to `sqlite3RCStrUnref`
+        ownership transfer when the helper lands (probably with
+        the first PrepareV2 / VDBE result-binding work).
+      * **`SQLITE_RESULT_SUBTYPE` is the same bit
+        (`$01000000`) used by the existing TVdbe `nullFnV`
+        kludge in `passqlite3vdbe.pas:7600`.**  The new constant
+        formalises that magic number; future vdbe touch-ups can
+        drop the inline literal.
+      * **TFuncDef arrays must NOT be padded with trailing zero
+        slots.**  `sqlite3InsertBuiltinFuncs` walks `nFunc`
+        entries and hashes each by `zName`; an all-zero slot has
+        `zName = nil` → `sqlite3Strlen30(nil)` (libc strlen on
+        nil) → segfault.  The arrays are sized to exactly the
+        number of registered entries (`array[0..31]` for 32
+        scalars, `array[0..3]` for 4 aggregates) and registered
+        with `Length(...)`.  Same convention as `aBuiltinFuncs`,
+        `aBuiltinAgg`, `aDateFuncs`, `aWindowFuncs`.
+
   - **2026-04-26 — Phase 6.8.h.5 json_each / json_tree vtabs.**  Lands
     the four-spelling read-only virtual table module
     (`json_each` / `json_tree` / `jsonb_each` / `jsonb_tree`) plus the
@@ -4280,11 +4362,56 @@ reference exactly.
           parser's `pCtx`.  Module-shape + BestIndex coverage is the
           stable surface for 6.8.h.5; full filter/next/column
           coverage rides 6.8.h.6.
-    - [ ] **6.8.h.6** Registration — `sqlite3RegisterJsonFunctions`
+    - [X] **6.8.h.6** Registration — `sqlite3RegisterJsonFunctions`
       and `sqlite3JsonVtabRegister`; wire into
       `sqlite3RegisterBuiltinFunctions` so the `json_*` SQL surface
       becomes live.  Optionally port `sqlite3RCStr` here so the
       cache-insert branch in `jsonReturnString` can match C exactly.
+      DONE 2026-04-26.  32 scalars + 4 aggregates registered via
+      `JFn` / `WAgg` helpers in `passqlite3codegen.pas`; `pUserData`
+      carries `iArg | (bJsonB?JSON_BLOB:0)` matching the C JFUNCTION
+      macro byte-for-byte.  `passqlite3jsoneach` brought into codegen's
+      `uses` so its `initialization` block runs (per-connection vtab
+      registration via `sqlite3JsonVtabRegister` is still lazy and
+      will hook up with the SELECT/parser surface in Phase 7).
+      Gate `TestJsonRegister.pas` 48/48 PASS.  Regression: TestJson
+      434/434, TestJsonEach 50/50, TestAuthBuiltins 34/34, TestPrintf
+      105/105, TestVtab 216/216, TestParser 45/45, TestSchemaBasic
+      44/44, TestVdbeApi 57/57, TestCarray 66/66.
+
+      Concrete changes:
+        * `src/passqlite3types.pas` — `SQLITE_RESULT_SUBTYPE = $01000000`.
+        * `src/passqlite3json.pas` — adds `jsonArrayFunc`,
+          `jsonObjectFunc` cdecl entry points (interface + impl).
+        * `src/passqlite3codegen.pas` — adds `sqlite3RegisterJsonFunctions`
+          (~110 lines), pulls `passqlite3json`, `passqlite3jsoneach`
+          into the implementation `uses` clause; `sqlite3RegisterBuiltinFunctions`
+          now calls it after the existing scalar+agg insert.
+        * `src/tests/TestJsonRegister.pas` — new gate, 48 asserts.
+        * `src/tests/build.sh` — adds `compile_test TestJsonRegister`.
+
+      Discoveries / next-step notes:
+        * **`sqlite3RCStr` still deferred.**  Same TRANSIENT-copy
+          fix-sites as 6.8.h.1 / 6.8.h.4 / 6.8.g.  Three swaps will
+          land together when a future PrepareV2/Vdbe-result chunk
+          ports the helper.
+        * **TFuncDef arrays cannot be over-sized with trailing zero
+          slots.**  `sqlite3InsertBuiltinFuncs` calls
+          `sqlite3Strlen30(zName)` per entry; a nil zName → segfault.
+          Always size arrays to exactly the registered count.
+        * **Per-connection vtab registration deferred.**  C's
+          `sqlite3JsonVtabRegister` is invoked lazily via
+          `sqlite3FindOrCreateModule` from the parser when a SQL
+          statement first names `json_each` etc.  Until that path
+          exists in this port (Phase 7), `sqlite3RegisterJsonFunctions`
+          merely keeps the `passqlite3jsoneach` unit linked so its
+          `initialization` block populates `jsonEachModule`.
+        * **`pUserData` is now live for the SQL path.**  The
+          `JSON_ISSET` / `JSON_AINS` / `JSON_BLOB` / `JSON_JSON` /
+          `JSON_SQL` / `JSON_ABPATH` flag-discrimination branches in
+          `jsonSetFunc` / `jsonExtractFunc` / etc. that h.3 and h.4
+          flagged as untested-because-fabricated-ctx all fire when
+          `sqlite3FindFunction` resolves a registered name.
 
 ### Phase 6.7 implementation notes (2026-04-25)
 
