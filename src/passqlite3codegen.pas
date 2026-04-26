@@ -5257,11 +5257,30 @@ end;
 // Phase 6.4 — insert.c
 // ===========================================================================
 
-{ sqlite3OpenTable — emit OP_Open* to open a table cursor (Phase 6.4 stub) }
+{ sqlite3OpenTable — port of insert.c:26.
+  Acquire a lock for table pTab and open it as cursor iCur.
+  If pTab is a WITHOUT ROWID table, the PRIMARY KEY index is opened instead.
+  sqlite3TableLock is a no-op when SQLITE_OMIT_SHARED_CACHE is in effect
+  (this port's default — see noSharedCache in passqlite3util). }
 procedure sqlite3OpenTable(pParse: PParse; iCur: i32; iDb: i32;
   pTab: PTable2; opcode: i32);
+var
+  v:   PVdbe;
+  pPk: PIndex2;
 begin
-  { Phase 6.5: emit OP_OpenRead or OP_OpenWrite for pTab }
+  v := pParse^.pVdbe;
+  if v = nil then Exit;
+  { sqlite3TableLock(pParse, iDb, pTab^.tnum, opcode=OP_OpenWrite, pTab^.zName)
+    is omitted — shared-cache off in this port. }
+  if (pTab^.tabFlags and TF_WithoutRowid) = 0 then begin
+    sqlite3VdbeAddOp4Int(v, opcode, iCur, i32(pTab^.tnum), iDb, pTab^.nNVCol);
+  end else begin
+    pPk := sqlite3PrimaryKeyIndex(pTab);
+    if pPk <> nil then begin
+      sqlite3VdbeAddOp3(v, opcode, iCur, i32(pPk^.tnum), iDb);
+      sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pPk));
+    end;
+  end;
 end;
 
 { sqlite3TableAffinity — emit OP_Affinity for INSERT values (Phase 6.4 stub) }

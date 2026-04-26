@@ -20,6 +20,82 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 11a): port `sqlite3OpenTable`
+    (insert.c:26).**  Replaces the `Phase 6.4 stub` body at
+    `passqlite3codegen.pas:5260` with a faithful structural port of
+    the C helper that emits `OP_OpenRead` / `OP_OpenWrite` for a
+    table cursor — a precondition for any productive port of
+    `sqlite3Insert` / `sqlite3Update` / `sqlite3DeleteFrom` (the
+    actual DIVERGE-flippers identified at the end of step 10).
+
+    Concrete changes (all in `src/passqlite3codegen.pas`):
+      * Body now emits `sqlite3VdbeAddOp4Int(v, opcode, iCur,
+        pTab^.tnum, iDb, pTab^.nNVCol)` for the rowid case (the
+        common path) and `sqlite3VdbeAddOp3 + sqlite3VdbeSetP4KeyInfo`
+        for the WITHOUT ROWID case.  HasRowid maps to
+        `(pTab^.tabFlags and TF_WithoutRowid) = 0`.
+      * `sqlite3TableLock` is omitted with a comment — it is a no-op
+        when SQLITE_OMIT_SHARED_CACHE is in effect (this port's
+        default; see `noSharedCache` in `passqlite3util`).  Same
+        choice already documented at `sqlite3OpenSchemaTable`
+        (codegen:5807).
+      * The WITHOUT ROWID arm passes `Pointer(pPk)` to
+        `sqlite3VdbeSetP4KeyInfo` — the vdbe-side prototype takes
+        `PIndex = Pointer` (vdbe.pas:611) so the codegen-side
+        `PIndex2` is forwarded by raw-pointer conversion.  The
+        function itself is still a Phase-6 no-op stub
+        (passqlite3vdbe.pas:2397), so nothing observable changes
+        for WITHOUT ROWID until that lands; the structural call is
+        in place for when it does.
+
+    Tests: full build clean.  TestExplainParity unchanged at
+    **2 PASS / 8 DIVERGE / 0 ERROR** (expected — `sqlite3OpenTable`
+    is not yet *called* by anything productive: `sqlite3Insert`,
+    `sqlite3Update`, `sqlite3DeleteFrom` are still Phase 6.4 stubs
+    that free their inputs).  Regression spot check (2026-04-26):
+    TestPrepareBasic 20/20, TestParser 45/45, TestParserSmoke 20/20,
+    TestSchemaBasic 44/44, TestVdbeApi 57/57, TestDMLBasic 54/54,
+    TestSelectBasic 49/49, TestExprBasic 40/40, TestVdbeTxn 8/8,
+    TestAuthBuiltins 34/34, TestOpenClose 17/17, TestSmoke +
+    TestUtil clean, TestJson 434/434, TestJsonEach 50/50,
+    TestJsonRegister 48/48, TestPrintf 105/105, TestVtab 216/216.
+
+    Discoveries / next-step notes:
+      * **Why this is a sub-step (11a) of step 11.**  The full
+        step-11 target — port `sqlite3Insert` / `sqlite3Update` /
+        `sqlite3DeleteFrom` to the point where they emit OpenWrite
+        / String8 / MakeRecord / Insert against `sqlite_master` — is
+        a multi-thousand-line C surface (insert.c is 3000+ lines,
+        update.c another 2000+, delete.c another 1000+).  Each of
+        those eventually calls `sqlite3OpenTable`, so landing this
+        helper first lets future sub-steps focus purely on the
+        per-statement codegen scaffold without entangling cursor-
+        open semantics.  Same incremental pattern as 6.9-bis steps
+        1..10.
+      * **`pParse^.pVdbe` not `sqlite3GetVdbe`.**  The C reference
+        asserts `pParse->pVdbe!=0` and reads the field directly; we
+        do the same (early-exit on nil rather than allocating a
+        fresh VDBE here, which would be wrong — the caller is always
+        already mid-codegen).
+      * **`IsVirtual(pTab)` assertion not wired.**  The C reference
+        asserts `!IsVirtual(pTab)`.  Pascal `tabIsVirtual` lives in
+        `passqlite3vtab` (vtab.pas:451) and would require adding a
+        `uses` to codegen's implementation block.  Skipped for now;
+        the productive call sites that go through `sqlite3OpenTable`
+        all gate on `pTab^.eTabType <> TABTYP_VTAB` upstream
+        (sqlite3CreateIndex codegen:6830 is the existing example),
+        so the assertion is structurally redundant.  Add later if
+        a defensive check proves necessary.
+      * **Next 6.9-bis target: step 11b — minimal `sqlite3Insert`.**
+        With `sqlite3OpenTable` available, the smallest productive
+        next sub-step is the schema-row-INSERT path inside
+        `sqlite3Insert`: `OpenWrite(0, SCHEMA_ROOT, iDb, 5)` on
+        cursor 0 (already handled by `sqlite3OpenSchemaTable`),
+        then `String8` / `MakeRecord` / `Insert` for the five-col
+        sqlite_master row.  That alone flips the CREATE INDEX +
+        DROP INDEX rows in TestExplainParity.  Update / Delete arms
+        follow the same pattern.
+
   - **2026-04-26 — Phase 6.9-bis (step 10): wire real format strings
     + args at the 7 sqlite3NestedParse call sites.**  Fills in the
     placeholders left by step 9 — every `sqlite3NestedParse(pParse,
