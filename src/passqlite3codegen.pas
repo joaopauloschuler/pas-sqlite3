@@ -5782,9 +5782,20 @@ begin
   end;
 end;
 
+{ sqlite3OpenSchemaTable — port of build.c:916.
+  Open the sqlite_schema table in database iDb for writing on cursor 0.
+  In the C reference this also calls sqlite3TableLock; with shared cache
+  disabled (the default in this port) sqlite3TableLock is a no-op. }
 procedure sqlite3OpenSchemaTable(p: PParse; iDb: i32);
+var
+  v: PVdbe;
 begin
-  { Phase 7 — emit OP_OpenRead on the schema table }
+  v := sqlite3GetVdbe(p);
+  { sqlite3TableLock(p, iDb, SCHEMA_ROOT, 1, LEGACY_SCHEMA_TABLE) is omitted —
+    a no-op when SQLITE_OMIT_SHARED_CACHE is in effect (this port's default). }
+  if v <> nil then
+    sqlite3VdbeAddOp4Int(v, OP_OpenWrite, 0, SCHEMA_ROOT, iDb, 5);
+  if p^.nTab = 0 then p^.nTab := 1;
 end;
 
 function sqlite3IsShadowTableOf(db: PTsqlite3; pTab: PTable2;
@@ -5861,9 +5872,18 @@ begin
   sqlite3ExprDelete(pParse^.db, pExpr);
 end;
 
+{ sqlite3ChangeCookie — port of build.c:2047.
+  Emit OP_SetCookie to bump schema_cookie by 1 for database iDb.  Called
+  whenever a DDL statement modifies the schema. }
 procedure sqlite3ChangeCookie(pParse: PParse; iDb: i32);
+var
+  db: PTsqlite3;
+  v:  PVdbe;
 begin
-  { Phase 7 }
+  db := pParse^.db;
+  v  := pParse^.pVdbe;
+  sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_SCHEMA_VERSION,
+    i32(1 + u32(db^.aDb[iDb].pSchema^.schema_cookie)));
 end;
 
 procedure sqlite3EndTable(pParse: PParse; const pCons: PToken;
@@ -6364,9 +6384,22 @@ begin
   end;
 end;
 
+{ sqlite3BeginWriteOperation — port of build.c:5403.
+  Mark database iDb as needing a write transaction, request a schema-cookie
+  verification at toplevel, and (if setStatement) flag this statement as
+  potentially multi-write so a statement journal will be opened. }
 procedure sqlite3BeginWriteOperation(pParse: PParse; setStatement: i32; iDb: i32);
+var
+  pToplevel: PParse;
 begin
-  { Phase 7 }
+  if pParse^.pToplevel <> nil then
+    pToplevel := pParse^.pToplevel
+  else
+    pToplevel := pParse;
+  sqlite3CodeVerifySchema(pToplevel, iDb);
+  pToplevel^.writeMask := pToplevel^.writeMask or (u32(1) shl iDb);
+  if setStatement <> 0 then
+    pToplevel^.isMultiWrite := pToplevel^.isMultiWrite or u8(1);
 end;
 
 procedure sqlite3MultiWrite(pParse: PParse);

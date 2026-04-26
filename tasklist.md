@@ -20,6 +20,69 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis (step 3): foundational helpers
+    sqlite3OpenSchemaTable + sqlite3ChangeCookie +
+    sqlite3BeginWriteOperation port (build.c:916, 2047, 5403).**
+    Replaces three more `{ Phase 7 }` stubs in `passqlite3codegen.pas`
+    with byte-faithful ports.  These are tiny (3–6 lines apiece) but
+    they are the on-ramp every remaining DDL codegen helper
+    (`sqlite3StartTable`, `sqlite3EndTable`, `sqlite3CreateIndex`,
+    `sqlite3DropTable`, `sqlite3CodeDropTable`) calls into — so
+    landing them now unblocks the larger ports without needing a
+    separate "infrastructure" commit interleaved with each one.
+
+    Concrete changes:
+      * `src/passqlite3codegen.pas`:
+        - `sqlite3OpenSchemaTable` (line 5785, was a stub):
+          `sqlite3GetVdbe` + `OP_OpenWrite p1=0 p2=SCHEMA_ROOT
+          p3=iDb p4=5` (numCols), `nTab := 1` if zero.  The C
+          reference also calls `sqlite3TableLock` here; that helper
+          is `OMIT_SHARED_CACHE`-gated and a no-op in this build,
+          so the call is replaced with a comment pointing at the
+          omission rather than added as a stub.
+        - `sqlite3ChangeCookie` (line 5868, was a stub):
+          `OP_SetCookie p1=iDb p2=BTREE_SCHEMA_VERSION
+          p3=schema_cookie+1`.  Mirrors C verbatim including the
+          `(int)(1+(unsigned)x)` overflow-tolerant cast (Pascal:
+          `i32(1 + u32(...))`).
+        - `sqlite3BeginWriteOperation` (line 6371, was a stub):
+          resolves toplevel via `pParse^.pToplevel ?? pParse`,
+          calls `sqlite3CodeVerifySchema(toplevel, iDb)`, sets
+          `writeMask` bit, ORs `setStatement` into `isMultiWrite`.
+
+    Tests: full build clean.  TestExplainParity score unchanged
+    at 1 PASS / 7 DIVERGE / 2 ERROR — these helpers do not by
+    themselves emit any new ops in the corpus rows; they are the
+    plumbing that the still-stubbed `sqlite3StartTable` /
+    `sqlite3EndTable` / etc. need to call.  Regression spot check:
+    TestPrepareBasic 20/20, TestParser 45/45, TestParserSmoke 20/20,
+    TestSchemaBasic 44/44, TestVdbeApi 57/57, TestDMLBasic 54/54,
+    TestSelectBasic 49/49, TestExprBasic 40/40, TestVdbeTxn 8/8,
+    TestAuthBuiltins 34/34, TestOpenClose 17/17.
+
+    Discoveries / next-step notes:
+      * **`sqlite3TableLock` is OMIT_SHARED_CACHE-gated.**  In the
+        upstream split source it is compiled away to a `#define
+        codeTableLocks(x)` no-op when shared cache is off.  This
+        port keeps shared cache off, so call-sites can simply
+        skip it — but the helper symbol still needs to exist as
+        a no-op stub if/when shared-cache callers land.  Worth a
+        forward decl + empty body in the next 6.9-bis step.
+      * **`isMultiWrite` is `u8`, OR-with-int needs an explicit
+        `u8()` cast** to satisfy FPC's type inference.  Same idiom
+        as elsewhere in the port.
+      * **Next 6.9-bis target unchanged:** `sqlite3StartTable` /
+        `sqlite3EndTable` (32–43 ops, biggest surface).  All of
+        their non-trivial helper deps now real:
+        BeginWriteOperation, CodeVerifySchema, ChangeCookie,
+        OpenSchemaTable, ForceNotReadOnly.  The remaining stubs
+        in their call graph are: `sqlite3CheckObjectName`,
+        `sqlite3FindTable`, the `Table*` allocator path
+        (`sqlite3DbMallocZero` is real; `pParse^.u1.cr.*` slot
+        wiring needs audit), and (for EndTable)
+        `sqlite3NestedParse` (still a stub) for the schema-row
+        UPDATE.
+
   - **2026-04-26 — Phase 6.9-bis (step 2): sqlite3DropIndex +
     schema-verify helpers port (build.c:4595, 5404, 5418, 1181).**
     Replaces the `{ Phase 7 }` stubs for sqlite3CodeVerifySchema,
