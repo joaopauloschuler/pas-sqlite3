@@ -450,6 +450,7 @@ function  sqlite3BtreeCursorRestore(pCur: PBtCursor; pDifferentRow: Pi32): i32;
 function  sqlite3BtreeEof(pCur: PBtCursor): i32;
 function  sqlite3BtreeIntegerKey(pCur: PBtCursor): i64;
 function  sqlite3BtreePayloadSize(pCur: PBtCursor): u32;
+function  sqlite3BtreeOffset(pCur: PBtCursor): i64;
 
 { ===========================================================================
   Phase 4.2 — payload access
@@ -2223,6 +2224,17 @@ function sqlite3BtreePayloadSize(pCur: PBtCursor): u32;
 begin
   getCellInfo(pCur);
   Result := pCur^.info.nPayload;
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3BtreeOffset
+  btree.c lines 4937-4948
+  --------------------------------------------------------------------------- }
+function sqlite3BtreeOffset(pCur: PBtCursor): i64;
+begin
+  getCellInfo(pCur);
+  Result := i64(pCur^.pBt^.pageSize) * (i64(pCur^.pPage^.pgno) - 1) +
+            i64(PtrUInt(pCur^.info.pPayload) - PtrUInt(pCur^.pPage^.aData));
 end;
 
 { ---------------------------------------------------------------------------

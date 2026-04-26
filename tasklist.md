@@ -20,6 +20,62 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 5.4c-bis VDBE overflow-column RCStr cache.**
+    Closes the "Phase 5 RCStr placeholder" deferral flagged by Phase
+    6.8.h.7's discovery notes (vdbe.c:719..795 / vdbeaux.c:2745..2762).
+    Ports the large-TEXT/BLOB column-cache branch of `vdbeColumnFromOverflow`
+    using the `sqlite3RCStr*` primitives that 6.8.h.7 promoted into
+    `passqlite3util`, and threads the matching `freeCursorWithCache`
+    cleanup into `sqlite3VdbeFreeCursorNN`.
+
+    Concrete changes:
+      * `src/passqlite3btree.pas` — adds `sqlite3BtreeOffset`
+        (btree.c:4941); needed by the cache-invalidation predicate
+        in `vdbeColumnFromOverflow` to detect "different row at the
+        same iCol/cacheStatus".
+      * `src/passqlite3vdbe.pas`:
+        - `vdbeColumnFromOverflow` — replaces the simplified
+          `VdbeMemFromBtree`-only body with the full vdbe.c:735..785
+          path: lazy `pCache` allocation under `VDBC_ColCache`,
+          5-way cache-validity check (pCValue / iCol / cacheStatus /
+          colCacheCtr / iOffset), `sqlite3RCStrUnref` of the previous
+          buffer, `sqlite3RCStrNew(len+3)` with the three trailing
+          zero bytes, `sqlite3BtreePayload` fill, and
+          `sqlite3VdbeMemSetStr(...)` with `sqlite3RCStrUnref` as
+          destructor (zero-copy ownership transfer to the result Mem).
+          Threshold matches C exactly (`len > 4000 && pKeyInfo == 0`).
+        - `sqlite3VdbeFreeCursorNN` — front-loads the
+          `freeCursorWithCache` body (vdbeaux.c:2752): if the cursor
+          carries `VDBC_ColCache`, drop the cached RCStr buffer via
+          `sqlite3RCStrUnref`, then `sqlite3DbFree` the cache record
+          before falling through to the type-specific cursor close.
+          Order matches C — the cache is freed regardless of cursor
+          eCurType, which mirrors the upstream guard.
+
+    Tests: full build clean (`bash src/tests/build.sh`).  Regression
+    spot check: TestVdbeCursor 27/27, TestVdbeMem 62/62,
+    TestVdbeRecord 13/13, TestVdbeApi 57/57, TestVdbeBlob 13/13,
+    TestJson 434/434, TestJsonRegister 48/48, TestJsonEach 50/50,
+    TestUtil ALL PASS, TestPagerCompat ALL PASS, TestBtreeCompat
+    337/337, TestSchemaBasic 44/44.
+
+    Discoveries / next-step notes:
+      * **`sqlite3RCStrUnref` cast through `TxDelProc(@...)` is required.**
+        FPC will not implicitly accept a `procedure(p:Pointer);cdecl`
+        symbol address as a `TxDelProc` parameter; an explicit cast
+        keeps the calling convention contract documented at the call
+        site.  Same trick used by the `sqlite3FreeXDel` callers.
+      * **`sqlite3BtreeOffset` body uses `PtrUInt` arithmetic.**  The
+        C version subtracts two `u8*` (`pPayload - aData`); Pascal's
+        pointer subtraction with `{$POINTERMATH ON}` is element-sized,
+        so cast through `PtrUInt` to get a byte-count.  Same idiom
+        already used by `accessPayload` in passqlite3btree.
+      * **`vdbeaux.c:2759` deferral closed.**  Per the 6.8.h.7
+        discovery list, this was the second of two RCStr fix-sites
+        in the VDBE port.  `vdbe.c:759..782` (the cache fill itself)
+        is now also live.  No remaining RCStr placeholders in the
+        VDBE.
+
   - **2026-04-26 — Phase 6.8.h.7 sqlite3RCStr port + JSON ownership-transfer.**
     Closes the `sqlite3RCStr*` deferral threaded through 6.8.b /
     6.8.g / 6.8.h.1 / 6.8.h.4.  Ports the four-function reference-counted

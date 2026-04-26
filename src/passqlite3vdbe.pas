@@ -2677,7 +2677,20 @@ var
   pVtab:   passqlite3vtab.PSqlite3Vtab;
   pModule: passqlite3vtab.PSqlite3Module;
   xClose:  TxCloseFn;
+  pCache:  PVdbeTxtBlbCache;
 begin
+  { Port of vdbeaux.c freeCursorWithCache: drop the RCStr-cached overflow
+    buffer (if any) before tearing down the underlying cursor. }
+  if (pCx^.cursorFlags and VDBC_ColCache) <> 0 then begin
+    pCache := pCx^.pCache;
+    pCx^.cursorFlags := pCx^.cursorFlags and not u32(VDBC_ColCache);
+    pCx^.pCache := nil;
+    if (pCache <> nil) and (pCache^.pCValue <> nil) then begin
+      sqlite3RCStrUnref(pCache^.pCValue);
+      pCache^.pCValue := nil;
+    end;
+    sqlite3DbFree(Psqlite3db(p^.db), pCache);
+  end;
   case pCx^.eCurType of
     CURTYPE_BTREE: begin
       if (pCx^.cursorFlags and VDBC_Ephemeral) <> 0 then begin
@@ -4159,32 +4172,77 @@ end;
 
 { -----------------------------------------------------------------------
   vdbeColumnFromOverflow — read a column value from overflow pages
-  Port of vdbe.c:719 (simplified: no RCStr cache, uses VdbeMemFromBtree)
+  Port of vdbe.c:719 (with RCStr-cached buffer for large TEXT/BLOB).
   ----------------------------------------------------------------------- }
 function vdbeColumnFromOverflow(pC: PVdbeCursor; iCol: i32; t: u32;
     iOffset: i64; cacheStatus: u32; colCacheCtr: u32;
     pDest: PMem): i32;
 var
-  db:  PTsqlite3;
-  len: i32;
-  rc:  i32;
+  db:       PTsqlite3;
+  encoding: u8;
+  len:      i32;
+  rc:       i32;
+  pCache:   PVdbeTxtBlbCache;
+  pBuf:     PAnsiChar;
 begin
-  db  := PTsqlite3(pDest^.db);
-  len := i32(sqlite3VdbeSerialTypeLen(t));
+  db       := PTsqlite3(pDest^.db);
+  encoding := pDest^.enc;
+  len      := i32(sqlite3VdbeSerialTypeLen(t));
   if len > i32(Pu32(Pu8(db) + 136)^) then begin
     { SQLITE_LIMIT_LENGTH exceeded }
     Result := SQLITE_TOOBIG; Exit;
   end;
-  rc := sqlite3VdbeMemFromBtree(pC^.uc.pCursor, u32(iOffset), u32(len), pDest);
-  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
-  sqlite3VdbeSerialGet(Pu8(pDest^.z), t, pDest);
-  if ((t and 1) <> 0) and (pDest^.enc = SQLITE_UTF8) then begin
-    if pDest^.szMalloc > pDest^.n then
-      pDest^.z[pDest^.n] := #0;
-    pDest^.flags := pDest^.flags or MEM_Term;
+  if (len > 4000) and (pC^.pKeyInfo = nil) then begin
+    { Large TEXT/BLOB on a table-btree: cache via RCStr so a re-read of
+      the same column on the same row reuses the buffer (vdbe.c:735..). }
+    if (pC^.cursorFlags and VDBC_ColCache) = 0 then begin
+      pC^.pCache := PVdbeTxtBlbCache(sqlite3DbMallocZero(Psqlite3db(db),
+                                          SizeOf(TVdbeTxtBlbCache)));
+      if pC^.pCache = nil then begin Result := SQLITE_NOMEM; Exit; end;
+      pC^.cursorFlags := pC^.cursorFlags or VDBC_ColCache;
+    end;
+    pCache := pC^.pCache;
+    if (pCache^.pCValue = nil)
+       or (pCache^.iCol <> iCol)
+       or (pCache^.cacheStatus <> cacheStatus)
+       or (pCache^.colCacheCtr <> colCacheCtr)
+       or (pCache^.iOffset <> sqlite3BtreeOffset(pC^.uc.pCursor)) then begin
+      if pCache^.pCValue <> nil then sqlite3RCStrUnref(pCache^.pCValue);
+      pBuf := sqlite3RCStrNew(u64(len) + 3);
+      pCache^.pCValue := pBuf;
+      if pBuf = nil then begin Result := SQLITE_NOMEM; Exit; end;
+      rc := sqlite3BtreePayload(pC^.uc.pCursor, u32(iOffset), u32(len), pBuf);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+      pBuf[len]     := #0;
+      pBuf[len + 1] := #0;
+      pBuf[len + 2] := #0;
+      pCache^.iCol        := iCol;
+      pCache^.cacheStatus := cacheStatus;
+      pCache^.colCacheCtr := colCacheCtr;
+      pCache^.iOffset     := sqlite3BtreeOffset(pC^.uc.pCursor);
+    end else
+      pBuf := pCache^.pCValue;
+    Assert(t >= 12);
+    sqlite3RCStrRef(pBuf);
+    if (t and 1) <> 0 then begin
+      rc := sqlite3VdbeMemSetStr(pDest, pBuf, len, encoding,
+                                 TxDelProc(@sqlite3RCStrUnref));
+      pDest^.flags := pDest^.flags or MEM_Term;
+    end else
+      rc := sqlite3VdbeMemSetStr(pDest, pBuf, len, 0,
+                                 TxDelProc(@sqlite3RCStrUnref));
+  end else begin
+    rc := sqlite3VdbeMemFromBtree(pC^.uc.pCursor, u32(iOffset), u32(len), pDest);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+    sqlite3VdbeSerialGet(Pu8(pDest^.z), t, pDest);
+    if ((t and 1) <> 0) and (pDest^.enc = SQLITE_UTF8) then begin
+      if pDest^.szMalloc > pDest^.n then
+        pDest^.z[pDest^.n] := #0;
+      pDest^.flags := pDest^.flags or MEM_Term;
+    end;
   end;
   pDest^.flags := pDest^.flags and not u16(MEM_Ephem);
-  Result := SQLITE_OK;
+  Result := rc;
 end;
 
 { ============================================================================
