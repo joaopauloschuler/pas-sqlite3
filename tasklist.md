@@ -20,6 +20,58 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.2c dbpage.c port.**  New unit
+    `src/passqlite3dbpage.pas` (~470 lines) hosts faithful Pascal ports
+    of the full v2 module callback set (dbpageConnect / dbpageDisconnect
+    / dbpageBestIndex / dbpageOpen / dbpageClose / dbpageNext /
+    dbpageEof / dbpageFilter / dbpageColumn / dbpageRowid / dbpageUpdate
+    / dbpageBegin / dbpageSync / dbpageRollbackTo) plus the
+    `dbpageModule: Tsqlite3_module` record (iVersion=2, xCreate=xConnect
+    so dbpage is eponymous-or-creatable, xDestroy=xDisconnect, full
+    transactional set: xUpdate / xBegin / xSync / xRollbackTo wired).
+    `sqlite3DbpageRegister(db)` delegates to `sqlite3VtabCreateModule`.
+
+    Notes that future phases should heed:
+
+      * **`sqlite3_context_db_handle` not ported.**  xColumn's schema
+        path normally derives `db` via `ctx->pVdbe->db`.  We instead
+        walk `cursor->base.pVtab->db` (DbpageTable.db is set in
+        xConnect); equivalent in C, simpler in Pascal.  When the
+        public helper does land, the dbpageColumn schema branch can
+        switch over without behaviour change.
+      * **`sqlite3_result_zeroblob` (i32) not ported** as a separate
+        entry point.  Bridged through the existing
+        `sqlite3_result_zeroblob64(ctx, u64(szPage))`; identical effect.
+      * **`SQLITE_Defensive` flag bit not exported** from
+        passqlite3vtab (lives in its impl section).  Mirrored locally
+        as `SQLITE_Defensive_Bit = u64($10000000)`.  Worth promoting
+        to passqlite3util's interface alongside the other db.flags
+        constants when one of the next sub-phases needs it too.
+      * **`sqlite3_mprintf` recurring blocker** — same shim pattern as
+        carray (6.bis.2b): local `dbpageFmtMsg` mirrors `carrayFmtMsg`
+        / `vtabFmtMsg`.  Three copies now; promote to a shared helper
+        when the printf sub-phase lands.
+      * **FPC name-collision pitfalls (per memory).**  Must rename
+        `pgno: Pgno` → `pg: Pgno`, `pPager: PPager` → `pPgr: PPager`,
+        `pDbPage: PDbPage` → `pDbPg: PDbPage` everywhere they appear
+        as local variable declarations.  Cursor / table record FIELDS
+        keep their upstream spelling — the case-insensitive collision
+        only fires for top-level `var` declarations, not record
+        members (qualified by record name).
+
+    Idiom worth memoising: `sqlite3_vtab_config` in our port takes a
+    mandatory `intArg: i32` even for opcodes that ignore it (DIRECTONLY
+    / USES_ALL_SCHEMAS); pass 0 explicitly.
+
+    Gate `src/tests/TestDbpage.pas` (new) — **68/68 PASS**.  Exercises
+    module registration (registry slot + name), the full v2 slot
+    layout (M1..M21), all four xBestIndex idxNum branches plus the
+    SQLITE_CONSTRAINT failure on unusable schema, xOpen/xClose, and
+    the cursor state machine (xNext / xEof / xRowid).  xColumn /
+    xFilter / xUpdate / xBegin / xSync require a live Btree on a
+    real db file; deferred to the end-to-end SQL gate (6.9).
+    No regressions across the 46-gate matrix; TestCarray still 66/66.
+
   - **2026-04-26 — Phase 6.bis.2b carray.c port.**  New unit
     `src/passqlite3carray.pas` (~360 lines) hosts faithful Pascal ports
     of all 10 static vtab callbacks (carrayConnect / carrayDisconnect
@@ -2959,9 +3011,35 @@ Phase 5.9 depends on this being done first.
     regressions across the existing 45 gates (TestVtab still 216/216,
     everything else green).
 
-  - [ ] **6.bis.2c** Port `dbpage.c` — the built-in `sqlite_dbpage`
+  - [X] **6.bis.2c** Port `dbpage.c` — the built-in `sqlite_dbpage`
     vtab.  Depends on the pager/btree page-fetch helpers
     (`sqlite3PagerGet` / `sqlite3PagerWrite` already in passqlite3pager).
+    DONE 2026-04-26.  New unit `src/passqlite3dbpage.pas` (~470 lines)
+    hosts the full v2 module callback set (xConnect, xDisconnect,
+    xBestIndex, xOpen, xClose, xFilter, xNext, xEof, xColumn, xRowid,
+    xUpdate, xBegin, xSync, xRollbackTo) and the `dbpageModule`
+    Tsqlite3_module record (iVersion=2, xCreate=xConnect,
+    xDestroy=xDisconnect — dbpage is eponymous-or-creatable).
+    `sqlite3DbpageRegister` is the public entry point.
+
+    Carry-overs:
+      * `sqlite3_context_db_handle` not ported — xColumn derives `db`
+        via the cursor's vtab back-pointer (DbpageTable.db).
+      * `sqlite3_result_zeroblob(ctx, n)` (i32 form) not separately
+        ported; bridged through `sqlite3_result_zeroblob64`.
+      * `SQLITE_Defensive` flag bit not in passqlite3vtab's interface;
+        mirrored locally as `SQLITE_Defensive_Bit`.  Promote to a
+        shared symbol when the next consumer arrives.
+      * `sqlite3_mprintf` shim pattern recurs (`dbpageFmtMsg`); now
+        three copies (vtab, carray, dbpage) — collapse when the
+        printf sub-phase lands.
+
+    Gate `src/tests/TestDbpage.pas` — 68/68 PASS.  Covers module
+    registration, full v2 slot layout, all four xBestIndex idxNum
+    branches plus the unusable-schema SQLITE_CONSTRAINT path,
+    xOpen/xClose, and the cursor state machine.  Live-db paths
+    (xColumn data column, xFilter, xUpdate, xBegin/xSync/xRollbackTo)
+    deferred to 6.9 — they need a real Btree-backed connection.
 
   - [ ] **6.bis.2d** Port `dbstat.c` — the `dbstat` vtab (B-tree
     statistics).  Largest of the three (906 C lines).  Heavy on
