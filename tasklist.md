@@ -20,6 +20,48 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.2a sqlite3_index_info types + constants.**
+    Plumbing for the three in-tree vtabs (carray.c / dbpage.c /
+    dbstat.c).  `passqlite3vtab.pas`'s interface section grew the four
+    record types from sqlite.h:7830..7860 (`Tsqlite3_index_info`,
+    `Tsqlite3_index_constraint`, `Tsqlite3_index_orderby`,
+    `Tsqlite3_index_constraint_usage`), the typed `TxBestIndex` function-
+    pointer alias for the `xBestIndex` slot in `Tsqlite3_module`, and
+    19 numeric constants — `SQLITE_INDEX_CONSTRAINT_*` (17 values,
+    sqlite.h:7911..7927) plus `SQLITE_INDEX_SCAN_UNIQUE` /
+    `SQLITE_INDEX_SCAN_HEX` (sqlite.h:7869..7870).  The previous Phase
+    6.bis.1a placeholder `PSqlite3IndexInfo = Pointer` is now
+    `^Tsqlite3_index_info`.
+
+    Layout pitfall worth memoising: gcc's default struct alignment
+    pads `unsigned char op; unsigned char usable;` followed by `int
+    iTermOffset;` to 4 bytes between them.  The Pascal records mirror
+    this with explicit `_pad: u16` filler so a `Tsqlite3_index_constraint`
+    is 12 bytes (matches `sizeof(struct sqlite3_index_constraint)` in C);
+    same trick for `Tsqlite3_index_orderby` (`u8 desc; u8 _pad0; u16
+    _pad1;` = 8 bytes) and `Tsqlite3_index_constraint_usage` (8 bytes).
+    Verified by running the xBestIndex pointer-walk idiom (`pConstraint++`
+    → `Inc(pC)`) in T91..T93 and reading back the right values.
+
+    Gate `src/tests/TestVtab.pas` extended with T89..T93 — **216/216
+    PASS** (was 181/181).  No regressions across the full 45-gate
+    matrix in build.sh.
+
+    Discoveries / dependencies for 6.bis.2b..d (full list under the
+    6.bis.2 task entry below):
+      * `sqlite3_value_pointer` / `sqlite3_bind_pointer` not ported —
+        carray.c uses both, so a small Phase-8 sub-phase needs to land
+        the type-tagged-pointer machinery before TestCarray can drive
+        an actual bind/filter.
+      * `sqlite3_mprintf` still not ported (recurring blocker since
+        6.bis.1b) — affects all three vtabs but only as an error-
+        message niceness on carray, more central in dbstat's idxStr.
+      * VDBE vtab opcodes (`OP_VFilter` / `OP_VColumn` / `OP_VNext` /
+        `OP_VRowid`) still no-op stubs — end-to-end SQL against an
+        in-tree vtab won't work until that wiring lands.  6.bis.2b..d
+        gates will drive xMethods directly through the module-pointer
+        slots, mirroring TestVtab.T35..T50.
+
   - **2026-04-26 — Phase 6.bis.1f vtab.c overload + writable + eponymous
     tables.**  Faithful ports of `sqlite3VtabOverloadFunction`
     (vtab.c:1153..1215), `sqlite3VtabMakeWritable` (vtab.c:1223..1240),
@@ -2741,11 +2783,84 @@ Phase 5.9 depends on this being done first.
       * `sqlite3VtabMakeWritable` is now callable but no codegen path
         invokes it yet — `OP_VBegin` emission is gated on the same
         Phase-7 build.c work.  Tracked under 6.bis.1d's wiring caveat.
-- [ ] **6.bis.2** Port the three in-tree virtual tables:
+- **6.bis.2** Port the three in-tree virtual tables:
   - `dbpage.c` — the built-in `sqlite_dbpage` vtab (exposes raw DB pages).
   - `dbstat.c` — the built-in `dbstat` vtab (B-tree statistics).
   - `carray.c` — the `carray()` table-valued function (passes C arrays into
     SQL); small and a good shake-down test for the vtab machinery.
+
+  Each xBestIndex implementation reads/writes a `sqlite3_index_info`
+  struct, and most of these vtabs lean on `sqlite3_value_pointer` /
+  `sqlite3_bind_pointer` and a real `sqlite3_mprintf`.  The first sub-phase
+  lands the prerequisite struct + constants so 6.bis.2b/c/d can compile.
+  Broken into:
+
+  - [X] **6.bis.2a** Prerequisite types: `Tsqlite3_index_info`,
+    `Tsqlite3_index_constraint`, `Tsqlite3_index_orderby`,
+    `Tsqlite3_index_constraint_usage` records (sqlite.h:7830..7860 byte
+    layout), `TxBestIndex` typed function-pointer alias, and the
+    `SQLITE_INDEX_CONSTRAINT_*` (17 values, sqlite.h:7911..7927) +
+    `SQLITE_INDEX_SCAN_*` (2 values, sqlite.h:7869..7870) constants.
+    DONE 2026-04-26.  All declared in `passqlite3vtab.pas`'s interface
+    section.  `PSqlite3IndexInfo` was previously a `Pointer` stub from
+    Phase 6.bis.1a; now resolves to `^Tsqlite3_index_info`.
+
+    The records use an explicit `_pad` byte/word inside each fixed-
+    layout struct so FPC alignment matches the C struct: in particular
+    the `op` / `usable` / `desc` / `omit` `unsigned char` fields are
+    followed by 3 bytes (or 1 + 2) of padding so the next `int` lands
+    on a 4-byte boundary, matching gcc default alignment.  Verified by
+    running the constraint/orderby/usage round-trip via pointer
+    arithmetic in TestVtab.T91..T93 (xBestIndex idiom: `pConstraint++`
+    walked via `Inc(pC)`).
+
+    Gate `src/tests/TestVtab.pas` extended with T89..T93 — **216/216
+    PASS** (was 181/181).  No regressions across the full 45-gate
+    matrix in build.sh.
+
+    Discoveries / dependencies for 6.bis.2b..d:
+      * **`sqlite3_value_pointer` / `sqlite3_bind_pointer` are not
+        ported.**  These are the type-tagged-pointer entry points that
+        carray.c uses to receive a `void*` from the application via
+        `SQL bind` and read it inside xFilter.  A small Phase 8 follow-
+        up will be needed before carray.c can do anything beyond
+        registering itself.  Recommended approach: port the pointer
+        flag/type machinery in `vdbeInt.h` (`MEM_Subtype`, `eSubtype`)
+        + `sqlite3_bind_pointer` (vdbeapi.c:1731) +
+        `sqlite3_value_pointer` (vdbeapi.c:1394) together with their
+        destructor-disposal contract.  Until then, carray.c's
+        carrayFilter / carrayBindDel can be partially ported but tests
+        cannot exercise the bind path.
+      * **`sqlite3_mprintf` is still not ported** (recurring blocker
+        per 6.bis.1c..f notes).  carray.c uses it once on the
+        unknown-datatype error path; dbpage / dbstat use it more
+        heavily (idxStr formatting in dbstat).  Workaround mirrors
+        the `vtabFmtMsg` pattern from 6.bis.1c.
+      * **VDBE wiring of vtab opcodes is still pending** (per
+        6.bis.1d notes): `OP_VOpen`, `OP_VFilter`, `OP_VColumn`,
+        `OP_VNext`, `OP_VRowid` exist in the dispatch table but
+        do not yet drive `xOpen / xFilter / xColumn / xNext /
+        xRowid` on a real VTable.  Until that lands, end-to-end
+        SQL `SELECT * FROM carray(...)` cannot be tested; gate
+        tests for 6.bis.2b/c/d will exercise the vtab callbacks
+        directly via the module-pointer slots, mirroring the
+        TestVtab.T35..T50 pattern from 6.bis.1d.
+
+  - [ ] **6.bis.2b** Port `carray.c` — the `carray()` table-valued
+    function.  Smallest of the three (558 C lines).  Provides a good
+    shake-down for `Tsqlite3_index_info` round-trip, the typed
+    `TxBestIndex` slot in `Tsqlite3_module`, and (once the bind-pointer
+    sub-phase lands) `sqlite3_value_pointer` / `sqlite3_bind_pointer`.
+    Module entry point is `sqlite3CarrayRegister(db)` returning a
+    `PVtabModule` for vdbevtab.c-style auto-registration.
+
+  - [ ] **6.bis.2c** Port `dbpage.c` — the built-in `sqlite_dbpage`
+    vtab.  Depends on the pager/btree page-fetch helpers
+    (`sqlite3PagerGet` / `sqlite3PagerWrite` already in passqlite3pager).
+
+  - [ ] **6.bis.2d** Port `dbstat.c` — the `dbstat` vtab (B-tree
+    statistics).  Largest of the three (906 C lines).  Heavy on
+    `sqlite3_mprintf` for idxStr; depends on the printf sub-phase.
 
 - [ ] **6.9** `TestExplainParity.pas`: for the full SQL corpus, `EXPLAIN` each
   statement via Pascal and via C; diff the opcode listings. This is the single

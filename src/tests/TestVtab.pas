@@ -1091,6 +1091,100 @@ begin
   sqlite3DbFree(db, pParse);
 end;
 
+{ ---- Phase 6.bis.2a — sqlite3_index_info struct + constants ----
+  Validates that the field layout matches what an xBestIndex implementation
+  reads/writes, and that the SQLITE_INDEX_CONSTRAINT_* / SQLITE_INDEX_SCAN_*
+  numeric values match upstream sqlite.h. }
+procedure TestVtabIndexInfo_Run;
+var
+  info: Tsqlite3_index_info;
+  cons: array[0..1] of Tsqlite3_index_constraint;
+  uses_: array[0..1] of Tsqlite3_index_constraint_usage;
+  ord: Tsqlite3_index_orderby;
+  pC: PSqlite3IndexConstraint;
+  pU: PSqlite3IndexConstraintUsage;
+begin
+  WriteLn('  -- T89..T93 sqlite3_index_info layout + constants --');
+
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_EQ,        2, 'T89a CONSTRAINT_EQ');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_GT,        4, 'T89b CONSTRAINT_GT');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_LE,        8, 'T89c CONSTRAINT_LE');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_LT,       16, 'T89d CONSTRAINT_LT');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_GE,       32, 'T89e CONSTRAINT_GE');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_MATCH,    64, 'T89f CONSTRAINT_MATCH');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_LIKE,     65, 'T89g CONSTRAINT_LIKE');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_GLOB,     66, 'T89h CONSTRAINT_GLOB');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_REGEXP,   67, 'T89i CONSTRAINT_REGEXP');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_NE,       68, 'T89j CONSTRAINT_NE');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_ISNOT,    69, 'T89k CONSTRAINT_ISNOT');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_ISNOTNULL,70, 'T89l CONSTRAINT_ISNOTNULL');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_ISNULL,   71, 'T89m CONSTRAINT_ISNULL');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_IS,       72, 'T89n CONSTRAINT_IS');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_LIMIT,    73, 'T89o CONSTRAINT_LIMIT');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_OFFSET,   74, 'T89p CONSTRAINT_OFFSET');
+  ExpectEq(SQLITE_INDEX_CONSTRAINT_FUNCTION,150, 'T89q CONSTRAINT_FUNCTION');
+  ExpectEq(SQLITE_INDEX_SCAN_UNIQUE,        1, 'T90a SCAN_UNIQUE');
+  ExpectEq(SQLITE_INDEX_SCAN_HEX,           2, 'T90b SCAN_HEX');
+
+  { Populate a 2-constraint info struct and verify pointer-array indexing
+    using the same idiom xBestIndex routines use (pConstraint++ in C). }
+  FillChar(info, SizeOf(info), 0);
+  FillChar(cons, SizeOf(cons), 0);
+  FillChar(uses_, SizeOf(uses_), 0);
+  FillChar(ord, SizeOf(ord), 0);
+
+  cons[0].iColumn := 1;
+  cons[0].op      := SQLITE_INDEX_CONSTRAINT_EQ;
+  cons[0].usable  := 1;
+  cons[1].iColumn := 2;
+  cons[1].op      := SQLITE_INDEX_CONSTRAINT_GE;
+  cons[1].usable  := 0;
+
+  ord.iColumn := 3;
+  ord.desc    := 1;
+
+  info.nConstraint    := 2;
+  info.aConstraint    := @cons[0];
+  info.nOrderBy       := 1;
+  info.aOrderBy       := @ord;
+  info.aConstraintUsage := @uses_[0];
+  info.idxNum         := 0;
+  info.estimatedCost  := 1.0;
+  info.estimatedRows  := 100;
+  info.idxFlags       := SQLITE_INDEX_SCAN_UNIQUE;
+  info.colUsed        := $FF;
+
+  pC := info.aConstraint;
+  ExpectEq(pC^.iColumn, 1, 'T91a aConstraint[0].iColumn');
+  ExpectEq(pC^.op,      SQLITE_INDEX_CONSTRAINT_EQ, 'T91b aConstraint[0].op');
+  ExpectEq(pC^.usable,  1, 'T91c aConstraint[0].usable');
+  Inc(pC);
+  ExpectEq(pC^.iColumn, 2, 'T91d aConstraint[1].iColumn');
+  ExpectEq(pC^.op,      SQLITE_INDEX_CONSTRAINT_GE, 'T91e aConstraint[1].op');
+  ExpectEq(pC^.usable,  0, 'T91f aConstraint[1].usable');
+
+  ExpectEq(info.aOrderBy^.iColumn, 3, 'T92a aOrderBy[0].iColumn');
+  ExpectEq(info.aOrderBy^.desc,    1, 'T92b aOrderBy[0].desc');
+
+  { Write through the usage array via pointer indexing (xBestIndex pattern). }
+  pU := info.aConstraintUsage;
+  pU^.argvIndex := 1;
+  pU^.omit      := 1;
+  Inc(pU);
+  pU^.argvIndex := 2;
+  pU^.omit      := 0;
+  ExpectEq(uses_[0].argvIndex, 1, 'T93a aConstraintUsage[0].argvIndex');
+  ExpectEq(uses_[0].omit,      1, 'T93b aConstraintUsage[0].omit');
+  ExpectEq(uses_[1].argvIndex, 2, 'T93c aConstraintUsage[1].argvIndex');
+  ExpectEq(uses_[1].omit,      0, 'T93d aConstraintUsage[1].omit');
+
+  { Estimated cost / rows / colUsed round-trip. }
+  Expect(info.estimatedCost = 1.0,        'T93e estimatedCost round-trip');
+  Expect(info.estimatedRows = 100,        'T93f estimatedRows round-trip');
+  ExpectEq(info.idxFlags, SQLITE_INDEX_SCAN_UNIQUE, 'T93g idxFlags');
+  Expect(info.colUsed = $FF,              'T93h colUsed round-trip');
+end;
+
 var
   db: PTsqlite3;
   rc: i32;
@@ -1236,6 +1330,9 @@ begin
   TestVtabOverload_Run(db);
   TestVtabMakeWritable_Run(db);
   TestVtabEponymous_Run(db);
+
+  { ---- Phase 6.bis.2a — sqlite3_index_info struct + constants ---- }
+  TestVtabIndexInfo_Run;
 
   rc := sqlite3_close_v2(db);
   ExpectEq(rc, SQLITE_OK, 'T16 close_v2');

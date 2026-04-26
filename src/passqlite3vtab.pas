@@ -67,7 +67,60 @@ type
   PPSqlite3Vtab       = ^PSqlite3Vtab;
   PSqlite3VtabCursor  = ^Tsqlite3_vtab_cursor;
   PSqlite3Module      = ^Tsqlite3_module;
-  PSqlite3IndexInfo   = Pointer;       { full type lands with 6.bis.1c }
+  PSqlite3IndexInfo   = ^Tsqlite3_index_info;
+
+  { ----- sqlite.h:7833 — sqlite3_index_constraint (input) ----- }
+  PSqlite3IndexConstraint = ^Tsqlite3_index_constraint;
+  Tsqlite3_index_constraint = record
+    iColumn      : i32;     { Column constrained.  -1 for ROWID }
+    op           : u8;      { Constraint operator }
+    usable       : u8;      { True if this constraint is usable }
+    _pad         : u16;
+    iTermOffset  : i32;     { Used internally - xBestIndex should ignore }
+  end;
+
+  { ----- sqlite.h:7840 — sqlite3_index_orderby (input) ----- }
+  PSqlite3IndexOrderBy = ^Tsqlite3_index_orderby;
+  Tsqlite3_index_orderby = record
+    iColumn : i32;
+    desc    : u8;     { True for DESC.  False for ASC. }
+    _pad0   : u8;
+    _pad1   : u16;
+  end;
+
+  { ----- sqlite.h:7845 — sqlite3_index_constraint_usage (output) ----- }
+  PSqlite3IndexConstraintUsage = ^Tsqlite3_index_constraint_usage;
+  Tsqlite3_index_constraint_usage = record
+    argvIndex : i32;     { if >0, constraint is part of argv to xFilter }
+    omit      : u8;      { Do not code a test for this constraint }
+    _pad0     : u8;
+    _pad1     : u16;
+  end;
+
+  { ----- sqlite.h:7830 — sqlite3_index_info ----- }
+  Tsqlite3_index_info = record
+    { Inputs }
+    nConstraint     : i32;
+    aConstraint     : PSqlite3IndexConstraint;
+    nOrderBy        : i32;
+    aOrderBy        : PSqlite3IndexOrderBy;
+    { Outputs }
+    aConstraintUsage: PSqlite3IndexConstraintUsage;
+    idxNum          : i32;
+    idxStr          : PAnsiChar;
+    needToFreeIdxStr: i32;
+    orderByConsumed : i32;
+    estimatedCost   : Double;
+    { 3.8.2+ }
+    estimatedRows   : i64;
+    { 3.9.0+ }
+    idxFlags        : i32;
+    { 3.10.0+ }
+    colUsed         : u64;
+  end;
+
+  { ----- typedef for xBestIndex callbacks (vtab modules cast their slot) ----- }
+  TxBestIndex = function(pVtab: PSqlite3Vtab; pIdxInfo: PSqlite3IndexInfo): i32; cdecl;
 
   { ----- sqlite.h:7684 — sqlite3_module ----- }
   Tsqlite3_module = record
@@ -162,6 +215,29 @@ const
   SQLITE_VTAB_INNOCUOUS          = 2;
   SQLITE_VTAB_DIRECTONLY         = 3;
   SQLITE_VTAB_USES_ALL_SCHEMAS   = 4;
+
+  { sqlite.h:7869 — sqlite3_index_info.idxFlags bits }
+  SQLITE_INDEX_SCAN_UNIQUE = $00000001;
+  SQLITE_INDEX_SCAN_HEX    = $00000002;
+
+  { sqlite.h:7911..7927 — aConstraint[].op codes }
+  SQLITE_INDEX_CONSTRAINT_EQ         = 2;
+  SQLITE_INDEX_CONSTRAINT_GT         = 4;
+  SQLITE_INDEX_CONSTRAINT_LE         = 8;
+  SQLITE_INDEX_CONSTRAINT_LT         = 16;
+  SQLITE_INDEX_CONSTRAINT_GE         = 32;
+  SQLITE_INDEX_CONSTRAINT_MATCH      = 64;
+  SQLITE_INDEX_CONSTRAINT_LIKE       = 65;
+  SQLITE_INDEX_CONSTRAINT_GLOB       = 66;
+  SQLITE_INDEX_CONSTRAINT_REGEXP     = 67;
+  SQLITE_INDEX_CONSTRAINT_NE         = 68;
+  SQLITE_INDEX_CONSTRAINT_ISNOT      = 69;
+  SQLITE_INDEX_CONSTRAINT_ISNOTNULL  = 70;
+  SQLITE_INDEX_CONSTRAINT_ISNULL     = 71;
+  SQLITE_INDEX_CONSTRAINT_IS         = 72;
+  SQLITE_INDEX_CONSTRAINT_LIMIT      = 73;
+  SQLITE_INDEX_CONSTRAINT_OFFSET     = 74;
+  SQLITE_INDEX_CONSTRAINT_FUNCTION   = 150;
 
 { ============================================================
   Module registry
