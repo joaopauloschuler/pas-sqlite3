@@ -454,7 +454,6 @@ var
   pMod: PSqlite3Module;
   pVTbl: PVTable;
   rc: i32;
-  pCur: PVdbeCursor;
 begin
   WriteLn('T5: OP_VOpen → xOpen fires, vtab cursor allocated');
   InitDb(db);
@@ -469,15 +468,13 @@ begin
   rc := sqlite3VdbeExec(v);
   ExpectEq(rc, SQLITE_DONE, 'T5 rc=DONE');
   ExpectEq(gOpenCount, 1, 'T5 xOpen fired');
-  pCur := v^.apCsr[0];
-  Check('T5 cursor allocated', (pCur <> nil) and (pCur^.eCurType = CURTYPE_VTAB));
-  ExpectEq(pVTbl^.pVtab^.nRef, 1, 'T5 sqlite3_vtab.nRef = 1 (incremented)');
-  { sqlite3VdbeHalt is a stub in this port (closeAllCursors not yet wired
-    to the Halt path) so cursor close fires from explicit FreeCursor. }
-  sqlite3VdbeFreeCursor(v, v^.apCsr[0]);
-  v^.apCsr[0] := nil;
-  ExpectEq(gCloseCount, 1, 'T5 xClose fired on FreeCursor');
-  ExpectEq(pVTbl^.pVtab^.nRef, 0, 'T5 nRef decremented to 0');
+  { After OP_Halt, sqlite3VdbeHalt's closeAllCursors-equivalent loop fires
+    the CURTYPE_VTAB cleanup branch (xClose + nRef--) and nils out the slot,
+    so the cursor pointer is no longer valid post-exec — only the side-
+    effect counters and the slot-cleared invariant can be asserted. }
+  Check('T5 vtab cursor slot cleared by VdbeHalt', v^.apCsr[0] = nil);
+  ExpectEq(gCloseCount, 1, 'T5 xClose fired via VdbeHalt close-all-cursors');
+  ExpectEq(pVTbl^.pVtab^.nRef, 0, 'T5 nRef decremented to 0 after Halt');
   sqlite3VdbeDelete(v);
   FreeMockVTable(pVTbl, pMod);
 end;

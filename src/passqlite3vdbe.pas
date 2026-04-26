@@ -2759,8 +2759,24 @@ end;
 { --- VdbeHalt, VdbeReset, VdbeFinalize (Phase 5.4 stubs) --- }
 
 function sqlite3VdbeHalt(v: PVdbe): i32;
+var
+  i:  i32;
+  pC: PVdbeCursor;
 begin
-  { Full implementation is in vdbeaux.c Phase 5.4 }
+  { Full implementation (transaction commit/rollback bookkeeping) is in
+    vdbeaux.c Phase 5.4.  closeAllCursors-equivalent loop wired here so
+    cursors (in particular CURTYPE_VTAB cursors) do not leak across
+    sqlite3_step → sqlite3_finalize.  Mirrors closeCursorsInFrame
+    (vdbeaux.c:2796) inlined the same way it is in sqlite3VdbeFrameRestoreFull. }
+  if (v <> nil) and (v^.apCsr <> nil) then begin
+    for i := 0 to v^.nCursor - 1 do begin
+      pC := v^.apCsr[i];
+      if pC <> nil then begin
+        sqlite3VdbeFreeCursorNN(v, pC);
+        v^.apCsr[i] := nil;
+      end;
+    end;
+  end;
   v^.eVdbeState := VDBE_HALT_STATE;
   Result := SQLITE_OK;
 end;

@@ -20,6 +20,54 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.3c sqlite3VdbeHalt cursor-leak fix.**
+    Follow-up to the 6.bis.3b caveat: the port's `sqlite3VdbeHalt`
+    (passqlite3vdbe.pas:2761) was a state-only stub, so vtab cursors
+    leaked across `sqlite3_step → sqlite3_finalize` (the C reference
+    closes them via `closeAllCursors → closeCursorsInFrame`).  The
+    `closeCursorsInFrame` loop is now inlined directly into
+    `sqlite3VdbeHalt`: walks `apCsr[0..nCursor-1]`, calls
+    `sqlite3VdbeFreeCursorNN` (which already has the CURTYPE_VTAB
+    branch from 6.bis.3b — `xClose` + `Dec(pVtab^.nRef)`), and nils
+    the slot.  Mirrors the same inlined loop already present in
+    `sqlite3VdbeFrameRestoreFull` (line ~3856).  Full Halt body
+    (transaction commit/rollback bookkeeping in vdbeaux.c) remains
+    Phase 8.x.
+
+    Gate `src/tests/TestVdbeVtabExec.pas` T5 simplified — previous
+    body manually called `sqlite3VdbeFreeCursor` after exec to
+    compensate for the stub Halt; now Halt closes the cursor inline
+    during OP_Halt's `sqlite3VdbeHalt(v)` call, so the test asserts
+    the post-exec slot-cleared invariant + close-counter + nRef=0
+    instead.  T6..T11 unchanged (none of them were depending on the
+    cursor surviving past Halt).  TestVdbeVtabExec **34/34 PASS**
+    (was 35/35 — one assertion dropped: the prior "nRef=1 after
+    exec" check no longer applies because Halt now decrements nRef
+    to 0 *during* exec).
+
+    Discoveries / next-step notes:
+      * `sqlite3VdbeReset` already calls `sqlite3VdbeHalt` first
+        when `eVdbeState = VDBE_RUN_STATE`, so the same close-all-
+        cursors path now fires from `sqlite3_finalize` too.  No
+        additional wiring needed for the finalize side.
+      * `sqlite3VdbeFrameRestoreFull` keeps its own inlined
+        close-cursors loop because it operates on a frame-restore
+        boundary (sub-program halt restoring outer-program state)
+        rather than full Vdbe halt.  Could promote to a shared
+        helper later.
+      * Real `closeAllCursors` also walks `pFrame` (sub-program
+        frames) and `pDelFrame`, releases `aMem`, and clears
+        `pAuxData`.  Those remain Phase 8.x because no codepath in
+        the port currently builds frames or auxdata.
+
+    Concrete changes:
+      * `src/passqlite3vdbe.pas` — `sqlite3VdbeHalt` body grows
+        from 2 lines to a 12-line cursor-cleanup loop.
+      * `src/tests/TestVdbeVtabExec.pas` — T5 simplified
+        (manual FreeCursor removed; assertions updated).
+
+    Full 50-binary test sweep: all green.
+
   - **2026-04-26 — Phase 6.bis.3b VDBE wiring of cursor-bearing vtab opcodes.**
     Replaced the unified `virtual table not supported` stub (which still
     covered eight opcodes after 6.bis.3a) with faithful per-opcode arms
@@ -3424,6 +3472,21 @@ Phase 5.9 depends on this being done first.
     SQLite 3.53), so 6.bis.3b should also audit our OP_Rowid
     implementation for the CURTYPE_VTAB branch.
 
+  - [X] **6.bis.3c** Wire `closeAllCursors`-equivalent cursor cleanup into
+    `sqlite3VdbeHalt`.  Follow-up to the 6.bis.3b caveat — the port's
+    Halt was a state-only stub, so vtab cursors leaked across
+    `sqlite3_step → sqlite3_finalize`.  Inlined the same
+    `closeCursorsInFrame` loop already present in
+    `sqlite3VdbeFrameRestoreFull` directly into `sqlite3VdbeHalt`.
+    DONE 2026-04-26.  See "Most recent activity" above.  Gate
+    `src/tests/TestVdbeVtabExec.pas` — **34/34 PASS** (T5 simplified;
+    no longer needs to manually call `sqlite3VdbeFreeCursor` after exec).
+    Full 50-binary sweep green.  Remaining Halt body work (transaction
+    commit/rollback bookkeeping, frame walk, aMem release, pAuxData
+    clear) stays in Phase 8.x — no codepath in the port currently
+    builds frames or auxdata, so cursor cleanup alone closes the
+    immediate vtab-leak gap.
+
 - [ ] **6.9** `TestExplainParity.pas`: for the full SQL corpus, `EXPLAIN` each
   statement via Pascal and via C; diff the opcode listings. This is the single
   most important gating test for the upper half of the port.
@@ -3525,7 +3588,7 @@ statement is syntactically complete — used by the CLI and REPLs).
     engine not yet exercised end-to-end since `sqlite3RunParser` remains
     stubbed pending 7.2e + 7.2f).
 
-  - [ ] **7.2e** Port the **reduce actions** — the giant switch statement at
+  - [X] **7.2e** Port the **reduce actions** — the giant switch statement at
     parse.c lines 3829–5993. This is the only sub-phase that is non-mechanical:
     each `case YYRULE_n:` body contains hand-written grammar action C code from
     `parse.y` that calls `sqlite3*` codegen routines from Phase 6. Many of the
