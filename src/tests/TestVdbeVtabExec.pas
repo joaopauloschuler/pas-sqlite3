@@ -662,11 +662,185 @@ begin
   FreeMockVTable(pVTbl, pMod);
 end;
 
+{ ===== T12: OP_VCheck — xIntegrity fires; error string lands in register ===== }
+{ Phase 6.bis.3d gate.  Builds a fake Table blob with eTabType=VTAB,
+  zName, and u.vtab.p pointing at a VTable + module whose xIntegrity
+  toggles between (a) success+no-error, (b) success+error string, and
+  (c) error rc. }
+
+const
+  TAB_BLOB_SZ        = 256;
+  TEST_TAB_OFF_eTabType = 63;
+  TEST_TAB_OFF_uVtab    = 64;
+  TEST_VTAB_OFF_p       = 16;
+
+var
+  gIntegrityCount: i32 = 0;
+  gLastIntegrityFlags: i32 = 0;
+  gLastIntegrityZSchema: AnsiString = '';
+  gLastIntegrityZTab: AnsiString = '';
+  gNextIntegrityRc: i32 = SQLITE_OK;
+  gNextIntegrityErr: AnsiString = '';
+
+function MockXIntegrity(pVtab: PSqlite3Vtab; zSchema, zTabName: PAnsiChar;
+                        mFlags: i32; pzErr: PPAnsiChar): i32; cdecl;
+var n: i32; z: PAnsiChar;
+begin
+  Inc(gIntegrityCount);
+  gLastIntegrityFlags := mFlags;
+  if zSchema <> nil then gLastIntegrityZSchema := AnsiString(zSchema)
+  else                   gLastIntegrityZSchema := '';
+  if zTabName <> nil then gLastIntegrityZTab := AnsiString(zTabName)
+  else                    gLastIntegrityZTab := '';
+  if (gNextIntegrityErr <> '') and (pzErr <> nil) then begin
+    n := Length(gNextIntegrityErr);
+    z := PAnsiChar(sqlite3_malloc(n + 1));
+    Move(PAnsiChar(gNextIntegrityErr)^, z^, n);
+    (z + n)^ := #0;
+    pzErr^ := z;
+  end;
+  Result := gNextIntegrityRc;
+end;
+
+function MakeIntegrityVTable(db: PTsqlite3; out pMod: PSqlite3Module;
+                             out pTabBlob: Pointer): PVTable;
+var
+  pVtbl: PVTable;
+  pV   : PSqlite3Vtab;
+  pp   : PPointer;
+begin
+  GetMem(pMod, SizeOf(Tsqlite3_module));
+  FillChar(pMod^, SizeOf(Tsqlite3_module), 0);
+  pMod^.iVersion    := 4;
+  pMod^.xDisconnect := @MockXDisconnect;
+  pMod^.xDestroy    := @MockXDestroy;
+  pMod^.xIntegrity  := @MockXIntegrity;
+
+  GetMem(pV, SizeOf(Tsqlite3_vtab));
+  FillChar(pV^, SizeOf(Tsqlite3_vtab), 0);
+  pV^.pModule := pMod;
+
+  GetMem(pVtbl, SizeOf(TVTable));
+  FillChar(pVtbl^, SizeOf(TVTable), 0);
+  pVtbl^.db    := db;
+  pVtbl^.pVtab := pV;
+  pVtbl^.nRef  := 1;
+
+  { Synthetic Table*: zName at offset 0, eTabType at 63, u.vtab.p at 80 }
+  GetMem(pTabBlob, TAB_BLOB_SZ);
+  FillChar(pTabBlob^, TAB_BLOB_SZ, 0);
+  PPAnsiChar(pTabBlob)^ := PAnsiChar('myvtab');
+  (PByte(pTabBlob) + TEST_TAB_OFF_eTabType)^ := 1;  { TABTYP_VTAB }
+  pp := PPointer(PByte(pTabBlob) + TEST_TAB_OFF_uVtab + TEST_VTAB_OFF_p);
+  pp^ := pVtbl;
+  Result := pVtbl;
+end;
+
+procedure FreeIntegrityVTable(pVTbl: PVTable; pMod: PSqlite3Module;
+                              pTabBlob: Pointer);
+begin
+  if pVTbl <> nil then begin
+    if pVTbl^.pVtab <> nil then FreeMem(pVTbl^.pVtab);
+    FreeMem(pVTbl);
+  end;
+  if pMod <> nil then FreeMem(pMod);
+  if pTabBlob <> nil then FreeMem(pTabBlob);
+end;
+
+procedure T12;
+var
+  db: Tsqlite3;
+  v:  PVdbe;
+  pMod: PSqlite3Module;
+  pVTbl: PVTable;
+  pTabBlob: Pointer;
+  aDbArr: array[0..0] of TDb;
+  rc: i32;
+begin
+  WriteLn('T12: OP_VCheck → xIntegrity fires; clean + dirty + rc paths');
+  InitDb(db);
+  FillChar(aDbArr, SizeOf(aDbArr), 0);
+  aDbArr[0].zDbSName := PAnsiChar('main');
+  db.aDb := @aDbArr[0];
+  db.nDb := 1;
+
+  pVTbl := MakeIntegrityVTable(@db, pMod, pTabBlob);
+
+  { ----- (a) clean run: rc=OK, no error string → register stays NULL ----- }
+  gIntegrityCount := 0;
+  gNextIntegrityRc := SQLITE_OK;
+  gNextIntegrityErr := '';
+  v := CreateMinVdbe(@db, 4);
+  if v = nil then begin Check('T12 vdbe', False); Exit; end;
+  sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
+  sqlite3VdbeAddOp4(v, OP_VCheck, 0, 2, 7, PAnsiChar(pTabBlob), P4_TABLEREF);
+  sqlite3VdbeAddOp2(v, OP_Halt, 0, 0);
+  v^.eVdbeState := VDBE_RUN_STATE;
+  rc := sqlite3VdbeExec(v);
+  ExpectEq(rc, SQLITE_DONE, 'T12a rc=DONE');
+  ExpectEq(gIntegrityCount, 1, 'T12a xIntegrity fired');
+  ExpectEq(gLastIntegrityFlags, 7, 'T12a flags=p3');
+  Check('T12a zSchema=main', gLastIntegrityZSchema = 'main');
+  Check('T12a zTabName=myvtab', gLastIntegrityZTab = 'myvtab');
+  Check('T12a reg2 is NULL on clean run', (v^.aMem[2].flags and MEM_Null) <> 0);
+  sqlite3VdbeDelete(v);
+
+  { ----- (b) dirty run: rc=OK, but xIntegrity emits an error string ----- }
+  gIntegrityCount := 0;
+  gNextIntegrityRc := SQLITE_OK;
+  gNextIntegrityErr := 'corruption detected';
+  v := CreateMinVdbe(@db, 4);
+  sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
+  sqlite3VdbeAddOp4(v, OP_VCheck, 0, 2, 0, PAnsiChar(pTabBlob), P4_TABLEREF);
+  sqlite3VdbeAddOp2(v, OP_Halt, 0, 0);
+  v^.eVdbeState := VDBE_RUN_STATE;
+  rc := sqlite3VdbeExec(v);
+  ExpectEq(rc, SQLITE_DONE, 'T12b rc=DONE');
+  ExpectEq(gIntegrityCount, 1, 'T12b xIntegrity fired');
+  Check('T12b reg2 is text', (v^.aMem[2].flags and MEM_Str) <> 0);
+  Check('T12b reg2 = error string',
+        StrComp(v^.aMem[2].z, PAnsiChar('corruption detected')) = 0);
+  sqlite3VdbeDelete(v);
+
+  { ----- (c) error rc: xIntegrity returns nonzero → abort ----- }
+  gIntegrityCount := 0;
+  gNextIntegrityRc := SQLITE_CORRUPT;
+  gNextIntegrityErr := 'bad page';
+  v := CreateMinVdbe(@db, 4);
+  sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
+  sqlite3VdbeAddOp4(v, OP_VCheck, 0, 2, 0, PAnsiChar(pTabBlob), P4_TABLEREF);
+  sqlite3VdbeAddOp2(v, OP_Halt, 0, 0);
+  v^.eVdbeState := VDBE_RUN_STATE;
+  rc := sqlite3VdbeExec(v);
+  ExpectEq(rc, SQLITE_ERROR, 'T12c rc=ERROR (return rewritten)');
+  ExpectEq(v^.rc, SQLITE_CORRUPT, 'T12c v^.rc=CORRUPT (preserved)');
+  ExpectEq(gIntegrityCount, 1, 'T12c xIntegrity fired');
+  sqlite3VdbeDelete(v);
+
+  { ----- (d) Table* with no attached VTable → register stays NULL ----- }
+  PPointer(PByte(pTabBlob) + TEST_TAB_OFF_uVtab + TEST_VTAB_OFF_p)^ := nil;
+  gIntegrityCount := 0;
+  v := CreateMinVdbe(@db, 4);
+  sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
+  sqlite3VdbeAddOp4(v, OP_VCheck, 0, 2, 0, PAnsiChar(pTabBlob), P4_TABLEREF);
+  sqlite3VdbeAddOp2(v, OP_Halt, 0, 0);
+  v^.eVdbeState := VDBE_RUN_STATE;
+  rc := sqlite3VdbeExec(v);
+  ExpectEq(rc, SQLITE_DONE, 'T12d rc=DONE on no-VTable');
+  ExpectEq(gIntegrityCount, 0, 'T12d xIntegrity NOT fired');
+  Check('T12d reg2 is NULL', (v^.aMem[2].flags and MEM_Null) <> 0);
+  sqlite3VdbeDelete(v);
+
+  FreeIntegrityVTable(pVTbl, pMod, pTabBlob);
+  db.aDb := nil;
+  db.nDb := 0;
+end;
+
 begin
   sqlite3OsInit;
   sqlite3PcacheInitialize;
 
-  WriteLn('=== TestVdbeVtabExec — Phase 6.bis.3a/3b gate ===');
+  WriteLn('=== TestVdbeVtabExec — Phase 6.bis.3a/3b/3d gate ===');
   WriteLn;
 
   T1; WriteLn;
@@ -680,6 +854,7 @@ begin
   T9; WriteLn;
   T10; WriteLn;
   T11; WriteLn;
+  T12; WriteLn;
 
   WriteLn(Format('Results: %d passed, %d failed', [gPass, gFail]));
   if gFail > 0 then Halt(1);

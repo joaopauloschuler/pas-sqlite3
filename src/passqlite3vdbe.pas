@@ -4504,6 +4504,8 @@ var
   iVRow:       i64;                     { OP_VUpdate: out rowid }
   iLegacyV:    i32;                     { OP_VRename: SQLITE_LegacyAlter saved bit }
   zErrIntV:    PAnsiChar;               { OP_VCheck: integrity error msg }
+  pTabIntV:    Pointer;                 { OP_VCheck: Table* from p4 }
+  pVTblIntV:   passqlite3vtab.PVTable;  { OP_VCheck: per-conn VTable }
   iQueryV:     i32;                     { OP_VFilter: idx number }
   nArgV:       i32;                     { OP_VFilter/VUpdate: arg count }
   resV:        i32;                     { OP_VFilter/VNext: xEof result }
@@ -7586,18 +7588,37 @@ begin
       end;
     end;
 
-    { ────── OP_VCheck (vdbe.c:8409) ────── Phase 6.bis.3b — stub
-      Requires Table* layout introspection (tabVtabPP / tabZName) which
-      lives in passqlite3vtab's implementation section.  Wiring this up
-      requires either exporting those helpers or porting the full Table
-      record into vdbe — both blocked on Phase 8.x.  For now, set the
-      output register to NULL (matches the "no errors seen" path) so
-      programs that include OP_VCheck for non-vtab targets continue to
-      run.  A vtab whose xIntegrity actually flags an error will not be
-      detected — flagged for revisit when Phase 8.x lands xIntegrity. }
+    { ────── OP_VCheck (vdbe.c:8409) ────── Phase 6.bis.3d
+      Run xIntegrity on the vtab in p4. If it returns an error string,
+      store it as a UTF-8 result in register p2; otherwise leave the
+      register NULL. p3 is the integer flags argument forwarded to
+      xIntegrity. }
     OP_VCheck: begin
       pOut := @aMem[pOp^.p2];
-      sqlite3VdbeMemSetNull(pOut);
+      sqlite3VdbeMemSetNull(pOut);  { innocent until proven guilty }
+      pTabIntV := pOp^.p4.pTab;
+      if (pTabIntV = nil) or (passqlite3vtab.tabVtabPP(pTabIntV)^ = nil) then
+        { no VTable attached — nothing to check }
+      else begin
+        pVTblIntV := passqlite3vtab.tabVtabPP(pTabIntV)^;
+        pVtabC    := pVTblIntV^.pVtab;
+        pModC     := pVtabC^.pModule;
+        Assert(pModC^.iVersion >= 4, 'OP_VCheck requires module iVersion>=4');
+        Assert(pModC^.xIntegrity <> nil, 'OP_VCheck requires xIntegrity');
+        passqlite3vtab.sqlite3VtabLock(pVTblIntV);
+        zErrIntV := nil;
+        rc := TxIntegrityFnV(pModC^.xIntegrity)(pVtabC,
+                db^.aDb[pOp^.p1].zDbSName,
+                passqlite3vtab.tabZName(pTabIntV),
+                pOp^.p3, @zErrIntV);
+        passqlite3vtab.sqlite3VtabUnlock(pVTblIntV);
+        if rc <> SQLITE_OK then begin
+          sqlite3_free(zErrIntV);
+          goto abort_due_to_error;
+        end;
+        if zErrIntV <> nil then
+          sqlite3VdbeMemSetStr(pOut, zErrIntV, -1, SQLITE_UTF8, SQLITE_DYNAMIC);
+      end;
     end;
 
     { ────── OP_VInitIn (vdbe.c:8456) ────── Phase 6.bis.3b }

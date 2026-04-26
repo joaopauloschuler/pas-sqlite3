@@ -385,6 +385,21 @@ procedure sqlite3VtabMakeWritable(pParse: passqlite3codegen.PParse;
 function sqlite3VtabEponymousTableInit(pParse: passqlite3codegen.PParse;
   pMd: PVtabModule): i32;
 
+{ ============================================================
+  Phase 6.bis.3d — Table-layout introspection helpers (interface)
+  Exposed for vdbe to drive OP_VCheck without taking a circular
+  dependency on passqlite3codegen's full TTable record.
+  ============================================================ }
+
+type
+  PPVTable = ^PVTable;
+
+{ Pointer to pTab^.u.vtab.p (the head of the per-connection VTable list). }
+function tabVtabPP(pTab: Pointer): PPVTable;
+
+{ pTab^.zName — table or view name. }
+function tabZName(pTab: Pointer): PAnsiChar; inline;
+
 implementation
 
 { ----------------------------------------------------------------------
@@ -411,7 +426,6 @@ const
   TABTYP_VIEW   = 2;
 
 type
-  PPVTable      = ^PVTable;
   PPPAnsiCharL  = ^PPAnsiChar;
 
 function tabIsVirtual(pTab: Pointer): Boolean; inline;
@@ -419,9 +433,14 @@ begin
   Result := (pTab <> nil) and ((PByte(pTab) + TAB_OFF_eTabType)^ = TABTYP_VTAB);
 end;
 
-function tabVtabPP(pTab: Pointer): PPVTable; inline;
+function tabVtabPP(pTab: Pointer): PPVTable;
 begin
   Result := PPVTable(PByte(pTab) + TAB_OFF_uVtab + VTAB_OFF_p);
+end;
+
+function tabZName(pTab: Pointer): PAnsiChar; inline;
+begin
+  Result := PPAnsiChar(pTab)^;
 end;
 
 function tabVtabAzArgPP(pTab: Pointer): PPPAnsiCharL; inline;

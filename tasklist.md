@@ -20,6 +20,79 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.bis.3d OP_VCheck wiring.**  Replaced the
+    pre-3d stub (set register p2 to NULL, period) with the faithful
+    vdbe.c:8409 port:
+      * Reads `pTab := pOp^.p4.pTab` and refuses to fire xIntegrity if
+        `tabVtabPP(pTab)^ = nil` (Table has no per-connection VTable
+        attached) — matches the C `if( pTab->u.vtab.p==0 ) break;`.
+      * `sqlite3VtabLock(pVTbl)` → `xIntegrity(pVtab, db^.aDb[p1].zDbSName,
+        pTab^.zName, p3, &zErr)` → `sqlite3VtabUnlock(pVTbl)`.
+      * On `rc<>SQLITE_OK`: `sqlite3_free(zErr)` + `goto
+        abort_due_to_error`.
+      * On `rc=SQLITE_OK` with non-nil zErr: `sqlite3VdbeMemSetStr(pOut,
+        zErr, -1, SQLITE_UTF8, SQLITE_DYNAMIC)` so register p2 owns the
+        string and frees it via the standard MEM_Dyn destructor.
+
+    Module dispatch uses the existing `TxIntegrityFnV` typed callback
+    alias (already declared in 6.bis.3b's local `type` block) — no
+    new aliases needed.  Two new locals: `pTabIntV: Pointer` and
+    `pVTblIntV: PVTable`.
+
+    **Interface exposure.**  `passqlite3vtab.pas` now publishes
+    `PPVTable`, `tabVtabPP`, and `tabZName` in the interface section
+    (previously implementation-private).  Keeps the byte-offset
+    Table-layout knowledge centralised in `passqlite3vtab` while
+    letting vdbe drive OP_VCheck without taking a circular dep on
+    `passqlite3codegen`'s full TTable record.
+
+    Gate `src/tests/TestVdbeVtabExec.pas` extended with **T12** —
+    50/50 PASS (was 34/34).  T12 covers four arms:
+      * T12a clean run: `xIntegrity` rc=OK, no error string → reg p2
+        stays MEM_Null; flags + zSchema + zTabName all forwarded.
+      * T12b dirty run: rc=OK + error string → reg p2 ends MEM_Str
+        with the exact text.
+      * T12c hard error: `xIntegrity` returns `SQLITE_CORRUPT` →
+        `abort_due_to_error` rewrites the function return to
+        `SQLITE_ERROR` while preserving the original on `v^.rc`.
+      * T12d no-VTable: `pTab^.u.vtab.p = nil` → `xIntegrity` not
+        called, reg p2 stays MEM_Null.
+
+    The test synthesises a fake Table blob (256 bytes, zName at
+    offset 0, eTabType=1 at offset 63, u.vtab.p at offset 80) and a
+    1-entry `aDb` array with `zDbSName='main'` so the C-reference
+    lookup works without a populated schema.  Module is built with
+    `iVersion=4` per the C reference's
+    `assert(pModule->iVersion>=4)`.
+
+    Concrete changes:
+      * `src/passqlite3vtab.pas` — moves `PPVTable` to interface,
+        adds `tabVtabPP` (was implementation-private inline) and new
+        `tabZName` helper.
+      * `src/passqlite3vdbe.pas` — fills in the OP_VCheck arm; adds
+        `pTabIntV` and `pVTblIntV` locals.
+      * `src/tests/TestVdbeVtabExec.pas` — adds T12 a..d with
+        `MockXIntegrity` callback, `MakeIntegrityVTable` helper, and
+        a synthetic Table* / TDb pair.
+
+    Full 49-binary test sweep: all green (TestVdbeVtabExec 50/50,
+    TestVtab 216/216, no regressions elsewhere).
+
+    Discoveries / next-step notes:
+      * The remaining vtab opcode that still sits in the unified
+        `virtual table not supported` stub is **OP_VRowid** — wait,
+        scratch that: 6.bis.3b already handled CURTYPE_VTAB inside
+        OP_Rowid.  Audit complete: every vtab-bearing opcode in
+        `passqlite3vdbe.pas` now has its real arm.  The unified
+        stub is gone for cursor-bearing opcodes; only OP_Rowid for
+        non-vtab cursor types still uses other branches.
+      * `SQLITE_DYNAMIC` is the right destructor for the zErr pointer
+        because xIntegrity allocates it via `sqlite3_malloc`-family
+        (per the C reference's `sqlite3_free(zErr)`).  Confirmed by
+        T12b reg2 → MEM_Str + later sqlite3VdbeMemRelease frees it
+        cleanly with no leaks under valgrind-equivalent FillChar
+        sentinels.
+
   - **2026-04-26 — Phase 6.bis.3c sqlite3VdbeHalt cursor-leak fix.**
     Follow-up to the 6.bis.3b caveat: the port's `sqlite3VdbeHalt`
     (passqlite3vdbe.pas:2761) was a state-only stub, so vtab cursors
@@ -3486,6 +3559,19 @@ Phase 5.9 depends on this being done first.
     clear) stays in Phase 8.x — no codepath in the port currently
     builds frames or auxdata, so cursor cleanup alone closes the
     immediate vtab-leak gap.
+
+  - [X] **6.bis.3d** Wire OP_VCheck (vdbe.c:8409) — the integrity-check
+    opcode that fires `xIntegrity` on a virtual table.  Was a stub left
+    by 6.bis.3b ("set output to NULL only") because `tabVtabPP` /
+    `tabZName` lived in `passqlite3vtab`'s implementation section.
+    DONE 2026-04-26.  Resolution: moved `PPVTable` + `tabVtabPP` to the
+    interface and added a `tabZName` helper; the new vdbe arm reads the
+    Table*, locks the VTable, calls `xIntegrity(pVtab, db^.aDb[p1].zDbSName,
+    pTab^.zName, p3, &zErr)`, and either propagates rc via
+    `abort_due_to_error` or stores the (possibly-nil) zErr into reg p2 as
+    a SQLITE_DYNAMIC text.  Gate `src/tests/TestVdbeVtabExec.pas` T12
+    (a..d) — **50/50 PASS**.  Full sweep green.  See "Most recent
+    activity" above.
 
 - [ ] **6.9** `TestExplainParity.pas`: for the full SQL corpus, `EXPLAIN` each
   statement via Pascal and via C; diff the opcode listings. This is the single
