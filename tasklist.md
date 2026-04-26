@@ -125,11 +125,28 @@ remains `history.md`.  This file is the punch list.
       `sqlite3WhereExprAnalyze` populates eOperator / leftCursor /
       u.x.leftColumn / prereqRight, the scanner returns nil for every
       term.  TestExplainParity remains 2 PASS / 8 DIVERGE / 0 ERROR.
+      Sub-progress 2026-04-26 (cont): ported `whereShortCut`
+      (where.c:6334..6440, ~90 lines) — the planner shortcut that
+      detects a single-table rowid-EQ predicate (cost=33,
+      sqlite3LogEst(10)) or a UNIQUE-index full-equality predicate
+      (cost=39, sqlite3LogEst(15)).  Lives in codegen.pas immediately
+      before the productive `sqlite3WhereBegin`.  Faithful 1:1 port
+      of the C control flow, including inline
+      `IsVirtual(pTab) → eTabType=TABTYP_VTAB` and
+      `IsUniqueIndex(pIdx) → onError<>OE_None` checks plus the
+      `uniqNotNull` (idxFlags bit 3) and `isCovering` (idxFlags
+      bit 5) bitfield reads from the layout block at
+      codegen.pas:1002..1004.  Returns 0 unconditionally today
+      because `whereScanInit` finds nothing (terms still carry
+      eOperator=0 from the stub `sqlite3WhereExprAnalyze`); becomes
+      effective once the minimal exprAnalyze body lands.
+      TestExplainParity remains 2 PASS / 8 DIVERGE / 0 ERROR.
       Outstanding inside this sub-bullet:
-      planner pick proper (whereShortCut shape probe), per-loop
-      codegen, OP_NotExists emission, plus a pre-req minimal
-      `exprAnalyze` body for TK_EQ rowid terms (folded into
-      11g.2.c work).
+      wire whereShortCut into sqlite3WhereBegin (after the
+      WANT_DISTINCT block, when nTabList=1 and not
+      WHERE_OR_SUBCLAUSE), per-loop codegen + OP_NotExists
+      emission, plus a pre-req minimal `exprAnalyze` body for
+      TK_EQ rowid terms (folded into 11g.2.c work).
     - [ ] Implement the loop-tail half of `sqlite3WhereEnd`
       (Goto continue + Resolve break label + cursor close).
     - [ ] Re-enable productive tails in `sqlite3DeleteFrom`

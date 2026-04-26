@@ -6179,6 +6179,139 @@ begin
   Result := 0;
 end;
 
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.b sub-progress) — whereShortCut planner shortcut.
+
+  Faithful port of where.c:6334..6440 (~90 lines, one of the smallest decision
+  procedures in the planner).  Walks the WhereClause looking for a single
+  predicate that uniquely identifies one row of the FROM-clause table:
+    (a) a rowid-EQ term ("rowid = X" or "ipk-column = X") — sets WHERE_IPK |
+        WHERE_COLUMN_EQ | WHERE_ONEROW; cost = sqlite3LogEst(10) = 33.
+    (b) a UNIQUE index whose every key column has an EQ term — sets
+        WHERE_INDEXED | WHERE_COLUMN_EQ | WHERE_ONEROW (+ WHERE_IDX_ONLY when
+        the index covers every column the query needs); cost = LogEst(15) = 39.
+  Returns 1 on hit (populates pBuilder^.pNew and pWInfo^.a[0]), 0 on miss.
+
+  Today this function returns 0 for every corpus shape because exprAnalyze
+  (whereexpr.c:1122) is still stubbed — until terms get populated eOperator /
+  leftCursor / u.x.leftColumn / prereqRight, the inner whereScanInit walk
+  finds nothing.  The function lands now so 11g.2.c can wire it in
+  immediately after exprAnalyze starts populating WhereTerm fields.
+
+  Helpers consumed:
+    * whereScanInit / whereScanNext (already ported, see banner above)
+    * IsVirtual(pTab) inlined as `eTabType = TABTYP_VTAB`
+    * IsUniqueIndex(pIdx) inlined as `onError <> OE_None`
+    * uniqNotNull / isCovering bits decoded from idxFlags (sqliteInt.h:2834..)
+      per the bitfield layout block at codegen.pas:1002..1004.
+  =========================================================================== }
+
+function whereShortCut(pBuilder: PWhereLoopBuilder): i32;
+var
+  pWInfo: PWhereInfo;
+  pItem:  PSrcItem;
+  pWC:    PWhereClause;
+  pTerm:  PWhereTerm;
+  pLoop:  PWhereLoop;
+  iCur:   i32;
+  j:      i32;
+  pTab:   PTable2;
+  pIdx:   PIndex2;
+  scan:   TWhereScan;
+  opMask: u32;
+begin
+  pWInfo := pBuilder^.pWInfo;
+  if (pWInfo^.wctrlFlags and WHERE_OR_SUBCLAUSE) <> 0 then Exit(0);
+  Assert(pWInfo^.pTabList^.nSrc >= 1);
+  pItem := @SrcListItems(pWInfo^.pTabList)[0];
+  pTab  := pItem^.pSTab;
+  if pTab^.eTabType = TABTYP_VTAB then Exit(0);
+  { fg.isIndexedBy = bit 1, fg.notIndexed = bit 0 (codegen.pas:7427). }
+  if (pItem^.fg.fgBits and u8($03)) <> 0 then Exit(0);
+  iCur  := pItem^.iCursor;
+  pWC   := @pWInfo^.sWC;
+  pLoop := pBuilder^.pNew;
+  pLoop^.wsFlags := 0;
+  pLoop^.nSkip   := 0;
+  pTerm := whereScanInit(@scan, pWC, iCur, -1, WO_EQ or WO_IS, nil);
+  while (pTerm <> nil) and (pTerm^.prereqRight <> 0) do
+    pTerm := whereScanNext(@scan);
+  if pTerm <> nil then
+  begin
+    pLoop^.wsFlags := WHERE_COLUMN_EQ or WHERE_IPK or WHERE_ONEROW;
+    pLoop^.aLTerm[0] := pTerm;
+    pLoop^.nLTerm := 1;
+    pLoop^.u.btree.nEq := 1;
+    { TUNING: cost of a rowid lookup is 10 → sqlite3LogEst(10) = 33. }
+    pLoop^.rRun := 33;
+  end
+  else
+  begin
+    pIdx := pTab^.pIndex;
+    while pIdx <> nil do
+    begin
+      Assert(pLoop^.aLTerm = PPWhereTerm(@pLoop^.aLTermSpace[0]));
+      { Skip non-UNIQUE, partial, or oversized indices.  IsUniqueIndex ↔
+        onError <> OE_None (sqliteInt.h:2786). }
+      if (pIdx^.onError = OE_None)
+         or (pIdx^.pPartIdxWhere <> nil)
+         or (pIdx^.nKeyCol > Length(pLoop^.aLTermSpace)) then
+      begin
+        pIdx := pIdx^.pNext;
+        Continue;
+      end;
+      { uniqNotNull = bit 3 of idxFlags (after idxType:2 + bUnordered:1). }
+      if ((pIdx^.idxFlags shr 3) and 1) <> 0 then
+        opMask := WO_EQ or WO_IS
+      else
+        opMask := WO_EQ;
+      j := 0;
+      while j < pIdx^.nKeyCol do
+      begin
+        pTerm := whereScanInit(@scan, pWC, iCur, j, opMask, pIdx);
+        while (pTerm <> nil) and (pTerm^.prereqRight <> 0) do
+          pTerm := whereScanNext(@scan);
+        if pTerm = nil then Break;
+        pLoop^.aLTerm[j] := pTerm;
+        Inc(j);
+      end;
+      if j <> pIdx^.nKeyCol then
+      begin
+        pIdx := pIdx^.pNext;
+        Continue;
+      end;
+      pLoop^.wsFlags := WHERE_COLUMN_EQ or WHERE_ONEROW or WHERE_INDEXED;
+      { isCovering = bit 5 of idxFlags. }
+      if (((pIdx^.idxFlags shr 5) and 1) <> 0)
+         or ((pItem^.colUsed and pIdx^.colNotIdxed) = 0) then
+        pLoop^.wsFlags := pLoop^.wsFlags or WHERE_IDX_ONLY;
+      pLoop^.nLTerm := u16(j);
+      pLoop^.u.btree.nEq := u16(j);
+      pLoop^.u.btree.pIndex := pIdx;
+      { TUNING: cost of a unique index lookup is 15 → sqlite3LogEst(15) = 39. }
+      pLoop^.rRun := 39;
+      Break;
+    end;
+  end;
+  if pLoop^.wsFlags <> 0 then
+  begin
+    pLoop^.nOut := i16(1);
+    whereInfoLevels(pWInfo)[0].pWLoop := pLoop;
+    Assert((pWInfo^.sMaskSet.n = 1) and (iCur = pWInfo^.sMaskSet.ix[0]));
+    pLoop^.maskSelf := 1; { sqlite3WhereGetMask(&pWInfo^.sMaskSet, iCur) }
+    whereInfoLevels(pWInfo)[0].iTabCur := iCur;
+    pWInfo^.nRowOut := i16(1);
+    if pWInfo^.pOrderBy <> nil then
+      pWInfo^.nOBSat := i8(pWInfo^.pOrderBy^.nExpr);
+    if (pWInfo^.wctrlFlags and WHERE_WANT_DISTINCT) <> 0 then
+      pWInfo^.eDistinct := WHERE_DISTINCT_UNIQUE;
+    if scan.iEquiv > 1 then
+      pLoop^.wsFlags := pLoop^.wsFlags or WHERE_TRANSCONS;
+    Exit(1);
+  end;
+  Result := 0;
+end;
+
 { Phase 6.9-bis step 11g.2.b — productive sqlite3WhereBegin prologue.
 
   Faithful port of where.c:6828..6993 — every line up to (but not including)
