@@ -20,6 +20,63 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.9-bis — formalise step 11g.2 sub-tasks
+    (sqlite3WhereBegin / WhereOkOnePass / WhereEnd port).**  Step
+    11g.1 closed in three sub-steps (a/b/c) per the precedent set
+    by commit `7392694`'s formalisation of step 11g; with 11g.1
+    fully [X], the remaining gate to flipping the 8 DIVERGE rows in
+    TestExplainParity is step 11g.2 — the where.c / wherecode.c /
+    whereexpr.c planner-core port.  That body of code is ~13.5k
+    lines of upstream C and clearly cannot land as a single step.
+    This commit splits it into 11g.2.a..f along the same staging
+    pattern (structural skeleton → minimal-viable productive slice
+    → audit) used for 11g.1, with an explicit *vertical slice*
+    detour at 11g.2.b: implement the single-table simple-rowid-EQ
+    case first (which is exactly the shape every schema-row inner
+    DML statement emits), so we can flip TestExplainParity rows
+    *before* paying the full planner-core port cost in 11g.2.d.
+    Documentation only; no code changes.
+    [X]
+
+    Concrete changes:
+      * `tasklist.md` — replaced the single `[ ] 11g.2` bullet with
+        a six-sub-task tree (11g.2.a structural records audit,
+        11g.2.b vertical-slice WhereBegin for rowid-EQ, 11g.2.c
+        whereexpr.c port, 11g.2.d planner-core port, 11g.2.e
+        wherecode.c port, 11g.2.f audit + corpus regression).
+        Each sub-task names the upstream functions it covers, the
+        Pascal stubs it replaces (with file:line anchors), and the
+        gate test it should ship with.
+
+    Discoveries / next-step notes:
+      * **Why 11g.2.b is the right first landing.**  Every
+        `sqlite3NestedParse` call site in `passqlite3codegen.pas`
+        (the 7 sites enumerated by step 10) emits an inner SQL
+        statement of the shape `UPDATE %Q.sqlite_master SET sql=%Q
+        WHERE rowid=#%d` or `DELETE FROM %Q.sqlite_master WHERE
+        name=%Q AND type=%Q`.  These are **single-table, single-
+        equality-predicate** queries — the simplest possible WHERE
+        clause shape.  Implementing the full where.c cost solver
+        before flipping any TestExplainParity row would be many
+        weeks of dead code; a 100-line minimal-viable WhereBegin
+        keyed on the rowid-EQ shape gets us productive bytecode
+        emission the same week.
+      * **11g.2.a may already be a no-op.**  Quick survey shows
+        all 14 whereInt.h record types already have skeletons in
+        `passqlite3codegen.pas:1091..1380` (TWhereTerm,
+        TWhereClause, TWhereOrInfo, TWhereAndInfo, TWhereMaskSet,
+        TWhereOrSet, TWhereLoopBtree, TWhereLoopVtab, TWhereLoopU,
+        TWhereLoop, TWhereLevelU, TWhereLevel, TWhereLoopBuilder,
+        TWhereInfo).  11g.2.a's actual job is to verify those are
+        in sync with the current upstream `whereInt.h` (HEAD), not
+        to draft them from scratch.  Lock the layout via a
+        TestWhereStructs.pas SizeOf/offset sentinel before any
+        productive code in 11g.2.b touches the records.
+      * **Next 6.9-bis target: step 11g.2.a — structural records
+        audit + size sentinel.**  Smallest of the six sub-tasks;
+        ~half-day of work; lays the type-layout groundwork that
+        11g.2.b's allocators rely on.
+
   - **2026-04-26 — Phase 6.9-bis (step 11g.1.c): audit init.busy=1
     publication arms via live sqlite3InitCallback + fix empty-string
     argv[4] bug.**  Closes the third and last sub-task of step 11g.1.
@@ -7666,6 +7723,128 @@ Phase 5.9 depends on this being done first.
     (codegen.pas:5401..5410, 5577..5599) once any productive opcode
     is emitted.  Largest single piece of remaining work for this
     sub-phase; may need to split further (where.c is ~7900 lines).
+
+    **Scope reality check (2026-04-26).**  The full port spans three
+    upstream files: `where.c` (7900 lines, planner core), `wherecode.c`
+    (2945 lines, per-loop body codegen), and `whereexpr.c` (1944 lines,
+    WHERE-clause term decomposition / analysis).  Plus the type
+    definitions in `whereInt.h` (668 lines).  Total: ~13.5k lines of C.
+    Splitting by file is the natural seam, but a *vertical slice*
+    (single-table simple-rowid-EQ predicate first, expand outward) is
+    what unblocks TestExplainParity fastest, because every schema-row
+    sub-statement emitted by `sqlite3NestedParse` is exactly that
+    shape (e.g. `UPDATE %Q.sqlite_master SET sql=%Q WHERE rowid=#%d`
+    and `DELETE FROM %Q.sqlite_master WHERE name=%Q AND type=%Q`).
+    Sub-tasks below mix both axes — vertical slice for the first
+    productive landing, then horizontal/exhaustive ports of the
+    remaining where.c / wherecode.c / whereexpr.c machinery.
+
+    Sub-task split (revised 2026-04-26, mirrors step 11g.1 staging):
+
+    - [ ] **11g.2.a** Audit/expand the existing whereInt.h record
+      skeletons in `passqlite3codegen.pas:1091..1380`
+      (`TWhereTerm`, `TWhereClause`, `TWhereOrInfo`, `TWhereAndInfo`,
+      `TWhereMaskSet`, `TWhereOrSet`, `TWhereLoopBtree`,
+      `TWhereLoopVtab`, `TWhereLoopU`, `TWhereLoop`, `TWhereLevelU`,
+      `TWhereLevel`, `TWhereLoopBuilder`, `TWhereInfo`).  Diff
+      field-for-field against `whereInt.h` HEAD; resolve any
+      bitfield/union/flexarray drift; verify sizes-of match GCC layout
+      where assumed by allocators.  No behavioural change expected;
+      this is the structural foundation 11g.2.b/c/d depend on.  Add a
+      `TestWhereStructs.pas` sentinel verifying SizeOf() and field
+      offsets to lock the layout against future drift.
+
+    - [ ] **11g.2.b** Vertical slice — minimal-viable
+      `sqlite3WhereBegin` / `sqlite3WhereEnd` that handles **only** the
+      single-table, single-rowid-EQ-predicate case (no joins, no
+      ORDER BY, no index selection, no virtual tables, no OR-terms).
+      Emits the `OP_NotExists` (or `OP_NoConflict` for non-rowid PK)
+      seek + body + jump-back-to-Next pattern that schema-row UPDATE /
+      DELETE inner statements need.  This is enough to flip the 5
+      CREATE TABLE rows in TestExplainParity from DIVERGE → PASS once
+      step 11e's sqlite3Insert also lands its productive tail.
+      Implementation:
+        * `whereLoopInit` / `whereLoopClear` / `whereLoopXfer` /
+          `whereLoopDelete` / `whereInfoFree` (where.c:2527..2655) —
+          bookkeeping primitives, ~150 lines, no policy logic.
+        * `sqlite3WhereGetMask` (where.c:245..262) — bitmask helper.
+        * Trim `sqlite3WhereBegin` (where.c:6828..7517) to the
+          single-loop, no-IPK case: allocate WhereInfo, init nLevel=1
+          / iEndWhere / iContinue / iBreak labels, install OP_OpenRead
+          with the table-cursor (already done by caller in our schema-
+          row path, so detect and reuse), emit `OP_NotExists` against
+          the rowid expression resolved out of `pWhere`, fall through
+          to body.
+        * `sqlite3WhereEnd` (where.c:7519..) — emit the loop tail
+          (Goto continue + Resolve break label), close cursor if we
+          opened it, free the WhereInfo.
+      Skip planner-core (`whereLoopAddBtree`, `whereLoopAddVirtual`,
+      `whereLoopAddOr`, `whereLoopAddAll`, the cost solver) by
+      hard-coding the cost selection for the rowid-EQ case.  Defer
+      `wherecode.c` body codegen by inlining the NotExists emission
+      directly here.  Re-enable the productive tails in
+      `sqlite3DeleteFrom` (codegen.pas:5460..5471) and
+      `sqlite3Update` (codegen.pas:5660..5670), drop the step-11f
+      skeleton-only error-state guard at codegen.pas:5401..5410 +
+      5577..5599 once the loop emits any productive opcode.
+      Gate test: a new `TestWhereSimple.pas` driving
+      `sqlite3WhereBegin` directly with a hand-built SrcList + rowid-
+      EQ Expr; assert OP_NotExists / OP_Goto / labels emitted in the
+      expected order.  Expected TestExplainParity bump:
+      2 PASS / 8 DIVERGE → 7 PASS / 3 DIVERGE (the 5 CREATE TABLE
+      rows flip; the 3 nil-Vdbe rows still need step 11e's productive
+      INSERT emission to seed sqlite_master).
+
+    - [ ] **11g.2.c** Port `whereexpr.c` (1944 lines) — WHERE-clause
+      term decomposition + analysis.  Public surface:
+      `sqlite3WhereSplit`, `sqlite3WhereClauseInit` (already a stub at
+      codegen.pas:3996), `sqlite3WhereClauseClear`,
+      `sqlite3WhereExprAnalyze`, `sqlite3WhereTabFuncArgs`,
+      `sqlite3WhereFindTerm` (already a stub).  Internal:
+      `exprAnalyze`, `exprAnalyzeAll`, `exprAnalyzeOrTerm`,
+      `whereSplit`, `markTermAsChild`, `whereCombineDisjuncts`,
+      `whereNthSubterm`, `transferJoinMarkings`,
+      `isLikeOrGlob`, `whereCommuteOperator`.  This is the gateway
+      to multi-term WHERE clauses (AND, OR, BETWEEN, LIKE, IN-list).
+      Until this lands, 11g.2.b is restricted to the single-rowid-EQ
+      shape; afterwards the planner can see all term flavours.
+      Gate test: extend `TestWhereSimple.pas` with multi-term cases
+      (a=1 AND b=2, a IN (1,2,3), a BETWEEN 1 AND 5).
+
+    - [ ] **11g.2.d** Port the planner core in `where.c` — the cost
+      solver (`whereLoopAddBtree`, `whereLoopAddBtreeIndex`,
+      `whereLoopAddVirtual*`, `whereLoopAddOr`, `whereLoopAddAll`,
+      `whereLoopOutputAdjust`, `whereLoopFindLesser`,
+      `whereLoopInsert`, `whereLoopCheaperProperSubset`,
+      `whereLoopAdjustCost`, the N-best path search in
+      `wherePathSolver`).  ~5000 lines.  Replaces the hard-coded
+      rowid-EQ pick from 11g.2.b with real N-way join planning,
+      index selection, and ORDER BY consumption.  Largest single
+      component; may itself need further sub-splitting once 11g.2.a..c
+      reveal the field-shape requirements.  Pulls in
+      `bestIndex`-style virtual-table costing (Phase 7.x territory)
+      iff vtab corpus is exercised — for now defer xBestIndex calls.
+
+    - [ ] **11g.2.e** Port `wherecode.c` (2945 lines) — per-loop
+      inner-body codegen.  Public surface:
+      `sqlite3WhereCodeOneLoopStart`, `sqlite3WhereRightJoinLoop`
+      (already a stub at codegen.pas:4233), `sqlite3WhereExplainOneScan`,
+      `sqlite3WhereAddScanStatus`, `disableTerm`, `codeApplyAffinity`,
+      `codeEqualityTerm`, `codeAllEqualityTerms`,
+      `whereLikeOptimizationStringFixup`, `codeCursorHint`.  Replaces
+      the inlined NotExists emission from 11g.2.b with full
+      index-key construction, range-scan setup, virtual-table xFilter
+      glue, and the per-row body dispatch that drives every WHERE-clause
+      consumer (sqlite3Select, sqlite3Update, sqlite3DeleteFrom).
+
+    - [ ] **11g.2.f** Audit + regression.  Land a comprehensive
+      `TestWhereCorpus.pas` covering the full WHERE shape matrix
+      (single rowid-EQ, multi-AND, OR-decomposed, LIKE, IN-subselect,
+      composite index range-scan, LEFT JOIN, virtual table xFilter)
+      and verify byte-identical bytecode emission against C via
+      TestExplainParity expansion.  Re-enable any disabled
+      assertion / safety-net guards left in place during 11g.2.b..e.
+      Mirrors the 11g.1.c audit pattern.
 
 ---
 
