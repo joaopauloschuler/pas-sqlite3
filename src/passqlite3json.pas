@@ -189,6 +189,19 @@ type
     zRepl : PAnsiChar;
   end;
 
+  {
+    Context for jsonTranslateBlobToPrettyText (json_pretty()).  Mirrors
+    json.c:2418.
+  }
+  PJsonPretty = ^TJsonPretty;
+  TJsonPretty = record
+    pParse   : PJsonParse;    { The BLOB being rendered }
+    pOut     : PJsonString;   { Generate pretty output into this string }
+    zIndent  : PAnsiChar;     { Use this text for indentation }
+    szIndent : u32;           { Bytes in zIndent[] }
+    nIndent  : u32;           { Current level of indentation }
+  end;
+
 { ===========================================================================
   Lookup tables
   =========================================================================== }
@@ -414,6 +427,27 @@ function  jsonLabelCompare(zLeft: PAnsiChar; nLeft: u32; rawLeft: i32;
                            zRight: PAnsiChar; nRight: u32; rawRight: i32): i32;
 function  jsonTranslateTextToBlob(pParse: PJsonParse; i: u32): i32;
 function  jsonConvertTextToBlob(pParse: PJsonParse; pCtx: Pointer): i32;
+
+{ ===========================================================================
+  Blob→text + pretty (Phase 6.8.e)
+
+  Faithful port of json.c:2192 (jsonTranslateBlobToText), 2428
+  (jsonPrettyIndent), 2452 (jsonTranslateBlobToPrettyText).
+
+  `jsonReturnTextJsonFromBlob` (json.c:3191) and `jsonReturnParse`
+  (json.c:3775) are the SQL-result wrappers — both call
+  `jsonReturnString` / `sqlite3_result_*` which would pull
+  passqlite3vdbe into the JSON unit.  Deferred to 6.8.h alongside the
+  other SQL dispatch.
+
+  `jsonPrintf` is implemented privately for the single jsonTranslateBlobToText
+  use-case (INT5 hex overflow → emit "9.0e999" / decimal u64).
+  =========================================================================== }
+
+function  jsonTranslateBlobToText(pParse: PJsonParse; i: u32;
+                                  pOut: PJsonString): u32;
+procedure jsonPrettyIndent(pPretty: PJsonPretty);
+function  jsonTranslateBlobToPrettyText(pPretty: PJsonPretty; i: u32): u32;
 
 implementation
 
@@ -2316,6 +2350,394 @@ begin
     Exit;
   end;
   Result := 0;
+end;
+
+{ ===========================================================================
+  Phase 6.8.e implementation — blob→text + pretty
+  =========================================================================== }
+
+{
+  Append decimal repr of u (or "9.0e999" if bOverflow) to the JsonString.
+  Stand-in for json.c's jsonPrintf(100, pOut, ...) used in the INT5 arm of
+  jsonTranslateBlobToText — that's the only call-site relevant to 6.8.e.
+}
+procedure jsonAppendU64Decimal(p: PJsonString; u: u64; bOverflow: i32);
+var
+  buf : array[0..31] of AnsiChar;
+  k   : i32;
+  rev : array[0..31] of AnsiChar;
+  n   : i32;
+begin
+  if bOverflow <> 0 then
+  begin
+    jsonAppendRawNZ(p, '9.0e999', 7);
+    Exit;
+  end;
+  if u = 0 then
+  begin
+    buf[0] := '0';
+    jsonAppendRawNZ(p, @buf[0], 1);
+    Exit;
+  end;
+  n := 0;
+  while u > 0 do
+  begin
+    rev[n] := AnsiChar(Ord('0') + (u mod 10));
+    u := u div 10;
+    Inc(n);
+  end;
+  for k := 0 to n - 1 do
+    buf[k] := rev[n - 1 - k];
+  jsonAppendRawNZ(p, @buf[0], u32(n));
+end;
+
+function jsonTranslateBlobToText(pParse: PJsonParse; i: u32;
+                                 pOut: PJsonString): u32;
+label
+  malformed_jsonb;
+var
+  sz, n, j, iEnd : u32;
+  k              : u32;
+  u              : u64;
+  zIn            : PAnsiChar;
+  bOverflow      : i32;
+  sz2            : u32;
+  x              : i32;
+  b              : u8;
+begin
+  n := jsonbPayloadSize(pParse, i, sz);
+  if n = 0 then
+  begin
+    pOut^.eErr := pOut^.eErr or JSTRING_MALFORMED;
+    Result := pParse^.nBlob + 1;
+    Exit;
+  end;
+  case pParse^.aBlob[i] and $0F of
+    JSONB_NULL:
+    begin
+      jsonAppendRawNZ(pOut, 'null', 4);
+      Result := i + 1;
+      Exit;
+    end;
+    JSONB_TRUE:
+    begin
+      jsonAppendRawNZ(pOut, 'true', 4);
+      Result := i + 1;
+      Exit;
+    end;
+    JSONB_FALSE:
+    begin
+      jsonAppendRawNZ(pOut, 'false', 5);
+      Result := i + 1;
+      Exit;
+    end;
+    JSONB_INT, JSONB_FLOAT:
+    begin
+      if sz = 0 then goto malformed_jsonb;
+      jsonAppendRaw(pOut, PAnsiChar(@pParse^.aBlob[i + n]), sz);
+    end;
+    JSONB_INT5:  { Integer literal in hexadecimal notation }
+    begin
+      if sz = 0 then goto malformed_jsonb;
+      k := 2;
+      u := 0;
+      bOverflow := 0;
+      zIn := PAnsiChar(@pParse^.aBlob[i + n]);
+      if zIn[0] = '-' then
+      begin
+        jsonAppendChar(pOut, '-');
+        Inc(k);
+      end
+      else if zIn[0] = '+' then
+        Inc(k);
+      while k < sz do
+      begin
+        if sqlite3Isxdigit(u8(zIn[k])) = 0 then
+        begin
+          pOut^.eErr := pOut^.eErr or JSTRING_MALFORMED;
+          Break;
+        end
+        else if (u shr 60) <> 0 then
+          bOverflow := 1
+        else
+          u := u * 16 + u64(sqlite3HexToInt(u8(zIn[k])));
+        Inc(k);
+      end;
+      jsonAppendU64Decimal(pOut, u, bOverflow);
+    end;
+    JSONB_FLOAT5:  { Float literal missing digits beside "." }
+    begin
+      if sz = 0 then goto malformed_jsonb;
+      k := 0;
+      zIn := PAnsiChar(@pParse^.aBlob[i + n]);
+      if zIn[0] = '-' then
+      begin
+        jsonAppendChar(pOut, '-');
+        Inc(k);
+      end;
+      if zIn[k] = '.' then
+        jsonAppendChar(pOut, '0');
+      while k < sz do
+      begin
+        jsonAppendChar(pOut, zIn[k]);
+        if (zIn[k] = '.')
+           and ((k + 1 = sz) or (sqlite3Isdigit(u8(zIn[k + 1])) = 0)) then
+          jsonAppendChar(pOut, '0');
+        Inc(k);
+      end;
+    end;
+    JSONB_TEXT, JSONB_TEXTJ:
+    begin
+      if (pOut^.nUsed + sz + 2 <= pOut^.nAlloc)
+         or (jsonStringGrow(pOut, sz + 2) = 0) then
+      begin
+        pOut^.zBuf[pOut^.nUsed] := '"';
+        if sz > 0 then
+          Move(pParse^.aBlob[i + n], pOut^.zBuf[pOut^.nUsed + 1], sz);
+        pOut^.zBuf[pOut^.nUsed + sz + 1] := '"';
+        pOut^.nUsed := pOut^.nUsed + sz + 2;
+      end;
+    end;
+    JSONB_TEXT5:
+    begin
+      sz2 := sz;
+      zIn := PAnsiChar(@pParse^.aBlob[i + n]);
+      jsonAppendChar(pOut, '"');
+      while sz2 > 0 do
+      begin
+        k := 0;
+        while (k < sz2) and ((jsonIsOk[u8(zIn[k])] <> 0)
+                             or (zIn[k] = '''')) do
+          Inc(k);
+        if k > 0 then
+        begin
+          jsonAppendRawNZ(pOut, zIn, k);
+          if k >= sz2 then Break;
+          zIn := zIn + k;
+          sz2 := sz2 - k;
+        end;
+        if zIn[0] = '"' then
+        begin
+          jsonAppendRawNZ(pOut, PAnsiChar(#$5C'"'), 2);
+          Inc(zIn);
+          Dec(sz2);
+          Continue;
+        end;
+        if u8(zIn[0]) <= $1F then
+        begin
+          if (pOut^.nUsed + 7 > pOut^.nAlloc)
+             and (jsonStringGrow(pOut, 7) <> 0) then Break;
+          jsonAppendControlChar(pOut, u8(zIn[0]));
+          Inc(zIn);
+          Dec(sz2);
+          Continue;
+        end;
+        { assert zIn[0] = '\' and sz2 >= 1 }
+        if sz2 < 2 then
+        begin
+          pOut^.eErr := pOut^.eErr or JSTRING_MALFORMED;
+          Break;
+        end;
+        b := u8(zIn[1]);
+        case b of
+          Ord(''''): jsonAppendChar(pOut, '''');
+          Ord('v'):  jsonAppendRawNZ(pOut, #$5C+'u000b', 6);
+          Ord('x'):
+            begin
+              if sz2 < 4 then
+              begin
+                pOut^.eErr := pOut^.eErr or JSTRING_MALFORMED;
+                sz2 := 2;
+              end
+              else
+              begin
+                jsonAppendRawNZ(pOut, '\u00', 4);
+                jsonAppendRawNZ(pOut, @zIn[2], 2);
+                zIn := zIn + 2;
+                sz2 := sz2 - 2;
+              end;
+            end;
+          Ord('0'):  jsonAppendRawNZ(pOut, #$5C+'u0000', 6);
+          $0D {CR}:
+            begin
+              if (sz2 > 2) and (zIn[2] = #$0A) then
+              begin
+                Inc(zIn);
+                Dec(sz2);
+              end;
+            end;
+          $0A {LF}: ;  { skip }
+          $E2:
+            begin
+              { '\' followed by U+2028 / U+2029 (UTF-8 e2 80 a8/a9) is whitespace }
+              if (sz2 < 4)
+                 or (u8(zIn[2]) <> $80)
+                 or ((u8(zIn[3]) <> $A8) and (u8(zIn[3]) <> $A9)) then
+              begin
+                pOut^.eErr := pOut^.eErr or JSTRING_MALFORMED;
+                sz2 := 2;
+              end
+              else
+              begin
+                zIn := zIn + 2;
+                sz2 := sz2 - 2;
+              end;
+            end;
+        else
+          jsonAppendRawNZ(pOut, zIn, 2);
+        end;
+        { sz2>=2 here }
+        zIn := zIn + 2;
+        sz2 := sz2 - 2;
+      end;
+      jsonAppendChar(pOut, '"');
+    end;
+    JSONB_TEXTRAW:
+    begin
+      jsonAppendString(pOut, PAnsiChar(@pParse^.aBlob[i + n]), sz);
+    end;
+    JSONB_ARRAY:
+    begin
+      jsonAppendChar(pOut, '[');
+      j := i + n;
+      iEnd := j + sz;
+      Inc(pParse^.iDepth);
+      if pParse^.iDepth > JSON_MAX_DEPTH then
+        jsonStringTooDeep(pOut);
+      while (j < iEnd) and (pOut^.eErr = 0) do
+      begin
+        j := jsonTranslateBlobToText(pParse, j, pOut);
+        jsonAppendChar(pOut, ',');
+      end;
+      Dec(pParse^.iDepth);
+      if j > iEnd then
+        pOut^.eErr := pOut^.eErr or JSTRING_MALFORMED;
+      if sz > 0 then jsonStringTrimOneChar(pOut);
+      jsonAppendChar(pOut, ']');
+    end;
+    JSONB_OBJECT:
+    begin
+      x := 0;
+      jsonAppendChar(pOut, '{');
+      j := i + n;
+      iEnd := j + sz;
+      Inc(pParse^.iDepth);
+      if pParse^.iDepth > JSON_MAX_DEPTH then
+        jsonStringTooDeep(pOut);
+      while (j < iEnd) and (pOut^.eErr = 0) do
+      begin
+        j := jsonTranslateBlobToText(pParse, j, pOut);
+        if (x and 1) <> 0 then
+          jsonAppendChar(pOut, ',')
+        else
+          jsonAppendChar(pOut, ':');
+        Inc(x);
+      end;
+      Dec(pParse^.iDepth);
+      if ((x and 1) <> 0) or (j > iEnd) then
+        pOut^.eErr := pOut^.eErr or JSTRING_MALFORMED;
+      if sz > 0 then jsonStringTrimOneChar(pOut);
+      jsonAppendChar(pOut, '}');
+    end;
+  else
+    malformed_jsonb:
+    pOut^.eErr := pOut^.eErr or JSTRING_MALFORMED;
+  end;
+  Result := i + n + sz;
+end;
+
+procedure jsonPrettyIndent(pPretty: PJsonPretty);
+var
+  jj : u32;
+begin
+  jj := 0;
+  while jj < pPretty^.nIndent do
+  begin
+    jsonAppendRaw(pPretty^.pOut, pPretty^.zIndent, pPretty^.szIndent);
+    Inc(jj);
+  end;
+end;
+
+function jsonTranslateBlobToPrettyText(pPretty: PJsonPretty; i: u32): u32;
+var
+  sz, n, j, iEnd : u32;
+  pParse         : PJsonParse;
+  pOut           : PJsonString;
+begin
+  pParse := pPretty^.pParse;
+  pOut := pPretty^.pOut;
+  n := jsonbPayloadSize(pParse, i, sz);
+  if n = 0 then
+  begin
+    pOut^.eErr := pOut^.eErr or JSTRING_MALFORMED;
+    Result := pParse^.nBlob + 1;
+    Exit;
+  end;
+  case pParse^.aBlob[i] and $0F of
+    JSONB_ARRAY:
+    begin
+      j := i + n;
+      iEnd := j + sz;
+      jsonAppendChar(pOut, '[');
+      if j < iEnd then
+      begin
+        jsonAppendChar(pOut, #$0A);
+        Inc(pPretty^.nIndent);
+        if pPretty^.nIndent >= JSON_MAX_DEPTH then
+          jsonStringTooDeep(pOut);
+        while pOut^.eErr = 0 do
+        begin
+          jsonPrettyIndent(pPretty);
+          j := jsonTranslateBlobToPrettyText(pPretty, j);
+          if j >= iEnd then Break;
+          jsonAppendChar(pOut, ',');
+          jsonAppendChar(pOut, #$0A);
+        end;
+        jsonAppendChar(pOut, #$0A);
+        Dec(pPretty^.nIndent);
+        jsonPrettyIndent(pPretty);
+      end;
+      jsonAppendChar(pOut, ']');
+      i := iEnd;
+    end;
+    JSONB_OBJECT:
+    begin
+      j := i + n;
+      iEnd := j + sz;
+      jsonAppendChar(pOut, '{');
+      if j < iEnd then
+      begin
+        jsonAppendChar(pOut, #$0A);
+        Inc(pPretty^.nIndent);
+        if pPretty^.nIndent >= JSON_MAX_DEPTH then
+          jsonStringTooDeep(pOut);
+        pParse^.iDepth := u16(pPretty^.nIndent);
+        while pOut^.eErr = 0 do
+        begin
+          jsonPrettyIndent(pPretty);
+          j := jsonTranslateBlobToText(pParse, j, pOut);
+          if j > iEnd then
+          begin
+            pOut^.eErr := pOut^.eErr or JSTRING_MALFORMED;
+            Break;
+          end;
+          jsonAppendRawNZ(pOut, ': ', 2);
+          j := jsonTranslateBlobToPrettyText(pPretty, j);
+          if j >= iEnd then Break;
+          jsonAppendChar(pOut, ',');
+          jsonAppendChar(pOut, #$0A);
+        end;
+        jsonAppendChar(pOut, #$0A);
+        Dec(pPretty^.nIndent);
+        jsonPrettyIndent(pPretty);
+      end;
+      jsonAppendChar(pOut, '}');
+      i := iEnd;
+    end;
+  else
+    i := jsonTranslateBlobToText(pParse, i, pOut);
+  end;
+  Result := i;
 end;
 
 end.

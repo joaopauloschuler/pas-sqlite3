@@ -924,8 +924,173 @@ begin
   CheckEqI('T275 4hexB op-unchanged', op, JSONB_TEXT);
 end;
 
+{ ----- Phase 6.8.e blob→text tests ----- }
+
+function StringFromAccum(var s: TJsonString): AnsiString;
 begin
-  WriteLn('=== TestJson — Phase 6.8.a/b/c/d JSON port ===');
+  if s.eErr <> 0 then begin Result := ''; Exit; end;
+  if s.nUsed = 0 then begin Result := ''; Exit; end;
+  SetLength(Result, s.nUsed);
+  Move(s.zBuf^, Result[1], s.nUsed);
+end;
+
+{ Compile JSON text → JSONB → re-render to text and compare. }
+function RoundTripText(const src: AnsiString): AnsiString;
+var
+  p  : TJsonParse;
+  s  : TJsonString;
+  rc : i32;
+begin
+  InitParseFromText(p, src);
+  rc := jsonConvertTextToBlob(@p, nil);
+  if rc <> 0 then begin FreeParse(p); Result := '<ERR>'; Exit; end;
+  jsonStringInit(@s, nil);
+  jsonTranslateBlobToText(@p, 0, @s);
+  Result := StringFromAccum(s);
+  jsonStringReset(@s);
+  FreeParse(p);
+end;
+
+procedure TestBlobToText_Literals;
+begin
+  CheckEqS('T276 b2t null',  RoundTripText('null'),  'null');
+  CheckEqS('T277 b2t true',  RoundTripText('true'),  'true');
+  CheckEqS('T278 b2t false', RoundTripText('false'), 'false');
+end;
+
+procedure TestBlobToText_Numbers;
+begin
+  CheckEqS('T279 b2t int',    RoundTripText('42'),    '42');
+  CheckEqS('T280 b2t neg',    RoundTripText('-7'),    '-7');
+  CheckEqS('T281 b2t float',  RoundTripText('3.14'),  '3.14');
+  { JSON5 hex int → decimal repr }
+  CheckEqS('T282 b2t hex',    RoundTripText('0x1A'),  '26');
+  { JSON5 leading-dot float → "0." prefix }
+  CheckEqS('T283 b2t .5',     RoundTripText('.5'),    '0.5');
+  CheckEqS('T284 b2t 5.',     RoundTripText('5.'),    '5.0');
+end;
+
+procedure TestBlobToText_Strings;
+begin
+  CheckEqS('T285 b2t plain',  RoundTripText('"abc"'), '"abc"');
+  { JSON5 single-quote re-rendered as double-quoted JSON }
+  CheckEqS('T286 b2t sq',     RoundTripText('''ab'''), '"ab"');
+end;
+
+procedure TestBlobToText_ArrayObject;
+begin
+  CheckEqS('T287 b2t arr',    RoundTripText('[1,2,3]'),         '[1,2,3]');
+  CheckEqS('T288 b2t empty arr', RoundTripText('[]'),           '[]');
+  CheckEqS('T289 b2t obj',    RoundTripText('{"a":1,"b":2}'),   '{"a":1,"b":2}');
+  CheckEqS('T290 b2t empty obj', RoundTripText('{}'),           '{}');
+  CheckEqS('T291 b2t nested',
+           RoundTripText('[[1],{"k":[2,3]}]'),
+           '[[1],{"k":[2,3]}]');
+end;
+
+procedure TestBlobToText_MalformedReturn;
+var
+  p  : TJsonParse;
+  s  : TJsonString;
+  rc : u32;
+begin
+  { Malformed: header byte with type 0x0F (invalid) — payloadSize parses
+    but the case-arm hits malformed_jsonb. }
+  InitParse(p);
+  jsonBlobAppendOneByte(@p, $0F);
+  jsonStringInit(@s, nil);
+  rc := jsonTranslateBlobToText(@p, 0, @s);
+  CheckTrue('T292 b2t malformed eErr',
+            (s.eErr and JSTRING_MALFORMED) <> 0);
+  CheckTrue('T293 b2t malformed rc',  rc >= 0);
+  jsonStringReset(@s);
+  FreeParse(p);
+end;
+
+procedure TestPrettyArray;
+var
+  p   : TJsonParse;
+  s   : TJsonString;
+  pp  : TJsonPretty;
+  src : AnsiString;
+  got : AnsiString;
+begin
+  src := '[1,2,3]';
+  InitParseFromText(p, src);
+  CheckEqI('T294 pretty parse', jsonConvertTextToBlob(@p, nil), 0);
+  jsonStringInit(@s, nil);
+  FillChar(pp, SizeOf(pp), 0);
+  pp.pParse := @p;
+  pp.pOut := @s;
+  pp.zIndent := PAnsiChar('  ');
+  pp.szIndent := 2;
+  pp.nIndent := 0;
+  jsonTranslateBlobToPrettyText(@pp, 0);
+  got := StringFromAccum(s);
+  CheckEqS('T295 pretty arr', got,
+           '[' + #10 + '  1,' + #10 + '  2,' + #10 + '  3' + #10 + ']');
+  jsonStringReset(@s);
+  FreeParse(p);
+end;
+
+procedure TestPrettyObject;
+var
+  p   : TJsonParse;
+  s   : TJsonString;
+  pp  : TJsonPretty;
+  got : AnsiString;
+begin
+  InitParseFromText(p, '{"a":1,"b":2}');
+  CheckEqI('T296 pretty obj parse', jsonConvertTextToBlob(@p, nil), 0);
+  jsonStringInit(@s, nil);
+  FillChar(pp, SizeOf(pp), 0);
+  pp.pParse := @p;
+  pp.pOut := @s;
+  pp.zIndent := PAnsiChar('  ');
+  pp.szIndent := 2;
+  pp.nIndent := 0;
+  jsonTranslateBlobToPrettyText(@pp, 0);
+  got := StringFromAccum(s);
+  CheckEqS('T297 pretty obj', got,
+           '{' + #10 + '  "a": 1,' + #10 + '  "b": 2' + #10 + '}');
+  jsonStringReset(@s);
+  FreeParse(p);
+end;
+
+procedure TestPrettyEmpty;
+var
+  p   : TJsonParse;
+  s   : TJsonString;
+  pp  : TJsonPretty;
+  got : AnsiString;
+begin
+  InitParseFromText(p, '[]');
+  CheckEqI('T298 pretty [] parse', jsonConvertTextToBlob(@p, nil), 0);
+  jsonStringInit(@s, nil);
+  FillChar(pp, SizeOf(pp), 0);
+  pp.pParse := @p; pp.pOut := @s;
+  pp.zIndent := PAnsiChar('  '); pp.szIndent := 2;
+  jsonTranslateBlobToPrettyText(@pp, 0);
+  got := StringFromAccum(s);
+  CheckEqS('T299 pretty []', got, '[]');
+  jsonStringReset(@s);
+  FreeParse(p);
+
+  InitParseFromText(p, '{}');
+  CheckEqI('T300 pretty {} parse', jsonConvertTextToBlob(@p, nil), 0);
+  jsonStringInit(@s, nil);
+  FillChar(pp, SizeOf(pp), 0);
+  pp.pParse := @p; pp.pOut := @s;
+  pp.zIndent := PAnsiChar('  '); pp.szIndent := 2;
+  jsonTranslateBlobToPrettyText(@pp, 0);
+  got := StringFromAccum(s);
+  CheckEqS('T301 pretty {}', got, '{}');
+  jsonStringReset(@s);
+  FreeParse(p);
+end;
+
+begin
+  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e JSON port ===');
   TestTypeNames;
   TestIsspace;
   TestSpacesString;
@@ -964,6 +1129,14 @@ begin
   TestConvertTextToBlob;
   TestValidityCheck;
   TestIs4HexB;
+  TestBlobToText_Literals;
+  TestBlobToText_Numbers;
+  TestBlobToText_Strings;
+  TestBlobToText_ArrayObject;
+  TestBlobToText_MalformedReturn;
+  TestPrettyArray;
+  TestPrettyObject;
+  TestPrettyEmpty;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);
