@@ -21,6 +21,79 @@ Important: At the end of this document, please find:
 ## Most recent activity
 
   - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
+    sqlite3ExprCodeTarget — TK_COLLATE / TK_SPAN / TK_UPLUS unary
+    delegate arms + expr_code_doover dispatch loop.**  Continues the
+    vertical-slice walk through `sqlite3ExprCodeTarget`'s arms.  Lands
+    the simple unblocked unary delegates flagged in the previous
+    sub-progress' discovery notes — the C source uses
+    `goto expr_code_doover` to re-dispatch on `pLeft` for these arms,
+    which the Pascal port models with a `repeat … until done` loop
+    around the existing `case` statement.
+
+      * **expr_code_doover loop scaffolding** — wraps the case in
+        `repeat … until done` so arms that consume their wrapper and
+        re-dispatch on `pExpr := pExpr^.pLeft` can iterate without
+        deep recursion (faithful translation of the OSSFuzz fix
+        pattern noted at expr.c:5528 / 5534).  All previously-landed
+        leaf arms now set `done := True` instead of writing `Result`
+        directly; `Result` is initialised to `target` up front and
+        only the TK_REGISTER arm overwrites it.
+      * **TK_COLLATE arm** (expr.c:5514..5530) — when the EP_Collate
+        tag is *clear* (a "soft-collate" pushed down by the WHERE
+        push-down optimisation), code `pLeft` then emit
+        `OP_ClrSubtype(target)` so subtypes do not cross the subquery
+        boundary; when EP_Collate is *set*, COLLATE is a codegen no-op
+        — re-dispatch on `pLeft`.  Asserts on `pExpr^.pLeft <> nil`
+        match the C source.
+      * **TK_SPAN, TK_UPLUS arms** (expr.c:5531..5535) — both arms
+        simply re-dispatch on `pLeft`; SPAN is a parser-side wrapper
+        used by virtual columns / CHECK constraints, UPLUS is the
+        unary `+` operator (a no-op at codegen).
+
+    Concrete changes:
+      * `passqlite3codegen.pas:1706..1714` — interface comment refreshed
+        to list the newly-landed arms (TK_COLLATE / TK_SPAN / TK_UPLUS).
+      * `passqlite3codegen.pas:3692..3804` — `sqlite3ExprCodeTarget`
+        body restructured around the `repeat … until done` dispatch
+        loop; three new arms added before the default arm.
+
+    Why this is safe to land alone: TK_SPAN / TK_UPLUS / TK_COLLATE do
+    not appear in the productive call paths the corpus currently exercises
+    (sqlite3NestedParse-driven INSERT/UPDATE/DELETE row codegen, PRAGMA
+    literals).  Soft-COLLATE is a WHERE push-down byproduct and only
+    fires once SELECT codegen lands.  Verified by build and full
+    regression sweep — TestWhereBasic 52/52, TestWhereStructs 148/148,
+    TestPrepareBasic 20/20, TestParser 45/45, TestSchemaBasic 44/44,
+    TestVdbeApi 57/57, TestDMLBasic 54/54, TestSelectBasic 49/49,
+    TestExprBasic 40/40, TestInitCallback 29/29, TestExplainParity
+    unchanged at **2 PASS / 8 DIVERGE / 0 ERROR**.
+
+    Discoveries / next-step notes:
+      * **The dispatch loop is now the right shape for every other
+        re-dispatching arm** — TK_IF_NULL_ROW (expr.c:5443) re-codes on
+        `pLeft` after wiring an OP_IfNullRow guard, TK_CAST (expr.c:5235)
+        re-dispatches via `sqlite3ExprCodeTarget(pParse, pExpr^.pLeft, …)`
+        but does *not* loop, and the subquery-eliding paths (EP_Subquery
+        with sqlite3ExprIsConstant) all benefit from the loop.  Future
+        sub-progresses can lean on the same `done` flag idiom rather
+        than reintroducing recursion.
+      * **`TK_PURE_FUNCTION` and `TK_TYPEOF` referenced in the previous
+        sub-progress' discovery note do not exist in this codebase.**
+        They are SQLite extension tokens introduced in newer minor
+        versions (3.45+) that gate function evaluation by determinism.
+        Drop them from the "easy unblocked arm" list — the actual
+        cheap-and-unblocked candidates remaining are TK_NULL (literal
+        OP_Null) and TK_IF_NULL_ROW (one-shot guard around `pLeft`).
+        Updated the next-step list accordingly.
+      * **Realistic next sub-progress: TK_NULL arm** (one-line:
+        `sqlite3VdbeAddOp2(v, OP_Null, 0, target)`) — currently routed
+        through the default arm with the *same* emission, so the
+        explicit arm is documentation only but lets the default arm be
+        reduced to a bare assert/abort once every productive opcode is
+        ported.  After that, the column-cache scaffolding sub-progress
+        becomes the right next chunk to land before TK_COLUMN.
+
+  - **2026-04-26 — Phase 6.9-bis (step 11g.2.b — sub-progress):
     sqlite3ExprCodeTarget — TK_BLOB arm + sqlite3HexToBlob util port.**
     Continues the vertical-slice walk through `sqlite3ExprCodeTarget`'s
     leaf arms.  Lands the second-easiest unblocked arm flagged in the

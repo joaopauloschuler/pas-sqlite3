@@ -1706,9 +1706,10 @@ function sqlite3ExprAddCollateString(pParse: PParse; p: PExpr;
 { Expr codegen — Phase 6.9-bis step 11g.2.b.
   sqlite3ExprCodeTarget is the recursive dispatch from expr.c:4930; the
   port currently lands the literal/leaf arms (TK_INTEGER, TK_TRUEFALSE,
-  TK_FLOAT, TK_STRING, TK_NULLS, TK_VARIABLE, TK_REGISTER, default-NULL)
-  and routes the unported arms (TK_COLUMN, TK_AGG_*, TK_BLOB, …) through
-  the C "default" arm so callers see OP_Null instead of crashing.
+  TK_FLOAT, TK_STRING, TK_NULLS, TK_VARIABLE, TK_REGISTER, TK_BLOB) plus
+  the unary delegate arms (TK_COLLATE, TK_SPAN, TK_UPLUS) and routes the
+  remaining arms (TK_COLUMN, TK_AGG_*, comparisons, arithmetic, …)
+  through the C "default" arm so callers see OP_Null instead of crashing.
   sqlite3ExprCode is the wrapper from expr.c:5884 — guarantees the value
   ends up in `target` via OP_Copy / OP_SCopy when ExprCodeTarget chose a
   different register. }
@@ -3697,73 +3698,113 @@ var
   z:     PAnsiChar;
   zBlob: PAnsiChar;
   n:     i32;
+  done:  Boolean;
 begin
+  Result := target;
   v := pParse^.pVdbe;
-  if pExpr = nil then op := TK_NULL
-  else op := pExpr^.op;
 
-  case op of
-    TK_INTEGER:
-      begin
-        codeInteger(pParse, pExpr, 0, target);
-        Result := target;
-      end;
-    TK_TRUEFALSE:
-      begin
-        sqlite3VdbeAddOp2(v, OP_Integer,
-                          sqlite3ExprTruthValue(pExpr), target);
-        Result := target;
-      end;
-    TK_FLOAT:
-      begin
-        codeReal(v, pExpr^.u.zToken, 0, target);
-        Result := target;
-      end;
-    TK_STRING:
-      begin
-        sqlite3VdbeLoadString(v, target, pExpr^.u.zToken);
-        Result := target;
-      end;
-    TK_NULLS:
-      begin
-        sqlite3VdbeAddOp3(v, OP_Null, 0, target,
-                          target + pExpr^.y.nReg - 1);
-        Result := target;
-      end;
-    TK_VARIABLE:
-      begin
-        sqlite3VdbeAddOp2(v, OP_Variable, pExpr^.iColumn, target);
-        Result := target;
-      end;
-    TK_REGISTER:
-      Result := pExpr^.iTable;
-    TK_BLOB:
-      begin
-        { Faithful port of expr.c:5125..5138 — emit OP_Blob with the
-          decoded binary value of an x'…' literal as P4_DYNAMIC payload.
-          The token is "x'hhhh…'" (or "X'hhhh…'") with the trailing
-          quote still attached, so we skip the first two bytes and pass
-          the remaining length (which still includes the trailing
-          quote byte — sqlite3HexToBlob consumes it via Dec(n)). }
-        Assert(not ExprHasProperty(pExpr, EP_IntValue));
-        Assert((pExpr^.u.zToken[0] = 'x') or (pExpr^.u.zToken[0] = 'X'));
-        Assert(pExpr^.u.zToken[1] = '''');
-        z := pExpr^.u.zToken + 2;
-        n := sqlite3Strlen30(z) - 1;
-        Assert(z[n] = '''');
-        zBlob := PAnsiChar(sqlite3HexToBlob(sqlite3VdbeDb(v), z, n));
-        sqlite3VdbeAddOp4(v, OP_Blob, n div 2, target, 0, zBlob, P4_DYNAMIC);
-        Result := target;
-      end;
-  else
-    { TODO(Phase 6.9-bis): TK_COLUMN, TK_AGG_COLUMN, TK_CAST,
-      TK_LT…TK_GT comparison cluster, TK_AND/TK_OR, TK_PLUS/TK_MINUS/…,
-      TK_FUNCTION, TK_CASE, TK_IN, TK_EXISTS, TK_SELECT, … — land in
-      subsequent vertical-slice sub-progress.  For now use the C
-      default arm: emit OP_Null so an unsupported op cannot crash. }
-    sqlite3VdbeAddOp2(v, OP_Null, 0, target);
-    Result := target;
-  end;
+  { expr_code_doover dispatch loop — mirrors the C label/goto pattern
+    in expr.c:4930.  The TK_COLLATE (with EP_Collate) and TK_SPAN /
+    TK_UPLUS arms re-dispatch on pLeft, hence the loop. }
+  done := False;
+  repeat
+    if pExpr = nil then op := TK_NULL
+    else op := pExpr^.op;
+
+    case op of
+      TK_INTEGER:
+        begin
+          codeInteger(pParse, pExpr, 0, target);
+          done := True;
+        end;
+      TK_TRUEFALSE:
+        begin
+          sqlite3VdbeAddOp2(v, OP_Integer,
+                            sqlite3ExprTruthValue(pExpr), target);
+          done := True;
+        end;
+      TK_FLOAT:
+        begin
+          codeReal(v, pExpr^.u.zToken, 0, target);
+          done := True;
+        end;
+      TK_STRING:
+        begin
+          sqlite3VdbeLoadString(v, target, pExpr^.u.zToken);
+          done := True;
+        end;
+      TK_NULLS:
+        begin
+          sqlite3VdbeAddOp3(v, OP_Null, 0, target,
+                            target + pExpr^.y.nReg - 1);
+          done := True;
+        end;
+      TK_VARIABLE:
+        begin
+          sqlite3VdbeAddOp2(v, OP_Variable, pExpr^.iColumn, target);
+          done := True;
+        end;
+      TK_REGISTER:
+        begin
+          Result := pExpr^.iTable;
+          done := True;
+        end;
+      TK_BLOB:
+        begin
+          { Faithful port of expr.c:5125..5138 — emit OP_Blob with the
+            decoded binary value of an x'…' literal as P4_DYNAMIC payload.
+            The token is "x'hhhh…'" (or "X'hhhh…'") with the trailing
+            quote still attached, so we skip the first two bytes and pass
+            the remaining length (which still includes the trailing
+            quote byte — sqlite3HexToBlob consumes it via Dec(n)). }
+          Assert(not ExprHasProperty(pExpr, EP_IntValue));
+          Assert((pExpr^.u.zToken[0] = 'x') or (pExpr^.u.zToken[0] = 'X'));
+          Assert(pExpr^.u.zToken[1] = '''');
+          z := pExpr^.u.zToken + 2;
+          n := sqlite3Strlen30(z) - 1;
+          Assert(z[n] = '''');
+          zBlob := PAnsiChar(sqlite3HexToBlob(sqlite3VdbeDb(v), z, n));
+          sqlite3VdbeAddOp4(v, OP_Blob, n div 2, target, 0, zBlob, P4_DYNAMIC);
+          done := True;
+        end;
+      TK_COLLATE:
+        begin
+          { Faithful port of expr.c:5514..5530.  A TK_COLLATE Expr node
+            without the EP_Collate tag is a "SOFT-COLLATE" pushed down
+            from outer queries by the WHERE-clause push-down optimisation;
+            we code pLeft, then emit OP_ClrSubtype so subtypes do not
+            cross the subquery boundary.  When EP_Collate *is* set the
+            COLLATE is a no-op at codegen — re-dispatch on pLeft. }
+          if not ExprHasProperty(pExpr, EP_Collate) then
+          begin
+            Assert(pExpr^.pLeft <> nil);
+            sqlite3ExprCode(pParse, pExpr^.pLeft, target);
+            sqlite3VdbeAddOp1(v, OP_ClrSubtype, target);
+            done := True;
+          end
+          else
+          begin
+            pExpr := pExpr^.pLeft;
+            { fall through to next loop iteration — re-dispatch }
+          end;
+        end;
+      TK_SPAN, TK_UPLUS:
+        begin
+          { Faithful port of expr.c:5531..5535 — both arms simply
+            re-dispatch on pLeft to avoid deep recursion (OSSFuzz). }
+          pExpr := pExpr^.pLeft;
+          { fall through to next loop iteration — re-dispatch }
+        end;
+    else
+      { TODO(Phase 6.9-bis): TK_COLUMN, TK_AGG_COLUMN, TK_CAST,
+        TK_LT…TK_GT comparison cluster, TK_AND/TK_OR, TK_PLUS/TK_MINUS/…,
+        TK_FUNCTION, TK_CASE, TK_IN, TK_EXISTS, TK_SELECT, … — land in
+        subsequent vertical-slice sub-progress.  For now use the C
+        default arm: emit OP_Null so an unsupported op cannot crash. }
+      sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+      done := True;
+    end;
+  until done;
 end;
 
 procedure sqlite3ExprCode(pParse: PParse; pExpr: PExpr; target: i32);
