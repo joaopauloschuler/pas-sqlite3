@@ -20,6 +20,104 @@ Important: At the end of this document, please find:
 
 ## Most recent activity
 
+  - **2026-04-26 — Phase 6.8.d JSON text→blob translator.**  Lands
+    the parsing surface that turns JSON / JSON5 source text into the
+    JSONB on-disk representation: `jsonTranslateTextToBlob` (~460
+    lines of recursive-descent over objects / arrays / strings /
+    numbers / literals / NaN-Inf / JSON5 hex+identifier keys),
+    `jsonConvertTextToBlob` (top-level driver — trailing whitespace
+    + JSON5 ws sweep, malformed-trailing-bytes detection),
+    `jsonbValidityCheck` (deferred from 6.8.c — full JSONB
+    self-check including TEXT5 escape replay through
+    `jsonUnescapeOneChar`), and the supporting helper layer:
+    `jsonBytesToBypass`, `jsonUnescapeOneChar` (recursive — chains
+    on the LS / PS / CR-LF escaped-newline replay path),
+    `jsonLabelCompare` + `jsonLabelCompareEscaped` (raw-vs-escaped
+    object-key comparison, both sides may carry escapes),
+    `jsonIs4HexB`, and a partial `jsonParseReset` (RCStr branch
+    stubbed — see 6.8.h).
+    
+    Pre-req helper added to `passqlite3util`:
+    `sqlite3Utf8ReadLimited` (faithful port of utf.c:208) — reads
+    one UTF-8 codepoint with a hard 4-byte limit.
+    `sqlite3Utf8Trans1` was already present from earlier UTF work
+    so no new table.
+
+    Concrete changes:
+      * `src/passqlite3util.pas` — adds `sqlite3Utf8ReadLimited`
+        (interface + ~15 line impl).
+      * `src/passqlite3json.pas` — adds the 6.8.d surface
+        (~700 lines added: 9 new routines + the recursive descent).
+      * `src/tests/TestJson.pas` — adds T200..T275 (76 new asserts:
+        bytesToBypass for \n / \r\n / LS escapes, unescapeOneChar
+        for short escapes / \x / \u / \uXXXX surrogate-pair
+        composition / malformed, labelCompare raw-vs-escaped,
+        translate for all literal/number/string/array/object/nested
+        forms incl. JSON5 single-quoted, convertTextToBlob trailing
+        whitespace and malformed gates, validityCheck pass/fail for
+        array/literal/int, jsonIs4HexB).  **274/274 PASS** (was
+        198/198).
+      * Regression spot check: TestUtil ALL PASS, TestPrintf
+        105/105, TestVtab 216/216, TestParser 45/45,
+        TestSchemaBasic 44/44 — all green.
+
+    Discoveries / next-step notes:
+      * **C `for(j=i+1;;j++)` ↔ Pascal `while True do`.**  C's
+        for-loop runs `j++` after every iteration body, including
+        the path through `continue`.  Mechanically translating to
+        a Pascal `while True do` drops that increment, so a
+        `Continue` after matching `,` left j parked on the comma
+        and the next iteration mis-parsed it as `-4`.  Fix:
+        explicitly `Inc(j); Continue;` everywhere the C `continue`
+        relied on the for-loop's tail.  Three sites in the array
+        body, three in the object body.  Same pattern will
+        re-appear in 6.8.e's blob-to-text reader and 6.8.f's
+        path-walk; flagging here so the reader catches it on first
+        pass.
+      * **`goto` across `case` arms is unsafe in FPC.**  Original
+        port had separate `case Ord('"')` / `case Ord('''')` arms
+        with a `goto parse_string` between them, mirroring C's
+        fallthrough.  FPC's label semantics for inter-arm goto are
+        undefined; consolidated to a single `Ord(''''), Ord('"')`
+        arm with a runtime branch on `z[i]` for the JSON5 nonstd
+        flag.  Same consolidation applied to `'+' / '.' / '-' /
+        '0'..'9'` for the number parser.  Within an arm, goto
+        between `parse_number` / `parse_number_2` /
+        `parse_number_finish` labels is fine (same scope).
+      * **Pascal source UTF-8 trap.**  Writing
+        `'«'` literal in a `'...'`-quoted Pascal string was
+        silently re-encoded by the editor pass into the actual
+        2-byte UTF-8 for «.  Test then exercised the wrong code
+        path in `jsonUnescapeOneChar` (which expects an ASCII `\`
+        + `u` + four hex bytes).  Switched to explicit char-code
+        composition `#92'u00AB'` to bypass file-encoding rewrites
+        — same fix applies to the surrogate-pair test.  Worth
+        keeping in mind for any future test that needs to embed
+        backslash-prefixed escapes.
+      * **`pCtx` error sinking deferred to 6.8.h.**  In C,
+        `jsonConvertTextToBlob` calls `sqlite3_result_error_nomem`
+        / `sqlite3_result_error(pCtx, "malformed JSON", -1)` to
+        propagate parse failures to the SQL caller.  Pulling
+        `passqlite3vdbe` into the JSON unit would create a
+        recursive dep with codegen, so the Pascal port stops at
+        the return-1 / parse-reset boundary.  6.8.h wires the SQL
+        dispatch surface; that's the natural place to translate
+        eErr / oom into `sqlite3_result_*`.
+      * **`jsonParseReset` RCStr branch stubbed.**  When
+        `bJsonIsRCStr` is set, C calls `sqlite3RCStrUnref(zJson)`.
+        RCStr isn't ported (deferred to 6.8.h alongside
+        `jsonReturnString`).  Until then, no caller sets
+        `bJsonIsRCStr` so the branch is unreachable; left as a
+        TODO marker rather than introducing a partial RCStr port.
+      * **`jsonTranslateTextToBlob` uses `pParse^.nJson` as the
+        outer JSON length** when reserving header sz for the root
+        `{` / `[`.  The reserved size is overwritten by
+        `jsonBlobChangePayloadSize` after the children land,
+        matching C — but it does mean the top-level header cost is
+        a function of input size, not output size.  6.8.f's path
+        edit uses `jsonAfterEditSizeAdjust` (already in 6.8.c) to
+        keep this in sync.
+
   - **2026-04-26 — Phase 6.8.c JsonParse blob primitives.**  Lands the
     JSONB editing surface: byte-accurate ports of `jsonBlobExpand`,
     `jsonBlobMakeEditable`, `jsonBlobAppendOneByte`, `jsonBlobAppendNode`
@@ -3359,13 +3457,20 @@ reference exactly.
     (it depends on `sqlite3Utf8ReadLimited` + `sqlite3Utf8Trans1`,
     neither yet in `passqlite3util`).  Cleaner to land both together
     in 6.8.d than to introduce a strictness divergence here.
-  - [ ] **6.8.d** Text→blob translator — `jsonTranslateTextToBlob`,
-    `jsonConvertTextToBlob`, `jsonAppendControlChar`,
-    `jsonUnescapeOneChar`, `jsonBytesToBypass`, `jsonLabelCompare(d)`,
-    plus `jsonbValidityCheck` (deferred from 6.8.c — needs
-    `jsonUnescapeOneChar`).  Will also require porting
-    `sqlite3Utf8ReadLimited` / `sqlite3Utf8Trans1` into
-    `passqlite3util` (small, ~30 lines).
+  - [X] **6.8.d** Text→blob translator — `jsonTranslateTextToBlob`,
+    `jsonConvertTextToBlob`, `jsonUnescapeOneChar`, `jsonBytesToBypass`,
+    `jsonLabelCompare(Escaped)`, `jsonIs4HexB`, `jsonbValidityCheck`,
+    `jsonParseReset` (partial — RCStr branch deferred), plus
+    `sqlite3Utf8ReadLimited` added to `passqlite3util`
+    (`sqlite3Utf8Trans1` was already present from earlier UTF work).
+    DONE 2026-04-26.  Gate `TestJson.pas` 274/274 PASS (was 198/198).
+    `jsonAppendControlChar` already landed in 6.8.b — kept off this
+    chunk's surface.  Error-sinking via `pCtx`
+    (`sqlite3_result_error[_nomem]`) deferred to 6.8.h to avoid pulling
+    `passqlite3vdbe` into the JSON unit; `jsonConvertTextToBlob` still
+    returns 1 on error and resets the parse, callers just don't get a
+    SQL error string yet.  Same deferral applies to
+    `jsonParseReset`'s RCStr unref branch (sqlite3RCStr* not ported).
   - [ ] **6.8.e** Blob→text + pretty — `jsonTranslateBlobToText`,
     `jsonPrettyIndent`, `jsonTranslateBlobToPrettyText`,
     `jsonReturnTextJsonFromBlob`, `jsonReturnParse`.

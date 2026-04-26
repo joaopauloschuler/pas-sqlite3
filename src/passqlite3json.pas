@@ -386,6 +386,35 @@ function  jsonBlobOverwrite(aOut: PByte; aIns: PByte; nIns: u32;
 procedure jsonBlobEdit(pParse: PJsonParse; iDel, nDel: u32;
                        aIns: PByte; nIns: u32);
 
+{ ===========================================================================
+  Text→blob translator and supporting helpers (Phase 6.8.d)
+
+  Faithful port of json.c:1355 (jsonIs4HexB), 1372 (jsonbValidityCheck),
+  1581 (jsonTranslateTextToBlob), 2055 (jsonConvertTextToBlob),
+  2689 (jsonBytesToBypass), 2727 (jsonUnescapeOneChar),
+  2820 (jsonLabelCompareEscaped), 2876 (jsonLabelCompare),
+  906 (jsonParseReset).
+
+  All rely on `sqlite3Utf8ReadLimited` newly added to passqlite3util.
+
+  Error sinking via pCtx (sqlite3_result_error / _nomem) is deferred to
+  6.8.h since it would pull passqlite3vdbe in.  jsonConvertTextToBlob
+  records oom/malformed via pParse^.oom and the JSTRING bits on the caller's
+  JsonString; the SQL surface in 6.8.h will translate those to result
+  errors at the dispatch layer.
+  =========================================================================== }
+
+procedure jsonParseReset(pParse: PJsonParse);
+function  jsonIs4HexB(z: PAnsiChar; var pOp: i32): i32;
+function  jsonBytesToBypass(z: PAnsiChar; n: u32): u32;
+function  jsonUnescapeOneChar(z: PAnsiChar; n: u32; out piOut: u32): u32;
+function  jsonbValidityCheck(pParse: PJsonParse;
+                             i, iEnd, iDepth: u32): u32;
+function  jsonLabelCompare(zLeft: PAnsiChar; nLeft: u32; rawLeft: i32;
+                           zRight: PAnsiChar; nRight: u32; rawRight: i32): i32;
+function  jsonTranslateTextToBlob(pParse: PJsonParse; i: u32): i32;
+function  jsonConvertTextToBlob(pParse: PJsonParse; pCtx: Pointer): i32;
+
 implementation
 
 function jsonIsspace(c: AnsiChar): i32; inline;
@@ -1143,6 +1172,1150 @@ begin
   end;
   if (nIns <> 0) and (aIns <> nil) then
     Move(aIns^, pParse^.aBlob[iDel], nIns);
+end;
+
+{ ===========================================================================
+  Phase 6.8.d implementation
+  =========================================================================== }
+
+procedure jsonParseReset(pParse: PJsonParse);
+begin
+  { RCStr branch deferred (sqlite3RCStrUnref not yet ported).  zJson
+    ownership for non-RCStr inputs is the caller's; we only release the
+    JSONB allocation here. }
+  if pParse^.bJsonIsRCStr <> 0 then
+  begin
+    { TODO 6.8.h: sqlite3RCStrUnref(pParse^.zJson) when RCStr lands. }
+    pParse^.zJson := nil;
+    pParse^.nJson := 0;
+    pParse^.bJsonIsRCStr := 0;
+  end;
+  if pParse^.nBlobAlloc <> 0 then
+  begin
+    sqlite3DbFree(pParse^.db, pParse^.aBlob);
+    pParse^.aBlob := nil;
+    pParse^.nBlob := 0;
+    pParse^.nBlobAlloc := 0;
+  end;
+end;
+
+function jsonIs4HexB(z: PAnsiChar; var pOp: i32): i32;
+begin
+  if z[0] <> 'u' then begin Result := 0; Exit; end;
+  if jsonIs4Hex(z + 1) = 0 then begin Result := 0; Exit; end;
+  pOp := JSONB_TEXTJ;
+  Result := 1;
+end;
+
+function jsonBytesToBypass(z: PAnsiChar; n: u32): u32;
+var
+  i : u32;
+  zb: PByte;
+begin
+  i := 0;
+  zb := PByte(z);
+  while i + 1 < n do
+  begin
+    if zb[i] <> Ord('\') then begin Result := i; Exit; end;
+    if zb[i + 1] = $0A then       { '\n' }
+    begin
+      i := i + 2;
+      Continue;
+    end;
+    if zb[i + 1] = $0D then       { '\r' }
+    begin
+      if (i + 2 < n) and (zb[i + 2] = $0A) then
+        i := i + 3
+      else
+        i := i + 2;
+      Continue;
+    end;
+    if (zb[i + 1] = $E2) and (i + 3 < n) and (zb[i + 2] = $80)
+       and ((zb[i + 3] = $A8) or (zb[i + 3] = $A9)) then
+    begin
+      i := i + 4;
+      Continue;
+    end;
+    Break;
+  end;
+  Result := i;
+end;
+
+function jsonUnescapeOneChar(z: PAnsiChar; n: u32; out piOut: u32): u32;
+var
+  v, vlo : u32;
+  nSkip  : u32;
+  sz     : i32;
+  zb     : PByte;
+begin
+  if n < 2 then
+  begin
+    piOut := JSON_INVALID_CHAR;
+    Result := n;
+    Exit;
+  end;
+  zb := PByte(z);
+  case zb[1] of
+    Ord('u'):
+    begin
+      if n < 6 then
+      begin
+        piOut := JSON_INVALID_CHAR;
+        Result := n;
+        Exit;
+      end;
+      v := jsonHexToInt4(z + 2);
+      if ((v and $FC00) = $D800)
+         and (n >= 12)
+         and (zb[6] = Ord('\'))
+         and (zb[7] = Ord('u')) then
+      begin
+        vlo := jsonHexToInt4(z + 8);
+        if (vlo and $FC00) = $DC00 then
+        begin
+          piOut := ((v and $3FF) shl 10) + (vlo and $3FF) + $10000;
+          Result := 12;
+          Exit;
+        end;
+      end;
+      piOut := v;
+      Result := 6;
+    end;
+    Ord('b'): begin piOut := $08; Result := 2; end;
+    Ord('f'): begin piOut := $0C; Result := 2; end;
+    Ord('n'): begin piOut := $0A; Result := 2; end;
+    Ord('r'): begin piOut := $0D; Result := 2; end;
+    Ord('t'): begin piOut := $09; Result := 2; end;
+    Ord('v'): begin piOut := $0B; Result := 2; end;
+    Ord('0'):
+    begin
+      { Correct (non-bug-compatible) JSON5 \0: invalid if next is digit. }
+      if (n > 2) and (sqlite3Isdigit(PByte(z)[2]) <> 0) then
+        piOut := JSON_INVALID_CHAR
+      else
+        piOut := 0;
+      Result := 2;
+    end;
+    Ord(''''), Ord('"'), Ord('/'), Ord('\'):
+    begin
+      piOut := zb[1];
+      Result := 2;
+    end;
+    Ord('x'):
+    begin
+      if n < 4 then
+      begin
+        piOut := JSON_INVALID_CHAR;
+        Result := n;
+        Exit;
+      end;
+      piOut := (u32(jsonHexToInt(zb[2])) shl 4) or jsonHexToInt(zb[3]);
+      Result := 4;
+    end;
+    $E2, $0D, $0A:
+    begin
+      nSkip := jsonBytesToBypass(z, n);
+      if nSkip = 0 then
+      begin
+        piOut := JSON_INVALID_CHAR;
+        Result := n;
+      end
+      else if nSkip = n then
+      begin
+        piOut := 0;
+        Result := n;
+      end
+      else if PByte(z)[nSkip] = Ord('\') then
+        Result := nSkip
+                + jsonUnescapeOneChar(z + nSkip, n - nSkip, piOut)
+      else
+      begin
+        sz := sqlite3Utf8ReadLimited(Pu8(z + nSkip),
+                                     i32(n - nSkip), piOut);
+        Result := nSkip + u32(sz);
+      end;
+    end;
+    else
+    begin
+      piOut := JSON_INVALID_CHAR;
+      Result := 2;
+    end;
+  end;
+end;
+
+function jsonbValidityCheck(pParse: PJsonParse;
+                            i, iEnd, iDepth: u32): u32;
+var
+  n, sz, j, k, sub, cnt, c, szC : u32;
+  z   : PByte;
+  x   : u8;
+  seen: u8;
+begin
+  if iDepth > JSON_MAX_DEPTH then begin Result := i + 1; Exit; end;
+  sz := 0;
+  n := jsonbPayloadSize(pParse, i, sz);
+  if n = 0 then begin Result := i + 1; Exit; end;
+  if i + n + sz <> iEnd then begin Result := i + 1; Exit; end;
+  z := pParse^.aBlob;
+  x := z[i] and $0F;
+  case x of
+    JSONB_NULL, JSONB_TRUE, JSONB_FALSE:
+    begin
+      if n + sz = 1 then Result := 0 else Result := i + 1;
+      Exit;
+    end;
+    JSONB_INT:
+    begin
+      if sz < 1 then begin Result := i + 1; Exit; end;
+      j := i + n;
+      if z[j] = Ord('-') then
+      begin
+        Inc(j);
+        if sz < 2 then begin Result := i + 1; Exit; end;
+      end;
+      k := i + n + sz;
+      while j < k do
+      begin
+        if sqlite3Isdigit(z[j]) <> 0 then
+          Inc(j)
+        else
+        begin
+          Result := j + 1;
+          Exit;
+        end;
+      end;
+      Result := 0;
+    end;
+    JSONB_INT5:
+    begin
+      if sz < 3 then begin Result := i + 1; Exit; end;
+      j := i + n;
+      if z[j] = Ord('-') then
+      begin
+        if sz < 4 then begin Result := i + 1; Exit; end;
+        Inc(j);
+      end;
+      if z[j] <> Ord('0') then begin Result := i + 1; Exit; end;
+      if (z[j + 1] <> Ord('x')) and (z[j + 1] <> Ord('X')) then
+      begin
+        Result := j + 2;
+        Exit;
+      end;
+      j := j + 2;
+      k := i + n + sz;
+      while j < k do
+      begin
+        if sqlite3Isxdigit(z[j]) <> 0 then
+          Inc(j)
+        else
+        begin
+          Result := j + 1;
+          Exit;
+        end;
+      end;
+      Result := 0;
+    end;
+    JSONB_FLOAT, JSONB_FLOAT5:
+    begin
+      seen := 0;
+      if sz < 2 then begin Result := i + 1; Exit; end;
+      j := i + n;
+      k := j + sz;
+      if z[j] = Ord('-') then
+      begin
+        Inc(j);
+        if sz < 3 then begin Result := i + 1; Exit; end;
+      end;
+      if z[j] = Ord('.') then
+      begin
+        if x = JSONB_FLOAT then begin Result := j + 1; Exit; end;
+        if sqlite3Isdigit(z[j + 1]) = 0 then begin Result := j + 1; Exit; end;
+        j := j + 2;
+        seen := 1;
+      end
+      else if (z[j] = Ord('0')) and (x = JSONB_FLOAT) then
+      begin
+        if j + 3 > k then begin Result := j + 1; Exit; end;
+        if (z[j + 1] <> Ord('.'))
+           and (z[j + 1] <> Ord('e'))
+           and (z[j + 1] <> Ord('E')) then
+        begin
+          Result := j + 1;
+          Exit;
+        end;
+        Inc(j);
+      end;
+      while j < k do
+      begin
+        if sqlite3Isdigit(z[j]) <> 0 then begin Inc(j); Continue; end;
+        if z[j] = Ord('.') then
+        begin
+          if seen > 0 then begin Result := j + 1; Exit; end;
+          if (x = JSONB_FLOAT)
+             and ((j = k - 1) or (sqlite3Isdigit(z[j + 1]) = 0)) then
+          begin
+            Result := j + 1;
+            Exit;
+          end;
+          seen := 1;
+          Inc(j);
+          Continue;
+        end;
+        if (z[j] = Ord('e')) or (z[j] = Ord('E')) then
+        begin
+          if seen = 2 then begin Result := j + 1; Exit; end;
+          if j = k - 1 then begin Result := j + 1; Exit; end;
+          if (z[j + 1] = Ord('+')) or (z[j + 1] = Ord('-')) then
+          begin
+            Inc(j);
+            if j = k - 1 then begin Result := j + 1; Exit; end;
+          end;
+          seen := 2;
+          Inc(j);
+          Continue;
+        end;
+        Result := j + 1;
+        Exit;
+      end;
+      if seen = 0 then begin Result := i + 1; Exit; end;
+      Result := 0;
+    end;
+    JSONB_TEXT:
+    begin
+      j := i + n;
+      k := j + sz;
+      while j < k do
+      begin
+        if (jsonIsOk[z[j]] = 0) and (z[j] <> Ord('''')) then
+        begin
+          Result := j + 1;
+          Exit;
+        end;
+        Inc(j);
+      end;
+      Result := 0;
+    end;
+    JSONB_TEXTJ, JSONB_TEXT5:
+    begin
+      j := i + n;
+      k := j + sz;
+      while j < k do
+      begin
+        if (jsonIsOk[z[j]] = 0) and (z[j] <> Ord('''')) then
+        begin
+          if z[j] = Ord('"') then
+          begin
+            if x = JSONB_TEXTJ then begin Result := j + 1; Exit; end;
+          end
+          else if z[j] <= $1F then
+          begin
+            if x = JSONB_TEXTJ then begin Result := j + 1; Exit; end;
+          end
+          else if (z[j] <> Ord('\')) or (j + 1 >= k) then
+          begin
+            Result := j + 1;
+            Exit;
+          end
+          else if (z[j + 1] = Ord('"')) or (z[j + 1] = Ord('\'))
+               or (z[j + 1] = Ord('/'))
+               or (z[j + 1] = Ord('b')) or (z[j + 1] = Ord('f'))
+               or (z[j + 1] = Ord('n')) or (z[j + 1] = Ord('r'))
+               or (z[j + 1] = Ord('t')) then
+            Inc(j)
+          else if z[j + 1] = Ord('u') then
+          begin
+            if j + 5 >= k then begin Result := j + 1; Exit; end;
+            if jsonIs4Hex(PAnsiChar(@z[j + 2])) = 0 then
+            begin
+              Result := j + 1;
+              Exit;
+            end;
+            Inc(j);
+          end
+          else if x <> JSONB_TEXT5 then
+          begin
+            Result := j + 1;
+            Exit;
+          end
+          else
+          begin
+            c := 0;
+            szC := jsonUnescapeOneChar(PAnsiChar(@z[j]), k - j, c);
+            if c = JSON_INVALID_CHAR then
+            begin
+              Result := j + 1;
+              Exit;
+            end;
+            j := j + szC - 1;
+          end;
+        end;
+        Inc(j);
+      end;
+      Result := 0;
+    end;
+    JSONB_TEXTRAW:
+    begin
+      Result := 0;
+    end;
+    JSONB_ARRAY:
+    begin
+      j := i + n;
+      k := j + sz;
+      while j < k do
+      begin
+        sz := 0;
+        n := jsonbPayloadSize(pParse, j, sz);
+        if n = 0 then begin Result := j + 1; Exit; end;
+        if j + n + sz > k then begin Result := j + 1; Exit; end;
+        sub := jsonbValidityCheck(pParse, j, j + n + sz, iDepth + 1);
+        if sub <> 0 then begin Result := sub; Exit; end;
+        j := j + n + sz;
+      end;
+      Result := 0;
+    end;
+    JSONB_OBJECT:
+    begin
+      cnt := 0;
+      j := i + n;
+      k := j + sz;
+      while j < k do
+      begin
+        sz := 0;
+        n := jsonbPayloadSize(pParse, j, sz);
+        if n = 0 then begin Result := j + 1; Exit; end;
+        if j + n + sz > k then begin Result := j + 1; Exit; end;
+        if (cnt and 1) = 0 then
+        begin
+          x := z[j] and $0F;
+          if (x < JSONB_TEXT) or (x > JSONB_TEXTRAW) then
+          begin
+            Result := j + 1;
+            Exit;
+          end;
+        end;
+        sub := jsonbValidityCheck(pParse, j, j + n + sz, iDepth + 1);
+        if sub <> 0 then begin Result := sub; Exit; end;
+        Inc(cnt);
+        j := j + n + sz;
+      end;
+      if (cnt and 1) <> 0 then begin Result := j + 1; Exit; end;
+      Result := 0;
+    end;
+    else
+      Result := i + 1;
+  end;
+end;
+
+function jsonLabelCompareEscaped(zLeft: PAnsiChar; nLeft: u32; rawLeft: i32;
+                                 zRight: PAnsiChar; nRight: u32;
+                                 rawRight: i32): i32;
+var
+  cLeft, cRight : u32;
+  sz            : i32;
+  n             : u32;
+begin
+  while True do
+  begin
+    if nLeft = 0 then
+      cLeft := 0
+    else if (rawLeft <> 0) or (zLeft[0] <> '\') then
+    begin
+      cLeft := PByte(zLeft)[0];
+      if cLeft >= $C0 then
+      begin
+        sz := sqlite3Utf8ReadLimited(Pu8(zLeft), i32(nLeft), cLeft);
+        zLeft := zLeft + sz;
+        nLeft := nLeft - u32(sz);
+      end
+      else
+      begin
+        Inc(zLeft);
+        Dec(nLeft);
+      end;
+    end
+    else
+    begin
+      n := jsonUnescapeOneChar(zLeft, nLeft, cLeft);
+      zLeft := zLeft + n;
+      nLeft := nLeft - n;
+    end;
+    if nRight = 0 then
+      cRight := 0
+    else if (rawRight <> 0) or (zRight[0] <> '\') then
+    begin
+      cRight := PByte(zRight)[0];
+      if cRight >= $C0 then
+      begin
+        sz := sqlite3Utf8ReadLimited(Pu8(zRight), i32(nRight), cRight);
+        zRight := zRight + sz;
+        nRight := nRight - u32(sz);
+      end
+      else
+      begin
+        Inc(zRight);
+        Dec(nRight);
+      end;
+    end
+    else
+    begin
+      n := jsonUnescapeOneChar(zRight, nRight, cRight);
+      zRight := zRight + n;
+      nRight := nRight - n;
+    end;
+    if cLeft <> cRight then begin Result := 0; Exit; end;
+    if cLeft = 0 then begin Result := 1; Exit; end;
+  end;
+end;
+
+function jsonLabelCompare(zLeft: PAnsiChar; nLeft: u32; rawLeft: i32;
+                          zRight: PAnsiChar; nRight: u32; rawRight: i32): i32;
+begin
+  if (rawLeft <> 0) and (rawRight <> 0) then
+  begin
+    if nLeft <> nRight then begin Result := 0; Exit; end;
+    if (nLeft = 0) or (CompareByte(zLeft^, zRight^, nLeft) = 0) then
+      Result := 1
+    else
+      Result := 0;
+  end
+  else
+    Result := jsonLabelCompareEscaped(zLeft, nLeft, rawLeft,
+                                      zRight, nRight, rawRight);
+end;
+
+function jsonTranslateTextToBlob(pParse: PJsonParse; i: u32): i32;
+label
+  json_parse_restart, parse_number,
+  parse_number_2, parse_number_finish, parse_object_value;
+var
+  c       : AnsiChar;
+  j, k, kk: u32;
+  iThis,
+  iStart,
+  iBlob   : u32;
+  x       : i32;
+  t       : u8;
+  z       : PAnsiChar;
+  zb      : PByte;
+  opcode  : u8;
+  cDelim  : AnsiChar;
+  seenE   : u8;
+  nn      : i32;
+  op      : i32;
+begin
+  z  := pParse^.zJson;
+  zb := PByte(z);
+
+json_parse_restart:
+  case zb[i] of
+    Ord('{'):
+    begin
+      iThis := pParse^.nBlob;
+      jsonBlobAppendNode(pParse, JSONB_OBJECT, u64(pParse^.nJson) - i, nil);
+      Inc(pParse^.iDepth);
+      if pParse^.iDepth > JSON_MAX_DEPTH then
+      begin
+        pParse^.iErr := i;
+        Result := -1;
+        Exit;
+      end;
+      iStart := pParse^.nBlob;
+      j := i + 1;
+      while True do
+      begin
+        iBlob := pParse^.nBlob;
+        x := jsonTranslateTextToBlob(pParse, j);
+        if x <= 0 then
+        begin
+          if x = -2 then
+          begin
+            j := pParse^.iErr;
+            if pParse^.nBlob <> iStart then pParse^.hasNonstd := 1;
+            Break;
+          end;
+          j := j + u32(json5Whitespace(z + j));
+          op := JSONB_TEXT;
+          if (sqlite3CtypeMap[zb[j]] and $42) <> 0 then
+          begin
+            { sqlite3JsonId1 hit — fall through to identifier scan }
+          end
+          else if not ((z[j] = '\') and (jsonIs4HexB(z + j + 1, op) <> 0)) then
+          begin
+            if x <> -1 then pParse^.iErr := j;
+            Result := -1;
+            Exit;
+          end;
+          k := j + 1;
+          while ((sqlite3CtypeMap[zb[k]] and $46) <> 0)
+                and (json5Whitespace(z + k) = 0)
+             or ((z[k] = '\') and (jsonIs4HexB(z + k + 1, op) <> 0))
+          do
+            Inc(k);
+          jsonBlobAppendNode(pParse, op, k - j, z + j);
+          pParse^.hasNonstd := 1;
+          x := i32(k);
+        end;
+        if pParse^.oom <> 0 then begin Result := -1; Exit; end;
+        t := pParse^.aBlob[iBlob] and $0F;
+        if (t < JSONB_TEXT) or (t > JSONB_TEXTRAW) then
+        begin
+          pParse^.iErr := j;
+          Result := -1;
+          Exit;
+        end;
+        j := u32(x);
+        if z[j] = ':' then
+          Inc(j)
+        else
+        begin
+          if jsonIsspace(z[j]) <> 0 then
+          begin
+            repeat Inc(j); until jsonIsspace(z[j]) = 0;
+            if z[j] = ':' then
+            begin
+              Inc(j);
+              goto parse_object_value;
+            end;
+          end;
+          x := jsonTranslateTextToBlob(pParse, j);
+          if x <> -5 then
+          begin
+            if x <> -1 then pParse^.iErr := j;
+            Result := -1;
+            Exit;
+          end;
+          j := pParse^.iErr + 1;
+        end;
+      parse_object_value:
+        x := jsonTranslateTextToBlob(pParse, j);
+        if x <= 0 then
+        begin
+          if x <> -1 then pParse^.iErr := j;
+          Result := -1;
+          Exit;
+        end;
+        j := u32(x);
+        if z[j] = ',' then
+        begin
+          Inc(j);
+          Continue;
+        end
+        else if z[j] = '}' then
+          Break
+        else
+        begin
+          if jsonIsspace(z[j]) <> 0 then
+          begin
+            Inc(j);
+            while aJsonIsSpace[zb[j]] <> 0 do Inc(j);
+            if z[j] = ',' then begin Inc(j); Continue; end;
+            if z[j] = '}' then Break;
+          end;
+          x := jsonTranslateTextToBlob(pParse, j);
+          if x = -4 then
+          begin
+            j := pParse^.iErr + 1;
+            Continue;
+          end;
+          if x = -2 then
+          begin
+            j := pParse^.iErr;
+            Break;
+          end;
+        end;
+        pParse^.iErr := j;
+        Result := -1;
+        Exit;
+      end;
+      jsonBlobChangePayloadSize(pParse, iThis, pParse^.nBlob - iStart);
+      Dec(pParse^.iDepth);
+      Result := i32(j + 1);
+      Exit;
+    end;
+    Ord('['):
+    begin
+      iThis := pParse^.nBlob;
+      jsonBlobAppendNode(pParse, JSONB_ARRAY, u64(pParse^.nJson) - i, nil);
+      iStart := pParse^.nBlob;
+      if pParse^.oom <> 0 then begin Result := -1; Exit; end;
+      Inc(pParse^.iDepth);
+      if pParse^.iDepth > JSON_MAX_DEPTH then
+      begin
+        pParse^.iErr := i;
+        Result := -1;
+        Exit;
+      end;
+      j := i + 1;
+      while True do
+      begin
+        x := jsonTranslateTextToBlob(pParse, j);
+        if x <= 0 then
+        begin
+          if x = -3 then
+          begin
+            j := pParse^.iErr;
+            if pParse^.nBlob <> iStart then pParse^.hasNonstd := 1;
+            Break;
+          end;
+          if x <> -1 then pParse^.iErr := j;
+          Result := -1;
+          Exit;
+        end;
+        j := u32(x);
+        if z[j] = ',' then
+        begin
+          Inc(j);
+          Continue;
+        end
+        else if z[j] = ']' then
+          Break
+        else
+        begin
+          if jsonIsspace(z[j]) <> 0 then
+          begin
+            Inc(j);
+            while aJsonIsSpace[zb[j]] <> 0 do Inc(j);
+            if z[j] = ',' then begin Inc(j); Continue; end;
+            if z[j] = ']' then Break;
+          end;
+          x := jsonTranslateTextToBlob(pParse, j);
+          if x = -4 then
+          begin
+            j := pParse^.iErr + 1;
+            Continue;
+          end;
+          if x = -3 then
+          begin
+            j := pParse^.iErr;
+            Break;
+          end;
+        end;
+        pParse^.iErr := j;
+        Result := -1;
+        Exit;
+      end;
+      jsonBlobChangePayloadSize(pParse, iThis, pParse^.nBlob - iStart);
+      Dec(pParse^.iDepth);
+      Result := i32(j + 1);
+      Exit;
+    end;
+    Ord(''''), Ord('"'):
+    begin
+      if z[i] = '''' then pParse^.hasNonstd := 1;
+      opcode := JSONB_TEXT;
+      cDelim := z[i];
+      j := i + 1;
+      while True do
+      begin
+        if jsonIsOk[zb[j]] <> 0 then
+        begin
+          if jsonIsOk[zb[j + 1]] = 0 then
+            j := j + 1
+          else if jsonIsOk[zb[j + 2]] = 0 then
+            j := j + 2
+          else
+          begin
+            j := j + 3;
+            Continue;
+          end;
+        end;
+        c := z[j];
+        if c = cDelim then
+          Break
+        else if c = '\' then
+        begin
+          Inc(j);
+          c := z[j];
+          if (c = '"') or (c = '\') or (c = '/') or (c = 'b') or (c = 'f')
+             or (c = 'n') or (c = 'r') or (c = 't')
+             or ((c = 'u') and (jsonIs4Hex(z + j + 1) <> 0)) then
+          begin
+            if opcode = JSONB_TEXT then opcode := JSONB_TEXTJ;
+          end
+          else if (c = '''') or (c = 'v') or (c = #10)
+               or ((c = '0') and (sqlite3Isdigit(zb[j + 1]) = 0))
+               or ((zb[j] = $E2) and (zb[j + 1] = $80)
+                   and ((zb[j + 2] = $A8) or (zb[j + 2] = $A9)))
+               or ((c = 'x') and (jsonIs2Hex(z + j + 1) <> 0)) then
+          begin
+            opcode := JSONB_TEXT5;
+            pParse^.hasNonstd := 1;
+          end
+          else if c = #13 then
+          begin
+            if z[j + 1] = #10 then Inc(j);
+            opcode := JSONB_TEXT5;
+            pParse^.hasNonstd := 1;
+          end
+          else
+          begin
+            pParse^.iErr := j;
+            Result := -1;
+            Exit;
+          end;
+        end
+        else if zb[j] <= $1F then
+        begin
+          if zb[j] = 0 then
+          begin
+            pParse^.iErr := j;
+            Result := -1;
+            Exit;
+          end;
+          opcode := JSONB_TEXT5;
+          pParse^.hasNonstd := 1;
+        end
+        else if c = '"' then
+        begin
+          opcode := JSONB_TEXT5;
+        end;
+        Inc(j);
+      end;
+      jsonBlobAppendNode(pParse, opcode, j - 1 - i, z + i + 1);
+      Result := i32(j + 1);
+      Exit;
+    end;
+    Ord('t'):
+    begin
+      if (CompareByte((z + i)^, 'true', 4) = 0)
+         and (sqlite3Isalnum(zb[i + 4]) = 0) then
+      begin
+        jsonBlobAppendOneByte(pParse, JSONB_TRUE);
+        Result := i32(i + 4);
+        Exit;
+      end;
+      pParse^.iErr := i;
+      Result := -1;
+      Exit;
+    end;
+    Ord('f'):
+    begin
+      if (CompareByte((z + i)^, 'false', 5) = 0)
+         and (sqlite3Isalnum(zb[i + 5]) = 0) then
+      begin
+        jsonBlobAppendOneByte(pParse, JSONB_FALSE);
+        Result := i32(i + 5);
+        Exit;
+      end;
+      pParse^.iErr := i;
+      Result := -1;
+      Exit;
+    end;
+    Ord('+'), Ord('.'),
+    Ord('-'), Ord('0'), Ord('1'), Ord('2'), Ord('3'), Ord('4'),
+    Ord('5'), Ord('6'), Ord('7'), Ord('8'), Ord('9'):
+    begin
+      if z[i] = '+' then
+      begin
+        pParse^.hasNonstd := 1;
+        t := $00;
+        goto parse_number;
+      end
+      else if z[i] = '.' then
+      begin
+        if sqlite3Isdigit(zb[i + 1]) <> 0 then
+        begin
+          pParse^.hasNonstd := 1;
+          t := $03;
+          seenE := 0;
+          goto parse_number_2;
+        end;
+        pParse^.iErr := i;
+        Result := -1;
+        Exit;
+      end;
+      t := $00;
+parse_number:
+      seenE := 0;
+      c := z[i];
+      if c <= '0' then
+      begin
+        if c = '0' then
+        begin
+          if ((z[i + 1] = 'x') or (z[i + 1] = 'X'))
+             and (sqlite3Isxdigit(zb[i + 2]) <> 0) then
+          begin
+            pParse^.hasNonstd := 1;
+            t := $01;
+            j := i + 3;
+            while sqlite3Isxdigit(zb[j]) <> 0 do Inc(j);
+            goto parse_number_finish;
+          end
+          else if sqlite3Isdigit(zb[i + 1]) <> 0 then
+          begin
+            pParse^.iErr := i + 1;
+            Result := -1;
+            Exit;
+          end;
+        end
+        else
+        begin
+          if sqlite3Isdigit(zb[i + 1]) = 0 then
+          begin
+            if ((z[i + 1] = 'I') or (z[i + 1] = 'i'))
+               and (sqlite3_strnicmp(z + i + 1, 'inf', 3) = 0) then
+            begin
+              pParse^.hasNonstd := 1;
+              if z[i] = '-' then
+                jsonBlobAppendNode(pParse, JSONB_FLOAT, 6, PAnsiChar('-9e999'))
+              else
+                jsonBlobAppendNode(pParse, JSONB_FLOAT, 5, PAnsiChar('9e999'));
+              if sqlite3_strnicmp(z + i + 4, 'inity', 5) = 0 then
+                Result := i32(i + 9)
+              else
+                Result := i32(i + 4);
+              Exit;
+            end;
+            if z[i + 1] = '.' then
+            begin
+              pParse^.hasNonstd := 1;
+              t := t or $01;
+              goto parse_number_2;
+            end;
+            pParse^.iErr := i;
+            Result := -1;
+            Exit;
+          end;
+          if z[i + 1] = '0' then
+          begin
+            if sqlite3Isdigit(zb[i + 2]) <> 0 then
+            begin
+              pParse^.iErr := i + 1;
+              Result := -1;
+              Exit;
+            end
+            else if ((z[i + 2] = 'x') or (z[i + 2] = 'X'))
+                 and (sqlite3Isxdigit(zb[i + 3]) <> 0) then
+            begin
+              pParse^.hasNonstd := 1;
+              t := t or $01;
+              j := i + 4;
+              while sqlite3Isxdigit(zb[j]) <> 0 do Inc(j);
+              goto parse_number_finish;
+            end;
+          end;
+        end;
+      end;
+parse_number_2:
+      j := i + 1;
+      while True do
+      begin
+        c := z[j];
+        if sqlite3Isdigit(zb[j]) <> 0 then begin Inc(j); Continue; end;
+        if c = '.' then
+        begin
+          if (t and $02) <> 0 then
+          begin
+            pParse^.iErr := j;
+            Result := -1;
+            Exit;
+          end;
+          t := t or $02;
+          Inc(j);
+          Continue;
+        end;
+        if (c = 'e') or (c = 'E') then
+        begin
+          if zb[j - 1] < Ord('0') then
+          begin
+            if (z[j - 1] = '.') and (j - 2 >= i)
+               and (sqlite3Isdigit(zb[j - 2]) <> 0) then
+            begin
+              pParse^.hasNonstd := 1;
+              t := t or $01;
+            end
+            else
+            begin
+              pParse^.iErr := j;
+              Result := -1;
+              Exit;
+            end;
+          end;
+          if seenE <> 0 then
+          begin
+            pParse^.iErr := j;
+            Result := -1;
+            Exit;
+          end;
+          t := t or $02;
+          seenE := 1;
+          c := z[j + 1];
+          if (c = '+') or (c = '-') then
+          begin
+            Inc(j);
+            c := z[j + 1];
+          end;
+          if (c < '0') or (c > '9') then
+          begin
+            pParse^.iErr := j;
+            Result := -1;
+            Exit;
+          end;
+          Inc(j);
+          Continue;
+        end;
+        Break;
+      end;
+      if zb[j - 1] < Ord('0') then
+      begin
+        if (z[j - 1] = '.') and (j - 2 >= i)
+           and (sqlite3Isdigit(zb[j - 2]) <> 0) then
+        begin
+          pParse^.hasNonstd := 1;
+          t := t or $01;
+        end
+        else
+        begin
+          pParse^.iErr := j;
+          Result := -1;
+          Exit;
+        end;
+      end;
+parse_number_finish:
+      if z[i] = '+' then Inc(i);
+      jsonBlobAppendNode(pParse, JSONB_INT + t, j - i, z + i);
+      Result := i32(j);
+      Exit;
+    end;
+    Ord('}'):
+    begin
+      pParse^.iErr := i;
+      Result := -2;
+      Exit;
+    end;
+    Ord(']'):
+    begin
+      pParse^.iErr := i;
+      Result := -3;
+      Exit;
+    end;
+    Ord(','):
+    begin
+      pParse^.iErr := i;
+      Result := -4;
+      Exit;
+    end;
+    Ord(':'):
+    begin
+      pParse^.iErr := i;
+      Result := -5;
+      Exit;
+    end;
+    0:
+    begin
+      Result := 0;
+      Exit;
+    end;
+    $09, $0A, $0D, $20:
+    begin
+      Inc(i);
+      while aJsonIsSpace[zb[i]] <> 0 do Inc(i);
+      goto json_parse_restart;
+    end;
+    $0B, $0C, Ord('/'), $C2, $E1, $E2, $E3, $EF:
+    begin
+      j := u32(json5Whitespace(z + i));
+      if j > 0 then
+      begin
+        i := i + j;
+        pParse^.hasNonstd := 1;
+        goto json_parse_restart;
+      end;
+      pParse^.iErr := i;
+      Result := -1;
+      Exit;
+    end;
+    Ord('n'):
+    begin
+      if (CompareByte((z + i)^, 'null', 4) = 0)
+         and (sqlite3Isalnum(zb[i + 4]) = 0) then
+      begin
+        jsonBlobAppendOneByte(pParse, JSONB_NULL);
+        Result := i32(i + 4);
+        Exit;
+      end;
+      { fall-through into NaN/Inf scan }
+      c := z[i];
+      for kk := 0 to High(aNanInfName) do
+      begin
+        if (c <> aNanInfName[kk].c1) and (c <> aNanInfName[kk].c2) then
+          Continue;
+        nn := aNanInfName[kk].n;
+        if sqlite3_strnicmp(z + i, aNanInfName[kk].zMatch, nn) <> 0 then
+          Continue;
+        if sqlite3Isalnum(zb[i + u32(nn)]) <> 0 then Continue;
+        if aNanInfName[kk].eType = JSONB_FLOAT then
+          jsonBlobAppendNode(pParse, JSONB_FLOAT, 5, PAnsiChar('9e999'))
+        else
+          jsonBlobAppendOneByte(pParse, JSONB_NULL);
+        pParse^.hasNonstd := 1;
+        Result := i32(i + u32(nn));
+        Exit;
+      end;
+      pParse^.iErr := i;
+      Result := -1;
+      Exit;
+    end;
+    else
+    begin
+      c := z[i];
+      for kk := 0 to High(aNanInfName) do
+      begin
+        if (c <> aNanInfName[kk].c1) and (c <> aNanInfName[kk].c2) then
+          Continue;
+        nn := aNanInfName[kk].n;
+        if sqlite3_strnicmp(z + i, aNanInfName[kk].zMatch, nn) <> 0 then
+          Continue;
+        if sqlite3Isalnum(zb[i + u32(nn)]) <> 0 then Continue;
+        if aNanInfName[kk].eType = JSONB_FLOAT then
+          jsonBlobAppendNode(pParse, JSONB_FLOAT, 5, PAnsiChar('9e999'))
+        else
+          jsonBlobAppendOneByte(pParse, JSONB_NULL);
+        pParse^.hasNonstd := 1;
+        Result := i32(i + u32(nn));
+        Exit;
+      end;
+      pParse^.iErr := i;
+      Result := -1;
+      Exit;
+    end;
+  end;
+end;
+
+function jsonConvertTextToBlob(pParse: PJsonParse; pCtx: Pointer): i32;
+var
+  i     : i32;
+  zJson : PAnsiChar;
+begin
+  zJson := pParse^.zJson;
+  i := jsonTranslateTextToBlob(pParse, 0);
+  if pParse^.oom <> 0 then i := -1;
+  if i > 0 then
+  begin
+    while jsonIsspace(zJson[i]) <> 0 do Inc(i);
+    if zJson[i] <> #0 then
+    begin
+      i := i + json5Whitespace(zJson + i);
+      if zJson[i] <> #0 then
+      begin
+        { TODO 6.8.h: sqlite3_result_error(pCtx, 'malformed JSON', -1). }
+        if pCtx <> nil then ;
+        jsonParseReset(pParse);
+        Result := 1;
+        Exit;
+      end;
+      pParse^.hasNonstd := 1;
+    end;
+  end;
+  if i <= 0 then
+  begin
+    { TODO 6.8.h: surface oom / 'malformed JSON' on pCtx. }
+    if pCtx <> nil then ;
+    jsonParseReset(pParse);
+    Result := 1;
+    Exit;
+  end;
+  Result := 0;
 end;
 
 end.

@@ -669,8 +669,263 @@ begin
   FreeParse(p);
 end;
 
+{ ----- Phase 6.8.d text→blob tests ----- }
+
+procedure InitParseFromText(out p: TJsonParse; const s: AnsiString);
 begin
-  WriteLn('=== TestJson — Phase 6.8.a/b/c JSON foundation + accumulator + blob ===');
+  FillChar(p, SizeOf(p), 0);
+  p.zJson := PAnsiChar(s);
+  p.nJson := Length(s);
+end;
+
+procedure TestBytesToBypass;
+var n: u32;
+begin
+  n := jsonBytesToBypass('\' + #10 + 'x', 3);
+  CheckEqI('T200 b2b CR-style \n', n, 2);
+  n := jsonBytesToBypass('\' + #13 + #10 + 'x', 4);
+  CheckEqI('T201 b2b \r\n', n, 3);
+  n := jsonBytesToBypass('\' + #13 + 'x', 3);
+  CheckEqI('T202 b2b \r alone', n, 2);
+  n := jsonBytesToBypass('\\x', 3);   { not a newline-escape }
+  CheckEqI('T203 b2b nope', n, 0);
+  n := jsonBytesToBypass('hi', 2);
+  CheckEqI('T204 b2b nonbslash', n, 0);
+  n := jsonBytesToBypass('\' + #$E2 + #$80 + #$A8 + 'x', 5);
+  CheckEqI('T205 b2b LS', n, 4);
+end;
+
+procedure TestUnescapeOneChar;
+var v: u32; n: u32;
+begin
+  n := jsonUnescapeOneChar('\n', 2, v);
+  CheckEqI('T206 \n n', n, 2); CheckEqI('T207 \n c', v, $0A);
+  n := jsonUnescapeOneChar('\t', 2, v);
+  CheckEqI('T208 \t n', n, 2); CheckEqI('T209 \t c', v, $09);
+  n := jsonUnescapeOneChar('\b', 2, v);
+  CheckEqI('T210 \b c', v, $08);
+  { \u escape: BMP code point U+00AB.  Build literal explicitly to avoid
+    UTF-8 encoding tricks in the source file. }
+  n := jsonUnescapeOneChar(PAnsiChar(#92'u00AB'), 6, v);
+  CheckEqI('T211 u-esc n', n, 6); CheckEqI('T212 u-esc c', v, $00AB);
+  n := jsonUnescapeOneChar('\x4f', 4, v);
+  CheckEqI('T213 \x4f n', n, 4); CheckEqI('T214 \x4f c', v, $4F);
+  n := jsonUnescapeOneChar('\v', 2, v);
+  CheckEqI('T215 \v c', v, $0B);
+  n := jsonUnescapeOneChar('\0', 2, v);
+  CheckEqI('T216 \0 c', v, 0);
+  n := jsonUnescapeOneChar('\"', 2, v);
+  CheckEqI('T217 \" c', v, Ord('"'));
+  n := jsonUnescapeOneChar('\\', 2, v);
+  CheckEqI('T218 \\ c', v, Ord('\'));
+  n := jsonUnescapeOneChar('\q', 2, v);
+  CheckEqI('T219 \q invalid', v, JSON_INVALID_CHAR);
+  { surrogate-pair 😀 → U+1F600 (😀) }
+  n := jsonUnescapeOneChar(PAnsiChar(#92'uD83D'#92'uDE00'), 12, v);
+  CheckEqI('T220 surr n', n, 12);
+  CheckEqI('T221 surr c', v, $1F600);
+end;
+
+procedure TestLabelCompare;
+begin
+  CheckEqI('T222 raw equal', jsonLabelCompare('foo', 3, 1, 'foo', 3, 1), 1);
+  CheckEqI('T223 raw diff',  jsonLabelCompare('foo', 3, 1, 'bar', 3, 1), 0);
+  CheckEqI('T224 len diff',  jsonLabelCompare('foo', 3, 1, 'foob', 4, 1), 0);
+  { Escape on left: "A" matches "A" }
+  CheckEqI('T225 esc=raw',
+           jsonLabelCompare('A', 6, 0, 'A', 1, 1), 1);
+  { Both escaped, same content }
+  CheckEqI('T226 esc=esc',
+           jsonLabelCompare('A', 6, 0, 'A', 6, 0), 1);
+end;
+
+procedure TestTranslateLiterals;
+var p: TJsonParse; rc: i32;
+begin
+  InitParseFromText(p, 'true');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T227 true rc', rc, 4);
+  CheckEqI('T228 true nBlob', p.nBlob, 1);
+  CheckTrue('T229 true byte', p.aBlob[0] = JSONB_TRUE);
+  FreeParse(p);
+
+  InitParseFromText(p, 'false');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T230 false rc', rc, 5);
+  CheckTrue('T231 false byte', p.aBlob[0] = JSONB_FALSE);
+  FreeParse(p);
+
+  InitParseFromText(p, 'null');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T232 null rc', rc, 4);
+  CheckTrue('T233 null byte', p.aBlob[0] = JSONB_NULL);
+  FreeParse(p);
+end;
+
+procedure TestTranslateNumber;
+var p: TJsonParse; rc: i32; sz, n: u32;
+begin
+  InitParseFromText(p, '123');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T234 123 rc', rc, 3);
+  n := jsonbPayloadSize(@p, 0, sz);
+  CheckEqI('T235 123 type', p.aBlob[0] and $0F, JSONB_INT);
+  CheckEqI('T236 123 sz',   sz, 3);
+  CheckTrue('T237 123 b1',  p.aBlob[1] = Ord('1'));
+  FreeParse(p);
+
+  InitParseFromText(p, '-7');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T238 -7 rc', rc, 2);
+  CheckEqI('T239 -7 type', p.aBlob[0] and $0F, JSONB_INT);
+  CheckTrue('T240 -7 b1', p.aBlob[1] = Ord('-'));
+  CheckTrue('T241 -7 b2', p.aBlob[2] = Ord('7'));
+  FreeParse(p);
+
+  InitParseFromText(p, '3.14');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T242 3.14 rc',   rc, 4);
+  CheckEqI('T243 3.14 type', p.aBlob[0] and $0F, JSONB_FLOAT);
+  FreeParse(p);
+
+  InitParseFromText(p, '1e10');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T244 1e10 rc',   rc, 4);
+  CheckEqI('T245 1e10 type', p.aBlob[0] and $0F, JSONB_FLOAT);
+  FreeParse(p);
+end;
+
+procedure TestTranslateString;
+var p: TJsonParse; rc: i32; sz: u32;
+begin
+  InitParseFromText(p, '"abc"');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T246 "abc" rc', rc, 5);
+  CheckEqI('T247 type', p.aBlob[0] and $0F, JSONB_TEXT);
+  jsonbPayloadSize(@p, 0, sz);
+  CheckEqI('T248 sz', sz, 3);
+  CheckTrue('T249 b1', p.aBlob[1] = Ord('a'));
+  FreeParse(p);
+
+  { string with \n escape → JSONB_TEXTJ }
+  InitParseFromText(p, '"a\n"');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T250 \n rc', rc, 5);
+  CheckEqI('T251 \n type', p.aBlob[0] and $0F, JSONB_TEXTJ);
+  FreeParse(p);
+
+  { JSON5 single-quoted string }
+  InitParseFromText(p, '''hi''');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T252 sq rc', rc, 4);
+  CheckEqI('T253 sq type', p.aBlob[0] and $0F, JSONB_TEXT);
+  CheckEqI('T254 sq nonstd', p.hasNonstd, 1);
+  FreeParse(p);
+end;
+
+procedure TestTranslateArrayObject;
+var p: TJsonParse; rc: i32; cnt: u32;
+begin
+  InitParseFromText(p, '[1,2,3]');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T255 arr rc', rc, 7);
+  CheckEqI('T256 arr type', p.aBlob[0] and $0F, JSONB_ARRAY);
+  cnt := jsonbArrayCount(@p, 0);
+  CheckEqI('T257 arr count', cnt, 3);
+  FreeParse(p);
+
+  InitParseFromText(p, '{"a":1,"b":2}');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T258 obj rc', rc, 13);
+  CheckEqI('T259 obj type', p.aBlob[0] and $0F, JSONB_OBJECT);
+  FreeParse(p);
+
+  InitParseFromText(p, '[]');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T260 [] rc', rc, 2);
+  CheckEqI('T261 [] type', p.aBlob[0] and $0F, JSONB_ARRAY);
+  FreeParse(p);
+end;
+
+procedure TestTranslateNested;
+var p: TJsonParse; rc: i32;
+begin
+  InitParseFromText(p, '[[1],{"k":[2,3]}]');
+  rc := jsonTranslateTextToBlob(@p, 0);
+  CheckEqI('T262 nested rc', rc, 17);
+  CheckEqI('T263 nested type', p.aBlob[0] and $0F, JSONB_ARRAY);
+  FreeParse(p);
+end;
+
+procedure TestConvertTextToBlob;
+var p: TJsonParse; rc: i32;
+begin
+  { trailing whitespace OK }
+  InitParseFromText(p, '  42  ');
+  rc := jsonConvertTextToBlob(@p, nil);
+  CheckEqI('T264 conv ok', rc, 0);
+  CheckEqI('T265 conv type', p.aBlob[0] and $0F, JSONB_INT);
+  FreeParse(p);
+
+  { trailing garbage → error }
+  InitParseFromText(p, '42 garbage');
+  rc := jsonConvertTextToBlob(@p, nil);
+  CheckEqI('T266 conv err', rc, 1);
+
+  { malformed }
+  InitParseFromText(p, '{');
+  rc := jsonConvertTextToBlob(@p, nil);
+  CheckEqI('T267 conv malformed', rc, 1);
+end;
+
+procedure TestValidityCheck;
+var p: TJsonParse;
+begin
+  { Build [1,2,3] in JSONB then validate. }
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_ARRAY, 6, nil);
+  jsonBlobAppendNode(@p, JSONB_INT, 1, PAnsiChar('1'));
+  jsonBlobAppendNode(@p, JSONB_INT, 1, PAnsiChar('2'));
+  jsonBlobAppendNode(@p, JSONB_INT, 1, PAnsiChar('3'));
+  CheckEqI('T268 valid array',
+           jsonbValidityCheck(@p, 0, p.nBlob, 0), 0);
+  FreeParse(p);
+
+  { JSONB_TRUE has size 0; valid only if n+sz=1 i.e. single byte. }
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_TRUE, 0, nil);
+  CheckEqI('T269 valid true',
+           jsonbValidityCheck(@p, 0, p.nBlob, 0), 0);
+  FreeParse(p);
+
+  { Validate INT body: single digit. }
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_INT, 1, PAnsiChar('7'));
+  CheckEqI('T270 valid int',
+           jsonbValidityCheck(@p, 0, p.nBlob, 0), 0);
+  FreeParse(p);
+
+  { Bad INT: contains a non-digit. }
+  InitParse(p);
+  jsonBlobAppendNode(@p, JSONB_INT, 2, PAnsiChar('1x'));
+  CheckTrue('T271 invalid int',
+           jsonbValidityCheck(@p, 0, p.nBlob, 0) <> 0);
+  FreeParse(p);
+end;
+
+procedure TestIs4HexB;
+var op: i32;
+begin
+  op := JSONB_TEXT;
+  CheckEqI('T272 4hexB ok',  jsonIs4HexB('u00ab', op), 1);
+  CheckEqI('T273 4hexB op',  op, JSONB_TEXTJ);
+  op := JSONB_TEXT;
+  CheckEqI('T274 4hexB no-u', jsonIs4HexB('x00ab', op), 0);
+  CheckEqI('T275 4hexB op-unchanged', op, JSONB_TEXT);
+end;
+
+begin
+  WriteLn('=== TestJson — Phase 6.8.a/b/c/d JSON port ===');
   TestTypeNames;
   TestIsspace;
   TestSpacesString;
@@ -698,6 +953,17 @@ begin
   TestArrayCount;
   TestBlobEdit;
   TestAfterEditSizeAdjust;
+  TestBytesToBypass;
+  TestUnescapeOneChar;
+  TestLabelCompare;
+  TestTranslateLiterals;
+  TestTranslateNumber;
+  TestTranslateString;
+  TestTranslateArrayObject;
+  TestTranslateNested;
+  TestConvertTextToBlob;
+  TestValidityCheck;
+  TestIs4HexB;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);

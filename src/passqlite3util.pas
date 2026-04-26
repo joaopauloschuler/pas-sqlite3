@@ -692,6 +692,7 @@ function sqlite3_snprintf(n: i32; zBuf: PChar; zFormat: PChar): PChar; cdecl;
 
 { UTF utilities (utf.c) }
 function sqlite3Utf8Read(pIn: PPChar): u32;
+function sqlite3Utf8ReadLimited(z: Pu8; n: i32; out piOut: u32): i32;
 function sqlite3Utf8CharLen(z: PChar; nByte: i32): i32;
 function sqlite3AppendOneUtf8Character(zOut: PChar; v: u32): i32;
 
@@ -2339,6 +2340,25 @@ begin
   end;
   pIn^ := PChar(p);
   Result := c;
+end;
+
+function sqlite3Utf8ReadLimited(z: Pu8; n: i32; out piOut: u32): i32;
+var
+  c: u32;
+  i: i32;
+begin
+  i := 1;
+  c := z[0];
+  if c >= $c0 then begin
+    c := sqlite3Utf8Trans1[c - $c0];
+    if n > 4 then n := 4;
+    while (i < n) and ((z[i] and $c0) = $80) do begin
+      c := (c shl 6) + u32(z[i] and $3f);
+      Inc(i);
+    end;
+  end;
+  piOut := c;
+  Result := i;
 end;
 
 function sqlite3Utf8CharLen(z: PChar; nByte: i32): i32;
