@@ -1500,6 +1500,8 @@ const
   JT_LEFT    = $08;
   JT_RIGHT   = $10;
   JT_OUTER   = $20;
+  JT_LTORJ   = $40;  { LEFT operand on the LHS of a RIGHT JOIN
+                       (sqliteInt.h:3441) }
   JT_ERROR   = $80;
 
   { N_OR_COST (WhereOrSet.a[] capacity) }
@@ -5961,6 +5963,34 @@ begin
   begin
     whereInfoFree(db, pWInfo);
     Exit(nil);
+  end;
+
+  { The False-WHERE-Term-Bypass optimisation (where.c:6995..7036).
+    For each base WHERE term that is independent of the join (prereqAll==0),
+    is deterministic when there are tables in the FROM, and is not an
+    EP_InnerON term sitting on the LHS of a RIGHT/FULL OUTER join, emit code
+    that jumps straight to pWInfo^.iBreak when the term evaluates false.
+    Mark such terms TERM_CODED so the per-loop codegen does not emit them
+    again later.  Conditions (1)–(4) follow the C comment block 1:1. }
+  for ii := 0 to sWLB.pWC^.nBase - 1 do
+  begin
+    { pT — current term; pX — its expression. }
+    if (sWLB.pWC^.a[ii].wtFlags and TERM_VIRTUAL) <> 0 then
+      Continue;
+    Assert(sWLB.pWC^.a[ii].pExpr <> nil);
+    Assert((sWLB.pWC^.a[ii].prereqAll <> 0)
+           or (not ExprHasProperty(sWLB.pWC^.a[ii].pExpr, EP_OuterON)));
+    if (sWLB.pWC^.a[ii].prereqAll = 0)                   { (1) and (2) }
+       and ((nTabList = 0)
+            or (exprIsDeterministic(sWLB.pWC^.a[ii].pExpr) <> 0))   { (4) }
+       and (not (ExprHasProperty(sWLB.pWC^.a[ii].pExpr, EP_InnerON) { (3) }
+                 and ((SrcListItems(pTabList)[0].fg.jointype
+                       and JT_LTORJ) <> 0))) then
+    begin
+      sqlite3ExprIfFalse(pParse, sWLB.pWC^.a[ii].pExpr,
+                         pWInfo^.iBreak, SQLITE_JUMPIFNULL);
+      sWLB.pWC^.a[ii].wtFlags := sWLB.pWC^.a[ii].wtFlags or TERM_CODED;
+    end;
   end;
 
   { Planner core + per-loop codegen + epilogue land in the next 11g.2.b

@@ -74,8 +74,19 @@ remains `history.md`.  This file is the punch list.
       form; promote when 11g.2.e lands.  Note: TK_GT is named
       `TK_GT_TK` in this codebase (collision with a Pascal type) —
       future ports must use the `_TK` suffix for that single token.
-    - [ ] Port the False-WHERE-Term-Bypass loop in `sqlite3WhereBegin`
-      (where.c:6995..7036).
+    - [X] Port the False-WHERE-Term-Bypass loop in `sqlite3WhereBegin`
+      (where.c:6995..7036).  Done — codegen.pas, immediately after the
+      `pParse^.nErr` short-circuit inside the productive `sqlite3WhereBegin`
+      prologue.  Walks `sWLB.pWC^.a[0..nBase-1]`, applies the four
+      conditions verbatim (TERM_VIRTUAL skip, prereqAll==0 + deterministic
+      + (no EP_InnerON ∧ JT_LTORJ-on-LHS) check), emits the
+      `sqlite3ExprIfFalse(...,iBreak,SQLITE_JUMPIFNULL)` short-circuit
+      and tags hit terms TERM_CODED.  Required adding the missing
+      `JT_LTORJ = $40` constant alongside the other JT_* flags
+      (sqliteInt.h:3441).  No corpus delta yet — the prologue still
+      tears down and returns nil at the end; this only becomes
+      observable once the trimmed planner pick + OP_NotExists emission
+      lands in the next sub-bullet.
     - [ ] Implement the trimmed planner pick + `OP_NotExists` emission
       for the rowid-EQ shape (hard-code the cost selection; defer
       `whereLoopAddBtree` etc.).
