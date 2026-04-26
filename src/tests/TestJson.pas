@@ -1650,8 +1650,279 @@ begin
   if p.nBlobAlloc > 0 then sqlite3DbFree(Psqlite3db(p.db), p.aBlob);
 end;
 
+{ ----- Phase 6.8.h.2 — Simple scalar SQL functions ----- }
+
+procedure SetupIntValue(var v: TMem; iVal: i64);
 begin
-  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e/f/g/h.1 JSON port ===');
+  FillChar(v, SizeOf(v), 0);
+  v.u.i   := iVal;
+  v.flags := MEM_Int;
+end;
+
+procedure CallScalar1(proc: TxSFuncProc;
+  var ctx: Tsqlite3_context; var v: TMem);
+var
+  arr: array[0..0] of PMem;
+begin
+  arr[0] := @v;
+  proc(@ctx, 1, PPMem(@arr[0]));
+end;
+
+procedure CallScalar2(proc: TxSFuncProc;
+  var ctx: Tsqlite3_context; var v0, v1: TMem);
+var
+  arr: array[0..1] of PMem;
+begin
+  arr[0] := @v0;
+  arr[1] := @v1;
+  proc(@ctx, 2, PPMem(@arr[0]));
+end;
+
+procedure ClearAuxCache(var ctx: Tsqlite3_context);
+begin
+  sqlite3_set_auxdata(@ctx, JSON_CACHE_ID, nil, nil);
+end;
+
+procedure TestAllAlphanum;
+begin
+  CheckEqI('T377 allAlphanum empty=true',
+           jsonAllAlphanum(PAnsiChar(''), 0), 1);
+  CheckEqI('T378 allAlphanum letters',
+           jsonAllAlphanum(PAnsiChar('abcXYZ'), 6), 1);
+  CheckEqI('T379 allAlphanum letters+digits+underscore',
+           jsonAllAlphanum(PAnsiChar('a_1B'), 4), 1);
+  CheckEqI('T380 allAlphanum reject space',
+           jsonAllAlphanum(PAnsiChar('a b'), 3), 0);
+  CheckEqI('T381 allAlphanum reject dash',
+           jsonAllAlphanum(PAnsiChar('a-b'), 3), 0);
+end;
+
+procedure TestJsonQuote;
+var
+  ctx:  Tsqlite3_context;
+  vm:   TVdbe;
+  pOut: TMem;
+  v:    TMem;
+  zS:   AnsiString;
+begin
+  SetupCtx(ctx, vm, pOut);
+  zS := 'hi';
+  SetupTextValue(v, PAnsiChar(zS), Length(zS));
+  CallScalar1(@jsonQuoteFunc, ctx, v);
+  CheckEqS('T382 json_quote("hi") → quoted',
+           MemString(pOut), '"hi"');
+
+  SetupCtx(ctx, vm, pOut);
+  FillChar(v, SizeOf(v), 0); v.flags := MEM_Null;
+  CallScalar1(@jsonQuoteFunc, ctx, v);
+  CheckEqS('T383 json_quote(NULL) → "null"',
+           MemString(pOut), 'null');
+
+  SetupCtx(ctx, vm, pOut);
+  SetupIntValue(v, 42);
+  CallScalar1(@jsonQuoteFunc, ctx, v);
+  CheckEqS('T384 json_quote(42) → "42"',
+           MemString(pOut), '42');
+end;
+
+procedure TestJsonType;
+var
+  ctx:  Tsqlite3_context;
+  vm:   TVdbe;
+  pOut: TMem;
+  v, p: TMem;
+  zJ, zP: AnsiString;
+begin
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{"a":[1,true,null]}';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  CallScalar1(@jsonTypeFunc, ctx, v);
+  CheckEqS('T385 json_type(object) → "object"',
+           MemString(pOut), 'object');
+  ClearAuxCache(ctx);
+
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.a';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonTypeFunc, ctx, v, p);
+  CheckEqS('T386 json_type(obj, $.a) → "array"',
+           MemString(pOut), 'array');
+  ClearAuxCache(ctx);
+
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.a[1]';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonTypeFunc, ctx, v, p);
+  CheckEqS('T387 json_type(obj, $.a[1]) → "true"',
+           MemString(pOut), 'true');
+  ClearAuxCache(ctx);
+
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := 'a';  { missing leading $ → bad path }
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonTypeFunc, ctx, v, p);
+  CheckTrue('T388 json_type bad path sets error',
+            ctx.isError <> 0);
+  ClearAuxCache(ctx);
+end;
+
+procedure TestJsonArrayLength;
+var
+  ctx:  Tsqlite3_context;
+  vm:   TVdbe;
+  pOut: TMem;
+  v, p: TMem;
+  zJ, zP: AnsiString;
+begin
+  SetupCtx(ctx, vm, pOut);
+  zJ := '[1,2,3,4]';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  CallScalar1(@jsonArrayLengthFunc, ctx, v);
+  CheckEqI('T389 json_array_length([1..4]) = 4', pOut.u.i, 4);
+  ClearAuxCache(ctx);
+
+  SetupCtx(ctx, vm, pOut);
+  zJ := '[]';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  CallScalar1(@jsonArrayLengthFunc, ctx, v);
+  CheckEqI('T390 json_array_length([]) = 0', pOut.u.i, 0);
+  ClearAuxCache(ctx);
+
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{"x":1}';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  CallScalar1(@jsonArrayLengthFunc, ctx, v);
+  CheckEqI('T391 json_array_length(object) = 0', pOut.u.i, 0);
+  ClearAuxCache(ctx);
+
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{"a":[10,20,30]}';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zP := '$.a';
+  SetupTextValue(p, PAnsiChar(zP), Length(zP));
+  CallScalar2(@jsonArrayLengthFunc, ctx, v, p);
+  CheckEqI('T392 json_array_length(obj, $.a) = 3', pOut.u.i, 3);
+  ClearAuxCache(ctx);
+end;
+
+procedure TestJsonPretty;
+var
+  ctx:  Tsqlite3_context;
+  vm:   TVdbe;
+  pOut: TMem;
+  v, p: TMem;
+  zJ, zI: AnsiString;
+  s: AnsiString;
+begin
+  SetupCtx(ctx, vm, pOut);
+  zJ := '[1,2]';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  CallScalar1(@jsonPrettyFunc, ctx, v);
+  s := MemString(pOut);
+  CheckTrue('T393 json_pretty([1,2]) contains newline',
+            Pos(#10, s) > 0);
+  CheckTrue('T394 json_pretty([1,2]) contains 4-space indent',
+            Pos('    1', s) > 0);
+  ClearAuxCache(ctx);
+
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  zI := '..';
+  SetupTextValue(p, PAnsiChar(zI), Length(zI));
+  CallScalar2(@jsonPrettyFunc, ctx, v, p);
+  s := MemString(pOut);
+  CheckTrue('T395 json_pretty custom indent ".."',
+            Pos('..1', s) > 0);
+  ClearAuxCache(ctx);
+end;
+
+procedure TestJsonValid;
+var
+  ctx:  Tsqlite3_context;
+  vm:   TVdbe;
+  pOut: TMem;
+  v, f: TMem;
+  zJ:   AnsiString;
+begin
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{"a":1}';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  CallScalar1(@jsonValidFunc, ctx, v);
+  CheckEqI('T396 json_valid(good) = 1', pOut.u.i, 1);
+  ClearAuxCache(ctx);
+
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{a:1}';  { JSON5 — bareword key }
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  CallScalar1(@jsonValidFunc, ctx, v);
+  CheckEqI('T397 json_valid(JSON5, default flags=1) = 0',
+           pOut.u.i, 0);
+  ClearAuxCache(ctx);
+
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  SetupIntValue(f, 2);
+  CallScalar2(@jsonValidFunc, ctx, v, f);
+  CheckEqI('T398 json_valid(JSON5, flags=2) = 1',
+           pOut.u.i, 1);
+  ClearAuxCache(ctx);
+
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{garbage';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  CallScalar1(@jsonValidFunc, ctx, v);
+  CheckEqI('T399 json_valid(malformed) = 0', pOut.u.i, 0);
+  ClearAuxCache(ctx);
+
+  SetupCtx(ctx, vm, pOut);
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  SetupIntValue(f, 99);  { out of range }
+  CallScalar2(@jsonValidFunc, ctx, v, f);
+  CheckTrue('T400 json_valid out-of-range flags → error',
+            ctx.isError <> 0);
+  ClearAuxCache(ctx);
+
+  SetupCtx(ctx, vm, pOut);
+  FillChar(v, SizeOf(v), 0); v.flags := MEM_Null;
+  CallScalar1(@jsonValidFunc, ctx, v);
+  CheckTrue('T401 json_valid(NULL) → no result set (NULL passthrough)',
+            (pOut.flags = 0) and (ctx.isError = 0));
+  ClearAuxCache(ctx);
+end;
+
+procedure TestJsonErrorPosition;
+var
+  ctx:  Tsqlite3_context;
+  vm:   TVdbe;
+  pOut: TMem;
+  v:    TMem;
+  zJ:   AnsiString;
+begin
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{"a":1}';
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  CallScalar1(@jsonErrorFunc, ctx, v);
+  CheckEqI('T402 json_error_position(good) = 0', pOut.u.i, 0);
+
+  SetupCtx(ctx, vm, pOut);
+  zJ := '{"a":x}';  { byte 6 (1-based) is the bad char }
+  SetupTextValue(v, PAnsiChar(zJ), Length(zJ));
+  CallScalar1(@jsonErrorFunc, ctx, v);
+  CheckTrue('T403 json_error_position(bad) > 0',
+            pOut.u.i > 0);
+
+  SetupCtx(ctx, vm, pOut);
+  FillChar(v, SizeOf(v), 0); v.flags := MEM_Null;
+  CallScalar1(@jsonErrorFunc, ctx, v);
+  CheckTrue('T404 json_error_position(NULL) → no result set',
+            (pOut.flags = 0) and (ctx.isError = 0));
+end;
+
+begin
+  WriteLn('=== TestJson — Phase 6.8.a/b/c/d/e/f/g/h.1/h.2 JSON port ===');
   TestTypeNames;
   TestIsspace;
   TestSpacesString;
@@ -1716,6 +1987,13 @@ begin
   TestWrongNumArgs;
   TestBadPathError;
   TestFunctionArgToBlob;
+  TestAllAlphanum;
+  TestJsonQuote;
+  TestJsonType;
+  TestJsonArrayLength;
+  TestJsonPretty;
+  TestJsonValid;
+  TestJsonErrorPosition;
   WriteLn;
   WriteLn('=== Total: ', gPass, ' pass, ', gFail, ' fail ===');
   if gFail > 0 then Halt(1);

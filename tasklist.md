@@ -3884,12 +3884,31 @@ reference exactly.
       currently always copies via SQLITE_TRANSIENT (correct, just
       one extra copy).  Float formatter uses RTL `FloatToStr`
       pending json-flavour `jsonPrintf` (see notes).
-    - [ ] **6.8.h.2** Simple scalar SQL functions — `json_quote`,
+    - [X] **6.8.h.2** Simple scalar SQL functions — `json_quote`,
       `json_type`, `json_valid`, `json_error_position`,
       `json_array_length`, `json_pretty` (delegates to
       `jsonTranslateBlobToPrettyText` from 6.8.e).  All small
       bodies; the JSON-text dispatch is `jsonReturnParse` from .h.1.
       Plus `jsonAllAlphanum` helper (json.c:4044).
+      DONE 2026-04-26.  Gate `TestJson.pas` 403/403 PASS (was
+      375/375).  Cdecl SQL-function entry points `jsonQuoteFunc`,
+      `jsonArrayLengthFunc`, `jsonTypeFunc`, `jsonPrettyFunc`,
+      `jsonValidFunc`, `jsonErrorFunc` exported with `TxSFuncProc`
+      shape so 6.8.h.6 can drop them straight into `TFuncDef` tables.
+      `passqlite3vdbe` promoted to interface-uses of `passqlite3json`
+      (was implementation-only) so `Psqlite3_context` / `PPMem` can
+      type the cdecl signatures; existing Pointer-typed h.1 helpers
+      kept as-is to avoid churn.  NULL-input branches of `json_valid`
+      / `json_error_position` rely on the SQL convention that an
+      uninitialised `pOut` Mem is implicitly NULL — they intentionally
+      issue no `sqlite3_result_*` call (matches C).
+      `json_valid(JSON, FLAGS)` text-fallthrough path duplicated in
+      both BLOB and default cases (mirrors C's `deliberate_fall_through`
+      by inlining the helper).  `json_pretty` default indent is the
+      4-space string `'    '` (PostgreSQL-compatible, identical to C).
+      Cache leak across tests handled by calling
+      `sqlite3_set_auxdata(@ctx, JSON_CACHE_ID, nil, nil)` between
+      cases — same pattern as T353 in 6.8.g.
     - [ ] **6.8.h.3** Path-driven scalars — `json_extract`,
       `json_set`, `json_replace`, `json_insert`, `json_remove`,
       `json_patch`.  Drives `jsonLookupStep` (6.8.f) +

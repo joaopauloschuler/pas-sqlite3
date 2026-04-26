@@ -45,7 +45,8 @@ interface
 uses
   passqlite3types,
   passqlite3os,
-  passqlite3util;
+  passqlite3util,
+  passqlite3vdbe;
 
 { ===========================================================================
   Constants
@@ -542,11 +543,36 @@ function  jsonBadPathError(pCtx: Pointer; zPath: PAnsiChar; rc: i32): PAnsiChar;
 function  jsonFunctionArgToBlob(pCtx: Pointer; pArg: Pointer;
                                 pParse: PJsonParse): i32;
 
+{ ===========================================================================
+  Simple scalar SQL functions (Phase 6.8.h.2)
+
+  Faithful port of the body-only json.c routines:
+    json.c:3960 jsonQuoteFunc        — json_quote(VALUE)
+    json.c:4005 jsonArrayLengthFunc  — json_array_length(JSON [, PATH])
+    json.c:4044 jsonAllAlphanum      — internal helper used by .h.3
+    json.c:4573 jsonTypeFunc         — json_type(JSON [, PATH])
+    json.c:4618 jsonPrettyFunc       — json_pretty(JSON [, INDENT])
+    json.c:4699 jsonValidFunc        — json_valid(JSON [, FLAGS])
+    json.c:4781 jsonErrorFunc        — json_error_position(JSON)
+
+  Signatures match TxSFuncProc (cdecl) so .h.6 can drop them straight into
+  TFuncDef tables.  Tests in TestJson.pas call them directly on a stack
+  Tsqlite3_context with a TVdbe-backed pOut Mem; no DB engine required.
+  =========================================================================== }
+
+function  jsonAllAlphanum(z: PAnsiChar; n: i32): i32;
+procedure jsonQuoteFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+procedure jsonArrayLengthFunc(pCtx: Psqlite3_context; argc: i32;
+                              argv: PPMem); cdecl;
+procedure jsonTypeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+procedure jsonPrettyFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+procedure jsonValidFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+procedure jsonErrorFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+
 implementation
 
 uses
-  SysUtils,
-  passqlite3vdbe;
+  SysUtils;
 
 function jsonIsspace(c: AnsiChar): i32; inline;
 begin
@@ -3980,6 +4006,273 @@ begin
   end
   else
     Result := 0;
+end;
+
+{ ===========================================================================
+  Phase 6.8.h.2 — Simple scalar SQL functions
+  =========================================================================== }
+
+{ json.c:4044 — true if z[0..n-1] is alphanumeric or underscores. }
+function jsonAllAlphanum(z: PAnsiChar; n: i32): i32;
+var
+  i: i32;
+begin
+  i := 0;
+  while (i < n) and ((sqlite3Isalnum(u8(z[i])) <> 0) or (z[i] = '_')) do
+    Inc(i);
+  if i = n then Result := 1 else Result := 0;
+end;
+
+{ json.c:3960 — json_quote(VALUE).  Render any SQL value as JSON. }
+procedure jsonQuoteFunc(pCtx: Psqlite3_context; argc: i32;
+                        argv: PPMem); cdecl;
+var
+  jx: TJsonString;
+begin
+  if argc < 1 then Exit;
+  jsonStringInit(@jx, pCtx);
+  jsonAppendSqlValue(@jx, argv[0]);
+  jsonReturnString(@jx, nil, nil);
+  sqlite3_result_subtype(pCtx, JSON_SUBTYPE);
+end;
+
+{ json.c:4005 — json_array_length(JSON [, PATH]).  Element count of the
+  top-level array (or array at PATH); 0 if input is not an array. }
+procedure jsonArrayLengthFunc(pCtx: Psqlite3_context; argc: i32;
+                              argv: PPMem); cdecl;
+var
+  p:    PJsonParse;
+  cnt:  i64;
+  i:    u32;
+  eErr: u8;
+  zPath: PAnsiChar;
+begin
+  cnt  := 0;
+  eErr := 0;
+  p := jsonParseFuncArg(pCtx, argv[0], 0);
+  if p = nil then Exit;
+  if argc = 2 then
+  begin
+    zPath := PAnsiChar(sqlite3_value_text(argv[1]));
+    if zPath = nil then begin jsonParseFree(p); Exit; end;
+    if zPath[0] = '$' then
+      i := jsonLookupStep(p, 0, zPath + 1, 0)
+    else
+      i := jsonLookupStep(p, 0, PAnsiChar('@'), 0);
+    if jsonLookupIsError(i) then
+    begin
+      if i <> JSON_LOOKUP_NOTFOUND then
+        jsonBadPathError(pCtx, zPath, i32(i));
+      eErr := 1;
+      i := 0;
+    end;
+  end
+  else
+    i := 0;
+  if (p^.aBlob[i] and $0F) = JSONB_ARRAY then
+    cnt := i64(jsonbArrayCount(p, i));
+  if eErr = 0 then
+    sqlite3_result_int64(pCtx, cnt);
+  jsonParseFree(p);
+end;
+
+{ json.c:4573 — json_type(JSON [, PATH]).  Return JSON-type name. }
+procedure jsonTypeFunc(pCtx: Psqlite3_context; argc: i32;
+                       argv: PPMem); cdecl;
+label
+  json_type_done;
+var
+  p:     PJsonParse;
+  zPath: PAnsiChar;
+  i:     u32;
+begin
+  p := jsonParseFuncArg(pCtx, argv[0], 0);
+  if p = nil then Exit;
+  if argc = 2 then
+  begin
+    zPath := PAnsiChar(sqlite3_value_text(argv[1]));
+    if zPath = nil then goto json_type_done;
+    if zPath[0] <> '$' then
+    begin
+      jsonBadPathError(pCtx, zPath, 0);
+      goto json_type_done;
+    end;
+    i := jsonLookupStep(p, 0, zPath + 1, 0);
+    if jsonLookupIsError(i) then
+    begin
+      if i <> JSON_LOOKUP_NOTFOUND then
+        jsonBadPathError(pCtx, zPath, i32(i));
+      goto json_type_done;
+    end;
+  end
+  else
+    i := 0;
+  sqlite3_result_text(pCtx, jsonbType[p^.aBlob[i] and $0F], -1, SQLITE_STATIC);
+json_type_done:
+  jsonParseFree(p);
+end;
+
+{ json.c:4618 — json_pretty(JSON [, INDENT]).  Pretty-printed text rendering. }
+procedure jsonPrettyFunc(pCtx: Psqlite3_context; argc: i32;
+                         argv: PPMem); cdecl;
+var
+  s: TJsonString;
+  x: TJsonPretty;
+begin
+  FillChar(x, SizeOf(x), 0);
+  x.pParse := jsonParseFuncArg(pCtx, argv[0], 0);
+  if x.pParse = nil then Exit;
+  x.pOut := @s;
+  jsonStringInit(@s, pCtx);
+  if argc = 1 then
+  begin
+    x.zIndent  := PAnsiChar('    ');
+    x.szIndent := 4;
+  end
+  else
+  begin
+    x.zIndent := PAnsiChar(sqlite3_value_text(argv[1]));
+    if x.zIndent = nil then
+    begin
+      x.zIndent  := PAnsiChar('    ');
+      x.szIndent := 4;
+    end
+    else
+      x.szIndent := u32(StrLen(x.zIndent));
+  end;
+  jsonTranslateBlobToPrettyText(@x, 0);
+  jsonReturnString(@s, nil, nil);
+  jsonParseFree(x.pParse);
+end;
+
+{ json.c:4699 — json_valid(JSON [, FLAGS]).  Return 1 if JSON is well-formed. }
+procedure jsonValidFunc(pCtx: Psqlite3_context; argc: i32;
+                        argv: PPMem); cdecl;
+var
+  p:     PJsonParse;
+  flags: u8;
+  res:   u8;
+  f:     i64;
+  py:    TJsonParse;
+begin
+  flags := 1;
+  res   := 0;
+  if argc = 2 then
+  begin
+    f := sqlite3_value_int64(argv[1]);
+    if (f < 1) or (f > 15) then
+    begin
+      sqlite3_result_error(pCtx,
+        PAnsiChar('FLAGS parameter to json_valid() must be between 1 and 15'),
+        -1);
+      Exit;
+    end;
+    flags := u8(f and $0F);
+  end;
+  case sqlite3_value_type(argv[0]) of
+    SQLITE_NULL:
+      Exit;
+    SQLITE_BLOB:
+      begin
+        FillChar(py, SizeOf(py), 0);
+        if jsonArgIsJsonb(argv[0], @py) <> 0 then
+        begin
+          if (flags and $04) <> 0 then
+            res := 1
+          else if (flags and $08) <> 0 then
+          begin
+            if jsonbValidityCheck(@py, 0, py.nBlob, 1) = 0 then
+              res := 1;
+          end;
+          sqlite3_result_int(pCtx, res);
+          Exit;
+        end;
+        { Fall through into text interpretation. }
+        if (flags and $03) = 0 then
+        begin
+          sqlite3_result_int(pCtx, 0);
+          Exit;
+        end;
+        p := jsonParseFuncArg(pCtx, argv[0], JSON_KEEPERROR);
+        if p <> nil then
+        begin
+          if p^.oom <> 0 then
+            sqlite3_result_error_nomem(pCtx)
+          else if p^.nErr = 0 then
+            if ((flags and $02) <> 0) or (p^.hasNonstd = 0) then
+              res := 1;
+          jsonParseFree(p);
+        end
+        else
+          sqlite3_result_error_nomem(pCtx);
+      end;
+  else
+    begin
+      if (flags and $03) = 0 then
+      begin
+        sqlite3_result_int(pCtx, 0);
+        Exit;
+      end;
+      p := jsonParseFuncArg(pCtx, argv[0], JSON_KEEPERROR);
+      if p <> nil then
+      begin
+        if p^.oom <> 0 then
+          sqlite3_result_error_nomem(pCtx)
+        else if p^.nErr = 0 then
+          if ((flags and $02) <> 0) or (p^.hasNonstd = 0) then
+            res := 1;
+        jsonParseFree(p);
+      end
+      else
+        sqlite3_result_error_nomem(pCtx);
+    end;
+  end;
+  sqlite3_result_int(pCtx, res);
+end;
+
+{ json.c:4781 — json_error_position(JSON).  1-based offset of first parse
+  error, 0 if JSON is well-formed, NULL on NULL input. }
+procedure jsonErrorFunc(pCtx: Psqlite3_context; argc: i32;
+                        argv: PPMem); cdecl;
+var
+  iErrPos: i64;
+  s:       TJsonParse;
+  k:       u32;
+begin
+  if argc <> 1 then Exit;
+  iErrPos := 0;
+  FillChar(s, SizeOf(s), 0);
+  s.db := sqlite3_context_db_handle(pCtx);
+  if jsonArgIsJsonb(argv[0], @s) <> 0 then
+    iErrPos := i64(jsonbValidityCheck(@s, 0, s.nBlob, 1))
+  else
+  begin
+    s.zJson := PAnsiChar(sqlite3_value_text(argv[0]));
+    if s.zJson = nil then Exit;  { NULL input or OOM }
+    s.nJson := sqlite3_value_bytes(argv[0]);
+    if jsonConvertTextToBlob(@s, nil) <> 0 then
+    begin
+      if s.oom <> 0 then
+        iErrPos := -1
+      else
+      begin
+        { Convert byte-offset s.iErr into a character offset (count
+          non-continuation UTF-8 bytes up to s.iErr). }
+        k := 0;
+        while (k < s.iErr) and (s.zJson[k] <> #0) do
+        begin
+          if (Byte(s.zJson[k]) and $C0) <> $80 then Inc(iErrPos);
+          Inc(k);
+        end;
+        Inc(iErrPos);
+      end;
+    end;
+  end;
+  jsonParseReset(@s);
+  if iErrPos < 0 then
+    sqlite3_result_error_nomem(pCtx)
+  else
+    sqlite3_result_int64(pCtx, iErrPos);
 end;
 
 end.
