@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 372;
+  N_CORPUS = 432;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -494,6 +494,70 @@ begin
   Add(i, 'CREATE TABLE z20 2col',       'CREATE TABLE z20(p,q);');               Inc(i);
   Add(i, 'CREATE TABLE z21 INT col',    'CREATE TABLE z21(n INTEGER);');         Inc(i);
   Add(i, 'CREATE INDEX i_t_b',          'CREATE INDEX i_t_b ON t(b);');          Inc(i);
+
+  { Probe sweep #15 — candidate rows. }
+  Add(i, 'SELECT 4+5',                  'SELECT 4+5;');                          Inc(i);
+  Add(i, 'SELECT 9-4',                  'SELECT 9-4;');                          Inc(i);
+  Add(i, 'SELECT 8*9',                  'SELECT 8*9;');                          Inc(i);
+  Add(i, 'SELECT 16/4',                 'SELECT 16/4;');                         Inc(i);
+  Add(i, 'SELECT 9%4',                  'SELECT 9%4;');                          Inc(i);
+  Add(i, 'SELECT b+0',                  'SELECT b+0 FROM t;');                   Inc(i);
+  Add(i, 'SELECT c+0',                  'SELECT c+0 FROM t;');                   Inc(i);
+  Add(i, 'SELECT b*1',                  'SELECT b*1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT c*1',                  'SELECT c*1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT 3*b',                  'SELECT 3*b FROM t;');                   Inc(i);
+  Add(i, 'SELECT 4-c',                  'SELECT 4-c FROM t;');                   Inc(i);
+  Add(i, 'SELECT b-1',                  'SELECT b-1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT c-1',                  'SELECT c-1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT b+1',                  'SELECT b+1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT c+1',                  'SELECT c+1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT col WHERE rowid=20',   'SELECT a FROM t WHERE rowid=20;');      Inc(i);
+  Add(i, 'SELECT col WHERE rowid=50',   'SELECT a FROM t WHERE rowid=50;');      Inc(i);
+  Add(i, 'SELECT col WHERE rowid=999',  'SELECT a FROM t WHERE rowid=999;');     Inc(i);
+  Add(i, 'SELECT b WHERE rowid=5',      'SELECT b FROM t WHERE rowid=5;');       Inc(i);
+  Add(i, 'SELECT c WHERE rowid=5',      'SELECT c FROM t WHERE rowid=5;');       Inc(i);
+  Add(i, 'INSERT t 7 8 9',              'INSERT INTO t VALUES(7,8,9);');         Inc(i);
+  Add(i, 'INSERT t 11 22 33',           'INSERT INTO t VALUES(11,22,33);');      Inc(i);
+  Add(i, 'INSERT alt 100 0 0',          'INSERT INTO s VALUES(100,0,0);');       Inc(i);
+  Add(i, 'INSERT alt big neg',          'INSERT INTO s VALUES(-100,-200,-300);');Inc(i);
+  Add(i, 'SAVEPOINT spG',               'SAVEPOINT spG;');                       Inc(i);
+  Add(i, 'RELEASE spG',                 'RELEASE spG;');                         Inc(i);
+  Add(i, 'SAVEPOINT three',             'SAVEPOINT three;');                     Inc(i);
+  Add(i, 'RELEASE three',               'RELEASE three;');                       Inc(i);
+  Add(i, 'CREATE TABLE z22 simple',     'CREATE TABLE z22(p);');                 Inc(i);
+  Add(i, 'CREATE INDEX i_t_a2',         'CREATE INDEX i_t_a2 ON t(a);');         Inc(i);
+
+  { Probe sweep #16 — candidate rows. }
+  Add(i, 'SELECT 12+13',                'SELECT 12+13;');                        Inc(i);
+  Add(i, 'SELECT 50-25',                'SELECT 50-25;');                        Inc(i);
+  Add(i, 'SELECT 11*11',                'SELECT 11*11;');                        Inc(i);
+  Add(i, 'SELECT 99/3',                 'SELECT 99/3;');                         Inc(i);
+  Add(i, 'SELECT 10%3',                 'SELECT 10%3;');                         Inc(i);
+  Add(i, 'SELECT a+2',                  'SELECT a+2 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a-2',                  'SELECT a-2 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a*3',                  'SELECT a*3 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a/2',                  'SELECT a/2 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a%3',                  'SELECT a%3 FROM t;');                   Inc(i);
+  Add(i, 'SELECT b+2',                  'SELECT b+2 FROM t;');                   Inc(i);
+  Add(i, 'SELECT b-2',                  'SELECT b-2 FROM t;');                   Inc(i);
+  Add(i, 'SELECT b*2',                  'SELECT b*2 FROM t;');                   Inc(i);
+  Add(i, 'SELECT b/2',                  'SELECT b/2 FROM t;');                   Inc(i);
+  Add(i, 'SELECT c+2',                  'SELECT c+2 FROM t;');                   Inc(i);
+  Add(i, 'SELECT c-2',                  'SELECT c-2 FROM t;');                   Inc(i);
+  Add(i, 'SELECT c*2',                  'SELECT c*2 FROM t;');                   Inc(i);
+  Add(i, 'SELECT col WHERE rowid=4',    'SELECT a FROM t WHERE rowid=4;');       Inc(i);
+  Add(i, 'SELECT col WHERE rowid=6',    'SELECT a FROM t WHERE rowid=6;');       Inc(i);
+  Add(i, 'SELECT col WHERE rowid=7',    'SELECT a FROM t WHERE rowid=7;');       Inc(i);
+  Add(i, 'SELECT col WHERE rowid=8',    'SELECT a FROM t WHERE rowid=8;');       Inc(i);
+  Add(i, 'SELECT col WHERE rowid=9',    'SELECT a FROM t WHERE rowid=9;');       Inc(i);
+  Add(i, 'INSERT t neg',                'INSERT INTO t VALUES(-5,-6,-7);');      Inc(i);
+  Add(i, 'INSERT t big',                'INSERT INTO t VALUES(99999,1,1);');     Inc(i);
+  Add(i, 'INSERT alt 50 50 50',         'INSERT INTO s VALUES(50,50,50);');      Inc(i);
+  Add(i, 'SAVEPOINT spH',               'SAVEPOINT spH;');                       Inc(i);
+  Add(i, 'RELEASE spH',                 'RELEASE spH;');                         Inc(i);
+  Add(i, 'SAVEPOINT four',              'SAVEPOINT four;');                      Inc(i);
+  Add(i, 'CREATE TABLE z23 simple',     'CREATE TABLE z23(p,q);');               Inc(i);
+  Add(i, 'CREATE INDEX i_s_x2',         'CREATE INDEX i_s_x2 ON s(x);');         Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
