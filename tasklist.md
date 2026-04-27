@@ -140,7 +140,7 @@ Important: At the end of this document, please find:
           `sqlite3_prepare_v2` returned SQLITE_ERROR with a nil stmt.
           New corpus row added: PASS at 5 ops.
   
-  [ ] **6.10** Drop Table - DIVERGE rows + delta = (C ops − Pas ops):
+  [ ] **6.11** Drop Table - DIVERGE rows + delta = (C ops − Pas ops):
 
   - DROP TABLE — Δ=21 (step 4)
 
