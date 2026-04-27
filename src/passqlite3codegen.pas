@@ -4595,6 +4595,8 @@ var
   casePTest:     PExpr;
   casePDel:      PExpr;
   caseDb:        PTsqlite3;
+  { TK_UMINUS runtime-path temp }
+  tempX:         TExpr;
 begin
   Result := target;
   v := pParse^.pVdbe;
@@ -5005,6 +5007,41 @@ begin
             sqlite3VdbeChangeP5(v, 1);
           sqlite3VdbeResolveLabel(v, caseEndLabel);
           done := True;
+        end;
+      TK_UMINUS:
+        begin
+          { Faithful port of expr.c:5253..5275.
+            Constant-fold: TK_INTEGER → codeInteger(negFlag=1); TK_FLOAT →
+            codeReal(negFlag=1).  Runtime path: emit 0 into a temp via a
+            scratch TK_INTEGER node, code pLeft into another temp, then
+            OP_Subtract(r2, r1, target) which computes target := r1 - r2
+            = 0 - pLeft. }
+          pLeft := pExpr^.pLeft;
+          Assert(pLeft <> nil);
+          if pLeft^.op = TK_INTEGER then
+          begin
+            codeInteger(pParse, pLeft, 1, target);
+            done := True;
+          end else if pLeft^.op = TK_FLOAT then
+          begin
+            Assert(not ExprHasProperty(pExpr, EP_IntValue));
+            codeReal(v, pLeft^.u.zToken, 1, target);
+            done := True;
+          end else
+          begin
+            FillChar(tempX, SizeOf(TExpr), 0);
+            tempX.op       := TK_INTEGER;
+            tempX.flags    := EP_IntValue or EP_TokenOnly;
+            tempX.u.iValue := 0;
+            r1 := sqlite3ExprCodeTemp(pParse, @tempX, @regFree1);
+            r2 := sqlite3ExprCodeTemp(pParse, pLeft,  @regFree2);
+            sqlite3VdbeAddOp3(v, OP_Subtract, r2, r1, target);
+            if regFree1 <> 0 then
+            begin sqlite3ReleaseTempReg(pParse, regFree1); regFree1 := 0; end;
+            if regFree2 <> 0 then
+            begin sqlite3ReleaseTempReg(pParse, regFree2); regFree2 := 0; end;
+            done := True;
+          end;
         end;
     else
       { TODO(Phase 6.9-bis): TK_AGG_COLUMN, TK_AND/TK_OR,
@@ -6483,6 +6520,32 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     begin
       if (pE^.flags and EP_xIsSelect) = 0 then
         ResolveExprList(pE^.x.pList);
+    end;
+    { Phase 6.9-bis 11g.2.f sub-progress 36b — TK_IS / TK_ISNOT + TK_TRUEFALSE
+      → TK_TRUTH rewrite.  Mirrors resolve.c:1403..1415: after child nodes are
+      resolved, if a TK_IS or TK_ISNOT node has a TK_TRUEFALSE right operand
+      (e.g. "a IS TRUE", "a IS NOT FALSE"), rewrite in place to TK_TRUTH with
+      op2 preserving the original operator.  Without this rewrite the TK_IS arm
+      of sqlite3ExprCodeTarget / sqlite3ExprIfFalse / sqlite3ExprIfTrue fires
+      instead of TK_TRUTH, producing a NULLEQ comparison path (extra ops) rather
+      than the OP_If/OP_IfNot fast path that C emits.
+
+      Note: the right operand may still be TK_ID "true"/"false" at this point
+      because our minimal ResolveExpr only rewrites TK_ID column references.
+      Mirror C's resolveExprStep: call sqlite3ExprIdToTrueFalse on pRight first,
+      then test for TK_TRUEFALSE. }
+    if (pE^.op = TK_IS) or (pE^.op = TK_ISNOT) then
+    begin
+      if pE^.pRight <> nil then
+      begin
+        if pE^.pRight^.op = TK_ID then
+          sqlite3ExprIdToTrueFalse(pE^.pRight);
+        if sqlite3ExprSkipCollateAndLikely(pE^.pRight)^.op = TK_TRUEFALSE then
+        begin
+          pE^.op2 := pE^.op;
+          pE^.op  := TK_TRUTH;
+        end;
+      end;
     end;
     { Phase 6.9-bis 11g.2.f sub-progress 30 — stamp EP_Unlikely on
       TK_FUNCTION nodes whose registered definition carries SQLITE_FUNC_UNLIKELY.

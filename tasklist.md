@@ -3720,10 +3720,46 @@ Important: At the end of this document, please find:
           84/84, TestWherePlanner 675/675, TestExplainParity 2/10,
           TestVdbeArith 41/41, TestJson 434/434.
 
-      Sub-progress 36 options: (i) port the column-variable TK_UMINUS
-      runtime arm; (ii) special-case TK_TRUEFALSE in TK_IS to use
-      OP_IfNot p3=1; (iii) corpus expansion group #7;
-      (iv) begin 11g.2.d multi-table planner.
+    - [X] Sub-progress 36 — TK_UMINUS column-variable runtime arm +
+      TK_IS/TK_TRUEFALSE → TK_TRUTH resolver rewrite (2026-04-27).
+      Two parallel landings merged:
+
+      (a) **TK_UMINUS runtime path** (codegen.pas
+      `sqlite3ExprCodeTarget`).  Ported expr.c:5253..5275:
+      constant-fold short-circuit kept (TK_INTEGER → codeInteger
+      negFlag=1; TK_FLOAT → codeReal negFlag=1); runtime arm
+      synthesises a scratch `tempX` TK_INTEGER node with iValue=0,
+      codes both into temp regs, emits `OP_Subtract(r2, r1, target)`
+      so `target := 0 - pLeft`.  UMINUS now emits the expected 14-op
+      shape.
+
+      (b) **TK_IS/TK_TRUEFALSE → TK_TRUTH resolver rewrite**
+      (codegen.pas `ResolveExpr` inside
+      `sqlite3ResolveSelectNames`).  Mirrors resolve.c:1403..1415:
+      after children resolve, when the node is TK_IS/TK_ISNOT and
+      the RHS is TK_ID `true`/`false`, call
+      `sqlite3ExprIdToTrueFalse` to retag as TK_TRUEFALSE; if RHS is
+      now TK_TRUEFALSE, rewrite in place to TK_TRUTH (saving the
+      original op in op2).  The existing TK_TRUTH codegen path then
+      emits `OP_IfNot p3=1` instead of materialising TRUE as integer
+      1 + OP_Ne.
+
+      Test-suite delta:
+        * TestWhereCorpus: **72 PASS / 4 DIVERGE / 0 ERROR (corpus = 76)**.
+          UMINUS and IS_TRUE both DIVERGE → PASS.  Remaining 4
+          DIVERGEs (LEFT_JOIN, JOIN_WHERE, EXISTS_SUB, NOT_EXISTS)
+          unchanged — all blocked on 11g.2.d.
+        * No regression: TestParser 45/45, TestExprBasic 40/40,
+          TestSelectBasic 49/49, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestPrepareBasic 20/20, TestWhereBasic 52/52,
+          TestWhereSimple 44/44, TestWhereExpr 84/84, TestWherePlanner
+          675/675, TestVdbeArith 41/41, TestJson 434/434.
+
+      All single-table corpus DIVERGEs are now resolved.  Remaining
+      DIVERGEs all require 11g.2.d (multi-table planner / correlated
+      subquery codegen).  Sub-progress 37 options: (i) corpus
+      expansion group #7 — discover more single-table gaps;
+      (ii) begin 11g.2.d planner work.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
