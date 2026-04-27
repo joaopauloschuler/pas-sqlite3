@@ -2055,6 +2055,206 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- whereLoopAddBtree (where.c:4003..4309) -----
+  Drives the per-table planner factory directly with hand-built records.
+  Exercises:
+    WLAB1: empty WC, table with no real indices and no auto-index flag
+           → exactly one WHERE_IPK template loop inserted via the
+             synthesized fake IPK index (rRun = nRowLogEst+16).
+    WLAB2: same shape with notIndexed bit lit on the SrcItem → still the
+           one synthetic IPK loop (real-index chain ignored anyway).
+    WLAB3: WITHOUT ROWID table (HasRowid=false) with no real indices →
+           pProbe = pTab^.pIndex = nil so the per-index loop never
+           runs; auto-index path also disabled (no AutoIndex flag) →
+           zero loops inserted, rc = OK.
+    WLAB4: HasRowid + auto-index ENABLED + a single rowid-EQ WHERE term →
+           termCanDriveIndex rejects (it's an EQ on the rowid column,
+           but its column is the ROWID alias — auto-index synthesis
+           still runs because termCanDriveIndex passes for any EQ on
+           a column of pSrc, including rowid).  The IPK probe also
+           inserts.  We assert at least one WHERE_AUTO_INDEX loop and
+           at least one WHERE_IPK loop, and both share the same iTab. }
+
+procedure TestWhereLoopAddBtree;
+const
+  iCur = 9;
+type
+  TSrcListBuf2 = record
+    hdr:  TSrcList;
+    item: TSrcItem;
+  end;
+var
+  db:        PTsqlite3;
+  rc:        i32;
+  parse:     TParse;
+  wInfoBuf:  array[0..1023] of u8;
+  pWInfo:    PWhereInfo;
+  bld:       TWhereLoopBuilder;
+  pNew:      TWhereLoop;
+  tab:       TTable;
+  src:       TSrcListBuf2;
+  p:         PWhereLoop;
+  nLoops, nIpk, nAuto: i32;
+  lhs, rhs, top: TExpr;
+  pT:        PWhereTerm;
+
+  procedure ResetLoops;
+  begin
+    while pWInfo^.pLoops <> nil do
+    begin
+      p := pWInfo^.pLoops;
+      pWInfo^.pLoops := p^.pNextLoop;
+      whereLoopDelete(db, p);
+    end;
+    pWInfo^.sWC.nTerm := 0;
+    FillChar(pWInfo^.sWC.aStatic, SizeOf(pWInfo^.sWC.aStatic), 0);
+    bld.iPlanLimit := 100;
+    bld.bldFlags1  := 0;
+    pNew.wsFlags   := 0;
+    pNew.nLTerm    := 0;
+    pNew.u.btree.nEq := 0;
+    pNew.u.btree.nBtm := 0;
+    pNew.u.btree.nTop := 0;
+    pNew.nSkip     := 0;
+    pNew.prereq    := 0;
+    pNew.nOut      := 0;
+    pNew.rRun      := 0;
+    pNew.rSetup    := 0;
+    pNew.iTab      := 0;
+    pNew.maskSelf  := 1;
+    pNew.u.btree.pIndex := nil;
+  end;
+
+  procedure CountLoops;
+  begin
+    nLoops := 0; nIpk := 0; nAuto := 0;
+    p := pWInfo^.pLoops;
+    while p <> nil do
+    begin
+      Inc(nLoops);
+      if (p^.wsFlags and WHERE_IPK)        <> 0 then Inc(nIpk);
+      if (p^.wsFlags and WHERE_AUTO_INDEX) <> 0 then Inc(nAuto);
+      p := p^.pNextLoop;
+    end;
+  end;
+
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('WLAB open',                         rc = SQLITE_OK);
+  { Default db^.flags does NOT carry SQLITE_AutoIndex; tests that need
+    auto-index synthesis flip it explicitly. }
+
+  FillChar(parse,    SizeOf(parse),    0);   parse.db := db;
+  FillChar(wInfoBuf, SizeOf(wInfoBuf), 0);
+  pWInfo := PWhereInfo(@wInfoBuf[0]);
+  pWInfo^.pParse := @parse;
+
+  FillChar(tab, SizeOf(tab), 0);
+  tab.szTabRow   := 1;
+  tab.iPKey      := -1;
+  tab.nRowLogEst := 50;       { ~32 rows (LogEst) }
+  { tabFlags = 0 → HasRowid = true (no TF_WithoutRowid bit). }
+
+  FillChar(src, SizeOf(src), 0);
+  src.hdr.nSrc       := 1;
+  src.item.iCursor   := iCur;
+  src.item.pSTab     := @tab;
+  src.item.fg.jointype := 0;
+  pWInfo^.pTabList   := @src.hdr;
+
+  pWInfo^.sWC.pWInfo := pWInfo;
+  pWInfo^.sWC.a      := @pWInfo^.sWC.aStatic[0];
+  pWInfo^.sWC.nSlot  := Length(pWInfo^.sWC.aStatic);
+  pWInfo^.sMaskSet.n   := 1;
+  pWInfo^.sMaskSet.ix[0] := iCur;
+
+  FillChar(bld, SizeOf(bld), 0);
+  bld.pWInfo := pWInfo;
+  bld.pWC    := @pWInfo^.sWC;
+
+  FillChar(pNew, SizeOf(pNew), 0);
+  whereLoopInit(@pNew);
+  pNew.iTab     := 0;
+  pNew.maskSelf := 1;
+  bld.pNew      := @pNew;
+
+  { ---- WLAB1: empty WC, no real indices, no auto-index ---- }
+  ResetLoops;
+  rc := whereLoopAddBtree(@bld, 0);
+  Check('WLAB1 returns OK',                  rc = SQLITE_OK);
+  CountLoops;
+  Check('WLAB1 exactly one loop',            nLoops = 1);
+  Check('WLAB1 the loop is WHERE_IPK',       nIpk = 1);
+  Check('WLAB1 no auto-index loop',          nAuto = 0);
+  if pWInfo^.pLoops <> nil then
+  begin
+    Check('WLAB1 rRun = nRowLogEst + 16',
+          pWInfo^.pLoops^.rRun = i16(tab.nRowLogEst + 16));
+    Check('WLAB1 nOut = nRowLogEst (after restore)',
+          pWInfo^.pLoops^.nOut = tab.nRowLogEst);
+  end;
+
+  { ---- WLAB2: notIndexed bit lit ---- }
+  ResetLoops;
+  src.item.fg.fgBits := u8($01);  { notIndexed }
+  rc := whereLoopAddBtree(@bld, 0);
+  Check('WLAB2 notIndexed returns OK',       rc = SQLITE_OK);
+  CountLoops;
+  Check('WLAB2 still one IPK loop',          (nLoops = 1) and (nIpk = 1));
+  src.item.fg.fgBits := 0;
+
+  { ---- WLAB3: WITHOUT ROWID table, no real indices, no auto-index ---- }
+  ResetLoops;
+  tab.tabFlags := tab.tabFlags or TF_WithoutRowid;
+  rc := whereLoopAddBtree(@bld, 0);
+  Check('WLAB3 WITHOUT ROWID returns OK',    rc = SQLITE_OK);
+  CountLoops;
+  Check('WLAB3 zero loops (no PK index, no auto-index)',
+        nLoops = 0);
+  tab.tabFlags := 0;
+
+  { ---- WLAB4: auto-index path skipped on a rowid-EQ term (leftColumn<0) —
+         auto-index synthesis enabled but the only WHERE term targets the
+         rowid (leftColumn=-1) which termCanDriveIndex rejects.  IPK probe
+         still fires and produces the single full-scan loop.  Avoids
+         touching pTab^.aCol so we don't have to allocate a TColumn. ---- }
+  ResetLoops;
+  db^.flags := db^.flags or SQLITE_AutoIndex;
+  pWInfo^.sWC.nTerm := 1;
+  FillChar(lhs, SizeOf(lhs), 0); lhs.op := TK_COLUMN;
+  lhs.iTable := iCur; lhs.iColumn := -1;   { rowid alias }
+  FillChar(rhs, SizeOf(rhs), 0); rhs.op := TK_INTEGER;
+  FillChar(top, SizeOf(top), 0); top.op := TK_EQ;
+  top.pLeft := @lhs; top.pRight := @rhs;
+  pT := @pWInfo^.sWC.aStatic[0];
+  pT^.pExpr        := @top;
+  pT^.pWC          := @pWInfo^.sWC;
+  pT^.eOperator    := WO_EQ;
+  pT^.leftCursor   := iCur;
+  pT^.u.leftColumn := -1;                  { rowid → termCanDriveIndex rejects }
+  pT^.prereqRight  := 0;
+  pT^.prereqAll    := 1;
+  pT^.truthProb    := 1;
+  pT^.wtFlags      := 0;
+  rc := whereLoopAddBtree(@bld, 0);
+  Check('WLAB4 returns OK',                  rc = SQLITE_OK);
+  CountLoops;
+  Check('WLAB4 no auto-index loop (rowid leftColumn skipped)',
+        nAuto = 0);
+  Check('WLAB4 IPK loop still inserted',     nIpk = 1);
+  db^.flags := db^.flags and (not SQLITE_AutoIndex);
+
+  { Cleanup. }
+  while pWInfo^.pLoops <> nil do
+  begin
+    p := pWInfo^.pLoops;
+    pWInfo^.pLoops := p^.pNextLoop;
+    whereLoopDelete(db, p);
+  end;
+  whereLoopClear(db, @pNew);
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -2083,6 +2283,7 @@ begin
   TestFindIndexCol;
   TestIsDistinctRedundant;
   TestWhereLoopAddBtreeIndex;
+  TestWhereLoopAddBtree;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

@@ -1441,6 +1441,7 @@ const
     actually consulted from the where engine and codegen are mirrored
     here so far; the remainder land alongside their first reader. }
   SQLITE_QueryFlattener = u32($00000001);
+  SQLITE_CoverIdxScan   = u32($00000020);  { covering-index scan opt (sqliteInt.h:1904) }
   SQLITE_DistinctOpt    = u32($00000010);
   SQLITE_OmitNoopJoin   = u32($00000100);
   SQLITE_Stat4          = u32($00000800);
@@ -1448,6 +1449,11 @@ const
   SQLITE_SeekScan       = u32($00020000);
   SQLITE_BloomFilter    = u32($00080000);
   SQLITE_OnePass        = u32($08000000);
+
+  { TOPBIT — top bit of a 64-bit Bitmask (sqliteInt.h:1414); used by
+    whereLoopAddBtree's "covering by bitmask" check to detect the
+    "column index >= BMS-1" overflow slot from SrcItem.colUsed. }
+  TOPBIT                = Bitmask(u64(1) shl 63);
 
   { TERM_* flags (WhereTerm.wtFlags) }
   TERM_DYNAMIC   = u16($0001);
@@ -1738,6 +1744,36 @@ function  whereRangeScanEst(pParse: PParse; pBuilder: PWhereLoopBuilder;
   are omitted, matching the project-wide non-STAT4 build. }
 function  whereLoopAddBtreeIndex(pBuilder: PWhereLoopBuilder;
   pSrc: PSrcItem; pProbe: PIndex2; nInMul: i16): i32;
+
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — whereLoopAddBtree
+  (where.c:4003..4309) — the per-table planner-loop factory.  For every
+  index on the FROM-clause table indicated by pBuilder^.pNew^.iTab (plus
+  a synthesized fake IPK index), build the candidate template loops and
+  feed them through whereLoopAddBtreeIndex.  Three candidate families:
+
+    * automatic-index synthesis (gated on SQLITE_AutoIndex + termCanDriveIndex);
+    * full-table scan / full-index scan (with cost ranking against a
+      covering-index scan when applicable);
+    * per-index probing via whereLoopAddBtreeIndex.
+
+  Virtual-table side (whereLoopAddVirtual*) is intentionally separate;
+  the IsVirtual short-circuit lives in whereLoopAddOr / whereLoopAddAll
+  upstream of this entry. }
+function  whereLoopAddBtree(pBuilder: PWhereLoopBuilder;
+  mPrereq: Bitmask): i32;
+
+{ sqlite3ExprCoveredByIndex (expr.c:7071..7085) — Walker-driven probe.
+  True iff every TK_COLUMN reference inside pExpr that targets cursor
+  iCur is mapped to a slot of pIdx (i.e. the index covers pExpr).
+  Internal exprIdxCover callback ports verbatim. }
+function  sqlite3ExprCoveredByIndex(pExpr: PExpr; iCur: i32;
+  pIdx: PIndex2): i32;
+
+{ HasRowid / IsView — the two macro accessors over Table.tabFlags /
+  Table.eTabType used throughout the planner.  Inlined for parity with
+  the C macros at sqliteInt.h:2502 / 2496. }
+function  HasRowid(pTab: PTable2): Boolean; inline;
+function  IsView(pTab: PTable2): Boolean; inline;
 
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
@@ -9332,6 +9368,385 @@ begin
   end;
 
   Result := 0;
+end;
+
+{ ---------------------------------------------------------------------------
+  HasRowid / IsView accessors — match the C macros at sqliteInt.h:2502 and
+  2496.  HasRowid is the "table has an implicit rowid" predicate (false
+  only for WITHOUT ROWID tables).  IsView returns true for a view.
+  =========================================================================== }
+
+function HasRowid(pTab: PTable2): Boolean; inline;
+begin
+  Result := (pTab^.tabFlags and TF_WithoutRowid) = 0;
+end;
+
+function IsView(pTab: PTable2): Boolean; inline;
+begin
+  Result := pTab^.eTabType = TABTYP_VIEW;
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3ExprCoveredByIndex — port of expr.c:7050..7085.
+
+  Walker callback exprIdxCover trips eCode := 1 the first time it sees
+  a TK_COLUMN node that references cursor iCur but whose iColumn is NOT
+  contained in pIdx.  After the walk returns, the public function
+  reports the negation: !eCode == "every column reference is covered".
+  =========================================================================== }
+
+type
+  PIdxCover = ^TIdxCover;
+  TIdxCover = record
+    iCur: i32;
+    pIdx: PIndex2;
+  end;
+
+function exprIdxCoverCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  cov: PIdxCover;
+begin
+  cov := PIdxCover(pWalker^.u.ptr);
+  if (pExpr^.op = TK_COLUMN)
+     and (pExpr^.iTable = cov^.iCur)
+     and (sqlite3TableColumnToIndex(cov^.pIdx, pExpr^.iColumn) < 0) then
+  begin
+    pWalker^.eCode := 1;
+    Result := WRC_Abort;
+    Exit;
+  end;
+  Result := WRC_Continue;
+end;
+
+function sqlite3ExprCoveredByIndex(pExpr: PExpr; iCur: i32;
+  pIdx: PIndex2): i32;
+var
+  w:    TWalker;
+  xcov: TIdxCover;
+begin
+  FillChar(w, SizeOf(w), 0);
+  xcov.iCur := iCur;
+  xcov.pIdx := pIdx;
+  w.xExprCallback := @exprIdxCoverCb;
+  w.u.ptr := @xcov;
+  sqlite3WalkExpr(@w, pExpr);
+  if w.eCode <> 0 then Result := 0 else Result := 1;
+end;
+
+{ ---------------------------------------------------------------------------
+  whereLoopAddBtree — port of where.c:4003..4309.
+
+  Per-FROM-clause-table planner factory.  Three candidate families are
+  threaded through whereLoopInsert via the shared pBuilder^.pNew template:
+
+    (1) Automatic index synthesis.  Gated on db's SQLITE_AutoIndex bit,
+        the absence of an INDEXED BY / NOT INDEXED clause, the absence of
+        the WHERE_RIGHT_JOIN / WHERE_OR_SUBCLAUSE wctrl bits, and a
+        per-term termCanDriveIndex() probe.  Setup cost is rLogSize+rSize
+        plus a +28 fudge for ordinary tables (-25 for views/ephemeral
+        materialisations).  Output row count is fixed at 43 (LogEst(20)).
+
+    (2) Full table scan / full index scan.  The IPK arm uses cost
+        rSize+16 (a 3.0x penalty over a uniform index lookup) and
+        suppresses the OrderBy hint when the source is a recursive CTE.
+        The non-IPK arm computes coverage either via colNotIdxed bitmask
+        or via whereIsCoveringIndex (when the index has expressions or
+        the bitmask saturates at TOPBIT), then prices an index scan at
+        rSize+1+15*szIdxRow/szTabRow with an extra non-covering-lookup
+        penalty when not WHERE_IDX_ONLY.  RIGHT-JOIN-on-aColExpr is
+        skipped to avoid the cursor-positioning hazard.
+
+    (3) Per-index probing via whereLoopAddBtreeIndex.  After it returns,
+        if bldFlags1 picked up SQLITE_BLDF1_INDEXED the table is tagged
+        TF_MaybeReanalyze (sqlite_stat1 selectivity becomes important).
+
+  STAT4 reset (sqlite3Stat4ProbeFree) is omitted with the project-wide
+  non-STAT4 build.  ApplyCostMultiplier is a no-op (no -DSQLITE_ENABLE_COSTMULT).
+  =========================================================================== }
+
+function whereLoopAddBtree(pBuilder: PWhereLoopBuilder;
+  mPrereq: Bitmask): i32;
+label NextProbe;
+var
+  pWInfo:    PWhereInfo;
+  pProbe:    PIndex2;
+  sPk:       TIndex;
+  aiRowEstPk: array[0..1] of i16;
+  aiColumnPk: i16;
+  pTabList:  PSrcList;
+  pSrc:      PSrcItem;
+  pNew:      PWhereLoop;
+  rc:        i32;
+  iSortIdx:  i32;
+  b:         i32;
+  rSize:     i16;
+  pWC:       PWhereClause;
+  pTab:      PTable2;
+  pFirst:    PIndex2;
+  rLogSize:  i16;
+  pTerm:     PWhereTerm;
+  pWCEnd:    PWhereTerm;
+  pTermArr:  PWhereTerm;
+  k:         i32;
+  m:         Bitmask;
+  isCov:     u32;
+  nLookup:   i16;
+  ii:        i32;
+  iCur:      i32;
+  pWC2:      PWhereClause;
+  pTerm2:    PWhereTerm;
+  bAllowFullScan: Boolean;
+  pSubq:     PSubquery;
+  pSel:      PSelect;
+  fgBits:    u8;
+begin
+  pNew := pBuilder^.pNew;
+  pWInfo := pBuilder^.pWInfo;
+  pTabList := pWInfo^.pTabList;
+  pSrc := @SrcListItems(pTabList)[pNew^.iTab];
+  pTab := pSrc^.pSTab;
+  pWC := pBuilder^.pWC;
+  Assert(pTab^.eTabType <> TABTYP_VTAB);
+  rc := SQLITE_OK;
+  iSortIdx := 1;
+  fgBits := pSrc^.fg.fgBits;
+
+  if (fgBits and u8($02)) <> 0 then  { isIndexedBy }
+  begin
+    Assert((pSrc^.fg.fgBits2 and u8($02)) = 0); { isCte = bit 1 of fgBits2 }
+    pProbe := pSrc^.u2.pIBIndex;
+  end
+  else if not HasRowid(pTab) then
+  begin
+    pProbe := pTab^.pIndex;
+  end
+  else
+  begin
+    { Build a fake Index for the implicit rowid PK.  Lives in the local
+      sPk record (does NOT participate in the schema's pIndex chain). }
+    FillChar(sPk, SizeOf(sPk), 0);
+    aiColumnPk := -1;
+    sPk.nKeyCol     := 1;
+    sPk.nColumn     := 1;
+    sPk.aiColumn    := @aiColumnPk;
+    sPk.aiRowLogEst := @aiRowEstPk[0];
+    sPk.onError     := OE_Replace;
+    sPk.pTable      := pTab;
+    sPk.szIdxRow    := 3;          { TUNING: tiny IPK interior rows }
+    sPk.idxFlags    := SQLITE_IDXTYPE_IPK;
+    aiRowEstPk[0]   := pTab^.nRowLogEst;
+    aiRowEstPk[1]   := 0;
+    pFirst := pSrc^.pSTab^.pIndex;
+    if (fgBits and u8($01)) = 0 then  { notIndexed clear → consider real indices }
+      sPk.pNext := pFirst;
+    pProbe := @sPk;
+  end;
+  rSize := pTab^.nRowLogEst;
+
+  { ---- (1) Auto-index synthesis ---- }
+  if (pBuilder^.pOrSet = nil)
+     and ((pWInfo^.wctrlFlags
+            and (WHERE_RIGHT_JOIN or WHERE_OR_SUBCLAUSE)) = 0)
+     and ((pWInfo^.pParse^.db^.flags and SQLITE_AutoIndex) <> 0)
+     and ((fgBits and u8($02)) = 0)            { not isIndexedBy }
+     and ((fgBits and u8($01)) = 0)            { not notIndexed }
+     and ((fgBits and u8($10)) = 0)            { not isCorrelated }
+     and ((fgBits and u8($80)) = 0)            { not isRecursive }
+     and ((pSrc^.fg.jointype and JT_RIGHT) = 0)
+  then
+  begin
+    rLogSize := estLog(rSize);
+    pTermArr := pWC^.a;
+    pWCEnd := pTermArr; Inc(pWCEnd, pWC^.nTerm);
+    pTerm := pTermArr;
+    while (rc = SQLITE_OK) and (pTerm < pWCEnd) do
+    begin
+      if (pTerm^.prereqRight and pNew^.maskSelf) <> 0 then
+      begin
+        Inc(pTerm); Continue;
+      end;
+      if termCanDriveIndex(pTerm, pSrc, 0) <> 0 then
+      begin
+        pNew^.u.btree.nEq    := 1;
+        pNew^.nSkip          := 0;
+        pNew^.u.btree.pIndex := nil;
+        pNew^.nLTerm         := 1;
+        pNew^.aLTerm[0]      := pTerm;
+        pNew^.rSetup := i16(rLogSize + rSize);
+        if (not IsView(pTab)) and ((pTab^.tabFlags and TF_Ephemeral) = 0) then
+          pNew^.rSetup := i16(pNew^.rSetup + 28)
+        else
+          pNew^.rSetup := i16(pNew^.rSetup - 25);
+        if pNew^.rSetup < 0 then pNew^.rSetup := 0;
+        pNew^.nOut    := 43;  { sqlite3LogEst(20) }
+        pNew^.rRun    := sqlite3LogEstAdd(rLogSize, pNew^.nOut);
+        pNew^.wsFlags := WHERE_AUTO_INDEX;
+        pNew^.prereq  := mPrereq or pTerm^.prereqRight;
+        rc := whereLoopInsert(pBuilder, pNew);
+      end;
+      Inc(pTerm);
+    end;
+  end;
+
+  { ---- (2) and (3) per-index loop ---- }
+  while (rc = SQLITE_OK) and (pProbe <> nil) do
+  begin
+    if (pProbe^.pPartIdxWhere <> nil)
+       and (whereUsablePartialIndex(pSrc^.iCursor, pSrc^.fg.jointype, pWC,
+                                    pProbe^.pPartIdxWhere) = 0) then
+    begin
+      goto NextProbe;
+    end;
+    if ((pProbe^.idxFlags shr 8) and 1) <> 0 then  { bNoQuery = bit 8 }
+      goto NextProbe;
+    rSize := pProbe^.aiRowLogEst[0];
+    pNew^.u.btree.nEq          := 0;
+    pNew^.u.btree.nBtm         := 0;
+    pNew^.u.btree.nTop         := 0;
+    pNew^.u.btree.nDistinctCol := 0;
+    pNew^.nSkip   := 0;
+    pNew^.nLTerm  := 0;
+    pNew^.iSortIdx := 0;
+    pNew^.rSetup  := 0;
+    pNew^.prereq  := mPrereq;
+    pNew^.nOut    := rSize;
+    pNew^.u.btree.pIndex   := pProbe;
+    pNew^.u.btree.pOrderBy := nil;
+    b := indexMightHelpWithOrderBy(pBuilder, pProbe, pSrc^.iCursor);
+    Assert(((pWInfo^.wctrlFlags and WHERE_ONEPASS_DESIRED) = 0) or (b = 0));
+
+    if (pProbe^.idxFlags and 3) = SQLITE_IDXTYPE_IPK then
+    begin
+      { ---- IPK / full-table scan ---- }
+      pNew^.wsFlags := WHERE_IPK;
+      if b <> 0 then pNew^.iSortIdx := u8(iSortIdx) else pNew^.iSortIdx := 0;
+      pNew^.rRun := i16(rSize + 16);  { non-STAT4 build: no -2 discount }
+      whereLoopOutputAdjust(pWC, pNew, rSize);
+      if (fgBits and u8($04)) <> 0 then  { isSubquery }
+      begin
+        if (fgBits and u8($40)) <> 0 then  { viaCoroutine }
+          pNew^.wsFlags := pNew^.wsFlags or WHERE_COROUTINE;
+        pSubq := pSrc^.u4.pSubq;
+        if pSubq <> nil then
+        begin
+          pSel := pSubq^.pSelect;
+          if (pSel <> nil) and ((pSel^.selFlags and SF_Recursive) = 0) then
+            pNew^.u.btree.pOrderBy := pSel^.pOrderBy;
+        end;
+      end
+      else if (pSrc^.fg.fgBits3 and u8($04)) <> 0 then  { fromExists }
+        pNew^.nOut := 0;
+      rc := whereLoopInsert(pBuilder, pNew);
+      pNew^.nOut := rSize;
+      if rc <> 0 then Break;
+    end
+    else
+    begin
+      { ---- non-IPK index ---- }
+      if ((pProbe^.idxFlags shr 5) and 1) <> 0 then  { isCovering = bit 5 }
+      begin
+        m := 0;
+        pNew^.wsFlags := WHERE_IDX_ONLY or WHERE_INDEXED;
+      end
+      else
+      begin
+        m := pSrc^.colUsed and pProbe^.colNotIdxed;
+        if pProbe^.pPartIdxWhere <> nil then
+          wherePartIdxExpr(pWInfo^.pParse, pProbe, pProbe^.pPartIdxWhere,
+                           @m, 0, nil);
+        pNew^.wsFlags := WHERE_INDEXED;
+        if (m = TOPBIT)
+           or ((((pProbe^.idxFlags shr 11) and 1) <> 0)        { bHasExpr = bit 11 }
+               and (((pProbe^.idxFlags shr 10) and 1) = 0)     { bHasVCol = bit 10 }
+               and (m <> 0)) then
+        begin
+          isCov := whereIsCoveringIndex(pWInfo, pProbe, pSrc^.iCursor);
+          if isCov <> 0 then
+          begin
+            m := 0;
+            pNew^.wsFlags := pNew^.wsFlags or isCov;
+          end;
+        end
+        else if (m = 0)
+                and (HasRowid(pTab) or (pWInfo^.pSelect <> nil)
+                     or (sqlite3FaultSim(700) <> 0)) then
+        begin
+          pNew^.wsFlags := WHERE_IDX_ONLY or WHERE_INDEXED;
+        end;
+      end;
+
+      bAllowFullScan := (b <> 0)
+        or (not HasRowid(pTab))
+        or (pProbe^.pPartIdxWhere <> nil)
+        or ((fgBits and u8($02)) <> 0)        { isIndexedBy }
+        or ((m = 0)
+            and (((pProbe^.idxFlags shr 2) and 1) = 0)  { bUnordered = bit 2 }
+            and (pProbe^.szIdxRow < pTab^.szTabRow)
+            and ((pWInfo^.wctrlFlags and WHERE_ONEPASS_DESIRED) = 0)
+            and (sqlite3GlobalConfig.bUseCis <> 0)
+            and OptimizationEnabled(pWInfo^.pParse^.db, SQLITE_CoverIdxScan));
+
+      if bAllowFullScan then
+      begin
+        if b <> 0 then pNew^.iSortIdx := u8(iSortIdx) else pNew^.iSortIdx := 0;
+        Assert(pTab^.szTabRow > 0);
+        pNew^.rRun := i16(rSize + 1
+                          + (15 * pProbe^.szIdxRow) div pTab^.szTabRow);
+        if m <> 0 then
+        begin
+          { Non-covering: add table-lookup cost. }
+          nLookup := i16(rSize + 16);
+          iCur := pSrc^.iCursor;
+          pWC2 := @pWInfo^.sWC;
+          ii := 0;
+          while ii < pWC2^.nTerm do
+          begin
+            pTerm2 := @pWC2^.a[ii];
+            if sqlite3ExprCoveredByIndex(pTerm2^.pExpr, iCur, pProbe) = 0 then
+              Break;
+            if pTerm2^.truthProb <= 0 then
+              nLookup := i16(nLookup + pTerm2^.truthProb)
+            else
+            begin
+              Dec(nLookup);
+              if (pTerm2^.eOperator and (WO_EQ or WO_IS)) <> 0 then
+                nLookup := i16(nLookup - 19);
+            end;
+            Inc(ii);
+          end;
+          pNew^.rRun := sqlite3LogEstAdd(pNew^.rRun, nLookup);
+        end;
+        whereLoopOutputAdjust(pWC, pNew, rSize);
+        if ((pSrc^.fg.jointype and JT_RIGHT) <> 0)
+           and (pProbe^.aColExpr <> nil) then
+        begin
+          { Skip — RIGHT JOIN on indexed expression. }
+        end
+        else
+        begin
+          if (pSrc^.fg.fgBits3 and u8($04)) <> 0 then  { fromExists }
+            pNew^.nOut := 0;
+          rc := whereLoopInsert(pBuilder, pNew);
+        end;
+        pNew^.nOut := rSize;
+        if rc <> 0 then Break;
+      end;
+    end;
+
+    pBuilder^.bldFlags1 := 0;
+    rc := whereLoopAddBtreeIndex(pBuilder, pSrc, pProbe, 0);
+    if pBuilder^.bldFlags1 = SQLITE_BLDF1_INDEXED then
+      pTab^.tabFlags := pTab^.tabFlags or TF_MaybeReanalyze;
+    { No STAT4 reset (sqlite3Stat4ProbeFree) — non-STAT4 build. }
+
+  NextProbe:
+    if (fgBits and u8($02)) <> 0 then  { isIndexedBy → only one probe }
+      pProbe := nil
+    else
+      pProbe := pProbe^.pNext;
+    Inc(iSortIdx);
+  end;
+  Result := rc;
 end;
 
 { ---------------------------------------------------------------------------

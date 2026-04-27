@@ -336,6 +336,29 @@ Important: At the end of this document, please find:
       (caller-supplied WHERE_BTM_LIMIT narrows opMask to LT|LE so the
       EQ term fails the gate).
 
+    - [X] `whereLoopAddBtree` (where.c:4003..4309) — per-FROM-clause-table
+      planner factory; the parent that drives `whereLoopAddBtreeIndex`.
+      Threads three candidate families through `whereLoopInsert` via the
+      shared `pBuilder^.pNew` template: (1) automatic-index synthesis
+      gated on `SQLITE_AutoIndex` + `termCanDriveIndex`; (2) full table
+      scan / full index scan with the covering-index price ranking
+      (`whereIsCoveringIndex`, `wherePartIdxExpr`); (3) per-index
+      probing via `whereLoopAddBtreeIndex`, with `TF_MaybeReanalyze` set
+      when `bldFlags1 == SQLITE_BLDF1_INDEXED`.  Synthesizes the fake
+      IPK index for HasRowid tables with `pNext` linked to the schema's
+      pIndex chain (unless NOT INDEXED is set).  Helper additions:
+      `sqlite3ExprCoveredByIndex` (expr.c:7050..7085, walker-based
+      column-coverage probe via the new `exprIdxCoverCb` callback),
+      `HasRowid` / `IsView` inline accessors, and the `TOPBIT` /
+      `SQLITE_CoverIdxScan` constants.  STAT4 (`sqlite3Stat4ProbeFree`)
+      and ApplyCostMultiplier omitted to match the project's
+      non-STAT4 / non-COSTMULT build.  Gate: `TestWherePlanner.pas`
+      (215/215): WLAB1 (empty WC, no real indices → exactly one
+      WHERE_IPK loop with rRun=nRowLogEst+16), WLAB2 (notIndexed bit
+      lit → still one IPK loop), WLAB3 (WITHOUT ROWID + no real
+      indices + no AutoIndex → zero loops), WLAB4 (auto-index path
+      enabled but the only WHERE term targets the rowid alias →
+      termCanDriveIndex rejects, IPK probe still produces one loop).
     - [X] `whereRangeScanEst` (where.c:2092..2254, no-STAT4 tail) —
       reduces `pLoop^.nOut` to account for the leftover range
       constraints on the leading (nEq+1)'th column of the index pLoop
