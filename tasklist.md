@@ -70,8 +70,13 @@ Important: At the end of this document, please find:
       Closes Δ=22 on the DROP TABLE row.
 
     - [ ] **6.10 step 6** Make these to work (port code when required):
-        [ ] `CREATE INDEX i ON t(a) WHERE a>0` — Δ=4 (partial-index
-          WHERE clause codegen path).
+        [X] `CREATE INDEX i ON t(a) WHERE a>0` — partial-index WHERE
+          clause codegen now ports `sqlite3ResolveSelfReference`
+          (NameContext-on-the-stack) + the `iSelfTab>0` arm of
+          TK_COLUMN, so `pPartIdxWhere` round-trips through
+          `sqlite3GenerateIndexKey` with the expected
+          `Column / Le / Integer-in-prologue` pattern.  Probe PASSes at
+          41 ops.
         [X] `INSERT INTO t(a) VALUES(1)` / `INSERT INTO t(a,b,c)
           VALUES(...)` — named-column INSERT path now ports IDLIST
           resolution (insert.c:1077..1108) + per-table-column store

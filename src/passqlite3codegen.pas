@@ -5092,6 +5092,20 @@ begin
             Result := r1;
             done := True;
           end
+          { Partial-index / CHECK / generated-column context: iTable<0 plus
+            pParse^.iSelfTab>0 routes the column read through cursor
+            (iSelfTab-1).  Faithful port of expr.c:5026..5076 (subset:
+            iSelfTab>0 arm only — the row-unpacked iSelfTab<0 path used by
+            sqlite3GenerateConstraintChecks remains deferred). }
+          else if (pExpr^.iTable < 0) and (pParse^.iSelfTab > 0)
+                  and (pExpr^.y.pTab <> nil) then
+          begin
+            sqlite3ExprCodeGetColumnOfTable(v, pExpr^.y.pTab,
+              pParse^.iSelfTab - 1, pExpr^.iColumn, target);
+            if pExpr^.op2 <> 0 then
+              sqlite3VdbeChangeP5(v, u16(pExpr^.op2));
+            done := True;
+          end
           { Resolved column reference — emit OP_Column.
             pExpr^.y.pTab is set by the resolver;
             sqlite3ExprCodeGetColumnOfTable handles iColumn=-1 (rowid)
@@ -7226,8 +7240,27 @@ end;
 
 function sqlite3ResolveSelfReference(pParse: PParse; pTab: PTable2;
   type_: i32; pExpr: PExpr; pList: PExprList): i32;
+var
+  buf:   array[0..SizeOf(TSrcList) + SizeOf(TSrcItem) - 1] of Byte;
+  pSrc:  PSrcList;
+  pItem: PSrcItem;
+  sNC:   TNameContext;
 begin
-  Result := SQLITE_OK;
+  FillChar(buf, SizeOf(buf), 0);
+  FillChar(sNC, SizeOf(sNC), 0);
+  pSrc := PSrcList(@buf[0]);
+  if pTab <> nil then
+  begin
+    pSrc^.nSrc  := 1;
+    pItem := SrcListItems(pSrc);
+    pItem^.zName   := pTab^.zName;
+    pItem^.pSTab   := pTab;
+    pItem^.iCursor := -1;
+  end;
+  sNC.pParse   := pParse;
+  sNC.pSrcList := pSrc;
+  sNC.ncFlags  := type_ or NC_IsDDL;
+  Result := sqlite3ResolveExprNames(@sNC, pExpr);
 end;
 
 function sqlite3ResolveOrderGroupBy(pParse: PParse; pSelect: PSelect;
@@ -18490,8 +18523,17 @@ begin
   begin
     if pIdx^.pPartIdxWhere <> nil then
     begin
-      Assert(False, 'sqlite3GenerateIndexKey: partial index not yet supported');
-      piPartIdxLabel^ := 0;
+      { Partial-index WHERE skip: emit a jump-over-row label.  Faithful port
+        of delete.c:980..988.  iSelfTab=iDataCur+1 routes column references
+        in the WHERE expression through iDataCur (the table cursor).  Set
+        pPrior=nil per ticket a9efb42811fa41ee — pPartIdxWhere may have
+        clobbered regPrior. }
+      piPartIdxLabel^ := sqlite3VdbeMakeLabel(pParse);
+      pParse^.iSelfTab := iDataCur + 1;
+      sqlite3ExprIfFalseDup(pParse, pIdx^.pPartIdxWhere, piPartIdxLabel^,
+                            SQLITE_JUMPIFNULL);
+      pParse^.iSelfTab := 0;
+      pPrior := nil;
     end else
       piPartIdxLabel^ := 0;
   end;
@@ -18500,7 +18542,9 @@ begin
   else
     nCol := i32(pIdx^.nColumn);
   regBase := sqlite3GetTempRange(pParse, nCol);
-  if (pPrior <> nil) and (regBase <> regPrior) then pPrior := nil;
+  if (pPrior <> nil)
+     and ((regBase <> regPrior) or (pPrior^.pPartIdxWhere <> nil)) then
+    pPrior := nil;
   for j := 0 to nCol - 1 do
   begin
     if (pPrior <> nil)
@@ -21313,6 +21357,7 @@ begin
   pIndex^.idxFlags := (pIndex^.idxFlags and not u32($03)) or u32(idxType);
   pIndex^.pSchema  := db^.aDb[iDb].pSchema;
   if pPIWhere <> nil then begin
+    sqlite3ResolveSelfReference(pParse, pTab, NC_PartIdx, pPIWhere, nil);
     pIndex^.pPartIdxWhere := pPIWhere;
     pPIWhere              := nil;
   end;
