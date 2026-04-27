@@ -111,12 +111,14 @@ begin
   WriteLn;
   WriteLn('# bytecode dumps');
   DumpBytecode('SELECT a FROM t WHERE rowid IN (1,2)');
-  DumpBytecode('SELECT a FROM t WHERE rowid=1');
+  DumpBytecode('SELECT a FROM t WHERE rowid=1 OR rowid=2');
 
   WriteLn;
-  WriteLn('# expect 10,20 — instead crashes (uncomment to see):');
-  WriteLn('#   SELECT a FROM t WHERE rowid IN (1,2,3)');
-  WriteLn('# crash: btreeParseCell line 906 via sqlite3VdbeFindCompare stub.');
+  WriteLn('# expect 10,20,30');
+  RunSql('SELECT a FROM t WHERE rowid IN (1,2,3)');
+
+  WriteLn('# expect 10,20,30,40 (4-entry list)');
+  RunSql('SELECT a FROM t WHERE rowid IN (1,2,3,4)');
 
   sqlite3_close(db);
 end.

@@ -2424,24 +2424,22 @@ end;
   --------------------------------------------------------------------------- }
 function sqlite3BtreePayloadFetch(pCur: PBtCursor; out pAmt: u32): PAnsiChar;
 var
-  pPage:    PMemPage;
-  nKey:     u32;
-  nLocal:   u32;
+  pPage: PMemPage;
 begin
   pPage := pCur^.pPage;
   if pPage = nil then begin
     pAmt := 0; Result := nil; Exit;
   end;
   getCellInfo(pCur);
-  nKey   := u32(pCur^.info.nKey);
-  nLocal := u32(pCur^.info.nLocal);
-  { For table leaves the payload starts after the key varint }
-  pAmt := nLocal;
-  if pPage^.intKey <> 0 then
-    Result := PAnsiChar(pCur^.info.pPayload)
-  else
-    Result := PAnsiChar(pCur^.info.pPayload) + nKey;
-  { If nLocal < the requested amount the caller must call BtreePayload }
+  { btree.c:fetchPayload — return pPayload directly for both table and
+    index cursors.  btreeParseCellPtr / btreeParseCellPtrIndex already
+    set pPayload past the cell prefix (size varint + optional rowid
+    varint).  Adding nKey for index cursors as a previous Pascal-port
+    quirk did was wrong: in index cells nKey == nPayload (length),
+    not an offset, so the previous code skipped past the entire record
+    and OP_Column read NULL on every index-eph row. }
+  pAmt   := u32(pCur^.info.nLocal);
+  Result := PAnsiChar(pCur^.info.pPayload);
 end;
 
 { ---------------------------------------------------------------------------

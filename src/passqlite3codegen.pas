@@ -14295,7 +14295,30 @@ begin
     nested helper above for the walk body. }
   if ((pLoop^.wsFlags and WHERE_IPK) <> 0)
      and ((pLoop^.wsFlags and WHERE_COLUMN_IN) <> 0) then
+  begin
+    { Phase 6.10 step 6.IPK-IN.a — force-materialise the IN-RHS for the
+      driving IPK term regardless of list size.  Case-2 IPK-IN below at
+      14336.. reads its eph cursor from pTerm^.pExpr^.iTable, which only
+      sqlite3FindInIndex(IN_INDEX_MEMBERSHIP) sets (along with EP_Subrtn).
+      InRhsHoistCandidate's <=2-entry residual-cost gate (codegen.pas:13846)
+      would skip short IN-lists, leaving iTable=0; Case-2 would then emit
+      OP_Rewind p1=0 / OP_SeekRowid p1=0, conflating the table cursor with
+      the IN-RHS source.  `WHERE rowid IN (1,2)` and the OR-rewritten
+      `WHERE rowid=1 OR rowid=2` would silently return 0 rows.  Calling
+      FindInIndex here makes DoInRhsHoist a no-op for this term (its
+      EP_Subrtn early-out fires) so we don't double-allocate. }
+    pTerm := pLoop^.aLTerm[0];
+    if (pTerm <> nil)
+       and (pTerm^.pExpr <> nil)
+       and (pTerm^.pExpr^.op = TK_IN)
+       and (not ExprHasProperty(pTerm^.pExpr, EP_Subrtn))
+       and ExprUseXList(pTerm^.pExpr)
+       and (pTerm^.pExpr^.x.pList <> nil) then
+      sqlite3FindInIndex(pParse, pTerm^.pExpr,
+                         IN_INDEX_MEMBERSHIP,
+                         nil, nil, @iInTabDummy);
     DoInRhsHoist;
+  end;
 
   { Phase 6.10 step 7 — emit OP_Explain for this scan (mirrors
     where.c:7464 sqlite3WhereExplainOneScan call, before pLevel->addrBody

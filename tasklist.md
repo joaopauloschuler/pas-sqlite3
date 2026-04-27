@@ -84,59 +84,31 @@ Important: At the end of this document, please find:
           `sqlite3Insert`).
         [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
           VALUES path).
-        [ ] **CORRECTNESS BUG — IPK-IN execution path entirely
-          broken.**  Surface symptom: every query whose plan is
-          `WHERE_IPK | WHERE_COLUMN_IN` returns zero rows or
-          crashes.  `WHERE rowid IN (1,2,3)` (≥3 entries) crashes
-          inside `btreeParseCell`; `WHERE rowid IN (1,2)` and the
-          OR-rewritten `WHERE rowid=1 OR rowid=2` return zero rows
-          silently.  Plain `WHERE a=10 OR a=20` and `WHERE rowid=1`
-          are correct.  Repro driver: `src/tests/ReproOrRowid.pas`.
+        [X] **IPK-IN execution path** — the original tri-bug
+          (hoist-gate skip / FindCompare stub / cursor-corruption /
+          BtreePayloadFetch index offset) is RESOLVED 2026-04-27.
+          Sub-tasks below track follow-on extensions and the runtime
+          gate.  Repro driver: `src/tests/ReproOrRowid.pas` — verifies
+          rowid IN (2/3/4 entries) end-to-end against the C oracle.
 
-          Two layered bugs:
-
-          (1) **Hoist-gate exclusion.**  `InRhsHoistCandidate` at
-              `passqlite3codegen.pas:13846` skips IN-RHS lists with
-              `≤2` constant entries (matches the residual-filter
-              cost heuristic).  But the IPK-IN Case-2 inline at
-              `passqlite3codegen.pas:14334..14407` reads its eph
-              cursor from `pTerm^.pExpr^.iTable`, which the hoist
-              would have set via `sqlite3FindInIndex(
-              IN_INDEX_MEMBERSHIP)`.  When the hoist is skipped,
-              `iTable` stays at default 0 and Case-2 emits
-              `OP_Rewind p1=0 / OP_Column p1=0 / OP_IsNull /
-              OP_SeekRowid p1=0` — i.e. the table cursor is used
-              as both the IN-RHS source AND the seek target.  The
-              guard asserts at `codegen.pas:14357..14358`
-              (`Assert(EP_Subrtn)` / `Assert(iTable > 0)`) compile
-              out at -O3.  Local fix proven to emit C-oracle-shape
-              bytecode: at `codegen.pas:14296`, force-call
-              `sqlite3FindInIndex(IN_INDEX_MEMBERSHIP, ...)` on
-              `pLoop^.aLTerm[0]` regardless of list size BEFORE
-              invoking `DoInRhsHoist`.
-
-          (2) **`sqlite3VdbeFindCompare` was a stub that returned
-              nil.**  Original behaviour: `sqlite3BtreeIndexMoveto`
-              short-circuited with `pRes^ := 0` ("exact match") when
-              the compare was nil; `sqlite3BtreeInsert` then took the
-              overwrite arm, called `getCellInfo(pCur)` on an
-              unpositioned cursor, and crashed in `btreeParseCell`.
-              This broke **every** OP_IdxInsert into a freshly
-              OpenEphemeral'd index — not just IPK-IN.
-              TestWhereCorpus rows still showed "PASS" because the
-              test only diffs EXPLAIN bytecode; nothing in the suite
-              executes an IN query end-to-end.
-
-            [ ] **6.10 step 6.IPK-IN.a** Apply the hoist-gate fix
-                from (1).  C-oracle-shape bytecode confirmed
-                2026-04-27.  6.IPK-IN.d (the cursor-corruption crash)
-                is now fixed (`nMem += nCursor` in
-                `sqlite3VdbeMakeReady`), so this step is unblocked.
-                Kept open until a runtime gate (6.IPK-IN.c) exercises
-                rowid-IN end-to-end so any regression is caught.
-                Without (1), `WHERE rowid IN (1,2)` and the
-                OR-rewritten equivalent silently return 0 rows; with
-                (1) they should return rows 10,20 (a-values).
+            [X] **6.10 step 6.IPK-IN.a** — landed 2026-04-27.
+                Hoist-gate fix at `passqlite3codegen.pas:14296`:
+                force-call `sqlite3FindInIndex(IN_INDEX_MEMBERSHIP)`
+                on `pLoop^.aLTerm[0]` before `DoInRhsHoist` whenever
+                the plan is `WHERE_IPK | WHERE_COLUMN_IN`, regardless
+                of list size.  Required a paired btree fix
+                (`sqlite3BtreePayloadFetch` in `passqlite3btree.pas:2425`):
+                the index-cursor branch was returning `pPayload+nKey`,
+                but for index cells `nKey == nPayload` (length, not
+                offset) — that skipped past the entire record so
+                OP_Column read NULL on every eph-index row.  C
+                `fetchPayload` returns `pPayload` directly for both
+                table and index cursors.  With both fixes,
+                `WHERE rowid IN (1,2)` returns 10,20;
+                `WHERE rowid IN (1,2,3)` returns 10,20,30 (no crash);
+                `WHERE rowid IN (1,2,3,4)` returns 10,20,30.
+                ReproOrRowid extended to 3- and 4-entry lists so
+                regressions surface end-to-end.
             [ ] **6.10 step 6.IPK-IN.b.full** Extend
                 `sqlite3VdbeRecordCompare` to cover string (collation
                 + encoding-change), blob (with MEM_Zero), and real
@@ -149,11 +121,29 @@ Important: At the end of this document, please find:
                 reconcile that vs. codegen.pas's bigger
                 TUnpackedRecord before porting the corruption /
                 BIGNULL / DESC arms.
-            [ ] **6.10 step 6.IPK-IN.c** Add a *runtime* correctness
-                gate (not just EXPLAIN diff) covering rowid IN,
-                column IN, OR-rewritten IN, and `rowid=K1 OR rowid=K2`.
-                Without runtime coverage, regressions of this class
-                keep slipping through the bytecode-only parity gate.
+            [ ] **6.10 step 6.IPK-IN.c** Promote `ReproOrRowid` (or
+                an equivalent test) into `build.sh` as a first-class
+                runtime gate covering rowid IN (2/3/4 entries), column
+                IN, OR-rewritten IN, and `rowid=K1 OR rowid=K2`.  The
+                driver currently exists at `src/tests/ReproOrRowid.pas`
+                and exercises 3 of these shapes correctly post-IPK-IN.a
+                fix, but is intentionally excluded from build.sh.
+                Without scripted runtime coverage, regressions like the
+                BtreePayloadFetch index-cursor bug keep slipping through
+                the bytecode-only parity gate.
+
+            [ ] **6.10 step 6.IPK-IN.e** OR-to-IN rewrite drops one
+                arm.  `WHERE rowid=1 OR rowid=2` emits a single
+                IdxInsert (key=2 only) into the IN-RHS eph cursor;
+                C oracle emits both (1 and 2).  Surface symptom:
+                `SELECT a FROM t WHERE rowid=1 OR rowid=2` returns
+                only row a=20 (rowid=2), missing a=10 (rowid=1).
+                ReproOrRowid bytecode dump shows `[5] Integer p1=2`
+                where C has `Integer p1=1` then `Integer p1=2` and
+                two IdxInserts.  Likely in `exprAnalyzeOrTerm` /
+                OR-to-IN list-builder path in `passqlite3codegen.pas`;
+                investigate `sqlite3ExprListAppend` calls during
+                OR-arm fold.
         [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
         [ ] `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3
