@@ -1630,6 +1630,9 @@ function  sqlite3WhereBegin(pParse: PParse; pTabList: PSrcList; pWhere: PExpr;
   pOrderBy: PExprList; pResultSet: PExprList; pSelect: PSelect;
   wctrlFlags: u16; iAuxArg: i32): PWhereInfo;
 procedure sqlite3WhereEnd(pWInfo: PWhereInfo);
+function  sqlite3WhereCodeOneLoopStart(pParse: PParse; v: PVdbe;
+  pWInfo: PWhereInfo; iLevel: i32; pLevel: PWhereLevel;
+  notReady: Bitmask): Bitmask;
 procedure sqlite3WhereRightJoinLoop(pWInfo: PWhereInfo; iLevel: i32;
   pLevel: PWhereLevel);
 
@@ -12154,6 +12157,121 @@ begin
 
   pPrs^.nQueryLoop := i16(pWInfo^.savedNQueryLoop);
   whereInfoFree(db, pWInfo);
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c sqlite3WhereCodeOneLoopStart,
+  batch 11.
+
+  Per-loop inner-body codegen entry point — matches wherecode.c:1466..2832.
+  This batch lands the function prelude (locals, addrBrk / addrCont label
+  setup, LEFT-OUTER-JOIN match-flag init at iLeftJoin), and Case 2 (IPK
+  rowid-EQ / rowid-IN — wherecode.c:1684..1711) which emits the canonical
+  codeEqualityTerm + optional Bloom-filter pull-down + OP_SeekRowid
+  sequence.  All other arms — viaCoroutine subquery (1546..1559), Case 1
+  virtual-table xFilter (1561..1681), Case 3 IPK range-scan (1712..1843),
+  Case 4 indexed equality / range scan (1844..2543), Case 5 OR-decomposed
+  fall-through (2544..2664), Case 6 full table / index scan (2665..2823) —
+  fall through to Assert(False).  These will land in subsequent batches as
+  fixtures get wired up.
+
+  The factoring out of the Case 2 logic from the inlined slice in
+  sqlite3WhereBegin (around the WHERE_IPK rowid-EQ path) is deferred to
+  batch 12 once a TestWhereSimple SQL corpus run can compare opcodes
+  against C; for now both the inlined sqlite3WhereBegin path and the new
+  function coexist so existing gates stay green.
+  =========================================================================== }
+
+function sqlite3WhereCodeOneLoopStart(pParse: PParse; v: PVdbe;
+  pWInfo: PWhereInfo; iLevel: i32; pLevel: PWhereLevel;
+  notReady: Bitmask): Bitmask;
+var
+  iCur:        i32;       { VDBE cursor for the table }
+  addrNxt:     i32;       { Where to jump to continue with the next IN case }
+  addrBrk:     i32;       { Jump here to break out of the loop }
+  addrCont:    i32;       { Jump here to continue with next cycle }
+  bRev:        i32;       { True if we need to scan in reverse order }
+  iRowidReg:   i32;       { Rowid is stored in this register, if not zero }
+  iReleaseReg: i32;       { Temp register to free before returning }
+  pLoop:       PWhereLoop;
+  pTerm:       PWhereTerm;
+  pTabItem:    PSrcItem;
+begin
+  pLoop    := pLevel^.pWLoop;
+  pTabItem := @SrcListItems(pWInfo^.pTabList)[pLevel^.iFrom];
+  iCur     := pTabItem^.iCursor;
+  pLevel^.notReady := notReady and
+    (not sqlite3WhereGetMask(@pWInfo^.sMaskSet, iCur));
+  bRev := i32((pWInfo^.revMask shr iLevel) and Bitmask(1));
+
+  iRowidReg   := 0;
+  iReleaseReg := 0;
+
+  { Create labels for the "break" and "continue" instructions for the
+    current loop.  When there is an IN operator we also have an "addrNxt"
+    label that means continue with the next IN value combination; when
+    there are no IN operators in the constraints, the "addrNxt" label is
+    the same as "addrBrk". }
+  addrBrk           := pLevel^.addrBrk;
+  pLevel^.addrNxt   := addrBrk;
+  addrCont          := sqlite3VdbeMakeLabel(pParse);
+  pLevel^.addrCont  := addrCont;
+
+  { LEFT OUTER JOIN match-flag init — wherecode.c:1535..1542.  Allocates a
+    memory cell that records whether this table matched any row of the left
+    table of the join; later sqlite3WhereEnd's null-row fixup tests it. }
+  Assert(((pWInfo^.wctrlFlags and (WHERE_OR_SUBCLAUSE or WHERE_RIGHT_JOIN)) <> 0)
+         or (pLevel^.iFrom > 0)
+         or ((pTabItem^.fg.jointype and JT_LEFT) = 0));
+  if (pLevel^.iFrom > 0)
+     and ((pTabItem^.fg.jointype and JT_LEFT) <> 0) then
+  begin
+    Inc(pParse^.nMem);
+    pLevel^.iLeftJoin := pParse^.nMem;
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, pLevel^.iLeftJoin);
+  end;
+
+  { Case 2 — wherecode.c:1684..1711.  IPK rowid-EQ or rowid-IN.  Emits
+    codeEqualityTerm into a fresh register, optional Bloom-filter
+    MustBeInt+Filter+filterPullDown chain, then OP_SeekRowid.  pLevel^.op
+    stays OP_Noop — the lookup is one-shot, sqlite3WhereEnd does not emit
+    an iteration opcode for this level. }
+  if ((pLoop^.wsFlags and WHERE_IPK) <> 0)
+     and ((pLoop^.wsFlags and (WHERE_COLUMN_IN or WHERE_COLUMN_EQ)) <> 0) then
+  begin
+    Assert(pLoop^.u.btree.nEq = 1);
+    pTerm := pLoop^.aLTerm[0];
+    Assert(pTerm <> nil);
+    Assert(pTerm^.pExpr <> nil);
+    Inc(pParse^.nMem);
+    iReleaseReg := pParse^.nMem;
+    iRowidReg := codeEqualityTerm(pParse, pTerm, pLevel, 0, bRev, iReleaseReg);
+    if iRowidReg <> iReleaseReg then
+      sqlite3ReleaseTempReg(pParse, iReleaseReg);
+    addrNxt := pLevel^.addrNxt;
+    if pLevel^.regFilter <> 0 then
+    begin
+      sqlite3VdbeAddOp2(v, OP_MustBeInt, iRowidReg, addrNxt);
+      sqlite3VdbeAddOp4Int(v, OP_Filter, pLevel^.regFilter, addrNxt,
+                           iRowidReg, 1);
+      filterPullDown(pParse, pWInfo, iLevel, addrNxt, notReady);
+    end;
+    sqlite3VdbeAddOp3(v, OP_SeekRowid, iCur, addrNxt, iRowidReg);
+    pLevel^.op := OP_Noop;
+  end
+  else
+  begin
+    { Cases 1, 3, 4, 5, 6 and the viaCoroutine special case land in
+      subsequent batches.  Until then the dispatch fails fast — callers
+      from TestWherePlanner only exercise the rowid-EQ arm; the inlined
+      sqlite3WhereBegin slice handles the rowid-EQ SQL flow today. }
+    Assert(False);
+  end;
+
+  Result := pLevel^.notReady;
+  { Suppress 'unused' on addrCont when the only emitted arm is Case 2 — the
+    label is resolved by sqlite3WhereEnd via pLevel^.addrCont. }
+  if addrCont = 0 then ;
 end;
 
 procedure sqlite3WhereRightJoinLoop(pWInfo: PWhereInfo; iLevel: i32;

@@ -726,6 +726,47 @@ Important: At the end of this document, please find:
       NOOP_OK ⇒ IN_INDEX_NOOP, piTab=-1, nTab restored, aiMap[0]=0,
       pLeft restored).  Sub-progress 11g.2.e now unblocks codeINTerm
       itself for the next batch.
+    - [X] Public surface, batch 11 — `sqlite3WhereCodeOneLoopStart`
+      (wherecode.c:1466..2832) prelude + Case 2 (IPK rowid-EQ /
+      rowid-IN, wherecode.c:1684..1711).  Function prelude lifts the
+      C var setup verbatim — pTabItem / iCur from
+      `pWInfo^.pTabList^.a[pLevel^.iFrom]`, pLevel^.notReady masked
+      against the cursor's own bit via `sqlite3WhereGetMask`, bRev
+      decoded from `(pWInfo^.revMask shr iLevel) and 1`, addrBrk
+      pinned from the level's pre-allocated label, addrNxt aliased to
+      addrBrk for the no-IN case, and addrCont allocated fresh via
+      `sqlite3VdbeMakeLabel`.  LEFT-OUTER-JOIN match-flag init
+      (wherecode.c:1535..1542) allocates `pLevel^.iLeftJoin` from
+      `pParse^.nMem` and emits `OP_Integer 0,iLeftJoin` when
+      `pLevel^.iFrom > 0` and `pTabItem^.fg.jointype` carries JT_LEFT —
+      the C precondition assert (`WHERE_OR_SUBCLAUSE | WHERE_RIGHT_JOIN
+      | iFrom>0 | not JT_LEFT`) ports verbatim.  Case 2 itself fires
+      when `(wsFlags & WHERE_IPK) and (wsFlags & (WHERE_COLUMN_IN |
+      WHERE_COLUMN_EQ))`: asserts `u.btree.nEq=1`, emits
+      `codeEqualityTerm` into a fresh `iReleaseReg` pulled from
+      `pParse^.nMem`, releases the temp when codeEqualityTerm reused
+      it, runs the Bloom-filter `OP_MustBeInt + OP_Filter +
+      filterPullDown` chain when `pLevel^.regFilter <> 0`, and emits
+      the canonical `OP_SeekRowid iCur,addrNxt,iRowidReg` plus
+      `pLevel^.op := OP_Noop` so sqlite3WhereEnd does not emit an
+      iteration opcode.  All other arms — viaCoroutine subquery
+      (1546..1559), Case 1 virtual-table xFilter (1561..1681), Case 3
+      IPK range-scan (1712..1843), Case 4 indexed equality / range
+      scan (1844..2543), Case 5 OR-decomposed fall-through
+      (2544..2664), Case 6 full table / index scan (2665..2823) —
+      land in subsequent batches as fixtures get wired up; the
+      else-branch `Assert(False)` keeps callers honest.  Refactor of
+      sqlite3WhereBegin's inlined Case 2 slice to call this routine is
+      deferred to batch 12 once a TestWhereSimple SQL corpus run can
+      compare opcodes against C.  Returns `pLevel^.notReady` per the
+      C contract.  Gate: `TestWherePlanner.pas` (488/488):
+      SCOLS1 (single-level rowid-EQ — addrNxt aliased to addrBrk,
+      addrCont label allocated, pLevel^.op flipped from sentinel 99
+      to OP_Noop, pTerm marked TERM_CODED via codeEqualityTerm,
+      OP_SeekRowid emitted on iCursor=9, return value matches
+      pLevel^.notReady), SCOLS2 (two-level frame with iFrom=1 and
+      JT_LEFT pTabItem — iLeftJoin > 0 after init, Case 2 still fires,
+      return value still matches pLevel^.notReady).
     - [X] Leaf helpers, batch 10 — `codeINTerm` (wherecode.c:668..784)
       full port replacing the prior `Assert(False)` stub.  IN-loop
       builder: opens the IN cursor (rowid table / shared index / EPH

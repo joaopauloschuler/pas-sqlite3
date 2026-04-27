@@ -4580,6 +4580,159 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- sqlite3WhereCodeOneLoopStart (batch 11) -----
+  Exercises the function prelude (label setup, LEFT JOIN flag init) plus
+  Case 2 (IPK rowid-EQ).  Other cases (vtab, IPK range, indexed, OR, full
+  scan) Assert(False) — left to subsequent batches. }
+procedure TestCodeOneLoopStart;
+const
+  N_LEVEL = 1;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  v:         PVdbe;
+  rc:        i32;
+  bufWI:     array of Byte;
+  bufSL:     array of Byte;
+  pWInfo:    PWhereInfo;
+  pSL:       PSrcList;
+  pSItem:    PSrcItem;
+  pLevel:    PWhereLevel;
+  loop:      TWhereLoop;
+  term:      TWhereTerm;
+  ex:        TExpr;
+  exRight:   TExpr;
+  alterm:    array[0..0] of PWhereTerm;
+  base, i:   i32;
+  pOp:       PVdbeOp;
+  foundSeek: Boolean;
+  notReady:  Bitmask;
+  rOut:      Bitmask;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('SCOLS open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  { TSrcList header (8 bytes) + one TSrcItem. }
+  SetLength(bufSL, SizeOf(TSrcList) + SizeOf(TSrcItem));
+  FillChar(bufSL[0], Length(bufSL), 0);
+  pSL := PSrcList(@bufSL[0]);
+  pSL^.nSrc   := 1;
+  pSL^.nAlloc := 1;
+  pSItem := @SrcListItems(pSL)[0];
+  pSItem^.iCursor := 9;       { arbitrary cursor id }
+  pSItem^.fg.jointype := 0;   { not LEFT — skip iLeftJoin init }
+
+  { TWhereInfo + one TWhereLevel. }
+  SetLength(bufWI, SZ_WHEREINFO(N_LEVEL));
+  FillChar(bufWI[0], Length(bufWI), 0);
+  pWInfo := PWhereInfo(@bufWI[0]);
+  pWInfo^.pParse   := @parse;
+  pWInfo^.pTabList := pSL;
+  pWInfo^.nLevel   := N_LEVEL;
+  pWInfo^.revMask  := 0;
+  pWInfo^.wctrlFlags := 0;
+  pLevel := @whereInfoLevels(pWInfo)[0];
+
+  FillChar(loop,    SizeOf(loop),    0);
+  FillChar(term,    SizeOf(term),    0);  term.iParent := -1;
+  FillChar(ex,      SizeOf(ex),      0);
+  FillChar(exRight, SizeOf(exRight), 0);
+
+  { rowid = 42 — TK_EQ with TK_INTEGER literal RHS. }
+  ex.op    := TK_EQ;
+  ex.pRight := @exRight;
+  exRight.op       := TK_INTEGER;
+  exRight.flags    := EP_IntValue;
+  exRight.u.iValue := 42;
+  term.pExpr     := @ex;
+  term.eOperator := WO_EQ;
+
+  alterm[0]      := @term;
+  loop.aLTerm    := @alterm[0];
+  loop.nLTerm    := 1;
+  loop.wsFlags   := WHERE_IPK or WHERE_COLUMN_EQ;
+  loop.u.btree.nEq := 1;
+
+  pLevel^.pWLoop  := @loop;
+  pLevel^.iFrom   := 0;
+  pLevel^.addrBrk := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.regFilter := 0;
+  pLevel^.op      := 99;        { sentinel — must be flipped to OP_Noop }
+
+  notReady := not Bitmask(0);
+  base := sqlite3VdbeCurrentAddr(v);
+
+  { ---- SCOLS1 — Case 2 IPK rowid-EQ emits OP_SeekRowid + sets pLevel^.op
+         to OP_Noop, leaves addrNxt = addrBrk. ---- }
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS1 returns pLevel^.notReady', rOut = pLevel^.notReady);
+  Check('SCOLS1 addrNxt = addrBrk',
+        pLevel^.addrNxt = pLevel^.addrBrk);
+  Check('SCOLS1 addrCont label allocated',
+        pLevel^.addrCont < 0);     { sqlite3VdbeMakeLabel returns a negative id }
+  Check('SCOLS1 pLevel^.op flipped to OP_Noop',
+        pLevel^.op = OP_Noop);
+  Check('SCOLS1 term flagged TERM_CODED',
+        (term.wtFlags and TERM_CODED) <> 0);
+
+  foundSeek := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_SeekRowid) and (pOp^.p1 = pSItem^.iCursor) then
+      foundSeek := True;
+  end;
+  Check('SCOLS1 OP_SeekRowid emitted on iCursor=9', foundSeek);
+
+  { ---- SCOLS2 — LEFT JOIN flag init: pLevel^.iFrom>0 + JT_LEFT lights
+         iLeftJoin and emits OP_Integer 0 → reg.  We exercise the prelude
+         alone by setting wsFlags=0 and switching to a stub Case path —
+         that would Assert(False).  Instead, drive the whole flow with the
+         LEFT-flag + the IPK rowid path, and verify iLeftJoin populated. ---- }
+  pSItem^.fg.jointype := JT_LEFT;
+  { Synthesize a 2-level frame so iFrom>0 path activates. }
+  SetLength(bufWI, SZ_WHEREINFO(2));
+  FillChar(bufWI[0], Length(bufWI), 0);
+  pWInfo := PWhereInfo(@bufWI[0]);
+  pWInfo^.pParse   := @parse;
+  pWInfo^.pTabList := pSL;
+  pWInfo^.nLevel   := 2;
+  pLevel := @whereInfoLevels(pWInfo)[1];   { level 1 → iFrom>0 branch }
+  FillChar(term, SizeOf(term), 0); term.iParent := -1;
+  term.pExpr := @ex;
+  term.eOperator := WO_EQ;
+  alterm[0] := @term;
+  pLevel^.pWLoop  := @loop;
+  pLevel^.iFrom   := 1;
+  pLevel^.addrBrk := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.iLeftJoin := 0;
+  pLevel^.op      := 99;
+  loop.wsFlags := WHERE_IPK or WHERE_COLUMN_EQ;
+  loop.u.btree.nEq := 1;
+
+  { Need iFrom=1 to index pTabList — extend SrcList to hold 2 items. }
+  SetLength(bufSL, SizeOf(TSrcList) + 2 * SizeOf(TSrcItem));
+  pSL := PSrcList(@bufSL[0]);
+  pSL^.nSrc := 2; pSL^.nAlloc := 2;
+  pWInfo^.pTabList := pSL;
+  FillChar(SrcListItems(pSL)[0], SizeOf(TSrcItem), 0);
+  FillChar(SrcListItems(pSL)[1], SizeOf(TSrcItem), 0);
+  SrcListItems(pSL)[1].iCursor := 11;
+  SrcListItems(pSL)[1].fg.jointype := JT_LEFT;
+
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 1, pLevel, notReady);
+  Check('SCOLS2 LEFT JOIN flag allocated (iLeftJoin>0)',
+        pLevel^.iLeftJoin > 0);
+  Check('SCOLS2 still routes through Case 2 → OP_Noop',
+        pLevel^.op = OP_Noop);
+  Check('SCOLS2 returns pLevel^.notReady', rOut = pLevel^.notReady);
+
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -4640,6 +4793,7 @@ begin
   TestRowidAlias;
   TestFindInIndex;
   TestCodeINTerm;
+  TestCodeOneLoopStart;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.
