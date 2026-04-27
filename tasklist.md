@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 169 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 170); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 196 PASS / 2
+    DIVERGE / 0 ERROR (corpus = 198); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -191,8 +191,8 @@ Important: At the end of this document, please find:
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
   comparison ops + literal-arith + col aliases + multi-col index +
   multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **169 PASS / 1 DIVERGE / 0 ERROR**
-  (corpus = 170 after probe sweep #7).
+  Current Status (2026-04-27): **196 PASS / 2 DIVERGE / 0 ERROR**
+  (corpus = 198 after probe sweep #8).
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -200,6 +200,8 @@ Important: At the end of this document, please find:
   DIVERGE rows + delta = (C ops − Pas ops):
 
   - DROP TABLE — Δ=21 (step 4)
+  - SELECT NULLIF — Δ=1 (probe sweep #8: NULLIF(a,0) op count
+    C=14 Pas=13; minor opcode-emission gap in the NULLIF expansion).
 
   Root cause for DROP TABLE Δ=21 (re-analysis 2026-04-27 from
   bytecode dump):
@@ -270,15 +272,14 @@ Important: At the end of this document, please find:
 
     - [ ] **6.10 step 6** Expand corpus further and drive remaining
       DIVERGEs to PASS, then promote from report-only to hard gate.
-      Corpus now 169 PASS / 1 DIVERGE / 170 total.  Probe sweep #7
-      added 44 PASS rows — sweep #7a (35 rows): chained arith,
-      mixed col/lit projection lists, paren grouping `(a+b)*c`,
-      NULL/zeros INSERT, BEGIN…TRANSACTION variants, typed-mixed
-      CREATE TABLE, large-rowid EQ, `SELECT *,1 FROM t`, more
-      SAVEPOINT/RELEASE pairs, `1.5` float literal.  Sweep #7b
-      (9 rows): predicate / unary / function shapes — `IS NULL`,
-      `IS NOT NULL`, `NOT a`, `a IS 1`, `a IS NOT 1`, `BETWEEN`,
-      `CAST`, `COALESCE`, `CASE WHEN…END`.
+      Corpus now 196 PASS / 2 DIVERGE / 198 total.  Probe sweep #8
+      added 27 PASS rows + 1 new DIVERGE (NULLIF Δ=1): bitwise
+      (`a&b`, `a|b`, `a<<1`, `a>>1`, `~a`, `1&3`, `1|2`, `4>>1`),
+      unary `+a`, `IFNULL`, `COALESCE` 3-arg, simple-form `CASE a
+      WHEN…END`, `CAST(a AS INTEGER/REAL)`, `CAST('5' AS INTEGER)`,
+      `NOT 0`/`NOT 1`, `a IS b`/`a IS NOT b`, `1.0`/`0.1` float
+      literals, multi-AND-3, `INSERT large`, `INSERT alt mixed`,
+      another SAVEPOINT/RELEASE pair, `DROP INDEX IF EXISTS`.
 
       DIVERGE shapes discovered in probe sweeps (kept out of corpus
       until they flip — each is a committable next-agent ticket):

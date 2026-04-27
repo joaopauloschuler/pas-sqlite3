@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 170;
+  N_CORPUS = 198;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -278,6 +278,36 @@ begin
   Add(i, 'SELECT CAST',                 'SELECT CAST(1 AS TEXT);');              Inc(i);
   Add(i, 'SELECT COALESCE',             'SELECT COALESCE(a, 0) FROM t;');        Inc(i);
   Add(i, 'SELECT CASE',                 'SELECT CASE WHEN a=1 THEN 1 ELSE 0 END FROM t;'); Inc(i);
+
+  { Probe sweep #8 — bitwise / unary / extra function / CASE / literal shapes. }
+  Add(i, 'SELECT a&b',                  'SELECT a&b FROM t;');                   Inc(i);
+  Add(i, 'SELECT a|b',                  'SELECT a|b FROM t;');                   Inc(i);
+  Add(i, 'SELECT a<<1',                 'SELECT a<<1 FROM t;');                  Inc(i);
+  Add(i, 'SELECT a>>1',                 'SELECT a>>1 FROM t;');                  Inc(i);
+  Add(i, 'SELECT ~a',                   'SELECT ~a FROM t;');                    Inc(i);
+  Add(i, 'SELECT +a',                   'SELECT +a FROM t;');                    Inc(i);
+  Add(i, 'SELECT 1&3',                  'SELECT 1&3;');                          Inc(i);
+  Add(i, 'SELECT 1|2',                  'SELECT 1|2;');                          Inc(i);
+  Add(i, 'SELECT 4>>1',                 'SELECT 4>>1;');                         Inc(i);
+  Add(i, 'SELECT IFNULL',               'SELECT IFNULL(a, 0) FROM t;');          Inc(i);
+  Add(i, 'SELECT NULLIF',               'SELECT NULLIF(a, 0) FROM t;');          Inc(i);
+  Add(i, 'SELECT COALESCE 3-arg',       'SELECT COALESCE(a, b, 0) FROM t;');     Inc(i);
+  Add(i, 'SELECT CASE simple',          'SELECT CASE a WHEN 1 THEN 1 ELSE 0 END FROM t;'); Inc(i);
+  Add(i, 'SELECT CAST a INT',           'SELECT CAST(a AS INTEGER) FROM t;');    Inc(i);
+  Add(i, 'SELECT CAST a REAL',          'SELECT CAST(a AS REAL) FROM t;');       Inc(i);
+  Add(i, 'SELECT CAST str INT',         'SELECT CAST(''5'' AS INTEGER);');       Inc(i);
+  Add(i, 'SELECT NOT 0',                'SELECT NOT 0;');                        Inc(i);
+  Add(i, 'SELECT NOT 1',                'SELECT NOT 1;');                        Inc(i);
+  Add(i, 'SELECT a IS b',               'SELECT a IS b FROM t;');                Inc(i);
+  Add(i, 'SELECT a IS NOT b',           'SELECT a IS NOT b FROM t;');            Inc(i);
+  Add(i, 'SELECT 1.0',                  'SELECT 1.0;');                          Inc(i);
+  Add(i, 'SELECT 0.1',                  'SELECT 0.1;');                          Inc(i);
+  Add(i, 'SELECT col WHERE multi-AND2', 'SELECT a FROM t WHERE a=1 AND b=2 AND c=3;'); Inc(i);
+  Add(i, 'INSERT large',                'INSERT INTO t VALUES (10,20,30);');     Inc(i);
+  Add(i, 'INSERT alt mixed',            'INSERT INTO s VALUES (1,''x'',NULL);'); Inc(i);
+  Add(i, 'SAVEPOINT s9',                'SAVEPOINT s9;');                        Inc(i);
+  Add(i, 'RELEASE s9',                  'RELEASE s9;');                          Inc(i);
+  Add(i, 'DROP INDEX IF EXISTS 2',      'DROP INDEX IF EXISTS i_other;');        Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
