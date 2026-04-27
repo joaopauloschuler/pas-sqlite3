@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 597;
+  N_CORPUS = 734;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -737,6 +737,154 @@ begin
   Add(i, 'SELECT x WHERE rowid=2',      'SELECT x FROM s WHERE rowid=2;');       Inc(i);
   Add(i, 'SELECT x WHERE rowid=3',      'SELECT x FROM s WHERE rowid=3;');       Inc(i);
   Add(i, 'SELECT y WHERE rowid=1',      'SELECT y FROM s WHERE rowid=1;');       Inc(i);
+
+  { Probe sweep #23 — more adjacent shapes (arith, col WHERE, INSERT,
+    DELETE rowid, SAVEPOINT/RELEASE, CREATE TABLE/INDEX, col concat). }
+  Add(i, 'SELECT 21+21',                'SELECT 21+21;');                        Inc(i);
+  Add(i, 'SELECT 25-12',                'SELECT 25-12;');                        Inc(i);
+  Add(i, 'SELECT 7*8',                  'SELECT 7*8;');                          Inc(i);
+  Add(i, 'SELECT 64/8',                 'SELECT 64/8;');                         Inc(i);
+  Add(i, 'SELECT 11%3',                 'SELECT 11%3;');                         Inc(i);
+  Add(i, 'SELECT a+5',                  'SELECT a+5 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a-5',                  'SELECT a-5 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a*6',                  'SELECT a*6 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a/6',                  'SELECT a/6 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a%6',                  'SELECT a%6 FROM t;');                   Inc(i);
+  Add(i, 'SELECT b+5',                  'SELECT b+5 FROM t;');                   Inc(i);
+  Add(i, 'SELECT c+5',                  'SELECT c+5 FROM t;');                   Inc(i);
+  Add(i, 'SELECT b||c',                 'SELECT b||c FROM t;');                  Inc(i);
+  Add(i, 'SELECT a||c',                 'SELECT a||c FROM t;');                  Inc(i);
+  Add(i, 'SELECT a WHERE rowid=21',     'SELECT a FROM t WHERE rowid=21;');      Inc(i);
+  Add(i, 'SELECT a WHERE rowid=22',     'SELECT a FROM t WHERE rowid=22;');      Inc(i);
+  Add(i, 'SELECT a WHERE rowid=23',     'SELECT a FROM t WHERE rowid=23;');      Inc(i);
+  Add(i, 'SELECT a WHERE a=8',          'SELECT a FROM t WHERE a=8;');           Inc(i);
+  Add(i, 'SELECT a WHERE a=9',          'SELECT a FROM t WHERE a=9;');           Inc(i);
+  Add(i, 'INSERT t 16 32 48',           'INSERT INTO t VALUES(16,32,48);');      Inc(i);
+  Add(i, 'INSERT t 17 34 51',           'INSERT INTO t VALUES(17,34,51);');      Inc(i);
+  Add(i, 'INSERT alt 20 21 22',         'INSERT INTO s VALUES(20,21,22);');      Inc(i);
+  Add(i, 'INSERT alt 30 31 32',         'INSERT INTO s VALUES(30,31,32);');      Inc(i);
+  Add(i, 'DELETE rowid=60',             'DELETE FROM t WHERE rowid=60;');        Inc(i);
+  Add(i, 'DELETE rowid=70',             'DELETE FROM t WHERE rowid=70;');        Inc(i);
+  Add(i, 'DELETE s rowid=15',           'DELETE FROM s WHERE rowid=15;');        Inc(i);
+  Add(i, 'SAVEPOINT spQ',               'SAVEPOINT spQ;');                       Inc(i);
+  Add(i, 'RELEASE spQ',                 'RELEASE spQ;');                         Inc(i);
+  Add(i, 'SAVEPOINT eleven',            'SAVEPOINT eleven;');                    Inc(i);
+  Add(i, 'CREATE TABLE z37 3col',       'CREATE TABLE z37(a,b,c);');             Inc(i);
+  Add(i, 'CREATE TABLE z38 typed',      'CREATE TABLE z38(p TEXT, q INTEGER);'); Inc(i);
+  Add(i, 'CREATE TABLE z39 INT col',    'CREATE TABLE z39(only INTEGER);');      Inc(i);
+  Add(i, 'CREATE INDEX i_t_a3',         'CREATE INDEX i_t_a3 ON t(a);');         Inc(i);
+  Add(i, 'CREATE UNIQUE INDEX i8u',     'CREATE UNIQUE INDEX i8u ON s(x);');     Inc(i);
+
+  { Probe sweep #24 — more adjacent shapes (NOT/IS, CAST, COALESCE, CASE,
+    bitwise, more col scans, more SAVEPOINTs / CREATEs / INSERTs / DELETEs). }
+  Add(i, 'SELECT NOT a col',            'SELECT NOT a FROM t;');                 Inc(i);
+  Add(i, 'SELECT NOT b col',            'SELECT NOT b FROM t;');                 Inc(i);
+  Add(i, 'SELECT a IS NULL col',        'SELECT a IS NULL FROM t;');             Inc(i);
+  Add(i, 'SELECT b IS NULL col',        'SELECT b IS NULL FROM t;');             Inc(i);
+  Add(i, 'SELECT c IS NULL col',        'SELECT c IS NULL FROM t;');             Inc(i);
+  Add(i, 'SELECT a IS NOT NULL b',      'SELECT a IS NOT NULL FROM t;');         Inc(i);
+  Add(i, 'SELECT b IS NOT NULL b',      'SELECT b IS NOT NULL FROM t;');         Inc(i);
+  Add(i, 'SELECT CAST b INT',           'SELECT CAST(b AS INTEGER) FROM t;');    Inc(i);
+  Add(i, 'SELECT CAST c INT',           'SELECT CAST(c AS INTEGER) FROM t;');    Inc(i);
+  Add(i, 'SELECT CAST b TEXT',          'SELECT CAST(b AS TEXT) FROM t;');       Inc(i);
+  Add(i, 'SELECT CAST c TEXT',          'SELECT CAST(c AS TEXT) FROM t;');       Inc(i);
+  Add(i, 'SELECT IFNULL b',             'SELECT IFNULL(b, 0) FROM t;');          Inc(i);
+  Add(i, 'SELECT IFNULL c',             'SELECT IFNULL(c, 0) FROM t;');          Inc(i);
+  Add(i, 'SELECT NULLIF b',             'SELECT NULLIF(b, 0) FROM t;');          Inc(i);
+  Add(i, 'SELECT COALESCE b',           'SELECT COALESCE(b, 0) FROM t;');        Inc(i);
+  Add(i, 'SELECT COALESCE c',           'SELECT COALESCE(c, 0) FROM t;');        Inc(i);
+  Add(i, 'SELECT b&c',                  'SELECT b&c FROM t;');                   Inc(i);
+  Add(i, 'SELECT b|c',                  'SELECT b|c FROM t;');                   Inc(i);
+  Add(i, 'SELECT b<<1',                 'SELECT b<<1 FROM t;');                  Inc(i);
+  Add(i, 'SELECT c<<1',                 'SELECT c<<1 FROM t;');                  Inc(i);
+  Add(i, 'SELECT ~b',                   'SELECT ~b FROM t;');                    Inc(i);
+  Add(i, 'SELECT +b',                   'SELECT +b FROM t;');                    Inc(i);
+  Add(i, 'SELECT a WHERE rowid=24',     'SELECT a FROM t WHERE rowid=24;');      Inc(i);
+  Add(i, 'SELECT a WHERE rowid=25',     'SELECT a FROM t WHERE rowid=25;');      Inc(i);
+  Add(i, 'SELECT a WHERE a=15',         'SELECT a FROM t WHERE a=15;');          Inc(i);
+  Add(i, 'INSERT t 18 36 54',           'INSERT INTO t VALUES(18,36,54);');      Inc(i);
+  Add(i, 'INSERT t 19 38 57',           'INSERT INTO t VALUES(19,38,57);');      Inc(i);
+  Add(i, 'INSERT alt 40 41 42',         'INSERT INTO s VALUES(40,41,42);');      Inc(i);
+  Add(i, 'DELETE rowid=80',             'DELETE FROM t WHERE rowid=80;');        Inc(i);
+  Add(i, 'DELETE rowid=90',             'DELETE FROM t WHERE rowid=90;');        Inc(i);
+  Add(i, 'DELETE s rowid=20',           'DELETE FROM s WHERE rowid=20;');        Inc(i);
+  Add(i, 'SAVEPOINT spR',               'SAVEPOINT spR;');                       Inc(i);
+  Add(i, 'RELEASE spR',                 'RELEASE spR;');                         Inc(i);
+  Add(i, 'CREATE INDEX i_t_b4',         'CREATE INDEX i_t_b4 ON t(b);');         Inc(i);
+  Add(i, 'CREATE INDEX i_t_c3',         'CREATE INDEX i_t_c3 ON t(c);');         Inc(i);
+
+  { Probe sweep #25 — extra adjacent shapes (more multi-AND / BETWEEN /
+    CASE / cast / arith / col concat / SAVEPOINT / CREATE / DELETE all). }
+  Add(i, 'SELECT BETWEEN 5 10',         'SELECT a FROM t WHERE a BETWEEN 5 AND 10;'); Inc(i);
+  Add(i, 'SELECT BETWEEN 0 100',        'SELECT a FROM t WHERE a BETWEEN 0 AND 100;'); Inc(i);
+  Add(i, 'SELECT BETWEEN -1 1',         'SELECT a FROM t WHERE a BETWEEN -1 AND 1;'); Inc(i);
+  Add(i, 'SELECT CASE b',               'SELECT CASE b WHEN 1 THEN 1 ELSE 0 END FROM t;'); Inc(i);
+  Add(i, 'SELECT CASE c',               'SELECT CASE c WHEN 1 THEN 1 ELSE 0 END FROM t;'); Inc(i);
+  Add(i, 'SELECT CASE WHEN b=1',        'SELECT CASE WHEN b=1 THEN 1 ELSE 0 END FROM t;'); Inc(i);
+  Add(i, 'SELECT CAST 2.5 INT',         'SELECT CAST(2.5 AS INTEGER);');         Inc(i);
+  Add(i, 'SELECT CAST -1 TEXT',         'SELECT CAST(-1 AS TEXT);');             Inc(i);
+  Add(i, 'SELECT CAST 0 TEXT',          'SELECT CAST(0 AS TEXT);');              Inc(i);
+  Add(i, 'SELECT 9*9',                  'SELECT 9*9;');                          Inc(i);
+  Add(i, 'SELECT 6*7',                  'SELECT 6*7;');                          Inc(i);
+  Add(i, 'SELECT 50+50',                'SELECT 50+50;');                        Inc(i);
+  Add(i, 'SELECT 1000-1',               'SELECT 1000-1;');                       Inc(i);
+  Add(i, 'SELECT 0/1',                  'SELECT 0/1;');                          Inc(i);
+  Add(i, 'SELECT a||b||1',              'SELECT a||b||1 FROM t;');               Inc(i);
+  Add(i, 'SELECT 1||a',                 'SELECT 1||a FROM t;');                  Inc(i);
+  Add(i, 'SELECT a*b*1',                'SELECT a*b*1 FROM t;');                 Inc(i);
+  Add(i, 'SELECT a+b+0',                'SELECT a+b+0 FROM t;');                 Inc(i);
+  Add(i, 'SELECT col WHERE multi3-AND', 'SELECT b FROM t WHERE a=1 AND b=2 AND c=3;'); Inc(i);
+  Add(i, 'SELECT col WHERE 2-AND2',     'SELECT a FROM t WHERE b=2 AND c=3;');   Inc(i);
+  Add(i, 'INSERT t 20 40 60',           'INSERT INTO t VALUES(20,40,60);');      Inc(i);
+  Add(i, 'INSERT t 21 42 63',           'INSERT INTO t VALUES(21,42,63);');      Inc(i);
+  Add(i, 'INSERT alt 50 60 70',         'INSERT INTO s VALUES(50,60,70);');      Inc(i);
+  Add(i, 'INSERT alt mixed 2',          'INSERT INTO s VALUES(NULL,1,2);');      Inc(i);
+  Add(i, 'DELETE rowid=200',            'DELETE FROM t WHERE rowid=200;');       Inc(i);
+  Add(i, 'DELETE s rowid=25',           'DELETE FROM s WHERE rowid=25;');        Inc(i);
+  Add(i, 'DELETE s rowid=30',           'DELETE FROM s WHERE rowid=30;');        Inc(i);
+  Add(i, 'SAVEPOINT spS',               'SAVEPOINT spS;');                       Inc(i);
+  Add(i, 'RELEASE spS',                 'RELEASE spS;');                         Inc(i);
+  Add(i, 'SAVEPOINT twelve',            'SAVEPOINT twelve;');                    Inc(i);
+  Add(i, 'CREATE TABLE z40 5col',       'CREATE TABLE z40(a,b,c,d,e);');         Inc(i);
+  Add(i, 'CREATE TABLE z41 typed2',     'CREATE TABLE z41(x INTEGER, y TEXT);'); Inc(i);
+  Add(i, 'CREATE INDEX i_t_a4',         'CREATE INDEX i_t_a4 ON t(a);');         Inc(i);
+  Add(i, 'CREATE UNIQUE INDEX i9u',     'CREATE UNIQUE INDEX i9u ON s(y);');     Inc(i);
+
+  { Probe sweep #26 — extra mixed adjacent shapes. }
+  Add(i, 'SELECT 22+22',                'SELECT 22+22;');                        Inc(i);
+  Add(i, 'SELECT 33-11',                'SELECT 33-11;');                        Inc(i);
+  Add(i, 'SELECT 7*7',                  'SELECT 7*7;');                          Inc(i);
+  Add(i, 'SELECT 121/11',               'SELECT 121/11;');                       Inc(i);
+  Add(i, 'SELECT 13%5',                 'SELECT 13%5;');                         Inc(i);
+  Add(i, 'SELECT 0*0',                  'SELECT 0*0;');                          Inc(i);
+  Add(i, 'SELECT -5+5',                 'SELECT -5+5;');                         Inc(i);
+  Add(i, 'SELECT -5*-5',                'SELECT -5*-5;');                        Inc(i);
+  Add(i, 'SELECT a+10',                 'SELECT a+10 FROM t;');                  Inc(i);
+  Add(i, 'SELECT a-10',                 'SELECT a-10 FROM t;');                  Inc(i);
+  Add(i, 'SELECT a*10',                 'SELECT a*10 FROM t;');                  Inc(i);
+  Add(i, 'SELECT a/10',                 'SELECT a/10 FROM t;');                  Inc(i);
+  Add(i, 'SELECT b+10',                 'SELECT b+10 FROM t;');                  Inc(i);
+  Add(i, 'SELECT c+10',                 'SELECT c+10 FROM t;');                  Inc(i);
+  Add(i, 'SELECT a WHERE rowid=26',     'SELECT a FROM t WHERE rowid=26;');      Inc(i);
+  Add(i, 'SELECT a WHERE rowid=27',     'SELECT a FROM t WHERE rowid=27;');      Inc(i);
+  Add(i, 'SELECT a WHERE rowid=28',     'SELECT a FROM t WHERE rowid=28;');      Inc(i);
+  Add(i, 'SELECT a WHERE a=20',         'SELECT a FROM t WHERE a=20;');          Inc(i);
+  Add(i, 'SELECT a WHERE a=30',         'SELECT a FROM t WHERE a=30;');          Inc(i);
+  Add(i, 'SELECT a WHERE a=50',         'SELECT a FROM t WHERE a=50;');          Inc(i);
+  Add(i, 'INSERT t 22 44 66',           'INSERT INTO t VALUES(22,44,66);');      Inc(i);
+  Add(i, 'INSERT t 23 46 69',           'INSERT INTO t VALUES(23,46,69);');      Inc(i);
+  Add(i, 'INSERT alt 60 70 80',         'INSERT INTO s VALUES(60,70,80);');      Inc(i);
+  Add(i, 'INSERT alt -10 -20 -30',      'INSERT INTO s VALUES(-10,-20,-30);');   Inc(i);
+  Add(i, 'DELETE rowid=110',            'DELETE FROM t WHERE rowid=110;');       Inc(i);
+  Add(i, 'DELETE s rowid=40',           'DELETE FROM s WHERE rowid=40;');        Inc(i);
+  Add(i, 'SAVEPOINT spT',               'SAVEPOINT spT;');                       Inc(i);
+  Add(i, 'RELEASE spT',                 'RELEASE spT;');                         Inc(i);
+  Add(i, 'SAVEPOINT thirteen',          'SAVEPOINT thirteen;');                  Inc(i);
+  Add(i, 'CREATE TABLE z42 1col',       'CREATE TABLE z42(only2);');             Inc(i);
+  Add(i, 'CREATE TABLE z43 2col',       'CREATE TABLE z43(a,b);');               Inc(i);
+  Add(i, 'CREATE INDEX i_s_x5',         'CREATE INDEX i_s_x5 ON s(x);');         Inc(i);
+  Add(i, 'CREATE INDEX i_s_y5',         'CREATE INDEX i_s_y5 ON s(y);');         Inc(i);
+  Add(i, 'CREATE UNIQUE INDEX i10u',    'CREATE UNIQUE INDEX i10u ON s(z);');    Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
