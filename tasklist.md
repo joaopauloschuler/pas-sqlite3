@@ -113,8 +113,13 @@ Important: At the end of this document, please find:
           path, not yet ported).
         [ ] `SELECT COUNT(*)` — Δ=−1; `SELECT SUM/MIN/MAX(a)` —
           Δ=3..4 (aggregate-no-GROUP path, partial codegen).
-        [ ] `SELECT a FROM t LIMIT 5 OFFSET 2` — Δ=13 (OFFSET path:
-          Pas emits only 3 ops, no offset-skip register init).
+        [X] `SELECT a FROM t LIMIT 5 OFFSET 2` — OFFSET path now ports
+          the OFFSET arm of `computeLimitRegisters` (iOffset + helper
+          allocation, ExprCode + MustBeInt + OffsetLimit prologue) and
+          `codeOffset`'s in-loop IfPos.  `sqlite3WhereBegin`'s scan
+          return path now publishes `pLevel^.addrCont` to
+          `pWInfo^.iContinue` so the IfPos jumps to OP_Next, not iBreak.
+          Probe PASSes at 16 ops.
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
           materialise / co-routine path not ported).
         [ ] `UPDATE t SET a=5 WHERE rowid=1` — Δ=14 (`sqlite3Update`

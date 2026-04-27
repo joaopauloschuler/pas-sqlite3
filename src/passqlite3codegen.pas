@@ -14619,6 +14619,10 @@ begin
     end;
   end;
 
+  { Mirror where.c:7634 — publish the level's addrCont so callers
+    (e.g. selectInnerLoop / codeOffset) jump to the per-row continue
+    point (resolved to OP_Next by sqlite3WhereEnd) instead of iBreak. }
+  pWInfo^.iContinue := pLevel^.addrCont;
   Result := pWInfo;
 end;
 
@@ -17313,13 +17317,12 @@ begin
   if p^.pHaving    <> nil then begin Result := SQLITE_OK; Exit; end;
   if p^.pOrderBy   <> nil then begin Result := SQLITE_OK; Exit; end;
   { SRT_Exists: pLimit is set to LIMIT 1 by sqlite3CodeSubselect — allow it.
-    Non-Exists: accept the constant-integer LIMIT shape (no OFFSET) — the
-    only one currently exercised by the parity corpus.  Falls back to the
-    stub for OFFSET / non-constant LIMIT until those land. }
+    Non-Exists: accept the constant-integer LIMIT shape, optionally with
+    an OFFSET expression (any expr; coded via sqlite3ExprCode + MustBeInt).
+    Falls back to the stub for non-constant LIMIT until that lands. }
   if (p^.pLimit <> nil) and (not isExists) then
   begin
-    if (p^.pLimit^.pRight <> nil)
-       or (p^.pLimit^.pLeft = nil)
+    if (p^.pLimit^.pLeft = nil)
        or (sqlite3ExprIsInteger(p^.pLimit^.pLeft, nil, pParse) = 0) then
     begin Result := SQLITE_OK; Exit; end;
   end;
@@ -17402,13 +17405,25 @@ begin
       sqlite3ExprIsInteger arm of computeLimitRegisters
       (select.c:2520..2530).  Emits OP_Integer N, iLimit before the
       WHERE loop opens; DecrJumpZero is emitted in the inner loop
-      after OP_ResultRow. }
+      after OP_ResultRow.  When pRight (OFFSET) is present, allocate
+      iOffset + helper, code OFFSET expr, MustBeInt, OffsetLimit;
+      mirrors computeLimitRegisters lines 2544..2552. }
     i := 0;
     sqlite3ExprIsInteger(p^.pLimit^.pLeft, @i, pParse);
     Inc(pParse^.nMem);
     iLimitReg := pParse^.nMem;
     p^.iLimit  := iLimitReg;
     sqlite3VdbeAddOp2(v, OP_Integer, i, iLimitReg);
+    if p^.pLimit^.pRight <> nil then
+    begin
+      Inc(pParse^.nMem);
+      p^.iOffset := pParse^.nMem;
+      Inc(pParse^.nMem);   { extra register for limit+offset }
+      sqlite3ExprCode(pParse, p^.pLimit^.pRight, p^.iOffset);
+      sqlite3VdbeAddOp1(v, OP_MustBeInt, p^.iOffset);
+      sqlite3VdbeAddOp3(v, OP_OffsetLimit, iLimitReg,
+                        p^.iOffset + 1, p^.iOffset);
+    end;
   end;
 
   { Drive the WHERE machinery for the (single, no-WHERE) loop body.
@@ -17449,6 +17464,11 @@ begin
       sqlite3VdbeAddOp2(v, OP_DecrJumpZero, iLimitReg, pWInfo^.iBreak);
   end else begin
     { Non-EXISTS path: emit result columns. iSdst was already allocated above. }
+
+    { OFFSET skip — codeOffset (select.c:881..887): emit IfPos at top of
+      inner loop body so rows below the OFFSET threshold are skipped. }
+    if p^.iOffset > 0 then
+      sqlite3VdbeAddOp3(v, OP_IfPos, p^.iOffset, pWInfo^.iContinue, 1);
 
     { Inner loop body — one OP_Column per result column (selectInnerLoop:1197).
       For TK_COLUMN / TK_AGG_COLUMN use sqlite3ExprCodeGetColumnOfTable
