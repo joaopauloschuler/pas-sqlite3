@@ -12,6 +12,8 @@ DO NOT default to the same work pattern as recent commits without questioning wh
 
 BEFORE TRYING TO FIX A BUG, LOOK AT THE ORIGINAL C IMPLEMENTATION!!!
 
+BEFORE STARTING TO PORT A NEW FUNCTION OR PROCEDURE, CHECK IF THIS FUNCTION ALREADY EXISTS AND IS NOT A STUB.
+
 Goal: **behavioural and on-disk parity with the C reference.** The Pascal build
 must (a) produce byte-identical `.db` files for the same SQL input, (b) return
 identical query results, and (c) emit the same VDBE bytecode for the same SQL.
