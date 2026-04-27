@@ -7411,6 +7411,76 @@ begin
   sqlite3WalkSelect(@w, p);
 end;
 
+{ existsToJoin — port of select.c:7317..7378 (SQLite 3.53.0).
+  Walks a WHERE clause for TK_EXISTS subqueries that match a tight
+  eligibility profile, and rewrites them as additional FROM clause
+  entries on the parent SELECT (with SrcItem.fg.fromExists=1).  This is
+  the EXISTS-to-JOIN optimisation; it lets the planner see the EXISTS
+  subquery's table as a regular join member, eligible for autoindex /
+  bloom filter co-optimization. }
+procedure existsToJoin(pParse: PParse; p: PSelect; pWhere: PExpr);
+var
+  pRight:    PExpr;
+  pSub:      PSelect;
+  pSubWhere: PExpr;
+  pSubItem:  PSrcItem;
+  db:        PTsqlite3;
+  aCsrMap:   Pi32;
+begin
+  if (pParse^.nErr <> 0) or (pWhere = nil)
+     or ExprHasProperty(pWhere, EP_OuterON or EP_InnerON)
+     or (p^.pSrc = nil) or (p^.pSrc^.nSrc >= BMS) then Exit;
+
+  if pWhere^.op = TK_AND then
+  begin
+    pRight := pWhere^.pRight;
+    existsToJoin(pParse, p, pWhere^.pLeft);
+    existsToJoin(pParse, p, pRight);
+    Exit;
+  end;
+
+  if pWhere^.op <> TK_EXISTS then Exit;
+
+  pSub := pWhere^.x.pSelect;
+  pSubWhere := pSub^.pWhere;
+  pSubItem  := @SrcListItems(pSub^.pSrc)[0];
+
+  if (pSub^.pSrc^.nSrc <> 1)
+     or ((pSub^.selFlags and SF_Aggregate) <> 0)
+     or ((pSubItem^.fg.fgBits and u8($04)) <> 0)  { isSubquery }
+     or (pSub^.pLimit <> nil)
+     or (pSub^.pPrior <> nil) then Exit;
+
+  { Renumber subquery cursors so a duplicated EXISTS Expr can't collide. }
+  db := pParse^.db;
+  aCsrMap := Pi32(sqlite3DbMallocZero(db, (pParse^.nTab + 2) * SizeOf(i32)));
+  if aCsrMap = nil then Exit;
+  aCsrMap[0] := pParse^.nTab + 1;
+  renumberCursors(pParse, pSub, -1, aCsrMap);
+  sqlite3DbFree(db, aCsrMap);
+
+  { Collapse the EXISTS Expr to TK_INTEGER 1. }
+  FillChar(pWhere^, SizeOf(TExpr), 0);
+  pWhere^.op := u8(TK_INTEGER);
+  pWhere^.u.iValue := 1;
+  ExprSetProperty(pWhere, EP_IntValue);
+
+  Assert(p^.pWhere <> nil, 'existsToJoin: parent pWhere');
+  pSubItem^.fg.fgBits3 := pSubItem^.fg.fgBits3 or u8($04);  { fromExists }
+  p^.pSrc := sqlite3SrcListAppendList(pParse, p^.pSrc, pSub^.pSrc);
+  if pSubWhere <> nil then
+  begin
+    p^.pWhere := sqlite3PExpr(pParse, TK_AND, p^.pWhere, pSubWhere);
+    pSub^.pWhere := nil;
+  end;
+  pSub^.pSrc := nil;
+  sqlite3ParserAddCleanup(pParse, @sqlite3SelectDeleteGeneric, pSub);
+
+  { Recurse into the (now-detached) subselect WHERE in case it contains
+    another nested EXISTS that should also be hoisted. }
+  existsToJoin(pParse, p, pSubWhere);
+end;
+
 procedure sqlite3SelectPopWith(pWalker: PWalker; pSel: PSelect); cdecl;
 begin
   { Phase 6.3 stub }
@@ -13920,6 +13990,17 @@ begin
         begin
           sqlite3OpenTable(pParse, pTabItem^.iCursor, iDb, pTab, OP_OpenRead);
           sqlite3VdbeChangeP5(v, 0);
+          { where.c:7310..7316 — for inner-join tables at level >= 2 whose
+            addrHalt matches the outermost level, emit OP_IfEmpty so an
+            empty fromExists subquery short-circuits the whole query.
+            Mirror the gate exactly; the join-type filter excludes LEFT
+            and LTORJ (RIGHT) joins where the cursor must remain alive. }
+          if (ii >= 2)
+             and ((pTabItem^.fg.jointype and (JT_LTORJ or JT_LEFT)) = 0)
+             and (pLevel^.addrHalt = whereInfoLevels(pWInfo)[0].addrHalt) then
+          begin
+            sqlite3VdbeAddOp2(v, OP_IfEmpty, pTabItem^.iCursor, pWInfo^.iBreak);
+          end;
         end;
       end;
       if iDb >= 0 then
@@ -14416,6 +14497,31 @@ begin
     for i := pWInfo^.nLevel - 1 downto 0 do
     begin
       pLevel := @whereInfoLevels(pWInfo)[i];
+      { where.c:7586..7607 — innermost-of-group EXISTS-to-JOIN break.
+        If this level's source has fromExists=1 and either it's the
+        innermost level or the next level is NOT fromExists, emit
+        OP_Goto -> addrBrk of the outermost EXISTS-to-JOIN level so a
+        single matching row terminates the whole nested-EXISTS group. }
+      if (pWInfo^.pTabList <> nil)
+         and ((SrcListItems(pWInfo^.pTabList)[pLevel^.iFrom].fg.fgBits3
+               and u8($04)) <> 0)
+         and ((i = pWInfo^.nLevel - 1)
+              or ((SrcListItems(pWInfo^.pTabList)[
+                     whereInfoLevels(pWInfo)[i + 1].iFrom].fg.fgBits3
+                   and u8($04)) = 0)) then
+      begin
+        { nOuter = number of contiguous outer EXISTS-to-JOIN levels. }
+        j := 0;
+        while j < i do
+        begin
+          if (SrcListItems(pWInfo^.pTabList)[
+                whereInfoLevels(pWInfo)[i - j - 1].iFrom].fg.fgBits3
+              and u8($04)) = 0 then Break;
+          Inc(j);
+        end;
+        sqlite3VdbeAddOp2(v, OP_Goto, 0,
+                          whereInfoLevels(pWInfo)[i - j].addrBrk);
+      end;
       sqlite3VdbeResolveLabel(v, pLevel^.addrCont);
       if pLevel^.op <> OP_Noop then
       begin
@@ -16772,6 +16878,18 @@ begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
   if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+
+  { EXISTS-to-JOIN optimisation — select.c:7897..7902 (sub-progress 51).
+    If the resolver flagged the SELECT as containing an EXISTS subquery,
+    try to graft each eligible EXISTS subselect's FROM into the parent
+    SELECT.  Runs immediately before WHERE-clause constant propagation
+    so the rewritten join sees the same downstream optimisations. }
+  if ((pParse^.parseFlags and PARSEFLAG_BHasExists) <> 0)
+     and OptimizationEnabled(pParse^.db, SQLITE_ExistsToJoin) then
+  begin
+    existsToJoin(pParse, p, p^.pWhere);
+    pTabList := p^.pSrc;
+  end;
 
   { WHERE-clause constant propagation — select.c:7904..7922 (sub-progress 31).
     Mirror C exactly: gate on TK_AND + OptimizationEnabled(SQLITE_PropagateConst).
