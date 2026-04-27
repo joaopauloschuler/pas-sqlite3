@@ -85,24 +85,6 @@ Important: At the end of this document, please find:
         [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
           VALUES path).
         [ ] **IPK-IN execution path**
-            [X] **6.10 step 6.IPK-IN.a** — landed 2026-04-27.
-                Hoist-gate fix at `passqlite3codegen.pas:14296`:
-                force-call `sqlite3FindInIndex(IN_INDEX_MEMBERSHIP)`
-                on `pLoop^.aLTerm[0]` before `DoInRhsHoist` whenever
-                the plan is `WHERE_IPK | WHERE_COLUMN_IN`, regardless
-                of list size.  Required a paired btree fix
-                (`sqlite3BtreePayloadFetch` in `passqlite3btree.pas:2425`):
-                the index-cursor branch was returning `pPayload+nKey`,
-                but for index cells `nKey == nPayload` (length, not
-                offset) — that skipped past the entire record so
-                OP_Column read NULL on every eph-index row.  C
-                `fetchPayload` returns `pPayload` directly for both
-                table and index cursors.  With both fixes,
-                `WHERE rowid IN (1,2)` returns 10,20;
-                `WHERE rowid IN (1,2,3)` returns 10,20,30 (no crash);
-                `WHERE rowid IN (1,2,3,4)` returns 10,20,30.
-                ReproOrRowid extended to 3- and 4-entry lists so
-                regressions surface end-to-end.
             [ ] **6.10 step 6.IPK-IN.b.full** Port 
                 `sqlite3VdbeRecordCompare` in full to cover string (collation
                 + encoding-change), blob (with MEM_Zero), and real
@@ -115,25 +97,6 @@ Important: At the end of this document, please find:
                 reconcile that vs. codegen.pas's bigger
                 TUnpackedRecord before porting the corruption /
                 BIGNULL / DESC arms.
-            [X] **6.10 step 6.IPK-IN.c** — landed 2026-04-27.
-                `src/tests/TestRowidIn.pas` is wired into
-                `src/tests/build.sh` and asserts: rowid IN (2/3/4
-                entries), the OR-rewritten `rowid=K1 OR rowid=K2`
-                shape, and the rowid-EQ control.  Exits non-zero on
-                any failure so regressions surface in the runtime
-                gate, not just the bytecode-only parity gate.
-
-            [X] **6.10 step 6.IPK-IN.e** — landed 2026-04-27.
-                Root cause was in `exprAnalyzeOrTerm`
-                (`passqlite3codegen.pas:8298`): the verify loop had
-                an extra `Dec(i); Inc(pOrTerm);` before its body, so
-                it skipped the candidate term that the search loop
-                broke on.  C's verify loop (whereexpr.c:881) re-uses
-                i and pOrTerm post-break, with the `i--, pOrTerm++`
-                only firing in the for-step.  For 2-term OR, that
-                meant only the second term received TERM_OK and only
-                one IdxInsert was emitted.  Fix: removed the pre-loop
-                step so the candidate is revisited.
         [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
         [ ] `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3
