@@ -13343,7 +13343,11 @@ begin
     pLoop^.nLTerm := 0;
     pLoop^.u.btree.nEq := 0;
     pLoop^.u.btree.pIndex := nil;
-    pLoop^.rRun := 33; { TUNING: full scan cost approximation. }
+    { TUNING — full scan cost mirrors C's whereLoopAddBtree
+      `pNew->rRun = rSize + 16` (where.c around the no-index tail), where
+      rSize = pTab->nRowLogEst (default 200 for an unanalyzed table).
+      Drives OP_Explain p3 to match the C oracle on single-table scans. }
+    pLoop^.rRun := i16(pTab^.nRowLogEst + 16);
     pLoop^.nOut := i16(20);
     whereInfoLevels(pWInfo)[0].pWLoop := pLoop;
     Assert((pWInfo^.sMaskSet.n = 1) and (iCur = pWInfo^.sMaskSet.ix[0]));
@@ -14032,6 +14036,9 @@ begin
           Exit(nil);
         end;
       end;
+      { Phase 6.10 step 7 — emit OP_Explain for this scan, before
+        addrBody is captured (mirrors where.c:7464). }
+      sqlite3WhereExplainOneScan(pParse, pTabList, pLevel, wctrlFlags);
       pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
       notReady := sqlite3WhereCodeOneLoopStart(pParse, v, pWInfo, ii,
                                                pLevel, notReady);
@@ -14113,6 +14120,11 @@ begin
   if ((pLoop^.wsFlags and WHERE_IPK) <> 0)
      and ((pLoop^.wsFlags and WHERE_COLUMN_IN) <> 0) then
     DoInRhsHoist;
+
+  { Phase 6.10 step 7 — emit OP_Explain for this scan (mirrors
+    where.c:7464 sqlite3WhereExplainOneScan call, before pLevel->addrBody
+    is captured). }
+  sqlite3WhereExplainOneScan(pParse, pTabList, pLevel, wctrlFlags);
 
   pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
   pLevel^.addrNxt  := pLevel^.addrBrk;
@@ -26194,14 +26206,35 @@ end;
 
 function sqlite3WhereExplainOneScan(pParse: PParse; pTabList: PSrcList;
   pLevel: PWhereLevel; wctrlFlags: u16): i32;
+var
+  v:    PVdbe;
+  addr: i32;
+  pTop: PParse;
 begin
-  { Upstream returns 0 unless toplevel.explain==2 or stmt-scanstatus is
-    enabled.  pas-sqlite3 does not yet implement EQP text generation, so the
-    stub always returns 0, matching the non-EXPLAIN compile path that every
-    ordinary query takes. }
+  { Phase 6.10 step 7 — port of wherecode.c:245..268.  The C oracle is
+    built with SQLITE_DEBUG, which short-circuits the explain==2 /
+    scanstatus gate so OP_Explain is always emitted for non-OR-subclause,
+    non-MULTI_OR scans.  Match that behaviour: emit OP_Explain p1=addr,
+    p2=pParse^.addrExplain, p3=pLevel^.pWLoop^.rRun.  P4 (the EQP text
+    string) stays NULL until %S printf composition lands; TestExplainParity
+    diffs only opcode/p1/p2/p3/p5, so this is enough to close op-count
+    parity on single-table scan rows.
+
+    Suppressed for OR-subclauses (WHERE_OR_SUBCLAUSE) and MULTI_OR
+    composite plans, matching the C-side gate. }
   Result := 0;
-  if (pParse = nil) and (pTabList = nil) and (pLevel = nil)
-     and (wctrlFlags = 0) then Exit;
+  if (pTabList = nil) and (wctrlFlags = 0) then begin end; { silence unused }
+  if pParse = nil then Exit;
+  if pLevel = nil then Exit;
+  if pLevel^.pWLoop = nil then Exit;
+  if (pLevel^.pWLoop^.wsFlags and WHERE_MULTI_OR) <> 0 then Exit;
+  if (wctrlFlags and WHERE_OR_SUBCLAUSE) <> 0 then Exit;
+  v := pParse^.pVdbe;
+  if v = nil then Exit;
+  addr := sqlite3VdbeCurrentAddr(v);
+  pTop := sqlite3ParseToplevel(pParse);
+  Result := sqlite3VdbeAddOp3(v, OP_Explain, addr,
+              pTop^.addrExplain, i32(pLevel^.pWLoop^.rRun));
 end;
 
 function sqlite3WhereExplainBloomFilter(pParse: PParse; pWInfo: PWhereInfo;
