@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 27;
+  N_CORPUS = 35;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -117,6 +117,16 @@ begin
 
   { Step 6 sub-progress — DEFAULT VALUES now factors OP_Null into prologue. }
   Add(i, 'INSERT DEFAULT VALUES',       'INSERT INTO t DEFAULT VALUES;');        Inc(i);
+
+  { Step 6 sub-progress (probe sweep #2) — additional shapes confirmed PASS. }
+  Add(i, 'CREATE INDEX 2col',           'CREATE INDEX i3 ON t(a,b);');           Inc(i);
+  Add(i, 'RELEASE',                     'RELEASE s1;');                          Inc(i);
+  Add(i, 'SELECT multi-col rowid EQ',   'SELECT a,b FROM t WHERE rowid=5;');     Inc(i);
+  Add(i, 'SELECT * rowid EQ',           'SELECT * FROM t WHERE rowid=5;');       Inc(i);
+  Add(i, 'SELECT col WHERE multi-AND',  'SELECT a FROM t WHERE a=5 AND b=7;');   Inc(i);
+  Add(i, 'SELECT NULL',                 'SELECT NULL;');                         Inc(i);
+  Add(i, 'DELETE rowid EQ AND col',     'DELETE FROM t WHERE rowid=5 AND a=1;'); Inc(i);
+  Add(i, 'SAVEPOINT 2',                 'SAVEPOINT s2;');                        Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
