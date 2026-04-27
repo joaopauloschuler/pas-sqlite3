@@ -5451,6 +5451,112 @@ begin
   Check('GTR-RT nMem not bumped on recycle', parse.nMem = 6);
 end;
 
+{ Leaf-helpers batch 12 — sqlite3ExprCodeGetColumnOfTable.
+  Drives all four arms of the dispatch (rowid alias, virtual-table column,
+  WITHOUT-ROWID PK-mapped column, regular HasRowid + storage-mapped column).
+  COLFLAG_VIRTUAL (generated columns) is asserted against because
+  sqlite3ExprCodeGeneratedColumn is still a Phase 6.x deferral. }
+procedure TestExprCodeGetColumnOfTable;
+var
+  db:    PTsqlite3;
+  parse: TParse;
+  v:     PVdbe;
+  rc:    i32;
+  pTab:  PTable2;
+  pPk:   PIndex2;
+  cols:  array[0..3] of TColumn;
+  pkCol: array[0..0] of i16;
+  base:  i32;
+  pOp:   PVdbeOp;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('ECGCT open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  pTab := PTable2(GetMem(SizeOf(TTable)));
+  FillChar(pTab^, SizeOf(TTable), 0);
+  pTab^.nCol     := 4;
+  pTab^.aCol     := @cols[0];
+  pTab^.iPKey    := 1;          { col 1 is INTEGER PRIMARY KEY rowid alias }
+  pTab^.tabFlags := 0;
+  pTab^.eTabType := 0;          { TABTYP_NORMAL }
+  pTab^.nNVCol   := 4;
+  FillChar(cols, SizeOf(cols), 0);
+
+  { ---- ECGCT1 — iCol < 0 (rowid sentinel) → OP_Rowid. ---- }
+  base := sqlite3VdbeCurrentAddr(v);
+  sqlite3ExprCodeGetColumnOfTable(v, pTab, 7, -1, 11);
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(base) * SizeOf(TVdbeOp));
+  Check('ECGCT1 single opcode',
+        sqlite3VdbeCurrentAddr(v) = base + 1);
+  Check('ECGCT1 opcode = OP_Rowid', pOp^.opcode = OP_Rowid);
+  Check('ECGCT1 p1 = iTabCur',      pOp^.p1 = 7);
+  Check('ECGCT1 p2 = regOut',       pOp^.p2 = 11);
+
+  { ---- ECGCT2 — iCol = iPKey → still OP_Rowid (alias of rowid). ---- }
+  base := sqlite3VdbeCurrentAddr(v);
+  sqlite3ExprCodeGetColumnOfTable(v, pTab, 8, 1, 12);
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(base) * SizeOf(TVdbeOp));
+  Check('ECGCT2 OP_Rowid for iPKey alias',
+        pOp^.opcode = OP_Rowid);
+  Check('ECGCT2 p1 = iTabCur', pOp^.p1 = 8);
+  Check('ECGCT2 p2 = regOut',  pOp^.p2 = 12);
+
+  { ---- ECGCT3 — regular HasRowid table, plain column → OP_Column with
+         storage index from sqlite3TableColumnToStorage (identity here
+         because no virtual columns). ---- }
+  base := sqlite3VdbeCurrentAddr(v);
+  sqlite3ExprCodeGetColumnOfTable(v, pTab, 9, 2, 13);
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(base) * SizeOf(TVdbeOp));
+  Check('ECGCT3 OP_Column for regular column',
+        pOp^.opcode = OP_Column);
+  Check('ECGCT3 p1 = iTabCur', pOp^.p1 = 9);
+  Check('ECGCT3 p2 = storage idx (=iCol, identity)', pOp^.p2 = 2);
+  Check('ECGCT3 p3 = regOut',  pOp^.p3 = 13);
+
+  { ---- ECGCT4 — virtual table → OP_VColumn keyed off the logical iCol. ---- }
+  pTab^.eTabType := TABTYP_VTAB;
+  base := sqlite3VdbeCurrentAddr(v);
+  sqlite3ExprCodeGetColumnOfTable(v, pTab, 10, 3, 14);
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(base) * SizeOf(TVdbeOp));
+  Check('ECGCT4 OP_VColumn for vtab',
+        pOp^.opcode = OP_VColumn);
+  Check('ECGCT4 p1 = iTabCur',     pOp^.p1 = 10);
+  Check('ECGCT4 p2 = iCol passthrough', pOp^.p2 = 3);
+  Check('ECGCT4 p3 = regOut',      pOp^.p3 = 14);
+
+  { ---- ECGCT5 — WITHOUT-ROWID table → OP_Column via PrimaryKeyIndex
+         + sqlite3TableColumnToIndex.  Set up a single-column PK whose
+         aiColumn maps logical col 2 to PK key position 0. ---- }
+  pTab^.eTabType := 0;
+  pTab^.tabFlags := TF_WithoutRowid or TF_HasPrimaryKey;
+  pTab^.iPKey    := -1;          { no rowid alias on WITHOUT ROWID }
+  pPk := PIndex2(GetMem(SizeOf(TIndex)));
+  FillChar(pPk^, SizeOf(TIndex), 0);
+  pPk^.pTable      := pTab;
+  pPk^.idxFlags    := 2;         { SQLITE_IDXTYPE_PRIMARYKEY (low 2 bits) }
+  pPk^.nKeyCol     := 1;
+  pPk^.nColumn     := 1;
+  pkCol[0] := 2;                 { logical col 2 is the PK }
+  pPk^.aiColumn    := @pkCol[0];
+  pTab^.pIndex     := pPk;       { sqlite3PrimaryKeyIndex walks pTab^.pIndex }
+
+  base := sqlite3VdbeCurrentAddr(v);
+  sqlite3ExprCodeGetColumnOfTable(v, pTab, 11, 2, 15);
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(base) * SizeOf(TVdbeOp));
+  Check('ECGCT5 OP_Column for WITHOUT ROWID column',
+        pOp^.opcode = OP_Column);
+  Check('ECGCT5 p1 = iTabCur (= PK cursor)', pOp^.p1 = 11);
+  Check('ECGCT5 p2 = PK key position 0',     pOp^.p2 = 0);
+  Check('ECGCT5 p3 = regOut',                pOp^.p3 = 15);
+
+  FreeMem(pPk);
+  FreeMem(pTab);
+  sqlite3_close(db);
+end;
+
 procedure TestCodeOneLoopStartBody;
 const
   N_LEVEL = 1;
@@ -5473,6 +5579,10 @@ var
   exBody: TExpr;
   fNe, fEq, fNotNull, fIfNot, fIsNull: Boolean;
   rOut:      Bitmask;
+  pTabRJ:    PTable2;
+  rj:        TWhereRightJoin;
+  fFound, fMakeRec, fIdxIns, fFilter, fBegin: Boolean;
+  pSeenFilter: PVdbeOp;
 begin
   rc := sqlite3_open(':memory:', @db);
   Check('SCOLS13 open', rc = SQLITE_OK);
@@ -5597,6 +5707,72 @@ begin
   pSItem^.fg.jointype := 0;
   pLevel^.iLeftJoin := 0;
 
+  { ---- SCOLS17 — RIGHT JOIN match-recording (pLevel^.pRJ <> nil,
+         iLeftJoin=0).  HasRowid table fixture: pTabItem^.pSTab points at
+         a table with default tabFlags (HasRowid=true).  Drives the
+         match-recording block (OP_Found, OP_MakeRecord, OP_IdxInsert,
+         OP_FilterAdd) and the BeginSubrtn block (OP_BeginSubrtn,
+         pRJ^.addrSubrtn, withinRJSubrtn++).  The code_outer_join_constraints
+         fall-through tags the outer-join term as TERM_CODED. ---- }
+  pTabRJ := PTable2(GetMem(SizeOf(TTable)));
+  FillChar(pTabRJ^, SizeOf(TTable), 0);
+  pTabRJ^.iPKey    := -1;
+  pTabRJ^.tabFlags := 0;          { HasRowid = true }
+  pTabRJ^.eTabType := 0;
+  pTabRJ^.nNVCol   := 1;
+  pTabRJ^.nCol     := 1;
+  pSItem^.pSTab := pTabRJ;
+
+  FillChar(rj, SizeOf(rj), 0);
+  rj.iMatch    := 33;
+  rj.regBloom  := 44;
+  rj.regReturn := 55;
+  pLevel^.pRJ := @rj;
+  pLevel^.iLeftJoin := 0;
+  pSItem^.fg.jointype := 0;
+  pBodyTerm^.wtFlags := 0;
+  pBodyTerm^.prereqAll := 0;
+  pWInfo^.bitwiseFlags := 0;
+  parse.withinRJSubrtn := 0;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.op := 99;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+
+  fFound := False; fMakeRec := False; fIdxIns := False;
+  fFilter := False; fBegin := False;
+  pSeenFilter := nil;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_Found) and (pOp^.p1 = 33) then fFound := True;
+    if (pOp^.opcode = OP_MakeRecord) then fMakeRec := True;
+    if (pOp^.opcode = OP_IdxInsert) and (pOp^.p1 = 33) then fIdxIns := True;
+    if (pOp^.opcode = OP_FilterAdd) and (pOp^.p1 = 44) then begin
+      fFilter := True;
+      pSeenFilter := pOp;
+    end;
+    if (pOp^.opcode = OP_BeginSubrtn) and (pOp^.p2 = 55) then fBegin := True;
+  end;
+  Check('SCOLS17 pRJ: OP_Found emitted on iMatch=33', fFound);
+  Check('SCOLS17 pRJ: OP_MakeRecord emitted', fMakeRec);
+  Check('SCOLS17 pRJ: OP_IdxInsert emitted on iMatch=33', fIdxIns);
+  Check('SCOLS17 pRJ: OP_FilterAdd emitted on regBloom=44', fFilter);
+  Check('SCOLS17 pRJ: OP_FilterAdd p5 = OPFLAG_USESEEKRESULT',
+        (pSeenFilter <> nil) and (pSeenFilter^.p5 = OPFLAG_USESEEKRESULT));
+  Check('SCOLS17 pRJ: OP_BeginSubrtn emitted on regReturn=55', fBegin);
+  Check('SCOLS17 pRJ: addrSubrtn set non-zero', rj.addrSubrtn > 0);
+  Check('SCOLS17 pRJ: withinRJSubrtn incremented',
+        parse.withinRJSubrtn = 1);
+  Check('SCOLS17 pRJ: code_outer_join_constraints tagged TERM_CODED',
+        (pBodyTerm^.wtFlags and TERM_CODED) <> 0);
+
+  pLevel^.pRJ := nil;
+  pSItem^.pSTab := nil;
+  FreeMem(pTabRJ);
+
   { ---- SCOLS15 — TERM_VIRTUAL or pre-coded TERM_CODED skips the walk
          entirely; body emits no residual for the term. ---- }
   pBodyTerm^.wtFlags  := TERM_VIRTUAL;
@@ -5682,6 +5858,7 @@ begin
   TestCodeOneLoopStartCase4;
   TestCodeOneLoopStartCase6;
   TestGetTempRange;
+  TestExprCodeGetColumnOfTable;
   TestCodeOneLoopStartBody;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);

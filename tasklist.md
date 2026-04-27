@@ -959,6 +959,68 @@ Important: At the end of this document, please find:
       cache alone), RTR4 (nReg=nRangeReg strict-gt comparison: equal
       block does not displace), GTR-RT round-trip (alloc → release →
       realloc returns the same registers, nMem not double-bumped).
+    - [X] Leaf helpers, batch 12 — `sqlite3ExprCodeGetColumnOfTable`
+      (expr.c:4417..4465).  Emits the opcode that fetches column `iCol`
+      of `pTab` from cursor `iTabCur` into register `regOut`.  Five-way
+      dispatch matching upstream verbatim: (1) `iCol < 0` or
+      `iCol = pTab^.iPKey` shortcuts to `OP_Rowid` (rowid alias path);
+      (2) virtual table (`eTabType = TABTYP_VTAB`) emits `OP_VColumn`
+      keyed off the logical column index; (3) generated columns
+      (`COLFLAG_VIRTUAL` on `pCol^.colFlags`) lands `Assert(False)` until
+      `sqlite3ExprCodeGeneratedColumn` ports — no current caller drives
+      this arm; (4) `WITHOUT-ROWID` tables resolve through
+      `sqlite3TableColumnToIndex(sqlite3PrimaryKeyIndex(pTab), iCol)`
+      and emit `OP_Column` against the PK cursor; (5) regular HasRowid
+      tables use `sqlite3TableColumnToStorage(pTab, iCol)` so virtual-
+      generated columns line up at their packed-after-real-columns
+      storage offset.  All non-rowid arms call `sqlite3ColumnDefault`
+      after the OP_Column / OP_VColumn emit (currently a Phase 6.4
+      stub but threaded for future correctness).  Direct prerequisite
+      of the pRJ RIGHT JOIN match-recording block (Public surface
+      batch 17) which uses it to extract the right-table primary-key
+      tuple for the iMatch / regBloom record-and-filter sequence.
+      Gate: `TestWherePlanner.pas` (610/610): ECGCT1 (iCol=-1 →
+      OP_Rowid, single-opcode emit, p1=iTabCur, p2=regOut), ECGCT2
+      (iCol = iPKey → OP_Rowid alias path), ECGCT3 (regular HasRowid
+      column → OP_Column with identity storage index, p3=regOut),
+      ECGCT4 (TABTYP_VTAB → OP_VColumn with iCol passthrough),
+      ECGCT5 (TF_WithoutRowid + idxFlags=2 PK → OP_Column with PK
+      key position 0, p1 = PK cursor).
+    - [X] Public surface, batch 17 — `sqlite3WhereCodeOneLoopStart`
+      pRJ RIGHT JOIN match-recording (wherecode.c:2729..2768) +
+      BeginSubrtn block (wherecode.c:2782..2799) + structural
+      refactor of `code_outer_join_constraints` to run on either
+      iLeftJoin OR pRJ being set (matches the C goto / fall-through
+      flow).  Match-recording: HasRowid tables emit OP_Rowid into a
+      2-register block via `sqlite3GetTempRange(pParse, 2)` +
+      `sqlite3ExprCodeGetColumnOfTable(v, pTab, pLevel^.iTabCur, -1,
+      r+1)`; WITHOUT-ROWID tables walk
+      `sqlite3PrimaryKeyIndex(pTab)^.aiColumn[]` for `nKeyCol` columns
+      via `GetTempRange(nPk+1)` and per-column
+      `sqlite3ExprCodeGetColumnOfTable(v, pTab, iCur, iCol, r+1+iPk)`
+      (note: HasRowid uses `pLevel^.iTabCur`, !HasRowid uses `iCur`,
+      mirroring the C cursor-mode split for WITHOUT-ROWID tables).
+      Then OP_Found shortcuts already-matched rows; OP_MakeRecord
+      packs the PK into the trailing register slot; OP_IdxInsert
+      writes to `pRJ^.iMatch`; OP_FilterAdd writes to `pRJ^.regBloom`
+      with `p5 := OPFLAG_USESEEKRESULT` (reuses the seek result from
+      OP_Found); JumpHere closes the OP_Found skip.  BeginSubrtn:
+      OP_BeginSubrtn target is `pRJ^.regReturn`; `pRJ^.addrSubrtn`
+      pins the next address; `pParse^.withinRJSubrtn` increments
+      (asserted < 255 to mirror the C invariant).  RIGHT JOIN match
+      recording fires BEFORE the LEFT JOIN match-flag set so the
+      iMatch insert reflects the unwrap-extended row, not the raw
+      cursor row.  The matching `OP_Return` / `OP_EndSubrtn` and the
+      post-pass null-extension driver still live in
+      `sqlite3WhereEnd` — that piece is part of the deferred
+      `sqlite3WhereRightJoinLoop` body and lands later in the public
+      surface tail.  Gate: `TestWherePlanner.pas` (619/619): SCOLS17
+      (HasRowid pTab, pRJ.iMatch=33, pRJ.regBloom=44,
+      pRJ.regReturn=55, iLeftJoin=0 — verifies OP_Found p1=33,
+      OP_MakeRecord, OP_IdxInsert p1=33, OP_FilterAdd p1=44 +
+      p5=OPFLAG_USESEEKRESULT, OP_BeginSubrtn p2=55, addrSubrtn>0,
+      withinRJSubrtn incremented to 1, code_outer_join_constraints
+      fall-through tags TERM_CODED).
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix

@@ -2281,6 +2281,8 @@ procedure sqlite3ResolvePartIdxLabel(pParse: PParse; iLabel: i32);
 // ---------------------------------------------------------------------------
 
 procedure sqlite3ColumnDefault(v: PVdbe; pTab: PTable2; i: i32; iReg: i32);
+procedure sqlite3ExprCodeGetColumnOfTable(v: PVdbe; pTab: PTable2;
+  iTabCur: i32; iCol: i32; regOut: i32);
 procedure sqlite3Update(pParse: PParse; pTabList: PSrcList;
   pChanges: PExprList; pWhere: PExpr; onError: i32;
   pOrderBy: PExprList; pLimit: PExpr; pUpsert: PUpsert);
@@ -12276,6 +12278,15 @@ var
   skipLikeAddr:    i32;
   pIdxBody:        PIndex2;
   xLR:             u32;
+  { ---- pRJ RIGHT JOIN match-recording / BeginSubrtn locals ---- }
+  pRJ:             PWhereRightJoin;
+  pTabRJ:          PTable2;
+  pPkRJ:           PIndex2;
+  rRJ:             i32;
+  nPkRJ:           i32;
+  iPkRJ:           i32;
+  iColRJ:          i32;
+  jmp1RJ:          i32;
 begin
   pLoop    := pLevel^.pWLoop;
   pTabItem := @SrcListItems(pWInfo^.pTabList)[pLevel^.iFrom];
@@ -12833,37 +12844,98 @@ begin
     end;
   end;
 
+  { RIGHT JOIN match-recording (wherecode.c:2729..2768).  For RIGHT
+    OUTER JOIN, record that the current right-table row has matched at
+    least once by storing its primary key in both the iMatch index and
+    the regBloom Bloom filter.  HasRowid tables emit an OP_Rowid into
+    a 2-register block via sqlite3ExprCodeGetColumnOfTable on iCol=-1
+    against pLevel^.iTabCur; WITHOUT-ROWID tables walk the PK via
+    sqlite3PrimaryKeyIndex(pTab) and emit one OP_Column per key column
+    against the iCur cursor.  OP_Found shortcuts already-matched rows;
+    OP_MakeRecord packs the PK into the trailing register slot;
+    OP_IdxInsert + OP_FilterAdd record the match (with
+    OPFLAG_USESEEKRESULT on FilterAdd so the seek result from OP_Found
+    is reused). }
+  if pLevel^.pRJ <> nil then
+  begin
+    pRJ    := pLevel^.pRJ;
+    pTabRJ := pTabItem^.pSTab;
+    if HasRowid(pTabRJ) then
+    begin
+      rRJ   := sqlite3GetTempRange(pParse, 2);
+      sqlite3ExprCodeGetColumnOfTable(v, pTabRJ, pLevel^.iTabCur, -1,
+                                      rRJ + 1);
+      nPkRJ := 1;
+    end
+    else
+    begin
+      pPkRJ := sqlite3PrimaryKeyIndex(pTabRJ);
+      nPkRJ := pPkRJ^.nKeyCol;
+      rRJ   := sqlite3GetTempRange(pParse, nPkRJ + 1);
+      for iPkRJ := 0 to nPkRJ - 1 do
+      begin
+        iColRJ := pPkRJ^.aiColumn[iPkRJ];
+        sqlite3ExprCodeGetColumnOfTable(v, pTabRJ, iCur, iColRJ,
+                                        rRJ + 1 + iPkRJ);
+      end;
+    end;
+    jmp1RJ := sqlite3VdbeAddOp4Int(v, OP_Found, pRJ^.iMatch, 0,
+                                   rRJ + 1, nPkRJ);
+    sqlite3VdbeAddOp3(v, OP_MakeRecord, rRJ + 1, nPkRJ, rRJ);
+    sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pRJ^.iMatch, rRJ,
+                         rRJ + 1, nPkRJ);
+    sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pRJ^.regBloom, 0,
+                         rRJ + 1, nPkRJ);
+    sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+    sqlite3VdbeJumpHere(v, jmp1RJ);
+    sqlite3ReleaseTempRange(pParse, rRJ, nPkRJ + 1);
+  end;
+
   { LEFT JOIN match-flag set (wherecode.c:2773..2780).  When this level is
     the inner side of a LEFT JOIN, record that the row-pairing succeeded
-    by storing 1 into the iLeftJoin memory cell allocated in the prelude.
-    The pRJ-driven RIGHT JOIN subroutine setup (wherecode.c:2782..2814)
-    is deferred — pLevel^.pRJ remains a stub. }
+    by storing 1 into the iLeftJoin memory cell allocated in the prelude. }
   if pLevel^.iLeftJoin <> 0 then
   begin
     pLevel^.addrFirst := sqlite3VdbeCurrentAddr(v);
     sqlite3VdbeAddOp2(v, OP_Integer, 1, pLevel^.iLeftJoin);
+  end;
 
-    { code_outer_join_constraints (wherecode.c:2800..2813) — re-walk
-      pWC^.a[0..nBase-1] and emit residuals for terms the main push-down
-      walk left untouched because they belong to the LEFT/LTORJ/RIGHT
-      outer-join arm.  pRJ=nil keeps us out of the (deferred) RIGHT JOIN
-      subroutine path; JT_LTORJ tables get skipped because their tail
-      lives inside the right-join subroutine that has not been ported. }
-    if pLevel^.pRJ = nil then
+  { RIGHT JOIN BeginSubrtn block (wherecode.c:2782..2799).  When this
+    level drives a RIGHT JOIN, wrap the body in a callable subroutine
+    so the post-pass null-extension driver can invoke it for unmatched
+    rows.  pRJ^.addrSubrtn pins the subroutine entry point; the
+    matching OP_Return / OP_EndSubrtn lives in sqlite3WhereEnd. }
+  if pLevel^.pRJ <> nil then
+  begin
+    pRJ := pLevel^.pRJ;
+    sqlite3VdbeAddOp2(v, OP_BeginSubrtn, 0, pRJ^.regReturn);
+    pRJ^.addrSubrtn := sqlite3VdbeCurrentAddr(v);
+    Assert(pParse^.withinRJSubrtn < 255);
+    Inc(pParse^.withinRJSubrtn);
+  end;
+
+  { code_outer_join_constraints (wherecode.c:2800..2813).  Re-walks
+    pWC^.a[0..nBase-1] and emits residuals for terms the main push-down
+    walk left untouched because they belong to the LEFT / LTORJ / RIGHT
+    outer-join arm.  Runs whenever iLeftJoin OR pRJ is set, mirroring
+    the C goto / fall-through structure: iLeftJoin && !pRJ jumps here
+    via the LEFT JOIN block's `goto`, pRJ falls through after the
+    BeginSubrtn block.  JT_LTORJ tables short-circuit because their
+    tail belongs to the RIGHT JOIN subroutine driver. }
+  if (pLevel^.iLeftJoin <> 0) or (pLevel^.pRJ <> nil) then
+  begin
+    pTermArr := pWCBody^.a;
+    for jBody := 0 to pWCBody^.nBase - 1 do
     begin
-      pTermArr := pWCBody^.a;
-      for jBody := 0 to pWCBody^.nBase - 1 do
-      begin
-        pTermBody := @pTermArr[jBody];
-        if (pTermBody^.wtFlags and (TERM_VIRTUAL or TERM_CODED)) <> 0 then
-          continue;
-        if (pTermBody^.prereqAll and pLevel^.notReady) <> 0 then continue;
-        if (pTabItem^.fg.jointype and JT_LTORJ) <> 0 then continue;
-        Assert(pTermBody^.pExpr <> nil);
-        sqlite3ExprIfFalse(pParse, pTermBody^.pExpr, addrCont,
-                           SQLITE_JUMPIFNULL);
-        pTermBody^.wtFlags := pTermBody^.wtFlags or TERM_CODED;
-      end;
+      pTermBody := @pTermArr[jBody];
+      if (pTermBody^.wtFlags and (TERM_VIRTUAL or TERM_CODED)) <> 0 then
+        continue;
+      if (pTermBody^.prereqAll and pLevel^.notReady) <> 0 then continue;
+      if (pTabItem^.fg.jointype and JT_LTORJ) <> 0 then continue;
+      Assert(pTermBody^.pExpr <> nil);
+      sqlite3ExprIfFalse(pParse, pTermBody^.pExpr, addrCont,
+                         SQLITE_JUMPIFNULL);
+      pTermBody^.wtFlags := pTermBody^.wtFlags or TERM_CODED;
     end;
   end;
 
@@ -14164,6 +14236,55 @@ end;
 procedure sqlite3ColumnDefault(v: PVdbe; pTab: PTable2; i: i32; iReg: i32);
 begin
   { Phase 6.5: emit OP_Null or OP_SCopy for default expression }
+end;
+
+{ sqlite3ExprCodeGetColumnOfTable — port of expr.c:4417..4465.
+  Emits the opcode that fetches column iCol of pTab from cursor iTabCur into
+  register regOut.  iCol<0 or iCol == pTab^.iPKey shortcuts to OP_Rowid.
+  Virtual tables emit OP_VColumn keyed off the logical column index.
+  WITHOUT-ROWID tables resolve through the primary-key index via
+  sqlite3TableColumnToIndex(sqlite3PrimaryKeyIndex(pTab), iCol).  Regular
+  rowid tables use sqlite3TableColumnToStorage(pTab, iCol) so virtual
+  generated columns line up at their storage offset.
+  COLFLAG_VIRTUAL columns (computed/stored generated columns) require
+  sqlite3ExprCodeGeneratedColumn — still a Phase 6.x deferral; we land
+  the assert here so any caller that strays into the generated-column
+  arm is loud about it. }
+procedure sqlite3ExprCodeGetColumnOfTable(v: PVdbe; pTab: PTable2;
+  iTabCur: i32; iCol: i32; regOut: i32);
+var
+  pCol:        PColumn;
+  op, x:       i32;
+begin
+  Assert(v <> nil);
+  Assert(pTab <> nil);
+  Assert(iCol <> XN_EXPR);
+  if (iCol < 0) or (iCol = pTab^.iPKey) then
+  begin
+    sqlite3VdbeAddOp2(v, OP_Rowid, iTabCur, regOut);
+    Exit;
+  end;
+  if pTab^.eTabType = TABTYP_VTAB then
+  begin
+    op := OP_VColumn;
+    x  := iCol;
+  end
+  else
+  begin
+    pCol := @pTab^.aCol[iCol];
+    if (pCol^.colFlags and COLFLAG_VIRTUAL) <> 0 then
+    begin
+      Assert(False, 'sqlite3ExprCodeGeneratedColumn not yet ported');
+      Exit;
+    end;
+    if not HasRowid(pTab) then
+      x := sqlite3TableColumnToIndex(sqlite3PrimaryKeyIndex(pTab), i16(iCol))
+    else
+      x := sqlite3TableColumnToStorage(pTab, i16(iCol));
+    op := OP_Column;
+  end;
+  sqlite3VdbeAddOp3(v, op, iTabCur, x, regOut);
+  sqlite3ColumnDefault(v, pTab, iCol, regOut);
 end;
 
 { sqlite3Update — port of update.c:285 (structural skeleton).
