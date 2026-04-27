@@ -214,9 +214,28 @@ Important: At the end of this document, please find:
           `NOT_EXISTS` already PASSes via the same correlated path.
 
     **Open follow-on:** Re-enable productive tails in `sqlite3DeleteFrom`
-    and `sqlite3Update` (still skeleton-only); drop the step-11f
-    error-state guard.  Re-enable any disabled assertions / safety-net
-    guards left during 11g.2.b..e.
+    (`passqlite3codegen.pas:16844` — needs `sqlite3WhereBegin` body +
+    `sqlite3GenerateRowDelete`; the step-11f guard at lines 16790..16793
+    snapshots/restores `nErr/rc/zErrMsg` to hide stub state and must
+    drop) and `sqlite3Update` (still skeleton-only — blocks CREATE
+    TABLE NestedParse UPDATE of the placeholder sqlite_master row, see
+    11g.2.f open-DIVERGE rows below).  Re-enable any disabled assertions
+    / safety-net guards left during 11g.2.b..e.
+
+    **Schema-publish gap (newly diagnosed 2026-04-27):** `sqlite3EndTable`
+    at `passqlite3codegen.pas:18512` only inserts the new Table object
+    into `pSchema^.tblHash` when `db^.init.busy <> 0`.  Tables created
+    via normal `sqlite3_exec` (init.busy = 0) emit Vdbe opcodes but
+    never publish into the in-memory schema, so any subsequent
+    `CREATE INDEX ON t(...)` hits the nil-table early exit at
+    `sqlite3CreateIndex` (`passqlite3codegen.pas:19069..19070`),
+    `prepare_v2` discards the half-built Vdbe, and `ppStmt^` returns
+    nil.  This is the root cause of the CREATE INDEX / CREATE UNIQUE
+    INDEX nil-Vdbe DIVERGE rows in TestExplainParity.  Fix path: either
+    wire `sqlite3InitCallback` so re-prepare populates `tblHash` from
+    the schema row, or publish `pNewTable` into `tblHash` on the
+    init.busy=0 path after the btree + schema-row write confirms
+    durability (matching C's reopen-driven init.busy bootstrap).
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
   Current Status: **2 PASS / 8 DIVERGE / 0 ERROR**.  Drive to
