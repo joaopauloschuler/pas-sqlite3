@@ -18283,14 +18283,69 @@ begin
   { Phase 6.5 }
 end;
 
-{ sqlite3OpenTableAndIndices — open table + index cursors (Phase 6.4 stub) }
+{ sqlite3OpenTableAndIndices — port of insert.c:2870.
+
+  Opens a write (or read) cursor on the table and on every index of the table.
+  Returns the count of indices.  Virtual tables are a no-op (cursor numbers
+  set to -999 to surface misuse).  When SQLITE_OMIT_SHARED_CACHE is in effect
+  (this port's default), the sqlite3TableLock fallback for the no-row-id /
+  aToOpen[0]=0 case reduces to a no-op. }
 function sqlite3OpenTableAndIndices(pParse: PParse; pTab: PTable2;
   op: i32; p5: u8; iBase: i32; aToOpen: Pu8; piDataCur: Pi32;
   piIdxCur: Pi32): i32;
+var
+  i:        i32;
+  iDb:      i32;
+  iDataCur: i32;
+  iIdxCur:  i32;
+  pIdx:     PIndex2;
+  v:        PVdbe;
 begin
-  if piDataCur <> nil then piDataCur^ := iBase;
-  if piIdxCur  <> nil then piIdxCur^  := iBase + 1;
-  Result := 0;
+  AssertH((op = OP_OpenRead) or (op = OP_OpenWrite), 'OpenTableAndIndices op');
+  AssertH((op = OP_OpenWrite) or (p5 = 0),           'OpenTableAndIndices p5');
+  AssertH(piDataCur <> nil,                          'OpenTableAndIndices piDataCur');
+  AssertH(piIdxCur  <> nil,                          'OpenTableAndIndices piIdxCur');
+  if pTab^.eTabType = TABTYP_VTAB then
+  begin
+    piDataCur^ := -999;
+    piIdxCur^  := -999;
+    Result := 0;
+    Exit;
+  end;
+  iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
+  v := pParse^.pVdbe;
+  AssertH(v <> nil, 'OpenTableAndIndices v');
+  if iBase < 0 then iBase := pParse^.nTab;
+  iDataCur := iBase;
+  Inc(iBase);
+  piDataCur^ := iDataCur;
+  if HasRowid(pTab) and ((aToOpen = nil) or (aToOpen[0] <> 0)) then
+    sqlite3OpenTable(pParse, iDataCur, iDb, pTab, op);
+  { else: sqlite3TableLock — no-op under SQLITE_OMIT_SHARED_CACHE. }
+  piIdxCur^ := iBase;
+  i := 0;
+  pIdx := pTab^.pIndex;
+  while pIdx <> nil do
+  begin
+    iIdxCur := iBase;
+    Inc(iBase);
+    AssertH(pIdx^.pSchema = pTab^.pSchema, 'OpenTableAndIndices pIdx schema');
+    if ((pIdx^.idxFlags and 3) = 2) and (not HasRowid(pTab)) then
+    begin
+      piDataCur^ := iIdxCur;
+      p5 := 0;
+    end;
+    if (aToOpen = nil) or (aToOpen[i + 1] <> 0) then
+    begin
+      sqlite3VdbeAddOp3(v, op, iIdxCur, i32(pIdx^.tnum), iDb);
+      sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pIdx));
+      sqlite3VdbeChangeP5(v, p5);
+    end;
+    Inc(i);
+    pIdx := pIdx^.pNext;
+  end;
+  if iBase > pParse^.nTab then pParse^.nTab := iBase;
+  Result := i;
 end;
 
 // ===========================================================================

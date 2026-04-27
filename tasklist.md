@@ -235,14 +235,17 @@ Important: At the end of this document, please find:
         at :20058; `OP_IfEmpty` opcode at vdbe.pas:89/6843.
         Companion `NOT_EXISTS` PASSes via plain-scan.
 
-    **Open follow-on:** Re-enable productive tails in `sqlite3DeleteFrom`
-    (`passqlite3codegen.pas:17269` — needs `sqlite3WhereBegin` body +
-    `sqlite3GenerateRowDelete` (currently a Phase 6.4 stub at
-    `passqlite3codegen.pas:17399`); skeleton-guard at lines 17312..17321 /
-    17385..17390 snapshots/restores `nErr/rc/zErrMsg` to hide stub state
-    and must drop) and `sqlite3Update` (`passqlite3codegen.pas:17548`
-    skeleton-only, mirror guard at 17605..17616 / 17687..17692; blocks
-    NestedParse UPDATE of the placeholder sqlite_master row).
+    **Open follow-on:** Re-enable productive tails:
+      * `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate arm
+        productive (commit `90cda3b`).  Where-loop / one-pass arm
+        (delete.c:495..665, ~170 LOC) still TODO at codegen.pas:17496.
+        `sqlite3OpenTableAndIndices` is now productive (insert.c:2870
+        ported); remaining gates: `sqlite3WhereOkOnePass`,
+        `sqlite3WhereUsesDeferredSeek`, RowSet/iEphCur loop, `OP_Once`
+        wrapper for ONEPASS_MULTI, vtab `OP_VUpdate` arm.
+      * `sqlite3Update` (`passqlite3codegen.pas:17835`): skeleton-only
+        with snapshot/restore guard at 17890..17893 / 17965..17970;
+        blocks NestedParse UPDATE of the placeholder sqlite_master row.
 
     **CREATE TABLE / CREATE INDEX DIVERGE-op-count rows** in
     TestExplainParity (Pas=21/19 vs C=32/37/41) are structural — extra
