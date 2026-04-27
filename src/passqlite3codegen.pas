@@ -4339,7 +4339,7 @@ var
   pFarg:     PExprList;
   pItem:     PExprListItem;
   items:     PExprListItem;
-  pDef:      PFuncDef;
+  pDef:      PTFuncDef;
   db:        PTsqlite3;
   i, n:      i32;
   r1:        i32;
@@ -4356,16 +4356,30 @@ begin
   else
     pFarg := nil;
   if pFarg <> nil then n := pFarg^.nExpr else n := 0;
-  pDef := PFuncDef(sqlite3FindFunction(db, z, n, db^.enc, 0));
+  pDef := sqlite3FindFunction(db, z, n, db^.enc, 0);
   if pDef = nil then
   begin
-    pDef := PFuncDef(sqlite3FindFunction(db, z, -1, db^.enc, 0));
+    pDef := sqlite3FindFunction(db, z, -1, db^.enc, 0);
     if pDef = nil then begin Result := False; Exit; end;
   end;
   constMask := 0;
   if n > 0 then
   begin
     items := ExprListItems(pFarg);
+    { length()/typeof() column-arg fast-path: stamp OPFLAG_LENGTHARG /
+      OPFLAG_TYPEOFARG onto the column expr's op2 so the subsequent
+      sqlite3ExprCode -> TK_COLUMN arm propagates it onto the OP_Column
+      P5 byte (mirrors expr.c:5365..5378).  Saves the payload load when
+      only the length / affinity is consumed. }
+    if (pDef^.funcFlags and (SQLITE_FUNC_LENGTH or SQLITE_FUNC_TYPEOF)) <> 0 then
+    begin
+      if n = 1 then
+      begin
+        pArg := PExprListItem(items)^.pExpr;
+        if (pArg <> nil) and ((pArg^.op = TK_COLUMN) or (pArg^.op = TK_AGG_COLUMN)) then
+          pArg^.op2 := u8(pDef^.funcFlags and (OPFLAG_LENGTHARG or OPFLAG_TYPEOFARG));
+      end;
+    end;
     { First pass: identify constant args so we can allocate a
       stable nMem-resident block (factored constants must live in
       a register that won't be reused across the loop body). }
@@ -4720,6 +4734,13 @@ begin
           begin
             sqlite3ExprCodeGetColumnOfTable(v, pExpr^.y.pTab,
               pExpr^.iTable, pExpr^.iColumn, target);
+            { Honour op2 — emitScalarFunctionCall stamps OPFLAG_LENGTHARG /
+              OPFLAG_TYPEOFARG onto a column-arg's op2 so the OP_Column
+              read can short-circuit the payload load.  Mirrors
+              expr.c sqlite3ExprCodeGetColumn's `sqlite3VdbeChangeP5(v, p5)`
+              tail when the most recent op is the just-emitted OP_Column. }
+            if pExpr^.op2 <> 0 then
+              sqlite3VdbeChangeP5(v, u16(pExpr^.op2));
             done := True;
           end else
           begin

@@ -104,7 +104,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 25;
+  N_CORPUS = 41;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -177,6 +177,53 @@ begin
       'SELECT a FROM t WHERE b BETWEEN 5 AND 10;');           Inc(i);
   Add(i, 'AND-of-OR mixed',           'AND_OR',
       'SELECT a FROM t WHERE (a = 5 OR a = 7) AND b > 0;');   Inc(i);
+
+  { Phase 6.9-bis 11g.2.f sub-progress 27 — single-table corpus extension #2.
+    Eight new shapes that exercise codegen paths the prior 25 rows did not
+    cover: parameter binding (TK_VARIABLE) on the IPK, column, and LIKE
+    operands; negated EQ via TK_NOT; column-vs-column comparison (no
+    constant on either side); a string-IN literal list (different operand
+    affinity from numeric IN); RHS arithmetic expression on the IPK
+    constant; LHS unary-minus on the column; and the constant-true WHERE
+    predicate (`WHERE 1`, planner-folded to no-op). }
+  Add(i, 'IPK param bind',            'IPK_PARAM',
+      'SELECT a FROM t WHERE rowid = ?;');                    Inc(i);
+  Add(i, 'col param bind',            'COL_PARAM',
+      'SELECT a FROM t WHERE a = ?;');                        Inc(i);
+  Add(i, 'LIKE param bind',           'LIKE_PARAM',
+      'SELECT a FROM t WHERE c LIKE ?;');                     Inc(i);
+  Add(i, 'NOT (a = 5)',               'NOT_EQ',
+      'SELECT a FROM t WHERE NOT (a = 5);');                  Inc(i);
+  Add(i, 'col-vs-col',                'COL_COL',
+      'SELECT a FROM t WHERE a = b;');                        Inc(i);
+  Add(i, 'string-IN literal',         'INDEX_IN_STR',
+      'SELECT a FROM t WHERE c IN (''x'',''y'',''z'');');     Inc(i);
+  Add(i, 'IPK RHS arith',             'IPK_RHS_EXPR',
+      'SELECT a FROM t WHERE rowid = 5+1;');                  Inc(i);
+  Add(i, 'WHERE constant true',       'CONST_TRUE',
+      'SELECT a FROM t WHERE 1;');                            Inc(i);
+
+  { Phase 6.9-bis 11g.2.f sub-progress 27 — extended single-table corpus
+    (group #2).  Eight further shapes that exercise built-in scalar
+    functions, parameterised IN-list, string-BETWEEN, parenthesised
+    grouping, NOT IS NULL, OR-of-AND, duplicate predicates, and a
+    nested OR. }
+  Add(i, 'string BETWEEN',            'COL_BETWEEN_STR',
+      'SELECT a FROM t WHERE c BETWEEN ''a'' AND ''z'';');    Inc(i);
+  Add(i, 'NOT IS NULL',               'NOT_NULL_PAREN',
+      'SELECT a FROM t WHERE NOT (c IS NULL);');              Inc(i);
+  Add(i, 'OR-of-AND',                 'OR_OF_AND',
+      'SELECT a FROM t WHERE (a=1 AND b=2) OR (a=3 AND b=4);'); Inc(i);
+  Add(i, 'param IN-list',             'INDEX_IN_PARAM',
+      'SELECT a FROM t WHERE a IN (?, ?, ?);');               Inc(i);
+  Add(i, 'parenthesised IPK-EQ',      'IPK_PAREN',
+      'SELECT a FROM t WHERE (rowid = 5);');                  Inc(i);
+  Add(i, 'duplicate AND',             'DUP_AND',
+      'SELECT a FROM t WHERE a = 5 AND a = 5;');              Inc(i);
+  Add(i, 'abs() in WHERE',            'FUNC_ABS',
+      'SELECT a FROM t WHERE abs(a) = 5;');                   Inc(i);
+  Add(i, 'length() in WHERE',         'FUNC_LENGTH',
+      'SELECT a FROM t WHERE length(c) > 0;');                Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

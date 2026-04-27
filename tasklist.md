@@ -3186,6 +3186,106 @@ Important: At the end of this document, please find:
       (whereLoopAddBtree across multiple tables, wherePathSolver
       multi-level path search) more than a 11g.2.f local fix; expect
       it to be a multi-step landing.
+    - [X] Sub-progress 27 — single-table corpus expansion (groups #2
+      and #3) + `length()` / `typeof()` OP_Column fast-path port
+      (2026-04-27).  Multi-table planner stays gated on 11g.2.d; this
+      sub-progress widens single-table coverage from 25 to 41 corpus
+      rows, lighting up 15 net new PASS shapes and surfacing two
+      genuine planner-optimization gaps (DUP_AND duplicate-predicate
+      hoist, length() column-arg payload short-circuit) — the latter
+      ported here, the former documented for a future sub-progress.
+
+      (a) `TestWhereCorpus` corpus widened 25 -> 41 rows (group #2 +
+      group #3).  Group #2 (8 rows): `IPK_PARAM` (`rowid = ?`),
+      `COL_PARAM` (`a = ?`), `LIKE_PARAM` (`c LIKE ?`), `NOT_EQ`
+      (`NOT (a = 5)`), `COL_COL` (`a = b` — column-vs-column),
+      `INDEX_IN_STR` (`c IN ('x','y','z')` — string IN), `IPK_RHS_EXPR`
+      (`rowid = 5+1` — RHS arithmetic), `CONST_TRUE` (`WHERE 1`).
+      Group #3 (8 rows): `COL_BETWEEN_STR` (`c BETWEEN 'a' AND 'z'`),
+      `NOT_NULL_PAREN` (`NOT (c IS NULL)`), `OR_OF_AND` (`(a=1 AND
+      b=2) OR (a=3 AND b=4)`), `INDEX_IN_PARAM` (`a IN (?,?,?)`),
+      `IPK_PAREN` (`(rowid = 5)`), `DUP_AND` (`a=5 AND a=5`),
+      `FUNC_ABS` (`abs(a) = 5`), `FUNC_LENGTH` (`length(c) > 0`).
+      Of the 16 new rows, 14 flipped to PASS immediately on the
+      existing single-table machinery — confirming TK_VARIABLE
+      (parameter binding), TK_NOT (negated EQ), column-vs-column
+      comparison, string IN, RHS expression folding, parenthesised
+      grouping, OR-of-AND associativity, NOT-IS-NULL, and string
+      BETWEEN are all correctly wired through the SCAN-with-residual
+      codegen path.
+
+      (b) `emitScalarFunctionCall` + TK_COLUMN arm of
+      `sqlite3ExprCodeTarget` (codegen.pas:4365..4385,
+      codegen.pas:4724..4732) — port of expr.c:5365..5378's
+      length()/typeof() column-arg fast-path.  When `pDef^.funcFlags`
+      carries `SQLITE_FUNC_LENGTH | SQLITE_FUNC_TYPEOF` and `nFarg=1`
+      with a TK_COLUMN / TK_AGG_COLUMN argument, stamp the
+      `OPFLAG_LENGTHARG | OPFLAG_TYPEOFARG` bits onto the column-arg
+      Expr's `op2` field BEFORE the second-pass argument codegen
+      runs.  The TK_COLUMN arm then propagates that op2 onto the
+      OP_Column's P5 byte via `sqlite3VdbeChangeP5(v, op2)` after the
+      `sqlite3ExprCodeGetColumnOfTable` emit.  At runtime the VDBE's
+      OP_Column handler short-circuits the payload-load step when
+      OPFLAG_LENGTHARG is set: only the column header (which carries
+      the byte length) is decoded, saving the full record copy when
+      only the length / affinity is consumed.  Latent local-shadow
+      bug also fixed: the `pDef` local in `emitScalarFunctionCall`
+      had been declared `PFuncDef` (the opaque `Pointer` alias used
+      for OP_FuncCtx parameter compat); changed to `PTFuncDef` so
+      the `funcFlags` field lookup resolves.  No callers of
+      `emitScalarFunctionCall` need updating since
+      `sqlite3FindFunction` already returns `PTFuncDef`.  Cast wraps
+      at lines 4359 / 4362 dropped (no longer needed once the local
+      type matches the return type).
+
+      (c) `DUP_AND` row left as DIVERGE.  Bytecode-shape inspection
+      (C oracle vs Pascal) shows C performs a constant-predicate
+      pre-test hoist: `Integer 5,r1` BEFORE OpenRead, then `Ne r2,
+      jump=Halt, r1, p5=81` (NULLEQ | JUMPIFNULL) so that if the
+      not-yet-loaded compare-target is NULL the entire scan is
+      short-circuited.  This is the classic "WHERE term constant
+      folding under duplicate AND" optimization and lives somewhere
+      in the planner's `exprAnalyzeOrTerm` / `whereCombineDisjuncts`
+      / sqlite3WhereOptimization lineage; without porting it the
+      Pascal output is the regular SCAN-with-residual shape (Init /
+      OpenRead / Rewind / Column / Eq / Eq / Column / ResultRow /
+      Next / Halt / Transaction / Integer-5 / Goto, 14 ops) which
+      executes correctly but has a 3-op shape gap against the
+      C-oracle pre-test prologue.  Marked as a known divergence; no
+      semantic bug.
+
+      Test-suite delta:
+        * TestWhereCorpus: **23 PASS / 2 DIVERGE / 0 ERROR (corpus =
+          25)** -> **38 PASS / 3 DIVERGE / 0 ERROR (corpus = 41)**.
+          15 net new PASS rows; 1 net new DIVERGE row (DUP_AND).
+          Failure-mode tally: `0 exception, 0 nil-Vdbe, 2 op-count,
+          1 op-diff` (LEFT_JOIN + JOIN_WHERE + DUP_AND).  Corpus
+          C-oracle reference total: `534 ops across 33 rows` ->
+          `657 ops across 41 rows` (avg 16.0).
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41, TestVdbeApi
+          57/57, TestVdbeMisc 45/45, TestVdbeAux 108/108, TestVdbeMem
+          62/62, TestVdbeRecord 13/13, TestVdbeAgg 11/11, TestVdbeStr
+          23/23, TestVdbeBlob 13/13, TestVdbeSort 14/14, TestVdbeCursor
+          27/27, TestVdbeVtabExec 50/50, TestExplainParity 2/10
+          unchanged, TestPrintf 105/105, TestJson 434/434, TestJsonEach
+          50/50, TestTokenizer 127/127, TestRegistration 19/19,
+          TestExecGetTable 23/23, TestBackup 20/20, TestConfigHooks
+          54/54, TestInitShutdown 27/27, TestUnlockNotify 14/14,
+          TestLoadExt 20/20, TestAuthBuiltins 34/34, TestOpenClose
+          17/17, TestInitCallback 29/29, TestBtreeCompat 337/337.
+
+      Sub-progress 28 (next) is still the multi-table planner
+      integration for LEFT_JOIN / JOIN_WHERE — both still currently
+      produce the 3-op stub through the `nSrc <> 1` gate at
+      sqlite3Select.  Genuinely a 11g.2.d follow-on; expect a multi-
+      step landing.  The DUP_AND duplicate-predicate hoist is a
+      separate optimization that can land independently in any
+      sub-progress.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
