@@ -3771,9 +3771,38 @@ Important: At the end of this document, please find:
           EXISTS_SUB, NOT_EXISTS) — all blocked on 11g.2.d.
         * No regression elsewhere.
 
-      All remaining corpus DIVERGEs require 11g.2.d.  Next productive
-      direction: begin 11g.2.d planner work or expand TestExplainParity
-      (still 2/10) for DDL parity.
+    - [X] Sub-progress 38 — corpus expansion group #8 (2026-04-27).
+      Eight new rows targeting harder shapes; N_CORPUS 84 → 92.
+      Outcomes: 4 PASS (NOT_COL, COL_COL_GT, COMPOUND_LHS, TRIM)
+      and 4 new DIVERGEs documenting fresh codegen gaps:
+
+        * IN_COL_RHS (`a IN (b,c)`, C=15 Pas=25): Pascal takes the
+          transient-index IN-list build path for non-constant RHS;
+          C emits an inline Eq-chain residual.  Future sub-progress:
+          short-circuit the index build when all RHS exprs are
+          column references on the same row.
+        * MIN_2ARG (`min(a,b)=1`, C=15 Pas=14): 2-arg min/max
+          INLINEFUNC missing one op — likely the `IfSmaller` guard
+          C uses to pick the smaller column.  Audit
+          `INLINEFUNC_min` codegen.
+        * MAX_2ARG (`max(a,b)=5`, C=15 Pas=14): same root cause as
+          MIN_2ARG, mirrored for max.
+        * INSTR (`instr(b,'x')>0`, C=14 Pas=12): Pascal short by 2
+          ops in `instr` argument-load — missing one `String8` for
+          the literal `'x'` and one constant `Integer` register.
+          Audit `codeFunc` const-arg hoisting for the 2-arg instr
+          path.
+
+      Test-suite delta:
+        * TestWhereCorpus: **84 PASS / 8 DIVERGE / 0 ERROR (corpus = 92)**.
+        * No regression elsewhere: TestParser 45/45, TestExprBasic
+          40/40, TestSelectBasic 49/49, TestWhereSimple 44/44,
+          TestVdbeArith 41/41, TestJson 434/434.
+
+      Of the 8 total DIVERGEs: 4 are blocked on 11g.2.d (LEFT_JOIN,
+      JOIN_WHERE, EXISTS_SUB, NOT_EXISTS); the new 4 are independent
+      single-table targets (IN_COL_RHS, MIN_2ARG, MAX_2ARG, INSTR)
+      that should be quick wins for sub-progress 39+.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

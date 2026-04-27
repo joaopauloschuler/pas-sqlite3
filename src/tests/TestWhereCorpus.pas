@@ -104,7 +104,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 84;
+  N_CORPUS = 92;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -364,6 +364,30 @@ begin
       'SELECT a FROM t WHERE a NOT IN (1,2,3);');               Inc(i);
   Add(i, 'round(a) = 5',              'ROUND',
       'SELECT a FROM t WHERE round(a) = 5;');                   Inc(i);
+
+  { Phase 6.9-bis 11g.2.f sub-progress 38 — corpus expansion group #8.
+    Eight new single-table shapes targeting harder codegen gaps:
+    NOT on bare column (truthiness test), column-on-RHS comparison,
+    IN with column RHS values, compound LHS arithmetic (a*a+1=5),
+    2-arg min()/max() scalar functions, instr() string search,
+    and trim() string trimming.  All degrade to SCAN-with-residual
+    on the un-indexed fixture. }
+  Add(i, 'NOT a (truthiness)',         'NOT_COL',
+      'SELECT a FROM t WHERE NOT a;');                          Inc(i);
+  Add(i, 'a > b (col-vs-col GT)',      'COL_COL_GT',
+      'SELECT a FROM t WHERE a > b;');                          Inc(i);
+  Add(i, 'a IN (b, c) (col RHS IN)',   'IN_COL_RHS',
+      'SELECT a FROM t WHERE a IN (b, c);');                    Inc(i);
+  Add(i, 'a*a+1=5 (compound LHS)',     'COMPOUND_LHS',
+      'SELECT a FROM t WHERE a*a + 1 = 5;');                   Inc(i);
+  Add(i, 'min(a,b)=1 (2-arg min)',     'MIN_2ARG',
+      'SELECT a FROM t WHERE min(a, b) = 1;');                  Inc(i);
+  Add(i, 'max(a,b)=5 (2-arg max)',     'MAX_2ARG',
+      'SELECT a FROM t WHERE max(a, b) = 5;');                  Inc(i);
+  Add(i, 'instr(b,''x'')>0',          'INSTR',
+      'SELECT a FROM t WHERE instr(b, ''x'') > 0;');            Inc(i);
+  Add(i, 'trim(b)=''x''',             'TRIM',
+      'SELECT a FROM t WHERE trim(b) = ''x'';');                Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
