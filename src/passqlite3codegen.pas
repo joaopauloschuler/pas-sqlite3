@@ -18891,14 +18891,15 @@ end;
   'trigger') and is passed P4_STATIC.  zName is duplicated via
   sqlite3DbStrDup so the bytecode owns its own copy. }
 procedure emitSchemaRowInsert(pParse: PParse; v: PVdbe; iDb: i32;
-  zType: PAnsiChar; zName: PAnsiChar; zStmt: PAnsiChar);
+  zType: PAnsiChar; zName: PAnsiChar; zTblName: PAnsiChar;
+  regRoot: i32; zStmt: PAnsiChar);
 var
   db:           PTsqlite3;
   regBase:      i32;
   regRowid:     i32;
   regOut:       i32;
   zNameDup:     PAnsiChar;
-  zNameDup2:    PAnsiChar;
+  zTblDup:      PAnsiChar;
 begin
   db := pParse^.db;
 
@@ -18910,16 +18911,20 @@ begin
   { regBase+0 = type (static literal) }
   sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 0, 0, zType, P4_STATIC);
 
-  { regBase+1 = name, regBase+2 = tbl_name (independent dup'd copies). }
+  { regBase+1 = name (dup'd into the bytecode's lifetime). }
   zNameDup := sqlite3DbStrDup(db, zName);
   sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 1, 0,
                     zNameDup, P4_DYNAMIC);
-  zNameDup2 := sqlite3DbStrDup(db, zName);
+
+  { regBase+2 = tbl_name.  For CREATE TABLE this is the same as name;
+    for CREATE INDEX it is the underlying table name. }
+  if zTblName = nil then zTblName := zName;
+  zTblDup := sqlite3DbStrDup(db, zTblName);
   sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 2, 0,
-                    zNameDup2, P4_DYNAMIC);
+                    zTblDup, P4_DYNAMIC);
 
   { regBase+3 = rootpage (SCopy from regRoot). }
-  sqlite3VdbeAddOp2(v, OP_SCopy, pParse^.u1.cr.regRoot, regBase + 3);
+  sqlite3VdbeAddOp2(v, OP_SCopy, regRoot, regBase + 3);
 
   { regBase+4 = sql (transferring zStmt ownership into P4_DYNAMIC). }
   if zStmt = nil then
@@ -19075,7 +19080,8 @@ begin
       sub-progress 8 deviation rationale.  Build the 5-column record
       (type, name, tbl_name, rootpage, sql) into a contiguous register
       block, then OpenWrite/NewRowid/MakeRecord/Insert/Close. }
-    emitSchemaRowInsert(pParse, v, iDb, zType, pTab^.zName, zStmt);
+    emitSchemaRowInsert(pParse, v, iDb, zType, pTab^.zName,
+                        pTab^.zName, pParse^.u1.cr.regRoot, zStmt);
     { zStmt ownership transferred to the OP_String8 P4_DYNAMIC slot. }
 
     sqlite3ChangeCookie(pParse, iDb);
@@ -19800,12 +19806,16 @@ begin
       end else
         zStmt := nil;
 
-      { Schema-row INSERT — build.c:4460. }
-      sqlite3NestedParse(pParse,
-        'INSERT INTO %Q.' + LEGACY_SCHEMA_TABLE +
-        ' VALUES(''index'',%Q,%Q,#%d,%Q);',
-        [db^.aDb[iDb].zDbSName, pIndex^.zName, pTab^.zName, iMem, zStmt]);
-      sqlite3DbFree(db, zStmt);
+      { Schema-row INSERT — build.c:4460.  Use the direct-emit helper
+        instead of sqlite3NestedParse('INSERT INTO sqlite_master ...,
+        #%d, ...') because (a) the parser's TK_REGISTER #%d path is not
+        exercised end-to-end on the prepare-from-codegen flow today, and
+        (b) the existing emitSchemaRowInsert helper already lands the
+        identical (type,name,tbl_name,rootpage,sql) record shape that
+        sqlite_master expects.  zStmt ownership transfers to the
+        OP_String8 P4_DYNAMIC slot. }
+      emitSchemaRowInsert(pParse, v, iDb, PAnsiChar('index'),
+                          pIndex^.zName, pTab^.zName, iMem, zStmt);
 
       if pTblName <> nil then begin
         { sqlite3RefillIndex(pParse, pIndex, iMem) — not yet ported; the
