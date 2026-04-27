@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 24 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 25); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 25 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 26); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -186,8 +186,9 @@ Important: At the end of this document, please find:
     `sqlite3SrcListAppend` (db/table arg swap + dequote) to mirror
     build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
-  Scaffold landed; corpus expanded to 25 rows (DDL + SELECT/DML/txn).
-  Current Status (2026-04-27): **24 PASS / 1 DIVERGE / 0 ERROR**.
+  Scaffold landed; corpus expanded to 26 rows (DDL + SELECT/DML/txn +
+  SAVEPOINT).
+  Current Status (2026-04-27): **25 PASS / 1 DIVERGE / 0 ERROR**.
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -195,9 +196,9 @@ Important: At the end of this document, please find:
   PASS rows: CREATE TABLE simple / typed / IF NOT EXISTS / composite PK
   / WITHOUT ROWID, CREATE INDEX, CREATE UNIQUE INDEX, DROP INDEX IF
   EXISTS, BEGIN, BEGIN IMMEDIATE, BEGIN EXCLUSIVE, COMMIT, ROLLBACK,
-  INSERT VALUES, SELECT literal, SELECT col scan, SELECT multi-col
-  scan, SELECT col WHERE, SELECT rowid EQ, SELECT * scan, SELECT arith
-  / string / multi literal, DELETE rowid EQ.
+  SAVEPOINT, INSERT VALUES, SELECT literal, SELECT col scan, SELECT
+  multi-col scan, SELECT col WHERE, SELECT rowid EQ, SELECT * scan,
+  SELECT arith / string / multi literal, DELETE rowid EQ.
 
   DIVERGE rows + delta = (C ops − Pas ops):
 
@@ -275,8 +276,8 @@ Important: At the end of this document, please find:
 
       Sub-progress (2026-04-27): probe sweep added 8 PASS rows
       (multi-col / col-WHERE scans, arith / string / multi literals,
-      BEGIN IMMEDIATE / EXCLUSIVE, ROLLBACK).  Bringing corpus to
-      24 PASS / 1 DIVERGE / 25 total.
+      BEGIN IMMEDIATE / EXCLUSIVE, ROLLBACK), then SAVEPOINT (port of
+      sqlite3Savepoint).  Corpus now 25 PASS / 1 DIVERGE / 26 total.
 
       DIVERGE shapes discovered in the probe sweep (kept out of
       corpus until they flip — each is a committable next-agent
@@ -296,10 +297,9 @@ Important: At the end of this document, please find:
           counters disagree).
         * `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
-        * `PRAGMA user_version` — Δ=4 (read-pragma codegen elides
-          ReadCookie / ResultRow tail).
-        * `SAVEPOINT s1` — Δ=1 (single op gap; likely Transaction
-          p1 wiring).
+        * `PRAGMA user_version` — Δ=4 (read-pragma codegen is a stub:
+          `sqlite3Pragma` in passqlite3codegen.pas:22374 returns
+          immediately; needs ReadCookie / ResultRow tail at minimum).
 
 - [X] **6.10b** Bug — `INSERT INTO <tbl> DEFAULT VALUES` raised
   EAccessViolation in `sqlite3Insert` (passqlite3codegen.pas:18974)

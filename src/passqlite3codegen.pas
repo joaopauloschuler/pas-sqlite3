@@ -21594,9 +21594,26 @@ begin
     sqlite3VdbeAddOp2(v, OP_AutoCommit, 1, isRollback);
 end;
 
+{ sqlite3Savepoint — port of build.c:5303.
+  Emit a single OP_Savepoint <op>, 0, 0, <name> for SAVEPOINT/RELEASE/ROLLBACK
+  TO statements. }
 procedure sqlite3Savepoint(pParse: PParse; op: i32; pName: PToken);
+var
+  zName: PAnsiChar;
+  v: PVdbe;
 begin
-  { Phase 7 }
+  if pName <> nil then begin
+    zName := sqlite3DbStrNDup(pParse^.db, pName^.z, u64(pName^.n));
+    sqlite3Dequote(zName);
+  end else
+    zName := nil;
+  if zName = nil then Exit;
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then begin
+    sqlite3DbFree(pParse^.db, zName);
+    Exit;
+  end;
+  sqlite3VdbeAddOp4(v, OP_Savepoint, op, 0, 0, zName, P4_DYNAMIC);
 end;
 
 function sqlite3OpenTempDatabase(pParse: PParse): i32;

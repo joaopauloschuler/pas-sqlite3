@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 25;
+  N_CORPUS = 26;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -113,6 +113,7 @@ begin
   Add(i, 'BEGIN IMMEDIATE',             'BEGIN IMMEDIATE;');                     Inc(i);
   Add(i, 'BEGIN EXCLUSIVE',             'BEGIN EXCLUSIVE;');                     Inc(i);
   Add(i, 'ROLLBACK',                    'ROLLBACK;');                            Inc(i);
+  Add(i, 'SAVEPOINT',                   'SAVEPOINT s1;');                        Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
