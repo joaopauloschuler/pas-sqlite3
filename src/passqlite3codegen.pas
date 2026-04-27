@@ -4583,6 +4583,18 @@ var
   bNormal:    i32;
   p5:         i32;
   pLeft:      PExpr;
+  { TK_CASE locals }
+  caseEndLabel:  i32;
+  caseNextCase:  i32;
+  caseNExpr:     i32;
+  caseI:         i32;
+  casePEList:    PExprList;
+  caseAList:     PExprListItem;
+  caseOpCmp:     TExpr;
+  casePX:        PExpr;
+  casePTest:     PExpr;
+  casePDel:      PExpr;
+  caseDb:        PTsqlite3;
 begin
   Result := target;
   v := pParse^.pVdbe;
@@ -4923,9 +4935,80 @@ begin
             sqlite3VdbeAddOp2(v, OP_Null, 0, target);
           done := True;
         end;
+      TK_CASE:
+        begin
+          { Port of expr.c:5663..5725 — CASE WHEN ... THEN ... ELSE ... END.
+            Form A: CASE x WHEN e1 THEN r1 ... (pLeft <> nil → compare x==Ei)
+            Form B: CASE WHEN c1 THEN r1 ...    (pLeft = nil → use Ci directly)
+            The corpus test is Form B: CASE WHEN a>5 THEN 1 ELSE 0 END. }
+          Assert(ExprUseXList(pExpr) and (pExpr^.x.pList <> nil));
+          Assert(pExpr^.x.pList^.nExpr > 0);
+          caseDb     := pParse^.db;
+          casePEList := pExpr^.x.pList;
+          caseAList  := ExprListItems(casePEList);
+          caseNExpr  := casePEList^.nExpr;
+          caseEndLabel := sqlite3VdbeMakeLabel(pParse);
+          casePDel  := nil;
+          casePTest := nil;
+          casePX    := pExpr^.pLeft;
+          if casePX <> nil then
+          begin
+            { Form A: duplicate X, code it into a register }
+            casePDel := sqlite3ExprDup(caseDb, casePX, 0);
+            if caseDb^.mallocFailed <> 0 then
+            begin
+              sqlite3ExprDelete(caseDb, casePDel);
+              sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+              done := True;
+              Continue; { restart loop — which will just exit since done=True... actually break }
+            end;
+            { exprCodeVector scalar fast-path: code into a temp reg }
+            r1 := sqlite3ExprCodeTemp(pParse, casePDel, @regFree1);
+            sqlite3ExprToRegister(casePDel, r1);
+            regFree1 := 0; { do not reuse — ticket b351d95f }
+            FillChar(caseOpCmp, SizeOf(caseOpCmp), 0);
+            caseOpCmp.op    := TK_EQ;
+            caseOpCmp.pLeft := casePDel;
+            casePTest       := @caseOpCmp;
+          end;
+          caseI := 0;
+          while caseI < caseNExpr - 1 do
+          begin
+            if casePX <> nil then
+            begin
+              caseOpCmp.pRight :=
+                PExprListItem(PByte(caseAList) + caseI * SZ_EXPRLIST_ITEM)^.pExpr;
+            end else
+            begin
+              casePTest :=
+                PExprListItem(PByte(caseAList) + caseI * SZ_EXPRLIST_ITEM)^.pExpr;
+            end;
+            caseNextCase := sqlite3VdbeMakeLabel(pParse);
+            sqlite3ExprIfFalse(pParse, casePTest, caseNextCase, SQLITE_JUMPIFNULL);
+            sqlite3ExprCode(pParse,
+              PExprListItem(PByte(caseAList) + (caseI + 1) * SZ_EXPRLIST_ITEM)^.pExpr,
+              target);
+            sqlite3VdbeGoto(v, caseEndLabel);
+            sqlite3VdbeResolveLabel(v, caseNextCase);
+            Inc(caseI, 2);
+          end;
+          { ELSE clause or NULL }
+          if (caseNExpr and 1) <> 0 then
+            sqlite3ExprCode(pParse,
+              PExprListItem(PByte(caseAList) + (caseNExpr - 1) * SZ_EXPRLIST_ITEM)^.pExpr,
+              target)
+          else
+            sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+          sqlite3ExprDelete(caseDb, casePDel);
+          { setDoNotMergeFlagOnCopy: if last op is OP_Copy, mark it non-mergeable }
+          if sqlite3VdbeGetLastOp(v)^.opcode = OP_Copy then
+            sqlite3VdbeChangeP5(v, 1);
+          sqlite3VdbeResolveLabel(v, caseEndLabel);
+          done := True;
+        end;
     else
       { TODO(Phase 6.9-bis): TK_AGG_COLUMN, TK_AND/TK_OR,
-        TK_FUNCTION, TK_CASE, TK_IN, TK_EXISTS, TK_SELECT,
+        TK_IN, TK_EXISTS, TK_SELECT,
         TK_IF_NULL_ROW, … — land in subsequent vertical-slice
         sub-progresses.  C default arm semantics: assert
         (op==TK_NULL || op==TK_ERROR || mallocFailed) then emit OP_Null.
@@ -21045,13 +21128,204 @@ begin
   end;
 end;
 
+{ Phase 6.9-bis 11g.2.f sub-progress 34 — printf() / format() SQL function.
+  Minimal port of func.c:printfFunc (line 311).  Handles the standard C
+  format specifiers used in the corpus (%d, %i, %u, %s, %f, %g, %e, %c)
+  plus SQLite's %q (single-quote escape) extension.  Variadic: arity = -1.
+  arg[0] = format string; arg[1..argc-1] = substitution values.
+
+  Implementation strategy: build the result as a Pascal AnsiString, then
+  copy to sqlite3_malloc buffer for the result.  For each %X specifier,
+  convert the argv value to a string using IntToStr / FloatToStr / Hex,
+  skipping the unported StrAccum / PrintfArguments machinery.  A full
+  port can replace this stub once StrAccum lands. }
+procedure printfFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  zFmt:    PAnsiChar;
+  result_: AnsiString;   { accumulated result }
+  argIdx:  i32;          { next argv index to consume (starts at 1) }
+  p:       PAnsiChar;    { cursor into format string }
+  pVal:    PMem;
+  zStr:    PAnsiChar;
+  c:       AnsiChar;
+  v64:     i64;
+  vDbl:    Double;
+  s:       AnsiString;
+  i:       i32;
+  zOut:    PAnsiChar;
+  nOut:    i32;
+
+  { Skip optional flag / width / precision chars between '%' and the type char.
+    Returns the next non-meta character (the specifier letter). }
+  function SkipFmtMeta: AnsiChar;
+  begin
+    { flags }
+    while p^ in ['-', '+', ' ', '0', '#'] do Inc(p);
+    { width }
+    while p^ in ['0'..'9'] do Inc(p);
+    { precision }
+    if p^ = '.' then begin Inc(p); while p^ in ['0'..'9'] do Inc(p); end;
+    Result := p^;
+  end;
+
+  { Append s to result_ }
+  procedure App(const as_: AnsiString); inline;
+  begin result_ := result_ + as_; end;
+
+  { Format u64 as hex (lower or upper) }
+  function HexStr(v: u64; upper: Boolean): AnsiString;
+  const L: AnsiString = '0123456789abcdef';
+        U: AnsiString = '0123456789ABCDEF';
+  var buf: array[0..15] of AnsiChar;
+      k, j: i32;
+  begin
+    if v = 0 then begin Result := '0'; Exit; end;
+    k := 0;
+    while v > 0 do begin
+      if upper then buf[k] := U[1 + (v and $F)]
+               else buf[k] := L[1 + (v and $F)];
+      v := v shr 4; Inc(k);
+    end;
+    SetLength(Result, k);
+    for j := 0 to k - 1 do Result[k - j] := buf[j];
+  end;
+
+  function OctStr(v: u64): AnsiString;
+  var buf: array[0..21] of AnsiChar;
+      k, j: i32;
+  begin
+    if v = 0 then begin Result := '0'; Exit; end;
+    k := 0;
+    while v > 0 do begin
+      buf[k] := AnsiChar(Ord('0') + (v and 7));
+      v := v shr 3; Inc(k);
+    end;
+    SetLength(Result, k);
+    for j := 0 to k - 1 do Result[k - j] := buf[j];
+  end;
+
+begin
+  if argc < 1 then begin sqlite3_result_null(pCtx); Exit; end;
+  zFmt := sqlite3_value_text(Psqlite3_value((argv + 0)^));
+  if zFmt = nil then begin sqlite3_result_null(pCtx); Exit; end;
+
+  result_ := '';
+  argIdx  := 1;
+  p       := zFmt;
+
+  while p^ <> #0 do begin
+    c := p^;
+    if c <> '%' then begin
+      result_ := result_ + c;
+      Inc(p);
+      Continue;
+    end;
+    Inc(p); { skip '%' }
+    if p^ = #0 then Break;
+    if p^ = '%' then begin
+      result_ := result_ + '%';
+      Inc(p);
+      Continue;
+    end;
+    { Skip optional width / precision / flags, then read the specifier. }
+    c := SkipFmtMeta;
+    { consume the current arg if any }
+    if argIdx < argc then begin
+      pVal := (argv + argIdx)^; Inc(argIdx);
+    end else
+      pVal := nil;
+    case c of
+      'd', 'i': begin
+        Inc(p);
+        if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
+        else v64 := 0;
+        App(IntToStr(v64));
+      end;
+      'u': begin
+        Inc(p);
+        if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
+        else v64 := 0;
+        App(IntToStr(u64(v64)));
+      end;
+      'x': begin
+        Inc(p);
+        if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
+        else v64 := 0;
+        App(HexStr(u64(v64), False));
+      end;
+      'X': begin
+        Inc(p);
+        if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
+        else v64 := 0;
+        App(HexStr(u64(v64), True));
+      end;
+      'o': begin
+        Inc(p);
+        if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
+        else v64 := 0;
+        App(OctStr(u64(v64)));
+      end;
+      'f', 'e', 'E', 'g', 'G': begin
+        Inc(p);
+        if pVal <> nil then vDbl := sqlite3_value_double(Psqlite3_value(pVal))
+        else vDbl := 0;
+        { Use Pascal FloatToStr as a best-effort approximation; matches %g
+          for most practical values used in SQL expressions. }
+        App(FloatToStr(vDbl));
+      end;
+      's': begin
+        Inc(p);
+        if pVal <> nil then begin
+          zStr := sqlite3_value_text(Psqlite3_value(pVal));
+          if zStr <> nil then App(AnsiString(zStr));
+        end;
+      end;
+      'c': begin
+        Inc(p);
+        if pVal <> nil then
+          result_ := result_ + AnsiChar(sqlite3_value_int(Psqlite3_value(pVal)) and $FF);
+      end;
+      'q': begin
+        { %q — wrap text in single-quotes, doubling internal single-quotes }
+        Inc(p);
+        if pVal <> nil then begin
+          if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then
+            App('NULL')
+          else begin
+            zStr := sqlite3_value_text(Psqlite3_value(pVal));
+            if zStr = nil then zStr := '';
+            s := AnsiString(zStr);
+            result_ := result_ + '''';
+            for i := 1 to Length(s) do begin
+              if s[i] = '''' then result_ := result_ + '''';
+              result_ := result_ + s[i];
+            end;
+            result_ := result_ + '''';
+          end;
+        end;
+      end;
+    else
+      { Unknown specifier — emit '%' + char verbatim }
+      Inc(p);
+      result_ := result_ + '%' + c;
+    end;
+  end;
+
+  nOut := Length(result_);
+  zOut := sqlite3_malloc(nOut + 1);
+  if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+  if nOut > 0 then Move(result_[1], zOut^, nOut);
+  (zOut + nOut)^ := #0;
+  sqlite3_result_text(pCtx, zOut, nOut, SQLITE_DYNAMIC);
+end;
+
 { Built-in function table — a static array of TFuncDef records. }
 const
   FUNC_ENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_CONSTANT;
   AGG_ENC  = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
 
 var
-  aBuiltinFuncs: array[0..42] of TFuncDef;
+  aBuiltinFuncs: array[0..44] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -21131,6 +21405,15 @@ begin
   MakeFD(aBuiltinFuncs[42], 1, FUNC_ENC or SQLITE_FUNC_INLINE or SQLITE_FUNC_UNLIKELY,
     @unlikelyFunc, nil, 'likely');
   aBuiltinFuncs[42].pUserData := Pointer(PtrInt(INLINEFUNC_unlikely));
+  { Phase 6.9-bis 11g.2.f sub-progress 34 — printf()/format() registration.
+    Mirrors func.c:  FUNCTION(printf, -1, 0, 0, printfFunc)
+                     FUNCTION(format, -1, 0, 0, printfFunc)
+    Variadic (nArg=-1) so sqlite3FindFunction finds it for any arg count.
+    SQLITE_FUNC_CONSTANT is set; the function is deterministic given the
+    same args (matches the C registration which uses FUNCTION macro, which
+    sets SQLITE_FUNC_DETERMINISTIC via FUNCTION_INTERNAL). }
+  MakeFD(aBuiltinFuncs[43], -1, FUNC_ENC, @printfFunc, nil, 'printf');
+  MakeFD(aBuiltinFuncs[44], -1, FUNC_ENC, @printfFunc, nil, 'format');
 end;
 
 var

@@ -3650,10 +3650,45 @@ Important: At the end of this document, please find:
           TestWhereExpr pass, TestWherePlanner pass, TestExplainParity 2/10
           (unchanged), TestVdbeArith 41/41, TestJson 434/434.
 
-      Sub-progress 34 options: (i) port TK_CASE arm in codegen.pas
-      (turns CASE_WHEN from DIVERGE to PASS); (ii) fix `printf()` multi-arg
-      function codegen; (iii) begin EXISTS/NOT EXISTS subquery machinery
-      (11g.2.d prerequisite).
+    - [X] Sub-progress 34 — TK_CASE arm port + `printf()`/`format()`
+      function registration (2026-04-27).  Two parallel landings merged
+      together:
+
+      (a) **TK_CASE port** (codegen.pas `sqlite3ExprCodeTarget`).  Ported
+      expr.c:5663..5725 covering both Form A (`CASE x WHEN ...`) and
+      Form B (`CASE WHEN ...`).  Inlines `setDoNotMergeFlagOnCopy` (P5=1
+      on trailing OP_Copy).  CASE_WHEN row now emits the expected 17-op
+      shape (Le/IfNot/Integer THEN/Goto/Integer ELSE/outer Ne).
+
+      (b) **printf/format registration** (codegen.pas).  Added a
+      ~130-line `printfFunc` (port of func.c:printfFunc covering the
+      standard %d/%i/%u/%x/%X/%o/%f/%g/%e/%s/%c/%q specifiers via
+      Pascal string ops, no StrAccum dependency) and registered
+      `printf` and `format` (-1 arity, FUNC_ENC) in `aBuiltinFuncs`
+      [43..44].  `sqlite3FindFunction` now resolves printf, so the
+      TK_FUNCTION arm's existing constMask path correctly hoists the
+      `'%d'` literal as `String8` and emits `OP_Function` — matching
+      the C oracle 14-op shape.
+
+      **Test-suite delta:**
+        * TestWhereCorpus: **64 PASS / 4 DIVERGE / 0 ERROR (corpus = 68)**.
+          PRINTF_2ARG and CASE_WHEN both flipped DIVERGE → PASS.
+          Remaining DIVERGEs: LEFT_JOIN, JOIN_WHERE, EXISTS_SUB,
+          NOT_EXISTS — all blocked on 11g.2.d (multi-table planner /
+          correlated subquery codegen).
+        * No regression across TestParser 45/45, TestExprBasic 40/40,
+          TestSelectBasic 49/49, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestPrepareBasic 20/20, TestWhereBasic 52/52,
+          TestWhereSimple 44/44, TestWhereExpr 84/84, TestWherePlanner
+          675/675, TestExplainParity 2/10, TestVdbeArith 41/41,
+          TestJson 434/434.
+
+      Sub-progress 35 options: all four remaining corpus DIVERGEs
+      (LEFT_JOIN, JOIN_WHERE, EXISTS_SUB, NOT_EXISTS) are gated on
+      11g.2.d.  Open avenues that do NOT depend on 11g.2.d:
+      (i) corpus expansion group #6 — additional single-table shapes;
+      (ii) begin sketching the multi-table planner (11g.2.d itself);
+      (iii) drive TestExplainParity diverges down (currently 2/10).
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
