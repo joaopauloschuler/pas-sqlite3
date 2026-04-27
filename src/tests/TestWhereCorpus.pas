@@ -185,9 +185,14 @@ begin
 
   n := 0;
   while csq_step(pStmt) = SQLITE_ROW do begin
-    SetLength(ops, n + 1);
     txt := csq_column_text(pStmt, 1);
     if txt <> nil then row.opcode := AnsiString(txt) else row.opcode := '';
+    { Skip OP_Explain comment opcodes — only emitted by the C oracle when
+      SQLITE_ENABLE_EXPLAIN_COMMENTS is on, and never by the Pascal codegen.
+      Removing them lets the row-by-row diff gate compare actual VDBE shape
+      instead of EXPLAIN-formatting chatter. }
+    if row.opcode = 'Explain' then continue;
+    SetLength(ops, n + 1);
     row.p1 := csq_column_int(pStmt, 2);
     row.p2 := csq_column_int(pStmt, 3);
     row.p3 := csq_column_int(pStmt, 4);

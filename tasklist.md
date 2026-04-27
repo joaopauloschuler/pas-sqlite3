@@ -1789,6 +1789,101 @@ Important: At the end of this document, please find:
       DIVERGE / 0 ERROR (unchanged — the CREATE TABLE rows in
       that corpus suffer the same rootpage drift, which is now
       flagged as the next sub-progress's target).
+    - [X] Sub-progress 11 — bootstrap rootpage drift fixed +
+      `:memory:` filename detection + Explain-opcode filter
+      (2026-04-27).  Three landings:
+
+      (a) `sqlite3PagerOpen` (passqlite3pager.pas:2220) — added a
+      pre-flag-check arm that recognises the literal filename
+      `:memory:` and OR-s `PAGER_MEMORY` into the open flags
+      before the existing `(flags and PAGER_MEMORY) <> 0` arm
+      runs.  Mirrors the higher-level `:memory:` detection in C
+      `openDatabase` (main.c) which sets `BTREE_MEMORY` on the
+      btree open path, then PAGER_MEMORY on the pager open path,
+      whenever the user passes `":memory:"` directly.  Without
+      this, our unix VFS treated `:memory:` as a regular filename
+      and `sqlite3OsOpen` opened an actual on-disk file at the
+      CWD literally named `:memory:`; if any earlier test run
+      had left such a file around (from sub-progress 8 onwards
+      the project root contained a 60 KB stale `:memory:` file
+      with a populated 15-page sqlite_master left over from the
+      first end-to-end CREATE TABLE round-trip), `pagerPagecount`
+      called from `sqlite3PagerSharedLock` (passqlite3pager.pas:
+      2631) read the on-disk file size, set `pPager^.dbSize=15`,
+      and `lockBtree` then propagated `pBt^.nPage=15` from page-1
+      header byte 28.  First user CREATE TABLE consequently
+      allocated rootpage 16 instead of 2, dragging every IPK /
+      INDEX_EQ corpus row's OpenRead-P2 by +14.
+
+      Fix root-caused via NPAGE_TRACE instrumentation in
+      `lockBtree`, `btreeCreateTable`, `allocateBtreePage`,
+      `newDatabase`, `btreeSetNPage`, plus all seven
+      `dbSize:=` sites in passqlite3pager.pas.  The trace
+      pinpointed `sqlite3PagerSharedLock` as the origin
+      (`[lockBtree.afterShared] pager.dbSize=15` after entering
+      with dbSize=0).  After the fix: dbSize=0 across the same
+      bracket, `newDatabase` lands `nPage<-1` from the
+      `if wrflag<>0 then newDatabase(pBt)` branch in
+      `btreeBeginTrans`, then the three corpus CREATE TABLEs
+      land at rootpages 2/3/4 — byte-identical to the C oracle.
+      All instrumentation reverted before commit.
+
+      (b) `TestWhereCorpus.CExplain` (TestWhereCorpus.pas:186) —
+      filter `Explain` opcodes from the C oracle's listing.
+      `EXPLAIN <sql>` under SQLITE_ENABLE_EXPLAIN_COMMENTS emits
+      `Explain` comment opcodes (one per high-level pseudo-op);
+      Pascal codegen never emits `OP_Explain`, so the comment
+      ops add a fixed +N delta to every C row's count.  Skipping
+      them lets the row-by-row diff gate compare actual VDBE
+      shape instead of EXPLAIN-formatting chatter.  After both
+      (a) and (b) the failure-mode tally moves from
+      `0 exception, 0 nil-Vdbe, 15 op-count, 5 op-diff`
+      (sub-progress 10) to `0 exception, 0 nil-Vdbe, 16
+      op-count, 4 op-diff` — same number of structurally aligned
+      rows, but rootpage P2 / cursor P1 / register-slot P3
+      drifts now stand alone instead of being masked by the
+      bootstrap +14 offset.  Cursor allocation alignment and the
+      typed-schema fixture upgrade are the next sub-progress's
+      targets.
+
+      (c) Stray `:memory:` files removed from
+      `/home/bpsa/app/pas-sqlite3/`,
+      `/home/bpsa/app/pas-sqlite3/src/`,
+      `/home/bpsa/app/pas-sqlite3/src/tests/`, and
+      `/home/bpsa/app/pas-sqlite3/bin/`.  These were latent
+      artefacts of (a)'s missing branch and would have continued
+      to confuse the unix-VFS open path on developer machines
+      until the fix landed.  `.gitignore` already covers them
+      via the project-root listing.
+
+      Test-suite delta: no regression anywhere.  TestParser
+      45/45, TestParserSmoke 20/20, TestPrepareBasic 20/20,
+      TestSelectBasic 49/49, TestExprBasic 40/40, TestDMLBasic
+      54/54, TestSchemaBasic 44/44, TestWhereBasic 52/52,
+      TestWhereSimple 44/44, TestWhereExpr 84/84,
+      TestWhereStructs 148/148, TestWherePlanner 675/675,
+      TestVdbeVtabExec 50/50, TestVdbeArith 41/41,
+      TestVdbeMisc 45/45, TestVdbeApi 57/57, TestVdbeMem 62/62,
+      TestVdbeAux 108/108, TestVdbeRecord 13/13, TestVdbeAgg
+      11/11, TestVdbeStr 23/23, TestVdbeBlob 13/13, TestVdbeSort
+      14/14, TestVdbeCursor 27/27, TestExplainParity 2/10
+      (unchanged), TestBtreeCompat 337/337, TestPager,
+      TestPagerCompat, TestPagerCrash, TestPagerRollback,
+      TestPagerReadOnly all green, TestOpenClose 17/17,
+      TestInitCallback 29/29, TestPrintf 105/105, TestJson
+      434/434, TestJsonEach 50/50, TestTokenizer 127/127,
+      TestRegistration 19/19, TestExecGetTable 23/23,
+      TestBackup 20/20, TestConfigHooks 54/54, TestInitShutdown
+      27/27, TestUnlockNotify 14/14, TestLoadExt 20/20,
+      TestAuthBuiltins 34/34.
+
+      Sub-progress 12 must align cursor numbering and emit a
+      typed-schema-equivalent codegen path so the four
+      remaining op-diff rows (IPK, IPK_RANGE, FULL via P3
+      register-slot drift, plus one more) flip green.  The
+      heavy lift — multi-table joins, ORDER BY consumption,
+      GROUP BY/aggregate — opens the remaining 16 op-count
+      rows.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

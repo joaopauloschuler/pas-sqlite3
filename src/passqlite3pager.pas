@@ -2215,7 +2215,16 @@ begin
 
   journalFileSize := ROUND8(sqlite3JournalSize(pVfs));
 
-  { Handle PAGER_MEMORY flag }
+  { Handle PAGER_MEMORY flag — also recognise the literal ":memory:"
+    filename so we don't fall through to the unix VFS and open a real
+    on-disk file by that name (mirrors the higher-level :memory:
+    detection in C openDatabase). }
+  if Assigned(zFilename) and (zFilename[0] = ':')
+     and (StrComp(zFilename, ':memory:') = 0) then
+  begin
+    flags := flags or PAGER_MEMORY;
+    zFilename := nil;
+  end;
   if (flags and PAGER_MEMORY) <> 0 then
   begin
     memDb := 1;
