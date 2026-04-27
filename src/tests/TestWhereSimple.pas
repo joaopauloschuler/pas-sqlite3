@@ -177,8 +177,8 @@ begin
         pLoop^.nLTerm = 1);
   Check('M1e rowid-EQ leaf is TERM_CODED',
         (pLoop^.aLTerm[0]^.wtFlags and TERM_CODED) <> 0);
-  Check('M1f col=7 leaf is NOT TERM_CODED (deferred to per-row body)',
-        (pWInfo^.sWC.a[1].wtFlags and TERM_CODED) = 0);
+  Check('M1f col=7 leaf is now TERM_CODED (residual emitted in body, sub-progress 9)',
+        (pWInfo^.sWC.a[1].wtFlags and TERM_CODED) <> 0);
 
   iOp := FindOpcode(v, OP_OpenRead, 0);
   Check('M1g OP_OpenRead emitted', iOp >= 0);
@@ -220,13 +220,24 @@ begin
 
   pWInfo := sqlite3WhereBegin(@parse, pSrc, pIn, nil, nil, nil, 0, 0);
 
-  { whereShortCut only matches WO_EQ / WO_IS, not WO_IN, so the planner
-    short-cut returns 0 and WhereBegin returns nil.  This is the expected
-    outcome until 11g.2.d lands the IN-list scan. }
-  Check('M2a WhereBegin returns nil for IN-list (no shortcut)',
-        pWInfo = nil);
-  Check('M2b parse.nErr = 0 (graceful fall-through, not an error)',
+  { Sub-progress 9: the SCAN-with-residual fallback now picks up IN-list
+    shapes that whereShortCut cannot match.  WhereBegin returns non-nil,
+    emits OP_OpenRead + OP_Rewind, and emits a per-row residual filter
+    via sqlite3ExprIfFalse on the TK_IN expression. }
+  Check('M2a WhereBegin returns non-nil for IN-list (SCAN+residual)',
+        pWInfo <> nil);
+  Check('M2b parse.nErr = 0',
         parse.nErr = 0);
+  if pWInfo <> nil then
+  begin
+    Check('M2g OP_OpenRead emitted',
+          FindOpcode(v, OP_OpenRead, 0) >= 0);
+    Check('M2h OP_Rewind emitted',
+          FindOpcode(v, OP_Rewind, 0) >= 0);
+    Check('M2i IN-list term tagged TERM_CODED after residual emission',
+          (pWInfo^.sWC.a[0].wtFlags and TERM_CODED) <> 0);
+    sqlite3WhereEnd(pWInfo);
+  end;
 
   { Independently exercise the analysis pipeline against the same shape so
     the regression catches breakage in sqlite3WhereSplit /
@@ -281,10 +292,21 @@ begin
   pBet^.x.pList := pBList;
 
   pWInfo := sqlite3WhereBegin(@parse, pSrc, pBet, nil, nil, nil, 0, 0);
-  Check('M3a WhereBegin returns nil for BETWEEN (no WO_EQ)',
-        pWInfo = nil);
-  Check('M3b parse.nErr = 0 (graceful fall-through)',
+  { Sub-progress 9: BETWEEN on rowid no longer falls back to nil.  The
+    SCAN-with-residual path emits OP_Rewind + a per-row IfFalse on the
+    parent TK_BETWEEN; the two TERM_VIRTUAL companions are skipped. }
+  Check('M3a WhereBegin returns non-nil for BETWEEN (SCAN+residual)',
+        pWInfo <> nil);
+  Check('M3b parse.nErr = 0',
         parse.nErr = 0);
+  if pWInfo <> nil then
+  begin
+    Check('M3k OP_Rewind emitted',
+          FindOpcode(v, OP_Rewind, 0) >= 0);
+    Check('M3l BETWEEN parent tagged TERM_CODED',
+          (pWInfo^.sWC.a[0].wtFlags and TERM_CODED) <> 0);
+    sqlite3WhereEnd(pWInfo);
+  end;
 
   { Drive analysis in isolation to verify BETWEEN spawns the two virtual
     WO_GE / WO_LE children expected by 11g.2.d's range-scan path. }

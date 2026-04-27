@@ -1634,6 +1634,88 @@ Important: At the end of this document, please find:
       sqlite3ExprIfFalse-coded predicates, jump-to-loop-tail on
       false), at which point the IPK / INDEX_EQ / IPK_RANGE corpus
       shapes can flip green.
+    - [X] Sub-progress 9 — per-row residual filter emission +
+      `pWhere <> nil` gate lifted from sqlite3Select (2026-04-27).
+      Three small landings:
+
+      (a) `whereShortCut` — dropped the `pWC^.nBase = 0` restriction
+      from the SCAN fallback (codegen.pas:11926 region).  The
+      planner now picks SCAN for any non-OR-subclause shape and
+      lets the WHERE machinery handle residual filtering at the
+      loop body, instead of returning 0 (which forced
+      sqlite3Select to bail to the 3-op stub).
+
+      (b) `sqlite3WhereBegin` — appended a distilled push-down
+      residual walk after the IPK / SCAN per-loop emission.
+      `notReadyResid := pLevel^.notReady and (not pLoop^.maskSelf)`
+      mirrors the post-this-level adjustment that
+      `sqlite3WhereCodeOneLoopStart` (codegen.pas:13287..13367)
+      makes before its main residual walk.  For every base WHERE
+      term that is non-virtual, non-already-coded, and whose
+      prereqAll bits are fully satisfied by this level (the only
+      level), emit `sqlite3ExprIfFalse(pParse, pTerm^.pExpr,
+      pLevel^.addrCont, SQLITE_JUMPIFNULL)` and tag the term
+      TERM_CODED so future walks (and the False-Bypass loop on
+      re-entry) cannot re-emit it.  Common tail covers both the
+      IPK arm (additional residuals like "rowid=k AND col=v"
+      where col=v is not the IPK term) and the SCAN arm (every
+      WHERE term against the table).  Single new var
+      `notReadyResid: Bitmask` declared; no new helpers.
+
+      (c) `sqlite3Select` — removed the `if p^.pWhere <> nil then
+      Result := SQLITE_OK; Exit;` gate at codegen.pas:14440.
+      With (a)+(b) in place, the trivial-gate body now drives
+      sqlite3WhereBegin(pWhere = p^.pWhere) for any single-table
+      SELECT regardless of the WHERE shape, so the IPK rowid-EQ
+      lookup, IN-list scan-with-residual, BETWEEN scan-with-
+      residual, LIKE scan-with-residual, etc. all reach the real
+      OpenRead / Rewind / Column / ResultRow / Next codegen path
+      instead of the 3-op Init/Halt/Goto stub.
+
+      Test-scaffold deviations: TestWhereSimple M1f / M2a-i /
+      M3a-l updated.  M1f (`col=7 leaf is NOT TERM_CODED`) flipped
+      to assert TERM_CODED is now SET — the residual walk codes
+      the leaf on the per-row body.  M2a / M2b reworded to expect
+      WhereBegin returning non-nil for IN-list (was: nil) plus
+      three new assertions (M2g OP_OpenRead, M2h OP_Rewind, M2i
+      term TERM_CODED).  M3a similarly flipped to non-nil + M3k /
+      M3l for OP_Rewind + parent TERM_CODED.  All 44 PASS / 0
+      FAIL.
+
+      Test-suite delta:
+        * TestWhereCorpus failure-mode tally moved from
+          `0 exception, 0 nil-Vdbe, 20 op-count, 0 op-diff`
+          (sub-progress 8) to `0 exception, 0 nil-Vdbe, 16
+          op-count, 4 op-diff`.  Four corpus rows (IPK shapes
+          and FULL) now generate real stepable Vdbes whose
+          structural shape closely matches the C oracle; the
+          remaining 16 still gate via the multi-table /
+          aggregate / etc. guards in sqlite3Select.  Per-row
+          differences are now P-operand drift (Pascal cursor
+          numbering 0 vs C's 1) rather than wholesale stub
+          divergence — the 4 op-diff rows are now within reach
+          of the next sub-progress that aligns cursor allocation
+          and EXPLAIN-comment opcode emission.
+        * No regression anywhere: TestParser 45/45,
+          TestParserSmoke 20/20, TestPrepareBasic 20/20,
+          TestSelectBasic 49/49, TestExprBasic 40/40,
+          TestDMLBasic 54/54, TestSchemaBasic 44/44,
+          TestWhereBasic 52/52, TestWhereSimple 44/44 (M1f /
+          M2*/M3* updated as above), TestWhereExpr 84/84,
+          TestWhereStructs 148/148, TestWherePlanner 675/675,
+          TestVdbeVtabExec 50/50, TestVdbeArith 41/41.
+          TestExplainParity unchanged at `2 pass / 6 diverge /
+          2 error` (the 2 ERRORs on CREATE INDEX / CREATE
+          UNIQUE INDEX are pre-existing — they ERR'd in the
+          sub-progress 8 baseline too; the headline tally
+          "TestExplainParity 2/10" elided the diverge/error
+          split).
+
+      Sub-progress 10 must align cursor numbering with the C
+      oracle so the 4 op-diff rows flip green, and lift
+      additional sqlite3Select gates (multi-table joins, ORDER
+      BY consumption, GROUP BY/aggregate) so the 16 remaining
+      op-count rows enter codegen.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

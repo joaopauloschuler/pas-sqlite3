@@ -11908,23 +11908,22 @@ begin
     Exit(1);
   end;
 
-  { Phase 6.9-bis 11g.2.f sub-progress 8 — full-table-scan fallback.
+  { Phase 6.9-bis 11g.2.f sub-progress 9 — full-table-scan fallback.
 
-    Fires only when the WHERE clause is empty (pWC^.nBase = 0); if there
-    are unsatisfied WHERE terms (e.g. IN-list, BETWEEN, residual range)
-    the fallback would silently emit an unfiltered scan and silently
-    return wrong rows, so we must keep returning nil for those shapes
-    until per-row residual evaluation lands.  TestWhereSimple's M2a/M3a
-    tests pin this defensive nil-return.
+    Sub-progress 8 gated this on `pWC^.nBase = 0` (no residual WHERE) so
+    that unsatisfied terms could not silently disappear into an
+    unfiltered scan.  Sub-progress 9 lifts that guard: sqlite3WhereBegin
+    now emits per-row residual filter terms (sqlite3ExprIfFalse →
+    addrCont) for every base WHERE term that the planner pick did not
+    consume, so SCAN-with-residual produces correct results.
 
     Plain SCAN: open the table cursor with OP_OpenRead, OP_Rewind seeds
     the iteration head, and sqlite3WhereEnd emits OP_Next at the iBreak
     label.  pLoop^.wsFlags = 0 (no IPK/INDEX/ONEROW hints) gates the
     Case-2 SeekRowid arm in sqlite3WhereBegin's tail off, so the tail
     emits the OP_Rewind seed instead and the per-row body is appended
-    directly by the caller. }
-  if ((pWInfo^.wctrlFlags and WHERE_OR_SUBCLAUSE) = 0)
-     and (pWInfo^.sWC.nBase = 0) then
+    directly by the caller, with residuals interleaved. }
+  if (pWInfo^.wctrlFlags and WHERE_OR_SUBCLAUSE) = 0 then
   begin
     pLoop^.wsFlags := 0; { plain scan — no IPK/INDEX/ONEROW hints }
     pLoop^.nLTerm := 0;
@@ -11973,6 +11972,7 @@ var
   v:           PVdbe;
   iReleaseReg: i32;
   iRowidReg:   i32;
+  notReadyResid: Bitmask;
 begin
   Assert(((wctrlFlags and WHERE_ONEPASS_MULTIROW) = 0)
       or (((wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0)
@@ -12253,6 +12253,36 @@ begin
     pLevel^.p1 := pLevel^.iTabCur;
     pLevel^.p2 := pLevel^.addrBody;
     pLevel^.p5 := 0;
+  end;
+
+  { Phase 6.9-bis 11g.2.f sub-progress 9 — per-row residual filter emission.
+
+    Distilled push-down walk for the single-table vertical slice (the full
+    walk lives in sqlite3WhereCodeOneLoopStart at codegen.pas:13287..13367,
+    which this slice does not invoke).  Every base WHERE term that is NOT
+    virtual, NOT already TERM_CODED (by the False-Bypass loop or by the
+    IPK SeekRowid arm above), and whose prereqAll is fully satisfied by
+    this level, gets evaluated at the loop head; failure jumps to
+    pLevel^.addrCont so the per-row body and OP_ResultRow are skipped.
+    Setting TERM_CODED prevents downstream walks from re-emitting.
+
+    This is the single change that lifts the `pWhere <> nil` gate from
+    sqlite3Select — IPK shapes (rowid=k AND col=v) and SCAN-with-residual
+    shapes (col=v with no index, IN-list, BETWEEN, LIKE …) now emit
+    correct bytecode instead of bailing to a 3-op stub. }
+  begin
+    { notReady for the post-this-level body: clear this loop's bit. }
+    notReadyResid := pLevel^.notReady and (not pLoop^.maskSelf);
+    for ii := 0 to pWInfo^.sWC.nTerm - 1 do
+    begin
+      pTerm := @pWInfo^.sWC.a[ii];
+      if (pTerm^.wtFlags and (TERM_VIRTUAL or TERM_CODED)) <> 0 then continue;
+      if pTerm^.pExpr = nil then continue;
+      if (pTerm^.prereqAll and notReadyResid) <> 0 then continue;
+      sqlite3ExprIfFalse(pParse, pTerm^.pExpr, pLevel^.addrCont,
+                         SQLITE_JUMPIFNULL);
+      pTerm^.wtFlags := pTerm^.wtFlags or TERM_CODED;
+    end;
   end;
 
   Result := pWInfo;
@@ -14437,7 +14467,9 @@ begin
   if p^.pSrc^.nSrc <> 1 then begin Result := SQLITE_OK; Exit; end;
   if p^.pEList = nil then begin Result := SQLITE_OK; Exit; end;
   if p^.pEList^.nExpr < 1 then begin Result := SQLITE_OK; Exit; end;
-  if p^.pWhere     <> nil then begin Result := SQLITE_OK; Exit; end;
+  { p^.pWhere <> nil gate lifted in sub-progress 9 — sqlite3WhereBegin
+    now drives whereShortCut → IPK / SCAN with per-row residual filter
+    emission, so any single-table WHERE shape produces a stepable body. }
   if p^.pGroupBy   <> nil then begin Result := SQLITE_OK; Exit; end;
   if p^.pHaving    <> nil then begin Result := SQLITE_OK; Exit; end;
   if p^.pOrderBy   <> nil then begin Result := SQLITE_OK; Exit; end;
