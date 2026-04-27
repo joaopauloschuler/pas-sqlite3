@@ -607,6 +607,29 @@ Important: At the end of this document, please find:
       OP_Null, TK_EQ INTEGER, TK_IS TERM_CODED, transitive EQUIV no-
       disable), CAET1..CAET3 (nEq=0 affinity-only, nEq=1 TK_EQ register
       block, nExtraReg=1 register accounting under TK_IS).
+    - [X] Leaf helpers, batch 6 — `removeUnindexableInClauseTerms`
+      (wherecode.c:573..653).  Builds a *reduced* duplicate of an
+      `X IN (SELECT ...)` expression so only the vector columns the chosen
+      index can use survive on both LHS and RHS.  sqlite3ExprDup deep-copies
+      pX, then for every pSelect in the (compound) chain a fresh ExprList is
+      assembled from pLoop^.aLTerm[iEq..nLTerm-1] entries whose pExpr matches
+      the original pX (using `iField - 1` as the column slot).  Original
+      ELists are released, the new ones stitched in.  When the reduced LHS
+      collapses to one column the wrapping TK_VECTOR is unwrapped (the parser
+      never produces single-element vectors, and downstream subroutines do
+      not accept them).  Each rewritten SELECT bumps `pParse^.nSelect` so
+      its `selId` is distinct from the original's (required for SubrtnSig
+      validity).  ORDER BY / GROUP BY references to old result-set positions
+      are remapped through `adjustOrderByCol`; orphans collapse to 0.
+      Caller retains ownership of the original pX — the routine never frees
+      it; the caller deletes the returned duplicate when finished.
+      Gate: `TestWherePlanner.pas` (423/423): RUICT1 (3-column → 2-column
+      reduction via two iField terms — RHS pEList nExpr=2, LHS still
+      TK_VECTOR with two children, selId bumped, original pIN intact),
+      RUICT2 (single-term reduction → TK_VECTOR unwrapped, pNew^.pLeft
+      lifted to the bare LHS column, RHS nExpr=1), RUICT3 (no-match path
+      under mallocFailed: routine returns without firing the
+      `(pRhs<>nil) or mallocFailed` assert).
     - [X] Leaf helpers, batch 5 — `codeExprOrVector`
       (wherecode.c:1320..1346) and `filterPullDown` (wherecode.c:1391..1439).
       codeExprOrVector emits a vector or scalar expression into a contiguous

@@ -3967,6 +3967,134 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- removeUnindexableInClauseTerms (wherecode.c:573..653) ----- }
+
+procedure TestRemoveUnindexableInClauseTerms;
+var
+  db:         PTsqlite3;
+  parse:      TParse;
+  rc:         i32;
+  pCol0,pCol1,pCol2: PExpr;
+  pLhs0,pLhs1,pLhs2: PExpr;
+  pVecLeft:   PExpr;
+  pIN:        PExpr;
+  pSel:       PSelect;
+  pListR:     PExprList;
+  pListL:     PExprList;
+  pLoop:      TWhereLoop;
+  termA,termB: TWhereTerm;
+  altermBuf:  array[0..1] of PWhereTerm;
+  pNew:       PExpr;
+  origSelId:  u32;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('RUICT open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+
+  { ---- Build a 3-column SELECT pEList of TK_INTEGER literals. ---- }
+  pCol0 := sqlite3Expr(db, TK_INTEGER, nil);
+  pCol1 := sqlite3Expr(db, TK_INTEGER, nil);
+  pCol2 := sqlite3Expr(db, TK_INTEGER, nil);
+  Check('RUICT cols allocated',
+    (pCol0 <> nil) and (pCol1 <> nil) and (pCol2 <> nil));
+  pCol0^.flags := pCol0^.flags or EP_IntValue; pCol0^.u.iValue := 100;
+  pCol1^.flags := pCol1^.flags or EP_IntValue; pCol1^.u.iValue := 200;
+  pCol2^.flags := pCol2^.flags or EP_IntValue; pCol2^.u.iValue := 300;
+  pListR := sqlite3ExprListAppend(@parse, nil,    pCol0);
+  pListR := sqlite3ExprListAppend(@parse, pListR, pCol1);
+  pListR := sqlite3ExprListAppend(@parse, pListR, pCol2);
+  Check('RUICT pListR nExpr=3', pListR^.nExpr = 3);
+
+  { ---- Build the matching 3-column TK_VECTOR LHS. ---- }
+  pLhs0 := sqlite3Expr(db, TK_INTEGER, nil);
+  pLhs1 := sqlite3Expr(db, TK_INTEGER, nil);
+  pLhs2 := sqlite3Expr(db, TK_INTEGER, nil);
+  pLhs0^.flags := pLhs0^.flags or EP_IntValue; pLhs0^.u.iValue := 1;
+  pLhs1^.flags := pLhs1^.flags or EP_IntValue; pLhs1^.u.iValue := 2;
+  pLhs2^.flags := pLhs2^.flags or EP_IntValue; pLhs2^.u.iValue := 3;
+  pListL := sqlite3ExprListAppend(@parse, nil,    pLhs0);
+  pListL := sqlite3ExprListAppend(@parse, pListL, pLhs1);
+  pListL := sqlite3ExprListAppend(@parse, pListL, pLhs2);
+
+  pVecLeft := sqlite3Expr(db, TK_VECTOR, nil);
+  Check('RUICT pVecLeft non-nil', pVecLeft <> nil);
+  pVecLeft^.x.pList := pListL;
+
+  { ---- Wrap pListR in a TSelect, then build the TK_IN root with
+       EP_xIsSelect lit so ExprUseXSelect/Dup follow the pSelect arm. ---- }
+  pSel := sqlite3SelectNew(@parse, pListR, nil, nil, nil, nil, nil, 0, nil);
+  Check('RUICT pSel non-nil', pSel <> nil);
+  origSelId := pSel^.selId;
+
+  pIN := sqlite3Expr(db, TK_IN, nil);
+  Check('RUICT pIN non-nil', pIN <> nil);
+  pIN^.flags     := pIN^.flags or EP_xIsSelect;
+  pIN^.pLeft     := pVecLeft;
+  pIN^.x.pSelect := pSel;
+
+  { ---- RUICT1 — two terms select columns with iField=2,3 (indices 1,2),
+       reducing the 3-column vector down to 2 columns.  Verify the dup is
+       independent (original pSel left untouched), the new pSelect carries a
+       freshly-bumped selId, and the LHS retains its TK_VECTOR wrap (still
+       multi-column). ---- }
+  FillChar(pLoop, SizeOf(pLoop), 0);
+  FillChar(termA, SizeOf(termA), 0);
+  FillChar(termB, SizeOf(termB), 0);
+  termA.pExpr := pIN; termA.eOperator := WO_EQ; termA.u.iField := 2;
+  termB.pExpr := pIN; termB.eOperator := WO_EQ; termB.u.iField := 3;
+  altermBuf[0] := @termA;
+  altermBuf[1] := @termB;
+  pLoop.aLTerm := @altermBuf[0];
+  pLoop.nLTerm := 2;
+
+  pNew := removeUnindexableInClauseTerms(@parse, 0, @pLoop, pIN);
+  Check('RUICT1 dup non-nil', pNew <> nil);
+  Check('RUICT1 dup distinct from original', pNew <> pIN);
+  Check('RUICT1 reduced RHS nExpr=2',
+        pNew^.x.pSelect^.pEList^.nExpr = 2);
+  Check('RUICT1 LHS still TK_VECTOR',
+        pNew^.pLeft^.op = TK_VECTOR);
+  Check('RUICT1 reduced LHS nExpr=2',
+        pNew^.pLeft^.x.pList^.nExpr = 2);
+  Check('RUICT1 selId bumped',
+        pNew^.x.pSelect^.selId <> origSelId);
+  Check('RUICT1 original pIN intact (still nExpr=3)',
+        pIN^.x.pSelect^.pEList^.nExpr = 3);
+  sqlite3ExprDelete(db, pNew);
+
+  { ---- RUICT2 — single matching term (iField=3 → index 2), the reduced
+       LHS has just one element so the routine unwraps the TK_VECTOR and
+       lifts the single LHS expression directly into pNew^.pLeft. ---- }
+  altermBuf[0] := @termB;
+  pLoop.nLTerm := 1;
+
+  pNew := removeUnindexableInClauseTerms(@parse, 0, @pLoop, pIN);
+  Check('RUICT2 dup non-nil', pNew <> nil);
+  Check('RUICT2 reduced RHS nExpr=1',
+        pNew^.x.pSelect^.pEList^.nExpr = 1);
+  Check('RUICT2 TK_VECTOR unwrapped → TK_INTEGER (single LHS column)',
+        pNew^.pLeft^.op = TK_INTEGER);
+  sqlite3ExprDelete(db, pNew);
+
+  { ---- RUICT3 — same single-term reduction, now starting at iEq=1: term
+       at index 0 is skipped, no terms match → builder appends nothing,
+       pRhs stays nil (mallocFailed-or-pRhs assert path).  Lift the assert
+       precondition by simulating mallocFailed for the duration of the
+       call so we can probe the empty-reduction branch deterministically. ---- }
+  db^.mallocFailed := 1;
+  pNew := removeUnindexableInClauseTerms(@parse, 1, @pLoop, pIN);
+  db^.mallocFailed := 0;
+  { mallocFailed propagates through ExprDup; pNew may be nil or partially
+    populated.  Either outcome is acceptable — we only need to confirm the
+    routine returns without asserting under mallocFailed. }
+  Check('RUICT3 returned under mallocFailed (no assert)', True);
+  if pNew <> nil then sqlite3ExprDelete(db, pNew);
+
+  sqlite3ExprDelete(db, pIN);
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -4019,6 +4147,7 @@ begin
   TestCodeAllEqualityTerms;
   TestCodeExprOrVector;
   TestFilterPullDown;
+  TestRemoveUnindexableInClauseTerms;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

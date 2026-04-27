@@ -2428,6 +2428,27 @@ procedure codeExprOrVector(pParse: PParse; p: PExpr; iReg: i32; nReg: i32);
 procedure filterPullDown(pParse: PParse; pWInfo: PWhereInfo; iLevel: i32;
   addrNxt: i32; notReady: Bitmask);
 
+{ Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers, batch 6.
+  removeUnindexableInClauseTerms (wherecode.c:573..653).  Builds a *reduced*
+  copy of an `X IN (SELECT ...)` expression so that only those vector columns
+  that the chosen index can actually use end up on the LHS / RHS of the IN
+  pair, in the order the index expects them.  The returned Expr is a deep
+  duplicate of pX with each pSelect in the (compound) SELECT chain rewritten
+  in-place: a fresh ExprList is assembled by walking pLoop^.aLTerm[iEq..] and
+  picking out only those WhereTerms whose pExpr matches the original pX,
+  using `iField - 1` as the column index of interest.  Original (unreduced)
+  ELists are released once the new ones are stitched in.  When the reduced
+  LHS collapses to a single column the wrapping TK_VECTOR is unwrapped, since
+  the parser never produces a single-element vector and downstream code does
+  not accept one.  Each rewritten SELECT bumps pParse^.nSelect (selId) so the
+  SubrtnSig deduplication treats it as distinct from the original.  ORDER BY
+  / GROUP BY references to the old result-set positions are remapped through
+  adjustOrderByCol; orphans collapse to 0.  Caller retains ownership of the
+  original pX — the routine never frees it; the caller deletes the returned
+  duplicate when finished.  Pure tree-rewrite, no codegen. }
+function removeUnindexableInClauseTerms(pParse: PParse; iEq: i32;
+  pLoop: PWhereLoop; pX: PExpr): PExpr;
+
 { Index helpers }
 procedure sqlite3FreeIndex(db: PTsqlite3; p: PIndex2);
 procedure sqlite3UnlinkAndDeleteIndex(db: PTsqlite3; iDb: i32;
@@ -19876,6 +19897,127 @@ begin
 
     Inc(iLevel);
   end;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers,
+  batch 6.
+
+  See forward-decl block (~line 2447) for the description.
+  =========================================================================== }
+
+function removeUnindexableInClauseTerms(pParse: PParse; iEq: i32;
+  pLoop: PWhereLoop; pX: PExpr): PExpr;
+var
+  db:        PTsqlite3;
+  pSel:      PSelect;
+  pNew:      PExpr;
+  pOrigRhs:  PExprList;
+  pOrigLhs:  PExprList;
+  pRhs:      PExprList;
+  pLhs:      PExprList;
+  pRhsItems: PExprListItem;
+  pLhsItems: PExprListItem;
+  pNewItems: PExprListItem;
+  pTerm:     PWhereTerm;
+  i, iField: i32;
+  p:         PExpr;
+begin
+  db   := pParse^.db;
+  pNew := sqlite3ExprDup(db, pX, 0);
+  if (pNew <> nil) and (db^.mallocFailed = 0) then
+  begin
+    Assert(ExprUseXSelect(pNew));
+    pSel := pNew^.x.pSelect;
+    while pSel <> nil do
+    begin
+      pOrigRhs := pSel^.pEList;
+      pOrigLhs := nil;
+      pRhs     := nil;
+      pLhs     := nil;
+      Assert(pNew^.pLeft <> nil);
+      Assert(ExprUseXList(pNew^.pLeft));
+      if pSel = pNew^.x.pSelect then
+        pOrigLhs := pNew^.pLeft^.x.pList;
+
+      pRhsItems := ExprListItems(pOrigRhs);
+      if pOrigLhs <> nil then
+        pLhsItems := ExprListItems(pOrigLhs)
+      else
+        pLhsItems := nil;
+
+      i := iEq;
+      while i < i32(pLoop^.nLTerm) do
+      begin
+        pTerm := pLoop^.aLTerm[i];
+        if (pTerm <> nil) and (pTerm^.pExpr = pX) then
+        begin
+          Assert((pTerm^.eOperator and (WO_OR or WO_AND)) = 0);
+          iField := pTerm^.u.iField - 1;
+          { NEVER(): a duplicate PK column reference would already have been
+            harvested on a prior iteration and the slot pExpr nilled.  Skip
+            silently in that case (matches upstream NEVER fall-through). }
+          if PExprListItem(PByte(pRhsItems) + iField * SZ_EXPRLIST_ITEM)^.pExpr <> nil then
+          begin
+            pRhs := sqlite3ExprListAppend(pParse, pRhs,
+              PExprListItem(PByte(pRhsItems) + iField * SZ_EXPRLIST_ITEM)^.pExpr);
+            PExprListItem(PByte(pRhsItems) + iField * SZ_EXPRLIST_ITEM)^.pExpr := nil;
+            if pRhs <> nil then
+            begin
+              pNewItems := PExprListItem(PByte(ExprListItems(pRhs))
+                + (pRhs^.nExpr - 1) * SZ_EXPRLIST_ITEM);
+              pNewItems^.u.x.iOrderByCol := u16(iField + 1);
+            end;
+            if pOrigLhs <> nil then
+            begin
+              Assert(PExprListItem(PByte(pLhsItems) + iField * SZ_EXPRLIST_ITEM)^.pExpr <> nil);
+              pLhs := sqlite3ExprListAppend(pParse, pLhs,
+                PExprListItem(PByte(pLhsItems) + iField * SZ_EXPRLIST_ITEM)^.pExpr);
+              PExprListItem(PByte(pLhsItems) + iField * SZ_EXPRLIST_ITEM)^.pExpr := nil;
+            end;
+          end;
+        end;
+        Inc(i);
+      end;
+
+      sqlite3ExprListDelete(db, pOrigRhs);
+      if pOrigLhs <> nil then
+      begin
+        sqlite3ExprListDelete(db, pOrigLhs);
+        pNew^.pLeft^.x.pList := pLhs;
+      end;
+      pSel^.pEList := pRhs;
+      Inc(pParse^.nSelect);
+      pSel^.selId  := pParse^.nSelect;
+
+      { If the reduced LHS collapses to a single column, unwrap the outer
+        TK_VECTOR.  The parser never produces single-element vectors, and a
+        few downstream subroutines do not handle them. }
+      if (pLhs <> nil) and (pLhs^.nExpr = 1) then
+      begin
+        pLhsItems := ExprListItems(pLhs);
+        p := pLhsItems^.pExpr;
+        pLhsItems^.pExpr := nil;
+        sqlite3ExprDelete(db, pNew^.pLeft);
+        pNew^.pLeft := p;
+      end;
+
+      { Remap ORDER BY / GROUP BY references that may have been pointing at
+        the old result-set positions. }
+      Assert((pRhs <> nil) or (db^.mallocFailed <> 0));
+      if pRhs <> nil then
+      begin
+        adjustOrderByCol(pSel^.pOrderBy, pRhs);
+        adjustOrderByCol(pSel^.pGroupBy, pRhs);
+        for i := 0 to pRhs^.nExpr - 1 do
+          PExprListItem(PByte(ExprListItems(pRhs))
+            + i * SZ_EXPRLIST_ITEM)^.u.x.iOrderByCol := 0;
+      end;
+
+      pSel := pSel^.pPrior;
+    end;
+  end;
+  Result := pNew;
 end;
 
 end.
