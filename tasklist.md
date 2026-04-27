@@ -187,21 +187,19 @@ Important: At the end of this document, please find:
     Verify byte-identical bytecode emission against C via
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
-    Current baseline (2026-04-27): **TestWhereCorpus 90 PASS / 2 DIVERGE
+    Current baseline (2026-04-27): **TestWhereCorpus 91 PASS / 1 DIVERGE
     / 0 ERROR (corpus = 92).**  Scaffold and progress through
-    sub-progresses 1..43 are recorded in git history (`git log
+    sub-progresses 1..44 are recorded in git history (`git log
     --grep="11g.2.f"`).  Sub-progress 43 ported the where.c:7732..7886
     Index→table column rewrite tail in `sqlite3WhereEnd`, flipping
-    JOIN_WHERE from DIVERGE to PASS.
+    JOIN_WHERE.  Sub-progress 44 fixed `sqlite3SrcListShiftJoinType`
+    (was a clearing stub; now mirrors build.c:5219 — shifts jointype
+    from item[i-1] to item[i] and tags JT_LTORJ for RIGHT JOIN), so
+    the existing iLeftJoin scaffolding (init/set/ljNullRowFixup)
+    finally fires for level 1 of `t LEFT JOIN s` — flipping LEFT_JOIN
+    from DIVERGE to PASS.
 
-    **Open DIVERGE rows (each blocked on a distinct planner
-    optimization, all correctness-equivalent):**
-      * `LEFT_JOIN` (Pas=27, C=32 ops): missing the LEFT-JOIN null-row
-        fixup tail.  Needs `pLevel^.iLeftJoin` match-flag init
-        (Integer 0 → reg) at WhereBegin, set-flag (Integer 1 → reg)
-        inside the inner body, and the post-loop `IfPos` + `NullRow`
-        + per-column null-row cleanup at WhereEnd
-        (where.c:6855..6873 + wherecode.c:2476..2497).
+    **Open DIVERGE rows:**
       * `EXISTS_SUB` (Pas=22, C=30): Pas emits a correct correlated
         subroutine; C uses a bloom-filter + autoindex co-optimization
         (`Once`/`OpenAutoindex`/`FilterAdd` cluster) at the subselect

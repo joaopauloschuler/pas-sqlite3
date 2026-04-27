@@ -20028,14 +20028,34 @@ end;
 procedure sqlite3SrcListShiftJoinType(pParse: PParse; p: PSrcList);
 var
   i: i32;
-  pItem: PSrcItem;
+  items: PSrcItem;
+  allFlags: u8;
 begin
-  { Rotate jointype from current last item to next item's fg.jointype }
+  { Port of build.c:5219 — shift jointype from item[i-1] to item[i],
+    so the JT_* flags live on the right-hand table of each join. }
   if (p = nil) or (p^.nSrc <= 1) then Exit;
-  for i := p^.nSrc - 1 downto 1 do begin
-    pItem := PSrcItem(PByte(SrcListItems(p)) + i * SizeOf(TSrcItem));
-    { shift: clear each item's jointype (set from parser later) }
-    pItem^.fg.jointype := 0;
+  items := SrcListItems(p);
+  allFlags := 0;
+  i := p^.nSrc - 1;
+  repeat
+    items[i].fg.jointype := items[i - 1].fg.jointype;
+    allFlags := allFlags or items[i].fg.jointype;
+    Dec(i);
+  until i <= 0;
+  items[0].fg.jointype := 0;
+
+  { Tag every term to the left of a RIGHT JOIN with JT_LTORJ. }
+  if (allFlags and JT_RIGHT) <> 0 then
+  begin
+    i := p^.nSrc - 1;
+    while (i > 0) and ((items[i].fg.jointype and JT_RIGHT) = 0) do
+      Dec(i);
+    Dec(i);
+    Assert(i >= 0);
+    repeat
+      items[i].fg.jointype := items[i].fg.jointype or JT_LTORJ;
+      Dec(i);
+    until i < 0;
   end;
 end;
 
