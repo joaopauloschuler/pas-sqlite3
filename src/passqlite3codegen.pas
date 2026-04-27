@@ -4079,10 +4079,21 @@ begin
 end;
 
 { expr.c: affinity helpers }
+{ sqlite3TableColumnAffinity — port of expr.c:331..335.  Returns the
+  affinity recorded on the requested column, or SQLITE_AFF_INTEGER for
+  the rowid pseudo-column (iCol < 0).  Out-of-range iCol (NEVER in C)
+  also returns SQLITE_AFF_INTEGER.  Sub-progress 14: this was a Phase 6.1
+  stub returning INTEGER for everything; the stub silently injected
+  AFF_INTEGER into binaryCompareP5 for column-vs-literal comparisons,
+  producing p5=0x54 (INTEGER|JUMPIFNULL) where C produces p5=0x51
+  (BLOB|JUMPIFNULL) on bare-typed columns.  Per-column affinity is now
+  populated by sqlite3AddColumn (sub-progress 7) so this lookup is real. }
 function sqlite3TableColumnAffinity(pTab: PTable2; iCol: i32): AnsiChar;
 begin
-  Result := AnsiChar(SQLITE_AFF_INTEGER);  { default for Phase 6.1 }
-  { Full implementation requires Column struct (Phase 6.5) }
+  if (iCol < 0) or (pTab = nil) or (pTab^.aCol = nil) or (iCol >= pTab^.nCol) then
+    Result := AnsiChar(SQLITE_AFF_INTEGER)
+  else
+    Result := PColumn(PByte(pTab^.aCol) + iCol * SizeOf(TColumn))^.affinity;
 end;
 
 function sqlite3ExprAffinity(const pExpr: PExpr): AnsiChar;
@@ -18105,6 +18116,11 @@ var
   iDb:     i32;
   pSchm:   passqlite3util.PSchema;
   p2Bit:   i32;
+  pEL:     PExprList;
+  pELItem: PExprListItem;
+  pELItems: PExprListItem;
+  ix:      i32;
+  savedOkCF: u32;
 begin
   Assert(pParse^.pToplevel = nil, 'sqlite3FinishCoding called on nested Parse');
   db := pParse^.db;
@@ -18184,13 +18200,31 @@ begin
     if pParse^.pAinc <> nil then sqlite3AutoincrementBegin(pParse);
 
     { Code constant expressions that were factored out of inner loops.
-      TODO(Phase 6.x): wire when sqlite3ExprCode is ported.  pConstExpr
-      stays nil today because no codegen path calls
-      sqlite3ExprCodeAtInit yet. }
+      Sub-progress 14 — port of build.c sqlite3FinishCoding's pConstExpr
+      consumption loop.  sqlite3ExprCodeRunJustOnce (and via it,
+      sqlite3ExprCodeTemp's constant-factor short-circuit) appends an
+      Expr/iConstExprReg pair to pParse^.pConstExpr at codegen time;
+      this is where the factored expression is actually emitted, after
+      OP_Transaction and before the trailing OP_Goto-back-to-body.  The
+      `okConstFactor` bit is cleared while emitting so the inner walk
+      doesn't recursively re-factor.  Without this loop the WHERE
+      machinery's `sqlite3ExprCodeTemp(pRight=literal-5)` returned a
+      register number that was never written, leaving the per-row
+      Eq/Ne/Lt/Gt comparison reading garbage at runtime — a latent
+      semantic bug masked because TestWhereCorpus only checks bytecode
+      shape.  Now matches C's emission location and order. }
     if pParse^.pConstExpr <> nil then begin
-      { Drop the list silently — no factored exprs reach here today. }
-      sqlite3ExprListDelete(db, pParse^.pConstExpr);
+      pEL := pParse^.pConstExpr;
+      savedOkCF := pParse^.parseFlags and PARSEFLAG_OkConstFactor;
+      pParse^.parseFlags := pParse^.parseFlags and (not PARSEFLAG_OkConstFactor);
+      pELItems := ExprListItems(pEL);
+      for ix := 0 to pEL^.nExpr - 1 do begin
+        pELItem := PExprListItem(PByte(pELItems) + ix * SZ_EXPRLIST_ITEM);
+        sqlite3ExprCode(pParse, pELItem^.pExpr, pELItem^.u.iConstExprReg);
+      end;
+      pParse^.parseFlags := pParse^.parseFlags or savedOkCF;
       pParse^.pConstExpr := nil;
+      sqlite3ExprListDelete(db, pEL);
     end;
 
     { TODO(Phase 6.x): second bReturning branch — emit OP_OpenEphemeral

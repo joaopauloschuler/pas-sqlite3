@@ -2069,6 +2069,101 @@ Important: At the end of this document, please find:
       nest.  The IPK_alias row's residual single-op delta (C=12
       Pas=11) is also unwound with (i) since the underlying
       difference is the IN/IPK-promotion gap.
+    - [X] Sub-progress 14 — `sqlite3TableColumnAffinity` real lookup +
+      `pConstExpr` factored-init emission + side-by-side diagnostic
+      (2026-04-27).  Three landings:
+
+      (a) `sqlite3TableColumnAffinity` (codegen.pas:4082) — replaced
+      the Phase 6.1 stub (`Result := AnsiChar(SQLITE_AFF_INTEGER)` for
+      every column) with a faithful port of expr.c:331..335: returns
+      `pTab^.aCol[iCol].affinity` for normal columns, `SQLITE_AFF_INTEGER`
+      for the rowid pseudo-column (iCol < 0) or out-of-range/NEVER
+      paths.  `aCol` is now populated by `sqlite3AddColumn` (sub-progress
+      7) so this lookup returns real per-column affinity instead of the
+      stub default.  Latent semantic bug masked by the stub: every
+      column-vs-literal comparison's `binaryCompareP5` saw the column
+      as INTEGER and produced `p5 = 0x44 | 0x10 = 0x54`, where C
+      computes `p5 = 0x41 | 0x10 = 0x51` (BLOB | JUMPIFNULL) for bare-
+      typed columns.  After the fix every Eq/Ne/Lt/Gt/Le/Ge p5 byte
+      matches C exactly.
+
+      (b) `sqlite3FinishCoding` (codegen.pas:18190..) — replaced the
+      "drop the list silently" branch with the real C consumption loop
+      from build.c sqlite3FinishCoding: for each entry in
+      `pParse^.pConstExpr`, clear `PARSEFLAG_OkConstFactor` (so the
+      inner walk does not re-factor), `sqlite3ExprCode(pELItem^.pExpr,
+      pELItem^.u.iConstExprReg)` to land the constant in its allocated
+      register, restore the flag, then free the list.  Without this
+      loop, `sqlite3ExprCodeTemp`'s constant-factor short-circuit had
+      been routing every literal operand to `sqlite3ExprCodeRunJustOnce`
+      which appended (Expr, regNum) to `pConstExpr` and returned the
+      register number — but the register was never written, so every
+      per-row WHERE comparison (`Eq r2, …` against a never-loaded r2)
+      compared the column to garbage at runtime.  Latent semantic bug
+      masked because TestWhereCorpus only checks bytecode shape and no
+      other test exercised the WHERE-with-literal residual through a
+      real `sqlite3_step`.  Now the trailing `Integer p1=5 p2=2 / Integer
+      p1=7 p2=3 / String8 p1=0 p2=3 / …` ops land between OP_Transaction
+      and the final OP_Goto, byte-identical in count, opcode, P1, P2
+      (register), P3, P5 against C.
+
+      (c) `TestWhereCorpus` diagnostic (TestWhereCorpus.pas:DumpBothSides)
+      — when an op-count divergence trips, the report now dumps both C
+      and Pascal sides side-by-side (up to 16 rows each, padded with
+      `(none)` for the shorter side) instead of just dumping the C
+      reference.  Made the per-row "what's missing" obvious at a glance:
+      every DIVERGE row before this sub-progress had pattern "C ends
+      with `Integer/String8 [factored constants]; Goto`; Pas ends with
+      `Goto`" — actionable visibility that drove (b)'s root-causing.
+
+      Test-suite delta:
+        * TestWhereCorpus moves from `3 PASS / 17 DIVERGE / 0 ERROR`
+          (sub-progress 13) to `12 PASS / 8 DIVERGE / 0 ERROR`.  Nine
+          new PASS rows: IPK alias (`SELECT q FROM u WHERE p=7`),
+          INDEX_EQ (`a=5`), INDEX_EQ_2 (`a=5 AND b=7`), INDEX_EQ_RES
+          (`a=5 AND c='hi'`), INDEX_RANGE (`a>5 AND a<100`),
+          INDEX_EQ_RANGE (`a=5 AND b>10`), MULTI_OR (`a=5 OR a=7`),
+          MULTI_OR_X (`a=5 OR b=7`), WOR_INDEX (`q='hi'`).  Failure-
+          mode tally moves from `0 exception, 0 nil-Vdbe, 17 op-count,
+          0 op-diff` to `0 exception, 0 nil-Vdbe, 8 op-count, 0
+          op-diff` — every column-vs-literal SCAN-with-residual shape
+          now matches C byte-for-byte.  Per-shape histogram: IPK 2/0,
+          INDEX_EQ 1/0, INDEX_EQ_2 1/0, INDEX_EQ_RES 1/0, INDEX_RANGE
+          1/0, INDEX_EQ_RANGE 1/0, MULTI_OR 1/0, MULTI_OR_X 1/0,
+          WOR_INDEX 1/0, NULL 1/0, FULL 1/0.  Remaining DIVERGE rows
+          all need *structural* codegen (not residual fix-ups): IPK_IN
+          / INDEX_IN / INDEX_IN_SUB need `sqlite3ExprCodeIN`'s
+          BeginSubrtn / Once / OpenEphemeral coroutine machinery;
+          IPK_RANGE needs BETWEEN range-plan in whereShortCut so
+          SeekGE/SeekLE replace the SCAN-with-residual; LIKE / LIKE_WILD
+          need the LIKE-prefix optimization (BLOB/Function/CollSeq
+          machinery in exprAnalyzeOrTerm); LEFT_JOIN / JOIN_WHERE need
+          the two-table JOIN codegen lifted from the single-table gate.
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41, TestVdbeApi
+          57/57, TestVdbeMisc 45/45, TestVdbeMem 62/62, TestVdbeAux
+          108/108, TestVdbeRecord 13/13, TestVdbeAgg 11/11, TestVdbeStr
+          23/23, TestVdbeBlob 13/13, TestVdbeSort 14/14, TestVdbeCursor
+          27/27, TestVdbeVtabExec 50/50, TestExplainParity 2 pass / 6
+          diverge / 2 error (CREATE INDEX/UNIQUE INDEX still ERROR —
+          unchanged), TestBtreeCompat 337/337, TestPrintf 105/105,
+          TestJson 434/434, TestJsonEach 50/50, TestTokenizer 127/127,
+          TestRegistration 19/19, TestExecGetTable 23/23, TestBackup
+          20/20, TestConfigHooks 54/54, TestInitShutdown 27/27,
+          TestUnlockNotify 14/14, TestLoadExt 20/20, TestAuthBuiltins
+          34/34, TestOpenClose 17/17, TestInitCallback 29/29, TestPager
+          / TestPagerCompat / TestPagerCrash / TestPagerRollback /
+          TestPagerReadOnly all green.
+
+      Sub-progress 15 must port `sqlite3ExprCodeIN` so the IN-list /
+      IN-subselect rows reach the BeginSubrtn coroutine machinery
+      (worth ~13..16 ops per row), then BETWEEN range-plan in
+      whereShortCut for IPK_RANGE.  LIKE optimization and JOIN codegen
+      remain heavier follow-on lifts.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

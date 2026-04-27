@@ -232,6 +232,33 @@ begin
             ' p3=', cOps[i].p3, ' p5=', cOps[i].p5);
 end;
 
+{ Sub-progress 14 — dump both sides side-by-side on op-count mismatch so
+  the per-row diff narrative tells us *which* op is missing on the Pascal
+  side, not just that the totals differ.  Print up to maxN rows from each
+  list; pad the shorter side with a placeholder so the column alignment
+  survives even when one side runs out early. }
+procedure DumpBothSides(const cOps, pOps: TOpList; maxN: Int32);
+var
+  i, nC, nP, nMax: Int32;
+  cs, ps: AnsiString;
+begin
+  nC := Length(cOps); nP := Length(pOps);
+  nMax := nC; if nP > nMax then nMax := nP;
+  if nMax > maxN then nMax := maxN;
+  WriteLn('       Side-by-side (C=', nC, ' Pas=', nP, ', showing ', nMax, '):');
+  for i := 0 to nMax - 1 do begin
+    if i < nC then
+      cs := Format('%s p1=%d p2=%d p3=%d p5=%d',
+        [cOps[i].opcode, cOps[i].p1, cOps[i].p2, cOps[i].p3, cOps[i].p5])
+    else cs := '(none)';
+    if i < nP then
+      ps := Format('%s p1=%d p2=%d p3=%d p5=%d',
+        [pOps[i].opcode, pOps[i].p1, pOps[i].p2, pOps[i].p3, pOps[i].p5])
+    else ps := '(none)';
+    WriteLn(Format('         [%2d] C=%-40s | Pas=%s', [i, cs, ps]));
+  end;
+end;
+
 { -------------------------------------------------------------------------- }
 { Pascal side — prepare and walk Vdbe.aOp[].                                 }
 { -------------------------------------------------------------------------- }
@@ -332,12 +359,7 @@ begin
     Inc(gDiverge); Inc(gModeOpCount);
     WriteLn('  DIVERGE ', row.label_, ' [', row.shape,
             '] — op count: C=', Length(cOps), ' Pas=', Length(pOps));
-    n := Length(cOps); if Length(pOps) < n then n := Length(pOps);
-    if n > 0 then begin
-      DumpOp('C  ', 0, cOps[0]);
-      DumpOp('Pas', 0, pOps[0]);
-    end;
-    DumpCRef(cOps, REF_DUMP_ROWS);
+    DumpBothSides(cOps, pOps, 16);
     Exit;
   end;
 
