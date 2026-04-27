@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 983 + 3;
+  N_CORPUS = 983 + 3 + 4;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -1157,6 +1157,12 @@ begin
   Add(i, 'SELECT a IN list',            'SELECT a FROM t WHERE a IN (1,2,3);');     Inc(i);
   Add(i, 'SELECT a NOT IN',             'SELECT a FROM t WHERE a NOT IN (1,2,3);'); Inc(i);
   Add(i, 'SELECT a LIKE',               'SELECT a FROM t WHERE a LIKE ''abc%'';');  Inc(i);
+
+  { Probe — rowid range scans (per task list 6.10 step 6 entry). }
+  Add(i, 'SELECT WHERE rowid<5',        'SELECT a FROM t WHERE rowid<5;');       Inc(i);
+  Add(i, 'SELECT WHERE rowid<=5',       'SELECT a FROM t WHERE rowid<=5;');      Inc(i);
+  Add(i, 'SELECT WHERE rowid>5',        'SELECT a FROM t WHERE rowid>5;');       Inc(i);
+  Add(i, 'SELECT WHERE rowid>=5',       'SELECT a FROM t WHERE rowid>=5;');      Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

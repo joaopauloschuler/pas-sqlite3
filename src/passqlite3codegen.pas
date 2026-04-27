@@ -13422,18 +13422,41 @@ begin
       Inc(pLoop^.nLTerm);
     end;
     if (pLoop^.wsFlags and WHERE_COLUMN_RANGE) <> 0 then
-      { TUNING: cost of an IPK range scan ≈ full scan minus seek savings. }
-      pLoop^.rRun := 33;
+    begin
+      { Faithful port of where.c whereRangeScanEst (no-STAT4 tail) +
+        whereLoopAddBtreeIndex IPK costing arm (where.c:3552..3572).
+        For an IPK range scan with default truthProb=1 / no TERM_VNULL:
+          nOut = rSize - 20*nBounds - 20*(both ? 1 : 0)
+          rCostIdx = nOut + 16
+          rLogSize = estLog(rSize) — typically << rCostIdx, so
+          sqlite3LogEstAdd(rLogSize, rCostIdx) ≈ rCostIdx.
+        WHERE_IPK is set, so the second sqlite3LogEstAdd
+        (`+ nOut + 16`) is skipped (where.c:3570). }
+      if ((pLoop^.wsFlags and WHERE_BTM_LIMIT) <> 0)
+         and ((pLoop^.wsFlags and WHERE_TOP_LIMIT) <> 0) then
+      begin
+        pLoop^.nOut := i16(pTab^.nRowLogEst - 60);
+        pLoop^.rRun := i16(pTab^.nRowLogEst - 44);
+      end
+      else
+      begin
+        pLoop^.nOut := i16(pTab^.nRowLogEst - 20);
+        pLoop^.rRun := i16(pTab^.nRowLogEst - 4);
+      end;
+    end;
   end;
 
   if pLoop^.wsFlags <> 0 then
   begin
-    pLoop^.nOut := i16(1);
+    { ONEROW (IPK-EQ / unique-index-EQ) plans visit at most one row;
+      a range-scan plan keeps the nOut estimate computed above. }
+    if (pLoop^.wsFlags and WHERE_ONEROW) <> 0 then
+      pLoop^.nOut := i16(1);
     whereInfoLevels(pWInfo)[0].pWLoop := pLoop;
     Assert((pWInfo^.sMaskSet.n = 1) and (iCur = pWInfo^.sMaskSet.ix[0]));
     pLoop^.maskSelf := 1; { sqlite3WhereGetMask(&pWInfo^.sMaskSet, iCur) }
     whereInfoLevels(pWInfo)[0].iTabCur := iCur;
-    pWInfo^.nRowOut := i16(1);
+    pWInfo^.nRowOut := pLoop^.nOut;
     if pWInfo^.pOrderBy <> nil then
       pWInfo^.nOBSat := i8(pWInfo^.pOrderBy^.nExpr);
     if (pWInfo^.wctrlFlags and WHERE_WANT_DISTINCT) <> 0 then
