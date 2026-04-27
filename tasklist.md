@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 68 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 69); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 97 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 98); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -186,10 +186,11 @@ Important: At the end of this document, please find:
     `sqlite3SrcListAppend` (db/table arg swap + dequote) to mirror
     build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
-  Scaffold landed; corpus expanded to 56 rows (DDL + SELECT/DML/txn +
+  Scaffold landed; corpus expanded to 98 rows (DDL + SELECT/DML/txn +
   SAVEPOINT/RELEASE + INSERT DEFAULT VALUES + multi-AND + multi-col
-  rowid-EQ + per-row arith / negate / concat + transaction synonyms).
-  Current Status (2026-04-27): **68 PASS / 1 DIVERGE / 0 ERROR**.
+  rowid-EQ + per-row arith / negate / concat + transaction synonyms +
+  comparison ops + literal-arith + col aliases + 3-col index).
+  Current Status (2026-04-27): **97 PASS / 1 DIVERGE / 0 ERROR**.
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -298,6 +299,15 @@ Important: At the end of this document, please find:
       arith literal `1+2-3`, unary literal `-1`, string concat literal
       `'abc'||'def'`, col `a-b` / `a/2`, and full-table `DELETE FROM t`
       truncate arm).  Corpus now 68 PASS / 1 DIVERGE / 69 total.
+
+      Sub-progress (2026-04-27): probe sweep #5 added 29 more PASS rows
+      (literal arith `2*3`/`6/2`/`7-3`/`5%2`/`2*3+4`, col arith `a+1`/
+      `a*b`/`a+b+c`/`a%2`, INSERT NULL/mixed-types/negative literal,
+      INSERT alt-table, 3-col rowid EQ, alt-table WHERE, col WHERE col,
+      col WHERE neg/str literal, col alias, SELECT alias, SELECT * alt,
+      DELETE rowid neg, CREATE INDEX 3col, CREATE UNIQUE INDEX 2,
+      additional SAVEPOINT/RELEASE/COMMIT shapes).  Corpus now
+      97 PASS / 1 DIVERGE / 98 total.
 
       DIVERGE shapes discovered in probe sweeps (kept out of corpus
       until they flip — each is a committable next-agent ticket):
