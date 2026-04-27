@@ -216,20 +216,29 @@ Important: At the end of this document, please find:
     11g.2.f open-DIVERGE rows below).  Re-enable any disabled assertions
     / safety-net guards left during 11g.2.b..e.
 
-    **Schema-publish gap (newly diagnosed 2026-04-27):** `sqlite3EndTable`
-    at `passqlite3codegen.pas:18512` only inserts the new Table object
-    into `pSchema^.tblHash` when `db^.init.busy <> 0`.  Tables created
-    via normal `sqlite3_exec` (init.busy = 0) emit Vdbe opcodes but
-    never publish into the in-memory schema, so any subsequent
-    `CREATE INDEX ON t(...)` hits the nil-table early exit at
-    `sqlite3CreateIndex` (`passqlite3codegen.pas:19069..19070`),
-    `prepare_v2` discards the half-built Vdbe, and `ppStmt^` returns
-    nil.  This is the root cause of the CREATE INDEX / CREATE UNIQUE
-    INDEX nil-Vdbe DIVERGE rows in TestExplainParity.  Fix path: either
-    wire `sqlite3InitCallback` so re-prepare populates `tblHash` from
-    the schema row, or publish `pNewTable` into `tblHash` on the
-    init.busy=0 path after the btree + schema-row write confirms
-    durability (matching C's reopen-driven init.busy bootstrap).
+    **CREATE INDEX nil-Vdbe — compound root cause (refined 2026-04-27):**
+    The CREATE INDEX / CREATE UNIQUE INDEX nil-Vdbe DIVERGE rows in
+    TestExplainParity are blocked on two distinct bugs, not one.
+      (a) Schema-publish gap: `sqlite3EndTable` at
+          `passqlite3codegen.pas:19085` only inserts the new Table into
+          `pSchema^.tblHash` when `db^.init.busy <> 0`.  On the
+          init.busy=0 path the Table is built but never published, so
+          subsequent `sqlite3CreateIndex` hits a nil-table early exit at
+          `passqlite3codegen.pas:19069..19070`.  A naïve fix that
+          mirrors the init.busy=1 publish into the init.busy=0 tail
+          DOES populate tblHash, but the Table object built by
+          `sqlite3StartTable + sqlite3AddColumn` is structurally
+          incomplete (missing column-tail / tnum machinery that the
+          init.busy=1 reparse path papers over) — DROP TABLE codegen
+          then finds the half-baked Table and AVs.  Fix needs to first
+          complete Table-object initialization (column tail, tnum
+          patching from the OP_CreateBtree result) before publishing.
+      (b) `sqlite3NestedParse('INSERT INTO %Q.sqlite_master ...')` at
+          `passqlite3codegen.pas:19796` fails inside `sqlite3Insert`
+          (nErr=1, rc=1, empty zErrMsg) — likely the `#%d`
+          register-reference column-value syntax or the sqlite_master
+          virtual-row write path is incompletely ported.  Independent
+          of (a); fixing (a) without (b) keeps CREATE INDEX nil-Vdbe.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
   Current Status: **2 PASS / 8 DIVERGE / 0 ERROR**.  Drive to
