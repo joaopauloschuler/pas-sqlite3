@@ -18995,8 +18995,10 @@ var
   bIdListInOrder: u8;
   nColumn:        i32;
   i:              i32;
+  j:              i32;
   regOut:         i32;
   pListItems:     PExprListItem;
+  pIdItems:       PIdListItem;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -19080,12 +19082,6 @@ begin
   bIdListInOrder := u8(ord(
     (pTab^.tabFlags and (TF_OOOHidden or TF_HasStored)) = 0));
 
-  { TODO(Phase 6.x): pColumn IDLIST resolution loop (insert.c:1077..1108).
-    The single-row schema-row INSERT cases produced by sqlite3NestedParse
-    pass IDLIST=nil, so this branch is unreachable in the productive path
-    today.  Bail out with a TODO if called with an IDLIST. }
-  if pColumn <> nil then goto insert_cleanup;
-
   { TODO(Phase 6.x): pSelect coroutine path (insert.c:1115..) — multi-row
     VALUES and SELECT-as-source.  Single-row VALUES path is captured into
     pList above and handled below. }
@@ -19102,36 +19098,82 @@ begin
   { pList = nil  ⇔  INSERT … DEFAULT VALUES (insert.c:1213..1215). }
   if pList <> nil then nColumn := pList^.nExpr else nColumn := 0;
 
+  { IDLIST resolution — port of insert.c:1077..1108.  Build aTabColMap so
+    aTabColMap[i] = (1-based) index into pColumn for table column i, or 0
+    if column i is not named in the IDLIST (default value path).  IPK alias
+    and generated-column arms are deferred until the IPK INSERT path lands. }
+  if pColumn <> nil then
+  begin
+    if nColumn <> pColumn^.nId then
+    begin
+      sqlite3ErrorMsg(pParse,
+        PAnsiChar('table has wrong number of values for INSERT'));
+      goto insert_cleanup;
+    end;
+    aTabColMap := Pi32(sqlite3DbMallocZero(db,
+      SizeOf(i32) * SizeInt(pTab^.nCol)));
+    if aTabColMap = nil then goto insert_cleanup;
+    pIdItems := IdListItems(pColumn);
+    for i := 0 to pColumn^.nId - 1 do
+    begin
+      j := sqlite3ColumnIndex(pTab, pIdItems[i].zName);
+      if j < 0 then
+      begin
+        sqlite3ErrorMsg(pParse,
+          PAnsiChar('table has no column with that name'));
+        pParse^.parseFlags := pParse^.parseFlags or $200;
+        goto insert_cleanup;
+      end;
+      if (aTabColMap + j)^ = 0 then (aTabColMap + j)^ := i + 1;
+      if i <> j then bIdListInOrder := 0;
+    end;
+  end;
+
   if not (isView <> 0) then
     sqlite3OpenTable(pParse, 0, iDb, pTab, OP_OpenWrite);
 
-  { Evaluate VALUES into regData..regData+nColumn-1.  Schema-row INSERTs from
-    sqlite3NestedParse always provide a value for every column (no IDLIST,
-    no defaults), so iterate up to nColumn — items beyond pTab^.nCol are
-    impossible on the productive path because the parser already validated
-    column count in C-side ExprListAppend / sqlite3SrcListLookup.
+  { Evaluate column values into regData..regData+nCol-1, iterating in table
+    storage order.  Three sub-cases per column:
+      * pColumn != nil  → consult aTabColMap; named columns get pList[k],
+                           unnamed ones get the column default (NULL stub).
+      * pList   = nil   → DEFAULT VALUES — every column gets its default.
+      * else            → positional VALUES — pList[i] is the value for
+                           table column i (parser-validated count match).
+    The DEFAULT/missing-column arms factor through sqlite3ExprCodeRunJustOnce
+    when PARSEFLAG_OkConstFactor is on, mirroring insert.c:1413..1418's
+    sqlite3ExprCodeFactorable.  sqlite3ColumnExpr is still a stub returning
+    nil (Phase 7); sqlite3ExprIsConstantNotJoin(nil) returns 2, so the C path
+    likewise lands a single OP_Null in the trailing init section. }
+  if pList <> nil then
+    pListItems := ExprListItems(pList)
+  else
+    pListItems := nil;
 
-    DEFAULT VALUES path (pList=nil, nColumn=0): factor each column's
-    default into the OP_Init prologue via sqlite3ExprCodeRunJustOnce so
-    OP_Null lands once per stmt, matching insert.c:1413..1418's
-    sqlite3ExprCodeFactorable(pParse, sqlite3ColumnExpr(...), iRegStore).
-    sqlite3ColumnExpr is still a stub returning nil (Phase 7), and
-    sqlite3ExprIsConstantNotJoin(nil) returns 2 (truthy) — the C path
-    likewise feeds NULL through ExprCodeRunJustOnce to land an OP_Null
-    in the trailing init section. }
-  if pList = nil then
+  for i := 0 to i32(pTab^.nCol) - 1 do
   begin
-    for i := 0 to i32(pTab^.nCol) - 1 do
+    if pColumn <> nil then
+    begin
+      j := (aTabColMap + i)^;
+      if j = 0 then
+      begin
+        if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
+           and (sqlite3ExprIsConstantNotJoin(pParse, nil) <> 0) then
+          sqlite3ExprCodeRunJustOnce(pParse, nil, regData + i)
+        else
+          sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i);
+      end
+      else
+        sqlite3ExprCode(pParse, pListItems[j - 1].pExpr, regData + i);
+    end
+    else if pList = nil then
+    begin
       if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
          and (sqlite3ExprIsConstantNotJoin(pParse, nil) <> 0) then
         sqlite3ExprCodeRunJustOnce(pParse, nil, regData + i)
       else
         sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i);
-  end
-  else
-  begin
-    pListItems := ExprListItems(pList);
-    for i := 0 to nColumn - 1 do
+    end
+    else
       sqlite3ExprCode(pParse, pListItems[i].pExpr, regData + i);
   end;
 

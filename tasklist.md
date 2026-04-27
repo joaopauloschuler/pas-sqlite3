@@ -72,10 +72,12 @@ Important: At the end of this document, please find:
     - [ ] **6.10 step 6** Make these to work (port code when required):
         [ ] `CREATE INDEX i ON t(a) WHERE a>0` — Δ=4 (partial-index
           WHERE clause codegen path).
-        [ ] `INSERT INTO t(a) VALUES(1)` / `INSERT INTO t(a,b,c)
-          VALUES(...)` — Δ=7 (named-column INSERT path differs from
-          positional; likely missing column-list permutation in
-          `sqlite3Insert`).
+        [X] `INSERT INTO t(a) VALUES(1)` / `INSERT INTO t(a,b,c)
+          VALUES(...)` — named-column INSERT path now ports IDLIST
+          resolution (insert.c:1077..1108) + per-table-column store
+          loop with aTabColMap; missing columns get OP_Null via the
+          existing DEFAULT-VALUES factor path. Both probes PASS at
+          11 ops, matching positional INSERT.
         [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
           VALUES path).
         [ ] **IPK-IN execution path**
