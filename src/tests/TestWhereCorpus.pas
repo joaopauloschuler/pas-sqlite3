@@ -594,9 +594,15 @@ var
   pTail:  PAnsiChar;
   rc:     i32;
   v:      PVdbe;
-  i:      i32;
+  i, n:   i32;
   pop:    PVdbeOp;
   nm:     PAnsiChar;
+  rawOps: TOpList;
+  rawN:   i32;
+  filtAt: array of Boolean;
+  shift:  array of i32;
+  delta:  i32;
+  row:    TOpRow;
 begin
   ops := nil;
   pStmtP := nil;
@@ -609,17 +615,43 @@ begin
     Exit;
   end;
 
-  SetLength(ops, v^.nOp);
+  SetLength(rawOps, v^.nOp);
+  SetLength(filtAt, v^.nOp + 1);
+  rawN := 0;
   for i := 0 to v^.nOp - 1 do begin
     pop := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
     nm  := sqlite3OpcodeName(pop^.opcode);
-    if nm <> nil then ops[i].opcode := AnsiString(nm) else ops[i].opcode := '?';
-    ops[i].p1 := pop^.p1;
-    ops[i].p2 := pop^.p2;
-    ops[i].p3 := pop^.p3;
-    ops[i].p5 := pop^.p5;
+    if nm <> nil then rawOps[rawN].opcode := AnsiString(nm)
+    else                rawOps[rawN].opcode := '?';
+    rawOps[rawN].p1 := pop^.p1;
+    rawOps[rawN].p2 := pop^.p2;
+    rawOps[rawN].p3 := pop^.p3;
+    rawOps[rawN].p5 := pop^.p5;
+    filtAt[rawN]    := isFilteredOpcode(rawOps[rawN].opcode);
+    Inc(rawN);
   end;
   sqlite3_finalize(v);
+
+  { Same renumber-jump-targets prefix-sum trick the C side uses, so the
+    Pas-side ReleaseReg filter doesn't break addresses on retained jumps. }
+  SetLength(shift, rawN + 1);
+  delta := 0;
+  for i := 0 to rawN - 1 do begin
+    shift[i] := delta;
+    if filtAt[i] then Inc(delta);
+  end;
+  shift[rawN] := delta;
+
+  n := 0;
+  for i := 0 to rawN - 1 do begin
+    if filtAt[i] then continue;
+    row := rawOps[i];
+    if isJumpOpcode(row.opcode) and (row.p2 >= 0) and (row.p2 <= rawN) then
+      row.p2 := row.p2 - shift[row.p2];
+    SetLength(ops, n + 1);
+    ops[n] := row;
+    Inc(n);
+  end;
   Result := True;
 end;
 

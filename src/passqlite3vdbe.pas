@@ -2588,7 +2588,8 @@ end;
 procedure sqlite3VdbeReleaseRegisters(pParse: PParse; iFirst, nReg, mask: i32;
                                       bUndefine: i32);
 begin
-  { Debug-only in C; no-op in release port }
+  { Forwarded — real implementation lives in passqlite3codegen.pas where
+    the full TParse layout is visible.  See vdbeReleaseRegistersImpl. }
 end;
 
 { --- TakeOpArray (returns the op array and zeroes v->aOp) --- }
@@ -2695,6 +2696,10 @@ end;
 
 procedure sqlite3VdbeVerifyAbortable(p: PVdbe; onError: i32);
 begin
+  { Faithful port of vdbeaux.c:1106 (SQLITE_DEBUG-gated in C; emitted
+    unconditionally here so explain-parity vs the reference debug build
+    matches). }
+  if onError = OE_Abort then sqlite3VdbeAddOp0(p, OP_Abortable);
 end;
 
 { --- Display helpers (stubs — full implementation Phase 5.8 vdbetrace.c) --- }

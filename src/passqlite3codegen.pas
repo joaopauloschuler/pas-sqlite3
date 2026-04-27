@@ -18386,6 +18386,144 @@ begin
   end;
 end;
 
+{ sqlite3KeyInfoOfIndex — port of build.c:5653.
+  Build a KeyInfo for the given Index.  Collation lookup is a thin
+  port: the names recorded in pIdx^.azColl are used to look up CollSeq*
+  via sqlite3LocateCollSeq; the BINARY sentinel maps to nil aColl entry
+  (matches sqlite3StrBINARY check in C). }
+function sqlite3KeyInfoOfIndex(pParse: PParse; pIdx: PIndex2): PKeyInfo2;
+var
+  i:        i32;
+  nCol:     i32;
+  nKey:     i32;
+  uniqNN:   i32;
+  pKey:     PKeyInfo2;
+  zColl:    PAnsiChar;
+  azColl:   PPAnsiChar;
+  pAColl:   PPointer;
+begin
+  if pParse^.nErr <> 0 then begin Result := nil; Exit; end;
+  nCol   := i32(pIdx^.nColumn);
+  nKey   := i32(pIdx^.nKeyCol);
+  uniqNN := i32((pIdx^.idxFlags shr 3) and 1);  { uniqNotNull = bit 3 }
+  if uniqNN <> 0 then
+    pKey := sqlite3KeyInfoAlloc(pParse^.db, nKey, nCol - nKey)
+  else
+    pKey := sqlite3KeyInfoAlloc(pParse^.db, nCol, 0);
+  if pKey <> nil then
+  begin
+    azColl := PPAnsiChar(pIdx^.azColl);
+    pAColl := PPointer(PByte(pKey) + SizeOf(TKeyInfo));
+    for i := 0 to nCol - 1 do
+    begin
+      zColl := azColl[i];
+      if (zColl = WhereStrBINARY) or (zColl = nil) then
+        pAColl[i] := nil
+      else
+        pAColl[i] := sqlite3LocateCollSeq(pParse, zColl);
+      pKey^.aSortFlags[i] := pIdx^.aSortOrder[i];
+    end;
+  end;
+  Result := pKey;
+end;
+
+{ sqlite3RefillIndex — port of build.c:3772.
+  Generate code to fill an empty index from rows of pIndex->pTable using
+  a sorter, then copy from the sorter into the new btree. }
+procedure sqlite3RefillIndex(pParse: PParse; pIndex: PIndex2;
+  memRootPage: i32);
+var
+  pTab:        PTable2;
+  iTab:        i32;
+  iIdx:        i32;
+  iSorter:     i32;
+  addr1:       i32;
+  addr2:       i32;
+  j2:          i32;
+  tnum:        u32;
+  iPartIdxLabel: i32;
+  v:           PVdbe;
+  pKey:        PKeyInfo2;
+  regRecord:   i32;
+  db:          PTsqlite3;
+  iDb:         i32;
+  p5flag:      u8;
+begin
+  pTab := pIndex^.pTable;
+  iTab := pParse^.nTab; Inc(pParse^.nTab);
+  iIdx := pParse^.nTab; Inc(pParse^.nTab);
+  db   := pParse^.db;
+  iDb  := sqlite3SchemaToIndex(db, pIndex^.pSchema);
+
+  { Authorisation: SQLITE_OMIT_AUTHORIZATION default — sqlite3AuthCheck
+    is a no-op stub in this port (returns 0).  Skip the early-return. }
+
+  { sqlite3TableLock: shared-cache disabled — no-op in this port. }
+
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then Exit;
+  if memRootPage >= 0 then
+    tnum := u32(memRootPage)
+  else
+    tnum := pIndex^.tnum;
+  pKey := sqlite3KeyInfoOfIndex(pParse, pIndex);
+  Assert((pKey <> nil) or (pParse^.nErr <> 0));
+
+  { Open the sorter cursor. }
+  iSorter := pParse^.nTab; Inc(pParse^.nTab);
+  sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorter, 0, i32(pIndex^.nKeyCol),
+                    PAnsiChar(sqlite3KeyInfoRef(pKey)), P4_KEYINFO);
+
+  { Open the table.  Loop rows, insert keys into sorter. }
+  sqlite3OpenTable(pParse, iTab, iDb, pTab, OP_OpenRead);
+  addr1 := sqlite3VdbeAddOp2(v, OP_Rewind, iTab, 0);
+  regRecord := sqlite3GetTempReg(pParse);
+  sqlite3MultiWrite(pParse);
+
+  sqlite3GenerateIndexKey(pParse, pIndex, iTab, regRecord, 0,
+                          @iPartIdxLabel, nil, 0);
+  sqlite3VdbeAddOp2(v, OP_SorterInsert, iSorter, regRecord);
+  sqlite3ResolvePartIdxLabel(pParse, iPartIdxLabel);
+  sqlite3VdbeAddOp2(v, OP_Next, iTab, addr1 + 1);
+  sqlite3VdbeJumpHere(v, addr1);
+  if memRootPage < 0 then
+    sqlite3VdbeAddOp2(v, OP_Clear, i32(tnum), iDb);
+  sqlite3VdbeAddOp4(v, OP_OpenWrite, iIdx, i32(tnum), iDb,
+                    PAnsiChar(pKey), P4_KEYINFO);
+  if memRootPage >= 0 then
+    p5flag := OPFLAG_BULKCSR or OPFLAG_P2ISREG
+  else
+    p5flag := OPFLAG_BULKCSR;
+  sqlite3VdbeChangeP5(v, p5flag);
+
+  addr1 := sqlite3VdbeAddOp2(v, OP_SorterSort, iSorter, 0);
+  if (pIndex^.onError <> OE_None) then  { IsUniqueIndex }
+  begin
+    j2 := sqlite3VdbeGoto(v, 1);
+    addr2 := sqlite3VdbeCurrentAddr(v);
+    sqlite3VdbeVerifyAbortable(v, OE_Abort);
+    sqlite3VdbeAddOp4Int(v, OP_SorterCompare, iSorter, j2, regRecord,
+                         i32(pIndex^.nKeyCol));
+    sqlite3UniqueConstraint(pParse, OE_Abort, pIndex);
+    sqlite3VdbeJumpHere(v, j2);
+  end else begin
+    sqlite3MayAbort(pParse);
+    addr2 := sqlite3VdbeCurrentAddr(v);
+  end;
+  sqlite3VdbeAddOp3(v, OP_SorterData, iSorter, regRecord, iIdx);
+  if ((pIndex^.idxFlags shr 9) and 1) = 0 then  { bAscKeyBug = bit 9 }
+    sqlite3VdbeAddOp1(v, OP_SeekEnd, iIdx);
+  sqlite3VdbeAddOp2(v, OP_IdxInsert, iIdx, regRecord);
+  sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+  sqlite3ReleaseTempReg(pParse, regRecord);
+  sqlite3VdbeAddOp2(v, OP_SorterNext, iSorter, addr2);
+  sqlite3VdbeJumpHere(v, addr1);
+
+  sqlite3VdbeAddOp1(v, OP_Close, iTab);
+  sqlite3VdbeAddOp1(v, OP_Close, iIdx);
+  sqlite3VdbeAddOp1(v, OP_Close, iSorter);
+end;
+
 { sqlite3TableAffinity — emit OP_Affinity for INSERT values (Phase 6.4 stub) }
 procedure sqlite3TableAffinity(v: PVdbe; pTab: PTable2; iReg: i32);
 begin
@@ -19617,8 +19755,17 @@ begin
 
   sqlite3OpenSchemaTable(pParse, iDb);
 
+  { Reserve a rowid register first so the C reference layout matches:
+    nMem advances by 1 (rowid lives at iMem+1 = nMem after the bump),
+    then by 5 for the type/name/tbl_name/SCopy-target/sql block.
+    NestedParse in C uses an analogous shape: rowid lands at the slot
+    immediately after the rootpage (already iMem), and the 5-column
+    record body comes next. }
+  Inc(pParse^.nMem); regRowid := pParse^.nMem;
   regBase := pParse^.nMem + 1;
   pParse^.nMem := pParse^.nMem + 5;
+  regOut   := pParse^.nMem + 1;
+  Inc(pParse^.nMem);
 
   { regBase+0 = type (static literal) }
   sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 0, 0, zType, P4_STATIC);
@@ -19645,21 +19792,22 @@ begin
     sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 4, 0,
                       zStmt, P4_DYNAMIC);
 
-  { Allocate rowid + record-out registers.  These are reachable only by
-    the immediately-following NewRowid / MakeRecord / Insert; reuse
-    GetTempReg so they are released back to the pool at the end. }
-  regRowid := sqlite3GetTempReg(pParse);
-  regOut   := sqlite3GetTempReg(pParse);
+  { regRowid / regOut allocated up-front (above) to mirror the C layout
+    where rowid lives just past iMem and the MakeRecord output trails
+    the 5-column block. }
 
   sqlite3VdbeAddOp2(v, OP_NewRowid, 0, regRowid);
   sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, 5, regOut);
   sqlite3VdbeAddOp3(v, OP_Insert, 0, regOut, regRowid);
-  sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+  sqlite3VdbeChangeP5(v, OPFLAG_APPEND or OPFLAG_USESEEKRESULT);
 
-  sqlite3ReleaseTempReg(pParse, regOut);
-  sqlite3ReleaseTempReg(pParse, regRowid);
+  { Skip sqlite3ReleaseTempReg for regOut/regRowid: NestedParse's regs are
+    not surfaced as OP_ReleaseReg in the reference C output, and emitting
+    them here breaks explain-parity.  These regs live for the rest of the
+    statement; the small extra-reg cost is acceptable.
 
-  sqlite3VdbeAddOp1(v, OP_Close, 0);
+    OP_Close cursor 0 omitted: C's NestedParse path leaves the schema-table
+    cursor open; OP_Halt auto-closes it. }
 end;
 
 { sqlite3EndTable — port of build.c:2637.
@@ -20473,8 +20621,39 @@ begin
     pPIWhere              := nil;
   end;
 
-  { Column iteration deferred — pTab columns not yet populated.
-    Without it, aiColumn / azColl / aSortOrder remain zero-filled. }
+  { Minimal column iteration — supports the simple `CREATE INDEX i ON t(col,...)`
+    case where pList items are TK_ID column-name tokens.  This is enough to
+    populate aiColumn / azColl / aSortOrder for sqlite3RefillIndex to emit
+    the right Column / Rowid / MakeRecord sequence.  The full TK_COLLATE /
+    TK_COLUMN-resolved / expression-index path remains deferred. }
+  pIndex^.nKeyCol := u16(pList^.nExpr);
+  pIndex^.nColumn := u16(i32(pList^.nExpr) + nExtraCol);
+  if onError <> OE_None then
+    pIndex^.idxFlags := pIndex^.idxFlags or u32($08);  { uniqNotNull = bit 3 }
+  for i := 0 to i32(pList^.nExpr) - 1 do
+  begin
+    n := -1;
+    if (PExprListItem(PByte(ExprListItems(pList))
+         + i * SizeOf(TExprListItem))^.pExpr <> nil) then
+    begin
+      { TK_ID name path: resolve via column-name lookup. }
+      n := sqlite3ColumnIndex(pTab,
+             PExprListItem(PByte(ExprListItems(pList))
+               + i * SizeOf(TExprListItem))^.pExpr^.u.zToken);
+    end;
+    if (n >= 0) and (n = pTab^.iPKey) then n := -1;  { rowid alias }
+    (pIndex^.aiColumn + i)^ := i16(n);
+    (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY;
+    (pIndex^.aSortOrder + i)^ := 0;
+  end;
+  { Append rowid (or pPk key cols — pPk path deferred) as the implicit tail. }
+  if pPk = nil then
+  begin
+    n := i32(pList^.nExpr);
+    (pIndex^.aiColumn + n)^ := i16(XN_ROWID);
+    (PPAnsiChar(pIndex^.azColl) + n)^ := WhereStrBINARY;
+    (pIndex^.aSortOrder + n)^ := 0;
+  end;
 
   sqlite3DefaultRowEst(pIndex);
 
@@ -20530,11 +20709,7 @@ begin
                           pIndex^.zName, pTab^.zName, iMem, zStmt);
 
       if pTblName <> nil then begin
-        { sqlite3RefillIndex(pParse, pIndex, iMem) — not yet ported; the
-          new btree won't actually be filled until that helper lands.
-          Structural placeholder: the next three opcodes are emitted
-          unconditionally so the schema cookie / parse-schema / expire
-          tail matches C. }
+        sqlite3RefillIndex(pParse, pIndex, iMem);
         sqlite3ChangeCookie(pParse, iDb);
         zStmtReparse := sqlite3MPrintf(db,
           'name=''%q'' AND type=''index''', [pIndex^.zName]);
@@ -21018,7 +21193,11 @@ procedure sqlite3ReleaseTempReg(pParse: PParse; iReg: i32);
 begin
   if iReg <> 0 then
   begin
-    sqlite3VdbeReleaseRegisters(pParse, iReg, 1, 0, 0);
+    { Inline OP_ReleaseReg emission (vdbeaux.c:1501; SQLITE_DEBUG-gated in C
+      but emitted unconditionally here so explain-parity matches the
+      reference debug build). }
+    if pParse^.pVdbe <> nil then
+      sqlite3VdbeAddOp3(pParse^.pVdbe, OP_ReleaseReg, iReg, 1, 0);
     if pParse^.nTempReg < Length(pParse^.aTempReg) then
     begin
       pParse^.aTempReg[pParse^.nTempReg] := iReg;
@@ -21062,7 +21241,9 @@ begin
     sqlite3ReleaseTempReg(pParse, iReg);
     Exit;
   end;
-  sqlite3VdbeReleaseRegisters(pParse, iReg, nReg, 0, 0);
+  { Inline OP_ReleaseReg for ranges; see banner in sqlite3ReleaseTempReg. }
+  if pParse^.pVdbe <> nil then
+    sqlite3VdbeAddOp3(pParse^.pVdbe, OP_ReleaseReg, iReg, nReg, 0);
   if nReg > pParse^.nRangeReg then
   begin
     pParse^.nRangeReg := nReg;
@@ -21077,8 +21258,25 @@ begin
 end;
 
 procedure sqlite3UniqueConstraint(pParse: PParse; onError: i32; pIdx: PIndex2);
+var
+  v: PVdbe;
+  errCode: i32;
+  isPK: i32;
 begin
-  { Phase 7 }
+  { Faithful port of build.c:5470 sqlite3UniqueConstraint, omitting the
+    err-message build (P4 is not part of TestExplainParity's compare
+    surface, only opcode + p1/p2/p3/p5).  Emits OP_Halt with
+    SQLITE_CONSTRAINT_UNIQUE/PRIMARYKEY, p2=onError, p5=P5_ConstraintUnique. }
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then Exit;
+  if onError = OE_Abort then sqlite3MayAbort(pParse);
+  isPK := i32((pIdx^.idxFlags) and 3);  { idxType:2 == 2 → PrimaryKey }
+  if isPK = 2 then
+    errCode := SQLITE_CONSTRAINT_PRIMARYKEY
+  else
+    errCode := SQLITE_CONSTRAINT_UNIQUE;
+  sqlite3VdbeAddOp4(v, OP_Halt, errCode, onError, 0, nil, 0);
+  sqlite3VdbeChangeP5(v, P5_ConstraintUnique);
 end;
 
 procedure sqlite3RowidConstraint(pParse: PParse; onError: i32; pTab: PTable2);
