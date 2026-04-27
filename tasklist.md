@@ -136,17 +136,15 @@ Important: At the end of this document, please find:
                 index lookup.  Confirmed: `TestExplainParity` 1004/1005
                 and `TestWhereCorpus` 92/92 still green.
             [ ] **6.10 step 6.IPK-IN.a** Apply the hoist-gate fix
-                from (1).  Confirmed 2026-04-27 that the patch shown
-                at codegen.pas:14296 produces C-oracle-shape bytecode,
-                but step-execution crashes inside `sqlite3VdbeFreeCursorNN`
-                (eCurType=2/VTAB cleanup arm) on the body Rewind/
-                Column/SeekRowid sequence, even with 6.IPK-IN.b's real
-                RecordCompare in place.  A third bug is hiding behind
-                (1)+(2); leaving (1) deferred until that is diagnosed
-                so we don't regress a working "silent zero rows"
-                path into a hard crash.  Repro:
-                `bin/ReproOrRowid` after enabling the codegen.pas
-                patch shown above.
+                from (1).  C-oracle-shape bytecode confirmed
+                2026-04-27.  6.IPK-IN.d (the cursor-corruption crash)
+                is now fixed (`nMem += nCursor` in
+                `sqlite3VdbeMakeReady`), so this step is unblocked.
+                Kept open until a runtime gate (6.IPK-IN.c) exercises
+                rowid-IN end-to-end so any regression is caught.
+                Without (1), `WHERE rowid IN (1,2)` and the
+                OR-rewritten equivalent silently return 0 rows; with
+                (1) they should return rows 10,20 (a-values).
             [ ] **6.10 step 6.IPK-IN.b.full** Extend
                 `sqlite3VdbeRecordCompare` to cover string (collation
                 + encoding-change), blob (with MEM_Zero), and real
@@ -164,14 +162,20 @@ Important: At the end of this document, please find:
                 column IN, OR-rewritten IN, and `rowid=K1 OR rowid=K2`.
                 Without runtime coverage, regressions of this class
                 keep slipping through the bytecode-only parity gate.
-            [ ] **6.10 step 6.IPK-IN.d** Diagnose and fix the
-                `VdbeFreeCursorNN`-eCurType-corruption crash that
-                shows up the moment the hoist-gate fix is enabled
-                end-to-end (≥3-entry IN crashes the same way today
-                without the hoist-gate fix).  Hypothesis: an
-                ephemeral-cursor allocation slot is being reused or
-                cell decoding is overwriting `apCsr[1]` during the
-                IdxInsert / Rewind sequence.
+            [X] **6.10 step 6.IPK-IN.d** — landed 2026-04-27.
+                `sqlite3VdbeMakeReady` was omitting `nMem += nCursor`
+                from vdbeaux.c:2679, so the `nCursor` Mem cells that
+                `allocateCursor` reserves at the top of `aMem[]`
+                (cursor i lives in `aMem[nMem-i]`) overlapped with
+                regular registers.  Any `OP_MakeRecord`/`OP_String`
+                writing into the colliding register clobbered
+                `pCx^.eCurType` and `pCx^.uc.pCursor`, surfacing as a
+                segfault inside `sqlite3VdbeFreeCursorNN` at finalize.
+                3-entry `WHERE rowid IN (1,2,3)` no longer crashes;
+                regression sweep `TestExplainParity` 1004/1005,
+                `TestWhereCorpus` 92/92, `TestDMLBasic` 54/54,
+                `TestSelectBasic` 49/49, `TestVdbeApi` 57/57,
+                `TestVdbeCursor` 27/27 all still green.
         [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
         [ ] `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3

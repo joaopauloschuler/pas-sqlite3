@@ -2832,6 +2832,15 @@ begin
 
   p^.vdbeFlags := p^.vdbeFlags and not (VDBF_UsesStmtJournal or VDBF_EXPIRED_MASK);
 
+  { Reserve nCursor extra Mem cells at the top of aMem[] for VdbeCursor
+    storage — allocateCursor() places cursor i at aMem[nMem-i] for i>0,
+    so without this bump the cursor slot collides with a regular register
+    and any OP_MakeRecord / OP_String write into that register clobbers
+    the cursor (causing eCurType corruption at sqlite3_finalize).
+    Port of vdbeaux.c:2679 (`nMem += nCursor`). }
+  nMem := nMem + nCursor;
+  if (nCursor = 0) and (nMem > 0) then Inc(nMem);
+
   { allocate Mem registers (aMem[1..nMem] are user registers; aMem[0] is
     the unused slot held by all VDBE programs).  Phase 6.9-bis. }
   if (not vdbeDbMallocFailed(db)) and (nMem > 0) then begin
