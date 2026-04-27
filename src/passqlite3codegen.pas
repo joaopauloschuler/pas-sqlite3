@@ -23423,8 +23423,16 @@ var
   op:          i32;
   regFree1:    i32;
   pOpOnce:     PVdbeOp;
+  prRhs:       Pi32;
+  destStep2, destStep6, destNotNull: i32;
+  addrTop, addrTruthOp: i32;
+  r3:          i32;
+  pVF:         PExpr;
+  regCkNull:   i32;
 begin
   rRhsHasNull := 0;
+  destStep6   := 0;
+  addrTruthOp := 0;
   zAff        := nil;
   iTab        := 0;
   v           := pParse^.pVdbe;
@@ -23436,17 +23444,35 @@ begin
     `sqlite3FindInIndex` below.  The prior pessimistic
     `OP_Goto destIfFalse` short-circuit is removed; the IN_INDEX_EPH
     arm picks up the cached eph cursor through the EP_Subrtn fast-path
-    and emits the standard OP_Affinity + OP_NotFound per-row test. }
+    and emits the standard OP_Affinity + OP_NotFound per-row test.
+
+    Phase 6.9-bis 11g.2.f sub-progress 26 — split-NULL path enabled
+    (destIfFalse != destIfNull).  Used by NOT IN inside the WHERE
+    residual filter: when a NULL on either side is observed the result
+    is NULL (not FALSE), and NOT-NULL must propagate to a different
+    jump target than NOT-FOUND.  Emits the canonical Step3 (Found),
+    Step4 (NotNull rRhsHasNull), Step6 (Rewind/Column/Ne loop) sequence
+    from expr.c:4226..4281.  Also drops the leading OP_Noop "begin IN
+    expr" peg (`VdbeNoopComment` at expr.c:4067) so byte-level parity
+    holds against -DSQLITE_DEBUG builds. }
 
   zAff    := exprINAffinity(pParse, pExpr);
   nVector := sqlite3ExprVectorSize(pLeft);
 
-  Assert(destIfFalse = destIfNull, 'sub-progress 18: split-NULL path deferred');
+  { OP_Noop "begin IN expr" — VdbeNoopComment under SQLITE_DEBUG.  Skip
+    when EP_Subrtn is already set: the WHERE pre-loop hoist preamble
+    (codegen.pas:12884) already emitted a Noop in the addrSkip slot
+    immediately after OP_Rewind, which lines up with the same C Noop. }
+  if not ExprHasProperty(pExpr, EP_Subrtn) then
+    sqlite3VdbeAddOp0(v, OP_Noop);
+
+  if destIfFalse = destIfNull then prRhs := nil
+  else                             prRhs := @rRhsHasNull;
 
   { Find or build the RHS index/eph table. }
   eType := sqlite3FindInIndex(pParse, pExpr,
              IN_INDEX_MEMBERSHIP or IN_INDEX_NOOP_OK,
-             nil, nil, @iTab);
+             prRhs, nil, @iTab);
 
   { Code the LHS scalar value into rLhs.  Must not const-factor — the
     OP_Affinity path may need to mutate the register. }
@@ -23463,13 +23489,24 @@ begin
     pList := pExpr^.x.pList;
     pColl := sqlite3ExprCollSeq(pParse, pExpr^.pLeft);
     labelOk := sqlite3VdbeMakeLabel(pParse);
+    regCkNull := 0;
+
+    { sub-progress 26 — split-NULL: track NULL-presence via OP_BitAnd over
+      the LHS and every list element that can be NULL (expr.c:4120). }
+    if destIfNull <> destIfFalse then begin
+      regCkNull := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp3(v, OP_BitAnd, rLhs, rLhs, regCkNull);
+    end;
 
     for ii := 0 to pList^.nExpr - 1 do begin
       pItemEL := PExprListItem(PByte(ExprListItems(pList))
                    + ii * SZ_EXPRLIST_ITEM);
       pE2 := pItemEL^.pExpr;
       r2 := sqlite3ExprCodeTemp(pParse, pE2, @regToFree);
-      if ii < pList^.nExpr - 1 then begin
+      if (regCkNull <> 0) and (sqlite3ExprCanBeNull(pE2) <> 0) then
+        sqlite3VdbeAddOp3(v, OP_BitAnd, regCkNull, r2, regCkNull);
+      sqlite3ReleaseTempReg(pParse, regToFree);
+      if (ii < pList^.nExpr - 1) or (destIfNull <> destIfFalse) then begin
         if rLhs <> r2 then op := OP_Eq else op := OP_NotNull;
         sqlite3VdbeAddOp4(v, op, rLhs, labelOk, r2, pColl, P4_COLLSEQ);
         sqlite3VdbeChangeP5(v, u16(zAff[0]));
@@ -23478,9 +23515,13 @@ begin
         sqlite3VdbeAddOp4(v, op, rLhs, destIfFalse, r2, pColl, P4_COLLSEQ);
         sqlite3VdbeChangeP5(v, u16(Byte(zAff[0]) or SQLITE_JUMPIFNULL));
       end;
-      sqlite3ReleaseTempReg(pParse, regToFree);
+    end;
+    if regCkNull <> 0 then begin
+      sqlite3VdbeAddOp2(v, OP_IsNull, regCkNull, destIfNull);
+      sqlite3VdbeGoto(v, destIfFalse);
     end;
     sqlite3VdbeResolveLabel(v, labelOk);
+    sqlite3ReleaseTempReg(pParse, regCkNull);
   end else begin
     { IN_INDEX_EPH (or IN_INDEX_INDEX_*): combined Step3+Step5 NotFound.
       Emit an OP_Affinity over rLhs first so the probe matches the eph
@@ -23496,25 +23537,80 @@ begin
       C's coverage harness emits the IsNull explicitly so the generated
       bytecode still matches. }
     sqlite3VdbeAddOp4(v, OP_Affinity, rLhs, nVector, 0, zAff, nVector);
+
+    { Step 2 (expr.c:4178..4194) — IsNull guard per LHS field that can
+      be NULL.  destStep2/destStep6 differ only when destIfFalse !=
+      destIfNull (NOT IN inside WHERE residual). }
+    if destIfFalse = destIfNull then
+      destStep2 := destIfFalse
+    else begin
+      destStep2 := sqlite3VdbeMakeLabel(pParse);
+      destStep6 := destStep2;
+    end;
     for ii := 0 to nVector - 1 do
     begin
       if sqlite3ExprCanBeNull(sqlite3VectorFieldSubexpr(pLeft, ii)) <> 0 then
-        sqlite3VdbeAddOp2(v, OP_IsNull, rLhs + ii, destIfFalse);
+        sqlite3VdbeAddOp2(v, OP_IsNull, rLhs + ii, destStep2);
     end;
-    { tag-202407032019 — Bloom-filter pre-check.  When the IN-RHS
-      materialisation built a Bloom filter (regBloom stashed in the
-      OP_Once.p3 slot at iAddr), emit OP_Filter rBloom, destIfFalse,
-      rLhs, nVector ahead of the OP_NotFound binary search so a missing
-      probe short-circuits without touching the eph cursor. }
-    if ExprHasProperty(pExpr, EP_Subrtn) then
+
+    if destIfFalse = destIfNull then
     begin
-      pOpOnce := sqlite3VdbeGetOp(v, pExpr^.y.sub.iAddr);
-      if (pOpOnce <> nil) and (pOpOnce^.p3 > 0) then
-        sqlite3VdbeAddOp4Int(v, OP_Filter, pOpOnce^.p3, destIfFalse,
-                             rLhs, nVector);
+      { Combined Step 3 + Step 5 (expr.c:4209..4223) — the fast-path
+        used when the caller does not distinguish FALSE from NULL. }
+      { tag-202407032019 — Bloom-filter pre-check.  When the IN-RHS
+        materialisation built a Bloom filter (regBloom stashed in the
+        OP_Once.p3 slot at iAddr), emit OP_Filter rBloom, destIfFalse,
+        rLhs, nVector ahead of the OP_NotFound binary search so a missing
+        probe short-circuits without touching the eph cursor. }
+      if ExprHasProperty(pExpr, EP_Subrtn) then
+      begin
+        pOpOnce := sqlite3VdbeGetOp(v, pExpr^.y.sub.iAddr);
+        if (pOpOnce <> nil) and (pOpOnce^.p3 > 0) then
+          sqlite3VdbeAddOp4Int(v, OP_Filter, pOpOnce^.p3, destIfFalse,
+                               rLhs, nVector);
+      end;
+      sqlite3VdbeAddOp4Int(v, OP_NotFound, iTab, destIfFalse,
+                           rLhs, nVector);
+    end else
+    begin
+      { Ordinary Step 3 (expr.c:4226) — Found jumps to the truthy
+        landing patched at the end via JumpHere. }
+      addrTruthOp := sqlite3VdbeAddOp4Int(v, OP_Found, iTab, 0,
+                                          rLhs, nVector);
+
+      { Step 4 (expr.c:4233..4236) — when RHS is known not to contain
+        NULLs we can skip directly to destIfFalse. }
+      if (rRhsHasNull <> 0) and (nVector = 1) then
+        sqlite3VdbeAddOp2(v, OP_NotNull, rRhsHasNull, destIfFalse);
+
+      { Step 5 skipped in the split-NULL branch (Step 6 handles it). }
+
+      { Step 6 (expr.c:4243..4281) — walk the eph table once and
+        compare each row to the LHS; any equal-with-NULL produces
+        the destIfNull result, all FALSE produces destIfFalse. }
+      sqlite3VdbeResolveLabel(v, destStep6);
+      addrTop := sqlite3VdbeAddOp2(v, OP_Rewind, iTab, destIfFalse);
+      if nVector > 1 then destNotNull := sqlite3VdbeMakeLabel(pParse)
+      else                destNotNull := destIfFalse;
+      for ii := 0 to nVector - 1 do
+      begin
+        pVF   := sqlite3VectorFieldSubexpr(pLeft, ii);
+        pColl := sqlite3ExprCollSeq(pParse, pVF);
+        r3    := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_Column, iTab, ii, r3);
+        sqlite3VdbeAddOp4(v, OP_Ne, rLhs + ii, destNotNull, r3,
+                          pColl, P4_COLLSEQ);
+        sqlite3ReleaseTempReg(pParse, r3);
+      end;
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, destIfNull);
+      if nVector > 1 then
+      begin
+        sqlite3VdbeResolveLabel(v, destNotNull);
+        sqlite3VdbeAddOp2(v, OP_Next, iTab, addrTop + 1);
+        sqlite3VdbeAddOp2(v, OP_Goto, 0, destIfFalse);
+      end;
+      sqlite3VdbeJumpHere(v, addrTruthOp);
     end;
-    sqlite3VdbeAddOp4Int(v, OP_NotFound, iTab, destIfFalse,
-                         rLhs, nVector);
   end;
 
   sqlite3ReleaseTempReg(pParse, regFree1);

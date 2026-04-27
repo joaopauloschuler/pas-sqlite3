@@ -3098,6 +3098,94 @@ Important: At the end of this document, please find:
       omits, so the divergence is a 1-op pre-amble alignment plus
       the membership-test inversion.  LEFT_JOIN / JOIN_WHERE
       continue to block on multi-table planner integration.
+    - [X] Sub-progress 26 — IPK_NOT_IN PASS via `sqlite3ExprCodeIN`
+      split-NULL path port + `begin IN expr` Noop alignment
+      (2026-04-27).  Three coupled landings inside
+      `sqlite3ExprCodeIN` (codegen.pas:23403):
+
+      (a) **Leading `OP_Noop` "begin IN expr" peg** — `VdbeNoopComment`
+      at expr.c:4067 emits an OP_Noop at the start of every
+      `sqlite3ExprCodeIN` invocation under -DSQLITE_DEBUG.  Pascal now
+      emits the same Noop, but ONLY when `EP_Subrtn` is not yet set on
+      the expression — the WHERE pre-loop hoist preamble
+      (codegen.pas:12884, sub-progress 21) already emits a Noop in the
+      addrSkip slot immediately after `OP_Rewind`, which lines up
+      against the same C Noop slot.  Without the EP_Subrtn gate every
+      INDEX_IN / INDEX_IN_SUB row would regress with a duplicate Noop
+      (Pas=29 vs C=28), since the residual probe walks ExprCodeIN a
+      second time after the hoist already laid the Noop down.
+
+      (b) **`prRhsHasNull` propagation** — when `destIfFalse !=
+      destIfNull` (NOT IN inside a WHERE residual reaches this branch
+      via TK_NOT → ExprIfTrue → TK_IN at codegen.pas:5870..5874 with
+      `jumpIfNull <> 0`), pass `@rRhsHasNull` to `sqlite3FindInIndex`.
+      `FindInIndex`'s IN_INDEX_EPH arm at codegen.pas:23752..23755
+      already increments `pParse^.nMem` and emits
+      `sqlite3SetHasNullFlag` on the eph cursor when the pointer is
+      non-nil — the +1 register shift is exactly the difference that
+      had `BeginSubrtn p2=2 / Integer p1=1 p2=3 / MakeRecord p1=3 …`
+      in C versus `BeginSubrtn p2=1 / Integer p1=1 p2=2 / MakeRecord
+      p1=2 …` in Pascal pre-fix.  The 3-op `Integer 0/Rewind/Column`
+      `SetHasNullFlag` block also drops in for free at the exact
+      C addresses.
+
+      (c) **Step-3 (Found) + Step-4 (NotNull rRhsHasNull) + Step-6
+      (Rewind/Column/Ne/Goto loop)** port — expr.c:4226..4281.  The
+      prior Pascal code only handled the collapsed
+      `destIfFalse=destIfNull` fast-path (combined Step3+5
+      `OP_NotFound`).  Sub-progress 26 adds the split-NULL branch:
+      `OP_Found` jumps to a JumpHere-patched truthy landing,
+      `OP_NotNull rRhsHasNull, destIfFalse` short-circuits when the
+      RHS is known not to contain NULLs, and the Step-6 single-row
+      walk (`Rewind / Column / Ne / Goto destIfNull`) closes the NULL
+      semantics for nVector=1 LHS.  The vector arm
+      (`destNotNull = MakeLabel; … ResolveLabel destNotNull; OP_Next;
+      OP_Goto destIfFalse`) is also wired in for forward-compatibility
+      with composite-IN shapes; no current corpus row exercises it.
+
+      The `IN_INDEX_NOOP` arm (≤2-entry literal list) gained the
+      `regCkNull = OP_BitAnd(rLhs, rLhs, regCkNull)` accumulator and
+      the trailing `IsNull regCkNull, destIfNull / Goto destIfFalse`
+      epilogue — expr.c:4120..4151 — even though the current corpus
+      doesn't reach the IN_INDEX_NOOP path with split-NULL (the
+      ≤2-element fast-path is skipped because the pre-loop hoist takes
+      the EPH route first), the code is straightforward and matches C
+      shape exactly when invoked.
+
+      Test-suite delta:
+        * TestWhereCorpus: **22 → 23 PASS / 3 → 2 DIVERGE / 0 ERROR
+          (corpus 25)**.  IPK_NOT_IN flipped to PASS at 36 ops
+          byte-for-byte against the C oracle (Init / OpenRead /
+          Rewind / Noop / BeginSubrtn / Once / OpenEphemeral / 3×
+          Integer/MakeRecord/IdxInsert / NullRow / Return / Integer /
+          Rewind / Column / Rowid / Affinity / Found / NotNull /
+          Rewind / Column / Ne / Goto / Goto / Column / ResultRow /
+          Next / Halt / Transaction / Goto).  Failure-mode tally:
+          `0 exception, 0 nil-Vdbe, 2 op-count, 0 op-diff` — the two
+          remaining op-count divergences are LEFT_JOIN / JOIN_WHERE
+          (multi-table planner from 11g.2.d).
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41,
+          TestVdbeApi 57/57, TestVdbeMisc 45/45, TestVdbeMem 62/62,
+          TestVdbeAux 108/108, TestExplainParity 2/10 unchanged,
+          TestPrintf 105/105, TestJson 434/434, TestTokenizer
+          127/127, TestRegistration 19/19.  In particular INDEX_IN
+          and INDEX_IN_SUB stay PASS at 28/28 ops despite the new
+          unconditional Noop in ExprCodeIN — the EP_Subrtn gate keeps
+          them on the single-Noop hoist path.
+
+      Sub-progress 27 (next) will need to tackle the multi-table
+      planner integration to lift LEFT_JOIN / JOIN_WHERE — both
+      currently produce a 3-op stub (Init/Halt/Goto) because
+      `sqlite3Select` rejects `nSrc <> 1` at the trivial-shape gate
+      from sub-progress 5.  This is genuinely a 11g.2.d follow-on
+      (whereLoopAddBtree across multiple tables, wherePathSolver
+      multi-level path search) more than a 11g.2.f local fix; expect
+      it to be a multi-step landing.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
