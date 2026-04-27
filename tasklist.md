@@ -607,6 +607,26 @@ Important: At the end of this document, please find:
       OP_Null, TK_EQ INTEGER, TK_IS TERM_CODED, transitive EQUIV no-
       disable), CAET1..CAET3 (nEq=0 affinity-only, nEq=1 TK_EQ register
       block, nExtraReg=1 register accounting under TK_IS).
+    - [X] Leaf helpers, batch 5 — `codeExprOrVector`
+      (wherecode.c:1320..1346) and `filterPullDown` (wherecode.c:1391..1439).
+      codeExprOrVector emits a vector or scalar expression into a contiguous
+      register run: TK_VECTOR with ExprUseXList walks pList^.a[].pExpr through
+      sqlite3ExprCode; scalars degrade to a single sqlite3ExprCode call into
+      iReg.  The TK_SELECT subselect arm asserts-stubs pending sqlite3CodeSubselect
+      (lands alongside codeINTerm proper in batch 6).  filterPullDown is the
+      Bloom-filter pull-down driver — walks inner WhereLevels after iLevel and
+      for each that has regFilter<>0 + nSkip=0 + (prereq & notReady)=0 emits
+      the filter's column-key pre-check before the outer index lookup.
+      WHERE_IPK arm threads codeEqualityTerm + OP_MustBeInt + OP_Filter through
+      a single temp register; otherwise codeAllEqualityTerms +
+      codeApplyAffinity + OP_Filter on the full nEq prefix.  Each handled
+      level has its regFilter zeroed and addrBrk restored.  Gate:
+      `TestWherePlanner.pas` (406/406): CEOV1 (scalar TK_INTEGER → ≥1 opcode),
+      CEOV2 (TK_VECTOR with two TK_INTEGER children → ≥2 opcodes via
+      ExprUseXList), FPD1 (all-regFilter=0 walk → no emit), FPD2 (IPK level
+      with regFilter=99 → MustBeInt + Filter pair, regFilter cleared, addrBrk
+      restored), FPD3 (nSkip=1 disqualifier → no emit, regFilter preserved),
+      FPD4 (iLevel=nLevel-1 walk body never enters → no emit).
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix

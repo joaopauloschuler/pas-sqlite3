@@ -3804,6 +3804,169 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- codeExprOrVector (wherecode.c:1320..1346) ----- }
+
+procedure TestCodeExprOrVector;
+var
+  db:    PTsqlite3;
+  parse: TParse;
+  v:     PVdbe;
+  rc:    i32;
+  exScalar, exA, exB, exVec: TExpr;
+  pList: PExprList;
+  base:  i32;
+  pItem: PExprListItem;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('CEOV open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  { ---- CEOV1 — scalar TK_INTEGER literal: emits exactly one OP into iReg. ---- }
+  FillChar(exScalar, SizeOf(exScalar), 0);
+  exScalar.op       := TK_INTEGER;
+  exScalar.flags    := EP_IntValue;
+  exScalar.u.iValue := 42;
+
+  parse.nMem := 5;
+  base := sqlite3VdbeCurrentAddr(v);
+  codeExprOrVector(@parse, @exScalar, 6, 1);
+  Check('CEOV1 scalar emits at least one opcode',
+        sqlite3VdbeCurrentAddr(v) > base);
+
+  { ---- CEOV2 — TK_VECTOR with two TK_INTEGER children: ExprUseXList path
+       emits one opcode per child into the contiguous register run. ---- }
+  FillChar(exA,   SizeOf(exA),   0);
+  FillChar(exB,   SizeOf(exB),   0);
+  FillChar(exVec, SizeOf(exVec), 0);
+  exA.op := TK_INTEGER; exA.flags := EP_IntValue; exA.u.iValue := 1;
+  exB.op := TK_INTEGER; exB.flags := EP_IntValue; exB.u.iValue := 2;
+
+  pList := sqlite3ExprListAppend(@parse, nil, @exA);
+  pList := sqlite3ExprListAppend(@parse, pList, @exB);
+  Check('CEOV2 list non-nil', pList <> nil);
+  Check('CEOV2 nExpr = 2',    pList^.nExpr = 2);
+
+  exVec.op    := TK_VECTOR;
+  exVec.flags := 0; { ExprUseXList: EP_xIsSelect cleared }
+  exVec.x.pList := pList;
+
+  Check('CEOV2 ExprIsVector', sqlite3ExprIsVector(@exVec) <> 0);
+
+  base := sqlite3VdbeCurrentAddr(v);
+  codeExprOrVector(@parse, @exVec, 10, 2);
+  Check('CEOV2 vector emits >= 2 opcodes',
+        sqlite3VdbeCurrentAddr(v) >= base + 2);
+
+  { Pull pList items off so ExprListDelete does not free the stack-allocated
+    children — we built them by hand. }
+  pItem := PExprListItem(PByte(ExprListItems(pList)));
+  pItem^.pExpr := nil;
+  pItem := PExprListItem(PByte(ExprListItems(pList)) + SZ_EXPRLIST_ITEM);
+  pItem^.pExpr := nil;
+  sqlite3ExprListDelete(db, pList);
+
+  sqlite3_close(db);
+end;
+
+{ ----- filterPullDown (wherecode.c:1391..1439) ----- }
+
+procedure TestFilterPullDown;
+const
+  N_LEVEL = 3;
+var
+  db:     PTsqlite3;
+  parse:  TParse;
+  v:      PVdbe;
+  rc:     i32;
+  buf:    array of Byte;
+  pWInfo: PWhereInfo;
+  loops:  array[0..2] of TWhereLoop;
+  term0:  TWhereTerm;
+  ex0:    TExpr;
+  alterm: array[0..0] of PWhereTerm;
+  base:   i32;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('FPD open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  SetLength(buf, SZ_WHEREINFO(N_LEVEL));
+  FillChar(buf[0], Length(buf), 0);
+  pWInfo := PWhereInfo(@buf[0]);
+  pWInfo^.nLevel := N_LEVEL;
+
+  FillChar(loops, SizeOf(loops), 0);
+  FillChar(term0, SizeOf(term0), 0);
+  FillChar(ex0,   SizeOf(ex0),   0);
+
+  { ---- FPD1 — no inner level beyond iLevel=0 with regFilter set: walk runs
+       but every pLevel^.regFilter is 0 → no opcodes emitted, no mutation. ---- }
+  whereInfoLevels(pWInfo)[0].pWLoop := @loops[0];
+  whereInfoLevels(pWInfo)[1].pWLoop := @loops[1];
+  whereInfoLevels(pWInfo)[2].pWLoop := @loops[2];
+  whereInfoLevels(pWInfo)[1].regFilter := 0;
+  whereInfoLevels(pWInfo)[2].regFilter := 0;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  filterPullDown(@parse, pWInfo, 0, 9999, 0);
+  Check('FPD1 no opcodes when all regFilter=0',
+        sqlite3VdbeCurrentAddr(v) = base);
+
+  { ---- FPD2 — IPK arm: level[1] has regFilter<>0, WHERE_IPK loop with one
+       TK_EQ rowid term; emits OP_MustBeInt + OP_Filter, regFilter cleared,
+       addrBrk preserved. ---- }
+  ex0.op       := TK_INTEGER;
+  ex0.flags    := EP_IntValue;
+  ex0.u.iValue := 7;
+
+  term0.pExpr     := @ex0;
+  term0.eOperator := WO_EQ;
+  term0.iParent   := -1;
+
+  alterm[0] := @term0;
+  loops[1].aLTerm := @alterm[0];
+  loops[1].nLTerm := 1;
+  loops[1].wsFlags := WHERE_IPK;
+  loops[1].nSkip   := 0;
+  loops[1].prereq  := 0;
+
+  whereInfoLevels(pWInfo)[1].regFilter := 99;
+  whereInfoLevels(pWInfo)[1].addrBrk   := 12345;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  filterPullDown(@parse, pWInfo, 0, 7777, 0);
+  Check('FPD2 IPK arm emitted opcodes',
+        sqlite3VdbeCurrentAddr(v) >= base + 2);
+  Check('FPD2 regFilter cleared',
+        whereInfoLevels(pWInfo)[1].regFilter = 0);
+  Check('FPD2 addrBrk restored',
+        whereInfoLevels(pWInfo)[1].addrBrk = 12345);
+
+  { ---- FPD3 — nSkip>0 disqualifies the level even if regFilter is set. ---- }
+  loops[2].wsFlags := WHERE_IPK;
+  loops[2].nSkip   := 1;
+  whereInfoLevels(pWInfo)[2].regFilter := 88;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  filterPullDown(@parse, pWInfo, 1, 5555, 0);
+  Check('FPD3 nSkip>0 → no emit',
+        sqlite3VdbeCurrentAddr(v) = base);
+  Check('FPD3 regFilter preserved',
+        whereInfoLevels(pWInfo)[2].regFilter = 88);
+
+  { ---- FPD4 — iLevel = nLevel-1: walk body never enters → no-op. ---- }
+  base := sqlite3VdbeCurrentAddr(v);
+  filterPullDown(@parse, pWInfo, N_LEVEL - 1, 1234, 0);
+  Check('FPD4 iLevel=last → no emit',
+        sqlite3VdbeCurrentAddr(v) = base);
+
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -3854,6 +4017,8 @@ begin
   TestIndexAffinityStr;
   TestCodeEqualityTerm;
   TestCodeAllEqualityTerms;
+  TestCodeExprOrVector;
+  TestFilterPullDown;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

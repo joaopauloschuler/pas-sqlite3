@@ -2410,6 +2410,24 @@ function  codeEqualityTerm(pParse: PParse; pTerm: PWhereTerm;
 function  codeAllEqualityTerms(pParse: PParse; pLevel: PWhereLevel;
   bRev: i32; nExtraReg: i32; pzAff: PPAnsiChar): i32;
 
+{ Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers, batch 5.
+  codeExprOrVector (wherecode.c:1320..1346) emits a vector or scalar expression
+  into nReg contiguous registers starting at iReg.  TK_SELECT vectors dispatch
+  through sqlite3CodeSubselect (not yet ported — assert if hit; gates on the
+  IN-subselect arm landing in batch 6 alongside codeINTerm proper); TK_VECTOR
+  RHS uses ExprUseXList and emits each child via sqlite3ExprCode; otherwise the
+  scalar is coded with sqlite3ExprCode into iReg.
+  filterPullDown (wherecode.c:1391..1439) walks the inner loops of pWInfo
+  starting after iLevel, looking for any pre-emittable Bloom filter
+  (regFilter<>0, nSkip=0, prereqs satisfied) and evaluates it before the outer
+  index lookup.  WHERE_IPK loops thread one register through codeEqualityTerm +
+  OP_MustBeInt + OP_Filter; otherwise the full nEq-prefix path emits via
+  codeAllEqualityTerms + codeApplyAffinity + OP_Filter.  Each handled level has
+  its regFilter zeroed so the inner loop does not double-check. }
+procedure codeExprOrVector(pParse: PParse; p: PExpr; iReg: i32; nReg: i32);
+procedure filterPullDown(pParse: PParse; pWInfo: PWhereInfo; iLevel: i32;
+  addrNxt: i32; notReady: Bitmask);
+
 { Index helpers }
 procedure sqlite3FreeIndex(db: PTsqlite3; p: PIndex2);
 procedure sqlite3UnlinkAndDeleteIndex(db: PTsqlite3; iDb: i32;
@@ -19763,6 +19781,101 @@ begin
   end;
   pzAff^ := zAff;
   Result := regBase;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers,
+  batch 5.
+
+  See forward-decl block (~line 2412) for descriptions.
+  =========================================================================== }
+
+procedure codeExprOrVector(pParse: PParse; p: PExpr; iReg: i32; nReg: i32);
+var
+  v:     PVdbe;
+  pList: PExprList;
+  pItem: PExprListItem;
+  i:     i32;
+begin
+  Assert(nReg > 0);
+  if (p <> nil) and (sqlite3ExprIsVector(p) <> 0) then begin
+    if ExprUseXSelect(p) then begin
+      { TK_SELECT vector RHS — sqlite3CodeSubselect not yet ported.  When the
+        prerequisite lands (batch 6, alongside codeINTerm proper), restore the
+        OP_Copy(iSelect..iReg, nReg-1) path verbatim. }
+      v := pParse^.pVdbe;
+      Assert(p^.op = TK_SELECT);
+      Assert(False, 'codeExprOrVector: TK_SELECT subselect not yet ported');
+      { Suppress "unused" warning. }
+      if v = nil then Exit;
+    end else begin
+      Assert(ExprUseXList(p));
+      pList := p^.x.pList;
+      Assert(nReg <= pList^.nExpr);
+      for i := 0 to nReg - 1 do begin
+        pItem := PExprListItem(PByte(ExprListItems(pList)) + i * SZ_EXPRLIST_ITEM);
+        sqlite3ExprCode(pParse, pItem^.pExpr, iReg + i);
+      end;
+    end;
+  end else begin
+    Assert((nReg = 1) or (pParse^.nErr <> 0));
+    sqlite3ExprCode(pParse, p, iReg);
+  end;
+end;
+
+procedure filterPullDown(pParse: PParse; pWInfo: PWhereInfo; iLevel: i32;
+  addrNxt: i32; notReady: Bitmask);
+var
+  pLevel:        PWhereLevel;
+  pLoop:         PWhereLoop;
+  pTerm:         PWhereTerm;
+  saved_addrBrk: i32;
+  regRowid:      i32;
+  r1:            i32;
+  nEq:           u16;
+  zStartAff:     PAnsiChar;
+  pa:            PWhereLevel;
+begin
+  pa := whereInfoLevels(pWInfo);
+  Inc(iLevel);
+  while iLevel < i32(pWInfo^.nLevel) do begin
+    pLevel := @pa[iLevel];
+    pLoop  := pLevel^.pWLoop;
+
+    if (pLevel^.regFilter <> 0)
+       and (pLoop^.nSkip = 0)
+       and ((pLoop^.prereq and notReady) = 0) then
+    begin
+      saved_addrBrk    := pLevel^.addrBrk;
+      pLevel^.addrBrk  := addrNxt;
+
+      if (pLoop^.wsFlags and WHERE_IPK) <> 0 then begin
+        pTerm := pLoop^.aLTerm[0];
+        Assert(pTerm <> nil);
+        Assert(pTerm^.pExpr <> nil);
+        regRowid := sqlite3GetTempReg(pParse);
+        regRowid := codeEqualityTerm(pParse, pTerm, pLevel, 0, 0, regRowid);
+        sqlite3VdbeAddOp2(pParse^.pVdbe, OP_MustBeInt, regRowid, addrNxt);
+        sqlite3VdbeAddOp4Int(pParse^.pVdbe, OP_Filter, pLevel^.regFilter,
+                             addrNxt, regRowid, 1);
+      end else begin
+        nEq := pLoop^.u.btree.nEq;
+        Assert((pLoop^.wsFlags and WHERE_INDEXED) <> 0);
+        Assert((pLoop^.wsFlags and WHERE_COLUMN_IN) = 0);
+        zStartAff := nil;
+        r1 := codeAllEqualityTerms(pParse, pLevel, 0, 0, @zStartAff);
+        codeApplyAffinity(pParse, r1, nEq, zStartAff);
+        sqlite3DbFree(pParse^.db, zStartAff);
+        sqlite3VdbeAddOp4Int(pParse^.pVdbe, OP_Filter, pLevel^.regFilter,
+                             addrNxt, r1, nEq);
+      end;
+
+      pLevel^.regFilter := 0;
+      pLevel^.addrBrk   := saved_addrBrk;
+    end;
+
+    Inc(iLevel);
+  end;
 end;
 
 end.
