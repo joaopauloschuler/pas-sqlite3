@@ -97,22 +97,20 @@ Important: At the end of this document, please find:
                 reconcile that vs. codegen.pas's bigger
                 TUnpackedRecord before porting the corruption /
                 BIGNULL / DESC arms.
-            [ ] **6.10 step 6.IPK-IN.f** — IN-subquery returns only
-                first match.  Surfaced 2026-04-27 by extending
-                `TestRowidIn` with edge-case probes; logged there as
-                an XFail so regressions in the literal-IN-list path
-                still fail the gate.  Repro: with
-                `t = {(10,1,1),(20,2,2),(30,3,3)}`,
-                `SELECT a FROM t WHERE rowid IN (SELECT b FROM t)`
-                returns `10` on Pas (C: `10,20,30`).  Likely cause:
-                IN_INDEX_EPH / IN_INDEX_LOOP build path (or
-                `sqlite3CodeSubselect`'s eph-table populate loop) is
-                short-circuiting after the first row when the RHS is
-                a SELECT rather than an ExprList.  Literal-RHS IN now
-                fully correct (singleton, no-match, out-of-order,
-                duplicates, mixed-sign, AND-combined, NOT IN — all
-                PASS).  Flipping XFAIL → UPASS in `TestRowidIn` is the
-                signal to remove the wrapper.
+            [X] **6.10 step 6.IPK-IN.f** — IN-subquery returned only
+                first match.  Fixed 2026-04-27 in
+                `sqlite3BtreeIndexMoveto`: the skip-to-root
+                short-circuit fired on *any* current-cell comparison
+                <= pIdxKey, but C btree.c:6049..6083 only allows it
+                when cursor is on the *last cell* (case 1) or when
+                the *first cell* of a non-root page is <= the seek
+                key (case 2 — restart search on current page,
+                bypassing root walk).  After a membership probe
+                landed on idx=0 for key=1, the next probe for key=2
+                short-circuited with c=-1 and reported "not found"
+                without descending the tree.  `TestRowidIn` now
+                covers both rowid-IPK and regular-column IN-subquery
+                shapes; both PASS.
         [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
         [ ] `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3

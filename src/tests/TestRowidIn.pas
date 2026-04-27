@@ -164,12 +164,16 @@ begin
   Expect('rowid NOT IN (2)',
          'SELECT a FROM t WHERE rowid NOT IN (2)', '10,30');
 
-  { IN with a SELECT subquery — known broken: Pas only returns the
-    first match (see tasklist 6.10 step 6.IPK-IN.f).  C returns
-    10,20,30. }
-  XFail('rowid IN (SELECT b FROM t)',
-        'SELECT a FROM t WHERE rowid IN (SELECT b FROM t)',
-        '10,20,30', '10');
+  { IN with a SELECT subquery — fixed by 6.IPK-IN.f
+    (sqlite3BtreeIndexMoveto skip-to-root short-circuit was firing on any
+    cursor cell, not just the last cell — masked all but the first IN
+    membership probe). }
+  Expect('rowid IN (SELECT b FROM t)',
+         'SELECT a FROM t WHERE rowid IN (SELECT b FROM t)',
+         '10,20,30');
+  Expect('a IN (SELECT b*10 FROM t) (general column)',
+         'SELECT a FROM t WHERE a IN (SELECT b*10 FROM t)',
+         '10,20,30');
 
   sqlite3_close(db);
 

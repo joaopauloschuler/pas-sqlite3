@@ -3069,14 +3069,36 @@ begin
     Exit;
   end;
 
-  { Skip-to-root optimization (simplified) }
+  { Skip-to-root optimization — mirrors btree.c:6049..6083.
+    Two cases:
+      (1) cursor is at the *last cell* of the table and pIdxKey >= that
+          cell — no movement required.
+      (2) cursor is below root and the *first cell* of the current page
+          is <= pIdxKey — start the search on the current page rather
+          than walking back up to the root.
+    The previous Pas port collapsed (1) into "compare against current ix"
+    which was wrong: the seek key may sort *after* the current cell yet
+    still appear later on the same page.  See tasklist 6.IPK-IN.f. }
   if (pCur^.eState = CURSOR_VALID) and (pCur^.pPage^.leaf <> 0) and
      (cursorOnLastPage(pCur) <> 0) then begin
-    c := indexCellCompare(pCur^.pPage, pCur^.ix, pIdxKey, xRecordCompare);
-    if c <= 0 then begin
-      pRes^ := c;
-      Result := SQLITE_OK;
-      Exit;
+    if pCur^.ix = u16(pCur^.pPage^.nCell - 1) then begin
+      c := indexCellCompare(pCur^.pPage, pCur^.ix, pIdxKey, xRecordCompare);
+      if c <= 0 then begin
+        pRes^ := c;
+        Result := SQLITE_OK;
+        Exit;
+      end;
+    end;
+    if pCur^.iPage > 0 then begin
+      c := indexCellCompare(pCur^.pPage, 0, pIdxKey, xRecordCompare);
+      if c <= 0 then begin
+        pCur^.curFlags := pCur^.curFlags and (not (BTCF_ValidOvfl or BTCF_AtLast));
+        if pCur^.pPage^.isInit = 0 then begin
+          Result := SQLITE_CORRUPT_BKPT;
+          Exit;
+        end;
+        goto bypass_moveto_root;
+      end;
     end;
   end;
 
