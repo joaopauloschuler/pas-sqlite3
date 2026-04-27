@@ -6647,8 +6647,109 @@ begin
   Result := 0;
 end;
 
+{ Minimal sqlite3ResolveExprNames — walk pExpr resolving TK_ID (and rowid
+  pseudo-column) against pNC^.pSrcList.  Mirrors the bare-identifier arm of
+  sqlite3ResolveSelectNames (resolve.c lookupName), enough for the DELETE /
+  UPDATE WHERE-clause path to drive sqlite3WhereBegin with a properly tagged
+  TK_COLUMN tree (so prereqAll picks up the cursor mask and the False-
+  WHERE-Term-Bypass does not spuriously fire on `rowid=N`). }
+procedure resolveExprAgainstSrcList(pSrc: PSrcList; pE: PExpr);
+var
+  i:      i32;
+  iCol:   i32;
+  pItem:  PSrcItem;
+  base:   PSrcItem;
+begin
+  if pE = nil then Exit;
+  if (pE^.op = TK_DOT) and (pSrc <> nil)
+     and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+     and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID) then
+  begin
+    base := SrcListItems(pSrc);
+    for i := 0 to pSrc^.nSrc - 1 do
+    begin
+      pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+      if pItem^.pSTab = nil then Continue;
+      if pItem^.zAlias <> nil then begin
+        if sqlite3StrICmp(pItem^.zAlias, pE^.pLeft^.u.zToken) <> 0 then Continue;
+      end else begin
+        if sqlite3StrICmp(pItem^.pSTab^.zName, pE^.pLeft^.u.zToken) <> 0 then Continue;
+      end;
+      iCol := sqlite3ColumnIndex(pItem^.pSTab, pE^.pRight^.u.zToken);
+      if iCol >= 0 then
+      begin
+        pE^.op      := TK_COLUMN;
+        pE^.iTable  := pItem^.iCursor;
+        pE^.iColumn := i16(iCol);
+        pE^.y.pTab  := pItem^.pSTab;
+        pE^.pLeft   := nil;
+        pE^.pRight  := nil;
+        if iCol < BMS - 1 then
+          pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
+        else
+          pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+        Exit;
+      end;
+    end;
+    Exit;
+  end;
+  if (pE^.op = TK_ID) and (pSrc <> nil) then
+  begin
+    base := SrcListItems(pSrc);
+    for i := 0 to pSrc^.nSrc - 1 do
+    begin
+      pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+      if pItem^.pSTab = nil then Continue;
+      iCol := sqlite3ColumnIndex(pItem^.pSTab, pE^.u.zToken);
+      if iCol >= 0 then
+      begin
+        pE^.op      := TK_COLUMN;
+        pE^.iTable  := pItem^.iCursor;
+        pE^.iColumn := i16(iCol);
+        pE^.y.pTab  := pItem^.pSTab;
+        if iCol < BMS - 1 then
+          pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
+        else
+          pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+        Exit;
+      end;
+    end;
+    if sqlite3IsRowid(pE^.u.zToken) <> 0 then
+    begin
+      for i := 0 to pSrc^.nSrc - 1 do
+      begin
+        pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+        if pItem^.pSTab = nil then Continue;
+        if not HasRowid(pItem^.pSTab) then Continue;
+        pE^.op      := TK_COLUMN;
+        pE^.iTable  := pItem^.iCursor;
+        pE^.iColumn := i16(-1);
+        pE^.y.pTab  := pItem^.pSTab;
+        pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+        Exit;
+      end;
+    end;
+    Exit;
+  end;
+  if not ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then
+  begin
+    resolveExprAgainstSrcList(pSrc, pE^.pLeft);
+    resolveExprAgainstSrcList(pSrc, pE^.pRight);
+    if (pE^.flags and EP_xIsSelect) = 0 then
+    begin
+      if pE^.x.pList <> nil then
+      begin
+        for i := 0 to pE^.x.pList^.nExpr - 1 do
+          resolveExprAgainstSrcList(pSrc, ExprListItems(pE^.x.pList)[i].pExpr);
+      end;
+    end;
+  end;
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
+  if (pNC <> nil) and (pExpr <> nil) then
+    resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
   Result := SQLITE_OK;
 end;
 
