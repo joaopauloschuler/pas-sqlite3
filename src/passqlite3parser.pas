@@ -2558,11 +2558,20 @@ begin
          yymsp[-4].minor.yy14 := sqlite3ExprListAppend(pPse,
            PExprList(yymsp[-4].minor.yy14), pDot_104);
        end;
-    105, 106, 117, 258, 259:
-       { as ::= AS nm;  as ::= ;  dbnm ::= DOT nm;
+    105, 117, 258, 259:
+       { as ::= AS nm;  dbnm ::= DOT nm;
          plus_num ::= PLUS INTEGER|FLOAT;
          minus_num ::= MINUS INTEGER|FLOAT }
        yymsp[-1].minor.yy0 := yymsp[0].minor.yy0;
+    106: { as ::= }
+       { Empty production: nrhs=0, so the LHS slot is yymsp[1] (the slot
+         the parser is about to push), NOT yymsp[-1] which would clobber
+         the entry BELOW the current top.  Mirrors C parse.c rule 106:
+           yymsp[1].minor.yy0.n = 0; yymsp[1].minor.yy0.z = 0; }
+       begin
+         yymsp[1].minor.yy0.z := nil;
+         yymsp[1].minor.yy0.n := 0;
+       end;
     107, 110: { from ::=;  stl_prefix ::= }
        yymsp[1].minor.yy203 := nil;
     108: { from ::= FROM seltablist }

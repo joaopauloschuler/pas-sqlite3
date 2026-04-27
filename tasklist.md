@@ -1315,6 +1315,45 @@ Important: At the end of this document, please find:
       Rewind / Column / ResultRow / Next / Halt / Transaction /
       Goto) — by tackling the root-cause `sqlite3ExprDeleteNN`
       double-descent during `sqlite3SelectDelete` cleanup.
+    - [X] Sub-progress 4 — root-caused the AV to a Pascal-port bug
+      in the lemon parser reduce action for rule 106 (`as ::= ε`,
+      2026-04-27).  Rules 105/106/117/258/259 had been collapsed
+      into a single shared body (`yymsp[-1].minor.yy0 :=
+      yymsp[0].minor.yy0;`) which is correct only for the
+      non-empty productions (nrhs = -2): the LHS slot is the one
+      *below* current top after dropping the consumed RHS items.
+      For rule 106 (nrhs = 0, epsilon production) the LHS slot is
+      `yymsp[1]` — the slot the parser is *about to push* — not
+      `yymsp[-1]`, which is the active stack entry for the
+      previous symbol.  The shared body therefore overwrote the
+      slot holding the just-reduced `expr` (yy454, an Expr*) with
+      the lookahead-source PAnsiChar (yy0.z) every time the
+      grammar took the optional `as` epsilon path inside
+      `selcollist ::= sclp scanpt expr scanpt as`.  Symptom: every
+      SELECT that traversed the column-AS path (i.e. every row of
+      the corpus) parsed an ExprList whose first item.pExpr was a
+      small low-VA pointer into the SQL source, which AVed as
+      soon as `sqlite3ExprDeleteNN` tried to dereference it
+      during the rule-84 cleanup of the parsed Select.  Fix:
+      split rule 106 out of the shared body and emit the C
+      parse.c equivalent (`yymsp[1].minor.yy0.z := nil;
+      yymsp[1].minor.yy0.n := 0;`).  Mirrors the same
+      yymsp[1]-write pattern already used by rules 30 (`scanpt
+      ::= ε`), 116 (`dbnm ::= ε`) and friends.  New baseline
+      (2026-04-27): **0 PASS / 20 DIVERGE / 0 ERROR**, but the
+      failure-mode partition flipped from `20 exception, 0
+      nil-Vdbe, 0 op-count, 0 op-diff` to `0 exception, 0
+      nil-Vdbe, 20 op-count, 0 op-diff` — every Pascal `prepare`
+      now succeeds and yields a stepable Vdbe (3 ops: a minimal
+      Init/Goto/Halt-like prologue from the codegen stub) where
+      C produces 8..31 ops with real OpenRead/Rewind/Column body.
+      All 45 TestParser rows + 20 TestParserSmoke rows + 49
+      TestSelectBasic + 20 TestPrepareBasic + 40 TestExprBasic +
+      54 TestDMLBasic + 44 TestSchemaBasic still PASS;
+      TestExplainParity stays at 2 pass / 8 diverge unchanged.
+      Sub-progress 5 will drive `sqlite3Select` from the
+      SelectPrep-only stub into the real codegen path so the
+      first PASS row (`full table scan`, 10 ops) flips green.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
