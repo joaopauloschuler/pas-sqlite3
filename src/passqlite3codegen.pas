@@ -5986,6 +5986,59 @@ begin
   Result := exprIsConst(pParse, p, 2);
 end;
 
+{ sqlite3ExprIsTableConstant — true when p references only cursor iCur.
+  Faithful port of expr.c:2691..2707.  pParse=nil is intentional (the
+  Walker only walks for iCur, not for constant-function recognition). }
+function sqlite3ExprIsTableConstant(p: PExpr; iCur: i32): i32;
+var
+  w: TWalker;
+begin
+  FillChar(w, SizeOf(w), 0);
+  w.eCode            := 3;
+  w.pParse           := nil;
+  w.xExprCallback    := @exprNodeIsConstant;
+  w.xSelectCallback  := @sqlite3SelectWalkFail;
+  w.u.iCur           := iCur;
+  sqlite3WalkExpr(@w, p);
+  Result := i32(w.eCode);
+end;
+
+{ sqlite3ExprIsSingleTableConstraint — true when pExpr is a constraint that
+  applies exclusively to the table at pSrcList->a[iSrc].
+  Faithful port of expr.c:2753..2784. }
+function sqlite3ExprIsSingleTableConstraint(pExpr: PExpr;
+  const pSrcList: PSrcList; iSrc: i32; bAllowSubq: i32): i32;
+var
+  pSrc: PSrcItem;
+  jj:   i32;
+begin
+  pSrc := @SrcListItems(pSrcList)[iSrc];
+  if (pSrc^.fg.jointype and JT_LTORJ) <> 0 then begin Result := 0; Exit; end; { rule 3 }
+  if (pSrc^.fg.jointype and JT_LEFT) <> 0 then
+  begin
+    if not ExprHasProperty(pExpr, EP_OuterON) then begin Result := 0; Exit; end;   { 4a }
+    if pExpr^.w.iJoin <> pSrc^.iCursor    then begin Result := 0; Exit; end;  { 4b }
+  end else
+  begin
+    if ExprHasProperty(pExpr, EP_OuterON) then begin Result := 0; Exit; end;   { rule 5 }
+  end;
+  if ExprHasProperty(pExpr, EP_OuterON or EP_InnerON)
+     and ((SrcListItems(pSrcList)[0].fg.jointype and JT_LTORJ) <> 0) then
+  begin
+    for jj := 0 to iSrc - 1 do
+    begin
+      if pExpr^.w.iJoin = SrcListItems(pSrcList)[jj].iCursor then
+      begin
+        if (SrcListItems(pSrcList)[jj].fg.jointype and JT_LTORJ) <> 0 then
+        begin Result := 0; Exit; end;   { rule 6 }
+        Break;
+      end;
+    end;
+  end;
+  { Rules 1, 2a, 2b: }
+  Result := sqlite3ExprIsTableConstant(pExpr, pSrc^.iCursor);
+end;
+
 { sqlite3ExprCodeRunJustOnce (expr.c:5777..5822) — factor a constant
   expression out of the main VDBE program into the once-at-prepare-time
   init section so its result is available in a stable register without
@@ -13067,6 +13120,248 @@ begin
   Result := 0;
 end;
 
+{ constructAutomaticIndex — build a transient auto-index for one join level.
+  Faithful port of where.c:986..1250.  pPartial path (partial auto-index)
+  exercises sqlite3ExprIfFalse which is already ported; the viaCoroutine
+  sub-path is guarded by Assert(False) since no corpus fixture uses it.
+  explainAutomaticIndex / sqlite3VdbeScanStatusCounters / translateColumnToCopy
+  are no-ops or deferred — they don't affect the opcode stream exercised by
+  the test corpus. }
+procedure constructAutomaticIndex(pParse: PParse; pWC: PWhereClause;
+  notReady: Bitmask; pLevel: PWhereLevel);
+var
+  nKeyCol:        i32;
+  pTerm:          PWhereTerm;
+  pWCEnd:         PWhereTerm;
+  pIdx:           PIndex2;
+  v:              PVdbe;
+  addrInit:       i32;
+  pTable:         PTable2;
+  addrTop:        i32;
+  regRecord:      i32;
+  n:              i32;
+  i:              i32;
+  mxBitCol:       i32;
+  pColl:          PTCollSeq;
+  pLoop:          PWhereLoop;
+  zNotUsed:       PAnsiChar;
+  idxCols:        Bitmask;
+  extraCols:      Bitmask;
+  sentWarning:    u8;
+  useBloomFilter: u8;
+  pPartial:       PExpr;
+  iContinue:      i32;
+  pTabList:       PSrcList;
+  pSrc:           PSrcItem;
+  regBase:        i32;
+  db:             PTsqlite3;
+begin
+  db       := pParse^.db;
+  v        := pParse^.pVdbe;
+  Assert(v <> nil);
+  pTabList := pWC^.pWInfo^.pTabList;
+  pSrc     := @SrcListItems(pTabList)[pLevel^.iFrom];
+  pTable   := pSrc^.pSTab;
+  pLoop    := pLevel^.pWLoop;
+
+  sentWarning    := 0;
+  useBloomFilter := 0;
+  pPartial       := nil;
+  iContinue      := 0;
+
+  { Emit OP_Once to skip re-creation on 2nd+ iterations of the outer loop. }
+  addrInit := sqlite3VdbeAddOp0(v, OP_Once);
+
+  { First pass: count key columns and build pPartial expression. }
+  nKeyCol  := 0;
+  pWCEnd   := pWC^.a;
+  Inc(pWCEnd, pWC^.nTerm);
+  idxCols  := 0;
+  pTerm    := pWC^.a;
+  while pTerm < pWCEnd do
+  begin
+    { Accumulate single-table constraints for a potential partial index. }
+    if ((pTerm^.wtFlags and TERM_VIRTUAL) = 0)
+       and (sqlite3ExprIsSingleTableConstraint(pTerm^.pExpr, pTabList,
+                                               pLevel^.iFrom, 0) <> 0) then
+    begin
+      pPartial := sqlite3ExprAnd(pParse, pPartial,
+                                 sqlite3ExprDup(db, pTerm^.pExpr, 0));
+    end;
+    if termCanDriveIndex(pTerm, pSrc, notReady) <> 0 then
+    begin
+      i := i32(pTerm^.u.leftColumn);
+      if i >= BMS then
+        idxCols := idxCols or (Bitmask(1) shl (BMS - 1))
+      else
+      begin
+        { Only count a column once — guard with idxCols (where.c:1061). }
+        if (idxCols and (Bitmask(1) shl i)) = 0 then
+        begin
+          idxCols := idxCols or (Bitmask(1) shl i);
+          if sentWarning = 0 then
+            sentWarning := 1;
+          { Resize aLTerm and record the driving term. }
+          if whereLoopResize(db, pLoop, nKeyCol + 1) <> SQLITE_OK then
+          begin
+            sqlite3ExprDelete(db, pPartial);
+            sqlite3VdbeJumpHere(v, addrInit);
+            Exit;
+          end;
+          pLoop^.aLTerm[nKeyCol] := pTerm;
+          Inc(nKeyCol);
+        end;
+      end;
+    end;
+    Inc(pTerm);
+  end;
+  if (nKeyCol = 0) and (db^.mallocFailed = 0) then
+  begin
+    sqlite3ExprDelete(db, pPartial);
+    sqlite3VdbeJumpHere(v, addrInit);
+    Exit;
+  end;
+  pLoop^.u.btree.nEq := u16(nKeyCol);
+  pLoop^.nLTerm      := u16(nKeyCol);
+
+  { Count extra columns needed to make a covering index. }
+  if IsView(pTable) then
+    extraCols := (not Bitmask(0)) and (not idxCols)
+  else
+    extraCols := pSrc^.colUsed and ((not idxCols) or (Bitmask(1) shl (BMS - 1)));
+  mxBitCol := BMS - 1;
+  if mxBitCol > i32(pTable^.nCol) then mxBitCol := i32(pTable^.nCol);
+  for i := 0 to mxBitCol - 1 do
+    if (extraCols and (Bitmask(1) shl i)) <> 0 then Inc(nKeyCol);
+  if (pSrc^.colUsed and (Bitmask(1) shl (BMS - 1))) <> 0 then
+    Inc(nKeyCol, i32(pTable^.nCol) - BMS + 1);
+
+  { Allocate the Index object. }
+  if HasRowid(pTable) then
+    pIdx := sqlite3AllocateIndexObject(db, i16(nKeyCol + 1), 0, @zNotUsed)
+  else
+    pIdx := sqlite3AllocateIndexObject(db, i16(nKeyCol),     0, @zNotUsed);
+  if pIdx = nil then
+  begin
+    sqlite3ExprDelete(db, pPartial);
+    sqlite3VdbeJumpHere(v, addrInit);
+    Exit;
+  end;
+  pLoop^.u.btree.pIndex := pIdx;
+  pIdx^.zName           := 'auto-index';
+  pIdx^.pTable          := pTable;
+
+  { Second pass: fill in key column descriptors.  Mirror C: only add each
+    column once by tracking idxCols bitmask (where.c:1121..1151). }
+  n       := 0;
+  idxCols := 0;
+  pTerm   := pWC^.a;
+  while pTerm < pWCEnd do
+  begin
+    if termCanDriveIndex(pTerm, pSrc, notReady) <> 0 then
+    begin
+      i := i32(pTerm^.u.leftColumn);
+      if i >= BMS then
+        idxCols := idxCols or (Bitmask(1) shl (BMS - 1))
+      else begin
+        if (idxCols and (Bitmask(1) shl i)) = 0 then
+        begin
+          idxCols := idxCols or (Bitmask(1) shl i);
+          (pIdx^.aiColumn + n)^ := i16(pTerm^.u.leftColumn);
+          pColl := PTCollSeq(sqlite3ExprCompareCollSeq(pParse, pTerm^.pExpr));
+          if pColl <> nil then
+            (PPAnsiChar(pIdx^.azColl) + n)^ := pColl^.zName
+          else
+            (PPAnsiChar(pIdx^.azColl) + n)^ := WhereStrBINARY;
+          if (pTerm^.pExpr^.pLeft <> nil)
+             and (Byte(sqlite3ExprAffinity(pTerm^.pExpr^.pLeft)) <> SQLITE_AFF_TEXT) then
+            useBloomFilter := 1;
+          Inc(n);
+        end;
+      end;
+    end;
+    Inc(pTerm);
+  end;
+
+  { Extra covering columns. }
+  for i := 0 to mxBitCol - 1 do
+  begin
+    if (extraCols and (Bitmask(1) shl i)) <> 0 then
+    begin
+      (pIdx^.aiColumn + n)^ := i16(i);
+      (PPAnsiChar(pIdx^.azColl) + n)^ := WhereStrBINARY;
+      Inc(n);
+    end;
+  end;
+  if (pSrc^.colUsed and (Bitmask(1) shl (BMS - 1))) <> 0 then
+    for i := BMS - 1 to i32(pTable^.nCol) - 1 do
+    begin
+      (pIdx^.aiColumn + n)^ := i16(i);
+      (PPAnsiChar(pIdx^.azColl) + n)^ := WhereStrBINARY;
+      Inc(n);
+    end;
+  if HasRowid(pTable) then
+  begin
+    (pIdx^.aiColumn + n)^ := i16(XN_ROWID);
+    (PPAnsiChar(pIdx^.azColl) + n)^ := WhereStrBINARY;
+  end;
+
+  { Set the final wsFlags now that the Index object exists. }
+  pLoop^.wsFlags := WHERE_COLUMN_EQ or WHERE_IDX_ONLY or WHERE_INDEXED
+                    or WHERE_AUTO_INDEX;
+
+  { Emit OP_OpenAutoindex + optional Bloom-filter blob. }
+  { explainAutomaticIndex is a no-op in non-STMT_SCANSTATUS builds. }
+  pLevel^.iIdxCur := pParse^.nTab;
+  Inc(pParse^.nTab);
+  sqlite3VdbeAddOp2(v, OP_OpenAutoindex, pLevel^.iIdxCur, nKeyCol + 1);
+  sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pIdx));
+  if OptimizationEnabled(db, SQLITE_BloomFilter) and (useBloomFilter <> 0) then
+  begin
+    Inc(pParse^.nMem);
+    pLevel^.regFilter := pParse^.nMem;
+    sqlite3VdbeAddOp2(v, OP_Blob, 10000, pLevel^.regFilter);
+  end;
+
+  { Emit the fill-loop: Rewind inner table, push rows into the auto-index. }
+  Assert((pSrc^.fg.fgBits and u8($40)) = 0,
+         'constructAutomaticIndex: viaCoroutine not yet supported');
+  Assert(pLevel^.addrHalt <> 0);
+  addrTop := sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrHalt);
+
+  if pPartial <> nil then
+  begin
+    iContinue := sqlite3VdbeMakeLabel(pParse);
+    sqlite3ExprIfFalse(pParse, pPartial, iContinue, SQLITE_JUMPIFNULL);
+    pLoop^.wsFlags := pLoop^.wsFlags or WHERE_PARTIALIDX;
+  end;
+
+  regRecord := sqlite3GetTempReg(pParse);
+  regBase   := sqlite3GenerateIndexKey(pParse, pIdx, pLevel^.iTabCur,
+                                       regRecord, 0, nil, nil, 0);
+  if pLevel^.regFilter <> 0 then
+    sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pLevel^.regFilter, 0,
+                         regBase, i32(pLoop^.u.btree.nEq));
+  { sqlite3VdbeScanStatusCounters — no-op without STMT_SCANSTATUS. }
+  sqlite3VdbeAddOp2(v, OP_IdxInsert, pLevel^.iIdxCur, regRecord);
+  sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+
+  if pPartial <> nil then
+    sqlite3VdbeResolveLabel(v, iContinue);
+
+  sqlite3VdbeAddOp2(v, OP_Next, pLevel^.iTabCur, addrTop + 1);
+  sqlite3VdbeChangeP5(v, SQLITE_STMTSTATUS_AUTOINDEX);
+  if (pSrc^.fg.jointype and JT_LEFT) <> 0 then
+    sqlite3VdbeJumpHere(v, addrTop);
+
+  sqlite3ReleaseTempReg(pParse, regRecord);
+
+  { Jump here to skip the auto-index creation on 2nd+ outer iterations. }
+  sqlite3VdbeJumpHere(v, addrInit);
+
+  sqlite3ExprDelete(db, pPartial);
+end;
+
 { Phase 6.9-bis step 11g.2.b — productive sqlite3WhereBegin prologue.
 
   Faithful port of where.c:6828..6993 — every line up to (but not including)
@@ -13475,7 +13770,21 @@ begin
         whereInfoFree(db, pWInfo);
         Exit(nil);
       end;
-      pLevel           := @whereInfoLevels(pWInfo)[ii];
+      pLevel  := @whereInfoLevels(pWInfo)[ii];
+      pLoop   := pLevel^.pWLoop;
+      { where.c:7454..7463 — build automatic index or Bloom filter if needed.
+        wsFlags is read from the loop BEFORE constructAutomaticIndex modifies it. }
+      if (pLoop^.wsFlags and (WHERE_AUTO_INDEX or WHERE_BLOOMFILTER)) <> 0 then
+      begin
+        if (pLoop^.wsFlags and WHERE_AUTO_INDEX) <> 0 then
+          constructAutomaticIndex(pParse, @pWInfo^.sWC, notReady, pLevel);
+        { WHERE_BLOOMFILTER-only path deferred (not exercised by corpus). }
+        if db^.mallocFailed <> 0 then
+        begin
+          whereInfoFree(db, pWInfo);
+          Exit(nil);
+        end;
+      end;
       pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
       notReady := sqlite3WhereCodeOneLoopStart(pParse, v, pWInfo, ii,
                                                pLevel, notReady);
@@ -15880,12 +16189,13 @@ end;
       raises sqlite3ErrorMsg, so we just propagate via pParse^.nErr. }
 procedure sqlite3SelectExpand(pParse: PParse; pSelect: PSelect);
 var
-  w:     TWalker;
-  pSrc:  PSrcList;
-  pItem: PSrcItem;
-  base:  PSrcItem;
-  i:     i32;
-  pTab:  PTable2;
+  w:        TWalker;
+  pSrc:     PSrcList;
+  pItem:    PSrcItem;
+  base:     PSrcItem;
+  i:        i32;
+  pTab:     PTable2;
+  joinFlag: u32;
 begin
   FillChar(w, SizeOf(w), 0);
   w.pParse := pParse;
@@ -15936,6 +16246,25 @@ begin
         Inc(pParse^.nTab);
       end;
       pItem^.colUsed := 0;
+
+      { Merge ON clause into pSelect->pWhere (select.c selectExpander:641..660).
+        For each non-first FROM item with a pOn expression, tag it with
+        EP_OuterON (LEFT/FULL JOIN) or EP_InnerON (INNER/CROSS) so the WHERE
+        machinery can enforce it correctly for outer-join null-row semantics,
+        then splice it into the SELECT's WHERE clause. }
+      if (i > 0) and (pItem^.u3.pOn <> nil) then
+      begin
+        if (pItem^.fg.jointype and JT_OUTER) <> 0 then
+          joinFlag := EP_OuterON
+        else
+          joinFlag := EP_InnerON;
+        sqlite3SetJoinExpr(pItem^.u3.pOn, pItem^.iCursor, joinFlag);
+        pSelect^.pWhere := sqlite3ExprAnd(pParse, pSelect^.pWhere,
+                                          pItem^.u3.pOn);
+        pItem^.u3.pOn  := nil;
+        pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $10;  { isOn bit }
+        pSelect^.selFlags := pSelect^.selFlags or SF_OnToWhere;
+      end;
     end;
   end;
 
@@ -16998,18 +17327,75 @@ begin
   { Phase 6.5 }
 end;
 
-{ sqlite3GenerateIndexKey — emit VDBE to form an index key (Phase 6.4 stub) }
+{ sqlite3ExprCodeLoadIndexColumn — load one column of an index from a table
+  cursor into a register.  Faithful port of expr.c:4359..4377.
+  XN_EXPR (expression-based) index columns are not yet supported (Assert). }
+procedure sqlite3ExprCodeLoadIndexColumn(pParse: PParse; pIdx: PIndex2;
+  iTabCur: i32; iIdxCol: i32; regOut: i32);
+var
+  iTabCol: i16;
+begin
+  iTabCol := pIdx^.aiColumn[iIdxCol];
+  if iTabCol = XN_EXPR then
+  begin
+    Assert(False, 'sqlite3ExprCodeLoadIndexColumn: XN_EXPR not yet supported');
+    Exit;
+  end;
+  sqlite3ExprCodeGetColumnOfTable(pParse^.pVdbe, pIdx^.pTable, iTabCur,
+                                  i32(iTabCol), regOut);
+end;
+
+{ sqlite3GenerateIndexKey — emit VDBE to form an index record key for pIdx,
+  reading column values from table cursor iDataCur.  Faithful port of
+  delete.c:965..1019.  piPartIdxLabel / pPrior / regPrior supported at
+  interface level; partial-index sub-expression and prior-key reuse are
+  gated to Assert(False) if exercised (not needed by the auto-index path). }
 function sqlite3GenerateIndexKey(pParse: PParse; pIdx: PIndex2;
   iDataCur: i32; regOut: i32; prefixOnly: i32; piPartIdxLabel: Pi32;
   pPrior: PIndex2; regPrior: i32): i32;
+var
+  v:       PVdbe;
+  j:       i32;
+  regBase: i32;
+  nCol:    i32;
 begin
-  Result := 0; { Phase 6.5 }
+  v := pParse^.pVdbe;
+  if piPartIdxLabel <> nil then
+  begin
+    if pIdx^.pPartIdxWhere <> nil then
+    begin
+      Assert(False, 'sqlite3GenerateIndexKey: partial index not yet supported');
+      piPartIdxLabel^ := 0;
+    end else
+      piPartIdxLabel^ := 0;
+  end;
+  if prefixOnly <> 0 then
+    nCol := i32(pIdx^.nKeyCol)
+  else
+    nCol := i32(pIdx^.nColumn);
+  regBase := sqlite3GetTempRange(pParse, nCol);
+  if (pPrior <> nil) and (regBase <> regPrior) then pPrior := nil;
+  for j := 0 to nCol - 1 do
+  begin
+    if (pPrior <> nil)
+       and (pPrior^.aiColumn[j] = pIdx^.aiColumn[j])
+       and (pIdx^.aiColumn[j] <> XN_EXPR) then
+      Continue;  { already computed by previous index }
+    sqlite3ExprCodeLoadIndexColumn(pParse, pIdx, iDataCur, j, regBase + j);
+    { sqlite3VdbeDeletePriorOpcode(v, OP_RealAffinity) — skip (rare path) }
+  end;
+  if regOut <> 0 then
+    sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, nCol, regOut);
+  sqlite3ReleaseTempRange(pParse, regBase, nCol);
+  Result := regBase;
 end;
 
-{ sqlite3ResolvePartIdxLabel — resolve partial-index skip label (Phase 6.4 stub) }
+{ sqlite3ResolvePartIdxLabel — resolve partial-index skip label.
+  Faithful port of delete.c:1027..1031. }
 procedure sqlite3ResolvePartIdxLabel(pParse: PParse; iLabel: i32);
 begin
-  { Phase 6.5 }
+  if iLabel <> 0 then
+    sqlite3VdbeResolveLabel(pParse^.pVdbe, iLabel);
 end;
 
 // ===========================================================================

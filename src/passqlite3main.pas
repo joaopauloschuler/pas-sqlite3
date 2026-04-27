@@ -504,7 +504,8 @@ begin
 
   db^.flags := db^.flags or
     (u64($00040) shl 32) or  { SQLITE_Comments — keep TestParser's flag bit }
-    (u64($00001) shl 32);    { SQLITE_ShortColNames }
+    (u64($00001) shl 32) or  { SQLITE_ShortColNames }
+    SQLITE_AutoIndex;        { SQLITE_DEFAULT_AUTOMATIC_INDEX default-on }
 
   sqlite3HashInit(@db^.aCollSeq);
   sqlite3HashInit(@db^.aModule);
