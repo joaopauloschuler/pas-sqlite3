@@ -3659,6 +3659,8 @@ function exprComputeOperands(pParse: PParse; pExpr: PExpr;
   pR1, pR2, pFree1, pFree2: Pi32): i32; forward;
 function codeCompare(pParse: PParse; pLeft, pRight: PExpr;
   opcode, in1, in2, dest, jumpIfNull, isCommuted: i32): i32; forward;
+function emitScalarFunctionCall(pParse: PParse; pExpr: PExpr;
+  target: i32): Boolean; forward;
 
 function exprDup_(db: PTsqlite3; const p: PExpr; dupFlags: i32;
   pEdupBuf: Pointer): PExpr;
@@ -4296,6 +4298,100 @@ begin
   end;
 end;
 
+{ Phase 6.9-bis 11g.2.f sub-progress 16(a) — minimal scalar TK_FUNCTION
+  codegen.  Subset port of expr.c:5267..5440.  Looks up the FuncDef by
+  (name, arity, encoding), codes each argument into a contiguous
+  register block (constant args factor-folded into the prologue via
+  sqlite3ExprCodeRunJustOnce, leaving the corresponding bit set in
+  constMask), then emits OP_Function via sqlite3VdbeAddFunctionCall.
+  Returns False if the FuncDef cannot be resolved so the caller can
+  emit the OP_Null fallback (preserving the dispatch's totality and
+  matching the C reference's "no such function" error path emitted
+  earlier by the resolver, not here).  Skipped for now:
+    * SQLITE_FUNC_NEEDCOLL pre-emit OP_CollSeq — required only for
+      collation-sensitive scalar funcs (substr/replace with explicit
+      COLLATE).  Default-collation calls work because OP_Function
+      tolerates a NULL pColl on first invocation.
+    * SQLITE_FUNC_OFFSET, SQLITE_FUNC_INLINE, date/time fast-paths.
+    * Aggregate function detection (caller asserts non-aggregate). }
+function emitScalarFunctionCall(pParse: PParse; pExpr: PExpr;
+  target: i32): Boolean;
+var
+  v:         PVdbe;
+  z:         PAnsiChar;
+  pFarg:     PExprList;
+  pItem:     PExprListItem;
+  items:     PExprListItem;
+  pDef:      PFuncDef;
+  db:        PTsqlite3;
+  i, n:      i32;
+  r1:        i32;
+  constMask: u32;
+  pArg:      PExpr;
+begin
+  v := pParse^.pVdbe;
+  db := pParse^.db;
+  if v = nil then begin Result := False; Exit; end;
+  z := pExpr^.u.zToken;
+  if z = nil then begin Result := False; Exit; end;
+  if ExprUseXList(pExpr) and (pExpr^.x.pList <> nil) then
+    pFarg := pExpr^.x.pList
+  else
+    pFarg := nil;
+  if pFarg <> nil then n := pFarg^.nExpr else n := 0;
+  pDef := PFuncDef(sqlite3FindFunction(db, z, n, db^.enc, 0));
+  if pDef = nil then
+  begin
+    pDef := PFuncDef(sqlite3FindFunction(db, z, -1, db^.enc, 0));
+    if pDef = nil then begin Result := False; Exit; end;
+  end;
+  constMask := 0;
+  if n > 0 then
+  begin
+    items := ExprListItems(pFarg);
+    { First pass: identify constant args so we can allocate a
+      stable nMem-resident block (factored constants must live in
+      a register that won't be reused across the loop body). }
+    i := 0;
+    while i < n do
+    begin
+      if (i < 32) and (sqlite3ExprIsConstant(pParse,
+            PExprListItem(PByte(items) + i * SZ_EXPRLIST_ITEM)^.pExpr) <> 0) then
+        constMask := constMask or (u32(1) shl i);
+      Inc(i);
+    end;
+    if constMask <> 0 then
+    begin
+      r1 := pParse^.nMem + 1;
+      pParse^.nMem := pParse^.nMem + n;
+    end
+    else
+      r1 := sqlite3GetTempRange(pParse, n);
+    { Second pass: code each arg into r1+i.  Constant args go
+      through sqlite3ExprCodeRunJustOnce so they land once in the
+      Init-section trailer; non-constant args are coded inline. }
+    i := 0;
+    while i < n do
+    begin
+      pItem := PExprListItem(PByte(items) + i * SZ_EXPRLIST_ITEM);
+      pArg  := pItem^.pExpr;
+      if (constMask and (u32(1) shl i)) <> 0 then
+        sqlite3ExprCodeRunJustOnce(pParse, pArg, r1 + i)
+      else
+        sqlite3ExprCode(pParse, pArg, r1 + i);
+      Inc(i);
+    end;
+  end
+  else
+    r1 := 0;
+  sqlite3VdbeAddFunctionCall(pParse, i32(constMask), r1, target, n,
+    pDef, i32(pExpr^.op2));
+  if (n > 0) and (constMask = 0) then
+    sqlite3ReleaseTempRange(pParse, r1, n);
+  Result := True;
+end;
+
+
 function sqlite3ExprCodeTarget(pParse: PParse; pExpr: PExpr;
   target: i32): i32;
 var
@@ -4613,6 +4709,12 @@ begin
             sqlite3VdbeAddOp2(v, OP_Null, 0, target);
             done := True;
           end;
+        end;
+      TK_FUNCTION:
+        begin
+          if not emitScalarFunctionCall(pParse, pExpr, target) then
+            sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+          done := True;
         end;
     else
       { TODO(Phase 6.9-bis): TK_AGG_COLUMN, TK_AND/TK_OR,

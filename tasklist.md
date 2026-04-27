@@ -2235,6 +2235,101 @@ Important: At the end of this document, please find:
       BETWEEN range-plan in `whereShortCut` for IPK_RANGE
       (SeekGE/Gt vs SCAN-with-residual).  LIKE optimisation and
       two-table JOIN codegen remain heavier follow-on lifts.
+    - [X] Sub-progress 16(a) — minimal scalar `TK_FUNCTION` codegen +
+      eager `sqlite3_initialize` from `openDatabase` (2026-04-27).
+      Three coupled landings:
+
+      (a) `sqlite3VdbeAddFunctionCall` (passqlite3vdbe.pas:2113) —
+      replaced the Phase 6 stub with a faithful subset port of
+      vdbeaux.c sqlite3VdbeAddFunctionCall.  Allocates a contiguous
+      `Tsqlite3_context + nArg * SizeOf(PMem)` block (8-byte aligned
+      argv tail), zero-fills, sets pFunc/argc/iOp, then emits
+      OP_Function (or OP_PureFunc when eCallCtx≠0) via
+      `sqlite3VdbeAddOp4` with P4_FUNCCTX.  ChangeP5(nArg) elided —
+      current upstream libsqlite3 (the EXPLAIN oracle this test diffs
+      against) does not write P5 for OP_Function/OP_PureFunc; argc
+      is read from `pCtx^.argc` at runtime, not `pOp^.p5`.
+
+      (b) `emitScalarFunctionCall` + TK_FUNCTION arm in
+      `sqlite3ExprCodeTarget` (passqlite3codegen.pas:4300).  Subset
+      port of expr.c:5267..5440.  Looks up the FuncDef via
+      `sqlite3FindFunction(db, zToken, nArg, db^.enc, 0)`, falls back
+      to `nArg=-1` for variable-arity functions when the exact match
+      fails.  First pass marks constant-arg positions in `constMask`;
+      second pass codes the args into a contiguous register block
+      (allocated from `pParse^.nMem` when constMask≠0 so the factored
+      registers persist across the loop body, otherwise from
+      `sqlite3GetTempRange`).  Constant args go through
+      `sqlite3ExprCodeRunJustOnce` so the literal lands once in the
+      Init-section trailer; non-constant args inline via
+      `sqlite3ExprCode`.  `sqlite3VdbeAddFunctionCall` then emits the
+      OP_Function with P1=constMask P2=r1 P3=target P4=pCtx.  Skipped
+      arms (collation pre-emit, OFFSET/INLINE/date-time fast-paths)
+      land with broader expr.c port — corpus rows that need them
+      degrade gracefully through the OP_Null fallback.
+
+      (c) `openDatabase` (passqlite3main.pas:448) — eager
+      `sqlite3_initialize` call before connection setup.  Mirrors
+      main.c:3328 — C's openDatabase calls sqlite3_initialize() first.
+      Latent gap: Pascal `openDatabase` had only called
+      `sqlite3_os_init` directly (omitting builtin-functions hash
+      population), and no Pascal-prepare path had reached TK_FUNCTION
+      codegen, so `sqlite3BuiltinFunctions` stayed empty and
+      `sqlite3FindFunction` returned nil for every name.  Confirmed
+      via diagnostic: pre-fix `aFunc.count=0` and bucket-20 (where
+      'like' hashes) was nil; post-fix the FuncDef pointer for `like`
+      resolves immediately.
+
+      (d) `TestConfigHooks.pas` T20..T23 — added an explicit
+      `sqlite3_close_v2 + sqlite3_shutdown` between the db_config
+      block and the global `sqlite3_config` block.  `sqlite3_config`
+      is gated on `isInit=0` per the C reference (config can only be
+      changed before initialisation); now that `sqlite3_open` wires
+      `sqlite3_initialize`, the test must reset isInit before
+      exercising the global-config arms.  Mirrors the documented
+      C-side calling convention; comment in the test (which had read
+      "isInit is currently 0 (sqlite3_initialize not yet wired)") is
+      updated.
+
+      Test-suite delta:
+        * TestWhereCorpus moves from `12 PASS / 8 DIVERGE / 0 ERROR`
+          (sub-progress 15) to `14 PASS / 6 DIVERGE / 0 ERROR`.  Two
+          new PASS rows: LIKE prefix (`SELECT a FROM t WHERE c LIKE
+          'hi%'`, 13 ops byte-identical), LIKE wildcard (`%X%`,
+          13 ops byte-identical).  Failure-mode tally unchanged at
+          `0 exception, 0 nil-Vdbe, 6 op-count, 0 op-diff`.
+          Per-shape histogram: LIKE 1/0, LIKE_WILD 1/0; remaining
+          DIVERGE rows are IPK_IN, IPK_RANGE, INDEX_IN, INDEX_IN_SUB,
+          LEFT_JOIN, JOIN_WHERE — each needs structural codegen
+          (IN-coroutine, BETWEEN range-plan, two-table JOIN).
+        * TestConfigHooks restored to 54/0 after the test fixture
+          update; T19d (close before shutdown) added.
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41, TestVdbeApi
+          57/57, TestVdbeMisc 45/45, TestVdbeMem 62/62, TestVdbeAux
+          108/108, TestVdbeRecord 13/13, TestVdbeAgg 11/11,
+          TestVdbeStr 23/23, TestVdbeBlob 13/13, TestVdbeSort 14/14,
+          TestVdbeCursor 27/27, TestVdbeVtabExec 50/50,
+          TestExplainParity 2/10 unchanged, TestBtreeCompat 337/337,
+          TestPrintf 105/105, TestJson 434/434, TestJsonEach 50/50,
+          TestTokenizer 127/127, TestRegistration 19/19,
+          TestExecGetTable 23/23, TestBackup 20/20, TestInitShutdown
+          27/27, TestUnlockNotify 14/14, TestLoadExt 20/20,
+          TestAuthBuiltins 34/34, TestOpenClose 17/17,
+          TestInitCallback 29/29, TestSmoke + TestUtil + TestPCache +
+          all TestPager* + TestOSLayer green.
+
+      Sub-progress 16(b) must port the IN-coroutine machinery
+      (`sqlite3CodeRhsOfIN` + `sqlite3ExprCodeIN`) so IPK_IN /
+      INDEX_IN / INDEX_IN_SUB reach the BeginSubrtn / Once /
+      OpenEphemeral structure (worth ~13..16 ops per row).  Then
+      BETWEEN range-plan in `whereShortCut` (or
+      `whereLoopAddBtree`) for IPK_RANGE.  Two-table JOIN codegen
+      remains the heaviest follow-on lift.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

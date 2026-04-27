@@ -449,6 +449,17 @@ begin
   if ppDb = nil then begin Result := SQLITE_MISUSE; Exit; end;
   ppDb^ := nil;
 
+  { Phase 6.9-bis 11g.2.f sub-progress 16(a) — ensure
+    sqlite3BuiltinFunctions and the rest of the global init state are
+    populated before any prepare runs.  Mirrors main.c:3328 — C's
+    openDatabase calls sqlite3_initialize() first.  Latent gap: prior
+    to TK_FUNCTION codegen, no Pascal-prepare path consulted the
+    built-in function hash, so the empty table was harmless. }
+  if sqlite3GlobalConfig.isInit = 0 then begin
+    Result := sqlite3_initialize;
+    if Result <> SQLITE_OK then Exit;
+  end;
+
   { Strip non-public flag bits, just like main.c:3371 does. }
   flags := flags and not (
       SQLITE_OPEN_DELETEONCLOSE or

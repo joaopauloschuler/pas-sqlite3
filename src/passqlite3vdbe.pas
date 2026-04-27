@@ -1650,6 +1650,11 @@ begin
   Result := PPsqlite3db(p)^;  { Parse.db at offset 0 }
 end;
 
+function vdbeParsePVdbe(p: PParse): PVdbe; inline;
+begin
+  Result := PPVdbe(PByte(p) + 16)^;  { Parse.pVdbe at offset 16 }
+end;
+
 function vdbeParseSzOpAllocPtr(p: PParse): Pi32; inline;
 begin
   Result := Pi32(PByte(p) + 64);
@@ -2104,9 +2109,49 @@ end;
 
 function sqlite3VdbeAddFunctionCall(pParse: PParse; p1: i32; p2, p3: i32;
                                     nArg: i32; pFunc: PFuncDef; p5: i32): i32;
+{ Faithful port of vdbeaux.c sqlite3VdbeAddFunctionCall.
+  p5 here is the C `eCallCtx` argument (0 = OP_Function, 1 = OP_PureFunc),
+  not the VDBE P5 byte.  Allocates a sqlite3_context with room for nArg
+  argv slots, wires pFunc/argc/iOp into it, emits the OP_Function /
+  OP_PureFunc opcode with P4_FUNCCTX, and ChangeP5(nArg). }
+var
+  v:      PVdbe;
+  pCtx:   Psqlite3_context;
+  pDb:    Psqlite3db;
+  nByte:  u64;
+  baseSz: u64;
+  addr:   i32;
+  op:     i32;
 begin
-  { Stub — requires Phase 6 (FuncDef, sqlite3_context allocation) }
-  Result := 0;
+  v := vdbeParsePVdbe(pParse);
+  Assert(v <> nil);
+  pDb := vdbeParseDbPtr(pParse);
+  baseSz := (u64(SizeOf(Tsqlite3_context)) + 7) and not u64(7);
+  nByte  := baseSz + u64(nArg) * u64(SizeOf(PMem));
+  pCtx   := Psqlite3_context(sqlite3DbMallocRawNN(pDb, nByte));
+  if pCtx = nil then
+  begin
+    Assert(vdbeDbMallocFailed(pDb));
+    Result := 0;
+    Exit;
+  end;
+  FillChar(pCtx^, nByte, 0);
+  pCtx^.pOut    := nil;
+  pCtx^.pFunc   := pFunc;
+  pCtx^.pVdbe   := nil;
+  pCtx^.isError := 0;
+  pCtx^.argc    := u16(nArg);
+  pCtx^.iOp     := sqlite3VdbeCurrentAddr(v);
+  if p5 <> 0 then
+    op := OP_PureFunc
+  else
+    op := OP_Function;
+  addr := sqlite3VdbeAddOp4(v, op, p1, p2, p3, PAnsiChar(pCtx), P4_FUNCCTX);
+  { Note: ChangeP5(nArg) elided — current libsqlite3 (matches the EXPLAIN
+    oracle) does not write P5 for OP_Function/OP_PureFunc; argc is read
+    from pCtx^.argc at runtime, not pOp^.p5.  Setting P5 introduces a
+    spurious bytecode-diff against the oracle. }
+  Result := addr;
 end;
 
 { --- Label management --- }

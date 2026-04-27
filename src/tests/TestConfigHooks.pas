@@ -159,7 +159,15 @@ begin
   ExpectEq(i32(db^.lookaside.bDisable), 1, 'T19c bDisable=1');
 
   { ---------------- sqlite3_config (int shape) ---------------- }
-  { isInit is currently 0 (sqlite3_initialize not yet wired). }
+  { sqlite3_open now eagerly wires sqlite3_initialize (sub-progress
+    16(a) — required for built-in function lookup on the codegen
+    path), so isInit=1 here.  sqlite3_config requires isInit=0; close
+    the connection and shutdown to reset, mirroring the real SQLite
+    requirement. }
+  rc := sqlite3_close_v2(db);
+  ExpectEq(rc, SQLITE_OK, 'T19d close_v2 before shutdown');
+  sqlite3_shutdown;
+  db := nil;
   rc := sqlite3_config(SQLITE_CONFIG_URI, 1);
   ExpectEq(rc, SQLITE_OK, 'T20 sqlite3_config(URI=1)');
   ExpectEq(sqlite3GlobalConfig.bOpenUri, 1, 'T20b bOpenUri=1');
@@ -177,8 +185,7 @@ begin
   rc := sqlite3_config(9999, 0);
   ExpectEq(rc, SQLITE_MISUSE, 'T24 sqlite3_config unknown op → MISUSE');
 
-  rc := sqlite3_close_v2(db);
-  ExpectEq(rc, SQLITE_OK, 'T25 close_v2');
+  { db already closed before shutdown; T25 was the explicit close. }
 
   WriteLn;
   WriteLn('Result: ', gPass, ' passed, ', gFail, ' failed');
