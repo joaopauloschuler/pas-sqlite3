@@ -278,6 +278,23 @@ const
   OE_Cascade  = 10;  { FK: cascade the changes }
   OE_Default  = 11;  { do whatever the default action is }
 
+  { IN_INDEX_* — return codes for sqlite3FindInIndex (sqliteInt.h:5754..5764).
+    Allowed b-tree shape for the IN operator's RHS.  ROWID, EPH, INDEX_ASC,
+    INDEX_DESC describe the cursor opened on a table or index; NOOP is the
+    "do not allocate a cursor — emit a sequence of comparisons" reply. }
+  IN_INDEX_ROWID      = 1;
+  IN_INDEX_EPH        = 2;
+  IN_INDEX_INDEX_ASC  = 3;
+  IN_INDEX_INDEX_DESC = 4;
+  IN_INDEX_NOOP       = 5;
+
+  { sqlite3FindInIndex inFlags bits.  NOOP_OK is request — caller permits the
+    NOOP reply when the RHS is a small list.  MEMBERSHIP / LOOP describe the
+    intended use (must-be-unique vs. fast set membership). }
+  IN_INDEX_NOOP_OK    = $0001;
+  IN_INDEX_MEMBERSHIP = $0002;
+  IN_INDEX_LOOP       = $0004;
+
   { TRIGGER_* timing constants (sqliteInt.h line 4115-4116) }
   TRIGGER_BEFORE = 1;
   TRIGGER_AFTER  = 2;
@@ -2511,6 +2528,27 @@ function isCandidateForInOpt(pX: PExpr): PSelect;
 function sqlite3InRhsIsConstant(pParse: PParse; pIn: PExpr): i32;
 procedure sqlite3SetHasNullFlag(v: PVdbe; iCur: i32; regHasNull: i32);
 function sqlite3RowidAlias(pTab: PTable2): PAnsiChar;
+
+{ Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers, batch 9.
+  sqlite3FindInIndex (expr.c:3230..3451) decides how the RHS of an IN operator
+  should be materialised: as an existing rowid scan, an existing index scan
+  (ASC/DESC), an ephemeral b-tree (IN_INDEX_EPH), or as a sequence of OP_Eq
+  comparisons (IN_INDEX_NOOP).  The b-tree paths reuse a table or index that
+  matches the result-list columns and affinity rules of the IN-RHS SELECT —
+  no ephemeral allocation is needed when an existing structure suffices.
+  Caller passes inFlags = IN_INDEX_LOOP | IN_INDEX_MEMBERSHIP (with the
+  optional IN_INDEX_NOOP_OK bit), an out-register for "RHS contains NULL"
+  (prRhsHasNull, may be nil), an out-mapping array (aiMap, may be nil) and
+  an out-cursor (piTab).  Returns the IN_INDEX_* code.
+
+  sqlite3CodeRhsOfIN (expr.c:3500..3731) materialises the IN-RHS into an
+  ephemeral b-tree.  Stub asserts on entry — full port lands once
+  sqlite3Select / sqlite3SelectDestInit are available.  IN_INDEX_EPH callers
+  must therefore not be exercised in this batch's tests. }
+function  sqlite3FindInIndex(pParse: PParse; pX: PExpr; inFlags: u32;
+  prRhsHasNull: Pi32; aiMap: Pi32; piTab: Pi32): i32;
+procedure sqlite3CodeRhsOfIN(pParse: PParse; pX: PExpr; iTab: i32;
+  bloomOk: i32);
 
 { Index helpers }
 procedure sqlite3FreeIndex(db: PTsqlite3; p: PIndex2);
@@ -20222,6 +20260,288 @@ begin
   for ii := 0 to High(azOpt) do
     if sqlite3ColumnIndex(pTab, azOpt[ii]) < 0 then Exit(azOpt[ii]);
   Result := nil;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers,
+  batch 9.
+
+  sqlite3FindInIndex (expr.c:3230..3451) and sqlite3CodeRhsOfIN stub.
+
+  sqlite3FindInIndex chooses the best b-tree shape for the RHS of an `IN`
+  operator.  Three reuse paths land here verbatim from upstream:
+
+    * IN_INDEX_ROWID — RHS is "SELECT rowid FROM tab" (single result column
+      with iColumn<0).  Opens the table directly with OP_OpenRead under an
+      OP_Once gate.
+    * IN_INDEX_INDEX_ASC / IN_INDEX_INDEX_DESC — RHS columns map onto a
+      sqlite_index whose nColumn>=nExpr, no partial-index predicate, fits
+      under BMS-1 and (when MEMBERSHIP plus nColumn>nExpr) is UNIQUE.  The
+      mapping is computed against pIdx^.azColl + the LHS/RHS comparison
+      collation; aiMap (when supplied) records "RHS col i → index col j".
+    * IN_INDEX_NOOP — caller passed NOOP_OK and either the RHS is a
+      non-constant list or the list has ≤2 entries: cheaper to emit a
+      sequence of OP_Eq comparisons than to spin up an ephemeral b-tree.
+      `pParse^.nTab--` rolls back the cursor allocation.
+
+  All other shapes fall through to sqlite3CodeRhsOfIN, which materialises
+  the RHS into an ephemeral table.  That routine itself is heavy (depends
+  on sqlite3Select / sqlite3SelectDestInit) and is stubbed here as an
+  Assert(False) — must not be hit by callers in this batch's test suite.
+
+  prRhsHasNull (when non-nil) is upgraded to nil if the SELECT result list
+  is provably NOT NULL on every column (sqlite3ExprCanBeNull short-circuit).
+  The IN_INDEX_INDEX_ASC/DESC branch allocates the register and, when the
+  comparison is single-column, emits the sqlite3SetHasNullFlag probe so the
+  caller can short-circuit a NULL-vs-NULL membership test.
+
+  aiMap, if supplied, is a length-nExpr int array.  In the index-reuse
+  branches the i'th slot is set to the matching index-key column.  In the
+  ROWID, EPH and NOOP branches the array is filled with identity 0..n-1
+  via the trailing fixup.
+
+  =========================================================================== }
+
+procedure sqlite3CodeRhsOfIN(pParse: PParse; pX: PExpr; iTab: i32;
+  bloomOk: i32);
+begin
+  { Materialises the RHS of an IN(...) into an ephemeral b-tree.  Full
+    implementation pulls in sqlite3Select (select.c, ~3500 lines) and
+    sqlite3SelectDestInit; landed in a later sub-progress.  Until then
+    the IN_INDEX_EPH path of sqlite3FindInIndex must not be reached. }
+  Assert(False, 'sqlite3CodeRhsOfIN not yet ported');
+  if (pParse = nil) and (pX = nil) and (iTab = 0) and (bloomOk = 0) then
+    Exit;
+end;
+
+function sqlite3FindInIndex(pParse: PParse; pX: PExpr; inFlags: u32;
+  prRhsHasNull: Pi32; aiMap: Pi32; piTab: Pi32): i32;
+var
+  p:           PSelect;
+  eType:       i32;
+  iTab:        i32;
+  mustBeUnique: Boolean;
+  v:           PVdbe;
+  pEList:      PExprList;
+  i, j:        i32;
+  nExpr:       i32;
+  pELItem:     PExprListItem;
+  db:          PTsqlite3;
+  pTab:        PTable2;
+  iDb:         i32;
+  affinity_ok: Boolean;
+  pLhs, pRhs:  PExpr;
+  pIdx:        PIndex2;
+  iCol:        i32;
+  idxaff, cmpaff: AnsiChar;
+  colUsed, mCol: Bitmask;
+  pReq:        Pointer;   { CollSeq* — opaque }
+  azColl:      PPAnsiChar;
+  iAddr:       i32;
+  savedNQueryLoop: u32;
+  rMayHaveNull: i32;
+  bloomOk:     i32;
+  n:           i32;
+  pItemSrc:    PSrcItem;
+begin
+  Assert(pX^.op = TK_IN);
+  eType        := 0;
+  mustBeUnique := (inFlags and IN_INDEX_LOOP) <> 0;
+  iTab         := pParse^.nTab;
+  Inc(pParse^.nTab);
+  v := sqlite3GetVdbe(pParse);
+  p := nil;
+
+  { If the caller wants to know whether the RHS can contain NULL, and the
+    RHS is a SELECT, scan its result list — if every column is provably NOT
+    NULL, drop prRhsHasNull so the callers stop tracking the flag. }
+  if (prRhsHasNull <> nil) and ExprUseXSelect(pX) then begin
+    pEList := pX^.x.pSelect^.pEList;
+    i := 0;
+    while i < pEList^.nExpr do begin
+      pELItem := PExprListItem(PByte(ExprListItems(pEList))
+                   + i * SZ_EXPRLIST_ITEM);
+      if sqlite3ExprCanBeNull(pELItem^.pExpr) <> 0 then Break;
+      Inc(i);
+    end;
+    if i = pEList^.nExpr then prRhsHasNull := nil;
+  end;
+
+  { Try to satisfy the IN with an existing table or index. }
+  if (pParse^.nErr = 0) then begin
+    p := isCandidateForInOpt(pX);
+    if p <> nil then begin
+      db       := pParse^.db;
+      pEList   := p^.pEList;
+      nExpr    := pEList^.nExpr;
+      pItemSrc := SrcListItems(p^.pSrc);
+      pTab     := pItemSrc^.pSTab;
+
+      iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+      Assert((iDb >= 0) and (iDb < SQLITE_MAX_ATTACHED + 2));
+      sqlite3CodeVerifySchema(pParse, iDb);
+      { sqlite3TableLock — no-op without SQLITE_OMIT_SHARED_CACHE shared cache. }
+
+      Assert(v <> nil);
+
+      pELItem := PExprListItem(ExprListItems(pEList));
+      if (nExpr = 1) and (pELItem^.pExpr^.iColumn < 0) then begin
+        { "x IN (SELECT rowid FROM table)" — open the table on iTab. }
+        iAddr := sqlite3VdbeAddOp0(v, OP_Once);
+        sqlite3OpenTable(pParse, iTab, iDb, pTab, OP_OpenRead);
+        eType := IN_INDEX_ROWID;
+        sqlite3VdbeJumpHere(v, iAddr);
+      end else begin
+        affinity_ok := True;
+
+        { Every result column must compare with an affinity that the RHS
+          table column can serve.  If the comparison affinity is BLOB or
+          TEXT (with idxaff TEXT), every index reuses; otherwise the RHS
+          column must be numeric. }
+        i := 0;
+        while (i < nExpr) and affinity_ok do begin
+          pLhs := sqlite3VectorFieldSubexpr(pX^.pLeft, i);
+          pELItem := PExprListItem(PByte(ExprListItems(pEList))
+                       + i * SZ_EXPRLIST_ITEM);
+          iCol   := pELItem^.pExpr^.iColumn;
+          idxaff := sqlite3TableColumnAffinity(pTab, iCol);
+          cmpaff := sqlite3CompareAffinity(pLhs, idxaff);
+          case Byte(cmpaff) of
+            SQLITE_AFF_BLOB: ;     { works with any RHS affinity }
+            SQLITE_AFF_TEXT:
+              { sqlite3CompareAffinity returns TEXT only when one side has
+                no affinity and the other is TEXT — so idxaff must be TEXT. }
+              Assert(Byte(idxaff) = SQLITE_AFF_TEXT);
+            else
+              affinity_ok := Byte(idxaff) >= SQLITE_AFF_NUMERIC;
+          end;
+          Inc(i);
+        end;
+
+        if affinity_ok then begin
+          pIdx := pTab^.pIndex;
+          while (pIdx <> nil) and (eType = 0) do begin
+            if pIdx^.nColumn < nExpr then begin
+              pIdx := pIdx^.pNext; Continue;
+            end;
+            if pIdx^.pPartIdxWhere <> nil then begin
+              pIdx := pIdx^.pNext; Continue;
+            end;
+            { BMS-2 ceiling lets us compute MASKBIT(nExpr) without overflow. }
+            if pIdx^.nColumn >= u16(BMS - 1) then begin
+              pIdx := pIdx^.pNext; Continue;
+            end;
+            if mustBeUnique then begin
+              if (pIdx^.nKeyCol > nExpr)
+                 or ((pIdx^.nColumn > nExpr) and (pIdx^.onError = OE_None)) then
+              begin
+                pIdx := pIdx^.pNext; Continue;
+              end;
+            end;
+
+            colUsed := 0;
+            azColl  := PPAnsiChar(pIdx^.azColl);
+            i := 0;
+            while i < nExpr do begin
+              pLhs := sqlite3VectorFieldSubexpr(pX^.pLeft, i);
+              pELItem := PExprListItem(PByte(ExprListItems(pEList))
+                           + i * SZ_EXPRLIST_ITEM);
+              pRhs := pELItem^.pExpr;
+              pReq := sqlite3BinaryCompareCollSeq(pParse, pLhs, pRhs);
+              j := 0;
+              while j < nExpr do begin
+                if pIdx^.aiColumn[j] = pRhs^.iColumn then begin
+                  Assert(azColl[j] <> nil);
+                  if (pReq = nil)
+                     or (sqlite3StrICmp(PTCollSeq(pReq)^.zName,
+                                         azColl[j]) = 0) then
+                    Break;
+                end;
+                Inc(j);
+              end;
+              if j = nExpr then Break;
+              mCol := Bitmask(1) shl j;
+              if (mCol and colUsed) <> 0 then Break;
+              colUsed := colUsed or mCol;
+              if aiMap <> nil then aiMap[i] := j;
+              Inc(i);
+            end;
+
+            Assert((nExpr > 0) and (nExpr < BMS));
+            Assert((i = nExpr)
+                   or (colUsed <> ((Bitmask(1) shl nExpr) - 1)));
+            if colUsed = ((Bitmask(1) shl nExpr) - 1) then begin
+              { pIdx is usable. }
+              iAddr := sqlite3VdbeAddOp0(v, OP_Once);
+              sqlite3VdbeAddOp3(v, OP_OpenRead, iTab, i32(pIdx^.tnum), iDb);
+              sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pIdx));
+              Assert(IN_INDEX_INDEX_DESC = IN_INDEX_INDEX_ASC + 1);
+              eType := IN_INDEX_INDEX_ASC + i32(pIdx^.aSortOrder[0]);
+              if prRhsHasNull <> nil then begin
+                Inc(pParse^.nMem);
+                prRhsHasNull^ := pParse^.nMem;
+                if nExpr = 1 then
+                  sqlite3SetHasNullFlag(v, iTab, prRhsHasNull^);
+              end;
+              sqlite3VdbeJumpHere(v, iAddr);
+            end;
+
+            pIdx := pIdx^.pNext;
+          end;
+        end;
+      end;
+    end;
+  end;
+
+  { No reusable b-tree?  If NOOP_OK and the RHS is a list (not a SELECT)
+    that's either non-constant or has ≤2 entries, fall back to OP_Eq
+    sequence — cheaper than building an ephemeral b-tree. }
+  if (eType = 0)
+     and ((inFlags and IN_INDEX_NOOP_OK) <> 0)
+     and ExprUseXList(pX)
+     and ((sqlite3InRhsIsConstant(pParse, pX) = 0)
+          or (pX^.x.pList^.nExpr <= 2)) then
+  begin
+    Dec(pParse^.nTab);    { roll back the cursor reservation }
+    iTab  := -1;
+    eType := IN_INDEX_NOOP;
+  end;
+
+  if eType = 0 then begin
+    { Materialise into an ephemeral table. }
+    savedNQueryLoop := pParse^.nQueryLoop;
+    rMayHaveNull    := 0;
+    if (inFlags and IN_INDEX_MEMBERSHIP) <> 0 then bloomOk := 1
+    else                                          bloomOk := 0;
+    eType := IN_INDEX_EPH;
+    if (inFlags and IN_INDEX_LOOP) <> 0 then
+      pParse^.nQueryLoop := 0
+    else if prRhsHasNull <> nil then begin
+      Inc(pParse^.nMem);
+      rMayHaveNull   := pParse^.nMem;
+      prRhsHasNull^  := rMayHaveNull;
+    end;
+    Assert(pX^.op = TK_IN);
+    if (bloomOk = 0)
+       and ExprUseXSelect(pX)
+       and ((pX^.x.pSelect^.selFlags and SF_ClonedRhsIn) <> 0) then
+      bloomOk := 1;
+    sqlite3CodeRhsOfIN(pParse, pX, iTab, bloomOk);
+    if rMayHaveNull <> 0 then
+      sqlite3SetHasNullFlag(v, iTab, rMayHaveNull);
+    pParse^.nQueryLoop := savedNQueryLoop;
+  end;
+
+  if (aiMap <> nil)
+     and (eType <> IN_INDEX_INDEX_ASC)
+     and (eType <> IN_INDEX_INDEX_DESC) then
+  begin
+    n := sqlite3ExprVectorSize(pX^.pLeft);
+    for i := 0 to n - 1 do aiMap[i] := i;
+  end;
+
+  piTab^ := iTab;
+  Result := eType;
 end;
 
 end.

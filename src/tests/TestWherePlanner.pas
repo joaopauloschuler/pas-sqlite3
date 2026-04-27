@@ -4404,6 +4404,81 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- sqlite3FindInIndex (expr.c:3230..3451) -----
+  Tests the NOOP fall-back path: with a small constant RHS list and
+  IN_INDEX_NOOP_OK in inFlags, the routine returns IN_INDEX_NOOP, rolls
+  back the cursor allocation (nTab restored), and back-fills aiMap with
+  the identity 0..n-1. }
+procedure TestFindInIndex;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  pLeft, pR1, pR2, pIN: PExpr;
+  pList:     PExprList;
+  pListItem: PExprListItem;
+  aiMap:     array[0..1] of i32;
+  iTab:      i32;
+  rc:        i32;
+  nTabBefore: i32;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('FII open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+
+  { LHS scalar TK_COLUMN. }
+  pLeft := PExpr(sqlite3DbMallocZero(db, SizeOf(TExpr)));
+  pLeft^.op      := TK_COLUMN;
+  pLeft^.iColumn := 0;
+
+  { RHS: 2-element constant TK_INTEGER list (small ⇒ qualifies for NOOP). }
+  pR1 := PExpr(sqlite3DbMallocZero(db, SizeOf(TExpr)));
+  pR1^.op       := TK_INTEGER;
+  pR1^.flags    := EP_IntValue;
+  pR1^.u.iValue := 1;
+  pR2 := PExpr(sqlite3DbMallocZero(db, SizeOf(TExpr)));
+  pR2^.op       := TK_INTEGER;
+  pR2^.flags    := EP_IntValue;
+  pR2^.u.iValue := 2;
+
+  pList := PExprList(sqlite3DbMallocZero(db, SizeOf(TExprList)
+                                            + 2 * SZ_EXPRLIST_ITEM));
+  pList^.nExpr  := 2;
+  pList^.nAlloc := 2;
+  pListItem := ExprListItems(pList);
+  pListItem^.pExpr := pR1;
+  Inc(pListItem);
+  pListItem^.pExpr := pR2;
+
+  pIN := PExpr(sqlite3DbMallocZero(db, SizeOf(TExpr)));
+  pIN^.op      := TK_IN;
+  pIN^.pLeft   := pLeft;
+  pIN^.x.pList := pList;
+
+  aiMap[0] := 99; aiMap[1] := 99;
+  iTab := -2;
+  nTabBefore := parse.nTab;
+  rc := sqlite3FindInIndex(@parse, pIN,
+          IN_INDEX_MEMBERSHIP or IN_INDEX_NOOP_OK,
+          nil, @aiMap[0], @iTab);
+
+  Check('FII1 returns IN_INDEX_NOOP',          rc   = IN_INDEX_NOOP);
+  Check('FII1 piTab = -1 (no cursor)',         iTab = -1);
+  Check('FII1 nTab restored',                  parse.nTab = nTabBefore);
+  { aiMap fixup loops over sqlite3ExprVectorSize(pX^.pLeft) = 1 (scalar
+    LHS) — index 0 fills, index 1 untouched. }
+  Check('FII1 aiMap[0] identity',              aiMap[0] = 0);
+  Check('FII1 aiMap[1] untouched',             aiMap[1] = 99);
+  Check('FII1 pIN->pLeft restored',            pIN^.pLeft = pLeft);
+
+  sqlite3DbFree(db, pIN);
+  sqlite3DbFree(db, pList);
+  sqlite3DbFree(db, pR2);
+  sqlite3DbFree(db, pR1);
+  sqlite3DbFree(db, pLeft);
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -4462,6 +4537,7 @@ begin
   TestInRhsIsConstant;
   TestSetHasNullFlag;
   TestRowidAlias;
+  TestFindInIndex;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

@@ -700,6 +700,32 @@ Important: At the end of this document, please find:
       emitted; OP_Integer p1=0 / p2=reg ; OP_Rewind p1=iCur / p2 patched to
       `baseAddr+3` ; OP_Column p1=iCur / p2=0 / p3=reg / p5=TYPEOFARG),
       RA1 (empty schema picks `_ROWID_`).
+    - [X] Leaf helpers, batch 9 — `sqlite3FindInIndex`
+      (expr.c:3230..3451) plus `sqlite3CodeRhsOfIN` assert-stub
+      (expr.c:3500..3731 deferred).  IN_INDEX_* return-codes and
+      IN_INDEX_LOOP / _MEMBERSHIP / _NOOP_OK inFlags wired up.
+      sqlite3FindInIndex chooses the b-tree shape used by codeINTerm:
+      IN_INDEX_ROWID for "x IN (SELECT rowid FROM t)" (opens the table
+      under OP_Once / OP_OpenRead), IN_INDEX_INDEX_ASC/_DESC when an
+      existing pIdx covers every result-list column with matching
+      affinity + collation (asserts UNIQUE when MEMBERSHIP requires it,
+      falls back when the partial-index pPartIdxWhere is set, when
+      pIdx^.nColumn>=BMS-1, or when nExpr exceeds nKeyCol on a
+      non-UNIQUE index), IN_INDEX_NOOP when NOOP_OK is set and the RHS
+      is a non-constant list or has ≤2 entries (rolls back the cursor
+      reservation via Dec(pParse^.nTab); piTab=-1), otherwise
+      IN_INDEX_EPH which delegates to sqlite3CodeRhsOfIN — currently
+      stubbed `Assert(False)` until select.c lands, so EPH callers must
+      not be exercised yet.  prRhsHasNull is dropped to nil when every
+      SELECT result column is provably NOT NULL; on the index path it
+      allocates pParse^.nMem and threads sqlite3SetHasNullFlag on
+      single-column comparisons.  The trailing aiMap-fixup fills 0..n-1
+      identity for ROWID/EPH/NOOP, reserving the meaningful per-column
+      mapping for the INDEX_ASC/_DESC branches.  Gate:
+      `TestWherePlanner.pas` (471/471): FII1 (constant 2-element list +
+      NOOP_OK ⇒ IN_INDEX_NOOP, piTab=-1, nTab restored, aiMap[0]=0,
+      pLeft restored).  Sub-progress 11g.2.e now unblocks codeINTerm
+      itself for the next batch.
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix
