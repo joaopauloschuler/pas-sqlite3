@@ -158,6 +158,7 @@ compile_test TestExecGetTable
 compile_test TestBackup
 compile_test TestUnlockNotify
 compile_test TestLoadExt
+compile_test TestRowidIn
 compile_test TestExplainParity
 compile_test TestWhereCorpus
 compile_test TestSQLCorpus

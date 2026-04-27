@@ -84,13 +84,7 @@ Important: At the end of this document, please find:
           `sqlite3Insert`).
         [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
           VALUES path).
-        [X] **IPK-IN execution path** — the original tri-bug
-          (hoist-gate skip / FindCompare stub / cursor-corruption /
-          BtreePayloadFetch index offset) is RESOLVED 2026-04-27.
-          Sub-tasks below track follow-on extensions and the runtime
-          gate.  Repro driver: `src/tests/ReproOrRowid.pas` — verifies
-          rowid IN (2/3/4 entries) end-to-end against the C oracle.
-
+        [ ] **IPK-IN execution path**
             [X] **6.10 step 6.IPK-IN.a** — landed 2026-04-27.
                 Hoist-gate fix at `passqlite3codegen.pas:14296`:
                 force-call `sqlite3FindInIndex(IN_INDEX_MEMBERSHIP)`
@@ -109,8 +103,8 @@ Important: At the end of this document, please find:
                 `WHERE rowid IN (1,2,3,4)` returns 10,20,30.
                 ReproOrRowid extended to 3- and 4-entry lists so
                 regressions surface end-to-end.
-            [ ] **6.10 step 6.IPK-IN.b.full** Extend
-                `sqlite3VdbeRecordCompare` to cover string (collation
+            [ ] **6.10 step 6.IPK-IN.b.full** Port 
+                `sqlite3VdbeRecordCompare` in full to cover string (collation
                 + encoding-change), blob (with MEM_Zero), and real
                 RHS arms.  Required before any non-IPK ephemeral
                 index lookup (column IN with text keys, ORDER BY
@@ -121,29 +115,25 @@ Important: At the end of this document, please find:
                 reconcile that vs. codegen.pas's bigger
                 TUnpackedRecord before porting the corruption /
                 BIGNULL / DESC arms.
-            [ ] **6.10 step 6.IPK-IN.c** Promote `ReproOrRowid` (or
-                an equivalent test) into `build.sh` as a first-class
-                runtime gate covering rowid IN (2/3/4 entries), column
-                IN, OR-rewritten IN, and `rowid=K1 OR rowid=K2`.  The
-                driver currently exists at `src/tests/ReproOrRowid.pas`
-                and exercises 3 of these shapes correctly post-IPK-IN.a
-                fix, but is intentionally excluded from build.sh.
-                Without scripted runtime coverage, regressions like the
-                BtreePayloadFetch index-cursor bug keep slipping through
-                the bytecode-only parity gate.
+            [X] **6.10 step 6.IPK-IN.c** — landed 2026-04-27.
+                `src/tests/TestRowidIn.pas` is wired into
+                `src/tests/build.sh` and asserts: rowid IN (2/3/4
+                entries), the OR-rewritten `rowid=K1 OR rowid=K2`
+                shape, and the rowid-EQ control.  Exits non-zero on
+                any failure so regressions surface in the runtime
+                gate, not just the bytecode-only parity gate.
 
-            [ ] **6.10 step 6.IPK-IN.e** OR-to-IN rewrite drops one
-                arm.  `WHERE rowid=1 OR rowid=2` emits a single
-                IdxInsert (key=2 only) into the IN-RHS eph cursor;
-                C oracle emits both (1 and 2).  Surface symptom:
-                `SELECT a FROM t WHERE rowid=1 OR rowid=2` returns
-                only row a=20 (rowid=2), missing a=10 (rowid=1).
-                ReproOrRowid bytecode dump shows `[5] Integer p1=2`
-                where C has `Integer p1=1` then `Integer p1=2` and
-                two IdxInserts.  Likely in `exprAnalyzeOrTerm` /
-                OR-to-IN list-builder path in `passqlite3codegen.pas`;
-                investigate `sqlite3ExprListAppend` calls during
-                OR-arm fold.
+            [X] **6.10 step 6.IPK-IN.e** — landed 2026-04-27.
+                Root cause was in `exprAnalyzeOrTerm`
+                (`passqlite3codegen.pas:8298`): the verify loop had
+                an extra `Dec(i); Inc(pOrTerm);` before its body, so
+                it skipped the candidate term that the search loop
+                broke on.  C's verify loop (whereexpr.c:881) re-uses
+                i and pOrTerm post-break, with the `i--, pOrTerm++`
+                only firing in the for-step.  For 2-term OR, that
+                meant only the second term received TERM_OK and only
+                one IdxInsert was emitted.  Fix: removed the pre-loop
+                step so the candidate is revisited.
         [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
         [ ] `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3

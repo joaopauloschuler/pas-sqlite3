@@ -8295,9 +8295,11 @@ begin
         Break;
       end;
 
-      { Verify that the candidate (cursor,column) is shared by every term. }
+      { Verify that the candidate (cursor,column) is shared by every term.
+        Mirrors whereexpr.c:881..904 — the verify loop continues from the
+        same i/pOrTerm at which the search loop above broke, so the very
+        first iteration revisits the candidate term. }
       okToChngToIN := 1;
-      Dec(i); Inc(pOrTerm);
       while (i >= 0) and (okToChngToIN <> 0) do
       begin
         Assert((pOrTerm^.eOperator and u16(WO_EQ)) <> 0);
