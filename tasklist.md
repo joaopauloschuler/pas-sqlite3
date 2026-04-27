@@ -236,16 +236,19 @@ Important: At the end of this document, please find:
         Companion `NOT_EXISTS` PASSes via plain-scan.
 
     **Open follow-on:** Re-enable productive tails:
-      * `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate arm
-        productive (commit `90cda3b`).  Where-loop / one-pass arm
-        (delete.c:495..665, ~170 LOC) still TODO at codegen.pas:17496.
-        `sqlite3OpenTableAndIndices` is now productive (insert.c:2870
-        ported); remaining gates: `sqlite3WhereOkOnePass`,
-        `sqlite3WhereUsesDeferredSeek`, RowSet/iEphCur loop, `OP_Once`
-        wrapper for ONEPASS_MULTI, vtab `OP_VUpdate` arm.
+      * `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
+        arm and where-loop / one-pass arm both productive (commits
+        `90cda3b`, sub-progress 49).  vtab `OP_VUpdate` arm still TODO
+        (out of current corpus).
       * `sqlite3Update` (`passqlite3codegen.pas:17835`): skeleton-only
         with snapshot/restore guard at 17890..17893 / 17965..17970;
         blocks NestedParse UPDATE of the placeholder sqlite_master row.
+      * DROP TABLE in TestExplainParity still returns nil Vdbe.  The
+        DELETE FROM sqlite_master path is now productive, so the bail
+        is upstream of that — investigate whether `sqlite3DropTable`'s
+        `sqlite3GetVdbe(pParse)` returns nil, the schema-cookie /
+        finishCoding short-circuits, or a NestedParse error trips the
+        prepare to rc=0 with pStmt=nil.
 
     **CREATE TABLE / CREATE INDEX DIVERGE-op-count rows** in
     TestExplainParity (Pas=21/19 vs C=32/37/41) are structural — extra

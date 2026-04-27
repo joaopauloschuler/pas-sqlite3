@@ -17341,21 +17341,40 @@ procedure sqlite3DeleteFrom(pParse: PParse; pTabList: PSrcList;
 label
   delete_from_cleanup;
 var
-  db:        PTsqlite3;
-  pTab:      PTable2;
-  v:         PVdbe;
-  iDb:       i32;
-  iTabCur:   i32;
-  iDataCur:  i32;
-  iIdxCur:   i32;
-  nIdx:      i32;
-  pIdx:      PIndex2;
-  pTrg:      PTrigger;
-  isView:    i32;
-  bComplex:  i32;
-  rcauth:    i32;
-  memCnt:    i32;
-  sContext:  TAuthContext;
+  db:           PTsqlite3;
+  pTab:         PTable2;
+  v:            PVdbe;
+  iDb:          i32;
+  iTabCur:      i32;
+  iDataCur:     i32;
+  iIdxCur:      i32;
+  nIdx:         i32;
+  pIdx:         PIndex2;
+  pTrg:         PTrigger;
+  isView:       i32;
+  bComplex:     i32;
+  rcauth:       i32;
+  memCnt:       i32;
+  sContext:     TAuthContext;
+  sNC:          TNameContext;
+  pWInfo:       PWhereInfo;
+  wcf:          u16;
+  eOnePass:     i32;
+  aiCurOnePass: array[0..1] of i32;
+  aToOpen:      Pu8;
+  pPk:          PIndex2;
+  iPk:          i32;
+  nPk:          i16;
+  iKey:         i32;
+  nKey:         i16;
+  iEphCur:      i32;
+  iRowSet:      i32;
+  addrBypass:   i32;
+  addrLoop:     i32;
+  addrEphOpen:  i32;
+  iAddrOnce:    i32;
+  ii:           i32;
+  countChg:     i32;
 begin
   pTab     := nil;
   v        := nil;
@@ -17367,7 +17386,23 @@ begin
   iDataCur := 0;
   iIdxCur  := 0;
   nIdx     := 0;
+  pWInfo       := nil;
+  aToOpen      := nil;
+  pPk          := nil;
+  iPk          := 0;
+  nPk          := 1;
+  iKey         := 0;
+  nKey         := 0;
+  iEphCur      := 0;
+  iRowSet      := 0;
+  addrBypass   := 0;
+  addrLoop     := 0;
+  addrEphOpen  := 0;
+  eOnePass     := ONEPASS_OFF;
+  aiCurOnePass[0] := -1;
+  aiCurOnePass[1] := -1;
   FillChar(sContext, SizeOf(sContext), 0);
+  FillChar(sNC, SizeOf(sNC), 0);
 
   db := pParse^.db;
   if pParse^.nErr <> 0 then goto delete_from_cleanup;
@@ -17437,15 +17472,11 @@ begin
   { TODO(Phase 6.5): sqlite3MaterializeView (delete.c:428).  isView=0 in the
     productive corpus today (sqlite_master is a real table). }
 
-  { Resolve column names in WHERE.  Provide a NameContext that points at the
-    SrcList so column refs bind to iTabCur. }
-  if pWhere <> nil then
-  begin
-    { TODO(Phase 6.5): NameContext + sqlite3ResolveExprNames (delete.c:440).
-      The schema-row DELETE WHERE is built by sqlite3NestedParse with
-      already-resolved column refs (literal token paths), so resolution is
-      a no-op; preserve productive semantics by skipping for now. }
-  end;
+  { Resolve column names in WHERE clause (delete.c:438..445). }
+  sNC.pParse := pParse;
+  sNC.pSrcList := pTabList;
+  if sqlite3ResolveExprNames(@sNC, pWhere) <> 0 then
+    goto delete_from_cleanup;
 
   { Row-counter cell.  C: db->flags & SQLITE_CountRows && !nested &&
     !pTriggerTab && !bReturning.  SQLITE_CountRows = HI(0x00001) =
@@ -17493,11 +17524,138 @@ begin
     end;
   end else
   begin
-    { TODO(Phase 6.9-bis step 11g.2.h): where-loop / one-pass DELETE arm
-      (delete.c:495..665).  Blocked on sqlite3OpenTableAndIndices being a
-      Phase 6.4 stub (no OP_OpenWrite emission).  Schema-row DELETEs
-      issued by sqlite3NestedParse (DROP TABLE / DROP INDEX) take this
-      path — productive emission lands once OpenTableAndIndices does. }
+    { Where-loop / one-pass DELETE arm — port of delete.c:495..665. }
+    wcf := WHERE_ONEPASS_DESIRED or WHERE_DUPLICATES_OK;
+    if (sNC.ncFlags and NC_Subquery) <> 0 then bComplex := 1;
+    if bComplex = 0 then wcf := wcf or u16($0008); { WHERE_ONEPASS_MULTIROW }
+    if HasRowid(pTab) then
+    begin
+      { Initialise an empty RowSet for two-pass deletes. }
+      pPk := nil;
+      AssertH(nPk = 1, 'DeleteFrom rowid nPk');
+      Inc(pParse^.nMem);
+      iRowSet := pParse^.nMem;
+      sqlite3VdbeAddOp2(v, OP_Null, 0, iRowSet);
+    end else
+    begin
+      pPk := sqlite3PrimaryKeyIndex(pTab);
+      AssertH(pPk <> nil, 'DeleteFrom WITHOUT ROWID pk');
+      nPk := pPk^.nKeyCol;
+      iPk := pParse^.nMem + 1;
+      Inc(pParse^.nMem, nPk);
+      iEphCur := pParse^.nTab;
+      Inc(pParse^.nTab);
+      addrEphOpen := sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iEphCur, nPk);
+      sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pPk));
+    end;
+
+    { Construct the WHERE-driven scan that finds rowids/PKs to delete. }
+    pWInfo := sqlite3WhereBegin(pParse, pTabList, pWhere, nil, nil, nil,
+                                wcf, iTabCur + 1);
+    if pWInfo = nil then goto delete_from_cleanup;
+    eOnePass := sqlite3WhereOkOnePass(pWInfo, @aiCurOnePass[0]);
+    if eOnePass <> ONEPASS_SINGLE then sqlite3MultiWrite(pParse);
+    if sqlite3WhereUsesDeferredSeek(pWInfo) <> 0 then
+      sqlite3VdbeAddOp1(v, OP_FinishSeek, iTabCur);
+
+    if memCnt <> 0 then
+      sqlite3VdbeAddOp2(v, OP_AddImm, memCnt, 1);
+
+    { Extract the rowid or primary key for the current row. }
+    if pPk <> nil then
+    begin
+      for ii := 0 to nPk - 1 do begin
+        AssertH(pPk^.aiColumn[ii] >= 0, 'DeleteFrom pk col');
+        sqlite3ExprCodeGetColumnOfTable(v, pTab, iTabCur,
+                                        pPk^.aiColumn[ii], iPk + ii);
+      end;
+      iKey := iPk;
+    end else begin
+      Inc(pParse^.nMem);
+      iKey := pParse^.nMem;
+      sqlite3ExprCodeGetColumnOfTable(v, pTab, iTabCur, -1, iKey);
+    end;
+
+    if eOnePass <> ONEPASS_OFF then
+    begin
+      nKey := nPk;
+      aToOpen := sqlite3DbMallocRawNN(db, u64(nIdx + 2));
+      if aToOpen = nil then begin
+        sqlite3WhereEnd(pWInfo);
+        goto delete_from_cleanup;
+      end;
+      FillChar(aToOpen^, nIdx + 1, 1);
+      aToOpen[nIdx + 1] := 0;
+      if aiCurOnePass[0] >= 0 then aToOpen[aiCurOnePass[0] - iTabCur] := 0;
+      if aiCurOnePass[1] >= 0 then aToOpen[aiCurOnePass[1] - iTabCur] := 0;
+      if addrEphOpen <> 0 then sqlite3VdbeChangeToNoop(v, addrEphOpen);
+      addrBypass := sqlite3VdbeMakeLabel(pParse);
+    end else begin
+      if pPk <> nil then begin
+        Inc(pParse^.nMem);
+        iKey := pParse^.nMem;
+        nKey := 0;
+        sqlite3VdbeAddOp4(v, OP_MakeRecord, iPk, nPk, iKey,
+          sqlite3IndexAffinityStr(pParse^.db, pPk), nPk);
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iEphCur, iKey, iPk, nPk);
+      end else begin
+        nKey := 1;
+        sqlite3VdbeAddOp2(v, OP_RowSetAdd, iRowSet, iKey);
+      end;
+      sqlite3WhereEnd(pWInfo);
+      pWInfo := nil;
+    end;
+
+    { Open data + index cursors for the actual delete. }
+    if isView = 0 then
+    begin
+      iAddrOnce := 0;
+      if eOnePass = ONEPASS_MULTI then
+        iAddrOnce := sqlite3VdbeAddOp0(v, OP_Once);
+      sqlite3OpenTableAndIndices(pParse, pTab, OP_OpenWrite, OPFLAG_FORDELETE,
+                                 iTabCur, aToOpen, @iDataCur, @iIdxCur);
+      if eOnePass = ONEPASS_MULTI then
+        sqlite3VdbeJumpHereOrPopInst(v, iAddrOnce);
+    end;
+
+    { Loop over the captured rowids/PKs. }
+    if eOnePass <> ONEPASS_OFF then
+    begin
+      AssertH(nKey = nPk, 'DeleteFrom nKey=nPk');
+      if (pTab^.eTabType <> TABTYP_VTAB)
+         and (aToOpen <> nil)
+         and (aToOpen[iDataCur - iTabCur] <> 0) then
+        sqlite3VdbeAddOp4Int(v, OP_NotFound, iDataCur, addrBypass, iKey, nKey);
+    end else if pPk <> nil then begin
+      addrLoop := sqlite3VdbeAddOp1(v, OP_Rewind, iEphCur);
+      sqlite3VdbeAddOp2(v, OP_RowData, iEphCur, iKey);
+    end else begin
+      addrLoop := sqlite3VdbeAddOp3(v, OP_RowSetRead, iRowSet, 0, iKey);
+    end;
+
+    { Emit the row delete (vtab xUpdate or core delete). }
+    if pTab^.eTabType = TABTYP_VTAB then
+    begin
+      { TODO(Phase 6.5): virtual-table OP_VUpdate emission.
+        Out of corpus for current TestExplainParity / TestWhereCorpus rows. }
+    end else begin
+      if pParse^.nested = 0 then countChg := 1 else countChg := 0;
+      sqlite3GenerateRowDelete(pParse, pTab, pTrg, iDataCur, iIdxCur,
+        iKey, nKey, countChg, OE_Default, eOnePass, aiCurOnePass[1]);
+    end;
+
+    { Loop tail. }
+    if eOnePass <> ONEPASS_OFF then begin
+      sqlite3VdbeResolveLabel(v, addrBypass);
+      if pWInfo <> nil then sqlite3WhereEnd(pWInfo);
+      pWInfo := nil;
+    end else if pPk <> nil then begin
+      sqlite3VdbeAddOp2(v, OP_Next, iEphCur, addrLoop + 1);
+      sqlite3VdbeJumpHere(v, addrLoop);
+    end else begin
+      sqlite3VdbeGoto(v, addrLoop);
+      sqlite3VdbeJumpHere(v, addrLoop);
+    end;
   end;
 
   if (pParse^.nested = 0) and (pParse^.pTriggerTab = nil) then
@@ -17512,6 +17670,7 @@ delete_from_cleanup:
   sqlite3ExprDelete(pParse^.db, pWhere);
   sqlite3ExprListDelete(pParse^.db, pOrderBy);
   sqlite3ExprDelete(pParse^.db, pLimit);
+  if aToOpen <> nil then sqlite3DbFree(pParse^.db, aToOpen);
 end;
 
 { sqlite3GenerateRowDelete — port of delete.c:745..879.
