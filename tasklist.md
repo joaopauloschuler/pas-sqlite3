@@ -437,6 +437,34 @@ Important: At the end of this document, please find:
       returns nOrderBy), OBSAT4 (vtab isOrdered=0 → 0), OBSAT5 (vtab
       ordered but pOrderBy mismatch → 0), OBSAT6 (nLoop=0 bypasses the
       OrderByIdxJoin gate per where.c:5203).
+    - [X] `wherePathSolver` + `computeMxChoice` (where.c:5651..5798,
+      5834..6257) — N-best forward dynamic-programming path search that
+      turns the per-table candidate WhereLoop list (pWInfo^.pLoops)
+      into the chosen plan stored in pWInfo^.a[].pWLoop.  computeMxChoice
+      gates on nLevel (1/5/12/18) plus a star-query heuristic that
+      detects fact-table + ≥3 dimensions joins and bumps dimension-table
+      full-scan rRun up to fact-table cost + 1 LogEst (so the dimension
+      scan never beats the fact scan).  wherePathSolver itself runs
+      nLevel generations of forward DP: at each step it extends every
+      surviving WherePath by every legal WhereLoop, scores sorted vs.
+      unsorted cost, and keeps only the mxChoice cheapest paths under a
+      lexicographic (rCost, nRow, rUnsort, szIdxRow) comparator.  The
+      final pass loads the unique survivor's loops into level[].pWLoop /
+      iFrom / iTabCur, runs the WHERE_DISTINCTBY / ORDERBY_LIMIT /
+      SORTBYGROUP post-pass via wherePathSatisfiesOrderBy, and writes
+      pWInfo^.nRowOut / nOBSat / revMask / eDistinct / bOrderedInnerLoop
+      / sorted.  WHERETRACE / SQLITE_DEBUG / STAT4 / rStarDelta blocks
+      are intentionally omitted to match the project-wide non-debug
+      build.  Allocation uses sqlite3DbMallocRawNN for the contiguous
+      aTo/aFrom + per-path aLoop slot block + aSortCost array; "no query
+      solution" returns SQLITE_ERROR; SQLITE_StarQuery dbOptFlags lifted
+      from sqliteInt.h:1931.  Gate: `TestWherePlanner.pas` (264/264):
+      WPS1 (FROM-less nLevel=0 plan returns OK with nRowOut seeded from
+      nQueryLoop), WPS2 (single-table single-loop pick wires loopA into
+      level[0]), WPS3 (two competing loops on the same table — cheaper
+      rRun wins), WPS4 (unsatisfiable prereq → "no query solution" →
+      SQLITE_ERROR), WPS5a/b (computeMxChoice trivial path — baseline
+      12, bStarUsed bumps to 18).
     - [X] `whereRangeScanEst` (where.c:2092..2254, no-STAT4 tail) —
       reduces `pLoop^.nOut` to account for the leftover range
       constraints on the leading (nEq+1)'th column of the index pLoop

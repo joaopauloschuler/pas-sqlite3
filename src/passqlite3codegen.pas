@@ -1451,6 +1451,7 @@ const
   SQLITE_BloomFilter    = u32($00080000);
   SQLITE_OnePass        = u32($08000000);
   SQLITE_OrderBySubq    = u32($10000000);  { ORDER BY in subquery helps outer (sqliteInt.h:1930) }
+  SQLITE_StarQuery      = u32($20000000);  { Star-query heuristic in computeMxChoice (sqliteInt.h:1931) }
 
   { TOPBIT — top bit of a 64-bit Bitmask (sqliteInt.h:1414); used by
     whereLoopAddBtree's "covering by bitmask" check to detect the
@@ -1849,6 +1850,25 @@ function  wherePathSatisfiesOrderBy(pWInfo: PWhereInfo; pOrderBy: PExprList;
 function  wherePathMatchSubqueryOB(pWInfo: PWhereInfo; pLoop: PWhereLoop;
   iLoop: i32; iCur: i32; pOrderBy: PExprList; pRevMask: PBitmask;
   pObSat: PBitmask): i32;
+
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — wherePathSolver
+  (where.c:5651..5798, 5834..6257).  N-best path search that turns the
+  per-table WhereLoop list (pWInfo^.pLoops, populated by whereLoopAddAll)
+  into the chosen execution plan stored in pWInfo^.a[].pWLoop.
+
+  computeMxChoice is the helper that decides how many simultaneous
+  candidate paths to track per generation: 1 / 5 / 12 / 18 depending on
+  nLevel and whether the star-query heuristic recognised a fact-table
+  pattern.  Pure cost arithmetic; no codegen.
+
+  wherePathSolver itself is a forward-DP search: at each generation it
+  extends every surviving path by every legal WhereLoop, scoring sorted
+  vs. unsorted cost, and keeps only the mxChoice cheapest paths.  After
+  nLevel generations the unique surviving path is loaded back into
+  pWInfo^.a[].pWLoop.  Returns SQLITE_OK on success, SQLITE_NOMEM_BKPT or
+  SQLITE_ERROR on failure (the latter for "no query solution"). }
+function  computeMxChoice(pWInfo: PWhereInfo): i32;
+function  wherePathSolver(pWInfo: PWhereInfo; nRowEst: i16): i32;
 
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
@@ -10562,6 +10582,488 @@ begin
     Exit(0);
   end;
   Result := -1;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.d sub-progress) — computeMxChoice +
+  wherePathSolver.
+
+  Faithful port of where.c:5651..5798 (computeMxChoice) and
+  where.c:5834..6257 (wherePathSolver).  The N-best forward dynamic-
+  programming search that transforms the per-table candidate WhereLoop
+  list at pWInfo^.pLoops (populated upstream by whereLoopAddAll) into the
+  chosen plan stored in pWInfo^.a[].pWLoop.
+
+  WHERETRACE / SQLITE_DEBUG and STAT4-only blocks are intentionally
+  omitted to match the project-wide non-debug build.  rStarDelta lives
+  inside WHERETRACE blocks in upstream and is similarly skipped — only
+  pWLoop^.rRun is updated by the star-query cost-adjustment loop.
+  =========================================================================== }
+
+function computeMxChoice(pWInfo: PWhereInfo): i32;
+var
+  nLoop:    i32;
+  pWLoop:   PWhereLoop;
+  pStart:   PWhereLoop;
+  aFromTabs: PSrcItem;
+  iFromIdx: i32;
+  m:        Bitmask;
+  mSelfJoin: Bitmask;
+  mSeen:    Bitmask;
+  mxRun:    i16;
+  nDep:     i32;
+  pFactTab: PSrcItem;
+begin
+  nLoop := i32(pWInfo^.nLevel);
+
+  if (nLoop >= 4)
+     and ((pWInfo^.bitwiseFlags and (u8(1) shl 4)) = 0) { !bStarDone }
+     and OptimizationEnabled(pWInfo^.pParse^.db, SQLITE_StarQuery) then
+  begin
+    { Mark the star-query analysis as complete (only run once per pWInfo). }
+    pWInfo^.bitwiseFlags := pWInfo^.bitwiseFlags or (u8(1) shl 4);
+
+    aFromTabs := SrcListItems(pWInfo^.pTabList);
+    pStart := pWInfo^.pLoops;
+    iFromIdx := 0;
+    m := 1;
+    while iFromIdx < nLoop do
+    begin
+      nDep := 0;
+      mSeen := 0;
+      mSelfJoin := 0;
+      pFactTab := @aFromTabs[iFromIdx];
+      if (pFactTab^.fg.jointype and (JT_OUTER or JT_CROSS)) <> 0 then
+      begin
+        if (iFromIdx + 3) > nLoop then Break;
+        while (pStart <> nil) and (i32(pStart^.iTab) <= iFromIdx) do
+          pStart := pStart^.pNextLoop;
+      end;
+      pWLoop := pStart;
+      while pWLoop <> nil do
+      begin
+        if (aFromTabs[pWLoop^.iTab].fg.jointype and (JT_OUTER or JT_CROSS)) <> 0 then
+          Break;
+        if ((pWLoop^.prereq and m) <> 0)
+           and ((pWLoop^.maskSelf and mSeen) = 0)
+           and ((pWLoop^.maskSelf and mSelfJoin) = 0) then
+        begin
+          if aFromTabs[pWLoop^.iTab].pSTab = pFactTab^.pSTab then
+            mSelfJoin := mSelfJoin or m
+          else
+          begin
+            Inc(nDep);
+            mSeen := mSeen or pWLoop^.maskSelf;
+          end;
+        end;
+        pWLoop := pWLoop^.pNextLoop;
+      end;
+      if nDep > 2 then
+      begin
+        { Mark bStarUsed (bit 5). }
+        pWInfo^.bitwiseFlags := pWInfo^.bitwiseFlags or (u8(1) shl 5);
+
+        { Compute mxRun = max rRun for any WhereLoop on the fact table, +1. }
+        mxRun := i16($8001);  { LOGEST_MIN ≈ -32767 }
+        pWLoop := pStart;
+        while pWLoop <> nil do
+        begin
+          if i32(pWLoop^.iTab) < iFromIdx then
+          begin
+            pWLoop := pWLoop^.pNextLoop;
+            Continue;
+          end;
+          if i32(pWLoop^.iTab) > iFromIdx then Break;
+          if pWLoop^.rRun > mxRun then mxRun := pWLoop^.rRun;
+          pWLoop := pWLoop^.pNextLoop;
+        end;
+        if mxRun < i16($7fff) then Inc(mxRun);
+
+        { Bump rRun on dimension-table full scans up to mxRun. }
+        pWLoop := pStart;
+        while pWLoop <> nil do
+        begin
+          if (pWLoop^.maskSelf and mSeen) = 0 then
+          begin
+            pWLoop := pWLoop^.pNextLoop;
+            Continue;
+          end;
+          if pWLoop^.nLTerm <> 0 then
+          begin
+            pWLoop := pWLoop^.pNextLoop;
+            Continue;
+          end;
+          if pWLoop^.rRun < mxRun then
+            pWLoop^.rRun := mxRun;
+          pWLoop := pWLoop^.pNextLoop;
+        end;
+      end;
+      Inc(iFromIdx);
+      m := m shl 1;
+    end;
+  end;
+
+  if (pWInfo^.bitwiseFlags and (u8(1) shl 5)) <> 0 then
+    Result := 18
+  else
+    Result := 12;
+end;
+
+function wherePathSolver(pWInfo: PWhereInfo; nRowEst: i16): i32;
+var
+  mxChoice:  i32;
+  nLoop:     i32;
+  pPrs:      PParse;
+  iLoop:     i32;
+  ii, jj:    i32;
+  mxI:       i32;
+  nOrderBy:  i32;
+  mxCost:    i16;
+  mxUnsort:  i16;
+  nTo, nFrom: i32;
+  aFrom, aTo: PWherePath;
+  pFrom, pTo: PWherePath;
+  pSwap:     PWherePath;
+  pWLoop:    PWhereLoop;
+  pX:        PPWhereLoop;
+  aSortCost: Pi16;
+  pSpace:    Pointer;
+  nSpace:    SizeInt;
+  nOut:      i16;
+  rCost:     i16;
+  rUnsort:   i16;
+  isOrdered: i8;
+  maskNew:   Bitmask;
+  revMask:   Bitmask;
+  notUsed:   Bitmask;
+  nByteWP:   SizeInt;
+  rc2:       i32;
+  wsFlags:   u32;
+  bMatch:    Boolean;
+  pPSel:     PSelect;
+  m_:        Bitmask;
+begin
+  pPrs := pWInfo^.pParse;
+  nLoop  := i32(pWInfo^.nLevel);
+
+  { TUNING: mxChoice based on nLoop. }
+  if nLoop <= 1 then mxChoice := 1
+  else if nLoop = 2 then mxChoice := 5
+  else if pPrs^.nErr <> 0 then mxChoice := 1
+  else mxChoice := computeMxChoice(pWInfo);
+  Assert(nLoop <= pWInfo^.pTabList^.nSrc);
+
+  if (pWInfo^.pOrderBy = nil) or (nRowEst = 0) then
+    nOrderBy := 0
+  else
+    nOrderBy := pWInfo^.pOrderBy^.nExpr;
+
+  { Allocate aTo/aFrom + per-path aLoop slot blocks + aSortCost in one
+    contiguous chunk. }
+  nByteWP := SizeOf(TWherePath) + SizeOf(PWhereLoop) * nLoop;
+  nSpace  := nByteWP * mxChoice * 2;
+  nSpace  := nSpace + SizeOf(i16) * nOrderBy;
+  pSpace  := sqlite3DbMallocRawNN(pPrs^.db, u64(nSpace));
+  if pSpace = nil then Exit(SQLITE_NOMEM_BKPT);
+  FillChar(pSpace^, nSpace, 0);
+
+  aTo   := PWherePath(pSpace);
+  aFrom := PWherePath(PtrUInt(aTo) + PtrUInt(SizeOf(TWherePath) * mxChoice));
+  pX    := PPWhereLoop(PtrUInt(aFrom) + PtrUInt(SizeOf(TWherePath) * mxChoice));
+  pFrom := aTo;
+  for ii := 0 to mxChoice * 2 - 1 do
+  begin
+    pFrom^.aLoop := pX;
+    Inc(pFrom);
+    pX := PPWhereLoop(PtrUInt(pX) + PtrUInt(SizeOf(PWhereLoop) * nLoop));
+  end;
+  if nOrderBy > 0 then
+    aSortCost := Pi16(pX)
+  else
+    aSortCost := nil;
+
+  { Seed search with one WherePath of zero loops; nRow = MIN(nQueryLoop,48). }
+  if pPrs^.nQueryLoop < 48 then
+    aFrom[0].nRow := pPrs^.nQueryLoop
+  else
+    aFrom[0].nRow := 48;
+  nFrom := 1;
+  Assert(aFrom[0].isOrdered = 0);
+  if nOrderBy > 0 then
+  begin
+    if nLoop > 0 then
+      aFrom[0].isOrdered := -1
+    else
+      aFrom[0].isOrdered := i8(nOrderBy);
+  end;
+
+  mxCost   := 0;
+  mxUnsort := 0;
+  mxI      := 0;
+
+  iLoop := 0;
+  while iLoop < nLoop do
+  begin
+    nTo := 0;
+    pFrom := aFrom;
+    ii := 0;
+    while ii < nFrom do
+    begin
+      pWLoop := pWInfo^.pLoops;
+      while pWLoop <> nil do
+      begin
+        if (pWLoop^.prereq and (not pFrom^.maskLoop)) <> 0 then
+        begin
+          pWLoop := pWLoop^.pNextLoop;
+          Continue;
+        end;
+        if (pWLoop^.maskSelf and pFrom^.maskLoop) <> 0 then
+        begin
+          pWLoop := pWLoop^.pNextLoop;
+          Continue;
+        end;
+        if ((pWLoop^.wsFlags and WHERE_AUTO_INDEX) <> 0)
+           and (pFrom^.nRow < 10) then  { LogEst(2) = 10 ⇒ <2 not <3; upstream uses 10 }
+        begin
+          { Skip auto-index when caller will run <1.25 times — upstream comment
+            cites "<3 rows" but the LogEst literal is 10 (log2(2.0)=1) so the
+            cutoff matches. }
+          pWLoop := pWLoop^.pNextLoop;
+          Continue;
+        end;
+
+        { Cost of pFrom + pWLoop. }
+        rUnsort := i16(pWLoop^.rRun + pFrom^.nRow);
+        if pWLoop^.rSetup <> 0 then
+          rUnsort := sqlite3LogEstAdd(pWLoop^.rSetup, rUnsort);
+        rUnsort := sqlite3LogEstAdd(rUnsort, pFrom^.rUnsort);
+        nOut := i16(pFrom^.nRow + pWLoop^.nOut);
+        maskNew := pFrom^.maskLoop or pWLoop^.maskSelf;
+        isOrdered := pFrom^.isOrdered;
+        if isOrdered < 0 then
+        begin
+          revMask := 0;
+          isOrdered := wherePathSatisfiesOrderBy(pWInfo,
+              pWInfo^.pOrderBy, pFrom, pWInfo^.wctrlFlags,
+              u16(iLoop), pWLoop, @revMask);
+        end
+        else
+          revMask := pFrom^.revLoop;
+        if (isOrdered >= 0) and (i32(isOrdered) < nOrderBy) then
+        begin
+          if aSortCost[isOrdered] = 0 then
+            aSortCost[isOrdered] := whereSortingCost(
+                pWInfo, nRowEst, nOrderBy, isOrdered);
+          { TUNING: +3 LogEst encourages ORDER-BY-via-index plans. }
+          rCost := i16(sqlite3LogEstAdd(rUnsort, aSortCost[isOrdered]) + 3);
+        end
+        else
+        begin
+          rCost := rUnsort;
+          rUnsort := i16(rUnsort - 2);  { TUNING: slight bias toward no-sort }
+        end;
+
+        { Look for an existing best-so-far path with the same loop set and
+          compatible isOrdered. }
+        bMatch := False;
+        jj := 0;
+        pTo := aTo;
+        while jj < nTo do
+        begin
+          if (pTo^.maskLoop = maskNew)
+             and ((((u8(pTo^.isOrdered) xor u8(isOrdered)) and $80) = 0)
+                  or (iLoop = nLoop - 1))
+          then
+          begin
+            bMatch := True;
+            Break;
+          end;
+          Inc(jj);
+          Inc(pTo);
+        end;
+        if not bMatch then
+        begin
+          if (nTo >= mxChoice)
+             and ((rCost > mxCost) or ((rCost = mxCost) and (rUnsort >= mxUnsort)))
+          then
+          begin
+            { Candidate is no better than the existing mxChoice paths. }
+            pWLoop := pWLoop^.pNextLoop;
+            Continue;
+          end;
+          if nTo < mxChoice then
+          begin
+            jj := nTo;
+            Inc(nTo);
+          end
+          else
+            jj := mxI;
+          pTo := @aTo[jj];
+        end
+        else
+        begin
+          { Existing best-so-far path covers the same loop set; replace only
+            if the candidate strictly dominates per the vector comparison. }
+          if (pTo^.rCost < rCost)
+             or ((pTo^.rCost = rCost) and (pTo^.nRow < nOut))
+             or ((pTo^.rCost = rCost) and (pTo^.nRow = nOut)
+                 and (pTo^.rUnsort < rUnsort))
+             or ((pTo^.rCost = rCost) and (pTo^.nRow = nOut)
+                 and (pTo^.rUnsort = rUnsort)
+                 and (whereLoopIsNoBetter(pWLoop, pTo^.aLoop[iLoop]) <> 0))
+          then
+          begin
+            pWLoop := pWLoop^.pNextLoop;
+            Continue;
+          end;
+        end;
+
+        { pWLoop is a winner — install it into pTo. }
+        pTo^.maskLoop  := pFrom^.maskLoop or pWLoop^.maskSelf;
+        pTo^.revLoop   := revMask;
+        pTo^.nRow      := nOut;
+        pTo^.rCost     := rCost;
+        pTo^.rUnsort   := rUnsort;
+        pTo^.isOrdered := isOrdered;
+        if iLoop > 0 then
+          Move(pFrom^.aLoop[0], pTo^.aLoop[0],
+               SizeOf(PWhereLoop) * iLoop);
+        pTo^.aLoop[iLoop] := pWLoop;
+        if nTo >= mxChoice then
+        begin
+          mxI := 0;
+          mxCost := aTo[0].rCost;
+          mxUnsort := aTo[0].nRow;  { upstream: aTo[0].rUnsort but the C source
+                                      stores nRow into mxUnsort via a tag named
+                                      mxUnsort — match the C literal. }
+          for jj := 1 to mxChoice - 1 do
+          begin
+            if (aTo[jj].rCost > mxCost)
+               or ((aTo[jj].rCost = mxCost) and (aTo[jj].rUnsort > mxUnsort))
+            then
+            begin
+              mxCost := aTo[jj].rCost;
+              mxUnsort := aTo[jj].rUnsort;
+              mxI := jj;
+            end;
+          end;
+        end;
+
+        pWLoop := pWLoop^.pNextLoop;
+      end;
+      Inc(ii);
+      Inc(pFrom);
+    end;
+
+    { Swap aFrom and aTo for next generation. }
+    pSwap := aTo;
+    aTo := aFrom;
+    aFrom := pSwap;
+    nFrom := nTo;
+    Inc(iLoop);
+  end;
+
+  if nFrom = 0 then
+  begin
+    sqlite3ErrorMsg(pPrs, 'no query solution');
+    sqlite3DbFree(pPrs^.db, pSpace);
+    Exit(SQLITE_ERROR);
+  end;
+
+  { Only one path is available, which is the best path. }
+  Assert(nFrom = 1);
+  pFrom := aFrom;
+  Assert(i32(pWInfo^.nLevel) = nLoop);
+  for iLoop := 0 to nLoop - 1 do
+  begin
+    pWLoop := pFrom^.aLoop[iLoop];
+    whereInfoLevels(pWInfo)[iLoop].pWLoop  := pWLoop;
+    whereInfoLevels(pWInfo)[iLoop].iFrom   := pWLoop^.iTab;
+    whereInfoLevels(pWInfo)[iLoop].iTabCur :=
+      SrcListItems(pWInfo^.pTabList)[pWLoop^.iTab].iCursor;
+  end;
+
+  if ((pWInfo^.wctrlFlags and WHERE_WANT_DISTINCT) <> 0)
+     and ((pWInfo^.wctrlFlags and WHERE_DISTINCTBY) = 0)
+     and (pWInfo^.eDistinct = WHERE_DISTINCT_NOOP)
+     and (nRowEst <> 0)
+  then
+  begin
+    notUsed := 0;
+    rc2 := wherePathSatisfiesOrderBy(pWInfo, pWInfo^.pResultSet, pFrom,
+              WHERE_DISTINCTBY, u16(nLoop - 1), pFrom^.aLoop[nLoop - 1],
+              @notUsed);
+    if rc2 = pWInfo^.pResultSet^.nExpr then
+      pWInfo^.eDistinct := WHERE_DISTINCT_ORDERED;
+  end;
+
+  { Clear bOrderedInnerLoop (bit 2). }
+  pWInfo^.bitwiseFlags := pWInfo^.bitwiseFlags and (not (u8(1) shl 2));
+  if pWInfo^.pOrderBy <> nil then
+  begin
+    pWInfo^.nOBSat := pFrom^.isOrdered;
+    if (pWInfo^.wctrlFlags and WHERE_DISTINCTBY) <> 0 then
+    begin
+      if i32(pFrom^.isOrdered) = pWInfo^.pOrderBy^.nExpr then
+        pWInfo^.eDistinct := WHERE_DISTINCT_ORDERED;
+      pPSel := pWInfo^.pSelect;
+      Assert((pPSel = nil) or (pPSel^.pOrderBy = nil)
+             or (pWInfo^.nOBSat <= pPSel^.pOrderBy^.nExpr));
+    end
+    else
+    begin
+      pWInfo^.revMask := pFrom^.revLoop;
+      if pWInfo^.nOBSat <= 0 then
+      begin
+        pWInfo^.nOBSat := 0;
+        if nLoop > 0 then
+        begin
+          wsFlags := pFrom^.aLoop[nLoop - 1]^.wsFlags;
+          if ((wsFlags and WHERE_ONEROW) = 0)
+             and ((wsFlags and (WHERE_IPK or WHERE_COLUMN_IN))
+                  <> (WHERE_IPK or WHERE_COLUMN_IN))
+          then
+          begin
+            m_ := 0;
+            rc2 := wherePathSatisfiesOrderBy(pWInfo, pWInfo^.pOrderBy, pFrom,
+                      WHERE_ORDERBY_LIMIT, u16(nLoop - 1),
+                      pFrom^.aLoop[nLoop - 1], @m_);
+            if rc2 = pWInfo^.pOrderBy^.nExpr then
+            begin
+              { bOrderedInnerLoop = 1. }
+              pWInfo^.bitwiseFlags := pWInfo^.bitwiseFlags or (u8(1) shl 2);
+              pWInfo^.revMask := m_;
+            end;
+          end;
+        end;
+      end
+      else if (nLoop > 0) and (pWInfo^.nOBSat = 1)
+              and ((pWInfo^.wctrlFlags
+                    and (WHERE_ORDERBY_MIN or WHERE_ORDERBY_MAX)) <> 0)
+      then
+        pWInfo^.bitwiseFlags := pWInfo^.bitwiseFlags or (u8(1) shl 2);
+    end;
+    if ((pWInfo^.wctrlFlags and WHERE_SORTBYGROUP) <> 0)
+       and (pWInfo^.nOBSat = pWInfo^.pOrderBy^.nExpr)
+       and (nLoop > 0)
+    then
+    begin
+      m_ := 0;
+      rc2 := wherePathSatisfiesOrderBy(pWInfo, pWInfo^.pOrderBy, pFrom,
+                0, u16(nLoop - 1), pFrom^.aLoop[nLoop - 1], @m_);
+      Assert((pWInfo^.bitwiseFlags and (u8(1) shl 3)) = 0);  { sorted=0 }
+      if rc2 = pWInfo^.pOrderBy^.nExpr then
+      begin
+        pWInfo^.bitwiseFlags := pWInfo^.bitwiseFlags or (u8(1) shl 3); { sorted }
+        pWInfo^.revMask := m_;
+      end;
+    end;
+  end;
+
+  pWInfo^.nRowOut := pFrom^.nRow;
+
+  sqlite3DbFree(pPrs^.db, pSpace);
+  Result := SQLITE_OK;
 end;
 
 { ---------------------------------------------------------------------------

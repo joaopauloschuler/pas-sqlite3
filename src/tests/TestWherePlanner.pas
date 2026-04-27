@@ -2694,6 +2694,112 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- wherePathSolver + computeMxChoice (where.c:5651..5798, 5834..6257) ----- }
+
+procedure TestPathSolver;
+var
+  db:        PTsqlite3;
+  rc:        i32;
+  parse:     TParse;
+  wInfoBuf:  array[0..2047] of u8;
+  pWInfo:    PWhereInfo;
+  src:       TSrcListBuf;
+  loopA, loopB: TWhereLoop;
+  mx:        i32;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('WPS open', rc = SQLITE_OK);
+
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  parse.nQueryLoop := 0;
+
+  FillChar(wInfoBuf, SizeOf(wInfoBuf), 0);
+  pWInfo := PWhereInfo(@wInfoBuf[0]);
+  pWInfo^.pParse := @parse;
+
+  FillChar(src, SizeOf(src), 0);
+  src.hdr.nSrc      := 1;
+  src.item.iCursor  := 7;
+  pWInfo^.pTabList  := @src.hdr;
+
+  { ---- WPS1 — nLevel=0 (FROM-less query) returns SQLITE_OK without
+    touching pLoops; nRowOut = MIN(nQueryLoop,48) = 0. ---- }
+  pWInfo^.nLevel := 0;
+  pWInfo^.pLoops := nil;
+  rc := wherePathSolver(pWInfo, 0);
+  Check('WPS1 FROM-less plan returns OK', rc = SQLITE_OK);
+  Check('WPS1 nRowOut = nQueryLoop seed', pWInfo^.nRowOut = 0);
+
+  { ---- WPS2 — single-table, single candidate WhereLoop is selected and
+    its identity wired into pWInfo->a[0]. ---- }
+  FillChar(loopA, SizeOf(loopA), 0);
+  loopA.iTab     := 0;
+  loopA.maskSelf := 1;
+  loopA.prereq   := 0;
+  loopA.rRun     := 33;
+  loopA.nOut     := 5;
+  loopA.wsFlags  := WHERE_IPK or WHERE_ONEROW;
+  pWInfo^.nLevel := 1;
+  pWInfo^.pLoops := @loopA;
+  rc := wherePathSolver(pWInfo, 0);
+  Check('WPS2 single-loop plan returns OK', rc = SQLITE_OK);
+  Check('WPS2 level[0].pWLoop = loopA',
+        whereInfoLevels(pWInfo)[0].pWLoop = @loopA);
+  Check('WPS2 level[0].iFrom = 0',
+        whereInfoLevels(pWInfo)[0].iFrom = 0);
+  Check('WPS2 level[0].iTabCur = 7',
+        whereInfoLevels(pWInfo)[0].iTabCur = 7);
+  Check('WPS2 nRowOut = nRow seed + nOut = 0 + 5',
+        pWInfo^.nRowOut = 5);
+
+  { ---- WPS3 — two competing candidates on the same table; the one with
+    the lower rRun wins. ---- }
+  FillChar(loopA, SizeOf(loopA), 0);
+  loopA.iTab := 0; loopA.maskSelf := 1; loopA.prereq := 0;
+  loopA.rRun := 50;  loopA.nOut := 7;
+  loopA.wsFlags := WHERE_INDEXED;
+  FillChar(loopB, SizeOf(loopB), 0);
+  loopB.iTab := 0; loopB.maskSelf := 1; loopB.prereq := 0;
+  loopB.rRun := 33;  loopB.nOut := 3;
+  loopB.wsFlags := WHERE_IPK or WHERE_ONEROW;
+  loopA.pNextLoop := @loopB;
+  loopB.pNextLoop := nil;
+  pWInfo^.pLoops := @loopA;
+  pWInfo^.nLevel := 1;
+  rc := wherePathSolver(pWInfo, 0);
+  Check('WPS3 two-loop pick returns OK', rc = SQLITE_OK);
+  Check('WPS3 cheaper loopB wins',
+        whereInfoLevels(pWInfo)[0].pWLoop = @loopB);
+
+  { ---- WPS4 — no candidate covers the (only) FROM table → "no query
+    solution" → SQLITE_ERROR. ---- }
+  FillChar(loopA, SizeOf(loopA), 0);
+  loopA.iTab := 0; loopA.maskSelf := 1;
+  loopA.prereq := $00000002;       { unsatisfiable: needs table 2 }
+  loopA.rRun := 33; loopA.nOut := 1;
+  loopA.wsFlags := WHERE_INDEXED;
+  pWInfo^.pLoops := @loopA;
+  pWInfo^.nLevel := 1;
+  rc := wherePathSolver(pWInfo, 0);
+  Check('WPS4 unsatisfiable plan returns SQLITE_ERROR',
+        rc = SQLITE_ERROR);
+
+  { ---- WPS5 — computeMxChoice gates on nLevel: <=1 → 1; star-query
+    flag toggles 12↔18 only when nLevel>=4.  Probe the trivial path. ---- }
+  pWInfo^.nLevel := 0;
+  mx := computeMxChoice(pWInfo);
+  Check('WPS5a nLevel=0 → mxChoice baseline = 12',
+        mx = 12);
+  pWInfo^.bitwiseFlags := pWInfo^.bitwiseFlags or (u8(1) shl 5); { bStarUsed }
+  mx := computeMxChoice(pWInfo);
+  Check('WPS5b bStarUsed → mxChoice = 18',
+        mx = 18);
+  pWInfo^.bitwiseFlags := pWInfo^.bitwiseFlags and (not (u8(1) shl 5));
+
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -2727,6 +2833,7 @@ begin
   TestSortingCost;
   TestLoopIsNoBetter;
   TestPathSatisfiesOrderBy;
+  TestPathSolver;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.
