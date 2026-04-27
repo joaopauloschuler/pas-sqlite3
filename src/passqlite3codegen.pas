@@ -27035,7 +27035,12 @@ begin
   pParse^.parseFlags := pParse^.parseFlags and (not PARSEFLAG_OkConstFactor);
   iDummy := 0;
   regFree1 := 0;
-  rLhs := sqlite3ExprCodeTemp(pParse, pLeft, @regFree1);
+  { Mirror C's exprCodeVector(.., &iDummy) on the scalar/nVector=1 fast
+    path: the temp reg is intentionally not released by sqlite3ExprCodeIN
+    (expr.c:4100), so don't capture it into regFree1 here either —
+    otherwise the trailing sqlite3ReleaseTempReg would emit an extra
+    OP_ReleaseReg under SQLITE_DEBUG that the C oracle never produces. }
+  rLhs := sqlite3ExprCodeTemp(pParse, pLeft, @iDummy);
   pParse^.parseFlags := pParse^.parseFlags or savedOk;
 
   if eType = IN_INDEX_NOOP then begin

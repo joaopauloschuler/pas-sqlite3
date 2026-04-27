@@ -160,8 +160,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 982 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 983); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 985 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 986); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -194,8 +194,11 @@ Important: At the end of this document, please find:
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
   comparison ops + literal-arith + col aliases + multi-col index +
   multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **982 PASS / 1 DIVERGE / 0 ERROR**
-  (corpus = 983 after DROP TABLE IF EXISTS znope row added).
+  Current Status (2026-04-27): **985 PASS / 1 DIVERGE / 0 ERROR**
+  (corpus = 986 after IN-list / NOT IN / LIKE rows added — the
+  NOT IN row flipped to PASS once `sqlite3ExprCodeIN` stopped
+  capturing the LHS into regFree1 / releasing it at function end,
+  matching C's `exprCodeVector(.., &iDummy)`).
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -293,10 +296,15 @@ Important: At the end of this document, please find:
           per-op divergence at op[2] (rowid range scan path: planner
           picks WHERE_IPK range but inner-loop opcode emission differs
           from C).  `<>` shape PASSes; only ordered comparisons fail.
-        [ ] `SELECT a FROM t WHERE a IN (1,2,3)` / `NOT IN (...)` —
-          Δ=−1 (Pas heavier by 1 op vs C in IN-list rowset path).
+        [X] `SELECT a FROM t WHERE a IN (1,2,3)` / `NOT IN (...)` —
+          fixed by aligning `sqlite3ExprCodeIN` (codegen.pas:27038)
+          with C's `exprCodeVector(.., &iDummy)`: capture the LHS
+          temp reg into iDummy instead of regFree1 so the trailing
+          `sqlite3ReleaseTempReg(regFree1)` no longer emits an extra
+          `OP_ReleaseReg` under SQLITE_DEBUG.  IN/NOT IN PASS.
         [ ] `SELECT a FROM t WHERE a LIKE 'abc%'` / `GLOB 'abc*'` —
-          Δ=1 (LIKE/GLOB virtual-term range-scan path off by 1).
+          LIKE shape now PASSes (added to corpus); GLOB still
+          unprobed.
         [ ] `SELECT DISTINCT a FROM t` — Δ=13 (DISTINCT codegen,
           ephemeral-table dedup not yet wired in `sqlite3Select`).
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —

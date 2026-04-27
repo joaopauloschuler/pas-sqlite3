@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 983;
+  N_CORPUS = 983 + 3;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -1151,6 +1151,12 @@ begin
   Add(i, 'SAVEPOINT spCC',              'SAVEPOINT spCC;');                      Inc(i);
   Add(i, 'RELEASE spCC',                'RELEASE spCC;');                        Inc(i);
   Add(i, 'SAVEPOINT twenty',            'SAVEPOINT twenty;');                    Inc(i);
+
+  { Step 6 — IN-list and LIKE shapes that close after sqlite3ExprCodeIN
+    no longer leaks the regFree1 release. }
+  Add(i, 'SELECT a IN list',            'SELECT a FROM t WHERE a IN (1,2,3);');     Inc(i);
+  Add(i, 'SELECT a NOT IN',             'SELECT a FROM t WHERE a NOT IN (1,2,3);'); Inc(i);
+  Add(i, 'SELECT a LIKE',               'SELECT a FROM t WHERE a LIKE ''abc%'';');  Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
