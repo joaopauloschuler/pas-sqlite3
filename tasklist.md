@@ -671,6 +671,35 @@ Important: At the end of this document, please find:
       WEBF1..WEBF2 (sqlite3WhereExplainBloomFilter returns 0 for both
       populated and all-nil shapes), WAET1..WAET2 (sqlite3WhereAddExplainText
       returns without effect for both populated and all-nil shapes).
+    - [X] Leaf helpers, batch 8 — IN-index pre-flight predicates used by
+      `sqlite3FindInIndex` (the next sub-progress).  `isCandidateForInOpt`
+      (expr.c:3072..3107) decides whether the RHS SELECT of an `X IN (...)`
+      can be answered by a direct table/index scan: rejects compound,
+      DISTINCT, aggregate, GROUP BY, LIMIT, WHERE, multi-table FROM,
+      sub-FROM, view, virtual table, EP_VarSelect (correlated), and any
+      result expression that is not a bare TK_COLUMN; passes the cursor-
+      identity assert (iTable = pSrc^.a[0].iCursor) for every result
+      column.  `sqlite3InRhsIsConstant` (expr.c:3134..3145) temporarily
+      detaches `pIn^.pLeft` so the constant walker only inspects the RHS
+      list, then reattaches — used by the IN_INDEX_NOOP_OK arm to decide
+      whether spinning up an ephemeral b-tree is worthwhile.
+      `sqlite3SetHasNullFlag` (expr.c:3119..3128) emits the three-opcode
+      probe (OP_Integer 0 → reg ; OP_Rewind iCur → done ; OP_Column iCur,0,
+      reg with OPFLAG_TYPEOFARG so OP_Column reports affinity rather than
+      fetching the value) plus the JumpHere back-patch — fills `regHasNull`
+      with NULL iff the b-tree's first column contains a NULL row.
+      `sqlite3RowidAlias` (expr.c:3046..3061) walks `_ROWID_`, `ROWID`,
+      `OID` and returns the first not shadowed by an explicit user column;
+      asserts HasRowid + !TF_NoVisibleRowid (the `VisibleRowid` predicate
+      inlined here, no helper macro added).  Gate: `TestWherePlanner.pas`
+      (464/464): ICO1..ICO8 (well-formed candidate accepted; EP_VarSelect,
+      SF_Distinct, pLimit, virtual table, non-COLUMN result, multi-FROM,
+      and scalar (TK_IN over list rather than SELECT) all rejected),
+      IRC1..IRC2 (constant integer-list accepted, TK_COLUMN list rejected,
+      pLeft restored after each call), SHNF1..SHNF4 (exactly three opcodes
+      emitted; OP_Integer p1=0 / p2=reg ; OP_Rewind p1=iCur / p2 patched to
+      `baseAddr+3` ; OP_Column p1=iCur / p2=0 / p3=reg / p5=TYPEOFARG),
+      RA1 (empty schema picks `_ROWID_`).
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix

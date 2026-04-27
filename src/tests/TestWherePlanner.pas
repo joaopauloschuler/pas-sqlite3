@@ -4179,6 +4179,231 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- batch 8: IN-index pre-flight predicates ----- }
+
+procedure TestInOptCandidate;
+var
+  db:    PTsqlite3;
+  parse: TParse;
+  rc:    i32;
+  pX:    PExpr;
+  pSel:  PSelect;
+  pSrc:  PSrcList;
+  pEL:   PExprList;
+  pTab:  PTable2;
+  pCol:  PExpr;
+  pItem: PSrcItem;
+  pELI:  PExprListItem;
+  ret:   PSelect;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('ICO open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+
+  { Build a minimal `X IN (SELECT col FROM tab)` shape.  We only fill the
+    fields that isCandidateForInOpt actually inspects. }
+  pTab := PTable2(sqlite3DbMallocZero(db, SizeOf(TTable)));
+  pTab^.nCol     := 1;
+  pTab^.eTabType := TABTYP_NORM;
+
+  pSrc := PSrcList(sqlite3DbMallocZero(db, SizeOf(TSrcList)
+                                          + SizeOf(TSrcItem)));
+  pSrc^.nSrc := 1;
+  pSrc^.nAlloc := 1;
+  pItem := SrcListItems(pSrc);
+  pItem^.pSTab := pTab;
+  pItem^.iCursor := 7;
+
+  pCol := PExpr(sqlite3DbMallocZero(db, SizeOf(TExpr)));
+  pCol^.op      := TK_COLUMN;
+  pCol^.iTable  := 7;
+  pCol^.iColumn := 0;
+
+  pEL := PExprList(sqlite3DbMallocZero(db, SizeOf(TExprList)
+                                         + SZ_EXPRLIST_ITEM));
+  pEL^.nExpr  := 1;
+  pEL^.nAlloc := 1;
+  pELI := ExprListItems(pEL);
+  pELI^.pExpr := pCol;
+
+  pSel := PSelect(sqlite3DbMallocZero(db, SizeOf(TSelect)));
+  pSel^.pSrc   := pSrc;
+  pSel^.pEList := pEL;
+
+  pX := PExpr(sqlite3DbMallocZero(db, SizeOf(TExpr)));
+  pX^.op    := TK_IN;
+  pX^.flags := EP_xIsSelect;
+  pX^.x.pSelect := pSel;
+
+  { ---- ICO1: well-formed candidate ⇒ returns the SELECT. ---- }
+  ret := isCandidateForInOpt(pX);
+  Check('ICO1 well-formed candidate accepted', ret = pSel);
+
+  { ---- ICO2: correlated subquery (EP_VarSelect) rejected. ---- }
+  pX^.flags := pX^.flags or EP_VarSelect;
+  Check('ICO2 EP_VarSelect rejected', isCandidateForInOpt(pX) = nil);
+  pX^.flags := pX^.flags and (not EP_VarSelect);
+
+  { ---- ICO3: SF_Distinct rejected. ---- }
+  pSel^.selFlags := SF_Distinct;
+  Check('ICO3 SF_Distinct rejected', isCandidateForInOpt(pX) = nil);
+  pSel^.selFlags := 0;
+
+  { ---- ICO4: pLimit non-nil rejected. ---- }
+  pSel^.pLimit := pX;  { any non-nil pointer }
+  Check('ICO4 pLimit rejected', isCandidateForInOpt(pX) = nil);
+  pSel^.pLimit := nil;
+
+  { ---- ICO5: virtual table rejected. ---- }
+  pTab^.eTabType := TABTYP_VTAB;
+  Check('ICO5 virtual table rejected', isCandidateForInOpt(pX) = nil);
+  pTab^.eTabType := TABTYP_NORM;
+
+  { ---- ICO6: non-COLUMN result expression rejected. ---- }
+  pCol^.op := TK_INTEGER;
+  Check('ICO6 non-COLUMN result rejected', isCandidateForInOpt(pX) = nil);
+  pCol^.op := TK_COLUMN;
+
+  { ---- ICO7: nSrc<>1 rejected. ---- }
+  pSrc^.nSrc := 2;
+  Check('ICO7 multi-FROM rejected', isCandidateForInOpt(pX) = nil);
+  pSrc^.nSrc := 1;
+
+  { ---- ICO8: scalar (non-SELECT) RHS rejected. ---- }
+  pX^.flags := 0;
+  Check('ICO8 scalar IN rejected', isCandidateForInOpt(pX) = nil);
+
+  sqlite3DbFree(db, pX);
+  sqlite3DbFree(db, pSel);
+  sqlite3DbFree(db, pEL);
+  sqlite3DbFree(db, pCol);
+  sqlite3DbFree(db, pSrc);
+  sqlite3DbFree(db, pTab);
+  sqlite3_close(db);
+end;
+
+procedure TestInRhsIsConstant;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  rc:        i32;
+  pIN:       PExpr;
+  pLeft:     PExpr;
+  pRight:    PExpr;
+  pList:     PExprList;
+  pListItem: PExprListItem;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('IRC open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+
+  { LHS is a TK_COLUMN (would normally make ExprIsConstant return 0); RHS is
+    an integer list (constant).  sqlite3InRhsIsConstant must temporarily detach
+    the LHS so the constant walker only sees the RHS. }
+  pLeft := PExpr(sqlite3DbMallocZero(db, SizeOf(TExpr)));
+  pLeft^.op := TK_COLUMN;
+
+  pRight := PExpr(sqlite3DbMallocZero(db, SizeOf(TExpr)));
+  pRight^.op    := TK_INTEGER;
+  pRight^.flags := EP_IntValue;
+  pRight^.u.iValue := 42;
+
+  pList := PExprList(sqlite3DbMallocZero(db, SizeOf(TExprList)
+                                            + SZ_EXPRLIST_ITEM));
+  pList^.nExpr  := 1;
+  pList^.nAlloc := 1;
+  pListItem := ExprListItems(pList);
+  pListItem^.pExpr := pRight;
+
+  pIN := PExpr(sqlite3DbMallocZero(db, SizeOf(TExpr)));
+  pIN^.op       := TK_IN;
+  pIN^.pLeft    := pLeft;
+  pIN^.x.pList  := pList;
+
+  { ---- IRC1: constant RHS ⇒ returns 1; pLeft restored after the call. ---- }
+  Check('IRC1 constant list accepted', sqlite3InRhsIsConstant(@parse, pIN) <> 0);
+  Check('IRC1 pLeft restored',         pIN^.pLeft = pLeft);
+
+  { ---- IRC2: non-constant RHS (TK_COLUMN) ⇒ returns 0. ---- }
+  pRight^.op    := TK_COLUMN;
+  pRight^.flags := 0;
+  Check('IRC2 non-constant list rejected',
+        sqlite3InRhsIsConstant(@parse, pIN) = 0);
+  Check('IRC2 pLeft restored',         pIN^.pLeft = pLeft);
+
+  sqlite3DbFree(db, pIN);
+  sqlite3DbFree(db, pList);
+  sqlite3DbFree(db, pRight);
+  sqlite3DbFree(db, pLeft);
+  sqlite3_close(db);
+end;
+
+procedure TestSetHasNullFlag;
+var
+  db:       PTsqlite3;
+  parse:    TParse;
+  v:        PVdbe;
+  rc:       i32;
+  baseAddr: i32;
+  pOp:      PVdbeOp;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('SHNF open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  baseAddr := sqlite3VdbeCurrentAddr(v);
+  sqlite3SetHasNullFlag(v, 5, 9);
+
+  { Exactly three opcodes are added (Integer + Rewind + Column); the
+    OP_Rewind's P2 is back-patched by JumpHere onto the *next* address,
+    which is what the body relies on for the "no-NULL" exit. }
+  Check('SHNF1 three opcodes emitted',
+        sqlite3VdbeCurrentAddr(v) = baseAddr + 3);
+
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(baseAddr) * SizeOf(TVdbeOp));
+  Check('SHNF2 [0] = OP_Integer',     pOp^.opcode = OP_Integer);
+  Check('SHNF2 [0].p1 = 0',           pOp^.p1     = 0);
+  Check('SHNF2 [0].p2 = regHasNull',  pOp^.p2     = 9);
+
+  Inc(pOp);
+  Check('SHNF3 [1] = OP_Rewind',      pOp^.opcode = OP_Rewind);
+  Check('SHNF3 [1].p1 = iCur',        pOp^.p1     = 5);
+  Check('SHNF3 [1].p2 = next addr',   pOp^.p2     = baseAddr + 3);
+
+  Inc(pOp);
+  Check('SHNF4 [2] = OP_Column',      pOp^.opcode = OP_Column);
+  Check('SHNF4 [2].p1 = iCur',        pOp^.p1     = 5);
+  Check('SHNF4 [2].p2 = 0',           pOp^.p2     = 0);
+  Check('SHNF4 [2].p3 = regHasNull',  pOp^.p3     = 9);
+  Check('SHNF4 [2].p5 = TYPEOFARG',   pOp^.p5     = OPFLAG_TYPEOFARG);
+
+  sqlite3_close(db);
+end;
+
+procedure TestRowidAlias;
+var
+  db:    PTsqlite3;
+  pTab:  PTable2;
+begin
+  db := nil;
+  if sqlite3_open(':memory:', @db) <> SQLITE_OK then begin
+    Check('RA open', False); Exit;
+  end;
+
+  { ---- RA1: empty schema ⇒ no shadow ⇒ first option `_ROWID_`. ---- }
+  pTab := PTable2(sqlite3DbMallocZero(db, SizeOf(TTable)));
+  pTab^.nCol := 0;
+  Check('RA1 empty schema picks _ROWID_',
+        sqlite3StrICmp(sqlite3RowidAlias(pTab), '_ROWID_') = 0);
+
+  sqlite3DbFree(db, pTab);
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -4233,6 +4458,10 @@ begin
   TestFilterPullDown;
   TestRemoveUnindexableInClauseTerms;
   TestWhereCodeCursorHintAndExplainStubs;
+  TestInOptCandidate;
+  TestInRhsIsConstant;
+  TestSetHasNullFlag;
+  TestRowidAlias;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

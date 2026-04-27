@@ -2479,6 +2479,39 @@ function  sqlite3WhereExplainBloomFilter(pParse: PParse; pWInfo: PWhereInfo;
 procedure sqlite3WhereAddExplainText(pParse: PParse; addr: i32;
   pTabList: PSrcList; pLevel: PWhereLevel; wctrlFlags: u16);
 
+{ Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers, batch 8.
+  IN-index pre-flight predicates used by `sqlite3FindInIndex` (the next sub-
+  progress).  All four are pure leaves, no recursion into the planner.
+
+  isCandidateForInOpt (expr.c:3072..3107) — pX is the RHS of an IN operator;
+  return the underlying SELECT iff it can be answered by a direct table or
+  index scan (single-table FROM, no WHERE / GROUP BY / LIMIT, no DISTINCT
+  or aggregates, no compound, no correlation, every result column a bare
+  TK_COLUMN).  Returns nil whenever materialisation into a transient table
+  would be required.  Pure tree-shape predicate, no codegen, no allocation.
+
+  sqlite3InRhsIsConstant (expr.c:3134..3145) — pIn is an `X IN (list)` Expr
+  whose RHS is a constant list.  Temporarily detaches pIn^.pLeft so that
+  sqlite3ExprIsConstant ignores the LHS, runs the constness walker over the
+  RHS, then reattaches pLeft.  Used by sqlite3FindInIndex's NOOP_OK arm to
+  decide whether spinning up an ephemeral b-tree is worthwhile.
+
+  sqlite3SetHasNullFlag (expr.c:3119..3128) — emits four opcodes that fill a
+  NULL-status register: OP_Integer 0 → reg ; OP_Rewind iCur → done ;
+  OP_Column iCur,0,reg with OPFLAG_TYPEOFARG (so OP_Column reports affinity
+  rather than fetching the value); OP_JumpHere patches the rewind label.
+  After execution the register is NULL iff the b-tree on iCur contains at
+  least one NULL in its first column.
+
+  sqlite3RowidAlias (expr.c:3046..3061) — picks the first of `_ROWID_`,
+  `ROWID`, `OID` that the user has *not* shadowed with an explicit column
+  name.  Returns nil when all three are taken.  Caller must guarantee
+  HasRowid(pTab) (the C version asserts on VisibleRowid). }
+function isCandidateForInOpt(pX: PExpr): PSelect;
+function sqlite3InRhsIsConstant(pParse: PParse; pIn: PExpr): i32;
+procedure sqlite3SetHasNullFlag(v: PVdbe; iCur: i32; regHasNull: i32);
+function sqlite3RowidAlias(pTab: PTable2): PAnsiChar;
+
 { Index helpers }
 procedure sqlite3FreeIndex(db: PTsqlite3; p: PIndex2);
 procedure sqlite3UnlinkAndDeleteIndex(db: PTsqlite3; iDb: i32;
@@ -20103,6 +20136,92 @@ begin
     once the EQP corpus tests in 6.10 require real OP_Explain text. }
   if (pParse = nil) and (addr = 0) and (pTabList = nil) and (pLevel = nil)
      and (wctrlFlags = 0) then Exit;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers,
+  batch 8.
+
+  See forward-decl block (~line 2480) for descriptions.
+
+  These four are the pre-flight predicates `sqlite3FindInIndex` consults
+  before deciding whether a `... IN (SELECT ...)` operator can reuse an
+  existing table or index — no codegen is performed here apart from the
+  4-opcode OP_Column-typeof probe that sqlite3SetHasNullFlag emits when the
+  caller wants a "RHS contains NULL?" register.
+  =========================================================================== }
+
+function isCandidateForInOpt(pX: PExpr): PSelect;
+var
+  p:     PSelect;
+  pSrc:  PSrcList;
+  pEL:   PExprList;
+  pTab:  PTable2;
+  pItem: PSrcItem;
+  pRes:  PExpr;
+  i:     i32;
+begin
+  if not ExprUseXSelect(pX)              then Exit(nil); { not a subquery }
+  if ExprHasProperty(pX, EP_VarSelect)   then Exit(nil); { correlated subq }
+  p := pX^.x.pSelect;
+  if p^.pPrior <> nil                    then Exit(nil); { compound SELECT }
+  if (p^.selFlags and (SF_Distinct or SF_Aggregate)) <> 0 then Exit(nil);
+  Assert(p^.pGroupBy = nil);             { implied by !SF_Aggregate }
+  if p^.pLimit <> nil                    then Exit(nil);
+  if p^.pWhere <> nil                    then Exit(nil);
+  pSrc := p^.pSrc;
+  Assert(pSrc <> nil);
+  if pSrc^.nSrc <> 1                     then Exit(nil); { single FROM term }
+  pItem := SrcListItems(pSrc);
+  { fg.fgBits bit 2 = isSubquery (matches the layout used at line 9865) }
+  if (pItem^.fg.fgBits and u8($04)) <> 0 then Exit(nil);
+  pTab := pItem^.pSTab;
+  Assert(pTab <> nil);
+  Assert(pTab^.eTabType <> TABTYP_VIEW); { isCandidate is called after view-flatten }
+  if pTab^.eTabType = TABTYP_VTAB        then Exit(nil); { virtual }
+  pEL := p^.pEList;
+  Assert(pEL <> nil);
+  for i := 0 to pEL^.nExpr - 1 do begin
+    pRes := PExprListItem(PByte(ExprListItems(pEL))
+              + i * SZ_EXPRLIST_ITEM)^.pExpr;
+    if pRes^.op <> TK_COLUMN then Exit(nil);
+    Assert(pRes^.iTable = pItem^.iCursor); { not correlated }
+  end;
+  Result := p;
+end;
+
+function sqlite3InRhsIsConstant(pParse: PParse; pIn: PExpr): i32;
+var
+  pLHS: PExpr;
+begin
+  Assert(not ExprHasProperty(pIn, EP_xIsSelect));
+  pLHS := pIn^.pLeft;
+  pIn^.pLeft := nil;
+  Result := sqlite3ExprIsConstant(pParse, pIn);
+  pIn^.pLeft := pLHS;
+end;
+
+procedure sqlite3SetHasNullFlag(v: PVdbe; iCur: i32; regHasNull: i32);
+var
+  addr1: i32;
+begin
+  sqlite3VdbeAddOp2(v, OP_Integer, 0, regHasNull);
+  addr1 := sqlite3VdbeAddOp1(v, OP_Rewind, iCur);
+  sqlite3VdbeAddOp3(v, OP_Column, iCur, 0, regHasNull);
+  sqlite3VdbeChangeP5(v, OPFLAG_TYPEOFARG);
+  sqlite3VdbeJumpHere(v, addr1);
+end;
+
+function sqlite3RowidAlias(pTab: PTable2): PAnsiChar;
+const
+  azOpt: array[0..2] of PAnsiChar = ('_ROWID_', 'ROWID', 'OID');
+var
+  ii: i32;
+begin
+  Assert((pTab^.tabFlags and (TF_WithoutRowid or TF_NoVisibleRowid)) = 0);
+  for ii := 0 to High(azOpt) do
+    if sqlite3ColumnIndex(pTab, azOpt[ii]) < 0 then Exit(azOpt[ii]);
+  Result := nil;
 end;
 
 end.
