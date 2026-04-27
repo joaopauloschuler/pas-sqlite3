@@ -156,7 +156,7 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 13 PASS / 4
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 16 PASS / 1
     DIVERGE / 0 ERROR (corpus = 17); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
@@ -187,28 +187,18 @@ Important: At the end of this document, please find:
     build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold landed; corpus expanded to 17 rows (DDL + a SELECT/DML probe).
-  Current Status (2026-04-27): **13 PASS / 4 DIVERGE / 0 ERROR**.
+  Current Status (2026-04-27): **16 PASS / 1 DIVERGE / 0 ERROR**.
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT) and promote from report-only to hard gate.
 
   PASS rows: CREATE TABLE simple / typed / IF NOT EXISTS / composite PK
   / WITHOUT ROWID, CREATE INDEX, CREATE UNIQUE INDEX, DROP INDEX IF
   EXISTS, BEGIN, COMMIT, INSERT VALUES, SELECT col scan,
-  SELECT rowid EQ.
+  SELECT rowid EQ, SELECT literal, SELECT * scan, DELETE rowid EQ.
 
   DIVERGE rows + delta = (C ops − Pas ops):
 
   - DROP TABLE — Δ=21 (step 4)
-  - SELECT literal — Δ=3 (sqlite3Select bails on no-FROM SELECT;
-    missing Integer + ResultRow + Explain tail)
-  - SELECT * scan — Δ=9 (sqlite3Select bails on `*` expansion;
-    OpenRead + Rewind + Column×3 + ResultRow + Next tail elided)
-  - DELETE rowid EQ — Δ=+5 (Pas still uses 2-pass ROWSET strategy
-    instead of C's ONEPASS_SINGLE; the spurious false-WHERE-Term-Bypass
-    on rowid=5 and the trailing change-counter Integer/Goto pair are
-    now resolved — fixed by porting a productive sqlite3ResolveExprNames
-    so DELETE/UPDATE WHERE clauses get TK_ID→TK_COLUMN resolution and
-    rowid pseudo-column rewrite)
 
   Root cause for DROP TABLE: Pas-side elides the C-side
   pre-Destroy "scan sqlite_schema for trigger rows + reinsert" pass
@@ -267,33 +257,33 @@ Important: At the end of this document, please find:
       further (pragma / trigger / multi-table SELECT / UPDATE) and
       promote from report-only to hard gate.
 
-    - [ ] **6.10 step 7** Resolve the SELECT/DML divergences exposed by
-      the expanded corpus:
-        * `sqlite3Select` early-bail on no-FROM SELECT (`SELECT 1;`)
-          and `SELECT *` shape — both currently produce only
-          Init/Halt/Goto.  Find the bail and emit the column-eval +
-          ResultRow tail.
+    - [X] **6.10 step 7** SELECT/DML divergences exposed by the
+      expanded corpus all closed:
+        * [X] `sqlite3Select` no-FROM fast path — `SELECT <expr-list>;`
+          with empty pSrc emits OP_Explain + per-col sqlite3ExprCode
+          + OP_ResultRow.  SELECT literal flipped to PASS.
+        * [X] `sqlite3SelectExpand` star-expansion (select.c:830..980,
+          plain TK_ASTERISK only — T.\* form deferred): replaces top-
+          level `*` with one TK_COLUMN per visible (non-HIDDEN /
+          non-VIRTUAL) FROM-table column, populates colUsed.  Also
+          fixed a latent double-advance bug in
+          `sqlite3GenerateColumnNames` (Inc(items) plus items[i] index
+          stepped by 2 — masked while every PASS row had nResultCol=1).
+          SELECT \* scan flipped to PASS.
         * [X] OP_Explain emission landed in `sqlite3WhereExplainOneScan`
-          (lower path + new multi-loop path of `sqlite3WhereBegin`);
-          `whereShortCut` full-scan rRun adjusted to
-          `pTab^.nRowLogEst + 16`.  SELECT col scan / SELECT rowid EQ
-          flipped to PASS.  DELETE rowid EQ now Δ=−13 (one extra
-          OP_Explain that C's ONEPASS path elides — addressed by the
-          ONEPASS migration sub-task below).
-        * `sqlite3DeleteFrom` rowid-EQ should pick ONEPASS_SINGLE
-          (in-loop Delete) instead of the 2-pass ROWSET strategy.
-          Spurious memCnt-driven AddImm / FkCheck / ResultRow path
-          closed by fixing the wrong default-flags bit in
-          `passqlite3main.pas:507` (HI(0x00001)=SQLITE_CountRows was
-          being set in place of the intended LO(0x40)=ShortColNames).
+          (lower path + new multi-loop path of `sqlite3WhereBegin`).
+        * [X] `sqlite3DeleteFrom` rowid-EQ → ONEPASS_SINGLE: when
+          `sqlite3WhereBegin` sees `WHERE_ONEPASS_DESIRED` and the
+          plan picked WHERE_ONEROW, it sets `pWInfo^.eOnePass =
+          ONEPASS_SINGLE`, populates `aiCurOnePass[0]`, and opens
+          the cursor with OP_OpenWrite.  DELETE rowid EQ flipped
+          to PASS (in-loop Delete, no ROWSET detour).  Spurious
+          memCnt-driven AddImm / FkCheck / ResultRow path closed by
+          fixing the wrong default-flags bit in `passqlite3main.pas:507`
+          (HI(0x00001)=SQLITE_CountRows was being set in place of the
+          intended LO(0x40)=ShortColNames).
         * [X] False-WHERE-Term-Bypass spurious-fire on `rowid=5` —
-          fixed by porting a productive `sqlite3ResolveExprNames`
-          (was a stub returning OK without resolving anything).
-          DELETE / UPDATE WHERE clauses now get TK_ID→TK_COLUMN
-          resolution + rowid pseudo-column rewrite, so prereqAll
-          picks up the cursor mask and the bypass loop skips the
-          term.  Trailing change-counter Integer/Goto pair was a
-          downstream symptom — also gone.
+          fixed by porting a productive `sqlite3ResolveExprNames`.
 
 ---
 

@@ -14160,10 +14160,13 @@ begin
     contributes nRowOut=1 (LogEst 0) to the parser's running query-loop count. }
   pParse^.nQueryLoop := i16(pParse^.nQueryLoop + pWInfo^.nRowOut);
 
-  { Open the level-0 table cursor.  Trimmed port of where.c:7242..7320 — the
-    rowid-EQ shape is non-virtual + non-view + WHERE_INDEXED=0 + ONEPASS_OFF,
-    so only the OP_OpenRead arm fires.  ColumnsUsed / cursor-hint / IfEmpty
-    decorations are deferred (not exercised by the gate today). }
+  { Open the level-0 table cursor.  Trimmed port of where.c:7242..7320.
+    The rowid-EQ shape opens with OP_OpenWrite when the caller passed
+    WHERE_ONEPASS_DESIRED (i.e. DELETE/UPDATE) — sqlite3DeleteFrom
+    consults sqlite3WhereOkOnePass and emits the in-loop OP_Delete
+    directly instead of the 2-pass ROWSET detour.  ColumnsUsed /
+    cursor-hint / IfEmpty decorations are deferred (not exercised by
+    the gate today). }
   pLevel   := @whereInfoLevels(pWInfo)[0];
   pTabItem := @SrcListItems(pTabList)[0];
   pTab     := pTabItem^.pSTab;
@@ -14184,10 +14187,25 @@ begin
     Exit(nil);
   end;
 
+  { ONEPASS_SINGLE detection — where.c:7263..7283.  When the caller
+    signals it can absorb a single-row delete/update inline and
+    whereShortCut picked WHERE_ONEROW (rowid-EQ), promote the cursor
+    to OP_OpenWrite and record eOnePass + the cursor in aiCurOnePass[0]
+    so sqlite3DeleteFrom skips the 2-pass ROWSET path. }
+  if ((wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0)
+     and ((pLoop^.wsFlags and WHERE_ONEROW) <> 0) then
+  begin
+    pWInfo^.eOnePass := ONEPASS_SINGLE;
+    pWInfo^.aiCurOnePass[0] := pLevel^.iTabCur;
+  end;
+
   { Ensure schema cookie / OP_Transaction prologue is emitted for iDb. }
   sqlite3CodeVerifySchema(pParse, iDb);
 
-  sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenRead);
+  if pWInfo^.eOnePass <> ONEPASS_OFF then
+    sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenWrite)
+  else
+    sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenRead);
   sqlite3VdbeChangeP5(v, 0);
 
   { Phase 6.9-bis 11g.2.f sub-progress 20 — pre-allocate the rowid-seek
@@ -16290,7 +16308,7 @@ begin
   for i := 0 to pEList^.nExpr - 1 do
   begin
     pE := items[i].pExpr;
-    if pE = nil then begin Inc(items); continue; end;
+    if pE = nil then continue;
     if (items[i].zEName <> nil) and
        ((items[i].fg.eBits and $03) = ENAME_NAME) then
     begin
@@ -16325,7 +16343,6 @@ begin
         zName := sqlite3DbStrDup(db, zName);
       sqlite3VdbeSetColName(v, i, COLNAME_NAME, zName, SQLITE_DYNAMIC);
     end;
-    Inc(items);
   end;
 end;
 
@@ -16644,6 +16661,93 @@ end;
       stub for those rows, same surface as before this change).
     * Fails fast on missing-table — sqlite3LocateTableItem already
       raises sqlite3ErrorMsg, so we just propagate via pParse^.nErr. }
+{ expandStar — minimum-viable port of the TK_ASTERISK expansion arm
+  inside selectExpander (select.c:830..980).  Builds a fresh pEList
+  by replacing each top-level `*` with one TK_COLUMN expr per visible
+  (non-HIDDEN, non-VIRTUAL) column of every resolved FROM item.
+
+  Restrictions of this slice:
+    * Only plain TK_ASTERISK at top level — TK_DOT/T.* form not yet
+      handled (no current corpus row exercises it).
+    * Result column names (zEName) are not synthesised here — the
+      codegen path uses sqlite3GenerateColumnNames which derives names
+      from the underlying Table->aCol[].zCnName, so leaving zEName=nil
+      matches what the C reference does for unaliased columns. }
+procedure expandStar(pParse: PParse; p: PSelect);
+var
+  pEList:    PExprList;
+  pNew:      PExprList;
+  items:     PExprListItem;
+  pE:        PExpr;
+  pSrc:      PSrcList;
+  base:      PSrcItem;
+  pItem:     PSrcItem;
+  pTab:      PTable2;
+  pCol:      PColumn;
+  k, i, j:   i32;
+  hasStar:   Boolean;
+  pColExpr:  PExpr;
+  db:        PTsqlite3;
+begin
+  pEList := p^.pEList;
+  pSrc   := p^.pSrc;
+  if (pEList = nil) or (pEList^.nExpr < 1) then Exit;
+
+  { Probe for any plain TK_ASTERISK at top level. }
+  hasStar := False;
+  items := ExprListItems(pEList);
+  for k := 0 to pEList^.nExpr - 1 do
+  begin
+    pE := items[k].pExpr;
+    if (pE <> nil) and (pE^.op = TK_ASTERISK) then begin hasStar := True; Break; end;
+  end;
+  if not hasStar then Exit;
+
+  db := pParse^.db;
+  pNew := nil;
+  for k := 0 to pEList^.nExpr - 1 do
+  begin
+    pE := items[k].pExpr;
+    if (pE = nil) or (pE^.op <> TK_ASTERISK) then
+    begin
+      { Carry the original entry intact — transfer ownership to pNew. }
+      pNew := sqlite3ExprListAppend(pParse, pNew, pE);
+      items[k].pExpr := nil;
+      Continue;
+    end;
+
+    { Expand: walk every resolved FROM item, append one TK_COLUMN per
+      visible column. }
+    base := SrcListItems(pSrc);
+    for i := 0 to pSrc^.nSrc - 1 do
+    begin
+      pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+      pTab  := pItem^.pSTab;
+      if pTab = nil then Continue;
+      if pTab^.aCol = nil then Continue;
+      for j := 0 to pTab^.nCol - 1 do
+      begin
+        pCol := PColumn(PByte(pTab^.aCol) + j * SizeOf(TColumn));
+        if (pCol^.colFlags and (COLFLAG_HIDDEN or COLFLAG_VIRTUAL)) <> 0 then
+          Continue;
+        pColExpr := sqlite3ExprAlloc(db, TK_COLUMN, nil, 0);
+        if pColExpr = nil then Continue;
+        pColExpr^.iTable  := pItem^.iCursor;
+        pColExpr^.iColumn := i16(j);
+        pColExpr^.y.pTab  := pTab;
+        if j < BMS - 1 then
+          pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl j)
+        else
+          pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+        pNew := sqlite3ExprListAppend(pParse, pNew, pColExpr);
+      end;
+    end;
+  end;
+
+  sqlite3ExprListDelete(db, pEList);
+  p^.pEList := pNew;
+end;
+
 procedure sqlite3SelectExpand(pParse: PParse; pSelect: PSelect);
 var
   w:        TWalker;
@@ -16724,6 +16828,15 @@ begin
       end;
     end;
   end;
+
+  { Star-expansion pass — minimal port of selectExpander's TK_ASTERISK
+    handling (select.c:830..980).  Replaces a top-level `*` in pEList
+    with one TK_COLUMN entry per visible (non-HIDDEN, non-VIRTUAL)
+    column of every resolved FROM item.  T.* form is not yet handled. }
+  if (pSelect <> nil) and (pSelect^.pEList <> nil)
+     and (pSelect^.pSrc <> nil) and (pSelect^.pSrc^.nSrc > 0)
+  then
+    expandStar(pParse, pSelect);
 
   { Tail-call sqlite3SelectPopWith via walker so the parser-supplied
     pWith stack stays balanced.  This was the only behaviour of the
@@ -17029,6 +17142,37 @@ begin
      (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
   if p^.pPrior <> nil then begin Result := SQLITE_OK; Exit; end;
+  { No-FROM fast path — `SELECT <expr-list>;` with no source table.
+    Emit OP_Explain + per-result-col sqlite3ExprCode + OP_ResultRow.
+    Mirrors the tail of selectInnerLoop for SRT_Output when WhereBegin
+    is skipped (no cursor to iterate). }
+  if ((p^.pSrc = nil) or (p^.pSrc^.nSrc = 0))
+     and (pDest^.eDest = SRT_Output)
+     and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
+     and (p^.pGroupBy = nil) and (p^.pHaving = nil)
+     and (p^.pOrderBy = nil) and (p^.pLimit = nil) and (p^.pWin = nil)
+     and ((p^.selFlags and (SF_Distinct or SF_Aggregate or SF_Compound)) = 0)
+  then
+  begin
+    v := sqlite3GetVdbe(pParse);
+    if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    sqlite3GenerateColumnNames(pParse, p);
+    pEList := p^.pEList;
+    nResultCol := pEList^.nExpr;
+    pDest^.nSdst := nResultCol;
+    if pDest^.iSdst = 0 then
+    begin
+      pDest^.iSdst := pParse^.nMem + 1;
+      pParse^.nMem := pParse^.nMem + nResultCol;
+    end;
+    sqlite3VdbeAddOp3(v, OP_Explain, sqlite3VdbeCurrentAddr(v), 0, 0);
+    items := ExprListItems(pEList);
+    for i := 0 to nResultCol - 1 do
+      sqlite3ExprCode(pParse, items[i].pExpr, pDest^.iSdst + i);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+    if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
+    Exit;
+  end;
   if p^.pSrc = nil then begin Result := SQLITE_OK; Exit; end;
   { Multi-table join gate: allow up to 2-table plain JOINs (nSrc=1 or 2).
     Larger join counts, subqueries, and other shapes stay deferred. }
