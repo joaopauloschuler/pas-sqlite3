@@ -3683,12 +3683,47 @@ Important: At the end of this document, please find:
           675/675, TestExplainParity 2/10, TestVdbeArith 41/41,
           TestJson 434/434.
 
-      Sub-progress 35 options: all four remaining corpus DIVERGEs
-      (LEFT_JOIN, JOIN_WHERE, EXISTS_SUB, NOT_EXISTS) are gated on
-      11g.2.d.  Open avenues that do NOT depend on 11g.2.d:
-      (i) corpus expansion group #6 — additional single-table shapes;
-      (ii) begin sketching the multi-table planner (11g.2.d itself);
-      (iii) drive TestExplainParity diverges down (currently 2/10).
+    - [X] Sub-progress 35 — corpus expansion group #6 (2026-04-27).
+      Eight new single-table rows added to TestWhereCorpus.pas;
+      N_CORPUS 68 → 76.  Test-corpus only — no codegen changes.
+
+      | Row | Shape | Outcome |
+      |-----|-------|---------|
+      | UMINUS  | `-a = -5`            | DIVERGE (C=14 Pas=12) |
+      | UPLUS   | `+a = 5`             | PASS (12 ops) |
+      | MOD     | `a % 3 = 0`          | PASS (14 ops) |
+      | DIV     | `a / 2 = 2`          | PASS (13 ops) |
+      | CONCAT  | `a \|\| 'x' = '5x'`  | PASS (14 ops) |
+      | IS_TRUE | `a IS TRUE`          | DIVERGE (C=11 Pas=12) |
+      | TYPEOF  | `typeof(a)='integer'`| PASS (13 ops) |
+      | HEX     | `hex(a)='05'`        | PASS (13 ops) |
+
+      Two new documented gaps:
+        * UMINUS: TK_UMINUS arm is constant-folding only; the
+          column-variable runtime path (Integer 0, Integer -5,
+          Subtract) is missing for `-a` against a column.  Future
+          sub-progress: port the runtime UMINUS arm in
+          `sqlite3ExprCodeTarget`.
+        * IS_TRUE: TK_IS with TK_TRUEFALSE/TK_TRUE RHS materialises
+          TRUE as integer 1 + OP_Ne instead of using the dedicated
+          OP_IfNot p3=1 fast path.  Future sub-progress: special-case
+          TK_TRUEFALSE in the TK_IS arm.
+
+      Test-suite delta:
+        * TestWhereCorpus: **70 PASS / 6 DIVERGE / 0 ERROR (corpus = 76)**.
+          Pre-existing DIVERGEs unchanged (LEFT_JOIN, JOIN_WHERE,
+          EXISTS_SUB, NOT_EXISTS — all blocked on 11g.2.d).
+        * No regression anywhere: TestParser 45/45, TestExprBasic
+          40/40, TestSelectBasic 49/49, TestDMLBasic 54/54,
+          TestSchemaBasic 44/44, TestPrepareBasic 20/20,
+          TestWhereBasic 52/52, TestWhereSimple 44/44, TestWhereExpr
+          84/84, TestWherePlanner 675/675, TestExplainParity 2/10,
+          TestVdbeArith 41/41, TestJson 434/434.
+
+      Sub-progress 36 options: (i) port the column-variable TK_UMINUS
+      runtime arm; (ii) special-case TK_TRUEFALSE in TK_IS to use
+      OP_IfNot p3=1; (iii) corpus expansion group #7;
+      (iv) begin 11g.2.d multi-table planner.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

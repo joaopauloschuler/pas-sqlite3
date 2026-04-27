@@ -104,7 +104,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 68;
+  N_CORPUS = 76;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -319,6 +319,29 @@ begin
       'SELECT a FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.x = t.a);'); Inc(i);
   Add(i, 'NOT EXISTS subselect',   'NOT_EXISTS',
       'SELECT a FROM t WHERE NOT EXISTS (SELECT 1 FROM s WHERE s.x = t.a);'); Inc(i);
+
+  { Phase 6.9-bis 11g.2.f sub-progress 35 — corpus expansion group #6.
+    Eight new single-table shapes that exercise codegen paths not yet
+    covered: TK_UMINUS (unary minus), TK_UPLUS (unary plus), modulo and
+    division arithmetic, string concatenation (TK_CONCAT), IS TRUE/IS FALSE
+    boolean tests, typeof() scalar function, and hex() scalar function.
+    All degrade to SCAN-with-residual on the un-indexed fixture. }
+  Add(i, '-a = -5 (UMINUS)',          'UMINUS',
+      'SELECT a FROM t WHERE -a = -5;');                         Inc(i);
+  Add(i, '+a = 5 (UPLUS)',            'UPLUS',
+      'SELECT a FROM t WHERE +a = 5;');                          Inc(i);
+  Add(i, 'a % 3 = 0 (MOD)',           'MOD',
+      'SELECT a FROM t WHERE a % 3 = 0;');                       Inc(i);
+  Add(i, 'a / 2 = 2 (DIV)',           'DIV',
+      'SELECT a FROM t WHERE a / 2 = 2;');                       Inc(i);
+  Add(i, 'a||''x'' = ''5x'' (CONCAT)','CONCAT',
+      'SELECT a FROM t WHERE a || ''x'' = ''5x'';');             Inc(i);
+  Add(i, 'a IS TRUE',                 'IS_TRUE',
+      'SELECT a FROM t WHERE a IS TRUE;');                       Inc(i);
+  Add(i, 'typeof(a)=''integer''',     'TYPEOF',
+      'SELECT a FROM t WHERE typeof(a) = ''integer'';');         Inc(i);
+  Add(i, 'hex(a)=''05''',             'HEX',
+      'SELECT a FROM t WHERE hex(a) = ''05'';');                 Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
