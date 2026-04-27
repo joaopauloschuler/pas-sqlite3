@@ -2666,6 +2666,8 @@ procedure sqlite3MultiWrite(pParse: PParse);
 procedure sqlite3MayAbort(pParse: PParse);
 function  sqlite3GetTempReg(pParse: PParse): i32;
 procedure sqlite3ReleaseTempReg(pParse: PParse; iReg: i32);
+function  sqlite3GetTempRange(pParse: PParse; nReg: i32): i32;
+procedure sqlite3ReleaseTempRange(pParse: PParse; iReg: i32; nReg: i32);
 procedure sqlite3HaltConstraint(pParse: PParse; errCode: i32;
   onError: i32; p4: PAnsiChar; p4type: i8; p5: u8);
 procedure sqlite3UniqueConstraint(pParse: PParse; onError: i32;
@@ -16689,6 +16691,49 @@ begin
       pParse^.aTempReg[pParse^.nTempReg] := iReg;
       Inc(pParse^.nTempReg);
     end;
+  end;
+end;
+
+{ sqlite3GetTempRange / sqlite3ReleaseTempRange — port of expr.c:7603/7617.
+  Allocate / recycle a contiguous block of nReg registers.  The single-register
+  case fans out to the temp-register pool; longer runs come out of the
+  Parse-scoped iRangeReg/nRangeReg cache or freshly bumped pParse^.nMem. }
+function sqlite3GetTempRange(pParse: PParse; nReg: i32): i32;
+var
+  i, n: i32;
+begin
+  if nReg = 1 then
+  begin
+    Result := sqlite3GetTempReg(pParse);
+    Exit;
+  end;
+  i := pParse^.iRangeReg;
+  n := pParse^.nRangeReg;
+  if nReg <= n then
+  begin
+    pParse^.iRangeReg := pParse^.iRangeReg + nReg;
+    pParse^.nRangeReg := pParse^.nRangeReg - nReg;
+  end
+  else
+  begin
+    i := pParse^.nMem + 1;
+    pParse^.nMem := pParse^.nMem + nReg;
+  end;
+  Result := i;
+end;
+
+procedure sqlite3ReleaseTempRange(pParse: PParse; iReg: i32; nReg: i32);
+begin
+  if nReg = 1 then
+  begin
+    sqlite3ReleaseTempReg(pParse, iReg);
+    Exit;
+  end;
+  sqlite3VdbeReleaseRegisters(pParse, iReg, nReg, 0, 0);
+  if nReg > pParse^.nRangeReg then
+  begin
+    pParse^.nRangeReg := nReg;
+    pParse^.iRangeReg := iReg;
   end;
 end;
 

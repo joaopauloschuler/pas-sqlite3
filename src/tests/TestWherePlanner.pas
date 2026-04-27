@@ -5337,6 +5337,120 @@ end;
        plus one residual WHERE term sitting in pWInfo^.sWC.  Verifies the
        iLoop=2 (no pIdx) walk emits a sqlite3ExprIfFalse residual against
        a TK_EQ over TK_INTEGER and tags the term TERM_CODED. ---- }
+{ Leaf-helpers batch 11 — sqlite3GetTempRange / sqlite3ReleaseTempRange.
+  No VDBE / db needed; the only fields touched are pParse^.{nMem, nTempReg,
+  aTempReg, iRangeReg, nRangeReg}.  Single-register cases proxy through
+  sqlite3GetTempReg / sqlite3ReleaseTempReg so we exercise both pool
+  paths.  Multi-register cases hit the iRangeReg/nRangeReg cache fast
+  path (when the cache is fat enough) and the nMem-bump fallback. }
+procedure TestGetTempRange;
+var
+  parse: TParse;
+  r:     i32;
+begin
+  { ---- GTR1 — nReg=1 with empty temp pool → bumps nMem, returns it. ---- }
+  FillChar(parse, SizeOf(parse), 0);
+  parse.nMem := 4;
+  r := sqlite3GetTempRange(@parse, 1);
+  Check('GTR1 nReg=1 empty pool returns ++nMem', r = 5);
+  Check('GTR1 nMem incremented by 1', parse.nMem = 5);
+
+  { ---- GTR2 — nReg=1 with one register cached in temp pool → reuses it. ---- }
+  FillChar(parse, SizeOf(parse), 0);
+  parse.nMem := 12;
+  parse.aTempReg[0] := 7;
+  parse.nTempReg := 1;
+  r := sqlite3GetTempRange(@parse, 1);
+  Check('GTR2 nReg=1 with pool returns cached register', r = 7);
+  Check('GTR2 nTempReg decremented', parse.nTempReg = 0);
+  Check('GTR2 nMem untouched', parse.nMem = 12);
+
+  { ---- GTR3 — nReg>1 with cache fat enough → carve from iRangeReg. ---- }
+  FillChar(parse, SizeOf(parse), 0);
+  parse.nMem := 100;
+  parse.iRangeReg := 50;
+  parse.nRangeReg := 10;
+  r := sqlite3GetTempRange(@parse, 4);
+  Check('GTR3 cache hit returns iRangeReg', r = 50);
+  Check('GTR3 iRangeReg advanced', parse.iRangeReg = 54);
+  Check('GTR3 nRangeReg shrunk', parse.nRangeReg = 6);
+  Check('GTR3 nMem untouched', parse.nMem = 100);
+
+  { ---- GTR4 — nReg>1 cache too small → fall back to nMem bump. ---- }
+  FillChar(parse, SizeOf(parse), 0);
+  parse.nMem := 20;
+  parse.iRangeReg := 0;
+  parse.nRangeReg := 0;
+  r := sqlite3GetTempRange(@parse, 5);
+  Check('GTR4 fallback returns nMem+1', r = 21);
+  Check('GTR4 nMem advanced by nReg', parse.nMem = 25);
+  Check('GTR4 iRangeReg untouched', parse.iRangeReg = 0);
+  Check('GTR4 nRangeReg untouched', parse.nRangeReg = 0);
+
+  { ---- GTR5 — nReg>1 cache exactly equal to nReg → carve, leaves zero. ---- }
+  FillChar(parse, SizeOf(parse), 0);
+  parse.nMem := 80;
+  parse.iRangeReg := 30;
+  parse.nRangeReg := 3;
+  r := sqlite3GetTempRange(@parse, 3);
+  Check('GTR5 exact-fit cache returns iRangeReg', r = 30);
+  Check('GTR5 iRangeReg advanced past block', parse.iRangeReg = 33);
+  Check('GTR5 nRangeReg drained to 0', parse.nRangeReg = 0);
+
+  { ---- RTR1 — nReg=1 routes through ReleaseTempReg → goes to aTempReg. ---- }
+  FillChar(parse, SizeOf(parse), 0);
+  parse.nMem := 10;
+  sqlite3ReleaseTempRange(@parse, 9, 1);
+  Check('RTR1 nReg=1 returns to temp pool', parse.nTempReg = 1);
+  Check('RTR1 cached register is the released one', parse.aTempReg[0] = 9);
+  Check('RTR1 iRangeReg untouched', parse.iRangeReg = 0);
+  Check('RTR1 nRangeReg untouched', parse.nRangeReg = 0);
+
+  { ---- RTR2 — nReg>1, nReg larger than current cache → block becomes cache. ---- }
+  FillChar(parse, SizeOf(parse), 0);
+  parse.nMem := 100;
+  parse.iRangeReg := 11;
+  parse.nRangeReg := 2;
+  sqlite3ReleaseTempRange(@parse, 80, 5);
+  Check('RTR2 cache replaced because nReg>nRangeReg',
+        parse.nRangeReg = 5);
+  Check('RTR2 iRangeReg points at released block', parse.iRangeReg = 80);
+
+  { ---- RTR3 — nReg>1, nReg <= current cache → cache untouched. ---- }
+  FillChar(parse, SizeOf(parse), 0);
+  parse.nMem := 100;
+  parse.iRangeReg := 50;
+  parse.nRangeReg := 9;
+  sqlite3ReleaseTempRange(@parse, 70, 3);
+  Check('RTR3 nReg<=nRangeReg keeps existing cache iRangeReg',
+        parse.iRangeReg = 50);
+  Check('RTR3 nRangeReg unchanged', parse.nRangeReg = 9);
+
+  { ---- RTR4 — nReg>1, nReg = nRangeReg → also keeps existing cache
+         (the C check is strict ">" not ">="). ---- }
+  FillChar(parse, SizeOf(parse), 0);
+  parse.nMem := 100;
+  parse.iRangeReg := 60;
+  parse.nRangeReg := 4;
+  sqlite3ReleaseTempRange(@parse, 90, 4);
+  Check('RTR4 strict-gt comparison: equal block does not displace',
+        parse.iRangeReg = 60);
+  Check('RTR4 nRangeReg unchanged', parse.nRangeReg = 4);
+
+  { ---- Round-trip — Get, Release, Get again recycles the block. ---- }
+  FillChar(parse, SizeOf(parse), 0);
+  parse.nMem := 0;
+  r := sqlite3GetTempRange(@parse, 6);
+  Check('GTR-RT alloc returns first register 1', r = 1);
+  Check('GTR-RT nMem advanced', parse.nMem = 6);
+  sqlite3ReleaseTempRange(@parse, r, 6);
+  Check('GTR-RT release populates cache', parse.nRangeReg = 6);
+  r := sqlite3GetTempRange(@parse, 6);
+  Check('GTR-RT realloc returns recycled block', r = 1);
+  Check('GTR-RT cache drained', parse.nRangeReg = 0);
+  Check('GTR-RT nMem not bumped on recycle', parse.nMem = 6);
+end;
+
 procedure TestCodeOneLoopStartBody;
 const
   N_LEVEL = 1;
@@ -5567,6 +5681,7 @@ begin
   TestCodeOneLoopStartCase3;
   TestCodeOneLoopStartCase4;
   TestCodeOneLoopStartCase6;
+  TestGetTempRange;
   TestCodeOneLoopStartBody;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);

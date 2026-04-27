@@ -929,6 +929,36 @@ Important: At the end of this document, please find:
       / EPH) require open-database fixtures (Schema + Table + cursor)
       and are deferred to the TestWhereCorpus / TestExplainParity gate
       under 11g.2.f.
+    - [X] Leaf helpers, batch 11 — `sqlite3GetTempRange` /
+      `sqlite3ReleaseTempRange` (expr.c:7603..7627).  Allocate / recycle
+      a contiguous block of `nReg` registers from the parser-scoped
+      register pool.  Single-register requests fan out to the existing
+      `sqlite3GetTempReg` / `sqlite3ReleaseTempReg` pair so the scalar
+      `aTempReg[]` cache stays in play.  Multi-register requests carve
+      from `pParse^.iRangeReg / nRangeReg` when the cached run is fat
+      enough (advances iRangeReg, shrinks nRangeReg by exactly nReg);
+      otherwise bump `pParse^.nMem` by `nReg` and return the next
+      register.  Release path: a freed run that is *strictly* larger
+      than the current `nRangeReg` cache replaces the cache (matches
+      the C `nReg > nRangeReg` predicate — equal blocks do not
+      displace), runs through `sqlite3VdbeReleaseRegisters` either way
+      so any pinned dependency tracking gets cleared.  Prerequisite
+      for the pRJ RIGHT JOIN match-recording block (wherecode.c:
+      2729..2768) and the multi-index OR driver (Case 5,
+      wherecode.c:2544..2664), both of which use `GetTempRange(nPk+1)`
+      / `GetTempRange(nReg)` to assemble PK-key tuples and OR-leg
+      register frames in subsequent batches.  Gate:
+      `TestWherePlanner.pas` (590/590): GTR1 (nReg=1 empty pool →
+      ++nMem path), GTR2 (nReg=1 with cached temp → recycles
+      aTempReg[]), GTR3 (cache fat enough → carve, advance iRangeReg,
+      shrink nRangeReg), GTR4 (cache too small → fall back to nMem
+      bump, leave iRangeReg/nRangeReg untouched), GTR5 (exact-fit
+      cache → drains nRangeReg to 0), RTR1 (nReg=1 release → routes
+      through ReleaseTempReg into aTempReg[]), RTR2 (nReg>nRangeReg
+      release replaces the cache), RTR3 (nReg<nRangeReg release leaves
+      cache alone), RTR4 (nReg=nRangeReg strict-gt comparison: equal
+      block does not displace), GTR-RT round-trip (alloc → release →
+      realloc returns the same registers, nMem not double-bumped).
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix
