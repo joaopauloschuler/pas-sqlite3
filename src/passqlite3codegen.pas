@@ -1888,6 +1888,27 @@ procedure whereLikeOptimizationStringFixup(v: PVdbe; pLevel: PWhereLevel;
   pTerm: PWhereTerm);
 procedure adjustOrderByCol(pOrderBy: PExprList; pEList: PExprList);
 
+{ Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers, batch 2.
+  sqlite3VectorFieldSubexpr (expr.c:538..551) returns the i-th sub-expression
+  of a vector pVector, or pVector itself when scalar.
+  sqlite3ExprNeedsNoAffinityChange (expr.c:3006..3037) returns 1 when applying
+  affinity `aff` to expression p is guaranteed not to change the value.
+  updateRangeAffinityStr (wherecode.c:494..508) modifies an affinity string
+  in place, replacing each entry with AFF_BLOB whenever the corresponding
+  vector element either compares with no affinity or needs no affinity change.
+  whereLoopIsOneRow (wherecode.c:1446..1460) returns 1 when a WHERE_INDEXED
+  loop using IN(...) is guaranteed to visit exactly one row per index key.
+  whereApplyPartialIndexConstraints (wherecode.c:1355..1374) walks pTruth
+  (the partial-index WHERE clause, known true) recursively through TK_AND
+  and tags every WC term that compares equal to a conjunct as TERM_CODED,
+  so the per-row body codegen does not re-emit them. }
+function  sqlite3VectorFieldSubexpr(pVector: PExpr; i: i32): PExpr;
+function  sqlite3ExprNeedsNoAffinityChange(const p: PExpr; aff: AnsiChar): i32;
+procedure updateRangeAffinityStr(pRight: PExpr; n: i32; zAff: PAnsiChar);
+function  whereLoopIsOneRow(pLoop: PWhereLoop): i32;
+procedure whereApplyPartialIndexConstraints(pTruth: PExpr; iTabCur: i32;
+  pWC: PWhereClause);
+
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
 // ---------------------------------------------------------------------------
@@ -11210,6 +11231,161 @@ begin
     end;
     if j >= pEList^.nExpr then
       pOrdItems[i].u.x.iOrderByCol := 0;
+  end;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers,
+  batch 2.
+
+  sqlite3VectorFieldSubexpr (expr.c:538..551).  Index-into-vector helper:
+  for a TK_VECTOR / TK_SELECT vector expression, returns the i-th column
+  expression (from x.pList for a value-list vector or x.pSelect^.pEList
+  for a sub-SELECT vector); for a scalar expression, returns pVector
+  unchanged.
+
+  sqlite3ExprNeedsNoAffinityChange (expr.c:3006..3037).  Returns 1 when
+  applying affinity `aff` to expression p is provably a no-op: BLOB
+  affinity is always a no-op; numeric affinity is a no-op for integer
+  literals, float literals, and rowid columns; TEXT is a no-op for
+  non-negated string literals; BLOB literals (non-negated) are always
+  unaffected.  TK_UPLUS / TK_UMINUS prefixes pass through (TK_UMINUS
+  also lights `unaryMinus`).  TK_REGISTER unwraps to op2.
+
+  updateRangeAffinityStr (wherecode.c:494..508).  Walks an affinity
+  string in lockstep with a vector RHS; entries that either compare with
+  no affinity (sqlite3CompareAffinity returns AFF_BLOB) or need no
+  affinity change (per the helper above) are downgraded to AFF_BLOB so
+  codeApplyAffinity can trim them away.
+
+  whereLoopIsOneRow (wherecode.c:1446..1460).  Returns 1 when a
+  WHERE_INDEXED loop with IN(...) is guaranteed to produce exactly one
+  row for each generated index key — i.e. the index is UNIQUE
+  (onError <> OE_None), nSkip is zero, every key column has an EQ term,
+  and none of those terms is WO_IS / WO_ISNULL.
+
+  whereApplyPartialIndexConstraints (wherecode.c:1355..1374).  Given the
+  WHERE clause pTruth of a partial index that drives the current loop
+  (so its constraints are known true), walks pTruth through TK_AND and
+  tags any WC term that compares equal (sqlite3ExprCompare) to a conjunct
+  as TERM_CODED.  Skips terms already TERM_CODED.
+  =========================================================================== }
+
+function sqlite3VectorFieldSubexpr(pVector: PExpr; i: i32): PExpr;
+begin
+  Assert((i < sqlite3ExprVectorSize(pVector)) or (pVector^.op = TK_ERROR));
+  if sqlite3ExprIsVector(pVector) <> 0 then
+  begin
+    Assert((pVector^.op2 = 0) or (pVector^.op = TK_REGISTER));
+    if (pVector^.op = TK_SELECT) or (pVector^.op2 = TK_SELECT) then
+    begin
+      Assert(ExprUseXSelect(pVector));
+      Result := ExprListItems(pVector^.x.pSelect^.pEList)[i].pExpr;
+      Exit;
+    end
+    else
+    begin
+      Assert(ExprUseXList(pVector));
+      Result := ExprListItems(pVector^.x.pList)[i].pExpr;
+      Exit;
+    end;
+  end;
+  Result := pVector;
+end;
+
+function sqlite3ExprNeedsNoAffinityChange(const p: PExpr; aff: AnsiChar): i32;
+var
+  op: u8;
+  unaryMinus: i32;
+  pp: PExpr;
+begin
+  if Byte(aff) = SQLITE_AFF_BLOB then Exit(1);
+  unaryMinus := 0;
+  pp := p;
+  while (pp^.op = TK_UPLUS) or (pp^.op = TK_UMINUS) do
+  begin
+    if pp^.op = TK_UMINUS then unaryMinus := 1;
+    pp := pp^.pLeft;
+  end;
+  op := pp^.op;
+  if op = TK_REGISTER then op := pp^.op2;
+  case op of
+    TK_INTEGER:
+      if Byte(aff) >= SQLITE_AFF_NUMERIC then Result := 1 else Result := 0;
+    TK_FLOAT:
+      if Byte(aff) >= SQLITE_AFF_NUMERIC then Result := 1 else Result := 0;
+    TK_STRING:
+      if (unaryMinus = 0) and (Byte(aff) = SQLITE_AFF_TEXT) then Result := 1 else Result := 0;
+    TK_BLOB:
+      if unaryMinus = 0 then Result := 1 else Result := 0;
+    TK_COLUMN:
+      begin
+        Assert(pp^.iTable >= 0);   { p cannot be part of a CHECK constraint }
+        if (Byte(aff) >= SQLITE_AFF_NUMERIC) and (pp^.iColumn < 0) then
+          Result := 1
+        else
+          Result := 0;
+      end;
+  else
+    Result := 0;
+  end;
+end;
+
+procedure updateRangeAffinityStr(pRight: PExpr; n: i32; zAff: PAnsiChar);
+var
+  i: i32;
+  pSub: PExpr;
+begin
+  for i := 0 to n - 1 do
+  begin
+    pSub := sqlite3VectorFieldSubexpr(pRight, i);
+    if (Byte(sqlite3CompareAffinity(pSub, zAff[i])) = SQLITE_AFF_BLOB)
+       or (sqlite3ExprNeedsNoAffinityChange(pSub, zAff[i]) <> 0) then
+    begin
+      zAff[i] := AnsiChar(SQLITE_AFF_BLOB);
+    end;
+  end;
+end;
+
+function whereLoopIsOneRow(pLoop: PWhereLoop): i32;
+var
+  ii: i32;
+  pIdx: PIndex2;
+begin
+  pIdx := pLoop^.u.btree.pIndex;
+  if (pIdx^.onError <> 0)             { OE_None = 0 — UNIQUE }
+     and (pLoop^.nSkip = 0)
+     and (pLoop^.u.btree.nEq = pIdx^.nKeyCol) then
+  begin
+    for ii := 0 to pLoop^.u.btree.nEq - 1 do
+    begin
+      if (pLoop^.aLTerm[ii]^.eOperator and (WO_IS or WO_ISNULL)) <> 0 then
+        Exit(0);
+    end;
+    Exit(1);
+  end;
+  Result := 0;
+end;
+
+procedure whereApplyPartialIndexConstraints(pTruth: PExpr; iTabCur: i32;
+  pWC: PWhereClause);
+var
+  i: i32;
+  pTrm: PWhereTerm;
+  pTrmExpr: PExpr;
+begin
+  while pTruth^.op = TK_AND do
+  begin
+    whereApplyPartialIndexConstraints(pTruth^.pLeft, iTabCur, pWC);
+    pTruth := pTruth^.pRight;
+  end;
+  for i := 0 to pWC^.nTerm - 1 do
+  begin
+    pTrm := @pWC^.a[i];
+    if (pTrm^.wtFlags and TERM_CODED) <> 0 then Continue;
+    pTrmExpr := pTrm^.pExpr;
+    if sqlite3ExprCompare(nil, pTrmExpr, pTruth, iTabCur) = 0 then
+      pTrm^.wtFlags := pTrm^.wtFlags or TERM_CODED;
   end;
 end;
 

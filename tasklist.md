@@ -518,6 +518,41 @@ Important: At the end of this document, please find:
       patching across two iLikeRepCntr values), AOBC1..AOBC3
       (adjustOrderByCol — nil short-circuit, t=0 skip, t=k → j+1
       rewrite, orphan → 0).
+    - [X] Leaf helpers, batch 2 — `sqlite3VectorFieldSubexpr`
+      (expr.c:538..551), `sqlite3ExprNeedsNoAffinityChange`
+      (expr.c:3006..3037), `updateRangeAffinityStr`
+      (wherecode.c:494..508), `whereLoopIsOneRow`
+      (wherecode.c:1446..1460), and `whereApplyPartialIndexConstraints`
+      (wherecode.c:1355..1374).  sqlite3VectorFieldSubexpr returns the
+      i-th column expression of a TK_VECTOR / TK_SELECT vector, or the
+      scalar itself.  sqlite3ExprNeedsNoAffinityChange decides when an
+      OP_Affinity emit can be omitted: BLOB is always a no-op; NUMERIC
+      is a no-op for TK_INTEGER / TK_FLOAT and rowid (iColumn<0) columns;
+      TEXT is a no-op for non-negated TK_STRING; non-negated TK_BLOB
+      survives any affinity.  TK_UPLUS / TK_UMINUS prefixes pass through
+      with TK_UMINUS lighting the unaryMinus flag; TK_REGISTER unwraps
+      to op2.  updateRangeAffinityStr walks an affinity string in
+      lockstep with a vector RHS, downgrading any slot that compares
+      with no affinity (sqlite3CompareAffinity → AFF_BLOB) or needs no
+      affinity change to AFF_BLOB so codeApplyAffinity can trim it.
+      whereLoopIsOneRow returns 1 only when a WHERE_INDEXED loop has
+      onError<>OE_None (UNIQUE), nSkip=0, every key column pinned by
+      an EQ term, and none of those terms is WO_IS / WO_ISNULL.
+      whereApplyPartialIndexConstraints walks the partial-index pTruth
+      predicate recursively through TK_AND and tags any WC term
+      structurally equal (sqlite3ExprCompare) to a conjunct as
+      TERM_CODED.  Pure analysis, no codegen, no planner recursion.
+      Gate: `TestWherePlanner.pas` (333/333): VFS1..VFS2 (scalar
+      passthrough, pList vector field 0/1/2), ENC1..ENC11 (AFF_BLOB
+      always 1; INTEGER+NUMERIC; INTEGER+TEXT reject; FLOAT+NUMERIC;
+      STRING+TEXT; STRING+NUMERIC reject; BLOB+TEXT; UMINUS BLOB
+      reject; UPLUS INTEGER passthrough; COLUMN rowid alias accept;
+      COLUMN regular column reject), URA1..URA3 (INTEGER+NUMERIC and
+      STRING+TEXT downgrade to AFF_BLOB; NULL+TEXT untouched),
+      WL1OR1..WL1OR6 (OE_None reject; all-EQ UNIQUE accept; WO_IS
+      reject; WO_ISNULL reject; nSkip>0 reject; partial-key reject),
+      WAPIC1..WAPIC4 (single-AND truth tags matching termA + termB;
+      mismatched termC untouched; pre-coded terms stay coded).
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix

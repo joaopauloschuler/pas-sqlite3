@@ -3108,6 +3108,254 @@ begin
   Check('AOBC3 orphan cleared to 0', ord.items[0].u.x.iOrderByCol = 0);
 end;
 
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers,
+  batch 2.  Tests for sqlite3VectorFieldSubexpr,
+  sqlite3ExprNeedsNoAffinityChange, updateRangeAffinityStr,
+  whereLoopIsOneRow, and whereApplyPartialIndexConstraints.
+  =========================================================================== }
+
+procedure TestVectorFieldSubexpr;
+type
+  TListBuf = record
+    hdr:   TExprList;
+    items: array[0..2] of TExprListItem;
+  end;
+var
+  scalar:           TExpr;
+  vec:              TExpr;
+  e0, e1, e2:       TExpr;
+  list:             TListBuf;
+begin
+  FillChar(scalar, SizeOf(scalar), 0);
+  scalar.op := TK_INTEGER;
+  Check('VFS1 scalar returns self',
+    sqlite3VectorFieldSubexpr(@scalar, 0) = @scalar);
+
+  FillChar(e0, SizeOf(e0), 0); e0.op := TK_COLUMN;
+  FillChar(e1, SizeOf(e1), 0); e1.op := TK_INTEGER;
+  FillChar(e2, SizeOf(e2), 0); e2.op := TK_STRING;
+  FillChar(list, SizeOf(list), 0);
+  list.hdr.nExpr := 3;
+  list.items[0].pExpr := @e0;
+  list.items[1].pExpr := @e1;
+  list.items[2].pExpr := @e2;
+
+  FillChar(vec, SizeOf(vec), 0);
+  vec.op := TK_VECTOR;
+  vec.flags := 0;       { x is pList — EP_xIsSelect cleared }
+  vec.x.pList := @list.hdr;
+  Check('VFS2 vector field 0', sqlite3VectorFieldSubexpr(@vec, 0) = @e0);
+  Check('VFS2 vector field 1', sqlite3VectorFieldSubexpr(@vec, 1) = @e1);
+  Check('VFS2 vector field 2', sqlite3VectorFieldSubexpr(@vec, 2) = @e2);
+end;
+
+procedure TestExprNeedsNoAffinityChange;
+var
+  e: TExpr;
+  inner: TExpr;
+begin
+  FillChar(e, SizeOf(e), 0);
+
+  { ENC1 — AFF_BLOB always returns 1 regardless of op. }
+  e.op := TK_INTEGER;
+  Check('ENC1 AFF_BLOB → 1',
+    sqlite3ExprNeedsNoAffinityChange(@e, AnsiChar(SQLITE_AFF_BLOB)) = 1);
+
+  { ENC2 — TK_INTEGER, AFF_NUMERIC → 1. }
+  Check('ENC2 INTEGER + NUMERIC → 1',
+    sqlite3ExprNeedsNoAffinityChange(@e, AnsiChar(SQLITE_AFF_NUMERIC)) = 1);
+
+  { ENC3 — TK_INTEGER, AFF_TEXT → 0 (TEXT < NUMERIC). }
+  Check('ENC3 INTEGER + TEXT → 0',
+    sqlite3ExprNeedsNoAffinityChange(@e, AnsiChar(SQLITE_AFF_TEXT)) = 0);
+
+  { ENC4 — TK_FLOAT + NUMERIC → 1. }
+  e.op := TK_FLOAT;
+  Check('ENC4 FLOAT + NUMERIC → 1',
+    sqlite3ExprNeedsNoAffinityChange(@e, AnsiChar(SQLITE_AFF_NUMERIC)) = 1);
+
+  { ENC5 — TK_STRING + TEXT (no unaryMinus) → 1. }
+  e.op := TK_STRING;
+  Check('ENC5 STRING + TEXT → 1',
+    sqlite3ExprNeedsNoAffinityChange(@e, AnsiChar(SQLITE_AFF_TEXT)) = 1);
+
+  { ENC6 — TK_STRING + NUMERIC → 0. }
+  Check('ENC6 STRING + NUMERIC → 0',
+    sqlite3ExprNeedsNoAffinityChange(@e, AnsiChar(SQLITE_AFF_NUMERIC)) = 0);
+
+  { ENC7 — TK_BLOB no unary minus → 1 for any aff. }
+  e.op := TK_BLOB;
+  Check('ENC7 BLOB + TEXT → 1',
+    sqlite3ExprNeedsNoAffinityChange(@e, AnsiChar(SQLITE_AFF_TEXT)) = 1);
+
+  { ENC8 — TK_UMINUS prefix lights unaryMinus, then BLOB returns 0. }
+  FillChar(inner, SizeOf(inner), 0);
+  inner.op := TK_BLOB;
+  e.op := TK_UMINUS;
+  e.pLeft := @inner;
+  Check('ENC8 UMINUS BLOB → 0',
+    sqlite3ExprNeedsNoAffinityChange(@e, AnsiChar(SQLITE_AFF_TEXT)) = 0);
+
+  { ENC9 — TK_UPLUS chain to TK_INTEGER, NUMERIC → 1. }
+  inner.op := TK_INTEGER;
+  e.op := TK_UPLUS;
+  e.pLeft := @inner;
+  Check('ENC9 UPLUS INTEGER + NUMERIC → 1',
+    sqlite3ExprNeedsNoAffinityChange(@e, AnsiChar(SQLITE_AFF_NUMERIC)) = 1);
+
+  { ENC10 — TK_COLUMN with iColumn=-1 (rowid alias) and NUMERIC → 1. }
+  FillChar(e, SizeOf(e), 0);
+  e.op := TK_COLUMN; e.iTable := 0; e.iColumn := -1;
+  Check('ENC10 COLUMN rowid + NUMERIC → 1',
+    sqlite3ExprNeedsNoAffinityChange(@e, AnsiChar(SQLITE_AFF_NUMERIC)) = 1);
+
+  { ENC11 — TK_COLUMN with iColumn=0 (regular column) → 0. }
+  e.iColumn := 0;
+  Check('ENC11 COLUMN regular + NUMERIC → 0',
+    sqlite3ExprNeedsNoAffinityChange(@e, AnsiChar(SQLITE_AFF_NUMERIC)) = 0);
+end;
+
+procedure TestUpdateRangeAffinityStr;
+var
+  scalar: TExpr;
+  zAff: array[0..3] of AnsiChar;
+begin
+  { URA1 — scalar TK_INTEGER, n=1, AFF_NUMERIC → no change (NUMERIC ≠ BLOB
+    but sqlite3CompareAffinity(int, NUMERIC) returns NUMERIC, not BLOB; and
+    sqlite3ExprNeedsNoAffinityChange(int, NUMERIC) = 1 → AFF_BLOB written). }
+  FillChar(scalar, SizeOf(scalar), 0);
+  scalar.op := TK_INTEGER;
+  zAff[0] := AnsiChar(SQLITE_AFF_NUMERIC);
+  updateRangeAffinityStr(@scalar, 1, @zAff[0]);
+  Check('URA1 INTEGER+NUMERIC → AFF_BLOB',
+    Byte(zAff[0]) = SQLITE_AFF_BLOB);
+
+  { URA2 — TK_STRING, AFF_TEXT → NeedsNoAffinityChange returns 1 → BLOB. }
+  FillChar(scalar, SizeOf(scalar), 0);
+  scalar.op := TK_STRING;
+  zAff[0] := AnsiChar(SQLITE_AFF_TEXT);
+  updateRangeAffinityStr(@scalar, 1, @zAff[0]);
+  Check('URA2 STRING+TEXT → AFF_BLOB',
+    Byte(zAff[0]) = SQLITE_AFF_BLOB);
+
+  { URA3 — TK_NULL + AFF_TEXT.  CompareAffinity returns NULL→0 ≠ BLOB; the
+    op isn't in the NeedsNoAffinityChange switch → 0; nothing written. }
+  FillChar(scalar, SizeOf(scalar), 0);
+  scalar.op := TK_NULL;
+  zAff[0] := AnsiChar(SQLITE_AFF_TEXT);
+  updateRangeAffinityStr(@scalar, 1, @zAff[0]);
+  Check('URA3 NULL+TEXT → unchanged',
+    Byte(zAff[0]) = SQLITE_AFF_TEXT);
+end;
+
+procedure TestWhereLoopIsOneRow;
+var
+  loop: TWhereLoop;
+  idx:  TIndex;
+  t0, t1: TWhereTerm;
+begin
+  FillChar(loop, SizeOf(loop), 0);
+  FillChar(idx,  SizeOf(idx),  0);
+  FillChar(t0,   SizeOf(t0),   0);
+  FillChar(t1,   SizeOf(t1),   0);
+
+  loop.aLTerm := PPWhereTerm(@loop.aLTermSpace[0]);
+  loop.aLTermSpace[0] := @t0;
+  loop.aLTermSpace[1] := @t1;
+  loop.u.btree.pIndex := @idx;
+
+  { WL1OR1 — onError=0 (OE_None) → 0. }
+  idx.onError := 0; idx.nKeyCol := 1;
+  loop.u.btree.nEq := 1; loop.nSkip := 0;
+  t0.eOperator := WO_EQ;
+  Check('WL1OR1 OE_None → 0', whereLoopIsOneRow(@loop) = 0);
+
+  { WL1OR2 — UNIQUE, nEq=nKeyCol=2, all WO_EQ → 1. }
+  idx.onError := 5; idx.nKeyCol := 2;          { OE_Replace = 5, any non-zero }
+  loop.u.btree.nEq := 2; loop.nSkip := 0;
+  t0.eOperator := WO_EQ; t1.eOperator := WO_EQ;
+  Check('WL1OR2 UNIQUE all-EQ → 1', whereLoopIsOneRow(@loop) = 1);
+
+  { WL1OR3 — one term WO_IS → 0. }
+  t1.eOperator := WO_IS;
+  Check('WL1OR3 WO_IS disqualifier → 0', whereLoopIsOneRow(@loop) = 0);
+
+  { WL1OR4 — WO_ISNULL also disqualifies. }
+  t1.eOperator := WO_ISNULL;
+  Check('WL1OR4 WO_ISNULL disqualifier → 0', whereLoopIsOneRow(@loop) = 0);
+
+  { WL1OR5 — nSkip > 0 → 0 (skip-scan loops are not single-row). }
+  t1.eOperator := WO_EQ;
+  loop.nSkip := 1;
+  Check('WL1OR5 nSkip>0 → 0', whereLoopIsOneRow(@loop) = 0);
+
+  { WL1OR6 — nEq < nKeyCol → 0 (partial key match). }
+  loop.nSkip := 0; loop.u.btree.nEq := 1;
+  Check('WL1OR6 nEq<nKeyCol → 0', whereLoopIsOneRow(@loop) = 0);
+end;
+
+procedure TestWhereApplyPartialIndexConstraints;
+var
+  buf: array[0..2047] of u8;
+  pWC: PWhereClause;
+  truth, lhs, rhs:        TExpr;
+  termA, termB, termC:    TExpr;
+  i: i32;
+begin
+  FillChar(buf, SizeOf(buf), 0);
+  pWC := PWhereClause(@buf[0]);
+  pWC^.nTerm := 3;
+  pWC^.nSlot := 8;
+  pWC^.a := @pWC^.aStatic[0];
+
+  { Truth = (lhs AND rhs).  lhs and rhs are leaf comparison expressions —
+    TK_NULL nodes are the easiest sqlite3ExprCompare match (op==TK_NULL
+    short-circuits to 0 once tokens have been checked).  We give the
+    second conjunct an EP_IntValue-tagged TK_INTEGER so the integer
+    fast-path is exercised too. }
+  FillChar(termA, SizeOf(termA), 0); termA.op := TK_NULL;
+  FillChar(termB, SizeOf(termB), 0); termB.op := TK_INTEGER;
+  termB.flags := EP_IntValue;
+  termB.u.iValue := 1;
+  FillChar(termC, SizeOf(termC), 0); termC.op := TK_FLOAT;
+
+  { Build truth = termA AND termB. }
+  FillChar(lhs, SizeOf(lhs), 0); lhs := termA;
+  FillChar(rhs, SizeOf(rhs), 0); rhs := termB;
+  FillChar(truth, SizeOf(truth), 0);
+  truth.op := TK_AND;
+  truth.pLeft  := @lhs;
+  truth.pRight := @rhs;
+
+  pWC^.aStatic[0].pWC := pWC;
+  pWC^.aStatic[0].pExpr := @termA;       { matches lhs by structure }
+  pWC^.aStatic[0].wtFlags := 0;
+  pWC^.aStatic[1].pWC := pWC;
+  pWC^.aStatic[1].pExpr := @termB;       { matches rhs by structure }
+  pWC^.aStatic[1].wtFlags := 0;
+  pWC^.aStatic[2].pWC := pWC;
+  pWC^.aStatic[2].pExpr := @termC;       { does NOT match }
+  pWC^.aStatic[2].wtFlags := 0;
+
+  whereApplyPartialIndexConstraints(@truth, 0, pWC);
+
+  Check('WAPIC1 termA tagged TERM_CODED',
+    (pWC^.aStatic[0].wtFlags and TERM_CODED) <> 0);
+  Check('WAPIC2 termB tagged TERM_CODED',
+    (pWC^.aStatic[1].wtFlags and TERM_CODED) <> 0);
+  Check('WAPIC3 termC NOT tagged',
+    (pWC^.aStatic[2].wtFlags and TERM_CODED) = 0);
+
+  { WAPIC4 — already-coded term is skipped silently. }
+  for i := 0 to 2 do pWC^.aStatic[i].wtFlags := TERM_CODED;
+  whereApplyPartialIndexConstraints(@truth, 0, pWC);
+  Check('WAPIC4 pre-coded all stay coded',
+    (pWC^.aStatic[0].wtFlags = TERM_CODED)
+    and (pWC^.aStatic[1].wtFlags = TERM_CODED)
+    and (pWC^.aStatic[2].wtFlags = TERM_CODED));
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -3146,6 +3394,11 @@ begin
   TestCodeApplyAffinity;
   TestWhereLikeOptStringFixup;
   TestAdjustOrderByCol;
+  TestVectorFieldSubexpr;
+  TestExprNeedsNoAffinityChange;
+  TestUpdateRangeAffinityStr;
+  TestWhereLoopIsOneRow;
+  TestWhereApplyPartialIndexConstraints;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.
