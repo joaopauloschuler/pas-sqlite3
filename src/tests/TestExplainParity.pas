@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 983 + 3 + 4 + 15;
+  N_CORPUS = 983 + 3 + 4 + 15 + 21;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -1180,6 +1180,30 @@ begin
   Add(i, 'SELECT WHERE 1',              'SELECT a FROM t WHERE 1;');                   Inc(i);
   Add(i, 'SELECT WHERE 0',              'SELECT a FROM t WHERE 0;');                   Inc(i);
   Add(i, 'SELECT rowid=5 AND a=10',     'SELECT a FROM t WHERE rowid=5 AND a=10;');    Inc(i);
+
+  { Step 6 — codegen-gap probes (one row per tasklist 6.10 step 6 entry,
+    so the running diverge count tracks the open tasklist Δs). }
+  Add(i, 'PRAGMA user_version',         'PRAGMA user_version;');                        Inc(i);
+  Add(i, 'PRAGMA encoding',             'PRAGMA encoding;');                            Inc(i);
+  Add(i, 'SELECT DISTINCT col',         'SELECT DISTINCT a FROM t;');                   Inc(i);
+  Add(i, 'SELECT ORDER BY asc',         'SELECT a FROM t ORDER BY a;');                 Inc(i);
+  Add(i, 'SELECT ORDER BY desc',        'SELECT a FROM t ORDER BY a DESC;');            Inc(i);
+  Add(i, 'SELECT ORDER BY 2col',        'SELECT a FROM t ORDER BY a, b;');              Inc(i);
+  Add(i, 'SELECT GROUP BY col',         'SELECT a FROM t GROUP BY a;');                 Inc(i);
+  Add(i, 'SELECT COUNT(*)',             'SELECT COUNT(*) FROM t;');                     Inc(i);
+  Add(i, 'SELECT SUM',                  'SELECT SUM(a) FROM t;');                       Inc(i);
+  Add(i, 'SELECT MIN',                  'SELECT MIN(a) FROM t;');                       Inc(i);
+  Add(i, 'SELECT MAX',                  'SELECT MAX(a) FROM t;');                       Inc(i);
+  Add(i, 'SELECT LIMIT OFFSET',         'SELECT a FROM t LIMIT 5 OFFSET 2;');           Inc(i);
+  Add(i, 'SELECT sub-FROM',             'SELECT a FROM (SELECT a FROM t);');            Inc(i);
+  Add(i, 'UPDATE rowid=1',              'UPDATE t SET a=5 WHERE rowid=1;');             Inc(i);
+  Add(i, 'INSERT named-col 1',          'INSERT INTO t(a) VALUES(1);');                 Inc(i);
+  Add(i, 'INSERT named-col 3',          'INSERT INTO t(a,b,c) VALUES(1,2,3);');         Inc(i);
+  Add(i, 'INSERT multi-row VALUES',     'INSERT INTO t VALUES(1,2,3),(4,5,6);');        Inc(i);
+  Add(i, 'CREATE INDEX WHERE',          'CREATE INDEX iw ON t(a) WHERE a>0;');          Inc(i);
+  Add(i, 'DELETE WHERE a=5',            'DELETE FROM t WHERE a=5;');                    Inc(i);
+  Add(i, 'INSERT IPK alias u',          'INSERT INTO u VALUES(1, 2);');                 Inc(i);
+  Add(i, 'SELECT IPK alias u',          'SELECT p FROM u;');                            Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

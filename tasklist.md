@@ -54,17 +54,11 @@ Important: At the end of this document, please find:
         `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
         the system one.
 
-    - [ ] Port or re-enable productive tails:
-      - [ ] Port or re-enable `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
-        arm and where-loop / one-pass arm both productive.  vtab
-        `OP_VUpdate` arm still TODO (out of current corpus).
-      - [ ] Port or re-enable `sqlite3Update` (`passqlite3codegen.pas:17835`): skeleton-only
-        with snapshot/restore guard at 17890..17893 / 17965..17970;
-        blocks NestedParse UPDATE of the placeholder sqlite_master row.
-
-  - [ ] Fix the only remaining TestExplainParity DIVERGE: DROP TABLE
-    op-count row — structural (extra C-side scan/reinsert pre-Destroy
-    pass that Pas elides; rows still materialise correctly).
+    - [ ] Port productive `sqlite3Update` body (skeleton-only today;
+      blocks DROP TABLE Δ=21 destroyRootPage path and UPDATE rowid=1
+      Δ=14).
+    - [ ] Port `sqlite3DeleteFrom` vtab `OP_VUpdate` arm (truncate +
+      where-loop arms already productive).
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Decomposition:
@@ -97,20 +91,8 @@ Important: At the end of this document, please find:
                 reconcile that vs. codegen.pas's bigger
                 TUnpackedRecord before porting the corruption /
                 BIGNULL / DESC arms.
-            [X] **6.10 step 6.IPK-IN.f** — IN-subquery returned only
-                first match.  Fixed 2026-04-27 in
-                `sqlite3BtreeIndexMoveto`: the skip-to-root
-                short-circuit fired on *any* current-cell comparison
-                <= pIdxKey, but C btree.c:6049..6083 only allows it
-                when cursor is on the *last cell* (case 1) or when
-                the *first cell* of a non-root page is <= the seek
-                key (case 2 — restart search on current page,
-                bypassing root walk).  After a membership probe
-                landed on idx=0 for key=1, the next probe for key=2
-                short-circuited with c=-1 and reported "not found"
-                without descending the tree.  `TestRowidIn` now
-                covers both rowid-IPK and regular-column IN-subquery
-                shapes; both PASS.
+            [X] **6.10 step 6.IPK-IN.f** — IN-subquery skip-to-root
+                short-circuit in `sqlite3BtreeIndexMoveto`. Done.
         [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
         [ ] `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3
@@ -137,27 +119,14 @@ Important: At the end of this document, please find:
         [ ] `SELECT p FROM u;` — per-op divergence at op[1] (scan
           of rowid-aliased PRIMARY KEY column).
   
-  [ ] **6.11** BUG FIX: Drop Table - DIVERGE rows + delta = (C ops − Pas ops):
-    DROP TABLE — Δ=21 (step 4)
-    Root cause for DROP TABLE Δ=21:
-      (a) Pas opens cursor 0 with `OP_OpenRead` and emits a 2-pass
-          RowSet delete loop for the sqlite_schema scrub
-          (`RowSetAdd` during scan, then `OpenWrite` + `RowSetRead` /
-          `NotExists` / `Delete` / `Goto` cleanup), where C uses a
-          single `OP_OpenWrite` and inline `Delete` during the scan
-          (~+5 Pas ops vs C).  Tracked under 11g.2.f open follow-on:
-          `sqlite3DeleteFrom` ONEPASS_MULTI promotion for non-rowid-EQ
-          scans.
-      (b) Pas elides the destroyRootPage autovacuum follow-on
-          (`Null` / `OpenEphemeral` / `IfNot` / `OpenRead` / `Explain`
-          / `Rewind` / `Column` / `ReleaseReg` / `Ne` / `ReleaseReg` /
-          `Rowid` / `Insert` / `Next` / `OpenWrite` / `Rewind` /
-          `Rowid` / `NotExists` / `Column`×3 / `Integer` / `Column` /
-          `MakeRecord` / `Insert` / `Next` / `ReleaseReg` — ~26 ops)
-          because `destroyRootPage` calls `sqlite3NestedParse(... UPDATE
-          sqlite_schema SET rootpage=... WHERE ... AND rootpage=...)`
-          and productive `sqlite3Update` is still skeleton-only
-          (11g.2.f open follow-on).
+  [ ] **6.11** DROP TABLE Δ=21 root cause:
+    (a) Pas emits a 2-pass RowSet delete for the sqlite_schema scrub
+        where C inlines `Delete` during the scan (~+5 ops). Needs
+        ONEPASS_MULTI promotion for non-rowid-EQ `sqlite3DeleteFrom`.
+    (b) Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
+        because `destroyRootPage` calls `sqlite3NestedParse(UPDATE
+        sqlite_schema ...)` and productive `sqlite3Update` is still
+        skeleton-only.
 
 ---
 
