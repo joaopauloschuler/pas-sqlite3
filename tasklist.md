@@ -187,14 +187,19 @@ Important: At the end of this document, please find:
     Verify byte-identical bytecode emission against C via
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
-    Current baseline (2026-04-27): **TestWhereCorpus 88 PASS / 4 DIVERGE
+    Current baseline (2026-04-27): **TestWhereCorpus 89 PASS / 3 DIVERGE
     / 0 ERROR (corpus = 92).**  Scaffold and progress through
-    sub-progresses 1..39 are recorded in git history (`git log
+    sub-progresses 1..40 are recorded in git history (`git log
     --grep="11g.2.f"`).
 
     **Open DIVERGE rows:**
-      * Multi-table (blocked on multi-table planner integration):
-        - `LEFT_JOIN`, `JOIN_WHERE`, `EXISTS_SUB`, `NOT_EXISTS`.
+      * Multi-table FROM (blocked on multi-table planner integration):
+        - `LEFT_JOIN`, `JOIN_WHERE`.
+      * Subquery planner-optimization gap:
+        - `EXISTS_SUB`: Pas emits a correct correlated subroutine
+          (22 ops); C uses a bloom-filter + autoindex optimization
+          (30 ops).  Strategy difference, not a correctness bug —
+          flips to PASS once the planner adopts the same optimization.
 
     **Open follow-on:** Re-enable productive tails in `sqlite3DeleteFrom`
     and `sqlite3Update` (still skeleton-only); drop the step-11f
