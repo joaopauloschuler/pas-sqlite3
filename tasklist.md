@@ -156,7 +156,7 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 4 PASS / 6
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 7 PASS / 3
     DIVERGE / 0 ERROR (corpus = 10); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
@@ -170,10 +170,11 @@ Important: At the end of this document, please find:
         with snapshot/restore guard at 17890..17893 / 17965..17970;
         blocks NestedParse UPDATE of the placeholder sqlite_master row.
 
-    The 6 TestExplainParity DIVERGEs are CREATE TABLE (5 shapes) /
-    DROP TABLE op-count rows — structural (extra C-side auth +
-    ParseSchema reparse + scope unwind that Pas elides; rows still
-    materialise correctly).  Tracked under 6.10.
+    The 3 TestExplainParity DIVERGEs are CREATE TABLE composite PK /
+    WITHOUT ROWID (auto-index pass) and DROP TABLE op-count rows —
+    structural (extra C-side scan/reinsert pre-Destroy pass that Pas
+    elides; rows still materialise correctly).  Tracked under 6.10
+    steps 4 and 5.
 
 - [X] **6.9-bis 11g.2.g** TestWhereCorpus startup EAccessViolation —
     fixed by porting `exprSelectUsage` (whereexpr.c:998..1024) so
@@ -186,33 +187,20 @@ Important: At the end of this document, please find:
     build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
-  Current Status (2026-04-27): **4 PASS / 6 DIVERGE / 0 ERROR**.
+  Current Status (2026-04-27): **7 PASS / 3 DIVERGE / 0 ERROR**.
   Drive to all-PASS, then expand corpus to DML / SELECT / pragma /
   trigger forms (same exclusion list as TestParser).  Promote from
   report-only to hard gate when the full corpus is green.
 
-  PASS rows: CREATE INDEX, CREATE UNIQUE INDEX, DROP INDEX IF EXISTS,
-  BEGIN.  Step 1 (sqlite3RefillIndex port, commit `4c9fe6b`) flipped
-  the two CREATE INDEX rows.  Step 2 (2-phase schema-write port,
-  commit pending) closed Δ=11 on the three simple-CREATE rows and
-  Δ=11 on the composite-PK / WITHOUT-ROWID rows.
+  PASS rows: CREATE TABLE simple / typed / IF NOT EXISTS, CREATE INDEX,
+  CREATE UNIQUE INDEX, DROP INDEX IF EXISTS, BEGIN.  Step 3 (Explain +
+  ReleaseReg emission, OPFLAG_ISNOOP Delete removal in
+  emitSchemaRowUpdate) flipped the three simple-CREATE rows.
 
   DIVERGE rows + delta = (C ops − Pas ops):
 
-  - CREATE TABLE simple / typed / IF NOT EXISTS — Δ=1 each
-  - CREATE TABLE composite PK / WITHOUT ROWID — Δ=12 each
+  - CREATE TABLE composite PK / WITHOUT ROWID — Δ=11 each
   - DROP TABLE — Δ=22
-
-  Root cause for CREATE TABLE rows: `emitSchemaRowInsert`
-  (`passqlite3codegen.pas:19743`) emits a single direct schema-row
-  INSERT.  C reference uses the `sqlite3StartTable` placeholder Insert
-  + `sqlite3EndTable` NestedParse 2-phase pattern (build.c:2842..2900):
-  Close, Close, Null, Noop, OpenWrite cur=1, SeekRowid, Rowid, IsNull,
-  String8 ×5 (type/name/tbl_name/sql/zStmt), Copy rootpage, MakeRecord
-  BBBDB, Delete (p2=68 = abort opcode), Insert, plus
-  `OP_SqlExec PRAGMA "main".integrity_check('zN')` after ParseSchema.
-  Composite-PK / WITHOUT-ROWID add a second auto-index pass (Δ=23 vs
-  Δ=12).
 
   Root cause for DROP TABLE: Pas-side elides the C-side
   pre-Destroy "scan sqlite_schema for trigger rows + reinsert" pass
@@ -239,16 +227,15 @@ Important: At the end of this document, please find:
       `sqlite3StartTable` (~19510), `emitSchemaRowUpdate` (~19790),
       `sqlite3EndTable` schema-row block (~19990).
 
-    - [ ] **6.10 step 3** Add `OP_SqlExec PRAGMA "main".integrity_check
-      ('zN')` emission after `ParseSchema`.  Our oracle
-      (`src/libsqlite3.so`, built with `-DSQLITE_DEBUG
-      -DSQLITE_ENABLE_EXPLAIN_COMMENTS -DSQLITE_ENABLE_API_ARMOR`)
-      emits this op for plain CREATE TABLE — the `TF_HasGenerated`
-      gate in build.c:2941 is bypassed in this build configuration.
-      Replicate by emitting `OP_SqlExec p1=1 p2=0 p3=0 p4='PRAGMA
-      "main".integrity_check(''zName'')'` unconditionally after
-      `sqlite3VdbeAddParseSchemaOp` in `sqlite3EndTable`.  Closes
-      the remaining Δ=1 on the three simple-CREATE rows → all PASS.
+    - [X] **6.10 step 3** Add `OP_Explain` + `OP_ReleaseReg` emission
+      and drop the spurious `OPFLAG_ISNOOP` `OP_Delete` from
+      `emitSchemaRowUpdate`.  The C oracle build (no
+      `SQLITE_ENABLE_PREUPDATE_HOOK`) does not emit the pre-Insert
+      Delete; it does emit the explain-comment scan op (under
+      `SQLITE_ENABLE_EXPLAIN_COMMENTS`) and the `OP_ReleaseReg` debug
+      op (under `SQLITE_DEBUG`) for the WHERE rowid=#N temp reg.  Net
+      effect: `(+Explain +ReleaseReg −Delete) = +1`, closing Δ=1.
+      Three simple-CREATE rows flip to PASS.
 
     - [ ] **6.10 step 4** Port `sqlite3CodeDropTable` pre-Destroy
       schema scan (build.c:3315..3445): the loop that walks

@@ -19777,28 +19777,33 @@ begin
   sqlite3VdbeChangeP5(v, OPFLAG_APPEND or OPFLAG_USESEEKRESULT);
 end;
 
-{ emitSchemaRowUpdate — Phase 6.10 step 2.
+{ emitSchemaRowUpdate — Phase 6.10 step 2 / step 3.
   Emit the schema-row UPDATE-equivalent bytecode that replaces the
   placeholder row inserted by sqlite3StartTable.  Mirrors the bytecode
   that sqlite3NestedParse(UPDATE %Q.sqlite_master ... WHERE rowid=#%d)
   produces when run through sqlite3Update (which is still skeleton in
   this port — so we hand-emit the same op sequence).
 
-  Sequence (matches build.c + update.c via PREUPDATE_HOOK build):
-    OP_Null    0  r4 r5         ; clear regNewRec, regCurRowid
-    OP_Noop    2  0  4          ; placeholder marker
+  Sequence (matches the C oracle build at -DSQLITE_DEBUG
+  -DSQLITE_ENABLE_EXPLAIN_COMMENTS, no -DSQLITE_ENABLE_PREUPDATE_HOOK):
+    OP_Null      0  r4 r5         ; clear regNewRec, regCurRowid
+    OP_Noop      2  0  4          ; placeholder marker
     OP_OpenWrite cur=N, root=1, p3=iDb, p4=5
+    OP_Explain   addr 0 33 P4='SEARCH .. INTEGER PRIMARY KEY (rowid=?)'
+    OP_ReleaseReg regKey 1 0      ; debug-only release of WHERE key reg
     OP_SeekRowid cur=N, addrIsNull, regRowid
-    OP_Rowid   cur=N, regCurRowid
-    OP_IsNull  regCurRowid, addrAfterInsert
-    OP_String8 r6=zType / r7=zName / r8=zTblName
-    OP_Copy    regRoot -> r9
-    OP_String8 r10=zStmt (or Null)
+    OP_Rowid     cur=N, regCurRowid
+    OP_IsNull    regCurRowid, addrAfterInsert
+    OP_String8   r6=zType / r7=zName / r8=zTblName
+    OP_Copy      regRoot -> r9
+    OP_String8   r10=zStmt (or Null)
     OP_MakeRecord regBase, 5, regNewRec, P4='BBBDB'
-    OP_Delete  cur=N, p2=OPFLAG_ISUPDATE|OPFLAG_ISNOOP, regCurRowid
-    OP_Insert  cur=N, regNewRec, regCurRowid
+    OP_Insert    cur=N, regNewRec, regCurRowid
     addrAfterInsert resolved here
-}
+
+  No OP_Delete: the C-side update.c only emits the OPFLAG_ISNOOP
+  pre-Insert delete when SQLITE_ENABLE_PREUPDATE_HOOK or fkeys are in
+  play, neither of which applies here. }
 procedure emitSchemaRowUpdate(pParse: PParse; v: PVdbe; iDb: i32;
   zType: PAnsiChar; zName: PAnsiChar; zTblName: PAnsiChar;
   regRoot: i32; zStmt: PAnsiChar; regRowid: i32);
@@ -19810,30 +19815,51 @@ var
   regNewRec: i32;
   regCurRow: i32;
   regBase:   i32;
+  regKey:    i32;
   addrSeek:  i32;
   addrIsN:   i32;
+  addrEx:    i32;
   zNameDup:  PAnsiChar;
   zTblDup:   PAnsiChar;
+  zExplain:  PAnsiChar;
+  zDbName:   PAnsiChar;
 begin
   db := pParse^.db;
 
   cur := pParse^.nTab; Inc(pParse^.nTab);
 
+  { Pre-allocate the regs the C-side UPDATE codegen consumes.  Order
+    matches the dump from the oracle: regNew=4, regOldRowid=5,
+    regBase..+4=6..10, then regKey=11 (the temp reg the WHERE rowid=?
+    expression released via OP_ReleaseReg). }
   Inc(pParse^.nMem); regNewRec := pParse^.nMem;
   Inc(pParse^.nMem); regCurRow := pParse^.nMem;
+  regBase := pParse^.nMem + 1;
+  pParse^.nMem := pParse^.nMem + 5;
+  Inc(pParse^.nMem); regKey := pParse^.nMem;
 
   sqlite3VdbeAddOp3(v, OP_Null, 0, regNewRec, regCurRow);
   sqlite3VdbeAddOp3(v, OP_Noop, 2, 0, 4);
   sqlite3VdbeAddOp4Int(v, OP_OpenWrite, cur, SCHEMA_ROOT, iDb, 5);
 
+  { OP_Explain — comment-style scan-description op the oracle emits via
+    sqlite3WhereExplainOneScan.  p1 = its own addr; p3 = wsFlags
+    (WHERE_COLUMN_EQ | WHERE_IPK | WHERE_ONEROW = 0x21 = 33). }
+  addrEx := sqlite3VdbeCurrentAddr(v);
+  zDbName := db^.aDb[iDb].zDbSName;
+  if zDbName = nil then zDbName := PAnsiChar('main');
+  zExplain := sqlite3MPrintf(db,
+    'SEARCH %s.sqlite_master USING INTEGER PRIMARY KEY (rowid=?)',
+    [zDbName]);
+  sqlite3VdbeAddOp4(v, OP_Explain, addrEx, 0, 33, zExplain, P4_DYNAMIC);
+
+  { OP_ReleaseReg — debug-only release of the WHERE-clause key reg. }
+  sqlite3VdbeAddOp3(v, OP_ReleaseReg, regKey, 1, 0);
+
   addrSeek := sqlite3VdbeAddOp3(v, OP_SeekRowid, cur, 0, regRowid);
   sqlite3VdbeAddOp2(v, OP_Rowid, cur, regCurRow);
   sqlite3VdbeJumpHere(v, addrSeek);  { SeekRowid jumps to the IsNull below }
   addrIsN := sqlite3VdbeAddOp1(v, OP_IsNull, regCurRow);
-
-  { 5 contiguous regs r6..r10 for the schema-row columns. }
-  regBase := pParse^.nMem + 1;
-  pParse^.nMem := pParse^.nMem + 5;
 
   sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 0, 0, zType, P4_STATIC);
 
@@ -19854,8 +19880,6 @@ begin
   sqlite3VdbeAddOp4(v, OP_MakeRecord, regBase, 5, regNewRec,
                     PAnsiChar(@AFFINITY_BBBDB[0]), P4_STATIC);
 
-  sqlite3VdbeAddOp3(v, OP_Delete, cur,
-                    OPFLAG_ISUPDATE or OPFLAG_ISNOOP, regCurRow);
   sqlite3VdbeAddOp3(v, OP_Insert, cur, regNewRec, regCurRow);
 
   sqlite3VdbeJumpHere(v, addrIsN);
