@@ -1151,6 +1151,48 @@ Important: At the end of this document, please find:
       emitted, OP_Goto follows, ChangeP1 back-patches OP_Integer.p1
       past itself, pLevel^.p2 lands past the OP_Goto at the resolved
       iLoopBody label).
+    - [X] Public surface, batch 23 — `sqlite3WhereRightJoinLoop`
+      (wherecode.c:2834..2945) replaces the prior Phase 6.2 stub.  Drives
+      the RIGHT JOIN unmatched-row pass: `sqlite3VdbeNoJumpsOutsideSubrtn`
+      brackets the subroutine, then for each prior level k=0..iLevel-1
+      builds `mAll |= a[k].pWLoop^.maskSelf`, OP_Null-zeroes any
+      `viaCoroutine` LHS subquery's `regResult..regResult+nExpr-1` block,
+      OP_NullRows the level's `iTabCur` and (when set) `iIdxCur`.  Outside
+      JT_LTORJ the routine then walks `pWC^.a[]` building `pSubWhere` from
+      every non-virtual / non-slice (or WO_ROWVAL-bearing) term whose
+      `prereqAll & ~mAll = 0` and that lacks `EP_OuterON|EP_InnerON`,
+      ANDed via `sqlite3ExprAnd(sqlite3ExprDup(...))`.  After the (gated)
+      `OP_NullRow pLevel^.iIdxCur` it allocates a fresh single-item SrcList
+      from the heap (pas-sqlite3 carries variable-length SrcLists, so
+      `sqlite3DbMallocRawNN(SZ_SRCLIST_HEADER + SZ_SRCLIST_ITEM)` replaces
+      the C `union { SrcList; u8[SZ_SRCLIST_1]; } uSrc;` stack idiom),
+      copies pTabItem in, zeros the copy's jointype, increments
+      `pParse^.withinRJSubrtn` (assert < 100), and recursively calls
+      `sqlite3WhereBegin(... WHERE_RIGHT_JOIN, 0)`.  The success arm then
+      pulls the right-table PK tuple (HasRowid: `OP_Rowid` via
+      `sqlite3ExprCodeGetColumnOfTable(v, pTab, iCur, -1, r)`, nPk=1; else
+      walks `sqlite3PrimaryKeyIndex(pTab)^.aiColumn[0..nKeyCol-1]` into
+      `r..r+nPk-1`), emits `OP_Filter pRJ^.regBloom, jmp, r, nPk` →
+      `OP_Found pRJ^.iMatch, addrCont, r, nPk` → `JumpHere(jmp)` →
+      `OP_Gosub pRJ^.regReturn, pRJ^.addrSubrtn`, then closes with
+      `sqlite3WhereEnd(pSubWInfo)`.  Cleanup ExprDeletes pSubWhere,
+      DbFreeNNs the heap pFrom, and decrements `withinRJSubrtn` (assert >0).
+      Renamed local `pParse` → `pPrs` to avoid the FPC case-insensitive
+      var/type collision with the `PParse` type alias (matches the
+      `ljNullRowFixup` precedent established in batch 22).
+      Gate: `TestWherePlanner.pas` (675/675): RJL1 (2-level pWInfo,
+      iLevel=1, JT_LTORJ on current pTabItem; prior level iTabCur=11 +
+      iIdxCur=22; current level iIdxCur=33; pRJ filled with iMatch=77,
+      regBloom=88, regReturn=99; mallocFailed=1 forces the inner
+      `sqlite3DbMallocRawNN(pFrom)` to return nil so we probe the prelude
+      OP_NullRow emissions in isolation — verifies all three OP_NullRows
+      land, withinRJSubrtn / nTab / nMem all unchanged because the
+      early-exit fires before the increment), RJL2 (iLevel=0 + iIdxCur=0
+      + empty pWC + JT_LTORJ off — verifies zero opcodes emitted, proves
+      NoJumpsOutsideSubrtn is an addr-marker not an op-emit and that the
+      pWC walk handles the empty-term shape).  Full integration with a
+      live recursive WhereBegin lands under TestWhereCorpus / TestExplain-
+      Parity in 11g.2.f.
     - [X] Public surface, batch 19 — `sqlite3WhereCodeOneLoopStart`
       Case 4 WITHOUT-ROWID secondary-index PK reconstruction
       (wherecode.c:2177..2186).  Replaces the prior `Assert(False)`

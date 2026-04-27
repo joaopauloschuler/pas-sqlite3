@@ -13353,10 +13353,154 @@ begin
   if addrCont = 0 then ;
 end;
 
+{ Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c
+  sqlite3WhereRightJoinLoop (wherecode.c:2834..2945).  RIGHT JOIN
+  unmatched-rows pass.  Driven from sqlite3WhereEnd at the bottom of the
+  enclosing query: emits the OP_NullRow sentinels for every preceding level
+  (including OP_Null'ing viaCoroutine LHS subquery result blocks), null-
+  rows the level's own iIdxCur, then recursively calls sqlite3WhereBegin
+  with a single-item SrcList rebuilt from pTabItem (jointype zeroed) and
+  the JT_LTORJ-gated pSubWhere conjunction so the inner scan can probe
+  every right-table row.  For each unmatched row, the pRJ Bloom filter is
+  consulted (skip on hit) and the iMatch ephemeral index is consulted
+  (continue on hit); a fresh row gosubs into pRJ^.addrSubrtn so the
+  subroutine emits the synthetic NULL-extended LEFT-JOIN row.  The
+  pSubWhere walks pWC^.a[] up to the first TERM_VIRTUAL/TERM_SLICE entry
+  (eOperator <> WO_ROWVAL), skipping any term still pinned by
+  prereqAll & ~mAll or carrying EP_OuterON/EP_InnerON.
+  Caller invariants: pParse^.withinRJSubrtn < 100 on entry. }
 procedure sqlite3WhereRightJoinLoop(pWInfo: PWhereInfo; iLevel: i32;
   pLevel: PWhereLevel);
+var
+  pPrs:      PParse;
+  v:         PVdbe;
+  pRJ:       PWhereRightJoin;
+  pSubWhere: PExpr;
+  pWC:       PWhereClause;
+  pSubWInfo: PWhereInfo;
+  pLoop:     PWhereLoop;
+  pTabItem:  PSrcItem;
+  pFrom:     PSrcList;
+  szSrc:     u64;
+  mAll:      Bitmask;
+  k:         i32;
+  iIdxCur:   i32;
+  pRight:    PSrcItem;
+  pSubq:     PSubquery;
+  origLevels: PWhereLevel;
+  origItems:  PSrcItem;
+  pTerm:     PWhereTerm;
+  pTab:      PTable2;
+  iCur:      i32;
+  r:         i32;
+  nPk:       i32;
+  jmp:       i32;
+  addrCont:  i32;
+  pPk:       PIndex2;
+  iPk, iCol: i32;
 begin
-  { Phase 6.2 stub }
+  pPrs   := pWInfo^.pParse;
+  v      := pPrs^.pVdbe;
+  pRJ    := pLevel^.pRJ;
+  pSubWhere := nil;
+  pWC    := @pWInfo^.sWC;
+  pLoop  := pLevel^.pWLoop;
+  origLevels := whereInfoLevels(pWInfo);
+  origItems  := SrcListItems(pWInfo^.pTabList);
+  pTabItem   := @origItems[pLevel^.iFrom];
+  mAll       := 0;
+
+  { ExplainQueryPlan no-op until EQP text lands (Phase 6.10). }
+  sqlite3VdbeNoJumpsOutsideSubrtn(v, pRJ^.addrSubrtn, pRJ^.endSubrtn,
+                                  pRJ^.regReturn);
+
+  for k := 0 to iLevel - 1 do
+  begin
+    Assert(origLevels[k].pWLoop^.iTab = origLevels[k].iFrom);
+    pRight := @origItems[origLevels[k].iFrom];
+    mAll := mAll or origLevels[k].pWLoop^.maskSelf;
+    if (pRight^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0 then
+    begin
+      Assert((pRight^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0);
+      Assert(pRight^.u4.pSubq <> nil);
+      pSubq := PSubquery(pRight^.u4.pSubq);
+      Assert(pSubq^.pSelect <> nil);
+      Assert(pSubq^.pSelect^.pEList <> nil);
+      sqlite3VdbeAddOp3(v, OP_Null, 0, pSubq^.regResult,
+        pSubq^.regResult + pSubq^.pSelect^.pEList^.nExpr - 1);
+    end;
+    sqlite3VdbeAddOp1(v, OP_NullRow, origLevels[k].iTabCur);
+    iIdxCur := origLevels[k].iIdxCur;
+    if iIdxCur <> 0 then
+      sqlite3VdbeAddOp1(v, OP_NullRow, iIdxCur);
+  end;
+
+  if (pTabItem^.fg.jointype and JT_LTORJ) = 0 then
+  begin
+    mAll := mAll or pLoop^.maskSelf;
+    for k := 0 to pWC^.nTerm - 1 do
+    begin
+      pTerm := @pWC^.a[k];
+      if ((pTerm^.wtFlags and (TERM_VIRTUAL or TERM_SLICE)) <> 0)
+         and (pTerm^.eOperator <> WO_ROWVAL) then
+        Break;
+      if (pTerm^.prereqAll and (not mAll)) <> 0 then continue;
+      if ExprHasProperty(pTerm^.pExpr, EP_OuterON or EP_InnerON) then continue;
+      pSubWhere := sqlite3ExprAnd(pPrs, pSubWhere,
+                                  sqlite3ExprDup(pPrs^.db, pTerm^.pExpr, 0));
+    end;
+  end;
+
+  if pLevel^.iIdxCur <> 0 then
+    sqlite3VdbeAddOp1(v, OP_NullRow, pLevel^.iIdxCur);
+
+  { Build a single-item SrcList from pTabItem with jointype cleared.
+    The C source uses an on-stack uSrc union; we malloc since SrcList is
+    variable-length in pas-sqlite3. }
+  szSrc := u64(SZ_SRCLIST_HEADER) + u64(SZ_SRCLIST_ITEM);
+  pFrom := PSrcList(sqlite3DbMallocRawNN(pPrs^.db, szSrc));
+  if pFrom = nil then Exit;
+  pFrom^.nSrc   := 1;
+  pFrom^.nAlloc := 1;
+  Move(pTabItem^, SrcListItems(pFrom)[0], SizeOf(TSrcItem));
+  SrcListItems(pFrom)[0].fg.jointype := 0;
+
+  Assert(pPrs^.withinRJSubrtn < 100);
+  Inc(pPrs^.withinRJSubrtn);
+  pSubWInfo := sqlite3WhereBegin(pPrs, pFrom, pSubWhere, nil, nil, nil,
+                                 WHERE_RIGHT_JOIN, 0);
+  if pSubWInfo <> nil then
+  begin
+    iCur := pLevel^.iTabCur;
+    Inc(pPrs^.nMem);
+    r := pPrs^.nMem;
+    addrCont := sqlite3WhereContinueLabel(pSubWInfo);
+    pTab := pTabItem^.pSTab;
+    if HasRowid(pTab) then
+    begin
+      sqlite3ExprCodeGetColumnOfTable(v, pTab, iCur, -1, r);
+      nPk := 1;
+    end else
+    begin
+      pPk := sqlite3PrimaryKeyIndex(pTab);
+      nPk := pPk^.nKeyCol;
+      Inc(pPrs^.nMem, nPk - 1);
+      for iPk := 0 to nPk - 1 do
+      begin
+        iCol := pPk^.aiColumn[iPk];
+        sqlite3ExprCodeGetColumnOfTable(v, pTab, iCur, iCol, r + iPk);
+      end;
+    end;
+    jmp := sqlite3VdbeAddOp4Int(v, OP_Filter, pRJ^.regBloom, 0, r, nPk);
+    sqlite3VdbeAddOp4Int(v, OP_Found, pRJ^.iMatch, addrCont, r, nPk);
+    sqlite3VdbeJumpHere(v, jmp);
+    sqlite3VdbeAddOp2(v, OP_Gosub, pRJ^.regReturn, pRJ^.addrSubrtn);
+    sqlite3WhereEnd(pSubWInfo);
+  end;
+  sqlite3ExprDelete(pPrs^.db, pSubWhere);
+  sqlite3DbFreeNN(pPrs^.db, pFrom);
+  Assert(pPrs^.withinRJSubrtn > 0);
+  Dec(pPrs^.withinRJSubrtn);
 end;
 
 // ---------------------------------------------------------------------------

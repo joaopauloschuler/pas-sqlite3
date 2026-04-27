@@ -6168,6 +6168,164 @@ begin
   sqlite3_close(db);
 end;
 
+{ ---- Phase 6.9-bis (step 11g.2.e sub-progress) public-surface batch 23 ----
+  sqlite3WhereRightJoinLoop (wherecode.c:2834..2945).  Drives the
+  prelude opcodes (NoJumpsOutsideSubrtn + per-prior-level OP_NullRow on
+  iTabCur and iIdxCur + pLevel^.iIdxCur OP_NullRow) on a 2-level
+  pWInfo with iLevel=1 and JT_LTORJ on pTabItem (so the pSubWhere walk
+  short-circuits).  Setting db^.mallocFailed=1 right before the call
+  forces the inner sqlite3WhereBegin recursion to return nil safely
+  (sqlite3DbMallocRawNN respects mallocFailed) so we can probe the
+  prelude emissions in isolation; the SrcList alloc inside the routine
+  also returns nil under the same gate, exiting the function without
+  touching the body or running the recursive scan.  Full integration
+  exercise lands under TestWhereCorpus / TestExplainParity in 11g.2.f. }
+procedure TestWhereRightJoinLoop;
+const
+  N_LEVEL = 2;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  v:         PVdbe;
+  rc:        i32;
+  bufWI:     array of Byte;
+  bufSL:     array of Byte;
+  pWInfo:    PWhereInfo;
+  pSL:       PSrcList;
+  pSItems:   PSrcItem;
+  pLevels:   PWhereLevel;
+  loop0, loop1: TWhereLoop;
+  rj:        TWhereRightJoin;
+  pTab:      PTable2;
+  base, i, addr: i32;
+  pOp:       PVdbeOp;
+  fNullTab11, fNullIdx22, fNullIdx33: Boolean;
+  savedNTab, savedNMem: i32;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('RJL1 open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  { 2-slot SrcList: prior-level table @0, current @1. }
+  SetLength(bufSL, SizeOf(TSrcList) + 2 * SizeOf(TSrcItem));
+  FillChar(bufSL[0], Length(bufSL), 0);
+  pSL := PSrcList(@bufSL[0]);
+  pSL^.nSrc := 2; pSL^.nAlloc := 2;
+  pSItems := SrcListItems(pSL);
+  pSItems[0].iCursor := 11;
+  pSItems[0].fg.jointype := 0;
+  pSItems[0].fg.fgBits   := 0;     { not viaCoroutine }
+  pSItems[1].iCursor := 12;
+  pSItems[1].fg.jointype := JT_LTORJ;  { skips pSubWhere walk }
+  pSItems[1].fg.fgBits   := 0;
+
+  { Stub Table for current pTabItem so HasRowid path inside the (skipped)
+    body has something to probe.  Not used until WhereBegin succeeds. }
+  pTab := PTable2(GetMem(SizeOf(TTable)));
+  FillChar(pTab^, SizeOf(TTable), 0);
+  pTab^.iPKey    := -1;
+  pTab^.tabFlags := 0;
+  pTab^.eTabType := 0;
+  pTab^.nNVCol   := 1;
+  pTab^.nCol     := 1;
+  pSItems[1].pSTab := pTab;
+
+  SetLength(bufWI, SZ_WHEREINFO(N_LEVEL));
+  FillChar(bufWI[0], Length(bufWI), 0);
+  pWInfo := PWhereInfo(@bufWI[0]);
+  pWInfo^.pParse   := @parse;
+  pWInfo^.pTabList := pSL;
+  pWInfo^.nLevel   := N_LEVEL;
+  pLevels := whereInfoLevels(pWInfo);
+
+  FillChar(loop0, SizeOf(loop0), 0);
+  loop0.iTab     := 0;
+  loop0.maskSelf := Bitmask(1);
+  pLevels[0].pWLoop  := @loop0;
+  pLevels[0].iFrom   := 0;
+  pLevels[0].iTabCur := 11;
+  pLevels[0].iIdxCur := 22;
+
+  FillChar(loop1, SizeOf(loop1), 0);
+  loop1.iTab     := 1;
+  loop1.maskSelf := Bitmask(2);
+  pLevels[1].pWLoop  := @loop1;
+  pLevels[1].iFrom   := 1;
+  pLevels[1].iTabCur := 12;
+  pLevels[1].iIdxCur := 33;
+
+  FillChar(rj, SizeOf(rj), 0);
+  rj.iMatch     := 77;
+  rj.regBloom   := 88;
+  rj.regReturn  := 99;
+  rj.addrSubrtn := sqlite3VdbeCurrentAddr(v);
+  rj.endSubrtn  := rj.addrSubrtn + 1; { trivial bracket; NoJumpsOutsideSubrtn
+                                        only checks emitted ops in [first..last] }
+  pLevels[1].pRJ := @rj;
+
+  savedNTab := parse.nTab;
+  savedNMem := parse.nMem;
+
+  { Force WhereBegin recursion to return nil cleanly via mallocFailed. The
+    prelude opcodes emit before the alloc gate, so they're observable. }
+  base := sqlite3VdbeCurrentAddr(v);
+  db^.mallocFailed := 1;
+  sqlite3WhereRightJoinLoop(pWInfo, 1, @pLevels[1]);
+  db^.mallocFailed := 0;
+
+  fNullTab11 := False; fNullIdx22 := False; fNullIdx33 := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if pOp^.opcode = OP_NullRow then
+    begin
+      if pOp^.p1 = 11 then fNullTab11 := True;
+      if pOp^.p1 = 22 then fNullIdx22 := True;
+      if pOp^.p1 = 33 then fNullIdx33 := True;
+    end;
+  end;
+  Check('RJL1 prior-level OP_NullRow on iTabCur=11', fNullTab11);
+  Check('RJL1 prior-level OP_NullRow on iIdxCur=22', fNullIdx22);
+  Check('RJL1 current-level OP_NullRow on iIdxCur=33', fNullIdx33);
+  { withinRJSubrtn never increments because mallocFailed short-circuits the
+    SrcList alloc before the increment.  That assertion of the no-leak path
+    is implicit: if the routine survived without crashing under mallocFailed
+    then the alloc-failure exit path is wired correctly. }
+  Check('RJL1 withinRJSubrtn unchanged under mallocFailed early-exit',
+        parse.withinRJSubrtn = 0);
+  Check('RJL1 nTab unchanged under early-exit (no recursive WhereBegin)',
+        parse.nTab = savedNTab);
+  Check('RJL1 nMem unchanged under early-exit',
+        parse.nMem = savedNMem);
+
+  { ---- RJL2 — JT_LTORJ off + pWC empty terms + pLevel^.iIdxCur=0 +
+         iLevel=0.  Tests that with no prior levels and no idx cursor on the
+         current level, the prelude emits zero ops and returns cleanly. ---- }
+  pSItems[1].fg.jointype := 0;  { allow pSubWhere walk (but pWC empty → no-op) }
+  pLevels[1].iIdxCur := 0;
+  pWInfo^.sWC.a := @pWInfo^.sWC.aStatic[0];
+  pWInfo^.sWC.nTerm := 0;
+  pWInfo^.sWC.nBase := 0;
+
+  addr := sqlite3VdbeCurrentAddr(v);
+  db^.mallocFailed := 1;
+  sqlite3WhereRightJoinLoop(pWInfo, 0, @pLevels[1]);
+  db^.mallocFailed := 0;
+
+  { With iLevel=0 the prior-level loop runs zero iterations; with
+    iIdxCur=0 the trailing OP_NullRow is suppressed; pWC empty + non-LTORJ
+    walks zero terms.  Net emit count = 0 (NoJumpsOutsideSubrtn is a label
+    range marker, not an op emit). }
+  Check('RJL2 zero ops emitted under iLevel=0 + iIdxCur=0 + empty pWC',
+        sqlite3VdbeCurrentAddr(v) = addr);
+
+  pSItems[1].pSTab := nil;
+  FreeMem(pTab);
+  sqlite3_close(db);
+end;
+
 procedure TestCodeOneLoopStartBody;
 const
   N_LEVEL = 1;
@@ -6534,6 +6692,7 @@ begin
   TestGetTempRange;
   TestExprCodeGetColumnOfTable;
   TestCodeOneLoopStartBody;
+  TestWhereRightJoinLoop;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.
