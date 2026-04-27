@@ -5181,6 +5181,158 @@ begin
   sqlite3_close(db);
 end;
 
+{ ---- Case 6 (full table scan) — wherecode.c:2561..2581.  Fires when
+       wsFlags has neither WHERE_IPK nor WHERE_INDEXED nor WHERE_MULTI_OR
+       set; we must emit the canonical OP_Rewind / OP_Last + OP_Next /
+       OP_Prev pair with SQLITE_STMTSTATUS_FULLSCAN_STEP stamped into
+       pLevel^.p5.  Recursive (CTE) tables short-circuit to OP_Noop. ---- }
+procedure TestCodeOneLoopStartCase6;
+const
+  N_LEVEL = 1;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  v:         PVdbe;
+  rc:        i32;
+  bufWI:     array of Byte;
+  bufSL:     array of Byte;
+  pWInfo:    PWhereInfo;
+  pSL:       PSrcList;
+  pSItem:    PSrcItem;
+  pLevel:    PWhereLevel;
+  loop:      TWhereLoop;
+  base, i:   i32;
+  pOp:       PVdbeOp;
+  notReady:  Bitmask;
+  rOut:      Bitmask;
+  fRewind, fLast, fNext, fPrev: Boolean;
+  emittedAddr: i32;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('SCOLS10 open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  { ---- SrcList with one cursor at iCursor=7. ---- }
+  SetLength(bufSL, SizeOf(TSrcList) + SizeOf(TSrcItem));
+  FillChar(bufSL[0], Length(bufSL), 0);
+  pSL := PSrcList(@bufSL[0]);
+  pSL^.nSrc := 1; pSL^.nAlloc := 1;
+  pSItem := @SrcListItems(pSL)[0];
+  pSItem^.iCursor := 7;
+  pSItem^.fg.jointype := 0;
+  pSItem^.fg.fgBits   := 0;
+
+  SetLength(bufWI, SZ_WHEREINFO(N_LEVEL));
+  FillChar(bufWI[0], Length(bufWI), 0);
+  pWInfo := PWhereInfo(@bufWI[0]);
+  pWInfo^.pParse   := @parse;
+  pWInfo^.pTabList := pSL;
+  pWInfo^.nLevel   := N_LEVEL;
+  pWInfo^.revMask  := 0;
+  pWInfo^.wctrlFlags := 0;
+  pLevel := @whereInfoLevels(pWInfo)[0];
+
+  FillChar(loop, SizeOf(loop), 0);
+  loop.wsFlags := 0;             { no IPK / INDEXED / MULTI_OR → Case 6 }
+
+  pLevel^.pWLoop := @loop;
+  pLevel^.iFrom  := 0;
+  pLevel^.iTabCur := 7;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.regFilter := 0;
+  pLevel^.op := 99;
+  pLevel^.p1 := 0; pLevel^.p2 := 0; pLevel^.p3 := 0; pLevel^.p5 := 0;
+  pLevel^.iLeftJoin := 0;
+  pLevel^.u.in_nIn := 0;
+
+  notReady := not Bitmask(0);
+
+  { ---- SCOLS10 — bRev=0: OP_Rewind start, OP_Next iteration step. ---- }
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS10 returns pLevel^.notReady', rOut = pLevel^.notReady);
+  Check('SCOLS10 pLevel^.op = OP_Next', pLevel^.op = OP_Next);
+  Check('SCOLS10 pLevel^.p1 = iCursor', pLevel^.p1 = pSItem^.iCursor);
+  Check('SCOLS10 pLevel^.p5 = FULLSCAN_STEP',
+        pLevel^.p5 = SQLITE_STMTSTATUS_FULLSCAN_STEP);
+  fRewind := False; fLast := False; emittedAddr := -1;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_Rewind) and (pOp^.p1 = pSItem^.iCursor) then
+    begin
+      fRewind := True; emittedAddr := i;
+    end;
+    if pOp^.opcode = OP_Last then fLast := True;
+  end;
+  Check('SCOLS10 OP_Rewind emitted on iCursor', fRewind);
+  Check('SCOLS10 no OP_Last (bRev=0)', not fLast);
+  Check('SCOLS10 pLevel^.p2 = OP_Rewind addr + 1',
+        pLevel^.p2 = emittedAddr + 1);
+
+  { ---- SCOLS11 — bRev=1: OP_Last start, OP_Prev iteration step. ---- }
+  pWInfo^.revMask := 1;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.op := 99;
+  pLevel^.p1 := 0; pLevel^.p2 := 0; pLevel^.p5 := 0;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS11 pLevel^.op = OP_Prev (bRev=1)', pLevel^.op = OP_Prev);
+  Check('SCOLS11 pLevel^.p5 = FULLSCAN_STEP',
+        pLevel^.p5 = SQLITE_STMTSTATUS_FULLSCAN_STEP);
+  fRewind := False; fLast := False; fPrev := False; fNext := False;
+  emittedAddr := -1;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_Last) and (pOp^.p1 = pSItem^.iCursor) then
+    begin
+      fLast := True; emittedAddr := i;
+    end;
+    if pOp^.opcode = OP_Rewind then fRewind := True;
+    if pOp^.opcode = OP_Next then fNext := True;
+    if pOp^.opcode = OP_Prev then fPrev := True;
+  end;
+  Check('SCOLS11 OP_Last emitted on iCursor (bRev=1)', fLast);
+  Check('SCOLS11 no OP_Rewind (bRev=1)', not fRewind);
+  Check('SCOLS11 pLevel^.p2 = OP_Last addr + 1',
+        pLevel^.p2 = emittedAddr + 1);
+  if fNext then ;
+  if fPrev then ;   { sqlite3WhereEnd emits the iteration opcode }
+
+  { ---- SCOLS12 — Recursive (CTE) pseudo-cursor short-circuits to OP_Noop;
+         no Rewind / Last / Next / Prev gets emitted at all. ---- }
+  pSItem^.fg.fgBits := u8($80);     { isRecursive bit 7 }
+  pWInfo^.revMask := 0;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.op := 99;
+  pLevel^.p1 := 12; pLevel^.p2 := 34; pLevel^.p5 := 56;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS12 isRecursive: pLevel^.op = OP_Noop', pLevel^.op = OP_Noop);
+  Check('SCOLS12 isRecursive: p1 not overwritten',  pLevel^.p1 = 12);
+  Check('SCOLS12 isRecursive: p2 not overwritten',  pLevel^.p2 = 34);
+  Check('SCOLS12 isRecursive: p5 not overwritten',  pLevel^.p5 = 56);
+  fRewind := False; fLast := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if pOp^.opcode = OP_Rewind then fRewind := True;
+    if pOp^.opcode = OP_Last   then fLast   := True;
+  end;
+  Check('SCOLS12 isRecursive: no OP_Rewind emitted', not fRewind);
+  Check('SCOLS12 isRecursive: no OP_Last emitted',   not fLast);
+
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -5244,6 +5396,7 @@ begin
   TestCodeOneLoopStart;
   TestCodeOneLoopStartCase3;
   TestCodeOneLoopStartCase4;
+  TestCodeOneLoopStartCase6;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

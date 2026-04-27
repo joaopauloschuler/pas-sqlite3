@@ -12668,13 +12668,38 @@ begin
     if omitTable <> 0 then pIdx4 := nil;
     if pIdx4 = nil then ;   { suppress 'value assigned but unused' on omit path }
   end
+  else if (pLoop^.wsFlags and WHERE_MULTI_OR) <> 0 then
+  begin
+    { Case 5 — wherecode.c:2351..2557.  Multi-index OR fall-through.
+      Defers to a subsequent batch (needs sqlite3WhereBegin recursion plus
+      the OR-disjunct sub-WHERE driver).  No fixture exercises this path
+      today — the dispatch fails fast when reached. }
+    Assert(False);
+  end
   else
   begin
-    { Cases 1, 5, 6 and the viaCoroutine special case land in subsequent
-      batches.  Until then the dispatch fails fast — callers from
-      TestWherePlanner exercise the rowid-EQ / rowid-range / indexed-EQ
-      arms today. }
-    Assert(False);
+    { Case 6 — wherecode.c:2561..2581.  No usable index; emit a complete
+      table scan.  Recursive (CTE) tables use a single-row pseudo-cursor
+      and need neither Rewind nor Next; everything else gets the canonical
+      OP_Rewind / OP_Last + OP_Next / OP_Prev pair with the fullscan-step
+      status flag stamped into pLevel^.p5. }
+    if (pTabItem^.fg.fgBits and u8($80)) <> 0 then  { isRecursive (bit 7) }
+    begin
+      pLevel^.op := OP_Noop;
+    end
+    else
+    begin
+      codeCursorHint(pTabItem, pWInfo, pLevel, nil);
+      if bRev <> 0 then pLevel^.op := OP_Prev else pLevel^.op := OP_Next;
+      pLevel^.p1 := iCur;
+      if bRev <> 0 then
+        pLevel^.p2 := 1 + sqlite3VdbeAddOp2(v, OP_Last,
+                                            iCur, pLevel^.addrHalt)
+      else
+        pLevel^.p2 := 1 + sqlite3VdbeAddOp2(v, OP_Rewind,
+                                            iCur, pLevel^.addrHalt);
+      pLevel^.p5 := SQLITE_STMTSTATUS_FULLSCAN_STEP;
+    end;
   end;
 
   Result := pLevel^.notReady;

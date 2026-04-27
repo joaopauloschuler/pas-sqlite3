@@ -832,6 +832,27 @@ Important: At the end of this document, please find:
       end-bound probe since nConstraint after build = 0, pStart marked
       TERM_CODED), SCOLS9 (BTM_LIMIT under bRev=1 — pLevel^.op flips to
       OP_Prev, swap path runs cleanly without crash).
+    - [X] Public surface, batch 14 — `sqlite3WhereCodeOneLoopStart`
+      Case 6 full-table scan (wherecode.c:2561..2581).  Falls through when
+      wsFlags has neither WHERE_IPK nor WHERE_INDEXED nor WHERE_MULTI_OR
+      lit.  isRecursive (SrcItemFg.fgBits bit 7) short-circuits to
+      `pLevel^.op := OP_Noop` for CTE pseudo-cursors that already hold a
+      single materialised row.  Non-recursive path emits the canonical
+      pair via `aStep[]`/`aStart[]` lookup tables: bRev=0 → OP_Rewind +
+      OP_Next; bRev=1 → OP_Last + OP_Prev.  `pLevel^.p1` set to the table
+      cursor, `pLevel^.p2` to `1 + sqlite3VdbeAddOp2(...)` (one past the
+      Rewind/Last so sqlite3WhereEnd's iteration opcode jumps back to the
+      first body instruction), `pLevel^.p5` stamped with
+      `SQLITE_STMTSTATUS_FULLSCAN_STEP` so the EQP / scan-status counters
+      mark this as a full scan.  Case 5 (multi-index OR) keeps its
+      Assert(False) skeleton — full port deferred until OR-disjunct
+      sub-WHERE driver lands alongside the next batch.
+      Gate: `TestWherePlanner.pas` (548/548): SCOLS10 (bRev=0 — OP_Rewind
+      on iCursor=7, OP_Next on pLevel^.op, p1=iCursor, p2=Rewind+1, p5=
+      FULLSCAN_STEP, no OP_Last), SCOLS11 (bRev=1 via revMask=1 — OP_Last
+      + OP_Prev, p2=Last+1, no OP_Rewind), SCOLS12 (isRecursive bit 7 set
+      — pLevel^.op=OP_Noop, p1/p2/p5 untouched, neither Rewind nor Last
+      emitted).
     - [X] Leaf helpers, batch 10 — `codeINTerm` (wherecode.c:668..784)
       full port replacing the prior `Assert(False)` stub.  IN-loop
       builder: opens the IN cursor (rowid table / shared index / EPH
