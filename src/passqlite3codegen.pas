@@ -13098,6 +13098,8 @@ var
   iReleaseReg: i32;
   iRowidReg:   i32;
   notReadyResid: Bitmask;
+  notReady:      Bitmask;
+  rc:            i32;
   pStart, pEnd: PWhereTerm;
   pX:          PExpr;
   rTemp:       i32;
@@ -13376,10 +13378,113 @@ begin
     ------------------------------------------------------------------------ }
   if (nTabList <> 1) or (whereShortCut(@sWLB) = 0) then
   begin
-    { TODO 11g.2.d: full planner.  Multi-table joins, non-rowid predicates,
-      ORDER BY consumption, virtual-table xFilter, etc. }
-    whereInfoFree(db, pWInfo);
-    Exit(nil);
+    { Full planner path — where.c:7079..7473.
+      Covers multi-table FROM (nTabList>1) and single-table shapes that
+      whereShortCut cannot handle (non-rowid predicates, index scans, etc.).
+      For now, bail if nTabList=1 and whereShortCut failed (existing behaviour
+      for those single-table shapes) so no PASS rows regress; only the
+      nTabList>1 branch proceeds to the planner. }
+    if nTabList = 1 then
+    begin
+      whereInfoFree(db, pWInfo);
+      Exit(nil);
+    end;
+
+    { where.c:7080 — build candidate WhereLoop list. }
+    rc := whereLoopAddAll(@sWLB);
+    if rc <> SQLITE_OK then
+    begin
+      whereInfoFree(db, pWInfo);
+      Exit(nil);
+    end;
+
+    { where.c:7105 — choose the best join order. }
+    rc := wherePathSolver(pWInfo, 0);
+    if db^.mallocFailed <> 0 then
+    begin
+      whereInfoFree(db, pWInfo);
+      Exit(nil);
+    end;
+    if pWInfo^.pOrderBy <> nil then
+    begin
+      if pWInfo^.nRowOut < 0 then
+        rc := wherePathSolver(pWInfo, 1)
+      else
+        rc := wherePathSolver(pWInfo, i16(pWInfo^.nRowOut + 1));
+      if db^.mallocFailed <> 0 then
+      begin
+        whereInfoFree(db, pWInfo);
+        Exit(nil);
+      end;
+    end;
+
+    if pParse^.nErr <> 0 then
+    begin
+      whereInfoFree(db, pWInfo);
+      Exit(nil);
+    end;
+
+    { where.c:7197 — accumulate row-count estimate. }
+    pParse^.nQueryLoop := i16(pParse^.nQueryLoop + pWInfo^.nRowOut);
+
+    v := sqlite3GetVdbe(pParse);
+    if v = nil then
+    begin
+      whereInfoFree(db, pWInfo);
+      Exit(nil);
+    end;
+
+    { where.c:7242..7423 — open a cursor for every level.
+      Simplified: skip virtual-table, WHERE_INDEXED, RIGHT JOIN, and ONEPASS
+      branches.  Only plain OP_OpenRead fires for the shapes exercised by
+      the LEFT_JOIN / JOIN_WHERE corpus rows. }
+    for ii := 0 to nTabList - 1 do
+    begin
+      pLevel   := @whereInfoLevels(pWInfo)[ii];
+      pTabItem := @SrcListItems(pTabList)[pLevel^.iFrom];
+      pTab     := pTabItem^.pSTab;
+      iDb      := sqlite3SchemaToIndex(db, pTab^.pSchema);
+      pLoop    := pLevel^.pWLoop;
+
+      pLevel^.addrBrk := sqlite3VdbeMakeLabel(pParse);
+      if (ii = 0) or ((pTabItem^.fg.jointype and JT_LEFT) <> 0) then
+        pLevel^.addrHalt := pLevel^.addrBrk
+      else
+        pLevel^.addrHalt := whereInfoLevels(pWInfo)[ii - 1].addrHalt;
+
+      { Skip ephemeral / view tables (no cursor to open). }
+      if ((pTab^.tabFlags and TF_Ephemeral) = 0) and (not IsView(pTab)) then
+      begin
+        if (pLoop^.wsFlags and WHERE_IDX_ONLY) = 0 then
+        begin
+          sqlite3OpenTable(pParse, pTabItem^.iCursor, iDb, pTab, OP_OpenRead);
+          sqlite3VdbeChangeP5(v, 0);
+        end;
+      end;
+      if iDb >= 0 then
+        sqlite3CodeVerifySchema(pParse, iDb);
+    end;
+    pWInfo^.iTop := sqlite3VdbeCurrentAddr(v);
+
+    { where.c:7431..7473 — emit code for each nested loop. }
+    notReady := not Bitmask(0);
+    for ii := 0 to nTabList - 1 do
+    begin
+      if pParse^.nErr <> 0 then
+      begin
+        whereInfoFree(db, pWInfo);
+        Exit(nil);
+      end;
+      pLevel           := @whereInfoLevels(pWInfo)[ii];
+      pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
+      notReady := sqlite3WhereCodeOneLoopStart(pParse, v, pWInfo, ii,
+                                               pLevel, notReady);
+      pWInfo^.iContinue := pLevel^.addrCont;
+    end;
+
+    pWInfo^.iEndWhere := sqlite3VdbeCurrentAddr(v);
+    Result := pWInfo;
+    Exit;
   end;
   if pParse^.nErr <> 0 then
   begin
@@ -16127,7 +16232,10 @@ begin
   then begin Result := SQLITE_OK; Exit; end;
   if p^.pPrior <> nil then begin Result := SQLITE_OK; Exit; end;
   if p^.pSrc = nil then begin Result := SQLITE_OK; Exit; end;
-  if p^.pSrc^.nSrc <> 1 then begin Result := SQLITE_OK; Exit; end;
+  { Multi-table join gate: allow up to 2-table plain JOINs (nSrc=1 or 2).
+    Larger join counts, subqueries, and other shapes stay deferred. }
+  if p^.pSrc^.nSrc < 1 then begin Result := SQLITE_OK; Exit; end;
+  if p^.pSrc^.nSrc > 2 then begin Result := SQLITE_OK; Exit; end;
   if p^.pEList = nil then begin Result := SQLITE_OK; Exit; end;
   if p^.pEList^.nExpr < 1 then begin Result := SQLITE_OK; Exit; end;
   { p^.pWhere <> nil gate lifted in sub-progress 9 — sqlite3WhereBegin
@@ -16149,17 +16257,26 @@ begin
   pItem    := SrcListItems(pTabList);
   pTab     := pItem^.pSTab;
 
-  { Source must be a real, non-virtual base table — no subqueries, no
-    vtabs, no view expansion in this slice. }
-  if pTab = nil then begin Result := SQLITE_OK; Exit; end;
-  if pItem^.fg.fgBits and $01 <> 0 then begin Result := SQLITE_OK; Exit; end;
-  if pTab^.eTabType = TABTYP_VTAB then begin Result := SQLITE_OK; Exit; end;
-  if (pTab^.tabFlags and TF_Ephemeral) <> 0 then begin Result := SQLITE_OK; Exit; end;
+  { All source items must be real, non-virtual base tables — no subqueries,
+    no vtabs, no view expansion in this slice. }
+  for i := 0 to pTabList^.nSrc - 1 do
+  begin
+    pTab := SrcListItems(pTabList)[i].pSTab;
+    if pTab = nil then begin Result := SQLITE_OK; Exit; end;
+    if SrcListItems(pTabList)[i].fg.fgBits and $01 <> 0 then
+      begin Result := SQLITE_OK; Exit; end;
+    if pTab^.eTabType = TABTYP_VTAB then begin Result := SQLITE_OK; Exit; end;
+    if (pTab^.tabFlags and TF_Ephemeral) <> 0 then
+      begin Result := SQLITE_OK; Exit; end;
+  end;
+  { Restore pTab to the first source for legacy single-table code below. }
+  pTab := pItem^.pSTab;
 
   { Result columns must be plain column references resolved by name
-    resolution (TK_COLUMN with iTable = pItem^.iCursor and a non-nil
-    pTab).  SRT_Exists does NOT evaluate result columns so skip this
-    check (mirrors C selectInnerLoop:1202 "else if eDest!=SRT_Exists"). }
+    resolution (TK_COLUMN with a non-nil pTab).  SRT_Exists does NOT
+    evaluate result columns so skip this check (mirrors C
+    selectInnerLoop:1202 "else if eDest!=SRT_Exists").
+    For multi-table joins, columns may reference any source cursor. }
   pEList := p^.pEList;
   items  := ExprListItems(pEList);
   if not isExists then
@@ -16169,10 +16286,6 @@ begin
       pE := items[i].pExpr;
       if pE = nil then begin Result := SQLITE_OK; Exit; end;
       if (pE^.op <> TK_COLUMN) and (pE^.op <> TK_AGG_COLUMN) then
-      begin
-        Result := SQLITE_OK; Exit;
-      end;
-      if pE^.iTable <> pItem^.iCursor then
       begin
         Result := SQLITE_OK; Exit;
       end;
@@ -16246,11 +16359,13 @@ begin
   end else begin
     { Non-EXISTS path: emit result columns. iSdst was already allocated above. }
 
-    { Inner loop body — one OP_Column per result column (selectInnerLoop:1197). }
+    { Inner loop body — one OP_Column per result column (selectInnerLoop:1197).
+      For multi-table joins, pE^.iTable is the actual cursor and pE^.y.pTab
+      is the source table; for single-table, this degenerates to the old path. }
     for i := 0 to nResultCol - 1 do
     begin
       pE := items[i].pExpr;
-      sqlite3ExprCodeGetColumnOfTable(v, pTab, pItem^.iCursor, pE^.iColumn,
+      sqlite3ExprCodeGetColumnOfTable(v, pE^.y.pTab, pE^.iTable, pE^.iColumn,
                                       pDest^.iSdst + i);
     end;
 
