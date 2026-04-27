@@ -2604,6 +2604,93 @@ Important: At the end of this document, please find:
       loop tail.  This is the lift that flips IPK_IN to PASS.  The
       analogous INDEX_IN scan plan (DeferredSeek + composite index)
       and `sqlite3SelectDup` for INDEX_IN_SUB Case 1 follow.
+    - [X] Sub-progress 20 — IPK-IN scan plan + Case-2 IPK-IN codegen +
+      WhereEnd IN-loop tail (2026-04-27).  Three coupled landings flip
+      `rowid IN list [IPK_IN]` from DIVERGE to PASS:
+
+      (a) `whereShortCut` (codegen.pas:12027) gains a WO_IN arm after
+      the IPK-EQ scan misses.  Walks the WhereClause for a single
+      rowid IN-with-literal-list term (`ExprUseXList` and
+      `pExpr^.x.pList <> nil`), excluding subselect IN-RHS (deferred
+      until Case-1 `sqlite3SelectDup` lands).  On hit, sets
+      `pLoop^.wsFlags = WHERE_IPK | WHERE_COLUMN_IN`, populates
+      `aLTerm[0]`, sets `nLTerm = nEq = 1`, and uses the same `rRun =
+      33` cost as IPK-EQ.  WHERE_ONEROW is intentionally NOT set —
+      the loop iterates the IN list, so the per-loop emission is the
+      eph-cursor walk, not a single-shot SeekRowid.  Mirrors the
+      cost/flags shape `whereLoopAddBtree` (where.c:4150) sets when
+      it picks the IPK-IN scan plan.
+
+      (b) `sqlite3WhereBegin` (codegen.pas:12455) gains two new
+      blocks coupled to the WO_IN arm: (1) a pre-allocation of
+      `iRowidReg = ++pParse^.nMem` BEFORE the sub-progress 19
+      pre-loop hoist runs, gated on `WHERE_IPK | WHERE_COLUMN_IN`;
+      this mirrors C's `iReleaseReg = ++pParse->nMem` at the top of
+      Case 2 (wherecode.c:1697) so the BeginSubrtn regReturn allocated
+      by `sqlite3CodeRhsOfIN` (expr.c:3663) lands at register N+1
+      instead of N — closing the only remaining op-diff in IPK_IN
+      under the previous baseline.  (2) A new Case-2 IPK-IN arm in
+      the case dispatch (between IPK-EQ and IPK-RANGE): asserts
+      EP_Subrtn + iTable populated by the pre-hoist, allocates a
+      fresh `addrNxt` label, emits `OP_Rewind iEph, 0` (P2 patched
+      later), allocates the InLoop slot via `sqlite3WhereRealloc`,
+      emits `OP_Column iEph 0 → iRowidReg`, `OP_IsNull iRowidReg`
+      (P2 patched later), `OP_SeekRowid iTabCur, addrNxt, iRowidReg`,
+      then populates the InLoop slot (`addrInTop`, `iCur=iEph`,
+      `eEndLoopOp=OP_Next`).  `pLevel^.op := OP_Noop` (the iteration
+      opcode lives in the IN-loop tail, not in the per-level slot)
+      and the IN term gets TERM_CODED so the residual walk does not
+      re-emit it as `OP_Affinity + OP_NotFound`.
+
+      (c) `sqlite3WhereEnd` (codegen.pas:12895) gains the IN-loop
+      tail (trimmed port of where.c:7628..7673).  Between the
+      `pLevel^.op` emission and `addrBrk` resolution, when
+      `WHERE_IN_ABLE` and `u.in_nIn > 0`: resolve `addrNxt` at the
+      current address (becomes the OP_Next emission point), walk
+      `aInLoop[]` in reverse, `JumpHere(addrInTop+1)` patches the
+      OP_IsNull jump to addrNxt, emit `OP_Next iCur, addrInTop`,
+      then `JumpHere(addrInTop-1)` patches the OP_Rewind jump-on-
+      empty to land just past OP_Next so the post-loop addrBrk
+      resolution exits cleanly.  WHERE_IN_EARLYOUT / iLeftJoin /
+      WHERE_IN_SEEKSCAN arms stay deferred — none exercised by the
+      single-level IPK-IN slice.
+
+      Test-suite delta:
+        * TestWhereCorpus: **15 → 16 PASS / 5 → 4 DIVERGE / 0 ERROR**.
+          IPK_IN flipped to PASS at exactly 26 ops (matches C-oracle
+          26 ops byte-for-byte).  Failure-mode tally: `0 exception,
+          0 nil-Vdbe, 4 op-count, 0 op-diff` — no per-op divergences
+          remain in the 5 IN-or-JOIN rows; the 4 op-count gaps are
+          INDEX_IN (composite-index IN, awaits DeferredSeek port),
+          INDEX_IN_SUB (subselect IN, awaits Case-1 sqlite3SelectDup),
+          LEFT_JOIN, JOIN_WHERE (multi-table planner, awaits 11g.2.d).
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41, TestVdbeApi
+          57/57, TestVdbeMisc 45/45, TestVdbeMem 62/62, TestVdbeAux
+          108/108, TestVdbeRecord 13/13, TestVdbeAgg 11/11,
+          TestVdbeStr 23/23, TestVdbeBlob 13/13, TestVdbeSort 14/14,
+          TestVdbeCursor 27/27, TestVdbeVtabExec 50/50,
+          TestExplainParity 2/10 unchanged, TestBtreeCompat 337/337,
+          TestPrintf 105/105, TestJson 434/434, TestJsonEach 50/50,
+          TestTokenizer 127/127, TestRegistration 19/19,
+          TestExecGetTable 23/23, TestBackup 20/20,
+          TestInitShutdown 27/27, TestUnlockNotify 14/14,
+          TestLoadExt 20/20, TestAuthBuiltins 34/34, TestOpenClose
+          17/17, TestInitCallback 29/29, TestConfigHooks 54/54.
+
+      Sub-progress 21 must port the analogous INDEX_IN scan plan: the
+      composite-index-EQ-with-IN shape (`a IN (1,2,3)` against an
+      index on `(a)` or `(a,b,…)`).  The plan adds OP_DeferredSeek
+      to bridge the index cursor's rowid into the table cursor and
+      iterates the eph cursor as the outer loop the same way Case-2
+      IPK-IN does today, but driving an OP_IdxRowid + OP_DeferredSeek
+      pair instead of OP_SeekRowid.  Then `sqlite3SelectDup` unlocks
+      INDEX_IN_SUB Case 1.  The two together flip the remaining IN
+      rows in TestWhereCorpus.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

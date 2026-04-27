@@ -12026,6 +12026,37 @@ begin
   end
   else
   begin
+    { Phase 6.9-bis 11g.2.f sub-progress 20 — WO_IN arm: rowid IN
+      literal-list scan plan.  The C planner places the IPK-IN scan plan
+      into whereLoopAddBtree (where.c:4150 sets WHERE_IPK and various
+      WHERE_COLUMN_IN flags), but the Pascal port is still on the
+      whereShortCut stand-in until 11g.2.d lands the full planner core.
+      Match a single rowid IN-with-literal-list term, build a
+      WHERE_IPK | WHERE_COLUMN_IN plan, and let sqlite3WhereBegin's
+      Case-2 IPK-IN body emit the eph-iterate + SeekRowid sequence the
+      C oracle produces.  Subselect IN RHS is excluded — it would
+      require Case-1 (sqlite3SelectDup) for the materialisation
+      subroutine, deferred to a later sub-progress.  The pre-loop
+      hoisting walk (sub-progress 19) already pre-emits the eph cursor
+      via FindInIndex(IN_INDEX_MEMBERSHIP); Case 2 just iterates it. }
+    pTerm := whereScanInit(@scan, pWC, iCur, -1, WO_IN, nil);
+    while (pTerm <> nil)
+       and ((pTerm^.prereqRight <> 0)
+            or (not ExprUseXList(pTerm^.pExpr))
+            or (pTerm^.pExpr^.x.pList = nil)) do
+      pTerm := whereScanNext(@scan);
+    if pTerm <> nil then
+    begin
+      pLoop^.wsFlags := WHERE_COLUMN_IN or WHERE_IPK;
+      pLoop^.aLTerm[0] := pTerm;
+      pLoop^.nLTerm := 1;
+      pLoop^.u.btree.nEq := 1;
+      pLoop^.rRun := 33;
+    end;
+  end;
+
+  if pLoop^.wsFlags = 0 then
+  begin
     pIdx := pTab^.pIndex;
     while pIdx <> nil do
     begin
@@ -12453,6 +12484,26 @@ begin
   sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenRead);
   sqlite3VdbeChangeP5(v, 0);
 
+  { Phase 6.9-bis 11g.2.f sub-progress 20 — pre-allocate the rowid-seek
+    register for IPK-IN scan plans, BEFORE the pre-loop IN-RHS hoist
+    walk runs.  Mirrors C's `iReleaseReg = ++pParse->nMem` at the top of
+    Case 2 (wherecode.c:1697) followed by sqlite3CodeRhsOfIN's
+    `pExpr->y.sub.regReturn = ++pParse->nMem` (expr.c:3663): C lays out
+    the seek register first and the BeginSubrtn regReturn second, so
+    BeginSubrtn p2 reports register N+1 instead of N.  Without this
+    pre-allocation, the BeginSubrtn slot in the pre-emitted IN-RHS
+    materialisation lands one register lower than C, the only remaining
+    op-diff in the IPK_IN row of TestWhereCorpus.  IPK-EQ keeps
+    its in-body `Inc(nMem)` arm — there is no pre-emitted subroutine
+    competing for register slots in that shape. }
+  iRowidReg := 0;
+  if ((pLoop^.wsFlags and WHERE_IPK) <> 0)
+     and ((pLoop^.wsFlags and WHERE_COLUMN_IN) <> 0) then
+  begin
+    Inc(pParse^.nMem);
+    iRowidReg := pParse^.nMem;
+  end;
+
   { Phase 6.9-bis 11g.2.f sub-progress 19 — pre-loop IN-RHS hoisting.
 
     Walk every base WHERE term that is NOT virtual, NOT already TERM_CODED
@@ -12518,6 +12569,81 @@ begin
     { Inline disableTerm — mark the rowid-EQ term TERM_CODED so the per-row
       body code generator (when wired up) does not re-emit it.  The full C
       disableTerm also handles transitive-equiv terms; deferred to 11g.2.e. }
+    pTerm^.wtFlags := pTerm^.wtFlags or TERM_CODED;
+  end
+  else if ((pLoop^.wsFlags and WHERE_IPK) <> 0)
+       and ((pLoop^.wsFlags and WHERE_COLUMN_IN) <> 0) then
+  begin
+    { Phase 6.9-bis 11g.2.f sub-progress 20 — Case-2 IPK-IN inline.
+
+      Trimmed port of wherecode.c:1684..1711 (Case 2 rowid-IN arm), backed by
+      the sub-progress 19 pre-loop IN-RHS hoist.  Sub-progress 19 already
+      called sqlite3FindInIndex(IN_INDEX_MEMBERSHIP) on this term, which set
+      EP_Subrtn on the TK_IN expression and stashed the eph cursor in
+      pX^.iTable.  Case 2 IPK-IN simply iterates that cached eph cursor as
+      the OUTER loop: OP_Rewind eph (jumps to addrBrk on empty), OP_Column
+      eph 0 → iRowidReg, OP_IsNull iRowidReg (jump-to-addrNxt patched by
+      sqlite3WhereEnd's IN-tail walk), OP_SeekRowid table → addrNxt.  The
+      InLoop slot drives sqlite3WhereEnd to emit OP_Next on the eph cursor
+      at addrNxt and patch the OP_Rewind / OP_IsNull jumps.  pLevel^.op
+      stays OP_Noop — the IN-tail block emits the iteration opcode.
+
+      Subselect IN-RHS is excluded by whereShortCut's WO_IN arm; this
+      block only runs for literal-list IN. }
+    pTerm := pLoop^.aLTerm[0];
+    Assert(pTerm <> nil);
+    Assert(pTerm^.pExpr <> nil);
+    Assert(pTerm^.pExpr^.op = TK_IN);
+    Assert(ExprHasProperty(pTerm^.pExpr, EP_Subrtn));
+    Assert(pTerm^.pExpr^.iTable > 0);
+    pX := pTerm^.pExpr;
+    iInTabDummy := pX^.iTable;  { eph cursor allocated by pre-hoist }
+
+    { Fresh per-iteration jump-target label; OP_IsNull / OP_SeekRowid jump
+      here on miss / NULL, and sqlite3WhereEnd resolves it at the OP_Next
+      eph emission point. }
+    pLevel^.addrNxt := sqlite3VdbeMakeLabel(pParse);
+
+    { OP_Rewind eph cursor — P2 is patched by WhereEnd's IN-tail
+      JumpHere(addrInTop-1) to land just past the OP_Next, exiting the
+      loop on an empty IN-RHS. }
+    sqlite3VdbeAddOp2(v, OP_Rewind, iInTabDummy, 0);
+
+    { Allocate the InLoop slot used by WhereEnd's IN-tail walk. }
+    pLoop^.wsFlags := pLoop^.wsFlags or WHERE_IN_ABLE;
+    pLevel^.u.in_nIn := 1;
+    pLevel^.u.in_aInLoop := PInLoop(sqlite3WhereRealloc(pWInfo,
+                              pLevel^.u.in_aInLoop, u64(SizeOf(TInLoop))));
+    if pLevel^.u.in_aInLoop = nil then pLevel^.u.in_nIn := 0;
+
+    { OP_Column iEph 0 → iRowidReg.  addrInTop = address of this OP_Column
+      so OP_Next can loop back here. }
+    startAddr := sqlite3VdbeAddOp3(v, OP_Column, iInTabDummy, 0, iRowidReg);
+
+    { OP_IsNull iRowidReg — P2 is patched by WhereEnd's
+      JumpHere(addrInTop+1) to addrNxt.  We pass 0 here because the
+      jump target is patched at WhereEnd time. }
+    sqlite3VdbeAddOp1(v, OP_IsNull, iRowidReg);
+
+    { OP_SeekRowid iTabCur → addrNxt on miss; iRowidReg holds the rowid
+      pulled out of the eph row. }
+    sqlite3VdbeAddOp3(v, OP_SeekRowid, pLevel^.iTabCur, pLevel^.addrNxt,
+                      iRowidReg);
+
+    if pLevel^.u.in_aInLoop <> nil then
+    begin
+      pLevel^.u.in_aInLoop^.addrInTop := startAddr;
+      pLevel^.u.in_aInLoop^.iCur      := iInTabDummy;
+      pLevel^.u.in_aInLoop^.eEndLoopOp := OP_Next;
+      pLevel^.u.in_aInLoop^.iBase     := 0;
+      pLevel^.u.in_aInLoop^.nPrefix   := 0;
+    end;
+
+    pLevel^.op := OP_Noop;
+
+    { Mark the IN term TERM_CODED so the residual-filter walk does not
+      re-emit a per-row OP_Affinity + OP_NotFound against the same eph
+      cursor — Case 2 IPK-IN's SeekRowid already enforces the predicate. }
     pTerm^.wtFlags := pTerm^.wtFlags or TERM_CODED;
   end
   else if ((pLoop^.wsFlags and WHERE_IPK) <> 0)
@@ -12731,7 +12857,10 @@ var
   pPrs:   PParse;
   v:      PVdbe;
   i:      i32;
+  j:      i32;
   pLevel: PWhereLevel;
+  pLoop:  PWhereLoop;
+  pIn:    PInLoop;
   db:     PTsqlite3;
 begin
   { Phase 6.9-bis 11g.2.b — productive loop-tail.
@@ -12771,6 +12900,36 @@ begin
       begin
         sqlite3VdbeAddOp3(v, pLevel^.op, pLevel^.p1, pLevel^.p2, pLevel^.p3);
         sqlite3VdbeChangeP5(v, pLevel^.p5);
+      end;
+      { Phase 6.9-bis 11g.2.f sub-progress 20 — IN-loop tail.
+
+        Trimmed port of where.c:7628..7673.  For loops with WHERE_IN_ABLE
+        and a populated u.in.aInLoop[] (today set up by Case 2 IPK-IN in
+        sqlite3WhereBegin), resolve addrNxt at the OP_Next emission point,
+        walk aInLoop in reverse, patch the OP_IsNull jump to addrNxt
+        (addrInTop+1), emit OP_Next iCur, addrInTop, then patch the
+        OP_Rewind jump-on-empty (addrInTop-1) to land just past OP_Next so
+        the post-loop addrBrk resolution exits cleanly.
+
+        The full C tail also handles WHERE_IN_EARLYOUT / iLeftJoin /
+        WHERE_IN_SEEKSCAN — none exercised by the IPK-IN single-level slice
+        today, so they stay deferred (will land alongside the composite
+        index-IN scan plan in a later sub-progress). }
+      pLoop := pLevel^.pWLoop;
+      if ((pLoop^.wsFlags and WHERE_IN_ABLE) <> 0)
+         and (pLevel^.u.in_nIn > 0)
+         and (pLevel^.u.in_aInLoop <> nil) then
+      begin
+        sqlite3VdbeResolveLabel(v, pLevel^.addrNxt);
+        for j := pLevel^.u.in_nIn downto 1 do
+        begin
+          pIn := pLevel^.u.in_aInLoop;
+          Inc(pIn, j - 1);
+          sqlite3VdbeJumpHere(v, pIn^.addrInTop + 1);
+          if pIn^.eEndLoopOp <> OP_Noop then
+            sqlite3VdbeAddOp2(v, pIn^.eEndLoopOp, pIn^.iCur, pIn^.addrInTop);
+          sqlite3VdbeJumpHere(v, pIn^.addrInTop - 1);
+        end;
       end;
       sqlite3VdbeResolveLabel(v, pLevel^.addrBrk);
       ljNullRowFixup(pPrs, v, pWInfo, pLevel);
