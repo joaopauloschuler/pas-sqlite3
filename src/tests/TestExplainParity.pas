@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 983 + 3 + 4;
+  N_CORPUS = 983 + 3 + 4 + 15;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -1163,6 +1163,23 @@ begin
   Add(i, 'SELECT WHERE rowid<=5',       'SELECT a FROM t WHERE rowid<=5;');      Inc(i);
   Add(i, 'SELECT WHERE rowid>5',        'SELECT a FROM t WHERE rowid>5;');       Inc(i);
   Add(i, 'SELECT WHERE rowid>=5',       'SELECT a FROM t WHERE rowid>=5;');      Inc(i);
+
+  { Probe sweep — additional shapes for corpus coverage expansion (6.10). }
+  Add(i, 'SELECT GLOB',                 'SELECT a FROM t WHERE a GLOB ''abc*'';');     Inc(i);
+  Add(i, 'SELECT IS NULL',              'SELECT a FROM t WHERE a IS NULL;');           Inc(i);
+  Add(i, 'SELECT IS NOT NULL',          'SELECT a FROM t WHERE a IS NOT NULL;');       Inc(i);
+  Add(i, 'SELECT a<>5',                 'SELECT a FROM t WHERE a<>5;');                Inc(i);
+  Add(i, 'SELECT a!=5',                 'SELECT a FROM t WHERE a!=5;');                Inc(i);
+  Add(i, 'SELECT BETWEEN',              'SELECT a FROM t WHERE a BETWEEN 5 AND 10;');  Inc(i);
+  Add(i, 'SELECT NOT (a=5)',            'SELECT a FROM t WHERE NOT (a=5);');           Inc(i);
+  Add(i, 'SELECT rowid<>5',             'SELECT a FROM t WHERE rowid<>5;');            Inc(i);
+  Add(i, 'SELECT abs(a)',               'SELECT abs(a) FROM t;');                      Inc(i);
+  Add(i, 'SELECT length lit',           'SELECT length(''hi'');');                     Inc(i);
+  Add(i, 'SELECT NULL lit',             'SELECT NULL;');                               Inc(i);
+  Add(i, 'SELECT 1=1',                  'SELECT 1=1;');                                Inc(i);
+  Add(i, 'SELECT WHERE 1',              'SELECT a FROM t WHERE 1;');                   Inc(i);
+  Add(i, 'SELECT WHERE 0',              'SELECT a FROM t WHERE 0;');                   Inc(i);
+  Add(i, 'SELECT rowid=5 AND a=10',     'SELECT a FROM t WHERE rowid=5 AND a=10;');    Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

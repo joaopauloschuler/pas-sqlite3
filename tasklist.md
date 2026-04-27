@@ -194,13 +194,12 @@ Important: At the end of this document, please find:
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
   comparison ops + literal-arith + col aliases + multi-col index +
   multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **989 PASS / 1 DIVERGE / 0 ERROR**
-  (corpus = 990 after rowid range probes (<,<=,>,>=) flipped to PASS
-  once `whereShortCut` stopped hard-coding `pLoop^.rRun := 33` for the
-  IPK range arm and instead applies the C costing
-  `rRun = (rSize - 20*nBounds - 20*both) + 16` from
-  `whereRangeScanEst` + `whereLoopAddBtreeIndex` IPK arm
-  (where.c:3552..3572)).
+  Current Status (2026-04-27): **1003 PASS / 2 DIVERGE / 0 ERROR**
+  (corpus = 1005 after a +15-row probe sweep covering GLOB, IS NULL,
+  IS NOT NULL, `<>` / `!=`, BETWEEN, NOT, `rowid<>`, `abs(a)`,
+  `NULL` literal, `1=1`, `WHERE 1` / `WHERE 0`, multi-AND
+  rowid+col).  14 of the 15 new shapes flipped straight to PASS;
+  the lone new DIVERGE is `SELECT length('hi');` — see step 8 below.
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -208,6 +207,8 @@ Important: At the end of this document, please find:
   DIVERGE rows + delta = (C ops − Pas ops):
 
   - DROP TABLE — Δ=21 (step 4)
+  - SELECT length('hi') — Δ=2 (step 8 — factorable-constant
+    `OP_Once` hoist gate missing on no-FROM literal call)
 
   Root cause for DROP TABLE Δ=21 (re-analysis 2026-04-27 from
   bytecode dump):
@@ -308,9 +309,8 @@ Important: At the end of this document, please find:
           temp reg into iDummy instead of regFree1 so the trailing
           `sqlite3ReleaseTempReg(regFree1)` no longer emits an extra
           `OP_ReleaseReg` under SQLITE_DEBUG.  IN/NOT IN PASS.
-        [ ] `SELECT a FROM t WHERE a LIKE 'abc%'` / `GLOB 'abc*'` —
-          LIKE shape now PASSes (added to corpus); GLOB still
-          unprobed.
+        [X] `SELECT a FROM t WHERE a LIKE 'abc%'` / `GLOB 'abc*'` —
+          both shapes PASS; rows landed in the +15-row probe sweep.
         [ ] `SELECT DISTINCT a FROM t` — Δ=13 (DISTINCT codegen,
           ephemeral-table dedup not yet wired in `sqlite3Select`).
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
@@ -352,7 +352,17 @@ Important: At the end of this document, please find:
   `sqlite3ExprCodeFactorable`) is still off by a few ops; tracked as
   the new step-6 follow-on below.
 
-    - [X] **6.10 step 7** SELECT/DML divergences exposed by the
+    - [ ] **6.10 step 8** Factorable-constant function-call hoist
+      missing on no-FROM SELECT.  Probe `SELECT length('hi');`
+      diverges Δ=2: C emits `Once / String8 / Function / Copy /
+      ResultRow / Halt / Goto` (9 ops with Init/Goto), gating the
+      String8+Function call behind `OP_Once` so a re-prepare step
+      can skip the constant-folding tail; Pas emits the call
+      inline (`String8 / Function / ResultRow`) for 7 ops.  Caused
+      by `sqlite3ExprCodeAtInit` / `sqlite3ExprCodeFactorable`
+      gate not firing in the no-FROM `sqlite3Select` fast path
+      (`passqlite3codegen.pas` ~17600).  No correctness impact —
+      cache only.
       expanded corpus all closed:
         * [X] `sqlite3Select` no-FROM fast path — `SELECT <expr-list>;`
           with empty pSrc emits OP_Explain + per-col sqlite3ExprCode
