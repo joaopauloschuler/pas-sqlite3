@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 310;
+  N_CORPUS = 342;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -428,6 +428,40 @@ begin
   Add(i, 'SELECT col concat both lit',  'SELECT ''a''||a||''z'' FROM t;');       Inc(i);
   Add(i, 'SELECT a+1+1',                'SELECT a+1+1 FROM t;');                 Inc(i);
   Add(i, 'SELECT a-1+2',                'SELECT a-1+2 FROM t;');                 Inc(i);
+
+  { Probe sweep #13 — candidate rows. }
+  Add(i, 'SELECT b col scan',           'SELECT b FROM t;');                     Inc(i);
+  Add(i, 'SELECT c col scan',           'SELECT c FROM t;');                     Inc(i);
+  Add(i, 'SELECT b+c col arith',        'SELECT b+c FROM t;');                   Inc(i);
+  Add(i, 'SELECT b-c col arith',        'SELECT b-c FROM t;');                   Inc(i);
+  Add(i, 'SELECT b*c col arith',        'SELECT b*c FROM t;');                   Inc(i);
+  Add(i, 'SELECT 1+1 lit',              'SELECT 1+1;');                          Inc(i);
+  Add(i, 'SELECT 2+3 lit',              'SELECT 2+3;');                          Inc(i);
+  Add(i, 'SELECT 10*10 lit',            'SELECT 10*10;');                        Inc(i);
+  Add(i, 'SELECT 100/2 lit',            'SELECT 100/2;');                        Inc(i);
+  Add(i, 'SELECT 7-3 lit',              'SELECT 7-3;');                          Inc(i);
+  Add(i, 'SELECT col WHERE a=1',        'SELECT a FROM t WHERE a=1;');           Inc(i);
+  Add(i, 'SELECT col WHERE a=2',        'SELECT a FROM t WHERE a=2;');           Inc(i);
+  Add(i, 'SELECT col WHERE a=100',      'SELECT a FROM t WHERE a=100;');         Inc(i);
+  Add(i, 'SELECT col WHERE a=-1',       'SELECT a FROM t WHERE a=-1;');          Inc(i);
+  Add(i, 'INSERT t zeros',              'INSERT INTO t VALUES(0,0,0);');         Inc(i);
+  Add(i, 'CREATE TABLE z16 4col',       'CREATE TABLE z16(a,b,c,d);');           Inc(i);
+  Add(i, 'CREATE TABLE z17 TEXT col',   'CREATE TABLE z17(a TEXT);');            Inc(i);
+  Add(i, 'CREATE TABLE z18 simple',     'CREATE TABLE z18(x);');                 Inc(i);
+  Add(i, 'SAVEPOINT spE',               'SAVEPOINT spE;');                       Inc(i);
+  Add(i, 'RELEASE spE',                 'RELEASE spE;');                         Inc(i);
+  Add(i, 'SAVEPOINT one',               'SAVEPOINT one;');                       Inc(i);
+  Add(i, 'RELEASE one',                 'RELEASE one;');                         Inc(i);
+  Add(i, 'SELECT * other u',            'SELECT * FROM u;');                     Inc(i);
+  Add(i, 'SELECT 1,2,3 lit',            'SELECT 1, 2, 3;');                      Inc(i);
+  Add(i, 'SELECT empty str',            'SELECT '''';');                         Inc(i);
+  Add(i, 'SELECT col MOD lit',          'SELECT a%3 FROM t;');                   Inc(i);
+  Add(i, 'SELECT col DIV',              'SELECT a/3 FROM t;');                   Inc(i);
+  Add(i, 'SELECT s x +0',               'SELECT x+0 FROM s;');                   Inc(i);
+  Add(i, 'SELECT y col scan',           'SELECT y FROM s;');                     Inc(i);
+  Add(i, 'SELECT z col scan',           'SELECT z FROM s;');                     Inc(i);
+  Add(i, 'SELECT x*y',                  'SELECT x*y FROM s;');                   Inc(i);
+  Add(i, 'SELECT col WHERE rowid=42',   'SELECT a FROM t WHERE rowid=42;');      Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
