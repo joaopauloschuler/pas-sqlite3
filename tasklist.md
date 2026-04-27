@@ -203,10 +203,11 @@ Important: At the end of this document, please find:
     missing Integer + ResultRow + Explain tail)
   - SELECT * scan — Δ=9 (sqlite3Select bails on `*` expansion;
     OpenRead + Rewind + Column×3 + ResultRow + Next tail elided)
-  - DELETE rowid EQ — Δ=−13 (Pas uses 2-pass ROWSET strategy
-    instead of C's ONEPASS_SINGLE; also emits spurious AddImm /
-    FkCheck / ResultRow / change-counter Integer at tail; Pas now
-    additionally emits an OP_Explain that C suppresses on this path)
+  - DELETE rowid EQ — Δ=−9 (Pas uses 2-pass ROWSET strategy
+    instead of C's ONEPASS_SINGLE; also emits a spurious
+    false-WHERE-Term-Bypass on rowid=5 (Null+Ne) before the scan
+    and a trailing change-counter Integer/Goto pair after Halt+
+    Transaction)
 
   Root cause for DROP TABLE: Pas-side elides the C-side
   pre-Destroy "scan sqlite_schema for trigger rows + reinsert" pass
@@ -279,9 +280,21 @@ Important: At the end of this document, please find:
           OP_Explain that C's ONEPASS path elides — addressed by the
           ONEPASS migration sub-task below).
         * `sqlite3DeleteFrom` rowid-EQ should pick ONEPASS_SINGLE
-          (in-loop Delete) instead of the 2-pass ROWSET strategy;
-          also drop the trailing AddImm / FkCheck / ResultRow ops
-          on the productive non-counted path.
+          (in-loop Delete) instead of the 2-pass ROWSET strategy.
+          Spurious memCnt-driven AddImm / FkCheck / ResultRow path
+          closed by fixing the wrong default-flags bit in
+          `passqlite3main.pas:507` (HI(0x00001)=SQLITE_CountRows was
+          being set in place of the intended LO(0x40)=ShortColNames).
+        * False-WHERE-Term-Bypass spuriously fires on `rowid=5`
+          (emits Null+Ne before the scan); root cause is prereqAll=0
+          on the rowid term, likely because rowid resolution doesn't
+          tag the table mask in `sqlite3WhereExprAnalyze`.  Fix in
+          the prereqAll/prereqRight population for TK_COLUMN with
+          iColumn=-1.
+        * Tail of DELETE rowid EQ has an extra `Integer p1=5 p2=3`
+          + `Goto 0,1` pair after Halt+Transaction that C does not
+          emit — likely a stray prologue-patch from
+          `sqlite3FinishCoding`.
 
 ---
 
