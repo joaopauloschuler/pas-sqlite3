@@ -18982,15 +18982,22 @@ begin
     impossible on the productive path because the parser already validated
     column count in C-side ExprListAppend / sqlite3SrcListLookup.
 
-    DEFAULT VALUES path (pList=nil, nColumn=0): emit OP_Null for every
-    column slot so the subsequent OP_MakeRecord has well-defined inputs.
-    sqlite3ColumnExpr is still a stub returning nil (Phase 7), so this
-    matches the result that `sqlite3ExprCodeFactorable(.., nil, .)` would
-    produce in the C reference for the not-yet-ported defaults case. }
+    DEFAULT VALUES path (pList=nil, nColumn=0): factor each column's
+    default into the OP_Init prologue via sqlite3ExprCodeRunJustOnce so
+    OP_Null lands once per stmt, matching insert.c:1413..1418's
+    sqlite3ExprCodeFactorable(pParse, sqlite3ColumnExpr(...), iRegStore).
+    sqlite3ColumnExpr is still a stub returning nil (Phase 7), and
+    sqlite3ExprIsConstantNotJoin(nil) returns 2 (truthy) — the C path
+    likewise feeds NULL through ExprCodeRunJustOnce to land an OP_Null
+    in the trailing init section. }
   if pList = nil then
   begin
     for i := 0 to i32(pTab^.nCol) - 1 do
-      sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i);
+      if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
+         and (sqlite3ExprIsConstantNotJoin(pParse, nil) <> 0) then
+        sqlite3ExprCodeRunJustOnce(pParse, nil, regData + i)
+      else
+        sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i);
   end
   else
   begin
