@@ -32,40 +32,37 @@ Important: At the end of this document, please find:
     TK_COLLATE/TK_SPAN/TK_UPLUS arms, whereShortCut, allowedOp +
     operatorMask + exprMightBeIndexed + minimal-viable exprAnalyze)
     are already landed.
-    - [ ] Re-enable productive tails — `sqlite3Update` skeleton-only
-      and `sqlite3DeleteFrom` vtab `OP_VUpdate` arm still open (tracked
-      under 11g.2.f "Open follow-on").  `sqlite3GenerateRowDelete`,
-      `sqlite3GenerateConstraintChecks` are landed; productive truncate
-      arm + where-loop arm of DeleteFrom landed in 11g.2.f sub-progress
-      48–49.  `sqlite3CompleteInsertion` still a stub but only used by
+    - [ ] Re-enable productive tails — 
+      - [ ] code `sqlite3Update`
+      - [ ] code `sqlite3DeleteFrom` vtab `OP_VUpdate`.  
+      - [ ] code `sqlite3GenerateRowDelete`,
+      - [ ] code `sqlite3GenerateConstraintChecks`
+      - [ ] code `sqlite3CompleteInsertion` still a stub but only used by
       Update productive tail.
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
-    `TestWhereCorpus.pas` covering the full WHERE shape matrix
-    (single rowid-EQ, multi-AND, OR-decomposed, LIKE, IN-subselect,
-    composite index range-scan, LEFT JOIN, virtual table xFilter).
-    Verify byte-identical bytecode emission against C via
-    TestExplainParity expansion.  Re-enable any disabled assertion /
-    safety-net guards left in place during 11g.2.b..e.
-    Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 1004 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 1005); TestWherePlanner 675/675.**
-    Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
-    `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
-    the system one.
+    
+    - [ ] Code `TestWhereCorpus.pas`
+        Verify byte-identical bytecode emission against C via
+        TestExplainParity expansion.  
+        Re-enable any disabled assertion /
+        safety-net guards left in place
+    
+        Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
+        `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
+        the system one.
 
-    **Open follow-on:** Re-enable productive tails:
-      * `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
+    - [ ] **Open follow-on:** Re-enable productive tails:
+      - [ ] Re-enable `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
         arm and where-loop / one-pass arm both productive.  vtab
         `OP_VUpdate` arm still TODO (out of current corpus).
-      * `sqlite3Update` (`passqlite3codegen.pas:17835`): skeleton-only
+      - [ ] Re-enable `sqlite3Update` (`passqlite3codegen.pas:17835`): skeleton-only
         with snapshot/restore guard at 17890..17893 / 17965..17970;
         blocks NestedParse UPDATE of the placeholder sqlite_master row.
 
-    The 1 remaining TestExplainParity DIVERGE is the DROP TABLE
+  - [ ] Fix the only remaining TestExplainParity DIVERGE: DROP TABLE
     op-count row — structural (extra C-side scan/reinsert pre-Destroy
-    pass that Pas elides; rows still materialise correctly).  Tracked
-    under 6.10 step 4.
+    pass that Pas elides; rows still materialise correctly).
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Decomposition:
@@ -109,22 +106,6 @@ Important: At the end of this document, please find:
           (read-pragma codegen is a stub: `sqlite3Pragma` in
           passqlite3codegen.pas:22374 returns immediately; needs
           ReadCookie / ResultRow tail at minimum).
-        [X] `SELECT a FROM t WHERE rowid<5` (and `>`, `<=`, `>=`) —
-          fixed by replacing `pLoop^.rRun := 33` in `whereShortCut`'s
-          IPK range arm with the proper C costing
-          `(rSize - 20*nBounds - 20*both) + 16`, mirroring
-          whereRangeScanEst + whereLoopAddBtreeIndex IPK arm
-          (where.c:3552..3572).  Also gated the `pLoop^.nOut := 1`
-          override on WHERE_ONEROW so range plans keep the scan
-          estimate (used by `pWInfo^.nRowOut`).  All four shapes PASS.
-        [X] `SELECT a FROM t WHERE a IN (1,2,3)` / `NOT IN (...)` —
-          fixed by aligning `sqlite3ExprCodeIN` (codegen.pas:27038)
-          with C's `exprCodeVector(.., &iDummy)`: capture the LHS
-          temp reg into iDummy instead of regFree1 so the trailing
-          `sqlite3ReleaseTempReg(regFree1)` no longer emits an extra
-          `OP_ReleaseReg` under SQLITE_DEBUG.  IN/NOT IN PASS.
-        [X] `SELECT a FROM t WHERE a LIKE 'abc%'` / `GLOB 'abc*'` —
-          both shapes PASS; rows landed in the +15-row probe sweep.
         [ ] `SELECT DISTINCT a FROM t` — Δ=13 (DISTINCT codegen,
           ephemeral-table dedup not yet wired in `sqlite3Select`).
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
@@ -144,42 +125,29 @@ Important: At the end of this document, please find:
           Δ=11 (rowid-aliased INTEGER PRIMARY KEY INSERT path).
         [ ] `SELECT p FROM u;` — per-op divergence at op[1] (scan
           of rowid-aliased PRIMARY KEY column).
-        [X] `DROP TABLE IF EXISTS znope;` (target absent) —
-          fixed by porting `db->suppressErr` short-circuit in
-          `sqlite3ErrorMsg` (build.c:138): when suppressErr is set,
-          drop the message silently and leave nErr/rc untouched (only
-          mallocFailed promotes to SQLITE_NOMEM).  Previously the Pas
-          version unconditionally incremented nErr, so the
-          `sqlite3LocateTableItem` "no such table" path under
-          DropTable's `Inc(suppressErr)` guard left nErr=1 and
-          `sqlite3_prepare_v2` returned SQLITE_ERROR with a nil stmt.
-          New corpus row added: PASS at 5 ops.
   
   [ ] **6.11** Drop Table - DIVERGE rows + delta = (C ops − Pas ops):
-
-  - DROP TABLE — Δ=21 (step 4)
-
-  Root cause for DROP TABLE Δ=21 (re-analysis 2026-04-27 from
-  bytecode dump):
-    (a) Pas opens cursor 0 with `OP_OpenRead` and emits a 2-pass
-        RowSet delete loop for the sqlite_schema scrub
-        (`RowSetAdd` during scan, then `OpenWrite` + `RowSetRead` /
-        `NotExists` / `Delete` / `Goto` cleanup), where C uses a
-        single `OP_OpenWrite` and inline `Delete` during the scan
-        (~+5 Pas ops vs C).  Tracked under 11g.2.f open follow-on:
-        `sqlite3DeleteFrom` ONEPASS_MULTI promotion for non-rowid-EQ
-        scans.
-    (b) Pas elides the destroyRootPage autovacuum follow-on
-        (`Null` / `OpenEphemeral` / `IfNot` / `OpenRead` / `Explain`
-        / `Rewind` / `Column` / `ReleaseReg` / `Ne` / `ReleaseReg` /
-        `Rowid` / `Insert` / `Next` / `OpenWrite` / `Rewind` /
-        `Rowid` / `NotExists` / `Column`×3 / `Integer` / `Column` /
-        `MakeRecord` / `Insert` / `Next` / `ReleaseReg` — ~26 ops)
-        because `destroyRootPage` calls `sqlite3NestedParse(... UPDATE
-        sqlite_schema SET rootpage=... WHERE ... AND rootpage=...)`
-        and productive `sqlite3Update` is still skeleton-only
-        (11g.2.f open follow-on).
-  Net delta: −26 + 5 = −21 ✓.
+    DROP TABLE — Δ=21 (step 4)
+    Root cause for DROP TABLE Δ=21 (re-analysis 2026-04-27 from
+    bytecode dump):
+      (a) Pas opens cursor 0 with `OP_OpenRead` and emits a 2-pass
+          RowSet delete loop for the sqlite_schema scrub
+          (`RowSetAdd` during scan, then `OpenWrite` + `RowSetRead` /
+          `NotExists` / `Delete` / `Goto` cleanup), where C uses a
+          single `OP_OpenWrite` and inline `Delete` during the scan
+          (~+5 Pas ops vs C).  Tracked under 11g.2.f open follow-on:
+          `sqlite3DeleteFrom` ONEPASS_MULTI promotion for non-rowid-EQ
+          scans.
+      (b) Pas elides the destroyRootPage autovacuum follow-on
+          (`Null` / `OpenEphemeral` / `IfNot` / `OpenRead` / `Explain`
+          / `Rewind` / `Column` / `ReleaseReg` / `Ne` / `ReleaseReg` /
+          `Rowid` / `Insert` / `Next` / `OpenWrite` / `Rewind` /
+          `Rowid` / `NotExists` / `Column`×3 / `Integer` / `Column` /
+          `MakeRecord` / `Insert` / `Next` / `ReleaseReg` — ~26 ops)
+          because `destroyRootPage` calls `sqlite3NestedParse(... UPDATE
+          sqlite_schema SET rootpage=... WHERE ... AND rootpage=...)`
+          and productive `sqlite3Update` is still skeleton-only
+          (11g.2.f open follow-on).
 
 
 ---
