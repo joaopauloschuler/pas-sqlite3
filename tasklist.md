@@ -198,11 +198,42 @@ Important: At the end of this document, please find:
         Upstream classification gap closed (commit `b94ddc1` —
         `exprSelectUsage` ported at `passqlite3codegen.pas:8105..8154`,
         cross-frame `prereqRight` masks now propagate correctly).
-        Closing the remaining 8-op gap requires the downstream
-        auto-index / `useBloomFilter` synthesis path
-        (`passqlite3codegen.pas:11055..11115` and `13151..13343`) to
-        actually fire on the now-correctly-classified term — separate
-        larger task.  Companion `NOT_EXISTS` PASSes via plain-scan.
+
+        **Diagnosis (2026-04-27):** The 8-op gap is NOT simply the
+        autoindex synthesis at `passqlite3codegen.pas:11055..11115`
+        failing to fire — it never gets the chance.  The C reference
+        emits `OpenAutoindex` / `FilterAdd` at the OUTER level of the
+        query, NOT inside the EXISTS subroutine.  This is the
+        **EXISTS-to-JOIN optimization** (`select.c:7295..7378`,
+        `existsToJoin()`), gated on `pParse->bHasExists` and
+        `OptimizationEnabled(SQLITE_ExistsToJoin)` at `select.c:7899`.
+        It rewrites the parse tree: `WHERE EXISTS (SELECT ... FROM s
+        WHERE s.x=t.a)` becomes a 2-table FROM `(t, s)` with
+        `s.fg.fromExists=1`, and the EXISTS expression collapses to
+        TK_INTEGER 1.  The 2-table FROM then drives the full planner
+        (`whereLoopAddAll` → `wherePathSolver` →
+        `constructAutomaticIndex`), which already exists in Pas at
+        `passqlite3codegen.pas:13733..13839`.
+
+        **Missing pieces to port** (estimated ~170–200 LOC, multiple
+        files, deferred as larger task):
+        1. `Parse.bHasExists` bit (sqliteInt.h:3902); set when an
+           EXISTS Expr node is created in expr.c.
+        2. `SQLITE_ExistsToJoin = 0x40000000` flag (sqliteInt.h:1932).
+        3. `renumberCursors` + `renumberCursorsCb` +
+           `srclistRenumberCursors` + `renumberCursorDoMapping`
+           (select.c:4019..4064, ~80 LOC).
+        4. `existsToJoin` (select.c:7317..7378, ~60 LOC).
+        5. Call site at `sqlite3Select` matching select.c:7899..7900.
+        6. `OP_IfEmpty` emission for fromExists tables in the
+           cursor-open loop at `passqlite3codegen.pas:13795..13820`,
+           mirroring where.c:7310..7316.
+
+        Pas-side surface already in place: `fromExists` flag is
+        `pSrc^.fg.fgBits3 bit 2` (codegen.pas:595), checked at
+        :10799, :11205, :11295, :11576; `sqlite3SrcListAppendList`
+        at :20058; `OP_IfEmpty` opcode at vdbe.pas:89/6843.
+        Companion `NOT_EXISTS` PASSes via plain-scan.
 
     **Open follow-on:** Re-enable productive tails in `sqlite3DeleteFrom`
     (`passqlite3codegen.pas:17269` — needs `sqlite3WhereBegin` body +
