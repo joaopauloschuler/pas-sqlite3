@@ -20398,7 +20398,9 @@ function sqlite3SrcListAppend(pParse: PParse; pList: PSrcList;
 var
   db: PTsqlite3;
   pItem: PSrcItem;
+  pDb: PToken;
 begin
+  pDb := pDatabase;
   db := pParse^.db;
   if pList = nil then begin
     { C: allocates just the header; Enlarge handles actual slot allocation }
@@ -20414,11 +20416,24 @@ begin
   { Enlarge already incremented nSrc; the new item is at index nSrc-1 }
   pItem := PSrcItem(PByte(SrcListItems(pList)) +
     (pList^.nSrc - 1) * SizeOf(TSrcItem));
-  if pTable <> nil then
-    pItem^.zName := sqlite3DbStrNDup(db, PChar(pTable^.z), pTable^.n);
-  if (pDatabase <> nil) and (pDatabase^.n > 0) then
+  { build.c:4908 — if pDatabase->z is NULL, ignore it (no-op token). }
+  if (pDb <> nil) and (pDb^.z = nil) then
+    pDb := nil;
+  { build.c:4913 — when both are present the args are SWAPPED on store:
+    zName := pDatabase, zDatabase := pTable.  The Lemon grammar passes
+    `nm DOT nm` as (db, table), so the arg labels here are misleading
+    in the C source; preserve the C semantics line-for-line. }
+  if pDb <> nil then begin
+    pItem^.zName := sqlite3DbStrNDup(db, PChar(pDb^.z), pDb^.n);
+    sqlite3Dequote(pItem^.zName);
     pItem^.u4.zDatabase :=
-      sqlite3DbStrNDup(db, PChar(pDatabase^.z), pDatabase^.n);
+      sqlite3DbStrNDup(db, PChar(pTable^.z), pTable^.n);
+    sqlite3Dequote(pItem^.u4.zDatabase);
+  end else if pTable <> nil then begin
+    pItem^.zName := sqlite3DbStrNDup(db, PChar(pTable^.z), pTable^.n);
+    sqlite3Dequote(pItem^.zName);
+    pItem^.u4.zDatabase := nil;
+  end;
   Result := pList;
 end;
 
@@ -20489,13 +20504,18 @@ procedure sqlite3SrcListIndexedBy(pParse: PParse; p: PSrcList;
 var
   pItem: PSrcItem;
 begin
+  Assert(pIndexedBy <> nil);
   if (p = nil) or (p^.nSrc = 0) then Exit;
+  if pIndexedBy^.n = 0 then Exit;
   pItem := PSrcItem(PByte(SrcListItems(p)) +
     (p^.nSrc - 1) * SizeOf(TSrcItem));
-  if pIndexedBy <> nil then begin
-    pItem^.fg.fgBits := pItem^.fg.fgBits or SRCITEM_FG_IS_INDEXED_BY;
+  if (pIndexedBy^.n = 1) and (pIndexedBy^.z = nil) then begin
+    { "NOT INDEXED" clause — see parse.y indexed_opt construct. }
+    pItem^.fg.fgBits := pItem^.fg.fgBits or SRCITEM_FG_NOT_INDEXED;
+  end else begin
     pItem^.u1.zIndexedBy :=
       sqlite3DbStrNDup(pParse^.db, PChar(pIndexedBy^.z), pIndexedBy^.n);
+    pItem^.fg.fgBits := pItem^.fg.fgBits or SRCITEM_FG_IS_INDEXED_BY;
   end;
 end;
 

@@ -190,6 +190,10 @@ Important: At the end of this document, please find:
     Current baseline (2026-04-27): **TestWhereCorpus 91 PASS / 1
     DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 2 PASS / 8
     DIVERGE / 0 ERROR (corpus = 10); TestWherePlanner 675/675.**
+    Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
+    `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
+    the system one (the latter's `sqlite3_initialize` can corrupt
+    shared globals and crash the Pas tokenizer at startup).
 
     **Open DIVERGE row:**
       * `EXISTS_SUB` (Pas=22, C=30): Pas emits a correct correlated
@@ -237,42 +241,37 @@ Important: At the end of this document, please find:
 
     **Open follow-on:** Re-enable productive tails:
       * `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
-        arm and where-loop / one-pass arm both productive (commits
-        `90cda3b`, sub-progress 49).  vtab `OP_VUpdate` arm still TODO
-        (out of current corpus).
+        arm and where-loop / one-pass arm both productive.  vtab
+        `OP_VUpdate` arm still TODO (out of current corpus).
       * `sqlite3Update` (`passqlite3codegen.pas:17835`): skeleton-only
         with snapshot/restore guard at 17890..17893 / 17965..17970;
         blocks NestedParse UPDATE of the placeholder sqlite_master row.
-      * DROP TABLE in TestExplainParity still returns nil Vdbe.  The
-        DELETE FROM sqlite_master path is now productive, so the bail
-        is upstream of that — investigate whether `sqlite3DropTable`'s
-        `sqlite3GetVdbe(pParse)` returns nil, the schema-cookie /
-        finishCoding short-circuits, or a NestedParse error trips the
-        prepare to rc=0 with pStmt=nil.
 
-    **CREATE TABLE / CREATE INDEX DIVERGE-op-count rows** in
-    TestExplainParity (Pas=21/19 vs C=32/37/41) are structural — extra
-    C-side auth + ParseSchema reparse + scope unwind that Pas elides; both
-    return rc=0 via `sqlite3_exec` and rows materialise in sqlite_master.
-    A 6.10-scoped follow-on.
+    **CREATE TABLE / CREATE INDEX / DROP TABLE DIVERGE-op-count rows**
+    in TestExplainParity (Pas=21/19/24 vs C=32/37/41/49) are structural
+    — extra C-side auth + ParseSchema reparse + scope unwind that Pas
+    elides; all return rc=0 via `sqlite3_exec` and rows materialise (or
+    are removed from) sqlite_master.  A 6.10-scoped follow-on.
 
-- [ ] **6.9-bis 11g.2.h** Standalone `DELETE FROM <tbl>` prepare returns
-    SQLITE_ERROR before parser rule 152 fires.  Repro: open `:memory:`,
-    issue `DELETE FROM t;` (table absent or present, no prior statements
-    in the same prepare).  `sqlite3_prepare_v2` returns rc=1 with
-    generic "SQL logic error" (no zErrMsg) and `sqlite3DeleteFrom` is
-    never reached.  The same SQL embedded in a multi-statement prepare
-    (`CREATE TABLE t(...); DELETE FROM t;`) parses successfully and
-    rule 152 fires.  Pre-existing — present at HEAD~2 and unchanged by
-    sub-progress 48 / 49.  Likely a parser-engine state issue
-    (sqlite3RunParser / sqlite3ParseObjectReset) specific to a fresh
-    sParse where the first reducible statement begins with TK_DELETE.
-    Blocks DROP TABLE in TestExplainParity: `sqlite3CodeDropTable`
-    issues `sqlite3NestedParse('DELETE FROM ...sqlite_master ...')`,
-    which calls `sqlite3RunParser` against the parent sParse with
-    PARSE_TAIL zeroed — effectively the same fresh-prepare scenario.
-    INSERT / SELECT / UPDATE in the same scenario all succeed; this
-    is specific to the DELETE first-token path.
+- [X] **6.9-bis 11g.2.h** Standalone `DELETE FROM <tbl>` prepare returned
+    SQLITE_ERROR.  Root cause was NOT a parser-engine state issue but
+    `sqlite3SrcListIndexedBy` (passqlite3codegen.pas:20493): it
+    unconditionally set `SRCITEM_FG_IS_INDEXED_BY` whenever
+    `pIndexedBy<>nil`, but rule 152 always passes a non-nil token (empty
+    when no `INDEXED BY` clause).  Fixed: early-out on `n=0`, route
+    NOT INDEXED (n=1, z=nil) to `SRCITEM_FG_NOT_INDEXED`, only set the
+    IS_INDEXED_BY bit + copy zIndexedBy when a real name is supplied —
+    mirroring build.c:5132.
+
+    Companion fix in `sqlite3SrcListAppend` (passqlite3codegen.pas:20396)
+    that unblocked DROP TABLE: (a) Lemon grammar `nm DOT nm` passes
+    (db, table) but C swaps args on store (build.c:4913); Pas was
+    storing them straight, so `sqlite_master.'main'` lookup formed.
+    (b) C uses `sqlite3NameFromToken` which dequotes; Pas called bare
+    `sqlite3DbStrNDup`, leaving `'main'` quoted.  Added the swap +
+    `sqlite3Dequote` calls + the `pDb^.z=nil` guard from build.c:4908.
+    DROP TABLE now produces a productive Vdbe (op-count diverge only,
+    classed as 6.10 follow-on alongside CREATE TABLE/INDEX).
 
 - [X] **6.9-bis 11g.2.g** TestWhereCorpus startup EAccessViolation —
     **Resolved.** The AV in `sqlite3StrDup`→`IndexByte` was downstream
