@@ -3365,17 +3365,6 @@ Important: At the end of this document, please find:
           TestLoadExt 20/20, TestAuthBuiltins 34/34, TestOpenClose
           17/17, TestInitCallback 29/29, TestBtreeCompat 337/337.
 
-      Sub-progress 29 (next) options: (i) port the `iif()` 3-arg
-      INLINEFUNC_iif inline expansion (mirrors INLINEFUNC_coalesce but
-      with implies-true / implies-false short-circuit branching);
-      (ii) the DUP_AND duplicate-predicate constant-folding hoist
-      (still pending — lives in `exprAnalyzeOrTerm` /
-      `whereCombineDisjuncts`); (iii) further single-table corpus
-      expansion (group #5) covering `unlikely()` /  `likely()`
-      no-op fast-path, `cast(... as ...)` codegen, `nullif()` /
-      `printf()` scalar functions, and `EXISTS`/`NOT EXISTS`
-      sub-selects.  Multi-table planner integration for LEFT_JOIN /
-      JOIN_WHERE remains gated on 11g.2.d.
 
     - [X] Sub-progress 29 — `iif()` INLINEFUNC_iif inline expansion
       (2026-04-27).  Port of `expr.c:exprCodeInlineFunction`'s
@@ -3419,14 +3408,6 @@ Important: At the end of this document, please find:
         * No regression: TestExprBasic 40/40, TestSelectBasic 49/49,
           TestParser 45/45, TestExplainParity 2/10 (diverges
           unchanged).
-
-      Sub-progress 30 (next) options: (i) the DUP_AND duplicate-
-      predicate constant-folding hoist; (ii) single-table corpus
-      expansion group #5 covering `unlikely()`/`likely()` no-op
-      fast-path, `cast(... as ...)` codegen, `nullif()`/`printf()`
-      scalars, and `EXISTS`/`NOT EXISTS` sub-selects; (iii) begin
-      TK_CASE codegen landing to unify the iif() and CASE-expression
-      paths in the Pascal port.
 
     - [X] Sub-progress 30 — `unlikely()`/`likely()` no-op fast-path
       + `nullif()` landing (2026-04-27).  Bundles three interrelated
