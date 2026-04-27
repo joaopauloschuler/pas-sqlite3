@@ -2444,6 +2444,148 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- whereSortingCost + whereLoopIsNoBetter (where.c:5527..5585, 5811..5820) ----- }
+
+procedure TestSortingCost;
+var
+  pWInfo:  PWhereInfo;
+  pSel:    PSelect;
+  pList:   PExprList;
+  cost:    i16;
+  nRow:    i16;
+  nCol:    i16;
+  expected: i16;
+begin
+  { Build a minimal stand-in TWhereInfo + TSelect + TExprList on the heap so
+    we can exercise the cost helper in isolation, without dragging in a full
+    Parse + db.  whereSortingCost only reads pWInfo^.pSelect^.pEList^.nExpr,
+    pWInfo^.wctrlFlags, and pWInfo^.iLimit. }
+  pWInfo := AllocMem(SizeOf(TWhereInfo));
+  pSel   := AllocMem(SizeOf(TSelect));
+  pList  := AllocMem(SizeOf(TExprList));
+  pWInfo^.pSelect := pSel;
+  pSel^.pEList    := pList;
+
+  { ---- WSC1: nSorted=0, no flags, nExpr=1, nRow=33 ----
+    nCol = LogEst((1+59)/30) = LogEst(2) = 10
+    rSortCost = nRow + nCol = 33 + 10 = 43
+    final = 43 + estLog(33) }
+  pList^.nExpr        := 1;
+  pWInfo^.wctrlFlags  := 0;
+  pWInfo^.iLimit      := 0;
+  nRow := 33;
+  nCol := i16(sqlite3LogEst(u64((1 + 59) div 30)));
+  expected := i16(nRow + nCol + estLog(nRow));
+  cost := whereSortingCost(pWInfo, nRow, 1, 0);
+  Check('WSC1 nSorted=0 baseline', cost = expected);
+  Check('WSC1 nCol = LogEst(2) = 10', nCol = 10);
+
+  { ---- WSC2: USE_LIMIT bumps cost by +10, caps nLocal at iLimit ----
+    iLimit = 20 (LogEst 13) caps nRow=50 → estLog(20) instead of estLog(50). }
+  pWInfo^.wctrlFlags := WHERE_USE_LIMIT;
+  pWInfo^.iLimit     := 20;
+  nRow := 50;
+  expected := i16(nRow + nCol + 10 + estLog(20));
+  cost := whereSortingCost(pWInfo, nRow, 1, 0);
+  Check('WSC2 LIMIT path +10 and caps nLocal at iLimit', cost = expected);
+
+  { ---- WSC3: USE_LIMIT + nSorted>0 adds another +6 partial-sort bonus,
+    and applies (Y/X) scaling: + LogEst((X-Y)*100/X) - 66.
+    nOrderBy=4, nSorted=2 → LogEst(2*100/4) = LogEst(50). }
+  pWInfo^.wctrlFlags := WHERE_USE_LIMIT;
+  pWInfo^.iLimit     := 20;
+  nRow := 50;
+  expected := i16(nRow + nCol
+                  + i16(sqlite3LogEst(u64((4 - 2) * 100 div 4))) - 66
+                  + 10 + 6
+                  + estLog(20));
+  cost := whereSortingCost(pWInfo, nRow, 4, 2);
+  Check('WSC3 LIMIT + partial-sort path', cost = expected);
+
+  { ---- WSC4: DISTINCT halves nLocal when >10 (subtracts LogEst(2)=10).
+    nRow=33 → nLocal=23 → estLog(23). ---- }
+  pWInfo^.wctrlFlags := WHERE_WANT_DISTINCT;
+  pWInfo^.iLimit     := 0;
+  nRow := 33;
+  expected := i16(nRow + nCol + estLog(i16(nRow - 10)));
+  cost := whereSortingCost(pWInfo, nRow, 1, 0);
+  Check('WSC4 DISTINCT halves nLocal', cost = expected);
+
+  { ---- WSC5: DISTINCT no-op when nRow <= 10 ---- }
+  pWInfo^.wctrlFlags := WHERE_WANT_DISTINCT;
+  nRow := 10;
+  expected := i16(nRow + nCol + estLog(nRow));
+  cost := whereSortingCost(pWInfo, nRow, 1, 0);
+  Check('WSC5 DISTINCT no-op when nRow<=10', cost = expected);
+
+  { ---- WSC6: nCol scales with output column count.  nExpr=121 →
+    (121+59)/30 = 6 → LogEst(6).  Verify nCol moves with nExpr. ---- }
+  pList^.nExpr := 121;
+  pWInfo^.wctrlFlags := 0;
+  nRow := 33;
+  nCol := i16(sqlite3LogEst(u64((121 + 59) div 30)));
+  expected := i16(nRow + nCol + estLog(nRow));
+  cost := whereSortingCost(pWInfo, nRow, 1, 0);
+  Check('WSC6 nCol scales with nExpr', cost = expected);
+  Check('WSC6 nCol > LogEst(2) for wider rows', nCol > 10);
+
+  FreeMem(pList);
+  FreeMem(pSel);
+  FreeMem(pWInfo);
+end;
+
+procedure TestLoopIsNoBetter;
+var
+  cand, base: TWhereLoop;
+  iCand, iBase: TIndex;
+  rc: i32;
+begin
+  FillChar(cand, SizeOf(cand), 0);
+  FillChar(base, SizeOf(base), 0);
+  FillChar(iCand, SizeOf(iCand), 0);
+  FillChar(iBase, SizeOf(iBase), 0);
+
+  { ---- WLNB1: candidate not WHERE_INDEXED → "no better" (return 1). ---- }
+  cand.wsFlags := WHERE_IPK;
+  base.wsFlags := WHERE_INDEXED;
+  base.u.btree.pIndex := @iBase;
+  iBase.szIdxRow := 100;
+  rc := whereLoopIsNoBetter(@cand, @base);
+  Check('WLNB1 non-indexed candidate → 1', rc = 1);
+
+  { ---- WLNB2: baseline not WHERE_INDEXED → "no better" (return 1). ---- }
+  cand.wsFlags := WHERE_INDEXED;
+  cand.u.btree.pIndex := @iCand;
+  iCand.szIdxRow := 50;
+  base.wsFlags := WHERE_IPK;
+  base.u.btree.pIndex := nil;
+  rc := whereLoopIsNoBetter(@cand, @base);
+  Check('WLNB2 non-indexed baseline → 1', rc = 1);
+
+  { ---- WLNB3: both indexed, candidate has smaller szIdxRow → 0
+    (pCandidate is strictly preferred). ---- }
+  cand.wsFlags := WHERE_INDEXED;
+  cand.u.btree.pIndex := @iCand;
+  iCand.szIdxRow := 50;
+  base.wsFlags := WHERE_INDEXED;
+  base.u.btree.pIndex := @iBase;
+  iBase.szIdxRow := 100;
+  rc := whereLoopIsNoBetter(@cand, @base);
+  Check('WLNB3 candidate smaller szIdxRow → 0', rc = 0);
+
+  { ---- WLNB4: equal szIdxRow → "no better" (return 1). ---- }
+  iCand.szIdxRow := 100;
+  iBase.szIdxRow := 100;
+  rc := whereLoopIsNoBetter(@cand, @base);
+  Check('WLNB4 equal szIdxRow → 1', rc = 1);
+
+  { ---- WLNB5: candidate larger szIdxRow → "no better" (return 1). ---- }
+  iCand.szIdxRow := 150;
+  iBase.szIdxRow := 100;
+  rc := whereLoopIsNoBetter(@cand, @base);
+  Check('WLNB5 candidate larger szIdxRow → 1', rc = 1);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -2474,6 +2616,8 @@ begin
   TestWhereLoopAddBtreeIndex;
   TestWhereLoopAddBtree;
   TestWhereLoopAddAllAndOr;
+  TestSortingCost;
+  TestLoopIsNoBetter;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

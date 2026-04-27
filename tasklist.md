@@ -389,6 +389,25 @@ Important: At the end of this document, please find:
       routes to AddOr but empty WC keeps single IPK loop), WLAA4
       (two-table CROSS → two IPK loops, double iPlanLimit bump),
       WLAO1 (JT_RIGHT short-circuits), WLAO2 (no WO_OR term → no-op).
+    - [X] wherePathSolver cost helpers — `whereSortingCost`
+      (where.c:5527..5585) and `whereLoopIsNoBetter` (where.c:5811..5820).
+      Pure cost arithmetic / index-row-width tie-breaker fed to the eventual
+      N-best path search.  whereSortingCost reproduces the textbook
+      `K * N * log(N) * (Y/X)` external-sort model with the +10/+6 LIMIT and
+      DISTINCT halving tuning constants verbatim from upstream; iLimit caps
+      the log(N) multiplier when WHERE_USE_LIMIT is set.  whereLoopIsNoBetter
+      compares two equal-rRun candidates by `u.btree.pIndex^.szIdxRow`,
+      returning 0 only when pCandidate's index has strictly smaller per-row
+      width and both loops are WHERE_INDEXED.  Land now so wherePathSolver
+      can wire them in without further sub-progress churn.  Gate:
+      `TestWherePlanner.pas` (244/244): WSC1 (nSorted=0 baseline,
+      nCol=LogEst(2)=10), WSC2 (USE_LIMIT path adds +10 and caps nLocal at
+      iLimit), WSC3 (USE_LIMIT + partial-sort adds +6 with full Y/X
+      scaling), WSC4 (DISTINCT halves nLocal when nRow>10), WSC5 (DISTINCT
+      no-op when nRow<=10), WSC6 (nCol scales with output column count
+      via nExpr), WLNB1..WLNB2 (non-indexed loops short-circuit to 1),
+      WLNB3 (smaller candidate szIdxRow → 0), WLNB4..WLNB5 (equal / larger
+      candidate → 1).
     - [X] `whereRangeScanEst` (where.c:2092..2254, no-STAT4 tail) —
       reduces `pLoop^.nOut` to account for the leftover range
       constraints on the leading (nEq+1)'th column of the index pLoop

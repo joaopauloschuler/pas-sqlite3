@@ -1812,6 +1812,18 @@ function  sqlite3ExprCoveredByIndex(pExpr: PExpr; iCur: i32;
 function  HasRowid(pTab: PTable2): Boolean; inline;
 function  IsView(pTab: PTable2): Boolean; inline;
 
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — wherePathSolver cost helpers
+  (where.c:5527..5585, 5811..5820).  Pure cost arithmetic, no codegen.
+    * whereSortingCost — LogEst external-sort cost for a candidate path,
+      scaled by partial-sort prefix Y/X, LIMIT, and DISTINCT.
+    * whereLoopIsNoBetter — tie-breaker comparator for two equal-cost
+      WhereLoops; returns 0 when pCandidate is a strictly better choice
+      (smaller index row size), 1 otherwise. }
+function  whereSortingCost(pWInfo: PWhereInfo; nRow: i16;
+                           nOrderBy: i32; nSorted: i32): i16;
+function  whereLoopIsNoBetter(pCandidate: PWhereLoop;
+                              pBaseline: PWhereLoop): i32;
+
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
 // ---------------------------------------------------------------------------
@@ -10105,6 +10117,93 @@ begin
 
   whereLoopClear(db, pNew);
   Result := rc;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.d sub-progress) — wherePathSolver cost helpers.
+
+  Faithful port of where.c:5527..5585 (whereSortingCost) and where.c:5811..5820
+  (whereLoopIsNoBetter).  Pure cost arithmetic / pointer-tag inspection — no
+  codegen, no side effects on the planner state.  Land now in advance of the
+  full wherePathSolver port so the N-best path search can wire them in
+  immediately when it lands.
+
+  whereSortingCost reproduces the textbook external-sort cost model the
+  C source uses:
+
+      cost = (K * N * log(N)) * (Y/X)
+
+  where K reflects per-row column width (-> nCol = sqlite3LogEst((nExpr+59)/30)),
+  Y/X is the unsorted-tail / total-ORDER-BY-terms ratio (so a partial sort gets
+  discounted), N is capped by the LIMIT when WHERE_USE_LIMIT is set, and the
+  result is bumped/discounted by tuning constants for LIMIT-driven sorts and
+  DISTINCT.  Final +estLog(N) absorbs the log(N) factor.
+
+  whereLoopIsNoBetter is the tie-breaker for equal-cost candidates: among two
+  WhereLoops with the same rRun, prefer the one whose chosen index has the
+  smaller per-row width (smaller szIdxRow → fewer bytes touched per row).
+  Both loops must be index-based; otherwise we cannot compare and return
+  "no better".  Returns 1 when we cannot tell or pBaseline is preferred,
+  0 only when pCandidate is strictly better.
+  =========================================================================== }
+
+function whereSortingCost(pWInfo: PWhereInfo; nRow: i16;
+                          nOrderBy: i32; nSorted: i32): i16;
+var
+  rSortCost: i16;
+  nCol:      i16;
+  nLocal:    i16;
+  pSel:      PSelect;
+  pEList:    PExprList;
+begin
+  { TUNING: sorting cost proportional to the number of output columns. }
+  pSel   := pWInfo^.pSelect;
+  Assert(pSel <> nil);
+  pEList := pSel^.pEList;
+  Assert(pEList <> nil);
+  nCol := i16(sqlite3LogEst(u64((pEList^.nExpr + 59) div 30)));
+  rSortCost := i16(nRow + nCol);
+  if nSorted > 0 then
+  begin
+    { Scale the result by (Y/X). }
+    rSortCost := i16(rSortCost
+                     + i16(sqlite3LogEst(u64((nOrderBy - nSorted) * 100
+                                             div nOrderBy)))
+                     - 66);
+  end;
+
+  nLocal := nRow;
+  { LIMIT path: extra 2.0x (and another 1.5x if also using a partial sort);
+    cap N at the LIMIT value when smaller. }
+  if (pWInfo^.wctrlFlags and WHERE_USE_LIMIT) <> 0 then
+  begin
+    rSortCost := i16(rSortCost + 10);   { TUNING: 2.0x for LIMIT }
+    if nSorted <> 0 then
+      rSortCost := i16(rSortCost + 6);  { TUNING: 1.5x for partial sort }
+    if pWInfo^.iLimit < nLocal then
+      nLocal := pWInfo^.iLimit;
+  end
+  else if (pWInfo^.wctrlFlags and WHERE_WANT_DISTINCT) <> 0 then
+  begin
+    { TUNING: DISTINCT halves the row count; LogEst(2) = 10. }
+    if nLocal > 10 then
+    begin
+      nLocal := i16(nLocal - 10);
+      Assert(10 = sqlite3LogEst(2));
+    end;
+  end;
+  rSortCost := i16(rSortCost + estLog(nLocal));
+  Result := rSortCost;
+end;
+
+function whereLoopIsNoBetter(pCandidate: PWhereLoop;
+                             pBaseline: PWhereLoop): i32;
+begin
+  if (pCandidate^.wsFlags and WHERE_INDEXED) = 0 then Exit(1);
+  if (pBaseline^.wsFlags  and WHERE_INDEXED) = 0 then Exit(1);
+  if pCandidate^.u.btree.pIndex^.szIdxRow
+     < pBaseline^.u.btree.pIndex^.szIdxRow then Exit(0);
+  Result := 1;
 end;
 
 { ---------------------------------------------------------------------------
