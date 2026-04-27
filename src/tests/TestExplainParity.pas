@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 17;
+  N_CORPUS = 25;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -103,6 +103,16 @@ begin
   Add(i, 'DELETE rowid EQ',             'DELETE FROM t WHERE rowid=5;');         Inc(i);
   Add(i, 'INSERT VALUES',               'INSERT INTO t VALUES (1,2,3);');        Inc(i);
   Add(i, 'COMMIT',                      'COMMIT;');                              Inc(i);
+
+  { Step 6 corpus expansion — additional shapes confirmed PASS. }
+  Add(i, 'SELECT multi-col scan',       'SELECT a, b FROM t;');                  Inc(i);
+  Add(i, 'SELECT col WHERE',            'SELECT a FROM t WHERE a=5;');           Inc(i);
+  Add(i, 'SELECT arith literal',        'SELECT 1+2;');                          Inc(i);
+  Add(i, 'SELECT string literal',       'SELECT ''hello'';');                    Inc(i);
+  Add(i, 'SELECT multi literal',        'SELECT 1, 2, 3;');                      Inc(i);
+  Add(i, 'BEGIN IMMEDIATE',             'BEGIN IMMEDIATE;');                     Inc(i);
+  Add(i, 'BEGIN EXCLUSIVE',             'BEGIN EXCLUSIVE;');                     Inc(i);
+  Add(i, 'ROLLBACK',                    'ROLLBACK;');                            Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

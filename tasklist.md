@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 16 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 17); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 24 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 25); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -186,27 +186,44 @@ Important: At the end of this document, please find:
     `sqlite3SrcListAppend` (db/table arg swap + dequote) to mirror
     build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
-  Scaffold landed; corpus expanded to 17 rows (DDL + a SELECT/DML probe).
-  Current Status (2026-04-27): **16 PASS / 1 DIVERGE / 0 ERROR**.
+  Scaffold landed; corpus expanded to 25 rows (DDL + SELECT/DML/txn).
+  Current Status (2026-04-27): **24 PASS / 1 DIVERGE / 0 ERROR**.
   Drive to all-PASS, then expand corpus further (pragma / trigger /
-  multi-table SELECT) and promote from report-only to hard gate.
+  multi-table SELECT / aggregates / joins) and promote from report-only
+  to hard gate.
 
   PASS rows: CREATE TABLE simple / typed / IF NOT EXISTS / composite PK
   / WITHOUT ROWID, CREATE INDEX, CREATE UNIQUE INDEX, DROP INDEX IF
-  EXISTS, BEGIN, COMMIT, INSERT VALUES, SELECT col scan,
-  SELECT rowid EQ, SELECT literal, SELECT * scan, DELETE rowid EQ.
+  EXISTS, BEGIN, BEGIN IMMEDIATE, BEGIN EXCLUSIVE, COMMIT, ROLLBACK,
+  INSERT VALUES, SELECT literal, SELECT col scan, SELECT multi-col
+  scan, SELECT col WHERE, SELECT rowid EQ, SELECT * scan, SELECT arith
+  / string / multi literal, DELETE rowid EQ.
 
   DIVERGE rows + delta = (C ops − Pas ops):
 
   - DROP TABLE — Δ=21 (step 4)
 
-  Root cause for DROP TABLE: Pas-side elides the C-side
-  pre-Destroy "scan sqlite_schema for trigger rows + reinsert" pass
-  (ops 1..21 in C: Null, OpenWrite, Rewind, per-row Column/Eq/Ne/Rowid/
-  Delete tail loop, OpenEphemeral, IfNot, OpenRead, Rewind, etc.) plus
-  the C-side `OP_DropTable` p4='t' op (35) and the trailing String8
-  P4='trigger' literals.  Driven by `sqlite3CodeDropTable` /
-  `destroyTable` arms.
+  Root cause for DROP TABLE Δ=21 (re-analysis 2026-04-27 from
+  bytecode dump):
+    (a) Pas opens cursor 0 with `OP_OpenRead` and emits a 2-pass
+        RowSet delete loop for the sqlite_schema scrub
+        (`RowSetAdd` during scan, then `OpenWrite` + `RowSetRead` /
+        `NotExists` / `Delete` / `Goto` cleanup), where C uses a
+        single `OP_OpenWrite` and inline `Delete` during the scan
+        (~+5 Pas ops vs C).  Tracked under 11g.2.f open follow-on:
+        `sqlite3DeleteFrom` ONEPASS_MULTI promotion for non-rowid-EQ
+        scans.
+    (b) Pas elides the destroyRootPage autovacuum follow-on
+        (`Null` / `OpenEphemeral` / `IfNot` / `OpenRead` / `Explain`
+        / `Rewind` / `Column` / `ReleaseReg` / `Ne` / `ReleaseReg` /
+        `Rowid` / `Insert` / `Next` / `OpenWrite` / `Rewind` /
+        `Rowid` / `NotExists` / `Column`×3 / `Integer` / `Column` /
+        `MakeRecord` / `Insert` / `Next` / `ReleaseReg` — ~26 ops)
+        because `destroyRootPage` calls `sqlite3NestedParse(... UPDATE
+        sqlite_schema SET rootpage=... WHERE ... AND rootpage=...)`
+        and productive `sqlite3Update` is still skeleton-only
+        (11g.2.f open follow-on).
+  Net delta: −26 + 5 = −21 ✓.
 
   Decomposition (next-agent picklist — each is committable in
   isolation and shrinks Δ by a known amount):
@@ -253,9 +270,40 @@ Important: At the end of this document, please find:
       collapse, UNIQUE-index rewrite to include PK key cols) is
       still deferred but not on any current corpus row.
 
-    - [ ] **6.10 step 6** Once DROP TABLE flips to PASS, expand corpus
-      further (pragma / trigger / multi-table SELECT / UPDATE) and
-      promote from report-only to hard gate.
+    - [ ] **6.10 step 6** Expand corpus further and drive remaining
+      DIVERGEs to PASS, then promote from report-only to hard gate.
+
+      Sub-progress (2026-04-27): probe sweep added 8 PASS rows
+      (multi-col / col-WHERE scans, arith / string / multi literals,
+      BEGIN IMMEDIATE / EXCLUSIVE, ROLLBACK).  Bringing corpus to
+      24 PASS / 1 DIVERGE / 25 total.
+
+      DIVERGE shapes discovered in the probe sweep (kept out of
+      corpus until they flip — each is a committable next-agent
+      ticket):
+        * `SELECT a FROM t LIMIT 3` — Δ=9 (Pas elides LIMIT
+          codegen path; needs `computeLimitRegisters` + IfPos /
+          DecrJumpZero emission in `sqlite3Select`).
+        * `INSERT INTO t(a) VALUES(1)` — Δ=7 (named-column INSERT
+          path differs from positional; likely missing column-list
+          permutation in `sqlite3Insert`).
+        * `INSERT INTO t DEFAULT VALUES` — **CRASH**
+          (EAccessViolation on Pas-side prepare).  See bug 6.10b.
+        * `SELECT a FROM t WHERE rowid=1 OR rowid=2` — Δ=5 (rowid
+          OR-decomposed path; planner reaches multi-loop branch but
+          counters disagree).
+        * `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
+          ONEPASS_MULTI gap as DROP TABLE arm (a)).
+        * `PRAGMA user_version` — Δ=4 (read-pragma codegen elides
+          ReadCookie / ResultRow tail).
+        * `SAVEPOINT s1` — Δ=1 (single op gap; likely Transaction
+          p1 wiring).
+
+- [ ] **6.10b** Bug — `INSERT INTO <tbl> DEFAULT VALUES` raises
+  EAccessViolation during Pascal `sqlite3_prepare_v2` (caught by
+  TestExplainParity probe sweep on 2026-04-27).  Reproduce with
+  `INSERT INTO t DEFAULT VALUES` against the standard
+  t(a,b,c) fixture.
 
     - [X] **6.10 step 7** SELECT/DML divergences exposed by the
       expanded corpus all closed:
