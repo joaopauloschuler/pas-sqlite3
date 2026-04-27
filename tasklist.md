@@ -93,15 +93,6 @@ Important: At the end of this document, please find:
     pass that Pas elides; rows still materialise correctly).  Tracked
     under 6.10 step 4.
 
-- [X] **6.9-bis 11g.2.g** TestWhereCorpus startup EAccessViolation —
-    fixed by porting `exprSelectUsage` (whereexpr.c:998..1024) so
-    `prereqRight` masks no longer drive inner-subselect codegen into
-    mis-keyed cursor probes (commit `b94ddc1`).
-
-- [X] **6.9-bis 11g.2.h** Standalone `DELETE FROM <tbl>` prepare —
-    fixed `sqlite3SrcListIndexedBy` (always-set IS_INDEXED_BY flag) and
-    `sqlite3SrcListAppend` (db/table arg swap + dequote) to mirror
-    build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold landed; corpus expanded to 126 rows (DDL + SELECT/DML/txn +
   SAVEPOINT/RELEASE + INSERT DEFAULT VALUES + multi-AND + multi-col
@@ -139,50 +130,13 @@ Important: At the end of this document, please find:
         (11g.2.f open follow-on).
   Net delta: −26 + 5 = −21 ✓.
 
-  Decomposition (next-agent picklist — each is committable in
-  isolation and shrinks Δ by a known amount):
-
-    - [X] **6.10 step 2** 2-phase schema-write of `sqlite3EndTable`
-      ported.  `sqlite3StartTable` now emits the placeholder
-      `OpenSchemaTable` + `NewRowid` + `Blob` (6-byte nullRow) +
-      `Insert(APPEND)` + `Close` (build.c:1378..1385); `sqlite3EndTable`
-      emits `OP_Close 0` (build.c:2806) followed by
-      `emitSchemaRowUpdate` — `Null/Noop/OpenWrite/SeekRowid/Rowid/
-      IsNull/String8 ×3/Copy/String8/MakeRecord BBBDB/Delete (p2=
-      OPFLAG_ISUPDATE|OPFLAG_ISNOOP)/Insert`.  CREATE INDEX path
-      retains the old `emitSchemaRowInsert` direct-emit (still PASSes).
-      Closed Δ=11 on three simple-CREATE rows and Δ=11 on composite-PK
-      / WITHOUT-ROWID rows.  Touch points: `passqlite3codegen.pas`
-      `sqlite3StartTable` (~19510), `emitSchemaRowUpdate` (~19790),
-      `sqlite3EndTable` schema-row block (~19990).
-
-    - [X] **6.10 step 3** Add `OP_Explain` + `OP_ReleaseReg` emission
-      and drop the spurious `OPFLAG_ISNOOP` `OP_Delete` from
-      `emitSchemaRowUpdate`.  The C oracle build (no
-      `SQLITE_ENABLE_PREUPDATE_HOOK`) does not emit the pre-Insert
-      Delete; it does emit the explain-comment scan op (under
-      `SQLITE_ENABLE_EXPLAIN_COMMENTS`) and the `OP_ReleaseReg` debug
-      op (under `SQLITE_DEBUG`) for the WHERE rowid=#N temp reg.  Net
-      effect: `(+Explain +ReleaseReg −Delete) = +1`, closing Δ=1.
-      Three simple-CREATE rows flip to PASS.
-
+  Decomposition:
     - [ ] **6.10 step 4** Port `sqlite3CodeDropTable` pre-Destroy
       schema scan (build.c:3315..3445): the loop that walks
       sqlite_schema, deletes rows whose `tbl_name = 'X'`, and
       reinserts the surviving trigger rows.  Plus the trailing
       `OP_DropTable` p4=table-name + `String8` literal emissions.
       Closes Δ=22 on the DROP TABLE row.
-
-    - [X] **6.10 step 5** Composite-PK / WITHOUT-ROWID auto-index
-      bytecode pass — `convertToWithoutRowidTable` minimal viable
-      (build.c:2376..2446) landed: BTREE_INTKEY→BTREE_BLOBKEY p3
-      patch, OP_Noop→OP_Goto patch on the auto-index PK skip via
-      sqlite3PrimaryKeyIndex(pTab) lookup, and contextual
-      `OP_Noop p1=cur+1 p3=regNewRec` placeholder marker in
-      `emitSchemaRowUpdate`.  Composite-PK and WITHOUT-ROWID rows
-      flip to PASS.  Full helper (column reorder, repeated-PK-col
-      collapse, UNIQUE-index rewrite to include PK key cols) is
-      still deferred but not on any current corpus row.
 
     - [ ] **6.10 step 6** Make these to work (port code when required):
         [ ] `CREATE INDEX i ON t(a) WHERE a>0` — Δ=4 (partial-index

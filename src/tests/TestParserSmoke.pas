@@ -51,6 +51,7 @@ begin
   db^.aLimit[SQLITE_LIMIT_SQL_LENGTH] := 1000000000;
   db^.aLimit[SQLITE_LIMIT_EXPR_DEPTH] := 1000;
   db^.aLimit[SQLITE_LIMIT_COLUMN]     := 2000;
+  db^.aLimit[SQLITE_LIMIT_VDBE_OP]    := 250000000;
   db^.lookaside.bDisable := 1;
   { Enable SQL comment recognition so '-- ...' is silently consumed. }
   db^.flags := db^.flags or (u64($00040) shl 32);  { SQLITE_Comments }

@@ -2246,14 +2246,44 @@ begin
   if Result = nil then sqlite3_free(p);
 end;
 
+{ sqlite3OomFault — port of malloc.c:827.
+  Set the OOM flag, interrupt running VDBEs, and disable lookaside. }
 procedure sqlite3OomFault(db: Psqlite3db);
+var
+  p: PTsqlite3;
 begin
-  { Phase 6: set db->mallocFailed flag. Stub for now. }
+  if db = nil then Exit;
+  p := PTsqlite3(db);
+  if (p^.mallocFailed = 0) and (p^.bBenignMalloc = 0) then begin
+    p^.mallocFailed := 1;
+    if p^.nVdbeExec > 0 then
+      p^.u1.isInterrupted := 1;
+    { DisableLookaside: bump bDisable and clear sz }
+    Inc(p^.lookaside.bDisable);
+    p^.lookaside.sz := 0;
+    { Note: the C version also calls sqlite3ErrorMsg(db->pParse, ...) and
+      walks pOuterParse to bump nErr/rc.  That requires codegen and is
+      handled by callers via the per-API mallocFailed checks. }
+  end;
 end;
 
+{ sqlite3OomClear — port of malloc.c:854.
+  Clear the OOM flag once VDBE execution has settled and re-enable lookaside. }
 procedure sqlite3OomClear(db: Psqlite3db);
+var
+  p: PTsqlite3;
 begin
-  { Phase 6: clear db->mallocFailed flag. Stub for now. }
+  if db = nil then Exit;
+  p := PTsqlite3(db);
+  if (p^.mallocFailed <> 0) and (p^.nVdbeExec = 0) then begin
+    p^.mallocFailed := 0;
+    p^.u1.isInterrupted := 0;
+    { EnableLookaside: drop bDisable and restore sz from szTrue }
+    if p^.lookaside.bDisable > 0 then
+      Dec(p^.lookaside.bDisable);
+    if p^.lookaside.bDisable = 0 then
+      p^.lookaside.sz := p^.lookaside.szTrue;
+  end;
 end;
 
 function sqlite3ApiExit(db: Psqlite3db; rc: i32): i32;
