@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 97 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 98); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 125 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 126); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -186,11 +186,12 @@ Important: At the end of this document, please find:
     `sqlite3SrcListAppend` (db/table arg swap + dequote) to mirror
     build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
-  Scaffold landed; corpus expanded to 98 rows (DDL + SELECT/DML/txn +
+  Scaffold landed; corpus expanded to 126 rows (DDL + SELECT/DML/txn +
   SAVEPOINT/RELEASE + INSERT DEFAULT VALUES + multi-AND + multi-col
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
-  comparison ops + literal-arith + col aliases + 3-col index).
-  Current Status (2026-04-27): **97 PASS / 1 DIVERGE / 0 ERROR**.
+  comparison ops + literal-arith + col aliases + multi-col index +
+  multi-arith chains + NULL mixing + alt-table DML).
+  Current Status (2026-04-27): **125 PASS / 1 DIVERGE / 0 ERROR**.
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -268,46 +269,11 @@ Important: At the end of this document, please find:
 
     - [ ] **6.10 step 6** Expand corpus further and drive remaining
       DIVERGEs to PASS, then promote from report-only to hard gate.
-
-      Sub-progress (2026-04-27): probe sweep #2 added 8 more PASS rows
-      (CREATE INDEX 2col, RELEASE, multi-col rowid EQ, * rowid EQ,
-      multi-AND col WHERE, SELECT NULL, DELETE rowid EQ AND col,
-      SAVEPOINT 2).  Then per-row arith over column scan (`SELECT a+b
-      FROM t`, `SELECT a*2 FROM t`) closed by lifting the
-      TK_COLUMN/TK_AGG_COLUMN-only bailout in `sqlite3Select`'s result
-      column gate and routing non-column EList exprs through
-      `sqlite3ExprCode` (passqlite3codegen.pas:17307).  Probe sweep #3
-      added 19 more PASS rows (3-col scan, alternate-table scan,
-      transaction-keyword synonyms BEGIN DEFERRED / BEGIN TRANSACTION /
-      COMMIT TRANSACTION / END / END TRANSACTION / ROLLBACK
-      TRANSACTION / ROLLBACK TO / ROLLBACK TO SAVEPOINT / RELEASE
-      SAVEPOINT, 3-AND WHERE, rowid scan / WHERE, arith literal
-      precedence `1+2*3`, unary `-a`, concat `a||b`, INSERT VALUES on
-      alt table, INSERT DEFAULT VALUES on alt table).  Corpus now
-      55 PASS / 1 DIVERGE / 56 total.
-
-      Sub-progress (2026-04-27): constant-integer LIMIT path landed in
-      `sqlite3Select` — `computeLimitRegisters` arm for
-      `sqlite3ExprIsInteger` constants emits `OP_Integer N, iLimit`
-      before `sqlite3WhereBegin`, and the SRT_Output inner loop emits
-      `OP_DecrJumpZero p^.iLimit, pWInfo^.iBreak` after `OP_ResultRow`
-      (mirrors select.c:2520..2530 + select.c:1522..1525).  OFFSET and
-      non-constant LIMIT still bail to the stub.
-
-      Sub-progress (2026-04-27): probe sweep #4 added 11 more PASS rows
-      (5 comparison ops `<`/`<>`/`<=`/`>=`/`>` against col=lit, multi-
-      arith literal `1+2-3`, unary literal `-1`, string concat literal
-      `'abc'||'def'`, col `a-b` / `a/2`, and full-table `DELETE FROM t`
-      truncate arm).  Corpus now 68 PASS / 1 DIVERGE / 69 total.
-
-      Sub-progress (2026-04-27): probe sweep #5 added 29 more PASS rows
-      (literal arith `2*3`/`6/2`/`7-3`/`5%2`/`2*3+4`, col arith `a+1`/
-      `a*b`/`a+b+c`/`a%2`, INSERT NULL/mixed-types/negative literal,
-      INSERT alt-table, 3-col rowid EQ, alt-table WHERE, col WHERE col,
-      col WHERE neg/str literal, col alias, SELECT alias, SELECT * alt,
-      DELETE rowid neg, CREATE INDEX 3col, CREATE UNIQUE INDEX 2,
-      additional SAVEPOINT/RELEASE/COMMIT shapes).  Corpus now
-      97 PASS / 1 DIVERGE / 98 total.
+      Corpus now 125 PASS / 1 DIVERGE / 126 total (probe sweep #6
+      added 28 PASS rows — multi-arith chains `1*2*3`/`1+2+3+4`/
+      `a+1+b`/`a*b+c`/`a-b-c`, NULL mixing, larger int literals,
+      empty string, alt-table DML/DELETE, 4-col CREATE TABLE, alt-
+      table CREATE INDEX 1col / 2col, additional SAVEPOINT shapes).
 
       DIVERGE shapes discovered in probe sweeps (kept out of corpus
       until they flip — each is a committable next-agent ticket):
@@ -325,6 +291,10 @@ Important: At the end of this document, please find:
         * `PRAGMA user_version` — Δ=4 (read-pragma codegen is a stub:
           `sqlite3Pragma` in passqlite3codegen.pas:22374 returns
           immediately; needs ReadCookie / ResultRow tail at minimum).
+        * `SELECT a FROM t WHERE rowid<5` (and `>`, `<=`, `>=`) —
+          per-op divergence at op[2] (rowid range scan path: planner
+          picks WHERE_IPK range but inner-loop opcode emission differs
+          from C).  `<>` shape PASSes; only ordered comparisons fail.
 
 - [X] **6.10b** Bug — `INSERT INTO <tbl> DEFAULT VALUES` raised
   EAccessViolation in `sqlite3Insert` (passqlite3codegen.pas:18974)

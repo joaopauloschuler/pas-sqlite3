@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 98;
+  N_CORPUS = 126;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -200,6 +200,36 @@ begin
   Add(i, 'CREATE UNIQUE INDEX 2',       'CREATE UNIQUE INDEX i5 ON s(x);');      Inc(i);
   Add(i, 'SAVEPOINT sxy',               'SAVEPOINT sxy;');                       Inc(i);
   Add(i, 'COMMIT vs END',               'COMMIT;');                              Inc(i);
+
+  { Probe sweep #6 — candidate rows. }
+  Add(i, 'SELECT 1*2*3',                'SELECT 1*2*3;');                        Inc(i);
+  Add(i, 'SELECT 10+20',                'SELECT 10+20;');                        Inc(i);
+  Add(i, 'SELECT a+1+b',                'SELECT a+1+b FROM t;');                 Inc(i);
+  Add(i, 'SELECT a+b+1',                'SELECT a+b+1 FROM t;');                 Inc(i);
+  Add(i, 'SELECT a*b+c',                'SELECT a*b+c FROM t;');                 Inc(i);
+  Add(i, 'SELECT a-b-c',                'SELECT a-b-c FROM t;');                 Inc(i);
+  Add(i, 'SELECT NULL,NULL',            'SELECT NULL, NULL;');                   Inc(i);
+  Add(i, 'SELECT 1,NULL',               'SELECT 1, NULL;');                      Inc(i);
+  Add(i, 'SELECT 1+NULL',               'SELECT 1+NULL;');                       Inc(i);
+  Add(i, 'SELECT a,b,c',                'SELECT a,b,c FROM t;');                 Inc(i);
+  Add(i, 'SELECT a,a',                  'SELECT a, a FROM t;');                  Inc(i);
+  Add(i, 'SELECT col+col rowid EQ',     'SELECT a+b FROM t WHERE rowid=1;');     Inc(i);
+  Add(i, 'SELECT col-1',                'SELECT a-1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT col*0',                'SELECT a*0 FROM t;');                   Inc(i);
+  Add(i, 'SELECT col WHERE rowid<>5',   'SELECT a FROM t WHERE rowid<>5;');      Inc(i);
+  Add(i, 'INSERT alt VALUES neg',       'INSERT INTO s VALUES(-1,-2,-3);');      Inc(i);
+  Add(i, 'INSERT alt VALUES str',       'INSERT INTO s VALUES(''a'',''b'',''c'');'); Inc(i);
+  Add(i, 'DELETE alt all',              'DELETE FROM s;');                       Inc(i);
+  Add(i, 'DELETE alt rowid EQ',         'DELETE FROM s WHERE rowid=1;');         Inc(i);
+  Add(i, 'SELECT 1+2+3+4',              'SELECT 1+2+3+4;');                      Inc(i);
+  Add(i, 'SELECT 100',                  'SELECT 100;');                          Inc(i);
+  Add(i, 'SELECT -100',                 'SELECT -100;');                         Inc(i);
+  Add(i, 'SELECT empty str',            'SELECT '''';');                         Inc(i);
+  Add(i, 'SAVEPOINT s7',                'SAVEPOINT s7;');                        Inc(i);
+  Add(i, 'RELEASE s7',                  'RELEASE s7;');                          Inc(i);
+  Add(i, 'CREATE TABLE 4col',           'CREATE TABLE z9(a,b,c,d);');            Inc(i);
+  Add(i, 'CREATE INDEX alt',            'CREATE INDEX i6 ON s(y);');             Inc(i);
+  Add(i, 'CREATE INDEX alt 2col',       'CREATE INDEX i7 ON s(y,z);');           Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
