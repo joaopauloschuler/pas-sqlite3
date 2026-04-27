@@ -10,6 +10,8 @@ REMEMBER: You are porting code. DO NOT RANDOMLY ADD TESTS unless you are looking
 
 DO NOT default to the same work pattern as recent commits without questioning whether actually move the project forward.
 
+BEFORE TRYING TO FIX A BUG, LOOK AT THE ORIGINAL C IMPLEMENTATION!!!
+
 Goal: **behavioural and on-disk parity with the C reference.** The Pascal build
 must (a) produce byte-identical `.db` files for the same SQL input, (b) return
 identical query results, and (c) emit the same VDBE bytecode for the same SQL.
@@ -24,23 +26,22 @@ Important: At the end of this document, please find:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-- [ ] **6.9-bis 11g.2.b** Vertical slice — minimal-viable
-    `sqlite3WhereBegin` / `sqlite3WhereEnd` for the single-table,
+- [ ] **6.9-bis 11g.2.b** Port `sqlite3WhereBegin` / `sqlite3WhereEnd` for the single-table,
     single-rowid-EQ-predicate case.  Bookkeeping primitives, prologue,
     cleanup contract, and several leaf helpers (codeCompare cluster,
     sqlite3ExprCanBeNull, sqlite3ExprCodeTemp + 6 unary arms,
     TK_COLLATE/TK_SPAN/TK_UPLUS arms, whereShortCut, allowedOp +
     operatorMask + exprMightBeIndexed + minimal-viable exprAnalyze)
-    are already landed.
+    are already ported.
     - [ ] Re-enable productive tails — 
-      - [ ] code `sqlite3Update`
-      - [ ] code `sqlite3DeleteFrom` vtab `OP_VUpdate`.  
-      - [ ] code `sqlite3GenerateRowDelete`,
-      - [ ] code `sqlite3GenerateConstraintChecks`
-      - [ ] code `sqlite3CompleteInsertion`
+      - [ ] port `sqlite3Update`
+      - [ ] port `sqlite3DeleteFrom` vtab `OP_VUpdate`.  
+      - [ ] port `sqlite3GenerateRowDelete`,
+      - [ ] port `sqlite3GenerateConstraintChecks`
+      - [ ] port `sqlite3CompleteInsertion`
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.    
-    - [ ] Code `TestWhereCorpus.pas`
+    - [ ] Port `TestWhereCorpus.pas`
         Verify byte-identical bytecode emission against C via
         TestExplainParity expansion.  
         Re-enable any disabled assertion /
@@ -50,11 +51,11 @@ Important: At the end of this document, please find:
         `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
         the system one.
 
-    - [ ] Re-enable productive tails:
-      - [ ] Re-enable `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
+    - [ ] port or re-enable productive tails:
+      - [ ] Port `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
         arm and where-loop / one-pass arm both productive.  vtab
         `OP_VUpdate` arm still TODO (out of current corpus).
-      - [ ] Re-enable `sqlite3Update` (`passqlite3codegen.pas:17835`): skeleton-only
+      - [ ] Port `sqlite3Update` (`passqlite3codegen.pas:17835`): skeleton-only
         with snapshot/restore guard at 17890..17893 / 17965..17970;
         blocks NestedParse UPDATE of the placeholder sqlite_master row.
 
@@ -89,7 +90,7 @@ Important: At the end of this document, please find:
           silently.  Plain `WHERE a=10 OR a=20` and `WHERE rowid=1`
           are correct.  Repro driver: `src/tests/ReproOrRowid.pas`.
 
-          Two layered bugs (diagnosed 2026-04-27):
+          Two layered bugs:
 
           (1) **Hoist-gate exclusion.**  `InRhsHoistCandidate` at
               `passqlite3codegen.pas:13846` skips IN-RHS lists with
@@ -133,7 +134,6 @@ Important: At the end of this document, please find:
               bytecode; nothing in the test suite executes an IN
               query end-to-end.
 
-          Recommended decomposition:
             [ ] **6.10 step 6.IPK-IN.a** Apply the hoist-gate fix
                 from (1).  Necessary but not sufficient — still
                 crashes on ≥3-entry execution until (2) lands.
