@@ -492,6 +492,32 @@ Important: At the end of this document, please find:
     `codeCursorHint`.  Replaces the inlined NotExists emission from
     11g.2.b with full index-key construction, range-scan setup,
     virtual-table xFilter glue, and per-row body dispatch.
+    - [X] Leaf helpers — `disableTerm` (wherecode.c:419..444),
+      `codeApplyAffinity` (wherecode.c:457..482),
+      `whereLikeOptimizationStringFixup` (wherecode.c:1015..1030),
+      `adjustOrderByCol` (wherecode.c:525..541).  Pure leaf helpers,
+      no recursion, no planner dependency.  disableTerm walks up the
+      WhereTerm parent chain marking each TERM_CODED (TERM_LIKECOND
+      after the first iteration on TERM_LIKE parents) so the per-loop
+      body codegen does not re-emit predicates the chosen index
+      already enforces; stops on TERM_CODED, outer-join + lacking
+      EP_OuterON, or unmet prereqs (notReady & prereqAll).
+      codeApplyAffinity emits OP_Affinity over a register run after
+      trimming AFF_BLOB / AFF_NONE prefix and suffix from zAff.
+      whereLikeOptimizationStringFixup patches the most-recent
+      OP_String8 with iLikeRepCntr>>1 in p3 and iLikeRepCntr&1 in p5
+      so the LIKE prefix bound shares the loop's run counter.
+      adjustOrderByCol rewrites pOrderBy^.a[].u.x.iOrderByCol after
+      a result-set rearrangement.  Gate: `TestWherePlanner.pas`
+      (305/305): DT1..DT6b (disableTerm — standalone, already-coded,
+      child + parent walk, TERM_LIKE → TERM_LIKECOND on iter 2,
+      notReady gate, outer-join + EP_OuterON gate),
+      CAA2..CAA5 (codeApplyAffinity — all-blob no-emit, single char,
+      prefix trim, suffix trim), WLOSF1..WLOSF3
+      (whereLikeOptimizationStringFixup — TERM_LIKEOPT gate, p3/p5
+      patching across two iLikeRepCntr values), AOBC1..AOBC3
+      (adjustOrderByCol — nil short-circuit, t=0 skip, t=k → j+1
+      rewrite, orphan → 0).
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix

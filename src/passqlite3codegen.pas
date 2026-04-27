@@ -1870,6 +1870,24 @@ function  wherePathMatchSubqueryOB(pWInfo: PWhereInfo; pLoop: PWhereLoop;
 function  computeMxChoice(pWInfo: PWhereInfo): i32;
 function  wherePathSolver(pWInfo: PWhereInfo; nRowEst: i16): i32;
 
+{ Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers.
+  disableTerm (wherecode.c:419..444) walks up the parent chain marking
+  WhereTerm nodes TERM_CODED so the per-loop body codegen does not re-emit
+  predicates already served by the index lookup; child terms with TERM_LIKE
+  get TERM_LIKECOND on the second iteration so the LIKE residual stays
+  enforced after the prefix range narrows the search.  codeApplyAffinity
+  (wherecode.c:457..482) emits OP_Affinity over a register run, trimming
+  AFF_BLOB / AFF_NONE prefix and suffix.  whereLikeOptimizationStringFixup
+  (wherecode.c:1015..1030) patches the most-recent OP_String8 emitted for a
+  LIKE-prefix bound to share the loop's iLikeRepCntr.  adjustOrderByCol
+  (wherecode.c:525..541) rewrites pOrderBy^.a[].u.x.iOrderByCol after a
+  result-set rearrangement.  Pure leaf helpers — no planning, no recursion. }
+procedure disableTerm(pLevel: PWhereLevel; pTerm: PWhereTerm);
+procedure codeApplyAffinity(pParse: PParse; base: i32; n: i32; zAff: PAnsiChar);
+procedure whereLikeOptimizationStringFixup(v: PVdbe; pLevel: PWhereLevel;
+  pTerm: PWhereTerm);
+procedure adjustOrderByCol(pOrderBy: PExprList; pEList: PExprList);
+
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
 // ---------------------------------------------------------------------------
@@ -11064,6 +11082,135 @@ begin
 
   sqlite3DbFree(pPrs^.db, pSpace);
   Result := SQLITE_OK;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers.
+
+  disableTerm walks up the parent chain of a WHERE term tagging each as
+  TERM_CODED, so the per-loop body codegen does not re-emit predicates that
+  the chosen index already enforces.  The walk stops at three conditions:
+    1. the term is already TERM_CODED;
+    2. the loop is the inner side of an outer join AND the term does NOT
+       carry EP_OuterON (so it must remain enforced for the null-row);
+    3. the term still has unresolved prereqs (notReady & prereqAll <> 0).
+  TERM_LIKE children of an OR-decomposed parent (nLoop > 0) get
+  TERM_LIKECOND instead of TERM_CODED so the LIKE residual stays enforced
+  after the prefix range narrows the search.  Reference: wherecode.c:419..444.
+
+  codeApplyAffinity emits OP_Affinity over the n registers starting at base,
+  trimming any AFF_BLOB / AFF_NONE prefix and suffix from zAff so the opcode
+  only covers registers whose affinity actually needs adjusting.  Returns
+  silently when zAff is nil (mallocFailed) or when every entry trims away.
+  Reference: wherecode.c:457..482.
+
+  whereLikeOptimizationStringFixup patches the most-recent OP_String8
+  opcode emitted for a LIKE-prefix bound: stores iLikeRepCntr>>1 in p3
+  (the register holding the run counter) and iLikeRepCntr&1 in p5 (ASC/
+  DESC bit).  Only fires when pTerm carries TERM_LIKEOPT.  Reference:
+  wherecode.c:1015..1030.
+
+  adjustOrderByCol rewrites pOrderBy^.a[].u.x.iOrderByCol values: each
+  ORDER BY column whose old result-set position is t gets its iOrderByCol
+  rewritten to (j+1) where pEList^.a[j].u.x.iOrderByCol = t; orphans
+  collapse to 0.  Reference: wherecode.c:525..541.
+  =========================================================================== }
+
+procedure disableTerm(pLevel: PWhereLevel; pTerm: PWhereTerm);
+var
+  nLoop: i32;
+begin
+  nLoop := 0;
+  Assert(pTerm <> nil);
+  while ((pTerm^.wtFlags and TERM_CODED) = 0)
+    and ((pLevel^.iLeftJoin = 0)
+         or ExprHasProperty(pTerm^.pExpr, EP_OuterON))
+    and ((pLevel^.notReady and pTerm^.prereqAll) = 0)
+  do
+  begin
+    if (nLoop <> 0) and ((pTerm^.wtFlags and TERM_LIKE) <> 0) then
+      pTerm^.wtFlags := pTerm^.wtFlags or TERM_LIKECOND
+    else
+      pTerm^.wtFlags := pTerm^.wtFlags or TERM_CODED;
+    if pTerm^.iParent < 0 then Break;
+    pTerm := @pTerm^.pWC^.a[pTerm^.iParent];
+    Assert(pTerm <> nil);
+    Dec(pTerm^.nChild);
+    if pTerm^.nChild <> 0 then Break;
+    Inc(nLoop);
+  end;
+end;
+
+procedure codeApplyAffinity(pParse: PParse; base: i32; n: i32; zAff: PAnsiChar);
+var
+  v: PVdbe;
+begin
+  v := pParse^.pVdbe;
+  if zAff = nil then
+  begin
+    Assert(pParse^.db^.mallocFailed <> 0);
+    Exit;
+  end;
+  Assert(v <> nil);
+
+  { Trim AFF_BLOB / AFF_NONE prefix.  AFF_NONE = $40 < AFF_BLOB = $41, so
+    the test `<= AFF_BLOB` covers both. }
+  Assert(SQLITE_AFF_NONE < SQLITE_AFF_BLOB);
+  while (n > 0) and (Byte(zAff[0]) <= SQLITE_AFF_BLOB) do
+  begin
+    Dec(n);
+    Inc(base);
+    Inc(zAff);
+  end;
+  while (n > 1) and (Byte(zAff[n - 1]) <= SQLITE_AFF_BLOB) do
+    Dec(n);
+
+  if n > 0 then
+    sqlite3VdbeAddOp4(v, OP_Affinity, base, n, 0, zAff, n);
+end;
+
+procedure whereLikeOptimizationStringFixup(v: PVdbe; pLevel: PWhereLevel;
+  pTerm: PWhereTerm);
+var
+  pOp: PVdbeOp;
+begin
+  if (pTerm^.wtFlags and TERM_LIKEOPT) <> 0 then
+  begin
+    Assert(pLevel^.iLikeRepCntr > 0);
+    pOp := sqlite3VdbeGetLastOp(v);
+    Assert(pOp <> nil);
+    Assert((pOp^.opcode = OP_String8)
+           or (pTerm^.pWC^.pWInfo^.pParse^.db^.mallocFailed <> 0));
+    pOp^.p3 := i32(pLevel^.iLikeRepCntr shr 1);  { register holding counter }
+    pOp^.p5 := u16(pLevel^.iLikeRepCntr and 1);  { ASC (0) or DESC (1) }
+  end;
+end;
+
+procedure adjustOrderByCol(pOrderBy: PExprList; pEList: PExprList);
+var
+  i, j, t: i32;
+  pOrdItems, pELItems: PExprListItem;
+begin
+  if pOrderBy = nil then Exit;
+  pOrdItems := ExprListItems(pOrderBy);
+  pELItems  := ExprListItems(pEList);
+  for i := 0 to pOrderBy^.nExpr - 1 do
+  begin
+    t := pOrdItems[i].u.x.iOrderByCol;
+    if t = 0 then Continue;
+    j := 0;
+    while j < pEList^.nExpr do
+    begin
+      if pELItems[j].u.x.iOrderByCol = t then
+      begin
+        pOrdItems[i].u.x.iOrderByCol := u16(j + 1);
+        Break;
+      end;
+      Inc(j);
+    end;
+    if j >= pEList^.nExpr then
+      pOrdItems[i].u.x.iOrderByCol := 0;
+  end;
 end;
 
 { ---------------------------------------------------------------------------

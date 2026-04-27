@@ -2800,6 +2800,314 @@ begin
   sqlite3_close(db);
 end;
 
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers gate.
+  Tests for disableTerm, codeApplyAffinity, whereLikeOptimizationStringFixup,
+  and adjustOrderByCol.  All four are pure leaf helpers ported from
+  wherecode.c:419..541, 1015..1030; they have no recursion into the planner
+  and can be exercised against hand-built records.
+  =========================================================================== }
+
+procedure TestDisableTerm;
+var
+  pWC: PWhereClause;
+  buf: array[0..2047] of u8;
+  pLevel: TWhereLevel;
+  pParent, pChild1, pChild2: PWhereTerm;
+  pExprNoOuter, pExprOuter: TExpr;
+begin
+  FillChar(buf, SizeOf(buf), 0);
+  pWC := PWhereClause(@buf[0]);
+  pWC^.nTerm := 3;
+  pWC^.nSlot := 8;
+  pWC^.a := @pWC^.aStatic[0];
+
+  FillChar(pExprNoOuter, SizeOf(pExprNoOuter), 0);
+  pExprNoOuter.flags := 0;
+  FillChar(pExprOuter,   SizeOf(pExprOuter),   0);
+  pExprOuter.flags   := EP_OuterON;
+
+  pParent := @pWC^.aStatic[0];
+  pChild1 := @pWC^.aStatic[1];
+  pChild2 := @pWC^.aStatic[2];
+
+  pParent^.pWC := pWC; pParent^.iParent := -1; pParent^.nChild := 2;
+  pParent^.pExpr := @pExprNoOuter; pParent^.wtFlags := 0; pParent^.prereqAll := 0;
+  pChild1^.pWC := pWC; pChild1^.iParent := 0; pChild1^.nChild := 0;
+  pChild1^.pExpr := @pExprNoOuter; pChild1^.wtFlags := 0; pChild1^.prereqAll := 0;
+  pChild2^.pWC := pWC; pChild2^.iParent := 0; pChild2^.nChild := 0;
+  pChild2^.pExpr := @pExprNoOuter; pChild2^.wtFlags := 0; pChild2^.prereqAll := 0;
+
+  FillChar(pLevel, SizeOf(pLevel), 0);
+
+  { ---- DT1 — simple term, no parent → TERM_CODED set, walk stops. ---- }
+  pParent^.iParent := -1; pParent^.nChild := 0; pParent^.wtFlags := 0;
+  disableTerm(@pLevel, pParent);
+  Check('DT1 standalone term marked TERM_CODED',
+        (pParent^.wtFlags and TERM_CODED) <> 0);
+
+  { ---- DT2 — already TERM_CODED → loop body skipped. ---- }
+  pParent^.wtFlags := TERM_CODED or TERM_VIRTUAL;
+  disableTerm(@pLevel, pParent);
+  Check('DT2 already-coded term unchanged',
+        pParent^.wtFlags = (TERM_CODED or TERM_VIRTUAL));
+
+  { ---- DT3 — child, parent.nChild=2 → child coded, parent.nChild→1, walk
+    stops because parent still has live children. ---- }
+  pParent^.iParent := -1; pParent^.nChild := 2; pParent^.wtFlags := 0;
+  pChild1^.iParent := 0;  pChild1^.nChild := 0; pChild1^.wtFlags := 0;
+  disableTerm(@pLevel, pChild1);
+  Check('DT3 child marked TERM_CODED',
+        (pChild1^.wtFlags and TERM_CODED) <> 0);
+  Check('DT3 parent.nChild decremented to 1',
+        pParent^.nChild = 1);
+  Check('DT3 parent NOT yet coded',
+        (pParent^.wtFlags and TERM_CODED) = 0);
+
+  { ---- DT3-cont — coding the second child takes parent.nChild→0 → parent
+    coded too. ---- }
+  pChild2^.iParent := 0;  pChild2^.nChild := 0; pChild2^.wtFlags := 0;
+  disableTerm(@pLevel, pChild2);
+  Check('DT3 second child marked TERM_CODED',
+        (pChild2^.wtFlags and TERM_CODED) <> 0);
+  Check('DT3 parent walked, now coded too',
+        (pParent^.wtFlags and TERM_CODED) <> 0);
+
+  { ---- DT4 — TERM_LIKE child after parent walk gets TERM_LIKECOND, not
+    TERM_CODED, on the second iteration (nLoop>0). ---- }
+  pParent^.iParent := -1; pParent^.nChild := 1; pParent^.wtFlags := 0;
+  pChild1^.iParent := 0;  pChild1^.nChild := 0;
+  pChild1^.wtFlags := TERM_LIKE;  { will become parent on iter 2 }
+  { Actually the C semantics: TERM_LIKE on a *parent* of the chain.  Set up:
+    grandchild → parent (TERM_LIKE) where TERM_LIKECOND fires on parent. }
+  pChild2^.iParent := 1;  pChild2^.nChild := 0; pChild2^.wtFlags := 0;
+  pChild1^.nChild := 1;
+  disableTerm(@pLevel, pChild2);
+  Check('DT4 grandchild marked TERM_CODED (iter 1, nLoop=0)',
+        (pChild2^.wtFlags and TERM_CODED) <> 0);
+  Check('DT4 TERM_LIKE parent gets TERM_LIKECOND (iter 2, nLoop=1)',
+        (pChild1^.wtFlags and TERM_LIKECOND) <> 0);
+  Check('DT4 TERM_LIKE parent NOT TERM_CODED',
+        (pChild1^.wtFlags and TERM_CODED) = 0);
+
+  { ---- DT5 — notReady & prereqAll <> 0 short-circuits. ---- }
+  pChild1^.wtFlags := 0; pChild1^.prereqAll := $F0;
+  pLevel.notReady := $0F;   { no overlap → still proceeds }
+  disableTerm(@pLevel, pChild1);
+  Check('DT5a non-overlapping notReady allows coding',
+        (pChild1^.wtFlags and TERM_CODED) <> 0);
+  pChild1^.wtFlags := 0; pChild1^.prereqAll := $0F;
+  pLevel.notReady := $0F;   { overlap → blocked }
+  disableTerm(@pLevel, pChild1);
+  Check('DT5b overlapping notReady blocks coding',
+        (pChild1^.wtFlags and TERM_CODED) = 0);
+  pLevel.notReady := 0;
+
+  { ---- DT6 — iLeftJoin <> 0 and term lacks EP_OuterON → blocked. ---- }
+  pLevel.iLeftJoin := 1;
+  pChild1^.wtFlags := 0; pChild1^.prereqAll := 0;
+  pChild1^.pExpr := @pExprNoOuter;
+  disableTerm(@pLevel, pChild1);
+  Check('DT6a outer-join + no EP_OuterON blocks coding',
+        (pChild1^.wtFlags and TERM_CODED) = 0);
+  pChild1^.pExpr := @pExprOuter;
+  disableTerm(@pLevel, pChild1);
+  Check('DT6b outer-join + EP_OuterON allows coding',
+        (pChild1^.wtFlags and TERM_CODED) <> 0);
+  pLevel.iLeftJoin := 0;
+end;
+
+procedure TestCodeApplyAffinity;
+var
+  db:    PTsqlite3;
+  parse: TParse;
+  v:     PVdbe;
+  rc:    i32;
+  zAff:  array[0..7] of AnsiChar;
+  startN: i32;
+  pOp:    PVdbeOp;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('CAA open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+  Check('CAA vdbe ready', v <> nil);
+  startN := v^.nOp;
+
+  { ---- CAA1 — zAff = nil triggers mallocFailed assert path; skip when not
+    asserting (production build).  Just verify no opcode is emitted. ---- }
+  { (cannot exercise nil arm without flipping mallocFailed; skipped.) }
+
+  { ---- CAA2 — all entries are AFF_BLOB → trimmed to nothing, no opcode. ---- }
+  zAff[0] := AnsiChar(SQLITE_AFF_BLOB);
+  zAff[1] := AnsiChar(SQLITE_AFF_BLOB);
+  zAff[2] := AnsiChar(SQLITE_AFF_NONE);
+  codeApplyAffinity(@parse, 5, 3, @zAff[0]);
+  Check('CAA2 all-blob → no OP_Affinity emitted',
+        v^.nOp = startN);
+
+  { ---- CAA3 — single non-trivial char → opcode emitted. ---- }
+  zAff[0] := 'C';   { SQLITE_AFF_TEXT = 'B'/'C' family > BLOB }
+  startN := v^.nOp;
+  codeApplyAffinity(@parse, 5, 1, @zAff[0]);
+  Check('CAA3 emits one opcode',
+        v^.nOp = startN + 1);
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(startN) * SizeOf(TVdbeOp));
+  Check('CAA3 opcode is OP_Affinity',
+        pOp^.opcode = OP_Affinity);
+  Check('CAA3 base preserved (p1=5)',
+        pOp^.p1 = 5);
+  Check('CAA3 n=1',
+        pOp^.p2 = 1);
+
+  { ---- CAA4 — prefix BLOB + tail TEXT → base/n shifted past prefix. ---- }
+  zAff[0] := AnsiChar(SQLITE_AFF_BLOB);
+  zAff[1] := AnsiChar(SQLITE_AFF_BLOB);
+  zAff[2] := 'C';
+  zAff[3] := 'D';
+  startN := v^.nOp;
+  codeApplyAffinity(@parse, 10, 4, @zAff[0]);
+  Check('CAA4 emits one opcode',
+        v^.nOp = startN + 1);
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(startN) * SizeOf(TVdbeOp));
+  Check('CAA4 base shifted by 2 (10+2)',
+        pOp^.p1 = 12);
+  Check('CAA4 length trimmed to 2',
+        pOp^.p2 = 2);
+
+  { ---- CAA5 — TEXT-prefix + BLOB-suffix → only suffix trimmed. ---- }
+  zAff[0] := 'C';
+  zAff[1] := 'C';
+  zAff[2] := AnsiChar(SQLITE_AFF_BLOB);
+  zAff[3] := AnsiChar(SQLITE_AFF_NONE);
+  startN := v^.nOp;
+  codeApplyAffinity(@parse, 20, 4, @zAff[0]);
+  Check('CAA5 suffix trim emits one opcode',
+        v^.nOp = startN + 1);
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(startN) * SizeOf(TVdbeOp));
+  Check('CAA5 base unchanged',
+        pOp^.p1 = 20);
+  Check('CAA5 length trimmed to 2',
+        pOp^.p2 = 2);
+
+  sqlite3_close(db);
+end;
+
+procedure TestWhereLikeOptStringFixup;
+var
+  db:     PTsqlite3;
+  parse:  TParse;
+  v:      PVdbe;
+  rc:     i32;
+  pLevel: TWhereLevel;
+  pTerm:  TWhereTerm;
+  pWC:    TWhereClause;
+  wInfo:  TWhereInfo;
+  pOp:    PVdbeOp;
+  addr:   i32;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('WLOSF open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  FillChar(pLevel, SizeOf(pLevel), 0);
+  FillChar(pTerm,  SizeOf(pTerm),  0);
+  FillChar(pWC,    SizeOf(pWC),    0);
+  FillChar(wInfo,  SizeOf(wInfo),  0);
+  wInfo.pParse := @parse;
+  pWC.pWInfo := @wInfo;
+  pTerm.pWC := @pWC;
+
+  { Emit an OP_String8 to anchor the fixup. }
+  addr := sqlite3VdbeAddOp4(v, OP_String8, 0, 1, 0, PAnsiChar('foo'), 0);
+  Check('WLOSF baseline OP_String8 emitted', addr >= 0);
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(addr) * SizeOf(TVdbeOp));
+
+  { ---- WLOSF1 — wtFlags lacks TERM_LIKEOPT → no fixup. ---- }
+  pTerm.wtFlags := 0;
+  pLevel.iLikeRepCntr := 7;
+  pOp^.p3 := 99; pOp^.p5 := 99;
+  whereLikeOptimizationStringFixup(v, @pLevel, @pTerm);
+  Check('WLOSF1 no TERM_LIKEOPT → p3 untouched', pOp^.p3 = 99);
+  Check('WLOSF1 no TERM_LIKEOPT → p5 untouched', pOp^.p5 = 99);
+
+  { ---- WLOSF2 — TERM_LIKEOPT + iLikeRepCntr=7 → p3=3 (7>>1), p5=1 (7&1). ---- }
+  pTerm.wtFlags := TERM_LIKEOPT;
+  pOp^.p3 := 0; pOp^.p5 := 0;
+  whereLikeOptimizationStringFixup(v, @pLevel, @pTerm);
+  Check('WLOSF2 p3 = iLikeRepCntr>>1 = 3', pOp^.p3 = 3);
+  Check('WLOSF2 p5 = iLikeRepCntr&1  = 1', pOp^.p5 = 1);
+
+  { ---- WLOSF3 — iLikeRepCntr=10 → p3=5, p5=0. ---- }
+  pLevel.iLikeRepCntr := 10;
+  whereLikeOptimizationStringFixup(v, @pLevel, @pTerm);
+  Check('WLOSF3 p3 = 10>>1 = 5', pOp^.p3 = 5);
+  Check('WLOSF3 p5 = 10&1  = 0', pOp^.p5 = 0);
+
+  sqlite3_close(db);
+end;
+
+procedure TestAdjustOrderByCol;
+const
+  N_ORD = 4;
+  N_EL  = 3;
+type
+  TOrdBuf = record
+    hdr:   TExprList;
+    items: array[0..N_ORD-1] of TExprListItem;
+  end;
+  TELBuf = record
+    hdr:   TExprList;
+    items: array[0..N_EL-1] of TExprListItem;
+  end;
+var
+  ord: TOrdBuf;
+  el:  TELBuf;
+  i: Integer;
+begin
+  { ---- AOBC1 — pOrderBy=nil is a no-op. ---- }
+  adjustOrderByCol(nil, nil);
+  Check('AOBC1 nil pOrderBy → no crash', True);
+
+  FillChar(ord, SizeOf(ord), 0);
+  FillChar(el,  SizeOf(el),  0);
+  ord.hdr.nExpr := N_ORD;
+  el.hdr.nExpr  := N_EL;
+
+  { ORDER BY column slots originally pointed at result-set positions
+    [3, 0, 1, 2]; result-set rearrangement put old-pos t at new-pos j:
+      el[0].iOrderByCol = 2  (old col 2 → new col 1)
+      el[1].iOrderByCol = 3  (old col 3 → new col 2)
+      el[2].iOrderByCol = 1  (old col 1 → new col 3)
+    So expected adjusted ord values: t=3 → j=1 → 2; t=0 → skip; t=1 → j=2 → 3;
+    t=2 → j=0 → 1. }
+  ord.items[0].u.x.iOrderByCol := 3;
+  ord.items[1].u.x.iOrderByCol := 0;
+  ord.items[2].u.x.iOrderByCol := 1;
+  ord.items[3].u.x.iOrderByCol := 2;
+  el.items[0].u.x.iOrderByCol := 2;
+  el.items[1].u.x.iOrderByCol := 3;
+  el.items[2].u.x.iOrderByCol := 1;
+
+  adjustOrderByCol(@ord.hdr, @el.hdr);
+  Check('AOBC2a t=3 → 2', ord.items[0].u.x.iOrderByCol = 2);
+  Check('AOBC2b t=0 stays 0 (skipped)', ord.items[1].u.x.iOrderByCol = 0);
+  Check('AOBC2c t=1 → 3', ord.items[2].u.x.iOrderByCol = 3);
+  Check('AOBC2d t=2 → 1', ord.items[3].u.x.iOrderByCol = 1);
+
+  { ---- AOBC3 — orphan (no match in pEList) → cleared to 0. ---- }
+  for i := 0 to N_ORD - 1 do ord.items[i].u.x.iOrderByCol := 0;
+  ord.items[0].u.x.iOrderByCol := 99;   { not present in el }
+  el.items[0].u.x.iOrderByCol := 1;
+  el.items[1].u.x.iOrderByCol := 2;
+  el.items[2].u.x.iOrderByCol := 3;
+  adjustOrderByCol(@ord.hdr, @el.hdr);
+  Check('AOBC3 orphan cleared to 0', ord.items[0].u.x.iOrderByCol = 0);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -2834,6 +3142,10 @@ begin
   TestLoopIsNoBetter;
   TestPathSatisfiesOrderBy;
   TestPathSolver;
+  TestDisableTerm;
+  TestCodeApplyAffinity;
+  TestWhereLikeOptStringFixup;
+  TestAdjustOrderByCol;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.
