@@ -133,54 +133,21 @@ Important: At the end of this document, please find:
       isolation spawns the two TERM_VIRTUAL|TERM_DYNAMIC WO_GE / WO_LE
       children, parent nChild=2, iParent links back).  39/39.
 
-- [ ] **6.9-bis 11g.2.d** Port the planner core in `where.c`
-    (~5000 lines): `whereLoopAddBtree`, `whereLoopAddBtreeIndex`,
-    `whereLoopAddVirtual*`, `whereLoopAddOr`, `whereLoopAddAll`,
-    `whereLoopOutputAdjust`, `whereLoopFindLesser`, `whereLoopInsert`,
-    `whereLoopCheaperProperSubset`, `whereLoopAdjustCost`, the N-best
-    path search in `wherePathSolver`.  Replaces the hard-coded rowid-
-    EQ pick from 11g.2.b with real N-way join planning, index
-    selection, and ORDER BY consumption.  May need further
-    sub-splitting once 11g.2.a..c reveal field-shape requirements.
-    Defer `xBestIndex`-style virtual-table costing until vtab corpus
-    is exercised.
-    Status: completed in detailed subtasks (recorded in
-    `git log --grep="11g.2.d"`).  Output-row count, leaf bookkeeping,
-    interstage heuristic, index-helper cluster, range-vector,
-    auto-index, implication / partial-index, DISTINCT/UNIQUE,
-    `whereLoopAddBtreeIndex`, `whereLoopAddBtree`, `whereLoopAddOr`,
-    `whereLoopAddAll`, `whereLoopAddVirtual*`, `whereSortingCost`,
-    `wherePathSatisfiesOrderBy`, `wherePathSolver` + `computeMxChoice`,
-    and `whereRangeScanEst` (no-STAT4 tail) all ported with
-    `TestWherePlanner` gate green.  Multi-table integration
-    (xBestIndex-style virtual-table costing, full N-way join
-    planning end-to-end) still gated on remaining 11g.2.f corpus
-    rows that surface multi-table planning needs (LEFT_JOIN,
-    JOIN_WHERE, EXISTS_SUB, NOT_EXISTS).  vtab xBestIndex deferred
-    until vtab corpus is exercised.
-- [ ] **6.9-bis 11g.2.e** Port `wherecode.c` (~2945 lines) —
-    per-loop inner-body codegen.  Public surface:
-    `sqlite3WhereCodeOneLoopStart`, `sqlite3WhereRightJoinLoop`,
-    `sqlite3WhereExplainOneScan`, `sqlite3WhereAddScanStatus`,
-    `disableTerm`, `codeApplyAffinity`, `codeEqualityTerm`,
-    `codeAllEqualityTerms`, `whereLikeOptimizationStringFixup`,
-    `codeCursorHint`.  Replaces the inlined NotExists emission from
-    11g.2.b with full index-key construction, range-scan setup,
-    virtual-table xFilter glue, and per-row body dispatch.
-    Status: completed in detailed subtasks (recorded in
-    `git log --grep="11g.2.e"`).  Leaf helpers (batches 1..9 covering
-    `disableTerm`, `sqlite3VectorFieldSubexpr`,
-    `sqlite3TableColumnToStorage`, `explainIndexColumnName`,
-    `removeUnindexableInClauseTerms`, `codeExprOrVector`,
-    `codeCursorHint`, IN-index pre-flight predicates,
-    `sqlite3FindInIndex`) and the `sqlite3WhereCodeOneLoopStart`
-    public surface (batches 11..14: prologue, IPK rowid-EQ,
-    rowid-RANGE, INDEX_EQ, INDEX_RANGE, OR-loop, scan tail, LEFT
-    JOIN null-row, deferred-seek, WITHOUT-ROWID HasRowid gating,
-    EXPLAIN/scan-status hooks) ported with `TestWherePlanner` gate
-    green (629/629).  Open: `sqlite3WhereRightJoinLoop` and the
-    full LEFT JOIN integration land alongside the 11g.2.f
-    multi-table corpus rows.
+- [X] **6.9-bis 11g.2.d** Planner core in `where.c` (~5000 lines):
+    `whereLoopAddBtree*`, `whereLoopAddVirtual*`, `whereLoopAddOr`,
+    `whereLoopAddAll`, `wherePathSolver` + `computeMxChoice`,
+    `whereRangeScanEst` (no-STAT4 tail), and ORDER BY consumption all
+    ported.  `TestWherePlanner` 675/675; multi-table corpus rows
+    (LEFT_JOIN, JOIN_WHERE, EXISTS_SUB, NOT_EXISTS) PASS in
+    TestWhereCorpus.  vtab `xBestIndex`-style costing deferred until
+    vtab corpus is exercised.
+- [X] **6.9-bis 11g.2.e** `wherecode.c` (~2945 lines) per-loop
+    inner-body codegen — `sqlite3WhereCodeOneLoopStart` public surface
+    (prologue, IPK rowid-EQ/RANGE, INDEX_EQ/RANGE, OR-loop, scan tail,
+    LEFT JOIN null-row, deferred-seek, WITHOUT-ROWID gating,
+    EXPLAIN/scan-status hooks) plus leaf helpers ported.
+    `TestWherePlanner` green.  `sqlite3WhereRightJoinLoop` lands with
+    any future RIGHT JOIN corpus expansion.
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix
     (single rowid-EQ, multi-AND, OR-decomposed, LIKE, IN-subselect,
@@ -193,16 +160,7 @@ Important: At the end of this document, please find:
     DIVERGE / 0 ERROR (corpus = 10); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
-    the system one (the latter's `sqlite3_initialize` can corrupt
-    shared globals and crash the Pas tokenizer at startup).
-
-    **EXISTS-to-JOIN optimization landed** (commits `4ab1bb5` + `4b765c8`,
-    sub-progress 50 + 51): Parse.bHasExists set in resolver, SQLITE_ExistsToJoin
-    flag, renumberCursors helpers, existsToJoin() itself, sqlite3Select call
-    site, OP_IfEmpty emission for fromExists in the cursor-open loop, and the
-    EXISTS-break tail (where.c:7586..7607).  fromExists planner-cost nudges
-    at where.c:3579/3630/4181/4285/4991 already in place.  EXISTS_SUB flipped
-    from DIVERGE (Pas=22, C=30) to **PASS at 30 ops, byte-identical**.
+    the system one.
 
     **Open follow-on:** Re-enable productive tails:
       * `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
@@ -212,39 +170,20 @@ Important: At the end of this document, please find:
         with snapshot/restore guard at 17890..17893 / 17965..17970;
         blocks NestedParse UPDATE of the placeholder sqlite_master row.
 
-    **CREATE TABLE / CREATE INDEX / DROP TABLE DIVERGE-op-count rows**
-    in TestExplainParity (Pas=21/19/24 vs C=32/37/41/49) are structural
-    — extra C-side auth + ParseSchema reparse + scope unwind that Pas
-    elides; all return rc=0 via `sqlite3_exec` and rows materialise (or
-    are removed from) sqlite_master.  A 6.10-scoped follow-on.
-
-- [X] **6.9-bis 11g.2.h** Standalone `DELETE FROM <tbl>` prepare returned
-    SQLITE_ERROR.  Root cause was NOT a parser-engine state issue but
-    `sqlite3SrcListIndexedBy` (passqlite3codegen.pas:20493): it
-    unconditionally set `SRCITEM_FG_IS_INDEXED_BY` whenever
-    `pIndexedBy<>nil`, but rule 152 always passes a non-nil token (empty
-    when no `INDEXED BY` clause).  Fixed: early-out on `n=0`, route
-    NOT INDEXED (n=1, z=nil) to `SRCITEM_FG_NOT_INDEXED`, only set the
-    IS_INDEXED_BY bit + copy zIndexedBy when a real name is supplied —
-    mirroring build.c:5132.
-
-    Companion fix in `sqlite3SrcListAppend` (passqlite3codegen.pas:20396)
-    that unblocked DROP TABLE: (a) Lemon grammar `nm DOT nm` passes
-    (db, table) but C swaps args on store (build.c:4913); Pas was
-    storing them straight, so `sqlite_master.'main'` lookup formed.
-    (b) C uses `sqlite3NameFromToken` which dequotes; Pas called bare
-    `sqlite3DbStrNDup`, leaving `'main'` quoted.  Added the swap +
-    `sqlite3Dequote` calls + the `pDb^.z=nil` guard from build.c:4908.
-    DROP TABLE now produces a productive Vdbe (op-count diverge only,
-    classed as 6.10 follow-on alongside CREATE TABLE/INDEX).
+    The 8 TestExplainParity DIVERGEs are CREATE TABLE / CREATE INDEX /
+    DROP TABLE op-count rows — structural (extra C-side auth +
+    ParseSchema reparse + scope unwind that Pas elides; rows still
+    materialise correctly).  Tracked under 6.10.
 
 - [X] **6.9-bis 11g.2.g** TestWhereCorpus startup EAccessViolation —
-    **Resolved.** The AV in `sqlite3StrDup`→`IndexByte` was downstream
-    of stale-zero `prereqRight` masks driving inner-subselect codegen
-    into mis-keyed cursor probes; not a malloc/static-state collision
-    as initially suspected.  Fixed by porting `exprSelectUsage`
-    (`whereexpr.c:998..1024` → `passqlite3codegen.pas:8105..8154`,
-    commit `b94ddc1`).  TestWhereCorpus now runs end-to-end at 92/0/0.
+    fixed by porting `exprSelectUsage` (whereexpr.c:998..1024) so
+    `prereqRight` masks no longer drive inner-subselect codegen into
+    mis-keyed cursor probes (commit `b94ddc1`).
+
+- [X] **6.9-bis 11g.2.h** Standalone `DELETE FROM <tbl>` prepare —
+    fixed `sqlite3SrcListIndexedBy` (always-set IS_INDEXED_BY flag) and
+    `sqlite3SrcListAppend` (db/table arg swap + dequote) to mirror
+    build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
   Current Status: **2 PASS / 8 DIVERGE / 0 ERROR**.  Drive to
