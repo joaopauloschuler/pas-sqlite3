@@ -1021,6 +1021,26 @@ Important: At the end of this document, please find:
       p5=OPFLAG_USESEEKRESULT, OP_BeginSubrtn p2=55, addrSubrtn>0,
       withinRJSubrtn incremented to 1, code_outer_join_constraints
       fall-through tags TERM_CODED).
+    - [X] Public surface, batch 18 — `sqlite3WhereCodeOneLoopStart`
+      viaCoroutine FROM-clause subquery arm (wherecode.c:1543..1555).
+      Inserted as the leading dispatch arm (before Case 2) to mirror
+      the C `if-else` chain.  Fires when `pTabItem^.fg.fgBits` has
+      bit 6 (`viaCoroutine`) set: emits OP_InitCoroutine targeting
+      `pTabItem^.u4.pSubq^.regReturn` with p3 = `addrFillSub` (the
+      coroutine entry point), then OP_Yield against the same
+      regReturn with p2 = addrBrk so when the coroutine signals
+      end-of-rows the outer loop falls out.  `pLevel^.p2` is set to
+      the OP_Yield address so sqlite3WhereEnd's iteration epilogue
+      jumps back through the yield instead of emitting a Next/Prev
+      pair, and `pLevel^.op := OP_Goto` so the loop iteration is
+      driven by a back-edge to the yield rather than a cursor step.
+      C-source assertions ported verbatim — `isSubquery` (fgBits
+      bit 2) must be set and `u4.pSubq` must be non-nil.  Gate:
+      `TestWherePlanner.pas` (624/624): SCOLS18 (Subquery fixture
+      with regReturn=77 / addrFillSub=123, fgBits = viaCoroutine |
+      isSubquery — verifies pLevel^.op = OP_Goto, pLevel^.p2 > 0,
+      OP_InitCoroutine p1=77 / p3=123 emitted, OP_Yield p1=77
+      emitted, pLevel^.p2 points at the emitted OP_Yield address).
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix

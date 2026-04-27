@@ -5583,6 +5583,9 @@ var
   rj:        TWhereRightJoin;
   fFound, fMakeRec, fIdxIns, fFilter, fBegin: Boolean;
   pSeenFilter: PVdbeOp;
+  sq:        PSubquery;
+  fInit, fYield: Boolean;
+  pYieldOp:  PVdbeOp;
 begin
   rc := sqlite3_open(':memory:', @db);
   Check('SCOLS13 open', rc = SQLITE_OK);
@@ -5772,6 +5775,62 @@ begin
   pLevel^.pRJ := nil;
   pSItem^.pSTab := nil;
   FreeMem(pTabRJ);
+
+  { ---- SCOLS18 — viaCoroutine FROM-clause subquery (fg.fgBits bit 6).
+         The arm fires at the top of the dispatch chain (before Case 2)
+         and emits OP_InitCoroutine + OP_Yield + sets pLevel^.op to
+         OP_Goto.  pLevel^.p2 pins the OP_Yield address so
+         sqlite3WhereEnd loops back through it.  Subquery struct holds
+         regReturn and addrFillSub which thread directly into the
+         opcode operands.  Caller invariant: isSubquery (bit 2) must
+         be set and u4.pSubq must be non-nil. ---- }
+  pBodyTerm^.wtFlags  := 0;
+  pBodyTerm^.prereqAll := 0;
+  pWInfo^.bitwiseFlags := 0;
+  pSItem^.fg.jointype := 0;
+  pSItem^.fg.fgBits := u8($40) or u8($04);  { viaCoroutine | isSubquery }
+  pLevel^.iLeftJoin := 0;
+  pLevel^.pRJ := nil;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.op := 99;
+  pLevel^.p2 := 0;
+
+  { Build a Subquery fixture: pSelect can stay nil since the arm only
+    reads regReturn / addrFillSub. }
+  sq := PSubquery(GetMem(SizeOf(TSubquery)));
+  FillChar(sq^, SizeOf(TSubquery), 0);
+  sq^.regReturn   := 77;
+  sq^.addrFillSub := 123;
+  pSItem^.u4.pSubq := sq;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS18 viaCoroutine: pLevel^.op = OP_Goto',
+        pLevel^.op = OP_Goto);
+  Check('SCOLS18 viaCoroutine: pLevel^.p2 set non-zero',
+        pLevel^.p2 > 0);
+  fInit := False; fYield := False; pYieldOp := nil;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_InitCoroutine) and (pOp^.p1 = 77)
+       and (pOp^.p3 = 123) then fInit := True;
+    if (pOp^.opcode = OP_Yield) and (pOp^.p1 = 77) then
+    begin
+      fYield := True;
+      pYieldOp := pOp;
+    end;
+  end;
+  Check('SCOLS18 viaCoroutine: OP_InitCoroutine emitted', fInit);
+  Check('SCOLS18 viaCoroutine: OP_Yield emitted', fYield);
+  Check('SCOLS18 viaCoroutine: pLevel^.p2 points at OP_Yield address',
+        (pYieldOp <> nil) and
+        (PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(pLevel^.p2) * SizeOf(TVdbeOp))
+          = pYieldOp));
+  FreeMem(sq);
+  pSItem^.fg.fgBits := 0;
+  pSItem^.u4.pSubq  := nil;
 
   { ---- SCOLS15 — TERM_VIRTUAL or pre-coded TERM_CODED skips the walk
          entirely; body emits no residual for the term. ---- }

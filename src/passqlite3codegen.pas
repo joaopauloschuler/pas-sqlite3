@@ -12322,6 +12322,27 @@ begin
     sqlite3VdbeAddOp2(v, OP_Integer, 0, pLevel^.iLeftJoin);
   end;
 
+  { viaCoroutine subquery — wherecode.c:1543..1555.  When the FROM-clause
+    item is a subquery materialised as a co-routine (fg.viaCoroutine bit
+    set), the body is driven by an OP_InitCoroutine + OP_Yield pair: the
+    init opcode primes the coroutine to start at pSubq^.addrFillSub, and
+    the yield (whose address pLevel^.p2 points at) advances one row per
+    outer-loop iteration, jumping to addrBrk when the coroutine signals
+    end-of-rows.  pLevel^.op = OP_Goto so sqlite3WhereEnd's iteration
+    epilogue jumps back to the yield instead of emitting a Next/Prev
+    opcode.  The C source guards this with `assert( pTabItem->fg.isSubquery
+    && pTabItem->u4.pSubq != 0 )`; we mirror via an Assert. }
+  if (pTabItem^.fg.fgBits and u8($40)) <> 0 then  { viaCoroutine }
+  begin
+    Assert((pTabItem^.fg.fgBits and u8($04)) <> 0);  { isSubquery }
+    Assert(pTabItem^.u4.pSubq <> nil);
+    sqlite3VdbeAddOp3(v, OP_InitCoroutine, pTabItem^.u4.pSubq^.regReturn,
+                      0, pTabItem^.u4.pSubq^.addrFillSub);
+    pLevel^.p2 := sqlite3VdbeAddOp2(v, OP_Yield,
+                                    pTabItem^.u4.pSubq^.regReturn, addrBrk);
+    pLevel^.op := OP_Goto;
+  end
+  else
   { Case 2 — wherecode.c:1684..1711.  IPK rowid-EQ or rowid-IN.  Emits
     codeEqualityTerm into a fresh register, optional Bloom-filter
     MustBeInt+Filter+filterPullDown chain, then OP_SeekRowid.  pLevel^.op
