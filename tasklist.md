@@ -1228,6 +1228,34 @@ Important: At the end of this document, please find:
     Verify byte-identical bytecode emission against C via
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
+    - [X] Sub-progress 1 — `TestWhereCorpus.pas` scaffold landed
+      (20-row WHERE-shape corpus, report-only).  Mirrors
+      `TestExplainParity` idiom: C oracle prepares `EXPLAIN <sql>` and
+      walks the bytecode listing row-by-row; Pascal port prepares the
+      bare SQL via `sqlite3_prepare_v2` and walks `PVdbe.aOp[]` directly.
+      Diff on (opcode, p1, p2, p3, p5).  Corpus rows: rowid-EQ literal,
+      rowid-EQ via INTEGER PRIMARY KEY alias, rowid IN-list, rowid range
+      (BETWEEN), col-EQ on secondary index, multi-AND on indexed pair,
+      AND mixing indexed + residual, col-RANGE single-column, col-RANGE
+      composite (a=k AND b>k), col-IN literal list, col-IN subselect,
+      OR same-column (decomposable), OR cross-column, LIKE prefix, LIKE
+      wildcard, IS NULL, WITHOUT-ROWID secondary-index scan, LEFT JOIN
+      simple, INNER JOIN with WHERE, full-table scan baseline.
+      Two-fixture split: the C oracle gets the full typed schema
+      (CREATE INDEX + WITHOUT ROWID + INTEGER PRIMARY KEY) so its
+      EXPLAIN output reflects realistic planner choices; the Pascal port
+      gets the minimal `CREATE TABLE t(a,b,c)` shape because the typed
+      DDL still flakes through `sqlite3_exec` under 11g.2.e codegen.
+      Pascal exceptions during prepare are caught and counted as
+      DIVERGE so the scaffold completes the full corpus instead of
+      bailing on the first crash.  ERROR remains reserved for C-side
+      failures (corrupt fixture / oracle).  Build wired into
+      `src/tests/build.sh` after `TestExplainParity`.  Current baseline
+      (2026-04-27): **0 PASS / 20 DIVERGE / 0 ERROR** — every SELECT
+      currently raises `EAccessViolation` inside Pascal `prepare_v2`
+      (SELECT codegen end-to-end is the next driver), confirming the
+      scaffold reaches the diff-gate without false-positive PASSes.
+      Each subsequent batch under 11g.2.f drives green rows up.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

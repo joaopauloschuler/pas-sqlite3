@@ -159,6 +159,7 @@ compile_test TestBackup
 compile_test TestUnlockNotify
 compile_test TestLoadExt
 compile_test TestExplainParity
+compile_test TestWhereCorpus
 compile_test TestSQLCorpus
 compile_test TestFuzzDiff
 compile_test TestReferenceVectors
