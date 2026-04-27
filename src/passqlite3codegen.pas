@@ -12215,6 +12215,7 @@ var
   memEndValue: i32;
   startAddr:   i32;
   jRng:        i32;
+  iInTabDummy: i32;
 begin
   Assert(((wctrlFlags and WHERE_ONEPASS_MULTIROW) = 0)
       or (((wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0)
@@ -12451,6 +12452,44 @@ begin
 
   sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenRead);
   sqlite3VdbeChangeP5(v, 0);
+
+  { Phase 6.9-bis 11g.2.f sub-progress 19 — pre-loop IN-RHS hoisting.
+
+    Walk every base WHERE term that is NOT virtual, NOT already TERM_CODED
+    by the False-Bypass loop, and whose root expression is a TK_IN with a
+    literal-list RHS (ExprUseXList).  For each such term, force-materialise
+    the IN-RHS into an ephemeral b-tree NOW (before Rewind/Seek emission)
+    by calling sqlite3FindInIndex with IN_INDEX_MEMBERSHIP — the eph
+    cursor is allocated, sqlite3CodeRhsOfIN emits the
+    OP_BeginSubrtn/OP_Once/.../OP_Return materialisation under
+    EP_Subrtn, and pX^.iTable caches the cursor.  The per-row residual
+    sqlite3ExprCodeIN call later in the loop body then short-circuits
+    through the EP_Subrtn cache fast-path (codegen.pas:23090) and emits
+    only the OP_Affinity + OP_NotFound test, matching the C oracle's
+    pre-loop-vs-in-loop placement.  Subselect IN-RHS (ExprUseXSelect)
+    stays out of the walk — sqlite3CodeRhsOfIN Case 1 is unported and
+    would soft-fallback to an empty eph table; deferring the pre-emit
+    keeps INDEX_IN_SUB on its existing pessimistic-false-jump path. }
+  for ii := 0 to pWInfo^.sWC.nBase - 1 do
+  begin
+    pTerm := @pWInfo^.sWC.a[ii];
+    if (pTerm^.wtFlags and (TERM_VIRTUAL or TERM_CODED)) <> 0 then continue;
+    if pTerm^.pExpr = nil then continue;
+    if pTerm^.pExpr^.op <> TK_IN then continue;
+    if not ExprUseXList(pTerm^.pExpr) then continue;
+    if pTerm^.pExpr^.x.pList = nil then continue;
+    { Skip ≤2-entry constant lists — sqlite3FindInIndex routes them through
+      IN_INDEX_NOOP (a sequence of OP_Eq comparisons), no eph table is
+      allocated.  Without this gate, the membership-only call would still
+      pick the NOOP path and not materialise, which is correct semantically
+      but pointless noise in the pre-emit walk. }
+    if (sqlite3InRhsIsConstant(pParse, pTerm^.pExpr) <> 0)
+       and (pTerm^.pExpr^.x.pList^.nExpr <= 2) then continue;
+    if ExprHasProperty(pTerm^.pExpr, EP_Subrtn) then continue;
+    sqlite3FindInIndex(pParse, pTerm^.pExpr,
+                       IN_INDEX_MEMBERSHIP,
+                       nil, nil, @iInTabDummy);
+  end;
 
   pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
   pLevel^.addrNxt  := pLevel^.addrBrk;
@@ -23081,10 +23120,35 @@ begin
   Assert(pX^.op = TK_IN);
   eType        := 0;
   mustBeUnique := (inFlags and IN_INDEX_LOOP) <> 0;
-  iTab         := pParse^.nTab;
-  Inc(pParse^.nTab);
   v := sqlite3GetVdbe(pParse);
   p := nil;
+
+  { Phase 6.9-bis 11g.2.f sub-progress 19 — IN-RHS materialisation cache.
+
+    If a prior call (typically the sqlite3WhereBegin pre-loop hoist walk)
+    already materialised the RHS of this TK_IN expression, the subroutine
+    body laid down at pX^.y.sub.iAddr remains valid for re-entry: every
+    materialisation site emits an OP_BeginSubrtn / OP_Once header that
+    skips re-execution, so per-row residual filter callers can reuse the
+    cached eph cursor (pX^.iTable) without re-emitting the materialisation
+    body.  EP_Subrtn marks the expression as already-cached.  Honour the
+    cache only when the caller's MEMBERSHIP / NOOP intent is satisfiable
+    by the eph table — IN_INDEX_LOOP (multi-pass index lookup) needs a
+    fresh allocation per call so it falls through. }
+  if ExprHasProperty(pX, EP_Subrtn) and ((inFlags and IN_INDEX_LOOP) = 0)
+     and (pX^.iTable > 0) then
+  begin
+    piTab^ := pX^.iTable;
+    if aiMap <> nil then
+    begin
+      n := sqlite3ExprVectorSize(pX^.pLeft);
+      for i := 0 to n - 1 do aiMap[i] := i;
+    end;
+    Exit(IN_INDEX_EPH);
+  end;
+
+  iTab := pParse^.nTab;
+  Inc(pParse^.nTab);
 
   { If the caller wants to know whether the RHS can contain NULL, and the
     RHS is a SELECT, scan its result list — if every column is provably NOT

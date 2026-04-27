@@ -2512,6 +2512,98 @@ Important: At the end of this document, please find:
       `sqlite3CodeRhsOfIN` Case 1 (subselect) for INDEX_IN_SUB.
       Two-table JOIN codegen for LEFT_JOIN / JOIN_WHERE remains the
       heaviest follow-on lift.
+    - [X] Sub-progress 19 — IN-RHS pre-loop hoisting + EP_Subrtn cache
+      fast-path (2026-04-27).  Two coupled landings:
+
+      (a) `sqlite3FindInIndex` (codegen.pas:23080) gains an EP_Subrtn cache
+      fast-path at function entry.  When the input expression already has
+      `EP_Subrtn` set (the marker `sqlite3CodeRhsOfIN` writes when it emits
+      the OP_BeginSubrtn / OP_Once / OP_OpenEphemeral / .../ OP_Return
+      materialisation block) and `pX^.iTable > 0`, the function returns
+      `IN_INDEX_EPH` with the cached cursor immediately — no fresh
+      `pParse^.nTab++` allocation, no second call into
+      `sqlite3CodeRhsOfIN`.  The cache is bypassed for `IN_INDEX_LOOP`
+      callers (multi-pass index scan needs a fresh cursor per call) so
+      the index-loop codegen path stays unaffected.  `aiMap` is still
+      populated (identity mapping) when requested, mirroring the
+      end-of-function aiMap path.  This mirrors the
+      `findCompatibleInRhsSubrtn` lookup in C expr.c (deferred port —
+      the upstream helper also walks a SubrtnSig table for cross-IN
+      reuse, which we sidestep by relying on the per-expression
+      EP_Subrtn flag alone).
+
+      (b) `sqlite3WhereBegin` (codegen.pas:12455) — pre-loop IN-RHS
+      hoisting walk inserted between `sqlite3OpenTable` and the case
+      dispatch (Case-2 SeekRowid / Case-3 IPK-range / full-scan
+      fallback).  Walks every base WHERE term that is NOT virtual, NOT
+      already TERM_CODED by the False-Bypass loop, and whose root
+      expression is a TK_IN with a literal-list RHS (`ExprUseXList`).
+      For each such term, calls `sqlite3FindInIndex(IN_INDEX_MEMBERSHIP)`
+      so the IN-RHS materialisation lands in the pre-loop section
+      (after OpenRead, before Rewind / Seek), matching the C oracle's
+      placement.  ≤2-entry constant lists are skipped — they route
+      through `IN_INDEX_NOOP` (a sequence of OP_Eq comparisons) and
+      do not allocate an eph table.  Subselect IN-RHS
+      (`ExprUseXSelect`) is excluded from the walk —
+      `sqlite3CodeRhsOfIN` Case 1 is unported, so a pre-emit there
+      would just emit an empty-eph soft-fallback that doesn't help
+      INDEX_IN_SUB and could regress its current
+      pessimistic-false-jump path.  The per-row residual call to
+      `sqlite3ExprCodeIN` later in the loop body picks up the cached
+      iTab through the EP_Subrtn fast-path from (a) and emits only
+      OP_Affinity + OP_NotFound — no duplicate
+      BeginSubrtn / Once / Return triplet inside the loop body.
+
+      Test-suite delta:
+        * TestWhereCorpus: stays at `15 PASS / 5 DIVERGE / 0 ERROR`.
+          Failure-mode tally unchanged at `0 exception, 0 nil-Vdbe,
+          4 op-count, 1 op-diff`.  IPK_IN's first divergence point
+          moves from `op[3]` (sub-progress 18) to `op[2]` (this
+          landing): Pas now emits BeginSubrtn at addr 2 (matching C's
+          BeginSubrtn at addr 2) instead of inside the loop body
+          after Rewind.  The remaining op[2] divergence is a
+          regReturn register-allocation slip (C uses r2 because the
+          IPK-IN-scan plan's `codeAllEqualityTerms` allocates one
+          rowid-seek register first, bumping nMem to 1; Pas uses r1
+          because the residual-filter plan allocates nothing before
+          CodeRhsOfIN).  Closing this gap requires the full IPK-IN
+          scan plan in `whereShortCut` + Case-2 IPK-IN codegen
+          (deferred to sub-progress 20+).  INDEX_IN now also opens
+          with BeginSubrtn at the right pre-loop slot (was at op[3]
+          inside loop, now hoisted) — Pas op count drops from 26 to
+          ~stays at 26 with the same materialisation block, just
+          repositioned.  INDEX_IN_SUB unchanged on the
+          pessimistic-false-jump path (still 10 ops, awaiting Case 1
+          sqlite3SelectDup port).
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41,
+          TestVdbeApi 57/57, TestVdbeMisc 45/45, TestVdbeMem 62/62,
+          TestVdbeAux 108/108, TestVdbeRecord 13/13, TestVdbeAgg
+          11/11, TestVdbeStr 23/23, TestVdbeBlob 13/13, TestVdbeSort
+          14/14, TestVdbeCursor 27/27, TestVdbeVtabExec 50/50,
+          TestExplainParity 2/10 unchanged, TestBtreeCompat 337/337,
+          TestPrintf 105/105, TestJson 434/434, TestJsonEach 50/50,
+          TestTokenizer 127/127, TestRegistration 19/19,
+          TestExecGetTable 23/23, TestBackup 20/20,
+          TestInitShutdown 27/27, TestUnlockNotify 14/14,
+          TestLoadExt 20/20, TestAuthBuiltins 34/34, TestOpenClose
+          17/17, TestInitCallback 29/29, TestConfigHooks 54/54,
+          TestSmoke + TestUtil + TestPCache + TestOSLayer green.
+
+      Sub-progress 20 must port the IPK-IN scan plan: extend
+      `whereShortCut` with a WO_IN arm that recognises rowid IN
+      literal-list and builds a `WHERE_IPK | WHERE_COLUMN_IN` plan,
+      then add a Case-2 IPK-IN codegen arm in `sqlite3WhereBegin`
+      that opens the pre-materialised eph cursor as the OUTER loop,
+      iterates with OP_Column + OP_IsNull + OP_SeekRowid into the
+      main table, and emits the OP_Next on the eph cursor as the
+      loop tail.  This is the lift that flips IPK_IN to PASS.  The
+      analogous INDEX_IN scan plan (DeferredSeek + composite index)
+      and `sqlite3SelectDup` for INDEX_IN_SUB Case 1 follow.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
