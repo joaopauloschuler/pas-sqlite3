@@ -286,6 +286,27 @@ Important: At the end of this document, please find:
       arms + mismatched-column negative case), WUPI1..WUPI3
       (partial-idx col1 NOTNULL usable when WHERE has col1=5;
       JT_LTORJ short-circuit; partial col1=99 not usable).
+    - [X] DISTINCT-redundancy UNIQUE-index cluster — `indexColumnNotNull`
+      (where.c:613..627), `findIndexCol` (where.c:583..608), and the (b)
+      branch of `isDistinctRedundant` (where.c:678..691).  Walks the
+      table's pIndex chain looking for a UNIQUE non-partial index whose
+      every key column is either pinned by a WO_EQ WHERE term
+      (`sqlite3WhereFindTerm`) or named in the DISTINCT list with a NOT
+      NULL constraint.  `indexColumnNotNull` decodes the three slot
+      kinds: aiColumn[i]>=0 → column's notNull bitfield (low nibble of
+      `typeFlags`); =-1 → IPK rowid alias, always NOT NULL; =-2
+      (XN_EXPR) → indexed expression, conservatively nullable.
+      `findIndexCol` walks pList through `sqlite3ExprSkipCollateAndLikely`,
+      gates on TK_COLUMN/TK_AGG_COLUMN, matches (iTable, iColumn), and
+      consults `sqlite3ExprNNCollSeq` for collation parity (Phase 6.6
+      stub returns nil → conservative match path so the BINARY-default
+      corpus works without false negatives).  Gate:
+      `TestWherePlanner.pas` (170/170): ICN1..ICN6 (NOT NULL nibble
+      decode across notNull=1, nullable=0, OE_Replace=5, rowid alias,
+      XN_EXPR), FIC1..FIC4 (cursor + column match, wrong cursor, non-
+      column entry skip), IDR1..IDR6 (UNIQUE NOT NULL covered, missing
+      column, nullable disqualifier, partial-index disqualifier, non-
+      UNIQUE disqualifier, IPK fast-path).
     - [X] `whereRangeScanEst` (where.c:2092..2254, no-STAT4 tail) —
       reduces `pLoop^.nOut` to account for the leftover range
       constraints on the leading (nEq+1)'th column of the index pLoop

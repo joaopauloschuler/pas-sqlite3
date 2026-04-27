@@ -1606,6 +1606,224 @@ begin
         whereUsablePartialIndex(0, 0, pWC, pPartEq) = 0);
 end;
 
+{ ----- indexColumnNotNull (where.c:613..627) ----- }
+
+procedure TestIndexColumnNotNull;
+var
+  tab:    TTable;
+  cols:   array[0..2] of TColumn;
+  idx:    TIndex;
+  aiCol:  array[0..3] of i16;
+begin
+  FillChar(tab,  SizeOf(tab), 0);
+  FillChar(cols, SizeOf(cols), 0);
+  FillChar(idx,  SizeOf(idx), 0);
+
+  { Layout three columns: col0 NOT NULL, col1 nullable, col2 NOT NULL }
+  cols[0].typeFlags := $01;        { notNull = 1 (low nibble) }
+  cols[1].typeFlags := $00;        { notNull = 0 }
+  cols[2].typeFlags := $05;        { notNull = 5 (any non-zero is "constrained") }
+  tab.aCol := @cols[0];
+
+  { Index over (col0, col1, rowid, indexed-expr) }
+  aiCol[0] := 0; aiCol[1] := 1; aiCol[2] := -1; aiCol[3] := -2; { -2 = XN_EXPR }
+  idx.aiColumn := @aiCol[0];
+  idx.nColumn  := 4;
+  idx.pTable   := @tab;
+
+  Check('ICN1 col0 NOT NULL → 1',     indexColumnNotNull(@idx, 0) = 1);
+  Check('ICN2 col1 nullable → 0',     indexColumnNotNull(@idx, 1) = 0);
+  Check('ICN3 col2 OE_Replace → 5',   indexColumnNotNull(@idx, 0) = 1);
+  Check('ICN4 rowid alias (-1) → 1',  indexColumnNotNull(@idx, 2) = 1);
+  Check('ICN5 indexed-expr (-2) → 0', indexColumnNotNull(@idx, 3) = 0);
+
+  { Pick a column whose notNull byte holds the OE_Replace constant 5 to
+    confirm the masking is to the low nibble only. }
+  aiCol[0] := 2;
+  Check('ICN6 typeFlags low nibble = OE_Replace=5',
+        indexColumnNotNull(@idx, 0) = 5);
+end;
+
+{ ----- findIndexCol (where.c:583..608) -----
+
+  Phase 6.6 stub keeps sqlite3ExprNNCollSeq returning nil; findIndexCol's
+  fallback then accepts the first matching (cursor, column) entry.  The
+  test exercises that path: the collation-mismatch arm becomes a dead
+  branch under the stub. }
+
+procedure TestFindIndexCol;
+var
+  parse:  TParse;
+  idx:    TIndex;
+  aiCol:  array[0..1] of i16;
+  azColl: array[0..1] of PAnsiChar;
+  listBuf: array[0 .. SizeOf(TExprList) + 3*SizeOf(TExprListItem) - 1] of Byte;
+  pList:  PExprList;
+  items:  PExprListItem;
+  e0, e1, e2: TExpr;
+  zBin:   array[0..6] of AnsiChar;
+begin
+  FillChar(parse,   SizeOf(parse), 0);
+  FillChar(idx,     SizeOf(idx),   0);
+  FillChar(listBuf, SizeOf(listBuf), 0);
+  FillChar(e0, SizeOf(e0), 0);
+  FillChar(e1, SizeOf(e1), 0);
+  FillChar(e2, SizeOf(e2), 0);
+
+  zBin[0]:='B'; zBin[1]:='I'; zBin[2]:='N'; zBin[3]:='A'; zBin[4]:='R';
+  zBin[5]:='Y'; zBin[6]:=#0;
+
+  aiCol[0]  := 5;
+  aiCol[1]  := 7;
+  azColl[0] := @zBin[0];
+  azColl[1] := @zBin[0];
+  idx.aiColumn := @aiCol[0];
+  idx.azColl   := @azColl[0];
+  idx.nKeyCol  := 2;
+  idx.nColumn  := 2;
+
+  pList := PExprList(@listBuf[0]);
+  pList^.nExpr := 3;
+  items := ExprListItems(pList);
+
+  { e0 references cursor 9, column 99 — no match. }
+  e0.op := TK_COLUMN; e0.iTable := 9; e0.iColumn := 99;
+  { e1 matches: cursor 9, column 5 → the iCol=0 of pIdx. }
+  e1.op := TK_COLUMN; e1.iTable := 9; e1.iColumn := 5;
+  { e2 matches: cursor 9, column 7 → the iCol=1 of pIdx. }
+  e2.op := TK_AGG_COLUMN; e2.iTable := 9; e2.iColumn := 7;
+
+  items[0].pExpr := @e0;
+  items[1].pExpr := @e1;
+  items[2].pExpr := @e2;
+
+  Check('FIC1 finds matching col0 at list[1]',
+        findIndexCol(@parse, pList, 9, @idx, 0) = 1);
+  Check('FIC2 finds matching col1 at list[2]',
+        findIndexCol(@parse, pList, 9, @idx, 1) = 2);
+
+  { Wrong cursor in every entry → -1. }
+  e1.iTable := 11;
+  e2.iTable := 11;
+  Check('FIC3 wrong cursor → -1',
+        findIndexCol(@parse, pList, 9, @idx, 0) = -1);
+
+  { Wrong op (skipped after sqlite3ExprSkipCollateAndLikely). }
+  e1.iTable := 9; e1.iColumn := 5; e1.op := TK_INTEGER;
+  e2.iTable := 9; e2.iColumn := 7; { still TK_AGG_COLUMN }
+  Check('FIC4 non-column entry skipped',
+        findIndexCol(@parse, pList, 9, @idx, 0) = -1);
+end;
+
+{ ----- isDistinctRedundant — (b) UNIQUE-index branch (where.c:678..691) ----- }
+
+procedure TestIsDistinctRedundant;
+var
+  parse:    TParse;
+  wInfo:    TWhereInfo;
+  pWC:      PWhereClause;
+  tab:      TTable;
+  cols:     array[0..2] of TColumn;
+  idx:      TIndex;
+  aiCol:    array[0..1] of i16;
+  azColl:   array[0..1] of PAnsiChar;
+  zBin:     array[0..6] of AnsiChar;
+  srcBuf:   array[0 .. SizeOf(TSrcList) + 1*SizeOf(TSrcItem) - 1] of Byte;
+  pSrc:     PSrcList;
+  srcItems: PSrcItem;
+  distBuf:  array[0 .. SizeOf(TExprList) + 2*SizeOf(TExprListItem) - 1] of Byte;
+  pDist:    PExprList;
+  dItems:   PExprListItem;
+  d0, d1:   TExpr;
+begin
+  FillChar(parse,   SizeOf(parse), 0);
+  FillChar(wInfo,   SizeOf(wInfo), 0);
+  FillChar(tab,     SizeOf(tab),   0);
+  FillChar(cols,    SizeOf(cols),  0);
+  FillChar(idx,     SizeOf(idx),   0);
+  FillChar(srcBuf,  SizeOf(srcBuf),0);
+  FillChar(distBuf, SizeOf(distBuf),0);
+  FillChar(d0, SizeOf(d0), 0);
+  FillChar(d1, SizeOf(d1), 0);
+
+  zBin[0]:='B'; zBin[1]:='I'; zBin[2]:='N'; zBin[3]:='A'; zBin[4]:='R';
+  zBin[5]:='Y'; zBin[6]:=#0;
+
+  pWC := @wInfo.sWC;
+  pWC^.pWInfo := @wInfo;
+  pWC^.nTerm  := 0;             { empty WHERE — every key column gates on (ii) }
+  wInfo.pParse := @parse;
+
+  { Two NOT NULL columns. }
+  cols[0].typeFlags := $01;
+  cols[1].typeFlags := $01;
+  cols[2].typeFlags := $00;     { col2 nullable — used in IDR4 negative case }
+  tab.aCol := @cols[0];
+
+  { UNIQUE index over (col0, col1) — onError <> OE_None, no partial WHERE. }
+  aiCol[0] := 0; aiCol[1] := 1;
+  azColl[0] := @zBin[0]; azColl[1] := @zBin[0];
+  idx.aiColumn := @aiCol[0];
+  idx.azColl   := @azColl[0];
+  idx.nKeyCol  := 2;
+  idx.nColumn  := 2;
+  idx.onError  := 1;            { OE_Rollback — anything <> OE_None }
+  idx.pPartIdxWhere := nil;
+  idx.pNext    := nil;
+  idx.pTable   := @tab;
+  tab.pIndex   := @idx;
+
+  { FROM table at cursor 4. }
+  pSrc := PSrcList(@srcBuf[0]);
+  pSrc^.nSrc := 1;
+  srcItems := SrcListItems(pSrc);
+  srcItems[0].iCursor := 4;
+  srcItems[0].pSTab   := @tab;
+
+  pDist := PExprList(@distBuf[0]);
+  pDist^.nExpr := 2;
+  dItems := ExprListItems(pDist);
+
+  { d0 → col0 of cursor 4, d1 → col1 of cursor 4. }
+  d0.op := TK_COLUMN; d0.iTable := 4; d0.iColumn := 0;
+  d1.op := TK_COLUMN; d1.iTable := 4; d1.iColumn := 1;
+  dItems[0].pExpr := @d0;
+  dItems[1].pExpr := @d1;
+
+  { IDR1: every key column named in DISTINCT + NOT NULL → redundant. }
+  Check('IDR1 UNIQUE NOT NULL covered by DISTINCT → 1',
+        isDistinctRedundant(@parse, pSrc, pWC, pDist) = 1);
+
+  { IDR2: drop col1 from DISTINCT → not redundant. }
+  pDist^.nExpr := 1;
+  Check('IDR2 missing col1 → 0',
+        isDistinctRedundant(@parse, pSrc, pWC, pDist) = 0);
+
+  { IDR3: nullable column breaks the gate even when listed. }
+  pDist^.nExpr := 2;
+  cols[1].typeFlags := $00;     { col1 now nullable }
+  Check('IDR3 nullable col disqualifies → 0',
+        isDistinctRedundant(@parse, pSrc, pWC, pDist) = 0);
+  cols[1].typeFlags := $01;
+
+  { IDR4: partial index disqualifies the whole index. }
+  idx.pPartIdxWhere := PExpr(Pointer(PtrUInt($1)));
+  Check('IDR4 partial-idx disqualified → 0',
+        isDistinctRedundant(@parse, pSrc, pWC, pDist) = 0);
+  idx.pPartIdxWhere := nil;
+
+  { IDR5: non-UNIQUE index disqualifies. }
+  idx.onError := OE_None;
+  Check('IDR5 non-UNIQUE disqualified → 0',
+        isDistinctRedundant(@parse, pSrc, pWC, pDist) = 0);
+  idx.onError := 1;
+
+  { IDR6: IPK fast-path (a) — DISTINCT on rowid alias short-circuits. }
+  d0.iColumn := -1;             { rowid }
+  Check('IDR6 IPK fast-path → 1',
+        isDistinctRedundant(@parse, pSrc, pWC, pDist) = 1);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -1630,6 +1848,9 @@ begin
   TestTermCanDriveIndex;
   TestTermCanDriveIndexGate;
   TestExprImplies;
+  TestIndexColumnNotNull;
+  TestFindIndexCol;
+  TestIsDistinctRedundant;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

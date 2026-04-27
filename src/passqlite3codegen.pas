@@ -1682,6 +1682,23 @@ function  termCanDriveIndex(pTerm: PWhereTerm; pSrc: PSrcItem;
   notReady: Bitmask): i32;
 function  indexHasStat1(pIdx: PIndex2): i32; inline;
 
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — UNIQUE-index DISTINCT cluster
+  (where.c:583..627).  Two leaf helpers feeding the (b) branch of
+  isDistinctRedundant:
+
+    * findIndexCol     (where.c:583..608) — locates an entry in pList that
+                       references the iCol-th column of pIdx via the same
+                       cursor and a matching collation.
+    * indexColumnNotNull (where.c:613..627) — true iff the iCol-th column of
+                       pIdx is constrained NOT NULL.  Indexed expressions
+                       (aiColumn[i] = -2 / XN_EXPR) are conservatively
+                       reported as nullable. }
+function  findIndexCol(pParse: PParse; pList: PExprList; iBase: i32;
+  pIdx: PIndex2; iCol: i32): i32;
+function  indexColumnNotNull(pIdx: PIndex2; iCol: i32): i32;
+function  isDistinctRedundant(pParse: PParse; pTabList: PSrcList;
+  pWC: PWhereClause; pDistinct: PExprList): i32;
+
 { whereUsablePartialIndex (where.c:3699..3728).  Decides whether a
   partial index whose creation predicate is pWhere can be used to
   service the query at iTab.  An index is usable if every conjunct
@@ -8692,6 +8709,89 @@ begin
   end;
 end;
 
+{ indexColumnNotNull — port of where.c:613..627.
+
+  Returns 1 iff the iCol-th key column of pIdx is constrained NOT NULL.
+  Three slot kinds:
+    * aiColumn[iCol] >= 0      — ordinary column; consult the column's
+                                 notNull bitfield (low nibble of typeFlags).
+    * aiColumn[iCol] = -1      — INTEGER PRIMARY KEY rowid alias; rowids
+                                 are inherently NOT NULL.
+    * aiColumn[iCol] = -2 (XN_EXPR) — indexed expression; conservatively
+                                 reported nullable (the expression body
+                                 might evaluate to NULL even when each
+                                 referenced column is NOT NULL). }
+function indexColumnNotNull(pIdx: PIndex2; iCol: i32): i32;
+var
+  j: i32;
+begin
+  Assert(pIdx <> nil);
+  Assert((iCol >= 0) and (iCol < i32(pIdx^.nColumn)));
+  j := pIdx^.aiColumn[iCol];
+  if j >= 0 then
+    Result := i32(pIdx^.pTable^.aCol[j].typeFlags and $0F)
+  else if j = -1 then
+    Result := 1
+  else
+  begin
+    Assert(j = -2);
+    Result := 0;  { indexed expression — assume potentially NULL }
+  end;
+end;
+
+{ findIndexCol — port of where.c:583..608.
+
+  Searches pList for an entry that references the iCol-th column of pIdx
+  via cursor iBase, with a matching collation.  Returns the list index on
+  hit, or -1.
+
+  The C version asserts ALWAYS(p!=0) on the skipped expression and calls
+  sqlite3ExprNNCollSeq() (non-null contract) for the match candidate.
+  Until the Phase 6.6 collation port lands, sqlite3ExprNNCollSeq is a
+  stub that returns nil.  We fall back to "treat unknown collation as
+  matching" so the BINARY-default corpus works without false negatives;
+  once Phase 6.6 wires real CollSeq objects, this fallback becomes a
+  dead branch (pColl is then never nil per the upstream contract). }
+function findIndexCol(pParse: PParse; pList: PExprList; iBase: i32;
+  pIdx: PIndex2; iCol: i32): i32;
+var
+  i:      i32;
+  p:      PExpr;
+  items:  PExprListItem;
+  zColl:  PAnsiChar;
+  azColl: PPAnsiChar;
+  pColl:  Pointer;
+  pCS:    PTCollSeq;
+begin
+  azColl := PPAnsiChar(pIdx^.azColl);
+  zColl  := azColl[iCol];
+  items  := ExprListItems(pList);
+  for i := 0 to pList^.nExpr - 1 do
+  begin
+    p := sqlite3ExprSkipCollateAndLikely(items[i].pExpr);
+    if (p <> nil)
+       and ((p^.op = TK_COLUMN) or (p^.op = TK_AGG_COLUMN))
+       and (p^.iColumn = pIdx^.aiColumn[iCol])
+       and (p^.iTable  = iBase) then
+    begin
+      pColl := sqlite3ExprNNCollSeq(pParse, items[i].pExpr);
+      if pColl = nil then
+      begin
+        { Phase 6.6 stub fallback: treat as matching (BINARY default). }
+        Result := i;
+        Exit;
+      end;
+      pCS := PTCollSeq(pColl);
+      if sqlite3StrICmp(pCS^.zName, zColl) = 0 then
+      begin
+        Result := i;
+        Exit;
+      end;
+    end;
+  end;
+  Result := -1;
+end;
+
 { whereRangeScanEst — port of where.c:2092..2254 (no-STAT4 variant).
 
   Reduces pLoop^.nOut to account for the leftover range constraints on the
@@ -8753,7 +8853,7 @@ begin
   Result := rc;
 end;
 
-{ isDistinctRedundant — port of where.c:629..685.
+{ isDistinctRedundant — port of where.c:629..694.
 
   A DISTINCT list is redundant when any subset of the listed columns is
   already collectively unique and individually non-null, so DISTINCT
@@ -8761,26 +8861,22 @@ end;
 
   Two checks fire:
     (a) IPK column on the single FROM-clause table — INTEGER PRIMARY KEY
-        rowid alias, so always unique + NOT NULL.  Fully ported here
-        (the only check the current corpus exercises).
+        rowid alias, so always unique + NOT NULL.
     (b) UNIQUE-index loop — for each unique non-partial index on the
-        single FROM-clause table, every key column must either be
-        named in the DISTINCT list or pinned to a constant via a WO_EQ
-        WHERE term, with NOT NULL covering any column not pinned by a
-        WHERE term.  Deferred to 11g.2.c: requires sqlite3WhereFindTerm
-        + findIndexCol + indexColumnNotNull, all unported until the
-        whereexpr.c port lands.  The skip is conservative — returning 0
-        tells the caller DISTINCT is *not* redundant, so the worst that
-        happens is a redundant DISTINCT pass survives one more layer.
-
-  Mirrors the C exactly for the IPK fast-path so the future 11g.2.c
-  follow-up only adds the index loop body without touching this skeleton. }
+        single FROM-clause table, every key column must either
+          (i)  be pinned to a constant via a WO_EQ WHERE term
+               (sqlite3WhereFindTerm), or
+          (ii) be named in the DISTINCT list (findIndexCol) AND
+               carry a NOT NULL constraint (indexColumnNotNull).
+        If every key column passes one of those two gates, the index
+        proves DISTINCT is redundant. }
 function isDistinctRedundant(pParse: PParse; pTabList: PSrcList;
   pWC: PWhereClause; pDistinct: PExprList): i32;
 var
   i:     i32;
   iBase: i32;
   pTab:  PTable2;
+  pIdx:  PIndex2;
   p:     PExpr;
   items: PExprListItem;
 begin
@@ -8800,10 +8896,33 @@ begin
       Exit(1);
   end;
 
-  { (b) UNIQUE-index loop: deferred to 11g.2.c (whereexpr.c port).
-    pTab^.pIndex chain walk + sqlite3WhereFindTerm + findIndexCol +
-    indexColumnNotNull.  Conservative: report not-redundant. }
-  if pTab = nil then ; { silence "unused" once the loop below lands }
+  { (b) UNIQUE-index loop (where.c:678..691). }
+  if pTab = nil then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  pIdx := pTab^.pIndex;
+  while pIdx <> nil do
+  begin
+    if (pIdx^.onError <> OE_None) and (pIdx^.pPartIdxWhere = nil) then
+    begin
+      i := 0;
+      while i < i32(pIdx^.nKeyCol) do
+      begin
+        if sqlite3WhereFindTerm(pWC, iBase, i, not Bitmask(0),
+                                WO_EQ, pIdx) = nil then
+        begin
+          if findIndexCol(pParse, pDistinct, iBase, pIdx, i) < 0 then Break;
+          if indexColumnNotNull(pIdx, i) = 0 then Break;
+        end;
+        Inc(i);
+      end;
+      if i = i32(pIdx^.nKeyCol) then
+        Exit(1);
+    end;
+    pIdx := pIdx^.pNext;
+  end;
 
   Result := 0;
 end;
