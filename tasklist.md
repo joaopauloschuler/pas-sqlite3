@@ -191,20 +191,6 @@ Important: At the end of this document, please find:
     / 0 ERROR (corpus = 92); TestExplainParity 2 PASS / 8 DIVERGE / 0
     ERROR (corpus = 10).**  Scaffold and progress through sub-progresses
     1..46 are recorded in git history (`git log --grep="11g.2.f"`).
-    Sub-progress 43 ported the where.c:7732..7886 Index→table column
-    rewrite tail in `sqlite3WhereEnd`, flipping JOIN_WHERE.
-    Sub-progress 44 fixed `sqlite3SrcListShiftJoinType` (was a clearing
-    stub; now mirrors build.c:5219), flipping LEFT_JOIN from DIVERGE to
-    PASS.  Sub-progress 45 made `sqlite3ErrorMsg` actually populate
-    `pParse^.zErrMsg` (mirrors build.c) so further probes return the
-    real error text.  Sub-progress 46 generalised
-    `emitSchemaRowInsert` to take regRoot + zTblName as parameters and
-    rewired `sqlite3CreateIndex` to use it instead of
-    `sqlite3NestedParse('INSERT INTO sqlite_master ... #%d ...')` —
-    flipping the CREATE INDEX / CREATE UNIQUE INDEX rows from
-    nil-Vdbe ERROR to DIVERGE-op-count (Pas emits 19 ops vs C 37/41,
-    same shape-class as the CREATE TABLE rows).  CREATE INDEX now
-    succeeds end-to-end (`sqlite3_exec` rc=0).
 
     **Open DIVERGE rows:**
       * `EXISTS_SUB` (Pas=22, C=30): Pas emits a correct correlated
@@ -215,37 +201,24 @@ Important: At the end of this document, please find:
         Companion `NOT_EXISTS` already PASSes via the correlated path.
 
     **Open follow-on:** Re-enable productive tails in `sqlite3DeleteFrom`
-    (`passqlite3codegen.pas:16844` — needs `sqlite3WhereBegin` body +
-    `sqlite3GenerateRowDelete`; the step-11f guard at lines 16790..16793
-    snapshots/restores `nErr/rc/zErrMsg` to hide stub state and must
-    drop) and `sqlite3Update` (still skeleton-only — blocks CREATE
-    TABLE NestedParse UPDATE of the placeholder sqlite_master row, see
-    11g.2.f open-DIVERGE rows below).  Re-enable any disabled assertions
-    / safety-net guards left during 11g.2.b..e.
+    (`passqlite3codegen.pas:17269` — needs `sqlite3WhereBegin` body +
+    `sqlite3GenerateRowDelete` (currently a Phase 6.4 stub at
+    `passqlite3codegen.pas:17399`); the step-11f skeleton-guard at
+    lines 17312..17321 / 17385..17390 snapshots/restores
+    `nErr/rc/zErrMsg` to hide stub state and must drop) and
+    `sqlite3Update` (`passqlite3codegen.pas:17548` — still
+    skeleton-only, mirror guard at 17605..17616 / 17687..17692; blocks
+    CREATE TABLE NestedParse UPDATE of the placeholder sqlite_master
+    row).  Re-enable any disabled assertions / safety-net guards left
+    during 11g.2.b..e.
 
-    **CREATE INDEX nil-Vdbe — RESOLVED 2026-04-27 (sub-progress 46):**
-    Bug (b) is fixed.  `sqlite3CreateIndex` now reuses
-    `emitSchemaRowInsert` (parametrised with regRoot + zTblName) for
-    the schema-row write instead of `sqlite3NestedParse('INSERT INTO
-    sqlite_master VALUES(... #%d ...)')`.  Empirical end-to-end check:
-    CREATE TABLE + CREATE INDEX both return rc=0 via `sqlite3_exec`,
-    and the rows materialise in sqlite_master (verified via
-    `SELECT name FROM sqlite_master WHERE type='table'` returning the
-    expected row, and `tblHash.count` becoming 2 after CT).
-    Earlier-reported "SELECT count(*) FROM sqlite_master returns 0"
-    was a separate count(*)-on-aggregateless-internal-table glitch and
-    not a sign that the INSERT failed.
-
-    Bug (a) — the schema-publish gap noted earlier (init.busy=0 tail
-    of `sqlite3EndTable` not populating `pSchema^.tblHash` directly) —
-    is no longer load-bearing: OP_ParseSchema at the tail of CT now
-    correctly rebuilds tblHash from the row that emitSchemaRowInsert
-    wrote.  The CREATE TABLE / CREATE INDEX DIVERGE-op-count rows in
-    TestExplainParity (Pas=21/19 vs C=32/37/41) are now the same
-    structural-difference shape as the existing prologue/scope-emit
-    deltas — the gap is in extra C-side guards (auth + extra
-    ParseSchema reparse + scope unwind) that Pas elides today, not a
-    correctness bug.  Driving them to PASS is a 6.10-scoped follow-on.
+    **CREATE TABLE / CREATE INDEX DIVERGE-op-count rows** in
+    TestExplainParity (Pas=21/19 vs C=32/37/41) are structural —
+    the gap is in extra C-side guards (auth + extra ParseSchema
+    reparse + scope unwind) that Pas elides today, not a correctness
+    bug.  CREATE TABLE + CREATE INDEX both return rc=0 via
+    `sqlite3_exec` and rows materialise in sqlite_master.  Driving
+    these to PASS is a 6.10-scoped follow-on.
 
     **EXISTS_SUB DIVERGE — confirmed strategy-difference, not a
     correctness gap (2026-04-27 investigation):** Pas's plain
