@@ -85,9 +85,24 @@ Important: At the end of this document, please find:
           `sqlite3Insert`).
         [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
           VALUES path).
-        [ ] `SELECT a FROM t WHERE rowid=1 OR rowid=2` — Δ=5 (rowid
-          OR-decomposed path; planner reaches multi-loop branch but
-          counters disagree).
+        [ ] **CORRECTNESS BUG** `SELECT a FROM t WHERE rowid=1 OR
+          rowid=2` and `SELECT a FROM t WHERE rowid IN (1,2)` —
+          both return *zero rows* instead of the matching rows.
+          Repro: `CREATE TABLE t(a,b,c); INSERT INTO t VALUES(10,1,1),
+          (20,2,2),(30,3,3); SELECT a FROM t WHERE rowid=1 OR rowid=2;`
+          (Pas: empty, C: 10/20).  Plain `WHERE a=10 OR a=20` is
+          correct, so the bug is specific to the rowid-OR-EQ /
+          rowid-IN-list planner+codegen path.  Bytecode dump shows
+          Pas emits a single Rewind/scan with garbled term codegen
+          (Column→reg, IsNull, SeekRowid p3=col-reg — using col `a`
+          as a rowid! — then Rowid+Eq+Ne against integer constants),
+          where C builds an ephemeral-rowset OR-decomposed plan
+          (BeginSubrtn / Once / OpenEphemeral / two IdxInsert /
+          Rewind+SeekRowid loop).  Likely root cause:
+          `whereLoopAddOr` not reaching the rowid-IN-rewrite, or
+          `sqlite3WhereCodeOneLoopStart`'s OR arm falling through to
+          the scan path with the OR-term incorrectly classified as a
+          column-EQ.  Found 2026-04-27.
         [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
         [ ] `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3
