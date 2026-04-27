@@ -2959,6 +2959,83 @@ Important: At the end of this document, please find:
       follow-on under sub-progress 25, blocked on no immediate
       corpus dependency.  LEFT_JOIN / JOIN_WHERE stay the residual
       multi-table-planner divergences awaiting 11g.2.d.
+    - [X] Sub-progress 24 — Bloom-filter machinery for IN-RHS subselect
+      materialisation (2026-04-27).  Three coupled landings flip
+      INDEX_IN_SUB from `op-count C=28 Pas=25` to PASS (28 ops
+      byte-for-byte against the C oracle):
+
+      (a) `sqlite3CodeRhsOfIN` Case-1 (codegen.pas:23215..23232) —
+      ahead of the `sqlite3SelectDup` recursion, when the Once-gated
+      subroutine wrapper is active (`addrOnce <> 0`), the caller
+      authorised Bloom-filter construction (`bloomOk <> 0`), and the
+      connection has `SQLITE_BloomFilter` enabled, allocate a fresh
+      `regBloom` slot via `++pParse^.nMem` and emit `OP_Blob 10000,
+      regBloom` (mirrors expr.c:3722..3725).  Stash the register into
+      `destSet.iSDParm2` so the inner `sqlite3Select`'s SRT_Set
+      disposal can chain `OP_FilterAdd` per row.  After
+      `sqlite3Select` returns, write `dest.iSDParm2` into the
+      `OP_Once` op's `p3` slot at `addrOnce` (the `tag-202407032019`
+      contract — `sqlite3ExprCodeIN` reads this slot to decide
+      whether to emit the per-row `OP_Filter` probe), and shrink the
+      `OP_Blob` to a 10-byte placeholder when iSDParm2 was cleared
+      out (e.g. by a sorter-disabled disposal arm — mirrors
+      expr.c:3733..3740).  No code change to the EP_Subrtn marking
+      or the keyinfo-collation pass; both stay as in sub-progress 23.
+
+      (b) `sqlite3Select` SRT_Set arm (codegen.pas:15175..15179) —
+      after the `OP_MakeRecord + OP_IdxInsert` pair that hashes the
+      result row into the eph cursor, when `pDest^.iSDParm2 <> 0`,
+      emit `OP_FilterAdd pDest^.iSDParm2, 0, pDest^.iSdst,
+      nResultCol` so the just-materialised row is recorded into the
+      Bloom filter (mirrors select.c:1399..1403, the
+      selectInnerLoop SRT_Set arm).  The temp-register `r1`
+      release stays at the tail.
+
+      (c) `sqlite3ExprCodeIN` IN_INDEX_EPH path
+      (codegen.pas:23397..23415) — between the `OP_IsNull` Step-2
+      guards and the combined Step3+Step5 `OP_NotFound`, when the
+      RHS is wrapped in an EP_Subrtn cache, look up the OP_Once at
+      `pExpr^.y.sub.iAddr` and check the stashed `p3` slot.  When
+      non-zero (a Bloom register from sub-progress 24(a)), emit
+      `OP_Filter pOp^.p3, destIfFalse, rLhs, nVector` ahead of the
+      NotFound — the membership pre-test short-circuits the binary
+      search on a confirmed miss (mirrors expr.c:4211..4219).  The
+      C-side `assert OptimizationEnabled(SQLITE_BloomFilter)` is
+      implicit in the `p3 > 0` guard because sub-progress 24(a)
+      never lights the slot when the optimisation is disabled.
+
+      Test-suite delta:
+        * TestWhereCorpus: **17 → 18 PASS / 3 → 2 DIVERGE / 0 ERROR**.
+          INDEX_IN_SUB flipped to PASS at 28 ops, byte-for-byte
+          identical to the C oracle (Init / OpenRead / Rewind / Noop /
+          BeginSubrtn / Once / OpenAutoindex / Blob / Rewind /
+          Column(s) / MakeRecord / FilterAdd / IdxInsert / Next /
+          Integer / NullRow / Return / … / Affinity / Filter /
+          NotFound / ResultRow / Halt).  Failure-mode tally:
+          `0 exception, 0 nil-Vdbe, 2 op-count, 0 op-diff` — the
+          remaining two op-count divergences are LEFT_JOIN and
+          JOIN_WHERE, both awaiting 11g.2.d's multi-table planner.
+          Per-shape histogram: INDEX_IN_SUB 1/0; LEFT_JOIN 0/1;
+          JOIN_WHERE 0/1.
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41,
+          TestVdbeApi 57/57, TestVdbeMisc 45/45, TestVdbeMem 62/62,
+          TestVdbeAux 108/108, TestExplainParity 2/10 unchanged,
+          TestPrintf 105/105, TestJson 434/434, TestTokenizer
+          127/127, TestRegistration 19/19, TestSmoke green.
+
+      Sub-progress 25 will tackle LEFT_JOIN / JOIN_WHERE — both block
+      on the multi-table planner port from 11g.2.d (whereLoopAddBtree
+      + wherePathSolver multi-level path search).  The
+      `findCompatibleInRhsSubrtn` SubrtnSig-based cross-IN cache
+      (expr.c:3585..3656) remains a deferred optimisation with no
+      immediate corpus dependency — re-visit once the multi-table
+      shapes land or the corpus expands to drive correlated-IN
+      shapes that exercise the cache.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

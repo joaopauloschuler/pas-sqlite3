@@ -15174,6 +15174,9 @@ begin
       pDest^.zAffSdst, nResultCol);
     sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, i,
       pDest^.iSdst, nResultCol);
+    if pDest^.iSDParm2 <> 0 then
+      sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pDest^.iSDParm2, 0,
+        pDest^.iSdst, nResultCol);
     sqlite3ReleaseTempReg(pParse, i);
   end;
 
@@ -23169,6 +23172,9 @@ var
   pELItm2:     PExprListItem;
   pVecField:   PExpr;
   nValSel:     i32;
+  addrBloom:   i32;
+  regBloom:    i32;
+  pOpRef:      PVdbeOp;
 begin
   v := pParse^.pVdbe;
   Assert(v <> nil);
@@ -23212,6 +23218,16 @@ begin
       sqlite3SelectDestInit(@destSet, SRT_Set, iTab);
       destSet.zAffSdst := exprINAffinity(pParse, pX);
       pSel^.iLimit     := 0;
+      addrBloom := 0;
+      if (addrOnce <> 0)
+         and (bloomOk <> 0)
+         and OptimizationEnabled(pParse^.db, SQLITE_BloomFilter) then
+      begin
+        Inc(pParse^.nMem);
+        regBloom := pParse^.nMem;
+        addrBloom := sqlite3VdbeAddOp2(v, OP_Blob, 10000, regBloom);
+        destSet.iSDParm2 := regBloom;
+      end;
       pCopy := sqlite3SelectDup(pParse^.db, pSel, 0);
       if pParse^.db^.mallocFailed <> 0 then
         rcSelect := 1
@@ -23219,6 +23235,20 @@ begin
         rcSelect := sqlite3Select(pParse, pCopy, @destSet);
       sqlite3SelectDelete(pParse^.db, pCopy);
       sqlite3DbFree(pParse^.db, destSet.zAffSdst);
+      if addrBloom <> 0 then
+      begin
+        { tag-202407032019 — stash the Bloom-filter register into the
+          OP_Once.p3 slot so sqlite3ExprCodeIN can find it on per-row
+          probes.  When the inner sqlite3Select unset iSDParm2 (e.g. due
+          to a deferred path), shrink the Blob to a 10-byte placeholder. }
+        pOpRef := sqlite3VdbeGetOp(v, addrOnce);
+        if pOpRef <> nil then pOpRef^.p3 := destSet.iSDParm2;
+        if destSet.iSDParm2 = 0 then
+        begin
+          pOpRef := sqlite3VdbeGetOp(v, addrBloom);
+          if pOpRef <> nil then pOpRef^.p1 := 10;
+        end;
+      end;
       if rcSelect <> 0 then
       begin
         sqlite3KeyInfoUnref(pKeyInfo);
@@ -23288,7 +23318,6 @@ begin
     pParse^.nRangeReg := 0;
   end;
 
-  if bloomOk = 0 then ; { silence unused-param hint }
 end;
 
 { sqlite3ExprCodeIN (expr.c:4029..4291) — emit the per-row IN test.  Sub-progress
@@ -23322,6 +23351,7 @@ var
   pE2:         PExpr;
   op:          i32;
   regFree1:    i32;
+  pOpOnce:     PVdbeOp;
 begin
   rRhsHasNull := 0;
   zAff        := nil;
@@ -23399,6 +23429,18 @@ begin
     begin
       if sqlite3ExprCanBeNull(sqlite3VectorFieldSubexpr(pLeft, ii)) <> 0 then
         sqlite3VdbeAddOp2(v, OP_IsNull, rLhs + ii, destIfFalse);
+    end;
+    { tag-202407032019 — Bloom-filter pre-check.  When the IN-RHS
+      materialisation built a Bloom filter (regBloom stashed in the
+      OP_Once.p3 slot at iAddr), emit OP_Filter rBloom, destIfFalse,
+      rLhs, nVector ahead of the OP_NotFound binary search so a missing
+      probe short-circuits without touching the eph cursor. }
+    if ExprHasProperty(pExpr, EP_Subrtn) then
+    begin
+      pOpOnce := sqlite3VdbeGetOp(v, pExpr^.y.sub.iAddr);
+      if (pOpOnce <> nil) and (pOpOnce^.p3 > 0) then
+        sqlite3VdbeAddOp4Int(v, OP_Filter, pOpOnce^.p3, destIfFalse,
+                             rLhs, nVector);
     end;
     sqlite3VdbeAddOp4Int(v, OP_NotFound, iTab, destIfFalse,
                          rLhs, nVector);
