@@ -8102,6 +8102,53 @@ begin
   Result := mask;
 end;
 
+{ Faithful port of whereexpr.c:998..1024 — exprSelectUsage.  Walks every
+  SELECT in a UNION/INTERSECT/EXCEPT chain, accumulating the cursor mask of
+  every TK_COLUMN node referenced from the result-list, GROUP BY, ORDER BY,
+  WHERE, HAVING, ON-clause, table-valued function args, and any nested
+  subquery FROM-items.  This is the upstream piece of correlated-subquery
+  classification: when the outer exprAnalyze processes an EXISTS / IN
+  predicate whose subselect references an outer-frame cursor, that cursor's
+  mask flows into pTerm^.prereqRight via this walk.  Until ported, the
+  predicate carried prereqRight=0 and the planner could not tell the
+  subselect was correlated. }
+function exprSelectUsage(pMaskSet: PWhereMaskSet; pS: PSelect): Bitmask;
+var
+  mask: Bitmask;
+  pSrc: PSrcList;
+  i:    i32;
+  it:   PSrcItem;
+begin
+  mask := 0;
+  while pS <> nil do
+  begin
+    pSrc := pS^.pSrc;
+    mask := mask or sqlite3WhereExprListUsage(pMaskSet, pS^.pEList);
+    mask := mask or sqlite3WhereExprListUsage(pMaskSet, pS^.pGroupBy);
+    mask := mask or sqlite3WhereExprListUsage(pMaskSet, pS^.pOrderBy);
+    mask := mask or sqlite3WhereExprUsage(pMaskSet, pS^.pWhere);
+    mask := mask or sqlite3WhereExprUsage(pMaskSet, pS^.pHaving);
+    if pSrc <> nil then  { ALWAYS in C }
+    begin
+      for i := 0 to pSrc^.nSrc - 1 do
+      begin
+        it := @SrcListItems(pSrc)[i];
+        if (it^.fg.fgBits and u8($04)) <> 0 then  { isSubquery }
+        begin
+          if (it^.u4.pSubq <> nil) and (it^.u4.pSubq^.pSelect <> nil) then
+            mask := mask or exprSelectUsage(pMaskSet, it^.u4.pSubq^.pSelect);
+        end;
+        if (it^.fg.fgBits2 and u8($08)) = 0 then  { not isUsing (fgBits2 bit 3) }
+          mask := mask or sqlite3WhereExprUsage(pMaskSet, it^.u3.pOn);
+        if (it^.fg.fgBits and u8($08)) <> 0 then  { isTabFunc (fgBits bit 3) }
+          mask := mask or sqlite3WhereExprListUsage(pMaskSet, it^.u1.pFuncArg);
+      end;
+    end;
+    pS := pS^.pPrior;
+  end;
+  Result := mask;
+end;
+
 function sqlite3WhereExprUsageFull(pMaskSet: PWhereMaskSet; p: PExpr): Bitmask;
 var
   mask: Bitmask;
@@ -8117,7 +8164,8 @@ begin
   begin
     if ExprHasProperty(p, EP_VarSelect) then
       pMaskSet^.bVarSelect := 1;
-    { exprSelectUsage deferred to Phase 6.3 — return 0 for subqueries }
+    { whereexpr.c:1836 — exprSelectUsage walk now ported above. }
+    mask := mask or exprSelectUsage(pMaskSet, p^.x.pSelect);
   end else if ExprUseXList(p) and (p^.x.pList <> nil) then
     mask := mask or sqlite3WhereExprListUsage(pMaskSet, p^.x.pList);
   Result := mask;
