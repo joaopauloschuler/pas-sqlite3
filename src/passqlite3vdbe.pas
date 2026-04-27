@@ -1231,7 +1231,7 @@ type
     pLast:   PRowSetEntry;
     pFresh:  PRowSetEntry;
     pForest: PRowSetEntry;
-    iFresh:  u16;
+    iFstresh:  u16;
     rsFlags: u16;
     iBatch:  i32;
   end;
@@ -1278,7 +1278,7 @@ function  sqlite3VdbeAssertMayAbort(v: PVdbe; mayAbort: i32): i32;
 procedure sqlite3VdbeIncrWriteCounter(p: PVdbe; pC: PVdbeCursor);
 procedure sqlite3VdbeCountChanges(v: PVdbe);
 procedure sqlite3VdbeAssertAbortable(p: PVdbe);
-procedure sqlite3VdbeNoJumpsOutsideSubrtn(v: PVdbe; iFirst, iLast: i32;
+procedure sqlite3VdbeNoJumpsOutsideSubrtn(v: PVdbe; iFstirst, iLast: i32;
                                           regReturn: i32);
 function  sqlite3VdbeCurrentAddr(p: PVdbe): i32;
 procedure sqlite3VdbeVerifyNoMallocRequired(p: PVdbe; N: i32);
@@ -1305,7 +1305,7 @@ procedure sqlite3VdbeLinkSubProgram(pVdbe: PVdbe; pSub: PSubProgram);
 function  sqlite3VdbeHasSubProgram(pVdbe: PVdbe): i32;
 function  sqlite3VdbeChangeToNoop(p: PVdbe; addr: i32): i32;
 function  sqlite3VdbeDeletePriorOpcode(p: PVdbe; op: u8): i32;
-procedure sqlite3VdbeReleaseRegisters(pParse: PParse; iFirst, nReg, mask: i32;
+procedure sqlite3VdbeReleaseRegisters(pParse: PParse; iFstirst, nReg, mask: i32;
                                       bUndefine: i32);
 procedure sqlite3VdbeChangeP4(p: PVdbe; addr: i32; zP4: PAnsiChar; n: i32);
 procedure sqlite3VdbeAppendP4(p: PVdbe; pP4: Pointer; n: i32);
@@ -1459,7 +1459,7 @@ function  sqlite3AnalysisLoad(db: PTsqlite3; iDb: i32): i32;
 procedure sqlite3UnlinkAndDeleteTable(db: PTsqlite3; iDb: i32; zTabName: PAnsiChar);
 procedure sqlite3UnlinkAndDeleteIndex(db: PTsqlite3; iDb: i32; zIdxName: PAnsiChar);
 procedure sqlite3UnlinkAndDeleteTrigger(db: PTsqlite3; iDb: i32; zTrigName: PAnsiChar);
-procedure sqlite3RootPageMoved(db: PTsqlite3; iDb: i32; iFrom: i32; iTo: i32);
+procedure sqlite3RootPageMoved(db: PTsqlite3; iDb: i32; iFstrom: i32; iTo: i32);
 procedure sqlite3FkClearTriggerCache(db: PTsqlite3; iDb: i32);
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
@@ -2585,11 +2585,43 @@ begin
     Result := 0;
 end;
 
-procedure sqlite3VdbeReleaseRegisters(pParse: PParse; iFirst, nReg, mask: i32;
+procedure sqlite3VdbeReleaseRegisters(pParse: PParse; iFstirst, nReg, mask: i32;
                                       bUndefine: i32);
+{ Port of vdbeaux.c:1501..1527 (under SQLITE_DEBUG).  Emits OP_ReleaseReg to
+  flag a contiguous register range as no longer in use.  Trims leading and
+  trailing bits set in `mask` (registers that must NOT be released) before
+  emission; if the trimmed range is empty, emits nothing. }
+var
+  v:    PVdbe;
+  uMask: u32;
+  N:    i32;
+  iFst:   i32;
 begin
-  { Forwarded — real implementation lives in passqlite3codegen.pas where
-    the full TParse layout is visible.  See vdbeReleaseRegistersImpl. }
+  if nReg = 0 then Exit;
+  v := vdbeParsePVdbe(pParse);
+  if v = nil then Exit;
+  uMask := u32(mask);
+  N := nReg;
+  iFst := iFstirst;
+  if (N <= 31) and (uMask <> 0) then
+  begin
+    while (N > 0) and ((uMask and 1) <> 0) do
+    begin
+      uMask := uMask shr 1;
+      Inc(iFst);
+      Dec(N);
+    end;
+    while (N > 0) and (N <= 32) and ((uMask and (u32(1) shl (N - 1))) <> 0) do
+    begin
+      uMask := uMask and (not (u32(1) shl (N - 1)));
+      Dec(N);
+    end;
+  end;
+  if N > 0 then
+  begin
+    sqlite3VdbeAddOp3(v, OP_ReleaseReg, iFst, N, i32(uMask));
+    if bUndefine <> 0 then sqlite3VdbeChangeP5(v, 1);
+  end;
 end;
 
 { --- TakeOpArray (returns the op array and zeroes v->aOp) --- }
@@ -2681,7 +2713,7 @@ procedure sqlite3VdbeAssertAbortable(p: PVdbe);
 begin
 end;
 
-procedure sqlite3VdbeNoJumpsOutsideSubrtn(v: PVdbe; iFirst, iLast: i32;
+procedure sqlite3VdbeNoJumpsOutsideSubrtn(v: PVdbe; iFstirst, iLast: i32;
                                           regReturn: i32);
 begin
 end;
@@ -8960,7 +8992,7 @@ begin
     Result^.pLast   := nil;
     Result^.pFresh  := nil;
     Result^.pForest := nil;
-    Result^.iFresh  := 0;
+    Result^.iFstresh  := 0;
     Result^.rsFlags := 0;
     Result^.iBatch  := 0;
   end;
@@ -8983,7 +9015,7 @@ begin
   pSet^.pLast   := nil;
   pSet^.pFresh  := nil;
   pSet^.pForest := nil;
-  pSet^.iFresh  := 0;
+  pSet^.iFstresh  := 0;
   pSet^.rsFlags := 0;
 end;
 
@@ -8999,17 +9031,17 @@ function rowSetEntryAlloc(pSet: PRowSet): PRowSetEntry;
 var
   pChunk: PRowSetChunk;
 begin
-  if pSet^.iFresh = 0 then begin
+  if pSet^.iFstresh = 0 then begin
     pChunk := sqlite3DbMallocRawNN(pSet^.db, SizeOf(TRowSetChunk));
     if pChunk = nil then begin Result := nil; Exit; end;
     pChunk^.pNextChunk := pSet^.pChunk;
     pSet^.pChunk := pChunk;
     pSet^.pFresh := @pChunk^.aEntry[0];
-    pSet^.iFresh := ROWSET_ENTRY_PER_CHUNK;
+    pSet^.iFstresh := ROWSET_ENTRY_PER_CHUNK;
   end;
   Result := pSet^.pFresh;
   Inc(pSet^.pFresh);
-  Dec(pSet^.iFresh);
+  Dec(pSet^.iFstresh);
 end;
 
 { rowset.c internal: merge two sorted lists by v }
@@ -9297,7 +9329,7 @@ begin { Stub: schema DDL requires Phase 6 } end;
 procedure sqlite3UnlinkAndDeleteTrigger(db: PTsqlite3; iDb: i32; zTrigName: PAnsiChar);
 begin { Stub: trigger DDL requires Phase 6 } end;
 
-procedure sqlite3RootPageMoved(db: PTsqlite3; iDb: i32; iFrom: i32; iTo: i32);
+procedure sqlite3RootPageMoved(db: PTsqlite3; iDb: i32; iFstrom: i32; iTo: i32);
 begin { Stub: auto-vacuum root page update requires Phase 6 } end;
 
 procedure sqlite3FkClearTriggerCache(db: PTsqlite3; iDb: i32);
@@ -9737,7 +9769,7 @@ var
   t:     u32;
   nHdr:  u32;
   iHdr:  u32;
-  iField: i64;
+  iFstield: i64;
   szField: u32;
   i:     i32;
   a:     Pu8;
@@ -9750,20 +9782,20 @@ begin
   if (nHdr > u32(nRec)) or (iHdr >= nHdr) then begin
     Result := SQLITE_CORRUPT_BKPT; Exit;
   end;
-  iField := nHdr;
+  iFstield := nHdr;
   for i := 0 to iCol do begin
     iHdr := iHdr + u32(sqlite3GetVarint32(@a[iHdr], t));
     if iHdr > nHdr then begin Result := SQLITE_CORRUPT_BKPT; Exit; end;
     szField := sqlite3VdbeSerialTypeLen(t);
-    iField := iField + szField;
+    iFstield := iFstield + szField;
   end;
-  if iField > nRec then begin Result := SQLITE_CORRUPT_BKPT; Exit; end;
+  if iFstield > nRec then begin Result := SQLITE_CORRUPT_BKPT; Exit; end;
   if pM = nil then begin
     pM := PMem(sqlite3ValueNew(db));
     ppVal := Psqlite3_value(pM);
     if pM = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
   end;
-  sqlite3VdbeSerialGet(@a[iField - szField], t, pM);
+  sqlite3VdbeSerialGet(@a[iFstield - szField], t, pM);
   pM^.enc := vdbeDbEnc(db);
   Result := SQLITE_OK;
 end;

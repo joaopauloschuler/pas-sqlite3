@@ -156,7 +156,7 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 196 PASS / 2
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 197 PASS / 1
     DIVERGE / 0 ERROR (corpus = 198); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
@@ -170,11 +170,10 @@ Important: At the end of this document, please find:
         with snapshot/restore guard at 17890..17893 / 17965..17970;
         blocks NestedParse UPDATE of the placeholder sqlite_master row.
 
-    The 3 TestExplainParity DIVERGEs are CREATE TABLE composite PK /
-    WITHOUT ROWID (auto-index pass) and DROP TABLE op-count rows —
-    structural (extra C-side scan/reinsert pre-Destroy pass that Pas
-    elides; rows still materialise correctly).  Tracked under 6.10
-    steps 4 and 5.
+    The 1 remaining TestExplainParity DIVERGE is the DROP TABLE
+    op-count row — structural (extra C-side scan/reinsert pre-Destroy
+    pass that Pas elides; rows still materialise correctly).  Tracked
+    under 6.10 step 4.
 
 - [X] **6.9-bis 11g.2.g** TestWhereCorpus startup EAccessViolation —
     fixed by porting `exprSelectUsage` (whereexpr.c:998..1024) so
@@ -191,7 +190,7 @@ Important: At the end of this document, please find:
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
   comparison ops + literal-arith + col aliases + multi-col index +
   multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **196 PASS / 2 DIVERGE / 0 ERROR**
+  Current Status (2026-04-27): **197 PASS / 1 DIVERGE / 0 ERROR**
   (corpus = 198 after probe sweep #8).
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
@@ -200,8 +199,6 @@ Important: At the end of this document, please find:
   DIVERGE rows + delta = (C ops − Pas ops):
 
   - DROP TABLE — Δ=21 (step 4)
-  - SELECT NULLIF — Δ=1 (probe sweep #8: NULLIF(a,0) op count
-    C=14 Pas=13; minor opcode-emission gap in the NULLIF expansion).
 
   Root cause for DROP TABLE Δ=21 (re-analysis 2026-04-27 from
   bytecode dump):
@@ -272,8 +269,12 @@ Important: At the end of this document, please find:
 
     - [ ] **6.10 step 6** Expand corpus further and drive remaining
       DIVERGEs to PASS, then promote from report-only to hard gate.
-      Corpus now 196 PASS / 2 DIVERGE / 198 total.  Probe sweep #8
-      added 27 PASS rows + 1 new DIVERGE (NULLIF Δ=1): bitwise
+      Corpus now 197 PASS / 1 DIVERGE / 198 total.  NULLIF Δ=1
+      closed by porting `sqlite3VdbeReleaseRegisters`
+      (vdbeaux.c:1501..1527) and wiring the constMask!=0 arm of
+      `emitScalarFunctionCall` to it (post-Function OP_ReleaseReg
+      emission with p5=1 under SQLITE_DEBUG).  Probe sweep #8
+      added 27 PASS rows: bitwise
       (`a&b`, `a|b`, `a<<1`, `a>>1`, `~a`, `1&3`, `1|2`, `4>>1`),
       unary `+a`, `IFNULL`, `COALESCE` 3-arg, simple-form `CASE a
       WHEN…END`, `CAST(a AS INTEGER/REAL)`, `CAST('5' AS INTEGER)`,

@@ -4581,8 +4581,13 @@ begin
       PAnsiChar(db^.pDfltColl), P4_COLLSEQ);
   sqlite3VdbeAddFunctionCall(pParse, i32(constMask), r1, target, n,
     pDef, i32(pExpr^.op2));
-  if (n > 0) and (constMask = 0) then
-    sqlite3ReleaseTempRange(pParse, r1, n);
+  if n > 0 then
+  begin
+    if constMask = 0 then
+      sqlite3ReleaseTempRange(pParse, r1, n)
+    else
+      sqlite3VdbeReleaseRegisters(pParse, r1, n, i32(constMask), 1);
+  end;
   Result := True;
 end;
 
