@@ -4733,6 +4733,238 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- sqlite3WhereCodeOneLoopStart Case 3 (batch 12) -----
+  Exercises the IPK range-scan arm (wherecode.c:1712..1819).  Builds
+  rowid > N (BTM only), rowid < N (TOP only), and rowid > N AND rowid < M
+  (both bounds) fixtures and checks the emitted opcode shape: OP_SeekGT
+  start probe / OP_Rewind fallback, OP_Next iteration on pLevel^.op,
+  optional OP_Rowid + OP_Ge/Gt end test for each term shape. }
+procedure TestCodeOneLoopStartCase3;
+const
+  N_LEVEL = 1;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  v:         PVdbe;
+  rc:        i32;
+  bufWI:     array of Byte;
+  bufSL:     array of Byte;
+  pWInfo:    PWhereInfo;
+  pSL:       PSrcList;
+  pSItem:    PSrcItem;
+  pLevel:    PWhereLevel;
+  loop:      TWhereLoop;
+  termStart: TWhereTerm;
+  termEnd:   TWhereTerm;
+  exStart:   TExpr;
+  exStartR:  TExpr;
+  exEnd:     TExpr;
+  exEndR:    TExpr;
+  alterm:    array[0..1] of PWhereTerm;
+  base, i:   i32;
+  pOp:       PVdbeOp;
+  notReady:  Bitmask;
+  rOut:      Bitmask;
+  fSeekGT, fRewind, fRowid, fGe, fNext, fSeekLE, fLast, fLe: Boolean;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('SCOLS3 open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  SetLength(bufSL, SizeOf(TSrcList) + SizeOf(TSrcItem));
+  FillChar(bufSL[0], Length(bufSL), 0);
+  pSL := PSrcList(@bufSL[0]);
+  pSL^.nSrc := 1; pSL^.nAlloc := 1;
+  pSItem := @SrcListItems(pSL)[0];
+  pSItem^.iCursor := 7;
+  pSItem^.fg.jointype := 0;
+
+  SetLength(bufWI, SZ_WHEREINFO(N_LEVEL));
+  FillChar(bufWI[0], Length(bufWI), 0);
+  pWInfo := PWhereInfo(@bufWI[0]);
+  pWInfo^.pParse   := @parse;
+  pWInfo^.pTabList := pSL;
+  pWInfo^.nLevel   := N_LEVEL;
+  pWInfo^.revMask  := 0;
+  pWInfo^.wctrlFlags := 0;
+  pLevel := @whereInfoLevels(pWInfo)[0];
+
+  FillChar(loop,      SizeOf(loop),      0);
+  FillChar(termStart, SizeOf(termStart), 0); termStart.iParent := -1;
+  FillChar(termEnd,   SizeOf(termEnd),   0); termEnd.iParent   := -1;
+  FillChar(exStart,   SizeOf(exStart),   0);
+  FillChar(exStartR,  SizeOf(exStartR),  0);
+  FillChar(exEnd,     SizeOf(exEnd),     0);
+  FillChar(exEndR,    SizeOf(exEndR),    0);
+
+  { rowid > 10 — TK_GT_TK with TK_INTEGER 10 RHS. }
+  exStart.op    := TK_GT_TK;
+  exStart.pRight := @exStartR;
+  exStartR.op   := TK_INTEGER;
+  exStartR.flags := EP_IntValue;
+  exStartR.u.iValue := 10;
+  termStart.pExpr := @exStart;
+  termStart.eOperator := WO_GT_WO;
+
+  { rowid < 100 — TK_LT with TK_INTEGER 100 RHS. }
+  exEnd.op    := TK_LT;
+  exEnd.pRight := @exEndR;
+  exEndR.op   := TK_INTEGER;
+  exEndR.flags := EP_IntValue;
+  exEndR.u.iValue := 100;
+  termEnd.pExpr := @exEnd;
+  termEnd.eOperator := WO_LT;
+
+  { ---- SCOLS3 — BTM only (rowid > 10).  Forward scan: emits OP_SeekGT,
+         pLevel^.op = OP_Next, no end-bound test. ---- }
+  alterm[0] := @termStart;
+  loop.aLTerm  := @alterm[0];
+  loop.nLTerm  := 1;
+  loop.wsFlags := WHERE_IPK or WHERE_COLUMN_RANGE or WHERE_BTM_LIMIT;
+  loop.u.btree.nEq := 0;
+
+  pLevel^.pWLoop := @loop;
+  pLevel^.iFrom  := 0;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.regFilter := 0;
+  pLevel^.op := 99;
+  pLevel^.p1 := 0; pLevel^.p2 := 0; pLevel^.p5 := 0;
+
+  notReady := not Bitmask(0);
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS3 returns pLevel^.notReady', rOut = pLevel^.notReady);
+  Check('SCOLS3 pLevel^.op = OP_Next', pLevel^.op = OP_Next);
+  Check('SCOLS3 pLevel^.p1 = iCur', pLevel^.p1 = pSItem^.iCursor);
+  Check('SCOLS3 pStart termStart marked TERM_CODED (disableTerm)',
+        (termStart.wtFlags and TERM_CODED) <> 0);
+  fSeekGT := False; fRowid := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_SeekGT) and (pOp^.p1 = pSItem^.iCursor) then
+      fSeekGT := True;
+    if pOp^.opcode = OP_Rowid then fRowid := True;
+  end;
+  Check('SCOLS3 OP_SeekGT emitted on iCursor=7', fSeekGT);
+  Check('SCOLS3 no OP_Rowid (no end-bound test)', not fRowid);
+
+  { ---- SCOLS4 — TOP only (rowid < 100).  Forward scan: emits OP_Rewind
+         (no start probe), pLevel^.op = OP_Next, OP_Rowid + OP_Ge end-test. ---- }
+  termStart.wtFlags := 0;   { reset disableTerm marking }
+  termEnd.wtFlags   := 0;
+  alterm[0] := @termEnd;
+  loop.aLTerm  := @alterm[0];
+  loop.nLTerm  := 1;
+  loop.wsFlags := WHERE_IPK or WHERE_COLUMN_RANGE or WHERE_TOP_LIMIT;
+  loop.u.btree.nEq := 0;
+
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.op := 99; pLevel^.p1 := 0; pLevel^.p2 := 0; pLevel^.p5 := 0;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS4 returns pLevel^.notReady', rOut = pLevel^.notReady);
+  Check('SCOLS4 pLevel^.op = OP_Next', pLevel^.op = OP_Next);
+  Check('SCOLS4 termEnd marked TERM_CODED (disableTerm)',
+        (termEnd.wtFlags and TERM_CODED) <> 0);
+  fRewind := False; fRowid := False; fGe := False; fSeekGT := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_Rewind) and (pOp^.p1 = pSItem^.iCursor) then
+      fRewind := True;
+    if pOp^.opcode = OP_Rowid  then fRowid := True;
+    if pOp^.opcode = OP_Ge     then fGe    := True;
+    if pOp^.opcode = OP_SeekGT then fSeekGT := True;
+  end;
+  Check('SCOLS4 OP_Rewind emitted (no start)', fRewind);
+  Check('SCOLS4 no OP_SeekGT', not fSeekGT);
+  Check('SCOLS4 OP_Rowid emitted (end-bound test)', fRowid);
+  Check('SCOLS4 OP_Ge emitted (TK_LT → testOp Ge, fwd)', fGe);
+
+  { ---- SCOLS5 — both BTM + TOP (10 < rowid < 100).  Forward scan:
+         OP_SeekGT start probe + OP_Rowid + OP_Ge end test, OP_Next. ---- }
+  termStart.wtFlags := 0;
+  termEnd.wtFlags   := 0;
+  alterm[0] := @termStart;
+  alterm[1] := @termEnd;
+  loop.aLTerm  := @alterm[0];
+  loop.nLTerm  := 2;
+  loop.wsFlags := WHERE_IPK or WHERE_COLUMN_RANGE or WHERE_BTM_LIMIT or WHERE_TOP_LIMIT;
+
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.op := 99; pLevel^.p1 := 0; pLevel^.p2 := 0; pLevel^.p5 := 0;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS5 returns pLevel^.notReady', rOut = pLevel^.notReady);
+  Check('SCOLS5 pLevel^.op = OP_Next', pLevel^.op = OP_Next);
+  fSeekGT := False; fRewind := False; fRowid := False; fGe := False;
+  fNext := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_SeekGT) and (pOp^.p1 = pSItem^.iCursor) then
+      fSeekGT := True;
+    if pOp^.opcode = OP_Rewind then fRewind := True;
+    if pOp^.opcode = OP_Rowid  then fRowid  := True;
+    if pOp^.opcode = OP_Ge     then fGe     := True;
+    if pOp^.opcode = OP_Next   then fNext   := True;
+  end;
+  Check('SCOLS5 OP_SeekGT emitted', fSeekGT);
+  Check('SCOLS5 no OP_Rewind (start probe present)', not fRewind);
+  Check('SCOLS5 OP_Rowid emitted', fRowid);
+  Check('SCOLS5 OP_Ge emitted', fGe);
+  Check('SCOLS5 (OP_Next on iteration; pLevel^.op recorded)',
+        pLevel^.op = OP_Next);
+  if fNext then ;   { pLevel^.op iteration emit lives in sqlite3WhereEnd }
+
+  { ---- SCOLS6 — bRev=1 swaps pStart/pEnd.  pLoop has BTM only (pStart=
+         termStart with TK_GT 10), but with bRev set the swap leaves
+         pStart=nil and pEnd=termStart, so we expect OP_Last (no start)
+         + OP_Rowid + OP_Le (end test for fwd-equivalent TK_GT under bRev).
+         pLevel^.op flips to OP_Prev. ---- }
+  termStart.wtFlags := 0;
+  termEnd.wtFlags   := 0;
+  alterm[0] := @termStart;
+  loop.aLTerm  := @alterm[0];
+  loop.nLTerm  := 1;
+  loop.wsFlags := WHERE_IPK or WHERE_COLUMN_RANGE or WHERE_BTM_LIMIT;
+  loop.u.btree.nEq := 0;
+
+  pWInfo^.revMask  := 1;   { bRev=1 for level 0 }
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.op := 99; pLevel^.p1 := 0; pLevel^.p2 := 0; pLevel^.p5 := 0;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS6 returns pLevel^.notReady', rOut = pLevel^.notReady);
+  Check('SCOLS6 pLevel^.op = OP_Prev (bRev)', pLevel^.op = OP_Prev);
+  fLast := False; fSeekLE := False; fRowid := False; fLe := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_Last) and (pOp^.p1 = pSItem^.iCursor) then
+      fLast := True;
+    if pOp^.opcode = OP_SeekLE then fSeekLE := True;
+    if pOp^.opcode = OP_Rowid  then fRowid  := True;
+    if pOp^.opcode = OP_Le     then fLe     := True;
+  end;
+  Check('SCOLS6 OP_Last emitted (post-swap pStart=nil)', fLast);
+  Check('SCOLS6 OP_Rowid emitted (post-swap pEnd=termStart)', fRowid);
+  Check('SCOLS6 OP_Le emitted (TK_GT → bRev testOp Le)', fLe);
+  if fSeekLE then ;
+
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -4794,6 +5026,7 @@ begin
   TestFindInIndex;
   TestCodeINTerm;
   TestCodeOneLoopStart;
+  TestCodeOneLoopStartCase3;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

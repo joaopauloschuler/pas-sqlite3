@@ -767,6 +767,33 @@ Important: At the end of this document, please find:
       pLevel^.notReady), SCOLS2 (two-level frame with iFrom=1 and
       JT_LEFT pTabItem — iLeftJoin > 0 after init, Case 2 still fires,
       return value still matches pLevel^.notReady).
+    - [X] Public surface, batch 12 — `sqlite3WhereCodeOneLoopStart`
+      Case 3 IPK range-scan (wherecode.c:1712..1819).  Inequality on the
+      rowid: optional start-bound seek (OP_SeekGT/SeekLE/SeekLT/SeekGE)
+      keyed off `aMoveOp[pX^.op - TK_GT_TK]` for scalar RHS or
+      `aMoveOp[((op-TK_GT-1) & 0x3) | 0x1]` for vector RHS (collapses to
+      OP_SeekGE / OP_SeekLE — vector compares already emit the
+      strict/non-strict half via `codeExprOrVector`); OP_Last / OP_Rewind
+      fallback when only the end-bound is present; `bRev` swaps pStart
+      and pEnd so reverse scans probe from the high end.  Iteration step
+      is `pLevel^.op := OP_Prev / OP_Next` with `p1 := iCur`,
+      `p2 := startAddr` so sqlite3WhereEnd resumes the loop body at the
+      post-seek address.  End-bound test allocates a fresh `memEndValue`
+      cell, emits `codeExprOrVector` into it, then OP_Rowid + OP_Le/Lt/
+      Ge/Gt with `p5 := SQLITE_AFF_NUMERIC | SQLITE_JUMPIFNULL` so a NULL
+      bound terminates the scan.  Strict-vs-non-strict choice mirrors C:
+      scalar TK_LT/TK_GT_TK → OP_Ge/Le (fwd) or OP_Lt/Gt (bRev); any
+      vector compare collapses to the strict variant since the seek
+      already enforced the boundary.  `disableTerm` runs on each scalar
+      bound so the per-row body codegen does not re-emit the predicate.
+      `codeCursorHint` runs against pEnd (no-op stub).  Gate:
+      `TestWherePlanner.pas` (514/514): SCOLS3 (BTM only — OP_SeekGT,
+      pLevel^.op=OP_Next, no OP_Rowid; pStart marked TERM_CODED via
+      disableTerm), SCOLS4 (TOP only — OP_Rewind fallback, OP_Rowid +
+      OP_Ge end test, no OP_SeekGT; termEnd marked TERM_CODED), SCOLS5
+      (both BTM+TOP — OP_SeekGT + OP_Rowid + OP_Ge + OP_Next, no
+      OP_Rewind), SCOLS6 (bRev=1 — pStart/pEnd swap leaves OP_Last +
+      OP_Rowid + OP_Le, pLevel^.op=OP_Prev).
     - [X] Leaf helpers, batch 10 — `codeINTerm` (wherecode.c:668..784)
       full port replacing the prior `Assert(False)` stub.  IN-loop
       builder: opens the IN cursor (rowid table / shared index / EPH

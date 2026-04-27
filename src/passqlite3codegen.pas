@@ -12185,6 +12185,17 @@ end;
 function sqlite3WhereCodeOneLoopStart(pParse: PParse; v: PVdbe;
   pWInfo: PWhereInfo; iLevel: i32; pLevel: PWhereLevel;
   notReady: Bitmask): Bitmask;
+const
+  { Case 3 IPK range-scan seek-op table (wherecode.c:1741..1746).
+    Indexed by (pX^.op - TK_GT_TK).  The TK_xx ordering invariants
+    (TK_LE = TK_GT+1, TK_LT = TK_GT+2, TK_GE = TK_GT+3) are asserted
+    in the cluster header. }
+  aMoveOp: array[0..3] of u8 = (
+    OP_SeekGT,   { TK_GT_TK }
+    OP_SeekLE,   { TK_LE    }
+    OP_SeekLT,   { TK_LT    }
+    OP_SeekGE    { TK_GE    }
+  );
 var
   iCur:        i32;       { VDBE cursor for the table }
   addrNxt:     i32;       { Where to jump to continue with the next IN case }
@@ -12196,6 +12207,17 @@ var
   pLoop:       PWhereLoop;
   pTerm:       PWhereTerm;
   pTabItem:    PSrcItem;
+  { ---- Case 3 (IPK range-scan) locals ---- }
+  pStart:      PWhereTerm;
+  pEnd:        PWhereTerm;
+  pX:          PExpr;
+  r1:          i32;
+  rTemp:       i32;
+  op3:         i32;
+  testOp:      i32;
+  startAddr:   i32;
+  memEndValue: i32;
+  jRng:        i32;
 begin
   pLoop    := pLevel^.pWLoop;
   pTabItem := @SrcListItems(pWInfo^.pTabList)[pLevel^.iFrom];
@@ -12259,12 +12281,123 @@ begin
     sqlite3VdbeAddOp3(v, OP_SeekRowid, iCur, addrNxt, iRowidReg);
     pLevel^.op := OP_Noop;
   end
+  else if ((pLoop^.wsFlags and WHERE_IPK) <> 0)
+       and ((pLoop^.wsFlags and WHERE_COLUMN_RANGE) <> 0) then
+  begin
+    { Case 3 — wherecode.c:1712..1819.  Inequality comparison against
+      the rowid (IPK).  Emits the optional start-bound seek (OP_SeekGT/
+      OP_SeekLE / OP_SeekLT / OP_SeekGE) or rewind, walks the table via
+      OP_Next / OP_Prev under sqlite3WhereEnd, and emits the optional
+      end-bound test (OP_Rowid + OP_Le/Lt/Ge/Gt).  bRev swaps pStart
+      and pEnd, mirrors the C source. }
+
+    { TK_xx ordering invariants used by the aMoveOp lookup. }
+    Assert(TK_LE = TK_GT_TK + 1);
+    Assert(TK_LT = TK_GT_TK + 2);
+    Assert(TK_GE = TK_GT_TK + 3);
+
+    testOp      := OP_Noop;
+    memEndValue := 0;
+    pStart      := nil;
+    pEnd        := nil;
+
+    jRng := 0;
+    if (pLoop^.wsFlags and WHERE_BTM_LIMIT) <> 0 then
+    begin
+      pStart := pLoop^.aLTerm[jRng];
+      Inc(jRng);
+    end;
+    if (pLoop^.wsFlags and WHERE_TOP_LIMIT) <> 0 then
+    begin
+      pEnd := pLoop^.aLTerm[jRng];
+      Inc(jRng);
+    end;
+    Assert((pStart <> nil) or (pEnd <> nil));
+
+    if bRev <> 0 then
+    begin
+      pTerm  := pStart;
+      pStart := pEnd;
+      pEnd   := pTerm;
+    end;
+
+    codeCursorHint(pTabItem, pWInfo, pLevel, pEnd);
+
+    if pStart <> nil then
+    begin
+      Assert((pStart^.wtFlags and TERM_VNULL) = 0);
+      pX := pStart^.pExpr;
+      Assert(pX <> nil);
+      if sqlite3ExprIsVector(pX^.pRight) <> 0 then
+      begin
+        rTemp := sqlite3GetTempReg(pParse);
+        r1    := rTemp;
+        codeExprOrVector(pParse, pX^.pRight, r1, 1);
+        op3 := i32(aMoveOp[((pX^.op - TK_GT_TK - 1) and $3) or $1]);
+        Assert((pX^.op <> TK_GT_TK) or (op3 = OP_SeekGE));
+        Assert((pX^.op <> TK_GE)    or (op3 = OP_SeekGE));
+        Assert((pX^.op <> TK_LT)    or (op3 = OP_SeekLE));
+        Assert((pX^.op <> TK_LE)    or (op3 = OP_SeekLE));
+      end
+      else
+      begin
+        r1 := sqlite3ExprCodeTemp(pParse, pX^.pRight, @rTemp);
+        disableTerm(pLevel, pStart);
+        op3 := i32(aMoveOp[(pX^.op - TK_GT_TK)]);
+      end;
+      sqlite3VdbeAddOp3(v, op3, iCur, addrBrk, r1);
+      sqlite3ReleaseTempReg(pParse, rTemp);
+    end
+    else
+    begin
+      if bRev <> 0 then
+        sqlite3VdbeAddOp2(v, OP_Last,   iCur, pLevel^.addrHalt)
+      else
+        sqlite3VdbeAddOp2(v, OP_Rewind, iCur, pLevel^.addrHalt);
+    end;
+
+    if pEnd <> nil then
+    begin
+      pX := pEnd^.pExpr;
+      Assert(pX <> nil);
+      Assert((pEnd^.wtFlags and TERM_VNULL) = 0);
+      Inc(pParse^.nMem);
+      memEndValue := pParse^.nMem;
+      codeExprOrVector(pParse, pX^.pRight, memEndValue, 1);
+      if (sqlite3ExprIsVector(pX^.pRight) = 0)
+         and ((pX^.op = TK_LT) or (pX^.op = TK_GT_TK)) then
+      begin
+        if bRev <> 0 then testOp := OP_Le else testOp := OP_Ge;
+      end
+      else
+      begin
+        if bRev <> 0 then testOp := OP_Lt else testOp := OP_Gt;
+      end;
+      if sqlite3ExprIsVector(pX^.pRight) = 0 then
+        disableTerm(pLevel, pEnd);
+    end;
+
+    startAddr := sqlite3VdbeCurrentAddr(v);
+    if bRev <> 0 then pLevel^.op := OP_Prev else pLevel^.op := OP_Next;
+    pLevel^.p1 := iCur;
+    pLevel^.p2 := startAddr;
+    Assert(pLevel^.p5 = 0);
+    if testOp <> OP_Noop then
+    begin
+      Inc(pParse^.nMem);
+      iRowidReg := pParse^.nMem;
+      sqlite3VdbeAddOp2(v, OP_Rowid, iCur, iRowidReg);
+      sqlite3VdbeAddOp3(v, testOp, memEndValue, addrBrk, iRowidReg);
+      sqlite3VdbeChangeP5(v, u16(SQLITE_AFF_NUMERIC or SQLITE_JUMPIFNULL));
+    end;
+  end
   else
   begin
-    { Cases 1, 3, 4, 5, 6 and the viaCoroutine special case land in
+    { Cases 1, 4, 5, 6 and the viaCoroutine special case land in
       subsequent batches.  Until then the dispatch fails fast — callers
-      from TestWherePlanner only exercise the rowid-EQ arm; the inlined
-      sqlite3WhereBegin slice handles the rowid-EQ SQL flow today. }
+      from TestWherePlanner only exercise the rowid-EQ / rowid-range arms;
+      the inlined sqlite3WhereBegin slice handles the rowid-EQ SQL flow
+      today. }
     Assert(False);
   end;
 
