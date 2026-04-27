@@ -28,19 +28,18 @@ Important: At the end of this document, please find:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-- [ ] **6.9-bis 11g.2.b** Port `sqlite3WhereBegin` / `sqlite3WhereEnd` for the single-table,
-    single-rowid-EQ-predicate case.  Bookkeeping primitives, prologue,
+- [ ] **6.9-bis 11g.2.b** Port `sqlite3WhereBegin` / `sqlite3WhereEnd`.  
+    Bookkeeping primitives, prologue,
     cleanup contract, and several leaf helpers (codeCompare cluster,
     sqlite3ExprCanBeNull, sqlite3ExprCodeTemp + 6 unary arms,
     TK_COLLATE/TK_SPAN/TK_UPLUS arms, whereShortCut, allowedOp +
     operatorMask + exprMightBeIndexed + minimal-viable exprAnalyze)
     are already ported.
-    - [ ] Re-enable productive tails — 
-      - [ ] port `sqlite3Update`
-      - [ ] port `sqlite3DeleteFrom` vtab `OP_VUpdate`.  
-      - [ ] port `sqlite3GenerateRowDelete`,
-      - [ ] port `sqlite3GenerateConstraintChecks`
-      - [ ] port `sqlite3CompleteInsertion`
+      - [ ] port or re-enable `sqlite3Update`
+      - [ ] port or re-enable `sqlite3DeleteFrom` vtab `OP_VUpdate`.  
+      - [ ] port or re-enable `sqlite3GenerateRowDelete`,
+      - [ ] port or re-enable `sqlite3GenerateConstraintChecks`
+      - [ ] port or re-enable `sqlite3CompleteInsertion`
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.    
     - [ ] Port `TestWhereCorpus.pas`
@@ -53,11 +52,11 @@ Important: At the end of this document, please find:
         `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
         the system one.
 
-    - [ ] port or re-enable productive tails:
-      - [ ] Port `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
+    - [ ] Port or re-enable productive tails:
+      - [ ] Port or re-enable `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
         arm and where-loop / one-pass arm both productive.  vtab
         `OP_VUpdate` arm still TODO (out of current corpus).
-      - [ ] Port `sqlite3Update` (`passqlite3codegen.pas:17835`): skeleton-only
+      - [ ] Port or re-enable `sqlite3Update` (`passqlite3codegen.pas:17835`): skeleton-only
         with snapshot/restore guard at 17890..17893 / 17965..17970;
         blocks NestedParse UPDATE of the placeholder sqlite_master row.
 
