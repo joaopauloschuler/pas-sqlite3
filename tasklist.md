@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 249 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 250); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 309 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 310); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -190,8 +190,8 @@ Important: At the end of this document, please find:
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
   comparison ops + literal-arith + col aliases + multi-col index +
   multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **249 PASS / 1 DIVERGE / 0 ERROR**
-  (corpus = 250 after probe sweep #10).
+  Current Status (2026-04-27): **309 PASS / 1 DIVERGE / 0 ERROR**
+  (corpus = 310 after probe sweeps #11 and #12).
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -269,16 +269,19 @@ Important: At the end of this document, please find:
 
     - [ ] **6.10 step 6** Expand corpus further and drive remaining
       DIVERGEs to PASS, then promote from report-only to hard gate.
-      Corpus now 249 PASS / 1 DIVERGE / 250 total.  Probe sweep #10
-      added 25 PASS rows: bitwise on cols / literals
-      (`a&1`, `a|1`, `a&b&c`, `1<<2`, `8>>2`, `~1`, `+1`),
-      multi-arg builtins (`IFNULL(a,b)`, `NULLIF(a,b)`,
-      `COALESCE(a,b,c)`), CASE WHEN-with-string-result,
-      3-arm CASE, longer arith (`a+b*c-1`), parenthesized
-      `(a-b)`, `a/b`, 3-str concat, mixed CAST in select-list
-      (`a, CAST(b AS INTEGER)`), `WHERE b IS NOT NULL`,
-      float `0.5`, `a||1`, additional CREATE TABLE / SAVEPOINT /
-      RELEASE / INSERT shapes.
+      Corpus now 309 PASS / 1 DIVERGE / 310 total.  Probe sweeps
+      #11 and #12 added 60 PASS rows covering: identity-arith
+      (`a+0`, `a*1`, `1+a`, `2*a`, `5-a`, `a+a+a`, `a+1+1`,
+      `a-1+2`, `0+0`, `100-50`), column-column comparisons
+      (`a<b`, `a>b`, `a<=b`, `a>=b`, `a=b`, `a<>b`, `a==b`,
+      `a!=b`), literal comparisons (`1=1`, `1<2`, `2>1`,
+      `1<>2`), more rowid-EQ literals (10/100/-5/2), float
+      WHERE (`a=1.5`), `IS NULL` WHERE, INSERT VALUES big/neg-
+      big/all-NULL/zeros into both fixture tables, more
+      SAVEPOINT/RELEASE pairs, more CREATE INDEX / TABLE
+      (z12..z15, t(c), s(z)), concat-with-mixed-literal
+      (`'a'||a||'z'`, `a||'!'`, `'pre'||a`), more select-list
+      shapes (`a, b, 1`; `a, 1, b`; `1, 2`).
 
       DIVERGE shapes discovered in probe sweeps (kept out of corpus
       until they flip — each is a committable next-agent ticket):
