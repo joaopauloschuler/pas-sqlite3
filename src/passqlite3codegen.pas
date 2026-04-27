@@ -2942,7 +2942,8 @@ uses
   DateUtils,
   passqlite3printf,
   passqlite3json,
-  passqlite3jsoneach;
+  passqlite3jsoneach,
+  passqlite3vtab;
 
 { snpFmt — format into a PAnsiChar buffer using Pascal Format(); same arg order as sqlite3_snprintf }
 procedure snpFmt(n: i32; dst: PAnsiChar; const fmt: AnsiString;
@@ -18014,6 +18015,7 @@ var
   iAddrOnce:    i32;
   ii:           i32;
   countChg:     i32;
+  pVTab:        PAnsiChar;
 begin
   pTab     := nil;
   v        := nil;
@@ -18275,8 +18277,22 @@ begin
     { Emit the row delete (vtab xUpdate or core delete). }
     if pTab^.eTabType = TABTYP_VTAB then
     begin
-      { TODO(Phase 6.5): virtual-table OP_VUpdate emission.
-        Out of corpus for current TestExplainParity / TestWhereCorpus rows. }
+      { Virtual-table DELETE — port of delete.c:632..646.
+        sqlite3GetVTable returns the sqlite3_vtab* attached to pTab; cast to
+        a generic pointer for the OP_VUpdate p4=P4_VTAB payload. }
+      pVTab := PAnsiChar(sqlite3GetVTable(db, Pointer(pTab)));
+      sqlite3VtabMakeWritable(pParse, Pointer(pTab));
+      AssertH((eOnePass = ONEPASS_OFF) or (eOnePass = ONEPASS_SINGLE),
+              'DeleteFrom vtab eOnePass');
+      sqlite3MayAbort(pParse);
+      if eOnePass = ONEPASS_SINGLE then
+      begin
+        sqlite3VdbeAddOp1(v, OP_Close, iTabCur);
+        if pParse^.pToplevel = nil then
+          pParse^.isMultiWrite := 0;
+      end;
+      sqlite3VdbeAddOp4(v, OP_VUpdate, 0, 1, iKey, pVTab, P4_VTAB);
+      sqlite3VdbeChangeP5(v, OE_Abort);
     end else begin
       if pParse^.nested = 0 then countChg := 1 else countChg := 0;
       sqlite3GenerateRowDelete(pParse, pTab, pTrg, iDataCur, iIdxCur,

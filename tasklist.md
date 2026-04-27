@@ -36,8 +36,8 @@ Important: At the end of this document, please find:
     operatorMask + exprMightBeIndexed + minimal-viable exprAnalyze)
     are already ported.
       - [ ] port or re-enable `sqlite3Update`
-      - [ ] port or re-enable `sqlite3DeleteFrom` vtab `OP_VUpdate`.  
-      - [ ] port or re-enable `sqlite3GenerateRowDelete`,
+      - [X] port or re-enable `sqlite3DeleteFrom` vtab `OP_VUpdate`.
+      - [X] port or re-enable `sqlite3GenerateRowDelete`,
       - [ ] port or re-enable `sqlite3GenerateConstraintChecks`
       - [ ] port or re-enable `sqlite3CompleteInsertion`
 - [ ] **6.9-complete** complete the porting of `sqlite3VdbeRecordCompare` and
@@ -57,8 +57,6 @@ Important: At the end of this document, please find:
     - [ ] Port productive `sqlite3Update` body (skeleton-only today;
       blocks DROP TABLE Δ=21 destroyRootPage path and UPDATE rowid=1
       Δ=14).
-    - [ ] Port `sqlite3DeleteFrom` vtab `OP_VUpdate` arm (truncate +
-      where-loop arms already productive).
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Decomposition:
