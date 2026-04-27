@@ -40,6 +40,8 @@ Important: At the end of this document, please find:
       - [ ] port or re-enable `sqlite3GenerateRowDelete`,
       - [ ] port or re-enable `sqlite3GenerateConstraintChecks`
       - [ ] port or re-enable `sqlite3CompleteInsertion`
+- [ ] **6.9-complete** complete the porting of `sqlite3VdbeRecordCompare` and
+  `sqlite3VdbeFindCompare` in FULL in `passqlite3btree.pas`.  Handles MEM_Int / MEM_IntReal - currently insufficient for general index lookup.
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.    
     - [ ] Port `TestWhereCorpus.pas`
@@ -125,16 +127,6 @@ Important: At the end of this document, please find:
               test only diffs EXPLAIN bytecode; nothing in the suite
               executes an IN query end-to-end.
 
-            [X] **6.10 step 6.IPK-IN.b** (min-viable) — landed
-                2026-04-27.  `sqlite3VdbeRecordCompare` and
-                `sqlite3VdbeFindCompare` ported in `passqlite3btree.pas`
-                (replacing stubs).  Handles MEM_Int / MEM_IntReal /
-                MEM_Null RHS arms exactly; string / blob / real RHS
-                degrade to neutral (rc=0 → default_rc tail), correct
-                for single-int-key ephemeral btrees (the IPK-IN /
-                rowid-OR rewrite shape) but insufficient for general
-                index lookup.  Confirmed: `TestExplainParity` 1004/1005
-                and `TestWhereCorpus` 92/92 still green.
             [ ] **6.10 step 6.IPK-IN.a** Apply the hoist-gate fix
                 from (1).  C-oracle-shape bytecode confirmed
                 2026-04-27.  6.IPK-IN.d (the cursor-corruption crash)
@@ -162,20 +154,6 @@ Important: At the end of this document, please find:
                 column IN, OR-rewritten IN, and `rowid=K1 OR rowid=K2`.
                 Without runtime coverage, regressions of this class
                 keep slipping through the bytecode-only parity gate.
-            [X] **6.10 step 6.IPK-IN.d** — landed 2026-04-27.
-                `sqlite3VdbeMakeReady` was omitting `nMem += nCursor`
-                from vdbeaux.c:2679, so the `nCursor` Mem cells that
-                `allocateCursor` reserves at the top of `aMem[]`
-                (cursor i lives in `aMem[nMem-i]`) overlapped with
-                regular registers.  Any `OP_MakeRecord`/`OP_String`
-                writing into the colliding register clobbered
-                `pCx^.eCurType` and `pCx^.uc.pCursor`, surfacing as a
-                segfault inside `sqlite3VdbeFreeCursorNN` at finalize.
-                3-entry `WHERE rowid IN (1,2,3)` no longer crashes;
-                regression sweep `TestExplainParity` 1004/1005,
-                `TestWhereCorpus` 92/92, `TestDMLBasic` 54/54,
-                `TestSelectBasic` 49/49, `TestVdbeApi` 57/57,
-                `TestVdbeCursor` 27/27 all still green.
         [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
         [ ] `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3
