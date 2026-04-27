@@ -3498,10 +3498,86 @@ Important: At the end of this document, please find:
           44/44, TestWherePlanner 675/675, TestExplainParity 2/10
           (diverges unchanged).
 
-      Sub-progress 31 (next) options: (i) the DUP_AND duplicate-
-      predicate constant-folding hoist; (ii) `cast(... as ...)` codegen;
-      (iii) `printf()`/format scalars; (iv) begin TK_CASE codegen
-      landing.
+    - [X] Sub-progress 31 (diagnostic) — DIVERGE root-cause triage
+      (2026-04-27, findings fed into sp31 fix below).  Remaining 3
+      DIVERGE rows after sp30: **LEFT_JOIN** and **JOIN_WHERE** are
+      blocked on the multi-table planner (11g.2.d); both fall through
+      the `pSrc^.nSrc ≠ 1` gate and produce a 3-op stub.  **DUP_AND**
+      (`SELECT a FROM t WHERE a=5 AND a=5`) has C=14/Pas=14 ops but
+      first diff at op[1]: C emits `Integer 5` while Pascal emits
+      `Column`.  Root cause: C calls `propagateConstants` (select.c:
+      4945..4985) after `sqlite3SelectPrep`; this tags the duplicate
+      `a` reference with `EP_FixedCol`, causing the False-WHERE-Term-
+      Bypass loop in `sqlite3WhereBegin` to emit a compile-time
+      constant check before `OpenRead`.  Pascal has neither
+      `propagateConstants` nor the `EP_FixedCol` guard in the
+      `TK_COLUMN` arm of `sqlite3ExprCodeTarget`.
+
+    - [X] Sub-progress 31 — `propagateConstants` port + DUP_AND PASS
+      (2026-04-27).  Ports the constant-propagation optimization from
+      select.c:4719..4985 (~155 Pascal lines) and adds the matching
+      `EP_FixedCol` fast-path in `sqlite3ExprCodeTarget`.
+
+      (a) **`TWhereConst` struct** (codegen.pas ~line 1228): mirrors
+      select.c:4720..4729 — fields `pParse`, `pOomFault` (`PByte`),
+      `nConst`, `nChng`, `bHasAffBlob`, `mExcludeOn`, `apExpr`
+      (`PPExpr`).
+
+      (b) **`SQLITE_PropagateConst = u32($00008000)`** added to the
+      optimization-flag constants block (~line 1475).
+
+      (c) **`constInsert`** (select.c:4739..4780): inserts a
+      COLUMN/VALUE pair into `TWhereConst.apExpr`, guarded by
+      `EP_FixedCol`, value-affinity, and BINARY collation checks.
+      Duplicate-column guard loops over existing entries.
+
+      (d) **`findConstInWhere`** (select.c:4788..4812): recursively
+      walks `TK_AND` trees, collecting top-level `COLUMN=VALUE` terms
+      via `constInsert`.
+
+      (e) **`propagateConstantExprRewriteOne`** (select.c:4823..4856):
+      tags a matching `TK_COLUMN` node with `EP_FixedCol` and hangs
+      `sqlite3ExprDup(value)` off its `pLeft`.
+
+      (f) **`propagateConstantExprRewrite`** (select.c:4874..4892):
+      Walker `xExprCallback`; handles the `bHasAffBlob` path for
+      comparison operators (TK_EQ..TK_GE, TK_IS), then delegates to
+      `propagateConstantExprRewriteOne`.
+
+      (g) **`propagateConstants`** (select.c:4945..4985): top-level
+      driver; iterates until no new `nChng`; uses `JT_LTORJ` to set
+      `mExcludeOn`; drives the Walker over `p^.pWhere`.
+
+      (h) **Call site in `sqlite3Select`** (~line 15499): inserted
+      after `sqlite3SelectPrep` / `nErr` check, gated on
+      `p^.pWhere <> nil AND p^.pWhere^.op = TK_AND AND
+      OptimizationEnabled(db, SQLITE_PropagateConst)`.  Mirrors
+      select.c:7909..7912 exactly.
+
+      (i) **`EP_FixedCol` arm in `sqlite3ExprCodeTarget` TK_COLUMN
+      case** (codegen.pas ~line 4868): when `ExprHasProperty(pExpr,
+      EP_FixedCol)`, recursively codes `pExpr^.pLeft` (the constant),
+      then applies `OP_Affinity` if `sqlite3TableColumnAffinity >
+      SQLITE_AFF_BLOB`.  For untyped columns (BLOB affinity) the
+      OP_Affinity is skipped, matching C output exactly.  Mirrors
+      expr.c:5005..5024.
+
+      Test-suite delta:
+        * TestWhereCorpus: **55 PASS / 2 DIVERGE / 0 ERROR (corpus =
+          57)** — DUP_AND flips from DIVERGE to PASS (14 ops).
+          Failure-mode tally drops from `2 op-count + 1 op-diff` to
+          `2 op-count + 0 op-diff`.  LEFT_JOIN / JOIN_WHERE unchanged
+          (blocked on 11g.2.d multi-table planner).
+        * No regression: TestParser 45/45, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestPrepareBasic 20/20, TestWhereBasic 52/52,
+          TestWhereSimple 44/44, TestWhereExpr 84/84, TestWherePlanner
+          675/675, TestExplainParity 2/10 (diverges unchanged),
+          TestVdbeArith 41/41, TestJson 434/434.
+
+      Sub-progress 32 (next) options: (i) `cast(... as ...)` codegen;
+      (ii) `printf()`/format scalars; (iii) begin TK_CASE codegen;
+      (iv) expand corpus with additional predicate shapes.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

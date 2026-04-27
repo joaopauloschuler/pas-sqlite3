@@ -1224,6 +1224,18 @@ type
     _pad14:  u16;      { 2 bytes @ 14 — pad to 16 }
   end;
 
+  { --- TWhereConst (select.c:4719..4729) — workspace for propagateConstants --- }
+  PWhereConst = ^TWhereConst;
+  TWhereConst = record
+    pParse:      PParse;    { Parsing context }
+    pOomFault:   PByte;     { Pointer to pParse^.db^.mallocFailed }
+    nConst:      i32;       { Number of COLUMN=CONSTANT terms }
+    nChng:       i32;       { Number of times a constant is propagated }
+    bHasAffBlob: i32;       { At least one column in apExpr[] with affinity BLOB }
+    mExcludeOn:  u32;       { Which ON expressions to exclude (EP_OuterON or both) }
+    apExpr:      PPExpr;    { [i*2]=COLUMN, [i*2+1]=VALUE pairs }
+  end;
+
   { --- TWhereLoopBtree + TWhereLoopVtab + TWhereLoop (sizeof=104) --- }
   TWhereLoopBtree = record
     nEq:          u16;        { 2 bytes @ 0 }
@@ -1470,6 +1482,7 @@ const
   SQLITE_OnePass        = u32($08000000);
   SQLITE_OrderBySubq    = u32($10000000);  { ORDER BY in subquery helps outer (sqliteInt.h:1930) }
   SQLITE_StarQuery      = u32($20000000);  { Star-query heuristic in computeMxChoice (sqliteInt.h:1931) }
+  SQLITE_PropagateConst = u32($00008000);  { Constant propagation optimization (sqliteInt.h:1915) }
 
   { TOPBIT — top bit of a 64-bit Bitmask (sqliteInt.h:1414); used by
     whereLoopAddBtree's "covering by bitmask" check to detect the
@@ -1970,6 +1983,13 @@ function  sqlite3IndexedByLookup(pParse: PParse; pFrom: PSrcItem): i32;
 procedure sqlite3SelectPrep(pParse: PParse; p: PSelect;
   pOuterNC: PNameContext);
 procedure sqlite3SelectCheckOnClauses(pParse: PParse; pSelect: PSelect);
+{ propagateConstants family — select.c:4719..4985 (sub-progress 31) }
+procedure constInsert(pConst: PWhereConst; pColumn, pValue, pExpr: PExpr);
+procedure findConstInWhere(pConst: PWhereConst; pExpr: PExpr);
+function  propagateConstantExprRewriteOne(pConst: PWhereConst; pExpr: PExpr;
+  bIgnoreAffBlob: i32): i32;
+function  propagateConstantExprRewrite(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+function  propagateConstants(pParse: PParse; p: PSelect): i32;
 function  sqlite3Select(pParse: PParse; p: PSelect;
   pDest: PSelectDest): i32;
 procedure sqlite3DeleteTable(db: PTsqlite3; pTab: PTable2);
@@ -4845,14 +4865,41 @@ begin
         end;
       TK_COLUMN:
         begin
-          { Minimal port of expr.c:5002..5088 — emit OP_Column for a
-            resolved column reference.  Skips EP_FixedCol /
-            iSelfTab<0 (CHECK constraint context) / partial-index
-            expression-shadowing arms; those land with the broader
-            wherecode.c port.  pExpr^.y.pTab is set by the resolver;
+          { Port of expr.c:5002..5088.
+
+            EP_FixedCol arm (expr.c:5005..5024, sub-progress 31): when
+            propagateConstants has tagged this column reference with a
+            constant equivalent, code the constant (pLeft) instead of
+            reading from the table, then apply the column affinity if it
+            is stricter than BLOB.  This is what produces the OP_Integer
+            before OpenRead in DUP_AND-style queries. }
+          if ExprHasProperty(pExpr, EP_FixedCol) then
+          begin
+            { EP_FixedCol: code the constant pLeft instead of the column,
+              then apply column affinity if > BLOB (expr.c:5005..5024).
+              For untyped columns (BLOB affinity) the OP_Affinity is skipped. }
+            r1  := sqlite3ExprCodeTarget(pParse, pExpr^.pLeft, target);
+            Assert((pExpr^.flags and EP_xIsSelect) = 0); { ExprUseYTab }
+            Assert(pExpr^.y.pTab <> nil);
+            n   := Byte(sqlite3TableColumnAffinity(pExpr^.y.pTab, pExpr^.iColumn));
+            if n > SQLITE_AFF_BLOB then begin
+              { Apply a 1-char affinity coercion; allocate a db-owned string
+                so the VDBE can own it via P4_DYNAMIC. }
+              z := sqlite3DbMallocZero(pParse^.db, 2);
+              if z <> nil then begin
+                z[0] := AnsiChar(n);
+                z[1] := AnsiChar(0);
+                sqlite3VdbeAddOp4(v, OP_Affinity, r1, 1, 0, z, P4_DYNAMIC);
+              end;
+            end;
+            Result := r1;
+            done := True;
+          end
+          { Resolved column reference — emit OP_Column.
+            pExpr^.y.pTab is set by the resolver;
             sqlite3ExprCodeGetColumnOfTable handles iColumn=-1 (rowid)
             via OP_Rowid and ordinary columns via OP_Column. }
-          if (pExpr^.y.pTab <> nil) and (pExpr^.iTable >= 0) then
+          else if (pExpr^.y.pTab <> nil) and (pExpr^.iTable >= 0) then
           begin
             sqlite3ExprCodeGetColumnOfTable(v, pExpr^.y.pTab,
               pExpr^.iTable, pExpr^.iColumn, target);
@@ -15239,6 +15286,191 @@ begin
   { Phase 6.5 stub }
 end;
 
+{ propagateConstants family — port of select.c:4719..4985.
+
+  Phase 6.9-bis 11g.2.f sub-progress 31 (2026-04-27).
+
+  Implements constant propagation for WHERE clauses of the form
+  COLUMN=VALUE AND ... so that duplicate predicates like `a=5 AND a=5`
+  get the second `a` tagged with EP_FixedCol (pointing at the literal 5),
+  which causes the False-WHERE-Term-Bypass loop in sqlite3WhereBegin to
+  emit a compile-time equality check before OpenRead — matching C bytecode.
+
+  Four functions mirror the C helpers verbatim:
+    constInsert                      (select.c:4739..4780)
+    findConstInWhere                 (select.c:4788..4812)
+    propagateConstantExprRewriteOne  (select.c:4823..4856)
+    propagateConstantExprRewrite     (select.c:4874..4892) — Walker callback
+    propagateConstants               (select.c:4945..4985) — top-level driver }
+
+{ constInsert — add a COLUMN=VALUE pair to pConst, avoiding duplicates.
+  select.c:4739..4780. }
+procedure constInsert(pConst: PWhereConst; pColumn, pValue, pExpr: PExpr);
+var
+  i:      i32;
+  pE2:    PExpr;
+  newSz:  PtrUInt;
+  ppNew:  PPExpr;
+begin
+  Assert(pColumn^.op = TK_COLUMN);
+  Assert(sqlite3ExprIsConstant(pConst^.pParse, pValue) <> 0);
+
+  if ExprHasProperty(pColumn, EP_FixedCol) then Exit;
+  if sqlite3ExprAffinity(pValue) <> AnsiChar(0) then Exit;
+  if sqlite3IsBinary(sqlite3ExprCompareCollSeq(pConst^.pParse, pExpr)) = 0 then
+    Exit;
+
+  { 2018-10-25 ticket [cf5ed20f] — no duplicate pColumn entries }
+  for i := 0 to pConst^.nConst - 1 do begin
+    pE2 := pConst^.apExpr[i * 2];
+    Assert(pE2^.op = TK_COLUMN);
+    if (pE2^.iTable = pColumn^.iTable) and (pE2^.iColumn = pColumn^.iColumn) then
+      Exit;  { already present }
+  end;
+
+  Assert(SQLITE_AFF_NONE < SQLITE_AFF_BLOB);
+  if Byte(sqlite3ExprAffinity(pColumn)) <= SQLITE_AFF_BLOB then
+    pConst^.bHasAffBlob := 1;
+
+  Inc(pConst^.nConst);
+  newSz := PtrUInt(pConst^.nConst) * 2 * SizeOf(PExpr);
+  ppNew := PPExpr(sqlite3DbReallocOrFree(pConst^.pParse^.db,
+                                         pConst^.apExpr, newSz));
+  if ppNew = nil then
+    pConst^.nConst := 0
+  else begin
+    pConst^.apExpr := ppNew;
+    pConst^.apExpr[pConst^.nConst * 2 - 2] := pColumn;
+    pConst^.apExpr[pConst^.nConst * 2 - 1] := pValue;
+  end;
+end;
+
+{ findConstInWhere — walk pExpr collecting top-level AND-connected
+  COLUMN=VALUE terms into pConst.  select.c:4788..4812. }
+procedure findConstInWhere(pConst: PWhereConst; pExpr: PExpr);
+var
+  pRight, pLeft: PExpr;
+begin
+  if pExpr = nil then Exit;  { NEVER(pExpr=0) guard }
+  if ExprHasProperty(pExpr, pConst^.mExcludeOn) then Exit;
+  if pExpr^.op = TK_AND then begin
+    findConstInWhere(pConst, pExpr^.pRight);
+    findConstInWhere(pConst, pExpr^.pLeft);
+    Exit;
+  end;
+  if pExpr^.op <> TK_EQ then Exit;
+  pRight := pExpr^.pRight;
+  pLeft  := pExpr^.pLeft;
+  Assert(pRight <> nil);
+  Assert(pLeft  <> nil);
+  if (pRight^.op = TK_COLUMN)
+     and (sqlite3ExprIsConstant(pConst^.pParse, pLeft) <> 0) then
+    constInsert(pConst, pRight, pLeft, pExpr);
+  if (pLeft^.op = TK_COLUMN)
+     and (sqlite3ExprIsConstant(pConst^.pParse, pRight) <> 0) then
+    constInsert(pConst, pLeft, pRight, pExpr);
+end;
+
+{ propagateConstantExprRewriteOne — try to tag pExpr with EP_FixedCol if it
+  matches a known COLUMN in pConst.  select.c:4823..4856. }
+function propagateConstantExprRewriteOne(pConst: PWhereConst; pExpr: PExpr;
+  bIgnoreAffBlob: i32): i32;
+var
+  i:       i32;
+  pColumn: PExpr;
+begin
+  if pConst^.pOomFault^ <> 0 then begin Result := WRC_Prune; Exit; end;
+  if pExpr^.op <> TK_COLUMN then begin Result := WRC_Continue; Exit; end;
+  if ExprHasProperty(pExpr, EP_FixedCol or pConst^.mExcludeOn) then
+  begin
+    Result := WRC_Continue; Exit;
+  end;
+  for i := 0 to pConst^.nConst - 1 do begin
+    pColumn := pConst^.apExpr[i * 2];
+    if pColumn = pExpr then Continue;
+    if pColumn^.iTable  <> pExpr^.iTable  then Continue;
+    if pColumn^.iColumn <> pExpr^.iColumn then Continue;
+    Assert(SQLITE_AFF_NONE < SQLITE_AFF_BLOB);
+    if (bIgnoreAffBlob <> 0)
+       and (Byte(sqlite3ExprAffinity(pColumn)) <= SQLITE_AFF_BLOB) then
+      Break;
+    { Match found — tag with EP_FixedCol }
+    Inc(pConst^.nChng);
+    ExprClearProperty(pExpr, EP_Leaf);
+    ExprSetProperty(pExpr, EP_FixedCol);
+    Assert(pExpr^.pLeft = nil);
+    pExpr^.pLeft := sqlite3ExprDup(pConst^.pParse^.db,
+                                    pConst^.apExpr[i * 2 + 1], 0);
+    if pConst^.pParse^.db^.mallocFailed <> 0 then
+    begin Result := WRC_Prune; Exit; end;
+    Break;
+  end;
+  Result := WRC_Prune;
+end;
+
+{ propagateConstantExprRewrite — Walker xExprCallback.
+  select.c:4874..4892. }
+function propagateConstantExprRewrite(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pConst: PWhereConst;
+begin
+  pConst := PWhereConst(pWalker^.u.ptr);
+  { assert( TK_GT_TK==TK_EQ+1 ); assert( TK_LE==TK_EQ+2 );
+    assert( TK_LT==TK_EQ+3  ); assert( TK_GE==TK_EQ+4  ); }
+  if pConst^.bHasAffBlob <> 0 then begin
+    if ((pExpr^.op >= TK_EQ) and (pExpr^.op <= TK_GE))
+        or (pExpr^.op = TK_IS) then begin
+      propagateConstantExprRewriteOne(pConst, pExpr^.pLeft, 0);
+      if pConst^.pOomFault^ <> 0 then begin Result := WRC_Prune; Exit; end;
+      if sqlite3ExprAffinity(pExpr^.pLeft) <> AnsiChar(SQLITE_AFF_TEXT) then
+        propagateConstantExprRewriteOne(pConst, pExpr^.pRight, 0);
+    end;
+  end;
+  Result := propagateConstantExprRewriteOne(pConst, pExpr, pConst^.bHasAffBlob);
+end;
+
+{ propagateConstants — top-level driver.  select.c:4945..4985.
+  Returns non-zero if any substitutions were made. }
+function propagateConstants(pParse: PParse; p: PSelect): i32;
+var
+  x:     TWhereConst;
+  w:     TWalker;
+  nChng: i32;
+  pSrcA: PSrcItem;
+begin
+  x.pParse    := pParse;
+  x.pOomFault := @pParse^.db^.mallocFailed;
+  nChng       := 0;
+  repeat
+    x.nConst      := 0;
+    x.nChng       := 0;
+    x.apExpr      := nil;
+    x.bHasAffBlob := 0;
+    if (p^.pSrc <> nil) and (p^.pSrc^.nSrc > 0) then begin
+      pSrcA := SrcListItems(p^.pSrc);
+      if (pSrcA^.fg.jointype and JT_LTORJ) <> 0 then
+        x.mExcludeOn := EP_InnerON or EP_OuterON
+      else
+        x.mExcludeOn := EP_OuterON;
+    end else
+      x.mExcludeOn := EP_OuterON;
+    findConstInWhere(@x, p^.pWhere);
+    if x.nConst > 0 then begin
+      FillChar(w, SizeOf(w), 0);
+      w.pParse           := pParse;
+      w.xExprCallback    := @propagateConstantExprRewrite;
+      w.xSelectCallback  := @sqlite3SelectWalkNoop;
+      w.xSelectCallback2 := nil;
+      w.walkerDepth      := 0;
+      w.u.ptr            := @x;
+      sqlite3WalkExpr(@w, p^.pWhere);
+      sqlite3DbFree(x.pParse^.db, x.apExpr);
+      nChng := nChng + x.nChng;
+    end;
+  until x.nChng = 0;
+  Result := nChng;
+end;
+
 { sqlite3Select — main SELECT code generator.
 
   Phase 6.9-bis step 11g.2.f sub-progress 5 (2026-04-27).
@@ -15293,6 +15525,16 @@ begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
   if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+
+  { WHERE-clause constant propagation — select.c:7904..7922 (sub-progress 31).
+    Mirror C exactly: gate on TK_AND + OptimizationEnabled(SQLITE_PropagateConst).
+    For single-table queries the WHERE planner in sqlite3WhereBegin would also
+    handle constant columns, but applying it here first lets duplicate predicates
+    like `a=5 AND a=5` have the second `a` rewritten to EP_FixedCol before the
+    False-WHERE-Term-Bypass loop fires, producing byte-identical bytecode. }
+  if (p^.pWhere <> nil) and (p^.pWhere^.op = TK_AND)
+     and OptimizationEnabled(pParse^.db, SQLITE_PropagateConst) then
+    propagateConstants(pParse, p);
 
   { Trivial-gate guards — bail out (same as the prior stub) for any
     non-full-scan / non-single-table / non-Output form.  Each of these
