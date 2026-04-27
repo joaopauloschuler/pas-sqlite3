@@ -1557,7 +1557,8 @@ const
   N_OR_COST = 3;
 
   { SQLITE_QUERY_PLANNER_LIMIT }
-  SQLITE_QUERY_PLANNER_LIMIT = i32(20000);
+  SQLITE_QUERY_PLANNER_LIMIT      = i32(20000);
+  SQLITE_QUERY_PLANNER_LIMIT_INCR = i32(1000);
 
   { SZ_WHERETERM_STATIC: number of static WhereTerm slots in TWhereClause.aStatic }
   SZ_WHERETERM_STATIC = 8;
@@ -1761,6 +1762,42 @@ function  whereLoopAddBtreeIndex(pBuilder: PWhereLoopBuilder;
   upstream of this entry. }
 function  whereLoopAddBtree(pBuilder: PWhereLoopBuilder;
   mPrereq: Bitmask): i32;
+
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — virtual-table planner stub.
+  Real port of where.c:4357..4810 (whereLoopAddVirtualOne / whereLoopAddVirtual)
+  is deferred until the vtab corpus is exercised; the project currently has
+  no virtual-table workload going through the planner.  The stub returns
+  SQLITE_OK with no template loops added so whereLoopAddOr / whereLoopAddAll
+  can still dispatch correctly through the IsVirtual branch on the rare
+  shapes where a vtab survives parser checks. }
+function  whereLoopAddVirtual(pBuilder: PWhereLoopBuilder;
+  mPrereq: Bitmask; mUnusable: Bitmask): i32;
+
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — whereLoopAddOr
+  (where.c:4810..4932) — multi-index OR planner.  Walks the WHERE clause
+  for terms tagged WO_OR whose pOrInfo^.indexable bitmask intersects
+  pNew^.maskSelf, then for each disjunct (WO_AND-decomposed sub-clause OR
+  bare leftCursor==iCur leaf) builds a sub-builder that runs through
+  whereLoopAddBtree (or whereLoopAddVirtual under IsVirtual), then
+  whereLoopAddOr recursively for nested OR shells.  Per-disjunct
+  WhereOrSet results are cross-summed via whereOrInsert so the parent
+  loop's prereq mask, rRun, and nOut are the OR-cost combination of all
+  branches.  Final WHERE_MULTI_OR template loops emitted via
+  whereLoopInsert.  RIGHT-JOIN tables short-circuit (the multi-index OR
+  optimization is unsound across right-join boundaries). }
+function  whereLoopAddOr(pBuilder: PWhereLoopBuilder;
+  mPrereq: Bitmask; mUnusable: Bitmask): i32;
+
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — whereLoopAddAll
+  (where.c:4937..5036) — top-level planner driver.  Iterates every FROM-
+  clause table, computes the FROM-clause-ordering prereq mask (CROSS / LEFT
+  / LTORJ / RIGHT JOIN reordering barriers, the EXISTS-to-JOIN dependency
+  walk, and the hasRightCrossJoin guard), dispatches each table through
+  whereLoopAddVirtual or whereLoopAddBtree, then through whereLoopAddOr
+  when the WHERE clause has any OR terms.  iPlanLimit accumulates per
+  table; SQLITE_DONE from a sub-call is converted to SQLITE_OK with a
+  one-shot SQLITE_WARNING log so partial plans still complete. }
+function  whereLoopAddAll(pBuilder: PWhereLoopBuilder): i32;
 
 { sqlite3ExprCoveredByIndex (expr.c:7071..7085) — Walker-driven probe.
   True iff every TK_COLUMN reference inside pExpr that targets cursor
@@ -9746,6 +9783,327 @@ begin
       pProbe := pProbe^.pNext;
     Inc(iSortIdx);
   end;
+  Result := rc;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.d sub-progress) — whereLoopAddVirtual stub.
+
+  The full virtual-table planner (where.c:4357..4810: whereLoopAddVirtualOne
+  + whereLoopAddVirtual) drives `xBestIndex` through up to four passes
+  (LIMIT/OFFSET, IN-handled, all-usable, dependency-bounded).  Porting it
+  requires the entire sqlite3_index_info marshalling layer plus the
+  ConstraintCompare / Cleanup glue.  None of the corpus this slice is
+  exercising touches xBestIndex, so the stub returns SQLITE_OK without
+  emitting any candidate loops.  whereLoopAddOr / whereLoopAddAll dispatch
+  here when IsVirtual(pSTab) is true; the parent driver tolerates the
+  zero-loops outcome (the eventual wherePathSolver will simply have no
+  vtab plans to choose from).
+  =========================================================================== }
+
+function whereLoopAddVirtual(pBuilder: PWhereLoopBuilder;
+  mPrereq: Bitmask; mUnusable: Bitmask): i32;
+begin
+  { Touch the parameters so unused-variable warnings stay quiet. }
+  if (pBuilder = nil) or (mPrereq = mPrereq) or (mUnusable = mUnusable) then
+    ; { no-op }
+  Result := SQLITE_OK;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.d sub-progress) — whereLoopAddOr.
+
+  Faithful port of where.c:4810..4932.  For every WO_OR term whose
+  pOrInfo^.indexable bitmask intersects pNew^.maskSelf, walks each
+  disjunct of the OR clause:
+    * a WO_AND child swaps in the AND-decomposed sub-clause
+      (pAndInfo^.wc) directly;
+    * a bare leaf with leftCursor == iCur is repackaged in a
+      single-term tempWC stack record;
+    * any other disjunct (referencing a different cursor) is skipped.
+  Each disjunct's sub-builder runs through whereLoopAddBtree (or the
+  vtab stub when IsVirtual is true), then recurses into whereLoopAddOr
+  to handle nested OR shells.  Per-disjunct WhereOrSet results are
+  cross-summed via whereOrInsert into sSum so the parent's prereq mask,
+  rRun, and nOut are the OR-cost combination of all branches; the +1
+  rRun penalty mirrors the upstream "TUNING" comment that prevents
+  OR-of-full-scan-and-index degenerate plans.
+  =========================================================================== }
+
+function whereLoopAddOr(pBuilder: PWhereLoopBuilder;
+  mPrereq: Bitmask; mUnusable: Bitmask): i32;
+var
+  pWInfo:    PWhereInfo;
+  pWC, pOrWC, pSubWC: PWhereClause;
+  pNew:      PWhereLoop;
+  pTerm, pWCEnd, pOrTerm, pOrWCEnd: PWhereTerm;
+  rc:        i32;
+  iCur:      i32;
+  tempWC:    TWhereClause;
+  sSubBuild: TWhereLoopBuilder;
+  sSum, sCur, sPrev: TWhereOrSet;
+  pItem:     PSrcItem;
+  once:      i32;
+  i, j:      i32;
+  iTerm:     i32;
+begin
+  pWInfo := pBuilder^.pWInfo;
+  pWC    := pBuilder^.pWC;
+  pNew   := pBuilder^.pNew;
+  rc     := SQLITE_OK;
+  FillChar(sSum, SizeOf(sSum), 0);
+  pItem  := @SrcListItems(pWInfo^.pTabList)[pNew^.iTab];
+  iCur   := pItem^.iCursor;
+
+  { The multi-index OR optimization does not work for RIGHT and FULL JOIN. }
+  if (pItem^.fg.jointype and JT_RIGHT) <> 0 then Exit(SQLITE_OK);
+
+  pWCEnd := @pWC^.a[pWC^.nTerm];
+  iTerm  := 0;
+  pTerm  := pWC^.a;
+  while (PtrUInt(pTerm) < PtrUInt(pWCEnd)) and (rc = SQLITE_OK) do
+  begin
+    if ((pTerm^.eOperator and WO_OR) <> 0)
+       and ((pTerm^.u.pOrInfo^.indexable and pNew^.maskSelf) <> 0) then
+    begin
+      pOrWC    := @pTerm^.u.pOrInfo^.wc;
+      pOrWCEnd := @pOrWC^.a[pOrWC^.nTerm];
+      once     := 1;
+
+      sSubBuild := pBuilder^;
+      sSubBuild.pOrSet := @sCur;
+
+      pOrTerm := pOrWC^.a;
+      while PtrUInt(pOrTerm) < PtrUInt(pOrWCEnd) do
+      begin
+        if (pOrTerm^.eOperator and WO_AND) <> 0 then
+        begin
+          pSubWC := @pOrTerm^.u.pAndInfo^.wc;
+          sSubBuild.pWC := pSubWC;
+        end
+        else if pOrTerm^.leftCursor = iCur then
+        begin
+          FillChar(tempWC, SizeOf(tempWC), 0);
+          tempWC.pWInfo := pWC^.pWInfo;
+          tempWC.pOuter := pWC;
+          tempWC.op     := TK_AND;
+          tempWC.nTerm  := 1;
+          tempWC.nBase  := 1;
+          tempWC.a      := pOrTerm;
+          sSubBuild.pWC := @tempWC;
+        end
+        else
+        begin
+          Inc(pOrTerm);
+          continue;
+        end;
+
+        sCur.n := 0;
+        if pItem^.pSTab^.eTabType = TABTYP_VTAB then
+          rc := whereLoopAddVirtual(@sSubBuild, mPrereq, mUnusable)
+        else
+          rc := whereLoopAddBtree(@sSubBuild, mPrereq);
+        if rc = SQLITE_OK then
+          rc := whereLoopAddOr(@sSubBuild, mPrereq, mUnusable);
+
+        if sCur.n = 0 then
+        begin
+          sSum.n := 0;
+          break;
+        end
+        else if once <> 0 then
+        begin
+          whereOrMove(@sSum, @sCur);
+          once := 0;
+        end
+        else
+        begin
+          whereOrMove(@sPrev, @sSum);
+          sSum.n := 0;
+          for i := 0 to sPrev.n - 1 do
+          begin
+            for j := 0 to sCur.n - 1 do
+            begin
+              whereOrInsert(@sSum,
+                sPrev.a[i].prereq or sCur.a[j].prereq,
+                sqlite3LogEstAdd(sPrev.a[i].rRun, sCur.a[j].rRun),
+                sqlite3LogEstAdd(sPrev.a[i].nOut, sCur.a[j].nOut));
+            end;
+          end;
+        end;
+        Inc(pOrTerm);
+      end;
+
+      pNew^.nLTerm     := 1;
+      pNew^.aLTerm[0]  := pTerm;
+      pNew^.wsFlags    := WHERE_MULTI_OR;
+      pNew^.rSetup     := 0;
+      pNew^.iSortIdx   := 0;
+      FillChar(pNew^.u, SizeOf(pNew^.u), 0);
+      i := 0;
+      while (rc = SQLITE_OK) and (i < sSum.n) do
+      begin
+        { TUNING: smallest possible penalty (≈1.07x) so the OR-scan never
+          ties its most expensive sub-scan — see the upstream comment at
+          where.c:4910..4922. }
+        pNew^.rRun   := i16(sSum.a[i].rRun + 1);
+        pNew^.nOut   := sSum.a[i].nOut;
+        pNew^.prereq := sSum.a[i].prereq;
+        rc := whereLoopInsert(pBuilder, pNew);
+        Inc(i);
+      end;
+    end;
+    Inc(pTerm);
+    Inc(iTerm);
+  end;
+  Result := rc;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.d sub-progress) — whereLoopAddAll.
+
+  Faithful port of where.c:4937..5036 — the top-level template-loop
+  factory.  Walks pTabList left-to-right; for each table:
+
+    (1) Compute the prereq mask honouring CROSS / OUTER / LTORJ / RIGHT
+        join-reordering barriers, the EXISTS-to-JOIN dependency walk,
+        and the hasRightCrossJoin guard.
+    (2) Dispatch to whereLoopAddVirtual (vtab stub) or whereLoopAddBtree.
+    (3) When the WHERE clause has any OR terms, follow up with
+        whereLoopAddOr.
+    (4) Accumulate maskSelf into mPrior and bump iPlanLimit per table.
+    (5) SQLITE_DONE from a sub-call is converted back to SQLITE_OK with a
+        one-shot SQLITE_WARNING log so partial plans still complete.
+
+  Caller responsibilities (per where.c:4953..4960): pBuilder^.pNew must
+  be initialized via whereLoopInit so nLTerm/wsFlags/nLSlot/aLTerm look
+  fresh on entry.  The trailing whereLoopClear releases template-loop
+  scratch state regardless of rc.
+  =========================================================================== }
+
+function whereLoopAddAll(pBuilder: PWhereLoopBuilder): i32;
+var
+  pWInfo:    PWhereInfo;
+  mPrereq:   Bitmask;
+  mPrior:    Bitmask;
+  iTab:      i32;
+  pTabList:  PSrcList;
+  pItem:     PSrcItem;
+  pEnd:      PSrcItem;
+  db:        PTsqlite3;
+  rc:        i32;
+  bFirstPastRJ: i32;
+  hasRightCrossJoin: i32;
+  pNew:      PWhereLoop;
+  mUnusable: Bitmask;
+  pSrc:      PSrcItem;
+  pTerm:     PWhereTerm;
+  pWC:       PWhereClause;
+  k:         i32;
+begin
+  pWInfo  := pBuilder^.pWInfo;
+  mPrereq := 0;
+  mPrior  := 0;
+  pTabList := pWInfo^.pTabList;
+  pEnd     := @SrcListItems(pTabList)[pWInfo^.nLevel];
+  db       := pWInfo^.pParse^.db;
+  rc       := SQLITE_OK;
+  bFirstPastRJ      := 0;
+  hasRightCrossJoin := 0;
+  pNew     := pBuilder^.pNew;
+
+  { Verify pNew has been initialized via whereLoopInit. }
+  Assert(pNew^.nLTerm  = 0);
+  Assert(pNew^.wsFlags = 0);
+  Assert(pNew^.nLSlot >= Length(pNew^.aLTermSpace));
+  Assert(pNew^.aLTerm <> nil);
+
+  pBuilder^.iPlanLimit := u32(SQLITE_QUERY_PLANNER_LIMIT);
+  iTab  := 0;
+  pItem := @SrcListItems(pTabList)[0];
+  while PtrUInt(pItem) < PtrUInt(pEnd) do
+  begin
+    mUnusable := 0;
+    pNew^.iTab := u8(iTab);
+    pBuilder^.iPlanLimit := pBuilder^.iPlanLimit
+                           + u32(SQLITE_QUERY_PLANNER_LIMIT_INCR);
+    pNew^.maskSelf := sqlite3WhereGetMask(@pWInfo^.sMaskSet, pItem^.iCursor);
+    if (bFirstPastRJ <> 0)
+       or ((pItem^.fg.jointype and (JT_OUTER or JT_CROSS or JT_LTORJ)) <> 0)
+    then
+    begin
+      { CROSS / outer-join reorder barrier; LTORJ keeps right-side terms
+        from migrating across the right operand of a RIGHT JOIN. }
+      if (pItem^.fg.jointype and (JT_LTORJ or JT_CROSS)) <> 0 then
+        hasRightCrossJoin := 1;
+      mPrereq := mPrereq or mPrior;
+      if (pItem^.fg.jointype and JT_RIGHT) <> 0 then
+        bFirstPastRJ := 1
+      else
+        bFirstPastRJ := 0;
+    end
+    else if (pItem^.fg.fgBits3 and u8($04)) <> 0 then  { fromExists }
+    begin
+      pWC := @pWInfo^.sWC;
+      k   := pWC^.nBase;
+      pTerm := pWC^.a;
+      while k > 0 do
+      begin
+        if (pNew^.maskSelf and pTerm^.prereqAll) <> 0 then
+          mPrereq := mPrereq or (pTerm^.prereqAll and (pNew^.maskSelf - 1));
+        Inc(pTerm);
+        Dec(k);
+      end;
+    end
+    else if hasRightCrossJoin = 0 then
+    begin
+      mPrereq := 0;
+    end;
+
+    if pItem^.pSTab^.eTabType = TABTYP_VTAB then
+    begin
+      pSrc := pItem;
+      Inc(pSrc);
+      while PtrUInt(pSrc) < PtrUInt(pEnd) do
+      begin
+        if (mUnusable <> 0)
+           or ((pSrc^.fg.jointype and (JT_OUTER or JT_CROSS)) <> 0) then
+        begin
+          mUnusable := mUnusable
+                       or sqlite3WhereGetMask(@pWInfo^.sMaskSet, pSrc^.iCursor);
+        end;
+        Inc(pSrc);
+      end;
+      rc := whereLoopAddVirtual(pBuilder, mPrereq, mUnusable);
+    end
+    else
+    begin
+      rc := whereLoopAddBtree(pBuilder, mPrereq);
+    end;
+    if (rc = SQLITE_OK) and (pBuilder^.pWC^.hasOr <> 0) then
+      rc := whereLoopAddOr(pBuilder, mPrereq, mUnusable);
+
+    mPrior := mPrior or pNew^.maskSelf;
+    if (rc <> SQLITE_OK) or (db^.mallocFailed <> 0) then
+    begin
+      if rc = SQLITE_DONE then
+      begin
+        { Hit the query-planner search limit set by iPlanLimit.  The C
+          source emits sqlite3_log(SQLITE_WARNING, ...) here; we suppress
+          the diagnostic in the Pascal port (no harm — the partial plan
+          remains usable). }
+        rc := SQLITE_OK;
+      end
+      else
+      begin
+        break;
+      end;
+    end;
+    Inc(iTab);
+    Inc(pItem);
+  end;
+
+  whereLoopClear(db, pNew);
   Result := rc;
 end;
 

@@ -359,6 +359,36 @@ Important: At the end of this document, please find:
       indices + no AutoIndex → zero loops), WLAB4 (auto-index path
       enabled but the only WHERE term targets the rowid alias →
       termCanDriveIndex rejects, IPK probe still produces one loop).
+    - [X] `whereLoopAddOr` + `whereLoopAddAll` + `whereLoopAddVirtual`
+      stub (where.c:4810..5036) — top-level template-loop driver and the
+      multi-index OR factory.  `whereLoopAddOr` walks the WHERE clause
+      for terms tagged WO_OR whose pOrInfo^.indexable bitmask intersects
+      pNew^.maskSelf, dispatches each disjunct (WO_AND child →
+      pAndInfo^.wc; bare leftCursor==iCur leaf → single-term tempWC;
+      otherwise skip) through whereLoopAddBtree (or the vtab stub) and
+      then recursively whereLoopAddOr, cross-summing per-disjunct
+      WhereOrSet results into sSum via whereOrInsert with the +1 rRun
+      "TUNING" penalty so OR-of-full-scan-and-index plans never
+      tie their most expensive sub-scan.  WHERE_MULTI_OR template
+      emitted via whereLoopInsert; JT_RIGHT short-circuits the entire
+      walk (the multi-index OR optimisation is unsound across right-join
+      boundaries).  `whereLoopAddAll` walks every FROM-clause table,
+      computes the prereq mask honouring CROSS / OUTER / LTORJ / RIGHT
+      reorder barriers, the EXISTS-to-JOIN dependency walk, and the
+      hasRightCrossJoin guard; dispatches to whereLoopAddVirtual
+      (TABTYP_VTAB) or whereLoopAddBtree, then whereLoopAddOr when
+      pWC^.hasOr is set; iPlanLimit accumulates per table.  SQLITE_DONE
+      collapses to SQLITE_OK so partial plans still complete.  The
+      virtual-table arm is a SQLITE_OK-no-loops stub — the full
+      whereLoopAddVirtualOne / whereLoopAddVirtual port (xBestIndex
+      driver, sqlite3_index_info marshalling) is deferred until the
+      vtab corpus is exercised.  `SQLITE_QUERY_PLANNER_LIMIT_INCR=1000`
+      lifted from whereInt.h:455..459.  Gate: `TestWherePlanner.pas`
+      (231/231): WLAA1 (single-table empty WC → IPK loop, iPlanLimit
+      bumped), WLAA2 (vtab table → zero loops via stub), WLAA3 (hasOr
+      routes to AddOr but empty WC keeps single IPK loop), WLAA4
+      (two-table CROSS → two IPK loops, double iPlanLimit bump),
+      WLAO1 (JT_RIGHT short-circuits), WLAO2 (no WO_OR term → no-op).
     - [X] `whereRangeScanEst` (where.c:2092..2254, no-STAT4 tail) —
       reduces `pLoop^.nOut` to account for the leftover range
       constraints on the leading (nEq+1)'th column of the index pLoop

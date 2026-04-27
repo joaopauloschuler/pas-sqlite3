@@ -2255,6 +2255,195 @@ begin
   sqlite3_close(db);
 end;
 
+{ ---------------------------------------------------------------------------
+  whereLoopAddAll + whereLoopAddOr — top-level planner driver (where.c:4937)
+  and multi-index OR template-loop factory (where.c:4810).
+
+  These run on the same single-table fixture as TestWhereLoopAddBtree but
+  enter the planner through the public driver (whereLoopAddAll) so the
+  prereq-mask + IsVirtual + hasOr dispatch arms are exercised.  The new
+  RIGHT-JOIN short-circuit and the WO_OR walk in whereLoopAddOr get
+  direct cases too.
+  =========================================================================== }
+
+procedure TestWhereLoopAddAllAndOr;
+const
+  iCur0 = 11;
+  iCur1 = 12;
+type
+  TSrcListBuf3 = record
+    hdr:   TSrcList;
+    item0: TSrcItem;
+    item1: TSrcItem;       { only used for two-table cases }
+  end;
+var
+  db:        PTsqlite3;
+  rc:        i32;
+  parse:     TParse;
+  wInfoBuf:  array[0..1023] of u8;
+  pWInfo:    PWhereInfo;
+  bld:       TWhereLoopBuilder;
+  pNew:      TWhereLoop;
+  tab:       TTable;
+  src:       TSrcListBuf3;
+  p:         PWhereLoop;
+  nLoops, nIpk, nMOR: i32;
+
+  procedure ResetLoops;
+  begin
+    while pWInfo^.pLoops <> nil do
+    begin
+      p := pWInfo^.pLoops;
+      pWInfo^.pLoops := p^.pNextLoop;
+      whereLoopDelete(db, p);
+    end;
+    pWInfo^.sWC.nTerm := 0;
+    pWInfo^.sWC.nBase := 0;
+    pWInfo^.sWC.hasOr := 0;
+    FillChar(pWInfo^.sWC.aStatic, SizeOf(pWInfo^.sWC.aStatic), 0);
+    bld.bldFlags1  := 0;
+    FillChar(pNew, SizeOf(pNew), 0);
+    whereLoopInit(@pNew);
+    pNew.iTab     := 0;
+    pNew.maskSelf := 1;
+  end;
+
+  procedure CountLoops;
+  begin
+    nLoops := 0; nIpk := 0; nMOR := 0;
+    p := pWInfo^.pLoops;
+    while p <> nil do
+    begin
+      Inc(nLoops);
+      if (p^.wsFlags and WHERE_IPK)       <> 0 then Inc(nIpk);
+      if (p^.wsFlags and WHERE_MULTI_OR)  <> 0 then Inc(nMOR);
+      p := p^.pNextLoop;
+    end;
+  end;
+
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('WLAA open',                        rc = SQLITE_OK);
+
+  FillChar(parse,    SizeOf(parse),    0);  parse.db := db;
+  FillChar(wInfoBuf, SizeOf(wInfoBuf), 0);
+  pWInfo := PWhereInfo(@wInfoBuf[0]);
+  pWInfo^.pParse := @parse;
+
+  FillChar(tab, SizeOf(tab), 0);
+  tab.szTabRow   := 1;
+  tab.iPKey      := -1;
+  tab.nRowLogEst := 50;
+
+  FillChar(src, SizeOf(src), 0);
+  src.hdr.nSrc       := 1;
+  src.item0.iCursor  := iCur0;
+  src.item0.pSTab    := @tab;
+  src.item0.fg.jointype := 0;
+  pWInfo^.pTabList   := @src.hdr;
+  pWInfo^.nLevel     := 1;
+
+  pWInfo^.sWC.pWInfo := pWInfo;
+  pWInfo^.sWC.a      := @pWInfo^.sWC.aStatic[0];
+  pWInfo^.sWC.nSlot  := Length(pWInfo^.sWC.aStatic);
+  pWInfo^.sMaskSet.n := 1;
+  pWInfo^.sMaskSet.ix[0] := iCur0;
+
+  FillChar(bld, SizeOf(bld), 0);
+  bld.pWInfo := pWInfo;
+  bld.pWC    := @pWInfo^.sWC;
+  bld.pNew   := @pNew;
+
+  { ---- WLAA1: single-table, empty WC → AddAll routes through AddBtree. ---- }
+  ResetLoops;
+  rc := whereLoopAddAll(@bld);
+  Check('WLAA1 returns OK',                 rc = SQLITE_OK);
+  CountLoops;
+  Check('WLAA1 exactly one loop',           nLoops = 1);
+  Check('WLAA1 the loop is WHERE_IPK',      nIpk = 1);
+  { iPlanLimit starts at SQLITE_QUERY_PLANNER_LIMIT, gets bumped by
+    SQLITE_QUERY_PLANNER_LIMIT_INCR per table, then is decremented by
+    whereLoopInsert per candidate.  After one IPK loop on one table the
+    counter must still be in the "barely consumed" band. }
+  Check('WLAA1 iPlanLimit in expected band',
+        (bld.iPlanLimit > u32(SQLITE_QUERY_PLANNER_LIMIT))
+        and (bld.iPlanLimit <= u32(SQLITE_QUERY_PLANNER_LIMIT
+                                   + SQLITE_QUERY_PLANNER_LIMIT_INCR)));
+
+  { ---- WLAA2: vtab table → AddVirtual stub adds zero loops. ---- }
+  ResetLoops;
+  tab.eTabType := TABTYP_VTAB;
+  rc := whereLoopAddAll(@bld);
+  Check('WLAA2 vtab returns OK',            rc = SQLITE_OK);
+  CountLoops;
+  Check('WLAA2 zero loops (vtab stub)',     nLoops = 0);
+  tab.eTabType := 0;
+
+  { ---- WLAA3: hasOr=1 routes to whereLoopAddOr.  No actual WO_OR term in
+         the WC, so AddOr is a no-op; AddAll still produces the IPK loop. ---- }
+  ResetLoops;
+  pWInfo^.sWC.hasOr := 1;
+  rc := whereLoopAddAll(@bld);
+  Check('WLAA3 hasOr returns OK',           rc = SQLITE_OK);
+  CountLoops;
+  Check('WLAA3 still one IPK loop',         (nLoops = 1) and (nIpk = 1));
+
+  { ---- WLAO1: whereLoopAddOr on a JT_RIGHT table short-circuits. ---- }
+  ResetLoops;
+  src.item0.fg.jointype := JT_RIGHT;
+  rc := whereLoopAddOr(@bld, 0, 0);
+  Check('WLAO1 JT_RIGHT returns OK',        rc = SQLITE_OK);
+  CountLoops;
+  Check('WLAO1 zero loops (RIGHT JOIN guard)',
+        nLoops = 0);
+  src.item0.fg.jointype := 0;
+
+  { ---- WLAO2: whereLoopAddOr on an empty WC → no WO_OR terms, no loops. ---- }
+  ResetLoops;
+  rc := whereLoopAddOr(@bld, 0, 0);
+  Check('WLAO2 empty WC returns OK',        rc = SQLITE_OK);
+  CountLoops;
+  Check('WLAO2 zero loops (no WO_OR term)', nLoops = 0);
+
+  { ---- WLAA4: two-table FROM, second table is JT_CROSS — exercises the
+         CROSS reorder barrier (mPrereq |= mPrior; hasRightCrossJoin set).
+         Both tables produce IPK loops. ---- }
+  ResetLoops;
+  src.hdr.nSrc      := 2;
+  src.item1.iCursor := iCur1;
+  src.item1.pSTab   := @tab;
+  src.item1.fg.jointype := JT_CROSS;
+  pWInfo^.nLevel    := 2;
+  pWInfo^.sMaskSet.n := 2;
+  pWInfo^.sMaskSet.ix[1] := iCur1;
+  rc := whereLoopAddAll(@bld);
+  Check('WLAA4 two-table CROSS returns OK', rc = SQLITE_OK);
+  CountLoops;
+  Check('WLAA4 two IPK loops (one per table)',
+        (nLoops = 2) and (nIpk = 2));
+  { Same band reasoning as WLAA1, but two tables → two LIMIT_INCR bumps
+    minus per-candidate consumption. }
+  Check('WLAA4 iPlanLimit in expected band',
+        (bld.iPlanLimit > u32(SQLITE_QUERY_PLANNER_LIMIT
+                              + SQLITE_QUERY_PLANNER_LIMIT_INCR))
+        and (bld.iPlanLimit <= u32(SQLITE_QUERY_PLANNER_LIMIT
+                                   + 2 * SQLITE_QUERY_PLANNER_LIMIT_INCR)));
+  src.hdr.nSrc := 1;
+  src.item1.fg.jointype := 0;
+  pWInfo^.nLevel := 1;
+  pWInfo^.sMaskSet.n := 1;
+
+  { Cleanup. }
+  while pWInfo^.pLoops <> nil do
+  begin
+    p := pWInfo^.pLoops;
+    pWInfo^.pLoops := p^.pNextLoop;
+    whereLoopDelete(db, p);
+  end;
+  whereLoopClear(db, @pNew);
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -2284,6 +2473,7 @@ begin
   TestIsDistinctRedundant;
   TestWhereLoopAddBtreeIndex;
   TestWhereLoopAddBtree;
+  TestWhereLoopAddAllAndOr;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.
