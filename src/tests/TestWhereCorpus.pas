@@ -104,7 +104,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 57;
+  N_CORPUS = 60;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -279,6 +279,20 @@ begin
       'SELECT a FROM t WHERE likely(a = 5);');                   Inc(i);
   Add(i, 'nullif(a,0) IS NOT NULL', 'NULLIF',
       'SELECT a FROM t WHERE nullif(a, 0) IS NOT NULL;');        Inc(i);
+
+  { Phase 6.9-bis 11g.2.f sub-progress 32 — CAST(... AS ...) codegen.
+    Three shapes that exercise the TK_CAST arm in sqlite3ExprCodeTarget:
+    CAST to INTEGER (OP_Cast with SQLITE_AFF_INTEGER), CAST to TEXT
+    (SQLITE_AFF_TEXT), and CAST to REAL (SQLITE_AFF_REAL) with a range
+    filter.  All degrade to SCAN-with-residual on the un-indexed fixture.
+    The TK_CAST arm was already ported (passqlite3codegen.pas:4693); these
+    rows confirm byte-identical EXPLAIN VDBE output against the C oracle. }
+  Add(i, 'cast(a AS INTEGER)=5',   'CAST_INT',
+      'SELECT a FROM t WHERE cast(a AS INTEGER) = 5;');          Inc(i);
+  Add(i, 'cast(a AS TEXT)=''5''', 'CAST_TEXT',
+      'SELECT a FROM t WHERE cast(a AS TEXT) = ''5'';');         Inc(i);
+  Add(i, 'cast(a AS REAL)>3.0',   'CAST_REAL',
+      'SELECT a FROM t WHERE cast(a AS REAL) > 3.0;');           Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

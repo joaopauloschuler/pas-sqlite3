@@ -3575,9 +3575,46 @@ Important: At the end of this document, please find:
           675/675, TestExplainParity 2/10 (diverges unchanged),
           TestVdbeArith 41/41, TestJson 434/434.
 
-      Sub-progress 32 (next) options: (i) `cast(... as ...)` codegen;
-      (ii) `printf()`/format scalars; (iii) begin TK_CASE codegen;
-      (iv) expand corpus with additional predicate shapes.
+    - [X] Sub-progress 32 — `cast(... as ...)` codegen + corpus
+      expansion (2026-04-27).  Audited the existing TK_CAST arm
+      (codegen.pas:4693..4703) and confirmed it was already a complete,
+      faithful port of expr.c:5151..5159: `sqlite3ExprCode(pLeft,
+      target)` → `OP_Cast(target, sqlite3AffinityType(zToken, nil))`.
+      No code changes were required; the sub-progress consists purely
+      of corpus expansion and confirmation of byte-identical EXPLAIN
+      output for three CAST shapes.
+
+      (a) **Corpus** (TestWhereCorpus.pas): N_CORPUS 57 → 60.  Added
+      3 rows at the end of `InitCorpus`:
+        * `CAST_INT` — `SELECT a FROM t WHERE cast(a AS INTEGER) = 5`
+          (OP_Cast P2=SQLITE_AFF_INTEGER, then EQ comparison).
+        * `CAST_TEXT` — `SELECT a FROM t WHERE cast(a AS TEXT) = '5'`
+          (OP_Cast P2=SQLITE_AFF_TEXT, then EQ comparison).
+        * `CAST_REAL` — `SELECT a FROM t WHERE cast(a AS REAL) > 3.0`
+          (OP_Cast P2=SQLITE_AFF_REAL, then GT comparison).
+
+      (b) **TK_CAST audit** (codegen.pas:4693..4703): the existing arm
+      covers all three: codes pLeft into `target`, asserts
+      `not EP_IntValue`, emits `OP_Cast(target,
+      sqlite3AffinityType(zToken, nil))`, sets `done := True`.
+      The affinity function `sqlite3AffinityType` was already ported
+      and handles `INTEGER`, `TEXT`, `REAL`, `NUMERIC`, `BLOB`.
+
+      Test-suite delta:
+        * TestWhereCorpus: **58 PASS / 2 DIVERGE / 0 ERROR (corpus =
+          60)** — all 3 new CAST rows PASS immediately.  The 2
+          pre-existing DIVERGE rows (LEFT_JOIN, JOIN_WHERE) are
+          unchanged (blocked on 11g.2.d multi-table planner).
+        * No regression: TestParser 45/45, TestExprBasic 40/40,
+          TestSelectBasic 49/49, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestPrepareBasic 20/20, TestWhereBasic 52/52,
+          TestWhereSimple 44/44, TestWhereExpr 84/84, TestWherePlanner
+          675/675, TestExplainParity 2/10 (diverges unchanged),
+          TestVdbeArith 41/41, TestJson 434/434.
+
+      Sub-progress 33 (next) options: (i) `printf()`/format scalars;
+      (ii) begin TK_CASE codegen landing; (iii) additional predicate
+      shapes (EXISTS/NOT EXISTS sub-selects, MATCH, REGEXP).
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
