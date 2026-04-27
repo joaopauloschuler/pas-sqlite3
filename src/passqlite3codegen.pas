@@ -4226,16 +4226,26 @@ end;
 
 function sqlite3ExprSkipCollateAndLikely(pExpr: PExpr): PExpr;
 begin
+  { Phase 6.9-bis 11g.2.f sub-progress 30 — fix: mirror C's
+    sqlite3ExprSkipCollateAndLikely (expr.c:218) exactly.  The C version
+    checks ExprHasProperty(pExpr, EP_Unlikely) to detect the unlikely /
+    likely / likelihood wrapper, then skips to arg[0].  The previous
+    Pascal version used a 'likely' string match with inverted ExprUseXList,
+    which failed to strip unlikely() and likelihood() and would also fire
+    incorrectly when xList was not in use. }
   Result := pExpr;
   while Result <> nil do
   begin
-    if ExprHasProperty(Result, EP_Skip or EP_IfNullRow) then
+    if ExprHasProperty(Result, EP_Unlikely) then
+    begin
+      { unlikely()/likely()/likelihood() wrapper — skip to arg[0]. }
+      Assert(ExprUseXList(Result));
+      Assert(Result^.x.pList <> nil);
+      Assert(Result^.x.pList^.nExpr > 0);
+      Result := ExprListItems(Result^.x.pList)^.pExpr;
+    end
+    else if ExprHasProperty(Result, EP_Skip or EP_IfNullRow) then
       Result := Result^.pLeft
-    else if (Result^.op = TK_FUNCTION) and (Result^.u.zToken <> nil) and
-            (sqlite3_strnicmp(Result^.u.zToken, 'likely', 6) = 0) and
-            not ExprUseXList(Result) and (Result^.x.pList <> nil) and
-            (Result^.x.pList^.nExpr > 0) then
-      Result := ExprListItems(Result^.x.pList)^.pExpr
     else
       Break;
   end;
@@ -4325,10 +4335,10 @@ end;
   emit the OP_Null fallback (preserving the dispatch's totality and
   matching the C reference's "no such function" error path emitted
   earlier by the resolver, not here).  Skipped for now:
-    * SQLITE_FUNC_NEEDCOLL pre-emit OP_CollSeq — required only for
-      collation-sensitive scalar funcs (substr/replace with explicit
-      COLLATE).  Default-collation calls work because OP_Function
-      tolerates a NULL pColl on first invocation.
+    * SQLITE_FUNC_NEEDCOLL OP_CollSeq — now implemented in sp30:
+      emits OP_CollSeq(0,0,0,pDfltColl) before OP_Function for functions
+      registered with bNC=1 (e.g. nullif).  Full collation propagation
+      (COLLATE clauses on args) is deferred to a later sub-progress.
     * SQLITE_FUNC_OFFSET, SQLITE_FUNC_INLINE, date/time fast-paths.
     * Aggregate function detection (caller asserts non-aggregate). }
 function emitScalarFunctionCall(pParse: PParse; pExpr: PExpr;
@@ -4447,6 +4457,21 @@ begin
       sqlite3VdbeResolveLabel(v, i);
       Result := True;
       Exit;
+    end
+    else if PtrInt(pDef^.pUserData) = INLINEFUNC_unlikely then
+    begin
+      { Phase 6.9-bis 11g.2.f sub-progress 30 — unlikely()/likely()/likelihood()
+        no-op fast-path.  Port of expr.c:exprCodeInlineFunction default arm
+        (INLINEFUNC_unlikely = 99 is the C "default" case):
+          target = sqlite3ExprCodeTarget(pParse, pFarg->a[0].pExpr, target);
+        The function call disappears entirely; only the inner expression is
+        emitted.  likelihood() takes 2 args (expr, probability) — arg[0] is
+        still the value to propagate.  Matches C oracle bytecode exactly. }
+      Assert(n >= 1);
+      items := ExprListItems(pFarg);
+      sqlite3ExprCode(pParse, PExprListItem(items)^.pExpr, target);
+      Result := True;
+      Exit;
     end;
   end;
   constMask := 0;
@@ -4502,6 +4527,16 @@ begin
   end
   else
     r1 := 0;
+  { Phase 6.9-bis 11g.2.f sub-progress 30 — SQLITE_FUNC_NEEDCOLL:
+    emit OP_CollSeq before OP_Function when the function's FuncDef carries
+    SQLITE_FUNC_NEEDCOLL (mirrors expr.c:5437..5439).  nullif() is the
+    primary case (FUNCTION macro with bNC=1).  We use the default collation
+    (db->pDfltColl = BINARY) since this port does not yet fully propagate
+    collation sequences through expression trees; a BINARY collation is
+    exactly what the C oracle uses for nullif(a,0) with no explicit COLLATE. }
+  if (pDef^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0 then
+    sqlite3VdbeAddOp4(v, OP_CollSeq, 0, 0, 0,
+      PAnsiChar(db^.pDfltColl), P4_COLLSEQ);
   sqlite3VdbeAddFunctionCall(pParse, i32(constMask), r1, target, n,
     pDef, i32(pExpr^.op2));
   if (n > 0) and (constMask = 0) then
@@ -6251,11 +6286,13 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
 
   procedure ResolveExpr(pE: PExpr);
   var
-    pSrc:  PSrcList;
-    pItem: PSrcItem;
-    base:  PSrcItem;
-    i:     i32;
-    iCol:  i32;
+    pSrc:   PSrcList;
+    pItem:  PSrcItem;
+    base:   PSrcItem;
+    pDef_:  PTFuncDef;
+    i:      i32;
+    iCol:   i32;
+    nArg_:  i32;
   begin
     if pE = nil then Exit;
     if (pE^.op = TK_ID) and (p^.pSrc <> nil) then
@@ -6316,6 +6353,26 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     begin
       if (pE^.flags and EP_xIsSelect) = 0 then
         ResolveExprList(pE^.x.pList);
+    end;
+    { Phase 6.9-bis 11g.2.f sub-progress 30 — stamp EP_Unlikely on
+      TK_FUNCTION nodes whose registered definition carries SQLITE_FUNC_UNLIKELY.
+      Mirrors resolve.c:1140..1142: when sqlite3FindFunction returns a pDef
+      with SQLITE_FUNC_UNLIKELY set, ExprSetProperty(pExpr, EP_Unlikely) is
+      called.  Without this, sqlite3ExprSkipCollateAndLikely cannot detect the
+      wrapper and whereexpr.c strips only the probability hint but not the
+      function call itself — leading to OP_Function + extra ops in the WHERE
+      residual instead of the direct comparison that C emits. }
+    if pE^.op = TK_FUNCTION then
+    begin
+      if (pE^.u.zToken <> nil) and ExprUseXList(pE) then
+      begin
+        if pE^.x.pList <> nil then nArg_ := pE^.x.pList^.nExpr else nArg_ := 0;
+        pDef_ := sqlite3FindFunction(pParse^.db, pE^.u.zToken, nArg_,
+                                     pParse^.db^.enc, 0);
+        if (pDef_ <> nil) and
+           ((pDef_^.funcFlags and SQLITE_FUNC_UNLIKELY) <> 0) then
+          ExprSetProperty(pE, EP_Unlikely);
+      end;
     end;
   end;
 
@@ -20461,6 +20518,18 @@ begin
     sqlite3_result_value(pCtx, Psqlite3_value((argv+2)^));
 end;
 
+{ Phase 6.9-bis 11g.2.f sub-progress 30 — unlikely()/likely()/likelihood()
+  runtime stub.  At compile time these are folded away by the
+  INLINEFUNC_unlikely arm in emitScalarFunctionCall (the default arm in
+  exprCodeInlineFunction, since INLINEFUNC_unlikely = 99).  This stub is
+  never reached during normal query compilation, but is registered so
+  sqlite3FindFunction() can locate the TFuncDef and check the INLINE flag. }
+procedure unlikelyFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  { No-op stub: at compile time the inline arm transparently codes arg[0]. }
+  sqlite3_result_value(pCtx, Psqlite3_value(argv^));
+end;
+
 procedure unicodeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   pz: PPChar;
@@ -20740,7 +20809,7 @@ const
   AGG_ENC  = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
 
 var
-  aBuiltinFuncs: array[0..39] of TFuncDef;
+  aBuiltinFuncs: array[0..42] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -20769,7 +20838,11 @@ begin
   MakeFD(aBuiltinFuncs[12], 1, FUNC_ENC,  @hexFunc,        nil, 'hex');
   MakeFD(aBuiltinFuncs[13], 1, FUNC_ENC,  @unhexFunc,      nil, 'unhex');
   MakeFD(aBuiltinFuncs[14], 1, FUNC_ENC,  @zeroblobFunc,   nil, 'zeroblob');
-  MakeFD(aBuiltinFuncs[15], 2, FUNC_ENC,  @nullifFunc,     nil, 'nullif');
+  { nullif needs SQLITE_FUNC_NEEDCOLL (bNC=1 in C's FUNCTION macro) so
+    emitScalarFunctionCall emits OP_CollSeq before OP_Function, matching
+    the C oracle bytecode exactly (func.c: FUNCTION(nullif, 2, 0, 1, nullifFunc)). }
+  MakeFD(aBuiltinFuncs[15], 2, FUNC_ENC or SQLITE_FUNC_NEEDCOLL,
+    @nullifFunc, nil, 'nullif');
   MakeFD(aBuiltinFuncs[16], 0, FUNC_ENC,  @versionFunc,    nil, 'sqlite_version');
   MakeFD(aBuiltinFuncs[17], 0, FUNC_ENC,  @sourceidFunc,   nil, 'sqlite_source_id');
   MakeFD(aBuiltinFuncs[18], 0, FUNC_ENC,  @randomFunc,     nil, 'random');
@@ -20799,6 +20872,23 @@ begin
     @globFunc, nil, 'glob');
   MakeFD(aBuiltinFuncs[39], 0, FUNC_ENC or SQLITE_FUNC_BUILTIN,
     @errlogFunc, nil, 'sqlite_log');
+  { Phase 6.9-bis 11g.2.f sub-progress 30 — unlikely()/likely()/likelihood()
+    inline registrations.  Mirrors func.c:
+      INLINE_FUNC(unlikely,   1, INLINEFUNC_unlikely, SQLITE_FUNC_UNLIKELY)
+      INLINE_FUNC(likelihood, 2, INLINEFUNC_unlikely, SQLITE_FUNC_UNLIKELY)
+      INLINE_FUNC(likely,     1, INLINEFUNC_unlikely, SQLITE_FUNC_UNLIKELY)
+    SQLITE_FUNC_INLINE ensures emitScalarFunctionCall routes to the
+    INLINEFUNC_unlikely arm; SQLITE_FUNC_UNLIKELY propagates hint metadata
+    used by the planner for cost estimation. }
+  MakeFD(aBuiltinFuncs[40], 1, FUNC_ENC or SQLITE_FUNC_INLINE or SQLITE_FUNC_UNLIKELY,
+    @unlikelyFunc, nil, 'unlikely');
+  aBuiltinFuncs[40].pUserData := Pointer(PtrInt(INLINEFUNC_unlikely));
+  MakeFD(aBuiltinFuncs[41], 2, FUNC_ENC or SQLITE_FUNC_INLINE or SQLITE_FUNC_UNLIKELY,
+    @unlikelyFunc, nil, 'likelihood');
+  aBuiltinFuncs[41].pUserData := Pointer(PtrInt(INLINEFUNC_unlikely));
+  MakeFD(aBuiltinFuncs[42], 1, FUNC_ENC or SQLITE_FUNC_INLINE or SQLITE_FUNC_UNLIKELY,
+    @unlikelyFunc, nil, 'likely');
+  aBuiltinFuncs[42].pUserData := Pointer(PtrInt(INLINEFUNC_unlikely));
 end;
 
 var

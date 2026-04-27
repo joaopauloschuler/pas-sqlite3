@@ -3428,6 +3428,81 @@ Important: At the end of this document, please find:
       TK_CASE codegen landing to unify the iif() and CASE-expression
       paths in the Pascal port.
 
+    - [X] Sub-progress 30 — `unlikely()`/`likely()` no-op fast-path
+      + `nullif()` landing (2026-04-27).  Bundles three interrelated
+      changes: the INLINEFUNC_unlikely register+dispatch, a bug-fix
+      to `sqlite3ExprSkipCollateAndLikely`, EP_Unlikely stamping in the
+      resolver, and `OP_CollSeq` pre-emission for NEEDCOLL functions.
+
+      (a) **Builtin registration** (codegen.pas): expanded `aBuiltinFuncs`
+      from `[0..39]` to `[0..42]` (+3 slots).  Added `unlikelyFunc`
+      runtime stub (no-op: passes arg[0] through) immediately after
+      `iifFunc`.  Registered entries [40]=`unlikely`(1 arg),
+      [41]=`likelihood`(2 args), [42]=`likely`(1 arg), all with
+      `FUNC_ENC or SQLITE_FUNC_INLINE or SQLITE_FUNC_UNLIKELY` and
+      `pUserData = INLINEFUNC_unlikely (99)`.  Also corrected
+      `nullif`'s registration (index 15) to add `SQLITE_FUNC_NEEDCOLL`
+      (mirrors upstream's `FUNCTION(nullif, 2, 0, 1, nullifFunc)` with
+      `bNC=1`).
+
+      (b) **INLINEFUNC_unlikely arm** in `emitScalarFunctionCall`
+      (codegen.pas:4461..4475): added `else if PtrInt(pDef^.pUserData)
+      = INLINEFUNC_unlikely` branch after the iif arm.  The C default
+      case (INLINEFUNC_unlikely = 99) simply calls
+      `sqlite3ExprCodeTarget(pParse, pFarg->a[0].pExpr, target)`,
+      discarding the wrapper entirely.  Pascal mirrors this with
+      `sqlite3ExprCode(pParse, items[0].pExpr, target)`.
+
+      (c) **`sqlite3ExprSkipCollateAndLikely` rewrite** (codegen.pas):
+      the previous Pascal version used a string-match on `'likely'` and
+      had an inverted `not ExprUseXList` guard, so it silently failed
+      to strip `unlikely()` and `likelihood()`.  Rewritten to exactly
+      mirror C expr.c:218: loop on `EP_Unlikely` (skip to arg[0]) then
+      `EP_Skip|EP_IfNullRow` (skip via pLeft), break otherwise.
+
+      (d) **EP_Unlikely stamping** in `sqlite3ResolveSelectNames`
+      (codegen.pas): `ResolveExpr` now calls `sqlite3FindFunction` for
+      every `TK_FUNCTION` node and sets `EP_Unlikely` on the expression
+      node when the registered `pDef^.funcFlags` carries
+      `SQLITE_FUNC_UNLIKELY`.  Mirrors resolve.c:1140..1142.  Without
+      this the WHERE-term analysis loop in whereexpr.c (Pascal) never
+      sees the flag and `sqlite3ExprSkipCollateAndLikely` cannot strip
+      the wrapper, leaving the full OP_Function residual in the bytecode.
+
+      (e) **OP_CollSeq pre-emission** in `emitScalarFunctionCall`
+      (codegen.pas): before `sqlite3VdbeAddFunctionCall`, check
+      `SQLITE_FUNC_NEEDCOLL`; if set, emit
+      `OP_CollSeq(0,0,0,db^.pDfltColl,P4_COLLSEQ)`.  Mirrors
+      expr.c:5437..5439.  Required for `nullif()` to match the C oracle.
+
+      (f) **nullif in Part B**: confirmed there is no `INLINEFUNC_nullif`
+      in upstream C — `nullif` is registered with the `FUNCTION` macro
+      (not `INLINE_FUNC`) and compiled via `nullifFunc` runtime.  The
+      Pascal port correctly routes it through OP_Function after the
+      NEEDCOLL fix above.
+
+      (g) **Corpus** (TestWhereCorpus.pas): N_CORPUS 54 → 57.  Added
+      3 rows: `UNLIKELY` (`SELECT a FROM t WHERE unlikely(a > 5)`),
+      `LIKELY` (`SELECT a FROM t WHERE likely(a = 5)`), `NULLIF`
+      (`SELECT a FROM t WHERE nullif(a, 0) IS NOT NULL`).
+
+      Test-suite delta:
+        * TestWhereCorpus: **54 PASS / 3 DIVERGE / 0 ERROR (corpus =
+          57)** — all 3 new rows PASS immediately; UNLIKELY and LIKELY
+          each generate 12 ops (direct comparison, no OP_Function
+          wrapper); NULLIF generates 14 ops (OP_CollSeq + OP_Function +
+          OP_IsNull residual pattern).  The 3 pre-existing DIVERGE rows
+          (LEFT_JOIN, JOIN_WHERE, DUP_AND) are unchanged.
+        * No regression: TestParser 45/45, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWherePlanner 675/675, TestExplainParity 2/10
+          (diverges unchanged).
+
+      Sub-progress 31 (next) options: (i) the DUP_AND duplicate-
+      predicate constant-folding hoist; (ii) `cast(... as ...)` codegen;
+      (iii) `printf()`/format scalars; (iv) begin TK_CASE codegen
+      landing.
+
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
   Current Status: **2 PASS / 8 DIVERGE / 0 ERROR**.  Drive to

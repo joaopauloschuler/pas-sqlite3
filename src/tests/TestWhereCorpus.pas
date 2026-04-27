@@ -104,7 +104,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 54;
+  N_CORPUS = 57;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -264,6 +264,21 @@ begin
       'SELECT a FROM t WHERE iif(a = b, a, b) > 3;');          Inc(i);
   Add(i, 'iif null else',            'IIF_NULL_ELSE',
       'SELECT a FROM t WHERE iif(a > 0, a, NULL) IS NOT NULL;'); Inc(i);
+
+  { Phase 6.9-bis 11g.2.f sub-progress 30 — unlikely()/likely() no-op
+    fast-path and nullif() runtime path.
+    unlikely(expr) and likely(expr) fold to a bare codegen of their first
+    argument (INLINEFUNC_unlikely default arm); the probability hint is
+    consumed by the planner and no OP_Function is emitted.
+    nullif(a,0) IS NOT NULL exercises the OP_Function runtime path for
+    nullifFunc; there is no INLINEFUNC_nullif in upstream C — nullif is
+    intentionally left as a runtime call (FUNCTION macro, not INLINE_FUNC). }
+  Add(i, 'unlikely(a>5)',           'UNLIKELY',
+      'SELECT a FROM t WHERE unlikely(a > 5);');                 Inc(i);
+  Add(i, 'likely(a=5)',             'LIKELY',
+      'SELECT a FROM t WHERE likely(a = 5);');                   Inc(i);
+  Add(i, 'nullif(a,0) IS NOT NULL', 'NULLIF',
+      'SELECT a FROM t WHERE nullif(a, 0) IS NOT NULL;');        Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
