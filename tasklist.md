@@ -553,6 +553,29 @@ Important: At the end of this document, please find:
       reject; WO_ISNULL reject; nSkip>0 reject; partial-key reject),
       WAPIC1..WAPIC4 (single-AND truth tags matching termA + termB;
       mismatched termC untouched; pre-coded terms stay coded).
+    - [X] Leaf helpers, batch 3 — `sqlite3TableColumnToStorage`
+      (build.c:1155..1170), `sqlite3ParseToplevel` (sqliteInt.h:5266
+      macro), `codeDeferredSeek` (wherecode.c:1276..1309), and a no-op
+      stub for `sqlite3WhereAddScanStatus` matching upstream's
+      SQLITE_ENABLE_STMT_SCANSTATUS-disabled fallthrough.
+      sqlite3TableColumnToStorage maps a logical column index to its
+      storage slot — identity unless TF_HasVirtual is lit, in which case
+      virtual columns are packed after the non-virtuals at offset
+      pTab^.nNVCol.  sqlite3ParseToplevel returns `pToplevel` when set,
+      else `p` (single-hop, matching the macro).  codeDeferredSeek emits
+      OP_DeferredSeek so the table-row fetch can be skipped when the
+      chosen index covers every column the loop needs; lights bit 0
+      (bDeferredSeek) of pWInfo^.bitwiseFlags; under WHERE_OR_SUBCLAUSE /
+      WHERE_RIGHT_JOIN with the toplevel's writeMask zero, attaches a
+      P4_INTARRAY mapping (table-storage-column → index-key-position) so
+      the deferred-seek epilogue can read columns directly out of the
+      current index key.  Gate: `TestWherePlanner.pas` (354/354):
+      TS1..TS5 (no-virtual identity, rowid-alias identity, all-real
+      counting, single-virtual packing, virtual-column-itself slot),
+      PT1..PT3 (nil pToplevel, single-hop, no chain walk), CDS1..CDS3
+      (OP_DeferredSeek + bDeferredSeek + no P4 outside OR/RIGHT_JOIN;
+      P4_INTARRAY attached under WHERE_OR_SUBCLAUSE with writeMask=0;
+      P4 suppressed when writeMask<>0).
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix

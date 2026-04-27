@@ -2372,6 +2372,14 @@ function  sqlite3TableColumnToIndex(pIdx: PIndex2; iCol: i16): i32;
 function  sqlite3DbIsNamed(db: PTsqlite3; iDb: i32; zName: PAnsiChar): i32;
 function  sqlite3PreferredTableName(zName: PAnsiChar): PAnsiChar;
 function  sqlite3DbMaskAllZero(m: u32): i32;
+function  sqlite3TableColumnToStorage(pTab: PTable2; iCol: i16): i16;
+function  sqlite3ParseToplevel(p: PParse): PParse;
+
+{ Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers, batch 3. }
+procedure codeDeferredSeek(pWInfo: PWhereInfo; pIdx: PIndex2;
+  iCur, iIdxCur: i32);
+procedure sqlite3WhereAddScanStatus(v: PVdbe; pSrclist: PSrcList;
+  pLvl: PWhereLevel; addrExplain: i32);
 
 { Index helpers }
 procedure sqlite3FreeIndex(db: PTsqlite3; p: PIndex2);
@@ -11388,6 +11396,114 @@ begin
       pTrm^.wtFlags := pTrm^.wtFlags or TERM_CODED;
   end;
 end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers,
+  batch 3.
+
+  sqlite3TableColumnToStorage (build.c:1155..1170).  Maps a logical column
+  index iCol into the storage-row column index.  When the table has no
+  virtual columns (TF_HasVirtual not set) or iCol is the rowid alias
+  (iCol<0), the mapping is the identity.  Otherwise iterates pTab^.aCol[]
+  counting non-virtual columns up to iCol — virtual columns are stored
+  after the non-virtual ones at offset pTab^.nNVCol.
+
+  sqlite3ParseToplevel (sqliteInt.h:5266 macro).  Returns the topmost
+  Parse in the pToplevel chain; called when emitting a deferred-seek
+  P4_INTARRAY into the outermost VM.
+
+  codeDeferredSeek (wherecode.c:1276..1309).  Emits OP_DeferredSeek so a
+  table-row fetch can be deferred until the row's content is actually
+  required; if the chosen scan happens not to need any non-indexed columns
+  the table seek is elided entirely.  When the loop is the outermost and
+  the connection has no pending writes, attaches a P4_INTARRAY mapping
+  table-storage-column -> index-key-position so the OP_Column rewrite path
+  in the deferred-seek epilogue can serve columns directly from the
+  current index key without doing the table seek.
+
+  sqlite3WhereAddScanStatus (wherecode.c:333..374).  Stub matching the
+  upstream `#else` branch when SQLITE_ENABLE_STMT_SCANSTATUS is not
+  defined — empty no-op.  Lands here so callers in
+  sqlite3WhereCodeOneLoopStart can compile cleanly.
+  =========================================================================== }
+
+function sqlite3TableColumnToStorage(pTab: PTable2; iCol: i16): i16;
+var
+  i: i32;
+  n: i16;
+begin
+  Assert(iCol < pTab^.nCol);
+  if ((pTab^.tabFlags and TF_HasVirtual) = 0) or (iCol < 0) then Exit(iCol);
+  n := 0;
+  for i := 0 to iCol - 1 do
+  begin
+    if (pTab^.aCol[i].colFlags and COLFLAG_VIRTUAL) = 0 then Inc(n);
+  end;
+  if (pTab^.aCol[iCol].colFlags and COLFLAG_VIRTUAL) <> 0 then
+  begin
+    { iCol itself is a virtual column — packed after the non-virtual ones. }
+    Result := pTab^.nNVCol + iCol - n;
+  end
+  else
+  begin
+    Result := n;
+  end;
+end;
+
+function sqlite3ParseToplevel(p: PParse): PParse;
+begin
+  if p^.pToplevel <> nil then Result := p^.pToplevel else Result := p;
+end;
+
+procedure codeDeferredSeek(pWInfo: PWhereInfo; pIdx: PIndex2;
+  iCur, iIdxCur: i32);
+var
+  pPar: PParse;
+  pTopLvl: PParse;
+  v: PVdbe;
+  i: i32;
+  pTab: PTable2;
+  ai: Pu32;
+  x1, x2: i16;
+  aiCol: Pi16;
+begin
+  pPar := pWInfo^.pParse;
+  v := pPar^.pVdbe;
+
+  Assert(iIdxCur > 0);
+  aiCol := pIdx^.aiColumn;
+  Assert(aiCol[pIdx^.nColumn - 1] = -1);
+
+  pWInfo^.bitwiseFlags := pWInfo^.bitwiseFlags or u8($01);  { bDeferredSeek }
+  sqlite3VdbeAddOp3(v, OP_DeferredSeek, iIdxCur, 0, iCur);
+  pTopLvl := sqlite3ParseToplevel(pPar);
+  if ((pWInfo^.wctrlFlags and (WHERE_OR_SUBCLAUSE or WHERE_RIGHT_JOIN)) <> 0)
+     and (sqlite3DbMaskAllZero(pTopLvl^.writeMask) <> 0) then
+  begin
+    pTab := pIdx^.pTable;
+    ai := Pu32(sqlite3DbMallocZero(pPar^.db, u64(SizeOf(u32)) * u64(pTab^.nCol + 1)));
+    if ai <> nil then
+    begin
+      ai[0] := u32(pTab^.nCol);
+      for i := 0 to pIdx^.nColumn - 2 do
+      begin
+        Assert(aiCol[i] < pTab^.nCol);
+        x1 := aiCol[i];
+        x2 := sqlite3TableColumnToStorage(pTab, x1);
+        if x1 >= 0 then ai[x2 + 1] := u32(i + 1);
+      end;
+      sqlite3VdbeChangeP4(v, -1, PAnsiChar(ai), P4_INTARRAY);
+    end;
+  end;
+end;
+
+procedure sqlite3WhereAddScanStatus(v: PVdbe; pSrclist: PSrcList;
+  pLvl: PWhereLevel; addrExplain: i32);
+begin
+  { No-op: SQLITE_ENABLE_STMT_SCANSTATUS not defined — matches upstream
+    wherecode.c's #else fallthrough. }
+end;
+
 
 { ---------------------------------------------------------------------------
   Phase 6.9-bis (step 11g.2.b sub-progress) — whereShortCut planner shortcut.

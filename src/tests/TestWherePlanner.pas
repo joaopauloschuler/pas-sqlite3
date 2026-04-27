@@ -3356,6 +3356,160 @@ begin
     and (pWC^.aStatic[2].wtFlags = TERM_CODED));
 end;
 
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers,
+  batch 3 gates.
+
+  TS1..TS5  — sqlite3TableColumnToStorage (build.c:1155..1170): identity
+              when TF_HasVirtual is unset; identity when iCol<0 (rowid
+              alias); virtual-column packing when TF_HasVirtual is set.
+  PT1..PT3  — sqlite3ParseToplevel: returns p when pToplevel is nil,
+              returns pToplevel otherwise (no chain walk — this is the
+              direct-parent macro from sqliteInt.h:5266).
+  CDS1..CDS3 — codeDeferredSeek (wherecode.c:1276..1309): emits
+              OP_DeferredSeek; lights bDeferredSeek (bit 0 of
+              pWInfo^.bitwiseFlags); attaches a P4_INTARRAY mapping when
+              the loop sits inside an OR-subclause / RIGHT-JOIN frame and
+              the toplevel's writeMask is empty.
+  =========================================================================== }
+
+procedure TestTableColumnToStorage;
+var
+  pTab: PTable2;
+  cols: array[0..3] of TColumn;
+  size: SizeInt;
+begin
+  size := SizeOf(TTable);
+  pTab := PTable2(GetMem(size));
+  FillChar(pTab^, size, 0);
+  pTab^.nCol := 4;
+  pTab^.aCol := @cols[0];
+  FillChar(cols, SizeOf(cols), 0);
+
+  { ---- TS1 — TF_HasVirtual unset → identity. ---- }
+  pTab^.tabFlags := 0;
+  Check('TS1 no virtual → identity 0', sqlite3TableColumnToStorage(pTab, 0) = 0);
+  Check('TS1 no virtual → identity 2', sqlite3TableColumnToStorage(pTab, 2) = 2);
+
+  { ---- TS2 — iCol<0 (rowid alias) is always identity even with virtuals. ---- }
+  pTab^.tabFlags := TF_HasVirtual;
+  Check('TS2 iCol=-1 → -1', sqlite3TableColumnToStorage(pTab, -1) = -1);
+
+  { ---- TS3 — TF_HasVirtual set, no virtual columns yet → counts non-virtual. ---- }
+  cols[0].colFlags := 0; cols[1].colFlags := 0;
+  cols[2].colFlags := 0; cols[3].colFlags := 0;
+  pTab^.nNVCol := 4;
+  Check('TS3 all-real iCol=2 → 2', sqlite3TableColumnToStorage(pTab, 2) = 2);
+
+  { ---- TS4 — column 1 is virtual → real column 2 stores at slot 1. ---- }
+  cols[1].colFlags := COLFLAG_VIRTUAL;
+  pTab^.nNVCol := 3;
+  Check('TS4 virtual at col 1 → real col 2 stores at 1',
+        sqlite3TableColumnToStorage(pTab, 2) = 1);
+  { Real col 0 still at slot 0. }
+  Check('TS4 real col 0 → 0',
+        sqlite3TableColumnToStorage(pTab, 0) = 0);
+
+  { ---- TS5 — query the virtual column itself: stored at nNVCol + (iCol - n). ---- }
+  { iCol=1 (virtual), n (non-virtual prefix) = 1, so storage = 3 + 1 - 1 = 3. }
+  Check('TS5 virtual col 1 → nNVCol + iCol - n = 3',
+        sqlite3TableColumnToStorage(pTab, 1) = 3);
+
+  FreeMem(pTab);
+end;
+
+procedure TestParseToplevel;
+var
+  inner, outer: TParse;
+begin
+  FillChar(inner, SizeOf(inner), 0);
+  FillChar(outer, SizeOf(outer), 0);
+
+  { ---- PT1 — pToplevel nil → returns p. ---- }
+  Check('PT1 pToplevel=nil → p', sqlite3ParseToplevel(@outer) = @outer);
+
+  { ---- PT2 — pToplevel set → returns pToplevel. ---- }
+  inner.pToplevel := @outer;
+  Check('PT2 pToplevel=outer → outer', sqlite3ParseToplevel(@inner) = @outer);
+
+  { ---- PT3 — does NOT chase the chain (matches the macro). ---- }
+  outer.pToplevel := nil;
+  Check('PT3 single hop only', sqlite3ParseToplevel(@inner) = @outer);
+end;
+
+procedure TestCodeDeferredSeek;
+var
+  db:    PTsqlite3;
+  parse: TParse;
+  v:     PVdbe;
+  rc:    i32;
+  wInfo: TWhereInfo;
+  pIdx:  PIndex2;
+  pTab:  PTable2;
+  aiCol: array[0..2] of i16;
+  baseAddr, addr: i32;
+  pOp:   PVdbeOp;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('CDS open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  pTab := PTable2(GetMem(SizeOf(TTable)));
+  FillChar(pTab^, SizeOf(TTable), 0);
+  pTab^.nCol := 3;
+
+  pIdx := PIndex2(GetMem(SizeOf(TIndex)));
+  FillChar(pIdx^, SizeOf(TIndex), 0);
+  pIdx^.pTable := pTab;
+  pIdx^.nColumn := 3;
+  aiCol[0] := 0; aiCol[1] := 1; aiCol[2] := -1;  { trailing rowid required by Assert }
+  pIdx^.aiColumn := @aiCol[0];
+
+  FillChar(wInfo, SizeOf(wInfo), 0);
+  wInfo.pParse := @parse;
+
+  { ---- CDS1 — outside OR / RIGHT_JOIN: emits OP_DeferredSeek, lights
+       bDeferredSeek, no P4 attachment. ---- }
+  wInfo.wctrlFlags := 0;
+  baseAddr := sqlite3VdbeCurrentAddr(v);
+  codeDeferredSeek(@wInfo, pIdx, 1, 2);
+  addr := sqlite3VdbeCurrentAddr(v);
+  Check('CDS1 emits exactly one opcode', addr = baseAddr + 1);
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(baseAddr) * SizeOf(TVdbeOp));
+  Check('CDS1 opcode is OP_DeferredSeek', pOp^.opcode = OP_DeferredSeek);
+  Check('CDS1 p1 = iIdxCur', pOp^.p1 = 2);
+  Check('CDS1 p3 = iCur',    pOp^.p3 = 1);
+  Check('CDS1 bDeferredSeek lit', (wInfo.bitwiseFlags and 1) = 1);
+  Check('CDS1 no P4 attachment', pOp^.p4type <> P4_INTARRAY);
+
+  { ---- CDS2 — under WHERE_OR_SUBCLAUSE, writeMask=0: P4_INTARRAY attached. ---- }
+  FillChar(wInfo.bitwiseFlags, 1, 0);
+  wInfo.wctrlFlags := WHERE_OR_SUBCLAUSE;
+  parse.writeMask  := 0;
+  parse.pToplevel  := nil;
+  baseAddr := sqlite3VdbeCurrentAddr(v);
+  codeDeferredSeek(@wInfo, pIdx, 1, 2);
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(baseAddr) * SizeOf(TVdbeOp));
+  Check('CDS2 OP_DeferredSeek emitted', pOp^.opcode = OP_DeferredSeek);
+  Check('CDS2 P4_INTARRAY attached',    pOp^.p4type = P4_INTARRAY);
+
+  { ---- CDS3 — under WHERE_OR_SUBCLAUSE but writeMask non-zero: no P4. ---- }
+  FillChar(wInfo.bitwiseFlags, 1, 0);
+  parse.writeMask := 1;
+  baseAddr := sqlite3VdbeCurrentAddr(v);
+  codeDeferredSeek(@wInfo, pIdx, 1, 2);
+  pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(baseAddr) * SizeOf(TVdbeOp));
+  Check('CDS3 OP_DeferredSeek emitted', pOp^.opcode = OP_DeferredSeek);
+  Check('CDS3 no P4 attachment when writeMask <> 0',
+        pOp^.p4type <> P4_INTARRAY);
+
+  FreeMem(pIdx);
+  FreeMem(pTab);
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -3399,6 +3553,9 @@ begin
   TestUpdateRangeAffinityStr;
   TestWhereLoopIsOneRow;
   TestWhereApplyPartialIndexConstraints;
+  TestTableColumnToStorage;
+  TestParseToplevel;
+  TestCodeDeferredSeek;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.
