@@ -853,6 +853,36 @@ Important: At the end of this document, please find:
       + OP_Prev, p2=Last+1, no OP_Rewind), SCOLS12 (isRecursive bit 7 set
       — pLevel^.op=OP_Noop, p1/p2/p5 untouched, neither Rewind nor Last
       emitted).
+    - [X] Public surface, batch 15 — `sqlite3WhereCodeOneLoopStart`
+      per-loop body push-down + transitive constraint + LEFT-JOIN match
+      flag (wherecode.c:2587..2780).  After the case-arm dispatch, walks
+      `pWInfo^.sWC.a` up to three times (iLoop=1: terms covered by
+      `pLoop^.u.btree.pIndex`; iLoop=2: remaining without TERM_VARSELECT;
+      iLoop=3: everything else) and emits each ready, non-virtual,
+      non-already-coded term via `sqlite3ExprIfFalse(addrCont,
+      JUMPIFNULL)` then tags it TERM_CODED.  Skips terms whose prereqAll
+      bits are still in pLevel^.notReady (lights bit 1 of
+      `pWInfo^.bitwiseFlags` = untestedTerms).  Outer-join LHS/RHS terms
+      gated through the `EP_OuterON|EP_InnerON` filter + per-table iJoin
+      mask probe.  TERM_LIKECOND wraps the residual call in OP_If/OP_IfNot
+      against `pLevel^.iLikeRepCntr` so the LIKE residual fires only on
+      the BLOB-comparison pass (range bound suffices for strings).
+      Transitive-equiv post-walk (wherecode.c:2683..2727) re-emits
+      "t1.a = t2.b ∧ t2.b = 123" as the implied "t1.a = 123" via
+      sqlite3WhereFindTerm (skipping IN-subselect-with-vector RHS).
+      LEFT-JOIN match-flag set (wherecode.c:2773..2780) emits
+      OP_Integer 1 → iLeftJoin and stamps `pLevel^.addrFirst`.  Deferred:
+      RIGHT JOIN match recording (pRJ Bloom-filter + iMatch IdxInsert,
+      wherecode.c:2729..2768) and `code_outer_join_constraints` post-pass
+      — both gated on the pRJ subroutine driver landing in the next
+      batch alongside Case 5 (multi-index OR).
+      Gate: `TestWherePlanner.pas` (555/555): SCOLS13 (Case 6 full scan
+      with one residual TK_INTEGER literal in pWC^.a — body walk fires,
+      term tagged TERM_CODED, ExprIfFalse short-circuits a constant-true
+      literal without emit), SCOLS14 (term with prereqAll & notReady
+      = bit 0 deferred — bit 1 of bitwiseFlags lit, TERM_CODED stays
+      clear), SCOLS15 (TERM_VIRTUAL skip — neither TERM_CODED set nor
+      untestedTerms lit).
     - [X] Leaf helpers, batch 10 — `codeINTerm` (wherecode.c:668..784)
       full port replacing the prior `Assert(False)` stub.  IN-loop
       builder: opens the IN cursor (rowid table / shared index / EPH

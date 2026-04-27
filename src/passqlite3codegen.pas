@@ -12260,6 +12260,20 @@ var
   jSwap16:         u16;
   jSwapTerm:       PWhereTerm;
   j4:              i32;
+  { ---- Per-loop body code (push-down + transitive constraint) locals ---- }
+  pWCBody:         PWhereClause;
+  pTermBody:       PWhereTerm;
+  pTermAlt:        PWhereTerm;
+  pTermArr:        PWhereTerm;
+  pEBody:          PExpr;
+  sEAlt:           TExpr;
+  mBody:           Bitmask;
+  iLoopBody:       i32;
+  iNextBody:       i32;
+  jBody:           i32;
+  skipLikeAddr:    i32;
+  pIdxBody:        PIndex2;
+  xLR:             u32;
 begin
   pLoop    := pLevel^.pWLoop;
   pTabItem := @SrcListItems(pWInfo^.pTabList)[pLevel^.iFrom];
@@ -12700,6 +12714,132 @@ begin
                                             iCur, pLevel^.addrHalt);
       pLevel^.p5 := SQLITE_STMTSTATUS_FULLSCAN_STEP;
     end;
+  end;
+
+  { wherecode.c:2587..2727 — per-loop body push-down + transitive constraint
+    + LEFT-JOIN match-flag set.  Tests every WHERE-clause sub-expression
+    that can be fully computed using the current set of tables and emits
+    the residual constraint check (sqlite3ExprIfFalse → addrCont).
+    iLoop=1: only terms covered by pIdx (= pLoop's chosen index).
+    iLoop=2: remaining terms without correlated subqueries.
+    iLoop=3: everything else.  TERM_LIKECOND wraps the call in OP_If/IfNot
+    against pLevel^.iLikeRepCntr so the LIKE residual fires only on the
+    BLOB-comparison pass (the range bound suffices for strings).
+
+    RIGHT JOIN match-recording (pRJ) and the JT_LEFT post-pass via
+    code_outer_join_constraints are deferred — pLevel^.pRJ is a stub for
+    now and the JT_LEFT/LTORJ/RIGHT skip path inside the main walk already
+    leaves outer-join terms uncoded so a future batch can pick them up
+    once the RIGHT JOIN subroutine driver lands. }
+  pWCBody := @pWInfo^.sWC;
+  if (pLoop^.wsFlags and WHERE_INDEXED) <> 0 then
+    pIdxBody := pLoop^.u.btree.pIndex
+  else
+    pIdxBody := nil;
+
+  if pIdxBody <> nil then iLoopBody := 1 else iLoopBody := 2;
+  repeat
+    iNextBody := 0;
+    pTermArr  := pWCBody^.a;
+    for jBody := 0 to pWCBody^.nTerm - 1 do
+    begin
+      pTermBody := @pTermArr[jBody];
+      skipLikeAddr := 0;
+      if (pTermBody^.wtFlags and (TERM_VIRTUAL or TERM_CODED)) <> 0 then
+        continue;
+      if (pTermBody^.prereqAll and pLevel^.notReady) <> 0 then
+      begin
+        { bit 1 of bitwiseFlags = untestedTerms }
+        pWInfo^.bitwiseFlags := pWInfo^.bitwiseFlags or u8($02);
+        continue;
+      end;
+      pEBody := pTermBody^.pExpr;
+      Assert(pEBody <> nil);
+      xLR := pTabItem^.fg.jointype and (JT_LEFT or JT_LTORJ or JT_RIGHT);
+      if xLR <> 0 then
+      begin
+        if not ExprHasProperty(pEBody, EP_OuterON or EP_InnerON) then
+          continue;
+        if ((pTabItem^.fg.jointype and JT_LEFT) = JT_LEFT)
+           and (not ExprHasProperty(pEBody, EP_OuterON)) then
+          continue;
+        mBody := sqlite3WhereGetMask(@pWInfo^.sMaskSet, pEBody^.w.iJoin);
+        if (mBody and pLevel^.notReady) <> 0 then continue;
+      end;
+      if (iLoopBody = 1)
+         and (sqlite3ExprCoveredByIndex(pEBody, pLevel^.iTabCur, pIdxBody) = 0)
+      then
+      begin
+        iNextBody := 2;
+        continue;
+      end;
+      if (iLoopBody < 3)
+         and ((pTermBody^.wtFlags and TERM_VARSELECT) <> 0) then
+      begin
+        if iNextBody = 0 then iNextBody := 3;
+        continue;
+      end;
+      if (pTermBody^.wtFlags and TERM_LIKECOND) <> 0 then
+      begin
+        if pLevel^.iLikeRepCntr > 0 then
+        begin
+          if (pLevel^.iLikeRepCntr and 1) <> 0 then
+            skipLikeAddr := sqlite3VdbeAddOp1(v, OP_IfNot,
+                              i32(pLevel^.iLikeRepCntr shr 1))
+          else
+            skipLikeAddr := sqlite3VdbeAddOp1(v, OP_If,
+                              i32(pLevel^.iLikeRepCntr shr 1));
+        end;
+      end;
+      sqlite3ExprIfFalse(pParse, pEBody, addrCont, SQLITE_JUMPIFNULL);
+      if skipLikeAddr <> 0 then sqlite3VdbeJumpHere(v, skipLikeAddr);
+      pTermBody^.wtFlags := pTermBody^.wtFlags or TERM_CODED;
+    end;
+    iLoopBody := iNextBody;
+  until iLoopBody = 0;
+
+  { Transitive constraint walk (wherecode.c:2683..2727).  When a term like
+    "t1.a = t2.b" cannot be coded directly (because t2.b's loop has not
+    coded yet) but a "t2.b = 123" predicate exists, code the implied
+    "t1.a = 123" constraint instead.  Skipped for outer-join tables since
+    the WO_EQUIV propagation does not commute with NULL extension. }
+  if (pTabItem^.fg.jointype and (JT_LEFT or JT_LTORJ or JT_RIGHT)) = 0 then
+  begin
+    pTermArr := pWCBody^.a;
+    for jBody := 0 to pWCBody^.nBase - 1 do
+    begin
+      pTermBody := @pTermArr[jBody];
+      if (pTermBody^.wtFlags and (TERM_VIRTUAL or TERM_CODED)) <> 0 then
+        continue;
+      if (pTermBody^.eOperator and (WO_EQ or WO_IS)) = 0 then continue;
+      if (pTermBody^.eOperator and WO_EQUIV) = 0 then continue;
+      if pTermBody^.leftCursor <> iCur then continue;
+      pEBody   := pTermBody^.pExpr;
+      pTermAlt := sqlite3WhereFindTerm(pWCBody, iCur,
+                    pTermBody^.u.leftColumn, notReady,
+                    WO_EQ or WO_IN or WO_IS, nil);
+      if pTermAlt = nil then continue;
+      if (pTermAlt^.wtFlags and TERM_CODED) <> 0 then continue;
+      if ((pTermAlt^.eOperator and WO_IN) <> 0)
+         and ExprUseXSelect(pTermAlt^.pExpr)
+         and (pTermAlt^.pExpr^.x.pSelect^.pEList^.nExpr > 1) then
+        continue;
+      sEAlt := pTermAlt^.pExpr^;
+      sEAlt.pLeft := pEBody^.pLeft;
+      sqlite3ExprIfFalse(pParse, @sEAlt, addrCont, SQLITE_JUMPIFNULL);
+      pTermAlt^.wtFlags := pTermAlt^.wtFlags or TERM_CODED;
+    end;
+  end;
+
+  { LEFT JOIN match-flag set (wherecode.c:2773..2780).  When this level is
+    the inner side of a LEFT JOIN, record that the row-pairing succeeded
+    by storing 1 into the iLeftJoin memory cell allocated in the prelude.
+    The pRJ-driven RIGHT JOIN subroutine setup (wherecode.c:2782..2814)
+    is deferred — pLevel^.pRJ remains a stub. }
+  if pLevel^.iLeftJoin <> 0 then
+  begin
+    pLevel^.addrFirst := sqlite3VdbeCurrentAddr(v);
+    sqlite3VdbeAddOp2(v, OP_Integer, 1, pLevel^.iLeftJoin);
   end;
 
   Result := pLevel^.notReady;

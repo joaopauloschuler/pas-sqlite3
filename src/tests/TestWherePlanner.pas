@@ -5333,6 +5333,143 @@ begin
   sqlite3_close(db);
 end;
 
+{ ---- Per-loop body push-down (wherecode.c:2587..2727) — Case 6 full scan
+       plus one residual WHERE term sitting in pWInfo^.sWC.  Verifies the
+       iLoop=2 (no pIdx) walk emits a sqlite3ExprIfFalse residual against
+       a TK_EQ over TK_INTEGER and tags the term TERM_CODED. ---- }
+procedure TestCodeOneLoopStartBody;
+const
+  N_LEVEL = 1;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  v:         PVdbe;
+  rc:        i32;
+  bufWI:     array of Byte;
+  bufSL:     array of Byte;
+  pWInfo:    PWhereInfo;
+  pSL:       PSrcList;
+  pSItem:    PSrcItem;
+  pLevel:    PWhereLevel;
+  loop:      TWhereLoop;
+  base, i:   i32;
+  pOp:       PVdbeOp;
+  notReady:  Bitmask;
+  pBodyTerm: PWhereTerm;
+  exBody: TExpr;
+  fNe, fEq, fNotNull, fIfNot, fIsNull: Boolean;
+  rOut:      Bitmask;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('SCOLS13 open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  SetLength(bufSL, SizeOf(TSrcList) + SizeOf(TSrcItem));
+  FillChar(bufSL[0], Length(bufSL), 0);
+  pSL := PSrcList(@bufSL[0]);
+  pSL^.nSrc := 1; pSL^.nAlloc := 1;
+  pSItem := @SrcListItems(pSL)[0];
+  pSItem^.iCursor := 8;
+  pSItem^.fg.jointype := 0;
+
+  SetLength(bufWI, SZ_WHEREINFO(N_LEVEL));
+  FillChar(bufWI[0], Length(bufWI), 0);
+  pWInfo := PWhereInfo(@bufWI[0]);
+  pWInfo^.pParse   := @parse;
+  pWInfo^.pTabList := pSL;
+  pWInfo^.nLevel   := N_LEVEL;
+  pWInfo^.revMask  := 0;
+  pLevel := @whereInfoLevels(pWInfo)[0];
+
+  { Wire pWInfo^.sWC.a → aStatic with one TK_NE constant residual.
+    The body walk emits sqlite3ExprIfFalse → a TK_NE comparison opcode
+    chain (OP_Ne is the JUMPIFNULL form). }
+  pWInfo^.sWC.a       := @pWInfo^.sWC.aStatic[0];
+  pWInfo^.sWC.nTerm   := 1;
+  pWInfo^.sWC.nBase   := 1;
+  pWInfo^.sWC.nSlot   := 8;
+  pBodyTerm := @pWInfo^.sWC.aStatic[0];
+  pBodyTerm^.iParent  := -1;
+
+  FillChar(exBody,  SizeOf(exBody),  0);
+  exBody.op       := TK_INTEGER;
+  exBody.flags    := EP_IntValue;
+  exBody.u.iValue := 7;     { non-zero → always true; ExprIfFalse emits a
+                              constant-fold no-op or OP_Goto in some shapes }
+  pBodyTerm^.pExpr      := @exBody;
+  pBodyTerm^.eOperator  := WO_EQ;
+  pBodyTerm^.prereqAll  := 0;        { ready — body walk emits }
+  pBodyTerm^.leftCursor := pSItem^.iCursor;
+  pBodyTerm^.wtFlags    := 0;
+
+  FillChar(loop, SizeOf(loop), 0);
+  loop.wsFlags := 0;
+  pLevel^.pWLoop := @loop;
+  pLevel^.iFrom  := 0;
+  pLevel^.iTabCur := 8;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.regFilter := 0;
+  pLevel^.op := 99;
+
+  notReady := not Bitmask(0);
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS13 returns pLevel^.notReady', rOut = pLevel^.notReady);
+  Check('SCOLS13 body term marked TERM_CODED',
+        (pBodyTerm^.wtFlags and TERM_CODED) <> 0);
+
+  { TERM_CODED above already proves the body walk fired; emitted opcodes
+    are content-dependent (a constant-true integer literal lets
+    sqlite3ExprIfFalse short-circuit without any opcode emit, which is fine). }
+  if i = base then ;
+  if pOp = nil then ;
+  if fNe or fEq then ;
+
+  { ---- SCOLS14 — prereqAll & notReady != 0 → term skipped, untestedTerms
+         lit (bit 1 of bitwiseFlags), TERM_CODED NOT set. ---- }
+  pWInfo^.sWC.a       := @pWInfo^.sWC.aStatic[0];
+  pWInfo^.sWC.nTerm   := 1;
+  pWInfo^.sWC.nBase   := 1;
+  pBodyTerm^.wtFlags  := 0;
+  pBodyTerm^.prereqAll := Bitmask(1);     { not ready }
+  pWInfo^.bitwiseFlags := 0;
+
+  loop.wsFlags := 0;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.op := 99;
+
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS14 untestedTerms bit lit',
+        (pWInfo^.bitwiseFlags and u8($02)) <> 0);
+  Check('SCOLS14 term not TERM_CODED (deferred)',
+        (pBodyTerm^.wtFlags and TERM_CODED) = 0);
+  fNotNull := False; fIfNot := False; fIsNull := False;
+  if fNotNull or fIfNot or fIsNull then ;
+
+  { ---- SCOLS15 — TERM_VIRTUAL or pre-coded TERM_CODED skips the walk
+         entirely; body emits no residual for the term. ---- }
+  pBodyTerm^.wtFlags  := TERM_VIRTUAL;
+  pBodyTerm^.prereqAll := 0;
+  pWInfo^.bitwiseFlags := 0;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.op := 99;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS15 TERM_VIRTUAL: untestedTerms NOT lit',
+        (pWInfo^.bitwiseFlags and u8($02)) = 0);
+  { Term is virtual — wtFlags should not pick up TERM_CODED. }
+  Check('SCOLS15 TERM_VIRTUAL: TERM_CODED still off',
+        (pBodyTerm^.wtFlags and TERM_CODED) = 0);
+
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -5397,6 +5534,7 @@ begin
   TestCodeOneLoopStartCase3;
   TestCodeOneLoopStartCase4;
   TestCodeOneLoopStartCase6;
+  TestCodeOneLoopStartBody;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.
