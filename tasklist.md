@@ -216,29 +216,69 @@ Important: At the end of this document, please find:
     11g.2.f open-DIVERGE rows below).  Re-enable any disabled assertions
     / safety-net guards left during 11g.2.b..e.
 
-    **CREATE INDEX nil-Vdbe — compound root cause (refined 2026-04-27):**
+    **CREATE INDEX nil-Vdbe — compound root cause (refined 2026-04-27,
+    re-refined after empirical probe):**
     The CREATE INDEX / CREATE UNIQUE INDEX nil-Vdbe DIVERGE rows in
     TestExplainParity are blocked on two distinct bugs, not one.
-      (a) Schema-publish gap: `sqlite3EndTable` at
-          `passqlite3codegen.pas:19085` only inserts the new Table into
+      (a) Schema-publish gap: `sqlite3EndTable` (around
+          `passqlite3codegen.pas:19096`) only inserts the new Table into
           `pSchema^.tblHash` when `db^.init.busy <> 0`.  On the
           init.busy=0 path the Table is built but never published, so
           subsequent `sqlite3CreateIndex` hits a nil-table early exit at
-          `passqlite3codegen.pas:19069..19070`.  A naïve fix that
-          mirrors the init.busy=1 publish into the init.busy=0 tail
-          DOES populate tblHash, but the Table object built by
-          `sqlite3StartTable + sqlite3AddColumn` is structurally
-          incomplete (missing column-tail / tnum machinery that the
-          init.busy=1 reparse path papers over) — DROP TABLE codegen
-          then finds the half-baked Table and AVs.  Fix needs to first
-          complete Table-object initialization (column tail, tnum
+          `passqlite3codegen.pas:19644` (`sqlite3SrcListLookup` returns
+          nil because `t` is not yet in tblHash, and the OP_ParseSchema
+          rebuild from sqlite_master finds no row to seed it from —
+          see (b)).  A naïve fix that mirrors the init.busy=1 publish
+          into the init.busy=0 tail DOES populate tblHash, but the Table
+          object built by `sqlite3StartTable + sqlite3AddColumn` is
+          structurally incomplete (missing column-tail / tnum machinery
+          that the init.busy=1 reparse path papers over) — DROP TABLE
+          codegen then finds the half-baked Table and AVs.  Fix needs to
+          first complete Table-object initialization (column tail, tnum
           patching from the OP_CreateBtree result) before publishing.
-      (b) `sqlite3NestedParse('INSERT INTO %Q.sqlite_master ...')` at
-          `passqlite3codegen.pas:19796` fails inside `sqlite3Insert`
-          (nErr=1, rc=1, empty zErrMsg) — likely the `#%d`
-          register-reference column-value syntax or the sqlite_master
-          virtual-row write path is incompletely ported.  Independent
-          of (a); fixing (a) without (b) keeps CREATE INDEX nil-Vdbe.
+      (b) **Refined:** the path no longer uses `sqlite3NestedParse`.
+          `sqlite3EndTable` now calls `emitSchemaRowInsert`
+          (`passqlite3codegen.pas:18893..18946, 19078`) which emits the
+          schema-row INSERT bytecode directly: OP_OpenWrite cursor 0 on
+          SCHEMA_ROOT, OP_String8 ×4 for type/name/tbl_name/sql,
+          OP_SCopy for rootpage, OP_NewRowid, OP_MakeRecord(5),
+          OP_Insert (P5=OPFLAG_APPEND), OP_Close.  Empirical probe
+          (CREATE TABLE t(a,b) followed by `SELECT count(*) FROM
+          sqlite_master` via prepare/step) returns 0 — so the OP_Insert
+          either never writes the cell or the page isn't committed
+          before the OP_ParseSchema rebuild reads sqlite_master back.
+          Likely candidates: regRoot (OP_CreateBtree result reg) is not
+          patched by the time emitSchemaRowInsert SCopy's it, OR the
+          OP_OpenWrite cursor needs `OPFLAG_P2ISREG` semantics for the
+          rootpage operand, OR the btree write isn't observable to the
+          subsequent ParseSchema scan because the implicit transaction
+          isn't open / OP_Transaction P2=1 was never emitted.
+          Diagnostic helper `sqlite3ErrorMsg` was upgraded
+          (`passqlite3codegen.pas:3196..3214`) to actually populate
+          `pParse^.zErrMsg` so future probes return a real message
+          instead of a bare nErr=1.  Independent of (a); fixing (a)
+          without (b) keeps CREATE INDEX nil-Vdbe.
+
+    **EXISTS_SUB DIVERGE — confirmed strategy-difference, not a
+    correctness gap (2026-04-27 investigation):** Pas's plain
+    correlated subroutine for the EXISTS subselect produces
+    semantically correct results.  The C-side advantage is the
+    auto-index + bloom-filter co-optimization synthesized inside
+    `whereLoopAddBtree` (`where.c:4063..4115`) when
+    `termCanDriveIndex` accepts the cross-frame `s.x = t.a` term.
+    Pas has all structural code (auto-index synthesis at
+    `passqlite3codegen.pas:11055..11115`; useBloomFilter /
+    OP_OpenAutoindex / OP_FilterAdd at `13151..13343`) — the gap is
+    upstream in `exprAnalyze`'s correlated-term classification: the
+    `s.x = t.a` term inside the inner SELECT is not classified as
+    `WO_EQ` with a usable cross-frame `prereqRight`.  Estimated fix
+    50..200 LOC concentrated in `exprAnalyze`
+    (`passqlite3codegen.pas:7418..7541`).  NOT_EXISTS already PASSes
+    on the plain-scan strategy, confirming the corpus already accepts
+    this shape; widening the comparator for EXISTS_SUB to PASS-on-
+    different-strategy is a defensible alternative, but the auto-index
+    optimization should land in a dedicated phase with shape-
+    validating coverage.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
   Current Status: **2 PASS / 8 DIVERGE / 0 ERROR**.  Drive to

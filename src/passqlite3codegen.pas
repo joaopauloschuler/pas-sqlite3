@@ -3192,13 +3192,24 @@ procedure sqlite3VdbeAddDblquoteStr(db: PTsqlite3; pVdbe: PVdbe;
   z: PAnsiChar);
 begin { Phase 6.5 stub } end;
 
-{ Error reporting (used by expr.c, resolve.c) }
+{ Error reporting (used by expr.c, resolve.c).  Mirrors build.c
+  sqlite3ErrorMsg: stores the formatted message on pParse^.zErrMsg
+  so callers (sqlite3NestedParse, sqlite3_prepare_v2) can surface
+  the exact failure reason instead of a bare nErr=1.  No %T fidelity
+  yet; that remains a deferred reduced-fidelity item. }
 procedure sqlite3ErrorMsg(pParse: PParse; zFormat: PAnsiChar);
+var
+  zMsg: PAnsiChar;
 begin
-  if pParse <> nil then begin
-    Inc(pParse^.nErr);
-    if pParse^.rc = SQLITE_OK then pParse^.rc := SQLITE_ERROR;
-  end;
+  if pParse = nil then Exit;
+  Inc(pParse^.nErr);
+  if pParse^.rc = SQLITE_OK then pParse^.rc := SQLITE_ERROR;
+  if zFormat = nil then Exit;
+  zMsg := sqlite3MPrintf(pParse^.db, zFormat, []);
+  if zMsg = nil then Exit;
+  if pParse^.zErrMsg <> nil then
+    sqlite3DbFree(pParse^.db, pParse^.zErrMsg);
+  pParse^.zErrMsg := zMsg;
 end;
 
 procedure sqlite3RecordErrorOffsetOfExpr(db: PTsqlite3; pExpr: PExpr);
