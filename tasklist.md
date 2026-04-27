@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 461 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 462); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 491 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 492); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -190,8 +190,8 @@ Important: At the end of this document, please find:
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
   comparison ops + literal-arith + col aliases + multi-col index +
   multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **461 PASS / 1 DIVERGE / 0 ERROR**
-  (corpus = 462 after probe sweep #17).
+  Current Status (2026-04-27): **491 PASS / 1 DIVERGE / 0 ERROR**
+  (corpus = 492 after probe sweep #18).
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -269,58 +269,57 @@ Important: At the end of this document, please find:
 
     - [ ] **6.10 step 6** Expand corpus further and drive remaining
       DIVERGEs to PASS, then promote from report-only to hard gate.
-      Corpus now 461 PASS / 1 DIVERGE / 462 total after probe
-      sweep #17 (added 30 PASS rows).  The pattern: pick SQL shapes
+      Corpus now 491 PASS / 1 DIVERGE / 492 total after probe
+      sweep #18 (added 30 PASS rows).  The pattern: pick SQL shapes
       adjacent to those already PASSing, batch ~20–30 at a time,
       drop any that DIVERGE into the actionable list below.
 
-      DIVERGE shapes discovered in probe sweeps (kept out of corpus
-      until they flip — each is a committable next-agent ticket):
-        * `CREATE INDEX i ON t(a) WHERE a>0` — Δ=4 (partial-index
+      Make these to work (port code when required):
+        [ ] `CREATE INDEX i ON t(a) WHERE a>0` — Δ=4 (partial-index
           WHERE clause codegen path).
-        * `INSERT INTO t(a) VALUES(1)` / `INSERT INTO t(a,b,c)
+        [ ] `INSERT INTO t(a) VALUES(1)` / `INSERT INTO t(a,b,c)
           VALUES(...)` — Δ=7 (named-column INSERT path differs from
           positional; likely missing column-list permutation in
           `sqlite3Insert`).
-        * `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
+        [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
           VALUES path).
-        * `SELECT a FROM t WHERE rowid=1 OR rowid=2` — Δ=5 (rowid
+        [ ] `SELECT a FROM t WHERE rowid=1 OR rowid=2` — Δ=5 (rowid
           OR-decomposed path; planner reaches multi-loop branch but
           counters disagree).
-        * `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
+        [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
-        * `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3
+        [ ] `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3
           (read-pragma codegen is a stub: `sqlite3Pragma` in
           passqlite3codegen.pas:22374 returns immediately; needs
           ReadCookie / ResultRow tail at minimum).
-        * `SELECT a FROM t WHERE rowid<5` (and `>`, `<=`, `>=`) —
+        [ ] `SELECT a FROM t WHERE rowid<5` (and `>`, `<=`, `>=`) —
           per-op divergence at op[2] (rowid range scan path: planner
           picks WHERE_IPK range but inner-loop opcode emission differs
           from C).  `<>` shape PASSes; only ordered comparisons fail.
-        * `SELECT a FROM t WHERE a IN (1,2,3)` / `NOT IN (...)` —
+        [ ] `SELECT a FROM t WHERE a IN (1,2,3)` / `NOT IN (...)` —
           Δ=−1 (Pas heavier by 1 op vs C in IN-list rowset path).
-        * `SELECT a FROM t WHERE a LIKE 'abc%'` / `GLOB 'abc*'` —
+        [ ] `SELECT a FROM t WHERE a LIKE 'abc%'` / `GLOB 'abc*'` —
           Δ=1 (LIKE/GLOB virtual-term range-scan path off by 1).
-        * `SELECT DISTINCT a FROM t` — Δ=13 (DISTINCT codegen,
+        [ ] `SELECT DISTINCT a FROM t` — Δ=13 (DISTINCT codegen,
           ephemeral-table dedup not yet wired in `sqlite3Select`).
-        * `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
+        [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
           Δ=16..18 (ORDER BY sorter / ephemeral-key path: Pas emits
           only 3 ops, no sorter open / KeyInfo / sort-finalise loop).
-        * `SELECT a FROM t GROUP BY a` — Δ=42 (aggregate-group
+        [ ] `SELECT a FROM t GROUP BY a` — Δ=42 (aggregate-group
           path, not yet ported).
-        * `SELECT COUNT(*)` — Δ=−1; `SELECT SUM/MIN/MAX(a)` —
+        [ ] `SELECT COUNT(*)` — Δ=−1; `SELECT SUM/MIN/MAX(a)` —
           Δ=3..4 (aggregate-no-GROUP path, partial codegen).
-        * `SELECT a FROM t LIMIT 5 OFFSET 2` — Δ=13 (OFFSET path:
+        [ ] `SELECT a FROM t LIMIT 5 OFFSET 2` — Δ=13 (OFFSET path:
           Pas emits only 3 ops, no offset-skip register init).
-        * `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
+        [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
           materialise / co-routine path not ported).
-        * `UPDATE t SET a=5 WHERE rowid=1` — Δ=14 (`sqlite3Update`
+        [ ] `UPDATE t SET a=5 WHERE rowid=1` — Δ=14 (`sqlite3Update`
           still skeleton-only — see 11g.2.f open follow-on).
-        * `INSERT INTO u VALUES(1, 2);` (u has `p PRIMARY KEY`) —
+        [ ] `INSERT INTO u VALUES(1, 2);` (u has `p PRIMARY KEY`) —
           Δ=11 (rowid-aliased INTEGER PRIMARY KEY INSERT path).
-        * `SELECT p FROM u;` — per-op divergence at op[1] (scan
+        [ ] `SELECT p FROM u;` — per-op divergence at op[1] (scan
           of rowid-aliased PRIMARY KEY column).
-        * `DROP TABLE IF EXISTS znope;` (target absent) — Pascal
+        [ ] `DROP TABLE IF EXISTS znope;` (target absent) — Pascal
           `prepare_v2` returns a nil Vdbe; C returns a stepable
           (no-op) Vdbe.  Likely an early-return in `sqlite3DropTable`
           before `sqlite3FinishCoding` runs.
