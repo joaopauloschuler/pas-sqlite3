@@ -32,23 +32,6 @@ Important: At the end of this document, please find:
     TK_COLLATE/TK_SPAN/TK_UPLUS arms, whereShortCut, allowedOp +
     operatorMask + exprMightBeIndexed + minimal-viable exprAnalyze)
     are already landed.
-    - [X] Trimmed planner pick + per-loop emission for the rowid-EQ
-      shape — `whereShortCut` wired into `sqlite3WhereBegin` after
-      the WHERE_WANT_DISTINCT block; level-0 cursor open via
-      `sqlite3OpenTable(OP_OpenRead)` + Case-2 body via
-      `sqlite3ExprCodeTarget` + `OP_SeekRowid` to addrBrk.
-    - [X] Loop-tail half of `sqlite3WhereEnd` — per-level
-      ResolveLabel(addrCont) + iteration-opcode emission +
-      ResolveLabel(addrBrk), final ResolveLabel(iBreak), nQueryLoop
-      restore, then `whereInfoFree`.  Deferred arms (RIGHT JOIN,
-      SKIPAHEAD_DISTINCT, IN-loop unwind, LEFT JOIN null-row,
-      addrSkip, index→table column rewrite) gated to 11g.2.e.
-    - [X] `TestWhereSimple.pas` gate — hand-built SrcList +
-      rowid-EQ Expr; asserts `whereShortCut` populates
-      WHERE_IPK | WHERE_ONEROW, OP_OpenRead + OP_SeekRowid emit at
-      expected cursors / labels, `pLevel^.op = OP_Noop`, term
-      flagged TERM_CODED, and `pParse.nQueryLoop` is restored
-      across `WhereBegin`/`WhereEnd`.
     - [ ] Re-enable productive tails — `sqlite3Update` skeleton-only
       and `sqlite3DeleteFrom` vtab `OP_VUpdate` arm still open (tracked
       under 11g.2.f "Open follow-on").  `sqlite3GenerateRowDelete`,
@@ -67,75 +50,6 @@ Important: At the end of this document, please find:
     `transferJoinMarkings`, `isLikeOrGlob`, `whereCommuteOperator`.
     Gate: extend `TestWhereSimple.pas` with multi-term cases
     (a=1 AND b=2, a IN (1,2,3), a BETWEEN 1 AND 5).
-    - [X] `whereClauseInsert` (heap-grow term array beyond aStatic),
-      `markTermAsChild`, `transferJoinMarkings`, `exprCommute` ported;
-      `sqlite3WhereSplit` rewritten to use `whereClauseInsert`;
-      `exprAnalyze` extended with the right-side commute path
-      (whereexpr.c:1222..1261) and the TK_ISNULL→TK_TRUEFALSE rewrite
-      (whereexpr.c:1262..1272).  Gate: `TestWhereExpr.pas` (22/22).
-    - [X] BETWEEN virtual-term synthesis (whereexpr.c:1291..1313) —
-      "a BETWEEN b AND c" → (a>=b) AND (a<=c) virtual children with
-      TERM_VIRTUAL|TERM_DYNAMIC and recursive exprAnalyze on each new
-      term.  Gate: `TestWhereExpr.pas` T7a..T7k (33/33).
-    - [X] NOTNULL virtual-term synthesis (whereexpr.c:1331..1359) —
-      "x IS NOT NULL" on a non-rowid column gets a virtual "x>NULL"
-      companion tagged TERM_VNULL with WO_GT.  Gate:
-      `TestWhereExpr.pas` T8a..T8g (40/40).
-    - [X] `whereNthSubterm` (whereexpr.c:521..534) and
-      `whereCombineDisjuncts` (whereexpr.c:556..599) ported as
-      collation-independent helpers for the eventual OR-term path.
-      Gate: `TestWhereExpr.pas` T9a..T9b (whereNthSubterm), T10a..T10e
-      ("a<5 OR a=5" → virtual TK_LE term), T11a (incompatible
-      "a<5 OR a>5" leaves pWC untouched). 48/48.
-    - [X] `exprAnalyzeOrTerm` (whereexpr.c:689..945) — TK_OR shatter
-      into disjuncts, per-disjunct AND-decomposition, indexable bitmask
-      synthesis (case 3), two-way disjunct collapse via
-      `whereCombineDisjuncts` (case 2), and case-1 conversion of
-      "col=A OR col=B …" into a virtual `col IN (A,B,…)` term tagged
-      TERM_VIRTUAL|TERM_DYNAMIC.  Wired into `exprAnalyze`'s top-level
-      OR-arm.  Gate: `TestWhereExpr.pas` T12a..T12k (case-1 IN
-      synthesis on rowid OR), T13a..T13c (column-mismatched OR keeps
-      ORINFO but skips the IN promotion).  62/62.
-    - [X] LIKE / GLOB virtual-term synthesis (whereexpr.c:1362..1455) +
-      `isLikeOrGlob` (whereexpr.c:178..343).  "x LIKE 'aBc%'" gets two
-      TERM_LIKEOPT|TERM_VIRTUAL|TERM_DYNAMIC children — `x>='ABC'` (TK_GE)
-      and `x<'abd'` (TK_LT) — so the pattern can be served by an index
-      range scan; original LIKE term gets TERM_LIKE when noCase, plus
-      isComplete-gated parent/child links.
-      `termIsEquivalence` (still deferred) needs `sqlite3ExprCollSeqMatch`
-      + `SQLITE_Transitive` and only affects join-graph WO_EQUIV
-      propagation, never correctness.  `whereCommuteOperator` is the
-      C-side `exprCommute`, already landed in 11g.2.b sub-progress.
-      Gate: `TestWhereExpr.pas` T14a..T14l (LIKE on rowid → range scan
-      synthesis), T15a..T15b (numeric-prefix bailout).  76/76.
-    - [X] TK_VARIABLE bound-parameter LIKE path
-      (whereexpr.c:208..216, 316..334).  `sqlite3VdbeSetVarmask` and
-      `sqlite3VdbeGetBoundValue` ported in `passqlite3vdbe.pas`
-      (vdbeaux.c:5366..5398).  `isLikeOrGlob` consults the current bound
-      TEXT value of `?N` via `pParse^.pReprepare`, runs the prefix /
-      numeric / wildcard scan against it, and synthesizes the same
-      range-scan virtual children as the literal-string path; rebinding
-      the parameter triggers reoptimize() reprepare via the expmask bit
-      set on `pParse^.pVdbe`.  The QPSG gate (`SQLITE_EnableQPSG`) is
-      respected — when the connection has Query-Planner Stability
-      Guarantee enabled, the optimization is skipped (matches C).
-      Gate: `TestWhereExpr.pas` T16a..T16g (`x LIKE ?1` with ?1 bound to
-      'aBc%' synthesizes `>='ABC'` and `<'abd'` children, expmask bit 0
-      set on rebind).  84/84.
-    - [X] Multi-term gate extension on `TestWhereSimple.pas` — drives
-      `sqlite3WhereBegin` / `sqlite3WhereEnd` and the analysis pipeline
-      across three multi-term shapes:
-      M1 "rowid = 5 AND col = 7" (whereShortCut still picks WHERE_IPK
-      with the col=7 leaf left in `sWC` for the eventual planner;
-      OP_OpenRead + OP_SeekRowid emitted; rowid leaf TERM_CODED, col=7
-      leaf not TERM_CODED).
-      M2 "rowid IN (1,2,3)" (whereShortCut returns 0 → WhereBegin
-      returns nil cleanly; isolated `sqlite3WhereSplit` +
-      `sqlite3WhereExprAnalyze` exercise tags the term with WO_IN and
-      leftCursor/leftColumn set to rowid).
-      M3 "rowid BETWEEN 1 AND 5" (WhereBegin returns nil; analysis in
-      isolation spawns the two TERM_VIRTUAL|TERM_DYNAMIC WO_GE / WO_LE
-      children, parent nChild=2, iParent links back).  39/39.
 
 - [X] **6.9-bis 11g.2.d** Planner core in `where.c` (~5000 lines):
     `whereLoopAddBtree*`, `whereLoopAddVirtual*`, `whereLoopAddOr`,
@@ -333,6 +247,19 @@ Important: At the end of this document, please find:
           DropTable's `Inc(suppressErr)` guard left nErr=1 and
           `sqlite3_prepare_v2` returned SQLITE_ERROR with a nil stmt.
           New corpus row added: PASS at 5 ops.
+
+- [X] **6.10c** Bug — `sqlite3OomFault` / `sqlite3OomClear` were stubs
+  in `passqlite3util.pas`, so an OOM in `growOpArray` (e.g. when
+  `SQLITE_LIMIT_VDBE_OP` was unset on a hand-crafted db) left
+  `db->mallocFailed` clear.  `sqlite3VdbeAddOp4`'s subsequent
+  `ChangeP4` then dereferenced `aOp[nOp-1]` on a nil/zero-sized
+  array → `EAccessViolation`.  Symptom surfaced in TestParser /
+  TestParserSmoke on the first AddOp4-with-P4_DYNAMIC path
+  (`SAVEPOINT`).  Fix: ported `sqlite3OomFault` / `sqlite3OomClear`
+  from malloc.c:827..861 (sets mallocFailed, interrupts running
+  VDBEs, DisableLookaside; clear path restores szTrue once
+  `nVdbeExec=0`).  Test fixtures also updated to seed
+  `SQLITE_LIMIT_VDBE_OP`.  TestParser now 45/45 (was crashing).
 
 - [X] **6.10b** Bug — `INSERT INTO <tbl> DEFAULT VALUES` raised
   EAccessViolation in `sqlite3Insert` (passqlite3codegen.pas:18974)
