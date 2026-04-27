@@ -86,6 +86,11 @@ var
   gCRefOps:              i32;   { running tally of C-oracle ops across the corpus — informational only }
   gCDb:    Pcsq_db;
   gPasDb:  PTsqlite3;
+  { Failure-mode classification — per-row Pascal-side outcome bucket.
+    Surfaces the *kind* of divergence at the report tail so future
+    sub-progress batches under 11g.2.f can target the dominant mode
+    (drive AVs to nil-Vdbe, then to op-count, then to per-op).        }
+  gModeException, gModeNilVdbe, gModeOpCount, gModeOpDiff: i32;
 
 { -------------------------------------------------------------------------- }
 { Corpus.                                                                    }
@@ -270,6 +275,19 @@ begin
           ' p1=', r.p1, ' p2=', r.p2, ' p3=', r.p3, ' p5=', r.p5);
 end;
 
+{ DumpContext — 2-before / 2-after window around firstDiff for one side.
+  Caller passes lo/hi context counts so the helper stays generic. }
+procedure DumpContext(side: AnsiString; const ops: TOpList;
+  firstDiff, lo, hi, total: i32);
+var
+  iStart, iStop, j: i32;
+begin
+  iStart := firstDiff - lo; if iStart < 0 then iStart := 0;
+  iStop  := firstDiff + hi; if iStop  >= total then iStop := total - 1;
+  for j := iStart to iStop do
+    DumpOp(side, j, ops[j]);
+end;
+
 { Two-stage check — the C oracle is consulted first (in the caller) and the
   resulting cOps are passed through to CheckRow.  This keeps the C reference
   available even when the Pascal side raises an exception inside prepare_v2,
@@ -290,7 +308,7 @@ begin
   pOk := PasExplain(PAnsiChar(row.sql), pOps);
 
   if not pOk then begin
-    Inc(gDiverge);
+    Inc(gDiverge); Inc(gModeNilVdbe);
     WriteLn('  DIVERGE ', row.label_, ' [', row.shape,
             '] — Pascal prepare returned nil Vdbe (codegen stub or error)');
     WriteLn('       SQL: ', row.sql);
@@ -299,7 +317,7 @@ begin
   end;
 
   if Length(cOps) <> Length(pOps) then begin
-    Inc(gDiverge);
+    Inc(gDiverge); Inc(gModeOpCount);
     WriteLn('  DIVERGE ', row.label_, ' [', row.shape,
             '] — op count: C=', Length(cOps), ' Pas=', Length(pOps));
     n := Length(cOps); if Length(pOps) < n then n := Length(pOps);
@@ -323,15 +341,28 @@ begin
     WriteLn('  PASS ', row.label_, ' [', row.shape, ']  (',
             Length(cOps), ' ops)');
   end else begin
-    Inc(gDiverge);
+    Inc(gDiverge); Inc(gModeOpDiff);
     WriteLn('  DIVERGE ', row.label_, ' [', row.shape, '] at op[',
             firstDiff, ']/', Length(cOps));
-    DumpOp('C  ', firstDiff, cOps[firstDiff]);
-    DumpOp('Pas', firstDiff, pOps[firstDiff]);
+    { Context window — show 2 ops before and 2 ops after firstDiff on
+      both sides so the report carries enough surrounding shape to tell
+      whether the divergence is a single-op slip (P-operand drift) or a
+      structural drift (extra/missing prologue, swapped scan direction,
+      etc.).  Aligned indices since we know lengths match here.       }
+    n := Length(cOps);
+    DumpContext('C  ', cOps, firstDiff, 2, 2, n);
+    DumpContext('Pas', pOps, firstDiff, 2, 2, n);
   end;
 end;
 
 { -------------------------------------------------------------------------- }
+
+type
+  TShapeBucket = record
+    shape:               AnsiString;
+    pass, diverge, err:  i32;
+    rows:                i32;
+  end;
 
 var
   i:        Int32;
@@ -340,6 +371,11 @@ var
   pzErrMsg: PChar;
   pasErr:   PAnsiChar;
   cOps:     TOpList;
+  shapes:   array of TShapeBucket;
+  preCnt:   i32;
+  bI:       i32;
+  bFound:   Boolean;
+  preP, preD, preE: i32;
 
 begin
   WriteLn('=== TestWhereCorpus — Phase 6.9-bis 11g.2.f bytecode-diff gate (scaffold) ===');
@@ -372,7 +408,9 @@ begin
   end;
 
   InitCorpus;
+  SetLength(shapes, 0);
   for i := 0 to N_CORPUS - 1 do begin
+    preP := gPass; preD := gDiverge; preE := gErr;
     { Run the C oracle first so its bytecode listing is available even when
       the Pascal side raises an exception inside prepare_v2.  Failure here
       means the oracle / fixture is corrupt and is the only condition that
@@ -403,12 +441,31 @@ begin
         exception-mode row carries the target opcodes alongside the
         crash signature — actionable visibility for the next batch. }
       on e: Exception do begin
-        Inc(gDiverge);
+        Inc(gDiverge); Inc(gModeException);
         WriteLn('  DIVERGE ', CORPUS[i].label_, ' [', CORPUS[i].shape,
                 '] — Pascal exception: ', e.ClassName, ' ', e.Message);
         DumpCRef(cOps, 5);
       end;
     end;
+
+    { Roll up the row's outcome into the per-shape bucket.  Buckets are
+      created lazily so the report tail orders shapes by first-seen
+      (matches the corpus declaration order). }
+    bFound := False;
+    for bI := 0 to Length(shapes) - 1 do
+      if shapes[bI].shape = CORPUS[i].shape then begin
+        bFound := True; Break;
+      end;
+    if not bFound then begin
+      bI := Length(shapes); SetLength(shapes, bI + 1);
+      shapes[bI].shape := CORPUS[i].shape;
+      shapes[bI].pass := 0; shapes[bI].diverge := 0;
+      shapes[bI].err := 0;  shapes[bI].rows := 0;
+    end;
+    Inc(shapes[bI].rows);
+    Inc(shapes[bI].pass,    gPass    - preP);
+    Inc(shapes[bI].diverge, gDiverge - preD);
+    Inc(shapes[bI].err,     gErr     - preE);
   end;
 
   csq_close(gCDb);
@@ -422,5 +479,23 @@ begin
       [gCRefOps, N_CORPUS - gErr, gCRefOps / Double(N_CORPUS - gErr)]))
   else
     WriteLn(Format('C-oracle reference total: %d ops (no rows ran)', [gCRefOps]));
+
+  { Failure-mode tally — partition the gDiverge bucket so the next batch
+    can target the dominant mode (exception → nil-Vdbe → op-count →
+    per-op).  Sum should equal gDiverge. }
+  preCnt := gModeException + gModeNilVdbe + gModeOpCount + gModeOpDiff;
+  WriteLn(Format(
+    'Failure-mode tally: %d exception, %d nil-Vdbe, %d op-count, %d op-diff (sum=%d, diverge=%d)',
+    [gModeException, gModeNilVdbe, gModeOpCount, gModeOpDiff, preCnt, gDiverge]));
+
+  { Per-shape histogram — by-tag PASS/DIVERGE/ERR rollup so shape-classes
+    flip green coarsely instead of forcing per-row hunts.  Sub-progress
+    batches under 11g.2.f drive these counters one shape-tag at a time. }
+  WriteLn('Per-shape histogram (shape: pass/diverge/err of rows):');
+  for bI := 0 to Length(shapes) - 1 do
+    WriteLn(Format('  %-16s %d/%d/%d  (rows=%d)',
+      [shapes[bI].shape, shapes[bI].pass, shapes[bI].diverge,
+       shapes[bI].err, shapes[bI].rows]));
+
   if gErr > 0 then Halt(1) else Halt(0);
 end.

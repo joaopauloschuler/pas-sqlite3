@@ -1284,6 +1284,37 @@ Important: At the end of this document, please find:
       `sqlite3SelectAddTypeInfo` (Phase 6.5).  Sub-progress 3 will
       drive the SELECT codegen end-to-end so the first PASS row
       (`full table scan`, 9 ops) flips green.
+    - [X] Sub-progress 3 — failure-mode classification + per-shape
+      histogram + diff-context window (2026-04-27).  The
+      `Results: P pass / D diverge / E error` header is now joined
+      by two structured tail blocks: (a) **Failure-mode tally** —
+      partitions the `gDiverge` bucket into `exception`,
+      `nil-Vdbe`, `op-count`, `op-diff` so the next sub-progress
+      can target the dominant mode (today: 20 exception, 0 of
+      everything else — flips to 20 nil-Vdbe once the AV is
+      tamed, then to op-count once codegen returns a stepable
+      Vdbe); (b) **Per-shape histogram** — corpus rows rolled up
+      by their shape tag (`IPK`, `IPK_IN`, `INDEX_EQ`, `MULTI_OR`,
+      `LEFT_JOIN`, `FULL`, …) showing pass/diverge/err per shape,
+      so shape-classes flip green coarsely instead of forcing
+      per-row hunts.  Bucket creation is lazy so the histogram
+      respects corpus declaration order.  When a row reaches the
+      per-op-diff arm, the report now emits a 5-op context window
+      (2 before / firstDiff / 2 after) on both sides instead of
+      just the diverging op — enough surrounding shape to
+      distinguish a P-operand slip from a structural prologue
+      drift without re-running with a wider dump.  New baseline
+      (2026-04-27): **0 PASS / 20 DIVERGE / 0 ERROR**, total
+      C-ops 363 across 20 rows (avg 18.1) — corpus C-op total
+      drifted up from 324 because the C oracle's `EXPLAIN`
+      listing now consistently includes `Explain` opcodes
+      (SQLITE_ENABLE_EXPLAIN_COMMENTS) on the upstream rebuild,
+      which is informational drift not corpus expansion.
+      Sub-progress 4 will drive the AV — the first pivot is
+      `full table scan` (10 ops: Init / OpenRead / Explain /
+      Rewind / Column / ResultRow / Next / Halt / Transaction /
+      Goto) — by tackling the root-cause `sqlite3ExprDeleteNN`
+      double-descent during `sqlite3SelectDelete` cleanup.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
