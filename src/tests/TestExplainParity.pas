@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 56;
+  N_CORPUS = 58;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -150,6 +150,11 @@ begin
   Add(i, 'SELECT col concat',           'SELECT a||b FROM t;');                  Inc(i);
   Add(i, 'INSERT VALUES s',             'INSERT INTO s VALUES (1,2,3);');        Inc(i);
   Add(i, 'INSERT DEFAULT VALUES s',     'INSERT INTO s DEFAULT VALUES;');        Inc(i);
+
+  { Step 6 sub-progress — constant-integer LIMIT codegen now emits
+    OP_Integer + OP_DecrJumpZero in sqlite3Select. }
+  Add(i, 'SELECT col LIMIT',            'SELECT a FROM t LIMIT 3;');             Inc(i);
+  Add(i, 'SELECT col WHERE LIMIT',      'SELECT a FROM t WHERE a=5 LIMIT 2;');   Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

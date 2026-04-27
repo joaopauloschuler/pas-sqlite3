@@ -17187,8 +17187,16 @@ begin
   if p^.pHaving    <> nil then begin Result := SQLITE_OK; Exit; end;
   if p^.pOrderBy   <> nil then begin Result := SQLITE_OK; Exit; end;
   { SRT_Exists: pLimit is set to LIMIT 1 by sqlite3CodeSubselect — allow it.
-    For all other destinations, bail on LIMIT (not yet ported). }
-  if (p^.pLimit <> nil) and (not isExists) then begin Result := SQLITE_OK; Exit; end;
+    Non-Exists: accept the constant-integer LIMIT shape (no OFFSET) — the
+    only one currently exercised by the parity corpus.  Falls back to the
+    stub for OFFSET / non-constant LIMIT until those land. }
+  if (p^.pLimit <> nil) and (not isExists) then
+  begin
+    if (p^.pLimit^.pRight <> nil)
+       or (p^.pLimit^.pLeft = nil)
+       or (sqlite3ExprIsInteger(p^.pLimit^.pLeft, nil, pParse) = 0) then
+    begin Result := SQLITE_OK; Exit; end;
+  end;
   if p^.pWin       <> nil then begin Result := SQLITE_OK; Exit; end;
   if (p^.selFlags and (SF_Distinct or SF_Aggregate or SF_Compound)) <> 0 then
   begin
@@ -17261,6 +17269,20 @@ begin
     iLimitReg := pParse^.nMem;
     p^.iLimit  := iLimitReg;
     sqlite3VdbeAddOp2(v, OP_Integer, 1, iLimitReg);
+  end
+  else if (not isExists) and (p^.pLimit <> nil) then
+  begin
+    { Non-Exists constant-integer LIMIT — mirrors the
+      sqlite3ExprIsInteger arm of computeLimitRegisters
+      (select.c:2520..2530).  Emits OP_Integer N, iLimit before the
+      WHERE loop opens; DecrJumpZero is emitted in the inner loop
+      after OP_ResultRow. }
+    i := 0;
+    sqlite3ExprIsInteger(p^.pLimit^.pLeft, @i, pParse);
+    Inc(pParse^.nMem);
+    iLimitReg := pParse^.nMem;
+    p^.iLimit  := iLimitReg;
+    sqlite3VdbeAddOp2(v, OP_Integer, i, iLimitReg);
   end;
 
   { Drive the WHERE machinery for the (single, no-WHERE) loop body.
@@ -17324,7 +17346,14 @@ begin
       by iSDParm via OP_MakeRecord + OP_IdxInsert with the per-row
       affinity string in P4. }
     if pDest^.eDest = SRT_Output then
-      sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
+    begin
+      sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+      { LIMIT decrement — selectInnerLoop:1522..1525.  Constant-integer
+        LIMIT case only (matched at the gate above); see computeLimitRegisters
+        block earlier in this function. }
+      if (p^.iLimit <> 0) and (not isExists) then
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, pWInfo^.iBreak);
+    end
     else
     begin
       i := sqlite3GetTempReg(pParse);

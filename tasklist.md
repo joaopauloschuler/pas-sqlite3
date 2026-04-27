@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 55 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 56); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 57 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 58); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -189,7 +189,7 @@ Important: At the end of this document, please find:
   Scaffold landed; corpus expanded to 56 rows (DDL + SELECT/DML/txn +
   SAVEPOINT/RELEASE + INSERT DEFAULT VALUES + multi-AND + multi-col
   rowid-EQ + per-row arith / negate / concat + transaction synonyms).
-  Current Status (2026-04-27): **55 PASS / 1 DIVERGE / 0 ERROR**.
+  Current Status (2026-04-27): **57 PASS / 1 DIVERGE / 0 ERROR**.
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -285,13 +285,20 @@ Important: At the end of this document, please find:
       alt table, INSERT DEFAULT VALUES on alt table).  Corpus now
       55 PASS / 1 DIVERGE / 56 total.
 
+      Sub-progress (2026-04-27): constant-integer LIMIT path landed in
+      `sqlite3Select` — `computeLimitRegisters` arm for
+      `sqlite3ExprIsInteger` constants emits `OP_Integer N, iLimit`
+      before `sqlite3WhereBegin`, and the SRT_Output inner loop emits
+      `OP_DecrJumpZero p^.iLimit, pWInfo^.iBreak` after `OP_ResultRow`
+      (mirrors select.c:2520..2530 + select.c:1522..1525).  OFFSET and
+      non-constant LIMIT still bail to the stub.  Corpus now
+      57 PASS / 1 DIVERGE / 58 total (added `SELECT col LIMIT` and
+      `SELECT col WHERE LIMIT`).
+
       DIVERGE shapes discovered in probe sweeps (kept out of corpus
       until they flip — each is a committable next-agent ticket):
         * `CREATE INDEX i ON t(a) WHERE a>0` — Δ=4 (partial-index
           WHERE clause codegen path).
-        * `SELECT a FROM t LIMIT 3` — Δ=9 (Pas elides LIMIT
-          codegen path; needs `computeLimitRegisters` + IfPos /
-          DecrJumpZero emission in `sqlite3Select`).
         * `INSERT INTO t(a) VALUES(1)` / `INSERT INTO t(a,b,c)
           VALUES(...)` — Δ=7 (named-column INSERT path differs from
           positional; likely missing column-list permutation in
