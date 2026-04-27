@@ -2808,17 +2808,182 @@ moveto_table_finish:
 end;
 
 { ---------------------------------------------------------------------------
-  VDBE stubs (Phase 6 will provide real implementations)
+  sqlite3VdbeRecordCompare / sqlite3VdbeFindCompare
+  Source: vdbeaux.c sqlite3VdbeRecordCompareWithSkip / sqlite3VdbeRecordCompare
+          / sqlite3VdbeFindCompare (lines 4733..5180).
+
+  Step 6.IPK-IN.b minimum-viable port.  Handles the integer / NULL RHS
+  cases that arise from rowid-keyed ephemeral btrees (IPK-IN literal-
+  list materialisation, OP_SeekRowid via OP_IdxInsert).  String / blob
+  / real RHS arms are stubbed as "neutral" (rc=0 → continue to default_rc),
+  which is correct for empty / non-collation single-int-key indexes but
+  insufficient for general index lookup.  Tracked under tasklist 6.10
+  step 6.IPK-IN.b.full.
+
+  Layout note: btree's slim TUnpackedRecord (pKeyInfo/aMem/nField:i32/
+  default_rc:i32/eqSeen:u8) is what every caller in vdbe.pas writes
+  (`rSeek: TUnpackedRecord` produced under btree's typedef).  No Mem
+  layout is exposed to btree, so we mirror only the prefix needed for
+  flags + integer value.
   --------------------------------------------------------------------------- }
-function sqlite3VdbeFindCompare(pIdxKey: PUnpackedRecord): TRecordCompare;
+
+type
+  TBtMemView = packed record
+    u_i:   i64;        { offset  0 — Mem.u (union: i64 / r) }
+    z:     PAnsiChar;  { offset  8 — Mem.z }
+    n:     i32;        { offset 16 — Mem.n }
+    flags: u16;        { offset 20 — Mem.flags }
+    { remainder unused by this comparator }
+  end;
+  PBtMemView = ^TBtMemView;
+
+const
+  BT_MEM_Null    = $0001;
+  BT_MEM_Str     = $0002;
+  BT_MEM_Int     = $0004;
+  BT_MEM_Real    = $0008;
+  BT_MEM_Blob    = $0010;
+  BT_MEM_IntReal = $0020;
+
+function btreeSerialTypeLen(t: u32): u32; inline;
 begin
-  Result := nil;
+  if t >= 12 then Result := (t - 12) shr 1
+  else case t of
+    0, 8, 9, 10, 11: Result := 0;
+    1: Result := 1;
+    2: Result := 2;
+    3: Result := 3;
+    4: Result := 4;
+    5: Result := 6;
+    6, 7: Result := 8;
+    else Result := 0;
+  end;
+end;
+
+function btreeDecodeInt(serialType: u32; aKey: Pu8): i64;
+var x: u64;
+begin
+  case serialType of
+    0, 1: Result := i64(i8(aKey[0]));
+    2:    Result := i64(i16((u16(aKey[0]) shl 8) or u16(aKey[1])));
+    3: begin
+      x := (u32(aKey[0]) shl 16) or (u32(aKey[1]) shl 8) or u32(aKey[2]);
+      if (x and $800000) <> 0 then x := x or u64($FFFFFFFFFF000000);
+      Result := i64(x);
+    end;
+    4: Result := i64(i32((u32(aKey[0]) shl 24) or (u32(aKey[1]) shl 16)
+                       or (u32(aKey[2]) shl 8) or u32(aKey[3])));
+    5: begin
+      x := (u32(aKey[2]) shl 24) or (u32(aKey[3]) shl 16)
+        or (u32(aKey[4]) shl 8) or u32(aKey[5]);
+      x := x + u64(i64(i16((u16(aKey[0]) shl 8) or u16(aKey[1]))) shl 32);
+      Result := i64(x);
+    end;
+    6: begin
+      x := (u64(aKey[0]) shl 56) or (u64(aKey[1]) shl 48)
+        or (u64(aKey[2]) shl 40) or (u64(aKey[3]) shl 32)
+        or (u64(aKey[4]) shl 24) or (u64(aKey[5]) shl 16)
+        or (u64(aKey[6]) shl 8)  or  u64(aKey[7]);
+      Result := i64(x);
+    end;
+    8: Result := 0;
+    9: Result := 1;
+    else Result := i64(serialType - 8);
+  end;
 end;
 
 function sqlite3VdbeRecordCompare(nKey: i32; pKey: Pointer;
                                   pIdxKey: PUnpackedRecord): i32;
+var
+  pKey1:       Pointer;
+  nKey1:       i32;
+  aKey1:       Pu8;
+  szHdr1:      u32;
+  idx1, d1:    u32;
+  i, rc:       i32;
+  serial_type: u32;
+  pRhs:        PBtMemView;
+  v1:          i64;
+  vTmp32:      u32;
 begin
-  Result := 0;
+  pKey1 := pKey;
+  nKey1 := nKey;
+  aKey1 := Pu8(pKey1);
+  rc := 0;
+  serial_type := 0;
+
+  szHdr1 := aKey1[0];
+  if szHdr1 < $80 then
+    idx1 := 1
+  else begin
+    idx1 := sqlite3GetVarint32(aKey1, szHdr1);
+  end;
+  d1 := szHdr1;
+  if d1 > u32(nKey1) then begin
+    Result := 0;
+    Exit;
+  end;
+
+  pRhs := PBtMemView(pIdxKey^.aMem);
+  i := 0;
+  while True do begin
+    if aKey1[idx1] < $80 then
+      serial_type := aKey1[idx1]
+    else
+      sqlite3GetVarint32(@aKey1[idx1], serial_type);
+
+    if (pRhs^.flags and (BT_MEM_Int or BT_MEM_IntReal)) <> 0 then begin
+      if serial_type >= 10 then begin
+        if serial_type = 10 then rc := -1 else rc := 1;
+      end else if serial_type = 0 then rc := -1
+      else if serial_type = 7 then rc := 0  { real LHS — TODO full impl }
+      else begin
+        v1 := btreeDecodeInt(serial_type, @aKey1[d1]);
+        if v1 < pRhs^.u_i then rc := -1
+        else if v1 > pRhs^.u_i then rc := 1
+        else rc := 0;
+      end;
+    end else if (pRhs^.flags and BT_MEM_Null) <> 0 then begin
+      if (serial_type = 0) or (serial_type = 10) then rc := 0
+      else rc := 1;
+    end else begin
+      { String / Blob / Real RHS — minimum-viable arm.  Returning 0
+        causes the per-field default_rc tail to govern.  For ephemeral
+        rowid-keyed indexes (IPK-IN materialisation) this branch is
+        unreachable; for general index lookup it is incorrect and is
+        tracked as 6.IPK-IN.b.full follow-on. }
+      rc := 0;
+    end;
+
+    if rc <> 0 then begin
+      Result := rc;
+      Exit;
+    end;
+
+    Inc(i);
+    if i = i32(pIdxKey^.nField) then break;
+    Inc(pRhs);
+    d1 := d1 + btreeSerialTypeLen(serial_type);
+    if d1 > u32(nKey1) then break;
+    if aKey1[idx1] < $80 then
+      Inc(idx1)
+    else begin
+      vTmp32 := sqlite3GetVarint32(@aKey1[idx1], serial_type);
+      Inc(idx1, vTmp32);
+    end;
+    if idx1 >= szHdr1 then begin
+      Result := 0;
+      Exit;
+    end;
+  end;
+
+  pIdxKey^.eqSeen := 1;
+  Result := pIdxKey^.default_rc;
+end;
+
+function sqlite3VdbeFindCompare(pIdxKey: PUnpackedRecord): TRecordCompare;
+begin
+  Result := @sqlite3VdbeRecordCompare;
 end;
 
 { ---------------------------------------------------------------------------

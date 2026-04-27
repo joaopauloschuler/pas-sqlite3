@@ -112,43 +112,65 @@ Important: At the end of this document, please find:
               `pLoop^.aLTerm[0]` regardless of list size BEFORE
               invoking `DoInRhsHoist`.
 
-          (2) **`sqlite3VdbeFindCompare` is a stub that returns
-              nil.**  Both definitions return nil:
-                * `passqlite3btree.pas:2813..2816`
-                * `passqlite3vdbe.pas:1951..1954`
-              `sqlite3BtreeIndexMoveto` (`btree.pas:2901..2907`)
-              short-circuits with `pRes^ := 0` when compare is
-              nil.  `0` means "exact match", so
-              `sqlite3BtreeInsert` (`btree.pas:5149`) takes the
-              overwrite arm, calls `getCellInfo(pCur)` on a cursor
-              whose `pPage` was never positioned, and crashes in
-              `btreeParseCell` at `btree.pas:906`
-              (`pPage^.xParseCell` dereferences a NULL function
-              pointer).  This breaks **every** OP_IdxInsert into a
-              freshly OpenEphemeral'd index — not just IPK-IN.
-              `sqlite3VdbeRecordCompare` at
-              `passqlite3btree.pas:2818..2822` is also stubbed
-              (returns 0).  The reason existing
-              TestWhereCorpus IPK_IN/IN_LIST rows still show
-              "PASS" is that TestWhereCorpus only diffs EXPLAIN
-              bytecode; nothing in the test suite executes an IN
-              query end-to-end.
+          (2) **`sqlite3VdbeFindCompare` was a stub that returned
+              nil.**  Original behaviour: `sqlite3BtreeIndexMoveto`
+              short-circuited with `pRes^ := 0` ("exact match") when
+              the compare was nil; `sqlite3BtreeInsert` then took the
+              overwrite arm, called `getCellInfo(pCur)` on an
+              unpositioned cursor, and crashed in `btreeParseCell`.
+              This broke **every** OP_IdxInsert into a freshly
+              OpenEphemeral'd index — not just IPK-IN.
+              TestWhereCorpus rows still showed "PASS" because the
+              test only diffs EXPLAIN bytecode; nothing in the suite
+              executes an IN query end-to-end.
 
+            [X] **6.10 step 6.IPK-IN.b** (min-viable) — landed
+                2026-04-27.  `sqlite3VdbeRecordCompare` and
+                `sqlite3VdbeFindCompare` ported in `passqlite3btree.pas`
+                (replacing stubs).  Handles MEM_Int / MEM_IntReal /
+                MEM_Null RHS arms exactly; string / blob / real RHS
+                degrade to neutral (rc=0 → default_rc tail), correct
+                for single-int-key ephemeral btrees (the IPK-IN /
+                rowid-OR rewrite shape) but insufficient for general
+                index lookup.  Confirmed: `TestExplainParity` 1004/1005
+                and `TestWhereCorpus` 92/92 still green.
             [ ] **6.10 step 6.IPK-IN.a** Apply the hoist-gate fix
-                from (1).  Necessary but not sufficient — still
-                crashes on ≥3-entry execution until (2) lands.
-            [ ] **6.10 step 6.IPK-IN.b** Port real bodies of
-                `sqlite3VdbeFindCompare` and
-                `sqlite3VdbeRecordCompare` (vdbeaux.c).  Once
-                IndexMoveto returns `loc <> 0` for an empty index,
-                IdxInsert allocates a new cell and the IPK-IN eph
-                materialisation executes.
-            [ ] **6.10 step 6.IPK-IN.c** Add a *runtime*
-                correctness gate (not just EXPLAIN diff) covering
-                rowid IN, column IN, OR-rewritten IN, and
-                `rowid=K1 OR rowid=K2`.  Without runtime coverage,
-                regressions of this class keep slipping through
-                the bytecode-only parity gate.
+                from (1).  Confirmed 2026-04-27 that the patch shown
+                at codegen.pas:14296 produces C-oracle-shape bytecode,
+                but step-execution crashes inside `sqlite3VdbeFreeCursorNN`
+                (eCurType=2/VTAB cleanup arm) on the body Rewind/
+                Column/SeekRowid sequence, even with 6.IPK-IN.b's real
+                RecordCompare in place.  A third bug is hiding behind
+                (1)+(2); leaving (1) deferred until that is diagnosed
+                so we don't regress a working "silent zero rows"
+                path into a hard crash.  Repro:
+                `bin/ReproOrRowid` after enabling the codegen.pas
+                patch shown above.
+            [ ] **6.10 step 6.IPK-IN.b.full** Extend
+                `sqlite3VdbeRecordCompare` to cover string (collation
+                + encoding-change), blob (with MEM_Zero), and real
+                RHS arms.  Required before any non-IPK ephemeral
+                index lookup (column IN with text keys, ORDER BY
+                sorter materialisation, etc.) executes correctly.
+                Layout note: btree's slim `TUnpackedRecord` does
+                NOT mirror the C `UnpackedRecord` (no errCode/r1/r2,
+                nField is i32 not u16, default_rc is i32 not i8) —
+                reconcile that vs. codegen.pas's bigger
+                TUnpackedRecord before porting the corruption /
+                BIGNULL / DESC arms.
+            [ ] **6.10 step 6.IPK-IN.c** Add a *runtime* correctness
+                gate (not just EXPLAIN diff) covering rowid IN,
+                column IN, OR-rewritten IN, and `rowid=K1 OR rowid=K2`.
+                Without runtime coverage, regressions of this class
+                keep slipping through the bytecode-only parity gate.
+            [ ] **6.10 step 6.IPK-IN.d** Diagnose and fix the
+                `VdbeFreeCursorNN`-eCurType-corruption crash that
+                shows up the moment the hoist-gate fix is enabled
+                end-to-end (≥3-entry IN crashes the same way today
+                without the hoist-gate fix).  Hypothesis: an
+                ephemeral-cursor allocation slot is being reused or
+                cell decoding is overwriting `apCsr[1]` during the
+                IdxInsert / Rewind sequence.
         [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
         [ ] `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3
