@@ -187,23 +187,13 @@ Important: At the end of this document, please find:
     Verify byte-identical bytecode emission against C via
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
-    Current baseline (2026-04-27): **TestWhereCorpus 84 PASS / 8 DIVERGE
+    Current baseline (2026-04-27): **TestWhereCorpus 88 PASS / 4 DIVERGE
     / 0 ERROR (corpus = 92).**  Scaffold and progress through
-    sub-progresses 1..38 are recorded in git history (`git log
+    sub-progresses 1..39 are recorded in git history (`git log
     --grep="11g.2.f"`).
 
     **Open DIVERGE rows:**
-      * Single-table (independent — quick wins for next sub-progress):
-        - `IN_COL_RHS` (`a IN (b,c)`): Pascal builds a transient index;
-          C uses an inline Eq-chain residual.  Short-circuit the index
-          build when all RHS exprs are columns of the current row.
-        - `MIN_2ARG` / `MAX_2ARG`: 2-arg INLINEFUNC missing one
-          `IfSmaller`/`IfNotSmaller` guard op.  Audit `INLINEFUNC_min`
-          / `INLINEFUNC_max` codegen.
-        - `INSTR` (`instr(b,'x')>0`): 2-arg const-arg hoisting short by
-          2 ops (one missing `String8`, one missing `Integer`).  Audit
-          `codeFunc` const-arg hoisting for the 2-arg path.
-      * Multi-table (blocked on 11g.2.d):
+      * Multi-table (blocked on multi-table planner integration):
         - `LEFT_JOIN`, `JOIN_WHERE`, `EXISTS_SUB`, `NOT_EXISTS`.
 
     **Open follow-on:** Re-enable productive tails in `sqlite3DeleteFrom`

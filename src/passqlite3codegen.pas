@@ -12718,8 +12718,13 @@ var
     end;
     if not ExprUseXList(pTrm^.pExpr) then Exit;
     if pTrm^.pExpr^.x.pList = nil then Exit;
-    if (sqlite3InRhsIsConstant(pParse, pTrm^.pExpr) <> 0)
-       and (pTrm^.pExpr^.x.pList^.nExpr <= 2) then Exit;
+    { Mirror sqlite3FindInIndex's NOOP_OK gate (expr.c:3407..3414): when the
+      RHS list is non-constant (e.g. column references that depend on the
+      current row), or when it has <=2 entries and is constant, the IN is
+      cheaper as an inline Eq-chain (IN_INDEX_NOOP).  Do NOT pre-hoist those
+      terms — leave them for sqlite3ExprCodeIN's NOOP arm. }
+    if sqlite3InRhsIsConstant(pParse, pTrm^.pExpr) = 0 then Exit;
+    if pTrm^.pExpr^.x.pList^.nExpr <= 2 then Exit;
     Result := True;
   end;
 
@@ -21096,6 +21101,32 @@ begin
   sqlite3_result_double(pCtx, pAcc^.sum / pAcc^.cnt);
 end;
 
+{ minmaxScalarFunc — scalar 2-or-more-arg min()/max() (func.c:49..74).
+  Port of C minmaxFunc.  pUserData=nil → min; pUserData<>nil → max.
+  Uses binary collation (nil pColl) matching OP_CollSeq P1=0 stub. }
+procedure minmaxScalarFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  i:     i32;
+  iBest: i32;
+  msk:   i32;
+begin
+  Assert(argc > 1);
+  { msk=0 → min; msk=-1 (all bits) → max (mirrors C: mask = pUserData==0 ? 0 : -1) }
+  if sqlite3_user_data(pCtx) = nil then msk := 0 else msk := -1;
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
+  iBest := 0;
+  i := 1;
+  while i < argc do
+  begin
+    if sqlite3_value_type(Psqlite3_value((argv+i)^)) = SQLITE_NULL then Exit;
+    { (compare ^ msk) >= 0: for min keeps i when best>=i; for max keeps i when best<i }
+    if (sqlite3MemCompare((argv+iBest)^, (argv+i)^, nil) xor msk) >= 0 then
+      iBest := i;
+    Inc(i);
+  end;
+  sqlite3_result_value(pCtx, Psqlite3_value((argv+iBest)^));
+end;
+
 { minStep/maxStep/minMaxFinal }
 procedure minStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
@@ -21382,13 +21413,99 @@ begin
   sqlite3_result_text(pCtx, zOut, nOut, SQLITE_DYNAMIC);
 end;
 
+{ Phase 6.9-bis 11g.2.f sub-progress 39 — instrFunc.
+  Faithful port of func.c:243..306 instrFunc.
+  instr(haystack, needle) returns the 1-based character position of the
+  first occurrence of needle within haystack, or 0 if not found.
+  If both args are BLOBs the result is the 1-based byte position.
+  Returns NULL when either argument is NULL.
+  C reference: FUNCTION(instr, 2, 0, 0, instrFunc). }
+procedure instrFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  zHaystack: PAnsiChar;
+  zNeedle:   PAnsiChar;
+  nHaystack: i32;
+  nNeedle:   i32;
+  typeHaystack, typeNeedle: i32;
+  N:         i32;
+  isText:    i32;
+  firstChar: AnsiChar;
+  pC1, pC2:  Psqlite3_value;
+begin
+  pC1 := nil;
+  pC2 := nil;
+  typeHaystack := sqlite3_value_type(Psqlite3_value(argv^));
+  typeNeedle   := sqlite3_value_type(Psqlite3_value((argv + 1)^));
+  if (typeHaystack = SQLITE_NULL) or (typeNeedle = SQLITE_NULL) then Exit;
+  nHaystack := sqlite3_value_bytes(Psqlite3_value(argv^));
+  nNeedle   := sqlite3_value_bytes(Psqlite3_value((argv + 1)^));
+  N := 1;
+  if nNeedle > 0 then
+  begin
+    if (typeHaystack = SQLITE_BLOB) and (typeNeedle = SQLITE_BLOB) then
+    begin
+      zHaystack := sqlite3_value_blob(Psqlite3_value(argv^));
+      zNeedle   := sqlite3_value_blob(Psqlite3_value((argv + 1)^));
+      isText := 0;
+    end
+    else if (typeHaystack <> SQLITE_BLOB) and (typeNeedle <> SQLITE_BLOB) then
+    begin
+      zHaystack := sqlite3_value_text(Psqlite3_value(argv^));
+      zNeedle   := sqlite3_value_text(Psqlite3_value((argv + 1)^));
+      isText := 1;
+    end
+    else
+    begin
+      { mixed: one blob, one text — coerce both to text }
+      pC1 := sqlite3_value_dup(Psqlite3_value(argv^));
+      zHaystack := sqlite3_value_text(pC1);
+      if zHaystack = nil then begin
+        sqlite3_result_error_nomem(pCtx);
+        sqlite3_value_free(pC1); sqlite3_value_free(pC2);
+        Exit;
+      end;
+      nHaystack := sqlite3_value_bytes(pC1);
+      pC2 := sqlite3_value_dup(Psqlite3_value((argv + 1)^));
+      zNeedle := sqlite3_value_text(pC2);
+      if zNeedle = nil then begin
+        sqlite3_result_error_nomem(pCtx);
+        sqlite3_value_free(pC1); sqlite3_value_free(pC2);
+        Exit;
+      end;
+      nNeedle := sqlite3_value_bytes(pC2);
+      isText := 1;
+    end;
+    if (zNeedle = nil) or ((nHaystack > 0) and (zHaystack = nil)) then
+    begin
+      sqlite3_result_error_nomem(pCtx);
+      sqlite3_value_free(pC1); sqlite3_value_free(pC2);
+      Exit;
+    end;
+    firstChar := zNeedle^;
+    while (nNeedle <= nHaystack)
+      and ((zHaystack^ <> firstChar) or not CompareMem(zHaystack, zNeedle, nNeedle))
+    do begin
+      Inc(N);
+      { advance one character (skip UTF-8 continuation bytes in text mode) }
+      repeat
+        Dec(nHaystack);
+        Inc(zHaystack);
+      until (isText = 0) or ((u8(zHaystack^) and $C0) <> $80);
+    end;
+    if nNeedle > nHaystack then N := 0;
+  end;
+  sqlite3_result_int(pCtx, N);
+  sqlite3_value_free(pC1);
+  sqlite3_value_free(pC2);
+end;
+
 { Built-in function table — a static array of TFuncDef records. }
 const
   FUNC_ENC = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_CONSTANT;
   AGG_ENC  = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
 
 var
-  aBuiltinFuncs: array[0..44] of TFuncDef;
+  aBuiltinFuncs: array[0..47] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -21477,6 +21594,26 @@ begin
     sets SQLITE_FUNC_DETERMINISTIC via FUNCTION_INTERNAL). }
   MakeFD(aBuiltinFuncs[43], -1, FUNC_ENC, @printfFunc, nil, 'printf');
   MakeFD(aBuiltinFuncs[44], -1, FUNC_ENC, @printfFunc, nil, 'format');
+  { Phase 6.9-bis 11g.2.f sub-progress 39 — instr().
+    Mirrors func.c: FUNCTION(instr, 2, 0, 0, instrFunc).
+    FUNC_ENC = SQLITE_UTF8|SQLITE_FUNC_BUILTIN|SQLITE_FUNC_CONSTANT which
+    matches the FUNCTION macro (bNC=0, SQLITE_FUNC_CONSTANT set). }
+  MakeFD(aBuiltinFuncs[45], 2, FUNC_ENC, @instrFunc, nil, 'instr');
+  { Phase 6.9-bis 11g.2.f sub-progress 40 — scalar 2-arg min()/max().
+    Mirrors func.c: FUNCTION(min,-3,0,1,minmaxFunc) / FUNCTION(max,-3,1,1,minmaxFunc)
+    bNC=1 means SQLITE_FUNC_NEEDCOLL.
+    nArg=-1 (variadic) so sqlite3FindFunction matches any arity call;
+    matchQuality scores the aggregate nArg=1 entry higher when arity=1
+    (aggregate path), and scores this entry when arity>=2 (scalar path).
+    SQLITE_FUNC_NEEDCOLL causes emitScalarFunctionCall to emit OP_CollSeq
+    before OP_Function, making MIN_2ARG / MAX_2ARG bytecode byte-identical
+    to the C oracle (expr.c:5437..5439).
+    pUserData=nil for min; pUserData=Pointer(1) for max. }
+  MakeFD(aBuiltinFuncs[46], -1,
+    FUNC_ENC or SQLITE_FUNC_NEEDCOLL, @minmaxScalarFunc, nil, 'min');
+  MakeFD(aBuiltinFuncs[47], -1,
+    FUNC_ENC or SQLITE_FUNC_NEEDCOLL, @minmaxScalarFunc, nil, 'max');
+  aBuiltinFuncs[47].pUserData := Pointer(PtrInt(1));
 end;
 
 var
