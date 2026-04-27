@@ -1659,6 +1659,29 @@ procedure whereIndexedExprCleanup(db: PTsqlite3; pObject: Pointer); cdecl;
 procedure wherePartIdxExpr(pParse: PParse; pIdx: PIndex2; pPart: PExpr;
   pMask: PBitmask; iIdxCur: i32; pItem: PSrcItem);
 
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — auto-index pre-flight cluster
+  (where.c:832..925).  Pure analysis helpers fed to whereLoopAddBtree's
+  automatic-index synthesis path:
+
+    * whereRangeAdjust              (where.c:1916..1926) — LogEst discount
+                                     for the leftover tail of a range scan.
+    * constraintCompatibleWithOuterJoin (where.c:832..852) — gates a WHERE
+                                     term on whether it is allowed to drive
+                                     an outer join's inner side.
+    * columnIsGoodIndexCandidate    (where.c:874..889) — true iff iCol is
+                                     not already the leading column of an
+                                     existing index, and (if hasStat1) is
+                                     selective enough to be worth indexing.
+    * termCanDriveIndex             (where.c:901..924) — true iff pTerm can
+                                     anchor an automatic index on pSrc. }
+function  whereRangeAdjust(pTerm: PWhereTerm; nNew: i16): i16;
+function  constraintCompatibleWithOuterJoin(pTerm: PWhereTerm;
+  pSrc: PSrcItem): i32;
+function  columnIsGoodIndexCandidate(pTab: PTable2; iCol: i32): i32;
+function  termCanDriveIndex(pTerm: PWhereTerm; pSrc: PSrcItem;
+  notReady: Bitmask): i32;
+function  indexHasStat1(pIdx: PIndex2): i32; inline;
+
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
 // ---------------------------------------------------------------------------
@@ -8199,6 +8222,146 @@ begin
   begin
     pMask^ := pMask^ and (not (Bitmask(1) shl pLeft^.iColumn));
   end;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.d sub-progress) — auto-index pre-flight cluster.
+
+  whereRangeAdjust (where.c:1916..1926):
+    LogEst discount applied by whereRangeScanEst when a range constraint
+    delivers fewer rows than the index span.  `truthProb<=0` means the
+    application supplied an explicit likelihood() factor; otherwise the
+    default discount of -20 LogEst (≈25%) fires unless the term was synthesized
+    by the IS-NOT-NULL → "x>NULL" rewrite (TERM_VNULL), which carries its own
+    selectivity model and must not be double-counted.
+
+  constraintCompatibleWithOuterJoin (where.c:832..852):
+    Outer-join compatibility predicate.  Caller has already verified that
+    pSrc is on a LEFT/LTORJ/RIGHT chain.  A WHERE term may drive that table
+    only if it is itself an ON/USING term targeting the same cursor; an
+    EP_InnerON term cannot drive a LEFT or RIGHT outer side.
+
+  columnIsGoodIndexCandidate (where.c:874..889):
+    Walks pTab's existing indexes; if iCol is already the leading column of
+    one, return 0 (no benefit from auto-indexing it).  If iCol is a
+    later-position key column with stat1 telling us the selectivity is poor
+    (aiRowLogEst[j+1] > 20 ≈ >16 dups per key), return 0.  Else 1.
+
+  termCanDriveIndex (where.c:901..924):
+    Sieve over a single WHERE term against a single FROM-clause table.
+    Anchors automatic-index synthesis: the term must be an EQ/IS predicate
+    that targets a column of pSrc whose affinity matches the predicate's
+    RHS expression and whose RHS is fully outer-join-compatible.  RIGHT-join
+    inner sides are forbidden by the caller via the JT_RIGHT==0 assert
+    (auto-indexing the inner of a RIGHT JOIN would leak null-row cells).
+  =========================================================================== }
+
+function indexHasStat1(pIdx: PIndex2): i32; inline;
+begin
+  Result := i32((pIdx^.idxFlags shr 7) and 1);
+end;
+
+function whereRangeAdjust(pTerm: PWhereTerm; nNew: i16): i16;
+var
+  nRet: i16;
+begin
+  nRet := nNew;
+  if pTerm <> nil then
+  begin
+    if pTerm^.truthProb <= 0 then
+      nRet := i16(nRet + pTerm^.truthProb)
+    else if (pTerm^.wtFlags and TERM_VNULL) = 0 then
+      nRet := i16(nRet - 20);  { 20 == sqlite3LogEst(4) }
+  end;
+  Result := nRet;
+end;
+
+function constraintCompatibleWithOuterJoin(pTerm: PWhereTerm;
+  pSrc: PSrcItem): i32;
+begin
+  Assert((pSrc^.fg.jointype and (JT_LEFT or JT_LTORJ or JT_RIGHT)) <> 0);
+  if (not ExprHasProperty(pTerm^.pExpr, EP_OuterON or EP_InnerON))
+     or (pTerm^.pExpr^.w.iJoin <> pSrc^.iCursor) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  if ((pSrc^.fg.jointype and (JT_LEFT or JT_RIGHT)) <> 0)
+     and ExprHasProperty(pTerm^.pExpr, EP_InnerON) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  Result := 1;
+end;
+
+function columnIsGoodIndexCandidate(pTab: PTable2; iCol: i32): i32;
+var
+  pIdx: PIndex2;
+  j:    i32;
+begin
+  pIdx := pTab^.pIndex;
+  while pIdx <> nil do
+  begin
+    j := 0;
+    while j < i32(pIdx^.nKeyCol) do
+    begin
+      if pIdx^.aiColumn[j] = i16(iCol) then
+      begin
+        if j = 0 then
+        begin
+          Result := 0;
+          Exit;
+        end;
+        if (indexHasStat1(pIdx) <> 0)
+           and (pIdx^.aiRowLogEst[j + 1] > 20) then
+        begin
+          Result := 0;
+          Exit;
+        end;
+        Break;
+      end;
+      Inc(j);
+    end;
+    pIdx := pIdx^.pNext;
+  end;
+  Result := 1;
+end;
+
+function termCanDriveIndex(pTerm: PWhereTerm; pSrc: PSrcItem;
+  notReady: Bitmask): i32;
+var
+  aff:     AnsiChar;
+  leftCol: i32;
+begin
+  if pTerm^.leftCursor <> pSrc^.iCursor then begin Result := 0; Exit; end;
+  if (pTerm^.eOperator and (WO_EQ or WO_IS)) = 0 then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  Assert((pSrc^.fg.jointype and JT_RIGHT) = 0);
+  if ((pSrc^.fg.jointype and (JT_LEFT or JT_LTORJ or JT_RIGHT)) <> 0)
+     and (constraintCompatibleWithOuterJoin(pTerm, pSrc) = 0) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  if (pTerm^.prereqRight and notReady) <> 0 then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  Assert((pTerm^.eOperator and (WO_OR or WO_AND)) = 0);
+  leftCol := pTerm^.u.leftColumn;
+  if leftCol < 0 then begin Result := 0; Exit; end;
+  aff := pSrc^.pSTab^.aCol[leftCol].affinity;
+  if sqlite3IndexAffinityOk(pTerm^.pExpr, aff) = 0 then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  Result := columnIsGoodIndexCandidate(pSrc^.pSTab, leftCol);
 end;
 
 { Helper for exprIsDeterministic (where.c:6445).  TK_FUNCTION nodes without

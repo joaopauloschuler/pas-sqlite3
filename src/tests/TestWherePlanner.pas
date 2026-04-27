@@ -1019,6 +1019,274 @@ begin
   Check('WPIE5 mask bit 3 cleared', mask = (Bitmask($FF) and not (Bitmask(1) shl 3)));
 end;
 
+{ ----- whereRangeAdjust (where.c:1916..1926) ----- }
+
+procedure TestWhereRangeAdjust;
+var
+  t: TWhereTerm;
+begin
+  FillChar(t, SizeOf(t), 0);
+
+  Check('RA1 nil pTerm passthrough', whereRangeAdjust(nil, 33) = 33);
+
+  { truthProb<=0 → nNew + truthProb (additive likelihood). }
+  t.truthProb := -7;
+  t.wtFlags   := 0;
+  Check('RA2 truthProb<=0 added', whereRangeAdjust(@t, 100) = 93);
+
+  { truthProb>0 + non-VNULL → -20 default discount. }
+  t.truthProb := 5;
+  t.wtFlags   := 0;
+  Check('RA3 truthProb>0 default -20', whereRangeAdjust(@t, 100) = 80);
+
+  { truthProb>0 + TERM_VNULL → no discount (selectivity owned by VNULL synth). }
+  t.truthProb := 5;
+  t.wtFlags   := TERM_VNULL;
+  Check('RA4 TERM_VNULL skips discount', whereRangeAdjust(@t, 100) = 100);
+
+  { truthProb=0 hits the "<=0" arm with additive 0. }
+  t.truthProb := 0;
+  t.wtFlags   := 0;
+  Check('RA5 truthProb=0 no change', whereRangeAdjust(@t, 42) = 42);
+end;
+
+{ ----- constraintCompatibleWithOuterJoin (where.c:832..852) ----- }
+
+procedure TestConstraintCompatOuterJoin;
+var
+  t:    TWhereTerm;
+  src:  TSrcItem;
+  e:    TExpr;
+begin
+  FillChar(t, SizeOf(t), 0);
+  FillChar(src, SizeOf(src), 0);
+  FillChar(e, SizeOf(e), 0);
+  t.pExpr := @e;
+
+  { CC1: LEFT join, term has no ON-bit → 0 (not an outer-driving term). }
+  src.fg.jointype := JT_LEFT;
+  src.iCursor     := 7;
+  e.flags         := 0;
+  e.w.iJoin       := 7;
+  Check('CC1 no OuterON/InnerON → 0',
+        constraintCompatibleWithOuterJoin(@t, @src) = 0);
+
+  { CC2: OuterON but iJoin mismatches cursor → 0. }
+  e.flags   := EP_OuterON;
+  e.w.iJoin := 99;
+  Check('CC2 iJoin mismatch → 0',
+        constraintCompatibleWithOuterJoin(@t, @src) = 0);
+
+  { CC3: OuterON + matching cursor on a LEFT side → 1. }
+  e.flags   := EP_OuterON;
+  e.w.iJoin := 7;
+  Check('CC3 OuterON+match LEFT → 1',
+        constraintCompatibleWithOuterJoin(@t, @src) = 1);
+
+  { CC4: InnerON on a LEFT join → forbidden (cannot drive outer side). }
+  e.flags := EP_InnerON;
+  Check('CC4 InnerON on LEFT → 0',
+        constraintCompatibleWithOuterJoin(@t, @src) = 0);
+
+  { CC5: InnerON on a pure LTORJ (no LEFT/RIGHT bit) → 1. }
+  src.fg.jointype := JT_LTORJ;
+  e.flags         := EP_InnerON;
+  Check('CC5 InnerON on LTORJ-only → 1',
+        constraintCompatibleWithOuterJoin(@t, @src) = 1);
+
+  { CC6: OuterON on RIGHT join → 1. }
+  src.fg.jointype := JT_RIGHT;
+  e.flags         := EP_OuterON;
+  Check('CC6 OuterON on RIGHT → 1',
+        constraintCompatibleWithOuterJoin(@t, @src) = 1);
+end;
+
+{ ----- indexHasStat1 (idxFlags bit 7) + columnIsGoodIndexCandidate ----- }
+
+procedure TestColumnIsGoodIndexCandidate;
+var
+  tab:        TTable;
+  idx1, idx2: TIndex;
+  cols1:      array[0..2] of i16;
+  cols2:      array[0..2] of i16;
+  rowEst1:    array[0..3] of i16;
+begin
+  FillChar(tab,   SizeOf(tab),   0);
+  FillChar(idx1,  SizeOf(idx1),  0);
+  FillChar(idx2,  SizeOf(idx2),  0);
+
+  { CG0: indexHasStat1 reads bit 7 of idxFlags. }
+  idx1.idxFlags := u32(1) shl 7;
+  Check('CG0 indexHasStat1 bit 7', indexHasStat1(@idx1) = 1);
+  idx1.idxFlags := 0;
+  Check('CG0b indexHasStat1 cleared', indexHasStat1(@idx1) = 0);
+
+  { No indexes at all → every column is "good". }
+  tab.pIndex := nil;
+  Check('CG1 empty pIndex → 1', columnIsGoodIndexCandidate(@tab, 0) = 1);
+
+  { idx1 covers (col0). col0 is leading → not a good auto-index candidate. }
+  cols1[0] := 0;  cols1[1] := 1;
+  idx1.aiColumn := @cols1[0];
+  idx1.nKeyCol  := 2;
+  idx1.idxFlags := 0;          { hasStat1 = 0 }
+  idx1.pNext    := nil;
+  tab.pIndex    := @idx1;
+  Check('CG2 leading col → 0', columnIsGoodIndexCandidate(@tab, 0) = 0);
+
+  { col1 is non-leading; hasStat1=0 means we don't reject on stat1, so 1. }
+  Check('CG3 non-leading + no stat1 → 1', columnIsGoodIndexCandidate(@tab, 1) = 1);
+
+  { Turn on hasStat1 and make aiRowLogEst[2] (j=1, j+1=2) > 20 → 0. }
+  rowEst1[0] := 100;  rowEst1[1] := 50;  rowEst1[2] := 25;  rowEst1[3] := 10;
+  idx1.aiRowLogEst := @rowEst1[0];
+  idx1.idxFlags    := u32(1) shl 7;  { hasStat1 = 1 }
+  Check('CG4 hasStat1 + bad selectivity → 0',
+        columnIsGoodIndexCandidate(@tab, 1) = 0);
+
+  { With selective stat1 (≤20), we keep returning 1. }
+  rowEst1[2] := 15;
+  Check('CG5 hasStat1 + good selectivity → 1',
+        columnIsGoodIndexCandidate(@tab, 1) = 1);
+
+  { Column not in any existing index → 1. }
+  Check('CG6 col not in any index → 1',
+        columnIsGoodIndexCandidate(@tab, 2) = 1);
+
+  { Walk the pNext chain: idx2 lists col 5 as leading → reject col 5. }
+  cols2[0] := 5;
+  idx2.aiColumn := @cols2[0];
+  idx2.nKeyCol  := 1;
+  idx2.idxFlags := 0;
+  idx2.pNext    := nil;
+  idx1.pNext    := @idx2;
+  Check('CG7 chained idx2 leading col 5 → 0',
+        columnIsGoodIndexCandidate(@tab, 5) = 0);
+end;
+
+{ ----- termCanDriveIndex (where.c:901..924) ----- }
+
+procedure TestTermCanDriveIndex;
+var
+  t:    TWhereTerm;
+  src:  TSrcItem;
+  tab:  TTable;
+  idx:  TIndex;
+  cols: array[0..3] of TColumn;
+  e, eL, eR: TExpr;
+begin
+  FillChar(t,    SizeOf(t),    0);
+  FillChar(src,  SizeOf(src),  0);
+  FillChar(tab,  SizeOf(tab),  0);
+  FillChar(idx,  SizeOf(idx),  0);
+  FillChar(cols, SizeOf(cols), 0);
+  FillChar(e,    SizeOf(e),    0);
+  FillChar(eL,   SizeOf(eL),   0);
+  FillChar(eR,   SizeOf(eR),   0);
+
+  cols[0].affinity := AnsiChar(SQLITE_AFF_BLOB);
+  cols[1].affinity := AnsiChar(SQLITE_AFF_BLOB);
+  cols[2].affinity := AnsiChar(SQLITE_AFF_BLOB);
+  tab.aCol         := @cols[0];
+  tab.nCol         := 4;
+  tab.pIndex       := nil;       { no preexisting indexes }
+
+  src.iCursor      := 4;
+  src.pSTab        := @tab;
+  src.fg.jointype  := 0;
+
+  { TK_EQ Expr with column LHS (iColumn=1) and TK_INTEGER RHS. }
+  e.op    := TK_EQ;
+  e.pLeft := @eL;
+  e.pRight:= @eR;
+  eL.op   := TK_COLUMN;
+  eL.iColumn := 1;
+  eR.op   := TK_INTEGER;
+
+  t.pExpr        := @e;
+  t.eOperator    := WO_EQ;
+  t.leftCursor   := 4;
+  t.u.leftColumn := 1;
+  t.prereqRight  := 0;
+  t.wtFlags      := 0;
+
+  Check('TC1 EQ on col 1 → 1', termCanDriveIndex(@t, @src, 0) = 1);
+
+  { Wrong cursor → 0. }
+  t.leftCursor := 99;
+  Check('TC2 wrong cursor → 0', termCanDriveIndex(@t, @src, 0) = 0);
+  t.leftCursor := 4;
+
+  { Non-EQ/IS operator → 0. }
+  t.eOperator := WO_LT;
+  Check('TC3 non-EQ → 0', termCanDriveIndex(@t, @src, 0) = 0);
+  t.eOperator := WO_IS;
+  Check('TC3b WO_IS accepted', termCanDriveIndex(@t, @src, 0) = 1);
+  t.eOperator := WO_EQ;
+
+  { prereqRight ∩ notReady → 0. }
+  t.prereqRight := $0F;
+  Check('TC4 prereqRight blocked → 0', termCanDriveIndex(@t, @src, $03) = 0);
+  t.prereqRight := 0;
+
+  { leftColumn<0 (rowid) → 0. }
+  t.u.leftColumn := -1;
+  Check('TC5 rowid leftColumn → 0', termCanDriveIndex(@t, @src, 0) = 0);
+  t.u.leftColumn := 1;
+
+end;
+
+{ Compose a more focused test for the existing-index gating to keep the
+  stack-allocated probe array alive in scope. }
+procedure TestTermCanDriveIndexGate;
+var
+  t:    TWhereTerm;
+  src:  TSrcItem;
+  tab:  TTable;
+  idx:  TIndex;
+  cols: array[0..3] of TColumn;
+  aiCol: array[0..1] of i16;
+  e, eL, eR: TExpr;
+begin
+  FillChar(t,    SizeOf(t),    0);
+  FillChar(src,  SizeOf(src),  0);
+  FillChar(tab,  SizeOf(tab),  0);
+  FillChar(idx,  SizeOf(idx),  0);
+  FillChar(cols, SizeOf(cols), 0);
+  FillChar(e,    SizeOf(e),    0);
+  FillChar(eL,   SizeOf(eL),   0);
+  FillChar(eR,   SizeOf(eR),   0);
+
+  cols[1].affinity := AnsiChar(SQLITE_AFF_BLOB);
+  tab.aCol         := @cols[0];
+  tab.nCol         := 4;
+
+  aiCol[0] := 1;
+  idx.aiColumn := @aiCol[0];
+  idx.nKeyCol  := 1;
+  idx.idxFlags := 0;
+  idx.pNext    := nil;
+  tab.pIndex   := @idx;
+
+  src.iCursor     := 4;
+  src.pSTab       := @tab;
+  src.fg.jointype := 0;
+
+  e.op := TK_EQ; e.pLeft := @eL; e.pRight := @eR;
+  eL.op := TK_COLUMN; eL.iColumn := 1;
+  eR.op := TK_INTEGER;
+
+  t.pExpr        := @e;
+  t.eOperator    := WO_EQ;
+  t.leftCursor   := 4;
+  t.u.leftColumn := 1;
+
+  { Existing index has col 1 as the leading key, so columnIsGoodIndexCandidate
+    rejects col 1 → termCanDriveIndex returns 0 even though everything else
+    matches. }
+  Check('TC7 existing leading idx → 0', termCanDriveIndex(@t, @src, 0) = 0);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -1036,6 +1304,11 @@ begin
   TestWhereIsCoveringIndex;
   TestIndexedExprCleanup;
   TestPartIdxExprMask;
+  TestWhereRangeAdjust;
+  TestConstraintCompatOuterJoin;
+  TestColumnIsGoodIndexCandidate;
+  TestTermCanDriveIndex;
+  TestTermCanDriveIndexGate;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

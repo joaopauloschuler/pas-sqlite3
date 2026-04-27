@@ -233,6 +233,29 @@ Important: At the end of this document, please find:
       i=1 breaks immediately, RV3 vector with mismatched sort order
       at i=1 breaks at the sort-order check, RV4 vector capped by
       (nColumn - nEq) so the i=1 iteration never starts.
+    - [X] Auto-index pre-flight cluster fed to `whereLoopAddBtree` —
+      `whereRangeAdjust` (where.c:1916..1926),
+      `constraintCompatibleWithOuterJoin` (where.c:832..852),
+      `columnIsGoodIndexCandidate` (where.c:874..889),
+      `termCanDriveIndex` (where.c:901..924), plus an `indexHasStat1`
+      accessor for the bit-7 slot of `TIndex.idxFlags`.  Pure analysis
+      helpers, no codegen.  `whereRangeAdjust` is the LogEst discount
+      whereRangeScanEst applies to a range constraint's leftover tail;
+      the other three gate auto-index synthesis: the term must be an
+      EQ/IS predicate targeting a column of pSrc whose affinity
+      matches the predicate, whose RHS is fully outer-join-compatible,
+      and that is not already the leading column of an existing index
+      or a column with poor stat1 selectivity.  Gate:
+      `TestWherePlanner.pas` (130/130): RA1..RA5 (nil passthrough,
+      truthProb<=0 additive, truthProb>0 -20 default, TERM_VNULL
+      skip, truthProb=0), CC1..CC6 (no ON-bit, iJoin mismatch,
+      OuterON+match LEFT, InnerON on LEFT forbidden, InnerON on
+      LTORJ-only allowed, OuterON on RIGHT), CG0..CG7 (idxFlags bit-7
+      decode, empty pIndex, leading-col reject, non-leading + no
+      stat1 accept, hasStat1 + bad/good selectivity, col not in any
+      index, pNext chain walk), TC1..TC7 (EQ accept, wrong-cursor,
+      non-EQ, WO_IS accept, prereqRight blocked, rowid leftColumn,
+      existing-leading-idx reject).
 
 - [ ] **6.9-bis 11g.2.e** Port `wherecode.c` (~2945 lines) —
     per-loop inner-body codegen.  Public surface:
