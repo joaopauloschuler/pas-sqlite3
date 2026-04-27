@@ -1466,6 +1466,7 @@ function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
 procedure sqlite3RollbackAll(pDb: PTsqlite3; tripCode: i32);
 function  sqlite3LogEst(n: u64): i16;
+function  sqlite3LogEstAdd(a: i16; b: i16): i16;
 
 procedure sqlite3ValueApplyAffinity(pVal: Psqlite3_value; aff: u8; enc: u8);
 function  sqlite3ValueText(pVal: Psqlite3_value; enc: u8): Pointer;
@@ -9271,6 +9272,36 @@ begin
     while x > 15  do begin Inc(y, 10); x := x shr 1; end;
   end;
   Result := a[x and 7] + y - 10;
+end;
+
+{ util.c:sqlite3LogEstAdd — approximate sum of two LogEst values
+  (where.c uses this when combining the cost of a key search with the
+  cost of stepping forward through matching rows).  Direct port of
+  util.c:2069..2098. }
+function sqlite3LogEstAdd(a: i16; b: i16): i16;
+const
+  x: array[0..31] of u8 = (
+    10, 10,
+     9,  9,
+     8,  8,
+     7,  7,  7,
+     6,  6,  6,
+     5,  5,  5,
+     4,  4,  4,  4,
+     3,  3,  3,  3,  3,  3,
+     2,  2,  2,  2,  2,  2,  2);
+begin
+  if a >= b then
+  begin
+    if a > b + 49 then Exit(a);
+    if a > b + 31 then Exit(i16(a + 1));
+    Result := i16(a + x[a - b]);
+  end else
+  begin
+    if b > a + 49 then Exit(b);
+    if b > a + 31 then Exit(i16(b + 1));
+    Result := i16(b + x[b - a]);
+  end;
 end;
 
 { -----------------------------------------------------------------------

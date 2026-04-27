@@ -307,6 +307,35 @@ Important: At the end of this document, please find:
       column entry skip), IDR1..IDR6 (UNIQUE NOT NULL covered, missing
       column, nullable disqualifier, partial-index disqualifier, non-
       UNIQUE disqualifier, IPK fast-path).
+    - [X] `whereLoopAddBtreeIndex` (where.c:3219..3653) — per-index
+      template-loop factory and the heart of the planner's index
+      probing.  Walks the WHERE clause via whereScanInit/whereScanNext
+      against the leading (saved_nEq+1)'th column of pProbe; for each
+      surviving term builds a candidate WhereLoop, dispatches into the
+      WO_IN / WO_EQ|WO_IS / WO_ISNULL / range arms, then recurses to
+      look for matches on the next index column.  Each candidate goes
+      through whereLoopInsert which handles the ranking / replacement
+      bookkeeping.  Tail block emits the SKIPSCAN candidate when the
+      leading columns have no available predicate but the per-key
+      duplicate count (`aiRowLogEst[saved_nEq+1] >= 42` ≈ 18 dups)
+      makes a forward scan plausibly cheaper than a seek.  STAT4 arms
+      (`whereEqualScanEst`, `whereInScanEst`, the TERM_HIGHTRUTH
+      self-correction) and the COSTMULT macro are intentionally
+      omitted to match the project-wide non-STAT4 / non-COSTMULT build.
+      Rest-of-file glue: `sqlite3LogEstAdd` (util.c:2069..2098) ported
+      into `passqlite3vdbe.pas`; SQLITE_Stat4 / SQLITE_SkipScan /
+      SQLITE_SeekScan dbOptFlags constants exposed in `passqlite3codegen.pas`.
+      Gate: `TestWherePlanner.pas` (201/201): WLB1 (empty WC), WLB2
+      (rowid EQ on a UNIQUE index — sets WHERE_COLUMN_EQ |
+      WHERE_ONEROW, IPK pIndex nilled by whereLoopInsert per
+      where.c:7842..7848, bldFlags1 picks up SQLITE_BLDF1_UNIQUE),
+      WLB3 (term whose prereqRight intersects maskSelf is skipped),
+      WLB4 (TERM_VNULL on a NOT NULL leading column → indexColumnNotNull
+      gate skips), WLB5 (WO_GT range → COLUMN_RANGE | BTM_LIMIT, no
+      ONEROW, nBtm=1), WLB6 (WO_ISNULL on rowid skipped), WLB7
+      (caller-supplied WHERE_BTM_LIMIT narrows opMask to LT|LE so the
+      EQ term fails the gate).
+
     - [X] `whereRangeScanEst` (where.c:2092..2254, no-STAT4 tail) —
       reduces `pLoop^.nOut` to account for the leftover range
       constraints on the leading (nEq+1)'th column of the index pLoop

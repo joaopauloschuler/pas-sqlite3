@@ -1824,6 +1824,237 @@ begin
         isDistinctRedundant(@parse, pSrc, pWC, pDist) = 1);
 end;
 
+{ ----- whereLoopAddBtreeIndex (where.c:3219..3653) -----
+  Drives the per-index template-loop factory directly with hand-built
+  WhereInfo / WhereClause / Index / SrcItem / Table records.  Uses the
+  XN_ROWID (-1) shape so the whereScanNext path bypasses affinity and
+  collation checks (zCollName stays nil), which keeps the test free of
+  full Schema / CollSeq plumbing.  All assertions exercise the template
+  that whereLoopInsert lands on pWInfo^.pLoops and the bookkeeping that
+  whereLoopAddBtreeIndex restores on exit. }
+
+procedure TestWhereLoopAddBtreeIndex;
+const
+  iCur = 7;
+var
+  db:        PTsqlite3;
+  rc:        i32;
+  parse:     TParse;
+  wInfoBuf:  array[0..1023] of u8;
+  pWInfo:    PWhereInfo;
+  bld:       TWhereLoopBuilder;
+  pNew:      TWhereLoop;
+  tab:       TTable;
+  src:       TSrcItem;
+  idx:       TIndex;
+  rowEst:    array[0..2] of i16;
+  aiCol:     array[0..1] of i16;
+  expr:      TExpr;
+  rhs:       TExpr;
+  lhs:       TExpr;
+  p:         PWhereLoop;
+  pT:        PWhereTerm;
+
+  procedure ResetState;
+  begin
+    while pWInfo^.pLoops <> nil do
+    begin
+      p := pWInfo^.pLoops;
+      pWInfo^.pLoops := p^.pNextLoop;
+      whereLoopDelete(db, p);
+    end;
+    pWInfo^.sWC.nTerm := 0;
+    FillChar(pWInfo^.sWC.aStatic, SizeOf(pWInfo^.sWC.aStatic), 0);
+    bld.iPlanLimit := 100;
+    bld.bldFlags1  := 0;
+    pNew.wsFlags   := 0;
+    pNew.nLTerm    := 0;
+    pNew.u.btree.nEq := 0;
+    pNew.u.btree.nBtm := 0;
+    pNew.u.btree.nTop := 0;
+    pNew.nSkip     := 0;
+    pNew.prereq    := 0;
+    pNew.nOut      := rowEst[0];
+    pNew.rRun      := 0;
+    pNew.rSetup    := 0;
+  end;
+
+  procedure SeedTerm(const i: i32; const op: u16; const wo: u16;
+                      const col: i32; const truth: i16; const wt: u16);
+  begin
+    pT := @pWInfo^.sWC.aStatic[i];
+    pT^.pExpr        := @expr;
+    pT^.pWC          := @pWInfo^.sWC;
+    pT^.eOperator    := wo;
+    pT^.leftCursor   := iCur;
+    pT^.u.leftColumn := col;
+    pT^.prereqRight  := 0;
+    pT^.prereqAll    := 1;
+    pT^.truthProb    := truth;
+    pT^.wtFlags      := wt;
+    expr.op := op;
+  end;
+
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('WLB open',                          rc = SQLITE_OK);
+
+  FillChar(parse,    SizeOf(parse),    0);   parse.db := db;
+  FillChar(wInfoBuf, SizeOf(wInfoBuf), 0);
+  pWInfo := PWhereInfo(@wInfoBuf[0]);
+  pWInfo^.pParse := @parse;
+
+  FillChar(tab, SizeOf(tab), 0);
+  tab.szTabRow := 1;
+  tab.iPKey    := -1;
+
+  FillChar(idx, SizeOf(idx), 0);
+  rowEst[0] := 50;   { ~32 rows in the table (LogEst) }
+  rowEst[1] := 0;    { 1 row per leading-key value }
+  rowEst[2] := 0;
+  aiCol[0]  := -1;   { XN_ROWID }
+  aiCol[1]  := 0;
+  idx.aiColumn    := @aiCol[0];
+  idx.aiRowLogEst := @rowEst[0];
+  idx.pTable      := @tab;
+  idx.szIdxRow    := 30;
+  idx.nKeyCol     := 1;
+  idx.nColumn     := 1;
+  idx.idxFlags    := SQLITE_IDXTYPE_IPK or u32(1 shl 7); { hasStat1 = bit 7 }
+  idx.onError     := 1;  { OE_Rollback — IsUniqueIndex }
+
+  FillChar(src, SizeOf(src), 0);
+  src.iCursor := iCur;
+  src.pSTab   := @tab;
+
+  pWInfo^.sWC.pWInfo := pWInfo;
+  pWInfo^.sWC.a      := @pWInfo^.sWC.aStatic[0];
+  pWInfo^.sWC.nSlot  := Length(pWInfo^.sWC.aStatic);
+
+  FillChar(bld, SizeOf(bld), 0);
+  bld.pWInfo := pWInfo;
+  bld.pWC    := @pWInfo^.sWC;
+
+  FillChar(pNew, SizeOf(pNew), 0);
+  whereLoopInit(@pNew);
+  pNew.iTab          := 0;
+  pNew.maskSelf      := 1;
+  pNew.u.btree.pIndex := @idx;
+  bld.pNew := @pNew;
+
+  FillChar(rhs, SizeOf(rhs), 0); rhs.op := TK_INTEGER;
+  FillChar(lhs, SizeOf(lhs), 0); lhs.op := TK_COLUMN;
+  lhs.iTable := iCur; lhs.iColumn := -1;
+  FillChar(expr, SizeOf(expr), 0);
+  expr.op    := TK_EQ;
+  expr.pLeft := @lhs;
+  expr.pRight := @rhs;
+
+  { ---- WLB1: empty WHERE clause, scanner finds nothing ---- }
+  ResetState;
+  rc := whereLoopAddBtreeIndex(@bld, @src, @idx, 0);
+  Check('WLB1 empty WC returns OK',          rc = SQLITE_OK);
+  Check('WLB1 no template inserted',         pWInfo^.pLoops = nil);
+  Check('WLB1 nLTerm restored to 0',         pNew.nLTerm = 0);
+  Check('WLB1 nEq restored to 0',            pNew.u.btree.nEq = 0);
+
+  { ---- WLB2: rowid = ? on a UNIQUE index ---- }
+  ResetState;
+  pWInfo^.sWC.nTerm := 1;
+  SeedTerm(0, TK_EQ, WO_EQ, XN_ROWID, 1, 0);
+  rc := whereLoopAddBtreeIndex(@bld, @src, @idx, 0);
+  Check('WLB2 rowid EQ returns OK',          rc = SQLITE_OK);
+  Check('WLB2 inserted exactly one loop',    (pWInfo^.pLoops <> nil)
+                                              and (pWInfo^.pLoops^.pNextLoop = nil));
+  if pWInfo^.pLoops <> nil then
+  begin
+    p := pWInfo^.pLoops;
+    Check('WLB2 wsFlags has WHERE_COLUMN_EQ',
+          (p^.wsFlags and WHERE_COLUMN_EQ) <> 0);
+    Check('WLB2 wsFlags has WHERE_ONEROW',
+          (p^.wsFlags and WHERE_ONEROW) <> 0);
+    Check('WLB2 nLTerm = 1',                 p^.nLTerm = 1);
+    Check('WLB2 u.btree.nEq = 1',            p^.u.btree.nEq = 1);
+    Check('WLB2 u.btree.pIndex nilled (IPK index)',
+          p^.u.btree.pIndex = nil);
+    Check('WLB2 first aLTerm[0] points at term',
+          p^.aLTerm[0] = @pWInfo^.sWC.aStatic[0]);
+  end;
+  Check('WLB2 saved state restored: nLTerm', pNew.nLTerm = 0);
+  Check('WLB2 saved state restored: nEq',    pNew.u.btree.nEq = 0);
+  Check('WLB2 saved state restored: wsFlags',pNew.wsFlags = 0);
+  Check('WLB2 builder bldFlags1 has UNIQUE', { saved_nEq=0 = nKeyCol-1=0 → UNIQUE bit }
+        (bld.bldFlags1 and u8(SQLITE_BLDF1_UNIQUE)) <> 0);
+
+  { ---- WLB3: term skipped because prereqRight intersects maskSelf ---- }
+  ResetState;
+  pWInfo^.sWC.nTerm := 1;
+  SeedTerm(0, TK_EQ, WO_EQ, XN_ROWID, 1, 0);
+  pWInfo^.sWC.aStatic[0].prereqRight := 1;  { intersects maskSelf=1 }
+  rc := whereLoopAddBtreeIndex(@bld, @src, @idx, 0);
+  Check('WLB3 self-prereq term returns OK',  rc = SQLITE_OK);
+  Check('WLB3 self-prereq skips insert',     pWInfo^.pLoops = nil);
+
+  { ---- WLB4: TERM_VNULL on rowid (NOT NULL) is skipped ---- }
+  ResetState;
+  pWInfo^.sWC.nTerm := 1;
+  SeedTerm(0, TK_EQ, WO_EQ, XN_ROWID, 1, TERM_VNULL);
+  rc := whereLoopAddBtreeIndex(@bld, @src, @idx, 0);
+  Check('WLB4 TERM_VNULL on rowid returns OK', rc = SQLITE_OK);
+  Check('WLB4 TERM_VNULL skipped (rowid is NOT NULL)',
+        pWInfo^.pLoops = nil);
+
+  { ---- WLB5: WO_GT range term → COLUMN_RANGE | BTM_LIMIT, no ONEROW ---- }
+  ResetState;
+  pWInfo^.sWC.nTerm := 1;
+  SeedTerm(0, TK_GT_TK, u16(WO_GT_WO), XN_ROWID, 1, 0);
+  rc := whereLoopAddBtreeIndex(@bld, @src, @idx, 0);
+  Check('WLB5 WO_GT range returns OK',       rc = SQLITE_OK);
+  Check('WLB5 inserted one loop',            (pWInfo^.pLoops <> nil)
+                                              and (pWInfo^.pLoops^.pNextLoop = nil));
+  if pWInfo^.pLoops <> nil then
+  begin
+    p := pWInfo^.pLoops;
+    Check('WLB5 wsFlags has WHERE_COLUMN_RANGE',
+          (p^.wsFlags and WHERE_COLUMN_RANGE) <> 0);
+    Check('WLB5 wsFlags has WHERE_BTM_LIMIT',
+          (p^.wsFlags and WHERE_BTM_LIMIT) <> 0);
+    Check('WLB5 wsFlags lacks WHERE_ONEROW (range, not EQ)',
+          (p^.wsFlags and WHERE_ONEROW) = 0);
+    Check('WLB5 nEq stays 0 (range slot)',   p^.u.btree.nEq = 0);
+    Check('WLB5 nBtm = 1 (scalar bound)',    p^.u.btree.nBtm = 1);
+  end;
+
+  { ---- WLB6: WO_ISNULL on a NOT-NULL leading column is skipped ---- }
+  ResetState;
+  pWInfo^.sWC.nTerm := 1;
+  SeedTerm(0, TK_ISNULL, u16(WO_ISNULL), XN_ROWID, 1, 0);
+  rc := whereLoopAddBtreeIndex(@bld, @src, @idx, 0);
+  Check('WLB6 WO_ISNULL on rowid returns OK', rc = SQLITE_OK);
+  Check('WLB6 WO_ISNULL skipped (rowid NOT NULL)',
+        pWInfo^.pLoops = nil);
+
+  { ---- WLB7: opMask narrowed when entering with WHERE_BTM_LIMIT pre-set ---- }
+  ResetState;
+  pWInfo^.sWC.nTerm := 1;
+  pNew.wsFlags := WHERE_BTM_LIMIT;  { caller has already pinned a lower bound }
+  SeedTerm(0, TK_EQ, WO_EQ, XN_ROWID, 1, 0);
+  rc := whereLoopAddBtreeIndex(@bld, @src, @idx, 0);
+  Check('WLB7 BTM-prefix opMask narrowed to LT|LE',
+        (rc = SQLITE_OK) and (pWInfo^.pLoops = nil));
+  pNew.wsFlags := 0;
+
+  { Cleanup. }
+  while pWInfo^.pLoops <> nil do
+  begin
+    p := pWInfo^.pLoops;
+    pWInfo^.pLoops := p^.pNextLoop;
+    whereLoopDelete(db, p);
+  end;
+  whereLoopClear(db, @pNew);
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -1851,6 +2082,7 @@ begin
   TestIndexColumnNotNull;
   TestFindIndexCol;
   TestIsDistinctRedundant;
+  TestWhereLoopAddBtreeIndex;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

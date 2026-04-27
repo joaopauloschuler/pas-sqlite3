@@ -1443,6 +1443,9 @@ const
   SQLITE_QueryFlattener = u32($00000001);
   SQLITE_DistinctOpt    = u32($00000010);
   SQLITE_OmitNoopJoin   = u32($00000100);
+  SQLITE_Stat4          = u32($00000800);
+  SQLITE_SkipScan       = u32($00004000);
+  SQLITE_SeekScan       = u32($00020000);
   SQLITE_BloomFilter    = u32($00080000);
   SQLITE_OnePass        = u32($08000000);
 
@@ -1722,6 +1725,19 @@ function  whereUsablePartialIndex(iTab: i32; jointype: u8;
   amalgamation built without -DSQLITE_ENABLE_STAT4). }
 function  whereRangeScanEst(pParse: PParse; pBuilder: PWhereLoopBuilder;
   pLower: PWhereTerm; pUpper: PWhereTerm; pLoop: PWhereLoop): i32;
+
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — per-index template-loop
+  factory (where.c:3219..3653).  Walks the WHERE clause looking for terms
+  that match the leading (nEq+1)'th column of pProbe; for each match,
+  builds a candidate WhereLoop and recurses to look for further matches
+  on the next column.  Drives the whereLoopInsert ranking machinery.
+
+  Recursion drives the EQ/IS/IN/RANGE/IS-NULL trees plus the SKIPSCAN
+  fall-back for indexes whose leading columns have no available
+  predicates.  STAT4-driven branches (whereEqualScanEst, whereInScanEst)
+  are omitted, matching the project-wide non-STAT4 build. }
+function  whereLoopAddBtreeIndex(pBuilder: PWhereLoopBuilder;
+  pSrc: PSrcItem; pProbe: PIndex2; nInMul: i16): i32;
 
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
@@ -8850,6 +8866,397 @@ begin
   if nNew < nOut then nOut := nNew;
 
   pLoop^.nOut := i16(nOut);
+  Result := rc;
+end;
+
+{ whereLoopAddBtreeIndex — direct port of where.c:3219..3653.
+
+  Per-index template-loop factory.  Walks the WHERE clause looking for
+  terms that match the leading (saved_nEq+1)'th column of pProbe and,
+  for each match, builds a candidate WhereLoop and recurses to look for
+  further matches against the next column.  Each candidate is pushed
+  through whereLoopInsert which handles ranking / replacement bookkeeping.
+
+  STAT4-driven branches (whereEqualScanEst, whereInScanEst, the
+  TERM_HIGHTRUTH self-correction) are intentionally omitted — this
+  project is built without -DSQLITE_ENABLE_STAT4, matching the C
+  amalgamation when that compile flag is absent.  ApplyCostMultiplier is
+  also a no-op (no -DSQLITE_ENABLE_COSTMULT).
+
+  Decoded bitfields out of pProbe^.idxFlags:
+    bUnordered  = bit 2,
+    uniqNotNull = bit 3,
+    noSkipScan  = bit 6,
+    hasStat1    = bit 7 (already exposed via indexHasStat1 helper). }
+function whereLoopAddBtreeIndex(pBuilder: PWhereLoopBuilder;
+  pSrc: PSrcItem; pProbe: PIndex2; nInMul: i16): i32;
+var
+  pWInfo:        PWhereInfo;
+  pPrs:          PParse;
+  db:            PTsqlite3;
+  pNew:          PWhereLoop;
+  pTerm:         PWhereTerm;
+  opMask:        u32;
+  scan:          TWhereScan;
+  saved_prereq:  Bitmask;
+  saved_nLTerm:  u16;
+  saved_nEq:     u16;
+  saved_nBtm:    u16;
+  saved_nTop:    u16;
+  saved_nSkip:   u16;
+  saved_wsFlags: u32;
+  saved_nOut:    i16;
+  rc:            i32;
+  rSize:         i16;
+  rLogSize:      i16;
+  pTop:          PWhereTerm;
+  pBtm:          PWhereTerm;
+  eOp:           u16;
+  rCostIdx:      i16;
+  nOutUnadjusted: i16;
+  nIn:           i16;
+  pXp:           PExpr;
+  i:             i32;
+  bRedundant:    i32;
+  M, logK, xCost: i16;
+  iCol:          i16;
+  uniqNotNull:   Boolean;
+  bUnordered:    Boolean;
+  noSkipScan:    Boolean;
+  hasStat1Flag:  Boolean;
+  isUnique:      Boolean;
+  nVecLen:       i32;
+  nEq:           i32;
+  nIter:         i16;
+  aLTermArr:     PPWhereTerm;
+  aLTermSlot:    PWhereTerm;
+begin
+  pWInfo := pBuilder^.pWInfo;
+  pPrs   := pWInfo^.pParse;
+  db     := pPrs^.db;
+  pNew   := pBuilder^.pNew;
+  Assert((db^.mallocFailed = 0) or (pPrs^.nErr > 0));
+  if pPrs^.nErr <> 0 then
+    Exit(pPrs^.rc);
+
+  Assert((pNew^.wsFlags and WHERE_VIRTUALTABLE) = 0);
+  Assert((pNew^.wsFlags and WHERE_TOP_LIMIT) = 0);
+  if (pNew^.wsFlags and WHERE_BTM_LIMIT) <> 0 then
+    opMask := WO_LT or WO_LE
+  else
+  begin
+    Assert(pNew^.u.btree.nBtm = 0);
+    opMask := WO_EQ or WO_IN or WO_GT_WO or WO_GE or WO_LT or WO_LE
+              or WO_ISNULL or WO_IS;
+  end;
+  bUnordered   := ((pProbe^.idxFlags shr 2) and 1) <> 0;
+  uniqNotNull  := ((pProbe^.idxFlags shr 3) and 1) <> 0;
+  noSkipScan   := ((pProbe^.idxFlags shr 6) and 1) <> 0;
+  hasStat1Flag := indexHasStat1(pProbe) <> 0;
+  if bUnordered then
+    opMask := opMask and (not (WO_GT_WO or WO_GE or WO_LT or WO_LE));
+  isUnique := pProbe^.onError <> OE_None;
+
+  Assert(pNew^.u.btree.nEq < pProbe^.nColumn);
+  Assert((pNew^.u.btree.nEq < pProbe^.nKeyCol)
+         or ((pProbe^.idxFlags and 3) <> SQLITE_IDXTYPE_PRIMARYKEY));
+
+  saved_nEq     := pNew^.u.btree.nEq;
+  saved_nBtm    := pNew^.u.btree.nBtm;
+  saved_nTop    := pNew^.u.btree.nTop;
+  saved_nSkip   := pNew^.nSkip;
+  saved_nLTerm  := pNew^.nLTerm;
+  saved_wsFlags := pNew^.wsFlags;
+  saved_prereq  := pNew^.prereq;
+  saved_nOut    := pNew^.nOut;
+
+  pTerm := whereScanInit(@scan, pBuilder^.pWC, pSrc^.iCursor, i32(saved_nEq),
+                         opMask, pProbe);
+  pNew^.rSetup := 0;
+  rSize    := pProbe^.aiRowLogEst[0];
+  rLogSize := estLog(rSize);
+  pTop := nil; pBtm := nil;
+  rc := SQLITE_OK;
+
+  while (rc = SQLITE_OK) and (pTerm <> nil) do
+  begin
+    eOp := pTerm^.eOperator;
+    nIn := 0;
+    if (((eOp = WO_ISNULL) or ((pTerm^.wtFlags and TERM_VNULL) <> 0))
+        and (indexColumnNotNull(pProbe, i32(saved_nEq)) <> 0)) then
+    begin
+      pTerm := whereScanNext(@scan);
+      Continue;
+    end;
+    if (pTerm^.prereqRight and pNew^.maskSelf) <> 0 then
+    begin
+      pTerm := whereScanNext(@scan);
+      Continue;
+    end;
+    { Do not allow upper bound of a LIKE-optimisation range constraint
+      to mix with a lower bound from another source. }
+    if ((pTerm^.wtFlags and TERM_LIKEOPT) <> 0) and (pTerm^.eOperator = WO_LT) then
+    begin
+      pTerm := whereScanNext(@scan);
+      Continue;
+    end;
+    if ((pSrc^.fg.jointype and (JT_LEFT or JT_LTORJ or JT_RIGHT)) <> 0)
+       and (constraintCompatibleWithOuterJoin(pTerm, pSrc) = 0) then
+    begin
+      pTerm := whereScanNext(@scan);
+      Continue;
+    end;
+    if isUnique and (saved_nEq = pProbe^.nKeyCol - 1) then
+      pBuilder^.bldFlags1 := pBuilder^.bldFlags1 or u8(SQLITE_BLDF1_UNIQUE)
+    else
+      pBuilder^.bldFlags1 := pBuilder^.bldFlags1 or u8(SQLITE_BLDF1_INDEXED);
+
+    pNew^.wsFlags     := saved_wsFlags;
+    pNew^.u.btree.nEq := saved_nEq;
+    pNew^.u.btree.nBtm := saved_nBtm;
+    pNew^.u.btree.nTop := saved_nTop;
+    pNew^.nLTerm      := saved_nLTerm;
+    if (pNew^.nLTerm >= pNew^.nLSlot)
+       and (whereLoopResize(db, pNew, i32(pNew^.nLTerm) + 1) <> 0) then
+      Break; { OOM }
+    aLTermArr := pNew^.aLTerm;
+    aLTermArr[pNew^.nLTerm] := pTerm;
+    Inc(pNew^.nLTerm);
+    pNew^.prereq := (saved_prereq or pTerm^.prereqRight) and (not pNew^.maskSelf);
+
+    Assert((nInMul = 0)
+           or ((pNew^.wsFlags and WHERE_COLUMN_NULL) <> 0)
+           or ((pNew^.wsFlags and WHERE_COLUMN_IN) <> 0)
+           or ((pNew^.wsFlags and WHERE_SKIPSCAN) <> 0));
+
+    if (eOp and WO_IN) <> 0 then
+    begin
+      pXp := pTerm^.pExpr;
+      if ExprUseXSelect(pXp) then
+      begin
+        { "x IN (SELECT ...)" — TUNING: assume 25 rows. }
+        bRedundant := 0;
+        nIn := 46; Assert(46 = sqlite3LogEst(25));
+        i := 0;
+        while i < (i32(pNew^.nLTerm) - 1) do
+        begin
+          aLTermSlot := aLTermArr[i];
+          if (aLTermSlot <> nil) and (aLTermSlot^.pExpr = pXp) then
+          begin
+            nIn := 0;
+            if aLTermSlot^.u.iField = pTerm^.u.iField then
+              bRedundant := 1;
+          end;
+          Inc(i);
+        end;
+        if bRedundant <> 0 then
+        begin
+          Dec(pNew^.nLTerm);
+          pTerm := whereScanNext(@scan);
+          Continue;
+        end;
+      end
+      else if (pXp^.x.pList <> nil) and (pXp^.x.pList^.nExpr > 0) then
+      begin
+        { "x IN (value, value, ...)" }
+        nIn := sqlite3LogEst(u64(pXp^.x.pList^.nExpr));
+      end;
+      if hasStat1Flag and (rLogSize >= 10) then
+      begin
+        M    := pProbe^.aiRowLogEst[saved_nEq];
+        logK := estLog(nIn);
+        xCost := i16(M + logK + 10 - (nIn + rLogSize));
+        if xCost >= 0 then
+        begin
+          { Prefers indexed lookup — fall through. }
+        end
+        else if (nInMul < 2) and OptimizationEnabled(db, SQLITE_SeekScan) then
+        begin
+          pNew^.wsFlags := pNew^.wsFlags or WHERE_IN_SEEKSCAN;
+        end
+        else
+        begin
+          { Prefers normal scan — skip this term. }
+          pTerm := whereScanNext(@scan);
+          Continue;
+        end;
+      end;
+      pNew^.wsFlags := pNew^.wsFlags or WHERE_COLUMN_IN;
+    end
+    else if (eOp and (WO_EQ or WO_IS)) <> 0 then
+    begin
+      iCol := pProbe^.aiColumn[saved_nEq];
+      pNew^.wsFlags := pNew^.wsFlags or WHERE_COLUMN_EQ;
+      Assert(saved_nEq = pNew^.u.btree.nEq);
+      if (iCol = XN_ROWID)
+         or ((iCol >= 0) and (nInMul = 0) and (saved_nEq = pProbe^.nKeyCol - 1))
+      then
+      begin
+        if (iCol = XN_ROWID) or uniqNotNull
+           or ((pProbe^.nKeyCol = 1) and (pProbe^.onError <> 0)
+               and ((eOp and WO_EQ) <> 0))
+        then
+          pNew^.wsFlags := pNew^.wsFlags or WHERE_ONEROW
+        else
+          pNew^.wsFlags := pNew^.wsFlags or WHERE_UNQ_WANTED;
+      end;
+      if scan.iEquiv > 1 then
+        pNew^.wsFlags := pNew^.wsFlags or WHERE_TRANSCONS;
+    end
+    else if (eOp and WO_ISNULL) <> 0 then
+    begin
+      pNew^.wsFlags := pNew^.wsFlags or WHERE_COLUMN_NULL;
+    end
+    else
+    begin
+      nVecLen := whereRangeVectorLen(pPrs, pSrc^.iCursor, pProbe,
+                                     i32(saved_nEq), pTerm);
+      if (eOp and (WO_GT_WO or WO_GE)) <> 0 then
+      begin
+        pNew^.wsFlags := pNew^.wsFlags or WHERE_COLUMN_RANGE or WHERE_BTM_LIMIT;
+        pNew^.u.btree.nBtm := u16(nVecLen);
+        pBtm := pTerm;
+        pTop := nil;
+        if (pTerm^.wtFlags and TERM_LIKEOPT) <> 0 then
+        begin
+          { Range constraints from the LIKE optimisation come in pairs. }
+          pTop := PWhereTerm(PtrUInt(pTerm) + SizeOf(TWhereTerm));
+          Assert((pTop^.wtFlags and TERM_LIKEOPT) <> 0);
+          Assert(pTop^.eOperator = WO_LT);
+          if whereLoopResize(db, pNew, i32(pNew^.nLTerm) + 1) <> 0 then Break;
+          aLTermArr := pNew^.aLTerm;
+          aLTermArr[pNew^.nLTerm] := pTop;
+          Inc(pNew^.nLTerm);
+          pNew^.wsFlags := pNew^.wsFlags or WHERE_TOP_LIMIT;
+          pNew^.u.btree.nTop := 1;
+        end;
+      end
+      else
+      begin
+        Assert((eOp and (WO_LT or WO_LE)) <> 0);
+        pNew^.wsFlags := pNew^.wsFlags or WHERE_COLUMN_RANGE or WHERE_TOP_LIMIT;
+        pNew^.u.btree.nTop := u16(nVecLen);
+        pTop := pTerm;
+        if (pNew^.wsFlags and WHERE_BTM_LIMIT) <> 0 then
+        begin
+          aLTermArr := pNew^.aLTerm;
+          pBtm := aLTermArr[pNew^.nLTerm - 2];
+        end
+        else
+          pBtm := nil;
+      end;
+    end;
+
+    Assert(pNew^.nOut = saved_nOut);
+    if (pNew^.wsFlags and WHERE_COLUMN_RANGE) <> 0 then
+    begin
+      whereRangeScanEst(pPrs, pBuilder, pBtm, pTop, pNew);
+    end
+    else
+    begin
+      Inc(pNew^.u.btree.nEq);
+      nEq := i32(pNew^.u.btree.nEq);
+      Assert((eOp and (WO_ISNULL or WO_EQ or WO_IN or WO_IS)) <> 0);
+      Assert(pNew^.nOut = saved_nOut);
+      if (pTerm^.truthProb <= 0) and (pProbe^.aiColumn[saved_nEq] >= 0) then
+      begin
+        Assert(((eOp and WO_IN) <> 0) or (nIn = 0));
+        pNew^.nOut := i16(pNew^.nOut + pTerm^.truthProb);
+        pNew^.nOut := i16(pNew^.nOut - nIn);
+      end
+      else
+      begin
+        { No-STAT4 path — use stat1 row counts. }
+        pNew^.nOut := i16(pNew^.nOut
+                          + (pProbe^.aiRowLogEst[nEq] - pProbe^.aiRowLogEst[nEq - 1]));
+        if (eOp and WO_ISNULL) <> 0 then
+          pNew^.nOut := i16(pNew^.nOut + 10);
+      end;
+    end;
+
+    { Cost of visiting selected rows in the index. }
+    Assert(pSrc^.pSTab^.szTabRow > 0);
+    if (pProbe^.idxFlags and 3) = SQLITE_IDXTYPE_IPK then
+      rCostIdx := i16(pNew^.nOut + 16)
+    else
+      rCostIdx := i16(pNew^.nOut + 1
+                      + (15 * pProbe^.szIdxRow) div pSrc^.pSTab^.szTabRow);
+    rCostIdx := sqlite3LogEstAdd(rLogSize, rCostIdx);
+
+    pNew^.rRun := rCostIdx;
+    if (pNew^.wsFlags and (WHERE_IDX_ONLY or WHERE_IPK or WHERE_EXPRIDX)) = 0 then
+      pNew^.rRun := sqlite3LogEstAdd(pNew^.rRun, i16(pNew^.nOut + 16));
+    { ApplyCostMultiplier no-op without SQLITE_ENABLE_COSTMULT. }
+
+    nOutUnadjusted := pNew^.nOut;
+    pNew^.rRun := i16(pNew^.rRun + nInMul + nIn);
+    pNew^.nOut := i16(pNew^.nOut + nInMul + nIn);
+    whereLoopOutputAdjust(pBuilder^.pWC, pNew, rSize);
+    if (pSrc^.fg.fgBits3 and u8($04)) <> 0 then  { fromExists }
+      pNew^.nOut := 0;
+    rc := whereLoopInsert(pBuilder, pNew);
+
+    if (pNew^.wsFlags and WHERE_COLUMN_RANGE) <> 0 then
+      pNew^.nOut := saved_nOut
+    else
+      pNew^.nOut := nOutUnadjusted;
+
+    if ((pNew^.wsFlags and WHERE_TOP_LIMIT) = 0)
+       and (pNew^.u.btree.nEq < pProbe^.nColumn)
+       and ((pNew^.u.btree.nEq < pProbe^.nKeyCol)
+            or ((pProbe^.idxFlags and 3) <> SQLITE_IDXTYPE_PRIMARYKEY))
+    then
+    begin
+      if pNew^.u.btree.nEq > 3 then
+        sqlite3ProgressCheck(pPrs);
+      whereLoopAddBtreeIndex(pBuilder, pSrc, pProbe, i16(nInMul + nIn));
+    end;
+    pNew^.nOut := saved_nOut;
+    pTerm := whereScanNext(@scan);
+  end;
+
+  pNew^.prereq      := saved_prereq;
+  pNew^.u.btree.nEq := saved_nEq;
+  pNew^.u.btree.nBtm := saved_nBtm;
+  pNew^.u.btree.nTop := saved_nTop;
+  pNew^.nSkip       := saved_nSkip;
+  pNew^.wsFlags     := saved_wsFlags;
+  pNew^.nOut        := saved_nOut;
+  pNew^.nLTerm      := saved_nLTerm;
+
+  { Skip-scan attempt — unchanged from upstream where.c:3622..3648. }
+  Assert(42 = sqlite3LogEst(18));
+  if (saved_nEq = saved_nSkip)
+     and (saved_nEq + 1 < pProbe^.nKeyCol)
+     and (saved_nEq = pNew^.nLTerm)
+     and (not noSkipScan)
+     and hasStat1Flag
+     and OptimizationEnabled(db, SQLITE_SkipScan)
+     and (pProbe^.aiRowLogEst[saved_nEq + 1] >= 42)
+     and ((pSrc^.fg.fgBits3 and u8($04)) = 0)
+  then
+  begin
+    rc := whereLoopResize(db, pNew, i32(pNew^.nLTerm) + 1);
+    if rc = SQLITE_OK then
+    begin
+      Inc(pNew^.u.btree.nEq);
+      Inc(pNew^.nSkip);
+      aLTermArr := pNew^.aLTerm;
+      aLTermArr[pNew^.nLTerm] := nil;
+      Inc(pNew^.nLTerm);
+      pNew^.wsFlags := pNew^.wsFlags or WHERE_SKIPSCAN;
+      nIter := i16(pProbe^.aiRowLogEst[saved_nEq] - pProbe^.aiRowLogEst[saved_nEq + 1]);
+      pNew^.nOut := i16(pNew^.nOut - nIter);
+      { 1.375 fudge factor (LogEst 5) so skip-scan is slightly less likely. }
+      nIter := i16(nIter + 5);
+      whereLoopAddBtreeIndex(pBuilder, pSrc, pProbe, i16(nIter + nInMul));
+      pNew^.nOut    := saved_nOut;
+      pNew^.u.btree.nEq := saved_nEq;
+      pNew^.nSkip   := saved_nSkip;
+      pNew^.wsFlags := saved_wsFlags;
+    end;
+  end;
+
   Result := rc;
 end;
 
