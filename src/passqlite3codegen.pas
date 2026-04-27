@@ -2148,6 +2148,7 @@ function  sqlite3ExprIsIIF(db: PTsqlite3; const pExpr: PExpr): i32;
 function  sqlite3ExprImpliesExpr(pParse: PParse; const pE1, pE2: PExpr;
   iTab: i32): i32;
 function  sqlite3ExprIsConstant(pParse: PParse; p: PExpr): i32;
+function  sqlite3ExprIsConstantNotJoin(pParse: PParse; p: PExpr): i32;
 function  sqlite3ExprCodeRunJustOnce(pParse: PParse; pExpr: PExpr;
   regDest: i32): i32;
 function  sqlite3ExprCodeTemp(pParse: PParse; pExpr: PExpr;
@@ -4575,7 +4576,8 @@ begin
     begin
       pItem := PExprListItem(PByte(items) + i * SZ_EXPRLIST_ITEM);
       pArg  := pItem^.pExpr;
-      if (constMask and (u32(1) shl i)) <> 0 then
+      if ((constMask and (u32(1) shl i)) <> 0)
+         and ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0) then
         sqlite3ExprCodeRunJustOnce(pParse, pArg, r1 + i)
       else
         sqlite3ExprCode(pParse, pArg, r1 + i);
@@ -5114,9 +5116,21 @@ begin
         end;
       TK_FUNCTION:
         begin
-          if not emitScalarFunctionCall(pParse, pExpr, target) then
-            sqlite3VdbeAddOp2(v, OP_Null, 0, target);
-          done := True;
+          { expr.c:5343..5349 — SQL functions can be expensive, so when
+            ConstFactorOk(pParse) holds and the call is constant-not-join,
+            hoist the evaluation to once-at-prepare time via
+            sqlite3ExprCodeRunJustOnce. }
+          if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
+             and (sqlite3ExprIsConstantNotJoin(pParse, pExpr) <> 0) then
+          begin
+            Result := sqlite3ExprCodeRunJustOnce(pParse, pExpr, -1);
+            done := True;
+          end else
+          begin
+            if not emitScalarFunctionCall(pParse, pExpr, target) then
+              sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+            done := True;
+          end;
         end;
       TK_CASE:
         begin
@@ -17140,6 +17154,7 @@ var
   items:       PExprListItem;
   nResultCol:  i32;
   i:           i32;
+  r1:          i32;
   pWInfo:      PWhereInfo;
   isExists:    Boolean;    { True when pDest^.eDest = SRT_Exists }
   iLimitReg:   i32;        { register holding LIMIT counter for SRT_Exists }
@@ -17210,8 +17225,17 @@ begin
     end;
     sqlite3VdbeAddOp3(v, OP_Explain, sqlite3VdbeCurrentAddr(v), 0, 0);
     items := ExprListItems(pEList);
+    { Mirrors sqlite3ExprCodeExprList(pEList, regResult, 0, SQLITE_ECEL_DUP)
+      called from selectInnerLoop / innerLoopLoadRow (select.c:693) for
+      eDest in {SRT_Mem, SRT_Output, SRT_Coroutine}: when an expression
+      lands in a different register than the result slot, emit OP_Copy
+      (ECEL_DUP), not OP_SCopy. }
     for i := 0 to nResultCol - 1 do
-      sqlite3ExprCode(pParse, items[i].pExpr, pDest^.iSdst + i);
+    begin
+      r1 := sqlite3ExprCodeTarget(pParse, items[i].pExpr, pDest^.iSdst + i);
+      if r1 <> pDest^.iSdst + i then
+        sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
+    end;
     sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
     if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
     Exit;

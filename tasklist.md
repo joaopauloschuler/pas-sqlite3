@@ -160,8 +160,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 989 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 990); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 1004 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 1005); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -194,21 +194,14 @@ Important: At the end of this document, please find:
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
   comparison ops + literal-arith + col aliases + multi-col index +
   multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **1003 PASS / 2 DIVERGE / 0 ERROR**
-  (corpus = 1005 after a +15-row probe sweep covering GLOB, IS NULL,
-  IS NOT NULL, `<>` / `!=`, BETWEEN, NOT, `rowid<>`, `abs(a)`,
-  `NULL` literal, `1=1`, `WHERE 1` / `WHERE 0`, multi-AND
-  rowid+col).  14 of the 15 new shapes flipped straight to PASS;
-  the lone new DIVERGE is `SELECT length('hi');` — see step 8 below.
-  Drive to all-PASS, then expand corpus further (pragma / trigger /
-  multi-table SELECT / aggregates / joins) and promote from report-only
-  to hard gate.
+  Current Status (2026-04-27): **1004 PASS / 1 DIVERGE / 0 ERROR**
+  (corpus = 1005).  Drive to all-PASS, then expand corpus further
+  (pragma / trigger / multi-table SELECT / aggregates / joins) and
+  promote from report-only to hard gate.
 
   DIVERGE rows + delta = (C ops − Pas ops):
 
   - DROP TABLE — Δ=21 (step 4)
-  - SELECT length('hi') — Δ=2 (step 8 — factorable-constant
-    `OP_Once` hoist gate missing on no-FROM literal call)
 
   Root cause for DROP TABLE Δ=21 (re-analysis 2026-04-27 from
   bytecode dump):
@@ -352,17 +345,21 @@ Important: At the end of this document, please find:
   `sqlite3ExprCodeFactorable`) is still off by a few ops; tracked as
   the new step-6 follow-on below.
 
-    - [ ] **6.10 step 8** Factorable-constant function-call hoist
-      missing on no-FROM SELECT.  Probe `SELECT length('hi');`
-      diverges Δ=2: C emits `Once / String8 / Function / Copy /
-      ResultRow / Halt / Goto` (9 ops with Init/Goto), gating the
-      String8+Function call behind `OP_Once` so a re-prepare step
-      can skip the constant-folding tail; Pas emits the call
-      inline (`String8 / Function / ResultRow`) for 7 ops.  Caused
-      by `sqlite3ExprCodeAtInit` / `sqlite3ExprCodeFactorable`
-      gate not firing in the no-FROM `sqlite3Select` fast path
-      (`passqlite3codegen.pas` ~17600).  No correctness impact —
-      cache only.
+    - [X] **6.10 step 8** Factorable-constant function-call hoist
+      on no-FROM SELECT.  Three-line fix in three call sites:
+      (a) TK_FUNCTION arm of `sqlite3ExprCodeTarget`: when
+      `ConstFactorOk(pParse) && sqlite3ExprIsConstantNotJoin(pExpr)`,
+      route through `sqlite3ExprCodeRunJustOnce(-1)` (mirrors
+      expr.c:5343..5349); (b) `emitScalarFunctionCall` constant-arg
+      coding loop now gates the `RunJustOnce` call on
+      `PARSEFLAG_OkConstFactor`, so the recursive emit (with
+      okConstFactor cleared) falls back to inline `sqlite3ExprCode`
+      (mirrors `sqlite3ExprCodeExprList`'s `ConstFactorOk` strip);
+      (c) no-FROM SELECT result-column emission switched from raw
+      `sqlite3ExprCode` to `sqlite3ExprCodeTarget` + manual
+      `OP_Copy` (matches selectInnerLoop's `ECEL_DUP` flag, which
+      makes the trailing copy `OP_Copy` instead of `OP_SCopy`).
+      `SELECT length('hi');` flips to PASS at 9 ops.
       expanded corpus all closed:
         * [X] `sqlite3Select` no-FROM fast path — `SELECT <expr-list>;`
           with empty pSrc emits OP_Explain + per-col sqlite3ExprCode

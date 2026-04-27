@@ -1343,6 +1343,12 @@ begin
     WriteLn('  DIVERGE ', row.label_, ' at op[', firstDiff, ']/', Length(cOps));
     DumpOp('C  ', firstDiff, cOps[firstDiff]);
     DumpOp('Pas', firstDiff, pOps[firstDiff]);
+    if GetEnvironmentVariable('VERBOSE') = '1' then begin
+      WriteLn('    --- C side ---');
+      for i := 0 to Length(cOps) - 1 do DumpOp('C  ', i, cOps[i]);
+      WriteLn('    --- Pas side ---');
+      for i := 0 to Length(pOps) - 1 do DumpOp('Pas', i, pOps[i]);
+    end;
   end;
 end;
 
