@@ -12247,6 +12247,62 @@ var
   startAddr:   i32;
   jRng:        i32;
   iInTabDummy: i32;
+
+  { Phase 6.9-bis 11g.2.f sub-progress 21 — hoist nested helper.
+    Walks every base WHERE term whose root is a TK_IN with a literal-list
+    RHS (size > 2 or non-constant) and force-materialises the IN-RHS
+    into an ephemeral b-tree by calling sqlite3FindInIndex with
+    IN_INDEX_MEMBERSHIP.  Sub-progress 19 inlined this body in the
+    sqlite3WhereBegin prelude (BEFORE the case dispatch).  Sub-progress
+    21 promotes it to a nested helper so the call site can vary by
+    plan: IPK-IN must call BEFORE the case dispatch (Case-2 IPK-IN
+    iterates the eph cursor as the outer loop, so it must exist by
+    the time we emit OP_Rewind on it), but plain SCAN-with-IN-residual
+    must call AFTER the table-cursor OP_Rewind (so the C oracle's
+    Rewind+Noop pre-amble lands in the correct order — the
+    materialisation comes between Rewind and the Next-loop body).
+    Same exclusions as sub-progress 19's inline walk: skip TERM_VIRTUAL
+    / TERM_CODED / non-TK_IN / non-list / ≤2-entry constant-list /
+    already-EP_Subrtn terms. }
+  function InRhsHoistCandidate(pTrm: PWhereTerm): Boolean;
+  begin
+    Result := False;
+    if pTrm = nil then Exit;
+    if (pTrm^.wtFlags and (TERM_VIRTUAL or TERM_CODED)) <> 0 then Exit;
+    if pTrm^.pExpr = nil then Exit;
+    if pTrm^.pExpr^.op <> TK_IN then Exit;
+    if not ExprUseXList(pTrm^.pExpr) then Exit;
+    if pTrm^.pExpr^.x.pList = nil then Exit;
+    if (sqlite3InRhsIsConstant(pParse, pTrm^.pExpr) <> 0)
+       and (pTrm^.pExpr^.x.pList^.nExpr <= 2) then Exit;
+    if ExprHasProperty(pTrm^.pExpr, EP_Subrtn) then Exit;
+    Result := True;
+  end;
+
+  function HasInRhsToHoist: Boolean;
+  var jj: i32;
+  begin
+    Result := False;
+    for jj := 0 to pWInfo^.sWC.nBase - 1 do
+      if InRhsHoistCandidate(@pWInfo^.sWC.a[jj]) then Exit(True);
+  end;
+
+  procedure DoInRhsHoist;
+  var
+    jj:    i32;
+    pTrm:  PWhereTerm;
+    iEphDummy: i32;
+  begin
+    for jj := 0 to pWInfo^.sWC.nBase - 1 do
+    begin
+      pTrm := @pWInfo^.sWC.a[jj];
+      if not InRhsHoistCandidate(pTrm) then continue;
+      sqlite3FindInIndex(pParse, pTrm^.pExpr,
+                         IN_INDEX_MEMBERSHIP,
+                         nil, nil, @iEphDummy);
+    end;
+  end;
+
 begin
   Assert(((wctrlFlags and WHERE_ONEPASS_MULTIROW) = 0)
       or (((wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0)
@@ -12504,43 +12560,17 @@ begin
     iRowidReg := pParse^.nMem;
   end;
 
-  { Phase 6.9-bis 11g.2.f sub-progress 19 — pre-loop IN-RHS hoisting.
-
-    Walk every base WHERE term that is NOT virtual, NOT already TERM_CODED
-    by the False-Bypass loop, and whose root expression is a TK_IN with a
-    literal-list RHS (ExprUseXList).  For each such term, force-materialise
-    the IN-RHS into an ephemeral b-tree NOW (before Rewind/Seek emission)
-    by calling sqlite3FindInIndex with IN_INDEX_MEMBERSHIP — the eph
-    cursor is allocated, sqlite3CodeRhsOfIN emits the
-    OP_BeginSubrtn/OP_Once/.../OP_Return materialisation under
-    EP_Subrtn, and pX^.iTable caches the cursor.  The per-row residual
-    sqlite3ExprCodeIN call later in the loop body then short-circuits
-    through the EP_Subrtn cache fast-path (codegen.pas:23090) and emits
-    only the OP_Affinity + OP_NotFound test, matching the C oracle's
-    pre-loop-vs-in-loop placement.  Subselect IN-RHS (ExprUseXSelect)
-    stays out of the walk — sqlite3CodeRhsOfIN Case 1 is unported and
-    would soft-fallback to an empty eph table; deferring the pre-emit
-    keeps INDEX_IN_SUB on its existing pessimistic-false-jump path. }
-  for ii := 0 to pWInfo^.sWC.nBase - 1 do
-  begin
-    pTerm := @pWInfo^.sWC.a[ii];
-    if (pTerm^.wtFlags and (TERM_VIRTUAL or TERM_CODED)) <> 0 then continue;
-    if pTerm^.pExpr = nil then continue;
-    if pTerm^.pExpr^.op <> TK_IN then continue;
-    if not ExprUseXList(pTerm^.pExpr) then continue;
-    if pTerm^.pExpr^.x.pList = nil then continue;
-    { Skip ≤2-entry constant lists — sqlite3FindInIndex routes them through
-      IN_INDEX_NOOP (a sequence of OP_Eq comparisons), no eph table is
-      allocated.  Without this gate, the membership-only call would still
-      pick the NOOP path and not materialise, which is correct semantically
-      but pointless noise in the pre-emit walk. }
-    if (sqlite3InRhsIsConstant(pParse, pTerm^.pExpr) <> 0)
-       and (pTerm^.pExpr^.x.pList^.nExpr <= 2) then continue;
-    if ExprHasProperty(pTerm^.pExpr, EP_Subrtn) then continue;
-    sqlite3FindInIndex(pParse, pTerm^.pExpr,
-                       IN_INDEX_MEMBERSHIP,
-                       nil, nil, @iInTabDummy);
-  end;
+  { Phase 6.9-bis 11g.2.f sub-progress 21 — early IN-RHS hoist gate.
+    Only run the hoist BEFORE the case dispatch when this loop's plan
+    is IPK-IN (Case-2 IPK-IN consumes the eph cursor as its outer-loop
+    seed).  For every other shape (SCAN-with-IN-residual, IPK-RANGE,
+    IPK-EQ), the hoist is deferred until AFTER the per-shape seek/
+    rewind emission so the C-oracle program order
+    Rewind → materialisation → body holds.  See the DoInRhsHoist
+    nested helper above for the walk body. }
+  if ((pLoop^.wsFlags and WHERE_IPK) <> 0)
+     and ((pLoop^.wsFlags and WHERE_COLUMN_IN) <> 0) then
+    DoInRhsHoist;
 
   pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
   pLevel^.addrNxt  := pLevel^.addrBrk;
@@ -12737,9 +12767,29 @@ begin
       empty table.  pLevel^.op := OP_Next so sqlite3WhereEnd emits the
       iteration step at the loop tail; addrBrk is resolved by WhereEnd
       after that OP_Next, which is exactly where OP_Rewind's P2 needs
-      to land for the empty-table case. }
+      to land for the empty-table case.
+
+      Phase 6.9-bis 11g.2.f sub-progress 21 — when the loop has any
+      IN-RHS to materialise, emit an OP_Noop placeholder right after
+      OP_Rewind (matching C's `addrSkip` slot — wherecode.c around the
+      Case-6 SCAN preamble emits a leading Noop that the IN-RHS
+      materialisation lands after).  pLevel^.addrBody is set to the
+      address of that Noop, NOT after the materialisation: C's
+      `pLevel->p2 = 1 + addrRewind` makes OP_Next jump back to the
+      Noop, falling through into the gated BeginSubrtn block on every
+      iteration (the Once gate at the head of the materialisation
+      short-circuits past it after the first hit).  The bytecode shape
+      is then byte-identical to the C oracle for SCAN-with-IN-residual.
+      For shapes with no IN-RHS to hoist (plain FULL scan, LIKE,
+      MULTI_OR …), the Noop is suppressed so the existing PASS rows
+      do not regress. }
     sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrBrk);
     pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
+    if HasInRhsToHoist then
+    begin
+      sqlite3VdbeAddOp0(v, OP_Noop);
+      DoInRhsHoist;
+    end;
     pLevel^.op := OP_Next;
     pLevel^.p1 := pLevel^.iTabCur;
     pLevel^.p2 := pLevel^.addrBody;
@@ -23235,8 +23285,23 @@ begin
   end else begin
     { IN_INDEX_EPH (or IN_INDEX_INDEX_*): combined Step3+Step5 NotFound.
       Emit an OP_Affinity over rLhs first so the probe matches the eph
-      key encoding (expr.c:4164). }
+      key encoding (expr.c:4164).
+
+      Phase 6.9-bis 11g.2.f sub-progress 21 — emit Step 2 OP_IsNull
+      guards (expr.c:4187..4194) for every LHS field that can be NULL
+      BEFORE the combined NotFound.  When destIfFalse == destIfNull,
+      the IsNull jumps directly to destIfFalse (== addrCont in the
+      residual-filter path), short-circuiting the binary search.  This
+      is required even on the combined-NotFound fast path: NotFound's
+      NULL semantics treat a NULL LHS as not-equal-to-anything, but
+      C's coverage harness emits the IsNull explicitly so the generated
+      bytecode still matches. }
     sqlite3VdbeAddOp4(v, OP_Affinity, rLhs, nVector, 0, zAff, nVector);
+    for ii := 0 to nVector - 1 do
+    begin
+      if sqlite3ExprCanBeNull(sqlite3VectorFieldSubexpr(pLeft, ii)) <> 0 then
+        sqlite3VdbeAddOp2(v, OP_IsNull, rLhs + ii, destIfFalse);
+    end;
     sqlite3VdbeAddOp4Int(v, OP_NotFound, iTab, destIfFalse,
                          rLhs, nVector);
   end;

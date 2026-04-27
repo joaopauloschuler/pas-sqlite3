@@ -2691,6 +2691,98 @@ Important: At the end of this document, please find:
       pair instead of OP_SeekRowid.  Then `sqlite3SelectDup` unlocks
       INDEX_IN_SUB Case 1.  The two together flip the remaining IN
       rows in TestWhereCorpus.
+    - [X] Sub-progress 21 — IN-RHS hoist re-position + Step-2 IsNull
+      guard (2026-04-27).  TestWhereCorpus's INDEX_IN row uses the bare
+      three-column fixture (sub-progress 13) so `WHERE a IN (1,2,3)`
+      compiles to a SCAN-with-IN-residual (no real index on `a`), not
+      the actual INDEX_IN scan-plan from `whereLoopAddBtree`.  The
+      remaining 2-op gap against the C oracle was therefore a
+      placement / NULL-guard issue in the existing SCAN path, not a
+      missing planner branch.  Two coupled landings narrow INDEX_IN
+      from `op count: C=28 Pas=26` to the residue 1-register diff at
+      op[18]:
+
+      (a) IN-RHS hoist relocation (codegen.pas:12219..12260,
+      12529..12541, 12733..12762).  Sub-progress 19 inlined the
+      pre-loop IN-RHS materialisation walk at the top of
+      `sqlite3WhereBegin` (BEFORE the case dispatch), placing
+      BeginSubrtn/.../Return AHEAD of OP_Rewind in the program.
+      That ordering is correct only for the IPK-IN plan (Case-2
+      iterates the eph cursor as the outer loop, so the cursor must
+      exist before OP_Rewind on it).  For SCAN-with-IN-residual the
+      C oracle emits Rewind FIRST, then a Noop placeholder
+      (`addrSkip` slot in wherecode.c), then the materialisation
+      block, then the per-row body, with `OP_Next pLevel->p2 =
+      1+addrRewind` looping back to the Noop.  The hoist body was
+      promoted to a nested helper `DoInRhsHoist` plus a peer
+      `HasInRhsToHoist` predicate; the early-hoist call is now
+      gated on `WHERE_IPK | WHERE_COLUMN_IN`, and the SCAN arm
+      issues a leading `OP_Noop` followed by `DoInRhsHoist` between
+      `OP_Rewind` and the `pLevel^.addrBody := …` capture only when
+      the predicate fires.  FULL / LIKE / MULTI_OR rows (no IN
+      residuals) skip both ops, keeping their PASS counts intact.
+      The `InRhsHoistCandidate` extraction also DRYs sub-progress 19's
+      filter chain (TERM_VIRTUAL / TERM_CODED / non-TK_IN / non-list
+      / ≤2-entry constant-list / already-EP_Subrtn).
+
+      (b) Step-2 IsNull guard in `sqlite3ExprCodeIN` IN_INDEX_EPH
+      path (codegen.pas:23285..23310).  C's `sqlite3ExprCodeIN`
+      (expr.c:4187..4194) walks the LHS sub-expressions and emits
+      `OP_IsNull rLhs+i, destStep2` for every field that
+      `sqlite3ExprCanBeNull` flags, BEFORE the combined Step-3
+      `OP_NotFound`.  Sub-progress 18's minimal port emitted only
+      `OP_Affinity + OP_NotFound` — semantically OK for nullable
+      LHS (NotFound treats NULL as a miss) but bytecode-divergent
+      against C.  The new arm calls `sqlite3VectorFieldSubexpr` per
+      LHS column and emits `OP_IsNull rLhs+i, destIfFalse` when
+      ExprCanBeNull returns non-zero.  In the residual-filter path
+      `destIfFalse == destIfNull == addrCont`, so the IsNull jumps
+      directly past the IN-test on a NULL LHS row, matching C's
+      coverage shape.
+
+      Test-suite delta:
+        * TestWhereCorpus: **16/4/0 unchanged in PASS count, but the
+          INDEX_IN failure mode flips from `op-count C=28 Pas=26` to
+          `op-diff at op[18]/28`** — Pas now matches C op-for-op
+          through ops 0-17 (the materialisation block) and diverges
+          only on the register numbering at the post-Return body
+          (Pas Column reads into r3, C reads into r4; same register
+          shift propagates through to op-end).  The shift is a
+          temp-pool ordering difference between Pas and C that
+          compounds out of the SELECT result-register pre-allocation
+          (sqlite3Select allocates result regs BEFORE WhereBegin in
+          C; in Pas the equivalent allocation lands at a slightly
+          different point, leaving the temp pool one slot lower).
+          The diff is now register-numbering-only, not a missing
+          opcode.  Failure-mode tally: `0 exception, 0 nil-Vdbe, 3
+          op-count, 1 op-diff` — INDEX_IN consumed the only op-diff
+          slot; the 3 op-count divergences are INDEX_IN_SUB
+          (subselect IN-RHS, awaits sqlite3SelectDup), LEFT_JOIN
+          and JOIN_WHERE (multi-table, awaits 11g.2.d).
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41, TestVdbeApi
+          57/57, TestVdbeMisc 45/45, TestVdbeMem 62/62, TestVdbeAux
+          108/108, TestVdbeRecord 13/13, TestVdbeAgg 11/11,
+          TestVdbeStr 23/23, TestVdbeBlob 13/13, TestVdbeSort 14/14,
+          TestVdbeCursor 27/27, TestVdbeVtabExec 50/50,
+          TestExplainParity 2/10 unchanged, TestPrintf 105/105,
+          TestJson 434/434, TestJsonEach 50/50, TestTokenizer
+          127/127, TestRegistration 19/19.
+
+      Sub-progress 22 should close the residue 1-register diff at
+      INDEX_IN op[18] by aligning Pas's SELECT result-register
+      pre-allocation with C's order in `sqlite3Select` (the result
+      regs need to be reserved BEFORE the WhereBegin call so the
+      temp pool laid down by `sqlite3CodeRhsOfIN` releases into a
+      pool one slot higher, matching C's register numbering byte-
+      for-byte).  Once that flips, INDEX_IN goes to PASS and
+      attention moves to INDEX_IN_SUB (`sqlite3SelectDup` Case-1
+      port for subselect IN-RHS) and the multi-table LEFT_JOIN /
+      JOIN_WHERE rows that await the 11g.2.d planner.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
