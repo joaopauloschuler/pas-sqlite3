@@ -156,7 +156,7 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 2 PASS / 8
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 4 PASS / 6
     DIVERGE / 0 ERROR (corpus = 10); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
@@ -170,7 +170,7 @@ Important: At the end of this document, please find:
         with snapshot/restore guard at 17890..17893 / 17965..17970;
         blocks NestedParse UPDATE of the placeholder sqlite_master row.
 
-    The 8 TestExplainParity DIVERGEs are CREATE TABLE / CREATE INDEX /
+    The 6 TestExplainParity DIVERGEs are CREATE TABLE (5 shapes) /
     DROP TABLE op-count rows — structural (extra C-side auth +
     ParseSchema reparse + scope unwind that Pas elides; rows still
     materialise correctly).  Tracked under 6.10.
@@ -186,7 +186,7 @@ Important: At the end of this document, please find:
     build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
-  Current Status: **2 PASS / 8 DIVERGE / 0 ERROR**.  Drive to
+  Current Status: **4 PASS / 6 DIVERGE / 0 ERROR**.  Drive to
   all-PASS, then expand corpus to DML / SELECT / pragma / trigger
   forms (same exclusion list as TestParser).  Promote from
   report-only to hard gate when the full corpus is green.
