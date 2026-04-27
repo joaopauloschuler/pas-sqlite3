@@ -44,27 +44,34 @@ uses
   passqlite3main;
 
 const
-  { Minimal fixture — the typed/PK/index variants the WHERE-shape corpus
-    really wants are still beyond what `sqlite3_exec` survives on the
-    Pascal side (CREATE INDEX / WITHOUT-ROWID flake under the current
-    11g.2.e codegen).  We use plain three-column declarations so the
-    *parser* path is identical on both sides; the C oracle still gets
-    the full schema (it owns its own DB), letting the corpus reach the
-    SELECT prepare on the Pascal side without an empty-schema bail-out
-    dominating the report.  When 11g.2.f flips the WHERE-codegen green,
-    upgrade this fixture to mirror the C oracle exactly. }
+  { Aligned fixture (sub-progress 13) — both sides use the same bare
+    three-column declarations.  Earlier sub-progresses ran the C oracle
+    against a typed/INTEGER PRIMARY KEY/WITHOUT ROWID/CREATE INDEX schema
+    so the planner could pick "realistic" plans (covering-index scan,
+    PK seek, etc.), but the Pascal port has none of the index machinery
+    yet (CREATE INDEX still flakes through sqlite3_exec under the
+    current 11g.2.e codegen, AddPrimaryKey is a stub, no covering-index
+    detection in the planner).  The result was wholesale fixture-driven
+    divergence — every IPK/INDEX_* row's OpenRead p1 (cursor-1 vs
+    cursor-0), p2 (rootpage 5+ vs 2-4), and Transaction.p3 (cookie 6
+    vs 3) drifted from typed-vs-bare schema, masking actual codegen
+    parity.  Both sides now use identical bare CREATE TABLE shapes;
+    rows that genuinely require index-based plans (INDEX_*) will keep
+    op-count differences against the C SCAN-with-residual baseline,
+    but the IPK / FULL / NULL / IS NULL / etc. rows that are within
+    Pascal's current codegen reach can flip to PASS.  When CREATE INDEX
+    + AddPrimaryKey + covering-index detection land in a future
+    sub-progress, the fixture can be upgraded back to typed/indexed and
+    the realistic-planner aspirations resume. }
   PAS_FIXTURE: PAnsiChar =
     'CREATE TABLE t(a, b, c);' +
     'CREATE TABLE s(x, y, z);' +
     'CREATE TABLE u(p, q, r);';
 
   C_FIXTURE: PAnsiChar =
-    'CREATE TABLE t(a INTEGER, b INTEGER, c TEXT);' +
-    'CREATE TABLE s(x INTEGER, y INTEGER, z TEXT);' +
-    'CREATE TABLE u(p INTEGER PRIMARY KEY, q TEXT, r INTEGER) WITHOUT ROWID;' +
-    'CREATE INDEX t_ab ON t(a, b);' +
-    'CREATE INDEX s_xy ON s(x, y);' +
-    'CREATE INDEX u_q  ON u(q);';
+    'CREATE TABLE t(a, b, c);' +
+    'CREATE TABLE s(x, y, z);' +
+    'CREATE TABLE u(p, q, r);';
 
 type
   TCorpusRow = record

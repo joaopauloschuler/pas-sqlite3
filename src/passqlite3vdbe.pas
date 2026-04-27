@@ -2301,7 +2301,13 @@ end;
 
 procedure sqlite3VdbeTypeofColumn(p: PVdbe; iDest: i32);
 const
-  OPFLAG_TYPEOFARG = $20;  { from sqliteInt.h }
+  OPFLAG_TYPEOFARG = $80;  { sqliteInt.h:4066 — was $20 prior to
+    sub-progress 13's IS NULL pathfix.  The two-bit slip silently
+    inverted OPFLAG_TYPEOFARG with an unrelated mask, causing
+    OP_Column p5 emitted by IS NULL / IS NOT NULL residuals to
+    diverge from the C oracle on this single bit.  All other
+    OPFLAG_TYPEOFARG sites in the codebase (codegen.pas:312,
+    util.pas:300) already use $80; this was the lone outlier. }
 var
   pOp: PVdbeOp;
 begin

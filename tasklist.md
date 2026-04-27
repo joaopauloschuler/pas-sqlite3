@@ -1954,6 +1954,121 @@ Important: At the end of this document, please find:
       and FULL flip from op-diff to PASS.  The heavy multi-table
       / aggregate / ORDER-BY work for the remaining 16 op-count
       rows is unchanged from the sub-progress 11 narrative.
+    - [X] Sub-progress 13 — fixture alignment + SCAN-tail
+      OPFLAG_FULLSCAN_STEP + TK_COLUMN codegen arm + OPFLAG_TYPEOFARG
+      constant fix (2026-04-27).  Four landings stitched together:
+
+      (a) `C_FIXTURE` aligned to `PAS_FIXTURE` (TestWhereCorpus.pas:56).
+      Both sides now use the same bare three-column declarations
+      (`CREATE TABLE t/s/u(a,b,c)`).  The earlier C-side typed +
+      INTEGER PRIMARY KEY + WITHOUT ROWID + CREATE INDEX schema
+      pursued realistic-planner outcomes (covering-index scan, PK
+      seek, index-only path) that the Pascal port cannot reach yet
+      — `CREATE INDEX` still flakes through `sqlite3_exec`,
+      `sqlite3AddPrimaryKey` is a stub, no covering-index detection
+      in the planner — so every IPK / INDEX_* corpus row's
+      OpenRead.p1 (cursor-1 vs cursor-0), OpenRead.p2 (rootpage 5+
+      vs 2-4), and Transaction.p3 (cookie 6 vs 3) drifted by fixture
+      shape rather than codegen reach.  The aligned bare schema lets
+      genuine codegen parity surface; INDEX_* shape rows revert from
+      "fictitious index plan" to "honest scan-with-residual" against
+      both sides.
+
+      (b) `sqlite3WhereBegin` SCAN-tail (codegen.pas:12298..12309) —
+      the SCAN fallback now seeds `pLevel^.p5 :=
+      SQLITE_STMTSTATUS_FULLSCAN_STEP` so the trailing OP_Next
+      (emitted by `sqlite3WhereEnd` via `pLevel^.op := OP_Next; … ;
+      sqlite3VdbeChangeP5(v, pLevel^.p5)`) carries the stmt-status
+      counter bump.  Mirrors wherecode.c:2221 / 2579, both of which
+      set `pLevel->p5 = SQLITE_STMTSTATUS_FULLSCAN_STEP` on the
+      table-scan / unindexed iteration tails.  Without this, FULL
+      diverged from C only on the OP_Next.p5 single bit.
+
+      (c) TK_COLUMN arm in `sqlite3ExprCodeTarget` (codegen.pas:
+      4586..4604) — replaced the TODO default-arm fallthrough that
+      emitted OP_Null with a minimal port of expr.c:5002..5088: when
+      `pExpr^.y.pTab <> nil` and `pExpr^.iTable >= 0`, dispatch to
+      `sqlite3ExprCodeGetColumnOfTable(v, y.pTab, iTable, iColumn,
+      target)` which already handles the rowid (iColumn=-1 → OP_Rowid)
+      and ordinary column (iColumn>=0 → OP_Column) cases.  Skipped
+      arms (EP_FixedCol, iSelfTab<0 CHECK-constraint context,
+      partial-index expression-shadow) land with the broader
+      wherecode.c port.  Without this, `c IS NULL` had been
+      emitting `OP_Null r1; OP_NotNull r1, jump` — loading literal
+      NULL into r1 instead of the column value, which made the
+      residual filter a no-op (NotNull r1 never jumps because r1
+      IS null), so every row would have wrongly satisfied the
+      `c IS NULL` filter at runtime.  Latent semantic bug masked
+      until now because TestWhereCorpus is bytecode-shape only and
+      no other test exercised IS NULL through the residual-filter
+      path.
+
+      (d) `OPFLAG_TYPEOFARG` constant fix (passqlite3vdbe.pas:2304) —
+      `sqlite3VdbeTypeofColumn` had a local-shadow `const
+      OPFLAG_TYPEOFARG = $20` overriding the unit-level value.  The
+      correct value is `$80` (sqliteInt.h:4066) and is the value
+      every other site in the codebase uses (codegen.pas:312 =
+      `$80`; util.pas:300 = `$80`).  The local override silently
+      flipped a different bit in OP_Column.p5 — symptom: IS NULL
+      residual emitted `Column p5=32` while C emits `Column p5=128`
+      (TYPEOFARG hint).  Fixed to `$80`; banner comment notes the
+      cross-codebase agreement and the lone-outlier history.
+
+      Test-suite delta:
+        * TestWhereCorpus moves from `0 PASS / 20 DIVERGE / 0 ERROR`
+          (sub-progress 12) to `3 PASS / 17 DIVERGE / 0 ERROR`.
+          PASS rows: IPK literal (`SELECT a FROM t WHERE rowid=5`,
+          9 ops byte-identical), NULL (`SELECT a FROM t WHERE c IS
+          NULL`, 11 ops byte-identical), FULL (`SELECT a FROM t`,
+          9 ops byte-identical).  Failure-mode tally moves from
+          `0 exception, 0 nil-Vdbe, 16 op-count, 4 op-diff` to
+          `0 exception, 0 nil-Vdbe, 17 op-count, 0 op-diff` — every
+          remaining DIVERGE row is now a structural shape difference
+          (Pascal emits SCAN-with-residual N=11..13 ops; C emits
+          IN-coroutine N=26..27, OR-shatter N=15..28, BETWEEN
+          range-plan N=13, JOIN N=29..32, etc.).  No row is in
+          op-diff (per-op P-operand drift) anymore.  Per-shape
+          histogram: IPK 1/1, NULL 1/0, FULL 1/0; all INDEX_* /
+          MULTI_OR / LEFT_JOIN / JOIN_WHERE shapes still 0/1
+          waiting on the next sub-progress's heavy lifts.
+        * TestWhereCorpus now reports `C-oracle reference total:
+          332 ops across 20 rows (avg 16.6)` (was 363 with the
+          typed schema), reflecting the bare-fixture alignment.
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41,
+          TestVdbeApi 57/57, TestVdbeMisc 45/45, TestVdbeMem 62/62,
+          TestVdbeAux 108/108, TestVdbeRecord 13/13, TestVdbeAgg
+          11/11, TestVdbeStr 23/23, TestVdbeBlob 13/13, TestVdbeSort
+          14/14, TestVdbeCursor 27/27, TestVdbeVtabExec 50/50,
+          TestExplainParity 2/10 unchanged (CREATE TABLE rows still
+          DIVERGE on placeholder vs UPDATE pattern), TestPager*,
+          TestBtreeCompat 337/337, TestPrintf 105/105, TestJson
+          434/434, TestJsonEach 50/50, TestTokenizer 127/127,
+          TestRegistration 19/19, TestExecGetTable 23/23, TestBackup
+          20/20, TestConfigHooks 54/54, TestInitShutdown 27/27,
+          TestUnlockNotify 14/14, TestLoadExt 20/20, TestAuthBuiltins
+          34/34.
+
+      Sub-progress 14 must lift the heavy gates that stop the
+      remaining 17 op-count rows: (i) `sqlite3ExprCodeIN` so
+      INDEX_IN / INDEX_IN_SUB / IPK_IN reach the BeginSubrtn / Once
+      / OpenEphemeral coroutine machinery (rows worth ~24..30 ops
+      vs Pascal's current 11), (ii) BETWEEN range-plan in
+      whereShortCut so IPK_RANGE picks SeekGE/SeekLE instead of
+      SCAN-with-residual, (iii) OR-shatter codegen in
+      `sqlite3WhereCodeOneLoopStart` for MULTI_OR (`a=5 OR a=7`
+      should hit the IN-promotion path as a virtual term — already
+      synthesized by exprAnalyze under `whereCombineDisjuncts`,
+      just not consumed by the SCAN fallback today), (iv) two-table
+      JOIN codegen so LEFT_JOIN / JOIN_WHERE move from the 3-op
+      Init/Halt/Goto stub to a real per-table cursor + Rewind/Next
+      nest.  The IPK_alias row's residual single-op delta (C=12
+      Pas=11) is also unwound with (i) since the underlying
+      difference is the IN/IPK-promotion gap.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

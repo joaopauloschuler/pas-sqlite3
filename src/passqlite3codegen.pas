@@ -4583,9 +4583,28 @@ begin
             sqlite3ReleaseTempReg(pParse, regFree1);
           done := True;
         end;
+      TK_COLUMN:
+        begin
+          { Minimal port of expr.c:5002..5088 — emit OP_Column for a
+            resolved column reference.  Skips EP_FixedCol /
+            iSelfTab<0 (CHECK constraint context) / partial-index
+            expression-shadowing arms; those land with the broader
+            wherecode.c port.  pExpr^.y.pTab is set by the resolver;
+            sqlite3ExprCodeGetColumnOfTable handles iColumn=-1 (rowid)
+            via OP_Rowid and ordinary columns via OP_Column. }
+          if (pExpr^.y.pTab <> nil) and (pExpr^.iTable >= 0) then
+          begin
+            sqlite3ExprCodeGetColumnOfTable(v, pExpr^.y.pTab,
+              pExpr^.iTable, pExpr^.iColumn, target);
+            done := True;
+          end else
+          begin
+            sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+            done := True;
+          end;
+        end;
     else
-      { TODO(Phase 6.9-bis): TK_COLUMN, TK_AGG_COLUMN,
-        TK_AND/TK_OR,
+      { TODO(Phase 6.9-bis): TK_AGG_COLUMN, TK_AND/TK_OR,
         TK_FUNCTION, TK_CASE, TK_IN, TK_EXISTS, TK_SELECT,
         TK_IF_NULL_ROW, … — land in subsequent vertical-slice
         sub-progresses.  C default arm semantics: assert
@@ -12300,7 +12319,11 @@ begin
     pLevel^.op := OP_Next;
     pLevel^.p1 := pLevel^.iTabCur;
     pLevel^.p2 := pLevel^.addrBody;
-    pLevel^.p5 := 0;
+    { pLevel^.p5 = SQLITE_STMTSTATUS_FULLSCAN_STEP — stmt-status counter
+      bump emitted on every iteration of a no-index scan (wherecode.c:2221
+      and 2579 both set this for the table-scan / index-scan tail).
+      Without it the FULL row's OP_Next disagrees with C on p5 only. }
+    pLevel^.p5 := SQLITE_STMTSTATUS_FULLSCAN_STEP;
   end;
 
   { Phase 6.9-bis 11g.2.f sub-progress 9 — per-row residual filter emission.
