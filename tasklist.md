@@ -193,12 +193,14 @@ Important: At the end of this document, please find:
 
   PASS rows: CREATE INDEX, CREATE UNIQUE INDEX, DROP INDEX IF EXISTS,
   BEGIN.  Step 1 (sqlite3RefillIndex port, commit `4c9fe6b`) flipped
-  the two CREATE INDEX rows.
+  the two CREATE INDEX rows.  Step 2 (2-phase schema-write port,
+  commit pending) closed Δ=11 on the three simple-CREATE rows and
+  Δ=11 on the composite-PK / WITHOUT-ROWID rows.
 
   DIVERGE rows + delta = (C ops − Pas ops):
 
-  - CREATE TABLE simple / typed / IF NOT EXISTS — Δ=12 each
-  - CREATE TABLE composite PK / WITHOUT ROWID — Δ=23 each
+  - CREATE TABLE simple / typed / IF NOT EXISTS — Δ=1 each
+  - CREATE TABLE composite PK / WITHOUT ROWID — Δ=12 each
   - DROP TABLE — Δ=22
 
   Root cause for CREATE TABLE rows: `emitSchemaRowInsert`
@@ -223,23 +225,30 @@ Important: At the end of this document, please find:
   Decomposition (next-agent picklist — each is committable in
   isolation and shrinks Δ by a known amount):
 
-    - [ ] **6.10 step 2** Port the 2-phase schema-write of
-      `sqlite3EndTable` (build.c:2884..2900): emit OP_Close, then the
-      NestedParse-equivalent `OpenWrite cur=1` + `SeekRowid` +
-      `Rowid` + `IsNull` + per-column `String8`/`Copy` + `MakeRecord
-      BBBDB` + `Delete` (p2=last-op-addr) + `Insert` chain.  Replaces
-      `emitSchemaRowInsert` (or branches it).  Closes Δ=11 on three
-      simple-CREATE rows; should also flip composite-PK / WITHOUT
-      ROWID partway.  Touch points: `passqlite3codegen.pas:19731` and
-      `:19831`.
+    - [X] **6.10 step 2** 2-phase schema-write of `sqlite3EndTable`
+      ported.  `sqlite3StartTable` now emits the placeholder
+      `OpenSchemaTable` + `NewRowid` + `Blob` (6-byte nullRow) +
+      `Insert(APPEND)` + `Close` (build.c:1378..1385); `sqlite3EndTable`
+      emits `OP_Close 0` (build.c:2806) followed by
+      `emitSchemaRowUpdate` — `Null/Noop/OpenWrite/SeekRowid/Rowid/
+      IsNull/String8 ×3/Copy/String8/MakeRecord BBBDB/Delete (p2=
+      OPFLAG_ISUPDATE|OPFLAG_ISNOOP)/Insert`.  CREATE INDEX path
+      retains the old `emitSchemaRowInsert` direct-emit (still PASSes).
+      Closed Δ=11 on three simple-CREATE rows and Δ=11 on composite-PK
+      / WITHOUT-ROWID rows.  Touch points: `passqlite3codegen.pas`
+      `sqlite3StartTable` (~19510), `emitSchemaRowUpdate` (~19790),
+      `sqlite3EndTable` schema-row block (~19990).
 
-    - [ ] **6.10 step 3** Re-verify whether `OP_SqlExec` (build.c:
-      2940..2944, gated on `TF_HasGenerated` in 3.53.0) needs to
-      emit unconditionally in the corpus.  3.45 system sqlite3 emits
-      `SqlExec PRAGMA integrity_check` for plain CREATE TABLE; in
-      3.53.0 the gate appears restricted to GENERATED columns.
-      Verify against the project's oracle (`src/libsqlite3.so`)
-      before adding any unconditional emission.  Closes Δ=0..1.
+    - [ ] **6.10 step 3** Add `OP_SqlExec PRAGMA "main".integrity_check
+      ('zN')` emission after `ParseSchema`.  Our oracle
+      (`src/libsqlite3.so`, built with `-DSQLITE_DEBUG
+      -DSQLITE_ENABLE_EXPLAIN_COMMENTS -DSQLITE_ENABLE_API_ARMOR`)
+      emits this op for plain CREATE TABLE — the `TF_HasGenerated`
+      gate in build.c:2941 is bypassed in this build configuration.
+      Replicate by emitting `OP_SqlExec p1=1 p2=0 p3=0 p4='PRAGMA
+      "main".integrity_check(''zName'')'` unconditionally after
+      `sqlite3VdbeAddParseSchemaOp` in `sqlite3EndTable`.  Closes
+      the remaining Δ=1 on the three simple-CREATE rows → all PASS.
 
     - [ ] **6.10 step 4** Port `sqlite3CodeDropTable` pre-Destroy
       schema scan (build.c:3315..3445): the loop that walks

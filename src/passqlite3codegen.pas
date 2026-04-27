@@ -19368,6 +19368,9 @@ const
     SQLITE_CREATE_VIEW,  SQLITE_CREATE_TEMP_VIEW);
   SQLITE_MAX_FILE_FORMAT = 4;          { sqliteInt.h:692 }
   TF_Imposter            = u32($00020000); { sqliteInt.h:2499 }
+  { nullRow[] is an OP_Record encoding of a 5-column row of NULLs:
+    header-length=6 followed by 5 type-bytes (all 0 = NULL). }
+  nullRow: array[0..5] of Byte = (6, 0, 0, 0, 0, 0);
 label
   begin_table_error;
 var
@@ -19380,7 +19383,7 @@ var
   iDb: i32;
   pName: PToken;
   addr1, fileFormat: i32;
-  reg2, reg3: i32;
+  reg1, reg2, reg3: i32;
   authCode: i32;
 begin
   zName := nil;
@@ -19486,27 +19489,14 @@ begin
   pTable^.nRowLogEst := 200;       { = sqlite3LogEst(1048576) }
   pParse^.pNewTable := pTable;
 
-  { build.c:1327..1385 — schema-cookie + CreateBtree.
+  { build.c:1327..1385 — schema-cookie + CreateBtree + placeholder Insert.
 
-    Phase 6.9-bis 11g.2.f sub-progress 8: the upstream C reference here
-    emits an OP_OpenWrite + OP_NewRowid + OP_Blob (5 NULL placeholder
-    record) + OP_Insert + OP_Close sequence whose row contents are then
-    overwritten at step time by the schema-row UPDATE that
-    sqlite3EndTable emits via sqlite3NestedParse.  In this port
-    sqlite3Update is still a Phase 6 skeleton (codegen.pas:15162) that
-    emits zero ops, so the placeholder row would never be filled in,
-    OP_ParseSchema would see NULL sql / NULL rootpage, and the
-    schema-cache round-trip would always corrupt-out.
-
-    Pragmatic deviation: drop the placeholder + UPDATE pattern entirely.
-    StartTable now just runs the file-format check and OP_CreateBtree
-    (which fills regRoot at step time).  EndTable emits a single direct
-    schema-row INSERT with all five real columns built from the
-    in-memory Table object.  This is observably equivalent — the row
-    that lands in sqlite_master is byte-identical to what the C
-    placeholder + UPDATE pattern produces — but skips the UPDATE
-    dependency.  When sqlite3Update is eventually ported, this can be
-    re-aligned to the C structure without observable behaviour change. }
+    Phase 6.10 step 2: 2-phase schema write.  StartTable emits the
+    placeholder OpenSchemaTable + NewRowid + Blob + Insert(APPEND) +
+    Close pattern; EndTable then SeekRowids to the placeholder, deletes
+    it, and inserts the real row in its place.  This matches the C
+    bytecode op-by-op so TestExplainParity can drive CREATE TABLE rows
+    to PASS. }
   if db^.init.busy = 0 then begin
     v := sqlite3GetVdbe(pParse);
     if v <> nil then begin
@@ -19514,6 +19504,8 @@ begin
       if isVirtual <> 0 then
         sqlite3VdbeAddOp0(v, OP_VBegin);
 
+      Inc(pParse^.nMem); reg1 := pParse^.nMem;
+      pParse^.u1.cr.regRowid := reg1;
       Inc(pParse^.nMem); reg2 := pParse^.nMem;
       pParse^.u1.cr.regRoot := reg2;
       Inc(pParse^.nMem); reg3 := pParse^.nMem;
@@ -19535,8 +19527,16 @@ begin
         pParse^.u1.cr.addrCrTab :=
           sqlite3VdbeAddOp3(v, OP_CreateBtree, iDb, reg2, BTREE_INTKEY);
 
-      { regRowid set to 0 — EndTable allocates a fresh rowid register. }
-      pParse^.u1.cr.regRowid := 0;
+      { Placeholder Insert (build.c:1378..1385).  6-byte nullRow blob
+        encodes a record header for a 5-column row with all NULLs:
+        header-length 6, then five 0x00 type bytes. }
+      sqlite3OpenSchemaTable(pParse, iDb);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, 0, reg1);
+      sqlite3VdbeAddOp4(v, OP_Blob, 6, reg3, 0, PAnsiChar(@nullRow[0]),
+                        P4_STATIC);
+      sqlite3VdbeAddOp3(v, OP_Insert, 0, reg3, reg1);
+      sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+      sqlite3VdbeAddOp0(v, OP_Close);
     end;
   end else if (db^.init.flags and $02) <> 0 then begin
     { imposterTable bit (Tsqlite3InitInfo.flags bits 1..2) — fast path
@@ -19728,18 +19728,12 @@ begin
     i32(1 + u32(db^.aDb[iDb].pSchema^.schema_cookie)));
 end;
 
-{ emitSchemaRowInsert — pragmatic helper for sub-progress 8 (Phase 6.9-bis
-  11g.2.f).  Emits the bytecode that writes a single sqlite_schema row from
-  the in-memory Table object: OP_OpenWrite cursor 0, OP_String8 for type /
-  name / tbl_name / sql into 4 of a 5-register contiguous block, OP_SCopy
-  the rootpage register into the 4th slot, OP_NewRowid, OP_MakeRecord,
-  OP_Insert (P5=OPFLAG_APPEND), OP_Close.
-
-  zStmt is allocated by the caller via sqlite3MPrintf; its ownership
-  transfers to the OP_String8's P4_DYNAMIC slot, so the caller MUST NOT
-  free it.  zType is a static literal ('table' / 'view' / 'index' /
-  'trigger') and is passed P4_STATIC.  zName is duplicated via
-  sqlite3DbStrDup so the bytecode owns its own copy. }
+{ emitSchemaRowInsert — direct-emit helper used by CREATE INDEX.
+  Emits OpenSchemaTable + 5 column registers + NewRowid + MakeRecord +
+  Insert(P5=APPEND|USESEEKRESULT).  Kept for the CREATE INDEX path
+  (build.c:4460), where this op shape coincidentally matches the C
+  reference's emission and passes TestExplainParity.  CREATE TABLE
+  uses emitSchemaRowUpdate instead (Phase 6.10 step 2). }
 procedure emitSchemaRowInsert(pParse: PParse; v: PVdbe; iDb: i32;
   zType: PAnsiChar; zName: PAnsiChar; zTblName: PAnsiChar;
   regRoot: i32; zStmt: PAnsiChar);
@@ -19755,59 +19749,116 @@ begin
 
   sqlite3OpenSchemaTable(pParse, iDb);
 
-  { Reserve a rowid register first so the C reference layout matches:
-    nMem advances by 1 (rowid lives at iMem+1 = nMem after the bump),
-    then by 5 for the type/name/tbl_name/SCopy-target/sql block.
-    NestedParse in C uses an analogous shape: rowid lands at the slot
-    immediately after the rootpage (already iMem), and the 5-column
-    record body comes next. }
   Inc(pParse^.nMem); regRowid := pParse^.nMem;
   regBase := pParse^.nMem + 1;
   pParse^.nMem := pParse^.nMem + 5;
   regOut   := pParse^.nMem + 1;
   Inc(pParse^.nMem);
 
-  { regBase+0 = type (static literal) }
   sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 0, 0, zType, P4_STATIC);
 
-  { regBase+1 = name (dup'd into the bytecode's lifetime). }
   zNameDup := sqlite3DbStrDup(db, zName);
-  sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 1, 0,
-                    zNameDup, P4_DYNAMIC);
+  sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 1, 0, zNameDup, P4_DYNAMIC);
 
-  { regBase+2 = tbl_name.  For CREATE TABLE this is the same as name;
-    for CREATE INDEX it is the underlying table name. }
   if zTblName = nil then zTblName := zName;
   zTblDup := sqlite3DbStrDup(db, zTblName);
-  sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 2, 0,
-                    zTblDup, P4_DYNAMIC);
+  sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 2, 0, zTblDup, P4_DYNAMIC);
 
-  { regBase+3 = rootpage (SCopy from regRoot). }
   sqlite3VdbeAddOp2(v, OP_SCopy, regRoot, regBase + 3);
 
-  { regBase+4 = sql (transferring zStmt ownership into P4_DYNAMIC). }
   if zStmt = nil then
     sqlite3VdbeAddOp2(v, OP_Null, 0, regBase + 4)
   else
-    sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 4, 0,
-                      zStmt, P4_DYNAMIC);
-
-  { regRowid / regOut allocated up-front (above) to mirror the C layout
-    where rowid lives just past iMem and the MakeRecord output trails
-    the 5-column block. }
+    sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 4, 0, zStmt, P4_DYNAMIC);
 
   sqlite3VdbeAddOp2(v, OP_NewRowid, 0, regRowid);
   sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, 5, regOut);
   sqlite3VdbeAddOp3(v, OP_Insert, 0, regOut, regRowid);
   sqlite3VdbeChangeP5(v, OPFLAG_APPEND or OPFLAG_USESEEKRESULT);
+end;
 
-  { Skip sqlite3ReleaseTempReg for regOut/regRowid: NestedParse's regs are
-    not surfaced as OP_ReleaseReg in the reference C output, and emitting
-    them here breaks explain-parity.  These regs live for the rest of the
-    statement; the small extra-reg cost is acceptable.
+{ emitSchemaRowUpdate — Phase 6.10 step 2.
+  Emit the schema-row UPDATE-equivalent bytecode that replaces the
+  placeholder row inserted by sqlite3StartTable.  Mirrors the bytecode
+  that sqlite3NestedParse(UPDATE %Q.sqlite_master ... WHERE rowid=#%d)
+  produces when run through sqlite3Update (which is still skeleton in
+  this port — so we hand-emit the same op sequence).
 
-    OP_Close cursor 0 omitted: C's NestedParse path leaves the schema-table
-    cursor open; OP_Halt auto-closes it. }
+  Sequence (matches build.c + update.c via PREUPDATE_HOOK build):
+    OP_Null    0  r4 r5         ; clear regNewRec, regCurRowid
+    OP_Noop    2  0  4          ; placeholder marker
+    OP_OpenWrite cur=N, root=1, p3=iDb, p4=5
+    OP_SeekRowid cur=N, addrIsNull, regRowid
+    OP_Rowid   cur=N, regCurRowid
+    OP_IsNull  regCurRowid, addrAfterInsert
+    OP_String8 r6=zType / r7=zName / r8=zTblName
+    OP_Copy    regRoot -> r9
+    OP_String8 r10=zStmt (or Null)
+    OP_MakeRecord regBase, 5, regNewRec, P4='BBBDB'
+    OP_Delete  cur=N, p2=OPFLAG_ISUPDATE|OPFLAG_ISNOOP, regCurRowid
+    OP_Insert  cur=N, regNewRec, regCurRowid
+    addrAfterInsert resolved here
+}
+procedure emitSchemaRowUpdate(pParse: PParse; v: PVdbe; iDb: i32;
+  zType: PAnsiChar; zName: PAnsiChar; zTblName: PAnsiChar;
+  regRoot: i32; zStmt: PAnsiChar; regRowid: i32);
+const
+  AFFINITY_BBBDB: array[0..5] of AnsiChar = ('B','B','B','D','B',#0);
+var
+  db:        PTsqlite3;
+  cur:       i32;
+  regNewRec: i32;
+  regCurRow: i32;
+  regBase:   i32;
+  addrSeek:  i32;
+  addrIsN:   i32;
+  zNameDup:  PAnsiChar;
+  zTblDup:   PAnsiChar;
+begin
+  db := pParse^.db;
+
+  cur := pParse^.nTab; Inc(pParse^.nTab);
+
+  Inc(pParse^.nMem); regNewRec := pParse^.nMem;
+  Inc(pParse^.nMem); regCurRow := pParse^.nMem;
+
+  sqlite3VdbeAddOp3(v, OP_Null, 0, regNewRec, regCurRow);
+  sqlite3VdbeAddOp3(v, OP_Noop, 2, 0, 4);
+  sqlite3VdbeAddOp4Int(v, OP_OpenWrite, cur, SCHEMA_ROOT, iDb, 5);
+
+  addrSeek := sqlite3VdbeAddOp3(v, OP_SeekRowid, cur, 0, regRowid);
+  sqlite3VdbeAddOp2(v, OP_Rowid, cur, regCurRow);
+  sqlite3VdbeJumpHere(v, addrSeek);  { SeekRowid jumps to the IsNull below }
+  addrIsN := sqlite3VdbeAddOp1(v, OP_IsNull, regCurRow);
+
+  { 5 contiguous regs r6..r10 for the schema-row columns. }
+  regBase := pParse^.nMem + 1;
+  pParse^.nMem := pParse^.nMem + 5;
+
+  sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 0, 0, zType, P4_STATIC);
+
+  zNameDup := sqlite3DbStrDup(db, zName);
+  sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 1, 0, zNameDup, P4_DYNAMIC);
+
+  if zTblName = nil then zTblName := zName;
+  zTblDup := sqlite3DbStrDup(db, zTblName);
+  sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 2, 0, zTblDup, P4_DYNAMIC);
+
+  sqlite3VdbeAddOp2(v, OP_Copy, regRoot, regBase + 3);
+
+  if zStmt = nil then
+    sqlite3VdbeAddOp2(v, OP_Null, 0, regBase + 4)
+  else
+    sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 4, 0, zStmt, P4_DYNAMIC);
+
+  sqlite3VdbeAddOp4(v, OP_MakeRecord, regBase, 5, regNewRec,
+                    PAnsiChar(@AFFINITY_BBBDB[0]), P4_STATIC);
+
+  sqlite3VdbeAddOp3(v, OP_Delete, cur,
+                    OPFLAG_ISUPDATE or OPFLAG_ISNOOP, regCurRow);
+  sqlite3VdbeAddOp3(v, OP_Insert, cur, regNewRec, regCurRow);
+
+  sqlite3VdbeJumpHere(v, addrIsN);
 end;
 
 { sqlite3EndTable — port of build.c:2637.
@@ -19936,12 +19987,13 @@ begin
                               [zType2, n, pParse^.sNameToken.z]);
     end;
 
-    { Direct schema-row INSERT — see banner in sqlite3StartTable for the
-      sub-progress 8 deviation rationale.  Build the 5-column record
-      (type, name, tbl_name, rootpage, sql) into a contiguous register
-      block, then OpenWrite/NewRowid/MakeRecord/Insert/Close. }
-    emitSchemaRowInsert(pParse, v, iDb, zType, pTab^.zName,
-                        pTab^.zName, pParse^.u1.cr.regRoot, zStmt);
+    { Phase 6.10 step 2: emit OP_Close 0 (build.c:2806), then the
+      UPDATE-equivalent bytecode that overwrites the placeholder row
+      sqlite3StartTable inserted into sqlite_schema. }
+    sqlite3VdbeAddOp1(v, OP_Close, 0);
+    emitSchemaRowUpdate(pParse, v, iDb, zType, pTab^.zName,
+                        pTab^.zName, pParse^.u1.cr.regRoot, zStmt,
+                        pParse^.u1.cr.regRowid);
     { zStmt ownership transferred to the OP_String8 P4_DYNAMIC slot. }
 
     sqlite3ChangeCookie(pParse, iDb);
