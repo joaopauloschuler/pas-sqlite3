@@ -156,7 +156,7 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 7 PASS / 3
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 9 PASS / 1
     DIVERGE / 0 ERROR (corpus = 10); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
@@ -187,21 +187,18 @@ Important: At the end of this document, please find:
     build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
-  Current Status (2026-04-27): **7 PASS / 3 DIVERGE / 0 ERROR**
-  (composite-PK and WITHOUT-ROWID rows are 1 op away from PASS;
-  DROP TABLE remains Δ=22 pending step 4).
+  Current Status (2026-04-27): **9 PASS / 1 DIVERGE / 0 ERROR**
+  (only DROP TABLE remains Δ=22 pending step 4).
   Drive to all-PASS, then expand corpus to DML / SELECT / pragma /
   trigger forms (same exclusion list as TestParser).  Promote from
   report-only to hard gate when the full corpus is green.
 
-  PASS rows: CREATE TABLE simple / typed / IF NOT EXISTS, CREATE INDEX,
-  CREATE UNIQUE INDEX, DROP INDEX IF EXISTS, BEGIN.  Step 3 (Explain +
-  ReleaseReg emission, OPFLAG_ISNOOP Delete removal in
-  emitSchemaRowUpdate) flipped the three simple-CREATE rows.
+  PASS rows: CREATE TABLE simple / typed / IF NOT EXISTS / composite PK
+  / WITHOUT ROWID, CREATE INDEX, CREATE UNIQUE INDEX, DROP INDEX IF
+  EXISTS, BEGIN.
 
   DIVERGE rows + delta = (C ops − Pas ops):
 
-  - CREATE TABLE composite PK / WITHOUT ROWID — Δ=11 each
   - DROP TABLE — Δ=22
 
   Root cause for DROP TABLE: Pas-side elides the C-side
@@ -246,27 +243,16 @@ Important: At the end of this document, please find:
       `OP_DropTable` p4=table-name + `String8` literal emissions.
       Closes Δ=22 on the DROP TABLE row.
 
-    - [ ] **6.10 step 5** Composite-PK / WITHOUT-ROWID auto-index
-      bytecode pass — the `convertToWithoutRowidTable` helper
-      (build.c:1830..2090).  Closes Δ=11 on those two rows once
-      step 2 is in.
-      Sub-progress (2026-04-27): foundational pieces landed —
-      `sqlite3AddColumn` standard-typename detection (sets eCType so
-      INTEGER PRIMARY KEY is detected), faithful `sqlite3AddPrimaryKey`
-      port with `makeColumnPartOfPrimaryKey` / `sqlite3StringToId`
-      helpers, `sqlite3CreateIndex` 1-column pList synthesis from the
-      last-added Column (build.c:4130..4147), `emitSchemaRowInsert`
-      now allocates a fresh cursor from `pParse^.nTab` (so the
-      auto-index INSERT after the StartTable placeholder uses cursor 1
-      not 0), and `sqlite3EndTable` back-patches the
-      placeholder OP_CreateBtree p3 from BTREE_INTKEY (1) to
-      BTREE_BLOBKEY (2) for WITHOUT ROWID (build.c:2376..2383).
-      Δ shrunk: composite-PK and WITHOUT-ROWID rows now diverge by
-      a single op each (placeholder Noop register-number ripple at
-      op[24] / OP_Noop→OP_Goto back-patch at op[11]).  Full
-      `convertToWithoutRowidTable` (PK index synthesis, column
-      reorder, NOT NULL propagation, OP_Noop→OP_Goto patch) still
-      pending.
+    - [X] **6.10 step 5** Composite-PK / WITHOUT-ROWID auto-index
+      bytecode pass — `convertToWithoutRowidTable` minimal viable
+      (build.c:2376..2446) landed: BTREE_INTKEY→BTREE_BLOBKEY p3
+      patch, OP_Noop→OP_Goto patch on the auto-index PK skip via
+      sqlite3PrimaryKeyIndex(pTab) lookup, and contextual
+      `OP_Noop p1=cur+1 p3=regNewRec` placeholder marker in
+      `emitSchemaRowUpdate`.  Composite-PK and WITHOUT-ROWID rows
+      flip to PASS.  Full helper (column reorder, repeated-PK-col
+      collapse, UNIQUE-index rewrite to include PK key cols) is
+      still deferred but not on any current corpus row.
 
     - [ ] **6.10 step 6** Once 4/6 → all-PASS, expand corpus with
       DML / SELECT / pragma / trigger forms and promote from

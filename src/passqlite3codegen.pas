@@ -19978,7 +19978,9 @@ begin
   Inc(pParse^.nMem); regKey := pParse^.nMem;
 
   sqlite3VdbeAddOp3(v, OP_Null, 0, regNewRec, regCurRow);
-  sqlite3VdbeAddOp3(v, OP_Noop, 2, 0, 4);
+  { Placeholder marker the C oracle emits before OpenWrite of sqlite_schema:
+    p1 = (cursor about to open)+1, p3 = regNewRec. }
+  sqlite3VdbeAddOp3(v, OP_Noop, cur + 1, 0, regNewRec);
   sqlite3VdbeAddOp4Int(v, OP_OpenWrite, cur, SCHEMA_ROOT, iDb, 5);
 
   { OP_Explain — comment-style scan-description op the oracle emits via
@@ -20055,6 +20057,7 @@ var
   zType2:  PAnsiChar;
   zStmt:   PAnsiChar;
   zReparse: PAnsiChar;
+  pPk2:    PIndex2;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -20109,14 +20112,25 @@ begin
   if (tabOpts and TF_WithoutRowid) <> 0 then begin
     pTab^.tabFlags := pTab^.tabFlags or TF_WithoutRowid or TF_NoVisibleRowid;
     { Back-patch the placeholder OP_CreateBtree from BTREE_INTKEY (1) to
-      BTREE_BLOBKEY (2) — port of build.c:2376..2383.  The full
-      convertToWithoutRowidTable transformation (PK index synthesis,
-      column reorder, NOT NULL propagation) remains 6.10 step 5; this
-      single-line p3 patch closes the corresponding TestExplainParity
-      DIVERGE at op[5]. }
+      BTREE_BLOBKEY (2) — port of build.c:2376..2383. }
     if pParse^.u1.cr.addrCrTab <> 0 then
       sqlite3VdbeChangeP3(sqlite3GetVdbe(pParse),
                           pParse^.u1.cr.addrCrTab, 2 { BTREE_BLOBKEY });
+    { Bypass creation of the PRIMARY KEY btree and its sqlite_schema
+      entry — port of build.c:2443..2446.  The PK index was emitted by
+      sqlite3AddPrimaryKey → sqlite3CreateIndex, which left an OP_Noop
+      placeholder at pPk^.tnum followed by the OP_CreateBtree +
+      schema-row INSERT sequence; converting that Noop to OP_Goto jumps
+      over the whole sub-sequence so the WITHOUT-ROWID PK shares the
+      table's root page (set just below: pPk^.tnum := pTab^.tnum). }
+    if (db^.init.busy = 0) then begin
+      v := sqlite3GetVdbe(pParse);
+      pPk2 := sqlite3PrimaryKeyIndex(pTab);
+      if (v <> nil) and (pPk2 <> nil) and (pPk2^.tnum > 0) then begin
+        sqlite3VdbeChangeOpcode(v, i32(pPk2^.tnum), OP_Goto);
+        pPk2^.tnum := u32(pTab^.tnum);
+      end;
+    end;
   end;
 
   iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
