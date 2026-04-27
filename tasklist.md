@@ -40,32 +40,6 @@ Important: At the end of this document, please find:
       48–49.  `sqlite3CompleteInsertion` still a stub but only used by
       Update productive tail.
 
-- [X] **6.9-bis 11g.2.c** Port `whereexpr.c` (~1944 lines) —
-    WHERE-clause term decomposition + analysis.  Public surface:
-    `sqlite3WhereSplit`, `sqlite3WhereClauseInit`,
-    `sqlite3WhereClauseClear`, `sqlite3WhereExprAnalyze`,
-    `sqlite3WhereTabFuncArgs`, `sqlite3WhereFindTerm`.  Internal:
-    `exprAnalyze`, `exprAnalyzeAll`, `exprAnalyzeOrTerm`, `whereSplit`,
-    `markTermAsChild`, `whereCombineDisjuncts`, `whereNthSubterm`,
-    `transferJoinMarkings`, `isLikeOrGlob`, `whereCommuteOperator`.
-    Gate: extend `TestWhereSimple.pas` with multi-term cases
-    (a=1 AND b=2, a IN (1,2,3), a BETWEEN 1 AND 5).
-
-- [X] **6.9-bis 11g.2.d** Planner core in `where.c` (~5000 lines):
-    `whereLoopAddBtree*`, `whereLoopAddVirtual*`, `whereLoopAddOr`,
-    `whereLoopAddAll`, `wherePathSolver` + `computeMxChoice`,
-    `whereRangeScanEst` (no-STAT4 tail), and ORDER BY consumption all
-    ported.  `TestWherePlanner` 675/675; multi-table corpus rows
-    (LEFT_JOIN, JOIN_WHERE, EXISTS_SUB, NOT_EXISTS) PASS in
-    TestWhereCorpus.  vtab `xBestIndex`-style costing deferred until
-    vtab corpus is exercised.
-- [X] **6.9-bis 11g.2.e** `wherecode.c` (~2945 lines) per-loop
-    inner-body codegen — `sqlite3WhereCodeOneLoopStart` public surface
-    (prologue, IPK rowid-EQ/RANGE, INDEX_EQ/RANGE, OR-loop, scan tail,
-    LEFT JOIN null-row, deferred-seek, WITHOUT-ROWID gating,
-    EXPLAIN/scan-status hooks) plus leaf helpers ported.
-    `TestWherePlanner` green.  `sqlite3WhereRightJoinLoop` lands with
-    any future RIGHT JOIN corpus expansion.
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix
     (single rowid-EQ, multi-AND, OR-decomposed, LIKE, IN-subselect,
@@ -94,42 +68,6 @@ Important: At the end of this document, please find:
     under 6.10 step 4.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
-  Scaffold landed; corpus expanded to 126 rows (DDL + SELECT/DML/txn +
-  SAVEPOINT/RELEASE + INSERT DEFAULT VALUES + multi-AND + multi-col
-  rowid-EQ + per-row arith / negate / concat + transaction synonyms +
-  comparison ops + literal-arith + col aliases + multi-col index +
-  multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **1004 PASS / 1 DIVERGE / 0 ERROR**
-  (corpus = 1005).  Drive to all-PASS, then expand corpus further
-  (pragma / trigger / multi-table SELECT / aggregates / joins) and
-  promote from report-only to hard gate.
-
-  DIVERGE rows + delta = (C ops − Pas ops):
-
-  - DROP TABLE — Δ=21 (step 4)
-
-  Root cause for DROP TABLE Δ=21 (re-analysis 2026-04-27 from
-  bytecode dump):
-    (a) Pas opens cursor 0 with `OP_OpenRead` and emits a 2-pass
-        RowSet delete loop for the sqlite_schema scrub
-        (`RowSetAdd` during scan, then `OpenWrite` + `RowSetRead` /
-        `NotExists` / `Delete` / `Goto` cleanup), where C uses a
-        single `OP_OpenWrite` and inline `Delete` during the scan
-        (~+5 Pas ops vs C).  Tracked under 11g.2.f open follow-on:
-        `sqlite3DeleteFrom` ONEPASS_MULTI promotion for non-rowid-EQ
-        scans.
-    (b) Pas elides the destroyRootPage autovacuum follow-on
-        (`Null` / `OpenEphemeral` / `IfNot` / `OpenRead` / `Explain`
-        / `Rewind` / `Column` / `ReleaseReg` / `Ne` / `ReleaseReg` /
-        `Rowid` / `Insert` / `Next` / `OpenWrite` / `Rewind` /
-        `Rowid` / `NotExists` / `Column`×3 / `Integer` / `Column` /
-        `MakeRecord` / `Insert` / `Next` / `ReleaseReg` — ~26 ops)
-        because `destroyRootPage` calls `sqlite3NestedParse(... UPDATE
-        sqlite_schema SET rootpage=... WHERE ... AND rootpage=...)`
-        and productive `sqlite3Update` is still skeleton-only
-        (11g.2.f open follow-on).
-  Net delta: −26 + 5 = −21 ✓.
-
   Decomposition:
     - [ ] **6.10 step 4** Port `sqlite3CodeDropTable` pre-Destroy
       schema scan (build.c:3315..3445): the loop that walks
@@ -201,72 +139,33 @@ Important: At the end of this document, please find:
           DropTable's `Inc(suppressErr)` guard left nErr=1 and
           `sqlite3_prepare_v2` returned SQLITE_ERROR with a nil stmt.
           New corpus row added: PASS at 5 ops.
+  
+  [ ] **6.10** Drop Table - DIVERGE rows + delta = (C ops − Pas ops):
 
-- [X] **6.10c** Bug — `sqlite3OomFault` / `sqlite3OomClear` were stubs
-  in `passqlite3util.pas`, so an OOM in `growOpArray` (e.g. when
-  `SQLITE_LIMIT_VDBE_OP` was unset on a hand-crafted db) left
-  `db->mallocFailed` clear.  `sqlite3VdbeAddOp4`'s subsequent
-  `ChangeP4` then dereferenced `aOp[nOp-1]` on a nil/zero-sized
-  array → `EAccessViolation`.  Symptom surfaced in TestParser /
-  TestParserSmoke on the first AddOp4-with-P4_DYNAMIC path
-  (`SAVEPOINT`).  Fix: ported `sqlite3OomFault` / `sqlite3OomClear`
-  from malloc.c:827..861 (sets mallocFailed, interrupts running
-  VDBEs, DisableLookaside; clear path restores szTrue once
-  `nVdbeExec=0`).  Test fixtures also updated to seed
-  `SQLITE_LIMIT_VDBE_OP`.  TestParser now 45/45 (was crashing).
+  - DROP TABLE — Δ=21 (step 4)
 
-- [X] **6.10b** Bug — `INSERT INTO <tbl> DEFAULT VALUES` raised
-  EAccessViolation in `sqlite3Insert` (passqlite3codegen.pas:18974)
-  because the single-row VALUES path dereferenced `pList^.nExpr`
-  without guarding the `pList=nil` ⇔ DEFAULT VALUES case.  Fixed by
-  mirroring insert.c:1213..1215: when pList is nil set nColumn=0 and
-  emit `OP_Null` for each column slot so the subsequent OP_MakeRecord
-  has well-defined inputs.  Bytecode-parity with the C reference
-  (which hoists each default into the OP_Init prologue via
-  `sqlite3ExprCodeFactorable`) is still off by a few ops; tracked as
-  the new step-6 follow-on below.
+  Root cause for DROP TABLE Δ=21 (re-analysis 2026-04-27 from
+  bytecode dump):
+    (a) Pas opens cursor 0 with `OP_OpenRead` and emits a 2-pass
+        RowSet delete loop for the sqlite_schema scrub
+        (`RowSetAdd` during scan, then `OpenWrite` + `RowSetRead` /
+        `NotExists` / `Delete` / `Goto` cleanup), where C uses a
+        single `OP_OpenWrite` and inline `Delete` during the scan
+        (~+5 Pas ops vs C).  Tracked under 11g.2.f open follow-on:
+        `sqlite3DeleteFrom` ONEPASS_MULTI promotion for non-rowid-EQ
+        scans.
+    (b) Pas elides the destroyRootPage autovacuum follow-on
+        (`Null` / `OpenEphemeral` / `IfNot` / `OpenRead` / `Explain`
+        / `Rewind` / `Column` / `ReleaseReg` / `Ne` / `ReleaseReg` /
+        `Rowid` / `Insert` / `Next` / `OpenWrite` / `Rewind` /
+        `Rowid` / `NotExists` / `Column`×3 / `Integer` / `Column` /
+        `MakeRecord` / `Insert` / `Next` / `ReleaseReg` — ~26 ops)
+        because `destroyRootPage` calls `sqlite3NestedParse(... UPDATE
+        sqlite_schema SET rootpage=... WHERE ... AND rootpage=...)`
+        and productive `sqlite3Update` is still skeleton-only
+        (11g.2.f open follow-on).
+  Net delta: −26 + 5 = −21 ✓.
 
-    - [X] **6.10 step 8** Factorable-constant function-call hoist
-      on no-FROM SELECT.  Three-line fix in three call sites:
-      (a) TK_FUNCTION arm of `sqlite3ExprCodeTarget`: when
-      `ConstFactorOk(pParse) && sqlite3ExprIsConstantNotJoin(pExpr)`,
-      route through `sqlite3ExprCodeRunJustOnce(-1)` (mirrors
-      expr.c:5343..5349); (b) `emitScalarFunctionCall` constant-arg
-      coding loop now gates the `RunJustOnce` call on
-      `PARSEFLAG_OkConstFactor`, so the recursive emit (with
-      okConstFactor cleared) falls back to inline `sqlite3ExprCode`
-      (mirrors `sqlite3ExprCodeExprList`'s `ConstFactorOk` strip);
-      (c) no-FROM SELECT result-column emission switched from raw
-      `sqlite3ExprCode` to `sqlite3ExprCodeTarget` + manual
-      `OP_Copy` (matches selectInnerLoop's `ECEL_DUP` flag, which
-      makes the trailing copy `OP_Copy` instead of `OP_SCopy`).
-      `SELECT length('hi');` flips to PASS at 9 ops.
-      expanded corpus all closed:
-        * [X] `sqlite3Select` no-FROM fast path — `SELECT <expr-list>;`
-          with empty pSrc emits OP_Explain + per-col sqlite3ExprCode
-          + OP_ResultRow.  SELECT literal flipped to PASS.
-        * [X] `sqlite3SelectExpand` star-expansion (select.c:830..980,
-          plain TK_ASTERISK only — T.\* form deferred): replaces top-
-          level `*` with one TK_COLUMN per visible (non-HIDDEN /
-          non-VIRTUAL) FROM-table column, populates colUsed.  Also
-          fixed a latent double-advance bug in
-          `sqlite3GenerateColumnNames` (Inc(items) plus items[i] index
-          stepped by 2 — masked while every PASS row had nResultCol=1).
-          SELECT \* scan flipped to PASS.
-        * [X] OP_Explain emission landed in `sqlite3WhereExplainOneScan`
-          (lower path + new multi-loop path of `sqlite3WhereBegin`).
-        * [X] `sqlite3DeleteFrom` rowid-EQ → ONEPASS_SINGLE: when
-          `sqlite3WhereBegin` sees `WHERE_ONEPASS_DESIRED` and the
-          plan picked WHERE_ONEROW, it sets `pWInfo^.eOnePass =
-          ONEPASS_SINGLE`, populates `aiCurOnePass[0]`, and opens
-          the cursor with OP_OpenWrite.  DELETE rowid EQ flipped
-          to PASS (in-loop Delete, no ROWSET detour).  Spurious
-          memCnt-driven AddImm / FkCheck / ResultRow path closed by
-          fixing the wrong default-flags bit in `passqlite3main.pas:507`
-          (HI(0x00001)=SQLITE_CountRows was being set in place of the
-          intended LO(0x40)=ShortColNames).
-        * [X] False-WHERE-Term-Bypass spurious-fire on `rowid=5` —
-          fixed by porting a productive `sqlite3ResolveExprNames`.
 
 ---
 
