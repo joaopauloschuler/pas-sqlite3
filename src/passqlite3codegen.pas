@@ -5642,6 +5642,73 @@ begin
   Result := r2;
 end;
 
+{ exprCodeBetween — port of expr.c:6058..6098 (Phase 6.9-bis 11g.2.f
+  sub-progress 25).  Code a TK_BETWEEN expression by synthesising a
+  stack-local "(x>=lo) AND (x<=hi)" expression tree and dispatching
+  it through ExprIfTrue / ExprIfFalse.  Without this, TK_BETWEEN falls
+  into the default sqlite3ExprCodeTarget arm which emits OP_Null and
+  the residual jump always fires — producing 0-row results for any
+  unindexed BETWEEN predicate.  Bug surfaced by TestWhereCorpus row
+  COL_BETWEEN (`SELECT a FROM t WHERE b BETWEEN 5 AND 10`).
+
+  Vector BETWEEN (where x is a TK_VECTOR / TK_SELECT) is deferred to
+  the eventual exprCodeVector port — the corpus does not exercise it.
+
+  jumpIsTrue selects the dispatch direction:
+    * False ⇒ jump to dest when (lo<=x<=hi) is FALSE — used by
+      sqlite3ExprIfFalse.  Equivalent to xJump=ExprIfFalse in C.
+    * True  ⇒ jump to dest when (lo<=x<=hi) is TRUE  — used by
+      sqlite3ExprIfTrue.  Equivalent to xJump=ExprIfTrue in C. }
+procedure exprCodeBetween(pParse: PParse; pExpr: PExpr; dest: i32;
+  jumpIsTrue: Boolean; jumpIfNull: i32);
+var
+  exprAnd:   TExpr;
+  compLeft:  TExpr;
+  compRight: TExpr;
+  regFree1:  i32;
+  pDel:      PExpr;
+  db:        PTsqlite3;
+  rPDel:     i32;
+begin
+  regFree1 := 0;
+  db := pParse^.db;
+
+  Assert(ExprUseXList(pExpr));
+  Assert(pExpr^.x.pList <> nil);
+  Assert(pExpr^.x.pList^.nExpr = 2);
+
+  FillChar(compLeft,  SizeOf(compLeft),  0);
+  FillChar(compRight, SizeOf(compRight), 0);
+  FillChar(exprAnd,   SizeOf(exprAnd),   0);
+
+  pDel := sqlite3ExprDup(db, pExpr^.pLeft, 0);
+  if db^.mallocFailed = 0 then
+  begin
+    exprAnd.op    := TK_AND;
+    exprAnd.pLeft := @compLeft;
+    exprAnd.pRight:= @compRight;
+    compLeft.op   := TK_GE;
+    compLeft.pLeft:= pDel;
+    compLeft.pRight := ExprListItems(pExpr^.x.pList)[0].pExpr;
+    compRight.op  := TK_LE;
+    compRight.pLeft := pDel;
+    compRight.pRight := ExprListItems(pExpr^.x.pList)[1].pExpr;
+
+    { Scalar fast-path — exprCodeVector reduces to ExprCodeTemp for
+      non-vector LHS, which is the only shape the corpus exercises. }
+    rPDel := sqlite3ExprCodeTemp(pParse, pDel, @regFree1);
+    sqlite3ExprToRegister(pDel, rPDel);
+
+    if jumpIsTrue then
+      sqlite3ExprIfTrue(pParse, @exprAnd, dest, jumpIfNull)
+    else
+      sqlite3ExprIfFalse(pParse, @exprAnd, dest, jumpIfNull);
+
+    sqlite3ReleaseTempReg(pParse, regFree1);
+  end;
+  sqlite3ExprDelete(db, pDel);
+end;
+
 { ────────────────────────────────────────────────────────────────────
   sqlite3ExprIfTrue / sqlite3ExprIfFalse — port of expr.c:6100..6455.
   Recursive jump pair: emit code that branches to `dest` depending on
@@ -5788,7 +5855,9 @@ begin
         if regFree1 <> 0 then sqlite3VdbeTypeofColumn(v, r1);
         sqlite3VdbeAddOp2(v, op, r1, dest);
       end;
-    TK_BETWEEN, TK_IN:
+    TK_BETWEEN:
+      exprCodeBetween(pParse, pExpr, dest, True { jumpIsTrue }, jumpIfNull);
+    TK_IN:
       goDefault := True;
   else
     goDefault := True;
@@ -5962,7 +6031,9 @@ begin
         if regFree1 <> 0 then sqlite3VdbeTypeofColumn(v, r1);
         sqlite3VdbeAddOp2(v, op, r1, dest);
       end;
-    TK_BETWEEN, TK_IN:
+    TK_BETWEEN:
+      exprCodeBetween(pParse, pExpr, dest, False { jumpIsTrue }, jumpIfNull);
+    TK_IN:
       goDefault := True;
   else
     goDefault := True;

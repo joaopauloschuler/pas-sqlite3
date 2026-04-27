@@ -3036,6 +3036,68 @@ Important: At the end of this document, please find:
       immediate corpus dependency — re-visit once the multi-table
       shapes land or the corpus expands to drive correlated-IN
       shapes that exercise the cache.
+    - [X] Sub-progress 25 — corpus expansion + `exprCodeBetween` port
+      (2026-04-27).  Two coupled landings:
+
+      (a) TestWhereCorpus widened from 20 → 25 rows with five new
+      single-table shapes that exercise edge cases of the existing
+      planner: `IS NOT NULL` (NOTNULL), `<>` literal (NEQ), `rowid NOT
+      IN (...)` (IPK_NOT_IN), `col BETWEEN lo AND hi` (COL_BETWEEN),
+      and `(a=k OR a=k2) AND b>k3` (AND_OR).  Three of the five flip
+      to PASS immediately (NOTNULL 11 ops, NEQ 12 ops, AND_OR 18 ops)
+      against the C oracle byte-for-byte — coverage growth without
+      planner work.
+
+      (b) `exprCodeBetween` (expr.c:6058..6098) — port of the C
+      helper that synthesises a stack-local `(x>=lo) AND (x<=hi)`
+      Expr tree and dispatches it through `sqlite3ExprIfTrue` /
+      `sqlite3ExprIfFalse`.  Wired into both jump-pair entry points'
+      TK_BETWEEN arms, replacing the prior fall-through-to-default
+      that called `sqlite3ExprCodeTemp` on the BETWEEN expression
+      itself.  `sqlite3ExprCodeTarget` has no TK_BETWEEN arm, so
+      that fall-through emitted `OP_Null` followed by `OP_IfNot`,
+      causing every unindexed BETWEEN residual to always-skip the
+      row.  This was a real correctness bug — `SELECT a FROM t
+      WHERE b BETWEEN 5 AND 10` returned zero rows when matching
+      data existed.  Repro: `bin/test_between` (5 rows inserted,
+      3 should match) — gated under the separate sqlite3Insert
+      stub (Phase 6 still no-op), so visible only via bytecode
+      inspection through TestWhereCorpus.
+
+      Vector BETWEEN (`(a,b) BETWEEN (?,?) AND (?,?)`) is deferred
+      — no corpus dependency, would require `exprCodeVector` which
+      remains unported.  The scalar fast-path uses
+      `sqlite3ExprCodeTemp` directly which is exactly what
+      `exprCodeVector` reduces to when the LHS is non-vector.
+
+      Test-suite delta:
+        * TestWhereCorpus: **18 → 22 PASS / 2 → 3 DIVERGE / 0 ERROR
+          (corpus 20 → 25)**.  COL_BETWEEN flipped to PASS at 14 ops
+          byte-for-byte against the C oracle (Init / OpenRead /
+          Rewind / Column / Lt / Gt / Column / ResultRow / Next /
+          Halt / Transaction / Integer(5) / Integer(10) / Goto).
+          Failure-mode tally: `0 exception, 0 nil-Vdbe, 3 op-count,
+          0 op-diff` — three remaining op-count divergences are
+          LEFT_JOIN, JOIN_WHERE (multi-table planner), and
+          IPK_NOT_IN (the rowid-NOT-IN shape, slightly different
+          subroutine prologue).
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41,
+          TestVdbeApi 57/57, TestVdbeMisc 45/45, TestVdbeMem 62/62,
+          TestVdbeAux 108/108, TestExplainParity 2/10 unchanged,
+          TestPrintf 105/105, TestJson 434/434, TestTokenizer
+          127/127, TestRegistration 19/19, TestSmoke green.
+
+      Sub-progress 26 (next) will likely tackle IPK_NOT_IN (the
+      simpler of the three remaining) — the C oracle prologue
+      uses a `Noop` peg before `BeginSubrtn` that the Pascal port
+      omits, so the divergence is a 1-op pre-amble alignment plus
+      the membership-test inversion.  LEFT_JOIN / JOIN_WHERE
+      continue to block on multi-table planner integration.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

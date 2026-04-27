@@ -104,7 +104,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 20;
+  N_CORPUS = 25;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -159,6 +159,24 @@ begin
       'SELECT t.a FROM t, s WHERE t.a = s.x AND s.y > 10;');  Inc(i);
   Add(i, 'full table scan',           'FULL',
       'SELECT a FROM t;');                                    Inc(i);
+
+  { Phase 6.9-bis 11g.2.f sub-progress 25 — single-table shape extension.
+    Five new shapes that exercise edge-cases of the EXISTING (single-table)
+    planner machinery: IS NOT NULL, != literal, NOT IN literal-list,
+    composite BETWEEN on a non-rowid column, and OR mixed with AND.
+    These all degrade to SCAN-with-residual on the un-indexed fixture,
+    so the Pascal port should produce the same byte-shape as C if the
+    residual-codegen for each operator is wired through. }
+  Add(i, 'IS NOT NULL',               'NOTNULL',
+      'SELECT a FROM t WHERE c IS NOT NULL;');                Inc(i);
+  Add(i, 'col-NE literal',            'NEQ',
+      'SELECT a FROM t WHERE a <> 5;');                       Inc(i);
+  Add(i, 'rowid NOT IN literal',      'IPK_NOT_IN',
+      'SELECT a FROM t WHERE rowid NOT IN (1,2,3);');         Inc(i);
+  Add(i, 'col BETWEEN literal',       'COL_BETWEEN',
+      'SELECT a FROM t WHERE b BETWEEN 5 AND 10;');           Inc(i);
+  Add(i, 'AND-of-OR mixed',           'AND_OR',
+      'SELECT a FROM t WHERE (a = 5 OR a = 7) AND b > 0;');   Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
