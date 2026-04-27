@@ -1636,6 +1636,8 @@ function  sqlite3WhereCodeOneLoopStart(pParse: PParse; v: PVdbe;
   notReady: Bitmask): Bitmask;
 procedure sqlite3WhereRightJoinLoop(pWInfo: PWhereInfo; iLevel: i32;
   pLevel: PWhereLevel);
+procedure ljNullRowFixup(pPrs: PParse; v: PVdbe; pWInfo: PWhereInfo;
+  pLevel: PWhereLevel);
 
 { Phase 6.9-bis 11g.2.d sub-progress — planner-core helpers exposed for
   the TestWherePlanner gate.  These are static in C; we promote the
@@ -12109,6 +12111,75 @@ begin
   Result := pWInfo;
 end;
 
+{ ljNullRowFixup — where.c:7692..7726.  LEFT JOIN null-row fixup.
+
+  When this level was the inner side of a LEFT JOIN, the per-row body
+  set pLevel^.iLeftJoin (allocated in sqlite3WhereCodeOneLoopStart's
+  prelude) to 1 on every successful row-pairing.  After
+  sqlite3WhereEnd's iteration epilogue jumps out of the loop body, an
+  OP_IfPos test on iLeftJoin determines whether *any* row paired:
+  zero (iLeftJoin still 0) means we need to synthesise a fake row of
+  NULLs and re-enter the body via either OP_Gosub (Case-5 OP_Return
+  loop tail) or OP_Goto (everything else).  The fake row is built by
+  emitting OP_NullRow against the table cursor (and, when an index is
+  in play, against the index cursor too — Case 5 may reopen the index
+  via OP_ReopenIdx if a covering index was tracked across all
+  disjuncts).  viaCoroutine subqueries get their result-register block
+  zeroed via OP_Null over [regResult..regResult+nCol-1] so the
+  outer-loop body sees NULL columns instead of stale coroutine state. }
+procedure ljNullRowFixup(pPrs: PParse; v: PVdbe; pWInfo: PWhereInfo;
+  pLevel: PWhereLevel);
+var
+  pLoop:    PWhereLoop;
+  ws:       u32;
+  addr:     i32;
+  pTabList: PSrcList;
+  pSrc:     PSrcItem;
+  pSubq:    PSubquery;
+  pIx:      PIndex2;
+  iDb:      i32;
+  m, n:     i32;
+begin
+  if pLevel^.iLeftJoin = 0 then Exit;
+  pLoop    := pLevel^.pWLoop;
+  ws       := pLoop^.wsFlags;
+  pTabList := pWInfo^.pTabList;
+  addr     := sqlite3VdbeAddOp1(v, OP_IfPos, pLevel^.iLeftJoin);
+  Assert(((ws and WHERE_IDX_ONLY) = 0) or ((ws and WHERE_INDEXED) <> 0));
+  if (ws and WHERE_IDX_ONLY) = 0 then
+  begin
+    pSrc := @SrcListItems(pTabList)[pLevel^.iFrom];
+    Assert(pLevel^.iTabCur = pSrc^.iCursor);
+    if (pSrc^.fg.fgBits and u8($40)) <> 0 then  { viaCoroutine }
+    begin
+      Assert((pSrc^.fg.fgBits and u8($04)) <> 0);  { isSubquery }
+      pSubq := pSrc^.u4.pSubq;
+      n := pSubq^.regResult;
+      Assert(pSrc^.pSTab <> nil);
+      m := pSrc^.pSTab^.nCol;
+      sqlite3VdbeAddOp3(v, OP_Null, 0, n, n + m - 1);
+    end;
+    sqlite3VdbeAddOp1(v, OP_NullRow, pLevel^.iTabCur);
+  end;
+  if ((ws and WHERE_INDEXED) <> 0)
+     or (((ws and WHERE_MULTI_OR) <> 0) and (pLevel^.u.pCoveringIdx <> nil)) then
+  begin
+    if (ws and WHERE_MULTI_OR) <> 0 then
+    begin
+      pIx := pLevel^.u.pCoveringIdx;
+      iDb := sqlite3SchemaToIndex(pPrs^.db, pIx^.pSchema);
+      sqlite3VdbeAddOp3(v, OP_ReopenIdx, pLevel^.iIdxCur, pIx^.tnum, iDb);
+      sqlite3VdbeSetP4KeyInfo(pPrs, Pointer(pIx));
+    end;
+    sqlite3VdbeAddOp1(v, OP_NullRow, pLevel^.iIdxCur);
+  end;
+  if pLevel^.op = OP_Return then
+    sqlite3VdbeAddOp2(v, OP_Gosub, pLevel^.p1, pLevel^.addrFirst)
+  else
+    sqlite3VdbeGoto(v, pLevel^.addrFirst);
+  sqlite3VdbeJumpHere(v, addr);
+end;
+
 procedure sqlite3WhereEnd(pWInfo: PWhereInfo);
 var
   pPrs:   PParse;
@@ -12156,6 +12227,7 @@ begin
         sqlite3VdbeChangeP5(v, pLevel^.p5);
       end;
       sqlite3VdbeResolveLabel(v, pLevel^.addrBrk);
+      ljNullRowFixup(pPrs, v, pWInfo, pLevel);
     end;
     sqlite3VdbeResolveLabel(v, pWInfo^.iBreak);
   end;

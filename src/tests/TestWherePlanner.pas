@@ -5495,6 +5495,147 @@ begin
   sqlite3_close(db);
 end;
 
+{ ---- TestLjNullRowFixup — LJN1..LJN3.  sqlite3WhereEnd's LEFT JOIN
+       null-row fixup (where.c:7692..7726).  When the per-row body left
+       pLevel^.iLeftJoin still 0 (no row paired), the fixup synthesises
+       a fake all-NULL row by emitting OP_IfPos guard + OP_NullRow on the
+       table cursor (and, when an index is in play, on the index cursor
+       too — Case 5 also reopens the index via OP_ReopenIdx) followed by
+       an OP_Goto / OP_Gosub back to pLevel^.addrFirst so the body sees
+       the synthetic row exactly once.  JumpHere closes the OP_IfPos. ---- }
+procedure TestLjNullRowFixup;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  v:         PVdbe;
+  rc:        i32;
+  bufWI:     array of Byte;
+  bufSL:     array of Byte;
+  pWInfo:    PWhereInfo;
+  pSL:       PSrcList;
+  pSItem:    PSrcItem;
+  pLevel:    PWhereLevel;
+  loop:      TWhereLoop;
+  pTab:      PTable2;
+  aCol:      array[0..0] of TColumn;
+  base, i:   i32;
+  pOp:       PVdbeOp;
+  fIfPos, fNullRowTab, fNullRowIdx, fGoto, fGosub, fReopenIdx: Boolean;
+  addrIfPos: i32;
+
+  procedure RunFixture(ws: u32; viaCoroutine: Boolean; covIdx: PIndex2;
+    opForRet: u8; const tag: AnsiString);
+  var
+    ii: i32;
+  begin
+    FillChar(parse, SizeOf(parse), 0);
+    parse.db := db;
+    v := sqlite3GetVdbe(@parse);
+
+    SetLength(bufWI, SZ_WHEREINFO(1));
+    FillChar(bufWI[0], Length(bufWI), 0);
+    pWInfo := PWhereInfo(@bufWI[0]);
+    pWInfo^.pParse   := @parse;
+    pWInfo^.pTabList := pSL;
+    pWInfo^.nLevel   := 1;
+
+    FillChar(loop, SizeOf(loop), 0);
+    loop.wsFlags := ws;
+
+    pLevel := @whereInfoLevels(pWInfo)[0];
+    pLevel^.pWLoop   := @loop;
+    pLevel^.iFrom    := 0;
+    pLevel^.iTabCur  := 5;
+    pLevel^.iIdxCur  := 6;
+    pLevel^.iLeftJoin := 99;        { non-zero → fixup fires }
+    pLevel^.addrFirst := 1;
+    pLevel^.op := opForRet;
+    pLevel^.p1 := 77;                { Case-5 regReturn for OP_Gosub }
+    pLevel^.u.pCoveringIdx := covIdx;
+
+    if viaCoroutine then
+      pSItem^.fg.fgBits := pSItem^.fg.fgBits or u8($40 or $04);
+
+    base := sqlite3VdbeCurrentAddr(v);
+    ljNullRowFixup(@parse, v, pWInfo, pLevel);
+
+    fIfPos := False; fNullRowTab := False; fNullRowIdx := False;
+    fGoto := False; fGosub := False; fReopenIdx := False;
+    addrIfPos := -1;
+    for ii := base to sqlite3VdbeCurrentAddr(v) - 1 do
+    begin
+      pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(ii) * SizeOf(TVdbeOp));
+      if (pOp^.opcode = OP_IfPos) and (pOp^.p1 = pLevel^.iLeftJoin) then
+      begin
+        fIfPos := True; addrIfPos := ii;
+      end;
+      if (pOp^.opcode = OP_NullRow) and (pOp^.p1 = pLevel^.iTabCur) then
+        fNullRowTab := True;
+      if (pOp^.opcode = OP_NullRow) and (pOp^.p1 = pLevel^.iIdxCur) then
+        fNullRowIdx := True;
+      if pOp^.opcode = OP_Goto then  fGoto  := True;
+      if pOp^.opcode = OP_Gosub then fGosub := True;
+      if pOp^.opcode = OP_ReopenIdx then fReopenIdx := True;
+    end;
+    Check(tag + ': OP_IfPos emitted on iLeftJoin', fIfPos);
+    Check(tag + ': OP_IfPos addr captured',        addrIfPos >= 0);
+  end;
+
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('LJN open', rc = SQLITE_OK);
+
+  pTab := PTable2(GetMem(SizeOf(TTable))); FillChar(pTab^, SizeOf(TTable), 0);
+  FillChar(aCol, SizeOf(aCol), 0);
+  aCol[0].zCnName := PAnsiChar('x');
+  aCol[0].affinity := AnsiChar(SQLITE_AFF_BLOB);
+  pTab^.aCol := @aCol[0]; pTab^.nCol := 1;
+  pTab^.iPKey := -1;
+  pTab^.tabFlags := 0;
+
+  SetLength(bufSL, SizeOf(TSrcList) + SizeOf(TSrcItem));
+  FillChar(bufSL[0], Length(bufSL), 0);
+  pSL := PSrcList(@bufSL[0]);
+  pSL^.nSrc := 1; pSL^.nAlloc := 1;
+  pSItem := @SrcListItems(pSL)[0];
+  pSItem^.iCursor := 5;
+  pSItem^.pSTab   := pTab;
+
+  { LJN1 — Case 6 (full table scan) LEFT JOIN: ws=0, no covering index.
+           Expects OP_NullRow on iTabCur, OP_Goto back, no idx ops. }
+  RunFixture(0, False, nil, OP_Next, 'LJN1');
+  Check('LJN1: OP_NullRow on iTabCur emitted',     fNullRowTab);
+  Check('LJN1: OP_Goto back to addrFirst',         fGoto);
+  Check('LJN1: no OP_NullRow on iIdxCur',     not fNullRowIdx);
+  Check('LJN1: no OP_ReopenIdx',              not fReopenIdx);
+  Check('LJN1: no OP_Gosub (op != OP_Return)', not fGosub);
+
+  { LJN2 — Case 4 indexed LEFT JOIN: ws=WHERE_INDEXED.
+           Expects OP_NullRow on both iTabCur and iIdxCur, no
+           OP_ReopenIdx (only Case 5 reopens). }
+  RunFixture(WHERE_INDEXED, False, nil, OP_Next, 'LJN2');
+  Check('LJN2: OP_NullRow on iTabCur',     fNullRowTab);
+  Check('LJN2: OP_NullRow on iIdxCur',     fNullRowIdx);
+  Check('LJN2: no OP_ReopenIdx (Case 4)', not fReopenIdx);
+  Check('LJN2: OP_Goto back',              fGoto);
+
+  { LJN3 — Case 5 LEFT JOIN without a tracked covering index:
+           ws=WHERE_MULTI_OR, pCoveringIdx=nil.  Expects OP_NullRow on
+           iTabCur, OP_Gosub back (op=OP_Return), no OP_ReopenIdx, no
+           OP_NullRow on iIdxCur (the index branch is gated on
+           pCoveringIdx<>nil).  Case 5 + covering-index path is
+           exercised end-to-end in TestWhereCorpus / TestExplainParity
+           under 11g.2.f. }
+  RunFixture(WHERE_MULTI_OR, False, nil, OP_Return, 'LJN3');
+  Check('LJN3: OP_NullRow on iTabCur',     fNullRowTab);
+  Check('LJN3: OP_Gosub back (op=Return)', fGosub);
+  Check('LJN3: no OP_NullRow on iIdxCur', not fNullRowIdx);
+  Check('LJN3: no OP_ReopenIdx',           not fReopenIdx);
+
+  FreeMem(pTab);
+  sqlite3_close(db);
+end;
+
 { ---- TestCodeOneLoopStartCase4WithoutRowid — SCOLS19.
        wherecode.c:2177..2186.  Case 4 secondary-index scan on a
        WITHOUT-ROWID table: the table-row seek extracts each PK column
@@ -6388,6 +6529,7 @@ begin
   TestCodeOneLoopStartCase4InSeekScan;
   TestCodeOneLoopStartCase4WithoutRowid;
   TestCodeOneLoopStartCase5MultiOr;
+  TestLjNullRowFixup;
   TestCodeOneLoopStartCase6;
   TestGetTempRange;
   TestExprCodeGetColumnOfTable;

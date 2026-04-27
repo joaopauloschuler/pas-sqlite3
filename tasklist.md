@@ -1075,6 +1075,42 @@ Important: At the end of this document, please find:
       OP_IdxGT end-bound probe still emitted, no-range-bound JumpHere
       patches OP_SeekScan.p2 to addrIdxGT+1 — the post-end-bound
       address).
+    - [X] Public surface, batch 22 — `sqlite3WhereEnd` LEFT JOIN
+      null-row fixup (where.c:7692..7726).  Lifts the per-level fixup
+      out of the assert-stub trimmed-tail comment block in
+      `sqlite3WhereEnd` and into a new top-level helper
+      `ljNullRowFixup(pPrs, v, pWInfo, pLevel)` invoked once after each
+      level's addrBrk resolves.  When `pLevel^.iLeftJoin <> 0` (per-row
+      body lit it on every successful pairing), the fixup synthesises
+      a fake all-NULL row by emitting `OP_IfPos iLeftJoin` (skipped when
+      a row already paired), `OP_NullRow iTabCur` (gated off when
+      `WHERE_IDX_ONLY` covers every needed column), `OP_NullRow
+      iIdxCur` (when `WHERE_INDEXED` *or* `WHERE_MULTI_OR` with a
+      tracked covering index), then re-enters the body via either
+      `OP_Gosub regReturn, addrFirst` (Case 5: `pLevel^.op = OP_Return`)
+      or `OP_Goto addrFirst` (everything else), closed by
+      `JumpHere(addr)` to land the IfPos on the post-fixup
+      instruction.  Case 5 carries the extra `OP_ReopenIdx iIdxCur,
+      tnum, iDb` + `SetP4KeyInfo` when a covering index was tracked
+      across all disjuncts (the index cursor was last positioned by an
+      OR-disjunct sub-WHERE that may have closed it).  viaCoroutine
+      LHS subqueries get their result-register block zeroed via
+      `OP_Null 0, regResult, regResult+nCol-1` so the synthetic NULL
+      row replaces stale coroutine state on the LHS columns.
+      Hooked into `sqlite3WhereEnd`'s per-level loop after the addrBrk
+      resolve, so the iteration-and-break cleanup is back-edge complete
+      for any LEFT JOIN regardless of which case-arm drove the level.
+      Closes the per-level cleanup comment in 11g.2.b — the trimmed
+      tail's "deferred LEFT JOIN null-row fixup" line is now real.
+      Gate: `TestWherePlanner.pas` (667/667): LJN1 (Case 6 LEFT JOIN —
+      ws=0, no idx: OP_IfPos + OP_NullRow on iTabCur + OP_Goto back,
+      no idx-cursor ops, no Gosub since op != OP_Return), LJN2 (Case 4
+      LEFT JOIN — ws=WHERE_INDEXED: OP_NullRow on both iTabCur and
+      iIdxCur, no OP_ReopenIdx since the Case-4 cursor was never
+      closed), LJN3 (Case 5 LEFT JOIN with pCoveringIdx=nil — ws=
+      WHERE_MULTI_OR, op=OP_Return: OP_NullRow on iTabCur, OP_Gosub
+      back to addrFirst, no idx-cursor ops since the covering-index
+      gate failed; covering-index path lands under TestWhereCorpus).
     - [X] Public surface, batch 21 — `sqlite3WhereCodeOneLoopStart`
       Case 5 multi-index OR fall-through (wherecode.c:2186..2557).
       Replaces the prior `Assert(False)` stub with the full port:
