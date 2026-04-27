@@ -226,10 +226,17 @@ begin
     Inc(gDiverge);
     WriteLn('  DIVERGE ', row.label_, ' — op count: C=', Length(cOps),
             ' Pas=', Length(pOps));
-    n := Length(cOps); if Length(pOps) < n then n := Length(pOps);
-    if n > 0 then begin
-      DumpOp('C  ', 0, cOps[0]);
-      DumpOp('Pas', 0, pOps[0]);
+    if GetEnvironmentVariable('VERBOSE') = '1' then begin
+      WriteLn('    --- C side ---');
+      for i := 0 to Length(cOps) - 1 do DumpOp('C  ', i, cOps[i]);
+      WriteLn('    --- Pas side ---');
+      for i := 0 to Length(pOps) - 1 do DumpOp('Pas', i, pOps[i]);
+    end else begin
+      n := Length(cOps); if Length(pOps) < n then n := Length(pOps);
+      if n > 0 then begin
+        DumpOp('C  ', 0, cOps[0]);
+        DumpOp('Pas', 0, pOps[0]);
+      end;
     end;
     Exit;
   end;

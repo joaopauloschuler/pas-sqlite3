@@ -187,7 +187,9 @@ Important: At the end of this document, please find:
     build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
-  Current Status (2026-04-27): **7 PASS / 3 DIVERGE / 0 ERROR**.
+  Current Status (2026-04-27): **7 PASS / 3 DIVERGE / 0 ERROR**
+  (composite-PK and WITHOUT-ROWID rows are 1 op away from PASS;
+  DROP TABLE remains Δ=22 pending step 4).
   Drive to all-PASS, then expand corpus to DML / SELECT / pragma /
   trigger forms (same exclusion list as TestParser).  Promote from
   report-only to hard gate when the full corpus is green.
@@ -248,6 +250,23 @@ Important: At the end of this document, please find:
       bytecode pass — the `convertToWithoutRowidTable` helper
       (build.c:1830..2090).  Closes Δ=11 on those two rows once
       step 2 is in.
+      Sub-progress (2026-04-27): foundational pieces landed —
+      `sqlite3AddColumn` standard-typename detection (sets eCType so
+      INTEGER PRIMARY KEY is detected), faithful `sqlite3AddPrimaryKey`
+      port with `makeColumnPartOfPrimaryKey` / `sqlite3StringToId`
+      helpers, `sqlite3CreateIndex` 1-column pList synthesis from the
+      last-added Column (build.c:4130..4147), `emitSchemaRowInsert`
+      now allocates a fresh cursor from `pParse^.nTab` (so the
+      auto-index INSERT after the StartTable placeholder uses cursor 1
+      not 0), and `sqlite3EndTable` back-patches the
+      placeholder OP_CreateBtree p3 from BTREE_INTKEY (1) to
+      BTREE_BLOBKEY (2) for WITHOUT ROWID (build.c:2376..2383).
+      Δ shrunk: composite-PK and WITHOUT-ROWID rows now diverge by
+      a single op each (placeholder Noop register-number ripple at
+      op[24] / OP_Noop→OP_Goto back-patch at op[11]).  Full
+      `convertToWithoutRowidTable` (PK index synthesis, column
+      reorder, NOT NULL propagation, OP_Noop→OP_Goto patch) still
+      pending.
 
     - [ ] **6.10 step 6** Once 4/6 → all-PASS, expand corpus with
       DML / SELECT / pragma / trigger forms and promote from

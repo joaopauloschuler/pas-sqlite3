@@ -19604,6 +19604,33 @@ begin
   szEst    := 1;
   affinity := AnsiChar(SQLITE_AFF_BLOB);
 
+  { Standard-typename detection — port of build.c:1526..1542.
+    On match, set sType.n=0 so the type string is not stored after the
+    column name (the eCType field carries the encoding instead).
+    Table sqlite3StdType[] = ANY/BLOB/INT/INTEGER/REAL/TEXT,
+    sqlite3StdTypeLen[] = 3/4/3/7/4/4,
+    sqlite3StdTypeAffinity[] = NUM/BLOB/INT/INT/REAL/TEXT. }
+  if sType.n >= 3 then begin
+    if (sType.n = 3) and (sqlite3_strnicmp(sType.z, PAnsiChar('ANY'), 3) = 0) then begin
+      eType := 1; affinity := AnsiChar(SQLITE_AFF_NUMERIC); sType.n := 0;
+    end
+    else if (sType.n = 4) and (sqlite3_strnicmp(sType.z, PAnsiChar('BLOB'), 4) = 0) then begin
+      eType := 2; affinity := AnsiChar(SQLITE_AFF_BLOB); szEst := 5; sType.n := 0;
+    end
+    else if (sType.n = 3) and (sqlite3_strnicmp(sType.z, PAnsiChar('INT'), 3) = 0) then begin
+      eType := 3; affinity := AnsiChar(SQLITE_AFF_INTEGER); sType.n := 0;
+    end
+    else if (sType.n = 7) and (sqlite3_strnicmp(sType.z, PAnsiChar('INTEGER'), 7) = 0) then begin
+      eType := 4; affinity := AnsiChar(SQLITE_AFF_INTEGER); sType.n := 0;
+    end
+    else if (sType.n = 4) and (sqlite3_strnicmp(sType.z, PAnsiChar('REAL'), 4) = 0) then begin
+      eType := 5; affinity := AnsiChar(SQLITE_AFF_REAL); sType.n := 0;
+    end
+    else if (sType.n = 4) and (sqlite3_strnicmp(sType.z, PAnsiChar('TEXT'), 4) = 0) then begin
+      eType := 6; affinity := AnsiChar(SQLITE_AFF_TEXT); szEst := 5; sType.n := 0;
+    end;
+  end;
+
   nName := i32(sName.n);
 
   { Allocate name + optional type buffer.  Layout: name\0type\0 (sType.n=0
@@ -19692,9 +19719,111 @@ begin
   sqlite3ExprDelete(pParse^.db, pExpr);
 end;
 
+{ makeColumnPartOfPrimaryKey — port of build.c:1799.
+  Tag the given column as participating in the PRIMARY KEY. }
+procedure makeColumnPartOfPrimaryKey(pParse: PParse; pCol: PColumn);
+begin
+  pCol^.colFlags := pCol^.colFlags or COLFLAG_PRIMKEY;
+  if (pCol^.colFlags and COLFLAG_GENERATED) <> 0 then
+    sqlite3ErrorMsg(pParse,
+      PAnsiChar('generated columns cannot be part of the PRIMARY KEY'));
+end;
+
+{ sqlite3StringToId — port of build.c:1788.
+  Backwards-compat: the parser allows TK_STRING in column-name position
+  inside a PRIMARY KEY / UNIQUE constraint clause; rewrite it to TK_ID
+  so column lookup succeeds. }
+procedure sqlite3StringToId(p: PExpr);
+begin
+  if p^.op = TK_STRING then
+    p^.op := TK_ID
+  else if (p^.op = TK_COLLATE) and (p^.pLeft <> nil)
+       and (p^.pLeft^.op = TK_STRING) then
+    p^.pLeft^.op := TK_ID;
+end;
+
+{ sqlite3AddPrimaryKey — port of build.c:1829.
+  Designate the PRIMARY KEY for the table currently under construction.
+  If the key is a single column whose declared eCType is COLTYPE_INTEGER
+  (and ASC), use it as the rowid alias (set iPKey, keyConf, optional
+  TF_Autoincrement).  Otherwise, manufacture a unique implicit index
+  via sqlite3CreateIndex(... SQLITE_IDXTYPE_PRIMARYKEY) — this is what
+  emits the auto-index sqlite_schema row at parse time for composite
+  PRIMARY KEY and WITHOUT ROWID forms. }
 procedure sqlite3AddPrimaryKey(pParse: PParse; pList: PExprList;
   onError: i32; autoInc: i32; sortOrder: i32);
+label primary_key_exit;
+var
+  pTab:    PTable2;
+  pCol:    PColumn;
+  iCol:    i32;
+  i:       i32;
+  nTerm:   i32;
+  pCExpr:  PExpr;
+  pItem:   PExprListItem;
+  zToken:  PAnsiChar;
+  eCType:  u8;
 begin
+  pTab := pParse^.pNewTable;
+  pCol := nil;
+  iCol := -1;
+  if pTab = nil then goto primary_key_exit;
+  if (pTab^.tabFlags and TF_HasPrimaryKey) <> 0 then begin
+    sqlite3ErrorMsg(pParse,
+      PAnsiChar('table has more than one primary key'));
+    goto primary_key_exit;
+  end;
+  pTab^.tabFlags := pTab^.tabFlags or TF_HasPrimaryKey;
+  if pList = nil then begin
+    iCol  := pTab^.nCol - 1;
+    pCol  := @pTab^.aCol[iCol];
+    makeColumnPartOfPrimaryKey(pParse, pCol);
+    nTerm := 1;
+  end else begin
+    nTerm := pList^.nExpr;
+    for i := 0 to nTerm - 1 do begin
+      pItem  := ExprListItems(pList);
+      pCExpr := sqlite3ExprSkipCollate(pItem[i].pExpr);
+      AssertH(pCExpr <> nil, 'AddPrimaryKey expr');
+      sqlite3StringToId(pCExpr);
+      if pCExpr^.op = TK_ID then begin
+        AssertH((pCExpr^.flags and EP_IntValue) = 0, 'AddPrimaryKey EP_IntValue');
+        zToken := pCExpr^.u.zToken;
+        iCol := sqlite3ColumnIndex(pTab, zToken);
+        if iCol >= 0 then begin
+          pCol := @pTab^.aCol[iCol];
+          makeColumnPartOfPrimaryKey(pParse, pCol);
+        end;
+      end;
+    end;
+  end;
+  if pCol <> nil then
+    eCType := (pCol^.typeFlags shr 4) and $0F
+  else
+    eCType := 0;
+  if (nTerm = 1) and (pCol <> nil)
+     and (eCType = COLTYPE_INTEGER) and (sortOrder <> SQLITE_SO_DESC) then
+  begin
+    pTab^.iPKey   := i16(iCol);
+    pTab^.keyConf := u8(onError);
+    AssertH((autoInc = 0) or (autoInc = 1), 'AddPrimaryKey autoInc');
+    if autoInc <> 0 then
+      pTab^.tabFlags := pTab^.tabFlags or TF_Autoincrement;
+    if pList <> nil then begin
+      pItem := ExprListItems(pList);
+      pParse^.iPkSortOrder := pItem[0].fg.sortFlags;
+    end;
+    sqlite3HasExplicitNulls(pParse, pList);
+  end else if autoInc <> 0 then begin
+    sqlite3ErrorMsg(pParse,
+      PAnsiChar('AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY'));
+  end else begin
+    sqlite3CreateIndex(pParse, nil, nil, nil, pList, onError, nil,
+                       nil, sortOrder, 0, SQLITE_IDXTYPE_PRIMARYKEY);
+    pList := nil;
+  end;
+
+primary_key_exit:
   sqlite3ExprListDelete(pParse^.db, pList);
 end;
 
@@ -19744,10 +19873,20 @@ var
   regOut:       i32;
   zNameDup:     PAnsiChar;
   zTblDup:      PAnsiChar;
+  iCursor:      i32;
 begin
   db := pParse^.db;
 
-  sqlite3OpenSchemaTable(pParse, iDb);
+  { Allocate a fresh cursor for this INSERT.  The C reference reaches the
+    same shape via sqlite3NestedParse('INSERT INTO sqlite_master ...')
+    which goes through Insert codegen and pulls a cursor from
+    pParse^.nTab.  Mirror that here so the second sqlite_master writer
+    in a CREATE TABLE composite-PK emission uses cursor 1, not cursor 0
+    (which is already burned by the StartTable placeholder Open/Close). }
+  iCursor := pParse^.nTab;
+  Inc(pParse^.nTab);
+  if v <> nil then
+    sqlite3VdbeAddOp4Int(v, OP_OpenWrite, iCursor, SCHEMA_ROOT, iDb, 5);
 
   Inc(pParse^.nMem); regRowid := pParse^.nMem;
   regBase := pParse^.nMem + 1;
@@ -19771,9 +19910,9 @@ begin
   else
     sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 4, 0, zStmt, P4_DYNAMIC);
 
-  sqlite3VdbeAddOp2(v, OP_NewRowid, 0, regRowid);
+  sqlite3VdbeAddOp2(v, OP_NewRowid, iCursor, regRowid);
   sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, 5, regOut);
-  sqlite3VdbeAddOp3(v, OP_Insert, 0, regOut, regRowid);
+  sqlite3VdbeAddOp3(v, OP_Insert, iCursor, regOut, regRowid);
   sqlite3VdbeChangeP5(v, OPFLAG_APPEND or OPFLAG_USESEEKRESULT);
 end;
 
@@ -19967,8 +20106,18 @@ begin
     leave the Vdbe half-initialised — so we *defer the entire WITHOUT
     ROWID arm* until those parser stubs land.  Just fold the flags into
     tabFlags so layout snapshots are correct. }
-  if (tabOpts and TF_WithoutRowid) <> 0 then
+  if (tabOpts and TF_WithoutRowid) <> 0 then begin
     pTab^.tabFlags := pTab^.tabFlags or TF_WithoutRowid or TF_NoVisibleRowid;
+    { Back-patch the placeholder OP_CreateBtree from BTREE_INTKEY (1) to
+      BTREE_BLOBKEY (2) — port of build.c:2376..2383.  The full
+      convertToWithoutRowidTable transformation (PK index synthesis,
+      column reorder, NOT NULL propagation) remains 6.10 step 5; this
+      single-line p3 patch closes the corresponding TestExplainParity
+      DIVERGE at op[5]. }
+    if pParse^.u1.cr.addrCrTab <> 0 then
+      sqlite3VdbeChangeP3(sqlite3GetVdbe(pParse),
+                          pParse^.u1.cr.addrCrTab, 2 { BTREE_BLOBKEY });
+  end;
 
   iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
 
@@ -20557,6 +20706,7 @@ var
   pName:       PToken;
   v:           PVdbe;
   pSchemaT:    passqlite3util.PSchema;
+  prevColTok:  TToken;
 begin
   pTab    := nil;
   pIndex  := nil;
@@ -20668,22 +20818,26 @@ begin
   end;
 {$ENDIF}
 
-  { Allocate the Index object.  pList may be nil on the auto-name path;
-    in that case we'd need to synthesise a 1-column ExprList from the
-    last-added Column — deferred (AddColumn stub). }
+  { Synthesise a 1-column pList from the last-added Column when invoked
+    via AddPrimaryKey on a column constraint (build.c:4130..4147). }
   if pList = nil then begin
-    nName     := sqlite3Strlen30(zName);
-    nExtraCol := 1;
-    pIndex    := sqlite3AllocateIndexObject(db, i16(nExtraCol),
-                                             nName + 1, @zExtra);
-  end else begin
-    nName     := sqlite3Strlen30(zName);
-    nExtraCol := 1;
-    if pPk <> nil then nExtraCol := i32(pPk^.nKeyCol);
-    pIndex    := sqlite3AllocateIndexObject(db,
-                   i16(i32(pList^.nExpr) + nExtraCol),
-                   nName + 1, @zExtra);
+    if (pTab^.aCol = nil) or (pTab^.nCol <= 0) then goto exit_create_index;
+    pTab^.aCol[pTab^.nCol - 1].colFlags :=
+      pTab^.aCol[pTab^.nCol - 1].colFlags or COLFLAG_UNIQUE;
+    prevColTok.z := pTab^.aCol[pTab^.nCol - 1].zCnName;
+    prevColTok.n := u32(sqlite3Strlen30(prevColTok.z));
+    pList := sqlite3ExprListAppend(pParse, nil,
+               sqlite3ExprAlloc(db, TK_ID, @prevColTok, 0));
+    if pList = nil then goto exit_create_index;
+    AssertH(pList^.nExpr = 1, 'CreateIndex synth 1-col');
+    sqlite3ExprListSetSortOrder(pList, sortOrder, SQLITE_SO_UNDEFINED);
   end;
+  nName     := sqlite3Strlen30(zName);
+  nExtraCol := 1;
+  if pPk <> nil then nExtraCol := i32(pPk^.nKeyCol);
+  pIndex    := sqlite3AllocateIndexObject(db,
+                 i16(i32(pList^.nExpr) + nExtraCol),
+                 nName + 1, @zExtra);
   if (pIndex = nil) or (db^.mallocFailed <> 0) then goto exit_create_index;
   pIndex^.zName := zExtra;
   Move(zName^, zExtra^, nName + 1);
