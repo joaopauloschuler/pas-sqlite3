@@ -160,8 +160,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 981 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 982); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 982 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 983); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -194,8 +194,8 @@ Important: At the end of this document, please find:
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
   comparison ops + literal-arith + col aliases + multi-col index +
   multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **981 PASS / 1 DIVERGE / 0 ERROR**
-  (corpus = 982 after probe sweep #34).
+  Current Status (2026-04-27): **982 PASS / 1 DIVERGE / 0 ERROR**
+  (corpus = 983 after DROP TABLE IF EXISTS znope row added).
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -273,7 +273,7 @@ Important: At the end of this document, please find:
 
     - [ ] **6.10 step 6** Expand corpus further and drive remaining
       DIVERGEs to PASS, then promote from report-only to hard gate.
-      Corpus now 981 PASS / 1 DIVERGE / 982 total after probe
+      Corpus now 982 PASS / 1 DIVERGE / 983 total after probe
       sweeps #18..#34 (each added 25–36 PASS rows).  The pattern:
       pick SQL shapes adjacent to those already PASSing, batch
       ~20–30 at a time, drop any that DIVERGE into the actionable
@@ -324,10 +324,16 @@ Important: At the end of this document, please find:
           Δ=11 (rowid-aliased INTEGER PRIMARY KEY INSERT path).
         [ ] `SELECT p FROM u;` — per-op divergence at op[1] (scan
           of rowid-aliased PRIMARY KEY column).
-        [ ] `DROP TABLE IF EXISTS znope;` (target absent) — Pascal
-          `prepare_v2` returns a nil Vdbe; C returns a stepable
-          (no-op) Vdbe.  Likely an early-return in `sqlite3DropTable`
-          before `sqlite3FinishCoding` runs.
+        [X] `DROP TABLE IF EXISTS znope;` (target absent) —
+          fixed by porting `db->suppressErr` short-circuit in
+          `sqlite3ErrorMsg` (build.c:138): when suppressErr is set,
+          drop the message silently and leave nErr/rc untouched (only
+          mallocFailed promotes to SQLITE_NOMEM).  Previously the Pas
+          version unconditionally incremented nErr, so the
+          `sqlite3LocateTableItem` "no such table" path under
+          DropTable's `Inc(suppressErr)` guard left nErr=1 and
+          `sqlite3_prepare_v2` returned SQLITE_ERROR with a nil stmt.
+          New corpus row added: PASS at 5 ops.
 
 - [X] **6.10b** Bug — `INSERT INTO <tbl> DEFAULT VALUES` raised
   EAccessViolation in `sqlite3Insert` (passqlite3codegen.pas:18974)

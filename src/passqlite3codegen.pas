@@ -3207,15 +3207,30 @@ begin { Phase 6.5 stub } end;
 procedure sqlite3ErrorMsg(pParse: PParse; zFormat: PAnsiChar);
 var
   zMsg: PAnsiChar;
+  db: PTsqlite3;
 begin
   if pParse = nil then Exit;
+  db := pParse^.db;
+  if zFormat <> nil then
+    zMsg := sqlite3MPrintf(db, zFormat, [])
+  else
+    zMsg := nil;
+  { build.c sqlite3ErrorMsg: when db->suppressErr is set the message is
+    silently dropped and nErr/rc are NOT modified (except on mallocFailed,
+    which surfaces as SQLITE_NOMEM). }
+  if (db <> nil) and (db^.suppressErr <> 0) then begin
+    if zMsg <> nil then sqlite3DbFree(db, zMsg);
+    if db^.mallocFailed <> 0 then begin
+      Inc(pParse^.nErr);
+      pParse^.rc := SQLITE_NOMEM;
+    end;
+    Exit;
+  end;
   Inc(pParse^.nErr);
   if pParse^.rc = SQLITE_OK then pParse^.rc := SQLITE_ERROR;
-  if zFormat = nil then Exit;
-  zMsg := sqlite3MPrintf(pParse^.db, zFormat, []);
   if zMsg = nil then Exit;
   if pParse^.zErrMsg <> nil then
-    sqlite3DbFree(pParse^.db, pParse^.zErrMsg);
+    sqlite3DbFree(db, pParse^.zErrMsg);
   pParse^.zErrMsg := zMsg;
 end;
 

@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 982;
+  N_CORPUS = 983;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -92,6 +92,7 @@ begin
   Add(i, 'CREATE UNIQUE INDEX',         'CREATE UNIQUE INDEX i2 ON t(b);');   Inc(i);
   Add(i, 'DROP TABLE',                  'DROP TABLE t;');                     Inc(i);
   Add(i, 'DROP INDEX IF EXISTS',        'DROP INDEX IF EXISTS i_nope;');      Inc(i);
+  Add(i, 'DROP TABLE IF EXISTS znope',  'DROP TABLE IF EXISTS znope;');       Inc(i);
   Add(i, 'BEGIN',                       'BEGIN;');                            Inc(i);
 
   { SELECT / DML probe rows — expand bytecode-diff coverage beyond DDL.
