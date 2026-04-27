@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 126;
+  N_CORPUS = 170;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -230,6 +230,54 @@ begin
   Add(i, 'CREATE TABLE 4col',           'CREATE TABLE z9(a,b,c,d);');            Inc(i);
   Add(i, 'CREATE INDEX alt',            'CREATE INDEX i6 ON s(y);');             Inc(i);
   Add(i, 'CREATE INDEX alt 2col',       'CREATE INDEX i7 ON s(y,z);');           Inc(i);
+
+  { Probe sweep #7 — candidate rows. }
+  Add(i, 'SELECT 0',                    'SELECT 0;');                            Inc(i);
+  Add(i, 'SELECT 1+1+1+1+1',            'SELECT 1+1+1+1+1;');                    Inc(i);
+  Add(i, 'SELECT a*b*c',                'SELECT a*b*c FROM t;');                 Inc(i);
+  Add(i, 'SELECT a-b+c',                'SELECT a-b+c FROM t;');                 Inc(i);
+  Add(i, 'SELECT a||b||c',              'SELECT a||b||c FROM t;');               Inc(i);
+  Add(i, 'SELECT col,lit',              'SELECT a, 1 FROM t;');                  Inc(i);
+  Add(i, 'SELECT lit,col',              'SELECT 1, a FROM t;');                  Inc(i);
+  Add(i, 'SELECT col,col arith',        'SELECT a+1, b+1 FROM t;');              Inc(i);
+  Add(i, 'SELECT col,col arith2',       'SELECT a, b+c FROM t;');                Inc(i);
+  Add(i, 'SELECT col arith,col',        'SELECT a+b, c FROM t;');                Inc(i);
+  Add(i, 'SELECT a+b*c',                'SELECT a+b*c FROM t;');                 Inc(i);
+  Add(i, 'SELECT (a+b)*c',              'SELECT (a+b)*c FROM t;');               Inc(i);
+  Add(i, 'INSERT NULL middle',          'INSERT INTO t VALUES(1,NULL,3);');      Inc(i);
+  Add(i, 'INSERT all NULL',             'INSERT INTO t VALUES(NULL,NULL,NULL);'); Inc(i);
+  Add(i, 'INSERT zeros',                'INSERT INTO t VALUES(0,0,0);');         Inc(i);
+  Add(i, 'DELETE alt rowid 2',          'DELETE FROM s WHERE rowid=2;');         Inc(i);
+  Add(i, 'DELETE rowid large',          'DELETE FROM t WHERE rowid=10;');        Inc(i);
+  Add(i, 'SAVEPOINT s8',                'SAVEPOINT s8;');                        Inc(i);
+  Add(i, 'RELEASE s8',                  'RELEASE s8;');                          Inc(i);
+  Add(i, 'SELECT col WHERE a=0',        'SELECT a FROM t WHERE a=0;');           Inc(i);
+  Add(i, 'SELECT col WHERE a=big',      'SELECT a FROM t WHERE a=1000000;');     Inc(i);
+  Add(i, 'SELECT col WHERE a=empty',    'SELECT a FROM t WHERE a='''';');        Inc(i);
+  Add(i, 'SELECT 1.5',                  'SELECT 1.5;');                          Inc(i);
+  Add(i, 'SELECT a,b,a',                'SELECT a, b, a FROM t;');               Inc(i);
+  Add(i, 'SELECT b,a',                  'SELECT b, a FROM t;');                  Inc(i);
+  Add(i, 'SELECT char str',             'SELECT ''multi word'';');               Inc(i);
+  Add(i, 'BEGIN DEFERRED TRANSACTION',  'BEGIN DEFERRED TRANSACTION;');          Inc(i);
+  Add(i, 'BEGIN IMM TRANSACTION',       'BEGIN IMMEDIATE TRANSACTION;');         Inc(i);
+  Add(i, 'BEGIN EXCL TRANSACTION',      'BEGIN EXCLUSIVE TRANSACTION;');         Inc(i);
+  Add(i, 'CREATE TABLE typed mixed',    'CREATE TABLE z10(x INTEGER, y TEXT, z BLOB);'); Inc(i);
+  Add(i, 'SELECT col-col',              'SELECT a-c FROM t;');                   Inc(i);
+  Add(i, 'SELECT col+col rowid 2',      'SELECT a+b FROM t WHERE rowid=2;');     Inc(i);
+  Add(i, 'SELECT col WHERE rowid=0',    'SELECT a FROM t WHERE rowid=0;');       Inc(i);
+  Add(i, 'SELECT col WHERE rowid=big',  'SELECT a FROM t WHERE rowid=1000;');    Inc(i);
+  Add(i, 'SELECT *,1',                  'SELECT *, 1 FROM t;');                  Inc(i);
+
+  { Probe sweep #7 (cont.) — predicate / unary / function shapes. }
+  Add(i, 'SELECT IS NULL',              'SELECT a FROM t WHERE a IS NULL;');     Inc(i);
+  Add(i, 'SELECT IS NOT NULL',          'SELECT a FROM t WHERE a IS NOT NULL;'); Inc(i);
+  Add(i, 'SELECT NOT a',                'SELECT NOT a FROM t;');                 Inc(i);
+  Add(i, 'SELECT a IS 1',               'SELECT a IS 1 FROM t;');                Inc(i);
+  Add(i, 'SELECT a IS NOT 1',           'SELECT a IS NOT 1 FROM t;');            Inc(i);
+  Add(i, 'SELECT BETWEEN',              'SELECT a FROM t WHERE a BETWEEN 1 AND 5;'); Inc(i);
+  Add(i, 'SELECT CAST',                 'SELECT CAST(1 AS TEXT);');              Inc(i);
+  Add(i, 'SELECT COALESCE',             'SELECT COALESCE(a, 0) FROM t;');        Inc(i);
+  Add(i, 'SELECT CASE',                 'SELECT CASE WHEN a=1 THEN 1 ELSE 0 END FROM t;'); Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

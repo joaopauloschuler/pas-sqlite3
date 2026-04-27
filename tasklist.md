@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 125 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 126); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 169 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 170); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -191,7 +191,8 @@ Important: At the end of this document, please find:
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
   comparison ops + literal-arith + col aliases + multi-col index +
   multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **125 PASS / 1 DIVERGE / 0 ERROR**.
+  Current Status (2026-04-27): **169 PASS / 1 DIVERGE / 0 ERROR**
+  (corpus = 170 after probe sweep #7).
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -269,11 +270,15 @@ Important: At the end of this document, please find:
 
     - [ ] **6.10 step 6** Expand corpus further and drive remaining
       DIVERGEs to PASS, then promote from report-only to hard gate.
-      Corpus now 125 PASS / 1 DIVERGE / 126 total (probe sweep #6
-      added 28 PASS rows — multi-arith chains `1*2*3`/`1+2+3+4`/
-      `a+1+b`/`a*b+c`/`a-b-c`, NULL mixing, larger int literals,
-      empty string, alt-table DML/DELETE, 4-col CREATE TABLE, alt-
-      table CREATE INDEX 1col / 2col, additional SAVEPOINT shapes).
+      Corpus now 169 PASS / 1 DIVERGE / 170 total.  Probe sweep #7
+      added 44 PASS rows — sweep #7a (35 rows): chained arith,
+      mixed col/lit projection lists, paren grouping `(a+b)*c`,
+      NULL/zeros INSERT, BEGIN…TRANSACTION variants, typed-mixed
+      CREATE TABLE, large-rowid EQ, `SELECT *,1 FROM t`, more
+      SAVEPOINT/RELEASE pairs, `1.5` float literal.  Sweep #7b
+      (9 rows): predicate / unary / function shapes — `IS NULL`,
+      `IS NOT NULL`, `NOT a`, `a IS 1`, `a IS NOT 1`, `BETWEEN`,
+      `CAST`, `COALESCE`, `CASE WHEN…END`.
 
       DIVERGE shapes discovered in probe sweeps (kept out of corpus
       until they flip — each is a committable next-agent ticket):
@@ -283,18 +288,40 @@ Important: At the end of this document, please find:
           VALUES(...)` — Δ=7 (named-column INSERT path differs from
           positional; likely missing column-list permutation in
           `sqlite3Insert`).
+        * `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
+          VALUES path).
         * `SELECT a FROM t WHERE rowid=1 OR rowid=2` — Δ=5 (rowid
           OR-decomposed path; planner reaches multi-loop branch but
           counters disagree).
         * `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
-        * `PRAGMA user_version` — Δ=4 (read-pragma codegen is a stub:
-          `sqlite3Pragma` in passqlite3codegen.pas:22374 returns
-          immediately; needs ReadCookie / ResultRow tail at minimum).
+        * `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3
+          (read-pragma codegen is a stub: `sqlite3Pragma` in
+          passqlite3codegen.pas:22374 returns immediately; needs
+          ReadCookie / ResultRow tail at minimum).
         * `SELECT a FROM t WHERE rowid<5` (and `>`, `<=`, `>=`) —
           per-op divergence at op[2] (rowid range scan path: planner
           picks WHERE_IPK range but inner-loop opcode emission differs
           from C).  `<>` shape PASSes; only ordered comparisons fail.
+        * `SELECT a FROM t WHERE a IN (1,2,3)` / `NOT IN (...)` —
+          Δ=−1 (Pas heavier by 1 op vs C in IN-list rowset path).
+        * `SELECT a FROM t WHERE a LIKE 'abc%'` / `GLOB 'abc*'` —
+          Δ=1 (LIKE/GLOB virtual-term range-scan path off by 1).
+        * `SELECT DISTINCT a FROM t` — Δ=13 (DISTINCT codegen,
+          ephemeral-table dedup not yet wired in `sqlite3Select`).
+        * `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
+          Δ=16..18 (ORDER BY sorter / ephemeral-key path: Pas emits
+          only 3 ops, no sorter open / KeyInfo / sort-finalise loop).
+        * `SELECT a FROM t GROUP BY a` — Δ=42 (aggregate-group
+          path, not yet ported).
+        * `SELECT COUNT(*)` — Δ=−1; `SELECT SUM/MIN/MAX(a)` —
+          Δ=3..4 (aggregate-no-GROUP path, partial codegen).
+        * `SELECT a FROM t LIMIT 5 OFFSET 2` — Δ=13 (OFFSET path:
+          Pas emits only 3 ops, no offset-skip register init).
+        * `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
+          materialise / co-routine path not ported).
+        * `UPDATE t SET a=5 WHERE rowid=1` — Δ=14 (`sqlite3Update`
+          still skeleton-only — see 11g.2.f open follow-on).
 
 - [X] **6.10b** Bug — `INSERT INTO <tbl> DEFAULT VALUES` raised
   EAccessViolation in `sqlite3Insert` (passqlite3codegen.pas:18974)
