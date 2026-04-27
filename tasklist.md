@@ -256,6 +256,24 @@ Important: At the end of this document, please find:
     return rc=0 via `sqlite3_exec` and rows materialise in sqlite_master.
     A 6.10-scoped follow-on.
 
+- [ ] **6.9-bis 11g.2.h** Standalone `DELETE FROM <tbl>` prepare returns
+    SQLITE_ERROR before parser rule 152 fires.  Repro: open `:memory:`,
+    issue `DELETE FROM t;` (table absent or present, no prior statements
+    in the same prepare).  `sqlite3_prepare_v2` returns rc=1 with
+    generic "SQL logic error" (no zErrMsg) and `sqlite3DeleteFrom` is
+    never reached.  The same SQL embedded in a multi-statement prepare
+    (`CREATE TABLE t(...); DELETE FROM t;`) parses successfully and
+    rule 152 fires.  Pre-existing — present at HEAD~2 and unchanged by
+    sub-progress 48 / 49.  Likely a parser-engine state issue
+    (sqlite3RunParser / sqlite3ParseObjectReset) specific to a fresh
+    sParse where the first reducible statement begins with TK_DELETE.
+    Blocks DROP TABLE in TestExplainParity: `sqlite3CodeDropTable`
+    issues `sqlite3NestedParse('DELETE FROM ...sqlite_master ...')`,
+    which calls `sqlite3RunParser` against the parent sParse with
+    PARSE_TAIL zeroed — effectively the same fresh-prepare scenario.
+    INSERT / SELECT / UPDATE in the same scenario all succeed; this
+    is specific to the DELETE first-token path.
+
 - [X] **6.9-bis 11g.2.g** TestWhereCorpus startup EAccessViolation —
     **Resolved.** The AV in `sqlite3StrDup`→`IndexByte` was downstream
     of stale-zero `prereqRight` masks driving inner-subselect codegen
