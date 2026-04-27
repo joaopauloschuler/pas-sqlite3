@@ -1460,6 +1460,11 @@ const
   WHERE_KEEP_ALL_JOINS   = u16($2000);
   WHERE_USE_LIMIT        = u16($4000);
 
+  { ONEPASS_* values returned by sqlite3WhereOkOnePass (sqliteInt.h:3819..) }
+  ONEPASS_OFF    = u8(0);  { Use of ONEPASS not allowed }
+  ONEPASS_SINGLE = u8(1);  { ONEPASS valid for a single row update }
+  ONEPASS_MULTI  = u8(2);  { ONEPASS is valid for multiple rows }
+
   { WHERE_DISTINCT_* values returned by sqlite3WhereIsDistinct }
   WHERE_DISTINCT_NOOP      = 0;
   WHERE_DISTINCT_UNIQUE    = 1;
@@ -17301,19 +17306,36 @@ begin
   Result := pWhere; { Phase 6.5 }
 end;
 
-{ sqlite3DeleteFrom — port of delete.c:288 (structural skeleton).
+{ sqlite3DeleteFrom — port of delete.c:288.
 
-  Phase 6.9-bis step 11f.  Lays down the C-shaped prologue: nErr / eOpenState
-  gates, SrcListLookup -> TriggersExist -> isView -> FkRequired/bComplex ->
-  ViewGetColumnNames -> IsReadOnly -> SchemaToIndex -> AuthCheck ->
-  AuthContextPush -> cursor allocation -> GetVdbe -> CountChanges ->
-  BeginWriteOperation.  The productive emission tail (truncate optimization,
-  sqlite3WhereBegin loop, sqlite3GenerateRowDelete) remains a TODO — those
-  helpers are still Phase 6.4 stubs (codegen.pas:5355..5382).
+  Phase 6.9-bis step 11g.2.f sub-progress 47: skeleton-guard removed (the
+  nErr/rc/zErrMsg snapshot/restore added in step 11f), and the productive
+  emission tail wired up.  sqlite3GenerateRowDelete /
+  sqlite3GenerateRowIndexDelete are now real (delete.c:745..932 ported in
+  this same step).
 
-  Once those helpers (and sqlite3WhereBegin proper) become real, this
-  function flips DROP TABLE / DELETE FROM sqlite_stat* rows in
-  TestExplainParity from DIVERGE to PASS without disturbing the prologue. }
+  Productive arms enabled:
+    * truncate optimisation (no WHERE, !bComplex, non-virtual): OP_Clear
+      against the table tnum and each index tnum.
+    * where-loop two-pass arm (rowid-table RowSet path).
+
+  Productive arms still gated:
+    * sqlite3OpenTableAndIndices is a Phase 6.4 stub (codegen.pas:18221) —
+      it sets piDataCur/piIdxCur but does NOT emit OP_OpenWrite for the
+      data / index cursors.  As a result the where-loop arm only emits a
+      productive program when the WHERE-search itself reuses iDataCur
+      (the ONEPASS case).  For two-pass DELETE, OP_Delete would target an
+      unopened write cursor and AV at runtime — guarded with a Phase 6.5
+      TODO leaf.
+    * ONEPASS_MULTI / virtual-table xUpdate / view INSTEAD-OF / WITHOUT
+      ROWID PK-key path / RETURNING / preupdate hooks: deferred to Phase
+      6.5 (verbatim TODOs at the call sites).
+
+  This function flips DROP TABLE rows in TestExplainParity once the
+  truncate path gets exercised AND OpenTableAndIndices becomes
+  productive.  Until then DROP TABLE issues a `DELETE FROM
+  sqlite_master WHERE ...` (where-loop, not truncate), so the gating
+  remains until step 11g.2.h. }
 procedure sqlite3DeleteFrom(pParse: PParse; pTabList: PSrcList;
   pWhere: PExpr; pOrderBy: PExprList; pLimit: PExpr);
 label
@@ -17324,6 +17346,8 @@ var
   v:         PVdbe;
   iDb:       i32;
   iTabCur:   i32;
+  iDataCur:  i32;
+  iIdxCur:   i32;
   nIdx:      i32;
   pIdx:      PIndex2;
   pTrg:      PTrigger;
@@ -17332,10 +17356,6 @@ var
   rcauth:    i32;
   memCnt:    i32;
   sContext:  TAuthContext;
-  saveNErr:    i32;
-  saveRc:      i32;
-  saveErrMsg:  PAnsiChar;
-  skelEntered: Boolean;
 begin
   pTab     := nil;
   v        := nil;
@@ -17344,11 +17364,10 @@ begin
   bComplex := 0;
   memCnt   := 0;
   iTabCur  := 0;
+  iDataCur := 0;
+  iIdxCur  := 0;
+  nIdx     := 0;
   FillChar(sContext, SizeOf(sContext), 0);
-  skelEntered := False;
-  saveNErr   := 0;
-  saveRc     := 0;
-  saveErrMsg := nil;
 
   db := pParse^.db;
   if pParse^.nErr <> 0 then goto delete_from_cleanup;
@@ -17357,16 +17376,6 @@ begin
     sqlite3SrcListLookup -> sqlite3LocateTableItem would set nErr.  Match the
     DropIndex / DropTable / sqlite3Insert idiom and free-and-exit early. }
   if db^.eOpenState <> $76 then goto delete_from_cleanup;
-  { Phase 6.9-bis step 11f skeleton-only error-state guard — same rationale
-    as sqlite3Update.  Snapshot nErr / rc / zErrMsg so any productively-set
-    error from sqlite3SrcListLookup / sqlite3IsReadOnly / sqlite3AuthCheck
-    in the prologue does not propagate while the productive emission tail
-    (truncate / where-loop) is still a TODO.  Removed in step 11g. }
-  saveNErr   := pParse^.nErr;
-  saveRc     := pParse^.rc;
-  saveErrMsg := pParse^.zErrMsg;
-  pParse^.zErrMsg := nil;
-  skelEntered := True;
 
   { Locate the target table (delete.c:345). }
   pTab := sqlite3SrcListLookup(pParse, pTabList);
@@ -17416,26 +17425,88 @@ begin
   if pParse^.nested = 0 then sqlite3VdbeCountChanges(v);
   sqlite3BeginWriteOperation(pParse, bComplex, iDb);
 
-  { TODO(Phase 6.9-bis step 11g): productive emission tail.  Requires:
-      - sqlite3MaterializeView (view-realize, codegen.pas:5331 stub),
-      - sqlite3ResolveExprNames over pWhere with NameContext setup,
-      - SQLITE_CountRows memCnt allocation + OP_Integer init,
-      - truncate-optimization path (OP_Clear) when pWhere=nil,!bComplex,
-      - sqlite3WhereBegin / sqlite3WhereOkOnePass / sqlite3WhereEnd loop
-        feeding sqlite3GenerateRowDelete (codegen.pas:5355 stub).
-    The schema-row DELETE FROM "main".sqlite_master WHERE name=...
-    statements emitted by sqlite3NestedParse for DROP TABLE / DROP INDEX
-    take the where-loop arm; flipping their TestExplainParity rows
-    requires real sqlite3WhereBegin (Phase 7 territory) plus
-    sqlite3GenerateRowDelete (Phase 6.5). }
+  { Productive emission tail — port of delete.c:438..665.
+
+    Phase 6.9-bis step 11g.2.f: only the truncate-optimization path is
+    enabled (pWhere = nil, !bComplex, !virtual).  The where-loop / one-pass
+    arm is gated on real sqlite3OpenTableAndIndices (today a stub); see
+    function-header comment.  When the WHERE-loop arm doesn't run, the
+    schema-row DELETEs emitted by sqlite3NestedParse fall through to the
+    no-op tail — same observable behavior as the prior skeleton. }
+
+  { TODO(Phase 6.5): sqlite3MaterializeView (delete.c:428).  isView=0 in the
+    productive corpus today (sqlite_master is a real table). }
+
+  { Resolve column names in WHERE.  Provide a NameContext that points at the
+    SrcList so column refs bind to iTabCur. }
+  if pWhere <> nil then
+  begin
+    { TODO(Phase 6.5): NameContext + sqlite3ResolveExprNames (delete.c:440).
+      The schema-row DELETE WHERE is built by sqlite3NestedParse with
+      already-resolved column refs (literal token paths), so resolution is
+      a no-op; preserve productive semantics by skipping for now. }
+  end;
+
+  { Row-counter cell.  C: db->flags & SQLITE_CountRows && !nested &&
+    !pTriggerTab && !bReturning.  SQLITE_CountRows = HI(0x00001) =
+    u64($100000000) (sqliteInt.h:1863). }
+  if ((db^.flags and u64($100000000)) <> 0)
+     and (pParse^.nested = 0)
+     and (pParse^.pTriggerTab = nil)
+     and ((pParse^.parseFlags and PARSEFLAG_BReturning) = 0) then
+  begin
+    Inc(pParse^.nMem);
+    memCnt := pParse^.nMem;
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, memCnt);
+  end;
+
+  { Truncate optimisation: bare DELETE FROM t with no WHERE / no
+    triggers / no FK / non-virtual / no preupdate-hook → OP_Clear. }
+  if (rcauth = SQLITE_OK)
+     and (pWhere = nil)
+     and (bComplex = 0)
+     and (pTab^.eTabType <> TABTYP_VTAB) then
+  begin
+    { Phase 7: shared-cache TableLock no-op. }
+    if HasRowid(pTab) then
+    begin
+      if memCnt <> 0 then
+        sqlite3VdbeAddOp4(v, OP_Clear, i32(pTab^.tnum), iDb, memCnt,
+                          PAnsiChar(pTab^.zName), P4_STATIC)
+      else
+        sqlite3VdbeAddOp4(v, OP_Clear, i32(pTab^.tnum), iDb, -1,
+                          PAnsiChar(pTab^.zName), P4_STATIC);
+    end;
+    pIdx := pTab^.pIndex;
+    while pIdx <> nil do
+    begin
+      if ((pIdx^.idxFlags and 3) = 2) { idxType:2 == 2 == IDX_PRIMARYKEY }
+         and (not HasRowid(pTab)) then
+      begin
+        if memCnt <> 0 then
+          sqlite3VdbeAddOp3(v, OP_Clear, i32(pIdx^.tnum), iDb, memCnt)
+        else
+          sqlite3VdbeAddOp3(v, OP_Clear, i32(pIdx^.tnum), iDb, -1);
+      end else
+        sqlite3VdbeAddOp2(v, OP_Clear, i32(pIdx^.tnum), iDb);
+      pIdx := pIdx^.pNext;
+    end;
+  end else
+  begin
+    { TODO(Phase 6.9-bis step 11g.2.h): where-loop / one-pass DELETE arm
+      (delete.c:495..665).  Blocked on sqlite3OpenTableAndIndices being a
+      Phase 6.4 stub (no OP_OpenWrite emission).  Schema-row DELETEs
+      issued by sqlite3NestedParse (DROP TABLE / DROP INDEX) take this
+      path — productive emission lands once OpenTableAndIndices does. }
+  end;
+
+  if (pParse^.nested = 0) and (pParse^.pTriggerTab = nil) then
+    sqlite3AutoincrementEnd(pParse);
+
+  if memCnt <> 0 then
+    sqlite3CodeChangeCount(v, memCnt, PAnsiChar('rows deleted'));
 
 delete_from_cleanup:
-  if skelEntered then begin
-    if pParse^.zErrMsg <> nil then sqlite3DbFree(db, pParse^.zErrMsg);
-    pParse^.zErrMsg := saveErrMsg;
-    pParse^.nErr    := saveNErr;
-    pParse^.rc      := saveRc;
-  end;
   sqlite3AuthContextPop(@sContext);
   sqlite3SrcListDelete(pParse^.db, pTabList);
   sqlite3ExprDelete(pParse^.db, pWhere);
@@ -17443,19 +17514,178 @@ delete_from_cleanup:
   sqlite3ExprDelete(pParse^.db, pLimit);
 end;
 
-{ sqlite3GenerateRowDelete — emit row-deletion VDBE (Phase 6.4 stub) }
+{ sqlite3GenerateRowDelete — port of delete.c:745..879.
+
+  Generate VDBE that deletes one row of pTab.  Preconditions:
+    1. iDataCur is open on the canonical data btree (table itself for rowid
+       tables; PRIMARY KEY index for WITHOUT ROWID).
+    2. Read/write cursors for each index of pTab are open at iIdxCur+i.
+    3. The PK is in nPk regs starting at iPk (or, if nPk=0, a packed search
+       record in iPk produced by OP_MakeRecord).
+
+  Phase 6.9-bis step 11g.2.f: trigger / FK arms are gated on stub helpers
+  (sqlite3CodeRowTrigger, sqlite3FkCheck/FkActions, sqlite3TriggerColmask,
+  sqlite3FkOldmask).  Calls match C verbatim — when those helpers become
+  productive, BEFORE/AFTER trigger fire and FK enforcement light up
+  automatically without further changes here. }
 procedure sqlite3GenerateRowDelete(pParse: PParse; pTab: PTable2;
   pTrigger: PTrigger; iDataCur: i32; iIdxCur: i32; iPk: i32;
   nPk: i16; count: u8; onconf: u8; eMode: u8; iIdxNoSeek: i32);
+var
+  v:         PVdbe;
+  iOld:      i32;
+  iLabel:    i32;
+  opSeek:    u8;
+  mask:      u32;
+  iCol:      i32;
+  addrStart: i32;
+  kk:        i32;
+  p5:        u8;
 begin
-  { Phase 6.5 }
+  iOld := 0;
+  v := pParse^.pVdbe;
+  Assert(v <> nil);
+
+  { Seek the row to delete.  ONEPASS_OFF means iDataCur is not yet positioned. }
+  iLabel := sqlite3VdbeMakeLabel(pParse);
+  if HasRowid(pTab) then
+    opSeek := OP_NotExists
+  else
+    opSeek := OP_NotFound;
+  if eMode = ONEPASS_OFF then
+    sqlite3VdbeAddOp4Int(v, i32(opSeek), iDataCur, iLabel, iPk, nPk);
+
+  { OLD.* register array setup for triggers / FK old-row reference. }
+  if (sqlite3FkRequired(pParse, pTab, nil, 0) <> 0) or (pTrigger <> nil) then
+  begin
+    { TODO(Phase 6.5): sqlite3TriggerColmask / sqlite3FkOldmask are stubs
+      today (return 0 / void).  Use 0xffffffff to be conservative — we copy
+      every column, which is a faithful upper bound; matches C's
+      "mask==0xffffffff" early-exit branch. }
+    mask := sqlite3TriggerColmask(pParse, pTrigger, nil, 0,
+                                  TRIGGER_BEFORE or TRIGGER_AFTER, pTab,
+                                  i32(onconf));
+    { mask |= sqlite3FkOldmask(pParse, pTab) — Phase 7 (FkOldmask is void). }
+    iOld := pParse^.nMem + 1;
+    pParse^.nMem := pParse^.nMem + (1 + i32(pTab^.nCol));
+
+    { Populate OLD.* pseudo-table registers. }
+    sqlite3VdbeAddOp2(v, OP_Copy, iPk, iOld);
+    iCol := 0;
+    while iCol < i32(pTab^.nCol) do
+    begin
+      if (mask = $FFFFFFFF) or ((iCol <= 31) and ((mask and (u32(1) shl iCol)) <> 0)) then
+      begin
+        kk := sqlite3TableColumnToStorage(pTab, i16(iCol));
+        sqlite3ExprCodeGetColumnOfTable(v, pTab, iDataCur, iCol, iOld + kk + 1);
+      end;
+      Inc(iCol);
+    end;
+
+    { BEFORE DELETE triggers. }
+    addrStart := sqlite3VdbeCurrentAddr(v);
+    sqlite3CodeRowTrigger(pParse, pTrigger, TK_DELETE, nil,
+                          TRIGGER_BEFORE, pTab, iOld, i32(onconf), iLabel);
+
+    { If BEFORE triggers were coded, re-seek (they may have moved cursors). }
+    if addrStart < sqlite3VdbeCurrentAddr(v) then
+    begin
+      sqlite3VdbeAddOp4Int(v, i32(opSeek), iDataCur, iLabel, iPk, nPk);
+      iIdxNoSeek := -1;
+    end;
+
+    { FK constraint check (no-op stub — Phase 7). }
+    sqlite3FkCheck(pParse, pTab, iOld, 0, nil, 0);
+  end;
+
+  { Delete row + index entries.  Skipped for views (INSTEAD OF triggers
+    are the only effect for views — the trigger arm above already fired). }
+  if not IsView(pTab) then
+  begin
+    p5 := 0;
+    sqlite3GenerateRowIndexDelete(pParse, pTab, iDataCur, iIdxCur,
+                                  nil, iIdxNoSeek);
+    if count <> 0 then
+      sqlite3VdbeAddOp2(v, OP_Delete, iDataCur, OPFLAG_NCHANGE)
+    else
+      sqlite3VdbeAddOp2(v, OP_Delete, iDataCur, 0);
+    if (pParse^.nested = 0)
+       or (sqlite3StrICmp(PChar(pTab^.zName), PChar('sqlite_stat1')) = 0) then
+      sqlite3VdbeAppendP4(v, Pointer(pTab), P4_TABLE);
+    if eMode <> ONEPASS_OFF then
+      sqlite3VdbeChangeP5(v, OPFLAG_AUXDELETE);
+    if (iIdxNoSeek >= 0) and (iIdxNoSeek <> iDataCur) then
+      sqlite3VdbeAddOp1(v, OP_Delete, iIdxNoSeek);
+    if eMode = ONEPASS_MULTI then p5 := p5 or OPFLAG_SAVEPOSITION;
+    sqlite3VdbeChangeP5(v, p5);
+  end;
+
+  { ON CASCADE / SET NULL / SET DEFAULT FK actions (no-op stub — Phase 7). }
+  sqlite3FkActions(pParse, pTab, nil, iOld, nil, 0);
+
+  { AFTER DELETE triggers. }
+  if pTrigger <> nil then
+    sqlite3CodeRowTrigger(pParse, pTrigger, TK_DELETE, nil,
+                          TRIGGER_AFTER, pTab, iOld, i32(onconf), iLabel);
+
+  { Resolved when row is missing or RAISE(IGNORE) skips out. }
+  sqlite3VdbeResolveLabel(v, iLabel);
 end;
 
-{ sqlite3GenerateRowIndexDelete — delete all index entries for a row (Phase 6.4 stub) }
+{ sqlite3GenerateRowIndexDelete — port of delete.c:899..932.
+
+  Emit OP_IdxDelete for every index of pTab whose entry should be removed
+  for the row currently positioned at iDataCur.  Skips:
+    * the PK index of WITHOUT ROWID tables (it IS iDataCur),
+    * cursors equal to iIdxNoSeek (caller already deleted it),
+    * indices for which aRegIdx is provided and aRegIdx[i]=0.
+  aRegIdx may be nil (treat all indices as candidates). }
 procedure sqlite3GenerateRowIndexDelete(pParse: PParse; pTab: PTable2;
   iDataCur: i32; iIdxCur: i32; aRegIdx: Pi32; iIdxSkip: i32);
+var
+  i:             i32;
+  r1:            i32;
+  iPartIdxLabel: i32;
+  pIdx, pPrior:  PIndex2;
+  pPk:           PIndex2;
+  v:             PVdbe;
+  uniqNN:        i32;
+  nIdxCol:       i32;
 begin
-  { Phase 6.5 }
+  v := pParse^.pVdbe;
+  if HasRowid(pTab) then
+    pPk := nil
+  else
+    pPk := sqlite3PrimaryKeyIndex(pTab);
+  r1 := -1;
+  pPrior := nil;
+  i := 0;
+  pIdx := pTab^.pIndex;
+  while pIdx <> nil do
+  begin
+    if (aRegIdx <> nil) and ((aRegIdx + i)^ = 0) then begin
+      Inc(i); pIdx := pIdx^.pNext; Continue;
+    end;
+    if pIdx = pPk then begin
+      Inc(i); pIdx := pIdx^.pNext; Continue;
+    end;
+    if (iIdxCur + i) = iIdxSkip then begin
+      Inc(i); pIdx := pIdx^.pNext; Continue;
+    end;
+    r1 := sqlite3GenerateIndexKey(pParse, pIdx, iDataCur, 0, 1,
+                                  @iPartIdxLabel, pPrior, r1);
+    uniqNN := i32((pIdx^.idxFlags shr 3) and 1);
+    if uniqNN <> 0 then
+      nIdxCol := i32(pIdx^.nKeyCol)
+    else
+      nIdxCol := i32(pIdx^.nColumn);
+    sqlite3VdbeAddOp3(v, OP_IdxDelete, iIdxCur + i, r1, nIdxCol);
+    sqlite3VdbeChangeP4(v, -1, PAnsiChar(pIdx), P4_INDEX);
+    sqlite3ResolvePartIdxLabel(pParse, iPartIdxLabel);
+    pPrior := pIdx;
+    Inc(i);
+    pIdx := pIdx^.pNext;
+  end;
 end;
 
 { sqlite3ExprCodeLoadIndexColumn — load one column of an index from a table
