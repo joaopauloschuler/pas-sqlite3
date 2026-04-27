@@ -2586,6 +2586,114 @@ begin
   Check('WLNB5 candidate larger szIdxRow → 1', rc = 1);
 end;
 
+{ ----- wherePathSatisfiesOrderBy ----- }
+
+procedure TestPathSatisfiesOrderBy;
+var
+  db:           PTsqlite3;
+  rc:           i32;
+  parse:        TParse;
+  wInfoBuf:     array[0..2047] of u8;
+  pWInfo:       PWhereInfo;
+  src:          TSrcListBuf;
+  loop:         TWhereLoop;
+  obItems:      array[0..0] of TExprListItem;
+  obList:       record hdr: TExprList; tail: TExprListItem; end;
+  pOrderBy:     PExprList;
+  pathBuf:      array[0..7] of PWhereLoop;
+  path:         TWherePath;
+  revMask:      Bitmask;
+  result:       i8;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('OBSAT open', rc = SQLITE_OK);
+
+  FillChar(parse,    SizeOf(parse),    0);
+  parse.db := db;
+
+  FillChar(wInfoBuf, SizeOf(wInfoBuf), 0);
+  pWInfo := PWhereInfo(@wInfoBuf[0]);
+  pWInfo^.pParse := @parse;
+
+  FillChar(src, SizeOf(src), 0);
+  src.hdr.nSrc        := 1;
+  src.item.iCursor    := 7;
+  pWInfo^.pTabList    := @src.hdr;
+
+  { Single-term ORDER BY referencing iCur=7. }
+  FillChar(obList, SizeOf(obList), 0);
+  FillChar(obItems, SizeOf(obItems), 0);
+  obList.hdr.nExpr := 1;
+  pOrderBy := @obList.hdr;
+
+  FillChar(path, SizeOf(path), 0);
+  FillChar(pathBuf, SizeOf(pathBuf), 0);
+  path.aLoop := @pathBuf[0];
+
+  { ---- OBSAT1: OrderByIdxJoin disabled with nLoop>0 → 0 (early exit). ---- }
+  FillChar(loop, SizeOf(loop), 0);
+  loop.iTab     := 0;
+  loop.maskSelf := $0001;
+  loop.wsFlags  := WHERE_IPK;
+  pathBuf[0]    := @loop;
+  db^.dbOptFlags := SQLITE_OrderByIdxJoin;
+  revMask := 0;
+  result := wherePathSatisfiesOrderBy(pWInfo, pOrderBy, @path, 0,
+                                      1, @loop, @revMask);
+  Check('OBSAT1 OrderByIdxJoin disabled → 0', result = 0);
+  db^.dbOptFlags := 0;
+
+  { ---- OBSAT2: ORDER BY too wide (>BMS-1 terms) → returns 0. ---- }
+  obList.hdr.nExpr := BMS;          { 64 — exceeds BMS-1 }
+  result := wherePathSatisfiesOrderBy(pWInfo, pOrderBy, @path, 0,
+                                      0, @loop, @revMask);
+  Check('OBSAT2 nOrderBy > BMS-1 → 0', result = 0);
+  obList.hdr.nExpr := 1;
+
+  { ---- OBSAT3: virtual table loop with isOrdered=1 and pWInfo->pOrderBy=pOrderBy
+    → obSat saturates → returns nOrderBy=1. ---- }
+  FillChar(loop, SizeOf(loop), 0);
+  loop.iTab     := 0;
+  loop.maskSelf := $0001;
+  loop.wsFlags  := WHERE_VIRTUALTABLE;
+  loop.u.vtab.isOrdered := 1;
+  pWInfo^.pOrderBy := pOrderBy;
+  revMask := 0;
+  result := wherePathSatisfiesOrderBy(pWInfo, pOrderBy, @path, 0,
+                                      0, @loop, @revMask);
+  Check('OBSAT3 vtab isOrdered + matching pOrderBy → nOrderBy', result = 1);
+
+  { ---- OBSAT4: virtual table loop with isOrdered=0 → isOrderDistinct cleared
+    → 0 (loops out, no satisfaction). ---- }
+  loop.u.vtab.isOrdered := 0;
+  revMask := 0;
+  result := wherePathSatisfiesOrderBy(pWInfo, pOrderBy, @path, 0,
+                                      0, @loop, @revMask);
+  Check('OBSAT4 vtab unordered → 0', result = 0);
+
+  { ---- OBSAT5: vtab with isOrdered=1 but pWInfo->pOrderBy != pOrderBy →
+    isOrderDistinct cleared → 0. ---- }
+  loop.u.vtab.isOrdered := 1;
+  pWInfo^.pOrderBy := nil;          { mismatched }
+  revMask := 0;
+  result := wherePathSatisfiesOrderBy(pWInfo, pOrderBy, @path, 0,
+                                      0, @loop, @revMask);
+  Check('OBSAT5 vtab ordered but pOrderBy mismatch → 0', result = 0);
+  pWInfo^.pOrderBy := pOrderBy;
+
+  { ---- OBSAT6: nLoop=0 with OrderByIdxJoin disabled is allowed (gate only
+    bites when nLoop > 0).  Use a vtab loop again to keep determinism. ---- }
+  db^.dbOptFlags := SQLITE_OrderByIdxJoin;
+  loop.u.vtab.isOrdered := 1;
+  revMask := 0;
+  result := wherePathSatisfiesOrderBy(pWInfo, pOrderBy, @path, 0,
+                                      0, @loop, @revMask);
+  Check('OBSAT6 nLoop=0 not gated by OrderByIdxJoin', result = 1);
+  db^.dbOptFlags := 0;
+
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -2618,6 +2726,7 @@ begin
   TestWhereLoopAddAllAndOr;
   TestSortingCost;
   TestLoopIsNoBetter;
+  TestPathSatisfiesOrderBy;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

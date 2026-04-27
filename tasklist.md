@@ -408,6 +408,35 @@ Important: At the end of this document, please find:
       via nExpr), WLNB1..WLNB2 (non-indexed loops short-circuit to 1),
       WLNB3 (smaller candidate szIdxRow → 0), WLNB4..WLNB5 (equal / larger
       candidate → 1).
+    - [X] `wherePathSatisfiesOrderBy` (where.c:5146..5478) — pure
+      analysis helper consumed by wherePathSolver; given a candidate
+      WherePath plus one more WhereLoop pLast appended at the end,
+      returns the number of leading ORDER BY (or GROUP BY / DISTINCT)
+      terms the path satisfies natively.  Returns nOrderBy on full
+      match, -1 when every prior loop is order-distinct and unconstrained
+      tail terms could still be satisfied by future loops, 0 otherwise.
+      pRevMask out-param accumulates the bitmask of WhereLoops that must
+      be run in reverse order for the natural sort direction to come out
+      forward.  All five branches ported verbatim: early SQLITE_OrderByIdxJoin
+      gate, BMS-1 nOrderBy cap, virtual-table isOrdered short-circuit,
+      "mark off ORDER BY column = ? from outer loops" pre-pass, full per-
+      index-column walk with EQ/IS/ISNULL/IN handling + sort-order
+      compatibility + WHERE_BIGNULL_SORT promotion + isOrderDistinct
+      tag-20210426-1 corrections + nDistinctCol bookkeeping for
+      WHERE_DISTINCTBY, plus the orderDistinctMask post-pass that absorbs
+      ORDER BY terms referencing only well-ordered tables.
+      `wherePathMatchSubqueryOB` lands as a returns-0 stub — full port
+      gated on subquery-flatten work in a later sub-progress; with the
+      stub the WHERE_IPK arm always takes the nColumn=1 branch (correct
+      behaviour, just leaves the SQLITE_OrderBySubq optimisation
+      dormant).  SQLITE_OrderByIdxJoin and SQLITE_OrderBySubq dbOptFlags
+      lifted from sqliteInt.h:1905,1930.  Gate: `TestWherePlanner.pas`
+      (251/251): OBSAT1 (OrderByIdxJoin gate triggers when nLoop>0),
+      OBSAT2 (nOrderBy=BMS exceeds the BMS-1 cap → 0), OBSAT3 (vtab
+      isOrdered=1 with matching pWInfo->pOrderBy → obSat saturates →
+      returns nOrderBy), OBSAT4 (vtab isOrdered=0 → 0), OBSAT5 (vtab
+      ordered but pOrderBy mismatch → 0), OBSAT6 (nLoop=0 bypasses the
+      OrderByIdxJoin gate per where.c:5203).
     - [X] `whereRangeScanEst` (where.c:2092..2254, no-STAT4 tail) —
       reduces `pLoop^.nOut` to account for the leftover range
       constraints on the leading (nEq+1)'th column of the index pLoop

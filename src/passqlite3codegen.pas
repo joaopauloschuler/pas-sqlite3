@@ -1443,12 +1443,14 @@ const
   SQLITE_QueryFlattener = u32($00000001);
   SQLITE_CoverIdxScan   = u32($00000020);  { covering-index scan opt (sqliteInt.h:1904) }
   SQLITE_DistinctOpt    = u32($00000010);
+  SQLITE_OrderByIdxJoin = u32($00000040);  { ORDER BY of joins via index (sqliteInt.h:1905) }
   SQLITE_OmitNoopJoin   = u32($00000100);
   SQLITE_Stat4          = u32($00000800);
   SQLITE_SkipScan       = u32($00004000);
   SQLITE_SeekScan       = u32($00020000);
   SQLITE_BloomFilter    = u32($00080000);
   SQLITE_OnePass        = u32($08000000);
+  SQLITE_OrderBySubq    = u32($10000000);  { ORDER BY in subquery helps outer (sqliteInt.h:1930) }
 
   { TOPBIT — top bit of a 64-bit Bitmask (sqliteInt.h:1414); used by
     whereLoopAddBtree's "covering by bitmask" check to detect the
@@ -1823,6 +1825,30 @@ function  whereSortingCost(pWInfo: PWhereInfo; nRow: i16;
                            nOrderBy: i32; nSorted: i32): i16;
 function  whereLoopIsNoBetter(pCandidate: PWhereLoop;
                               pBaseline: PWhereLoop): i32;
+
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — wherePathSatisfiesOrderBy
+  (where.c:5146..5478).  Pure analysis helper consumed by wherePathSolver:
+  given a candidate WherePath plus one more WhereLoop pLast appended at
+  the end, returns the number of leading ORDER BY (or GROUP BY / DISTINCT)
+  terms the path satisfies natively.  Returns nOrderBy on full match, -1
+  when every prior loop is order-distinct and unconstrained tail terms
+  could still be satisfied by future loops, 0 otherwise.  pRevMask
+  out-parameter accumulates the bitmask of WhereLoops that must be run in
+  reverse order for the natural sort direction to come out forward. }
+function  wherePathSatisfiesOrderBy(pWInfo: PWhereInfo; pOrderBy: PExprList;
+  pPath: PWherePath; wctrlFlags: u16; nLoop: u16; pLast: PWhereLoop;
+  pRevMask: PBitmask): i8;
+
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — wherePathMatchSubqueryOB
+  stub (where.c:5036..5144).  The ORDER-BY-from-subquery optimisation
+  recognises an outer ORDER BY whose leading terms are also the leading
+  terms of an inlined subquery's ORDER BY; matching extends obSat past
+  the columns of the IPK loop.  Full port lands alongside subquery
+  flattening in a later sub-progress.  Stub returns 0 (no match) so the
+  WHERE_IPK arm in wherePathSatisfiesOrderBy takes the nColumn=1 branch. }
+function  wherePathMatchSubqueryOB(pWInfo: PWhereInfo; pLoop: PWhereLoop;
+  iLoop: i32; iCur: i32; pOrderBy: PExprList; pRevMask: PBitmask;
+  pObSat: PBitmask): i32;
 
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
@@ -10204,6 +10230,338 @@ begin
   if pCandidate^.u.btree.pIndex^.szIdxRow
      < pBaseline^.u.btree.pIndex^.szIdxRow then Exit(0);
   Result := 1;
+end;
+
+{ wherePathMatchSubqueryOB — stub. See interface banner. }
+function wherePathMatchSubqueryOB(pWInfo: PWhereInfo; pLoop: PWhereLoop;
+  iLoop: i32; iCur: i32; pOrderBy: PExprList; pRevMask: PBitmask;
+  pObSat: PBitmask): i32;
+begin
+  Result := 0;
+end;
+
+{ wherePathSatisfiesOrderBy — direct port of where.c:5146..5478.
+
+  Returns -1, 0, or a count in [0, nOrderBy] of how many leading ORDER BY
+  (or GROUP BY / DISTINCT) terms the (pPath + pLast) WhereLoop chain
+  satisfies natively.  -1 means "every prior loop is order-distinct, so
+  appending more loops could still extend obSat".  Pure analysis — never
+  emits VDBE code, never mutates the WhereClause, and only writes to
+  pPath/pLast through the ORDER-BY-bookkeeping fields wsFlags
+  (WHERE_BIGNULL_SORT) and u.btree.nDistinctCol that wherePathSolver
+  expects to find populated. }
+function wherePathSatisfiesOrderBy(pWInfo: PWhereInfo; pOrderBy: PExprList;
+  pPath: PWherePath; wctrlFlags: u16; nLoop: u16; pLast: PWhereLoop;
+  pRevMask: PBitmask): i8;
+var
+  revSet:           u8;
+  rev:              u8;
+  revIdx:           u8;
+  isOrderDistinct:  u8;
+  distinctColumns:  u8;
+  isMatch:          u8;
+  bOnce:            u8;
+  eqOpMask:         u16;
+  nKeyCol:          u16;
+  nColumn:          u16;
+  nOrderBy:         u16;
+  iLoop:            i32;
+  i, j:             i32;
+  iCur:             i32;
+  iColumn:          i32;
+  pLoop:            PWhereLoop;
+  pTerm:            PWhereTerm;
+  pOBExpr:          PExpr;
+  pColl, pColl1, pColl2: PTCollSeq;
+  pIndex:           PIndex2;
+  db:               PTsqlite3;
+  obSat:            Bitmask;
+  obDone:           Bitmask;
+  orderDistinctMask: Bitmask;
+  ready:            Bitmask;
+  obItems:          PExprListItem;
+  obi:              PExprListItem;
+  pPrs:             PParse;
+  pIxExpr:          PExpr;
+  eOp:              u16;
+  pX:               PExpr;
+  p:                PExpr;
+  mTerm:            Bitmask;
+  m:                Bitmask;
+begin
+  pLoop := nil;
+  db := pWInfo^.pParse^.db;
+  obSat := 0;
+  Assert(pOrderBy <> nil);
+  if (nLoop <> 0) and OptimizationDisabled(db, SQLITE_OrderByIdxJoin) then
+    Exit(0);
+  nOrderBy := u16(pOrderBy^.nExpr);
+  obItems := ExprListItems(pOrderBy);
+  if i32(nOrderBy) > BMS - 1 then Exit(0);
+  isOrderDistinct  := 1;
+  if nOrderBy = 0 then obDone := 0
+  else obDone := (Bitmask(1) shl nOrderBy) - 1;
+  orderDistinctMask := 0;
+  ready := 0;
+  eqOpMask := WO_EQ or WO_IS or WO_ISNULL;
+  if (wctrlFlags and (WHERE_ORDERBY_LIMIT or WHERE_ORDERBY_MAX
+                      or WHERE_ORDERBY_MIN)) <> 0 then
+    eqOpMask := eqOpMask or WO_IN;
+
+  iLoop := 0;
+  while (isOrderDistinct <> 0) and (obSat < obDone)
+        and (iLoop <= i32(nLoop)) do
+  begin
+    if iLoop > 0 then ready := ready or pLoop^.maskSelf;
+    if iLoop < i32(nLoop) then
+    begin
+      pLoop := PPWhereLoop(pPath^.aLoop)[iLoop];
+      if (wctrlFlags and WHERE_ORDERBY_LIMIT) <> 0 then
+      begin
+        Inc(iLoop);
+        Continue;
+      end;
+    end
+    else
+      pLoop := pLast;
+
+    if (pLoop^.wsFlags and WHERE_VIRTUALTABLE) <> 0 then
+    begin
+      if (pLoop^.u.vtab.isOrdered <> 0) and (pWInfo^.pOrderBy = pOrderBy) then
+        obSat := obDone
+      else
+        isOrderDistinct := 0;
+      Break;
+    end;
+    iCur := SrcListItems(pWInfo^.pTabList)[pLoop^.iTab].iCursor;
+
+    { Mark off any ORDER BY term X that is a column in the table of the
+      current loop for which there is term in the WHERE clause of the
+      form X IS NULL or X=? that reference only outer loops. }
+    for i := 0 to i32(nOrderBy) - 1 do
+    begin
+      if ((Bitmask(1) shl i) and obSat) <> 0 then Continue;
+      pOBExpr := sqlite3ExprSkipCollateAndLikely(obItems[i].pExpr);
+      if pOBExpr = nil then Continue;
+      if (pOBExpr^.op <> TK_COLUMN) and (pOBExpr^.op <> TK_AGG_COLUMN) then
+        Continue;
+      if pOBExpr^.iTable <> iCur then Continue;
+      pTerm := sqlite3WhereFindTerm(@pWInfo^.sWC, iCur, pOBExpr^.iColumn,
+                                    not ready, eqOpMask, nil);
+      if pTerm = nil then Continue;
+      if pTerm^.eOperator = WO_IN then
+      begin
+        Assert((wctrlFlags and (WHERE_ORDERBY_LIMIT or WHERE_ORDERBY_MIN
+                                or WHERE_ORDERBY_MAX)) <> 0);
+        j := 0;
+        while (j < pLoop^.nLTerm)
+              and (pTerm <> PPWhereTerm(pLoop^.aLTerm)[j]) do Inc(j);
+        if j >= pLoop^.nLTerm then Continue;
+      end;
+      if ((pTerm^.eOperator and (WO_EQ or WO_IS)) <> 0)
+         and (pOBExpr^.iColumn >= 0) then
+      begin
+        pPrs := pWInfo^.pParse;
+        pColl1 := PTCollSeq(sqlite3ExprNNCollSeq(pPrs, obItems[i].pExpr));
+        pColl2 := PTCollSeq(sqlite3ExprCompareCollSeq(pPrs, pTerm^.pExpr));
+        { Phase 6.6 stub: sqlite3ExprNNCollSeq returns nil → conservatively
+          accept (BINARY-default match) so the most common corpus shape
+          isn't disqualified by missing collation metadata. }
+        if (pColl1 <> nil) and (pColl2 <> nil) then
+          if sqlite3StrICmp(pColl1^.zName, pColl2^.zName) <> 0 then Continue;
+      end;
+      obSat := obSat or (Bitmask(1) shl i);
+    end;
+
+    if (pLoop^.wsFlags and WHERE_ONEROW) = 0 then
+    begin
+      if (pLoop^.wsFlags and WHERE_IPK) <> 0 then
+      begin
+        if (pLoop^.u.btree.pOrderBy <> nil)
+           and OptimizationEnabled(db, SQLITE_OrderBySubq)
+           and (wherePathMatchSubqueryOB(pWInfo, pLoop, iLoop, iCur,
+                                         pOrderBy, pRevMask, @obSat) <> 0) then
+        begin
+          nColumn := 0;
+          isOrderDistinct := 0;
+        end
+        else
+          nColumn := 1;
+        pIndex := nil;
+        nKeyCol := 0;
+      end
+      else
+      begin
+        pIndex := pLoop^.u.btree.pIndex;
+        if (pIndex = nil) or (indexBUnordered(pIndex) <> 0) then Exit(0);
+        nKeyCol := pIndex^.nKeyCol;
+        nColumn := pIndex^.nColumn;
+        isOrderDistinct := u8((pIndex^.onError <> OE_None)
+          and ((pLoop^.wsFlags and WHERE_SKIPSCAN) = 0));
+      end;
+
+      { Loop through all columns of the index and deal with the ones that
+        are not constrained by == or IN. }
+      rev := 0; revSet := 0; distinctColumns := 0;
+      j := 0;
+      while j < i32(nColumn) do
+      begin
+        bOnce := 1;
+        if (j < i32(pLoop^.u.btree.nEq)) and (j >= i32(pLoop^.nSkip)) then
+        begin
+          eOp := PPWhereTerm(pLoop^.aLTerm)[j]^.eOperator;
+          if (eOp and eqOpMask) <> 0 then
+          begin
+            if (eOp and (WO_ISNULL or WO_IS)) <> 0 then
+              isOrderDistinct := 0;
+            Inc(j); Continue;
+          end
+          else if (eOp and WO_IN) <> 0 then
+          begin
+            pX := PPWhereTerm(pLoop^.aLTerm)[j]^.pExpr;
+            i := j + 1;
+            while i < i32(pLoop^.u.btree.nEq) do
+            begin
+              if PPWhereTerm(pLoop^.aLTerm)[i]^.pExpr = pX then
+              begin
+                bOnce := 0;
+                Break;
+              end;
+              Inc(i);
+            end;
+          end;
+        end;
+
+        if pIndex <> nil then
+        begin
+          iColumn := pIndex^.aiColumn[j];
+          revIdx  := pIndex^.aSortOrder[j] and KEYINFO_ORDER_DESC;
+          if (pIndex^.pTable <> nil) and (i16(iColumn) = pIndex^.pTable^.iPKey)
+            then iColumn := XN_ROWID;
+        end
+        else
+        begin
+          iColumn := XN_ROWID;
+          revIdx  := 0;
+        end;
+
+        { An unconstrained column that might be NULL means that this
+          WhereLoop is not well-ordered.  tag-20210426-1 }
+        if isOrderDistinct <> 0 then
+        begin
+          if (iColumn >= 0) and (j >= i32(pLoop^.u.btree.nEq))
+             and (pIndex <> nil) and (pIndex^.pTable <> nil)
+             and ((pIndex^.pTable^.aCol[iColumn].typeFlags and $0F) = 0) then
+            isOrderDistinct := 0;
+          if iColumn = XN_EXPR then isOrderDistinct := 0;
+        end;
+
+        { Find the ORDER BY term that matches the j-th index column. }
+        isMatch := 0;
+        i := 0;
+        while (bOnce <> 0) and (i < i32(nOrderBy)) do
+        begin
+          if ((Bitmask(1) shl i) and obSat) <> 0 then begin Inc(i); Continue; end;
+          obi := @obItems[i];
+          pOBExpr := sqlite3ExprSkipCollateAndLikely(obi^.pExpr);
+          if pOBExpr = nil then begin Inc(i); Continue; end;
+          if (wctrlFlags and (WHERE_GROUPBY or WHERE_DISTINCTBY)) = 0 then
+            bOnce := 0;
+          if iColumn >= XN_ROWID then
+          begin
+            if (pOBExpr^.op <> TK_COLUMN) and (pOBExpr^.op <> TK_AGG_COLUMN) then
+              begin Inc(i); Continue; end;
+            if pOBExpr^.iTable <> iCur then begin Inc(i); Continue; end;
+            if pOBExpr^.iColumn <> i16(iColumn) then begin Inc(i); Continue; end;
+          end
+          else
+          begin
+            pIxExpr := ExprListItems(pIndex^.aColExpr)[j].pExpr;
+            if sqlite3ExprCompareSkip(pOBExpr, pIxExpr, iCur) <> 0 then
+              begin Inc(i); Continue; end;
+          end;
+          if iColumn <> XN_ROWID then
+          begin
+            pColl := PTCollSeq(sqlite3ExprNNCollSeq(pWInfo^.pParse, obi^.pExpr));
+            if (pColl <> nil)
+               and (sqlite3StrICmp(pColl^.zName,
+                                   PPAnsiChar(pIndex^.azColl)[j]) <> 0) then
+              begin Inc(i); Continue; end;
+          end;
+          if (wctrlFlags and WHERE_DISTINCTBY) <> 0 then
+            pLoop^.u.btree.nDistinctCol := u16(j + 1);
+          isMatch := 1;
+          Break;
+        end;
+        if (isMatch <> 0) and ((wctrlFlags and WHERE_GROUPBY) = 0) then
+        begin
+          { Sort order must be compatible. }
+          if revSet <> 0 then
+          begin
+            if (rev xor revIdx)
+               <> (obItems[i].fg.sortFlags and KEYINFO_ORDER_DESC) then
+              isMatch := 0;
+          end
+          else
+          begin
+            rev := revIdx xor (obItems[i].fg.sortFlags and KEYINFO_ORDER_DESC);
+            if rev <> 0 then pRevMask^ := pRevMask^ or (Bitmask(1) shl iLoop);
+            revSet := 1;
+          end;
+        end;
+        if (isMatch <> 0)
+           and ((obItems[i].fg.sortFlags and KEYINFO_ORDER_BIGNULL) <> 0) then
+        begin
+          if j = i32(pLoop^.u.btree.nEq) then
+            pLoop^.wsFlags := pLoop^.wsFlags or WHERE_BIGNULL_SORT
+          else
+            isMatch := 0;
+        end;
+        if isMatch <> 0 then
+        begin
+          if iColumn = XN_ROWID then distinctColumns := 1;
+          obSat := obSat or (Bitmask(1) shl i);
+        end
+        else
+        begin
+          { No match. }
+          if (j = 0) or (j < i32(nKeyCol)) then isOrderDistinct := 0;
+          Break;
+        end;
+        Inc(j);
+      end; { end column loop }
+      if distinctColumns <> 0 then isOrderDistinct := 1;
+    end; { end-if not one-row }
+
+    { Mark off any other ORDER BY terms that reference pLoop. }
+    if isOrderDistinct <> 0 then
+    begin
+      orderDistinctMask := orderDistinctMask or pLoop^.maskSelf;
+      for i := 0 to i32(nOrderBy) - 1 do
+      begin
+        if ((Bitmask(1) shl i) and obSat) <> 0 then Continue;
+        p := obItems[i].pExpr;
+        mTerm := sqlite3WhereExprUsage(@pWInfo^.sMaskSet, p);
+        if (mTerm = 0) and (sqlite3ExprIsConstant(nil, p) = 0) then Continue;
+        if (mTerm and (not orderDistinctMask)) = 0 then
+          obSat := obSat or (Bitmask(1) shl i);
+      end;
+    end;
+
+    Inc(iLoop);
+  end; { end while loop over levels }
+  if obSat = obDone then Exit(i8(nOrderBy));
+  if isOrderDistinct = 0 then
+  begin
+    for i := i32(nOrderBy) - 1 downto 1 do
+    begin
+      if i < BMS then m := (Bitmask(1) shl i) - 1
+      else m := 0;
+      if (obSat and m) = m then Exit(i8(i));
+    end;
+    Exit(0);
+  end;
+  Result := -1;
 end;
 
 { ---------------------------------------------------------------------------
