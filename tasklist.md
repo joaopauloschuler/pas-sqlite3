@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 57 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 58); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 68 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 69); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -189,7 +189,7 @@ Important: At the end of this document, please find:
   Scaffold landed; corpus expanded to 56 rows (DDL + SELECT/DML/txn +
   SAVEPOINT/RELEASE + INSERT DEFAULT VALUES + multi-AND + multi-col
   rowid-EQ + per-row arith / negate / concat + transaction synonyms).
-  Current Status (2026-04-27): **57 PASS / 1 DIVERGE / 0 ERROR**.
+  Current Status (2026-04-27): **68 PASS / 1 DIVERGE / 0 ERROR**.
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -291,9 +291,13 @@ Important: At the end of this document, please find:
       before `sqlite3WhereBegin`, and the SRT_Output inner loop emits
       `OP_DecrJumpZero p^.iLimit, pWInfo^.iBreak` after `OP_ResultRow`
       (mirrors select.c:2520..2530 + select.c:1522..1525).  OFFSET and
-      non-constant LIMIT still bail to the stub.  Corpus now
-      57 PASS / 1 DIVERGE / 58 total (added `SELECT col LIMIT` and
-      `SELECT col WHERE LIMIT`).
+      non-constant LIMIT still bail to the stub.
+
+      Sub-progress (2026-04-27): probe sweep #4 added 11 more PASS rows
+      (5 comparison ops `<`/`<>`/`<=`/`>=`/`>` against col=lit, multi-
+      arith literal `1+2-3`, unary literal `-1`, string concat literal
+      `'abc'||'def'`, col `a-b` / `a/2`, and full-table `DELETE FROM t`
+      truncate arm).  Corpus now 68 PASS / 1 DIVERGE / 69 total.
 
       DIVERGE shapes discovered in probe sweeps (kept out of corpus
       until they flip — each is a committable next-agent ticket):

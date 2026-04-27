@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 58;
+  N_CORPUS = 69;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -155,6 +155,20 @@ begin
     OP_Integer + OP_DecrJumpZero in sqlite3Select. }
   Add(i, 'SELECT col LIMIT',            'SELECT a FROM t LIMIT 3;');             Inc(i);
   Add(i, 'SELECT col WHERE LIMIT',      'SELECT a FROM t WHERE a=5 LIMIT 2;');   Inc(i);
+
+  { Step 6 sub-progress (probe sweep #4) — comparison / arith / DELETE-all
+    shapes confirmed PASS. }
+  Add(i, 'SELECT col WHERE a<5',        'SELECT a FROM t WHERE a<5;');           Inc(i);
+  Add(i, 'SELECT col WHERE a<>5',       'SELECT a FROM t WHERE a<>5;');          Inc(i);
+  Add(i, 'SELECT col WHERE a<=5',       'SELECT a FROM t WHERE a<=5;');          Inc(i);
+  Add(i, 'SELECT col WHERE a>=5',       'SELECT a FROM t WHERE a>=5;');          Inc(i);
+  Add(i, 'SELECT col WHERE a>5',        'SELECT a FROM t WHERE a>5;');           Inc(i);
+  Add(i, 'SELECT 1+2-3',                'SELECT 1+2-3;');                        Inc(i);
+  Add(i, 'SELECT -1',                   'SELECT -1;');                           Inc(i);
+  Add(i, 'SELECT concat literal',       'SELECT ''abc''||''def'';');             Inc(i);
+  Add(i, 'SELECT col sub',              'SELECT a-b FROM t;');                   Inc(i);
+  Add(i, 'SELECT col div',              'SELECT a/2 FROM t;');                   Inc(i);
+  Add(i, 'DELETE all',                  'DELETE FROM t;');                       Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
