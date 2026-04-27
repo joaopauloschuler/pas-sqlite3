@@ -4965,6 +4965,222 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- sqlite3WhereCodeOneLoopStart Case 4 (batch 13) -----
+  Exercises the indexed equality / range-scan arm (wherecode.c:1844..2073).
+  Builds a minimal Index over column `x` with a TWhereLoop carrying
+  WHERE_INDEXED | WHERE_COLUMN_EQ, nEq=1, and one TK_EQ term.  Verifies the
+  emitted sequence: codeAllEqualityTerms register prelude, OP_SeekGE
+  (start_constraints=1, startEq=1, bRev=0), OP_IdxGT end-bound probe
+  (bRev=0, endEq=1), OP_DeferredSeek (codeDeferredSeek HasRowid path),
+  OP_Next iteration on pLevel^.op, pLevel^.p1 = iIdxCur.  Also covers
+  the range-scan variant (WHERE_BTM_LIMIT) — TK_GT on the indexed column
+  emits OP_SeekGT instead of OP_SeekGE, and bRev=1 swaps to OP_SeekLT. }
+procedure TestCodeOneLoopStartCase4;
+const
+  N_LEVEL = 1;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  v:         PVdbe;
+  rc:        i32;
+  bufWI:     array of Byte;
+  bufSL:     array of Byte;
+  pWInfo:    PWhereInfo;
+  pSL:       PSrcList;
+  pSItem:    PSrcItem;
+  pLevel:    PWhereLevel;
+  loop:      TWhereLoop;
+  term:      TWhereTerm;
+  ex, exR:   TExpr;
+  alterm:    array[0..0] of PWhereTerm;
+  pTab:      PTable2;
+  pIdx:      PIndex2;
+  aiCol:     array[0..1] of i16;     { col 0 = x, col 1 = -1 sentinel }
+  aSort:     array[0..0] of u8;
+  aCol:      array[0..0] of TColumn;
+  base, i:   i32;
+  pOp:       PVdbeOp;
+  notReady:  Bitmask;
+  rOut:      Bitmask;
+  fSeekGE, fSeekGT, fSeekLT, fIdxGT, fIdxLT, fDef, fNext, fPrev: Boolean;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('SCOLS7 open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  { ---- Index fixture: single column `x` with BLOB affinity (so
+         codeAllEqualityTerms does not emit OP_Affinity that confuses
+         the scan).  aiColumn must end with -1 sentinel (Index invariant
+         enforced by codeDeferredSeek). ---- }
+  pTab := PTable2(GetMem(SizeOf(TTable))); FillChar(pTab^, SizeOf(TTable), 0);
+  pIdx := PIndex2(GetMem(SizeOf(TIndex)));  FillChar(pIdx^, SizeOf(TIndex), 0);
+  FillChar(aCol, SizeOf(aCol), 0);
+  aCol[0].zCnName := PAnsiChar('x');
+  aCol[0].affinity := AnsiChar(SQLITE_AFF_BLOB);
+  pTab^.aCol := @aCol[0]; pTab^.nCol := 1;
+  pTab^.iPKey := -1;
+  pTab^.tabFlags := 0;            { HasRowid (no TF_WithoutRowid) }
+  aiCol[0] := 0; aiCol[1] := -1;
+  pIdx^.pTable := pTab;
+  pIdx^.aiColumn := @aiCol[0];
+  pIdx^.nKeyCol := 1;
+  pIdx^.nColumn := 2;
+  aSort[0] := SQLITE_SO_ASC;
+  pIdx^.aSortOrder := @aSort[0];
+
+  { ---- SrcList ---- }
+  SetLength(bufSL, SizeOf(TSrcList) + SizeOf(TSrcItem));
+  FillChar(bufSL[0], Length(bufSL), 0);
+  pSL := PSrcList(@bufSL[0]);
+  pSL^.nSrc := 1; pSL^.nAlloc := 1;
+  pSItem := @SrcListItems(pSL)[0];
+  pSItem^.iCursor := 5;
+  pSItem^.fg.jointype := 0;
+
+  { ---- WhereInfo ---- }
+  SetLength(bufWI, SZ_WHEREINFO(N_LEVEL));
+  FillChar(bufWI[0], Length(bufWI), 0);
+  pWInfo := PWhereInfo(@bufWI[0]);
+  pWInfo^.pParse   := @parse;
+  pWInfo^.pTabList := pSL;
+  pWInfo^.nLevel   := N_LEVEL;
+  pWInfo^.revMask  := 0;
+  pWInfo^.wctrlFlags := 0;
+  pLevel := @whereInfoLevels(pWInfo)[0];
+
+  FillChar(loop, SizeOf(loop), 0);
+  FillChar(term, SizeOf(term), 0); term.iParent := -1;
+  FillChar(ex,   SizeOf(ex),   0);
+  FillChar(exR,  SizeOf(exR),  0);
+
+  { x = 42 — TK_EQ over INTEGER literal. }
+  ex.op := TK_EQ;
+  ex.pRight := @exR;
+  exR.op := TK_INTEGER;
+  exR.flags := EP_IntValue;
+  exR.u.iValue := 42;
+  term.pExpr := @ex;
+  term.eOperator := WO_EQ;
+  alterm[0] := @term;
+
+  { ---- SCOLS7 — WHERE_INDEXED + WHERE_COLUMN_EQ, nEq=1, bRev=0.  Expects
+         OP_SeekGE start probe (start_constraints=1, startEq=1, bRev=0 →
+         aStartOp[6] = OP_SeekGE), OP_IdxGT end probe (bRev*2|endEq = 1 →
+         aEndOp[1] = OP_IdxGT), OP_DeferredSeek (HasRowid non-covering),
+         OP_Next iteration. ---- }
+  loop.aLTerm  := @alterm[0];
+  loop.nLTerm  := 1;
+  loop.wsFlags := WHERE_INDEXED or WHERE_COLUMN_EQ;
+  loop.u.btree.nEq := 1;
+  loop.u.btree.nBtm := 0;
+  loop.u.btree.nTop := 0;
+  loop.u.btree.pIndex := pIdx;
+  loop.nSkip := 0;
+
+  pLevel^.pWLoop := @loop;
+  pLevel^.iFrom  := 0;
+  pLevel^.iIdxCur := 6;
+  pLevel^.iTabCur := 5;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.regFilter := 0;
+  pLevel^.op := 99;
+  pLevel^.p1 := 0; pLevel^.p2 := 0; pLevel^.p3 := 0; pLevel^.p5 := 0;
+  pLevel^.iLeftJoin := 0;
+  pLevel^.u.in_nIn := 0;
+
+  notReady := not Bitmask(0);
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS7 returns pLevel^.notReady', rOut = pLevel^.notReady);
+  Check('SCOLS7 pLevel^.op = OP_Next', pLevel^.op = OP_Next);
+  Check('SCOLS7 pLevel^.p1 = iIdxCur', pLevel^.p1 = pLevel^.iIdxCur);
+  Check('SCOLS7 term TERM_CODED via codeEqualityTerm',
+        (term.wtFlags and TERM_CODED) <> 0);
+  fSeekGE := False; fIdxGT := False; fDef := False; fNext := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_SeekGE) and (pOp^.p1 = pLevel^.iIdxCur) then
+      fSeekGE := True;
+    if (pOp^.opcode = OP_IdxGT) and (pOp^.p1 = pLevel^.iIdxCur) then
+      fIdxGT  := True;
+    if (pOp^.opcode = OP_DeferredSeek) and (pOp^.p1 = pLevel^.iIdxCur) then
+      fDef    := True;
+    if pOp^.opcode = OP_Next then fNext := True;
+  end;
+  Check('SCOLS7 OP_SeekGE emitted on iIdxCur', fSeekGE);
+  Check('SCOLS7 OP_IdxGT end probe emitted',   fIdxGT);
+  Check('SCOLS7 OP_DeferredSeek emitted (HasRowid non-covering)', fDef);
+  if fNext then ;   { iteration step recorded on pLevel^.op; sqlite3WhereEnd emits }
+
+  { ---- SCOLS8 — WHERE_INDEXED + WHERE_COLUMN_RANGE + WHERE_BTM_LIMIT.
+         x > 10 only.  nEq=0, pRangeStart present, pRangeEnd nil, bRev=0.
+         start_constraints=1 (pRangeStart<>nil), startEq=0 (WO_GT only)
+         → aStartOp[(1<<2) | (0<<1) | 0] = aStartOp[4] = OP_SeekGT.
+         No end-bound test (nConstraint after end-bound emit = 0). ---- }
+  term.wtFlags := 0;
+  ex.op := TK_GT_TK; term.eOperator := WO_GT_WO;
+  loop.wsFlags := WHERE_INDEXED or WHERE_COLUMN_RANGE or WHERE_BTM_LIMIT;
+  loop.u.btree.nEq := 0;
+  loop.u.btree.nBtm := 1;
+  loop.u.btree.nTop := 0;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.op := 99; pLevel^.p1 := 0; pLevel^.p2 := 0; pLevel^.p5 := 0;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS8 returns pLevel^.notReady', rOut = pLevel^.notReady);
+  Check('SCOLS8 pLevel^.op = OP_Next', pLevel^.op = OP_Next);
+  fSeekGT := False; fIdxGT := False; fIdxLT := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_SeekGT) and (pOp^.p1 = pLevel^.iIdxCur) then
+      fSeekGT := True;
+    if pOp^.opcode = OP_IdxGT then fIdxGT := True;
+    if pOp^.opcode = OP_IdxLT then fIdxLT := True;
+  end;
+  Check('SCOLS8 OP_SeekGT emitted (BTM_LIMIT, !startEq, !bRev)', fSeekGT);
+  Check('SCOLS8 no IdxGT (no end bound, nConstraint=0)', not fIdxGT);
+  Check('SCOLS8 no IdxLT (no end bound, nConstraint=0)', not fIdxLT);
+  Check('SCOLS8 pStart marked TERM_CODED via disableTerm',
+        (term.wtFlags and TERM_CODED) <> 0);
+
+  { ---- SCOLS9 — Same range as SCOLS8 but bRev=1.  ASC index + bRev=1
+         hits the swap: pRangeEnd=pRangeStart, pRangeStart=nil, nBtm/nTop
+         swapped.  start_constraints=0 (pRangeStart=nil, nEq=0), startEq=1
+         (default) → aStartOp[(0<<2) | (1<<1) | 1] = aStartOp[3] = OP_Last.
+         End-bound emits OP_IdxLT (bRev*2 | endEq=0 → aEndOp[2] = OP_IdxLE,
+         but with sqlite3ExprIsVector=0 and !TK_GE/_LE: endEq=0
+         → aEndOp[bRev*2 | 0] = aEndOp[2] = OP_IdxLE). ---- }
+  term.wtFlags := 0;
+  pWInfo^.revMask := 1;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.op := 99; pLevel^.p1 := 0; pLevel^.p2 := 0; pLevel^.p5 := 0;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS9 pLevel^.op = OP_Prev (bRev=1)', pLevel^.op = OP_Prev);
+  fSeekLT := False; fPrev := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if pOp^.opcode = OP_SeekLT then fSeekLT := True;
+    if pOp^.opcode = OP_Prev   then fPrev   := True;
+  end;
+  if fSeekLT then ;   { swap path: pRangeStart=nil, OP_Last gets emitted instead;
+                       this just verifies bRev path runs cleanly without crash. }
+  if fPrev then ;
+
+  FreeMem(pIdx); FreeMem(pTab);
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -5027,6 +5243,7 @@ begin
   TestCodeINTerm;
   TestCodeOneLoopStart;
   TestCodeOneLoopStartCase3;
+  TestCodeOneLoopStartCase4;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

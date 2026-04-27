@@ -794,6 +794,44 @@ Important: At the end of this document, please find:
       (both BTM+TOP — OP_SeekGT + OP_Rowid + OP_Ge + OP_Next, no
       OP_Rewind), SCOLS6 (bRev=1 — pStart/pEnd swap leaves OP_Last +
       OP_Rowid + OP_Le, pLevel^.op=OP_Prev).
+    - [X] Public surface, batch 13 — `sqlite3WhereCodeOneLoopStart`
+      Case 4 indexed equality / range scan (wherecode.c:1844..2073).
+      Common path: nEq>=0, optional WHERE_BTM_LIMIT / WHERE_TOP_LIMIT,
+      no WHERE_BIGNULL_SORT, no WHERE_IN_SEEKSCAN, no LIKEOPT counter,
+      HasRowid table (codeDeferredSeek path).  Emits the start-bound
+      seek selected from `aStartOp[(start_constraints<<2) | (startEq<<1)
+      | bRev]` (OP_Rewind / OP_Last / OP_SeekGT / OP_SeekLT / OP_SeekGE
+      / OP_SeekLE), the optional end-bound idx-probe from
+      `aEndOp[bRev*2 | endEq]` (OP_IdxGE / OP_IdxGT / OP_IdxLE /
+      OP_IdxLT) when nConstraint after the end-bound build is non-zero,
+      OP_DeferredSeek for non-covering indexes, OP_SeekHit when
+      WHERE_IN_EARLYOUT is set, and the iteration opcode (OP_Next /
+      OP_Prev / OP_Noop) on `pLevel^.op`.  ASC/DESC swap
+      (wherecode.c:1907..1911) interchanges pRangeStart/pRangeEnd plus
+      bSeekPastNull/bStopAtNull plus nBtm/nTop when bRev matches the
+      column's aSortOrder.  pRangeStart / pRangeEnd construction
+      threads `codeExprOrVector` + `whereLikeOptimizationStringFixup` +
+      OP_IsNull guard (when sqlite3ExprCanBeNull) + per-vector
+      `updateRangeAffinityStr` + `disableTerm` (or endEq=1 fallback for
+      vector RHS).  Partial-index constraint elision via
+      `whereApplyPartialIndexConstraints` runs only on inner-loop
+      levels (iLeftJoin=0) outside any RIGHT-JOIN subroutine.
+      `pLevel^.p3` is set from WHERE_UNQ_WANTED, `pLevel^.p5` defaults
+      to SQLITE_STMTSTATUS_FULLSCAN_STEP unless WHERE_CONSTRAINT is
+      lit.  Defers WHERE_BIGNULL_SORT (NULL-pad two-pass scan),
+      WHERE_IN_SEEKSCAN (OP_SeekScan tuning), WHERE_IDX_ONLY without
+      rowid (WITHOUT-ROWID PK-key reconstruction), and the trailing
+      Case 5 (MULTI_OR) / Case 6 (full-table scan) arms to subsequent
+      batches.  Gate: `TestWherePlanner.pas` (529/529): SCOLS7
+      (WHERE_INDEXED + WHERE_COLUMN_EQ, nEq=1 — OP_SeekGE on iIdxCur,
+      OP_IdxGT end probe, OP_DeferredSeek, term TERM_CODED via
+      codeEqualityTerm, pLevel^.op=OP_Next, pLevel^.p1=iIdxCur,
+      return value matches pLevel^.notReady), SCOLS8 (WHERE_INDEXED +
+      WHERE_COLUMN_RANGE + WHERE_BTM_LIMIT, x>10 — OP_SeekGT
+      (start_constraints=1, !startEq, !bRev → aStartOp[4]), no
+      end-bound probe since nConstraint after build = 0, pStart marked
+      TERM_CODED), SCOLS9 (BTM_LIMIT under bRev=1 — pLevel^.op flips to
+      OP_Prev, swap path runs cleanly without crash).
     - [X] Leaf helpers, batch 10 — `codeINTerm` (wherecode.c:668..784)
       full port replacing the prior `Assert(False)` stub.  IN-loop
       builder: opens the IN cursor (rowid table / shared index / EPH

@@ -12196,6 +12196,26 @@ const
     OP_SeekLT,   { TK_LT    }
     OP_SeekGE    { TK_GE    }
   );
+  { Case 4 start-of-range seek-op table (wherecode.c:1852..1861).
+    Indexed by (start_constraints<<2) | (startEq<<1) | bRev. }
+  aStartOp: array[0..7] of u8 = (
+    0,
+    0,
+    OP_Rewind,           { 2: !start_constraints && startEq && !bRev }
+    OP_Last,             { 3: !start_constraints && startEq &&  bRev }
+    OP_SeekGT,           { 4:  start_constraints && !startEq && !bRev }
+    OP_SeekLT,           { 5:  start_constraints && !startEq &&  bRev }
+    OP_SeekGE,           { 6:  start_constraints &&  startEq && !bRev }
+    OP_SeekLE            { 7:  start_constraints &&  startEq &&  bRev }
+  );
+  { Case 4 end-of-range probe-op table (wherecode.c:1862..1867).
+    Indexed by (bRev*2) | endEq. }
+  aEndOp: array[0..3] of u8 = (
+    OP_IdxGE,            { 0: end_constraints && !bRev && !endEq }
+    OP_IdxGT,            { 1: end_constraints && !bRev &&  endEq }
+    OP_IdxLE,            { 2: end_constraints &&  bRev && !endEq }
+    OP_IdxLT             { 3: end_constraints &&  bRev &&  endEq }
+  );
 var
   iCur:        i32;       { VDBE cursor for the table }
   addrNxt:     i32;       { Where to jump to continue with the next IN case }
@@ -12218,6 +12238,28 @@ var
   startAddr:   i32;
   memEndValue: i32;
   jRng:        i32;
+  { ---- Case 4 (indexed equality / range scan) locals ---- }
+  pIdx4:           PIndex2;
+  iIdxCur:         i32;
+  nEq4, nBtm4, nTop4: u16;
+  pRangeStart:     PWhereTerm;
+  pRangeEnd:       PWhereTerm;
+  startEq, endEq:  i32;
+  start_constraints: i32;
+  nConstraint:     i32;
+  nExtraReg:       i32;
+  op4:             i32;
+  zStartAff:       PAnsiChar;
+  zEndAff:         PAnsiChar;
+  bSeekPastNull:   u8;
+  bStopAtNull:     u8;
+  omitTable:       i32;
+  regBase4:        i32;
+  pRight4:         PExpr;
+  jSwap8:          u8;
+  jSwap16:         u16;
+  jSwapTerm:       PWhereTerm;
+  j4:              i32;
 begin
   pLoop    := pLevel^.pWLoop;
   pTabItem := @SrcListItems(pWInfo^.pTabList)[pLevel^.iFrom];
@@ -12391,13 +12433,247 @@ begin
       sqlite3VdbeChangeP5(v, u16(SQLITE_AFF_NUMERIC or SQLITE_JUMPIFNULL));
     end;
   end
+  else if (pLoop^.wsFlags and WHERE_INDEXED) <> 0 then
+  begin
+    { Case 4 — wherecode.c:1844..2073.  Indexed equality and/or range
+      scan over a non-IPK index.  Emits the start-bound seek
+      (OP_Rewind / OP_Last / OP_SeekGT / OP_SeekLT / OP_SeekGE /
+      OP_SeekLE) selected from aStartOp[start_constraints<<2 | startEq<<1
+      | bRev], optionally followed by an end-bound idx-probe
+      (OP_IdxGE / OP_IdxGT / OP_IdxLE / OP_IdxLT) from aEndOp[bRev*2 |
+      endEq], a deferred table-row seek (codeDeferredSeek) when the
+      index is non-covering, and the per-loop iteration opcode
+      (OP_Next / OP_Prev / OP_Noop) on pLevel^.op.
+
+      This batch lands the common path: nEq>=0, optional BTM/TOP_LIMIT,
+      no BIGNULL_SORT (asserts off), no IN_SEEKSCAN, no LIKEOPT counter,
+      no bSeekPastNull / bStopAtNull NULL-pad asymmetry, HasRowid table
+      (no WITHOUT ROWID PK-key reconstruction).  These deferred sub-
+      paths land in subsequent batches as fixtures get wired up. }
+
+    pIdx4   := pLoop^.u.btree.pIndex;
+    iIdxCur := pLevel^.iIdxCur;
+    nEq4    := pLoop^.u.btree.nEq;
+    nBtm4   := pLoop^.u.btree.nBtm;
+    nTop4   := pLoop^.u.btree.nTop;
+    Assert(nEq4 >= pLoop^.nSkip);
+
+    { Defer paths that need their own batch.  bSeekPastNull / regBignull
+      and IN_SEEKSCAN both involve OP_NullRow / OP_SeekScan / NULL-pad
+      separate-pass logic that has no fixture yet. }
+    Assert((pLoop^.wsFlags and WHERE_BIGNULL_SORT) = 0);
+    Assert((pLoop^.wsFlags and WHERE_IN_SEEKSCAN) = 0);
+
+    pRangeStart := nil;
+    pRangeEnd   := nil;
+    nExtraReg   := 0;
+    j4          := nEq4;
+    if (pLoop^.wsFlags and WHERE_BTM_LIMIT) <> 0 then
+    begin
+      pRangeStart := pLoop^.aLTerm[j4]; Inc(j4);
+      if i32(pLoop^.u.btree.nBtm) > nExtraReg then
+        nExtraReg := i32(pLoop^.u.btree.nBtm);
+    end;
+    if (pLoop^.wsFlags and WHERE_TOP_LIMIT) <> 0 then
+    begin
+      pRangeEnd := pLoop^.aLTerm[j4]; Inc(j4);
+      if i32(pLoop^.u.btree.nTop) > nExtraReg then
+        nExtraReg := i32(pLoop^.u.btree.nTop);
+      if pRangeStart = nil then
+      begin
+        j4 := pIdx4^.aiColumn[nEq4];
+        if ((j4 >= 0) and ((pIdx4^.pTable^.aCol[j4].typeFlags and $0F) = 0))
+           or (j4 = -2 { XN_EXPR }) then
+          bSeekPastNull := 1
+        else
+          bSeekPastNull := 0;
+      end
+      else
+        bSeekPastNull := 0;
+    end
+    else
+      bSeekPastNull := 0;
+    bStopAtNull := 0;
+
+    { Reverse-order / ASC swap (wherecode.c:1907..1911).  When scanning
+      in the opposite direction of the index sort order, swap pRangeStart
+      and pRangeEnd so the same start-/end-bound emit logic produces the
+      mirror-image probe sequence. }
+    if (nEq4 < pIdx4^.nColumn) and
+       (bRev = i32(pIdx4^.aSortOrder[nEq4] = SQLITE_SO_ASC)) then
+    begin
+      jSwapTerm := pRangeEnd; pRangeEnd := pRangeStart; pRangeStart := jSwapTerm;
+      jSwap8 := bSeekPastNull; bSeekPastNull := bStopAtNull; bStopAtNull := jSwap8;
+      jSwap16 := nBtm4; nBtm4 := nTop4; nTop4 := jSwap16;
+    end;
+
+    { Equality-prefix codegen — emits the constraint-value computation,
+      stores the affinity string in zStartAff for the per-vector trim. }
+    codeCursorHint(pTabItem, pWInfo, pLevel, pRangeEnd);
+    regBase4 := codeAllEqualityTerms(pParse, pLevel, bRev, nExtraReg, @zStartAff);
+    Assert((zStartAff = nil) or (i32(StrLen(zStartAff)) >= i32(nEq4)));
+    if (zStartAff <> nil) and (nTop4 > 0) then
+      zEndAff := sqlite3DbStrDup(pParse^.db, zStartAff + nEq4)
+    else
+      zEndAff := nil;
+    addrNxt := pLevel^.addrNxt;
+
+    if pRangeStart <> nil then
+      startEq := i32((pRangeStart^.eOperator and (WO_LE or WO_GE)) <> 0)
+    else
+      startEq := 1;
+    if pRangeEnd <> nil then
+      endEq := i32((pRangeEnd^.eOperator and (WO_LE or WO_GE)) <> 0)
+    else
+      endEq := 1;
+    if (pRangeStart <> nil) or (nEq4 > 0) then
+      start_constraints := 1
+    else
+      start_constraints := 0;
+
+    nConstraint := nEq4;
+    if pRangeStart <> nil then
+    begin
+      pRight4 := pRangeStart^.pExpr^.pRight;
+      codeExprOrVector(pParse, pRight4, regBase4 + nEq4, i32(nBtm4));
+      whereLikeOptimizationStringFixup(v, pLevel, pRangeStart);
+      if ((pRangeStart^.wtFlags and TERM_VNULL) = 0)
+         and (sqlite3ExprCanBeNull(pRight4) <> 0) then
+      begin
+        sqlite3VdbeAddOp2(v, OP_IsNull, regBase4 + nEq4, addrNxt);
+      end;
+      if zStartAff <> nil then
+        updateRangeAffinityStr(pRight4, i32(nBtm4), zStartAff + nEq4);
+      Inc(nConstraint, i32(nBtm4));
+      if sqlite3ExprIsVector(pRight4) = 0 then
+        disableTerm(pLevel, pRangeStart)
+      else
+        startEq := 1;
+      bSeekPastNull := 0;
+    end
+    else if bSeekPastNull <> 0 then
+    begin
+      startEq := 0;
+      sqlite3VdbeAddOp2(v, OP_Null, 0, regBase4 + nEq4);
+      start_constraints := 1;
+      Inc(nConstraint);
+    end;
+    codeApplyAffinity(pParse, regBase4, nConstraint - i32(bSeekPastNull),
+                      zStartAff);
+    if (pLoop^.nSkip > 0) and (nConstraint = i32(pLoop^.nSkip)) then
+    begin
+      { Skip-scan prelude inside codeAllEqualityTerms already left the
+        cursor sitting on the correct row; no further seek required. }
+    end
+    else
+    begin
+      if pLevel^.regFilter <> 0 then
+      begin
+        sqlite3VdbeAddOp4Int(v, OP_Filter, pLevel^.regFilter, addrNxt,
+                             regBase4, i32(nEq4));
+        filterPullDown(pParse, pWInfo, iLevel, addrNxt, notReady);
+      end;
+      op4 := i32(aStartOp[(start_constraints shl 2) or (startEq shl 1) or bRev]);
+      Assert(op4 <> 0);
+      sqlite3VdbeAddOp4Int(v, op4, iIdxCur, addrNxt, regBase4, nConstraint);
+    end;
+
+    { End-bound emit (wherecode.c:2068..2105). }
+    nConstraint := nEq4;
+    Assert(pLevel^.p2 = 0);
+    if pRangeEnd <> nil then
+    begin
+      pRight4 := pRangeEnd^.pExpr^.pRight;
+      codeExprOrVector(pParse, pRight4, regBase4 + nEq4, i32(nTop4));
+      whereLikeOptimizationStringFixup(v, pLevel, pRangeEnd);
+      if ((pRangeEnd^.wtFlags and TERM_VNULL) = 0)
+         and (sqlite3ExprCanBeNull(pRight4) <> 0) then
+      begin
+        sqlite3VdbeAddOp2(v, OP_IsNull, regBase4 + nEq4, addrNxt);
+      end;
+      if zEndAff <> nil then
+      begin
+        updateRangeAffinityStr(pRight4, i32(nTop4), zEndAff);
+        codeApplyAffinity(pParse, regBase4 + nEq4, i32(nTop4), zEndAff);
+      end;
+      Inc(nConstraint, i32(nTop4));
+      if sqlite3ExprIsVector(pRight4) = 0 then
+        disableTerm(pLevel, pRangeEnd)
+      else
+        endEq := 1;
+    end
+    else if bStopAtNull <> 0 then
+    begin
+      sqlite3VdbeAddOp2(v, OP_Null, 0, regBase4 + nEq4);
+      endEq := 0;
+      Inc(nConstraint);
+    end;
+    if zStartAff <> nil then sqlite3DbFree(pParse^.db, zStartAff);
+    if zEndAff   <> nil then sqlite3DbFree(pParse^.db, zEndAff);
+
+    { Top of the loop body. }
+    pLevel^.p2 := sqlite3VdbeCurrentAddr(v);
+
+    { Check if the index cursor is past the end of the range. }
+    if nConstraint <> 0 then
+    begin
+      op4 := i32(aEndOp[bRev * 2 + endEq]);
+      sqlite3VdbeAddOp4Int(v, op4, iIdxCur, addrNxt, regBase4, nConstraint);
+    end;
+
+    if (pLoop^.wsFlags and WHERE_IN_EARLYOUT) <> 0 then
+      sqlite3VdbeAddOp3(v, OP_SeekHit, iIdxCur, i32(nEq4), i32(nEq4));
+
+    { Seek the table cursor when the index is non-covering. }
+    omitTable := i32((pLoop^.wsFlags and WHERE_IDX_ONLY) <> 0)
+              and i32((pWInfo^.wctrlFlags and (WHERE_OR_SUBCLAUSE or WHERE_RIGHT_JOIN)) = 0);
+    if omitTable <> 0 then
+    begin
+      { covering index — no table-row seek }
+    end
+    else if HasRowid(pIdx4^.pTable) then
+    begin
+      codeDeferredSeek(pWInfo, pIdx4, iCur, iIdxCur);
+    end
+    else
+    begin
+      { WITHOUT ROWID PK-key reconstruction lands in a subsequent batch. }
+      Assert(False);
+    end;
+
+    if pLevel^.iLeftJoin = 0 then
+    begin
+      if (pIdx4^.pPartIdxWhere <> nil) and (pLevel^.pRJ = nil) then
+        whereApplyPartialIndexConstraints(pIdx4^.pPartIdxWhere, iCur,
+                                          @pWInfo^.sWC);
+    end;
+
+    { Iteration opcode. }
+    if ((pLoop^.wsFlags and WHERE_ONEROW) <> 0)
+       or ((pLevel^.u.in_nIn <> 0) and (whereLoopIsOneRow(pLoop) <> 0)) then
+      pLevel^.op := OP_Noop
+    else if bRev <> 0 then
+      pLevel^.op := OP_Prev
+    else
+      pLevel^.op := OP_Next;
+    pLevel^.p1 := iIdxCur;
+    if (pLoop^.wsFlags and WHERE_UNQ_WANTED) <> 0 then
+      pLevel^.p3 := 1
+    else
+      pLevel^.p3 := 0;
+    if (pLoop^.wsFlags and WHERE_CONSTRAINT) = 0 then
+      pLevel^.p5 := SQLITE_STMTSTATUS_FULLSCAN_STEP
+    else
+      Assert(pLevel^.p5 = 0);
+    if omitTable <> 0 then pIdx4 := nil;
+    if pIdx4 = nil then ;   { suppress 'value assigned but unused' on omit path }
+  end
   else
   begin
-    { Cases 1, 4, 5, 6 and the viaCoroutine special case land in
-      subsequent batches.  Until then the dispatch fails fast — callers
-      from TestWherePlanner only exercise the rowid-EQ / rowid-range arms;
-      the inlined sqlite3WhereBegin slice handles the rowid-EQ SQL flow
-      today. }
+    { Cases 1, 5, 6 and the viaCoroutine special case land in subsequent
+      batches.  Until then the dispatch fails fast — callers from
+      TestWherePlanner exercise the rowid-EQ / rowid-range / indexed-EQ
+      arms today. }
     Assert(False);
   end;
 
