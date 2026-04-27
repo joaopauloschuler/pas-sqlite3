@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 225;
+  N_CORPUS = 250;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -337,6 +337,33 @@ begin
   Add(i, 'SELECT a||lit',               'SELECT a||''x'' FROM t;');              Inc(i);
   Add(i, 'SAVEPOINT spA',               'SAVEPOINT spA;');                       Inc(i);
   Add(i, 'RELEASE spA',                 'RELEASE spA;');                         Inc(i);
+
+  { Probe sweep #10 — candidate rows. }
+  Add(i, 'SELECT a&1',                  'SELECT a&1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a|1',                  'SELECT a|1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT 1<<2',                 'SELECT 1<<2;');                         Inc(i);
+  Add(i, 'SELECT 8>>2',                 'SELECT 8>>2;');                         Inc(i);
+  Add(i, 'SELECT ~1',                   'SELECT ~1;');                           Inc(i);
+  Add(i, 'SELECT +1',                   'SELECT +1;');                           Inc(i);
+  Add(i, 'SELECT IFNULL col',           'SELECT IFNULL(a, b) FROM t;');          Inc(i);
+  Add(i, 'SELECT NULLIF col',           'SELECT NULLIF(a, b) FROM t;');          Inc(i);
+  Add(i, 'SELECT COALESCE 3 col',       'SELECT COALESCE(a, b, c) FROM t;');     Inc(i);
+  Add(i, 'SELECT CASE WHEN str',        'SELECT CASE WHEN a=1 THEN ''a'' ELSE ''b'' END FROM t;'); Inc(i);
+  Add(i, 'SELECT CASE 3-arm',           'SELECT CASE a WHEN 1 THEN 1 WHEN 2 THEN 2 ELSE 0 END FROM t;'); Inc(i);
+  Add(i, 'SELECT a+b*c-1',              'SELECT a+b*c-1 FROM t;');               Inc(i);
+  Add(i, 'SELECT (a-b)',                'SELECT (a-b) FROM t;');                 Inc(i);
+  Add(i, 'SELECT a/b',                  'SELECT a/b FROM t;');                   Inc(i);
+  Add(i, 'SELECT a&b&c',                'SELECT a&b&c FROM t;');                 Inc(i);
+  Add(i, 'SELECT 3-str concat',         'SELECT ''a''||''b''||''c'';');          Inc(i);
+  Add(i, 'INSERT large 2',              'INSERT INTO t VALUES(100,200,300);');   Inc(i);
+  Add(i, 'SAVEPOINT spB',               'SAVEPOINT spB;');                       Inc(i);
+  Add(i, 'RELEASE spB',                 'RELEASE spB;');                         Inc(i);
+  Add(i, 'SELECT a, CAST b INT',        'SELECT a, CAST(b AS INTEGER) FROM t;'); Inc(i);
+  Add(i, 'SELECT CAST a INT, b',        'SELECT CAST(a AS INTEGER), b FROM t;'); Inc(i);
+  Add(i, 'SELECT col WHERE NOT NULL',   'SELECT a FROM t WHERE b IS NOT NULL;'); Inc(i);
+  Add(i, 'SELECT 0.5',                  'SELECT 0.5;');                          Inc(i);
+  Add(i, 'SELECT a||1',                 'SELECT a||1 FROM t;');                  Inc(i);
+  Add(i, 'CREATE TABLE 5col',           'CREATE TABLE z11(a,b,c,d,e);');         Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
