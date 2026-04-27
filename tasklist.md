@@ -2415,6 +2415,103 @@ Important: At the end of this document, please find:
       (sqlite3CodeRhsOfIN + sqlite3ExprCodeIN) for IPK_IN / INDEX_IN /
       INDEX_IN_SUB, then the two-table JOIN codegen for LEFT_JOIN /
       JOIN_WHERE.
+    - [X] Sub-progress 18 — IN-coroutine port (literal-list path)
+      (2026-04-27).  Three coupled landings:
+
+      (a) `exprINAffinity` (codegen.pas, expr.c:3463..3485) — builds the
+      affinity string for the IN-RHS comparison.  One byte per LHS vector
+      field; for SELECT-RHS the per-position byte is
+      `sqlite3CompareAffinity(SELECT-result-col, LHS affinity)`, for
+      list-RHS it's the LHS affinity verbatim.  Caller must
+      `sqlite3DbFree` the buffer.
+
+      (b) `sqlite3CodeRhsOfIN` (codegen.pas:22862, expr.c:3592..3823) —
+      Case 2 (literal expression list) ported with the Once-gated
+      subroutine prologue when reuse-eligible (no `EP_VarSelect`,
+      `iSelfTab=0`).  Emits `OP_BeginSubrtn` + `OP_Once` +
+      `OP_OpenEphemeral`, then per-element `sqlite3ExprCode(pE2, r1) +
+      OP_MakeRecord(affinity) + OP_IdxInsert`, closed by `OP_NullRow +
+      OP_Return`.  Non-constant entries defeat the Once gate via
+      `sqlite3VdbeChangeToNoop` on both the BeginSubrtn and Once
+      addresses, mirroring expr.c:3792..3796.  Case 1 (subselect) is a
+      soft-fallback no-op — leaves the eph table empty rather than
+      asserting; future sub-progress lands `sqlite3SelectDup` recursion
+      via `sqlite3Select(pCopy, &SRT_Set dest)`.  Bloom filter and
+      `SubrtnSig` cache reuse (`findCompatibleInRhsSubrtn`) deferred —
+      both are pure optimisations, semantics-preserving when omitted.
+      KeyInfo is allocated and attached via `sqlite3VdbeChangeP4`
+      (P4_KEYINFO); the single LHS-collation slot is written via
+      pointer arithmetic past `SizeOf(TKeyInfo)` since `aColl` is a
+      C99 flexible-array-member tail in the upstream layout.
+
+      (c) `sqlite3ExprCodeIN` (codegen.pas:22942, expr.c:4029..4291) —
+      minimal port for residual-filter call sites: nVector=1,
+      `destIfFalse=destIfNull` (single-jump path used by
+      `sqlite3ExprIfTrue` / `sqlite3ExprIfFalse` when emitting per-row
+      WHERE residuals).  Two paths land:
+        * `IN_INDEX_NOOP`: emits a sequence of `OP_Eq` (or `OP_NotNull`
+          when r1=r2) with the last entry replaced by `OP_Ne` /
+          `OP_IsNull` jumping to destIfFalse.  P5 carries
+          `zAff[0]` (or `zAff[0] | SQLITE_JUMPIFNULL` on the last).
+        * `IN_INDEX_EPH`: emits `OP_Affinity rLhs nVector zAff` then
+          `OP_NotFound iTab destIfFalse rLhs nVector` — combined
+          Step3+Step5 path under destIfFalse=destIfNull (expr.c:4209..
+          4223).
+      Vector LHS, `rRhsHasNull` tracking, the separate-NULL-jump Step6
+      loop, `IN_INDEX_INDEX_ASC/DESC`, and `IN_INDEX_ROWID` are deferred
+      (only the residual-filter shape is exercised by today's corpus).
+      Subselect IN-RHS short-circuits at function entry to a pessimistic
+      `OP_Goto destIfFalse` so prepare cannot crash on the unported
+      `sqlite3SelectDup` path.
+
+      (d) Dispatch wired in `sqlite3ExprIfTrue` (codegen.pas:5787) and
+      `sqlite3ExprIfFalse` (codegen.pas:5964/5970).  Replaced the four
+      TODO stubs (`OP_Null + OP_If/OP_IfNot` placeholders) with calls to
+      `sqlite3ExprCodeIN(pParse, pExpr, dest, dest)` /
+      `sqlite3ExprCodeIN(pParse, pExpr, destIfFalse, destIfNull)`.
+      `sqlite3ExprIfTrue` adds an `sqlite3VdbeGoto(v, dest)` after the
+      IN body so the truthy path falls through to `dest` (the
+      "if-true-jump" semantic from expr.c:6428..6432).
+
+      Test-suite delta:
+        * TestWhereCorpus: `15 PASS / 5 DIVERGE / 0 ERROR` (corpus row
+          count unchanged).  Failure-mode tally moves from
+          `0 exception, 0 nil-Vdbe, 5 op-count, 0 op-diff` (sub-progress
+          17) to `0 exception, 0 nil-Vdbe, 4 op-count, 1 op-diff`.
+          IPK_IN now produces a 26-op program byte-for-byte against the
+          C oracle's 26 ops EXCEPT for placement: Pas emits the IN
+          materialisation INSIDE the loop body (after Rewind, where
+          residual-filter codegen runs), C emits it during WHERE setup
+          (after OpenRead, before Rewind).  Both shapes are runtime-
+          equivalent — `OP_BeginSubrtn` is self-executing under the
+          `OP_Once` gate — but bytecode-shape diffing flags the
+          divergence.  INDEX_IN is similar (28 C ops vs 26 Pas ops; C
+          has an extra `Noop` placeholder at the pre-loop slot from
+          where the IN was hoisted by sqlite3WhereBegin's pre-emission
+          walk).  INDEX_IN_SUB stays DIVERGE on a soft-fallback
+          "always false" stub instead of crashing, since
+          `sqlite3CodeRhsOfIN` Case 1 needs `sqlite3SelectDup`.
+        * Sub-progress 19 will lift the placement to pre-loop position
+          via a `sqlite3WhereBegin`-side pre-emission walk that visits
+          every TK_IN term and calls `sqlite3CodeRhsOfIN` *before*
+          emitting Rewind, so IPK_IN / INDEX_IN flip to PASS without
+          changing the per-row residual codegen.
+        * No regression anywhere: TestParser 45/45, TestSelectBasic
+          49/49, TestExprBasic 40/40, TestDMLBasic 54/54,
+          TestSchemaBasic 44/44, TestWhereBasic 52/52, TestWhereSimple
+          44/44, TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41, TestVdbeApi
+          57/57, TestExplainParity 2/10, TestSmoke green, TestPrintf
+          105/105, TestJson 434/434, TestConfigHooks 54/54,
+          TestAuthBuiltins 34/34, TestBtreeCompat 337/337.
+
+      Sub-progress 19 must hoist the IN-RHS materialisation into
+      `sqlite3WhereBegin`'s pre-loop section (mirroring wherecode.c's
+      `codeAllEqualityTerms` IN-pre-emission idiom) so IPK_IN /
+      INDEX_IN flip to PASS, then port `sqlite3SelectDup` recursion +
+      `sqlite3CodeRhsOfIN` Case 1 (subselect) for INDEX_IN_SUB.
+      Two-table JOIN codegen for LEFT_JOIN / JOIN_WHERE remains the
+      heaviest follow-on lift.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

@@ -2557,6 +2557,15 @@ function  sqlite3FindInIndex(pParse: PParse; pX: PExpr; inFlags: u32;
   prRhsHasNull: Pi32; aiMap: Pi32; piTab: Pi32): i32;
 procedure sqlite3CodeRhsOfIN(pParse: PParse; pX: PExpr; iTab: i32;
   bloomOk: i32);
+{ Sub-progress 18 — minimal sqlite3ExprCodeIN (expr.c:4029).  Emits
+  per-row IN test for the WHERE residual: handles NOOP (OP_Eq sequence
+  for ≤2-entry list) and EPH (sqlite3CodeRhsOfIN materialisation +
+  combined Step3+Step5 NotFound) paths under destIfFalse==destIfNull
+  (the only shape used by sqlite3ExprIfTrue/IfFalse residual emission).
+  Vector LHS, rRhsHasNull, IN_INDEX_INDEX_*, IN_INDEX_ROWID, and the
+  separate-NULL-jump Step6 loop are deferred. }
+procedure sqlite3ExprCodeIN(pParse: PParse; pExpr: PExpr;
+  destIfFalse, destIfNull: i32);
 
 { Index helpers }
 procedure sqlite3FreeIndex(db: PTsqlite3; p: PIndex2);
@@ -5784,13 +5793,9 @@ begin
       destIfFalse := sqlite3VdbeMakeLabel(pParse);
       if jumpIfNull <> 0 then destIfNull := dest
       else                    destIfNull := destIfFalse;
-      { TODO(11g.2.e): sqlite3ExprCodeIN not yet ported.  Stub: emit
-        a default OP_If on the bare TK_IN node.  Not hit on the
-        rowid-EQ vertical-slice corpus. }
-      r1 := sqlite3ExprCodeTemp(pParse, pExpr, @regFree1);
-      sqlite3VdbeAddOp3(v, OP_If, r1, dest, Ord(jumpIfNull <> 0));
+      sqlite3ExprCodeIN(pParse, pExpr, destIfFalse, destIfNull);
+      sqlite3VdbeGoto(v, dest);
       sqlite3VdbeResolveLabel(v, destIfFalse);
-      destIfNull := destIfNull;     { silence unused-var warning }
     end else if ExprAlwaysTrue(pExpr) then
       sqlite3VdbeGoto(v, dest)
     else if ExprAlwaysFalse(pExpr) then
@@ -5961,15 +5966,11 @@ begin
     begin
       if jumpIfNull <> 0 then
       begin
-        { TODO(11g.2.e): sqlite3ExprCodeIN(pParse, pExpr, dest, dest) }
-        r1 := sqlite3ExprCodeTemp(pParse, pExpr, @regFree1);
-        sqlite3VdbeAddOp3(v, OP_IfNot, r1, dest, 1);
+        sqlite3ExprCodeIN(pParse, pExpr, dest, dest);
       end else
       begin
         destIfNull := sqlite3VdbeMakeLabel(pParse);
-        { TODO(11g.2.e): sqlite3ExprCodeIN(pParse, pExpr, dest, destIfNull) }
-        r1 := sqlite3ExprCodeTemp(pParse, pExpr, @regFree1);
-        sqlite3VdbeAddOp3(v, OP_IfNot, r1, dest, 0);
+        sqlite3ExprCodeIN(pParse, pExpr, dest, destIfNull);
         sqlite3VdbeResolveLabel(v, destIfNull);
       end;
     end else if ExprAlwaysFalse(pExpr) then
@@ -22799,16 +22800,252 @@ end;
 
   =========================================================================== }
 
+{ exprINAffinity (expr.c:3463..3485) — build the affinity string for the
+  IN-RHS comparison.  One byte per LHS vector field; for SELECT-RHS the
+  per-position affinity is sqlite3CompareAffinity(SELECT-result-col, LHS
+  affinity), for list-RHS it's just the LHS affinity verbatim.  Caller
+  must sqlite3DbFree the returned buffer. }
+function exprINAffinity(pParse: PParse; pExpr: PExpr): PAnsiChar;
+var
+  pLeft:    PExpr;
+  nVal:     i32;
+  pSel:     PSelect;
+  zRet:     PAnsiChar;
+  i:        i32;
+  pA:       PExpr;
+  a:        AnsiChar;
+  pELItem:  PExprListItem;
+begin
+  pLeft := pExpr^.pLeft;
+  nVal  := sqlite3ExprVectorSize(pLeft);
+  if ExprUseXSelect(pExpr) then pSel := pExpr^.x.pSelect
+  else                          pSel := nil;
+  Assert(pExpr^.op = TK_IN);
+  zRet := PAnsiChar(sqlite3DbMallocRaw(pParse^.db, 1 + i64(nVal)));
+  if zRet <> nil then begin
+    for i := 0 to nVal - 1 do begin
+      pA := sqlite3VectorFieldSubexpr(pLeft, i);
+      a  := sqlite3ExprAffinity(pA);
+      if pSel <> nil then begin
+        pELItem := PExprListItem(PByte(ExprListItems(pSel^.pEList))
+                     + i * SZ_EXPRLIST_ITEM);
+        zRet[i] := sqlite3CompareAffinity(pELItem^.pExpr, a);
+      end else
+        zRet[i] := a;
+    end;
+    zRet[nVal] := #0;
+  end;
+  Result := zRet;
+end;
+
 procedure sqlite3CodeRhsOfIN(pParse: PParse; pX: PExpr; iTab: i32;
   bloomOk: i32);
+{ Materialises the RHS of an IN(...) into an ephemeral b-tree.  Sub-progress
+  18 minimal port: handles only the literal-exprlist case (Case 2,
+  expr.c:3757..3806) wrapped in the Once-gated subroutine prologue when
+  reuse-eligible (no VarSelect, iSelfTab=0).  Subselect (Case 1), Bloom
+  filter, and SubrtnSig caching are deferred — they need sqlite3SelectDup
+  recursion and the SubrtnSig-walk findCompatibleInRhsSubrtn helper. }
+var
+  v:           PVdbe;
+  pKeyInfo:    PKeyInfo2;
+  pLeft:       PExpr;
+  nVal:        i32;
+  addrOnce:    i32;
+  addr:        i32;
+  pList:       PExprList;
+  pItem:       PExprListItem;
+  pE2:         PExpr;
+  affinity:    AnsiChar;
+  i:           i32;
+  r1, r2:      i32;
 begin
-  { Materialises the RHS of an IN(...) into an ephemeral b-tree.  Full
-    implementation pulls in sqlite3Select (select.c, ~3500 lines) and
-    sqlite3SelectDestInit; landed in a later sub-progress.  Until then
-    the IN_INDEX_EPH path of sqlite3FindInIndex must not be reached. }
-  Assert(False, 'sqlite3CodeRhsOfIN not yet ported');
-  if (pParse = nil) and (pX = nil) and (iTab = 0) and (bloomOk = 0) then
+  v := pParse^.pVdbe;
+  Assert(v <> nil);
+  if v = nil then Exit;
+
+  addrOnce := 0;
+
+  { Wrap in a Once-gated subroutine when neither EP_VarSelect nor a CHECK
+    constraint context (iSelfTab) forces re-evaluation per row. }
+  if (not ExprHasProperty(pX, EP_VarSelect)) and (pParse^.iSelfTab = 0) then
+  begin
+    ExprSetProperty(pX, EP_Subrtn);
+    Inc(pParse^.nMem);
+    pX^.y.sub.regReturn := pParse^.nMem;
+    pX^.y.sub.iAddr :=
+      sqlite3VdbeAddOp2(v, OP_BeginSubrtn, 0, pX^.y.sub.regReturn) + 1;
+    addrOnce := sqlite3VdbeAddOp0(v, OP_Once);
+  end;
+
+  pLeft := pX^.pLeft;
+  nVal  := sqlite3ExprVectorSize(pLeft);
+
+  pX^.iTable := iTab;
+  addr := sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pX^.iTable, nVal);
+  pKeyInfo := sqlite3KeyInfoAlloc(pParse^.db, nVal, 1);
+
+  { Case 1 (subselect) — deferred to a future sub-progress (needs
+    sqlite3SelectDup recursion + sqlite3SelectDestInit).  Soft-fallback
+    leaves the eph table empty; per-row OP_NotFound on it then always
+    jumps to destIfFalse, yielding "x IN (empty)" semantics.  Wrong
+    against C for any row that should match, but doesn't crash and is
+    still bytecode-shape-divergent against the C oracle (so the test
+    correctly continues to DIVERGE for INDEX_IN_SUB). }
+  if ExprUseXSelect(pX) then begin
+    { intentional no-op — eph table stays empty }
+  end else if pX^.x.pList <> nil then begin
+    { Case 2 — literal expression list. }
+    pList := pX^.x.pList;
+    affinity := sqlite3ExprAffinity(pLeft);
+    if affinity <= AnsiChar(SQLITE_AFF_NONE) then
+      affinity := AnsiChar(SQLITE_AFF_BLOB)
+    else if affinity = AnsiChar(SQLITE_AFF_REAL) then
+      affinity := AnsiChar(SQLITE_AFF_NUMERIC);
+    if pKeyInfo <> nil then
+      PPointer(PByte(pKeyInfo) + SizeOf(TKeyInfo))[0] :=
+        sqlite3ExprCollSeq(pParse, pX^.pLeft);
+
+    r1 := sqlite3GetTempReg(pParse);
+    r2 := sqlite3GetTempReg(pParse);
+    pItem := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do begin
+      pE2 := PExprListItem(PByte(pItem) + i * SZ_EXPRLIST_ITEM)^.pExpr;
+      { If the entry is non-constant, the Once gate must be defeated
+        (re-execute every row) — change the BeginSubrtn + Once to no-ops. }
+      if (addrOnce <> 0) and (sqlite3ExprIsConstant(pParse, pE2) = 0) then
+      begin
+        sqlite3VdbeChangeToNoop(v, addrOnce - 1);
+        sqlite3VdbeChangeToNoop(v, addrOnce);
+        ExprClearProperty(pX, EP_Subrtn);
+        addrOnce := 0;
+      end;
+      sqlite3ExprCode(pParse, pE2, r1);
+      sqlite3VdbeAddOp4(v, OP_MakeRecord, r1, 1, r2, @affinity, 1);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iTab, r2, r1, 1);
+    end;
+    sqlite3ReleaseTempReg(pParse, r1);
+    sqlite3ReleaseTempReg(pParse, r2);
+  end;
+
+  if pKeyInfo <> nil then
+    sqlite3VdbeChangeP4(v, addr, Pointer(pKeyInfo), P4_KEYINFO);
+
+  if addrOnce <> 0 then begin
+    sqlite3VdbeAddOp1(v, OP_NullRow, iTab);
+    sqlite3VdbeJumpHere(v, addrOnce);
+    sqlite3VdbeAddOp3(v, OP_Return, pX^.y.sub.regReturn,
+                      pX^.y.sub.iAddr, 1);
+  end;
+
+  if bloomOk = 0 then ; { silence unused-param hint }
+end;
+
+{ sqlite3ExprCodeIN (expr.c:4029..4291) — emit the per-row IN test.  Sub-progress
+  18 minimal port for residual-filter call sites: nVector=1, destIfFalse=destIfNull,
+  no rRhsHasNull tracking, no CHECK-context iSelfTab.  Two paths:
+
+    * IN_INDEX_NOOP: emit a sequence of OP_Ne / OP_IsNull comparisons and fall
+      through on miss (see expr.c:4109..4156, simplified for nVector=1).
+    * IN_INDEX_EPH:  combined Step3+Step5 OP_NotFound on iTab (expr.c:4209..4223,
+      jump on miss).
+}
+procedure sqlite3ExprCodeIN(pParse: PParse; pExpr: PExpr;
+  destIfFalse, destIfNull: i32);
+var
+  rRhsHasNull: i32;
+  eType:       i32;
+  rLhs:        i32;
+  v:           PVdbe;
+  zAff:        PAnsiChar;
+  pLeft:       PExpr;
+  iTab:        i32;
+  nVector:     i32;
+  iDummy:      i32;
+  savedOk:     u32;
+  pList:       PExprList;
+  pColl:       Pointer;
+  labelOk:     i32;
+  r2, regToFree: i32;
+  ii:          i32;
+  pItemEL:     PExprListItem;
+  pE2:         PExpr;
+  op:          i32;
+  regFree1:    i32;
+begin
+  rRhsHasNull := 0;
+  zAff        := nil;
+  iTab        := 0;
+  v           := pParse^.pVdbe;
+  if v = nil then Exit;
+  pLeft   := pExpr^.pLeft;
+
+  { Subselect IN-RHS deferred — sqlite3SelectDup recursion through
+    sqlite3CodeRhsOfIN's Case 1 isn't ported.  Soft-fallback: emit a
+    pessimistic "always false" jump so the row is never accepted —
+    matches "x IN (empty)" semantics, wrong for actual data but no
+    crash and no test regression.  TestWhereCorpus continues to
+    DIVERGE on INDEX_IN_SUB. }
+  if ExprUseXSelect(pExpr) then begin
+    sqlite3VdbeGoto(v, destIfFalse);
     Exit;
+  end;
+
+  zAff    := exprINAffinity(pParse, pExpr);
+  nVector := sqlite3ExprVectorSize(pLeft);
+
+  Assert(destIfFalse = destIfNull, 'sub-progress 18: split-NULL path deferred');
+
+  { Find or build the RHS index/eph table. }
+  eType := sqlite3FindInIndex(pParse, pExpr,
+             IN_INDEX_MEMBERSHIP or IN_INDEX_NOOP_OK,
+             nil, nil, @iTab);
+
+  { Code the LHS scalar value into rLhs.  Must not const-factor — the
+    OP_Affinity path may need to mutate the register. }
+  savedOk := pParse^.parseFlags and PARSEFLAG_OkConstFactor;
+  pParse^.parseFlags := pParse^.parseFlags and (not PARSEFLAG_OkConstFactor);
+  iDummy := 0;
+  regFree1 := 0;
+  rLhs := sqlite3ExprCodeTemp(pParse, pLeft, @regFree1);
+  pParse^.parseFlags := pParse^.parseFlags or savedOk;
+
+  if eType = IN_INDEX_NOOP then begin
+    Assert(nVector = 1);
+    Assert(ExprUseXList(pExpr));
+    pList := pExpr^.x.pList;
+    pColl := sqlite3ExprCollSeq(pParse, pExpr^.pLeft);
+    labelOk := sqlite3VdbeMakeLabel(pParse);
+
+    for ii := 0 to pList^.nExpr - 1 do begin
+      pItemEL := PExprListItem(PByte(ExprListItems(pList))
+                   + ii * SZ_EXPRLIST_ITEM);
+      pE2 := pItemEL^.pExpr;
+      r2 := sqlite3ExprCodeTemp(pParse, pE2, @regToFree);
+      if ii < pList^.nExpr - 1 then begin
+        if rLhs <> r2 then op := OP_Eq else op := OP_NotNull;
+        sqlite3VdbeAddOp4(v, op, rLhs, labelOk, r2, pColl, P4_COLLSEQ);
+        sqlite3VdbeChangeP5(v, u16(zAff[0]));
+      end else begin
+        if rLhs <> r2 then op := OP_Ne else op := OP_IsNull;
+        sqlite3VdbeAddOp4(v, op, rLhs, destIfFalse, r2, pColl, P4_COLLSEQ);
+        sqlite3VdbeChangeP5(v, u16(Byte(zAff[0]) or SQLITE_JUMPIFNULL));
+      end;
+      sqlite3ReleaseTempReg(pParse, regToFree);
+    end;
+    sqlite3VdbeResolveLabel(v, labelOk);
+  end else begin
+    { IN_INDEX_EPH (or IN_INDEX_INDEX_*): combined Step3+Step5 NotFound.
+      Emit an OP_Affinity over rLhs first so the probe matches the eph
+      key encoding (expr.c:4164). }
+    sqlite3VdbeAddOp4(v, OP_Affinity, rLhs, nVector, 0, zAff, nVector);
+    sqlite3VdbeAddOp4Int(v, OP_NotFound, iTab, destIfFalse,
+                         rLhs, nVector);
+  end;
+
+  sqlite3ReleaseTempReg(pParse, regFree1);
+  sqlite3DbFree(pParse^.db, zAff);
+  if rRhsHasNull = 0 then ; { silence unused }
 end;
 
 function sqlite3FindInIndex(pParse: PParse; pX: PExpr; inFlags: u32;
