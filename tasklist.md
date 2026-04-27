@@ -286,6 +286,23 @@ Important: At the end of this document, please find:
       arms + mismatched-column negative case), WUPI1..WUPI3
       (partial-idx col1 NOTNULL usable when WHERE has col1=5;
       JT_LTORJ short-circuit; partial col1=99 not usable).
+    - [X] `whereRangeScanEst` (where.c:2092..2254, no-STAT4 tail) —
+      reduces `pLoop^.nOut` to account for the leftover range
+      constraints on the leading (nEq+1)'th column of the index pLoop
+      is being built against.  Without SQLITE_ENABLE_STAT4 the
+      sample-driven branch (where.c:2103..2223) is omitted; only the
+      post-`#endif` arithmetic survives — `whereRangeAdjust` on each
+      bound, an extra -20 LogEst when both bounds carry default
+      truthProb (closed-range BETWEEN ≈ 1/64), floor 10, capped by
+      `nOut - (pLower<>nil) - (pUpper<>nil)`.  Wire-in to
+      `whereLoopAddBtreeIndex` deferred to the next sub-progress.
+      Gate: `TestWherePlanner.pas` (154/154): RSE1 (single lower
+      default -20), RSE2 (single upper with app likelihood -7),
+      RSE3 (closed range default → -60 LogEst), RSE4 (app likelihood
+      on either bound disables the closed-range extra -20), RSE5
+      (TERM_VNULL skips per-bound but closed-range gate still fires
+      because it only checks truthProb>0), RSE6 (floor 10 capped by
+      nOut-2 = 9), RSE7 (small -1 app likelihood narrowly clamps).
 
 - [ ] **6.9-bis 11g.2.e** Port `wherecode.c` (~2945 lines) —
     per-loop inner-body codegen.  Public surface:

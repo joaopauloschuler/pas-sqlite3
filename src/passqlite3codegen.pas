@@ -1693,6 +1693,19 @@ function  indexHasStat1(pIdx: PIndex2): i32; inline;
 function  whereUsablePartialIndex(iTab: i32; jointype: u8;
   pWC: PWhereClause; pWhere: PExpr): i32;
 
+{ Phase 6.9-bis (step 11g.2.d sub-progress) — range-scan row count estimator
+  (where.c:2092..2254).  Reduces pLoop^.nOut to account for the upper /
+  lower range constraints on the leading nEq+1 column of the index that
+  pLoop is being built for.  This project does not enable
+  SQLITE_ENABLE_STAT4, so only the post-#endif tail of the C function is
+  ported: a single range inequality discounts by 4x, a closed range
+  (BETWEEN-shape) by an additional 4x, and any application-supplied
+  likelihood() factor on either bound replaces the default.  Rest of the
+  STAT4-only sample-driven path is intentionally omitted (matches the
+  amalgamation built without -DSQLITE_ENABLE_STAT4). }
+function  whereRangeScanEst(pParse: PParse; pBuilder: PWhereLoopBuilder;
+  pLower: PWhereTerm; pUpper: PWhereTerm; pLoop: PWhereLoop): i32;
+
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
 // ---------------------------------------------------------------------------
@@ -8677,6 +8690,67 @@ begin
     end;
     Inc(i);
   end;
+end;
+
+{ whereRangeScanEst — port of where.c:2092..2254 (no-STAT4 variant).
+
+  Reduces pLoop^.nOut to account for the leftover range constraints on the
+  leading (nEq+1)'th column of the index pLoop is being built against.
+  Inputs:
+    pLower — lower bound (e.g. "x > 5"), may be nil
+    pUpper — upper bound (e.g. "x < 100"), may be nil
+  At least one of pLower/pUpper is non-nil.  pLoop^.nOut on entry is the
+  index's row estimate ignoring the range; on exit it has been reduced by:
+    * whereRangeAdjust(pLower) and whereRangeAdjust(pUpper) — application
+      likelihood() factors or default -20 LogEst (~25%) per bound
+    * an extra -20 if both bounds are present and neither carries an
+      application likelihood — the default closed-range model of -75% on
+      top of the per-bound -25% gives ~1/64 selectivity for BETWEEN
+  Floor enforced at 10 LogEst (~2 rows) and never grown above
+  pLoop^.nOut - (pLower<>nil) - (pUpper<>nil).
+
+  This project does not enable SQLITE_ENABLE_STAT4 so the histogram-driven
+  branch (lines 2103..2223) is omitted; matches the amalgamation built
+  without -DSQLITE_ENABLE_STAT4. }
+function whereRangeScanEst(pParse: PParse; pBuilder: PWhereLoopBuilder;
+  pLower: PWhereTerm; pUpper: PWhereTerm; pLoop: PWhereLoop): i32;
+var
+  rc:    i32;
+  nOut:  i32;
+  nNew:  i32;
+begin
+  rc   := SQLITE_OK;
+  nOut := pLoop^.nOut;
+
+  { No-STAT4 build — pParse / pBuilder unused on this branch (matches
+    UNUSED_PARAMETER at where.c:2225..2226). }
+  if pParse = nil then ; { silence "unused" hint }
+  if pBuilder = nil then ;
+
+  Assert((pLower <> nil) or (pUpper <> nil));
+  Assert((pUpper = nil) or ((pUpper^.wtFlags and TERM_VNULL) = 0)
+         or (pParse^.nErr > 0));
+
+  nNew := whereRangeAdjust(pLower, i16(nOut));
+  nNew := whereRangeAdjust(pUpper, i16(nNew));
+
+  { Closed-range default discount: extra -20 LogEst when both bounds are
+    present and neither carries an application-supplied likelihood (i.e.
+    both truthProb > 0).  Together with the per-bound -20 from
+    whereRangeAdjust this gives the upstream BETWEEN selectivity of ~1/64. }
+  if (pLower <> nil) and (pLower^.truthProb > 0)
+     and (pUpper <> nil) and (pUpper^.truthProb > 0) then
+  begin
+    nNew := nNew - 20;
+  end;
+
+  if pLower <> nil then Dec(nOut);
+  if pUpper <> nil then Dec(nOut);
+  if nNew < 10 then nNew := 10;
+  if nNew < nOut then nOut := nNew;
+
+  pLoop^.nOut := i16(nOut);
+  Result := rc;
 end;
 
 { isDistinctRedundant — port of where.c:629..685.

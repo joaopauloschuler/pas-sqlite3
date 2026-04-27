@@ -1050,6 +1050,111 @@ begin
   Check('RA5 truthProb=0 no change', whereRangeAdjust(@t, 42) = 42);
 end;
 
+{ ----- whereRangeScanEst (where.c:2092..2254, no-STAT4 tail) ----- }
+
+procedure TestWhereRangeScanEst;
+var
+  loop:   TWhereLoop;
+  lower:  TWhereTerm;
+  upper:  TWhereTerm;
+  parse:  TParse;
+  rc:     i32;
+begin
+  FillChar(parse, SizeOf(parse), 0);
+
+  { RSE1 — single lower bound, default discount.
+    truthProb>0, no TERM_VNULL → whereRangeAdjust nudges by -20.
+    nOut starts at 100; pLower<>nil → nOut decremented to 99 by the tail.
+    nNew = 100 - 20 = 80; floor 10; min(nNew, nOut) = 80.  Result: 80. }
+  FillChar(loop, SizeOf(loop), 0);
+  FillChar(lower, SizeOf(lower), 0);
+  loop.nOut := 100;
+  lower.truthProb := 1;
+  lower.wtFlags   := 0;
+  rc := whereRangeScanEst(@parse, nil, @lower, nil, @loop);
+  Check('RSE1 single lower → -20 LogEst', (rc = SQLITE_OK) and (loop.nOut = 80));
+
+  { RSE2 — single upper bound carries app likelihood (truthProb=-7).
+    whereRangeAdjust adds -7 → nNew = 100 + (-7) = 93.  No closed-range
+    extra discount (only one bound).  Result: 93. }
+  FillChar(loop, SizeOf(loop), 0);
+  FillChar(upper, SizeOf(upper), 0);
+  loop.nOut := 100;
+  upper.truthProb := -7;
+  upper.wtFlags   := 0;
+  rc := whereRangeScanEst(@parse, nil, nil, @upper, @loop);
+  Check('RSE2 single upper + app likelihood', (rc = SQLITE_OK) and (loop.nOut = 93));
+
+  { RSE3 — closed range, both bounds default (truthProb>0, no VNULL).
+    whereRangeAdjust on each: nNew = 100 - 20 - 20 = 60.  Both bounds
+    have truthProb>0 → extra -20 = 40.  nOut = 100 - 1 - 1 = 98.
+    min(40, 98) = 40.  Result: 40 (≈1/64 of 100 in LogEst space). }
+  FillChar(loop, SizeOf(loop), 0);
+  FillChar(lower, SizeOf(lower), 0);
+  FillChar(upper, SizeOf(upper), 0);
+  loop.nOut := 100;
+  lower.truthProb := 1; lower.wtFlags := 0;
+  upper.truthProb := 1; upper.wtFlags := 0;
+  rc := whereRangeScanEst(@parse, nil, @lower, @upper, @loop);
+  Check('RSE3 closed range default → 1/64 (LogEst -60)',
+        (rc = SQLITE_OK) and (loop.nOut = 40));
+
+  { RSE4 — closed range but lower carries app likelihood.
+    Closed-range extra -20 only fires when BOTH bounds have truthProb>0;
+    pLower.truthProb=-3 disqualifies, so just per-bound adjustments.
+    nNew = 100 + (-3) - 20 = 77.  Result: 77. }
+  FillChar(loop, SizeOf(loop), 0);
+  FillChar(lower, SizeOf(lower), 0);
+  FillChar(upper, SizeOf(upper), 0);
+  loop.nOut := 100;
+  lower.truthProb := -3; lower.wtFlags := 0;
+  upper.truthProb := 1;  upper.wtFlags := 0;
+  rc := whereRangeScanEst(@parse, nil, @lower, @upper, @loop);
+  Check('RSE4 app-likelihood disables closed-range extra',
+        (rc = SQLITE_OK) and (loop.nOut = 77));
+
+  { RSE5 — TERM_VNULL on lower → whereRangeAdjust no-ops; closed-range
+    extra still fires only when truthProb>0 AND (per whereRangeAdjust)
+    no TERM_VNULL.  Here lower=VNULL contributes no -20 in adjust, but
+    the closed-range gate at the bottom only checks truthProb>0 — both
+    lower and upper truthProb=1, so extra -20 still fires.
+    nNew = 100 (lower VNULL skipped) - 20 (upper) - 20 (closed) = 60.
+    nOut = 100 - 2 = 98.  min(60, 98) = 60.  Result: 60. }
+  FillChar(loop, SizeOf(loop), 0);
+  FillChar(lower, SizeOf(lower), 0);
+  FillChar(upper, SizeOf(upper), 0);
+  loop.nOut := 100;
+  lower.truthProb := 1; lower.wtFlags := TERM_VNULL;
+  upper.truthProb := 1; upper.wtFlags := 0;
+  rc := whereRangeScanEst(@parse, nil, @lower, @upper, @loop);
+  Check('RSE5 TERM_VNULL skips per-bound but closed-range extra fires',
+        (rc = SQLITE_OK) and (loop.nOut = 60));
+
+  { RSE6 — floor at 10 LogEst.  Tiny nOut, big discount drives nNew below 10;
+    floor clamps to 10, but nOut after decrement is 11 - 1 - 1 = 9, so
+    min(10, 9) = 9 wins.  Validates the floor doesn't *raise* the answer. }
+  FillChar(loop, SizeOf(loop), 0);
+  FillChar(lower, SizeOf(lower), 0);
+  FillChar(upper, SizeOf(upper), 0);
+  loop.nOut := 11;
+  lower.truthProb := 1; lower.wtFlags := 0;
+  upper.truthProb := 1; upper.wtFlags := 0;
+  rc := whereRangeScanEst(@parse, nil, @lower, @upper, @loop);
+  Check('RSE6 floor 10 capped by nOut - 2 (= 9)',
+        (rc = SQLITE_OK) and (loop.nOut = 9));
+
+  { RSE7 — single bound, no shrinkage worth taking.  truthProb=-1 (-1
+    LogEst ≈ -7%) gives nNew = 100 - 1 = 99.  Tail nOut = 100 - 1 = 99.
+    min(99, 99) = 99.  Result: 99. }
+  FillChar(loop, SizeOf(loop), 0);
+  FillChar(lower, SizeOf(lower), 0);
+  loop.nOut := 100;
+  lower.truthProb := -1; lower.wtFlags := 0;
+  rc := whereRangeScanEst(@parse, nil, @lower, nil, @loop);
+  Check('RSE7 small app-likelihood narrowly clamps',
+        (rc = SQLITE_OK) and (loop.nOut = 99));
+end;
+
 { ----- constraintCompatibleWithOuterJoin (where.c:832..852) ----- }
 
 procedure TestConstraintCompatOuterJoin;
@@ -1519,6 +1624,7 @@ begin
   TestIndexedExprCleanup;
   TestPartIdxExprMask;
   TestWhereRangeAdjust;
+  TestWhereRangeScanEst;
   TestConstraintCompatOuterJoin;
   TestColumnIsGoodIndexCandidate;
   TestTermCanDriveIndex;
