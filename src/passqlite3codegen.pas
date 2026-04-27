@@ -1682,6 +1682,17 @@ function  termCanDriveIndex(pTerm: PWhereTerm; pSrc: PSrcItem;
   notReady: Bitmask): i32;
 function  indexHasStat1(pIdx: PIndex2): i32; inline;
 
+{ whereUsablePartialIndex (where.c:3699..3728).  Decides whether a
+  partial index whose creation predicate is pWhere can be used to
+  service the query at iTab.  An index is usable if every conjunct
+  of pWhere is implied by some conjunct of pWC (the WHERE clause),
+  and the implication does not depend on the iTab cursor being
+  unbound.  JT_LTORJ tables are excluded because the LTORJ side of a
+  RIGHT JOIN can be presented null-row, and partial-index predicates
+  cannot reason about that. }
+function  whereUsablePartialIndex(iTab: i32; jointype: u8;
+  pWC: PWhereClause; pWhere: PExpr): i32;
+
 // ---------------------------------------------------------------------------
 // Phase 6.3 public API — select.c (SQLite 3.53.0)
 // ---------------------------------------------------------------------------
@@ -1865,6 +1876,10 @@ function  sqlite3ExprCompareCollSeq(pParse: PParse; const p: PExpr): Pointer;
 procedure sqlite3ExprToRegister(pExpr: PExpr; iReg: i32);
 function  sqlite3ExprIsInteger(const p: PExpr; pValue: Pi32;
   pParse: PParse): i32;
+function  sqlite3ExprIsNotTrue(pExpr: PExpr): i32;
+function  sqlite3ExprIsIIF(db: PTsqlite3; const pExpr: PExpr): i32;
+function  sqlite3ExprImpliesExpr(pParse: PParse; const pE1, pE2: PExpr;
+  iTab: i32): i32;
 function  sqlite3ExprIsConstant(pParse: PParse; p: PExpr): i32;
 function  sqlite3ExprCodeRunJustOnce(pParse: PParse; pExpr: PExpr;
   regDest: i32): i32;
@@ -4559,6 +4574,191 @@ begin
   Result := rc;
 end;
 
+{ exprImpliesNotNull — expr.c:6678..6748.  Return non-zero if Expr p
+  can only evaluate true when pNN is not NULL.  When seenNot is set,
+  return non-zero only if p can evaluate to a non-NULL value when pNN
+  is not NULL.  Helper for sqlite3ExprImpliesExpr's TK_NOTNULL arm. }
+function exprImpliesNotNull(const pParse: PParse;
+  const p, pNN: PExpr; iTab: i32; seenNot: i32): i32;
+begin
+  Result := 0;
+  Assert(p  <> nil);
+  Assert(pNN <> nil);
+  if sqlite3ExprCompare(pParse, p, pNN, iTab) = 0 then
+  begin
+    if pNN^.op <> TK_NULL then Result := 1;
+    Exit;
+  end;
+  case p^.op of
+    TK_IN:
+    begin
+      if (seenNot <> 0) and ExprHasProperty(p, EP_xIsSelect) then Exit;
+      Assert(ExprUseXSelect(p)
+             or ((p^.x.pList <> nil) and (p^.x.pList^.nExpr > 0)));
+      Result := exprImpliesNotNull(pParse, p^.pLeft, pNN, iTab, 1);
+    end;
+    TK_BETWEEN:
+    begin
+      if seenNot <> 0 then Exit;
+      Assert(ExprUseXList(p));
+      Assert(p^.x.pList <> nil);
+      Assert(p^.x.pList^.nExpr = 2);
+      if (exprImpliesNotNull(pParse,
+            ExprListItems(p^.x.pList)[0].pExpr, pNN, iTab, 1) <> 0)
+         or (exprImpliesNotNull(pParse,
+            ExprListItems(p^.x.pList)[1].pExpr, pNN, iTab, 1) <> 0) then
+      begin
+        Result := 1;
+        Exit;
+      end;
+      Result := exprImpliesNotNull(pParse, p^.pLeft, pNN, iTab, 1);
+    end;
+    TK_EQ, TK_NE, TK_LT, TK_LE, TK_GT_TK, TK_GE,
+    TK_PLUS, TK_MINUS, TK_BITOR, TK_LSHIFT:
+    begin
+      if exprImpliesNotNull(pParse, p^.pRight, pNN, iTab, seenNot) <> 0 then
+      begin
+        Result := 1;
+        Exit;
+      end;
+      Result := exprImpliesNotNull(pParse, p^.pLeft, pNN, iTab, seenNot);
+    end;
+    TK_RSHIFT, TK_CONCAT:
+    begin
+      { seenNot := 1 fall-through }
+      if exprImpliesNotNull(pParse, p^.pRight, pNN, iTab, 1) <> 0 then
+      begin
+        Result := 1;
+        Exit;
+      end;
+      Result := exprImpliesNotNull(pParse, p^.pLeft, pNN, iTab, 1);
+    end;
+    TK_STAR, TK_REM, TK_BITAND, TK_SLASH:
+    begin
+      if exprImpliesNotNull(pParse, p^.pRight, pNN, iTab, seenNot) <> 0 then
+      begin
+        Result := 1;
+        Exit;
+      end;
+      Result := exprImpliesNotNull(pParse, p^.pLeft, pNN, iTab, seenNot);
+    end;
+    TK_SPAN, TK_COLLATE, TK_UPLUS, TK_UMINUS:
+      Result := exprImpliesNotNull(pParse, p^.pLeft, pNN, iTab, seenNot);
+    TK_TRUTH:
+    begin
+      if seenNot <> 0 then Exit;
+      if p^.op2 <> TK_IS then Exit;
+      Result := exprImpliesNotNull(pParse, p^.pLeft, pNN, iTab, 1);
+    end;
+    TK_BITNOT, TK_NOT:
+      Result := exprImpliesNotNull(pParse, p^.pLeft, pNN, iTab, 1);
+  end;
+end;
+
+{ sqlite3ExprIsNotTrue — expr.c:6750..6761.  Return non-zero if the
+  boolean value of pExpr is always either FALSE or NULL. }
+function sqlite3ExprIsNotTrue(pExpr: PExpr): i32;
+var v: i32;
+begin
+  Result := 0;
+  if pExpr^.op = TK_NULL then begin Result := 1; Exit; end;
+  if (pExpr^.op = TK_TRUEFALSE) and (sqlite3ExprTruthValue(pExpr) = 0) then
+  begin
+    Result := 1;
+    Exit;
+  end;
+  v := 1;
+  if (sqlite3ExprIsInteger(pExpr, @v, nil) <> 0) and (v = 0) then
+    Result := 1;
+end;
+
+{ sqlite3ExprIsIIF — expr.c:6763..6798.  Returns non-zero when pExpr is
+  one of:
+    CASE WHEN x THEN y END
+    CASE WHEN x THEN y ELSE NULL END
+    CASE WHEN x THEN y ELSE false END
+    iif(x,y)
+    iif(x,y,NULL)
+    iif(x,y,false)
+
+  For TK_FUNCTION nodes, the registered FuncDef must carry
+  SQLITE_FUNC_INLINE and the INLINEFUNC_iif tag (via pUserData).  The
+  current passqlite3 builtin table registers iif as a regular function
+  rather than inline; in that case this branch returns 0 and only the
+  TK_CASE arm is productive. }
+function sqlite3ExprIsIIF(db: PTsqlite3; const pExpr: PExpr): i32;
+var
+  pList: PExprList;
+  z:     PAnsiChar;
+  pDef:  PTFuncDef;
+  items: PExprListItem;
+begin
+  Result := 0;
+  if pExpr^.op = TK_FUNCTION then
+  begin
+    z := pExpr^.u.zToken;
+    if z = nil then Exit;
+    if (z[0] <> 'i') and (z[0] <> 'I') then Exit;
+    if not ExprUseXList(pExpr) then Exit;
+    if pExpr^.x.pList = nil then Exit;
+    pDef := sqlite3FindFunction(db, z, pExpr^.x.pList^.nExpr, db^.enc, 0);
+    if pDef = nil then Exit;
+    if (pDef^.funcFlags and SQLITE_FUNC_INLINE) = 0 then Exit;
+    if PtrInt(pDef^.pUserData) <> INLINEFUNC_iif then Exit;
+  end else if pExpr^.op = TK_CASE then
+  begin
+    if pExpr^.pLeft <> nil then Exit;
+  end else
+    Exit;
+  pList := pExpr^.x.pList;
+  Assert(pList <> nil);
+  if pList^.nExpr = 2 then begin Result := 1; Exit; end;
+  if pList^.nExpr = 3 then
+  begin
+    items := ExprListItems(pList);
+    if sqlite3ExprIsNotTrue(items[2].pExpr) <> 0 then Result := 1;
+  end;
+end;
+
+{ sqlite3ExprImpliesExpr — expr.c:6800..6851.  Return non-zero when pE1
+  being true is sufficient to prove pE2 must also be true.  A false
+  return is always safe (it only forfeits an optimisation); a false
+  positive corrupts query results, so when in doubt the routine returns
+  0.  Used by whereUsablePartialIndex and (eventually) the predicate-
+  pushdown machinery. }
+function sqlite3ExprImpliesExpr(pParse: PParse; const pE1, pE2: PExpr;
+  iTab: i32): i32;
+begin
+  Result := 0;
+  if sqlite3ExprCompare(pParse, pE1, pE2, iTab) = 0 then
+  begin
+    Result := 1;
+    Exit;
+  end;
+  if pE2^.op = TK_OR then
+  begin
+    if (sqlite3ExprImpliesExpr(pParse, pE1, pE2^.pLeft, iTab) <> 0)
+       or (sqlite3ExprImpliesExpr(pParse, pE1, pE2^.pRight, iTab) <> 0) then
+    begin
+      Result := 1;
+      Exit;
+    end;
+  end;
+  if pE2^.op = TK_NOTNULL then
+  begin
+    if exprImpliesNotNull(pParse, pE1, pE2^.pLeft, iTab, 0) <> 0 then
+    begin
+      Result := 1;
+      Exit;
+    end;
+  end;
+  if (pParse <> nil) and (sqlite3ExprIsIIF(pParse^.db, pE1) <> 0) then
+  begin
+    Result := sqlite3ExprImpliesExpr(pParse,
+                ExprListItems(pE1^.x.pList)[0].pExpr, pE2, iTab);
+  end;
+end;
+
 { exprNodeIsConstantFunction — TK_FUNCTION node walker helper.
   Faithful translation of expr.c:2482..2512.  Determines if a TK_FUNCTION
   call is a constant function — all arguments must already be constant
@@ -6575,10 +6775,14 @@ end;
 
 function sqlite3ExprCompareSkip(pA: PExpr; pB: PExpr; iTab: i32): i32;
 begin
-  { 0 = "expressions match" (i.e. don't skip).  Real impl is in expr.c
-    (sqlite3ExprCompare with iTab translation).  Only invoked for
-    XN_EXPR-indexed columns, which the rowid-EQ shape never produces. }
-  Result := 0;
+  { expr.c:6665..6670 — strip TK_COLLATE wrappers from both sides then
+    delegate to sqlite3ExprCompare.  Returns 0 when the two expressions
+    are equivalent, 1 (and higher) when they differ.  The XN_EXPR scan
+    in whereScanNext relies on the equivalent-zero contract. }
+  Result := sqlite3ExprCompare(nil,
+              sqlite3ExprSkipCollate(pA),
+              sqlite3ExprSkipCollate(pB),
+              iTab);
 end;
 
 function sqlite3IndexAffinityOk(pX: PExpr; idxaff: AnsiChar): i32;
@@ -8406,6 +8610,73 @@ end;
 function OptimizationEnabled(db: PTsqlite3; mask: u32): Boolean; inline;
 begin
   Result := (db^.dbOptFlags and mask) = 0;
+end;
+
+{ whereUsablePartialIndex — where.c:3699..3728.
+
+  Decides whether a partial index built with WHERE clause `pWhere` can be
+  used to service the query whose WHERE clause is `pWC`, when the table
+  whose iTab cursor identifies that table sits on the join chain at
+  jointype.
+
+  The classic partial-index test: every TK_AND conjunct of pWhere must be
+  implied by at least one term in pWC, with two extra wrinkles —
+
+    * a WHERE term tagged EP_OuterON only counts when its iJoin matches
+      iTab (otherwise the term applies to a different ON clause and does
+      not reach this table);
+    * if the join chain involves an outer join (JT_OUTER) then the WHERE
+      term must itself carry EP_OuterON, because plain WHERE-clause
+      predicates are evaluated *after* the null-row injection and cannot
+      be relied on at probe time;
+    * the implication must NOT also fire with iTab=-1, because that
+      would mean pWC implies pWhere unconditionally — i.e. the partial
+      predicate is trivially true and the index is just a regular
+      index, in which case the caller should have walked the regular-
+      index path.
+
+  TERM_VNULL terms (synthesised by the IS-NOT-NULL → "x>NULL" rewrite)
+  are skipped — they have a synthetic shape that confuses the implication
+  test and would only trigger false positives.
+
+  Returns 1 if the partial index is usable, 0 otherwise. }
+function whereUsablePartialIndex(iTab: i32; jointype: u8;
+  pWC: PWhereClause; pWhere: PExpr): i32;
+var
+  i:        i32;
+  pTerm:    PWhereTerm;
+  pTermArr: PWhereTerm;
+  pPrs:     PParse;
+  pE:       PExpr;
+begin
+  Result := 0;
+  if (jointype and JT_LTORJ) <> 0 then Exit;
+  pPrs := pWC^.pWInfo^.pParse;
+  while pWhere^.op = TK_AND do
+  begin
+    if whereUsablePartialIndex(iTab, jointype, pWC, pWhere^.pLeft) = 0 then
+      Exit;
+    pWhere := pWhere^.pRight;
+  end;
+  pTermArr := pWC^.a;
+  i := 0;
+  while i < pWC^.nTerm do
+  begin
+    pTerm := @pTermArr[i];
+    pE := pTerm^.pExpr;
+    if ((not ExprHasProperty(pE, EP_OuterON))
+         or (pE^.w.iJoin = iTab))
+       and (((jointype and JT_OUTER) = 0)
+         or ExprHasProperty(pE, EP_OuterON))
+       and (sqlite3ExprImpliesExpr(pPrs, pE, pWhere, iTab) <> 0)
+       and (sqlite3ExprImpliesExpr(pPrs, pE, pWhere, -1) = 0)
+       and ((pTerm^.wtFlags and TERM_VNULL) = 0) then
+    begin
+      Result := 1;
+      Exit;
+    end;
+    Inc(i);
+  end;
 end;
 
 { isDistinctRedundant — port of where.c:629..685.

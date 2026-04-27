@@ -1287,6 +1287,220 @@ begin
   Check('TC7 existing leading idx → 0', termCanDriveIndex(@t, @src, 0) = 0);
 end;
 
+{ ----- ExprImpliesExpr / ExprIsNotTrue / ExprIsIIF / whereUsablePartialIndex ----- }
+
+procedure TestExprImplies;
+var
+  rc:    i32;
+  db:    PTsqlite3;
+  parse: TParse;
+  pTab:  PTable2;
+  zNm:   array[0..3] of AnsiChar;
+  pSrcBuf: Pointer;
+  pSrc:    PSrcList;
+  pItem:   PSrcItem;
+  pWInfo:  PWhereInfo;
+  pWC:     PWhereClause;
+  pNull, pTrueE, pFalseE, pOne, pZero: PExpr;
+  pColA, pInt5, pEqA1, pEqA2: PExpr;
+  pColA2, pInt5b, pEqA2same: PExpr;
+  pColB, pInt7, pEqB, pOrAB: PExpr;
+  pColC, pNotnullC: PExpr;
+  pColC2, pEqC5, pInt5c: PExpr;
+  pColUnequal, pInt9, pEqU: PExpr;
+  pCaseList: PExprList;
+  pCase2arg, pCase3argNull, pCase3argFalse, pCase3argTrue: PExpr;
+  pColPart, pNotnullPart: PExpr;
+  pTmpInt5: PExpr;
+  pPartCol, pPart5, pPartEq: PExpr;
+  pColMain, pIntMain, pEqMain: PExpr;
+  tokI: TToken;
+begin
+  rc := sqlite3_initialize;
+  if rc <> SQLITE_OK then begin
+    WriteLn('FATAL: sqlite3_initialize rc=', rc); Halt(2);
+  end;
+  db := nil;
+  rc := sqlite3_open(':memory:', @db);
+  if (rc <> SQLITE_OK) or (db = nil) then begin
+    WriteLn('FATAL: sqlite3_open rc=', rc); Halt(2);
+  end;
+
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+
+  { sqlite3ExprIsNotTrue — TK_NULL. }
+  pNull := sqlite3ExprAlloc(db, TK_NULL, nil, 0);
+  Check('EINT1 TK_NULL is not-true',
+        sqlite3ExprIsNotTrue(pNull) = 1);
+
+  { TK_TRUEFALSE 'true' / 'false'. }
+  tokI.z := 'true';  tokI.n := 4;
+  pTrueE := sqlite3ExprAlloc(db, TK_TRUEFALSE, @tokI, 0);
+  pTrueE^.flags := pTrueE^.flags or EP_IsTrue;
+  Check('EINT2 TK_TRUEFALSE true is true',
+        sqlite3ExprIsNotTrue(pTrueE) = 0);
+  tokI.z := 'false'; tokI.n := 5;
+  pFalseE := sqlite3ExprAlloc(db, TK_TRUEFALSE, @tokI, 0);
+  pFalseE^.flags := pFalseE^.flags or EP_IsFalse;
+  Check('EINT3 TK_TRUEFALSE false is not-true',
+        sqlite3ExprIsNotTrue(pFalseE) = 1);
+
+  { TK_INTEGER 0 → not-true; TK_INTEGER 1 → true. }
+  pZero := sqlite3ExprInt32(db, 0);
+  pOne  := sqlite3ExprInt32(db, 1);
+  Check('EINT4 integer 0 is not-true', sqlite3ExprIsNotTrue(pZero) = 1);
+  Check('EINT5 integer 1 is true',     sqlite3ExprIsNotTrue(pOne)  = 0);
+
+  { sqlite3ExprIsIIF — TK_CASE with two-element pList → IIF. }
+  pCaseList := sqlite3ExprListAppend(@parse, nil, sqlite3ExprInt32(db, 1));
+  pCaseList := sqlite3ExprListAppend(@parse, pCaseList, sqlite3ExprInt32(db, 2));
+  pCase2arg := sqlite3ExprAlloc(db, TK_CASE, nil, 0);
+  pCase2arg^.x.pList := pCaseList;
+  Check('EIIF1 TK_CASE 2-arg is IIF', sqlite3ExprIsIIF(db, pCase2arg) = 1);
+
+  { TK_CASE with pLeft set → not IIF. }
+  pCase2arg^.pLeft := sqlite3ExprInt32(db, 0);
+  Check('EIIF2 TK_CASE with pLeft is NOT IIF', sqlite3ExprIsIIF(db, pCase2arg) = 0);
+  pCase2arg^.pLeft := nil;
+
+  { TK_CASE with three-arg, ELSE = NULL → IIF. }
+  pCaseList := sqlite3ExprListAppend(@parse, nil, sqlite3ExprInt32(db, 1));
+  pCaseList := sqlite3ExprListAppend(@parse, pCaseList, sqlite3ExprInt32(db, 2));
+  pCaseList := sqlite3ExprListAppend(@parse, pCaseList,
+                  sqlite3ExprAlloc(db, TK_NULL, nil, 0));
+  pCase3argNull := sqlite3ExprAlloc(db, TK_CASE, nil, 0);
+  pCase3argNull^.x.pList := pCaseList;
+  Check('EIIF3 TK_CASE 3-arg ELSE NULL is IIF',
+        sqlite3ExprIsIIF(db, pCase3argNull) = 1);
+
+  { TK_CASE three-arg ELSE 0 → IIF (literal 0 is not-true). }
+  pCaseList := sqlite3ExprListAppend(@parse, nil, sqlite3ExprInt32(db, 1));
+  pCaseList := sqlite3ExprListAppend(@parse, pCaseList, sqlite3ExprInt32(db, 2));
+  pCaseList := sqlite3ExprListAppend(@parse, pCaseList, sqlite3ExprInt32(db, 0));
+  pCase3argFalse := sqlite3ExprAlloc(db, TK_CASE, nil, 0);
+  pCase3argFalse^.x.pList := pCaseList;
+  Check('EIIF4 TK_CASE 3-arg ELSE 0 is IIF',
+        sqlite3ExprIsIIF(db, pCase3argFalse) = 1);
+
+  { TK_CASE three-arg ELSE non-zero → NOT IIF. }
+  pCaseList := sqlite3ExprListAppend(@parse, nil, sqlite3ExprInt32(db, 1));
+  pCaseList := sqlite3ExprListAppend(@parse, pCaseList, sqlite3ExprInt32(db, 2));
+  pCaseList := sqlite3ExprListAppend(@parse, pCaseList, sqlite3ExprInt32(db, 5));
+  pCase3argTrue := sqlite3ExprAlloc(db, TK_CASE, nil, 0);
+  pCase3argTrue^.x.pList := pCaseList;
+  Check('EIIF5 TK_CASE 3-arg ELSE 5 is NOT IIF',
+        sqlite3ExprIsIIF(db, pCase3argTrue) = 0);
+
+  { sqlite3ExprImpliesExpr — equivalent (compare path). }
+  pColA := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColA^.iTable := 0; pColA^.iColumn := 1;
+  pInt5 := sqlite3ExprInt32(db, 5);
+  pEqA1 := sqlite3PExpr(@parse, TK_EQ, pColA, pInt5);
+
+  pColA2 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColA2^.iTable := 0; pColA2^.iColumn := 1;
+  pInt5b := sqlite3ExprInt32(db, 5);
+  pEqA2same := sqlite3PExpr(@parse, TK_EQ, pColA2, pInt5b);
+  Check('EIE1 x=5 implies x=5 (compare path)',
+        sqlite3ExprImpliesExpr(@parse, pEqA1, pEqA2same, -1) = 1);
+
+  { TK_OR right-hand side: x=5 implies (x=5 OR y=7). }
+  pColB := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColB^.iTable := 0; pColB^.iColumn := 2;
+  pInt7 := sqlite3ExprInt32(db, 7);
+  pEqB  := sqlite3PExpr(@parse, TK_EQ, pColB, pInt7);
+  pColA2 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColA2^.iTable := 0; pColA2^.iColumn := 1;
+  pTmpInt5 := sqlite3ExprInt32(db, 5);
+  pEqA2 := sqlite3PExpr(@parse, TK_EQ, pColA2, pTmpInt5);
+  pOrAB := sqlite3PExpr(@parse, TK_OR, pEqA2, pEqB);
+  Check('EIE2 x=5 implies (x=5 OR y=7) (TK_OR path)',
+        sqlite3ExprImpliesExpr(@parse, pEqA1, pOrAB, -1) = 1);
+
+  { TK_NOTNULL via exprImpliesNotNull: x=5 implies x NOTNULL. }
+  pColC := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColC^.iTable := 0; pColC^.iColumn := 1;
+  pNotnullC := sqlite3PExpr(@parse, TK_NOTNULL, pColC, nil);
+  pColC2 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColC2^.iTable := 0; pColC2^.iColumn := 1;
+  pInt5c := sqlite3ExprInt32(db, 5);
+  pEqC5 := sqlite3PExpr(@parse, TK_EQ, pColC2, pInt5c);
+  Check('EIE3 x=5 implies x NOTNULL',
+        sqlite3ExprImpliesExpr(@parse, pEqC5, pNotnullC, -1) = 1);
+
+  { Mismatched columns: y=9 does NOT imply x=5. }
+  pColUnequal := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColUnequal^.iTable := 0; pColUnequal^.iColumn := 9;
+  pInt9 := sqlite3ExprInt32(db, 9);
+  pEqU  := sqlite3PExpr(@parse, TK_EQ, pColUnequal, pInt9);
+  Check('EIE4 y=9 does NOT imply x=5',
+        sqlite3ExprImpliesExpr(@parse, pEqU, pEqA1, -1) = 0);
+
+  { whereUsablePartialIndex — partial index predicate "x NOTNULL" gets
+    served by a WHERE clause containing "x=5".  Build a tiny WhereClause
+    whose only term is x=5, then ask whether a partial-index whose
+    creation predicate is "x NOTNULL" is usable. }
+
+  pTab := PTable2(sqlite3DbMallocZero(db, SizeOf(TTable)));
+  zNm[0] := 't'; zNm[1] := #0;
+  pTab^.zName := @zNm[0];
+  pTab^.pSchema := db^.aDb[0].pSchema;
+  pTab^.tnum := 2;
+  pTab^.nCol := 2;
+  pTab^.nNVCol := 2;
+  pTab^.tabFlags := 0;
+  pTab^.eTabType := TABTYP_NORM;
+  pTab^.pIndex := nil;
+
+  pSrcBuf := sqlite3DbMallocZero(db, SZ_SRCLIST_HEADER + SizeOf(TSrcItem));
+  pSrc := PSrcList(pSrcBuf);
+  pSrc^.nSrc := 1;
+  pSrc^.nAlloc := 1;
+  pItem := @SrcListItems(pSrc)[0];
+  pItem^.pSTab := pTab;
+  pItem^.iCursor := 0;
+  pItem^.colUsed := Bitmask($3);
+  parse.nTab := 1;
+
+  pWInfo := PWhereInfo(sqlite3DbMallocZero(db, SizeOf(TWhereInfo)));
+  if pWInfo = nil then begin WriteLn('FATAL: pWInfo'); Halt(2); end;
+  pWInfo^.pParse := @parse;
+  pWInfo^.pTabList := pSrc;
+
+  pWC := @pWInfo^.sWC;
+  sqlite3WhereClauseInit(pWC, pWInfo);
+
+  { WHERE term:  t.col1 = 5  (analyzed via WhereSplit + ExprAnalyze). }
+  pColMain := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColMain^.iTable := 0; pColMain^.iColumn := 1;
+  pIntMain := sqlite3ExprInt32(db, 5);
+  pEqMain  := sqlite3PExpr(@parse, TK_EQ, pColMain, pIntMain);
+  sqlite3WhereSplit(pWC, pEqMain, TK_AND);
+
+  { Partial-index predicate:  col1 NOTNULL.  Use iTable=-1 so the iTab
+    parameter substitutes (per sqlite3ExprCompare semantics for partial
+    indexes), and so the iTab=-1 sentinel call returns 0 — i.e. the
+    predicate is truly conditional on the table being bound. }
+  pColPart := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColPart^.iTable := -1; pColPart^.iColumn := 1;
+  pNotnullPart := sqlite3PExpr(@parse, TK_NOTNULL, pColPart, nil);
+  Check('WUPI1 partial-idx "col1 NOTNULL" usable when WHERE has col1=5',
+        whereUsablePartialIndex(0, 0, pWC, pNotnullPart) = 1);
+
+  { Same partial predicate but JT_LTORJ → unconditional refusal. }
+  Check('WUPI2 JT_LTORJ short-circuits to 0',
+        whereUsablePartialIndex(0, JT_LTORJ, pWC, pNotnullPart) = 0);
+
+  { Partial predicate that the WHERE term cannot prove (col1 = 99). }
+  pPartCol := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pPartCol^.iTable := -1; pPartCol^.iColumn := 1;
+  pPart5 := sqlite3ExprInt32(db, 99);
+  pPartEq := sqlite3PExpr(@parse, TK_EQ, pPartCol, pPart5);
+  Check('WUPI3 partial-idx "col1=99" NOT usable when WHERE has col1=5',
+        whereUsablePartialIndex(0, 0, pWC, pPartEq) = 0);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -1309,6 +1523,7 @@ begin
   TestColumnIsGoodIndexCandidate;
   TestTermCanDriveIndex;
   TestTermCanDriveIndexGate;
+  TestExprImplies;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.

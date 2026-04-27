@@ -502,6 +502,19 @@ const
 
   SQLITE_FUNC_HASH_SZ  = 23;
 
+{ INLINEFUNC_* — pUserData tags for SQLITE_FUNC_INLINE built-ins.
+  Mirrors sqliteInt.h:2055..2062.  The expression-parity layer reads
+  these to decide whether a TK_FUNCTION node has implication / non-NULL-
+  row inferences attached. }
+  INLINEFUNC_coalesce            = 0;
+  INLINEFUNC_implies_nonnull_row = 1;
+  INLINEFUNC_expr_implies_expr   = 2;
+  INLINEFUNC_expr_compare        = 3;
+  INLINEFUNC_affinity            = 4;
+  INLINEFUNC_iif                 = 5;
+  INLINEFUNC_sqlite_offset       = 6;
+  INLINEFUNC_unlikely            = 99;
+
 { ============================================================================
   Auth action codes (sqlite3.h — for sqlite3_set_authorizer)
   ============================================================================ }

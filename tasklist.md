@@ -256,6 +256,36 @@ Important: At the end of this document, please find:
       index, pNext chain walk), TC1..TC7 (EQ accept, wrong-cursor,
       non-EQ, WO_IS accept, prereqRight blocked, rowid leftColumn,
       existing-leading-idx reject).
+    - [X] Implication cluster + partial-index gate —
+      `exprImpliesNotNull` (expr.c:6678..6748) recursive helper that
+      proves `Expr p` is non-NULL whenever `pNN` is non-NULL (case
+      arms: TK_IN, TK_BETWEEN, the comparison / arithmetic / shift /
+      mul-div families, TK_SPAN/TK_COLLATE/TK_UPLUS/TK_UMINUS pass-
+      through, TK_TRUTH IS-only, TK_BITNOT/TK_NOT seenNot=1 fall-in);
+      `sqlite3ExprIsNotTrue` (expr.c:6750..6761) — TK_NULL,
+      TK_TRUEFALSE-EP_IsFalse, integer-zero gate; `sqlite3ExprIsIIF`
+      (expr.c:6763..6798) — recognises both `iif(x,y[,FALSE|NULL])`
+      and `CASE WHEN x THEN y [ELSE FALSE|NULL] END`, gated on
+      INLINEFUNC_iif tag for TK_FUNCTION; `sqlite3ExprImpliesExpr`
+      (expr.c:6800..6851) drives all three above plus the TK_OR /
+      TK_NOTNULL implication arms.  `sqlite3ExprCompareSkip`'s
+      11g.2.b stub replaced with the real impl (sqlite3ExprCompare
+      after stripping TK_COLLATE wrappers).  INLINEFUNC_*
+      pUserData tags lifted from sqliteInt.h:2055..2062 into
+      passqlite3vdbe.pas.  These unblock `whereUsablePartialIndex`
+      (where.c:3699..3728) — the partial-index usability gate ported
+      verbatim: TK_AND short-circuit, EP_OuterON / iJoin filter,
+      JT_OUTER → require EP_OuterON, dual implication probe at
+      iTab and iTab=-1 to reject trivially-true predicates,
+      TERM_VNULL skip, JT_LTORJ refusal.  Gate:
+      `TestWherePlanner.pas` (147/147): EINT1..EINT5
+      (sqlite3ExprIsNotTrue across TK_NULL / TK_TRUEFALSE / int
+      0 / int 1), EIIF1..EIIF5 (TK_CASE with two-arg + ELSE NULL /
+      ELSE 0 IIF; pLeft<>nil rejection; ELSE non-zero rejection),
+      EIE1..EIE4 (compare-path / TK_OR / TK_NOTNULL implication
+      arms + mismatched-column negative case), WUPI1..WUPI3
+      (partial-idx col1 NOTNULL usable when WHERE has col1=5;
+      JT_LTORJ short-circuit; partial col1=99 not usable).
 
 - [ ] **6.9-bis 11g.2.e** Port `wherecode.c` (~2945 lines) —
     per-loop inner-body codegen.  Public surface:
