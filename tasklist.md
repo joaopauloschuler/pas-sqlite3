@@ -1716,6 +1716,79 @@ Important: At the end of this document, please find:
       additional sqlite3Select gates (multi-table joins, ORDER
       BY consumption, GROUP BY/aggregate) so the 16 remaining
       op-count rows enter codegen.
+    - [X] Sub-progress 10 — rowid pseudo-column resolution +
+      rootpage drift root-causing (2026-04-27).  Two landings:
+
+      (a) `sqlite3ResolveSelectNames` (codegen.pas:5916..5973) —
+      when the bare TK_ID does not match any real column of any
+      FROM-clause table, fall through to the rowid pseudo-column
+      arm: `sqlite3IsRowid(zToken) <> 0` AND the SrcItem's
+      pSTab `HasRowid` (i.e. not a WITHOUT-ROWID table) →
+      rewrite in place to TK_COLUMN with `iColumn=-1`,
+      `affExpr=AnsiChar(SQLITE_AFF_INTEGER)`, iTable/y.pTab
+      bound to the matching item.  Mirrors lookupName at
+      resolve.c:498..505.  `_ROWID_` / `ROWID` / `OID` all
+      route through `sqlite3IsRowid` (codegen.pas:4759).
+      WITHOUT-ROWID items are skipped — the C reference hides
+      `rowid` on those, and TestWhereCorpus's WOR_INDEX row
+      uses an IPK alias (`p`), not `rowid`.
+
+      Effect on TestWhereCorpus: IPK row 0 (`SELECT a FROM t
+      WHERE rowid = 5`) now reaches `whereShortCut`'s
+      WHERE_IPK | WHERE_ONEROW arm — the rowid TK_ID resolves
+      to a TK_COLUMN with leftColumn=-1, exprAnalyze tags the
+      term WO_EQ, whereShortCut picks IPK and emits the C-shape
+      Init/OpenRead/Integer/SeekRowid/Column/ResultRow body
+      (9 ops, matching C's count exactly) instead of falling to
+      the SCAN-with-residual fallback (11 ops with the broken
+      `Null + Ne p5=80` always-jump-to-Halt residual that the
+      unresolved rowid TK_ID had been generating).
+      Failure-mode tally moved from `0 exception, 0 nil-Vdbe,
+      16 op-count, 4 op-diff` (sub-progress 9) to `0 exception,
+      0 nil-Vdbe, 15 op-count, 5 op-diff` — IPK row 0 converted
+      from op-count to op-diff, consistent with structural
+      alignment but residual P-operand drift.
+
+      (b) Rootpage drift root-causing.  IPK row 0's three
+      remaining op-diffs are: P2 of OpenRead (Pas=16 vs C=2 for
+      table `t` rootpage), opcode at op[2] (Pas=Int64 vs
+      C=Integer for the literal `5`), and P3 of SeekRowid
+      (Pas=2 vs C=1 register slot drift).  The dominant
+      contributor is the rootpage drift — every Pascal table
+      rootpage is shifted by +14 vs C.  Instrumented
+      `btreeCreateTable` (passqlite3btree.pas:6131..6156) with
+      a temporary trace and confirmed: a fresh `:memory:` DB
+      whose only operation is the very first CREATE TABLE has
+      `pBt^.nPage = 15` *before* `allocateBtreePage` runs (so
+      `pgnoRoot=16` for the first user table).  In C the same
+      sequence produces `nPage_before=1` / `pgnoRoot=2`.
+      `newDatabase` (btree.pas:5441..5470) sets `pBt^.nPage=1`
+      correctly, so 14 phantom pages are being allocated
+      between sqlite3_open completion and the first user CREATE
+      TABLE.  The trace was reverted; the root-cause is now
+      localised to the bootstrap path (likely
+      `sqlite3InstallSchemaTable` or one of the `OP_ParseSchema`
+      worker entry points re-running CreateBtree on the
+      sqlite_master / sqlite_temp_master / sqlite_temp_schema
+      stubs without a properly seeded `pBt^.nPage`).
+      Sub-progress 11 must locate and fix the bootstrap-path
+      page allocator so `pBt^.nPage` stays at 1 until a real
+      user DDL fires; that single fix should flip every
+      currently op-diff row's OpenRead-P2 mismatch and turn the
+      4 op-diff rows green wholesale (modulo the Int64/Integer
+      and register-slot drift, which are easier follow-on
+      fixes).
+
+      Test-suite delta: no regression anywhere.  TestParser
+      45/45, TestParserSmoke 20/20, TestPrepareBasic 20/20,
+      TestSelectBasic 49/49, TestExprBasic 40/40, TestDMLBasic
+      54/54, TestSchemaBasic 44/44, TestWhereBasic 52/52,
+      TestWhereSimple 44/44, TestWhereExpr 84/84,
+      TestWhereStructs 148/148, TestWherePlanner 675/675,
+      TestVdbeVtabExec 50/50, TestExplainParity 2 PASS / 8
+      DIVERGE / 0 ERROR (unchanged — the CREATE TABLE rows in
+      that corpus suffer the same rootpage drift, which is now
+      flagged as the next sub-progress's target).
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

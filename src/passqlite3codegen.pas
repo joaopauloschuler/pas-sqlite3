@@ -5936,6 +5936,29 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           Exit;
         end;
       end;
+      { Phase 6.9-bis 11g.2.f sub-progress 10 — rowid pseudo-column.
+        Mirror lookupName at resolve.c:498..505: when no real column
+        matched and the bare identifier is one of {rowid, oid, _rowid_},
+        bind to iColumn=-1 against the first FROM-clause table whose
+        VisibleRowid is true (i.e. HasRowid).  WITHOUT-ROWID tables
+        skip the rewrite, leaving the TK_ID unresolved (matches C, where
+        rowid is hidden on those tables and "no such column: rowid"
+        is the expected error). }
+      if sqlite3IsRowid(pE^.u.zToken) <> 0 then
+      begin
+        for i := 0 to pSrc^.nSrc - 1 do
+        begin
+          pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+          if pItem^.pSTab = nil then Continue;
+          if not HasRowid(pItem^.pSTab) then Continue;
+          pE^.op      := TK_COLUMN;
+          pE^.iTable  := pItem^.iCursor;
+          pE^.iColumn := i16(-1);
+          pE^.y.pTab  := pItem^.pSTab;
+          pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+          Exit;
+        end;
+      end;
       { Unresolved bare identifier — leave as TK_ID; downstream
         codegen will refuse the trivial gate and fall back to the
         SQLITE_OK no-body stub.  No error msg yet — Phase 6.x will
