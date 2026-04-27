@@ -292,17 +292,22 @@ begin
   pBet^.x.pList := pBList;
 
   pWInfo := sqlite3WhereBegin(@parse, pSrc, pBet, nil, nil, nil, 0, 0);
-  { Sub-progress 9: BETWEEN on rowid no longer falls back to nil.  The
-    SCAN-with-residual path emits OP_Rewind + a per-row IfFalse on the
-    parent TK_BETWEEN; the two TERM_VIRTUAL companions are skipped. }
-  Check('M3a WhereBegin returns non-nil for BETWEEN (SCAN+residual)',
+  { Sub-progress 17: rowid BETWEEN now drives the IPK-range shortcut
+    (whereShortCut sets WHERE_IPK | WHERE_COLUMN_RANGE | WHERE_BTM_LIMIT |
+    WHERE_TOP_LIMIT after exprAnalyzeBetween populates the WO_GE / WO_LE
+    virtual children).  Codegen Case-3 emits OP_SeekGE for the start
+    bound + OP_Rowid / OP_Gt for the end bound, replacing the previous
+    OP_Rewind+per-row-IfFalse SCAN-with-residual fallback.  The original
+    BETWEEN parent is still tagged TERM_CODED via the disableTerm
+    iParent/nChild propagation so no residual filter re-emits it. }
+  Check('M3a WhereBegin returns non-nil for BETWEEN (IPK range)',
         pWInfo <> nil);
   Check('M3b parse.nErr = 0',
         parse.nErr = 0);
   if pWInfo <> nil then
   begin
-    Check('M3k OP_Rewind emitted',
-          FindOpcode(v, OP_Rewind, 0) >= 0);
+    Check('M3k OP_SeekGE emitted (start bound of IPK range)',
+          FindOpcode(v, OP_SeekGE, 0) >= 0);
     Check('M3l BETWEEN parent tagged TERM_CODED',
           (pWInfo^.sWC.a[0].wtFlags and TERM_CODED) <> 0);
     sqlite3WhereEnd(pWInfo);

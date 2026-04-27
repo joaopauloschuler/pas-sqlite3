@@ -2331,6 +2331,91 @@ Important: At the end of this document, please find:
       `whereLoopAddBtree`) for IPK_RANGE.  Two-table JOIN codegen
       remains the heaviest follow-on lift.
 
+      Sub-progress 17 (2026-04-27) — IPK-RANGE shortcut.
+
+      (a) `whereShortCut` extended with an IPK-range arm: after the
+      IPK-EQ scan and the unique-index loop fail to populate a plan,
+      a fresh `whereScanInit` pair runs over the rowid (column index
+      `XN_ROWID = -1`) with `WO_GT_WO | WO_GE` then `WO_LT | WO_LE`
+      opmasks.  Either match (or both, for BETWEEN) populates
+      `pLoop^.aLTerm[0..1]` with the lower / upper bound term and
+      sets `wsFlags = WHERE_IPK | WHERE_COLUMN_RANGE | WHERE_BTM_LIMIT
+      [| WHERE_TOP_LIMIT]`, with `u.btree.nBtm` / `nTop` bumped to 1
+      per side; rRun = LogEst(10) = 33 (full-scan tuning approximation
+      pending whereRangeScanEst port).  exprAnalyzeBetween was already
+      synthesising the WO_GE / WO_LE virtual children at
+      whereexpr.c:1275..1313 (codegen.pas:7805..7824), so no new
+      planner-side analysis was needed — only the shortcut's scan
+      itself.
+
+      (b) `sqlite3WhereBegin` tail extended with a Case-3 IPK-range
+      codegen arm (codegen.pas:12478..12544), trimmed port of
+      wherecode.c:1712..1819.  Reads `pStart` / `pEnd` from
+      `aLTerm[0..1]` per the WHERE_BTM_LIMIT / WHERE_TOP_LIMIT bits;
+      emits `OP_SeekGE / OP_SeekGT / OP_SeekLE / OP_SeekLT` (selected
+      by the inline `aMoveOp[pX^.op - TK_GT_TK]` lookup) for the start
+      bound, then `OP_Integer` (via `sqlite3ExprCode`) loading the end
+      bound into a fresh memory cell, then `OP_Rowid` + a numeric
+      `OP_Gt` / `OP_Ge` / `OP_Lt` / `OP_Le` with `p5 = SQLITE_AFF_NUMERIC
+      | SQLITE_JUMPIFNULL` to break the loop on out-of-range rowids.
+      `pLevel^.op := OP_Next` lets the existing `sqlite3WhereEnd`
+      tail emit the iteration step on `addrBody`, the seek's landing
+      addr.  bRev / vector RHS / cursor-hint paths deferred — IPK_RANGE
+      in the gate exercises only the forward, scalar shape.
+
+      (c) `pLevel^.notReady` initialisation pulled in from C
+      (`(~Bitmask(0)) & ~pLoop^.maskSelf`) so that `disableTerm`'s
+      `(notReady & prereqAll) = 0` guard fires correctly.  Without this,
+      disableTerm short-circuited at the first iteration on every
+      rowid-bound term (whose prereqAll = level-self mask), preventing
+      the BETWEEN parent from being marked TERM_CODED via
+      iParent / nChild propagation.  The fix also lays groundwork for
+      multi-level loops where `notReady` must reflect "loops not yet
+      opened" — single-level today, generalises trivially.
+
+      (d) `disableTerm` invocations on `pStart` and `pEnd` in the
+      IPK-range Case-3 arm walk the iParent/nChild chain so the
+      original TK_BETWEEN parent (still alive in `pWC^.a[0]` — only
+      its WO_GE / WO_LE *children* are virtual) flips to TERM_CODED
+      once both bounds are coded.  The downstream residual filter
+      walk at codegen.pas:12576..12586 then skips the BETWEEN, so no
+      `OP_Null + OP_IfNot` per-row stub is emitted on top of the
+      seek+rowid+test sequence.
+
+      (e) `TestWhereSimple.M3k` updated: previously asserted
+      `OP_Rewind` for the SCAN-with-residual fallback shape; now
+      asserts `OP_SeekGE` for the IPK-range start-bound seek.  M3l
+      (BETWEEN parent TERM_CODED) unchanged — still passes, now
+      via the disableTerm-propagation route described in (d) instead
+      of the residual-walk's manual TERM_CODED set.
+
+      Test-suite delta:
+        * TestWhereCorpus moves from `14 PASS / 6 DIVERGE / 0 ERROR`
+          (sub-progress 16(a)) to `15 PASS / 5 DIVERGE / 0 ERROR`.
+          New PASS row: IPK_RANGE (`SELECT a FROM t WHERE rowid
+          BETWEEN 5 AND 10`, 13 ops byte-identical to the C oracle).
+          Failure-mode tally drops from `0/0/6/0` to `0/0/5/0`.
+          Per-shape histogram: IPK_RANGE 1/0; remaining DIVERGE rows
+          are IPK_IN, INDEX_IN, INDEX_IN_SUB, LEFT_JOIN, JOIN_WHERE
+          — each still needs structural codegen
+          (IN-coroutine, two-table JOIN).
+        * TestWhereSimple stays at 44/0 after the M3k update; M3a /
+          M3b / M3l remain green so the exprAnalyzeBetween path is
+          still exercised end-to-end.
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereExpr 84/84,
+          TestWhereStructs 148/148, TestWherePlanner 675/675,
+          TestVdbeArith 41/41, TestVdbeApi 57/57, TestVdbeMisc 45/45,
+          TestExplainParity 2/10 unchanged, TestPrintf 105/105,
+          TestJson 434/434, TestConfigHooks 54/54, TestSmoke green.
+
+      Sub-progress 18 stays focused on the IN-coroutine port
+      (sqlite3CodeRhsOfIN + sqlite3ExprCodeIN) for IPK_IN / INDEX_IN /
+      INDEX_IN_SUB, then the two-table JOIN codegen for LEFT_JOIN /
+      JOIN_WHERE.
+
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
   Current Status: **2 PASS / 8 DIVERGE / 0 ERROR**.  Drive to

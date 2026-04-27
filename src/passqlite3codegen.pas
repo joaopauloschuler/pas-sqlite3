@@ -12071,6 +12071,58 @@ begin
       Break;
     end;
   end;
+
+  { Phase 6.9-bis 11g.2.f sub-progress 17 — IPK-range shortcut.
+
+    When neither IPK-EQ nor a UNIQUE-index-EQ plan matched, look for
+    inequality terms on the rowid (rowid > k, rowid < k, rowid >= k,
+    rowid <= k, including the BETWEEN virtual >= / <= children).  Build
+    a WHERE_IPK | WHERE_COLUMN_RANGE plan with WHERE_BTM_LIMIT and/or
+    WHERE_TOP_LIMIT set; the existing Case-3 codegen at sqlite3WhereCodeOneLoopStart
+    emits the OP_SeekGE / OP_SeekLE prologue and the per-row OP_Rowid /
+    OP_Gt / OP_Lt loop-exit test, exactly mirroring the C reference for
+    `WHERE rowid BETWEEN x AND y`. }
+  if pLoop^.wsFlags = 0 then
+  begin
+    pTerm := whereScanInit(@scan, pWC, iCur, -1, WO_GT_WO or WO_GE, nil);
+    while (pTerm <> nil) and (pTerm^.prereqRight <> 0) do
+      pTerm := whereScanNext(@scan);
+    if pTerm <> nil then
+    begin
+      Assert(pLoop^.aLTerm = PPWhereTerm(@pLoop^.aLTermSpace[0]));
+      pLoop^.wsFlags := WHERE_IPK or WHERE_COLUMN_RANGE or WHERE_BTM_LIMIT;
+      pLoop^.aLTerm[0] := pTerm;
+      pLoop^.nLTerm    := 1;
+      pLoop^.u.btree.nEq  := 0;
+      pLoop^.u.btree.nBtm := 1;
+      pLoop^.u.btree.nTop := 0;
+      pLoop^.u.btree.pIndex := nil;
+    end;
+    pTerm := whereScanInit(@scan, pWC, iCur, -1, WO_LT or WO_LE, nil);
+    while (pTerm <> nil) and (pTerm^.prereqRight <> 0) do
+      pTerm := whereScanNext(@scan);
+    if pTerm <> nil then
+    begin
+      if pLoop^.wsFlags = 0 then
+      begin
+        Assert(pLoop^.aLTerm = PPWhereTerm(@pLoop^.aLTermSpace[0]));
+        pLoop^.wsFlags := WHERE_IPK or WHERE_COLUMN_RANGE;
+        pLoop^.nLTerm  := 0;
+        pLoop^.u.btree.nEq  := 0;
+        pLoop^.u.btree.nBtm := 0;
+        pLoop^.u.btree.nTop := 0;
+        pLoop^.u.btree.pIndex := nil;
+      end;
+      pLoop^.wsFlags := pLoop^.wsFlags or WHERE_TOP_LIMIT;
+      pLoop^.u.btree.nTop := 1;
+      pLoop^.aLTerm[pLoop^.nLTerm] := pTerm;
+      Inc(pLoop^.nLTerm);
+    end;
+    if (pLoop^.wsFlags and WHERE_COLUMN_RANGE) <> 0 then
+      { TUNING: cost of an IPK range scan ≈ full scan minus seek savings. }
+      pLoop^.rRun := 33;
+  end;
+
   if pLoop^.wsFlags <> 0 then
   begin
     pLoop^.nOut := i16(1);
@@ -12153,6 +12205,15 @@ var
   iReleaseReg: i32;
   iRowidReg:   i32;
   notReadyResid: Bitmask;
+  pStart, pEnd: PWhereTerm;
+  pX:          PExpr;
+  rTemp:       i32;
+  r1:          i32;
+  op3:         i32;
+  testOp:      i32;
+  memEndValue: i32;
+  startAddr:   i32;
+  jRng:        i32;
 begin
   Assert(((wctrlFlags and WHERE_ONEPASS_MULTIROW) = 0)
       or (((wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0)
@@ -12375,7 +12436,7 @@ begin
   pLevel^.addrBrk  := sqlite3VdbeMakeLabel(pParse);
   pLevel^.addrHalt := pLevel^.addrBrk;
   pLevel^.addrCont := sqlite3VdbeMakeLabel(pParse);
-  pLevel^.notReady := not Bitmask(0);
+  pLevel^.notReady := (not Bitmask(0)) and (not pLoop^.maskSelf);
 
   v := sqlite3GetVdbe(pParse);
   if v = nil then
@@ -12418,6 +12479,90 @@ begin
       body code generator (when wired up) does not re-emit it.  The full C
       disableTerm also handles transitive-equiv terms; deferred to 11g.2.e. }
     pTerm^.wtFlags := pTerm^.wtFlags or TERM_CODED;
+  end
+  else if ((pLoop^.wsFlags and WHERE_IPK) <> 0)
+       and ((pLoop^.wsFlags and WHERE_COLUMN_RANGE) <> 0) then
+  begin
+    { Phase 6.9-bis 11g.2.f sub-progress 17 — Case-3 IPK-range inline.
+
+      Trimmed port of wherecode.c:1712..1819, restricted to the rowid
+      inequality (and BETWEEN) shape exercised by IPK_RANGE in the
+      TestWhereCorpus gate.  Emits the optional start-bound seek
+      (OP_SeekGE / OP_SeekGT / OP_SeekLE / OP_SeekLT) or OP_Rewind,
+      and the optional end-bound test (OP_Rowid + OP_Le/Lt/Ge/Gt with
+      p5 = SQLITE_AFF_NUMERIC | SQLITE_JUMPIFNULL).  bRev / vector RHS
+      / cursor-hint paths are deferred — IPK_RANGE in the gate exercises
+      only the forward, scalar shape.
+
+      pStart = aLTerm[0] when WHERE_BTM_LIMIT, pEnd = aLTerm[next] when
+      WHERE_TOP_LIMIT, mirroring whereShortCut's IPK-range population. }
+    testOp      := OP_Noop;
+    memEndValue := 0;
+    pStart      := nil;
+    pEnd        := nil;
+    jRng        := 0;
+    if (pLoop^.wsFlags and WHERE_BTM_LIMIT) <> 0 then
+    begin
+      pStart := pLoop^.aLTerm[jRng];
+      Inc(jRng);
+    end;
+    if (pLoop^.wsFlags and WHERE_TOP_LIMIT) <> 0 then
+    begin
+      pEnd := pLoop^.aLTerm[jRng];
+      Inc(jRng);
+    end;
+    Assert((pStart <> nil) or (pEnd <> nil));
+
+    if pStart <> nil then
+    begin
+      Assert((pStart^.wtFlags and TERM_VNULL) = 0);
+      pX := pStart^.pExpr;
+      Assert(pX <> nil);
+      r1 := sqlite3ExprCodeTemp(pParse, pX^.pRight, @rTemp);
+      disableTerm(pLevel, pStart);
+      { aMoveOp[TK_GT_TK..TK_GE - TK_GT_TK]: SeekGT, SeekLE, SeekLT, SeekGE.
+        See wherecode.c:1741..1746; same table inlined in sqlite3WhereCodeOneLoopStart. }
+      case pX^.op of
+        TK_GT_TK: op3 := OP_SeekGT;
+        TK_LE:    op3 := OP_SeekLE;
+        TK_LT:    op3 := OP_SeekLT;
+        TK_GE:    op3 := OP_SeekGE;
+      else        op3 := OP_SeekGE;
+      end;
+      sqlite3VdbeAddOp3(v, op3, pLevel^.iTabCur, pLevel^.addrBrk, r1);
+      sqlite3ReleaseTempReg(pParse, rTemp);
+    end
+    else
+      sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrHalt);
+
+    if pEnd <> nil then
+    begin
+      pX := pEnd^.pExpr;
+      Assert(pX <> nil);
+      Assert((pEnd^.wtFlags and TERM_VNULL) = 0);
+      Inc(pParse^.nMem);
+      memEndValue := pParse^.nMem;
+      sqlite3ExprCode(pParse, pX^.pRight, memEndValue);
+      if (pX^.op = TK_LT) or (pX^.op = TK_GT_TK) then
+        testOp := OP_Ge
+      else
+        testOp := OP_Gt;
+      disableTerm(pLevel, pEnd);
+    end;
+
+    startAddr := sqlite3VdbeCurrentAddr(v);
+    pLevel^.op := OP_Next;
+    pLevel^.p1 := pLevel^.iTabCur;
+    pLevel^.p2 := startAddr;
+    pLevel^.addrBody := startAddr;
+    if testOp <> OP_Noop then
+    begin
+      Inc(pParse^.nMem);
+      iRowidReg := pParse^.nMem;
+      sqlite3VdbeAddOp2(v, OP_Rowid, pLevel^.iTabCur, iRowidReg);
+      sqlite3VdbeAddOp3(v, testOp, memEndValue, pLevel^.addrBrk, iRowidReg);
+      sqlite3VdbeChangeP5(v, u16(SQLITE_AFF_NUMERIC or SQLITE_JUMPIFNULL));
+    end;
   end
   else
   begin
