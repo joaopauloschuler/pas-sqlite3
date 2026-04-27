@@ -16,6 +16,8 @@ Important: At the end of this document, please find:
 * Per-function porting checklist
 * Key rules for the developer
 
+REMEMBER: Remember that you are porting code. DO NOT RANDOMLY ADD TESTS unless you are looking for a specific bug. If you are porting existing tests in C, mention the origin of the test that you are porting.
+
 ---
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
