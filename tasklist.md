@@ -187,7 +187,7 @@ Important: At the end of this document, please find:
     Verify byte-identical bytecode emission against C via
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
-    Current baseline (2026-04-27): **TestWhereCorpus 91 PASS / 1
+    Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
     DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 2 PASS / 8
     DIVERGE / 0 ERROR (corpus = 10); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
@@ -195,49 +195,18 @@ Important: At the end of this document, please find:
     the system one (the latter's `sqlite3_initialize` can corrupt
     shared globals and crash the Pas tokenizer at startup).
 
-    **Open DIVERGE row:**
-      * `EXISTS_SUB` (Pas=22, C=30): Pas emits a correct correlated
-        subroutine; C uses a bloom-filter + autoindex co-optimization
-        (`Once`/`OpenAutoindex`/`FilterAdd`) at the subselect level.
-        Upstream classification gap closed (commit `b94ddc1` —
-        `exprSelectUsage` ported at `passqlite3codegen.pas:8105..8154`,
-        cross-frame `prereqRight` masks now propagate correctly).
+    **EXISTS-to-JOIN optimization landed** (commits `4ab1bb5` + `4b765c8`,
+    sub-progress 50 + 51): Parse.bHasExists set in resolver, SQLITE_ExistsToJoin
+    flag, renumberCursors helpers, existsToJoin() itself, sqlite3Select call
+    site, OP_IfEmpty emission for fromExists in the cursor-open loop, and the
+    EXISTS-break tail (where.c:7586..7607).  EXISTS_SUB flipped from DIVERGE
+    (Pas=22, C=30) to **PASS at 30 ops, byte-identical**.
 
-        **Diagnosis (2026-04-27):** The 8-op gap is NOT simply the
-        autoindex synthesis at `passqlite3codegen.pas:11055..11115`
-        failing to fire — it never gets the chance.  The C reference
-        emits `OpenAutoindex` / `FilterAdd` at the OUTER level of the
-        query, NOT inside the EXISTS subroutine.  This is the
-        **EXISTS-to-JOIN optimization** (`select.c:7295..7378`,
-        `existsToJoin()`), gated on `pParse->bHasExists` and
-        `OptimizationEnabled(SQLITE_ExistsToJoin)` at `select.c:7899`.
-        It rewrites the parse tree: `WHERE EXISTS (SELECT ... FROM s
-        WHERE s.x=t.a)` becomes a 2-table FROM `(t, s)` with
-        `s.fg.fromExists=1`, and the EXISTS expression collapses to
-        TK_INTEGER 1.  The 2-table FROM then drives the full planner
-        (`whereLoopAddAll` → `wherePathSolver` →
-        `constructAutomaticIndex`), which already exists in Pas at
-        `passqlite3codegen.pas:13733..13839`.
-
-        **Missing pieces to port** (estimated ~170–200 LOC, multiple
-        files, deferred as larger task):
-        1. `Parse.bHasExists` bit (sqliteInt.h:3902); set when an
-           EXISTS Expr node is created in expr.c.
-        2. `SQLITE_ExistsToJoin = 0x40000000` flag (sqliteInt.h:1932).
-        3. `renumberCursors` + `renumberCursorsCb` +
-           `srclistRenumberCursors` + `renumberCursorDoMapping`
-           (select.c:4019..4064, ~80 LOC).
-        4. `existsToJoin` (select.c:7317..7378, ~60 LOC).
-        5. Call site at `sqlite3Select` matching select.c:7899..7900.
-        6. `OP_IfEmpty` emission for fromExists tables in the
-           cursor-open loop at `passqlite3codegen.pas:13795..13820`,
-           mirroring where.c:7310..7316.
-
-        Pas-side surface already in place: `fromExists` flag is
-        `pSrc^.fg.fgBits3 bit 2` (codegen.pas:595), checked at
-        :10799, :11205, :11295, :11576; `sqlite3SrcListAppendList`
-        at :20058; `OP_IfEmpty` opcode at vdbe.pas:89/6843.
-        Companion `NOT_EXISTS` PASSes via plain-scan.
+    **Minor follow-on (optional polish):** fromExists planner-cost nudges at
+    `where.c:3579, 3630, 4181, 4285, 4991` (5 sites, ~2–10 LOC each — `pNew->nOut = 0`
+    / cost-skip in `whereLoopAddBtree*` / `whereLoopAddOr`).  Did not block the
+    EXISTS_SUB flip because the corpus shape's plan is the one the existing
+    planner picks anyway; only matter for borderline non-corpus shapes.
 
     **Open follow-on:** Re-enable productive tails:
       * `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
@@ -279,8 +248,7 @@ Important: At the end of this document, please find:
     into mis-keyed cursor probes; not a malloc/static-state collision
     as initially suspected.  Fixed by porting `exprSelectUsage`
     (`whereexpr.c:998..1024` → `passqlite3codegen.pas:8105..8154`,
-    commit `b94ddc1`).  TestWhereCorpus now runs end-to-end at
-    91/1/0.
+    commit `b94ddc1`).  TestWhereCorpus now runs end-to-end at 92/0/0.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
   Current Status: **2 PASS / 8 DIVERGE / 0 ERROR**.  Drive to
