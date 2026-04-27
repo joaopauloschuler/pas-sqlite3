@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 35;
+  N_CORPUS = 37;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -127,6 +127,8 @@ begin
   Add(i, 'SELECT NULL',                 'SELECT NULL;');                         Inc(i);
   Add(i, 'DELETE rowid EQ AND col',     'DELETE FROM t WHERE rowid=5 AND a=1;'); Inc(i);
   Add(i, 'SAVEPOINT 2',                 'SAVEPOINT s2;');                        Inc(i);
+  Add(i, 'SELECT col arith',            'SELECT a+b FROM t;');                   Inc(i);
+  Add(i, 'SELECT col mul',              'SELECT a*2 FROM t;');                   Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

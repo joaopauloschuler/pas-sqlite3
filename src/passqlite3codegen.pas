@@ -17214,9 +17214,10 @@ begin
   { Restore pTab to the first source for legacy single-table code below. }
   pTab := pItem^.pSTab;
 
-  { Result columns must be plain column references resolved by name
-    resolution (TK_COLUMN with a non-nil pTab).  SRT_Exists does NOT
-    evaluate result columns so skip this check (mirrors C
+  { Result columns may be plain column references (TK_COLUMN /
+    TK_AGG_COLUMN with a non-nil pTab) or general expressions over them
+    (TK_PLUS / TK_MINUS / TK_STAR / literals / etc.).  SRT_Exists does
+    NOT evaluate result columns so skip this check (mirrors C
     selectInnerLoop:1202 "else if eDest!=SRT_Exists").
     For multi-table joins, columns may reference any source cursor. }
   pEList := p^.pEList;
@@ -17227,11 +17228,11 @@ begin
     begin
       pE := items[i].pExpr;
       if pE = nil then begin Result := SQLITE_OK; Exit; end;
-      if (pE^.op <> TK_COLUMN) and (pE^.op <> TK_AGG_COLUMN) then
+      if ((pE^.op = TK_COLUMN) or (pE^.op = TK_AGG_COLUMN))
+         and (pE^.y.pTab = nil) then
       begin
         Result := SQLITE_OK; Exit;
       end;
-      if pE^.y.pTab = nil then begin Result := SQLITE_OK; Exit; end;
     end;
   end;
 
@@ -17302,13 +17303,20 @@ begin
     { Non-EXISTS path: emit result columns. iSdst was already allocated above. }
 
     { Inner loop body — one OP_Column per result column (selectInnerLoop:1197).
-      For multi-table joins, pE^.iTable is the actual cursor and pE^.y.pTab
-      is the source table; for single-table, this degenerates to the old path. }
+      For TK_COLUMN / TK_AGG_COLUMN use sqlite3ExprCodeGetColumnOfTable
+      (preserves the OP_Column-direct-to-target shape that the existing
+      passing rows depend on).  For general expressions (TK_PLUS, literals,
+      etc.) defer to sqlite3ExprCode, which walks sqlite3ExprCodeTarget
+      and handles the operator-table arms. }
     for i := 0 to nResultCol - 1 do
     begin
       pE := items[i].pExpr;
-      sqlite3ExprCodeGetColumnOfTable(v, pE^.y.pTab, pE^.iTable, pE^.iColumn,
-                                      pDest^.iSdst + i);
+      if ((pE^.op = TK_COLUMN) or (pE^.op = TK_AGG_COLUMN))
+         and (pE^.y.pTab <> nil) then
+        sqlite3ExprCodeGetColumnOfTable(v, pE^.y.pTab, pE^.iTable, pE^.iColumn,
+                                        pDest^.iSdst + i)
+      else
+        sqlite3ExprCode(pParse, pE, pDest^.iSdst + i);
     end;
 
     { Disposal — selectInnerLoop:1304..1370.  SRT_Output emits

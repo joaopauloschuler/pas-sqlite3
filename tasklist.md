@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 34 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 35); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 36 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 37); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -186,10 +186,10 @@ Important: At the end of this document, please find:
     `sqlite3SrcListAppend` (db/table arg swap + dequote) to mirror
     build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
-  Scaffold landed; corpus expanded to 35 rows (DDL + SELECT/DML/txn +
+  Scaffold landed; corpus expanded to 37 rows (DDL + SELECT/DML/txn +
   SAVEPOINT/RELEASE + INSERT DEFAULT VALUES + multi-AND + multi-col
-  rowid-EQ).
-  Current Status (2026-04-27): **34 PASS / 1 DIVERGE / 0 ERROR**.
+  rowid-EQ + per-row arith over column scan).
+  Current Status (2026-04-27): **36 PASS / 1 DIVERGE / 0 ERROR**.
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -201,8 +201,8 @@ Important: At the end of this document, please find:
   DEFAULT VALUES, SELECT literal, SELECT NULL, SELECT col scan, SELECT
   multi-col scan, SELECT col WHERE, SELECT col WHERE multi-AND, SELECT
   rowid EQ, SELECT multi-col rowid EQ, SELECT * scan, SELECT * rowid
-  EQ, SELECT arith / string / multi literal, DELETE rowid EQ, DELETE
-  rowid EQ AND col.
+  EQ, SELECT arith / string / multi literal, SELECT col arith
+  (a+b / a*2), DELETE rowid EQ, DELETE rowid EQ AND col.
 
   DIVERGE rows + delta = (C ops − Pas ops):
 
@@ -281,15 +281,17 @@ Important: At the end of this document, please find:
       Sub-progress (2026-04-27): probe sweep #2 added 8 more PASS rows
       (CREATE INDEX 2col, RELEASE, multi-col rowid EQ, * rowid EQ,
       multi-AND col WHERE, SELECT NULL, DELETE rowid EQ AND col,
-      SAVEPOINT 2). Corpus now 34 PASS / 1 DIVERGE / 35 total.
+      SAVEPOINT 2).  Then per-row arith over column scan (`SELECT a+b
+      FROM t`, `SELECT a*2 FROM t`) closed by lifting the
+      TK_COLUMN/TK_AGG_COLUMN-only bailout in `sqlite3Select`'s result
+      column gate and routing non-column EList exprs through
+      `sqlite3ExprCode` (passqlite3codegen.pas:17307).  Corpus now
+      36 PASS / 1 DIVERGE / 37 total.
 
       DIVERGE shapes discovered in probe sweeps (kept out of corpus
       until they flip — each is a committable next-agent ticket):
         * `CREATE INDEX i ON t(a) WHERE a>0` — Δ=4 (partial-index
           WHERE clause codegen path).
-        * `SELECT a+b FROM t` / `SELECT a*2 FROM t` — Δ≈11
-          (per-row expression eval over a column scan; Pas emits
-          only the prologue).
         * `SELECT a FROM t LIMIT 3` — Δ=9 (Pas elides LIMIT
           codegen path; needs `computeLimitRegisters` + IfPos /
           DecrJumpZero emission in `sqlite3Select`).
