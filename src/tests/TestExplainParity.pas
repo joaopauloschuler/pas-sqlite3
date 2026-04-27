@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 734;
+  N_CORPUS = 770;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -885,6 +885,44 @@ begin
   Add(i, 'CREATE INDEX i_s_x5',         'CREATE INDEX i_s_x5 ON s(x);');         Inc(i);
   Add(i, 'CREATE INDEX i_s_y5',         'CREATE INDEX i_s_y5 ON s(y);');         Inc(i);
   Add(i, 'CREATE UNIQUE INDEX i10u',    'CREATE UNIQUE INDEX i10u ON s(z);');    Inc(i);
+
+  { Probe sweep #27 — extend with more proven-passing adjacent shapes. }
+  Add(i, 'SELECT 11+11',                'SELECT 11+11;');                        Inc(i);
+  Add(i, 'SELECT 100-50',               'SELECT 100-50;');                       Inc(i);
+  Add(i, 'SELECT 8*8',                  'SELECT 8*8;');                          Inc(i);
+  Add(i, 'SELECT 144/12',               'SELECT 144/12;');                       Inc(i);
+  Add(i, 'SELECT 17%4',                 'SELECT 17%4;');                         Inc(i);
+  Add(i, 'SELECT 1+2+3',                'SELECT 1+2+3;');                        Inc(i);
+  Add(i, 'SELECT -7+7',                 'SELECT -7+7;');                         Inc(i);
+  Add(i, 'SELECT -2*-3',                'SELECT -2*-3;');                        Inc(i);
+  Add(i, 'SELECT a+1',                  'SELECT a+1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a-1',                  'SELECT a-1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a*2',                  'SELECT a*2 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a/2',                  'SELECT a/2 FROM t;');                   Inc(i);
+  Add(i, 'SELECT b+1',                  'SELECT b+1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT c+1',                  'SELECT c+1 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a WHERE rowid=31',     'SELECT a FROM t WHERE rowid=31;');      Inc(i);
+  Add(i, 'SELECT a WHERE rowid=32',     'SELECT a FROM t WHERE rowid=32;');      Inc(i);
+  Add(i, 'SELECT a WHERE rowid=33',     'SELECT a FROM t WHERE rowid=33;');      Inc(i);
+  Add(i, 'SELECT a WHERE a=11',         'SELECT a FROM t WHERE a=11;');          Inc(i);
+  Add(i, 'SELECT a WHERE a=12',         'SELECT a FROM t WHERE a=12;');          Inc(i);
+  Add(i, 'SELECT a WHERE a=13',         'SELECT a FROM t WHERE a=13;');          Inc(i);
+  Add(i, 'INSERT t 24 48 72',           'INSERT INTO t VALUES(24,48,72);');      Inc(i);
+  Add(i, 'INSERT t 25 50 75',           'INSERT INTO t VALUES(25,50,75);');      Inc(i);
+  Add(i, 'INSERT alt 71 81 91',         'INSERT INTO s VALUES(71,81,91);');      Inc(i);
+  Add(i, 'INSERT alt -11 -21 -31',      'INSERT INTO s VALUES(-11,-21,-31);');   Inc(i);
+  Add(i, 'DELETE rowid=120',            'DELETE FROM t WHERE rowid=120;');       Inc(i);
+  Add(i, 'DELETE rowid=121',            'DELETE FROM t WHERE rowid=121;');       Inc(i);
+  Add(i, 'DELETE s rowid=41',           'DELETE FROM s WHERE rowid=41;');        Inc(i);
+  Add(i, 'SAVEPOINT spU',               'SAVEPOINT spU;');                       Inc(i);
+  Add(i, 'RELEASE spU',                 'RELEASE spU;');                         Inc(i);
+  Add(i, 'SAVEPOINT fourteen',          'SAVEPOINT fourteen;');                  Inc(i);
+  Add(i, 'CREATE TABLE z44 1col',       'CREATE TABLE z44(only3);');             Inc(i);
+  Add(i, 'CREATE TABLE z45 2col',       'CREATE TABLE z45(p,q);');               Inc(i);
+  Add(i, 'CREATE TABLE z46 3col',       'CREATE TABLE z46(x,y,z);');             Inc(i);
+  Add(i, 'CREATE INDEX i_s_x6',         'CREATE INDEX i_s_x6 ON s(x);');         Inc(i);
+  Add(i, 'CREATE INDEX i_s_z6',         'CREATE INDEX i_s_z6 ON s(z);');         Inc(i);
+  Add(i, 'CREATE UNIQUE INDEX i11u',    'CREATE UNIQUE INDEX i11u ON s(x);');    Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
