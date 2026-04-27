@@ -104,7 +104,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 76;
+  N_CORPUS = 84;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -342,6 +342,28 @@ begin
       'SELECT a FROM t WHERE typeof(a) = ''integer'';');         Inc(i);
   Add(i, 'hex(a)=''05''',             'HEX',
       'SELECT a FROM t WHERE hex(a) = ''05'';');                 Inc(i);
+
+  { Phase 6.9-bis 11g.2.f sub-progress 37 — corpus expansion group #7.
+    Eight new single-table shapes: bitwise operators (BITNOT, BITAND, BITOR,
+    LSHIFT, RSHIFT), IS FALSE boolean test, NOT IN literal-list on a column,
+    and round() scalar function.  All degrade to SCAN-with-residual on the
+    un-indexed fixture. }
+  Add(i, '~a = -1 (BITNOT)',           'BITNOT',
+      'SELECT a FROM t WHERE ~a = -1;');                        Inc(i);
+  Add(i, 'a & 7 = 1 (BITAND)',         'BITAND',
+      'SELECT a FROM t WHERE a & 7 = 1;');                      Inc(i);
+  Add(i, 'a | 1 = 5 (BITOR)',          'BITOR',
+      'SELECT a FROM t WHERE a | 1 = 5;');                      Inc(i);
+  Add(i, 'a << 1 = 10 (LSHIFT)',       'LSHIFT',
+      'SELECT a FROM t WHERE a << 1 = 10;');                    Inc(i);
+  Add(i, 'a >> 1 = 2 (RSHIFT)',        'RSHIFT',
+      'SELECT a FROM t WHERE a >> 1 = 2;');                     Inc(i);
+  Add(i, 'a IS FALSE',                 'IS_FALSE',
+      'SELECT a FROM t WHERE a IS FALSE;');                     Inc(i);
+  Add(i, 'a NOT IN (1,2,3)',           'COL_NOT_IN',
+      'SELECT a FROM t WHERE a NOT IN (1,2,3);');               Inc(i);
+  Add(i, 'round(a) = 5',              'ROUND',
+      'SELECT a FROM t WHERE round(a) = 5;');                   Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

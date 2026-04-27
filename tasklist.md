@@ -3757,9 +3757,23 @@ Important: At the end of this document, please find:
 
       All single-table corpus DIVERGEs are now resolved.  Remaining
       DIVERGEs all require 11g.2.d (multi-table planner / correlated
-      subquery codegen).  Sub-progress 37 options: (i) corpus
-      expansion group #7 — discover more single-table gaps;
-      (ii) begin 11g.2.d planner work.
+      subquery codegen).
+    - [X] Sub-progress 37 — corpus expansion group #7 (2026-04-27).
+      Eight new single-table rows; N_CORPUS 76 → 84.  All 8 PASS
+      immediately — confirms wide bitwise / IS-FALSE / NOT-IN /
+      runtime-function coverage is already byte-identical:
+      BITNOT (~a), BITAND, BITOR, LSHIFT, RSHIFT, IS_FALSE,
+      COL_NOT_IN (`a NOT IN (1,2,3)`, 37 ops), ROUND.
+
+      Test-suite delta:
+        * TestWhereCorpus: **80 PASS / 4 DIVERGE / 0 ERROR (corpus = 84)**.
+          Same 4 persistent DIVERGEs (LEFT_JOIN, JOIN_WHERE,
+          EXISTS_SUB, NOT_EXISTS) — all blocked on 11g.2.d.
+        * No regression elsewhere.
+
+      All remaining corpus DIVERGEs require 11g.2.d.  Next productive
+      direction: begin 11g.2.d planner work or expand TestExplainParity
+      (still 2/10) for DDL parity.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
