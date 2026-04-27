@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 517;
+  N_CORPUS = 542;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -650,6 +650,33 @@ begin
   Add(i, 'CREATE TABLE z27 2col',       'CREATE TABLE z27(a,b);');               Inc(i);
   Add(i, 'CREATE INDEX i_t_b2',         'CREATE INDEX i_t_b2 ON t(b);');         Inc(i);
   Add(i, 'CREATE INDEX i_t_c2',         'CREATE INDEX i_t_c2 ON t(c);');         Inc(i);
+
+  { Probe sweep #20 — more arith / negative / float / multi-AND / col-mix. }
+  Add(i, 'SELECT -1',                   'SELECT -1;');                           Inc(i);
+  Add(i, 'SELECT -100',                 'SELECT -100;');                         Inc(i);
+  Add(i, 'SELECT 0',                    'SELECT 0;');                            Inc(i);
+  Add(i, 'SELECT 3.14',                 'SELECT 3.14;');                         Inc(i);
+  Add(i, 'SELECT -2.5',                 'SELECT -2.5;');                         Inc(i);
+  Add(i, 'SELECT 1+2-3',                'SELECT 1+2-3;');                        Inc(i);
+  Add(i, 'SELECT 5*2+1',                'SELECT 5*2+1;');                        Inc(i);
+  Add(i, 'SELECT 10/2-3',               'SELECT 10/2-3;');                       Inc(i);
+  Add(i, 'SELECT b WHERE a=5',          'SELECT b FROM t WHERE a=5;');           Inc(i);
+  Add(i, 'SELECT c WHERE a=5',          'SELECT c FROM t WHERE a=5;');           Inc(i);
+  Add(i, 'SELECT a,b WHERE a=5',        'SELECT a,b FROM t WHERE a=5;');         Inc(i);
+  Add(i, 'SELECT * WHERE a=5',          'SELECT * FROM t WHERE a=5;');           Inc(i);
+  Add(i, 'SELECT * WHERE b=5',          'SELECT * FROM t WHERE b=5;');           Inc(i);
+  Add(i, 'SELECT col 4-AND',            'SELECT a FROM t WHERE rowid=5 AND a=1 AND b=2 AND c=3;'); Inc(i);
+  Add(i, 'INSERT t 7 14 21',            'INSERT INTO t VALUES(7,14,21);');       Inc(i);
+  Add(i, 'INSERT t 8 16 24',            'INSERT INTO t VALUES(8,16,24);');       Inc(i);
+  Add(i, 'INSERT alt 100 200 300',      'INSERT INTO s VALUES(100,200,300);');   Inc(i);
+  Add(i, 'SAVEPOINT spL',               'SAVEPOINT spL;');                       Inc(i);
+  Add(i, 'RELEASE spL',                 'RELEASE spL;');                         Inc(i);
+  Add(i, 'SAVEPOINT eight',             'SAVEPOINT eight;');                     Inc(i);
+  Add(i, 'CREATE TABLE z28 1col',       'CREATE TABLE z28(p);');                 Inc(i);
+  Add(i, 'CREATE TABLE z29 5col',       'CREATE TABLE z29(a,b,c,d,e);');         Inc(i);
+  Add(i, 'CREATE INDEX i_s_x3',         'CREATE INDEX i_s_x3 ON s(x);');         Inc(i);
+  Add(i, 'CREATE INDEX i_t_a2',         'CREATE INDEX i_t_a2 ON t(a);');         Inc(i);
+  Add(i, 'SELECT hello world',          'SELECT ''hello world'';');              Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
