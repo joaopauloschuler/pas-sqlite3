@@ -12278,6 +12278,10 @@ var
   skipLikeAddr:    i32;
   pIdxBody:        PIndex2;
   xLR:             u32;
+  { ---- Case 4 WITHOUT-ROWID PK-key reconstruction locals ---- }
+  pPk4:            PIndex2;
+  jPk4:            i32;
+  kPk4:            i32;
   { ---- pRJ RIGHT JOIN match-recording / BeginSubrtn locals ---- }
   pRJ:             PWhereRightJoin;
   pTabRJ:          PTable2;
@@ -12683,10 +12687,25 @@ begin
     begin
       codeDeferredSeek(pWInfo, pIdx4, iCur, iIdxCur);
     end
-    else
+    else if iCur <> iIdxCur then
     begin
-      { WITHOUT ROWID PK-key reconstruction lands in a subsequent batch. }
-      Assert(False);
+      { WITHOUT-ROWID PK-key reconstruction (wherecode.c:2177..2186).  When
+        a secondary index drives the loop on a WITHOUT-ROWID table, the
+        deferred-seek mechanism does not apply (there is no rowid).
+        Instead, extract each primary-key column from the index key into a
+        contiguous register block via OP_Column on the index cursor, then
+        OP_NotFound to seek the canonical PK table to the matching row.
+        When the PK itself is the driver index (iCur = iIdxCur) the index
+        cursor IS the table cursor, so no extraction is required. }
+      pPk4       := sqlite3PrimaryKeyIndex(pIdx4^.pTable);
+      iRowidReg  := sqlite3GetTempRange(pParse, pPk4^.nKeyCol);
+      for jPk4 := 0 to i32(pPk4^.nKeyCol) - 1 do
+      begin
+        kPk4 := sqlite3TableColumnToIndex(pIdx4, pPk4^.aiColumn[jPk4]);
+        sqlite3VdbeAddOp3(v, OP_Column, iIdxCur, kPk4, iRowidReg + jPk4);
+      end;
+      sqlite3VdbeAddOp4Int(v, OP_NotFound, iCur, addrCont,
+                           iRowidReg, i32(pPk4^.nKeyCol));
     end;
 
     if pLevel^.iLeftJoin = 0 then

@@ -1041,6 +1041,33 @@ Important: At the end of this document, please find:
       isSubquery — verifies pLevel^.op = OP_Goto, pLevel^.p2 > 0,
       OP_InitCoroutine p1=77 / p3=123 emitted, OP_Yield p1=77
       emitted, pLevel^.p2 points at the emitted OP_Yield address).
+    - [X] Public surface, batch 19 — `sqlite3WhereCodeOneLoopStart`
+      Case 4 WITHOUT-ROWID secondary-index PK reconstruction
+      (wherecode.c:2177..2186).  Replaces the prior `Assert(False)`
+      stub on the !HasRowid arm of the Case 4 table-row seek.  When
+      the driving index of a Case 4 indexed scan is *not* the PK of
+      a WITHOUT-ROWID table, the deferred-seek mechanism does not
+      apply (no rowid).  Instead, we extract each PK key column out
+      of the index key into a contiguous register block via
+      `sqlite3GetTempRange(pParse, pPk^.nKeyCol)` + per-column
+      `OP_Column iIdxCur, sqlite3TableColumnToIndex(pIdx,
+      pPk^.aiColumn[j]), iRowidReg+j`, then issue
+      `OP_NotFound iCur, addrCont, iRowidReg, pPk^.nKeyCol` to
+      position the canonical PK cursor.  When the PK itself is the
+      driver index (`iCur = iIdxCur`) the index cursor IS the table
+      cursor, so the C source elides emit (the third `else if
+      iCur != iIdxCur` arm) — the Pascal port mirrors that gating
+      verbatim.  Closes the last fall-through assertion in Case 4 for
+      the canonical `nEq=k, !BIGNULL_SORT, !IN_SEEKSCAN, !ONEROW`
+      path on WITHOUT-ROWID tables, unblocking the upcoming
+      WhereCorpus run on tables declared `WITHOUT ROWID`.  Gate:
+      `TestWherePlanner.pas` (629/629): SCOLS19 (WITHOUT-ROWID
+      single-column table with separate PK index installed first on
+      `pTab^.pIndex` so `sqlite3PrimaryKeyIndex` finds it; secondary
+      `pIdx` drives the loop with `x = 42`, `iCur=5 / iIdxCur=6`;
+      verifies OP_Column emitted on iIdxCur, OP_NotFound emitted on
+      iTabCur, no OP_DeferredSeek (HasRowid path gated off), return
+      value matches pLevel^.notReady).
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix

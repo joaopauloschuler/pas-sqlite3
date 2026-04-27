@@ -5181,6 +5181,162 @@ begin
   sqlite3_close(db);
 end;
 
+{ ---- TestCodeOneLoopStartCase4WithoutRowid — SCOLS19.
+       wherecode.c:2177..2186.  Case 4 secondary-index scan on a
+       WITHOUT-ROWID table: the table-row seek extracts each PK column
+       from the index key with OP_Column (against iIdxCur) and uses
+       OP_NotFound to position the canonical PK cursor.  No
+       OP_DeferredSeek — that arm is gated on HasRowid(pTab). ---- }
+procedure TestCodeOneLoopStartCase4WithoutRowid;
+const
+  N_LEVEL = 1;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  v:         PVdbe;
+  rc:        i32;
+  bufWI:     array of Byte;
+  bufSL:     array of Byte;
+  pWInfo:    PWhereInfo;
+  pSL:       PSrcList;
+  pSItem:    PSrcItem;
+  pLevel:    PWhereLevel;
+  loop:      TWhereLoop;
+  term:      TWhereTerm;
+  ex, exR:   TExpr;
+  alterm:    array[0..0] of PWhereTerm;
+  pTab:      PTable2;
+  pIdx:      PIndex2;
+  pPkIdx:    PIndex2;
+  aiCol:     array[0..1] of i16;
+  aiPkCol:   array[0..1] of i16;
+  aSort:     array[0..0] of u8;
+  aSortPk:   array[0..0] of u8;
+  aCol:      array[0..0] of TColumn;
+  base, i:   i32;
+  pOp:       PVdbeOp;
+  notReady:  Bitmask;
+  rOut:      Bitmask;
+  fColIdx, fNotFound, fDef: Boolean;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('SCOLS19 open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  { ---- Table fixture (WITHOUT-ROWID): single column `x`, PK on x,
+         secondary index also on x (so the loop can drive against the
+         secondary while the PK reconstruction logic engages). ---- }
+  pTab := PTable2(GetMem(SizeOf(TTable))); FillChar(pTab^, SizeOf(TTable), 0);
+  FillChar(aCol, SizeOf(aCol), 0);
+  aCol[0].zCnName := PAnsiChar('x');
+  aCol[0].affinity := AnsiChar(SQLITE_AFF_BLOB);
+  pTab^.aCol := @aCol[0]; pTab^.nCol := 1;
+  pTab^.iPKey := -1;
+  pTab^.tabFlags := TF_WithoutRowid;
+
+  { ---- PK index — installed first on pTab^.pIndex so
+         sqlite3PrimaryKeyIndex(pTab) finds it. ---- }
+  pPkIdx := PIndex2(GetMem(SizeOf(TIndex))); FillChar(pPkIdx^, SizeOf(TIndex), 0);
+  aiPkCol[0] := 0; aiPkCol[1] := -1;
+  aSortPk[0] := SQLITE_SO_ASC;
+  pPkIdx^.pTable    := pTab;
+  pPkIdx^.aiColumn  := @aiPkCol[0];
+  pPkIdx^.nKeyCol   := 1;
+  pPkIdx^.nColumn   := 1;
+  pPkIdx^.aSortOrder := @aSortPk[0];
+  pPkIdx^.idxFlags  := 2;     { SQLITE_IDXTYPE_PRIMARYKEY }
+  pPkIdx^.pNext     := nil;
+  pTab^.pIndex      := pPkIdx;
+
+  { ---- Secondary index — drives the loop. ---- }
+  pIdx := PIndex2(GetMem(SizeOf(TIndex))); FillChar(pIdx^, SizeOf(TIndex), 0);
+  aiCol[0] := 0; aiCol[1] := -1;
+  aSort[0] := SQLITE_SO_ASC;
+  pIdx^.pTable     := pTab;
+  pIdx^.aiColumn   := @aiCol[0];
+  pIdx^.nKeyCol    := 1;
+  pIdx^.nColumn    := 2;
+  pIdx^.aSortOrder := @aSort[0];
+
+  SetLength(bufSL, SizeOf(TSrcList) + SizeOf(TSrcItem));
+  FillChar(bufSL[0], Length(bufSL), 0);
+  pSL := PSrcList(@bufSL[0]);
+  pSL^.nSrc := 1; pSL^.nAlloc := 1;
+  pSItem := @SrcListItems(pSL)[0];
+  pSItem^.iCursor := 5;
+  pSItem^.fg.jointype := 0;
+
+  SetLength(bufWI, SZ_WHEREINFO(N_LEVEL));
+  FillChar(bufWI[0], Length(bufWI), 0);
+  pWInfo := PWhereInfo(@bufWI[0]);
+  pWInfo^.pParse   := @parse;
+  pWInfo^.pTabList := pSL;
+  pWInfo^.nLevel   := N_LEVEL;
+  pWInfo^.revMask  := 0;
+  pWInfo^.wctrlFlags := 0;
+  pLevel := @whereInfoLevels(pWInfo)[0];
+
+  FillChar(loop, SizeOf(loop), 0);
+  FillChar(term, SizeOf(term), 0); term.iParent := -1;
+  FillChar(ex,   SizeOf(ex),   0);
+  FillChar(exR,  SizeOf(exR),  0);
+
+  ex.op := TK_EQ;
+  ex.pRight := @exR;
+  exR.op := TK_INTEGER;
+  exR.flags := EP_IntValue;
+  exR.u.iValue := 42;
+  term.pExpr := @ex;
+  term.eOperator := WO_EQ;
+  alterm[0] := @term;
+
+  loop.aLTerm  := @alterm[0];
+  loop.nLTerm  := 1;
+  loop.wsFlags := WHERE_INDEXED or WHERE_COLUMN_EQ;
+  loop.u.btree.nEq := 1;
+  loop.u.btree.nBtm := 0;
+  loop.u.btree.nTop := 0;
+  loop.u.btree.pIndex := pIdx;
+  loop.nSkip := 0;
+
+  pLevel^.pWLoop := @loop;
+  pLevel^.iFrom  := 0;
+  pLevel^.iIdxCur := 6;       { iCur=5, iIdxCur=6 → distinct → PK reconstruction fires }
+  pLevel^.iTabCur := 5;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.regFilter := 0;
+  pLevel^.op := 99;
+  pLevel^.p1 := 0; pLevel^.p2 := 0; pLevel^.p3 := 0; pLevel^.p5 := 0;
+  pLevel^.iLeftJoin := 0;
+  pLevel^.u.in_nIn := 0;
+
+  notReady := not Bitmask(0);
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+
+  fColIdx := False; fNotFound := False; fDef := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_Column) and (pOp^.p1 = pLevel^.iIdxCur) then
+      fColIdx := True;
+    if (pOp^.opcode = OP_NotFound) and (pOp^.p1 = pLevel^.iTabCur) then
+      fNotFound := True;
+    if pOp^.opcode = OP_DeferredSeek then
+      fDef := True;
+  end;
+  Check('SCOLS19 returns pLevel^.notReady', rOut = pLevel^.notReady);
+  Check('SCOLS19 OP_Column emitted on iIdxCur (PK key extraction)', fColIdx);
+  Check('SCOLS19 OP_NotFound emitted on iTabCur (PK seek)', fNotFound);
+  Check('SCOLS19 no OP_DeferredSeek (HasRowid path gated off)', not fDef);
+
+  FreeMem(pIdx); FreeMem(pPkIdx); FreeMem(pTab);
+  sqlite3_close(db);
+end;
+
 { ---- Case 6 (full table scan) — wherecode.c:2561..2581.  Fires when
        wsFlags has neither WHERE_IPK nor WHERE_INDEXED nor WHERE_MULTI_OR
        set; we must emit the canonical OP_Rewind / OP_Last + OP_Next /
@@ -5915,6 +6071,7 @@ begin
   TestCodeOneLoopStart;
   TestCodeOneLoopStartCase3;
   TestCodeOneLoopStartCase4;
+  TestCodeOneLoopStartCase4WithoutRowid;
   TestCodeOneLoopStartCase6;
   TestGetTempRange;
   TestExprCodeGetColumnOfTable;
