@@ -170,6 +170,75 @@ end;
 { C side — drive `EXPLAIN <sql>` and collect rows.                           }
 { -------------------------------------------------------------------------- }
 
+{ Build-flag chatter opcodes filtered out of the C oracle EXPLAIN listing
+  before the diff against the Pascal port.  Each entry is a name the upstream
+  EXPLAIN_COMMENTS / SQLITE_DEBUG / SHARED_CACHE feature flags can produce
+  but the Pascal codegen never emits in any code path: filtering keeps the
+  diff focused on actual VDBE shape rather than build-flag noise.
+
+    'Explain'    — SQLITE_ENABLE_EXPLAIN_COMMENTS structured-narrative tag
+    'ReleaseReg' — SQLITE_DEBUG register-pressure debug hint
+    'TableLock'  — SQLITE_OMIT_SHARED_CACHE=off shared-cache table-lock op
+
+  Filtering is index-aware: every retained op's p2 (the universal jump
+  target field) is decremented by the number of filtered ops at strictly
+  lower original addresses, so post-filter `Init.p2 = 7` actually points
+  at the post-filter `Transaction` instead of the now-shifted-out
+  `Goto`.  Without this fix-up every row diverged at op[0] with a
+  bogus single-op p2 mismatch even when the underlying shape was
+  identical, masking real structural divergences further down the
+  listing. }
+function isFilteredOpcode(const op: AnsiString): Boolean; inline;
+begin
+  Result := (op = 'Explain') or (op = 'ReleaseReg') or (op = 'TableLock');
+end;
+
+{ Opcodes whose p2 field encodes a jump target into the program addr space.
+  Renumbering p2 after filtering is correct only for these — for ops like
+  `Integer p1=N p2=R` the p2 is a destination register, not an address, and
+  the fix-up must leave it alone or it will silently corrupt register-pool
+  semantics (latent bug seen in sub-progress 14 follow-up: ReleaseReg
+  filtering decremented the per-row factored-constant target register from
+  3 to 2, masquerading as a real codegen divergence).
+
+  This list covers every jump opcode the WHERE / SELECT codegen exercise
+  hits in the corpus.  Outside-corpus jump opcodes (e.g. AggStep for
+  GROUP BY, IdxRowid for covering-index walks) can be added when the
+  corpus expands; until then they trivially fall through to "no
+  renumber" which is the only-safe default. }
+function isJumpOpcode(const op: AnsiString): Boolean; inline;
+begin
+  Result :=
+    (op = 'Init') or (op = 'Goto') or
+    (op = 'Rewind') or (op = 'Next') or (op = 'Prev') or
+    (op = 'Eq') or (op = 'Ne') or
+    (op = 'Lt') or (op = 'Le') or (op = 'Gt') or (op = 'Ge') or
+    (op = 'If') or (op = 'IfNot') or (op = 'IfNullRow') or
+    (op = 'IsNull') or (op = 'NotNull') or
+    (op = 'IfPos') or (op = 'IfNeg') or (op = 'IfNotZero') or
+    (op = 'IfSmaller') or (op = 'IfNullRow') or (op = 'IfNoHope') or
+    (op = 'Found') or (op = 'NotFound') or
+    (op = 'NotExists') or (op = 'SeekRowid') or
+    (op = 'SeekGE') or (op = 'SeekGT') or
+    (op = 'SeekLE') or (op = 'SeekLT') or
+    (op = 'IdxGE') or (op = 'IdxGT') or
+    (op = 'IdxLE') or (op = 'IdxLT') or
+    (op = 'Once') or (op = 'Yield') or
+    (op = 'BeginSubrtn') or (op = 'Return') or
+    (op = 'NoConflict') or (op = 'NotInList') or
+    (op = 'MustBeInt') or (op = 'IdxNoSeek') or
+    (op = 'VFilter') or (op = 'VNext') or
+    (op = 'Last') or (op = 'SorterNext') or (op = 'SorterSort') or
+    (op = 'RowSetTest') or (op = 'RowSetRead') or
+    (op = 'Program') or (op = 'FkIfZero') or
+    (op = 'DecrJumpZero') or (op = 'OffsetLimit') or
+    (op = 'AggStep') or (op = 'AggFinal') or
+    (op = 'Filter') or (op = 'NotInList') or
+    (op = 'ElseEq') or (op = 'ElseNotEq') or
+    (op = 'IsType') or (op = 'TypeCheck') or
+    (op = 'Gosub') or (op = 'InitCoroutine');
+end;
+
 function CExplain(zSql: PAnsiChar; out ops: TOpList): Boolean;
 var
   zExp:   AnsiString;
@@ -179,6 +248,12 @@ var
   n:      i32;
   txt:    PChar;
   row:    TOpRow;
+  rawOps: array of TOpRow;
+  rawN:   i32;
+  filtAt: array of Boolean;
+  shift:  array of i32;
+  delta:  i32;
+  i:      i32;
 begin
   ops := nil;
   zExp := 'EXPLAIN ' + AnsiString(zSql);
@@ -190,20 +265,41 @@ begin
     Exit;
   end;
 
-  n := 0;
+  { First pass — collect all ops verbatim, marking which are filtered. }
+  rawN := 0;
   while csq_step(pStmt) = SQLITE_ROW do begin
+    SetLength(rawOps, rawN + 1);
+    SetLength(filtAt,  rawN + 1);
     txt := csq_column_text(pStmt, 1);
-    if txt <> nil then row.opcode := AnsiString(txt) else row.opcode := '';
-    { Skip OP_Explain comment opcodes — only emitted by the C oracle when
-      SQLITE_ENABLE_EXPLAIN_COMMENTS is on, and never by the Pascal codegen.
-      Removing them lets the row-by-row diff gate compare actual VDBE shape
-      instead of EXPLAIN-formatting chatter. }
-    if row.opcode = 'Explain' then continue;
+    if txt <> nil then rawOps[rawN].opcode := AnsiString(txt)
+    else               rawOps[rawN].opcode := '';
+    rawOps[rawN].p1 := csq_column_int(pStmt, 2);
+    rawOps[rawN].p2 := csq_column_int(pStmt, 3);
+    rawOps[rawN].p3 := csq_column_int(pStmt, 4);
+    rawOps[rawN].p5 := csq_column_int(pStmt, 6);
+    filtAt[rawN] := isFilteredOpcode(rawOps[rawN].opcode);
+    Inc(rawN);
+  end;
+
+  { Build a prefix-sum table: shift[i] = number of filtered ops at
+    addresses < i.  Subtracting shift[op.p2] from each retained op's p2
+    renumbers jump targets so they reference the post-filter index space. }
+  SetLength(shift, rawN + 1);
+  delta := 0;
+  for i := 0 to rawN - 1 do begin
+    shift[i] := delta;
+    if filtAt[i] then Inc(delta);
+  end;
+  shift[rawN] := delta;
+
+  { Second pass — emit retained ops with renumbered p2. }
+  n := 0;
+  for i := 0 to rawN - 1 do begin
+    if filtAt[i] then continue;
+    row := rawOps[i];
+    if isJumpOpcode(row.opcode) and (row.p2 >= 0) and (row.p2 <= rawN) then
+      row.p2 := row.p2 - shift[row.p2];
     SetLength(ops, n + 1);
-    row.p1 := csq_column_int(pStmt, 2);
-    row.p2 := csq_column_int(pStmt, 3);
-    row.p3 := csq_column_int(pStmt, 4);
-    row.p5 := csq_column_int(pStmt, 6);
     ops[n] := row;
     Inc(n);
   end;
@@ -386,6 +482,13 @@ begin
     n := Length(cOps);
     DumpContext('C  ', cOps, firstDiff, 2, 2, n);
     DumpContext('Pas', pOps, firstDiff, 2, 2, n);
+    { When the divergence is at op[0] (Init.p2 typically), the 2-before /
+      2-after window collapses to the prologue head and elides the tail
+      where the actual structural difference often lives (Goto position).
+      Dump the full side-by-side too — same idiom as the op-count arm
+      above so structural diffs at the head are visible end-to-end. }
+    if firstDiff = 0 then
+      DumpBothSides(cOps, pOps, 16);
   end;
 end;
 

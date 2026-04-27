@@ -2164,6 +2164,77 @@ Important: At the end of this document, please find:
       (worth ~13..16 ops per row), then BETWEEN range-plan in
       whereShortCut for IPK_RANGE.  LIKE optimization and JOIN codegen
       remain heavier follow-on lifts.
+    - [X] Sub-progress 15 — TestWhereCorpus C-oracle filter regression
+      restored (2026-04-27).  Two latent bugs fixed in the test
+      scaffold:
+
+      (a) `libsqlite3.so` was rebuilt with `-DSQLITE_DEBUG` between
+      sub-progress 14 and now, which causes the C oracle's EXPLAIN
+      listing to interleave `OP_ReleaseReg` debug-only register-
+      pressure hints between the productive opcodes.  The Pascal
+      codegen never emits OP_ReleaseReg in any code path, so every
+      previously-PASS row diverged on a wholesale shape mismatch
+      (Pas missing N ReleaseReg ops).  Same shape as the existing
+      `Explain` filter (SQLITE_ENABLE_EXPLAIN_COMMENTS chatter).
+      Added `ReleaseReg` and `TableLock` (SQLITE_OMIT_SHARED_CACHE=off)
+      to the filter list — these are build-flag-only opcodes the
+      Pascal port cannot emit by definition, so filtering them is
+      semantics-preserving.  TestWhereCorpus.pas:`isFilteredOpcode`
+      consolidates the per-name skip into a single inline.
+
+      (b) Filtering opcodes from the C oracle listing without
+      renumbering jump-target `p2` fields produces incoherent diffs:
+      the original `Init.p2 = 8` (jump to old-addr Transaction)
+      becomes a stale reference once Explain at addr 2 is filtered
+      out — the new addr-8 op is `Goto`, not `Transaction`.  Symptom:
+      every row diverged at op[0] with a single-byte `p2` slip even
+      when the underlying VDBE shape was structurally identical
+      after filtering.  Added a prefix-sum `shift[]` table over the
+      raw op listing: `shift[i]` = number of filtered ops at
+      addresses strictly less than `i`.  After filtering, every
+      retained jump opcode's `p2` is decremented by `shift[p2]` so
+      it points into the post-filter index space.  Renumbering is
+      gated on `isJumpOpcode(op)` — a whitelist of every WHERE /
+      SELECT / sort / coroutine jump opcode the corpus exercises
+      (Init, Goto, Rewind, Next, Eq/Ne/Lt/Le/Gt/Ge, If/IfNot,
+      IsNull/NotNull, Found/NotFound, NotExists, SeekRowid,
+      SeekGE/GT/LE/LT, IdxGE/GT/LE/LT, Once, BeginSubrtn, Yield,
+      MustBeInt, …).  Without the gate, non-jump opcodes whose p2
+      is a register number (`Integer p1=7 p2=3` ↔ "load 7 into r3")
+      get their register operand silently corrupted — sub-progress
+      14 follow-up bug, latent in sub-progress 14's regression too.
+
+      (c) `DumpBothSides` is now also invoked from the op-diff arm
+      when `firstDiff = 0`, since the 2-before/2-after context
+      window collapses to the prologue head and elides the tail
+      where the actual structural difference (Goto position, Init
+      target) often lives.  Same idiom as the op-count arm.
+
+      Test-suite delta:
+        * TestWhereCorpus restored from `0 PASS / 20 DIVERGE`
+          (regression introduced by SQLITE_DEBUG rebuild) back to
+          `12 PASS / 8 DIVERGE / 0 ERROR` — the sub-progress 14
+          baseline.  All originally-green rows green again: IPK
+          literal, IPK alias, INDEX_EQ, INDEX_EQ_2, INDEX_EQ_RES,
+          INDEX_RANGE, INDEX_EQ_RANGE, MULTI_OR, MULTI_OR_X,
+          WOR_INDEX, NULL, FULL.  Failure-mode tally: `0 exception,
+          0 nil-Vdbe, 8 op-count, 0 op-diff` — every remaining
+          DIVERGE is structural codegen needed (IN-coroutine,
+          BETWEEN range-plan, LIKE-prefix, two-table JOIN), not
+          per-byte fix-up.
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestExplainParity 2/10 unchanged.
+
+      Sub-progress 16 must port `sqlite3ExprCodeIN` (expr.c:4029,
+      ~250 lines) so IPK_IN / INDEX_IN / INDEX_IN_SUB reach the
+      BeginSubrtn / Once / OpenEphemeral coroutine machinery; then
+      BETWEEN range-plan in `whereShortCut` for IPK_RANGE
+      (SeekGE/Gt vs SCAN-with-residual).  LIKE optimisation and
+      two-table JOIN codegen remain heavier follow-on lifts.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
