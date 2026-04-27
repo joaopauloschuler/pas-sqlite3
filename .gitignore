@@ -16,3 +16,4 @@ backup
 *.compiled
 :memory:
 :memory:*
+.claude
