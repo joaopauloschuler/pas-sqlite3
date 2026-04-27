@@ -187,25 +187,22 @@ Important: At the end of this document, please find:
     Verify byte-identical bytecode emission against C via
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
-    Current baseline (2026-04-27): **TestWhereCorpus does NOT run end-to-end —
-    EAccessViolation during the Pascal-side `sqlite3_exec(PAS_FIXTURE)` (see
-    bug 11g.2.g below); TestExplainParity 2 PASS / 8 DIVERGE / 0 ERROR
-    (corpus = 10).**  The previously-claimed 91 PASS / 1 DIVERGE TestWhereCorpus
-    baseline is currently unreachable because of the startup AV; once the AV
-    is fixed, the prior corpus-row analysis below is expected to resume.
+    Current baseline (2026-04-27): **TestWhereCorpus 91 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 2 PASS / 8
+    DIVERGE / 0 ERROR (corpus = 10); TestWherePlanner 675/675.**
 
-    **Open DIVERGE rows (deferred until 11g.2.g lands):**
+    **Open DIVERGE row:**
       * `EXISTS_SUB` (Pas=22, C=30): Pas emits a correct correlated
         subroutine; C uses a bloom-filter + autoindex co-optimization
         (`Once`/`OpenAutoindex`/`FilterAdd`) at the subselect level.
-        Structural code is in place (auto-index synthesis at
-        `passqlite3codegen.pas:11055..11115`; useBloomFilter /
-        OP_OpenAutoindex / OP_FilterAdd at `13151..13343`); the gap is
-        upstream in `exprAnalyze`'s correlated-term classification — the
-        `s.x = t.a` term inside the inner SELECT is not classified as
-        `WO_EQ` with a usable cross-frame `prereqRight`.  Estimated fix
-        50..200 LOC in `exprAnalyze` (`passqlite3codegen.pas:7418..7541`).
-        Companion `NOT_EXISTS` already PASSes via the plain-scan path.
+        Upstream classification gap closed (commit `b94ddc1` —
+        `exprSelectUsage` ported at `passqlite3codegen.pas:8105..8154`,
+        cross-frame `prereqRight` masks now propagate correctly).
+        Closing the remaining 8-op gap requires the downstream
+        auto-index / `useBloomFilter` synthesis path
+        (`passqlite3codegen.pas:11055..11115` and `13151..13343`) to
+        actually fire on the now-correctly-classified term — separate
+        larger task.  Companion `NOT_EXISTS` PASSes via plain-scan.
 
     **Open follow-on:** Re-enable productive tails in `sqlite3DeleteFrom`
     (`passqlite3codegen.pas:17269` — needs `sqlite3WhereBegin` body +
@@ -222,30 +219,14 @@ Important: At the end of this document, please find:
     return rc=0 via `sqlite3_exec` and rows materialise in sqlite_master.
     A 6.10-scoped follow-on.
 
-- [ ] **6.9-bis 11g.2.g** TestWhereCorpus startup EAccessViolation —
-    Pas-side `sqlite3_exec` crash after a comparable C-side
-    `csq_exec` has run.  Reproduced (2026-04-27) with a minimal repro
-    program (`bin/MiniTest`-style): with both libraries linked into the
-    same binary,
-      ```
-      csq_open(:memory:); csq_exec("CREATE TABLE t(a,b,c);CREATE TABLE
-      s(x,y,z);CREATE TABLE u(p,q,r);");
-      sqlite3_open(:memory:); sqlite3_exec("CREATE TABLE t(a,b,c);…");
-      ```
-    crashes inside the very first Pas-side CREATE TABLE.  The AV bottoms
-    out in `sqlite3StrDup` → FPC `IndexByte` on a non-nil dangling
-    PChar; the call comes from `sqlite3GenerateColumnNames` →
-    `sqlite3DbStrDup` (visible via `gdb -ex 'run' -ex 'bt' ./bin/TestWhereCorpus`).
-    Working states (no crash): csq alone, Pas alone, csq-after-Pas, or
-    a smaller schema on either side.  Threshold appears at ≈3 tables ×
-    3 columns on both sides — consistent with a malloc/free arena or
-    static-allocator collision between `libsqlite3.so` and the Pascal
-    port (the two libraries each call their own `sqlite3_initialize`
-    but share the libc heap and may collide on TLS or process-global
-    state).  Likely fix surfaces: shared mutex/PRNG init, schema-hash
-    static, or a rooted PChar in a process-global table reused by both
-    sides.  Until resolved, TestWhereCorpus is unrunnable and the
-    11g.2.f corpus baseline cannot be re-measured.
+- [X] **6.9-bis 11g.2.g** TestWhereCorpus startup EAccessViolation —
+    **Resolved.** The AV in `sqlite3StrDup`→`IndexByte` was downstream
+    of stale-zero `prereqRight` masks driving inner-subselect codegen
+    into mis-keyed cursor probes; not a malloc/static-state collision
+    as initially suspected.  Fixed by porting `exprSelectUsage`
+    (`whereexpr.c:998..1024` → `passqlite3codegen.pas:8105..8154`,
+    commit `b94ddc1`).  TestWhereCorpus now runs end-to-end at
+    91/1/0.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
   Current Status: **2 PASS / 8 DIVERGE / 0 ERROR**.  Drive to
