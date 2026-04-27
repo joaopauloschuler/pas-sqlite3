@@ -3893,6 +3893,14 @@ begin
     else
       pNewItem^.u1.nRow := pOldItem^.u1.nRow;
     pNewItem^.u2 := pOldItem^.u2;
+    { Carry the resolved Table* across — selectExpander runs once on the
+      original AST; the duplicate inherits pSTab so a recursive
+      sqlite3Select on the dup (sub-progress 23 IN-RHS subselect path)
+      finds the table without re-running SelectExpand.  Mirrors C
+      expr.c's SrcListDup nTabRef bump. }
+    pNewItem^.pSTab := pOldItem^.pSTab;
+    if pNewItem^.pSTab <> nil then
+      Inc(pNewItem^.pSTab^.nTabRef);
     if (pOldItem^.fg.fgBits2 and $08) <> 0 then  { isUsing }
       pNewItem^.u3.pUsing := sqlite3IdListDup(db, pOldItem^.u3.pUsing)
     else
@@ -12271,11 +12279,18 @@ var
     if (pTrm^.wtFlags and (TERM_VIRTUAL or TERM_CODED)) <> 0 then Exit;
     if pTrm^.pExpr = nil then Exit;
     if pTrm^.pExpr^.op <> TK_IN then Exit;
+    if ExprHasProperty(pTrm^.pExpr, EP_Subrtn) then Exit;
+    { Subselect IN-RHS: always hoist (Case-1 sqlite3CodeRhsOfIN
+      materialises via SRT_Set into an eph cursor, sub-progress 23). }
+    if ExprUseXSelect(pTrm^.pExpr) then
+    begin
+      Result := pTrm^.pExpr^.x.pSelect <> nil;
+      Exit;
+    end;
     if not ExprUseXList(pTrm^.pExpr) then Exit;
     if pTrm^.pExpr^.x.pList = nil then Exit;
     if (sqlite3InRhsIsConstant(pParse, pTrm^.pExpr) <> 0)
        and (pTrm^.pExpr^.x.pList^.nExpr <= 2) then Exit;
-    if ExprHasProperty(pTrm^.pExpr, EP_Subrtn) then Exit;
     Result := True;
   end;
 
@@ -12297,6 +12312,14 @@ var
     begin
       pTrm := @pWInfo^.sWC.a[jj];
       if not InRhsHoistCandidate(pTrm) then continue;
+      { For subselect IN-RHS, run SelectPrep on the original AST first
+        so the source-table cursor is allocated BEFORE the eph cursor
+        FindInIndex is about to claim — this keeps cursor numbering
+        aligned with the C oracle (eph_id = source_id+1) and gives
+        sqlite3SrcListDup something to copy into the duplicate that
+        sqlite3CodeRhsOfIN's Case-1 hands to sqlite3Select. }
+      if ExprUseXSelect(pTrm^.pExpr) then
+        sqlite3SelectPrep(pParse, pTrm^.pExpr^.x.pSelect, nil);
       sqlite3FindInIndex(pParse, pTrm^.pExpr,
                          IN_INDEX_MEMBERSHIP,
                          nil, nil, @iEphDummy);
@@ -15039,7 +15062,13 @@ begin
     non-full-scan / non-single-table / non-Output form.  Each of these
     will be lifted as the corresponding shape lands under 11g.2.f. }
   if pDest = nil then begin Result := SQLITE_OK; Exit; end;
-  if pDest^.eDest <> SRT_Output then begin Result := SQLITE_OK; Exit; end;
+  { Phase 6.9-bis 11g.2.f sub-progress 23 — accept SRT_Set in addition
+    to SRT_Output so sqlite3CodeRhsOfIN's Case-1 (subselect IN-RHS)
+    materialisation lands real Column / MakeRecord / IdxInsert ops on
+    the eph cursor (iSDParm).  The disposal-arm divergence between the
+    two destinations is handled inline at the end of the inner loop. }
+  if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_Set) then
+  begin Result := SQLITE_OK; Exit; end;
   if p^.pPrior <> nil then begin Result := SQLITE_OK; Exit; end;
   if p^.pSrc = nil then begin Result := SQLITE_OK; Exit; end;
   if p^.pSrc^.nSrc <> 1 then begin Result := SQLITE_OK; Exit; end;
@@ -15093,8 +15122,11 @@ begin
   v := sqlite3GetVdbe(pParse);
   if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
 
-  { Column-name header — mirrors select.c:7682..7684 (eDest==SRT_Output). }
-  sqlite3GenerateColumnNames(pParse, p);
+  { Column-name header — only for SRT_Output (the SELECT user is the
+    statement caller); SRT_Set materialisation is internal so column
+    names are irrelevant. }
+  if pDest^.eDest = SRT_Output then
+    sqlite3GenerateColumnNames(pParse, p);
 
   nResultCol := pEList^.nExpr;
   pDest^.nSdst := nResultCol;
@@ -15129,8 +15161,21 @@ begin
                                     pDest^.iSdst + i);
   end;
 
-  { SRT_Output disposal (selectInnerLoop:1304 case SRT_Output). }
-  sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+  { Disposal — selectInnerLoop:1304..1370.  SRT_Output emits
+    OP_ResultRow; SRT_Set hashes the row into the eph cursor referenced
+    by iSDParm via OP_MakeRecord + OP_IdxInsert with the per-row
+    affinity string in P4. }
+  if pDest^.eDest = SRT_Output then
+    sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
+  else
+  begin
+    i := sqlite3GetTempReg(pParse);
+    sqlite3VdbeAddOp4(v, OP_MakeRecord, pDest^.iSdst, nResultCol, i,
+      pDest^.zAffSdst, nResultCol);
+    sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, i,
+      pDest^.iSdst, nResultCol);
+    sqlite3ReleaseTempReg(pParse, i);
+  end;
 
   { Close the loop — emits OP_Next and resolves the iBreak label. }
   sqlite3WhereEnd(pWInfo);
@@ -22960,7 +23005,16 @@ begin
   { fg.fgBits bit 2 = isSubquery (matches the layout used at line 9865) }
   if (pItem^.fg.fgBits and u8($04)) <> 0 then Exit(nil);
   pTab := pItem^.pSTab;
-  Assert(pTab <> nil);
+  { In the upstream C source isCandidateForInOpt runs after the global
+    selectExpander has resolved every nested subquery's pSrc, so pSTab
+    is guaranteed non-nil.  The pas-sqlite3 selectExpander is still
+    single-level (sqlite3SelectExpand walks only the top-level pSrc;
+    11g.2.f sub-progress 6 deferred recursion into IN-RHS subselects).
+    Bail defensively on nil pSTab so the caller falls through to the
+    full `materialise into eph table` branch — sqlite3CodeRhsOfIN's
+    Case-1 then runs SelectPrep on a fresh sqlite3SelectDup copy and
+    expands the FROM clause inside the recursive sqlite3Select. }
+  if pTab = nil                          then Exit(nil);
   Assert(pTab^.eTabType <> TABTYP_VIEW); { isCandidate is called after view-flatten }
   if pTab^.eTabType = TABTYP_VTAB        then Exit(nil); { virtual }
   pEL := p^.pEList;
@@ -23107,6 +23161,14 @@ var
   affinity:    AnsiChar;
   i:           i32;
   r1, r2:      i32;
+  pSel:        PSelect;
+  pEList:      PExprList;
+  pCopy:       PSelect;
+  rcSelect:    i32;
+  destSet:     TSelectDest;
+  pELItm2:     PExprListItem;
+  pVecField:   PExpr;
+  nValSel:     i32;
 begin
   v := pParse^.pVdbe;
   Assert(v <> nil);
@@ -23133,15 +23195,49 @@ begin
   addr := sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pX^.iTable, nVal);
   pKeyInfo := sqlite3KeyInfoAlloc(pParse^.db, nVal, 1);
 
-  { Case 1 (subselect) — deferred to a future sub-progress (needs
-    sqlite3SelectDup recursion + sqlite3SelectDestInit).  Soft-fallback
-    leaves the eph table empty; per-row OP_NotFound on it then always
-    jumps to destIfFalse, yielding "x IN (empty)" semantics.  Wrong
-    against C for any row that should match, but doesn't crash and is
-    still bytecode-shape-divergent against the C oracle (so the test
-    correctly continues to DIVERGE for INDEX_IN_SUB). }
+  { Case 1 (subselect) — Phase 6.9-bis 11g.2.f sub-progress 23.
+    Materialise the result-set of the embedded SELECT into the eph
+    table opened above via SRT_Set disposal.  Mirrors expr.c:3713..3756
+    minus Bloom-filter / SubrtnSig / EXPLAIN-comments noise (deferred).
+    The recursive sqlite3Select compiles the inner SELECT against the
+    SRT_Set destination so each row of the sub-query is hashed into
+    iTab via OP_MakeRecord + OP_IdxInsert.  Also fills in pKeyInfo's
+    per-column collation slots from sqlite3BinaryCompareCollSeq applied
+    to LHS-vector-field × RHS-result-list pairs. }
   if ExprUseXSelect(pX) then begin
-    { intentional no-op — eph table stays empty }
+    pSel   := pX^.x.pSelect;
+    pEList := pSel^.pEList;
+    if (pEList <> nil) and (pEList^.nExpr = nVal) then
+    begin
+      sqlite3SelectDestInit(@destSet, SRT_Set, iTab);
+      destSet.zAffSdst := exprINAffinity(pParse, pX);
+      pSel^.iLimit     := 0;
+      pCopy := sqlite3SelectDup(pParse^.db, pSel, 0);
+      if pParse^.db^.mallocFailed <> 0 then
+        rcSelect := 1
+      else
+        rcSelect := sqlite3Select(pParse, pCopy, @destSet);
+      sqlite3SelectDelete(pParse^.db, pCopy);
+      sqlite3DbFree(pParse^.db, destSet.zAffSdst);
+      if rcSelect <> 0 then
+      begin
+        sqlite3KeyInfoUnref(pKeyInfo);
+        Exit;
+      end;
+      if pKeyInfo <> nil then
+      begin
+        nValSel := nVal;
+        for i := 0 to nValSel - 1 do
+        begin
+          pVecField := sqlite3VectorFieldSubexpr(pLeft, i);
+          pELItm2   := PExprListItem(PByte(ExprListItems(pEList))
+                         + i * SZ_EXPRLIST_ITEM);
+          PPointer(PByte(pKeyInfo) + SizeOf(TKeyInfo))[i] :=
+            sqlite3BinaryCompareCollSeq(pParse, pVecField,
+              pELItm2^.pExpr);
+        end;
+      end;
+    end;
   end else if pX^.x.pList <> nil then begin
     { Case 2 — literal expression list. }
     pList := pX^.x.pList;
@@ -23234,16 +23330,12 @@ begin
   if v = nil then Exit;
   pLeft   := pExpr^.pLeft;
 
-  { Subselect IN-RHS deferred — sqlite3SelectDup recursion through
-    sqlite3CodeRhsOfIN's Case 1 isn't ported.  Soft-fallback: emit a
-    pessimistic "always false" jump so the row is never accepted —
-    matches "x IN (empty)" semantics, wrong for actual data but no
-    crash and no test regression.  TestWhereCorpus continues to
-    DIVERGE on INDEX_IN_SUB. }
-  if ExprUseXSelect(pExpr) then begin
-    sqlite3VdbeGoto(v, destIfFalse);
-    Exit;
-  end;
+  { Phase 6.9-bis 11g.2.f sub-progress 23 — subselect IN-RHS now
+    routes through `sqlite3CodeRhsOfIN`'s Case-1 materialisation via
+    `sqlite3FindInIndex` below.  The prior pessimistic
+    `OP_Goto destIfFalse` short-circuit is removed; the IN_INDEX_EPH
+    arm picks up the cached eph cursor through the EP_Subrtn fast-path
+    and emits the standard OP_Affinity + OP_NotFound per-row test. }
 
   zAff    := exprINAffinity(pParse, pExpr);
   nVector := sqlite3ExprVectorSize(pLeft);

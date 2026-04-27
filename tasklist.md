@@ -2836,6 +2836,129 @@ Important: At the end of this document, please find:
       reaches the SRT_Set materialisation path; LEFT_JOIN /
       JOIN_WHERE remain the heaviest follow-on lift, blocked on
       11g.2.d's multi-table planner.
+    - [X] Sub-progress 23 — `sqlite3CodeRhsOfIN` Case-1 + SRT_Set
+      disposal in `sqlite3Select` (2026-04-27).  Five coupled
+      landings flip INDEX_IN_SUB from `Pascal exception
+      EAccessViolation` (Pas=10 ops) to `op-count C=28 Pas=25`
+      with byte-identical opcode prefix through the entire
+      materialisation block:
+
+      (a) `sqlite3CodeRhsOfIN` (codegen.pas:23089) — Case-1
+      subselect arm ported (expr.c:3713..3756 minus deferred
+      Bloom-filter / SubrtnSig / EXPLAIN-comments noise).  After
+      the OpenEphemeral + KeyInfoAlloc setup, when
+      `ExprUseXSelect(pX)` and `pSelect^.pEList^.nExpr = nVal`,
+      initialise a stack `TSelectDest` with `SRT_Set` + iTab,
+      attach `exprINAffinity(pParse, pX)` as `zAffSdst`, zero
+      `iLimit`, dup the inner SELECT via `sqlite3SelectDup` and
+      drive `sqlite3Select(pParse, pCopy, @destSet)` to compile
+      the inner SELECT body against the eph cursor.  Tail releases
+      pCopy via `sqlite3SelectDelete` and `dest.zAffSdst` via
+      `sqlite3DbFree`.  On rcSelect != 0 the freshly-allocated
+      `pKeyInfo` is unref'd and the function exits cleanly.  Per
+      vector field index, `pKeyInfo^.aColl[i]` is filled via
+      `sqlite3BinaryCompareCollSeq(pParse, LHS-vector-field-i,
+      pEList^.a[i].pExpr)` so OP_NotFound's per-row probe uses the
+      right collation (mirrors expr.c:3760..3768).
+
+      (b) `sqlite3Select` (codegen.pas:15020) — gate widened to
+      accept `SRT_Set` in addition to `SRT_Output`.  The body
+      branches at the disposal step: SRT_Output emits OP_ResultRow
+      (unchanged); SRT_Set allocates a temp register via
+      `sqlite3GetTempReg`, emits `OP_MakeRecord pDest^.iSdst,
+      nResultCol, regRec, pDest^.zAffSdst` followed by
+      `OP_IdxInsert pDest^.iSDParm, regRec, pDest^.iSdst, nResultCol`
+      and releases the temp.  Mirrors selectInnerLoop's SRT_Set
+      arm (select.c:1351..1370) for the non-pSort / non-SF_Distinct
+      shape exercised by the corpus.  `sqlite3GenerateColumnNames`
+      is gated to SRT_Output only — column names are irrelevant to
+      an internal eph-table materialisation.
+
+      (c) `sqlite3SrcListDup` (codegen.pas:3844) — pSTab inheritance
+      added (mirrors C expr.c's nTabRef bump).  Without this, every
+      `sqlite3SelectDup` would produce a copy whose pSrc has nil
+      pSTab; the recursive `sqlite3Select` on the dup then sees
+      SF_HasTypeInfo (also copied verbatim) and skips SelectExpand,
+      leaving pSTab nil at the per-row OP_Column emission point —
+      AV at the first `pTab := pItem^.pSTab` deref.  Now the dup
+      inherits both pSTab and the SF_HasTypeInfo skip-flag, so
+      sqlite3Select's loop-body codegen finds the table directly.
+      Adds a `Inc(pTab^.nTabRef)` so `sqlite3DeleteTable` on the
+      dup's cleanup path doesn't free a still-live original.
+
+      (d) `sqlite3WhereBegin`'s `DoInRhsHoist` (codegen.pas:12305)
+      — extended to call `sqlite3SelectPrep(pParse,
+      pTrm^.pExpr^.x.pSelect, nil)` before
+      `sqlite3FindInIndex` for `ExprUseXSelect` terms.  This
+      allocates the source-table cursor BEFORE FindInIndex bumps
+      nTab for the eph cursor, so cursor numbering aligns with
+      C's selectExpander-recurse-first ordering: source table at
+      cursor N, eph at cursor N+1.  Without the early prep, the
+      eph cursor was N and the source table allocated to N+1
+      inside the recursive sqlite3Select — the bytecode shape
+      stayed the same but every `p1=` referenced the swapped
+      cursor IDs, blocking byte parity.  `InRhsHoistCandidate`
+      also extended to accept ExprUseXSelect terms (with
+      non-nil pSelect), no longer rejecting them as deferred.
+
+      (e) `isCandidateForInOpt` (codegen.pas:22980) — defensive
+      nil-pSTab bail-out replacing the original `Assert(pTab <>
+      nil)`.  In the upstream C the global selectExpander walks
+      every nested subquery so pSTab is guaranteed populated; the
+      pas-sqlite3 selectExpander is still single-level (sub-progress
+      6 deferred subquery recursion), so when FindInIndex hits the
+      isCandidate probe on a not-yet-prepped subselect, pSTab is
+      nil and the assert AV'd.  Returning nil instead falls through
+      to the full materialisation path, which immediately calls
+      sqlite3SelectPrep on the dup — same end state, no crash.
+
+      (f) `sqlite3ExprCodeIN` (codegen.pas:23207) — the prior
+      `if ExprUseXSelect(pExpr) then sqlite3VdbeGoto(v,
+      destIfFalse); Exit;` pessimistic short-circuit removed.  The
+      EP_Subrtn fast-path in sqlite3FindInIndex (sub-progress 19)
+      now picks up the eph cursor materialised by the hoist; the
+      IN_INDEX_EPH arm emits the standard OP_Affinity +
+      OP_NotFound per-row test.  Subselect IN-RHS now produces a
+      real membership test instead of jumping unconditionally to
+      destIfFalse.
+
+      Test-suite delta:
+        * TestWhereCorpus: stays at **17 PASS / 3 DIVERGE / 0
+          ERROR** (corpus row count unchanged), but INDEX_IN_SUB
+          flips from `Pascal exception EAccessViolation` to
+          `op-count C=28 Pas=25` — every opcode in Pas[0..14]
+          matches C[0..14] for opcode/p1/p2/p3 except offsets:
+          Init/OpenRead(t,0)/Rewind/Noop/BeginSubrtn/Once/
+          OpenEphemeral(2)/OpenRead(s,1)/Rewind/Column/MakeRecord/
+          IdxInsert/Next/NullRow/Return then Column for the outer
+          loop body.  The 3-op gap is exactly the bloom-filter
+          trio (Blob at C[7], FilterAdd at C[13], Filter inside the
+          residual); sub-progress 18 documented these as deferred
+          pure-optimisation ops semantics-preserving when omitted.
+          Failure-mode tally: `1 exception → 0 exception, 2 op-count
+          → 3 op-count`.  Per-shape histogram: INDEX_IN_SUB still
+          0/1, awaiting bloom-filter port for byte parity.
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41, TestVdbeApi
+          57/57, TestVdbeMisc 45/45, TestVdbeMem 62/62, TestVdbeAux
+          108/108, TestExplainParity 2/10 unchanged, TestPrintf
+          105/105, TestJson 434/434, TestConfigHooks 54/54,
+          TestAuthBuiltins 34/34, TestBtreeCompat 337/337,
+          TestTokenizer 127/127, TestSmoke green.
+
+      Sub-progress 24 must port the bloom-filter machinery (`OP_Blob`
+      pre-allocate at the materialisation prologue, `OP_FilterAdd`
+      inside the materialisation insert loop, `OP_Filter` in the
+      per-row residual just before `OP_NotFound`) so INDEX_IN_SUB
+      flips to PASS at 28 ops byte-for-byte.  `findCompatibleInRhsSubrtn`
+      (the SubrtnSig-based cross-IN-cache) remains the heaviest
+      follow-on under sub-progress 25, blocked on no immediate
+      corpus dependency.  LEFT_JOIN / JOIN_WHERE stay the residual
+      multi-table-planner divergences awaiting 11g.2.d.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
