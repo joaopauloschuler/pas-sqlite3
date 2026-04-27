@@ -5354,6 +5354,147 @@ begin
   sqlite3_close(db);
 end;
 
+{ ---- TestCodeOneLoopStartCase5MultiOr — SCOLS21.  WHERE_MULTI_OR
+       multi-index OR fall-through (wherecode.c:2186..2557).  Verifies
+       the prelude/epilogue scaffolding in isolation: regReturn allocated,
+       OP_Integer initialiser emitted, pLevel^.op set to OP_Return,
+       pLevel^.p1 = regReturn, the OP_Goto to addrBrk fires after the
+       (empty) disjunct loop, iLoopBody label is resolved, and pLevel^.p2
+       points at the resolved label.  Uses an empty pOrInfo->wc (nTerm=0)
+       and WHERE_DUPLICATES_OK on wctrlFlags so the body recursion never
+       runs and the rowset block is skipped.  Real OR-disjunct codegen
+       is exercised end-to-end under TestExplainParity / TestWhereCorpus
+       in 11g.2.f. ---- }
+procedure TestCodeOneLoopStartCase5MultiOr;
+const
+  N_LEVEL = 1;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  v:         PVdbe;
+  rc:        i32;
+  bufWI:     array of Byte;
+  bufSL:     array of Byte;
+  pWInfo:    PWhereInfo;
+  pSL:       PSrcList;
+  pSItem:    PSrcItem;
+  pLevel:    PWhereLevel;
+  loop:      TWhereLoop;
+  term:      TWhereTerm;
+  orInfo:    TWhereOrInfo;
+  alterm:    array[0..0] of PWhereTerm;
+  pTab:      PTable2;
+  aCol:      array[0..0] of TColumn;
+  base, i:   i32;
+  pOp:       PVdbeOp;
+  notReady:  Bitmask;
+  rOut:      Bitmask;
+  fInteger, fGoto: Boolean;
+  addrInteger, addrGoto, regReturn: i32;
+  startNTab, startNMem: i32;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('SCOLS21 open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  pTab := PTable2(GetMem(SizeOf(TTable))); FillChar(pTab^, SizeOf(TTable), 0);
+  FillChar(aCol, SizeOf(aCol), 0);
+  aCol[0].zCnName := PAnsiChar('x');
+  aCol[0].affinity := AnsiChar(SQLITE_AFF_BLOB);
+  pTab^.aCol := @aCol[0]; pTab^.nCol := 1;
+  pTab^.iPKey := -1;
+  pTab^.tabFlags := 0;            { HasRowid }
+
+  SetLength(bufSL, SizeOf(TSrcList) + SizeOf(TSrcItem));
+  FillChar(bufSL[0], Length(bufSL), 0);
+  pSL := PSrcList(@bufSL[0]);
+  pSL^.nSrc := 1; pSL^.nAlloc := 1;
+  pSItem := @SrcListItems(pSL)[0];
+  pSItem^.iCursor := 5;
+  pSItem^.fg.jointype := 0;
+  pSItem^.pSTab := pTab;
+
+  SetLength(bufWI, SZ_WHEREINFO(N_LEVEL));
+  FillChar(bufWI[0], Length(bufWI), 0);
+  pWInfo := PWhereInfo(@bufWI[0]);
+  pWInfo^.pParse   := @parse;
+  pWInfo^.pTabList := pSL;
+  pWInfo^.nLevel   := N_LEVEL;
+  pWInfo^.revMask  := 0;
+  { WHERE_DUPLICATES_OK skips the rowset register init so an empty
+    pOrInfo->wc lets the disjunct loop fall through cleanly. }
+  pWInfo^.wctrlFlags := WHERE_DUPLICATES_OK;
+  pLevel := @whereInfoLevels(pWInfo)[0];
+
+  FillChar(loop,   SizeOf(loop),   0);
+  FillChar(term,   SizeOf(term),   0); term.iParent := -1;
+  FillChar(orInfo, SizeOf(orInfo), 0);
+  { Empty wc: nTerm=0 so no recursion into sqlite3WhereBegin. }
+  orInfo.wc.nTerm := 0;
+
+  term.eOperator := WO_OR;
+  term.wtFlags   := TERM_ORINFO;
+  term.u.pOrInfo := @orInfo;
+  alterm[0]      := @term;
+
+  loop.aLTerm  := @alterm[0];
+  loop.nLTerm  := 1;
+  loop.wsFlags := WHERE_MULTI_OR;
+
+  pLevel^.pWLoop := @loop;
+  pLevel^.iFrom  := 0;
+  pLevel^.iTabCur := 5;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.regFilter := 0;
+  pLevel^.op := 99;
+  pLevel^.p1 := 0; pLevel^.p2 := 0; pLevel^.p3 := 0; pLevel^.p5 := 0;
+  pLevel^.iLeftJoin := 0;
+  pLevel^.u.pCoveringIdx := nil;
+
+  startNTab := parse.nTab;
+  startNMem := parse.nMem;
+  notReady := not Bitmask(0);
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS21 returns pLevel^.notReady', rOut = pLevel^.notReady);
+  Check('SCOLS21 pLevel^.op = OP_Return',   pLevel^.op = OP_Return);
+  Check('SCOLS21 iCovCur reserved (nTab+=1)', parse.nTab >= startNTab + 1);
+  Check('SCOLS21 regReturn reserved (nMem+=1)', parse.nMem >= startNMem + 1);
+  regReturn := pLevel^.p1;
+  Check('SCOLS21 pLevel^.p1 = regReturn',    regReturn > 0);
+
+  fInteger := False; fGoto := False;
+  addrInteger := -1; addrGoto := -1;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_Integer) and (pOp^.p2 = regReturn) then
+    begin
+      fInteger := True;
+      addrInteger := i;
+    end;
+    if (pOp^.opcode = OP_Goto) and (addrInteger >= 0) and (i > addrInteger) then
+    begin
+      fGoto := True;
+      addrGoto := i;
+    end;
+  end;
+  Check('SCOLS21 OP_Integer 0 → regReturn emitted', fInteger);
+  Check('SCOLS21 OP_Goto → addrBrk emitted',         fGoto);
+  Check('SCOLS21 iRetInit ChangeP1 patched OP_Integer.p1',
+        (addrInteger >= 0) and
+        (PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(addrInteger) * SizeOf(TVdbeOp))^.p1
+          > addrInteger));
+  Check('SCOLS21 pLevel^.p2 set to post-iLoopBody address',
+        pLevel^.p2 > addrGoto);
+
+  FreeMem(pTab);
+  sqlite3_close(db);
+end;
+
 { ---- TestCodeOneLoopStartCase4WithoutRowid — SCOLS19.
        wherecode.c:2177..2186.  Case 4 secondary-index scan on a
        WITHOUT-ROWID table: the table-row seek extracts each PK column
@@ -6246,6 +6387,7 @@ begin
   TestCodeOneLoopStartCase4;
   TestCodeOneLoopStartCase4InSeekScan;
   TestCodeOneLoopStartCase4WithoutRowid;
+  TestCodeOneLoopStartCase5MultiOr;
   TestCodeOneLoopStartCase6;
   TestGetTempRange;
   TestExprCodeGetColumnOfTable;

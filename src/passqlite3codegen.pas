@@ -1437,6 +1437,7 @@ const
   WHERE_ORDERBY_MAX      = u16($0002);
   WHERE_ONEPASS_DESIRED  = u16($0004);
   WHERE_ONEPASS_MULTIROW = u16($0008);
+  WHERE_DUPLICATES_OK    = u16($0010);
   WHERE_OR_SUBCLAUSE     = u16($0020);
   WHERE_GROUPBY          = u16($0040);
   WHERE_DISTINCTBY       = u16($0080);
@@ -12292,6 +12293,39 @@ var
   iPkRJ:           i32;
   iColRJ:          i32;
   jmp1RJ:          i32;
+  { ---- Case 5 (multi-OR) locals ---- }
+  pOrWc:           PWhereClause;
+  pOrTab:          PSrcList;
+  pCov5:           PIndex2;
+  iCovCur:         i32;
+  regReturn5:      i32;
+  regRowset:       i32;
+  regRowid:        i32;
+  iLoopBody5:      i32;
+  iRetInit:        i32;
+  untestedTerms:   i32;
+  ii5:             i32;
+  pAndExpr5:       PExpr;
+  pTabOR:          PTable2;
+  pPkOR:           PIndex2;
+  nNotReady:       i32;
+  k5:              i32;
+  origSrc:         PSrcItem;
+  pOrTerm:         PWhereTerm;
+  pSubWInfo:       PWhereInfo;
+  pOrExpr:         PExpr;
+  pDelete:         PExpr;
+  pSubLoop:        PWhereLoop;
+  jmp1OR:          i32;
+  iSet:            i32;
+  nPk5:            i32;
+  iPk5:            i32;
+  iCol5:           i32;
+  rPk5:            i32;
+  pTermInner:      PExpr;
+  iTerm:           i32;
+  addrExplain:     i32;
+  szSrc:           u64;
 begin
   pLoop    := pLevel^.pWLoop;
   pTabItem := @SrcListItems(pWInfo^.pTabList)[pLevel^.iFrom];
@@ -12768,11 +12802,242 @@ begin
   end
   else if (pLoop^.wsFlags and WHERE_MULTI_OR) <> 0 then
   begin
-    { Case 5 — wherecode.c:2351..2557.  Multi-index OR fall-through.
-      Defers to a subsequent batch (needs sqlite3WhereBegin recursion plus
-      the OR-disjunct sub-WHERE driver).  No fixture exercises this path
-      today — the dispatch fails fast when reached. }
-    Assert(False);
+    { Case 5 — wherecode.c:2186..2557.  Multi-index OR fall-through.
+
+      Two or more separately indexed terms connected by OR.  Walks each
+      OR-disjunct via a recursive sqlite3WhereBegin / sqlite3WhereEnd cycle
+      under WHERE_OR_SUBCLAUSE; the per-disjunct loops gosub the shared
+      body (label iLoopBody) which is emitted *after* the OR scaffolding
+      via the trailing OP_Goto / ResolveLabel pair.  Each gosub-side row
+      is filtered through OP_RowSetTest (HasRowid) or the OpenEphemeral
+      PK index (WITHOUT-ROWID) so the same row never reaches the body
+      twice.  pCov tracks a candidate covering index when every disjunct
+      uses the same physical Index*.
+
+      Faithful port — comments map 1:1 to the C source line numbers. }
+    pTerm := pLoop^.aLTerm[0];
+    Assert(pTerm <> nil);
+    Assert((pTerm^.eOperator and WO_OR) <> 0);
+    Assert((pTerm^.wtFlags and TERM_ORINFO) <> 0);
+    pOrWc := @pTerm^.u.pOrInfo^.wc;
+    pLevel^.op := OP_Return;
+    pLevel^.p1 := 0;     { regReturn — assigned below }
+
+    pCov5     := nil;
+    iCovCur   := pParse^.nTab;
+    Inc(pParse^.nTab);
+    Inc(pParse^.nMem);
+    regReturn5 := pParse^.nMem;
+    pLevel^.p1 := regReturn5;
+    regRowset  := 0;
+    regRowid   := 0;
+    iLoopBody5 := sqlite3VdbeMakeLabel(pParse);
+    untestedTerms := 0;
+    pAndExpr5  := nil;
+    pTabOR     := pTabItem^.pSTab;
+
+    { Set up a new SrcList in pOrTab containing the table being scanned by
+      this loop in the a[0] slot and all notReady tables in a[1..] slots.
+      Becomes the SrcList in the recursive call to sqlite3WhereBegin
+      (wherecode.c:2300..2315). }
+    if pWInfo^.nLevel > 1 then
+    begin
+      nNotReady := pWInfo^.nLevel - iLevel - 1;
+      szSrc := u64(SZ_SRCLIST_HEADER) + u64(nNotReady + 1) * u64(SZ_SRCLIST_ITEM);
+      pOrTab := PSrcList(sqlite3DbMallocRawNN(pParse^.db, szSrc));
+      if pOrTab = nil then Exit(notReady);
+      pOrTab^.nAlloc := u8(nNotReady + 1);
+      pOrTab^.nSrc   := pOrTab^.nAlloc;
+      Move(pTabItem^, SrcListItems(pOrTab)[0], SizeOf(TSrcItem));
+      origSrc := SrcListItems(pWInfo^.pTabList);
+      for k5 := 1 to nNotReady do
+        Move(origSrc[whereInfoLevels(pWInfo)[iLevel + k5].iFrom],
+             SrcListItems(pOrTab)[k5], SizeOf(TSrcItem));
+    end
+    else
+      pOrTab := pWInfo^.pTabList;
+
+    { Initialise the rowset register to NULL (HasRowid) or open an ephemeral
+      index over the PK columns (WITHOUT ROWID).  Also init regReturn to
+      contain the address one past the bottom-of-loop OP_Return so a few
+      LEFT JOIN cases that jump over the top of the loop into its body
+      fall through cleanly (wherecode.c:2317..2341). }
+    if (pWInfo^.wctrlFlags and WHERE_DUPLICATES_OK) = 0 then
+    begin
+      if HasRowid(pTabOR) then
+      begin
+        Inc(pParse^.nMem);
+        regRowset := pParse^.nMem;
+        sqlite3VdbeAddOp2(v, OP_Null, 0, regRowset);
+      end
+      else
+      begin
+        pPkOR := sqlite3PrimaryKeyIndex(pTabOR);
+        regRowset := pParse^.nTab;
+        Inc(pParse^.nTab);
+        sqlite3VdbeAddOp2(v, OP_OpenEphemeral, regRowset, pPkOR^.nKeyCol);
+        sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pPkOR));
+      end;
+      Inc(pParse^.nMem);
+      regRowid := pParse^.nMem;
+    end;
+    iRetInit := sqlite3VdbeAddOp2(v, OP_Integer, 0, regReturn5);
+
+    { Build the conjunction (xN AND w) where w = remaining "interesting"
+      clause terms — see wherecode.c:2343..2395.  Each xN gets a deep
+      copy ANDed under a TK_AND|0x10000 head so sqlite3PExpr's AND
+      short-circuit optimisation does not collapse the result. }
+    if pWInfo^.sWC.nTerm > 1 then
+    begin
+      for iTerm := 0 to pWInfo^.sWC.nTerm - 1 do
+      begin
+        pTermInner := pWInfo^.sWC.a[iTerm].pExpr;
+        if @pWInfo^.sWC.a[iTerm] = pTerm then continue;
+        if (pWInfo^.sWC.a[iTerm].wtFlags
+            and (TERM_VIRTUAL or TERM_CODED or TERM_SLICE)) <> 0 then
+          continue;
+        if (pWInfo^.sWC.a[iTerm].eOperator and WO_ALL) = 0 then continue;
+        if ExprHasProperty(pTermInner, EP_Subquery) then continue;
+        pTermInner := sqlite3ExprDup(pParse^.db, pTermInner, 0);
+        pAndExpr5  := sqlite3ExprAnd(pParse, pAndExpr5, pTermInner);
+      end;
+      if pAndExpr5 <> nil then
+        pAndExpr5 := sqlite3PExpr(pParse, TK_AND or $10000, nil, pAndExpr5);
+    end;
+
+    { Run a separate WHERE clause for each term of the OR clause (wherecode.c:
+      2397..2533).  After eliminating duplicates from prior sub-WHEREs, each
+      disjunct's body becomes a Gosub into the shared loop body. }
+    for ii5 := 0 to pOrWc^.nTerm - 1 do
+    begin
+      pOrTerm := @pOrWc^.a[ii5];
+      if (pOrTerm^.leftCursor = iCur)
+         or ((pOrTerm^.eOperator and WO_AND) <> 0) then
+      begin
+        pOrExpr := pOrTerm^.pExpr;
+        pDelete := sqlite3ExprDup(pParse^.db, pOrExpr, 0);
+        pOrExpr := pDelete;
+        if pParse^.db^.mallocFailed <> 0 then
+        begin
+          sqlite3ExprDelete(pParse^.db, pDelete);
+          continue;
+        end;
+        if pAndExpr5 <> nil then
+        begin
+          pAndExpr5^.pLeft := pOrExpr;
+          pOrExpr := pAndExpr5;
+        end;
+
+        pSubWInfo := sqlite3WhereBegin(pParse, pOrTab, pOrExpr,
+                                       nil, nil, nil,
+                                       WHERE_OR_SUBCLAUSE, iCovCur);
+        Assert((pSubWInfo <> nil) or (pParse^.nErr <> 0));
+        if pSubWInfo <> nil then
+        begin
+          addrExplain := sqlite3WhereExplainOneScan(pParse, pOrTab,
+                                @whereInfoLevels(pSubWInfo)[0], 0);
+          sqlite3WhereAddScanStatus(v, pOrTab,
+                                    @whereInfoLevels(pSubWInfo)[0],
+                                    addrExplain);
+
+          { Skip duplicates from prior sub-WHERE clauses (wherecode.c:
+            2434..2484).  iSet=-1 on the last term tells RowSetTest /
+            OP_Found to bypass the insert because no later term will
+            test against the rowset. }
+          jmp1OR := 0;
+          if (pWInfo^.wctrlFlags and WHERE_DUPLICATES_OK) = 0 then
+          begin
+            if ii5 = pOrWc^.nTerm - 1 then
+              iSet := -1
+            else
+              iSet := ii5;
+            if HasRowid(pTabOR) then
+            begin
+              sqlite3ExprCodeGetColumnOfTable(v, pTabOR, iCur, -1, regRowid);
+              jmp1OR := sqlite3VdbeAddOp4Int(v, OP_RowSetTest, regRowset, 0,
+                                             regRowid, iSet);
+            end
+            else
+            begin
+              pPkOR := sqlite3PrimaryKeyIndex(pTabOR);
+              nPk5  := pPkOR^.nKeyCol;
+              rPk5  := sqlite3GetTempRange(pParse, nPk5);
+              for iPk5 := 0 to nPk5 - 1 do
+              begin
+                iCol5 := pPkOR^.aiColumn[iPk5];
+                sqlite3ExprCodeGetColumnOfTable(v, pTabOR, iCur, iCol5,
+                                                rPk5 + iPk5);
+              end;
+              if iSet <> 0 then
+                jmp1OR := sqlite3VdbeAddOp4Int(v, OP_Found, regRowset, 0,
+                                               rPk5, nPk5);
+              if iSet >= 0 then
+              begin
+                sqlite3VdbeAddOp3(v, OP_MakeRecord, rPk5, nPk5, regRowid);
+                sqlite3VdbeAddOp4Int(v, OP_IdxInsert, regRowset, regRowid,
+                                     rPk5, nPk5);
+                if iSet <> 0 then
+                  sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+              end;
+              sqlite3ReleaseTempRange(pParse, rPk5, nPk5);
+            end;
+          end;
+
+          { Invoke the main loop body as a subroutine. }
+          sqlite3VdbeAddOp2(v, OP_Gosub, regReturn5, iLoopBody5);
+
+          if jmp1OR <> 0 then sqlite3VdbeJumpHere(v, jmp1OR);
+
+          if (pSubWInfo^.bitwiseFlags and (u8(1) shl 1)) <> 0 then
+            untestedTerms := 1;
+
+          { Track a covering-index candidate (wherecode.c:2500..2522).
+            Becomes nil the moment two disjuncts pick different indexes. }
+          pSubLoop := whereInfoLevels(pSubWInfo)[0].pWLoop;
+          Assert((pSubLoop^.wsFlags and WHERE_AUTO_INDEX) = 0);
+          if ((pSubLoop^.wsFlags and WHERE_INDEXED) <> 0)
+             and ((ii5 = 0) or (pSubLoop^.u.btree.pIndex = pCov5))
+             and (HasRowid(pTabOR)
+                  or ((pSubLoop^.u.btree.pIndex^.idxFlags and $03)
+                       <> SQLITE_IDXTYPE_PRIMARYKEY)) then
+          begin
+            Assert(whereInfoLevels(pSubWInfo)[0].iIdxCur = iCovCur);
+            pCov5 := pSubLoop^.u.btree.pIndex;
+          end
+          else
+            pCov5 := nil;
+          if sqlite3WhereUsesDeferredSeek(pSubWInfo) <> 0 then
+            pWInfo^.bitwiseFlags := pWInfo^.bitwiseFlags or u8($01);
+
+          sqlite3WhereEnd(pSubWInfo);
+        end;
+        sqlite3ExprDelete(pParse^.db, pDelete);
+      end;
+    end;
+
+    Assert(pLevel^.pWLoop = pLoop);
+    Assert((pLoop^.wsFlags and WHERE_MULTI_OR) <> 0);
+    Assert((pLoop^.wsFlags and WHERE_IN_ABLE) = 0);
+    pLevel^.u.pCoveringIdx := pCov5;
+    if pCov5 <> nil then pLevel^.iIdxCur := iCovCur;
+    if pAndExpr5 <> nil then
+    begin
+      pAndExpr5^.pLeft := nil;
+      sqlite3ExprDelete(pParse^.db, pAndExpr5);
+    end;
+    sqlite3VdbeChangeP1(v, iRetInit, sqlite3VdbeCurrentAddr(v));
+    sqlite3VdbeGoto(v, pLevel^.addrBrk);
+    sqlite3VdbeResolveLabel(v, iLoopBody5);
+
+    { wherecode.c:2553..2554 — the byte-code formatter uses pLevel^.p2 as
+      an indent hint for everything between this point and the final
+      OP_Return.  See tag-20220407a in vdbe.c / shell.c. }
+    Assert(pLevel^.op = OP_Return);
+    pLevel^.p2 := sqlite3VdbeCurrentAddr(v);
+
+    if pWInfo^.nLevel > 1 then
+      sqlite3DbFreeNN(pParse^.db, pOrTab);
+    if untestedTerms = 0 then disableTerm(pLevel, pTerm);
   end
   else
   begin

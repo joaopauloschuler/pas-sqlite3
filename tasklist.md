@@ -1075,6 +1075,46 @@ Important: At the end of this document, please find:
       OP_IdxGT end-bound probe still emitted, no-range-bound JumpHere
       patches OP_SeekScan.p2 to addrIdxGT+1 — the post-end-bound
       address).
+    - [X] Public surface, batch 21 — `sqlite3WhereCodeOneLoopStart`
+      Case 5 multi-index OR fall-through (wherecode.c:2186..2557).
+      Replaces the prior `Assert(False)` stub with the full port:
+      allocates `regReturn`, builds a per-OR-disjunct `pOrTab` SrcList
+      header (notReady tables in slots 1..n), opens a rowset register
+      (HasRowid: OP_Null) or an OpenEphemeral PK index (WITHOUT-ROWID:
+      OP_OpenEphemeral + sqlite3VdbeSetP4KeyInfo) under the
+      `WHERE_DUPLICATES_OK = 0` gate, emits `OP_Integer 0 → regReturn`
+      whose p1 is back-patched at the end via ChangeP1, builds the
+      shared `pAndExpr` conjunction by walking `pWInfo^.sWC.a[]` and
+      ANDing every non-virtual / non-coded / non-slice / WO_ALL /
+      non-EP_Subquery sibling under a `TK_AND|0x10000` head (the
+      0x10000 high-bit defeats `sqlite3PExpr`'s AND short-circuit, per
+      ticket f2369304e4 + dbsqlfuzz tag-20220303a), then for each
+      disjunct dups the term, glues `pAndExpr^.pLeft` to it, calls
+      `sqlite3WhereBegin(... WHERE_OR_SUBCLAUSE, iCovCur)` recursively,
+      filters duplicates via `sqlite3ExprCodeGetColumnOfTable` →
+      `OP_RowSetTest` (rowid) or `OP_Found` + `OP_MakeRecord` +
+      `OP_IdxInsert` with `OPFLAG_USESEEKRESULT` (PK), gosubs into the
+      shared body label, tracks `pCov` + `bDeferredSeek` from each
+      sub-WhereInfo, calls `sqlite3WhereEnd`, then back-patches the
+      iRetInit OP_Integer's p1 to point past the OP_Goto / iLoopBody
+      label and stamps `pLevel^.p2 = sqlite3VdbeCurrentAddr` (the
+      tag-20220407a indent hint that the byte-code formatter consumes
+      between this point and the OP_Return). `pLevel^.op = OP_Return`,
+      `pLevel^.p1 = regReturn`, `pLevel^.u.pCoveringIdx = pCov`,
+      `pLevel^.iIdxCur = iCovCur` when pCov non-nil. `IsPrimaryKeyIndex`
+      inlined as `(idxFlags and 3) <> SQLITE_IDXTYPE_PRIMARYKEY`. Adds
+      missing `WHERE_DUPLICATES_OK = $0010` constant (was unused before
+      Case 5 wired).  Real OR-disjunct codegen is exercised end-to-end
+      under the upcoming TestWhereCorpus / TestExplainParity gates in
+      11g.2.f; this batch lands the body so the dispatch never falls
+      into the assert-stub when planner output sets WHERE_MULTI_OR.
+      Gate: `TestWherePlanner.pas` (647/647): SCOLS21 (empty pOrInfo
+      with WHERE_DUPLICATES_OK so the disjunct loop doesn't recurse —
+      verifies pLevel^.op = OP_Return, pLevel^.p1 = regReturn>0,
+      pParse^.nTab and nMem each bumped by ≥1, OP_Integer 0/regReturn
+      emitted, OP_Goto follows, ChangeP1 back-patches OP_Integer.p1
+      past itself, pLevel^.p2 lands past the OP_Goto at the resolved
+      iLoopBody label).
     - [X] Public surface, batch 19 — `sqlite3WhereCodeOneLoopStart`
       Case 4 WITHOUT-ROWID secondary-index PK reconstruction
       (wherecode.c:2177..2186).  Replaces the prior `Assert(False)`
