@@ -119,10 +119,24 @@ Important: At the end of this document, please find:
           materialise / co-routine path not ported).
         [ ] `UPDATE t SET a=5 WHERE rowid=1` — Δ=14 (`sqlite3Update`
           still skeleton-only — see 11g.2.f open follow-on).
-        [ ] `INSERT INTO u VALUES(1, 2);` (u has `p PRIMARY KEY`) —
-          Δ=11 (rowid-aliased INTEGER PRIMARY KEY INSERT path).
-        [ ] `SELECT p FROM u;` — per-op divergence at op[1] (scan
-          of rowid-aliased PRIMARY KEY column).
+        [ ] `INSERT INTO u VALUES(1, 2);` (u declared `p PRIMARY KEY,
+          q` — non-INTEGER PK, so NOT a rowid alias) — Δ=11.  Diag
+          (`src/tests/DiagAutoIdx.pas`) confirms the implicit
+          `sqlite_autoindex_u_1` *is* registered at parse time
+          (sqlite_schema row, rootpage 5), so the gap is downstream:
+          the INSERT codegen does not maintain the autoindex because
+          `sqlite3GenerateConstraintChecks` + `sqlite3CompleteInsertion`
+          are still stubs (see 6.9-bis 11g.2.b open items).  Closing
+          those will close this row.
+        [ ] `SELECT p FROM u;` — per-op divergence at op[1]
+          (`OpenRead p1=1 p2=5` in C vs `p1=0 p2=4` in Pas).  Same
+          fixture: u has the implicit autoindex on `p`.  C planner
+          picks the autoindex for a covering scan (rootpage 5);
+          Pas planner falls through to the table scan (rootpage 4).
+          Root cause: `whereLoopAddBtree` / `bestIndex` cost model
+          not yet considering covering indexes when no WHERE clause
+          exists.  Distinct from the INSERT row above — needs planner
+          work, not insert.c work.
   
   [ ] **6.11** DROP TABLE Δ=21 root cause:
     (a) Pas emits a 2-pass RowSet delete for the sqlite_schema scrub
