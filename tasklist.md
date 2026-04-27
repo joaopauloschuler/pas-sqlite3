@@ -1256,6 +1256,34 @@ Important: At the end of this document, please find:
       (SELECT codegen end-to-end is the next driver), confirming the
       scaffold reaches the diff-gate without false-positive PASSes.
       Each subsequent batch under 11g.2.f drives green rows up.
+    - [X] Sub-progress 2 — diagnostics + corpus fix-up (2026-04-27).
+      The C oracle is now consulted *before* the Pascal try/except, so
+      `cOps` is captured and remains available even when Pascal raises
+      inside `prepare_v2`.  Every DIVERGE/ERROR path (nil Vdbe,
+      op-count mismatch, op-mismatch, exception) now emits a 5-row
+      C-reference dump (`opcode p1 p2 p3 p5`) inline beneath the row's
+      verdict — actionable target opcodes for subsequent batches
+      instead of a uniform "Access violation" wall.  Header tally adds
+      `C-oracle reference total: N ops across M rows (avg X.X)` so
+      shape-coverage drift is visible at a glance.  Corpus row 1
+      (`rowid-EQ via alias`) had `SELECT a FROM u` against a
+      WITHOUT-ROWID table whose columns are `(p,q,r)` — flipped to
+      `SELECT q FROM u` so the C oracle no longer raises `no such
+      column: a` (which had been masquerading as ERROR).  New baseline
+      (2026-04-27): **0 PASS / 20 DIVERGE / 0 ERROR**, total C-ops
+      324 across 20 rows (avg 16.2).  Header bytecode shapes now
+      visible per-row: simplest path is `full table scan` (9 ops:
+      Init / OpenRead / Rewind / Column / ResultRow / Next / Halt /
+      Transaction / Goto), most complex is `col-IN literal` at 31
+      ops with BeginSubrtn / Once / OpenEphemeral coroutine
+      machinery.  Pascal-side AV root-cause traced to
+      `sqlite3ExprDeleteNN` invoked from `sqlite3SelectDelete` after
+      rule 84 (`cmd ::= select`) finishes; `sqlite3Select` is still a
+      Phase 6.3 stub (calls only `SelectPrep`), and `SelectPrep`
+      depends on stubbed `sqlite3ResolveSelectNames` (Phase 6.2) +
+      `sqlite3SelectAddTypeInfo` (Phase 6.5).  Sub-progress 3 will
+      drive the SELECT codegen end-to-end so the first PASS row
+      (`full table scan`, 9 ops) flips green.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

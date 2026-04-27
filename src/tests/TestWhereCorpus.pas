@@ -83,6 +83,7 @@ type
 
 var
   gPass, gDiverge, gErr: i32;
+  gCRefOps:              i32;   { running tally of C-oracle ops across the corpus — informational only }
   gCDb:    Pcsq_db;
   gPasDb:  PTsqlite3;
 
@@ -109,7 +110,7 @@ begin
   Add(i, 'rowid-EQ literal',          'IPK',
       'SELECT a FROM t WHERE rowid = 5;');                    Inc(i);
   Add(i, 'rowid-EQ via alias',        'IPK',
-      'SELECT a FROM u WHERE p = 7;');                        Inc(i);
+      'SELECT q FROM u WHERE p = 7;');                        Inc(i);
   Add(i, 'rowid IN list',             'IPK_IN',
       'SELECT a FROM t WHERE rowid IN (1,2,3);');             Inc(i);
   Add(i, 'rowid range',               'IPK_RANGE',
@@ -193,6 +194,27 @@ begin
   Result := True;
 end;
 
+{ Dump the first N ops from a C-oracle listing — used as a forward-visibility
+  reference whenever the Pascal side fails (exception, nil Vdbe, op-count
+  mismatch, divergent op).  Subsequent sub-progress batches under 11g.2.f
+  can read this dump and target it directly. }
+procedure DumpCRef(const cOps: TOpList; maxRows: Int32);
+var
+  i, n: Int32;
+begin
+  n := Length(cOps);
+  if n > maxRows then n := maxRows;
+  if n = 0 then begin
+    WriteLn('       (C reference: 0 ops)');
+    Exit;
+  end;
+  WriteLn('       C reference (', Length(cOps), ' ops, showing ', n, '):');
+  for i := 0 to n - 1 do
+    WriteLn('         [', i, '] ', cOps[i].opcode,
+            ' p1=', cOps[i].p1, ' p2=', cOps[i].p2,
+            ' p3=', cOps[i].p3, ' p5=', cOps[i].p5);
+end;
+
 { -------------------------------------------------------------------------- }
 { Pascal side — prepare and walk Vdbe.aOp[].                                 }
 { -------------------------------------------------------------------------- }
@@ -248,32 +270,31 @@ begin
           ' p1=', r.p1, ' p2=', r.p2, ' p3=', r.p3, ' p5=', r.p5);
 end;
 
-procedure CheckRow(const row: TCorpusRow);
+{ Two-stage check — the C oracle is consulted first (in the caller) and the
+  resulting cOps are passed through to CheckRow.  This keeps the C reference
+  available even when the Pascal side raises an exception inside prepare_v2,
+  so the per-row report can dump the target opcodes (DumpCRef) regardless of
+  which Pascal failure mode trips first.  Once 11g.2.f stops the AVs and the
+  divergences become structural (op-count or per-op), the same dump still
+  shows the planner-level shape we are targeting. }
+procedure CheckRow(const row: TCorpusRow; const cOps: TOpList);
+const
+  REF_DUMP_ROWS = 5;
 var
-  cOps, pOps: TOpList;
-  cOk, pOk:   Boolean;
-  i, n:       i32;
-  firstDiff:  i32;
+  pOps:      TOpList;
+  pOk:       Boolean;
+  i, n:      i32;
+  firstDiff: i32;
 begin
-  cOps := nil; pOps := nil;
-  cOk := CExplain(PAnsiChar(row.sql), cOps);
+  pOps := nil;
   pOk := PasExplain(PAnsiChar(row.sql), pOps);
-
-  if not cOk then begin
-    Inc(gErr);
-    WriteLn('  ERROR ', row.label_, ' [', row.shape,
-            '] — C-side EXPLAIN prepare failed');
-    WriteLn('       SQL: ', row.sql);
-    WriteLn('       errmsg: ', AnsiString(csq_errmsg(gCDb)));
-    Exit;
-  end;
 
   if not pOk then begin
     Inc(gDiverge);
     WriteLn('  DIVERGE ', row.label_, ' [', row.shape,
             '] — Pascal prepare returned nil Vdbe (codegen stub or error)');
     WriteLn('       SQL: ', row.sql);
-    WriteLn('       C ops: ', Length(cOps));
+    DumpCRef(cOps, REF_DUMP_ROWS);
     Exit;
   end;
 
@@ -286,6 +307,7 @@ begin
       DumpOp('C  ', 0, cOps[0]);
       DumpOp('Pas', 0, pOps[0]);
     end;
+    DumpCRef(cOps, REF_DUMP_ROWS);
     Exit;
   end;
 
@@ -317,6 +339,7 @@ var
   pRc:      i32;
   pzErrMsg: PChar;
   pasErr:   PAnsiChar;
+  cOps:     TOpList;
 
 begin
   WriteLn('=== TestWhereCorpus — Phase 6.9-bis 11g.2.f bytecode-diff gate (scaffold) ===');
@@ -350,19 +373,40 @@ begin
 
   InitCorpus;
   for i := 0 to N_CORPUS - 1 do begin
+    { Run the C oracle first so its bytecode listing is available even when
+      the Pascal side raises an exception inside prepare_v2.  Failure here
+      means the oracle / fixture is corrupt and is the only condition that
+      maps to ERROR (counted in gErr); the Pascal side mapping to DIVERGE
+      is handled below. }
+    cOps := nil;
+    if not CExplain(PAnsiChar(CORPUS[i].sql), cOps) then begin
+      Inc(gErr);
+      WriteLn('  ERROR ', CORPUS[i].label_, ' [', CORPUS[i].shape,
+              '] — C-side EXPLAIN prepare failed');
+      WriteLn('       SQL: ', CORPUS[i].sql);
+      WriteLn('       errmsg: ', AnsiString(csq_errmsg(gCDb)));
+      Continue;
+    end;
+    Inc(gCRefOps, Length(cOps));
+
     try
-      CheckRow(CORPUS[i]);
+      CheckRow(CORPUS[i], cOps);
     except
       { Pascal-side codegen for SELECT-with-WHERE is still landing under
         11g.2.f.  Treat exceptions raised inside prepare_v2 as DIVERGE
         rather than ERROR so the scaffold can run end-to-end and report
         a single diff-finder tally instead of bailing on the first crash.
         ERROR remains reserved for C-side prepare failures, which would
-        indicate a corrupt fixture or oracle. }
+        indicate a corrupt fixture or oracle.
+
+        With cOps now hoisted, dump the C reference inline so each
+        exception-mode row carries the target opcodes alongside the
+        crash signature — actionable visibility for the next batch. }
       on e: Exception do begin
         Inc(gDiverge);
         WriteLn('  DIVERGE ', CORPUS[i].label_, ' [', CORPUS[i].shape,
                 '] — Pascal exception: ', e.ClassName, ' ', e.Message);
+        DumpCRef(cOps, 5);
       end;
     end;
   end;
@@ -373,5 +417,10 @@ begin
   WriteLn;
   WriteLn(Format('Results: %d pass, %d diverge, %d error (corpus = %d)',
     [gPass, gDiverge, gErr, N_CORPUS]));
+  if (N_CORPUS - gErr) > 0 then
+    WriteLn(Format('C-oracle reference total: %d ops across %d rows (avg %.1f)',
+      [gCRefOps, N_CORPUS - gErr, gCRefOps / Double(N_CORPUS - gErr)]))
+  else
+    WriteLn(Format('C-oracle reference total: %d ops (no rows ran)', [gCRefOps]));
   if gErr > 0 then Halt(1) else Halt(0);
 end.
