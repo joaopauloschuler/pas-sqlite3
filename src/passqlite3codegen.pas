@@ -18733,8 +18733,12 @@ begin
     until that lands. }
   sqlite3VdbeAddOp3(v, OP_NewRowid, 0, regRowid, regAutoinc);
 
-  { Pack the per-column regData block into a single record register. }
-  regOut := sqlite3GetTempReg(pParse);
+  { Pack the per-column regData block into a single record register.
+    Allocate from nMem (matching C's sqlite3CompleteInsertion frame), not
+    sqlite3GetTempReg — the temp-reg release would emit a spurious
+    OP_ReleaseReg under SQLITE_DEBUG that the C reference does not. }
+  Inc(pParse^.nMem);
+  regOut := pParse^.nMem;
   sqlite3VdbeAddOp3(v, OP_MakeRecord, regData, i32(pTab^.nCol), regOut);
   sqlite3SetMakeRecordP5(v, pTab);
 
@@ -18743,7 +18747,6 @@ begin
   sqlite3VdbeAddOp3(v, OP_Insert, 0, regOut, regRowid);
   sqlite3VdbeChangeP5(v,
     OPFLAG_NCHANGE or OPFLAG_LASTROWID or OPFLAG_APPEND or OPFLAG_USESEEKRESULT);
-  sqlite3ReleaseTempReg(pParse, regOut);
 
   if (pParse^.nested = 0) and (regRowCount <> 0) then
     sqlite3CodeChangeCount(v, regRowCount, 'rows inserted');

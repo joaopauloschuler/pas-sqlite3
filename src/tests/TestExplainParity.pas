@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 10;
+  N_CORPUS = 17;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -93,6 +93,16 @@ begin
   Add(i, 'DROP TABLE',                  'DROP TABLE t;');                     Inc(i);
   Add(i, 'DROP INDEX IF EXISTS',        'DROP INDEX IF EXISTS i_nope;');      Inc(i);
   Add(i, 'BEGIN',                       'BEGIN;');                            Inc(i);
+
+  { SELECT / DML probe rows — expand bytecode-diff coverage beyond DDL.
+    Uses fixture tables t(a,b,c), s(x,y,z), u(p PRIMARY KEY, q). }
+  Add(i, 'SELECT literal',              'SELECT 1;');                            Inc(i);
+  Add(i, 'SELECT col scan',             'SELECT a FROM t;');                     Inc(i);
+  Add(i, 'SELECT rowid EQ',             'SELECT a FROM t WHERE rowid=5;');       Inc(i);
+  Add(i, 'SELECT * scan',               'SELECT * FROM t;');                     Inc(i);
+  Add(i, 'DELETE rowid EQ',             'DELETE FROM t WHERE rowid=5;');         Inc(i);
+  Add(i, 'INSERT VALUES',               'INSERT INTO t VALUES (1,2,3);');        Inc(i);
+  Add(i, 'COMMIT',                      'COMMIT;');                              Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 9 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 10); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 11 PASS / 6
+    DIVERGE / 0 ERROR (corpus = 17); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -186,20 +186,28 @@ Important: At the end of this document, please find:
     `sqlite3SrcListAppend` (db/table arg swap + dequote) to mirror
     build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
-  Scaffold is landed (10-row DDL/transaction corpus, report-only).
-  Current Status (2026-04-27): **9 PASS / 1 DIVERGE / 0 ERROR**
-  (only DROP TABLE remains Δ=22 pending step 4).
-  Drive to all-PASS, then expand corpus to DML / SELECT / pragma /
-  trigger forms (same exclusion list as TestParser).  Promote from
-  report-only to hard gate when the full corpus is green.
+  Scaffold landed; corpus expanded to 17 rows (DDL + a SELECT/DML probe).
+  Current Status (2026-04-27): **11 PASS / 6 DIVERGE / 0 ERROR**.
+  Drive to all-PASS, then expand corpus further (pragma / trigger /
+  multi-table SELECT) and promote from report-only to hard gate.
 
   PASS rows: CREATE TABLE simple / typed / IF NOT EXISTS / composite PK
   / WITHOUT ROWID, CREATE INDEX, CREATE UNIQUE INDEX, DROP INDEX IF
-  EXISTS, BEGIN.
+  EXISTS, BEGIN, COMMIT, INSERT VALUES.
 
   DIVERGE rows + delta = (C ops − Pas ops):
 
-  - DROP TABLE — Δ=22
+  - DROP TABLE — Δ=22 (step 4)
+  - SELECT literal — Δ=3 (sqlite3Select bails on no-FROM SELECT;
+    missing Integer + ResultRow + Explain tail)
+  - SELECT col scan — Δ=1 (single missing OP_Explain comment op
+    after OpenRead)
+  - SELECT rowid EQ — Δ=1 (same: missing OP_Explain comment op)
+  - SELECT * scan — Δ=9 (sqlite3Select bails on `*` expansion;
+    OpenRead + Rewind + Column×3 + ResultRow + Next tail elided)
+  - DELETE rowid EQ — Δ=−12 (Pas uses 2-pass ROWSET strategy
+    instead of C's ONEPASS_SINGLE; also emits spurious AddImm /
+    FkCheck / ResultRow / change-counter Integer at tail)
 
   Root cause for DROP TABLE: Pas-side elides the C-side
   pre-Destroy "scan sqlite_schema for trigger rows + reinsert" pass
@@ -254,9 +262,23 @@ Important: At the end of this document, please find:
       collapse, UNIQUE-index rewrite to include PK key cols) is
       still deferred but not on any current corpus row.
 
-    - [ ] **6.10 step 6** Once 4/6 → all-PASS, expand corpus with
-      DML / SELECT / pragma / trigger forms and promote from
-      report-only to hard gate.
+    - [ ] **6.10 step 6** Once DROP TABLE flips to PASS, expand corpus
+      further (pragma / trigger / multi-table SELECT / UPDATE) and
+      promote from report-only to hard gate.
+
+    - [ ] **6.10 step 7** Resolve the SELECT/DML divergences exposed by
+      the expanded corpus:
+        * `sqlite3Select` early-bail on no-FROM SELECT (`SELECT 1;`)
+          and `SELECT *` shape — both currently produce only
+          Init/Halt/Goto.  Find the bail and emit the column-eval +
+          ResultRow tail.
+        * Add OP_Explain comment-op emission to `sqlite3WhereBegin`
+          loop preamble (gated on `SQLITE_ENABLE_EXPLAIN_COMMENTS`)
+          so single-table scans match C's op[Explain p1=N p3=216].
+        * `sqlite3DeleteFrom` rowid-EQ should pick ONEPASS_SINGLE
+          (in-loop Delete) instead of the 2-pass ROWSET strategy;
+          also drop the trailing AddImm / FkCheck / ResultRow ops
+          on the productive non-counted path.
 
 ---
 
