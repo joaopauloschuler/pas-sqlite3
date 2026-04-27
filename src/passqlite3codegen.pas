@@ -14207,6 +14207,15 @@ var
   pLoop:  PWhereLoop;
   pIn:    PInLoop;
   db:     PTsqlite3;
+  iEnd:   i32;
+  pIdxR:  PIndex2;
+  pTabR:  PTable2;
+  pSrcR:  PSrcItem;
+  kAddr:  i32;
+  lastAddr: i32;
+  pOpR:   PVdbeOp;
+  xCol:   i32;
+  pPkR:   PIndex2;
 begin
   { Phase 6.9-bis 11g.2.b — productive loop-tail.
 
@@ -14237,6 +14246,7 @@ begin
 
   if v <> nil then
   begin
+    iEnd := sqlite3VdbeCurrentAddr(v);
     for i := pWInfo^.nLevel - 1 downto 0 do
     begin
       pLevel := @whereInfoLevels(pWInfo)[i];
@@ -14274,6 +14284,68 @@ begin
           if pIn^.eEndLoopOp <> OP_Noop then
             sqlite3VdbeAddOp2(v, pIn^.eEndLoopOp, pIn^.iCur, pIn^.addrInTop);
           sqlite3VdbeJumpHere(v, pIn^.addrInTop - 1);
+        end;
+      end;
+      { Phase 6.9-bis 11g.2.f — Index→table column rewrite tail
+        (where.c:7732..7886).  When the loop drives an index (or covering
+        index for OR-decomposed scans), translate OP_Column / OP_Rowid /
+        OP_IfNullRow opcodes that reference the table cursor into ones
+        that pull from the index cursor instead.  Skipped arms (deferred):
+          - RIGHT JOIN early-exit (where.c:7745..7748),
+          - viaCoroutine OP_Column→OP_Copy rewrite (where.c:7754..7761),
+          - SQLITE_ENABLE_OFFSET_SQL_FUNC OP_Offset case,
+          - pParse->pIdxEpr disable on bHasExpr indexes,
+          - WHERE_EXPRIDX explain-text rewrite on covering miss. }
+      pIdxR := nil;
+      if (pLoop^.wsFlags and (WHERE_INDEXED or WHERE_IDX_ONLY)) <> 0 then
+        pIdxR := pLoop^.u.btree.pIndex
+      else if (pLoop^.wsFlags and WHERE_MULTI_OR) <> 0 then
+        pIdxR := pLevel^.u.pCoveringIdx;
+      if (pIdxR <> nil) and (db^.mallocFailed = 0) then
+      begin
+        pSrcR := @SrcListItems(pWInfo^.pTabList)[pLevel^.iFrom];
+        pTabR := pSrcR^.pSTab;
+        if pWInfo^.eOnePass = 0 then
+          lastAddr := iEnd
+        else if not HasRowid(pIdxR^.pTable) then
+          lastAddr := iEnd
+        else
+          lastAddr := pWInfo^.iEndWhere;
+        kAddr := pLevel^.addrBody + 1;
+        while kAddr < lastAddr do
+        begin
+          pOpR := sqlite3VdbeGetOp(v, kAddr);
+          if pOpR^.p1 = pLevel^.iTabCur then
+          begin
+            if pOpR^.opcode = OP_Column then
+            begin
+              xCol := pOpR^.p2;
+              if not HasRowid(pTabR) then
+              begin
+                pPkR := sqlite3PrimaryKeyIndex(pTabR);
+                xCol := pPkR^.aiColumn[xCol];
+              end;
+              { sqlite3StorageColumnToTable is a no-op pass-through unless
+                SQLITE_ENABLE_HIDDEN_COLUMNS is defined (sqliteInt.h:4985) — skip. }
+              xCol := sqlite3TableColumnToIndex(pIdxR, i16(xCol));
+              if xCol >= 0 then
+              begin
+                pOpR^.p2 := xCol;
+                pOpR^.p1 := pLevel^.iIdxCur;
+              end;
+              { WHERE_IDX_ONLY / WHERE_EXPRIDX miss-handling deferred. }
+            end
+            else if pOpR^.opcode = OP_Rowid then
+            begin
+              pOpR^.p1     := pLevel^.iIdxCur;
+              pOpR^.opcode := OP_IdxRowid;
+            end
+            else if pOpR^.opcode = OP_IfNullRow then
+            begin
+              pOpR^.p1 := pLevel^.iIdxCur;
+            end;
+          end;
+          Inc(kAddr);
         end;
       end;
       sqlite3VdbeResolveLabel(v, pLevel^.addrBrk);

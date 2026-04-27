@@ -187,25 +187,15 @@ Important: At the end of this document, please find:
     Verify byte-identical bytecode emission against C via
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
-    Current baseline (2026-04-27): **TestWhereCorpus 89 PASS / 3 DIVERGE
+    Current baseline (2026-04-27): **TestWhereCorpus 90 PASS / 2 DIVERGE
     / 0 ERROR (corpus = 92).**  Scaffold and progress through
-    sub-progresses 1..42 are recorded in git history (`git log
-    --grep="11g.2.f"`).  PR-A (sub-progress 41) lifted the
-    `nTabList<>1` and `nSrc<>1` guards so 2-table FROMs emit real
-    bytecode.  PR-B (sub-progress 42) ported `constructAutomaticIndex`
-    + ON-clause merge + real `sqlite3GenerateIndexKey`/
-    `sqlite3ExprCodeLoadIndexColumn`/`sqlite3ResolvePartIdxLabel`,
-    landing the auto-index Bloom-filter cluster.
+    sub-progresses 1..43 are recorded in git history (`git log
+    --grep="11g.2.f"`).  Sub-progress 43 ported the where.c:7732..7886
+    Index→table column rewrite tail in `sqlite3WhereEnd`, flipping
+    JOIN_WHERE from DIVERGE to PASS.
 
     **Open DIVERGE rows (each blocked on a distinct planner
     optimization, all correctness-equivalent):**
-      * `JOIN_WHERE` (op[21]/29): `Column p1=2` (C, reads via auto-idx
-        cursor) vs `Column p1=0` (Pas, reads via table cursor).  Same
-        opcode, same value at runtime — needs the equality-join column
-        substitution (`whereIndexExprTrans` from where.c:5693..5817):
-        when `t.a = s.x` is a covered equality term and the inner
-        loop's auto-index already holds s.x, rewrite outer-loop reads
-        of `t.a` to read from the inner index cursor.
       * `LEFT_JOIN` (Pas=27, C=32 ops): missing the LEFT-JOIN null-row
         fixup tail.  Needs `pLevel^.iLeftJoin` match-flag init
         (Integer 0 → reg) at WhereBegin, set-flag (Integer 1 → reg)
