@@ -16303,14 +16303,131 @@ begin
   sqlite3ExprListDelete(pParse^.db, pList);
 end;
 
+{ sqlite3AddColumn — port of build.c:1490 (Phase 6.9-bis 11g.2.f sub-progress 7).
+  Append a column descriptor to pParse^.pNewTable^.aCol[].  Mirrors the C
+  reference path for the common non-RENAME, non-STRICT, non-GENERATED
+  shape: dequote the name token, reallocate the column array, copy
+  zCnName (and zType when provided) into a single packed allocation
+  (name + NUL + type + NUL — the layout sqlite3ColumnType() expects),
+  populate hName / affinity / colFlags / szEst, and update aHx and the
+  column counts.
+
+  Standard typename detection (sqlite3StdType[] / SQLITE_N_STDTYPE) is
+  deferred — the table is unported in this codebase today, so we always
+  treat the type as CUSTOM and let sqlite3AffinityType derive affinity
+  from the type string, mirroring what the C code does when the standard
+  match fails. }
 procedure sqlite3AddColumn(pParse: PParse; sName: TToken; sType: TToken);
+var
+  p:        PTable2;
+  z:        PAnsiChar;
+  zType:    PAnsiChar;
+  pCol:     PColumn;
+  aNew:     PColumn;
+  db:       PTsqlite3;
+  affinity: AnsiChar;
+  szEst:    u8;
+  eType:    u8;
+  nName:    i32;
+  hName:    u8;
+  h:        u8;
+  i:        i32;
 begin
-  { Phase 7 }
+  p := pParse^.pNewTable;
+  if p = nil then Exit;
+
+  db := pParse^.db;
+
+  if i32(p^.nCol) + 1 > db^.aLimit[SQLITE_LIMIT_COLUMN] then begin
+    sqlite3ErrorMsg(pParse, 'too many columns');
+    Exit;
+  end;
+
+  { Default attributes — used when sType is empty. }
+  eType    := COLTYPE_CUSTOM;
+  szEst    := 1;
+  affinity := AnsiChar(SQLITE_AFF_BLOB);
+
+  nName := i32(sName.n);
+
+  { Allocate name + optional type buffer.  Layout: name\0type\0 (sType.n=0
+    drops the second segment to a single trailing NUL). }
+  if sType.n > 0 then
+    z := PAnsiChar(sqlite3DbMallocRaw(db, u64(nName) + 1 + u64(sType.n) + 1))
+  else
+    z := PAnsiChar(sqlite3DbMallocRaw(db, u64(nName) + 1));
+  if z = nil then Exit;
+
+  if nName > 0 then Move(sName.z^, z^, nName);
+  z[nName] := #0;
+  sqlite3Dequote(z);
+
+  { Reject duplicate column name (case-insensitive). }
+  if (p^.nCol > 0) and (sqlite3ColumnIndex(p, z) >= 0) then begin
+    sqlite3ErrorMsg(pParse, 'duplicate column name');
+    sqlite3DbFree(db, z);
+    Exit;
+  end;
+
+  aNew := PColumn(sqlite3DbRealloc(db, p^.aCol,
+                                    u64(p^.nCol + 1) * u64(SizeOf(TColumn))));
+  if aNew = nil then begin
+    sqlite3DbFree(db, z);
+    Exit;
+  end;
+  p^.aCol := aNew;
+
+  pCol := @p^.aCol[p^.nCol];
+  FillChar(pCol^, SizeOf(TColumn), 0);
+  pCol^.zCnName := z;
+  hName := sqlite3StrIHash(z);
+  pCol^.hName   := hName;
+  sqlite3ColumnPropertiesFromName(p, pCol);
+
+  if sType.n = 0 then begin
+    pCol^.affinity := affinity;
+    pCol^.typeFlags := (pCol^.typeFlags and $0F) or u8(eType shl 4);
+    pCol^.szEst := szEst;
+  end else begin
+    nName := sqlite3Strlen30(z);
+    zType := z + nName + 1;
+    Move(sType.z^, zType^, sType.n);
+    zType[sType.n] := #0;
+    sqlite3Dequote(zType);
+    pCol^.affinity := sqlite3AffinityType(zType, pCol);
+    pCol^.colFlags := pCol^.colFlags or COLFLAG_HASTYPE;
+  end;
+
+  { aHx is a 16-entry hash hint table: writes that collide are tolerated
+    (consumers re-check by name).  Mirrors build.c:1588..1591. }
+  if p^.nCol <= $FF then begin
+    h := hName mod 16;
+    p^.aHx[h] := u8(p^.nCol);
+  end;
+
+  Inc(p^.nCol);
+  Inc(p^.nNVCol);
+  pParse^.u1.cr.constraintName.n := 0;
+
+  { suppress "unused" warning in the eType=COLTYPE_CUSTOM branch. }
+  i := 0; if i <> 0 then Exit;
 end;
 
+{ sqlite3AddNotNull — port of build.c:1604.
+  Mark the most-recently-added column NOT NULL.  Stores onError in the
+  notNull bitfield (low nibble of typeFlags) and sets TF_HasNotNull. }
 procedure sqlite3AddNotNull(pParse: PParse; onError: i32);
+var
+  p:    PTable2;
+  pCol: PColumn;
 begin
-  { Phase 7 }
+  p := pParse^.pNewTable;
+  if (p = nil) or (p^.nCol < 1) then Exit;
+  pCol := @p^.aCol[p^.nCol - 1];
+  pCol^.typeFlags := (pCol^.typeFlags and $F0) or u8(onError and $0F);
+  p^.tabFlags := p^.tabFlags or TF_HasNotNull;
+  { COLFLAG_UNIQUE / uniqNotNull index loop is gated on AddPrimaryKey/
+    UNIQUE-index porting, which is still a stub today. }
 end;
 
 procedure sqlite3AddDefaultValue(pParse: PParse; pExpr: PExpr;

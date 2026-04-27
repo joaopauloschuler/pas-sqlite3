@@ -1454,6 +1454,62 @@ Important: At the end of this document, please find:
       `sqlite3Insert` schema-row INSERT into sqlite_master so the
       OP_ParseSchema round-trip becomes a real round-trip) before
       the FULL row can flip green.
+    - [X] Sub-progress 7 — `sqlite3AddColumn` + `sqlite3AddNotNull`
+      schema-population port (2026-04-27).  Replaced the Phase 7 stubs
+      at codegen.pas:16306/16311 with a narrow port of build.c:1490
+      and build.c:1604 covering the corpus shape: dequote the column
+      name token, reallocate `pTab^.aCol` to fit nCol+1 entries, copy
+      `zCnName` (and the optional `zType`) into a single packed
+      allocation laid out `name\0type\0` (the layout
+      `sqlite3ColumnType()` already expects), populate `hName`
+      (sqlite3StrIHash), `affinity` (sqlite3AffinityType when typed,
+      SQLITE_AFF_BLOB otherwise), `colFlags |= COLFLAG_HASTYPE` when
+      typed, and `szEst=1`; update the 16-entry `aHx` collision-hint
+      table; bump `nCol`/`nNVCol`; reset `u1.cr.constraintName.n`.
+      Duplicate-name detection short-circuits on `sqlite3ColumnIndex`.
+      `SQLITE_LIMIT_COLUMN` enforced.  `AddNotNull` packs `onError`
+      into the low nibble of `typeFlags` (the bitfield slot consumers
+      already mask with `$0F` — see codegen.pas:4809, 9198, 12736)
+      and sets `TF_HasNotNull`.  The `COLFLAG_UNIQUE`/`uniqNotNull`
+      index-loop arm stays gated on `AddPrimaryKey`/UNIQUE-index
+      porting (still Phase 7 stubs).  Standard typename detection
+      (`sqlite3StdType[]` / SQLITE_N_STDTYPE) is deferred — that table
+      is unported, so we always treat the type as `COLTYPE_CUSTOM` and
+      let `sqlite3AffinityType` derive the affinity from the
+      type-string substring scan, which is exactly what the C arm
+      falls through to when the standard-type match fails.
+
+      Test-scaffold deviation considered and reverted: tried also
+      publishing the populated `pTab` to `pSchema^.tblHash` from the
+      `init.busy=0` arm of `EndTable` so subsequent prepares in the
+      same connection could resolve columns despite Pascal
+      `sqlite3Insert` still emitting zero ops (so `OP_ParseSchema`
+      finds nothing).  That broke TestPrepareBasic T8/T9 (rc=1
+      instead of OK) because both prepare a `CREATE TABLE z(x)`
+      after T7 already prepared+finalized-without-stepping the same
+      SQL — with prepare-time publish the second prepare sees a
+      duplicate table.  In real C the publish only happens via
+      `OP_ParseSchema` *during step*, so finalize-without-step
+      leaves the schema untouched.  Reverted; the proper fix is to
+      drive `sqlite3Insert` real in sub-progress 8 so the
+      Insert→ParseSchema round-trip works as designed.
+
+      Net result of sub-progress 7: column descriptor population is
+      now real and dormant — when tblHash is populated (init.busy=1
+      reload path, or after sub-progress 8 lands) the resolver from
+      sub-progress 6 will find live columns instead of nCol=0.  No
+      shift in the failure-mode tally yet (still
+      `0 exception, 0 nil-Vdbe, 20 op-count, 0 op-diff` — table
+      lookup still fails because tblHash is empty), no regression
+      anywhere: TestParser 45/45, TestParserSmoke 20/20,
+      TestPrepareBasic 20/20, TestSelectBasic 49/49, TestExprBasic
+      40/40, TestDMLBasic 54/54, TestSchemaBasic 44/44,
+      TestExplainParity 2/10, TestWherePlanner 675/675,
+      TestWhereSimple 39/39, TestWhereExpr 84/84, TestWhereStructs
+      148/148, TestWhereBasic 52/52.  Sub-progress 8 must drive
+      `sqlite3Insert` to emit a real schema-row INSERT against
+      `sqlite_master` so the OP_ParseSchema round-trip populates
+      `tblHash` for real, lighting up the FULL row (10 ops).
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
