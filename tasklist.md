@@ -194,12 +194,24 @@ Important: At the end of this document, please find:
 
     **Open DIVERGE rows:**
       * Multi-table FROM (blocked on multi-table planner integration):
-        - `LEFT_JOIN`, `JOIN_WHERE`.
+        - `LEFT_JOIN`, `JOIN_WHERE`.  Two sequential gates must lift
+          together for a 2-table FROM to emit any body:
+          (1) `passqlite3codegen.pas:16130` — `sqlite3Select`'s
+              `p^.pSrc^.nSrc <> 1` early-return; widen alongside the
+              N-way nested-loop body.
+          (2) `passqlite3codegen.pas:13377` — `sqlite3WhereBegin`'s
+              `nTabList <> 1` guard (TODO 11g.2.d).  Replacing it
+              needs the planner loop (`whereLoopAddAll`,
+              `wherePathSolver`) plus per-level cursor opens and
+              LEFT-JOIN null-row semantics (`OP_NullRow` + the
+              `pLevel^.iLeftJoin` flag).
       * Subquery planner-optimization gap:
         - `EXISTS_SUB`: Pas emits a correct correlated subroutine
           (22 ops); C uses a bloom-filter + autoindex optimization
-          (30 ops).  Strategy difference, not a correctness bug —
-          flips to PASS once the planner adopts the same optimization.
+          (30 ops, the `Once`/`OpenAutoindex`/`FilterAdd` cluster).
+          Strategy difference, not a correctness bug — flips to PASS
+          once the planner adopts the same optimization.  Companion
+          `NOT_EXISTS` already PASSes via the same correlated path.
 
     **Open follow-on:** Re-enable productive tails in `sqlite3DeleteFrom`
     and `sqlite3Update` (still skeleton-only); drop the step-11f
