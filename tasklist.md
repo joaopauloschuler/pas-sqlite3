@@ -883,6 +883,18 @@ Important: At the end of this document, please find:
       = bit 0 deferred — bit 1 of bitwiseFlags lit, TERM_CODED stays
       clear), SCOLS15 (TERM_VIRTUAL skip — neither TERM_CODED set nor
       untestedTerms lit).
+    - [X] Public surface, batch 16 — `sqlite3WhereCodeOneLoopStart`
+      `code_outer_join_constraints` re-walk (wherecode.c:2800..2813).
+      Fires after the LEFT-JOIN match-flag set when `pLevel^.pRJ = nil`;
+      walks `pWInfo^.sWC.a[0..nBase-1]` a second time picking up any
+      term the main push-down walk left untouched because of the
+      JT_LEFT/LTORJ/RIGHT EP_OuterON gate.  Each non-virtual,
+      non-already-coded, ready term gets a `sqlite3ExprIfFalse(addrCont,
+      JUMPIFNULL)` residual; JT_LTORJ tables short-circuit because their
+      tail is owned by the (still-deferred) RIGHT JOIN subroutine driver.
+      Gate: `TestWherePlanner.pas` (558/558): SCOLS16 (LEFT JOIN +
+      iLeftJoin=99 + nBase=1 outer-join term — post-pass tags TERM_CODED,
+      addrFirst non-zero, sentinel OP_Integer p1=1/p2=99 emitted).
     - [X] Leaf helpers, batch 10 — `codeINTerm` (wherecode.c:668..784)
       full port replacing the prior `Assert(False)` stub.  IN-loop
       builder: opens the IN cursor (rowid table / shared index / EPH

@@ -12840,6 +12840,29 @@ begin
   begin
     pLevel^.addrFirst := sqlite3VdbeCurrentAddr(v);
     sqlite3VdbeAddOp2(v, OP_Integer, 1, pLevel^.iLeftJoin);
+
+    { code_outer_join_constraints (wherecode.c:2800..2813) — re-walk
+      pWC^.a[0..nBase-1] and emit residuals for terms the main push-down
+      walk left untouched because they belong to the LEFT/LTORJ/RIGHT
+      outer-join arm.  pRJ=nil keeps us out of the (deferred) RIGHT JOIN
+      subroutine path; JT_LTORJ tables get skipped because their tail
+      lives inside the right-join subroutine that has not been ported. }
+    if pLevel^.pRJ = nil then
+    begin
+      pTermArr := pWCBody^.a;
+      for jBody := 0 to pWCBody^.nBase - 1 do
+      begin
+        pTermBody := @pTermArr[jBody];
+        if (pTermBody^.wtFlags and (TERM_VIRTUAL or TERM_CODED)) <> 0 then
+          continue;
+        if (pTermBody^.prereqAll and pLevel^.notReady) <> 0 then continue;
+        if (pTabItem^.fg.jointype and JT_LTORJ) <> 0 then continue;
+        Assert(pTermBody^.pExpr <> nil);
+        sqlite3ExprIfFalse(pParse, pTermBody^.pExpr, addrCont,
+                           SQLITE_JUMPIFNULL);
+        pTermBody^.wtFlags := pTermBody^.wtFlags or TERM_CODED;
+      end;
+    end;
   end;
 
   Result := pLevel^.notReady;

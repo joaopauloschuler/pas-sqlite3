@@ -5450,6 +5450,39 @@ begin
   fNotNull := False; fIfNot := False; fIsNull := False;
   if fNotNull or fIfNot or fIsNull then ;
 
+  { ---- SCOLS16 — LEFT JOIN + iLeftJoin set + outer-join term in pWC
+         (prereqAll=0, no EP_OuterON).  Main walk skips the term because
+         JT_LEFT requires EP_OuterON; code_outer_join_constraints picks
+         it up after the OP_Integer 1 → iLeftJoin emit (provided pRJ=nil
+         and not JT_LTORJ).  Verifies TERM_CODED is set by the post-pass
+         and the sentinel OP_Integer 1 fires before the residual. ---- }
+  pBodyTerm^.wtFlags  := 0;
+  pBodyTerm^.prereqAll := 0;
+  pWInfo^.bitwiseFlags := 0;
+  pSItem^.fg.jointype := JT_LEFT;
+  pLevel^.pRJ := nil;
+  pLevel^.iLeftJoin := 99;       { pretend prelude allocated reg 99 }
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.op := 99;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 0, pLevel, notReady);
+  Check('SCOLS16 LEFT JOIN: outer-join post-pass tags TERM_CODED',
+        (pBodyTerm^.wtFlags and TERM_CODED) <> 0);
+  Check('SCOLS16 LEFT JOIN: addrFirst set to LEFT-hit addr',
+        pLevel^.addrFirst > 0);
+  fIfNot := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_Integer) and (pOp^.p1 = 1) and (pOp^.p2 = 99) then
+      fIfNot := True;
+  end;
+  Check('SCOLS16 LEFT JOIN: OP_Integer 1 → iLeftJoin emitted', fIfNot);
+  pSItem^.fg.jointype := 0;
+  pLevel^.iLeftJoin := 0;
+
   { ---- SCOLS15 — TERM_VIRTUAL or pre-coded TERM_CODED skips the walk
          entirely; body emits no residual for the term. ---- }
   pBodyTerm^.wtFlags  := TERM_VIRTUAL;
