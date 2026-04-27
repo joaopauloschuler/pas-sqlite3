@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 198;
+  N_CORPUS = 225;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -308,6 +308,35 @@ begin
   Add(i, 'SAVEPOINT s9',                'SAVEPOINT s9;');                        Inc(i);
   Add(i, 'RELEASE s9',                  'RELEASE s9;');                          Inc(i);
   Add(i, 'DROP INDEX IF EXISTS 2',      'DROP INDEX IF EXISTS i_other;');        Inc(i);
+
+  { Probe sweep #9 — candidate rows. }
+  Add(i, 'SELECT CAST a TEXT',          'SELECT CAST(a AS TEXT) FROM t;');       Inc(i);
+  Add(i, 'SELECT CAST a NUMERIC',       'SELECT CAST(a AS NUMERIC) FROM t;');    Inc(i);
+  Add(i, 'SELECT CAST a BLOB',          'SELECT CAST(a AS BLOB) FROM t;');       Inc(i);
+  Add(i, 'SELECT CAST NULL INT',        'SELECT CAST(NULL AS INTEGER);');        Inc(i);
+  Add(i, 'SELECT CAST 1.5 INT',         'SELECT CAST(1.5 AS INTEGER);');         Inc(i);
+  Add(i, 'SELECT 1.5+2.5',              'SELECT 1.5+2.5;');                      Inc(i);
+  Add(i, 'SELECT 1.0*2',                'SELECT 1.0*2;');                        Inc(i);
+  Add(i, 'SELECT 1+2+3',                'SELECT 1+2+3;');                        Inc(i);
+  Add(i, 'SELECT 1-2-3',                'SELECT 1-2-3;');                        Inc(i);
+  Add(i, 'SELECT (1+2)',                'SELECT (1+2);');                        Inc(i);
+  Add(i, 'SELECT (a) col',              'SELECT (a) FROM t;');                   Inc(i);
+  Add(i, 'SELECT a*a',                  'SELECT a*a FROM t;');                   Inc(i);
+  Add(i, 'SELECT a+a',                  'SELECT a+a FROM t;');                   Inc(i);
+  Add(i, 'SELECT a IS NULL expr',       'SELECT a IS NULL FROM t;');             Inc(i);
+  Add(i, 'SELECT a IS NOT NULL expr',   'SELECT a IS NOT NULL FROM t;');         Inc(i);
+  Add(i, 'SELECT a%b',                  'SELECT a%b FROM t;');                   Inc(i);
+  Add(i, 'SELECT a, b AS y',            'SELECT a, b AS y FROM t;');             Inc(i);
+  Add(i, 'SELECT 1 AS x, 2 AS y',       'SELECT 1 AS x, 2 AS y;');               Inc(i);
+  Add(i, 'SELECT a*-1',                 'SELECT a*-1 FROM t;');                  Inc(i);
+  Add(i, 'SELECT a, NULL',              'SELECT a, NULL FROM t;');               Inc(i);
+  Add(i, 'SELECT NULL, a',              'SELECT NULL, a FROM t;');               Inc(i);
+  Add(i, 'SELECT NOT NOT 1',            'SELECT NOT NOT 1;');                    Inc(i);
+  Add(i, 'SELECT 1 IS 1',               'SELECT 1 IS 1;');                       Inc(i);
+  Add(i, 'SELECT NULL IS NULL',         'SELECT NULL IS NULL;');                 Inc(i);
+  Add(i, 'SELECT a||lit',               'SELECT a||''x'' FROM t;');              Inc(i);
+  Add(i, 'SAVEPOINT spA',               'SAVEPOINT spA;');                       Inc(i);
+  Add(i, 'RELEASE spA',                 'RELEASE spA;');                         Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

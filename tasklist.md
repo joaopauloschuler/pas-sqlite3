@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 197 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 198); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 224 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 225); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -190,8 +190,8 @@ Important: At the end of this document, please find:
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
   comparison ops + literal-arith + col aliases + multi-col index +
   multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **197 PASS / 1 DIVERGE / 0 ERROR**
-  (corpus = 198 after probe sweep #8).
+  Current Status (2026-04-27): **224 PASS / 1 DIVERGE / 0 ERROR**
+  (corpus = 225 after probe sweep #9).
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -269,18 +269,16 @@ Important: At the end of this document, please find:
 
     - [ ] **6.10 step 6** Expand corpus further and drive remaining
       DIVERGEs to PASS, then promote from report-only to hard gate.
-      Corpus now 197 PASS / 1 DIVERGE / 198 total.  NULLIF Δ=1
-      closed by porting `sqlite3VdbeReleaseRegisters`
-      (vdbeaux.c:1501..1527) and wiring the constMask!=0 arm of
-      `emitScalarFunctionCall` to it (post-Function OP_ReleaseReg
-      emission with p5=1 under SQLITE_DEBUG).  Probe sweep #8
-      added 27 PASS rows: bitwise
-      (`a&b`, `a|b`, `a<<1`, `a>>1`, `~a`, `1&3`, `1|2`, `4>>1`),
-      unary `+a`, `IFNULL`, `COALESCE` 3-arg, simple-form `CASE a
-      WHEN…END`, `CAST(a AS INTEGER/REAL)`, `CAST('5' AS INTEGER)`,
-      `NOT 0`/`NOT 1`, `a IS b`/`a IS NOT b`, `1.0`/`0.1` float
-      literals, multi-AND-3, `INSERT large`, `INSERT alt mixed`,
-      another SAVEPOINT/RELEASE pair, `DROP INDEX IF EXISTS`.
+      Corpus now 224 PASS / 1 DIVERGE / 225 total.  Probe sweep #9
+      added 27 PASS rows: more CAST shapes
+      (`CAST(a AS TEXT/NUMERIC/BLOB)`, `CAST(NULL AS INTEGER)`,
+      `CAST(1.5 AS INTEGER)`), float arith literals
+      (`1.5+2.5`, `1.0*2`), 3-element add/sub chains, parenthesized
+      forms (`(1+2)`, `(a)`), col self-arith (`a*a`, `a+a`),
+      `IS [NOT] NULL` as expression (vs predicate), `a%b`,
+      multi-alias (`a, b AS y`, `1 AS x, 2 AS y`), `a*-1`,
+      `a, NULL`/`NULL, a`, `NOT NOT 1`, `1 IS 1`, `NULL IS NULL`,
+      `a||'x'`, more SAVEPOINT/RELEASE.
 
       DIVERGE shapes discovered in probe sweeps (kept out of corpus
       until they flip — each is a committable next-agent ticket):
@@ -324,6 +322,14 @@ Important: At the end of this document, please find:
           materialise / co-routine path not ported).
         * `UPDATE t SET a=5 WHERE rowid=1` — Δ=14 (`sqlite3Update`
           still skeleton-only — see 11g.2.f open follow-on).
+        * `INSERT INTO u VALUES(1, 2);` (u has `p PRIMARY KEY`) —
+          Δ=11 (rowid-aliased INTEGER PRIMARY KEY INSERT path).
+        * `SELECT p FROM u;` — per-op divergence at op[1] (scan
+          of rowid-aliased PRIMARY KEY column).
+        * `DROP TABLE IF EXISTS znope;` (target absent) — Pascal
+          `prepare_v2` returns a nil Vdbe; C returns a stepable
+          (no-op) Vdbe.  Likely an early-return in `sqlite3DropTable`
+          before `sqlite3FinishCoding` runs.
 
 - [X] **6.10b** Bug — `INSERT INTO <tbl> DEFAULT VALUES` raised
   EAccessViolation in `sqlite3Insert` (passqlite3codegen.pas:18974)
