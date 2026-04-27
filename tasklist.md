@@ -80,24 +80,75 @@ Important: At the end of this document, please find:
           `sqlite3Insert`).
         [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
           VALUES path).
-        [ ] **CORRECTNESS BUG** `SELECT a FROM t WHERE rowid=1 OR
-          rowid=2` and `SELECT a FROM t WHERE rowid IN (1,2)` —
-          both return *zero rows* instead of the matching rows.
-          Repro: `CREATE TABLE t(a,b,c); INSERT INTO t VALUES(10,1,1),
-          (20,2,2),(30,3,3); SELECT a FROM t WHERE rowid=1 OR rowid=2;`
-          (Pas: empty, C: 10/20).  Plain `WHERE a=10 OR a=20` is
-          correct, so the bug is specific to the rowid-OR-EQ /
-          rowid-IN-list planner+codegen path.  Bytecode dump shows
-          Pas emits a single Rewind/scan with garbled term codegen
-          (Column→reg, IsNull, SeekRowid p3=col-reg — using col `a`
-          as a rowid! — then Rowid+Eq+Ne against integer constants),
-          where C builds an ephemeral-rowset OR-decomposed plan
-          (BeginSubrtn / Once / OpenEphemeral / two IdxInsert /
-          Rewind+SeekRowid loop).  Likely root cause:
-          `whereLoopAddOr` not reaching the rowid-IN-rewrite, or
-          `sqlite3WhereCodeOneLoopStart`'s OR arm falling through to
-          the scan path with the OR-term incorrectly classified as a
-          column-EQ.  Found 2026-04-27.
+        [ ] **CORRECTNESS BUG — IPK-IN execution path entirely
+          broken.**  Surface symptom: every query whose plan is
+          `WHERE_IPK | WHERE_COLUMN_IN` returns zero rows or
+          crashes.  `WHERE rowid IN (1,2,3)` (≥3 entries) crashes
+          inside `btreeParseCell`; `WHERE rowid IN (1,2)` and the
+          OR-rewritten `WHERE rowid=1 OR rowid=2` return zero rows
+          silently.  Plain `WHERE a=10 OR a=20` and `WHERE rowid=1`
+          are correct.  Repro driver: `src/tests/ReproOrRowid.pas`.
+
+          Two layered bugs (diagnosed 2026-04-27):
+
+          (1) **Hoist-gate exclusion.**  `InRhsHoistCandidate` at
+              `passqlite3codegen.pas:13846` skips IN-RHS lists with
+              `≤2` constant entries (matches the residual-filter
+              cost heuristic).  But the IPK-IN Case-2 inline at
+              `passqlite3codegen.pas:14334..14407` reads its eph
+              cursor from `pTerm^.pExpr^.iTable`, which the hoist
+              would have set via `sqlite3FindInIndex(
+              IN_INDEX_MEMBERSHIP)`.  When the hoist is skipped,
+              `iTable` stays at default 0 and Case-2 emits
+              `OP_Rewind p1=0 / OP_Column p1=0 / OP_IsNull /
+              OP_SeekRowid p1=0` — i.e. the table cursor is used
+              as both the IN-RHS source AND the seek target.  The
+              guard asserts at `codegen.pas:14357..14358`
+              (`Assert(EP_Subrtn)` / `Assert(iTable > 0)`) compile
+              out at -O3.  Local fix proven to emit C-oracle-shape
+              bytecode: at `codegen.pas:14296`, force-call
+              `sqlite3FindInIndex(IN_INDEX_MEMBERSHIP, ...)` on
+              `pLoop^.aLTerm[0]` regardless of list size BEFORE
+              invoking `DoInRhsHoist`.
+
+          (2) **`sqlite3VdbeFindCompare` is a stub that returns
+              nil.**  Both definitions return nil:
+                * `passqlite3btree.pas:2813..2816`
+                * `passqlite3vdbe.pas:1951..1954`
+              `sqlite3BtreeIndexMoveto` (`btree.pas:2901..2907`)
+              short-circuits with `pRes^ := 0` when compare is
+              nil.  `0` means "exact match", so
+              `sqlite3BtreeInsert` (`btree.pas:5149`) takes the
+              overwrite arm, calls `getCellInfo(pCur)` on a cursor
+              whose `pPage` was never positioned, and crashes in
+              `btreeParseCell` at `btree.pas:906`
+              (`pPage^.xParseCell` dereferences a NULL function
+              pointer).  This breaks **every** OP_IdxInsert into a
+              freshly OpenEphemeral'd index — not just IPK-IN.
+              `sqlite3VdbeRecordCompare` at
+              `passqlite3btree.pas:2818..2822` is also stubbed
+              (returns 0).  The reason existing
+              TestWhereCorpus IPK_IN/IN_LIST rows still show
+              "PASS" is that TestWhereCorpus only diffs EXPLAIN
+              bytecode; nothing in the test suite executes an IN
+              query end-to-end.
+
+          Recommended decomposition:
+            [ ] **6.10 step 6.IPK-IN.a** Apply the hoist-gate fix
+                from (1).  Necessary but not sufficient — still
+                crashes on ≥3-entry execution until (2) lands.
+            [ ] **6.10 step 6.IPK-IN.b** Port real bodies of
+                `sqlite3VdbeFindCompare` and
+                `sqlite3VdbeRecordCompare` (vdbeaux.c).  Once
+                IndexMoveto returns `loc <> 0` for an empty index,
+                IdxInsert allocates a new cell and the IPK-IN eph
+                materialisation executes.
+            [ ] **6.10 step 6.IPK-IN.c** Add a *runtime*
+                correctness gate (not just EXPLAIN diff) covering
+                rowid IN, column IN, OR-rewritten IN, and
+                `rowid=K1 OR rowid=K2`.  Without runtime coverage,
+                regressions of this class keep slipping through
+                the bytecode-only parity gate.
         [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
         [ ] `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3
