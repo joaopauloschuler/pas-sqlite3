@@ -374,6 +374,7 @@ type
 
   { Phase 6.2 primitive aliases }
   Pi16  = ^i16;
+  Pi32  = ^i32;
   LogEst = i16;   { SQLite logarithmic estimate: 1.5*log2(N) }
 
   { Forward pointers for Phase 6.2 types (defined later in this type block) }
@@ -1488,6 +1489,7 @@ const
   SQLITE_OrderBySubq    = u32($10000000);  { ORDER BY in subquery helps outer (sqliteInt.h:1930) }
   SQLITE_StarQuery      = u32($20000000);  { Star-query heuristic in computeMxChoice (sqliteInt.h:1931) }
   SQLITE_PropagateConst = u32($00008000);  { Constant propagation optimization (sqliteInt.h:1915) }
+  SQLITE_ExistsToJoin   = u32($40000000);  { EXISTS-to-JOIN optimization (sqliteInt.h:1932) }
 
   { TOPBIT — top bit of a 64-bit Bitmask (sqliteInt.h:1414); used by
     whereLoopAddBtree's "covering by bitmask" check to detect the
@@ -6970,6 +6972,10 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         ResolveExprList(pE^.x.pList)
       else if pE^.x.pSelect <> nil then
       begin
+        { Mirror resolve.c:1378 — flag the Parse so sqlite3Select can
+          consider the EXISTS-to-JOIN optimisation. }
+        if pE^.op = TK_EXISTS then
+          pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_BHasExists;
         { Phase 6.9-bis — correlated subquery prep for TK_EXISTS /
           TK_SELECT / TK_IN-subselect.  Mirrors resolve.c:1382..1388.
 
@@ -7307,6 +7313,102 @@ function sqlite3SelectWalkFail(pWalker: PWalker; pSel: PSelect): i32; cdecl;
 begin
   pWalker^.eCode := 0;
   Result := WRC_Abort;
+end;
+
+{ ---------------------------------------------------------------------------
+  renumberCursors helpers — port of select.c:3982..4064 (SQLite 3.53.0).
+  Static helpers used by existsToJoin (Phase 6.9-bis 11g.2.f) to renumber
+  cursors when grafting an EXISTS subquery's FROM clause into the outer
+  query.  Walk SrcList + Expr trees via the Walker machinery.
+  --------------------------------------------------------------------------- }
+
+{ srclistRenumberCursors — recursive helper that walks a SrcList, assigning
+  a fresh cursor number to every item except the iExcept'th element.
+  aCsrMap[0] holds the original cursor count (upper bound); aCsrMap[i+1]
+  receives the new cursor for old cursor i. }
+procedure srclistRenumberCursors(pParse: PParse; aCsrMap: Pi32;
+                                  pSrc: PSrcList; iExcept: i32); forward;
+
+procedure srclistRenumberCursors(pParse: PParse; aCsrMap: Pi32;
+                                  pSrc: PSrcList; iExcept: i32);
+var
+  i:       i32;
+  pItem:   PSrcItem;
+  pSelLoc: PSelect;
+  pBase:   PSrcItem;
+begin
+  pBase := SrcListItems(pSrc);
+  i := 0;
+  while i < pSrc^.nSrc do
+  begin
+    pItem := @pBase[i];
+    if i <> iExcept then
+    begin
+      Assert(pItem^.iCursor < aCsrMap[0]);
+      if ((pItem^.fg.fgBits and SRCITEM_FG_IS_RECURSIVE) = 0)
+         or (aCsrMap[pItem^.iCursor + 1] = 0) then
+      begin
+        aCsrMap[pItem^.iCursor + 1] := pParse^.nTab;
+        Inc(pParse^.nTab);
+      end;
+      pItem^.iCursor := aCsrMap[pItem^.iCursor + 1];
+      if (pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0 then
+      begin
+        pSelLoc := pItem^.u4.pSubq^.pSelect;
+        while pSelLoc <> nil do
+        begin
+          srclistRenumberCursors(pParse, aCsrMap, pSelLoc^.pSrc, -1);
+          pSelLoc := pSelLoc^.pPrior;
+        end;
+      end;
+    end;
+    Inc(i);
+  end;
+end;
+
+{ renumberCursorDoMapping — *piCursor is a cursor number; remap if listed
+  in aCsrMap (mirrors select.c:4010..4016). }
+procedure renumberCursorDoMapping(pWalker: PWalker; piCursor: Pi32);
+var
+  aCsrMap: Pi32;
+  iCsr:    i32;
+begin
+  aCsrMap := Pi32(pWalker^.u.ptr);
+  iCsr := piCursor^;
+  if (iCsr < aCsrMap[0]) and (aCsrMap[iCsr + 1] > 0) then
+    piCursor^ := aCsrMap[iCsr + 1];
+end;
+
+{ renumberCursorsCb — Expr walker callback; rewrites TK_COLUMN /
+  TK_IF_NULL_ROW iTable values and EP_OuterON w.iJoin via aCsrMap. }
+function renumberCursorsCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  op2: i32;
+begin
+  op2 := pExpr^.op;
+  if (op2 = TK_COLUMN) or (op2 = TK_IF_NULL_ROW) then
+    renumberCursorDoMapping(pWalker, @pExpr^.iTable);
+  if ExprHasProperty(pExpr, EP_OuterON) then
+    renumberCursorDoMapping(pWalker, @pExpr^.w.iJoin);
+  Result := WRC_Continue;
+end;
+
+{ renumberCursors — assign fresh cursor numbers to every cursor in the
+  FROM clauses of (*p) and its sub-selects (recursively), except for the
+  iExcept'th element of p^.pSrc.  Update all expressions and other refs.
+  aCsrMap is caller-provided working space whose [0] entry is the upper
+  bound on cursor numbers and remaining entries are zero-initialised. }
+procedure renumberCursors(pParse: PParse; p: PSelect; iExcept: i32;
+                          aCsrMap: Pi32);
+var
+  w: TWalker;
+begin
+  srclistRenumberCursors(pParse, aCsrMap, p^.pSrc, iExcept);
+  FillChar(w, SizeOf(w), 0);
+  w.u.ptr := Pointer(aCsrMap);
+  w.xExprCallback   := @renumberCursorsCb;
+  w.xSelectCallback := @sqlite3SelectWalkNoop;
+  sqlite3WalkSelect(@w, p);
 end;
 
 procedure sqlite3SelectPopWith(pWalker: PWalker; pSel: PSelect); cdecl;
