@@ -271,15 +271,7 @@ Important: At the end of this document, please find:
       collapse, UNIQUE-index rewrite to include PK key cols) is
       still deferred but not on any current corpus row.
 
-    - [ ] **6.10 step 6** Expand corpus further and drive remaining
-      DIVERGEs to PASS, then promote from report-only to hard gate.
-      Corpus now 982 PASS / 1 DIVERGE / 983 total after probe
-      sweeps #18..#34 (each added 25–36 PASS rows).  The pattern:
-      pick SQL shapes adjacent to those already PASSing, batch
-      ~20–30 at a time, drop any that DIVERGE into the actionable
-      list below.
-
-      Make these to work (port code when required):
+    - [ ] **6.10 step 6** Make these to work (port code when required):
         [ ] `CREATE INDEX i ON t(a) WHERE a>0` — Δ=4 (partial-index
           WHERE clause codegen path).
         [ ] `INSERT INTO t(a) VALUES(1)` / `INSERT INTO t(a,b,c)
