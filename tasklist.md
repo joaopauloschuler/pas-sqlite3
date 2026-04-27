@@ -1041,6 +1041,40 @@ Important: At the end of this document, please find:
       isSubquery — verifies pLevel^.op = OP_Goto, pLevel^.p2 > 0,
       OP_InitCoroutine p1=77 / p3=123 emitted, OP_Yield p1=77
       emitted, pLevel^.p2 points at the emitted OP_Yield address).
+    - [X] Public surface, batch 20 — `sqlite3WhereCodeOneLoopStart`
+      Case 4 `WHERE_IN_SEEKSCAN` driver (wherecode.c:1965..1969,
+      2043..2061, 2146).  Drops the prior assertion-stub gate on the
+      IN-skip-scan flag and ports the three-piece codegen: (1) before
+      the equality-prefix codegen, when `iLevel > 0` and the loop carries
+      `WHERE_IN_SEEKSCAN`, emit `OP_NullRow iIdxCur` so the index cursor
+      starts un-positioned and the first iteration enters the
+      seek-or-step path cleanly; (2) at the start-bound seek-op
+      selection, when the chosen op is `OP_SeekGE` and IN_SEEKSCAN is
+      lit, prepend `OP_SeekScan` whose p1 carries the tunable step
+      budget `(pIdx^.aiRowLogEst[0] + 9) div 10` (one-tenth of the
+      log-row-estimate, rounded up — matches upstream's seek-cost
+      heuristic).  When a range bound is present (`pRangeStart` or
+      `pRangeEnd <> nil`), patch `OP_SeekScan.p5 := 1` and
+      `OP_SeekScan.p2 := currentAddr + 1` via ChangeP2 so the
+      seek-or-step driver knows to fall through to the bound-load
+      sequence; otherwise leave `addrSeekScan` set so the trailing
+      `JumpHere` after the end-bound `OP_IdxGE/Gt/Le/Lt` emit threads
+      the bypass to the post-end-bound address.  (3) at wherecode.c:
+      2146, after the end-bound probe emit, `if addrSeekScan <> 0 then
+      sqlite3VdbeJumpHere(v, addrSeekScan)` lands the seek-skip target
+      one past the IdxGT/IdxLE so the body fall-through is reached when
+      the SeekScan budget exhausts without a hit.  Local
+      `addrSeekScan` initialised to 0 inside the Case 4 block; existing
+      Case 4 fixtures (SCOLS7..9, SCOLS19) untouched because they run
+      with IN_SEEKSCAN cleared, so the new code is transparent on the
+      pre-existing path.  Gate: `TestWherePlanner.pas` (637/637):
+      SCOLS20 (N_LEVEL=2 with iLevel=1 + iIdxCur=6, WHERE_INDEXED |
+      WHERE_COLUMN_EQ | WHERE_IN_SEEKSCAN, nEq=1, x=42, aiRowLogEst[0]
+      =33 → budget=4; verifies OP_NullRow emitted on iIdxCur,
+      OP_SeekScan emitted with p1=4, OP_SeekGE follows immediately,
+      OP_IdxGT end-bound probe still emitted, no-range-bound JumpHere
+      patches OP_SeekScan.p2 to addrIdxGT+1 — the post-end-bound
+      address).
     - [X] Public surface, batch 19 — `sqlite3WhereCodeOneLoopStart`
       Case 4 WITHOUT-ROWID secondary-index PK reconstruction
       (wherecode.c:2177..2186).  Replaces the prior `Assert(False)`

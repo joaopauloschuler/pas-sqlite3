@@ -12264,6 +12264,7 @@ var
   jSwap16:         u16;
   jSwapTerm:       PWhereTerm;
   j4:              i32;
+  addrSeekScan:    i32;
   { ---- Per-loop body code (push-down + transitive constraint) locals ---- }
   pWCBody:         PWhereClause;
   pTermBody:       PWhereTerm;
@@ -12510,11 +12511,10 @@ begin
     nTop4   := pLoop^.u.btree.nTop;
     Assert(nEq4 >= pLoop^.nSkip);
 
-    { Defer paths that need their own batch.  bSeekPastNull / regBignull
-      and IN_SEEKSCAN both involve OP_NullRow / OP_SeekScan / NULL-pad
-      separate-pass logic that has no fixture yet. }
+    { Defer regBignull NULL-pad two-pass scan to its own batch — no
+      fixture exercises BIGNULL_SORT today. }
     Assert((pLoop^.wsFlags and WHERE_BIGNULL_SORT) = 0);
-    Assert((pLoop^.wsFlags and WHERE_IN_SEEKSCAN) = 0);
+    addrSeekScan := 0;
 
     pRangeStart := nil;
     pRangeEnd   := nil;
@@ -12558,6 +12558,13 @@ begin
       jSwap8 := bSeekPastNull; bSeekPastNull := bStopAtNull; bStopAtNull := jSwap8;
       jSwap16 := nBtm4; nBtm4 := nTop4; nTop4 := jSwap16;
     end;
+
+    { OP_SeekScan setup (wherecode.c:1965..1969).  When this loop is not
+      the outermost (iLevel>0) and uses the IN-skip-scan optimization,
+      the index cursor must start positioned on no row so the first
+      iteration enters the seek-or-step path cleanly. }
+    if (iLevel > 0) and ((pLoop^.wsFlags and WHERE_IN_SEEKSCAN) <> 0) then
+      sqlite3VdbeAddOp1(v, OP_NullRow, iIdxCur);
 
     { Equality-prefix codegen — emits the constraint-value computation,
       stores the affinity string in zStartAff for the per-vector trim. }
@@ -12627,6 +12634,26 @@ begin
       end;
       op4 := i32(aStartOp[(start_constraints shl 2) or (startEq shl 1) or bRev]);
       Assert(op4 <> 0);
+      { OP_SeekScan substitution (wherecode.c:2043..2061).  When IN_SEEKSCAN
+        is set and the chosen start probe is OP_SeekGE, prepend OP_SeekScan
+        whose p1 carries the tunable step budget (rounded up tenth of the
+        index's logarithmic row count).  When a range bound is present
+        (pRangeStart or pRangeEnd) the scan budget is patched into the next
+        opcode's address via ChangeP2 + p5=1 so the seek-or-step driver
+        knows to fall through; otherwise the JumpHere fix-up after the
+        end-bound emit threads the bypass. }
+      if ((pLoop^.wsFlags and WHERE_IN_SEEKSCAN) <> 0) and (op4 = OP_SeekGE) then
+      begin
+        addrSeekScan := sqlite3VdbeAddOp1(v, OP_SeekScan,
+                          (i32(pIdx4^.aiRowLogEst[0]) + 9) div 10);
+        if (pRangeStart <> nil) or (pRangeEnd <> nil) then
+        begin
+          sqlite3VdbeChangeP5(v, 1);
+          sqlite3VdbeChangeP2(v, addrSeekScan,
+                              sqlite3VdbeCurrentAddr(v) + 1);
+          addrSeekScan := 0;
+        end;
+      end;
       sqlite3VdbeAddOp4Int(v, op4, iIdxCur, addrNxt, regBase4, nConstraint);
     end;
 
@@ -12671,6 +12698,10 @@ begin
     begin
       op4 := i32(aEndOp[bRev * 2 + endEq]);
       sqlite3VdbeAddOp4Int(v, op4, iIdxCur, addrNxt, regBase4, nConstraint);
+      { OP_SeekScan back-patch (wherecode.c:2146).  When OP_SeekScan was
+        emitted without a range bound, ChangeP2 above was skipped so the
+        scan budget jumps over the start-bound seek to land here. }
+      if addrSeekScan <> 0 then sqlite3VdbeJumpHere(v, addrSeekScan);
     end;
 
     if (pLoop^.wsFlags and WHERE_IN_EARLYOUT) <> 0 then

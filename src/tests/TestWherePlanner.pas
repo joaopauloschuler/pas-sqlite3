@@ -5181,6 +5181,179 @@ begin
   sqlite3_close(db);
 end;
 
+{ ---- TestCodeOneLoopStartCase4InSeekScan — SCOLS20.  WHERE_INDEXED +
+       WHERE_COLUMN_EQ + WHERE_IN_SEEKSCAN at iLevel=1 (inner loop).
+       Verifies the OP_NullRow pre-positioning emit (wherecode.c:
+       1965..1969) before the equality-prefix codegen, and the OP_SeekScan
+       substitution (wherecode.c:2043..2061) wrapping the OP_SeekGE start
+       probe with the seek-or-step budget computed from
+       `(aiRowLogEst[0]+9) div 10`.  Since nEq=1 produces non-zero
+       end-bound nConstraint, OP_IdxGT is emitted and the JumpHere
+       back-patch (wherecode.c:2146) targets the post-end-bound address
+       (no pRangeStart/pRangeEnd → ChangeP2 path skipped, JumpHere fires
+       instead). ---- }
+procedure TestCodeOneLoopStartCase4InSeekScan;
+const
+  N_LEVEL = 2;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  v:         PVdbe;
+  rc:        i32;
+  bufWI:     array of Byte;
+  bufSL:     array of Byte;
+  pWInfo:    PWhereInfo;
+  pSL:       PSrcList;
+  pSItem:    PSrcItem;
+  pLevel:    PWhereLevel;
+  loop:      TWhereLoop;
+  term:      TWhereTerm;
+  ex, exR:   TExpr;
+  alterm:    array[0..0] of PWhereTerm;
+  pTab:      PTable2;
+  pIdx:      PIndex2;
+  aiCol:     array[0..1] of i16;
+  aSort:     array[0..0] of u8;
+  aCol:      array[0..0] of TColumn;
+  aRowLog:   array[0..1] of i16;
+  base, i:   i32;
+  pOp:       PVdbeOp;
+  notReady:  Bitmask;
+  rOut:      Bitmask;
+  fNullRow, fSeekScan, fSeekGE, fIdxGT: Boolean;
+  addrSeekScan, addrSeekGE, addrIdxGT: i32;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('SCOLS20 open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  pTab := PTable2(GetMem(SizeOf(TTable))); FillChar(pTab^, SizeOf(TTable), 0);
+  pIdx := PIndex2(GetMem(SizeOf(TIndex)));  FillChar(pIdx^, SizeOf(TIndex), 0);
+  FillChar(aCol, SizeOf(aCol), 0);
+  aCol[0].zCnName := PAnsiChar('x');
+  aCol[0].affinity := AnsiChar(SQLITE_AFF_BLOB);
+  pTab^.aCol := @aCol[0]; pTab^.nCol := 1;
+  pTab^.iPKey := -1;
+  pTab^.tabFlags := 0;            { HasRowid }
+  aiCol[0] := 0; aiCol[1] := -1;
+  pIdx^.pTable := pTab;
+  pIdx^.aiColumn := @aiCol[0];
+  pIdx^.nKeyCol := 1;
+  pIdx^.nColumn := 2;
+  aSort[0] := SQLITE_SO_ASC;
+  pIdx^.aSortOrder := @aSort[0];
+  { Logarithmic row count: 33 → (33+9) div 10 = 4 step budget. }
+  aRowLog[0] := 33; aRowLog[1] := 0;
+  pIdx^.aiRowLogEst := @aRowLog[0];
+
+  SetLength(bufSL, SizeOf(TSrcList) + SizeOf(TSrcItem));
+  FillChar(bufSL[0], Length(bufSL), 0);
+  pSL := PSrcList(@bufSL[0]);
+  pSL^.nSrc := 1; pSL^.nAlloc := 1;
+  pSItem := @SrcListItems(pSL)[0];
+  pSItem^.iCursor := 5;
+  pSItem^.fg.jointype := 0;
+
+  SetLength(bufWI, SZ_WHEREINFO(N_LEVEL));
+  FillChar(bufWI[0], Length(bufWI), 0);
+  pWInfo := PWhereInfo(@bufWI[0]);
+  pWInfo^.pParse   := @parse;
+  pWInfo^.pTabList := pSL;
+  pWInfo^.nLevel   := N_LEVEL;
+  pWInfo^.revMask  := 0;
+  pWInfo^.wctrlFlags := 0;
+  { Use level 1 (inner loop) so the iLevel>0 OP_NullRow gate fires. }
+  pLevel := @whereInfoLevels(pWInfo)[1];
+
+  FillChar(loop, SizeOf(loop), 0);
+  FillChar(term, SizeOf(term), 0); term.iParent := -1;
+  FillChar(ex,   SizeOf(ex),   0);
+  FillChar(exR,  SizeOf(exR),  0);
+
+  ex.op := TK_EQ;
+  ex.pRight := @exR;
+  exR.op := TK_INTEGER;
+  exR.flags := EP_IntValue;
+  exR.u.iValue := 42;
+  term.pExpr := @ex;
+  term.eOperator := WO_EQ;
+  alterm[0] := @term;
+
+  loop.aLTerm  := @alterm[0];
+  loop.nLTerm  := 1;
+  loop.wsFlags := WHERE_INDEXED or WHERE_COLUMN_EQ or WHERE_IN_SEEKSCAN;
+  loop.u.btree.nEq := 1;
+  loop.u.btree.nBtm := 0;
+  loop.u.btree.nTop := 0;
+  loop.u.btree.pIndex := pIdx;
+  loop.nSkip := 0;
+
+  pLevel^.pWLoop := @loop;
+  pLevel^.iFrom  := 0;
+  pLevel^.iIdxCur := 6;
+  pLevel^.iTabCur := 5;
+  pLevel^.addrBrk  := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.addrHalt := sqlite3VdbeMakeLabel(@parse);
+  pLevel^.regFilter := 0;
+  pLevel^.op := 99;
+  pLevel^.p1 := 0; pLevel^.p2 := 0; pLevel^.p3 := 0; pLevel^.p5 := 0;
+  pLevel^.iLeftJoin := 0;
+  pLevel^.u.in_nIn := 0;
+
+  notReady := not Bitmask(0);
+  base := sqlite3VdbeCurrentAddr(v);
+  rOut := sqlite3WhereCodeOneLoopStart(@parse, v, pWInfo, 1, pLevel, notReady);
+  Check('SCOLS20 returns pLevel^.notReady', rOut = pLevel^.notReady);
+
+  fNullRow := False; fSeekScan := False; fSeekGE := False; fIdxGT := False;
+  addrSeekScan := -1; addrSeekGE := -1;
+  addrIdxGT := -1;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do
+  begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_NullRow) and (pOp^.p1 = pLevel^.iIdxCur) then
+      fNullRow := True;
+    if pOp^.opcode = OP_SeekScan then
+    begin
+      fSeekScan := True;
+      addrSeekScan := i;
+    end;
+    if (pOp^.opcode = OP_SeekGE) and (pOp^.p1 = pLevel^.iIdxCur) then
+    begin
+      fSeekGE := True;
+      addrSeekGE := i;
+    end;
+    if (pOp^.opcode = OP_IdxGT) and (pOp^.p1 = pLevel^.iIdxCur) then
+    begin
+      fIdxGT := True;
+      addrIdxGT := i;
+    end;
+  end;
+  Check('SCOLS20 OP_NullRow emitted on iIdxCur (iLevel>0 + IN_SEEKSCAN)',
+        fNullRow);
+  Check('SCOLS20 OP_SeekScan emitted (IN_SEEKSCAN + OP_SeekGE start)',
+        fSeekScan);
+  Check('SCOLS20 OP_SeekScan p1 = budget (33+9 div 10 = 4)',
+        (addrSeekScan >= 0) and
+        (PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(addrSeekScan) * SizeOf(TVdbeOp))^.p1 = 4));
+  Check('SCOLS20 OP_SeekGE follows OP_SeekScan',
+        (addrSeekGE >= 0) and (addrSeekGE = addrSeekScan + 1));
+  Check('SCOLS20 OP_IdxGT end-bound probe still emitted', fIdxGT);
+  { No pRangeStart/pRangeEnd → ChangeP2 path skipped → JumpHere fires
+    after the end-bound emit so SeekScan's p2 lands at the address one
+    past the IdxGT (i.e., the next instruction after the end-bound
+    probe), bypassing the seek and dropping into the body fall-through. }
+  Check('SCOLS20 OP_SeekScan p2 patched by JumpHere (post-IdxGT)',
+        (addrSeekScan >= 0) and (addrIdxGT >= 0) and
+        (PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(addrSeekScan) * SizeOf(TVdbeOp))^.p2
+          = addrIdxGT + 1));
+
+  FreeMem(pIdx); FreeMem(pTab);
+  sqlite3_close(db);
+end;
+
 { ---- TestCodeOneLoopStartCase4WithoutRowid — SCOLS19.
        wherecode.c:2177..2186.  Case 4 secondary-index scan on a
        WITHOUT-ROWID table: the table-row seek extracts each PK column
@@ -6071,6 +6244,7 @@ begin
   TestCodeOneLoopStart;
   TestCodeOneLoopStartCase3;
   TestCodeOneLoopStartCase4;
+  TestCodeOneLoopStartCase4InSeekScan;
   TestCodeOneLoopStartCase4WithoutRowid;
   TestCodeOneLoopStartCase6;
   TestGetTempRange;
