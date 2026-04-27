@@ -14153,15 +14153,156 @@ begin
   { Phase 6.5 stub }
 end;
 
-{ sqlite3Select — main SELECT code generator (stub until Phase 6.3+ full) }
+{ sqlite3Select — main SELECT code generator.
+
+  Phase 6.9-bis step 11g.2.f sub-progress 5 (2026-04-27).
+
+  This is a *narrow* port of select.c:7578 that handles the trivial
+  single-table full-scan / WHERE shape and falls back to the prior
+  Phase 6.3 stub (return SQLITE_OK after SelectPrep) for every
+  non-trivial form.  The trivial gate matches the corpus row
+  `full table scan` exactly:
+
+    * single-source FROM (`pSrc^.nSrc = 1`)
+    * not a compound SELECT (`p^.pPrior = nil`)
+    * not aggregate / DISTINCT / window / GROUP BY / HAVING
+    * no ORDER BY / LIMIT / OFFSET
+    * source item is a real Table (not a subquery / vtab / CTE)
+    * destination is `SRT_Output`
+    * pEList exists and contains only TK_COLUMN / TK_AGG_COLUMN
+      references to the single source table
+
+  Inside the gate the body mirrors the C selectInnerLoop SRT_Output
+  arm: allocate the result-register block, drive the loop via
+  sqlite3WhereBegin(pWhere = p^.pWhere), emit one OP_Column per
+  pEList item via sqlite3ExprCodeGetColumnOfTable, finish with
+  OP_ResultRow + sqlite3WhereEnd.  The Init / Halt / Transaction /
+  Goto prologue/epilogue is supplied by sqlite3FinishCoding.
+
+  Everything outside the trivial gate (every WHERE corpus row that
+  is not `FULL`) still returns SQLITE_OK without emitting a body —
+  same surface as the Phase 6.3 stub — so the existing TestParser /
+  TestPrepareBasic / TestSelectBasic / TestExplainParity baselines
+  do not regress.
+
+  Future sub-progress under 11g.2.f will widen the gate one shape at
+  a time (rowid-EQ, INDEX_EQ, IN-list, multi-AND, …) until the full
+  20-row corpus flips green.  For each new shape the only change
+  here is to remove a guard and verify the existing inner-loop body
+  still produces byte-identical bytecode against the C oracle. }
 function sqlite3Select(pParse: PParse; p: PSelect;
   pDest: PSelectDest): i32;
+var
+  v:           PVdbe;
+  pTabList:    PSrcList;
+  pEList:      PExprList;
+  pItem:       PSrcItem;
+  pTab:        PTable2;
+  pE:          PExpr;
+  items:       PExprListItem;
+  nResultCol:  i32;
+  i:           i32;
+  pWInfo:      PWhereInfo;
 begin
-  { Phase 6.3 stub — full code generation requires build.c / parser (Phase 7) }
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
   if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
-  Result := SQLITE_OK;
+
+  { Trivial-gate guards — bail out (same as the prior stub) for any
+    non-full-scan / non-single-table / non-Output form.  Each of these
+    will be lifted as the corresponding shape lands under 11g.2.f. }
+  if pDest = nil then begin Result := SQLITE_OK; Exit; end;
+  if pDest^.eDest <> SRT_Output then begin Result := SQLITE_OK; Exit; end;
+  if p^.pPrior <> nil then begin Result := SQLITE_OK; Exit; end;
+  if p^.pSrc = nil then begin Result := SQLITE_OK; Exit; end;
+  if p^.pSrc^.nSrc <> 1 then begin Result := SQLITE_OK; Exit; end;
+  if p^.pEList = nil then begin Result := SQLITE_OK; Exit; end;
+  if p^.pEList^.nExpr < 1 then begin Result := SQLITE_OK; Exit; end;
+  if p^.pWhere     <> nil then begin Result := SQLITE_OK; Exit; end;
+  if p^.pGroupBy   <> nil then begin Result := SQLITE_OK; Exit; end;
+  if p^.pHaving    <> nil then begin Result := SQLITE_OK; Exit; end;
+  if p^.pOrderBy   <> nil then begin Result := SQLITE_OK; Exit; end;
+  if p^.pLimit     <> nil then begin Result := SQLITE_OK; Exit; end;
+  if p^.pWin       <> nil then begin Result := SQLITE_OK; Exit; end;
+  if (p^.selFlags and (SF_Distinct or SF_Aggregate or SF_Compound)) <> 0 then
+  begin
+    Result := SQLITE_OK; Exit;
+  end;
+
+  pTabList := p^.pSrc;
+  pItem    := SrcListItems(pTabList);
+  pTab     := pItem^.pSTab;
+
+  { Source must be a real, non-virtual base table — no subqueries, no
+    vtabs, no view expansion in this slice. }
+  if pTab = nil then begin Result := SQLITE_OK; Exit; end;
+  if pItem^.fg.fgBits and $01 <> 0 then begin Result := SQLITE_OK; Exit; end;
+  if pTab^.eTabType = TABTYP_VTAB then begin Result := SQLITE_OK; Exit; end;
+  if (pTab^.tabFlags and TF_Ephemeral) <> 0 then begin Result := SQLITE_OK; Exit; end;
+
+  { Result columns must be plain column references resolved by name
+    resolution (TK_COLUMN with iTable = pItem^.iCursor and a non-nil
+    pTab).  Anything else (literals, expressions, aggregates) drops to
+    the stub. }
+  pEList := p^.pEList;
+  items  := ExprListItems(pEList);
+  for i := 0 to pEList^.nExpr - 1 do
+  begin
+    pE := items[i].pExpr;
+    if pE = nil then begin Result := SQLITE_OK; Exit; end;
+    if (pE^.op <> TK_COLUMN) and (pE^.op <> TK_AGG_COLUMN) then
+    begin
+      Result := SQLITE_OK; Exit;
+    end;
+    if pE^.iTable <> pItem^.iCursor then
+    begin
+      Result := SQLITE_OK; Exit;
+    end;
+    if pE^.y.pTab = nil then begin Result := SQLITE_OK; Exit; end;
+  end;
+
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
+
+  { Column-name header — mirrors select.c:7682..7684 (eDest==SRT_Output). }
+  sqlite3GenerateColumnNames(pParse, p);
+
+  { Allocate the contiguous result-register block (selectInnerLoop:1179..1196). }
+  nResultCol := pEList^.nExpr;
+  if pDest^.iSdst = 0 then
+  begin
+    pDest^.iSdst   := pParse^.nMem + 1;
+    pParse^.nMem   := pParse^.nMem + nResultCol;
+  end
+  else if pDest^.iSdst + nResultCol > pParse^.nMem then
+    pParse^.nMem := pParse^.nMem + nResultCol;
+  pDest^.nSdst := nResultCol;
+
+  { Drive the WHERE machinery for the (single, no-WHERE) loop body.
+    sqlite3WhereBegin emits OpenRead + Rewind for the only level. }
+  pWInfo := sqlite3WhereBegin(pParse, pTabList, p^.pWhere, p^.pOrderBy,
+                              pEList, p, 0, 0);
+  if pWInfo = nil then
+  begin
+    Result := SQLITE_ERROR; Exit;
+  end;
+
+  { Inner loop body — one OP_Column per result column (selectInnerLoop:1197). }
+  for i := 0 to nResultCol - 1 do
+  begin
+    pE := items[i].pExpr;
+    sqlite3ExprCodeGetColumnOfTable(v, pTab, pItem^.iCursor, pE^.iColumn,
+                                    pDest^.iSdst + i);
+  end;
+
+  { SRT_Output disposal (selectInnerLoop:1304 case SRT_Output). }
+  sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+
+  { Close the loop — emits OP_Next and resolves the iBreak label. }
+  sqlite3WhereEnd(pWInfo);
+
+  if pParse^.nErr <> 0 then Result := SQLITE_ERROR
+  else Result := SQLITE_OK;
 end;
 
 { sqlite3DeleteTable — free a Table object and all its substructure }

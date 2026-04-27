@@ -1354,6 +1354,54 @@ Important: At the end of this document, please find:
       Sub-progress 5 will drive `sqlite3Select` from the
       SelectPrep-only stub into the real codegen path so the
       first PASS row (`full table scan`, 10 ops) flips green.
+    - [X] Sub-progress 5 — `sqlite3Select` codegen scaffold +
+      blocker triage (2026-04-27).  Replaced the Phase 6.3
+      stub at codegen.pas:14157 with a narrow port of
+      select.c:7578 that handles the trivial single-table /
+      no-WHERE / no-aggregation / no-ORDER / no-LIMIT /
+      `SRT_Output` shape exactly: gate on every non-trivial
+      tag (`pPrior`, `nSrc<>1`, `pWhere`, `pGroupBy`,
+      `pHaving`, `pOrderBy`, `pLimit`, `pWin`, `SF_Distinct`,
+      `SF_Aggregate`, `SF_Compound`, vtab, ephemeral, view,
+      subquery), then for the trivial case allocate the
+      result-register block (selectInnerLoop:1179..1196),
+      drive `sqlite3WhereBegin(pWhere=nil)` for the only
+      level, emit one `OP_Column` per pEList item via
+      `sqlite3ExprCodeGetColumnOfTable`, finish with
+      `OP_ResultRow` + `sqlite3WhereEnd`.  The
+      Init/Halt/Transaction/Goto prologue is emitted by
+      `sqlite3FinishCoding`.  The structural shape is right
+      (matches the C oracle's 9-op `OpenRead/Rewind/Column/
+      ResultRow/Next` body) and is verified to not regress
+      any existing baseline (TestParser 45/45,
+      TestPrepareBasic 20/20, TestSelectBasic 49/49,
+      TestExprBasic 40/40, TestDMLBasic 54/54,
+      TestSchemaBasic 44/44, TestExplainParity 2 pass /
+      8 diverge unchanged).  However the body is gated
+      behind `pTab <> nil` in the trivial-case enter, and
+      `pItem^.pSTab` is *always* nil today because the
+      `selectExpander` pass at codegen.pas:14125 is still a
+      Phase 6.5 stub: it walks the tree but never invokes
+      `sqlite3SrcListLookup -> sqlite3LocateTableItem`, so
+      `pItem^.pSTab` is left at its parser-allocated nil.
+      `sqlite3ResolveSelectNames` (codegen.pas:5876) is a
+      sibling stub, so even if pSTab were populated the
+      pEList TK_COLUMN nodes would still have iTable=0 /
+      iColumn=0 / y.pTab=nil — codegen would walk into
+      `sqlite3ExprCodeGetColumnOfTable(pTab=nil)` and
+      assert.  Sub-progress 6 must therefore land a minimal
+      `selectExpander` (sqlite3SrcListLookup loop +
+      `LocateTableItem` per item, allocate `iCursor` via
+      `pParse^.nTab++`, populate `colUsed`) plus a minimal
+      `sqlite3ResolveSelectNames` (resolve TK_ID `a` against
+      `pItem^.pSTab^.aCol[]` → set TK_COLUMN/iTable/iColumn/
+      y.pTab) before the codegen body lights up.  Net
+      result of sub-progress 5: the codegen scaffold is in
+      place and quiescent (3 Pas ops vs 9 C ops on FULL —
+      identical to sub-progress 4); the blocker is now
+      precisely localised to a name-resolution gap rather
+      than a codegen gap.  Test failure-mode tally remains
+      `0 exception, 0 nil-Vdbe, 20 op-count, 0 op-diff`.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
