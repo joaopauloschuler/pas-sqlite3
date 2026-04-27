@@ -2381,6 +2381,35 @@ procedure codeDeferredSeek(pWInfo: PWhereInfo; pIdx: PIndex2;
 procedure sqlite3WhereAddScanStatus(v: PVdbe; pSrclist: PSrcList;
   pLvl: PWhereLevel; addrExplain: i32);
 
+{ Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers, batch 4.
+  explainIndexColumnName (wherecode.c:28..33) returns a printable name for the
+  i-th key column of pIdx — "<expr>" for XN_EXPR slots, "rowid" for XN_ROWID,
+  otherwise the underlying table column's zCnName.
+  computeIndexAffStr (insert.c:75..109) lazily allocates pIdx^.zColAff, walks
+  every key column, and stores its comparison affinity (clamped to
+  AFF_BLOB..AFF_NUMERIC).  XN_ROWID slots → AFF_INTEGER, XN_EXPR slots →
+  sqlite3ExprAffinity of the indexed expression.  sqlite3IndexAffinityStr
+  (insert.c:111..114) is the cached-accessor entry point.
+  codeEqualityTerm (wherecode.c:803..845) emits VDBE for one equality term
+  (TK_EQ / TK_IS / TK_ISNULL); leaves the value in iTarget (or another
+  register, returned).  TK_IN dispatches to codeINTerm.
+  codeINTerm (wherecode.c:668..784) IN-loop builder — currently a stub
+  (sqlite3FindInIndex not yet ported) — must not be hit by callers at this
+  point; defers the full port to the next sub-progress.
+  codeAllEqualityTerms (wherecode.c:892..995) emits the contiguous register
+  block for every == / IN / ISNULL term that the chosen index will use as
+  a key prefix; computes the affinity string returned through pzAff (caller
+  frees with sqlite3DbFree). }
+function  explainIndexColumnName(pIdx: PIndex2; i: i32): PAnsiChar;
+function  computeIndexAffStr(db: PTsqlite3; pIdx: PIndex2): PAnsiChar;
+function  sqlite3IndexAffinityStr(db: PTsqlite3; pIdx: PIndex2): PAnsiChar;
+procedure codeINTerm(pParse: PParse; pTerm: PWhereTerm;
+  pLevel: PWhereLevel; iEq: i32; bRev: i32; iTarget: i32);
+function  codeEqualityTerm(pParse: PParse; pTerm: PWhereTerm;
+  pLevel: PWhereLevel; iEq: i32; bRev: i32; iTarget: i32): i32;
+function  codeAllEqualityTerms(pParse: PParse; pLevel: PWhereLevel;
+  bRev: i32; nExtraReg: i32; pzAff: PPAnsiChar): i32;
+
 { Index helpers }
 procedure sqlite3FreeIndex(db: PTsqlite3; p: PIndex2);
 procedure sqlite3UnlinkAndDeleteIndex(db: PTsqlite3; iDb: i32;
@@ -19547,6 +19576,193 @@ procedure sqlite3WindowCodeStep(pParse: PParse; p: PSelect;
   pWInfo: Pointer; regGosub: i32; addrGosub: i32);
 begin
   { Phase 6.7 stub — full VDBE window code generation deferred to Phase 7+ }
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers,
+  batch 4.
+
+  See forward-decl block (~line 2400) for descriptions.
+  =========================================================================== }
+
+function explainIndexColumnName(pIdx: PIndex2; i: i32): PAnsiChar;
+var
+  iCol: i16;
+begin
+  iCol := pIdx^.aiColumn[i];
+  if iCol = XN_EXPR  then Exit(PAnsiChar('<expr>'));
+  if iCol = XN_ROWID then Exit(PAnsiChar('rowid'));
+  Result := pIdx^.pTable^.aCol[iCol].zCnName;
+end;
+
+function computeIndexAffStr(db: PTsqlite3; pIdx: PIndex2): PAnsiChar;
+var
+  n:    i32;
+  pTab: PTable2;
+  x:    i16;
+  aff:  AnsiChar;
+  pCol: PColumn;
+begin
+  pTab := pIdx^.pTable;
+  pIdx^.zColAff := PAnsiChar(sqlite3DbMallocRaw(db, u64(pIdx^.nColumn) + 1));
+  if pIdx^.zColAff = nil then begin
+    sqlite3OomFault(db);
+    Exit(nil);
+  end;
+  for n := 0 to pIdx^.nColumn - 1 do begin
+    x := pIdx^.aiColumn[n];
+    if x >= 0 then begin
+      pCol := @pTab^.aCol[x];
+      aff  := pCol^.affinity;
+    end else if x = XN_ROWID then begin
+      aff := AnsiChar(SQLITE_AFF_INTEGER);
+    end else begin
+      Assert(x = XN_EXPR);
+      Assert(pIdx^.aColExpr <> nil);
+      aff := sqlite3ExprAffinity(PExprListItem(PByte(ExprListItems(pIdx^.aColExpr))
+                                  + n * SZ_EXPRLIST_ITEM)^.pExpr);
+    end;
+    if Byte(aff) < SQLITE_AFF_BLOB    then aff := AnsiChar(SQLITE_AFF_BLOB);
+    if Byte(aff) > SQLITE_AFF_NUMERIC then aff := AnsiChar(SQLITE_AFF_NUMERIC);
+    pIdx^.zColAff[n] := aff;
+  end;
+  pIdx^.zColAff[pIdx^.nColumn] := #0;
+  Result := pIdx^.zColAff;
+end;
+
+function sqlite3IndexAffinityStr(db: PTsqlite3; pIdx: PIndex2): PAnsiChar;
+begin
+  if pIdx^.zColAff = nil then Result := computeIndexAffStr(db, pIdx)
+  else                       Result := pIdx^.zColAff;
+end;
+
+procedure codeINTerm(pParse: PParse; pTerm: PWhereTerm;
+  pLevel: PWhereLevel; iEq: i32; bRev: i32; iTarget: i32);
+begin
+  { wherecode.c:668..784 — the IN-loop builder.  Full implementation requires
+    sqlite3FindInIndex (select.c subselect codegen, not yet ported).  Caller
+    contract for this stub: never invoke until that prerequisite lands.
+    Coverage at the next sub-progress. }
+  Assert(False, 'codeINTerm not yet ported (depends on sqlite3FindInIndex)');
+end;
+
+function codeEqualityTerm(pParse: PParse; pTerm: PWhereTerm;
+  pLevel: PWhereLevel; iEq: i32; bRev: i32; iTarget: i32): i32;
+var
+  pX:   PExpr;
+  iReg: i32;
+begin
+  pX := pTerm^.pExpr;
+  Assert(pLevel^.pWLoop^.aLTerm[iEq] = pTerm);
+  Assert(iTarget > 0);
+
+  if (pX^.op = TK_EQ) or (pX^.op = TK_IS) then begin
+    iReg := sqlite3ExprCodeTarget(pParse, pX^.pRight, iTarget);
+  end else if pX^.op = TK_ISNULL then begin
+    iReg := iTarget;
+    sqlite3VdbeAddOp2(pParse^.pVdbe, OP_Null, 0, iReg);
+  end else begin
+    Assert(pX^.op = TK_IN);
+    iReg := iTarget;
+    codeINTerm(pParse, pTerm, pLevel, iEq, bRev, iTarget);
+  end;
+
+  { Disable the term unless this is a transitive-equivalence loop where the
+    constraint cannot be safely elided (see sqlite.org forum eb8613976a). }
+  if ((pLevel^.pWLoop^.wsFlags and WHERE_TRANSCONS) = 0)
+     or ((pTerm^.eOperator and WO_EQUIV) = 0) then
+  begin
+    disableTerm(pLevel, pTerm);
+  end;
+
+  Result := iReg;
+end;
+
+function codeAllEqualityTerms(pParse: PParse; pLevel: PWhereLevel;
+  bRev: i32; nExtraReg: i32; pzAff: PPAnsiChar): i32;
+var
+  nEq, nSkip:    u16;
+  v:             PVdbe;
+  pIdx:          PIndex2;
+  pTerm:         PWhereTerm;
+  pLoop:         PWhereLoop;
+  j:             i32;
+  regBase, nReg: i32;
+  zAff:          PAnsiChar;
+  iIdxCur:       i32;
+  jOp:           i32;
+  r1:            i32;
+  pRight:        PExpr;
+  src:           PAnsiChar;
+begin
+  pLoop := pLevel^.pWLoop;
+  Assert((pLoop^.wsFlags and WHERE_VIRTUALTABLE) = 0);
+  nEq   := pLoop^.u.btree.nEq;
+  nSkip := pLoop^.nSkip;
+  pIdx  := pLoop^.u.btree.pIndex;
+  Assert(pIdx <> nil);
+  v := pParse^.pVdbe;
+
+  regBase := pParse^.nMem + 1;
+  nReg    := nEq + nExtraReg;
+  pParse^.nMem := pParse^.nMem + nReg;
+
+  src := sqlite3IndexAffinityStr(pParse^.db, pIdx);
+  if src <> nil then zAff := sqlite3DbStrDup(pParse^.db, src) else zAff := nil;
+  Assert((zAff <> nil) or (pParse^.db^.mallocFailed <> 0));
+
+  if nSkip <> 0 then begin
+    iIdxCur := pLevel^.iIdxCur;
+    sqlite3VdbeAddOp3(v, OP_Null, 0, regBase, regBase + nSkip - 1);
+    if bRev <> 0 then sqlite3VdbeAddOp1(v, OP_Last,   iIdxCur)
+                 else sqlite3VdbeAddOp1(v, OP_Rewind, iIdxCur);
+    jOp := sqlite3VdbeAddOp0(v, OP_Goto);
+    Assert(pLevel^.addrSkip = 0);
+    if bRev <> 0 then
+      pLevel^.addrSkip := sqlite3VdbeAddOp4Int(v, OP_SeekLT, iIdxCur, 0, regBase, nSkip)
+    else
+      pLevel^.addrSkip := sqlite3VdbeAddOp4Int(v, OP_SeekGT, iIdxCur, 0, regBase, nSkip);
+    sqlite3VdbeJumpHere(v, jOp);
+    for j := 0 to nSkip - 1 do
+      sqlite3VdbeAddOp3(v, OP_Column, iIdxCur, j, regBase + j);
+  end;
+
+  Assert((zAff = nil) or (i32(StrLen(zAff)) >= nEq));
+  for j := nSkip to nEq - 1 do begin
+    pTerm := pLoop^.aLTerm[j];
+    Assert(pTerm <> nil);
+    r1 := codeEqualityTerm(pParse, pTerm, pLevel, j, bRev, regBase + j);
+    if r1 <> regBase + j then begin
+      if nReg = 1 then begin
+        sqlite3ReleaseTempReg(pParse, regBase);
+        regBase := r1;
+      end else begin
+        sqlite3VdbeAddOp2(v, OP_Copy, r1, regBase + j);
+      end;
+    end;
+
+    if (pTerm^.eOperator and WO_IN) <> 0 then begin
+      if (pTerm^.pExpr^.flags and EP_xIsSelect) <> 0 then begin
+        { Affinity already applied by sqlite3FindInIndex — drop ours. }
+        if zAff <> nil then zAff[j] := AnsiChar(SQLITE_AFF_BLOB);
+      end;
+    end else if (pTerm^.eOperator and WO_ISNULL) = 0 then begin
+      pRight := pTerm^.pExpr^.pRight;
+      if ((pTerm^.wtFlags and TERM_IS) = 0) and (sqlite3ExprCanBeNull(pRight) <> 0) then
+      begin
+        sqlite3VdbeAddOp2(v, OP_IsNull, regBase + j, pLevel^.addrBrk);
+      end;
+      if pParse^.nErr = 0 then begin
+        Assert(pParse^.db^.mallocFailed = 0);
+        if Byte(sqlite3CompareAffinity(pRight, zAff[j])) = SQLITE_AFF_BLOB then
+          zAff[j] := AnsiChar(SQLITE_AFF_BLOB);
+        if sqlite3ExprNeedsNoAffinityChange(pRight, zAff[j]) <> 0 then
+          zAff[j] := AnsiChar(SQLITE_AFF_BLOB);
+      end;
+    end;
+  end;
+  pzAff^ := zAff;
+  Result := regBase;
 end;
 
 end.

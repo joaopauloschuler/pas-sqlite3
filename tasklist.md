@@ -576,6 +576,37 @@ Important: At the end of this document, please find:
       (OP_DeferredSeek + bDeferredSeek + no P4 outside OR/RIGHT_JOIN;
       P4_INTARRAY attached under WHERE_OR_SUBCLAUSE with writeMask=0;
       P4 suppressed when writeMask<>0).
+    - [X] Leaf helpers, batch 4 — `explainIndexColumnName`
+      (wherecode.c:28..33), `computeIndexAffStr` + `sqlite3IndexAffinityStr`
+      (insert.c:75..114), `codeEqualityTerm` (wherecode.c:803..845),
+      `codeAllEqualityTerms` (wherecode.c:892..995), and a `codeINTerm`
+      stub (wherecode.c:668..784) that asserts on entry — full IN-loop
+      builder deferred until `sqlite3FindInIndex` lands in the next sub-
+      progress.  explainIndexColumnName returns the printable name of
+      the i-th index key column ("<expr>" for XN_EXPR slots, "rowid" for
+      XN_ROWID, otherwise pTab^.aCol[].zCnName).  computeIndexAffStr
+      lazily allocates pIdx^.zColAff and walks every key column writing
+      its comparison affinity into the cache, clamped to
+      [AFF_BLOB..AFF_NUMERIC] (so AFF_INTEGER and AFF_REAL slots collapse
+      to AFF_NUMERIC, matching upstream).  sqlite3IndexAffinityStr is
+      the cached-accessor wrapper.  codeEqualityTerm dispatches on the
+      term operator: TK_EQ/TK_IS → sqlite3ExprCodeTarget on pRight,
+      TK_ISNULL → OP_Null into iTarget, TK_IN → codeINTerm.  Disables
+      the term unless the loop is WHERE_TRANSCONS + WO_EQUIV (per
+      sqlite.org forum eb8613976a).  codeAllEqualityTerms allocates
+      nEq+nExtraReg contiguous registers, copies the cached affinity
+      string, threads each equality term through codeEqualityTerm, then
+      patches AFF_BLOB into the affinity slot when the RHS already
+      forced its own affinity (WO_IN / WO_xxx with EP_xIsSelect, BLOB
+      compare, or sqlite3ExprNeedsNoAffinityChange).  Skip-scan prelude
+      (nSkip>0) emits OP_Null + OP_Last/OP_Rewind + OP_Goto + OP_SeekGT/
+      LT + per-skipped OP_Column verbatim.  Gate:
+      `TestWherePlanner.pas` (392/392): EICN1..EICN3 (regular column,
+      XN_ROWID, XN_EXPR), CIA1..CIA3 (allocation, INTEGER→NUMERIC and
+      AFF_NONE→BLOB clamps), IAS1 (cached path), CET1..CET4 (TK_ISNULL
+      OP_Null, TK_EQ INTEGER, TK_IS TERM_CODED, transitive EQUIV no-
+      disable), CAET1..CAET3 (nEq=0 affinity-only, nEq=1 TK_EQ register
+      block, nExtraReg=1 register accounting under TK_IS).
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix

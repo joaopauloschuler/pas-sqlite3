@@ -3510,6 +3510,300 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- explainIndexColumnName / sqlite3IndexAffinityStr (batch 4) ----- }
+
+procedure TestExplainIndexColumnName;
+var
+  pTab:  PTable2;
+  pIdx:  PIndex2;
+  aiCol: array[0..2] of i16;
+  aCol:  array[0..2] of TColumn;
+  z:     PAnsiChar;
+begin
+  pTab := PTable2(GetMem(SizeOf(TTable))); FillChar(pTab^, SizeOf(TTable), 0);
+  pIdx := PIndex2(GetMem(SizeOf(TIndex)));  FillChar(pIdx^, SizeOf(TIndex), 0);
+  FillChar(aCol, SizeOf(aCol), 0);
+  aCol[0].zCnName := PAnsiChar('alpha');
+  aCol[1].zCnName := PAnsiChar('beta');
+  aCol[2].zCnName := PAnsiChar('gamma');
+  pTab^.aCol := @aCol[0];
+  pTab^.nCol := 3;
+  pIdx^.pTable := pTab;
+  aiCol[0] := 1;            { regular column "beta" }
+  aiCol[1] := XN_ROWID;     { rowid alias            }
+  aiCol[2] := XN_EXPR;      { expression slot        }
+  pIdx^.aiColumn := @aiCol[0];
+  pIdx^.nColumn  := 3;
+
+  z := explainIndexColumnName(pIdx, 0);
+  Check('EICN1 column 0 → "beta"',  StrComp(z, PAnsiChar('beta')) = 0);
+  z := explainIndexColumnName(pIdx, 1);
+  Check('EICN2 XN_ROWID → "rowid"', StrComp(z, PAnsiChar('rowid')) = 0);
+  z := explainIndexColumnName(pIdx, 2);
+  Check('EICN3 XN_EXPR → "<expr>"', StrComp(z, PAnsiChar('<expr>')) = 0);
+
+  FreeMem(pIdx); FreeMem(pTab);
+end;
+
+procedure TestIndexAffinityStr;
+var
+  db:    PTsqlite3;
+  pTab:  PTable2;
+  pIdx:  PIndex2;
+  aiCol: array[0..2] of i16;
+  aCol:  array[0..2] of TColumn;
+  z, z2: PAnsiChar;
+  rc:    i32;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('IAS open', rc = SQLITE_OK);
+  pTab := PTable2(GetMem(SizeOf(TTable))); FillChar(pTab^, SizeOf(TTable), 0);
+  pIdx := PIndex2(GetMem(SizeOf(TIndex)));  FillChar(pIdx^, SizeOf(TIndex), 0);
+  FillChar(aCol, SizeOf(aCol), 0);
+  aCol[0].zCnName := PAnsiChar('a'); aCol[0].affinity := AnsiChar(SQLITE_AFF_TEXT);
+  aCol[1].zCnName := PAnsiChar('b'); aCol[1].affinity := AnsiChar(SQLITE_AFF_NUMERIC);
+  aCol[2].zCnName := PAnsiChar('c'); aCol[2].affinity := AnsiChar(SQLITE_AFF_BLOB);
+  pTab^.aCol := @aCol[0]; pTab^.nCol := 3;
+  pIdx^.pTable := pTab;
+  aiCol[0] := 0;            { a → TEXT     }
+  aiCol[1] := XN_ROWID;     { → INTEGER    }
+  aiCol[2] := 2;            { c → BLOB     }
+  pIdx^.aiColumn := @aiCol[0];
+  pIdx^.nColumn  := 3;
+
+  { CIA1 — first call materialises pIdx^.zColAff. }
+  Check('CIA1 zColAff initially nil', pIdx^.zColAff = nil);
+  z := computeIndexAffStr(db, pIdx);
+  Check('CIA1 zColAff allocated',     pIdx^.zColAff <> nil);
+  Check('CIA1 returned ptr equals zColAff', z = pIdx^.zColAff);
+
+  { CIA2 — payload: TEXT, INTEGER, BLOB clamped within [BLOB..NUMERIC]. }
+  Check('CIA2 [0] = TEXT',    Byte(z[0]) = SQLITE_AFF_TEXT);
+  { XN_ROWID is INTEGER then clamped down to NUMERIC by the upstream
+    `aff>SQLITE_AFF_NUMERIC ? aff = NUMERIC` guard (insert.c:105). }
+  Check('CIA2 [1] = NUMERIC (clamped from INTEGER)',
+        Byte(z[1]) = SQLITE_AFF_NUMERIC);
+  Check('CIA2 [2] = BLOB',    Byte(z[2]) = SQLITE_AFF_BLOB);
+  Check('CIA2 NUL terminator',z[3] = #0);
+
+  { IAS1 — wrapper hits the cached path on subsequent calls. }
+  z2 := sqlite3IndexAffinityStr(db, pIdx);
+  Check('IAS1 cached path returns same buffer', z2 = z);
+
+  { CIA3 — clamp test: AFF_NONE ($40) below BLOB clamps up to BLOB. }
+  sqlite3DbFree(db, pIdx^.zColAff);
+  pIdx^.zColAff := nil;
+  aCol[0].affinity := AnsiChar($40);                { AFF_NONE }
+  aCol[1].affinity := AnsiChar($50);                { > AFF_NUMERIC, clamps down }
+  aiCol[1] := 1;                                    { use real column slot }
+  z := computeIndexAffStr(db, pIdx);
+  Check('CIA3 < BLOB clamps up',     Byte(z[0]) = SQLITE_AFF_BLOB);
+  Check('CIA3 > NUMERIC clamps down',Byte(z[1]) = SQLITE_AFF_NUMERIC);
+
+  sqlite3DbFree(db, pIdx^.zColAff);
+  FreeMem(pIdx); FreeMem(pTab);
+  sqlite3_close(db);
+end;
+
+{ ----- codeEqualityTerm — TK_EQ / TK_IS / TK_ISNULL (batch 4) ----- }
+
+procedure TestCodeEqualityTerm;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  v:         PVdbe;
+  rc:        i32;
+  loop:      TWhereLoop;
+  level:     TWhereLevel;
+  term:      TWhereTerm;
+  ex:        TExpr;
+  exRight:   TExpr;
+  alterm:    array[0..0] of PWhereTerm;
+  reg, base, i: i32;
+  pOp:       PVdbeOp;
+  found:     Boolean;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('CET open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  FillChar(loop,    SizeOf(loop),    0);
+  FillChar(level,   SizeOf(level),   0);
+  FillChar(term,    SizeOf(term),    0);  term.iParent := -1;
+  FillChar(ex,      SizeOf(ex),      0);
+  FillChar(exRight, SizeOf(exRight), 0);
+
+  { ---- CET1 — TK_ISNULL: emits OP_Null into iTarget, returns iTarget. ---- }
+  ex.op    := TK_ISNULL;
+  term.pExpr := @ex;
+  term.eOperator := WO_ISNULL;
+  alterm[0] := @term;
+  loop.aLTerm  := @alterm[0];
+  loop.nLTerm  := 1;
+  level.pWLoop := @loop;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  reg  := codeEqualityTerm(@parse, @term, @level, 0, 0, 5);
+  Check('CET1 returns iTarget', reg = 5);
+  found := False;
+  for i := base to sqlite3VdbeCurrentAddr(v) - 1 do begin
+    pOp := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    if (pOp^.opcode = OP_Null) and (pOp^.p2 = 5) then found := True;
+  end;
+  Check('CET1 OP_Null emitted to reg 5', found);
+  Check('CET1 term flagged TERM_CODED', (term.wtFlags and TERM_CODED) <> 0);
+
+  { ---- CET2 — TK_EQ with TK_INTEGER RHS: pRight evaluated into a temp reg.
+       Term gets disabled. ---- }
+  FillChar(term, SizeOf(term), 0); term.iParent := -1;
+  term.pExpr := @ex;
+  term.eOperator := WO_EQ;
+  ex.op := TK_EQ;
+  ex.pRight := @exRight;
+  exRight.op := TK_INTEGER;
+  exRight.u.iValue := 42;
+  exRight.flags := EP_IntValue;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  reg := codeEqualityTerm(@parse, @term, @level, 0, 0, 7);
+  Check('CET2 returns positive register', reg > 0);
+  Check('CET2 emitted at least one opcode', sqlite3VdbeCurrentAddr(v) > base);
+  Check('CET2 term flagged TERM_CODED', (term.wtFlags and TERM_CODED) <> 0);
+
+  { ---- CET3 — TK_IS path also disables term. ---- }
+  FillChar(term, SizeOf(term), 0); term.iParent := -1;
+  term.pExpr := @ex;
+  term.eOperator := WO_IS;
+  ex.op := TK_IS;
+  reg := codeEqualityTerm(@parse, @term, @level, 0, 0, 9);
+  Check('CET3 TK_IS returns positive register', reg > 0);
+  Check('CET3 TK_IS term flagged TERM_CODED', (term.wtFlags and TERM_CODED) <> 0);
+
+  { ---- CET4 — WHERE_TRANSCONS + WO_EQUIV: term must NOT be auto-disabled. ---- }
+  FillChar(term, SizeOf(term), 0); term.iParent := -1;
+  term.pExpr := @ex;
+  term.eOperator := WO_EQ or WO_EQUIV;
+  ex.op := TK_EQ;
+  loop.wsFlags := WHERE_TRANSCONS;
+  reg := codeEqualityTerm(@parse, @term, @level, 0, 0, 11);
+  Check('CET4 transitive EQUIV term not disabled',
+        (term.wtFlags and TERM_CODED) = 0);
+
+  sqlite3_close(db);
+end;
+
+{ ----- codeAllEqualityTerms (batch 4) ----- }
+
+procedure TestCodeAllEqualityTerms;
+var
+  db:    PTsqlite3;
+  parse: TParse;
+  v:     PVdbe;
+  rc:    i32;
+  pTab:  PTable2;
+  pIdx:  PIndex2;
+  aiCol: array[0..1] of i16;
+  aCol:  array[0..1] of TColumn;
+  loop:  TWhereLoop;
+  level: TWhereLevel;
+  term:  TWhereTerm;
+  ex, exRight: TExpr;
+  alterm: array[0..0] of PWhereTerm;
+  base, regBase: i32;
+  zAff:  PAnsiChar;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('CAET open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  pTab := PTable2(GetMem(SizeOf(TTable))); FillChar(pTab^, SizeOf(TTable), 0);
+  pIdx := PIndex2(GetMem(SizeOf(TIndex)));  FillChar(pIdx^, SizeOf(TIndex), 0);
+  FillChar(aCol, SizeOf(aCol), 0);
+  { Use BLOB / TEXT (both within [BLOB..NUMERIC]) so the per-column clamp
+    does not change the values from the source affinity. }
+  aCol[0].zCnName := PAnsiChar('x'); aCol[0].affinity := AnsiChar(SQLITE_AFF_BLOB);
+  aCol[1].zCnName := PAnsiChar('y'); aCol[1].affinity := AnsiChar(SQLITE_AFF_TEXT);
+  pTab^.aCol := @aCol[0]; pTab^.nCol := 2;
+  pIdx^.pTable := pTab;
+  aiCol[0] := 0; aiCol[1] := 1;
+  pIdx^.aiColumn := @aiCol[0];
+  pIdx^.nColumn  := 2;
+  pIdx^.nKeyCol  := 2;
+
+  FillChar(loop,    SizeOf(loop),    0);
+  FillChar(level,   SizeOf(level),   0);
+  FillChar(term,    SizeOf(term),    0);
+  FillChar(ex,      SizeOf(ex),      0);
+  FillChar(exRight, SizeOf(exRight), 0);
+
+  { ---- CAET1 — nEq=0, nExtraReg=0: pure no-op apart from affinity-string
+       allocation; regBase advances by 0; affinity string copied from pIdx. ---- }
+  loop.u.btree.pIndex := pIdx;
+  loop.u.btree.nEq := 0;
+  loop.nSkip := 0;
+  level.pWLoop := @loop;
+
+  parse.nMem := 5;
+  base := sqlite3VdbeCurrentAddr(v);
+  regBase := codeAllEqualityTerms(@parse, @level, 0, 0, @zAff);
+  Check('CAET1 regBase = old nMem+1', regBase = 6);
+  Check('CAET1 nMem unchanged when nEq=nExtraReg=0', parse.nMem = 5);
+  Check('CAET1 no opcodes emitted',  sqlite3VdbeCurrentAddr(v) = base);
+  Check('CAET1 affinity string allocated', zAff <> nil);
+  if zAff <> nil then begin
+    Check('CAET1 zAff[0] = BLOB', Byte(zAff[0]) = SQLITE_AFF_BLOB);
+    Check('CAET1 zAff[1] = TEXT', Byte(zAff[1]) = SQLITE_AFF_TEXT);
+    sqlite3DbFree(db, zAff);
+  end;
+
+  { ---- CAET2 — nEq=1 with TK_EQ over an INTEGER literal: emits at least one
+       opcode (the literal), allocates 1 register, returns first one. ---- }
+  FillChar(term, SizeOf(term), 0); term.iParent := -1;
+  ex.op := TK_EQ;
+  ex.pRight := @exRight;
+  exRight.op := TK_INTEGER;
+  exRight.u.iValue := 100;
+  exRight.flags := EP_IntValue;
+  term.pExpr := @ex;
+  term.eOperator := WO_EQ;
+  alterm[0] := @term;
+  loop.aLTerm := @alterm[0];
+  loop.nLTerm := 1;
+  loop.u.btree.nEq := 1;
+
+  parse.nMem := 5;
+  base := sqlite3VdbeCurrentAddr(v);
+  regBase := codeAllEqualityTerms(@parse, @level, 0, 0, @zAff);
+  Check('CAET2 regBase = nMem+1 = 6', regBase = 6);
+  Check('CAET2 nMem advanced by 1',   parse.nMem = 6);
+  Check('CAET2 emitted at least one opcode', sqlite3VdbeCurrentAddr(v) > base);
+  Check('CAET2 term TERM_CODED',      (term.wtFlags and TERM_CODED) <> 0);
+  Check('CAET2 zAff[0] = BLOB',       Byte(zAff[0]) = SQLITE_AFF_BLOB);
+  if zAff <> nil then sqlite3DbFree(db, zAff);
+
+  { ---- CAET3 — TK_IS / WO_IS path tags TERM_IS so the IsNull guard is NOT
+       emitted; but we just verify the term gets coded (term flag toggling
+       already covered by CAET2). ---- }
+  FillChar(term, SizeOf(term), 0); term.iParent := -1;
+  term.pExpr := @ex;
+  term.eOperator := WO_IS;
+  term.wtFlags := TERM_IS;
+  ex.op := TK_IS;
+  loop.wsFlags := 0;
+  parse.nMem := 5;
+  regBase := codeAllEqualityTerms(@parse, @level, 0, 1, @zAff);
+  Check('CAET3 nExtraReg=1 advances nMem by 2', parse.nMem = 7);
+  Check('CAET3 regBase = 6',                    regBase = 6);
+  if zAff <> nil then sqlite3DbFree(db, zAff);
+
+  FreeMem(pIdx); FreeMem(pTab);
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -3556,6 +3850,10 @@ begin
   TestTableColumnToStorage;
   TestParseToplevel;
   TestCodeDeferredSeek;
+  TestExplainIndexColumnName;
+  TestIndexAffinityStr;
+  TestCodeEqualityTerm;
+  TestCodeAllEqualityTerms;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.
