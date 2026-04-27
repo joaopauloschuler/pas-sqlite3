@@ -8,6 +8,8 @@ Inspiration for structure, tone, and workflow: `../pas-core-math/`, `../pas-bzip
 
 REMEMBER: You are porting code. DO NOT RANDOMLY ADD TESTS unless you are looking for a specific bug. If you are porting existing tests in C, mention the origin of the test that you are porting.
 
+DO NOT default to the same work pattern as recent commits without questioning whether actually move the project forward.
+
 Goal: **behavioural and on-disk parity with the C reference.** The Pascal build
 must (a) produce byte-identical `.db` files for the same SQL input, (b) return
 identical query results, and (c) emit the same VDBE bytecode for the same SQL.
