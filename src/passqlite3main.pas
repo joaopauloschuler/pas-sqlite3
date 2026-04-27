@@ -1995,6 +1995,17 @@ begin
       if zArg4[0] <> #0 then c1 := sqlite3UpperToLower[u8(zArg4[1])];
     end;
     if (zArg4 <> nil) and (c0 = u8(Ord('c'))) and (c1 = u8(Ord('r'))) then begin
+      { Phase 6.9-bis 11g.2.f sub-progress 8: skip if already published.
+        Without a WHERE filter on the schema-row SELECT (see banner in
+        execParseSchemaImpl), OP_ParseSchema enumerates every existing
+        schema row each time it fires.  Already-published tables would
+        otherwise trip StartTable's "table already exists" collision
+        check on every subsequent CREATE TABLE step. }
+      if (zArg1 <> nil)
+         and (sqlite3FindTable(db, zArg1, db^.aDb[iDb].zDbSName) <> nil) then
+      begin
+        Result := 0; Exit;
+      end;
       { Branch (b) — re-prepare a CREATE statement to publish into
         pSchema^.tblHash.  init.busy is already 1 (set by the
         OP_ParseSchema worker / sqlite3InitOne); we save & restore
@@ -2067,9 +2078,20 @@ begin
     Result := SQLITE_ERROR;
     Exit;
   end;
+  { Phase 6.9-bis 11g.2.f sub-progress 8: drop the WHERE/ORDER BY from
+    the schema-cache SELECT until the Pascal sqlite3Select codegen path
+    can handle them productively (today it stub-bails to a 3-op
+    Init/Halt/Goto, returning zero rows, which leaves tblHash empty
+    after every CREATE TABLE).  Iterating every schema row instead is
+    safe because sqlite3InitCallback gates each row on
+    "table already in tblHash" before re-preparing the CREATE
+    statement, so already-published tables are no-ops on subsequent
+    OP_ParseSchema fires.  The %s zWhere argument is kept in the
+    function signature for caller compatibility but ignored. }
+  if zWhere = nil then ;  { unreferenced — see banner. }
   zSql := sqlite3MPrintf(db,
-            'SELECT*FROM"%w".%s WHERE %s ORDER BY rowid',
-            [db^.aDb[iDb].zDbSName, LEGACY_SCHEMA_TABLE, zWhere]);
+            'SELECT type,name,tbl_name,rootpage,sql FROM %s',
+            [LEGACY_SCHEMA_TABLE]);
   if zSql = nil then begin
     Result := SQLITE_NOMEM;
     Exit;

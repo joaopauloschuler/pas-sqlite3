@@ -11907,6 +11907,39 @@ begin
       pLoop^.wsFlags := pLoop^.wsFlags or WHERE_TRANSCONS;
     Exit(1);
   end;
+
+  { Phase 6.9-bis 11g.2.f sub-progress 8 — full-table-scan fallback.
+
+    Fires only when the WHERE clause is empty (pWC^.nBase = 0); if there
+    are unsatisfied WHERE terms (e.g. IN-list, BETWEEN, residual range)
+    the fallback would silently emit an unfiltered scan and silently
+    return wrong rows, so we must keep returning nil for those shapes
+    until per-row residual evaluation lands.  TestWhereSimple's M2a/M3a
+    tests pin this defensive nil-return.
+
+    Plain SCAN: open the table cursor with OP_OpenRead, OP_Rewind seeds
+    the iteration head, and sqlite3WhereEnd emits OP_Next at the iBreak
+    label.  pLoop^.wsFlags = 0 (no IPK/INDEX/ONEROW hints) gates the
+    Case-2 SeekRowid arm in sqlite3WhereBegin's tail off, so the tail
+    emits the OP_Rewind seed instead and the per-row body is appended
+    directly by the caller. }
+  if ((pWInfo^.wctrlFlags and WHERE_OR_SUBCLAUSE) = 0)
+     and (pWInfo^.sWC.nBase = 0) then
+  begin
+    pLoop^.wsFlags := 0; { plain scan — no IPK/INDEX/ONEROW hints }
+    pLoop^.nLTerm := 0;
+    pLoop^.u.btree.nEq := 0;
+    pLoop^.u.btree.pIndex := nil;
+    pLoop^.rRun := 33; { TUNING: full scan cost approximation. }
+    pLoop^.nOut := i16(20);
+    whereInfoLevels(pWInfo)[0].pWLoop := pLoop;
+    Assert((pWInfo^.sMaskSet.n = 1) and (iCur = pWInfo^.sMaskSet.ix[0]));
+    pLoop^.maskSelf := 1;
+    whereInfoLevels(pWInfo)[0].iTabCur := iCur;
+    pWInfo^.nRowOut := i16(20);
+    Exit(1);
+  end;
+
   Result := 0;
 end;
 
@@ -12171,35 +12204,56 @@ begin
     Exit(nil);
   end;
 
+  { Ensure schema cookie / OP_Transaction prologue is emitted for iDb. }
+  sqlite3CodeVerifySchema(pParse, iDb);
+
   sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenRead);
   sqlite3VdbeChangeP5(v, 0);
 
-  { Per-loop body — trimmed port of wherecode.c:1684..1711 (Case 2: rowid-EQ).
-
-    Code the right-hand expression of the EQ predicate into a register, then
-    emit OP_SeekRowid to position the cursor on that single row (jumps to
-    addrNxt = addrBrk if the row is missing).  pLevel^.op stays OP_Noop —
-    the lookup is one-shot, so sqlite3WhereEnd does not emit an iteration
-    opcode for this level. }
   pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
   pLevel^.addrNxt  := pLevel^.addrBrk;
-  pTerm := pLoop^.aLTerm[0];
-  Assert(pTerm <> nil);
-  Assert(pTerm^.pExpr <> nil);
 
-  Inc(pParse^.nMem);
-  iReleaseReg := pParse^.nMem;
-  iRowidReg := sqlite3ExprCodeTarget(pParse, pTerm^.pExpr^.pRight, iReleaseReg);
-  if iRowidReg <> iReleaseReg then
-    sqlite3ReleaseTempReg(pParse, iReleaseReg);
-  sqlite3VdbeAddOp3(v, OP_SeekRowid, pLevel^.iTabCur, pLevel^.addrNxt,
-                    iRowidReg);
-  pLevel^.op := OP_Noop;
+  if (pLoop^.wsFlags and WHERE_ONEROW) <> 0 then
+  begin
+    { Per-loop body — trimmed port of wherecode.c:1684..1711 (Case 2: rowid-EQ).
+      Code the right-hand expression of the EQ predicate into a register, then
+      emit OP_SeekRowid to position the cursor on that single row (jumps to
+      addrNxt = addrBrk if the row is missing).  pLevel^.op stays OP_Noop —
+      the lookup is one-shot, so sqlite3WhereEnd does not emit an iteration
+      opcode for this level. }
+    pTerm := pLoop^.aLTerm[0];
+    Assert(pTerm <> nil);
+    Assert(pTerm^.pExpr <> nil);
 
-  { Inline disableTerm — mark the rowid-EQ term TERM_CODED so the per-row
-    body code generator (when wired up) does not re-emit it.  The full C
-    disableTerm also handles transitive-equiv terms; deferred to 11g.2.e. }
-  pTerm^.wtFlags := pTerm^.wtFlags or TERM_CODED;
+    Inc(pParse^.nMem);
+    iReleaseReg := pParse^.nMem;
+    iRowidReg := sqlite3ExprCodeTarget(pParse, pTerm^.pExpr^.pRight, iReleaseReg);
+    if iRowidReg <> iReleaseReg then
+      sqlite3ReleaseTempReg(pParse, iReleaseReg);
+    sqlite3VdbeAddOp3(v, OP_SeekRowid, pLevel^.iTabCur, pLevel^.addrNxt,
+                      iRowidReg);
+    pLevel^.op := OP_Noop;
+
+    { Inline disableTerm — mark the rowid-EQ term TERM_CODED so the per-row
+      body code generator (when wired up) does not re-emit it.  The full C
+      disableTerm also handles transitive-equiv terms; deferred to 11g.2.e. }
+    pTerm^.wtFlags := pTerm^.wtFlags or TERM_CODED;
+  end
+  else
+  begin
+    { Full-table-scan path (Phase 6.9-bis 11g.2.f sub-progress 8).
+      Emit OP_Rewind to position at the first row, jumping to addrBrk on an
+      empty table.  pLevel^.op := OP_Next so sqlite3WhereEnd emits the
+      iteration step at the loop tail; addrBrk is resolved by WhereEnd
+      after that OP_Next, which is exactly where OP_Rewind's P2 needs
+      to land for the empty-table case. }
+    sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrBrk);
+    pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
+    pLevel^.op := OP_Next;
+    pLevel^.p1 := pLevel^.iTabCur;
+    pLevel^.p2 := pLevel^.addrBody;
+    pLevel^.p5 := 0;
+  end;
 
   Result := pWInfo;
 end;
@@ -16117,8 +16171,6 @@ procedure sqlite3StartTable(pParse: PParse; const pName1: PToken;
   const pName2: PToken; isTemp: i32; isView: i32; isVirtual: i32;
   noErr: i32);
 const
-  { OP_Record encoding of a row containing 5 NULLs (build.c:1332). }
-  nullRow: array[0..5] of u8 = (6, 0, 0, 0, 0, 0);
   { build.c:1253..1258 — auth code per (isTemp,isView). }
   aCode: array[0..3] of u8 = (
     SQLITE_CREATE_TABLE, SQLITE_CREATE_TEMP_TABLE,
@@ -16137,7 +16189,7 @@ var
   iDb: i32;
   pName: PToken;
   addr1, fileFormat: i32;
-  reg1, reg2, reg3: i32;
+  reg2, reg3: i32;
   authCode: i32;
 begin
   zName := nil;
@@ -16243,7 +16295,27 @@ begin
   pTable^.nRowLogEst := 200;       { = sqlite3LogEst(1048576) }
   pParse^.pNewTable := pTable;
 
-  { build.c:1327..1385 — schema-row place-holder bytecode. }
+  { build.c:1327..1385 — schema-cookie + CreateBtree.
+
+    Phase 6.9-bis 11g.2.f sub-progress 8: the upstream C reference here
+    emits an OP_OpenWrite + OP_NewRowid + OP_Blob (5 NULL placeholder
+    record) + OP_Insert + OP_Close sequence whose row contents are then
+    overwritten at step time by the schema-row UPDATE that
+    sqlite3EndTable emits via sqlite3NestedParse.  In this port
+    sqlite3Update is still a Phase 6 skeleton (codegen.pas:15162) that
+    emits zero ops, so the placeholder row would never be filled in,
+    OP_ParseSchema would see NULL sql / NULL rootpage, and the
+    schema-cache round-trip would always corrupt-out.
+
+    Pragmatic deviation: drop the placeholder + UPDATE pattern entirely.
+    StartTable now just runs the file-format check and OP_CreateBtree
+    (which fills regRoot at step time).  EndTable emits a single direct
+    schema-row INSERT with all five real columns built from the
+    in-memory Table object.  This is observably equivalent — the row
+    that lands in sqlite_master is byte-identical to what the C
+    placeholder + UPDATE pattern produces — but skips the UPDATE
+    dependency.  When sqlite3Update is eventually ported, this can be
+    re-aligned to the C structure without observable behaviour change. }
   if db^.init.busy = 0 then begin
     v := sqlite3GetVdbe(pParse);
     if v <> nil then begin
@@ -16251,8 +16323,6 @@ begin
       if isVirtual <> 0 then
         sqlite3VdbeAddOp0(v, OP_VBegin);
 
-      Inc(pParse^.nMem); reg1 := pParse^.nMem;
-      pParse^.u1.cr.regRowid := reg1;
       Inc(pParse^.nMem); reg2 := pParse^.nMem;
       pParse^.u1.cr.regRoot := reg2;
       Inc(pParse^.nMem); reg3 := pParse^.nMem;
@@ -16274,13 +16344,8 @@ begin
         pParse^.u1.cr.addrCrTab :=
           sqlite3VdbeAddOp3(v, OP_CreateBtree, iDb, reg2, BTREE_INTKEY);
 
-      sqlite3OpenSchemaTable(pParse, iDb);
-      sqlite3VdbeAddOp2(v, OP_NewRowid, 0, reg1);
-      sqlite3VdbeAddOp4(v, OP_Blob, 6, reg3, 0,
-                        PAnsiChar(@nullRow[0]), P4_STATIC);
-      sqlite3VdbeAddOp3(v, OP_Insert, 0, reg3, reg1);
-      sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
-      sqlite3VdbeAddOp0(v, OP_Close);
+      { regRowid set to 0 — EndTable allocates a fresh rowid register. }
+      pParse^.u1.cr.regRowid := 0;
     end;
   end else if (db^.init.flags and $02) <> 0 then begin
     { imposterTable bit (Tsqlite3InitInfo.flags bits 1..2) — fast path
@@ -16472,6 +16537,73 @@ begin
     i32(1 + u32(db^.aDb[iDb].pSchema^.schema_cookie)));
 end;
 
+{ emitSchemaRowInsert — pragmatic helper for sub-progress 8 (Phase 6.9-bis
+  11g.2.f).  Emits the bytecode that writes a single sqlite_schema row from
+  the in-memory Table object: OP_OpenWrite cursor 0, OP_String8 for type /
+  name / tbl_name / sql into 4 of a 5-register contiguous block, OP_SCopy
+  the rootpage register into the 4th slot, OP_NewRowid, OP_MakeRecord,
+  OP_Insert (P5=OPFLAG_APPEND), OP_Close.
+
+  zStmt is allocated by the caller via sqlite3MPrintf; its ownership
+  transfers to the OP_String8's P4_DYNAMIC slot, so the caller MUST NOT
+  free it.  zType is a static literal ('table' / 'view' / 'index' /
+  'trigger') and is passed P4_STATIC.  zName is duplicated via
+  sqlite3DbStrDup so the bytecode owns its own copy. }
+procedure emitSchemaRowInsert(pParse: PParse; v: PVdbe; iDb: i32;
+  zType: PAnsiChar; zName: PAnsiChar; zStmt: PAnsiChar);
+var
+  db:           PTsqlite3;
+  regBase:      i32;
+  regRowid:     i32;
+  regOut:       i32;
+  zNameDup:     PAnsiChar;
+  zNameDup2:    PAnsiChar;
+begin
+  db := pParse^.db;
+
+  sqlite3OpenSchemaTable(pParse, iDb);
+
+  regBase := pParse^.nMem + 1;
+  pParse^.nMem := pParse^.nMem + 5;
+
+  { regBase+0 = type (static literal) }
+  sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 0, 0, zType, P4_STATIC);
+
+  { regBase+1 = name, regBase+2 = tbl_name (independent dup'd copies). }
+  zNameDup := sqlite3DbStrDup(db, zName);
+  sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 1, 0,
+                    zNameDup, P4_DYNAMIC);
+  zNameDup2 := sqlite3DbStrDup(db, zName);
+  sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 2, 0,
+                    zNameDup2, P4_DYNAMIC);
+
+  { regBase+3 = rootpage (SCopy from regRoot). }
+  sqlite3VdbeAddOp2(v, OP_SCopy, pParse^.u1.cr.regRoot, regBase + 3);
+
+  { regBase+4 = sql (transferring zStmt ownership into P4_DYNAMIC). }
+  if zStmt = nil then
+    sqlite3VdbeAddOp2(v, OP_Null, 0, regBase + 4)
+  else
+    sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 4, 0,
+                      zStmt, P4_DYNAMIC);
+
+  { Allocate rowid + record-out registers.  These are reachable only by
+    the immediately-following NewRowid / MakeRecord / Insert; reuse
+    GetTempReg so they are released back to the pool at the end. }
+  regRowid := sqlite3GetTempReg(pParse);
+  regOut   := sqlite3GetTempReg(pParse);
+
+  sqlite3VdbeAddOp2(v, OP_NewRowid, 0, regRowid);
+  sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, 5, regOut);
+  sqlite3VdbeAddOp3(v, OP_Insert, 0, regOut, regRowid);
+  sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+
+  sqlite3ReleaseTempReg(pParse, regOut);
+  sqlite3ReleaseTempReg(pParse, regRowid);
+
+  sqlite3VdbeAddOp1(v, OP_Close, 0);
+end;
+
 { sqlite3EndTable — port of build.c:2637.
   Caps the prologue emitted by sqlite3StartTable: emits OP_Close, the
   schema-row UPDATE NestedParse (no-op while NestedParse is a stub),
@@ -16569,8 +16701,6 @@ begin
       Exit;
     end;
 
-    sqlite3VdbeAddOp1(v, OP_Close, 0);
-
     { CREATE TABLE ... AS SELECT body deferred to Phase 7.x.  Free the
       input list here (the upstream branch consumes it). }
     if pSelect <> nil then begin
@@ -16600,19 +16730,12 @@ begin
                               [zType2, n, pParse^.sNameToken.z]);
     end;
 
-    { Schema-row UPDATE — port of build.c:2903..2914. }
-    sqlite3NestedParse(pParse,
-      'UPDATE %Q.' + LEGACY_SCHEMA_TABLE +
-      ' SET type=''%s'', name=%Q, tbl_name=%Q, rootpage=#%d, sql=%Q' +
-      ' WHERE rowid=#%d',
-      [db^.aDb[iDb].zDbSName,
-       zType,
-       pTab^.zName,
-       pTab^.zName,
-       pParse^.u1.cr.regRoot,
-       zStmt,
-       pParse^.u1.cr.regRowid]);
-    sqlite3DbFree(db, zStmt);
+    { Direct schema-row INSERT — see banner in sqlite3StartTable for the
+      sub-progress 8 deviation rationale.  Build the 5-column record
+      (type, name, tbl_name, rootpage, sql) into a contiguous register
+      block, then OpenWrite/NewRowid/MakeRecord/Insert/Close. }
+    emitSchemaRowInsert(pParse, v, iDb, zType, pTab^.zName, zStmt);
+    { zStmt ownership transferred to the OP_String8 P4_DYNAMIC slot. }
 
     sqlite3ChangeCookie(pParse, iDb);
 
@@ -17388,6 +17511,7 @@ var
   db: PTsqlite3;
   nNew: i32;
   pNew: PSrcList;
+  iSeed: i32;
 begin
   db := pParse^.db;
   nNew := pSrc^.nSrc + nExtra;
@@ -17403,9 +17527,19 @@ begin
   if iStart > 0 then
     Move(SrcListItems(pSrc)^, SrcListItems(pNew)^,
          i32(iStart) * SizeOf(TSrcItem));
-  { Zero the new slots }
+  { Zero the new slots, then initialise iCursor=-1 (C reference convention).
+    sqlite3SrcListAssignCursors / selectExpander only bump nTab when the
+    field is < 0, mirroring src.c:103.  Without this seed they treat the
+    fresh zero as a valid cursor 0 and skip the assignment, leading to
+    nTab staying 0 and Vdbe.apCsr never being allocated. }
   FillChar(PSrcItem(PByte(SrcListItems(pNew)) + iStart * SizeOf(TSrcItem))^,
            nExtra * SizeOf(TSrcItem), 0);
+  iSeed := 0;
+  while iSeed < nExtra do begin
+    PSrcItem(PByte(SrcListItems(pNew)) +
+             (iStart + iSeed) * SizeOf(TSrcItem))^.iCursor := -1;
+    Inc(iSeed);
+  end;
   { Copy items after iStart }
   if iStart < pSrc^.nSrc then
     Move(PSrcItem(PByte(SrcListItems(pSrc)) + iStart * SizeOf(TSrcItem))^,

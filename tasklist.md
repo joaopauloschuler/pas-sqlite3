@@ -1510,6 +1510,130 @@ Important: At the end of this document, please find:
       `sqlite3Insert` to emit a real schema-row INSERT against
       `sqlite_master` so the OP_ParseSchema round-trip populates
       `tblHash` for real, lighting up the FULL row (10 ops).
+    - [X] Sub-progress 8 — schema-row INSERT + ParseSchema round-trip
+      end-to-end + SrcItem.iCursor seed + WHERE-empty SCAN fallback
+      (2026-04-27).  Five separate landings stitched together:
+
+      (a) `sqlite3StartTable` / `sqlite3EndTable` — replaced the
+      C-reference "OpenWrite + NewRowid + Blob(NULL5) + Insert"
+      placeholder + NestedParse'd schema-row UPDATE pattern with a
+      single direct sqlite_master INSERT emitted by EndTable.
+      `emitSchemaRowInsert` builds a contiguous 5-register block
+      (type, name, tbl_name, rootpage via SCopy from
+      `pParse^.u1.cr.regRoot`, sql) via OP_String8 (P4_STATIC for the
+      type literal, P4_DYNAMIC for the dup'd name and the
+      sqlite3MPrintf-allocated zStmt), then OP_NewRowid, OP_MakeRecord,
+      OP_Insert (P5=OPFLAG_APPEND), OP_Close.  Drops the dependency on
+      `sqlite3Update` — that's still a Phase-6 skeleton (codegen.pas:
+      15162) and the placeholder pattern would never be filled in.
+      The row that lands in sqlite_master is byte-identical to what
+      the C placeholder + UPDATE pattern produces.  `regRowid` slot in
+      `pParse^.u1.cr` is now zeroed by StartTable (no longer
+      pre-allocated) since the INSERT allocates its rowid via
+      GetTempReg.  When `sqlite3Update` is eventually ported, this
+      can be re-aligned to the C structure without observable change.
+
+      (b) `execParseSchemaImpl` (passqlite3main.pas) — simplified the
+      schema-row enumeration SQL from `SELECT*FROM"%w".%s WHERE %s
+      ORDER BY rowid` to `SELECT type,name,tbl_name,rootpage,sql FROM
+      sqlite_master`.  The WHERE/ORDER-BY clauses can't go through the
+      minimal sqlite3Select codegen yet (they gate it back to the 3-op
+      Init/Halt/Goto stub, returning zero rows, which kept tblHash
+      empty after every CREATE TABLE).  Iterating every schema row is
+      safe because of (c) below.  `zWhere` arg kept in the signature
+      for caller compatibility but ignored.  `"main".` schema
+      qualifier dropped — the lemon parser stores qualified table
+      names as `zName='main', zDatabase='sqlite_master'` (inverted
+      from the C reference), so the qualifier prevented LocateTable
+      from finding sqlite_master; the unqualified form resolves
+      correctly via the `sqlite3InstallSchemaTable` bootstrap.
+
+      (c) `sqlite3InitCallback` (passqlite3main.pas) — added a
+      tblHash-already-present skip at the top of branch (b)
+      (CREATE-prefix re-prepare).  Without a WHERE filter on the
+      schema-row SELECT, OP_ParseSchema enumerates every existing
+      schema row each time it fires; already-published tables would
+      otherwise trip StartTable's "table already exists" collision
+      check on the second-and-later CREATE TABLE step in the same
+      connection.  Skip is keyed on `sqlite3FindTable(db, zArg1,
+      db^.aDb[iDb].zDbSName) <> nil` — gives O(N²) re-prepare attempts
+      across N CREATE TABLEs but the per-row check is O(1) hash, so
+      the overhead is negligible at the corpus sizes the tests
+      exercise.
+
+      (d) `whereShortCut` / `sqlite3WhereBegin` / `sqlite3WhereEnd`
+      (codegen.pas) — added a full-table-scan fallback gated on
+      `pWInfo^.sWC.nBase = 0` (no residual WHERE terms).  Previously
+      whereShortCut returned 0 for any non-rowid-EQ / non-unique-EQ
+      shape, dragging WhereBegin to nil and forcing sqlite3Select to
+      stub-bail; now an empty-WHERE SELECT lands a `WHERE_COLUMN_EQ=0
+      / WHERE_IPK=0 / WHERE_ONEROW=0` plan that emits OP_OpenRead
+      (already in WhereBegin tail) + OP_Rewind (new — addrBrk-targeted
+      so OP_Rewind P2 jumps past OP_Next on empty table) + per-row
+      body + OP_Next (emitted by sqlite3WhereEnd via
+      `pLevel^.op := OP_Next; p1 := iTabCur; p2 := addrBody`).
+      The `WHERE_ONEROW`-vs-SCAN switch is the new branch in the tail
+      of `sqlite3WhereBegin`.  `sqlite3CodeVerifySchema(pParse, iDb)`
+      now lands before the OpenTable call so OP_Transaction is in the
+      prologue (otherwise the OP_OpenRead AVs at allocateCursor
+      because pParse^.cookieMask stays 0 and FinishCoding emits no
+      Transaction opcode).  Gating on `nBase=0` keeps
+      TestWhereSimple's M2a (IN-list) and M3a (BETWEEN) defensive
+      nil-return tests green — when nBase>0 (residual filter terms
+      present) WhereBegin still returns nil because per-row residual
+      evaluation isn't ported yet.
+
+      (e) `sqlite3SrcListEnlarge` (codegen.pas) — fresh SrcItem slots
+      now have `iCursor := -1` after the FillChar zero-fill, mirroring
+      the C reference src.c:103 convention.  Without this seed,
+      `sqlite3SrcListAssignCursors` and `sqlite3SelectExpand` see the
+      zero as a valid cursor 0 and skip the assignment; pParse^.nTab
+      stays 0; sqlite3VdbeMakeReady allocates `apCsr` with size 0; the
+      first OP_OpenRead's allocateCursor AVs on apCsr[0].  Latent bug
+      that only surfaced when (d) made a SELECT-driven OP_OpenRead
+      reach Vdbe.exec.
+
+      End-to-end verification: a fresh `sqlite3_open(':memory:')`
+      followed by `sqlite3_exec('CREATE TABLE t(a,b,c)')` now
+      populates `pSchema^.tblHash` with a Table* for `t` (verified
+      via sqlite3FindTable returning non-nil).  The follow-on
+      `prepare_v2('SELECT a FROM t')` produces 9 ops
+      (Init/OpenRead/Rewind/Column/ResultRow/Next/Halt/Transaction/
+      Goto) — byte-identical to the C oracle modulo a single Explain
+      comment opcode the C build emits with
+      SQLITE_ENABLE_EXPLAIN_COMMENTS.
+
+      Test-suite delta:
+        * TestWhereCorpus FULL row drops from `Pas=3` to `Pas=9`
+          (vs C=10) — only the Explain comment opcode at C[2] is
+          missing; structural shape matches exactly.
+        * TestWhereCorpus failure-mode tally still
+          `0 exception, 0 nil-Vdbe, 20 op-count, 0 op-diff` because
+          the other 19 corpus rows have WHERE clauses that
+          sqlite3Select still gates on (`p^.pWhere <> nil` returns
+          stub) — those flip green when WHERE-residual eval lands in
+          a future sub-progress.
+        * TestExplainParity unchanged at 2 PASS / 8 DIVERGE — the
+          CREATE TABLE rows now diverge by Pas=21 vs C=32 (instead of
+          Pas=21 vs C=32 — same delta, but the Pascal bytecode
+          structure is fundamentally different from the placeholder +
+          UPDATE pattern, so byte-equal is unattainable without
+          porting sqlite3Update).
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 39/39
+          (M2a/M3a defensive nil-returns still green),
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeVtabExec 50/50, plus all
+          the TestVdbeArith / TestVdbe* / TestPager* / TestJson* /
+          TestTokenizer suites unaffected.
+
+      Sub-progress 9 must lift `pWhere <> nil` from sqlite3Select's
+      gate by emitting per-row residual filter terms (OP_If on
+      sqlite3ExprIfFalse-coded predicates, jump-to-loop-tail on
+      false), at which point the IPK / INDEX_EQ / IPK_RANGE corpus
+      shapes can flip green.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
