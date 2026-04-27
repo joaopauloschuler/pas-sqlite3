@@ -189,29 +189,35 @@ Important: At the end of this document, please find:
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 89 PASS / 3 DIVERGE
     / 0 ERROR (corpus = 92).**  Scaffold and progress through
-    sub-progresses 1..40 are recorded in git history (`git log
-    --grep="11g.2.f"`).
+    sub-progresses 1..42 are recorded in git history (`git log
+    --grep="11g.2.f"`).  PR-A (sub-progress 41) lifted the
+    `nTabList<>1` and `nSrc<>1` guards so 2-table FROMs emit real
+    bytecode.  PR-B (sub-progress 42) ported `constructAutomaticIndex`
+    + ON-clause merge + real `sqlite3GenerateIndexKey`/
+    `sqlite3ExprCodeLoadIndexColumn`/`sqlite3ResolvePartIdxLabel`,
+    landing the auto-index Bloom-filter cluster.
 
-    **Open DIVERGE rows:**
-      * Multi-table FROM (blocked on multi-table planner integration):
-        - `LEFT_JOIN`, `JOIN_WHERE`.  Two sequential gates must lift
-          together for a 2-table FROM to emit any body:
-          (1) `passqlite3codegen.pas:16130` — `sqlite3Select`'s
-              `p^.pSrc^.nSrc <> 1` early-return; widen alongside the
-              N-way nested-loop body.
-          (2) `passqlite3codegen.pas:13377` — `sqlite3WhereBegin`'s
-              `nTabList <> 1` guard (TODO 11g.2.d).  Replacing it
-              needs the planner loop (`whereLoopAddAll`,
-              `wherePathSolver`) plus per-level cursor opens and
-              LEFT-JOIN null-row semantics (`OP_NullRow` + the
-              `pLevel^.iLeftJoin` flag).
-      * Subquery planner-optimization gap:
-        - `EXISTS_SUB`: Pas emits a correct correlated subroutine
-          (22 ops); C uses a bloom-filter + autoindex optimization
-          (30 ops, the `Once`/`OpenAutoindex`/`FilterAdd` cluster).
-          Strategy difference, not a correctness bug — flips to PASS
-          once the planner adopts the same optimization.  Companion
-          `NOT_EXISTS` already PASSes via the same correlated path.
+    **Open DIVERGE rows (each blocked on a distinct planner
+    optimization, all correctness-equivalent):**
+      * `JOIN_WHERE` (op[21]/29): `Column p1=2` (C, reads via auto-idx
+        cursor) vs `Column p1=0` (Pas, reads via table cursor).  Same
+        opcode, same value at runtime — needs the equality-join column
+        substitution (`whereIndexExprTrans` from where.c:5693..5817):
+        when `t.a = s.x` is a covered equality term and the inner
+        loop's auto-index already holds s.x, rewrite outer-loop reads
+        of `t.a` to read from the inner index cursor.
+      * `LEFT_JOIN` (Pas=27, C=32 ops): missing the LEFT-JOIN null-row
+        fixup tail.  Needs `pLevel^.iLeftJoin` match-flag init
+        (Integer 0 → reg) at WhereBegin, set-flag (Integer 1 → reg)
+        inside the inner body, and the post-loop `IfPos` + `NullRow`
+        + per-column null-row cleanup at WhereEnd
+        (where.c:6855..6873 + wherecode.c:2476..2497).
+      * `EXISTS_SUB` (Pas=22, C=30): Pas emits a correct correlated
+        subroutine; C uses a bloom-filter + autoindex co-optimization
+        (`Once`/`OpenAutoindex`/`FilterAdd` cluster) at the subselect
+        level.  Strategy difference — flips to PASS when the planner
+        recognises the EXISTS subselect as an auto-index candidate.
+        Companion `NOT_EXISTS` already PASSes via the correlated path.
 
     **Open follow-on:** Re-enable productive tails in `sqlite3DeleteFrom`
     (`passqlite3codegen.pas:16844` — needs `sqlite3WhereBegin` body +
