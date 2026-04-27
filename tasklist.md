@@ -186,10 +186,76 @@ Important: At the end of this document, please find:
     build.c:4908..5132.  Commit `df93287`.
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
-  Current Status: **4 PASS / 6 DIVERGE / 0 ERROR**.  Drive to
-  all-PASS, then expand corpus to DML / SELECT / pragma / trigger
-  forms (same exclusion list as TestParser).  Promote from
+  Current Status (2026-04-27): **4 PASS / 6 DIVERGE / 0 ERROR**.
+  Drive to all-PASS, then expand corpus to DML / SELECT / pragma /
+  trigger forms (same exclusion list as TestParser).  Promote from
   report-only to hard gate when the full corpus is green.
+
+  PASS rows: CREATE INDEX, CREATE UNIQUE INDEX, DROP INDEX IF EXISTS,
+  BEGIN.  Step 1 (sqlite3RefillIndex port, commit `4c9fe6b`) flipped
+  the two CREATE INDEX rows.
+
+  DIVERGE rows + delta = (C ops − Pas ops):
+
+  - CREATE TABLE simple / typed / IF NOT EXISTS — Δ=12 each
+  - CREATE TABLE composite PK / WITHOUT ROWID — Δ=23 each
+  - DROP TABLE — Δ=22
+
+  Root cause for CREATE TABLE rows: `emitSchemaRowInsert`
+  (`passqlite3codegen.pas:19743`) emits a single direct schema-row
+  INSERT.  C reference uses the `sqlite3StartTable` placeholder Insert
+  + `sqlite3EndTable` NestedParse 2-phase pattern (build.c:2842..2900):
+  Close, Close, Null, Noop, OpenWrite cur=1, SeekRowid, Rowid, IsNull,
+  String8 ×5 (type/name/tbl_name/sql/zStmt), Copy rootpage, MakeRecord
+  BBBDB, Delete (p2=68 = abort opcode), Insert, plus
+  `OP_SqlExec PRAGMA "main".integrity_check('zN')` after ParseSchema.
+  Composite-PK / WITHOUT-ROWID add a second auto-index pass (Δ=23 vs
+  Δ=12).
+
+  Root cause for DROP TABLE: Pas-side elides the C-side
+  pre-Destroy "scan sqlite_schema for trigger rows + reinsert" pass
+  (ops 1..21 in C: Null, OpenWrite, Rewind, per-row Column/Eq/Ne/Rowid/
+  Delete tail loop, OpenEphemeral, IfNot, OpenRead, Rewind, etc.) plus
+  the C-side `OP_DropTable` p4='t' op (35) and the trailing String8
+  P4='trigger' literals.  Driven by `sqlite3CodeDropTable` /
+  `destroyTable` arms.
+
+  Decomposition (next-agent picklist — each is committable in
+  isolation and shrinks Δ by a known amount):
+
+    - [ ] **6.10 step 2** Port the 2-phase schema-write of
+      `sqlite3EndTable` (build.c:2884..2900): emit OP_Close, then the
+      NestedParse-equivalent `OpenWrite cur=1` + `SeekRowid` +
+      `Rowid` + `IsNull` + per-column `String8`/`Copy` + `MakeRecord
+      BBBDB` + `Delete` (p2=last-op-addr) + `Insert` chain.  Replaces
+      `emitSchemaRowInsert` (or branches it).  Closes Δ=11 on three
+      simple-CREATE rows; should also flip composite-PK / WITHOUT
+      ROWID partway.  Touch points: `passqlite3codegen.pas:19731` and
+      `:19831`.
+
+    - [ ] **6.10 step 3** Re-verify whether `OP_SqlExec` (build.c:
+      2940..2944, gated on `TF_HasGenerated` in 3.53.0) needs to
+      emit unconditionally in the corpus.  3.45 system sqlite3 emits
+      `SqlExec PRAGMA integrity_check` for plain CREATE TABLE; in
+      3.53.0 the gate appears restricted to GENERATED columns.
+      Verify against the project's oracle (`src/libsqlite3.so`)
+      before adding any unconditional emission.  Closes Δ=0..1.
+
+    - [ ] **6.10 step 4** Port `sqlite3CodeDropTable` pre-Destroy
+      schema scan (build.c:3315..3445): the loop that walks
+      sqlite_schema, deletes rows whose `tbl_name = 'X'`, and
+      reinserts the surviving trigger rows.  Plus the trailing
+      `OP_DropTable` p4=table-name + `String8` literal emissions.
+      Closes Δ=22 on the DROP TABLE row.
+
+    - [ ] **6.10 step 5** Composite-PK / WITHOUT-ROWID auto-index
+      bytecode pass — the `convertToWithoutRowidTable` helper
+      (build.c:1830..2090).  Closes Δ=11 on those two rows once
+      step 2 is in.
+
+    - [ ] **6.10 step 6** Once 4/6 → all-PASS, expand corpus with
+      DML / SELECT / pragma / trigger forms and promote from
+      report-only to hard gate.
 
 ---
 
