@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 37;
+  N_CORPUS = 56;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -129,6 +129,27 @@ begin
   Add(i, 'SAVEPOINT 2',                 'SAVEPOINT s2;');                        Inc(i);
   Add(i, 'SELECT col arith',            'SELECT a+b FROM t;');                   Inc(i);
   Add(i, 'SELECT col mul',              'SELECT a*2 FROM t;');                   Inc(i);
+
+  { Step 6 sub-progress (probe sweep #3) — additional shapes confirmed PASS. }
+  Add(i, 'SELECT 3-col scan',           'SELECT a,b,c FROM t;');                 Inc(i);
+  Add(i, 'SELECT other table',          'SELECT x FROM s;');                     Inc(i);
+  Add(i, 'BEGIN DEFERRED',              'BEGIN DEFERRED;');                      Inc(i);
+  Add(i, 'BEGIN TRANSACTION',           'BEGIN TRANSACTION;');                   Inc(i);
+  Add(i, 'COMMIT TRANSACTION',          'COMMIT TRANSACTION;');                  Inc(i);
+  Add(i, 'END',                         'END;');                                 Inc(i);
+  Add(i, 'END TRANSACTION',             'END TRANSACTION;');                     Inc(i);
+  Add(i, 'ROLLBACK TRANSACTION',        'ROLLBACK TRANSACTION;');                Inc(i);
+  Add(i, 'ROLLBACK TO',                 'ROLLBACK TO s1;');                      Inc(i);
+  Add(i, 'ROLLBACK TO SAVEPOINT',       'ROLLBACK TO SAVEPOINT s1;');            Inc(i);
+  Add(i, 'RELEASE SAVEPOINT',           'RELEASE SAVEPOINT s1;');                Inc(i);
+  Add(i, 'SELECT col WHERE 3-AND',      'SELECT a FROM t WHERE a=5 AND b=7 AND c=9;'); Inc(i);
+  Add(i, 'SELECT rowid scan',           'SELECT rowid FROM t;');                 Inc(i);
+  Add(i, 'SELECT rowid WHERE',          'SELECT rowid FROM t WHERE rowid=5;');   Inc(i);
+  Add(i, 'SELECT col arith literal',    'SELECT 1+2*3;');                        Inc(i);
+  Add(i, 'SELECT col negate',           'SELECT -a FROM t;');                    Inc(i);
+  Add(i, 'SELECT col concat',           'SELECT a||b FROM t;');                  Inc(i);
+  Add(i, 'INSERT VALUES s',             'INSERT INTO s VALUES (1,2,3);');        Inc(i);
+  Add(i, 'INSERT DEFAULT VALUES s',     'INSERT INTO s DEFAULT VALUES;');        Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
