@@ -1402,6 +1402,58 @@ Important: At the end of this document, please find:
       precisely localised to a name-resolution gap rather
       than a codegen gap.  Test failure-mode tally remains
       `0 exception, 0 nil-Vdbe, 20 op-count, 0 op-diff`.
+    - [X] Sub-progress 6 — minimal `selectExpander` FROM-resolution
+      loop + minimal `sqlite3ResolveSelectNames` (2026-04-27).
+      `sqlite3SelectExpand` now walks `pSelect^.pSrc` and, for every
+      base-table SrcItem with `zName <> nil` and no attached subquery,
+      calls `sqlite3LocateTableItem(LOCATE_NOERR)` to populate
+      `pItem^.pSTab`, bumps `pTab^.nTabRef`, sets the `notCte` flag
+      bit, allocates `iCursor` from `pParse^.nTab++`, and zeros
+      `colUsed`.  `sqlite3ResolveSelectNames` is no longer a no-op
+      stub: it walks `pEList`, `pWhere`, `pHaving`, `pOrderBy`,
+      `pGroupBy`, descends into `pLeft`/`pRight`/`x.pList` for
+      composite expressions, and rewrites every TK_ID whose token
+      matches a column of one of the FROM-clause tables in place to
+      a fully-resolved TK_COLUMN (op/iTable/iColumn/y.pTab).
+      Each match also sets the corresponding `colUsed` bitmask bit
+      (column index < BMS-1) or the BMS-1 overflow slot.  Both
+      pieces use LOCATE_NOERR / soft-fail behaviour so prepare
+      returns the existing 3-op Init/Halt/Goto stub instead of
+      nil-Vdbe whenever name resolution can't proceed — no
+      regression to the failure-mode tally.
+
+      Discovery during the bring-up: even with the resolver in place,
+      the FULL corpus row still falls back to the stub because the
+      Pascal `sqlite3LocateTable` lookup against
+      `pSchema^.tblHash` returns nil for every fixture table (`t`,
+      `s`, `u`).  Root-caused to a deeper persistence gap: Pascal
+      `sqlite3EndTable` only inserts into `tblHash` under
+      `db^.init.busy=1`, mirroring C; in C that branch fires from
+      OP_ParseSchema -> sqlite3InitOne re-reading sqlite_master
+      after CREATE TABLE.  Pascal `sqlite3Insert` is still a Phase
+      6 structural skeleton emitting zero ops, so the schema-row
+      UPDATE in the CREATE TABLE epilogue never lands, OP_ParseSchema
+      finds no rows, and tblHash is never populated — the table
+      object is built fresh in `pParse^.pNewTable` and freed at
+      ParseObjectReset.  Tried short-circuiting by ALSO inserting
+      into `tblHash` from the init.busy=0 path: the insert
+      succeeded but `pTab^.nCol = 0` (sqlite3AddColumn / pTab^.aCol
+      population is also a Phase 6 stub today), so even with a
+      visible Table the new resolver still wouldn't find any
+      columns to bind against.  Reverted that workaround as net-zero
+      surface (still 20 op-count, but with risk to other tests).
+
+      Net result of sub-progress 6: name resolution substrate is
+      complete and dormant — no PASS rows, no failure-mode tally
+      shift (still `0 exception, 0 nil-Vdbe, 20 op-count, 0 op-diff`),
+      no regression in TestParser 45/45, TestPrepareBasic 20/20,
+      TestSelectBasic 49/49, TestExprBasic 40/40, TestDMLBasic
+      54/54, TestSchemaBasic 44/44, TestExplainParity 2/10.
+      Sub-progress 7 must lift the `sqlite3AddColumn` /
+      `sqlite3EndTable` schema-population pipeline (and ideally the
+      `sqlite3Insert` schema-row INSERT into sqlite_master so the
+      OP_ParseSchema round-trip becomes a real round-trip) before
+      the FULL row can flip green.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

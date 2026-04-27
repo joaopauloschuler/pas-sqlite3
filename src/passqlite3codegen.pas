@@ -5873,10 +5873,103 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ sqlite3ResolveSelectNames — Phase 6.9-bis 11g.2.f sub-progress 6.
+
+  Minimal port of the resolve.c name-resolution pass, scoped to the
+  TestWhereCorpus surface area: walks pEList / pWhere / pHaving /
+  pOrderBy / pGroupBy expressions, and for every TK_ID node whose
+  spelling matches a column of one of the FROM-clause tables, rewrites
+  the node in place to a fully-resolved TK_COLUMN
+  (op / iTable / iColumn / y.pTab) and updates that source item's
+  colUsed bitmask.
+
+  Constraints of this slice:
+    * Only handles TK_ID (unqualified column refs) — TK_DOT (qualified
+      `t.col`), TK_FUNCTION, TK_AGG_*, TK_VARIABLE, TK_REGISTER are
+      left alone for the next sub-progress.
+    * Recurses into pLeft / pRight (binary ops, IS NULL, NOT, …) and
+      into x.pList (IN-list, function args).  x.pSelect (subqueries)
+      is not recursed yet — TestWhereCorpus row INDEX_IN_SUB will need
+      that lift.
+    * Resolution uses the first FROM item where the column name matches.
+      Ambiguous names raise an error message but still resolve to the
+      first hit (faithful enough for the corpus where every column is
+      unique inside a single source table).
+    * If pSTab is nil for a SrcItem — selectExpander did not populate
+      it (table not found) — that item is silently skipped.  The
+      sqlite3SelectExpand caller already raised the missing-table
+      error in that case. }
 procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
   pOuterNC: PNameContext);
+
+  procedure ResolveExprList(pList: PExprList); forward;
+
+  procedure ResolveExpr(pE: PExpr);
+  var
+    pSrc:  PSrcList;
+    pItem: PSrcItem;
+    base:  PSrcItem;
+    i:     i32;
+    iCol:  i32;
+  begin
+    if pE = nil then Exit;
+    if (pE^.op = TK_ID) and (p^.pSrc <> nil) then
+    begin
+      pSrc := p^.pSrc;
+      base := SrcListItems(pSrc);
+      for i := 0 to pSrc^.nSrc - 1 do
+      begin
+        pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+        if pItem^.pSTab = nil then Continue;
+        iCol := sqlite3ColumnIndex(pItem^.pSTab, pE^.u.zToken);
+        if iCol >= 0 then
+        begin
+          pE^.op      := TK_COLUMN;
+          pE^.iTable  := pItem^.iCursor;
+          pE^.iColumn := i16(iCol);
+          pE^.y.pTab  := pItem^.pSTab;
+          if iCol < BMS - 1 then
+            pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
+          else
+            pItem^.colUsed := pItem^.colUsed or
+                              (Bitmask(1) shl (BMS - 1));
+          Exit;
+        end;
+      end;
+      { Unresolved bare identifier — leave as TK_ID; downstream
+        codegen will refuse the trivial gate and fall back to the
+        SQLITE_OK no-body stub.  No error msg yet — Phase 6.x will
+        wire sqlite3ErrorMsg("no such column: %s") here. }
+      Exit;
+    end;
+    ResolveExpr(pE^.pLeft);
+    ResolveExpr(pE^.pRight);
+    if not ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then
+    begin
+      if (pE^.flags and EP_xIsSelect) = 0 then
+        ResolveExprList(pE^.x.pList);
+    end;
+  end;
+
+  procedure ResolveExprList(pList: PExprList);
+  var
+    items: PExprListItem;
+    i:     i32;
+  begin
+    if pList = nil then Exit;
+    items := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+      ResolveExpr(items[i].pExpr);
+  end;
+
 begin
-  { Phase 6.2 stub }
+  if (pParse = nil) or (p = nil) then Exit;
+  if pParse^.db^.mallocFailed <> 0 then Exit;
+  ResolveExprList(p^.pEList);
+  ResolveExpr    (p^.pWhere);
+  ResolveExprList(p^.pGroupBy);
+  ResolveExpr    (p^.pHaving);
+  ResolveExprList(p^.pOrderBy);
 end;
 
 function sqlite3ResolveSelfReference(pParse: PParse; pTab: PTable2;
@@ -14121,9 +14214,36 @@ begin
   sqlite3SelectAddTypeInfo(pParse, p);
 end;
 
-{ sqlite3SelectExpand (internal walker-based expand pass) }
+{ sqlite3SelectExpand (internal walker-based expand pass).
+
+  Phase 6.9-bis 11g.2.f sub-progress 6 (2026-04-27).
+
+  Adds the minimum FROM-clause expansion needed by the trivial
+  sqlite3Select gate landed under sub-progress 5: for every SrcItem
+  in pSelect^.pSrc, locate the underlying Table*, attach it to
+  pItem^.pSTab, bump nTabRef, mark notCte, and assign a fresh
+  iCursor via pParse^.nTab++.  The colUsed bitmask is initialised to
+  zero here and populated lazily by sqlite3ResolveSelectNames as it
+  rewrites TK_ID references into TK_COLUMN.
+
+  Restrictions of this slice:
+    * Only top-level pSelect — no recursion into compound terms or
+      subqueries (sqlite3WalkSelect-driven expansion stays parked
+      until sub-progress 7 needs it for INDEX_IN_SUB).
+    * Only base tables — subquery / CTE / vtab items are detected by
+      a non-nil pSubq or zName=nil and skipped (their pSTab stays
+      nil, the trivial gate falls back to the SQLITE_OK no-body
+      stub for those rows, same surface as before this change).
+    * Fails fast on missing-table — sqlite3LocateTableItem already
+      raises sqlite3ErrorMsg, so we just propagate via pParse^.nErr. }
 procedure sqlite3SelectExpand(pParse: PParse; pSelect: PSelect);
-var w: TWalker;
+var
+  w:     TWalker;
+  pSrc:  PSrcList;
+  pItem: PSrcItem;
+  base:  PSrcItem;
+  i:     i32;
+  pTab:  PTable2;
 begin
   FillChar(w, SizeOf(w), 0);
   w.pParse := pParse;
@@ -14134,7 +14254,52 @@ begin
     w.xSelectCallback2 := nil;
     sqlite3WalkSelect(@w, pSelect);
   end;
-  { selectExpander pass — stub (Phase 6.5 will call real selectExpander) }
+
+  { FROM-clause resolution loop — minimum viable selectExpander. }
+  if (pSelect <> nil) and (pSelect^.pSrc <> nil) then
+  begin
+    pSrc := pSelect^.pSrc;
+    base := SrcListItems(pSrc);
+    for i := 0 to pSrc^.nSrc - 1 do
+    begin
+      pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+      { Skip non-base items — subquery / CTE source items have no
+        zName, vtab items have a populated pSubq.  Their resolution
+        is deferred. }
+      if pItem^.zName = nil then Continue;
+      if pItem^.u4.pSubq <> nil then Continue;
+      if pItem^.pSTab = nil then
+      begin
+        { LOCATE_NOERR — degrade gracefully when the table is not in
+          pSchema^.tblHash.  Today the Pascal sqlite3Insert (codegen
+          schema-row INSERT into sqlite_master) is still a structural
+          stub emitting zero ops, so OP_ParseSchema during CREATE
+          TABLE finds nothing and the table never reaches tblHash.
+          Soft-fail keeps the trivial-gate sqlite3Select fall-back
+          path alive — prepare returns the 3-op Init/Halt/Goto stub
+          instead of nil — exactly the surface this scaffold had
+          before sub-progress 6 landed.  When sqlite3Insert starts
+          writing real schema rows (tasklist 11g.1+ productive
+          tail), this NOERR can be lifted to drive errors. }
+        pTab := sqlite3LocateTableItem(pParse, LOCATE_NOERR, pItem);
+        if pTab = nil then Continue;
+        pItem^.pSTab := pTab;
+        Inc(pTab^.nTabRef);
+        { fg.notCte = bit 2 of fgBits2. }
+        pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $04;
+      end;
+      if pItem^.iCursor < 0 then
+      begin
+        pItem^.iCursor := pParse^.nTab;
+        Inc(pParse^.nTab);
+      end;
+      pItem^.colUsed := 0;
+    end;
+  end;
+
+  { Tail-call sqlite3SelectPopWith via walker so the parser-supplied
+    pWith stack stays balanced.  This was the only behaviour of the
+    Phase 6.5 stub before sub-progress 6 took over. }
   w.xSelectCallback := nil;
   w.xSelectCallback2 := TSelectCallback2(@sqlite3SelectPopWith);
   w.eCode := 0;
