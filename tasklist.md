@@ -650,6 +650,27 @@ Important: At the end of this document, please find:
       with regFilter=99 → MustBeInt + Filter pair, regFilter cleared, addrBrk
       restored), FPD3 (nSkip=1 disqualifier → no emit, regFilter preserved),
       FPD4 (iLevel=nLevel-1 walk body never enters → no emit).
+    - [X] Leaf helpers, batch 7 — `codeCursorHint`
+      (wherecode.c:1146..1245), `sqlite3WhereExplainOneScan`
+      (wherecode.c:245..268), `sqlite3WhereExplainBloomFilter`
+      (wherecode.c:280..320), and `sqlite3WhereAddExplainText`
+      (wherecode.c:117..233).  All four are runtime-no-op stubs matching
+      upstream's SQLITE_ENABLE_CURSOR_HINTS=OFF (codeCursorHint compiles down
+      to the `#else #define ... /*No-op*/`) and SQLITE_OMIT_EXPLAIN /
+      explain<>2 / IS_STMT_SCANSTATUS-disabled fall-through paths (the three
+      explain entry points return 0 / no-op since pas-sqlite3 has no EQP text
+      generation yet; the StrAccum + %S printf wiring lands as a prerequisite
+      for the EQP corpus tests in 6.10).  These stubs unblock the public-
+      surface forward references that `sqlite3WhereCodeOneLoopStart` needs in
+      the next sub-progress.  Gate: `TestWherePlanner.pas` (436/436):
+      CCH1..CCH3 (codeCursorHint accepts nil and populated arg shapes
+      without dereferencing — proves the no-op contract for both unused-arg
+      and active-call paths), WEOS1..WEOS3 (sqlite3WhereExplainOneScan
+      returns 0 for explain=0, explain=1, and explain=2 with
+      WHERE_ORDERBY_MIN — all three still 0 until EQP text lands),
+      WEBF1..WEBF2 (sqlite3WhereExplainBloomFilter returns 0 for both
+      populated and all-nil shapes), WAET1..WAET2 (sqlite3WhereAddExplainText
+      returns without effect for both populated and all-nil shapes).
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix

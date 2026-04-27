@@ -2449,6 +2449,36 @@ procedure filterPullDown(pParse: PParse; pWInfo: PWhereInfo; iLevel: i32;
 function removeUnindexableInClauseTerms(pParse: PParse; iEq: i32;
   pLoop: PWhereLoop; pX: PExpr): PExpr;
 
+{ Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers, batch 7.
+  Public-surface stubs gated under SQLITE_ENABLE_CURSOR_HINTS (off by default in
+  pas-sqlite3, so codeCursorHint matches upstream's `#else #define ... /*No-op*/`)
+  and SQLITE_OMIT_EXPLAIN / explain<>2 / IS_STMT_SCANSTATUS-disabled (the no-op
+  fall-through path in upstream's wherecode.c).  These exist so that
+  sqlite3WhereCodeOneLoopStart can be ported without forward references.
+  codeCursorHint (wherecode.c:1146..1245) — emits OP_CursorHint when the
+  cursor-hint optimisation is active.  pas-sqlite3 does not enable this build
+  flag; the stub is unconditionally a no-op, matching upstream's `#else` define.
+  sqlite3WhereExplainOneScan (wherecode.c:245..268) — adds an OP_Explain opcode
+  describing one table scan.  Returns 0 (no opcode added) when toplevel.explain
+  <> 2 and stmt-scanstatus is disabled, which is the only case pas-sqlite3
+  currently exercises (EXPLAIN QUERY PLAN text generation lands once the
+  StrAccum / SrcItem-aware printf wiring is in place).
+  sqlite3WhereExplainBloomFilter (wherecode.c:280..320) — Bloom-filter EQP
+  describer.  Same fall-through (returns 0) until the EQP text path lands.
+  sqlite3WhereAddExplainText (wherecode.c:117..233) — back-patches the P4 of an
+  existing OP_Explain with the rendered scan-description text.  Stubbed as a
+  no-op until EQP support lands; sqlite3WhereExplainOneScan never adds the
+  OP_Explain in the first place, so there's nothing for this routine to fix
+  up. }
+procedure codeCursorHint(pTabItem: PSrcItem; pWInfo: PWhereInfo;
+  pLevel: PWhereLevel; pEndRange: PWhereTerm);
+function  sqlite3WhereExplainOneScan(pParse: PParse; pTabList: PSrcList;
+  pLevel: PWhereLevel; wctrlFlags: u16): i32;
+function  sqlite3WhereExplainBloomFilter(pParse: PParse; pWInfo: PWhereInfo;
+  pLevel: PWhereLevel): i32;
+procedure sqlite3WhereAddExplainText(pParse: PParse; addr: i32;
+  pTabList: PSrcList; pLevel: PWhereLevel; wctrlFlags: u16);
+
 { Index helpers }
 procedure sqlite3FreeIndex(db: PTsqlite3; p: PIndex2);
 procedure sqlite3UnlinkAndDeleteIndex(db: PTsqlite3; iDb: i32;
@@ -20018,6 +20048,61 @@ begin
     end;
   end;
   Result := pNew;
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers,
+  batch 7.
+
+  See forward-decl block (~line 2452) for descriptions.
+
+  All four routines are runtime-no-op stubs matching upstream's
+  SQLITE_ENABLE_CURSOR_HINTS=OFF and SQLITE_OMIT_EXPLAIN / explain<>2 /
+  IS_STMT_SCANSTATUS-disabled fall-through paths.  They are correct for every
+  query pas-sqlite3 currently compiles (no EXPLAIN QUERY PLAN text emission,
+  no cursor-hint codegen).  Promotion to full implementations is gated on the
+  StrAccum / SrcItem printf wiring landing alongside the EQP corpus tests in
+  6.10.
+  =========================================================================== }
+
+procedure codeCursorHint(pTabItem: PSrcItem; pWInfo: PWhereInfo;
+  pLevel: PWhereLevel; pEndRange: PWhereTerm);
+begin
+  { SQLITE_ENABLE_CURSOR_HINTS is not set — matches upstream's
+    `# define codeCursorHint(A,B,C,D) /* No-op */`. }
+  if (pTabItem = nil) and (pWInfo = nil) and (pLevel = nil)
+     and (pEndRange = nil) then Exit; { silence unused warnings }
+end;
+
+function sqlite3WhereExplainOneScan(pParse: PParse; pTabList: PSrcList;
+  pLevel: PWhereLevel; wctrlFlags: u16): i32;
+begin
+  { Upstream returns 0 unless toplevel.explain==2 or stmt-scanstatus is
+    enabled.  pas-sqlite3 does not yet implement EQP text generation, so the
+    stub always returns 0, matching the non-EXPLAIN compile path that every
+    ordinary query takes. }
+  Result := 0;
+  if (pParse = nil) and (pTabList = nil) and (pLevel = nil)
+     and (wctrlFlags = 0) then Exit;
+end;
+
+function sqlite3WhereExplainBloomFilter(pParse: PParse; pWInfo: PWhereInfo;
+  pLevel: PWhereLevel): i32;
+begin
+  { Stubbed for the same reason as sqlite3WhereExplainOneScan — Bloom-filter
+    OP_Explain text composition needs StrAccum / %S printf, not yet ported. }
+  Result := 0;
+  if (pParse = nil) and (pWInfo = nil) and (pLevel = nil) then Exit;
+end;
+
+procedure sqlite3WhereAddExplainText(pParse: PParse; addr: i32;
+  pTabList: PSrcList; pLevel: PWhereLevel; wctrlFlags: u16);
+begin
+  { sqlite3WhereExplainOneScan stubs out the OP_Explain emit, so addr never
+    points at a real opcode; this back-patcher has nothing to do.  Both lift
+    once the EQP corpus tests in 6.10 require real OP_Explain text. }
+  if (pParse = nil) and (addr = 0) and (pTabList = nil) and (pLevel = nil)
+     and (wctrlFlags = 0) then Exit;
 end;
 
 end.

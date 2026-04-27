@@ -4095,6 +4095,90 @@ begin
   sqlite3_close(db);
 end;
 
+{ ---- Phase 6.9-bis (step 11g.2.e sub-progress) batch 7 stubs ----
+  codeCursorHint, sqlite3WhereExplainOneScan, sqlite3WhereExplainBloomFilter,
+  sqlite3WhereAddExplainText.  All four are currently runtime no-ops matching
+  upstream's SQLITE_ENABLE_CURSOR_HINTS=OFF + SQLITE_OMIT_EXPLAIN / explain<>2
+  fall-through paths.  These tests pin the contract: callers may invoke them
+  freely (even with nil arguments — the entry path must not deref) and the
+  explain functions must always return 0 in a non-EXPLAIN compile.  When the
+  EQP text path is filled in alongside StrAccum, these tests will gain
+  positive-path siblings; the no-deref / return-0 invariants remain. }
+procedure TestWhereCodeCursorHintAndExplainStubs;
+var
+  parse:    TParse;
+  db:       PTsqlite3;
+  v:        PVdbe;
+  pTabList: PSrcList;
+  pLevel:   TWhereLevel;
+  pWInfo:   TWhereInfo;
+  pTabItem: TSrcItem;
+  pTerm:    TWhereTerm;
+  ret:      i32;
+  rc:       i32;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('CHX open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+
+  v := sqlite3VdbeCreate(@parse);
+  Check('CHX VDBE allocated', v <> nil);
+  parse.pVdbe := v;
+
+  FillChar(pLevel,    SizeOf(pLevel),    0);
+  FillChar(pWInfo,    SizeOf(pWInfo),    0);
+  FillChar(pTabItem,  SizeOf(pTabItem),  0);
+  FillChar(pTerm,     SizeOf(pTerm),     0);
+  pTabList := sqlite3DbMallocZero(db, SizeOf(TSrcList));
+  Check('CHX SrcList alloc', pTabList <> nil);
+
+  { ---- CCH1..CCH3: codeCursorHint must not deref any arg.  In particular,
+       the all-nil call exercises the unused-arg short-circuit; the populated
+       call exercises the body (still no-op since SQLITE_ENABLE_CURSOR_HINTS
+       is off, but proves the routine accepts real shapes). ---- }
+  codeCursorHint(nil, nil, nil, nil);
+  Check('CCH1 codeCursorHint(nil,...) returned', True);
+  codeCursorHint(@pTabItem, @pWInfo, @pLevel, @pTerm);
+  Check('CCH2 codeCursorHint(populated) returned', True);
+  codeCursorHint(@pTabItem, @pWInfo, @pLevel, nil);
+  Check('CCH3 codeCursorHint(no pEndRange) returned', True);
+
+  { ---- WEOS1..WEOS3: sqlite3WhereExplainOneScan must return 0 in every
+       non-EXPLAIN code path.  Cover explain=0 / explain=1 / explain=2 plus
+       wctrlFlags variants — all should currently return 0 since the EQP
+       text path isn't yet wired. ---- }
+  parse.explain := 0;
+  ret := sqlite3WhereExplainOneScan(@parse, pTabList, @pLevel, 0);
+  Check('WEOS1 explain=0 returns 0', ret = 0);
+  parse.explain := 1;
+  ret := sqlite3WhereExplainOneScan(@parse, pTabList, @pLevel, 0);
+  Check('WEOS2 explain=1 returns 0', ret = 0);
+  parse.explain := 2;
+  ret := sqlite3WhereExplainOneScan(@parse, pTabList, @pLevel, WHERE_ORDERBY_MIN);
+  Check('WEOS3 explain=2 stub still returns 0 (EQP text deferred)', ret = 0);
+
+  { ---- WEBF1..WEBF2: sqlite3WhereExplainBloomFilter mirrors WEOS — return
+       0 unconditionally until the EQP text path lands. ---- }
+  pWInfo.pParse   := @parse;
+  pWInfo.pTabList := pTabList;
+  ret := sqlite3WhereExplainBloomFilter(@parse, @pWInfo, @pLevel);
+  Check('WEBF1 BloomFilter stub returns 0', ret = 0);
+  ret := sqlite3WhereExplainBloomFilter(nil, nil, nil);
+  Check('WEBF2 BloomFilter(nil,...) returns 0', ret = 0);
+
+  { ---- WAET1..WAET2: sqlite3WhereAddExplainText is a no-op back-patcher.
+       Both an all-nil and a populated invocation must return without effect. }
+  sqlite3WhereAddExplainText(@parse, 0, pTabList, @pLevel, 0);
+  Check('WAET1 AddExplainText(populated) returned', True);
+  sqlite3WhereAddExplainText(nil, 0, nil, nil, 0);
+  Check('WAET2 AddExplainText(nil,...) returned', True);
+
+  sqlite3DbFree(db, pTabList);
+  sqlite3VdbeFinalize(v);
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -4148,6 +4232,7 @@ begin
   TestCodeExprOrVector;
   TestFilterPullDown;
   TestRemoveUnindexableInClauseTerms;
+  TestWhereCodeCursorHintAndExplainStubs;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.
