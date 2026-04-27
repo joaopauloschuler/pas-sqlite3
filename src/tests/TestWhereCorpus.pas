@@ -104,7 +104,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 60;
+  N_CORPUS = 68;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -293,6 +293,32 @@ begin
       'SELECT a FROM t WHERE cast(a AS TEXT) = ''5'';');         Inc(i);
   Add(i, 'cast(a AS REAL)>3.0',   'CAST_REAL',
       'SELECT a FROM t WHERE cast(a AS REAL) > 3.0;');           Inc(i);
+
+  { Phase 6.9-bis 11g.2.f sub-progress 33 — corpus expansion group #5.
+    Eight new shapes: printf() 2-arg, abs() with inequality, substr() 3-arg,
+    lower()/upper() equality, CASE WHEN, EXISTS subquery, NOT EXISTS subquery.
+    The first five exercise existing single-table SCAN-with-residual machinery
+    via built-in scalar functions.  CASE_WHEN exercises TK_CASE codegen.
+    EXISTS_SUB/NOT_EXISTS exercise correlated subquery codegen (multi-table-ish;
+    likely blocked on 11g.2.d but included for shape coverage).
+    Columns b and c are untyped (TEXT-friendly in practice) per the bare
+    fixture 'CREATE TABLE t(a, b, c)' — substr/lower/upper on b are valid. }
+  Add(i, 'printf(''%d'',a)=''5''',  'PRINTF_2ARG',
+      'SELECT a FROM t WHERE printf(''%d'', a) = ''5'';');        Inc(i);
+  Add(i, 'abs(a)>3',               'ABS_NEG',
+      'SELECT a FROM t WHERE abs(a) > 3;');                       Inc(i);
+  Add(i, 'substr(b,1,1)=''x''',   'SUBSTR_3ARG',
+      'SELECT a FROM t WHERE substr(b, 1, 1) = ''x'';');          Inc(i);
+  Add(i, 'lower(b)=''hello''',     'LOWER_EQ',
+      'SELECT a FROM t WHERE lower(b) = ''hello'';');             Inc(i);
+  Add(i, 'upper(b)=''HELLO''',     'UPPER_EQ',
+      'SELECT a FROM t WHERE upper(b) = ''HELLO'';');             Inc(i);
+  Add(i, 'CASE WHEN a>5 THEN 1',   'CASE_WHEN',
+      'SELECT a FROM t WHERE CASE WHEN a > 5 THEN 1 ELSE 0 END = 1;'); Inc(i);
+  Add(i, 'EXISTS subselect',       'EXISTS_SUB',
+      'SELECT a FROM t WHERE EXISTS (SELECT 1 FROM s WHERE s.x = t.a);'); Inc(i);
+  Add(i, 'NOT EXISTS subselect',   'NOT_EXISTS',
+      'SELECT a FROM t WHERE NOT EXISTS (SELECT 1 FROM s WHERE s.x = t.a);'); Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);

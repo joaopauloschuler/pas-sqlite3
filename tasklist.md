@@ -3612,9 +3612,48 @@ Important: At the end of this document, please find:
           675/675, TestExplainParity 2/10 (diverges unchanged),
           TestVdbeArith 41/41, TestJson 434/434.
 
-      Sub-progress 33 (next) options: (i) `printf()`/format scalars;
-      (ii) begin TK_CASE codegen landing; (iii) additional predicate
-      shapes (EXISTS/NOT EXISTS sub-selects, MATCH, REGEXP).
+    - [X] Sub-progress 33 — corpus expansion group #5 (2026-04-27).
+      Eight new corpus rows added to TestWhereCorpus.pas; N_CORPUS 60 → 68.
+      No codegen changes — test-corpus-only sub-progress.
+
+      **Outcomes (row-by-row):**
+
+      | Row | Shape | Outcome | Notes |
+      |-----|-------|---------|-------|
+      | `printf('%d',a)='5'` | PRINTF_2ARG | DIVERGE | op-count C=14 Pas=12: Pascal omits the `String8` for the format literal and the `Function` call — printf() is not registered as an INLINEFUNC, so it must go through OP_Function; the two-arg call needs the format-string constant in a register. Root cause: `sqlite3FindFunction` for `printf` returns a non-inline fn; `codeFunc` path should emit `String8` for the literal '%d' arg, then `Function`. The Pascal side emits only a `Null` + bare `Ne` (missing column-load + function call). |
+      | `abs(a)>3` | ABS_NEG | **PASS** (13 ops) | `abs()` with `>` inequality — already working via existing FUNC_ABS path. |
+      | `substr(b,1,1)='x'` | SUBSTR_3ARG | **PASS** (15 ops) | 3-arg substr on untyped column b — already working. |
+      | `lower(b)='hello'` | LOWER_EQ | **PASS** (13 ops) | `lower()` scalar — already working. |
+      | `upper(b)='HELLO'` | UPPER_EQ | **PASS** (13 ops) | `upper()` scalar — already working. |
+      | `CASE WHEN a>5 THEN 1 ELSE 0 END=1` | CASE_WHEN | DIVERGE | op-count C=17 Pas=12: Pascal emits a bare `Null`+`Ne` (treating the whole CASE as an unknown expression) instead of the CASE body. TK_CASE arm in codegen.pas either falls through to a stub or is absent. Root cause: `sqlite3ExprCodeTarget` TK_CASE arm needs to emit `Column`+`Le`(condition)+`Goto`+`Integer`(THEN)+`Integer`(ELSE)+outer `Ne`. Follow-on: port TK_CASE arm. |
+      | `EXISTS (SELECT 1 FROM s WHERE s.x=t.a)` | EXISTS_SUB | DIVERGE | op-count C=30 Pas=11: Pascal produces only a SCAN-with-residual (no subquery machinery). C emits `IfNot`+`OpenAutoindex`+`FilterAdd` (bloom-filter correlated subquery). Root cause: EXISTS subquery codegen (sqlite3CodeSubselect / OP_NotExists path) not yet wired into the WHERE residual for correlated EXISTS predicates. Blocked on 11g.2.d multi-table/subquery planner. |
+      | `NOT EXISTS (SELECT 1 FROM s WHERE s.x=t.a)` | NOT_EXISTS | DIVERGE | op-count C=22 Pas=11: Pascal produces only a SCAN-with-residual. C emits `BeginSubrtn`+`DecrJumpZero`+`Return`+`If` (subroutine-based NOT EXISTS). Same root cause as EXISTS_SUB — correlated subquery codegen not yet ported. Blocked on 11g.2.d. |
+
+      **Summary:** 5 new PASS rows (ABS_NEG, SUBSTR_3ARG, LOWER_EQ, UPPER_EQ
+      confirmed working; ABS_NEG with inequality specifically new).
+      3 new documented DIVERGE gaps:
+        * PRINTF_2ARG: `printf()` multi-arg function codegen — format-string
+          literal not being loaded into a register before `Function` call.
+          Future sub-progress: audit `codeFunc` for non-inline variadic fns.
+        * CASE_WHEN: TK_CASE arm in `sqlite3ExprCodeTarget` produces wrong
+          output (collapses to stub path). Future sub-progress: port TK_CASE.
+        * EXISTS_SUB / NOT_EXISTS: correlated subquery EXISTS/NOT EXISTS —
+          blocked on 11g.2.d multi-table planner (same as LEFT_JOIN/JOIN_WHERE).
+
+      **Test-suite delta:**
+        * TestWhereCorpus: **62 PASS / 6 DIVERGE / 0 ERROR (corpus = 68)**.
+          Pre-existing DIVERGEs: LEFT_JOIN, JOIN_WHERE (blocked on 11g.2.d).
+          New DIVERGEs: PRINTF_2ARG, CASE_WHEN, EXISTS_SUB, NOT_EXISTS.
+        * No regression: TestParser 45/45, TestExprBasic 40/40,
+          TestSelectBasic pass, TestDMLBasic 54/54, TestSchemaBasic 44/44,
+          TestPrepareBasic 20/20, TestWhereBasic pass, TestWhereSimple pass,
+          TestWhereExpr pass, TestWherePlanner pass, TestExplainParity 2/10
+          (unchanged), TestVdbeArith 41/41, TestJson 434/434.
+
+      Sub-progress 34 options: (i) port TK_CASE arm in codegen.pas
+      (turns CASE_WHEN from DIVERGE to PASS); (ii) fix `printf()` multi-arg
+      function codegen; (iii) begin EXISTS/NOT EXISTS subquery machinery
+      (11g.2.d prerequisite).
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
