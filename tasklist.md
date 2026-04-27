@@ -1884,6 +1884,76 @@ Important: At the end of this document, please find:
       heavy lift — multi-table joins, ORDER BY consumption,
       GROUP BY/aggregate — opens the remaining 16 op-count
       rows.
+    - [X] Sub-progress 12 — EP_IntValue literal optimization +
+      sqlite3GetInt32 substring tolerance + sqlite3Select
+      result-register allocation order alignment (2026-04-27).
+      Three landings:
+
+      (a) `sqlite3GetInt32` (passqlite3util.pas:2667) — removed
+      the trailing-NUL requirement (`if p^ <> #0 then Exit;`)
+      after the digit scan loop.  The C reference tolerates
+      arbitrary trailing characters at the end of the parsed
+      digit run; the Pascal port's strict-NUL gate caused every
+      raw token from the lemon parser (e.g. `5` in `WHERE rowid =
+      5 AND ...`) to fail the parse, demoting it to the textual
+      zToken arm in `codeInteger`, which emits OP_Int64 (P4
+      payload) instead of OP_Integer (P1 payload).  The
+      TestExprBasic T7 `'abc'` non-numeric assertion still holds
+      via the early-out `if not (p^ in ['0'..'9']) then Exit;`.
+
+      (b) `sqlite3ExprAlloc` (codegen.pas:3289) — added the
+      C-equivalent EP_IntValue fast path: when `op = TK_INTEGER`
+      and `sqlite3GetInt32` succeeds on the token, set
+      `EP_IntValue | EP_Leaf | (iValue ? EP_IsTrue : EP_IsFalse)`
+      and write `pNew^.u.iValue := iValue` instead of allocating
+      the trailing zToken buffer.  Mirrors expr.c:929..950's
+      `if(op==TK_INTEGER || ... sqlite3GetInt32(...)==0)` arm.
+
+      Both (a) and (b) flip the IPK-row WHERE-constant codegen
+      from `Int64 p1=0 p2=2 p4=&5` to `Integer p1=5 p2=1` —
+      byte-identical to the C oracle for the value column.
+
+      (c) `sqlite3Select` (codegen.pas:14569..14600) — moved the
+      result-register block allocation from BEFORE
+      `sqlite3WhereBegin` to AFTER it, mirroring select.c's
+      selectInnerLoop convention where `pDest^.iSdst` is
+      allocated lazily on first reference.  Previously the result
+      registers reserved regs 1..N first, leaving the WHERE
+      machinery's IPK constant register (allocated via
+      sqlite3GetTempReg inside codeEqualityTerm) at reg N+1; C
+      orders it the other way (WHERE constant gets reg 1, result
+      reg 2).  After the swap the IPK row's Integer / Column /
+      ResultRow / SeekRowid registers all align byte-identically
+      with the C oracle.
+
+      Test-suite delta:
+        * TestWhereCorpus IPK literal row: bytecode body now
+          matches C exactly except for `Init.p2` (Pascal=7 vs
+          C=8 — Pascal Init jumps to Transaction; C Init jumps to
+          Goto, presumably a SQLITE_USER_AUTHENTICATION or other
+          conditional opcode in the C build's prologue layout).
+          Failure-mode tally moves from `15 op-count, 5 op-diff`
+          (sub-progress 11) back to the sub-progress 10 baseline
+          `16 op-count, 4 op-diff` — IPK literal stays in op-diff
+          but with a single-op delta instead of a 4-op
+          register/value-shape divergence.
+        * No regression anywhere: TestParser 45/45,
+          TestParserSmoke 20/20, TestPrepareBasic 20/20,
+          TestSelectBasic 49/49, TestExprBasic 40/40,
+          TestDMLBasic 54/54, TestSchemaBasic 44/44,
+          TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41,
+          TestExplainParity 2 pass / 8 diverge / 0 error
+          (unchanged).
+
+      Sub-progress 13 must root-cause the Init.p2 single-op
+      delta (likely an authentication / autoincrement / vtab-lock
+      conditional emit in C's sqlite3FinishCoding that the Pascal
+      port omits) and align the trailing op layout so IPK literal
+      and FULL flip from op-diff to PASS.  The heavy multi-table
+      / aggregate / ORDER-BY work for the remaining 16 op-count
+      rows is unchanged from the sub-progress 11 narrative.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

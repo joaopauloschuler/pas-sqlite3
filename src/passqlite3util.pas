@@ -2686,7 +2686,6 @@ begin
     if v > $80000000 then Exit;
     Inc(p);
   end;
-  if p^ <> #0 then Exit;
   if neg then v := -v;
   if (v < Low(i32)) or (v > High(i32)) then Exit;
   if pValue <> nil then pValue^ := i32(v);

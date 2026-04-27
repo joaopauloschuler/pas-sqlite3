@@ -3291,22 +3291,47 @@ function sqlite3ExprAlloc(db: PTsqlite3; op: i32;
 var
   pNew:   PExpr;
   nExtra: i32;
+  iValue: i32;
+  isIntLit: Boolean;
 begin
-  if pToken <> nil then nExtra := i32(pToken^.n) + 1 else nExtra := 0;
+  iValue := 0;
+  isIntLit := False;
+  nExtra := 0;
+  if pToken <> nil then
+  begin
+    if (op = TK_INTEGER) and (pToken^.z <> nil)
+       and (sqlite3GetInt32(pToken^.z, @iValue) <> 0) then
+    begin
+      isIntLit := True;
+    end
+    else
+      nExtra := i32(pToken^.n) + 1;
+  end;
   pNew := PExpr(sqlite3DbMallocRawNN(db, SizeOf(TExpr) + nExtra));
   if pNew <> nil then
   begin
     FillChar(pNew^, SizeOf(TExpr), 0);
     pNew^.op   := u8(op);
     pNew^.iAgg := -1;
-    if nExtra > 0 then
+    if pToken <> nil then
     begin
-      pNew^.u.zToken := PAnsiChar(PByte(pNew) + SizeOf(TExpr));
-      if (pToken^.n > 0) and (pToken^.z <> nil) then
-        Move(pToken^.z^, pNew^.u.zToken^, pToken^.n);
-      pNew^.u.zToken[pToken^.n] := #0;
-      if (dequote <> 0) and (pNew^.u.zToken[0] in ['"', '''', '[', '`']) then
-        sqlite3DequoteExpr(pNew);
+      if isIntLit then
+      begin
+        if iValue <> 0 then
+          pNew^.flags := pNew^.flags or (EP_IntValue or EP_Leaf or EP_IsTrue)
+        else
+          pNew^.flags := pNew^.flags or (EP_IntValue or EP_Leaf or EP_IsFalse);
+        pNew^.u.iValue := iValue;
+      end
+      else if nExtra > 0 then
+      begin
+        pNew^.u.zToken := PAnsiChar(PByte(pNew) + SizeOf(TExpr));
+        if (pToken^.n > 0) and (pToken^.z <> nil) then
+          Move(pToken^.z^, pNew^.u.zToken^, pToken^.n);
+        pNew^.u.zToken[pToken^.n] := #0;
+        if (dequote <> 0) and (pNew^.u.zToken[0] in ['"', '''', '[', '`']) then
+          sqlite3DequoteExpr(pNew);
+      end;
     end;
     pNew^.nHeight := 1;
   end;
@@ -14541,8 +14566,23 @@ begin
   { Column-name header — mirrors select.c:7682..7684 (eDest==SRT_Output). }
   sqlite3GenerateColumnNames(pParse, p);
 
-  { Allocate the contiguous result-register block (selectInnerLoop:1179..1196). }
   nResultCol := pEList^.nExpr;
+  pDest^.nSdst := nResultCol;
+
+  { Drive the WHERE machinery for the (single, no-WHERE) loop body.
+    sqlite3WhereBegin emits OpenRead + Rewind for the only level. The
+    WHERE codegen allocates whatever scratch registers the IPK / index
+    lookup needs FIRST, then the result-register block is allocated
+    inside selectInnerLoop below.  Mirrors C select.c selectInnerLoop
+    which lazily allocates pDest->iSdst when zero. }
+  pWInfo := sqlite3WhereBegin(pParse, pTabList, p^.pWhere, p^.pOrderBy,
+                              pEList, p, 0, 0);
+  if pWInfo = nil then
+  begin
+    Result := SQLITE_ERROR; Exit;
+  end;
+
+  { Allocate the contiguous result-register block (selectInnerLoop:1179..1196). }
   if pDest^.iSdst = 0 then
   begin
     pDest^.iSdst   := pParse^.nMem + 1;
@@ -14550,16 +14590,6 @@ begin
   end
   else if pDest^.iSdst + nResultCol > pParse^.nMem then
     pParse^.nMem := pParse^.nMem + nResultCol;
-  pDest^.nSdst := nResultCol;
-
-  { Drive the WHERE machinery for the (single, no-WHERE) loop body.
-    sqlite3WhereBegin emits OpenRead + Rewind for the only level. }
-  pWInfo := sqlite3WhereBegin(pParse, pTabList, p^.pWhere, p^.pOrderBy,
-                              pEList, p, 0, 0);
-  if pWInfo = nil then
-  begin
-    Result := SQLITE_ERROR; Exit;
-  end;
 
   { Inner loop body — one OP_Column per result column (selectInnerLoop:1197). }
   for i := 0 to nResultCol - 1 do
