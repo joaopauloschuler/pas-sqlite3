@@ -158,8 +158,8 @@ REMEMBER: Remember that you are porting code. DO NOT RANDOMLY ADD TESTS unless y
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 829 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 830); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 861 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 862); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -192,8 +192,8 @@ REMEMBER: Remember that you are porting code. DO NOT RANDOMLY ADD TESTS unless y
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
   comparison ops + literal-arith + col aliases + multi-col index +
   multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **829 PASS / 1 DIVERGE / 0 ERROR**
-  (corpus = 830 after probe sweeps #28..#29).
+  Current Status (2026-04-27): **861 PASS / 1 DIVERGE / 0 ERROR**
+  (corpus = 862 after probe sweep #30).
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -271,8 +271,8 @@ REMEMBER: Remember that you are porting code. DO NOT RANDOMLY ADD TESTS unless y
 
     - [ ] **6.10 step 6** Expand corpus further and drive remaining
       DIVERGEs to PASS, then promote from report-only to hard gate.
-      Corpus now 829 PASS / 1 DIVERGE / 830 total after probe
-      sweeps #18..#29 (each added 25–36 PASS rows).  The pattern:
+      Corpus now 861 PASS / 1 DIVERGE / 862 total after probe
+      sweeps #18..#30 (each added 25–36 PASS rows).  The pattern:
       pick SQL shapes adjacent to those already PASSing, batch
       ~20–30 at a time, drop any that DIVERGE into the actionable
       list below.

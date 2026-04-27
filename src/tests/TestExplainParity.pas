@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 830;
+  N_CORPUS = 862;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -988,6 +988,40 @@ begin
   Add(i, 'DELETE s rowid=43',           'DELETE FROM s WHERE rowid=43;');        Inc(i);
   Add(i, 'SAVEPOINT spW',               'SAVEPOINT spW;');                       Inc(i);
   Add(i, 'RELEASE spW',                 'RELEASE spW;');                         Inc(i);
+
+  { Probe sweep #30 — additional adjacent shapes mirroring sweeps #27..#29. }
+  Add(i, 'SELECT 14+14',                'SELECT 14+14;');                        Inc(i);
+  Add(i, 'SELECT 250-25',               'SELECT 250-25;');                       Inc(i);
+  Add(i, 'SELECT 11*11',                'SELECT 11*11;');                        Inc(i);
+  Add(i, 'SELECT 196/14',               'SELECT 196/14;');                       Inc(i);
+  Add(i, 'SELECT 23%6',                 'SELECT 23%6;');                         Inc(i);
+  Add(i, 'SELECT 1+2+3+4+5',            'SELECT 1+2+3+4+5;');                    Inc(i);
+  Add(i, 'SELECT -8+8',                 'SELECT -8+8;');                         Inc(i);
+  Add(i, 'SELECT -6*-7',                'SELECT -6*-7;');                        Inc(i);
+  Add(i, 'SELECT a+5',                  'SELECT a+5 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a-5',                  'SELECT a-5 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a*5',                  'SELECT a*5 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a/5',                  'SELECT a/5 FROM t;');                   Inc(i);
+  Add(i, 'SELECT b-3',                  'SELECT b-3 FROM t;');                   Inc(i);
+  Add(i, 'SELECT c*4',                  'SELECT c*4 FROM t;');                   Inc(i);
+  Add(i, 'SELECT a WHERE rowid=37',     'SELECT a FROM t WHERE rowid=37;');      Inc(i);
+  Add(i, 'SELECT a WHERE rowid=38',     'SELECT a FROM t WHERE rowid=38;');      Inc(i);
+  Add(i, 'SELECT a WHERE rowid=39',     'SELECT a FROM t WHERE rowid=39;');      Inc(i);
+  Add(i, 'SELECT a WHERE a=17',         'SELECT a FROM t WHERE a=17;');          Inc(i);
+  Add(i, 'SELECT a WHERE a=18',         'SELECT a FROM t WHERE a=18;');          Inc(i);
+  Add(i, 'SELECT a WHERE a=19',         'SELECT a FROM t WHERE a=19;');          Inc(i);
+  Add(i, 'INSERT t 29 58 87',           'INSERT INTO t VALUES(29,58,87);');      Inc(i);
+  Add(i, 'INSERT t 30 60 90',           'INSERT INTO t VALUES(30,60,90);');      Inc(i);
+  Add(i, 'INSERT alt 74 84 94',         'INSERT INTO s VALUES(74,84,94);');      Inc(i);
+  Add(i, 'INSERT alt -13 -23 -33',      'INSERT INTO s VALUES(-13,-23,-33);');   Inc(i);
+  Add(i, 'DELETE rowid=125',            'DELETE FROM t WHERE rowid=125;');       Inc(i);
+  Add(i, 'DELETE rowid=126',            'DELETE FROM t WHERE rowid=126;');       Inc(i);
+  Add(i, 'DELETE s rowid=44',           'DELETE FROM s WHERE rowid=44;');        Inc(i);
+  Add(i, 'DELETE s rowid=45',           'DELETE FROM s WHERE rowid=45;');        Inc(i);
+  Add(i, 'SAVEPOINT spX',               'SAVEPOINT spX;');                       Inc(i);
+  Add(i, 'RELEASE spX',                 'RELEASE spX;');                         Inc(i);
+  Add(i, 'SAVEPOINT spY',               'SAVEPOINT spY;');                       Inc(i);
+  Add(i, 'SAVEPOINT sixteen',           'SAVEPOINT sixteen;');                   Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
