@@ -156,8 +156,8 @@ Important: At the end of this document, please find:
     TestExplainParity expansion.  Re-enable any disabled assertion /
     safety-net guards left in place during 11g.2.b..e.
     Current baseline (2026-04-27): **TestWhereCorpus 92 PASS / 0
-    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 566 PASS / 1
-    DIVERGE / 0 ERROR (corpus = 567); TestWherePlanner 675/675.**
+    DIVERGE / 0 ERROR (corpus = 92); TestExplainParity 596 PASS / 1
+    DIVERGE / 0 ERROR (corpus = 597); TestWherePlanner 675/675.**
     Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
     `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
     the system one.
@@ -190,8 +190,8 @@ Important: At the end of this document, please find:
   rowid-EQ + per-row arith / negate / concat + transaction synonyms +
   comparison ops + literal-arith + col aliases + multi-col index +
   multi-arith chains + NULL mixing + alt-table DML).
-  Current Status (2026-04-27): **566 PASS / 1 DIVERGE / 0 ERROR**
-  (corpus = 567 after probe sweep #21).
+  Current Status (2026-04-27): **596 PASS / 1 DIVERGE / 0 ERROR**
+  (corpus = 597 after probe sweep #22).
   Drive to all-PASS, then expand corpus further (pragma / trigger /
   multi-table SELECT / aggregates / joins) and promote from report-only
   to hard gate.
@@ -269,8 +269,8 @@ Important: At the end of this document, please find:
 
     - [ ] **6.10 step 6** Expand corpus further and drive remaining
       DIVERGEs to PASS, then promote from report-only to hard gate.
-      Corpus now 566 PASS / 1 DIVERGE / 567 total after probe
-      sweeps #18..#21 (each added 25–30 PASS rows).  The pattern:
+      Corpus now 596 PASS / 1 DIVERGE / 597 total after probe
+      sweeps #18..#22 (each added 25–30 PASS rows).  The pattern:
       pick SQL shapes adjacent to those already PASSing, batch
       ~20–30 at a time, drop any that DIVERGE into the actionable
       list below.

@@ -69,7 +69,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 567;
+  N_CORPUS = 597;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -705,6 +705,38 @@ begin
   Add(i, 'CREATE INDEX i_t_b3',         'CREATE INDEX i_t_b3 ON t(b);');         Inc(i);
   Add(i, 'CREATE UNIQUE INDEX i3u',     'CREATE UNIQUE INDEX i3u ON t(c);');     Inc(i);
   Add(i, 'CREATE INDEX i_s_y3',         'CREATE INDEX i_s_y3 ON s(y);');         Inc(i);
+
+  { Probe sweep #22 — more adjacent shapes. }
+  Add(i, 'CREATE TABLE z32 simple',     'CREATE TABLE z32(a,b);');               Inc(i);
+  Add(i, 'CREATE TABLE z33 simple',     'CREATE TABLE z33(p,q,r);');             Inc(i);
+  Add(i, 'CREATE TABLE z34 1col',       'CREATE TABLE z34(only);');              Inc(i);
+  Add(i, 'CREATE TABLE z35 6col',       'CREATE TABLE z35(a,b,c,d,e,f);');       Inc(i);
+  Add(i, 'CREATE TABLE z36 IPK',        'CREATE TABLE z36(k INTEGER PRIMARY KEY, v);'); Inc(i);
+  Add(i, 'CREATE INDEX i_s_z3',         'CREATE INDEX i_s_z3 ON s(z);');         Inc(i);
+  Add(i, 'CREATE INDEX i_t_c2',         'CREATE INDEX i_t_c2 ON t(c);');         Inc(i);
+  Add(i, 'CREATE UNIQUE INDEX i6u',     'CREATE UNIQUE INDEX i6u ON s(y);');     Inc(i);
+  Add(i, 'CREATE UNIQUE INDEX i7u',     'CREATE UNIQUE INDEX i7u ON s(z);');     Inc(i);
+  Add(i, 'SAVEPOINT spO',               'SAVEPOINT spO;');                       Inc(i);
+  Add(i, 'RELEASE spO',                 'RELEASE spO;');                         Inc(i);
+  Add(i, 'SAVEPOINT spP',               'SAVEPOINT spP;');                       Inc(i);
+  Add(i, 'RELEASE spP',                 'RELEASE spP;');                         Inc(i);
+  Add(i, 'SAVEPOINT ten',               'SAVEPOINT ten;');                       Inc(i);
+  Add(i, 'INSERT t 13 26 39',           'INSERT INTO t VALUES(13,26,39);');      Inc(i);
+  Add(i, 'INSERT t 14 28 42',           'INSERT INTO t VALUES(14,28,42);');      Inc(i);
+  Add(i, 'INSERT t 15 30 45',           'INSERT INTO t VALUES(15,30,45);');      Inc(i);
+  Add(i, 'INSERT alt 7 8 9',            'INSERT INTO s VALUES(7,8,9);');         Inc(i);
+  Add(i, 'INSERT alt 10 11 12',         'INSERT INTO s VALUES(10,11,12);');      Inc(i);
+  Add(i, 'DELETE rowid=30',             'DELETE FROM t WHERE rowid=30;');        Inc(i);
+  Add(i, 'DELETE rowid=40',             'DELETE FROM t WHERE rowid=40;');        Inc(i);
+  Add(i, 'DELETE rowid=50',             'DELETE FROM t WHERE rowid=50;');        Inc(i);
+  Add(i, 'DELETE s rowid=5',            'DELETE FROM s WHERE rowid=5;');         Inc(i);
+  Add(i, 'DELETE s rowid=10',           'DELETE FROM s WHERE rowid=10;');        Inc(i);
+  Add(i, 'SELECT a WHERE rowid=7',      'SELECT a FROM t WHERE rowid=7;');       Inc(i);
+  Add(i, 'SELECT a WHERE rowid=11',     'SELECT a FROM t WHERE rowid=11;');      Inc(i);
+  Add(i, 'SELECT a WHERE rowid=13',     'SELECT a FROM t WHERE rowid=13;');      Inc(i);
+  Add(i, 'SELECT x WHERE rowid=2',      'SELECT x FROM s WHERE rowid=2;');       Inc(i);
+  Add(i, 'SELECT x WHERE rowid=3',      'SELECT x FROM s WHERE rowid=3;');       Inc(i);
+  Add(i, 'SELECT y WHERE rowid=1',      'SELECT y FROM s WHERE rowid=1;');       Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
