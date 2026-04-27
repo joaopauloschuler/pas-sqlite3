@@ -19778,12 +19778,130 @@ end;
 
 procedure codeINTerm(pParse: PParse; pTerm: PWhereTerm;
   pLevel: PWhereLevel; iEq: i32; bRev: i32; iTarget: i32);
+var
+  pX:     PExpr;
+  eType:  i32;
+  iTab:   i32;
+  pIn:    PInLoop;
+  pLoop:  PWhereLoop;
+  v:      PVdbe;
+  i:      i32;
+  nEq:    i32;
+  aiMap:  Pi32;
+  pXMod:  PExpr;
+  db:     PTsqlite3;
+  iMap:   i32;
+  iOut:   i32;
+  iCol:   i32;
+  newSize: u64;
+  baseInLoop: i32;
+  rcOp:   i32;
 begin
-  { wherecode.c:668..784 — the IN-loop builder.  Full implementation requires
-    sqlite3FindInIndex (select.c subselect codegen, not yet ported).  Caller
-    contract for this stub: never invoke until that prerequisite lands.
-    Coverage at the next sub-progress. }
-  Assert(False, 'codeINTerm not yet ported (depends on sqlite3FindInIndex)');
+  { wherecode.c:668..784 — IN-loop builder.  Allocates an InLoop slot per
+    matching aLTerm entry, opens the IN cursor (table/index/EPH per
+    sqlite3FindInIndex), and emits the per-iteration OP_Rowid/OP_Column +
+    OP_IsNull preamble that the per-row body will jump back to. }
+  pX     := pTerm^.pExpr;
+  eType  := IN_INDEX_NOOP;
+  pLoop  := pLevel^.pWLoop;
+  v      := pParse^.pVdbe;
+  nEq    := 0;
+  aiMap  := nil;
+
+  if ((pLoop^.wsFlags and WHERE_VIRTUALTABLE) = 0)
+     and (pLoop^.u.btree.pIndex <> nil)
+     and (pLoop^.u.btree.pIndex^.aSortOrder[iEq] <> 0) then
+  begin
+    if bRev <> 0 then bRev := 0 else bRev := 1;
+  end;
+  Assert(pX^.op = TK_IN);
+
+  { If an earlier equality term already built a loop on the same Expr, just
+    disable the term — the existing loop already iterates X. }
+  for i := 0 to iEq - 1 do begin
+    if (pLoop^.aLTerm[i] <> nil) and (pLoop^.aLTerm[i]^.pExpr = pX) then begin
+      disableTerm(pLevel, pTerm);
+      Exit;
+    end;
+  end;
+  for i := iEq to pLoop^.nLTerm - 1 do begin
+    Assert(pLoop^.aLTerm[i] <> nil);
+    if pLoop^.aLTerm[i]^.pExpr = pX then Inc(nEq);
+  end;
+
+  iTab := 0;
+  if (not ExprUseXSelect(pX)) or (pX^.x.pSelect^.pEList^.nExpr = 1) then begin
+    eType := sqlite3FindInIndex(pParse, pX, IN_INDEX_LOOP, nil, nil, @iTab);
+  end else begin
+    db    := pParse^.db;
+    pXMod := removeUnindexableInClauseTerms(pParse, iEq, pLoop, pX);
+    if db^.mallocFailed = 0 then begin
+      aiMap := Pi32(sqlite3DbMallocZero(db, u64(SizeOf(i32)) * u64(nEq)));
+      eType := sqlite3FindInIndex(pParse, pXMod, IN_INDEX_LOOP, nil, aiMap, @iTab);
+    end;
+    sqlite3ExprDelete(db, pXMod);
+  end;
+
+  if eType = IN_INDEX_INDEX_DESC then begin
+    if bRev <> 0 then bRev := 0 else bRev := 1;
+  end;
+  if bRev <> 0 then rcOp := OP_Last else rcOp := OP_Rewind;
+  sqlite3VdbeAddOp2(v, rcOp, iTab, 0);
+
+  Assert((pLoop^.wsFlags and WHERE_MULTI_OR) = 0);
+  pLoop^.wsFlags := pLoop^.wsFlags or WHERE_IN_ABLE;
+  if pLevel^.u.in_nIn = 0 then
+    pLevel^.addrNxt := sqlite3VdbeMakeLabel(pParse);
+  if (iEq > 0) and ((pLoop^.wsFlags and WHERE_IN_SEEKSCAN) = 0) then
+    pLoop^.wsFlags := pLoop^.wsFlags or WHERE_IN_EARLYOUT;
+
+  baseInLoop          := pLevel^.u.in_nIn;
+  pLevel^.u.in_nIn    := pLevel^.u.in_nIn + nEq;
+  newSize             := u64(SizeOf(TInLoop)) * u64(pLevel^.u.in_nIn);
+  pLevel^.u.in_aInLoop := PInLoop(sqlite3WhereRealloc(pTerm^.pWC^.pWInfo,
+                                  pLevel^.u.in_aInLoop, newSize));
+  pIn := pLevel^.u.in_aInLoop;
+  if pIn <> nil then begin
+    iMap := 0;
+    Inc(pIn, baseInLoop);
+    for i := iEq to pLoop^.nLTerm - 1 do begin
+      if pLoop^.aLTerm[i]^.pExpr = pX then begin
+        iOut := iTarget + i - iEq;
+        if eType = IN_INDEX_ROWID then begin
+          pIn^.addrInTop := sqlite3VdbeAddOp2(v, OP_Rowid, iTab, iOut);
+        end else begin
+          if aiMap <> nil then begin
+            iCol := aiMap[iMap]; Inc(iMap);
+          end else
+            iCol := 0;
+          pIn^.addrInTop := sqlite3VdbeAddOp3(v, OP_Column, iTab, iCol, iOut);
+        end;
+        sqlite3VdbeAddOp1(v, OP_IsNull, iOut);
+        if i = iEq then begin
+          pIn^.iCur := iTab;
+          if bRev <> 0 then pIn^.eEndLoopOp := OP_Prev
+                       else pIn^.eEndLoopOp := OP_Next;
+          if iEq > 0 then begin
+            pIn^.iBase   := iTarget - i;
+            pIn^.nPrefix := i;
+          end else begin
+            pIn^.nPrefix := 0;
+          end;
+        end else begin
+          pIn^.eEndLoopOp := OP_Noop;
+        end;
+        Inc(pIn);
+      end;
+    end;
+    if (iEq > 0)
+       and ((pLoop^.wsFlags and (WHERE_IN_SEEKSCAN or WHERE_VIRTUALTABLE)) = 0) then
+    begin
+      sqlite3VdbeAddOp3(v, OP_SeekHit, pLevel^.iIdxCur, 0, iEq);
+    end;
+  end else begin
+    pLevel^.u.in_nIn := 0;
+  end;
+  sqlite3DbFree(pParse^.db, aiMap);
 end;
 
 function codeEqualityTerm(pParse: PParse; pTerm: PWhereTerm;

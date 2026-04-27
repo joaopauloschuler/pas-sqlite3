@@ -726,6 +726,40 @@ Important: At the end of this document, please find:
       NOOP_OK ⇒ IN_INDEX_NOOP, piTab=-1, nTab restored, aiMap[0]=0,
       pLeft restored).  Sub-progress 11g.2.e now unblocks codeINTerm
       itself for the next batch.
+    - [X] Leaf helpers, batch 10 — `codeINTerm` (wherecode.c:668..784)
+      full port replacing the prior `Assert(False)` stub.  IN-loop
+      builder: opens the IN cursor (rowid table / shared index / EPH
+      per `sqlite3FindInIndex`), allocates an `InLoop` slot per
+      matching aLTerm entry via `sqlite3WhereRealloc`, and emits the
+      per-iteration body preamble (OP_Rowid or OP_Column → iOut, then
+      OP_IsNull guard).  Honours the index-aSortOrder bRev flip on
+      DESC keys, the early-disable shortcut when an earlier aLTerm[i]
+      already references the same TK_IN Expr (calls disableTerm and
+      returns without codegen or FindInIndex), the SELECT-vector path
+      (delegates to `removeUnindexableInClauseTerms` + nEq-sized aiMap
+      from `sqlite3DbMallocZero`), and the IN_INDEX_INDEX_DESC bRev
+      double-flip.  Sets `WHERE_IN_ABLE` (always) and `WHERE_IN_EARLYOUT`
+      (when iEq>0 and not WHERE_IN_SEEKSCAN) on `pLoop^.wsFlags`,
+      threads `pLevel^.addrNxt` via `sqlite3VdbeMakeLabel` on the first
+      slot, fills `pIn^.iCur / eEndLoopOp / iBase / nPrefix` for the
+      head-of-chain entry and `OP_Noop` end-loop for every subsequent
+      slot, and emits the trailing `OP_SeekHit` index-skip-only marker
+      when iEq>0 and neither WHERE_IN_SEEKSCAN nor WHERE_VIRTUALTABLE
+      is set.  Realloc-failure path (pIn=nil) restores in_nIn=0 so the
+      level looks empty to the body codegen.  Also corrected the FPD2
+      filterPullDown fixture: `ex0.op` flipped from `TK_INTEGER` to
+      `TK_EQ` with a TK_INTEGER `pRight` literal so codeEqualityTerm
+      routes through the TK_EQ arm (the prior fixture only "passed"
+      because the no-op `Assert(False)` codeINTerm stub silently
+      bypassed the broken dispatch — the fixture would have crashed
+      the moment a real codeINTerm landed).  Gate: `TestWherePlanner.pas`
+      (478/478): CIT1 (early-disable when `aLTerm[0]^.pExpr = pX` and
+      iEq=1 — disableTerm fires, no opcodes emitted, no FindInIndex
+      call, parse.nTab unchanged, in_nIn / addrNxt / WHERE_IN_ABLE all
+      untouched).  Body emission paths (ROWID / INDEX_ASC / INDEX_DESC
+      / EPH) require open-database fixtures (Schema + Table + cursor)
+      and are deferred to the TestWhereCorpus / TestExplainParity gate
+      under 11g.2.f.
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
     `TestWhereCorpus.pas` covering the full WHERE shape matrix

@@ -3885,6 +3885,7 @@ var
   loops:  array[0..2] of TWhereLoop;
   term0:  TWhereTerm;
   ex0:    TExpr;
+  exRight: TExpr;
   alterm: array[0..0] of PWhereTerm;
   base:   i32;
 begin
@@ -3919,9 +3920,16 @@ begin
   { ---- FPD2 — IPK arm: level[1] has regFilter<>0, WHERE_IPK loop with one
        TK_EQ rowid term; emits OP_MustBeInt + OP_Filter, regFilter cleared,
        addrBrk preserved. ---- }
-  ex0.op       := TK_INTEGER;
-  ex0.flags    := EP_IntValue;
-  ex0.u.iValue := 7;
+  { codeEqualityTerm dispatches on pTerm^.pExpr^.op: TK_EQ → emit RHS via
+    sqlite3ExprCodeTarget.  Build a TK_EQ with a TK_INTEGER literal RHS so
+    the IPK filter pull-down emits real opcodes for the rowid==7 term. }
+  FillChar(exRight, SizeOf(exRight), 0);
+  exRight.op       := TK_INTEGER;
+  exRight.flags    := EP_IntValue;
+  exRight.u.iValue := 7;
+
+  ex0.op           := TK_EQ;
+  ex0.pRight       := @exRight;
 
   term0.pExpr     := @ex0;
   term0.eOperator := WO_EQ;
@@ -4479,6 +4487,99 @@ begin
   sqlite3_close(db);
 end;
 
+{ ----- codeINTerm (wherecode.c:668..784) -----
+  Tests the early-disable shortcut: when an earlier aLTerm[i] (i<iEq)
+  already references the same TK_IN Expr, codeINTerm calls disableTerm
+  on pTerm and returns without calling sqlite3FindInIndex or emitting
+  any opcodes.  The body's ROWID/INDEX/EPH/NOOP arms require an open
+  database with real Schema+Table fixtures, deferred to the later
+  TestWhereCorpus / TestExplainParity gates. }
+procedure TestCodeINTerm;
+var
+  db:        PTsqlite3;
+  parse:     TParse;
+  v:         PVdbe;
+  rc:        i32;
+  pIN, pLeft, pR1: PExpr;
+  pList:     PExprList;
+  pListItem: PExprListItem;
+  pLoop:     TWhereLoop;
+  prevTerm, curTerm: TWhereTerm;
+  altermBuf: array[0..1] of PWhereTerm;
+  level:     TWhereLevel;
+  base:      i32;
+begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('CIT open', rc = SQLITE_OK);
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+  v := sqlite3GetVdbe(@parse);
+
+  { Build a minimal `x IN (1)` Expr.  RHS is a 1-element list (ExprUseXList
+    so ExprUseXSelect is false). }
+  pLeft := PExpr(sqlite3DbMallocZero(db, SizeOf(TExpr)));
+  pLeft^.op      := TK_COLUMN;
+  pLeft^.iColumn := 0;
+
+  pR1 := PExpr(sqlite3DbMallocZero(db, SizeOf(TExpr)));
+  pR1^.op       := TK_INTEGER;
+  pR1^.flags    := EP_IntValue;
+  pR1^.u.iValue := 7;
+
+  pList := PExprList(sqlite3DbMallocZero(db, SizeOf(TExprList)
+                                            + 1 * SZ_EXPRLIST_ITEM));
+  pList^.nExpr  := 1;
+  pList^.nAlloc := 1;
+  pListItem := ExprListItems(pList);
+  pListItem^.pExpr := pR1;
+
+  pIN := PExpr(sqlite3DbMallocZero(db, SizeOf(TExpr)));
+  pIN^.op      := TK_IN;
+  pIN^.pLeft   := pLeft;
+  pIN^.x.pList := pList;
+
+  { CIT1 — prior aLTerm[0] already references pX; codeINTerm at iEq=1
+    must call disableTerm + return without codegen or FindInIndex calls.
+    Pre-condition: pTerm^.iParent = -1 so disableTerm just lights
+    TERM_CODED and exits. }
+  FillChar(pLoop,    SizeOf(pLoop),    0);
+  FillChar(prevTerm, SizeOf(prevTerm), 0);
+  FillChar(curTerm,  SizeOf(curTerm),  0);
+  FillChar(level,    SizeOf(level),    0);
+
+  prevTerm.pExpr   := pIN;
+  prevTerm.iParent := -1;
+  curTerm.pExpr    := pIN;
+  curTerm.iParent  := -1;
+
+  altermBuf[0]    := @prevTerm;
+  altermBuf[1]    := @curTerm;
+  pLoop.aLTerm    := @altermBuf[0];
+  pLoop.nLTerm    := 2;
+  pLoop.wsFlags   := 0;
+  level.pWLoop    := @pLoop;
+
+  base := sqlite3VdbeCurrentAddr(v);
+  codeINTerm(@parse, @curTerm, @level, 1 { iEq }, 0 { bRev }, 5 { iTarget });
+
+  Check('CIT1 no opcodes emitted on early-disable',
+        sqlite3VdbeCurrentAddr(v) = base);
+  Check('CIT1 pTerm marked TERM_CODED',
+        (curTerm.wtFlags and TERM_CODED) <> 0);
+  Check('CIT1 wsFlags untouched (no WHERE_IN_ABLE)',
+        (pLoop.wsFlags and WHERE_IN_ABLE) = 0);
+  Check('CIT1 in_nIn untouched',         level.u.in_nIn   = 0);
+  Check('CIT1 addrNxt untouched',        level.addrNxt    = 0);
+  Check('CIT1 nTab untouched (no FindInIndex)',
+        parse.nTab = 0);
+
+  sqlite3DbFree(db, pIN);
+  sqlite3DbFree(db, pList);
+  sqlite3DbFree(db, pR1);
+  sqlite3DbFree(db, pLeft);
+  sqlite3_close(db);
+end;
+
 begin
   WriteLn('---- TestWherePlanner ----');
   TestOrSet;
@@ -4538,6 +4639,7 @@ begin
   TestSetHasNullFlag;
   TestRowidAlias;
   TestFindInIndex;
+  TestCodeINTerm;
   WriteLn('---- ', gPass, '/', gPass + gFail, ' passed ----');
   if gFail > 0 then Halt(1);
 end.
