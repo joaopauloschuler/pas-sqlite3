@@ -45,12 +45,13 @@ Important: At the end of this document, please find:
       expected cursors / labels, `pLevel^.op = OP_Noop`, term
       flagged TERM_CODED, and `pParse.nQueryLoop` is restored
       across `WhereBegin`/`WhereEnd`.
-    - [ ] Re-enable productive tails in `sqlite3DeleteFrom` and
-      `sqlite3Update`; drop the step-11f skeleton-only error-state
-      guard.  Blocked on Phase 6.5 helpers — `sqlite3GenerateRowDelete`,
-      `sqlite3GenerateConstraintChecks`, `sqlite3CompleteInsertion` are
-      still stubs.  Folded into 11g.2.e alongside `wherecode.c`'s
-      per-row body.
+    - [ ] Re-enable productive tails — `sqlite3Update` skeleton-only
+      and `sqlite3DeleteFrom` vtab `OP_VUpdate` arm still open (tracked
+      under 11g.2.f "Open follow-on").  `sqlite3GenerateRowDelete`,
+      `sqlite3GenerateConstraintChecks` are landed; productive truncate
+      arm + where-loop arm of DeleteFrom landed in 11g.2.f sub-progress
+      48–49.  `sqlite3CompleteInsertion` still a stub but only used by
+      Update productive tail.
 
 - [X] **6.9-bis 11g.2.c** Port `whereexpr.c` (~1944 lines) —
     WHERE-clause term decomposition + analysis.  Public surface:
@@ -199,14 +200,9 @@ Important: At the end of this document, please find:
     sub-progress 50 + 51): Parse.bHasExists set in resolver, SQLITE_ExistsToJoin
     flag, renumberCursors helpers, existsToJoin() itself, sqlite3Select call
     site, OP_IfEmpty emission for fromExists in the cursor-open loop, and the
-    EXISTS-break tail (where.c:7586..7607).  EXISTS_SUB flipped from DIVERGE
-    (Pas=22, C=30) to **PASS at 30 ops, byte-identical**.
-
-    **Minor follow-on (optional polish):** fromExists planner-cost nudges at
-    `where.c:3579, 3630, 4181, 4285, 4991` (5 sites, ~2–10 LOC each — `pNew->nOut = 0`
-    / cost-skip in `whereLoopAddBtree*` / `whereLoopAddOr`).  Did not block the
-    EXISTS_SUB flip because the corpus shape's plan is the one the existing
-    planner picks anyway; only matter for borderline non-corpus shapes.
+    EXISTS-break tail (where.c:7586..7607).  fromExists planner-cost nudges
+    at where.c:3579/3630/4181/4285/4991 already in place.  EXISTS_SUB flipped
+    from DIVERGE (Pas=22, C=30) to **PASS at 30 ops, byte-identical**.
 
     **Open follow-on:** Re-enable productive tails:
       * `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
