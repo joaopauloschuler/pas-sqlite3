@@ -37,11 +37,9 @@ Important: At the end of this document, please find:
       - [ ] code `sqlite3DeleteFrom` vtab `OP_VUpdate`.  
       - [ ] code `sqlite3GenerateRowDelete`,
       - [ ] code `sqlite3GenerateConstraintChecks`
-      - [ ] code `sqlite3CompleteInsertion` still a stub but only used by
-      Update productive tail.
+      - [ ] code `sqlite3CompleteInsertion`
 
-- [ ] **6.9-bis 11g.2.f** Audit + regression.  Land
-    
+- [ ] **6.9-bis 11g.2.f** Audit + regression.    
     - [ ] Code `TestWhereCorpus.pas`
         Verify byte-identical bytecode emission against C via
         TestExplainParity expansion.  
@@ -52,7 +50,7 @@ Important: At the end of this document, please find:
         `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
         the system one.
 
-    - [ ] **Open follow-on:** Re-enable productive tails:
+    - [ ] Re-enable productive tails:
       - [ ] Re-enable `sqlite3DeleteFrom` (`passqlite3codegen.pas:17339`): truncate
         arm and where-loop / one-pass arm both productive.  vtab
         `OP_VUpdate` arm still TODO (out of current corpus).
