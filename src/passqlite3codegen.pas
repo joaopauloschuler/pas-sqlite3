@@ -4362,6 +4362,42 @@ begin
     pDef := sqlite3FindFunction(db, z, -1, db^.enc, 0);
     if pDef = nil then begin Result := False; Exit; end;
   end;
+  { Phase 6.9-bis 11g.2.f sub-progress 28 — inline COALESCE / IFNULL.
+    Faithful port of expr.c:exprCodeInlineFunction's INLINEFUNC_coalesce
+    arm: code arg[0] into target, then for each remaining arg emit
+    OP_NotNull jumping past the rest, followed by codegen of the next
+    arg into the same target slot.  An end-label is resolved once at
+    the bottom so the chain short-circuits the moment a non-NULL value
+    is found.  This avoids the OP_Function dispatch entirely and
+    matches the C oracle's bytecode shape for coalesce()/ifnull() —
+    both use the same INLINEFUNC_coalesce tag in upstream func.c.
+    iif() is left to the existing OP_Function path until its TK_CASE-
+    rewrite landing — `sqlite3ExprIsIIF` already recognises the inline
+    flag for *predicate* analysis, but inline *codegen* of iif() is
+    an independent landing that requires the 3-arg implies-true
+    short-circuit. }
+  if (pDef^.funcFlags and SQLITE_FUNC_INLINE) <> 0 then
+  begin
+    if PtrInt(pDef^.pUserData) = INLINEFUNC_coalesce then
+    begin
+      Assert(n >= 2);
+      items := ExprListItems(pFarg);
+      i := sqlite3VdbeMakeLabel(pParse);
+      sqlite3ExprCode(pParse, PExprListItem(items)^.pExpr, target);
+      r1 := 1;
+      while r1 < n do
+      begin
+        sqlite3VdbeAddOp2(v, OP_NotNull, target, i);
+        sqlite3ExprCode(pParse,
+          PExprListItem(PByte(items) + r1 * SZ_EXPRLIST_ITEM)^.pExpr,
+          target);
+        Inc(r1);
+      end;
+      sqlite3VdbeResolveLabel(v, i);
+      Result := True;
+      Exit;
+    end;
+  end;
   constMask := 0;
   if n > 0 then
   begin
@@ -20690,8 +20726,10 @@ begin
   MakeFD(aBuiltinFuncs[20], 0, FUNC_ENC,  @lastInsertRowid,nil, 'last_insert_rowid');
   MakeFD(aBuiltinFuncs[21], 0, FUNC_ENC,  @changesFunc,    nil, 'changes');
   MakeFD(aBuiltinFuncs[22], 0, FUNC_ENC,  @totalChangesFunc,nil,'total_changes');
-  MakeFD(aBuiltinFuncs[23],-1, FUNC_ENC,  @coalesceFunc,   nil, 'coalesce');
-  MakeFD(aBuiltinFuncs[24], 2, FUNC_ENC,  @ifnullFunc,     nil, 'ifnull');
+  MakeFD(aBuiltinFuncs[23],-1, FUNC_ENC or SQLITE_FUNC_INLINE,  @coalesceFunc,   nil, 'coalesce');
+  aBuiltinFuncs[23].pUserData := Pointer(PtrInt(INLINEFUNC_coalesce));
+  MakeFD(aBuiltinFuncs[24], 2, FUNC_ENC or SQLITE_FUNC_INLINE,  @ifnullFunc,     nil, 'ifnull');
+  aBuiltinFuncs[24].pUserData := Pointer(PtrInt(INLINEFUNC_coalesce));
   MakeFD(aBuiltinFuncs[25], 3, FUNC_ENC,  @iifFunc,        nil, 'iif');
   MakeFD(aBuiltinFuncs[26], 1, FUNC_ENC,  @quoteFunc,      nil, 'quote');
   MakeFD(aBuiltinFuncs[27], 1, FUNC_ENC,  @unicodeFunc,    nil, 'unicode');

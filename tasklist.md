@@ -3286,6 +3286,96 @@ Important: At the end of this document, please find:
       step landing.  The DUP_AND duplicate-predicate hoist is a
       separate optimization that can land independently in any
       sub-progress.
+    - [X] Sub-progress 28 — single-table corpus expansion (group #4) +
+      `coalesce()`/`ifnull()` inline codegen port (2026-04-27).
+      Multi-table planner stays gated on 11g.2.d; this sub-progress
+      widens single-table coverage from 41 to 51 corpus rows, lighting
+      up 10 net new PASS shapes and surfacing one genuine codegen gap
+      (coalesce/ifnull inline-expansion) — ported here.
+
+      (a) `TestWhereCorpus` corpus widened 41 -> 51 rows (group #4).
+      Ten new shapes that exercise additional codegen paths the prior
+      41 rows did not cover: open-ended range comparisons (`a >= 5`,
+      `a <= 5`), `IS` / `IS NOT` against a literal (TK_IS / TK_ISNOT
+      with the typed RHS, distinct from IS NULL / IS NOT NULL), the
+      `GLOB` pattern match (separate codegen arm from LIKE — different
+      built-in dispatch), `NOT BETWEEN` (negated TK_BETWEEN), the
+      `coalesce(a, 0) > 0` scalar-inline shape, triple-OR (`a = 5 OR
+      a = 7 OR a = 9` — three-way decomposition), triple-AND (`a = 5
+      AND b = 7 AND c = 'x'` — left-associative AND chain), and an
+      LHS arithmetic expression (`a + 1 = 5`).  Of the 10 new rows,
+      9 flipped to PASS immediately on the existing single-table
+      machinery — confirming that GE/LE comparison, IS / IS NOT
+      against literals, GLOB built-in dispatch, NOT BETWEEN
+      desugaring, multi-way OR/AND associativity, and LHS arithmetic
+      are all correctly wired through the SCAN-with-residual codegen
+      path.
+
+      (b) Inline `coalesce()` / `ifnull()` codegen — port of expr.c's
+      `exprCodeInlineFunction` INLINEFUNC_coalesce arm
+      (codegen.pas:4365..4404).  C bytecode for `coalesce(a, 0) > 0`
+      avoids OP_Function entirely: it loads arg[0] into the target
+      register, then for each subsequent arg emits an `OP_NotNull
+      target,endLabel` jump followed by codegen of the next arg into
+      the same target, with a label resolved once at the end so the
+      chain short-circuits the moment a non-NULL value is found.
+      `ifnull(a, b)` shares the same INLINEFUNC_coalesce tag in
+      upstream func.c (it's just a 2-arg coalesce alias), so both
+      flow through the single inline path.  Implementation: detect
+      the `(funcFlags and SQLITE_FUNC_INLINE) <> 0` AND
+      `pUserData = INLINEFUNC_coalesce` combo at the top of
+      `emitScalarFunctionCall` (after FindFunction resolution, before
+      the constant-mask first pass), allocate a label via
+      `sqlite3VdbeMakeLabel`, code arg 0 into target, loop over args
+      1..n-1 emitting OP_NotNull + sqlite3ExprCode, resolve the label
+      at the bottom, return True.  The `coalesce`/`ifnull` builtin
+      registrations were updated to set `funcFlags |=
+      SQLITE_FUNC_INLINE` and `pUserData :=
+      Pointer(PtrInt(INLINEFUNC_coalesce))` (codegen.pas:20693..20696)
+      — mirrors upstream func.c's `INLINE_FUNC(coalesce, -1,
+      INLINEFUNC_coalesce, SQLITE_FUNC_INLINE)` and `INLINE_FUNC(
+      ifnull, 2, INLINEFUNC_coalesce, SQLITE_FUNC_INLINE)`.  The
+      original `coalesceFunc` / `ifnullFunc` C entry points are kept
+      as the runtime safety-net path (matches upstream's `noopFunc`
+      placeholder semantics — never reached when codegen succeeds).
+      `iif()` is left to the existing OP_Function path; its inline
+      expansion needs the TK_CASE 3-arg implies-true short-circuit
+      and is an independent landing.
+
+      Test-suite delta:
+        * TestWhereCorpus: **38 PASS / 3 DIVERGE / 0 ERROR (corpus =
+          41)** -> **48 PASS / 3 DIVERGE / 0 ERROR (corpus = 51)**.
+          10 net new PASS rows; 0 net new DIVERGE rows.  Failure-mode
+          tally unchanged: `0 exception, 0 nil-Vdbe, 2 op-count, 1
+          op-diff` (LEFT_JOIN + JOIN_WHERE + DUP_AND).
+        * No regression anywhere: TestParser 45/45, TestParserSmoke
+          20/20, TestPrepareBasic 20/20, TestSelectBasic 49/49,
+          TestExprBasic 40/40, TestDMLBasic 54/54, TestSchemaBasic
+          44/44, TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41, TestVdbeApi
+          57/57, TestVdbeMisc 45/45, TestVdbeAux 108/108, TestVdbeMem
+          62/62, TestVdbeRecord 13/13, TestVdbeAgg 11/11, TestVdbeStr
+          23/23, TestVdbeBlob 13/13, TestVdbeSort 14/14, TestVdbeCursor
+          27/27, TestVdbeVtabExec 50/50, TestExplainParity 2/10
+          unchanged, TestPrintf 105/105, TestJson 434/434, TestJsonEach
+          50/50, TestTokenizer 127/127, TestRegistration 19/19,
+          TestExecGetTable 23/23, TestBackup 20/20, TestConfigHooks
+          54/54, TestInitShutdown 27/27, TestUnlockNotify 14/14,
+          TestLoadExt 20/20, TestAuthBuiltins 34/34, TestOpenClose
+          17/17, TestInitCallback 29/29, TestBtreeCompat 337/337.
+
+      Sub-progress 29 (next) options: (i) port the `iif()` 3-arg
+      INLINEFUNC_iif inline expansion (mirrors INLINEFUNC_coalesce but
+      with implies-true / implies-false short-circuit branching);
+      (ii) the DUP_AND duplicate-predicate constant-folding hoist
+      (still pending — lives in `exprAnalyzeOrTerm` /
+      `whereCombineDisjuncts`); (iii) further single-table corpus
+      expansion (group #5) covering `unlikely()` /  `likely()`
+      no-op fast-path, `cast(... as ...)` codegen, `nullif()` /
+      `printf()` scalar functions, and `EXISTS`/`NOT EXISTS`
+      sub-selects.  Multi-table planner integration for LEFT_JOIN /
+      JOIN_WHERE remains gated on 11g.2.d.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).

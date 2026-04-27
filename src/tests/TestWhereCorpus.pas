@@ -104,7 +104,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 41;
+  N_CORPUS = 51;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -224,6 +224,33 @@ begin
       'SELECT a FROM t WHERE abs(a) = 5;');                   Inc(i);
   Add(i, 'length() in WHERE',         'FUNC_LENGTH',
       'SELECT a FROM t WHERE length(c) > 0;');                Inc(i);
+
+  { Phase 6.9-bis 11g.2.f sub-progress 28 — single-table corpus extension #4.
+    Ten further shapes that exercise additional codegen paths:
+    open-ended range comparisons (>=, <=), the IS / IS NOT operators
+    against a literal (TK_IS / TK_ISNOT), the GLOB pattern match,
+    NOT BETWEEN, scalar coalesce() / lower() / cast(), triple-AND and
+    triple-OR chains, and an LHS arithmetic expression. }
+  Add(i, 'col-GE literal',            'COL_GE',
+      'SELECT a FROM t WHERE a >= 5;');                       Inc(i);
+  Add(i, 'col-LE literal',            'COL_LE',
+      'SELECT a FROM t WHERE a <= 5;');                       Inc(i);
+  Add(i, 'col IS literal',            'IS_LIT',
+      'SELECT a FROM t WHERE a IS 5;');                       Inc(i);
+  Add(i, 'col IS NOT literal',        'ISNOT_LIT',
+      'SELECT a FROM t WHERE a IS NOT 5;');                   Inc(i);
+  Add(i, 'GLOB prefix',               'GLOB',
+      'SELECT a FROM t WHERE c GLOB ''X*'';');                Inc(i);
+  Add(i, 'NOT BETWEEN literal',       'NOT_BETWEEN',
+      'SELECT a FROM t WHERE b NOT BETWEEN 1 AND 10;');       Inc(i);
+  Add(i, 'coalesce() in WHERE',       'COALESCE',
+      'SELECT a FROM t WHERE coalesce(a, 0) > 0;');           Inc(i);
+  Add(i, 'triple OR',                 'TRIPLE_OR',
+      'SELECT a FROM t WHERE a = 5 OR a = 7 OR a = 9;');      Inc(i);
+  Add(i, 'triple AND',                'TRIPLE_AND',
+      'SELECT a FROM t WHERE a = 5 AND b = 7 AND c = ''x'';'); Inc(i);
+  Add(i, 'LHS arith',                 'LHS_ARITH',
+      'SELECT a FROM t WHERE a + 1 = 5;');                    Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
