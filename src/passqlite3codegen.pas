@@ -4342,7 +4342,7 @@ var
   pDef:      PTFuncDef;
   db:        PTsqlite3;
   i, n:      i32;
-  r1:        i32;
+  r1, r2:    i32;
   constMask: u32;
   pArg:      PExpr;
 begin
@@ -4371,11 +4371,10 @@ begin
     is found.  This avoids the OP_Function dispatch entirely and
     matches the C oracle's bytecode shape for coalesce()/ifnull() —
     both use the same INLINEFUNC_coalesce tag in upstream func.c.
-    iif() is left to the existing OP_Function path until its TK_CASE-
-    rewrite landing — `sqlite3ExprIsIIF` already recognises the inline
-    flag for *predicate* analysis, but inline *codegen* of iif() is
-    an independent landing that requires the 3-arg implies-true
-    short-circuit. }
+    iif() inline codegen landed in sub-progress 29 (INLINEFUNC_iif arm
+    below); sqlite3ExprIsIIF already recognises the inline flag for
+    predicate analysis, and the iif registration now carries
+    SQLITE_FUNC_INLINE + INLINEFUNC_iif so both paths are live. }
   if (pDef^.funcFlags and SQLITE_FUNC_INLINE) <> 0 then
   begin
     if PtrInt(pDef^.pUserData) = INLINEFUNC_coalesce then
@@ -4393,6 +4392,58 @@ begin
           target);
         Inc(r1);
       end;
+      sqlite3VdbeResolveLabel(v, i);
+      Result := True;
+      Exit;
+    end
+    else if PtrInt(pDef^.pUserData) = INLINEFUNC_iif then
+    begin
+      { Phase 6.9-bis 11g.2.f sub-progress 29 — inline iif().
+        Port of expr.c:exprCodeInlineFunction INLINEFUNC_iif arm:
+          caseExpr.op = TK_CASE; caseExpr.x.pList = pFarg;
+          return sqlite3ExprCodeTarget(pParse, &caseExpr, target);
+        Since TK_CASE codegen is not yet landed in the Pascal port, we
+        inline the equivalent TK_CASE logic directly.  For iif(cond,a,b):
+          pFarg has 3 items [cond, a, b] — nExpr=3.
+        The TK_CASE WHEN/THEN/ELSE pattern (pLeft=nil → form B):
+          endLabel = make_label
+          for i=0; i<nExpr-1; i+=2:
+            nextCase = make_label
+            ExprIfFalse(pFarg[i], nextCase, SQLITE_JUMPIFNULL)
+            ExprCode(pFarg[i+1], target)
+            Goto endLabel
+            ResolveLabel(nextCase)
+          if nExpr odd: ExprCode(pFarg[nExpr-1], target)   ← else clause
+          else: OP_Null(0, target)
+          ResolveLabel(endLabel)
+        iif() always has n=3 (SQLITE_FUNC_INLINE is registered for arity 3
+        only), so nExpr-1=2 → one iteration, then the else clause.
+        iif(cond,a) with 2 args falls through to OP_Function (not registered
+        inline). }
+      Assert(n = 3);
+      items := ExprListItems(pFarg);
+      i := sqlite3VdbeMakeLabel(pParse);   { endLabel }
+      r1 := 0;                              { loop counter — pairs of WHEN/THEN }
+      while r1 < n - 1 do
+      begin
+        r2 := sqlite3VdbeMakeLabel(pParse); { nextCase }
+        sqlite3ExprIfFalse(pParse,
+          PExprListItem(PByte(items) + r1 * SZ_EXPRLIST_ITEM)^.pExpr,
+          r2, SQLITE_JUMPIFNULL);
+        sqlite3ExprCode(pParse,
+          PExprListItem(PByte(items) + (r1 + 1) * SZ_EXPRLIST_ITEM)^.pExpr,
+          target);
+        sqlite3VdbeGoto(v, i);
+        sqlite3VdbeResolveLabel(v, r2);
+        Inc(r1, 2);
+      end;
+      { ELSE clause: if nExpr is odd, pFarg[nExpr-1] is the else expr }
+      if (n and 1) <> 0 then
+        sqlite3ExprCode(pParse,
+          PExprListItem(PByte(items) + (n - 1) * SZ_EXPRLIST_ITEM)^.pExpr,
+          target)
+      else
+        sqlite3VdbeAddOp2(v, OP_Null, 0, target);
       sqlite3VdbeResolveLabel(v, i);
       Result := True;
       Exit;
@@ -5316,10 +5367,10 @@ end;
     iif(x,y,false)
 
   For TK_FUNCTION nodes, the registered FuncDef must carry
-  SQLITE_FUNC_INLINE and the INLINEFUNC_iif tag (via pUserData).  The
-  current passqlite3 builtin table registers iif as a regular function
-  rather than inline; in that case this branch returns 0 and only the
-  TK_CASE arm is productive. }
+  SQLITE_FUNC_INLINE and the INLINEFUNC_iif tag (via pUserData).
+  As of sub-progress 29 the builtin table registers iif with
+  SQLITE_FUNC_INLINE + INLINEFUNC_iif, so this branch is now fully
+  productive alongside the TK_CASE arm. }
 function sqlite3ExprIsIIF(db: PTsqlite3; const pExpr: PExpr): i32;
 var
   pList: PExprList;
@@ -20730,7 +20781,8 @@ begin
   aBuiltinFuncs[23].pUserData := Pointer(PtrInt(INLINEFUNC_coalesce));
   MakeFD(aBuiltinFuncs[24], 2, FUNC_ENC or SQLITE_FUNC_INLINE,  @ifnullFunc,     nil, 'ifnull');
   aBuiltinFuncs[24].pUserData := Pointer(PtrInt(INLINEFUNC_coalesce));
-  MakeFD(aBuiltinFuncs[25], 3, FUNC_ENC,  @iifFunc,        nil, 'iif');
+  MakeFD(aBuiltinFuncs[25], 3, FUNC_ENC or SQLITE_FUNC_INLINE,  @iifFunc,        nil, 'iif');
+  aBuiltinFuncs[25].pUserData := Pointer(PtrInt(INLINEFUNC_iif));
   MakeFD(aBuiltinFuncs[26], 1, FUNC_ENC,  @quoteFunc,      nil, 'quote');
   MakeFD(aBuiltinFuncs[27], 1, FUNC_ENC,  @unicodeFunc,    nil, 'unicode');
   MakeFD(aBuiltinFuncs[28],-1, FUNC_ENC,  @charFunc,       nil, 'char');

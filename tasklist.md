@@ -3377,6 +3377,57 @@ Important: At the end of this document, please find:
       sub-selects.  Multi-table planner integration for LEFT_JOIN /
       JOIN_WHERE remains gated on 11g.2.d.
 
+    - [X] Sub-progress 29 — `iif()` INLINEFUNC_iif inline expansion
+      (2026-04-27).  Port of `expr.c:exprCodeInlineFunction`'s
+      `INLINEFUNC_iif` arm, which rewrites `iif(cond, a, b)` into a
+      synthetic TK_CASE-like short-circuit.  In the C oracle the arm is
+      a one-liner: create a zero-init `Expr` with `op=TK_CASE`,
+      `x.pList=pFarg`, then call `sqlite3ExprCodeTarget` on it —
+      delegating entirely to the TK_CASE codegen.  Since TK_CASE codegen
+      is not yet landed in the Pascal port, the INLINEFUNC_iif arm in
+      `emitScalarFunctionCall` inlines the equivalent TK_CASE loop
+      directly: allocate an `endLabel`; for each consecutive WHEN/THEN
+      pair in `pFarg` (just one pair for arity-3 iif) call
+      `sqlite3ExprIfFalse(pParse, cond, nextCase, SQLITE_JUMPIFNULL)`,
+      code the THEN expr into target, `sqlite3VdbeGoto(v, endLabel)`,
+      resolve nextCase; then if `nExpr` is odd code the ELSE expr into
+      target (the 3rd arg), else emit `OP_Null(0, target)`; resolve
+      endLabel.  This is semantically identical to what the C oracle
+      emits once TK_CASE dispatches.  Changes:
+
+      (a) Builtin registration (codegen.pas:20733-20734): changed the
+      `iif` entry from `FUNC_ENC` to `FUNC_ENC or SQLITE_FUNC_INLINE`
+      and added `aBuiltinFuncs[25].pUserData :=
+      Pointer(PtrInt(INLINEFUNC_iif))` — mirrors upstream func.c's
+      `INLINE_FUNC(iif, 3, INLINEFUNC_iif, SQLITE_FUNC_INLINE)`.
+
+      (b) `emitScalarFunctionCall` (codegen.pas:4399..4456): added
+      `else if PtrInt(pDef^.pUserData) = INLINEFUNC_iif` arm
+      immediately after the INLINEFUNC_coalesce arm; added `r2: i32`
+      to the function's var block (used for the nextCase label).
+      Added 3 new corpus rows to `TestWhereCorpus.pas` (N_CORPUS
+      51 -> 54): `IIF_GT` (`iif(a > 5, 1, 0) = 1`), `IIF_COL_EQ`
+      (`iif(a = b, a, b) > 3`), `IIF_NULL_ELSE`
+      (`iif(a > 0, a, NULL) IS NOT NULL`).
+
+      Test-suite delta:
+        * TestWhereCorpus: **51 PASS / 3 DIVERGE / 0 ERROR (corpus =
+          54)** → all 3 new iif() rows PASS immediately; the 3
+          pre-existing DIVERGE rows (LEFT_JOIN, JOIN_WHERE, DUP_AND)
+          are unchanged.  New iif shapes generate 16-17 ops each,
+          matching the C oracle byte-for-byte.
+        * No regression: TestExprBasic 40/40, TestSelectBasic 49/49,
+          TestParser 45/45, TestExplainParity 2/10 (diverges
+          unchanged).
+
+      Sub-progress 30 (next) options: (i) the DUP_AND duplicate-
+      predicate constant-folding hoist; (ii) single-table corpus
+      expansion group #5 covering `unlikely()`/`likely()` no-op
+      fast-path, `cast(... as ...)` codegen, `nullif()`/`printf()`
+      scalars, and `EXISTS`/`NOT EXISTS` sub-selects; (iii) begin
+      TK_CASE codegen landing to unify the iif() and CASE-expression
+      paths in the Pascal port.
+
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
   Current Status: **2 PASS / 8 DIVERGE / 0 ERROR**.  Drive to

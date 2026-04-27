@@ -104,7 +104,7 @@ var
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 51;
+  N_CORPUS = 54;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -251,6 +251,19 @@ begin
       'SELECT a FROM t WHERE a = 5 AND b = 7 AND c = ''x'';'); Inc(i);
   Add(i, 'LHS arith',                 'LHS_ARITH',
       'SELECT a FROM t WHERE a + 1 = 5;');                    Inc(i);
+
+  { Phase 6.9-bis 11g.2.f sub-progress 29 — iif() inline codegen.
+    Three shapes that exercise the INLINEFUNC_iif expansion: a simple
+    iif(cond,1,0) filter, iif with a column-comparison condition, and
+    iif with a NULL ELSE branch (2-arg form is not registered inline
+    so we use the explicit 3-arg form with an explicit NULL).  All
+    degrade to SCAN-with-residual on the un-indexed fixture. }
+  Add(i, 'iif(a>5,1,0)=1',           'IIF_GT',
+      'SELECT a FROM t WHERE iif(a > 5, 1, 0) = 1;');         Inc(i);
+  Add(i, 'iif col-eq branch',        'IIF_COL_EQ',
+      'SELECT a FROM t WHERE iif(a = b, a, b) > 3;');          Inc(i);
+  Add(i, 'iif null else',            'IIF_NULL_ELSE',
+      'SELECT a FROM t WHERE iif(a > 0, a, NULL) IS NOT NULL;'); Inc(i);
 
   if i <> N_CORPUS then begin
     WriteLn('FATAL: corpus row count mismatch: filled=', i, ' decl=', N_CORPUS);
