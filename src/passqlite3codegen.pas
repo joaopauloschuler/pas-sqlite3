@@ -18970,8 +18970,8 @@ begin
     sqlite3CompleteInsertion path (those still stubs) — emits the four-op
     OpenWrite / column-eval / NewRowid / MakeRecord / Insert sequence
     directly. }
-  Assert(pList <> nil, 'pList nil at sqlite3Insert single-row path');
-  nColumn := pList^.nExpr;
+  { pList = nil  ⇔  INSERT … DEFAULT VALUES (insert.c:1213..1215). }
+  if pList <> nil then nColumn := pList^.nExpr else nColumn := 0;
 
   if not (isView <> 0) then
     sqlite3OpenTable(pParse, 0, iDb, pTab, OP_OpenWrite);
@@ -18980,10 +18980,24 @@ begin
     sqlite3NestedParse always provide a value for every column (no IDLIST,
     no defaults), so iterate up to nColumn — items beyond pTab^.nCol are
     impossible on the productive path because the parser already validated
-    column count in C-side ExprListAppend / sqlite3SrcListLookup. }
-  pListItems := ExprListItems(pList);
-  for i := 0 to nColumn - 1 do
-    sqlite3ExprCode(pParse, pListItems[i].pExpr, regData + i);
+    column count in C-side ExprListAppend / sqlite3SrcListLookup.
+
+    DEFAULT VALUES path (pList=nil, nColumn=0): emit OP_Null for every
+    column slot so the subsequent OP_MakeRecord has well-defined inputs.
+    sqlite3ColumnExpr is still a stub returning nil (Phase 7), so this
+    matches the result that `sqlite3ExprCodeFactorable(.., nil, .)` would
+    produce in the C reference for the not-yet-ported defaults case. }
+  if pList = nil then
+  begin
+    for i := 0 to i32(pTab^.nCol) - 1 do
+      sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i);
+  end
+  else
+  begin
+    pListItems := ExprListItems(pList);
+    for i := 0 to nColumn - 1 do
+      sqlite3ExprCode(pParse, pListItems[i].pExpr, regData + i);
+  end;
 
   { OP_NewRowid -> regRowid (cursor 0).  C reference passes regAutoinc as P3;
     today's stub returns 0 so this is structurally a no-op for AUTOINCREMENT

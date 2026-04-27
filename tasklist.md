@@ -287,8 +287,10 @@ Important: At the end of this document, please find:
         * `INSERT INTO t(a) VALUES(1)` — Δ=7 (named-column INSERT
           path differs from positional; likely missing column-list
           permutation in `sqlite3Insert`).
-        * `INSERT INTO t DEFAULT VALUES` — **CRASH**
-          (EAccessViolation on Pas-side prepare).  See bug 6.10b.
+        * `INSERT INTO t DEFAULT VALUES` — Δ=5 (no longer crashes —
+          6.10b landed; Pas emits OP_Null inline per column whereas C
+          uses `sqlite3ExprCodeFactorable` to hoist them into the
+          OP_Init prologue so they're only evaluated once per stmt).
         * `SELECT a FROM t WHERE rowid=1 OR rowid=2` — Δ=5 (rowid
           OR-decomposed path; planner reaches multi-loop branch but
           counters disagree).
@@ -299,11 +301,16 @@ Important: At the end of this document, please find:
         * `SAVEPOINT s1` — Δ=1 (single op gap; likely Transaction
           p1 wiring).
 
-- [ ] **6.10b** Bug — `INSERT INTO <tbl> DEFAULT VALUES` raises
-  EAccessViolation during Pascal `sqlite3_prepare_v2` (caught by
-  TestExplainParity probe sweep on 2026-04-27).  Reproduce with
-  `INSERT INTO t DEFAULT VALUES` against the standard
-  t(a,b,c) fixture.
+- [X] **6.10b** Bug — `INSERT INTO <tbl> DEFAULT VALUES` raised
+  EAccessViolation in `sqlite3Insert` (passqlite3codegen.pas:18974)
+  because the single-row VALUES path dereferenced `pList^.nExpr`
+  without guarding the `pList=nil` ⇔ DEFAULT VALUES case.  Fixed by
+  mirroring insert.c:1213..1215: when pList is nil set nColumn=0 and
+  emit `OP_Null` for each column slot so the subsequent OP_MakeRecord
+  has well-defined inputs.  Bytecode-parity with the C reference
+  (which hoists each default into the OP_Init prologue via
+  `sqlite3ExprCodeFactorable`) is still off by a few ops; tracked as
+  the new step-6 follow-on below.
 
     - [X] **6.10 step 7** SELECT/DML divergences exposed by the
       expanded corpus all closed:
