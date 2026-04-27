@@ -23184,6 +23184,12 @@ begin
     sqlite3VdbeJumpHere(v, addrOnce);
     sqlite3VdbeAddOp3(v, OP_Return, pX^.y.sub.regReturn,
                       pX^.y.sub.iAddr, 1);
+    { Mirrors expr.c:3821 — invalidate the temp-register pool so that
+      registers released inside this subroutine are not reused by the
+      caller (the per-row residual filter walks the same Vdbe with no
+      knowledge of which regs the materialisation block consumed). }
+    pParse^.nTempReg  := 0;
+    pParse^.nRangeReg := 0;
   end;
 
   if bloomOk = 0 then ; { silence unused-param hint }

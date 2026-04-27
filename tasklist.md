@@ -2783,6 +2783,59 @@ Important: At the end of this document, please find:
       attention moves to INDEX_IN_SUB (`sqlite3SelectDup` Case-1
       port for subselect IN-RHS) and the multi-table LEFT_JOIN /
       JOIN_WHERE rows that await the 11g.2.d planner.
+    - [X] Sub-progress 22 — `sqlite3ClearTempRegCache` after IN-RHS
+      subroutine emit (2026-04-27).  Root-caused the residue
+      1-register diff at INDEX_IN op[18] to a missing temp-pool
+      invalidation, not a result-register-allocation ordering
+      problem as previously hypothesised.  In C, `sqlite3CodeRhsOfIN`
+      ends the Once-gated subroutine with `OP_NullRow + OP_Return`
+      followed by `sqlite3ClearTempRegCache(pParse)` (expr.c:3821):
+      this is the documented contract for any sub/co-routine that
+      can be invoked from elsewhere — the caller must not reuse
+      registers that the subroutine consumed.  Pas's
+      `sqlite3CodeRhsOfIN` released `r1` and `r2` back to
+      `aTempReg[]` at the end of the literal-list loop and never
+      cleared the pool, so the per-row residual filter (in the
+      same Vdbe but emitted AFTER the subroutine) reused those
+      released slots — `sqlite3ExprCodeIN` Step-2's LHS column
+      load picked register 3 (reusing the released r3 slot)
+      instead of bumping `nMem` to 4.
+
+      Fix: at the end of `sqlite3CodeRhsOfIN`'s `addrOnce <> 0`
+      tail, after `OP_Return`, set `pParse^.nTempReg := 0` and
+      `pParse^.nRangeReg := 0` — the same two-line body upstream
+      uses for `sqlite3ClearTempRegCache`.  Adds 0 opcodes;
+      simply invalidates the pool so the next `GetTempReg`
+      bumps `nMem` instead of reusing.  No new helper added —
+      inlined the two writes since this is the only port site
+      we need today (the other upstream call sites in `analyze.c`,
+      `select.c`, and `pragma.c` aren't reachable yet).
+
+      Test-suite delta:
+        * TestWhereCorpus: **16 → 17 PASS / 4 → 3 DIVERGE / 0
+          ERROR**.  INDEX_IN flipped from `op-diff at op[18]/28`
+          to PASS (28 ops byte-for-byte against the C oracle).
+          Failure-mode tally: `0 exception, 0 nil-Vdbe, 3
+          op-count, 0 op-diff` — no per-op divergences remain in
+          any corpus row.  Per-shape histogram: INDEX_IN 1/0;
+          remaining DIVERGE rows are INDEX_IN_SUB (subselect
+          IN-RHS, awaits Case-1 sqlite3SelectDup), LEFT_JOIN,
+          JOIN_WHERE (multi-table planner, awaits 11g.2.d).
+        * No regression anywhere: TestParser 45/45,
+          TestParserSmoke 20/20, TestPrepareBasic 20/20,
+          TestSelectBasic 49/49, TestExprBasic 40/40,
+          TestDMLBasic 54/54, TestSchemaBasic 44/44,
+          TestWhereBasic 52/52, TestWhereSimple 44/44,
+          TestWhereExpr 84/84, TestWhereStructs 148/148,
+          TestWherePlanner 675/675, TestVdbeArith 41/41,
+          TestVdbeApi 57/57, TestVdbeMisc 45/45,
+          TestExplainParity 2/10 unchanged.
+
+      Sub-progress 23 must port `sqlite3SelectDup` Case-1 of
+      `sqlite3CodeRhsOfIN` (sub-select recursion) so INDEX_IN_SUB
+      reaches the SRT_Set materialisation path; LEFT_JOIN /
+      JOIN_WHERE remain the heaviest follow-on lift, blocked on
+      11g.2.d's multi-table planner.
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
   Scaffold is landed (10-row DDL/transaction corpus, report-only).
