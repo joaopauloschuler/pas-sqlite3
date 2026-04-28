@@ -818,9 +818,20 @@ Important: At the end of this document, please find:
             (build.c:1604); flags any UNIQUE/PK index already attached
             for the column.
   [ ] **6.26** port codegen.pas where / select / window stubs in full from C
-       to pascal: `sqlite3SelectAddTypeInfo`,
-       `sqlite3WhereExplainBloomFilter`, `sqlite3WhereAddExplainText`,
-       `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep`.
+       to pascal: `sqlite3WhereExplainBloomFilter`,
+       `sqlite3WhereAddExplainText`, `sqlite3WindowCodeInit`,
+       `sqlite3WindowCodeStep`.
+       [X] `sqlite3SelectAddTypeInfo` — ported in full (select.c:6399..6439)
+            2026-04-28.  Replaced the "set SF_HasTypeInfo and exit" stub
+            with the real walker: xSelectCallback2 = selectAddSubqueryTypeInfo
+            (Pas) which, for every TF_Ephemeral FROM-subquery item, calls
+            sqlite3SubqueryColumnTypes(pTab, pSel, SQLITE_AFF_NONE) to fill
+            Column.affinity from the subquery's projection list.  Productive
+            for sub-FROM type/affinity propagation once selectExpander wires
+            the SF_NestedFrom / view-expansion arms; Δ-neutral on current
+            corpus (TestExplainParity 1013/13, TestSelectBasic 49/49,
+            TestParser 45/45, TestWhereBasic 52/0, TestVdbeAgg 11/0,
+            TestDMLBasic 54/0, TestSchemaBasic 44/0 — same as before).
        [X] `sqlite3SelectPopWith` — ported in full (select.c:5857..5866)
             2026-04-28.  xSelectCallback2 used by sqlite3SelectExpand: when
             the walker unwinds back through the rightmost SELECT of a

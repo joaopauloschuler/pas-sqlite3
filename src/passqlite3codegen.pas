@@ -17619,14 +17619,57 @@ begin
   sqlite3WalkSelect(@w, pSelect);
 end;
 
-{ sqlite3SelectAddTypeInfo (internal) — stub, wired in Phase 6.5 }
-procedure sqlite3SelectAddTypeInfo(pParse: PParse; pSelect: PSelect);
+{ selectAddSubqueryTypeInfo — fill datatype/affinity/coll on FROM-clause
+  subquery Tables (select.c:6399..6419).  xSelectCallback2 invoked once
+  per Select node post-walk. }
+function selectAddSubqueryTypeInfo(pWalker: PWalker; p: PSelect): i32; cdecl;
+var
+  pPars:    PParse;
+  pTabList: PSrcList;
+  aItems:   PSrcItem;
+  pFrom:    PSrcItem;
+  pTab:     PTable2;
+  pSel:     PSelect;
+  i:        i32;
 begin
-  { Phase 6.5 — subquery type info wiring deferred.
-    Set SF_HasTypeInfo so that sqlite3SelectPrep does not re-run
-    sqlite3SelectExpand / sqlite3ResolveSelectNames on this Select. }
-  if pSelect <> nil then
-    pSelect^.selFlags := pSelect^.selFlags or SF_HasTypeInfo;
+  Result := WRC_Continue;
+  if p = nil then Exit;
+  if (p^.selFlags and SF_HasTypeInfo) <> 0 then Exit;
+  p^.selFlags := p^.selFlags or SF_HasTypeInfo;
+  pPars := pWalker^.pParse;
+  pTabList := p^.pSrc;
+  if pTabList = nil then Exit;
+  aItems := SrcListItems(pTabList);
+  for i := 0 to pTabList^.nSrc - 1 do
+  begin
+    pFrom := @aItems[i];
+    pTab := pFrom^.pSTab;
+    if pTab = nil then Continue;
+    if ((pTab^.tabFlags and TF_Ephemeral) <> 0)
+       and SrcItemIsSubquery(pFrom^.fg)
+       and (pFrom^.u4.pSubq <> nil) then
+    begin
+      pSel := pFrom^.u4.pSubq^.pSelect;
+      if pSel <> nil then
+        sqlite3SubqueryColumnTypes(pPars, pTab, pSel,
+                                   AnsiChar(SQLITE_AFF_NONE));
+    end;
+  end;
+end;
+
+{ sqlite3SelectAddTypeInfo (select.c:6430..6439) — walk a SELECT's
+  sub-tree applying selectAddSubqueryTypeInfo to every Select node. }
+procedure sqlite3SelectAddTypeInfo(pParse: PParse; pSelect: PSelect);
+var
+  w: TWalker;
+begin
+  if pSelect = nil then Exit;
+  FillChar(w, SizeOf(w), 0);
+  w.xSelectCallback  := @sqlite3SelectWalkNoop;
+  w.xSelectCallback2 := TSelectCallback2(@selectAddSubqueryTypeInfo);
+  w.xExprCallback    := @sqlite3ExprWalkNoop;
+  w.pParse           := pParse;
+  sqlite3WalkSelect(@w, pSelect);
 end;
 
 { sqlite3SelectCheckOnClauses — verify ON/USING clauses (select.c:7398..7508).
