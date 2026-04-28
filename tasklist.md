@@ -177,11 +177,18 @@ Important: At the end of this document, please find:
         UTF-8 build never reaches it.  DiagFeatureProbe COLLATE NOCASE
         compare → PASS; total divergences 14 → 13.  No
         TestExplainParity regression (1012 pass / 14 diverge — same).
-      [ ] **b) Scalar subquery returns 0 instead of value.**
-        With t populated `INSERT INTO t VALUES(42)`, the expression
-        `SELECT (SELECT a FROM t)` returns 0 on Pas, 42 on C.  Wraps a
-        codegen gap in `sqlite3CodeSubselect` for the SRT_Mem (scalar)
-        path or in the OP_Once / OP_Integer pre-store; needs trace.
+      [X] **b) Scalar subquery returns 0 instead of value.**  Fixed
+        2026-04-28 by accepting `SRT_Mem` in the `sqlite3Select`
+        eDest gate (codegen.pas:17578) and adding the SRT_Mem disposal
+        arm (selectInnerLoop:1422..1438) — column codegen targets
+        iSdst (=iSDParm) directly, then OP_DecrJumpZero on the
+        sqlite3CodeSubselect-installed LIMIT 1 breaks the loop.
+        Previously the gate exited early so the subroutine body was
+        empty (just OP_Null + OP_Return).  Verified via DiagSubsel:
+        `SELECT (SELECT a FROM t)` now returns 42; bytecode mirrors C
+        modulo the deferred OP_Explain EQP metadata.  DiagFeatureProbe
+        divergences 13 → 12; TestExplainParity unchanged
+        (1012 pass / 14 diverge).
       [ ] **c) View materialisation in SELECT.**
         `SELECT count(*) FROM v` returns no row on Pas.  The
         `sqlite3MaterializeView` body just landed (6.24) but is wired

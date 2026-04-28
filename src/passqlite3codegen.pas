@@ -17576,6 +17576,7 @@ begin
     Sub-progress (TK_EXISTS): accept SRT_Exists for correlated EXISTS subquery. }
   isExists := (pDest^.eDest = SRT_Exists);
   if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_Set) and
+     (pDest^.eDest <> SRT_Mem) and
      (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
   if p^.pPrior <> nil then begin Result := SQLITE_OK; Exit; end;
@@ -17877,6 +17878,18 @@ begin
         LIMIT case only (matched at the gate above); see computeLimitRegisters
         block earlier in this function. }
       if (p^.iLimit <> 0) and (not isExists) then
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, pWInfo^.iBreak);
+    end
+    else if pDest^.eDest = SRT_Mem then
+    begin
+      { selectInnerLoop:1422..1438 — scalar subquery disposal.  Result
+        registers were coded directly into iSdst (== iSDParm) above; no
+        further emit is needed here.  sqlite3CodeSubselect always installs
+        LIMIT 1, so the OP_DecrJumpZero below breaks the loop after the
+        first matching row.  Mirrors the "LIMIT clause will jump out of
+        the loop" comment in C. }
+      Assert(pDest^.iSdst = pDest^.iSDParm);
+      if p^.iLimit <> 0 then
         sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, pWInfo^.iBreak);
     end
     else
