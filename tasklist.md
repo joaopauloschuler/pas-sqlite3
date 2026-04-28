@@ -129,6 +129,40 @@ Important: At the end of this document, please find:
           exists.  Distinct from the INSERT row above — needs planner
           work, not insert.c work.
   
+  [ ] **6.10 step 7** Runtime divergences surfaced by
+      `src/tests/DiagMisc.pas` (run with `LD_LIBRARY_PATH=$PWD/src
+      bin/DiagMisc`).  These all prepare+step cleanly on both Pas and C
+      (rc=0/101) but produce wrong values, so they are *silent
+      result-set bugs* — not bytecode-Δ entries:
+      [ ] **a) DEFAULT clause ignored by INSERT.**  `CREATE TABLE t(a,
+        b DEFAULT 7); INSERT INTO t(a) VALUES(1); SELECT b FROM t`
+        returns 7 on C, 0/NULL on Pas.  Almost certainly the
+        downstream symptom of `sqlite3GenerateConstraintChecks` /
+        `sqlite3CompleteInsertion` not yet wired into `sqlite3Insert`
+        (6.9-bis 11g.2.b open items) — DEFAULT expressions are only
+        emitted by the GenerateConstraintChecks path.  Re-test once
+        those land; if still failing, the DEFAULT-expr lowering itself
+        is broken.
+      [ ] **b) Hex integer literal decoded as 0.**  `INSERT INTO t
+        VALUES(0x1F); SELECT a FROM t` returns 31 on C, 0 on Pas.
+        Both prepare and step succeed, so the value is being parsed
+        but lost during codegen / OP_Integer emission.  Likely a bug
+        in `codeInteger` / `sqlite3DecOrHexToI64` wiring — TK_INTEGER
+        with leading "0x" prefix.  Distinct from the IPK / autoindex
+        gaps and not blocked on any larger port.
+      [ ] **c) Aggregate `count(*)` with WHERE returns no row.**
+        On a table populated via setup,
+        `SELECT count(*) FROM t WHERE a IS NULL` (and the `IS NOT
+        NULL`, `LIKE 'pat%'`, `BETWEEN`, `IN (...)` variants) step
+        directly to SQLITE_DONE without producing a SQLITE_ROW on
+        Pas; C returns one row with the count.  Bare `count(*) FROM
+        t` and the same WHERE filters *without* the aggregate work
+        on Pas (verified in DiagMisc).  So the gap is the
+        aggregate-with-WHERE codegen path: AggStep / AggFinal not
+        emitted when the inner loop carries a residual WHERE branch.
+        Likely shares root cause with the `SELECT SUM/MIN/MAX`
+        Δ=12..13 entry under step 6.
+
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
         the sqlite_schema scrub now uses one-pass inline delete.
