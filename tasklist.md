@@ -42,7 +42,25 @@ Important: At the end of this document, please find:
         (still inline-emits the OP_Insert path) so does not move Δ until
         `sqlite3GenerateConstraintChecks` lands and call-site swaps over.
 - [ ] **6.9-complete** complete the porting of `sqlite3VdbeRecordCompare` and
-  `sqlite3VdbeFindCompare` in FULL in `passqlite3btree.pas`.  Handles MEM_Int / MEM_IntReal - currently insufficient for general index lookup.
+  `sqlite3VdbeFindCompare` in FULL in `passqlite3btree.pas`.
+    - [X] **a)** RHS arms for Real / String / Blob / extra-Null cases
+      ported 2026-04-28.  serialGet7 + IntFloatCompare + isAllZero
+      helpers added locally in btree.pas to avoid a uses-cycle to
+      vdbe.pas.  Real RHS uses sqlite3IntFloatCompare; String / Blob
+      RHS use memcmp (BINARY collation only — see (b)).  Verified
+      TestExplainParity 1013/13, TestBtreeCompat 337/0, TestVdbeRecord
+      13/0, TestVdbeCursor 27/0, TestRowidIn ALL PASS, TestVdbeAgg
+      11/0, TestDMLBasic 54/0, TestSelectBasic 49/0, TestWhereBasic
+      52/0, TestParser 45/0 — no regressions.
+    - [ ] **b)** Collation-aware string compare (vdbeCompareMemString
+      hook from btree.pas → vdbe.pas) — required only for non-BINARY
+      collated index lookups; current corpus has none.  Defer until
+      a test needs it.
+    - [ ] **c)** TUnpackedRecord layout reconcile (btree's slim record
+      vs. codegen's full record) for errCode/aSortFlags/BIGNULL/DESC
+      arms.  Existing slim layout is the lowest common denominator and
+      every caller writes through it; no current corpus exercises sort
+      flags or corruption flagging.
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.        
         Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
@@ -74,19 +92,11 @@ Important: At the end of this document, please find:
           fallback were ported, `sqlite3Insert` early-exits when
           `pSelect <> nil` (codegen.pas:19756 TODO) so the coroutine
           path through sqlite3Insert is required too.
-        [ ] **IPK-IN execution path**
-            [ ] **6.10 step 6.IPK-IN.b.full** Port 
-                `sqlite3VdbeRecordCompare` in full to cover string (collation
-                + encoding-change), blob (with MEM_Zero), and real
-                RHS arms.  Required before any non-IPK ephemeral
-                index lookup (column IN with text keys, ORDER BY
-                sorter materialisation, etc.) executes correctly.
-                Layout note: btree's slim `TUnpackedRecord` does
-                NOT mirror the C `UnpackedRecord` (no errCode/r1/r2,
-                nField is i32 not u16, default_rc is i32 not i8) —
-                reconcile that vs. codegen.pas's bigger
-                TUnpackedRecord before porting the corruption /
-                BIGNULL / DESC arms.
+        [X] **IPK-IN execution path** — string / blob / real RHS arms
+            of `sqlite3VdbeRecordCompare` ported 2026-04-28 (see
+            6.9-complete (a)).  Collation-aware string compare and the
+            TUnpackedRecord layout reconcile remain open under
+            6.9-complete (b)/(c) — neither blocks current-corpus tests.
         [ ] `SELECT DISTINCT a FROM t` — Δ=13 (DISTINCT codegen,
           ephemeral-table dedup not yet wired in `sqlite3Select`).
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —

@@ -2839,6 +2839,7 @@ const
   BT_MEM_Real    = $0008;
   BT_MEM_Blob    = $0010;
   BT_MEM_IntReal = $0020;
+  BT_MEM_Zero    = $0400;
 
 function btreeSerialTypeLen(t: u32): u32; inline;
 begin
@@ -2853,6 +2854,57 @@ begin
     6, 7: Result := 8;
     else Result := 0;
   end;
+end;
+
+{ Decode an IEEE-754 8-byte big-endian float from aKey.  Returns 1 when the
+  bit pattern is a NaN (caller must treat as NULL), 0 otherwise.  Mirrors
+  vdbeaux.c serialGet7. }
+function btreeSerialGet7Real(buf: Pu8; out r: Double): i32;
+var x: u64;
+begin
+  x := (u64(buf[0]) shl 56) or (u64(buf[1]) shl 48)
+    or (u64(buf[2]) shl 40) or (u64(buf[3]) shl 32)
+    or (u64(buf[4]) shl 24) or (u64(buf[5]) shl 16)
+    or (u64(buf[6]) shl 8)  or  u64(buf[7]);
+  Move(x, r, 8);
+  if ((x and u64($7FF0000000000000)) = u64($7FF0000000000000))
+     and ((x and u64($000FFFFFFFFFFFFF)) <> 0) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ Local copy of sqlite3IntFloatCompare (vdbeaux.c:4551) — vdbe.pas's copy
+  is unreachable from btree.pas without a uses-cycle. }
+function btreeIntFloatCompare(i: i64; r: Double): i32;
+var y: i64;
+    di: Double;
+begin
+  { NaN → NULL → integer is greater }
+  if (PUInt64(@r)^ and u64($7FF0000000000000)) = u64($7FF0000000000000) then begin
+    if (PUInt64(@r)^ and u64($000FFFFFFFFFFFFF)) <> 0 then begin
+      Result := 1;
+      Exit;
+    end;
+  end;
+  if r < -9223372036854775808.0 then begin Result := 1; Exit; end;
+  if r >=  9223372036854775808.0 then begin Result := -1; Exit; end;
+  y := i64(Trunc(r));
+  if i < y then begin Result := -1; Exit; end;
+  if i > y then begin Result := 1; Exit; end;
+  di := i;
+  if di < r then Result := -1
+  else if di > r then Result := 1
+  else Result := 0;
+end;
+
+{ Test whether an n-byte buffer is all 0x00. }
+function btreeIsAllZero(p: Pu8; n: i32): Boolean;
+var k: i32;
+begin
+  for k := 0 to n - 1 do
+    if p[k] <> 0 then begin Result := False; Exit; end;
+  Result := True;
 end;
 
 function btreeDecodeInt(serialType: u32; aKey: Pu8): i64;
@@ -2900,6 +2952,8 @@ var
   pRhs:        PBtMemView;
   v1:          i64;
   vTmp32:      u32;
+  rReal, rRhs: Double;
+  nStr, nCmp:  i32;
 begin
   pKey1 := pKey;
   nKey1 := nKey;
@@ -2928,27 +2982,93 @@ begin
       sqlite3GetVarint32(@aKey1[idx1], serial_type);
 
     if (pRhs^.flags and (BT_MEM_Int or BT_MEM_IntReal)) <> 0 then begin
+      { RHS integer — vdbeaux.c:4786 }
       if serial_type >= 10 then begin
         if serial_type = 10 then rc := -1 else rc := 1;
       end else if serial_type = 0 then rc := -1
-      else if serial_type = 7 then rc := 0  { real LHS — TODO full impl }
+      else if serial_type = 7 then begin
+        btreeSerialGet7Real(@aKey1[d1], rReal);
+        rc := -btreeIntFloatCompare(pRhs^.u_i, rReal);
+      end
       else begin
         v1 := btreeDecodeInt(serial_type, @aKey1[d1]);
         if v1 < pRhs^.u_i then rc := -1
         else if v1 > pRhs^.u_i then rc := 1
         else rc := 0;
       end;
+    end else if (pRhs^.flags and BT_MEM_Real) <> 0 then begin
+      { RHS real — vdbeaux.c:4810 }
+      rRhs := PDouble(@pRhs^.u_i)^;
+      if serial_type >= 10 then begin
+        if serial_type = 10 then rc := -1 else rc := 1;
+      end else if serial_type = 0 then rc := -1
+      else if serial_type = 7 then begin
+        if btreeSerialGet7Real(@aKey1[d1], rReal) <> 0 then rc := -1
+        else if rReal < rRhs then rc := -1
+        else if rReal > rRhs then rc := 1
+        else rc := 0;
+      end else begin
+        v1 := btreeDecodeInt(serial_type, @aKey1[d1]);
+        rc := btreeIntFloatCompare(v1, rRhs);
+      end;
+    end else if (pRhs^.flags and BT_MEM_Str) <> 0 then begin
+      { RHS string — vdbeaux.c:4839.  Re-decode serial_type as varint
+        because string serial types are always >=12 (varint width >1
+        is possible). }
+      sqlite3GetVarint32(@aKey1[idx1], serial_type);
+      if serial_type < 12 then rc := -1
+      else if (serial_type and 1) = 0 then rc := 1
+      else begin
+        nStr := i32((serial_type - 12) shr 1);
+        if (d1 + u32(nStr)) > u32(nKey1) then begin
+          { Corruption — match C return-0-without-eqSeen }
+          Result := 0;
+          Exit;
+        end;
+        { No collation hook from btree.pas (would require a vdbe.pas
+          callback — see 6.10 step 6.IPK-IN.b.full).  For BINARY
+          collation (default, aColl[i]==nil in C) the memcmp arm below
+          is exact; for explicit COLLATE clauses on non-rowid btrees
+          this still falls back to memcmp, which is wrong only when a
+          non-BINARY collation is attached.  No call site in the
+          current corpus exercises that. }
+        if nStr < pRhs^.n then nCmp := nStr else nCmp := pRhs^.n;
+        if nCmp > 0 then
+          rc := i32(CompareByte((@aKey1[d1])^, pRhs^.z^, nCmp))
+        else
+          rc := 0;
+        if rc = 0 then rc := nStr - pRhs^.n;
+      end;
+    end else if (pRhs^.flags and BT_MEM_Blob) <> 0 then begin
+      { RHS blob — vdbeaux.c:4872 }
+      sqlite3GetVarint32(@aKey1[idx1], serial_type);
+      if (serial_type < 12) or ((serial_type and 1) <> 0) then rc := -1
+      else begin
+        nStr := i32((serial_type - 12) shr 1);
+        if (d1 + u32(nStr)) > u32(nKey1) then begin
+          Result := 0;
+          Exit;
+        end;
+        if (pRhs^.flags and BT_MEM_Zero) <> 0 then begin
+          if not btreeIsAllZero(@aKey1[d1], nStr) then rc := 1
+          else rc := nStr - i32(pRhs^.u_i);  { u.nZero shares u.i slot }
+        end else begin
+          if nStr < pRhs^.n then nCmp := nStr else nCmp := pRhs^.n;
+          if nCmp > 0 then
+            rc := i32(CompareByte((@aKey1[d1])^, pRhs^.z^, nCmp))
+          else
+            rc := 0;
+          if rc = 0 then rc := nStr - pRhs^.n;
+        end;
+      end;
     end else if (pRhs^.flags and BT_MEM_Null) <> 0 then begin
       if (serial_type = 0) or (serial_type = 10) then rc := 0
-      else rc := 1;
-    end else begin
-      { String / Blob / Real RHS — minimum-viable arm.  Returning 0
-        causes the per-field default_rc tail to govern.  For ephemeral
-        rowid-keyed indexes (IPK-IN materialisation) this branch is
-        unreachable; for general index lookup it is incorrect and is
-        tracked as 6.IPK-IN.b.full follow-on. }
+      else if (serial_type = 7) then begin
+        if btreeSerialGet7Real(@aKey1[d1], rReal) <> 0 then rc := 0
+        else rc := 1;
+      end else rc := 1;
+    end else
       rc := 0;
-    end;
 
     if rc <> 0 then begin
       Result := rc;
