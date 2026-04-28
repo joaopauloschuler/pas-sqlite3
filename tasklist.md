@@ -505,14 +505,36 @@ Important: At the end of this document, please find:
         (just doubles internal `'`, NULL → "(NULL)" per printf.c:861);
         `%Q` arm added (wraps in outer quotes, NULL → "NULL").
         DiagMoreFunc %q / %Q str / %Q null → PASS.
-      [ ] **f) Aggregate-no-FROM no-row.**  `SELECT count(*)` /
-        `SELECT sum(5)` step to DONE without producing a row.
-        The 6.10 step 7(c3..c7) agg gate handles SF_Aggregate with a
-        FROM clause; the no-FROM case still falls into the no-FROM
-        fast path at codegen.pas:18412 which excludes SF_Aggregate.
-        Open work: extend either the no-FROM path or the agg gate to
-        cover nSrc=0 (no WhereBegin needed — emit
-        reset/AggStep/AggFinal then ResultRow once).
+      [X] **f) Aggregate-no-FROM no-row.**  Closed 2026-04-28.  Added
+        an `agg-no-FROM` arm in `sqlite3Select` (codegen.pas, just after
+        the no-FROM fast path) that handles SF_Aggregate with
+        `pSrc=nil` / `nSrc=0` by emitting reset / AggStep / AggFinal
+        / ResultRow with no WhereBegin/End wrapper.  Surfaced two
+        latent runtime bugs in the aggregate plumbing that broke
+        finalize for *every* aggregate (count/sum/min/max/avg) — both
+        fixed in the same commit:
+          - `sqlite3_aggregate_context` (vdbe.pas) was not setting
+            `pAggMem^.u.pDef := pCtx^.pFunc`; MemFinalize relies on
+            this when MEM_Agg is set, so the FuncDef pointer was
+            picked up as nil/garbage and finalize silently fell
+            through to MEM_Null.
+          - `sqlite3VdbeMemFinalize` (vdbe.pas) called
+            `sqlite3VdbeMemRelease` after `xFinalize`, which recursed
+            via `vdbeMemClearExternAndSetNull`'s MEM_Agg arm back into
+            MemFinalize.  Replaced with the direct
+            `sqlite3DbFreeNN(zMalloc)` cleanup C uses
+            (`vdbemem.c sqlite3VdbeMemFinalize`).
+          - `TSumAcc` (codegen.pas) inverted: `isInt` was False on
+            allocation (FillChar zero) so the integer-tracking arm
+            never fired and `SUM(5)` came back as REAL 5.0.  Renamed
+            to `approx`/`cnt` and aligned with C's SumCtx: track
+            both `iVal` (i64) and `rVal` (double) every step, set
+            `approx` only on a non-integer arg, return integer iff
+            `!approx`, return NULL when `cnt=0`.
+        DiagMoreFunc 2 → 0 divergences; TestExplainParity 1012 pass
+        / 14 diverge → 1013 pass / 13 diverge (no regressions).
+        TestSelectBasic / TestVdbeAgg / TestParser / TestDMLBasic /
+        TestSchemaBasic / TestWhereBasic / TestWhereSimple all green.
       [X] **g) printf `%s` precision / width ignored.**  Fixed
         2026-04-28.  `%s` arm appended raw with no truncation/padding;
         now honours width + precision per printf.c et_STRING (precision

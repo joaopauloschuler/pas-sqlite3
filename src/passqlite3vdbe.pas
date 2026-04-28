@@ -4174,7 +4174,8 @@ begin
     sqlite3VdbeMemClearAndResize(pAggMem, nByte);
     if pAggMem^.szMalloc > 0 then begin
       FillChar(pAggMem^.z^, nByte, 0);
-      pAggMem^.flags := MEM_Agg or MEM_Dyn;
+      pAggMem^.flags     := MEM_Agg or MEM_Dyn;
+      pAggMem^.u.pDef    := pCtx^.pFunc;   { vdbeaux.c sqlite3_aggregate_context — needed by MemFinalize }
     end else begin
       sqlite3OomFault(pAggMem^.db);
       Result := nil; Exit;
@@ -9231,7 +9232,13 @@ begin
       pMem^.flags := MEM_Null;
       Result := ctx.isError;
     end else begin
-      sqlite3VdbeMemRelease(pMem);
+      { Direct release of zMalloc without going through MemRelease, which
+        would recurse via MEM_Agg → MemFinalize.  Mirrors vdbemem.c
+        sqlite3VdbeMemFinalize. }
+      if pMem^.szMalloc > 0 then begin
+        sqlite3DbFreeNN(pMem^.db, pMem^.zMalloc);
+        pMem^.szMalloc := 0;
+      end;
       pMem^ := t;
       Result := SQLITE_OK;
     end;

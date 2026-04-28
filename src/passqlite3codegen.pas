@@ -18698,6 +18698,83 @@ begin
     if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
     Exit;
   end;
+
+  { Aggregate-no-FROM arm — `SELECT count(*)` / `SELECT sum(5)` and similar.
+    SF_Aggregate set, no source.  No WhereBegin/End needed; the implicit
+    "single row" iterates exactly once.  Emit reset / AggStep / AggFinal
+    / ResultRow.  See 6.10 step 12(f). }
+  if ((p^.pSrc = nil) or (p^.pSrc^.nSrc = 0))
+     and ((p^.selFlags and SF_Aggregate) <> 0)
+     and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
+     and (p^.pGroupBy = nil) and (p^.pHaving = nil)
+     and (p^.pWin     = nil) and (p^.pOrderBy = nil)
+     and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem))
+  then
+  begin
+    v := sqlite3GetVdbe(pParse);
+    if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
+
+    pAggI2 := PAggInfo(sqlite3DbMallocZero(pParse^.db, SizeOf(TAggInfo)));
+    if pAggI2 = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    sqlite3ParserAddCleanup(pParse, @agginfoFreeCleanup, pAggI2);
+    pAggI2^.selId    := p^.selId;
+    pAggI2^.pGroupBy := nil;
+
+    FillChar(sNCAgg, SizeOf(sNCAgg), 0);
+    sNCAgg.pParse        := pParse;
+    sNCAgg.pSrcList      := p^.pSrc;
+    sNCAgg.uNC.pAggInfo  := pAggI2;
+    sNCAgg.ncFlags       := NC_UAggInfo;
+
+    markAggregateInExprList(pParse, p^.pEList);
+    sqlite3ExprAnalyzeAggList(@sNCAgg, p^.pEList);
+    pAggI2^.nAccumulator := pAggI2^.nColumn;
+    analyzeAggFuncArgs(pAggI2, @sNCAgg);
+
+    canUseAgg := True;
+    for jAgg := 0 to pAggI2^.nFunc - 1 do
+    begin
+      pAggFunc := @pAggI2^.aFunc[jAgg];
+      if pAggFunc^.iDistinct >= 0 then begin canUseAgg := False; break; end;
+      if pAggFunc^.iOBTab    >= 0 then begin canUseAgg := False; break; end;
+      if (pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0 then
+        begin canUseAgg := False; break; end;
+      if (pAggFunc^.pFunc <> nil)
+         and ((PTFuncDef(pAggFunc^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0)
+      then begin canUseAgg := False; break; end;
+    end;
+    if canUseAgg and (pAggI2^.nAccumulator > 0) then canUseAgg := False;
+
+    if canUseAgg and (pParse^.nErr = 0) then
+    begin
+      sqlite3GenerateColumnNames(pParse, p);
+      assignAggregateRegisters(pParse, pAggI2);
+      resetAccumulatorSimple(pParse, pAggI2);
+      updateAccumulatorSimple(pParse, pAggI2);
+      finalizeAggFunctionsSimple(pParse, pAggI2);
+
+      nResultCol     := p^.pEList^.nExpr;
+      pDest^.nSdst   := nResultCol;
+      if pDest^.iSdst = 0 then
+      begin
+        pDest^.iSdst := pParse^.nMem + 1;
+        pParse^.nMem := pParse^.nMem + nResultCol;
+      end;
+      items := ExprListItems(p^.pEList);
+      for i := 0 to nResultCol - 1 do
+      begin
+        r1 := sqlite3ExprCodeTarget(pParse, items[i].pExpr, pDest^.iSdst + i);
+        if r1 <> pDest^.iSdst + i then
+          sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
+      end;
+      if pDest^.eDest = SRT_Output then
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+      if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
+      Exit;
+    end;
+  end;
+
   if p^.pSrc = nil then begin Result := SQLITE_OK; Exit; end;
   { Multi-table join gate: allow up to 2-table plain JOINs (nSrc=1 or 2).
     Larger join counts, subqueries, and other shapes stay deferred. }
@@ -26610,7 +26687,9 @@ end;
 
 { Aggregate accumulator types — used by sum/avg functions }
 type
-  TSumAcc = record isInt: Boolean; iVal: i64; rVal: Double; end;
+  { Mirrors func.c SumCtx — track both iVal and rVal each step, set approx
+    when any non-integer is added.  Result is integer iff !approx. }
+  TSumAcc = record approx: Boolean; iVal: i64; rVal: Double; cnt: i64; end;
   PSumAcc = ^TSumAcc;
   TAvgAcc = record cnt: i64; sum: Double; end;
   PAvgAcc = ^TAvgAcc;
@@ -26625,14 +26704,17 @@ begin
   if (pAcc = nil) or
      (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then Exit;
   vt := sqlite3_value_type(Psqlite3_value(argv^));
-  if pAcc^.isInt and (vt = SQLITE_INTEGER) then begin
+  if vt = SQLITE_INTEGER then begin
     sqlite3AddInt64(@pAcc^.iVal,
       sqlite3_value_int64(Psqlite3_value(argv^)));
+    pAcc^.rVal := pAcc^.rVal +
+      sqlite3_value_double(Psqlite3_value(argv^));
   end else begin
-    pAcc^.isInt := False;
+    pAcc^.approx := True;
     pAcc^.rVal := pAcc^.rVal +
       sqlite3_value_double(Psqlite3_value(argv^));
   end;
+  Inc(pAcc^.cnt);
 end;
 
 procedure sumFinal(pCtx: Psqlite3_context); cdecl;
@@ -26640,8 +26722,8 @@ var
   pAcc: PSumAcc;
 begin
   pAcc := PSumAcc(sqlite3_aggregate_context(pCtx, 0));
-  if pAcc = nil then begin sqlite3_result_null(pCtx); Exit; end;
-  if pAcc^.isInt then sqlite3_result_int64(pCtx, pAcc^.iVal)
+  if (pAcc = nil) or (pAcc^.cnt = 0) then begin sqlite3_result_null(pCtx); Exit; end;
+  if not pAcc^.approx then sqlite3_result_int64(pCtx, pAcc^.iVal)
   else sqlite3_result_double(pCtx, pAcc^.rVal);
 end;
 
@@ -26651,7 +26733,7 @@ var
 begin
   pAcc := PSumAcc(sqlite3_aggregate_context(pCtx, 0));
   if pAcc = nil then begin sqlite3_result_double(pCtx, 0.0); Exit; end;
-  if pAcc^.isInt then sqlite3_result_double(pCtx, pAcc^.iVal)
+  if not pAcc^.approx then sqlite3_result_double(pCtx, pAcc^.iVal)
   else sqlite3_result_double(pCtx, pAcc^.rVal);
 end;
 
