@@ -279,71 +279,30 @@ Important: At the end of this document, please find:
       bin/DiagMisc`).  These all prepare+step cleanly on both Pas and C
       (rc=0/101) but produce wrong values, so they are *silent
       result-set bugs* — not bytecode-Δ entries:
-      [X] **a) DEFAULT clause ignored by INSERT.**  Fixed by porting
-        `sqlite3AddDefaultValue` (build.c:1729), `sqlite3ColumnSetExpr`
-        (build.c:683), `sqlite3ColumnExpr` (build.c:709), and
-        `sqlite3ExprIsConstantOrFunction` (eCode=4/5 variants of
-        exprIsConst) — none were wired before, so DEFAULT expressions
-        never reached pTab->u.tab.pDfltList and `pCol^.iDflt` stayed 0.
-        Also wired the missing-column / DEFAULT-VALUES arms of
-        `sqlite3Insert` (codegen.pas:19852) to consult sqlite3ColumnExpr
-        instead of always emitting OP_Null.  The TK_SPAN source-text
-        wrapper from C is not duplicated faithfully (Pas exprDup_
-        cannot yet duplicate a stack TExpr with EP_Skip + extra zToken
-        — the ExprDup buffer-passing recursion AVs); pExpr is dup'd
-        directly which is sufficient for runtime semantics, only the
-        DEFAULT source-text round-trip in EXPLAIN/error messages is
-        lost.  Verified via DiagMisc "INSERT default literal" PASS.
-      [X] **b) Hex integer literal decoded as 0.**  Fixed by porting
-        the missing hex arm in `sqlite3GetInt32` (util.c:1298..1326);
-        previous decimal-only scan stopped at "0", set EP_IntValue
-        with iValue=0, and codeInteger emitted OP_Integer 0.  Hex
-        literals now flow through as i32 (or fall back to the zToken
-        + sqlite3DecOrHexToI64 path for >32-bit values).  Verified
-        via DiagMisc "INSERT hex literal" → PASS.
-      [ ] **c) Aggregate-no-GROUP-BY codegen path.**
-        Silent gap for `count(*)`, `sum`, `min`, `max`, `avg` etc. when
-        the SELECT carries a WHERE / multi-table FROM / DISTINCT-arg /
-        anything that misses the bytecode simple-count fast path.
-        DiagAggWhere (`bin/DiagAggWhere`) confirms `SELECT count(*)
-        FROM t WHERE a IS NULL` lands as 3 ops on Pas (Init / Halt /
-        Goto) vs 16 on C — Pas emits *no* loop body at all.
-        **Exact gate:** `passqlite3codegen.pas:18045` — a hard `Exit`
-        on any `selFlags & (SF_Distinct | SF_Aggregate | SF_Compound)`
-        that didn't match the inline simple-count optimisation at
-        18002..18043.  Decomposition into achievable sub-tasks (each
-        a discrete commit unit; the C reference is select.c
-        analyzeAggregate / generateAggSelect, ≈ select.c:6120..6450
-        + 8819..9050).
+      [X] **a) DEFAULT clause ignored by INSERT** — closed.  Ported
+        sqlite3AddDefaultValue / ColumnSetExpr / ColumnExpr /
+        ExprIsConstantOrFunction; wired sqlite3Insert's missing-
+        column arm to consult ColumnExpr instead of OP_Null.
+      [X] **b) Hex integer literal decoded as 0** — closed.  Ported
+        the hex arm in sqlite3GetInt32.
+      [ ] **c) Aggregate-no-GROUP-BY codegen path** — partially closed.
+        DiagAggWhere `count(*) FROM t WHERE a IS NULL` now bytecode-
+        parity with C (16 ops match exactly).  DiagMoreFunc count/sum
+        no-FROM cases also PASS.  Remaining gaps land via the still-
+        open INNER-JOIN bloom-filter case (see 6.10 step 9 d-INNER)
+        and sub-FROM materialise (step 6 sub-FROM).  C reference:
+        select.c analyzeAggregate / generateAggSelect.
 
   [ ] **6.10 step 9** Runtime divergences surfaced by
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
       bin/DiagFeatureProbe`).  Most fold into existing tasks; the genuinely
       new silent-result bugs are listed first.
-      [X] **a) COLLATE NOCASE operator silently case-sensitive.**  Fixed
-        2026-04-28 by porting the missing collation arm of
-        `sqlite3MemCompare` (vdbeaux.c:4659..4661 / vdbeCompareMemString
-        same-encoding branch).  Bytecode was already correct (`OP_Eq`
-        carried `P4=COLLSEQ(NOCASE)` and `P5=64` — verified via
-        src/tests/DiagCollate.pas); the runtime helper just dropped
-        pColl on the floor with a `"no collation support"` TODO.  Now
-        invokes `pColl^.xCmp` when both operands share `pColl^.enc`.
-        UTF-8/UTF-16 transcoding arm (vdbeaux.c:4450) deferred — default
-        UTF-8 build never reaches it.  DiagFeatureProbe COLLATE NOCASE
-        compare → PASS; total divergences 14 → 13.  No
-        TestExplainParity regression (1012 pass / 14 diverge — same).
-      [X] **b) Scalar subquery returns 0 instead of value.**  Fixed
-        2026-04-28 by accepting `SRT_Mem` in the `sqlite3Select`
-        eDest gate (codegen.pas:17578) and adding the SRT_Mem disposal
-        arm (selectInnerLoop:1422..1438) — column codegen targets
-        iSdst (=iSDParm) directly, then OP_DecrJumpZero on the
-        sqlite3CodeSubselect-installed LIMIT 1 breaks the loop.
-        Previously the gate exited early so the subroutine body was
-        empty (just OP_Null + OP_Return).  Verified via DiagSubsel:
-        `SELECT (SELECT a FROM t)` now returns 42; bytecode mirrors C
-        modulo the deferred OP_Explain EQP metadata.  DiagFeatureProbe
-        divergences 13 → 12; TestExplainParity unchanged
-        (1012 pass / 14 diverge).
+      [X] **a) COLLATE NOCASE** — closed.  Ported same-encoding arm
+        of `sqlite3MemCompare`/`vdbeCompareMemString` so the
+        runtime invokes `pColl^.xCmp`.
+      [X] **b) Scalar subquery returns 0** — closed.  Accepted
+        `SRT_Mem` in the `sqlite3Select` gate + added SRT_Mem
+        disposal in selectInnerLoop.
       [ ] **c) View materialisation in SELECT.**
         `SELECT count(*) FROM v` returns no row on Pas.  Foundation
         landed 2026-04-28: ported `sqlite3CreateView` (build.c:2990) so
@@ -371,15 +330,17 @@ Important: At the end of this document, please find:
         row count.
       [ ] **d-INNER) `INNER JOIN` aggregate raises SQL logic
         error.** `SELECT count(*) FROM t INNER JOIN u ON t.a=u.b`
-        prepares cleanly (bytecode generated by the agg-no-GROUP-BY
-        gate) but `step` returns SQLITE_ERROR.  Bytecode diff vs C:
-        Pas omits the bloom-filter OP_Explain (C:[8] `BLOOM FILTER
-        ON u`) and emits OP_Filter/OP_SeekGE/OP_IdxGT *without* the
-        p4 KeyInfo carried by C.  Root cause is in the auto-index
-        + bloom-filter codegen path inside sqlite3WhereBegin (not
-        the agg gate, not pSTab resolution as previously diagnosed).
-        Closes once whereBloomFilterOptHelper / setupAutoIndex
-        wire p4 KeyInfo + the bloom-filter explain.
+        prepares cleanly but step returns SQLITE_ERROR ("SQL logic
+        error" — confirmed via `bin/DiagInnerJoin`).  Bytecode is
+        nearly identical to C apart from a missing OP_Explain
+        ("BLOOM FILTER ON u") between OP_OpenAutoindex and OP_Blob.
+        The auto-index ops (Filter/SeekGE/IdxGT at p1=2) appear to
+        have correct p4 KeyInfo at the OpenAutoindex level
+        (codegen.pas:14429 sets it via sqlite3VdbeSetP4KeyInfo) but
+        downstream lookups still fail at runtime — likely the per-
+        op p4 plumbing on Filter/SeekGE/IdxGT or the WhereLoop
+        bloom-filter explain helper (whereBloomFilterOptHelper).
+        Probe `src/tests/DiagInnerJoin.pas` reproduces the error.
       [ ] **e) UNION / compound SELECT.**
         `SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)`
         returns no row.  Compound-select codegen / sub-FROM
@@ -414,29 +375,10 @@ Important: At the end of this document, please find:
       `src/tests/DiagDate.pas` probe (date/time + scalar coercion).
       Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagDate`.
 
-  [ ] **6.10 step 12** Runtime divergences surfaced by the new
-      `src/tests/DiagMoreFunc.pas` probe (built-in functions / expression
-      edges).  Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagMoreFunc`.
-      Initial run 2026-04-28 reported 27 divergences; 2 remain after
-      fixes to TRUE/FALSE, printf width/flags, %e, %c, %q, %Q,
-      TK_AND/TK_OR/TK_BETWEEN/TK_IN scalar arms, and math-function
-      registration.  Both remaining divergences are `count(*)` /
-      `sum(5)` no-FROM — same root cause as 6.10 step 7(c).
-      [ ] **i) Built-in scalar functions missing.**
-        [X] `unistr(text)` — ported 2026-04-28 (func.c:1174).
-            Decodes \XXXX / \uXXXX / \+XXXXXX / \UXXXXXXXX, plus \\
-            literal backslash; "invalid Unicode escape" otherwise.
-            Registered as aBuiltinFuncs[78] (nArg=1).  DiagMoreFunc
-            unistr 4hex / backslash / u / U / + / null → all PASS.
-        [X] printf `%w` — ported 2026-04-28 (printf.c:848 etESCAPE_w).
-            Doubles internal `"` characters; NULL → "(NULL)".
-            DiagMoreFunc printf %w / printf %w null → PASS.
-        [ ] `sqlite_compileoption_used(name)` / `sqlite_compileoption_get(idx)`
-            (func.c:1042/1066) — blocked on porting `sqlite3_compileoption_used`
-            / `sqlite3_compileoption_get` (ctime.c), which require the
-            compile-options table not yet built on the Pas side.  Defer.
-        [ ] `%b` / `%n` printf specifiers — not present in upstream
-            printf.c fmtinfo[] (probe artifacts).  Drop from scope.
+  [X] **6.10 step 12** DiagMoreFunc — all divergences closed.  Final
+      sweep 2026-04-28 reports 0/28.  Remaining sub-bullets
+      (sqlite_compileoption_used/get, %b/%n) deferred or dropped from
+      scope (see 8.4.1 / printf fmtinfo).
 
   [ ] **6.10 step 15** Runtime divergences surfaced by the new
       `src/tests/DiagTxn.pas` probe (transactions, savepoints, conflict
@@ -446,16 +388,9 @@ Important: At the end of this document, please find:
       reported 14 divergences; 1 fixed.  Most remaining fold into already-
       tracked gaps (sqlite3Pragma, sqlite3GenerateConstraintChecks,
       sqlite3Update body).
-      [X] **a) `total_changes()` returned 0 after INSERT** — fixed
-        2026-04-28.  `sqlite3VdbeHalt` (vdbe.pas:3328) was a stub that
-        only closed cursors; never flushed `v^.nChange` to the connection.
-        Per vdbeaux.c:3481, when `p->changeCntOn` is set the halt path
-        must call `sqlite3VdbeSetChanges(db, p->nChange)` and reset
-        `p->nChange = 0`.  Added that arm gated on `VDBF_ChangeCntOn`.
-        DiagTxn `total_changes()` → PASS; no regression in
-        TestExplainParity (1016/10) or any of TestVdbeTxn / TestVdbeAgg /
-        TestSelectBasic / TestParser / TestDMLBasic / TestSchemaBasic /
-        TestWhereBasic / TestVdbeRecord / TestVdbeApi (all green).
+      [X] **a) `total_changes()` returned 0 after INSERT** — closed.
+        sqlite3VdbeHalt now flushes `v^.nChange` to the connection
+        when `VDBF_ChangeCntOn` is set.
       [ ] **b) `BEGIN; ...; ROLLBACK` does not roll back changes** —
         DiagTxn `begin rollback insert`: Pas SELECT after rollback errors
         (val=-99999) where C returns 1.  Likely the BEGIN/ROLLBACK
@@ -481,19 +416,11 @@ Important: At the end of this document, please find:
         `changes() after update`.  Folds into `sqlite3Update` body
         skeleton (6.9-bis 11g.2.f); UPDATE never actually fires, so
         nChange stays 0 even with the new VdbeHalt accounting.
-      [ ] **g) Most PRAGMAs return no row** — partially closed
-        2026-04-28.  Extended `sqlite3Pragma` (codegen.pas:25427) with
-        explicit arms for application_id (read+write via
-        PragTyp_HEADER_VALUE / pragma.c:2324), user_version SET (same
-        path, was read-only), page_size (PragTyp_PAGE_SIZE /
-        pragma.c:598 — captures sqlite3BtreeGetPageSize at codegen),
-        cache_size (PragTyp_CACHE_SIZE / pragma.c:882 — reads
-        pSchema^.cache_size, now seeded to SQLITE_DEFAULT_CACHE_SIZE
-        in sqlite3SchemaGet), and synchronous (PragTyp_SYNCHRONOUS /
-        pragma.c:1132 — reads safety_level-1).  DiagTxn pragma
-        divergences 6 → 1.  Remaining: `journal_mode` — needs a real
-        OP_JournalMode runtime arm (currently a 0-returning stub at
-        vdbe.pas:8140) plus the per-db pager journal-mode plumbing.
+      [ ] **g) `journal_mode` PRAGMA** — only remaining DiagTxn pragma
+        divergence.  Needs a real OP_JournalMode runtime arm
+        (currently 0-returning stub at vdbe.pas:8140) + per-db pager
+        journal-mode plumbing.  Other pragmas (application_id,
+        user_version, page_size, cache_size, synchronous) closed.
         Full table-driven `pragmaLocate` dispatch still deferred
         under 6.12.
 
