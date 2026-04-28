@@ -163,6 +163,15 @@ Important: At the end of this document, please find:
         Likely shares root cause with the `SELECT SUM/MIN/MAX`
         Δ=12..13 entry under step 6.
 
+  [ ] **6.10 step 8** Auto-named result columns carry a trailing space
+      on Pas.  `SELECT count(*) FROM t` returns column-name
+      `"count(*) "` (with trailing space) on Pas vs `"count(*)"` on C.
+      Verified via `src/tests/DiagColName.pas` after the SetColName /
+      SetNumCols port landed.  Bug lives in
+      `sqlite3GenerateColumnNames` (codegen.pas ~16710) — the auto-name
+      builder synthesises an extra space when naming non-COLUMN
+      expressions.  Localised fix; no bytecode-Δ contribution.
+
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
         the sqlite_schema scrub now uses one-pass inline delete.
@@ -199,7 +208,7 @@ Important: At the end of this document, please find:
        like the gUnlinkAndDelete* pattern),
        `sqlite3VdbeDisplayComment`, `sqlite3VdbeDisplayP4`,
        `sqlite3VdbeEnter`, `sqlite3VdbeNextOpcode`,
-       `sqlite3VdbeFrameRestore`, `sqlite3VdbeSetColName`,
+       `sqlite3VdbeFrameRestore`,
        `sqlite3VdbeCloseStatement`, `sqlite3VdbeList`,
        `sqlite3_blob_open`, `sqlite3VdbeLogAbort`,
        `sqlite3ResetOneSchema`,
@@ -219,6 +228,16 @@ Important: At the end of this document, please find:
        [X] `sqlite3VdbeMemHandleBom` — ported in full (utf.c:437..465).
             Strips a UTF-16 BOM if present and updates pMem^.enc to the
             BOM-derived encoding (no byte-swap, just header adjustment).
+       [X] `sqlite3VdbeSetColName` + `sqlite3VdbeSetNumCols` — ported in
+            full (vdbeaux.c:2866..2911).  SetNumCols now allocates
+            aColName as nResColumn*COLNAME_N Mem cells (was a no-op
+            stub that only set nResColumn); SetColName stores zName via
+            sqlite3VdbeMemSetText.  Vdbe destructor extended with
+            vdbeReleaseColNames to free Mem-owned strings.  Verified
+            via src/tests/DiagColName.pas — sqlite3_column_name now
+            returns "a", "xyz" etc. instead of NULL.  Side-finding:
+            count(*) auto-name comes back as "count(*) " with a trailing
+            space on Pas vs "count(*)" on C — see new 6.10 step 8 entry.
        [X] `sqlite3VdbeFrameMemDel` — ported in full (vdbeaux.c:2247);
             adds the frame to v->pDelFrame for deferred free.
        [X] `sqlite3VdbeExplainParent` — ported in full (vdbeaux.c:493).

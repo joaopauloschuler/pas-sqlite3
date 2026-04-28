@@ -2962,16 +2962,76 @@ end;
 
 { --- Column name management --- }
 
-procedure sqlite3VdbeSetNumCols(p: PVdbe; nResColumn: i32);
+{ Internal helper — release any allocated Mem auxiliary memory in the
+  aColName array before the array itself is freed.  Mirrors the relevant
+  arms of releaseMemArray (vdbeaux.c:2179) for the limited subset of
+  flags column-name Mem cells can carry: MEM_Dyn / MEM_Agg via xDel,
+  or szMalloc/zMalloc via the small-buffer path. }
+procedure vdbeReleaseColNames(p: PMem; N: i32);
+var
+  i: i32;
+  pCell: PMem;
 begin
-  p^.nResColumn := u16(nResColumn);
+  if (p = nil) or (N <= 0) then Exit;
+  for i := 0 to N - 1 do begin
+    pCell := PMem(PtrUInt(p) + PtrUInt(i) * SizeOf(TMem));
+    if (pCell^.flags and (MEM_Agg or MEM_Dyn)) <> 0 then begin
+      sqlite3VdbeMemRelease(pCell);
+      pCell^.flags := MEM_Undefined;
+    end else if pCell^.szMalloc > 0 then begin
+      sqlite3DbFree(pCell^.db, pCell^.zMalloc);
+      pCell^.zMalloc := nil;
+      pCell^.szMalloc := 0;
+      pCell^.flags := MEM_Undefined;
+    end;
+  end;
 end;
 
+{ vdbeaux.c:2866 — set the number of result columns this VDBE will emit.
+  Allocates aColName as nResColumn*COLNAME_N Mem cells, each initialised
+  to MEM_Null with db backref, ready for sqlite3VdbeSetColName to fill in
+  the various COLNAME_* slots. }
+procedure sqlite3VdbeSetNumCols(p: PVdbe; nResColumn: i32);
+var
+  db: Psqlite3;
+  n, i: i32;
+  pCell: PMem;
+begin
+  db := p^.db;
+  if p^.nResAlloc > 0 then begin
+    vdbeReleaseColNames(p^.aColName, i32(p^.nResAlloc) * COLNAME_N);
+    sqlite3DbFree(db, p^.aColName);
+  end;
+  n := nResColumn * COLNAME_N;
+  p^.nResColumn := u16(nResColumn);
+  p^.nResAlloc  := u16(nResColumn);
+  p^.aColName := PMem(sqlite3DbMallocRawNN(db, SizeOf(TMem) * n));
+  if p^.aColName = nil then Exit;
+  for i := 0 to n - 1 do begin
+    pCell := PMem(PtrUInt(p^.aColName) + PtrUInt(i) * SizeOf(TMem));
+    FillChar(pCell^, SizeOf(TMem), 0);
+    pCell^.flags := MEM_Null;
+    pCell^.db    := db;
+  end;
+end;
+
+{ vdbeaux.c:2891 — store zName at aColName[idx + slot*nResAlloc].
+  slot is one of the COLNAME_* constants; xDel is SQLITE_DYNAMIC,
+  SQLITE_STATIC or SQLITE_TRANSIENT. }
 function sqlite3VdbeSetColName(p: PVdbe; idx, var2: i32; zName: PAnsiChar;
                                xDel: TxDelProc): i32;
+var
+  pColName: PMem;
 begin
-  { Stub — Phase 5.5 (vdbeapi.c sqlite3_column_name) }
-  Result := SQLITE_OK;
+  Assert(idx < i32(p^.nResAlloc));
+  Assert(var2 < COLNAME_N);
+  if PTsqlite3(p^.db)^.mallocFailed <> 0 then begin
+    Result := SQLITE_NOMEM_BKPT; Exit;
+  end;
+  Assert(p^.aColName <> nil);
+  pColName := PMem(PtrUInt(p^.aColName) +
+              PtrUInt(idx + var2 * i32(p^.nResAlloc)) * SizeOf(TMem));
+  Result := sqlite3VdbeMemSetText(pColName, zName, -1, xDel);
 end;
 
 { --- Statement close --- }
@@ -3234,8 +3294,10 @@ begin
   { Free op array }
   vdbeFreeOpArray(db, p^.aOp, p^.nOp);
   { Free col names }
-  if p^.aColName <> nil then
+  if p^.aColName <> nil then begin
+    vdbeReleaseColNames(p^.aColName, i32(p^.nResAlloc) * COLNAME_N);
     sqlite3DbFree(db, p^.aColName);
+  end;
   { Free aMem registers }
   if p^.aMem <> nil then begin
     for i := 0 to p^.nMem - 1 do begin
