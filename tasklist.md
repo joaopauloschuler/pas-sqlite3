@@ -279,10 +279,25 @@ Important: At the end of this document, please find:
         divergences 13 → 12; TestExplainParity unchanged
         (1012 pass / 14 diverge).
       [ ] **c) View materialisation in SELECT.**
-        `SELECT count(*) FROM v` returns no row on Pas.  The
-        `sqlite3MaterializeView` body just landed (6.24) but is wired
-        only for INSTEAD OF DELETE/UPDATE; non-trigger SELECT … FROM v
-        still needs view-expansion in `sqlite3SelectExpand`.
+        `SELECT count(*) FROM v` returns no row on Pas.  Foundation
+        landed 2026-04-28: ported `sqlite3CreateView` (build.c:2990) so
+        CREATE VIEW now stores the duplicated SELECT in
+        `pTab^.u.view_pSelect`; ported `viewGetColumnNames`
+        (build.c:3087) which runs `sqlite3ResultSetOfSelect` on the
+        view's SELECT to compute column names/affinities (honours the
+        `CREATE VIEW name(arglist)` arm too via pTable^.pCheck);
+        wired the selectExpander view-arm (select.c:6039..6073) so a
+        VIEW FROM-item is replaced by `sqlite3SrcItemAttachSubquery
+        (..., pTab^.u.view_pSelect, 1)` and recursively expanded.
+        Verified: schema row "CREATE view v AS SELECT a FROM t" is
+        written and on reload `pTab^.u.view_pSelect` is repopulated;
+        `SELECT * FROM v` prepares cleanly.  Remaining gap: the
+        agg-no-GROUP-BY gates (codegen.pas:18968 / :19025) reject FROM
+        items where `fgBits & SRCITEM_FG_IS_SUBQUERY`, so
+        `count(*) FROM v` falls through to the Init/Halt/Goto trivial
+        stub.  Closing this needs the sub-FROM materialise / co-routine
+        codegen path (6.10 step 6 sub-FROM entry) — same blocker as
+        non-view sub-FROM SELECTs.
       [X] **d-LEFT) `LEFT JOIN` aggregate** — closed 2026-04-28.
         DiagFeatureProbe `LEFT JOIN` now PASS (val=2, matches C).
         agg gate at codegen.pas:18979 accepts nSrc=2 and the

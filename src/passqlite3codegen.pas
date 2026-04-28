@@ -17582,6 +17582,25 @@ begin
       end;
       pItem^.colUsed := 0;
 
+      { View-expansion arm — port of selectExpander view branch
+        (select.c:6039..6073).  When the FROM item is a VIEW, attach the
+        view's stored SELECT as a subquery on the FROM item so subsequent
+        codegen treats `FROM v` as `FROM (SELECT ...)`.  Walks the just-
+        attached subquery to recursively expand. }
+      pTab := pItem^.pSTab;
+      if (pTab <> nil) and (pTab^.eTabType = TABTYP_VIEW) then
+      begin
+        if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then Exit;
+        if pTab^.u.view_pSelect <> nil then
+          sqlite3SrcItemAttachSubquery(pParse, pItem,
+                                       pTab^.u.view_pSelect, 1);
+        if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
+        begin
+          { Recursively expand the view's SELECT body. }
+          sqlite3SelectExpand(pParse, pItem^.u4.pSubq^.pSelect);
+        end;
+      end;
+
       { Merge ON clause into pSelect->pWhere (select.c selectExpander:641..660).
         For each non-first FROM item with a pOn expression, tag it with
         EP_OuterON (LEFT/FULL JOIN) or EP_InnerON (INNER/CROSS) so the WHERE
@@ -23340,17 +23359,145 @@ begin
   sqlite3SelectDelete(db, pSelect);
 end;
 
+{ sqlite3CreateView — port of build.c:2990.
+  Captures a CREATE VIEW into the schema: stores the duplicated SELECT in
+  pTab^.u.view_pSelect, optional column-name list in pCheck, marks the
+  Table as TABTYP_VIEW, then routes through sqlite3EndTable to write the
+  sqlite_schema row. }
 procedure sqlite3CreateView(pParse: PParse; const pBegin: PToken;
   const pName1: PToken; const pName2: PToken; pCNames: PExprList;
   pSelect: PSelect; isTemp: i32; noErr: i32);
+label
+  create_view_fail;
+var
+  p:     PTable2;
+  n:     i32;
+  z:     PAnsiChar;
+  sEnd:  TToken;
+  sFix:  TDbFixer;
+  pName: PToken;
+  iDb:   i32;
+  db:    PTsqlite3;
 begin
-  sqlite3ExprListDelete(pParse^.db, pCNames);
-  sqlite3SelectDelete(pParse^.db, pSelect);
+  pName := nil;
+  db := pParse^.db;
+  if pParse^.nVar > 0 then begin
+    sqlite3ErrorMsg(pParse, PAnsiChar('parameters are not allowed in views'));
+    goto create_view_fail;
+  end;
+  sqlite3StartTable(pParse, pName1, pName2, isTemp, 1, 0, noErr);
+  p := pParse^.pNewTable;
+  if (p = nil) or (pParse^.nErr <> 0) then goto create_view_fail;
+
+  { Views never expose rowid (SQLITE_ALLOW_ROWID_IN_VIEW is off). }
+  p^.tabFlags := p^.tabFlags or TF_NoVisibleRowid;
+
+  sqlite3TwoPartName(pParse, pName1, pName2, @pName);
+  iDb := sqlite3SchemaToIndex(db, p^.pSchema);
+  AssertH((iDb >= 0) and (iDb < db^.nDb), 'CreateView: iDb');
+  sqlite3FixInit(@sFix, pParse, iDb, PAnsiChar('view'), pName);
+  if sqlite3FixSelect(@sFix, pSelect) <> 0 then goto create_view_fail;
+
+  if pSelect <> nil then
+    pSelect^.selFlags := pSelect^.selFlags or SF_View;
+  p^.u.view_pSelect := sqlite3SelectDup(db, pSelect, EXPRDUP_REDUCE);
+  p^.pCheck := sqlite3ExprListDup(db, pCNames, EXPRDUP_REDUCE);
+  p^.eTabType := TABTYP_VIEW;
+  if db^.mallocFailed <> 0 then goto create_view_fail;
+
+  { Locate end of CREATE VIEW statement (build.c:3051..3065). }
+  sEnd := pParse^.sLastToken;
+  if (sEnd.z <> nil) and (sEnd.z[0] <> ';') then
+    sEnd.z := PAnsiChar(PtrUInt(sEnd.z) + sEnd.n);
+  sEnd.n := 0;
+  n := i32(PtrUInt(sEnd.z) - PtrUInt(pBegin^.z));
+  AssertH(n > 0, 'CreateView: sEnd>pBegin');
+  z := pBegin^.z;
+  while (n > 0) and (sqlite3Isspace(u8(z[n-1])) <> 0) do Dec(n);
+  sEnd.z := PAnsiChar(PtrUInt(z) + n - 1);
+  sEnd.n := 1;
+
+  sqlite3EndTable(pParse, nil, @sEnd, 0, nil);
+
+create_view_fail:
+  sqlite3SelectDelete(db, pSelect);
+  sqlite3ExprListDelete(db, pCNames);
+end;
+
+{ viewGetColumnNames — port of build.c:3087.
+  Compute column names/affinity for a VIEW by running sqlite3ResultSetOfSelect
+  on a duplicate of the view's defining SELECT.  If the CREATE VIEW supplied
+  a column-name list (stored in pTable->pCheck), prefer those names. }
+function viewGetColumnNamesImpl(pParse: PParse; pTable: PTable2): i32;
+var
+  pSelTab: PTable2;
+  pSel:    PSelect;
+  nErr:    i32;
+  db:      PTsqlite3;
+  nTab:    i32;
+  nSelect: i32;
+begin
+  nErr := 0;
+  db := pParse^.db;
+  AssertH(pTable <> nil, 'viewGetColumnNames: pTable');
+  if pTable^.nCol < 0 then begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      PAnsiChar('view %s is circularly defined'),
+      [pTable^.zName]));
+    Result := 1;
+    Exit;
+  end;
+  AssertH(pTable^.nCol >= 0, 'viewGetColumnNames: nCol>=0');
+
+  pSel := sqlite3SelectDup(db, pTable^.u.view_pSelect, 0);
+  if pSel <> nil then begin
+    nTab    := pParse^.nTab;
+    nSelect := pParse^.nSelect;
+    sqlite3SrcListAssignCursors(pParse, pSel^.pSrc);
+    pTable^.nCol := -1;
+    pSelTab := sqlite3ResultSetOfSelect(pParse, pSel, AnsiChar(SQLITE_AFF_NONE));
+    pParse^.nTab    := nTab;
+    pParse^.nSelect := nSelect;
+    if pSelTab = nil then begin
+      pTable^.nCol := 0;
+      Inc(nErr);
+    end else if pTable^.pCheck <> nil then begin
+      { CREATE VIEW name(arglist) AS ... — column names come from arglist
+        stored in pTable->pCheck (build.c:3168..3182). }
+      sqlite3ColumnsFromExprList(pParse, pTable^.pCheck,
+                                 @pTable^.nCol, @pTable^.aCol);
+      if (pParse^.nErr = 0)
+         and (pSel^.pEList <> nil)
+         and (pTable^.nCol = pSel^.pEList^.nExpr) then
+        sqlite3SubqueryColumnTypes(pParse, pTable, pSel,
+                                   AnsiChar(SQLITE_AFF_NONE));
+    end else begin
+      { CREATE VIEW name AS ... (no arglist): take names from the result
+        set of the SELECT (build.c:3184..3193). }
+      AssertH(pTable^.aCol = nil, 'viewGetColumnNames: aCol nil');
+      pTable^.nCol     := pSelTab^.nCol;
+      pTable^.aCol     := pSelTab^.aCol;
+      pTable^.tabFlags := pTable^.tabFlags or
+                         (pSelTab^.tabFlags and COLFLAG_NOINSERT);
+      pSelTab^.nCol := 0;
+      pSelTab^.aCol := nil;
+    end;
+    pTable^.nNVCol := pTable^.nCol;
+    sqlite3DeleteTable(db, pSelTab);
+    sqlite3SelectDelete(db, pSel);
+  end else
+    Inc(nErr);
+  if db^.mallocFailed <> 0 then
+    Inc(nErr);
+  Result := nErr;
 end;
 
 function sqlite3ViewGetColumnNames(pParse: PParse; pTable: PTable2): i32;
 begin
-  Result := SQLITE_OK;
+  AssertH(pTable <> nil, 'sqlite3ViewGetColumnNames: pTable');
+  { Skip if columns are already known.  Mirrors build.c:3211. }
+  if pTable^.nCol > 0 then begin Result := 0; Exit; end;
+  Result := viewGetColumnNamesImpl(pParse, pTable);
 end;
 
 { sqlite3RootPageMoved — port of build.c:3255.
