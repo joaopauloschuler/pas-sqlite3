@@ -345,6 +345,7 @@ function sqlite3_get_autocommit(db: PTsqlite3): i32; cdecl;
 function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;
 function sqlite3_txn_state(db: PTsqlite3; zSchema: PAnsiChar): i32; cdecl;
 function sqlite3_error_offset(db: PTsqlite3): i32; cdecl;
+function sqlite3_set_errmsg(db: PTsqlite3; errcode: i32; zMsg: PAnsiChar): i32; cdecl;
 function sqlite3_limit(db: PTsqlite3; limitId: i32; newLimit: i32): i32; cdecl;
 
 function sqlite3_stmt_busy(pStmt: Pointer): i32; cdecl;
@@ -2481,6 +2482,28 @@ begin
     Result := db^.errByteOffset
   else
     Result := -1;
+end;
+
+{ main.c:2741 — sqlite3_set_errmsg.  Public extension hook (called by the
+  Session extension); internal callers should use sqlite3Error /
+  sqlite3ErrorWithMsg directly.  Faithful one-to-one port. }
+function sqlite3_set_errmsg(db: PTsqlite3; errcode: i32; zMsg: PAnsiChar): i32; cdecl;
+var
+  rc: i32;
+begin
+  rc := SQLITE_OK;
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE;  { C uses SQLITE_MISUSE_BKPT — same value, debug breakpoint hook }
+    Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  if zMsg <> nil then
+    sqlite3ErrorWithMsg(db, errcode, zMsg)
+  else
+    sqlite3Error(db, errcode);
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
 end;
 
 { main.c — sqlite3_limit.  Mirrors aHardLimit clamp + LENGTH floor. }

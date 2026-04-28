@@ -321,22 +321,29 @@ Important: At the end of this document, please find:
 
   [ ] **6.10 step 16** Regressions surfaced by full-suite sweep on 2026-04-28.
       Both reproduce on current HEAD (a3, after 7b807ec).
-      [ ] **a) TestAuthBuiltins hangs at T9** — T8 reports `FAIL FindFunction
-        "abs" found`, then the run never returns.  Root cause: the test
-        calls `sqlite3RegisterBuiltinFunctions` manually (line 123) after
-        `sqlite3MallocZero` has already triggered `sqlite3_initialize` →
-        `sqlite3RegisterBuiltinFunctions` once.  The second call walks the
-        same `aBuiltinFuncs[]` records through `sqlite3InsertBuiltinFuncs`;
-        `sqlite3FunctionSearch` finds the existing entry as `pOther`, then
-        `aDef[i].pNext := pOther^.pNext; pOther^.pNext := @aDef[i]` makes
-        `aDef[i].pNext = &aDef[i]` — a self-loop that hangs every later
-        `sqlite3FindFunction` walk.  C source has
-        `assert( pOther!=&aDef[i] && pOther->pNext!=&aDef[i] )` at
-        callback.c:371 — the Pas `sqlite3InsertBuiltinFuncs`
-        (codegen.pas:26056) is missing this guard.  Either harden the test
-        (don't double-register) or make Pas InsertBuiltinFuncs idempotent
-        with a guard `if (pOther = @aDef[i]) or (pOther^.pNext = @aDef[i])
-        then continue`.
+      [ ] **a) TestAuthBuiltins hangs around T9-T10** — T8 reports
+        `FAIL FindFunction "abs" found`, then the run hangs.  Tested
+        2026-04-28: TestAuthBuiltins does NOT call `sqlite3_initialize`
+        (sqlite3MallocZero in passqlite3os.pas:714 is a plain GetMem+
+        FillChar — does not pull init).  So
+        `sqlite3RegisterBuiltinFunctions` is invoked exactly once at
+        line 123, not twice.  The earlier "double-registration self-loop"
+        diagnosis is wrong.  Adding a once-flag at the top of
+        `sqlite3RegisterBuiltinFunctions` (verified locally — reverted)
+        does not change the symptom: T8 still FAILs and the chain at
+        slot 22 still hangs at T9/T10.  Real root cause must therefore
+        live inside the single first-time path through
+        `sqlite3InsertBuiltinFuncs(@aBuiltinFuncs)` →
+        `sqlite3InsertBuiltinFuncs(@aBuiltinAgg)` →
+        `sqlite3RegisterJsonFunctions` →
+        `sqlite3RegisterDateTimeFunctions`.  Likely candidate: a name
+        collision between an `aBuiltinFuncs` and `aJsonFunc`/`aDateFuncs`
+        entry (both inserted into the same global hash) wiring an
+        unintended `pNext` cycle, OR a stale `u`/`pNext` link in
+        `aBuiltinFuncs[]` left over from a prior test run that loaded the
+        same FPC binary's globals (FPC initialises module-level arrays
+        to zero only at process start).  Needs an instrumented walk of
+        `sqlite3BuiltinFunctions.a[22]` after registration to localise.
       [ ] **b) TestWhereExpr T14a..T14i FAIL + access violation** — LIKE
         virtual-term synthesis no longer fires for the synthetic
         TK_FUNCTION 'like' built directly in the test (line 491..506).
@@ -582,7 +589,10 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [X] `sqlite3_errcode` / `sqlite3_extended_errcode` /
             `sqlite3_extended_result_codes` — ported 2026-04-28
             (passqlite3main.pas).
-       [ ] `sqlite3_set_errmsg` — overwrite db^.pErr.
+       [X] `sqlite3_set_errmsg` — ported 2026-04-28
+            (passqlite3main.pas).  Faithful one-to-one port of main.c:2741:
+            SafetyCheckOk gate, mutex enter/leave, dispatches to
+            sqlite3ErrorWithMsg when zMsg<>nil else sqlite3Error.
        [X] `sqlite3_error_offset` — ported 2026-04-28
             (passqlite3main.pas) — returns db^.errByteOffset when an
             error is pending, else -1.
