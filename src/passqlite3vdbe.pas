@@ -3325,6 +3325,8 @@ end;
 
 { --- VdbeHalt, VdbeReset, VdbeFinalize (Phase 5.4 stubs) --- }
 
+procedure sqlite3VdbeSetChanges(db: Pointer; nChange: i64); forward;
+
 function sqlite3VdbeHalt(v: PVdbe): i32;
 var
   i:  i32;
@@ -3343,6 +3345,10 @@ begin
         v^.apCsr[i] := nil;
       end;
     end;
+  end;
+  if (v <> nil) and ((v^.vdbeFlags and VDBF_ChangeCntOn) <> 0) then begin
+    sqlite3VdbeSetChanges(v^.db, v^.nChange);
+    v^.nChange := 0;
   end;
   v^.eVdbeState := VDBE_HALT_STATE;
   Result := SQLITE_OK;

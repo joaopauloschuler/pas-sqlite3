@@ -641,6 +641,57 @@ Important: At the end of this document, please find:
         TestParser / TestDMLBasic / TestSchemaBasic / TestWhereBasic /
         TestVdbeRecord all green.
 
+  [ ] **6.10 step 15** Runtime divergences surfaced by the new
+      `src/tests/DiagTxn.pas` probe (transactions, savepoints, conflict
+      resolution, ROWID/IPK alias edges, BLOB literals, PRAGMA round-trips,
+      typeof boundaries, NULL propagation).  Run with
+      `LD_LIBRARY_PATH=$PWD/src bin/DiagTxn`.  Initial sweep (~52 cases)
+      reported 14 divergences; 1 fixed.  Most remaining fold into already-
+      tracked gaps (sqlite3Pragma, sqlite3GenerateConstraintChecks,
+      sqlite3Update body).
+      [X] **a) `total_changes()` returned 0 after INSERT** — fixed
+        2026-04-28.  `sqlite3VdbeHalt` (vdbe.pas:3328) was a stub that
+        only closed cursors; never flushed `v^.nChange` to the connection.
+        Per vdbeaux.c:3481, when `p->changeCntOn` is set the halt path
+        must call `sqlite3VdbeSetChanges(db, p->nChange)` and reset
+        `p->nChange = 0`.  Added that arm gated on `VDBF_ChangeCntOn`.
+        DiagTxn `total_changes()` → PASS; no regression in
+        TestExplainParity (1016/10) or any of TestVdbeTxn / TestVdbeAgg /
+        TestSelectBasic / TestParser / TestDMLBasic / TestSchemaBasic /
+        TestWhereBasic / TestVdbeRecord / TestVdbeApi (all green).
+      [ ] **b) `BEGIN; ...; ROLLBACK` does not roll back changes** —
+        DiagTxn `begin rollback insert`: Pas SELECT after rollback errors
+        (val=-99999) where C returns 1.  Likely the BEGIN/ROLLBACK
+        statements are no-ops on the Pas side (no write-transaction
+        bookkeeping in `sqlite3VdbeHalt`); blocked on Phase 5.4 full
+        VdbeHalt port.
+      [ ] **c) `SAVEPOINT s; ...; ROLLBACK TO s` does not unwind** —
+        DiagTxn `savepoint rollback` reports Pas count=2 vs C=1.  Same
+        VdbeHalt root cause as (b) plus OP_Savepoint not wired.
+      [ ] **d) `INSERT OR IGNORE` / `OR REPLACE` / `OR FAIL` ignore
+        conflict resolution** — DiagTxn `insert or ignore unique`,
+        `insert or replace unique`, `insert or fail returns err` all
+        diverge.  Folds into the existing 6.9-bis 11g.2.b
+        `sqlite3GenerateConstraintChecks` gap — the conflict-resolution
+        action is encoded in OP_Halt P5 but currently not emitted.
+      [ ] **e) IPK alias auto-rowid increment** — DiagTxn `integer
+        primary key alias`: `INSERT INTO t(id INTEGER PRIMARY KEY, x)
+        VALUES(7,'a'); INSERT VALUES(NULL,'b')` should set id=8 (next
+        rowid past max), Pas sets id=2 (sequential).  Same root cause
+        as INSERT IPK alias u Δ in TestExplainParity — folds into
+        sqlite3GenerateConstraintChecks.
+      [ ] **f) `changes()` returns 0 after UPDATE** — DiagTxn
+        `changes() after update`.  Folds into `sqlite3Update` body
+        skeleton (6.9-bis 11g.2.f); UPDATE never actually fires, so
+        nChange stays 0 even with the new VdbeHalt accounting.
+      [ ] **g) Most PRAGMAs return no row** — DiagTxn `pragma
+        application_id default`, `page_size`, `cache_size`,
+        `journal_mode`, `synchronous`, and `user_version set` (the
+        write/read round-trip) all diverge.  `user_version` *read*
+        passes, `encoding` passes.  Folds into 6.12 `sqlite3Pragma`
+        port; most pragmas dispatch through the table-driven body that
+        is still stubbed.
+
   [X] **6.10 step 13** Runtime divergences surfaced by the new
       `src/tests/DiagCast.pas` probe (CAST expressions + type-affinity
       coercion).  Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagCast`.
