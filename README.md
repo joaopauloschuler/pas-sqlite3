@@ -89,50 +89,50 @@ TestSmoke PASSED.
 
 ## Project layout
 
-```
+<pre>
 pas-sqlite3/
-├── src/
-│   ├── passqlite3.inc          compiler directives (included first in every unit)
-│   ├── passqlite3types.pas     primitive types, result codes, open flags, limits
-│   ├── passqlite3internal.pas  shared constants from sqliteInt.h
-│   ├── passqlite3util.pas      hash, varint, printf glue, mprintf, UTF helpers
-│   ├── passqlite3printf.pas    sqlite3_snprintf / %!.*g / sqlite3RenderNumF
-│   ├── passqlite3os.pas        VFS, POSIX file locks, mutexes
-│   ├── passqlite3pcache.pas    page cache
-│   ├── passqlite3pager.pas     pager + journal
-│   ├── passqlite3wal.pas       write-ahead log
-│   ├── passqlite3btree.pas     B-tree
-│   ├── passqlite3vdbe.pas      VDBE bytecode interpreter
-│   ├── passqlite3codegen.pas   SQL → VDBE code generators (build/select/expr/where/...)
-│   ├── passqlite3parser.pas    tokenizer + Lemon grammar
-│   ├── passqlite3main.pas      public sqlite3_* API surface
-│   ├── passqlite3backup.pas    online backup API
-│   ├── passqlite3vtab.pas      virtual-table interface
-│   ├── passqlite3json.pas      JSON1 extension
-│   ├── passqlite3jsoneach.pas  json_each / json_tree table-valued fns
-│   ├── passqlite3carray.pas    carray() table-valued function
-│   ├── passqlite3dbpage.pas    sqlite_dbpage virtual table
-│   ├── passqlite3dbstat.pas    sqlite_dbstat virtual table
-│   ├── csqlite3.pas            cdecl bindings to libsqlite3.so (tests only)
-│   └── tests/
-│       ├── build.sh            build script
-│       ├── vectors/            canonical .db files and .sql scripts
-│       ├── TestSmoke.pas       build-system health check
-│       ├── TestExplainParity.pas   primary VDBE-bytecode parity gate
-│       ├── TestParser.pas / TestSelectBasic.pas / TestDMLBasic.pas /
-│       │   TestWhereBasic.pas / TestVdbeAgg.pas / TestSchemaBasic.pas /
-│       │   TestVdbeRecord.pas / TestBtreeCompat.pas / TestPager*.pas /
-│       │   TestPCache.pas / TestOSLayer.pas / TestPrepareBasic.pas / ...
-│       │   per-layer differential tests
-│       └── Diag*.pas               focused runtime-divergence probes
-│                                   (DiagOps, DiagCast, DiagDate, DiagFunctions,
-│                                    DiagMoreFunc, DiagFeatureProbe, ...)
-├── bin/                        compiled test binaries
-├── install_dependencies.sh
-├── LICENSE                     public domain (matching upstream SQLite)
-├── README.md                   this file
-└── tasklist.md                 detailed phase-by-phase task list
-```
+├── <a href="src/">src/</a>
+│   ├── <a href="src/passqlite3.inc">passqlite3.inc</a>          # compiler directives (included first in every unit)
+│   ├── <a href="src/passqlite3types.pas">passqlite3types.pas</a>     # primitive types, result codes, open flags, limits
+│   ├── <a href="src/passqlite3internal.pas">passqlite3internal.pas</a>  # shared constants from sqliteInt.h
+│   ├── <a href="src/passqlite3util.pas">passqlite3util.pas</a>      # hash, varint, printf glue, mprintf, UTF helpers
+│   ├── <a href="src/passqlite3printf.pas">passqlite3printf.pas</a>    # sqlite3_snprintf / %!.*g / sqlite3RenderNumF
+│   ├── <a href="src/passqlite3os.pas">passqlite3os.pas</a>        # VFS, POSIX file locks, mutexes
+│   ├── <a href="src/passqlite3pcache.pas">passqlite3pcache.pas</a>    # page cache
+│   ├── <a href="src/passqlite3pager.pas">passqlite3pager.pas</a>     # pager + journal
+│   ├── <a href="src/passqlite3wal.pas">passqlite3wal.pas</a>       # write-ahead log
+│   ├── <a href="src/passqlite3btree.pas">passqlite3btree.pas</a>     # B-tree
+│   ├── <a href="src/passqlite3vdbe.pas">passqlite3vdbe.pas</a>      # VDBE bytecode interpreter
+│   ├── <a href="src/passqlite3codegen.pas">passqlite3codegen.pas</a>   # SQL → VDBE code generators (build/select/expr/where/...)
+│   ├── <a href="src/passqlite3parser.pas">passqlite3parser.pas</a>    # tokenizer + Lemon grammar
+│   ├── <a href="src/passqlite3main.pas">passqlite3main.pas</a>      # public sqlite3_* API surface
+│   ├── <a href="src/passqlite3backup.pas">passqlite3backup.pas</a>    # online backup API
+│   ├── <a href="src/passqlite3vtab.pas">passqlite3vtab.pas</a>      # virtual-table interface
+│   ├── <a href="src/passqlite3json.pas">passqlite3json.pas</a>      # JSON1 extension
+│   ├── <a href="src/passqlite3jsoneach.pas">passqlite3jsoneach.pas</a>  # json_each / json_tree table-valued fns
+│   ├── <a href="src/passqlite3carray.pas">passqlite3carray.pas</a>    # carray() table-valued function
+│   ├── <a href="src/passqlite3dbpage.pas">passqlite3dbpage.pas</a>    # sqlite_dbpage virtual table
+│   ├── <a href="src/passqlite3dbstat.pas">passqlite3dbstat.pas</a>    # sqlite_dbstat virtual table
+│   ├── <a href="src/csqlite3.pas">csqlite3.pas</a>            # cdecl bindings to libsqlite3.so (tests only)
+│   └── <a href="src/tests/">tests/</a>
+│       ├── <a href="src/tests/build.sh">build.sh</a>                  # build script
+│       ├── <a href="src/tests/vectors/">vectors/</a>                  # canonical .db files and .sql scripts
+│       ├── <a href="src/tests/TestSmoke.pas">TestSmoke.pas</a>             # build-system health check
+│       ├── <a href="src/tests/TestExplainParity.pas">TestExplainParity.pas</a>     # primary VDBE-bytecode parity gate
+│       ├── <a href="src/tests/TestParser.pas">TestParser.pas</a> / <a href="src/tests/TestSelectBasic.pas">TestSelectBasic.pas</a> / <a href="src/tests/TestDMLBasic.pas">TestDMLBasic.pas</a> /
+│       │   <a href="src/tests/TestWhereBasic.pas">TestWhereBasic.pas</a> / <a href="src/tests/TestVdbeAgg.pas">TestVdbeAgg.pas</a> / <a href="src/tests/TestSchemaBasic.pas">TestSchemaBasic.pas</a> /
+│       │   <a href="src/tests/TestVdbeRecord.pas">TestVdbeRecord.pas</a> / <a href="src/tests/TestBtreeCompat.pas">TestBtreeCompat.pas</a> / <a href="src/tests/TestPager.pas">TestPager*.pas</a> /
+│       │   <a href="src/tests/TestPCache.pas">TestPCache.pas</a> / <a href="src/tests/TestOSLayer.pas">TestOSLayer.pas</a> / <a href="src/tests/TestPrepareBasic.pas">TestPrepareBasic.pas</a> / ...
+│       │     per-layer differential tests
+│       └── <a href="src/tests/DiagOps.pas">Diag*.pas</a>                 # focused runtime-divergence probes
+│                                     (<a href="src/tests/DiagOps.pas">DiagOps</a>, <a href="src/tests/DiagCast.pas">DiagCast</a>, <a href="src/tests/DiagDate.pas">DiagDate</a>, <a href="src/tests/DiagFunctions.pas">DiagFunctions</a>,
+│                                      <a href="src/tests/DiagMoreFunc.pas">DiagMoreFunc</a>, <a href="src/tests/DiagFeatureProbe.pas">DiagFeatureProbe</a>, ...)
+├── bin/                        # compiled test binaries (git-ignored)
+├── <a href="install_dependencies.sh">install_dependencies.sh</a>
+├── <a href="LICENSE">LICENSE</a>                      # public domain (matching upstream SQLite)
+├── <a href="README.md">README.md</a>                    # this file
+└── <a href="tasklist.md">tasklist.md</a>                  # detailed phase-by-phase task list
+</pre>
 
 ---
 
