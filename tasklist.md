@@ -562,12 +562,20 @@ Important: At the end of this document, please find:
 
 - [ ] **7.1.5** Constraint / abort plumbing (build.c, insert.c) —
        empty-body stubs that affect VDBE abort/halt semantics:
-       [ ] `sqlite3MayAbort` (codegen.pas:24759) — set the `mayAbort`
-            flag on parse + propagate to halt.
-       [ ] `sqlite3HaltConstraint` (codegen.pas:24842) — emit
-            `OP_Halt` with constraint error code.
-       [ ] `sqlite3RowidConstraint` (codegen.pas:24870) — wraps
-            `HaltConstraint` for IPK conflict.
+       [X] `sqlite3MayAbort` / `sqlite3HaltConstraint` /
+            `sqlite3RowidConstraint` — ported 2026-04-28
+            (codegen.pas).  MayAbort sets PARSEFLAG_MayAbort on
+            sqlite3ParseToplevel(pParse).  HaltConstraint emits
+            `OP_Halt errCode, onError, 0, p4` + ChangeP5(p5),
+            calling MayAbort when onError=OE_Abort.  RowidConstraint
+            builds `<table>.<col>` (PRIMARYKEY) or `<table>.rowid`
+            (ROWID) via sqlite3MPrintf and dispatches through
+            HaltConstraint with P5_ConstraintUnique.  Verified
+            TestExplainParity 1016/10, TestDMLBasic 54/0,
+            TestSchemaBasic 44/0, TestSelectBasic 49/0,
+            TestParser 45/0 — no regressions.  Productive once
+            sqlite3GenerateConstraintChecks (6.9-bis 11g.2.b)
+            wires its callers.
 
 - [ ] **7.1.6** Btree mutex acquisition (btmutex.c) — empty stubs
        (siblings of the 6.8 mutex entries):

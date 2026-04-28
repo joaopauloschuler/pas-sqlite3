@@ -24856,9 +24856,15 @@ begin
   pParse^.isMultiWrite := 1;
 end;
 
+{ sqlite3MayAbort — port of build.c:5438.
+  Mark the toplevel parse as potentially throwing an SQLITE_ABORT, so the
+  generated VDBE will open a statement journal. }
 procedure sqlite3MayAbort(pParse: PParse);
+var
+  pToplevel: PParse;
 begin
-  { Phase 7 }
+  pToplevel := sqlite3ParseToplevel(pParse);
+  pToplevel^.parseFlags := pToplevel^.parseFlags or PARSEFLAG_MayAbort;
 end;
 
 { sqlite3GetTempReg / sqlite3ReleaseTempReg — port of expr.c:7580/7591.
@@ -24939,10 +24945,23 @@ begin
   end;
 end;
 
+{ sqlite3HaltConstraint — port of build.c:5448.
+  Emit OP_Halt with an SQLITE_CONSTRAINT_* extended error code. The onError
+  parameter (OE_Abort/OE_Rollback/OE_Fail/OE_Ignore/OE_Replace) becomes p2;
+  p4 carries the error message; p5 is the constraint-type tag. }
 procedure sqlite3HaltConstraint(pParse: PParse; errCode: i32; onError: i32;
   p4: PAnsiChar; p4type: i8; p5: u8);
+var
+  v: PVdbe;
 begin
-  { Phase 7 }
+  Assert(pParse^.pVdbe <> nil, 'sqlite3HaltConstraint: no VDBE');
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then Exit;
+  Assert(((errCode and $ff) = SQLITE_CONSTRAINT) or (pParse^.nested <> 0),
+         'sqlite3HaltConstraint: not SQLITE_CONSTRAINT');
+  if onError = OE_Abort then sqlite3MayAbort(pParse);
+  sqlite3VdbeAddOp4(v, OP_Halt, errCode, onError, 0, p4, p4type);
+  sqlite3VdbeChangeP5(v, p5);
 end;
 
 procedure sqlite3UniqueConstraint(pParse: PParse; onError: i32; pIdx: PIndex2);
@@ -24967,9 +24986,25 @@ begin
   sqlite3VdbeChangeP5(v, P5_ConstraintUnique);
 end;
 
+{ sqlite3RowidConstraint — port of build.c:5506.
+  Emit OP_Halt for a non-unique rowid.  When pTab has an INTEGER PRIMARY KEY
+  alias, the message is "<table>.<col>" with SQLITE_CONSTRAINT_PRIMARYKEY;
+  otherwise "<table>.rowid" with SQLITE_CONSTRAINT_ROWID. }
 procedure sqlite3RowidConstraint(pParse: PParse; onError: i32; pTab: PTable2);
+var
+  zMsg: PAnsiChar;
+  rc: i32;
 begin
-  { Phase 7 }
+  if pTab^.iPKey >= 0 then begin
+    zMsg := sqlite3MPrintf(pParse^.db, '%s.%s',
+              [pTab^.zName, pTab^.aCol[pTab^.iPKey].zCnName]);
+    rc := SQLITE_CONSTRAINT_PRIMARYKEY;
+  end else begin
+    zMsg := sqlite3MPrintf(pParse^.db, '%s.rowid', [pTab^.zName]);
+    rc := SQLITE_CONSTRAINT_ROWID;
+  end;
+  sqlite3HaltConstraint(pParse, rc, onError, zMsg, P4_DYNAMIC,
+                        P5_ConstraintUnique);
 end;
 
 { sqlite3FinishCoding — emit termination/prologue and finalise the VDBE.
