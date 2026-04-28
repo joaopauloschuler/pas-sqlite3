@@ -9454,9 +9454,23 @@ end;
   Phase 5.4 — high-level stubs needed by new opcodes
   ----------------------------------------------------------------------- }
 
+{ sqlite3ExpirePreparedStatements — vdbeaux.c:5337.
+  Walks every Vdbe attached to the connection and writes (iCode+1) into
+  the 2-bit `expired` field (low bits of vdbeFlags via VDBF_EXPIRED_MASK).
+  iCode=0 → expired=1 (recompile now); iCode=1 → expired=2 (recompile
+  when convenient).  C: `for(p=db->pVdbe; p; p=p->pVNext) p->expired = iCode+1;` }
 procedure sqlite3ExpirePreparedStatements(db: PTsqlite3; iCode: i32);
+var
+  v: PVdbe;
+  newExp: u32;
 begin
-  { Stub — full implementation requires Phase 6 parser types }
+  if db = nil then Exit;
+  newExp := u32(iCode + 1) and VDBF_EXPIRED_MASK;
+  v := PVdbe(db^.pVdbe);
+  while v <> nil do begin
+    v^.vdbeFlags := (v^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or newExp;
+    v := v^.pVNext;
+  end;
 end;
 
 function sqlite3AnalysisLoad(db: PTsqlite3; iDb: i32): i32;

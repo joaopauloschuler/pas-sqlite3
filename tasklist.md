@@ -208,9 +208,14 @@ Important: At the end of this document, please find:
         READ_UTF8 / WRITE_UTF8 / WRITE_UTF16{LE,BE} macro ports —
         sqlite3VdbeChangeEncoding callers in default UTF-8 builds
         no-op out before reaching those arms),
-       `sqlite3ExpirePreparedStatements`,
        `sqlite3AnalysisLoad`, `sqlite3FkClearTriggerCache`,
        `sqlite3ResetAllSchemasOfConnection`, `sqlite3Stat4ProbeFree`.
+       [X] `sqlite3ExpirePreparedStatements` — ported in full
+            (vdbeaux.c:5337).  Walks db->pVdbe and writes (iCode+1) into
+            the 2-bit `expired` field via VDBF_EXPIRED_MASK.  Replaces a
+            no-op stub in vdbe.pas plus a duplicate-but-wrong impl in
+            codegen.pas that ORed the full mask (= expired=3) regardless
+            of iCode.
        [X] `sqlite3VdbeMemHandleBom` — ported in full (utf.c:437..465).
             Strips a UTF-16 BOM if present and updates pMem^.enc to the
             BOM-derived encoding (no byte-swap, just header adjustment).

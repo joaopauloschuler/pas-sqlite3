@@ -2932,12 +2932,6 @@ procedure sqlite3RegisterDateTimeFunctions;
   global table (sqlite3RegisterBuiltinFunctions) reset the hash first. }
 procedure sqlite3RegisterJsonFunctions;
 
-// ---------------------------------------------------------------------------
-// Phase 6.6 helper — sqlite3ExpirePreparedStatements
-// ---------------------------------------------------------------------------
-
-procedure sqlite3ExpirePreparedStatements(db: PTsqlite3; iCode: i32);
-
 { Phase 6.20: exposed for sqlite3Reindex (passqlite3parser). }
 function indexBHasExpr(pIdx: PIndex2): i32; inline;
 procedure sqlite3RefillIndex(pParse: PParse; pIndex: PIndex2;
@@ -23482,18 +23476,9 @@ end;
 // Phase 6.6 — auth.c
 // ===========================================================================
 
-{ sqlite3ExpirePreparedStatements — invalidate all prepared statements.
-  Full implementation requires iterating db->pVdbe; this stub marks iCode. }
-procedure sqlite3ExpirePreparedStatements(db: PTsqlite3; iCode: i32);
-var
-  v: PVdbe;
-begin
-  v := PVdbe(db^.pVdbe);
-  while v <> nil do begin
-    v^.vdbeFlags := v^.vdbeFlags or VDBF_EXPIRED_MASK;
-    v := v^.pVNext;
-  end;
-end;
+{ sqlite3ExpirePreparedStatements lives in passqlite3vdbe.pas (faithful port
+  of vdbeaux.c:5337); the duplicate that used to live here set the 2-bit
+  expired field to 3 instead of (iCode+1), so was a real-bug stub. }
 
 function sqlite3_set_authorizer(db: PTsqlite3;
   xAuth: Pointer; pArg: Pointer): i32;
