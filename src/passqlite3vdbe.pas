@@ -2426,7 +2426,10 @@ begin
   Result := pFirst;
 end;
 
-{ --- Scan status (stubs — SQLITE_ENABLE_STMT_SCANSTATUS not enabled) --- }
+{ --- Scan status --- }
+{ All three scan-status entry points (vdbeaux.c:1190, :1222, :1254) are
+  gated by SQLITE_ENABLE_STMT_SCANSTATUS (off in default upstream build);
+  the no-op bodies match default-build behaviour exactly. }
 
 procedure sqlite3VdbeScanStatus(p: PVdbe; addrExplain, addrLoop, addrVisit: i32;
                                 nEst: LogEst; zName: PAnsiChar);
@@ -2652,12 +2655,23 @@ end;
 { --- Explain helpers (stubs) --- }
 
 function sqlite3VdbeExplainParent(pParse: PParse): i32;
+{ Port of vdbeaux.c:493.  Returns the address of the current EXPLAIN
+  QUERY PLAN baseline (0 if none).  pParse->addrExplain lives at offset
+  312 (verified against passqlite3codegen.TParse layout). }
+var
+  addrExplain: i32;
+  pOp:         PVdbeOp;
 begin
-  Result := 0;
+  addrExplain := PInt32(PByte(pParse) + 312)^;
+  if addrExplain = 0 then begin Result := 0; Exit; end;
+  pOp := sqlite3VdbeGetOp(vdbeParsePVdbe(pParse), addrExplain);
+  Result := pOp^.p2;
 end;
 
 procedure sqlite3ExplainBreakpoint(z1, z2: PAnsiChar);
 begin
+  { vdbeaux.c:505 — SQLITE_DEBUG-only debugger hook; no-op matches
+    default-build (NDEBUG) behaviour exactly. }
 end;
 
 function sqlite3VdbeExplain(pParse: PParse; bPush: u8; zFmt: PAnsiChar): i32;
@@ -2788,8 +2802,15 @@ begin
 end;
 
 procedure sqlite3VdbeFrameMemDel(pArg: Pointer); cdecl;
+{ Port of vdbeaux.c:2247.  Mem destructor that defers the actual frame
+  free until the owning Vdbe halts (so OP_Program callers can still walk
+  the frame chain after the sub-program returns). }
+var
+  pFrame: PVdbeFrame;
 begin
-  { Stub — Phase 5.4 }
+  pFrame := PVdbeFrame(pArg);
+  pFrame^.pParent := pFrame^.v^.pDelFrame;
+  pFrame^.v^.pDelFrame := pFrame;
 end;
 
 function sqlite3VdbeNextOpcode(p: PVdbe; pSub: PSubProgram; eType: i32;

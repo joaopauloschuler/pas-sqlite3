@@ -153,19 +153,29 @@ Important: At the end of this document, please find:
   [ ] **6.21** port vdbe.pas stubs in full from C to pascal:
        `sqlite3VdbeMultiLoad` (blocked: only used by pragma.c and
        requires va_list — defer until 6.12 sqlite3Pragma lands),
-       `sqlite3VdbeScanStatus`, `sqlite3VdbeScanStatusRange`,
-       `sqlite3VdbeSetP4KeyInfo`, `sqlite3VdbeExplainParent`,
-       `sqlite3ExplainBreakpoint`, `sqlite3VdbeDisplayComment`,
-       `sqlite3VdbeDisplayP4`, `sqlite3VdbeEnter`,
-       `sqlite3VdbeFrameMemDel`, `sqlite3VdbeNextOpcode`,
+       `sqlite3VdbeSetP4KeyInfo` (blocked on cross-unit access to
+       `sqlite3KeyInfoOfIndex` in codegen.pas — needs hook indirection
+       like the gUnlinkAndDelete* pattern),
+       `sqlite3VdbeDisplayComment`, `sqlite3VdbeDisplayP4`,
+       `sqlite3VdbeEnter`, `sqlite3VdbeNextOpcode`,
        `sqlite3VdbeFrameRestore`, `sqlite3VdbeSetColName`,
        `sqlite3VdbeCloseStatement`, `sqlite3VdbeList`,
-       `sqlite3VdbePrintSql`,
        `sqlite3_blob_open`, `sqlite3VdbeLogAbort`,
        `sqlite3ResetOneSchema`, `sqlite3VdbeMemTranslate`,
        `sqlite3VdbeMemHandleBom`, `sqlite3ExpirePreparedStatements`,
        `sqlite3AnalysisLoad`, `sqlite3FkClearTriggerCache`,
        `sqlite3ResetAllSchemasOfConnection`, `sqlite3Stat4ProbeFree`.
+       [X] `sqlite3VdbeFrameMemDel` — ported in full (vdbeaux.c:2247);
+            adds the frame to v->pDelFrame for deferred free.
+       [X] `sqlite3VdbeExplainParent` — ported in full (vdbeaux.c:493).
+       [X] `sqlite3VdbeScanStatus` / `sqlite3VdbeScanStatusRange` /
+            `sqlite3VdbeScanStatusCounters` — gated by
+            `SQLITE_ENABLE_STMT_SCANSTATUS` (off in default upstream
+            build); no-op matches default-build behaviour exactly.
+       [X] `sqlite3ExplainBreakpoint` — `SQLITE_DEBUG`-only debugger
+            hook (vdbeaux.c:505); no-op matches default (NDEBUG) build.
+       [X] `sqlite3VdbePrintSql` — `SQLITE_DEBUG`-only (vdbeaux.c:2501);
+            no-op matches default-build behaviour.
        [X] `sqlite3UnlinkAndDeleteTable` / `Index` / `Trigger` and
             `sqlite3RootPageMoved` — wired via callback hooks
             (gUnlinkAndDelete{Table,Index,Trigger}, gRootPageMoved)
