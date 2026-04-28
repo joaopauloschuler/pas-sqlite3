@@ -17946,6 +17946,349 @@ end;
   20-row corpus flips green.  For each new shape the only change
   here is to remove a guard and verify the existing inner-loop body
   still produces byte-identical bytecode against the C oracle. }
+{ --- AggInfo bookkeeping (expr.c:7264..7559) — Phase 6.10 step 7(c2). --- }
+
+{ addAggInfoColumn / addAggInfoFunc — expr.c:7275 / 7291.  Append a slot
+  to pAggInfo->aCol[] / aFunc[].  Returns the new index, or -1 on OOM. }
+function addAggInfoColumn(db: PTsqlite3; pInfo: PAggInfo): i32;
+var idx, n: i32;
+begin
+  n := pInfo^.nColumn;
+  pInfo^.aCol := PAggInfoCol(sqlite3ArrayAllocate(db, pInfo^.aCol,
+    SizeOf(TAggInfoCol), @n, @idx));
+  pInfo^.nColumn := n;
+  Result := idx;
+end;
+
+function addAggInfoFunc(db: PTsqlite3; pInfo: PAggInfo): i32;
+var idx, n: i32;
+begin
+  n := pInfo^.nFunc;
+  pInfo^.aFunc := PAggInfoFunc(sqlite3ArrayAllocate(db, pInfo^.aFunc,
+    SizeOf(TAggInfoFunc), @n, @idx));
+  pInfo^.nFunc := n;
+  Result := idx;
+end;
+
+{ findOrCreateAggInfoColumn — expr.c:7310.  Search pAggInfo->aCol[] for
+  a slot with the given (iTable, iColumn); create one when missing.
+  Wires pExpr->pAggInfo + iAgg, and (when the column matches a
+  GROUP BY term) records the matching iSorterColumn. }
+procedure findOrCreateAggInfoColumn(pParse: PParse; pAggInfo: PAggInfo;
+                                    pExpr: PExpr);
+var
+  pCol: PAggInfoCol;
+  k, j, n, mxTerm: i32;
+  pGB: PExprList;
+  pTerm: PExprListItem;
+  pE: PExpr;
+  reused: Boolean;
+begin
+  mxTerm := pParse^.db^.aLimit[SQLITE_LIMIT_COLUMN];
+  Assert(pAggInfo^.iFirstReg = 0);
+  reused := False;
+  k := 0;
+  while k < pAggInfo^.nColumn do
+  begin
+    pCol := @pAggInfo^.aCol[k];
+    if pCol^.pCExpr = pExpr then Exit;
+    if (pCol^.iTable = pExpr^.iTable)
+       and (pCol^.iColumn = pExpr^.iColumn)
+       and (pExpr^.op <> TK_IF_NULL_ROW) then
+    begin
+      reused := True;
+      break;
+    end;
+    Inc(k);
+  end;
+  if not reused then
+  begin
+    k := addAggInfoColumn(pParse^.db, pAggInfo);
+    if k < 0 then
+    begin
+      Assert(pParse^.db^.mallocFailed <> 0);
+      Exit;
+    end;
+    if k > mxTerm then
+    begin
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+        'more than %d aggregate terms', [mxTerm]));
+      k := mxTerm;
+    end;
+    pCol := @pAggInfo^.aCol[k];
+    Assert((pExpr^.flags and EP_xIsSelect) = 0);  { ExprUseYTab }
+    pCol^.pTab          := pExpr^.y.pTab;
+    pCol^.iTable        := pExpr^.iTable;
+    pCol^.iColumn       := pExpr^.iColumn;
+    pCol^.iSorterColumn := -1;
+    pCol^.pCExpr        := pExpr;
+    if (pAggInfo^.pGroupBy <> nil) and (pExpr^.op <> TK_IF_NULL_ROW) then
+    begin
+      pGB   := pAggInfo^.pGroupBy;
+      pTerm := ExprListItems(pGB);
+      n     := pGB^.nExpr;
+      for j := 0 to n - 1 do
+      begin
+        pE := pTerm[j].pExpr;
+        if (pE^.op = TK_COLUMN)
+           and (pE^.iTable = pExpr^.iTable)
+           and (pE^.iColumn = pExpr^.iColumn) then
+        begin
+          pCol^.iSorterColumn := j;
+          break;
+        end;
+      end;
+    end;
+    if pCol^.iSorterColumn < 0 then
+    begin
+      pCol^.iSorterColumn := i32(pAggInfo^.nSortingColumn);
+      Inc(pAggInfo^.nSortingColumn);
+    end;
+  end;
+  Assert((pExpr^.pAggInfo = nil) or (pExpr^.pAggInfo = pAggInfo));
+  pExpr^.pAggInfo := pAggInfo;
+  if pExpr^.op = TK_COLUMN then
+    pExpr^.op := TK_AGG_COLUMN;
+  pExpr^.iAgg := i16(k);
+end;
+
+{ analyzeAggregate — expr.c:7383.  Walker callback used by
+  sqlite3ExprAnalyzeAggregates to collect AggInfo entries.
+
+  Note on the default arm: the C reference also recognises ordinary
+  expressions that match an entry in pParse^.pIdxEpr (CREATE INDEX ...
+  ON <expr>).  The Pas port leaves pIdxEpr=nil unconditionally
+  (see TParse), so the default arm is a pure no-op until indexed
+  expressions land. }
+function analyzeAggregate(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pNC: PNameContext;
+  pP: PParse;
+  pSL: PSrcList;
+  pAgg: PAggInfo;
+  i, mxTerm, nArg: i32;
+  pItem: PSrcItem;
+  srcItems: PSrcItem;
+  pAFunc: PAggInfoFunc;
+  pOBList: PExprList;
+  enc: u8;
+begin
+  pNC  := pWalker^.u.pNC;
+  pP   := pNC^.pParse;
+  pSL  := pNC^.pSrcList;
+  pAgg := pNC^.uNC.pAggInfo;
+  Assert((pNC^.ncFlags and NC_UAggInfo) <> 0);
+  Assert(pAgg^.iFirstReg = 0);
+
+  case pExpr^.op of
+    TK_IF_NULL_ROW, TK_AGG_COLUMN, TK_COLUMN:
+    begin
+      if pSL <> nil then
+      begin
+        srcItems := SrcListItems(pSL);
+        for i := 0 to pSL^.nSrc - 1 do
+        begin
+          pItem := @srcItems[i];
+          Assert((pExpr^.flags and (EP_TokenOnly or EP_Reduced)) = 0);
+          if pExpr^.iTable = pItem^.iCursor then
+          begin
+            findOrCreateAggInfoColumn(pP, pAgg, pExpr);
+            break;
+          end;
+        end;
+      end;
+      Result := WRC_Continue;
+      Exit;
+    end;
+    TK_AGG_FUNCTION:
+    begin
+      if ((pNC^.ncFlags and NC_InAggFunc) = 0)
+         and (pWalker^.walkerDepth = i32(pExpr^.op2))
+         and (pExpr^.pAggInfo = nil) then
+      begin
+        mxTerm := pP^.db^.aLimit[SQLITE_LIMIT_COLUMN];
+        i := 0;
+        while i < pAgg^.nFunc do
+        begin
+          pAFunc := @pAgg^.aFunc[i];
+          if pAFunc^.pFExpr = pExpr then break;
+          if sqlite3ExprCompare(nil, pAFunc^.pFExpr, pExpr, -1) = 0 then
+            break;
+          Inc(i);
+        end;
+        if i > mxTerm then
+        begin
+          sqlite3ErrorMsg(pP, sqlite3MPrintf(pP^.db,
+            'more than %d aggregate terms', [mxTerm]));
+          i := mxTerm;
+        end
+        else if i >= pAgg^.nFunc then
+        begin
+          enc := pP^.db^.enc;
+          i := addAggInfoFunc(pP^.db, pAgg);
+          if i >= 0 then
+          begin
+            Assert((pExpr^.flags and EP_xIsSelect) = 0);
+            pAFunc := @pAgg^.aFunc[i];
+            pAFunc^.pFExpr := pExpr;
+            { ExprUseUToken: (flags & EP_IntValue)==0 — TK_AGG_FUNCTION
+              never carries EP_IntValue. }
+            if (pExpr^.x.pList <> nil) then
+              nArg := pExpr^.x.pList^.nExpr
+            else
+              nArg := 0;
+            pAFunc^.pFunc := sqlite3FindFunction(pP^.db,
+              pExpr^.u.zToken, nArg, enc, 0);
+            Assert(pAFunc^.bOBUnique = 0);
+            if (pExpr^.pLeft <> nil) and (pAFunc^.pFunc <> nil)
+               and ((PTFuncDef(pAFunc^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) = 0) then
+            begin
+              { ORDER BY clause attached to aggregate (e.g. group_concat(x ORDER BY y)) }
+              Assert(nArg > 0);
+              Assert(pExpr^.pLeft^.op = TK_ORDER);
+              Assert((pExpr^.pLeft^.flags and EP_xIsSelect) = 0);
+              pAFunc^.iOBTab := pP^.nTab;
+              Inc(pP^.nTab);
+              pOBList := pExpr^.pLeft^.x.pList;
+              Assert(pOBList^.nExpr > 0);
+              if (pOBList^.nExpr = 1) and (nArg = 1)
+                 and (sqlite3ExprCompare(nil,
+                       ExprListItems(pOBList)[0].pExpr,
+                       ExprListItems(pExpr^.x.pList)[0].pExpr, 0) = 0) then
+              begin
+                pAFunc^.bOBPayload := 0;
+                if (pExpr^.flags and EP_Distinct) <> 0 then
+                  pAFunc^.bOBUnique := 1
+                else
+                  pAFunc^.bOBUnique := 0;
+              end
+              else
+                pAFunc^.bOBPayload := 1;
+              if (PTFuncDef(pAFunc^.pFunc)^.funcFlags and SQLITE_SUBTYPE) <> 0 then
+                pAFunc^.bUseSubtype := 1
+              else
+                pAFunc^.bUseSubtype := 0;
+            end
+            else
+              pAFunc^.iOBTab := -1;
+            if ((pExpr^.flags and EP_Distinct) <> 0)
+               and (pAFunc^.bOBUnique = 0) then
+            begin
+              pAFunc^.iDistinct := pP^.nTab;
+              Inc(pP^.nTab);
+            end
+            else
+              pAFunc^.iDistinct := -1;
+          end;
+        end;
+        Assert((pExpr^.flags and (EP_TokenOnly or EP_Reduced)) = 0);
+        pExpr^.iAgg     := i16(i);
+        pExpr^.pAggInfo := pAgg;
+        Result := WRC_Prune;
+        Exit;
+      end
+      else
+      begin
+        Result := WRC_Continue;
+        Exit;
+      end;
+    end;
+    else
+    begin
+      { Default arm — IndexedExpr shortcut.  Pas port keeps pIdxEpr=nil,
+        so this is currently always a no-op (matches C's break;). }
+      if pP^.pIdxEpr = nil then begin Result := WRC_Continue; Exit; end;
+      Result := WRC_Continue;
+      Exit;
+    end;
+  end;
+end;
+
+{ sqlite3ExprAnalyzeAggregates — expr.c:7549.  Drive analyzeAggregate
+  over a single expression tree under a NameContext that already has
+  NC_UAggInfo set and pAggInfo bound. }
+procedure sqlite3ExprAnalyzeAggregates(pNC: PNameContext; pExpr: PExpr);
+var w: TWalker;
+begin
+  FillChar(w, SizeOf(w), 0);
+  w.xExprCallback    := @analyzeAggregate;
+  w.xSelectCallback  := @sqlite3WalkerDepthIncrease;
+  w.xSelectCallback2 := @sqlite3WalkerDepthDecrease;
+  w.walkerDepth      := 0;
+  w.u.pNC            := pNC;
+  w.pParse           := nil;
+  Assert(pNC^.pSrcList <> nil);
+  sqlite3WalkExpr(@w, pExpr);
+end;
+
+{ sqlite3ExprAnalyzeAggList — expr.c:7567.  Apply
+  sqlite3ExprAnalyzeAggregates to every expression in pList. }
+procedure sqlite3ExprAnalyzeAggList(pNC: PNameContext; pList: PExprList);
+var
+  i: i32;
+  items: PExprListItem;
+begin
+  if pList = nil then Exit;
+  items := ExprListItems(pList);
+  for i := 0 to pList^.nExpr - 1 do
+    if items[i].pExpr <> nil then
+      sqlite3ExprAnalyzeAggregates(pNC, items[i].pExpr);
+end;
+
+{ agginfoPersistExprCb — expr.c:7227.  Persist (deep-copy and defer-
+  delete) any Expr that the AggInfo retains a pointer to, so the
+  AggInfo entry survives even if the parent tree is rewritten or
+  freed.  Wired by sqlite3AggInfoPersistWalkerInit. }
+function agginfoPersistExprCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pAgg: PAggInfo;
+  iAgg: i32;
+  pP: PParse;
+  db: PTsqlite3;
+  pDup: PExpr;
+begin
+  if ((pExpr^.flags and (EP_TokenOnly or EP_Reduced)) = 0)
+     and (pExpr^.pAggInfo <> nil) then
+  begin
+    pAgg := pExpr^.pAggInfo;
+    iAgg := pExpr^.iAgg;
+    pP   := pWalker^.pParse;
+    db   := pP^.db;
+    Assert(iAgg >= 0);
+    if pExpr^.op <> TK_AGG_FUNCTION then
+    begin
+      if (iAgg < pAgg^.nColumn)
+         and (pAgg^.aCol[iAgg].pCExpr = pExpr) then
+      begin
+        pDup := sqlite3ExprDup(db, pExpr, 0);
+        if (pDup <> nil) and (sqlite3ExprDeferredDelete(pP, pDup) = 0) then
+          pAgg^.aCol[iAgg].pCExpr := pDup;
+      end;
+    end
+    else
+    begin
+      Assert(pExpr^.op = TK_AGG_FUNCTION);
+      if (iAgg < pAgg^.nFunc)
+         and (pAgg^.aFunc[iAgg].pFExpr = pExpr) then
+      begin
+        pDup := sqlite3ExprDup(db, pExpr, 0);
+        if (pDup <> nil) and (sqlite3ExprDeferredDelete(pP, pDup) = 0) then
+          pAgg^.aFunc[iAgg].pFExpr := pDup;
+      end;
+    end;
+  end;
+  Result := WRC_Continue;
+end;
+
+{ sqlite3AggInfoPersistWalkerInit — expr.c:7264. }
+procedure sqlite3AggInfoPersistWalkerInit(pWalker: PWalker; pParse: PParse);
+begin
+  FillChar(pWalker^, SizeOf(pWalker^), 0);
+  pWalker^.pParse          := pParse;
+  pWalker^.xExprCallback   := @agginfoPersistExprCb;
+  pWalker^.xSelectCallback := @sqlite3SelectWalkNoop;
+end;
+
 { exprNodeHasAggFunc — Walker callback that sets w.eCode := 1 the first
   time it sees a TK_FUNCTION whose resolved FuncDef is an aggregate
   (xFinalize<>nil), then aborts.  Used by selectMarkAggregate below to

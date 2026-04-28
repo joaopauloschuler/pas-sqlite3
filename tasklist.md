@@ -172,11 +172,23 @@ Important: At the end of this document, please find:
               only the lifecycle helper
               `sqlite3AggInfoPersistWalkerInit` (select.c:6121)
               remains for (c2) wiring.
-        [ ] **(c2)** Port `analyzeAggregate` (select.c:6280..6450)
-              — the walker that scans pEList / pHaving / pOrderBy
-              for TK_AGG_FUNCTION / TK_AGG_COLUMN and populates
-              the AggInfo entries.  Wire from sqlite3Select after
-              selectMarkAggregate (already runs at 17890).
+        [X] **(c2)** Port `analyzeAggregate` (expr.c:7383) +
+              dependencies — landed 2026-04-28.  Ported
+              `sqlite3ArrayAllocate` (build.c:4680) into util.pas
+              and the AggInfo helper cluster in codegen.pas:
+              `addAggInfoColumn`, `addAggInfoFunc`,
+              `findOrCreateAggInfoColumn`, `analyzeAggregate`,
+              `sqlite3ExprAnalyzeAggregates`,
+              `sqlite3ExprAnalyzeAggList`, `agginfoPersistExprCb`,
+              `sqlite3AggInfoPersistWalkerInit`.  Default arm
+              (`pParse->pIdxEpr` indexed-expression shortcut) is
+              a documented no-op until `pIdxEpr` lands.  Code is
+              uncalled until (c3) opens the SF_Aggregate gate, so
+              Δ-neutral (TestExplainParity 1012/14, TestVdbeAgg
+              11/11, TestSelectBasic 49/49, TestParser 45/45 all
+              green).  Next: (c3) replace the
+              codegen.pas:18180 `Exit` for SF_Aggregate (pGroupBy=nil)
+              with the agg-codegen tail using the now-real walker.
         [ ] **(c3)** Open the SF_Aggregate gate at codegen.pas:18045
               for the no-GROUP-BY case (`p^.pGroupBy = nil` already
               checked at 17980).  Replace the unconditional `Exit`

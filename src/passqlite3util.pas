@@ -667,6 +667,9 @@ function  sqlite3DbStrNDup(db: Psqlite3db; z: PChar; n: u64): PChar;
 function  sqlite3DbRealloc(db: Psqlite3db; p: Pointer; n: u64): Pointer;
 function  sqlite3DbMallocSize(db: Psqlite3db; p: Pointer): i32;
 function  sqlite3DbReallocOrFree(db: Psqlite3db; p: Pointer; n: u64): Pointer;
+function  sqlite3ArrayAllocate(db: Psqlite3db; pArray: Pointer;
+                               szEntry: i32; pnEntry: Pi32;
+                               pIdx: Pi32): Pointer;
 procedure sqlite3OomFault(db: Psqlite3db);
 procedure sqlite3OomClear(db: Psqlite3db);
 function  sqlite3ApiExit(db: Psqlite3db; rc: i32): i32;
@@ -2256,6 +2259,37 @@ function sqlite3DbReallocOrFree(db: Psqlite3db; p: Pointer; n: u64): Pointer;
 begin
   Result := sqlite3_realloc64(p, n);
   if Result = nil then sqlite3_free(p);
+end;
+
+{ sqlite3ArrayAllocate — port of build.c:4680.  Append a slot to a
+  power-of-two-sized array, growing the allocation when (n & (n-1))==0.
+  *pIdx receives the new slot index (or -1 on OOM); *pnEntry is bumped. }
+function sqlite3ArrayAllocate(db: Psqlite3db; pArray: Pointer;
+                              szEntry: i32; pnEntry: Pi32;
+                              pIdx: Pi32): Pointer;
+var
+  z:    PByte;
+  n, sz: i64;
+  pNew: Pointer;
+begin
+  n := pnEntry^;
+  pIdx^ := i32(n);
+  if (n and (n - 1)) = 0 then
+  begin
+    if n = 0 then sz := 1 else sz := 2 * n;
+    pNew := sqlite3DbRealloc(db, pArray, u64(sz * szEntry));
+    if pNew = nil then
+    begin
+      pIdx^ := -1;
+      Result := pArray;
+      Exit;
+    end;
+    pArray := pNew;
+  end;
+  z := PByte(pArray);
+  FillChar((z + n * szEntry)^, szEntry, 0);
+  Inc(pnEntry^);
+  Result := pArray;
 end;
 
 { sqlite3OomFault — port of malloc.c:827.
