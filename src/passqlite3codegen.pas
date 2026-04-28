@@ -26047,7 +26047,7 @@ var
   function FmtFloat(spec: AnsiChar; v: Double): AnsiString;
   var
     fmt: TFloatFormat;
-    digits, prec: i32;
+    digits, prec, i: i32;
   begin
     if (spec = 'e') or (spec = 'E') then begin
       if metaHavePrec then prec := metaPrec else prec := 6;
@@ -26055,6 +26055,14 @@ var
     end else begin
       if (not metaHaveWidth) and (not metaHavePrec) and (spec <> 'f') then begin
         Result := FloatToStr(v);
+        if (spec = 'G') then Result := UpperCase(Result);
+        for i := 1 to Length(Result) - 1 do
+          if (Result[i] = 'e') or (Result[i] = 'E') then begin
+            if (i + 1 <= Length(Result))
+               and (Result[i + 1] <> '+') and (Result[i + 1] <> '-') then
+              Insert('+', Result, i + 1);
+            Break;
+          end;
       end else begin
         case spec of
           'f': begin fmt := ffFixed;    if metaHavePrec then prec := metaPrec else prec := 6; end;
@@ -26065,6 +26073,15 @@ var
         else digits := prec;
         Result := FloatToStrF(v, fmt, 15, digits);
         if (spec = 'G') then Result := UpperCase(Result);
+        { Ensure scientific-notation exponent carries an explicit sign,
+          matching C printf(%g/%G) which always emits "e+NN" / "e-NN". }
+        for i := 1 to Length(Result) - 1 do
+          if (Result[i] = 'e') or (Result[i] = 'E') then begin
+            if (i + 1 <= Length(Result))
+               and (Result[i + 1] <> '+') and (Result[i + 1] <> '-') then
+              Insert('+', Result, i + 1);
+            Break;
+          end;
       end;
     end;
     if metaHaveWidth and (Length(Result) < metaWidth) then begin
@@ -26224,10 +26241,22 @@ begin
         App(FmtFloat(c, vDbl));
       end;
       's': begin
+        { %s — honour width / precision per printf.c et_STRING.  Precision
+          truncates the source string to that many bytes; width pads
+          (left-aligned with '-' flag, otherwise right-aligned with spaces). }
         Inc(p);
         if pVal <> nil then begin
           zStr := sqlite3_value_text(Psqlite3_value(pVal));
-          if zStr <> nil then App(AnsiString(zStr));
+          if zStr = nil then s := '' else s := AnsiString(zStr);
+          if metaHavePrec and (Length(s) > metaPrec) then
+            SetLength(s, metaPrec);
+          if metaHaveWidth and (Length(s) < metaWidth) then begin
+            if Pos('-', metaFlags) > 0 then
+              s := s + StringOfChar(' ', metaWidth - Length(s))
+            else
+              s := StringOfChar(' ', metaWidth - Length(s)) + s;
+          end;
+          App(s);
         end;
       end;
       'c': begin

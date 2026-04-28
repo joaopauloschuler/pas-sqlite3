@@ -481,6 +481,36 @@ Important: At the end of this document, please find:
         `SELECT sum(5)` step to DONE without producing a row.
         Same root cause as 6.10 step 7(c) — agg-no-GROUP gate at
         codegen.pas:18045.  Closed when (c1)..(c7) lands.
+      [X] **g) printf `%s` precision / width ignored.**  Fixed
+        2026-04-28.  `%s` arm appended raw with no truncation/padding;
+        now honours width + precision per printf.c et_STRING (precision
+        truncates, '-' flag left-aligns, otherwise right-aligns with
+        spaces).  `%.5s 'abcdefg'` → "abcde", `%10.5s` → "     abcde",
+        `%-10.5s|` → "abcde     |".
+      [X] **h) printf `%g`/`%G` exponent missing '+' sign.**  Fixed
+        2026-04-28.  FPC's `FloatToStr` / `FloatToStrF` emit
+        "1.5E20" without the '+', whereas C printf always emits
+        "1.5e+20" / "1.5E+20".  Post-process inserts '+' after E/e
+        when no explicit sign follows.  Verified `printf('%G',1.5e20)`
+        → "1.5E+20".
+      [ ] **i) Built-in scalar functions missing.**  Probe surfaced
+        unported builtins that resolve as user-defined and return
+        NULL (Pas) vs the productive C result:
+        - `unistr(text)` — func.c unistrFunc.  Decodes Unicode
+          escape sequences (\uXXXX, \UXXXXXXXX, \\, \xXX) per
+          func.c:2706.
+        - `sqlite_compileoption_used(name)` — func.c:1031
+          compileoptionusedFunc.  Reports if a compile-time option
+          was enabled.
+        - `sqlite_compileoption_get(idx)` — func.c:1056
+          compileoptiongetFunc.  Returns the Nth registered option
+          string.
+        Also unported printf specifiers detected:
+        - `%b` — boolean (truthy text per printf.c et_BOOLEAN).
+        - `%w` — SQL identifier-quote (doubles internal `"`).
+        - `%n` — diagnostic no-op specifier.
+        Low priority but track here so future probes don't re-find
+        them.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
