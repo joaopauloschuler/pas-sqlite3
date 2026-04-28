@@ -25145,6 +25145,70 @@ begin
   sqlite3_free(zOut);
 end;
 
+{ concat()/concat_ws() — func.c:1656..1725.  concat() ignores NULL arguments
+  and concatenates the rest with no separator; concat_ws(sep, ...) uses the
+  first argument as a non-NULL separator (returns NULL if separator is NULL)
+  and joins the remaining non-NULL arguments. }
+procedure concatFuncCore(pCtx: Psqlite3_context; argc: i32; argv: PPMem;
+                         nSep: i32; zSep: PAnsiChar);
+var
+  i, k:      i32;
+  j, n:      i64;
+  bNotNull:  Int32;
+  z, p:      PAnsiChar;
+  v:         PAnsiChar;
+  pVal:      Psqlite3_value;
+begin
+  n := 0;
+  for i := 0 to argc - 1 do begin
+    pVal := Psqlite3_value((argv + i)^);
+    n := n + sqlite3_value_bytes(pVal);
+  end;
+  if argc > 0 then n := n + i64(argc - 1) * i64(nSep);
+  z := sqlite3_malloc(i32(n) + 1);
+  if z = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+  j := 0;
+  bNotNull := 0;
+  for i := 0 to argc - 1 do begin
+    pVal := Psqlite3_value((argv + i)^);
+    if sqlite3_value_type(pVal) <> SQLITE_NULL then begin
+      k := sqlite3_value_bytes(pVal);
+      v := sqlite3_value_text(pVal);
+      if v <> nil then begin
+        if (bNotNull <> 0) and (nSep > 0) then begin
+          Move(zSep^, (z + j)^, nSep);
+          j := j + nSep;
+        end;
+        if k > 0 then Move(v^, (z + j)^, k);
+        j := j + k;
+        bNotNull := 1;
+      end;
+    end;
+  end;
+  p := z + j;
+  p^ := #0;
+  sqlite3_result_text(pCtx, z, i32(j), SQLITE_TRANSIENT);
+  sqlite3_free(z);
+end;
+
+procedure concatFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  concatFuncCore(pCtx, argc, argv, 0, '');
+end;
+
+procedure concatwsFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  nSep: i32;
+  zSep: PAnsiChar;
+begin
+  if argc < 1 then Exit;
+  nSep := sqlite3_value_bytes(Psqlite3_value(argv^));
+  zSep := sqlite3_value_text(Psqlite3_value(argv^));
+  if zSep = nil then Exit;
+  concatFuncCore(pCtx, argc - 1, PPMem(PtrUInt(argv) + SizeOf(Pointer)),
+                 nSep, zSep);
+end;
+
 procedure likeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   zPat, zStr, zE: PAnsiChar;
@@ -25875,7 +25939,7 @@ const
   AGG_ENC  = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
 
 var
-  aBuiltinFuncs: array[0..48] of TFuncDef;
+  aBuiltinFuncs: array[0..50] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -25987,6 +26051,13 @@ begin
   { sign(X) — func.c:3427: FUNCTION(sign, 1, 0, 0, signFunc).
     Closes 6.10 step 11(j). }
   MakeFD(aBuiltinFuncs[48], 1, FUNC_ENC, @signFunc, nil, 'sign');
+  { concat / concat_ws — func.c:3329..3330.
+      FUNCTION(concat,    -3, 0, 0, concatFunc)
+      FUNCTION(concat_ws, -4, 0, 0, concatwsFunc)
+    nArg=-3 means "1 or more args" (variadic, min 1); -4 means "min 2".
+    sqlite3FindFunction's matchQuality treats negative nArg as variadic. }
+  MakeFD(aBuiltinFuncs[49], -3, FUNC_ENC, @concatFunc,   nil, 'concat');
+  MakeFD(aBuiltinFuncs[50], -4, FUNC_ENC, @concatwsFunc, nil, 'concat_ws');
 end;
 
 var
