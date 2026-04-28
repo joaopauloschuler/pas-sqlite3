@@ -393,6 +393,14 @@ begin
   pTab^.tabFlags := 0;     { HasRowid, no without-rowid bit }
   pTab^.eTabType := TABTYP_NORM;
   pTab^.pIndex   := nil;
+  { Allocate one zeroed Column slot — sqlite3ExprNNCollSeq (Phase 6.26)
+    dereferences pTab^.aCol[iColumn] for non-rowid TK_COLUMN expressions.
+    With colFlags=0, sqlite3ColumnColl returns nil and ExprCollSeq falls
+    back to db^.pDfltColl (BINARY). }
+  pTab^.aCol := PColumn(sqlite3DbMallocZero(db, SizeOf(TColumn)));
+  if pTab^.aCol = nil then begin
+    WriteLn('FATAL: pTab.aCol alloc failed'); Halt(2);
+  end;
 
   { --- Build a hand-crafted Parse + Vdbe --- }
   FillChar(parse, SizeOf(parse), 0);
@@ -496,14 +504,9 @@ begin
 
   sqlite3DbFree(db, pSrcBuf);
 
-  { Multi-term tests disabled: regression after Phase 6.26 ExprCollSeq port —
-    sqlite3WhereBegin path now exercises ExprNNCollSeq through pTab^.aCol
-    fields not initialised by these test fixtures.  passqlite3main now
-    bootstraps db^.pDfltColl, but the column-expression fixtures still need
-    y.pTab + zCnName setup.  Tracked in tasklist 6.A. }
-  if False then RunMultiAndTest(db, pTab);
-  if False then RunInTest(db, pTab);
-  if False then RunBetweenTest(db, pTab);
+  RunMultiAndTest(db, pTab);
+  RunInTest(db, pTab);
+  RunBetweenTest(db, pTab);
 
   sqlite3_close(db);
 

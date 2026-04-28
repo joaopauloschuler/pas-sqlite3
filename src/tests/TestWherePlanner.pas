@@ -1671,7 +1671,11 @@ end;
 
 procedure TestFindIndexCol;
 var
+  db:     PTsqlite3;
+  rc:     i32;
   parse:  TParse;
+  tab:    TTable;
+  cols:   array[0..7] of TColumn;
   idx:    TIndex;
   aiCol:  array[0..1] of i16;
   azColl: array[0..1] of PAnsiChar;
@@ -1681,7 +1685,16 @@ var
   e0, e1, e2: TExpr;
   zBin:   array[0..6] of AnsiChar;
 begin
+  { Real db + Parse: sqlite3ExprNNCollSeq (Phase 6.26) dereferences
+    pParse->db->pDfltColl whenever a TK_COLUMN/TK_AGG_COLUMN matches the
+    index column, so the previous FillChar'd Parse is no longer survivable. }
+  rc := sqlite3_open(':memory:', @db);
+  Check('FIC0 open :memory:', rc = SQLITE_OK);
   FillChar(parse,   SizeOf(parse), 0);
+  parse.db := db;
+
+  FillChar(tab,     SizeOf(tab),   0);
+  FillChar(cols,    SizeOf(cols),  0);
   FillChar(idx,     SizeOf(idx),   0);
   FillChar(listBuf, SizeOf(listBuf), 0);
   FillChar(e0, SizeOf(e0), 0);
@@ -1700,16 +1713,23 @@ begin
   idx.nKeyCol  := 2;
   idx.nColumn  := 2;
 
+  { Tab needs at least 8 columns since e2 references column 7.  cols[*] are
+    zeroed so colFlags=0 → sqlite3ColumnColl returns nil → ExprCollSeq picks
+    the connection's default BINARY collation. }
+  tab.aCol := @cols[0];
+
   pList := PExprList(@listBuf[0]);
   pList^.nExpr := 3;
   items := ExprListItems(pList);
 
-  { e0 references cursor 9, column 99 — no match. }
+  { e0 references cursor 9, column 99 — no match (skipped before ExprCollSeq). }
   e0.op := TK_COLUMN; e0.iTable := 9; e0.iColumn := 99;
   { e1 matches: cursor 9, column 5 → the iCol=0 of pIdx. }
   e1.op := TK_COLUMN; e1.iTable := 9; e1.iColumn := 5;
+  e1.y.pTab := @tab;
   { e2 matches: cursor 9, column 7 → the iCol=1 of pIdx. }
   e2.op := TK_AGG_COLUMN; e2.iTable := 9; e2.iColumn := 7;
+  e2.y.pTab := @tab;
 
   items[0].pExpr := @e0;
   items[1].pExpr := @e1;
@@ -1731,12 +1751,16 @@ begin
   e2.iTable := 9; e2.iColumn := 7; { still TK_AGG_COLUMN }
   Check('FIC4 non-column entry skipped',
         findIndexCol(@parse, pList, 9, @idx, 0) = -1);
+
+  sqlite3_close(db);
 end;
 
 { ----- isDistinctRedundant — (b) UNIQUE-index branch (where.c:678..691) ----- }
 
 procedure TestIsDistinctRedundant;
 var
+  db:       PTsqlite3;
+  rc:       i32;
   parse:    TParse;
   wInfo:    TWhereInfo;
   pWC:      PWhereClause;
@@ -1754,7 +1778,10 @@ var
   dItems:   PExprListItem;
   d0, d1:   TExpr;
 begin
+  rc := sqlite3_open(':memory:', @db);
+  Check('IDR0 open :memory:', rc = SQLITE_OK);
   FillChar(parse,   SizeOf(parse), 0);
+  parse.db := db;
   FillChar(wInfo,   SizeOf(wInfo), 0);
   FillChar(tab,     SizeOf(tab),   0);
   FillChar(cols,    SizeOf(cols),  0);
@@ -1804,7 +1831,9 @@ begin
 
   { d0 → col0 of cursor 4, d1 → col1 of cursor 4. }
   d0.op := TK_COLUMN; d0.iTable := 4; d0.iColumn := 0;
+  d0.y.pTab := @tab;
   d1.op := TK_COLUMN; d1.iTable := 4; d1.iColumn := 1;
+  d1.y.pTab := @tab;
   dItems[0].pExpr := @d0;
   dItems[1].pExpr := @d1;
 
@@ -1840,6 +1869,8 @@ begin
   d0.iColumn := -1;             { rowid }
   Check('IDR6 IPK fast-path → 1',
         isDistinctRedundant(@parse, pSrc, pWC, pDist) = 1);
+
+  sqlite3_close(db);
 end;
 
 { ----- whereLoopAddBtreeIndex (where.c:3219..3653) -----
@@ -6664,13 +6695,8 @@ begin
   TestTermCanDriveIndexGate;
   TestExprImplies;
   TestIndexColumnNotNull;
-  { TestFindIndexCol / TestIsDistinctRedundant pass nil parse.db and
-    column expressions with y.pTab=nil; sqlite3ExprNNCollSeq dereferences
-    both since the Phase 6.26 ExprCollSeq port.  Tests need a real-db
-    rewrite (passqlite3main now bootstraps db^.pDfltColl, but the tests
-    still hand a FillChar'd Parse).  Tracked in tasklist 6.A. }
-  if False then TestFindIndexCol;
-  if False then TestIsDistinctRedundant;
+  TestFindIndexCol;
+  TestIsDistinctRedundant;
   TestWhereLoopAddBtreeIndex;
   TestWhereLoopAddBtree;
   TestWhereLoopAddAllAndOr;

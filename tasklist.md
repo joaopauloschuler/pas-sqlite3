@@ -264,20 +264,6 @@ Important: At the end of this document, please find:
        [X] `sqlite3ColumnSetColl` / `sqlite3ColumnColl` — ported in full
             (build.c:720, build.c:745).  Packs/recovers collation name
             in the zCnName allocation.  Was a Phase 6.6 stub pair.
-  [ ] **6.A** Re-enable column-expression unit tests broken by Phase 6.26
-       ExprCollSeq port.  Connection-level bootstrap landed (passqlite3main
-       now createCollation()s BINARY/NOCASE/RTRIM and points pDfltColl at
-       BINARY), but three test fixtures still hand `Expr` records with
-       `y.pTab=nil` to sqlite3WhereBegin / findIndexCol / isDistinctRedundant
-       and crash inside ExprCollSeq's `p^.y.pTab^.aCol[j]` deref:
-         * src/tests/TestWherePlanner.pas — `TestFindIndexCol`,
-           `TestIsDistinctRedundant` (currently gated behind `if False`).
-         * src/tests/TestWhereSimple.pas — `RunMultiAndTest`, `RunInTest`,
-           `RunBetweenTest` (currently gated behind `if False`).
-       Fix: each TK_COLUMN/TK_AGG_COLUMN expression in these fixtures must
-       set `y.pTab := pTab` (and the column[i].zCnName allocations need to
-       be valid C strings so sqlite3ColumnColl can walk the packed name).
-       Re-enable the gated calls once those mechanical setups are in place.
   [ ] **6.27** port codegen.pas alter / attach / analyze / vacuum / FK /
        extension / scalar-function stubs in full from C to pascal:
        `sqlite3AlterRenameTable`, `sqlite3AlterFinishAddColumn`,
