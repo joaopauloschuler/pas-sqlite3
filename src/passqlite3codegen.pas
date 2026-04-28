@@ -30659,6 +30659,67 @@ begin
     sqlite3VdbeAppendP4(v, Pointer(pKeyInfo), P4_KEYINFO);
 end;
 
+{ displayP4Trampoline — gDisplayP4 hook (vdbeaux.c:1905 P4_KEYINFO/TABLE/
+  TABLEREF/INDEX arms).  Returns nil for other p4types so vdbe.pas's inline
+  arms take over. }
+function displayP4Trampoline(db: Psqlite3; pOp: PVdbeOp): PAnsiChar; cdecl;
+var
+  pKI: PKeyInfo2;
+  j:   i32;
+  pColl: PCollSeq2;
+  zColl: PAnsiChar;
+  pSortFlags: Pu8;
+  flag: u8;
+  prefix, bigNullStr: PAnsiChar;
+begin
+  Result := nil;
+  case pOp^.p4type of
+    P4_KEYINFO:
+      begin
+        pKI := PKeyInfo2(pOp^.p4.pKeyInfo);
+        if pKI = nil then Exit;
+        Assert(pKI^.aSortFlags <> nil);
+        Result := sqlite3MPrintf(PTsqlite3(db), 'k(%d', [i32(pKI^.nKeyField)]);
+        pSortFlags := pKI^.aSortFlags;
+        for j := 0 to i32(pKI^.nKeyField) - 1 do
+        begin
+          { aColl[j] sits at offset 32 + j*8 within the KeyInfo allocation. }
+          pColl := PPointer(Pu8(pKI) + 32 + Cardinal(j) * SizeOf(Pointer))^;
+          if pColl <> nil then
+            zColl := PTCollSeq(pColl)^.zName
+          else
+            zColl := '';
+          if (zColl <> nil) and (StrComp(zColl, 'BINARY') = 0) then
+            zColl := 'B';
+          flag := pSortFlags[j];
+          if (flag and KEYINFO_ORDER_DESC) <> 0 then
+            prefix := '-'
+          else
+            prefix := '';
+          if (flag and KEYINFO_ORDER_BIGNULL) <> 0 then
+            bigNullStr := 'N.'
+          else
+            bigNullStr := '';
+          Result := sqlite3MPrintf(PTsqlite3(db), '%z,%s%s%s',
+                                    [Result, prefix, bigNullStr, zColl]);
+        end;
+        Result := sqlite3MPrintf(PTsqlite3(db), '%z)', [Result]);
+      end;
+    P4_TABLE, P4_TABLEREF:
+      begin
+        if pOp^.p4.pTab = nil then Exit;
+        Result := sqlite3MPrintf(PTsqlite3(db), '%s',
+                                  [PTable2(pOp^.p4.pTab)^.zName]);
+      end;
+    P4_INDEX:
+      begin
+        if pOp^.p4.pIdx = nil then Exit;
+        Result := sqlite3MPrintf(PTsqlite3(db), '%s',
+                                  [PIndex2(pOp^.p4.pIdx)^.zName]);
+      end;
+  end;
+end;
+
 initialization
   { Wire the schema-cleanup hooks declared by passqlite3vdbe.  The opcode
     handlers there (OP_DropTable, OP_DropIndex, OP_DropTrigger, OP_Destroy
@@ -30673,5 +30734,6 @@ initialization
   passqlite3vdbe.gSetP4KeyInfo           := passqlite3vdbe.TSetP4KeyInfoFn(@setP4KeyInfoTrampoline);
   passqlite3vdbe.gResetOneSchema         := @sqlite3ResetOneSchema;
   passqlite3vdbe.gResetAllSchemas        := @sqlite3ResetAllSchemasOfConnection;
+  passqlite3vdbe.gDisplayP4              := passqlite3vdbe.TDisplayP4Fn(@displayP4Trampoline);
 
 end.

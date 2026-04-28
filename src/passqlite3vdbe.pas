@@ -1476,6 +1476,7 @@ type
   TSetP4KeyInfoFn    = procedure(pParse: PParse; pIdx: PIndex);
   TResetOneSchemaFn  = procedure(db: PTsqlite3; iDb: i32);
   TResetAllSchemasFn = procedure(db: PTsqlite3);
+  TDisplayP4Fn       = function(db: Psqlite3; pOp: PVdbeOp): PAnsiChar;
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
@@ -1484,6 +1485,7 @@ var
   gSetP4KeyInfo:           TSetP4KeyInfoFn;
   gResetOneSchema:         TResetOneSchemaFn;
   gResetAllSchemas:        TResetAllSchemasFn;
+  gDisplayP4:              TDisplayP4Fn;
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
@@ -2783,9 +2785,108 @@ begin
   Result := nil;
 end;
 
+{ sqlite3VdbeDisplayP4 — vdbeaux.c:1905.  Renders the P4 operand of an
+  opcode as a heap-allocated string (caller must sqlite3_free).  Real body
+  lives in passqlite3codegen via the gDisplayP4 hook (needs PTable/PIndex
+  field access not visible to this unit); the standalone arms (P4_INT32,
+  P4_INT64, P4_REAL, P4_FUNCDEF, P4_FUNCCTX, P4_INTARRAY, P4_SUBPROGRAM,
+  P4_MEM, P4_VTAB, default) are handled inline so the helper still works
+  for opcode display in vdbe-only test programs. }
 function sqlite3VdbeDisplayP4(db: Psqlite3; pOp: PVdbeOp): PAnsiChar;
+var
+  pFD:  PTFuncDef;
+  pCx:  Psqlite3_context;
+  pM:   PMem;
+  ai:   Pu32;
+  i, n: u32;
+  zRes: PAnsiChar;
 begin
-  Result := nil;
+  if Assigned(gDisplayP4) then
+  begin
+    zRes := gDisplayP4(db, pOp);
+    if zRes <> nil then begin Result := zRes; Exit; end;
+  end;
+  case pOp^.p4type of
+    P4_FUNCDEF:
+      begin
+        pFD := PTFuncDef(pOp^.p4.pFunc);
+        Result := sqlite3MPrintf(PTsqlite3(db), '%s(%d)',
+                                 [pFD^.zName, i32(pFD^.nArg)]);
+      end;
+    P4_FUNCCTX:
+      begin
+        pCx := pOp^.p4.pCtx;
+        pFD := PTFuncDef(pCx^.pFunc);
+        Result := sqlite3MPrintf(PTsqlite3(db), '%s(%d)',
+                                 [pFD^.zName, i32(pFD^.nArg)]);
+      end;
+    P4_INT64:
+      Result := sqlite3MPrintf(PTsqlite3(db), '%lld', [pOp^.p4.pI64^]);
+    P4_INT32:
+      Result := sqlite3MPrintf(PTsqlite3(db), '%d', [pOp^.p4.i]);
+    P4_REAL:
+      Result := sqlite3MPrintf(PTsqlite3(db), '%.16g', [pOp^.p4.pReal^]);
+    P4_MEM:
+      begin
+        pM := pOp^.p4.pMem;
+        if (pM^.flags and MEM_Str) <> 0 then
+          Result := sqlite3MPrintf(PTsqlite3(db), '%s', [pM^.z])
+        else if (pM^.flags and (MEM_Int or MEM_IntReal)) <> 0 then
+          Result := sqlite3MPrintf(PTsqlite3(db), '%lld', [pM^.u.i])
+        else if (pM^.flags and MEM_Real) <> 0 then
+          Result := sqlite3MPrintf(PTsqlite3(db), '%.16g', [pM^.u.r])
+        else if (pM^.flags and MEM_Null) <> 0 then
+          Result := sqlite3MPrintf(PTsqlite3(db), 'NULL', [])
+        else
+          Result := sqlite3MPrintf(PTsqlite3(db), '(blob)', []);
+      end;
+    P4_VTAB:
+      Result := sqlite3MPrintf(PTsqlite3(db), 'vtab:%p',
+                               [Pointer(pOp^.p4.pVtab)]);
+    P4_INTARRAY:
+      begin
+        ai := pOp^.p4.ai;
+        if ai = nil then begin Result := nil; Exit; end;
+        n := ai[0];
+        if n = 0 then
+          Result := sqlite3MPrintf(PTsqlite3(db), '[]', [])
+        else
+        begin
+          Result := sqlite3MPrintf(PTsqlite3(db), '[%u', [ai[1]]);
+          for i := 2 to n do
+            Result := sqlite3MPrintf(PTsqlite3(db), '%z,%u', [Result, ai[i]]);
+          Result := sqlite3MPrintf(PTsqlite3(db), '%z]', [Result]);
+        end;
+      end;
+    P4_SUBPROGRAM:
+      Result := sqlite3MPrintf(PTsqlite3(db), 'program', []);
+    P4_SUBRTNSIG:
+      Result := sqlite3MPrintf(PTsqlite3(db), 'subrtnsig:%d,%s',
+                               [pOp^.p4.pSubrtnSig^.selId,
+                                pOp^.p4.pSubrtnSig^.zAff]);
+    P4_COLLSEQ:
+      begin
+        { encnames mirror vdbeaux.c:1935 }
+        case PTCollSeq(pOp^.p4.pColl)^.enc of
+          1: Result := sqlite3MPrintf(PTsqlite3(db), '%.18s-8',
+                                       [PTCollSeq(pOp^.p4.pColl)^.zName]);
+          2: Result := sqlite3MPrintf(PTsqlite3(db), '%.18s-16LE',
+                                       [PTCollSeq(pOp^.p4.pColl)^.zName]);
+          3: Result := sqlite3MPrintf(PTsqlite3(db), '%.18s-16BE',
+                                       [PTCollSeq(pOp^.p4.pColl)^.zName]);
+        else
+          Result := sqlite3MPrintf(PTsqlite3(db), '%.18s-?',
+                                    [PTCollSeq(pOp^.p4.pColl)^.zName]);
+        end;
+      end;
+    P4_KEYINFO, P4_TABLE, P4_TABLEREF, P4_INDEX:
+      Result := nil;  { handled by gDisplayP4 hook above when wired }
+  else
+    if pOp^.p4.z <> nil then
+      Result := sqlite3MPrintf(PTsqlite3(db), '%s', [pOp^.p4.z])
+    else
+      Result := nil;
+  end;
 end;
 
 procedure sqlite3VdbeUsesBtree(p: PVdbe; i: i32);

@@ -587,9 +587,21 @@ Important: At the end of this document, please find:
   [ ] **6.21** port vdbe.pas stubs in full from C to pascal:
        `sqlite3VdbeMultiLoad` (blocked: only used by pragma.c and
        requires va_list — defer until 6.12 sqlite3Pragma lands),
-       `sqlite3VdbeDisplayComment`, `sqlite3VdbeDisplayP4`,
+       `sqlite3VdbeDisplayComment` (blocked: needs opcode-synopsis
+       tables appended after each name in sqlite3OpcodeName — Pas
+       OpcodeNames table is plain names only, defer),
        `sqlite3VdbeList`, `sqlite3_blob_open`,
        `sqlite3AnalysisLoad`.
+       [X] `sqlite3VdbeDisplayP4` — ported in full (vdbeaux.c:1905)
+            2026-04-28.  Inline arms in vdbe.pas handle FUNCDEF/
+            FUNCCTX/INT32/INT64/REAL/MEM/VTAB/INTARRAY/SUBPROGRAM/
+            SUBRTNSIG/COLLSEQ/default; KEYINFO/TABLE/TABLEREF/INDEX
+            arms dispatch through the new gDisplayP4 hook to a
+            displayP4Trampoline in codegen.pas (PTable2/PIndex2/
+            PKeyInfo2 not visible to vdbe.pas).  Δ-neutral on
+            TestExplainParity (1012/14) — no current call site
+            invokes DisplayP4 (sqlite3VdbeList still stubbed);
+            unblocks future VdbeList port + Phase 7.4c trace gate.
        [X] `sqlite3VdbeMemTranslate` — ported in full (utf.c:242..423).
        [X] `sqlite3VdbeEnter` / `sqlite3VdbeLeave` — gated under
             `!OMIT_SHARED_CACHE && THREADSAFE>0`; this port omits
