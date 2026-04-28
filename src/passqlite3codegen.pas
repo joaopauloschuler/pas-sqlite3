@@ -7960,9 +7960,26 @@ begin
   existsToJoin(pParse, p, pSubWhere);
 end;
 
+function findRightmost(p: PSelect): PSelect; forward;
+
 procedure sqlite3SelectPopWith(pWalker: PWalker; pSel: PSelect); cdecl;
+{ Port of sqlite3SelectPopWith — select.c:5857..5866.  xSelectCallback2 used
+  by sqlite3SelectExpand.  When unwinding back through the rightmost SELECT
+  of a compound, pop its WITH clause off the parser's pWith stack. }
+var
+  pPrs:  PParse;
+  pWth:  PWith;
 begin
-  { Phase 6.3 stub }
+  pPrs := pWalker^.pParse;
+  if (pPrs <> nil) and (pPrs^.pWith <> nil) and (pSel^.pPrior = nil) then
+  begin
+    pWth := findRightmost(pSel)^.pWith;
+    if pWth <> nil then
+    begin
+      Assert((pPrs^.pWith = pWth) or (pPrs^.nErr <> 0));
+      pPrs^.pWith := pWth^.pOuter;
+    end;
+  end;
 end;
 
 // ---------------------------------------------------------------------------
@@ -24149,7 +24166,9 @@ end;
 
 procedure sqlite3DeleteIndexSamples(db: PTsqlite3; pIdx: PIndex2);
 begin
-  { Phase 7 }
+  { analyze.c:1656 — body is gated under SQLITE_ENABLE_STAT4, off in default
+    upstream build.  The non-STAT4 arm is a no-op (UNUSED_PARAMETER pair),
+    which matches the existing implementation. }
 end;
 
 function sqlite3AnalysisLoad(db: PTsqlite3; iDb: i32): i32;
@@ -24613,7 +24632,10 @@ end;
 
 procedure sqlite3AutoLoadExtensions(db: PTsqlite3);
 begin
-  { Stub: loadext.c deferred to Phase 8.9 }
+  { loadext.c:908 — early-exits when wsdAutoext.nExt==0, which is the common
+    case for this build (no entries registered via sqlite3_auto_extension).
+    Productive arm requires the loadext.c machinery (Phase 8.9); the no-op
+    matches default-build behaviour exactly until then. }
 end;
 
 { sqlite3CreateFunc — register a user-defined SQL function. }
