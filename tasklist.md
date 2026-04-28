@@ -676,11 +676,11 @@ Important: At the end of this document, please find:
             remaining values with optional separator, allocates via
             sqlite3_malloc; concat_ws returns NULL when separator is NULL.
             Registered as aBuiltinFuncs[49]/[50] with nArg=-3/-4 per
-            func.c:3329..3330.  Verified via src/tests/DiagConcat.pas
-            (5/6 PASS — concat() zero-arg falls through because Pas
-            matchQuality does not yet enforce min-arity from negative
-            nArg encoding; trivial-shape gap, productive cases all match
-            C exactly).  TestExplainParity unchanged (1012/14).
+            func.c:3329..3330.  DiagConcat 6/6 PASS after `matchQuality`
+            was reworked (callback.c:299) to honour the -3/-4 min-arity
+            encoding and resolveExpr now emits "no such function" /
+            "wrong number of arguments to function" at parse time per
+            resolve.c:1131..1278.  TestExplainParity unchanged (1012/14).
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
        marked as "stub" that was missed by 6.16..6.27 (catch-all).

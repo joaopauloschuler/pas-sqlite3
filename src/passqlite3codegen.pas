@@ -7398,8 +7398,27 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         if pE^.x.pList <> nil then nArg_ := pE^.x.pList^.nExpr else nArg_ := 0;
         pDef_ := sqlite3FindFunction(pParse^.db, pE^.u.zToken, nArg_,
                                      pParse^.db^.enc, 0);
-        if (pDef_ <> nil) and
-           ((pDef_^.funcFlags and SQLITE_FUNC_UNLIKELY) <> 0) then
+        if pDef_ = nil then
+        begin
+          { Faithful arm of resolve.c:1131..1137 — second lookup with
+            nArg=-2 distinguishes "no such function" from "wrong number
+            of arguments to function".  matchQuality treats nArg=-2 as
+            an arity-agnostic perfect match for any registered FuncDef
+            with xSFunc set. }
+          pDef_ := sqlite3FindFunction(pParse^.db, pE^.u.zToken, -2,
+                                       pParse^.db^.enc, 0);
+          if pParse^.db^.init.busy = 0 then
+          begin
+            if pDef_ = nil then
+              sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+                'no such function: %s', [pE^.u.zToken]))
+            else
+              sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+                'wrong number of arguments to function %s()',
+                [pE^.u.zToken]));
+          end;
+        end
+        else if (pDef_^.funcFlags and SQLITE_FUNC_UNLIKELY) <> 0 then
           ExprSetProperty(pE, EP_Unlikely);
       end;
     end;
@@ -24356,18 +24375,28 @@ function matchQuality(p: PTFuncDef; nArg: i32; enc: u8): i32;
 var
   match: i32;
 begin
-  if (nArg >= 0) and (p^.nArg <> nArg) and (p^.nArg >= 0) then begin
-    Result := 0; Exit;
+  { Faithful port of callback.c:matchQuality.
+    p->nArg encoding (built-ins only):
+       -1   any number of arguments
+       -3   1 or more arguments required
+       -4   2 or more arguments required
+    nArg ==  -1 means "any arity"; nArg == -2 means "any arity, prefer
+    a function with xSFunc set (used by sqlite3_overload_function)". }
+  if p^.nArg <> nArg then begin
+    if nArg = -2 then begin
+      if p^.xSFunc = nil then Result := 0 else Result := 6 { FUNC_PERFECT_MATCH };
+      Exit;
+    end;
+    if p^.nArg >= 0 then begin Result := 0; Exit; end;
+    if (p^.nArg < -2) and (nArg < (-2 - p^.nArg)) then begin
+      Result := 0; Exit;
+    end;
   end;
-  match := 1;
-  if p^.nArg = nArg then Inc(match, 4);
-  if (p^.funcFlags and SQLITE_FUNC_ENCMASK) <> 0 then begin
-    if u8(p^.funcFlags and SQLITE_FUNC_ENCMASK) = enc then
-      Inc(match, 2)
-    else if (p^.funcFlags and SQLITE_FUNC_ENCMASK) = SQLITE_UTF16 then
-      Inc(match);
-  end else
-    Inc(match, 2);  { enc-agnostic functions match any encoding }
+  if p^.nArg = nArg then match := 4 else match := 1;
+  if enc = u8(p^.funcFlags and SQLITE_FUNC_ENCMASK) then
+    Inc(match, 2)
+  else if (enc and u8(p^.funcFlags) and 2) <> 0 then
+    Inc(match);
   Result := match;
 end;
 
