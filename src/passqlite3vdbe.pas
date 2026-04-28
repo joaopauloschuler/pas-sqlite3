@@ -2060,18 +2060,34 @@ end;
 function sqlite3VdbeRecordCompareWithSkip(nKey1: i32; pKey1: Pointer;
                                           pPKey2: Pointer; bSkip: i32): i32;
 begin
-  Result := 0;
+  { Phase 6.10 step 9 d-INNER fix: previously a stub returning 0, which
+    caused INNER JOIN aggregate count() to wrongly return 0 because
+    OP_IdxGT computed res = 0 + 1 = 1 → jumped past OP_AggStep.
+    The full key-compare engine is implemented in btree.pas as
+    sqlite3VdbeRecordCompare; bSkip=0 is the only value passed by the
+    callsites in vdbe.pas (OP_IdxGT/IdxGE/IdxLT/IdxLE and OP_SeekScan),
+    so we delegate.  Real bSkip support (skip first N pre-matched
+    fields) is a fast-path optimisation; defer until profiling shows
+    it matters. }
+  if bSkip = 0 then
+    Result := passqlite3btree.sqlite3VdbeRecordCompare(nKey1, pKey1,
+                passqlite3btree.PUnpackedRecord(pPKey2))
+  else
+    Result := passqlite3btree.sqlite3VdbeRecordCompare(nKey1, pKey1,
+                passqlite3btree.PUnpackedRecord(pPKey2));
 end;
 
 function sqlite3VdbeRecordCompare(nKey1: i32; pKey1: Pointer;
                                   pPKey2: Pointer): i32;
 begin
-  Result := 0;
+  Result := passqlite3btree.sqlite3VdbeRecordCompare(nKey1, pKey1,
+              passqlite3btree.PUnpackedRecord(pPKey2));
 end;
 
 function sqlite3VdbeFindCompare(pKey: Pointer): Pointer;
 begin
-  Result := nil;
+  Result := passqlite3btree.sqlite3VdbeFindCompare(
+              passqlite3btree.PUnpackedRecord(pKey));
 end;
 
 { ============================================================================

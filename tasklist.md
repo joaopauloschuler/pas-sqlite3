@@ -37,9 +37,13 @@ Important: At the end of this document, please find:
        [ ] `sqlite3VdbeCloseStatement` (vdbe.pas) — currently returns
             `SQLITE_OK`; missing the `vdbeCloseStatement(p, eOp)` arm
             taken when `p^.db^.nStatement and p^.iStatement`.
-       [ ] `sqlite3VdbeRecordCompareWithSkip` — returns `0`; full
-            key-compare engine (~150 lines).  Returning 0 means
-            "keys equal" always.
+       [X] `sqlite3VdbeRecordCompareWithSkip` — closed 2026-04-28.
+            vdbe.pas wrapper now delegates to the full
+            `sqlite3VdbeRecordCompare` body in btree.pas (bSkip=0 is
+            the only value passed by current callsites; bSkip>0
+            optimisation deferred).  Same fix lifted the
+            `sqlite3VdbeRecordCompare` and `sqlite3VdbeFindCompare`
+            local stubs in vdbe.pas onto the btree.pas bodies.
        [ ] `sqlite3VdbeScanStatus` / `sqlite3VdbeScanStatusRange` /
             `sqlite3VdbeScanStatusCounters` — empty bodies; populate
             `p^.aScan[]` when `IS_STMT_SCANSTATUS(db)`.
@@ -222,35 +226,17 @@ Important: At the end of this document, please find:
         agg gate at codegen.pas:18979 accepts nSrc=2 and the
         WhereBegin LEFT JOIN nullification arm yields the correct
         row count.
-      [ ] **d-INNER) `INNER JOIN` aggregate returns count=0 vs C=1.**
-        `SELECT count(*) FROM t INNER JOIN u ON t.a=u.b` (t=u={1})
-        now prepares + steps cleanly (rc=100) but returns 0 instead
-        of C's 1 — confirmed via `bin/DiagInnerJoin`.  Two
-        upstream-divergence bugs fixed 2026-04-28: (1) `btreeMoveto`
-        index-cursor arm (btree.pas:3362) was a stub returning
-        SQLITE_INTERNAL; now delegates to a new
-        `btreeMovetoIndexImpl` hook installed by vdbe.pas's
-        initialization — ports btree.c:858..889 (alloc unpacked
-        record → unpack → IndexMoveto → free).  Hook avoids a
-        uses-cycle (vdbe.pas already uses btree.pas).  (2)
-        `sqlite3VdbeRecordUnpack` (vdbe.pas:2026) called
-        `sqlite3GetVarint32` without honouring the
-        `getVarint32(A,B)` macro's fast-path contract (the function
-        body assumes `(p[0] & 0x80) != 0`; high-bit-clear means
-        single-byte varint and the caller must inline that).  A
-        3-byte index record `03 09 09` was being decoded as
-        szHdr=393 → nField=0 → SQLITE_CORRUPT.  Remaining gap:
-        with the runtime now reaching ResultRow, count=0 means the
-        auto-index SeekGE doesn't find the matching row — likely
-        `sqlite3BtreeIndexMoveto` index compare or auto-index
-        population (rows not committed before SeekGE).  Bytecode
-        parity unchanged: still missing one OP_Explain ("BLOOM
-        FILTER ON u") between OP_OpenAutoindex and OP_Blob.
-        Note 2026-04-28: getVarint32 fast-path inline guard now
-        applied at all callsites in vdbe.pas (sqlite3VdbeIdxRowid +
-        sqlite3Stat4Column).  TestExplainParity gained 3 cases
-        (1013→1016 PASS, 13→10 diverge) — three previously-Δ
-        rows were silent miscompares blocked behind that bug.
+      [X] **d-INNER) `INNER JOIN` aggregate returns count=0 vs C=1**
+        — closed 2026-04-28.  Root cause: vdbe.pas had local stubs for
+        `sqlite3VdbeRecordCompareWithSkip` / `sqlite3VdbeRecordCompare`
+        / `sqlite3VdbeFindCompare` that always returned 0/nil, even
+        though btree.pas already had the real bodies.  OP_IdxGT then
+        computed `Inc(res) → 1 → jump_to_p2`, skipping OP_AggStep, so
+        every join row was dropped.  Fixed by delegating the vdbe.pas
+        wrappers to btree.pas's implementations.  DiagInnerJoin val=1,
+        DiagFeatureProbe `INNER JOIN` PASS.  Bytecode parity gap
+        (missing "BLOOM FILTER ON u" OP_Explain) unchanged and
+        cosmetic only.
       [ ] **e) UNION / compound SELECT.**
         `SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)`
         returns no row.  Compound-select codegen / sub-FROM
