@@ -83,8 +83,17 @@ Important: At the end of this document, please find:
           only 3 ops, no sorter open / KeyInfo / sort-finalise loop).
         [ ] `SELECT a FROM t GROUP BY a` — Δ=42 (aggregate-group
           path, not yet ported).
-        [ ] `SELECT COUNT(*)` — Δ=−1; `SELECT SUM/MIN/MAX(a)` —
-          Δ=3..4 (aggregate-no-GROUP path, partial codegen).
+        [ ] `SELECT COUNT(*)` — Δ=6; `SELECT SUM/MIN/MAX(a)` —
+          Δ=12..13 (aggregate-no-GROUP path: not ported).
+          Detection landed: `selectMarkAggregate` walks pEList for
+          TK_FUNCTION whose FuncDef has xFinalize<>nil and sets
+          SF_Aggregate so `sqlite3Select` short-circuits cleanly
+          (Init/Halt/Goto skeleton, zero rows).  Without it the
+          scalar Function arm crashed at runtime on aggregate
+          FuncDefs.  To close: port resolve.c:resolveExprStep
+          aggregate marking (so `selectMarkAggregate` becomes
+          redundant) and the no-GROUP-BY codegen arms (Count for
+          COUNT(*), AggStep+AggFinal for SUM/MIN/MAX).
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
           materialise / co-routine path not ported).
         [ ] `UPDATE t SET a=5 WHERE rowid=1` — Δ=14 (`sqlite3Update`

@@ -17205,6 +17205,58 @@ end;
   20-row corpus flips green.  For each new shape the only change
   here is to remove a guard and verify the existing inner-loop body
   still produces byte-identical bytecode against the C oracle. }
+{ exprNodeHasAggFunc — Walker callback that sets w.eCode := 1 the first
+  time it sees a TK_FUNCTION whose resolved FuncDef is an aggregate
+  (xFinalize<>nil), then aborts.  Used by selectMarkAggregate below to
+  set SF_Aggregate on SELECTs that contain aggregate calls in their
+  result list — the C resolver does this in resolve.c:resolveExprStep,
+  not yet ported.  Without this flag the WHERE-loop branch of
+  sqlite3Select would code the aggregate FuncDef as a scalar
+  OP_Function, which crashes at runtime (xSFunc points to a step
+  routine that requires an aggregate context). }
+function exprNodeHasAggFunc(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pDef: PTFuncDef;
+  db:   PTsqlite3;
+  n:    i32;
+begin
+  if (pExpr^.op = TK_FUNCTION) and (pExpr^.u.zToken <> nil) then
+  begin
+    if ExprUseXList(pExpr) and (pExpr^.x.pList <> nil) then
+      n := pExpr^.x.pList^.nExpr
+    else
+      n := 0;
+    db := pWalker^.pParse^.db;
+    pDef := sqlite3FindFunction(db, pExpr^.u.zToken, n, db^.enc, 0);
+    if (pDef = nil) and (n <> 0) then
+      pDef := sqlite3FindFunction(db, pExpr^.u.zToken, -1, db^.enc, 0);
+    if (pDef <> nil) and Assigned(pDef^.xFinalize) then
+    begin
+      pWalker^.eCode := 1;
+      Result := WRC_Abort;
+      Exit;
+    end;
+  end;
+  Result := WRC_Continue;
+end;
+
+procedure selectMarkAggregate(pParse: PParse; p: PSelect);
+var
+  w: TWalker;
+begin
+  if p = nil then Exit;
+  if (p^.selFlags and SF_Aggregate) <> 0 then Exit;
+  if p^.pEList = nil then Exit;
+  FillChar(w, SizeOf(w), 0);
+  w.eCode           := 0;
+  w.pParse          := pParse;
+  w.xExprCallback   := @exprNodeHasAggFunc;
+  w.xSelectCallback := @sqlite3SelectWalkFail;
+  sqlite3WalkExprList(@w, p^.pEList);
+  if w.eCode = 1 then
+    p^.selFlags := p^.selFlags or SF_Aggregate;
+end;
+
 function sqlite3Select(pParse: PParse; p: PSelect;
   pDest: PSelectDest): i32;
 var
@@ -17226,6 +17278,7 @@ begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
   if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+  selectMarkAggregate(pParse, p);
 
   { EXISTS-to-JOIN optimisation — select.c:7897..7902 (sub-progress 51).
     If the resolver flagged the SELECT as containing an EXISTS subquery,
