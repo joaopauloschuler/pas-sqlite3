@@ -97,6 +97,15 @@ function sqlite3MAppendf(db: Psqlite3db; zOld: PAnsiChar; fmt: PAnsiChar;
 function sqlite3FormatStr(fmt: PAnsiChar;
   const args: array of const): AnsiString;
 
+{ Render a finite IEEE-754 double into zBuf using SQLite's own %!.*g
+  algorithm (printf.c:528..738 + util.c:1380 sqlite3FpDecode).  Matches
+  the C reference for vdbeMemRenderNum (vdbemem.c:106).  Returns the
+  number of bytes written (excluding the NUL terminator); zBuf[result]
+  is set to NUL.  sz must be ≥ 26 to accommodate the worst-case
+  "1.2345678901234567e-308" representation. }
+function sqlite3RenderNumF(r: Double; iRound: i32;
+  isAltform2: Boolean; zBuf: PAnsiChar; sz: i32): i32;
+
 implementation
 
 uses
@@ -632,9 +641,75 @@ begin
   pP := -p;
 end;
 
+{ Build IEEE-754 +Inf bit-pattern as a Double (no FPU exception). }
+function pasInfinity: Double; inline;
+const inf_bits: u64 = u64($7ff0000000000000);
+var d: Double;
+begin
+  Move(inf_bits, d, 8);
+  Result := d;
+end;
+
+{ Return an IEEE754 floating point value that approximates d*pow(10,p).
+  Port of util.c:775 sqlite3Fp10Convert2.  Used by the iRound==17
+  round-trip optimisation in fpDecode. }
+function fp10Convert2(d: u64; p: i32): Double;
+var
+  b, lp, e, adj, s: i32;
+  pwr10l, mid1, mid2: u32;
+  pwr10h, x, hi, lo, sticky, u, m: u64;
+  d1: u64;
+  raw: array[0..7] of Byte;
+begin
+  if p < POWERSOF10_FIRST then begin Result := 0.0; Exit; end;
+  if p > POWERSOF10_LAST  then begin Result := pasInfinity; Exit; end;
+  b := 64 - countLeadingZeros(d);
+  lp := pwr10to2(p);
+  e := 53 - b - lp;
+  if e > 1074 then begin
+    if e >= 1130 then begin Result := 0.0; Exit; end;
+    e := 1074;
+  end;
+  s := -(e - (64 - b) + lp + 3);
+  pwr10h := powerOfTen(p, pwr10l);
+  if pwr10l <> 0 then begin
+    Inc(pwr10h);
+    pwr10l := not pwr10l;
+  end;
+  x := d shl (64 - b);
+  hi := multiply128(x, pwr10h, lo);
+  mid1 := u32(lo shr 32);
+  sticky := 1;
+  if (s >= 0) and (s < 64) and ((hi and ((u64(1) shl s) - 1)) = 0) then
+  begin
+    mid2 := u32(multiply128(x, u64(pwr10l) shl 32, d1) shr 32);
+    if mid1 > mid2 + 1 then sticky := 1
+    else                    sticky := 0;
+    if mid1 < mid2 then Dec(hi);
+  end;
+  if (s >= 0) and (s < 64) then
+    u := (hi shr s) or sticky
+  else if s = 64 then
+    u := sticky
+  else
+    u := sticky;
+  if u >= (u64(1) shl 55) - 2 then adj := 1 else adj := 0;
+  if adj <> 0 then begin
+    u := (u shr adj) or (u and 1);
+    Dec(e, adj);
+  end;
+  m := (u + 1 + ((u shr 2) and 1)) shr 2;
+  if e <= -972 then begin Result := pasInfinity; Exit; end;
+  if (m and (u64(1) shl 52)) <> 0 then
+    m := (m and (not (u64(1) shl 52))) or (u64(1075 - e) shl 52);
+  Move(m, raw, 8);
+  Move(raw, Result, 8);
+end;
+
 { Convert IEEE754 double r into the FpDecode form.  Mirror of
-  util.c:1380 sqlite3FpDecode (modulo iRound==17 round-trip
-  optimization noted above). }
+  util.c:1380 sqlite3FpDecode, including the iRound==17 round-trip
+  optimisation that lets %!.17g emit the shortest decimal that
+  still round-trips to the same double. }
 procedure fpDecode(out p: TFpDecode; r: Double; iRound, mxRound: i32);
 var
   i, n, nn, j: i32;
@@ -712,8 +787,32 @@ begin
   z := @p.zBuf[i];
   if (iRound > 0) and ((iRound < n) or (n > mxRound)) then begin
     if iRound > mxRound then iRound := mxRound;
-    { iRound==17 round-trip optimization deliberately skipped — see
-      header comment.  Falls through to the generic rounding rule. }
+    if iRound = 17 then begin
+      if (z[15] = '9') and (z[14] = '9') then begin
+        nn := 14;
+        while (nn > 0) and (z[nn - 1] = '9') do Dec(nn);
+        if nn = 0 then begin
+          v := 1;
+        end else begin
+          v := u64(Ord(z[0]) - Ord('0'));
+          for j := 1 to nn - 1 do
+            v := (v * 10) + u64(Ord(z[j]) - Ord('0'));
+          Inc(v);
+        end;
+        if r = fp10Convert2(v, exp + n - nn) then iRound := nn + 1;
+      end else if (p.iDP >= n)
+              or ((z[15] = '0') and (z[14] = '0') and (z[13] = '0')) then
+      begin
+        nn := 13;
+        while (nn > 0) and (z[nn - 1] = '0') do Dec(nn);
+        if nn > 0 then begin
+          v := u64(Ord(z[0]) - Ord('0'));
+          for j := 1 to nn - 1 do
+            v := (v * 10) + u64(Ord(z[j]) - Ord('0'));
+          if r = fp10Convert2(v, exp + n - nn) then iRound := nn + 1;
+        end;
+      end;
+    end;
     n := iRound;
     if z[iRound] >= '5' then begin
       j := iRound - 1;
@@ -847,6 +946,40 @@ begin
   if not isFloat then ResolveExpRender;
 
   body := buf;
+end;
+
+{ Public: render r as %!.*g (or %.*g if isAltform2 = False) into zBuf.
+  Mirrors vdbeMemRenderNum's call to sqlite3_str_appendf("%!.*g", ...).
+  Returns the byte length written; zBuf[len] is set to NUL. }
+function sqlite3RenderNumF(r: Double; iRound: i32;
+  isAltform2: Boolean; zBuf: PAnsiChar; sz: i32): i32;
+var
+  s:        TFpDecode;
+  body:     AnsiString;
+  prefix:   AnsiString;
+  outStr:   AnsiString;
+  usePref:  Boolean;
+  mxRound:  i32;
+  i, n:     i32;
+begin
+  if isAltform2 then mxRound := 20 else mxRound := 16;
+  fpDecode(s, r, iRound, mxRound);
+  prefix := '';
+  if s.isSpecial = 2 then begin
+    if s.sign = '-' then outStr := '-NaN' else outStr := 'NaN';
+  end else if s.isSpecial = 1 then begin
+    if s.sign = '-' then outStr := '-Inf' else outStr := 'Inf';
+  end else begin
+    if s.sign = '-' then prefix := '-';
+    renderFloat(s, False, True, 'e', iRound, False, isAltform2, body, usePref);
+    if usePref then outStr := prefix + body
+    else            outStr := body;
+  end;
+  n := Length(outStr);
+  if n > sz - 1 then n := sz - 1;
+  for i := 1 to n do zBuf[i - 1] := outStr[i];
+  zBuf[n] := #0;
+  Result := n;
 end;
 
 { ============================================================

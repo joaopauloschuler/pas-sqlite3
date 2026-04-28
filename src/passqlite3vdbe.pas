@@ -36,6 +36,7 @@ uses
   passqlite3types,
   passqlite3os,
   passqlite3util,
+  passqlite3printf,
   passqlite3pcache,
   passqlite3pager,
   passqlite3wal,
@@ -8577,9 +8578,9 @@ begin
   end else begin
     nFp := vdbeDbNFpDigit(p^.db);
     if nFp <= 0 then nFp := 17;
-    { use libc snprintf with %g formatting; SQLite uses its own %!.*g }
-    libc_snprintf(zBuf, sz, '%.*g', nFp, p^.u.r);
-    p^.n := sqlite3Strlen30(zBuf);
+    { Mirror C: sqlite3_str_appendf(&acc, "%!.*g", nFp, r) — altform2,
+      via sqlite3RenderNumF (printf.c:528..738 + util.c:1380). }
+    p^.n := sqlite3RenderNumF(p^.u.r, nFp, True, zBuf, sz);
   end;
   { suppress compiler hint — sz unused in int branch }
   if sz < 0 then FillChar(tmpBuf, 0, 1);

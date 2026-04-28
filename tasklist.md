@@ -236,20 +236,18 @@ Important: At the end of this document, please find:
         terminator, so `p - zOut` is the correct payload length;
         the `- 1` was an off-by-one truncating the closing `'`.
         Verified: `SELECT quote('a')` now returns `'a'` (was `'a`).
-      [ ] **b) `round(x, n)` text formatting**.
-        `SELECT round(3.14159, 2)` yields `3.1400000000000001` on
-        Pas vs `3.14` on C.  The stored double is identical
-        (closest IEEE-754 to 3.14); the divergence is in
-        `vdbeMemRenderNum` (vdbe.pas:8581) calling libc
-        `snprintf("%.*g", nFp, ...)` instead of SQLite's own
-        `%!.*g` altform2 ("shortest round-trip-correct decimal").
-        Architectural note 5 already calls this out; closing
-        requires routing `vdbeMemRenderNum` through the Pas
-        printf module's `sqlite3FpDecode` (printf.pas:432) with
-        the deferred `iRound==17` round-trip arm finished.
-        Bytecode-Δ-neutral but observable for any
-        `column_text` on a REAL value whose %g output is shorter
-        than 17 sig digits.
+      [X] **b) `round(x, n)` text formatting** — fixed
+        2026-04-28.  Ported `sqlite3Fp10Convert2` (util.c:775),
+        wired the `iRound==17` round-trip arm into `fpDecode`
+        (util.c:1465..1498), and added a public
+        `sqlite3RenderNumF` helper in passqlite3printf.pas that
+        runs the full `%!.*g` (altform2) pipeline.
+        `vdbeMemRenderNum` (vdbe.pas:8581) now calls it instead
+        of libc `snprintf("%.*g", ...)`.  Verified via
+        src/tests/DiagFloatRender.pas (11/11 PASS); no
+        TestExplainParity regression (1012 pass / 14 diverge —
+        same).  Closes architectural note 5 for the REAL→TEXT
+        coercion path.
 
   [X] **6.10 step 8** Auto-named result columns carry a trailing space
       on Pas — fixed.  Root cause was `sqlite3DbSpanDup`
