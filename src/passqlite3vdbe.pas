@@ -647,6 +647,7 @@ type
   PAuxData       = ^TAuxData;
   PPAuxData      = ^PAuxData;
   PSubProgram    = ^TSubProgram;
+  PPSubProgram   = ^PSubProgram;
 
   { Phase 5.6 — vdbeblob.c Incrblob handle }
   PIncrblob      = ^TIncrblob;
@@ -1323,8 +1324,8 @@ procedure sqlite3VdbeLeave(p: PVdbe);
 procedure sqlite3VdbePrintOp(pOut: Pointer; pc: i32; pOp: PVdbeOp);
 function  sqlite3VdbeFrameIsValid(pFrame: PVdbeFrame): i32;
 procedure sqlite3VdbeFrameMemDel(pArg: Pointer); cdecl;
-function  sqlite3VdbeNextOpcode(p: PVdbe; pSub: PSubProgram; eType: i32;
-                                piSub: Pi32; piAddr: Pi32): PVdbeOp;
+function  sqlite3VdbeNextOpcode(p: PVdbe; pSub: PMem; eMode: i32;
+                                piPc: Pi32; piAddr: Pi32; paOp: PPVdbeOp): i32;
 procedure sqlite3VdbeFrameDelete(p: PVdbeFrame);
 function  sqlite3VdbeList(v: PVdbe): i32;
 procedure sqlite3VdbePrintSql(p: PVdbe);
@@ -2820,11 +2821,125 @@ begin
   pFrame^.v^.pDelFrame := pFrame;
 end;
 
-function sqlite3VdbeNextOpcode(p: PVdbe; pSub: PSubProgram; eType: i32;
-                               piSub: Pi32; piAddr: Pi32): PVdbeOp;
+{ sqlite3VdbeNextOpcode — port of vdbeaux.c:2262.
+  Locate the next opcode to be displayed in EXPLAIN or EXPLAIN QUERY PLAN
+  output.  Returns SQLITE_ROW on success, SQLITE_DONE when no more opcodes
+  remain.  pSub stores subprogram-nesting state across calls (initially a
+  zero-flagged Mem; promoted to MEM_Blob holding a SubProgram*[] array
+  the first time an OP_Program with a P4_SUBPROGRAM argument is seen).
+  eMode: 0=normal, 1=EQP (stop at OP_Explain), 2=TablesUsed (gated on
+  SQLITE_ENABLE_BYTECODE_VTAB, off in default upstream build). }
+function sqlite3VdbeNextOpcode(p: PVdbe; pSub: PMem; eMode: i32;
+                               piPc: Pi32; piAddr: Pi32; paOp: PPVdbeOp): i32;
+var
+  nRow:  i32;
+  nSub:  i32;
+  apSub: PPSubProgram;
+  i:     i32;
+  j:     i32;
+  rc:    i32;
+  aOp:   PVdbeOp;
+  iPc:   i32;
+  pOp:   PVdbeOp;
+  nByte: i32;
 begin
-  { Stub — Phase 5.8 vdbetrace.c }
-  Result := nil;
+  nSub  := 0;
+  apSub := nil;
+  rc    := SQLITE_OK;
+  aOp   := nil;
+  i     := 0;
+
+  { When the number of output rows reaches nRow, that means the listing
+    has finished and sqlite3_step() should return SQLITE_DONE.  nRow is
+    the sum of the number of rows in the main program plus the number of
+    rows in all trigger subprograms encountered so far. }
+  nRow := p^.nOp;
+  if pSub <> nil then
+  begin
+    if (pSub^.flags and MEM_Blob) <> 0 then
+    begin
+      nSub  := pSub^.n div SizeOf(PSubProgram);
+      apSub := PPSubProgram(pSub^.z);
+    end;
+    j := 0;
+    while j < nSub do
+    begin
+      nRow := nRow + apSub[j]^.nOp;
+      Inc(j);
+    end;
+  end;
+  iPc := piPc^;
+  while True do
+  begin
+    i := iPc;
+    Inc(iPc);
+    if i >= nRow then
+    begin
+      p^.rc := SQLITE_OK;
+      rc := SQLITE_DONE;
+      Break;
+    end;
+    if i < p^.nOp then
+    begin
+      aOp := p^.aOp;
+    end
+    else
+    begin
+      i := i - p^.nOp;
+      Assert(apSub <> nil);
+      Assert(nSub > 0);
+      j := 0;
+      while i >= apSub[j]^.nOp do
+      begin
+        i := i - apSub[j]^.nOp;
+        Assert((i < apSub[j]^.nOp) or (j + 1 < nSub));
+        Inc(j);
+      end;
+      aOp := apSub[j]^.aOp;
+    end;
+
+    { When an OP_Program opcode is encountered (the only opcode that has
+      a P4_SUBPROGRAM argument), expand the size of the array of
+      subprograms kept in pSub->z to hold the new program — assuming the
+      subprogram has not already been seen. }
+    if (pSub <> nil) and (aOp[i].p4type = P4_SUBPROGRAM) then
+    begin
+      nByte := (nSub + 1) * i32(SizeOf(PSubProgram));
+      j := 0;
+      while j < nSub do
+      begin
+        if apSub[j] = aOp[i].p4.pProgram then Break;
+        Inc(j);
+      end;
+      if j = nSub then
+      begin
+        if nSub <> 0 then p^.rc := sqlite3VdbeMemGrow(pSub, nByte, 1)
+        else                p^.rc := sqlite3VdbeMemGrow(pSub, nByte, 0);
+        if p^.rc <> SQLITE_OK then
+        begin
+          rc := SQLITE_ERROR;
+          Break;
+        end;
+        apSub := PPSubProgram(pSub^.z);
+        apSub[nSub] := aOp[i].p4.pProgram;
+        Inc(nSub);
+        { MemSetTypeFlag(pSub, MEM_Blob) — clear all type bits then set MEM_Blob. }
+        pSub^.flags := (pSub^.flags and not u16(MEM_TypeMask or MEM_Zero)) or MEM_Blob;
+        pSub^.n     := nSub * i32(SizeOf(PSubProgram));
+        nRow        := nRow + apSub[nSub - 1]^.nOp;
+      end;
+    end;
+    if eMode = 0 then Break;
+    { SQLITE_ENABLE_BYTECODE_VTAB (eMode=2) — off in default upstream build. }
+    Assert(eMode = 1);
+    pOp := @aOp[i];
+    if pOp^.opcode = OP_Explain then Break;
+    if (pOp^.opcode = OP_Init) and (iPc > 1) then Break;
+  end;
+  piPc^   := iPc;
+  piAddr^ := i;
+  paOp^   := aOp;
+  Result := rc;
 end;
 
 procedure sqlite3VdbeFrameDelete(p: PVdbeFrame);

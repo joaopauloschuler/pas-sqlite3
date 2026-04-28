@@ -211,7 +211,7 @@ Important: At the end of this document, please find:
        `sqlite3VdbeMultiLoad` (blocked: only used by pragma.c and
        requires va_list — defer until 6.12 sqlite3Pragma lands),
        `sqlite3VdbeDisplayComment`, `sqlite3VdbeDisplayP4`,
-       `sqlite3VdbeEnter`, `sqlite3VdbeNextOpcode`,
+       `sqlite3VdbeEnter`,
        `sqlite3VdbeCloseStatement`, `sqlite3VdbeList`,
        `sqlite3_blob_open`, `sqlite3VdbeLogAbort`,
        `sqlite3ResetOneSchema`,
@@ -246,6 +246,11 @@ Important: At the end of this document, please find:
             unit-init, mirroring the existing gUnlinkAndDelete* pattern.
        [X] `sqlite3VdbeFrameMemDel` — ported in full (vdbeaux.c:2247);
             adds the frame to v->pDelFrame for deferred free.
+       [X] `sqlite3VdbeNextOpcode` — ported in full (vdbeaux.c:2262).
+            Pas signature corrected to mirror C (Mem* pSub instead of
+            SubProgram*; piPc/piAddr/paOp out-params; rc return).
+            Δ-neutral until `sqlite3VdbeList` is also ported (existing
+            stubbed VdbeList does not call NextOpcode).
        [X] `sqlite3VdbeFrameRestore` — ported in full (vdbeaux.c:2812).
             Real body lived in sqlite3VdbeFrameRestoreFull but the
             externally-named entry point was a 0-returning stub; now
