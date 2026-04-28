@@ -1,0 +1,644 @@
+{
+  SPDX-License-Identifier: blessing
+
+  The author disclaims copyright to this source code.  In place of
+  a legal notice, here is a blessing:
+
+     May you do good and not evil.
+     May you find forgiveness for yourself and forgive others.
+     May you share freely, never taking more than you give.
+
+  ------------------------------------------------------------------------
+
+  This work is dedicated to all human kind, and also to all non-human kinds.
+
+  This is a faithful port of SQLite 3.53 (https://sqlite.org/) from C to
+  Free Pascal, authored by Dr. Joao Paulo Schwarz Schuler and contributors
+  (see commit history). The original SQLite C source code is in the public
+  domain, authored by D. Richard Hipp and contributors. This Pascal port
+  adopts the same public-domain posture.
+}
+{$I ../passqlite3.inc}
+program TestWhereExpr;
+{
+  Phase 6.9-bis (step 11g.2.c sub-progress) gate test for the whereexpr.c
+  helpers landed alongside this test:
+
+    * whereClauseInsert      — heap-grow the term array beyond aStatic
+    * markTermAsChild        — parent/child link + truthProb propagation
+    * transferJoinMarkings   — EP_OuterON / EP_InnerON propagation
+    * exprCommute            — TK_GT  → TK_LT swap (and op rewrite)
+    * sqlite3WhereSplit      — uses whereClauseInsert; faithful split
+    * exprAnalyze right-side commute  — "5 = rowid" → "rowid = 5" path
+
+  The harness builds a synthetic Parse/WhereInfo/WhereClause stack so
+  that helpers exercise code paths in isolation, without going through
+  the full sqlite3WhereBegin pipeline (which is gated by 11g.2.b).
+}
+
+uses
+  SysUtils,
+  passqlite3types,
+  passqlite3internal,
+  passqlite3os,
+  passqlite3util,
+  passqlite3pcache,
+  passqlite3pager,
+  passqlite3wal,
+  passqlite3btree,
+  passqlite3vdbe,
+  passqlite3codegen,
+  passqlite3main;
+
+var
+  gPass: i32 = 0;
+  gFail: i32 = 0;
+
+procedure Check(const name: string; cond: Boolean);
+begin
+  if cond then begin Inc(gPass); WriteLn('PASS  ', name); end
+  else       begin Inc(gFail); WriteLn('FAIL  ', name); end;
+end;
+
+{ Build a deeply-left-nested AND chain "rowid=1 AND rowid=2 AND ... AND rowid=N"
+  by repeated TK_AND construction.  Each leaf is a freshly-allocated TK_EQ. }
+function BuildAndChain(parse: PParse; nLeaves: i32): PExpr;
+var
+  i:  i32;
+  pCol, pInt, pEq, pAnd: PExpr;
+begin
+  Result := nil;
+  for i := 1 to nLeaves do
+  begin
+    pCol := sqlite3PExpr(parse, TK_COLUMN, nil, nil);
+    pCol^.iTable  := 0;
+    pCol^.iColumn := -1;
+    pInt := sqlite3ExprInt32(parse^.db, i);
+    pEq  := sqlite3PExpr(parse, TK_EQ, pCol, pInt);
+    if Result = nil then Result := pEq
+    else
+    begin
+      pAnd := sqlite3PExpr(parse, TK_AND, Result, pEq);
+      Result := pAnd;
+    end;
+  end;
+end;
+
+var
+  db:        PTsqlite3;
+  rc:        i32;
+  pTab:      PTable2;
+  zNameBuf:  array[0..3] of AnsiChar;
+  parse:     TParse;
+  pSrcBuf:   Pointer;
+  pSrc:      PSrcList;
+  pItem:     PSrcItem;
+  pWInfo:    PWhereInfo;
+  pWC:       PWhereClause;
+  expr:      PExpr;
+  i:         i32;
+  pCol, pInt, pEq, pNew: PExpr;
+  pBet, pLo, pHi, pNN, pColNN: PExpr;
+  pBList: PExprList;
+  iBetIdx, iNNIdx: i32;
+  pCol1, pInt1, pCol2, pInt2, pLt, pEq2: PExpr;
+  pTermA, pTermB: PWhereTerm;
+  pSubA, pSubB, pSubC: PWhereTerm;
+  iCombIdx, nTermBefore: i32;
+  pColA, pColB, pIntA, pIntB, pEqA, pEqB, pOr: PExpr;
+  iOrIdx: i32;
+  pOrInfo3: PWhereOrInfo;
+  pColC, pColD, pIntC, pIntD, pEqC, pEqD, pOr2: PExpr;
+  iOrIdx2: i32;
+  { T14: LIKE optimization. }
+  pLikeFn, pLikeCol, pLikePat: PExpr;
+  pLikeList: PExprList;
+  iLikeIdx: i32;
+  tokLike: TToken;
+  pLikePatRight, pLikeGeRhs, pLikeLtRhs: PExpr;
+  pSc: PExpr;
+  { T15: numeric prefix bails out. }
+  pLikeFn2, pLikeCol2, pLikePat2: PExpr;
+  pLikeList2: PExprList;
+  iLikeIdx2: i32;
+  nTermBeforeLike: i32;
+  { T16: TK_VARIABLE LIKE pattern (bound parameter). }
+  pLikeFn3, pLikeCol3, pLikeVar3: PExpr;
+  pLikeList3: PExprList;
+  iLikeIdx3: i32;
+  vBound: PVdbe;
+  pLikeVarRhs3: PExpr;
+  tokVar: TToken;
+
+begin
+  WriteLn('=== TestWhereExpr — Phase 6.9-bis 11g.2.c whereexpr helpers ===');
+  WriteLn;
+
+  { sqlite3_initialize populates the global builtin-function hash table —
+    required before isLikeOrGlob can resolve "like" via sqlite3FindFunction. }
+  rc := sqlite3_initialize;
+  if rc <> SQLITE_OK then begin
+    WriteLn('FATAL: sqlite3_initialize rc=', rc); Halt(2);
+  end;
+
+  db := nil;
+  rc := sqlite3_open(':memory:', @db);
+  if (rc <> SQLITE_OK) or (db = nil) then begin
+    WriteLn('FATAL: sqlite3_open rc=', rc); Halt(2);
+  end;
+
+  pTab := PTable2(sqlite3DbMallocZero(db, SizeOf(TTable)));
+  zNameBuf[0] := 't'; zNameBuf[1] := #0;
+  pTab^.zName    := @zNameBuf[0];
+  pTab^.pSchema  := db^.aDb[0].pSchema;
+  pTab^.tnum     := 2;
+  pTab^.nCol     := 1;
+  pTab^.nNVCol   := 1;
+  pTab^.tabFlags := 0;
+  pTab^.eTabType := TABTYP_NORM;
+  pTab^.pIndex   := nil;
+
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db := db;
+
+  pSrcBuf := sqlite3DbMallocZero(db, SZ_SRCLIST_HEADER + SizeOf(TSrcItem));
+  pSrc := PSrcList(pSrcBuf);
+  pSrc^.nSrc   := 1;
+  pSrc^.nAlloc := 1;
+  pItem := @SrcListItems(pSrc)[0];
+  pItem^.pSTab   := pTab;
+  pItem^.iCursor := 0;
+  pItem^.colUsed := Bitmask(1);
+  parse.nTab := 1;
+
+  { Hand-allocate a WhereInfo just rich enough to drive the helpers under
+    test.  whereInfoFree expects pMemToFree to be a heap-tracked list, so
+    we let it stay nil and call sqlite3DbFree on pWInfo manually below. }
+  pWInfo := PWhereInfo(sqlite3DbMallocZero(db, SizeOf(TWhereInfo)));
+  if pWInfo = nil then begin WriteLn('FATAL: pWInfo'); Halt(2); end;
+  pWInfo^.pParse  := @parse;
+  pWInfo^.pTabList := pSrc;
+
+  pWC := @pWInfo^.sWC;
+  sqlite3WhereClauseInit(pWC, pWInfo);
+
+  { ---- T1: sqlite3WhereSplit on a 12-leaf AND chain — must grow nSlot
+        beyond the static 8-entry pool. ---- }
+  expr := BuildAndChain(@parse, 12);
+  sqlite3WhereSplit(pWC, expr, TK_AND);
+  Check('T1a sqlite3WhereSplit produced 12 base terms', pWC^.nTerm = 12);
+  Check('T1b nBase = 12',                                pWC^.nBase = 12);
+  Check('T1c nSlot grew past static pool',                pWC^.nSlot >= 16);
+  Check('T1d pWC^.a moved off aStatic',                   pWC^.a <> @pWC^.aStatic[0]);
+  Check('T1e pWC^.op = TK_AND',                           pWC^.op = TK_AND);
+
+  { Every leaf should be the underlying TK_EQ (collate/likely peeled off);
+    the iParent default is -1 and pWC pointer is back-set to pWC. }
+  Check('T2a leaf 0 is TK_EQ',
+        pWC^.a[0].pExpr^.op = TK_EQ);
+  Check('T2b leaf 11 is TK_EQ',
+        pWC^.a[11].pExpr^.op = TK_EQ);
+  Check('T2c leaf truthProb default = 1',
+        pWC^.a[0].truthProb = 1);
+  Check('T2d leaf iParent default = -1',
+        pWC^.a[0].iParent = -1);
+  Check('T2e leaf pWC back-pointer set',
+        pWC^.a[0].pWC = pWC);
+
+  { ---- T3: markTermAsChild — link leaf 1 as child of leaf 0. ---- }
+  pWC^.a[0].truthProb := 42;
+  markTermAsChild(pWC, 1, 0);
+  Check('T3a child iParent set',
+        pWC^.a[1].iParent = 0);
+  Check('T3b child truthProb inherited',
+        pWC^.a[1].truthProb = 42);
+  Check('T3c parent nChild incremented',
+        pWC^.a[0].nChild = 1);
+
+  { ---- T4: transferJoinMarkings.  Build a "tagged" base expr and a fresh
+            derived expr; verify the EP_OuterON flag and iJoin propagate. ---- }
+  pCol := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol^.iTable := 0; pCol^.iColumn := -1;
+  pInt := sqlite3ExprInt32(db, 7);
+  pEq  := sqlite3PExpr(@parse, TK_EQ, pCol, pInt);
+  pCol := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol^.iTable := 0; pCol^.iColumn := -1;
+  pInt := sqlite3ExprInt32(db, 8);
+  pNew := sqlite3PExpr(@parse, TK_EQ, pCol, pInt);
+  pEq^.flags    := pEq^.flags or EP_OuterON;
+  pEq^.w.iJoin  := 9;
+  transferJoinMarkings(pNew, pEq);
+  Check('T4a derived gets EP_OuterON',
+        (pNew^.flags and EP_OuterON) <> 0);
+  Check('T4b derived gets iJoin=9',
+        pNew^.w.iJoin = 9);
+
+  { ---- T5: exprCommute on "5 > rowid" — op rewrites to TK_LT, sides swap. ---- }
+  pInt := sqlite3ExprInt32(db, 5);
+  pCol := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol^.iTable := 0; pCol^.iColumn := -1;
+  pEq := sqlite3PExpr(@parse, TK_GT_TK, pInt, pCol);
+  exprCommute(@parse, pEq);
+  Check('T5a op rewritten to TK_LT', pEq^.op = TK_LT);
+  Check('T5b LHS now points at column',
+        (pEq^.pLeft <> nil) and (pEq^.pLeft^.op = TK_COLUMN));
+  Check('T5c RHS now integer literal',
+        (pEq^.pRight <> nil) and (pEq^.pRight^.op = TK_INTEGER));
+
+  { ---- T6: exprAnalyze right-side commute — "5 = rowid" with leftCursor=-1
+            commutes the original term in place; eOperator gets WO_EQ. ---- }
+  i := pWC^.nTerm;     { tail index where the next leaf will be inserted }
+  pInt := sqlite3ExprInt32(db, 99);
+  pCol := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol^.iTable := 0; pCol^.iColumn := -1;
+  pEq := sqlite3PExpr(@parse, TK_EQ, pInt, pCol);
+  whereClauseInsert(pWC, pEq, 0);
+  { The mask set must know about cursor 0 before exprAnalyze fires. }
+  pWInfo^.sMaskSet.n := 0;
+  pWInfo^.sMaskSet.ix[0] := 0;
+  pWInfo^.sMaskSet.n := 1;
+  sqlite3WhereExprAnalyze(pSrc, pWC);
+  Check('T6a commuted term has leftCursor = 0',
+        pWC^.a[i].leftCursor = 0);
+  Check('T6b commuted term has u.leftColumn = -1 (rowid)',
+        pWC^.a[i].u.leftColumn = -1);
+  Check('T6c commuted term has WO_EQ',
+        (pWC^.a[i].eOperator and WO_EQ) <> 0);
+  Check('T6d original Expr LHS is now the column',
+        (pEq^.pLeft <> nil) and (pEq^.pLeft^.op = TK_COLUMN));
+
+  { ---- T7: BETWEEN virtual-term synthesis (whereexpr.c:1291..1312).
+            "rowid BETWEEN 3 AND 7" must produce two TERM_VIRTUAL|TERM_DYNAMIC
+            children (a>=3 and a<=7), each linked via iParent to the BETWEEN
+            term, with eOperator = WO_GE / WO_LE respectively. ---- }
+  iBetIdx := pWC^.nTerm;
+  pCol := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol^.iTable := 0; pCol^.iColumn := -1;
+  pLo := sqlite3ExprInt32(db, 3);
+  pHi := sqlite3ExprInt32(db, 7);
+  pBList := sqlite3ExprListAppend(@parse, nil, pLo);
+  pBList := sqlite3ExprListAppend(@parse, pBList, pHi);
+  pBet := sqlite3PExpr(@parse, TK_BETWEEN, pCol, nil);
+  pBet^.x.pList := pBList;
+  whereClauseInsert(pWC, pBet, 0);
+  exprAnalyze(pSrc, pWC, iBetIdx);
+  Check('T7a BETWEEN spawned 2 children',
+        pWC^.nTerm = iBetIdx + 3);
+  Check('T7b child 0 is TK_GE',
+        pWC^.a[iBetIdx + 1].pExpr^.op = TK_GE);
+  Check('T7c child 1 is TK_LE',
+        pWC^.a[iBetIdx + 2].pExpr^.op = TK_LE);
+  Check('T7d child 0 wtFlags has VIRTUAL|DYNAMIC',
+        (pWC^.a[iBetIdx + 1].wtFlags
+         and (TERM_VIRTUAL or TERM_DYNAMIC))
+        = (TERM_VIRTUAL or TERM_DYNAMIC));
+  Check('T7e child 0 iParent = BETWEEN idx',
+        pWC^.a[iBetIdx + 1].iParent = iBetIdx);
+  Check('T7f child 1 iParent = BETWEEN idx',
+        pWC^.a[iBetIdx + 2].iParent = iBetIdx);
+  Check('T7g BETWEEN nChild = 2',
+        pWC^.a[iBetIdx].nChild = 2);
+  Check('T7h child 0 has WO_GE on rowid cursor 0',
+        (pWC^.a[iBetIdx + 1].eOperator and WO_GE) <> 0);
+  Check('T7i child 1 has WO_LE on rowid cursor 0',
+        (pWC^.a[iBetIdx + 2].eOperator and WO_LE) <> 0);
+  Check('T7j child 0 leftCursor = 0',
+        pWC^.a[iBetIdx + 1].leftCursor = 0);
+  Check('T7k child 1 leftCursor = 0',
+        pWC^.a[iBetIdx + 2].leftCursor = 0);
+
+  { ---- T8: TK_NOTNULL virtual-term synthesis (whereexpr.c:1331..1359).
+            "col0 NOTNULL" with column 0 (not rowid) must add one virtual
+            term tagged TERM_VNULL whose eOperator = WO_GT. The original
+            NOTNULL term gets TERM_COPIED. ---- }
+  iNNIdx := pWC^.nTerm;
+  pColNN := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColNN^.iTable := 0; pColNN^.iColumn := 0;     { column 0, not rowid }
+  pNN := sqlite3PExpr(@parse, TK_NOTNULL, pColNN, nil);
+  whereClauseInsert(pWC, pNN, 0);
+  exprAnalyze(pSrc, pWC, iNNIdx);
+  Check('T8a NOTNULL spawned 1 child',
+        pWC^.nTerm = iNNIdx + 2);
+  Check('T8b child wtFlags has VNULL',
+        (pWC^.a[iNNIdx + 1].wtFlags and TERM_VNULL) <> 0);
+  Check('T8c child eOperator = WO_GT',
+        (pWC^.a[iNNIdx + 1].eOperator and WO_GT_WO) <> 0);
+  Check('T8d child leftCursor = 0',
+        pWC^.a[iNNIdx + 1].leftCursor = 0);
+  Check('T8e child u.leftColumn = 0',
+        pWC^.a[iNNIdx + 1].u.leftColumn = 0);
+  Check('T8f original NOTNULL has TERM_COPIED',
+        (pWC^.a[iNNIdx].wtFlags and TERM_COPIED) <> 0);
+  Check('T8g child iParent links back',
+        pWC^.a[iNNIdx + 1].iParent = iNNIdx);
+
+  { ---- T9: whereNthSubterm — non-AND term acts as its own 0-th subterm,
+            requests beyond N=0 return nil. ---- }
+  pSubA := @pWC^.a[iNNIdx + 1];   { the WO_GT VNULL child from T8 }
+  pSubB := whereNthSubterm(pSubA, 0);
+  Check('T9a whereNthSubterm(non-AND, 0) = self', pSubB = pSubA);
+  pSubC := whereNthSubterm(pSubA, 1);
+  Check('T9b whereNthSubterm(non-AND, 1) = nil', pSubC = nil);
+
+  { ---- T10: whereCombineDisjuncts — "a<5 OR a=5" must synthesize the
+            virtual term "a<=5" (TK_LE) tagged TERM_VIRTUAL|TERM_DYNAMIC. ---- }
+  { Build two disjunct WhereTerm objects pointing at "a<5" and "a=5". }
+  pCol1 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol1^.iTable := 0; pCol1^.iColumn := -1;
+  pInt1 := sqlite3ExprInt32(db, 5);
+  pLt   := sqlite3PExpr(@parse, TK_LT, pCol1, pInt1);
+
+  pCol2 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol2^.iTable := 0; pCol2^.iColumn := -1;
+  pInt2 := sqlite3ExprInt32(db, 5);
+  pEq2  := sqlite3PExpr(@parse, TK_EQ, pCol2, pInt2);
+
+  { Stand-alone WhereTerm shells — not threaded through the WhereClause
+    array; whereCombineDisjuncts does not inspect pWC linkage on them. }
+  New(pTermA);  FillChar(pTermA^, SizeOf(pTermA^), 0);
+  New(pTermB);  FillChar(pTermB^, SizeOf(pTermB^), 0);
+  pTermA^.pExpr     := pLt;
+  pTermA^.eOperator := WO_LT;
+  pTermB^.pExpr     := pEq2;
+  pTermB^.eOperator := WO_EQ;
+
+  nTermBefore := pWC^.nTerm;
+  iCombIdx    := nTermBefore;
+  whereCombineDisjuncts(pSrc, pWC, pTermA, pTermB);
+  Check('T10a virtual term inserted',
+        pWC^.nTerm = nTermBefore + 1);
+  Check('T10b combined op = TK_LE',
+        pWC^.a[iCombIdx].pExpr^.op = TK_LE);
+  Check('T10c combined wtFlags has VIRTUAL|DYNAMIC',
+        (pWC^.a[iCombIdx].wtFlags
+         and (TERM_VIRTUAL or TERM_DYNAMIC))
+        = (TERM_VIRTUAL or TERM_DYNAMIC));
+  Check('T10d combined eOperator has WO_LE',
+        (pWC^.a[iCombIdx].eOperator and WO_LE) <> 0);
+  Check('T10e combined leftCursor = 0',
+        pWC^.a[iCombIdx].leftCursor = 0);
+
+  { ---- T11: whereCombineDisjuncts must reject incompatible mixes —
+            "a<5 OR a>5" cannot collapse to a single comparison term. ---- }
+  pCol1 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol1^.iTable := 0; pCol1^.iColumn := -1;
+  pInt1 := sqlite3ExprInt32(db, 5);
+  pLt   := sqlite3PExpr(@parse, TK_LT, pCol1, pInt1);
+  pCol2 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pCol2^.iTable := 0; pCol2^.iColumn := -1;
+  pInt2 := sqlite3ExprInt32(db, 5);
+  pEq2  := sqlite3PExpr(@parse, TK_GT_TK, pCol2, pInt2);
+
+  pTermA^.pExpr     := pLt;
+  pTermA^.eOperator := WO_LT;
+  pTermA^.wtFlags   := 0;
+  pTermB^.pExpr     := pEq2;
+  pTermB^.eOperator := WO_GT_WO;
+  pTermB^.wtFlags   := 0;
+
+  nTermBefore := pWC^.nTerm;
+  whereCombineDisjuncts(pSrc, pWC, pTermA, pTermB);
+  Check('T11a a<5 OR a>5 leaves nTerm untouched',
+        pWC^.nTerm = nTermBefore);
+
+  Dispose(pTermA);
+  Dispose(pTermB);
+
+  { ---- T12: exprAnalyzeOrTerm — "rowid=1 OR rowid=2" must (a) tag the
+            outer term TERM_ORINFO with eOperator=WO_OR, leftCursor=-1,
+            and (b) synthesize a virtual TK_IN child via case-1
+            (whereexpr.c:911..944).  The OR term itself is shattered
+            into two disjunct terms held inside pOrInfo^.wc. ---- }
+  pColA := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColA^.iTable := 0; pColA^.iColumn := -1;
+  pIntA := sqlite3ExprInt32(db, 1);
+  pEqA  := sqlite3PExpr(@parse, TK_EQ, pColA, pIntA);
+
+  pColB := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColB^.iTable := 0; pColB^.iColumn := -1;
+  pIntB := sqlite3ExprInt32(db, 2);
+  pEqB  := sqlite3PExpr(@parse, TK_EQ, pColB, pIntB);
+
+  pOr := sqlite3PExpr(@parse, TK_OR, pEqA, pEqB);
+  iOrIdx := pWC^.nTerm;
+  whereClauseInsert(pWC, pOr, 0);
+  exprAnalyze(pSrc, pWC, iOrIdx);
+
+  Check('T12a OR term tagged TERM_ORINFO',
+        (pWC^.a[iOrIdx].wtFlags and TERM_ORINFO) <> 0);
+  Check('T12b OR term eOperator = WO_OR',
+        (pWC^.a[iOrIdx].eOperator and WO_OR) <> 0);
+  Check('T12c OR term leftCursor = -1',
+        pWC^.a[iOrIdx].leftCursor = -1);
+  pOrInfo3 := pWC^.a[iOrIdx].u.pOrInfo;
+  Check('T12d pOrInfo allocated',
+        pOrInfo3 <> nil);
+  Check('T12e pOrInfo.wc has 2 disjunct subterms',
+        (pOrInfo3 <> nil) and (pOrInfo3^.wc.nTerm = 2));
+  Check('T12f pOrInfo.wc.op = TK_OR',
+        (pOrInfo3 <> nil) and (pOrInfo3^.wc.op = TK_OR));
+  Check('T12g pOrInfo.indexable bit 0 set (rowid cursor 0)',
+        (pOrInfo3 <> nil) and ((pOrInfo3^.indexable and 1) <> 0));
+  Check('T12h pWC^.hasOr set',
+        pWC^.hasOr = 1);
+  { Case-1 should append a virtual TK_IN term beyond the OR; iOrIdx+1
+    is the synthesized child (markTermAsChild links it back). }
+  Check('T12i virtual TK_IN child appended',
+        (pWC^.nTerm > iOrIdx + 1)
+        and (pWC^.a[iOrIdx + 1].pExpr^.op = TK_IN));
+  Check('T12j virtual term wtFlags has VIRTUAL|DYNAMIC',
+        (pWC^.nTerm > iOrIdx + 1)
+        and ((pWC^.a[iOrIdx + 1].wtFlags
+              and (TERM_VIRTUAL or TERM_DYNAMIC))
+             = (TERM_VIRTUAL or TERM_DYNAMIC)));
+  Check('T12k virtual TK_IN term iParent = OR idx',
+        (pWC^.nTerm > iOrIdx + 1)
+        and (pWC^.a[iOrIdx + 1].iParent = iOrIdx));
+
+  { ---- T13: exprAnalyzeOrTerm with mismatched columns —
+            "(c0=1) OR (rowid=2)" cannot collapse into a single IN
+            (different leftColumn), so case-1 must NOT run.  pOrInfo
+            still tags the outer term, but no virtual TK_IN child is
+            appended. ---- }
+  pColC := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColC^.iTable := 0; pColC^.iColumn := 0;          { col 0 }
+  pIntC := sqlite3ExprInt32(db, 1);
+  pEqC  := sqlite3PExpr(@parse, TK_EQ, pColC, pIntC);
+
+  pColD := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pColD^.iTable := 0; pColD^.iColumn := -1;         { rowid }
+  pIntD := sqlite3ExprInt32(db, 2);
+  pEqD  := sqlite3PExpr(@parse, TK_EQ, pColD, pIntD);
+
+  pOr2 := sqlite3PExpr(@parse, TK_OR, pEqC, pEqD);
+  iOrIdx2     := pWC^.nTerm;
+  nTermBefore := pWC^.nTerm;
+  whereClauseInsert(pWC, pOr2, 0);
+  exprAnalyze(pSrc, pWC, iOrIdx2);
+  Check('T13a OR term still tagged TERM_ORINFO',
+        (pWC^.a[iOrIdx2].wtFlags and TERM_ORINFO) <> 0);
+  Check('T13b OR term still gets WO_OR',
+        (pWC^.a[iOrIdx2].eOperator and WO_OR) <> 0);
+  Check('T13c no virtual TK_IN appended for column-mismatched OR',
+        pWC^.nTerm = nTermBefore + 1);
+
+  { ---- T14: LIKE virtual-term synthesis (whereexpr.c:1362..1455).
+            "x LIKE 'aBc%'" must synthesize two TERM_LIKEOPT|TERM_VIRTUAL|
+            TERM_DYNAMIC children: x>='ABC' (TK_GE) and x<'abd' (TK_LT).
+            Default LIKE is case-insensitive so the original LIKE term gets
+            TERM_LIKE; isComplete=1 so both children are linked as parents
+            of the LIKE term. ---- }
+  pLikeCol := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pLikeCol^.iTable := 0; pLikeCol^.iColumn := -1;
+
+  tokLike.z := PChar('aBc%'); tokLike.n := 4;
+  pLikePat  := sqlite3ExprAlloc(db, TK_STRING, @tokLike, 0);
+
+  pLikeList := sqlite3ExprListAppend(@parse, nil, pLikePat);
+  pLikeList := sqlite3ExprListAppend(@parse, pLikeList, pLikeCol);
+
+  tokLike.z := PChar('like'); tokLike.n := 4;
+  pLikeFn   := sqlite3ExprAlloc(db, TK_FUNCTION, @tokLike, 0);
+  pLikeFn^.x.pList := pLikeList;
+
+  iLikeIdx := pWC^.nTerm;
+  whereClauseInsert(pWC, pLikeFn, 0);
+  exprAnalyze(pSrc, pWC, iLikeIdx);
+
+  Check('T14a LIKE term flagged TERM_LIKE',
+        (pWC^.a[iLikeIdx].wtFlags and TERM_LIKE) <> 0);
+  Check('T14b LIKE spawned 2 children',
+        pWC^.nTerm = iLikeIdx + 3);
+  Check('T14c child 0 op = TK_GE',
+        (pWC^.nTerm > iLikeIdx + 1) and
+        (pWC^.a[iLikeIdx + 1].pExpr^.op = TK_GE));
+  Check('T14d child 1 op = TK_LT',
+        (pWC^.nTerm > iLikeIdx + 2) and
+        (pWC^.a[iLikeIdx + 2].pExpr^.op = TK_LT));
+  Check('T14e child 0 wtFlags has LIKEOPT|VIRTUAL|DYNAMIC',
+        (pWC^.a[iLikeIdx + 1].wtFlags
+         and (TERM_LIKEOPT or TERM_VIRTUAL or TERM_DYNAMIC))
+        = (TERM_LIKEOPT or TERM_VIRTUAL or TERM_DYNAMIC));
+  Check('T14f child 1 wtFlags has LIKEOPT|VIRTUAL|DYNAMIC',
+        (pWC^.a[iLikeIdx + 2].wtFlags
+         and (TERM_LIKEOPT or TERM_VIRTUAL or TERM_DYNAMIC))
+        = (TERM_LIKEOPT or TERM_VIRTUAL or TERM_DYNAMIC));
+  Check('T14g child 0 iParent = LIKE idx (isComplete)',
+        pWC^.a[iLikeIdx + 1].iParent = iLikeIdx);
+  Check('T14h child 1 iParent = LIKE idx (isComplete)',
+        pWC^.a[iLikeIdx + 2].iParent = iLikeIdx);
+  Check('T14i LIKE nChild = 2',
+        pWC^.a[iLikeIdx].nChild = 2);
+  pLikeGeRhs := pWC^.a[iLikeIdx + 1].pExpr^.pRight;
+  pLikeLtRhs := pWC^.a[iLikeIdx + 2].pExpr^.pRight;
+  Check('T14j child 0 RHS = "ABC" (uppercased lower bound)',
+        (pLikeGeRhs <> nil) and (pLikeGeRhs^.op = TK_STRING)
+        and (StrComp(pLikeGeRhs^.u.zToken, 'ABC') = 0));
+  Check('T14k child 1 RHS = "abd" (incremented lower bound)',
+        (pLikeLtRhs <> nil) and (pLikeLtRhs^.op = TK_STRING)
+        and (StrComp(pLikeLtRhs^.u.zToken, 'abd') = 0));
+  pSc := pWC^.a[iLikeIdx + 1].pExpr^.pLeft;
+  Check('T14l child 0 LHS wraps a TK_COLLATE node',
+        (pSc <> nil) and (pSc^.op = TK_COLLATE));
+
+  { ---- T15: LIKE numeric-prefix bailout — "rowid LIKE '12%'"  is
+            rejected because pLeft is non-TEXT-affinity and "12" parses
+            as a number; whereexpr.c:1376..1378 returns rc=0, no virtual
+            children. ---- }
+  pLikeCol2 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+  pLikeCol2^.iTable := 0; pLikeCol2^.iColumn := -1;
+
+  tokLike.z := PChar('12%'); tokLike.n := 3;
+  pLikePat2 := sqlite3ExprAlloc(db, TK_STRING, @tokLike, 0);
+
+  pLikeList2 := sqlite3ExprListAppend(@parse, nil, pLikePat2);
+  pLikeList2 := sqlite3ExprListAppend(@parse, pLikeList2, pLikeCol2);
+
+  tokLike.z := PChar('like'); tokLike.n := 4;
+  pLikeFn2  := sqlite3ExprAlloc(db, TK_FUNCTION, @tokLike, 0);
+  pLikeFn2^.x.pList := pLikeList2;
+
+  iLikeIdx2       := pWC^.nTerm;
+  nTermBeforeLike := pWC^.nTerm;
+  whereClauseInsert(pWC, pLikeFn2, 0);
+  exprAnalyze(pSrc, pWC, iLikeIdx2);
+  Check('T15a numeric-prefix LIKE adds no virtual child',
+        pWC^.nTerm = nTermBeforeLike + 1);
+  Check('T15b numeric-prefix LIKE term not flagged TERM_LIKE',
+        (pWC^.a[iLikeIdx2].wtFlags and TERM_LIKE) = 0);
+
+  { ---- T16: TK_VARIABLE LIKE pattern (whereexpr.c:208..216, 316..334).
+            "x LIKE ?1" with ?1 currently bound to TEXT 'aBc%' must drive
+            isLikeOrGlob through the bound-parameter arm: read the current
+            value via sqlite3VdbeGetBoundValue, synthesize the same
+            range-scan virtual children as the literal-string path, and
+            set the expmask bit on parse.pVdbe so reoptimize() reprepares
+            on rebind. ---- }
+  vBound := sqlite3VdbeCreate(@parse);
+  if vBound = nil then begin Check('T16 vbound', False); end
+  else
+  begin
+    vBound^.nVar := 1;
+    vBound^.aVar := PMem(sqlite3DbMallocZero(db, SizeOf(TMem)));
+    vBound^.aVar^.flags := MEM_Null;
+    vBound^.eVdbeState := VDBE_READY_STATE;
+    Check('T16 setup bind_text rc=OK',
+          sqlite3_bind_text(vBound, 1, 'aBc%', 4, SQLITE_STATIC) = SQLITE_OK);
+    parse.pVdbe      := vBound;
+    parse.pReprepare := vBound;
+
+    pLikeCol3 := sqlite3PExpr(@parse, TK_COLUMN, nil, nil);
+    pLikeCol3^.iTable := 0; pLikeCol3^.iColumn := -1;
+
+    tokVar.z := PChar('?'); tokVar.n := 1;
+    pLikeVar3 := sqlite3ExprAlloc(db, TK_VARIABLE, @tokVar, 0);
+    pLikeVar3^.iColumn := 1;     { bound-parameter index }
+
+    pLikeList3 := sqlite3ExprListAppend(@parse, nil, pLikeVar3);
+    pLikeList3 := sqlite3ExprListAppend(@parse, pLikeList3, pLikeCol3);
+
+    tokLike.z := PChar('like'); tokLike.n := 4;
+    pLikeFn3  := sqlite3ExprAlloc(db, TK_FUNCTION, @tokLike, 0);
+    pLikeFn3^.x.pList := pLikeList3;
+
+    iLikeIdx3 := pWC^.nTerm;
+    whereClauseInsert(pWC, pLikeFn3, 0);
+    exprAnalyze(pSrc, pWC, iLikeIdx3);
+
+    Check('T16a TK_VARIABLE LIKE flagged TERM_LIKE',
+          (pWC^.a[iLikeIdx3].wtFlags and TERM_LIKE) <> 0);
+    Check('T16b TK_VARIABLE LIKE spawned 2 children',
+          pWC^.nTerm = iLikeIdx3 + 3);
+    Check('T16c child 0 op = TK_GE',
+          (pWC^.nTerm > iLikeIdx3 + 1) and
+          (pWC^.a[iLikeIdx3 + 1].pExpr^.op = TK_GE));
+    Check('T16d child 1 op = TK_LT',
+          (pWC^.nTerm > iLikeIdx3 + 2) and
+          (pWC^.a[iLikeIdx3 + 2].pExpr^.op = TK_LT));
+    pLikeVarRhs3 := pWC^.a[iLikeIdx3 + 1].pExpr^.pRight;
+    Check('T16e child 0 RHS = "ABC" (uppercased lower bound from bound value)',
+          (pLikeVarRhs3 <> nil) and (pLikeVarRhs3^.op = TK_STRING)
+          and (StrComp(pLikeVarRhs3^.u.zToken, 'ABC') = 0));
+    pLikeVarRhs3 := pWC^.a[iLikeIdx3 + 2].pExpr^.pRight;
+    Check('T16f child 1 RHS = "abd" (incremented upper bound)',
+          (pLikeVarRhs3 <> nil) and (pLikeVarRhs3^.op = TK_STRING)
+          and (StrComp(pLikeVarRhs3^.u.zToken, 'abd') = 0));
+    Check('T16g pVdbe.expmask bit 0 set on iColumn=1 binding',
+          (vBound^.expmask and 1) = 1);
+
+    parse.pVdbe      := nil;
+    parse.pReprepare := nil;
+  end;
+
+  { Skip sqlite3WhereClauseClear / sqlite3DbFree for the synthetic
+    WhereInfo: pWC^.a was allocated through sqlite3WhereMalloc and is
+    threaded on pWInfo^.pMemToFree, so a manual sqlite3DbFree(pWC^.a)
+    would corrupt the lookaside arena.  whereInfoFree's full chain-walk
+    is the C-faithful release path, but it requires more state than
+    this test sets up.  The OS reclaims the leaked allocations at exit. }
+  sqlite3_close(db);
+
+  WriteLn;
+  WriteLn('Results: ', gPass, ' PASS, ', gFail, ' FAIL');
+  if gFail > 0 then Halt(1);
+end.
