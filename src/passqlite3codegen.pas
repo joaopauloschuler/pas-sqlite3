@@ -809,6 +809,7 @@ type
       6: (pGroupBy: PExprList);
       7: (pSelect:  PSelect);
       8: (aiCol:    Pi32);    { CHECK-constraint changed-column map (insert.c:1727) }
+      9: (pCheckOnCtx: Pointer);  { CheckOnCtx*  (select.c:7392) }
   end;
 
   TWalker = record
@@ -7423,6 +7424,15 @@ begin
   ResolveExprList(p^.pGroupBy);
   ResolveExpr    (p^.pHaving);
   ResolveExprList(p^.pOrderBy);
+
+  { resolve.c:2079 — once ON clauses have been spliced into pWhere
+    (selectExpander tags Select with SF_OnToWhere when it does this),
+    walk pWhere to confirm no ON term references a table to its right.
+    The walker clears SF_OnToWhere as it goes, so this fires at most once. }
+  if (p^.selFlags and SF_OnToWhere) <> 0 then
+  begin
+    sqlite3SelectCheckOnClauses(pParse, p);
+  end;
 end;
 
 function sqlite3ResolveSelfReference(pParse: PParse; pTab: PTable2;
@@ -17416,10 +17426,148 @@ begin
     pSelect^.selFlags := pSelect^.selFlags or SF_HasTypeInfo;
 end;
 
-{ sqlite3SelectCheckOnClauses — verify ON/USING clauses (Phase 6.5 stub) }
-procedure sqlite3SelectCheckOnClauses(pParse: PParse; pSelect: PSelect);
+{ sqlite3SelectCheckOnClauses — verify ON/USING clauses (select.c:7398..7508).
+
+  After ON expressions are spliced into pSelect->pWhere via SF_OnToWhere,
+  walk the resulting WHERE looking for a TK_COLUMN inside an ON-attributed
+  expression that references a cursor to the right of the ON clause's join
+  cursor.  A match is a hard syntax error per SQL semantics for OUTER JOIN.
+
+  Pas TWalkerU now carries a pCheckOnCtx variant (case 9, pointer-typed),
+  so the C `pWalker->u.pCheckOnCtx` pattern translates directly. }
+
+type
+  PCheckOnCtx = ^TCheckOnCtx;
+  TCheckOnCtx = record
+    pSrc:     PSrcList;
+    pParent:  PCheckOnCtx;
+    iJoin:    i32;
+    bFuncArg: i32;
+  end;
+
+function selectCheckOnClausesExpr(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pCtx:  PCheckOnCtx;
+  pSrc:  PSrcList;
+  iTab:  i32;
+  iLast: i32;
+  zMsg:  PAnsiChar;
+  zKind: PAnsiChar;
 begin
-  { Phase 6.5 stub }
+  pCtx := PCheckOnCtx(pWalker^.u.pCheckOnCtx);
+  Result := WRC_Continue;
+
+  { Root-of-ON detection: ON exprs carry EP_OuterON; INNER ON exprs only
+    matter when the SrcList contains a RIGHT/FULL JOIN (JT_LTORJ on a[0]). }
+  if ExprHasProperty(pExpr, EP_OuterON)
+     or (ExprHasProperty(pExpr, EP_InnerON)
+         and (pCtx^.pSrc <> nil)
+         and ((SrcListItems(pCtx^.pSrc)[0].fg.jointype and JT_LTORJ) <> 0)) then
+  begin
+    if pCtx^.iJoin = 0 then
+    begin
+      pCtx^.iJoin := pExpr^.w.iJoin;
+      sqlite3WalkExprNN(pWalker, pExpr);
+      pCtx^.iJoin := 0;
+      Result := WRC_Prune;
+      Exit;
+    end;
+  end;
+
+  if pExpr^.op = TK_COLUMN then
+  begin
+    iTab := pExpr^.iTable;
+    while pCtx <> nil do
+    begin
+      pSrc := pCtx^.pSrc;
+      if (pSrc <> nil) and (pSrc^.nSrc > 0) then
+      begin
+        iLast := SrcListItems(pSrc)[pSrc^.nSrc - 1].iCursor;
+        if (iTab >= SrcListItems(pSrc)[0].iCursor) and (iTab <= iLast) then
+        begin
+          if (pCtx^.iJoin <> 0) and (iTab > pCtx^.iJoin) then
+          begin
+            if pCtx^.bFuncArg <> 0 then
+              zKind := 'table-function argument'
+            else
+              zKind := 'ON clause';
+            zMsg := sqlite3MPrintf(pWalker^.pParse^.db,
+              '%s references tables to its right', [zKind]);
+            sqlite3ErrorMsg(pWalker^.pParse, zMsg);
+            if zMsg <> nil then sqlite3DbFree(pWalker^.pParse^.db, zMsg);
+            Result := WRC_Abort;
+            Exit;
+          end;
+          Break;
+        end;
+      end;
+      pCtx := pCtx^.pParent;
+    end;
+  end;
+end;
+
+procedure selectCheckOnClausesSelect(pWalker: PWalker; pSelect: PSelect); cdecl;
+var
+  pCtx: PCheckOnCtx;
+  sCtx: TCheckOnCtx;
+begin
+  pCtx := PCheckOnCtx(pWalker^.u.pCheckOnCtx);
+  if (pSelect^.pSrc = pCtx^.pSrc) or (pSelect^.pSrc = nil)
+     or (pSelect^.pSrc^.nSrc = 0) then Exit;
+
+  FillChar(sCtx, SizeOf(sCtx), 0);
+  sCtx.pSrc    := pSelect^.pSrc;
+  sCtx.pParent := pCtx;
+  pWalker^.u.pCheckOnCtx := @sCtx;
+  sqlite3WalkSelect(pWalker, pSelect);
+  pWalker^.u.pCheckOnCtx := pCtx;
+  pSelect^.selFlags := pSelect^.selFlags and (not SF_OnToWhere);
+end;
+
+function selectCheckOnClausesSelectStep(pWalker: PWalker; pSel: PSelect): i32; cdecl;
+begin
+  selectCheckOnClausesSelect(pWalker, pSel);
+  if (pSel <> nil) and (pSel^.pSrc <> nil) and (pSel^.pSrc^.nSrc <> 0)
+     and (PCheckOnCtx(pWalker^.u.pCheckOnCtx)^.pSrc <> pSel^.pSrc) then
+    Result := WRC_Prune
+  else
+    Result := WRC_Continue;
+end;
+
+procedure sqlite3SelectCheckOnClauses(pParse: PParse; pSelect: PSelect);
+var
+  w:    TWalker;
+  sCtx: TCheckOnCtx;
+  ii:   i32;
+  pIt:  PSrcItem;
+begin
+  if (pSelect = nil) or (pSelect^.pSrc = nil) or (pSelect^.pSrc^.nSrc < 2) then Exit;
+  Assert((pSelect^.selFlags and SF_OnToWhere) <> 0);
+
+  FillChar(w, SizeOf(w), 0);
+  w.pParse          := pParse;
+  w.xExprCallback   := TExprCallback(@selectCheckOnClausesExpr);
+  w.xSelectCallback := TSelectCallback(@selectCheckOnClausesSelectStep);
+  FillChar(sCtx, SizeOf(sCtx), 0);
+  sCtx.pSrc := pSelect^.pSrc;
+  w.u.pCheckOnCtx := @sCtx;
+
+  sqlite3WalkExpr(@w, pSelect^.pWhere);
+  pSelect^.selFlags := pSelect^.selFlags and (not SF_OnToWhere);
+
+  { Table-function args attached to vtabs on the RHS of an outer join carry
+    the same constraint. }
+  sCtx.bFuncArg := 1;
+  for ii := 0 to pSelect^.pSrc^.nSrc - 1 do
+  begin
+    pIt := @SrcListItems(pSelect^.pSrc)[ii];
+    if ((pIt^.fg.fgBits and $08) <> 0)        { isTabFunc bit 3 }
+       and ((pIt^.fg.jointype and JT_OUTER) <> 0) then
+    begin
+      sCtx.iJoin := pIt^.iCursor;
+      sqlite3WalkExprList(@w, pIt^.u1.pFuncArg);
+    end;
+  end;
 end;
 
 { propagateConstants family — port of select.c:4719..4985.

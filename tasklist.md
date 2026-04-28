@@ -608,9 +608,21 @@ Important: At the end of this document, please find:
        to pascal: `sqlite3SelectPopWith` (blocked on full TWith record — see
        6.20), `sqlite3WhereMinMaxOptEarlyOut`,
        `sqlite3KeyInfoFromExprList`, `sqlite3SelectAddTypeInfo`,
-       `sqlite3SelectCheckOnClauses`,
        `sqlite3WhereExplainBloomFilter`, `sqlite3WhereAddExplainText`,
        `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep`.
+       [X] `sqlite3SelectCheckOnClauses` — ported in full (select.c:7398..7508)
+            2026-04-28.  CheckOnCtx record + xExpr/xSelect walker callbacks
+            mirror the C; selectCheckOnClausesExpr emits
+            `"ON clause references tables to its right"` (or the
+            table-function-argument variant) when a TK_COLUMN inside an
+            ON-attributed predicate references a cursor past the join
+            cursor.  TWalkerU gained a 9th case (pCheckOnCtx).  Wired from
+            the tail of `sqlite3ResolveSelectNames` (mirroring
+            resolve.c:2079) so SF_OnToWhere triggers the check.  Selects
+            with <2 SrcList items short-circuit (matches C `nSrc>=2`
+            assert).  TestExplainParity unchanged (1012 pass / 14 diverge);
+            DiagFeatureProbe unchanged (12 divergences); TestParser /
+            TestSelectBasic / TestWhereBasic / TestWhereSimple all green.
        [X] `wherePathMatchSubqueryOB` — ported in full (where.c:5077..5127)
             2026-04-28.  Detects whether a sub-FROM's ORDER BY (carried in
             pLoop^.u.btree.pOrderBy) satisfies leading terms of the outer
