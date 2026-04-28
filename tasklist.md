@@ -225,9 +225,9 @@ Important: At the end of this document, please find:
         `SELECT count(*) FROM pragma_table_info('t')` returns no row.
         Tracked under 6.12 (sqlite3Pragma).
 
-  [ ] **6.10 step 10** Built-in scalar function bugs (surfaced via ad-hoc
-      differential probe — not DiagFeatureProbe; consider folding into a
-      DiagBuiltins fixture if more arrive):
+  [ ] **6.10 step 10** Built-in scalar function bugs (surfaced via the
+      DiagFunctions probe — `src/tests/DiagFunctions.pas`, run with
+      `LD_LIBRARY_PATH=$PWD/src bin/DiagFunctions`):
       [X] **a) `quote(text)` drops the trailing quote** — fixed
         2026-04-28.  Both the BLOB and TEXT arms of `quoteFunc`
         (codegen.pas:24823, codegen.pas:24841) passed `p - zOut - 1`
@@ -248,6 +248,41 @@ Important: At the end of this document, please find:
         TestExplainParity regression (1012 pass / 14 diverge —
         same).  Closes architectural note 5 for the REAL→TEXT
         coercion path.
+      [X] **c) `substr(text, -k, n)` returns empty** — fixed
+        2026-04-28.  Pas had a clamp-style branch
+        (`if p1 < 1 then begin p2 := p2 + p1 - 1; p1 := 1; end`)
+        that turned negative offsets into "before-string" with
+        the count chopped, so `substr('hello', -3, 2)` produced
+        '' instead of 'll'.  Replaced with the faithful C
+        normalisation chain (func.c:382..415): `p1 += len; if
+        p1<0 then ... else if p1>0 then p1--; else if p2>0 then
+        p2--; if p2<0 then ...`.  Also added the missing NULL
+        arms (`p1==NULL`, `p2==NULL` early-return) per
+        func.c:378/391.  Indices widened to i64 to mirror C.
+        DiagFunctions "substr neg" → PASS.
+      [X] **d) `printf('%.2f', x)` ignores precision** — fixed
+        2026-04-28.  `printfFunc`'s `f/e/E/g/G` arm called
+        `FloatToStr(vDbl)`, dropping the parsed precision/width
+        on the floor.  Extended `SkipFmtMeta` to capture
+        width/precision (and the "have" flags), added an
+        `FmtFloat` helper that maps `f→ffFixed`, `e/E→ffExponent`,
+        `g/G→ffGeneral` via `FloatToStrF` and applies width
+        padding/zero-fill from the captured flags.  Unadorned
+        specifiers still use `FloatToStr` to preserve the prior
+        natural-%g shape.  DiagFunctions "printf %.2f" → PASS.
+      [X] **e) UTF-8 char advance off-by-one in `substrFunc`** —
+        fixed 2026-04-28.  The slicing advance loops mishandled
+        multi-byte chars: `if u8(z^) >= $80 then begin while
+        (u8(z^) and $C0) = $80 do Inc(z); end; Inc(z); Inc(i)`
+        treated each continuation byte as a separate char (the
+        outer `>= $80` re-fires for every continuation, but
+        the inner while only fires once we already moved off the
+        lead).  Replaced with the SQLITE_SKIP_UTF8 shape: step
+        past the lead first (`>= $C0`), then drain continuation
+        bytes.  `length()` was already correct (uses
+        `sqlite3Utf8CharLen`).  Verified: `substr('café',4,1)`
+        now returns 'é' (was 0xC3 alone), `substr('日本語',2,1)`
+        returns '本'.  DiagFunctions utf8 cases → PASS.
 
   [X] **6.10 step 8** Auto-named result columns carry a trailing space
       on Pas — fixed.  Root cause was `sqlite3DbSpanDup`

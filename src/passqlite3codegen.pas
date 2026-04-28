@@ -24304,8 +24304,8 @@ end;
 procedure substrFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   z, zOut, zEnd: PAnsiChar;
-  p0, p1, p2, lenArg, lenTotal: PMem;
-  p1i, p2i, n, nByte, i: i32;
+  p0, p1, p2: PMem;
+  p1i, p2i, n, nByte, i: i64;
 begin
   p0 := (argv + 0)^;
   p1 := (argv + 1)^;
@@ -24315,38 +24315,60 @@ begin
   z := sqlite3_value_text(Psqlite3_value(p0));
   if z = nil then begin sqlite3_result_null(pCtx); Exit; end;
   nByte := sqlite3_value_bytes(Psqlite3_value(p0));
-  n     := sqlite3Utf8CharLen(z, nByte);
-  p1i   := sqlite3_value_int(Psqlite3_value(p1));
+  n     := sqlite3Utf8CharLen(z, i32(nByte));
+  p1i   := sqlite3_value_int64(Psqlite3_value(p1));
   if argc = 3 then begin
     p2  := (argv + 2)^;
-    p2i := sqlite3_value_int(Psqlite3_value(p2));
-    if p2i < 0 then begin
-      p1i := p1i + p2i;
-      p2i := -p2i;
+    p2i := sqlite3_value_int64(Psqlite3_value(p2));
+    if (p2i = 0)
+       and (sqlite3_value_type(Psqlite3_value(p2)) = SQLITE_NULL) then begin
+      sqlite3_result_null(pCtx); Exit;
     end;
   end else
-    p2i := n;
-  if p1i < 1 then begin
-    p2i := p2i + p1i - 1;
-    p1i := 1;
-  end;
-  if p2i < 0 then begin sqlite3_result_text(pCtx, '', 0, SQLITE_STATIC); Exit; end;
-  if p1i > n then begin sqlite3_result_text(pCtx, '', 0, SQLITE_STATIC); Exit; end;
-  { advance z to the start char }
-  i := 1;
-  while (i < p1i) and (z^ <> #0) do begin
-    if u8(z^) >= $80 then begin
-      while (u8(z^) and $C0) = $80 do Inc(z);
+    p2i := i64(High(i32));
+  if p1i = 0 then begin
+    if sqlite3_value_type(Psqlite3_value(p1)) = SQLITE_NULL then begin
+      sqlite3_result_null(pCtx); Exit;
     end;
-    Inc(z); Inc(i);
+  end;
+  { Faithful port of func.c:382..415 — index normalisation. }
+  if p1i < 0 then begin
+    p1i := p1i + n;
+    if p1i < 0 then begin
+      if p2i < 0 then p2i := 0
+      else p2i := p2i + p1i;
+      p1i := 0;
+    end;
+  end else if p1i > 0 then
+    Dec(p1i)
+  else if p2i > 0 then
+    Dec(p2i);
+  if p2i < 0 then begin
+    if p2i < -p1i then p2i := p1i
+    else p2i := -p2i;
+    p1i := p1i - p2i;
+  end;
+  { Now p1i (0-based start) and p2i (char count) are both >= 0.
+    Mirrors SQLITE_SKIP_UTF8 (sqliteInt.h): step past the lead byte first,
+    then skip any continuation bytes ($80..$BF). }
+  i := 0;
+  while (i < p1i) and (z^ <> #0) do begin
+    if u8(z^) >= $C0 then begin
+      Inc(z);
+      while (u8(z^) and $C0) = $80 do Inc(z);
+    end else
+      Inc(z);
+    Inc(i);
   end;
   zOut := z;
   i := 0;
   while (i < p2i) and (z^ <> #0) do begin
-    if u8(z^) >= $80 then begin
+    if u8(z^) >= $C0 then begin
+      Inc(z);
       while (u8(z^) and $C0) = $80 do Inc(z);
-    end;
-    Inc(z); Inc(i);
+    end else
+      Inc(z);
+    Inc(i);
   end;
   zEnd := z;
   sqlite3_result_text(pCtx, zOut, zEnd - zOut, SQLITE_TRANSIENT);
@@ -25080,18 +25102,73 @@ var
   i:       i32;
   zOut:    PAnsiChar;
   nOut:    i32;
+  metaWidth, metaPrec: i32;
+  metaHaveWidth, metaHavePrec: Boolean;
+  metaFlags: AnsiString;
 
   { Skip optional flag / width / precision chars between '%' and the type char.
-    Returns the next non-meta character (the specifier letter). }
+    Captures the parsed width and precision (and "have" flags) into the
+    enclosing locals so float specifiers can honour them.  Returns the next
+    non-meta character (the specifier letter). }
   function SkipFmtMeta: AnsiChar;
   begin
+    metaFlags := '';
+    metaWidth := 0; metaPrec := 0;
+    metaHaveWidth := False; metaHavePrec := False;
     { flags }
-    while p^ in ['-', '+', ' ', '0', '#'] do Inc(p);
+    while p^ in ['-', '+', ' ', '0', '#'] do begin
+      metaFlags := metaFlags + p^; Inc(p);
+    end;
     { width }
-    while p^ in ['0'..'9'] do Inc(p);
+    if p^ in ['0'..'9'] then begin
+      metaHaveWidth := True;
+      while p^ in ['0'..'9'] do begin
+        metaWidth := metaWidth * 10 + (Ord(p^) - Ord('0')); Inc(p);
+      end;
+    end;
     { precision }
-    if p^ = '.' then begin Inc(p); while p^ in ['0'..'9'] do Inc(p); end;
+    if p^ = '.' then begin
+      Inc(p);
+      metaHavePrec := True;
+      while p^ in ['0'..'9'] do begin
+        metaPrec := metaPrec * 10 + (Ord(p^) - Ord('0')); Inc(p);
+      end;
+    end;
     Result := p^;
+  end;
+
+  { Format a double using the captured width/precision metadata, mirroring
+    C printf semantics for %f / %e / %E / %g / %G via FloatToStrF.  When no
+    width or precision is given, fall back to FloatToStr for natural %g-like
+    output (matches the previous behaviour for unadorned specifiers). }
+  function FmtFloat(spec: AnsiChar; v: Double): AnsiString;
+  var
+    fmt: TFloatFormat;
+    digits, prec: i32;
+  begin
+    if (not metaHaveWidth) and (not metaHavePrec) then begin
+      Result := FloatToStr(v); Exit;
+    end;
+    case spec of
+      'f': begin fmt := ffFixed;    if metaHavePrec then prec := metaPrec else prec := 6; end;
+      'e': begin fmt := ffExponent; if metaHavePrec then prec := metaPrec else prec := 6; end;
+      'E': begin fmt := ffExponent; if metaHavePrec then prec := metaPrec else prec := 6; end;
+    else
+      begin fmt := ffGeneral; if metaHavePrec then prec := metaPrec else prec := 15; end;
+    end;
+    if fmt = ffFixed then digits := prec
+    else if fmt = ffExponent then digits := prec
+    else digits := prec;
+    Result := FloatToStrF(v, fmt, 15, digits);
+    if (spec = 'E') or (spec = 'G') then Result := UpperCase(Result);
+    if metaHaveWidth and (Length(Result) < metaWidth) then begin
+      if Pos('-', metaFlags) > 0 then
+        Result := Result + StringOfChar(' ', metaWidth - Length(Result))
+      else if (Pos('0', metaFlags) > 0) and (Pos('-', metaFlags) = 0) then
+        Result := StringOfChar('0', metaWidth - Length(Result)) + Result
+      else
+        Result := StringOfChar(' ', metaWidth - Length(Result)) + Result;
+    end;
   end;
 
   { Append s to result_ }
@@ -25195,9 +25272,7 @@ begin
         Inc(p);
         if pVal <> nil then vDbl := sqlite3_value_double(Psqlite3_value(pVal))
         else vDbl := 0;
-        { Use Pascal FloatToStr as a best-effort approximation; matches %g
-          for most practical values used in SQL expressions. }
-        App(FloatToStr(vDbl));
+        App(FmtFloat(c, vDbl));
       end;
       's': begin
         Inc(p);
