@@ -434,6 +434,17 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ Forward decls — built-in collation funcs + createCollation are defined
+  later in this unit but called from openDatabase below. }
+function binCollFunc(NotUsed: Pointer; nKey1: i32; pKey1: Pointer;
+  nKey2: i32; pKey2: Pointer): i32; cdecl; forward;
+function rtrimCollFunc(pUser: Pointer; nKey1: i32; pKey1: Pointer;
+  nKey2: i32; pKey2: Pointer): i32; cdecl; forward;
+function nocaseCollatingFunc(NotUsed: Pointer; nKey1: i32; pKey1: Pointer;
+  nKey2: i32; pKey2: Pointer): i32; cdecl; forward;
+function createCollation(db: PTsqlite3; zName: PAnsiChar; enc: u8;
+  pCtx: Pointer; xCompare: Pointer; xDel: Pointer): i32; forward;
+
 { ----------------------------------------------------------------------
   openDatabase — main.c:3324
   ---------------------------------------------------------------------- }
@@ -573,6 +584,19 @@ begin
 
   { Register per-connection built-ins (collations + scalar/aggregate funcs). }
   sqlite3RegisterPerConnectionBuiltinFunctions(db);
+
+  { Register the three built-in collations BINARY / NOCASE / RTRIM, then
+    point pDfltColl at the BINARY entry — port of the openDatabase tail in
+    main.c:3515..3519 + the sqlite3SetTextEncoding finalisation.  Without
+    this bootstrap, sqlite3ExprNNCollSeq asserts because db^.pDfltColl is
+    nil (Phase 6.26 ExprCollSeq port surfaced this gap). }
+  createCollation(db, 'BINARY', SQLITE_UTF8,    nil, @binCollFunc, nil);
+  createCollation(db, 'BINARY', SQLITE_UTF16BE, nil, @binCollFunc, nil);
+  createCollation(db, 'BINARY', SQLITE_UTF16LE, nil, @binCollFunc, nil);
+  createCollation(db, 'NOCASE', SQLITE_UTF8,    nil, @nocaseCollatingFunc, nil);
+  createCollation(db, 'RTRIM',  SQLITE_UTF8,    nil, @rtrimCollFunc, nil);
+  if db^.mallocFailed = 0 then
+    db^.pDfltColl := sqlite3FindCollSeq(db, db^.enc, 'BINARY', 0);
 
   sqlite3Error(db, SQLITE_OK);
   rc := SQLITE_OK;
@@ -889,6 +913,64 @@ function sqlite3_create_window_function(db: PTsqlite3; zFunc: PAnsiChar;
 begin
   Result := createFunctionApi(db, zFunc, nArg, enc, pUserData,
               nil, xStep, xFinal, xValue, xInverse, xDestroy);
+end;
+
+{ binCollFunc — main.c:1044.  Default BINARY collation: byte-by-byte memcmp,
+  break tie with length difference. }
+function binCollFunc(NotUsed: Pointer; nKey1: i32; pKey1: Pointer;
+  nKey2: i32; pKey2: Pointer): i32; cdecl;
+var
+  rc, n, i: i32;
+  p1, p2:   PByte;
+begin
+  if nKey1 < nKey2 then n := nKey1 else n := nKey2;
+  Assert((pKey1 <> nil) and (pKey2 <> nil));
+  rc := 0;
+  p1 := PByte(pKey1);
+  p2 := PByte(pKey2);
+  for i := 0 to n - 1 do
+    if p1[i] <> p2[i] then begin
+      rc := i32(p1[i]) - i32(p2[i]);
+      Break;
+    end;
+  if rc = 0 then rc := nKey1 - nKey2;
+  Result := rc;
+end;
+
+{ rtrimCollFunc — main.c:1067.  As BINARY but ignores trailing spaces. }
+function rtrimCollFunc(pUser: Pointer; nKey1: i32; pKey1: Pointer;
+  nKey2: i32; pKey2: Pointer): i32; cdecl;
+var
+  pK1, pK2: PByte;
+begin
+  pK1 := PByte(pKey1);
+  pK2 := PByte(pKey2);
+  while (nKey1 > 0) and (pK1[nKey1 - 1] = Ord(' ')) do Dec(nKey1);
+  while (nKey2 > 0) and (pK2[nKey2 - 1] = Ord(' ')) do Dec(nKey2);
+  Result := binCollFunc(pUser, nKey1, pKey1, nKey2, pKey2);
+end;
+
+{ nocaseCollatingFunc — main.c:1096.  Case-insensitive ASCII compare,
+  English-letter folding only.  Standalone implementation since
+  sqlite3StrNICmp is not yet available in passqlite3util. }
+function nocaseCollatingFunc(NotUsed: Pointer; nKey1: i32; pKey1: Pointer;
+  nKey2: i32; pKey2: Pointer): i32; cdecl;
+var
+  pK1, pK2: PByte;
+  n, i, c1, c2, r: i32;
+begin
+  pK1 := PByte(pKey1);
+  pK2 := PByte(pKey2);
+  if nKey1 < nKey2 then n := nKey1 else n := nKey2;
+  r := 0;
+  for i := 0 to n - 1 do begin
+    c1 := pK1[i]; c2 := pK2[i];
+    if (c1 >= Ord('A')) and (c1 <= Ord('Z')) then c1 := c1 + 32;
+    if (c2 >= Ord('A')) and (c2 <= Ord('Z')) then c2 := c2 + 32;
+    if c1 <> c2 then begin r := c1 - c2; Break; end;
+  end;
+  if r = 0 then r := nKey1 - nKey2;
+  Result := r;
 end;
 
 { createCollation — main.c:2852.  Performs the replace-or-create flow that
