@@ -27091,8 +27091,11 @@ begin
     zSep := ',';
     nSep := 1;
   end;
-  if (pAgg^.flags and MEM_Null) <> 0 then begin
-    { First value }
+  if pAgg^.flags = 0 then begin
+    { First value — sqlite3_aggregate_context zero-fills the buffer; flags=0
+      means we have not yet stored anything.  C uses a custom GroupConcatCtx
+      (func.c:1083) with an fAdd sentinel bit; here we overlay TMem on the
+      buffer and use flags=0 as the "blank" marker. }
     zOut := sqlite3_malloc(nVal + 1);
     if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
     Move(zVal^, zOut^, nVal);

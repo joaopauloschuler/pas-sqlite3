@@ -603,6 +603,29 @@ Important: At the end of this document, please find:
         [ ] `%b` / `%n` printf specifiers — not present in upstream
             printf.c fmtinfo[] (probe artifacts).  Drop from scope.
 
+  [X] **6.10 step 14** Runtime divergences surfaced by the new
+      `src/tests/DiagOps.pas` probe (operators, scalar/agg fns,
+      bitwise / logical / string edges).  Run with
+      `LD_LIBRARY_PATH=$PWD/src bin/DiagOps`.  Initial sweep
+      (60 cases) reported 8 divergences; 6 fold into already-tracked
+      gaps (ORDER BY / multi-row VALUES / DISTINCT-agg / HAVING).
+      [X] **a) `group_concat(a)` prepended a spurious `"0.0"` to the
+        result** — fixed 2026-04-28.  `groupConcatStep`
+        (codegen.pas:27074) overlays `TMem` on the
+        `sqlite3_aggregate_context` buffer (zero-filled on first call)
+        and used `(flags and MEM_Null) <> 0` as the "first value"
+        sentinel.  But a freshly zeroed buffer has `flags = 0`
+        (no bits set), not `MEM_Null = $0001`, so the first call took
+        the *append* branch and read 0-byte text from the
+        uninitialised Mem — `sqlite3_value_text` on flags=0 rendered
+        REAL `0.0`.  Replaced sentinel with `flags = 0`; subsequent
+        calls have MEM_Str set so they correctly take the append
+        branch.  Verified DiagOps `group_concat` /
+        `group_concat(a,'-')` → PASS.  No regression in
+        TestExplainParity (1016/10), TestVdbeAgg / TestSelectBasic /
+        TestParser / TestDMLBasic / TestSchemaBasic / TestWhereBasic /
+        TestVdbeRecord all green.
+
   [X] **6.10 step 13** Runtime divergences surfaced by the new
       `src/tests/DiagCast.pas` probe (CAST expressions + type-affinity
       coercion).  Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagCast`.
