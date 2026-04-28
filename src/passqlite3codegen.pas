@@ -2959,6 +2959,7 @@ implementation
 
 uses
   DateUtils,
+  Math,
   passqlite3printf,
   passqlite3json,
   passqlite3jsoneach,
@@ -7295,11 +7296,18 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           Exit;
         end;
       end;
-      { Unresolved bare identifier — leave as TK_ID; downstream
-        codegen will refuse the trivial gate and fall back to the
-        SQLITE_OK no-body stub.  No error msg yet — Phase 6.x will
-        wire sqlite3ErrorMsg("no such column: %s") here. }
+      { Unresolved bare identifier — try TK_ID → TK_TRUEFALSE rewrite
+        (resolve.c:747).  Otherwise leave as TK_ID; downstream codegen
+        will refuse the trivial gate and fall back to the SQLITE_OK
+        no-body stub. }
+      sqlite3ExprIdToTrueFalse(pE);
       Exit;
+    end;
+    { No FROM clause — still attempt the TK_ID → TK_TRUEFALSE rewrite
+      so bare `SELECT TRUE` / `SELECT FALSE` resolve. }
+    if pE^.op = TK_ID then
+    begin
+      sqlite3ExprIdToTrueFalse(pE);
     end;
     ResolveExpr(pE^.pLeft);
     ResolveExpr(pE^.pRight);
@@ -25697,26 +25705,56 @@ var
     C printf semantics for %f / %e / %E / %g / %G via FloatToStrF.  When no
     width or precision is given, fall back to FloatToStr for natural %g-like
     output (matches the previous behaviour for unadorned specifiers). }
+  { C-style %e/%E render: 1 digit . prec digits e±NN.  prec defaults to 6
+    when not specified.  Matches `printf("%e",1234.5)` → "1.234500e+03". }
+  function FmtSciE(v: Double; prec: i32; upper: Boolean): AnsiString;
+  var
+    expN: i32;
+    mant: Double;
+    s, expStr, mantStr: AnsiString;
+    expSign: AnsiChar;
+  begin
+    if v = 0 then begin
+      mant := 0; expN := 0;
+    end else begin
+      expN := Trunc(Ln(Abs(v)) / Ln(10));
+      mant := v / Power(10.0, expN);
+      while Abs(mant) >= 10 do begin mant := mant / 10; Inc(expN); end;
+      while Abs(mant) < 1   do begin mant := mant * 10; Dec(expN); end;
+    end;
+    mantStr := FloatToStrF(mant, ffFixed, 15, prec);
+    if expN < 0 then begin expSign := '-'; expN := -expN; end
+    else expSign := '+';
+    expStr := IntToStr(expN);
+    if Length(expStr) < 2 then expStr := '0' + expStr;
+    if upper then s := mantStr + 'E' + expSign + expStr
+    else          s := mantStr + 'e' + expSign + expStr;
+    Result := s;
+  end;
+
   function FmtFloat(spec: AnsiChar; v: Double): AnsiString;
   var
     fmt: TFloatFormat;
     digits, prec: i32;
   begin
-    if (not metaHaveWidth) and (not metaHavePrec) then begin
-      Result := FloatToStr(v); Exit;
+    if (spec = 'e') or (spec = 'E') then begin
+      if metaHavePrec then prec := metaPrec else prec := 6;
+      Result := FmtSciE(v, prec, spec = 'E');
+    end else begin
+      if (not metaHaveWidth) and (not metaHavePrec) and (spec <> 'f') then begin
+        Result := FloatToStr(v);
+      end else begin
+        case spec of
+          'f': begin fmt := ffFixed;    if metaHavePrec then prec := metaPrec else prec := 6; end;
+        else
+          begin fmt := ffGeneral; if metaHavePrec then prec := metaPrec else prec := 15; end;
+        end;
+        if fmt = ffFixed then digits := prec
+        else digits := prec;
+        Result := FloatToStrF(v, fmt, 15, digits);
+        if (spec = 'G') then Result := UpperCase(Result);
+      end;
     end;
-    case spec of
-      'f': begin fmt := ffFixed;    if metaHavePrec then prec := metaPrec else prec := 6; end;
-      'e': begin fmt := ffExponent; if metaHavePrec then prec := metaPrec else prec := 6; end;
-      'E': begin fmt := ffExponent; if metaHavePrec then prec := metaPrec else prec := 6; end;
-    else
-      begin fmt := ffGeneral; if metaHavePrec then prec := metaPrec else prec := 15; end;
-    end;
-    if fmt = ffFixed then digits := prec
-    else if fmt = ffExponent then digits := prec
-    else digits := prec;
-    Result := FloatToStrF(v, fmt, 15, digits);
-    if (spec = 'E') or (spec = 'G') then Result := UpperCase(Result);
     if metaHaveWidth and (Length(Result) < metaWidth) then begin
       if Pos('-', metaFlags) > 0 then
         Result := Result + StringOfChar(' ', metaWidth - Length(Result))
@@ -25725,6 +25763,49 @@ var
       else
         Result := StringOfChar(' ', metaWidth - Length(Result)) + Result;
     end;
+  end;
+
+  { Apply width / flag padding to an integer-shaped digit string.
+    sign is '+' / '-' / #0 indicating any explicit sign that must hug the
+    digits when zero-pad is in effect. }
+  function ApplyIntWidth(const digits: AnsiString; sign: AnsiChar): AnsiString;
+  var
+    body: AnsiString;
+    pad:  i32;
+  begin
+    if sign <> #0 then body := sign + digits else body := digits;
+    if (not metaHaveWidth) or (Length(body) >= metaWidth) then
+    begin
+      Result := body; Exit;
+    end;
+    pad := metaWidth - Length(body);
+    if Pos('-', metaFlags) > 0 then
+      Result := body + StringOfChar(' ', pad)
+    else if (Pos('0', metaFlags) > 0) and not metaHavePrec then
+    begin
+      { zero-pad keeps the sign at the front, zeroes after }
+      if sign <> #0 then
+        Result := sign + StringOfChar('0', pad) + digits
+      else
+        Result := StringOfChar('0', pad) + digits;
+    end else
+      Result := StringOfChar(' ', pad) + body;
+  end;
+
+  function FmtSignedInt(v: i64): AnsiString;
+  var
+    sign: AnsiChar;
+    digits: AnsiString;
+  begin
+    if v < 0 then begin
+      sign := '-'; digits := IntToStr(u64(-v));
+    end else begin
+      digits := IntToStr(v);
+      if Pos('+', metaFlags) > 0 then sign := '+'
+      else if Pos(' ', metaFlags) > 0 then sign := ' '
+      else sign := #0;
+    end;
+    Result := ApplyIntWidth(digits, sign);
   end;
 
   { Append s to result_ }
@@ -25798,31 +25879,31 @@ begin
         Inc(p);
         if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
         else v64 := 0;
-        App(IntToStr(v64));
+        App(FmtSignedInt(v64));
       end;
       'u': begin
         Inc(p);
         if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
         else v64 := 0;
-        App(IntToStr(u64(v64)));
+        App(ApplyIntWidth(IntToStr(u64(v64)), #0));
       end;
       'x': begin
         Inc(p);
         if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
         else v64 := 0;
-        App(HexStr(u64(v64), False));
+        App(ApplyIntWidth(HexStr(u64(v64), False), #0));
       end;
       'X': begin
         Inc(p);
         if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
         else v64 := 0;
-        App(HexStr(u64(v64), True));
+        App(ApplyIntWidth(HexStr(u64(v64), True), #0));
       end;
       'o': begin
         Inc(p);
         if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
         else v64 := 0;
-        App(OctStr(u64(v64)));
+        App(ApplyIntWidth(OctStr(u64(v64)), #0));
       end;
       'f', 'e', 'E', 'g', 'G': begin
         Inc(p);
@@ -25838,12 +25919,44 @@ begin
         end;
       end;
       'c': begin
+        { %c — first UTF-8 character of textified arg per printf.c:752..761
+          (bArgList branch).  Function-call printf walks PrintfArguments,
+          which always takes the etCHARX branch through getTextArg. }
         Inc(p);
-        if pVal <> nil then
-          result_ := result_ + AnsiChar(sqlite3_value_int(Psqlite3_value(pVal)) and $FF);
+        if pVal <> nil then begin
+          zStr := sqlite3_value_text(Psqlite3_value(pVal));
+          if (zStr <> nil) and (zStr^ <> #0) then begin
+            result_ := result_ + zStr^;
+            if (Byte(zStr^) and $C0) = $C0 then begin
+              Inc(zStr); i := 1;
+              while (i < 4) and ((Byte(zStr^) and $C0) = $80) do begin
+                result_ := result_ + zStr^; Inc(zStr); Inc(i);
+              end;
+            end;
+          end;
+        end;
       end;
       'q': begin
-        { %q — wrap text in single-quotes, doubling internal single-quotes }
+        { %q — double internal single-quotes; do NOT add outer quotes.
+          NULL → "(NULL)" per printf.c:861. }
+        Inc(p);
+        if pVal <> nil then begin
+          if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then
+            App('(NULL)')
+          else begin
+            zStr := sqlite3_value_text(Psqlite3_value(pVal));
+            if zStr = nil then zStr := '';
+            s := AnsiString(zStr);
+            for i := 1 to Length(s) do begin
+              if s[i] = '''' then result_ := result_ + '''';
+              result_ := result_ + s[i];
+            end;
+          end;
+        end;
+      end;
+      'Q': begin
+        { %Q — wrap in single-quotes, doubling internal '.
+          NULL → "NULL" (no quotes) per printf.c:861. }
         Inc(p);
         if pVal <> nil then begin
           if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then

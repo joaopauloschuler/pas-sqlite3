@@ -418,7 +418,8 @@ Important: At the end of this document, please find:
   [ ] **6.10 step 12** Runtime divergences surfaced by the new
       `src/tests/DiagMoreFunc.pas` probe (built-in functions / expression
       edges).  Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagMoreFunc`.
-      Initial run 2026-04-28 reported 27 divergences; sub-tasks below.
+      Initial run 2026-04-28 reported 27 divergences; 17 remain after
+      fixes to TRUE/FALSE, printf width/flags, %e, %c, %q, %Q.
       [ ] **a) Default arm of `sqlite3ExprCodeTarget` emits OP_Null
         for TK_BETWEEN / TK_IN / TK_AND / TK_OR.**  Affects scalar
         evaluation of `5 BETWEEN 1 AND 10`, `3 IN (1,2,3)`, `NOT
@@ -429,11 +430,15 @@ Important: At the end of this document, please find:
         short-circuit emit; TK_BETWEEN dispatches to
         `exprCodeBetween` with destIfFalse->target=0; TK_IN goes
         through `sqlite3ExprCodeIN`).
-      [ ] **b) `TRUE` / `FALSE` keyword literals return NULL.**
-        `SELECT TRUE` yields type 5 (NULL).  Likely the parser
-        produces TK_TRUEFALSE but the resolver / codeExpr path
-        loses it under no-FROM / no-resolve branch.  Verify via
-        EXPLAIN whether the AST node is TK_TRUEFALSE or TK_ID.
+      [X] **b) `TRUE` / `FALSE` keyword literals return NULL.**
+        Fixed 2026-04-28.  `SELECT TRUE` lands at parse time as a bare
+        TK_ID whose TK_TRUEFALSE rewrite (resolve.c:747) was only
+        triggered when the resolver had a non-nil pSrc.  Now
+        `sqlite3ExprIdToTrueFalse` is also invoked at the no-FROM /
+        no-column-match tail of ResolveExpr (codegen.pas:7298 +
+        the new bare-TK_ID arm right after).  DiagMoreFunc TRUE /
+        FALSE → PASS; TestExplainParity unchanged (1012 pass / 14
+        diverge).
       [ ] **c) Math functions not registered.**  `sqrt`, `exp`,
         `ln`, `pow`, `sin`, `cos`, `floor`, `ceil`, `pi` (and all
         of `func.c:mathRoll[]`) prepare-fail on Pas with
@@ -442,24 +447,22 @@ Important: At the end of this document, please find:
         gated on SQLITE_ENABLE_MATH_FUNCTIONS — flag is on per
         `passqlite3.inc`.  Port the table + helper functions and
         wire from `sqlite3RegisterBuiltinFunctions`.
-      [ ] **d) printf/format width / flag specifiers ignored.**
-        `%05d` (zero-pad width) drops the pad → "7" not "00007";
-        `%-5d` left-align ignored; `%+d` for positives drops the
-        '+'; `%c` emits the char *value* but with int=6 (mis-parsed
-        as %c06); `%e` falls back to `%g`-style render.  Tracked
-        as a follow-on to 6.10 step 10(d) (previously fixed `%.2f`
-        — only precision was wired); now extend `SkipFmtMeta` /
-        `FmtFloat` / `FmtInt` to honour width, '0' flag, '-' flag,
-        '+' flag, and the `%e/%E/%c` specifier dispatch.  Mirrors
-        the sqlite3_str_vappendf flag set in printf.c:235..530.
-      [ ] **e) printf %q drops outer quotes; %Q not implemented.**
-        `printf('%q', 'it''s')` returns `'it''s'` on Pas vs
-        `it''s` on C — the C `%q` doubles single quotes but does
-        NOT add outer single quotes (printf.c:760..771); Pas wraps
-        unconditionally.  `printf('%Q', 'hi')` returns `%Q`
-        verbatim — entirely unimplemented; C returns `'hi'`
-        (printf.c:773..786).  `printf('%Q', NULL)` should emit
-        `NULL`.  Port both arms from printf.c.
+      [X] **d) printf/format width / flag specifiers** — fixed
+        2026-04-28.  Added `ApplyIntWidth` / `FmtSignedInt` helpers
+        that honour width / '-' / '0' / '+' / ' ' flags for integer
+        specifiers (d/i/u/x/X/o); rewrote `FmtFloat` so %e/%E always
+        take the scientific-notation arm via the new `FmtSciE` helper
+        (mantissa with `prec` fractional digits, lowercase/upper
+        'e±NN' with 2-digit minimum exponent — matches printf.c
+        et_EXP behaviour).  `%c` now mirrors printf.c:752..761 by
+        copying the first UTF-8 character of the textified arg
+        (printf invoked via SQL function takes the bArgList branch).
+        DiagMoreFunc %05d / %-5d / %+d / %e / %c → PASS.
+      [X] **e) printf %q drops outer quotes; %Q not implemented**
+        — fixed 2026-04-28.  `%q` no longer wraps in outer quotes
+        (just doubles internal `'`, NULL → "(NULL)" per printf.c:861);
+        `%Q` arm added (wraps in outer quotes, NULL → "NULL").
+        DiagMoreFunc %q / %Q str / %Q null → PASS.
       [ ] **f) Aggregate-no-FROM no-row.**  `SELECT count(*)` /
         `SELECT sum(5)` step to DONE without producing a row.
         Same root cause as 6.10 step 7(c) — agg-no-GROUP gate at
