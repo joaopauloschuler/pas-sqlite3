@@ -26056,9 +26056,10 @@ end;
 procedure sqlite3InsertBuiltinFuncs(aFunc: Pointer; nFunc: i32);
 var
   aDef: PTFuncDef;
-  i, h, nName: i32;
-  pOther: PTFuncDef;
+  i, h, nName, guard: i32;
+  pOther, pWalk: PTFuncDef;
   zName: PAnsiChar;
+  alreadyLinked: Boolean;
 begin
   aDef := PTFuncDef(aFunc);
   for i := 0 to nFunc - 1 do begin
@@ -26066,6 +26067,21 @@ begin
     nName  := sqlite3Strlen30(zName);
     h      := (Ord(sqlite3UpperToLower[u8(zName^)]) + nName) mod SQLITE_FUNC_HASH_SZ;
     pOther := sqlite3FunctionSearch(h, zName);
+    { Defensive idempotence: if aDef[i] is already linked in the variant
+      chain rooted at pOther, skip.  Re-registration of the same module-
+      static array (e.g. test harness re-calling sqlite3RegisterDateTimeFunctions)
+      would otherwise self-loop pNext via `pOther^.pNext := @aDef[i]`,
+      hanging sqlite3FindFunction.  C asserts pOther!=&aDef[i] &&
+      pOther^.pNext!=&aDef[i] in debug builds; we degrade gracefully. }
+    alreadyLinked := False;
+    pWalk := pOther;
+    guard := 0;
+    while (pWalk <> nil) and (guard < 4096) do begin
+      if pWalk = @aDef[i] then begin alreadyLinked := True; break; end;
+      pWalk := PTFuncDef(pWalk^.pNext);
+      Inc(guard);
+    end;
+    if alreadyLinked then continue;
     if pOther <> nil then begin
       aDef[i].pNext := pOther^.pNext;
       pOther^.pNext := @aDef[i];
@@ -28395,11 +28411,18 @@ function sqlite3IsLikeFunction(db: PTsqlite3; pExpr: PExpr;
 var
   pDef: PTFuncDef;
   zName: PAnsiChar;
+  nExpr: i32;
 begin
   if pExpr^.op <> TK_FUNCTION then begin Result := 0; Exit; end;
   zName := PAnsiChar(pExpr^.u.zToken);
   if zName = nil then begin Result := 0; Exit; end;
-  pDef := sqlite3FindFunction(db, zName, -1, SQLITE_UTF8, 0);
+  { func.c sqlite3IsLikeFunction uses the actual argument count from
+    pExpr->x.pList->nExpr, not -1.  matchQuality returns 0 for arity
+    mismatches, so calling FindFunction with -1 against a 2-arg builtin
+    'like' yields nil and the LIKE optimisation is silently disabled. }
+  if (pExpr^.x.pList <> nil) then nExpr := pExpr^.x.pList^.nExpr
+  else nExpr := 2;
+  pDef := sqlite3FindFunction(db, zName, nExpr, SQLITE_UTF8, 0);
   if (pDef = nil) or ((pDef^.funcFlags and SQLITE_FUNC_LIKE) = 0) then begin
     Result := 0; Exit;
   end;

@@ -319,43 +319,30 @@ Important: At the end of this document, please find:
         Full table-driven `pragmaLocate` dispatch still deferred
         under 6.12.
 
-  [ ] **6.10 step 16** Regressions surfaced by full-suite sweep on 2026-04-28.
-      Both reproduce on current HEAD (a3, after 7b807ec).
-      [ ] **a) TestAuthBuiltins hangs around T9-T10** — T8 reports
-        `FAIL FindFunction "abs" found`, then the run hangs.  Tested
-        2026-04-28: TestAuthBuiltins does NOT call `sqlite3_initialize`
-        (sqlite3MallocZero in passqlite3os.pas:714 is a plain GetMem+
-        FillChar — does not pull init).  So
-        `sqlite3RegisterBuiltinFunctions` is invoked exactly once at
-        line 123, not twice.  The earlier "double-registration self-loop"
-        diagnosis is wrong.  Adding a once-flag at the top of
-        `sqlite3RegisterBuiltinFunctions` (verified locally — reverted)
-        does not change the symptom: T8 still FAILs and the chain at
-        slot 22 still hangs at T9/T10.  Real root cause must therefore
-        live inside the single first-time path through
-        `sqlite3InsertBuiltinFuncs(@aBuiltinFuncs)` →
-        `sqlite3InsertBuiltinFuncs(@aBuiltinAgg)` →
-        `sqlite3RegisterJsonFunctions` →
-        `sqlite3RegisterDateTimeFunctions`.  Likely candidate: a name
-        collision between an `aBuiltinFuncs` and `aJsonFunc`/`aDateFuncs`
-        entry (both inserted into the same global hash) wiring an
-        unintended `pNext` cycle, OR a stale `u`/`pNext` link in
-        `aBuiltinFuncs[]` left over from a prior test run that loaded the
-        same FPC binary's globals (FPC initialises module-level arrays
-        to zero only at process start).  Needs an instrumented walk of
-        `sqlite3BuiltinFunctions.a[22]` after registration to localise.
-      [ ] **b) TestWhereExpr T14a..T14i FAIL + access violation** — LIKE
-        virtual-term synthesis no longer fires for the synthetic
-        TK_FUNCTION 'like' built directly in the test (line 491..506).
-        `sqlite3IsLikeFunction` returns 0, so `isLikeOrGlob` early-exits
-        and the GE/LT children are never inserted.  T14j dereferences
-        `pWC^.a[iLikeIdx + 1].pExpr^.pRight` and EAccessViolation results
-        because the children don't exist.  Test was reported 84/84 in
-        commit 1235bd0; today reports 62 PASS / 9 FAIL.  Likely related
-        to (a) — the corrupted FuncDef chain may also affect db^.aFunc
-        or sqlite3BuiltinFunctions for the `like` lookup.  Investigate
-        after (a) lands.  Also: T14j..T14l should bail when T14i fails
-        rather than blind-deref.
+  [X] **6.10 step 16** Regressions surfaced by full-suite sweep on 2026-04-28
+      — both closed 2026-04-28.
+      [X] **a) TestAuthBuiltins hangs** — closed.  Root cause:
+        TestAuthBuiltins.pas:124 calls `sqlite3RegisterDateTimeFunctions`
+        explicitly, but `sqlite3RegisterBuiltinFunctions` (called at
+        line 123) already calls it transitively (codegen.pas).  The
+        second `sqlite3InsertBuiltinFuncs(@aDateFuncs)` finds each
+        aDateFuncs[i] already in its bucket (functionSearch returns
+        `&aDateFuncs[i]` — itself), then `pOther^.pNext := @aDef[i]`
+        wires `aDateFuncs[i].pNext := &aDateFuncs[i]` — a self-loop
+        that hangs sqlite3FindFunction's variant-chain walk at slot 22.
+        Same mechanism corrupts slot 8 (strftime collides with abs/avg).
+        Fix: defensive idempotence in `sqlite3InsertBuiltinFuncs` —
+        walk the variant chain rooted at pOther; if `&aDef[i]` is
+        already linked, skip.  C asserts `pOther!=&aDef[i] &&
+        pOther->pNext!=&aDef[i]` in debug; we degrade gracefully.
+        Verified: 34/0 PASS.
+      [X] **b) TestWhereExpr T14a..T14i FAIL** — closed.  Independent
+        bug: `sqlite3IsLikeFunction` (codegen.pas) called
+        `sqlite3FindFunction(db, zName, -1, ...)`, but matchQuality
+        returns 0 for arity mismatch when `p^.nArg >= 0`.  C version
+        (func.c) passes `pExpr->x.pList->nExpr` (actual arg count),
+        not -1.  Fix: read nExpr from pExpr^.x.pList^.nExpr.
+        Verified: 84/84 PASS.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
