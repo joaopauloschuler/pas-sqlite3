@@ -343,12 +343,18 @@ function sqlite3_system_errno(db: PTsqlite3): i32; cdecl;
 
 function sqlite3_get_autocommit(db: PTsqlite3): i32; cdecl;
 function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;
+function sqlite3_txn_state(db: PTsqlite3; zSchema: PAnsiChar): i32; cdecl;
+function sqlite3_error_offset(db: PTsqlite3): i32; cdecl;
+function sqlite3_limit(db: PTsqlite3; limitId: i32; newLimit: i32): i32; cdecl;
 
 function sqlite3_sleep(ms: i32): i32; cdecl;
 
 function sqlite3_release_memory(n: i32): i32; cdecl;
 function sqlite3_memory_highwater(resetFlag: i32): i64; cdecl;
 function sqlite3_msize(p: Pointer): u64; cdecl;
+function sqlite3_soft_heap_limit64(n: i64): i64; cdecl;
+function sqlite3_hard_heap_limit64(n: i64): i64; cdecl;
+procedure sqlite3_soft_heap_limit(n: i32); cdecl;
 
 implementation
 
@@ -2415,6 +2421,62 @@ begin
   Result := sqlite3BtreeIsReadonly(PBtree(pBt));
 end;
 
+{ main.c — sqlite3_txn_state. }
+function sqlite3_txn_state(db: PTsqlite3; zSchema: PAnsiChar): i32; cdecl;
+var
+  iDb, nDb, x, iTxn: i32;
+  pBt: Pointer;
+begin
+  iTxn := -1;
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := -1; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  if zSchema <> nil then begin
+    iDb := sqlite3FindDbName(db, zSchema);
+    nDb := iDb;
+    if iDb < 0 then nDb := -1;
+  end else begin
+    iDb := 0;
+    nDb := db^.nDb - 1;
+  end;
+  while iDb <= nDb do begin
+    pBt := db^.aDb[iDb].pBt;
+    if pBt <> nil then begin
+      x := sqlite3BtreeTxnState(PBtree(pBt));
+      if x > iTxn then iTxn := x;
+    end;
+    Inc(iDb);
+  end;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := iTxn;
+end;
+
+{ main.c — sqlite3_error_offset. }
+function sqlite3_error_offset(db: PTsqlite3): i32; cdecl;
+begin
+  if (db <> nil) and (db^.errCode <> 0) and (db^.errByteOffset >= 0) then
+    Result := db^.errByteOffset
+  else
+    Result := -1;
+end;
+
+{ main.c — sqlite3_limit.  Mirrors aHardLimit clamp + LENGTH floor. }
+function sqlite3_limit(db: PTsqlite3; limitId: i32; newLimit: i32): i32; cdecl;
+var
+  oldLimit: i32;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := -1; Exit; end;
+  if (limitId < 0) or (limitId >= Length(aHardLimit)) then begin
+    Result := -1; Exit;
+  end;
+  oldLimit := db^.aLimit[limitId];
+  if newLimit >= 0 then begin
+    if newLimit > aHardLimit[limitId] then newLimit := aHardLimit[limitId];
+    if (limitId = 0) and (newLimit < 100) then newLimit := 100;  { SQLITE_LIMIT_LENGTH floor }
+    db^.aLimit[limitId] := newLimit;
+  end;
+  Result := oldLimit;
+end;
+
 function sqlite3_sleep(ms: i32): i32; cdecl;
 var
   pVfs: Psqlite3_vfs;
@@ -2447,6 +2509,38 @@ function sqlite3_msize(p: Pointer): u64; cdecl;
 begin
   if p = nil then Result := 0
   else Result := u64(MemSize(p));
+end;
+
+{ malloc.c — soft/hard heap-limit accessors.  SQLITE_ENABLE_MEMORY_MANAGEMENT
+  is off in this build, so the no-op return path is the upstream contract:
+  return the previously-set limit (kept in unit-level state) without
+  installing a real alarm. }
+var
+  gSoftHeapLimit: i64 = 0;
+  gHardHeapLimit: i64 = 0;
+
+function sqlite3_soft_heap_limit64(n: i64): i64; cdecl;
+var
+  prior: i64;
+begin
+  prior := gSoftHeapLimit;
+  if n >= 0 then gSoftHeapLimit := n;
+  Result := prior;
+end;
+
+function sqlite3_hard_heap_limit64(n: i64): i64; cdecl;
+var
+  prior: i64;
+begin
+  prior := gHardHeapLimit;
+  if n >= 0 then gHardHeapLimit := n;
+  Result := prior;
+end;
+
+procedure sqlite3_soft_heap_limit(n: i32); cdecl;
+begin
+  if n < 0 then n := 0;
+  sqlite3_soft_heap_limit64(i64(n));
 end;
 
 initialization

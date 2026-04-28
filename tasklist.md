@@ -501,7 +501,9 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             typed wrappers `_text`/`_lookaside`/`_int` exist).
        [X] `sqlite3_get_autocommit` (main.c:3936) — ported 2026-04-28
             (passqlite3main.pas) — returns db^.autoCommit.
-       [ ] `sqlite3_txn_state` (main.c) — `SQLITE_TXN_NONE / READ / WRITE`.
+       [X] `sqlite3_txn_state` (main.c) — ported 2026-04-28
+            (passqlite3main.pas) — folds sqlite3BtreeTxnState across
+            db^.aDb[].
        [ ] `sqlite3_filename` / `sqlite3_free_filename` — VFS filename
             helpers.
        [ ] `sqlite3_set_clientdata` — typed pointer slots on the db.
@@ -558,7 +560,9 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             `sqlite3_extended_result_codes` — ported 2026-04-28
             (passqlite3main.pas).
        [ ] `sqlite3_set_errmsg` — overwrite db^.pErr.
-       [ ] `sqlite3_error_offset` — byte offset of the error in zSql.
+       [X] `sqlite3_error_offset` — ported 2026-04-28
+            (passqlite3main.pas) — returns db^.errByteOffset when an
+            error is pending, else -1.
        [X] `sqlite3_system_errno` — ported 2026-04-28
             (passqlite3main.pas) — db^.iSysErrno.
        [X] `sqlite3_libversion_number` — ported 2026-04-28
@@ -576,8 +580,12 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             off in build), matching upstream OMIT path.
        [X] `sqlite3_memory_highwater` — ported 2026-04-28
             (passqlite3main.pas) via sqlite3_status64.
-       [ ] `sqlite3_soft_heap_limit64` / `sqlite3_hard_heap_limit64`.
-       [ ] `sqlite3_limit` — per-db SQLITE_LIMIT_* getter/setter.
+       [X] `sqlite3_soft_heap_limit64` / `sqlite3_hard_heap_limit64` /
+            `sqlite3_soft_heap_limit` — ported 2026-04-28
+            (passqlite3main.pas).  Memory-management is off in this
+            build, so the no-op return path matches upstream malloc.c.
+       [X] `sqlite3_limit` — ported 2026-04-28 (passqlite3main.pas) —
+            full body with aHardLimit clamp + LENGTH 100-floor.
        [ ] `sqlite3_uri_int64` — URI-parameter integer accessor.
        [ ] `sqlite3_compileoption_used` (ctime.c) — also gated on the
             6.10 step 12 task that touches the compile-options table.

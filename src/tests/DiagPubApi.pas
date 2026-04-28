@@ -87,6 +87,60 @@ begin
   Check('db_readonly bogus = -1',
         sqlite3_db_readonly(db, 'no_such_db') = -1);
 
+  { txn_state — fresh connection has no transaction on any attached db. }
+  Check('txn_state main = NONE',
+        sqlite3_txn_state(db, 'main') = 0);
+  Check('txn_state nil(any) = NONE',
+        sqlite3_txn_state(db, nil) = 0);
+  Check('txn_state bogus = -1',
+        sqlite3_txn_state(db, 'no_such_db') = -1);
+  Check('txn_state(nil db) = -1',
+        sqlite3_txn_state(nil, nil) = -1);
+
+  { error_offset — no error pending → -1. }
+  Check('error_offset fresh = -1',
+        sqlite3_error_offset(db) = -1);
+  Check('error_offset(nil) = -1',
+        sqlite3_error_offset(nil) = -1);
+
+  { sqlite3_limit — get current, set, reread, clamp behaviour. }
+  Check('limit LENGTH default = 1e9',
+        sqlite3_limit(db, 0, -1) = 1000000000);
+  Check('limit LENGTH set 50000',
+        sqlite3_limit(db, 0, 50000) = 1000000000);
+  Check('limit LENGTH read back',
+        sqlite3_limit(db, 0, -1) = 50000);
+  { LENGTH floor at 100. }
+  Check('limit LENGTH floor=100',
+        sqlite3_limit(db, 0, 1) = 50000);
+  Check('limit LENGTH read after floor',
+        sqlite3_limit(db, 0, -1) = 100);
+  { Out-of-range limitId. }
+  Check('limit bogus id = -1',
+        sqlite3_limit(db, 999, -1) = -1);
+  Check('limit nil db = -1',
+        sqlite3_limit(nil, 0, -1) = -1);
+  { Hard-cap: passing huge value clamps to aHardLimit. }
+  Check('limit LENGTH clamp big',
+        sqlite3_limit(db, 0, $7FFFFFFF) = 100);
+  Check('limit LENGTH clamped read',
+        sqlite3_limit(db, 0, -1) = 1000000000);
+
+  { soft/hard heap-limit accessors return prior value, store new. }
+  Check('soft_heap_limit64 init = 0',
+        sqlite3_soft_heap_limit64(-1) = 0);
+  Check('soft_heap_limit64 set 1MB',
+        sqlite3_soft_heap_limit64(1 shl 20) = 0);
+  Check('soft_heap_limit64 read back',
+        sqlite3_soft_heap_limit64(-1) = (1 shl 20));
+  Check('hard_heap_limit64 init = 0',
+        sqlite3_hard_heap_limit64(-1) = 0);
+  Check('hard_heap_limit64 set 2MB',
+        sqlite3_hard_heap_limit64(2 shl 20) = 0);
+  sqlite3_soft_heap_limit(0);
+  Check('soft_heap_limit(0) clears',
+        sqlite3_soft_heap_limit64(-1) = 0);
+
   { Misuse / nil paths. }
   Check('errcode(nil) = NOMEM', sqlite3_errcode(nil) = SQLITE_NOMEM);
   Check('changes(nil) = 0', sqlite3_changes(nil) = 0);
