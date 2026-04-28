@@ -1474,12 +1474,16 @@ type
   TUnlinkAndDeleteFn = procedure(db: PTsqlite3; iDb: i32; zName: PAnsiChar);
   TRootPageMovedFn   = procedure(db: PTsqlite3; iDb: i32; iFrom, iTo: i32);
   TSetP4KeyInfoFn    = procedure(pParse: PParse; pIdx: PIndex);
+  TResetOneSchemaFn  = procedure(db: PTsqlite3; iDb: i32);
+  TResetAllSchemasFn = procedure(db: PTsqlite3);
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteTrigger: TUnlinkAndDeleteFn;
   gRootPageMoved:          TRootPageMovedFn;
   gSetP4KeyInfo:           TSetP4KeyInfoFn;
+  gResetOneSchema:         TResetOneSchemaFn;
+  gResetAllSchemas:        TResetAllSchemasFn;
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
@@ -4506,7 +4510,8 @@ end;
 
 procedure sqlite3ResetOneSchema(db: Pointer; iDb: i32);
 begin
-  { Stub — Phase 6 }
+  if Assigned(gResetOneSchema) then
+    gResetOneSchema(PTsqlite3(db), iDb);
 end;
 
 { Implement sqlite3VdbeFrameRestore properly (vdbeaux.c:2812) }
@@ -9779,7 +9784,10 @@ procedure sqlite3FkClearTriggerCache(db: PTsqlite3; iDb: i32);
 begin { Stub: FK trigger cache requires Phase 6 } end;
 
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
-begin { Stub: schema reset requires Phase 6 } end;
+begin
+  if Assigned(gResetAllSchemas) then
+    gResetAllSchemas(db);
+end;
 
 function sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 begin Result := 1; end;  { Always held in single-connection mode }

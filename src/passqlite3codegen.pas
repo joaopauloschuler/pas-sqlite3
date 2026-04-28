@@ -2628,6 +2628,7 @@ procedure sqlite3DefaultRowEst(pIdx: PIndex2);
 
 { Schema reset }
 procedure sqlite3CollapseDatabaseArray(db: PTsqlite3);
+procedure sqlite3ResetOneSchema(db: PTsqlite3; iDb: i32);
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 procedure sqlite3CommitInternalChanges(db: PTsqlite3);
 
@@ -20885,20 +20886,78 @@ begin
   end;
 end;
 
+{ build.c:599 — collapse the aDb[] array, dropping any detached entries
+  past index 1.  Entries 0 (main) and 1 (temp) are never collapsed. }
 procedure sqlite3CollapseDatabaseArray(db: PTsqlite3);
+var
+  i, j: i32;
+  pDx:  passqlite3util.PDb;
 begin
-  { Phase 7 }
+  i := 2; j := 2;
+  while i < db^.nDb do begin
+    pDx := @db^.aDb[i];
+    if pDx^.pBt = nil then begin
+      sqlite3DbFree(db, pDx^.zDbSName);
+      pDx^.zDbSName := nil;
+    end else begin
+      if j < i then
+        db^.aDb[j] := db^.aDb[i];
+      Inc(j);
+    end;
+    Inc(i);
+  end;
+  db^.nDb := j;
+  if (db^.nDb <= 2) and (db^.aDb <> @db^.aDbStatic[0]) then begin
+    Move(db^.aDb[0], db^.aDbStatic[0], 2 * SizeOf(TDb));
+    sqlite3DbFree(db, db^.aDb);
+    db^.aDb := @db^.aDbStatic[0];
+  end;
 end;
 
+{ build.c:650 — erase all schema info from all attached databases. }
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
+var
+  i:   i32;
+  pDx: passqlite3util.PDb;
+begin
+  sqlite3BtreeEnterAll(db);
+  for i := 0 to db^.nDb - 1 do begin
+    pDx := @db^.aDb[i];
+    if pDx^.pSchema <> nil then begin
+      if db^.nSchemaLock = 0 then
+        sqlite3SchemaClear(pDx^.pSchema)
+      else
+        db^.aDb[i].pSchema^.schemaFlags := db^.aDb[i].pSchema^.schemaFlags or u16(DB_ResetWanted);
+    end;
+  end;
+  db^.mDbFlags := db^.mDbFlags and not u32(DBFLAG_SchemaChange or DBFLAG_SchemaKnownOk);
+  sqlite3VtabUnlockList(db);
+  sqlite3BtreeLeaveAll(db);
+  if db^.nSchemaLock = 0 then
+    sqlite3CollapseDatabaseArray(db);
+end;
+
+{ build.c:625 — reset schema for a single attached database (also temp). }
+procedure sqlite3ResetOneSchema(db: PTsqlite3; iDb: i32);
 var
   i: i32;
 begin
-  for i := 0 to db^.nDb - 1 do begin
-    if db^.aDb[i].pSchema <> nil then
-      sqlite3SchemaClear(db^.aDb[i].pSchema);
+  AssertH(iDb < db^.nDb, 'sqlite3ResetOneSchema: iDb out of range');
+  if iDb >= 0 then begin
+    db^.aDb[iDb].pSchema^.schemaFlags :=
+      db^.aDb[iDb].pSchema^.schemaFlags or u16(DB_ResetWanted);
+    db^.aDb[1].pSchema^.schemaFlags :=
+      db^.aDb[1].pSchema^.schemaFlags or u16(DB_ResetWanted);
+    db^.mDbFlags := db^.mDbFlags and not u32(DBFLAG_SchemaKnownOk);
   end;
-  db^.mDbFlags := db^.mDbFlags and not DBFLAG_SchemaKnownOk;
+  if db^.nSchemaLock = 0 then begin
+    for i := 0 to db^.nDb - 1 do begin
+      if (db^.aDb[i].pSchema <> nil)
+         and ((db^.aDb[i].pSchema^.schemaFlags and u16(DB_ResetWanted))
+              = u16(DB_ResetWanted)) then
+        sqlite3SchemaClear(db^.aDb[i].pSchema);
+    end;
+  end;
 end;
 
 procedure sqlite3CommitInternalChanges(db: PTsqlite3);
@@ -29369,5 +29428,7 @@ initialization
   passqlite3vdbe.gUnlinkAndDeleteTrigger := @sqlite3UnlinkAndDeleteTrigger;
   passqlite3vdbe.gRootPageMoved          := @rootPageMovedTrampoline;
   passqlite3vdbe.gSetP4KeyInfo           := passqlite3vdbe.TSetP4KeyInfoFn(@setP4KeyInfoTrampoline);
+  passqlite3vdbe.gResetOneSchema         := @sqlite3ResetOneSchema;
+  passqlite3vdbe.gResetAllSchemas        := @sqlite3ResetAllSchemasOfConnection;
 
 end.

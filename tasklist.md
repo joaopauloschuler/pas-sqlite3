@@ -436,14 +436,24 @@ Important: At the end of this document, please find:
        `sqlite3VdbeEnter`,
        `sqlite3VdbeCloseStatement`, `sqlite3VdbeList`,
        `sqlite3_blob_open`,
-       `sqlite3ResetOneSchema`,
        `sqlite3VdbeMemTranslate` (UTF-16 byte-swap arm now ported,
         utf.c:266..288; UTF-8 ↔ UTF-16 arms still stubbed pending
         READ_UTF8 / WRITE_UTF8 / WRITE_UTF16{LE,BE} macro ports —
         sqlite3VdbeChangeEncoding callers in default UTF-8 builds
         no-op out before reaching those arms),
        `sqlite3AnalysisLoad`, `sqlite3FkClearTriggerCache`,
-       `sqlite3ResetAllSchemasOfConnection`, `sqlite3Stat4ProbeFree`.
+       `sqlite3Stat4ProbeFree`.
+       [X] `sqlite3ResetOneSchema` + `sqlite3ResetAllSchemasOfConnection`
+            + `sqlite3CollapseDatabaseArray` — ported in full
+            (build.c:599, build.c:625, build.c:650) 2026-04-28.  vdbe.pas
+            stubs now dispatch through `gResetOneSchema` /
+            `gResetAllSchemas` hooks wired by codegen at unit init, so
+            OP_ParseSchema fault recovery and the `resetSchemaOnFault`
+            arm in OP_Halt actually clear the schemas.  ResetAllSchemas
+            now honours `db^.nSchemaLock` (defers via DB_ResetWanted),
+            clears DBFLAG_SchemaChange|DBFLAG_SchemaKnownOk, and calls
+            CollapseDatabaseArray to release detached attached-DB slots
+            past index 1.  Δ-neutral on TestExplainParity (1012/14).
        [X] `sqlite3ExpirePreparedStatements` — ported in full
             (vdbeaux.c:5337).  Walks db->pVdbe and writes (iCode+1) into
             the 2-bit `expired` field via VDBF_EXPIRED_MASK.  Replaces a
