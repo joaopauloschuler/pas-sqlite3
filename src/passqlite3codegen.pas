@@ -27458,6 +27458,12 @@ begin
 end;
 
 { minStep/maxStep/minMaxFinal }
+{ Faithful port of func.c:2090 minmaxStep.  C uses `if(pBest->flags)` to
+  detect a populated accumulator; sqlite3_aggregate_context zero-inits the
+  Mem so flags=0 marks the first call.  An earlier port checked
+  `flags & MEM_Null` which never triggers (init leaves all bits 0): min
+  worked only by accident (number<string fallback returned -1 so the <0
+  branch happened to copy); max always missed because >0 was never true. }
 procedure minStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   pAgg: PMem;
@@ -27465,12 +27471,11 @@ begin
   pAgg := PMem(sqlite3_aggregate_context(pCtx, SizeOf(TMem)));
   if pAgg = nil then Exit;
   if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
-  if (pAgg^.flags and MEM_Null) <> 0 then begin
+  if pAgg^.flags = 0 then begin
+    pAgg^.db := sqlite3_context_db_handle(pCtx);
     sqlite3VdbeMemCopy(pAgg, argv^);
-  end else begin
-    if sqlite3MemCompare(argv^, pAgg, nil) < 0 then
-      sqlite3VdbeMemCopy(pAgg, argv^);
-  end;
+  end else if sqlite3MemCompare(argv^, pAgg, nil) < 0 then
+    sqlite3VdbeMemCopy(pAgg, argv^);
 end;
 
 procedure maxStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
@@ -27480,12 +27485,11 @@ begin
   pAgg := PMem(sqlite3_aggregate_context(pCtx, SizeOf(TMem)));
   if pAgg = nil then Exit;
   if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
-  if (pAgg^.flags and MEM_Null) <> 0 then begin
+  if pAgg^.flags = 0 then begin
+    pAgg^.db := sqlite3_context_db_handle(pCtx);
     sqlite3VdbeMemCopy(pAgg, argv^);
-  end else begin
-    if sqlite3MemCompare(argv^, pAgg, nil) > 0 then
-      sqlite3VdbeMemCopy(pAgg, argv^);
-  end;
+  end else if sqlite3MemCompare(argv^, pAgg, nil) > 0 then
+    sqlite3VdbeMemCopy(pAgg, argv^);
 end;
 
 procedure minMaxFinal(pCtx: Psqlite3_context); cdecl;

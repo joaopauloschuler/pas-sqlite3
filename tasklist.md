@@ -321,20 +321,19 @@ Important: At the end of this document, please find:
 
   [ ] **6.10 step 17** Window-function and aggregate divergences surfaced
       by the new `src/tests/DiagWindow.pas` probe (run with
-      `LD_LIBRARY_PATH=$PWD/src bin/DiagWindow`).  20 divergences logged
-      2026-04-28; most fold into existing window/agg tasks.  New unique
-      items first:
-      [ ] **a) `max(val) FROM g` returns `0.0` instead of `5`** — silent
-        wrong value.  `min(val)`, `count(*)`, `sum(val)` all correct on
-        the same table; only `max` diverges.  REAL-typed `0.0` output
-        suggests the min/max optimisation rewrite (codegen.pas:18460,
-        WHERE_ORDERBY_MAX + KEYINFO_ORDER_DESC) routes max through a
-        zero-row early-exit / DESC-ordered scan that does not honour
-        the DESC sort flag in the planner, so the aggregate accumulator
-        is never updated and minMaxFinal returns the default 0.0.
-        Reproduced with single-row INSERTs (not the multi-row VALUES
-        path), so independent of step 6 sub-FROM gap.  C reference:
-        select.c minMaxQuery + where.c WHERE_ORDERBY_MIN/MAX handling.
+      `LD_LIBRARY_PATH=$PWD/src bin/DiagWindow`).  19 divergences open;
+      most fold into existing window/agg tasks.
+      [X] **a) `max(val) FROM g` returns `0.0` instead of `5`** —
+        closed 2026-04-28.  Root cause: minStep/maxStep checked
+        `(pAgg^.flags and MEM_Null) <> 0` for "first call init", but
+        sqlite3_aggregate_context zero-inits the Mem so flags=0
+        (MEM_Null bit unset).  min worked only by accident — the
+        number-vs-flag-0 fallback in sqlite3MemCompare returns -1,
+        which made `<0` true and copied argv on call 1.  max's `>0`
+        was never true, so the accumulator stayed zero forever and
+        minMaxFinal returned the default REAL 0.0.  Fix: faithful
+        port of func.c:2090 minmaxStep — `if pAgg^.flags = 0` for
+        the init branch (also seeds pAgg^.db).
       [ ] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** — the
         ORDER-BY-in-aggregate arm is not honoured; the unordered
         variant `group_concat(val,',')` PASSes.  Tracked under 6.24
@@ -361,6 +360,15 @@ Important: At the end of this document, please find:
         DiagWindow `group order`: GROUP BY combined with ORDER BY drops
         rows.  Likely shares root cause with (g) — agg-with-trailing-
         clauses gate at codegen.pas:18968.
+
+  [ ] **6.10 step 18** TestAuthBuiltins regression: T8 FindFunction("abs",1)
+      and T12 FindFunction("count",0) now return nil where step 16 fix
+      had them PASSing.  Run: `LD_LIBRARY_PATH=$PWD/src bin/TestAuthBuiltins`
+      → 31 passed, 2 failed.  Confirmed pre-existing (reproduces with
+      `git stash` of unrelated work).  Likely landed in commit 2911267
+      or 72804a2 — bisect needed.  Other 31 cases still pass, so
+      sqlite3InsertBuiltinFuncs idempotence is intact; the regression
+      is selective per-name.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
