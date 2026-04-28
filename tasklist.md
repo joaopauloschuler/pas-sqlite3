@@ -396,12 +396,22 @@ Important: At the end of this document, please find:
   [X] **6.19** port util.pas stubs `sqlite3_mprintf` / `sqlite3_snprintf`
        in full.
   [ ] **6.20** port remaining parser.pas stubs in full:
-       `sqlite3ExprListAppendVector` (blocked on
-       `sqlite3ExprForVectorField`, expr.c:1893),
        `sqlite3TriggerUpdateStep` + Insert/Delete/Select step
        siblings (blocked on trigger.c step-builder port).
        (`addModuleArgument` already fully ported — parser.pas:2020.
        `sqlite3Reindex` ported in full — parser.pas:1821.)
+       [X] `sqlite3ExprForVectorField` + `sqlite3ExprListAppendVector` —
+            ported in full (expr.c:574, expr.c:2093) 2026-04-28.
+            ExprForVectorField builds TK_SELECT_COLUMN nodes for
+            TK_SELECT vectors, returns/duplicates element exprs for
+            TK_VECTOR / scalar inputs (with rename-mode ownership
+            transfer arm).  AppendVector replaces the parse-time
+            "vector assignment not yet supported" error stub; vector
+            UPDATEs (`SET (a,b)=(...)` / `SET (a,b)=(SELECT ...)`)
+            now reach codegen.  Δ-neutral on TestExplainParity (1012
+            pass / 14 diverge — same), DiagFeatureProbe unchanged
+            (12 divergences); productive runtime gated on
+            `sqlite3Update` body.
        [X] `sqlite3CteNew` / `sqlite3WithAdd` — ported in full
             (build.c:5702, 5753) 2026-04-28.  TWith stub replaced with
             faithful header layout (nCte/bView/pOuter + flex array of

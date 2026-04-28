@@ -1673,19 +1673,110 @@ begin
   end;
 end;
 
+{ ---- sqlite3ExprForVectorField (expr.c:574) ------------------------------ }
+{ Faithful port — Phase 6.20.  Returns an Expr representing iField of the   }
+{ vector pVector.  For TK_SELECT vectors, builds a TK_SELECT_COLUMN node    }
+{ that references pVector via pLeft (caller still owns pVector).  For       }
+{ TK_VECTOR vectors, returns the iField'th element (taking ownership in     }
+{ rename mode), otherwise duplicates the scalar pVector.                    }
+function sqlite3ExprForVectorField(pPse: PParse; pVector: PExpr;
+                                   iField, nField: i32): PExpr;
+var
+  pRet:     PExpr;
+  ppVector: ^PExpr;
+  pItem:    PExprListItem;
+begin
+  if pVector^.op = TK_SELECT then begin
+    pRet := sqlite3PExpr(pPse, TK_SELECT_COLUMN, nil, nil);
+    if pRet <> nil then begin
+      pRet^.flags   := pRet^.flags or EP_FullSize;
+      pRet^.iTable  := nField;
+      pRet^.iColumn := iField;
+      pRet^.pLeft   := pVector;
+    end;
+  end else begin
+    if pVector^.op = TK_VECTOR then begin
+      pItem := ExprListItems(pVector^.x.pList);
+      Inc(pItem, iField);
+      ppVector := @pItem^.pExpr;
+      pVector  := ppVector^;
+      if inRenameObject(pPse) then begin
+        ppVector^ := nil;
+        Result := pVector;
+        Exit;
+      end;
+    end;
+    pRet := sqlite3ExprDup(pPse^.db, pVector, 0);
+  end;
+  Result := pRet;
+end;
+
 { ---- sqlite3ExprListAppendVector (expr.c:2093) --------------------------- }
-{ Append the LHS columns of a vector assignment "(a,b,c) = (...)" as new    }
-{ ExprList items.  Phase 7.2e.4 stub: full port requires                    }
-{ sqlite3ExprForVectorField (expr.c:1893) which has not yet been ported.    }
-{ For now we simply free pColumns / pExpr and report an error if invoked —  }
-{ vector UPDATEs (`SET (a,b)=...`) are uncommon in our gated test corpus.   }
-{ Phase 8 will port the full implementation.                                }
+{ Faithful port — Phase 6.20.  Appends each column of the vector            }
+{ assignment "(a,b,c) = (...)" as a new ExprList entry.                     }
 function sqlite3ExprListAppendVector(pPse: PParse; pList: PExprList;
                                      pColumns: PIdList; pExpr: PExpr): PExprList;
+var
+  db:       PTsqlite3;
+  n, i, iFirst: i32;
+  pSubExpr: PExpr;
+  pFirst:   PExpr;
+  pItems:   PExprListItem;
+  pIdItems: PIdListItem;
+  bAbort:   Boolean;
+  zMsg:     PAnsiChar;
 begin
-  sqlite3ErrorMsg(pPse, 'vector assignment not yet supported (Phase 8 TODO)');
-  sqlite3ExprDelete(pPse^.db, pExpr);
-  sqlite3IdListDelete(pPse^.db, pColumns);
+  db     := pPse^.db;
+  bAbort := False;
+  if pList <> nil then iFirst := pList^.nExpr else iFirst := 0;
+  if (pColumns = nil) or (pExpr = nil) then bAbort := True;
+
+  if (not bAbort) and (pExpr^.op <> TK_SELECT) then begin
+    n := sqlite3ExprVectorSize(pExpr);
+    if pColumns^.nId <> n then begin
+      zMsg := sqlite3MPrintf(Psqlite3db(db),
+        '%d columns assigned %d values', [pColumns^.nId, n]);
+      if zMsg <> nil then begin
+        sqlite3ErrorMsg(pPse, zMsg);
+        sqlite3DbFree(db, zMsg);
+      end;
+      bAbort := True;
+    end;
+  end;
+
+  if not bAbort then begin
+    i := 0;
+    while i < pColumns^.nId do begin
+      pSubExpr := sqlite3ExprForVectorField(pPse, pExpr, i, pColumns^.nId);
+      if pSubExpr <> nil then begin
+        pList := sqlite3ExprListAppend(pPse, pList, pSubExpr);
+        if pList <> nil then begin
+          pItems := ExprListItems(pList);
+          Inc(pItems, pList^.nExpr - 1);
+          pIdItems := IdListItems(pColumns);
+          Inc(pIdItems, i);
+          pItems^.zEName  := pIdItems^.zName;
+          pIdItems^.zName := nil;
+        end;
+      end;
+      Inc(i);
+    end;
+
+    if (db^.mallocFailed = 0) and (pExpr^.op = TK_SELECT)
+       and (pList <> nil) then begin
+      pItems := ExprListItems(pList);
+      Inc(pItems, iFirst);
+      pFirst := pItems^.pExpr;
+      if (pFirst <> nil) and (pFirst^.op = TK_SELECT_COLUMN) then begin
+        pFirst^.pRight := pExpr;
+        pExpr := nil;
+        pFirst^.iTable := pColumns^.nId;
+      end;
+    end;
+  end;
+
+  sqlite3ExprUnmapAndDelete(pPse, pExpr);
+  sqlite3IdListDelete(db, pColumns);
   Result := pList;
 end;
 
