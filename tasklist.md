@@ -435,7 +435,7 @@ Important: At the end of this document, please find:
        `sqlite3VdbeDisplayComment`, `sqlite3VdbeDisplayP4`,
        `sqlite3VdbeEnter`,
        `sqlite3VdbeCloseStatement`, `sqlite3VdbeList`,
-       `sqlite3_blob_open`, `sqlite3VdbeLogAbort`,
+       `sqlite3_blob_open`,
        `sqlite3ResetOneSchema`,
        `sqlite3VdbeMemTranslate` (UTF-16 byte-swap arm now ported,
         utf.c:266..288; UTF-8 ↔ UTF-16 arms still stubbed pending
@@ -506,6 +506,13 @@ Important: At the end of this document, please find:
        [X] `sqlite3SystemError` — ported in full (util.c:155);
             `SQLITE_USE_SEH` arm gated off in default build, matches
             default-build behaviour.
+       [X] `sqlite3VdbeLogAbort` — ported in full (vdbe.c:800).  Renders
+            `statement aborts at <pc>: <errMsg>; [<prefix><sql>]` via
+            sqlite3PfSnprintf and dispatches through sqlite3GlobalConfig.xLog
+            (avoiding a uses-cycle to passqlite3pager).  Trigger-frame prefix
+            arm honoured: when running inside a sub-program, the OP_Init's
+            P4 "-- ..." trigger label is rendered as "/* ... */ ".  No
+            TestExplainParity regression (1012 pass / 14 diverge — same).
        [X] `sqlite3VdbeIncrWriteCounter` — SQLITE_DEBUG-only
             (vdbeaux.c:829); existing no-op matches default-build
             behaviour exactly (release `Vdbe` record has no `nWrite`

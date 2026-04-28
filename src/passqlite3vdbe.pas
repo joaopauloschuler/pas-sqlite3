@@ -4412,9 +4412,62 @@ begin
   end;
 end;
 
+{ Port of vdbe.c:800 sqlite3VdbeLogAbort.
+  Sends a "statement aborts at <pc>: <errMsg>; [<prefix><sql>]" message
+  through sqlite3_log so the configured xLog callback can record the
+  aborting opcode.  The trigger-frame prefix is mirrored faithfully:
+  when running inside a sub-program (p^.pFrame <> nil) and the OP_Init
+  carries a "-- ..." trigger label in its P4 string, the label is
+  rendered as a "/* ... */ " prefix to disambiguate which trigger fired. }
 procedure sqlite3VdbeLogAbort(p: PVdbe; rc: i32; pOp, aOp: Pointer);
+var
+  pOp1:    PVdbeOp;
+  aOp1:    PVdbeOp;
+  zSqlT:   PAnsiChar;
+  zPrefix: PAnsiChar;
+  zXtra:   array[0..99] of AnsiChar;
+  pcAddr:  PtrInt;
+  zP4:     PAnsiChar;
+  zMsg:    array[0..511] of AnsiChar;
+  zErr:    PAnsiChar;
+  xLog:    procedure(pArg: Pointer; iErrCode: i32; zMsg: PAnsiChar); cdecl;
 begin
-  { Stub — Phase 5.5 }
+  if p = nil then Exit;
+  zSqlT   := p^.zSql;
+  zPrefix := PAnsiChar('');
+  pOp1 := PVdbeOp(pOp);
+  aOp1 := PVdbeOp(aOp);
+  if (p^.pFrame <> nil) and (aOp1 <> nil) then begin
+    Assert(aOp1^.opcode = OP_Init,
+           'sqlite3VdbeLogAbort expects aOp[0]=OP_Init');
+    if (aOp1^.p4type = P4_DYNAMIC) or (aOp1^.p4type = P4_STATIC) then
+      zP4 := aOp1^.p4.z
+    else
+      zP4 := nil;
+    if zP4 <> nil then begin
+      Assert((zP4[0] = '-') and (zP4[1] = '-') and (zP4[2] = ' '),
+             'trigger zSql label expected to start with "-- "');
+      sqlite3PfSnprintf(SizeOf(zXtra), @zXtra[0],
+                        PAnsiChar(AnsiString('/* %s */ ')), [zP4 + 3]);
+      zPrefix := @zXtra[0];
+    end else
+      zPrefix := PAnsiChar('/* unknown trigger */ ');
+  end;
+  if (pOp1 <> nil) and (aOp1 <> nil) then
+    pcAddr := (PtrUInt(pOp1) - PtrUInt(aOp1)) div SizeOf(TVdbeOp)
+  else
+    pcAddr := 0;
+  zErr := p^.zErrMsg;
+  if zErr  = nil then zErr  := PAnsiChar('');
+  if zSqlT = nil then zSqlT := PAnsiChar('');
+  sqlite3PfSnprintf(SizeOf(zMsg), @zMsg[0],
+                    PAnsiChar(AnsiString(
+                      'statement aborts at %d: %s; [%s%s]')),
+                    [i32(pcAddr), zErr, zPrefix, zSqlT]);
+  if sqlite3GlobalConfig.xLog <> nil then begin
+    Pointer(xLog) := sqlite3GlobalConfig.xLog;
+    xLog(sqlite3GlobalConfig.pLogArg, rc, @zMsg[0]);
+  end;
 end;
 
 procedure sqlite3VdbeSetChanges(db: Pointer; nChange: i64);
