@@ -18170,11 +18170,45 @@ begin
   { Phase 6.5: generate OP_DropTrigger VDBE instruction }
 end;
 
-{ sqlite3UnlinkAndDeleteTrigger — remove trigger from schema hash (Phase 6.4 stub) }
+{ sqlite3UnlinkAndDeleteTrigger — port of trigger.c:747.
+  Remove the named trigger from the trigHash, unlink it from its parent
+  table's pTrigger chain (only when the trigger's pSchema == pTabSchema —
+  TEMP triggers attached to MAIN tables intentionally skip the unlink),
+  free it, and stamp DBFLAG_SchemaChange. }
 procedure sqlite3UnlinkAndDeleteTrigger(db: PTsqlite3; iDb: i32;
   zName: PAnsiChar);
+var
+  pTrg:    PTrigger;
+  pHash:   passqlite3util.PHash;
+  pSchTab: passqlite3util.PSchema;
+  pTab:    PTable2;
+  pp:      ^PTrigger;
 begin
-  { Phase 6.5: schema hash removal }
+  if (iDb < 0) or (iDb >= db^.nDb) then Exit;
+  if db^.aDb[iDb].pSchema = nil then Exit;
+  pHash := @db^.aDb[iDb].pSchema^.trigHash;
+  pTrg := PTrigger(sqlite3HashInsert(pHash, PChar(zName), nil));
+  if pTrg <> nil then begin
+    if (pTrg^.pSchema <> nil)
+       and (pTrg^.pSchema = pTrg^.pTabSchema) then begin
+      { tableOfTrigger: lookup by pTrg->table in pTabSchema->tblHash. }
+      pSchTab := pTrg^.pTabSchema;
+      pHash   := @pSchTab^.tblHash;
+      pTab    := PTable2(sqlite3HashFind(pHash, PChar(pTrg^.table)));
+      if pTab <> nil then begin
+        pp := @pTab^.pTrigger;
+        while pp^ <> nil do begin
+          if pp^ = pTrg then begin
+            pp^ := pTrg^.pNext;
+            Break;
+          end;
+          pp := @(pp^^.pNext);
+        end;
+      end;
+    end;
+    sqlite3DeleteTrigger(db, pTrg);
+    db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
+  end;
 end;
 
 { sqlite3TriggersExist — check for triggers on table (Phase 6.4 stub) }
@@ -20192,10 +20226,34 @@ begin
   if p <> nil then sqlite3DbFree(db, p);
 end;
 
+{ sqlite3UnlinkAndDeleteIndex — port of build.c:566.
+  Drop the named index from the idxHash, unlink it from its parent table's
+  pIndex chain, free it, and stamp DBFLAG_SchemaChange. }
 procedure sqlite3UnlinkAndDeleteIndex(db: PTsqlite3; iDb: i32;
   zIdxName: PAnsiChar);
+var
+  pIndex: PIndex2;
+  p:      PIndex2;
+  pHash:  passqlite3util.PHash;
 begin
-  { Phase 7 }
+  if (iDb < 0) or (iDb >= db^.nDb) then Exit;
+  if db^.aDb[iDb].pSchema = nil then Exit;
+  pHash := @db^.aDb[iDb].pSchema^.idxHash;
+  pIndex := PIndex2(sqlite3HashInsert(pHash, PChar(zIdxName), nil));
+  if pIndex <> nil then begin
+    if (pIndex^.pTable <> nil) then begin
+      if pIndex^.pTable^.pIndex = pIndex then begin
+        pIndex^.pTable^.pIndex := pIndex^.pNext;
+      end else begin
+        p := pIndex^.pTable^.pIndex;
+        while (p <> nil) and (p^.pNext <> pIndex) do p := p^.pNext;
+        if (p <> nil) and (p^.pNext = pIndex) then
+          p^.pNext := pIndex^.pNext;
+      end;
+    end;
+    sqlite3FreeIndex(db, pIndex);
+  end;
+  db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
 end;
 
 function sqlite3AllocateIndexObject(db: PTsqlite3; nCol: i16;
@@ -28123,5 +28181,25 @@ begin
   piTab^ := iTab;
   Result := eType;
 end;
+
+{ Trampoline for sqlite3RootPageMoved — vdbe's hook signature is i32-based
+  (matches OP_Destroy register types); the real port is u32-based (Pgno).
+  Bit-pattern preserved across the cast. }
+procedure rootPageMovedTrampoline(db: PTsqlite3; iDb: i32; iFrom, iTo: i32);
+begin
+  sqlite3RootPageMoved(db, iDb, u32(iFrom), u32(iTo));
+end;
+
+initialization
+  { Wire the schema-cleanup hooks declared by passqlite3vdbe.  The opcode
+    handlers there (OP_DropTable, OP_DropIndex, OP_DropTrigger, OP_Destroy
+    autovacuum follow-on) call through these to reach the real ports
+    that live in this unit and depend on PTable2 / PIndex2 / PTrigger
+    types not visible to vdbe.pas.  Mirrors the existing
+    gNestedRunParser hook installed by passqlite3parser. }
+  passqlite3vdbe.gUnlinkAndDeleteTable   := @sqlite3UnlinkAndDeleteTable;
+  passqlite3vdbe.gUnlinkAndDeleteIndex   := @sqlite3UnlinkAndDeleteIndex;
+  passqlite3vdbe.gUnlinkAndDeleteTrigger := @sqlite3UnlinkAndDeleteTrigger;
+  passqlite3vdbe.gRootPageMoved          := @rootPageMovedTrampoline;
 
 end.

@@ -164,10 +164,18 @@ Important: At the end of this document, please find:
        `sqlite3_blob_open`, `sqlite3VdbeLogAbort`,
        `sqlite3ResetOneSchema`, `sqlite3VdbeMemTranslate`,
        `sqlite3VdbeMemHandleBom`, `sqlite3ExpirePreparedStatements`,
-       `sqlite3AnalysisLoad`, `sqlite3UnlinkAndDeleteTable`,
-       `sqlite3UnlinkAndDeleteIndex`, `sqlite3UnlinkAndDeleteTrigger`,
-       `sqlite3RootPageMoved`, `sqlite3FkClearTriggerCache`,
+       `sqlite3AnalysisLoad`, `sqlite3FkClearTriggerCache`,
        `sqlite3ResetAllSchemasOfConnection`, `sqlite3Stat4ProbeFree`.
+       [X] `sqlite3UnlinkAndDeleteTable` / `Index` / `Trigger` and
+            `sqlite3RootPageMoved` — wired via callback hooks
+            (gUnlinkAndDelete{Table,Index,Trigger}, gRootPageMoved)
+            registered by passqlite3codegen at unit-init.  Real ports
+            live in codegen.pas; vdbe.pas's stubs now invoke the hooks
+            so OP_DropTable/Index/Trigger and OP_Destroy autovacuum
+            follow-on update the in-memory schema (idxHash/tblHash/
+            trigHash unlink + DBFLAG_SchemaChange).  On-disk
+            sqlite_schema row deletion still gated on Phase 7
+            sqlite3RunParser (see 6.10 step 4).
        [X] `sqlite3VdbeError` — ported in full (vdbeaux.c:59).
             Pas signature drops the va_list (every call site already
             passes a pre-formatted plain string); strdups into db-tracked

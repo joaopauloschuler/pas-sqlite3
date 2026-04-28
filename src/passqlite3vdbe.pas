@@ -1461,6 +1461,21 @@ procedure sqlite3UnlinkAndDeleteIndex(db: PTsqlite3; iDb: i32; zIdxName: PAnsiCh
 procedure sqlite3UnlinkAndDeleteTrigger(db: PTsqlite3; iDb: i32; zTrigName: PAnsiChar);
 procedure sqlite3RootPageMoved(db: PTsqlite3; iDb: i32; iFstrom: i32; iTo: i32);
 procedure sqlite3FkClearTriggerCache(db: PTsqlite3; iDb: i32);
+
+{ Hook variables registered by passqlite3codegen at unit-init time so that
+  the OP_Destroy / OP_DropTable / OP_DropIndex / OP_DropTrigger opcode
+  handlers reach the real schema-cleanup ports (which live in codegen.pas
+  and depend on PTable2/PIndex2/PTrigger types not visible to this unit).
+  Default nil → opcode handlers degrade to no-ops, matching prior stub
+  behaviour for codegen-less test programs. }
+type
+  TUnlinkAndDeleteFn = procedure(db: PTsqlite3; iDb: i32; zName: PAnsiChar);
+  TRootPageMovedFn   = procedure(db: PTsqlite3; iDb: i32; iFrom, iTo: i32);
+var
+  gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
+  gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
+  gUnlinkAndDeleteTrigger: TUnlinkAndDeleteFn;
+  gRootPageMoved:          TRootPageMovedFn;
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
@@ -9364,16 +9379,28 @@ begin
 end;
 
 procedure sqlite3UnlinkAndDeleteTable(db: PTsqlite3; iDb: i32; zTabName: PAnsiChar);
-begin { Stub: schema DDL requires Phase 6 } end;
+begin
+  if Assigned(gUnlinkAndDeleteTable) then
+    gUnlinkAndDeleteTable(db, iDb, zTabName);
+end;
 
 procedure sqlite3UnlinkAndDeleteIndex(db: PTsqlite3; iDb: i32; zIdxName: PAnsiChar);
-begin { Stub: schema DDL requires Phase 6 } end;
+begin
+  if Assigned(gUnlinkAndDeleteIndex) then
+    gUnlinkAndDeleteIndex(db, iDb, zIdxName);
+end;
 
 procedure sqlite3UnlinkAndDeleteTrigger(db: PTsqlite3; iDb: i32; zTrigName: PAnsiChar);
-begin { Stub: trigger DDL requires Phase 6 } end;
+begin
+  if Assigned(gUnlinkAndDeleteTrigger) then
+    gUnlinkAndDeleteTrigger(db, iDb, zTrigName);
+end;
 
 procedure sqlite3RootPageMoved(db: PTsqlite3; iDb: i32; iFstrom: i32; iTo: i32);
-begin { Stub: auto-vacuum root page update requires Phase 6 } end;
+begin
+  if Assigned(gRootPageMoved) then
+    gRootPageMoved(db, iDb, iFstrom, iTo);
+end;
 
 procedure sqlite3FkClearTriggerCache(db: PTsqlite3; iDb: i32);
 begin { Stub: FK trigger cache requires Phase 6 } end;
