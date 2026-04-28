@@ -126,7 +126,7 @@ Important: At the end of this document, please find:
        corpus — only exercised by FROM = single virtual table + LIMIT —
        but ports cleanly so the path is in place once the vtab + LIMIT
        gate lands.
-  [ ] **6.16** port btree.pas stubs in full from C to pascal:
+  [X] **6.16** port btree.pas stubs in full from C to pascal:
        `ptrmapPutOvflPtr`, `invalidateIncrblobCursors`.
   [ ] **6.17** port pager.pas stubs in full from C to pascal:
        `pager_reset`, `pagerReleaseMapPage`, `sqlite3_log`.

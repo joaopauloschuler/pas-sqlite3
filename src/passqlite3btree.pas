@@ -1636,13 +1636,10 @@ begin
   Result := pBt^.nPage;
 end;
 
-{ ===========================================================================
-  ptrmapPutOvflPtr stub  (autovacuum, Phase 4.5)
-  =========================================================================== }
-procedure ptrmapPutOvflPtr(pPage: PMemPage; pSrc: PMemPage; pCell: Pu8; pRC: Pi32);
-begin
-  { Autovacuum pointer-map stub — full implementation in Phase 4.5 }
-end;
+{ ptrmapPutOvflPtr — forward decl; implemented after ptrmapPut /
+  SQLITE_OVERFLOW_CHK below (btree.c lines 1582-1597). }
+procedure ptrmapPutOvflPtr(pPage: PMemPage; pSrc: PMemPage; pCell: Pu8;
+                           pRC: Pi32); forward;
 
 { ===========================================================================
   dropCell
@@ -3492,6 +3489,31 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ ===========================================================================
+  ptrmapPutOvflPtr — btree.c lines 1582-1597
+  The cell pCell is currently part of page pSrc but will ultimately be part
+  of pPage.  If pCell contains a pointer to an overflow page, insert an
+  entry into the pointer-map for that overflow page.
+  =========================================================================== }
+procedure ptrmapPutOvflPtr(pPage: PMemPage; pSrc: PMemPage; pCell: Pu8;
+                           pRC: Pi32);
+var
+  info: TCellInfo;
+  ovfl: Pgno;
+begin
+  if pRC^ <> SQLITE_OK then Exit;
+  Assert(pCell <> nil);
+  pPage^.xParseCell(pPage, pCell, @info);
+  if info.nLocal < info.nPayload then begin
+    if SQLITE_OVERFLOW_CHK(pSrc^.aDataEnd, pCell, pCell + info.nLocal) then begin
+      pRC^ := SQLITE_CORRUPT_BKPT;
+      Exit;
+    end;
+    ovfl := sqlite3Get4byte(pCell + info.nSize - 4);
+    ptrmapPut(pPage^.pBt, ovfl, PTRMAP_OVERFLOW1, pPage^.pgno, pRC);
+  end;
+end;
+
 function setChildPtrmaps(pPage: PMemPage): i32;
 begin
   Result := SQLITE_OK;
@@ -3578,11 +3600,29 @@ begin
   Result := SQLITE_OK;
 end;
 
-{ invalidateIncrblobCursors — stub (SQLITE_OMIT_INCRBLOB) }
+{ invalidateIncrblobCursors — btree.c lines 591-609
+  If argument isClearTable is true, set CURSOR_INVALID on every incrblob
+  cursor open on any row within the table with root-page pgnoRoot.
+  Otherwise, invalidate only those incrblob cursors open on the row with
+  rowid iRow. }
 procedure invalidateIncrblobCursors(p: PBtree; pgnoRoot: Pgno;
                                     iRow: i64; isClearTable: i32);
+var
+  pCur: PBtCursor;
 begin
-  { Incrblob not supported in this port }
+  Assert(p^.hasIncrblobCur <> 0);
+  Assert(sqlite3BtreeHoldsMutex(p) <> 0);
+  p^.hasIncrblobCur := 0;
+  pCur := p^.pBt^.pCursor;
+  while pCur <> nil do begin
+    if (pCur^.curFlags and BTCF_Incrblob) <> 0 then begin
+      p^.hasIncrblobCur := 1;
+      if (pCur^.pgnoRoot = pgnoRoot)
+         and ((isClearTable <> 0) or (pCur^.info.nKey = iRow)) then
+        pCur^.eState := CURSOR_INVALID;
+    end;
+    pCur := pCur^.pNext;
+  end;
 end;
 
 { ---------------------------------------------------------------------------
