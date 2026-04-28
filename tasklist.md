@@ -319,6 +319,37 @@ Important: At the end of this document, please find:
         Full table-driven `pragmaLocate` dispatch still deferred
         under 6.12.
 
+  [ ] **6.10 step 16** Regressions surfaced by full-suite sweep on 2026-04-28.
+      Both reproduce on current HEAD (a3, after 7b807ec).
+      [ ] **a) TestAuthBuiltins hangs at T9** — T8 reports `FAIL FindFunction
+        "abs" found`, then the run never returns.  Root cause: the test
+        calls `sqlite3RegisterBuiltinFunctions` manually (line 123) after
+        `sqlite3MallocZero` has already triggered `sqlite3_initialize` →
+        `sqlite3RegisterBuiltinFunctions` once.  The second call walks the
+        same `aBuiltinFuncs[]` records through `sqlite3InsertBuiltinFuncs`;
+        `sqlite3FunctionSearch` finds the existing entry as `pOther`, then
+        `aDef[i].pNext := pOther^.pNext; pOther^.pNext := @aDef[i]` makes
+        `aDef[i].pNext = &aDef[i]` — a self-loop that hangs every later
+        `sqlite3FindFunction` walk.  C source has
+        `assert( pOther!=&aDef[i] && pOther->pNext!=&aDef[i] )` at
+        callback.c:371 — the Pas `sqlite3InsertBuiltinFuncs`
+        (codegen.pas:26056) is missing this guard.  Either harden the test
+        (don't double-register) or make Pas InsertBuiltinFuncs idempotent
+        with a guard `if (pOther = @aDef[i]) or (pOther^.pNext = @aDef[i])
+        then continue`.
+      [ ] **b) TestWhereExpr T14a..T14i FAIL + access violation** — LIKE
+        virtual-term synthesis no longer fires for the synthetic
+        TK_FUNCTION 'like' built directly in the test (line 491..506).
+        `sqlite3IsLikeFunction` returns 0, so `isLikeOrGlob` early-exits
+        and the GE/LT children are never inserted.  T14j dereferences
+        `pWC^.a[iLikeIdx + 1].pExpr^.pRight` and EAccessViolation results
+        because the children don't exist.  Test was reported 84/84 in
+        commit 1235bd0; today reports 62 PASS / 9 FAIL.  Likely related
+        to (a) — the corrupted FuncDef chain may also affect db^.aFunc
+        or sqlite3BuiltinFunctions for the `like` lookup.  Investigate
+        after (a) lands.  Also: T14j..T14l should bail when T14i fails
+        rather than blind-deref.
+
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
         the sqlite_schema scrub now uses one-pass inline delete.
