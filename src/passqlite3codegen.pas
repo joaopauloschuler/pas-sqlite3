@@ -9293,9 +9293,133 @@ begin
   { Phase 6.2 stub }
 end;
 
-procedure sqlite3WhereAddLimit(pWC: PWhereClause; p: PSelect);
+{ whereAddLimitExpr — port of whereexpr.c:1620..1651.
+
+  Add a LIMIT (eMatchOp=SQLITE_INDEX_CONSTRAINT_LIMIT) or OFFSET
+  (SQLITE_INDEX_CONSTRAINT_OFFSET) constraint term to pWC.  In the common
+  case where the value is a simple integer, the inner expression codes as
+  a TK_INTEGER (so sqlite3_vtab_rhs_value() can read it); otherwise it
+  codes as a TK_REGISTER expression carrying iReg. }
+procedure whereAddLimitExpr(pWC: PWhereClause; iReg: i32; pExpr: PExpr;
+  iCsr: i32; eMatchOp: i32);
+var
+  pPse:   PParse;
+  db:     PTsqlite3;
+  pNew:   PExpr;
+  pVal:   PExpr;
+  iVal:   i32;
+  pTerm:  PWhereTerm;
+  idx:    i32;
 begin
-  { Phase 6.2 stub }
+  pPse := pWC^.pWInfo^.pParse;
+  db := pPse^.db;
+  iVal := 0;
+
+  if (sqlite3ExprIsInteger(pExpr, @iVal, pPse) <> 0) and (iVal >= 0) then
+  begin
+    pVal := sqlite3ExprInt32(db, iVal);
+    if pVal = nil then Exit;
+    pNew := sqlite3PExpr(pPse, TK_MATCH, nil, pVal);
+  end
+  else
+  begin
+    pVal := sqlite3ExprAlloc(db, TK_REGISTER, nil, 0);
+    if pVal = nil then Exit;
+    pVal^.iTable := iReg;
+    pNew := sqlite3PExpr(pPse, TK_MATCH, nil, pVal);
+  end;
+  if pNew <> nil then
+  begin
+    idx := whereClauseInsert(pWC, pNew, TERM_DYNAMIC or TERM_VIRTUAL);
+    pTerm := @pWC^.a[idx];
+    pTerm^.leftCursor := iCsr;
+    pTerm^.eOperator  := u16(WO_AUX);
+    pTerm^.eMatchOp   := u8(eMatchOp);
+  end;
+end;
+
+{ sqlite3WhereAddLimit — port of whereexpr.c:1671..1736.
+  Possibly add LIMIT/OFFSET terms when the FROM clause is a single virtual
+  table and all WHERE terms will be passed to xBestIndex. }
+procedure sqlite3WhereAddLimit(pWC: PWhereClause; p: PSelect);
+var
+  pOrderBy: PExprList;
+  iCsr:     i32;
+  ii:       i32;
+  pTerm:    PWhereTerm;
+  pParent:  PWhereTerm;
+  pE:       PExpr;
+begin
+  Assert((p <> nil) and (p^.pLimit <> nil));
+  if (p^.pGroupBy = nil)
+     and ((p^.selFlags and (SF_Distinct or SF_Aggregate)) = 0)
+     and (p^.pSrc^.nSrc = 1)
+     and (SrcListItems(p^.pSrc)[0].pSTab <> nil)
+     and (SrcListItems(p^.pSrc)[0].pSTab^.eTabType = TABTYP_VTAB) then
+  begin
+    pOrderBy := p^.pOrderBy;
+    iCsr := SrcListItems(p^.pSrc)[0].iCursor;
+
+    { Condition (4): every WC term must be passable to xBestIndex. }
+    ii := 0;
+    while ii < pWC^.nTerm do
+    begin
+      pTerm := @pWC^.a[ii];
+      if (pTerm^.wtFlags and TERM_CODED) <> 0 then
+      begin
+        { Vector op decomposed into subsequent terms.  See tag-20220128a. }
+        Assert((pTerm^.wtFlags and TERM_VIRTUAL) <> 0);
+        Assert(pTerm^.eOperator = u16(WO_ROWVAL));
+        Inc(ii);
+        Continue;
+      end;
+      if pTerm^.nChild <> 0 then
+      begin
+        { Children are themselves in pWC->a[]; ignore the parent here. }
+        Inc(ii);
+        Continue;
+      end;
+      if (pTerm^.leftCursor = iCsr) and (pTerm^.prereqRight = 0) then
+      begin
+        Inc(ii);
+        Continue;
+      end;
+      if pTerm^.iParent >= 0 then
+      begin
+        pParent := @pWC^.a[pTerm^.iParent];
+        if (pParent^.leftCursor = iCsr)
+           and (pParent^.prereqRight = 0)
+           and (pParent^.nChild = 1) then
+        begin
+          Inc(ii);
+          Continue;
+        end;
+      end;
+      Exit; { This term will not be passed through. Bail. }
+    end;
+
+    { Condition (5): every ORDER BY column must be a column of iCsr without
+      BIGNULL ordering. }
+    if pOrderBy <> nil then
+    begin
+      for ii := 0 to pOrderBy^.nExpr - 1 do
+      begin
+        pE := ExprListItems(pOrderBy)[ii].pExpr;
+        if pE^.op <> TK_COLUMN then Exit;
+        if pE^.iTable <> iCsr then Exit;
+        if (ExprListItems(pOrderBy)[ii].fg.sortFlags and KEYINFO_ORDER_BIGNULL) <> 0 then
+          Exit;
+      end;
+    end;
+
+    Assert(p^.pLimit^.op = TK_LIMIT);
+    if (p^.iOffset <> 0) and ((p^.selFlags and SF_Compound) = 0) then
+      whereAddLimitExpr(pWC, p^.iOffset, p^.pLimit^.pRight,
+                        iCsr, SQLITE_INDEX_CONSTRAINT_OFFSET);
+    if (p^.iOffset = 0) or ((p^.selFlags and SF_Compound) = 0) then
+      whereAddLimitExpr(pWC, p^.iLimit, p^.pLimit^.pLeft,
+                        iCsr, SQLITE_INDEX_CONSTRAINT_LIMIT);
+  end;
 end;
 
 // ---------------------------------------------------------------------------

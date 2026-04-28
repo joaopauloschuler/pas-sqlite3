@@ -51,7 +51,7 @@ Important: At the end of this document, please find:
       Δ=14).
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
-    - [ ] **6.10 step 4** Port `sqlite3CodeDropTable` pre-Destroy
+    - [ ] **6.10 step 4** Port in full `sqlite3CodeDropTable` pre-Destroy
       schema scan (build.c:3315..3445): the loop that walks
       sqlite_schema, deletes rows whose `tbl_name = 'X'`, and
       reinserts the surviving trigger rows.  Plus the trailing
@@ -81,9 +81,6 @@ Important: At the end of this document, please find:
           only 3 ops, no sorter open / KeyInfo / sort-finalise loop).
         [ ] `SELECT a FROM t GROUP BY a` — Δ=42 (aggregate-group
           path, not yet ported).
-        [X] `SELECT COUNT(*)` — Δ=6 closed by porting the
-          isSimpleCount fast path (select.c:8758..8818) inline in
-          `sqlite3Select`: OpenRead+Count+Close+Copy+ResultRow.
         [ ] `SELECT SUM/MIN/MAX(a)` — Δ=12..13 (aggregate-no-GROUP
           path).  Needs AggStep + AggFinal codegen
           (select.c:8819+).  The `selectMarkAggregate` walker keeps
@@ -121,9 +118,13 @@ Important: At the end of this document, please find:
   [ ] **6.12** port sqlite3Pragma in full
   [ ] **6.13** port sqlite3Vacuum in full
   [ ] **6.14** port sqlite3WhereTabFuncArgs in full
-  [ ] **6.15** port sqlite3WhereAddLimit in full
+  [X] **6.15** port sqlite3WhereAddLimit in full (whereexpr.c:1620..1736;
+       includes the whereAddLimitExpr helper).  Dead code on the current
+       corpus — only exercised by FROM = single virtual table + LIMIT —
+       but ports cleanly so the path is in place once the vtab + LIMIT
+       gate lands.
   [ ] **6.16** search for "stub" in the pascal source code and port
-       from C in full all functions or procedures marked as "stub".
+       from C to pascal in full all functions or procedures marked as "stub".
 ---
 
 ## Phase 7 — Parser (one gate open)
