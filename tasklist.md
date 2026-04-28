@@ -95,9 +95,14 @@ Important: At the end of this document, please find:
             for query compilation.
        [ ] `sqlite3ResolveOrderGroupBy` — returns `SQLITE_OK`; resolves
             ORDER BY / GROUP BY positional aliases against `pSelect^.pEList`.
-       [ ] `sqlite3ExprColUsed` (resolve.c) — returns `0`; must compute
-            column-usage bitmask honouring `TF_HasGenerated` /
-            `COLFLAG_GENERATED` and the `BMS` cap.
+       [X] `sqlite3ExprColUsed` (resolve.c) — ported 2026-04-28
+            (codegen.pas:7040).  Generated-column arm returns
+            `(1 shl nCol)-1` (or `not 0` when nCol >= BMS); regular arm
+            clamps n to BMS-1 and returns `1 shl n`.  Verified
+            TestExplainParity 1016/10, plus TestWhereBasic 52/0,
+            TestSelectBasic 49/0, TestParser 45/0, TestDMLBasic 54/0,
+            TestSchemaBasic 44/0, TestVdbeRecord 13/0, TestVdbeAgg 11/0,
+            TestVdbeTxn 8/0 — no regressions.
 
        Build / schema (build.c):
        [X] `sqlite3HasExplicitNulls` — ported 2026-04-28

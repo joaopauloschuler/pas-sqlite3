@@ -7037,9 +7037,31 @@ begin
   Result := 1;
 end;
 
+{ resolve.c:179 — column-usage bitmask for a TK_COLUMN expression.
+  Generated columns reference *all* columns transitively, so when the host
+  table has TF_HasGenerated and the column itself is COLFLAG_GENERATED the
+  caller must assume "all columns up to nCol" are touched.  Otherwise just
+  the single column bit. }
 function sqlite3ExprColUsed(pExpr: PExpr): Bitmask;
+var
+  n:      i32;
+  pExTab: PTable2;
 begin
-  Result := 0;
+  n := pExpr^.iColumn;
+  pExTab := pExpr^.y.pTab;
+  Assert(pExTab <> nil);
+  Assert(n < pExTab^.nCol);
+  if ((pExTab^.tabFlags and TF_HasGenerated) <> 0)
+     and ((pExTab^.aCol[n].colFlags and COLFLAG_GENERATED) <> 0) then
+  begin
+    if pExTab^.nCol >= BMS then
+      Result := not Bitmask(0)
+    else
+      Result := (Bitmask(1) shl pExTab^.nCol) - 1;
+  end else begin
+    if n >= BMS then n := BMS - 1;
+    Result := Bitmask(1) shl n;
+  end;
 end;
 
 { Minimal sqlite3ResolveExprNames — walk pExpr resolving TK_ID (and rowid
