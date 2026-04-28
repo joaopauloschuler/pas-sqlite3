@@ -24820,7 +24820,7 @@ begin
           p^ := HEX2[(zBlob + i)^ and $0F]; Inc(p);
         end;
         p^ := ''''; Inc(p); p^ := #0;
-        sqlite3_result_text(pCtx, zOut, p - zOut - 1, SQLITE_TRANSIENT);
+        sqlite3_result_text(pCtx, zOut, p - zOut, SQLITE_TRANSIENT);
         sqlite3_free(zOut);
       end;
   else begin { SQLITE_TEXT }
@@ -24838,7 +24838,7 @@ begin
         p^ := (z + i)^; Inc(p);
       end;
       p^ := ''''; Inc(p); p^ := #0;
-      sqlite3_result_text(pCtx, zOut, p - zOut - 1, SQLITE_TRANSIENT);
+      sqlite3_result_text(pCtx, zOut, p - zOut, SQLITE_TRANSIENT);
       sqlite3_free(zOut);
     end;
   end;

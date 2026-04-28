@@ -225,6 +225,32 @@ Important: At the end of this document, please find:
         `SELECT count(*) FROM pragma_table_info('t')` returns no row.
         Tracked under 6.12 (sqlite3Pragma).
 
+  [ ] **6.10 step 10** Built-in scalar function bugs (surfaced via ad-hoc
+      differential probe — not DiagFeatureProbe; consider folding into a
+      DiagBuiltins fixture if more arrive):
+      [X] **a) `quote(text)` drops the trailing quote** — fixed
+        2026-04-28.  Both the BLOB and TEXT arms of `quoteFunc`
+        (codegen.pas:24823, codegen.pas:24841) passed `p - zOut - 1`
+        to `sqlite3_result_text`.  After the trailing `Inc(p)` and
+        `p^ := #0` the cursor `p` already points at the null
+        terminator, so `p - zOut` is the correct payload length;
+        the `- 1` was an off-by-one truncating the closing `'`.
+        Verified: `SELECT quote('a')` now returns `'a'` (was `'a`).
+      [ ] **b) `round(x, n)` text formatting**.
+        `SELECT round(3.14159, 2)` yields `3.1400000000000001` on
+        Pas vs `3.14` on C.  The stored double is identical
+        (closest IEEE-754 to 3.14); the divergence is in
+        `vdbeMemRenderNum` (vdbe.pas:8581) calling libc
+        `snprintf("%.*g", nFp, ...)` instead of SQLite's own
+        `%!.*g` altform2 ("shortest round-trip-correct decimal").
+        Architectural note 5 already calls this out; closing
+        requires routing `vdbeMemRenderNum` through the Pas
+        printf module's `sqlite3FpDecode` (printf.pas:432) with
+        the deferred `iRound==17` round-trip arm finished.
+        Bytecode-Δ-neutral but observable for any
+        `column_text` on a REAL value whose %g output is shorter
+        than 17 sig digits.
+
   [X] **6.10 step 8** Auto-named result columns carry a trailing space
       on Pas — fixed.  Root cause was `sqlite3DbSpanDup`
       (passqlite3util.pas) skipping the leading/trailing whitespace
