@@ -17221,6 +17221,7 @@ var
   pWInfo:      PWhereInfo;
   isExists:    Boolean;    { True when pDest^.eDest = SRT_Exists }
   iLimitReg:   i32;        { register holding LIMIT counter for SRT_Exists }
+  iLimit0Goto: i32;        { addr of LIMIT-0 short-circuit Goto, or -1 }
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -17392,6 +17393,7 @@ begin
     Mirrors C select.c:2526 "p->iLimit = iLimit = ++pParse->nMem" followed
     by "OP_Integer n, iLimit". }
   iLimitReg := 0;
+  iLimit0Goto := -1;
   if isExists and (p^.pLimit <> nil) then
   begin
     Inc(pParse^.nMem);
@@ -17414,6 +17416,12 @@ begin
     iLimitReg := pParse^.nMem;
     p^.iLimit  := iLimitReg;
     sqlite3VdbeAddOp2(v, OP_Integer, i, iLimitReg);
+    { LIMIT 0 short-circuit — select.c:2532..2533.  Constant-integer
+      LIMIT of 0 means "return no rows"; emit an unconditional Goto
+      over the WHERE loop (target = pWInfo^.iBreak, patched after
+      sqlite3WhereBegin establishes the label). }
+    if i = 0 then
+      iLimit0Goto := sqlite3VdbeAddOp2(v, OP_Goto, 0, 0);
     if p^.pLimit^.pRight <> nil then
     begin
       Inc(pParse^.nMem);
@@ -17438,6 +17446,11 @@ begin
   begin
     Result := SQLITE_ERROR; Exit;
   end;
+
+  { Patch the LIMIT-0 short-circuit Goto's target now that
+    pWInfo^.iBreak is allocated. }
+  if iLimit0Goto >= 0 then
+    sqlite3VdbeChangeP2(v, iLimit0Goto, pWInfo^.iBreak);
 
   { Allocate the iSdst result-register block unconditionally — mirrors
     selectInnerLoop:1179-1194 which bumps pDest->iSdst/pParse->nMem even
