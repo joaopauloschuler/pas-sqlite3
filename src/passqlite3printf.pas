@@ -1306,4 +1306,15 @@ begin
   Result := strDupDb(db, s);
 end;
 
+{ Hook installer — lets passqlite3util's cdecl sqlite3_mprintf /
+  sqlite3_snprintf route through the native formatter without forcing a
+  uses-cycle (this unit already imports passqlite3util). }
+function formatNoArgsImpl(zFormat: PAnsiChar): AnsiString;
+begin
+  Result := sqlite3FormatStr(zFormat, []);
+end;
+
+initialization
+  passqlite3util.sqlite3FormatNoArgsHook := @formatNoArgsImpl;
+
 end.

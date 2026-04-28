@@ -734,6 +734,18 @@ function  sqlite3Pcache1Mutex: Psqlite3_mutex;
 var
   gPcache1Mutex: Psqlite3_mutex = nil;  { set by pcache1Init — interface-visible }
 
+{ printf hook — installed by passqlite3printf.initialization to break the
+  uses cycle (passqlite3printf already imports passqlite3util).  When set,
+  sqlite3_mprintf / sqlite3_snprintf route their format strings through
+  sqlite3FormatStr so `%%` and other no-arg-consuming specifiers are
+  processed faithfully.  Pascal callers that need varargs use
+  sqlite3PfMprintf / sqlite3MPrintf directly — the cdecl entries below
+  cannot extract C varargs from a Pascal-defined body in FPC. }
+type
+  TSqlite3FormatNoArgs = function(zFormat: PAnsiChar): AnsiString;
+var
+  sqlite3FormatNoArgsHook: TSqlite3FormatNoArgs = nil;
+
 implementation
 
 { ============================================================
@@ -2425,10 +2437,22 @@ begin
   Result := rawStr;
 end;
 
+{ printf.c:1404 — sqlite3_mprintf.  C is variadic; FPC cannot access C
+  va_list inside a Pascal-defined body, so the cdecl single-arg entry
+  here is meaningful only for format strings with no arg-consuming
+  specifiers (anything else would be UB even in C if no args were
+  pushed).  We route through sqlite3FormatStr so `%%` and similar are
+  processed faithfully; Pascal callers needing real varargs use
+  sqlite3PfMprintf instead. }
 function sqlite3_mprintf(zFormat: PChar): PChar; cdecl;
+var s: AnsiString;
 begin
-  { Stub: returns copy of format for Phase 2; full port in Phase 6 }
-  Result := PChar(sqlite3StrDup(zFormat));
+  if zFormat = nil then begin Result := nil; Exit; end;
+  if Assigned(sqlite3FormatNoArgsHook) then begin
+    s := sqlite3FormatNoArgsHook(zFormat);
+    Result := PChar(sqlite3StrDup(PChar(s)));
+  end else
+    Result := PChar(sqlite3StrDup(zFormat));
 end;
 
 function sqlite3_vsnprintf(n: i32; zBuf: PChar; zFormat: PChar; va: Pointer): PChar; cdecl;
@@ -2437,10 +2461,23 @@ begin
   Result := zBuf;
 end;
 
+{ printf.c:1430 — sqlite3_snprintf.  Same constraint as sqlite3_mprintf:
+  cdecl single-fmt-arg entry processes `%%` and other no-arg specifiers
+  via the printf hook.  Returns zBuf so chained-call patterns from C
+  continue to work. }
 function sqlite3_snprintf(n: i32; zBuf: PChar; zFormat: PChar): PChar; cdecl;
+var s: AnsiString; copy: i32;
 begin
-  if (n > 0) and (zBuf <> nil) then zBuf[0] := #0;
   Result := zBuf;
+  if (zBuf = nil) or (n <= 0) then Exit;
+  if (zFormat <> nil) and Assigned(sqlite3FormatNoArgsHook) then begin
+    s := sqlite3FormatNoArgsHook(zFormat);
+    copy := Length(s);
+    if copy > n - 1 then copy := n - 1;
+    if copy > 0 then Move(PChar(s)^, zBuf^, copy);
+    zBuf[copy] := #0;
+  end else
+    zBuf[0] := #0;
 end;
 
 { ============================================================

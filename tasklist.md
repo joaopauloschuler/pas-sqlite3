@@ -143,7 +143,16 @@ Important: At the end of this document, please find:
        `sqlite3_log`; call sites in `walIndexRecover` and `walLimitSize`
        now pre-render the C format strings via `Format()`.  Local copy
        in wal.pas avoids pulling pager.pas into the uses graph.)
-  [ ] **6.19** port util.pas stub `sqlite3_mprintf` in full from C to pascal.
+  [X] **6.19** port util.pas stubs `sqlite3_mprintf` / `sqlite3_snprintf` in
+       full from C to pascal.  FPC cannot extract C va_list inside a
+       Pascal-defined cdecl body, so the cdecl single-fmt-arg entries route
+       through `sqlite3FormatStr` (passqlite3printf) via an init-time
+       function-pointer hook installed in passqlite3util — same break-the-
+       cycle pattern used in 6.17 for `pager_reset → sqlite3BackupRestart`.
+       The hook handles `%%` and other no-arg-consuming specifiers
+       faithfully.  Pascal callers that need real varargs use
+       `sqlite3PfMprintf` / `sqlite3MPrintf` (already fully ported in
+       passqlite3printf).
   [ ] **6.20** port parser.pas stubs in full from C to pascal:
        `sqlite3ExprListAppendVector`, `sqlite3Reindex`,
        `sqlite3TriggerUpdateStep`, `addModuleArgument`,
