@@ -165,14 +165,18 @@ Important: At the end of this document, please find:
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
       bin/DiagFeatureProbe`).  Most fold into existing tasks; the genuinely
       new silent-result bugs are listed first.
-      [ ] **a) COLLATE NOCASE operator silently case-sensitive.**
-        `SELECT 'ABC' COLLATE NOCASE = 'abc'` returns 0 on Pas, 1 on C
-        (verified 2026-04-28).  Same answer for the postfix form
-        `'ABC' = 'abc' COLLATE NOCASE`.  Plain equality `'abc' = 'abc'`
-        works.  TK_COLLATE arm of the eq codegen does not propagate the
-        collation onto the comparison — likely
-        `sqlite3BinaryCompareCollSeq` / `codeCompare` not reading the
-        EP_Collate node.  Sister bug to 6.26's collation work.
+      [X] **a) COLLATE NOCASE operator silently case-sensitive.**  Fixed
+        2026-04-28 by porting the missing collation arm of
+        `sqlite3MemCompare` (vdbeaux.c:4659..4661 / vdbeCompareMemString
+        same-encoding branch).  Bytecode was already correct (`OP_Eq`
+        carried `P4=COLLSEQ(NOCASE)` and `P5=64` — verified via
+        src/tests/DiagCollate.pas); the runtime helper just dropped
+        pColl on the floor with a `"no collation support"` TODO.  Now
+        invokes `pColl^.xCmp` when both operands share `pColl^.enc`.
+        UTF-8/UTF-16 transcoding arm (vdbeaux.c:4450) deferred — default
+        UTF-8 build never reaches it.  DiagFeatureProbe COLLATE NOCASE
+        compare → PASS; total divergences 14 → 13.  No
+        TestExplainParity regression (1012 pass / 14 diverge — same).
       [ ] **b) Scalar subquery returns 0 instead of value.**
         With t populated `INSERT INTO t VALUES(42)`, the expression
         `SELECT (SELECT a FROM t)` returns 0 on Pas, 42 on C.  Wraps a

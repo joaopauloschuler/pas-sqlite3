@@ -4854,7 +4854,20 @@ begin
   if (cf and MEM_Str) <> 0 then begin
     if (f1 and MEM_Str) = 0 then begin Result := 1; Exit; end;
     if (f2 and MEM_Str) = 0 then begin Result := -1; Exit; end;
-    { no collation support in this port — fall through to blob compare }
+    { Collation-aware compare (vdbeaux.c:4659..4661, vdbeCompareMemString
+      same-encoding arm).  pColl=nil falls through to blob compare. }
+    if pColl <> nil then begin
+      Assert(Assigned(PTCollSeq(pColl)^.xCmp));
+      if pMem1^.enc = PTCollSeq(pColl)^.enc then begin
+        Result := PTCollSeq(pColl)^.xCmp(PTCollSeq(pColl)^.pUser,
+                                          pMem1^.n, pMem1^.z,
+                                          pMem2^.n, pMem2^.z);
+        Exit;
+      end;
+      { Encoding-change arm (vdbeaux.c:4450) — UTF-8/UTF-16 transcoding
+        not yet ported.  Default UTF-8 build never reaches this branch. }
+    end;
+    { no collation: fall through to blob compare (memcmp) }
   end;
   Result := sqlite3BlobCompare(pMem1, pMem2);
 end;
