@@ -2215,7 +2215,7 @@ function  sqlite3ExprListCompare(pA: PExprList; pB: PExprList;
 // ---------------------------------------------------------------------------
 
 function  sqlite3MatchEName(pItem: PExprListItem; zCol: PAnsiChar;
-  zTab: PAnsiChar; zDb: PAnsiChar; pResult: Pi32): i32;
+  zTab: PAnsiChar; zDb: PAnsiChar; pbRowid: Pi32): i32;
 function  sqlite3ExprColUsed(pExpr: PExpr): Bitmask;
 function  sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 function  sqlite3ResolveExprListNames(pNC: PNameContext;
@@ -6716,11 +6716,43 @@ end;
 // Phase 6.1 — resolve.c stubs (SQLite 3.53.0)
 // ---------------------------------------------------------------------------
 
+{ sqlite3MatchEName — port of resolve.c:125.  Match an SF_NestedFrom result
+  column entry (pItem) against a (zDb, zTab, zCol) triple.  Returns 1 on
+  match, 0 otherwise.  pbRowid is set to 1 when the matching entry is the
+  implicit ENAME_ROWID alias. }
 function sqlite3MatchEName(pItem: PExprListItem; zCol: PAnsiChar;
-  zTab: PAnsiChar; zDb: PAnsiChar; pResult: Pi32): i32;
+  zTab: PAnsiChar; zDb: PAnsiChar; pbRowid: Pi32): i32;
+var
+  n:      i32;
+  zSpan:  PAnsiChar;
+  eName:  i32;
 begin
-  { Phase 6.1 stub — full resolver in Phase 6.2+ }
-  Result := 0;
+  eName := i32(pItem^.fg.eBits and $03);
+  if (eName <> ENAME_TAB) and ((eName <> ENAME_ROWID) or (pbRowid = nil)) then
+    Exit(0);
+  Assert((pbRowid = nil) or (pbRowid^ = 0));
+  zSpan := pItem^.zEName;
+  if zSpan = nil then Exit(0);
+  n := 0;
+  while (zSpan[n] <> #0) and (zSpan[n] <> '.') do Inc(n);
+  if (zDb <> nil)
+     and ((sqlite3_strnicmp(zSpan, zDb, n) <> 0) or (zDb[n] <> #0)) then
+    Exit(0);
+  zSpan := zSpan + (n + 1);
+  n := 0;
+  while (zSpan[n] <> #0) and (zSpan[n] <> '.') do Inc(n);
+  if (zTab <> nil)
+     and ((sqlite3_strnicmp(zSpan, zTab, n) <> 0) or (zTab[n] <> #0)) then
+    Exit(0);
+  zSpan := zSpan + (n + 1);
+  if zCol <> nil then begin
+    if (eName = ENAME_TAB) and (sqlite3StrICmp(zSpan, zCol) <> 0) then
+      Exit(0);
+    if (eName = ENAME_ROWID) and (sqlite3IsRowid(zCol) = 0) then
+      Exit(0);
+  end;
+  if eName = ENAME_ROWID then pbRowid^ := 1;
+  Result := 1;
 end;
 
 function sqlite3ExprColUsed(pExpr: PExpr): Bitmask;

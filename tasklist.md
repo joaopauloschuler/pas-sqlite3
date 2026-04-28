@@ -74,7 +74,14 @@ Important: At the end of this document, please find:
 
     - [ ] **6.10 step 6** Make these to work (port code when required):
         [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
-          VALUES path).
+          VALUES path).  **Runtime impact (verified 2026-04-28 via
+          src/tests/DiagMultiValues.pas):** silent data loss — Pas
+          inserts only the first row (count=1), C inserts all three
+          (count=3).  Stub `sqlite3MultiValues` (codegen.pas:19613)
+          drops every pRow past the first; even if the UNION ALL
+          fallback were ported, `sqlite3Insert` early-exits when
+          `pSelect <> nil` (codegen.pas:19756 TODO) so the coroutine
+          path through sqlite3Insert is required too.
         [ ] **IPK-IN execution path**
             [ ] **6.10 step 6.IPK-IN.b.full** Port 
                 `sqlite3VdbeRecordCompare` in full to cover string (collation
@@ -246,7 +253,7 @@ Important: At the end of this document, please find:
             (build.c:1604); flags any UNIQUE/PK index already attached
             for the column.
   [ ] **6.26** port codegen.pas where / select / window stubs in full from C
-       to pascal: `sqlite3MatchEName`, `sqlite3SelectPopWith`,
+       to pascal: `sqlite3SelectPopWith`,
        `whereRightSubexprIsColumn`, `sqlite3WhereMinMaxOptEarlyOut`,
        `wherePathMatchSubqueryOB`, `sqlite3KeyInfoFromExprList`,
        `sqlite3SelectWalkAssert2`, `sqlite3SelectAddTypeInfo`,
@@ -264,6 +271,12 @@ Important: At the end of this document, please find:
        [X] `sqlite3ColumnSetColl` / `sqlite3ColumnColl` — ported in full
             (build.c:720, build.c:745).  Packs/recovers collation name
             in the zCnName allocation.  Was a Phase 6.6 stub pair.
+       [X] `sqlite3MatchEName` — ported in full (resolve.c:125).  Was a
+            Phase 6.1 stub returning 0; now matches SF_NestedFrom result-
+            column entries against (zDb, zTab, zCol) triples and reports
+            ENAME_ROWID hits via pbRowid.  No call sites yet exercise this
+            (resolveAlias / lookupName paths still gated), so Δ-neutral
+            today; unblocks the SF_NestedFrom resolver work.
   [ ] **6.27** port codegen.pas alter / attach / analyze / vacuum / FK /
        extension / scalar-function stubs in full from C to pascal:
        `sqlite3AlterRenameTable`, `sqlite3AlterFinishAddColumn`,
