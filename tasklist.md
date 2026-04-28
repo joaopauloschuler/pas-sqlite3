@@ -220,12 +220,17 @@ Important: At the end of this document, please find:
   [ ] **6.24** port codegen.pas DML / insert stubs in full from C to pascal:
        `sqlite3UpsertAnalyzeTarget`, `sqlite3UpsertDoUpdate`,
        `sqlite3MaterializeView`, `sqlite3LimitWhere`,
-       `sqlite3ColumnDefault`, `sqlite3TableAffinity`,
+       `sqlite3ColumnDefault`,
        `sqlite3ComputeGeneratedColumns`, `sqlite3AutoincrementBegin`,
        `sqlite3AutoincrementEnd`, `sqlite3MultiValuesEnd`,
        `sqlite3MultiValues`, `autoIncBegin`,
        `sqlite3ExprReferencesUpdatedColumn`,
        `sqlite3GenerateConstraintChecks`.
+       [X] `sqlite3TableAffinity` + `sqlite3TableAffinityStr` — ported
+            in full (insert.c:122, insert.c:179).  STRICT arm reachable
+            once AddColumn lands TF_Strict; non-STRICT arm wired but
+            Δ-neutral until call sites in sqlite3Insert /
+            sqlite3GenerateConstraintChecks switch off the inline path.
        (`sqlite3CompleteInsertion` is now fully ported — see 6.9-bis 11g.2.b.)
   [ ] **6.25** port codegen.pas schema / index stubs in full from C to pascal:
        `sqlite3ReadSchema`, `sqlite3RunParser`.

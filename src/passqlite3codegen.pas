@@ -2328,6 +2328,7 @@ procedure sqlite3Update(pParse: PParse; pTabList: PSrcList;
 
 procedure sqlite3OpenTable(pParse: PParse; iCur: i32; iDb: i32;
   pTab: PTable2; opcode: i32);
+function  sqlite3TableAffinityStr(db: PTsqlite3; pTab: PTable2): PAnsiChar;
 procedure sqlite3TableAffinity(v: PVdbe; pTab: PTable2; iReg: i32);
 procedure sqlite3ComputeGeneratedColumns(pParse: PParse; iRegStore: i32;
   pTab: PTable2);
@@ -19391,10 +19392,91 @@ begin
   sqlite3VdbeAddOp1(v, OP_Close, iSorter);
 end;
 
-{ sqlite3TableAffinity — emit OP_Affinity for INSERT values (Phase 6.4 stub) }
-procedure sqlite3TableAffinity(v: PVdbe; pTab: PTable2; iReg: i32);
+{ sqlite3TableAffinityStr — port of insert.c:122.
+  Compute the affinity string for a table.  Caller frees. }
+function sqlite3TableAffinityStr(db: PTsqlite3; pTab: PTable2): PAnsiChar;
+var
+  zColAff: PAnsiChar;
+  i, j:    i32;
 begin
-  { Phase 6.5 }
+  zColAff := PAnsiChar(sqlite3DbMallocRaw(db, u64(pTab^.nCol) + 1));
+  if zColAff <> nil then
+  begin
+    j := 0;
+    for i := 0 to pTab^.nCol - 1 do
+    begin
+      if (pTab^.aCol[i].colFlags and COLFLAG_VIRTUAL) = 0 then
+      begin
+        zColAff[j] := pTab^.aCol[i].affinity;
+        Inc(j);
+      end;
+    end;
+    repeat
+      zColAff[j] := #0;
+      Dec(j);
+    until (j < 0) or (Byte(zColAff[j]) > SQLITE_AFF_BLOB);
+  end;
+  Result := zColAff;
+end;
+
+{ sqlite3TableAffinity — port of insert.c:179.
+  Generate VDBE to apply column affinities (or OP_TypeCheck for STRICT
+  tables) before a row is gathered into a record. }
+procedure sqlite3TableAffinity(v: PVdbe; pTab: PTable2; iReg: i32);
+var
+  i, p3:    i32;
+  zColAff:  PAnsiChar;
+  pPrev:    PVdbeOp;
+begin
+  if (pTab^.tabFlags and TF_Strict) <> 0 then
+  begin
+    if iReg = 0 then
+    begin
+      sqlite3VdbeAppendP4(v, Pointer(pTab), P4_TABLE);
+      pPrev := sqlite3VdbeGetLastOp(v);
+      AssertH(pPrev <> nil, 'sqlite3TableAffinity: pPrev<>0');
+      AssertH((pPrev^.opcode = OP_MakeRecord) or
+              (sqlite3VdbeDb(v)^.mallocFailed <> 0),
+              'sqlite3TableAffinity: pPrev->opcode==OP_MakeRecord');
+      pPrev^.opcode := OP_TypeCheck;
+      p3 := pPrev^.p3;
+      pPrev^.p3 := 0;
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, pPrev^.p1, pPrev^.p2, p3);
+    end
+    else
+    begin
+      sqlite3VdbeAddOp2(v, OP_TypeCheck, iReg, pTab^.nNVCol);
+      sqlite3VdbeAppendP4(v, Pointer(pTab), P4_TABLE);
+    end;
+    Exit;
+  end;
+  zColAff := pTab^.zColAff;
+  if zColAff = nil then
+  begin
+    zColAff := sqlite3TableAffinityStr(nil, pTab);
+    if zColAff = nil then
+    begin
+      sqlite3OomFault(sqlite3VdbeDb(v));
+      Exit;
+    end;
+    pTab^.zColAff := zColAff;
+  end;
+  AssertH(zColAff <> nil, 'sqlite3TableAffinity: zColAff<>0');
+  i := sqlite3Strlen30NN(zColAff);
+  if i <> 0 then
+  begin
+    if iReg <> 0 then
+    begin
+      sqlite3VdbeAddOp4(v, OP_Affinity, iReg, i, 0, zColAff, i);
+    end
+    else
+    begin
+      AssertH((sqlite3VdbeGetLastOp(v)^.opcode = OP_MakeRecord) or
+              (sqlite3VdbeDb(v)^.mallocFailed <> 0),
+              'sqlite3TableAffinity: last op is MakeRecord');
+      sqlite3VdbeChangeP4(v, -1, zColAff, i);
+    end;
+  end;
 end;
 
 { sqlite3ComputeGeneratedColumns — emit VDBE for generated cols (Phase 6.4 stub) }
