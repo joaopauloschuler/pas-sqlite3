@@ -117,7 +117,10 @@ Important: At the end of this document, please find:
         skeleton-only.  This is the only remaining contributor.
   [ ] **6.12** port sqlite3Pragma in full
   [ ] **6.13** port sqlite3Vacuum in full
-  [ ] **6.14** port sqlite3WhereTabFuncArgs in full
+  [X] **6.14** port sqlite3WhereTabFuncArgs in full (whereexpr.c:1899..1944).
+       Dead code on the current corpus — only exercised by table-valued
+       functions (FROM = vtab(args)) — but ports cleanly so the path is
+       in place once the vtab gate lands.
   [X] **6.15** port sqlite3WhereAddLimit in full (whereexpr.c:1620..1736;
        includes the whereAddLimitExpr helper).  Dead code on the current
        corpus — only exercised by FROM = single virtual table + LIMIT —

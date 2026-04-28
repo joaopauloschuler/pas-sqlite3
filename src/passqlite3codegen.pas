@@ -9287,10 +9287,64 @@ begin
     exprAnalyze(pTabList, pWC, i);
 end;
 
+{ sqlite3WhereTabFuncArgs — port of whereexpr.c:1899..1944.
+
+  For table-valued-functions, transform the function arguments into new
+  WHERE clause terms.  Each function argument translates into an equality
+  constraint against a HIDDEN column in the table. }
 procedure sqlite3WhereTabFuncArgs(pParse: PParse; pItem: PSrcItem;
   pWC: PWhereClause);
+var
+  pTab:     PTable2;
+  j, k:     i32;
+  pArgs:    PExprList;
+  pColRef:  PExpr;
+  pTerm:    PExpr;
+  pRhs:     PExpr;
+  joinType: u32;
+  aColArr:  PColumn;
+  nCol:     i32;
+  aArgItm:  PExprListItem;
 begin
-  { Phase 6.2 stub }
+  if (pItem^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) = 0 then Exit;
+  pTab := pItem^.pSTab;
+  Assert(pTab <> nil);
+  pArgs := pItem^.u1.pFuncArg;
+  if pArgs = nil then Exit;
+  aColArr := pTab^.aCol;
+  nCol := pTab^.nCol;
+  k := 0;
+  j := 0;
+  aArgItm := ExprListItems(pArgs);
+  while j < pArgs^.nExpr do
+  begin
+    while (k < nCol) and ((aColArr[k].colFlags and COLFLAG_HIDDEN) = 0) do
+      Inc(k);
+    if k >= nCol then
+    begin
+      sqlite3ErrorMsg(pParse, PAnsiChar(AnsiString(
+        Format('too many arguments on %s() - max %d',
+          [string(pTab^.zName), j]))));
+      Exit;
+    end;
+    pColRef := sqlite3ExprAlloc(pParse^.db, TK_COLUMN, nil, 0);
+    if pColRef = nil then Exit;
+    pColRef^.iTable  := pItem^.iCursor;
+    pColRef^.iColumn := i16(k);
+    Inc(k);
+    pColRef^.y.pTab  := pTab;
+    pItem^.colUsed   := pItem^.colUsed or sqlite3ExprColUsed(pColRef);
+    pRhs := sqlite3PExpr(pParse, TK_UPLUS,
+              sqlite3ExprDup(pParse^.db, aArgItm[j].pExpr, 0), nil);
+    pTerm := sqlite3PExpr(pParse, TK_EQ, pColRef, pRhs);
+    if (pItem^.fg.jointype and (JT_LEFT or JT_RIGHT)) <> 0 then
+      joinType := EP_OuterON
+    else
+      joinType := EP_InnerON;
+    sqlite3SetJoinExpr(pTerm, pItem^.iCursor, joinType);
+    whereClauseInsert(pWC, pTerm, TERM_DYNAMIC);
+    Inc(j);
+  end;
 end;
 
 { whereAddLimitExpr — port of whereexpr.c:1620..1651.
