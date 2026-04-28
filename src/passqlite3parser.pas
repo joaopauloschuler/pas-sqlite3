@@ -2169,25 +2169,82 @@ begin
   end;
 end;
 
-{ sqlite3CteNew — allocate a Cte node (build.c:131988).  Phase 7.2e.7 stub }
-{ returns nil and frees its inputs.  Once build.c's CTE helpers are ported }
-{ in Phase 8, replace this with the full body.                              }
+{ sqlite3CteNew — allocate a Cte node (build.c:5702). Faithful port. }
 function sqlite3CteNew(pPse: PParse; pName: PToken; pArglist: PExprList;
                        pQuery: PSelect; eM10d: u8): Pointer;
+var
+  db:   PTsqlite3;
+  pNew: PCte;
 begin
-  Result := nil;
-  sqlite3ExprListDelete(pPse^.db, pArglist);
-  sqlite3SelectDelete(pPse^.db, pQuery);
+  db := pPse^.db;
+  pNew := PCte(sqlite3DbMallocZero(db, SZ_CTE));
+  Assert((pNew <> nil) or (db^.mallocFailed <> 0));
+  if db^.mallocFailed <> 0 then begin
+    sqlite3ExprListDelete(db, pArglist);
+    sqlite3SelectDelete(db, pQuery);
+  end else begin
+    pNew^.pSelect := pQuery;
+    pNew^.pCols   := pArglist;
+    pNew^.zName   := sqlite3NameFromToken(db, pName);
+    pNew^.eM10d   := eM10d;
+  end;
+  Result := pNew;
 end;
 
-{ sqlite3WithAdd — append a Cte to a With list (build.c:132039).            }
-{ Stub: returns the existing With pointer unchanged and frees the Cte.     }
-{ Sufficient for parser-only flow; Phase 8 must port the real body.        }
-function sqlite3WithAdd(pPse: PParse; pWith: Pointer; pCte: Pointer): Pointer;
+{ sqlite3WithAdd — append a Cte to a With list (build.c:5753). Faithful port.
+  pWith may be nil (allocate a fresh With for one CTE) or an existing With
+  (realloc to fit one more CTE).  Reports duplicate WITH names via
+  sqlite3ErrorMsg. }
+function sqlite3WithAdd(pPse: PParse; pWthIn: Pointer; pCteIn: Pointer): Pointer;
+var
+  db:    PTsqlite3;
+  pNew:  PWith;
+  pOld:  PWith;
+  pCt:   PCte;
+  zName: PAnsiChar;
+  i:     i32;
+  pSlot: PCte;
+  pBase: PCte;
+  zMsg:  PAnsiChar;
 begin
-  Result := pWith;
-  { pCte is opaque here (no PCte type yet); leak-free path is Phase 8's. }
-  if pCte = nil then ;
+  pCt  := PCte(pCteIn);
+  pOld := PWith(pWthIn);
+  if pCt = nil then begin
+    Result := pWthIn;
+    Exit;
+  end;
+  db    := pPse^.db;
+  zName := pCt^.zName;
+  if (zName <> nil) and (pOld <> nil) then begin
+    pBase := PCte(PByte(pOld) + SZ_WITH_HEADER);
+    for i := 0 to pOld^.nCte - 1 do begin
+      pSlot := PCte(PByte(pBase) + PtrUInt(i) * SZ_CTE);
+      if sqlite3StrICmp(zName, pSlot^.zName) = 0 then begin
+        zMsg := sqlite3MPrintf(db, 'duplicate WITH table name: %s', [zName]);
+        if zMsg <> nil then begin
+          sqlite3ErrorMsg(pPse, zMsg);
+          sqlite3DbFree(db, zMsg);
+        end;
+      end;
+    end;
+  end;
+  if pOld <> nil then
+    pNew := PWith(sqlite3DbRealloc(db, pOld,
+              SZ_WITH_HEADER + PtrUInt(pOld^.nCte + 1) * SZ_CTE))
+  else
+    pNew := PWith(sqlite3DbMallocZero(db, SZ_WITH_HEADER + SZ_CTE));
+  Assert(((pNew <> nil) and (zName <> nil)) or (db^.mallocFailed <> 0));
+  if db^.mallocFailed <> 0 then begin
+    sqlite3CteDelete(db, pCt);
+    pNew := pOld;
+  end else begin
+    pSlot := PCte(PByte(pNew) + SZ_WITH_HEADER +
+                  PtrUInt(pNew^.nCte) * SZ_CTE);
+    pSlot^ := pCt^;
+    Inc(pNew^.nCte);
+    sqlite3DbFree(db, pCt);
+  end;
+  Result := pNew;
 end;
 
 { sqlite3DequoteNumber — strip digit-separator '_' from a QNUMBER literal,  }

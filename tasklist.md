@@ -399,11 +399,19 @@ Important: At the end of this document, please find:
        `sqlite3ExprListAppendVector` (blocked on
        `sqlite3ExprForVectorField`, expr.c:1893),
        `sqlite3TriggerUpdateStep` + Insert/Delete/Select step
-       siblings (blocked on trigger.c step-builder port),
-       `sqlite3CteNew`, `sqlite3WithAdd` (blocked on full TCte
-       record definition; current TWith is a 64-byte opaque stub).
+       siblings (blocked on trigger.c step-builder port).
        (`addModuleArgument` already fully ported — parser.pas:2020.
        `sqlite3Reindex` ported in full — parser.pas:1821.)
+       [X] `sqlite3CteNew` / `sqlite3WithAdd` — ported in full
+            (build.c:5702, 5753) 2026-04-28.  TWith stub replaced with
+            faithful header layout (nCte/bView/pOuter + flex array of
+            TCte = zName/pCols/pSelect/zCteErr/pUse/eM10d, sizeof=48).
+            sqlite3WithDelete + sqlite3CteDelete + cteClear added so the
+            CTE allocations are released cleanly; duplicate-name check
+            via sqlite3MPrintf + sqlite3ErrorMsg.  Δ-neutral on
+            TestExplainParity (1012 pass / 14 diverge); CTE codegen
+            still gated on full select.c CTE expansion, so DiagFeatureProbe
+            CTE probes still diverge.
   [ ] **6.21** port vdbe.pas stubs in full from C to pascal:
        `sqlite3VdbeMultiLoad` (blocked: only used by pragma.c and
        requires va_list — defer until 6.12 sqlite3Pragma lands),

@@ -370,6 +370,7 @@ type
   PDbFixer     = ^TDbFixer;
   PToken       = ^TToken;
   PWith        = ^TWith;
+  PCte         = ^TCte;
   PExprListItem = ^TExprListItem;
 
   { Phase 6.2 primitive aliases }
@@ -953,10 +954,23 @@ type
   { Pointer-to-pointer token type }
   PPToken = ^PToken;
 
-  { --- TWith (opaque stub — full in Phase 6.5) --- }
+  { --- TCte (sizeof=48) — sqliteInt.h:4454 --- }
+  TCte = record
+    zName:    PAnsiChar;     { 8 @ 0  }
+    pCols:    PExprList;     { 8 @ 8  }
+    pSelect:  PSelect;       { 8 @ 16 }
+    zCteErr:  PAnsiChar;     { 8 @ 24 }
+    pUse:     PCteUse;       { 8 @ 32 }
+    eM10d:    u8;            { 1 @ 40 }
+    _pad:     array[0..6] of u8;  { 7 @ 41 → record size 48 }
+  end;
+
+  { --- TWith (header sizeof=16; flex array a[N] of TCte) — sqliteInt.h:4474 --- }
   TWith = record
-    nCte: i32;
-    _rest: array[0..63] of u8;
+    nCte:   i32;             { 4 @ 0  }
+    bView:  i32;             { 4 @ 4  }
+    pOuter: PWith;           { 8 @ 8  }
+    a:      array[0..0] of TCte; { flex; allocations use SZ_WITH_HEADER + N*SZ_CTE }
   end;
 
   // -----------------------------------------------------------------------
@@ -2003,6 +2017,7 @@ function  sqlite3Select(pParse: PParse; p: PSelect;
 procedure sqlite3DeleteTable(db: PTsqlite3; pTab: PTable2);
 procedure sqlite3WithDelete(db: PTsqlite3; pWth: PWith);
 procedure sqlite3WithDeleteGeneric(db: PTsqlite3; p: Pointer);
+procedure sqlite3CteDelete(db: PTsqlite3; pCte: PCte);
 { sqlite3WindowListDelete and sqlite3WindowUnlinkFromSelect declared in Phase 6.7 block below }
 function  sqlite3OomFault(db: PTsqlite3): Pointer;
 function  sqlite3ExprNNCollSeq(pParse: PParse; pE: PExpr): Pointer;
@@ -18048,10 +18063,37 @@ begin
   sqlite3DbFree(db, pTab);
 end;
 
-{ sqlite3WithDelete — free a With object }
-procedure sqlite3WithDelete(db: PTsqlite3; pWth: PWith);
+{ cteClear — free interior allocations of a Cte (build.c:5731). Does not
+  free the Cte itself. }
+procedure cteClear(db: PTsqlite3; pCte: PCte);
 begin
-  if pWth <> nil then sqlite3DbFree(db, pWth);
+  Assert(pCte <> nil);
+  sqlite3ExprListDelete(db, pCte^.pCols);
+  sqlite3SelectDelete(db, pCte^.pSelect);
+  sqlite3DbFree(db, pCte^.zName);
+end;
+
+{ sqlite3CteDelete — free a free-standing Cte (build.c:5741) }
+procedure sqlite3CteDelete(db: PTsqlite3; pCte: PCte);
+begin
+  Assert(pCte <> nil);
+  cteClear(db, pCte);
+  sqlite3DbFree(db, pCte);
+end;
+
+{ sqlite3WithDelete — free a With object (build.c:5799). Walks every CTE
+  in the flex array and clears it before releasing the With itself. }
+procedure sqlite3WithDelete(db: PTsqlite3; pWth: PWith);
+var
+  i: i32;
+  pBase: PCte;
+begin
+  if pWth <> nil then begin
+    pBase := PCte(PByte(pWth) + SZ_WITH_HEADER);
+    for i := 0 to pWth^.nCte - 1 do
+      cteClear(db, PCte(PByte(pBase) + PtrUInt(i) * SZ_CTE));
+    sqlite3DbFree(db, pWth);
+  end;
 end;
 
 procedure sqlite3WithDeleteGeneric(db: PTsqlite3; p: Pointer);
