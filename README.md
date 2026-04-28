@@ -146,9 +146,9 @@ pas-sqlite3/
 | 3 | Page cache + Pager + WAL | ✅ Done |
 | 4 | B-tree | ✅ Done |
 | 5 | VDBE bytecode interpreter | ✅ Done |
-| 6 | Code generators (SQL → VDBE) | 🚧 In progress (1016/1026 EXPLAIN parity; runtime sweeps 6.10..6.27) |
-| 7 | Parser (tokenizer + Lemon grammar) | 🚧 In progress (7.4b/7.4c bytecode-/trace-diff gates open) |
-| 8 | Public API | 🚧 In progress (8.10 sample-program gate open) |
+| 6 | Code generators (SQL → VDBE) | 🚧 In progress |
+| 7 | Parser (tokenizer + Lemon grammar) | 🚧 In progress |
+| 8 | Public API | 🚧 In progress |
 | 10 | CLI tool (`shell.c` → `passqlite3shell.pas`) | 🔲 Pending |
 | 11 | Benchmarks (Pascal `speedtest1` port) | 🔲 Pending |
 | 12 | Acceptance: differential + fuzz testing | 🔲 Pending |
