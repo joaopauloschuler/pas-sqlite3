@@ -143,13 +143,13 @@ Important: At the end of this document, please find:
         emitted by the GenerateConstraintChecks path.  Re-test once
         those land; if still failing, the DEFAULT-expr lowering itself
         is broken.
-      [ ] **b) Hex integer literal decoded as 0.**  `INSERT INTO t
-        VALUES(0x1F); SELECT a FROM t` returns 31 on C, 0 on Pas.
-        Both prepare and step succeed, so the value is being parsed
-        but lost during codegen / OP_Integer emission.  Likely a bug
-        in `codeInteger` / `sqlite3DecOrHexToI64` wiring — TK_INTEGER
-        with leading "0x" prefix.  Distinct from the IPK / autoindex
-        gaps and not blocked on any larger port.
+      [X] **b) Hex integer literal decoded as 0.**  Fixed by porting
+        the missing hex arm in `sqlite3GetInt32` (util.c:1298..1326);
+        previous decimal-only scan stopped at "0", set EP_IntValue
+        with iValue=0, and codeInteger emitted OP_Integer 0.  Hex
+        literals now flow through as i32 (or fall back to the zToken
+        + sqlite3DecOrHexToI64 path for >32-bit values).  Verified
+        via DiagMisc "INSERT hex literal" → PASS.
       [ ] **c) Aggregate `count(*)` with WHERE returns no row.**
         On a table populated via setup,
         `SELECT count(*) FROM t WHERE a IS NULL` (and the `IS NOT

@@ -2731,30 +2731,57 @@ begin
   sqlite3DbFreeNN(db, p);
 end;
 
-{ util.c: sqlite3GetInt32 — parse a decimal integer string into *pValue.
-  Returns 1 on success (fits in i32), 0 on failure. }
+{ sqlite3GetInt32 — port of util.c:1298.  Parses an integer literal
+  (decimal or 0x-prefixed hex) into *pValue.  Returns 1 on success
+  (fits in i32 / u32 for hex), 0 on failure. }
 function sqlite3GetInt32(zNum: PAnsiChar; pValue: Pi32): i32;
 var
   v:    i64;
-  neg:  Boolean;
+  c:    i32;
+  i:    i32;
+  neg:  i32;
   p:    PAnsiChar;
+  u:    u32;
 begin
   Result := 0;
   if zNum = nil then Exit;
   p   := zNum;
-  neg := False;
-  if p^ = '-' then begin neg := True; Inc(p); end
-  else if p^ = '+' then Inc(p);
-  if not (p^ in ['0'..'9']) then Exit;
-  v := 0;
-  while p^ in ['0'..'9'] do
+  neg := 0;
+  if p^ = '-' then begin neg := 1; Inc(p); end
+  else if p^ = '+' then Inc(p)
+  else if (p[0] = '0') and ((p[1] = 'x') or (p[1] = 'X'))
+          and (sqlite3Isxdigit(Ord(p[2])) <> 0) then
   begin
-    v := v * 10 + (Ord(p^) - Ord('0'));
-    if v > $80000000 then Exit;
-    Inc(p);
+    u := 0;
+    Inc(p, 2);
+    while p^ = '0' do Inc(p);
+    i := 0;
+    while (i < 8) and (sqlite3Isxdigit(Ord(p[i])) <> 0) do
+    begin
+      u := u * 16 + sqlite3HexToInt(Ord(p[i]));
+      Inc(i);
+    end;
+    if ((u and $80000000) = 0) and (sqlite3Isxdigit(Ord(p[i])) = 0) then
+    begin
+      if pValue <> nil then Move(u, pValue^, 4);
+      Result := 1;
+    end;
+    Exit;
   end;
-  if neg then v := -v;
-  if (v < Low(i32)) or (v > High(i32)) then Exit;
+  if not (p^ in ['0'..'9']) then Exit;
+  while p^ = '0' do Inc(p);
+  v := 0;
+  i := 0;
+  while i < 11 do
+  begin
+    c := Ord(p[i]) - Ord('0');
+    if (c < 0) or (c > 9) then Break;
+    v := v * 10 + c;
+    Inc(i);
+  end;
+  if i > 10 then Exit;
+  if v - neg > 2147483647 then Exit;
+  if neg <> 0 then v := -v;
   if pValue <> nil then pValue^ := i32(v);
   Result := 1;
 end;
