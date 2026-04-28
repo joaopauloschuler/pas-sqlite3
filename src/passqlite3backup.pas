@@ -598,4 +598,15 @@ begin
   Result := rc;
 end;
 
+{ pager_reset (pager.c:1772) calls sqlite3BackupRestart, but passqlite3backup
+  uses passqlite3pager.  Install ourselves via the hook variable so the call
+  goes through without a circular unit dependency. }
+procedure pagerBackupRestartHook(pHead: Pointer);
+begin
+  sqlite3BackupRestart(PSqlite3Backup(pHead));
+end;
+
+initialization
+  sqlite3PagerBackupRestartFn := @pagerBackupRestartHook;
+
 end.

@@ -404,6 +404,16 @@ function  sqlite3PagerBackupPtr(pPager: PPager): PPointer;
 { pager.c:6857 — drop every page out of the page cache. }
 procedure sqlite3PagerClearCache(pPager: PPager);
 
+{ Cross-unit hook: backup.c's sqlite3BackupRestart, installed by
+  passqlite3backup at unit initialisation.  Faithful port of pager_reset
+  needs to call sqlite3BackupRestart, but passqlite3backup `uses`
+  passqlite3pager — direct call would cycle.  Hook breaks the cycle while
+  keeping behaviour identical to the C source. }
+type
+  TPagerBackupRestartProc = procedure(pBackupHead: Pointer);
+var
+  sqlite3PagerBackupRestartFn: TPagerBackupRestartProc;
+
 implementation
 
 { ============================================================
@@ -1456,7 +1466,8 @@ end;
 procedure pager_reset(pPager: PPager);
 begin
   Inc(pPager^.iDataVersion);
-  { sqlite3BackupRestart is a no-op stub until Phase 8.7 (pPager^.pBackup is nil) }
+  if Assigned(sqlite3PagerBackupRestartFn) then
+    sqlite3PagerBackupRestartFn(pPager^.pBackup);
   sqlite3PcacheClear(pPager^.pPCache);
 end;
 
@@ -3574,9 +3585,22 @@ end_playback:
   Result := rc;
 end;
 
-{ sqlite3.h: sqlite3_log -- stub: no error log callback in this port phase }
+{ printf.c:1499 — sqlite3_log.  C uses varargs + sqlite3_str_vappendf to
+  format zFormat; Pas callers pre-render the message with Format() and
+  pass it as zMsg, so this port skips the format step and dispatches the
+  finished message directly to the configured xLog callback. }
+type
+  TSqlite3LogCallback = procedure(pArg: Pointer; iErrCode: i32; zMsg: PChar); cdecl;
+
 procedure sqlite3_log(iErrCode: i32; zMsg: PChar);
+var
+  xLog: TSqlite3LogCallback;
 begin
+  if sqlite3GlobalConfig.xLog <> nil then
+  begin
+    xLog := TSqlite3LogCallback(sqlite3GlobalConfig.xLog);
+    xLog(sqlite3GlobalConfig.pLogArg, iErrCode, zMsg);
+  end;
 end;
 
 { pager.c ~2635: pager_delsuper -- delete super-journal if no children reference it }

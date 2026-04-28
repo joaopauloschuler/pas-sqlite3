@@ -128,8 +128,13 @@ Important: At the end of this document, please find:
        gate lands.
   [X] **6.16** port btree.pas stubs in full from C to pascal:
        `ptrmapPutOvflPtr`, `invalidateIncrblobCursors`.
-  [ ] **6.17** port pager.pas stubs in full from C to pascal:
+  [X] **6.17** port pager.pas stubs in full from C to pascal:
        `pager_reset`, `pagerReleaseMapPage`, `sqlite3_log`.
+       (`pagerReleaseMapPage` was already a 1:1 port; `pager_reset`
+       now invokes `sqlite3BackupRestart` via a function-pointer hook
+       installed by passqlite3backup at unit init — direct call would
+       cycle the uses graph; `sqlite3_log` now dispatches to
+       `sqlite3GlobalConfig.xLog(pLogArg, iErrCode, zMsg)`.)
   [ ] **6.18** port wal.pas stub `sqlite3_log_wal` in full from C to pascal.
   [ ] **6.19** port util.pas stub `sqlite3_mprintf` in full from C to pascal.
   [ ] **6.20** port parser.pas stubs in full from C to pascal:
