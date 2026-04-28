@@ -263,13 +263,11 @@ Important: At the end of this document, please find:
         `SELECT count(*) FROM pragma_table_info('t')` returns no row.
         Tracked under 6.12 (sqlite3Pragma).
 
-  [ ] **6.10 step 10** Built-in scalar function bugs (surfaced via the
-      DiagFunctions probe — `src/tests/DiagFunctions.pas`, run with
-      `LD_LIBRARY_PATH=$PWD/src bin/DiagFunctions`)
+  [X] **6.10 step 10** DiagFunctions — all divergences closed (65/0
+      verified 2026-04-28).
 
-  [ ] **6.10 step 11** Runtime divergences surfaced by the new
-      `src/tests/DiagDate.pas` probe (date/time + scalar coercion).
-      Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagDate`.
+  [X] **6.10 step 11** DiagDate — all divergences closed (41/0 verified
+      2026-04-28).
 
   [X] **6.10 step 12** DiagMoreFunc — all divergences closed.
 
