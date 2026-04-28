@@ -3,9 +3,17 @@
 A faithful line-by-line port of **SQLite 3.53.0** (D. Richard Hipp et al.)
 from C to **Free Pascal (FPC 3.2.2+)** targeting x86-64 Linux.
 
-> **Status: Phase 0 of 12 complete** — infrastructure and build scaffolding
-> in place.  No SQLite logic has been ported yet; the differential-testing
-> oracle is the focus of the next phases.
+> **Status: Phases 0–5 complete; Phase 6 in flight; Phases 7–8
+> largely landed.**  The Pascal port now opens databases, parses SQL,
+> generates VDBE bytecode, and runs queries end-to-end against its own
+> pager / B-tree / VDBE.  `TestExplainParity` reports **1016 / 1026** SQL
+> statements producing byte-identical VDBE bytecode versus the C reference,
+> with the remaining 10 divergences enumerated in `tasklist.md` (mostly
+> ORDER BY sorter, GROUP BY, multi-row VALUES, sub-FROM materialisation,
+> the autovacuum DROP TABLE follow-on, and the `INNER JOIN` aggregate
+> bloom-filter KeyInfo gap).  Differential probes (`DiagOps`, `DiagCast`,
+> `DiagDate`, `DiagFunctions`, `DiagMoreFunc`, `DiagFeatureProbe`, ...)
+> drive the remaining runtime gaps.
 
 ---
 
@@ -86,12 +94,39 @@ pas-sqlite3/
 ├── src/
 │   ├── passqlite3.inc          compiler directives (included first in every unit)
 │   ├── passqlite3types.pas     primitive types, result codes, open flags, limits
-│   ├── passqlite3internal.pas  shared constants from sqliteInt.h (built progressively)
+│   ├── passqlite3internal.pas  shared constants from sqliteInt.h
+│   ├── passqlite3util.pas      hash, varint, printf glue, mprintf, UTF helpers
+│   ├── passqlite3printf.pas    sqlite3_snprintf / %!.*g / sqlite3RenderNumF
+│   ├── passqlite3os.pas        VFS, POSIX file locks, mutexes
+│   ├── passqlite3pcache.pas    page cache
+│   ├── passqlite3pager.pas     pager + journal
+│   ├── passqlite3wal.pas       write-ahead log
+│   ├── passqlite3btree.pas     B-tree
+│   ├── passqlite3vdbe.pas      VDBE bytecode interpreter
+│   ├── passqlite3codegen.pas   SQL → VDBE code generators (build/select/expr/where/...)
+│   ├── passqlite3parser.pas    tokenizer + Lemon grammar
+│   ├── passqlite3main.pas      public sqlite3_* API surface
+│   ├── passqlite3backup.pas    online backup API
+│   ├── passqlite3vtab.pas      virtual-table interface
+│   ├── passqlite3json.pas      JSON1 extension
+│   ├── passqlite3jsoneach.pas  json_each / json_tree table-valued fns
+│   ├── passqlite3carray.pas    carray() table-valued function
+│   ├── passqlite3dbpage.pas    sqlite_dbpage virtual table
+│   ├── passqlite3dbstat.pas    sqlite_dbstat virtual table
 │   ├── csqlite3.pas            cdecl bindings to libsqlite3.so (tests only)
 │   └── tests/
 │       ├── build.sh            build script
 │       ├── vectors/            canonical .db files and .sql scripts
-│       └── TestSmoke.pas       build-system health check
+│       ├── TestSmoke.pas       build-system health check
+│       ├── TestExplainParity.pas   primary VDBE-bytecode parity gate
+│       ├── TestParser.pas / TestSelectBasic.pas / TestDMLBasic.pas /
+│       │   TestWhereBasic.pas / TestVdbeAgg.pas / TestSchemaBasic.pas /
+│       │   TestVdbeRecord.pas / TestBtreeCompat.pas / TestPager*.pas /
+│       │   TestPCache.pas / TestOSLayer.pas / TestPrepareBasic.pas / ...
+│       │   per-layer differential tests
+│       └── Diag*.pas               focused runtime-divergence probes
+│                                   (DiagOps, DiagCast, DiagDate, DiagFunctions,
+│                                    DiagMoreFunc, DiagFeatureProbe, ...)
 ├── bin/                        compiled test binaries
 ├── install_dependencies.sh
 ├── LICENSE                     public domain (matching upstream SQLite)
@@ -106,18 +141,18 @@ pas-sqlite3/
 | Phase | Contents | Status |
 |-------|----------|--------|
 | 0 | Infrastructure (inc, types, csqlite3, build scripts) | ✅ Done |
-| 1 | OS abstraction (VFS, POSIX locks, mutexes) | 🔲 Pending |
-| 2 | Utilities (varint, hash, printf, random, UTF) | 🔲 Pending |
-| 3 | Page cache + Pager + WAL | 🔲 Pending |
-| 4 | B-tree | 🔲 Pending |
-| 5 | VDBE bytecode interpreter | 🔲 Pending |
-| 6 | Code generators (SQL → VDBE) | 🔲 Pending |
-| 7 | Parser (tokenizer + Lemon grammar) | 🔲 Pending |
-| 8 | Public API | 🔲 Pending |
-| 9 | Acceptance: differential + fuzz testing | 🔲 Pending |
-| 10 | Benchmarks | 🔲 Pending |
-| 11 | Performance optimisation | 🔲 Pending |
-| 12 | CLI tool (shell.c) | 🔲 Pending |
+| 1 | OS abstraction (VFS, POSIX locks, mutexes) | ✅ Done |
+| 2 | Utilities (varint, hash, printf, random, UTF) | ✅ Done |
+| 3 | Page cache + Pager + WAL | ✅ Done |
+| 4 | B-tree | ✅ Done |
+| 5 | VDBE bytecode interpreter | ✅ Done |
+| 6 | Code generators (SQL → VDBE) | 🚧 In progress (1016/1026 EXPLAIN parity; runtime sweeps 6.10..6.27) |
+| 7 | Parser (tokenizer + Lemon grammar) | 🚧 In progress (7.4b/7.4c bytecode-/trace-diff gates open) |
+| 8 | Public API | 🚧 In progress (8.10 sample-program gate open) |
+| 10 | CLI tool (`shell.c` → `passqlite3shell.pas`) | 🔲 Pending |
+| 11 | Benchmarks (Pascal `speedtest1` port) | 🔲 Pending |
+| 12 | Acceptance: differential + fuzz testing | 🔲 Pending |
+| 13 | Performance optimisation | 🔲 Pending |
 
 See `tasklist.md` for the full per-task breakdown.
 
