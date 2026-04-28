@@ -50,12 +50,17 @@ Important: At the end of this document, please find:
        [ ] `sqlite3VdbeExplain` — returns `0`; must emit `OP_Explain`
             via `sqlite3VdbeAddOp4` and call `sqlite3VdbeScanStatus`.
             Required for EXPLAIN QUERY PLAN.
-       [ ] `sqlite3VdbeExplainPop` — empty body; must restore
-            `pParse^.addrExplain` to parent via
-            `sqlite3VdbeExplainParent`.
-       [ ] `sqlite3VdbeEnter` / `sqlite3VdbeLeave` — empty; acquire /
-            release per-btree mutexes from `p^.lockMask`.  Required for
-            shared-cache / multi-thread builds.
+       [X] `sqlite3VdbeExplainPop` — closed 2026-04-28.  vdbe.pas now
+            mirrors the C one-liner: `pParse^.addrExplain :=
+            sqlite3VdbeExplainParent(pParse)`, reusing the existing
+            offset-312 access into Parse used by ExplainParent.
+       [ ] `sqlite3VdbeEnter` / `sqlite3VdbeLeave` — empty bodies.
+            In C these are gated on
+            `!defined(SQLITE_OMIT_SHARED_CACHE) && SQLITE_THREADSAFE>0`
+            and early-out via `DbMaskAllZero(p->lockMask)` in the common
+            single-cache case.  Pas port has no shared-cache, so empty
+            bodies match the OMIT_SHARED_CACHE compile path; full bodies
+            land with the shared-cache port.
 
        Bytecode virtual table (vdbevtab.c):
        [ ] `sqlite3VdbeBytecodeVtabInit` — returns `SQLITE_OK`; must
@@ -80,13 +85,12 @@ Important: At the end of this document, please find:
             `pragma_*` eponymous virtual tables via
             `sqlite3VtabCreateModule` + `pragmaVtabModule`.
 
-       Btree mutex (btmutex.c / btree.c):
-       [ ] `sqlite3BtreeHoldsAllMutexes` — returns `1`; in C walks
-            `db^.aDb[]` checking each shared btree's mutex.  Acceptable
-            in single-threaded mode but must be ported for shared cache.
-       [ ] `sqlite3BtreeSchemaLocked` — returns `0`; in C calls
-            `querySharedCacheTableLock(p, SCHEMA_ROOT, READ_LOCK)`.
-            Acceptable without shared cache; required otherwise.
+       Btree mutex (btmutex.c / btree.c) — both gated on `#ifndef NDEBUG`
+       and called only inside `assert()`.  Default Pas build is NDEBUG-
+       equivalent, so the stubs are never invoked.  Land with the shared-
+       cache / debug-assert port:
+       [ ] `sqlite3BtreeHoldsAllMutexes` — assert-only helper.
+       [ ] `sqlite3BtreeSchemaLocked` — assert-only helper.
 
 - [ ] **6.9-bis 11g.2.b** Port `sqlite3WhereBegin` / `sqlite3WhereEnd` in full.  
     Bookkeeping primitives, prologue,

@@ -2807,7 +2807,13 @@ begin
 end;
 
 procedure sqlite3VdbeExplainPop(pParse: PParse);
+{ Port of vdbeaux.c:548.  Pop the EXPLAIN QUERY PLAN stack one level by
+  resetting pParse^.addrExplain to the parent's address.  The C body is
+  a one-liner: pParse->addrExplain = sqlite3VdbeExplainParent(pParse);
+  Parse.addrExplain lives at offset 312 (same offset used by
+  sqlite3VdbeExplainParent above). }
 begin
+  PInt32(PByte(pParse) + 312)^ := sqlite3VdbeExplainParent(pParse);
 end;
 
 { --- ParseSchema and EndCoroutine --- }
