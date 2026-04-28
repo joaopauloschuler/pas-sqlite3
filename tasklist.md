@@ -418,18 +418,23 @@ Important: At the end of this document, please find:
   [ ] **6.10 step 12** Runtime divergences surfaced by the new
       `src/tests/DiagMoreFunc.pas` probe (built-in functions / expression
       edges).  Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagMoreFunc`.
-      Initial run 2026-04-28 reported 27 divergences; 17 remain after
-      fixes to TRUE/FALSE, printf width/flags, %e, %c, %q, %Q.
-      [ ] **a) Default arm of `sqlite3ExprCodeTarget` emits OP_Null
-        for TK_BETWEEN / TK_IN / TK_AND / TK_OR.**  Affects scalar
-        evaluation of `5 BETWEEN 1 AND 10`, `3 IN (1,2,3)`, `NOT
-        BETWEEN`, `NOT IN`.  Pas yields SQLITE_NULL; C yields the
-        expected 0/1.  Port the missing arms in
-        `passqlite3codegen.pas:5435..5445` from C `expr.c`
-        (`sqlite3ExprCodeTarget` arms ~5340..5440 — TK_AND/TK_OR
-        short-circuit emit; TK_BETWEEN dispatches to
-        `exprCodeBetween` with destIfFalse->target=0; TK_IN goes
-        through `sqlite3ExprCodeIN`).
+      Initial run 2026-04-28 reported 27 divergences; 11 remain after
+      fixes to TRUE/FALSE, printf width/flags, %e, %c, %q, %Q,
+      TK_AND/TK_OR/TK_BETWEEN/TK_IN scalar arms.
+      [X] **a) Default arm of `sqlite3ExprCodeTarget` emits OP_Null
+        for TK_BETWEEN / TK_IN / TK_AND / TK_OR.**  Fixed 2026-04-28.
+        Ported the four scalar arms from expr.c:5208..5512 — TK_AND/
+        TK_OR inline `exprCodeTargetAndOr` (sqlite3ExprSimplifiedAndOr
+        + exprEvalRhsFirst + short-circuit OP_If/OP_IfNot when one
+        operand is a sub-select); TK_IN emits Null/<test>/Integer 1/
+        AddImm via sqlite3ExprCodeIN with split labels; TK_BETWEEN
+        dispatches through exprCodeBetween's new `jumpKind=0` scalar
+        arm (signature changed from `jumpIsTrue: Boolean` to
+        `jumpKind: i32` so the xJump=NULL path can route through
+        sqlite3ExprCodeTarget on the synthesised AND).  Verified
+        DiagMoreFunc BETWEEN true/false / NOT BETWEEN / IN literal
+        yes/no / NOT IN → all PASS (17 → 11 divergences).
+        TestExplainParity unchanged (1012 pass / 14 diverge).
       [X] **b) `TRUE` / `FALSE` keyword literals return NULL.**
         Fixed 2026-04-28.  `SELECT TRUE` lands at parse time as a bare
         TK_ID whose TK_TRUEFALSE rewrite (resolve.c:747) was only

@@ -3885,6 +3885,9 @@ function codeCompare(pParse: PParse; pLeft, pRight: PExpr;
   opcode, in1, in2, dest, jumpIfNull, isCommuted: i32): i32; forward;
 function emitScalarFunctionCall(pParse: PParse; pExpr: PExpr;
   target: i32): Boolean; forward;
+procedure exprCodeBetween(pParse: PParse; pExpr: PExpr; dest: i32;
+  jumpKind: i32; jumpIfNull: i32); forward;
+function exprEvalRhsFirst(pExpr: PExpr): i32; forward;
 
 function exprDup_(db: PTsqlite3; const p: PExpr; dupFlags: i32;
   pEdupBuf: Pointer): PExpr;
@@ -4923,6 +4926,14 @@ var
   bNormal:    i32;
   p5:         i32;
   pLeft:      PExpr;
+  { TK_AND/TK_OR locals }
+  skipOp:     i32;
+  addrSkip:   i32;
+  regSS:      i32;
+  pAlt:       PExpr;
+  { TK_IN locals }
+  inDestIfFalse: i32;
+  inDestIfNull:  i32;
   { TK_CASE locals }
   caseEndLabel:  i32;
   caseNextCase:  i32;
@@ -5433,14 +5444,82 @@ begin
           done := True;
         end;
       end;
+    TK_AND, TK_OR:
+      begin
+        { Port of expr.c:5208..5212 + exprCodeTargetAndOr (expr.c:4848..4914).
+          AND/OR with short-circuit when one operand is a sub-select. }
+        Assert(TK_AND = OP_And);
+        Assert(TK_OR  = OP_Or);
+        pAlt := sqlite3ExprSimplifiedAndOr(pExpr);
+        if pAlt <> pExpr then
+        begin
+          r1 := sqlite3ExprCodeTarget(pParse, pAlt, target);
+          sqlite3VdbeAddOp3(v, OP_And, r1, r1, target);
+          done := True;
+        end else
+        begin
+          if op = TK_AND then skipOp := OP_IfNot else skipOp := OP_If;
+          regSS := 0;
+          if exprEvalRhsFirst(pExpr) <> 0 then
+          begin
+            r2 := sqlite3ExprCodeTarget(pParse, pExpr^.pRight, target);
+            regSS := r2;
+            addrSkip := sqlite3VdbeAddOp1(v, skipOp, r2);
+            r1 := sqlite3ExprCodeTemp(pParse, pExpr^.pLeft, @regFree1);
+          end else
+          begin
+            r1 := sqlite3ExprCodeTarget(pParse, pExpr^.pLeft, target);
+            if ExprHasProperty(pExpr^.pRight, EP_Subquery) then
+            begin
+              regSS    := r1;
+              addrSkip := sqlite3VdbeAddOp1(v, skipOp, r1);
+            end else
+              addrSkip := 0;
+            r2 := sqlite3ExprCodeTemp(pParse, pExpr^.pRight, @regFree2);
+          end;
+          sqlite3VdbeAddOp3(v, op, r2, r1, target);
+          if addrSkip <> 0 then
+          begin
+            sqlite3VdbeAddOp2(v, OP_Goto, 0,
+                              sqlite3VdbeCurrentAddr(v) + 2);
+            sqlite3VdbeJumpHere(v, addrSkip);
+            sqlite3VdbeAddOp3(v, OP_Or, regSS, regSS, target);
+          end;
+          done := True;
+        end;
+      end;
+    TK_IN:
+      begin
+        { Port of expr.c:5485..5495.  Compile to:
+            OP_Null target
+            <IN test> jumps to destIfFalse / destIfNull
+            OP_Integer 1, target
+          destIfFalse:
+            OP_AddImm target, 0     ; coerces 1→1 fall-through, leaves
+                                    ; 0/NULL alone
+          destIfNull: }
+        inDestIfFalse := sqlite3VdbeMakeLabel(pParse);
+        inDestIfNull  := sqlite3VdbeMakeLabel(pParse);
+        sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+        sqlite3ExprCodeIN(pParse, pExpr, inDestIfFalse, inDestIfNull);
+        sqlite3VdbeAddOp2(v, OP_Integer, 1, target);
+        sqlite3VdbeResolveLabel(v, inDestIfFalse);
+        sqlite3VdbeAddOp2(v, OP_AddImm, target, 0);
+        sqlite3VdbeResolveLabel(v, inDestIfNull);
+        done := True;
+      end;
+    TK_BETWEEN:
+      begin
+        { Port of expr.c:5510..5512 — scalar BETWEEN: synthesise
+          (lo<=x<=hi) and let exprCodeBetween's xJump=NULL arm route
+          through sqlite3ExprCodeTarget for the AND/compare codegen. }
+        exprCodeBetween(pParse, pExpr, target, 0 { scalar }, 0);
+        done := True;
+      end;
     else
-      { TODO(Phase 6.9-bis): TK_AGG_COLUMN, TK_AND/TK_OR,
-        TK_IN,
-        TK_IF_NULL_ROW, … — land in subsequent vertical-slice
-        sub-progresses.  C default arm semantics: assert
-        (op==TK_NULL || op==TK_ERROR || mallocFailed) then emit OP_Null.
-        TK_NULL is now its own arm above; TK_ERROR is rare;
-        mallocFailed is a hard error path. }
+      { C default arm semantics: assert (op==TK_NULL || op==TK_ERROR ||
+        mallocFailed) then emit OP_Null.  TK_NULL is its own arm above;
+        TK_ERROR is rare; mallocFailed is a hard error path. }
       sqlite3VdbeAddOp2(v, OP_Null, 0, target);
       done := True;
     end;
@@ -6407,13 +6486,15 @@ end;
   Vector BETWEEN (where x is a TK_VECTOR / TK_SELECT) is deferred to
   the eventual exprCodeVector port — the corpus does not exercise it.
 
-  jumpIsTrue selects the dispatch direction:
-    * False ⇒ jump to dest when (lo<=x<=hi) is FALSE — used by
-      sqlite3ExprIfFalse.  Equivalent to xJump=ExprIfFalse in C.
-    * True  ⇒ jump to dest when (lo<=x<=hi) is TRUE  — used by
-      sqlite3ExprIfTrue.  Equivalent to xJump=ExprIfTrue in C. }
+  jumpKind selects the dispatch direction:
+    * 0 ⇒ scalar — store 0/1 result into register `dest`; equivalent to
+      xJump=NULL in C (the TK_BETWEEN arm of sqlite3ExprCodeTarget).
+    * 1 ⇒ jump to dest when (lo<=x<=hi) is TRUE  — used by
+      sqlite3ExprIfTrue.  Equivalent to xJump=ExprIfTrue in C.
+    * 2 ⇒ jump to dest when (lo<=x<=hi) is FALSE — used by
+      sqlite3ExprIfFalse.  Equivalent to xJump=ExprIfFalse in C. }
 procedure exprCodeBetween(pParse: PParse; pExpr: PExpr; dest: i32;
-  jumpIsTrue: Boolean; jumpIfNull: i32);
+  jumpKind: i32; jumpIfNull: i32);
 var
   exprAnd:   TExpr;
   compLeft:  TExpr;
@@ -6452,10 +6533,16 @@ begin
     rPDel := sqlite3ExprCodeTemp(pParse, pDel, @regFree1);
     sqlite3ExprToRegister(pDel, rPDel);
 
-    if jumpIsTrue then
-      sqlite3ExprIfTrue(pParse, @exprAnd, dest, jumpIfNull)
+    case jumpKind of
+      1: sqlite3ExprIfTrue(pParse, @exprAnd, dest, jumpIfNull);
+      2: sqlite3ExprIfFalse(pParse, @exprAnd, dest, jumpIfNull);
     else
-      sqlite3ExprIfFalse(pParse, @exprAnd, dest, jumpIfNull);
+      { Scalar arm (expr.c:6062..6068): mark pDel with EP_OuterON so
+        sqlite3ExprCodeTarget does not hoist it into Parse.pConstExpr,
+        then code the synthesised AND directly into `dest`. }
+      pDel^.flags := pDel^.flags or EP_OuterON;
+      sqlite3ExprCodeTarget(pParse, @exprAnd, dest);
+    end;
 
     sqlite3ReleaseTempReg(pParse, regFree1);
   end;
@@ -6609,7 +6696,7 @@ begin
         sqlite3VdbeAddOp2(v, op, r1, dest);
       end;
     TK_BETWEEN:
-      exprCodeBetween(pParse, pExpr, dest, True { jumpIsTrue }, jumpIfNull);
+      exprCodeBetween(pParse, pExpr, dest, 1 { ifTrue }, jumpIfNull);
     TK_IN:
       goDefault := True;
   else
@@ -6785,7 +6872,7 @@ begin
         sqlite3VdbeAddOp2(v, op, r1, dest);
       end;
     TK_BETWEEN:
-      exprCodeBetween(pParse, pExpr, dest, False { jumpIsTrue }, jumpIfNull);
+      exprCodeBetween(pParse, pExpr, dest, 2 { ifFalse }, jumpIfNull);
     TK_IN:
       goDefault := True;
   else
