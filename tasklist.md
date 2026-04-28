@@ -51,7 +51,6 @@ Important: At the end of this document, please find:
       Δ=14).
 
 - [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
-  Decomposition:
     - [ ] **6.10 step 4** Port `sqlite3CodeDropTable` pre-Destroy
       schema scan (build.c:3315..3445): the loop that walks
       sqlite_schema, deletes rows whose `tbl_name = 'X'`, and
