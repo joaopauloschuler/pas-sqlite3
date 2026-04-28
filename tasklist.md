@@ -116,7 +116,10 @@ Important: At the end of this document, please find:
         because `destroyRootPage` calls `sqlite3NestedParse(UPDATE
         sqlite_schema ...)` and productive `sqlite3Update` is still
         skeleton-only.
-
+  [ ] port sqlite3Pragma in full
+  [ ] port sqlite3Vacuum in full
+  [ ] search for "stub" in the pascal source code and port from C in
+      full all functions or procedures marked as "stub".
 ---
 
 ## Phase 7 — Parser (one gate open)
