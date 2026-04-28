@@ -9527,8 +9527,14 @@ begin
     SQLITE_AFF_REAL:
       sqlite3VdbeMemRealify(pMem);
     else begin { SQLITE_AFF_TEXT }
+      { vdbemem.c:951..962 — set MEM_Str via the MEM_Blob>>3 trick so a
+        BLOB is reinterpreted in place as TEXT, then ApplyAffinity-TEXT
+        only stringifies a numeric value (its MEM_Str|MEM_Blob early-out
+        leaves an existing string/blob payload untouched).  Calling
+        MemStringify directly was wrong: it always re-rendered as a
+        number and overwrote the blob bytes. }
       pMem^.flags := pMem^.flags or ((pMem^.flags and MEM_Blob) shr 3);
-      sqlite3VdbeMemStringify(pMem, encoding, 0);
+      sqlite3ValueApplyAffinity(pMem, SQLITE_AFF_TEXT, encoding);
       pMem^.flags := pMem^.flags and not u16(MEM_Int or MEM_Real or MEM_IntReal or MEM_Blob or MEM_Zero);
       if encoding <> SQLITE_UTF8 then pMem^.n := pMem^.n and not 1;
       sqlite3VdbeChangeEncoding(pMem, encoding);

@@ -584,6 +584,28 @@ Important: At the end of this document, please find:
         [ ] `%b` / `%n` printf specifiers — not present in upstream
             printf.c fmtinfo[] (probe artifacts).  Drop from scope.
 
+  [X] **6.10 step 13** Runtime divergences surfaced by the new
+      `src/tests/DiagCast.pas` probe (CAST expressions + type-affinity
+      coercion).  Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagCast`.
+      Initial sweep (60 cases) reported 1 divergence; fixed in the same
+      commit.
+      [X] **a) `CAST(blob AS TEXT)` returned the stringified numeric
+        value instead of reinterpreting the blob bytes** — fixed
+        2026-04-28.  `sqlite3VdbeMemCast`'s SQLITE_AFF_TEXT arm
+        (vdbe.pas:9529) called `sqlite3VdbeMemStringify` directly after
+        OR-ing in `MEM_Str` via the `MEM_Blob>>3` trick.  In C
+        (vdbemem.c:956) the call goes through
+        `sqlite3ValueApplyAffinity(pMem, SQLITE_AFF_TEXT, encoding)`,
+        which short-circuits when MEM_Str|MEM_Blob is already set so the
+        in-place reinterpretation actually sticks.  Pas's MemStringify
+        unconditionally calls `vdbeMemRenderNum` and overwrites the
+        payload — for a blob that has no MEM_Int|MEM_Real flags, this
+        rendered "0.0".  Now mirrors C: routes through ApplyAffinity.
+        Verified `SELECT CAST(X'4142' AS TEXT)` → "AB" (was "0.0").
+        DiagCast 60/60 PASS; TestExplainParity 1015 pass / 11 diverge
+        unchanged; TestSelectBasic / TestVdbeRecord / TestParser /
+        TestDMLBasic / TestWhereBasic all green.
+
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
         the sqlite_schema scrub now uses one-pass inline delete.
