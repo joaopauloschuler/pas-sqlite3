@@ -253,14 +253,20 @@ Important: At the end of this document, please find:
             (build.c:1604); flags any UNIQUE/PK index already attached
             for the column.
   [ ] **6.26** port codegen.pas where / select / window stubs in full from C
-       to pascal: `sqlite3SelectPopWith`,
-       `whereRightSubexprIsColumn`, `sqlite3WhereMinMaxOptEarlyOut`,
-       `wherePathMatchSubqueryOB`, `sqlite3KeyInfoFromExprList`,
-       `sqlite3SelectWalkAssert2`, `sqlite3SelectAddTypeInfo`,
+       to pascal: `sqlite3SelectPopWith` (blocked on full TWith record — see
+       6.20), `sqlite3WhereMinMaxOptEarlyOut`, `wherePathMatchSubqueryOB`,
+       `sqlite3KeyInfoFromExprList`, `sqlite3SelectAddTypeInfo`,
        `sqlite3SelectCheckOnClauses`,
        `sqlite3WhereExplainBloomFilter`, `sqlite3WhereAddExplainText`,
-       `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep`,
-       `sqlite3BtreeHoldsAllMutexes`.
+       `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep`.
+       [X] `whereRightSubexprIsColumn` — ported in full (where.c:302).
+            Strips TK_COLLATE/TK_LIKELY off p->pRight and returns the inner
+            TK_COLUMN node when EP_FixedCol is unset.
+       [X] `sqlite3SelectWalkAssert2` — `SQLITE_DEBUG`-only assert(0) walker
+            (select.c:6351); existing no-op matches default-build behaviour.
+       [X] `sqlite3BtreeHoldsAllMutexes` — `#ifndef NDEBUG` only
+            (btmutex.c:223), used inside assert() statements only; existing
+            `Result := 1` stub matches default-build behaviour exactly.
        [X] `sqlite3ExprCollSeq` / `sqlite3ExprNNCollSeq` — ported in full
             (expr.c:248, expr.c:321).  Walks TK_COLLATE / EP_Collate
             precedence, descends through TK_CAST/TK_UPLUS/TK_VECTOR and
@@ -282,8 +288,14 @@ Important: At the end of this document, please find:
        `sqlite3AlterRenameTable`, `sqlite3AlterFinishAddColumn`,
        `sqlite3AlterAddConstraint`, `sqlite3Detach`, `sqlite3Attach`,
        `sqlite3Analyze`, `sqlite3DeleteIndexSamples`, `sqlite3Vacuum`,
-       `sqlite3AutoLoadExtensions`, `errlogFunc`, `unlikelyFunc`,
+       `sqlite3AutoLoadExtensions`,
        `sqlite3FkCheck`, `sqlite3FkActions`.
+       [X] `errlogFunc` — ported in full (func.c:1026): dispatches the
+            configured xLog callback with the int code + text message.
+       [X] `unlikelyFunc` — C registers `noopFunc` (=versionFunc) as the
+            runtime placeholder, since the INLINEFUNC_unlikely arm folds the
+            call away at compile time; existing Pas stub returning argv[0]
+            is never reached during normal compilation and is benign.
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
        marked as "stub" that was missed by 6.16..6.27 (catch-all).

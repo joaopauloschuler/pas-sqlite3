@@ -8827,12 +8827,16 @@ end;
 { Stubs for helpers consumed by the scanner.  See the banner above for the
   gates that keep the rowid-EQ shape from reaching any of them. }
 
+{ where.c:302 — strip TK_COLLATE/TK_LIKELY off p->pRight; return the inner
+  TK_COLUMN node iff that node is a column without EP_FixedCol.  Used by the
+  WO_EQUIV transitivity walker in whereScanNext. }
 function whereRightSubexprIsColumn(p: PExpr): PExpr;
 begin
-  { Real impl walks p^.pRight stripping TK_COLLATE; returns nil when the
-    final expression is not TK_COLUMN.  Until exprAnalyze sets WO_EQUIV,
-    the only caller bypasses this anyway. }
-  Result := nil;
+  p := sqlite3ExprSkipCollateAndLikely(p^.pRight);
+  if (p <> nil) and (p^.op = TK_COLUMN) and (not ExprHasProperty(p, EP_FixedCol)) then
+    Result := p
+  else
+    Result := nil;
 end;
 
 function sqlite3ExprCompareSkip(pA: PExpr; pB: PExpr; iTab: i32): i32;
@@ -24297,9 +24301,23 @@ begin
   sqlite3_result_text(pCtx, SQLITE_SOURCE_ID, -1, SQLITE_STATIC);
 end;
 
+{ func.c:1026 — sqlite_log(iErrCode, zMsg) wrapper around sqlite3_log.  C uses
+  sqlite3_log(code, "%s", text); the Pas sqlite3_log already takes a finished
+  message string, so we dispatch the configured xLog callback directly with
+  the text value (mirrors passqlite3pager.sqlite3_log to avoid a unit cycle). }
+type
+  TErrlogLogCallback = procedure(pArg: Pointer; iErrCode: i32; zMsg: PChar); cdecl;
 procedure errlogFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  xLog: TErrlogLogCallback;
 begin
-  { no-op stub }
+  if sqlite3GlobalConfig.xLog <> nil then
+  begin
+    xLog := TErrlogLogCallback(sqlite3GlobalConfig.xLog);
+    xLog(sqlite3GlobalConfig.pLogArg,
+         sqlite3_value_int(Psqlite3_value(argv^)),
+         PChar(sqlite3_value_text(Psqlite3_value((argv+1)^))));
+  end;
 end;
 
 procedure randomFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
