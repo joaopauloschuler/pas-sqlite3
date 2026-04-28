@@ -54,24 +54,23 @@ Important: At the end of this document, please find:
       Δ=14).
 
 - [ ] **6.10** `TestExplainParity.pas`
-    - [ ] **6.10 step 4** Port in full `sqlite3CodeDropTable` pre-Destroy
-      schema scan (build.c:3315..3445): the loop that walks
-      sqlite_schema, deletes rows whose `tbl_name = 'X'`, and
-      reinserts the surviving trigger rows.  Plus the trailing
-      `OP_DropTable` p4=table-name + `String8` literal emissions.
-      Closes Δ=22 on the DROP TABLE row.
-      **Runtime impact (verified 2026-04-27):** this is not cosmetic.
-      `DROP TABLE t` followed by either `CREATE TABLE t(...)` or
+    - [ ] **6.10 step 4** DROP TABLE schema-row deletion does not run.
+      `sqlite3CodeDropTable` itself is fully ported (build.c:3387) and
+      calls `sqlite3NestedParse(... DELETE FROM sqlite_schema ...)`
+      identically to C.  The actual blocker is that
+      `sqlite3RunParser` (passqlite3codegen.pas) is still a Phase-7
+      stub — `sqlite3NestedParse` formats the SQL and hands it to
+      `gNestedRunParser`, which never compiles it, so no schema-row
+      deletion ops are emitted.  OP_DropTable then destroys the btree
+      root while the sqlite_schema row survives pointing at the
+      now-invalid rootpage.
+      **Runtime impact (verified 2026-04-27):**
+      `DROP TABLE t` followed by `CREATE TABLE t(...)` or
       `SELECT * FROM t` on the same connection returns
-      `SQLITE_CORRUPT` (rc=11) / `SQLITE_ERROR` (rc=1) on Pas, while
-      C returns no-such-table cleanly and lets re-CREATE succeed.
+      `SQLITE_CORRUPT` (rc=11) / `SQLITE_ERROR` (rc=1) on Pas; C
+      returns no-such-table cleanly and lets re-CREATE succeed.
       Repro: `sqlite3_open(":memory:")` → CREATE / INSERT / DROP /
-      CREATE.  Cause: the `sqlite3NestedParse(... DELETE FROM
-      sqlite_master WHERE tbl_name=%Q ...)` call inside
-      `sqlite3CodeDropTable` does not expand into the schema-row
-      deletion ops, so OP_DropTable destroys the btree root but the
-      schema row survives, pointing at a now-invalid rootpage.
-      Closing this task closes the runtime bug.
+      CREATE.  Closing this row requires Phase 7 `sqlite3RunParser`.
 
     - [ ] **6.10 step 6** Make these to work (port code when required):
         [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
@@ -133,44 +132,24 @@ Important: At the end of this document, please find:
   [ ] **6.12** port sqlite3Pragma in full
   [ ] **6.13** port sqlite3Vacuum in full
   [X] **6.14** port sqlite3WhereTabFuncArgs in full (whereexpr.c:1899..1944).
-       Dead code on the current corpus — only exercised by table-valued
-       functions (FROM = vtab(args)) — but ports cleanly so the path is
-       in place once the vtab gate lands.
-  [X] **6.15** port sqlite3WhereAddLimit in full (whereexpr.c:1620..1736;
-       includes the whereAddLimitExpr helper).  Dead code on the current
-       corpus — only exercised by FROM = single virtual table + LIMIT —
-       but ports cleanly so the path is in place once the vtab + LIMIT
-       gate lands.
-  [X] **6.16** port btree.pas stubs in full from C to pascal:
-       `ptrmapPutOvflPtr`, `invalidateIncrblobCursors`.
-  [X] **6.17** port pager.pas stubs in full from C to pascal:
-       `pager_reset`, `pagerReleaseMapPage`, `sqlite3_log`.
-       (`pagerReleaseMapPage` was already a 1:1 port; `pager_reset`
-       now invokes `sqlite3BackupRestart` via a function-pointer hook
-       installed by passqlite3backup at unit init — direct call would
-       cycle the uses graph; `sqlite3_log` now dispatches to
-       `sqlite3GlobalConfig.xLog(pLogArg, iErrCode, zMsg)`.)
-  [X] **6.18** port wal.pas stub `sqlite3_log_wal` in full from C to pascal.
-       (Dispatches to `sqlite3GlobalConfig.xLog` like pager.pas's
-       `sqlite3_log`; call sites in `walIndexRecover` and `walLimitSize`
-       now pre-render the C format strings via `Format()`.  Local copy
-       in wal.pas avoids pulling pager.pas into the uses graph.)
-  [X] **6.19** port util.pas stubs `sqlite3_mprintf` / `sqlite3_snprintf` in
-       full from C to pascal.  FPC cannot extract C va_list inside a
-       Pascal-defined cdecl body, so the cdecl single-fmt-arg entries route
-       through `sqlite3FormatStr` (passqlite3printf) via an init-time
-       function-pointer hook installed in passqlite3util — same break-the-
-       cycle pattern used in 6.17 for `pager_reset → sqlite3BackupRestart`.
-       The hook handles `%%` and other no-arg-consuming specifiers
-       faithfully.  Pascal callers that need real varargs use
-       `sqlite3PfMprintf` / `sqlite3MPrintf` (already fully ported in
-       passqlite3printf).
-  [ ] **6.20** port parser.pas stubs in full from C to pascal:
-       `sqlite3ExprListAppendVector`, `sqlite3TriggerUpdateStep`,
-       `addModuleArgument`, `sqlite3CteNew`, `sqlite3WithAdd`.
-       (`sqlite3Reindex` ported in full — build.c:5564..5644 — including
-       internal `reindexCollationMatch` helper.  Dead code on the current
-       corpus; the gate exercises no REINDEX statement, so Δ unchanged.)
+  [X] **6.15** port sqlite3WhereAddLimit + whereAddLimitExpr in full
+       (whereexpr.c:1620..1736).
+  [X] **6.16** port btree.pas stubs in full: `ptrmapPutOvflPtr`,
+       `invalidateIncrblobCursors`.
+  [X] **6.17** port pager.pas stubs in full: `pager_reset`,
+       `pagerReleaseMapPage`, `sqlite3_log`.
+  [X] **6.18** port wal.pas stub `sqlite3_log_wal` in full.
+  [X] **6.19** port util.pas stubs `sqlite3_mprintf` / `sqlite3_snprintf`
+       in full.
+  [ ] **6.20** port remaining parser.pas stubs in full:
+       `sqlite3ExprListAppendVector` (blocked on
+       `sqlite3ExprForVectorField`, expr.c:1893),
+       `sqlite3TriggerUpdateStep` + Insert/Delete/Select step
+       siblings (blocked on trigger.c step-builder port),
+       `sqlite3CteNew`, `sqlite3WithAdd` (blocked on full TCte
+       record definition; current TWith is a 64-byte opaque stub).
+       (`addModuleArgument` already fully ported — parser.pas:2020.
+       `sqlite3Reindex` ported in full — parser.pas:1821.)
   [ ] **6.21** port vdbe.pas stubs in full from C to pascal:
        `sqlite3VdbeMultiLoad`, `sqlite3VdbeScanStatus`,
        `sqlite3VdbeScanStatusRange`, `sqlite3VdbeSetP4KeyInfo`,
