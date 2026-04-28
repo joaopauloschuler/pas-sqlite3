@@ -547,10 +547,21 @@ Important: At the end of this document, please find:
   [X] **6.19** port util.pas stubs `sqlite3_mprintf` / `sqlite3_snprintf`
        in full.
   [ ] **6.20** port remaining parser.pas stubs in full:
-       `sqlite3TriggerUpdateStep` + Insert/Delete/Select step
-       siblings (blocked on trigger.c step-builder port).
        (`addModuleArgument` already fully ported — parser.pas:2020.
        `sqlite3Reindex` ported in full — parser.pas:1821.)
+       [X] `sqlite3TriggerUpdateStep` + Insert/Delete/Select step
+            siblings — ported in full (trigger.c:443..635) 2026-04-28.
+            Replaces the field-zeroed stubs with faithful builders:
+            triggerSpanDup whitespace-normalises the span text;
+            triggerStepAllocate duplicates the target SrcList via
+            sqlite3SrcListDup (EXPRDUP_REDUCE) and rejects qualified
+            db.tbl names inside non-temp triggers; UpdateStep wraps a
+            non-empty FROM clause as a SF_NestedFrom subquery and
+            appends it via sqlite3SrcListAppendList; rename-mode arms
+            transfer ownership to the step (no dup) and remap zName
+            via sqlite3RenameTokenRemap.  Δ-neutral on TestExplainParity
+            (1012/14) — productive only after Phase 6.23 trigger
+            codegen lands.
        [X] `sqlite3ExprForVectorField` + `sqlite3ExprListAppendVector` —
             ported in full (expr.c:574, expr.c:2093) 2026-04-28.
             ExprForVectorField builds TK_SELECT_COLUMN nodes for

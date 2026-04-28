@@ -2018,67 +2018,177 @@ begin
 end;
 
 { ---- sqlite3TriggerUpdateStep / InsertStep / DeleteStep / SelectStep ----- }
-{ Phase 7.2e.6 stubs.  These live in trigger.c.  Until Phase 8 ports        }
-{ trigger.c's step-builders, the stubs allocate a TTriggerStep and return  }
-{ it so that the parser can chain steps via pNext/pLast (rules 270/271).   }
-{ The structural fields used by trigger.c's codegen (pSelect, pIdList, ...)}
-{ are zeroed — running a trigger built via the parser will be a no-op until }
-{ the real builders land.                                                     }
-function sqlite3TriggerUpdateStep(pPse: PParse; pTableName: PSrcList;
-                                  pFrom: PSrcList; pEList: PExprList;
-                                  pWhere: PExpr; orconf: i32;
-                                  zStart: PAnsiChar;
-                                  zEnd: PAnsiChar): PTriggerStep;
+{ Faithful port of trigger.c:443..635 (6.20).  triggerSpanDup +              }
+{ triggerStepAllocate are file-static helpers in C; ported here as local     }
+{ functions.  Codegen for these steps still depends on Phase 6.23 trigger    }
+{ code-emitter port — these builders just construct the AST nodes.           }
+
+{ trigger.c:425..434 — duplicate a SQL text range, normalise whitespace. }
+function triggerSpanDup(db: PTsqlite3; zStart, zEnd: PAnsiChar): PAnsiChar;
+var
+  i: PtrInt;
 begin
-  Result := PTriggerStep(sqlite3DbMallocZero(pPse^.db, SizeOf(TTriggerStep)));
+  Result := sqlite3DbSpanDup(db, zStart, zEnd);
   if Result <> nil then begin
-    Result^.op := TK_UPDATE;
-    Result^.orconf := u8(orconf);
+    i := 0;
+    while Result[i] <> #0 do begin
+      if sqlite3Isspace(u8(Result[i])) <> 0 then Result[i] := ' ';
+      Inc(i);
+    end;
   end;
-  sqlite3SrcListDelete(pPse^.db, pTableName);
-  sqlite3SrcListDelete(pPse^.db, pFrom);
-  sqlite3ExprListDelete(pPse^.db, pEList);
-  sqlite3ExprDelete(pPse^.db, pWhere);
 end;
 
-function sqlite3TriggerInsertStep(pPse: PParse; pTableName: PSrcList;
-                                  pColumn: PIdList; pSelect: PSelect;
-                                  orconf: i32; pUpsert: PUpsert;
-                                  zStart: PAnsiChar;
-                                  zEnd: PAnsiChar): PTriggerStep;
+{ trigger.c:467..504 — allocate a TriggerStep + duplicate the target SrcList. }
+function triggerStepAllocate(pPse: PParse; op: u8; pTabList: PSrcList;
+                             zStart, zEnd: PAnsiChar): PTriggerStep;
+var
+  pNew: PTrigger;
+  db: PTsqlite3;
+  pSrcItems: PSrcItem;
+  pTabSrcItems: PSrcItem;
 begin
-  Result := PTriggerStep(sqlite3DbMallocZero(pPse^.db, SizeOf(TTriggerStep)));
-  if Result <> nil then begin
-    Result^.op := TK_INSERT;
-    Result^.orconf := u8(orconf);
+  Result := nil;
+  pNew := pPse^.pNewTrigger;
+  db   := pPse^.db;
+  if pPse^.nErr = 0 then begin
+    pTabSrcItems := SrcListItems(pTabList);
+    if (pNew <> nil)
+       and (pNew^.pSchema <> db^.aDb[1].pSchema)
+       and (pTabSrcItems[0].u4.zDatabase <> nil) then begin
+      sqlite3ErrorMsg(pPse,
+        'qualified table names are not allowed on INSERT, UPDATE, and DELETE '
+        + 'statements within triggers');
+    end else begin
+      Result := PTriggerStep(sqlite3DbMallocZero(db, SizeOf(TTriggerStep)));
+      if Result <> nil then begin
+        Result^.pSrc := sqlite3SrcListDup(db, pTabList, EXPRDUP_REDUCE);
+        Result^.op := op;
+        Result^.zSpan := triggerSpanDup(db, zStart, zEnd);
+        if (Result^.pSrc <> nil) and inRenameObject(pPse) then begin
+          pSrcItems := SrcListItems(Result^.pSrc);
+          sqlite3RenameTokenRemap(pPse,
+            pSrcItems[0].zName, pTabSrcItems[0].zName);
+        end;
+      end;
+    end;
   end;
-  sqlite3SrcListDelete(pPse^.db, pTableName);
-  sqlite3IdListDelete(pPse^.db, pColumn);
-  sqlite3SelectDelete(pPse^.db, pSelect);
-  sqlite3UpsertDelete(pPse^.db, pUpsert);
+  sqlite3SrcListDelete(db, pTabList);
 end;
 
-function sqlite3TriggerDeleteStep(pPse: PParse; pTableName: PSrcList;
-                                  pWhere: PExpr; zStart: PAnsiChar;
-                                  zEnd: PAnsiChar): PTriggerStep;
-begin
-  Result := PTriggerStep(sqlite3DbMallocZero(pPse^.db, SizeOf(TTriggerStep)));
-  if Result <> nil then begin
-    Result^.op := TK_DELETE;
-  end;
-  sqlite3SrcListDelete(pPse^.db, pTableName);
-  sqlite3ExprDelete(pPse^.db, pWhere);
-end;
-
+{ trigger.c:443..459 }
 function sqlite3TriggerSelectStep(db: PTsqlite3; pSelect: PSelect;
                                   zStart: PAnsiChar;
                                   zEnd: PAnsiChar): PTriggerStep;
 begin
   Result := PTriggerStep(sqlite3DbMallocZero(db, SizeOf(TTriggerStep)));
+  if Result = nil then begin
+    sqlite3SelectDelete(db, pSelect);
+    Exit;
+  end;
+  Result^.op := TK_SELECT;
+  Result^.pSelect := pSelect;
+  Result^.orconf := OE_Default;
+  Result^.zSpan := triggerSpanDup(db, zStart, zEnd);
+end;
+
+{ trigger.c:513..551 }
+function sqlite3TriggerInsertStep(pPse: PParse; pTableName: PSrcList;
+                                  pColumn: PIdList; pSelect: PSelect;
+                                  orconf: i32; pUpsert: PUpsert;
+                                  zStart: PAnsiChar;
+                                  zEnd: PAnsiChar): PTriggerStep;
+var
+  db: PTsqlite3;
+begin
+  db := pPse^.db;
+  Assert((pSelect <> nil) or (db^.mallocFailed <> 0));
+  Result := triggerStepAllocate(pPse, TK_INSERT, pTableName, zStart, zEnd);
   if Result <> nil then begin
-    Result^.op := TK_SELECT;
+    if inRenameObject(pPse) then begin
+      Result^.pSelect := pSelect;
+      pSelect := nil;
+    end else begin
+      Result^.pSelect := sqlite3SelectDup(db, pSelect, EXPRDUP_REDUCE);
+    end;
+    Result^.pIdList := pColumn;
+    Result^.pUpsert := pUpsert;
+    Result^.orconf := u8(orconf);
+    if pUpsert <> nil then
+      sqlite3HasExplicitNulls(pPse, pUpsert^.pUpsertTarget);
+  end else begin
+    sqlite3IdListDelete(db, pColumn);
+    sqlite3UpsertDelete(db, pUpsert);
   end;
   sqlite3SelectDelete(db, pSelect);
+end;
+
+{ trigger.c:558..606 }
+function sqlite3TriggerUpdateStep(pPse: PParse; pTableName: PSrcList;
+                                  pFrom: PSrcList; pEList: PExprList;
+                                  pWhere: PExpr; orconf: i32;
+                                  zStart: PAnsiChar;
+                                  zEnd: PAnsiChar): PTriggerStep;
+var
+  db: PTsqlite3;
+  pFromDup: PSrcList;
+  pSub: PSelect;
+  asTok: TToken;
+begin
+  db := pPse^.db;
+  Result := triggerStepAllocate(pPse, TK_UPDATE, pTableName, zStart, zEnd);
+  if Result <> nil then begin
+    pFromDup := nil;
+    if inRenameObject(pPse) then begin
+      Result^.pExprList := pEList;
+      Result^.pWhere    := pWhere;
+      pFromDup := pFrom;
+      pEList := nil;
+      pWhere := nil;
+      pFrom  := nil;
+    end else begin
+      Result^.pExprList := sqlite3ExprListDup(db, pEList, EXPRDUP_REDUCE);
+      Result^.pWhere    := sqlite3ExprDup(db, pWhere, EXPRDUP_REDUCE);
+      pFromDup := sqlite3SrcListDup(db, pFrom, EXPRDUP_REDUCE);
+    end;
+    Result^.orconf := u8(orconf);
+
+    if (pFromDup <> nil) and (not inRenameObject(pPse)) then begin
+      asTok.z := nil; asTok.n := 0;
+      pSub := sqlite3SelectNew(pPse, nil, pFromDup, nil, nil, nil, nil,
+                               SF_NestedFrom, nil);
+      pFromDup := sqlite3SrcListAppendFromTerm(pPse, nil, nil, nil,
+                    @asTok, pSub, nil, nil);
+    end;
+    if (pFromDup <> nil) and (Result^.pSrc <> nil) then begin
+      Result^.pSrc := sqlite3SrcListAppendList(pPse, Result^.pSrc, pFromDup);
+    end else begin
+      sqlite3SrcListDelete(db, pFromDup);
+    end;
+  end;
+  sqlite3ExprListDelete(db, pEList);
+  sqlite3ExprDelete(db, pWhere);
+  sqlite3SrcListDelete(db, pFrom);
+end;
+
+{ trigger.c:613..635 }
+function sqlite3TriggerDeleteStep(pPse: PParse; pTableName: PSrcList;
+                                  pWhere: PExpr; zStart: PAnsiChar;
+                                  zEnd: PAnsiChar): PTriggerStep;
+var
+  db: PTsqlite3;
+begin
+  db := pPse^.db;
+  Result := triggerStepAllocate(pPse, TK_DELETE, pTableName, zStart, zEnd);
+  if Result <> nil then begin
+    if inRenameObject(pPse) then begin
+      Result^.pWhere := pWhere;
+      pWhere := nil;
+    end else begin
+      Result^.pWhere := sqlite3ExprDup(db, pWhere, EXPRDUP_REDUCE);
+    end;
+    Result^.orconf := OE_Default;
+  end;
+  sqlite3ExprDelete(db, pWhere);
 end;
 
 { ---- Phase 7.2e.7 helpers (rules 300..347) ------------------------------ }
