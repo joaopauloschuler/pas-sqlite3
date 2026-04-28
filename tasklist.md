@@ -100,10 +100,13 @@ Important: At the end of this document, please find:
                 short-circuit in `sqlite3BtreeIndexMoveto`. Done.
         [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
-        [ ] `PRAGMA user_version` / `PRAGMA encoding` — Δ=4/3
-          (read-pragma codegen is a stub: `sqlite3Pragma` in
-          passqlite3codegen.pas:22374 returns immediately; needs
-          ReadCookie / ResultRow tail at minimum).
+        [X] `PRAGMA user_version` / `PRAGMA encoding` — read-pragma
+          codegen now ports the `PragTyp_HEADER_VALUE` and
+          `PragTyp_ENCODING` read arms (RunOnlyOnce + Transaction +
+          ReadCookie + ResultRow for user_version; RunOnlyOnce +
+          String8 'UTF-8' + ResultRow for encoding).  Both probes
+          PASS at 7 / 6 ops.  Schema-prefix `PRAGMA main.X` and the
+          full pragmaLocate dispatch table remain deferred.
         [ ] `SELECT DISTINCT a FROM t` — Δ=13 (DISTINCT codegen,
           ephemeral-table dedup not yet wired in `sqlite3Select`).
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —

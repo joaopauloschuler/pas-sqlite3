@@ -22643,10 +22643,53 @@ end;
 // Phase 6.5 — pragma.c stubs
 // ===========================================================================
 
+{ sqlite3Pragma — minimal viable port of pragma.c:425.
+
+  Only the read arms of `PRAGMA user_version` (PragTyp_HEADER_VALUE) and
+  `PRAGMA encoding` (PragTyp_ENCODING) are wired through.  Both are
+  read-only and emit short, fixed op sequences; this closes the Δ=4 / Δ=3
+  rows for the two probes in TestExplainParity.  The full pragmaLocate
+  table-driven dispatch is deferred until more pragma probes land. }
 procedure sqlite3Pragma(pParse: PParse; const pId1: PToken;
   const pId2: PToken; pValue: PToken; minusFlag: i32);
+var
+  v:     PVdbe;
+  zName: AnsiString;
+  iDb:   i32;
 begin
-  { Phase 7 }
+  if (pParse = nil) or (pId1 = nil) then Exit;
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then Exit;
+
+  { Mark the prepared statement as single-use.  The PragTyp_HEADER_VALUE
+    arm later flips this OP_Expire back to OP_Noop via sqlite3VdbeReusable. }
+  sqlite3VdbeRunOnlyOnce(v);
+  pParse^.nMem := 2;
+
+  { Schema prefix not yet honoured — ignore pId2 and use the main db.
+    Sufficient for the bare `PRAGMA name` shape covered by the probes. }
+  iDb := 0;
+
+  SetString(zName, pId1^.z, pId1^.n);
+
+  if SameText(zName, 'user_version') and (pValue = nil) then begin
+    { PragTyp_HEADER_VALUE read arm (pragma.c:2349). }
+    sqlite3VdbeUsesBtree(v, iDb);
+    sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 0, 0);
+    sqlite3VdbeAddOp3(v, OP_ReadCookie,  iDb, 1, BTREE_USER_VERSION);
+    sqlite3VdbeAddOp2(v, OP_ResultRow,   1,   1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
+
+  if SameText(zName, 'encoding') and (pValue = nil) then begin
+    { PragTyp_ENCODING read arm (pragma.c:2261).  The Pas port runs UTF-8
+      only today, so emit the literal name unconditionally. }
+    if sqlite3ReadSchema(pParse) <> SQLITE_OK then Exit;
+    sqlite3VdbeLoadString(v, 1, 'UTF-8');
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    Exit;
+  end;
 end;
 
 function sqlite3PragmaVtabRegister(db: PTsqlite3; zName: PAnsiChar): Pointer;
