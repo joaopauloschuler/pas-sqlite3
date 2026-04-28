@@ -2237,9 +2237,21 @@ begin
     OP_ParseSchema fires.  The %s zWhere argument is kept in the
     function signature for caller compatibility but ignored. }
   if zWhere = nil then ;  { unreferenced — see banner. }
-  zSql := sqlite3MPrintf(db,
-            'SELECT type,name,tbl_name,rootpage,sql FROM %s',
-            [LEGACY_SCHEMA_TABLE]);
+  { SCHEMA_TABLE(iDb) — temp DB (iDb=1) lives in sqlite_temp_master,
+    every other attached DB in sqlite_master.  Bootstrap installs
+    sqlite_master only in main and sqlite_temp_master only in temp,
+    so the bare name resolves unambiguously to the right btree.
+    (A qualified "<dbname>.<table>" form still trips the codegen's
+    silent-bail on qualified lookups; revisit when that gate is
+    closed.) }
+  if iDb = 1 then
+    zSql := sqlite3MPrintf(db,
+              'SELECT type,name,tbl_name,rootpage,sql FROM %s',
+              [LEGACY_TEMP_SCHEMA_TABLE])
+  else
+    zSql := sqlite3MPrintf(db,
+              'SELECT type,name,tbl_name,rootpage,sql FROM %s',
+              [LEGACY_SCHEMA_TABLE]);
   if zSql = nil then begin
     Result := SQLITE_NOMEM;
     Exit;

@@ -146,16 +146,28 @@ Important: At the end of this document, please find:
             49/0, TestParser 45/0 — no regressions.
 
        TEMP-database follow-on (build.c / insert.c):
-       [ ] **6.8b** TEMP-table INSERT/SELECT not wired.  After the
-           OpenTempDatabase port, `CREATE TEMP TABLE t(x INTEGER)`
-           succeeds but `INSERT INTO t VALUES(42)` then fails at
-           prepare (rc=1) and `SELECT count(*) FROM t` returns no
-           row.  Likely cause: temp schema (db^.aDb[1].pSchema) is
-           created but the parsed CREATE TEMP TABLE does not register
-           the table into it, so name resolution misses on subsequent
-           statements.  Inspect `sqlite3StartTable` /
-           `sqlite3EndTable` for the iDb=1 path and the temp-schema
-           hash insertion.
+       [X] **6.8b** TEMP-table INSERT/SELECT now wired — closed
+           2026-04-28.  Two upstream-divergence bugs fixed in tandem:
+           (1) `execParseSchemaImpl` (passqlite3main.pas) always read
+           `LEGACY_SCHEMA_TABLE` regardless of iDb, so the OP_ParseSchema
+           re-load for iDb=1 queried `sqlite_master` (main DB) and
+           returned 0 rows.  Switched to `LEGACY_TEMP_SCHEMA_TABLE` when
+           iDb=1 (bare name; the qualified `temp.sqlite_temp_master`
+           form still trips a separate codegen silent-bail on qualified
+           lookups).  (2) `sqlite3TwoPartName` (passqlite3codegen.pas)
+           returned `iDb=0` for unqualified one-part names, so
+           re-parsing `CREATE TABLE t(x INTEGER)` from sqlite_temp_master
+           with `init.iDb=1` placed `t` in main's tblHash anyway —
+           subsequent INSERT/SELECT codegen then emitted OpenWrite/Read
+           with `p3=0` (main btree) instead of `p3=1` (temp).  Aligned
+           with build.c:1003 — return `db^.init.iDb`.  Verified
+           `CREATE TEMP TABLE t(x INTEGER); INSERT INTO t VALUES(42);
+           SELECT count(*) FROM t` returns 1 (matches C).  No
+           regressions across TestExplainParity 1016/10, TestSchemaBasic,
+           TestDMLBasic, TestSelectBasic, TestParser, TestVdbeTxn,
+           TestVdbeRecord, TestVdbeAgg, TestBtreeCompat, TestWhereBasic,
+           TestVtab, TestOpenClose, TestExecGetTable, TestExprBasic,
+           TestJson, TestVdbeApi, TestRowidIn.
 
        Foreign keys (fkey.c):
        [X] `sqlite3FkReferences` — ported 2026-04-28

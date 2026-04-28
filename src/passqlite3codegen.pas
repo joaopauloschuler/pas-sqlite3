@@ -22079,9 +22079,12 @@ begin
       Result := -1; Exit;
     end;
   end else begin
-    { One-part name }
+    { One-part name — returns the current init.iDb so that re-parses
+      driven by sqlite3InitCallback for sqlite_temp_master rows
+      (init.iDb=1) place the table in the temp schema rather than
+      defaulting to main.  Mirrors build.c:1003. }
     pUnqual^ := pName1;
-    iDb := 0;
+    iDb := db^.init.iDb;
   end;
   Result := iDb;
 end;
