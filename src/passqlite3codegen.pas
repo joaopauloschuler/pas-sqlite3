@@ -26333,67 +26333,200 @@ begin
   sqlite3InsertBuiltinFuncs(@aDateFuncs, Length(aDateFuncs));
 end;
 
-function sqlite3_strglob(zGlobPattern: PAnsiChar; zString: PAnsiChar): i32;
-var
-  p, s: PByte;
-begin
-  { Simple glob: * matches any sequence, ? matches one char }
-  p := PByte(zGlobPattern);
-  s := PByte(zString);
-  while (p^ <> 0) and (s^ <> 0) do begin
-    if p^ = Ord('*') then begin
-      Inc(p);
-      if p^ = 0 then begin Result := 0; Exit; end;
-      while s^ <> 0 do begin
-        if sqlite3_strglob(PAnsiChar(p), PAnsiChar(s)) = 0 then begin
-          Result := 0; Exit;
-        end;
-        Inc(s);
-      end;
-      Result := 1; Exit;
-    end else if (p^ = Ord('?')) or (p^ = s^) then begin
-      Inc(p); Inc(s);
-    end else begin
-      Result := 1; Exit;
-    end;
+{ Phase 6.10 step 11(k): full port of patternCompare (func.c:728..855).
+  Adds GLOB [...] / [^...] / [a-z] char-class support, UTF-8 lookahead for
+  the wildcard tail-search, and SQLITE_NOWILDCARDMATCH semantics. }
+type
+  TCompareInfo = record
+    matchAll, matchOne, matchSet, noCase: u8;
   end;
-  while p^ = Ord('*') do Inc(p);
-  if (p^ = 0) and (s^ = 0) then Result := 0 else Result := 1;
+
+const
+  SQLITE_MATCH            = 0;
+  SQLITE_NOMATCH          = 1;
+  SQLITE_NOWILDCARDMATCH  = 2;
+  globInfo:     TCompareInfo = (matchAll: Ord('*'); matchOne: Ord('?'); matchSet: Ord('['); noCase: 0);
+  likeInfoNorm: TCompareInfo = (matchAll: Ord('%'); matchOne: Ord('_'); matchSet: 0;          noCase: 1);
+
+function utf8ReadByteOrSlow(var p: Pu8): u32; inline;
+var
+  pc: PChar;
+begin
+  if p^ < $80 then begin
+    Result := p^;
+    Inc(p);
+  end else begin
+    pc := PChar(p);
+    Result := sqlite3Utf8Read(@pc);
+    p := Pu8(pc);
+  end;
+end;
+
+procedure skipUtf8(var p: Pu8); inline;
+begin
+  if p^ < $80 then Inc(p)
+  else begin
+    Inc(p);
+    while (p^ and $C0) = $80 do Inc(p);
+  end;
+end;
+
+function patternCompare(
+  zPattern, zString: Pu8;
+  const pInfo: TCompareInfo;
+  matchOther: u32
+): i32;
+var
+  c, c2: u32;
+  matchOne, matchAll: u32;
+  noCase: u8;
+  zEscaped: Pu8;
+  prior_c: u32;
+  seen, invert, bMatch: i32;
+  zStop0, zStop1: u8;
+  zPatPrev: Pu8;
+begin
+  matchOne := pInfo.matchOne;
+  matchAll := pInfo.matchAll;
+  noCase   := pInfo.noCase;
+  zEscaped := nil;
+
+  c := utf8ReadByteOrSlow(zPattern);
+  while c <> 0 do begin
+    if c = matchAll then begin
+      { Skip multiple matchAll, consuming one input char per matchOne. }
+      c := utf8ReadByteOrSlow(zPattern);
+      while (c = matchAll) or ((c = matchOne) and (matchOne <> 0)) do begin
+        if (c = matchOne) and (zString^ = 0) then begin
+          Result := SQLITE_NOWILDCARDMATCH; Exit;
+        end;
+        if c = matchOne then skipUtf8(zString);
+        c := utf8ReadByteOrSlow(zPattern);
+      end;
+      if c = 0 then begin Result := SQLITE_MATCH; Exit; end;
+      if c = matchOther then begin
+        if pInfo.matchSet = 0 then begin
+          c := utf8ReadByteOrSlow(zPattern);
+          if c = 0 then begin Result := SQLITE_NOWILDCARDMATCH; Exit; end;
+        end else begin
+          { "[...]" follows the "*" — slow recursive search. }
+          while zString^ <> 0 do begin
+            zPatPrev := zPattern; Dec(zPatPrev);
+            bMatch := patternCompare(zPatPrev, zString, pInfo, matchOther);
+            if bMatch <> SQLITE_NOMATCH then begin Result := bMatch; Exit; end;
+            skipUtf8(zString);
+          end;
+          Result := SQLITE_NOWILDCARDMATCH; Exit;
+        end;
+      end;
+
+      if c < $80 then begin
+        if noCase <> 0 then begin
+          zStop0 := sqlite3Toupper(u8(c));
+          zStop1 := sqlite3Tolower(u8(c));
+        end else begin
+          zStop0 := u8(c);
+          zStop1 := u8(c);
+        end;
+        while True do begin
+          while (zString^ <> 0) and (zString^ <> zStop0) and (zString^ <> zStop1) do
+            Inc(zString);
+          if zString^ = 0 then break;
+          Inc(zString);
+          bMatch := patternCompare(zPattern, zString, pInfo, matchOther);
+          if bMatch <> SQLITE_NOMATCH then begin Result := bMatch; Exit; end;
+        end;
+      end else begin
+        c2 := utf8ReadByteOrSlow(zString);
+        while c2 <> 0 do begin
+          if c2 = c then begin
+            bMatch := patternCompare(zPattern, zString, pInfo, matchOther);
+            if bMatch <> SQLITE_NOMATCH then begin Result := bMatch; Exit; end;
+          end;
+          c2 := utf8ReadByteOrSlow(zString);
+        end;
+      end;
+      Result := SQLITE_NOWILDCARDMATCH; Exit;
+    end;
+
+    if c = matchOther then begin
+      if pInfo.matchSet = 0 then begin
+        c := utf8ReadByteOrSlow(zPattern);
+        if c = 0 then begin Result := SQLITE_NOMATCH; Exit; end;
+        zEscaped := zPattern;
+      end else begin
+        prior_c := 0;
+        seen := 0;
+        invert := 0;
+        c := utf8ReadByteOrSlow(zString);
+        if c = 0 then begin Result := SQLITE_NOMATCH; Exit; end;
+        c2 := utf8ReadByteOrSlow(zPattern);
+        if c2 = Ord('^') then begin
+          invert := 1;
+          c2 := utf8ReadByteOrSlow(zPattern);
+        end;
+        if c2 = Ord(']') then begin
+          if c = Ord(']') then seen := 1;
+          c2 := utf8ReadByteOrSlow(zPattern);
+        end;
+        while (c2 <> 0) and (c2 <> Ord(']')) do begin
+          if (c2 = Ord('-')) and (zPattern^ <> Ord(']')) and (zPattern^ <> 0) and (prior_c > 0) then begin
+            c2 := utf8ReadByteOrSlow(zPattern);
+            if (c >= prior_c) and (c <= c2) then seen := 1;
+            prior_c := 0;
+          end else begin
+            if c = c2 then seen := 1;
+            prior_c := c2;
+          end;
+          c2 := utf8ReadByteOrSlow(zPattern);
+        end;
+        if (c2 = 0) or ((seen xor invert) = 0) then begin
+          Result := SQLITE_NOMATCH; Exit;
+        end;
+        c := utf8ReadByteOrSlow(zPattern);
+        continue;
+      end;
+    end;
+
+    c2 := utf8ReadByteOrSlow(zString);
+    if c = c2 then begin
+      c := utf8ReadByteOrSlow(zPattern);
+      continue;
+    end;
+    if (noCase <> 0) and (c < $80) and (c2 < $80) and
+       (sqlite3Tolower(u8(c)) = sqlite3Tolower(u8(c2))) then begin
+      c := utf8ReadByteOrSlow(zPattern);
+      continue;
+    end;
+    if (c = matchOne) and (zPattern <> zEscaped) and (c2 <> 0) then begin
+      c := utf8ReadByteOrSlow(zPattern);
+      continue;
+    end;
+    Result := SQLITE_NOMATCH; Exit;
+  end;
+  if zString^ = 0 then Result := SQLITE_MATCH else Result := SQLITE_NOMATCH;
+end;
+
+function sqlite3_strglob(zGlobPattern: PAnsiChar; zString: PAnsiChar): i32;
+begin
+  if zString = nil then begin
+    if zGlobPattern <> nil then Result := 1 else Result := 0;
+    Exit;
+  end;
+  if zGlobPattern = nil then begin Result := 1; Exit; end;
+  Result := patternCompare(Pu8(zGlobPattern), Pu8(zString), globInfo, Ord('['));
+  if Result = SQLITE_NOWILDCARDMATCH then Result := SQLITE_NOMATCH;
 end;
 
 function sqlite3_strlike(zPattern: PAnsiChar; zStr: PAnsiChar; esc: u32): i32;
-var
-  p, s: PByte;
-  c, cs: u32;
 begin
-  p := PByte(zPattern);
-  s := PByte(zStr);
-  while (p^ <> 0) and (s^ <> 0) do begin
-    c := sqlite3UpperToLower[p^];
-    if (esc <> 0) and (c = esc) then begin
-      Inc(p);
-      c := sqlite3UpperToLower[p^];
-      cs := sqlite3UpperToLower[s^];
-      if c <> cs then begin Result := 1; Exit; end;
-      Inc(p); Inc(s);
-    end else if c = Ord('%') then begin
-      Inc(p);
-      if p^ = 0 then begin Result := 0; Exit; end;
-      while s^ <> 0 do begin
-        if sqlite3_strlike(PAnsiChar(p), PAnsiChar(s), esc) = 0 then begin
-          Result := 0; Exit;
-        end;
-        Inc(s);
-      end;
-      Result := 1; Exit;
-    end else if (c = Ord('_')) or (c = sqlite3UpperToLower[s^]) then begin
-      Inc(p); Inc(s);
-    end else begin
-      Result := 1; Exit;
-    end;
+  if zStr = nil then begin
+    if zPattern <> nil then Result := 1 else Result := 0;
+    Exit;
   end;
-  while p^ = Ord('%') do Inc(p);
-  if (p^ = 0) and (s^ = 0) then Result := 0 else Result := 1;
+  if zPattern = nil then begin Result := 1; Exit; end;
+  Result := patternCompare(Pu8(zPattern), Pu8(zStr), likeInfoNorm, esc);
+  if Result = SQLITE_NOWILDCARDMATCH then Result := SQLITE_NOMATCH;
 end;
 
 

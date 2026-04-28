@@ -356,8 +356,15 @@ Important: At the end of this document, please find:
         per func.c:3427 `FUNCTION(sign,1,0,0,signFunc)`.  Returns
         -1/0/+1 for negative/zero/positive numeric inputs, NULL
         otherwise.  DiagDate sign pos/neg/zero → PASS.
-      [ ] **k) `'abc' GLOB '[ab]bc'` mismatches** — char-class arm
-        of patternCompare missing or buggy.  Port from func.c.
+      [X] **k) `'abc' GLOB '[ab]bc'` mismatches** — fixed
+        2026-04-28.  Ported `patternCompare` in full (func.c:728..855)
+        replacing the simplified ASCII-only `sqlite3_strglob` /
+        `sqlite3_strlike` helpers.  Adds `[...]` / `[^...]` /
+        `[a-z]` char-class support, UTF-8 lookahead in the wildcard
+        tail-search, and `SQLITE_NOWILDCARDMATCH` semantics (mapped
+        back to `SQLITE_NOMATCH` at the public-API boundary).
+        Verified via DiagDate "glob []" → PASS; TestExplainParity
+        unchanged (1012 pass / 14 diverge).
 
   [X] **6.10 step 8** Auto-named result columns carry a trailing space
       on Pas — fixed.  Root cause was `sqlite3DbSpanDup`
