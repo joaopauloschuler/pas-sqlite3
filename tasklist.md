@@ -705,10 +705,19 @@ Important: At the end of this document, please find:
             for the column.
   [ ] **6.26** port codegen.pas where / select / window stubs in full from C
        to pascal: `sqlite3SelectPopWith` (blocked on full TWith record — see
-       6.20), `sqlite3WhereMinMaxOptEarlyOut`,
-       `sqlite3KeyInfoFromExprList`, `sqlite3SelectAddTypeInfo`,
+       6.20), `sqlite3SelectAddTypeInfo`,
        `sqlite3WhereExplainBloomFilter`, `sqlite3WhereAddExplainText`,
        `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep`.
+       [X] `sqlite3WhereMinMaxOptEarlyOut` — ported in full (where.c:124..137)
+            2026-04-28.  Honours `bOrderedInnerLoop` (bit 2 of bitwiseFlags) +
+            `nOBSat`; emits OP_Goto to the innermost WHERE_COLUMN_IN level's
+            addrNxt or to pWInfo^.iBreak.  Productive once min/max-with-IN
+            aggregate codegen lands (6.10 step 7(c)).  TestExplainParity
+            unchanged (1012 pass / 14 diverge).
+       [X] `sqlite3KeyInfoFromExprList` — completed in full (select.c:1598)
+            2026-04-28.  CollSeq nil-stub replaced with productive
+            `sqlite3ExprNNCollSeq(pParse, pItem^.pExpr)` — the helper has been
+            real since 6.6.  Δ-neutral on TestExplainParity (1012/14).
        [X] `sqlite3SelectCheckOnClauses` — ported in full (select.c:7398..7508)
             2026-04-28.  CheckOnCtx record + xExpr/xSelect walker callbacks
             mirror the C; selectCheckOnClausesExpr emits

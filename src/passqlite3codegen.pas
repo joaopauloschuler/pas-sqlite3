@@ -9822,9 +9822,31 @@ begin
   Result := pWInfo^.iBreak;
 end;
 
+{ sqlite3WhereMinMaxOptEarlyOut — port of where.c:124..137.
+  After handling the aggregate-step call to min() or max(), check whether
+  any further looping is required.  If the output order guarantees the
+  correct answer is already found, emit an OP_Goto to bypass the rest. }
 procedure sqlite3WhereMinMaxOptEarlyOut(v: Pointer; pWInfo: PWhereInfo);
+var
+  pInner: PWhereLevel;
+  i: i32;
+  pLevels: PWhereLevel;
 begin
-  { Phase 6.2 stub }
+  if ((pWInfo^.bitwiseFlags shr 2) and 1) = 0 then Exit;  { !bOrderedInnerLoop }
+  if pWInfo^.nOBSat = 0 then Exit;
+  pLevels := whereInfoLevels(pWInfo);
+  i := i32(pWInfo^.nLevel) - 1;
+  while i >= 0 do
+  begin
+    pInner := @pLevels[i];
+    if (pInner^.pWLoop^.wsFlags and WHERE_COLUMN_IN) <> 0 then
+    begin
+      sqlite3VdbeGoto(PVdbe(v), pInner^.addrNxt);
+      Exit;
+    end;
+    Dec(i);
+  end;
+  sqlite3VdbeGoto(PVdbe(v), pWInfo^.iBreak);
 end;
 
 function sqlite3WhereContinueLabel(pWInfo: PWhereInfo): i32;
@@ -16911,9 +16933,10 @@ begin
     Inc(pItem, iStart);
     for i := iStart to nExpr - 1 do
     begin
-      { CollSeq stub — nil (full collation in Phase 6.6) }
+      { aColl[i-iStart] = sqlite3ExprNNCollSeq(pParse, pItem^.pExpr) — select.c:1615 }
       PPointer(PByte(pInfo) + SizeOf(TKeyInfo)
-         + (i - iStart) * SizeOf(Pointer))^ := nil;
+         + (i - iStart) * SizeOf(Pointer))^ :=
+           sqlite3ExprNNCollSeq(pParse, pItem^.pExpr);
       pInfo^.aSortFlags[i - iStart] := pItem^.fg.sortFlags;
       Inc(pItem);
     end;
