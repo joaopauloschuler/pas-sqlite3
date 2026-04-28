@@ -28,33 +28,25 @@ Important: At the end of this document, please find:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-- [ ] **6.9-bis 11g.2.b** Port `sqlite3WhereBegin` / `sqlite3WhereEnd`.  
+- [ ] **6.9-bis 11g.2.b** Port `sqlite3WhereBegin` / `sqlite3WhereEnd` in full.  
     Bookkeeping primitives, prologue,
     cleanup contract, and several leaf helpers (codeCompare cluster,
     sqlite3ExprCanBeNull, sqlite3ExprCodeTemp + 6 unary arms,
     TK_COLLATE/TK_SPAN/TK_UPLUS arms, whereShortCut, allowedOp +
     operatorMask + exprMightBeIndexed + minimal-viable exprAnalyze)
     are already ported.
-      - [ ] port or re-enable `sqlite3Update`
-      - [X] port or re-enable `sqlite3DeleteFrom` vtab `OP_VUpdate`.
-      - [X] port or re-enable `sqlite3GenerateRowDelete`,
-      - [ ] port or re-enable `sqlite3GenerateConstraintChecks`
-      - [ ] port or re-enable `sqlite3CompleteInsertion`
+      - [ ] port in full or re-enable `sqlite3Update`
+      - [ ] port in full or re-enable `sqlite3GenerateConstraintChecks`
+      - [ ] port in full or re-enable `sqlite3CompleteInsertion`
 - [ ] **6.9-complete** complete the porting of `sqlite3VdbeRecordCompare` and
   `sqlite3VdbeFindCompare` in FULL in `passqlite3btree.pas`.  Handles MEM_Int / MEM_IntReal - currently insufficient for general index lookup.
 
-- [ ] **6.9-bis 11g.2.f** Audit + regression.    
-    - [ ] Port `TestWhereCorpus.pas`
-        Verify byte-identical bytecode emission against C via
-        TestExplainParity expansion.  
-        Re-enable any disabled assertion /
-        safety-net guards left in place
-    
+- [ ] **6.9-bis 11g.2.f** Audit + regression.        
         Note: tests must be run with `LD_LIBRARY_PATH=$PWD/src` so the
         `csq_*` oracle resolves to the project's `src/libsqlite3.so`, not
         the system one.
 
-    - [ ] Port productive `sqlite3Update` body (skeleton-only today;
+    - [ ] Port in full `sqlite3Update` body (skeleton-only today;
       blocks DROP TABLE Δ=21 destroyRootPage path and UPDATE rowid=1
       Δ=14).
 
@@ -68,19 +60,6 @@ Important: At the end of this document, please find:
       Closes Δ=22 on the DROP TABLE row.
 
     - [ ] **6.10 step 6** Make these to work (port code when required):
-        [X] `CREATE INDEX i ON t(a) WHERE a>0` — partial-index WHERE
-          clause codegen now ports `sqlite3ResolveSelfReference`
-          (NameContext-on-the-stack) + the `iSelfTab>0` arm of
-          TK_COLUMN, so `pPartIdxWhere` round-trips through
-          `sqlite3GenerateIndexKey` with the expected
-          `Column / Le / Integer-in-prologue` pattern.  Probe PASSes at
-          41 ops.
-        [X] `INSERT INTO t(a) VALUES(1)` / `INSERT INTO t(a,b,c)
-          VALUES(...)` — named-column INSERT path now ports IDLIST
-          resolution (insert.c:1077..1108) + per-table-column store
-          loop with aTabColMap; missing columns get OP_Null via the
-          existing DEFAULT-VALUES factor path. Both probes PASS at
-          11 ops, matching positional INSERT.
         [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
           VALUES path).
         [ ] **IPK-IN execution path**
@@ -96,17 +75,8 @@ Important: At the end of this document, please find:
                 reconcile that vs. codegen.pas's bigger
                 TUnpackedRecord before porting the corruption /
                 BIGNULL / DESC arms.
-            [X] **6.10 step 6.IPK-IN.f** — IN-subquery skip-to-root
-                short-circuit in `sqlite3BtreeIndexMoveto`. Done.
         [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
           ONEPASS_MULTI gap as DROP TABLE arm (a)).
-        [X] `PRAGMA user_version` / `PRAGMA encoding` — read-pragma
-          codegen now ports the `PragTyp_HEADER_VALUE` and
-          `PragTyp_ENCODING` read arms (RunOnlyOnce + Transaction +
-          ReadCookie + ResultRow for user_version; RunOnlyOnce +
-          String8 'UTF-8' + ResultRow for encoding).  Both probes
-          PASS at 7 / 6 ops.  Schema-prefix `PRAGMA main.X` and the
-          full pragmaLocate dispatch table remain deferred.
         [ ] `SELECT DISTINCT a FROM t` — Δ=13 (DISTINCT codegen,
           ephemeral-table dedup not yet wired in `sqlite3Select`).
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
@@ -116,13 +86,6 @@ Important: At the end of this document, please find:
           path, not yet ported).
         [ ] `SELECT COUNT(*)` — Δ=−1; `SELECT SUM/MIN/MAX(a)` —
           Δ=3..4 (aggregate-no-GROUP path, partial codegen).
-        [X] `SELECT a FROM t LIMIT 5 OFFSET 2` — OFFSET path now ports
-          the OFFSET arm of `computeLimitRegisters` (iOffset + helper
-          allocation, ExprCode + MustBeInt + OffsetLimit prologue) and
-          `codeOffset`'s in-loop IfPos.  `sqlite3WhereBegin`'s scan
-          return path now publishes `pLevel^.addrCont` to
-          `pWInfo^.iContinue` so the IfPos jumps to OP_Next, not iBreak.
-          Probe PASSes at 16 ops.
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
           materialise / co-routine path not ported).
         [ ] `UPDATE t SET a=5 WHERE rowid=1` — Δ=14 (`sqlite3Update`

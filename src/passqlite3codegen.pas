@@ -19331,10 +19331,18 @@ begin
   { Phase 6.5 }
 end;
 
-{ sqlite3SetMakeRecordP5 — set P5 of OP_MakeRecord for WITHOUT ROWID (Phase 6.4 stub) }
+{ sqlite3SetMakeRecordP5 — port of insert.c:2732.
+  C reference is gated behind #ifdef SQLITE_ENABLE_NULL_TRIM; the default
+  upstream build does NOT define that symbol, so the call site expands to
+  a no-op macro and the OP_MakeRecord's P5 stays at zero.  This port keeps
+  the same default and emits no code.  When NULL_TRIM compatibility is
+  needed, restore the body: for i := nCol-1 downto 1 do break-on
+  iDflt<>0 OR COLFLAG_PRIMKEY; sqlite3VdbeChangeP5(v, i+1) — gated by
+  pTab^.pSchema^.file_format >= 2 (file_format is bumped to 4 once any
+  CREATE TABLE has executed OP_SetCookie, see vdbe.pas:7261). }
 procedure sqlite3SetMakeRecordP5(v: PVdbe; pTab: PTable2);
 begin
-  { Phase 6.5 }
+  { No-op in the default (NULL_TRIM-disabled) build, matching upstream. }
 end;
 
 { sqlite3CompleteInsertion — emit final OP_Insert/OP_IdxInsert (Phase 6.4 stub) }
