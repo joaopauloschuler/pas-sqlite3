@@ -3383,14 +3383,34 @@ begin
   end;
 end;
 
+{ vdbeaux.c:3284 — vdbeFkError.  Set the VM's rc/errorAction/zErrMsg
+  to SQLITE_CONSTRAINT_FOREIGNKEY; return SQLITE_ERROR for a one-shot
+  prepare (legacy sqlite3_prepare path) or SQLITE_CONSTRAINT_FOREIGNKEY
+  when SQLITE_PREPARE_SAVESQL is set (sqlite3_prepare_v2). }
+function vdbeFkError(p: PVdbe): i32;
+begin
+  p^.rc := SQLITE_CONSTRAINT_FOREIGNKEY;
+  p^.errorAction := OE_Abort;
+  sqlite3VdbeError(p, 'FOREIGN KEY constraint failed');
+  if (p^.prepFlags and SQLITE_PREPARE_SAVESQL) = 0 then
+    Result := SQLITE_ERROR
+  else
+    Result := SQLITE_CONSTRAINT_FOREIGNKEY;
+end;
+
 function sqlite3VdbeCheckFkImmediate(p: PVdbe): i32;
 begin
-  Result := 0;
+  if p^.nFkConstraint = 0 then Exit(SQLITE_OK);
+  Result := vdbeFkError(p);
 end;
 
 function sqlite3VdbeCheckFkDeferred(p: PVdbe): i32;
+var
+  db: PTsqlite3;
 begin
-  Result := 0;
+  db := p^.db;
+  if (db^.nDeferredCons + db^.nDeferredImmCons) = 0 then Exit(SQLITE_OK);
+  Result := vdbeFkError(p);
 end;
 
 { --- VdbeList — EXPLAIN output (stub; Phase 5.8 vdbetrace.c) --- }

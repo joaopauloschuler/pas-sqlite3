@@ -78,9 +78,19 @@ Important: At the end of this document, please find:
        [ ] `sqlite3VdbeEnter` / `sqlite3VdbeLeave` — empty; acquire /
             release per-btree mutexes from `p^.lockMask`.  Required for
             shared-cache / multi-thread builds.
-       [ ] `sqlite3VdbeCheckFkImmediate` / `sqlite3VdbeCheckFkDeferred`
-            — both return `0`; in C this is a single `sqlite3VdbeCheckFk(p,
-            deferred)` that walks the FK counter list.
+       [X] `sqlite3VdbeCheckFkImmediate` / `sqlite3VdbeCheckFkDeferred`
+            — ported 2026-04-28 (vdbe.pas:3386).  CheckFkImmediate
+            short-circuits when `p^.nFkConstraint=0`; CheckFkDeferred
+            short-circuits when `db^.nDeferredCons + nDeferredImmCons = 0`.
+            Both delegate to a new local `vdbeFkError` (vdbeaux.c:3284)
+            that sets `p^.rc=SQLITE_CONSTRAINT_FOREIGNKEY`,
+            `errorAction=OE_Abort`, calls sqlite3VdbeError(`FOREIGN KEY
+            constraint failed`), and returns SQLITE_ERROR
+            (legacy prepare) or SQLITE_CONSTRAINT_FOREIGNKEY when
+            SQLITE_PREPARE_SAVESQL is set.  No regressions:
+            TestExplainParity 1016/10, TestSchemaBasic 44/0, TestDMLBasic
+            54/0, TestSelectBasic 49/0, TestParser 45/0, TestVdbeTxn 8/0,
+            TestVdbeRecord 13/0, TestVdbeAgg 11/0, TestBtreeCompat 337/0.
 
        Bytecode virtual table (vdbevtab.c):
        [ ] `sqlite3VdbeBytecodeVtabInit` — returns `SQLITE_OK`; must
