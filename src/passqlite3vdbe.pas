@@ -1477,6 +1477,7 @@ type
   TResetOneSchemaFn  = procedure(db: PTsqlite3; iDb: i32);
   TResetAllSchemasFn = procedure(db: PTsqlite3);
   TDisplayP4Fn       = function(db: Psqlite3; pOp: PVdbeOp): PAnsiChar;
+  TAnalysisLoadFn    = function(db: PTsqlite3; iDb: i32): i32;
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
@@ -1486,6 +1487,7 @@ var
   gResetOneSchema:         TResetOneSchemaFn;
   gResetAllSchemas:        TResetAllSchemasFn;
   gDisplayP4:              TDisplayP4Fn;
+  gAnalysisLoad:           TAnalysisLoadFn;
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
@@ -10017,8 +10019,10 @@ end;
 
 function sqlite3AnalysisLoad(db: PTsqlite3; iDb: i32): i32;
 begin
-  { Stub — full stat1 loading requires codegen (Phase 6) }
-  Result := SQLITE_OK;
+  if Assigned(gAnalysisLoad) then
+    Result := gAnalysisLoad(db, iDb)
+  else
+    Result := SQLITE_OK;
 end;
 
 procedure sqlite3UnlinkAndDeleteTable(db: PTsqlite3; iDb: i32; zTabName: PAnsiChar);

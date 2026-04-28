@@ -22121,6 +22121,67 @@ begin
   end;
 end;
 
+{ sqlite3AnalysisLoad — port of analyze.c:1942.
+  Clear any prior stat1 flags on every Table/Index in pSchema, and re-seed
+  default row estimates on indexes that lack stat1.  The sqlite_stat1
+  SELECT/loader arm (analysisLoader + decodeIntArray) is omitted: the
+  current build never produces a sqlite_stat1 row (sqlite3Analyze is still
+  a stub), so sqlite3FindTable("sqlite_stat1") would return nil and skip
+  the SELECT regardless.  Wired into vdbe.pas via the gAnalysisLoad hook
+  registered at unit-init below. }
+function analysisLoadTrampoline(db: PTsqlite3; iDb: i32): i32;
+var
+  pSchema:  passqlite3util.PSchema;
+  pElem:    PHashElem;
+  pTab:     PTable2;
+  pIdx:     PIndex2;
+  pStat1:   PTable2;
+begin
+  Result := SQLITE_OK;
+  if db = nil then Exit;
+  if (iDb < 0) or (iDb >= db^.nDb) then Exit;
+  pSchema := passqlite3util.PSchema(db^.aDb[iDb].pSchema);
+  if pSchema = nil then Exit;
+
+  { Clear TF_HasStat1 on every table. }
+  pElem := pSchema^.tblHash.first;
+  while pElem <> nil do
+  begin
+    pTab := PTable2(pElem^.data);
+    if pTab <> nil then
+      pTab^.tabFlags := pTab^.tabFlags and (not TF_HasStat1);
+    pElem := PHashElem(pElem^.next);
+  end;
+
+  { Clear hasStat1 (bit 7 of idxFlags) on every index. }
+  pElem := pSchema^.idxHash.first;
+  while pElem <> nil do
+  begin
+    pIdx := PIndex2(pElem^.data);
+    if pIdx <> nil then
+      pIdx^.idxFlags := pIdx^.idxFlags and (not u16(1 shl 7));
+    pElem := PHashElem(pElem^.next);
+  end;
+
+  { If sqlite_stat1 exists, the C reference loads stats here.  decodeIntArray
+    + analysisLoader are not yet ported; sqlite3Analyze is itself a stub, so
+    no row is ever written and this arm is unreachable today.  Match the
+    "table not found" no-op path of analyze.c:1971..1982. }
+  pStat1 := sqlite3FindTable(db, 'sqlite_stat1', db^.aDb[iDb].zDbSName);
+  { Use pStat1 only as a presence probe; loader is deferred. }
+  if pStat1 = nil then ;
+
+  { Seed default row estimates on every index that lacks stat1. }
+  pElem := pSchema^.idxHash.first;
+  while pElem <> nil do
+  begin
+    pIdx := PIndex2(pElem^.data);
+    if (pIdx <> nil) and (indexHasStat1(pIdx) = 0) then
+      sqlite3DefaultRowEst(pIdx);
+    pElem := PHashElem(pElem^.next);
+  end;
+end;
+
 { build.c:599 — collapse the aDb[] array, dropping any detached entries
   past index 1.  Entries 0 (main) and 1 (temp) are never collapsed. }
 procedure sqlite3CollapseDatabaseArray(db: PTsqlite3);
@@ -31332,5 +31393,6 @@ initialization
   passqlite3vdbe.gResetOneSchema         := @sqlite3ResetOneSchema;
   passqlite3vdbe.gResetAllSchemas        := @sqlite3ResetAllSchemasOfConnection;
   passqlite3vdbe.gDisplayP4              := passqlite3vdbe.TDisplayP4Fn(@displayP4Trampoline);
+  passqlite3vdbe.gAnalysisLoad           := @analysisLoadTrampoline;
 
 end.

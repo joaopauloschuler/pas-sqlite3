@@ -647,8 +647,17 @@ Important: At the end of this document, please find:
        `sqlite3VdbeDisplayComment` (blocked: needs opcode-synopsis
        tables appended after each name in sqlite3OpcodeName — Pas
        OpcodeNames table is plain names only, defer),
-       `sqlite3VdbeList`, `sqlite3_blob_open`,
-       `sqlite3AnalysisLoad`.
+       `sqlite3VdbeList`, `sqlite3_blob_open`.
+       [X] `sqlite3AnalysisLoad` — ported (analyze.c:1942) 2026-04-28
+            via the new `gAnalysisLoad` hook (codegen registers
+            `analysisLoadTrampoline`).  Clears `TF_HasStat1` on every
+            tblHash entry, clears `hasStat1` (bit 7 of idxFlags) on every
+            idxHash entry, and re-seeds `sqlite3DefaultRowEst` on every
+            stat1-less index.  Stat1 SELECT/loader arm
+            (`analysisLoader` + `decodeIntArray`) deferred — never
+            reachable until `sqlite3Analyze` lands and a sqlite_stat1
+            table actually exists.  Δ-neutral on TestExplainParity
+            (1015/11), no regressions.
        [X] `sqlite3VdbeDisplayP4` — ported in full (vdbeaux.c:1905)
             2026-04-28.  Inline arms in vdbe.pas handle FUNCDEF/
             FUNCCTX/INT32/INT64/REAL/MEM/VTAB/INTARRAY/SUBPROGRAM/
