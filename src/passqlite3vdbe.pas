@@ -2825,10 +2825,15 @@ begin
   sqlite3DbFree(p^.v^.db, p);
 end;
 
+{ sqlite3VdbeFrameRestore — port of vdbeaux.c:2812.
+  Forwards to sqlite3VdbeFrameRestoreFull (see further down in this unit) which
+  already mirrors the C body line-for-line; consolidating the two declarations
+  here so the real implementation is reachable through both names. }
+function sqlite3VdbeFrameRestoreFull(pFrame: PVdbeFrame): i32; forward;
 function sqlite3VdbeFrameRestore(pFrame: PVdbeFrame): i32;
 begin
-  { Stub — Phase 5.4 }
-  Result := 0;
+  Result := sqlite3VdbeFrameRestoreFull(pFrame);
+  Exit;
 end;
 
 { --- VdbeMakeReady / VdbeRewind --- }
@@ -4320,12 +4325,13 @@ end;
 { Implement sqlite3VdbeFrameRestore properly (vdbeaux.c:2812) }
 function sqlite3VdbeFrameRestoreFull(pFrame: PVdbeFrame): i32;
 var
-  v: PVdbe;
-  i: i32;
+  v:  PVdbe;
+  db: PTsqlite3;
+  i:  i32;
   pC: PVdbeCursor;
 begin
   v := pFrame^.v;
-  { Close cursors in current frame }
+  { closeCursorsInFrame — vdbeaux.c:2796 }
   for i := 0 to v^.nCursor - 1 do begin
     pC := v^.apCsr[i];
     if pC <> nil then begin
@@ -4339,7 +4345,11 @@ begin
   v^.nMem   := pFrame^.nMem;
   v^.apCsr  := pFrame^.apCsr;
   v^.nCursor := pFrame^.nCursor;
-  { db->lastRowid and db->nChange would need PTsqlite3 cast }
+  db := v^.db;
+  if db <> nil then begin
+    db^.lastRowid := pFrame^.lastRowid;
+    db^.nChange   := pFrame^.nDbChange;
+  end;
   v^.nChange := pFrame^.nChange;
   sqlite3VdbeDeleteAuxData(v^.db, @v^.pAuxData, -1, 0);
   v^.pAuxData := pFrame^.pAuxData;

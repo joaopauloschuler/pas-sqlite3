@@ -209,7 +209,6 @@ Important: At the end of this document, please find:
        like the gUnlinkAndDelete* pattern),
        `sqlite3VdbeDisplayComment`, `sqlite3VdbeDisplayP4`,
        `sqlite3VdbeEnter`, `sqlite3VdbeNextOpcode`,
-       `sqlite3VdbeFrameRestore`,
        `sqlite3VdbeCloseStatement`, `sqlite3VdbeList`,
        `sqlite3_blob_open`, `sqlite3VdbeLogAbort`,
        `sqlite3ResetOneSchema`,
@@ -239,6 +238,12 @@ Important: At the end of this document, please find:
             returns "a", "xyz" etc. instead of NULL.
        [X] `sqlite3VdbeFrameMemDel` — ported in full (vdbeaux.c:2247);
             adds the frame to v->pDelFrame for deferred free.
+       [X] `sqlite3VdbeFrameRestore` — ported in full (vdbeaux.c:2812).
+            Real body lived in sqlite3VdbeFrameRestoreFull but the
+            externally-named entry point was a 0-returning stub; now
+            forwards to the real impl.  Also fixed FrameRestoreFull's
+            previously TODO'd db->lastRowid / db->nChange propagation
+            (was unwritten on frame return).
        [X] `sqlite3VdbeExplainParent` — ported in full (vdbeaux.c:493).
        [X] `sqlite3VdbeScanStatus` / `sqlite3VdbeScanStatusRange` /
             `sqlite3VdbeScanStatusCounters` — gated by
