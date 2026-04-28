@@ -3195,16 +3195,30 @@ end;
 
 { sqlite3ParserAddCleanup implemented in Phase 6.5 section below }
 
+{ alter.c:914 / 776 — these only do non-trivial work when
+  pParse^.eParseMode is PARSE_MODE_RENAME (set by sqlite3AlterRenameTable
+  / sqlite3AlterRenameColumn, both still stubbed under task 6.27).  All
+  productive call sites in build.c / parser.pas guard with InRenameObject,
+  so under the current build this path is never reached and a no-op
+  matches the C reference exactly.  Full bodies (RenameToken record +
+  walker callbacks) land alongside ALTER TABLE RENAME in 6.27. }
 procedure sqlite3RenameExprUnmap(pParse: PParse; pExpr: PExpr);
-begin { Phase 6.5 stub } end;
+begin
+end;
 
 procedure sqlite3RenameTokenMap(pParse: PParse; pPtr: Pointer;
   const pToken: PToken);
-begin { Phase 6.5 stub } end;
+begin
+end;
 
+{ vdbeaux.c:84 — only emitted when SQLITE_ENABLE_NORMALIZE is defined.
+  The default upstream build (and our oracle) compiles without it, so all
+  call sites in resolve.c are #ifdef-gated out and this routine is never
+  reached.  The no-op below matches default-build behaviour exactly. }
 procedure sqlite3VdbeAddDblquoteStr(db: PTsqlite3; pVdbe: PVdbe;
   z: PAnsiChar);
-begin { Phase 6.5 stub } end;
+begin
+end;
 
 { Error reporting (used by expr.c, resolve.c).  Mirrors build.c
   sqlite3ErrorMsg: stores the formatted message on pParse^.zErrMsg
@@ -3241,8 +3255,19 @@ begin
   pParse^.zErrMsg := zMsg;
 end;
 
+{ printf.c:1066..1075 — record the start-byte offset of pExpr (or its
+  left-most descendant carrying a real offset) on db^.errByteOffset, so
+  that a downstream parse-error message can point at the right column. }
 procedure sqlite3RecordErrorOffsetOfExpr(db: PTsqlite3; pExpr: PExpr);
-begin { Phase 6.5 stub } end;
+begin
+  while (pExpr <> nil)
+    and (((pExpr^.flags and (EP_OuterON or EP_InnerON)) <> 0)
+         or (pExpr^.w.iOfst <= 0)) do
+    pExpr := pExpr^.pLeft;
+  if pExpr = nil then Exit;
+  if (pExpr^.flags and EP_FromDDL) <> 0 then Exit;
+  db^.errByteOffset := pExpr^.w.iOfst;
+end;
 
 procedure sqlite3DequoteExpr(p: PExpr);
 begin

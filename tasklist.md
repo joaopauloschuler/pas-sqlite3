@@ -169,8 +169,18 @@ Important: At the end of this document, please find:
        `sqlite3RootPageMoved`, `sqlite3FkClearTriggerCache`,
        `sqlite3ResetAllSchemasOfConnection`, `sqlite3Stat4ProbeFree`.
   [ ] **6.22** port codegen.pas rename / error-offset stubs in full from C
-       to pascal: `sqlite3RenameExprUnmap`, `sqlite3RenameTokenMap`,
-       `sqlite3VdbeAddDblquoteStr`, `sqlite3RecordErrorOffsetOfExpr`.
+       to pascal:
+       [X] `sqlite3RecordErrorOffsetOfExpr` — ported in full
+            (printf.c:1066).
+       [X] `sqlite3VdbeAddDblquoteStr` — gated under
+            `SQLITE_ENABLE_NORMALIZE` (off in default upstream build);
+            no-op matches default-build behaviour exactly.
+       [ ] `sqlite3RenameExprUnmap`, `sqlite3RenameTokenMap` — only
+            productive under `PARSE_MODE_RENAME`.  Full bodies
+            (`RenameToken` record + walker callbacks) deferred to land
+            with `sqlite3AlterRenameTable` / `sqlite3AlterRenameColumn`
+            in 6.27; current no-op matches C semantics whenever the
+            parser is not in rename mode.
   [ ] **6.23** port codegen.pas trigger stubs in full from C to pascal:
        `sqlite3TriggerList`, `sqlite3BeginTrigger`, `sqlite3FinishTrigger`,
        `sqlite3DropTrigger`, `sqlite3DropTriggerPtr`,
