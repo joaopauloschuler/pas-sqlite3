@@ -74,8 +74,10 @@ Important: At the end of this document, please find:
                 reconcile that vs. codegen.pas's bigger
                 TUnpackedRecord before porting the corruption /
                 BIGNULL / DESC arms.
-        [ ] `DELETE FROM t WHERE a=5` — Δ=−5 (Pas heavier than C; same
-          ONEPASS_MULTI gap as DROP TABLE arm (a)).
+        [X] `DELETE FROM t WHERE a=5` — Δ=−5 closed by porting
+          ONEPASS_MULTI promotion in sqlite3WhereBegin
+          (where.c:7218..7237).  Pas now picks one-pass inline delete
+          on full-scan DELETEs.
         [ ] `SELECT DISTINCT a FROM t` — Δ=13 (DISTINCT codegen,
           ephemeral-table dedup not yet wired in `sqlite3Select`).
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
@@ -117,14 +119,13 @@ Important: At the end of this document, please find:
           exists.  Distinct from the INSERT row above — needs planner
           work, not insert.c work.
   
-  [ ] **6.11** DROP TABLE Δ=21 root cause:
-    (a) Pas emits a 2-pass RowSet delete for the sqlite_schema scrub
-        where C inlines `Delete` during the scan (~+5 ops). Needs
-        ONEPASS_MULTI promotion for non-rowid-EQ `sqlite3DeleteFrom`.
+  [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
+    (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
+        the sqlite_schema scrub now uses one-pass inline delete.
     (b) Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
         because `destroyRootPage` calls `sqlite3NestedParse(UPDATE
         sqlite_schema ...)` and productive `sqlite3Update` is still
-        skeleton-only.
+        skeleton-only.  This is the only remaining contributor.
   [ ] port sqlite3Pragma in full
   [ ] port sqlite3Vacuum in full
   [ ] search for "stub" in the pascal source code and port from C in

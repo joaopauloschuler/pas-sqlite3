@@ -14280,16 +14280,34 @@ begin
     Exit(nil);
   end;
 
-  { ONEPASS_SINGLE detection — where.c:7263..7283.  When the caller
-    signals it can absorb a single-row delete/update inline and
-    whereShortCut picked WHERE_ONEROW (rowid-EQ), promote the cursor
-    to OP_OpenWrite and record eOnePass + the cursor in aiCurOnePass[0]
-    so sqlite3DeleteFrom skips the 2-pass ROWSET path. }
-  if ((wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0)
-     and ((pLoop^.wsFlags and WHERE_ONEROW) <> 0) then
+  { ONEPASS_SINGLE / ONEPASS_MULTI detection — where.c:7218..7237.
+    When the caller signals it can absorb the delete/update inline,
+    promote the cursor to OP_OpenWrite and record eOnePass + the cursor
+    in aiCurOnePass[0] so sqlite3DeleteFrom skips the 2-pass ROWSET
+    path.  WHERE_ONEROW → ONEPASS_SINGLE; otherwise ONEPASS_MULTI when
+    the caller granted WHERE_ONEPASS_MULTIROW, the table is not virtual,
+    the scan is not a MULTI-OR (or the caller granted DUPLICATES_OK),
+    and the OnePass optimisation is enabled.
+
+    bFordelete / WHERE_IDX_ONLY clearing is deferred — Pas planner does
+    not currently emit covering-index DELETE plans, so the gate has no
+    work to do on those bits. }
+  if (wctrlFlags and WHERE_ONEPASS_DESIRED) <> 0 then
   begin
-    pWInfo^.eOnePass := ONEPASS_SINGLE;
-    pWInfo^.aiCurOnePass[0] := pLevel^.iTabCur;
+    if (pLoop^.wsFlags and WHERE_ONEROW) <> 0 then
+    begin
+      pWInfo^.eOnePass := ONEPASS_SINGLE;
+      pWInfo^.aiCurOnePass[0] := pLevel^.iTabCur;
+    end
+    else if ((wctrlFlags and u16($0008)) <> 0) { WHERE_ONEPASS_MULTIROW }
+         and (pTab^.eTabType <> TABTYP_VTAB)
+         and (((pLoop^.wsFlags and WHERE_MULTI_OR) = 0)
+              or ((wctrlFlags and WHERE_DUPLICATES_OK) <> 0))
+         and OptimizationEnabled(db, SQLITE_OnePass) then
+    begin
+      pWInfo^.eOnePass := ONEPASS_MULTI;
+      pWInfo^.aiCurOnePass[0] := pLevel^.iTabCur;
+    end;
   end;
 
   { Ensure schema cookie / OP_Transaction prologue is emitted for iDb. }
