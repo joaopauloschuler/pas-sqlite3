@@ -25353,14 +25353,34 @@ begin
   Result := SQLITE_OK; { Phase 7 }
 end;
 
+{ sqlite3BtreeEnterAll — port of btmutex.c:280..288 (single-threaded /
+  shared-cache-omitted arm).  Mirrors sqlite3BtreeEnter for every attached
+  btree: copy p->db down to p->pBt->db so any subsequent btree call sees
+  the active connection.  Mutex acquisition is a no-op in this build. }
 procedure sqlite3BtreeEnterAll(db: PTsqlite3);
+var
+  i: i32;
+  p: PBtree;
 begin
-  { Phase 7 — acquire btree mutexes }
+  for i := 0 to db^.nDb - 1 do begin
+    p := PBtree(db^.aDb[i].pBt);
+    if p <> nil then
+      sqlite3BtreeEnter(p);
+  end;
 end;
 
+{ sqlite3BtreeLeaveAll — symmetric to EnterAll.  No-op in
+  shared-cache-omitted build (matches sqlite3BtreeLeave). }
 procedure sqlite3BtreeLeaveAll(db: PTsqlite3);
+var
+  i: i32;
+  p: PBtree;
 begin
-  { Phase 7 }
+  for i := 0 to db^.nDb - 1 do begin
+    p := PBtree(db^.aDb[i].pBt);
+    if p <> nil then
+      sqlite3BtreeLeave(p);
+  end;
 end;
 
 function sqlite3BtreeSchemaLocked(pBt: Pointer): i32;

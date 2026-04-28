@@ -577,10 +577,15 @@ Important: At the end of this document, please find:
             sqlite3GenerateConstraintChecks (6.9-bis 11g.2.b)
             wires its callers.
 
-- [ ] **7.1.6** Btree mutex acquisition (btmutex.c) — empty stubs
-       (siblings of the 6.8 mutex entries):
-       [ ] `sqlite3BtreeEnterAll` (codegen.pas:25221).
-       [ ] `sqlite3BtreeLeaveAll` (codegen.pas:25226).
+- [X] **7.1.6** Btree mutex acquisition (btmutex.c) — ported
+       2026-04-28 (codegen.pas:25356..).  Walks `db^.aDb[i].pBt` and
+       calls `sqlite3BtreeEnter` / `sqlite3BtreeLeave` for each non-nil
+       slot, matching btmutex.c:280..288 (single-threaded /
+       shared-cache-omitted arm).  In this build that reduces to
+       copying `p^.db` to `p^.pBt^.db` per attached btree on enter,
+       and a no-op on leave.  Verified TestExplainParity 1016/10,
+       TestSelectBasic 49/0, TestVdbeTxn 8/0, TestParser 45/0 — no
+       regressions.
 
 - [ ] **7.1.7** Lemon parser tail (parse.c epilogue) — gaps inside
        `passqlite3parser.pas`:
