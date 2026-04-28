@@ -316,6 +316,40 @@ function sqlite3InitCallback(pInit: Pointer; argc: i32;
                              argv: PPAnsiChar;
                              NotUsed: PPAnsiChar): i32; cdecl;
 
+{ ----------------------------------------------------------------------
+  Phase 8.1.1 / 8.4.1 — informational + change-counter / interrupt /
+  errcode / autocommit / readonly / sleep / memory accessors.
+  Faithful ports of the corresponding main.c / malloc.c entry points.
+  ---------------------------------------------------------------------- }
+function sqlite3_libversion: PAnsiChar; cdecl;
+function sqlite3_libversion_number: i32; cdecl;
+function sqlite3_sourceid: PAnsiChar; cdecl;
+function sqlite3_threadsafe: i32; cdecl;
+
+function sqlite3_last_insert_rowid(db: PTsqlite3): i64; cdecl;
+procedure sqlite3_set_last_insert_rowid(db: PTsqlite3; iRowid: i64); cdecl;
+function sqlite3_changes(db: PTsqlite3): i32; cdecl;
+function sqlite3_changes64(db: PTsqlite3): i64; cdecl;
+function sqlite3_total_changes(db: PTsqlite3): i32; cdecl;
+function sqlite3_total_changes64(db: PTsqlite3): i64; cdecl;
+
+procedure sqlite3_interrupt(db: PTsqlite3); cdecl;
+function sqlite3_is_interrupted(db: PTsqlite3): i32; cdecl;
+
+function sqlite3_errcode(db: PTsqlite3): i32; cdecl;
+function sqlite3_extended_errcode(db: PTsqlite3): i32; cdecl;
+function sqlite3_extended_result_codes(db: PTsqlite3; onoff: i32): i32; cdecl;
+function sqlite3_system_errno(db: PTsqlite3): i32; cdecl;
+
+function sqlite3_get_autocommit(db: PTsqlite3): i32; cdecl;
+function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;
+
+function sqlite3_sleep(ms: i32): i32; cdecl;
+
+function sqlite3_release_memory(n: i32): i32; cdecl;
+function sqlite3_memory_highwater(resetFlag: i32): i64; cdecl;
+function sqlite3_msize(p: Pointer): u64; cdecl;
+
 implementation
 
 uses
@@ -2239,6 +2273,168 @@ begin
   //   rc := SQLITE_CORRUPT;
   sqlite3DbFree(db, zSql);
   Result := rc;
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 8.1.1 / 8.4.1 implementations — see interface comment.
+  ---------------------------------------------------------------------- }
+
+function sqlite3_libversion: PAnsiChar; cdecl;
+begin
+  Result := PAnsiChar(SQLITE_VERSION);
+end;
+
+function sqlite3_libversion_number: i32; cdecl;
+begin
+  Result := SQLITE_VERSION_NUMBER;
+end;
+
+function sqlite3_sourceid: PAnsiChar; cdecl;
+begin
+  Result := PAnsiChar(SQLITE_SOURCE_ID);
+end;
+
+function sqlite3_threadsafe: i32; cdecl;
+begin
+  { passqlite3util:848 sets bFullMutex=1 → SQLITE_THREADSAFE==1. }
+  Result := 1;
+end;
+
+function sqlite3_last_insert_rowid(db: PTsqlite3): i64; cdecl;
+begin
+  if db = nil then begin Result := 0; Exit; end;
+  Result := db^.lastRowid;
+end;
+
+procedure sqlite3_set_last_insert_rowid(db: PTsqlite3; iRowid: i64); cdecl;
+begin
+  if db = nil then Exit;
+  sqlite3_mutex_enter(db^.mutex);
+  db^.lastRowid := iRowid;
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+function sqlite3_changes64(db: PTsqlite3): i64; cdecl;
+begin
+  if db = nil then begin Result := 0; Exit; end;
+  Result := db^.nChange;
+end;
+
+function sqlite3_changes(db: PTsqlite3): i32; cdecl;
+begin
+  Result := i32(sqlite3_changes64(db));
+end;
+
+function sqlite3_total_changes64(db: PTsqlite3): i64; cdecl;
+begin
+  if db = nil then begin Result := 0; Exit; end;
+  Result := db^.nTotalChange;
+end;
+
+function sqlite3_total_changes(db: PTsqlite3): i32; cdecl;
+begin
+  Result := i32(sqlite3_total_changes64(db));
+end;
+
+procedure sqlite3_interrupt(db: PTsqlite3); cdecl;
+begin
+  if db = nil then Exit;
+  db^.u1.isInterrupted := 1;
+end;
+
+function sqlite3_is_interrupted(db: PTsqlite3): i32; cdecl;
+begin
+  if db = nil then begin Result := 0; Exit; end;
+  if db^.u1.isInterrupted <> 0 then Result := 1 else Result := 0;
+end;
+
+function sqlite3_errcode(db: PTsqlite3): i32; cdecl;
+begin
+  if (db <> nil) and (sqlite3SafetyCheckSickOrOk(db) = 0) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  if (db = nil) or (db^.mallocFailed <> 0) then begin
+    Result := SQLITE_NOMEM; Exit;
+  end;
+  Result := db^.errCode and db^.errMask;
+end;
+
+function sqlite3_extended_errcode(db: PTsqlite3): i32; cdecl;
+begin
+  if (db <> nil) and (sqlite3SafetyCheckSickOrOk(db) = 0) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  if (db = nil) or (db^.mallocFailed <> 0) then begin
+    Result := SQLITE_NOMEM; Exit;
+  end;
+  Result := db^.errCode;
+end;
+
+function sqlite3_extended_result_codes(db: PTsqlite3; onoff: i32): i32; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  if onoff <> 0 then db^.errMask := i32($FFFFFFFF) else db^.errMask := $FF;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+function sqlite3_system_errno(db: PTsqlite3): i32; cdecl;
+begin
+  if db = nil then Result := 0 else Result := db^.iSysErrno;
+end;
+
+function sqlite3_get_autocommit(db: PTsqlite3): i32; cdecl;
+begin
+  if db = nil then begin Result := 0; Exit; end;
+  Result := db^.autoCommit;
+end;
+
+function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;
+var
+  iDb: i32;
+  pBt: Pointer;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := -1; Exit; end;
+  if zDbName <> nil then iDb := sqlite3FindDbName(db, zDbName) else iDb := 0;
+  if iDb < 0 then begin Result := -1; Exit; end;
+  pBt := db^.aDb[iDb].pBt;
+  if pBt = nil then begin Result := -1; Exit; end;
+  Result := sqlite3BtreeIsReadonly(PBtree(pBt));
+end;
+
+function sqlite3_sleep(ms: i32): i32; cdecl;
+var
+  pVfs: Psqlite3_vfs;
+  micros: i32;
+begin
+  pVfs := sqlite3_vfs_find(nil);
+  if pVfs = nil then begin Result := 0; Exit; end;
+  if ms < 0 then micros := 0 else micros := 1000 * ms;
+  Result := sqlite3OsSleep(pVfs, micros) div 1000;
+end;
+
+function sqlite3_release_memory(n: i32): i32; cdecl;
+begin
+  { SQLITE_ENABLE_MEMORY_MANAGEMENT is off in this build — match the C
+    no-op return path (malloc.c:30). }
+  if n = 0 then ;  { unused }
+  Result := 0;
+end;
+
+function sqlite3_memory_highwater(resetFlag: i32): i64; cdecl;
+var
+  res, mx: i64;
+begin
+  res := 0; mx := 0;
+  sqlite3_status64(SQLITE_STATUS_MEMORY_USED, @res, @mx, resetFlag);
+  Result := mx;
+end;
+
+function sqlite3_msize(p: Pointer): u64; cdecl;
+begin
+  if p = nil then Result := 0
+  else Result := u64(MemSize(p));
 end;
 
 initialization

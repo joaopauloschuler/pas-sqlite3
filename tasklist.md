@@ -627,7 +627,8 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 
 - [ ] **8.1.1** Connection-lifecycle gaps (main.c):
        [ ] `sqlite3_open16` — UTF-16 filename open.
-       [ ] `sqlite3_db_readonly` (main.c:5232) — per-db read-only flag.
+       [X] `sqlite3_db_readonly` (main.c:5001) — ported 2026-04-28
+            (passqlite3main.pas) via sqlite3FindDbName + sqlite3BtreeIsReadonly.
        [ ] `sqlite3_db_release_memory` (main.c) — release pager / pcache
             memory for a connection.
        [ ] `sqlite3_db_status` / `sqlite3_db_status64` (status.c) — per-
@@ -635,8 +636,8 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_db_cacheflush` (main.c:1986) — flush dirty pages.
        [ ] `sqlite3_db_config` — raw varargs entry point (currently only
             typed wrappers `_text`/`_lookaside`/`_int` exist).
-       [ ] `sqlite3_get_autocommit` (main.c:5249) — query auto-commit
-            state.
+       [X] `sqlite3_get_autocommit` (main.c:3936) — ported 2026-04-28
+            (passqlite3main.pas) — returns db^.autoCommit.
        [ ] `sqlite3_txn_state` (main.c) — `SQLITE_TXN_NONE / READ / WRITE`.
        [ ] `sqlite3_filename` / `sqlite3_free_filename` — VFS filename
             helpers.
@@ -681,25 +682,37 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        (main.c, status.c):
        [ ] `sqlite3_progress_handler` — set per-vdbe progress callback.
        [ ] `sqlite3_autovacuum_pages` — per-db autovacuum hook.
-       [ ] `sqlite3_interrupt` / `sqlite3_is_interrupted` —
-            cooperative interrupt.
-       [ ] `sqlite3_changes` / `sqlite3_changes64` — last-stmt change
-            count.
-       [ ] `sqlite3_total_changes` / `_total_changes64` — connection
-            change count.
-       [ ] `sqlite3_last_insert_rowid` / `_set_last_insert_rowid`.
-       [ ] `sqlite3_errcode` / `sqlite3_extended_errcode` /
-            `sqlite3_extended_result_codes`.
+       [X] `sqlite3_interrupt` / `sqlite3_is_interrupted` — ported
+            2026-04-28 (passqlite3main.pas) — sets/reads
+            db^.u1.isInterrupted.
+       [X] `sqlite3_changes` / `sqlite3_changes64` — ported 2026-04-28
+            (passqlite3main.pas) — returns db^.nChange.
+       [X] `sqlite3_total_changes` / `_total_changes64` — ported
+            2026-04-28 (passqlite3main.pas) — returns db^.nTotalChange.
+       [X] `sqlite3_last_insert_rowid` / `_set_last_insert_rowid` —
+            ported 2026-04-28 (passqlite3main.pas) — db^.lastRowid.
+       [X] `sqlite3_errcode` / `sqlite3_extended_errcode` /
+            `sqlite3_extended_result_codes` — ported 2026-04-28
+            (passqlite3main.pas).
        [ ] `sqlite3_set_errmsg` — overwrite db^.pErr.
        [ ] `sqlite3_error_offset` — byte offset of the error in zSql.
-       [ ] `sqlite3_system_errno` — last OS-level error.
-       [ ] `sqlite3_libversion_number` — int form of version.
-       [ ] `sqlite3_threadsafe` — compile-time threadsafe mode.
-       [ ] `sqlite3_sleep` — millisecond sleep via VFS xSleep.
+       [X] `sqlite3_system_errno` — ported 2026-04-28
+            (passqlite3main.pas) — db^.iSysErrno.
+       [X] `sqlite3_libversion_number` — ported 2026-04-28
+            (passqlite3main.pas).  Also exported sqlite3_libversion +
+            sqlite3_sourceid.
+       [X] `sqlite3_threadsafe` — ported 2026-04-28
+            (passqlite3main.pas) — returns 1 (bFullMutex=1).
+       [X] `sqlite3_sleep` — ported 2026-04-28 (passqlite3main.pas)
+            via sqlite3OsSleep.
        [ ] `sqlite3_setlk_timeout` — POSIX lock timeout.
-       [ ] `sqlite3_msize` — allocated size of a malloc block.
-       [ ] `sqlite3_release_memory` — release shared cache memory.
-       [ ] `sqlite3_memory_highwater` — peak alloc.
+       [X] `sqlite3_msize` — ported 2026-04-28 (passqlite3main.pas)
+            via FPC's MemSize.
+       [X] `sqlite3_release_memory` — ported 2026-04-28
+            (passqlite3main.pas) — no-op (SQLITE_ENABLE_MEMORY_MANAGEMENT
+            off in build), matching upstream OMIT path.
+       [X] `sqlite3_memory_highwater` — ported 2026-04-28
+            (passqlite3main.pas) via sqlite3_status64.
        [ ] `sqlite3_soft_heap_limit64` / `sqlite3_hard_heap_limit64`.
        [ ] `sqlite3_limit` — per-db SQLITE_LIMIT_* getter/setter.
        [ ] `sqlite3_uri_int64` — URI-parameter integer accessor.
