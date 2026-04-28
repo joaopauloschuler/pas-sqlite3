@@ -202,10 +202,18 @@ Important: At the end of this document, please find:
        `sqlite3VdbeFrameRestore`, `sqlite3VdbeSetColName`,
        `sqlite3VdbeCloseStatement`, `sqlite3VdbeList`,
        `sqlite3_blob_open`, `sqlite3VdbeLogAbort`,
-       `sqlite3ResetOneSchema`, `sqlite3VdbeMemTranslate`,
-       `sqlite3VdbeMemHandleBom`, `sqlite3ExpirePreparedStatements`,
+       `sqlite3ResetOneSchema`,
+       `sqlite3VdbeMemTranslate` (UTF-16 byte-swap arm now ported,
+        utf.c:266..288; UTF-8 ↔ UTF-16 arms still stubbed pending
+        READ_UTF8 / WRITE_UTF8 / WRITE_UTF16{LE,BE} macro ports —
+        sqlite3VdbeChangeEncoding callers in default UTF-8 builds
+        no-op out before reaching those arms),
+       `sqlite3ExpirePreparedStatements`,
        `sqlite3AnalysisLoad`, `sqlite3FkClearTriggerCache`,
        `sqlite3ResetAllSchemasOfConnection`, `sqlite3Stat4ProbeFree`.
+       [X] `sqlite3VdbeMemHandleBom` — ported in full (utf.c:437..465).
+            Strips a UTF-16 BOM if present and updates pMem^.enc to the
+            BOM-derived encoding (no byte-swap, just header adjustment).
        [X] `sqlite3VdbeFrameMemDel` — ported in full (vdbeaux.c:2247);
             adds the frame to v->pDelFrame for deferred free.
        [X] `sqlite3VdbeExplainParent` — ported in full (vdbeaux.c:493).

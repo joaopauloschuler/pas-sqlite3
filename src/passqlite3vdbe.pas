@@ -8407,24 +8407,90 @@ end;
   sqlite3VdbeMemTranslate — UTF encoding conversion stub (Phase 2 note)
   Full port deferred to Phase 6 (needs Mem encoding fully wired).
   ----------------------------------------------------------------------- }
+{ sqlite3VdbeMemTranslate — convert pMem->z between SQLITE_UTF8 / UTF16LE /
+  UTF16BE.  Partial port of utf.c:242..423: the UTF-16 ↔ UTF-16 byte-swap
+  arm (utf.c:266..288) is faithful; the UTF-8 ↔ UTF-16 arms still depend on
+  the READ_UTF8 / WRITE_UTF8 / WRITE_UTF16{LE,BE} macros and remain stubbed
+  out — they hand back SQLITE_ERROR until those macros land. }
 function sqlite3VdbeMemTranslate(pMem: PMem; desiredEnc: u8): i32;
+var
+  rc:    i32;
+  zIn:   Pu8;
+  zTerm: Pu8;
+  temp:  u8;
 begin
-  { Stub: if already the right encoding (or UTF8), no-op }
   if (pMem^.flags and MEM_Str) = 0 then begin
     Result := SQLITE_OK; Exit;
   end;
   if pMem^.enc = desiredEnc then begin
     Result := SQLITE_OK; Exit;
   end;
-  { For now, we only support UTF-8; other conversions fail gracefully }
+  Assert(pMem^.enc <> 0);
+  Assert(pMem^.n >= 0);
+  if (pMem^.enc <> SQLITE_UTF8) and (desiredEnc <> SQLITE_UTF8) then
+  begin
+    rc := sqlite3VdbeMemMakeWriteable(pMem);
+    if rc <> SQLITE_OK then begin
+      Assert(rc = SQLITE_NOMEM);
+      Result := SQLITE_NOMEM_BKPT; Exit;
+    end;
+    zIn   := Pu8(pMem^.z);
+    zTerm := zIn + (pMem^.n and (not 1));
+    while PtrUInt(zIn) < PtrUInt(zTerm) do
+    begin
+      temp     := zIn^;
+      zIn^     := (zIn + 1)^;
+      Inc(zIn);
+      zIn^     := temp;
+      Inc(zIn);
+    end;
+    pMem^.enc := desiredEnc;
+    Result := SQLITE_OK; Exit;
+  end;
+  { UTF-8 ↔ UTF-16 conversion arms still stubbed — see header comment. }
   Result := SQLITE_ERROR;
 end;
 
+{ sqlite3VdbeMemHandleBom — strip a UTF-16 byte-order mark, if present, from
+  the start of pMem->z and adjust pMem->enc to the BOM-derived encoding.
+  Faithful port of utf.c:437..465.  No byte-swapping; only sets pMem->enc.
+  Caller must ensure pMem->n >= 0. }
 function sqlite3VdbeMemHandleBom(pMem: PMem): i32;
+var
+  rc:  i32;
+  bom: u8;
+  b1:  u8;
+  b2:  u8;
+  pZ:  Pu8;
 begin
-  { BOM handling stub — UTF-16 BOM stripping deferred to Phase 6 }
-  Result := SQLITE_OK;
-  if pMem = nil then Exit;
+  rc  := SQLITE_OK;
+  bom := 0;
+  Assert(pMem^.n >= 0);
+  if pMem^.n > 1 then
+  begin
+    pZ := Pu8(pMem^.z);
+    b1 := pZ^;
+    b2 := (pZ + 1)^;
+    if (b1 = $FE) and (b2 = $FF) then
+      bom := SQLITE_UTF16BE;
+    if (b1 = $FF) and (b2 = $FE) then
+      bom := SQLITE_UTF16LE;
+  end;
+  if bom <> 0 then
+  begin
+    rc := sqlite3VdbeMemMakeWriteable(pMem);
+    if rc = SQLITE_OK then
+    begin
+      Dec(pMem^.n, 2);
+      pZ := Pu8(pMem^.z);
+      Move((pZ + 2)^, pZ^, pMem^.n);
+      (pZ + pMem^.n)^     := 0;
+      (pZ + pMem^.n + 1)^ := 0;
+      pMem^.flags := pMem^.flags or MEM_Term;
+      pMem^.enc   := bom;
+    end;
+  end;
+  Result := rc;
 end;
 
 { -----------------------------------------------------------------------
