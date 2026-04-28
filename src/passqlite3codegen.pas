@@ -22405,24 +22405,85 @@ begin
   if p^.nTab = 0 then p^.nTab := 1;
 end;
 
+{ build.c:2515 — return true if pTab is a virtual table and zName is a
+  shadow-table name belonging to that virtual table's module. }
 function sqlite3IsShadowTableOf(db: PTsqlite3; pTab: PTable2;
   zName: PAnsiChar): i32;
+type
+  TxShadowName = function(zTail: PAnsiChar): i32; cdecl;
+  PPCharA = ^PAnsiChar;
+var
+  nName : i32;
+  pMod  : PVtabModule;
+  pSqMod: PSqlite3Module;
+  azArg : PPCharA;
+  zMod  : PAnsiChar;
+  zTab  : PAnsiChar;
 begin
   Result := 0;
+  if pTab = nil then Exit;
+  if pTab^.eTabType <> TABTYP_VTAB then Exit;
+  zTab := pTab^.zName;
+  nName := sqlite3Strlen30(PChar(zTab));
+  if sqlite3_strnicmp(PChar(zName), PChar(zTab), nName) <> 0 then Exit;
+  if (zName + nName)^ <> '_' then Exit;
+  azArg := PPCharA(pTab^.u.vtab.azArg);
+  if azArg = nil then Exit;
+  zMod := azArg[0];
+  if zMod = nil then Exit;
+  pMod := PVtabModule(sqlite3HashFind(@db^.aModule, PChar(zMod)));
+  if pMod = nil then Exit;
+  pSqMod := pMod^.pModule;
+  if pSqMod = nil then Exit;
+  if pSqMod^.iVersion < 3 then Exit;
+  if pSqMod^.xShadowName = nil then Exit;
+  Result := TxShadowName(pSqMod^.xShadowName)(zName + nName + 1);
 end;
 
 procedure sqlite3MarkAllShadowTablesOf(db: PTsqlite3; pTab: PTable2);
 begin
 end;
 
+{ build.c:2574 — return true if zName names a shadow table of any virtual
+  table in db.  Splits zName at its last '_' and looks up the prefix. }
 function sqlite3ShadowTableName(db: PTsqlite3; zName: PAnsiChar): i32;
+var
+  zTail: PAnsiChar;
+  pTab : PTable2;
+  zCopy: PAnsiChar;
+  i    : i32;
 begin
   Result := 0;
+  if zName = nil then Exit;
+  zTail := nil;
+  i := 0;
+  while (zName + i)^ <> #0 do begin
+    if (zName + i)^ = '_' then zTail := zName + i;
+    Inc(i);
+  end;
+  if zTail = nil then Exit;
+  zCopy := sqlite3DbStrNDup(db, PChar(zName), u64(zTail - zName));
+  if zCopy = nil then Exit;
+  pTab := sqlite3FindTable(db, zCopy, nil);
+  sqlite3DbFree(db, zCopy);
+  if pTab = nil then Exit;
+  if pTab^.eTabType <> TABTYP_VTAB then Exit;
+  Result := sqlite3IsShadowTableOf(db, pTab, zName);
 end;
 
+{ build.c:3460 — true when shadow tables should be read-only.  Flag bit
+  is sqliteInt.h:1859 SQLITE_Defensive.  vtabInSync(db) macro inlined. }
 function sqlite3ReadOnlyShadowTables(db: PTsqlite3): i32;
+const
+  SQLITE_Defensive_LOCAL = u64($10000000);
 begin
-  Result := 0;
+  if ((db^.flags and SQLITE_Defensive_LOCAL) <> 0)
+    and (db^.pVtabCtx = nil)
+    and (db^.nVdbeExec = 0)
+    and ((db^.nVTrans <= 0) or (db^.aVTrans <> nil)) then
+    Result := 1
+  else
+    Result := 0;
 end;
 
 // ===========================================================================

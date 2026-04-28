@@ -102,13 +102,16 @@ Important: At the end of this document, please find:
             `SQLITE_OPEN_READWRITE | CREATE | EXCLUSIVE | DELETEONCLOSE
             | TEMP_DB` and call `sqlite3BtreeSetPageSize`.  Stub →
             `CREATE TEMP TABLE` silently broken.
-       [ ] `sqlite3IsShadowTableOf` — returns `0`; checks vtab module
-            `xShadowName` callback.
-       [ ] `sqlite3ShadowTableName` — returns `0`; splits name at last
-            `_` and looks up parent vtab via `sqlite3FindTable`.
-       [ ] `sqlite3ReadOnlyShadowTables` — returns `0`; returns 1 when
-            `SQLITE_Defensive` is set, `pVtabCtx=nil`, `nVdbeExec=0`,
-            and not `sqlite3VtabInSync`.
+       [X] `sqlite3IsShadowTableOf` / `sqlite3ShadowTableName` /
+            `sqlite3ReadOnlyShadowTables` — ported 2026-04-28
+            (codegen.pas:22408..).  IsShadowTableOf walks
+            `aModule^.pModule^.xShadowName` honouring `iVersion>=3`;
+            ShadowTableName splits at last `_` via DbStrNDup +
+            FindTable; ReadOnlyShadowTables tests
+            `SQLITE_Defensive | pVtabCtx=nil | nVdbeExec=0 | not vtabInSync`.
+            Verified TestVtab 216/0, TestExplainParity 1016/10,
+            TestSchemaBasic 44/0, TestDMLBasic 54/0, TestSelectBasic
+            49/0, TestParser 45/0 — no regressions.
 
        Foreign keys (fkey.c):
        [X] `sqlite3FkReferences` — ported 2026-04-28
