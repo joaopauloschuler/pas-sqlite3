@@ -126,8 +126,76 @@ Important: At the end of this document, please find:
        corpus — only exercised by FROM = single virtual table + LIMIT —
        but ports cleanly so the path is in place once the vtab + LIMIT
        gate lands.
-  [ ] **6.16** search for "stub" in the pascal source code and port
-       from C to pascal in full all functions or procedures marked as "stub".
+  [ ] **6.16** port btree.pas stubs in full from C to pascal:
+       `ptrmapPutOvflPtr`, `invalidateIncrblobCursors`.
+  [ ] **6.17** port pager.pas stubs in full from C to pascal:
+       `pager_reset`, `pagerReleaseMapPage`, `sqlite3_log`.
+  [ ] **6.18** port wal.pas stub `sqlite3_log_wal` in full from C to pascal.
+  [ ] **6.19** port util.pas stub `sqlite3_mprintf` in full from C to pascal.
+  [ ] **6.20** port parser.pas stubs in full from C to pascal:
+       `sqlite3ExprListAppendVector`, `sqlite3Reindex`,
+       `sqlite3TriggerUpdateStep`, `addModuleArgument`,
+       `sqlite3CteNew`, `sqlite3WithAdd`.
+  [ ] **6.21** port vdbe.pas stubs in full from C to pascal:
+       `sqlite3VdbeMultiLoad`, `sqlite3VdbeScanStatus`,
+       `sqlite3VdbeScanStatusRange`, `sqlite3VdbeSetP4KeyInfo`,
+       `sqlite3VdbeExplainParent`, `sqlite3ExplainBreakpoint`,
+       `sqlite3VdbeIncrWriteCounter`, `sqlite3VdbeDisplayComment`,
+       `sqlite3VdbeDisplayP4`, `sqlite3VdbeEnter`,
+       `sqlite3VdbeFrameMemDel`, `sqlite3VdbeNextOpcode`,
+       `sqlite3VdbeFrameRestore`, `sqlite3VdbeSetColName`,
+       `sqlite3VdbeCloseStatement`, `sqlite3VdbeList`,
+       `sqlite3VdbePrintSql`, `sqlite3VdbeError`,
+       `sqlite3_blob_open`, `sqlite3VdbeLogAbort`,
+       `sqlite3VdbeSetChanges`, `sqlite3SystemError`,
+       `sqlite3ResetOneSchema`, `sqlite3VdbeMemTranslate`,
+       `sqlite3VdbeMemHandleBom`, `sqlite3ExpirePreparedStatements`,
+       `sqlite3AnalysisLoad`, `sqlite3UnlinkAndDeleteTable`,
+       `sqlite3UnlinkAndDeleteIndex`, `sqlite3UnlinkAndDeleteTrigger`,
+       `sqlite3RootPageMoved`, `sqlite3FkClearTriggerCache`,
+       `sqlite3ResetAllSchemasOfConnection`, `sqlite3Stat4ProbeFree`.
+  [ ] **6.22** port codegen.pas rename / error-offset stubs in full from C
+       to pascal: `sqlite3RenameExprUnmap`, `sqlite3RenameTokenMap`,
+       `sqlite3VdbeAddDblquoteStr`, `sqlite3RecordErrorOffsetOfExpr`.
+  [ ] **6.23** port codegen.pas trigger stubs in full from C to pascal:
+       `sqlite3TriggerList`, `sqlite3BeginTrigger`, `sqlite3FinishTrigger`,
+       `sqlite3DropTrigger`, `sqlite3DropTriggerPtr`,
+       `sqlite3UnlinkAndDeleteTrigger`, `sqlite3TriggersExist`,
+       `sqlite3CodeRowTriggerDirect`, `sqlite3CodeRowTrigger`,
+       `sqlite3TriggerStepSrc`, `sqlite3TriggerColmask`.
+  [ ] **6.24** port codegen.pas DML / insert stubs in full from C to pascal:
+       `sqlite3UpsertAnalyzeTarget`, `sqlite3UpsertDoUpdate`,
+       `sqlite3MaterializeView`, `sqlite3LimitWhere`,
+       `sqlite3ColumnDefault`, `sqlite3TableAffinity`,
+       `sqlite3ComputeGeneratedColumns`, `sqlite3AutoincrementBegin`,
+       `sqlite3AutoincrementEnd`, `sqlite3MultiValuesEnd`,
+       `sqlite3MultiValues`, `autoIncBegin`,
+       `sqlite3ExprReferencesUpdatedColumn`,
+       `sqlite3GenerateConstraintChecks`, `sqlite3CompleteInsertion`.
+  [ ] **6.25** port codegen.pas schema / index stubs in full from C to pascal:
+       `sqlite3ReadSchema`, `sqlite3PrimaryKeyIndex`,
+       `sqlite3CheckObjectName`, `sqlite3FreeIndex`,
+       `sqlite3AddNotNull`, `sqlite3RunParser`.
+  [ ] **6.26** port codegen.pas where / select / window stubs in full from C
+       to pascal: `sqlite3MatchEName`, `sqlite3SelectPopWith`,
+       `whereRightSubexprIsColumn`, `sqlite3WhereMinMaxOptEarlyOut`,
+       `wherePathMatchSubqueryOB`, `sqlite3KeyInfoFromExprList`,
+       `sqlite3SelectWalkAssert2`, `sqlite3SelectAddTypeInfo`,
+       `sqlite3SelectCheckOnClauses`, `sqlite3ExprNNCollSeq`,
+       `sqlite3ExprCollSeq`, `sqlite3ProgressCheck`,
+       `sqlite3WhereExplainBloomFilter`, `sqlite3WhereAddExplainText`,
+       `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep`,
+       `sqlite3BtreeHoldsAllMutexes`.
+  [ ] **6.27** port codegen.pas alter / attach / analyze / vacuum / FK /
+       extension / scalar-function stubs in full from C to pascal:
+       `sqlite3AlterRenameTable`, `sqlite3AlterFinishAddColumn`,
+       `sqlite3AlterAddConstraint`, `sqlite3Detach`, `sqlite3Attach`,
+       `sqlite3Analyze`, `sqlite3DeleteIndexSamples`, `sqlite3Vacuum`,
+       `sqlite3AutoLoadExtensions`, `errlogFunc`, `unlikelyFunc`,
+       `sqlite3FkCheck`, `sqlite3FkActions`.
+  [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
+       port from C to pascal in full any function or procedure still
+       marked as "stub" that was missed by 6.16..6.27 (catch-all).
 ---
 
 ## Phase 7 — Parser (one gate open)
