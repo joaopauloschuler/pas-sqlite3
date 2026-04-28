@@ -74,10 +74,6 @@ Important: At the end of this document, please find:
                 reconcile that vs. codegen.pas's bigger
                 TUnpackedRecord before porting the corruption /
                 BIGNULL / DESC arms.
-        [X] `DELETE FROM t WHERE a=5` — Δ=−5 closed by porting
-          ONEPASS_MULTI promotion in sqlite3WhereBegin
-          (where.c:7218..7237).  Pas now picks one-pass inline delete
-          on full-scan DELETEs.
         [ ] `SELECT DISTINCT a FROM t` — Δ=13 (DISTINCT codegen,
           ephemeral-table dedup not yet wired in `sqlite3Select`).
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
@@ -85,17 +81,13 @@ Important: At the end of this document, please find:
           only 3 ops, no sorter open / KeyInfo / sort-finalise loop).
         [ ] `SELECT a FROM t GROUP BY a` — Δ=42 (aggregate-group
           path, not yet ported).
-        [ ] `SELECT COUNT(*)` — Δ=6; `SELECT SUM/MIN/MAX(a)` —
-          Δ=12..13 (aggregate-no-GROUP path: not ported).
-          Detection landed: `selectMarkAggregate` walks pEList for
-          TK_FUNCTION whose FuncDef has xFinalize<>nil and sets
-          SF_Aggregate so `sqlite3Select` short-circuits cleanly
-          (Init/Halt/Goto skeleton, zero rows).  Without it the
-          scalar Function arm crashed at runtime on aggregate
-          FuncDefs.  To close: port resolve.c:resolveExprStep
-          aggregate marking (so `selectMarkAggregate` becomes
-          redundant) and the no-GROUP-BY codegen arms (Count for
-          COUNT(*), AggStep+AggFinal for SUM/MIN/MAX).
+        [X] `SELECT COUNT(*)` — Δ=6 closed by porting the
+          isSimpleCount fast path (select.c:8758..8818) inline in
+          `sqlite3Select`: OpenRead+Count+Close+Copy+ResultRow.
+        [ ] `SELECT SUM/MIN/MAX(a)` — Δ=12..13 (aggregate-no-GROUP
+          path).  Needs AggStep + AggFinal codegen
+          (select.c:8819+).  The `selectMarkAggregate` walker keeps
+          the runtime stub safe until that lands.
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
           materialise / co-routine path not ported).
         [ ] `UPDATE t SET a=5 WHERE rowid=1` — Δ=14 (`sqlite3Update`
@@ -122,7 +114,7 @@ Important: At the end of this document, please find:
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
         the sqlite_schema scrub now uses one-pass inline delete.
-    (b) Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
+    (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
         because `destroyRootPage` calls `sqlite3NestedParse(UPDATE
         sqlite_schema ...)` and productive `sqlite3Update` is still
         skeleton-only.  This is the only remaining contributor.

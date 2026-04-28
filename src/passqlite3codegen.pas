@@ -17292,6 +17292,9 @@ var
   isExists:    Boolean;    { True when pDest^.eDest = SRT_Exists }
   iLimitReg:   i32;        { register holding LIMIT counter for SRT_Exists }
   iLimit0Goto: i32;        { addr of LIMIT-0 short-circuit Goto, or -1 }
+  iDb:         i32;
+  iCsr:        i32;
+  regAgg:      i32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -17399,6 +17402,57 @@ begin
     begin Result := SQLITE_OK; Exit; end;
   end;
   if p^.pWin       <> nil then begin Result := SQLITE_OK; Exit; end;
+
+  { Simple-count optimization — select.c:8758..8818 (isSimpleCount + the
+    inline OpenRead/Count/Close/Copy/ResultRow tail).  For
+    `SELECT count(*) FROM <ordinary-table>` with no WHERE/GROUP BY/HAVING/
+    ORDER BY/LIMIT/window/DISTINCT, emit the 5-op fast path directly so
+    bytecode matches C without porting AggInfo.  explainSimpleCount only
+    fires under EXPLAIN QUERY PLAN (explain==2) so we omit it here, same
+    as the C reference under standard EXPLAIN. }
+  if ((p^.selFlags and SF_Aggregate) <> 0)
+     and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
+     and (p^.pWhere = nil)
+     and (p^.pSrc <> nil) and (p^.pSrc^.nSrc = 1)
+     and (p^.pEList <> nil) and (p^.pEList^.nExpr = 1)
+     and (pDest^.eDest = SRT_Output)
+  then begin
+    pItem := SrcListItems(p^.pSrc);
+    pTab  := pItem^.pSTab;
+    if (pTab <> nil)
+       and (pTab^.eTabType <> TABTYP_VTAB)
+       and (pTab^.eTabType <> TABTYP_VIEW)
+       and ((pTab^.tabFlags and TF_Ephemeral) = 0)
+       and ((pItem^.fg.fgBits and $01) = 0)   { not a subquery }
+    then begin
+      pE := ExprListItems(p^.pEList)[0].pExpr;
+      if (pE <> nil) and (pE^.op = TK_FUNCTION) and (pE^.u.zToken <> nil)
+         and (sqlite3StrICmp(pE^.u.zToken, 'count') = 0)
+         and ((not ExprUseXList(pE)) or (pE^.x.pList = nil))
+         and ((pE^.flags and (EP_Distinct or EP_WinFunc)) = 0)
+      then begin
+        v := sqlite3GetVdbe(pParse);
+        if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
+        sqlite3GenerateColumnNames(pParse, p);
+        iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
+        sqlite3CodeVerifySchema(pParse, iDb);
+        iCsr := pParse^.nTab;
+        Inc(pParse^.nTab);
+        sqlite3VdbeAddOp4Int(v, OP_OpenRead, iCsr, i32(pTab^.tnum), iDb, 1);
+        Inc(pParse^.nMem);
+        regAgg := pParse^.nMem;
+        Inc(pParse^.nMem);
+        pDest^.iSdst := pParse^.nMem;
+        pDest^.nSdst := 1;
+        sqlite3VdbeAddOp2(v, OP_Count, iCsr, regAgg);
+        sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+        sqlite3VdbeAddOp2(v, OP_Copy, regAgg, pDest^.iSdst);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, 1);
+        Result := SQLITE_OK; Exit;
+      end;
+    end;
+  end;
+
   if (p^.selFlags and (SF_Distinct or SF_Aggregate or SF_Compound)) <> 0 then
   begin
     Result := SQLITE_OK; Exit;
