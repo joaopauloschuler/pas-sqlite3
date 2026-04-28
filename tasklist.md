@@ -37,12 +37,19 @@ Important: At the end of this document, please find:
        [ ] `sqlite3VdbeCloseStatement` (vdbe.pas) — currently returns
             `SQLITE_OK`; missing the `vdbeCloseStatement(p, eOp)` arm
             taken when `p^.db^.nStatement and p^.iStatement`.
-       [ ] `sqlite3VdbeAllocUnpackedRecord` — returns `nil`; must
-            allocate `UnpackedRecord` + `Mem` array sized from
-            `pKeyInfo^.nKeyField + 1`.
-       [ ] `sqlite3VdbeRecordUnpack` — returns `nil`; must decode the
-            binary record into `Mem` cells via `sqlite3VdbeSerialGet` /
-            `sqlite3VdbeSerialTypeLen`.
+       [X] `sqlite3VdbeAllocUnpackedRecord` — ported 2026-04-28
+            (vdbe.pas:1982).  Allocates UnpackedRecord + nKeyField+1
+            Mem array in one DbMallocRaw block; aMem placed at
+            ROUND8(SizeOf(TUnpackedRecord)) past the header.
+            KeyInfo fields read by manual offsets (nKeyField @6, db @16)
+            since vdbe.pas does not import codegen.
+       [X] `sqlite3VdbeRecordUnpack` — ported 2026-04-28
+            (vdbe.pas:2006).  Decodes binary record via
+            sqlite3GetVarint32 + sqlite3VdbeSerialGet +
+            sqlite3VdbeSerialTypeLen, sets default_rc=0, populates
+            Mem.enc / Mem.db, sets nField to actual decoded count.
+            Verified TestVdbeRecord 13/0, TestExplainParity 1016/10,
+            TestBtreeCompat 337/0 — no regressions.
        [ ] `sqlite3VdbeRecordCompareWithSkip` — returns `0`; full
             key-compare engine (~150 lines).  Returning 0 means
             "keys equal" always.

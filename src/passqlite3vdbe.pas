@@ -1972,15 +1972,80 @@ end;
   Record comparison — stubs for Phase 5.2 (full port in Phase 5.4).
   ============================================================================ }
 
+{ sqlite3VdbeAllocUnpackedRecord — vdbeaux.c:4222 port.
+  Allocates an UnpackedRecord plus an array of (nKeyField+1) Mem cells in a
+  single contiguous block, with the Mem array placed at the 8-byte-aligned
+  offset past the UnpackedRecord header.  KeyInfo fields are accessed by
+  the offsets documented in passqlite3codegen.pas TKeyInfo (nKeyField @6,
+  db @16); vdbe.pas does not import codegen so manual offsets are used,
+  matching the convention already employed at vdbe.pas:5728/7891. }
 function sqlite3VdbeAllocUnpackedRecord(pKeyInfo: PKeyInfo): Pointer;
+var
+  p:      PUnpackedRecord;
+  nByte:  u64;
+  nField: i32;
+  pDb:    Psqlite3;
+  hdr8:   PtrUInt;
 begin
-  Result := nil;
+  hdr8   := (PtrUInt(SizeOf(TUnpackedRecord)) + 7) and (not PtrUInt(7));
+  nField := i32(Pu16(Pu8(pKeyInfo) + 6)^) + 1;
+  pDb    := PPointer(Pu8(pKeyInfo) + 16)^;
+  nByte  := u64(hdr8) + u64(SizeOf(TMem)) * u64(nField);
+  p      := PUnpackedRecord(sqlite3DbMallocRaw(pDb, nByte));
+  if p = nil then begin Result := nil; Exit; end;
+  p^.pKeyInfo := pKeyInfo;
+  p^.aMem     := Pointer(PtrUInt(p) + hdr8);
+  p^.nField   := nField;
+  Result := p;
 end;
 
+{ sqlite3VdbeRecordUnpack — vdbeaux.c:4242 port.
+  Decodes the binary record at pKey/nKey into the Mem cells embedded in p,
+  using sqlite3VdbeSerialGet / sqlite3VdbeSerialTypeLen.  Returns p (the
+  C reference is void; the Pascal signature returns Pointer historically). }
 function sqlite3VdbeRecordUnpack(pKeyInfo: PKeyInfo; nKey: i32; pKey: Pointer;
                                  p: Pointer): Pointer;
+var
+  pUR:        PUnpackedRecord;
+  aKey:       Pu8;
+  d, idx:     u32;
+  szHdr:      u32;
+  serialType: u32;
+  consumed:   u8;
+  u:          u16;
+  pMm:        PMem;
+  enc:        u8;
+  pDb:        Psqlite3;
 begin
-  Result := nil;
+  pUR  := PUnpackedRecord(p);
+  aKey := Pu8(pKey);
+  pMm  := PMem(pUR^.aMem);
+  enc  := Pu8(pKeyInfo)[4];
+  pDb  := PPointer(Pu8(pKeyInfo) + 16)^;
+  pUR^.default_rc := 0;
+  consumed := sqlite3GetVarint32(aKey, szHdr);
+  idx := consumed;
+  d   := szHdr;
+  u   := 0;
+  while (idx < szHdr) and (d <= u32(nKey)) do begin
+    consumed := sqlite3GetVarint32(@aKey[idx], serialType);
+    Inc(idx, consumed);
+    pMm^.enc      := enc;
+    pMm^.db       := pDb;
+    pMm^.szMalloc := 0;
+    pMm^.z        := nil;
+    sqlite3VdbeSerialGet(@aKey[d], serialType, pMm);
+    Inc(d, sqlite3VdbeSerialTypeLen(serialType));
+    Inc(u);
+    if u >= u16(pUR^.nField) then break;
+    Inc(pMm);
+  end;
+  if (d > u32(nKey)) and (u <> 0) then begin
+    if u < u16(pUR^.nField) then
+      sqlite3VdbeMemSetNull(pMm);
+  end;
+  pUR^.nField := i32(u);
+  Result := p;
 end;
 
 function sqlite3VdbeRecordCompareWithSkip(nKey1: i32; pKey1: Pointer;
