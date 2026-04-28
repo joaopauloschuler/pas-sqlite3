@@ -18733,6 +18733,13 @@ var
   pAggFunc:    PAggInfoFunc;
   pMinMaxOrderBy: PExprList;
   minMaxFlag:  u8;
+  { DISTINCT codegen locals (select.c:8253..8260) — only the
+    WHERE_DISTINCT_UNORDERED ephemeral-table path is implemented;
+    UNIQUE/ORDERED optimisations stay deferred (matches a build that
+    never passes WHERE_WANT_DISTINCT to sqlite3WhereBegin). }
+  iTabTnct:    i32;
+  pDistKey:    PKeyInfo2;
+  rDistTmp:    i32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -19110,7 +19117,10 @@ begin
     end;
   end;
 
-  if (p^.selFlags and (SF_Distinct or SF_Aggregate or SF_Compound)) <> 0 then
+  { SF_Distinct alone (no aggregate, no compound) drops into the trivial
+    gate body below, taking the WHERE_DISTINCT_UNORDERED ephemeral-table
+    path emitted around the inner loop. }
+  if (p^.selFlags and (SF_Aggregate or SF_Compound)) <> 0 then
   begin
     Result := SQLITE_OK; Exit;
   end;
@@ -19166,6 +19176,20 @@ begin
 
   nResultCol := pEList^.nExpr;
   pDest^.nSdst := nResultCol;
+
+  { DISTINCT — open the dedup ephemeral cursor (select.c:8253..8260).
+    Only WHERE_DISTINCT_UNORDERED is supported here; UNIQUE/ORDERED
+    optimisations require passing WHERE_WANT_DISTINCT into
+    sqlite3WhereBegin and are deferred. }
+  iTabTnct := -1;
+  if (p^.selFlags and SF_Distinct) <> 0 then
+  begin
+    iTabTnct := pParse^.nTab; Inc(pParse^.nTab);
+    pDistKey := sqlite3KeyInfoFromExprList(pParse, pEList, 0, 0);
+    sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iTabTnct, 0, 0,
+                      PAnsiChar(pDistKey), P4_KEYINFO);
+    sqlite3VdbeChangeP5(v, BTREE_UNORDERED);
+  end;
 
   { SRT_Exists LIMIT setup — mirrors computeLimitRegisters (select.c:2508).
     sqlite3CodeSubselect always adds LIMIT 1 to the inner SELECT.  Emit
@@ -19282,6 +19306,22 @@ begin
         sqlite3ExprCode(pParse, pE, pDest^.iSdst + i);
     end;
 
+    { DISTINCT dedup — codeDistinct WHERE_DISTINCT_UNORDERED
+      (select.c:978..988).  Inserted before any disposal so the per-row
+      arms below see only first-occurrence rows. }
+    if iTabTnct >= 0 then
+    begin
+      rDistTmp := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp4Int(v, OP_Found, iTabTnct, pWInfo^.iContinue,
+                           pDest^.iSdst, nResultCol);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol,
+                        rDistTmp);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iTabTnct, rDistTmp,
+                           pDest^.iSdst, nResultCol);
+      sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+      sqlite3ReleaseTempReg(pParse, rDistTmp);
+    end;
+
     { Disposal — selectInnerLoop:1304..1370.  SRT_Output emits
       OP_ResultRow; SRT_Set hashes the row into the eph cursor referenced
       by iSDParm via OP_MakeRecord + OP_IdxInsert with the per-row
@@ -19323,6 +19363,19 @@ begin
 
   { Close the loop — emits OP_Next and resolves the iBreak label. }
   sqlite3WhereEnd(pWInfo);
+
+  { explainTempTable("DISTINCT") — select.c:8905..8907.  Emitted after
+    sqlite3WhereEnd so the EQP entry sits between OP_Next and OP_Halt,
+    matching the C oracle's bytecode order. }
+  if iTabTnct >= 0 then
+  begin
+    i := sqlite3VdbeCurrentAddr(v);
+    sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+                      sqlite3MPrintf(pParse^.db,
+                                     'USE TEMP B-TREE FOR %s',
+                                     ['DISTINCT']),
+                      P4_DYNAMIC);
+  end;
 
   if pParse^.nErr <> 0 then Result := SQLITE_ERROR
   else Result := SQLITE_OK;

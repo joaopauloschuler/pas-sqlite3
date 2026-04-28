@@ -97,8 +97,27 @@ Important: At the end of this document, please find:
             6.9-complete (a)).  Collation-aware string compare and the
             TUnpackedRecord layout reconcile remain open under
             6.9-complete (b)/(c) — neither blocks current-corpus tests.
-        [ ] `SELECT DISTINCT a FROM t` — Δ=13 (DISTINCT codegen,
-          ephemeral-table dedup not yet wired in `sqlite3Select`).
+        [X] `SELECT DISTINCT a FROM t` — closed 2026-04-28.  Lifted
+          the SF_Distinct bail in `sqlite3Select` (SF_Distinct now
+          drops into the trivial-gate body) and wired the
+          WHERE_DISTINCT_UNORDERED ephemeral-table path: emit
+          OP_OpenEphemeral with `sqlite3KeyInfoFromExprList(pEList)` +
+          P5=BTREE_UNORDERED before sqlite3WhereBegin; in the inner
+          loop, before disposal, emit OP_Found / OP_MakeRecord /
+          OP_IdxInsert(P5=OPFLAG_USESEEKRESULT) per
+          codeDistinct(WHERE_DISTINCT_UNORDERED)
+          (select.c:978..988); after sqlite3WhereEnd emit the
+          `USE TEMP B-TREE FOR DISTINCT` OP_Explain
+          (explainTempTable, select.c:8905..8907).
+          Verified: TestExplainParity 1015/11 → 1016/10
+          (`SELECT DISTINCT col` 16/16 ops byte-identical with C);
+          TestSelectBasic 49/0, TestParser 45/0, TestWhereBasic 52/0,
+          TestDMLBasic 54/0, TestVdbeAgg 11/0, TestSchemaBasic 44/0,
+          TestVdbeRecord 13/0 all green.  Out of scope:
+          WHERE_DISTINCT_UNIQUE / WHERE_DISTINCT_ORDERED optimisations
+          (require passing WHERE_WANT_DISTINCT into sqlite3WhereBegin
+          + the fixDistinctOpenEph patcher), DISTINCT-with-aggregate,
+          DISTINCT inside compound selects.
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
           Δ=16..18 (ORDER BY sorter / ephemeral-key path: Pas emits
           only 3 ops, no sorter open / KeyInfo / sort-finalise loop).
