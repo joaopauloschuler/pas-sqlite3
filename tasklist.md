@@ -161,14 +161,11 @@ Important: At the end of this document, please find:
         a discrete commit unit; the C reference is select.c
         analyzeAggregate / generateAggSelect, ≈ select.c:6120..6450
         + 8819..9050):
-        [ ] **(c1)** Port the `AggInfo` record + lifecycle
-              (sqliteInt.h:3530..3580 + select.c:6121
-              `sqlite3AggInfoPersistWalkerInit`).  Pas already
-              declares `PAggInfo` (codegen.pas:522) but the body is
-              empty; bring over `aCol[]`, `aFunc[]`, `iFirstReg`,
-              `nColumn`, `nFunc`, `nAccumulator`, `directMode`,
-              `useSortingIdx`, `sortingIdx`, plus the per-entry
-              `AggInfo_col` / `AggInfo_func` shapes.
+        [X] **(c1)** TAggInfoCol / TAggInfoFunc / TAggInfo records
+              already match the C layout (codegen.pas:433..473);
+              only the lifecycle helper
+              `sqlite3AggInfoPersistWalkerInit` (select.c:6121)
+              remains for (c2) wiring.
         [ ] **(c2)** Port `analyzeAggregate` (select.c:6280..6450)
               — the walker that scans pEList / pHaving / pOrderBy
               for TK_AGG_FUNCTION / TK_AGG_COLUMN and populates
@@ -417,6 +414,56 @@ Important: At the end of this document, please find:
       `"count(*)"`.  Verified via DiagColName 4/4 PASS; no bytecode-Δ
       regression in TestExplainParity (1012 pass / 14 diverge — same
       as before).
+
+  [ ] **6.10 step 12** Runtime divergences surfaced by the new
+      `src/tests/DiagMoreFunc.pas` probe (built-in functions / expression
+      edges).  Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagMoreFunc`.
+      Initial run 2026-04-28 reported 27 divergences; sub-tasks below.
+      [ ] **a) Default arm of `sqlite3ExprCodeTarget` emits OP_Null
+        for TK_BETWEEN / TK_IN / TK_AND / TK_OR.**  Affects scalar
+        evaluation of `5 BETWEEN 1 AND 10`, `3 IN (1,2,3)`, `NOT
+        BETWEEN`, `NOT IN`.  Pas yields SQLITE_NULL; C yields the
+        expected 0/1.  Port the missing arms in
+        `passqlite3codegen.pas:5435..5445` from C `expr.c`
+        (`sqlite3ExprCodeTarget` arms ~5340..5440 — TK_AND/TK_OR
+        short-circuit emit; TK_BETWEEN dispatches to
+        `exprCodeBetween` with destIfFalse->target=0; TK_IN goes
+        through `sqlite3ExprCodeIN`).
+      [ ] **b) `TRUE` / `FALSE` keyword literals return NULL.**
+        `SELECT TRUE` yields type 5 (NULL).  Likely the parser
+        produces TK_TRUEFALSE but the resolver / codeExpr path
+        loses it under no-FROM / no-resolve branch.  Verify via
+        EXPLAIN whether the AST node is TK_TRUEFALSE or TK_ID.
+      [ ] **c) Math functions not registered.**  `sqrt`, `exp`,
+        `ln`, `pow`, `sin`, `cos`, `floor`, `ceil`, `pi` (and all
+        of `func.c:mathRoll[]`) prepare-fail on Pas with
+        `SQLITE_ERROR` ("no such function").  Upstream registers
+        them in `sqlite3RegisterMathFunctions` (func.c:2700..2800)
+        gated on SQLITE_ENABLE_MATH_FUNCTIONS — flag is on per
+        `passqlite3.inc`.  Port the table + helper functions and
+        wire from `sqlite3RegisterBuiltinFunctions`.
+      [ ] **d) printf/format width / flag specifiers ignored.**
+        `%05d` (zero-pad width) drops the pad → "7" not "00007";
+        `%-5d` left-align ignored; `%+d` for positives drops the
+        '+'; `%c` emits the char *value* but with int=6 (mis-parsed
+        as %c06); `%e` falls back to `%g`-style render.  Tracked
+        as a follow-on to 6.10 step 10(d) (previously fixed `%.2f`
+        — only precision was wired); now extend `SkipFmtMeta` /
+        `FmtFloat` / `FmtInt` to honour width, '0' flag, '-' flag,
+        '+' flag, and the `%e/%E/%c` specifier dispatch.  Mirrors
+        the sqlite3_str_vappendf flag set in printf.c:235..530.
+      [ ] **e) printf %q drops outer quotes; %Q not implemented.**
+        `printf('%q', 'it''s')` returns `'it''s'` on Pas vs
+        `it''s` on C — the C `%q` doubles single quotes but does
+        NOT add outer single quotes (printf.c:760..771); Pas wraps
+        unconditionally.  `printf('%Q', 'hi')` returns `%Q`
+        verbatim — entirely unimplemented; C returns `'hi'`
+        (printf.c:773..786).  `printf('%Q', NULL)` should emit
+        `NULL`.  Port both arms from printf.c.
+      [ ] **f) Aggregate-no-FROM no-row.**  `SELECT count(*)` /
+        `SELECT sum(5)` step to DONE without producing a row.
+        Same root cause as 6.10 step 7(c) — agg-no-GROUP gate at
+        codegen.pas:18045.  Closed when (c1)..(c7) lands.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
