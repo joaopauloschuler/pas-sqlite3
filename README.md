@@ -1,6 +1,6 @@
 # pas-sqlite3
 
-A faithful line-by-line port of **SQLite 3.53.0** (D. Richard Hipp et al.)
+A faithful port of **SQLite 3.53.0** (D. Richard Hipp et al.)
 from C to **Free Pascal (FPC 3.2.2+)** targeting x86-64 Linux.
 
 > **Status: Phases 0–5 complete; Phase 6 in flight; Phases 7–8
