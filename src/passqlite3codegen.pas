@@ -17938,10 +17938,31 @@ begin
 end;
 
 
-{ sqlite3ProgressCheck — check sqlite3_progress_handler (Phase 8 stub) }
+{ sqlite3ProgressCheck — port of util.c:211.  Honour sqlite3_interrupt() and
+  invoke the progress callback every nProgressOps statement-compile steps. }
 procedure sqlite3ProgressCheck(pParse: PParse);
+var
+  db: PTsqlite3;
 begin
-  { Phase 8 stub }
+  db := pParse^.db;
+  if db^.u1.isInterrupted <> 0 then begin
+    Inc(pParse^.nErr);
+    pParse^.rc := SQLITE_INTERRUPT;
+  end;
+  if Assigned(db^.xProgress) then begin
+    if pParse^.rc = SQLITE_INTERRUPT then begin
+      pParse^.nProgressSteps := 0;
+    end else begin
+      Inc(pParse^.nProgressSteps);
+      if pParse^.nProgressSteps >= db^.nProgressOps then begin
+        if db^.xProgress(db^.pProgressArg) <> 0 then begin
+          Inc(pParse^.nErr);
+          pParse^.rc := SQLITE_INTERRUPT;
+        end;
+        pParse^.nProgressSteps := 0;
+      end;
+    end;
+  end;
 end;
 
 // ===========================================================================

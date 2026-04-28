@@ -53,7 +53,7 @@ Important: At the end of this document, please find:
       blocks DROP TABLE Δ=21 destroyRootPage path and UPDATE rowid=1
       Δ=14).
 
-- [ ] **6.10** `TestExplainParity.pas` — full SQL corpus EXPLAIN diff.
+- [ ] **6.10** `TestExplainParity.pas`
     - [ ] **6.10 step 4** Port in full `sqlite3CodeDropTable` pre-Destroy
       schema scan (build.c:3315..3445): the loop that walks
       sqlite_schema, deletes rows whose `tbl_name = 'X'`, and
@@ -204,7 +204,7 @@ Important: At the end of this document, please find:
        `wherePathMatchSubqueryOB`, `sqlite3KeyInfoFromExprList`,
        `sqlite3SelectWalkAssert2`, `sqlite3SelectAddTypeInfo`,
        `sqlite3SelectCheckOnClauses`, `sqlite3ExprNNCollSeq`,
-       `sqlite3ExprCollSeq`, `sqlite3ProgressCheck`,
+       `sqlite3ExprCollSeq`,
        `sqlite3WhereExplainBloomFilter`, `sqlite3WhereAddExplainText`,
        `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep`,
        `sqlite3BtreeHoldsAllMutexes`.
