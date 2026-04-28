@@ -161,6 +161,59 @@ Important: At the end of this document, please find:
         Likely shares root cause with the `SELECT SUM/MIN/MAX`
         Δ=12..13 entry under step 6.
 
+  [ ] **6.10 step 9** Runtime divergences surfaced by
+      `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
+      bin/DiagFeatureProbe`).  Most fold into existing tasks; the genuinely
+      new silent-result bugs are listed first.
+      [ ] **a) COLLATE NOCASE operator silently case-sensitive.**
+        `SELECT 'ABC' COLLATE NOCASE = 'abc'` returns 0 on Pas, 1 on C
+        (verified 2026-04-28).  Same answer for the postfix form
+        `'ABC' = 'abc' COLLATE NOCASE`.  Plain equality `'abc' = 'abc'`
+        works.  TK_COLLATE arm of the eq codegen does not propagate the
+        collation onto the comparison — likely
+        `sqlite3BinaryCompareCollSeq` / `codeCompare` not reading the
+        EP_Collate node.  Sister bug to 6.26's collation work.
+      [ ] **b) Scalar subquery returns 0 instead of value.**
+        With t populated `INSERT INTO t VALUES(42)`, the expression
+        `SELECT (SELECT a FROM t)` returns 0 on Pas, 42 on C.  Wraps a
+        codegen gap in `sqlite3CodeSubselect` for the SRT_Mem (scalar)
+        path or in the OP_Once / OP_Integer pre-store; needs trace.
+      [ ] **c) View materialisation in SELECT.**
+        `SELECT count(*) FROM v` returns no row on Pas.  The
+        `sqlite3MaterializeView` body just landed (6.24) but is wired
+        only for INSTEAD OF DELETE/UPDATE; non-trigger SELECT … FROM v
+        still needs view-expansion in `sqlite3SelectExpand`.
+      [ ] **d) Multi-table JOIN aggregate returns no row.**
+        `SELECT count(*) FROM t INNER JOIN u ON t.a=u.b` and the LEFT
+        JOIN variant both step to DONE without a row.  Same root cause
+        as 6.10 step 7(c) (aggregate-no-GROUP) — gated on the
+        full agg codegen port.
+      [ ] **e) UNION / compound SELECT.**
+        `SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)`
+        returns no row.  Compound-select codegen / sub-FROM
+        materialisation gap (overlaps step 6 sub-FROM Δ=7 entry).
+      [ ] **f) WITH / CTE not productive.**
+        Both simple (`WITH c(x) AS (SELECT 7) SELECT x FROM c`) and
+        recursive forms return no row.  Tracked under 6.20 (CteNew /
+        WithAdd stubs blocked on full TCte record).
+      [ ] **g) ALTER TABLE no-op.**
+        `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
+        do not modify the schema.  Tracked under 6.27.
+      [ ] **h) CHECK constraint not enforced.**
+        `CREATE TABLE t(a CHECK(a > 0)); INSERT INTO t VALUES(-1)` is
+        accepted by Pas; C rejects with SQLITE_CONSTRAINT (rc=19).
+        Wraps 6.9-bis 11g.2.b (`sqlite3GenerateConstraintChecks`).
+      [ ] **i) GENERATED column virtual.**
+        Inserting into `(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2)
+        VIRTUAL)` and selecting `b` returns 0 instead of `a*2`.
+        Tracked under 6.24 (`sqlite3ComputeGeneratedColumns`).
+      [ ] **j) AFTER INSERT trigger does not fire.**
+        Side-table populated by the trigger remains empty.  Tracked
+        under 6.23 (trigger codegen stubs).
+      [ ] **k) `pragma_table_info(...)` table-valued function.**
+        `SELECT count(*) FROM pragma_table_info('t')` returns no row.
+        Tracked under 6.12 (sqlite3Pragma).
+
   [X] **6.10 step 8** Auto-named result columns carry a trailing space
       on Pas — fixed.  Root cause was `sqlite3DbSpanDup`
       (passqlite3util.pas) skipping the leading/trailing whitespace
