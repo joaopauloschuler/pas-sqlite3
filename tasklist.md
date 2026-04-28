@@ -328,29 +328,34 @@ Important: At the end of this document, please find:
         unixepoch() resolved at prepare time only via the global
         builtins hash being unpopulated → SQL parser registered them
         as user functions returning NULL.  Wired through.
-      [ ] **f) `time('13:45:00')` / `datetime('2024-01-15 13:45:00')`
-        return NULL** — `parseDateTime` (codegen.pas:25867) is too
-        strict.  It requires `Length(s) >= 10` (rejecting time-only
-        like "13:45:00") and reads the time component starting at
-        offset 11 with `getN(p,2)` which returns -1 on the space
-        separator at offset 11 of "2024-01-15 13:45:00".  Need to
-        port the proper parseHhMmSs / parseDateOrTime arm from
-        date.c.
-      [ ] **g) `julianday('2000-01-01 12:00:00')` returns NULL** —
-        same root cause as (f) — parseDateTime fails on the space-
-        separated form.  Will close once (f) lands.
-      [ ] **h) `strftime('%w', ...)` returns "%w"** — `%w` (weekday)
-        and likely other format chars (`%j`, `%U`, `%W`) are not
-        handled in the strftime arm at codegen.pas:26085.  Port the
-        full strftimeFunc switch from date.c.
+      [X] **f) `time('13:45:00')` / `datetime('2024-01-15 13:45:00')`
+        return NULL** — fixed 2026-04-28.  Refactored `parseDateTime`
+        to mirror date.c:parseYyyyMmDd + parseHhMmSs (date.c:207..366):
+        accepts time-only `HH:MM[:SS[.FFF]]` (defaults date to
+        2000-01-01 per date.c:269), and skips space/'T' between date
+        and time.  Also fixed time/datetime/date output formatting to
+        emit integer `%02d:%02d:%02d` instead of `%02d:%02d:%05.3f`
+        (date.c:1283..1287 — useSubsec is off by default).
+      [X] **g) `julianday('2000-01-01 12:00:00')` returns NULL** —
+        closed by (f).  DiagDate "julianday epoch" → PASS.
+      [X] **h) `strftime('%w', ...)` returns "%w"** — fixed
+        2026-04-28.  Added %w (weekday 0=Sun..6=Sat) and %u
+        (1=Mon..7=Sun) per date.c:1379.  Also added %e, %F, %k, %I,
+        %l, %p, %P, %R, %T arms for strftime parity (date.c:1438..1527);
+        fixed %S to emit integer seconds and %f to use %06.3f.
+        Remaining unported: %g/%G (ISO week year), %j is already
+        partial (uses Trunc(jd-jan1)+1 vs C's daysAfterJan01).
       [ ] **i) Date modifiers (`+5 days`, `-1 month`, `start of
         month`) ignored** — `dateFunc` / `datetimeFunc` only handle
         argc=1 path; the modifier-list arm (parseModifier in
         date.c:584) is not ported.  Until then the 2+arg dispatchers
         register at MakeFD with nArg=1 only, so multi-arg calls fall
         through to NULL.
-      [ ] **j) `sign(x)` returns NULL** — function not registered
-        at all.  Port C's signFunc (func.c:404) — 4 lines.
+      [X] **j) `sign(x)` returns NULL** — fixed 2026-04-28.  Ported
+        signFunc (func.c:2621) and registered as aBuiltinFuncs[48]
+        per func.c:3427 `FUNCTION(sign,1,0,0,signFunc)`.  Returns
+        -1/0/+1 for negative/zero/positive numeric inputs, NULL
+        otherwise.  DiagDate sign pos/neg/zero → PASS.
       [ ] **k) `'abc' GLOB '[ab]bc'` mismatches** — char-class arm
         of patternCompare missing or buggy.  Port from func.c.
 

@@ -24364,6 +24364,26 @@ begin
   end;
 end;
 
+{ signFunc — port of func.c:2621 signFunc.
+  Returns -1, 0, +1 for negative, zero, positive numeric arguments;
+  returns NULL for non-numeric (TEXT/BLOB without numeric content) or NULL. }
+procedure signFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pVal: PMem;
+  t: i32;
+  r: Double;
+  res: i32;
+begin
+  pVal := argv^;
+  t := sqlite3_value_type(Psqlite3_value(pVal));
+  if (t <> SQLITE_INTEGER) and (t <> SQLITE_REAL) then Exit;
+  r := sqlite3_value_double(Psqlite3_value(pVal));
+  if r < 0.0 then res := -1
+  else if r > 0.0 then res := 1
+  else res := 0;
+  sqlite3_result_int(pCtx, res);
+end;
+
 procedure typeofFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   pVal: PMem;
@@ -25553,7 +25573,7 @@ const
   AGG_ENC  = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
 
 var
-  aBuiltinFuncs: array[0..47] of TFuncDef;
+  aBuiltinFuncs: array[0..48] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -25662,6 +25682,9 @@ begin
   MakeFD(aBuiltinFuncs[47], -1,
     FUNC_ENC or SQLITE_FUNC_NEEDCOLL, @minmaxScalarFunc, nil, 'max');
   aBuiltinFuncs[47].pUserData := Pointer(PtrInt(1));
+  { sign(X) — func.c:3427: FUNCTION(sign, 1, 0, 0, signFunc).
+    Closes 6.10 step 11(j). }
+  MakeFD(aBuiltinFuncs[48], 1, FUNC_ENC, @signFunc, nil, 'sign');
 end;
 
 var
@@ -25975,13 +25998,17 @@ begin
   s  := ((F * 24.0 - h) * 60.0 - mn) * 60.0;
 end;
 
-{ parseDateTime — parse a date/time string in ISO 8601 format. }
+{ parseDateTime — parse a date/time string in ISO 8601 format.
+  Faithful port of date.c:parseYyyyMmDd + parseHhMmSs + parseDateOrTime
+  (date.c:207..442).  Accepts:
+    YYYY-MM-DD [ T|space HH:MM[:SS[.FFF]] ]
+    HH:MM[:SS[.FFF]]                        (time-only — date defaults to 2000-01-01)
+}
 function parseDateTime(zStr: PAnsiChar; var dt: TDateTime2): Boolean;
 var
   s: AnsiString;
-  p, sv, fp: i32;
   y, m, d, h, mn: i32;
-  sec, frac: Double;
+  sec: Double;
   function isdig(c: AnsiChar): Boolean; inline;
   begin Result := (c >= '0') and (c <= '9'); end;
   function getN(start, count: i32): i32;
@@ -25993,35 +26020,53 @@ var
       Result := Result * 10 + Ord(s[i]) - Ord('0');
     end;
   end;
+  { Parse HH:MM[:SS[.FFF]] starting at position pos. Returns True on success. }
+  function parseHhMmSs(pos: i32; out hh, mm: i32; out ss: Double): Boolean;
+  var sv, fp: i32; frac: Double;
+  begin
+    Result := False;
+    hh := getN(pos, 2); if hh < 0 then Exit;
+    if (pos+2 > Length(s)) or (s[pos+2] <> ':') then Exit;
+    mm := getN(pos+3, 2); if mm < 0 then Exit;
+    ss := 0.0;
+    if (pos+5 <= Length(s)) and (s[pos+5] = ':') then begin
+      sv := getN(pos+6, 2); if sv < 0 then Exit;
+      ss := sv;
+      if (pos+8 <= Length(s)) and (s[pos+8] = '.') and
+         (pos+9 <= Length(s)) and isdig(s[pos+9]) then begin
+        frac := 0.1; fp := pos+9;
+        while (fp <= Length(s)) and isdig(s[fp]) do begin
+          ss := ss + (Ord(s[fp]) - Ord('0')) * frac;
+          frac := frac * 0.1;
+          Inc(fp);
+        end;
+      end;
+    end;
+    Result := True;
+  end;
+var tpos: i32;
 begin
   Result := False;
   if zStr = nil then Exit;
   s := AnsiString(zStr);
-  if Length(s) < 10 then Exit;
-  y := getN(1,4); if y < 0 then Exit;
-  if s[5] <> '-' then Exit;
-  m := getN(6,2); if m < 1 then Exit;
-  if s[8] <> '-' then Exit;
-  d := getN(9,2); if d < 1 then Exit;
   h := 0; mn := 0; sec := 0.0;
-  p := 11;
-  if Length(s) >= 13 then begin
-    h := getN(p,2); if h < 0 then Exit;
-    if (Length(s) > p+1) and (s[p+2] = ':') then begin
-      mn := getN(p+3,2); if mn < 0 then Exit;
-      if (Length(s) > p+4) and (s[p+5] = ':') then begin
-        sv := getN(p+6,2);
-        if sv < 0 then Exit;
-        sec := sv;
-        if (Length(s) > p+7) and (s[p+8] = '.') then begin
-          frac := 0.1;
-          fp := p+9;
-          while (fp <= Length(s)) and isdig(s[fp]) do begin
-            sec := sec + (Ord(s[fp]) - Ord('0')) * frac;
-            frac := frac * 0.1;
-            Inc(fp);
-          end;
-        end;
+  if (Length(s) >= 5) and (s[3] = ':') then begin
+    { Time-only form HH:MM... — date defaults to 2000-01-01 (date.c:269). }
+    if not parseHhMmSs(1, h, mn, sec) then Exit;
+    y := 2000; m := 1; d := 1;
+  end else begin
+    if Length(s) < 10 then Exit;
+    y := getN(1,4); if y < 0 then Exit;
+    if s[5] <> '-' then Exit;
+    m := getN(6,2); if m < 1 then Exit;
+    if s[8] <> '-' then Exit;
+    d := getN(9,2); if d < 1 then Exit;
+    { Optional time component: skip space or 'T', then parse HH:MM[:SS[.FFF]] }
+    if Length(s) > 10 then begin
+      tpos := 11;
+      while (tpos <= Length(s)) and ((s[tpos] = ' ') or (s[tpos] = 'T')) do Inc(tpos);
+      if tpos <= Length(s) then begin
+        if not parseHhMmSs(tpos, h, mn, sec) then Exit;
       end;
     end;
   end;
@@ -26083,7 +26128,7 @@ begin
      (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
-    snpFmt(SizeOf(buf), buf, '%02d:%02d:%05.3f', [h2, mn2, s2]);
+    snpFmt(SizeOf(buf), buf, '%02d:%02d:%02d', [h2, mn2, Trunc(s2)]);
     sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
     Exit;
   end;
@@ -26091,7 +26136,7 @@ begin
   if not parseDateTime(z, dt) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
-  snpFmt(SizeOf(buf), buf, '%02d:%02d:%05.3f', [dt.hr, dt.mi, dt.s]);
+  snpFmt(SizeOf(buf), buf, '%02d:%02d:%02d', [dt.hr, dt.mi, Trunc(dt.s)]);
   sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
 end;
 
@@ -26108,8 +26153,8 @@ begin
      (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then begin
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
-    snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%05.3f',
-      [y2, m2, d2, h2, mn2, s2]);
+    snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%02d',
+      [y2, m2, d2, h2, mn2, Trunc(s2)]);
     sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
     Exit;
   end;
@@ -26117,8 +26162,8 @@ begin
   if not parseDateTime(z, dt) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
-  snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%05.3f',
-    [dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s]);
+  snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%02d',
+    [dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, Trunc(dt.s)]);
   sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
 end;
 
@@ -26198,8 +26243,8 @@ begin
         'd': begin snpFmt(4, op, '%02d', [d2]); while op^ <> #0 do Inc(op); end;
         'H': begin snpFmt(4, op, '%02d', [h2]); while op^ <> #0 do Inc(op); end;
         'M': begin snpFmt(4, op, '%02d', [mn2]); while op^ <> #0 do Inc(op); end;
-        'S': begin snpFmt(8, op, '%05.3f', [s2]); while op^ <> #0 do Inc(op); end;
-        'f': begin snpFmt(8, op, '%05.3f', [s2]); while op^ <> #0 do Inc(op); end;
+        'S': begin snpFmt(4, op, '%02d', [Trunc(s2)]); while op^ <> #0 do Inc(op); end;
+        'f': begin snpFmt(8, op, '%06.3f', [s2]); while op^ <> #0 do Inc(op); end;
         'j': begin
                { Day of year 001-366 }
                jan1 := toJulianDay(y2,1,1,0,0,0.0);
@@ -26207,11 +26252,47 @@ begin
                while op^ <> #0 do Inc(op);
              end;
         'J': begin snpFmt(24, op, '%.16g', [jd]); while op^ <> #0 do Inc(op); end;
+        'w': begin
+               { Day of week 0..6 (0=Sunday).  date.c:1379:
+                   sqlite3_snprintf(3,zBuf,"%d", (((p->iJD+129600000)/86400000)%7) )
+                 dt.jd here is JD at midnight (= JD_noon - 0.5), so
+                 Trunc(jd + 1.5) = JD_noon + 1, and (... mod 7) = weekday. }
+               snpFmt(4, op, '%d', [Trunc(jd + 1.5) mod 7]);
+               while op^ <> #0 do Inc(op);
+             end;
+        'u': begin
+               { Day of week 1..7 (1=Monday).  date.c arm. }
+               snpFmt(4, op, '%d', [((Trunc(jd + 0.5) + 6) mod 7) + 1]);
+               while op^ <> #0 do Inc(op);
+             end;
         's': begin
                epoch := toJulianDay(1970,1,1,0,0,0.0);
                snpFmt(24, op, '%lld', [Trunc((jd-epoch)*86400.0)]);
                while op^ <> #0 do Inc(op);
              end;
+        'e': begin snpFmt(4, op, '%2d', [d2]); while op^ <> #0 do Inc(op); end;
+        'F': begin snpFmt(12, op, '%04d-%02d-%02d', [y2, m2, d2]); while op^ <> #0 do Inc(op); end;
+        'k': begin snpFmt(4, op, '%2d', [h2]); while op^ <> #0 do Inc(op); end;
+        'I': begin
+               snpFmt(4, op, '%02d',
+                 [((h2 + 11) mod 12) + 1]);
+               while op^ <> #0 do Inc(op);
+             end;
+        'l': begin
+               snpFmt(4, op, '%2d',
+                 [((h2 + 11) mod 12) + 1]);
+               while op^ <> #0 do Inc(op);
+             end;
+        'p': begin
+               if h2 >= 12 then begin op^ := 'P'; Inc(op); op^ := 'M'; Inc(op); end
+               else begin op^ := 'A'; Inc(op); op^ := 'M'; Inc(op); end;
+             end;
+        'P': begin
+               if h2 >= 12 then begin op^ := 'p'; Inc(op); op^ := 'm'; Inc(op); end
+               else begin op^ := 'a'; Inc(op); op^ := 'm'; Inc(op); end;
+             end;
+        'R': begin snpFmt(8, op, '%02d:%02d', [h2, mn2]); while op^ <> #0 do Inc(op); end;
+        'T': begin snpFmt(12, op, '%02d:%02d:%02d', [h2, mn2, Trunc(s2)]); while op^ <> #0 do Inc(op); end;
         '%': begin op^ := '%'; Inc(op); end;
         else begin op^ := '%'; Inc(op); op^ := c; Inc(op); end;
       end;
