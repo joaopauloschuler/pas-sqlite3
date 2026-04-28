@@ -436,11 +436,11 @@ Important: At the end of this document, please find:
        `sqlite3VdbeEnter`,
        `sqlite3VdbeCloseStatement`, `sqlite3VdbeList`,
        `sqlite3_blob_open`,
-       `sqlite3VdbeMemTranslate` (UTF-16 byte-swap arm now ported,
-        utf.c:266..288; UTF-8 ↔ UTF-16 arms still stubbed pending
-        READ_UTF8 / WRITE_UTF8 / WRITE_UTF16{LE,BE} macro ports —
-        sqlite3VdbeChangeEncoding callers in default UTF-8 builds
-        no-op out before reaching those arms),
+       `sqlite3VdbeMemTranslate` (now fully ported — utf.c:242..423;
+        UTF-16 ↔ UTF-16 byte-swap, UTF-8 → UTF-16{LE,BE}, and UTF-16{LE,BE}
+        → UTF-8 arms with inline READ_UTF8 / WRITE_UTF8 /
+        WRITE_UTF16{LE,BE}; SQLITE_REPLACE_INVALID_UTF arm omitted —
+        off in default upstream build),
        `sqlite3AnalysisLoad`, `sqlite3FkClearTriggerCache`,
        `sqlite3Stat4ProbeFree`.
        [X] `sqlite3ResetOneSchema` + `sqlite3ResetAllSchemasOfConnection`

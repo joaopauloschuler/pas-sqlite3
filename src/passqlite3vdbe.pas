@@ -8685,16 +8685,28 @@ end;
   Full port deferred to Phase 6 (needs Mem encoding fully wired).
   ----------------------------------------------------------------------- }
 { sqlite3VdbeMemTranslate — convert pMem->z between SQLITE_UTF8 / UTF16LE /
-  UTF16BE.  Partial port of utf.c:242..423: the UTF-16 ↔ UTF-16 byte-swap
-  arm (utf.c:266..288) is faithful; the UTF-8 ↔ UTF-16 arms still depend on
-  the READ_UTF8 / WRITE_UTF8 / WRITE_UTF16{LE,BE} macros and remain stubbed
-  out — they hand back SQLITE_ERROR until those macros land. }
+  UTF16BE.  Faithful port of utf.c:242..423.  The UTF-16 ↔ UTF-16 byte-swap
+  arm (utf.c:266..288) is in-place; UTF-8 ↔ UTF-16 arms allocate a new
+  output buffer and READ_UTF8 / WRITE_UTF8 / WRITE_UTF16{LE,BE} are expanded
+  inline.  SQLITE_REPLACE_INVALID_UTF arm is omitted (off in default build). }
 function sqlite3VdbeMemTranslate(pMem: PMem; desiredEnc: u8): i32;
+const
+  utfTrans1: array[0..63] of u8 = (
+    $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0a,$0b,$0c,$0d,$0e,$0f,
+    $10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$1a,$1b,$1c,$1d,$1e,$1f,
+    $00,$01,$02,$03,$04,$05,$06,$07,$08,$09,$0a,$0b,$0c,$0d,$0e,$0f,
+    $00,$01,$02,$03,$04,$05,$06,$07,$00,$01,$02,$03,$00,$01,$00,$00
+  );
 var
   rc:    i32;
   zIn:   Pu8;
   zTerm: Pu8;
+  zOut:  Pu8;
+  z:     Pu8;
   temp:  u8;
+  c, c2: u32;
+  len:   i64;
+  newFlags: u32;
 begin
   if (pMem^.flags and MEM_Str) = 0 then begin
     Result := SQLITE_OK; Exit;
@@ -8724,8 +8736,143 @@ begin
     pMem^.enc := desiredEnc;
     Result := SQLITE_OK; Exit;
   end;
-  { UTF-8 ↔ UTF-16 conversion arms still stubbed — see header comment. }
-  Result := SQLITE_ERROR;
+
+  if desiredEnc = SQLITE_UTF8 then begin
+    pMem^.n := pMem^.n and (not 1);
+    len := 2 * i64(pMem^.n) + 1;
+  end else begin
+    len := 2 * i64(pMem^.n) + 2;
+  end;
+
+  zIn   := Pu8(pMem^.z);
+  zTerm := zIn + pMem^.n;
+  zOut  := Pu8(sqlite3DbMallocRaw(pMem^.db, u64(len)));
+  if zOut = nil then begin
+    Result := SQLITE_NOMEM_BKPT; Exit;
+  end;
+  z := zOut;
+
+  if pMem^.enc = SQLITE_UTF8 then begin
+    if desiredEnc = SQLITE_UTF16LE then begin
+      while PtrUInt(zIn) < PtrUInt(zTerm) do begin
+        c := zIn^; Inc(zIn);
+        if c >= $c0 then begin
+          c := utfTrans1[c - $c0];
+          while (PtrUInt(zIn) < PtrUInt(zTerm)) and ((zIn^ and $c0) = $80) do begin
+            c := (c shl 6) + u32($3f and zIn^);
+            Inc(zIn);
+          end;
+          if (c < $80)
+             or ((c and $FFFFF800) = $D800)
+             or ((c and $FFFFFFFE) = $FFFE) then c := $FFFD;
+        end;
+        if c <= $FFFF then begin
+          z^ := u8(c and $FF); Inc(z);
+          z^ := u8((c shr 8) and $FF); Inc(z);
+        end else begin
+          z^ := u8(((c shr 10) and $3F) + (((c - $10000) shr 10) and $C0)); Inc(z);
+          z^ := u8($D8 + (((c - $10000) shr 18) and $03)); Inc(z);
+          z^ := u8(c and $FF); Inc(z);
+          z^ := u8($DC + ((c shr 8) and $03)); Inc(z);
+        end;
+      end;
+    end else begin
+      Assert(desiredEnc = SQLITE_UTF16BE);
+      while PtrUInt(zIn) < PtrUInt(zTerm) do begin
+        c := zIn^; Inc(zIn);
+        if c >= $c0 then begin
+          c := utfTrans1[c - $c0];
+          while (PtrUInt(zIn) < PtrUInt(zTerm)) and ((zIn^ and $c0) = $80) do begin
+            c := (c shl 6) + u32($3f and zIn^);
+            Inc(zIn);
+          end;
+          if (c < $80)
+             or ((c and $FFFFF800) = $D800)
+             or ((c and $FFFFFFFE) = $FFFE) then c := $FFFD;
+        end;
+        if c <= $FFFF then begin
+          z^ := u8((c shr 8) and $FF); Inc(z);
+          z^ := u8(c and $FF); Inc(z);
+        end else begin
+          z^ := u8($D8 + (((c - $10000) shr 18) and $03)); Inc(z);
+          z^ := u8(((c shr 10) and $3F) + (((c - $10000) shr 10) and $C0)); Inc(z);
+          z^ := u8($DC + ((c shr 8) and $03)); Inc(z);
+          z^ := u8(c and $FF); Inc(z);
+        end;
+      end;
+    end;
+    pMem^.n := i32(PtrUInt(z) - PtrUInt(zOut));
+    z^ := 0; Inc(z);
+  end else begin
+    Assert(desiredEnc = SQLITE_UTF8);
+    if pMem^.enc = SQLITE_UTF16LE then begin
+      while PtrUInt(zIn) < PtrUInt(zTerm) do begin
+        c := zIn^; Inc(zIn);
+        c := c + (u32(zIn^) shl 8); Inc(zIn);
+        if (c >= $d800) and (c < $e000) then begin
+          if PtrUInt(zIn) < PtrUInt(zTerm) then begin
+            c2 := zIn^; Inc(zIn);
+            c2 := c2 + (u32(zIn^) shl 8); Inc(zIn);
+            c := (c2 and $03FF) + ((c and $003F) shl 10) + (((c and $03C0) + $0040) shl 10);
+          end;
+        end;
+        if c < $00080 then begin
+          z^ := u8(c and $FF); Inc(z);
+        end else if c < $00800 then begin
+          z^ := u8($C0 + ((c shr 6) and $1F)); Inc(z);
+          z^ := u8($80 + (c and $3F)); Inc(z);
+        end else if c < $10000 then begin
+          z^ := u8($E0 + ((c shr 12) and $0F)); Inc(z);
+          z^ := u8($80 + ((c shr 6) and $3F)); Inc(z);
+          z^ := u8($80 + (c and $3F)); Inc(z);
+        end else begin
+          z^ := u8($F0 + ((c shr 18) and $07)); Inc(z);
+          z^ := u8($80 + ((c shr 12) and $3F)); Inc(z);
+          z^ := u8($80 + ((c shr 6) and $3F)); Inc(z);
+          z^ := u8($80 + (c and $3F)); Inc(z);
+        end;
+      end;
+    end else begin
+      while PtrUInt(zIn) < PtrUInt(zTerm) do begin
+        c := u32(zIn^) shl 8; Inc(zIn);
+        c := c + zIn^; Inc(zIn);
+        if (c >= $d800) and (c < $e000) then begin
+          if PtrUInt(zIn) < PtrUInt(zTerm) then begin
+            c2 := u32(zIn^) shl 8; Inc(zIn);
+            c2 := c2 + zIn^; Inc(zIn);
+            c := (c2 and $03FF) + ((c and $003F) shl 10) + (((c and $03C0) + $0040) shl 10);
+          end;
+        end;
+        if c < $00080 then begin
+          z^ := u8(c and $FF); Inc(z);
+        end else if c < $00800 then begin
+          z^ := u8($C0 + ((c shr 6) and $1F)); Inc(z);
+          z^ := u8($80 + (c and $3F)); Inc(z);
+        end else if c < $10000 then begin
+          z^ := u8($E0 + ((c shr 12) and $0F)); Inc(z);
+          z^ := u8($80 + ((c shr 6) and $3F)); Inc(z);
+          z^ := u8($80 + (c and $3F)); Inc(z);
+        end else begin
+          z^ := u8($F0 + ((c shr 18) and $07)); Inc(z);
+          z^ := u8($80 + ((c shr 12) and $3F)); Inc(z);
+          z^ := u8($80 + ((c shr 6) and $3F)); Inc(z);
+          z^ := u8($80 + (c and $3F)); Inc(z);
+        end;
+      end;
+    end;
+    pMem^.n := i32(PtrUInt(z) - PtrUInt(zOut));
+  end;
+  z^ := 0;
+  Assert((pMem^.n + i32(Ord(desiredEnc = SQLITE_UTF8) * 1 + Ord(desiredEnc <> SQLITE_UTF8) * 2)) <= len);
+
+  newFlags := MEM_Str or MEM_Term or (pMem^.flags and (MEM_AffMask or MEM_Subtype));
+  sqlite3VdbeMemRelease(pMem);
+  pMem^.flags := newFlags;
+  pMem^.enc   := desiredEnc;
+  pMem^.z     := PAnsiChar(zOut);
+  pMem^.zMalloc  := pMem^.z;
+  pMem^.szMalloc := sqlite3DbMallocSize(pMem^.db, pMem^.z);
+  Result := SQLITE_OK;
 end;
 
 { sqlite3VdbeMemHandleBom — strip a UTF-16 byte-order mark, if present, from
