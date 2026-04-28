@@ -37,19 +37,6 @@ Important: At the end of this document, please find:
        [ ] `sqlite3VdbeCloseStatement` (vdbe.pas) — currently returns
             `SQLITE_OK`; missing the `vdbeCloseStatement(p, eOp)` arm
             taken when `p^.db^.nStatement and p^.iStatement`.
-       [X] `sqlite3VdbeAllocUnpackedRecord` — ported 2026-04-28
-            (vdbe.pas:1982).  Allocates UnpackedRecord + nKeyField+1
-            Mem array in one DbMallocRaw block; aMem placed at
-            ROUND8(SizeOf(TUnpackedRecord)) past the header.
-            KeyInfo fields read by manual offsets (nKeyField @6, db @16)
-            since vdbe.pas does not import codegen.
-       [X] `sqlite3VdbeRecordUnpack` — ported 2026-04-28
-            (vdbe.pas:2006).  Decodes binary record via
-            sqlite3GetVarint32 + sqlite3VdbeSerialGet +
-            sqlite3VdbeSerialTypeLen, sets default_rc=0, populates
-            Mem.enc / Mem.db, sets nField to actual decoded count.
-            Verified TestVdbeRecord 13/0, TestExplainParity 1016/10,
-            TestBtreeCompat 337/0 — no regressions.
        [ ] `sqlite3VdbeRecordCompareWithSkip` — returns `0`; full
             key-compare engine (~150 lines).  Returning 0 means
             "keys equal" always.
@@ -62,35 +49,9 @@ Important: At the end of this document, please find:
        [ ] `sqlite3VdbeExplainPop` — empty body; must restore
             `pParse^.addrExplain` to parent via
             `sqlite3VdbeExplainParent`.
-       [X] Debug-/coverage-only no-ops (faithful in release builds —
-            C source gates each on `SQLITE_DEBUG` /
-            `SQLITE_VDBE_COVERAGE` / `SQLITE_ENABLE_STMT_SCANSTATUS`,
-            and the Pas port tracks the release struct which lacks
-            `nWrite`): `sqlite3VdbeIncrWriteCounter`,
-            `sqlite3VdbePrintSql`, `sqlite3VdbeIOTraceSql`,
-            `sqlite3VdbeComment`, `sqlite3VdbeSetLineNumber`,
-            `sqlite3VdbePrintOp`, `sqlite3VdbeAssertMayAbort`,
-            `sqlite3VdbeAssertAbortable`,
-            `sqlite3VdbeNoJumpsOutsideSubrtn`,
-            `sqlite3VdbeVerifyNoMallocRequired`,
-            `sqlite3VdbeVerifyNoResultRow`.  Re-port if/when a
-            SQLITE_DEBUG-equivalent build mode is added.
        [ ] `sqlite3VdbeEnter` / `sqlite3VdbeLeave` — empty; acquire /
             release per-btree mutexes from `p^.lockMask`.  Required for
             shared-cache / multi-thread builds.
-       [X] `sqlite3VdbeCheckFkImmediate` / `sqlite3VdbeCheckFkDeferred`
-            — ported 2026-04-28 (vdbe.pas:3386).  CheckFkImmediate
-            short-circuits when `p^.nFkConstraint=0`; CheckFkDeferred
-            short-circuits when `db^.nDeferredCons + nDeferredImmCons = 0`.
-            Both delegate to a new local `vdbeFkError` (vdbeaux.c:3284)
-            that sets `p^.rc=SQLITE_CONSTRAINT_FOREIGNKEY`,
-            `errorAction=OE_Abort`, calls sqlite3VdbeError(`FOREIGN KEY
-            constraint failed`), and returns SQLITE_ERROR
-            (legacy prepare) or SQLITE_CONSTRAINT_FOREIGNKEY when
-            SQLITE_PREPARE_SAVESQL is set.  No regressions:
-            TestExplainParity 1016/10, TestSchemaBasic 44/0, TestDMLBasic
-            54/0, TestSelectBasic 49/0, TestParser 45/0, TestVdbeTxn 8/0,
-            TestVdbeRecord 13/0, TestVdbeAgg 11/0, TestBtreeCompat 337/0.
 
        Bytecode virtual table (vdbevtab.c):
        [ ] `sqlite3VdbeBytecodeVtabInit` — returns `SQLITE_OK`; must
@@ -105,75 +66,8 @@ Important: At the end of this document, please find:
             for query compilation.
        [ ] `sqlite3ResolveOrderGroupBy` — returns `SQLITE_OK`; resolves
             ORDER BY / GROUP BY positional aliases against `pSelect^.pEList`.
-       [X] `sqlite3ExprColUsed` (resolve.c) — ported 2026-04-28
-            (codegen.pas:7040).  Generated-column arm returns
-            `(1 shl nCol)-1` (or `not 0` when nCol >= BMS); regular arm
-            clamps n to BMS-1 and returns `1 shl n`.  Verified
-            TestExplainParity 1016/10, plus TestWhereBasic 52/0,
-            TestSelectBasic 49/0, TestParser 45/0, TestDMLBasic 54/0,
-            TestSchemaBasic 44/0, TestVdbeRecord 13/0, TestVdbeAgg 11/0,
-            TestVdbeTxn 8/0 — no regressions.
-
-       Build / schema (build.c):
-       [X] `sqlite3HasExplicitNulls` — ported 2026-04-28
-            (codegen.pas:22195).  Walks `pList^.a[i].fg.eBits & $20`
-            (bNulls), emits `unsupported use of NULLS FIRST/LAST` via
-            `sqlite3ErrorMsg` honouring the sortFlags 0/3 ↔ FIRST mapping.
-       [X] `sqlite3OpenTempDatabase` — ported 2026-04-28
-            (codegen.pas:24772).  Now calls `sqlite3BtreeOpen` with
-            `READWRITE|CREATE|EXCLUSIVE|DELETEONCLOSE|TEMP_DB` flags
-            against `db^.pVfs` (zFilename=NULL → memdb /
-            mkstemp depending on VFS) and follows up with
-            `sqlite3BtreeSetPageSize(pBt, db^.nextPagesize, 0, 0)`.
-            On failure raises sqlite3ErrorMsg + sets pParse^.rc / 1.
-            Verified: `CREATE TEMP TABLE t(x INTEGER)` now prepares
-            and steps cleanly (rc=0/101); previously the stub
-            returned SQLITE_OK without opening any back-end.
-            Downstream INSERT into temp tables still errors out
-            (prep rc=1) — separate gap, see new task 6.8b below.
-            No regressions: TestExplainParity 1016/10,
-            TestSchemaBasic 44/0, TestDMLBasic 54/0, TestParser 45/0,
-            TestSelectBasic 49/0.
-       [X] `sqlite3IsShadowTableOf` / `sqlite3ShadowTableName` /
-            `sqlite3ReadOnlyShadowTables` — ported 2026-04-28
-            (codegen.pas:22408..).  IsShadowTableOf walks
-            `aModule^.pModule^.xShadowName` honouring `iVersion>=3`;
-            ShadowTableName splits at last `_` via DbStrNDup +
-            FindTable; ReadOnlyShadowTables tests
-            `SQLITE_Defensive | pVtabCtx=nil | nVdbeExec=0 | not vtabInSync`.
-            Verified TestVtab 216/0, TestExplainParity 1016/10,
-            TestSchemaBasic 44/0, TestDMLBasic 54/0, TestSelectBasic
-            49/0, TestParser 45/0 — no regressions.
-
-       TEMP-database follow-on (build.c / insert.c):
-       [X] **6.8b** TEMP-table INSERT/SELECT now wired — closed
-           2026-04-28.  Two upstream-divergence bugs fixed in tandem:
-           (1) `execParseSchemaImpl` (passqlite3main.pas) always read
-           `LEGACY_SCHEMA_TABLE` regardless of iDb, so the OP_ParseSchema
-           re-load for iDb=1 queried `sqlite_master` (main DB) and
-           returned 0 rows.  Switched to `LEGACY_TEMP_SCHEMA_TABLE` when
-           iDb=1 (bare name; the qualified `temp.sqlite_temp_master`
-           form still trips a separate codegen silent-bail on qualified
-           lookups).  (2) `sqlite3TwoPartName` (passqlite3codegen.pas)
-           returned `iDb=0` for unqualified one-part names, so
-           re-parsing `CREATE TABLE t(x INTEGER)` from sqlite_temp_master
-           with `init.iDb=1` placed `t` in main's tblHash anyway —
-           subsequent INSERT/SELECT codegen then emitted OpenWrite/Read
-           with `p3=0` (main btree) instead of `p3=1` (temp).  Aligned
-           with build.c:1003 — return `db^.init.iDb`.  Verified
-           `CREATE TEMP TABLE t(x INTEGER); INSERT INTO t VALUES(42);
-           SELECT count(*) FROM t` returns 1 (matches C).  No
-           regressions across TestExplainParity 1016/10, TestSchemaBasic,
-           TestDMLBasic, TestSelectBasic, TestParser, TestVdbeTxn,
-           TestVdbeRecord, TestVdbeAgg, TestBtreeCompat, TestWhereBasic,
-           TestVtab, TestOpenClose, TestExecGetTable, TestExprBasic,
-           TestJson, TestVdbeApi, TestRowidIn.
 
        Foreign keys (fkey.c):
-       [X] `sqlite3FkReferences` — ported 2026-04-28
-            (codegen.pas:28283).  One-liner
-            `sqlite3HashFind(@pSch^.fkeyHash, pTab^.zName)` with
-            nil-guards on pTab/pSchema.
        [ ] `sqlite3FkRequired` — returns `0`; full FK-required decision
             walking `pFKey` / parent-key change masks.
 
@@ -375,10 +269,7 @@ Important: At the end of this document, please find:
       `src/tests/DiagDate.pas` probe (date/time + scalar coercion).
       Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagDate`.
 
-  [X] **6.10 step 12** DiagMoreFunc — all divergences closed.  Final
-      sweep 2026-04-28 reports 0/28.  Remaining sub-bullets
-      (sqlite_compileoption_used/get, %b/%n) deferred or dropped from
-      scope (see 8.4.1 / printf fmtinfo).
+  [X] **6.10 step 12** DiagMoreFunc — all divergences closed.
 
   [ ] **6.10 step 15** Runtime divergences surfaced by the new
       `src/tests/DiagTxn.pas` probe (transactions, savepoints, conflict
@@ -531,33 +422,6 @@ Important: At the end of this document, please find:
        [ ] `sqlite3FixExpr` (codegen.pas:25405).
        [ ] `sqlite3FixTriggerStep` (codegen.pas:25410).
 
-- [ ] **7.1.5** Constraint / abort plumbing (build.c, insert.c) —
-       empty-body stubs that affect VDBE abort/halt semantics:
-       [X] `sqlite3MayAbort` / `sqlite3HaltConstraint` /
-            `sqlite3RowidConstraint` — ported 2026-04-28
-            (codegen.pas).  MayAbort sets PARSEFLAG_MayAbort on
-            sqlite3ParseToplevel(pParse).  HaltConstraint emits
-            `OP_Halt errCode, onError, 0, p4` + ChangeP5(p5),
-            calling MayAbort when onError=OE_Abort.  RowidConstraint
-            builds `<table>.<col>` (PRIMARYKEY) or `<table>.rowid`
-            (ROWID) via sqlite3MPrintf and dispatches through
-            HaltConstraint with P5_ConstraintUnique.  Verified
-            TestExplainParity 1016/10, TestDMLBasic 54/0,
-            TestSchemaBasic 44/0, TestSelectBasic 49/0,
-            TestParser 45/0 — no regressions.  Productive once
-            sqlite3GenerateConstraintChecks (6.9-bis 11g.2.b)
-            wires its callers.
-
-- [X] **7.1.6** Btree mutex acquisition (btmutex.c) — ported
-       2026-04-28 (codegen.pas:25356..).  Walks `db^.aDb[i].pBt` and
-       calls `sqlite3BtreeEnter` / `sqlite3BtreeLeave` for each non-nil
-       slot, matching btmutex.c:280..288 (single-threaded /
-       shared-cache-omitted arm).  In this build that reduces to
-       copying `p^.db` to `p^.pBt^.db` per attached btree on enter,
-       and a no-op on leave.  Verified TestExplainParity 1016/10,
-       TestSelectBasic 49/0, TestVdbeTxn 8/0, TestParser 45/0 — no
-       regressions.
-
 - [ ] **7.1.7** Lemon parser tail (parse.c epilogue) — gaps inside
        `passqlite3parser.pas`:
        [ ] `sqlite3ParserFallback` — stubbed as 0 (parser.pas:1070);
@@ -576,8 +440,7 @@ Important: At the end of this document, please find:
        allocate `aDb[]` slot, run schema load.  (Overlaps 6.27 — move
        here when ported.)
 
-- [ ] **7.1.9** ALTER TABLE (alter.c) — full bodies for the stubs at
-       codegen.pas:25347+:
+- [ ] **7.1.9** ALTER TABLE (alter.c) — Full port from C to pascal:
        [ ] `sqlite3AlterRenameTable`, `sqlite3AlterRenameColumn`.
        [ ] `sqlite3AlterDropColumn`, `sqlite3AlterDropConstraint`.
        [ ] `sqlite3AlterSetNotNull`, `sqlite3AlterAddConstraint`.
