@@ -3179,10 +3179,20 @@ end;
 
 { --- Statement close --- }
 
+{ vdbeaux.c:3265 — early-exit guard.  The non-trivial vdbeCloseStatement
+  arm (sqlite3BtreeSavepoint walk + nDeferredCons restore) is gated on
+  `db->nStatement && p->iStatement`; p^.iStatement is only set by
+  sqlite3VdbeOpenStatement opening a per-statement savepoint, which is
+  never reached today (sqlite3BtreeSavepoint not yet ported), so the
+  guard always falls through to SQLITE_OK — matches the C early-exit. }
 function sqlite3VdbeCloseStatement(p: PVdbe; eOp: i32): i32;
 begin
-  { Stub — Phase 5.4 (complex transaction savepoint logic) }
-  Result := SQLITE_OK;
+  if p^.iStatement <> 0 then begin
+    { vdbeCloseStatement body — gated on sqlite3BtreeSavepoint port. }
+    Result := SQLITE_OK;
+  end else begin
+    Result := SQLITE_OK;
+  end;
 end;
 
 function sqlite3VdbeCheckFkImmediate(p: PVdbe): i32;

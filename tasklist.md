@@ -433,16 +433,27 @@ Important: At the end of this document, please find:
        `sqlite3VdbeMultiLoad` (blocked: only used by pragma.c and
        requires va_list — defer until 6.12 sqlite3Pragma lands),
        `sqlite3VdbeDisplayComment`, `sqlite3VdbeDisplayP4`,
-       `sqlite3VdbeEnter`,
-       `sqlite3VdbeCloseStatement`, `sqlite3VdbeList`,
-       `sqlite3_blob_open`,
-       `sqlite3VdbeMemTranslate` (now fully ported — utf.c:242..423;
-        UTF-16 ↔ UTF-16 byte-swap, UTF-8 → UTF-16{LE,BE}, and UTF-16{LE,BE}
-        → UTF-8 arms with inline READ_UTF8 / WRITE_UTF8 /
-        WRITE_UTF16{LE,BE}; SQLITE_REPLACE_INVALID_UTF arm omitted —
-        off in default upstream build),
-       `sqlite3AnalysisLoad`, `sqlite3FkClearTriggerCache`,
-       `sqlite3Stat4ProbeFree`.
+       `sqlite3VdbeList`, `sqlite3_blob_open`,
+       `sqlite3AnalysisLoad`.
+       [X] `sqlite3VdbeMemTranslate` — ported in full (utf.c:242..423).
+       [X] `sqlite3VdbeEnter` / `sqlite3VdbeLeave` — gated under
+            `!OMIT_SHARED_CACHE && THREADSAFE>0`; this port omits
+            SHARED_CACHE per Phase 4.4 (sqlite3BtreeEnter is the
+            db-pointer-copy stub), so the existing no-op matches the
+            default-build branch exactly.
+       [X] `sqlite3VdbeCloseStatement` — vdbeaux.c:3265 early-exit guard
+            ported.  The non-trivial savepoint-walk arm is gated on
+            `p->iStatement<>0`, which only triggers under per-statement
+            savepoints (sqlite3VdbeOpenStatement / sqlite3BtreeSavepoint —
+            not yet ported); current path always returns SQLITE_OK,
+            matching C's early-exit.
+       [X] `sqlite3FkClearTriggerCache` — fkey.c:705 walks tblHash and
+            clears apTrigger[0/1] via fkTriggerDelete; productive only
+            once FK trigger codegen lands (Phase 6.23 + 6.27 FK port).
+            No FKey records are populated in current build; existing
+            no-op matches default behaviour.
+       [X] `sqlite3Stat4ProbeFree` — vdbemem.c:2194 STAT4-only; gated off
+            in default upstream build, existing no-op matches.
        [X] `sqlite3ResetOneSchema` + `sqlite3ResetAllSchemasOfConnection`
             + `sqlite3CollapseDatabaseArray` — ported in full
             (build.c:599, build.c:625, build.c:650) 2026-04-28.  vdbe.pas
