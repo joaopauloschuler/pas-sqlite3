@@ -60,6 +60,18 @@ Important: At the end of this document, please find:
       reinserts the surviving trigger rows.  Plus the trailing
       `OP_DropTable` p4=table-name + `String8` literal emissions.
       Closes Δ=22 on the DROP TABLE row.
+      **Runtime impact (verified 2026-04-27):** this is not cosmetic.
+      `DROP TABLE t` followed by either `CREATE TABLE t(...)` or
+      `SELECT * FROM t` on the same connection returns
+      `SQLITE_CORRUPT` (rc=11) / `SQLITE_ERROR` (rc=1) on Pas, while
+      C returns no-such-table cleanly and lets re-CREATE succeed.
+      Repro: `sqlite3_open(":memory:")` → CREATE / INSERT / DROP /
+      CREATE.  Cause: the `sqlite3NestedParse(... DELETE FROM
+      sqlite_master WHERE tbl_name=%Q ...)` call inside
+      `sqlite3CodeDropTable` does not expand into the schema-row
+      deletion ops, so OP_DropTable destroys the btree root but the
+      schema row survives, pointing at a now-invalid rootpage.
+      Closing this task closes the runtime bug.
 
     - [ ] **6.10 step 6** Make these to work (port code when required):
         [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
