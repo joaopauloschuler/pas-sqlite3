@@ -22193,8 +22193,25 @@ begin
 end;
 
 function sqlite3HasExplicitNulls(pParse: PParse; pList: PExprList): i32;
+var
+  i: i32;
+  items: PExprListItem;
+  sf: u8;
 begin
   Result := 0;
+  if pList = nil then Exit;
+  items := ExprListItems(pList);
+  for i := 0 to pList^.nExpr - 1 do begin
+    if (items[i].fg.eBits and $20) <> 0 then begin
+      sf := items[i].fg.sortFlags;
+      if (sf = 0) or (sf = 3) then
+        sqlite3ErrorMsg(pParse, 'unsupported use of NULLS FIRST')
+      else
+        sqlite3ErrorMsg(pParse, 'unsupported use of NULLS LAST');
+      Result := 1;
+      Exit;
+    end;
+  end;
 end;
 
 procedure sqlite3DefaultRowEst(pIdx: PIndex2);
@@ -28264,8 +28281,14 @@ begin
 end;
 
 function sqlite3FkReferences(pTab: PTable2): Pointer;
+var
+  pSch: passqlite3util.PSchema;
 begin
   Result := nil;
+  if pTab = nil then Exit;
+  pSch := passqlite3util.PSchema(pTab^.pSchema);
+  if pSch = nil then Exit;
+  Result := sqlite3HashFind(@pSch^.fkeyHash, pTab^.zName);
 end;
 
 // ===========================================================================

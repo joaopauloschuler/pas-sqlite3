@@ -55,29 +55,19 @@ Important: At the end of this document, please find:
        [ ] `sqlite3VdbeExplainPop` — empty body; must restore
             `pParse^.addrExplain` to parent via
             `sqlite3VdbeExplainParent`.
-       [ ] `sqlite3VdbeIncrWriteCounter` — empty body; must increment
-            `p^.nWrite` when `pC` is not sorter / pseudo / ephemeral.
-            Affects journal/abort decisions.
-       [ ] `sqlite3VdbePrintSql` — empty body; debug aid that prints
-            `SQL: [...]` from `p^.zSql` or OP_Init's p4.
-       [ ] `sqlite3VdbeIOTraceSql` — empty body; emits compressed SQL
-            to `sqlite3IoTrace` callback.
-       [ ] `sqlite3VdbeComment` — empty body; stores per-op comment via
-            varargs `vdbeVComment` (debug builds only).
-       [ ] `sqlite3VdbeSetLineNumber` — empty body; one-liner
-            `sqlite3VdbeGetLastOp(v)^.iSrcLine := iLine`.
-       [ ] `sqlite3VdbePrintOp` — empty body; formatted opcode dump
-            via `sqlite3VdbeDisplayP4` + `sqlite3OpcodeName`.
-       [ ] `sqlite3VdbeAssertMayAbort` — returns `1`; debug-only
-            opcode-iterator verifying abort/FK counter consistency.
-       [ ] `sqlite3VdbeAssertAbortable` — empty; debug-only
-            `assert(p^.nWrite=0 or p^.usesStmtJournal)`.
-       [ ] `sqlite3VdbeNoJumpsOutsideSubrtn` — empty; debug-only
-            verifier scanning for cross-subroutine jumps.
-       [ ] `sqlite3VdbeVerifyNoMallocRequired` — empty; debug-only
-            `assert(p^.nOp + N <= p^.nOpAlloc)`.
-       [ ] `sqlite3VdbeVerifyNoResultRow` — empty; debug-only loop
-            asserting no `OP_ResultRow` in `p^.aOp[]`.
+       [X] Debug-/coverage-only no-ops (faithful in release builds —
+            C source gates each on `SQLITE_DEBUG` /
+            `SQLITE_VDBE_COVERAGE` / `SQLITE_ENABLE_STMT_SCANSTATUS`,
+            and the Pas port tracks the release struct which lacks
+            `nWrite`): `sqlite3VdbeIncrWriteCounter`,
+            `sqlite3VdbePrintSql`, `sqlite3VdbeIOTraceSql`,
+            `sqlite3VdbeComment`, `sqlite3VdbeSetLineNumber`,
+            `sqlite3VdbePrintOp`, `sqlite3VdbeAssertMayAbort`,
+            `sqlite3VdbeAssertAbortable`,
+            `sqlite3VdbeNoJumpsOutsideSubrtn`,
+            `sqlite3VdbeVerifyNoMallocRequired`,
+            `sqlite3VdbeVerifyNoResultRow`.  Re-port if/when a
+            SQLITE_DEBUG-equivalent build mode is added.
        [ ] `sqlite3VdbeEnter` / `sqlite3VdbeLeave` — empty; acquire /
             release per-btree mutexes from `p^.lockMask`.  Required for
             shared-cache / multi-thread builds.
@@ -103,9 +93,10 @@ Important: At the end of this document, please find:
             `COLFLAG_GENERATED` and the `BMS` cap.
 
        Build / schema (build.c):
-       [ ] `sqlite3HasExplicitNulls` — returns `0`; must scan
-            `pList^.a[i].fg.bNulls` and raise
-            `"unsupported use of NULLS FIRST/LAST"`.
+       [X] `sqlite3HasExplicitNulls` — ported 2026-04-28
+            (codegen.pas:22195).  Walks `pList^.a[i].fg.eBits & $20`
+            (bNulls), emits `unsupported use of NULLS FIRST/LAST` via
+            `sqlite3ErrorMsg` honouring the sortFlags 0/3 ↔ FIRST mapping.
        [ ] `sqlite3OpenTempDatabase` — returns `SQLITE_OK` without
             opening anything; must call `sqlite3BtreeOpen` with
             `SQLITE_OPEN_READWRITE | CREATE | EXCLUSIVE | DELETEONCLOSE
@@ -120,8 +111,10 @@ Important: At the end of this document, please find:
             and not `sqlite3VtabInSync`.
 
        Foreign keys (fkey.c):
-       [ ] `sqlite3FkReferences` — returns `nil`; one-liner
-            `sqlite3HashFind(@pTab^.pSchema^.fkeyHash, pTab^.zName)`.
+       [X] `sqlite3FkReferences` — ported 2026-04-28
+            (codegen.pas:28283).  One-liner
+            `sqlite3HashFind(@pSch^.fkeyHash, pTab^.zName)` with
+            nil-guards on pTab/pSchema.
        [ ] `sqlite3FkRequired` — returns `0`; full FK-required decision
             walking `pFKey` / parent-key change masks.
 
