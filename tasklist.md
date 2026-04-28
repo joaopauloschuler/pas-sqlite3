@@ -95,9 +95,8 @@ Important: At the end of this document, please find:
         [ ] `SELECT a FROM t GROUP BY a` — Δ=42 (aggregate-group
           path, not yet ported).
         [ ] `SELECT SUM/MIN/MAX(a)` — Δ=12..13 (aggregate-no-GROUP
-          path).  Needs AggStep + AggFinal codegen
-          (select.c:8819+).  The `selectMarkAggregate` walker keeps
-          the runtime stub safe until that lands.
+          path).  Tracked under the 6.10 step 7(c) decomposition
+          (c1..c7) — same root cause as count(*)+WHERE.
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
           materialise / co-routine path not ported).
         [ ] `UPDATE t SET a=5 WHERE rowid=1` — Δ=14 (`sqlite3Update`
@@ -148,18 +147,54 @@ Important: At the end of this document, please find:
         literals now flow through as i32 (or fall back to the zToken
         + sqlite3DecOrHexToI64 path for >32-bit values).  Verified
         via DiagMisc "INSERT hex literal" → PASS.
-      [ ] **c) Aggregate `count(*)` with WHERE returns no row.**
-        On a table populated via setup,
-        `SELECT count(*) FROM t WHERE a IS NULL` (and the `IS NOT
-        NULL`, `LIKE 'pat%'`, `BETWEEN`, `IN (...)` variants) step
-        directly to SQLITE_DONE without producing a SQLITE_ROW on
-        Pas; C returns one row with the count.  Bare `count(*) FROM
-        t` and the same WHERE filters *without* the aggregate work
-        on Pas (verified in DiagMisc).  So the gap is the
-        aggregate-with-WHERE codegen path: AggStep / AggFinal not
-        emitted when the inner loop carries a residual WHERE branch.
-        Likely shares root cause with the `SELECT SUM/MIN/MAX`
-        Δ=12..13 entry under step 6.
+      [ ] **c) Aggregate-no-GROUP-BY codegen path.**
+        Silent gap for `count(*)`, `sum`, `min`, `max`, `avg` etc. when
+        the SELECT carries a WHERE / multi-table FROM / DISTINCT-arg /
+        anything that misses the bytecode simple-count fast path.
+        DiagAggWhere (`bin/DiagAggWhere`) confirms `SELECT count(*)
+        FROM t WHERE a IS NULL` lands as 3 ops on Pas (Init / Halt /
+        Goto) vs 16 on C — Pas emits *no* loop body at all.
+        **Exact gate:** `passqlite3codegen.pas:18045` — a hard `Exit`
+        on any `selFlags & (SF_Distinct | SF_Aggregate | SF_Compound)`
+        that didn't match the inline simple-count optimisation at
+        18002..18043.  Decomposition into achievable sub-tasks (each
+        a discrete commit unit; the C reference is select.c
+        analyzeAggregate / generateAggSelect, ≈ select.c:6120..6450
+        + 8819..9050):
+        [ ] **(c1)** Port the `AggInfo` record + lifecycle
+              (sqliteInt.h:3530..3580 + select.c:6121
+              `sqlite3AggInfoPersistWalkerInit`).  Pas already
+              declares `PAggInfo` (codegen.pas:522) but the body is
+              empty; bring over `aCol[]`, `aFunc[]`, `iFirstReg`,
+              `nColumn`, `nFunc`, `nAccumulator`, `directMode`,
+              `useSortingIdx`, `sortingIdx`, plus the per-entry
+              `AggInfo_col` / `AggInfo_func` shapes.
+        [ ] **(c2)** Port `analyzeAggregate` (select.c:6280..6450)
+              — the walker that scans pEList / pHaving / pOrderBy
+              for TK_AGG_FUNCTION / TK_AGG_COLUMN and populates
+              the AggInfo entries.  Wire from sqlite3Select after
+              selectMarkAggregate (already runs at 17890).
+        [ ] **(c3)** Open the SF_Aggregate gate at codegen.pas:18045
+              for the no-GROUP-BY case (`p^.pGroupBy = nil` already
+              checked at 17980).  Replace the unconditional `Exit`
+              with a branch that proceeds into the agg-codegen tail.
+        [ ] **(c4)** Emit accumulator-init prologue: `OP_Null` over
+              `[regAcc .. regAcc+nAccumulator-1]` and any per-Func
+              initial state (`min/max` start NULL, `sum/total/count`
+              start 0/NULL).  Mirrors select.c:8819..8870.
+        [ ] **(c5)** Emit `OP_AggStep` / `OP_AggStep1` inside the
+              existing sqlite3WhereBegin..End loop, one per
+              `AggInfo.aFunc[]` entry, with the FuncDef attached
+              via P4_FUNCDEF.  See select.c:8950..9000.
+        [ ] **(c6)** Emit `OP_AggFinal` after `sqlite3WhereEnd`,
+              followed by Copy/ResultRow into `pDest` (mirrors
+              select.c:9020..9050; SRT_Output / SRT_Mem disposal
+              already wired in selectInnerLoop).
+        [ ] **(c7)** Verify against DiagAggWhere + DiagFeatureProbe
+              + DiagMisc; flips the 6.10 step 6 SUM/MIN/MAX entry
+              (Δ=12..13), the JOIN-aggregate entry under step 9(d),
+              and the CHECK-constraint check-no-row case under
+              step 9(h) once 6.9-bis 11g.2.b lands.
 
   [ ] **6.10 step 9** Runtime divergences surfaced by
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
