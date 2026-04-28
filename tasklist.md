@@ -585,11 +585,22 @@ Important: At the end of this document, please find:
             for the column.
   [ ] **6.26** port codegen.pas where / select / window stubs in full from C
        to pascal: `sqlite3SelectPopWith` (blocked on full TWith record — see
-       6.20), `sqlite3WhereMinMaxOptEarlyOut`, `wherePathMatchSubqueryOB`,
+       6.20), `sqlite3WhereMinMaxOptEarlyOut`,
        `sqlite3KeyInfoFromExprList`, `sqlite3SelectAddTypeInfo`,
        `sqlite3SelectCheckOnClauses`,
        `sqlite3WhereExplainBloomFilter`, `sqlite3WhereAddExplainText`,
        `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep`.
+       [X] `wherePathMatchSubqueryOB` — ported in full (where.c:5077..5127)
+            2026-04-28.  Detects whether a sub-FROM's ORDER BY (carried in
+            pLoop^.u.btree.pOrderBy) satisfies leading terms of the outer
+            ORDER BY without a sort.  Was a 0-returning stub silently
+            disabling the SQLITE_OrderBySubq optimisation; the call site
+            in wherePathSatisfiesOrderBy:12590 already passes obSat by
+            address and updates pRevMask, so the optimiser now activates
+            whenever a materialised sub-FROM has a productive ORDER BY.
+            Δ-neutral on TestExplainParity (1012/14 — same) since the
+            current corpus has no sub-FROM ORDER BY fixtures; productive
+            once 6.10 step 6 sub-FROM materialise lands.
        [X] `whereRightSubexprIsColumn` — ported in full (where.c:302).
             Strips TK_COLLATE/TK_LIKELY off p->pRight and returns the inner
             TK_COLUMN node when EP_FixedCol is unset.

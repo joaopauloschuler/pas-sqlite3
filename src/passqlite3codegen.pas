@@ -12440,12 +12440,65 @@ begin
   Result := 1;
 end;
 
-{ wherePathMatchSubqueryOB — stub. See interface banner. }
+{ wherePathMatchSubqueryOB — port of where.c:5077..5127.
+
+  Detects whether a subquery's ORDER BY (carried in pLoop^.u.btree.pOrderBy)
+  satisfies leading terms of the outer ORDER BY without a separate sort.
+  Returns the match count > 0 / 0 (encoded as the C "jSub>0" boolean). }
 function wherePathMatchSubqueryOB(pWInfo: PWhereInfo; pLoop: PWhereLoop;
   iLoop: i32; iCur: i32; pOrderBy: PExprList; pRevMask: PBitmask;
   pObSat: PBitmask): i32;
+var
+  iOB, jSub: i32;
+  rev, revIdx: u8;
+  sfOB, sfSub: u8;
+  pOBExpr: PExpr;
+  pSubOB: PExprList;
+  aOB, aSub: PExprListItem;
 begin
-  Result := 0;
+  rev    := 0;
+  revIdx := 0;
+  pSubOB := pLoop^.u.btree.pOrderBy;
+  AssertH(pSubOB <> nil, 'wherePathMatchSubqueryOB: pSubOB');
+  aOB  := ExprListItems(pOrderBy);
+  aSub := ExprListItems(pSubOB);
+  iOB := 0;
+  while ((Bitmask(1) shl iOB) and pObSat^) <> 0 do
+    Inc(iOB);
+  jSub := 0;
+  while (jSub < pSubOB^.nExpr) and (iOB < pOrderBy^.nExpr) do
+  begin
+    if aSub[jSub].u.x.iOrderByCol = 0 then break;
+    pOBExpr := aOB[iOB].pExpr;
+    if (pOBExpr^.op <> TK_COLUMN) and (pOBExpr^.op <> TK_AGG_COLUMN) then break;
+    if pOBExpr^.iTable <> iCur then break;
+    if pOBExpr^.iColumn <> i32(aSub[jSub].u.x.iOrderByCol) - 1 then break;
+    if (pWInfo^.wctrlFlags and WHERE_GROUPBY) = 0 then
+    begin
+      sfOB  := aOB[iOB].fg.sortFlags;
+      sfSub := aSub[jSub].fg.sortFlags;
+      if (sfSub and KEYINFO_ORDER_BIGNULL) <> (sfOB and KEYINFO_ORDER_BIGNULL) then
+        break;
+      revIdx := sfSub and KEYINFO_ORDER_DESC;
+      if jSub > 0 then
+      begin
+        if (rev xor revIdx) <> (sfOB and KEYINFO_ORDER_DESC) then break;
+      end
+      else
+      begin
+        rev := revIdx xor (sfOB and KEYINFO_ORDER_DESC);
+        if rev <> 0 then
+        begin
+          if (pLoop^.wsFlags and WHERE_COROUTINE) <> 0 then break;
+          pRevMask^ := pRevMask^ or (Bitmask(1) shl iLoop);
+        end;
+      end;
+    end;
+    pObSat^ := pObSat^ or (Bitmask(1) shl iOB);
+    Inc(jSub);
+    Inc(iOB);
+  end;
+  if jSub > 0 then Result := 1 else Result := 0;
 end;
 
 { wherePathSatisfiesOrderBy — direct port of where.c:5146..5478.
