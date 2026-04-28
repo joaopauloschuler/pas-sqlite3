@@ -28,6 +28,116 @@ Important: At the end of this document, please find:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
+- [ ] **6.8** port one-line / empty-body stubs in full from C to pascal.
+       Identified 2026-04-28 by cross-referencing each Pascal one-liner
+       against `../sqlite3/src/`.  Each entry below has a non-trivial C
+       body that the current Pascal version silently elides.
+
+       VDBE auxiliary (vdbeaux.c):
+       [ ] `sqlite3VdbeCloseStatement` (vdbe.pas) — currently returns
+            `SQLITE_OK`; missing the `vdbeCloseStatement(p, eOp)` arm
+            taken when `p^.db^.nStatement and p^.iStatement`.
+       [ ] `sqlite3VdbeAllocUnpackedRecord` — returns `nil`; must
+            allocate `UnpackedRecord` + `Mem` array sized from
+            `pKeyInfo^.nKeyField + 1`.
+       [ ] `sqlite3VdbeRecordUnpack` — returns `nil`; must decode the
+            binary record into `Mem` cells via `sqlite3VdbeSerialGet` /
+            `sqlite3VdbeSerialTypeLen`.
+       [ ] `sqlite3VdbeRecordCompareWithSkip` — returns `0`; full
+            key-compare engine (~150 lines).  Returning 0 means
+            "keys equal" always.
+       [ ] `sqlite3VdbeScanStatus` / `sqlite3VdbeScanStatusRange` /
+            `sqlite3VdbeScanStatusCounters` — empty bodies; populate
+            `p^.aScan[]` when `IS_STMT_SCANSTATUS(db)`.
+       [ ] `sqlite3VdbeExplain` — returns `0`; must emit `OP_Explain`
+            via `sqlite3VdbeAddOp4` and call `sqlite3VdbeScanStatus`.
+            Required for EXPLAIN QUERY PLAN.
+       [ ] `sqlite3VdbeExplainPop` — empty body; must restore
+            `pParse^.addrExplain` to parent via
+            `sqlite3VdbeExplainParent`.
+       [ ] `sqlite3VdbeIncrWriteCounter` — empty body; must increment
+            `p^.nWrite` when `pC` is not sorter / pseudo / ephemeral.
+            Affects journal/abort decisions.
+       [ ] `sqlite3VdbePrintSql` — empty body; debug aid that prints
+            `SQL: [...]` from `p^.zSql` or OP_Init's p4.
+       [ ] `sqlite3VdbeIOTraceSql` — empty body; emits compressed SQL
+            to `sqlite3IoTrace` callback.
+       [ ] `sqlite3VdbeComment` — empty body; stores per-op comment via
+            varargs `vdbeVComment` (debug builds only).
+       [ ] `sqlite3VdbeSetLineNumber` — empty body; one-liner
+            `sqlite3VdbeGetLastOp(v)^.iSrcLine := iLine`.
+       [ ] `sqlite3VdbePrintOp` — empty body; formatted opcode dump
+            via `sqlite3VdbeDisplayP4` + `sqlite3OpcodeName`.
+       [ ] `sqlite3VdbeAssertMayAbort` — returns `1`; debug-only
+            opcode-iterator verifying abort/FK counter consistency.
+       [ ] `sqlite3VdbeAssertAbortable` — empty; debug-only
+            `assert(p^.nWrite=0 or p^.usesStmtJournal)`.
+       [ ] `sqlite3VdbeNoJumpsOutsideSubrtn` — empty; debug-only
+            verifier scanning for cross-subroutine jumps.
+       [ ] `sqlite3VdbeVerifyNoMallocRequired` — empty; debug-only
+            `assert(p^.nOp + N <= p^.nOpAlloc)`.
+       [ ] `sqlite3VdbeVerifyNoResultRow` — empty; debug-only loop
+            asserting no `OP_ResultRow` in `p^.aOp[]`.
+       [ ] `sqlite3VdbeEnter` / `sqlite3VdbeLeave` — empty; acquire /
+            release per-btree mutexes from `p^.lockMask`.  Required for
+            shared-cache / multi-thread builds.
+       [ ] `sqlite3VdbeCheckFkImmediate` / `sqlite3VdbeCheckFkDeferred`
+            — both return `0`; in C this is a single `sqlite3VdbeCheckFk(p,
+            deferred)` that walks the FK counter list.
+
+       Bytecode virtual table (vdbevtab.c):
+       [ ] `sqlite3VdbeBytecodeVtabInit` — returns `SQLITE_OK`; must
+            register `bytecode` and `tables_used` virtual tables via
+            `sqlite3_create_module`.
+
+       Resolver (resolve.c):
+       [ ] `sqlite3ResolveExprListNames` — returns `SQLITE_OK`; must
+            walk the expr list with `resolveExprStep` /
+            `resolveSelectStep` and propagate
+            `NC_HasAgg|NC_MinMaxAgg|NC_HasWin|NC_OrderAgg`.  Required
+            for query compilation.
+       [ ] `sqlite3ResolveOrderGroupBy` — returns `SQLITE_OK`; resolves
+            ORDER BY / GROUP BY positional aliases against `pSelect^.pEList`.
+       [ ] `sqlite3ExprColUsed` (resolve.c) — returns `0`; must compute
+            column-usage bitmask honouring `TF_HasGenerated` /
+            `COLFLAG_GENERATED` and the `BMS` cap.
+
+       Build / schema (build.c):
+       [ ] `sqlite3HasExplicitNulls` — returns `0`; must scan
+            `pList^.a[i].fg.bNulls` and raise
+            `"unsupported use of NULLS FIRST/LAST"`.
+       [ ] `sqlite3OpenTempDatabase` — returns `SQLITE_OK` without
+            opening anything; must call `sqlite3BtreeOpen` with
+            `SQLITE_OPEN_READWRITE | CREATE | EXCLUSIVE | DELETEONCLOSE
+            | TEMP_DB` and call `sqlite3BtreeSetPageSize`.  Stub →
+            `CREATE TEMP TABLE` silently broken.
+       [ ] `sqlite3IsShadowTableOf` — returns `0`; checks vtab module
+            `xShadowName` callback.
+       [ ] `sqlite3ShadowTableName` — returns `0`; splits name at last
+            `_` and looks up parent vtab via `sqlite3FindTable`.
+       [ ] `sqlite3ReadOnlyShadowTables` — returns `0`; returns 1 when
+            `SQLITE_Defensive` is set, `pVtabCtx=nil`, `nVdbeExec=0`,
+            and not `sqlite3VtabInSync`.
+
+       Foreign keys (fkey.c):
+       [ ] `sqlite3FkReferences` — returns `nil`; one-liner
+            `sqlite3HashFind(@pTab^.pSchema^.fkeyHash, pTab^.zName)`.
+       [ ] `sqlite3FkRequired` — returns `0`; full FK-required decision
+            walking `pFKey` / parent-key change masks.
+
+       Pragma (pragma.c):
+       [ ] `sqlite3PragmaVtabRegister` — returns `nil`; registers
+            `pragma_*` eponymous virtual tables via
+            `sqlite3VtabCreateModule` + `pragmaVtabModule`.
+
+       Btree mutex (btmutex.c / btree.c):
+       [ ] `sqlite3BtreeHoldsAllMutexes` — returns `1`; in C walks
+            `db^.aDb[]` checking each shared btree's mutex.  Acceptable
+            in single-threaded mode but must be ported for shared cache.
+       [ ] `sqlite3BtreeSchemaLocked` — returns `0`; in C calls
+            `querySharedCacheTableLock(p, SCHEMA_ROOT, READ_LOCK)`.
+            Acceptable without shared cache; required otherwise.
+
 - [ ] **6.9-bis 11g.2.b** Port `sqlite3WhereBegin` / `sqlite3WhereEnd` in full.  
     Bookkeeping primitives, prologue,
     cleanup contract, and several leaf helpers (codeCompare cluster,
@@ -401,6 +511,90 @@ Important: At the end of this document, please find:
 
 ## Phase 7 — Parser (one gate open)
 
+- [ ] **7.1.1** Schema initialisation (prepare.c).  Currently
+       `sqlite3ReadSchema` (codegen.pas:21928) returns `SQLITE_OK`
+       without reading anything; tests pre-populate the schema.  Port
+       in full:
+       [ ] `sqlite3ReadSchema` — drive the schema-load query.
+       [ ] `sqlite3Init` / `sqlite3InitOne` (prepare.c) — read each
+            sqlite_master row and parse its CREATE statement via
+            `sqlite3NestedParse`.
+       [ ] `sqlite3InitCallback` (main.pas:2063) — currently installs
+            only system tables; full body parses each schema row.
+       [ ] `schemaIsValid` / `sqlite3SchemaToIndex` plumbing.
+
+- [ ] **7.1.2** `sqlite3NestedParse` full driver (build.c).  The
+       current skeleton (codegen.pas:25041) early-exits when
+       `zFormat=nil`; printf-formatted call sites for DROP/UPDATE
+       sqlite_master are still wired with `nil`.  Required for:
+       DROP TABLE autovacuum follow-on (current Δ=26 — see 6.11), the
+       CREATE TABLE schema-row INSERT, and the destroyRootPage
+       UPDATE sqlite_master path.  Closes the last contributor of
+       6.11(b).
+
+- [ ] **7.1.3** Statement re-prepare / SQL plumbing (vdbeaux.c,
+       prepare.c):
+       [ ] `sqlite3VdbeSetSql` (codegen.pas:25246) — stub returns
+            `SQLITE_OK`; must store SQL text in `Vdbe^.zSql`.
+       [ ] `sqlite3Reprepare` (codegen.pas:25295) — re-prepare a
+            statement after schema change.
+       [ ] `sqlite3TransferBindings` (codegen.pas:25216) — copy
+            bindings from old stmt to new.
+       [ ] `sqlite3VdbeResetStepResult` — currently stub.
+       [ ] `sqlite3_prepare16` / `sqlite3_prepare16_v2` /
+            `sqlite3_prepare16_v3` (codegen.pas:25117..25130) — UTF-16
+            wrappers around the UTF-8 prepare path.
+
+- [ ] **7.1.4** DbFixer — schema-name fixups for ATTACH (attach.c).
+       All four currently return `SQLITE_OK` no-op:
+       [ ] `sqlite3FixSrcList` (codegen.pas:25395).
+       [ ] `sqlite3FixSelect` (codegen.pas:25400).
+       [ ] `sqlite3FixExpr` (codegen.pas:25405).
+       [ ] `sqlite3FixTriggerStep` (codegen.pas:25410).
+
+- [ ] **7.1.5** Constraint / abort plumbing (build.c, insert.c) —
+       empty-body stubs that affect VDBE abort/halt semantics:
+       [ ] `sqlite3MayAbort` (codegen.pas:24759) — set the `mayAbort`
+            flag on parse + propagate to halt.
+       [ ] `sqlite3HaltConstraint` (codegen.pas:24842) — emit
+            `OP_Halt` with constraint error code.
+       [ ] `sqlite3RowidConstraint` (codegen.pas:24870) — wraps
+            `HaltConstraint` for IPK conflict.
+
+- [ ] **7.1.6** Btree mutex acquisition (btmutex.c) — empty stubs
+       (siblings of the 6.8 mutex entries):
+       [ ] `sqlite3BtreeEnterAll` (codegen.pas:25221).
+       [ ] `sqlite3BtreeLeaveAll` (codegen.pas:25226).
+
+- [ ] **7.1.7** Lemon parser tail (parse.c epilogue) — gaps inside
+       `passqlite3parser.pas`:
+       [ ] `sqlite3ParserFallback` — stubbed as 0 (parser.pas:1070);
+            needs the Lemon fallback table.
+       [ ] `yy_accept` / `yy_parse_failed` / `yy_syntax_error` —
+            stub bodies (parser.pas:1444).
+       [ ] Per-rule reduce actions (Phase 7.2e) — several rule arms
+            still TODO and gated on the codegen Phase 7 stubs
+            (NestedParse, BeginWriteOperation, FK actions, etc.).
+       [ ] `sqlite3RenameToken` / `sqlite3RenameTokenMap` /
+            `sqlite3RenameExprUnmap` — needed for `PARSE_MODE_RENAME`
+            (currently no-ops; OK in normal mode).
+
+- [ ] **7.1.8** ATTACH / DETACH (attach.c) — currently Phase 7 stubs
+       at codegen.pas:25213/25218.  Must open the attached btree,
+       allocate `aDb[]` slot, run schema load.  (Overlaps 6.27 — move
+       here when ported.)
+
+- [ ] **7.1.9** ALTER TABLE (alter.c) — full bodies for the stubs at
+       codegen.pas:25347+:
+       [ ] `sqlite3AlterRenameTable`, `sqlite3AlterRenameColumn`.
+       [ ] `sqlite3AlterDropColumn`, `sqlite3AlterDropConstraint`.
+       [ ] `sqlite3AlterSetNotNull`, `sqlite3AlterAddConstraint`.
+       [ ] `sqlite3AlterBeginAddColumn`, `sqlite3AlterFinishAddColumn`.
+       [ ] `sqlite3AlterFunctions` — registers the rename-helper SQL
+            functions.
+       [ ] `sqlite3RenameTokenRemap`, `sqlite3RenameExprlistUnmap`.
+       (Overlaps 6.22 / 6.27 — move here when ported.)
+
 - [ ] **7.4b** Bytecode-diff scope of `TestParser.pas`.  Now that
   Phase 8.2 wires `sqlite3_prepare_v2` end-to-end, extend `TestParser`
   to dump and diff the resulting VDBE program (opcode + p1 + p2 + p3
@@ -416,6 +610,134 @@ Important: At the end of this document, please find:
 ---
 
 ## Phase 8 — Public API (one gate open)
+
+Public-API gap analysis 2026-04-28: `../sqlite3/src/sqlite.h.in` exports
+~238 `sqlite3_*` symbols; the Pascal port currently exposes ~156.  The
+items below enumerate every missing symbol grouped by sub-phase.
+Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
+(`sqlite3_int64`, `sqlite3_uint64`, opaque struct names) are excluded.
+
+- [ ] **8.1.1** Connection-lifecycle gaps (main.c):
+       [ ] `sqlite3_open16` — UTF-16 filename open.
+       [ ] `sqlite3_db_readonly` (main.c:5232) — per-db read-only flag.
+       [ ] `sqlite3_db_release_memory` (main.c) — release pager / pcache
+            memory for a connection.
+       [ ] `sqlite3_db_status` / `sqlite3_db_status64` (status.c) — per-
+            connection counters (LOOKASIDE_USED, CACHE_HIT etc.).
+       [ ] `sqlite3_db_cacheflush` (main.c:1986) — flush dirty pages.
+       [ ] `sqlite3_db_config` — raw varargs entry point (currently only
+            typed wrappers `_text`/`_lookaside`/`_int` exist).
+       [ ] `sqlite3_get_autocommit` (main.c:5249) — query auto-commit
+            state.
+       [ ] `sqlite3_txn_state` (main.c) — `SQLITE_TXN_NONE / READ / WRITE`.
+       [ ] `sqlite3_filename` / `sqlite3_free_filename` — VFS filename
+            helpers.
+       [ ] `sqlite3_set_clientdata` — typed pointer slots on the db.
+
+- [ ] **8.2.1** Statement-introspection gaps (vdbeapi.c):
+       [ ] `sqlite3_stmt_busy` (vdbeapi.c) — has the stmt been stepped?
+       [ ] `sqlite3_stmt_readonly` — true if stmt has no side effects.
+       [ ] `sqlite3_stmt_explain` — current explain mode (0/1/2).
+       [ ] `sqlite3_stmt_status` — per-stmt counters.
+       [ ] `sqlite3_stmt_scanstatus` / `_scanstatus_v2` /
+            `_scanstatus_reset` — gated on the 6.8
+            `sqlite3VdbeScanStatus*` arms landing first.
+
+- [ ] **8.3.1** Bind variants (vdbeapi.c):
+       [ ] `sqlite3_bind_blob64` — i64-length blob bind.
+       [ ] `sqlite3_bind_text16` — UTF-16 text bind.
+       [ ] `sqlite3_bind_text64` — i64-length text bind.
+       [ ] `sqlite3_bind_zeroblob` / `_zeroblob64` — zero-filled blob.
+       [ ] `sqlite3_bind_pointer` — typed pointer bind.
+       [ ] `sqlite3_bind_parameter_index` — name → 1-based index.
+
+- [ ] **8.3.2** Result / value variants (vdbeapi.c, vdbemem.c):
+       [ ] `sqlite3_result_blob64`.
+       [ ] `sqlite3_result_text16` / `_text16be` / `_text16le`.
+       [ ] `sqlite3_result_error16` — UTF-16 error string.
+       [ ] `sqlite3_result_error_code` — set rc without msg.
+       [ ] `sqlite3_result_pointer` — typed pointer result.
+       [ ] `sqlite3_result_zeroblob`.
+       [ ] `sqlite3_value_bytes16`.
+       [ ] `sqlite3_value_encoding`.
+       [ ] `sqlite3_value_numeric_type`.
+       [ ] `sqlite3_column_bytes16`.
+
+- [ ] **8.3.3** Collation / function UTF-16 wrappers:
+       [ ] `sqlite3_create_collation16`.
+       [ ] `sqlite3_create_function16`.
+       [ ] `sqlite3_collation_needed16`.
+       [ ] `sqlite3_complete16` — UTF-16 statement completeness.
+
+- [ ] **8.4.1** Hooks / control / change-counter / errors / limits
+       (main.c, status.c):
+       [ ] `sqlite3_progress_handler` — set per-vdbe progress callback.
+       [ ] `sqlite3_autovacuum_pages` — per-db autovacuum hook.
+       [ ] `sqlite3_interrupt` / `sqlite3_is_interrupted` —
+            cooperative interrupt.
+       [ ] `sqlite3_changes` / `sqlite3_changes64` — last-stmt change
+            count.
+       [ ] `sqlite3_total_changes` / `_total_changes64` — connection
+            change count.
+       [ ] `sqlite3_last_insert_rowid` / `_set_last_insert_rowid`.
+       [ ] `sqlite3_errcode` / `sqlite3_extended_errcode` /
+            `sqlite3_extended_result_codes`.
+       [ ] `sqlite3_set_errmsg` — overwrite db^.pErr.
+       [ ] `sqlite3_error_offset` — byte offset of the error in zSql.
+       [ ] `sqlite3_system_errno` — last OS-level error.
+       [ ] `sqlite3_libversion_number` — int form of version.
+       [ ] `sqlite3_threadsafe` — compile-time threadsafe mode.
+       [ ] `sqlite3_sleep` — millisecond sleep via VFS xSleep.
+       [ ] `sqlite3_setlk_timeout` — POSIX lock timeout.
+       [ ] `sqlite3_msize` — allocated size of a malloc block.
+       [ ] `sqlite3_release_memory` — release shared cache memory.
+       [ ] `sqlite3_memory_highwater` — peak alloc.
+       [ ] `sqlite3_soft_heap_limit64` / `sqlite3_hard_heap_limit64`.
+       [ ] `sqlite3_limit` — per-db SQLITE_LIMIT_* getter/setter.
+       [ ] `sqlite3_uri_int64` — URI-parameter integer accessor.
+       [ ] `sqlite3_compileoption_used` (ctime.c) — also gated on the
+            6.10 step 12 task that touches the compile-options table.
+       [ ] `sqlite3_test_control` — testing back-door (subset).
+       [ ] `sqlite3_file_control` — opcode dispatcher into VFS xFileControl.
+       [ ] `sqlite3_overload_function` — vtab-overloaded scalar.
+       [ ] `sqlite3_table_column_metadata` — column metadata getter.
+
+- [ ] **8.5.1** Dynamic string builder API (`sqlite3_str_*`,
+       printf.c):
+       [ ] `sqlite3_str_append`, `_appendall`, `_appendchar`,
+            `_appendf`, `_vappendf`.
+       [ ] `sqlite3_str_errcode`, `_free`, `_length`, `_reset`,
+            `_truncate`.
+       [ ] `sqlite3_stricmp` — case-insensitive ASCII strcmp helper.
+
+- [ ] **8.7.1** Snapshot / WAL APIs:
+       [ ] `sqlite3_snapshot_get` / `_open` / `_free` / `_cmp` /
+            `_recover`.
+       [ ] `sqlite3_wal_autocheckpoint`.
+       [ ] `sqlite3_wal_checkpoint` / `_v2`.
+
+- [ ] **8.7.2** Backup / serialization (currently `sqlite3_backup_init`
+       / `_step` / `_finish` exist; the remaining surface is missing):
+       [ ] `sqlite3_deserialize` — open in-memory db from a buffer.
+
+- [ ] **8.8.1** Pre-update hook (preupdate.c — `SQLITE_ENABLE_PREUPDATE_HOOK`):
+       [ ] `sqlite3_preupdate_count` / `_new` / `_old` / `_depth` /
+            `_blobwrite`.
+
+- [ ] **8.9.1** Vtab helper APIs (vtab.c, vdbeapi.c):
+       [ ] `sqlite3_vtab_distinct` — query-planner DISTINCT hint.
+       [ ] `sqlite3_vtab_in` / `_in_first` / `_in_next` — IN-operator
+            helpers.
+       [ ] `sqlite3_vtab_nochange` — true when UPDATE doesn't change col.
+       [ ] `sqlite3_vtab_rhs_value` — extract RHS value of a constraint.
+
+- [ ] **8.9.2** Carray / shared-cache / misc:
+       [ ] `sqlite3_carray_bind` / `_carray_bind_v2` (carray.c) — bind a
+            C array to a prepared stmt.
+       [ ] `sqlite3_enable_shared_cache` — process-wide shared-cache
+            toggle.
+       [ ] `sqlite3_activate_cerod` — CEROD extension activator
+            (deprecated; trivial stub).
 
 - [ ] **8.10** Public-API sample-program gate.  Pascal
   transliterations of the sample programs in `../sqlite3/src/shell.c.in`
@@ -434,10 +756,35 @@ dot-commands must return the upstream
 `Error: unknown command or invalid arguments: ".foo"` so partial
 landings cannot silently no-op.
 
+Sub-tasks 10.1.x decompose 10.1a..10.1f into one item per dot-command
+or helper.  Source references are line ranges in
+`../sqlite3/src/shell.c.in`.  No `passqlite3shell.pas` exists yet, so
+*every* item is missing — this list exists to break the 13 816-line
+file into reviewable chunks.
+
 - [ ] **10.1a** Skeleton + arg parsing + REPL loop.  Entry point,
   command-line flag parser, `ShellState` struct, line reader,
   prompts, the read-eval-print loop, statement-completeness via
   `sqlite3_complete`, exit codes.  Gate: `tests/cli/10a_repl/`.
+
+  [ ] **10.1.1** `ShellState` record + global state (shell.c.in
+       `struct ShellState` ~3650).  Counters, mode flags, current
+       output FILE*, prompt strings, history settings.
+  [ ] **10.1.2** `process_input` / `one_input_line` REPL core
+       (~12530..12700).  Statement-completeness via `sqlite3_complete`,
+       continuation-prompt switching, `.echo` plumbing.
+  [ ] **10.1.3** `main` + `process_command_line` argument parser
+       (~13200..13816).  All `-bail`, `-batch`, `-cmd`, `-init`,
+       `-readonly`, `-newline`, `-mode`, `-separator`, `-nullvalue`,
+       `-header`, `-version`, etc.
+  [ ] **10.1.4** Line reader / readline integration
+       (`local_getline` + `shell_readline`).  Includes basic edit
+       support when linked without GNU readline.
+  [ ] **10.1.5** Exit-code mapping + `interrupt_handler` + signal wiring.
+  [ ] **10.1.6** `do_meta_command` dispatcher skeleton (~9100) —
+       parses `.foo` lines, splits into `azArg[]`, invokes per-command
+       handler.  Initially returns "unknown command" for everything;
+       per-command handlers land in the 10.1.7..10.1.42 sub-tasks.
 
 - [ ] **10.1b** Output modes + formatting controls.  `.mode`
   (`list`, `line`, `column`, `csv`, `tabs`, `html`, `insert`, `quote`,
@@ -446,20 +793,98 @@ landings cannot silently no-op.
   `.print` / `.parameter` (formatting-only subset), Unicode-width
   helpers, box-drawing renderer.  Gate: `tests/cli/10b_modes/`.
 
+  [ ] **10.1.7** `.mode` dispatcher (~10470) — parses mode name +
+       optional table-name argument, sets `p->mode` / `p->cMode`.
+  [ ] **10.1.8** `shell_callback` row dispatcher + per-mode renderers
+       (`exec_prepared_stmt_columnar`, `exec_prepared_stmt`).
+       Renderers: `MODE_Line`, `MODE_List`, `MODE_Semi`, `MODE_Csv`,
+       `MODE_Tcl`, `MODE_Insert`, `MODE_Quote`, `MODE_Html`,
+       `MODE_Json`, `MODE_Ascii`, `MODE_Pretty`.
+  [ ] **10.1.9** Columnar renderers — `MODE_Column`, `MODE_Table`,
+       `MODE_Markdown`, `MODE_Box`.  Column-width auto-sizing,
+       `utf8_width` / `utf8_printf` helpers, box-drawing glyphs.
+  [ ] **10.1.10** `.headers` / `.separator` / `.nullvalue` / `.width`
+       / `.echo` / `.changes` setters.
+  [ ] **10.1.11** `.print` / `.parameter` (formatting subset) —
+       `.parameter init / list / set / unset / clear`.
+  [ ] **10.1.12** CSV writer helpers (`output_csv`, `output_quoted_string`,
+       `output_quoted_escaped_string`) + `.nullvalue` integration.
+  [ ] **10.1.13** JSON writer helpers (`output_json_string`).
+  [ ] **10.1.14** HTML writer helpers (`output_html_string`).
+
 - [ ] **10.1c** Schema introspection dot-commands.  `.schema`,
   `.tables`, `.indexes`, `.databases`, `.fullschema`,
   `.lint fkey-indexes`, `.expert` (read-only subset).  Gate:
   `tests/cli/10c_schema/`.
 
+  [ ] **10.1.15** `.schema` + `.sqlite_schema` (shell.c.in
+       `do_meta_command` schema arm).  LIKE-pattern argument,
+       `--indent`, `--nosys` flags.
+  [ ] **10.1.16** `.tables` — runs the canonical
+       `SELECT name FROM sqlite_schema WHERE type IN ('table','view')`
+       query with column-formatted output.
+  [ ] **10.1.17** `.indexes` — per-table index listing.
+  [ ] **10.1.18** `.databases` — list `main`/`temp`/attached files.
+  [ ] **10.1.19** `.fullschema` — schema + sqlite_stat1/4 dump.
+  [ ] **10.1.20** `.lint fkey-indexes` — runs the canonical FK-index
+       audit query.  Other `.lint` sub-options remain stubs.
+  [ ] **10.1.21** `.expert` — read-only subset wrapping the
+       sqlite3_expert.c module (deferred until that module is ported;
+       stub with the upstream "expert is disabled" message until then).
+
 - [ ] **10.1d** Data I/O dot-commands.  `.read`, `.dump`, `.import`
   (CSV/ASCII), `.output` / `.once`, `.save`, `.open`.  Gate:
   `tests/cli/10d_io/`.
+
+  [ ] **10.1.22** `.read` — push a script file onto the input stack,
+       respecting `.echo` and recursion guard.
+  [ ] **10.1.23** `.dump` — full schema-and-data dump.  Per-row
+       INSERT generation via `run_schema_dump_query` +
+       `run_table_dump_query` + `output_quoted_escaped_string`.
+       `--preserve-rowids`, `--newlines`, `--data-only`.
+  [ ] **10.1.24** `.import` — CSV / ASCII import.  ImportCtx struct,
+       `csv_read_one_field`, `ascii_read_one_field`, auto-create
+       table from header row, transactional bulk-insert path.
+  [ ] **10.1.25** `.output` / `.once` — redirect to file / pipe /
+       stdout; `-x` (Excel) and `--bom` flags.
+  [ ] **10.1.26** `.save` — `VACUUM INTO 'file'` wrapper.
+  [ ] **10.1.27** `.open` — close current db and re-open with
+       `--readonly`, `--zip`, `--deserialize`, `--new`, `--nofollow`.
 
 - [ ] **10.1e** Meta / diagnostic dot-commands.  `.stats`, `.timer`,
   `.eqp`, `.explain`, `.show`, `.help`, `.shell`/`.system`, `.cd`,
   `.log`, `.trace`, `.iotrace`, `.scanstats`, `.testcase`,
   `.testctrl`, `.selecttrace`, `.wheretrace`.  Gate:
   `tests/cli/10e_meta/`.
+
+  [ ] **10.1.28** `.stats` — toggle per-stmt status counters output;
+       reads `sqlite3_stmt_status` for each opcode set.
+  [ ] **10.1.29** `.timer` — wall / user / sys clock around each
+       statement.
+  [ ] **10.1.30** `.eqp` — sets `EXPLAIN QUERY PLAN` auto-prefix mode.
+       (`off` / `on` / `trigger` / `full`).
+  [ ] **10.1.31** `.explain` — sets `EXPLAIN` auto-prefix mode and
+       formats the bytecode dump.
+  [ ] **10.1.32** `.show` — dump all current `ShellState` settings.
+  [ ] **10.1.33** `.help` — built-in help text dispatch
+       (`showHelp`, ~750-line static help table).
+  [ ] **10.1.34** `.shell` / `.system` — fork+exec, `popen`, capture
+       output to current `.output` sink.
+  [ ] **10.1.35** `.cd` — `chdir` wrapper.
+  [ ] **10.1.36** `.log` — opens / closes a logging FILE* + wires
+       `sqlite3_config(SQLITE_CONFIG_LOG, …)`.
+  [ ] **10.1.37** `.trace` — installs `sqlite3_trace_v2` callback
+       (`stmt` / `profile` / `row` / `close`).
+  [ ] **10.1.38** `.iotrace` — wires `sqlite3IoTrace` (gated on the
+       6.8 `sqlite3VdbeIOTraceSql` arm landing first).
+  [ ] **10.1.39** `.scanstats` — gated on the 6.8
+       `sqlite3VdbeScanStatus*` arms + 8.2.1 `sqlite3_stmt_scanstatus`.
+  [ ] **10.1.40** `.testcase` / `.check` — testcase output capture
+       used by the upstream test runner.
+  [ ] **10.1.41** `.testctrl` — `sqlite3_test_control` opcode
+       dispatcher (gated on 8.4.1).
+  [ ] **10.1.42** `.selecttrace` / `.wheretrace` / `.treetrace` —
+       compile-time-debug toggles wrapping `sqlite3_test_control`.
 
 - [ ] **10.1f** Long-tail / specialised dot-commands.  `.backup`,
   `.restore`, `.clone`, `.archive`/`.ar`, `.session`, `.recover`,
@@ -468,6 +893,44 @@ landings cannot silently no-op.
   `.vfsname`.  Out-of-scope dependencies (session, archive, recover)
   may stub with the upstream `SQLITE_OMIT_*` "feature not compiled
   in" message.  Gate: `tests/cli/10f_misc/`.
+
+  [ ] **10.1.43** `.backup` — `sqlite3_backup_init/_step/_finish`
+       wrapper writing to the destination file.
+  [ ] **10.1.44** `.restore` — symmetric, source = file.
+  [ ] **10.1.45** `.clone` — combines backup + reattach (multi-db
+       variant of `.backup`).
+  [ ] **10.1.46** `.archive` / `.ar` — sqlar reader/writer; gated on
+       sqlar extension.  Stub with omit-message until that lands.
+  [ ] **10.1.47** `.session` — session-extension dispatcher
+       (`attach`, `enable`, `filter`, `indirect`, `isempty`, `list`,
+       `changeset`, `patchset`).  Gated on session extension; stub
+       with omit-message.
+  [ ] **10.1.48** `.recover` — corruption-recovery extension dispatcher.
+       Gated on recover extension; stub with omit-message.
+  [ ] **10.1.49** `.dbinfo` — runs the canonical
+       `pragma_database_list` + page-1 header dump.
+  [ ] **10.1.50** `.dbconfig` — `sqlite3_db_config` opcode dispatcher
+       (gated on 8.1.1 raw-varargs `sqlite3_db_config`).
+  [ ] **10.1.51** `.filectrl` — `sqlite3_file_control` opcode
+       dispatcher (gated on 8.4.1).
+  [ ] **10.1.52** `.sha3sum` — runs the SHA3 hash extension over
+       schema + data.  Bundles a Pascal SHA3 implementation or links
+       the existing extension.
+  [ ] **10.1.53** `.crnl` — toggles CR-NL translation on Windows
+       output (no-op on Linux).
+  [ ] **10.1.54** `.binary` — toggles binary stdout mode (no-op on
+       Linux).
+  [ ] **10.1.55** `.connection` — multi-connection switching
+       (`.connection 0..N`, `.connection close N`).
+  [ ] **10.1.56** `.unmodule` — `sqlite3_drop_modules` wrapper.
+  [ ] **10.1.57** `.vfsinfo` / `.vfslist` / `.vfsname` — VFS
+       introspection via `sqlite3_file_control`
+       (`SQLITE_FCNTL_VFS_POINTER`).
+  [ ] **10.1.58** `.dbtotxt` — page-by-page hex dump (used by the
+       upstream `dbsqlfuzz` corpus); gated on the bytecode of the
+       db being readable, no extension dependency.
+  [ ] **10.1.59** `.breakpoint` — debug-only no-op breakpoint
+       target (one-line stub).
 
 - [ ] **10.2** Integration parity: `bin/passqlite3 foo.db` ↔
   `sqlite3 foo.db` on a scripted corpus that unions all 10.1a..f
