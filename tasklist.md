@@ -151,23 +151,35 @@ Important: At the end of this document, please find:
        (`addModuleArgument` already fully ported — parser.pas:2020.
        `sqlite3Reindex` ported in full — parser.pas:1821.)
   [ ] **6.21** port vdbe.pas stubs in full from C to pascal:
-       `sqlite3VdbeMultiLoad`, `sqlite3VdbeScanStatus`,
-       `sqlite3VdbeScanStatusRange`, `sqlite3VdbeSetP4KeyInfo`,
-       `sqlite3VdbeExplainParent`, `sqlite3ExplainBreakpoint`,
-       `sqlite3VdbeIncrWriteCounter`, `sqlite3VdbeDisplayComment`,
+       `sqlite3VdbeMultiLoad` (blocked: only used by pragma.c and
+       requires va_list — defer until 6.12 sqlite3Pragma lands),
+       `sqlite3VdbeScanStatus`, `sqlite3VdbeScanStatusRange`,
+       `sqlite3VdbeSetP4KeyInfo`, `sqlite3VdbeExplainParent`,
+       `sqlite3ExplainBreakpoint`, `sqlite3VdbeDisplayComment`,
        `sqlite3VdbeDisplayP4`, `sqlite3VdbeEnter`,
        `sqlite3VdbeFrameMemDel`, `sqlite3VdbeNextOpcode`,
        `sqlite3VdbeFrameRestore`, `sqlite3VdbeSetColName`,
        `sqlite3VdbeCloseStatement`, `sqlite3VdbeList`,
-       `sqlite3VdbePrintSql`, `sqlite3VdbeError`,
+       `sqlite3VdbePrintSql`,
        `sqlite3_blob_open`, `sqlite3VdbeLogAbort`,
-       `sqlite3VdbeSetChanges`, `sqlite3SystemError`,
        `sqlite3ResetOneSchema`, `sqlite3VdbeMemTranslate`,
        `sqlite3VdbeMemHandleBom`, `sqlite3ExpirePreparedStatements`,
        `sqlite3AnalysisLoad`, `sqlite3UnlinkAndDeleteTable`,
        `sqlite3UnlinkAndDeleteIndex`, `sqlite3UnlinkAndDeleteTrigger`,
        `sqlite3RootPageMoved`, `sqlite3FkClearTriggerCache`,
        `sqlite3ResetAllSchemasOfConnection`, `sqlite3Stat4ProbeFree`.
+       [X] `sqlite3VdbeError` — ported in full (vdbeaux.c:59).
+            Pas signature drops the va_list (every call site already
+            passes a pre-formatted plain string); strdups into db-tracked
+            memory after freeing prior message.
+       [X] `sqlite3VdbeSetChanges` — ported in full (vdbeaux.c:5305).
+       [X] `sqlite3SystemError` — ported in full (util.c:155);
+            `SQLITE_USE_SEH` arm gated off in default build, matches
+            default-build behaviour.
+       [X] `sqlite3VdbeIncrWriteCounter` — SQLITE_DEBUG-only
+            (vdbeaux.c:829); existing no-op matches default-build
+            behaviour exactly (release `Vdbe` record has no `nWrite`
+            field).
   [ ] **6.22** port codegen.pas rename / error-offset stubs in full from C
        to pascal:
        [X] `sqlite3RecordErrorOffsetOfExpr` — ported in full

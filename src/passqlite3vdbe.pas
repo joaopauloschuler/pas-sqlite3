@@ -3274,8 +3274,18 @@ begin
 end;
 
 procedure sqlite3VdbeError(p: PVdbe; zFormat: PAnsiChar);
+{ Port of vdbeaux.c:59.  C uses sqlite3VMPrintf to format zFormat with a
+  va_list and stores the result in p->zErrMsg.  Every Pas caller passes
+  an already-formatted plain string (no %-substitution required at this
+  layer — see callers in passqlite3vdbe.pas), so we duplicate the string
+  directly into db-tracked memory after freeing any prior message. }
 begin
-  { Stub — Phase 5.5 }
+  if p = nil then Exit;
+  sqlite3DbFree(p^.db, p^.zErrMsg);
+  if zFormat = nil then
+    p^.zErrMsg := nil
+  else
+    p^.zErrMsg := PAnsiChar(sqlite3DbStrDup(p^.db, PChar(zFormat)));
 end;
 
 procedure sqlite3VdbeSetSql(p: PVdbe; z: PAnsiChar; n: i32; prepFlags: u8);
@@ -4171,13 +4181,37 @@ begin
 end;
 
 procedure sqlite3VdbeSetChanges(db: Pointer; nChange: i64);
+{ Port of vdbeaux.c:5305.  Sets the per-connection change counter and
+  bumps the cumulative total — the value subsequently returned by
+  sqlite3_changes() / sqlite3_total_changes(). }
+var
+  pDb: PTsqlite3;
 begin
-  { Stub — Phase 6 (needs db->nChange) }
+  pDb := PTsqlite3(db);
+  if pDb = nil then Exit;
+  pDb^.nChange := nChange;
+  pDb^.nTotalChange := pDb^.nTotalChange + nChange;
 end;
 
 procedure sqlite3SystemError(db: Pointer; rc: i32);
+{ Port of util.c:155.  Records the host OS errno on the connection so
+  sqlite3_system_errno() can surface it.  SQLITE_USE_SEH path is gated
+  off in the default upstream build (and sqlite3PagerWalSystemErrno is
+  not a Pas symbol yet); we mirror the default-build body. }
+var
+  pDb:  PTsqlite3;
+  pVfs: Psqlite3_vfs;
 begin
-  { Stub — Phase 6 }
+  if rc = SQLITE_IOERR_NOMEM then Exit;
+  rc := rc and $FF;
+  if (rc = SQLITE_CANTOPEN) or (rc = SQLITE_IOERR) then
+  begin
+    pDb := PTsqlite3(db);
+    if pDb = nil then Exit;
+    pVfs := Psqlite3_vfs(pDb^.pVfs);
+    if (pVfs <> nil) and Assigned(pVfs^.xGetLastError) then
+      pDb^.iSysErrno := pVfs^.xGetLastError(pVfs, 0, nil);
+  end;
 end;
 
 procedure sqlite3ResetOneSchema(db: Pointer; iDb: i32);
