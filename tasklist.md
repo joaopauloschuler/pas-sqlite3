@@ -37,7 +37,10 @@ Important: At the end of this document, please find:
     are already ported.
       - [ ] port in full or re-enable `sqlite3Update`
       - [ ] port in full or re-enable `sqlite3GenerateConstraintChecks`
-      - [ ] port in full or re-enable `sqlite3CompleteInsertion`
+      - [X] port in full `sqlite3CompleteInsertion` (insert.c:2782..2847).
+        Function is ported and compiles; not yet wired into `sqlite3Insert`
+        (still inline-emits the OP_Insert path) so does not move Δ until
+        `sqlite3GenerateConstraintChecks` lands and call-site swaps over.
 - [ ] **6.9-complete** complete the porting of `sqlite3VdbeRecordCompare` and
   `sqlite3VdbeFindCompare` in FULL in `passqlite3btree.pas`.  Handles MEM_Int / MEM_IntReal - currently insufficient for general index lookup.
 
@@ -176,7 +179,8 @@ Important: At the end of this document, please find:
        `sqlite3AutoincrementEnd`, `sqlite3MultiValuesEnd`,
        `sqlite3MultiValues`, `autoIncBegin`,
        `sqlite3ExprReferencesUpdatedColumn`,
-       `sqlite3GenerateConstraintChecks`, `sqlite3CompleteInsertion`.
+       `sqlite3GenerateConstraintChecks`.
+       (`sqlite3CompleteInsertion` is now fully ported — see 6.9-bis 11g.2.b.)
   [ ] **6.25** port codegen.pas schema / index stubs in full from C to pascal:
        `sqlite3ReadSchema`, `sqlite3PrimaryKeyIndex`,
        `sqlite3CheckObjectName`, `sqlite3FreeIndex`,

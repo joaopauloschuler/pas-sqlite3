@@ -19648,12 +19648,90 @@ begin
   { No-op in the default (NULL_TRIM-disabled) build, matching upstream. }
 end;
 
-{ sqlite3CompleteInsertion — emit final OP_Insert/OP_IdxInsert (Phase 6.4 stub) }
+{ sqlite3CompleteInsertion — port of insert.c:2782..2847.
+  Generates code to finish the INSERT or UPDATE that was started by a prior
+  call to sqlite3GenerateConstraintChecks.  A consecutive range of registers
+  starting at regNewData contains the rowid and the content to be inserted.
+
+  codeWithoutRowidPreupdate is gated on SQLITE_ENABLE_PREUPDATE_HOOK in C
+  (insert.c:2753..2771); the default upstream build leaves it as a no-op
+  macro, so this port omits it (matches the default oracle build). }
 procedure sqlite3CompleteInsertion(pParse: PParse; pTab: PTable2;
   iDataCur: i32; iIdxCur: i32; regNewData: i32; aRegIdx: Pi32;
   update_flags: i32; appendBias: i32; useSeekResult: i32);
+var
+  v:         PVdbe;
+  pIdx:      PIndex2;
+  pik_flags: u8;
+  i:         i32;
+  nIdxCol:   i32;
 begin
-  { Phase 6.5 }
+  AssertH((update_flags = 0)
+       or (update_flags = OPFLAG_ISUPDATE)
+       or (update_flags = (OPFLAG_ISUPDATE or OPFLAG_SAVEPOSITION)),
+    'CompleteInsertion update_flags');
+
+  v := pParse^.pVdbe;
+  AssertH(v <> nil, 'CompleteInsertion v');
+  AssertH(not IsView(pTab), 'CompleteInsertion not view');
+
+  i := 0;
+  pIdx := pTab^.pIndex;
+  while pIdx <> nil do
+  begin
+    { All REPLACE indexes are at the end of the list. }
+    AssertH((pIdx^.onError <> OE_Replace)
+         or (pIdx^.pNext = nil)
+         or (pIdx^.pNext^.onError = OE_Replace),
+      'CompleteInsertion REPLACE order');
+    if (aRegIdx + i)^ = 0 then
+    begin
+      pIdx := pIdx^.pNext; Inc(i); Continue;
+    end;
+    if pIdx^.pPartIdxWhere <> nil then
+    begin
+      sqlite3VdbeAddOp2(v, OP_IsNull, (aRegIdx + i)^,
+        sqlite3VdbeCurrentAddr(v) + 2);
+      { VdbeCoverage(v) — debug-only no-op in release builds }
+    end;
+    if useSeekResult <> 0 then pik_flags := OPFLAG_USESEEKRESULT
+    else pik_flags := 0;
+    if ((pIdx^.idxFlags and 3) = SQLITE_IDXTYPE_PRIMARYKEY)
+       and (not HasRowid(pTab)) then
+    begin
+      pik_flags := pik_flags or OPFLAG_NCHANGE;
+      pik_flags := pik_flags or u8(update_flags and OPFLAG_SAVEPOSITION);
+      { codeWithoutRowidPreupdate is a no-op without
+        SQLITE_ENABLE_PREUPDATE_HOOK — see header comment. }
+    end;
+    if ((pIdx^.idxFlags shr 3) and 1) <> 0 then
+      nIdxCol := i32(pIdx^.nKeyCol)
+    else
+      nIdxCol := i32(pIdx^.nColumn);
+    sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iIdxCur + i, (aRegIdx + i)^,
+                         (aRegIdx + i)^ + 1, nIdxCol);
+    sqlite3VdbeChangeP5(v, pik_flags);
+    pIdx := pIdx^.pNext; Inc(i);
+  end;
+  if not HasRowid(pTab) then Exit;
+  if pParse^.nested <> 0 then
+    pik_flags := 0
+  else
+  begin
+    pik_flags := OPFLAG_NCHANGE;
+    if update_flags <> 0 then
+      pik_flags := pik_flags or u8(update_flags)
+    else
+      pik_flags := pik_flags or OPFLAG_LASTROWID;
+  end;
+  if appendBias <> 0 then
+    pik_flags := pik_flags or OPFLAG_APPEND;
+  if useSeekResult <> 0 then
+    pik_flags := pik_flags or OPFLAG_USESEEKRESULT;
+  sqlite3VdbeAddOp3(v, OP_Insert, iDataCur, (aRegIdx + i)^, regNewData);
+  if pParse^.nested = 0 then
+    sqlite3VdbeAppendP4(v, Pointer(pTab), P4_TABLE);
+  sqlite3VdbeChangeP5(v, pik_flags);
 end;
 
 { sqlite3OpenTableAndIndices — port of insert.c:2870.
