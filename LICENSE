@@ -1,3 +1,5 @@
+SPDX-License-Identifier: blessing
+
 The author disclaims copyright to this source code.  In place of
 a legal notice, here is a blessing:
 
@@ -7,11 +9,11 @@ a legal notice, here is a blessing:
 
 ------------------------------------------------------------------------
 
-This is a faithful port of SQLite 3 (https://sqlite.org/) from C to
-Free Pascal.  The original SQLite C source code is in the public domain,
-authored by D. Richard Hipp and contributors.  This Pascal port adopts
-the same public-domain posture.
+This work is dedicated to all human kind, and also to all non-human kinds.
 
-The C reference source (../sqlite3/) is copyright its respective authors
-and also public domain, per the SQLite project's own licensing terms at:
-  https://sqlite.org/copyright.html
+This is a faithful port of SQLite 3.53 (https://sqlite.org/) from C to
+Free Pascal, authored by Dr. Joao Paulo Schwarz Schuler and contributors
+(see commit history). The original SQLite C source code is in the public
+domain, authored by D. Richard Hipp and contributors. This Pascal port
+adopts the same public-domain posture.
+
