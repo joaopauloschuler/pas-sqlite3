@@ -24810,6 +24810,186 @@ begin
   sqlite3_result_int(pCtx, res);
 end;
 
+{ Math function tag values stored in pUserData (PtrInt).  Each scalar
+  arm of math1Func / math2Func / logFunc / ceilingFunc dispatches on
+  this tag in lieu of the C reference's libm function-pointer (which
+  Pascal cannot portably stash into a `Pointer` user-data slot). }
+const
+  MATH_TAG_SQRT     = 1;
+  MATH_TAG_EXP      = 2;
+  MATH_TAG_LN       = 3;
+  MATH_TAG_LOG10    = 4;
+  MATH_TAG_LOG2     = 5;
+  MATH_TAG_SIN      = 6;
+  MATH_TAG_COS      = 7;
+  MATH_TAG_TAN      = 8;
+  MATH_TAG_ASIN     = 9;
+  MATH_TAG_ACOS     = 10;
+  MATH_TAG_ATAN     = 11;
+  MATH_TAG_SINH     = 12;
+  MATH_TAG_COSH     = 13;
+  MATH_TAG_TANH     = 14;
+  MATH_TAG_ACOSH    = 15;
+  MATH_TAG_ASINH    = 16;
+  MATH_TAG_ATANH    = 17;
+  MATH_TAG_DEGTORAD = 18;
+  MATH_TAG_RADTODEG = 19;
+  MATH_TAG_POW      = 20;
+  MATH_TAG_ATAN2    = 21;
+  MATH_TAG_FMOD     = 22;
+  MATH_TAG_CEIL     = 23;
+  MATH_TAG_FLOOR    = 24;
+  MATH_TAG_TRUNC    = 25;
+
+{ valueIsNumericLike — returns 1 iff the Mem holds an int or real, or
+  is a TEXT/BLOB whose contents parse to numeric.  Mirrors C
+  sqlite3_value_numeric_type's filter (returning SQLITE_INTEGER /
+  SQLITE_FLOAT).  May coerce pVal in place via applyNumericAffinity. }
+function valueIsNumericLike(pVal: PMem): i32;
+var r: Double;
+begin
+  if (pVal^.flags and (MEM_Int or MEM_Real or MEM_IntReal)) <> 0 then begin
+    Result := 1; Exit;
+  end;
+  if (pVal^.flags and MEM_Null) <> 0 then begin
+    Result := 0; Exit;
+  end;
+  if (pVal^.flags and MEM_Str) <> 0 then begin
+    if sqlite3MemRealValueRC(pVal, r) <= 0 then begin
+      Result := 1; Exit;
+    end;
+  end;
+  Result := 0;
+end;
+
+{ ceilingFunc — port of func.c:2455.  ceil(X) / ceiling(X) / floor(X) /
+  trunc(X).  Integer args pass through unchanged; real args route to
+  the libm function selected by pUserData tag. }
+procedure ceilingFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pVal: PMem;
+  tag: PtrInt;
+  v, ans: Double;
+begin
+  pVal := argv^;
+  if not (valueIsNumericLike(pVal) <> 0) then Exit;
+  if (pVal^.flags and MEM_Int) <> 0 then begin
+    sqlite3_result_int64(pCtx, sqlite3_value_int64(Psqlite3_value(pVal)));
+    Exit;
+  end;
+  v := sqlite3_value_double(Psqlite3_value(pVal));
+  tag := PtrInt(sqlite3_user_data(pCtx));
+  case tag of
+    MATH_TAG_CEIL:  ans := Math.Ceil(v);
+    MATH_TAG_FLOOR: ans := Math.Floor(v);
+    MATH_TAG_TRUNC: ans := System.Int(v);
+  else
+    ans := v;
+  end;
+  sqlite3_result_double(pCtx, ans);
+end;
+
+{ logFunc — port of func.c:2505.  ln(X) / log(X) / log10(X) / log2(X) /
+  log(B,X).  Tag selects base when 1-arg; 2-arg form computes log_B(X). }
+procedure logFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pX, pB: PMem;
+  x, b, ans: Double;
+  tag: PtrInt;
+begin
+  pX := argv^;
+  if valueIsNumericLike(pX) = 0 then Exit;
+  x := sqlite3_value_double(Psqlite3_value(pX));
+  if x <= 0.0 then Exit;
+  if argc = 2 then begin
+    { log(B, X): pX is base, second arg is value (mirrors func.c:2521..2533) }
+    pB := PPMem(PtrUInt(argv) + SizeOf(PMem))^;
+    if valueIsNumericLike(pB) = 0 then Exit;
+    b := System.Ln(x);
+    if b <= 0.0 then Exit;
+    x := sqlite3_value_double(Psqlite3_value(pB));
+    if x <= 0.0 then Exit;
+    ans := System.Ln(x) / b;
+  end else begin
+    tag := PtrInt(sqlite3_user_data(pCtx));
+    case tag of
+      MATH_TAG_LOG10: ans := System.Ln(x) * 0.4342944819032517867;
+      MATH_TAG_LOG2:  ans := System.Ln(x) * 1.442695040888963456;
+    else
+      ans := System.Ln(x);
+    end;
+  end;
+  sqlite3_result_double(pCtx, ans);
+end;
+
+{ math1Func — port of func.c:2561.  Single-arg math function dispatched
+  via pUserData tag. }
+procedure math1Func(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pVal: PMem;
+  v, ans: Double;
+  tag: PtrInt;
+begin
+  pVal := argv^;
+  if valueIsNumericLike(pVal) = 0 then Exit;
+  v := sqlite3_value_double(Psqlite3_value(pVal));
+  tag := PtrInt(sqlite3_user_data(pCtx));
+  case tag of
+    MATH_TAG_SQRT:     ans := System.Sqrt(v);
+    MATH_TAG_EXP:      ans := System.Exp(v);
+    MATH_TAG_SIN:      ans := System.Sin(v);
+    MATH_TAG_COS:      ans := System.Cos(v);
+    MATH_TAG_TAN:      ans := Math.Tan(v);
+    MATH_TAG_ASIN:     ans := Math.ArcSin(v);
+    MATH_TAG_ACOS:     ans := Math.ArcCos(v);
+    MATH_TAG_ATAN:     ans := System.ArcTan(v);
+    MATH_TAG_SINH:     ans := Math.Sinh(v);
+    MATH_TAG_COSH:     ans := Math.Cosh(v);
+    MATH_TAG_TANH:     ans := Math.Tanh(v);
+    MATH_TAG_ACOSH:    ans := Math.arccosh(v);
+    MATH_TAG_ASINH:    ans := Math.arcsinh(v);
+    MATH_TAG_ATANH:    ans := Math.arctanh(v);
+    MATH_TAG_DEGTORAD: ans := v * (System.Pi / 180.0);
+    MATH_TAG_RADTODEG: ans := v * (180.0 / System.Pi);
+  else
+    ans := v;
+  end;
+  sqlite3_result_double(pCtx, ans);
+end;
+
+{ math2Func — port of func.c:2583.  Two-arg math function dispatched
+  via pUserData tag. }
+procedure math2Func(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  p0, p1: PMem;
+  v0, v1, ans: Double;
+  tag: PtrInt;
+begin
+  p0 := argv^;
+  p1 := PPMem(PtrUInt(argv) + SizeOf(PMem))^;
+  if valueIsNumericLike(p0) = 0 then Exit;
+  if valueIsNumericLike(p1) = 0 then Exit;
+  v0 := sqlite3_value_double(Psqlite3_value(p0));
+  v1 := sqlite3_value_double(Psqlite3_value(p1));
+  tag := PtrInt(sqlite3_user_data(pCtx));
+  case tag of
+    MATH_TAG_POW:   ans := Math.Power(v0, v1);
+    MATH_TAG_ATAN2: ans := Math.ArcTan2(v0, v1);
+    MATH_TAG_FMOD:
+      if v1 = 0.0 then Exit
+      else ans := v0 - System.Int(v0 / v1) * v1;
+  else
+    ans := v0;
+  end;
+  sqlite3_result_double(pCtx, ans);
+end;
+
+{ piFunc — port of func.c:2606.  0-arg pi() → M_PI as double. }
+procedure piFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  sqlite3_result_double(pCtx, System.Pi);
+end;
+
 procedure typeofFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   pVal: PMem;
@@ -26168,7 +26348,7 @@ const
   AGG_ENC  = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
 
 var
-  aBuiltinFuncs: array[0..50] of TFuncDef;
+  aBuiltinFuncs: array[0..77] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -26287,6 +26467,63 @@ begin
     sqlite3FindFunction's matchQuality treats negative nArg as variadic. }
   MakeFD(aBuiltinFuncs[49], -3, FUNC_ENC, @concatFunc,   nil, 'concat');
   MakeFD(aBuiltinFuncs[50], -4, FUNC_ENC, @concatwsFunc, nil, 'concat_ws');
+  { Math functions — port of func.c:3391..3425 (SQLITE_ENABLE_MATH_FUNCTIONS).
+    The C reference stashes a libm function pointer in pUserData and
+    dispatches via math1Func / math2Func / logFunc / ceilingFunc; the Pas
+    port stores a small integer tag (MATH_TAG_*) instead, since Pascal
+    cannot portably round-trip an arbitrary function pointer through a
+    Pointer slot.  Closes 6.10 step 12(c). }
+  MakeFD(aBuiltinFuncs[51], 1, FUNC_ENC, @ceilingFunc, nil, 'ceil');
+  aBuiltinFuncs[51].pUserData := Pointer(PtrInt(MATH_TAG_CEIL));
+  MakeFD(aBuiltinFuncs[52], 1, FUNC_ENC, @ceilingFunc, nil, 'ceiling');
+  aBuiltinFuncs[52].pUserData := Pointer(PtrInt(MATH_TAG_CEIL));
+  MakeFD(aBuiltinFuncs[53], 1, FUNC_ENC, @ceilingFunc, nil, 'floor');
+  aBuiltinFuncs[53].pUserData := Pointer(PtrInt(MATH_TAG_FLOOR));
+  MakeFD(aBuiltinFuncs[54], 1, FUNC_ENC, @ceilingFunc, nil, 'trunc');
+  aBuiltinFuncs[54].pUserData := Pointer(PtrInt(MATH_TAG_TRUNC));
+  MakeFD(aBuiltinFuncs[55], 1, FUNC_ENC, @logFunc,    nil, 'ln');
+  MakeFD(aBuiltinFuncs[56], 1, FUNC_ENC, @logFunc,    nil, 'log');
+  aBuiltinFuncs[56].pUserData := Pointer(PtrInt(MATH_TAG_LOG10));
+  MakeFD(aBuiltinFuncs[57], 1, FUNC_ENC, @logFunc,    nil, 'log10');
+  aBuiltinFuncs[57].pUserData := Pointer(PtrInt(MATH_TAG_LOG10));
+  MakeFD(aBuiltinFuncs[58], 1, FUNC_ENC, @logFunc,    nil, 'log2');
+  aBuiltinFuncs[58].pUserData := Pointer(PtrInt(MATH_TAG_LOG2));
+  MakeFD(aBuiltinFuncs[59], 2, FUNC_ENC, @logFunc,    nil, 'log');
+  MakeFD(aBuiltinFuncs[60], 1, FUNC_ENC, @math1Func,  nil, 'exp');
+  aBuiltinFuncs[60].pUserData := Pointer(PtrInt(MATH_TAG_EXP));
+  MakeFD(aBuiltinFuncs[61], 2, FUNC_ENC, @math2Func,  nil, 'pow');
+  aBuiltinFuncs[61].pUserData := Pointer(PtrInt(MATH_TAG_POW));
+  MakeFD(aBuiltinFuncs[62], 2, FUNC_ENC, @math2Func,  nil, 'power');
+  aBuiltinFuncs[62].pUserData := Pointer(PtrInt(MATH_TAG_POW));
+  MakeFD(aBuiltinFuncs[63], 2, FUNC_ENC, @math2Func,  nil, 'mod');
+  aBuiltinFuncs[63].pUserData := Pointer(PtrInt(MATH_TAG_FMOD));
+  MakeFD(aBuiltinFuncs[64], 1, FUNC_ENC, @math1Func,  nil, 'acos');
+  aBuiltinFuncs[64].pUserData := Pointer(PtrInt(MATH_TAG_ACOS));
+  MakeFD(aBuiltinFuncs[65], 1, FUNC_ENC, @math1Func,  nil, 'asin');
+  aBuiltinFuncs[65].pUserData := Pointer(PtrInt(MATH_TAG_ASIN));
+  MakeFD(aBuiltinFuncs[66], 1, FUNC_ENC, @math1Func,  nil, 'atan');
+  aBuiltinFuncs[66].pUserData := Pointer(PtrInt(MATH_TAG_ATAN));
+  MakeFD(aBuiltinFuncs[67], 2, FUNC_ENC, @math2Func,  nil, 'atan2');
+  aBuiltinFuncs[67].pUserData := Pointer(PtrInt(MATH_TAG_ATAN2));
+  MakeFD(aBuiltinFuncs[68], 1, FUNC_ENC, @math1Func,  nil, 'cos');
+  aBuiltinFuncs[68].pUserData := Pointer(PtrInt(MATH_TAG_COS));
+  MakeFD(aBuiltinFuncs[69], 1, FUNC_ENC, @math1Func,  nil, 'sin');
+  aBuiltinFuncs[69].pUserData := Pointer(PtrInt(MATH_TAG_SIN));
+  MakeFD(aBuiltinFuncs[70], 1, FUNC_ENC, @math1Func,  nil, 'tan');
+  aBuiltinFuncs[70].pUserData := Pointer(PtrInt(MATH_TAG_TAN));
+  MakeFD(aBuiltinFuncs[71], 1, FUNC_ENC, @math1Func,  nil, 'cosh');
+  aBuiltinFuncs[71].pUserData := Pointer(PtrInt(MATH_TAG_COSH));
+  MakeFD(aBuiltinFuncs[72], 1, FUNC_ENC, @math1Func,  nil, 'sinh');
+  aBuiltinFuncs[72].pUserData := Pointer(PtrInt(MATH_TAG_SINH));
+  MakeFD(aBuiltinFuncs[73], 1, FUNC_ENC, @math1Func,  nil, 'tanh');
+  aBuiltinFuncs[73].pUserData := Pointer(PtrInt(MATH_TAG_TANH));
+  MakeFD(aBuiltinFuncs[74], 1, FUNC_ENC, @math1Func,  nil, 'sqrt');
+  aBuiltinFuncs[74].pUserData := Pointer(PtrInt(MATH_TAG_SQRT));
+  MakeFD(aBuiltinFuncs[75], 1, FUNC_ENC, @math1Func,  nil, 'radians');
+  aBuiltinFuncs[75].pUserData := Pointer(PtrInt(MATH_TAG_DEGTORAD));
+  MakeFD(aBuiltinFuncs[76], 1, FUNC_ENC, @math1Func,  nil, 'degrees');
+  aBuiltinFuncs[76].pUserData := Pointer(PtrInt(MATH_TAG_RADTODEG));
+  MakeFD(aBuiltinFuncs[77], 0, FUNC_ENC, @piFunc,    nil, 'pi');
 end;
 
 var

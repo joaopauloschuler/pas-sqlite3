@@ -418,9 +418,11 @@ Important: At the end of this document, please find:
   [ ] **6.10 step 12** Runtime divergences surfaced by the new
       `src/tests/DiagMoreFunc.pas` probe (built-in functions / expression
       edges).  Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagMoreFunc`.
-      Initial run 2026-04-28 reported 27 divergences; 11 remain after
+      Initial run 2026-04-28 reported 27 divergences; 2 remain after
       fixes to TRUE/FALSE, printf width/flags, %e, %c, %q, %Q,
-      TK_AND/TK_OR/TK_BETWEEN/TK_IN scalar arms.
+      TK_AND/TK_OR/TK_BETWEEN/TK_IN scalar arms, and math-function
+      registration.  Both remaining divergences are `count(*)` /
+      `sum(5)` no-FROM — same root cause as 6.10 step 7(c).
       [X] **a) Default arm of `sqlite3ExprCodeTarget` emits OP_Null
         for TK_BETWEEN / TK_IN / TK_AND / TK_OR.**  Fixed 2026-04-28.
         Ported the four scalar arms from expr.c:5208..5512 — TK_AND/
@@ -444,14 +446,21 @@ Important: At the end of this document, please find:
         the new bare-TK_ID arm right after).  DiagMoreFunc TRUE /
         FALSE → PASS; TestExplainParity unchanged (1012 pass / 14
         diverge).
-      [ ] **c) Math functions not registered.**  `sqrt`, `exp`,
-        `ln`, `pow`, `sin`, `cos`, `floor`, `ceil`, `pi` (and all
-        of `func.c:mathRoll[]`) prepare-fail on Pas with
-        `SQLITE_ERROR` ("no such function").  Upstream registers
-        them in `sqlite3RegisterMathFunctions` (func.c:2700..2800)
-        gated on SQLITE_ENABLE_MATH_FUNCTIONS — flag is on per
-        `passqlite3.inc`.  Port the table + helper functions and
-        wire from `sqlite3RegisterBuiltinFunctions`.
+      [X] **c) Math functions not registered.**  Fixed 2026-04-28.
+        Ported `ceilingFunc`, `logFunc`, `math1Func`, `math2Func`,
+        `piFunc` (func.c:2455..2614) and registered the full
+        `func.c:3391..3425` math table — ceil/ceiling/floor/trunc,
+        ln/log/log10/log2/log(B,X), exp, pow/power/mod, acos/asin/
+        atan/atan2, cos/sin/tan, cosh/sinh/tanh, acosh/asinh/atanh,
+        sqrt, radians, degrees, pi.  C reference stashes a libm
+        function pointer in `pUserData`; the Pas port stores a
+        small integer tag (`MATH_TAG_*`) instead, since Pascal
+        cannot portably round-trip an arbitrary function pointer
+        through a `Pointer` slot.  `valueIsNumericLike` mirrors C's
+        `sqlite3_value_numeric_type` filter (returns 1 for int/real
+        or TEXT/BLOB that parse to numeric).  DiagMoreFunc sqrt /
+        exp / ln / pow / sin / cos / floor / ceil / pi → all PASS;
+        TestExplainParity unchanged (1012 pass / 14 diverge).
       [X] **d) printf/format width / flag specifiers** — fixed
         2026-04-28.  Added `ApplyIntWidth` / `FmtSignedInt` helpers
         that honour width / '-' / '0' / '+' / ' ' flags for integer
