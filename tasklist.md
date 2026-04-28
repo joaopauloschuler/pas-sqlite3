@@ -267,14 +267,6 @@ Important: At the end of this document, please find:
         `SELECT count(*) FROM pragma_table_info('t')` returns no row.
         Tracked under 6.12 (sqlite3Pragma).
 
-  [X] **6.10 step 10** DiagFunctions — all divergences closed (65/0
-      verified 2026-04-28).
-
-  [X] **6.10 step 11** DiagDate — all divergences closed (41/0 verified
-      2026-04-28).
-
-  [X] **6.10 step 12** DiagMoreFunc — all divergences closed.
-
   [ ] **6.10 step 15** Runtime divergences surfaced by the new
       `src/tests/DiagTxn.pas` probe (transactions, savepoints, conflict
       resolution, ROWID/IPK alias edges, BLOB literals, PRAGMA round-trips,
