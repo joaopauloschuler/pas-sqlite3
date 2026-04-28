@@ -9,6 +9,7 @@ unit passqlite3wal;
 interface
 
 uses
+  SysUtils,
   passqlite3types, passqlite3internal, passqlite3os, passqlite3util,
   passqlite3pcache, ctypes;
 
@@ -242,12 +243,23 @@ begin
   end;
 end;
 
-{ Local sqlite3_log stub — full impl deferred to Phase 8 (main.c) }
+{ printf.c:1499 — sqlite3_log.  C uses varargs + sqlite3_str_vappendf to
+  format zFormat; Pas callers pre-render the message with Format() and
+  pass it as zMsg, so this port skips the format step and dispatches the
+  finished message directly to the configured xLog callback.  Local
+  copy in this unit avoids pulling pager.pas into the uses graph. }
+type
+  TSqlite3LogCallbackWal = procedure(pArg: Pointer; iErrCode: i32; zMsg: PChar); cdecl;
+
 procedure sqlite3_log_wal(iErrCode: i32; zMsg: PChar);
+var
+  xLog: TSqlite3LogCallbackWal;
 begin
-  { no-op stub }
-  iErrCode := iErrCode; { suppress unused warning }
-  zMsg := zMsg;
+  if sqlite3GlobalConfig.xLog <> nil then
+  begin
+    xLog := TSqlite3LogCallbackWal(sqlite3GlobalConfig.xLog);
+    xLog(sqlite3GlobalConfig.pLogArg, iErrCode, zMsg);
+  end;
 end;
 
 { sqlite3SectorSize: minimum sector size from VFS (pager.c ~2694) }
@@ -882,7 +894,9 @@ begin
     end;
 
     if pWal^.hdr.nPage <> 0 then
-      sqlite3_log_wal(SQLITE_NOTICE_RECOVER_WAL, pWal^.zWalName);
+      sqlite3_log_wal(SQLITE_NOTICE_RECOVER_WAL,
+        PChar(Format('recovered %d frames from WAL file %s',
+                     [Integer(pWal^.hdr.mxFrame), string(pWal^.zWalName)])));
   end;
 
   recovery_error:
@@ -929,7 +943,8 @@ begin
     rx := sqlite3OsTruncate(pWal^.pWalFd, nMax);
   sqlite3EndBenignMalloc;
   if rx <> SQLITE_OK then
-    sqlite3_log_wal(rx, pWal^.zWalName);
+    sqlite3_log_wal(rx,
+      PChar(Format('cannot limit WAL size: %s', [string(pWal^.zWalName)])));
 end;
 
 { ============================================================

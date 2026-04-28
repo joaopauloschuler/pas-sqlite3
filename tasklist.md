@@ -138,7 +138,11 @@ Important: At the end of this document, please find:
        installed by passqlite3backup at unit init — direct call would
        cycle the uses graph; `sqlite3_log` now dispatches to
        `sqlite3GlobalConfig.xLog(pLogArg, iErrCode, zMsg)`.)
-  [ ] **6.18** port wal.pas stub `sqlite3_log_wal` in full from C to pascal.
+  [X] **6.18** port wal.pas stub `sqlite3_log_wal` in full from C to pascal.
+       (Dispatches to `sqlite3GlobalConfig.xLog` like pager.pas's
+       `sqlite3_log`; call sites in `walIndexRecover` and `walLimitSize`
+       now pre-render the C format strings via `Format()`.  Local copy
+       in wal.pas avoids pulling pager.pas into the uses graph.)
   [ ] **6.19** port util.pas stub `sqlite3_mprintf` in full from C to pascal.
   [ ] **6.20** port parser.pas stubs in full from C to pascal:
        `sqlite3ExprListAppendVector`, `sqlite3Reindex`,
