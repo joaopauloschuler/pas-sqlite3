@@ -807,6 +807,7 @@ type
       5: (pSrcList: PSrcList);
       6: (pGroupBy: PExprList);
       7: (pSelect:  PSelect);
+      8: (aiCol:    Pi32);    { CHECK-constraint changed-column map (insert.c:1727) }
   end;
 
   TWalker = record
@@ -19145,10 +19146,38 @@ end;
 // Phase 6.4 — update.c
 // ===========================================================================
 
-{ sqlite3ColumnDefault — emit OP_Column default value code (Phase 6.4 stub) }
+{ sqlite3ColumnDefault — port of update.c:61.
+  Append OP_Column-default P4 metadata for column i of pTab and, for REAL
+  affinity columns of ordinary tables, emit a trailing OP_RealAffinity so
+  values stored as integers are converted to real on read.  Mirrors C
+  behaviour: only attaches P4_MEM when pCol^.iDflt is set AND
+  sqlite3ValueFromExpr produces a non-nil value (currently always nil
+  while sqlite3ValueFromExpr is itself a Phase-6 stub — the P4 attach is
+  thus dormant but forward-wired). }
 procedure sqlite3ColumnDefault(v: PVdbe; pTab: PTable2; i: i32; iReg: i32);
+var
+  pCol:   PColumn;
+  pValue: Psqlite3_value;
+  enc:    u8;
+  db:     PTsqlite3;
 begin
-  { Phase 6.5: emit OP_Null or OP_SCopy for default expression }
+  Assert(pTab <> nil);
+  Assert(pTab^.nCol > i);
+  pCol := @pTab^.aCol[i];
+  if pCol^.iDflt <> 0 then
+  begin
+    pValue := nil;
+    db := sqlite3VdbeDb(v);
+    enc := db^.enc;
+    Assert(not IsView(pTab));
+    sqlite3ValueFromExpr(db, sqlite3ColumnExpr(pTab, pCol), enc,
+                         u8(pCol^.affinity), pValue);
+    if pValue <> nil then
+      sqlite3VdbeAppendP4(v, Pointer(pValue), P4_MEM);
+  end;
+  if (pCol^.affinity = AnsiChar(SQLITE_AFF_REAL))
+     and (pTab^.eTabType <> TABTYP_VTAB) then
+    sqlite3VdbeAddOp1(v, OP_RealAffinity, iReg);
 end;
 
 { sqlite3ExprCodeGetColumnOfTable — port of expr.c:4417..4465.
@@ -19923,11 +19952,51 @@ begin
   Result := 0;
 end;
 
-{ sqlite3ExprReferencesUpdatedColumn — check if expr refs any changed col (Phase 6.4 stub) }
+{ Walker callback for sqlite3ExprReferencesUpdatedColumn — port of
+  insert.c:1689 checkConstraintExprNode.  Sets CKCNSTRNT_COLUMN /
+  CKCNSTRNT_ROWID bits in pWalker^.eCode when the expression references
+  a column or rowid changed by an UPDATE. }
+const
+  CKCNSTRNT_COLUMN = $01;
+  CKCNSTRNT_ROWID  = $02;
+
+function checkConstraintExprNode(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  iCol: i32;
+begin
+  if pExpr^.op = TK_COLUMN then
+  begin
+    Assert((pExpr^.iColumn >= 0) or (pExpr^.iColumn = -1));
+    if pExpr^.iColumn >= 0 then
+    begin
+      iCol := pExpr^.iColumn;
+      if pWalker^.u.aiCol[iCol] >= 0 then
+        pWalker^.eCode := pWalker^.eCode or CKCNSTRNT_COLUMN;
+    end
+    else
+      pWalker^.eCode := pWalker^.eCode or CKCNSTRNT_ROWID;
+  end;
+  Result := WRC_Continue;
+end;
+
+{ sqlite3ExprReferencesUpdatedColumn — port of insert.c:1718.
+  Returns non-zero iff pExpr (typically a CHECK constraint or
+  index-on-expression) references any column/rowid being modified by
+  an UPDATE.  aiChng[i]>=0 indicates column i is changing; chngRowid
+  indicates the rowid is changing. }
 function sqlite3ExprReferencesUpdatedColumn(pExpr: PExpr; aiChng: Pi32;
   chngRowid: i32): i32;
+var
+  w: TWalker;
 begin
-  Result := 0; { Phase 6.5 }
+  FillChar(w, SizeOf(w), 0);
+  w.eCode := 0;
+  w.xExprCallback := TExprCallback(@checkConstraintExprNode);
+  w.u.aiCol := aiChng;
+  sqlite3WalkExpr(@w, pExpr);
+  if chngRowid = 0 then
+    w.eCode := w.eCode and (not u16(CKCNSTRNT_ROWID));
+  if w.eCode <> 0 then Result := 1 else Result := 0;
 end;
 
 { sqlite3GenerateConstraintChecks — emit constraint-checking VDBE (Phase 6.4 stub) }

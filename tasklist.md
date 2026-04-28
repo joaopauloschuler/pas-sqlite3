@@ -305,12 +305,23 @@ Important: At the end of this document, please find:
   [ ] **6.24** port codegen.pas DML / insert stubs in full from C to pascal:
        `sqlite3UpsertAnalyzeTarget`, `sqlite3UpsertDoUpdate`,
        `sqlite3MaterializeView`, `sqlite3LimitWhere`,
-       `sqlite3ColumnDefault`,
        `sqlite3ComputeGeneratedColumns`, `sqlite3AutoincrementBegin`,
        `sqlite3AutoincrementEnd`, `sqlite3MultiValuesEnd`,
        `sqlite3MultiValues`, `autoIncBegin`,
-       `sqlite3ExprReferencesUpdatedColumn`,
        `sqlite3GenerateConstraintChecks`.
+       [X] `sqlite3ColumnDefault` — ported in full (update.c:61).  Attaches
+            P4_MEM default-value metadata via sqlite3ValueFromExpr (currently
+            dormant — sqlite3ValueFromExpr is itself a Phase-6 stub returning
+            nil; forward-wired so the P4 attach activates when ValueFromExpr
+            lands), and emits trailing OP_RealAffinity on REAL-affinity
+            columns of ordinary tables.  Δ-neutral against current corpus
+            (no REAL-affinity schemas exercised in TestExplainParity).
+       [X] `sqlite3ExprReferencesUpdatedColumn` + `checkConstraintExprNode`
+            — ported in full (insert.c:1689, insert.c:1718).  Walker callback
+            sets CKCNSTRNT_COLUMN/CKCNSTRNT_ROWID bits when a CHECK
+            constraint or index-on-expression references an UPDATE-changed
+            column.  TWalkerU gained an `aiCol: Pi32` arm (insert.c:1727).
+            Productive once `sqlite3GenerateConstraintChecks` lands.
        [X] `sqlite3TableAffinity` + `sqlite3TableAffinityStr` — ported
             in full (insert.c:122, insert.c:179).  STRICT arm reachable
             once AddColumn lands TF_Strict; non-STRICT arm wired but
