@@ -497,8 +497,12 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_set_clientdata` — typed pointer slots on the db.
 
 - [ ] **8.2.1** Statement-introspection gaps (vdbeapi.c):
-       [ ] `sqlite3_stmt_busy` (vdbeapi.c) — has the stmt been stepped?
-       [ ] `sqlite3_stmt_readonly` — true if stmt has no side effects.
+       [X] `sqlite3_stmt_busy` (vdbeapi.c) — ported 2026-04-28
+            (passqlite3main.pas) — `v <> nil and eVdbeState =
+            VDBE_RUN_STATE`.
+       [X] `sqlite3_stmt_readonly` — ported 2026-04-28
+            (passqlite3main.pas) — `vdbeFlags and VDBF_ReadOnly`,
+            returns 1 for nil stmt to match C reference.
        [ ] `sqlite3_stmt_explain` — current explain mode (0/1/2).
        [ ] `sqlite3_stmt_status` — per-stmt counters.
        [ ] `sqlite3_stmt_scanstatus` / `_scanstatus_v2` /

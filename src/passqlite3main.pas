@@ -347,6 +347,9 @@ function sqlite3_txn_state(db: PTsqlite3; zSchema: PAnsiChar): i32; cdecl;
 function sqlite3_error_offset(db: PTsqlite3): i32; cdecl;
 function sqlite3_limit(db: PTsqlite3; limitId: i32; newLimit: i32): i32; cdecl;
 
+function sqlite3_stmt_busy(pStmt: Pointer): i32; cdecl;
+function sqlite3_stmt_readonly(pStmt: Pointer): i32; cdecl;
+
 function sqlite3_sleep(ms: i32): i32; cdecl;
 
 function sqlite3_release_memory(n: i32): i32; cdecl;
@@ -2406,6 +2409,27 @@ function sqlite3_get_autocommit(db: PTsqlite3): i32; cdecl;
 begin
   if db = nil then begin Result := 0; Exit; end;
   Result := db^.autoCommit;
+end;
+
+{ vdbeapi.c:2074 — sqlite3_stmt_busy. }
+function sqlite3_stmt_busy(pStmt: Pointer): i32; cdecl;
+var v: PVdbe;
+begin
+  v := PVdbe(pStmt);
+  if (v <> nil) and (v^.eVdbeState = VDBE_RUN_STATE) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ vdbeapi.c:2023 — sqlite3_stmt_readonly. }
+function sqlite3_stmt_readonly(pStmt: Pointer): i32; cdecl;
+begin
+  if pStmt = nil then begin Result := 1; Exit; end;
+  if (PVdbe(pStmt)^.vdbeFlags and VDBF_ReadOnly) <> 0 then
+    Result := 1
+  else
+    Result := 0;
 end;
 
 function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;

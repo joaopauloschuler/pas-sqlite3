@@ -41,6 +41,8 @@ end;
 var
   db: PTsqlite3;
   rc: i32;
+  rcs: i32;
+  pStmt: Pointer;
   highwater: i64;
 begin
   Check('libversion_number = 3053000',
@@ -145,6 +147,22 @@ begin
   Check('errcode(nil) = NOMEM', sqlite3_errcode(nil) = SQLITE_NOMEM);
   Check('changes(nil) = 0', sqlite3_changes(nil) = 0);
   Check('autocommit(nil) = 0', sqlite3_get_autocommit(nil) = 0);
+
+  { Phase 8.2.1 — sqlite3_stmt_busy / _readonly. }
+  Check('stmt_busy(nil) = 0',     sqlite3_stmt_busy(nil) = 0);
+  Check('stmt_readonly(nil) = 1', sqlite3_stmt_readonly(nil) = 1);
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT 1', -1, @pStmt, nil);
+  Check('prepare SELECT 1', rcs = SQLITE_OK);
+  Check('stmt_readonly(SELECT 1) = 1', sqlite3_stmt_readonly(pStmt) = 1);
+  Check('stmt_busy fresh = 0',         sqlite3_stmt_busy(pStmt) = 0);
+  rcs := sqlite3_step(pStmt);
+  Check('step -> ROW',                 rcs = SQLITE_ROW);
+  Check('stmt_busy mid-run = 1',       sqlite3_stmt_busy(pStmt) = 1);
+  rcs := sqlite3_step(pStmt);
+  Check('step -> DONE',                rcs = SQLITE_DONE);
+  Check('stmt_busy after DONE = 0',    sqlite3_stmt_busy(pStmt) = 0);
+  sqlite3_finalize(pStmt);
 
   rc := sqlite3_close(db);
   Check('close', rc = SQLITE_OK);
