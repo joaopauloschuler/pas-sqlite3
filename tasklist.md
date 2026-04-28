@@ -345,12 +345,19 @@ Important: At the end of this document, please find:
         fixed %S to emit integer seconds and %f to use %06.3f.
         Remaining unported: %g/%G (ISO week year), %j is already
         partial (uses Trunc(jd-jan1)+1 vs C's daysAfterJan01).
-      [ ] **i) Date modifiers (`+5 days`, `-1 month`, `start of
-        month`) ignored** — `dateFunc` / `datetimeFunc` only handle
-        argc=1 path; the modifier-list arm (parseModifier in
-        date.c:584) is not ported.  Until then the 2+arg dispatchers
-        register at MakeFD with nArg=1 only, so multi-arg calls fall
-        through to NULL.
+      [X] **i) Date modifiers (`+5 days`, `-1 month`, `start of
+        month`) ignored** — fixed 2026-04-28.  Date funcs (date /
+        time / datetime / julianday / strftime / unixepoch) now
+        register variadic (`nArg=-1`) per date.c:1808..1813, and
+        a subset port of `parseModifier` (date.c:730..1095) handles
+        `±N {seconds|minutes|hours|days|months|years}` and
+        `start of {day|month|year}`.  Day/month/year arms bump
+        the YMD field directly with default-ceiling normalisation;
+        sub-day arms add to JD and re-derive YMD via fromJulianDay.
+        DiagDate divergences 3 → 0.  Out-of-scope for now: floor /
+        ceiling / weekday N / unixepoch-as-modifier / localtime /
+        utc / auto / julianday-as-modifier / `±YYYY-MM-DD HH:MM`
+        absolute forms — call sites needing those still get NULL.
       [X] **j) `sign(x)` returns NULL** — fixed 2026-04-28.  Ported
         signFunc (func.c:2621) and registered as aBuiltinFuncs[48]
         per func.c:3427 `FUNCTION(sign,1,0,0,signFunc)`.  Returns

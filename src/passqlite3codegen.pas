@@ -15377,7 +15377,7 @@ var
   sEAlt:           TExpr;
   mBody:           Bitmask;
   iLoopBody:       i32;
-  iNextBody:       i32;
+  nUnitextBody:       i32;
   jBody:           i32;
   skipLikeAddr:    i32;
   pIdxBody:        PIndex2;
@@ -16190,7 +16190,7 @@ begin
 
   if pIdxBody <> nil then iLoopBody := 1 else iLoopBody := 2;
   repeat
-    iNextBody := 0;
+    nUnitextBody := 0;
     pTermArr  := pWCBody^.a;
     for jBody := 0 to pWCBody^.nTerm - 1 do
     begin
@@ -16221,13 +16221,13 @@ begin
          and (sqlite3ExprCoveredByIndex(pEBody, pLevel^.iTabCur, pIdxBody) = 0)
       then
       begin
-        iNextBody := 2;
+        nUnitextBody := 2;
         continue;
       end;
       if (iLoopBody < 3)
          and ((pTermBody^.wtFlags and TERM_VARSELECT) <> 0) then
       begin
-        if iNextBody = 0 then iNextBody := 3;
+        if nUnitextBody = 0 then nUnitextBody := 3;
         continue;
       end;
       if (pTermBody^.wtFlags and TERM_LIKECOND) <> 0 then
@@ -16246,7 +16246,7 @@ begin
       if skipLikeAddr <> 0 then sqlite3VdbeJumpHere(v, skipLikeAddr);
       pTermBody^.wtFlags := pTermBody^.wtFlags or TERM_CODED;
     end;
-    iLoopBody := iNextBody;
+    iLoopBody := nUnitextBody;
   until iLoopBody = 0;
 
   { Transitive constraint walk (wherecode.c:2683..2727).  When a term like
@@ -26132,6 +26132,134 @@ begin
   Result := toJulianDay(y, m, d, h, mn, s + ms/1000.0);
 end;
 
+{ applyModifier — Phase 6.10 step 11(i): subset port of parseModifier
+  (date.c:730..1095).  Supports the most common forms:
+    "+N <unit>" / "-N <unit>" where <unit> in
+        {seconds, minutes, hours, days, months, years} (with optional 's')
+    "start of {day, month, year}"
+  Returns True on success; False on parse error / unrecognised modifier.
+  Modifies dt in place — recomputes dt.jd and re-derives YMD via
+  fromJulianDay for sub-day units; for day/month/year units bumps the
+  field directly and normalises with default-ceiling semantics
+  (matching C's computeFloor(nFloor=0)). }
+function applyModifier(z: PAnsiChar; var dt: TDateTime2): Boolean;
+var
+  zMod, unit_: PAnsiChar;
+  buf: array[0..31] of AnsiChar;
+  i, nUsed, nUnit, iVal: i32;
+  r: Double;
+begin
+  Result := False;
+  if z = nil then Exit;
+  zMod := z;
+  while (zMod^ <> #0) and (sqlite3Isspace(u8(zMod^)) <> 0) do Inc(zMod);
+
+  if sqlite3_strnicmp(zMod, 'start of ', 9) = 0 then begin
+    unit_ := zMod + 9;
+    if sqlite3StrICmp(unit_, 'day') = 0 then begin
+      dt.hr := 0; dt.mi := 0; dt.s := 0;
+    end else if sqlite3StrICmp(unit_, 'month') = 0 then begin
+      dt.dy := 1; dt.hr := 0; dt.mi := 0; dt.s := 0;
+    end else if sqlite3StrICmp(unit_, 'year') = 0 then begin
+      dt.mo := 1; dt.dy := 1; dt.hr := 0; dt.mi := 0; dt.s := 0;
+    end else
+      Exit;
+    dt.jd := toJulianDay(dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+    dt.validJD := True;
+    Result := True;
+    Exit;
+  end;
+
+  if (zMod^ <> '+') and (zMod^ <> '-') and ((zMod^ < '0') or (zMod^ > '9')) then
+    Exit;
+
+  i := 0;
+  if (zMod^ = '+') or (zMod^ = '-') then begin
+    buf[i] := zMod^; Inc(i);
+  end;
+  while ((zMod[i] >= '0') and (zMod[i] <= '9')) and (i < 30) do begin
+    buf[i] := zMod[i]; Inc(i);
+  end;
+  if (zMod[i] = '.') and (i < 30) then begin
+    buf[i] := zMod[i]; Inc(i);
+    while ((zMod[i] >= '0') and (zMod[i] <= '9')) and (i < 30) do begin
+      buf[i] := zMod[i]; Inc(i);
+    end;
+  end;
+  nUsed := i;
+  buf[i] := #0;
+  if (nUsed = 0) or ((nUsed = 1) and ((buf[0] = '+') or (buf[0] = '-'))) then Exit;
+  if sqlite3AtoF(buf, r) <= 0 then Exit;
+  iVal := Trunc(r);
+
+  unit_ := zMod + nUsed;
+  while (unit_^ <> #0) and (sqlite3Isspace(u8(unit_^)) <> 0) do Inc(unit_);
+  nUnit := 0;
+  while (unit_+nUnit)^ <> #0 do Inc(nUnit);
+  if (nUnit > 1) and ((Upcase((unit_+nUnit-1)^)) = 'S') then Dec(nUnit);
+
+  if (nUnit = 6) and (sqlite3_strnicmp(unit_, 'second', 6) = 0) then begin
+    dt.jd := dt.jd + r/86400.0;
+    fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+  end else if (nUnit = 6) and (sqlite3_strnicmp(unit_, 'minute', 6) = 0) then begin
+    dt.jd := dt.jd + r/1440.0;
+    fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+  end else if (nUnit = 4) and (sqlite3_strnicmp(unit_, 'hour', 4) = 0) then begin
+    dt.jd := dt.jd + r/24.0;
+    fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+  end else if (nUnit = 3) and (sqlite3_strnicmp(unit_, 'day', 3) = 0) then begin
+    if r = iVal then
+      dt.dy := dt.dy + iVal
+    else begin
+      dt.jd := dt.jd + r;
+      fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+    end;
+  end else if (nUnit = 5) and (sqlite3_strnicmp(unit_, 'month', 5) = 0) then begin
+    dt.mo := dt.mo + iVal;
+  end else if (nUnit = 4) and (sqlite3_strnicmp(unit_, 'year', 4) = 0) then begin
+    dt.yr := dt.yr + iVal;
+  end else
+    Exit;
+
+  while dt.mo > 12 do begin Inc(dt.yr); Dec(dt.mo, 12); end;
+  while dt.mo < 1  do begin Dec(dt.yr); Inc(dt.mo, 12); end;
+  while dt.dy > daysInMonth(dt.yr, dt.mo) do begin
+    dt.dy := dt.dy - daysInMonth(dt.yr, dt.mo);
+    Inc(dt.mo);
+    if dt.mo > 12 then begin dt.mo := 1; Inc(dt.yr); end;
+  end;
+  while dt.dy < 1 do begin
+    Dec(dt.mo);
+    if dt.mo < 1 then begin dt.mo := 12; Dec(dt.yr); end;
+    dt.dy := dt.dy + daysInMonth(dt.yr, dt.mo);
+  end;
+  dt.jd := toJulianDay(dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+  dt.validJD := True;
+  Result := True;
+end;
+
+{ applyModifiers — apply argv[fromIdx..argc-1] modifiers to dt.
+  Returns True on success; False if any modifier failed. }
+function applyModifiers(argc, fromIdx: i32; argv: PPMem;
+  var dt: TDateTime2): Boolean;
+var
+  i: i32;
+  zMod: PAnsiChar;
+begin
+  Result := True;
+  i := fromIdx;
+  while i < argc do begin
+    if sqlite3_value_type(Psqlite3_value((argv+i)^)) = SQLITE_NULL then begin
+      Result := False; Exit;
+    end;
+    zMod := sqlite3_value_text(Psqlite3_value((argv+i)^));
+    if not applyModifier(zMod, dt) then begin
+      Result := False; Exit;
+    end;
+    Inc(i);
+  end;
+end;
+
 procedure dateFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
   dt: TDateTime2;
@@ -26151,6 +26279,9 @@ begin
   end;
   z := sqlite3_value_text(Psqlite3_value(argv^));
   if not parseDateTime(z, dt) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
   snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d', [dt.yr, dt.mo, dt.dy]);
@@ -26176,6 +26307,9 @@ begin
   end;
   z := sqlite3_value_text(Psqlite3_value(argv^));
   if not parseDateTime(z, dt) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
   snpFmt(SizeOf(buf), buf, '%02d:%02d:%02d', [dt.hr, dt.mi, Trunc(dt.s)]);
@@ -26204,6 +26338,9 @@ begin
   if not parseDateTime(z, dt) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
+  if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
   snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%02d',
     [dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, Trunc(dt.s)]);
   sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
@@ -26222,6 +26359,9 @@ begin
   if not parseDateTime(z, dt) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
+  if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
   sqlite3_result_double(pCtx, dt.jd);
 end;
 
@@ -26238,6 +26378,9 @@ begin
   end else begin
     z := sqlite3_value_text(Psqlite3_value(argv^));
     if not parseDateTime(z, dt) then begin
+      sqlite3_result_null(pCtx); Exit;
+    end;
+    if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
       sqlite3_result_null(pCtx); Exit;
     end;
     jd := dt.jd;
@@ -26267,6 +26410,9 @@ begin
     jd := currentJD;
     fromJulianDay(jd, y2, m2, d2, h2, mn2, s2);
   end else begin
+    if (argc > 2) and (not applyModifiers(argc, 2, argv, dt)) then begin
+      sqlite3_result_null(pCtx); Exit;
+    end;
     jd := dt.jd;
     y2 := dt.yr; m2 := dt.mo; d2 := dt.dy;
     h2 := dt.hr; mn2 := dt.mi; s2 := dt.s;
@@ -26346,7 +26492,7 @@ begin
 end;
 
 var
-  aDateFuncs: array[0..7] of TFuncDef;
+  aDateFuncs: array[0..5] of TFuncDef;
 
 procedure InitDateFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; sfunc: TxSFuncProc;
@@ -26359,14 +26505,13 @@ begin
   fd.zName     := nm;
 end;
 begin
-  MakeFD(aDateFuncs[0],  1, @dateFunc,      'date');
-  MakeFD(aDateFuncs[1],  1, @timeFunc,      'time');
-  MakeFD(aDateFuncs[2],  1, @datetimeFunc,  'datetime');
-  MakeFD(aDateFuncs[3],  1, @juliandayFunc, 'julianday');
-  MakeFD(aDateFuncs[4],  2, @strftimeFunc,  'strftime');
-  MakeFD(aDateFuncs[5],  1, @unixtimeFunc,  'unixepoch');
-  MakeFD(aDateFuncs[6],  0, @dateFunc,      'date');
-  MakeFD(aDateFuncs[7],  0, @datetimeFunc,  'datetime');
+  { date.c:1808..1813 — all date funcs are variadic (PURE_DATE nArg=-1). }
+  MakeFD(aDateFuncs[0], -1, @dateFunc,      'date');
+  MakeFD(aDateFuncs[1], -1, @timeFunc,      'time');
+  MakeFD(aDateFuncs[2], -1, @datetimeFunc,  'datetime');
+  MakeFD(aDateFuncs[3], -1, @juliandayFunc, 'julianday');
+  MakeFD(aDateFuncs[4], -1, @strftimeFunc,  'strftime');
+  MakeFD(aDateFuncs[5], -1, @unixtimeFunc,  'unixepoch');
 end;
 
 procedure sqlite3RegisterDateTimeFunctions;
