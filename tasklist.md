@@ -54,23 +54,15 @@ Important: At the end of this document, please find:
       Δ=14).
 
 - [ ] **6.10** `TestExplainParity.pas`
-    - [ ] **6.10 step 4** DROP TABLE schema-row deletion does not run.
-      `sqlite3CodeDropTable` itself is fully ported (build.c:3387) and
-      calls `sqlite3NestedParse(... DELETE FROM sqlite_schema ...)`
-      identically to C.  The actual blocker is that
-      `sqlite3RunParser` (passqlite3codegen.pas) is still a Phase-7
-      stub — `sqlite3NestedParse` formats the SQL and hands it to
-      `gNestedRunParser`, which never compiles it, so no schema-row
-      deletion ops are emitted.  OP_DropTable then destroys the btree
-      root while the sqlite_schema row survives pointing at the
-      now-invalid rootpage.
-      **Runtime impact (verified 2026-04-27):**
-      `DROP TABLE t` followed by `CREATE TABLE t(...)` or
-      `SELECT * FROM t` on the same connection returns
-      `SQLITE_CORRUPT` (rc=11) / `SQLITE_ERROR` (rc=1) on Pas; C
-      returns no-such-table cleanly and lets re-CREATE succeed.
-      Repro: `sqlite3_open(":memory:")` → CREATE / INSERT / DROP /
-      CREATE.  Closing this row requires Phase 7 `sqlite3RunParser`.
+    - [X] **6.10 step 4** DROP TABLE schema-row deletion now runs.
+      `sqlite3NestedParse` dispatches the DELETE through the
+      `gNestedRunParser` hook (registered by `passqlite3parser` at unit
+      init), so the schema row is removed before OP_DropTable destroys
+      the btree root.  Verified 2026-04-28: CREATE / INSERT / DROP /
+      CREATE / SELECT round-trip succeeds (rc=0 / DONE on every step)
+      and `SELECT name FROM sqlite_schema` no longer shows the dropped
+      table.  The remaining DROP TABLE Δ=26 entry is the destroyRootPage
+      autovacuum follow-on (6.11(b)).
 
     - [ ] **6.10 step 6** Make these to work (port code when required):
         [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
@@ -309,7 +301,6 @@ Important: At the end of this document, please find:
        `sqlite3TriggerStepSrc`, `sqlite3TriggerColmask`.
   [ ] **6.24** port codegen.pas DML / insert stubs in full from C to pascal:
        `sqlite3UpsertAnalyzeTarget`, `sqlite3UpsertDoUpdate`,
-       `sqlite3MaterializeView`, `sqlite3LimitWhere`,
        `sqlite3ComputeGeneratedColumns`, `sqlite3AutoincrementBegin`,
        `sqlite3AutoincrementEnd`, `sqlite3MultiValuesEnd`,
        `sqlite3MultiValues`, `autoIncBegin`,
@@ -333,6 +324,15 @@ Important: At the end of this document, please find:
             Δ-neutral until call sites in sqlite3Insert /
             sqlite3GenerateConstraintChecks switch off the inline path.
        (`sqlite3CompleteInsertion` is now fully ported — see 6.9-bis 11g.2.b.)
+       [X] `sqlite3MaterializeView` — ported in full (delete.c:142).  Builds
+            `SELECT * FROM <view> WHERE … ORDER BY … LIMIT …` with
+            SF_IncludeHidden and runs it into an SRT_EphemTab cursor for
+            INSTEAD OF DELETE/UPDATE trigger paths.  Δ-neutral against the
+            current corpus (no view-with-trigger tests yet); productive
+            once trigger codegen lands.
+       [X] `sqlite3LimitWhere` — gated under SQLITE_ENABLE_UPDATE_DELETE_LIMIT
+            (off in default upstream build); existing no-op stub matches
+            default-build behaviour.
   [ ] **6.25** port codegen.pas schema / index stubs in full from C to pascal:
        `sqlite3ReadSchema`, `sqlite3RunParser`.
        [X] `sqlite3PrimaryKeyIndex` — already a faithful port (build.c:1069);

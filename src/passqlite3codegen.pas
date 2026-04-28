@@ -18490,11 +18490,38 @@ begin
   Result := 0;
 end;
 
-{ sqlite3MaterializeView — store view into a temp table (Phase 6.4 stub) }
+{ sqlite3MaterializeView — port of delete.c:142.
+  Evaluate the view pView (with optional WHERE/ORDER BY/LIMIT) and store
+  the resulting rows in an ephemeral table at cursor iCur, so that DML
+  with INSTEAD OF triggers on a view can iterate over those materialised
+  rows.  Constructs `SELECT * FROM <view> WHERE ... ORDER BY ... LIMIT ...`
+  with SF_IncludeHidden and runs it into an SRT_EphemTab destination. }
 procedure sqlite3MaterializeView(pParse: PParse; pView: PTable2;
   pWhere: PExpr; pOrderBy: PExprList; pLimit: PExpr; iCur: i32);
+var
+  dest:  TSelectDest;
+  pSel:  PSelect;
+  pFrom: PSrcList;
+  db:    PTsqlite3;
+  iDb:   i32;
+  pItem: PSrcItem;
 begin
-  { Phase 6.5 }
+  db    := pParse^.db;
+  iDb   := sqlite3SchemaToIndex(db, pView^.pSchema);
+  pWhere := sqlite3ExprDup(db, pWhere, 0);
+  pFrom := sqlite3SrcListAppend(pParse, nil, nil, nil);
+  if pFrom <> nil then
+  begin
+    AssertH(pFrom^.nSrc = 1, 'MaterializeView: nSrc=1');
+    pItem := PSrcItem(PByte(SrcListItems(pFrom)));
+    pItem^.zName := sqlite3DbStrDup(db, pView^.zName);
+    pItem^.u4.zDatabase := sqlite3DbStrDup(db, db^.aDb[iDb].zDbSName);
+  end;
+  pSel := sqlite3SelectNew(pParse, nil, pFrom, pWhere, nil, nil,
+                           pOrderBy, SF_IncludeHidden, pLimit);
+  sqlite3SelectDestInit(@dest, SRT_EphemTab, iCur);
+  sqlite3Select(pParse, pSel, @dest);
+  sqlite3SelectDelete(db, pSel);
 end;
 
 { sqlite3LimitWhere — rewrite WHERE for DELETE/UPDATE with LIMIT (Phase 6.4 stub) }
