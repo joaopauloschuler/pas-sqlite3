@@ -1471,11 +1471,13 @@ procedure sqlite3FkClearTriggerCache(db: PTsqlite3; iDb: i32);
 type
   TUnlinkAndDeleteFn = procedure(db: PTsqlite3; iDb: i32; zName: PAnsiChar);
   TRootPageMovedFn   = procedure(db: PTsqlite3; iDb: i32; iFrom, iTo: i32);
+  TSetP4KeyInfoFn    = procedure(pParse: PParse; pIdx: PIndex);
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteTrigger: TUnlinkAndDeleteFn;
   gRootPageMoved:          TRootPageMovedFn;
+  gSetP4KeyInfo:           TSetP4KeyInfoFn;
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
@@ -2549,7 +2551,12 @@ end;
 
 procedure sqlite3VdbeSetP4KeyInfo(pParse: PParse; pIdx: PIndex);
 begin
-  { Stub — requires Phase 6 (KeyInfo / Index) }
+  { Real body lives in passqlite3codegen (vdbeaux.c:1629) — needs PIndex2
+    layout + sqlite3KeyInfoOfIndex which are codegen-private.  Hook is
+    registered at codegen unit-init; nil hook = degraded no-op for
+    codegen-less test programs. }
+  if Assigned(gSetP4KeyInfo) then
+    gSetP4KeyInfo(pParse, pIdx);
 end;
 
 { --- Comment helpers (no-ops unless SQLITE_ENABLE_EXPLAIN_COMMENTS) --- }

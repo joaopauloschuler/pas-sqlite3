@@ -28556,6 +28556,27 @@ begin
   sqlite3RootPageMoved(db, iDb, u32(iFrom), u32(iTo));
 end;
 
+{ sqlite3VdbeSetP4KeyInfo — port of vdbeaux.c:1629.
+  Lives here (not in passqlite3vdbe) because the body needs PIndex2 layout
+  + sqlite3KeyInfoOfIndex which are codegen-private.  Reached via the
+  gSetP4KeyInfo hook installed at unit-init below.  The signature uses
+  passqlite3vdbe's opaque PIndex (= Pointer) so the hook type matches; we
+  cast to PIndex2 here. }
+procedure setP4KeyInfoTrampoline(pParseRaw: Pointer; pIdxRaw: Pointer);
+var
+  pPrs:     PParse;
+  v:        PVdbe;
+  pKeyInfo: PKeyInfo2;
+begin
+  pPrs := PParse(pParseRaw);
+  v := pPrs^.pVdbe;
+  Assert(v <> nil);
+  Assert(pIdxRaw <> nil);
+  pKeyInfo := sqlite3KeyInfoOfIndex(pPrs, PIndex2(pIdxRaw));
+  if pKeyInfo <> nil then
+    sqlite3VdbeAppendP4(v, Pointer(pKeyInfo), P4_KEYINFO);
+end;
+
 initialization
   { Wire the schema-cleanup hooks declared by passqlite3vdbe.  The opcode
     handlers there (OP_DropTable, OP_DropIndex, OP_DropTrigger, OP_Destroy
@@ -28567,5 +28588,6 @@ initialization
   passqlite3vdbe.gUnlinkAndDeleteIndex   := @sqlite3UnlinkAndDeleteIndex;
   passqlite3vdbe.gUnlinkAndDeleteTrigger := @sqlite3UnlinkAndDeleteTrigger;
   passqlite3vdbe.gRootPageMoved          := @rootPageMovedTrampoline;
+  passqlite3vdbe.gSetP4KeyInfo           := passqlite3vdbe.TSetP4KeyInfoFn(@setP4KeyInfoTrampoline);
 
 end.

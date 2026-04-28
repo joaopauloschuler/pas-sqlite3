@@ -210,9 +210,6 @@ Important: At the end of this document, please find:
   [ ] **6.21** port vdbe.pas stubs in full from C to pascal:
        `sqlite3VdbeMultiLoad` (blocked: only used by pragma.c and
        requires va_list — defer until 6.12 sqlite3Pragma lands),
-       `sqlite3VdbeSetP4KeyInfo` (blocked on cross-unit access to
-       `sqlite3KeyInfoOfIndex` in codegen.pas — needs hook indirection
-       like the gUnlinkAndDelete* pattern),
        `sqlite3VdbeDisplayComment`, `sqlite3VdbeDisplayP4`,
        `sqlite3VdbeEnter`, `sqlite3VdbeNextOpcode`,
        `sqlite3VdbeCloseStatement`, `sqlite3VdbeList`,
@@ -242,6 +239,11 @@ Important: At the end of this document, please find:
             vdbeReleaseColNames to free Mem-owned strings.  Verified
             via src/tests/DiagColName.pas — sqlite3_column_name now
             returns "a", "xyz" etc. instead of NULL.
+       [X] `sqlite3VdbeSetP4KeyInfo` — ported in full (vdbeaux.c:1629).
+            Real body lives in passqlite3codegen as setP4KeyInfoTrampoline
+            (needs PIndex2 + sqlite3KeyInfoOfIndex which are codegen-private);
+            registered into vdbe.pas's gSetP4KeyInfo hook at codegen
+            unit-init, mirroring the existing gUnlinkAndDelete* pattern.
        [X] `sqlite3VdbeFrameMemDel` — ported in full (vdbeaux.c:2247);
             adds the frame to v->pDelFrame for deferred free.
        [X] `sqlite3VdbeFrameRestore` — ported in full (vdbeaux.c:2812).
