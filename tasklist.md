@@ -284,6 +284,76 @@ Important: At the end of this document, please find:
         now returns 'é' (was 0xC3 alone), `substr('日本語',2,1)`
         returns '本'.  DiagFunctions utf8 cases → PASS.
 
+  [ ] **6.10 step 11** Runtime divergences surfaced by the new
+      `src/tests/DiagDate.pas` probe (date/time + scalar coercion).
+      Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagDate`.
+      [X] **a) `quote(int)` / `quote(real)` returned wrong type** —
+        fixed 2026-04-28.  C semantics: quote() always returns TEXT
+        (sqlite3StrAccumFinish in func.c:1265).  Pas was calling
+        `sqlite3_result_value` for SQLITE_INTEGER / SQLITE_REAL,
+        which copies the original value preserving its type.  Now
+        renders int via `sqlite3Int64ToText` and real via
+        `sqlite3RenderNumF(r, 17, altform2=true)` (matching C's
+        `"%lld"` / `"%!0.17g"`), then emits as TEXT.
+      [X] **b) `round(-2.5)` returned -2 (banker's) instead of -3** —
+        fixed 2026-04-28.  Pas used `Int(r * factor + 0.5)` which is
+        round-half-up, wrong for negatives.  Now mirrors C
+        (func.c:462): `r + (r<0 ? -0.5 : +0.5)` cast to i64 — round
+        half away from zero.  Also added the func.c:447 NULL-second-
+        arg early-return arm, the |r|>2^52 no-fractional-part arm,
+        and bumped the n cap from 15 to 30 per C.  n>0 path still
+        uses factor multiply (TODO: switch to `%!.*f` once
+        sqlite3RenderNumF gains a fixed-point arm — currently only
+        does general/`%!.*g`); ordinary inputs match C.
+      [X] **c) `last_insert_rowid()` / `changes()` / `total_changes()`
+        crashed with EAccessViolation** — fixed 2026-04-28.  Root
+        cause: `sqlite3VdbeMakeReady` zero-initialised aMem[]
+        registers but never set `Mem.db`.  `sqlite3_context_db_handle
+        (pCtx) := pCtx^.pOut^.db` therefore deref'd a NULL.  Now
+        mirrors C's `initMemArray` (vdbeaux.c:2740) — every Mem slot
+        gets pVdbe^.db on allocation.  Verified DiagDate
+        last_insert_rowid / changes / total_changes → PASS, no
+        TestExplainParity regression (1012 pass / 14 diverge — same).
+      [X] **d) `date()` formatted as "2024- 1-15"** — fixed
+        2026-04-28.  Pascal's `SysUtils.Format` does not honour the
+        C `%0Nd` 0-pad+width syntax used throughout date.c snpFmt
+        callers.  Replaced `snpFmt` with a hand-rolled C-style
+        snprintf clone (parses %0Nd / %lld / %s / %05.3f / %.16g).
+        Closes the date / strftime ymd / unixepoch DiagDate
+        divergences.
+      [X] **e) Date-time functions never registered with the DB** —
+        fixed 2026-04-28.  `sqlite3RegisterDateTimeFunctions` existed
+        but was not invoked by `sqlite3RegisterBuiltinFunctions`, so
+        date() / time() / datetime() / julianday() / strftime() /
+        unixepoch() resolved at prepare time only via the global
+        builtins hash being unpopulated → SQL parser registered them
+        as user functions returning NULL.  Wired through.
+      [ ] **f) `time('13:45:00')` / `datetime('2024-01-15 13:45:00')`
+        return NULL** — `parseDateTime` (codegen.pas:25867) is too
+        strict.  It requires `Length(s) >= 10` (rejecting time-only
+        like "13:45:00") and reads the time component starting at
+        offset 11 with `getN(p,2)` which returns -1 on the space
+        separator at offset 11 of "2024-01-15 13:45:00".  Need to
+        port the proper parseHhMmSs / parseDateOrTime arm from
+        date.c.
+      [ ] **g) `julianday('2000-01-01 12:00:00')` returns NULL** —
+        same root cause as (f) — parseDateTime fails on the space-
+        separated form.  Will close once (f) lands.
+      [ ] **h) `strftime('%w', ...)` returns "%w"** — `%w` (weekday)
+        and likely other format chars (`%j`, `%U`, `%W`) are not
+        handled in the strftime arm at codegen.pas:26085.  Port the
+        full strftimeFunc switch from date.c.
+      [ ] **i) Date modifiers (`+5 days`, `-1 month`, `start of
+        month`) ignored** — `dateFunc` / `datetimeFunc` only handle
+        argc=1 path; the modifier-list arm (parseModifier in
+        date.c:584) is not ported.  Until then the 2+arg dispatchers
+        register at MakeFD with nArg=1 only, so multi-arg calls fall
+        through to NULL.
+      [ ] **j) `sign(x)` returns NULL** — function not registered
+        at all.  Port C's signFunc (func.c:404) — 4 lines.
+      [ ] **k) `'abc' GLOB '[ab]bc'` mismatches** — char-class arm
+        of patternCompare missing or buggy.  Port from func.c.
+
   [X] **6.10 step 8** Auto-named result columns carry a trailing space
       on Pas — fixed.  Root cause was `sqlite3DbSpanDup`
       (passqlite3util.pas) skipping the leading/trailing whitespace

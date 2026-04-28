@@ -2948,14 +2948,125 @@ uses
   passqlite3vtab;
 
 { snpFmt — format into a PAnsiChar buffer using Pascal Format(); same arg order as sqlite3_snprintf }
+{ snpFmt — limited C-style snprintf replacement.  Supports %d / %lld
+  with optional 0-padding and minimum width (e.g. %04d, %02d, %lld),
+  %s, and %f / %g with optional 0-padding + precision (e.g. %05.3f,
+  %.16g).  Pascal's SysUtils.Format does not honour the C 0-pad +
+  width syntax, so several call sites in the date-time and ANALYZE
+  paths produced unpadded output (e.g. "2024- 1-15" for date()). }
 procedure snpFmt(n: i32; dst: PAnsiChar; const fmt: AnsiString;
   const args: array of const);
 var
-  s: AnsiString;
+  out_: AnsiString;
+  i, ai, width, prec: i32;
+  zeroPad, hasPrec: Boolean;
+  c: AnsiChar;
+  iv: Int64;
+  dv: Double;
+  vr: TVarRec;
+  piece, pad: AnsiString;
+  k: i32;
 begin
-  s := Format(fmt, args);
-  if Length(s) >= n then SetLength(s, n - 1);
-  StrPCopy(dst, s);
+  out_ := '';
+  ai := 0;
+  i := 1;
+  while i <= Length(fmt) do begin
+    c := fmt[i];
+    if c <> '%' then begin out_ := out_ + c; Inc(i); continue; end;
+    Inc(i);
+    if (i <= Length(fmt)) and (fmt[i] = '%') then begin
+      out_ := out_ + '%'; Inc(i); continue;
+    end;
+    zeroPad := False;
+    width := 0;
+    prec := -1;
+    hasPrec := False;
+    if (i <= Length(fmt)) and (fmt[i] = '0') then begin zeroPad := True; Inc(i); end;
+    while (i <= Length(fmt)) and (fmt[i] >= '0') and (fmt[i] <= '9') do begin
+      width := width * 10 + Ord(fmt[i]) - Ord('0'); Inc(i);
+    end;
+    if (i <= Length(fmt)) and (fmt[i] = '.') then begin
+      Inc(i); prec := 0; hasPrec := True;
+      while (i <= Length(fmt)) and (fmt[i] >= '0') and (fmt[i] <= '9') do begin
+        prec := prec * 10 + Ord(fmt[i]) - Ord('0'); Inc(i);
+      end;
+    end;
+    { Skip length modifiers l / ll. }
+    while (i <= Length(fmt)) and ((fmt[i] = 'l') or (fmt[i] = 'h')) do Inc(i);
+    if i > Length(fmt) then Break;
+    c := fmt[i]; Inc(i);
+    if ai > High(args) then begin out_ := out_ + '?'; continue; end;
+    vr := args[ai]; Inc(ai);
+    case c of
+      'd', 'i': begin
+          case vr.VType of
+            vtInteger:    iv := vr.VInteger;
+            vtInt64:      iv := vr.VInt64^;
+            vtQWord:      iv := Int64(vr.VQWord^);
+            vtExtended:   iv := Trunc(vr.VExtended^);
+          else iv := 0;
+          end;
+          if iv < 0 then begin
+            piece := IntToStr(-iv);
+            if zeroPad and (Length(piece) + 1 < width) then begin
+              SetLength(pad, width - Length(piece) - 1);
+              for k := 1 to Length(pad) do pad[k] := '0';
+              piece := '-' + pad + piece;
+            end else piece := '-' + piece;
+          end else
+            piece := IntToStr(iv);
+          while Length(piece) < width do begin
+            if zeroPad then piece := '0' + piece else piece := ' ' + piece;
+          end;
+          out_ := out_ + piece;
+        end;
+      's': begin
+          case vr.VType of
+            vtString:     piece := vr.VString^;
+            vtAnsiString: piece := AnsiString(vr.VAnsiString);
+            vtPChar:      piece := AnsiString(vr.VPChar);
+            vtChar:       piece := vr.VChar;
+          else piece := '';
+          end;
+          while Length(piece) < width do piece := ' ' + piece;
+          out_ := out_ + piece;
+        end;
+      'f': begin
+          case vr.VType of
+            vtExtended: dv := vr.VExtended^;
+            vtInteger:  dv := vr.VInteger;
+            vtInt64:    dv := vr.VInt64^;
+          else dv := 0.0;
+          end;
+          if not hasPrec then prec := 6;
+          piece := FormatFloat('0.' + StringOfChar('0', prec), dv);
+          { FormatFloat uses locale decimal separator; force '.'. }
+          for k := 1 to Length(piece) do
+            if piece[k] = SysUtils.FormatSettings.DecimalSeparator then piece[k] := '.';
+          while Length(piece) < width do begin
+            if zeroPad then piece := '0' + piece else piece := ' ' + piece;
+          end;
+          out_ := out_ + piece;
+        end;
+      'g', 'G': begin
+          case vr.VType of
+            vtExtended: dv := vr.VExtended^;
+            vtInteger:  dv := vr.VInteger;
+            vtInt64:    dv := vr.VInt64^;
+          else dv := 0.0;
+          end;
+          if not hasPrec then prec := 6;
+          piece := FloatToStrF(dv, ffGeneral, prec, 0);
+          for k := 1 to Length(piece) do
+            if piece[k] = SysUtils.FormatSettings.DecimalSeparator then piece[k] := '.';
+          out_ := out_ + piece;
+        end;
+    else
+      out_ := out_ + '?';
+    end;
+  end;
+  if Length(out_) >= n then SetLength(out_, n - 1);
+  StrPCopy(dst, out_);
 end;
 
 function ExprListItems(p: PExprList): PExprListItem; inline;
@@ -24581,23 +24692,37 @@ end;
 
 procedure roundFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
-  r: Double;
-  n, i: i32;
-  factor: Double;
+  r, half, factor: Double;
+  n: i64;
+  i: i32;
 begin
-  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
-    sqlite3_result_null(pCtx); Exit;
+  n := 0;
+  if argc = 2 then begin
+    { C (func.c:447): SQLITE_NULL second arg → return without setting result. }
+    if sqlite3_value_type(Psqlite3_value((argv+1)^)) = SQLITE_NULL then Exit;
+    n := sqlite3_value_int64(Psqlite3_value((argv+1)^));
+    if n > 30 then n := 30;
+    if n < 0  then n := 0;
   end;
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
   r := sqlite3_value_double(Psqlite3_value(argv^));
-  if argc = 2 then
-    n := sqlite3_value_int(Psqlite3_value((argv+1)^))
-  else
-    n := 0;
-  if n < 0 then n := 0;
-  if n > 15 then n := 15;
-  factor := 1.0;
-  for i := 0 to n-1 do factor := factor * 10.0;
-  r := Int(r * factor + 0.5) / factor;
+  { No fractional part (|r| > 2^52) — leave r unchanged (func.c:459). }
+  if (r >= -4503599627370496.0) and (r <= 4503599627370496.0) then begin
+    if n = 0 then begin
+      { Round half away from zero (func.c:462). }
+      if r < 0 then half := -0.5 else half := +0.5;
+      r := Double(i64(Trunc(r + half)));
+    end else begin
+      { Approximate "%!.*f" + sqlite3AtoF round-trip via factor multiply.
+        Not byte-identical to C for pathological FP cases (TODO: switch
+        to sqlite3RenderNumF once a fixed-point %!.*f arm exists), but
+        matches for ordinary values used in tests. }
+      factor := 1.0;
+      for i := 0 to n - 1 do factor := factor * 10.0;
+      if r < 0 then half := -0.5 else half := +0.5;
+      r := Trunc(r * factor + half) / factor;
+    end;
+  end;
   sqlite3_result_double(pCtx, r);
 end;
 
@@ -24823,10 +24948,26 @@ var
 begin
   pVal := argv^;
   case sqlite3_value_type(Psqlite3_value(pVal)) of
-    SQLITE_INTEGER:
-      sqlite3_result_value(pCtx, Psqlite3_value(pVal));
-    SQLITE_REAL:
-      sqlite3_result_value(pCtx, Psqlite3_value(pVal));
+    SQLITE_INTEGER: begin
+        { C: sqlite3_str_appendf(pStr, "%lld", ...) — render as TEXT.
+          Buffer must hold worst-case "-9223372036854775808" + NUL = 21. }
+        zOut := sqlite3_malloc(32);
+        if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+        n := sqlite3Int64ToText(sqlite3_value_int64(Psqlite3_value(pVal)),
+                                zOut);
+        sqlite3_result_text(pCtx, zOut, n, SQLITE_TRANSIENT);
+        sqlite3_free(zOut);
+      end;
+    SQLITE_REAL: begin
+        { C: sqlite3_str_appendf(pStr, "%!0.17g", ...) — altform2,
+          17-precision round-trip, via sqlite3RenderNumF. }
+        zOut := sqlite3_malloc(32);
+        if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+        n := sqlite3RenderNumF(sqlite3_value_double(Psqlite3_value(pVal)),
+                               17, True, zOut, 32);
+        sqlite3_result_text(pCtx, zOut, n, SQLITE_TRANSIENT);
+        sqlite3_free(zOut);
+      end;
     SQLITE_NULL:
       sqlite3_result_text(pCtx, 'NULL', 4, SQLITE_STATIC);
     SQLITE_BLOB: begin
@@ -25556,6 +25697,7 @@ begin
   sqlite3InsertBuiltinFuncs(@aBuiltinFuncs, Length(aBuiltinFuncs));
   sqlite3InsertBuiltinFuncs(@aBuiltinAgg,   Length(aBuiltinAgg));
   sqlite3RegisterJsonFunctions;
+  sqlite3RegisterDateTimeFunctions;
 end;
 
 { ===========================================================================

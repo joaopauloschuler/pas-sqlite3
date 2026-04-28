@@ -3011,6 +3011,17 @@ begin
     p^.aMem := PMem(sqlite3DbMallocZero(db,
                                        u64(nMem + 1) * SizeOf(TMem)));
     p^.nMem := nMem;
+    { initMemArray (vdbeaux.c:2740): every Mem slot must carry db so that
+      callbacks like sqlite3_context_db_handle (which reads pCtx^.pOut^.db)
+      do not deref a NULL.  Default flags are MEM_Undefined for aMem
+      registers; flag bits left zero are corrected on first write. }
+    if p^.aMem <> nil then begin
+      n := 0;
+      while n <= nMem do begin
+        (p^.aMem + n)^.db := db;
+        Inc(n);
+      end;
+    end;
   end;
   if (not vdbeDbMallocFailed(db)) and (nCursor > 0) then begin
     p^.apCsr := PPVdbeCursor(sqlite3DbMallocZero(db,
