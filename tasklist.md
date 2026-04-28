@@ -163,14 +163,15 @@ Important: At the end of this document, please find:
         Likely shares root cause with the `SELECT SUM/MIN/MAX`
         Δ=12..13 entry under step 6.
 
-  [ ] **6.10 step 8** Auto-named result columns carry a trailing space
-      on Pas.  `SELECT count(*) FROM t` returns column-name
-      `"count(*) "` (with trailing space) on Pas vs `"count(*)"` on C.
-      Verified via `src/tests/DiagColName.pas` after the SetColName /
-      SetNumCols port landed.  Bug lives in
-      `sqlite3GenerateColumnNames` (codegen.pas ~16710) — the auto-name
-      builder synthesises an extra space when naming non-COLUMN
-      expressions.  Localised fix; no bytecode-Δ contribution.
+  [X] **6.10 step 8** Auto-named result columns carry a trailing space
+      on Pas — fixed.  Root cause was `sqlite3DbSpanDup`
+      (passqlite3util.pas) skipping the leading/trailing whitespace
+      strip that the C reference performs (malloc.c:792).  Pas now
+      mirrors C: skip leading sqlite3Isspace, decrement n while
+      sqlite3Isspace at tail.  `SELECT count(*) FROM t` now returns
+      `"count(*)"`.  Verified via DiagColName 4/4 PASS; no bytecode-Δ
+      regression in TestExplainParity (1012 pass / 14 diverge — same
+      as before).
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
@@ -235,9 +236,7 @@ Important: At the end of this document, please find:
             sqlite3VdbeMemSetText.  Vdbe destructor extended with
             vdbeReleaseColNames to free Mem-owned strings.  Verified
             via src/tests/DiagColName.pas — sqlite3_column_name now
-            returns "a", "xyz" etc. instead of NULL.  Side-finding:
-            count(*) auto-name comes back as "count(*) " with a trailing
-            space on Pas vs "count(*)" on C — see new 6.10 step 8 entry.
+            returns "a", "xyz" etc. instead of NULL.
        [X] `sqlite3VdbeFrameMemDel` — ported in full (vdbeaux.c:2247);
             adds the frame to v->pDelFrame for deferred free.
        [X] `sqlite3VdbeExplainParent` — ported in full (vdbeaux.c:493).

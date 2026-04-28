@@ -2718,10 +2718,12 @@ function sqlite3DbSpanDup(db: Psqlite3db; zStart: PAnsiChar; zEnd: PAnsiChar): P
 var n: i32;
 begin
   if zStart = nil then begin Result := nil; Exit; end;
+  while (zStart^ <> #0) and (sqlite3Isspace(u8(zStart^)) <> 0) do Inc(zStart);
   if zEnd = nil then
     n := sqlite3Strlen30(zStart)
   else
     n := zEnd - zStart;
+  while (n > 0) and (sqlite3Isspace(u8((zStart + (n - 1))^)) <> 0) do Dec(n);
   Result := sqlite3DbStrNDup(db, zStart, u64(n));
 end;
 
