@@ -154,9 +154,11 @@ Important: At the end of this document, please find:
        `sqlite3PfMprintf` / `sqlite3MPrintf` (already fully ported in
        passqlite3printf).
   [ ] **6.20** port parser.pas stubs in full from C to pascal:
-       `sqlite3ExprListAppendVector`, `sqlite3Reindex`,
-       `sqlite3TriggerUpdateStep`, `addModuleArgument`,
-       `sqlite3CteNew`, `sqlite3WithAdd`.
+       `sqlite3ExprListAppendVector`, `sqlite3TriggerUpdateStep`,
+       `addModuleArgument`, `sqlite3CteNew`, `sqlite3WithAdd`.
+       (`sqlite3Reindex` ported in full — build.c:5564..5644 — including
+       internal `reindexCollationMatch` helper.  Dead code on the current
+       corpus; the gate exercises no REINDEX statement, so Δ unchanged.)
   [ ] **6.21** port vdbe.pas stubs in full from C to pascal:
        `sqlite3VdbeMultiLoad`, `sqlite3VdbeScanStatus`,
        `sqlite3VdbeScanStatusRange`, `sqlite3VdbeSetP4KeyInfo`,

@@ -1794,14 +1794,136 @@ begin
   Result := pRet;
 end;
 
-{ ---- sqlite3Reindex (analyze.c / build.c) -------------------------------- }
-{ Phase 7.2e.6 stub.  The full body lives in build.c (REINDEX statement      }
-{ codegen).  Until Phase 8 ports build.c's reindex helper, this is a no-op   }
-{ — sufficient for parser-only differential testing, since the gate test    }
-{ does not yet execute REINDEX statements end-to-end.                        }
-procedure sqlite3Reindex(pPse: PParse; pName1: PToken; pName2: PToken);
+{ ---- sqlite3Reindex (build.c:5564) --------------------------------------- }
+{ Phase 6.20: full port.  Generates code for the REINDEX statement:          }
+{   form 1   REINDEX                            -- rebuild every index       }
+{   form 2   REINDEX <collation>                -- rebuild indexes using it  }
+{   form 3/4 REINDEX ?<db>.?<idx-or-tbl>        -- rebuild named index/table }
+{   form 5   REINDEX EXPRESSIONS                -- rebuild all expr indexes  }
+{ Ambiguous names match the union of forms 2..5.                             }
+function reindexCollationMatch(zColl: PAnsiChar; pIndex: PIndex2): i32;
+var
+  i:    i32;
+  azC:  PPAnsiChar;
 begin
-  { TODO Phase 8: port build.c reindex codegen. }
+  Assert(zColl <> nil);
+  azC := PPAnsiChar(pIndex^.azColl);
+  for i := 0 to i32(pIndex^.nColumn) - 1 do begin
+    Assert(azC[i] <> nil);
+    if sqlite3StrICmp(PChar(azC[i]), PChar(zColl)) = 0 then begin
+      Result := 1;
+      Exit;
+    end;
+  end;
+  Result := 0;
+end;
+
+procedure sqlite3Reindex(pPse: PParse; pName1: PToken; pName2: PToken);
+var
+  z:        PAnsiChar;
+  zDb:      PAnsiChar;
+  iReDb:    i32;
+  db:       PTsqlite3;
+  pObjName: PToken;
+  bMatch:   i32;
+  zColl:    PAnsiChar;
+  pReTab:   PTable2;
+  pReIndex: PIndex2;
+  isExprIdx: i32;
+  bAll:     i32;
+  iDb:      i32;
+  k:        PHashElem;
+  pTab:     PTable2;
+  pIdx:     PIndex2;
+  pDb:      passqlite3util.PDb;
+begin
+  z         := nil;
+  zDb       := nil;
+  iReDb     := -1;
+  db        := pPse^.db;
+  pObjName  := nil;
+  bMatch    := 0;
+  zColl     := nil;
+  pReTab    := nil;
+  pReIndex  := nil;
+  isExprIdx := 0;
+  bAll      := 0;
+
+  if sqlite3ReadSchema(pPse) <> SQLITE_OK then Exit;
+
+  if pName1 = nil then begin
+    bMatch := 1;
+    bAll   := 1;
+  end else if (pName2 = nil) or (pName2^.z = nil) then begin
+    Assert(pName1^.z <> nil);
+    z := sqlite3NameFromToken(db, pName1);
+    if z = nil then Exit;
+  end else begin
+    iReDb := sqlite3TwoPartName(pPse, pName1, pName2, @pObjName);
+    if iReDb < 0 then Exit;
+    z := sqlite3NameFromToken(db, pObjName);
+    if z = nil then Exit;
+    zDb := db^.aDb[iReDb].zDbSName;
+  end;
+
+  if bAll = 0 then begin
+    if (zDb = nil) and (sqlite3StrICmp(PChar(z), 'expressions') = 0) then begin
+      isExprIdx := 1;
+      bMatch    := 1;
+    end;
+    if (zDb = nil) and (sqlite3FindCollSeq(db, db^.enc, z, 0) <> nil) then begin
+      zColl  := z;
+      bMatch := 1;
+    end;
+    if zColl = nil then begin
+      pReTab := sqlite3FindTable(db, z, zDb);
+      if pReTab <> nil then bMatch := 1;
+    end;
+    if zColl = nil then begin
+      pReIndex := sqlite3FindIndex(db, z, zDb);
+      if pReIndex <> nil then bMatch := 1;
+    end;
+  end;
+
+  if bMatch <> 0 then begin
+    iDb := 0;
+    while iDb < db^.nDb do begin
+      pDb := @db^.aDb[iDb];
+      Assert(pDb <> nil);
+      if (iReDb >= 0) and (iReDb <> iDb) then begin
+        Inc(iDb);
+        Continue;
+      end;
+      if pDb^.pSchema = nil then begin
+        Inc(iDb);
+        Continue;
+      end;
+      k := pDb^.pSchema^.tblHash.first;
+      while k <> nil do begin
+        pTab := PTable2(k^.data);
+        if pTab^.eTabType <> TABTYP_VTAB then begin
+          pIdx := pTab^.pIndex;
+          while pIdx <> nil do begin
+            if (bAll <> 0)
+               or (pTab = pReTab)
+               or (pIdx = pReIndex)
+               or ((isExprIdx <> 0) and (indexBHasExpr(pIdx) <> 0))
+               or ((zColl <> nil) and (reindexCollationMatch(zColl, pIdx) <> 0)) then
+            begin
+              sqlite3BeginWriteOperation(pPse, 0, iDb);
+              sqlite3RefillIndex(pPse, pIdx, -1);
+            end;
+            pIdx := pIdx^.pNext;
+          end;
+        end;
+        k := PHashElem(k^.next);
+      end;
+      Inc(iDb);
+    end;
+  end else
+    sqlite3ErrorMsg(pPse, 'unable to identify the object to be reindexed');
+
+  sqlite3DbFree(db, z);
 end;
 
 { ---- sqlite3TriggerUpdateStep / InsertStep / DeleteStep / SelectStep ----- }

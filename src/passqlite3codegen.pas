@@ -2936,6 +2936,11 @@ procedure sqlite3RegisterJsonFunctions;
 
 procedure sqlite3ExpirePreparedStatements(db: PTsqlite3; iCode: i32);
 
+{ Phase 6.20: exposed for sqlite3Reindex (passqlite3parser). }
+function indexBHasExpr(pIdx: PIndex2): i32; inline;
+procedure sqlite3RefillIndex(pParse: PParse; pIndex: PIndex2;
+  memRootPage: i32);
+
 implementation
 
 uses
