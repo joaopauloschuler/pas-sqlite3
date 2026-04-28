@@ -362,31 +362,6 @@ Important: At the end of this document, please find:
         rows.  Likely shares root cause with (g) — agg-with-trailing-
         clauses gate at codegen.pas:18968.
 
-  [X] **6.10 step 16** Regressions surfaced by full-suite sweep on 2026-04-28
-      — both closed 2026-04-28.
-      [X] **a) TestAuthBuiltins hangs** — closed.  Root cause:
-        TestAuthBuiltins.pas:124 calls `sqlite3RegisterDateTimeFunctions`
-        explicitly, but `sqlite3RegisterBuiltinFunctions` (called at
-        line 123) already calls it transitively (codegen.pas).  The
-        second `sqlite3InsertBuiltinFuncs(@aDateFuncs)` finds each
-        aDateFuncs[i] already in its bucket (functionSearch returns
-        `&aDateFuncs[i]` — itself), then `pOther^.pNext := @aDef[i]`
-        wires `aDateFuncs[i].pNext := &aDateFuncs[i]` — a self-loop
-        that hangs sqlite3FindFunction's variant-chain walk at slot 22.
-        Same mechanism corrupts slot 8 (strftime collides with abs/avg).
-        Fix: defensive idempotence in `sqlite3InsertBuiltinFuncs` —
-        walk the variant chain rooted at pOther; if `&aDef[i]` is
-        already linked, skip.  C asserts `pOther!=&aDef[i] &&
-        pOther->pNext!=&aDef[i]` in debug; we degrade gracefully.
-        Verified: 34/0 PASS.
-      [X] **b) TestWhereExpr T14a..T14i FAIL** — closed.  Independent
-        bug: `sqlite3IsLikeFunction` (codegen.pas) called
-        `sqlite3FindFunction(db, zName, -1, ...)`, but matchQuality
-        returns 0 for arity mismatch when `p^.nArg >= 0`.  C version
-        (func.c) passes `pExpr->x.pList->nExpr` (actual arg count),
-        not -1.  Fix: read nExpr from pExpr^.x.pList^.nExpr.
-        Verified: 84/84 PASS.
-
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
         the sqlite_schema scrub now uses one-pass inline delete.
@@ -555,11 +530,6 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_db_cacheflush` (main.c:1986) — flush dirty pages.
        [ ] `sqlite3_db_config` — raw varargs entry point (currently only
             typed wrappers `_text`/`_lookaside`/`_int` exist).
-       [X] `sqlite3_get_autocommit` (main.c:3936) — ported 2026-04-28
-            (passqlite3main.pas) — returns db^.autoCommit.
-       [X] `sqlite3_txn_state` (main.c) — ported 2026-04-28
-            (passqlite3main.pas) — folds sqlite3BtreeTxnState across
-            db^.aDb[].
        [ ] `sqlite3_filename` / `sqlite3_free_filename` — VFS filename
             helpers.
        [ ] `sqlite3_set_clientdata` — typed pointer slots on the db.
@@ -568,9 +538,6 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [X] `sqlite3_stmt_busy` (vdbeapi.c) — ported 2026-04-28
             (passqlite3main.pas) — `v <> nil and eVdbeState =
             VDBE_RUN_STATE`.
-       [X] `sqlite3_stmt_readonly` — ported 2026-04-28
-            (passqlite3main.pas) — `vdbeFlags and VDBF_ReadOnly`,
-            returns 1 for nil stmt to match C reference.
        [ ] `sqlite3_stmt_explain` — current explain mode (0/1/2).
        [ ] `sqlite3_stmt_status` — per-stmt counters.
        [ ] `sqlite3_stmt_scanstatus` / `_scanstatus_v2` /
@@ -610,45 +577,6 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [X] `sqlite3_interrupt` / `sqlite3_is_interrupted` — ported
             2026-04-28 (passqlite3main.pas) — sets/reads
             db^.u1.isInterrupted.
-       [X] `sqlite3_changes` / `sqlite3_changes64` — ported 2026-04-28
-            (passqlite3main.pas) — returns db^.nChange.
-       [X] `sqlite3_total_changes` / `_total_changes64` — ported
-            2026-04-28 (passqlite3main.pas) — returns db^.nTotalChange.
-       [X] `sqlite3_last_insert_rowid` / `_set_last_insert_rowid` —
-            ported 2026-04-28 (passqlite3main.pas) — db^.lastRowid.
-       [X] `sqlite3_errcode` / `sqlite3_extended_errcode` /
-            `sqlite3_extended_result_codes` — ported 2026-04-28
-            (passqlite3main.pas).
-       [X] `sqlite3_set_errmsg` — ported 2026-04-28
-            (passqlite3main.pas).  Faithful one-to-one port of main.c:2741:
-            SafetyCheckOk gate, mutex enter/leave, dispatches to
-            sqlite3ErrorWithMsg when zMsg<>nil else sqlite3Error.
-       [X] `sqlite3_error_offset` — ported 2026-04-28
-            (passqlite3main.pas) — returns db^.errByteOffset when an
-            error is pending, else -1.
-       [X] `sqlite3_system_errno` — ported 2026-04-28
-            (passqlite3main.pas) — db^.iSysErrno.
-       [X] `sqlite3_libversion_number` — ported 2026-04-28
-            (passqlite3main.pas).  Also exported sqlite3_libversion +
-            sqlite3_sourceid.
-       [X] `sqlite3_threadsafe` — ported 2026-04-28
-            (passqlite3main.pas) — returns 1 (bFullMutex=1).
-       [X] `sqlite3_sleep` — ported 2026-04-28 (passqlite3main.pas)
-            via sqlite3OsSleep.
-       [ ] `sqlite3_setlk_timeout` — POSIX lock timeout.
-       [X] `sqlite3_msize` — ported 2026-04-28 (passqlite3main.pas)
-            via FPC's MemSize.
-       [X] `sqlite3_release_memory` — ported 2026-04-28
-            (passqlite3main.pas) — no-op (SQLITE_ENABLE_MEMORY_MANAGEMENT
-            off in build), matching upstream OMIT path.
-       [X] `sqlite3_memory_highwater` — ported 2026-04-28
-            (passqlite3main.pas) via sqlite3_status64.
-       [X] `sqlite3_soft_heap_limit64` / `sqlite3_hard_heap_limit64` /
-            `sqlite3_soft_heap_limit` — ported 2026-04-28
-            (passqlite3main.pas).  Memory-management is off in this
-            build, so the no-op return path matches upstream malloc.c.
-       [X] `sqlite3_limit` — ported 2026-04-28 (passqlite3main.pas) —
-            full body with aHardLimit clamp + LENGTH 100-floor.
        [ ] `sqlite3_uri_int64` — URI-parameter integer accessor.
        [ ] `sqlite3_compileoption_used` (ctime.c) — also gated on the
             6.10 step 12 task that touches the compile-options table.
