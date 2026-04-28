@@ -23168,10 +23168,47 @@ end;
 
 function sqlite3SrcItemAttachSubquery(pParse: PParse; p: PSrcItem;
   pSubquery: PSelect; isSub: i32): i32;
+{ Port of build.c:5019 — wrap pSubquery in a TSubquery and attach to p.
+  When isSub<>0, attach a copy (sqlite3SelectDup) instead of pSubquery
+  itself; on OOM the helper returns 0 after freeing pSubquery. }
+var
+  pSubq: PSubquery;
+  db:    PTsqlite3;
+  pSel:  PSelect;
 begin
-  { Phase 7 }
-  sqlite3SelectDelete(pParse^.db, pSubquery);
-  Result := 0;
+  Assert(pSubquery <> nil);
+  Assert((p^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0);
+  db := pParse^.db;
+  if (p^.fg.fgBits3 and $01) <> 0 then begin
+    { fixedSchema bit set — clear the schema pointer and the bit }
+    p^.u4.pSchema := nil;
+    p^.fg.fgBits3 := p^.fg.fgBits3 and not u8($01);
+  end else if p^.u4.zDatabase <> nil then begin
+    sqlite3DbFree(db, p^.u4.zDatabase);
+    p^.u4.zDatabase := nil;
+  end;
+  pSel := pSubquery;
+  if isSub <> 0 then begin
+    pSel := sqlite3SelectDup(db, pSubquery, 0);
+    if pSel = nil then begin
+      Result := 0;
+      Exit;
+    end;
+  end;
+  pSubq := sqlite3DbMallocRawNN(db, u64(SizeOf(TSubquery)));
+  p^.u4.pSubq := pSubq;
+  if pSubq = nil then begin
+    sqlite3SelectDelete(db, pSel);
+    Result := 0;
+    Exit;
+  end;
+  p^.fg.fgBits := p^.fg.fgBits or SRCITEM_FG_IS_SUBQUERY;
+  pSubq^.pSelect     := pSel;
+  pSubq^.addrFillSub := 0;
+  pSubq^.regReturn   := 0;
+  pSubq^.regResult   := 0;
+  pSubq^._pad        := 0;
+  Result := 1;
 end;
 
 function sqlite3SrcListAppendFromTerm(pParse: PParse; p: PSrcList;
@@ -23182,10 +23219,6 @@ var
   pItem: PSrcItem;
 begin
   db := pParse^.db;
-  if pSubquery <> nil then begin
-    { Subquery — just delete it for now }
-    sqlite3SelectDelete(db, pSubquery);
-  end;
   p := sqlite3SrcListAppend(pParse, p, pTable, pDatabase);
   if p <> nil then begin
     pItem := PSrcItem(PByte(SrcListItems(p)) +
@@ -23193,6 +23226,15 @@ begin
     if (pAlias <> nil) and (pAlias^.n > 0) then
       pItem^.zAlias :=
         sqlite3DbStrNDup(db, PChar(pAlias^.z), pAlias^.n);
+    if pSubquery <> nil then begin
+      if sqlite3SrcItemAttachSubquery(pParse, pItem, pSubquery, 0) <> 0 then begin
+        if (pSubquery^.selFlags and SF_NestedFrom) <> 0 then
+          { isNestedFrom — bit 6 of fgBits2 (TSrcItem layout: fromDDL(0),
+            isCte(1), notCte(2), isUsing(3), isOn(4), isSynthUsing(5),
+            isNestedFrom(6), rowidUsed(7)). }
+          pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $40;
+      end;
+    end;
     if pOn <> nil then begin
       pItem^.u3.pOn := pOn;
       pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $10;  { isOn bit }
@@ -23204,6 +23246,7 @@ begin
   end else begin
     sqlite3ExprDelete(db, pOn);
     sqlite3IdListDelete(db, pUsing);
+    if pSubquery <> nil then sqlite3SelectDelete(db, pSubquery);
   end;
   Result := p;
 end;

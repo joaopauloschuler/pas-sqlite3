@@ -99,6 +99,12 @@ Important: At the end of this document, please find:
           (c1..c7) — same root cause as count(*)+WHERE.
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
           materialise / co-routine path not ported).
+          Note 2026-04-28: `sqlite3SrcItemAttachSubquery` (build.c:5019)
+          + the subquery branch of `sqlite3SrcListAppendFromTerm`
+          (build.c:5102) are now real; the parser no longer drops the
+          inner SELECT.  Remaining work: view-expansion arm of
+          selectExpander (select.c:6045 IsView path) + sub-FROM
+          codegen / co-routine emission in sqlite3Select.
         [ ] `UPDATE t SET a=5 WHERE rowid=1` — Δ=14 (`sqlite3Update`
           still skeleton-only — see 11g.2.f open follow-on).
         [ ] `INSERT INTO u VALUES(1, 2);` (u declared `p PRIMARY KEY,
