@@ -355,6 +355,7 @@ type
   PExpr        = ^TExpr;
   PPExpr       = ^PExpr;
   PExprList    = ^TExprList;
+  PPExprList   = ^PExprList;
   PSelect      = ^TSelect;
   PWindow      = ^TWindow;
   PPWindow     = ^PWindow;
@@ -1506,6 +1507,7 @@ const
   SQLITE_StarQuery      = u32($20000000);  { Star-query heuristic in computeMxChoice (sqliteInt.h:1931) }
   SQLITE_PropagateConst = u32($00008000);  { Constant propagation optimization (sqliteInt.h:1915) }
   SQLITE_ExistsToJoin   = u32($40000000);  { EXISTS-to-JOIN optimization (sqliteInt.h:1932) }
+  SQLITE_MinMaxOpt      = u32($00010000);  { The min/max optimization (sqliteInt.h:1916) }
 
   { TOPBIT — top bit of a 64-bit Bitmask (sqliteInt.h:1414); used by
     whereLoopAddBtree's "covering by bitmask" check to detect the
@@ -18357,6 +18359,60 @@ begin
   pNC^.ncFlags := pNC^.ncFlags and (not NC_InAggFunc);
 end;
 
+{ minMaxQuery — port of select.c:5377.  When the SELECT has exactly one
+  aggregate function (no GROUP BY, no HAVING) and that function is
+  min(x) / max(x) over a single argument, return WHERE_ORDERBY_MIN /
+  WHERE_ORDERBY_MAX and emit a synthesised single-element ORDER BY into
+  *ppMinMax so sqlite3WhereBegin can ride an existing index in the
+  matching direction and bail out after the first row. }
+function minMaxQuery(db: PTsqlite3; pFunc: PExpr; ppMinMax: PPExprList): u8;
+var
+  pEList:    PExprList;
+  zFunc:     PAnsiChar;
+  pOrderBy:  PExprList;
+  sortFlags: u8;
+  eRet:      u8;
+begin
+  eRet      := WHERE_ORDERBY_NORMAL;
+  sortFlags := 0;
+
+  Assert(ppMinMax^ = nil);
+  Assert(pFunc^.op = TK_AGG_FUNCTION);
+  Assert(not ExprHasProperty(pFunc, EP_WinFunc));
+  Assert(ExprUseXList(pFunc));
+  pEList := pFunc^.x.pList;
+  if (pEList = nil)
+     or (pEList^.nExpr <> 1)
+     or ExprHasProperty(pFunc, EP_WinFunc)
+     or OptimizationDisabled(db, SQLITE_MinMaxOpt) then
+  begin
+    Result := eRet; Exit;
+  end;
+  Assert(not ExprHasProperty(pFunc, EP_IntValue));
+  zFunc := pFunc^.u.zToken;
+  if sqlite3StrICmp(zFunc, 'min') = 0 then
+  begin
+    eRet := WHERE_ORDERBY_MIN;
+    if sqlite3ExprCanBeNull(ExprListItems(pEList)[0].pExpr) <> 0 then
+      sortFlags := KEYINFO_ORDER_BIGNULL;
+  end
+  else if sqlite3StrICmp(zFunc, 'max') = 0 then
+  begin
+    eRet      := WHERE_ORDERBY_MAX;
+    sortFlags := KEYINFO_ORDER_DESC;
+  end
+  else
+  begin
+    Result := eRet; Exit;
+  end;
+  pOrderBy := sqlite3ExprListDup(db, pEList, 0);
+  ppMinMax^ := pOrderBy;
+  Assert((pOrderBy <> nil) or (db^.mallocFailed <> 0));
+  if pOrderBy <> nil then
+    ExprListItems(pOrderBy)[0].fg.sortFlags := sortFlags;
+  Result := eRet;
+end;
+
 { markAggregateExprNode — Walker callback that rewrites TK_FUNCTION
   nodes whose resolved FuncDef carries xFinalize (aggregate) to
   TK_AGG_FUNCTION.  Pas's resolver does not do this rewrite today
@@ -18455,6 +18511,7 @@ var
   pC:      PAggInfoCol;
   pList:   PExprList;
   argItems: PExprListItem;
+  pCollAgg: Pointer;
 begin
   v := pParse^.pVdbe;
   Assert(pAggInfo^.iFirstReg > 0);
@@ -18481,6 +18538,23 @@ begin
     begin
       nArg   := 0;
       regAgg := 0;
+    end;
+    { NEEDCOLL — select.c:6918..6932.  Aggregate functions flagged with
+      SQLITE_FUNC_NEEDCOLL (min/max) need an OP_CollSeq immediately
+      before OP_AggStep so the comparison helper picks up the resolved
+      collation.  regHit stays 0 here (nAccumulator=0 in the simple
+      gate), matching C bytecode for `SELECT min(a) FROM t`. }
+    if (pF^.pFunc <> nil) and (pList <> nil)
+       and ((PTFuncDef(pF^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0) then
+    begin
+      pCollAgg := nil;
+      for j := 0 to nArg - 1 do
+      begin
+        pCollAgg := sqlite3ExprCollSeq(pParse, ExprListItems(pList)[j].pExpr);
+        if pCollAgg <> nil then break;
+      end;
+      if pCollAgg = nil then pCollAgg := pParse^.db^.pDfltColl;
+      sqlite3VdbeAddOp4(v, OP_CollSeq, 0, 0, 0, PAnsiChar(pCollAgg), P4_COLLSEQ);
     end;
     sqlite3VdbeAddOp3(v, OP_AggStep, 0, regAgg,
       pAggInfo^.iFirstReg + pAggInfo^.nColumn + i);
@@ -18657,6 +18731,8 @@ var
   canUseAgg:   Boolean;
   jAgg:        i32;
   pAggFunc:    PAggInfoFunc;
+  pMinMaxOrderBy: PExprList;
+  minMaxFlag:  u8;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -18969,9 +19045,6 @@ begin
         if pAggFunc^.iOBTab    >= 0 then begin canUseAgg := False; break; end;
         if (pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0 then
           begin canUseAgg := False; break; end;
-        if (pAggFunc^.pFunc <> nil)
-           and ((PTFuncDef(pAggFunc^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0)
-        then begin canUseAgg := False; break; end;
       end;
       { Bail also when result list contains a non-trivial reference to
         a base column (the directMode column-emit arm we don't fully
@@ -18991,10 +19064,24 @@ begin
         assignAggregateRegisters(pParse, pAggI2);
         resetAccumulatorSimple(pParse, pAggI2);
 
+        { MIN/MAX optimisation gate — select.c:8433.  When there is
+          exactly one aggregate, no GROUP BY, no HAVING, probe whether
+          it is min(x)/max(x) and if so synthesise a single-element
+          ORDER BY so sqlite3WhereBegin can ride an index in the
+          correct direction and trigger the early-out emitted by
+          sqlite3WhereMinMaxOptEarlyOut. }
+        pMinMaxOrderBy := nil;
+        minMaxFlag := WHERE_ORDERBY_NORMAL;
+        if pAggI2^.nFunc = 1 then
+          minMaxFlag := minMaxQuery(pParse^.db, pAggI2^.aFunc[0].pFExpr,
+                                    @pMinMaxOrderBy);
+
         pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere,
-                                    nil, nil, p, 0, 0);
+                                    pMinMaxOrderBy, nil, p, minMaxFlag, 0);
         if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
         updateAccumulatorSimple(pParse, pAggI2);
+        if minMaxFlag <> WHERE_ORDERBY_NORMAL then
+          sqlite3WhereMinMaxOptEarlyOut(v, pWInfo);
         sqlite3WhereEnd(pWInfo);
         finalizeAggFunctionsSimple(pParse, pAggI2);
 
@@ -27612,8 +27699,10 @@ begin
   MakeAgg(aBuiltinAgg[2], 1, AGG_ENC, @sumStep,  @sumFinal,   'sum');
   MakeAgg(aBuiltinAgg[3], 1, AGG_ENC, @sumStep,  @totalFinal, 'total');
   MakeAgg(aBuiltinAgg[4], 1, AGG_ENC, @avgStep,  @avgFinal,   'avg');
-  MakeAgg(aBuiltinAgg[5], 1, AGG_ENC or SQLITE_FUNC_MINMAX, @minStep, @minMaxFinal, 'min');
-  MakeAgg(aBuiltinAgg[6], 1, AGG_ENC or SQLITE_FUNC_MINMAX, @maxStep, @minMaxFinal, 'max');
+  MakeAgg(aBuiltinAgg[5], 1, AGG_ENC or SQLITE_FUNC_MINMAX or SQLITE_FUNC_NEEDCOLL,
+          @minStep, @minMaxFinal, 'min');
+  MakeAgg(aBuiltinAgg[6], 1, AGG_ENC or SQLITE_FUNC_MINMAX or SQLITE_FUNC_NEEDCOLL,
+          @maxStep, @minMaxFinal, 'max');
   MakeAgg(aBuiltinAgg[7], 1, AGG_ENC, @groupConcatStep, @groupConcatFinal, 'group_concat');
   MakeAgg(aBuiltinAgg[8], 2, AGG_ENC, @groupConcatStep, @groupConcatFinal, 'group_concat');
 end;

@@ -106,10 +106,15 @@ Important: At the end of this document, please find:
           path, not yet ported).
         [X] `SELECT SUM(a)` — closed 2026-04-28 by 6.10 step 7(c3..c7)
           aggregate-no-GROUP-BY codegen path.  `SELECT MIN/MAX(a)`
-          still differs by 1 op (C carries the
-          `WHERE_ORDERBY_MIN/MAX` early-out optimisation; Pas's
-          `sqlite3WhereMinMaxOptEarlyOut` is ported but not yet
-          driven from the agg gate via the minMaxQuery probe).
+          closed 2026-04-28 — added SQLITE_FUNC_NEEDCOLL to min/max
+          agg registration (matching WAGGREGATE nc=1 in func.c:3300/
+          3303), wired the OP_CollSeq emit before OP_AggStep in
+          updateAccumulatorSimple (select.c:6918..6932), and ported
+          minMaxQuery (select.c:5377) so the agg gate also passes
+          minMaxFlag / pMinMaxOrderBy through to sqlite3WhereBegin
+          and calls sqlite3WhereMinMaxOptEarlyOut after the inner
+          loop.  Removed the prior NEEDCOLL bail in the gate now
+          that updateAccumulatorSimple handles it.
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
           materialise / co-routine path not ported).
           Note 2026-04-28: `sqlite3SrcItemAttachSubquery` (build.c:5019)
@@ -842,9 +847,10 @@ Important: At the end of this document, please find:
        [X] `sqlite3WhereMinMaxOptEarlyOut` — ported in full (where.c:124..137)
             2026-04-28.  Honours `bOrderedInnerLoop` (bit 2 of bitwiseFlags) +
             `nOBSat`; emits OP_Goto to the innermost WHERE_COLUMN_IN level's
-            addrNxt or to pWInfo^.iBreak.  Productive once min/max-with-IN
-            aggregate codegen lands (6.10 step 7(c)).  TestExplainParity
-            unchanged (1012 pass / 14 diverge).
+            addrNxt or to pWInfo^.iBreak.  Wired into the agg-no-GROUP-BY
+            gate via the minMaxQuery probe 2026-04-28; productive once an
+            ordered index scan satisfies pMinMaxOrderBy.  Closed the MIN/
+            MAX divergence in TestExplainParity (1013/13 → 1015/11).
        [X] `sqlite3KeyInfoFromExprList` — completed in full (select.c:1598)
             2026-04-28.  CollSeq nil-stub replaced with productive
             `sqlite3ExprNNCollSeq(pParse, pItem^.pExpr)` — the helper has been
