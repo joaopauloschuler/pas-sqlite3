@@ -2008,6 +2008,7 @@ function  sqlite3ExprNNCollSeq(pParse: PParse; pE: PExpr): Pointer;
 function  sqlite3ExprCollSeq(pParse: PParse; pE: PExpr): Pointer;
 procedure sqlite3ColumnSetColl(db: PTsqlite3; pCol: PColumn;
   zColl: PAnsiChar);
+function  sqlite3ColumnColl(pCol: PColumn): PAnsiChar;
 procedure sqlite3ColumnPropertiesFromName(pTab: PTable2; pCol: PColumn);
 function  sqlite3IdListIndex(pList: PIdList; zName: PAnsiChar): i32;
 function  sqlite3DbReallocOrFree(db: PTsqlite3; p: Pointer;
@@ -17912,24 +17913,128 @@ begin
   Result := nil;
 end;
 
-{ sqlite3ExprNNCollSeq — get non-null CollSeq for expr (Phase 6.6 stub) }
-function sqlite3ExprNNCollSeq(pParse: PParse; pE: PExpr): Pointer;
-begin
-  Result := nil; { Phase 6.6 }
-end;
-
-{ sqlite3ExprCollSeq — get CollSeq for expr, may be nil (Phase 6.6 stub) }
+{ sqlite3ExprCollSeq — port of expr.c:248.  Walk the expression tree
+  honouring TK_COLLATE / EP_Collate precedence, descending through
+  TK_CAST / TK_UPLUS, TK_VECTOR, and SQLITE_AFF_DEFER function args, and
+  fetching the column collation for TK_COLUMN / TK_TRIGGER / TK_AGG_COLUMN
+  leaves.  Returns nil if no defined collation is in scope. }
 function sqlite3ExprCollSeq(pParse: PParse; pE: PExpr): Pointer;
+var
+  db:    PTsqlite3;
+  pColl: Pointer;
+  p:     PExpr;
+  pNext: PExpr;
+  op:    i32;
+  j, i:  i32;
+  zColl: PAnsiChar;
+  pList: PExprList;
+  items: PExprListItem;
 begin
-  Result := nil; { Phase 6.6 }
+  db    := pParse^.db;
+  pColl := nil;
+  p     := pE;
+  while p <> nil do begin
+    op := p^.op;
+    if op = TK_REGISTER then op := p^.op2;
+    if ((op = TK_AGG_COLUMN) and (p^.y.pTab <> nil))
+       or (op = TK_COLUMN) or (op = TK_TRIGGER) then
+    begin
+      j := p^.iColumn;
+      if j >= 0 then begin
+        zColl := sqlite3ColumnColl(@p^.y.pTab^.aCol[j]);
+        pColl := sqlite3FindCollSeq(db, db^.enc, zColl, 0);
+      end;
+      Break;
+    end;
+    if (op = TK_CAST) or (op = TK_UPLUS) then begin
+      p := p^.pLeft;
+      continue;
+    end;
+    if (op = TK_VECTOR)
+       or ((op = TK_FUNCTION) and (Byte(p^.affExpr) = SQLITE_AFF_DEFER)) then
+    begin
+      p := ExprListItems(p^.x.pList)[0].pExpr;
+      continue;
+    end;
+    if op = TK_COLLATE then begin
+      pColl := sqlite3GetCollSeq(pParse, db^.enc, nil, p^.u.zToken);
+      Break;
+    end;
+    if (p^.flags and EP_Collate) <> 0 then begin
+      if (p^.pLeft <> nil) and ((p^.pLeft^.flags and EP_Collate) <> 0) then begin
+        p := p^.pLeft;
+      end else begin
+        pNext := p^.pRight;
+        if ExprUseXList(p) and (p^.x.pList <> nil) and (db^.mallocFailed = 0) then begin
+          pList := p^.x.pList;
+          items := ExprListItems(pList);
+          for i := 0 to pList^.nExpr - 1 do begin
+            if (items[i].pExpr^.flags and EP_Collate) <> 0 then begin
+              pNext := items[i].pExpr;
+              Break;
+            end;
+          end;
+        end;
+        p := pNext;
+      end;
+    end else begin
+      Break;
+    end;
+  end;
+  if sqlite3CheckCollSeq(pParse, pColl) <> 0 then
+    pColl := nil;
+  Result := pColl;
 end;
 
-{ sqlite3ColumnSetColl — attach a collation name to a Column }
+{ sqlite3ExprNNCollSeq — port of expr.c:321.  As sqlite3ExprCollSeq, but
+  fall back to db^.pDfltColl when no defined collation is found. }
+function sqlite3ExprNNCollSeq(pParse: PParse; pE: PExpr): Pointer;
+var p: Pointer;
+begin
+  p := sqlite3ExprCollSeq(pParse, pE);
+  if p = nil then p := pParse^.db^.pDfltColl;
+  AssertH(p <> nil, 'ExprNNCollSeq pDfltColl');
+  Result := p;
+end;
+
+{ sqlite3ColumnSetColl — port of build.c:720.  Append a NUL-terminated
+  collation name to the packed zCnName allocation (name + NUL [+ type +
+  NUL] + collation + NUL) so sqlite3ColumnColl can recover it later. }
 procedure sqlite3ColumnSetColl(db: PTsqlite3; pCol: PColumn;
   zColl: PAnsiChar);
+var
+  nColl: i64;
+  n:     i64;
+  zNew:  PAnsiChar;
 begin
-  pCol^.colFlags := pCol^.colFlags or COLFLAG_HASCOLL;
-  { Full implementation deferred to Phase 6.6 }
+  AssertH(zColl <> nil, 'ColumnSetColl zColl');
+  n := i64(sqlite3Strlen30(pCol^.zCnName)) + 1;
+  if (pCol^.colFlags and COLFLAG_HASTYPE) <> 0 then
+    n := n + i64(sqlite3Strlen30(pCol^.zCnName + n)) + 1;
+  nColl := i64(sqlite3Strlen30(zColl)) + 1;
+  zNew := sqlite3DbRealloc(db, pCol^.zCnName, u64(nColl + n));
+  if zNew <> nil then begin
+    pCol^.zCnName := zNew;
+    Move(zColl^, (pCol^.zCnName + n)^, nColl);
+    pCol^.colFlags := pCol^.colFlags or COLFLAG_HASCOLL;
+  end;
+end;
+
+{ sqlite3ColumnColl — port of build.c:745.  Walk over the name (and type
+  if COLFLAG_HASTYPE) NUL-terminators packed into zCnName and return the
+  collation slot.  nil if the column has no defined collation. }
+function sqlite3ColumnColl(pCol: PColumn): PAnsiChar;
+var z: PAnsiChar;
+begin
+  if (pCol^.colFlags and COLFLAG_HASCOLL) = 0 then begin
+    Result := nil; Exit;
+  end;
+  z := pCol^.zCnName;
+  while z^ <> #0 do Inc(z);
+  if (pCol^.colFlags and COLFLAG_HASTYPE) <> 0 then begin
+    repeat Inc(z); until z^ = #0;
+  end;
+  Result := z + 1;
 end;
 
 { sqlite3ColumnPropertiesFromName — set Column flags from name heuristics }

@@ -250,11 +250,20 @@ Important: At the end of this document, please find:
        `whereRightSubexprIsColumn`, `sqlite3WhereMinMaxOptEarlyOut`,
        `wherePathMatchSubqueryOB`, `sqlite3KeyInfoFromExprList`,
        `sqlite3SelectWalkAssert2`, `sqlite3SelectAddTypeInfo`,
-       `sqlite3SelectCheckOnClauses`, `sqlite3ExprNNCollSeq`,
-       `sqlite3ExprCollSeq`,
+       `sqlite3SelectCheckOnClauses`,
        `sqlite3WhereExplainBloomFilter`, `sqlite3WhereAddExplainText`,
        `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep`,
        `sqlite3BtreeHoldsAllMutexes`.
+       [X] `sqlite3ExprCollSeq` / `sqlite3ExprNNCollSeq` — ported in full
+            (expr.c:248, expr.c:321).  Walks TK_COLLATE / EP_Collate
+            precedence, descends through TK_CAST/TK_UPLUS/TK_VECTOR and
+            SQLITE_AFF_DEFER, fetches column collation via the now-real
+            sqlite3ColumnColl.  Productive return values flow into
+            sqlite3KeyInfoFromExprList consumers; further KeyInfo
+            wiring still gated on the rest of 6.26.
+       [X] `sqlite3ColumnSetColl` / `sqlite3ColumnColl` — ported in full
+            (build.c:720, build.c:745).  Packs/recovers collation name
+            in the zCnName allocation.  Was a Phase 6.6 stub pair.
   [ ] **6.27** port codegen.pas alter / attach / analyze / vacuum / FK /
        extension / scalar-function stubs in full from C to pascal:
        `sqlite3AlterRenameTable`, `sqlite3AlterFinishAddColumn`,
