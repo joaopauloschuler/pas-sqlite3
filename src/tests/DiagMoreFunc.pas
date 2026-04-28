@@ -173,6 +173,16 @@ begin
   Probe('printf %q',          'SELECT printf(''%q'',''it''''s'')');
   Probe('printf %Q str',      'SELECT printf(''%Q'',''hi'')');
   Probe('printf %Q null',     'SELECT printf(''%Q'',NULL)');
+  Probe('printf %w',          'SELECT printf(''%w'',''col"name'')');
+  Probe('printf %w null',     'SELECT printf(''%w'',NULL)');
+
+  // --- unistr Unicode escape decoder (func.c:1174) ---
+  Probe('unistr 4hex',        'SELECT unistr(''a\0041b'')');
+  Probe('unistr backslash',   'SELECT unistr(''a\\b'')');
+  Probe('unistr u',           'SELECT unistr(''é'')');
+  Probe('unistr U',           'SELECT unistr(''\U0001F600'')');
+  Probe('unistr +',           'SELECT unistr(''\+01F600'')');
+  Probe('unistr null',        'SELECT unistr(NULL)');
 
   // --- Numeric coerce edges ---
   Probe('concat number',      'SELECT 1+''2''');

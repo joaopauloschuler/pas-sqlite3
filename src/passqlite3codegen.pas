@@ -24835,6 +24835,82 @@ begin
   end;
 end;
 
+{ unistrFunc — port of func.c:1174 unistrFunc.  Decodes Unicode escape
+  sequences \XXXX (4 hex), \+XXXXXX (6 hex), \uXXXX (4 hex), \UXXXXXXXX
+  (8 hex); \\ → backslash.  Any other backslash form is an error. }
+function unistrIsNHex(z: PAnsiChar; N: i32; out v: u32): i32;
+var
+  i: i32;
+begin
+  v := 0;
+  for i := 0 to N - 1 do begin
+    if sqlite3Isxdigit(Ord(z[i])) = 0 then begin Result := 0; Exit; end;
+    v := (v shl 4) or sqlite3HexToInt(Ord(z[i]));
+  end;
+  Result := 1;
+end;
+
+procedure unistrFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+label
+  unistr_error;
+var
+  zIn, zOut: PAnsiChar;
+  nIn: i32;
+  i, j, n, k: i32;
+  v: u32;
+begin
+  zIn := sqlite3_value_text(Psqlite3_value(argv^));
+  if zIn = nil then Exit;
+  nIn := sqlite3_value_bytes(Psqlite3_value(argv^));
+  zOut := sqlite3_malloc(nIn + 1);
+  if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+  i := 0; j := 0;
+  while i < nIn do begin
+    k := i;
+    while (k < nIn) and (zIn[k] <> '\') do Inc(k);
+    if k >= nIn then begin
+      n := nIn - i;
+      if n > 0 then Move((zIn + i)^, (zOut + j)^, n);
+      Inc(j, n);
+      Break;
+    end;
+    n := k - i;
+    if n > 0 then begin
+      Move((zIn + i)^, (zOut + j)^, n);
+      Inc(j, n); Inc(i, n);
+    end;
+    if (i + 1 >= nIn) then goto unistr_error;
+    if zIn[i + 1] = '\' then begin
+      Inc(i, 2);
+      zOut[j] := '\'; Inc(j);
+    end else if sqlite3Isxdigit(Ord(zIn[i + 1])) <> 0 then begin
+      if (i + 4 >= nIn) or (unistrIsNHex(zIn + i + 1, 4, v) = 0) then goto unistr_error;
+      Inc(i, 5);
+      Inc(j, sqlite3AppendOneUtf8Character(PChar(zOut + j), v));
+    end else if zIn[i + 1] = '+' then begin
+      if (i + 7 >= nIn) or (unistrIsNHex(zIn + i + 2, 6, v) = 0) then goto unistr_error;
+      Inc(i, 8);
+      Inc(j, sqlite3AppendOneUtf8Character(PChar(zOut + j), v));
+    end else if zIn[i + 1] = 'u' then begin
+      if (i + 5 >= nIn) or (unistrIsNHex(zIn + i + 2, 4, v) = 0) then goto unistr_error;
+      Inc(i, 6);
+      Inc(j, sqlite3AppendOneUtf8Character(PChar(zOut + j), v));
+    end else if zIn[i + 1] = 'U' then begin
+      if (i + 9 >= nIn) or (unistrIsNHex(zIn + i + 2, 8, v) = 0) then goto unistr_error;
+      Inc(i, 10);
+      Inc(j, sqlite3AppendOneUtf8Character(PChar(zOut + j), v));
+    end else
+      goto unistr_error;
+  end;
+  zOut[j] := #0;
+  sqlite3_result_text(pCtx, zOut, j, SQLITE_TRANSIENT);
+  sqlite3_free(zOut);
+  Exit;
+unistr_error:
+  sqlite3_free(zOut);
+  sqlite3_result_error(pCtx, 'invalid Unicode escape', -1);
+end;
+
 { signFunc — port of func.c:2621 signFunc.
   Returns -1, 0, +1 for negative, zero, positive numeric arguments;
   returns NULL for non-numeric (TEXT/BLOB without numeric content) or NULL. }
@@ -26295,6 +26371,24 @@ begin
           end;
         end;
       end;
+      'w': begin
+        { %w — escape internal `"` characters by doubling them; no outer quotes.
+          Mirrors printf.c:848 etESCAPE_w.  NULL → "(NULL)" per printf.c:861. }
+        Inc(p);
+        if pVal <> nil then begin
+          if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then
+            App('(NULL)')
+          else begin
+            zStr := sqlite3_value_text(Psqlite3_value(pVal));
+            if zStr = nil then zStr := '';
+            s := AnsiString(zStr);
+            for i := 1 to Length(s) do begin
+              if s[i] = '"' then result_ := result_ + '"';
+              result_ := result_ + s[i];
+            end;
+          end;
+        end;
+      end;
       'Q': begin
         { %Q — wrap in single-quotes, doubling internal '.
           NULL → "NULL" (no quotes) per printf.c:861. }
@@ -26422,7 +26516,7 @@ const
   AGG_ENC  = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
 
 var
-  aBuiltinFuncs: array[0..77] of TFuncDef;
+  aBuiltinFuncs: array[0..78] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -26598,6 +26692,10 @@ begin
   MakeFD(aBuiltinFuncs[76], 1, FUNC_ENC, @math1Func,  nil, 'degrees');
   aBuiltinFuncs[76].pUserData := Pointer(PtrInt(MATH_TAG_RADTODEG));
   MakeFD(aBuiltinFuncs[77], 0, FUNC_ENC, @piFunc,    nil, 'pi');
+  { unistr — func.c:3338: FUNCTION(unistr, 1, 0, 0, unistrFunc).
+    Decodes Unicode escape sequences \XXXX / \uXXXX / \+XXXXXX / \UXXXXXXXX.
+    Closes part of 6.10 step 12(i). }
+  MakeFD(aBuiltinFuncs[78], 1, FUNC_ENC, @unistrFunc, nil, 'unistr');
 end;
 
 var

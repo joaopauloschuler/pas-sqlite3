@@ -493,24 +493,21 @@ Important: At the end of this document, please find:
         "1.5e+20" / "1.5E+20".  Post-process inserts '+' after E/e
         when no explicit sign follows.  Verified `printf('%G',1.5e20)`
         → "1.5E+20".
-      [ ] **i) Built-in scalar functions missing.**  Probe surfaced
-        unported builtins that resolve as user-defined and return
-        NULL (Pas) vs the productive C result:
-        - `unistr(text)` — func.c unistrFunc.  Decodes Unicode
-          escape sequences (\uXXXX, \UXXXXXXXX, \\, \xXX) per
-          func.c:2706.
-        - `sqlite_compileoption_used(name)` — func.c:1031
-          compileoptionusedFunc.  Reports if a compile-time option
-          was enabled.
-        - `sqlite_compileoption_get(idx)` — func.c:1056
-          compileoptiongetFunc.  Returns the Nth registered option
-          string.
-        Also unported printf specifiers detected:
-        - `%b` — boolean (truthy text per printf.c et_BOOLEAN).
-        - `%w` — SQL identifier-quote (doubles internal `"`).
-        - `%n` — diagnostic no-op specifier.
-        Low priority but track here so future probes don't re-find
-        them.
+      [ ] **i) Built-in scalar functions missing.**
+        [X] `unistr(text)` — ported 2026-04-28 (func.c:1174).
+            Decodes \XXXX / \uXXXX / \+XXXXXX / \UXXXXXXXX, plus \\
+            literal backslash; "invalid Unicode escape" otherwise.
+            Registered as aBuiltinFuncs[78] (nArg=1).  DiagMoreFunc
+            unistr 4hex / backslash / u / U / + / null → all PASS.
+        [X] printf `%w` — ported 2026-04-28 (printf.c:848 etESCAPE_w).
+            Doubles internal `"` characters; NULL → "(NULL)".
+            DiagMoreFunc printf %w / printf %w null → PASS.
+        [ ] `sqlite_compileoption_used(name)` / `sqlite_compileoption_get(idx)`
+            (func.c:1042/1066) — blocked on porting `sqlite3_compileoption_used`
+            / `sqlite3_compileoption_get` (ctime.c), which require the
+            compile-options table not yet built on the Pas side.  Defer.
+        [ ] `%b` / `%n` printf specifiers — not present in upstream
+            printf.c fmtinfo[] (probe artifacts).  Drop from scope.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
