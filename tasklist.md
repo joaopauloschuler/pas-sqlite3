@@ -246,11 +246,11 @@ Important: At the end of this document, please find:
         population (rows not committed before SeekGE).  Bytecode
         parity unchanged: still missing one OP_Explain ("BLOOM
         FILTER ON u") between OP_OpenAutoindex and OP_Blob.
-        Note: other callsites of `sqlite3GetVarint32` in
-        vdbe.pas (vdbe.pas:4908, 4914, 6115, 6155, 10627, 10633)
-        also lack the fast-path inline guard; existing tests don't
-        exercise them with high-bit-clear bytes, but a future bug
-        likely lurks there — sweep when next touched.
+        Note 2026-04-28: getVarint32 fast-path inline guard now
+        applied at all callsites in vdbe.pas (sqlite3VdbeIdxRowid +
+        sqlite3Stat4Column).  TestExplainParity gained 3 cases
+        (1013→1016 PASS, 13→10 diverge) — three previously-Δ
+        rows were silent miscompares blocked behind that bug.
       [ ] **e) UNION / compound SELECT.**
         `SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)`
         returns no row.  Compound-select codegen / sub-FROM

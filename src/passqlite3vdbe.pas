@@ -4905,13 +4905,20 @@ begin
   rc := sqlite3VdbeMemFromBtreeZeroOffset(pCur, u32(nCellKey), @pMem);
   if rc <> SQLITE_OK then begin Result := rc; Exit; end;
   szHdr := 0;
-  sqlite3GetVarint32(Pu8(pMem.z), szHdr);
+  { getVarint32 macro fast path: high-bit clear means single-byte varint. }
+  if (Pu8(pMem.z)[0] and $80) = 0 then
+    szHdr := u32(Pu8(pMem.z)[0])
+  else
+    sqlite3GetVarint32(Pu8(pMem.z), szHdr);
   if (szHdr < 3) or (szHdr > u32(pMem.n)) then begin
     sqlite3VdbeMemReleaseMalloc(@pMem);
     Result := SQLITE_CORRUPT_BKPT; Exit;
   end;
   typeRowid := 0;
-  sqlite3GetVarint32(Pu8(pMem.z + szHdr - 1), typeRowid);
+  if (Pu8(pMem.z + szHdr - 1)[0] and $80) = 0 then
+    typeRowid := u32(Pu8(pMem.z + szHdr - 1)[0])
+  else
+    sqlite3GetVarint32(Pu8(pMem.z + szHdr - 1), typeRowid);
   if (typeRowid < 1) or (typeRowid > 9) or (typeRowid = 7) then begin
     sqlite3VdbeMemReleaseMalloc(@pMem);
     Result := SQLITE_CORRUPT_BKPT; Exit;
@@ -10624,13 +10631,22 @@ begin
   t := 0; nHdr := 0; iHdr := 0; szField := 0;
   a := Pu8(pRec);
   pM := PMem(ppVal);
-  iHdr := sqlite3GetVarint32(a, nHdr);
+  { getVarint32 macro fast path: high-bit clear means single-byte varint. }
+  if (a[0] and $80) = 0 then begin
+    nHdr := u32(a[0]);
+    iHdr := 1;
+  end else
+    iHdr := sqlite3GetVarint32(a, nHdr);
   if (nHdr > u32(nRec)) or (iHdr >= nHdr) then begin
     Result := SQLITE_CORRUPT_BKPT; Exit;
   end;
   iFstield := nHdr;
   for i := 0 to iCol do begin
-    iHdr := iHdr + u32(sqlite3GetVarint32(@a[iHdr], t));
+    if (a[iHdr] and $80) = 0 then begin
+      t := u32(a[iHdr]);
+      iHdr := iHdr + 1;
+    end else
+      iHdr := iHdr + u32(sqlite3GetVarint32(@a[iHdr], t));
     if iHdr > nHdr then begin Result := SQLITE_CORRUPT_BKPT; Exit; end;
     szField := sqlite3VdbeSerialTypeLen(t);
     iFstield := iFstield + szField;
