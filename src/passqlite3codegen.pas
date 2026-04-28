@@ -25427,11 +25427,18 @@ end;
 procedure sqlite3Pragma(pParse: PParse; const pId1: PToken;
   const pId2: PToken; pValue: PToken; minusFlag: i32);
 var
-  v:     PVdbe;
-  zName: AnsiString;
-  iDb:   i32;
+  v:       PVdbe;
+  zName:   AnsiString;
+  zRight:  AnsiString;
+  iDb:     i32;
+  iCookie: i32;
+  iVal:    i32;
+  addrOp:  i32;
+  pBtArg:  PBtree;
+  db:      PTsqlite3;
 begin
   if (pParse = nil) or (pId1 = nil) then Exit;
+  db := pParse^.db;
   v := sqlite3GetVdbe(pParse);
   if v = nil then Exit;
 
@@ -25446,13 +25453,31 @@ begin
 
   SetString(zName, pId1^.z, pId1^.n);
 
-  if SameText(zName, 'user_version') and (pValue = nil) then begin
-    { PragTyp_HEADER_VALUE read arm (pragma.c:2349). }
+  { PragTyp_HEADER_VALUE — pragma.c:2324.  Reads/writes a 4-byte slot in
+    the database file header.  user_version is iCookie=BTREE_USER_VERSION,
+    application_id is iCookie=BTREE_APPLICATION_ID. }
+  if SameText(zName, 'user_version') or SameText(zName, 'application_id') then
+  begin
+    if SameText(zName, 'user_version') then
+      iCookie := BTREE_USER_VERSION
+    else
+      iCookie := BTREE_APPLICATION_ID;
     sqlite3VdbeUsesBtree(v, iDb);
-    sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 0, 0);
-    sqlite3VdbeAddOp3(v, OP_ReadCookie,  iDb, 1, BTREE_USER_VERSION);
-    sqlite3VdbeAddOp2(v, OP_ResultRow,   1,   1);
-    sqlite3VdbeReusable(v);
+    if pValue <> nil then begin
+      { Write arm — Transaction(write) + SetCookie(P5=1). }
+      SetString(zRight, pValue^.z, pValue^.n);
+      sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 1, 0);
+      addrOp := sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, iCookie,
+                                  sqlite3Atoi(PChar(zRight)));
+      sqlite3VdbeChangeP5(v, 1);
+      if addrOp = 0 then ;
+    end else begin
+      { Read arm. }
+      sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 0, 0);
+      sqlite3VdbeAddOp3(v, OP_ReadCookie,  iDb, 1, iCookie);
+      sqlite3VdbeAddOp2(v, OP_ResultRow,   1,   1);
+      sqlite3VdbeReusable(v);
+    end;
     Exit;
   end;
 
@@ -25462,6 +25487,39 @@ begin
     if sqlite3ReadSchema(pParse) <> SQLITE_OK then Exit;
     sqlite3VdbeLoadString(v, 1, 'UTF-8');
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    Exit;
+  end;
+
+  { PragTyp_PAGE_SIZE read arm (pragma.c:598).  Page size is fixed at
+    open time so capture at codegen via sqlite3BtreeGetPageSize. }
+  if SameText(zName, 'page_size') and (pValue = nil) then begin
+    pBtArg := PBtree(db^.aDb[iDb].pBt);
+    if pBtArg <> nil then
+      iVal := sqlite3BtreeGetPageSize(pBtArg)
+    else
+      iVal := 0;
+    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    Exit;
+  end;
+
+  { PragTyp_CACHE_SIZE read arm (pragma.c:882).  Default is
+    SQLITE_DEFAULT_CACHE_SIZE (-2000) seeded by sqlite3SchemaGet. }
+  if SameText(zName, 'cache_size') and (pValue = nil) then begin
+    if (db^.aDb[iDb].pSchema <> nil) then
+      iVal := db^.aDb[iDb].pSchema^.cache_size
+    else
+      iVal := SQLITE_DEFAULT_CACHE_SIZE;
+    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    Exit;
+  end;
+
+  { PragTyp_SYNCHRONOUS read arm (pragma.c:1132). }
+  if SameText(zName, 'synchronous') and (pValue = nil) then begin
+    iVal := i32(db^.aDb[iDb].safety_level) - 1;
+    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
     Exit;
   end;
 end;
@@ -25950,6 +26008,7 @@ begin
       sqlite3HashInit(@p^.trigHash);
       sqlite3HashInit(@p^.fkeyHash);
       p^.enc := SQLITE_UTF8;
+      p^.cache_size := SQLITE_DEFAULT_CACHE_SIZE;
     end;
     Result := p;
   end else

@@ -684,13 +684,21 @@ Important: At the end of this document, please find:
         `changes() after update`.  Folds into `sqlite3Update` body
         skeleton (6.9-bis 11g.2.f); UPDATE never actually fires, so
         nChange stays 0 even with the new VdbeHalt accounting.
-      [ ] **g) Most PRAGMAs return no row** — DiagTxn `pragma
-        application_id default`, `page_size`, `cache_size`,
-        `journal_mode`, `synchronous`, and `user_version set` (the
-        write/read round-trip) all diverge.  `user_version` *read*
-        passes, `encoding` passes.  Folds into 6.12 `sqlite3Pragma`
-        port; most pragmas dispatch through the table-driven body that
-        is still stubbed.
+      [ ] **g) Most PRAGMAs return no row** — partially closed
+        2026-04-28.  Extended `sqlite3Pragma` (codegen.pas:25427) with
+        explicit arms for application_id (read+write via
+        PragTyp_HEADER_VALUE / pragma.c:2324), user_version SET (same
+        path, was read-only), page_size (PragTyp_PAGE_SIZE /
+        pragma.c:598 — captures sqlite3BtreeGetPageSize at codegen),
+        cache_size (PragTyp_CACHE_SIZE / pragma.c:882 — reads
+        pSchema^.cache_size, now seeded to SQLITE_DEFAULT_CACHE_SIZE
+        in sqlite3SchemaGet), and synchronous (PragTyp_SYNCHRONOUS /
+        pragma.c:1132 — reads safety_level-1).  DiagTxn pragma
+        divergences 6 → 1.  Remaining: `journal_mode` — needs a real
+        OP_JournalMode runtime arm (currently a 0-returning stub at
+        vdbe.pas:8140) plus the per-db pager journal-mode plumbing.
+        Full table-driven `pragmaLocate` dispatch still deferred
+        under 6.12.
 
   [X] **6.10 step 13** Runtime divergences surfaced by the new
       `src/tests/DiagCast.pas` probe (CAST expressions + type-affinity
