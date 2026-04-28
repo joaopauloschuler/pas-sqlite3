@@ -507,6 +507,18 @@ function  sqlite3VdbeFindCompare(pIdxKey: PUnpackedRecord): TRecordCompare;
 function  sqlite3VdbeRecordCompare(nKey: i32; pKey: Pointer;
                                    pIdxKey: PUnpackedRecord): i32;
 
+{ ---------------------------------------------------------------------------
+  btreeMovetoIndexHook — vdbe.pas registers a callback here at unit init
+  that allocates an UnpackedRecord, unpacks pKey into it, calls
+  sqlite3BtreeIndexMoveto, then frees the record.  Pulled out of
+  btreeMoveto to avoid a uses-cycle (vdbe.pas already uses btree.pas).
+  --------------------------------------------------------------------------- }
+type
+  TBtreeMovetoIndexFn = function(pCur: PBtCursor; pKey: Pointer; nKey: i64;
+                                 pRes: Pi32): i32;
+var
+  btreeMovetoIndexHook: TBtreeMovetoIndexFn;
+
 { ===========================================================================
   Phase 4.3 — Insert path public API
   =========================================================================== }
@@ -3363,8 +3375,13 @@ function btreeMoveto(pCur: PBtCursor; pKey: Pointer; nKey: i64;
                      bias: i32; pRes: Pi32): i32;
 begin
   if pKey <> nil then begin
-    { Index cursor: would need sqlite3VdbeAllocUnpackedRecord (Phase 6) }
-    Result := SQLITE_INTERNAL;
+    { Index cursor: delegate to vdbe.pas via hook (port of btree.c:858..889
+      index-cursor arm, which calls sqlite3VdbeAllocUnpackedRecord +
+      sqlite3VdbeRecordUnpack + sqlite3BtreeIndexMoveto). }
+    if btreeMovetoIndexHook <> nil then
+      Result := btreeMovetoIndexHook(pCur, pKey, nKey, pRes)
+    else
+      Result := SQLITE_INTERNAL;
   end else begin
     Result := sqlite3BtreeTableMoveto(pCur, nKey, bias, pRes);
   end;

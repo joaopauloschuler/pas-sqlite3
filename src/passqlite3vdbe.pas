@@ -2023,12 +2023,21 @@ begin
   enc  := Pu8(pKeyInfo)[4];
   pDb  := PPointer(Pu8(pKeyInfo) + 16)^;
   pUR^.default_rc := 0;
-  consumed := sqlite3GetVarint32(aKey, szHdr);
+  { getVarint32 macro fast path: high-bit clear means single-byte varint. }
+  if (aKey[0] and $80) = 0 then begin
+    szHdr := u32(aKey[0]);
+    consumed := 1;
+  end else
+    consumed := sqlite3GetVarint32(aKey, szHdr);
   idx := consumed;
   d   := szHdr;
   u   := 0;
   while (idx < szHdr) and (d <= u32(nKey)) do begin
-    consumed := sqlite3GetVarint32(@aKey[idx], serialType);
+    if (aKey[idx] and $80) = 0 then begin
+      serialType := u32(aKey[idx]);
+      consumed := 1;
+    end else
+      consumed := sqlite3GetVarint32(@aKey[idx], serialType);
     Inc(idx, consumed);
     pMm^.enc      := enc;
     pMm^.db       := pDb;
@@ -10642,9 +10651,36 @@ begin
   { Stub: full implementation deferred to Phase 6 }
 end;
 
+{ btreeMovetoIndexImpl — registered into btree.pas as the index-cursor arm
+  of btreeMoveto.  Faithful port of btree.c:858..889 (the pKey<>nil branch). }
+function btreeMovetoIndexImpl(pCur: PBtCursor; pKey: Pointer; nKey: i64;
+                              pRes: Pi32): i32;
+var
+  pIdxKey: PUnpackedRecord;
+  pKI:     PKeyInfo;
+  rc:      i32;
+  nAll:    u16;
+begin
+  pKI := pCur^.pKeyInfo;
+  pIdxKey := PUnpackedRecord(sqlite3VdbeAllocUnpackedRecord(pKI));
+  if pIdxKey = nil then begin
+    Result := SQLITE_NOMEM_BKPT;
+    Exit;
+  end;
+  sqlite3VdbeRecordUnpack(pKI, i32(nKey), pKey, pIdxKey);
+  nAll := Pu16(Pu8(pKI) + 8)^;
+  if (pIdxKey^.nField = 0) or (pIdxKey^.nField > i32(nAll)) then
+    rc := SQLITE_CORRUPT_BKPT
+  else
+    rc := sqlite3BtreeIndexMoveto(pCur, pIdxKey, pRes);
+  sqlite3DbFree(pCur^.pBtree^.db, pIdxKey);
+  Result := rc;
+end;
+
 initialization
   FillChar(gVdbeOpDummy, SizeOf(TVdbeOp), 0);
   SQLITE_DYNAMIC   := @sqlite3FreeXDel;
   SQLITE_TRANSIENT := TxDelProc(Pointer(-1));
+  btreeMovetoIndexHook := @btreeMovetoIndexImpl;
 
 end.

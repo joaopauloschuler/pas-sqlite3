@@ -222,19 +222,35 @@ Important: At the end of this document, please find:
         agg gate at codegen.pas:18979 accepts nSrc=2 and the
         WhereBegin LEFT JOIN nullification arm yields the correct
         row count.
-      [ ] **d-INNER) `INNER JOIN` aggregate raises SQL logic
-        error.** `SELECT count(*) FROM t INNER JOIN u ON t.a=u.b`
-        prepares cleanly but step returns SQLITE_ERROR ("SQL logic
-        error" — confirmed via `bin/DiagInnerJoin`).  Bytecode is
-        nearly identical to C apart from a missing OP_Explain
-        ("BLOOM FILTER ON u") between OP_OpenAutoindex and OP_Blob.
-        The auto-index ops (Filter/SeekGE/IdxGT at p1=2) appear to
-        have correct p4 KeyInfo at the OpenAutoindex level
-        (codegen.pas:14429 sets it via sqlite3VdbeSetP4KeyInfo) but
-        downstream lookups still fail at runtime — likely the per-
-        op p4 plumbing on Filter/SeekGE/IdxGT or the WhereLoop
-        bloom-filter explain helper (whereBloomFilterOptHelper).
-        Probe `src/tests/DiagInnerJoin.pas` reproduces the error.
+      [ ] **d-INNER) `INNER JOIN` aggregate returns count=0 vs C=1.**
+        `SELECT count(*) FROM t INNER JOIN u ON t.a=u.b` (t=u={1})
+        now prepares + steps cleanly (rc=100) but returns 0 instead
+        of C's 1 — confirmed via `bin/DiagInnerJoin`.  Two
+        upstream-divergence bugs fixed 2026-04-28: (1) `btreeMoveto`
+        index-cursor arm (btree.pas:3362) was a stub returning
+        SQLITE_INTERNAL; now delegates to a new
+        `btreeMovetoIndexImpl` hook installed by vdbe.pas's
+        initialization — ports btree.c:858..889 (alloc unpacked
+        record → unpack → IndexMoveto → free).  Hook avoids a
+        uses-cycle (vdbe.pas already uses btree.pas).  (2)
+        `sqlite3VdbeRecordUnpack` (vdbe.pas:2026) called
+        `sqlite3GetVarint32` without honouring the
+        `getVarint32(A,B)` macro's fast-path contract (the function
+        body assumes `(p[0] & 0x80) != 0`; high-bit-clear means
+        single-byte varint and the caller must inline that).  A
+        3-byte index record `03 09 09` was being decoded as
+        szHdr=393 → nField=0 → SQLITE_CORRUPT.  Remaining gap:
+        with the runtime now reaching ResultRow, count=0 means the
+        auto-index SeekGE doesn't find the matching row — likely
+        `sqlite3BtreeIndexMoveto` index compare or auto-index
+        population (rows not committed before SeekGE).  Bytecode
+        parity unchanged: still missing one OP_Explain ("BLOOM
+        FILTER ON u") between OP_OpenAutoindex and OP_Blob.
+        Note: other callsites of `sqlite3GetVarint32` in
+        vdbe.pas (vdbe.pas:4908, 4914, 6115, 6155, 10627, 10633)
+        also lack the fast-path inline guard; existing tests don't
+        exercise them with high-bit-clear bytes, but a future bug
+        likely lurks there — sweep when next touched.
       [ ] **e) UNION / compound SELECT.**
         `SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)`
         returns no row.  Compound-select codegen / sub-FROM
