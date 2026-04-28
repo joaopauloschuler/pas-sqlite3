@@ -109,11 +109,21 @@ Important: At the end of this document, please find:
             (codegen.pas:22195).  Walks `pList^.a[i].fg.eBits & $20`
             (bNulls), emits `unsupported use of NULLS FIRST/LAST` via
             `sqlite3ErrorMsg` honouring the sortFlags 0/3 ↔ FIRST mapping.
-       [ ] `sqlite3OpenTempDatabase` — returns `SQLITE_OK` without
-            opening anything; must call `sqlite3BtreeOpen` with
-            `SQLITE_OPEN_READWRITE | CREATE | EXCLUSIVE | DELETEONCLOSE
-            | TEMP_DB` and call `sqlite3BtreeSetPageSize`.  Stub →
-            `CREATE TEMP TABLE` silently broken.
+       [X] `sqlite3OpenTempDatabase` — ported 2026-04-28
+            (codegen.pas:24772).  Now calls `sqlite3BtreeOpen` with
+            `READWRITE|CREATE|EXCLUSIVE|DELETEONCLOSE|TEMP_DB` flags
+            against `db^.pVfs` (zFilename=NULL → memdb /
+            mkstemp depending on VFS) and follows up with
+            `sqlite3BtreeSetPageSize(pBt, db^.nextPagesize, 0, 0)`.
+            On failure raises sqlite3ErrorMsg + sets pParse^.rc / 1.
+            Verified: `CREATE TEMP TABLE t(x INTEGER)` now prepares
+            and steps cleanly (rc=0/101); previously the stub
+            returned SQLITE_OK without opening any back-end.
+            Downstream INSERT into temp tables still errors out
+            (prep rc=1) — separate gap, see new task 6.8b below.
+            No regressions: TestExplainParity 1016/10,
+            TestSchemaBasic 44/0, TestDMLBasic 54/0, TestParser 45/0,
+            TestSelectBasic 49/0.
        [X] `sqlite3IsShadowTableOf` / `sqlite3ShadowTableName` /
             `sqlite3ReadOnlyShadowTables` — ported 2026-04-28
             (codegen.pas:22408..).  IsShadowTableOf walks
@@ -124,6 +134,18 @@ Important: At the end of this document, please find:
             Verified TestVtab 216/0, TestExplainParity 1016/10,
             TestSchemaBasic 44/0, TestDMLBasic 54/0, TestSelectBasic
             49/0, TestParser 45/0 — no regressions.
+
+       TEMP-database follow-on (build.c / insert.c):
+       [ ] **6.8b** TEMP-table INSERT/SELECT not wired.  After the
+           OpenTempDatabase port, `CREATE TEMP TABLE t(x INTEGER)`
+           succeeds but `INSERT INTO t VALUES(42)` then fails at
+           prepare (rc=1) and `SELECT count(*) FROM t` returns no
+           row.  Likely cause: temp schema (db^.aDb[1].pSchema) is
+           created but the parsed CREATE TEMP TABLE does not register
+           the table into it, so name resolution misses on subsequent
+           statements.  Inspect `sqlite3StartTable` /
+           `sqlite3EndTable` for the iDb=1 path and the temp-schema
+           hash insertion.
 
        Foreign keys (fkey.c):
        [X] `sqlite3FkReferences` — ported 2026-04-28

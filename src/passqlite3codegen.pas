@@ -24769,9 +24769,38 @@ begin
   sqlite3VdbeAddOp4(v, OP_Savepoint, op, 0, 0, zName, P4_DYNAMIC);
 end;
 
+{ build.c:5323 — open the TEMP database when first needed.
+  Returns 0 on success / no-op, 1 on error (with pParse^.rc set). }
 function sqlite3OpenTempDatabase(pParse: PParse): i32;
+const
+  TEMP_FLAGS = SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE or
+               SQLITE_OPEN_EXCLUSIVE or SQLITE_OPEN_DELETEONCLOSE or
+               SQLITE_OPEN_TEMP_DB;
+var
+  db  : PTsqlite3;
+  pBt : PBtree;
+  rc  : i32;
 begin
-  Result := SQLITE_OK;
+  db := pParse^.db;
+  if (db^.aDb[1].pBt = nil) and (pParse^.explain = 0) then begin
+    pBt := nil;
+    rc := sqlite3BtreeOpen(db^.pVfs, nil, Psqlite3(db), @pBt, 0, TEMP_FLAGS);
+    if rc <> SQLITE_OK then begin
+      sqlite3ErrorMsg(pParse,
+        'unable to open a temporary database file for storing temporary tables');
+      pParse^.rc := rc;
+      Result := 1;
+      Exit;
+    end;
+    db^.aDb[1].pBt := pBt;
+    Assert(db^.aDb[1].pSchema <> nil, 'temp pSchema must already exist');
+    if SQLITE_NOMEM = sqlite3BtreeSetPageSize(pBt, db^.nextPagesize, 0, 0) then begin
+      sqlite3OomFault(db);
+      Result := 1;
+      Exit;
+    end;
+  end;
+  Result := 0;
 end;
 
 { sqlite3CodeVerifySchema — port of build.c:5404.
