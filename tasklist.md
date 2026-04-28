@@ -134,15 +134,21 @@ Important: At the end of this document, please find:
       bin/DiagMisc`).  These all prepare+step cleanly on both Pas and C
       (rc=0/101) but produce wrong values, so they are *silent
       result-set bugs* — not bytecode-Δ entries:
-      [ ] **a) DEFAULT clause ignored by INSERT.**  `CREATE TABLE t(a,
-        b DEFAULT 7); INSERT INTO t(a) VALUES(1); SELECT b FROM t`
-        returns 7 on C, 0/NULL on Pas.  Almost certainly the
-        downstream symptom of `sqlite3GenerateConstraintChecks` /
-        `sqlite3CompleteInsertion` not yet wired into `sqlite3Insert`
-        (6.9-bis 11g.2.b open items) — DEFAULT expressions are only
-        emitted by the GenerateConstraintChecks path.  Re-test once
-        those land; if still failing, the DEFAULT-expr lowering itself
-        is broken.
+      [X] **a) DEFAULT clause ignored by INSERT.**  Fixed by porting
+        `sqlite3AddDefaultValue` (build.c:1729), `sqlite3ColumnSetExpr`
+        (build.c:683), `sqlite3ColumnExpr` (build.c:709), and
+        `sqlite3ExprIsConstantOrFunction` (eCode=4/5 variants of
+        exprIsConst) — none were wired before, so DEFAULT expressions
+        never reached pTab->u.tab.pDfltList and `pCol^.iDflt` stayed 0.
+        Also wired the missing-column / DEFAULT-VALUES arms of
+        `sqlite3Insert` (codegen.pas:19852) to consult sqlite3ColumnExpr
+        instead of always emitting OP_Null.  The TK_SPAN source-text
+        wrapper from C is not duplicated faithfully (Pas exprDup_
+        cannot yet duplicate a stack TExpr with EP_Skip + extra zToken
+        — the ExprDup buffer-passing recursion AVs); pExpr is dup'd
+        directly which is sufficient for runtime semantics, only the
+        DEFAULT source-text round-trip in EXPLAIN/error messages is
+        lost.  Verified via DiagMisc "INSERT default literal" PASS.
       [X] **b) Hex integer literal decoded as 0.**  Fixed by porting
         the missing hex arm in `sqlite3GetInt32` (util.c:1298..1326);
         previous decimal-only scan stopped at "0", set EP_IntValue

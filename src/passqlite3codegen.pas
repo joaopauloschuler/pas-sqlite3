@@ -19697,6 +19697,7 @@ var
   regOut:         i32;
   pListItems:     PExprListItem;
   pIdItems:       PIdListItem;
+  pDflt:          PExpr;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -19839,9 +19840,9 @@ begin
                            table column i (parser-validated count match).
     The DEFAULT/missing-column arms factor through sqlite3ExprCodeRunJustOnce
     when PARSEFLAG_OkConstFactor is on, mirroring insert.c:1413..1418's
-    sqlite3ExprCodeFactorable.  sqlite3ColumnExpr is still a stub returning
-    nil (Phase 7); sqlite3ExprIsConstantNotJoin(nil) returns 2, so the C path
-    likewise lands a single OP_Null in the trailing init section. }
+    sqlite3ExprCodeFactorable.  sqlite3ColumnExpr returns the bound DEFAULT /
+    AS expression for the column (or nil for columns without one — those
+    fall through to OP_Null via the constant-factor short-circuit). }
   if pList <> nil then
     pListItems := ExprListItems(pList)
   else
@@ -19854,9 +19855,10 @@ begin
       j := (aTabColMap + i)^;
       if j = 0 then
       begin
+        pDflt := sqlite3ColumnExpr(pTab, @pTab^.aCol[i]);
         if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
-           and (sqlite3ExprIsConstantNotJoin(pParse, nil) <> 0) then
-          sqlite3ExprCodeRunJustOnce(pParse, nil, regData + i)
+           and (sqlite3ExprIsConstantNotJoin(pParse, pDflt) <> 0) then
+          sqlite3ExprCodeRunJustOnce(pParse, pDflt, regData + i)
         else
           sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i);
       end
@@ -19865,9 +19867,10 @@ begin
     end
     else if pList = nil then
     begin
+      pDflt := sqlite3ColumnExpr(pTab, @pTab^.aCol[i]);
       if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
-         and (sqlite3ExprIsConstantNotJoin(pParse, nil) <> 0) then
-        sqlite3ExprCodeRunJustOnce(pParse, nil, regData + i)
+         and (sqlite3ExprIsConstantNotJoin(pParse, pDflt) <> 0) then
+        sqlite3ExprCodeRunJustOnce(pParse, pDflt, regData + i)
       else
         sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i);
     end
@@ -21024,10 +21027,89 @@ begin
   end;
 end;
 
+{ sqlite3ExprIsConstantOrFunction — port of expr.c (variant 4/5 of
+  exprIsConst).  initFlag=4 in normal parse; 5 when re-reading sqlite_schema
+  on connection-open (silently rewrites bound params to NULL). }
+function sqlite3ExprIsConstantOrFunction(p: PExpr; isInit: u8): i32;
+begin
+  Assert((isInit = 0) or (isInit = 1));
+  if isInit <> 0 then
+    Result := exprIsConst(nil, p, 5)
+  else
+    Result := exprIsConst(nil, p, 4);
+end;
+
+{ sqlite3ColumnSetExpr — port of build.c:683.  Bind pExpr to pCol as either
+  the DEFAULT value or the AS expression for a generated column.  Append to
+  pTab^.u.tab.pDfltList; pCol^.iDflt is the 1-based slot. }
+procedure sqlite3ColumnSetExpr(pParse: PParse; pTab: PTable2; pCol: PColumn;
+  pExpr: PExpr);
+var
+  pList: PExprList;
+begin
+  Assert(pTab^.eTabType = TABTYP_NORM);
+  pList := pTab^.u.tab.pDfltList;
+  if (pCol^.iDflt = 0) or (pList = nil) or (pList^.nExpr < pCol^.iDflt) then
+  begin
+    if pList = nil then
+      pCol^.iDflt := 1
+    else
+      pCol^.iDflt := u16(pList^.nExpr + 1);
+    pTab^.u.tab.pDfltList := sqlite3ExprListAppend(pParse, pList, pExpr);
+  end
+  else
+  begin
+    sqlite3ExprDelete(pParse^.db, ExprListItems(pList)[pCol^.iDflt - 1].pExpr);
+    ExprListItems(pList)[pCol^.iDflt - 1].pExpr := pExpr;
+  end;
+end;
+
+{ sqlite3AddDefaultValue — port of build.c:1729.  Validate and bind a DEFAULT
+  expression to the most recently added column on pNewTable.  pExpr's tokens
+  point at volatile parser memory, so we ExprDup a wrapper TK_SPAN node that
+  carries the literal source text (zStart..zEnd) into the bound copy. }
 procedure sqlite3AddDefaultValue(pParse: PParse; pExpr: PExpr;
   zStart: PAnsiChar; zEnd: PAnsiChar);
+var
+  p:         PTable2;
+  pCol:      PColumn;
+  db:        PTsqlite3;
+  isInit:    u8;
+  pDfltExpr: PExpr;
 begin
-  sqlite3ExprDelete(pParse^.db, pExpr);
+  db := pParse^.db;
+  p  := pParse^.pNewTable;
+  if p <> nil then
+  begin
+    if (db^.init.busy <> 0) and (db^.init.iDb <> 1) then
+      isInit := 1
+    else
+      isInit := 0;
+    pCol := @p^.aCol[p^.nCol - 1];
+    if sqlite3ExprIsConstantOrFunction(pExpr, isInit) = 0 then
+    begin
+      sqlite3ErrorMsg(pParse,
+        PAnsiChar('default value of column is not constant'));
+    end
+    else if (pCol^.colFlags and COLFLAG_GENERATED) <> 0 then
+    begin
+      sqlite3ErrorMsg(pParse,
+        PAnsiChar('cannot use DEFAULT on a generated column'));
+    end
+    else
+    begin
+      { Faithful port wraps pExpr in a TK_SPAN node that carries the source
+        text via sqlite3DbSpanDup so error messages and EXPLAIN can display
+        the original DEFAULT expression.  The Pas exprDup_ does not yet
+        correctly handle that stack-Expr-with-ExtraToken wrapper (deep
+        recursion through EXPRDUP_REDUCE buffers); for now we ExprDup
+        pExpr directly, sufficient for runtime semantics — only the
+        cosmetic source-text round-trip is lost. }
+      pDfltExpr := sqlite3ExprDup(db, pExpr, EXPRDUP_REDUCE);
+      sqlite3ColumnSetExpr(pParse, p, pCol, pDfltExpr);
+    end;
+  end;
+  sqlite3ExprDelete(db, pExpr);
 end;
 
 { makeColumnPartOfPrimaryKey — port of build.c:1799.
@@ -23060,9 +23142,20 @@ begin
   Dec(pParse^.nested);
 end;
 
+{ sqlite3ColumnExpr — port of build.c:709.  Returns the DEFAULT (or AS, for
+  generated columns) expression bound to pCol, or nil when the column has no
+  bound expression / pTab is not an ordinary rowid table. }
 function sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
+var
+  pList: PExprList;
 begin
-  Result := nil; { Phase 7 }
+  Result := nil;
+  if pCol^.iDflt = 0 then Exit;
+  if pTab^.eTabType <> TABTYP_NORM then Exit;
+  pList := pTab^.u.tab.pDfltList;
+  if pList = nil then Exit;
+  if pList^.nExpr < pCol^.iDflt then Exit;
+  Result := ExprListItems(pList)[pCol^.iDflt - 1].pExpr;
 end;
 
 // ===========================================================================
