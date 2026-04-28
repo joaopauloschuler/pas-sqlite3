@@ -20149,17 +20149,16 @@ begin
   end;
 end;
 
-{ sqlite3PrimaryKeyIndex — return the PRIMARY KEY index of a table (build.c:1069) }
+{ sqlite3PrimaryKeyIndex — port of build.c:1069.
+  Return the index marked SQLITE_IDXTYPE_PRIMARYKEY for pTab, or nil if
+  none exists (rowid tables without an explicit PK index). }
 function sqlite3PrimaryKeyIndex(pTab: PTable2): PIndex2;
 var
   p: PIndex2;
 begin
-  { Walk the index list; the first WITH_ROWID table has no PK index,
-    WITHOUT ROWID tables have pIndex pointing to the PK.
-    As a stub: return pTab^.pIndex (first index). }
   p := pTab^.pIndex;
   while p <> nil do begin
-    if (p^.idxFlags and $03) = 2 then begin  { SQLITE_IDXTYPE_PRIMARYKEY = 2 }
+    if (p^.idxFlags and $03) = SQLITE_IDXTYPE_PRIMARYKEY then begin
       Result := p; Exit;
     end;
     p := p^.pNext;
@@ -20209,10 +20208,40 @@ begin
   if (db^.flags and u64($00000020)) <> 0 then Result := 1 else Result := 0;
 end;
 
-{ sqlite3CheckObjectName — validate object name (build.c:1031) stub }
+{ sqlite3CheckObjectName — port of build.c:1031.
+  Reject reserved "sqlite_" names for new schema objects.  When parsing
+  the on-disk sqlite_schema row (db->init.busy=1), instead verify that
+  zType/zName/zTblName match the canonical (type,name,tbl_name) tuple
+  the loader staged into db->init.azInit[0..2]. }
 function sqlite3CheckObjectName(pParse: PParse; zName: PAnsiChar;
   zType: PAnsiChar; zTblName: PAnsiChar): i32;
+var
+  db: PTsqlite3;
 begin
+  db := pParse^.db;
+  if (sqlite3WritableSchema(db) <> 0)
+     or ((db^.init.flags and $02) <> 0)         { imposterTable bit }
+     or (sqlite3GlobalConfig.bExtraSchemaChecks = 0) then begin
+    Result := SQLITE_OK; Exit;
+  end;
+  if db^.init.busy <> 0 then begin
+    if (db^.init.azInit = nil)
+       or (sqlite3StrICmp(zType,    db^.init.azInit[0]) <> 0)
+       or (sqlite3StrICmp(zName,    db^.init.azInit[1]) <> 0)
+       or (sqlite3StrICmp(zTblName, db^.init.azInit[2]) <> 0) then begin
+      sqlite3ErrorMsg(pParse, '');  { corruptSchema() supplies the real msg }
+      Result := SQLITE_ERROR; Exit;
+    end;
+  end else begin
+    if ((pParse^.nested = 0) and (sqlite3_strnicmp(zName, 'sqlite_', 7) = 0))
+       or ((sqlite3ReadOnlyShadowTables(db) <> 0)
+           and (sqlite3ShadowTableName(db, zName) <> 0)) then begin
+      sqlite3ErrorMsg(pParse, PAnsiChar(AnsiString(
+        Format('object name reserved for internal use: %s',
+          [string(AnsiString(zName))]))));
+      Result := SQLITE_ERROR; Exit;
+    end;
+  end;
   Result := SQLITE_OK;
 end;
 
@@ -20220,10 +20249,22 @@ end;
 // Phase 6.5 — build.c: index & table management stubs
 // ===========================================================================
 
+{ sqlite3FreeIndex — port of build.c:546.
+  Release a TIndex and any heap memory it owns: the partial-index WHERE
+  expression, indexed-expression list, lazily-built column-affinity
+  string, and the resized azColl[] when the index has grown past its
+  in-place backing.  STAT4 sample arrays are gated off in the default
+  build (SQLITE_ENABLE_STAT4 is not defined). }
 procedure sqlite3FreeIndex(db: PTsqlite3; p: PIndex2);
 begin
-  { Phase 7 }
-  if p <> nil then sqlite3DbFree(db, p);
+  if p = nil then Exit;
+  { sqlite3DeleteIndexSamples — STAT4 only; gated off in default build. }
+  sqlite3ExprDelete(db, p^.pPartIdxWhere);
+  sqlite3ExprListDelete(db, p^.aColExpr);
+  sqlite3DbFree(db, p^.zColAff);
+  if ((p^.idxFlags shr 4) and 1) <> 0 then  { isResized = bit 4 of idxFlags }
+    sqlite3DbFree(db, p^.azColl);
+  sqlite3DbFree(db, p);
 end;
 
 { sqlite3UnlinkAndDeleteIndex — port of build.c:566.
@@ -20741,19 +20782,29 @@ end;
 
 { sqlite3AddNotNull — port of build.c:1604.
   Mark the most-recently-added column NOT NULL.  Stores onError in the
-  notNull bitfield (low nibble of typeFlags) and sets TF_HasNotNull. }
+  notNull bitfield (low nibble of typeFlags), sets TF_HasNotNull, and
+  propagates uniqNotNull to any UNIQUE / PRIMARY KEY index that has
+  already been attached for this column. }
 procedure sqlite3AddNotNull(pParse: PParse; onError: i32);
 var
   p:    PTable2;
   pCol: PColumn;
+  pIdx: PIndex2;
 begin
   p := pParse^.pNewTable;
   if (p = nil) or (p^.nCol < 1) then Exit;
   pCol := @p^.aCol[p^.nCol - 1];
   pCol^.typeFlags := (pCol^.typeFlags and $F0) or u8(onError and $0F);
   p^.tabFlags := p^.tabFlags or TF_HasNotNull;
-  { COLFLAG_UNIQUE / uniqNotNull index loop is gated on AddPrimaryKey/
-    UNIQUE-index porting, which is still a stub today. }
+
+  if (pCol^.colFlags and COLFLAG_UNIQUE) <> 0 then begin
+    pIdx := p^.pIndex;
+    while pIdx <> nil do begin
+      if (pIdx^.aiColumn <> nil) and (pIdx^.aiColumn[0] = (p^.nCol - 1)) then
+        pIdx^.idxFlags := pIdx^.idxFlags or u32($08);  { uniqNotNull = bit 3 }
+      pIdx := pIdx^.pNext;
+    end;
+  end;
 end;
 
 procedure sqlite3AddDefaultValue(pParse: PParse; pExpr: PExpr;

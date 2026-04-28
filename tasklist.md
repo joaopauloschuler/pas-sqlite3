@@ -228,9 +228,18 @@ Important: At the end of this document, please find:
        `sqlite3GenerateConstraintChecks`.
        (`sqlite3CompleteInsertion` is now fully ported — see 6.9-bis 11g.2.b.)
   [ ] **6.25** port codegen.pas schema / index stubs in full from C to pascal:
-       `sqlite3ReadSchema`, `sqlite3PrimaryKeyIndex`,
-       `sqlite3CheckObjectName`, `sqlite3FreeIndex`,
-       `sqlite3AddNotNull`, `sqlite3RunParser`.
+       `sqlite3ReadSchema`, `sqlite3RunParser`.
+       [X] `sqlite3PrimaryKeyIndex` — already a faithful port (build.c:1069);
+            comment cleaned up.
+       [X] `sqlite3CheckObjectName` — ported in full (build.c:1031): rejects
+            "sqlite_" prefix outside nested parses, validates init.azInit
+            tuple under db->init.busy, honours writable_schema /
+            imposterTable / bExtraSchemaChecks bypass arms.
+       [X] `sqlite3FreeIndex` — ported in full (build.c:546): frees
+            pPartIdxWhere, aColExpr, zColAff, and azColl when isResized.
+       [X] `sqlite3AddNotNull` — uniqNotNull propagation loop now ported
+            (build.c:1604); flags any UNIQUE/PK index already attached
+            for the column.
   [ ] **6.26** port codegen.pas where / select / window stubs in full from C
        to pascal: `sqlite3MatchEName`, `sqlite3SelectPopWith`,
        `whereRightSubexprIsColumn`, `sqlite3WhereMinMaxOptEarlyOut`,
