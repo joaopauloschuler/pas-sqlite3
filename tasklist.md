@@ -94,9 +94,12 @@ Important: At the end of this document, please find:
           only 3 ops, no sorter open / KeyInfo / sort-finalise loop).
         [ ] `SELECT a FROM t GROUP BY a` — Δ=42 (aggregate-group
           path, not yet ported).
-        [ ] `SELECT SUM/MIN/MAX(a)` — Δ=12..13 (aggregate-no-GROUP
-          path).  Tracked under the 6.10 step 7(c) decomposition
-          (c1..c7) — same root cause as count(*)+WHERE.
+        [X] `SELECT SUM(a)` — closed 2026-04-28 by 6.10 step 7(c3..c7)
+          aggregate-no-GROUP-BY codegen path.  `SELECT MIN/MAX(a)`
+          still differs by 1 op (C carries the
+          `WHERE_ORDERBY_MIN/MAX` early-out optimisation; Pas's
+          `sqlite3WhereMinMaxOptEarlyOut` is ported but not yet
+          driven from the agg gate via the minMaxQuery probe).
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
           materialise / co-routine path not ported).
           Note 2026-04-28: `sqlite3SrcItemAttachSubquery` (build.c:5019)
@@ -189,27 +192,29 @@ Important: At the end of this document, please find:
               green).  Next: (c3) replace the
               codegen.pas:18180 `Exit` for SF_Aggregate (pGroupBy=nil)
               with the agg-codegen tail using the now-real walker.
-        [ ] **(c3)** Open the SF_Aggregate gate at codegen.pas:18045
-              for the no-GROUP-BY case (`p^.pGroupBy = nil` already
-              checked at 17980).  Replace the unconditional `Exit`
-              with a branch that proceeds into the agg-codegen tail.
-        [ ] **(c4)** Emit accumulator-init prologue: `OP_Null` over
-              `[regAcc .. regAcc+nAccumulator-1]` and any per-Func
-              initial state (`min/max` start NULL, `sum/total/count`
-              start 0/NULL).  Mirrors select.c:8819..8870.
-        [ ] **(c5)** Emit `OP_AggStep` / `OP_AggStep1` inside the
-              existing sqlite3WhereBegin..End loop, one per
-              `AggInfo.aFunc[]` entry, with the FuncDef attached
-              via P4_FUNCDEF.  See select.c:8950..9000.
-        [ ] **(c6)** Emit `OP_AggFinal` after `sqlite3WhereEnd`,
-              followed by Copy/ResultRow into `pDest` (mirrors
-              select.c:9020..9050; SRT_Output / SRT_Mem disposal
-              already wired in selectInnerLoop).
-        [ ] **(c7)** Verify against DiagAggWhere + DiagFeatureProbe
-              + DiagMisc; flips the 6.10 step 6 SUM/MIN/MAX entry
-              (Δ=12..13), the JOIN-aggregate entry under step 9(d),
-              and the CHECK-constraint check-no-row case under
-              step 9(h) once 6.9-bis 11g.2.b lands.
+        [X] **(c3..c7)** Aggregate-no-GROUP-BY codegen path landed
+              2026-04-28.  Ported assignAggregateRegisters,
+              resetAccumulatorSimple, updateAccumulatorSimple,
+              finalizeAggFunctionsSimple, agginfoFreeCleanup,
+              analyzeAggFuncArgs (select.c:6498/6643/6658/6724/6799/
+              7101).  Added TK_AGG_FUNCTION + TK_AGG_COLUMN arms to
+              sqlite3ExprCodeTarget (expr.c:4957..5004 and 5313..5325).
+              Wired a new agg gate in sqlite3Select that fires for
+              SF_Aggregate selects with no GROUP BY / HAVING / DISTINCT
+              / Compound / Window, no DISTINCT/ORDER-BY/FILTER/NEEDCOLL
+              on the agg, single- or two-table base FROM (no vtab/view/
+              subquery), SRT_Output or SRT_Mem.  Pas-only Pre-step
+              markAggregateInExprList rewrites TK_FUNCTION → TK_AGG_FUNCTION
+              when the FuncDef has xFinalize (Pas resolver does not).
+              Verified: DiagAggWhere `count(*) FROM t WHERE a IS NULL`
+              now byte-identical with C; TestExplainParity 1012/14 →
+              1013/13 (SUM matches; MIN/MAX still differ by 1 op due
+              to the unported WHERE_ORDERBY_MIN/MAX optimisation);
+              TestSelectBasic 49/49, TestVdbeAgg 11/11, TestParser
+              45/45 all green.  Out of scope: COUNT(DISTINCT x), agg
+              with FILTER clause, agg with ORDER BY in arg list,
+              NEEDCOLL aggregates (group_concat etc.), no-FROM
+              aggregate (`SELECT count(*)`).
 
   [ ] **6.10 step 9** Runtime divergences surfaced by
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
@@ -245,10 +250,15 @@ Important: At the end of this document, please find:
         only for INSTEAD OF DELETE/UPDATE; non-trigger SELECT … FROM v
         still needs view-expansion in `sqlite3SelectExpand`.
       [ ] **d) Multi-table JOIN aggregate returns no row.**
-        `SELECT count(*) FROM t INNER JOIN u ON t.a=u.b` and the LEFT
-        JOIN variant both step to DONE without a row.  Same root cause
-        as 6.10 step 7(c) (aggregate-no-GROUP) — gated on the
-        full agg codegen port.
+        Partially closed 2026-04-28: agg gate at codegen.pas:18715
+        accepts nSrc=2 now and `LEFT JOIN` returns one row (val=0
+        instead of -1; off by 2 because Pas WhereBegin's LEFT JOIN
+        nullification arm is incomplete — separate gap).  `INNER
+        JOIN` variant still val=-1 because pSTab is nil on one of
+        the join items at agg-gate time (likely SrcList resolution
+        ordering during ON-clause merge).  Both fully close once
+        WhereBegin's JOIN paths land + selectExpander resolves
+        pSTab on every SrcItem.
       [ ] **e) UNION / compound SELECT.**
         `SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)`
         returns no row.  Compound-select codegen / sub-FROM
@@ -497,8 +507,12 @@ Important: At the end of this document, please find:
         DiagMoreFunc %q / %Q str / %Q null → PASS.
       [ ] **f) Aggregate-no-FROM no-row.**  `SELECT count(*)` /
         `SELECT sum(5)` step to DONE without producing a row.
-        Same root cause as 6.10 step 7(c) — agg-no-GROUP gate at
-        codegen.pas:18045.  Closed when (c1)..(c7) lands.
+        The 6.10 step 7(c3..c7) agg gate handles SF_Aggregate with a
+        FROM clause; the no-FROM case still falls into the no-FROM
+        fast path at codegen.pas:18412 which excludes SF_Aggregate.
+        Open work: extend either the no-FROM path or the agg gate to
+        cover nSrc=0 (no WhereBegin needed — emit
+        reset/AggStep/AggFinal then ResultRow once).
       [X] **g) printf `%s` precision / width ignored.**  Fixed
         2026-04-28.  `%s` arm appended raw with no truncation/padding;
         now honours width + precision per printf.c et_STRING (precision

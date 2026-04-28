@@ -5516,6 +5516,55 @@ begin
         exprCodeBetween(pParse, pExpr, target, 0 { scalar }, 0);
         done := True;
       end;
+    TK_AGG_COLUMN:
+      begin
+        { Port of expr.c:4957..5004 (slim).  In non-directMode return the
+          accumulator-column register (AggInfoColumnReg = iFirstReg + iAgg).
+          In directMode (set during updateAccumulator), fall through to
+          the TK_COLUMN OP_Column emission so arg evaluation reads from
+          the live cursor.  useSortingIdx arm omitted (GROUP BY only). }
+        if (pExpr^.pAggInfo <> nil) and (pExpr^.iAgg >= 0)
+           and (pExpr^.iAgg < pExpr^.pAggInfo^.nColumn)
+           and (pExpr^.pAggInfo^.directMode = 0) then
+        begin
+          Result := pExpr^.pAggInfo^.iFirstReg + pExpr^.iAgg;
+          done := True;
+        end
+        else if (pExpr^.y.pTab <> nil) and (pExpr^.iTable >= 0) then
+        begin
+          sqlite3ExprCodeGetColumnOfTable(v, pExpr^.y.pTab,
+            pExpr^.iTable, pExpr^.iColumn, target);
+          if pExpr^.op2 <> 0 then
+            sqlite3VdbeChangeP5(v, u16(pExpr^.op2));
+          done := True;
+        end
+        else
+        begin
+          sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+          done := True;
+        end;
+      end;
+    TK_AGG_FUNCTION:
+      begin
+        { Port of expr.c:5313..5325.  Aggregate-function read: return
+          the function-accumulator register (AggInfoFuncReg = iFirstReg
+          + nColumn + iAgg) when the AggInfo is wired up.  Misuse path
+          (no AggInfo) raises "misuse of aggregate". }
+        if (pExpr^.pAggInfo = nil) or (pExpr^.iAgg < 0)
+           or (pExpr^.iAgg >= pExpr^.pAggInfo^.nFunc) then
+        begin
+          sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+            'misuse of aggregate function', []));
+          sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+          done := True;
+        end
+        else
+        begin
+          Result := pExpr^.pAggInfo^.iFirstReg + pExpr^.pAggInfo^.nColumn
+                    + pExpr^.iAgg;
+          done := True;
+        end;
+      end;
     else
       { C default arm semantics: assert (op==TK_NULL || op==TK_ERROR ||
         mallocFailed) then emit OP_Null.  TK_NULL is its own arm above;
@@ -18235,6 +18284,202 @@ begin
       sqlite3ExprAnalyzeAggregates(pNC, items[i].pExpr);
 end;
 
+{ analyzeAggFuncArgs — select.c:6498.  After analyzeAggList has
+  populated pAggI^.aFunc[], walk each aggregate's argument list
+  (and ORDER BY clause) under NC_InAggFunc so TK_COLUMN refs inside
+  args land in pAggI^.aCol[].  Mirrors C exactly except the pLeft
+  (ORDER BY) arm — gated to nil today since the ORDER-BY-arg agg
+  path is not yet handled. }
+procedure analyzeAggFuncArgs(pAggI: PAggInfo; pNC: PNameContext);
+var
+  i: i32;
+  pE: PExpr;
+begin
+  Assert(pAggI <> nil);
+  Assert(pAggI^.iFirstReg = 0);
+  pNC^.ncFlags := pNC^.ncFlags or NC_InAggFunc;
+  for i := 0 to pAggI^.nFunc - 1 do
+  begin
+    pE := pAggI^.aFunc[i].pFExpr;
+    Assert(pE <> nil);
+    Assert(ExprUseXList(pE));
+    sqlite3ExprAnalyzeAggList(pNC, pE^.x.pList);
+    if pE^.pLeft <> nil then
+    begin
+      Assert(pE^.pLeft^.op = TK_ORDER);
+      Assert(ExprUseXList(pE^.pLeft));
+      sqlite3ExprAnalyzeAggList(pNC, pE^.pLeft^.x.pList);
+    end;
+  end;
+  pNC^.ncFlags := pNC^.ncFlags and (not NC_InAggFunc);
+end;
+
+{ markAggregateExprNode — Walker callback that rewrites TK_FUNCTION
+  nodes whose resolved FuncDef carries xFinalize (aggregate) to
+  TK_AGG_FUNCTION.  Pas's resolver does not do this rewrite today
+  (selectMarkAggregate only sets the SF_Aggregate flag), so the agg
+  codegen path runs this pre-analyzeAggList to give analyzeAggregate
+  TK_AGG_FUNCTION nodes to walk. }
+function markAggregateExprNode(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pDef: PTFuncDef;
+  db:   PTsqlite3;
+  n:    i32;
+begin
+  if (pExpr^.op = TK_FUNCTION) and (pExpr^.u.zToken <> nil) then
+  begin
+    if ExprUseXList(pExpr) and (pExpr^.x.pList <> nil) then
+      n := pExpr^.x.pList^.nExpr
+    else
+      n := 0;
+    db := pWalker^.pParse^.db;
+    pDef := sqlite3FindFunction(db, pExpr^.u.zToken, n, db^.enc, 0);
+    if (pDef = nil) and (n <> 0) then
+      pDef := sqlite3FindFunction(db, pExpr^.u.zToken, -1, db^.enc, 0);
+    if (pDef <> nil) and Assigned(pDef^.xFinalize) then
+      pExpr^.op := TK_AGG_FUNCTION;
+  end;
+  Result := WRC_Continue;
+end;
+
+procedure markAggregateInExprList(pParse: PParse; pList: PExprList);
+var
+  w: TWalker;
+begin
+  if pList = nil then Exit;
+  FillChar(w, SizeOf(w), 0);
+  w.pParse        := pParse;
+  w.xExprCallback := @markAggregateExprNode;
+  sqlite3WalkExprList(@w, pList);
+end;
+
+{ agginfoFree — select.c:7101.  Cleanup callback for AggInfo allocated
+  via sqlite3DbMallocZero in the SF_Aggregate gate.  Frees the aCol[]
+  and aFunc[] sub-arrays then the AggInfo record itself. }
+procedure agginfoFreeCleanup(db: PTsqlite3; pArg: Pointer); cdecl;
+var p: PAggInfo;
+begin
+  p := PAggInfo(pArg);
+  if p = nil then Exit;
+  if p^.aCol  <> nil then sqlite3DbFree(db, p^.aCol);
+  if p^.aFunc <> nil then sqlite3DbFree(db, p^.aFunc);
+  sqlite3DbFree(db, p);
+end;
+
+{ assignAggregateRegisters — select.c:6643.  Allocate a contiguous block
+  of registers spanning all aCol[] + aFunc[] entries; record the first
+  register in pAggInfo^.iFirstReg.  After this call,
+  AggInfoColumnReg/AggInfoFuncReg are valid. }
+procedure assignAggregateRegisters(pParse: PParse; pAggInfo: PAggInfo);
+begin
+  Assert(pAggInfo <> nil);
+  Assert(pAggInfo^.iFirstReg = 0);
+  pAggInfo^.iFirstReg := pParse^.nMem + 1;
+  pParse^.nMem := pParse^.nMem + pAggInfo^.nColumn + pAggInfo^.nFunc;
+end;
+
+{ resetAccumulatorSimple — select.c:6658 (slim).  Emit OP_Null over the
+  accumulator register block.  The DISTINCT (iDistinct>=0) and ORDER BY
+  (iOBTab>=0) ephemeral-table arms are intentionally omitted; the gate
+  in sqlite3Select rejects those forms today. }
+procedure resetAccumulatorSimple(pParse: PParse; pAggInfo: PAggInfo);
+var
+  v:    PVdbe;
+  nReg: i32;
+begin
+  v    := pParse^.pVdbe;
+  nReg := pAggInfo^.nFunc + pAggInfo^.nColumn;
+  Assert(pAggInfo^.iFirstReg > 0);
+  if (nReg = 0) or (v = nil) then Exit;
+  if pParse^.nErr <> 0 then Exit;
+  sqlite3VdbeAddOp3(v, OP_Null, 0, pAggInfo^.iFirstReg,
+                    pAggInfo^.iFirstReg + nReg - 1);
+end;
+
+{ updateAccumulatorSimple — select.c:6799 (slim).  For each aggregate
+  function, code its argument list into a contiguous temp range and emit
+  OP_AggStep with the FuncDef attached as P4.  After the per-Func loop,
+  re-emit each accumulator-column expression in directMode so columns
+  referenced by ordinary (non-agg) result-list expressions are
+  populated.  Slim variant: no FILTER / DISTINCT / ORDER BY / NEEDCOLL
+  arms (rejected by gate). }
+procedure updateAccumulatorSimple(pParse: PParse; pAggInfo: PAggInfo);
+var
+  v:       PVdbe;
+  i, j, nArg, r1: i32;
+  regAgg:  i32;
+  pF:      PAggInfoFunc;
+  pC:      PAggInfoCol;
+  pList:   PExprList;
+  argItems: PExprListItem;
+begin
+  v := pParse^.pVdbe;
+  Assert(pAggInfo^.iFirstReg > 0);
+  if pParse^.nErr <> 0 then Exit;
+  pAggInfo^.directMode := 1;
+  for i := 0 to pAggInfo^.nFunc - 1 do
+  begin
+    pF := @pAggInfo^.aFunc[i];
+    Assert(ExprUseXList(pF^.pFExpr));
+    pList := pF^.pFExpr^.x.pList;
+    if pList <> nil then
+    begin
+      nArg   := pList^.nExpr;
+      regAgg := sqlite3GetTempRange(pParse, nArg);
+      argItems := ExprListItems(pList);
+      for j := 0 to nArg - 1 do
+      begin
+        r1 := sqlite3ExprCodeTarget(pParse, argItems[j].pExpr, regAgg + j);
+        if r1 <> regAgg + j then
+          sqlite3VdbeAddOp2(v, OP_Copy, r1, regAgg + j);
+      end;
+    end
+    else
+    begin
+      nArg   := 0;
+      regAgg := 0;
+    end;
+    sqlite3VdbeAddOp3(v, OP_AggStep, 0, regAgg,
+      pAggInfo^.iFirstReg + pAggInfo^.nColumn + i);
+    sqlite3VdbeAppendP4(v, Pointer(pF^.pFunc), P4_FUNCDEF);
+    sqlite3VdbeChangeP5(v, u16(nArg));
+    if nArg > 0 then sqlite3ReleaseTempRange(pParse, regAgg, nArg);
+    if pParse^.nErr <> 0 then begin pAggInfo^.directMode := 0; Exit; end;
+  end;
+  for i := 0 to pAggInfo^.nAccumulator - 1 do
+  begin
+    pC := @pAggInfo^.aCol[i];
+    sqlite3ExprCode(pParse, pC^.pCExpr, pAggInfo^.iFirstReg + i);
+    if pParse^.nErr <> 0 then begin pAggInfo^.directMode := 0; Exit; end;
+  end;
+  pAggInfo^.directMode := 0;
+end;
+
+{ finalizeAggFunctions — select.c:6724 (slim).  Emit OP_AggFinal for
+  each aggregate function with the FuncDef attached as P4.  Skips the
+  iOBTab>=0 ORDER BY arm (rejected by gate). }
+procedure finalizeAggFunctionsSimple(pParse: PParse; pAggInfo: PAggInfo);
+var
+  v:     PVdbe;
+  i:     i32;
+  pF:    PAggInfoFunc;
+  pList: PExprList;
+  nArgP2: i32;
+begin
+  v := pParse^.pVdbe;
+  for i := 0 to pAggInfo^.nFunc - 1 do
+  begin
+    pF := @pAggInfo^.aFunc[i];
+    Assert(ExprUseXList(pF^.pFExpr));
+    if pParse^.nErr <> 0 then Exit;
+    pList := pF^.pFExpr^.x.pList;
+    if pList <> nil then nArgP2 := pList^.nExpr else nArgP2 := 0;
+    sqlite3VdbeAddOp2(v, OP_AggFinal,
+      pAggInfo^.iFirstReg + pAggInfo^.nColumn + i, nArgP2);
+    sqlite3VdbeAppendP4(v, Pointer(pF^.pFunc), P4_FUNCDEF);
+  end;
+end;
+
 { agginfoPersistExprCb — expr.c:7227.  Persist (deep-copy and defer-
   delete) any Expr that the AggInfo retains a pointer to, so the
   AggInfo entry survives even if the parent tree is rewritten or
@@ -18361,6 +18606,14 @@ var
   iDb:         i32;
   iCsr:        i32;
   regAgg:      i32;
+  { Aggregate-no-GROUP-BY locals — populated only when the SF_Aggregate
+    path at codegen.pas:18696 lifts off (count(*) / sum / min / max with
+    no GROUP BY / HAVING / DISTINCT / FILTER / ORDER-in-arg / NEEDCOLL). }
+  pAggI2:      PAggInfo;
+  sNCAgg:      TNameContext;
+  canUseAgg:   Boolean;
+  jAgg:        i32;
+  pAggFunc:    PAggInfoFunc;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -18516,6 +18769,136 @@ begin
         sqlite3VdbeAddOp2(v, OP_Copy, regAgg, pDest^.iSdst);
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, 1);
         Result := SQLITE_OK; Exit;
+      end;
+    end;
+  end;
+
+  { Aggregate-no-GROUP-BY general path — select.c:8819..8893.  Single-
+    table aggregate with no GROUP BY / HAVING / DISTINCT / Compound /
+    Window, single-table FROM that is an ordinary base table.  Honours
+    pWhere via sqlite3WhereBegin.  DISTINCT-arg / ORDER-BY-in-arg /
+    FILTER / NEEDCOLL aggregates re-enter the early-exit gate below
+    (i.e. fall back to the pre-agg 3-op stub) — they need extra ephem
+    table / collation plumbing not yet ported. }
+  if ((p^.selFlags and SF_Aggregate) <> 0)
+     and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
+     and (p^.pGroupBy = nil) and (p^.pHaving = nil)
+     and (p^.pWin     = nil)
+     and (p^.pOrderBy = nil)
+     and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
+     and (p^.pSrc^.nSrc <= 2)
+     and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem))
+  then
+  begin
+    canUseAgg := True;
+    pItem := SrcListItems(p^.pSrc);
+    for jAgg := 0 to p^.pSrc^.nSrc - 1 do
+    begin
+      pTab := pItem[jAgg].pSTab;
+      if (pTab = nil)
+         or (pTab^.eTabType = TABTYP_VTAB)
+         or (pTab^.eTabType = TABTYP_VIEW)
+         or ((pTab^.tabFlags and TF_Ephemeral) <> 0)
+         or ((pItem[jAgg].fg.fgBits and $01) <> 0)
+      then begin canUseAgg := False; break; end;
+    end;
+    pTab := pItem^.pSTab;  { restore for downstream pTab uses }
+    if canUseAgg then
+    begin
+      v := sqlite3GetVdbe(pParse);
+      if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
+
+      { Allocate AggInfo + register cleanup (select.c:8401..8403). }
+      pAggI2 := PAggInfo(sqlite3DbMallocZero(pParse^.db, SizeOf(TAggInfo)));
+      if pAggI2 = nil then begin Result := SQLITE_NOMEM; Exit; end;
+      sqlite3ParserAddCleanup(pParse, @agginfoFreeCleanup, pAggI2);
+      pAggI2^.selId    := p^.selId;
+      pAggI2^.pGroupBy := nil;
+
+      { NameContext bound to AggInfo (select.c:8413..8417). }
+      FillChar(sNCAgg, SizeOf(sNCAgg), 0);
+      sNCAgg.pParse        := pParse;
+      sNCAgg.pSrcList      := p^.pSrc;
+      sNCAgg.uNC.pAggInfo  := pAggI2;
+      sNCAgg.ncFlags       := NC_UAggInfo;
+
+      { Pas-only step — rewrite TK_FUNCTION → TK_AGG_FUNCTION on
+        aggregate calls in pEList so analyzeAggregate's TK_AGG_FUNCTION
+        arm fires.  The C resolver does this in resolve.c per node;
+        Pas's resolver only sets SF_Aggregate. }
+      markAggregateInExprList(pParse, p^.pEList);
+
+      { analyzeAggList — populates pAggI2->aCol[] / aFunc[]
+        (select.c:8420). }
+      sqlite3ExprAnalyzeAggList(@sNCAgg, p^.pEList);
+      pAggI2^.nAccumulator := pAggI2^.nColumn;
+      analyzeAggFuncArgs(pAggI2, @sNCAgg);
+
+      { Bail when any aggregate carries DISTINCT, ORDER BY in the arg
+        list, FILTER, or NEEDCOLL collation — those need ephemeral
+        tables / collation plumbing not in scope here.  Returning
+        SQLITE_OK here re-enters the 3-op fallback stub at the
+        general-exit gate below, preserving prior behaviour for the
+        unsupported cases. }
+      canUseAgg := True;
+      for jAgg := 0 to pAggI2^.nFunc - 1 do
+      begin
+        pAggFunc := @pAggI2^.aFunc[jAgg];
+        if pAggFunc^.iDistinct >= 0 then begin canUseAgg := False; break; end;
+        if pAggFunc^.iOBTab    >= 0 then begin canUseAgg := False; break; end;
+        if (pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0 then
+          begin canUseAgg := False; break; end;
+        if (pAggFunc^.pFunc <> nil)
+           and ((PTFuncDef(pAggFunc^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0)
+        then begin canUseAgg := False; break; end;
+      end;
+      { Bail also when result list contains a non-trivial reference to
+        a base column (the directMode column-emit arm we don't fully
+        cover here).  For the targeted bug shapes (count/sum/min/max
+        with simple WHERE), nAccumulator is 0 — let those pass.  When
+        nAccumulator > 0 we'd need the assignAggregateRegisters block
+        plus the directMode column-store loop in updateAccumulator —
+        deferred until the GROUP BY path lands. }
+      if canUseAgg and (pAggI2^.nAccumulator > 0) then canUseAgg := False;
+
+      if canUseAgg and (pParse^.nErr = 0) then
+      begin
+        sqlite3GenerateColumnNames(pParse, p);
+        iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
+        sqlite3CodeVerifySchema(pParse, iDb);
+
+        assignAggregateRegisters(pParse, pAggI2);
+        resetAccumulatorSimple(pParse, pAggI2);
+
+        pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere,
+                                    nil, nil, p, 0, 0);
+        if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+        updateAccumulatorSimple(pParse, pAggI2);
+        sqlite3WhereEnd(pWInfo);
+        finalizeAggFunctionsSimple(pParse, pAggI2);
+
+        { Render the result row — sqlite3ExprCodeTarget routes
+          TK_AGG_FUNCTION through the AggInfoFuncReg arm (added above)
+          so result columns read directly from accumulators. }
+        nResultCol     := p^.pEList^.nExpr;
+        pDest^.nSdst   := nResultCol;
+        if pDest^.iSdst = 0 then
+        begin
+          pDest^.iSdst := pParse^.nMem + 1;
+          pParse^.nMem := pParse^.nMem + nResultCol;
+        end;
+        items := ExprListItems(p^.pEList);
+        for i := 0 to nResultCol - 1 do
+        begin
+          r1 := sqlite3ExprCodeTarget(pParse, items[i].pExpr, pDest^.iSdst + i);
+          if r1 <> pDest^.iSdst + i then
+            sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
+        end;
+        if pDest^.eDest = SRT_Output then
+          sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
+        Exit;
       end;
     end;
   end;
