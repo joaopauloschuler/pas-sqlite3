@@ -319,6 +319,49 @@ Important: At the end of this document, please find:
         Full table-driven `pragmaLocate` dispatch still deferred
         under 6.12.
 
+  [ ] **6.10 step 17** Window-function and aggregate divergences surfaced
+      by the new `src/tests/DiagWindow.pas` probe (run with
+      `LD_LIBRARY_PATH=$PWD/src bin/DiagWindow`).  20 divergences logged
+      2026-04-28; most fold into existing window/agg tasks.  New unique
+      items first:
+      [ ] **a) `max(val) FROM g` returns `0.0` instead of `5`** — silent
+        wrong value.  `min(val)`, `count(*)`, `sum(val)` all correct on
+        the same table; only `max` diverges.  REAL-typed `0.0` output
+        suggests the min/max optimisation rewrite (codegen.pas:18460,
+        WHERE_ORDERBY_MAX + KEYINFO_ORDER_DESC) routes max through a
+        zero-row early-exit / DESC-ordered scan that does not honour
+        the DESC sort flag in the planner, so the aggregate accumulator
+        is never updated and minMaxFinal returns the default 0.0.
+        Reproduced with single-row INSERTs (not the multi-row VALUES
+        path), so independent of step 6 sub-FROM gap.  C reference:
+        select.c minMaxQuery + where.c WHERE_ORDERBY_MIN/MAX handling.
+      [ ] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** — the
+        ORDER-BY-in-aggregate arm is not honoured; the unordered
+        variant `group_concat(val,',')` PASSes.  Tracked under 6.24
+        (aggregate-with-ORDER-BY codegen) when it lands.
+      [ ] **c) Window functions fail at prepare time** —
+        `rank()`, `dense_rank()`, `lag()`, `lead()`, `first_value()`,
+        `ntile()` with OVER clauses all return prepRc=1.  Folds into
+        6.26 `sqlite3WindowCodeInit` / `sqlite3WindowCodeStep` stubs.
+      [ ] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
+        prepare cleanly but emit no rows** — `row_number() OVER (...)`
+        same.  Symptom: prep=0 step=101 with empty result set when C
+        produces N rows.  Window-codegen sub-issue under 6.26; distinct
+        from (c) because here the parse + prepare succeed.
+      [ ] **e) `count(*) FILTER (WHERE …)` / `sum() FILTER` empty
+        result** — agg + FILTER-clause codegen not wired.  C reference:
+        select.c analyzeAggregate FILTER arm.
+      [ ] **f) `count(DISTINCT col)` / `sum(DISTINCT col)` empty
+        result** — agg-DISTINCT codegen path missing.  C reference:
+        select.c codeDistinct.
+      [ ] **g) `GROUP BY ... HAVING ...` returns no rows** —
+        DiagWindow `group having`: HAVING clause filtering on aggregate
+        result not emitted.
+      [ ] **h) `GROUP BY ... ORDER BY ... DESC` returns no rows** —
+        DiagWindow `group order`: GROUP BY combined with ORDER BY drops
+        rows.  Likely shares root cause with (g) — agg-with-trailing-
+        clauses gate at codegen.pas:18968.
+
   [X] **6.10 step 16** Regressions surfaced by full-suite sweep on 2026-04-28
       — both closed 2026-04-28.
       [X] **a) TestAuthBuiltins hangs** — closed.  Root cause:
