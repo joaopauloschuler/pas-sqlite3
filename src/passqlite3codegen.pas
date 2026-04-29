@@ -28184,45 +28184,82 @@ var
     Result := s;
   end;
 
+  { %g / %G implementation matching printf.c:530..617 etGENERIC arm.
+    prec defaults to 6, precision==0 → 1.  exp = floor(log10(|v|)).
+    if exp<-4 or exp>=prec → scientific with prec-1 fractional digits;
+    else fixed with (prec-1-exp) fractional digits.  Trailing zeros are
+    stripped (rtz) unless '#' alt-form flag is set; a trailing '.' is
+    always stripped when it has no fractional digits left. }
+  function FmtGeneric(v: Double; upper: Boolean): AnsiString;
+  var
+    prec, expN, fracDigits, k: i32;
+    mant: Double;
+    s: AnsiString;
+    keepTrailingZeros: Boolean;
+  begin
+    if metaHavePrec then prec := metaPrec else prec := 6;
+    if prec = 0 then prec := 1;
+    keepTrailingZeros := Pos('#', metaFlags) > 0;
+    if v = 0 then begin
+      expN := 0;
+    end else begin
+      expN := Trunc(Ln(Abs(v)) / Ln(10));
+      mant := Abs(v) / Power(10.0, expN);
+      if mant < 1 then begin Dec(expN); end
+      else if mant >= 10 then begin Inc(expN); end;
+    end;
+    if (expN < -4) or (expN >= prec) then begin
+      Result := FmtSciE(v, prec - 1, upper);
+    end else begin
+      fracDigits := prec - 1 - expN;
+      if fracDigits < 0 then fracDigits := 0;
+      Result := FloatToStrF(v, ffFixed, 15, fracDigits);
+    end;
+    if not keepTrailingZeros then begin
+      { strip trailing zeros after the decimal point, then a trailing '.' }
+      k := Pos('e', Result);
+      if k = 0 then k := Pos('E', Result);
+      if k = 0 then begin
+        if Pos('.', Result) > 0 then begin
+          while (Length(Result) > 0) and (Result[Length(Result)] = '0') do
+            SetLength(Result, Length(Result) - 1);
+          if (Length(Result) > 0) and (Result[Length(Result)] = '.') then
+            SetLength(Result, Length(Result) - 1);
+        end;
+      end else begin
+        s := Copy(Result, k, Length(Result) - k + 1);
+        SetLength(Result, k - 1);
+        if Pos('.', Result) > 0 then begin
+          while (Length(Result) > 0) and (Result[Length(Result)] = '0') do
+            SetLength(Result, Length(Result) - 1);
+          if (Length(Result) > 0) and (Result[Length(Result)] = '.') then
+            SetLength(Result, Length(Result) - 1);
+        end;
+        Result := Result + s;
+      end;
+    end;
+  end;
+
   function FmtFloat(spec: AnsiChar; v: Double): AnsiString;
   var
-    fmt: TFloatFormat;
-    digits, prec, i: i32;
+    prec, i: i32;
   begin
     if (spec = 'e') or (spec = 'E') then begin
       if metaHavePrec then prec := metaPrec else prec := 6;
       Result := FmtSciE(v, prec, spec = 'E');
+    end else if (spec = 'g') or (spec = 'G') then begin
+      Result := FmtGeneric(v, spec = 'G');
     end else begin
-      if (not metaHaveWidth) and (not metaHavePrec) and (spec <> 'f') then begin
-        Result := FloatToStr(v);
-        if (spec = 'G') then Result := UpperCase(Result);
-        for i := 1 to Length(Result) - 1 do
-          if (Result[i] = 'e') or (Result[i] = 'E') then begin
-            if (i + 1 <= Length(Result))
-               and (Result[i + 1] <> '+') and (Result[i + 1] <> '-') then
-              Insert('+', Result, i + 1);
-            Break;
-          end;
-      end else begin
-        case spec of
-          'f': begin fmt := ffFixed;    if metaHavePrec then prec := metaPrec else prec := 6; end;
-        else
-          begin fmt := ffGeneral; if metaHavePrec then prec := metaPrec else prec := 15; end;
+      { %f }
+      if metaHavePrec then prec := metaPrec else prec := 6;
+      Result := FloatToStrF(v, ffFixed, 15, prec);
+      for i := 1 to Length(Result) - 1 do
+        if (Result[i] = 'e') or (Result[i] = 'E') then begin
+          if (i + 1 <= Length(Result))
+             and (Result[i + 1] <> '+') and (Result[i + 1] <> '-') then
+            Insert('+', Result, i + 1);
+          Break;
         end;
-        if fmt = ffFixed then digits := prec
-        else digits := prec;
-        Result := FloatToStrF(v, fmt, 15, digits);
-        if (spec = 'G') then Result := UpperCase(Result);
-        { Ensure scientific-notation exponent carries an explicit sign,
-          matching C printf(%g/%G) which always emits "e+NN" / "e-NN". }
-        for i := 1 to Length(Result) - 1 do
-          if (Result[i] = 'e') or (Result[i] = 'E') then begin
-            if (i + 1 <= Length(Result))
-               and (Result[i + 1] <> '+') and (Result[i + 1] <> '-') then
-              Insert('+', Result, i + 1);
-            Break;
-          end;
-      end;
     end;
     if metaHaveWidth and (Length(Result) < metaWidth) then begin
       if Pos('-', metaFlags) > 0 then

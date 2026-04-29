@@ -433,7 +433,7 @@ Important: At the end of this document, please find:
       and `SELECT :a + :b` round-trips.  Released the deferred follow-on
       from the 8.3.1 sqlite3_bind_zeroblob entry.
 
-  [ ] **6.10 step 21** DiagPrintfFmt probe (added 2026-04-29,
+  [X] **6.10 step 21** DiagPrintfFmt probe (added 2026-04-29,
       `src/tests/DiagPrintfFmt.pas`).  Covers SQL `printf()` /`format()`
       format-specifier coverage — 38 cases.  Initial sweep flagged 10
       divergences against the C reference; 8 closed in the same commit
@@ -445,22 +445,17 @@ Important: At the end of this document, please find:
       `%llx` etc. now route to the `d`/`x` arms instead of being
       emitted verbatim).  TestPrintf 105/0, DiagFunctions 0,
       TestExplainParity 1016/10, DiagPubApi 240/0 — no regressions.
-      Remaining 2 divergences (real-formatter gaps):
-      [ ] **a) `%g` switch to scientific.**  `printf('%g', 1234567.0)`
-          should yield `1.23457e+06` (C printf rule: switch to
-          scientific when the exponent is < −4 or ≥ precision, default
-          precision 6, strip trailing zeros).  Pas FmtFloat falls back
-          to `FloatToStr` when no width/precision metadata is set,
-          which keeps fixed-form for any value that fits in i64
-          range.  Requires reimplementing `%g`/`%G` per printf.c rules
-          rather than delegating to `FloatToStr`.
-      [ ] **b) `%!g` alt-form-2 long precision.**  SQLite extension
-          `%!g` (printf.c:763 etGENERIC + altForm2) prints with up to
-          ~17 significant digits.  Pas now consumes the `!` flag (no
-          longer surfaces as a literal `%!g`) but the float renderer
-          ignores `altForm2` so the precision still defaults to
-          `FloatToStr`'s default.  Closes when (a) lands and FmtFloat
-          honours metaFlags `'!'` to widen precision to 16/17.
+      Remaining 2 divergences closed 2026-04-29 by porting a proper
+      `%g`/`%G` (etGENERIC) renderer in printfFunc (codegen.pas):
+      default precision 6, switch to scientific when exp<-4 or
+      exp>=precision, strip trailing zeros (and trailing '.') unless
+      `#` alt-form is set.  `%!g` resolves as a side-effect — the C
+      etGENERIC arm gates rtz on `#` (flag_alternateform), not on `!`
+      (flag_altform2), so once rtz is honoured `%!g` matches.
+      DiagPrintfFmt 38/0; TestPrintf 105/0, TestExplainParity 1016/10,
+      TestVdbeAgg 11/0, TestSelectBasic 49/0, TestParser 45/0,
+      TestBtreeCompat 337/0, TestDMLBasic 54/0, TestVdbeApi 57/0,
+      TestAuthBuiltins 34/0 — no regressions.
 
   [X] **6.10 step 18** TestAuthBuiltins 34/0 closed 2026-04-28 — guard
       each `sqlite3Register*Functions` (Builtin/DateTime/Json/Window)
