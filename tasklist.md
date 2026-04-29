@@ -593,7 +593,17 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             mirrors C destructor-on-error contract.  Replaces the
             sqlite3_value_pointer_stub in passqlite3carray.pas; carray
             xFilter now consults the real typed-pointer Mem.
-       [ ] `sqlite3_bind_parameter_index` — name → 1-based index.
+       [X] `sqlite3_bind_parameter_index` / `sqlite3_bind_parameter_name`
+            — ported 2026-04-28 (passqlite3vdbe.pas + util.pas).  Added
+            full util.c VList machinery (sqlite3VListAdd /
+            VListNumToName / VListNameToNum), wired
+            `sqlite3ExprAssignVarNumber` to maintain `pParse^.pVList`
+            with named-bind dedup, transferred Parse→Vdbe in
+            `sqlite3VdbeMakeReady` and freed in `sqlite3VdbeClearObject`.
+            DiagPubApi covers round-trip, `:x+:x` dedup (1 slot, value
+            10), `?` returns nil name, out-of-range/nil-stmt guards.
+            Side-effect: TestExplainParity 1013/13 → 1016/10 (3 prior
+            divergences resolved by correct named-bind slot reuse).
 
 - [ ] **8.3.2** Result / value variants (vdbeapi.c, vdbemem.c):
        [ ] `sqlite3_result_blob64`.

@@ -630,6 +630,14 @@ function  sqlite3Atoi64(zNum: PChar; out pNum: i64; length: i32; enc: u8): i32;
 function  sqlite3Int64ToText(v: i64; zOut: PChar): i32;
 function  sqlite3DecOrHexToI64(z: PChar; out pOut: i64): i32;
 
+{ VList — variable name/number mapping (util.c:2155..2249).
+  pVList is a packed int array; layout documented at util.c:2156. }
+function  sqlite3VListAdd(db: Psqlite3db; pIn: Pointer;
+                          zName: PAnsiChar; nName: i32; iVal: i32): Pointer;
+function  sqlite3VListNumToName(pIn: Pointer; iVal: i32): PAnsiChar;
+function  sqlite3VListNameToNum(pIn: Pointer;
+                                zName: PAnsiChar; nName: i32): i32;
+
 { Big-endian 4-byte accessors (util.c) }
 function  sqlite3Get4byte(p: Pu8): u32;
 procedure sqlite3Put4byte(p: Pu8; v: u32);
@@ -951,6 +959,83 @@ begin
     Inc(a); Inc(b);
   until False;
   Result := c;
+end;
+
+{ ============================================================
+  VList — packed int array carrying (iVal, nSlot, zName) triples.
+  Direct port of util.c:2155..2249.
+  ============================================================ }
+
+function sqlite3VListAdd(db: Psqlite3db; pIn: Pointer;
+                         zName: PAnsiChar; nName: i32; iVal: i32): Pointer;
+var
+  nInt:   i32;
+  i:      i32;
+  pa:     Pi32;
+  pOut:   Pointer;
+  nAlloc: i64;
+  z:      PAnsiChar;
+begin
+  nInt := nName div 4 + 3;
+  pa := Pi32(pIn);
+  Assert((pa = nil) or (pa[0] >= 3));
+  if (pa = nil) or (pa[1] + nInt > pa[0]) then begin
+    if pa <> nil then nAlloc := 2 * i64(pa[0]) + nInt
+    else              nAlloc := 10 + nInt;
+    pOut := sqlite3DbRealloc(db, pIn, u64(nAlloc) * SizeOf(i32));
+    if pOut = nil then begin Result := pIn; Exit; end;
+    if pa = nil then Pi32(pOut)[1] := 2;
+    pa := Pi32(pOut);
+    pa[0] := i32(nAlloc);
+    pIn := pOut;
+  end;
+  i := pa[1];
+  pa[i]     := iVal;
+  pa[i + 1] := nInt;
+  z := PAnsiChar(@pa[i + 2]);
+  pa[1] := i + nInt;
+  Assert(pa[1] <= pa[0]);
+  if nName > 0 then Move(zName^, z^, nName);
+  z[nName] := #0;
+  Result := pIn;
+end;
+
+function sqlite3VListNumToName(pIn: Pointer; iVal: i32): PAnsiChar;
+var pa: Pi32; i, mx: i32;
+begin
+  if pIn = nil then begin Result := nil; Exit; end;
+  pa := Pi32(pIn);
+  mx := pa[1];
+  i  := 2;
+  while True do begin
+    if pa[i] = iVal then begin
+      Result := PAnsiChar(@pa[i + 2]);
+      Exit;
+    end;
+    Inc(i, pa[i + 1]);
+    if i >= mx then Break;
+  end;
+  Result := nil;
+end;
+
+function sqlite3VListNameToNum(pIn: Pointer;
+                               zName: PAnsiChar; nName: i32): i32;
+var pa: Pi32; i, mx: i32; z: PAnsiChar;
+begin
+  if pIn = nil then begin Result := 0; Exit; end;
+  pa := Pi32(pIn);
+  mx := pa[1];
+  i  := 2;
+  while True do begin
+    z := PAnsiChar(@pa[i + 2]);
+    if (StrLComp(z, zName, nName) = 0) and (z[nName] = #0) then begin
+      Result := pa[i];
+      Exit;
+    end;
+    Inc(i, pa[i + 1]);
+    if i >= mx then Break;
+  end;
+  Result := 0;
 end;
 
 { util.c:408 — public-API wrapper around sqlite3StrICmp with NULL guards. }

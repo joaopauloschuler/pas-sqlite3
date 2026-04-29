@@ -1586,6 +1586,9 @@ function sqlite3_bind_pointer(pStmt: PVdbe; i: i32; pPtr: Pointer;
 function sqlite3_bind_value(pStmt: PVdbe; i: i32;
                             pValue: Psqlite3_value): i32;
 function sqlite3_bind_parameter_count(pStmt: PVdbe): i32;
+function sqlite3_bind_parameter_name(pStmt: PVdbe; i: i32): PAnsiChar;
+function sqlite3_bind_parameter_index(pStmt: PVdbe; zName: PAnsiChar): i32;
+function sqlite3VdbeParameterIndex(p: PVdbe; zName: PAnsiChar; nName: i32): i32;
 
 { --- vdbeapi.c — sqlite3_result_* context-result setters (Phase 6.6) --- }
 procedure sqlite3_result_null(pCtx: Psqlite3_context);
@@ -3219,11 +3222,15 @@ var
 begin
   db      := p^.db;
   { Parse field offsets (verified against passqlite3codegen.TParse layout):
-    nTab @56 (i32), nMem @60 (i32), nVar @296 (i16). }
+    nTab @56 (i32), nMem @60 (i32), nVar @296 (i16), pVList @320 (Pointer). }
   nCursor := PInt32(PByte(pParse) + 56)^;
   nMem    := PInt32(PByte(pParse) + 60)^;
   nVar    := i32(PWord(PByte(pParse) + 296)^);
   nArg    := 0;
+  { vdbeaux.c:2665 — transfer the variable-name VList from Parse to Vdbe.
+    Required by sqlite3_bind_parameter_name / _index. }
+  p^.pVList := PPointer(PByte(pParse) + 320)^;
+  PPointer(PByte(pParse) + 320)^ := nil;
 
   n := vdbeParseSzOpAllocPtr(pParse)^;
   resolveP2Values(p, @nArg);
@@ -3730,6 +3737,10 @@ begin
       if (p^.aMem[i].flags and (MEM_Dyn or MEM_Agg)) <> 0 then
         sqlite3VdbeMemRelease(@p^.aMem[i]);
     end;
+  end;
+  if p^.pVList <> nil then begin
+    sqlite3DbNNFreeNN(db, p^.pVList);
+    p^.pVList := nil;
   end;
   if p^.pFree <> nil then
     sqlite3DbFree(db, p^.pFree);
@@ -4269,6 +4280,25 @@ function sqlite3_bind_parameter_count(pStmt: PVdbe): i32;
 begin
   if pStmt = nil then begin Result := 0; Exit; end;
   Result := pStmt^.nVar;
+end;
+
+{ vdbeapi.c:1942 — name of an indexed wildcard, NULL if unnamed/out-of-range. }
+function sqlite3_bind_parameter_name(pStmt: PVdbe; i: i32): PAnsiChar;
+begin
+  if pStmt = nil then begin Result := nil; Exit; end;
+  Result := sqlite3VListNumToName(pStmt^.pVList, i);
+end;
+
+{ vdbeapi.c:1953/1957 — name → 1-based wildcard index, 0 if absent. }
+function sqlite3VdbeParameterIndex(p: PVdbe; zName: PAnsiChar; nName: i32): i32;
+begin
+  if (p = nil) or (zName = nil) then begin Result := 0; Exit; end;
+  Result := sqlite3VListNameToNum(p^.pVList, zName, nName);
+end;
+
+function sqlite3_bind_parameter_index(pStmt: PVdbe; zName: PAnsiChar): i32;
+begin
+  Result := sqlite3VdbeParameterIndex(pStmt, zName, sqlite3Strlen30(zName));
 end;
 
 { --- sqlite3_clear_bindings (vdbeapi.c:149) --- }

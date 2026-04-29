@@ -216,6 +216,46 @@ begin
   sqlite3_bind_int(pStmt, 2, 4);
   Check('step :a+:b ROW', sqlite3_step(pStmt) = SQLITE_ROW);
   Check('column_int(:a+:b) = 7', sqlite3_column_int(pStmt, 0) = 7);
+  { Phase 8.3.1 — sqlite3_bind_parameter_name / _index round-trip. }
+  Check('parameter_name(:a)',
+        StrComp(sqlite3_bind_parameter_name(pStmt, 1), ':a') = 0);
+  Check('parameter_name(:b)',
+        StrComp(sqlite3_bind_parameter_name(pStmt, 2), ':b') = 0);
+  Check('parameter_name(out-of-range)',
+        sqlite3_bind_parameter_name(pStmt, 3) = nil);
+  Check('parameter_index(:a) = 1',
+        sqlite3_bind_parameter_index(pStmt, ':a') = 1);
+  Check('parameter_index(:b) = 2',
+        sqlite3_bind_parameter_index(pStmt, ':b') = 2);
+  Check('parameter_index(:zzz) = 0 (absent)',
+        sqlite3_bind_parameter_index(pStmt, ':zzz') = 0);
+  Check('parameter_name(nil stmt) = nil',
+        sqlite3_bind_parameter_name(nil, 1) = nil);
+  Check('parameter_index(nil stmt) = 0',
+        sqlite3_bind_parameter_index(nil, ':a') = 0);
+  sqlite3_finalize(pStmt);
+
+  { De-duplication: ":x + :x" should resolve to 1 wildcard slot. }
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT :x + :x', -1, @pStmt, nil);
+  Check('prep SELECT :x + :x', rcs = SQLITE_OK);
+  Check('bind_parameter_count(:x dedup) = 1',
+        sqlite3_bind_parameter_count(pStmt) = 1);
+  Check('parameter_index(:x dedup) = 1',
+        sqlite3_bind_parameter_index(pStmt, ':x') = 1);
+  Check('parameter_name(:x dedup)',
+        StrComp(sqlite3_bind_parameter_name(pStmt, 1), ':x') = 0);
+  sqlite3_bind_int(pStmt, 1, 5);
+  Check('step :x+:x ROW', sqlite3_step(pStmt) = SQLITE_ROW);
+  Check('column_int(:x+:x) = 10', sqlite3_column_int(pStmt, 0) = 10);
+  sqlite3_finalize(pStmt);
+
+  { ?N anonymous wildcards: name should be NULL. }
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT ?, ?', -1, @pStmt, nil);
+  Check('prep SELECT ?, ?', rcs = SQLITE_OK);
+  Check('parameter_name(?) = nil',
+        sqlite3_bind_parameter_name(pStmt, 1) = nil);
   sqlite3_finalize(pStmt);
 
   { Phase 8.1.1 — sqlite3_db_release_memory / sqlite3_db_cacheflush. }
