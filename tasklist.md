@@ -1178,12 +1178,31 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             no-op stub, so `COLLATE NOCASE` never sets COLFLAG_HASCOLL
             and metadata falls back to "BINARY".  See new task 6.27a.
 
-- [ ] **8.5.1** Dynamic string builder API (`sqlite3_str_*`,
-       printf.c):
-       [ ] `sqlite3_str_append`, `_appendall`, `_appendchar`,
-            `_appendf`, `_vappendf`.
-       [ ] `sqlite3_str_errcode`, `_free`, `_length`, `_reset`,
-            `_truncate`.
+- [X] **8.5.1** Dynamic string builder API (`sqlite3_str_*`,
+       printf.c) — closed 2026-04-29 (passqlite3printf.pas).  Verbatim
+       port of printf.c:1141..1341.  TSqlite3Str record mirrors the C
+       StrAccum (db / zText / nAlloc / mxAlloc / nChar / accError /
+       printfFlags); raw libc malloc/realloc/free backing (no lookaside
+       — matches sqlite3_str_new(nil) shape).  Functions ported:
+       `_new`, `_finish`, `_free`, `_reset`, `_truncate`, `_value`,
+       `_length`, `_errcode`, `_append`, `_appendall`, `_appendchar`,
+       `_appendf` (the last takes `array of const`; matches the project
+       no-C-ABI-varargs policy from main.pas:1294).  Local
+       `strAccumEnlarge` helper mirrors sqlite3StrAccumEnlarge.  OOM
+       singleton `gOomStr` matches sqlite3OomStr.  csqlite3 bindings
+       added for `_new`/_finish`/_reset`/_value`/_length`/_errcode`/
+       `_append`/_appendall`/_appendchar` (the system Debian
+       libsqlite3 used at link time does not export `_truncate` or
+       `_free`, so those bind only via the local libsqlite3.so at
+       runtime — Pas implementations are tested directly).  New gate
+       `src/tests/DiagStrAccum.pas` (8/0 PASS — basic build/length/
+       truncate/reset/reuse/empty/errcode/large-append).  Buffers
+       returned by `csq_str_finish` must be released with `csq_free`
+       (not the local libc-free wrapper); test reflects that.  No
+       regressions: TestPrintf 105/0, TestExplainParity 1016/10,
+       DiagPubApi 254/0, TestSelectBasic 49/0, TestVdbeAgg 11/0,
+       TestParser 45/0, TestBtreeCompat 337/0, TestDMLBasic 54/0,
+       TestVdbeApi 57/0, TestAuthBuiltins 34/0.
        [X] `sqlite3_stricmp` — case-insensitive ASCII strcmp helper
             (passqlite3util.pas:957) — public-API wrapper around
             sqlite3StrICmp with NULL guards; covered by TestUtil T3.
