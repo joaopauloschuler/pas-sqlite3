@@ -21872,11 +21872,118 @@ begin
   end;
 end;
 
-{ sqlite3ComputeGeneratedColumns — emit VDBE for generated cols (Phase 6.4 stub) }
+{ exprColumnFlagUnion — walker callback that ORs colFlags of every
+  TK_COLUMN reference into pWalker^.eCode.  Port of insert.c:269. }
+function exprColumnFlagUnion(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pTab: PTable2;
+begin
+  if (pExpr^.op = TK_COLUMN) and (pExpr^.iColumn >= 0) then
+  begin
+    pTab := PTable2(pWalker^.u.ptr);
+    AssertH(pExpr^.iColumn < pTab^.nCol,
+      'exprColumnFlagUnion: iColumn<nCol');
+    pWalker^.eCode := pWalker^.eCode or pTab^.aCol[pExpr^.iColumn].colFlags;
+  end;
+  Result := WRC_Continue;
+end;
+
+{ sqlite3ComputeGeneratedColumns — port of insert.c:285.
+  All regular columns for table pTab have been put into registers starting
+  at iRegStore.  STORED / VIRTUAL columns are not yet initialised; this
+  routine fills them in based on the previously computed normal columns. }
 procedure sqlite3ComputeGeneratedColumns(pParse: PParse; iRegStore: i32;
   pTab: PTable2);
+var
+  i, ii, jj: i32;
+  w: TWalker;
+  pRedo, pCol: PColumn;
+  eProgress, x: i32;
+  pOp: PVdbeOp;
+  zP4: PAnsiChar;
 begin
-  { Phase 6.5 }
+  AssertH((pTab^.tabFlags and TF_HasGenerated) <> 0,
+    'sqlite3ComputeGeneratedColumns: TF_HasGenerated set');
+
+  { Apply affinity to the regular columns first. }
+  sqlite3TableAffinity(pParse^.pVdbe, pTab, iRegStore);
+  if (pTab^.tabFlags and TF_HasStored) <> 0 then
+  begin
+    pOp := sqlite3VdbeGetLastOp(pParse^.pVdbe);
+    if pOp^.opcode = OP_Affinity then
+    begin
+      { Change OP_Affinity arg to '@' (NONE) for stored columns —
+        their values have not been computed yet. }
+      zP4 := pOp^.p4.z;
+      AssertH(zP4 <> nil, 'sqlite3ComputeGeneratedColumns: zP4<>nil');
+      AssertH(pOp^.p4type = P4_DYNAMIC,
+        'sqlite3ComputeGeneratedColumns: p4type=P4_DYNAMIC');
+      ii := 0; jj := 0;
+      while zP4[jj] <> #0 do
+      begin
+        if (pTab^.aCol[ii].colFlags and COLFLAG_VIRTUAL) <> 0 then
+        begin
+          Inc(ii);
+          Continue;
+        end;
+        if (pTab^.aCol[ii].colFlags and COLFLAG_STORED) <> 0 then
+          zP4[jj] := AnsiChar(SQLITE_AFF_NONE);
+        Inc(ii);
+        Inc(jj);
+      end;
+    end
+    else if pOp^.opcode = OP_TypeCheck then
+    begin
+      { OP_TypeCheck (STRICT table): set P3 to flag that generated
+        columns should not be checked. }
+      pOp^.p3 := 1;
+    end;
+  end;
+
+  { Pass 1: mark every generated column as NOT-AVAILABLE. }
+  for i := 0 to pTab^.nCol - 1 do
+    if (pTab^.aCol[i].colFlags and COLFLAG_GENERATED) <> 0 then
+      pTab^.aCol[i].colFlags := pTab^.aCol[i].colFlags or COLFLAG_NOTAVAIL;
+
+  FillChar(w, SizeOf(w), 0);
+  w.u.ptr := Pointer(pTab);
+  w.xExprCallback    := @exprColumnFlagUnion;
+  w.xSelectCallback  := nil;
+  w.xSelectCallback2 := nil;
+
+  { Pass 2: code each NOT-AVAILABLE column.  Multiple passes if the
+    expression depends on another generated column not yet ready. }
+  pParse^.iSelfTab := -iRegStore;
+  repeat
+    eProgress := 0;
+    pRedo := nil;
+    for i := 0 to pTab^.nCol - 1 do
+    begin
+      pCol := @pTab^.aCol[i];
+      if (pCol^.colFlags and COLFLAG_NOTAVAIL) <> 0 then
+      begin
+        pCol^.colFlags := pCol^.colFlags or COLFLAG_BUSY;
+        w.eCode := 0;
+        sqlite3WalkExpr(@w, sqlite3ColumnExpr(pTab, pCol));
+        pCol^.colFlags := pCol^.colFlags and (not COLFLAG_BUSY);
+        if (w.eCode and COLFLAG_NOTAVAIL) <> 0 then
+        begin
+          pRedo := pCol;
+          Continue;
+        end;
+        eProgress := 1;
+        AssertH((pCol^.colFlags and COLFLAG_GENERATED) <> 0,
+          'sqlite3ComputeGeneratedColumns: COLFLAG_GENERATED');
+        x := sqlite3TableColumnToStorage(pTab, i) + iRegStore;
+        sqlite3ExprCodeGeneratedColumn(pParse, pTab, pCol, x);
+        pCol^.colFlags := pCol^.colFlags and (not COLFLAG_NOTAVAIL);
+      end;
+    end;
+  until (pRedo = nil) or (eProgress = 0);
+  if pRedo <> nil then
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+      'generated column loop on "%s"', [pRedo^.zCnName]));
+  pParse^.iSelfTab := 0;
 end;
 
 { sqlite3AutoincrementBegin — emit AUTOINCREMENT init code (Phase 6.4 stub) }

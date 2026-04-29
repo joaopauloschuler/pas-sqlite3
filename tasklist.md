@@ -409,11 +409,14 @@ Important: At the end of this document, please find:
        `sqlite3TriggerStepSrc`, `sqlite3TriggerColmask`.
   [ ] **6.24** port codegen.pas DML / insert stubs in full from C to pascal:
        `sqlite3UpsertAnalyzeTarget`, `sqlite3UpsertDoUpdate`,
-       `sqlite3ComputeGeneratedColumns`, `sqlite3AutoincrementBegin`,
-       `sqlite3AutoincrementEnd`,
+       `sqlite3AutoincrementBegin`, `sqlite3AutoincrementEnd`,
        `sqlite3MultiValues`, `autoIncBegin`,
        `sqlite3GenerateConstraintChecks`.
        [X] `sqlite3MultiValuesEnd` — ported 2026-04-29.
+       [X] `sqlite3ComputeGeneratedColumns` — ported 2026-04-29.
+            Body lands ahead of its callers (sqlite3Insert / sqlite3Update /
+            sqlite3GenerateConstraintChecks are still skeletons), so the
+            function is dead-code today; it becomes live when those land.
   [ ] **6.25** port codegen.pas schema / index stubs in full from C to pascal:
        `sqlite3ReadSchema`, `sqlite3RunParser`.
   [ ] **6.26** port codegen.pas where / select / window stubs in full from C
