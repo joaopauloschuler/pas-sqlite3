@@ -73,8 +73,16 @@ Important: At the end of this document, please find:
             `resolveSelectStep` and propagate
             `NC_HasAgg|NC_MinMaxAgg|NC_HasWin|NC_OrderAgg`.  Required
             for query compilation.
-       [ ] `sqlite3ResolveOrderGroupBy` — returns `SQLITE_OK`; resolves
-            ORDER BY / GROUP BY positional aliases against `pSelect^.pEList`.
+       [X] `sqlite3ResolveOrderGroupBy` — closed 2026-04-28.  Real body
+            (resolve.c:1700) ported in passqlite3codegen.pas, plus the
+            `resolveAlias` / `incrAggFunctionDepth` / `incrAggDepth`
+            walker / `resolveOutOfRangeError` helpers it requires.
+            iOrderByCol terms now rewrite into deferred-deleted aliases
+            of the matching pEList expression; out-of-range terms
+            surface "%r ORDER/GROUP BY term out of range" via
+            sqlite3MPrintf.  TestExplainParity 1016/10 (no regression),
+            TestParser 45/0, TestVdbeAgg 11/0, TestSelectBasic 49/0,
+            TestWhereBasic 52/0.
 
        Foreign keys (fkey.c):
        [ ] `sqlite3FkRequired` — returns `0`; full FK-required decision

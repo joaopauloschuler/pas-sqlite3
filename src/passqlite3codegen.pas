@@ -7667,10 +7667,133 @@ begin
   Result := sqlite3ResolveExprNames(@sNC, pExpr);
 end;
 
+{ resolve.c:35 — incrAggDepth walker callback. }
+function incrAggDepth(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+begin
+  if pExpr^.op = TK_AGG_FUNCTION then
+    pExpr^.op2 := pExpr^.op2 + u8(pWalker^.u.n);
+  Result := WRC_Continue;
+end;
+
+{ resolve.c:39 — incrAggFunctionDepth: bump TK_AGG_FUNCTION.op2 by N
+  for every aggregate-function node in pExpr's tree.  Used when copying
+  an aggregate from an outer query into an inner subquery. }
+procedure incrAggFunctionDepth(pExpr: PExpr; N: i32);
+var
+  w: TWalker;
+begin
+  if N > 0 then
+  begin
+    FillChar(w, SizeOf(w), 0);
+    w.xExprCallback := @incrAggDepth;
+    w.u.n           := N;
+    sqlite3WalkExpr(@w, pExpr);
+  end;
+end;
+
+{ resolve.c:68 — resolveAlias.  Turn pExpr into a copy of the iCol-th
+  column of pEList.  The original pExpr is preserved (swapped into
+  the duplicate) and queued for deferred deletion so any caller that
+  retained the address of pExpr keeps a valid Expr. }
+procedure resolveAlias(pParse: PParse; pEList: PExprList; iCol: i32;
+  pExpr: PExpr; nSubquery: i32);
+var
+  pOrig: PExpr;
+  pDup:  PExpr;
+  db:    PTsqlite3;
+  temp:  TExpr;
+  pItems: PExprListItem;
+begin
+  Assert((iCol >= 0) and (iCol < pEList^.nExpr), 'resolveAlias iCol');
+  pItems := ExprListItems(pEList);
+  pOrig := pItems[iCol].pExpr;
+  Assert(pOrig <> nil, 'resolveAlias pOrig');
+  if pExpr^.pAggInfo <> nil then Exit;
+  db := pParse^.db;
+  pDup := sqlite3ExprDup(db, pOrig, 0);
+  if (db <> nil) and (db^.mallocFailed <> 0) then
+  begin
+    sqlite3ExprDelete(db, pDup);
+    pDup := nil;
+  end
+  else
+  begin
+    incrAggFunctionDepth(pDup, nSubquery);
+    if pExpr^.op = TK_COLLATE then
+    begin
+      Assert(not ExprHasProperty(pExpr, EP_IntValue), 'resolveAlias collate IntValue');
+      pDup := sqlite3ExprAddCollateString(pParse, pDup, pExpr^.u.zToken);
+    end;
+    Move(pDup^,  temp,   SizeOf(TExpr));
+    Move(pExpr^, pDup^,  SizeOf(TExpr));
+    Move(temp,   pExpr^, SizeOf(TExpr));
+    if ExprHasProperty(pExpr, EP_WinFunc) then
+    begin
+      if pExpr^.y.pWin <> nil then
+        pExpr^.y.pWin^.pOwner := pExpr;
+    end;
+    sqlite3ExprDeferredDelete(pParse, pDup);
+  end;
+end;
+
+{ resolve.c:1561 — out-of-range error for ORDER/GROUP BY. }
+procedure resolveOutOfRangeError(pParse: PParse; zType: PAnsiChar;
+  i: i32; mx: i32; pError: PExpr);
+var
+  zMsg: PAnsiChar;
+begin
+  zMsg := sqlite3MPrintf(pParse^.db,
+    '%r %s BY term out of range - should be between 1 and %d',
+    [i, zType, mx]);
+  if zMsg <> nil then
+  begin
+    sqlite3ErrorMsg(pParse, zMsg);
+    sqlite3DbFree(pParse^.db, zMsg);
+  end;
+  sqlite3RecordErrorOffsetOfExpr(pParse^.db, pError);
+end;
+
+{ resolve.c:1700 — sqlite3ResolveOrderGroupBy.  Walk pOrderBy: any term
+  with a non-zero iOrderByCol is rewritten into an alias for that
+  result-set column. }
 function sqlite3ResolveOrderGroupBy(pParse: PParse; pSelect: PSelect;
   pOrderBy: PExprList; zType: PAnsiChar): i32;
+var
+  i: i32;
+  db: PTsqlite3;
+  pEList: PExprList;
+  pItems: PExprListItem;
+  iCol: i32;
 begin
-  Result := SQLITE_OK;
+  Result := 0;
+  if (pOrderBy = nil) or (pParse = nil) then Exit;
+  db := pParse^.db;
+  if (db <> nil) and (db^.mallocFailed <> 0) then Exit;
+  if InRenameObject(pParse) then Exit;
+  if pOrderBy^.nExpr > db^.aLimit[SQLITE_LIMIT_COLUMN] then
+  begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'too many terms in %s BY clause', [zType]));
+    Result := 1;
+    Exit;
+  end;
+  pEList := pSelect^.pEList;
+  Assert(pEList <> nil, 'sqlite3ResolveOrderGroupBy pEList');
+  pItems := ExprListItems(pOrderBy);
+  for i := 0 to pOrderBy^.nExpr - 1 do
+  begin
+    iCol := pItems[i].u.x.iOrderByCol;
+    if iCol <> 0 then
+    begin
+      if iCol > pEList^.nExpr then
+      begin
+        resolveOutOfRangeError(pParse, zType, i + 1, pEList^.nExpr, nil);
+        Result := 1;
+        Exit;
+      end;
+      resolveAlias(pParse, pEList, iCol - 1, pItems[i].pExpr, 0);
+    end;
+  end;
 end;
 
 // ---------------------------------------------------------------------------
