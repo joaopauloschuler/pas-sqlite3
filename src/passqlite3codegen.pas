@@ -21541,9 +21541,9 @@ end;
   affinity columns of ordinary tables, emit a trailing OP_RealAffinity so
   values stored as integers are converted to real on read.  Mirrors C
   behaviour: only attaches P4_MEM when pCol^.iDflt is set AND
-  sqlite3ValueFromExpr produces a non-nil value (currently always nil
-  while sqlite3ValueFromExpr is itself a Phase-6 stub — the P4 attach is
-  thus dormant but forward-wired). }
+  sqlite3ValueFromExpr produces a non-nil value (now wired to the real
+  valueFromExprTrampoline below — handles literal / negative-literal /
+  TK_NULL / TK_BLOB / TK_TRUEFALSE / TK_CAST DEFAULT clauses). }
 procedure sqlite3ColumnDefault(v: PVdbe; pTab: PTable2; i: i32; iReg: i32);
 var
   pCol:   PColumn;
@@ -34270,6 +34270,171 @@ begin
   Result := rc;
 end;
 
+{ -----------------------------------------------------------------------
+  valueFromExprTrampoline — port of vdbemem.c:1795 valueFromExpr() (with
+  the public-API wrapper sqlite3ValueFromExpr at vdbemem.c:1978 inlined).
+  Constant-expression literals are converted to a sqlite3_value object
+  that callers can attach as P4_MEM (DEFAULT clauses, vtab_rhs_value,
+  STAT4 sample probes, etc).  Faithful port without SQLITE_ENABLE_STAT4
+  (pCtx is always 0 on this branch) and without OMIT_FLOATING_POINT.
+  ----------------------------------------------------------------------- }
+function valueFromExprTrampoline(db: Psqlite3; pInExpr: Pointer;
+                                 enc: u8; affinity: u8;
+                                 out ppVal: passqlite3vdbe.Psqlite3_value): i32;
+label
+  no_mem;
+var
+  e:      PExpr;
+  pLeft:  PExpr;
+  op:     i32;
+  zVal:   PAnsiChar;
+  pVal:   PMem;
+  negInt: i32;
+  zNeg:   PAnsiChar;
+  rc:     i32;
+  iVal:   i64;
+  aff:    u8;
+  zTok:   PAnsiChar;
+  nVal:   i32;
+begin
+  ppVal := nil;
+  pVal  := nil;
+  zVal  := nil;
+  negInt := 1;
+  zNeg   := PAnsiChar('');
+  rc     := SQLITE_OK;
+  e := PExpr(pInExpr);
+  if e = nil then begin Result := 0; Exit; end;
+
+  op := i32(e^.op);
+  while (op = TK_UPLUS) or (op = TK_SPAN) do begin
+    e := e^.pLeft;
+    if e = nil then begin Result := 0; Exit; end;
+    op := i32(e^.op);
+  end;
+  if op = TK_REGISTER then op := i32(e^.op2);
+
+  if op = TK_CAST then begin
+    Assert(not ExprHasProperty(e, EP_IntValue));
+    aff := u8(sqlite3AffinityType(e^.u.zToken, nil));
+    rc := valueFromExprTrampoline(db, e^.pLeft, enc, aff, ppVal);
+    if ppVal <> nil then begin
+      Assert((PMem(ppVal)^.flags and MEM_Zero) = 0);
+      sqlite3VdbeMemCast(PMem(ppVal), aff, enc);
+      sqlite3ValueApplyAffinity(ppVal, affinity, enc);
+    end;
+    Result := rc;
+    Exit;
+  end;
+
+  { Negative-integer fast path — except hex literals. }
+  if op = TK_UMINUS then begin
+    pLeft := e^.pLeft;
+    if (pLeft <> nil)
+       and ((pLeft^.op = TK_INTEGER) or (pLeft^.op = TK_FLOAT)) then begin
+      if ExprHasProperty(pLeft, EP_IntValue)
+         or (pLeft^.u.zToken = nil)
+         or (pLeft^.u.zToken[0] <> '0')
+         or ((Byte(pLeft^.u.zToken[1]) and not Byte($20)) <> Byte('X'))
+      then begin
+        e := pLeft;
+        op := i32(e^.op);
+        negInt := -1;
+        zNeg   := PAnsiChar('-');
+      end;
+    end;
+  end;
+
+  if (op = TK_STRING) or (op = TK_FLOAT) or (op = TK_INTEGER) then begin
+    pVal := PMem(sqlite3ValueNew(db));
+    if pVal = nil then goto no_mem;
+    if ExprHasProperty(e, EP_IntValue) then begin
+      sqlite3VdbeMemSetInt64(pVal, i64(e^.u.iValue) * negInt);
+    end else begin
+      iVal := 0;
+      if (op = TK_INTEGER) and (sqlite3DecOrHexToI64(e^.u.zToken, iVal) = 0) then begin
+        sqlite3VdbeMemSetInt64(pVal, iVal * negInt);
+      end else begin
+        zVal := sqlite3MPrintf(db, '%s%s', [zNeg, e^.u.zToken]);
+        if zVal = nil then goto no_mem;
+        sqlite3ValueSetStr(Psqlite3_value(pVal), -1, zVal,
+                           SQLITE_UTF8, SQLITE_DYNAMIC);
+      end;
+    end;
+    if affinity = SQLITE_AFF_BLOB then begin
+      if op = TK_FLOAT then begin
+        Assert((pVal <> nil) and (pVal^.z <> nil)
+               and (pVal^.flags = (MEM_Str or MEM_Term)));
+        sqlite3AtoF(pVal^.z, pVal^.u.r);
+        pVal^.flags := MEM_Real;
+      end else if op = TK_INTEGER then begin
+        sqlite3ValueApplyAffinity(Psqlite3_value(pVal),
+                                  SQLITE_AFF_NUMERIC, SQLITE_UTF8);
+      end;
+    end else begin
+      sqlite3ValueApplyAffinity(Psqlite3_value(pVal), affinity, SQLITE_UTF8);
+    end;
+    Assert((pVal^.flags and MEM_IntReal) = 0);
+    if (pVal^.flags and (MEM_Int or MEM_IntReal or MEM_Real)) <> 0 then
+      pVal^.flags := pVal^.flags and not u16(MEM_Str);
+    if enc <> SQLITE_UTF8 then
+      rc := sqlite3VdbeChangeEncoding(pVal, enc);
+  end else if op = TK_UMINUS then begin
+    { Multiple negative signs: -(-5). }
+    if (valueFromExprTrampoline(db, e^.pLeft, enc, affinity, ppVal) = SQLITE_OK)
+       and (ppVal <> nil) then begin
+      pVal := PMem(ppVal);
+      sqlite3VdbeMemNumerify(pVal);
+      if (pVal^.flags and MEM_Real) <> 0 then begin
+        pVal^.u.r := -pVal^.u.r;
+      end else if pVal^.u.i = SMALLEST_INT64 then begin
+        pVal^.u.r := -Double(SMALLEST_INT64);
+        pVal^.flags := (pVal^.flags and not u16(MEM_TypeMask or MEM_Zero)) or MEM_Real;
+      end else begin
+        pVal^.u.i := -pVal^.u.i;
+      end;
+      sqlite3ValueApplyAffinity(Psqlite3_value(pVal), affinity, enc);
+      Result := SQLITE_OK;
+      Exit;  { ppVal already set by recursive call }
+    end;
+  end else if op = TK_NULL then begin
+    pVal := PMem(sqlite3ValueNew(db));
+    if pVal = nil then goto no_mem;
+    sqlite3VdbeMemSetNull(pVal);
+  end else if op = TK_BLOB then begin
+    Assert(not ExprHasProperty(e, EP_IntValue));
+    Assert((e^.u.zToken[0] = 'x') or (e^.u.zToken[0] = 'X'));
+    Assert(e^.u.zToken[1] = '''');
+    pVal := PMem(sqlite3ValueNew(db));
+    if pVal = nil then goto no_mem;
+    zTok := e^.u.zToken + 2;
+    nVal := sqlite3Strlen30(zTok) - 1;
+    Assert(zTok[nVal] = '''');
+    sqlite3VdbeMemSetStr(pVal, PAnsiChar(sqlite3HexToBlob(db, zTok, nVal)),
+                         nVal div 2, 0, SQLITE_DYNAMIC);
+  end else if op = TK_TRUEFALSE then begin
+    Assert(not ExprHasProperty(e, EP_IntValue));
+    pVal := PMem(sqlite3ValueNew(db));
+    if pVal <> nil then begin
+      pVal^.flags := MEM_Int;
+      { TRUE.zToken = "TRUE" (len 4, [4]==NUL → 1); FALSE has [4]='E' → 0. }
+      if e^.u.zToken[4] = #0 then pVal^.u.i := 1 else pVal^.u.i := 0;
+      sqlite3ValueApplyAffinity(Psqlite3_value(pVal), affinity, enc);
+    end;
+  end;
+
+  ppVal := Psqlite3_value(pVal);
+  Result := rc;
+  Exit;
+
+no_mem:
+  sqlite3OomFault(db);
+  if zVal <> nil then sqlite3DbFree(db, zVal);
+  Assert(ppVal = nil);
+  sqlite3ValueFree(Psqlite3_value(pVal));
+  Result := SQLITE_NOMEM_BKPT;
+end;
+
 initialization
   { Wire the schema-cleanup hooks declared by passqlite3vdbe.  The opcode
     handlers there (OP_DropTable, OP_DropIndex, OP_DropTrigger, OP_Destroy
@@ -34288,5 +34453,6 @@ initialization
   passqlite3vdbe.gAnalysisLoad           := @analysisLoadTrampoline;
   passqlite3vdbe.gBlobOpenImpl           := @vdbeBlobOpenImpl;
   passqlite3vdbe.gBlobReopenImpl         := @vdbeBlobReopenImpl;
+  passqlite3vdbe.gValueFromExprImpl      := @valueFromExprTrampoline;
 
 end.

@@ -376,6 +376,16 @@ Important: At the end of this document, please find:
             `vdbeParseSchemaExec`); main.pas trampolines into
             `sqlite3_exec`.  Honours pOp.p1 bits 0x01 (suppress
             xAuth+mTrace) and 0x02 (override nAnalysisLimit).
+       [X] `sqlite3ValueFromExpr` / `valueFromExpr` — ported 2026-04-29
+            (vdbemem.c:1978 / 1795).  Body lives in
+            passqlite3codegen.valueFromExprTrampoline (needs PExpr
+            layout); vdbe.pas exposes the public name via the new
+            `gValueFromExprImpl` hook.  Handles TK_UPLUS/TK_SPAN/
+            TK_REGISTER reentry, TK_CAST recursion, TK_UMINUS literal
+            fast-path (incl. SMALLEST_INT64), TK_INTEGER/TK_FLOAT/
+            TK_STRING/TK_NULL/TK_BLOB/TK_TRUEFALSE arms.  Closes the
+            "always returns NULL" stub at vdbemem; sqlite3ColumnDefault
+            now actually attaches P4_MEM for literal DEFAULT clauses.
   [ ] **6.22** port codegen.pas rename / error-offset stubs in full from C
        to pascal:
        [ ] `sqlite3RenameExprUnmap`

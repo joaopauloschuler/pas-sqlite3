@@ -1514,6 +1514,9 @@ type
                                 out ppBlob: Psqlite3_blob): i32;
   TBlobReopenFn      = function(pBlob: Psqlite3_blob; iRow: i64): i32;
   TGetTokenFn        = function(z: PByte; tokenType: Pi32): i64;
+  TValueFromExprFn   = function(db: Psqlite3; pExpr: Pointer;
+                                enc: u8; affinity: u8;
+                                out ppVal: Psqlite3_value): i32;
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
@@ -1529,6 +1532,8 @@ var
   gGetTokenImpl:           TGetTokenFn;  { wired by passqlite3parser at init;
                                             used by sqlite3VdbeExpandSql to scan
                                             host-parameter tokens. }
+  gValueFromExprImpl:      TValueFromExprFn;  { wired by passqlite3codegen —
+                                                 needs PExpr layout. }
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
@@ -11774,14 +11779,22 @@ begin
 end;
 
 { -----------------------------------------------------------------------
-  sqlite3ValueFromExpr — stub (Expr not yet ported, Phase 6)
+  sqlite3ValueFromExpr — vdbemem.c:1978.  Dispatches to the codegen
+  trampoline that has visibility into the PExpr layout.  When the hook
+  is unwired (codegen-less test harnesses) returns NULL — the documented
+  fallback for "expression cannot be converted to a value".  Body lives
+  at passqlite3codegen.valueFromExprTrampoline.
   ----------------------------------------------------------------------- }
 function sqlite3ValueFromExpr(db: Psqlite3; pExpr: Pointer;
                               enc: u8; affinity: u8;
                               out ppVal: Psqlite3_value): i32;
 begin
   ppVal := nil;
-  Result := SQLITE_OK;
+  if pExpr = nil then begin Result := 0; Exit; end;
+  if Assigned(gValueFromExprImpl) then
+    Result := gValueFromExprImpl(db, pExpr, enc, affinity, ppVal)
+  else
+    Result := SQLITE_OK;
 end;
 
 { -----------------------------------------------------------------------
