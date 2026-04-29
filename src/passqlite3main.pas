@@ -385,6 +385,10 @@ function sqlite3_get_autocommit(db: PTsqlite3): i32; cdecl;
 function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;
 function sqlite3_db_release_memory(db: PTsqlite3): i32; cdecl;
 function sqlite3_db_cacheflush(db: PTsqlite3): i32; cdecl;
+function sqlite3_db_status(db: PTsqlite3; op: i32; pCurrent, pHighwtr: Pi32;
+                           resetFlag: i32): i32; cdecl;
+function sqlite3_db_status64(db: PTsqlite3; op: i32; pCurrent, pHighwtr: Pi64;
+                             resetFlag: i32): i32; cdecl;
 function sqlite3_file_control(db: PTsqlite3; zDbName: PAnsiChar; op: i32;
                               pArg: Pointer): i32; cdecl;
 function sqlite3_txn_state(db: PTsqlite3; zSchema: PAnsiChar): i32; cdecl;
@@ -3214,6 +3218,176 @@ begin
     Result := SQLITE_BUSY
   else
     Result := rc;
+end;
+
+{ status.c:188 — sqlite3LookasideUsed.  Count outstanding lookaside slots,
+  optionally returning the high-water mark in pHighwater. }
+function sqlite3LookasideUsed(db: PTsqlite3; pHighwater: Pi32): i32;
+  function countSlots(p: PLookasideSlot): u32;
+  var n: u32;
+  begin
+    n := 0;
+    while p <> nil do begin Inc(n); p := p^.pNext; end;
+    Result := n;
+  end;
+var
+  nInit, nFree: u32;
+begin
+  nInit := countSlots(db^.lookaside.pInit) + countSlots(db^.lookaside.pSmallInit);
+  nFree := countSlots(db^.lookaside.pFree) + countSlots(db^.lookaside.pSmallFree);
+  if pHighwater <> nil then pHighwater^ := i32(db^.lookaside.nSlot - nInit);
+  Result := i32(db^.lookaside.nSlot - (nInit + nFree));
+end;
+
+{ status.c:203 — sqlite3_db_status64.  Query per-connection status counters.
+  Verbs SCHEMA_USED and STMT_USED require the pnBytesFreed accounting plumbing
+  (drives sqlite3DbFree to count rather than free); not yet wired in this
+  port, so they fall through to SQLITE_ERROR. }
+function sqlite3_db_status64(db: PTsqlite3; op: i32; pCurrent, pHighwtr: Pi64;
+                             resetFlag: i32): i32; cdecl;
+var
+  rc: i32;
+  H:  i32;
+  p, pTail: PLookasideSlot;
+  i:  i32;
+  pBt: PBtree;
+  pPgr: PPager;
+  totalUsed: i64;
+  nByte: i32;
+  nRet: u64;
+  opLocal: i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (pCurrent = nil) or (pHighwtr = nil) then
+  begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  rc := SQLITE_OK;
+  sqlite3_mutex_enter(db^.mutex);
+  case op of
+    SQLITE_DBSTATUS_LOOKASIDE_USED:
+      begin
+        H := 0;
+        pCurrent^ := sqlite3LookasideUsed(db, @H);
+        pHighwtr^ := H;
+        if resetFlag <> 0 then
+        begin
+          { Reset HWM: append pFree at the tail of pInit, then clear pFree. }
+          p := db^.lookaside.pFree;
+          if p <> nil then
+          begin
+            pTail := p;
+            while pTail^.pNext <> nil do pTail := pTail^.pNext;
+            pTail^.pNext := db^.lookaside.pInit;
+            db^.lookaside.pInit := db^.lookaside.pFree;
+            db^.lookaside.pFree := nil;
+          end;
+          p := db^.lookaside.pSmallFree;
+          if p <> nil then
+          begin
+            pTail := p;
+            while pTail^.pNext <> nil do pTail := pTail^.pNext;
+            pTail^.pNext := db^.lookaside.pSmallInit;
+            db^.lookaside.pSmallInit := db^.lookaside.pSmallFree;
+            db^.lookaside.pSmallFree := nil;
+          end;
+        end;
+      end;
+    SQLITE_DBSTATUS_LOOKASIDE_HIT,
+    SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE,
+    SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL:
+      begin
+        pCurrent^ := 0;
+        pHighwtr^ := db^.lookaside.anStat[op - SQLITE_DBSTATUS_LOOKASIDE_HIT];
+        if resetFlag <> 0 then
+          db^.lookaside.anStat[op - SQLITE_DBSTATUS_LOOKASIDE_HIT] := 0;
+      end;
+    SQLITE_DBSTATUS_CACHE_USED, SQLITE_DBSTATUS_CACHE_USED_SHARED:
+      begin
+        totalUsed := 0;
+        sqlite3BtreeEnterAll(db);
+        for i := 0 to db^.nDb - 1 do
+        begin
+          pBt := PBtree(db^.aDb[i].pBt);
+          if pBt <> nil then
+          begin
+            pPgr := sqlite3BtreePager(pBt);
+            nByte := sqlite3PagerMemUsed(pPgr);
+            { No shared-cache in this port — connection count is always 1. }
+            totalUsed := totalUsed + nByte;
+          end;
+        end;
+        sqlite3BtreeLeaveAll(db);
+        pCurrent^ := totalUsed;
+        pHighwtr^ := 0;
+      end;
+    SQLITE_DBSTATUS_CACHE_SPILL,
+    SQLITE_DBSTATUS_CACHE_HIT,
+    SQLITE_DBSTATUS_CACHE_MISS,
+    SQLITE_DBSTATUS_CACHE_WRITE:
+      begin
+        opLocal := op;
+        if opLocal = SQLITE_DBSTATUS_CACHE_SPILL then
+          opLocal := SQLITE_DBSTATUS_CACHE_WRITE + 1;
+        nRet := 0;
+        for i := 0 to db^.nDb - 1 do
+          if db^.aDb[i].pBt <> nil then
+          begin
+            pPgr := sqlite3BtreePager(PBtree(db^.aDb[i].pBt));
+            nRet := nRet + sqlite3PagerCacheStat(pPgr, opLocal, resetFlag);
+          end;
+        pHighwtr^ := 0;
+        pCurrent^ := i64(nRet);
+      end;
+    SQLITE_DBSTATUS_TEMPBUF_SPILL:
+      begin
+        nRet := 0;
+        if (db^.nDb >= 2) and (db^.aDb[1].pBt <> nil) then
+        begin
+          pPgr := sqlite3BtreePager(PBtree(db^.aDb[1].pBt));
+          nRet := sqlite3PagerCacheStat(pPgr, SQLITE_DBSTATUS_CACHE_WRITE, resetFlag);
+          nRet := nRet * u64(sqlite3BtreeGetPageSize(PBtree(db^.aDb[1].pBt)));
+        end;
+        nRet := nRet + db^.nSpill;
+        if resetFlag <> 0 then db^.nSpill := 0;
+        pHighwtr^ := 0;
+        pCurrent^ := i64(nRet);
+      end;
+    SQLITE_DBSTATUS_DEFERRED_FKS:
+      begin
+        pHighwtr^ := 0;
+        if (db^.nDeferredImmCons > 0) or (db^.nDeferredCons > 0) then
+          pCurrent^ := 1
+        else
+          pCurrent^ := 0;
+      end;
+  else
+    rc := SQLITE_ERROR;
+  end;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+{ status.c:426 — sqlite3_db_status.  32-bit variant of sqlite3_db_status64. }
+function sqlite3_db_status(db: PTsqlite3; op: i32; pCurrent, pHighwtr: Pi32;
+                           resetFlag: i32): i32; cdecl;
+var
+  C, H: i64;
+  rc:   i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (pCurrent = nil) or (pHighwtr = nil) then
+  begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  C := 0; H := 0;
+  rc := sqlite3_db_status64(db, op, @C, @H, resetFlag);
+  if rc = SQLITE_OK then
+  begin
+    pCurrent^ := i32(C and $7FFFFFFF);
+    pHighwtr^ := i32(H and $7FFFFFFF);
+  end;
+  Result := rc;
 end;
 
 { main.c:4958 — sqlite3DbNameToBtree.  Resolve a database name to its

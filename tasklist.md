@@ -818,8 +818,25 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [X] `sqlite3_db_release_memory` (main.c:897) — ported 2026-04-28
             (passqlite3main.pas) — sqlite3BtreeEnterAll + per-db
             sqlite3PagerShrink loop; pager.pas wrapper added.
-       [ ] `sqlite3_db_status` / `sqlite3_db_status64` (status.c) — per-
-            connection counters (LOOKASIDE_USED, CACHE_HIT etc.).
+       [X] `sqlite3_db_status` / `sqlite3_db_status64` (status.c) — ported
+            2026-04-29 (passqlite3main.pas) — verbatim port of status.c:188
+            (sqlite3LookasideUsed) + status.c:203 (sqlite3_db_status64) +
+            status.c:426 (sqlite3_db_status).  Verbs implemented:
+            LOOKASIDE_USED (with reset arm), LOOKASIDE_HIT/MISS_SIZE/MISS_FULL,
+            CACHE_USED, CACHE_USED_SHARED (no shared-cache → equiv to CACHE_USED),
+            CACHE_HIT/MISS/WRITE/SPILL via sqlite3PagerCacheStat, TEMPBUF_SPILL
+            via aDb[1] pager + db^.nSpill, DEFERRED_FKS via nDeferredImmCons /
+            nDeferredCons.  SCHEMA_USED and STMT_USED return SQLITE_ERROR
+            (require pnBytesFreed accounting plumbing through sqlite3DbFree
+            — not yet wired).  SQLITE_DBSTATUS_* constants moved from impl
+            to interface section of passqlite3pager.pas so callers can name
+            the verbs.  csq_db_status binding added; DiagPubApi extended
+            with 13 new cases (nil/bad-op/MISUSE guards, LOOKASIDE_USED /
+            DEFERRED_FKS / CACHE_USED / CACHE_HIT happy-path round-trips,
+            64-bit variant); 254/0.  TestExplainParity 1016/10, TestVdbeApi
+            57/0, TestBtreeCompat 337/0, TestSelectBasic 49/0, TestParser
+            45/0, TestVdbeAgg 11/0, TestDMLBasic 54/0, TestWhereBasic 52/0,
+            TestAuthBuiltins 34/0, TestPrintf 105/0 — no regressions.
        [X] `sqlite3_db_cacheflush` (main.c:921) — ported 2026-04-28
             (passqlite3main.pas) — flushes dirty pages on every db with
             an open write txn; folds SQLITE_BUSY into a single trailing

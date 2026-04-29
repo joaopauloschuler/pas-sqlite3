@@ -187,6 +187,8 @@ var
   zType, zColl: PAnsiChar;
   nn, pk, ai, mrc: i32;
   pPrev: Pointer;
+  dsCur, dsHi, ccur, chi: i32;
+  dsCur64, dsHi64: i64;
 begin
   Check('libversion_number = 3053000',
         sqlite3_libversion_number = 3053000);
@@ -584,6 +586,48 @@ begin
   Check('db_cacheflush = OK',      sqlite3_db_cacheflush(db)       = SQLITE_OK);
   Check('db_cacheflush(nil) = MISUSE',
         sqlite3_db_cacheflush(nil)      = SQLITE_MISUSE);
+
+  { Phase 8.1.1 — sqlite3_db_status / sqlite3_db_status64. }
+  begin
+    Check('db_status(nil, …) = MISUSE',
+          sqlite3_db_status(nil, SQLITE_DBSTATUS_LOOKASIDE_USED,
+                            @dsCur, @dsHi, 0) = SQLITE_MISUSE);
+    Check('db_status(db, …, nil, nil) = MISUSE',
+          sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_USED,
+                            nil, nil, 0) = SQLITE_MISUSE);
+    Check('db_status(db, BAD_OP) = ERROR',
+          sqlite3_db_status(db, 999, @dsCur, @dsHi, 0) = SQLITE_ERROR);
+    dsCur := -1; dsHi := -1;
+    Check('db_status LOOKASIDE_USED OK',
+          sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_USED,
+                            @dsCur, @dsHi, 0) = SQLITE_OK);
+    Check('db_status LOOKASIDE_USED current >= 0', dsCur >= 0);
+    dsCur := -1; dsHi := -1;
+    Check('db_status DEFERRED_FKS OK',
+          sqlite3_db_status(db, SQLITE_DBSTATUS_DEFERRED_FKS,
+                            @dsCur, @dsHi, 0) = SQLITE_OK);
+    Check('db_status DEFERRED_FKS = 0', dsCur = 0);
+    Check('db_status DEFERRED_FKS hwm = 0', dsHi = 0);
+    dsCur := -1; dsHi := -1;
+    Check('db_status CACHE_USED OK',
+          sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_USED,
+                            @dsCur, @dsHi, 0) = SQLITE_OK);
+    Check('db_status CACHE_USED hwm = 0', dsHi = 0);
+    dsCur := -1; dsHi := -1;
+    Check('db_status CACHE_HIT OK',
+          sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_HIT,
+                            @dsCur, @dsHi, 0) = SQLITE_OK);
+    Check('db_status CACHE_HIT hwm = 0', dsHi = 0);
+    dsCur64 := -1; dsHi64 := -1;
+    Check('db_status64 LOOKASIDE_USED OK',
+          sqlite3_db_status64(db, SQLITE_DBSTATUS_LOOKASIDE_USED,
+                              @dsCur64, @dsHi64, 0) = SQLITE_OK);
+    { Differential parity vs C reference for op + nil-arg shape. }
+    ccur := 0; chi := 0;
+    Check('csq_db_status nil = MISUSE',
+          csq_db_status(nil, SQLITE_DBSTATUS_LOOKASIDE_USED,
+                        @ccur, @chi, 0) = SQLITE_MISUSE);
+  end;
 
   { Phase 8.4.1 — sqlite3_table_column_metadata.  Create a table with
     a known schema, then inspect column metadata.  The Pas port has no

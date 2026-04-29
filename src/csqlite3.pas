@@ -292,6 +292,10 @@ function csq_db_filename(db: Pcsq_db; zDbName: PChar): PChar;
 function csq_db_readonly(db: Pcsq_db; zDbName: PChar): Int32;
     cdecl; external LIBSQLITE3 name 'sqlite3_db_readonly';
 
+function csq_db_status(db: Pcsq_db; op: Int32; pCurrent, pHighwtr: PInt32;
+                       resetFlag: Int32): Int32;
+    cdecl; external LIBSQLITE3 name 'sqlite3_db_status';
+
 // ---------------------------------------------------------------------------
 // sqlite3_complete
 // ---------------------------------------------------------------------------
