@@ -25559,10 +25559,33 @@ begin
   db^.errCode := err_code;
 end;
 
+{ Port of util.c:192 sqlite3ErrorWithMsg.  Pas callers pre-format the
+  message (no va_list); we treat zFmt as a final UTF-8 string. }
 procedure sqlite3ErrorWithMsg(db: PTsqlite3; err_code: i32; zFmt: PAnsiChar);
+var
+  pErr: PMem;
+  zCopy: PAnsiChar;
+  nCopy: i32;
 begin
+  if db = nil then Exit;
   db^.errCode := err_code;
-  { Phase 7: store formatted error in db^.pErr }
+  sqlite3SystemError(db, err_code);
+  if zFmt = nil then begin
+    { mirrors C: sqlite3Error(db, err_code) — clears pErr if set }
+    if db^.pErr <> nil then sqlite3ValueSetNull(Psqlite3_value(db^.pErr));
+    Exit;
+  end;
+  if db^.pErr = nil then
+    db^.pErr := sqlite3ValueNew(Psqlite3(db));
+  if db^.pErr <> nil then begin
+    pErr := PMem(db^.pErr);
+    nCopy := sqlite3Strlen30(zFmt);
+    zCopy := PAnsiChar(sqlite3DbStrNDup(Psqlite3(db), zFmt, u64(nCopy)));
+    if zCopy <> nil then
+      sqlite3VdbeMemSetStr(pErr, zCopy, nCopy, SQLITE_UTF8, SQLITE_DYNAMIC)
+    else
+      sqlite3ValueSetNull(Psqlite3_value(pErr));
+  end;
 end;
 
 procedure sqlite3ErrorClear(db: PTsqlite3);

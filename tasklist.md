@@ -724,23 +724,26 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             (passqlite3vdbe.pas) — `sqlite3_value_bytes16(columnMem(...))`.
             Covered by DiagPubApi.
 
-- [ ] **8.3.2-bis** Error-message routing.  `sqlite3ErrorWithMsg`
-       (codegen.pas:25562) and `sqlite3_errmsg` (main.pas:1671) are
-       stubs: the former only stores `errCode`, the latter returns
-       `sqlite3ErrStr(errCode)` and never consults the per-connection
-       error string.  Net effect: every runtime error message produced
-       by `sqlite3_result_error*`, `sqlite3VdbeError`, parser fixups,
-       etc. surfaces through `sqlite3_errmsg` as the generic
-       `sqlite3ErrStr(rc)` (e.g. "SQL logic error") instead of the
-       real cause (e.g. "integer overflow", "no such column: foo").
-       Discovered while closing 6.10 step 17(a-bis).  Fix needs:
-       (1) add `pErr: PMem` slot to `Tsqlite3` (util.pas:444); (2) port
-       `sqlite3ErrorWithMsg` to populate `db^.pErr` via
-       `sqlite3VdbeMemSetStr` mirroring main.c:1473; (3) port
-       `sqlite3_errmsg` to consult `db^.pErr` first per main.c:1654;
-       (4) wire `sqlite3_step` to call `sqlite3VdbeTransferError(v)`
-       (currently a stub at vdbe.pas:3543) so the per-statement
-       `v^.zErrMsg` flows into `db^.pErr`.
+- [X] **8.3.2-bis** Error-message routing — closed 2026-04-28.
+       `sqlite3ErrorWithMsg` (codegen.pas) now allocates `db^.pErr` via
+       `sqlite3ValueNew` and stores the duplicated message via
+       `sqlite3VdbeMemSetStr` (mirrors util.c:192).  `sqlite3_errmsg`
+       (main.pas) reads `sqlite3_value_text(db^.pErr)` first and falls
+       back to `sqlite3ErrStr(errCode)` (mirrors main.c:2711).
+       `sqlite3VdbeTransferError` (vdbe.pas) ported in full from
+       vdbeaux.c:3536 — copies `p^.zErrMsg` into `db^.pErr` via
+       `sqlite3ValueSetStr`.  `sqlite3_step` now calls TransferError on
+       every non-DONE/non-ROW return (gate on SQLITE_PREPARE_SAVESQL
+       relaxed: auto-reprepare not yet wired so the message-routing is
+       the only effect).  Verified: `SELECT sum(a) FROM t` overflow
+       now surfaces `errmsg = "integer overflow"` instead of generic
+       "SQL logic error".  Regressions clean: TestExplainParity
+       1016/10, DiagPubApi 156/0, DiagSumOverflow 12/0, TestVdbeAgg
+       11/0, TestVdbeApi 57/0, TestParser 45/0, TestSelectBasic 49/0,
+       TestWhereBasic 52/0, TestBtreeCompat 337/0, TestDMLBasic 54/0,
+       TestAuthBuiltins 34/0; DiagFeatureProbe 10, DiagPragma 29,
+       DiagWindow 19, DiagDml 12/2, DiagTxn 8 — all match prior
+       baselines.
 
 - [ ] **8.3.3** Collation / function UTF-16 wrappers:
        [ ] `sqlite3_create_collation16`.

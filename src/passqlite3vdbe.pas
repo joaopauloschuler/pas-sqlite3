@@ -3540,9 +3540,30 @@ begin
   p^.rc := SQLITE_OK;
 end;
 
+{ Port of vdbeaux.c:3536 sqlite3VdbeTransferError.  Copies p^.zErrMsg
+  (set by sqlite3VdbeError) into db^.pErr so sqlite3_errmsg returns the
+  real cause; clears db^.pErr if no VDBE-side message. }
 function sqlite3VdbeTransferError(p: PVdbe): i32;
+var
+  db: PTsqlite3;
+  rc: i32;
 begin
-  Result := p^.rc;
+  db := p^.db;
+  rc := p^.rc;
+  if p^.zErrMsg <> nil then begin
+    Inc(db^.bBenignMalloc);
+    if db^.pErr = nil then
+      db^.pErr := sqlite3ValueNew(Psqlite3(db));
+    if db^.pErr <> nil then
+      sqlite3ValueSetStr(Psqlite3_value(db^.pErr), -1, p^.zErrMsg,
+                         SQLITE_UTF8, SQLITE_TRANSIENT);
+    Dec(db^.bBenignMalloc);
+  end else if db^.pErr <> nil then begin
+    sqlite3ValueSetNull(Psqlite3_value(db^.pErr));
+  end;
+  db^.errCode := rc;
+  db^.errByteOffset := -1;
+  Result := rc;
 end;
 
 function sqlite3VdbeReset(p: PVdbe): i32;
@@ -4464,6 +4485,12 @@ begin
 
   pStmt^.pResultRow := nil;
   if db <> nil then begin
+    { vdbeapi.c:884 — transfer p^.zErrMsg into db^.pErr so sqlite3_errmsg
+      returns the real cause.  C gates on SQLITE_PREPARE_SAVESQL to also
+      override rc on SCHEMA-retry; we always transfer (no auto-reprepare
+      yet) since the message-routing is the load-bearing effect here. }
+    if rc <> SQLITE_DONE then
+      rc := sqlite3VdbeTransferError(pStmt);
     db^.errCode := rc;
     Dec(db^.nVdbeActive);
   end;

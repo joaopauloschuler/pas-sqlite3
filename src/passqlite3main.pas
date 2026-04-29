@@ -1659,7 +1659,11 @@ end;
   Faithful port of legacy.c (entire file) and table.c.
   ---------------------------------------------------------------------- }
 
+{ Port of main.c:2711 sqlite3_errmsg — consult db^.pErr first, fall
+  back to sqlite3ErrStr(errCode) if no per-connection message stored. }
 function sqlite3_errmsg(db: PTsqlite3): PAnsiChar;
+var
+  z: PAnsiChar;
 begin
   if db = nil then begin Result := sqlite3ErrStr(SQLITE_NOMEM); Exit; end;
   if sqlite3SafetyCheckSickOrOk(db) = 0 then begin
@@ -1668,7 +1672,12 @@ begin
   if db^.mallocFailed <> 0 then begin
     Result := sqlite3ErrStr(SQLITE_NOMEM); Exit;
   end;
-  Result := sqlite3ErrStr(db^.errCode and db^.errMask);
+  z := nil;
+  if db^.errCode <> 0 then
+    z := PAnsiChar(sqlite3_value_text(Psqlite3_value(db^.pErr)));
+  if z = nil then
+    z := sqlite3ErrStr(db^.errCode);
+  Result := z;
 end;
 
 type
