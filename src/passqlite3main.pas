@@ -394,6 +394,13 @@ function sqlite3_limit(db: PTsqlite3; limitId: i32; newLimit: i32): i32; cdecl;
 
 function sqlite3_complete16(zSql: Pointer): i32; cdecl;
 function sqlite3_open16(zFilename: Pointer; ppDb: PPTsqlite3): i32; cdecl;
+function sqlite3_create_collation16(db: PTsqlite3; zName: Pointer; enc: i32;
+  pCtx: Pointer; xCompare: Pointer): i32; cdecl;
+function sqlite3_collation_needed16(db: PTsqlite3; pCollNeededArg: Pointer;
+  xCollNeeded16: Pointer): i32; cdecl;
+function sqlite3_create_function16(db: PTsqlite3; zFunctionName: Pointer;
+  nArg: i32; eTextRep: i32; p: Pointer;
+  xSFunc: Pointer; xStep: Pointer; xFinal: Pointer): i32; cdecl;
 
 function sqlite3_stmt_busy(pStmt: Pointer): i32; cdecl;
 function sqlite3_stmt_readonly(pStmt: Pointer): i32; cdecl;
@@ -2818,6 +2825,85 @@ begin
     rc := SQLITE_NOMEM;
   sqlite3ValueFree(pVal);
   Result := rc and $FF;
+end;
+
+{ main.c:3783 — sqlite3_create_collation16.  UTF-16 wrapper around
+  createCollation: transcode the name to UTF-8 via a sqlite3_value, then
+  forward.  Mirrors the !defined(SQLITE_OMIT_UTF16) arm. }
+function sqlite3_create_collation16(db: PTsqlite3; zName: Pointer; enc: i32;
+  pCtx: Pointer; xCompare: Pointer): i32; cdecl;
+var
+  pVal: Psqlite3_value;
+  zName8: PAnsiChar;
+  rc: i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (zName = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  rc := SQLITE_OK;
+  pVal := sqlite3ValueNew(db);
+  if pVal = nil then begin
+    rc := SQLITE_NOMEM;
+  end else begin
+    sqlite3ValueSetStr(pVal, -1, zName, SQLITE_UTF16NATIVE, SQLITE_STATIC);
+    zName8 := PAnsiChar(sqlite3ValueText(pVal, SQLITE_UTF8));
+    if zName8 <> nil then
+      rc := createCollation(db, zName8, u8(enc), pCtx, xCompare, nil)
+    else
+      rc := SQLITE_NOMEM;
+    sqlite3ValueFree(pVal);
+  end;
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+{ main.c:3834 — sqlite3_collation_needed16. }
+function sqlite3_collation_needed16(db: PTsqlite3; pCollNeededArg: Pointer;
+  xCollNeeded16: Pointer): i32; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  db^.xCollNeeded    := nil;
+  db^.xCollNeeded16  := xCollNeeded16;
+  db^.pCollNeededArg := pCollNeededArg;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+{ main.c:2161 — sqlite3_create_function16.  UTF-16 wrapper around
+  sqlite3CreateFunc: transcode the function name to UTF-8 via a sqlite3_value,
+  then forward through createFunctionApi. }
+function sqlite3_create_function16(db: PTsqlite3; zFunctionName: Pointer;
+  nArg: i32; eTextRep: i32; p: Pointer;
+  xSFunc: Pointer; xStep: Pointer; xFinal: Pointer): i32; cdecl;
+var
+  pVal: Psqlite3_value;
+  zFunc8: PAnsiChar;
+  rc: i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (zFunctionName = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  rc := SQLITE_OK;
+  pVal := sqlite3ValueNew(db);
+  if pVal = nil then begin
+    rc := SQLITE_NOMEM;
+  end else begin
+    sqlite3ValueSetStr(pVal, -1, zFunctionName, SQLITE_UTF16NATIVE, SQLITE_STATIC);
+    zFunc8 := PAnsiChar(sqlite3ValueText(pVal, SQLITE_UTF8));
+    if zFunc8 <> nil then
+      rc := sqlite3CreateFunc(db, zFunc8, nArg, eTextRep, p,
+              xSFunc, xStep, xFinal, nil, nil, nil)
+    else
+      rc := SQLITE_NOMEM;
+    sqlite3ValueFree(pVal);
+  end;
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
 end;
 
 { vdbeapi.c:2074 — sqlite3_stmt_busy. }

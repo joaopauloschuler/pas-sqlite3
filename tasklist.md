@@ -883,10 +883,18 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             `sqlite3SelectExpand` (FROM-clause now resolves before the
             argument-count check, matching C ordering).
 
-- [ ] **8.3.3** Collation / function UTF-16 wrappers:
-       [ ] `sqlite3_create_collation16`.
-       [ ] `sqlite3_create_function16`.
-       [ ] `sqlite3_collation_needed16`.
+- [X] **8.3.3** Collation / function UTF-16 wrappers — closed 2026-04-29.
+       All three ported (passqlite3main.pas) — verbatim ports of
+       main.c:3783 / main.c:2161 / main.c:3834.  Each wraps the input
+       UTF-16NATIVE name in a sqlite3_value, transcodes to UTF-8 via
+       sqlite3ValueText, then forwards to the existing UTF-8 entry point
+       (createCollation / sqlite3CreateFunc) under the db mutex.
+       collation_needed16 sets db^.xCollNeeded16 and clears xCollNeeded
+       (mirrors C exactly).  DiagPubApi extended with 14 new cases
+       (round-trip + nil-db/nil-name MISUSE for each); 217/0.  No
+       regressions: TestExplainParity 1016/10, TestParser 45/0,
+       TestSelectBasic 49/0, TestVdbeAgg 11/0, TestBtreeCompat 337/0,
+       TestVdbeApi 57/0.
        [X] `sqlite3_complete16` — ported 2026-04-29 (passqlite3main.pas) —
             verbatim port of complete.c:269: wraps the UTF-16NATIVE input
             in a sqlite3_value, transcodes via sqlite3ValueText(UTF8),

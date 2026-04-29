@@ -45,6 +45,7 @@ begin
 end;
 
 procedure Open16Test; forward;
+procedure Utf16WrappersTest; forward;
 
 procedure Check(name: string; cond: Boolean);
 begin
@@ -84,6 +85,91 @@ begin
 
   rc := sqlite3_open16(@buf16[0], nil);
   Check('open16(nil ppDb) MISUSE', rc = SQLITE_MISUSE);
+end;
+
+{ ASCII string -> UTF-16LE byte buffer (NUL-terminated). }
+procedure Ascii16(const s: AnsiString; out buf: array of Byte);
+var i: i32;
+begin
+  FillChar(buf[0], Length(buf), 0);
+  for i := 1 to Length(s) do
+    if (i - 1) * 2 + 1 < Length(buf) then
+      buf[(i - 1) * 2] := Byte(s[i]);
+end;
+
+function CollAlwaysEq(pUser: Pointer; n1: i32; p1: Pointer;
+  n2: i32; p2: Pointer): i32; cdecl;
+begin
+  Result := 0;
+end;
+
+procedure FuncReturn42(ctx: Pointer; argc: i32; argv: Pointer); cdecl;
+begin
+  sqlite3_result_int(ctx, 42);
+end;
+
+var collNeededFires: i32 = 0;
+
+procedure CollNeeded16Cb(pArg: Pointer; pDb: Pointer; eEnc: i32;
+  zName16: Pointer); cdecl;
+begin
+  Inc(collNeededFires);
+end;
+
+procedure Utf16WrappersTest;
+var
+  db2: PTsqlite3;
+  buf: array[0..63] of Byte;
+  rc: i32;
+  pStmt2: Pointer;
+begin
+  rc := sqlite3_open(':memory:', @db2);
+  Check('utf16 wrappers: open', rc = SQLITE_OK);
+  if rc <> SQLITE_OK then Exit;
+
+  { sqlite3_create_collation16 }
+  Ascii16('myc16', buf);
+  rc := sqlite3_create_collation16(db2, @buf[0], SQLITE_UTF8, nil,
+                                   @CollAlwaysEq);
+  Check('create_collation16 OK', rc = SQLITE_OK);
+  rc := sqlite3_create_collation16(nil, @buf[0], SQLITE_UTF8, nil,
+                                   @CollAlwaysEq);
+  Check('create_collation16(nil db) MISUSE', rc = SQLITE_MISUSE);
+  rc := sqlite3_create_collation16(db2, nil, SQLITE_UTF8, nil,
+                                   @CollAlwaysEq);
+  Check('create_collation16(nil name) MISUSE', rc = SQLITE_MISUSE);
+
+  { sqlite3_create_function16 }
+  Ascii16('answer16', buf);
+  rc := sqlite3_create_function16(db2, @buf[0], 0, SQLITE_UTF8, nil,
+                                  @FuncReturn42, nil, nil);
+  Check('create_function16 OK', rc = SQLITE_OK);
+  rc := sqlite3_prepare_v2(db2, 'SELECT answer16()', -1, @pStmt2, nil);
+  Check('prepare answer16()', rc = SQLITE_OK);
+  if rc = SQLITE_OK then begin
+    rc := sqlite3_step(pStmt2);
+    Check('step answer16() ROW', rc = SQLITE_ROW);
+    Check('answer16() = 42', sqlite3_column_int(pStmt2, 0) = 42);
+    sqlite3_finalize(pStmt2);
+  end;
+  rc := sqlite3_create_function16(nil, @buf[0], 0, SQLITE_UTF8, nil,
+                                  @FuncReturn42, nil, nil);
+  Check('create_function16(nil db) MISUSE', rc = SQLITE_MISUSE);
+  rc := sqlite3_create_function16(db2, nil, 0, SQLITE_UTF8, nil,
+                                  @FuncReturn42, nil, nil);
+  Check('create_function16(nil name) MISUSE', rc = SQLITE_MISUSE);
+
+  { sqlite3_collation_needed16 }
+  rc := sqlite3_collation_needed16(db2, nil, @CollNeeded16Cb);
+  Check('collation_needed16 OK', rc = SQLITE_OK);
+  Check('collation_needed16 installs xCollNeeded16',
+        db2^.xCollNeeded16 = Pointer(@CollNeeded16Cb));
+  Check('collation_needed16 clears xCollNeeded',
+        db2^.xCollNeeded = nil);
+  rc := sqlite3_collation_needed16(nil, nil, @CollNeeded16Cb);
+  Check('collation_needed16(nil db) MISUSE', rc = SQLITE_MISUSE);
+
+  sqlite3_close(db2);
 end;
 
 var
@@ -608,6 +694,9 @@ begin
 
   { sqlite3_open16 — UTF-16NATIVE filename. }
   Open16Test;
+
+  { UTF-16 wrappers for create_collation / create_function / collation_needed. }
+  Utf16WrappersTest;
 
   Writeln;
   Writeln('Results: ', pass, ' passed, ', fail, ' failed');
