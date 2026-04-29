@@ -363,26 +363,26 @@ Important: At the end of this document, please find:
         — closed 2026-04-29 (cascade fix from (a)).
       [X] **c) Expression index `CREATE INDEX ... ON t(a*2)`**
         — closed 2026-04-29 (cascade fix from (a)).
-      [ ] **d) Affinity not applied at INSERT time.**
-        `INSERT INTO af(a INTEGER) VALUES('42')` stores TEXT '42'
-        instead of INTEGER 42; symmetric for TEXT/NUMERIC affinity from
-        non-matching literal type.  `sqlite3TableAffinity` (insert.c:179)
-        is fully ported at codegen.pas:21515 but never invoked — the C
-        call site is inside `sqlite3GenerateConstraintChecks`, still a
-        stub (folds into 6.9-bis 11g.2.b).  Real-world impact: typeof()
-        round-trip wrong, secondary-index key bytes differ, future
-        rowid/IPK lookups by integer fail when stored text is "42".
+      [X] **d) Affinity not applied at INSERT time** — closed 2026-04-29.
+        Wired sqlite3TableAffinity(v, pTab, regData) into the Pas
+        sqlite3Insert single-row VALUES path right before OP_MakeRecord.
+        Mirrors the C call site inside sqlite3GenerateConstraintChecks
+        (insert.c:2080); the constraint-check body itself remains a stub.
+        DiagIndexing affinity int/text/real/blob + numeric int/real
+        all PASS.  Cascade: 4 unrelated DiagIndexing divergences
+        also dropped (15 → 7 total).  (e) below did NOT cascade —
+        see updated note.
       [ ] **e) `INDEXED BY` / `NOT INDEXED` against `WHERE a=1` returns
         empty rowset** (DiagIndexing `indexed by ok`, `not indexed`,
         2026-04-29).  Seed `CREATE TABLE t(a INTEGER, b TEXT); CREATE
         INDEX ix_t_a ON t(a); INSERT INTO t VALUES(1,'x'),(2,'y');`.
         Pas: `SELECT b FROM t INDEXED BY ix_t_a WHERE a=1` returns no
         rows; `SELECT b FROM t NOT INDEXED WHERE a=1` likewise.
-        Sibling `WHERE a=2` (without INDEXED BY) PASSes — so the affinity-
-        comparison gap looks rowid-1-specific (likely the planner is
-        reading the index entry for a=1 and the row-1 indirection drops
-        because of the same affinity bug as (d)).  Likely cascades from
-        (d) once it lands; recheck then.
+        Sibling `WHERE a=2` (without INDEXED BY) PASSes.  Confirmed
+        2026-04-29 NOT cascading from (d): after the INSERT-affinity fix
+        landed, "indexed by ok" / "not indexed" still DIVERGE.  Distinct
+        root cause — likely in the INDEXED BY / NOT INDEXED parser arm
+        or in how the planner honours the hint.
 
   [X] **6.10 step 25** Date/time `'now'` + strftime `%s` parity —
       closed 2026-04-29.

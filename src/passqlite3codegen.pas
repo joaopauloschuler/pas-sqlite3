@@ -22155,6 +22155,13 @@ begin
     until that lands. }
   sqlite3VdbeAddOp3(v, OP_NewRowid, 0, regRowid, regAutoinc);
 
+  { Apply column affinities (or OP_TypeCheck for STRICT tables) before
+    packing the record.  Mirrors the call inside sqlite3GenerateConstraintChecks
+    at insert.c:2080 — the constraint-check body itself is still a stub but
+    the affinity application stands alone and is required for typeof()
+    parity (e.g. INSERT INTO af(a INTEGER) VALUES('42') must store INTEGER). }
+  sqlite3TableAffinity(v, pTab, regData);
+
   { Pack the per-column regData block into a single record register.
     Allocate from nMem (matching C's sqlite3CompleteInsertion frame), not
     sqlite3GetTempReg — the temp-reg release would emit a spurious
