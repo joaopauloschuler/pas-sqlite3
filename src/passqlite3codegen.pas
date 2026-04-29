@@ -25836,6 +25836,35 @@ end;
   read-only and emit short, fixed op sequences; this closes the Δ=4 / Δ=3
   rows for the two probes in TestExplainParity.  The full pragmaLocate
   table-driven dispatch is deferred until more pragma probes land. }
+type
+  TFlagPragma = record
+    name: PChar;
+    mask: u64;
+  end;
+const
+  { pragma.c PragTyp_FLAG entries (canonical mask values from sqliteInt.h
+    flag bits).  Read arm emits ((db.flags & mask) <> 0); write arm
+    sets/clears the bit at codegen time so a subsequent prepare picks up
+    the new value. }
+  cFlagPragmas: array[0..13] of TFlagPragma = (
+    (name: 'foreign_keys';             mask: SQLITE_ForeignKeys),
+    (name: 'recursive_triggers';       mask: SQLITE_RecTriggers),
+    (name: 'reverse_unordered_selects';mask: SQLITE_ReverseOrder),
+    (name: 'defer_foreign_keys';       mask: SQLITE_DeferFKs),
+    (name: 'writable_schema';          mask: SQLITE_WriteSchema),
+    (name: 'legacy_alter_table';       mask: SQLITE_LegacyAlter),
+    (name: 'cell_size_check';          mask: SQLITE_CellSizeCk),
+    (name: 'automatic_index';          mask: SQLITE_AutoIndex),
+    (name: 'full_column_names';        mask: SQLITE_FullColNames),
+    (name: 'short_column_names';       mask: SQLITE_ShortColNames),
+    (name: 'checkpoint_fullfsync';     mask: SQLITE_CkptFullFSync),
+    (name: 'fullfsync';                mask: SQLITE_FullFSync),
+    (name: 'ignore_check_constraints'; mask: SQLITE_IgnoreChecks),
+    (name: 'query_only';               mask: SQLITE_QueryOnly)
+  );
+  cFlagPragmasTrusted: TFlagPragma =
+    (name: 'trusted_schema'; mask: SQLITE_TrustedSchema);
+
 procedure sqlite3Pragma(pParse: PParse; const pId1: PToken;
   const pId2: PToken; pValue: PToken; minusFlag: i32);
 var
@@ -25848,6 +25877,9 @@ var
   addrOp:  i32;
   pBtArg:  PBtree;
   db:      PTsqlite3;
+  i:       i32;
+  flagMask: u64;
+  bSet:    u8;
 begin
   if (pParse = nil) or (pId1 = nil) then Exit;
   db := pParse^.db;
@@ -25864,6 +25896,35 @@ begin
   iDb := 0;
 
   SetString(zName, pId1^.z, pId1^.n);
+
+  { PragTyp_FLAG — pragma.c (generic boolean-flag arm).  Read emits
+    `(db^.flags and mask) <> 0` as a single int row.  Write parses the
+    boolean rhs and updates db^.flags directly at codegen time, matching
+    the C body. }
+  flagMask := 0;
+  for i := Low(cFlagPragmas) to High(cFlagPragmas) do
+    if SameText(zName, cFlagPragmas[i].name) then begin
+      flagMask := cFlagPragmas[i].mask;
+      Break;
+    end;
+  if (flagMask = 0) and SameText(zName, cFlagPragmasTrusted.name) then
+    flagMask := cFlagPragmasTrusted.mask;
+  if flagMask <> 0 then begin
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      bSet := sqlite3GetBoolean(PChar(zRight), 0);
+      if bSet <> 0 then
+        db^.flags := db^.flags or flagMask
+      else
+        db^.flags := db^.flags and (not flagMask);
+    end else begin
+      if (db^.flags and flagMask) <> 0 then iVal := 1 else iVal := 0;
+      sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+      sqlite3VdbeReusable(v);
+    end;
+    Exit;
+  end;
 
   { PragTyp_HEADER_VALUE — pragma.c:2324.  Reads/writes a 4-byte slot in
     the database file header.  user_version is iCookie=BTREE_USER_VERSION,

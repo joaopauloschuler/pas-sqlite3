@@ -405,16 +405,27 @@ Important: At the end of this document, please find:
         because `destroyRootPage` calls `sqlite3NestedParse(UPDATE
         sqlite_schema ...)` and productive `sqlite3Update` is still
         skeleton-only.  This is the only remaining contributor.
-  [ ] **6.12** port sqlite3Pragma in full.  Regression gate landed
-       2026-04-28: `src/tests/DiagPragma.pas` (run with
-       `LD_LIBRARY_PATH=$PWD/src bin/DiagPragma`).  60 probes covering
-       boolean/scalar/string/header/introspection PRAGMAs +
-       integrity/quick check.  Current baseline 12 PASS / 49 DIVERGE —
-       most divergences are silent no-ops (Pas returns no row vs C
-       returns the default value).  Closing 6.12 should drive
-       divergences to 0.  Notable PASSes (already wired): page_size,
-       cache_size, mmap_size, encoding, synchronous, user_version
-       round-trip, application_id round-trip, shrink_memory.
+  [ ] **6.12** port sqlite3Pragma in full.  Regression gate
+       `src/tests/DiagPragma.pas` (run with
+       `LD_LIBRARY_PATH=$PWD/src bin/DiagPragma`).  Baseline 49 DIVERGE
+       was driven to 31 DIVERGE on 2026-04-28 by adding a table-driven
+       PragTyp_FLAG arm (codegen.pas sqlite3Pragma) covering 14 boolean
+       PRAGMAs (foreign_keys, recursive_triggers, reverse_unordered_selects,
+       defer_foreign_keys, writable_schema, legacy_alter_table,
+       cell_size_check, automatic_index, full_column_names,
+       short_column_names, checkpoint_fullfsync, fullfsync,
+       ignore_check_constraints, query_only, trusted_schema) plus
+       SQLITE_TrustedSchema/EnableTrigger/CacheSpill in connection-flag
+       init defaults; SQLITE_ReverseOrder + SQLITE_LegacyAlter constants
+       added.  Both read and write arms wired; write arm sets/clears the
+       bit at codegen time matching pragma.c PragTyp_FLAG body.
+       Remaining divergences (31): table-valued pragma_* introspection
+       functions, integrity_check / quick_check, journal_mode /
+       locking_mode / auto_vacuum, schema_version / data_version /
+       freelist_count, max_page_count / cache_spill / soft_heap_limit /
+       hard_heap_limit / busy_timeout / analysis_limit /
+       wal_autocheckpoint / journal_size_limit, count_changes /
+       read_uncommitted / secure_delete / temp_store / threads.
   [ ] **6.13** port sqlite3Vacuum in full
   [X] **6.14** port sqlite3WhereTabFuncArgs in full (whereexpr.c:1899..1944).
   [X] **6.15** port sqlite3WhereAddLimit + whereAddLimitExpr in full

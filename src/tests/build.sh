@@ -161,6 +161,7 @@ compile_test TestLoadExt
 compile_test TestRowidIn
 compile_test TestExplainParity
 compile_test TestWhereCorpus
+compile_test DiagPragma
 compile_test TestSQLCorpus
 compile_test TestFuzzDiff
 compile_test TestReferenceVectors

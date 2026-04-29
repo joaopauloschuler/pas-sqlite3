@@ -259,6 +259,7 @@ const
   SQLITE_TrustedSchema  = u64($00000080);
   SQLITE_NullCallback   = u64($00000100);
   SQLITE_IgnoreChecks   = u64($00000200);
+  SQLITE_ReverseOrder   = u64($00001000);
   SQLITE_RecTriggers    = u64($00002000);
   SQLITE_ForeignKeys    = u64($00004000);
   SQLITE_AutoIndex      = u64($00008000);
@@ -267,6 +268,7 @@ const
   SQLITE_QueryOnly      = u64($00100000);
   SQLITE_CellSizeCk     = u64($00200000);
   SQLITE_CorruptRdOnly  = u64($02000000);  { internal flag }
+  SQLITE_LegacyAlter    = u64($04000000);
   SQLITE_VdbeListing    = u64($0000000100000000);
   SQLITE_VdbeTrace      = u64($0000000200000000);
   SQLITE_VdbeEQP        = u64($0000001000000000);
