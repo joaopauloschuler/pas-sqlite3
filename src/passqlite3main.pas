@@ -353,6 +353,11 @@ function sqlite3_autovacuum_pages(db: PTsqlite3; xCallback: TAutovacuumPagesFn;
 function sqlite3_overload_function(db: PTsqlite3; zName: PAnsiChar;
   nArg: i32): i32; cdecl;
 
+function sqlite3_table_column_metadata(db: PTsqlite3;
+  zDbName: PAnsiChar; zTableName: PAnsiChar; zColumnName: PAnsiChar;
+  pzDataType: PPAnsiChar; pzCollSeq: PPAnsiChar;
+  pNotNull: Pi32; pPrimaryKey: Pi32; pAutoinc: Pi32): i32; cdecl;
+
 function sqlite3_errcode(db: PTsqlite3): i32; cdecl;
 function sqlite3_extended_errcode(db: PTsqlite3): i32; cdecl;
 function sqlite3_extended_result_codes(db: PTsqlite3; onoff: i32): i32; cdecl;
@@ -2475,6 +2480,107 @@ begin
   if zCopy = nil then begin Result := SQLITE_NOMEM; Exit; end;
   Result := sqlite3_create_function_v2(db, zName, nArg, SQLITE_UTF8,
               zCopy, @sqlite3InvalidFunction, nil, nil, @sqlite3_free);
+end;
+
+{ main.c:4009 — sqlite3_table_column_metadata.  Return type, collation,
+  NOT NULL, PK and AUTOINCREMENT metadata for a table column.  When
+  zColumnName is nil, only existence of the table is checked.  rowid
+  aliases ("rowid", "oid", "_rowid_") resolve to the IPK column when
+  HasRowid; otherwise INTEGER + PRIMARY KEY are reported. }
+function sqlite3_table_column_metadata(db: PTsqlite3;
+  zDbName: PAnsiChar; zTableName: PAnsiChar; zColumnName: PAnsiChar;
+  pzDataType: PPAnsiChar; pzCollSeq: PPAnsiChar;
+  pNotNull: Pi32; pPrimaryKey: Pi32; pAutoinc: Pi32): i32; cdecl;
+label
+  error_out;
+var
+  rc:         i32;
+  iCol:       i32;
+  zErrMsg:    PAnsiChar;
+  pTab:       PTable2;
+  pCol:       PColumn;
+  zDataType:  PAnsiChar;
+  zCollSeq:   PAnsiChar;
+  notnull:    i32;
+  primarykey: i32;
+  autoinc:    i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (zTableName = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  rc         := SQLITE_OK;
+  zErrMsg    := nil;
+  pTab       := nil;
+  pCol       := nil;
+  iCol       := 0;
+  zDataType  := nil;
+  zCollSeq   := nil;
+  notnull    := 0;
+  primarykey := 0;
+  autoinc    := 0;
+
+  sqlite3_mutex_enter(db^.mutex);
+  sqlite3BtreeEnterAll(db);
+
+  pTab := sqlite3FindTable(db, zTableName, zDbName);
+  if (pTab = nil) or IsView(pTab) then begin
+    pTab := nil;
+    goto error_out;
+  end;
+
+  if zColumnName = nil then begin
+    { Existence check only. }
+  end else begin
+    iCol := sqlite3ColumnIndex(pTab, zColumnName);
+    if iCol >= 0 then
+      pCol := @pTab^.aCol[iCol]
+    else if HasRowid(pTab) and (sqlite3IsRowid(zColumnName) <> 0) then begin
+      iCol := pTab^.iPKey;
+      if iCol >= 0 then pCol := @pTab^.aCol[iCol] else pCol := nil;
+    end else begin
+      pTab := nil;
+      goto error_out;
+    end;
+  end;
+
+  if pCol <> nil then begin
+    zDataType  := sqlite3ColumnType(pCol, nil);
+    zCollSeq   := sqlite3ColumnColl(pCol);
+    if (pCol^.typeFlags and $0F) <> 0 then notnull := 1 else notnull := 0;
+    if (pCol^.colFlags and COLFLAG_PRIMKEY) <> 0 then primarykey := 1
+    else primarykey := 0;
+    if (pTab^.iPKey = iCol)
+       and ((pTab^.tabFlags and TF_Autoincrement) <> 0) then
+      autoinc := 1
+    else
+      autoinc := 0;
+  end else begin
+    zDataType  := 'INTEGER';
+    primarykey := 1;
+  end;
+  if zCollSeq = nil then zCollSeq := 'BINARY';
+
+error_out:
+  sqlite3BtreeLeaveAll(db);
+
+  if pzDataType  <> nil then pzDataType^  := zDataType;
+  if pzCollSeq   <> nil then pzCollSeq^   := zCollSeq;
+  if pNotNull    <> nil then pNotNull^    := notnull;
+  if pPrimaryKey <> nil then pPrimaryKey^ := primarykey;
+  if pAutoinc    <> nil then pAutoinc^    := autoinc;
+
+  if (rc = SQLITE_OK) and (pTab = nil) then begin
+    sqlite3DbFree(db, zErrMsg);
+    zErrMsg := sqlite3MPrintf(db, 'no such table column: %s.%s',
+                              [zTableName, zColumnName]);
+    rc := SQLITE_ERROR;
+  end;
+  if zErrMsg <> nil then sqlite3ErrorWithMsg(db, rc, zErrMsg)
+  else if rc <> SQLITE_OK then sqlite3ErrorWithMsg(db, rc, nil);
+  sqlite3DbFree(db, zErrMsg);
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
 end;
 
 function sqlite3_errcode(db: PTsqlite3): i32; cdecl;

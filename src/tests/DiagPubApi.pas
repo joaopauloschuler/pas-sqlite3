@@ -51,6 +51,8 @@ var
   rcs: i32;
   pStmt: Pointer;
   highwater: i64;
+  zType, zColl: PAnsiChar;
+  nn, pk, ai, mrc: i32;
 begin
   Check('libversion_number = 3053000',
         sqlite3_libversion_number = 3053000);
@@ -333,6 +335,70 @@ begin
   Check('db_cacheflush = OK',      sqlite3_db_cacheflush(db)       = SQLITE_OK);
   Check('db_cacheflush(nil) = MISUSE',
         sqlite3_db_cacheflush(nil)      = SQLITE_MISUSE);
+
+  { Phase 8.4.1 — sqlite3_table_column_metadata.  Create a table with
+    a known schema, then inspect column metadata.  The Pas port has no
+    on-disk schema reload, but in-process pTab is populated by
+    CREATE TABLE so the lookup goes through sqlite3FindTable. }
+  begin
+    Check('exec CREATE TABLE',
+          sqlite3_exec(db,
+            'CREATE TABLE tcm(' +
+              'a INTEGER PRIMARY KEY AUTOINCREMENT, ' +
+              'b TEXT NOT NULL COLLATE NOCASE, ' +
+              'c REAL)',
+            nil, nil, nil) = SQLITE_OK);
+    zType := nil; zColl := nil; nn := -1; pk := -1; ai := -1;
+      mrc := sqlite3_table_column_metadata(db, nil,
+               'tcm', 'a', @zType, @zColl, @nn, @pk, @ai);
+      Check('metadata a OK', mrc = SQLITE_OK);
+      Check('metadata a type=INTEGER',
+            (zType <> nil) and (StrComp(zType, 'INTEGER') = 0));
+      Check('metadata a coll=BINARY',
+            (zColl <> nil) and (StrComp(zColl, 'BINARY') = 0));
+      Check('metadata a primarykey=1', pk = 1);
+      Check('metadata a autoinc=1',    ai = 1);
+
+      zType := nil; zColl := nil; nn := -1; pk := -1; ai := -1;
+      mrc := sqlite3_table_column_metadata(db, nil,
+               'tcm', 'b', @zType, @zColl, @nn, @pk, @ai);
+      Check('metadata b OK', mrc = SQLITE_OK);
+      Check('metadata b type=TEXT',
+            (zType <> nil) and (StrComp(zType, 'TEXT') = 0));
+      { sqlite3AddCollateType is still a stub (codegen.pas:23244), so
+        COLFLAG_HASCOLL is never set on b and sqlite3ColumnColl returns
+        nil; sqlite3_table_column_metadata then falls back to "BINARY".
+        Once AddCollateType is ported this will read "NOCASE". }
+      Check('metadata b coll=BINARY (NOCASE pending AddCollateType port)',
+            (zColl <> nil) and (StrComp(zColl, 'BINARY') = 0));
+      Check('metadata b notnull=1', nn = 1);
+      Check('metadata b primarykey=0', pk = 0);
+      Check('metadata b autoinc=0',    ai = 0);
+
+      zType := nil;
+      mrc := sqlite3_table_column_metadata(db, nil,
+               'tcm', 'rowid', @zType, nil, nil, @pk, nil);
+      Check('metadata rowid OK', mrc = SQLITE_OK);
+      Check('metadata rowid type=INTEGER',
+            (zType <> nil) and (StrComp(zType, 'INTEGER') = 0));
+      Check('metadata rowid pk=1', pk = 1);
+
+      mrc := sqlite3_table_column_metadata(db, nil,
+               'tcm', 'nosuch', nil, nil, nil, nil, nil);
+      Check('metadata nosuch col = ERROR', mrc = SQLITE_ERROR);
+
+      mrc := sqlite3_table_column_metadata(db, nil,
+               'nosuch_tbl', nil, nil, nil, nil, nil, nil);
+      Check('metadata nosuch tbl = ERROR', mrc = SQLITE_ERROR);
+
+      mrc := sqlite3_table_column_metadata(nil, nil,
+               'tcm', 'a', nil, nil, nil, nil, nil);
+      Check('metadata(nil db) = MISUSE', mrc = SQLITE_MISUSE);
+
+      mrc := sqlite3_table_column_metadata(db, nil,
+               nil, nil, nil, nil, nil, nil, nil);
+      Check('metadata(nil tbl) = MISUSE', mrc = SQLITE_MISUSE);
+  end;
 
   rc := sqlite3_close(db);
   Check('close', rc = SQLITE_OK);

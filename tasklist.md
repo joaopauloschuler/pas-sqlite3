@@ -447,6 +447,15 @@ Important: At the end of this document, please find:
        `sqlite3AlterAddConstraint`, `sqlite3Detach`, `sqlite3Attach`,
        `sqlite3Analyze`, `sqlite3Vacuum`,
        `sqlite3FkCheck`, `sqlite3FkActions`.
+  [ ] **6.27a** port `sqlite3AddCollateType` (codegen.pas:23244) in full
+       from build.c:1751.  Currently a no-op stub, so
+       `COLUMN ... COLLATE <name>` never writes the collation name into
+       pCol^.zCnName / sets COLFLAG_HASCOLL.  Surfaced 2026-04-28 by the
+       new sqlite3_table_column_metadata path (DiagPubApi `metadata b`)
+       — declared NOCASE columns report "BINARY" instead.  Body should
+       mirror sqlite3ColumnSetColl: append name + NUL to zCnName tail,
+       OR flag with COLFLAG_HASCOLL.  Likely also affects per-column
+       collation pickup in WHERE/ORDER index lookups.
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
        marked as "stub" that was missed by 6.16..6.27 (catch-all).
@@ -675,7 +684,17 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             runtime).  Destructor = sqlite3_free for the strdup'd name
             buffer.  Covered by DiagPubApi (success path + SELECT runtime
             ERROR + nil/MISUSE guards).
-       [ ] `sqlite3_table_column_metadata` — column metadata getter.
+       [X] `sqlite3_table_column_metadata` — ported 2026-04-28
+            (passqlite3main.pas) — verbatim port of main.c:4009; added
+            `sqlite3ColumnType` helper (util.c:104) to passqlite3codegen.pas
+            using the existing eCType field + literal `sqlite3StdType[]`
+            strings ("ANY"/"BLOB"/"INT"/"INTEGER"/"REAL"/"TEXT").  Skips
+            sqlite3Init (Pas schema is in-process only — see 7.1.1).
+            Covered by DiagPubApi (a/b/c column lookups, rowid alias,
+            error_out paths, MISUSE guards).  Side-discovery: surfaced
+            that `sqlite3AddCollateType` (codegen.pas:23244) is still a
+            no-op stub, so `COLLATE NOCASE` never sets COLFLAG_HASCOLL
+            and metadata falls back to "BINARY".  See new task 6.27a.
 
 - [ ] **8.5.1** Dynamic string builder API (`sqlite3_str_*`,
        printf.c):

@@ -2048,6 +2048,7 @@ function  sqlite3ExprCollSeq(pParse: PParse; pE: PExpr): Pointer;
 procedure sqlite3ColumnSetColl(db: PTsqlite3; pCol: PColumn;
   zColl: PAnsiChar);
 function  sqlite3ColumnColl(pCol: PColumn): PAnsiChar;
+function  sqlite3ColumnType(pCol: PColumn; zDflt: PAnsiChar): PAnsiChar;
 procedure sqlite3ColumnPropertiesFromName(pTab: PTable2; pCol: PColumn);
 function  sqlite3IdListIndex(pList: PIdList; zName: PAnsiChar): i32;
 function  sqlite3DbReallocOrFree(db: PTsqlite3; p: Pointer;
@@ -19758,6 +19759,32 @@ begin
     repeat Inc(z); until z^ = #0;
   end;
   Result := z + 1;
+end;
+
+{ sqlite3ColumnType — port of util.c:104.  Return the declared type
+  string for a column.  If COLFLAG_HASTYPE is set the type lives after
+  the name's NUL terminator inside zCnName.  Otherwise consult eCType
+  (high nibble of typeFlags) and map to the sqlite3StdType[] strings.
+  Falls through to zDflt when neither source is populated. }
+function sqlite3ColumnType(pCol: PColumn; zDflt: PAnsiChar): PAnsiChar;
+const
+  StdType: array[1..6] of PAnsiChar = (
+    'ANY', 'BLOB', 'INT', 'INTEGER', 'REAL', 'TEXT');
+var
+  z:      PAnsiChar;
+  eCType: u8;
+begin
+  if (pCol^.colFlags and COLFLAG_HASTYPE) <> 0 then begin
+    z := pCol^.zCnName;
+    while z^ <> #0 do Inc(z);
+    Result := z + 1;
+    Exit;
+  end;
+  eCType := (pCol^.typeFlags shr 4) and $0F;
+  if (eCType >= 1) and (eCType <= 6) then
+    Result := StdType[eCType]
+  else
+    Result := zDflt;
 end;
 
 { sqlite3ColumnPropertiesFromName — set Column flags from name heuristics }
