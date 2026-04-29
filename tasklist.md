@@ -757,7 +757,18 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_create_collation16`.
        [ ] `sqlite3_create_function16`.
        [ ] `sqlite3_collation_needed16`.
-       [ ] `sqlite3_complete16` — UTF-16 statement completeness.
+       [X] `sqlite3_complete16` — ported 2026-04-29 (passqlite3main.pas) —
+            verbatim port of complete.c:269: wraps the UTF-16NATIVE input
+            in a sqlite3_value, transcodes via sqlite3ValueText(UTF8),
+            forwards to sqlite3_complete, masks result with 0xFF.  Added
+            csq_complete16 binding in csqlite3.pas; new T14b in
+            TestTokenizer.pas drives 10 differential parity cases (empty,
+            whitespace, complete/incomplete statements, comments, embedded
+            string semicolons, trigger BEGIN…END).  Tokenizer 137/0,
+            TestExplainParity 1016/10, DiagPubApi 156/0, TestParser 45/0,
+            TestVdbeAgg 11/0, TestSelectBasic 49/0, TestWhereBasic 52/0,
+            TestBtreeCompat 337/0, TestDMLBasic 54/0, TestAuthBuiltins
+            34/0 — no regressions.
 
 - [ ] **8.4.1** Hooks / control / change-counter / errors / limits
        (main.c, status.c):

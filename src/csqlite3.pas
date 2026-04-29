@@ -290,6 +290,9 @@ function csq_db_readonly(db: Pcsq_db; zDbName: PChar): Int32;
 function csq_complete(zSql: PChar): Int32;
     cdecl; external LIBSQLITE3 name 'sqlite3_complete';
 
+function csq_complete16(zSql: Pointer): Int32;
+    cdecl; external LIBSQLITE3 name 'sqlite3_complete16';
+
 // ---------------------------------------------------------------------------
 // Tracing
 // ---------------------------------------------------------------------------

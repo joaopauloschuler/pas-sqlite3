@@ -375,6 +375,8 @@ function sqlite3_error_offset(db: PTsqlite3): i32; cdecl;
 function sqlite3_set_errmsg(db: PTsqlite3; errcode: i32; zMsg: PAnsiChar): i32; cdecl;
 function sqlite3_limit(db: PTsqlite3; limitId: i32; newLimit: i32): i32; cdecl;
 
+function sqlite3_complete16(zSql: Pointer): i32; cdecl;
+
 function sqlite3_stmt_busy(pStmt: Pointer): i32; cdecl;
 function sqlite3_stmt_readonly(pStmt: Pointer): i32; cdecl;
 function sqlite3_stmt_explain(pStmt: Pointer; eMode: i32): i32; cdecl;
@@ -2672,6 +2674,27 @@ function sqlite3_get_autocommit(db: PTsqlite3): i32; cdecl;
 begin
   if db = nil then begin Result := 0; Exit; end;
   Result := db^.autoCommit;
+end;
+
+{ complete.c:269 — sqlite3_complete16.  UTF-16 wrapper around sqlite3_complete:
+  wraps the input as a sqlite3_value with SQLITE_UTF16NATIVE encoding, asks
+  the value layer to transcode to UTF-8, then forwards. }
+function sqlite3_complete16(zSql: Pointer): i32; cdecl;
+var
+  pVal: Psqlite3_value;
+  zSql8: PAnsiChar;
+  rc: i32;
+begin
+  pVal := sqlite3ValueNew(nil);
+  if pVal = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  sqlite3ValueSetStr(pVal, -1, zSql, SQLITE_UTF16NATIVE, SQLITE_STATIC);
+  zSql8 := PAnsiChar(sqlite3ValueText(pVal, SQLITE_UTF8));
+  if zSql8 <> nil then
+    rc := sqlite3_complete(zSql8)
+  else
+    rc := SQLITE_NOMEM;
+  sqlite3ValueFree(pVal);
+  Result := rc and $FF;
 end;
 
 { vdbeapi.c:2074 — sqlite3_stmt_busy. }
