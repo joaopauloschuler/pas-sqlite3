@@ -2807,8 +2807,6 @@ procedure sqlite3BtreeLeaveAll(db: PTsqlite3);
 function  sqlite3BtreeSchemaLocked(pBt: Pointer): i32;
 function  sqlite3BtreeHoldsAllMutexes(db: PTsqlite3): i32;
 procedure sqlite3OomFaultGeneric(db: PTsqlite3);
-function  sqlite3VdbeSetSql(v: PVdbe; z: PAnsiChar; n: i32;
-  prepFlags: u32): i32;
 function  sqlite3VdbeDb(v: PVdbe): PTsqlite3;
 function  sqlite3VdbePrepareFlags(v: PVdbe): u8;
 function  sqlite3VdbeResetStepResult(v: PVdbe): i32;
@@ -26386,12 +26384,6 @@ end;
 procedure sqlite3OomFaultGeneric(db: PTsqlite3);
 begin
   db^.mallocFailed := 1;
-end;
-
-function sqlite3VdbeSetSql(v: PVdbe; z: PAnsiChar; n: i32; prepFlags: u32): i32;
-begin
-  { Phase 7 — store SQL text in Vdbe }
-  Result := SQLITE_OK;
 end;
 
 function sqlite3VdbeDb(v: PVdbe): PTsqlite3;

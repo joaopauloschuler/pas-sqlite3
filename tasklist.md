@@ -502,6 +502,18 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             varargs shape; if a future C-ABI export is added, expose a
             cdecl shim that dispatches into the typed wrappers.
        [X] `sqlite3_set_clientdata` / `sqlite3_get_clientdata` — ported 2026-04-29.
+       [X] `sqlite3_db_handle` / `sqlite3_db_mutex` / `sqlite3_db_name` /
+            `sqlite3_errstr` / `sqlite3_next_stmt` / `sqlite3_sql` /
+            `sqlite3_expanded_sql` — ported 2026-04-29.  Side-fix:
+            removed the no-op `sqlite3VdbeSetSql` stub from codegen.pas
+            that was shadowing the real implementation in vdbe.pas
+            (Vdbe.zSql was always nil after prepare_v2); now the
+            preserved-SQL path actually populates `zSql`.  Gate:
+            `src/tests/TestPublicApi.pas`.  `sqlite3_expanded_sql`
+            currently returns the raw SQL unchanged because
+            `sqlite3VdbeExpandSql` is itself still a degraded stub
+            (vdbe.pas:5125); tighten the test once the printf-based
+            expander lands.
 
 - [ ] **8.2.1** Statement-introspection gaps (vdbeapi.c):
        [X] `sqlite3_stmt_busy` — ported 2026-04-28.

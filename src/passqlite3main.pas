@@ -416,6 +416,13 @@ function sqlite3_stmt_busy(pStmt: Pointer): i32; cdecl;
 function sqlite3_stmt_readonly(pStmt: Pointer): i32; cdecl;
 function sqlite3_stmt_explain(pStmt: Pointer; eMode: i32): i32; cdecl;
 function sqlite3_stmt_status(pStmt: Pointer; op, resetFlag: i32): i32; cdecl;
+function sqlite3_db_handle(pStmt: Pointer): PTsqlite3; cdecl;
+function sqlite3_db_mutex(db: PTsqlite3): Pointer; cdecl;
+function sqlite3_db_name(db: PTsqlite3; N: i32): PAnsiChar; cdecl;
+function sqlite3_errstr(rc: i32): PAnsiChar; cdecl;
+function sqlite3_next_stmt(pDb: PTsqlite3; pStmt: Pointer): Pointer; cdecl;
+function sqlite3_sql(pStmt: Pointer): PAnsiChar; cdecl;
+function sqlite3_expanded_sql(pStmt: Pointer): PAnsiChar; cdecl;
 
 function sqlite3_sleep(ms: i32): i32; cdecl;
 
@@ -3149,6 +3156,75 @@ begin
     Result := 1
   else
     Result := 0;
+end;
+
+{ vdbeapi.c:2015 — sqlite3_db_handle.  Return the connection that owns
+  the prepared statement. }
+function sqlite3_db_handle(pStmt: Pointer): PTsqlite3; cdecl;
+begin
+  if pStmt = nil then Result := nil
+  else Result := PTsqlite3(PVdbe(pStmt)^.db);
+end;
+
+{ main.c:883 — sqlite3_db_mutex.  Return the per-connection mutex. }
+function sqlite3_db_mutex(db: PTsqlite3): Pointer; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := nil; Exit; end;
+  Result := db^.mutex;
+end;
+
+{ main.c:4967 — sqlite3_db_name.  Return the name of the N-th database
+  schema, or nil if N is out of range. }
+function sqlite3_db_name(db: PTsqlite3; N: i32): PAnsiChar; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := nil; Exit; end;
+  if (N < 0) or (N >= db^.nDb) then Result := nil
+  else Result := db^.aDb[N].zDbSName;
+end;
+
+{ main.c:2844 — sqlite3_errstr.  Return the static error-code string. }
+function sqlite3_errstr(rc: i32): PAnsiChar; cdecl;
+begin
+  Result := sqlite3ErrStr(rc);
+end;
+
+{ vdbeapi.c:2085 — sqlite3_next_stmt.  Walk the per-connection linked list
+  of prepared statements; nil pStmt returns the head. }
+function sqlite3_next_stmt(pDb: PTsqlite3; pStmt: Pointer): Pointer; cdecl;
+var pNext: Pointer;
+begin
+  if sqlite3SafetyCheckOk(pDb) = 0 then begin Result := nil; Exit; end;
+  sqlite3_mutex_enter(pDb^.mutex);
+  if pStmt = nil then pNext := pDb^.pVdbe
+  else pNext := PVdbe(pStmt)^.pVNext;
+  sqlite3_mutex_leave(pDb^.mutex);
+  Result := pNext;
+end;
+
+{ vdbeapi.c:2138 — sqlite3_sql.  Return the original SQL text saved on the
+  Vdbe (only populated when the statement was prepared with
+  SQLITE_PREPARE_SAVESQL / sqlite3_prepare_v2/v3). }
+function sqlite3_sql(pStmt: Pointer): PAnsiChar; cdecl;
+begin
+  if pStmt = nil then Result := nil
+  else Result := PVdbe(pStmt)^.zSql;
+end;
+
+{ vdbeapi.c:2152 — sqlite3_expanded_sql.  Expand bound parameters in the
+  SQL text; returned string is allocated via sqlite3_malloc. }
+function sqlite3_expanded_sql(pStmt: Pointer): PAnsiChar; cdecl;
+var
+  zSrc: PAnsiChar;
+  p:    PVdbe;
+begin
+  Result := nil;
+  if pStmt = nil then Exit;
+  p := PVdbe(pStmt);
+  zSrc := p^.zSql;
+  if zSrc = nil then Exit;
+  sqlite3_mutex_enter(PTsqlite3(p^.db)^.mutex);
+  Result := sqlite3VdbeExpandSql(p, zSrc);
+  sqlite3_mutex_leave(PTsqlite3(p^.db)^.mutex);
 end;
 
 function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;
