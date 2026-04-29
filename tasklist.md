@@ -307,6 +307,13 @@ Important: At the end of this document, please find:
 
   [X] **6.10 step 24** Scalar built-in parity sweep — closed
 
+  [X] **6.10 step 27** LIKE / GLOB / NOT LIKE / NOT GLOB / ESCAPE
+      parity sweep — closed 2026-04-29.  `src/tests/DiagLikeGlob.pas`
+      probes 55 cases (wildcards, character classes, ESCAPE, NULL
+      semantics, NOT-form, like()/glob() function form, UTF-8 input,
+      typeof, numeric coercion to TEXT, prefix-LIKE optimisation
+      result-set behaviour).  All 55 PASS; no divergence found.
+
   [ ] **6.10 step 26** DiagIndexing probe (added 2026-04-29,
       `src/tests/DiagIndexing.pas`).  44 cases, 15 DIVERGE — surfaced new
       silent bugs not previously captured.  Run with
