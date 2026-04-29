@@ -401,6 +401,12 @@ function sqlite3_collation_needed16(db: PTsqlite3; pCollNeededArg: Pointer;
 function sqlite3_create_function16(db: PTsqlite3; zFunctionName: Pointer;
   nArg: i32; eTextRep: i32; p: Pointer;
   xSFunc: Pointer; xStep: Pointer; xFinal: Pointer): i32; cdecl;
+function sqlite3_prepare16(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPointer): i32; cdecl;
+function sqlite3_prepare16_v2(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPointer): i32; cdecl;
+function sqlite3_prepare16_v3(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  prepFlags: u32; ppStmt: PPointer; pzTail: PPointer): i32; cdecl;
 
 function sqlite3_stmt_busy(pStmt: Pointer): i32; cdecl;
 function sqlite3_stmt_readonly(pStmt: Pointer): i32; cdecl;
@@ -2837,6 +2843,117 @@ begin
     rc := SQLITE_NOMEM;
   sqlite3ValueFree(pVal);
   Result := rc and $FF;
+end;
+
+{ prepare.c:983 — sqlite3Prepare16.  Transcode UTF-16 zSql to UTF-8 via a
+  sqlite3_value, forward to sqlite3LockAndPrepare, then translate the UTF-8
+  tail pointer back into a UTF-16 byte offset for *pzTail. }
+function utf16ByteLenForChars(zIn: Pointer; nByte: i32; nChar: i32): i32;
+{ Mirrors sqlite3Utf16ByteLen: count up to nChar codepoints in the UTF-16NATIVE
+  buffer zIn (length nByte; -1 = until U+0000), return their byte length. }
+var
+  p: PByte;
+  c: u32;
+  i, n: i32;
+begin
+  p := PByte(zIn);
+  i := 0;
+  n := 0;
+  while (nChar > 0) and ((nByte < 0) or (i + 1 < nByte)) do
+  begin
+    { Read one UTF-16LE code unit (Pas port is LE-only). }
+    c := u32(p[i]) or (u32(p[i + 1]) shl 8);
+    if (nByte < 0) and (c = 0) then break;
+    Inc(i, 2);
+    { High surrogate? Consume the trailing low surrogate too. }
+    if (c >= $D800) and (c < $DC00)
+       and ((nByte < 0) or (i + 1 < nByte)) then
+    begin
+      c := u32(p[i]) or (u32(p[i + 1]) shl 8);
+      if (c >= $DC00) and (c < $E000) then Inc(i, 2);
+    end;
+    Dec(nChar);
+    n := i;
+  end;
+  Result := n;
+end;
+
+function sqlite3Prepare16(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  prepFlags: u32; ppStmt: PPointer; pzTail: PPointer): i32;
+var
+  pVal: Psqlite3_value;
+  zSql8, zTail8: PAnsiChar;
+  rc: i32;
+  z: PByte;
+  sz: i32;
+  charsParsed: i32;
+begin
+  if ppStmt = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  ppStmt^ := nil;
+  if (sqlite3SafetyCheckOk(db) = 0) or (zSql = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+
+  { Find U+0000 terminator / clamp nBytes to even. }
+  z := PByte(zSql);
+  if nBytes >= 0 then begin
+    sz := 0;
+    while (sz < nBytes) and ((z[sz] <> 0) or (z[sz + 1] <> 0)) do Inc(sz, 2);
+    nBytes := sz;
+  end else begin
+    sz := 0;
+    while (z[sz] <> 0) or (z[sz + 1] <> 0) do Inc(sz, 2);
+    nBytes := sz;
+  end;
+
+  sqlite3_mutex_enter(db^.mutex);
+  zTail8 := nil;
+  pVal := sqlite3ValueNew(db);
+  if pVal = nil then begin
+    rc := SQLITE_NOMEM;
+  end else begin
+    sqlite3ValueSetStr(pVal, nBytes, zSql, SQLITE_UTF16NATIVE, SQLITE_STATIC);
+    zSql8 := PAnsiChar(sqlite3ValueText(pVal, SQLITE_UTF8));
+    if zSql8 <> nil then
+      rc := sqlite3LockAndPrepare(db, zSql8, -1, prepFlags, nil,
+                                  ppStmt, @zTail8)
+    else
+      rc := SQLITE_NOMEM;
+
+    if (zTail8 <> nil) and (pzTail <> nil) and (zSql8 <> nil) then
+    begin
+      charsParsed := sqlite3Utf8CharLen(zSql8,
+                                        i32(PtrUInt(zTail8) - PtrUInt(zSql8)));
+      pzTail^ := Pointer(PtrUInt(zSql)
+                         + PtrUInt(utf16ByteLenForChars(zSql, nBytes,
+                                                        charsParsed)));
+    end;
+    sqlite3ValueFree(pVal);
+  end;
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+function sqlite3_prepare16(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPointer): i32; cdecl;
+begin
+  Result := sqlite3Prepare16(db, zSql, nBytes, 0, ppStmt, pzTail);
+end;
+
+function sqlite3_prepare16_v2(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPointer): i32; cdecl;
+begin
+  Result := sqlite3Prepare16(db, zSql, nBytes, SQLITE_PREPARE_SAVESQL,
+                             ppStmt, pzTail);
+end;
+
+function sqlite3_prepare16_v3(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  prepFlags: u32; ppStmt: PPointer; pzTail: PPointer): i32; cdecl;
+begin
+  Result := sqlite3Prepare16(db, zSql, nBytes,
+              (prepFlags and SQLITE_PREPARE_MASK) or SQLITE_PREPARE_SAVESQL,
+              ppStmt, pzTail);
 end;
 
 { main.c:3783 — sqlite3_create_collation16.  UTF-16 wrapper around

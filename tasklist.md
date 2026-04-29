@@ -586,9 +586,20 @@ Important: At the end of this document, please find:
        [X] `sqlite3VdbeResetStepResult` — real body in vdbe.pas:3493
             (resets `p^.rc`).  The codegen.pas:25449 duplicate that
             also clears `pc:=-1` is dead.
-       [ ] `sqlite3_prepare16` / `sqlite3_prepare16_v2` /
-            `sqlite3_prepare16_v3` (codegen.pas:25117..25130) — UTF-16
-            wrappers around the UTF-8 prepare path.
+       [X] `sqlite3_prepare16` / `sqlite3_prepare16_v2` /
+            `sqlite3_prepare16_v3` — ported 2026-04-29 (passqlite3main.pas)
+            — verbatim port of prepare.c:983/1053/1065/1077.  Local
+            `utf16ByteLenForChars` mirrors C's `sqlite3Utf16ByteLen`
+            (UTF-16LE, surrogate-aware) so *pzTail correctly tracks the
+            consumed UTF-16 byte offset.  Dead codegen.pas stubs removed.
+            Smoke-verified end-to-end: `SELECT 42;` UTF-16 prepare → step
+            yields col0=42, tail offset = 20 bytes (10 chars × 2).
+            MISUSE on nil zSql / nil ppStmt.  No regressions:
+            TestExplainParity 1016/10, DiagPubApi 231/0, TestVdbeApi
+            57/0, TestParser 45/0, TestSelectBasic 49/0, TestVdbeAgg
+            11/0, TestBtreeCompat 337/0, TestDMLBasic 54/0, TestPrintf
+            105/0, TestAuthBuiltins 34/0, TestCarray 74/0,
+            DiagSumOverflow 12/0.
 
 - [ ] **7.1.4** DbFixer — schema-name fixups for ATTACH (attach.c).
        All four currently return `SQLITE_OK` no-op:

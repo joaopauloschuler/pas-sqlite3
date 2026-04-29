@@ -2786,16 +2786,8 @@ function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
 procedure sqlite3ParseObjectInit(pParse: PParse; db: PTsqlite3);
 procedure sqlite3ParseObjectReset(pParse: PParse);
 function  sqlite3ReadSchema(pParse: PParse): i32;
-{ sqlite3Reprepare is defined in passqlite3main (Phase 7.1.3) — it needs
-  sqlite3LockAndPrepare which lives there.
-  sqlite3_prepare, sqlite3_prepare_v2, sqlite3_prepare_v3 are now defined in
-  passqlite3main (Phase 8.2).  The UTF-16 entry points remain stubs here. }
-function  sqlite3_prepare16(db: PTsqlite3; zSql: Pointer; nBytes: i32;
-  ppStmt: PPointer; pzTail: PPointer): i32;
-function  sqlite3_prepare16_v2(db: PTsqlite3; zSql: Pointer; nBytes: i32;
-  ppStmt: PPointer; pzTail: PPointer): i32;
-function  sqlite3_prepare16_v3(db: PTsqlite3; zSql: Pointer; nBytes: i32;
-  prepFlags: u32; ppStmt: PPointer; pzTail: PPointer): i32;
+{ sqlite3Reprepare / sqlite3_prepare* (incl. UTF-16 variants) live in
+  passqlite3main (Phase 7.1.3 / 8.2). }
 
 { Stubs needed by vdbeaux.c / main.c callers }
 procedure sqlite3RunParser(pParse: PParse; zSql: PAnsiChar);
@@ -25776,27 +25768,8 @@ begin
   Result := i32((PVdbe(pStmt)^.vdbeFlags and VDBF_EXPLAIN_MASK) shr 2);
 end;
 
-{ sqlite3_prepare / _v2 / _v3 — see passqlite3main.pas (Phase 8.2). }
-
-function sqlite3_prepare16(db: PTsqlite3; zSql: Pointer; nBytes: i32;
-  ppStmt: PPointer; pzTail: PPointer): i32;
-begin
-  if ppStmt <> nil then ppStmt^ := nil;
-  Result := SQLITE_ERROR; { Phase 7 }
-end;
-
-function sqlite3_prepare16_v2(db: PTsqlite3; zSql: Pointer; nBytes: i32;
-  ppStmt: PPointer; pzTail: PPointer): i32;
-begin
-  Result := sqlite3_prepare16(db, zSql, nBytes, ppStmt, pzTail);
-end;
-
-function sqlite3_prepare16_v3(db: PTsqlite3; zSql: Pointer; nBytes: i32;
-  prepFlags: u32; ppStmt: PPointer; pzTail: PPointer): i32;
-begin
-  Result := sqlite3_prepare16(db, zSql, nBytes, ppStmt, pzTail);
-end;
-
+{ sqlite3_prepare / _v2 / _v3 plus UTF-16 variants — see passqlite3main.pas
+  (Phase 8.2 / 7.1.3). }
 { sqlite3Reprepare body lives in passqlite3main (needs sqlite3LockAndPrepare). }
 
 // ===========================================================================
