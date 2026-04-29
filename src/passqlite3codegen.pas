@@ -18553,6 +18553,12 @@ begin
       Assert(ExprUseXList(pE^.pLeft));
       sqlite3ExprAnalyzeAggList(pNC, pE^.pLeft^.x.pList);
     end;
+    { select.c:6534..6535 — walk the FILTER predicate of a windowless
+      aggregate (EP_WinFunc + eFrmType=TK_FILTER) so TK_COLUMN refs inside
+      the FILTER also land in pAggI^.aCol[] as TK_AGG_COLUMN. }
+    if ExprHasProperty(pE, EP_WinFunc) and (pE^.y.pWin <> nil)
+       and (pE^.y.pWin^.pFilter <> nil) then
+      sqlite3ExprAnalyzeAggregates(pNC, pE^.y.pWin^.pFilter);
   end;
   pNC^.ncFlags := pNC^.ncFlags and (not NC_InAggFunc);
 end;
@@ -18705,6 +18711,7 @@ var
   v:       PVdbe;
   i, j, nArg, r1: i32;
   regAgg:  i32;
+  addrNext: i32;
   pF:      PAggInfoFunc;
   pC:      PAggInfoCol;
   pList:   PExprList;
@@ -18717,9 +18724,22 @@ begin
   pAggInfo^.directMode := 1;
   for i := 0 to pAggInfo^.nFunc - 1 do
   begin
+    addrNext := 0;
     pF := @pAggInfo^.aFunc[i];
     Assert(ExprUseXList(pF^.pFExpr));
     pList := pF^.pFExpr^.x.pList;
+    { select.c:6826..6847 — FILTER arm.  When the aggregate carries
+      EP_WinFunc with eFrmType=TK_FILTER, jump over the AggStep when
+      the FILTER predicate evaluates false or NULL. }
+    if ((pF^.pFExpr^.flags and EP_WinFunc) <> 0)
+       and (pF^.pFExpr^.y.pWin <> nil)
+       and (pF^.pFExpr^.y.pWin^.eFrmType = TK_FILTER)
+       and (pF^.pFExpr^.y.pWin^.pFilter <> nil) then
+    begin
+      addrNext := sqlite3VdbeMakeLabel(pParse);
+      sqlite3ExprIfFalse(pParse, pF^.pFExpr^.y.pWin^.pFilter, addrNext,
+                         SQLITE_JUMPIFNULL);
+    end;
     if pList <> nil then
     begin
       nArg   := pList^.nExpr;
@@ -18759,6 +18779,7 @@ begin
     sqlite3VdbeAppendP4(v, Pointer(pF^.pFunc), P4_FUNCDEF);
     sqlite3VdbeChangeP5(v, u16(nArg));
     if nArg > 0 then sqlite3ReleaseTempRange(pParse, regAgg, nArg);
+    if addrNext <> 0 then sqlite3VdbeResolveLabel(v, addrNext);
     if pParse^.nErr <> 0 then begin pAggInfo^.directMode := 0; Exit; end;
   end;
   for i := 0 to pAggInfo^.nAccumulator - 1 do
@@ -19062,8 +19083,10 @@ begin
       pAggFunc := @pAggI2^.aFunc[jAgg];
       if pAggFunc^.iDistinct >= 0 then begin canUseAgg := False; break; end;
       if pAggFunc^.iOBTab    >= 0 then begin canUseAgg := False; break; end;
-      if (pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0 then
-        begin canUseAgg := False; break; end;
+      if ((pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0)
+         and ((pAggFunc^.pFExpr^.y.pWin = nil)
+              or (pAggFunc^.pFExpr^.y.pWin^.eFrmType <> TK_FILTER))
+      then begin canUseAgg := False; break; end;
       if (pAggFunc^.pFunc <> nil)
          and ((PTFuncDef(pAggFunc^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0)
       then begin canUseAgg := False; break; end;
@@ -19248,8 +19271,10 @@ begin
         pAggFunc := @pAggI2^.aFunc[jAgg];
         if pAggFunc^.iDistinct >= 0 then begin canUseAgg := False; break; end;
         if pAggFunc^.iOBTab    >= 0 then begin canUseAgg := False; break; end;
-        if (pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0 then
-          begin canUseAgg := False; break; end;
+        if ((pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0)
+           and ((pAggFunc^.pFExpr^.y.pWin = nil)
+                or (pAggFunc^.pFExpr^.y.pWin^.eFrmType <> TK_FILTER))
+        then begin canUseAgg := False; break; end;
       end;
       { Bail also when result list contains a non-trivial reference to
         a base column (the directMode column-emit arm we don't fully

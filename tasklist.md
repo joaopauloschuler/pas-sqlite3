@@ -368,36 +368,28 @@ Important: At the end of this document, please find:
         same.  Symptom: prep=0 step=101 with empty result set when C
         produces N rows.  Window-codegen sub-issue under 6.26; distinct
         from (c) because here the parse + prepare succeed.
-      [ ] **e) `count(*) FILTER (WHERE …)` / `sum() FILTER` empty
-        result** — agg + FILTER-clause codegen not wired.  Investigation
-        2026-04-29: parser's rule 343 already builds `pWin{eFrmType=
-        TK_FILTER, pFilter=expr}` and sqlite3WindowAttach hangs it on
-        the agg Expr with EP_WinFunc set.  Three concrete gaps before
-        the FILTER predicate can fire at runtime:
-          1. [X] ResolveExpr (codegen.pas:7505) now walks
-             pE^.y.pWin^.pFilter when EP_WinFunc is set — closed
-             2026-04-29.  Mirrors resolve.c:1334.  Column refs inside a
-             FILTER (WHERE …) clause now become TK_COLUMN.  Sub-tasks 2
-             and 3 below are still required before FILTER fires at
-             runtime; no DiagWindow regression (19 div unchanged).
-          2. analyzeAggFuncArgs (codegen.pas:18529) does not call
-             sqlite3ExprAnalyzeAggregates on pWin^.pFilter, so the
-             FILTER's column refs are never converted to TK_AGG_COLUMN
-             nor added to pAggInfo^.aCol[].  C reference:
-             select.c:6534..6535 EP_WinFunc arm.
-          3. Both agg gates (codegen.pas:19058 / :19244) reject any
-             EP_WinFunc; should accept eFrmType=TK_FILTER.  Plus the
-             nAccumulator>0 bail at :19064 / :19280 must be lifted (or
-             a directMode column-emit pre-pass added) so a FILTER
-             whose predicate references a base column doesn't
-             re-bail.  Once nAccumulator>0 is honoured,
-             updateAccumulatorSimple needs the C 6826..6847 arm:
-             before each AggStep, when EP_WinFunc + pWin^.pFilter,
-             emit `addrNext := MakeLabel; ExprIfFalse(pFilter,
-             addrNext, JUMPIFNULL)`, and after AggStep
-             `ResolveLabel(addrNext)`.
-          C reference: select.c:6826..6847 (updateAccumulator FILTER
-          arm) + 6534..6535 (analyze) + resolve.c:1334 (resolve).
+      [X] **e) `count(*) FILTER (WHERE …)` / `sum() FILTER` empty
+        result** — closed 2026-04-29.  Three sub-tasks landed:
+          1. ResolveExpr (codegen.pas:7505) walks pE^.y.pWin^.pFilter
+             when EP_WinFunc is set (mirrors resolve.c:1334).
+          2. analyzeAggFuncArgs (codegen.pas) now calls
+             sqlite3ExprAnalyzeAggregates on pE^.y.pWin^.pFilter under
+             NC_InAggFunc so FILTER's column refs become TK_AGG_COLUMN
+             and land in pAggInfo^.aCol[] (mirrors select.c:6534..6535).
+          3. Both agg gates (no-FROM at :19030, with-FROM at :19150)
+             accept EP_WinFunc when pWin^.eFrmType=TK_FILTER.
+             updateAccumulatorSimple now emits the C 6826..6847 arm:
+             addrNext := MakeLabel; ExprIfFalse(pFilter, addrNext,
+             JUMPIFNULL); ... AggStep ... ResolveLabel(addrNext).
+          DiagWindow `count filter` and `sum filter` PASS; total
+          divergences 19 → 17.  TestExplainParity 1016/10, TestVdbeAgg
+          11/0, TestSelectBasic 49/0, TestWhereBasic 52/0, TestParser
+          45/0, TestDMLBasic 54/0, DiagPubApi 189/0 — no regressions.
+          Note: the directMode column-emit / nAccumulator>0 pre-pass
+          remains deferred (still rejected at :19071/:19261 — not
+          required for the count/sum FILTER shapes since the FILTER
+          predicate's columns are added to aCol[] AFTER nAccumulator is
+          set, leaving nAccumulator at 0 for these cases).
       [ ] **f) `count(DISTINCT col)` / `sum(DISTINCT col)` empty
         result** — agg-DISTINCT codegen path missing.  C reference:
         select.c codeDistinct.
