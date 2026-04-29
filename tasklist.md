@@ -643,7 +643,11 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             pProgressArg}; nOps<=0 clears.  Runtime invocation arm in
             sqlite3VdbeExec was already wired (vdbe.pas:8909..).
             Covered by DiagPubApi (set / clear / nil-db guard).
-       [ ] `sqlite3_autovacuum_pages` — per-db autovacuum hook.
+       [X] `sqlite3_autovacuum_pages` — ported 2026-04-28
+            (passqlite3main.pas) — sets db^.{xAutovacPages, pAutovacPagesArg,
+            xAutovacDestr}; previous destructor fires for stale pArg before
+            the new one is installed.  Covered by DiagPubApi (set / clear /
+            nil-db MISUSE).
        [X] `sqlite3_interrupt` / `sqlite3_is_interrupted` — ported
             2026-04-28 (passqlite3main.pas) — sets/reads
             db^.u1.isInterrupted.
@@ -655,7 +659,14 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             6.10 step 12 task that touches the compile-options table.
        [ ] `sqlite3_test_control` — testing back-door (subset).
        [ ] `sqlite3_file_control` — opcode dispatcher into VFS xFileControl.
-       [ ] `sqlite3_overload_function` — vtab-overloaded scalar.
+       [X] `sqlite3_overload_function` — ported 2026-04-28
+            (passqlite3main.pas).  No-op when sqlite3FindFunction already
+            resolves; otherwise registers a stub via
+            sqlite3_create_function_v2 with sqlite3InvalidFunction (errors
+            "unable to use function NAME in the requested context" at
+            runtime).  Destructor = sqlite3_free for the strdup'd name
+            buffer.  Covered by DiagPubApi (success path + SELECT runtime
+            ERROR + nil/MISUSE guards).
        [ ] `sqlite3_table_column_metadata` — column metadata getter.
 
 - [ ] **8.5.1** Dynamic string builder API (`sqlite3_str_*`,

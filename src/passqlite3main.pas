@@ -342,6 +342,17 @@ type
 procedure sqlite3_progress_handler(db: PTsqlite3; nOps: i32;
   xProgress: TProgressHandlerFn; pArg: Pointer); cdecl;
 
+type
+  TAutovacuumPagesFn = function(pArg: Pointer; zSchema: PAnsiChar;
+    nDbPage: u32; nFreePage: u32; nBytePerPage: u32): u32; cdecl;
+  TAutovacuumDestrFn = procedure(p: Pointer); cdecl;
+
+function sqlite3_autovacuum_pages(db: PTsqlite3; xCallback: TAutovacuumPagesFn;
+  pArg: Pointer; xDestructor: TAutovacuumDestrFn): i32; cdecl;
+
+function sqlite3_overload_function(db: PTsqlite3; zName: PAnsiChar;
+  nArg: i32): i32; cdecl;
+
 function sqlite3_errcode(db: PTsqlite3): i32; cdecl;
 function sqlite3_extended_errcode(db: PTsqlite3): i32; cdecl;
 function sqlite3_extended_result_codes(db: PTsqlite3; onoff: i32): i32; cdecl;
@@ -2395,6 +2406,75 @@ begin
     db^.nProgressOps := 0;
     db^.pProgressArg := nil;
   end;
+end;
+
+{ main.c:2439 — sqlite3_autovacuum_pages.  Per-connection autovacuum hook
+  invoked from the pager autovacuum path.  If a previous destructor was
+  registered, fire it for the previous pArg before installing the new
+  callback. }
+function sqlite3_autovacuum_pages(db: PTsqlite3; xCallback: TAutovacuumPagesFn;
+  pArg: Pointer; xDestructor: TAutovacuumDestrFn): i32; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    if Assigned(xDestructor) then xDestructor(pArg);
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  if Assigned(db^.xAutovacDestr) then
+    db^.xAutovacDestr(db^.pAutovacPagesArg);
+  db^.xAutovacPages    := Pointer(@xCallback);
+  db^.pAutovacPagesArg := pArg;
+  db^.xAutovacDestr    := xDestructor;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+{ main.c:2197 — sqlite3InvalidFunction.  Static helper used by
+  sqlite3_overload_function: when a virtual table claims to overload
+  a function but the runtime ends up calling the global stub directly,
+  this scalar emits the canonical "unable to use function NAME in the
+  requested context" error. }
+procedure sqlite3InvalidFunction(pCtx: Psqlite3_context; nArg: i32;
+  argv: PPsqlite3_value); cdecl;
+var
+  zName, zErr: PAnsiChar;
+begin
+  { sqlite3_mprintf is a single-fmt-arg wrapper in the Pas port (no real
+    varargs), so format the message inline rather than via "%s". }
+  zName := PAnsiChar(sqlite3_user_data(pCtx));
+  if zName <> nil then
+    zErr := PAnsiChar(sqlite3StrDup(PChar('unable to use function ' + StrPas(zName) + ' in the requested context')))
+  else
+    zErr := PAnsiChar(sqlite3StrDup(PChar('unable to use function in the requested context')));
+  sqlite3_result_error(pCtx, zErr, -1);
+  sqlite3_free(zErr);
+end;
+
+{ main.c:2223 — sqlite3_overload_function.  Declare that a function has
+  been overloaded by a virtual table.  If the function already exists as
+  a regular global function, this is a no-op.  Otherwise create a stub
+  that always errors at runtime; xFindFunction on the vtab is expected
+  to redirect lookups to the real implementation. }
+function sqlite3_overload_function(db: PTsqlite3; zName: PAnsiChar;
+  nArg: i32): i32; cdecl;
+var
+  rc:    i32;
+  zCopy: PAnsiChar;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (zName = nil) or (nArg < -2) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  if sqlite3FindFunction(db, zName, nArg, SQLITE_UTF8, 0) <> nil then
+    rc := 1
+  else
+    rc := 0;
+  sqlite3_mutex_leave(db^.mutex);
+  if rc <> 0 then begin Result := SQLITE_OK; Exit; end;
+  zCopy := PAnsiChar(sqlite3StrDup(PChar(zName)));
+  if zCopy = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  Result := sqlite3_create_function_v2(db, zName, nArg, SQLITE_UTF8,
+              zCopy, @sqlite3InvalidFunction, nil, nil, @sqlite3_free);
 end;
 
 function sqlite3_errcode(db: PTsqlite3): i32; cdecl;

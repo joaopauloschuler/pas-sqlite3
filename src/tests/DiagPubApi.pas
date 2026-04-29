@@ -294,6 +294,38 @@ begin
         sqlite3_value_bytes16(sqlite3_column_value(pStmt, 0)) = 4);
   sqlite3_finalize(pStmt);
 
+  { Phase 8.4.1 — sqlite3_autovacuum_pages.  Setter only; verify the
+    callback / arg / destructor slots populate, then clear via nil/nil. }
+  Check('autovacuum_pages set = OK',
+        sqlite3_autovacuum_pages(db, nil, Pointer(PtrUInt($DEAD)), nil)
+          = SQLITE_OK);
+  Check('autovacuum_pages pArg stored',
+        db^.pAutovacPagesArg = Pointer(PtrUInt($DEAD)));
+  Check('autovacuum_pages clear = OK',
+        sqlite3_autovacuum_pages(db, nil, nil, nil) = SQLITE_OK);
+  Check('autovacuum_pages pArg cleared',
+        db^.pAutovacPagesArg = nil);
+  Check('autovacuum_pages(nil db) = MISUSE',
+        sqlite3_autovacuum_pages(nil, nil, nil, nil) = SQLITE_MISUSE);
+
+  { Phase 8.4.1 — sqlite3_overload_function.  Registering an unknown
+    name installs a stub; calling it via SQL yields a runtime error
+    "unable to use function NAME ...". }
+  Check('overload_function ok',
+        sqlite3_overload_function(db, 'my_overload', 1) = SQLITE_OK);
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT my_overload(1)', -1, @pStmt, nil);
+  Check('prep SELECT my_overload(1)', rcs = SQLITE_OK);
+  rcs := sqlite3_step(pStmt);
+  Check('step my_overload -> ERROR', rcs = SQLITE_ERROR);
+  sqlite3_finalize(pStmt);
+  Check('overload_function(nil db) = MISUSE',
+        sqlite3_overload_function(nil, 'x', 1) = SQLITE_MISUSE);
+  Check('overload_function(nil name) = MISUSE',
+        sqlite3_overload_function(db, nil, 1) = SQLITE_MISUSE);
+  Check('overload_function(nArg=-3) = MISUSE',
+        sqlite3_overload_function(db, 'x', -3) = SQLITE_MISUSE);
+
   { Phase 8.1.1 — sqlite3_db_release_memory / sqlite3_db_cacheflush. }
   Check('db_release_memory = OK',  sqlite3_db_release_memory(db)   = SQLITE_OK);
   Check('db_release_memory(nil) = MISUSE',
