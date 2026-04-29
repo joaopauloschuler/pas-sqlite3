@@ -776,10 +776,14 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        surfaced by `DiagErrMsg.pas`.  Each prepares cleanly on Pas
        where C errors at prepare or step time — NOT error-routing
        bugs, but catches in earlier phases:
-       [ ] `SLECT 1` — Pas reports `near "": syntax error`, missing
-            the offending token.  `parserSyntaxError` token capture is
-            losing `sParse.sLastToken` after the unrecognised TK_ID
-            shift; fix in passqlite3parser.pas.
+       [X] `SLECT 1` — closed 2026-04-29.  Root cause: `yy_syntax_error`
+            (passqlite3parser.pas) called `sqlite3ErrorMsg(pPse,
+            'near "%T": syntax error')` but the existing one-arg
+            sqlite3ErrorMsg passes `[]` to sqlite3MPrintf, so `%T`
+            consumed nil → empty token rendered.  Fix: inline
+            sqlite3MPrintf with `[@yyminor]` + replicate the
+            nErr/rc/zErrMsg bookkeeping.  DiagErrMsg `parse syntax`
+            now PASS (`near "SLECT": syntax error`).
        [ ] `SELECT z FROM t` (z not a column) — Pas accepts at prepare,
             steps with no rows; C errors `no such column: z`.  Folds
             into the resolver coverage gap (sqlite3ResolveExprListNames

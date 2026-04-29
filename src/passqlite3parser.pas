@@ -1459,12 +1459,30 @@ procedure yy_syntax_error(yypParser: PyyParser; yymajor: i32;
                           const yyminor: TToken);
 var
   pPse: PParse;
+  zMsg: PAnsiChar;
+  db: PTsqlite3;
 begin
   pPse := PParse(yypParser^.pParse);
   if pPse = nil then Exit;
-  if (yyminor.z <> nil) and (yyminor.z^ <> #0) then
-    sqlite3ErrorMsg(pPse, 'near "%T": syntax error')
-  else
+  db := pPse^.db;
+  if (yyminor.z <> nil) and (yyminor.z^ <> #0) then begin
+    { parse.c yy_syntax_error: sqlite3ErrorMsg(pParse, "near \"%T\": syntax error", &TOKEN);
+      sqlite3ErrorMsg in this codebase has no varargs overload — inline
+      sqlite3MPrintf with the token pointer + replicate the bookkeeping
+      (nErr++, rc:=SQLITE_ERROR, zErrMsg). }
+    if (db <> nil) and (db^.suppressErr <> 0) then begin
+      Inc(pPse^.nErr);
+      if pPse^.rc = SQLITE_OK then pPse^.rc := SQLITE_ERROR;
+    end else begin
+      zMsg := sqlite3MPrintf(db, 'near "%T": syntax error', [@yyminor]);
+      Inc(pPse^.nErr);
+      if pPse^.rc = SQLITE_OK then pPse^.rc := SQLITE_ERROR;
+      if zMsg <> nil then begin
+        if pPse^.zErrMsg <> nil then sqlite3DbFree(db, pPse^.zErrMsg);
+        pPse^.zErrMsg := zMsg;
+      end;
+    end;
+  end else
     sqlite3ErrorMsg(pPse, 'incomplete input');
   if yymajor = 0 then ;
 end;
