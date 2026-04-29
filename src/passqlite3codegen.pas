@@ -21030,11 +21030,106 @@ begin
   sqlite3SelectDelete(db, pSel);
 end;
 
-{ sqlite3LimitWhere — rewrite WHERE for DELETE/UPDATE with LIMIT (Phase 6.4 stub) }
+{ sqlite3LimitWhere — port of delete.c:182.
+  Rewrite the WHERE clause of a DELETE/UPDATE that carries an ORDER BY/LIMIT
+  into "rowid IN (SELECT rowid FROM ... ORDER BY ... LIMIT ...)" (or the PK
+  equivalent for WITHOUT ROWID tables).  Dead-code at present (the parser's
+  delete/update arms still drop pOrderBy/pLimit before reaching here), but
+  the body is the line-for-line port the catch-all 6.28 sweep calls for. }
 function sqlite3LimitWhere(pParse: PParse; pSrc: PSrcList; pWhere: PExpr;
   pOrderBy: PExprList; pLimit: PExpr; zStmtType: PAnsiChar): PExpr;
+var
+  db:          PTsqlite3;
+  pLhs:        PExpr;
+  pInClause:   PExpr;
+  pEList:      PExprList;
+  pSelectSrc:  PSrcList;
+  pSel:        PSelect;
+  pTab:        PTable2;
+  pPk:         PIndex2;
+  pItem:       PSrcItem;
+  zName:       PAnsiChar;
+  pCol:        PColumn;
+  pP:          PExpr;
+  i:           i32;
+  iColIdx:     i32;
 begin
-  Result := pWhere; { Phase 6.5 }
+  db := pParse^.db;
+  pLhs := nil;
+  pInClause := nil;
+  pEList := nil;
+  pSelectSrc := nil;
+  pSel := nil;
+
+  { ORDER BY without LIMIT is an error. }
+  if (pOrderBy <> nil) and (pLimit = nil) then begin
+    sqlite3ErrorMsg(pParse,
+      sqlite3MPrintf(db, PAnsiChar('ORDER BY without LIMIT on %s'),
+        [zStmtType]));
+    sqlite3ExprDelete(db, pWhere);
+    sqlite3ExprListDelete(db, pOrderBy);
+    Result := nil;
+    Exit;
+  end;
+
+  { No LIMIT — nothing to rewrite. }
+  if pLimit = nil then begin
+    Result := pWhere;
+    Exit;
+  end;
+
+  pItem := SrcListItems(pSrc);
+  pTab  := pItem^.pSTab;
+  if HasRowid(pTab) then begin
+    pLhs   := sqlite3PExpr(pParse, TK_ROW, nil, nil);
+    pEList := sqlite3ExprListAppend(pParse, nil,
+                sqlite3PExpr(pParse, TK_ROW, nil, nil));
+  end else begin
+    pPk := sqlite3PrimaryKeyIndex(pTab);
+    Assert(pPk <> nil);
+    Assert(pPk^.nKeyCol >= 1);
+    if pPk^.nKeyCol = 1 then begin
+      iColIdx := (pPk^.aiColumn + 0)^;
+      Assert((iColIdx >= 0) and (iColIdx < pTab^.nCol));
+      pCol  := pTab^.aCol; Inc(pCol, iColIdx);
+      zName := pCol^.zCnName;
+      pLhs   := sqlite3Expr(db, TK_ID, zName);
+      pEList := sqlite3ExprListAppend(pParse, nil,
+                  sqlite3Expr(db, TK_ID, zName));
+    end else begin
+      for i := 0 to pPk^.nKeyCol - 1 do begin
+        iColIdx := (pPk^.aiColumn + i)^;
+        Assert((iColIdx >= 0) and (iColIdx < pTab^.nCol));
+        pCol := pTab^.aCol; Inc(pCol, iColIdx);
+        pP   := sqlite3Expr(db, TK_ID, pCol^.zCnName);
+        pEList := sqlite3ExprListAppend(pParse, pEList, pP);
+      end;
+      pLhs := sqlite3PExpr(pParse, TK_VECTOR, nil, nil);
+      if pLhs <> nil then
+        pLhs^.x.pList := sqlite3ExprListDup(db, pEList, 0);
+    end;
+  end;
+
+  { Duplicate the FROM clause for the inner SELECT. }
+  pItem^.pSTab := nil;
+  pSelectSrc := sqlite3SrcListDup(db, pSrc, 0);
+  pItem^.pSTab := pTab;
+  if (pItem^.fg.fgBits and u8($02)) <> 0 then begin    { isIndexedBy }
+    Assert((pItem^.fg.fgBits2 and u8($02)) = 0);       { isCte = bit 1 of fgBits2 }
+    pItem^.u2.pIBIndex := nil;
+    pItem^.fg.fgBits := pItem^.fg.fgBits and (not u8($02));
+    sqlite3DbFree(db, pItem^.u1.zIndexedBy);
+  end else if (pItem^.fg.fgBits2 and u8($02)) <> 0 then begin { isCte }
+    { TODO: pSrc->a[0].u2.pCteUse->nUse++ — TCteUse record not yet defined
+      in the Pas port; deferred until WITH/CTE codegen lands (Phase 6.20). }
+  end;
+
+  pSel := sqlite3SelectNew(pParse, pEList, pSelectSrc, pWhere,
+            nil, nil, pOrderBy, 0, pLimit);
+
+  pInClause := sqlite3PExpr(pParse, TK_IN, pLhs, nil);
+  sqlite3PExprAddSelect(pParse, pInClause, pSel);
+  Result := pInClause;
 end;
 
 { sqlite3DeleteFrom — port of delete.c:288.

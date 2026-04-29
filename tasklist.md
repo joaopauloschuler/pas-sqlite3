@@ -456,6 +456,13 @@ Important: At the end of this document, please find:
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
        marked as "stub" that was missed by 6.16..6.27 (catch-all).
+       [X] `sqlite3LimitWhere` — ported 2026-04-29 (delete.c:182).
+            Builds the `WHERE rowid IN (SELECT rowid FROM ... LIMIT ...)`
+            rewrite for DELETE/UPDATE-with-LIMIT, including the WITHOUT
+            ROWID PK and PK-vector arms.  Dead-code today (parser
+            delete/update arms still drop pOrderBy/pLimit before reaching
+            here — gated on SQLITE_ENABLE_UPDATE_DELETE_LIMIT).  CTE arm
+            (pCteUse->nUse++) left as TODO until TCteUse record is defined.
 ---
 
 ## Phase 7 — Parser (one gate open)
