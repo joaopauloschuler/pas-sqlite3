@@ -53,6 +53,8 @@ Important: At the end of this document, please find:
             shared cache).
 
 - [ ] **6.9-bis 11g.2.b** Port `sqlite3WhereBegin` / `sqlite3WhereEnd` in full.  
+    [ ] Port `sqlite3WhereBegin` in full.
+    [ ] Port `sqlite3WhereBegin` in full.
     Bookkeeping primitives, prologue,
     cleanup contract, and several leaf helpers (codeCompare cluster,
     sqlite3ExprCanBeNull, sqlite3ExprCodeTemp + 6 unary arms,
@@ -415,13 +417,19 @@ Important: At the end of this document, please find:
        to pascal:
        [X] `sqlite3WhereExplainBloomFilter` — ported 2026-04-29.
        [X] `sqlite3WhereAddExplainText` — ported 2026-04-29.
-       [ ] `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep`.
+       [ ] `sqlite3WindowCodeInit`
+       [ ] `sqlite3WindowCodeStep`.
   [ ] **6.27** port codegen.pas alter / attach / analyze / vacuum / FK /
        extension / scalar-function stubs in full from C to pascal:
-       `sqlite3AlterRenameTable`, `sqlite3AlterFinishAddColumn`,
-       `sqlite3AlterAddConstraint`, `sqlite3Detach`, `sqlite3Attach`,
-       `sqlite3Analyze`, `sqlite3Vacuum`,
-       `sqlite3FkCheck`, `sqlite3FkActions`.
+       [ ] `sqlite3AlterRenameTable`
+       [ ] `sqlite3AlterFinishAddColumn`
+       [ ] `sqlite3AlterAddConstraint`
+       [ ] `sqlite3Detach`
+       [ ] `sqlite3Attach`
+       [ ] `sqlite3Analyze`
+       [ ] `sqlite3Vacuum`
+       [ ] `sqlite3FkCheck`
+       [ ] `sqlite3FkActions`.
   [X] **6.27a** `sqlite3AddCollateType` — ported 2026-04-28.
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
@@ -477,13 +485,18 @@ Important: At the end of this document, please find:
        here when ported.)
 
 - [ ] **7.1.9** ALTER TABLE (alter.c) — Full port from C to pascal:
-       [ ] `sqlite3AlterRenameTable`, `sqlite3AlterRenameColumn`.
-       [ ] `sqlite3AlterDropColumn`, `sqlite3AlterDropConstraint`.
-       [ ] `sqlite3AlterSetNotNull`, `sqlite3AlterAddConstraint`.
-       [ ] `sqlite3AlterBeginAddColumn`, `sqlite3AlterFinishAddColumn`.
+       [ ] `sqlite3AlterRenameTable`
+       [ ] `sqlite3AlterRenameColumn`
+       [ ] `sqlite3AlterDropColumn`
+       [ ] `sqlite3AlterDropConstraint`
+       [ ] `sqlite3AlterSetNotNull`
+       [ ] `sqlite3AlterAddConstraint`.
+       [ ] `sqlite3AlterBeginAddColumn`
+       [ ] `sqlite3AlterFinishAddColumn`.
        [ ] `sqlite3AlterFunctions` — registers the rename-helper SQL
             functions.
-       [ ] `sqlite3RenameTokenRemap`, `sqlite3RenameExprlistUnmap`.
+       [ ] `sqlite3RenameTokenRemap`
+       [ ] `sqlite3RenameExprlistUnmap`.
        (Overlaps 6.22 / 6.27 — move here when ported.)
 
 - [ ] **7.4b** Bytecode-diff scope of `TestParser.pas`.  Now that
