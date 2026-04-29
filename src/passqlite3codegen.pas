@@ -2294,7 +2294,7 @@ function  sqlite3UpsertNew(db: PTsqlite3; pTarget: PExprList;
   pTargetWhere: PExpr; pSet: PExprList; pWhere: PExpr;
   pNext: PUpsert): PUpsert;
 function  sqlite3UpsertAnalyzeTarget(pParse: PParse; pTabList: PSrcList;
-  pUpsert: PUpsert; pIdx: PIndex2): i32;
+  pUpsert: PUpsert; pAll: PUpsert): i32;
 function  sqlite3UpsertNextIsIPK(pUpsert: PUpsert): i32;
 function  sqlite3UpsertOfIndex(pUpsert: PUpsert; pIdx: PIndex2): PUpsert;
 procedure sqlite3UpsertDoUpdate(pParse: PParse; pUpsert: PUpsert;
@@ -20340,12 +20340,155 @@ begin
   Result := p;
 end;
 
-{ sqlite3UpsertAnalyzeTarget — match ON CONFLICT target to an index
-  (Phase 6.4 stub — full implementation requires schema lookup) }
+{ sqlite3UpsertAnalyzeTarget — port of upsert.c:90.
+  Resolve all symbols in the conflict-target clause and match each ON CONFLICT
+  clause to either the rowid of an HasRowid table or to a UNIQUE index of pTab.
+  On success pUpsert^.pUpsertIdx is set (or left nil for the rowid case);
+  duplicates against pAll set isDup so the second clause silently never fires. }
 function sqlite3UpsertAnalyzeTarget(pParse: PParse; pTabList: PSrcList;
-  pUpsert: PUpsert; pIdx: PIndex2): i32;
+  pUpsert: PUpsert; pAll: PUpsert): i32;
+var
+  pTab:    PTable2;
+  rc:      i32;
+  iCursor: i32;
+  pIdx:    PIndex2;
+  pTarget: PExprList;
+  pTerm:   PExpr;
+  sNC:     TNameContext;
+  sCol:    array[0..1] of TExpr;
+  nClause: i32;
+  ii, jj, nn: i32;
+  pXpr:    PExpr;
+  zWhich:  array[0..15] of AnsiChar;
+  pTargetItems: PExprListItem;
+  azCollArr: PPAnsiChar;
+  pColExprItems: PExprListItem;
 begin
-  Result := SQLITE_OK; { Phase 6.5 will complete this }
+  Assert(pTabList^.nSrc = 1);
+  Assert(SrcListItems(pTabList)[0].pSTab <> nil);
+  Assert(pUpsert <> nil);
+  Assert(pUpsert^.pUpsertTarget <> nil);
+
+  FillChar(sNC, SizeOf(sNC), 0);
+  sNC.pParse   := pParse;
+  sNC.pSrcList := pTabList;
+  nClause := 0;
+
+  while (pUpsert <> nil) and (pUpsert^.pUpsertTarget <> nil) do
+  begin
+    rc := sqlite3ResolveExprListNames(@sNC, pUpsert^.pUpsertTarget);
+    if rc <> 0 then begin Result := rc; Exit; end;
+    rc := sqlite3ResolveExprNames(@sNC, pUpsert^.pUpsertTargetWhere);
+    if rc <> 0 then begin Result := rc; Exit; end;
+
+    pTab    := SrcListItems(pTabList)[0].pSTab;
+    pTarget := pUpsert^.pUpsertTarget;
+    iCursor := SrcListItems(pTabList)[0].iCursor;
+    pTargetItems := ExprListItems(pTarget);
+
+    if HasRowid(pTab)
+       and (pTarget^.nExpr = 1) then
+    begin
+      pTerm := pTargetItems[0].pExpr;
+      if (pTerm <> nil) and (pTerm^.op = TK_COLUMN)
+         and (pTerm^.iColumn = XN_ROWID) then
+      begin
+        Assert(pUpsert^.pUpsertIdx = nil);
+        pUpsert := pUpsert^.pNextUpsert;
+        Inc(nClause);
+        Continue;
+      end;
+    end;
+
+    FillChar(sCol, SizeOf(sCol), 0);
+    sCol[0].op    := TK_COLLATE;
+    sCol[0].pLeft := @sCol[1];
+    sCol[1].op    := TK_COLUMN;
+    sCol[1].iTable := iCursor;
+
+    pIdx := pTab^.pIndex;
+    while pIdx <> nil do
+    begin
+      if pIdx^.onError = OE_None then
+      begin
+        pIdx := pIdx^.pNext; Continue;
+      end;
+      if pTarget^.nExpr <> i32(pIdx^.nKeyCol) then
+      begin
+        pIdx := pIdx^.pNext; Continue;
+      end;
+      if pIdx^.pPartIdxWhere <> nil then
+      begin
+        if pUpsert^.pUpsertTargetWhere = nil then
+        begin
+          pIdx := pIdx^.pNext; Continue;
+        end;
+        if sqlite3ExprCompare(pParse, pUpsert^.pUpsertTargetWhere,
+                              pIdx^.pPartIdxWhere, iCursor) <> 0 then
+        begin
+          pIdx := pIdx^.pNext; Continue;
+        end;
+      end;
+      nn := i32(pIdx^.nKeyCol);
+      azCollArr := pIdx^.azColl;
+      ii := 0;
+      while ii < nn do
+      begin
+        sCol[0].u.zToken := azCollArr[ii];
+        if pIdx^.aiColumn[ii] = XN_EXPR then
+        begin
+          Assert(pIdx^.aColExpr <> nil);
+          Assert(pIdx^.aColExpr^.nExpr > ii);
+          pColExprItems := ExprListItems(pIdx^.aColExpr);
+          pXpr := pColExprItems[ii].pExpr;
+          if pXpr^.op <> TK_COLLATE then
+          begin
+            sCol[0].pLeft := pXpr;
+            pXpr := @sCol[0];
+          end;
+        end
+        else
+        begin
+          sCol[0].pLeft  := @sCol[1];
+          sCol[1].iColumn := pIdx^.aiColumn[ii];
+          pXpr := @sCol[0];
+        end;
+        jj := 0;
+        while jj < nn do
+        begin
+          if sqlite3ExprCompare(nil, pTargetItems[jj].pExpr, pXpr, iCursor) < 2 then
+            Break;
+          Inc(jj);
+        end;
+        if jj >= nn then Break;
+        Inc(ii);
+      end;
+      if ii < nn then
+      begin
+        pIdx := pIdx^.pNext; Continue;
+      end;
+      pUpsert^.pUpsertIdx := pIdx;
+      if sqlite3UpsertOfIndex(pAll, pIdx) <> pUpsert then
+        pUpsert^.isDup := 1;
+      Break;
+    end;
+
+    if pUpsert^.pUpsertIdx = nil then
+    begin
+      if (nClause = 0) and (pUpsert^.pNextUpsert = nil) then
+        zWhich[0] := #0
+      else
+        snpFmt(SizeOf(zWhich), @zWhich[0], '%d ', [nClause + 1]);
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+        '%sON CONFLICT clause does not match any '
+      + 'PRIMARY KEY or UNIQUE constraint', [PAnsiChar(@zWhich[0])]));
+      Result := SQLITE_ERROR; Exit;
+    end;
+
+    pUpsert := pUpsert^.pNextUpsert;
+    Inc(nClause);
+  end;
+  Result := SQLITE_OK;
 end;
 
 { sqlite3UpsertNextIsIPK — true if next upsert clause targets the IPK }

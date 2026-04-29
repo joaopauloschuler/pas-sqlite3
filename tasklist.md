@@ -52,19 +52,20 @@ Important: At the end of this document, please find:
             SQLITE_OK (querySharedCacheTableLock is no-op without
             shared cache).
 
-- [ ] **6.9-bis 11g.2.b** Port `sqlite3WhereBegin` / `sqlite3WhereEnd` in full.  
-    [ ] Port `sqlite3WhereBegin` in full.
-    [ ] Port `sqlite3WhereBegin` in full.
+- [ ] **6.9-bis 11g.2.b** Port:  
+    [ ] Port `sqlite3WhereBegin`
+    [ ] Port `sqlite3WhereEnd`
     Bookkeeping primitives, prologue,
     cleanup contract, and several leaf helpers (codeCompare cluster,
     sqlite3ExprCanBeNull, sqlite3ExprCodeTemp + 6 unary arms,
     TK_COLLATE/TK_SPAN/TK_UPLUS arms, whereShortCut, allowedOp +
     operatorMask + exprMightBeIndexed + minimal-viable exprAnalyze)
     are already ported.
-- [ ] **6.9-bis 11g.2.c** port in full or re-enable `sqlite3Update`
-- [ ] **6.9-bis 11g.2.d** port in full or re-enable `sqlite3GenerateConstraintChecks`
-- [ ] **6.9-complete** complete the porting of `sqlite3VdbeRecordCompare` and
-  `sqlite3VdbeFindCompare` in FULL in `passqlite3btree.pas`.
+- [ ] **6.9-bis 11g.2.c** port `sqlite3Update`
+- [ ] **6.9-bis 11g.2.d** port `sqlite3GenerateConstraintChecks`
+- [ ] **6.9-complete** complete the porting:
+    - [ ] `sqlite3VdbeRecordCompare` in FULL in `passqlite3btree.pas`.
+    - [ ] `sqlite3VdbeFindCompare` in FULL in `passqlite3btree.pas`.
     - [X] **a)** RHS arms for Real / String / Blob / extra-Null
       ported 2026-04-28.  serialGet7 + IntFloatCompare + isAllZero
       helpers added locally in btree.pas (avoids uses-cycle to
@@ -414,7 +415,16 @@ Important: At the end of this document, please find:
             triggersReallyExist inlined).  Faithful no-op until
             `sqlite3BeginTrigger` populates the trigger schema.
   [ ] **6.24** port codegen.pas DML / insert stubs in full from C to pascal:
-       [ ] `sqlite3UpsertAnalyzeTarget`
+       [X] `sqlite3UpsertAnalyzeTarget` — ported 2026-04-29 (upsert.c:90).
+            ResolveExprListNames + ResolveExprNames on conflict-target /
+            WHERE; HasRowid + TK_COLUMN/XN_ROWID short-circuit; per-index
+            loop honouring IsUniqueIndex (onError<>OE_None), nKeyCol match,
+            partial-index WHERE compare, XN_EXPR / TK_COLLATE column compare
+            via sCol[2] scaffold; pUpsertOfIndex duplicate sets isDup;
+            ON CONFLICT mismatch error with %d-prefix nClause label.
+            Side-fix: stub had wrong 4th arg (pIdx instead of pAll) —
+            signature now matches C.  Dead-code until
+            sqlite3GenerateConstraintChecks lands.
        [ ] `sqlite3UpsertDoUpdate`,
        [X] `sqlite3AutoincrementBegin` — ported 2026-04-29 (insert.c:460).
        [X] `sqlite3AutoincrementEnd` + `autoIncrementEnd` — ported 2026-04-29
@@ -460,13 +470,14 @@ Important: At the end of this document, please find:
        `sqlite3ReadSchema` (codegen.pas:21928) returns `SQLITE_OK`
        without reading anything; tests pre-populate the schema.  Port
        in full:
-       [ ] `sqlite3ReadSchema` — drive the schema-load query.
-       [ ] `sqlite3Init` / `sqlite3InitOne` (prepare.c) — read each
+       [ ] Port `sqlite3ReadSchema` — drive the schema-load query.
+       [ ] Port `sqlite3Init`
+       [ ] Port `sqlite3InitOne` (prepare.c) — read each
             sqlite_master row and parse its CREATE statement via
             `sqlite3NestedParse`.
-       [ ] `sqlite3InitCallback` (main.pas:2063) — currently installs
+       [ ] Port `sqlite3InitCallback` (main.pas:2063) — currently installs
             only system tables; full body parses each schema row.
-       [ ] `schemaIsValid` / `sqlite3SchemaToIndex` plumbing.
+       [ ] Port `schemaIsValid` / `sqlite3SchemaToIndex` plumbing.
 
 - [ ] **7.1.2** `sqlite3NestedParse` full driver (build.c).  The
        current skeleton (codegen.pas:25041) early-exits when
@@ -493,8 +504,9 @@ Important: At the end of this document, please find:
        [ ] Per-rule reduce actions (Phase 7.2e) — several rule arms
             still TODO and gated on the codegen Phase 7 stubs
             (NestedParse, BeginWriteOperation, FK actions, etc.).
-       [ ] `sqlite3RenameToken` / `sqlite3RenameTokenMap` /
-            `sqlite3RenameExprUnmap` — needed for `PARSE_MODE_RENAME`
+       [ ] Port `sqlite3RenameToken`
+       [ ] Port `sqlite3RenameTokenMap`
+       [ ] Port `sqlite3RenameExprUnmap` — needed for `PARSE_MODE_RENAME`
             (currently no-ops; OK in normal mode).
 
 - [ ] **7.1.8** ATTACH / DETACH (attach.c) — currently Phase 7 stubs
