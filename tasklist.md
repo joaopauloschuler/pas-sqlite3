@@ -85,8 +85,18 @@ Important: At the end of this document, please find:
             TestWhereBasic 52/0.
 
        Foreign keys (fkey.c):
-       [ ] `sqlite3FkRequired` — returns `0`; full FK-required decision
-            walking `pFKey` / parent-key change masks.
+       [X] `sqlite3FkRequired` — DELETE arm ported 2026-04-28
+            (codegen.pas).  Checks `db^.flags & SQLITE_ForeignKeys` +
+            `pTab^.eTabType = TABTYP_NORM`, returns 1 when
+            `sqlite3FkReferences(pTab) <> nil` or `pTab^.u.tab.pFKey <>
+            nil`.  UPDATE arm (fkChildIsModified / fkParentIsModified
+            walk) deferred — needs full TFKey record (PFKey is still
+            `Pointer` at codegen.pas:418).  Safe under current corpus:
+            no test enables PRAGMA foreign_keys, and FkCheck/FkActions
+            remain no-op stubs so an over-approximation here would not
+            emit real enforcement.  TestExplainParity 1016/10,
+            TestDMLBasic 54/0, TestSelectBasic 49/0, TestVdbeAgg 11/0,
+            TestBtreeCompat 337/0, DiagPubApi 138/0 — no regressions.
 
        Pragma (pragma.c):
        [ ] `sqlite3PragmaVtabRegister` — returns `nil`; registers

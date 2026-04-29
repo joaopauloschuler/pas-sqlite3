@@ -28678,10 +28678,34 @@ begin
   { Phase 7 }
 end;
 
+{ fkey.c:1145 — sqlite3FkRequired.  Returns non-zero if FK processing is
+  required for the DELETE/UPDATE on pTab.
+
+  Current scope: DELETE arm (aChange=nil) is fully ported.  UPDATE arm
+  requires per-FKey column-mask walks via fkChildIsModified /
+  fkParentIsModified, both of which need a fully-defined TFKey record
+  (TFKey is still PFKey = Pointer in this port — see codegen.pas:418).
+  Until TFKey lands, UPDATE returns 0 = "no FK action required".  Safe
+  because (a) PRAGMA foreign_keys defaults to OFF in the Pas port and
+  no current test enables it, and (b) sqlite3FkCheck/sqlite3FkActions
+  are still no-op stubs, so even an over-approximation here would not
+  emit real FK enforcement code. }
 function sqlite3FkRequired(pParse: PParse; pTab: PTable2;
   aChange: Pi32; chngRowid: i32): i32;
+var
+  bHaveFK: i32;
 begin
-  Result := 0;
+  bHaveFK := 0;
+  if ((pParse^.db^.flags and SQLITE_ForeignKeys) <> 0)
+     and (pTab <> nil) and (pTab^.eTabType = TABTYP_NORM) then
+  begin
+    if aChange = nil then begin
+      if (sqlite3FkReferences(pTab) <> nil) or (pTab^.u.tab.pFKey <> nil) then
+        bHaveFK := 1;
+    end;
+    { UPDATE arm deferred — see comment above. }
+  end;
+  if bHaveFK <> 0 then Result := 1 else Result := 0;
 end;
 
 procedure sqlite3FkDelete(db: PTsqlite3; pTab: PTable2);
