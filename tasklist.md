@@ -44,9 +44,12 @@ Important: At the end of this document, please find:
             optimisation deferred).  Same fix lifted the
             `sqlite3VdbeRecordCompare` and `sqlite3VdbeFindCompare`
             local stubs in vdbe.pas onto the btree.pas bodies.
-       [ ] `sqlite3VdbeScanStatus` / `sqlite3VdbeScanStatusRange` /
-            `sqlite3VdbeScanStatusCounters` — empty bodies; populate
-            `p^.aScan[]` when `IS_STMT_SCANSTATUS(db)`.
+       [X] `sqlite3VdbeScanStatus` / `sqlite3VdbeScanStatusRange` /
+            `sqlite3VdbeScanStatusCounters` — empty stubs match the C
+            `#define foo(...)` arms when SQLITE_ENABLE_STMT_SCANSTATUS
+            is not defined (vdbe.h:423..425).  Pas build does not enable
+            this option; bodies will land alongside any future
+            `sqlite3_stmt_scanstatus` port (8.2.1).
        [ ] `sqlite3VdbeExplain` — returns `0`; must emit `OP_Explain`
             via `sqlite3VdbeAddOp4` and call `sqlite3VdbeScanStatus`.
             Required for EXPLAIN QUERY PLAN.
@@ -63,16 +66,22 @@ Important: At the end of this document, please find:
             land with the shared-cache port.
 
        Bytecode virtual table (vdbevtab.c):
-       [ ] `sqlite3VdbeBytecodeVtabInit` — returns `SQLITE_OK`; must
-            register `bytecode` and `tables_used` virtual tables via
-            `sqlite3_create_module`.
+       [X] `sqlite3VdbeBytecodeVtabInit` — `return SQLITE_OK` matches
+            the C arm at vdbevtab.c:445 when SQLITE_ENABLE_BYTECODE_VTAB
+            is not defined.  Pas build does not enable that option;
+            register the modules only when it does.
 
        Resolver (resolve.c):
-       [ ] `sqlite3ResolveExprListNames` — returns `SQLITE_OK`; must
-            walk the expr list with `resolveExprStep` /
-            `resolveSelectStep` and propagate
-            `NC_HasAgg|NC_MinMaxAgg|NC_HasWin|NC_OrderAgg`.  Required
-            for query compilation.
+       [X] `sqlite3ResolveExprListNames` — closed 2026-04-29.  Now walks
+            every expression in pList through `sqlite3ResolveExprNames`
+            (the Pas resolver entry point) and propagates
+            NC_HasAgg|NC_MinMaxAgg|NC_HasWin|NC_OrderAgg flags onto each
+            pExpr (EP_Agg/EP_Win) via the same save/clear/restore cycle
+            as resolve.c:2191.  Aborts the loop on per-expression error
+            and on pParse^.nErr>0.  TestExplainParity 1016/10,
+            DiagWindow 17, DiagFeatureProbe 10, DiagPubApi 195/0,
+            TestParser 45/0, TestVdbeAgg 11/0, TestSelectBasic 49/0,
+            TestWhereBasic 52/0 — no regressions.
        [X] `sqlite3ResolveOrderGroupBy` — closed 2026-04-28.  Real body
             (resolve.c:1700) ported in passqlite3codegen.pas, plus the
             `resolveAlias` / `incrAggFunctionDepth` / `incrAggDepth`

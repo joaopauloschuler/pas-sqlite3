@@ -7172,9 +7172,57 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ sqlite3ResolveExprListNames — port of resolve.c:2191.
+  Walks every expression in pList through sqlite3ResolveExprNames,
+  propagating NC_HasAgg/HasWin/MinMaxAgg/OrderAgg flags onto each
+  pExpr (EP_Agg / EP_Win) the way the C body does.  The Pas resolver
+  is a structurally lighter walk than the C resolveExprStep walker,
+  but it shares the per-expression entry point — so iterating here
+  matches the C contract for the SrcList-bound resolution the Pas
+  port performs today. }
 function sqlite3ResolveExprListNames(pNC: PNameContext;
   pList: PExprList): i32;
+var
+  i:           i32;
+  savedHasAgg: i32;
+  curMask:     i32;
+  items:       PExprListItem;
+  pE2:         PExpr;
 begin
+  if pList = nil then begin Result := SQLITE_OK; Exit; end;
+  if pNC = nil then begin Result := SQLITE_OK; Exit; end;
+  savedHasAgg := pNC^.ncFlags and
+                   (NC_HasAgg or NC_MinMaxAgg or NC_HasWin or NC_OrderAgg);
+  pNC^.ncFlags := pNC^.ncFlags and not
+                   (NC_HasAgg or NC_MinMaxAgg or NC_HasWin or NC_OrderAgg);
+  items := ExprListItems(pList);
+  for i := 0 to pList^.nExpr - 1 do
+  begin
+    pE2 := items[i].pExpr;
+    if pE2 = nil then continue;
+    if sqlite3ResolveExprNames(pNC, pE2) <> SQLITE_OK then
+    begin
+      pNC^.ncFlags := pNC^.ncFlags or savedHasAgg;
+      Result := SQLITE_ERROR; Exit;
+    end;
+    curMask := pNC^.ncFlags and
+                 (NC_HasAgg or NC_MinMaxAgg or NC_HasWin or NC_OrderAgg);
+    if curMask <> 0 then
+    begin
+      { EP_Agg = NC_HasAgg, EP_Win = NC_HasWin (C asserts these match). }
+      pE2^.flags := pE2^.flags or
+                    u32(curMask and (NC_HasAgg or NC_HasWin));
+      savedHasAgg := savedHasAgg or curMask;
+      pNC^.ncFlags := pNC^.ncFlags and not
+                        (NC_HasAgg or NC_MinMaxAgg or NC_HasWin or NC_OrderAgg);
+    end;
+    if (pNC^.pParse <> nil) and (pNC^.pParse^.nErr > 0) then
+    begin
+      pNC^.ncFlags := pNC^.ncFlags or savedHasAgg;
+      Result := SQLITE_ERROR; Exit;
+    end;
+  end;
+  pNC^.ncFlags := pNC^.ncFlags or savedHasAgg;
   Result := SQLITE_OK;
 end;
 
