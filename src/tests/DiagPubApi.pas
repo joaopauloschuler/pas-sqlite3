@@ -341,6 +341,28 @@ begin
   Check('stmt_busy after DONE = 0',    sqlite3_stmt_busy(pStmt) = 0);
   sqlite3_finalize(pStmt);
 
+  { Phase 8.2.1 — sqlite3_stmt_status. }
+  Check('stmt_status(nil) = 0', sqlite3_stmt_status(nil, 0, 0) = 0);
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT 1', -1, @pStmt, nil);
+  Check('stmt_status prepare', rcs = SQLITE_OK);
+  Check('stmt_status bad op = 0',
+        sqlite3_stmt_status(pStmt, -1, 0) = 0);
+  Check('stmt_status RUN fresh = 0',
+        sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_RUN, 0) = 0);
+  rcs := sqlite3_step(pStmt);
+  Check('stmt_status step ROW', rcs = SQLITE_ROW);
+  rcs := sqlite3_step(pStmt);
+  Check('stmt_status step DONE', rcs = SQLITE_DONE);
+  Check('stmt_status RUN after step >= 1',
+        sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_RUN, 0) >= 1);
+  Check('stmt_status VM_STEP after step >= 1',
+        sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_VM_STEP, 0) >= 1);
+  Check('stmt_status VM_STEP reset returns >=1 then 0',
+        (sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_VM_STEP, 1) >= 1)
+        and (sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_VM_STEP, 0) = 0));
+  sqlite3_finalize(pStmt);
+
   { Phase 8.2.1 — sqlite3_stmt_explain. }
   Check('stmt_explain(nil) = MISUSE', sqlite3_stmt_explain(nil, 0) = SQLITE_MISUSE);
   pStmt := nil;

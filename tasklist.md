@@ -737,7 +737,16 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             EXPLAIN modes, restored to nResAlloc on mode 0.  Misuse
             (nil pStmt → MISUSE) and bad-mode (eMode<0/>2 → ERROR)
             covered by DiagPubApi.
-       [ ] `sqlite3_stmt_status` — per-stmt counters.
+       [X] `sqlite3_stmt_status` — ported 2026-04-29 (passqlite3main.pas)
+            — verbatim port of vdbeapi.c:2106.  Returns v^.aCounter[op]
+            and optionally clears it; SQLITE_STMTSTATUS_MEMUSED runs
+            sqlite3VdbeDelete with db^.pnBytesFreed pointing at a local
+            counter (lookaside^.pEnd lowered to pStart for the duration)
+            so freed bytes accumulate into the result.  API-armor guards:
+            nil pStmt or out-of-range op => 0.  DiagPubApi extended with
+            9 cases (nil/bad-op guards, RUN/VM_STEP increment after step,
+            reset semantics); 240/0.  TestExplainParity 1016/10,
+            TestVdbeApi 57/0, TestParser 45/0 — no regressions.
        [ ] `sqlite3_stmt_scanstatus` / `_scanstatus_v2` /
             `_scanstatus_reset` — gated on the 6.8
             `sqlite3VdbeScanStatus*` arms landing first.

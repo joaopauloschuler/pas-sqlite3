@@ -411,6 +411,7 @@ function sqlite3_prepare16_v3(db: PTsqlite3; zSql: Pointer; nBytes: i32;
 function sqlite3_stmt_busy(pStmt: Pointer): i32; cdecl;
 function sqlite3_stmt_readonly(pStmt: Pointer): i32; cdecl;
 function sqlite3_stmt_explain(pStmt: Pointer; eMode: i32): i32; cdecl;
+function sqlite3_stmt_status(pStmt: Pointer; op, resetFlag: i32): i32; cdecl;
 
 function sqlite3_sleep(ms: i32): i32; cdecl;
 
@@ -3044,6 +3045,46 @@ begin
     Result := 1
   else
     Result := 0;
+end;
+
+{ vdbeapi.c:2106 — sqlite3_stmt_status.  Return (and optionally reset)
+  one of the per-stmt counters maintained in v^.aCounter[].  The
+  SQLITE_STMTSTATUS_MEMUSED branch reproduces the C trick of running
+  sqlite3VdbeDelete with db^.pnBytesFreed pointing at a local counter so
+  every freed allocation accumulates into v. }
+function sqlite3_stmt_status(pStmt: Pointer; op, resetFlag: i32): i32; cdecl;
+var
+  v: PVdbe;
+  db: PTsqlite3;
+  vCnt: u32;
+begin
+  if (pStmt = nil)
+     or ((op <> SQLITE_STMTSTATUS_MEMUSED)
+         and ((op < 0) or (op >= 9))) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  v := PVdbe(pStmt);
+  if op = SQLITE_STMTSTATUS_MEMUSED then
+  begin
+    db := PTsqlite3(v^.db);
+    sqlite3_mutex_enter(db^.mutex);
+    vCnt := 0;
+    db^.pnBytesFreed := Pi32(@vCnt);
+    db^.lookaside.pEnd := db^.lookaside.pStart;
+    sqlite3VdbeDelete(v);
+    db^.pnBytesFreed := nil;
+    db^.lookaside.pEnd := db^.lookaside.pTrueEnd;
+    sqlite3_mutex_leave(db^.mutex);
+  end
+  else
+  begin
+    vCnt := v^.aCounter[op];
+    if resetFlag <> 0 then
+      v^.aCounter[op] := 0;
+  end;
+  Result := i32(vCnt);
 end;
 
 { vdbeapi.c:2038 — sqlite3_stmt_explain.  Switch a prepared statement
