@@ -915,7 +915,17 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_compileoption_used` (ctime.c) — also gated on the
             6.10 step 12 task that touches the compile-options table.
        [ ] `sqlite3_test_control` — testing back-door (subset).
-       [ ] `sqlite3_file_control` — opcode dispatcher into VFS xFileControl.
+       [X] `sqlite3_file_control` — ported 2026-04-29 (passqlite3main.pas) —
+            verbatim port of main.c:4153.  Dispatches FILE_POINTER /
+            VFS_POINTER / JOURNAL_POINTER / DATA_VERSION / RESERVE_BYTES /
+            RESET_CACHE inline, falls through to sqlite3OsFileControl for
+            unknown opcodes.  Helpers added: sqlite3DbNameToBtree (main.c:4958)
+            in main.pas, sqlite3BtreeGetRequestedReserve (btree.c:3136) +
+            sqlite3BtreeClearCache (btree.c:11544) in btree.pas.  DiagPubApi
+            extended with 6 cases (FILE_POINTER on main, VFS_POINTER on
+            nil-name, unknown-schema → ERROR, nil-db → MISUSE) — 195/0.
+            TestExplainParity 1016/10, TestBtreeCompat 337/0, TestVdbeApi
+            57/0, TestSelectBasic 49/0, TestPager ALL PASS — no regressions.
        [X] `sqlite3_overload_function` — ported 2026-04-28
             (passqlite3main.pas).  No-op when sqlite3FindFunction already
             resolves; otherwise registers a stub via

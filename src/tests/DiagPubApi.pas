@@ -564,6 +564,22 @@ begin
           sqlite3_set_clientdata(db, 'kp', pA, @ClientDataDestrCb) = SQLITE_OK);
   end;
 
+  { sqlite3_file_control — opcode dispatch. }
+  begin
+    pA := nil;
+    Check('file_control FILE_POINTER on main',
+          sqlite3_file_control(db, 'main', SQLITE_FCNTL_FILE_POINTER, @pA) = SQLITE_OK);
+    Check('file_control FILE_POINTER returned non-nil', pA <> nil);
+    pA := nil;
+    Check('file_control VFS_POINTER on nil-name',
+          sqlite3_file_control(db, nil, SQLITE_FCNTL_VFS_POINTER, @pA) = SQLITE_OK);
+    Check('file_control VFS_POINTER returned non-nil', pA <> nil);
+    Check('file_control on unknown schema -> ERROR',
+          sqlite3_file_control(db, 'nosuch', SQLITE_FCNTL_FILE_POINTER, @pA) = SQLITE_ERROR);
+    Check('file_control nil-db -> MISUSE',
+          sqlite3_file_control(nil, nil, SQLITE_FCNTL_FILE_POINTER, @pA) = SQLITE_MISUSE);
+  end;
+
   rc := sqlite3_close(db);
   Check('close', rc = SQLITE_OK);
   Check('clientdata destrs fired on close', destrFires = 3);

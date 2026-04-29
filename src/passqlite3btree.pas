@@ -651,6 +651,12 @@ function  sqlite3BtreeSetPageSize(p: PBtree; iPageSize: i32;
 function  sqlite3BtreeTxnState(p: PBtree): i32;
 { btree.c:3257 — number of bytes of unused space at the end of every page. }
 function  sqlite3BtreeGetReserveNoMutex(p: PBtree): i32;
+{ btree.c:3136 — return the larger of the current reserve and the most
+  recently requested reserve.  Mutex-aware variant. }
+function  sqlite3BtreeGetRequestedReserve(p: PBtree): i32;
+{ btree.c:11544 — clear the in-memory pager cache when no transaction is
+  active and the database is not a temp-db. }
+procedure sqlite3BtreeClearCache(p: PBtree);
 { btree.c:7046 — set the database file format version (1 or 2 = WAL). }
 function  sqlite3BtreeSetVersion(p: PBtree; iVersion: i32): i32;
 
@@ -6887,6 +6893,26 @@ end;
 function sqlite3BtreeGetReserveNoMutex(p: PBtree): i32;
 begin
   Result := i32(p^.pBt^.pageSize - p^.pBt^.usableSize);
+end;
+
+{ btree.c:3136 }
+function sqlite3BtreeGetRequestedReserve(p: PBtree): i32;
+var n1, n2: i32;
+begin
+  sqlite3BtreeEnter(p);
+  n1 := i32(p^.pBt^.nReserveWanted);
+  n2 := sqlite3BtreeGetReserveNoMutex(p);
+  sqlite3BtreeLeave(p);
+  if n1 > n2 then Result := n1 else Result := n2;
+end;
+
+{ btree.c:11544 }
+procedure sqlite3BtreeClearCache(p: PBtree);
+var pBt: PBtShared;
+begin
+  pBt := p^.pBt;
+  if pBt^.inTransaction = TRANS_NONE then
+    sqlite3PagerClearCache(pBt^.pPager);
 end;
 
 { btree.c:7046 — set page-1 byte 18 (file-format-write) and byte 19

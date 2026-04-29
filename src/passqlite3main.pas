@@ -377,6 +377,8 @@ function sqlite3_get_autocommit(db: PTsqlite3): i32; cdecl;
 function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;
 function sqlite3_db_release_memory(db: PTsqlite3): i32; cdecl;
 function sqlite3_db_cacheflush(db: PTsqlite3): i32; cdecl;
+function sqlite3_file_control(db: PTsqlite3; zDbName: PAnsiChar; op: i32;
+                              pArg: Pointer): i32; cdecl;
 function sqlite3_txn_state(db: PTsqlite3; zSchema: PAnsiChar): i32; cdecl;
 function sqlite3_error_offset(db: PTsqlite3): i32; cdecl;
 function sqlite3_set_errmsg(db: PTsqlite3; errcode: i32; zMsg: PAnsiChar): i32; cdecl;
@@ -2897,6 +2899,77 @@ begin
     Result := SQLITE_BUSY
   else
     Result := rc;
+end;
+
+{ main.c:4958 — sqlite3DbNameToBtree.  Resolve a database name to its
+  Btree*, or nil if the name is unknown. }
+function sqlite3DbNameToBtree(db: PTsqlite3; zDbName: PAnsiChar): PBtree;
+var iDb: i32;
+begin
+  if zDbName <> nil then iDb := sqlite3FindDbName(db, zDbName)
+  else                   iDb := 0;
+  if iDb < 0 then Result := nil
+  else            Result := PBtree(db^.aDb[iDb].pBt);
+end;
+
+{ main.c:4153 — sqlite3_file_control.  Dispatch file-control opcodes to
+  the per-database pager / btree, falling through to the VFS xFileControl
+  for unknown opcodes. }
+function sqlite3_file_control(db: PTsqlite3; zDbName: PAnsiChar; op: i32;
+                              pArg: Pointer): i32; cdecl;
+var
+  rc:     i32;
+  pBt:    PBtree;
+  pPgr:   PPager;
+  fd:     Psqlite3_file;
+  iNew:   i32;
+  nSave:  i32;
+begin
+  rc := SQLITE_ERROR;
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  pBt := sqlite3DbNameToBtree(db, zDbName);
+  if pBt <> nil then begin
+    sqlite3BtreeEnter(pBt);
+    pPgr := sqlite3BtreePager(pBt);
+    fd   := sqlite3PagerFile(pPgr);
+    case op of
+      SQLITE_FCNTL_FILE_POINTER: begin
+        PPointer(pArg)^ := Pointer(fd);
+        rc := SQLITE_OK;
+      end;
+      SQLITE_FCNTL_VFS_POINTER: begin
+        PPointer(pArg)^ := Pointer(sqlite3PagerVfs(pPgr));
+        rc := SQLITE_OK;
+      end;
+      SQLITE_FCNTL_JOURNAL_POINTER: begin
+        PPointer(pArg)^ := Pointer(sqlite3PagerJrnlFile(pPgr));
+        rc := SQLITE_OK;
+      end;
+      SQLITE_FCNTL_DATA_VERSION: begin
+        Pu32(pArg)^ := sqlite3PagerDataVersion(pPgr);
+        rc := SQLITE_OK;
+      end;
+      SQLITE_FCNTL_RESERVE_BYTES: begin
+        iNew := Pi32(pArg)^;
+        Pi32(pArg)^ := sqlite3BtreeGetRequestedReserve(pBt);
+        if (iNew >= 0) and (iNew <= 255) then
+          sqlite3BtreeSetPageSize(pBt, 0, iNew, 0);
+        rc := SQLITE_OK;
+      end;
+      SQLITE_FCNTL_RESET_CACHE: begin
+        sqlite3BtreeClearCache(pBt);
+        rc := SQLITE_OK;
+      end;
+    else
+      nSave := db^.busyHandler.nBusy;
+      rc := sqlite3OsFileControl(fd, op, pArg);
+      db^.busyHandler.nBusy := nSave;
+    end;
+    sqlite3BtreeLeave(pBt);
+  end;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
 end;
 
 { Local case-sensitive C-string equality + length helpers.  Avoid pulling
