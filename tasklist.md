@@ -588,16 +588,25 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             stmt → RANGE, over-LENGTH → TOOBIG).  Round-trip via prepared
             statement closed 2026-04-28 — see "host-parameter binding"
             below.
-       [ ] `sqlite3_bind_pointer` — typed pointer bind.
+       [X] `sqlite3_bind_pointer` — ported 2026-04-28
+            (passqlite3vdbe.pas) — vdbeUnbind55 + sqlite3VdbeMemSetPointer;
+            mirrors C destructor-on-error contract.  Replaces the
+            sqlite3_value_pointer_stub in passqlite3carray.pas; carray
+            xFilter now consults the real typed-pointer Mem.
        [ ] `sqlite3_bind_parameter_index` — name → 1-based index.
 
 - [ ] **8.3.2** Result / value variants (vdbeapi.c, vdbemem.c):
        [ ] `sqlite3_result_blob64`.
        [ ] `sqlite3_result_text16` / `_text16be` / `_text16le`.
        [ ] `sqlite3_result_error16` — UTF-16 error string.
-       [ ] `sqlite3_result_error_code` — set rc without msg.
-       [ ] `sqlite3_result_pointer` — typed pointer result.
-       [ ] `sqlite3_result_zeroblob`.
+       [X] `sqlite3_result_error_code` — ported 2026-04-28
+            (passqlite3vdbe.pas) — sets `pCtx^.isError`, falls back to
+            sqlite3ErrStr on MEM_Null Mem.
+       [X] `sqlite3_result_pointer` — ported 2026-04-28
+            (passqlite3vdbe.pas) — sqlite3VdbeMemRelease + SetPointer.
+       [X] `sqlite3_result_zeroblob` — ported 2026-04-28
+            (passqlite3vdbe.pas) — int wrapper around _zeroblob64,
+            mapping negative n to 0 per C.
        [ ] `sqlite3_value_bytes16`.
        [X] `sqlite3_value_encoding` — ported 2026-04-28 (passqlite3vdbe.pas)
             returns `pVal^.enc`; UTF8 for nil. Covered by DiagPubApi.

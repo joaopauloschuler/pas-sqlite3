@@ -273,16 +273,6 @@ begin
   if pCur^.iRowid > pCur^.iCnt then Result := 1 else Result := 0;
 end;
 
-{ Forward stub for sqlite3_value_pointer — not yet ported (recurring
-  blocker tracked in 6.bis.2a notes).  Returns nil so xFilter's bind
-  branch and 2/3-arg pointer extraction degrade to "empty table"
-  rather than crash. }
-function sqlite3_value_pointer_stub(pVal: Psqlite3_value;
-  zType: PAnsiChar): Pointer;
-begin
-  Result := nil;
-end;
-
 { Phase 6.bis follow-up (2026-04-26): unknown-datatype error path now
   delegates to the shared sqlite3VtabFmtMsg1Libc helper in passqlite3vtab. }
 
@@ -302,7 +292,7 @@ begin
   pCur^.iCnt := 0;
   case idxNum of
     1: begin
-      pBind := PCarrayBind(sqlite3_value_pointer_stub(argv[0], 'carray-bind'));
+      pBind := PCarrayBind(sqlite3_value_pointer(argv[0], 'carray-bind'));
       if pBind <> nil then begin
         pCur^.pPtr  := pBind^.aData;
         pCur^.iCnt  := pBind^.nData;
@@ -310,7 +300,7 @@ begin
       end;
     end;
     2, 3: begin
-      pCur^.pPtr := sqlite3_value_pointer_stub(argv[0], 'carray');
+      pCur^.pPtr := sqlite3_value_pointer(argv[0], 'carray');
       if pCur^.pPtr <> nil then
         pCur^.iCnt := sqlite3_value_int64(argv[1])
       else

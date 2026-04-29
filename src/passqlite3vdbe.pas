@@ -1549,6 +1549,7 @@ function sqlite3_value_text(pVal: Psqlite3_value): PAnsiChar;
 function sqlite3_value_blob(pVal: Psqlite3_value): Pointer;
 function sqlite3_value_bytes(pVal: Psqlite3_value): i32;
 function sqlite3_value_subtype(pVal: Psqlite3_value): u32;
+function sqlite3_value_pointer(pVal: Psqlite3_value; zPType: PAnsiChar): Pointer;
 function sqlite3_value_dup(pOrig: Psqlite3_value): Psqlite3_value;
 procedure sqlite3_value_free(pOld: Psqlite3_value);
 function sqlite3_value_nochange(pVal: Psqlite3_value): i32;
@@ -1580,6 +1581,8 @@ function sqlite3_bind_blob(pStmt: PVdbe; i: i32; zData: Pointer;
                            nData: i32; xDel: TxDelProc): i32;
 function sqlite3_bind_zeroblob(pStmt: PVdbe; i: i32; n: i32): i32;
 function sqlite3_bind_zeroblob64(pStmt: PVdbe; i: i32; n: u64): i32;
+function sqlite3_bind_pointer(pStmt: PVdbe; i: i32; pPtr: Pointer;
+                              zPType: PAnsiChar; xDestructor: TxDelProc): i32;
 function sqlite3_bind_value(pStmt: PVdbe; i: i32;
                             pValue: Psqlite3_value): i32;
 function sqlite3_bind_parameter_count(pStmt: PVdbe): i32;
@@ -1597,6 +1600,10 @@ procedure sqlite3_result_value(pCtx: Psqlite3_context; pVal: Psqlite3_value);
 procedure sqlite3_result_error(pCtx: Psqlite3_context; z: PAnsiChar; n: i32);
 procedure sqlite3_result_error_nomem(pCtx: Psqlite3_context);
 procedure sqlite3_result_error_toobig(pCtx: Psqlite3_context);
+procedure sqlite3_result_error_code(pCtx: Psqlite3_context; errCode: i32);
+procedure sqlite3_result_pointer(pCtx: Psqlite3_context; pPtr: Pointer;
+                                 zPType: PAnsiChar; xDestructor: TxDelProc);
+procedure sqlite3_result_zeroblob(pCtx: Psqlite3_context; n: i32);
 function  sqlite3_result_zeroblob64(pCtx: Psqlite3_context; n: u64): i32;
 function  sqlite3_aggregate_context(pCtx: Psqlite3_context;
   nByte: i32): Pointer;
@@ -3932,6 +3939,29 @@ begin
   else Result := 0;
 end;
 
+{ vdbeapi.c:214 — sqlite3_value_pointer.
+  A typed-pointer Mem is encoded as MEM_Null|MEM_Term|MEM_Subtype with
+  eSubtype='p'.  zPType must match the tag stored in u.zPType (strict
+  strcmp, not stricmp) — used to enforce type-correctness of typed-
+  pointer bindings (vtab IN-helpers, carray, etc.). }
+function sqlite3_value_pointer(pVal: Psqlite3_value; zPType: PAnsiChar): Pointer;
+const
+  MASK = MEM_TypeMask or MEM_Term or MEM_Subtype;
+  WANT = MEM_Null or MEM_Term or MEM_Subtype;
+var
+  pa, pb: PAnsiChar;
+begin
+  Result := nil;
+  if (pVal = nil) or (zPType = nil) then Exit;
+  if (pVal^.flags and MASK) <> WANT then Exit;
+  if pVal^.eSubtype <> Ord('p') then Exit;
+  pa := pVal^.u.zPType;
+  if pa = nil then Exit;
+  pb := zPType;
+  while (pa^ <> #0) and (pa^ = pb^) do begin Inc(pa); Inc(pb); end;
+  if pa^ = pb^ then Result := pVal^.z;
+end;
+
 function sqlite3_value_dup(pOrig: Psqlite3_value): Psqlite3_value;
 var
   pNew: Psqlite3_value;
@@ -4204,6 +4234,23 @@ begin
     Result := sqlite3_bind_zeroblob(pStmt, i, i32(n));
 end;
 
+{ vdbeapi.c:1806 — sqlite3_bind_pointer.
+  Bind a typed pointer to the i'th host parameter.  vdbeUnbind55
+  validates pStmt and i; on validation failure the destructor (if any)
+  is invoked with pPtr to release ownership, mirroring the C body. }
+function sqlite3_bind_pointer(pStmt: PVdbe; i: i32; pPtr: Pointer;
+                              zPType: PAnsiChar; xDestructor: TxDelProc): i32;
+var
+  rc: i32;
+begin
+  rc := vdbeUnbind55(pStmt, u32(i - 1));
+  if rc = SQLITE_OK then
+    sqlite3VdbeMemSetPointer(pStmt^.aVar + (i - 1), pPtr, zPType, xDestructor)
+  else if Assigned(xDestructor) then
+    xDestructor(pPtr);
+  Result := rc;
+end;
+
 function sqlite3_bind_value(pStmt: PVdbe; i: i32;
                             pValue: Psqlite3_value): i32;
 begin
@@ -4377,6 +4424,44 @@ begin
   end;
   sqlite3VdbeMemSetZeroBlob(pCtx^.pOut, i32(n));
   Result := SQLITE_OK;
+end;
+
+{ vdbeapi.c:662 — sqlite3_result_zeroblob.  Negative n maps to 0 per C. }
+procedure sqlite3_result_zeroblob(pCtx: Psqlite3_context; n: i32);
+begin
+  if n > 0 then
+    sqlite3_result_zeroblob64(pCtx, u64(n))
+  else
+    sqlite3_result_zeroblob64(pCtx, 0);
+end;
+
+{ vdbeapi.c:684 — sqlite3_result_error_code.  Sets isError without
+  changing the result Mem; errCode=0 maps to -1 to keep isError truthy. }
+procedure sqlite3_result_error_code(pCtx: Psqlite3_context; errCode: i32);
+begin
+  if pCtx = nil then Exit;
+  if errCode <> 0 then pCtx^.isError := errCode
+  else pCtx^.isError := -1;
+  if (pCtx^.pOut^.flags and MEM_Null) <> 0 then
+    sqlite3VdbeMemSetStr(pCtx^.pOut, sqlite3ErrStr(errCode), -1,
+                         SQLITE_UTF8, SQLITE_STATIC);
+end;
+
+{ vdbeapi.c:533 — sqlite3_result_pointer.  Encode a typed pointer in
+  pCtx^.pOut as MEM_Null|MEM_Term|MEM_Subtype with eSubtype='p'. }
+procedure sqlite3_result_pointer(pCtx: Psqlite3_context; pPtr: Pointer;
+                                 zPType: PAnsiChar; xDestructor: TxDelProc);
+var
+  pOut: PMem;
+begin
+  if pCtx = nil then begin
+    if Assigned(xDestructor) then xDestructor(pPtr);
+    Exit;
+  end;
+  pOut := pCtx^.pOut;
+  sqlite3VdbeMemRelease(pOut);
+  pOut^.flags := MEM_Null;
+  sqlite3VdbeMemSetPointer(pOut, pPtr, zPType, xDestructor);
 end;
 
 function sqlite3_aggregate_context(pCtx: Psqlite3_context;
