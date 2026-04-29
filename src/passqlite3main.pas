@@ -235,6 +235,9 @@ type
   pErr is nil, so this is byte-correct for that path. }
 function sqlite3_errmsg(db: PTsqlite3): PAnsiChar;
 
+{ sqlite3_errmsg16 — UTF-16 form of sqlite3_errmsg (main.c:2775). }
+function sqlite3_errmsg16(db: PTsqlite3): Pointer;
+
 function sqlite3_exec(db: PTsqlite3; zSql: PAnsiChar;
                       xCallback: Tsqlite3_callback; pArg: Pointer;
                       pzErrMsg: PPAnsiChar): i32;
@@ -1891,6 +1894,54 @@ begin
     z := PAnsiChar(sqlite3_value_text(Psqlite3_value(db^.pErr)));
   if z = nil then
     z := sqlite3ErrStr(db^.errCode);
+  Result := z;
+end;
+
+{ Port of main.c:2775 sqlite3_errmsg16 — UTF-16 form.  Reads the per-
+  connection sqlite3_value pErr via sqlite3_value_text16; on the static
+  out-of-memory / misuse paths, returns hardcoded UTF-16 strings to
+  match the C oracle byte-for-byte. }
+const
+  c_errmsg16_oom: array[0..13] of u16 = (
+    Ord('o'), Ord('u'), Ord('t'), Ord(' '),
+    Ord('o'), Ord('f'), Ord(' '),
+    Ord('m'), Ord('e'), Ord('m'), Ord('o'), Ord('r'), Ord('y'), 0);
+  c_errmsg16_misuse: array[0..33] of u16 = (
+    Ord('b'), Ord('a'), Ord('d'), Ord(' '),
+    Ord('p'), Ord('a'), Ord('r'), Ord('a'), Ord('m'), Ord('e'), Ord('t'), Ord('e'), Ord('r'), Ord(' '),
+    Ord('o'), Ord('r'), Ord(' '),
+    Ord('o'), Ord('t'), Ord('h'), Ord('e'), Ord('r'), Ord(' '),
+    Ord('A'), Ord('P'), Ord('I'), Ord(' '),
+    Ord('m'), Ord('i'), Ord('s'), Ord('u'), Ord('s'), Ord('e'), 0);
+
+function sqlite3_errmsg16(db: PTsqlite3): Pointer;
+var
+  z: Pointer;
+begin
+  if db = nil then begin
+    Result := @c_errmsg16_oom;
+    Exit;
+  end;
+  if sqlite3SafetyCheckSickOrOk(db) = 0 then begin
+    Result := @c_errmsg16_misuse;
+    Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  if db^.mallocFailed <> 0 then
+    z := @c_errmsg16_oom
+  else begin
+    z := sqlite3_value_text16(Psqlite3_value(db^.pErr));
+    if z = nil then begin
+      sqlite3ErrorWithMsg(db, db^.errCode, sqlite3ErrStr(db^.errCode));
+      z := sqlite3_value_text16(Psqlite3_value(db^.pErr));
+    end;
+    { Mirror sqlite3OomClear (malloc.c:854) inline: clear mallocFailed if
+      set during sqlite3_value_text16 above so the error path does not
+      leave the connection sticky. }
+    if (db^.mallocFailed <> 0) and (db^.nVdbeExec = 0) then
+      db^.mallocFailed := 0;
+  end;
+  sqlite3_mutex_leave(db^.mutex);
   Result := z;
 end;
 

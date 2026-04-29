@@ -42,8 +42,7 @@ Important: At the end of this document, please find:
     - [ ] `sqlite3VdbeFindCompare`
     - [ ] **b)** Collation-aware string compare (vdbeCompareMemString
       hook from btree.pas → vdbe.pas) — required only for non-BINARY
-      collated index lookups; current corpus has none.  Defer until
-      a test needs it.
+      collated index lookups;
     - [ ] **c)** TUnpackedRecord layout reconcile (btree's slim record
       vs. codegen's full record) for errCode/aSortFlags/BIGNULL/DESC
       arms.  Existing slim layout is the lowest common denominator and
@@ -424,54 +423,6 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        (main.c, status.c):
        [ ] `sqlite3_test_control` — testing back-door (subset).
 
-- [X] **8.2.2** Column-metadata public APIs
-       (`SQLITE_ENABLE_COLUMN_METADATA`).  Ported 2026-04-29 in
-       passqlite3vdbe.pas as one-line wrappers around the existing
-       `columnName` helper (vdbeapi.c:1485): `sqlite3_column_database_name`,
-       `_database_name16`, `_table_name`, `_table_name16`, `_origin_name`,
-       `_origin_name16`.  The COLNAME_DATABASE/_TABLE/_COLUMN aColName
-       slots are populated at codegen time by sqlite3VdbeSetColName, so
-       these wrappers are productive end-to-end for callers that need
-       column-source introspection.
-
-- [X] **8.4.2** Deprecated public-API surface (one-liners that are
-       part of `sqlite.h.in` but `SQLITE_OMIT_DEPRECATED`-gated upstream).
-       Ported 2026-04-29 in passqlite3vdbe.pas:
-       `sqlite3_expired` (vdbeapi.c:29 — reads VDBF_EXPIRED_MASK out of
-       vdbeFlags since `expired` is a 2-bit field on the Pas side),
-       `sqlite3_aggregate_count` (vdbeapi.c:1257 — returns pCtx^.pMem^.n),
-       `sqlite3_transfer_bindings` (vdbeapi.c:1991 — inlines the aVar
-       MemMove loop because the underlying sqlite3TransferBindings lives
-       in passqlite3codegen which would create a uses-cycle).
-       Extended 2026-04-29 in passqlite3main.pas with the deprecated
-       trace/profile/recover/cleanup/memory_alarm group: `sqlite3_trace`
-       (main.c:2256 — installs trace.xLegacy + SQLITE_TRACE_LEGACY mTrace
-       bit), `sqlite3_profile` (main.c:2307 — keeps legacy xProfile slot
-       and toggles SQLITE_TRACE_XPROFILE / clears NONLEGACY mask),
-       `sqlite3_global_recover` (main.c:3925 — anachronism, SQLITE_OK),
-       `sqlite3_thread_cleanup` (main.c:4001 — no-op), `sqlite3_memory_alarm`
-       (malloc.c:72 — superseded by sqlite3_soft_heap_limit64).  Added
-       SQLITE_TRACE_XPROFILE = $80 and SQLITE_TRACE_NONLEGACY_MASK = $0F
-       to passqlite3util.pas (sqliteInt.h:1646/:1651).
-
-- [X] **8.8.1** Pre-update hook public-API stubs (preupdate.c —
-       `SQLITE_ENABLE_PREUPDATE_HOOK`).  Ported 2026-04-29 in
-       passqlite3main.pas: `sqlite3_preupdate_hook` returns nil
-       (no callback storage), `_count` / `_depth` return 0,
-       `_blobwrite` returns -1, `_new` / `_old` return SQLITE_MISUSE
-       with `*ppValue := nil`.  Faithful to the
-       SQLITE_ENABLE_API_ARMOR / `db->pPreUpdate==NULL` arms in
-       vdbeapi.c:2209..2400.  Full preupdate machinery (PreUpdate
-       record, BTree column-payload unpack) stays unported.
-
-- [X] **8.x** `sqlite3_create_filename` (main.c:4821) — ported 2026-04-29
-       in passqlite3util.pas alongside the existing `sqlite3_free_filename`,
-       `sqlite3_filename_database/_journal/_wal`, `sqlite3_uri_*` family.
-       Builds the 4-byte-prefixed key/value buffer expected by databaseName /
-       uriParameter.  Byte-parity with the C reference verified against
-       libsqlite3.so on a 56-byte (`mydb`+2 params+`mydb-journal`+`mydb-wal`)
-       fixture.
-
 - [ ] **8.9.1** Vtab helper APIs (vtab.c, vdbeapi.c):
        [ ] `sqlite3_vtab_distinct` — query-planner DISTINCT hint.
        [ ] `sqlite3_vtab_in` — IN-operator iterator-mode toggle (gated on
@@ -479,6 +430,17 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_vtab_rhs_value` — extract RHS value of a constraint.
 
 - [ ] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind).
+
+- [X] **8.x** `sqlite3_errmsg16` (main.c:2775) — ported 2026-04-29 in
+       passqlite3main.pas alongside the existing `sqlite3_errmsg`.
+       Faithful UTF-16 sibling: returns the static UTF-16 "out of
+       memory" / "bad parameter or other API misuse" buffers on the
+       error paths and routes through `sqlite3_value_text16(db^.pErr)`
+       when a per-connection error value is set; inlines the
+       `sqlite3OomClear` post-condition (malloc.c:854) since that
+       helper has no separate Pas port.  Differential probe
+       `src/tests/DiagErrMsg16.pas` confirms parity on nil-db /
+       clean-db / parse-error.
 
 - [ ] **8.10** Public-API sample-program gate.  Pascal
   transliterations of the sample programs in `../sqlite3/src/shell.c.in`
