@@ -739,6 +739,11 @@ function sqlite3GetBoolean(z: PChar; dflt: u8): u8;
 function sqlite3_uri_parameter(zFilename: PChar; zParam: PChar): PChar;
 function sqlite3_uri_boolean(zFilename: PChar; zParam: PChar; bDflt: i32): i32;
 function sqlite3_uri_int64(zFilename: PChar; zParam: PChar; bDflt: i64): i64;
+function sqlite3_uri_key(zFilename: PChar; N: i32): PChar;
+function sqlite3_filename_database(zFilename: PChar): PChar;
+function sqlite3_filename_journal(zFilename: PChar): PChar;
+function sqlite3_filename_wal(zFilename: PChar): PChar;
+procedure sqlite3_free_filename(p: PChar);
 function sqlite3Atoi(z: PChar): i32;
 
 { Alignment helpers (used by pcache and btree) }
@@ -2729,6 +2734,59 @@ begin
     Result := v
   else
     Result := bDflt;
+end;
+
+{ main.c ~4884: sqlite3_uri_key }
+function sqlite3_uri_key(zFilename: PChar; N: i32): PChar;
+begin
+  if (zFilename = nil) or (N < 0) then Exit(nil);
+  zFilename := databaseName(zFilename);
+  zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+  while (zFilename <> nil) and (zFilename[0] <> #0) and (N > 0) do
+  begin
+    Dec(N);
+    zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+    zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+  end;
+  if zFilename[0] <> #0 then Result := zFilename else Result := nil;
+end;
+
+{ main.c ~4930: sqlite3_filename_database }
+function sqlite3_filename_database(zFilename: PChar): PChar;
+begin
+  if zFilename = nil then Exit(nil);
+  Result := databaseName(zFilename);
+end;
+
+{ main.c ~4934: sqlite3_filename_journal }
+function sqlite3_filename_journal(zFilename: PChar): PChar;
+begin
+  if zFilename = nil then Exit(nil);
+  zFilename := databaseName(zFilename);
+  zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+  while (zFilename <> nil) and (zFilename[0] <> #0) do
+  begin
+    zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+    zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+  end;
+  Result := zFilename + 1;
+end;
+
+{ main.c ~4944: sqlite3_filename_wal — non-OMIT_WAL arm only. }
+function sqlite3_filename_wal(zFilename: PChar): PChar;
+begin
+  zFilename := sqlite3_filename_journal(zFilename);
+  if zFilename <> nil then
+    zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+  Result := zFilename;
+end;
+
+{ main.c ~4857: sqlite3_free_filename — pair of sqlite3_create_filename. }
+procedure sqlite3_free_filename(p: PChar);
+begin
+  if p = nil then Exit;
+  p := databaseName(p);
+  sqlite3_free(p - 4);
 end;
 
 { util.c ~1357: sqlite3Atoi -- parse integer from string }

@@ -549,8 +549,12 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             return as in the C body.
        [ ] `sqlite3_db_config` — raw varargs entry point (currently only
             typed wrappers `_text`/`_lookaside`/`_int` exist).
-       [ ] `sqlite3_filename` / `sqlite3_free_filename` — VFS filename
-            helpers.
+       [X] `sqlite3_filename_database` / `_journal` / `_wal` /
+            `sqlite3_free_filename` / `sqlite3_uri_key` — ported
+            2026-04-28 (passqlite3util.pas) — verbatim ports of
+            main.c:4857..4953; reuse existing databaseName +
+            sqlite3Strlen30 helpers.  Runtime smoke deferred until
+            `sqlite3_create_filename` lands (no buffer producer yet).
        [ ] `sqlite3_set_clientdata` — typed pointer slots on the db.
 
 - [ ] **8.2.1** Statement-introspection gaps (vdbeapi.c):
