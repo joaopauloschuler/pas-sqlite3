@@ -315,17 +315,9 @@ Important: At the end of this document, please find:
       by the new `src/tests/DiagWindow.pas` probe (run with
       `LD_LIBRARY_PATH=$PWD/src bin/DiagWindow`).  19 divergences open;
       most fold into existing window/agg tasks.
-      [X] **a) `max(val) FROM g` returns `0.0` instead of `5`** —
-        closed 2026-04-28.  Root cause: minStep/maxStep checked
-        `(pAgg^.flags and MEM_Null) <> 0` for "first call init", but
-        sqlite3_aggregate_context zero-inits the Mem so flags=0
-        (MEM_Null bit unset).  min worked only by accident — the
-        number-vs-flag-0 fallback in sqlite3MemCompare returns -1,
-        which made `<0` true and copied argv on call 1.  max's `>0`
-        was never true, so the accumulator stayed zero forever and
-        minMaxFinal returned the default REAL 0.0.  Fix: faithful
-        port of func.c:2090 minmaxStep — `if pAgg^.flags = 0` for
-        the init branch (also seeds pAgg^.db).
+      [X] **a) `max(val) FROM g` returns `0.0`** — closed 2026-04-28.
+        minmaxStep's init branch must use `if pAgg^.flags = 0`, not
+        `MEM_Null` flag (sqlite3_aggregate_context zero-inits Mem).
       [ ] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** — the
         ORDER-BY-in-aggregate arm is not honoured; the unordered
         variant `group_concat(val,',')` PASSes.  Tracked under 6.24
@@ -353,21 +345,30 @@ Important: At the end of this document, please find:
         rows.  Likely shares root cause with (g) — agg-with-trailing-
         clauses gate at codegen.pas:18968.
 
-  [X] **6.10 step 18** TestAuthBuiltins regression closed 2026-04-28
-      (34/0).  Root cause: each `Init*Funcs` (InitDateFuncs,
-      InitBuiltinFuncs, InitBuiltinAgg, InitWindowFuncs, JSON
-      registration) FillChars its module-static TFuncDef array on every
-      call, zeroing the `.u` bucket-chain link that
-      sqlite3InsertBuiltinFuncs writes on first registration.  The test
-      calls sqlite3RegisterDateTimeFunctions a second time after
-      sqlite3RegisterBuiltinFunctions had already invoked it
-      transitively → InitDateFuncs FillChar set date.u to nil,
-      orphaning every entry sharing date's bucket head (count/0 in
-      bucket 12; abs / octet_length in bucket 8 via strftime).
-      sqlite3FunctionSearch then walked only the new head and returned
-      nil for `abs`/`count`.  Fix: guard each `sqlite3Register*Functions`
-      (Builtin / DateTime / Json / Window) with a one-shot `done` flag
-      in passqlite3codegen.pas.  TestExplainParity 1016/10 unchanged.
+  [X] **6.10 step 18** TestAuthBuiltins 34/0 closed 2026-04-28 — guard
+      each `sqlite3Register*Functions` (Builtin/DateTime/Json/Window)
+      with a one-shot `done` flag so re-entry doesn't FillChar
+      module-static TFuncDef arrays and orphan bucket-chain links.
+
+  [ ] **6.10 step 19** DiagDml runtime probe (added 2026-04-28,
+      `src/tests/DiagDml.pas`, run `LD_LIBRARY_PATH=$PWD/src bin/DiagDml`).
+      Sweep of UPSERT / RETURNING / INSERT-FROM-SELECT / UPDATE-FROM /
+      column-reorder / DEFAULT-expr / multi-row-VALUES variants.  12 PASS,
+      2 DIVERGE — surprises noted below; UPSERT (DO NOTHING + DO UPDATE +
+      excluded.b), RETURNING (INSERT/UPDATE/DELETE), INSERT INTO d SELECT
+      * FROM s, UPDATE...FROM, column-reorder all already PASS.
+      [ ] **a) `INSERT INTO t SELECT 1,2 UNION ALL SELECT 3,4`** —
+        Pas inserts 0 rows, C inserts 2.  Compound-SELECT-as-INSERT-source
+        gap; folds into 6.10 step 6 (sqlite3Insert pSelect early-exit at
+        codegen.pas:19756) + step 9(e) (compound-SELECT codegen).
+      [ ] **b) Multi-row VALUES with non-constant exprs** —
+        `INSERT INTO t VALUES(1,1+1),(2,2*2),(3,3+3)`: Pas count=1,
+        C count=3.  Distinct from the constant variant logged in
+        step 6 because non-constant rows force the C UNION-ALL fallback
+        path in `sqlite3MultiValues` (insert.c:679 condition (c)) — the
+        coroutine path is bypassed.  Closing requires the UNION-ALL arm of
+        `sqlite3MultiValues` (codegen.pas:21268) plus sqlite3Insert pSelect
+        path (same codegen.pas:19756 TODO).
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
