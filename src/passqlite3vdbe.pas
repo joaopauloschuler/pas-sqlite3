@@ -3047,11 +3047,257 @@ begin
   if onError = OE_Abort then sqlite3VdbeAddOp0(p, OP_Abortable);
 end;
 
-{ --- Display helpers (stubs — full implementation Phase 5.8 vdbetrace.c) --- }
+{ --- Display helpers --- }
+
+{ Phase 6.21 port — vdbeaux.c:1740 sqlite3VdbeDisplayComment.
+
+  Renders the EXPLAIN "comment" column for a single VDBE opcode.  The C
+  reference is gated on SQLITE_ENABLE_EXPLAIN_COMMENTS (which the oracle
+  build at src/tests/build.sh:53 enables); this port produces the same
+  synopsis-driven text so EXPLAIN output can be diffed against the C
+  reference once TestExplainParity expands its scope to include the
+  comment column (currently restricted to (op,p1,p2,p3,p5)).
+
+  The synopsis text is stored in a separate per-opcode table
+  (vdbeOpcodeSynopsis below) instead of being embedded in the opcode
+  name like in the C `opcodes.c` generated file — Pascal string-literal
+  arrays have no clean syntax for embedded NULs, and lookup tables of
+  192 entries are tractable enough on their own.
+
+  pOp^.zComment (the comment field carried by each opcode at codegen
+  time) is not present on the Pas TVdbeOp record (no SQLITE_DEBUG-style
+  per-instruction comments wired yet), so the zComment branches are
+  short-circuited.  When such a field is added, the corresponding
+  branches can simply be re-enabled. }
+function vdbeOpcodeSynopsis(op: i32): PAnsiChar;
+const Syn: array[0..191] of PAnsiChar = (
+  '', '', '', '', '', '',
+  'iplan=r[P3] zplan=''P4''',
+  'data=r[P3@P2]',
+  'Start at P2',
+  '', '', '', '', '', '', '', '', '',
+  'if typeof(P1.P3) in P5 goto P2',
+  'r[P2]= !r[P1]',
+  'if P1.nullRow then r[P3]=NULL, goto P2',
+  'key=r[P3@P4]', 'key=r[P3@P4]', 'key=r[P3@P4]', 'key=r[P3@P4]',
+  'if( !csr[P1] ) goto P2',
+  'key=r[P3@P4]', 'key=r[P3@P4]', 'key=r[P3@P4]', 'key=r[P3@P4]',
+  'intkey=r[P3]', 'intkey=r[P3]',
+  '', '', '', '', '',
+  'if( empty(P1) ) goto P2',
+  '', '', '',
+  'key=r[P3@P4]', 'key=r[P3@P4]',
+  'r[P3]=(r[P1] || r[P2])',
+  'r[P3]=(r[P1] && r[P2])',
+  'key=r[P3@P4]', 'key=r[P3@P4]',
+  '',
+  'r[P3]=rowset(P1)',
+  'if r[P3] in rowset(P1) goto P2',
+  '',
+  'if r[P1]==NULL goto P2',
+  'if r[P1]!=NULL goto P2',
+  'IF r[P3]!=r[P1]', 'IF r[P3]==r[P1]', 'IF r[P3]>r[P1]',
+  'IF r[P3]<=r[P1]', 'IF r[P3]<r[P1]', 'IF r[P3]>=r[P1]',
+  '',
+  'if fkctr[P1]==0 goto P2',
+  'if r[P1]>0 then r[P1]-=P3, goto P2',
+  'if r[P1]!=0 then r[P1]--, goto P2',
+  'if (--r[P1])==0 goto P2',
+  '', '',
+  'if key(P3@P4) not in filter(P1) goto P2',
+  'r[P3]=func(r[P2@NP])', 'r[P3]=func(r[P2@NP])',
+  '', '',
+  'if r[P3]=null halt',
+  '',
+  'r[P2]=P1', 'r[P2]=P4',
+  'r[P2]=''P4'' (len=P1)',
+  'r[P2]=NULL', 'r[P2..P3]=NULL', 'r[P1]=NULL',
+  'r[P2]=P4 (len=P1)',
+  'r[P2]=parameter(P1)',
+  'r[P2@P3]=r[P1@P3]', 'r[P2@P3+1]=r[P1@P3+1]',
+  'r[P2]=r[P1]', 'r[P2]=r[P1]',
+  '',
+  'output=r[P1@P2]',
+  '',
+  'r[P1]=r[P1]+P2',
+  '',
+  'affinity(r[P1])',
+  '',
+  'r[P1@P3] <-> r[P2@P3]',
+  'r[P2] = coalesce(r[P1]==TRUE,P3) ^ P4',
+  'r[P2] = 0 OR NULL',
+  'r[P3] = sqlite_offset(P1)',
+  'r[P3]=PX cursor P1 column P2',
+  'typecheck(r[P1@P2])',
+  'affinity(r[P1@P2])',
+  'r[P3]=mkrec(r[P1@P2])',
+  'r[P2]=count()',
+  '', '',
+  'r[P3]=r[P1]&r[P2]', 'r[P3]=r[P1]|r[P2]',
+  'r[P3]=r[P2]<<r[P1]', 'r[P3]=r[P2]>>r[P1]',
+  'r[P3]=r[P1]+r[P2]', 'r[P3]=r[P2]-r[P1]',
+  'r[P3]=r[P1]*r[P2]', 'r[P3]=r[P2]/r[P1]',
+  'r[P3]=r[P2]%r[P1]', 'r[P3]=r[P2]+r[P1]',
+  'root=P2 iDb=P3', 'root=P2 iDb=P3',
+  'r[P2]= ~r[P1]',
+  'root=P2 iDb=P3',
+  '',
+  'r[P2]=''P4''',
+  'nColumn=P2', 'nColumn=P2',
+  '',
+  'if( cursor[P1].ctr++ ) pc = P2',
+  'P3 columns in r[P2]',
+  '', '',
+  'Scan-ahead up to P1 rows',
+  'set P2<=seekHit<=P3',
+  'r[P2]=cursor[P1].ctr++',
+  'r[P2]=rowid',
+  'intkey=r[P3] data=r[P2]',
+  '', '', '',
+  'if key(P1)!=trim(r[P3],P4) goto P2',
+  'r[P2]=data', 'r[P2]=data',
+  'r[P2]=PX rowid of P1',
+  '', '',
+  'key=r[P2]', 'key=r[P2]',
+  'key=r[P2@P3]',
+  'Move P3 to P1.rowid if needed',
+  'r[P2]=rowid',
+  '', '', '', '',
+  'r[P2]=root iDb=P1 flags=P3',
+  '', '', '',
+  '',
+  'r[P2]=P4',
+  '', '', '',
+  'rowset(P1)=r[P2]',
+  '',
+  'fkctr[P1]+=P2',
+  'r[P1]=max(r[P1],r[P2])',
+  'if r[P1]>0 then r[P2]=r[P1]+max(0,r[P3]) else r[P2]=(-1)',
+  'accum=r[P3] inverse(r[P2@P5])',
+  'accum=r[P3] step(r[P2@P5])',
+  'accum=r[P3] step(r[P2@P5])',
+  'r[P3]=value N=P2',
+  'accum=r[P1] N=P2',
+  '', '', '',
+  'iDb=P1 root=P2 write=P3',
+  '', '', '', '', '',
+  'r[P2]=ValueList(P1,P3)',
+  'r[P3]=vcolumn(P2)',
+  '',
+  '', '',
+  'r[P1].subtype = 0',
+  'r[P2] = r[P1].subtype',
+  'r[P2].subtype = r[P1]',
+  'filter(P1) += key(P3@P4)',
+  '', '',
+  'release r[P1@P2] mask P3',
+  '', '', ''
+);
+begin
+  if (op >= 0) and (op <= 191) then
+    Result := Syn[op]
+  else
+    Result := '';
+end;
+
+function translateP(c: AnsiChar; pOp: PVdbeOp): i32; inline;
+begin
+  case c of
+    '1': Result := pOp^.p1;
+    '2': Result := pOp^.p2;
+    '3': Result := pOp^.p3;
+    '4': Result := pOp^.p4.i;
+  else   Result := i32(pOp^.p5);
+  end;
+end;
 
 function sqlite3VdbeDisplayComment(db: Psqlite3; pOp: PVdbeOp; zP4: PAnsiChar): PAnsiChar;
+var
+  zSynopsis: PAnsiChar;
+  zAlt:      array[0..49] of AnsiChar;
+  ii:        i32;
+  c:         AnsiChar;
+  v1, v2:    i32;
+  pStr:      PSqlite3Str;
+  pCtx:      Psqlite3_context;
 begin
   Result := nil;
+  zSynopsis := vdbeOpcodeSynopsis(pOp^.opcode);
+  if (zSynopsis = nil) or (zSynopsis[0] = #0) then Exit;
+
+  pStr := sqlite3_str_new(Psqlite3db(db));
+  if pStr = nil then Exit;
+
+  if (zSynopsis[0] = 'I') and (zSynopsis[1] = 'F') and (zSynopsis[2] = ' ') then begin
+    { Hand-rolled `snprintf("if %s goto P2", zSynopsis+3)` — sqlite3_snprintf
+      in this port handles only no-arg fmt strings. }
+    ii := 0;
+    zAlt[0] := 'i'; zAlt[1] := 'f'; zAlt[2] := ' ';
+    ii := 3;
+    while (zSynopsis[ii] <> #0) and (ii < SizeOf(zAlt) - 12) do begin
+      zAlt[ii] := zSynopsis[ii]; Inc(ii);
+    end;
+    zAlt[ii] := ' '; zAlt[ii+1] := 'g'; zAlt[ii+2] := 'o'; zAlt[ii+3] := 't';
+    zAlt[ii+4] := 'o'; zAlt[ii+5] := ' '; zAlt[ii+6] := 'P'; zAlt[ii+7] := '2';
+    zAlt[ii+8] := #0;
+    zSynopsis := @zAlt[0];
+  end;
+
+  ii := 0;
+  c := zSynopsis[ii];
+  while c <> #0 do begin
+    if c = 'P' then begin
+      Inc(ii);
+      c := zSynopsis[ii];
+      if c = '4' then begin
+        if zP4 <> nil then sqlite3_str_appendall(pStr, zP4);
+      end else if c = 'X' then begin
+        { pOp->zComment branch — not present in Pas TVdbeOp; skip }
+      end else begin
+        v1 := translateP(c, pOp);
+        if (zSynopsis[ii+1] = '@') and (zSynopsis[ii+2] = 'P') then begin
+          Inc(ii, 3);
+          v2 := translateP(zSynopsis[ii], pOp);
+          if (zSynopsis[ii+1] = '+') and (zSynopsis[ii+2] = '1') then begin
+            Inc(ii, 2);
+            Inc(v2);
+          end;
+          if v2 < 2 then
+            sqlite3_str_appendf(pStr, '%d', [v1])
+          else
+            sqlite3_str_appendf(pStr, '%d..%d', [v1, v1+v2-1]);
+        end else if (zSynopsis[ii+1] = '@') and (zSynopsis[ii+2] = 'N')
+                and (zSynopsis[ii+3] = 'P') then begin
+          pCtx := pOp^.p4.pCtx;
+          if (pOp^.p4type <> P4_FUNCCTX) or (pCtx^.argc = 1) then
+            sqlite3_str_appendf(pStr, '%d', [v1])
+          else if pCtx^.argc > 1 then
+            sqlite3_str_appendf(pStr, '%d..%d', [v1, v1 + i32(pCtx^.argc) - 1])
+          else if pStr^.accError = 0 then begin
+            Assert(pStr^.nChar > 2, 'DisplayComment: nChar>2 required for @NP rewind');
+            pStr^.nChar := pStr^.nChar - 2;
+            Inc(ii);
+          end;
+          Inc(ii, 3);
+        end else begin
+          sqlite3_str_appendf(pStr, '%d', [v1]);
+          if (zSynopsis[ii+1] = '.') and (zSynopsis[ii+2] = '.')
+             and (zSynopsis[ii+3] = 'P') and (zSynopsis[ii+4] = '3')
+             and (pOp^.p3 = 0) then
+            Inc(ii, 4);
+        end;
+      end;
+    end else begin
+      sqlite3_str_appendchar(pStr, 1, c);
+    end;
+    Inc(ii);
+    c := zSynopsis[ii];
+  end;
+
+  if (pStr^.accError and SQLITE_NOMEM) <> 0 then begin
+    if db <> nil then sqlite3OomFault(db);
+  end;
+  Result := sqlite3_str_finish(pStr);
 end;
 
 { sqlite3VdbeDisplayP4 — vdbeaux.c:1905.  Renders the P4 operand of an

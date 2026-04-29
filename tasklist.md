@@ -32,8 +32,8 @@ Important: At the end of this document, please find:
             `pragma_*` eponymous virtual tables via
             `sqlite3VtabCreateModule` + `pragmaVtabModule`.
 
-- [ ] **6.8.1** port `sqlite3Update`
-- [ ] **6.8.2** port `sqlite3GenerateConstraintChecks`
+- [ ] **6.8.1** finish porting `sqlite3Update` from `tsrc/update.c`
+- [ ] **6.8.2** port `sqlite3GenerateConstraintChecks` from `tsrc/insert.c`
 - [ ] **6.8.4** port `sqlite3WhereBegin`
 - [ ] **6.8.5** port `sqlite3WhereEnd`
 
@@ -273,7 +273,14 @@ Important: At the end of this document, please find:
        still stub, but every db this port produces is corruption-free
        by construction).
   [ ] **6.13** port `sqlite3Vacuum`
-  [ ] **6.21** port `sqlite3VdbeDisplayComment`
+  [X] **6.21** port `sqlite3VdbeDisplayComment` — ported 2026-04-29
+       (vdbeaux.c:1740).  Synopsis-driven EXPLAIN comment renderer,
+       faithful to the C reference compiled with
+       SQLITE_ENABLE_EXPLAIN_COMMENTS (oracle build flag, see
+       src/tests/build.sh:53).  Per-opcode synopsis text lives in
+       `vdbeOpcodeSynopsis` instead of being embedded after a NUL in
+       the opcode-name table.  pOp^.zComment branches short-circuited
+       (TVdbeOp has no zComment field in the Pas port).
 
   [ ] **6.22** port codegen.pas rename / error-offset stubs in full from C
        to pascal:
