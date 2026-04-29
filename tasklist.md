@@ -373,16 +373,29 @@ Important: At the end of this document, please find:
         also dropped (15 → 7 total).  (e) below did NOT cascade —
         see updated note.
       [ ] **e) `INDEXED BY` / `NOT INDEXED` against `WHERE a=1` returns
-        empty rowset** (DiagIndexing `indexed by ok`, `not indexed`,
-        2026-04-29).  Seed `CREATE TABLE t(a INTEGER, b TEXT); CREATE
-        INDEX ix_t_a ON t(a); INSERT INTO t VALUES(1,'x'),(2,'y');`.
-        Pas: `SELECT b FROM t INDEXED BY ix_t_a WHERE a=1` returns no
-        rows; `SELECT b FROM t NOT INDEXED WHERE a=1` likewise.
-        Sibling `WHERE a=2` (without INDEXED BY) PASSes.  Confirmed
-        2026-04-29 NOT cascading from (d): after the INSERT-affinity fix
-        landed, "indexed by ok" / "not indexed" still DIVERGE.  Distinct
-        root cause — likely in the INDEXED BY / NOT INDEXED parser arm
-        or in how the planner honours the hint.
+        empty rowset** (DiagIndexing `indexed by ok`, `not indexed`).
+        Root cause traced 2026-04-29: sqlite3WhereBegin's nTabList=1 gate
+        at codegen.pas:14991 unconditionally bails when whereShortCut
+        returns 0, but whereShortCut bails for any FROM item with the
+        INDEXED BY ($02) or NOT INDEXED ($01) flag (gate at
+        codegen.pas:14203).  Lifting the bail exposes downstream gaps
+        in single-table planner codegen (AV in sqlite3VdbeExec on the
+        emitted plan).  Blocked on full single-table planner port
+        (extension of the multi-table whereLoopAddAll / wherePathSolver /
+        sqlite3WhereCodeOneLoopStart path to nTabList=1 — overlaps
+        6.9-bis 11g.2.b open items).
+        Side fixes landed 2026-04-29:
+          (i) `$01 → SRCITEM_FG_IS_SUBQUERY ($04)` in four
+              sqlite3Select gates (codegen.pas:19288, :19566, :19623,
+              :19756) — the bits had been confused; $01 is NOT_INDEXED,
+              not IS_SUBQUERY.  Cascade: DiagWindow 14→13 divergences.
+          (ii) Ported `estimateTableWidth` (build.c:2613) inline at the
+              tail of `sqlite3EndTable` so `pTab^.szTabRow` gets a
+              non-zero LogEst on every CREATE TABLE — required by
+              whereLoopAddBtree's IPK / index-scan cost model
+              (codegen.pas:12428..12430 divides by szTabRow; previously
+              latent because the single-table planner gate kept that
+              path unreachable).
 
   [X] **6.10 step 25** Date/time `'now'` + strftime `%s` parity —
       closed 2026-04-29.

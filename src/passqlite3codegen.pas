@@ -19277,7 +19277,7 @@ begin
        or (pTab^.eTabType = TABTYP_VTAB)
        or (pTab^.eTabType = TABTYP_VIEW)
        or ((pTab^.tabFlags and TF_Ephemeral) <> 0)
-       or ((pItem^.fg.fgBits and $01) <> 0)
+       or ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
     then begin Result := SQLITE_OK; Exit; end;
 
     pGroupByLoc := p^.pGroupBy;
@@ -19555,7 +19555,7 @@ begin
        and (pTab^.eTabType <> TABTYP_VTAB)
        and (pTab^.eTabType <> TABTYP_VIEW)
        and ((pTab^.tabFlags and TF_Ephemeral) = 0)
-       and ((pItem^.fg.fgBits and $01) = 0)   { not a subquery }
+       and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)   { not a subquery }
     then begin
       pE := ExprListItems(p^.pEList)[0].pExpr;
       if (pE <> nil) and (pE^.op = TK_FUNCTION) and (pE^.u.zToken <> nil)
@@ -19612,7 +19612,7 @@ begin
          or (pTab^.eTabType = TABTYP_VTAB)
          or (pTab^.eTabType = TABTYP_VIEW)
          or ((pTab^.tabFlags and TF_Ephemeral) <> 0)
-         or ((pItem[jAgg].fg.fgBits and $01) <> 0)
+         or ((pItem[jAgg].fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
       then begin canUseAgg := False; break; end;
     end;
     pTab := pItem^.pSTab;  { restore for downstream pTab uses }
@@ -19745,7 +19745,7 @@ begin
   begin
     pTab := SrcListItems(pTabList)[i].pSTab;
     if pTab = nil then begin Result := SQLITE_OK; Exit; end;
-    if SrcListItems(pTabList)[i].fg.fgBits and $01 <> 0 then
+    if SrcListItems(pTabList)[i].fg.fgBits and SRCITEM_FG_IS_SUBQUERY <> 0 then
       begin Result := SQLITE_OK; Exit; end;
     if pTab^.eTabType = TABTYP_VTAB then begin Result := SQLITE_OK; Exit; end;
     if (pTab^.tabFlags and TF_Ephemeral) <> 0 then
@@ -24075,6 +24075,9 @@ var
   nNG:     i32;
   pX:      PExpr;
   colFlg:  u16;
+  wTable:  u32;
+  iCol:    i32;
+  pColEW:  PColumn;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -24183,7 +24186,20 @@ begin
 
   iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
 
-  { CHECK / GENERATED / row-width estimates: deferred (banner). }
+  { Row-width estimate — port of estimateTableWidth (build.c:2613).
+    Sets pTab^.szTabRow to LogEst(sum_of_szEst*4 + (no IPK ? 1 : 0)).
+    Required by whereLoopAddBtree's IPK / index-scan cost model
+    (codegen.pas:12428..12430 divides by szTabRow). }
+  if (pTab^.aCol <> nil) and (pTab^.nCol > 0) then begin
+    wTable := 0;
+    pColEW := pTab^.aCol;
+    for iCol := 0 to pTab^.nCol - 1 do begin
+      Inc(wTable, pColEW^.szEst);
+      Inc(pColEW);
+    end;
+    if pTab^.iPKey < 0 then Inc(wTable);
+    pTab^.szTabRow := sqlite3LogEst(u64(wTable) * 4);
+  end;
 
   { Emit the schema-write epilogue when not parsing the schema-cache itself. }
   if db^.init.busy = 0 then begin
