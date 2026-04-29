@@ -418,6 +418,28 @@ begin
   Check('overload_function(nArg=-3) = MISUSE',
         sqlite3_overload_function(db, 'x', -3) = SQLITE_MISUSE);
 
+  { Phase 8.9.2 — sqlite3_enable_shared_cache (omit-stub: always OK). }
+  Check('enable_shared_cache(0) = OK',
+        sqlite3_enable_shared_cache(0) = SQLITE_OK);
+  Check('enable_shared_cache(1) = OK',
+        sqlite3_enable_shared_cache(1) = SQLITE_OK);
+
+  { Phase 8.9.2 — sqlite3_activate_cerod is a deprecated no-op stub. }
+  sqlite3_activate_cerod(nil);
+  sqlite3_activate_cerod('test-key');
+  Check('activate_cerod no-op survived', 1 = 1);
+
+  { Phase 8.4.1 — sqlite3_setlk_timeout.  No-op under OMIT_SETLK_TIMEOUT,
+    but the C MISUSE / RANGE guards still apply. }
+  Check('setlk_timeout(db, 100) = OK',
+        sqlite3_setlk_timeout(db, 100, 0) = SQLITE_OK);
+  Check('setlk_timeout(db, -1) = OK',
+        sqlite3_setlk_timeout(db, -1, 0) = SQLITE_OK);
+  Check('setlk_timeout(db, -2) = RANGE',
+        sqlite3_setlk_timeout(db, -2, 0) = SQLITE_RANGE);
+  Check('setlk_timeout(nil, 1) = MISUSE',
+        sqlite3_setlk_timeout(nil, 1, 0) = SQLITE_MISUSE);
+
   { Phase 8.1.1 — sqlite3_db_release_memory / sqlite3_db_cacheflush. }
   Check('db_release_memory = OK',  sqlite3_db_release_memory(db)   = SQLITE_OK);
   Check('db_release_memory(nil) = MISUSE',

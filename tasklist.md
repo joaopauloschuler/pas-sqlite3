@@ -884,7 +884,12 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [X] `sqlite3_interrupt` / `sqlite3_is_interrupted` — ported
             2026-04-28 (passqlite3main.pas) — sets/reads
             db^.u1.isInterrupted.
-       [ ] `sqlite3_setlk_timeout` — POSIX lock timeout.
+       [X] `sqlite3_setlk_timeout` — ported 2026-04-29 (passqlite3main.pas)
+            — verbatim port of main.c:1863 OMIT_SETLK_TIMEOUT path:
+            MISUSE on safety-check fail, RANGE for ms<-1, otherwise OK
+            no-op (timeout itself unimplemented; the port has no
+            db^.setlkTimeout / SQLITE_FCNTL_BLOCK_ON_CONNECT plumbing).
+            Covered by DiagPubApi.
        [X] `sqlite3_uri_int64` — ported 2026-04-28 (passqlite3util.pas)
             via sqlite3_uri_parameter + sqlite3DecOrHexToI64; mirrors
             main.c:4907 exactly.
@@ -963,10 +968,15 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             49/0, TestWhereBasic 52/0, TestBtreeCompat 337/0,
             TestDMLBasic 54/0, TestVdbeAgg 11/0, DiagSumOverflow 12/0,
             TestAuthBuiltins 34/0, TestPrintf 105/0 — no regressions.
-       [ ] `sqlite3_enable_shared_cache` — process-wide shared-cache
-            toggle.
-       [ ] `sqlite3_activate_cerod` — CEROD extension activator
-            (deprecated; trivial stub).
+       [X] `sqlite3_enable_shared_cache` — ported 2026-04-29
+            (passqlite3main.pas).  This port is built equivalent to
+            SQLITE_OMIT_SHARED_CACHE (loadext.c:91 stub posture):
+            accept the call and return SQLITE_OK; future opens never
+            actually enable shared cache.  Covered by DiagPubApi.
+       [X] `sqlite3_activate_cerod` — ported 2026-04-29
+            (passqlite3main.pas) — deprecated CEROD activator, no-op
+            stub matching the !defined(SQLITE_ENABLE_CEROD) build
+            path.  Covered by DiagPubApi.
 
 - [ ] **8.10** Public-API sample-program gate.  Pascal
   transliterations of the sample programs in `../sqlite3/src/shell.c.in`

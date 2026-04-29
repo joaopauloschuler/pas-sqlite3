@@ -398,6 +398,10 @@ function sqlite3_soft_heap_limit64(n: i64): i64; cdecl;
 function sqlite3_hard_heap_limit64(n: i64): i64; cdecl;
 procedure sqlite3_soft_heap_limit(n: i32); cdecl;
 
+function sqlite3_enable_shared_cache(enable: i32): i32; cdecl;
+procedure sqlite3_activate_cerod(zPassPhrase: PAnsiChar); cdecl;
+function sqlite3_setlk_timeout(db: PTsqlite3; ms: i32; flags: i32): i32; cdecl;
+
 implementation
 
 uses
@@ -3133,6 +3137,34 @@ procedure sqlite3_soft_heap_limit(n: i32); cdecl;
 begin
   if n < 0 then n := 0;
   sqlite3_soft_heap_limit64(i64(n));
+end;
+
+{ btree.c:89 — sqlite3_enable_shared_cache.  This Pascal port is built
+  with the SQLITE_OMIT_SHARED_CACHE compile path: there is no
+  sqlite3GlobalConfig.sharedCacheEnabled to mutate.  Mirror the
+  loadext.c:91 omit-stub posture by accepting the call and returning
+  SQLITE_OK; future opens never enable shared cache regardless. }
+function sqlite3_enable_shared_cache(enable: i32): i32; cdecl;
+begin
+  Result := SQLITE_OK;
+end;
+
+{ sqlite.h.in:6780 — sqlite3_activate_cerod.  Deprecated CEROD
+  (Compressed Encrypted Read-Only Database) activator; only meaningful
+  under SQLITE_ENABLE_CEROD.  No-op stub here. }
+procedure sqlite3_activate_cerod(zPassPhrase: PAnsiChar); cdecl;
+begin
+end;
+
+{ main.c:1863 — sqlite3_setlk_timeout.  POSIX advisory-lock timeout.
+  Only productive under SQLITE_ENABLE_SETLK_TIMEOUT (not enabled in
+  this port).  Honour the C MISUSE / RANGE guards so callers see the
+  same return codes; the timeout itself is a no-op. }
+function sqlite3_setlk_timeout(db: PTsqlite3; ms: i32; flags: i32): i32; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  if ms < -1 then begin Result := SQLITE_RANGE; Exit; end;
+  Result := SQLITE_OK;
 end;
 
 initialization
