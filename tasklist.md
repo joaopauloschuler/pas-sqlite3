@@ -438,23 +438,30 @@ Important: At the end of this document, please find:
       `src/tests/DiagIndexing.pas`).  44 cases, 15 DIVERGE — surfaced new
       silent bugs not previously captured.  Run with
       `LD_LIBRARY_PATH=$PWD/src bin/DiagIndexing`.
-      [ ] **a) `CREATE INDEX <name> ON t(col)` runtime SQL_LOGIC_ERROR.**
-        Prepare succeeds (rc=0); step returns rc=1 / "SQL logic error".
-        Side effect: any subsequent statements in the same `sqlite3_exec`
-        seed batch are silently skipped (this is *the* root cause of
-        `schema after create idx`, `select via idx`, `select range via
-        idx`, `indexed by ok`, `not indexed`, `rowid select`, `rowid
-        alias custom`, `drop idx then list` all reporting empty result
-        sets — the seed INSERTs never executed).  TestWhereCorpus header
-        comment notes "CREATE INDEX still flakes through sqlite3_exec
-        under the current 11g.2.e codegen" but no tasklist.md item
-        tracked it.  Likely `sqlite3CreateIndex` codegen tail emits an
-        OP_ParseSchema / OP_SqliteRewind that hits a stub.
-      [ ] **b) Partial index `CREATE INDEX ... ON t(a) WHERE b='y'`.**
-        Pas: prep=0 step=1.  Likely cascade of (a) — partial-index
-        WHERE-clause arm of sqlite3CreateIndex.
-      [ ] **c) Expression index `CREATE INDEX ... ON t(a*2)`.**
-        Same as (b) — expression-index arm of sqlite3CreateIndex.
+      [X] **a) `CREATE INDEX <name> ON t(col)` runtime SQL_LOGIC_ERROR**
+        — closed 2026-04-29.  Prior hypothesis (OP_ParseSchema /
+        OP_SqliteRewind stub) was wrong: Pas codegen emits a
+        bytecode-identical program to C (37 ops, see DiagCreateIdx).
+        Real root cause: `sqlite3VdbeSorterWrite` / `_Rewind` /
+        `_Rowkey` / `_Next` / `_Compare` were stubs returning
+        SQLITE_ERROR, so OP_SorterInsert at pc=19 aborted.  Ported a
+        minimal in-memory sorter (vdbesort.c equivalents): linked-list
+        Write, in-memory mergesort on Rewind via
+        sqlite3VdbeRecordCompare + Alloc/RecordUnpack on the existing
+        pUnpacked slot, MEM_Blob copy in Rowkey, linked-list walk in
+        Next.  Single-PMA, no disk-spill, no threaded merge — covers
+        every CREATE INDEX in the existing test corpus.  Side fix:
+        added missing OP_SorterNext arm in vdbe.pas dispatch.
+        DiagIndexing 15→11 DIVERGE (4 closed: partial idx, expr idx,
+        drop+list, select via idx).  No regressions across
+        TestExplainParity 1016/10, TestWhereCorpus 92/0, TestParser
+        45/0, TestVdbeAgg 11/0, TestBtreeCompat 337/0, TestVdbeApi
+        57/0, TestSchemaBasic 44/0, TestDMLBasic 54/0,
+        TestAuthBuiltins 34/0.  Gate: src/tests/DiagCreateIdx.pas.
+      [X] **b) Partial index `CREATE INDEX ... ON t(a) WHERE b='y'`**
+        — closed 2026-04-29 (cascade fix from (a)).
+      [X] **c) Expression index `CREATE INDEX ... ON t(a*2)`**
+        — closed 2026-04-29 (cascade fix from (a)).
       [ ] **d) Affinity not applied at INSERT time.**
         `INSERT INTO af(a INTEGER) VALUES('42')` stores TEXT '42'
         instead of INTEGER 42; symmetric for TEXT/NUMERIC affinity from

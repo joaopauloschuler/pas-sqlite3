@@ -4986,51 +4986,240 @@ begin
   end;
 end;
 
+{ ----------------------------------------------------------------------
+  Minimal in-memory VdbeSorter port — Phase 6.10 step 26(a) follow-on.
+
+  Layout of one record allocation: pNext (8B) | nVal (4B) | pad (4B) |
+  serialised key bytes (nVal).  pNext lives at offset 0 to match the
+  list-walking convention already used by sqlite3VdbeSorterReset above.
+
+  This is a single-PMA, single-list implementation suitable for
+  CREATE INDEX over rows that fit in process memory.  Disk-spill
+  (PMA) and threaded merge are deferred — use sites that need them
+  (very large indexes / VACUUM with sort) will fall back to OOM,
+  matching SQLITE_DEFAULT_TEMP_CACHE_SIZE behaviour as a hard cap.
+  ---------------------------------------------------------------------- }
+
+const
+  SORTER_REC_HDR = 16;   { offset of payload bytes after pNext+nVal+pad }
+
+procedure vdbeSorterListToArray(pSorter: PVdbeSorter;
+  out aRec: array of Pointer; out nRec: i32);
+var
+  p, pNxt: Pointer;
+  i: i32;
+begin
+  nRec := 0;
+  p := pSorter^.list.pList;
+  i := 0;
+  while (p <> nil) and (i <= High(aRec)) do begin
+    aRec[i] := p;
+    pNxt := PPointer(p)^;
+    p := pNxt;
+    Inc(i);
+  end;
+  nRec := i;
+end;
+
+function vdbeSorterCountRecords(pSorter: PVdbeSorter): i32;
+var
+  p: Pointer;
+  n: i32;
+begin
+  p := pSorter^.list.pList;
+  n := 0;
+  while p <> nil do begin
+    Inc(n);
+    p := PPointer(p)^;
+  end;
+  Result := n;
+end;
+
+{ Compare two encoded records pA, pB using pSorter^.pKeyInfo.
+  Returns <0 if A<B, 0 if equal, >0 if A>B. }
+function vdbeSorterCompareRec(pSorter: PVdbeSorter;
+  pA, pB: Pointer): i32;
+var
+  pUR: PUnpackedRecord;
+  resB: i32;
+  aBytes, bBytes: Pointer;
+  aLen, bLen: i32;
+begin
+  if pSorter^.pUnpacked = nil then
+    pSorter^.pUnpacked := sqlite3VdbeAllocUnpackedRecord(pSorter^.pKeyInfo);
+  pUR := PUnpackedRecord(pSorter^.pUnpacked);
+  if pUR = nil then begin Result := 0; Exit; end;
+  aLen   := Pi32(PByte(pA) + 8)^;
+  bLen   := Pi32(PByte(pB) + 8)^;
+  aBytes := PByte(pA) + SORTER_REC_HDR;
+  bBytes := PByte(pB) + SORTER_REC_HDR;
+  sqlite3VdbeRecordUnpack(pSorter^.pKeyInfo, aLen, aBytes, pUR);
+  { sqlite3VdbeRecordCompare(nKey, pKey, pUnp) returns sign of (key vs unp). }
+  resB := sqlite3VdbeRecordCompare(bLen, bBytes, pUR);
+  if resB > 0 then Result := -1     { B>A => A<B }
+  else if resB < 0 then Result := 1
+  else Result := 0;
+end;
+
+procedure vdbeSorterMergeSort(pSorter: PVdbeSorter;
+  arr: PPointerArray; lo, hi: i32);
+var
+  mid, i, j, k: i32;
+  tmp: array of Pointer;
+begin
+  if hi - lo <= 0 then Exit;
+  if hi - lo = 1 then begin
+    if vdbeSorterCompareRec(pSorter, arr^[lo], arr^[hi]) > 0 then begin
+      tmp := nil;
+      SetLength(tmp, 1);
+      tmp[0]    := arr^[lo];
+      arr^[lo]  := arr^[hi];
+      arr^[hi]  := tmp[0];
+    end;
+    Exit;
+  end;
+  mid := (lo + hi) div 2;
+  vdbeSorterMergeSort(pSorter, arr, lo, mid);
+  vdbeSorterMergeSort(pSorter, arr, mid + 1, hi);
+  SetLength(tmp, hi - lo + 1);
+  i := lo; j := mid + 1; k := 0;
+  while (i <= mid) and (j <= hi) do begin
+    if vdbeSorterCompareRec(pSorter, arr^[i], arr^[j]) <= 0 then begin
+      tmp[k] := arr^[i]; Inc(i);
+    end else begin
+      tmp[k] := arr^[j]; Inc(j);
+    end;
+    Inc(k);
+  end;
+  while i <= mid do begin tmp[k] := arr^[i]; Inc(i); Inc(k); end;
+  while j <= hi  do begin tmp[k] := arr^[j]; Inc(j); Inc(k); end;
+  for i := 0 to hi - lo do arr^[lo + i] := tmp[i];
+end;
+
 function sqlite3VdbeSorterWrite(pCsr: PVdbeCursor; pVal: PMem): i32;
+var
+  pSorter: PVdbeSorter;
+  pNew:    Pointer;
+  nByte:   u64;
 begin
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
-  { Full in-memory insertion requires UnpackedRecord (Phase 6+) }
-  Result := SQLITE_ERROR;
+  pSorter := pCsr^.uc.pSorter;
+  nByte := u64(SORTER_REC_HDR) + u64(pVal^.n);
+  pNew := sqlite3DbMallocRaw(pSorter^.db, nByte);
+  if pNew = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+  PPointer(pNew)^ := pSorter^.list.pList;     { pNext at offset 0 }
+  Pi32(PByte(pNew) + 8)^ := pVal^.n;          { nVal at offset 8 }
+  if pVal^.n > 0 then
+    Move(pVal^.z^, (PByte(pNew) + SORTER_REC_HDR)^, pVal^.n);
+  pSorter^.list.pList := pNew;
+  pSorter^.list.szPMA := pSorter^.list.szPMA + i64(pVal^.n);
+  Result := SQLITE_OK;
 end;
 
 function sqlite3VdbeSorterRewind(pCsr: PVdbeCursor; out pbEof: i32): i32;
+var
+  pSorter: PVdbeSorter;
+  arr:     array of Pointer;
+  n, i:    i32;
 begin
   pbEof := 1;
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
-  { Rewind requires sort + PMA merge (Phase 6+) }
-  Result := SQLITE_ERROR;
+  pSorter := pCsr^.uc.pSorter;
+  if pSorter^.list.pList = nil then begin
+    pSorter^.pReader := nil;
+    Result := SQLITE_OK; Exit;
+  end;
+  n := vdbeSorterCountRecords(pSorter);
+  SetLength(arr, n);
+  vdbeSorterListToArray(pSorter, arr, n);
+  if n > 1 then
+    vdbeSorterMergeSort(pSorter, PPointerArray(arr), 0, n - 1);
+  { Re-thread the linked list head→...→tail in sorted order. }
+  for i := 0 to n - 2 do
+    PPointer(arr[i])^ := arr[i + 1];
+  PPointer(arr[n - 1])^ := nil;
+  pSorter^.list.pList := arr[0];
+  pSorter^.pReader    := arr[0];
+  pbEof := 0;
+  Result := SQLITE_OK;
 end;
 
 function sqlite3VdbeSorterNext(db: PTsqlite3; pCsr: PVdbeCursor): i32;
+var
+  pSorter: PVdbeSorter;
+  cur:     Pointer;
 begin
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
-  Result := SQLITE_DONE;
+  pSorter := pCsr^.uc.pSorter;
+  cur := pSorter^.pReader;
+  if cur = nil then begin Result := SQLITE_DONE; Exit; end;
+  pSorter^.pReader := PPointer(cur)^;
+  if pSorter^.pReader = nil then Result := SQLITE_DONE
+  else                         Result := SQLITE_OK;
 end;
 
 function sqlite3VdbeSorterRowkey(pCsr: PVdbeCursor; pOut: PMem): i32;
+var
+  pSorter: PVdbeSorter;
+  cur:     Pointer;
+  nVal:    i32;
 begin
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
-  sqlite3VdbeMemSetNull(pOut);
-  Result := SQLITE_ERROR;
+  pSorter := pCsr^.uc.pSorter;
+  cur := pSorter^.pReader;
+  if cur = nil then begin
+    sqlite3VdbeMemSetNull(pOut);
+    Result := SQLITE_OK; Exit;
+  end;
+  nVal := Pi32(PByte(cur) + 8)^;
+  if sqlite3VdbeMemClearAndResize(pOut, nVal + 2) <> 0 then begin
+    Result := SQLITE_NOMEM_BKPT; Exit;
+  end;
+  if nVal > 0 then
+    Move((PByte(cur) + SORTER_REC_HDR)^, pOut^.z^, nVal);
+  pOut^.n := nVal;
+  pOut^.flags := MEM_Blob;
+  Result := SQLITE_OK;
 end;
 
 function sqlite3VdbeSorterCompare(pCsr: PVdbeCursor; bOmitRowid: i32;
                                   pKey: Pointer; nKey: i32;
                                   out pRes: i32): i32;
+var
+  pSorter: PVdbeSorter;
+  cur:     Pointer;
+  pUR:     PUnpackedRecord;
+  curBytes:Pointer;
+  curLen:  i32;
+  nKeyCol: i32;
 begin
   pRes := 0;
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
     Result := SQLITE_MISUSE; Exit;
   end;
-  Result := SQLITE_ERROR;
+  pSorter := pCsr^.uc.pSorter;
+  cur := pSorter^.pReader;
+  if cur = nil then begin Result := SQLITE_OK; Exit; end;
+  if pSorter^.pUnpacked = nil then
+    pSorter^.pUnpacked := sqlite3VdbeAllocUnpackedRecord(pSorter^.pKeyInfo);
+  pUR := PUnpackedRecord(pSorter^.pUnpacked);
+  if pUR = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+  curLen   := Pi32(PByte(cur) + 8)^;
+  curBytes := PByte(cur) + SORTER_REC_HDR;
+  sqlite3VdbeRecordUnpack(pSorter^.pKeyInfo, curLen, curBytes, pUR);
+  nKeyCol := i32(Pu16(Pu8(pSorter^.pKeyInfo) + 6)^);
+  if bOmitRowid <> 0 then Dec(nKeyCol);
+  if pUR^.nField > nKeyCol then pUR^.nField := nKeyCol;
+  pRes := sqlite3VdbeRecordCompare(nKey, pKey, pUR);
+  Result := SQLITE_OK;
 end;
 
 { ============================================================================
@@ -6381,6 +6570,13 @@ begin
     OP_Next: begin
       pCur := v^.apCsr[pOp^.p1];
       rc := sqlite3BtreeNext(pCur^.uc.pCursor, pOp^.p3);
+      goto next_tail;
+    end;
+
+    { ────── OP_SorterNext ────── (vdbe.c:6533) }
+    OP_SorterNext: begin
+      pCur := v^.apCsr[pOp^.p1];
+      rc := sqlite3VdbeSorterNext(db, pCur);
       goto next_tail;
     end;
 
