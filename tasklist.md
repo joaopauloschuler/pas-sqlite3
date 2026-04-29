@@ -405,7 +405,16 @@ Important: At the end of this document, please find:
         because `destroyRootPage` calls `sqlite3NestedParse(UPDATE
         sqlite_schema ...)` and productive `sqlite3Update` is still
         skeleton-only.  This is the only remaining contributor.
-  [ ] **6.12** port sqlite3Pragma in full
+  [ ] **6.12** port sqlite3Pragma in full.  Regression gate landed
+       2026-04-28: `src/tests/DiagPragma.pas` (run with
+       `LD_LIBRARY_PATH=$PWD/src bin/DiagPragma`).  60 probes covering
+       boolean/scalar/string/header/introspection PRAGMAs +
+       integrity/quick check.  Current baseline 12 PASS / 49 DIVERGE —
+       most divergences are silent no-ops (Pas returns no row vs C
+       returns the default value).  Closing 6.12 should drive
+       divergences to 0.  Notable PASSes (already wired): page_size,
+       cache_size, mmap_size, encoding, synchronous, user_version
+       round-trip, application_id round-trip, shrink_memory.
   [ ] **6.13** port sqlite3Vacuum in full
   [X] **6.14** port sqlite3WhereTabFuncArgs in full (whereexpr.c:1899..1944).
   [X] **6.15** port sqlite3WhereAddLimit + whereAddLimitExpr in full
