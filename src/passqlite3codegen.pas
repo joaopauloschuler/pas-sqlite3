@@ -17724,19 +17724,13 @@ begin
       if pItem^.u4.pSubq <> nil then Continue;
       if pItem^.pSTab = nil then
       begin
-        { LOCATE_NOERR — degrade gracefully when the table is not in
-          pSchema^.tblHash.  Today the Pascal sqlite3Insert (codegen
-          schema-row INSERT into sqlite_master) is still a structural
-          stub emitting zero ops, so OP_ParseSchema during CREATE
-          TABLE finds nothing and the table never reaches tblHash.
-          Soft-fail keeps the trivial-gate sqlite3Select fall-back
-          path alive — prepare returns the 3-op Init/Halt/Goto stub
-          instead of nil — exactly the surface this scaffold had
-          before sub-progress 6 landed.  When sqlite3Insert starts
-          writing real schema rows (tasklist 11g.1+ productive
-          tail), this NOERR can be lifted to drive errors. }
-        pTab := sqlite3LocateTableItem(pParse, LOCATE_NOERR, pItem);
-        if pTab = nil then Continue;
+        { Mirror selectExpander (select.c:6022) — locate the table by
+          name and abort the expand pass with a parse error when it is
+          not found.  Bare-error path; tests that need to defer schema
+          resolution must populate pSTab via SrcItemAttachSubquery
+          before reaching here. }
+        pTab := sqlite3LocateTableItem(pParse, 0, pItem);
+        if pTab = nil then Exit;
         pItem^.pSTab := pTab;
         Inc(pTab^.nTabRef);
         { fg.notCte = bit 2 of fgBits2. }

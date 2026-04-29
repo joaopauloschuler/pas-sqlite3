@@ -798,9 +798,14 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             steps with no rows; C errors `no such column: z`.  Folds
             into the resolver coverage gap (sqlite3ResolveExprListNames
             in 6.8 or the trivial-stub gate in sqlite3Select).
-       [ ] `SELECT * FROM nonesuch` — Pas accepts; C errors `no such
-            table`.  Schema lookup at expand-from-clause time not
-            firing for the trivial path.
+       [X] `SELECT * FROM nonesuch` — closed 2026-04-29.  Lifted the
+            `LOCATE_NOERR` flag in `sqlite3SelectExpand`'s FROM-clause
+            resolution loop (codegen.pas) so a missing table now sets
+            `pParse^.nErr` + `zErrMsg` via `sqlite3LocateTableItem` and
+            the function exits early, matching select.c:6022.  Side
+            benefit: DiagErrMsg `group concat dup sep` also flips to
+            PASS (`no such table: t` now wins the resolve race over
+            argument-count check, mirroring C ordering).
        [X] `SELECT 'a' LIKE 'b' ESCAPE 'abc'` — closed 2026-04-29.
             Two fixes: (1) likeFunc (codegen.pas) now validates the
             ESCAPE arg via sqlite3Utf8CharLen and raises
@@ -819,10 +824,10 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             TestAuthBuiltins 34/0.
        [ ] `SELECT sum` — bare function name treated as column ref.
             Pas reports "not an error", C reports `no such column: sum`.
-       [ ] `SELECT group_concat(a, 'x', 'y') FROM t` — Pas reports
-            `wrong number of arguments` first; C resolves the FROM
-            clause first and reports `no such table: t`.  Argument-
-            check vs. FROM-resolution ordering mismatch.
+       [X] `SELECT group_concat(a, 'x', 'y') FROM t` — closed 2026-04-29
+            as a side-effect of lifting `LOCATE_NOERR` in
+            `sqlite3SelectExpand` (FROM-clause now resolves before the
+            argument-count check, matching C ordering).
 
 - [ ] **8.3.3** Collation / function UTF-16 wrappers:
        [ ] `sqlite3_create_collation16`.
