@@ -2724,6 +2724,7 @@ function  sqlite3SrcListAppend(pParse: PParse; pList: PSrcList;
   const pTable: PToken; const pDatabase: PToken): PSrcList;
 procedure sqlite3SrcListAssignCursors(pParse: PParse; pList: PSrcList);
 procedure sqlite3SubqueryDelete(db: PTsqlite3; pSubq: Pointer);
+function  sqlite3SubqueryDetach(db: PTsqlite3; pItem: PSrcItem): PSelect;
 function  sqlite3SrcItemAttachSubquery(pParse: PParse; p: PSrcItem;
   pSubquery: PSelect; isSub: i32): i32;
 function  sqlite3SrcListAppendFromTerm(pParse: PParse; p: PSrcList;
@@ -3789,10 +3790,8 @@ begin
     sqlite3DbFree(db, pItem^.zName);
     sqlite3DbFree(db, pItem^.zAlias);
     if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
-    begin
-      sqlite3SelectDelete(db, pItem^.u4.pSubq^.pSelect);
-      sqlite3DbFree(db, pItem^.u4.pSubq);
-    end else if (pItem^.fg.fgBits and SRCITEM_FG_IS_INDEXED_BY) <> 0 then
+      sqlite3SubqueryDelete(db, pItem^.u4.pSubq)
+    else if (pItem^.fg.fgBits and SRCITEM_FG_IS_INDEXED_BY) <> 0 then
       sqlite3DbFree(db, pItem^.u1.zIndexedBy)
     else if SrcItemIsTabFunc(pItem^.fg) then
       sqlite3ExprListDelete(db, pItem^.u1.pFuncArg);
@@ -26157,9 +26156,30 @@ begin
   end;
 end;
 
+{ build.c:4944 — delete a Subquery object and its substructure. }
 procedure sqlite3SubqueryDelete(db: PTsqlite3; pSubq: Pointer);
+var
+  p: PSubquery;
 begin
-  { Phase 7 }
+  p := PSubquery(pSubq);
+  Assert((p <> nil) and (p^.pSelect <> nil));
+  sqlite3SelectDelete(db, p^.pSelect);
+  sqlite3DbFree(db, p);
+end;
+
+{ build.c:4956 — remove a Subquery from a SrcItem.  Returns the associated
+  Select, which becomes the responsibility of the caller. }
+function sqlite3SubqueryDetach(db: PTsqlite3; pItem: PSrcItem): PSelect;
+var
+  pSel: PSelect;
+begin
+  Assert(pItem <> nil);
+  Assert(SrcItemIsSubquery(pItem^.fg));
+  pSel := pItem^.u4.pSubq^.pSelect;
+  sqlite3DbFree(db, pItem^.u4.pSubq);
+  pItem^.u4.pSubq := nil;
+  pItem^.fg.fgBits := pItem^.fg.fgBits and not SRCITEM_FG_IS_SUBQUERY;
+  Result := pSel;
 end;
 
 function sqlite3SrcItemAttachSubquery(pParse: PParse; p: PSrcItem;
