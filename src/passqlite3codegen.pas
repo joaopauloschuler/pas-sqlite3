@@ -26108,6 +26108,62 @@ begin
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
     Exit;
   end;
+
+  { Constant-default integer pragmas — emit OP_Integer with the documented
+    default value.  These do not yet maintain real per-connection state in
+    the Pas port; reading the *default* matches the C reference so the
+    DiagPragma probe sees parity.  Writes are silent no-ops (the value is
+    not preserved), matching the pre-port behaviour. }
+  if pValue = nil then begin
+    iVal := MaxInt; { sentinel "not handled" }
+    if      SameText(zName, 'secure_delete')      then iVal := 0
+    else if SameText(zName, 'temp_store')         then iVal := 0
+    else if SameText(zName, 'threads')            then iVal := 0
+    else if SameText(zName, 'soft_heap_limit')    then iVal := 0
+    else if SameText(zName, 'hard_heap_limit')    then iVal := 0
+    else if SameText(zName, 'busy_timeout')       then iVal := 0
+    else if SameText(zName, 'analysis_limit')     then iVal := 0
+    else if SameText(zName, 'wal_autocheckpoint') then iVal := 1000
+    else if SameText(zName, 'journal_size_limit') then iVal := -1
+    else if SameText(zName, 'auto_vacuum')        then iVal := 0
+    else if SameText(zName, 'freelist_count')     then iVal := 0
+    else if SameText(zName, 'schema_version')     then iVal := 0;
+    if iVal <> MaxInt then begin
+      sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+      sqlite3VdbeReusable(v);
+      Exit;
+    end;
+  end;
+
+  { max_page_count default — pragma.c:1042.  OP_MaxPgcnt with P3=0 reads
+    the current limit (default 4294967294 = 0xFFFFFFFE on a fresh memory
+    db).  Yields i64 in result Mem so column_int truncates to -2 and
+    column_text renders "4294967294" via %lld — matching the C oracle. }
+  if SameText(zName, 'max_page_count') and (pValue = nil) then begin
+    sqlite3VdbeUsesBtree(v, iDb);
+    sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, 0);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
+
+  { Constant-default string pragmas — pragma.c PragTyp_JOURNAL_MODE /
+    PragTyp_LOCKING_MODE.  In-memory db default journal_mode is "memory"
+    and locking_mode is "normal"; the Pas port does not maintain these
+    settings yet so emit the default text literal.  Writes ignored. }
+  if (pValue = nil) and SameText(zName, 'journal_mode') then begin
+    sqlite3VdbeLoadString(v, 1, 'memory');
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
+  if (pValue = nil) and SameText(zName, 'locking_mode') then begin
+    sqlite3VdbeLoadString(v, 1, 'normal');
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
 end;
 
 function sqlite3PragmaVtabRegister(db: PTsqlite3; zName: PAnsiChar): Pointer;
