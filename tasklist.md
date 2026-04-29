@@ -454,6 +454,14 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        vdbeapi.c:2209..2400.  Full preupdate machinery (PreUpdate
        record, BTree column-payload unpack) stays unported.
 
+- [X] **8.x** `sqlite3_create_filename` (main.c:4821) — ported 2026-04-29
+       in passqlite3util.pas alongside the existing `sqlite3_free_filename`,
+       `sqlite3_filename_database/_journal/_wal`, `sqlite3_uri_*` family.
+       Builds the 4-byte-prefixed key/value buffer expected by databaseName /
+       uriParameter.  Byte-parity with the C reference verified against
+       libsqlite3.so on a 56-byte (`mydb`+2 params+`mydb-journal`+`mydb-wal`)
+       fixture.
+
 - [ ] **8.9.1** Vtab helper APIs (vtab.c, vdbeapi.c):
        [ ] `sqlite3_vtab_distinct` — query-planner DISTINCT hint.
        [ ] `sqlite3_vtab_in` — IN-operator iterator-mode toggle (gated on
