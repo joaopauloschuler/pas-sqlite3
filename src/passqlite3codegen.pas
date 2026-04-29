@@ -28098,19 +28098,34 @@ var
 
   { Skip optional flag / width / precision chars between '%' and the type char.
     Captures the parsed width and precision (and "have" flags) into the
-    enclosing locals so float specifiers can honour them.  Returns the next
-    non-meta character (the specifier letter). }
+    enclosing locals so float specifiers can honour them.  Also accepts the
+    SQLite '!' alt-form-2 flag and consumes C length modifiers (l, ll, h,
+    hh, L) so e.g. %lld is treated as %d.  Star ('*') in width/precision
+    consumes the next argv as an i32.  Returns the next non-meta character
+    (the specifier letter). }
   function SkipFmtMeta: AnsiChar;
+  var pStarVal: PMem;
   begin
     metaFlags := '';
     metaWidth := 0; metaPrec := 0;
     metaHaveWidth := False; metaHavePrec := False;
-    { flags }
-    while p^ in ['-', '+', ' ', '0', '#'] do begin
+    { flags — include SQLite '!' alt-form-2 and ',' (printf.c et_FLAG table) }
+    while p^ in ['-', '+', ' ', '0', '#', '!', ','] do begin
       metaFlags := metaFlags + p^; Inc(p);
     end;
     { width }
-    if p^ in ['0'..'9'] then begin
+    if p^ = '*' then begin
+      Inc(p);
+      metaHaveWidth := True;
+      if argIdx < argc then begin
+        pStarVal := (argv + argIdx)^; Inc(argIdx);
+        metaWidth := sqlite3_value_int(Psqlite3_value(pStarVal));
+      end;
+      if metaWidth < 0 then begin
+        metaFlags := metaFlags + '-';
+        metaWidth := -metaWidth;
+      end;
+    end else if p^ in ['0'..'9'] then begin
       metaHaveWidth := True;
       while p^ in ['0'..'9'] do begin
         metaWidth := metaWidth * 10 + (Ord(p^) - Ord('0')); Inc(p);
@@ -28120,10 +28135,21 @@ var
     if p^ = '.' then begin
       Inc(p);
       metaHavePrec := True;
-      while p^ in ['0'..'9'] do begin
-        metaPrec := metaPrec * 10 + (Ord(p^) - Ord('0')); Inc(p);
-      end;
+      if p^ = '*' then begin
+        Inc(p);
+        if argIdx < argc then begin
+          pStarVal := (argv + argIdx)^; Inc(argIdx);
+          metaPrec := sqlite3_value_int(Psqlite3_value(pStarVal));
+        end;
+        if metaPrec < 0 then begin metaHavePrec := False; metaPrec := 0; end;
+      end else
+        while p^ in ['0'..'9'] do begin
+          metaPrec := metaPrec * 10 + (Ord(p^) - Ord('0')); Inc(p);
+        end;
     end;
+    { length modifiers — consumed but otherwise ignored (Pas i64 path
+      always runs full-width through sqlite3_value_int64) }
+    while p^ in ['l', 'L', 'h', 'j', 'z', 't'] do Inc(p);
     Result := p^;
   end;
 
@@ -28248,6 +28274,8 @@ var
       else if Pos(' ', metaFlags) > 0 then sign := ' '
       else sign := #0;
     end;
+    if metaHavePrec and (Length(digits) < metaPrec) then
+      digits := StringOfChar('0', metaPrec - Length(digits)) + digits;
     Result := ApplyIntWidth(digits, sign);
   end;
 
@@ -28334,19 +28362,26 @@ begin
         Inc(p);
         if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
         else v64 := 0;
-        App(ApplyIntWidth(HexStr(u64(v64), False), #0));
+        s := HexStr(u64(v64), False);
+        if (Pos('#', metaFlags) > 0) and (v64 <> 0) then s := '0x' + s;
+        App(ApplyIntWidth(s, #0));
       end;
       'X': begin
         Inc(p);
         if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
         else v64 := 0;
-        App(ApplyIntWidth(HexStr(u64(v64), True), #0));
+        s := HexStr(u64(v64), True);
+        if (Pos('#', metaFlags) > 0) and (v64 <> 0) then s := '0X' + s;
+        App(ApplyIntWidth(s, #0));
       end;
       'o': begin
         Inc(p);
         if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
         else v64 := 0;
-        App(ApplyIntWidth(OctStr(u64(v64)), #0));
+        s := OctStr(u64(v64));
+        if (Pos('#', metaFlags) > 0) and ((Length(s) = 0) or (s[1] <> '0')) then
+          s := '0' + s;
+        App(ApplyIntWidth(s, #0));
       end;
       'f', 'e', 'E', 'g', 'G': begin
         Inc(p);
