@@ -28,14 +28,14 @@ Important: At the end of this document, please find:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-- [ ] **6.8.0**  Pragma (pragma.c): `sqlite3PragmaVtabRegister` — returns `nil`; registers
-            `pragma_*` eponymous virtual tables via
-            `sqlite3VtabCreateModule` + `pragmaVtabModule`.
+- [ ] **6.8.0**  Pragma (pragma.c): `sqlite3PragmaVtabRegister` — returns `nil`; registers`pragma_*` eponymous virtual tables via
+     `sqlite3VtabCreateModule` + `pragmaVtabModule`.
 
 - [ ] **6.8.1** finish porting `sqlite3Update` from `tsrc/update.c`
 - [ ] **6.8.2** port `sqlite3GenerateConstraintChecks` from `tsrc/insert.c`
 - [ ] **6.8.4** port `sqlite3WhereBegin`
 - [ ] **6.8.5** port `sqlite3WhereEnd`
+- [ ] **6.9.6** Finish porting `sqlite3Update`.
 
 - [ ] **6.9** complete the porting:
     - [ ] `sqlite3VdbeRecordCompare`
@@ -57,7 +57,70 @@ Important: At the end of this document, please find:
       Remaining: errCode-bearing corruption signalling + the codegen
       full-layout fields (u/n/r1/r2) that the slim layout still drops.
 
-- [ ] **6.9-bis** Finish porting `sqlite3Update`.
+  [ ] **6.13** port `sqlite3Vacuum`
+
+  [ ] **6.22** port codegen.pas rename:
+       [ ] `sqlite3RenameExprUnmap`
+       [ ] `sqlite3RenameTokenMap` — only
+            productive under `PARSE_MODE_RENAME`.  Full bodies
+            (`RenameToken` record + walker callbacks) deferred to land
+            with `sqlite3AlterRenameTable` / `sqlite3AlterRenameColumn`
+            in 6.27; current no-op matches C semantics whenever the
+            parser is not in rename mode.
+  
+  [ ] **6.23** port codegen.pas trigger:
+       [ ] `Port sqlite3BeginTrigger`
+       [ ] Port `sqlite3FinishTrigger`
+       [ ] Port `sqlite3CodeRowTriggerDirect`
+       [ ] Port `sqlite3CodeRowTrigger`
+       [ ] Port `sqlite3TriggerStepSrc`
+       [ ] Port `sqlite3TriggerColmask`.
+
+  [ ] **6.24** port codegen.pas DML
+       [ ] `sqlite3GenerateConstraintChecks`.
+
+  [ ] **6.25** port codegen.pas schema:
+       [ ] Port `sqlite3ReadSchema`
+       [ ] Port `sqlite3RunParser`.
+
+  [ ] **6.26** port codegen.pas:
+       [ ] Port `sqlite3WindowCodeInit`
+       [ ] Port `sqlite3WindowCodeStep`.
+
+  [ ] **6.27** port codegen.pas:
+       [ ] Port `sqlite3AlterRenameTable`
+       [ ] Port `sqlite3AlterFinishAddColumn`
+       [ ] Port `sqlite3AlterAddConstraint`
+       [ ] Port `sqlite3Detach`
+       [ ] Port `sqlite3Attach`
+       [ ] Port `sqlite3Analyze`
+       [ ] Port `sqlite3Vacuum`
+       [ ] Port `sqlite3FkCheck`
+       [ ] Port `sqlite3FkActions`.
+
+  [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
+       port from C to pascal in full any function or procedure still
+       marked as "stub" that was missed by 6.16..6.27 (catch-all).
+       [X] `sqlite3LimitWhere` — ported 2026-04-29 (delete.c:182).
+            Builds the `WHERE rowid IN (SELECT rowid FROM ... LIMIT ...)`
+            rewrite for DELETE/UPDATE-with-LIMIT, including the WITHOUT
+            ROWID PK and PK-vector arms.  Dead-code today (parser
+            delete/update arms still drop pOrderBy/pLimit before reaching
+            here — gated on SQLITE_ENABLE_UPDATE_DELETE_LIMIT).  CTE arm
+            (pCteUse->nUse++) left as TODO until TCteUse record is defined.
+       [X] `sqlite3SubqueryDelete` + `sqlite3SubqueryDetach` — ported
+            2026-04-29 (build.c:4944 / :4956).  sqlite3SrcListDelete now
+            calls the standalone helper instead of inlining
+            sqlite3SelectDelete + sqlite3DbFree, matching the C call
+            graph 1:1.
+       [X] `sqlite3MarkAllShadowTablesOf` — ported 2026-04-29
+            (build.c:2538).  Walks pTab^.pSchema^.tblHash and tags any
+            ordinary table whose name is "<vtab>_<suffix>" and whose
+            suffix is accepted by the module's xShadowName callback
+            with TF_Shadow.  Previously a no-op so shadow tables of
+            iVersion>=3 modules were never marked.
+
+### Open Bugs
 
 - [ ] **6.10** `TestExplainParity.pas`
     - [ ] **6.10 step 6** Make these to work (port code when required):
@@ -236,9 +299,6 @@ Important: At the end of this document, please find:
         path (same codegen.pas:19756 TODO).
 
   [ ] **6.10 step 26** DiagIndexing probe
-      (`src/tests/DiagIndexing.pas`, baseline 44 cases / 15 DIVERGE on
-      add).  35 PASS / 7 DIVERGE on 2026-04-29 re-run — a..d closed.
-      Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagIndexing`.
       [ ] **e) `INDEXED BY` / `NOT INDEXED`** — DiagIndexing `indexed
         by ok`, `not indexed` return empty rowset.  Blocker:
         sqlite3WhereBegin's nTabList=1 gate (codegen.pas:14991) bails
@@ -247,9 +307,11 @@ Important: At the end of this document, please find:
         (codegen.pas:14203).  Lifting the bail exposes downstream gaps
         — full single-table planner port required (overlaps
         6.9-bis 11g.2.b).
-      [ ] **f) Remaining 5 divergences** — `schema after create idx`,
-        `select range via idx`, `unique violation`, `rowid select`,
-        `rowid alias custom`.  Likely fold into single-table planner
+      [ ] `schema after create idx`
+      [ ] `select range via idx`
+      [ ] `unique violation`
+      [ ] `rowid select`,
+      [ ] `rowid alias custom`.  Likely fold into single-table planner
         and sqlite3GenerateConstraintChecks gaps (e + 6.9-bis 11g.2.b);
         triage when those land.
 
@@ -272,71 +334,10 @@ Important: At the end of this document, please find:
        `PRAGMA quick_check` now emit "ok" on a clean db (real walker is
        still stub, but every db this port produces is corruption-free
        by construction).
-  [ ] **6.13** port `sqlite3Vacuum`
 
-  [ ] **6.22** port codegen.pas rename:
-       [ ] `sqlite3RenameExprUnmap`
-       [ ] `sqlite3RenameTokenMap` — only
-            productive under `PARSE_MODE_RENAME`.  Full bodies
-            (`RenameToken` record + walker callbacks) deferred to land
-            with `sqlite3AlterRenameTable` / `sqlite3AlterRenameColumn`
-            in 6.27; current no-op matches C semantics whenever the
-            parser is not in rename mode.
-  
-  [ ] **6.23** port codegen.pas trigger:
-       [ ] `Port sqlite3BeginTrigger`
-       [ ] Port `sqlite3FinishTrigger`
-       [ ] Port `sqlite3CodeRowTriggerDirect`
-       [ ] Port `sqlite3CodeRowTrigger`
-       [ ] Port `sqlite3TriggerStepSrc`
-       [ ] Port `sqlite3TriggerColmask`.
-
-  [ ] **6.24** port codegen.pas DML
-       [ ] `sqlite3GenerateConstraintChecks`.
-
-  [ ] **6.25** port codegen.pas schema:
-       [ ] Port `sqlite3ReadSchema`
-       [ ] Port `sqlite3RunParser`.
-
-  [ ] **6.26** port codegen.pas:
-       [ ] Port `sqlite3WindowCodeInit`
-       [ ] Port `sqlite3WindowCodeStep`.
-
-  [ ] **6.27** port codegen.pas:
-       [ ] Port `sqlite3AlterRenameTable`
-       [ ] Port `sqlite3AlterFinishAddColumn`
-       [ ] Port `sqlite3AlterAddConstraint`
-       [ ] Port `sqlite3Detach`
-       [ ] Port `sqlite3Attach`
-       [ ] Port `sqlite3Analyze`
-       [ ] Port `sqlite3Vacuum`
-       [ ] Port `sqlite3FkCheck`
-       [ ] Port `sqlite3FkActions`.
-
-  [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
-       port from C to pascal in full any function or procedure still
-       marked as "stub" that was missed by 6.16..6.27 (catch-all).
-       [X] `sqlite3LimitWhere` — ported 2026-04-29 (delete.c:182).
-            Builds the `WHERE rowid IN (SELECT rowid FROM ... LIMIT ...)`
-            rewrite for DELETE/UPDATE-with-LIMIT, including the WITHOUT
-            ROWID PK and PK-vector arms.  Dead-code today (parser
-            delete/update arms still drop pOrderBy/pLimit before reaching
-            here — gated on SQLITE_ENABLE_UPDATE_DELETE_LIMIT).  CTE arm
-            (pCteUse->nUse++) left as TODO until TCteUse record is defined.
-       [X] `sqlite3SubqueryDelete` + `sqlite3SubqueryDetach` — ported
-            2026-04-29 (build.c:4944 / :4956).  sqlite3SrcListDelete now
-            calls the standalone helper instead of inlining
-            sqlite3SelectDelete + sqlite3DbFree, matching the C call
-            graph 1:1.
-       [X] `sqlite3MarkAllShadowTablesOf` — ported 2026-04-29
-            (build.c:2538).  Walks pTab^.pSchema^.tblHash and tags any
-            ordinary table whose name is "<vtab>_<suffix>" and whose
-            suffix is accepted by the module's xShadowName callback
-            with TF_Shadow.  Previously a no-op so shadow tables of
-            iVersion>=3 modules were never marked.
 ---
 
-## Phase 7 — Parser (one gate open)
+## Phase 7 — Parser
 
 - [ ] **7.1.1** Schema initialisation (prepare.c).  Currently
        `sqlite3ReadSchema` (codegen.pas:21928) returns `SQLITE_OK`
@@ -349,7 +350,8 @@ Important: At the end of this document, please find:
             `sqlite3NestedParse`.
        [ ] Port `sqlite3InitCallback` (main.pas:2063) — currently installs
             only system tables; full body parses each schema row.
-       [ ] Port `schemaIsValid` / `sqlite3SchemaToIndex` plumbing.
+       [ ] Port `schemaIsValid`
+       [ ] Port `sqlite3SchemaToIndex` plumbing.
 
 - [ ] **7.1.2** `sqlite3NestedParse` full driver (build.c).  The
        current skeleton (codegen.pas:25041) early-exits when
