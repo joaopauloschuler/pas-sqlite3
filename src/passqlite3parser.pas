@@ -382,10 +382,11 @@ function  sqlite3IsIdChar(c: u8): i32;
   Returns TK_ID if not a keyword, otherwise the TK_* code. }
 function  sqlite3KeywordCode(z: PByte; n: i32): i32;
 
-{ Keyword enumeration API (sqlite3.h public API). }
-function  sqlite3_keyword_name(idx: i32; out pzName: PAnsiChar; out pnName: i32): i32;
-function  sqlite3_keyword_count: i32;
-function  sqlite3_keyword_check(zName: PAnsiChar; nName: i32): i32;
+{ Keyword enumeration API (sqlite3.h public API).  Uses cdecl for ABI
+  parity with the C reference (keywordhash.h:472..482). }
+function  sqlite3_keyword_name(idx: i32; out pzName: PAnsiChar; out pnName: i32): i32; cdecl;
+function  sqlite3_keyword_count: i32; cdecl;
+function  sqlite3_keyword_check(zName: PAnsiChar; nName: i32): i32; cdecl;
 
 { Run the LALR(1) parser on zSql.  Phase 7.2f — drives the lexer through
   the Lemon engine.  Returns the number of errors encountered. }
@@ -692,7 +693,7 @@ end;
 { Keyword API (sqlite3.h public surface)                                      }
 { =========================================================================== }
 
-function sqlite3_keyword_name(idx: i32; out pzName: PAnsiChar; out pnName: i32): i32;
+function sqlite3_keyword_name(idx: i32; out pzName: PAnsiChar; out pnName: i32): i32; cdecl;
 begin
   if (idx < 0) or (idx >= SQLITE_N_KEYWORD) then begin
     Result := SQLITE_ERROR; Exit;
@@ -703,12 +704,12 @@ begin
   Result := SQLITE_OK;
 end;
 
-function sqlite3_keyword_count: i32;
+function sqlite3_keyword_count: i32; cdecl;
 begin
   Result := SQLITE_N_KEYWORD;
 end;
 
-function sqlite3_keyword_check(zName: PAnsiChar; nName: i32): i32;
+function sqlite3_keyword_check(zName: PAnsiChar; nName: i32): i32; cdecl;
 begin
   if TK_ID <> sqlite3KeywordCode(PByte(zName), nName) then
     Result := 1

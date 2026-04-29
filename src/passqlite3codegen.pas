@@ -21320,8 +21320,7 @@ begin
   pTab := sqlite3SrcListLookup(pParse, pTabList);
   if pTab = nil then goto delete_from_cleanup;
 
-  { Trigger detection — sqlite3TriggersExist is a stub returning nil today;
-    the call shape matches delete.c:352 verbatim. }
+  { delete.c:352 — pick up DELETE triggers (BEFORE/AFTER) on pTab. }
   pTrg := sqlite3TriggersExist(pParse, pTab, TK_DELETE, nil, nil);
   if pTab^.eTabType = TABTYP_VIEW then isView := 1 else isView := 0;
   if (pTrg <> nil) or (sqlite3FkRequired(pParse, pTab, nil, 0) <> 0) then
@@ -22072,8 +22071,7 @@ begin
   if pTab = nil then goto update_cleanup;
   iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
 
-  { Trigger detection — sqlite3TriggersExist is a stub returning nil today;
-    call shape matches update.c:370. }
+  { update.c:370 — pick up UPDATE triggers (BEFORE/AFTER) on pTab. }
   pTrg := sqlite3TriggersExist(pParse, pTab, TK_UPDATE, pChanges, @tmask);
   if pTab^.eTabType = TABTYP_VIEW then isView := 1 else isView := 0;
 
@@ -22846,9 +22844,8 @@ begin
   else
     withoutRowid := 1;
 
-  { Trigger detection — sqlite3TriggersExist is currently a stub returning
-    nil with tmask=0, but the call shape matches insert.c:979 verbatim so
-    that wiring real trigger lookup is a one-line change. }
+  { insert.c:979 — pick up INSERT triggers (BEFORE/AFTER) on pTab; tmask
+    receives the OR of TRIGGER_BEFORE / TRIGGER_AFTER flags. }
   pTrg := sqlite3TriggersExist(pParse, pTab, TK_INSERT, nil, @tmask);
   if pTab^.eTabType = TABTYP_VIEW then isView := 1 else isView := 0;
 
