@@ -228,6 +228,42 @@ begin
         sqlite3_bind_zeroblob64(pStmt, 1, u64(2) shl 40) = SQLITE_TOOBIG);
   sqlite3_finalize(pStmt);
 
+  { Phase 8.3.1 — sqlite3_bind_blob64 / _text64 / _text16 round-trips. }
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT ?', -1, @pStmt, nil);
+  Check('prep SELECT ? for blob64', rcs = SQLITE_OK);
+  Check('bind_blob64 rc=OK',
+        sqlite3_bind_blob64(pStmt, 1, PAnsiChar('xyz'), 3, SQLITE_TRANSIENT)
+          = SQLITE_OK);
+  Check('step blob64 ROW', sqlite3_step(pStmt) = SQLITE_ROW);
+  Check('column_bytes(blob64) = 3', sqlite3_column_bytes(pStmt, 0) = 3);
+  Check('value_type(blob64) = BLOB',
+        sqlite3_value_type(sqlite3_column_value(pStmt, 0)) = SQLITE_BLOB);
+  sqlite3_finalize(pStmt);
+
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT ?', -1, @pStmt, nil);
+  Check('prep SELECT ? for text64', rcs = SQLITE_OK);
+  Check('bind_text64 utf8 rc=OK',
+        sqlite3_bind_text64(pStmt, 1, 'hello', 5, SQLITE_TRANSIENT,
+                            SQLITE_UTF8) = SQLITE_OK);
+  Check('step text64 ROW', sqlite3_step(pStmt) = SQLITE_ROW);
+  Check('column_bytes(text64) = 5', sqlite3_column_bytes(pStmt, 0) = 5);
+  Check('value_type(text64) = TEXT',
+        sqlite3_value_type(sqlite3_column_value(pStmt, 0)) = SQLITE_TEXT);
+  sqlite3_finalize(pStmt);
+
+  { bind_blob64 nil-stmt MISUSE guard. }
+  Check('bind_blob64(nil) = MISUSE',
+        sqlite3_bind_blob64(nil, 1, PAnsiChar('z'), 1, SQLITE_STATIC)
+          = SQLITE_MISUSE);
+  Check('bind_text64(nil) = MISUSE',
+        sqlite3_bind_text64(nil, 1, 'z', 1, SQLITE_STATIC, SQLITE_UTF8)
+          = SQLITE_MISUSE);
+  Check('bind_text16(nil) = MISUSE',
+        sqlite3_bind_text16(nil, 1, PAnsiChar('z'), 2, SQLITE_STATIC)
+          = SQLITE_MISUSE);
+
   { Host-parameter round-trip — verifies sqlite3VdbeMakeReady aVar/nVar
     propagation (vdbeaux.c:2714/2737-2738).  Single `?`, indexed `?N`,
     and named `:`/`@`/`$` forms all flow through OP_Variable. }

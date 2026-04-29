@@ -1581,6 +1581,12 @@ function sqlite3_bind_text(pStmt: PVdbe; i: i32; zData: PAnsiChar;
                            nData: i32; xDel: TxDelProc): i32;
 function sqlite3_bind_blob(pStmt: PVdbe; i: i32; zData: Pointer;
                            nData: i32; xDel: TxDelProc): i32;
+function sqlite3_bind_blob64(pStmt: PVdbe; i: i32; zData: Pointer;
+                             nData: u64; xDel: TxDelProc): i32;
+function sqlite3_bind_text64(pStmt: PVdbe; i: i32; zData: PAnsiChar;
+                             nData: u64; xDel: TxDelProc; enc: u8): i32;
+function sqlite3_bind_text16(pStmt: PVdbe; i: i32; zData: Pointer;
+                             n: i32; xDel: TxDelProc): i32;
 function sqlite3_bind_zeroblob(pStmt: PVdbe; i: i32; n: i32): i32;
 function sqlite3_bind_zeroblob64(pStmt: PVdbe; i: i32; n: u64): i32;
 function sqlite3_bind_pointer(pStmt: PVdbe; i: i32; pPtr: Pointer;
@@ -4227,6 +4233,99 @@ begin
   if zData <> nil then begin
     pVar := pStmt^.aVar + (i - 1);
     rc := sqlite3VdbeMemSetStr(pVar, zData, nData, 0, xDel);
+  end;
+  Result := rc;
+end;
+
+{ vdbeapi.c:1761 — sqlite3_bind_blob64.
+  i64-length blob bind.  C body asserts xDel<>SQLITE_DYNAMIC then
+  delegates to bindText with encoding=0 (BLOB).  Pascal port inlines
+  the bindText body since no shared helper exists; sqlite3VdbeMemSetStr
+  already accepts i64 nData and enforces SQLITE_LIMIT_LENGTH. }
+function sqlite3_bind_blob64(pStmt: PVdbe; i: i32; zData: Pointer;
+                             nData: u64; xDel: TxDelProc): i32;
+var
+  rc: i32;
+  pVar: PMem;
+begin
+  rc := vdbeUnbind55(pStmt, u32(i - 1));
+  if rc <> SQLITE_OK then begin
+    if (xDel <> SQLITE_STATIC) and (xDel <> SQLITE_TRANSIENT) and
+       (xDel <> nil) and (zData <> nil) then
+      xDel(zData);
+    Result := rc; Exit;
+  end;
+  if zData <> nil then begin
+    pVar := pStmt^.aVar + (i - 1);
+    rc := sqlite3VdbeMemSetStr(pVar, zData, i64(nData), 0, xDel);
+  end;
+  Result := rc;
+end;
+
+{ vdbeapi.c:1834 — sqlite3_bind_text64.
+  i64-length text bind with explicit encoding.  Mirrors the C body:
+  for non-UTF8 encodings, SQLITE_UTF16 is mapped to SQLITE_UTF16NATIVE
+  and nData is masked to even (drops trailing half-codeunit). }
+function sqlite3_bind_text64(pStmt: PVdbe; i: i32; zData: PAnsiChar;
+                             nData: u64; xDel: TxDelProc; enc: u8): i32;
+var
+  rc: i32;
+  pVar: PMem;
+  effEnc: u8;
+  effLen: i64;
+begin
+  effEnc := enc;
+  effLen := i64(nData);
+  if effEnc <> SQLITE_UTF8 then begin
+    if effEnc = SQLITE_UTF16 then effEnc := SQLITE_UTF16NATIVE;
+    effLen := effLen and (not i64(1));
+  end;
+  rc := vdbeUnbind55(pStmt, u32(i - 1));
+  if rc <> SQLITE_OK then begin
+    if (xDel <> SQLITE_STATIC) and (xDel <> SQLITE_TRANSIENT) and
+       (xDel <> nil) and (zData <> nil) then
+      xDel(zData);
+    Result := rc; Exit;
+  end;
+  if zData <> nil then begin
+    pVar := pStmt^.aVar + (i - 1);
+    if effEnc = SQLITE_UTF8 then begin
+      rc := sqlite3VdbeMemSetText(pVar, zData, effLen, xDel);
+      if rc = SQLITE_OK then
+        rc := sqlite3VdbeChangeEncoding(pVar, PTsqlite3(pStmt^.db)^.enc);
+    end else begin
+      rc := sqlite3VdbeMemSetStr(pVar, zData, effLen, effEnc, xDel);
+      if rc = SQLITE_OK then
+        rc := sqlite3VdbeChangeEncoding(pVar, PTsqlite3(pStmt^.db)^.enc);
+    end;
+  end;
+  Result := rc;
+end;
+
+{ vdbeapi.c:1850 — sqlite3_bind_text16.
+  UTF-16 text bind.  C body delegates to bindText with
+  SQLITE_UTF16NATIVE encoding and length masked to even. }
+function sqlite3_bind_text16(pStmt: PVdbe; i: i32; zData: Pointer;
+                             n: i32; xDel: TxDelProc): i32;
+var
+  rc: i32;
+  pVar: PMem;
+  effLen: i64;
+begin
+  effLen := i64(n) and (not i64(1));
+  rc := vdbeUnbind55(pStmt, u32(i - 1));
+  if rc <> SQLITE_OK then begin
+    if (xDel <> SQLITE_STATIC) and (xDel <> SQLITE_TRANSIENT) and
+       (xDel <> nil) and (zData <> nil) then
+      xDel(zData);
+    Result := rc; Exit;
+  end;
+  if zData <> nil then begin
+    pVar := pStmt^.aVar + (i - 1);
+    rc := sqlite3VdbeMemSetStr(pVar, PAnsiChar(zData), effLen,
+                               SQLITE_UTF16NATIVE, xDel);
+    if rc = SQLITE_OK then
+      rc := sqlite3VdbeChangeEncoding(pVar, PTsqlite3(pStmt^.db)^.enc);
   end;
   Result := rc;
 end;

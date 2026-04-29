@@ -641,9 +641,17 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             `sqlite3VdbeScanStatus*` arms landing first.
 
 - [ ] **8.3.1** Bind variants (vdbeapi.c):
-       [ ] `sqlite3_bind_blob64` — i64-length blob bind.
-       [ ] `sqlite3_bind_text16` — UTF-16 text bind.
-       [ ] `sqlite3_bind_text64` — i64-length text bind.
+       [X] `sqlite3_bind_blob64` / `sqlite3_bind_text64` /
+            `sqlite3_bind_text16` — ported 2026-04-28 (passqlite3vdbe.pas)
+            mirroring the C bindText helper at vdbeapi.c:1696.  blob64
+            takes a u64 length and routes to sqlite3VdbeMemSetStr with
+            enc=0; text64 maps SQLITE_UTF16 → SQLITE_UTF16NATIVE and
+            masks nData to even for non-UTF8 encodings before delegating
+            to MemSetText/MemSetStr + ChangeEncoding to the connection
+            encoding; text16 inlines the n & ~1 mask plus
+            SQLITE_UTF16NATIVE delegation.  Misuse + round-trip covered
+            by DiagPubApi (156/0).  TestExplainParity 1016/10 — no
+            regression.
        [X] `sqlite3_bind_zeroblob` / `_zeroblob64` — ported 2026-04-28
             (passqlite3vdbe.pas) — vdbeUnbind55 + sqlite3VdbeMemSetZeroBlob;
             64-bit variant gates on aLimit[LIMIT_LENGTH] for SQLITE_TOOBIG.
