@@ -33,24 +33,10 @@ Important: At the end of this document, please find:
        against `../sqlite3/src/`.  Each entry below has a non-trivial C
        body that the current Pascal version silently elides.
 
-       VDBE auxiliary (vdbeaux.c):
-       [X] `sqlite3VdbeExplainPop` — closed
-       [X] `sqlite3VdbeEnter` / `sqlite3VdbeLeave` — closed 2026-04-29.
-            Empty bodies match the OMIT_SHARED_CACHE macro expansions
-            (vdbeInt.h:714/720); Pas has no shared-cache so this is the
-            faithful port for the build configuration.
-
        Pragma (pragma.c):
        [ ] `sqlite3PragmaVtabRegister` — returns `nil`; registers
             `pragma_*` eponymous virtual tables via
             `sqlite3VtabCreateModule` + `pragmaVtabModule`.
-
-       Btree mutex (btmutex.c / btree.c):
-       [X] `sqlite3BtreeHoldsAllMutexes` — closed 2026-04-29.  Returns
-            constant 1 (matches btree.h:420 macro for OMIT_SHARED_CACHE).
-       [X] `sqlite3BtreeSchemaLocked` — closed 2026-04-29.  Returns
-            SQLITE_OK (querySharedCacheTableLock is no-op without
-            shared cache).
 
 - [ ] **6.8.1** port `sqlite3Update`
 - [ ] **6.8.2** port `sqlite3GenerateConstraintChecks`
@@ -266,13 +252,6 @@ Important: At the end of this document, please find:
       [X] **g) `GROUP BY ... HAVING ...`** — closed 2026-04-29.
       [X] **h) `GROUP BY ... ORDER BY <col> DESC`** — closed 2026-04-29.
 
-  [X] **6.10 step 20** Host-parameter binding (`?`/`?N`/`:name`/
-      `@name`/`$name`)
-
-  [X] **6.10 step 21** DiagPrintfFmt probe
-
-  [X] **6.10 step 18** TestAuthBuiltins
-
   [ ] **6.10 step 19** DiagDml runtime probe (added 2026-04-28,
       `src/tests/DiagDml.pas`, run `LD_LIBRARY_PATH=$PWD/src bin/DiagDml`).
       Sweep of UPSERT / RETURNING / INSERT-FROM-SELECT / UPDATE-FROM /
@@ -292,15 +271,6 @@ Important: At the end of this document, please find:
         coroutine path is bypassed.  Closing requires the UNION-ALL arm of
         `sqlite3MultiValues` (codegen.pas:21268) plus sqlite3Insert pSelect
         path (same codegen.pas:19756 TODO).
-
-  [X] **6.10 step 22** Ephemeral b-tree dedup over TEXT/BLOB keys
-
-  [X] **6.10 step 23** absFunc error-message parity
-
-  [X] **6.10 step 24** Scalar built-in parity sweep — closed
-
-  [X] **6.10 step 27** LIKE / GLOB / NOT LIKE / NOT GLOB / ESCAPE
-      parity sweep — closed 2026-04-29 (DiagLikeGlob, 55/55 PASS).
 
   [ ] **6.10 step 26** DiagIndexing probe
       (`src/tests/DiagIndexing.pas`, baseline 44 cases / 15 DIVERGE on
@@ -324,9 +294,6 @@ Important: At the end of this document, please find:
         and sqlite3GenerateConstraintChecks gaps (e + 6.9-bis 11g.2.b);
         triage when those land.
 
-  [X] **6.10 step 25** Date/time `'now'` + strftime `%s` parity —
-      closed 2026-04-29.
-
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
         the sqlite_schema scrub now uses one-pass inline delete.
@@ -349,17 +316,6 @@ Important: At the end of this document, please find:
        still stub, but every db this port produces is corruption-free
        by construction).
   [ ] **6.13** port sqlite3Vacuum in full
-  [X] **6.14** port sqlite3WhereTabFuncArgs in full (whereexpr.c:1899..1944).
-  [X] **6.15** port sqlite3WhereAddLimit + whereAddLimitExpr in full
-       (whereexpr.c:1620..1736).
-  [X] **6.16** port btree.pas stubs in full: `ptrmapPutOvflPtr`,
-       `invalidateIncrblobCursors`.
-  [X] **6.17** port pager.pas stubs in full: `pager_reset`,
-       `pagerReleaseMapPage`, `sqlite3_log`.
-  [X] **6.18** port wal.pas stub `sqlite3_log_wal` in full.
-  [X] **6.19** port util.pas stubs `sqlite3_mprintf` / `sqlite3_snprintf`
-       in full.
-  [ ] **6.20** port remaining parser.pas stubs in full:
   [ ] **6.21** port vdbe.pas stubs in full from C to pascal:
        [X] `sqlite3VdbeMultiLoad` — ported 2026-04-29 (vdbeaux.c:391).
             Variadic 'i'/'s'/'X' walker exposed via `array of const`
@@ -423,7 +379,14 @@ Important: At the end of this document, please find:
             Side-fix: stub had wrong 4th arg (pIdx instead of pAll) —
             signature now matches C.  Dead-code until
             sqlite3GenerateConstraintChecks lands.
-       [ ] `sqlite3UpsertDoUpdate`,
+       [X] `sqlite3UpsertDoUpdate` — ported 2026-04-29 (upsert.c:267).
+            Seek-on-conflict arm for both rowid + WITHOUT-ROWID PK paths
+            (OP_IdxRowid/OP_SeekRowid for rowid; OP_Column probe + Found
+            corruption-halt for the PK-vector arm).  Duplicates
+            pUpsertSrc / pUpsertSet / pUpsertWhere before handing off to
+            sqlite3Update with OE_Abort + pUpsert; coerces excluded.* REAL
+            columns via OP_RealAffinity.  Dead-code until sqlite3Update
+            body is productive (6.9-bis).
        [X] `sqlite3AutoincrementBegin` — ported 2026-04-29 (insert.c:460).
        [X] `sqlite3AutoincrementEnd` + `autoIncrementEnd` — ported 2026-04-29
             (insert.c:534/571).  Both lists (autoInc[12], autoIncEnd[5])

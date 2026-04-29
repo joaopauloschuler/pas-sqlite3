@@ -20512,11 +20512,89 @@ begin
   Result := nil;
 end;
 
-{ sqlite3UpsertDoUpdate — generate VDBE for DO UPDATE clause (Phase 6.4 stub) }
+{ sqlite3UpsertDoUpdate — port of upsert.c:267.
+  Generate VDBE for the DO UPDATE arm of an UPSERT after the unique
+  constraint pIdx (or the IPK if pIdx is nil) has fired.  iCur points at
+  the conflicting row (table cursor when pIdx is nil; index cursor
+  otherwise).  The function (a) seeks the table cursor onto the
+  conflicting rowid when an index cursor was supplied, (b) coerces
+  excluded.* REAL columns, and (c) hands off to sqlite3Update with a
+  duplicated FROM-clause and SET/WHERE expression lists.
+
+  Dead-code today because sqlite3Update is still a skeleton — but the
+  full body must land here so the upsert pipeline matches C once Update
+  is productive. }
 procedure sqlite3UpsertDoUpdate(pParse: PParse; pUpsert: PUpsert;
   pTab: PTable2; pIdx: PIndex2; iCur: i32);
+var
+  v:        PVdbe;
+  db:       PTsqlite3;
+  pSrc:     PSrcList;
+  pTop:     PUpsert;
+  iDataCur: i32;
+  i, k, n:  i32;
+  regRowid: i32;
+  pPk:      PIndex2;
+  nPk:      i32;
+  iPk:      i32;
+  iAddr:    i32;
+  pColAt:   PColumn;
 begin
-  { Full implementation requires WhereBegin / code gen — Phase 6.5+ }
+  v  := pParse^.pVdbe;
+  db := pParse^.db;
+  pTop := pUpsert;
+  iDataCur := pUpsert^.iDataCur;
+  pUpsert := sqlite3UpsertOfIndex(pTop, pIdx);
+  { VdbeNoopComment(v, "Begin DO UPDATE of UPSERT") — debug-only no-op }
+  if (pIdx <> nil) and (iCur <> iDataCur) then
+  begin
+    if HasRowid(pTab) then
+    begin
+      regRowid := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp2(v, OP_IdxRowid, iCur, regRowid);
+      sqlite3VdbeAddOp3(v, OP_SeekRowid, iDataCur, 0, regRowid);
+      { VdbeCoverage(v) — debug-only no-op }
+      sqlite3ReleaseTempReg(pParse, regRowid);
+    end
+    else
+    begin
+      pPk := sqlite3PrimaryKeyIndex(pTab);
+      nPk := i32(pPk^.nKeyCol);
+      iPk := pParse^.nMem + 1;
+      pParse^.nMem := pParse^.nMem + nPk;
+      for i := 0 to nPk - 1 do
+      begin
+        { assert(pPk->aiColumn[i] >= 0) }
+        k := sqlite3TableColumnToIndex(pIdx, pPk^.aiColumn[i]);
+        sqlite3VdbeAddOp3(v, OP_Column, iCur, k, iPk + i);
+        { VdbeComment((v,"%s.%s", pIdx->zName, pTab->aCol[..].zCnName))
+          — debug-only no-op }
+      end;
+      { sqlite3VdbeVerifyAbortable(v, OE_Abort) — debug-only no-op }
+      iAddr := sqlite3VdbeAddOp4Int(v, OP_Found, iDataCur, 0, iPk, nPk);
+      { VdbeCoverage(v) — debug-only no-op }
+      sqlite3VdbeAddOp4(v, OP_Halt, SQLITE_CORRUPT, OE_Abort, 0,
+        'corrupt database', P4_STATIC);
+      sqlite3MayAbort(pParse);
+      sqlite3VdbeJumpHere(v, iAddr);
+    end;
+  end;
+  { pUpsert does not own pTop->pUpsertSrc — the outer INSERT does, so
+    we duplicate before passing into sqlite3Update. }
+  pSrc := sqlite3SrcListDup(db, pTop^.pUpsertSrc, 0);
+  { excluded.* columns of type REAL need to be converted to a hard real }
+  n := i32(pTab^.nCol);
+  for i := 0 to n - 1 do
+  begin
+    pColAt := PColumn(PByte(pTab^.aCol) + SizeOf(TColumn) * i);
+    if pColAt^.affinity = AnsiChar(SQLITE_AFF_REAL) then
+      sqlite3VdbeAddOp1(v, OP_RealAffinity, pTop^.regData + i);
+  end;
+  sqlite3Update(pParse, pSrc,
+    sqlite3ExprListDup(db, pUpsert^.pUpsertSet, 0),
+    sqlite3ExprDup(db, pUpsert^.pUpsertWhere, 0),
+    OE_Abort, nil, nil, pUpsert);
+  { VdbeNoopComment(v, "End DO UPDATE of UPSERT") — debug-only no-op }
 end;
 
 // ===========================================================================
