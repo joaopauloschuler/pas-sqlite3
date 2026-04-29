@@ -661,7 +661,10 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             divergences resolved by correct named-bind slot reuse).
 
 - [ ] **8.3.2** Result / value variants (vdbeapi.c, vdbemem.c):
-       [ ] `sqlite3_result_blob64`.
+       [X] `sqlite3_result_blob64` — ported 2026-04-28 (passqlite3vdbe.pas).
+            Mirrors existing `sqlite3_result_text64` shape: u64 length,
+            n>0x7FFFFFFF routes to `sqlite3_result_error_toobig`,
+            otherwise delegates to `sqlite3VdbeMemSetStr` with enc=0.
        [ ] `sqlite3_result_text16` / `_text16be` / `_text16le`.
        [ ] `sqlite3_result_error16` — UTF-16 error string.
        [X] `sqlite3_result_error_code` — ported 2026-04-28

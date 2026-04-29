@@ -1601,6 +1601,8 @@ procedure sqlite3_result_text(pCtx: Psqlite3_context; z: PAnsiChar;
   n: i32; xDel: TxDelProc);
 procedure sqlite3_result_blob(pCtx: Psqlite3_context; z: Pointer;
   n: i32; xDel: TxDelProc);
+procedure sqlite3_result_blob64(pCtx: Psqlite3_context; z: Pointer;
+  n: u64; xDel: TxDelProc);
 procedure sqlite3_result_value(pCtx: Psqlite3_context; pVal: Psqlite3_value);
 procedure sqlite3_result_error(pCtx: Psqlite3_context; z: PAnsiChar; n: i32);
 procedure sqlite3_result_error_nomem(pCtx: Psqlite3_context);
@@ -4424,6 +4426,21 @@ procedure sqlite3_result_blob(pCtx: Psqlite3_context; z: Pointer;
 begin
   if pCtx = nil then Exit;
   sqlite3VdbeMemSetStr(pCtx^.pOut, z, n, 0, xDel);
+end;
+
+{ vdbeapi.c:880 — wide-length blob result.  Mirrors sqlite3_result_blob
+  but accepts a u64 length so callers producing >2GB payloads can at
+  least signal SQLITE_TOOBIG instead of overflowing into a negative i32. }
+procedure sqlite3_result_blob64(pCtx: Psqlite3_context; z: Pointer;
+  n: u64; xDel: TxDelProc);
+begin
+  if pCtx = nil then Exit;
+  if n > $7FFFFFFF then
+  begin
+    sqlite3_result_error_toobig(pCtx);
+    Exit;
+  end;
+  sqlite3VdbeMemSetStr(pCtx^.pOut, z, i64(n), 0, xDel);
 end;
 
 procedure sqlite3_result_value(pCtx: Psqlite3_context; pVal: Psqlite3_value);
