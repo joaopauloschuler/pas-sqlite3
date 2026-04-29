@@ -733,12 +733,20 @@ Important: At the end of this document, please find:
             105/0, TestAuthBuiltins 34/0, TestCarray 74/0,
             DiagSumOverflow 12/0.
 
-- [ ] **7.1.4** DbFixer — schema-name fixups for ATTACH (attach.c).
-       All four currently return `SQLITE_OK` no-op:
-       [ ] `sqlite3FixSrcList` (codegen.pas:25395).
-       [ ] `sqlite3FixSelect` (codegen.pas:25400).
-       [ ] `sqlite3FixExpr` (codegen.pas:25405).
-       [ ] `sqlite3FixTriggerStep` (codegen.pas:25410).
+- [X] **7.1.4** DbFixer — closed 2026-04-29.  Verbatim port of attach.c:457..621
+       in passqlite3codegen.pas: `fixExprCb` tags every Expr with EP_FromDDL
+       (when not in TEMP) and rejects bound parameters; `fixSelectCb` walks
+       SrcList items, binds each non-subquery item to pFix^.pSchema, and
+       reports `<type> <name> cannot reference objects in database <db>` when
+       the original SQL named a different schema.  TDbFixer record extended
+       to carry the embedded TWalker + bTemp; TWalkerU gained a pFix slot.
+       Wired through the existing CREATE VIEW (codegen.pas:23985) and CREATE
+       INDEX (codegen.pas:24607) call sites.  No regressions:
+       TestExplainParity 1016/10, TestParser 45/0, TestVdbeApi 57/0,
+       TestSelectBasic 49/0, TestVdbeAgg 11/0, TestBtreeCompat 337/0,
+       TestDMLBasic 54/0, TestWhereBasic 52/0, TestCarray 74/0,
+       TestPrintf 105/0, TestAuthBuiltins 34/0, DiagPubApi 240/0,
+       DiagFeatureProbe 9, DiagWindow 15, DiagSumOverflow 12/0.
 
 - [ ] **7.1.7** Lemon parser tail (parse.c epilogue) — gaps inside
        `passqlite3parser.pas`:

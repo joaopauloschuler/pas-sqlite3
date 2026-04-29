@@ -831,6 +831,7 @@ type
       7: (pSelect:  PSelect);
       8: (aiCol:    Pi32);    { CHECK-constraint changed-column map (insert.c:1727) }
       9: (pCheckOnCtx: Pointer);  { CheckOnCtx*  (select.c:7392) }
+     10: (pFix:     PDbFixer);    { attach.c sqlite3FixAAAA() walker context }
   end;
 
   TWalker = record
@@ -965,8 +966,9 @@ type
   { --- TDbFixer (attach.c) --- }
   TDbFixer = record
     pParse   : PParse;
+    w        : TWalker;
     pSchema  : PSchema;
-    bVarOnly : u8;
+    bTemp    : u8;
     _pad1    : array[0..2] of u8;
     zDb      : PAnsiChar;
     zType    : PAnsiChar;
@@ -26047,35 +26049,166 @@ begin
   sqlite3ExprDelete(pParse^.db, pKey);
 end;
 
+{ Phase 7.1.4 — DbFixer port (attach.c:457..621).
+  Walks a parse-tree fragment associated with CREATE VIEW / CREATE INDEX /
+  CREATE TRIGGER and (a) tags every Expr with EP_FromDDL when the container
+  is not in the TEMP schema, (b) rejects bound-parameter references in
+  schema-bound DDL, (c) binds every SrcItem to pFix^.pSchema, complaining
+  if the original SQL named a different database. }
+function fixExprCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pFix: PDbFixer;
+begin
+  pFix := pWalker^.u.pFix;
+  if pFix^.bTemp = 0 then
+    ExprSetProperty(pExpr, EP_FromDDL);
+  if pExpr^.op = TK_VARIABLE then
+  begin
+    if pFix^.pParse^.db^.init.busy <> 0 then
+    begin
+      pExpr^.op := TK_NULL;
+    end
+    else
+    begin
+      sqlite3ErrorMsg(pFix^.pParse, sqlite3MPrintf(Psqlite3db(pFix^.pParse^.db),
+        '%s cannot use variables', [pFix^.zType]));
+      Result := WRC_Abort; Exit;
+    end;
+  end;
+  Result := WRC_Continue;
+end;
+
+function fixSelectCb(pWalker: PWalker; pSelect: PSelect): i32; cdecl;
+var
+  pFix:    PDbFixer;
+  i:       i32;
+  pItem:   PSrcItem;
+  db:      PTsqlite3;
+  iDb:     i32;
+  pList:   PSrcList;
+  pWth:    PWith;
+  pCteBase: PCte;
+  pSubSel: PSelect;
+begin
+  pFix := pWalker^.u.pFix;
+  db   := pFix^.pParse^.db;
+  iDb  := sqlite3FindDbName(db, pFix^.zDb);
+  pList := pSelect^.pSrc;
+
+  if pList = nil then begin Result := WRC_Continue; Exit; end;
+  pItem := SrcListItems(pList);
+  for i := 0 to pList^.nSrc - 1 do
+  begin
+    if (pFix^.bTemp = 0)
+       and ((pItem^.fg.fgBits and u8($04)) = 0)  { not isSubquery }
+    then
+    begin
+      if ((pItem^.fg.fgBits3 and u8($01)) = 0)   { fixedSchema not set }
+         and (pItem^.u4.zDatabase <> nil) then
+      begin
+        if iDb <> sqlite3FindDbName(db, pItem^.u4.zDatabase) then
+        begin
+          sqlite3ErrorMsg(pFix^.pParse,
+            sqlite3MPrintf(Psqlite3db(db),
+              '%s %T cannot reference objects in database %s',
+              [pFix^.zType, pFix^.pName, pItem^.u4.zDatabase]));
+          Result := WRC_Abort; Exit;
+        end;
+        sqlite3DbFree(db, pItem^.u4.zDatabase);
+        pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or u8($04);  { notCte }
+        pItem^.fg.fgBits3 := pItem^.fg.fgBits3 or u8($02);  { hadSchema }
+      end;
+      pItem^.u4.pSchema := pFix^.pSchema;
+      pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or u8($01);    { fromDDL }
+      pItem^.fg.fgBits3 := pItem^.fg.fgBits3 or u8($01);    { fixedSchema }
+    end;
+    if ((pItem^.fg.fgBits2 and u8($08)) = 0)  { not isUsing }
+       and (sqlite3WalkExpr(@pFix^.w, pItem^.u3.pOn) = WRC_Abort) then
+    begin Result := WRC_Abort; Exit; end;
+    Inc(pItem);
+  end;
+
+  pWth := pSelect^.pWith;
+  if pWth <> nil then
+  begin
+    pCteBase := PCte(PByte(pWth) + SZ_WITH_HEADER);
+    for i := 0 to pWth^.nCte - 1 do
+    begin
+      pSubSel := PCte(PByte(pCteBase) + PtrUInt(i) * SZ_CTE)^.pSelect;
+      if sqlite3WalkSelect(pWalker, pSubSel) = WRC_Abort then
+      begin Result := WRC_Abort; Exit; end;
+    end;
+  end;
+  Result := WRC_Continue;
+end;
+
 procedure sqlite3FixInit(pFix: PDbFixer; pParse: PParse; iDb: i32;
   zType: PAnsiChar; const pName: PToken);
+var
+  db: PTsqlite3;
 begin
+  db := pParse^.db;
+  AssertH(db^.nDb > iDb, 'FixInit: iDb out of range');
   FillChar(pFix^, SizeOf(TDbFixer), 0);
-  pFix^.pParse := pParse;
-  pFix^.zDb := pParse^.db^.aDb[iDb].zDbSName;
-  pFix^.zType := zType;
-  pFix^.pName := pName;
-  pFix^.pSchema := pParse^.db^.aDb[iDb].pSchema;
+  pFix^.pParse  := pParse;
+  pFix^.zDb     := db^.aDb[iDb].zDbSName;
+  pFix^.pSchema := db^.aDb[iDb].pSchema;
+  pFix^.zType   := zType;
+  pFix^.pName   := pName;
+  if iDb = 1 then pFix^.bTemp := 1 else pFix^.bTemp := 0;
+  pFix^.w.pParse           := pParse;
+  pFix^.w.xExprCallback    := @fixExprCb;
+  pFix^.w.xSelectCallback  := @fixSelectCb;
+  pFix^.w.xSelectCallback2 := @sqlite3WalkWinDefnDummyCallback;
+  pFix^.w.walkerDepth      := 0;
+  pFix^.w.eCode            := 0;
+  pFix^.w.u.pFix           := pFix;
 end;
 
 function sqlite3FixSrcList(pFix: PDbFixer; pList: PSrcList): i32;
+var
+  s: TSelect;
 begin
-  Result := SQLITE_OK;
+  if pList = nil then begin Result := SQLITE_OK; Exit; end;
+  FillChar(s, SizeOf(s), 0);
+  s.pSrc := pList;
+  Result := sqlite3WalkSelect(@pFix^.w, @s);
 end;
 
 function sqlite3FixSelect(pFix: PDbFixer; pSelect: PSelect): i32;
 begin
-  Result := SQLITE_OK;
+  Result := sqlite3WalkSelect(@pFix^.w, pSelect);
 end;
 
 function sqlite3FixExpr(pFix: PDbFixer; pExpr: PExpr): i32;
 begin
-  Result := SQLITE_OK;
+  Result := sqlite3WalkExpr(@pFix^.w, pExpr);
 end;
 
 function sqlite3FixTriggerStep(pFix: PDbFixer; pStep: PTriggerStep): i32;
+var
+  pUp: PUpsert;
 begin
-  Result := SQLITE_OK;
+  while pStep <> nil do
+  begin
+    if (sqlite3WalkSelect  (@pFix^.w, pStep^.pSelect)    = WRC_Abort)
+       or (sqlite3WalkExpr (@pFix^.w, pStep^.pWhere)     = WRC_Abort)
+       or (sqlite3WalkExprList(@pFix^.w, pStep^.pExprList) = WRC_Abort)
+       or (sqlite3FixSrcList(pFix, pStep^.pSrc) <> 0) then
+    begin Result := 1; Exit; end;
+    pUp := pStep^.pUpsert;
+    while pUp <> nil do
+    begin
+      if (sqlite3WalkExprList(@pFix^.w, pUp^.pUpsertTarget)      = WRC_Abort)
+         or (sqlite3WalkExpr (@pFix^.w, pUp^.pUpsertTargetWhere) = WRC_Abort)
+         or (sqlite3WalkExprList(@pFix^.w, pUp^.pUpsertSet)      = WRC_Abort)
+         or (sqlite3WalkExpr (@pFix^.w, pUp^.pUpsertWhere)       = WRC_Abort) then
+      begin Result := 1; Exit; end;
+      pUp := pUp^.pNextUpsert;
+    end;
+    pStep := pStep^.pNext;
+  end;
+  Result := 0;
 end;
 
 // ===========================================================================
