@@ -596,6 +596,7 @@ function  sqlite3BtreeCommitPhaseOne(p: PBtree; zSuperJrnl: PChar): i32;
 function  sqlite3BtreeCommitPhaseTwo(p: PBtree; bCleanup: i32): i32;
 function  sqlite3BtreeCommit(p: PBtree): i32;
 function  sqlite3BtreeRollback(p: PBtree; tripCode: i32; writeOnly: i32): i32;
+function  sqlite3BtreeSavepoint(p: PBtree; op: i32; iSavepoint: i32): i32;
 
 { ===========================================================================
   Phase 4.4 — Delete path
@@ -6247,6 +6248,35 @@ begin
   end;
   btreeEndTransaction(p);
   sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c:4614 — sqlite3BtreeSavepoint.
+  Release / rollback to the named statement-savepoint of a write txn.
+  No-op for read-only / no-txn btrees. }
+function sqlite3BtreeSavepoint(p: PBtree; op: i32; iSavepoint: i32): i32;
+var
+  rc  : i32;
+  pBt : PBtShared;
+  pP1 : PMemPage;
+begin
+  rc := SQLITE_OK;
+  if (p <> nil) and (p^.inTrans = TRANS_WRITE) then begin
+    pBt := p^.pBt;
+    sqlite3BtreeEnter(p);
+    if op = SAVEPOINT_ROLLBACK then
+      rc := saveAllCursors(pBt, 0, nil);
+    if rc = SQLITE_OK then
+      rc := sqlite3PagerSavepoint(pBt^.pPager, op, iSavepoint);
+    if rc = SQLITE_OK then begin
+      if (iSavepoint < 0) and ((pBt^.btsFlags and BTS_INITIALLY_EMPTY) <> 0) then
+        pBt^.nPage := 0;
+      rc := newDatabase(pBt);
+      pP1 := pBt^.pPage1;
+      if pP1 <> nil then btreeSetNPage(pBt, pP1);
+    end;
+    sqlite3BtreeLeave(p);
+  end;
   Result := rc;
 end;
 

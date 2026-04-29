@@ -3461,20 +3461,56 @@ end;
 
 { --- Statement close --- }
 
-{ vdbeaux.c:3265 — early-exit guard.  The non-trivial vdbeCloseStatement
-  arm (sqlite3BtreeSavepoint walk + nDeferredCons restore) is gated on
-  `db->nStatement && p->iStatement`; p^.iStatement is only set by
-  sqlite3VdbeOpenStatement opening a per-statement savepoint, which is
-  never reached today (sqlite3BtreeSavepoint not yet ported), so the
-  guard always falls through to SQLITE_OK — matches the C early-exit. }
+{ vdbeaux.c:3215 — vdbeCloseStatement (release/rollback the per-stmt savepoint
+  on every attached btree, then on every vtab, then unwind nDeferredCons). }
+function vdbeCloseStatement(p: PVdbe; eOp: i32): i32;
+var
+  db          : PTsqlite3;
+  rc, rc2     : i32;
+  i           : i32;
+  iSavepoint  : i32;
+  pBt         : PBtree;
+  pAdb        : PtrUInt;
+begin
+  db         := PTsqlite3(p^.db);
+  rc         := SQLITE_OK;
+  iSavepoint := p^.iStatement - 1;
+  for i := 0 to db^.nDb - 1 do begin
+    pAdb := PtrUInt(db^.aDb) + PtrUInt(i) * SizeOf(TDb);
+    pBt  := PBtree(PDb(pAdb)^.pBt);
+    if pBt <> nil then begin
+      rc2 := SQLITE_OK;
+      if eOp = SAVEPOINT_ROLLBACK then
+        rc2 := sqlite3BtreeSavepoint(pBt, SAVEPOINT_ROLLBACK, iSavepoint);
+      if rc2 = SQLITE_OK then
+        rc2 := sqlite3BtreeSavepoint(pBt, SAVEPOINT_RELEASE, iSavepoint);
+      if rc = SQLITE_OK then rc := rc2;
+    end;
+  end;
+  Dec(db^.nStatement);
+  p^.iStatement := 0;
+  if rc = SQLITE_OK then begin
+    if eOp = SAVEPOINT_ROLLBACK then
+      rc := sqlite3VtabSavepoint(db, SAVEPOINT_ROLLBACK, iSavepoint);
+    if rc = SQLITE_OK then
+      rc := sqlite3VtabSavepoint(db, SAVEPOINT_RELEASE, iSavepoint);
+  end;
+  if eOp = SAVEPOINT_ROLLBACK then begin
+    db^.nDeferredCons    := p^.nStmtDefCons;
+    db^.nDeferredImmCons := p^.nStmtDefImmCons;
+  end;
+  Result := rc;
+end;
+
+{ vdbeaux.c:3265 — sqlite3VdbeCloseStatement.  Outer guard: only walk the
+  btrees when an outer transaction has actually opened a per-statement
+  savepoint (db^.nStatement>0 and p^.iStatement set). }
 function sqlite3VdbeCloseStatement(p: PVdbe; eOp: i32): i32;
 begin
-  if p^.iStatement <> 0 then begin
-    { vdbeCloseStatement body — gated on sqlite3BtreeSavepoint port. }
+  if (PTsqlite3(p^.db)^.nStatement <> 0) and (p^.iStatement <> 0) then
+    Result := vdbeCloseStatement(p, eOp)
+  else
     Result := SQLITE_OK;
-  end else begin
-    Result := SQLITE_OK;
-  end;
 end;
 
 { vdbeaux.c:3284 — vdbeFkError.  Set the VM's rc/errorAction/zErrMsg

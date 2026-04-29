@@ -34,9 +34,22 @@ Important: At the end of this document, please find:
        body that the current Pascal version silently elides.
 
        VDBE auxiliary (vdbeaux.c):
-       [ ] `sqlite3VdbeCloseStatement` (vdbe.pas) — currently returns
-            `SQLITE_OK`; missing the `vdbeCloseStatement(p, eOp)` arm
-            taken when `p^.db^.nStatement and p^.iStatement`.
+       [X] `sqlite3VdbeCloseStatement` — closed 2026-04-29.  Ported the
+            `vdbeCloseStatement` body in vdbe.pas (verbatim from
+            vdbeaux.c:3215..3263): per-attached-btree
+            sqlite3BtreeSavepoint(ROLLBACK then RELEASE), nStatement
+            decrement, sqlite3VtabSavepoint pair, and nDeferredCons
+            restore on ROLLBACK.  Required helper `sqlite3BtreeSavepoint`
+            ported in btree.pas (verbatim from btree.c:4614 — no
+            shared-cache, gated on inTrans=TRANS_WRITE; calls
+            saveAllCursors → sqlite3PagerSavepoint → newDatabase →
+            btreeSetNPage).  Not yet exercised by any test path because
+            the VDBE op that opens a per-statement savepoint is not
+            emitted yet (lands with sqlite3GenerateConstraintChecks /
+            sqlite3Update); regressions clean: TestBtreeCompat 337/0,
+            TestExplainParity 1016/10, TestVdbeApi 57/0, TestDMLBasic
+            54/0, TestSelectBasic 49/0, TestVdbeAgg 11/0,
+            TestPagerRollback ALL PASS, TestVdbeTxn 8/0.
        [X] `sqlite3VdbeRecordCompareWithSkip` — closed 2026-04-28.
             vdbe.pas wrapper now delegates to the full
             `sqlite3VdbeRecordCompare` body in btree.pas (bSkip=0 is
