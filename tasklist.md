@@ -34,28 +34,6 @@ Important: At the end of this document, please find:
        body that the current Pascal version silently elides.
 
        VDBE auxiliary (vdbeaux.c):
-       [X] `sqlite3VdbeCloseStatement` — closed 2026-04-29 (vdbe.pas
-            verbatim from vdbeaux.c:3215..3263); required helper
-            `sqlite3BtreeSavepoint` ported in btree.pas (btree.c:4614,
-            no shared-cache).  Not yet exercised: VDBE op that opens a
-            per-statement savepoint lands with
-            sqlite3GenerateConstraintChecks / sqlite3Update.
-       [X] `sqlite3VdbeRecordCompareWithSkip` — closed 2026-04-28.
-            vdbe.pas wrapper now delegates to the full
-            `sqlite3VdbeRecordCompare` body in btree.pas (bSkip=0 is
-            the only value passed by current callsites; bSkip>0
-            optimisation deferred).  Same fix lifted the
-            `sqlite3VdbeRecordCompare` and `sqlite3VdbeFindCompare`
-            local stubs in vdbe.pas onto the btree.pas bodies.
-       [X] `sqlite3VdbeScanStatus` / `sqlite3VdbeScanStatusRange` /
-            `sqlite3VdbeScanStatusCounters` — empty stubs match the C
-            `#define foo(...)` arms when SQLITE_ENABLE_STMT_SCANSTATUS
-            is not defined (vdbe.h:423..425).  Pas build does not enable
-            this option; bodies will land alongside any future
-            `sqlite3_stmt_scanstatus` port (8.2.1).
-       [X] `sqlite3VdbeExplain` — closed 2026-04-29 (vdbeaux.c:517,
-            NDEBUG arm).  Signature gained `array of const` tail to
-            match C's varargs.
        [X] `sqlite3VdbeExplainPop` — closed 2026-04-28.  vdbe.pas now
             mirrors the C one-liner: `pParse^.addrExplain :=
             sqlite3VdbeExplainParent(pParse)`, reusing the existing
@@ -67,31 +45,6 @@ Important: At the end of this document, please find:
             single-cache case.  Pas port has no shared-cache, so empty
             bodies match the OMIT_SHARED_CACHE compile path; full bodies
             land with the shared-cache port.
-
-       Bytecode virtual table (vdbevtab.c):
-       [X] `sqlite3VdbeBytecodeVtabInit` — `return SQLITE_OK` matches
-            the C arm at vdbevtab.c:445 when SQLITE_ENABLE_BYTECODE_VTAB
-            is not defined.  Pas build does not enable that option;
-            register the modules only when it does.
-
-       Resolver (resolve.c):
-       [X] `sqlite3ResolveExprListNames` — closed 2026-04-29
-            (resolve.c:2191).  Walks each pList expression through
-            sqlite3ResolveExprNames; propagates
-            NC_HasAgg/MinMaxAgg/HasWin/OrderAgg into per-expr EP_Agg/EP_Win.
-       [X] `sqlite3ResolveOrderGroupBy` — closed 2026-04-28
-            (resolve.c:1700) plus `resolveAlias` /
-            `incrAggFunctionDepth` / `incrAggDepth` walker /
-            `resolveOutOfRangeError` helpers.  iOrderByCol terms rewrite
-            to deferred-deleted aliases; out-of-range surfaces
-            "%r ORDER/GROUP BY term out of range".
-
-       Foreign keys (fkey.c):
-       [X] `sqlite3FkRequired` — DELETE arm ported 2026-04-28.
-            UPDATE arm (fkChildIsModified / fkParentIsModified walk)
-            deferred — needs full TFKey record (PFKey still `Pointer`
-            at codegen.pas:418).  Safe under current corpus (no test
-            enables PRAGMA foreign_keys; FkCheck/FkActions still stubs).
 
        Pragma (pragma.c):
        [ ] `sqlite3PragmaVtabRegister` — returns `nil`; registers
@@ -371,18 +324,11 @@ Important: At the end of this document, please find:
         clauses gate at codegen.pas:18968.
 
   [X] **6.10 step 20** Host-parameter binding (`?`/`?N`/`:name`/
-      `@name`/`$name`) — closed 2026-04-28.  Root cause:
-      sqlite3VdbeMakeReady read pParse^.nVar but did not propagate to
-      p^.nVar / allocate p^.aVar[].  Fix: vdbeaux.c:2714/2737-2738 arms.
+      `@name`/`$name`)
 
-  [X] **6.10 step 21** DiagPrintfFmt probe — closed 2026-04-29.
-      Extended printfFunc with alt-form, precision-pad-zeros,
-      star width/precision, length modifiers, and etGENERIC `%g`/`%G`.
+  [X] **6.10 step 21** DiagPrintfFmt probe
 
-  [X] **6.10 step 18** TestAuthBuiltins 34/0 closed 2026-04-28 — guard
-      each `sqlite3Register*Functions` (Builtin/DateTime/Json/Window)
-      with a one-shot `done` flag so re-entry doesn't FillChar
-      module-static TFuncDef arrays and orphan bucket-chain links.
+  [X] **6.10 step 18** TestAuthBuiltins
 
   [ ] **6.10 step 19** DiagDml runtime probe (added 2026-04-28,
       `src/tests/DiagDml.pas`, run `LD_LIBRARY_PATH=$PWD/src bin/DiagDml`).
@@ -404,24 +350,11 @@ Important: At the end of this document, please find:
         `sqlite3MultiValues` (codegen.pas:21268) plus sqlite3Insert pSelect
         path (same codegen.pas:19756 TODO).
 
-  [X] **6.10 step 22** Ephemeral b-tree dedup over TEXT/BLOB keys —
-      closed 2026-04-29.  Fixed redundant `sqlite3GetVarint32` re-decode
-      of serial_type in `sqlite3VdbeRecordCompare` BT_MEM_Str/Blob arms.
+  [X] **6.10 step 22** Ephemeral b-tree dedup over TEXT/BLOB keys
 
-  [X] **6.10 step 23** absFunc error-message parity — closed 2026-04-29.
-      `SELECT abs(-9223372036854775808)` raises canonical "integer
-      overflow" (func.c:205) instead of bespoke wording.
+  [X] **6.10 step 23** absFunc error-message parity
 
   [X] **6.10 step 24** Scalar built-in parity sweep — closed
-      2026-04-29.  Gate `src/tests/DiagScalarFunc.pas` (~85 cases).
-      Three fixes:
-        1. `unicode('')` → NULL (func.c:1284 `if( z && z[0] )`).
-        2. 2-arg `unhex(zHex, zIgnore)` registered + body ported
-           (func.c:3328 / func.c:1396..1447) + strContainsChar helper.
-        3. `date(2440587.5)` (Julian-Day numeric) — parseDateTime
-           falls back to sqlite3AtoF + fromJulianDay (date.c
-           parseDateOrTime AtoF arm).  Lifts time()/datetime()/
-           strftime() for numeric JD too.
 
   [ ] **6.10 step 26** DiagIndexing probe (added 2026-04-29,
       `src/tests/DiagIndexing.pas`).  44 cases, 15 DIVERGE — surfaced new
@@ -607,35 +540,9 @@ Important: At the end of this document, please find:
        UPDATE sqlite_master path.  Closes the last contributor of
        6.11(b).
 
-- [ ] **7.1.3** Statement re-prepare / SQL plumbing (vdbeaux.c,
-       prepare.c):
-       [X] `sqlite3VdbeSetSql` — real body in vdbe.pas:3787 (writes
-            `prepFlags`/`expmask`/`zSql`); the codegen.pas:25433
-            duplicate is dead and shadowed by the vdbe.pas version that
-            main.pas:802 actually calls (u8-cast confirms the dispatch).
-       [X] `sqlite3Reprepare` — ported 2026-04-28 (prepare.c:886).
-            Not currently called by any prepared-step path (sqlite3_step
-            does not auto-reprepare on SQLITE_SCHEMA yet).
-       [X] `sqlite3TransferBindings` — ported 2026-04-28 (codegen.pas)
-            — verbatim port of vdbeapi.c:1964; aVar[] entries moved via
-            sqlite3VdbeMemMove with same-db / matching-nVar asserts.
-       [X] `sqlite3VdbeResetStepResult` — real body in vdbe.pas:3493
-            (resets `p^.rc`).  The codegen.pas:25449 duplicate that
-            also clears `pc:=-1` is dead.
-       [X] `sqlite3_prepare16` / `sqlite3_prepare16_v2` /
-            `sqlite3_prepare16_v3` — ported 2026-04-29
-            (prepare.c:983/1053/1065/1077).  Local
-            `utf16ByteLenForChars` mirrors C's sqlite3Utf16ByteLen
-            (UTF-16LE, surrogate-aware) so *pzTail tracks consumed
-            UTF-16 byte offset.  MISUSE on nil zSql / nil ppStmt.
+- [ ] **7.1.3** Statement re-prepare (sqlite3Reprepare)
 
-- [X] **7.1.4** DbFixer — closed 2026-04-29 (attach.c:457..621).
-       fixExprCb tags Expr with EP_FromDDL (non-TEMP) and rejects
-       bound params; fixSelectCb walks SrcList items, binds them to
-       pFix^.pSchema, reports `<type> <name> cannot reference objects
-       in database <db>` cross-schema.  TDbFixer record extended with
-       embedded TWalker + bTemp; TWalkerU gained pFix slot.  Wired
-       through CREATE VIEW + CREATE INDEX call sites.
+- [X] **7.1.4** DbFixer
 
 - [ ] **7.1.7** Lemon parser tail (parse.c epilogue) — gaps inside
        `passqlite3parser.pas`:
@@ -696,32 +603,8 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             to UTF-8, forwards to openDatabase (READWRITE|CREATE).
             On schema-not-loaded, sets aDb[0].pSchema^.enc and db^.enc
             to SQLITE_UTF16NATIVE so subsequent prepares produce UTF-16.
-       [X] `sqlite3_db_readonly` (main.c:5001) — ported 2026-04-28
-            (passqlite3main.pas) via sqlite3FindDbName + sqlite3BtreeIsReadonly.
-       [X] `sqlite3_db_release_memory` (main.c:897) — ported 2026-04-28
-            (passqlite3main.pas) — sqlite3BtreeEnterAll + per-db
-            sqlite3PagerShrink loop; pager.pas wrapper added.
-       [X] `sqlite3_db_status` / `sqlite3_db_status64` (status.c) —
-            ported 2026-04-29 (status.c:188/203/426).  Verbs:
-            LOOKASIDE_USED (with reset), LOOKASIDE_HIT/MISS_SIZE/MISS_FULL,
-            CACHE_USED, CACHE_USED_SHARED (≡CACHE_USED — no shared-cache),
-            CACHE_HIT/MISS/WRITE/SPILL via sqlite3PagerCacheStat,
-            TEMPBUF_SPILL via aDb[1] pager + db^.nSpill, DEFERRED_FKS
-            via nDeferredImmCons/nDeferredCons.  SCHEMA_USED + STMT_USED
-            return SQLITE_ERROR (need pnBytesFreed plumbing through
-            sqlite3DbFree — not yet wired).
-       [X] `sqlite3_db_cacheflush` (main.c:921) — ported 2026-04-28
-            (passqlite3main.pas) — flushes dirty pages on every db with
-            an open write txn; folds SQLITE_BUSY into a single trailing
-            return as in the C body.
        [ ] `sqlite3_db_config` — raw varargs entry point (currently only
             typed wrappers `_text`/`_lookaside`/`_int` exist).
-       [X] `sqlite3_filename_database` / `_journal` / `_wal` /
-            `sqlite3_free_filename` / `sqlite3_uri_key` — ported
-            2026-04-28 (passqlite3util.pas) — verbatim ports of
-            main.c:4857..4953; reuse existing databaseName +
-            sqlite3Strlen30 helpers.  Runtime smoke deferred until
-            `sqlite3_create_filename` lands (no buffer producer yet).
        [X] `sqlite3_set_clientdata` / `sqlite3_get_clientdata` —
             ported 2026-04-29 (main.c:3854/3877).  Allocates DbClientData
             nodes via sqlite3_malloc64 with name appended after struct
@@ -733,20 +616,6 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [X] `sqlite3_stmt_busy` (vdbeapi.c) — ported 2026-04-28
             (passqlite3main.pas) — `v <> nil and eVdbeState =
             VDBE_RUN_STATE`.
-       [X] `sqlite3_stmt_explain` — ported 2026-04-28 (passqlite3main.pas)
-            — verbatim port of vdbeapi.c:2038.  Decodes/encodes the
-            2-bit explain field via VDBF_EXPLAIN_MASK; no-reprepare
-            fast path when v^.nMem >= 10 and (eMode<>2 or
-            VDBF_HaveEqpOps already set); reprepare fall-through via
-            sqlite3Reprepare; nResColumn adjusted to 12-4*explain on
-            EXPLAIN modes, restored to nResAlloc on mode 0.  Misuse
-            (nil pStmt → MISUSE) and bad-mode (eMode<0/>2 → ERROR)
-            covered by DiagPubApi.
-       [X] `sqlite3_stmt_status` — ported 2026-04-29 (vdbeapi.c:2106).
-            Returns v^.aCounter[op] (with optional reset).  MEMUSED
-            runs sqlite3VdbeDelete with db^.pnBytesFreed pointing at a
-            local counter (lookaside^.pEnd lowered for the duration).
-            Armor: nil pStmt or out-of-range op → 0.
        [ ] `sqlite3_stmt_scanstatus` / `_scanstatus_v2` /
             `_scanstatus_reset` — gated on the 6.8
             `sqlite3VdbeScanStatus*` arms landing first.
@@ -763,124 +632,12 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             SQLITE_UTF16NATIVE delegation.  Misuse + round-trip covered
             by DiagPubApi (156/0).  TestExplainParity 1016/10 — no
             regression.
-       [X] `sqlite3_bind_zeroblob` / `_zeroblob64` — ported 2026-04-28
-            (passqlite3vdbe.pas) — vdbeUnbind55 + sqlite3VdbeMemSetZeroBlob;
-            64-bit variant gates on aLimit[LIMIT_LENGTH] for SQLITE_TOOBIG.
-            Misuse paths covered by DiagPubApi (nil → MISUSE, no-params
-            stmt → RANGE, over-LENGTH → TOOBIG).  Round-trip via prepared
-            statement closed 2026-04-28 — see "host-parameter binding"
-            below.
-       [X] `sqlite3_bind_pointer` — ported 2026-04-28
-            (passqlite3vdbe.pas) — vdbeUnbind55 + sqlite3VdbeMemSetPointer;
-            mirrors C destructor-on-error contract.  Replaces the
-            sqlite3_value_pointer_stub in passqlite3carray.pas; carray
-            xFilter now consults the real typed-pointer Mem.
-       [X] `sqlite3_bind_parameter_index` / `sqlite3_bind_parameter_name`
-            — ported 2026-04-28 (passqlite3vdbe.pas + util.pas).  Added
-            full util.c VList machinery (sqlite3VListAdd /
-            VListNumToName / VListNameToNum), wired
-            `sqlite3ExprAssignVarNumber` to maintain `pParse^.pVList`
-            with named-bind dedup, transferred Parse→Vdbe in
-            `sqlite3VdbeMakeReady` and freed in `sqlite3VdbeClearObject`.
-            DiagPubApi covers round-trip, `:x+:x` dedup (1 slot, value
-            10), `?` returns nil name, out-of-range/nil-stmt guards.
-            Side-effect: TestExplainParity 1013/13 → 1016/10 (3 prior
-            divergences resolved by correct named-bind slot reuse).
 
-- [ ] **8.3.2** Result / value variants (vdbeapi.c, vdbemem.c):
-       [X] `sqlite3_result_blob64` — ported 2026-04-28 (passqlite3vdbe.pas).
-            Mirrors existing `sqlite3_result_text64` shape: u64 length,
-            n>0x7FFFFFFF routes to `sqlite3_result_error_toobig`,
-            otherwise delegates to `sqlite3VdbeMemSetStr` with enc=0.
-       [X] `sqlite3_result_text16` / `_text16be` / `_text16le` — ported
-            2026-04-28 (passqlite3vdbe.pas) — verbatim port of
-            vdbeapi.c:616/625/634; n masked with `not i64(1)` per the C
-            `n & ~(u64)1` arm before delegating to sqlite3VdbeMemSetStr
-            with SQLITE_UTF16NATIVE / SQLITE_UTF16BE / SQLITE_UTF16LE
-            respectively.
-       [X] `sqlite3_result_error16` — ported 2026-04-28
-            (passqlite3vdbe.pas) — sets isError=SQLITE_ERROR and stores
-            the UTF-16NATIVE message via sqlite3VdbeMemSetStr (mirrors
-            vdbeapi.c:503).
-       [X] `sqlite3_result_error_code` — ported 2026-04-28
-            (passqlite3vdbe.pas) — sets `pCtx^.isError`, falls back to
-            sqlite3ErrStr on MEM_Null Mem.
-       [X] `sqlite3_result_pointer` — ported 2026-04-28
-            (passqlite3vdbe.pas) — sqlite3VdbeMemRelease + SetPointer.
-       [X] `sqlite3_result_zeroblob` — ported 2026-04-28
-            (passqlite3vdbe.pas) — int wrapper around _zeroblob64,
-            mapping negative n to 0 per C.
-       [X] `sqlite3_value_bytes16` — ported 2026-04-28 (passqlite3vdbe.pas)
-            wraps `sqlite3ValueBytes(pVal, SQLITE_UTF16NATIVE)`; added
-            `SQLITE_UTF16NATIVE = SQLITE_UTF16LE` constant in
-            passqlite3types.pas (LE-only port).  Covered by DiagPubApi.
-       [X] `sqlite3_value_encoding` — ported 2026-04-28 (passqlite3vdbe.pas)
-            returns `pVal^.enc`; UTF8 for nil. Covered by DiagPubApi.
-       [X] `sqlite3_value_numeric_type` — ported 2026-04-28
-            (passqlite3vdbe.pas) — applies numeric affinity for TEXT then
-            re-reads `sqlite3_value_type`. Covered by DiagPubApi.
-       [X] `sqlite3_column_bytes16` — ported 2026-04-28
-            (passqlite3vdbe.pas) — `sqlite3_value_bytes16(columnMem(...))`.
-            Covered by DiagPubApi.
+- [ ] **8.3.2** Result / value variants (vdbeapi.c, vdbemem.c).
 
-- [X] **8.3.2-bis** Error-message routing — closed 2026-04-28.
-       sqlite3ErrorWithMsg allocates db^.pErr via sqlite3ValueNew +
-       sqlite3VdbeMemSetStr (util.c:192).  sqlite3_errmsg reads
-       sqlite3_value_text(db^.pErr) first, falls back to
-       sqlite3ErrStr(errCode) (main.c:2711).  sqlite3VdbeTransferError
-       ported (vdbeaux.c:3536).  sqlite3_step calls TransferError on
-       every non-DONE/non-ROW return.
+- [X] **8.3.2-bis** Error-message routing.
 
 - [X] **8.3.2-ter** `sqlite3VdbeReset` errCode reset — closed
-       2026-04-29.  After clean DONE+finalize, sqlite3_errmsg returned
-       "no more rows available" because the vdbeaux.c:3605..3611 arm
-       that syncs db^.errCode:=p^.rc was missing.  Fix: port the arm.
-       Gate: src/tests/DiagErrMsg.pas.
-
-- [X] **8.3.2-quater** Pre-existing parse/resolve error-message gaps
-       surfaced by DiagErrMsg.pas — all six closed 2026-04-29;
-       DiagErrMsg now 10/0 PASS:
-         (1) `SLECT 1` — yy_syntax_error called sqlite3ErrorMsg with
-             '%T' but [] varargs; fixed by inlining sqlite3MPrintf
-             with [@yyminor].
-         (2) `SELECT z FROM t` — ported the resolve.c:784..795
-             lookupName "no such column" arm into ResolveExpr (also
-             added to no-FROM branch).
-         (3) `SELECT * FROM nonesuch` — lifted LOCATE_NOERR in
-             sqlite3SelectExpand's FROM-clause resolution loop
-             (select.c:6022).
-         (4) `LIKE ... ESCAPE 'abc'` — likeFunc validates ESCAPE via
-             sqlite3Utf8CharLen (func.c:947); OP_Function arm in
-             vdbe.pas now copies pCtx^.pOut into v^.zErrMsg via
-             sqlite3VdbeError (vdbe.c:8884), so all
-             sqlite3_result_error messages reach sqlite3_errmsg.
-         (5) `SELECT sum` — side-effect of (2).
-         (6) `group_concat(a,'x','y')` — side-effect of (3).
-
-- [X] **8.3.3** Collation / function UTF-16 wrappers — closed 2026-04-29.
-       All three ported (passqlite3main.pas) — verbatim ports of
-       main.c:3783 / main.c:2161 / main.c:3834.  Each wraps the input
-       UTF-16NATIVE name in a sqlite3_value, transcodes to UTF-8 via
-       sqlite3ValueText, then forwards to the existing UTF-8 entry point
-       (createCollation / sqlite3CreateFunc) under the db mutex.
-       collation_needed16 sets db^.xCollNeeded16 and clears xCollNeeded
-       (mirrors C exactly).  DiagPubApi extended with 14 new cases
-       (round-trip + nil-db/nil-name MISUSE for each); 217/0.  No
-       regressions: TestExplainParity 1016/10, TestParser 45/0,
-       TestSelectBasic 49/0, TestVdbeAgg 11/0, TestBtreeCompat 337/0,
-       TestVdbeApi 57/0.
-       [X] `sqlite3_complete16` — ported 2026-04-29 (passqlite3main.pas) —
-            verbatim port of complete.c:269: wraps the UTF-16NATIVE input
-            in a sqlite3_value, transcodes via sqlite3ValueText(UTF8),
-            forwards to sqlite3_complete, masks result with 0xFF.  Added
-            csq_complete16 binding in csqlite3.pas; new T14b in
-            TestTokenizer.pas drives 10 differential parity cases (empty,
-            whitespace, complete/incomplete statements, comments, embedded
-            string semicolons, trigger BEGIN…END).  Tokenizer 137/0,
-            TestExplainParity 1016/10, DiagPubApi 156/0, TestParser 45/0,
-            TestVdbeAgg 11/0, TestSelectBasic 49/0, TestWhereBasic 52/0,
-            TestBtreeCompat 337/0, TestDMLBasic 54/0, TestAuthBuiltins
-            34/0 — no regressions.
 
 - [ ] **8.4.1** Hooks / control / change-counter / errors / limits
        (main.c, status.c):
@@ -889,61 +646,10 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             pProgressArg}; nOps<=0 clears.  Runtime invocation arm in
             sqlite3VdbeExec was already wired (vdbe.pas:8909..).
             Covered by DiagPubApi (set / clear / nil-db guard).
-       [X] `sqlite3_autovacuum_pages` — ported 2026-04-28
-            (passqlite3main.pas) — sets db^.{xAutovacPages, pAutovacPagesArg,
-            xAutovacDestr}; previous destructor fires for stale pArg before
-            the new one is installed.  Covered by DiagPubApi (set / clear /
-            nil-db MISUSE).
-       [X] `sqlite3_interrupt` / `sqlite3_is_interrupted` — ported
-            2026-04-28 (passqlite3main.pas) — sets/reads
-            db^.u1.isInterrupted.
-       [X] `sqlite3_setlk_timeout` — ported 2026-04-29 (passqlite3main.pas)
-            — verbatim port of main.c:1863 OMIT_SETLK_TIMEOUT path:
-            MISUSE on safety-check fail, RANGE for ms<-1, otherwise OK
-            no-op (timeout itself unimplemented; the port has no
-            db^.setlkTimeout / SQLITE_FCNTL_BLOCK_ON_CONNECT plumbing).
-            Covered by DiagPubApi.
-       [X] `sqlite3_uri_int64` — ported 2026-04-28 (passqlite3util.pas)
-            via sqlite3_uri_parameter + sqlite3DecOrHexToI64; mirrors
-            main.c:4907 exactly.
-       [X] `sqlite3_compileoption_used` / `sqlite3_compileoption_get` —
-            ported 2026-04-29 (main.c:5158/5191 + ctime.c:809
-            sqlite3CompileOptions accessor).  Options table empty
-            (no ENABLE_/OMIT_ flag plumbing yet) so _used()=0 and
-            _get(N)=nil — matches a C build with no SQLITE_ENABLE_*/
-            OMIT_* defines.
        [ ] `sqlite3_test_control` — testing back-door (subset).
-       [X] `sqlite3_file_control` — ported 2026-04-29 (main.c:4153).
-            Dispatches FILE_POINTER / VFS_POINTER / JOURNAL_POINTER /
-            DATA_VERSION / RESERVE_BYTES / RESET_CACHE inline; falls
-            through to sqlite3OsFileControl otherwise.  Added helpers
-            sqlite3DbNameToBtree (main.c:4958), sqlite3BtreeGetRequestedReserve
-            (btree.c:3136), sqlite3BtreeClearCache (btree.c:11544).
-       [X] `sqlite3_overload_function` — ported 2026-04-28
-            (passqlite3main.pas).  No-op when sqlite3FindFunction already
-            resolves; otherwise registers a stub via
-            sqlite3_create_function_v2 with sqlite3InvalidFunction (errors
-            "unable to use function NAME in the requested context" at
-            runtime).  Destructor = sqlite3_free for the strdup'd name
-            buffer.  Covered by DiagPubApi (success path + SELECT runtime
-            ERROR + nil/MISUSE guards).
-       [X] `sqlite3_table_column_metadata` — ported 2026-04-28
-            (main.c:4009).  Added sqlite3ColumnType helper (util.c:104)
-            using eCType + sqlite3StdType[] literals.  Skips
-            sqlite3Init (Pas schema is in-process only — see 7.1.1).
 
 - [X] **8.5.1** Dynamic string builder API (`sqlite3_str_*`,
-       printf.c) — closed 2026-04-29 (printf.c:1141..1341).  TSqlite3Str
-       mirrors C StrAccum; raw libc malloc/realloc/free backing.
-       Functions: _new, _finish, _free, _reset, _truncate, _value,
-       _length, _errcode, _append, _appendall, _appendchar, _appendf
-       (`array of const`; matches no-C-varargs policy).  Note: system
-       Debian libsqlite3 does not export `_truncate`/`_free` so
-       csq_ bindings for those work only against local libsqlite3.so.
-       Gate: src/tests/DiagStrAccum.pas.
-       [X] `sqlite3_stricmp` — case-insensitive ASCII strcmp helper
-            (passqlite3util.pas:957) — public-API wrapper around
-            sqlite3StrICmp with NULL guards; covered by TestUtil T3.
+       printf.c).
 
 - [ ] **8.7.1** Snapshot / WAL APIs:
        [ ] `sqlite3_snapshot_get` / `_open` / `_free` / `_cmp` /
@@ -970,25 +676,7 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_vtab_nochange` — true when UPDATE doesn't change col.
        [ ] `sqlite3_vtab_rhs_value` — extract RHS value of a constraint.
 
-- [ ] **8.9.2** Carray / shared-cache / misc:
-       [X] `sqlite3_carray_bind` / `_carray_bind_v2` (carray.c) — ported
-            2026-04-29 (carray.c:412..549 incl. SQLITE_TRANSIENT
-            duplication arms for INT32/INT64/DOUBLE/TEXT/BLOB and
-            carrayBindDel destructor); wrapped via sqlite3_bind_pointer
-            with tag "carray-bind".  Side fixes: (1) sqlite3VdbeMakeReady
-            sets p^.nVar unconditionally (vdbeaux.c:2731..2737 — was
-            uninit when nVar=0); (2) sqlite3VdbeClearObject releases
-            aVar entries via sqlite3VdbeMemRelease (vdbeaux.c:3748) so
-            bind-pointer/text/blob destructors fire on finalize.
-       [X] `sqlite3_enable_shared_cache` — ported 2026-04-29
-            (passqlite3main.pas).  This port is built equivalent to
-            SQLITE_OMIT_SHARED_CACHE (loadext.c:91 stub posture):
-            accept the call and return SQLITE_OK; future opens never
-            actually enable shared cache.  Covered by DiagPubApi.
-       [X] `sqlite3_activate_cerod` — ported 2026-04-29
-            (passqlite3main.pas) — deprecated CEROD activator, no-op
-            stub matching the !defined(SQLITE_ENABLE_CEROD) build
-            path.  Covered by DiagPubApi.
+- [ ] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind).
 
 - [ ] **8.10** Public-API sample-program gate.  Pascal
   transliterations of the sample programs in `../sqlite3/src/shell.c.in`
