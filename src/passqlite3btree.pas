@@ -480,6 +480,11 @@ function  sqlite3BtreeCheckpoint(p: PBtree; eMode: i32;
   =========================================================================== }
 function  sqlite3BtreePayload(pCur: PBtCursor; offset: u32; amt: u32;
                                pBuf: Pointer): i32;
+function  sqlite3BtreePayloadChecked(pCur: PBtCursor; offset: u32; amt: u32;
+                                     pBuf: Pointer): i32;
+function  sqlite3BtreePutData(pCsr: PBtCursor; offset: u32; amt: u32;
+                              z: Pointer): i32;
+procedure sqlite3BtreeIncrblobCursor(pCur: PBtCursor);
 { sqlite3BtreePayloadFetch: return pointer to in-page data if available.
   Sets pAmt to the number of contiguous bytes at the returned address.
   Returns nil if no in-page data is available (caller must use BtreePayload). }
@@ -2476,6 +2481,80 @@ function sqlite3BtreePayload(pCur: PBtCursor; offset: u32; amt: u32;
                               pBuf: Pointer): i32;
 begin
   Result := accessPayload(pCur, offset, amt, Pu8(pBuf), 0);
+end;
+
+{ ---------------------------------------------------------------------------
+  accessPayloadChecked — slow path of sqlite3BtreePayloadChecked.
+  btree.c lines 5346-5358.  Used by the incremental-blob read path when the
+  cursor may have been invalidated by an intervening write.
+  --------------------------------------------------------------------------- }
+function accessPayloadChecked(pCur: PBtCursor; offset: u32; amt: u32;
+                              pBuf: Pointer): i32;
+var
+  rc: i32;
+begin
+  if pCur^.eState = CURSOR_INVALID then begin
+    Result := SQLITE_ABORT;
+    Exit;
+  end;
+  rc := btreeRestoreCursorPosition(pCur);
+  if rc <> SQLITE_OK then
+    Result := rc
+  else
+    Result := accessPayload(pCur, offset, amt, Pu8(pBuf), 0);
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3BtreePayloadChecked
+  btree.c lines 5360-5367.  Like sqlite3BtreePayload but tolerates a cursor
+  whose state is not CURSOR_VALID (used only by sqlite3_blob_read).
+  --------------------------------------------------------------------------- }
+function sqlite3BtreePayloadChecked(pCur: PBtCursor; offset: u32; amt: u32;
+                                    pBuf: Pointer): i32;
+begin
+  if pCur^.eState = CURSOR_VALID then
+    Result := accessPayload(pCur, offset, amt, Pu8(pBuf), 0)
+  else
+    Result := accessPayloadChecked(pCur, offset, amt, pBuf);
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3BtreePutData — write into the data area of the row pCsr points at.
+  btree.c lines 11430-11473.  The cursor must be open for writing on an
+  INTKEY table.  The size of the data is not changed; writing past the end
+  returns SQLITE_CORRUPT.
+  --------------------------------------------------------------------------- }
+function sqlite3BtreePutData(pCsr: PBtCursor; offset: u32; amt: u32;
+                             z: Pointer): i32;
+var
+  rc: i32;
+begin
+  rc := restoreCursorPosition(pCsr);
+  if rc <> SQLITE_OK then begin
+    Result := rc;
+    Exit;
+  end;
+  if pCsr^.eState <> CURSOR_VALID then begin
+    Result := SQLITE_ABORT;
+    Exit;
+  end;
+  { saveAllCursors cannot fail on an INTKEY table; ignore its return value. }
+  saveAllCursors(pCsr^.pBt, pCsr^.pgnoRoot, pCsr);
+  if (pCsr^.curFlags and BTCF_WriteFlag) = 0 then begin
+    Result := SQLITE_READONLY;
+    Exit;
+  end;
+  Result := accessPayload(pCsr, offset, amt, Pu8(z), 1);
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3BtreeIncrblobCursor — mark this cursor as an incremental blob
+  cursor.  btree.c lines 11475-11481.
+  --------------------------------------------------------------------------- }
+procedure sqlite3BtreeIncrblobCursor(pCur: PBtCursor);
+begin
+  pCur^.curFlags := pCur^.curFlags or BTCF_Incrblob;
+  pCur^.pBtree^.hasIncrblobCur := 1;
 end;
 
 { ---------------------------------------------------------------------------

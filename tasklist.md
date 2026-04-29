@@ -453,7 +453,16 @@ Important: At the end of this document, please find:
        `sqlite3VdbeDisplayComment` (blocked: needs opcode-synopsis
        tables appended after each name in sqlite3OpcodeName — Pas
        OpcodeNames table is plain names only, defer),
-       `sqlite3_blob_open`.
+       [ ] `sqlite3_blob_open` — body still a stub at vdbe.pas:4970.
+            The read/write path is now functional (see below); only the
+            handle-creation step remains.  Full body needs the blobSeekToRow
+            helper plus the seven-op VDBE program emitted via
+            sqlite3VdbeAddOpList.  Foundation landed 2026-04-29: ported
+            sqlite3BtreeIncrblobCursor + sqlite3BtreePayloadChecked +
+            sqlite3BtreePutData + accessPayloadChecked in btree.pas, then
+            wired sqlite3_blob_read / _write to invoke them
+            (vdbe.pas:4990).  TestVdbeBlob stays 13/0 (handle still nil so
+            ABORT-arm tests dominate), TestExplainParity 1016/10 unchanged.
        [X] `sqlite3VdbeList` — ported 2026-04-29 (vdbeaux.c:2406).
             Wired through sqlite3_step (vdbeFlags & VDBF_EXPLAIN_MASK
             routes to VdbeList instead of VdbeExec) and

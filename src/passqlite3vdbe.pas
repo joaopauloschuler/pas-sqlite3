@@ -4997,8 +4997,8 @@ begin
      (i64(iOffset) + i64(n) > pBlob^.nByte) then begin
     Result := SQLITE_ERROR; Exit;
   end;
-  { sqlite3BtreePayloadChecked not yet ported (Phase 5.7 / btree) }
-  Result := SQLITE_ERROR;
+  Result := sqlite3BtreePayloadChecked(pBlob^.pCsr,
+              u32(iOffset + pBlob^.iOffset), u32(n), z);
 end;
 
 function sqlite3_blob_write(pBlob: Psqlite3_blob; z: Pointer;
@@ -5010,8 +5010,8 @@ begin
      (i64(iOffset) + i64(n) > pBlob^.nByte) then begin
     Result := SQLITE_ERROR; Exit;
   end;
-  { sqlite3BtreePutData not yet ported (Phase 5.7 / btree) }
-  Result := SQLITE_ERROR;
+  Result := sqlite3BtreePutData(pBlob^.pCsr,
+              u32(iOffset + pBlob^.iOffset), u32(n), z);
 end;
 
 function sqlite3_blob_bytes(pBlob: Psqlite3_blob): i32;
