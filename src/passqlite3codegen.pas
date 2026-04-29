@@ -23989,8 +23989,56 @@ begin
   Result := TxShadowName(pSqMod^.xShadowName)(zName + nName + 1);
 end;
 
+{ build.c:2538 — for a virtual table pTab, scan all ordinary tables in
+  the same schema and mark any whose name matches "<vtab>_<suffix>" and
+  whose suffix is accepted by the module's xShadowName callback as
+  shadow tables (TF_Shadow). }
 procedure sqlite3MarkAllShadowTablesOf(db: PTsqlite3; pTab: PTable2);
+type
+  TxShadowName = function(zTail: PAnsiChar): i32; cdecl;
+  PPCharA = ^PAnsiChar;
+var
+  nName  : i32;
+  pMod   : PVtabModule;
+  pSqMod : PSqlite3Module;
+  azArg  : PPCharA;
+  zMod   : PAnsiChar;
+  pSchema: passqlite3util.PSchema;
+  pElem  : PHashElem;
+  pOther : PTable2;
+  zOther : PAnsiChar;
 begin
+  if pTab = nil then Exit;
+  if pTab^.eTabType <> TABTYP_VTAB then Exit;
+  azArg := PPCharA(pTab^.u.vtab.azArg);
+  if azArg = nil then Exit;
+  zMod := azArg[0];
+  if zMod = nil then Exit;
+  pMod := PVtabModule(sqlite3HashFind(@db^.aModule, PChar(zMod)));
+  if pMod = nil then Exit;
+  pSqMod := pMod^.pModule;
+  if pSqMod = nil then Exit;
+  if pSqMod^.iVersion < 3 then Exit;
+  if pSqMod^.xShadowName = nil then Exit;
+  if pTab^.zName = nil then Exit;
+  nName := sqlite3Strlen30(PChar(pTab^.zName));
+  pSchema := passqlite3util.PSchema(pTab^.pSchema);
+  if pSchema = nil then Exit;
+  pElem := pSchema^.tblHash.first;
+  while pElem <> nil do begin
+    pOther := PTable2(pElem^.data);
+    if (pOther <> nil)
+       and (pOther^.eTabType = TABTYP_NORM)
+       and ((pOther^.tabFlags and TF_Shadow) = 0) then begin
+      zOther := pOther^.zName;
+      if (zOther <> nil)
+         and (sqlite3_strnicmp(PChar(zOther), PChar(pTab^.zName), nName) = 0)
+         and ((zOther + nName)^ = '_')
+         and (TxShadowName(pSqMod^.xShadowName)(zOther + nName + 1) <> 0) then
+        pOther^.tabFlags := pOther^.tabFlags or TF_Shadow;
+    end;
+    pElem := PHashElem(pElem^.next);
+  end;
 end;
 
 { build.c:2574 — return true if zName names a shadow table of any virtual

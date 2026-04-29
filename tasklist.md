@@ -273,17 +273,8 @@ Important: At the end of this document, please find:
        still stub, but every db this port produces is corruption-free
        by construction).
   [ ] **6.13** port `sqlite3Vacuum`
-  [X] **6.21** port `sqlite3VdbeDisplayComment` — ported 2026-04-29
-       (vdbeaux.c:1740).  Synopsis-driven EXPLAIN comment renderer,
-       faithful to the C reference compiled with
-       SQLITE_ENABLE_EXPLAIN_COMMENTS (oracle build flag, see
-       src/tests/build.sh:53).  Per-opcode synopsis text lives in
-       `vdbeOpcodeSynopsis` instead of being embedded after a NUL in
-       the opcode-name table.  pOp^.zComment branches short-circuited
-       (TVdbeOp has no zComment field in the Pas port).
 
-  [ ] **6.22** port codegen.pas rename / error-offset stubs in full from C
-       to pascal:
+  [ ] **6.22** port codegen.pas rename:
        [ ] `sqlite3RenameExprUnmap`
        [ ] `sqlite3RenameTokenMap` — only
             productive under `PARSE_MODE_RENAME`.  Full bodies
@@ -291,36 +282,36 @@ Important: At the end of this document, please find:
             with `sqlite3AlterRenameTable` / `sqlite3AlterRenameColumn`
             in 6.27; current no-op matches C semantics whenever the
             parser is not in rename mode.
-  [ ] **6.23** port codegen.pas trigger stubs in full from C to pascal:
-       [ ] `sqlite3BeginTrigger`
-       [ ] `sqlite3FinishTrigger`
-       [ ] `sqlite3CodeRowTriggerDirect`
-       [ ] `sqlite3CodeRowTrigger`
-       [ ] `sqlite3TriggerStepSrc`
-       [ ] `sqlite3TriggerColmask`.
+  
+  [ ] **6.23** port codegen.pas trigger:
+       [ ] `Port sqlite3BeginTrigger`
+       [ ] Port `sqlite3FinishTrigger`
+       [ ] Port `sqlite3CodeRowTriggerDirect`
+       [ ] Port `sqlite3CodeRowTrigger`
+       [ ] Port `sqlite3TriggerStepSrc`
+       [ ] Port `sqlite3TriggerColmask`.
 
   [ ] **6.24** port codegen.pas DML
        [ ] `sqlite3GenerateConstraintChecks`.
 
-  [ ] **6.25** port codegen.pas schema / index stubs in full from C to pascal:
-       `sqlite3ReadSchema`, `sqlite3RunParser`.
+  [ ] **6.25** port codegen.pas schema:
+       [ ] Port `sqlite3ReadSchema`
+       [ ] Port `sqlite3RunParser`.
 
-  [ ] **6.26** port codegen.pas where / select / window stubs in full from C
-       to pascal:
-       [ ] `sqlite3WindowCodeInit`
-       [ ] `sqlite3WindowCodeStep`.
+  [ ] **6.26** port codegen.pas:
+       [ ] Port `sqlite3WindowCodeInit`
+       [ ] Port `sqlite3WindowCodeStep`.
 
-  [ ] **6.27** port codegen.pas alter / attach / analyze / vacuum / FK /
-       extension / scalar-function stubs in full from C to pascal:
-       [ ] `sqlite3AlterRenameTable`
-       [ ] `sqlite3AlterFinishAddColumn`
-       [ ] `sqlite3AlterAddConstraint`
-       [ ] `sqlite3Detach`
-       [ ] `sqlite3Attach`
-       [ ] `sqlite3Analyze`
-       [ ] `sqlite3Vacuum`
-       [ ] `sqlite3FkCheck`
-       [ ] `sqlite3FkActions`.
+  [ ] **6.27** port codegen.pas:
+       [ ] Port `sqlite3AlterRenameTable`
+       [ ] Port `sqlite3AlterFinishAddColumn`
+       [ ] Port `sqlite3AlterAddConstraint`
+       [ ] Port `sqlite3Detach`
+       [ ] Port `sqlite3Attach`
+       [ ] Port `sqlite3Analyze`
+       [ ] Port `sqlite3Vacuum`
+       [ ] Port `sqlite3FkCheck`
+       [ ] Port `sqlite3FkActions`.
 
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
@@ -337,6 +328,12 @@ Important: At the end of this document, please find:
             calls the standalone helper instead of inlining
             sqlite3SelectDelete + sqlite3DbFree, matching the C call
             graph 1:1.
+       [X] `sqlite3MarkAllShadowTablesOf` — ported 2026-04-29
+            (build.c:2538).  Walks pTab^.pSchema^.tblHash and tags any
+            ordinary table whose name is "<vtab>_<suffix>" and whose
+            suffix is accepted by the module's xShadowName callback
+            with TF_Shadow.  Previously a no-op so shadow tables of
+            iVersion>=3 modules were never marked.
 ---
 
 ## Phase 7 — Parser (one gate open)
@@ -375,20 +372,19 @@ Important: At the end of this document, please find:
        allocate `aDb[]` slot, run schema load.  (Overlaps 6.27 — move
        here when ported.)
 
-- [ ] **7.1.9** ALTER TABLE (alter.c) — Full port from C to pascal:
-       [ ] `sqlite3AlterRenameTable`
-       [ ] `sqlite3AlterRenameColumn`
-       [ ] `sqlite3AlterDropColumn`
-       [ ] `sqlite3AlterDropConstraint`
-       [ ] `sqlite3AlterSetNotNull`
-       [ ] `sqlite3AlterAddConstraint`.
-       [ ] `sqlite3AlterBeginAddColumn`
-       [ ] `sqlite3AlterFinishAddColumn`.
-       [ ] `sqlite3AlterFunctions` — registers the rename-helper SQL
+- [ ] **7.1.9** ALTER TABLE (alter.c):
+       [ ] Port `sqlite3AlterRenameTable`
+       [ ] Port `sqlite3AlterRenameColumn`
+       [ ] Port `sqlite3AlterDropColumn`
+       [ ] Port `sqlite3AlterDropConstraint`
+       [ ] Port `sqlite3AlterSetNotNull`
+       [ ] Port `sqlite3AlterAddConstraint`.
+       [ ] Port `sqlite3AlterBeginAddColumn`
+       [ ] Port `sqlite3AlterFinishAddColumn`.
+       [ ] Port `sqlite3AlterFunctions` — registers the rename-helper SQL
             functions.
-       [ ] `sqlite3RenameTokenRemap`
-       [ ] `sqlite3RenameExprlistUnmap`.
-       (Overlaps 6.22 / 6.27 — move here when ported.)
+       [ ] Port `sqlite3RenameTokenRemap`
+       [ ] Port `sqlite3RenameExprlistUnmap`.
 
 - [ ] **7.4b** Bytecode-diff scope of `TestParser.pas`.  Now that
   Phase 8.2 wires `sqlite3_prepare_v2` end-to-end, extend `TestParser`
