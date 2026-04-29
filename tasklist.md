@@ -459,13 +459,17 @@ Important: At the end of this document, please find:
 
 - [ ] **7.1.3** Statement re-prepare / SQL plumbing (vdbeaux.c,
        prepare.c):
-       [ ] `sqlite3VdbeSetSql` (codegen.pas:25246) — stub returns
-            `SQLITE_OK`; must store SQL text in `Vdbe^.zSql`.
+       [X] `sqlite3VdbeSetSql` — real body in vdbe.pas:3787 (writes
+            `prepFlags`/`expmask`/`zSql`); the codegen.pas:25433
+            duplicate is dead and shadowed by the vdbe.pas version that
+            main.pas:802 actually calls (u8-cast confirms the dispatch).
        [ ] `sqlite3Reprepare` (codegen.pas:25295) — re-prepare a
             statement after schema change.
        [ ] `sqlite3TransferBindings` (codegen.pas:25216) — copy
             bindings from old stmt to new.
-       [ ] `sqlite3VdbeResetStepResult` — currently stub.
+       [X] `sqlite3VdbeResetStepResult` — real body in vdbe.pas:3493
+            (resets `p^.rc`).  The codegen.pas:25449 duplicate that
+            also clears `pc:=-1` is dead.
        [ ] `sqlite3_prepare16` / `sqlite3_prepare16_v2` /
             `sqlite3_prepare16_v3` (codegen.pas:25117..25130) — UTF-16
             wrappers around the UTF-8 prepare path.
@@ -479,10 +483,13 @@ Important: At the end of this document, please find:
 
 - [ ] **7.1.7** Lemon parser tail (parse.c epilogue) — gaps inside
        `passqlite3parser.pas`:
-       [ ] `sqlite3ParserFallback` — stubbed as 0 (parser.pas:1070);
-            needs the Lemon fallback table.
-       [ ] `yy_accept` / `yy_parse_failed` / `yy_syntax_error` —
-            stub bodies (parser.pas:1444).
+       [X] `sqlite3ParserFallback` — done; uses `yyFallbackTab`
+            (parsertables.inc:703).  Original "stubbed as 0" comment
+            block at parser.pas:1070 is stale; real body at parser.pas:4261.
+       [X] `yy_accept` / `yy_parse_failed` / `yy_syntax_error` — done;
+            bodies match C parse.c:6019/6042/6068 (the %parse_accept and
+            %parse_failure blocks are empty in parse.y, so the Pas empty
+            bodies are correct; %syntax_error mirrors `parserSyntaxError`).
        [ ] Per-rule reduce actions (Phase 7.2e) — several rule arms
             still TODO and gated on the codegen Phase 7 stubs
             (NestedParse, BeginWriteOperation, FK actions, etc.).
@@ -572,8 +579,11 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_result_pointer` — typed pointer result.
        [ ] `sqlite3_result_zeroblob`.
        [ ] `sqlite3_value_bytes16`.
-       [ ] `sqlite3_value_encoding`.
-       [ ] `sqlite3_value_numeric_type`.
+       [X] `sqlite3_value_encoding` — ported 2026-04-28 (passqlite3vdbe.pas)
+            returns `pVal^.enc`; UTF8 for nil. Covered by DiagPubApi.
+       [X] `sqlite3_value_numeric_type` — ported 2026-04-28
+            (passqlite3vdbe.pas) — applies numeric affinity for TEXT then
+            re-reads `sqlite3_value_type`. Covered by DiagPubApi.
        [ ] `sqlite3_column_bytes16`.
 
 - [ ] **8.3.3** Collation / function UTF-16 wrappers:

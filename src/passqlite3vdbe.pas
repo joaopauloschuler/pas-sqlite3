@@ -1553,6 +1553,8 @@ function sqlite3_value_dup(pOrig: Psqlite3_value): Psqlite3_value;
 procedure sqlite3_value_free(pOld: Psqlite3_value);
 function sqlite3_value_nochange(pVal: Psqlite3_value): i32;
 function sqlite3_value_frombind(pVal: Psqlite3_value): i32;
+function sqlite3_value_numeric_type(pVal: Psqlite3_value): i32;
+function sqlite3_value_encoding(pVal: Psqlite3_value): i32;
 
 { sqlite3_column_* accessors }
 function sqlite3_column_count(pStmt: PVdbe): i32;
@@ -3949,6 +3951,25 @@ function sqlite3_value_frombind(pVal: Psqlite3_value): i32;
 begin
   if (pVal^.flags and MEM_FromBind) <> 0 then Result := 1
   else Result := 0;
+end;
+
+procedure applyNumericAffinity(pRec: PMem; bTryForInt: i32); forward;
+
+{ vdbe.c:436 — apply numeric affinity if value is TEXT, then return type. }
+function sqlite3_value_numeric_type(pVal: Psqlite3_value): i32;
+begin
+  Result := sqlite3_value_type(pVal);
+  if Result = SQLITE_TEXT then begin
+    applyNumericAffinity(PMem(pVal), 0);
+    Result := sqlite3_value_type(pVal);
+  end;
+end;
+
+{ vdbeapi.c:329 }
+function sqlite3_value_encoding(pVal: Psqlite3_value): i32;
+begin
+  if pVal = nil then begin Result := SQLITE_UTF8; Exit; end;
+  Result := i32(pVal^.enc);
 end;
 
 { --- static columnNullValue / columnMem helpers (vdbeapi.c:1285) --- }

@@ -164,6 +164,23 @@ begin
   Check('stmt_busy after DONE = 0',    sqlite3_stmt_busy(pStmt) = 0);
   sqlite3_finalize(pStmt);
 
+  { Phase 8.3.2 — sqlite3_value_numeric_type / _encoding. }
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT ''42''', -1, @pStmt, nil);
+  Check('prepare ''42''', rcs = SQLITE_OK);
+  rcs := sqlite3_step(pStmt);
+  Check('step text 42 -> ROW', rcs = SQLITE_ROW);
+  Check('value_type text = TEXT',
+        sqlite3_value_type(sqlite3_column_value(pStmt, 0)) = SQLITE_TEXT);
+  Check('value_numeric_type text(''42'') = INTEGER',
+        sqlite3_value_numeric_type(sqlite3_column_value(pStmt, 0))
+          = SQLITE_INTEGER);
+  Check('value_encoding = UTF8',
+        sqlite3_value_encoding(sqlite3_column_value(pStmt, 0)) = SQLITE_UTF8);
+  Check('value_encoding(nil) = UTF8',
+        sqlite3_value_encoding(nil) = SQLITE_UTF8);
+  sqlite3_finalize(pStmt);
+
   { Phase 8.1.1 — sqlite3_db_release_memory / sqlite3_db_cacheflush. }
   Check('db_release_memory = OK',  sqlite3_db_release_memory(db)   = SQLITE_OK);
   Check('db_release_memory(nil) = MISUSE',
