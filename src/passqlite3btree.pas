@@ -3075,10 +3075,9 @@ begin
         rc := btreeIntFloatCompare(v1, rRhs);
       end;
     end else if (pRhs^.flags and BT_MEM_Str) <> 0 then begin
-      { RHS string — vdbeaux.c:4839.  Re-decode serial_type as varint
-        because string serial types are always >=12 (varint width >1
-        is possible). }
-      sqlite3GetVarint32(@aKey1[idx1], serial_type);
+      { RHS string — vdbeaux.c:4839.  serial_type already decoded above;
+        the C arm uses the value computed by getVarint32() at the top of
+        the loop and does not re-read it. }
       if serial_type < 12 then rc := -1
       else if (serial_type and 1) = 0 then rc := 1
       else begin
@@ -3103,8 +3102,7 @@ begin
         if rc = 0 then rc := nStr - pRhs^.n;
       end;
     end else if (pRhs^.flags and BT_MEM_Blob) <> 0 then begin
-      { RHS blob — vdbeaux.c:4872 }
-      sqlite3GetVarint32(@aKey1[idx1], serial_type);
+      { RHS blob — vdbeaux.c:4872.  serial_type already decoded above. }
       if (serial_type < 12) or ((serial_type and 1) <> 0) then rc := -1
       else begin
         nStr := i32((serial_type - 12) shr 1);

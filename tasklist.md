@@ -423,7 +423,7 @@ Important: At the end of this document, please find:
           predicate's columns are added to aCol[] AFTER nAccumulator is
           set, leaving nAccumulator at 0 for these cases).
       [X] **f) `count(DISTINCT col)` / `sum(DISTINCT col)` empty
-        result** — partially closed 2026-04-29.  Ported the agg-DISTINCT
+        result** — closed 2026-04-29 (TEXT path closed by 6.10 step 22).  Ported the agg-DISTINCT
         codegen arm: `resetAccumulatorSimple` now opens an OP_OpenEphemeral
         with KeyInfo built from the agg arg-list for each `iDistinct>=0`
         function (mirrors select.c:6671..6685, including the "DISTINCT
@@ -510,33 +510,28 @@ Important: At the end of this document, please find:
         `sqlite3MultiValues` (codegen.pas:21268) plus sqlite3Insert pSelect
         path (same codegen.pas:19756 TODO).
 
-  [ ] **6.10 step 22** Ephemeral b-tree dedup over TEXT/BLOB keys is
-      broken — surfaced 2026-04-29 while landing the agg-DISTINCT path
-      (6.10 step 17 f).  Minimal repro:
-      ```
-      CREATE TABLE g(grp TEXT);
-      INSERT INTO g VALUES('A'); INSERT INTO g VALUES('B');
-      INSERT INTO g VALUES('A');
-      SELECT DISTINCT grp FROM g;   -- Pas: row='A' only.  C: A,B.
-      ```
-      INTEGER `SELECT DISTINCT val` works correctly.  Affects every code
-      path that opens an ephemeral b-tree with a P4_KEYINFO containing a
-      TEXT/BLOB column and uses `OP_Found / OP_MakeRecord / OP_IdxInsert`
-      to dedup — including the existing selectInnerLoop DISTINCT arm
-      (codegen.pas:19452) and the new agg-DISTINCT arm
-      (resetAccumulatorSimple/updateAccumulatorSimple).  Symptom: every
-      OP_Found returns "found" after the first IdxInsert, so only the
-      first row gets a unique-row action.  Likely root cause: KeyInfo
-      collation / record-comparison plumbing for TEXT in the ephemeral
-      btree — sqlite3VdbeRecordCompare in btree.pas uses memcmp for
-      strings (see 6.9-complete b — non-BINARY collations punted) but the
-      bug reproduces with default BINARY collation, so it is more likely
-      that the OP_MakeRecord serialization of a TEXT Mem and the
-      OP_IdxInsert / OP_Found b-tree key path disagree on the encoded
-      record bytes (e.g. zero-length-prefix mismatch, or the index cursor
-      reading the record-length field at the wrong offset).  Worth
-      checking sqlite3BtreeIndexMoveto and the in-memory btree's payload
-      handling for non-fixed-width keys.
+  [X] **6.10 step 22** Ephemeral b-tree dedup over TEXT/BLOB keys —
+      closed 2026-04-29.  Root cause: `sqlite3VdbeRecordCompare`
+      (btree.pas) re-decoded `serial_type` inside the BT_MEM_Str /
+      BT_MEM_Blob arms by calling `sqlite3GetVarint32(@aKey1[idx1], ...)`
+      unconditionally, but that helper requires the high bit of p[0] to
+      be set (multi-byte varint precondition documented at util.pas:1601).
+      For a 1-byte TEXT serial type 0x0F it read p[0..1] and produced
+      `(0x0F<<7) | next_byte` (= 1985 for "A"), so every comparison
+      returned <0 / >0 inconsistently and the cursor's last-cell skip-to-
+      root optimisation latched on the first inserted row, making every
+      subsequent OP_Found report `seekResult=0` ("found").  Fix: drop the
+      redundant re-read; `serial_type` is already correctly decoded at
+      the top of the loop using the inline `aKey1[idx1] < $80` guard,
+      which is what the C reference (vdbeaux.c:4839 / 4872) does too.
+      DiagWindow `count distinct` now PASS (16→15 divergences).
+      Regressions clean: TestExplainParity 1016/10, TestBtreeCompat
+      337/0, TestVdbeAgg 11/0, TestVdbeRecord 13/0, TestSelectBasic
+      49/0, TestVdbeApi 57/0, TestParser 45/0, TestDMLBasic 54/0,
+      TestWhereBasic 52/0, TestPrintf 105/0, TestAuthBuiltins 34/0,
+      TestCarray 74/0, TestVdbeCursor 27/0, TestRowidIn ALL PASS,
+      TestPager/PagerRollback/WalCompat ALL PASS, DiagPubApi 240/0,
+      DiagSumOverflow 12/0, DiagFunctions/Cast/Date/Printf 0/0.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
