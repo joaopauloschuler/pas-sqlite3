@@ -533,6 +533,14 @@ Important: At the end of this document, please find:
       TestPager/PagerRollback/WalCompat ALL PASS, DiagPubApi 240/0,
       DiagSumOverflow 12/0, DiagFunctions/Cast/Date/Printf 0/0.
 
+  [X] **6.10 step 23** absFunc error-message parity — closed 2026-04-29.
+      `SELECT abs(-9223372036854775808)` now raises the canonical
+      "integer overflow" message (func.c:205) instead of the bespoke
+      "-9223372036854775808 is not representable…" wording, so
+      `sqlite3_errmsg` now matches C verbatim.  TestExplainParity
+      1016/10, DiagFunctions/SumOverflow/Misc/Ops/PubApi/ErrMsg —
+      no regressions.
+
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
         the sqlite_schema scrub now uses one-pass inline delete.

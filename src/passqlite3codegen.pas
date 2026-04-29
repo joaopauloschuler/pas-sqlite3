@@ -26786,7 +26786,7 @@ begin
       iVal := sqlite3_value_int64(Psqlite3_value(pVal));
       if iVal < 0 then begin
         if iVal = Low(i64) then begin
-          sqlite3_result_error(pCtx, '-9223372036854775808 is not representable as a positive 64-bit integer', -1);
+          sqlite3_result_error(pCtx, 'integer overflow', -1);
           Exit;
         end;
         iVal := -iVal;
