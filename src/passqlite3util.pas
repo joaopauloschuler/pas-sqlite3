@@ -294,6 +294,8 @@ const
   SQLITE_TRACE_ROW     = $04;
   SQLITE_TRACE_CLOSE   = $08;
   SQLITE_TRACE_LEGACY  = $40;
+  SQLITE_TRACE_XPROFILE        = $80;  { sqliteInt.h:1646 — legacy xProfile in use }
+  SQLITE_TRACE_NONLEGACY_MASK  = $0F;  { sqliteInt.h:1651 — public mTrace bits }
 
   { Conflict resolution actions }
   OE_None      = 0;

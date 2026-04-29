@@ -186,6 +186,20 @@ function sqlite3_update_hook(db: PTsqlite3;
 function sqlite3_trace_v2(db: PTsqlite3; mTrace: u32;
   xTrace: Pointer; pArg: Pointer): i32;
 
+{ Phase 8.4.2 — deprecated trace/profile/recover/cleanup/memory_alarm.
+  All five live behind SQLITE_OMIT_DEPRECATED in upstream.  sqlite3_trace
+  + sqlite3_profile install the legacy single-callback shapes superseded
+  by sqlite3_trace_v2; the remaining three are no-ops that retain ABI
+  compatibility with very old callers. }
+function sqlite3_trace(db: PTsqlite3;
+  xTrace: Pointer; pArg: Pointer): Pointer;     { main.c:2256 }
+function sqlite3_profile(db: PTsqlite3;
+  xProfile: Pointer; pArg: Pointer): Pointer;   { main.c:2307 }
+function sqlite3_global_recover: i32;           { main.c:3925 — anachronism }
+procedure sqlite3_thread_cleanup;               { main.c:4001 — no-op }
+function sqlite3_memory_alarm(xCallback: Pointer; pArg: Pointer;
+  iThreshold: i64): i32;                        { malloc.c:72 — no-op }
+
 { db_config — Pascal-friendly typed entry points (no C varargs).
   The varargs C signature collapses into three argument shapes; we expose
   one entry point per shape.  Phase 8.4 covers MAINDBNAME / FP_DIGITS /
@@ -1508,6 +1522,66 @@ begin
   db^.trace.xV2   := TTraceV2Fn(xTrace);
   db^.pTraceArg   := pArg;
   sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+{ main.c:2256 — sqlite3_trace.  Deprecated single-callback trace shape;
+  installs xTrace into trace.xLegacy, returns the previous pTraceArg.  The
+  v2 dispatcher in vdbeapi treats the SQLITE_TRACE_LEGACY mTrace bit as
+  "fire xLegacy on stmt-start" exactly the way the C reference does. }
+function sqlite3_trace(db: PTsqlite3;
+  xTrace: Pointer; pArg: Pointer): Pointer;
+type
+  TTraceLegacyFn = procedure(p: Pointer; s: PAnsiChar); cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := nil; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  Result := db^.pTraceArg;
+  if xTrace <> nil then
+    db^.mTrace := u8(SQLITE_TRACE_LEGACY)
+  else
+    db^.mTrace := 0;
+  db^.trace.xLegacy := TTraceLegacyFn(xTrace);
+  db^.pTraceArg := pArg;
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+{ main.c:2307 — sqlite3_profile.  Deprecated; superseded by
+  sqlite3_trace_v2 with SQLITE_TRACE_PROFILE.  Keeps the legacy non-union
+  xProfile slot live so the v2 dispatcher can fan out to it via the
+  SQLITE_TRACE_XPROFILE mTrace bit. }
+function sqlite3_profile(db: PTsqlite3;
+  xProfile: Pointer; pArg: Pointer): Pointer;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := nil; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  Result := db^.pProfileArg;
+  db^.xProfile := xProfile;
+  db^.pProfileArg := pArg;
+  db^.mTrace := db^.mTrace and SQLITE_TRACE_NONLEGACY_MASK;
+  if db^.xProfile <> nil then
+    db^.mTrace := db^.mTrace or u8(SQLITE_TRACE_XPROFILE);
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+{ main.c:3925 — sqlite3_global_recover.  Anachronism; SQLite recovers
+  from OOM automatically since 3.x. }
+function sqlite3_global_recover: i32;
+begin
+  Result := SQLITE_OK;
+end;
+
+{ main.c:4001 — sqlite3_thread_cleanup.  SQLite no longer uses
+  thread-specific data; retained for binary compatibility. }
+procedure sqlite3_thread_cleanup;
+begin
+end;
+
+{ malloc.c:72 — sqlite3_memory_alarm.  Used to install a high-water-mark
+  callback; replaced by sqlite3_soft_heap_limit64 long ago. }
+function sqlite3_memory_alarm(xCallback: Pointer; pArg: Pointer;
+  iThreshold: i64): i32;
+begin
   Result := SQLITE_OK;
 end;
 

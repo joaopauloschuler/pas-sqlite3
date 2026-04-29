@@ -69,7 +69,7 @@ Important: At the end of this document, please find:
             parser is not in rename mode.
   
   [ ] **6.23** port codegen.pas trigger:
-       [ ] `Port sqlite3BeginTrigger`
+       [ ] Port `sqlite3BeginTrigger`
        [ ] Port `sqlite3FinishTrigger`
        [ ] Port `sqlite3CodeRowTriggerDirect`
        [ ] Port `sqlite3CodeRowTrigger`
@@ -443,6 +443,16 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        `sqlite3_transfer_bindings` (vdbeapi.c:1991 — inlines the aVar
        MemMove loop because the underlying sqlite3TransferBindings lives
        in passqlite3codegen which would create a uses-cycle).
+       Extended 2026-04-29 in passqlite3main.pas with the deprecated
+       trace/profile/recover/cleanup/memory_alarm group: `sqlite3_trace`
+       (main.c:2256 — installs trace.xLegacy + SQLITE_TRACE_LEGACY mTrace
+       bit), `sqlite3_profile` (main.c:2307 — keeps legacy xProfile slot
+       and toggles SQLITE_TRACE_XPROFILE / clears NONLEGACY mask),
+       `sqlite3_global_recover` (main.c:3925 — anachronism, SQLITE_OK),
+       `sqlite3_thread_cleanup` (main.c:4001 — no-op), `sqlite3_memory_alarm`
+       (malloc.c:72 — superseded by sqlite3_soft_heap_limit64).  Added
+       SQLITE_TRACE_XPROFILE = $80 and SQLITE_TRACE_NONLEGACY_MASK = $0F
+       to passqlite3util.pas (sqliteInt.h:1646/:1651).
 
 - [X] **8.8.1** Pre-update hook public-API stubs (preupdate.c —
        `SQLITE_ENABLE_PREUPDATE_HOOK`).  Ported 2026-04-29 in
