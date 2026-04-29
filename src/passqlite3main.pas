@@ -356,6 +356,13 @@ function sqlite3_autovacuum_pages(db: PTsqlite3; xCallback: TAutovacuumPagesFn;
 function sqlite3_overload_function(db: PTsqlite3; zName: PAnsiChar;
   nArg: i32): i32; cdecl;
 
+type
+  TClientDataDestrFn = procedure(p: Pointer); cdecl;
+
+function sqlite3_get_clientdata(db: PTsqlite3; zName: PAnsiChar): Pointer; cdecl;
+function sqlite3_set_clientdata(db: PTsqlite3; zName: PAnsiChar;
+  pData: Pointer; xDestructor: TClientDataDestrFn): i32; cdecl;
+
 function sqlite3_table_column_metadata(db: PTsqlite3;
   zDbName: PAnsiChar; zTableName: PAnsiChar; zColumnName: PAnsiChar;
   pzDataType: PPAnsiChar; pzCollSeq: PPAnsiChar;
@@ -505,6 +512,8 @@ end;
   main.c:1254
   ---------------------------------------------------------------------- }
 function sqlite3Close(db: PTsqlite3; forceZombie: i32): i32;
+var
+  cdNode: PDbClientData;
 begin
   if db = nil then begin
     { R-63257-11740: NULL is a harmless no-op. }
@@ -522,6 +531,15 @@ begin
       'unable to close due to unfinalized statements or unfinished backups');
     Result := SQLITE_BUSY;
     Exit;
+  end;
+
+  { main.c:1297 — fire xDestructor on each pDbData entry, free node. }
+  while db^.pDbData <> nil do begin
+    cdNode  := db^.pDbData;
+    db^.pDbData := PDbClientData(cdNode^.pNext);
+    if Assigned(cdNode^.xDestroyData) then
+      cdNode^.xDestroyData(cdNode^.pData);
+    sqlite3_free(cdNode);
   end;
 
   db^.eOpenState := SQLITE_STATE_ZOMBIE;
@@ -2875,6 +2893,102 @@ begin
     Result := SQLITE_BUSY
   else
     Result := rc;
+end;
+
+{ Local case-sensitive C-string equality + length helpers.  Avoid pulling
+  SysUtils into main's interface for these tiny ASCII-byte routines. }
+function clientNameEq(a, b: PAnsiChar): Boolean;
+begin
+  while (a^ <> #0) and (a^ = b^) do begin Inc(a); Inc(b); end;
+  Result := a^ = b^;
+end;
+
+function clientNameLen(z: PAnsiChar): PtrUInt;
+var p: PAnsiChar;
+begin
+  p := z;
+  while p^ <> #0 do Inc(p);
+  Result := PtrUInt(p) - PtrUInt(z);
+end;
+
+{ main.c:3854 — sqlite3_get_clientdata.  Look up a client-data slot by name.
+  Returns the stored pointer or nil if missing. }
+function sqlite3_get_clientdata(db: PTsqlite3; zName: PAnsiChar): Pointer; cdecl;
+var
+  p: PDbClientData;
+  zSlot: PAnsiChar;
+begin
+  if (zName = nil) or (sqlite3SafetyCheckOk(db) = 0) then begin
+    Result := nil;
+    Exit;
+  end;
+  Result := nil;
+  sqlite3_mutex_enter(db^.mutex);
+  p := db^.pDbData;
+  while p <> nil do begin
+    zSlot := PAnsiChar(p) + SizeOf(TDbClientData);
+    if clientNameEq(zSlot, zName) then begin
+      Result := p^.pData;
+      break;
+    end;
+    p := PDbClientData(p^.pNext);
+  end;
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+{ main.c:3877 — sqlite3_set_clientdata.  Store/replace/remove a named pointer
+  on the connection.  Variable-length name is appended to the allocation. }
+function sqlite3_set_clientdata(db: PTsqlite3; zName: PAnsiChar;
+  pData: Pointer; xDestructor: TClientDataDestrFn): i32; cdecl;
+var
+  p, pPrev: PDbClientData;
+  zSlot: PAnsiChar;
+  n: PtrUInt;
+begin
+  sqlite3_mutex_enter(db^.mutex);
+  pPrev := nil;
+  p := db^.pDbData;
+  while p <> nil do begin
+    zSlot := PAnsiChar(p) + SizeOf(TDbClientData);
+    if clientNameEq(zSlot, zName) then break;
+    pPrev := p;
+    p := PDbClientData(p^.pNext);
+  end;
+  if p <> nil then begin
+    if Assigned(p^.xDestroyData) then
+      p^.xDestroyData(p^.pData);
+    if pData = nil then begin
+      if pPrev = nil then
+        db^.pDbData := PDbClientData(p^.pNext)
+      else
+        pPrev^.pNext := p^.pNext;
+      sqlite3_free(p);
+      sqlite3_mutex_leave(db^.mutex);
+      Result := SQLITE_OK;
+      Exit;
+    end;
+  end else if pData = nil then begin
+    sqlite3_mutex_leave(db^.mutex);
+    Result := SQLITE_OK;
+    Exit;
+  end else begin
+    n := clientNameLen(zName);
+    p := PDbClientData(sqlite3_malloc64(u64(SizeOf(TDbClientData) + n + 1)));
+    if p = nil then begin
+      if Assigned(xDestructor) then xDestructor(pData);
+      sqlite3_mutex_leave(db^.mutex);
+      Result := SQLITE_NOMEM;
+      Exit;
+    end;
+    zSlot := PAnsiChar(p) + SizeOf(TDbClientData);
+    Move(zName^, zSlot^, n + 1);
+    p^.pNext := db^.pDbData;
+    db^.pDbData := p;
+  end;
+  p^.pData := pData;
+  p^.xDestroyData := xDestructor;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
 end;
 
 { main.c — sqlite3_txn_state. }

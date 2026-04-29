@@ -30,11 +30,18 @@ var
   pass: i32 = 0;
   fail: i32 = 0;
   progressCalls: i32 = 0;
+  pA, pB, got: Pointer;
+  destrFires: i32 = 0;
 
 function ProgressCb(p: Pointer): i32; cdecl;
 begin
   Inc(progressCalls);
   Result := 0;
+end;
+
+procedure ClientDataDestrCb(p: Pointer); cdecl;
+begin
+  Inc(destrFires);
 end;
 
 procedure Open16Test; forward;
@@ -479,8 +486,65 @@ begin
       Check('metadata(nil tbl) = MISUSE', mrc = SQLITE_MISUSE);
   end;
 
+  { sqlite3_set_clientdata / sqlite3_get_clientdata — named pointer slots. }
+  begin
+    pA := Pointer(PtrUInt($DEAD0001));
+    pB := Pointer(PtrUInt($DEAD0002));
+
+    Check('clientdata get(empty) = nil',
+          sqlite3_get_clientdata(db, 'k1') = nil);
+
+    Check('clientdata set k1=A',
+          sqlite3_set_clientdata(db, 'k1', pA, nil) = SQLITE_OK);
+    got := sqlite3_get_clientdata(db, 'k1');
+    Check('clientdata get k1 = A', got = pA);
+
+    Check('clientdata set k2=B',
+          sqlite3_set_clientdata(db, 'k2', pB, nil) = SQLITE_OK);
+    Check('clientdata get k2 = B',
+          sqlite3_get_clientdata(db, 'k2') = pB);
+    Check('clientdata get k1 still A',
+          sqlite3_get_clientdata(db, 'k1') = pA);
+
+    { Replace k1's value. }
+    Check('clientdata set k1=B (replace)',
+          sqlite3_set_clientdata(db, 'k1', pB, nil) = SQLITE_OK);
+    Check('clientdata get k1 = B',
+          sqlite3_get_clientdata(db, 'k1') = pB);
+
+    { Remove k1. }
+    Check('clientdata clear k1',
+          sqlite3_set_clientdata(db, 'k1', nil, nil) = SQLITE_OK);
+    Check('clientdata get k1 = nil after clear',
+          sqlite3_get_clientdata(db, 'k1') = nil);
+    { k2 still present. }
+    Check('clientdata get k2 still B after k1 clear',
+          sqlite3_get_clientdata(db, 'k2') = pB);
+
+    { Remove non-existent key. }
+    Check('clientdata clear nonexistent OK',
+          sqlite3_set_clientdata(db, 'nope', nil, nil) = SQLITE_OK);
+
+    { Misuse guards. }
+    Check('clientdata get(nil name) = nil',
+          sqlite3_get_clientdata(db, nil) = nil);
+
+    { Destructor on replace + on close. }
+    destrFires := 0;
+    Check('clientdata set kd=A +destr',
+          sqlite3_set_clientdata(db, 'kd', pA, @ClientDataDestrCb) = SQLITE_OK);
+    Check('clientdata destr not yet fired', destrFires = 0);
+    Check('clientdata replace kd=B fires destr',
+          sqlite3_set_clientdata(db, 'kd', pB, @ClientDataDestrCb) = SQLITE_OK);
+    Check('clientdata destr fired once on replace', destrFires = 1);
+    { kd remains installed; sqlite3_close should fire it. }
+    Check('clientdata install kp=A +destr',
+          sqlite3_set_clientdata(db, 'kp', pA, @ClientDataDestrCb) = SQLITE_OK);
+  end;
+
   rc := sqlite3_close(db);
   Check('close', rc = SQLITE_OK);
+  Check('clientdata destrs fired on close', destrFires = 3);
 
   { sqlite3_open16 — UTF-16NATIVE filename. }
   Open16Test;

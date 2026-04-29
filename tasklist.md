@@ -650,7 +650,24 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             main.c:4857..4953; reuse existing databaseName +
             sqlite3Strlen30 helpers.  Runtime smoke deferred until
             `sqlite3_create_filename` lands (no buffer producer yet).
-       [ ] `sqlite3_set_clientdata` — typed pointer slots on the db.
+       [X] `sqlite3_set_clientdata` / `sqlite3_get_clientdata` — ported
+            2026-04-29 (passqlite3main.pas) — verbatim port of
+            main.c:3854/3877.  Allocates each `DbClientData` node via
+            `sqlite3_malloc64` with the C-string name appended after the
+            struct (mirrors C's flexible `zName[]`).  Replace fires the
+            old destructor before installing the new value; clear unlinks
+            the node and frees it.  `sqlite3Close` now walks `db^.pDbData`
+            firing each `xDestructor` and freeing the node before the
+            connection transitions to ZOMBIE.  Local
+            `clientNameEq`/`clientNameLen` helpers avoid pulling SysUtils
+            into main.pas.  DiagPubApi extended with 19 cases:
+            install/get/replace/clear, multi-key isolation, nil-name guard,
+            destructor-on-replace fires once, destructor-on-close fires
+            for all installed slots.  TestExplainParity 1016/10,
+            TestVdbeApi 57/0, TestParser 45/0, TestSelectBasic 49/0,
+            TestWhereBasic 52/0, TestBtreeCompat 337/0, TestDMLBasic 54/0,
+            TestVdbeAgg 11/0, TestAuthBuiltins 34/0, TestCarray 74/0 — no
+            regressions.
 
 - [ ] **8.2.1** Statement-introspection gaps (vdbeapi.c):
        [X] `sqlite3_stmt_busy` (vdbeapi.c) — ported 2026-04-28
