@@ -1373,6 +1373,7 @@ procedure sqlite3VdbeDelete(p: PVdbe);
 
 { --- vdbeapi.c — sqlite3_context introspection + auxdata (Phase 6.8.g) --- }
 function  sqlite3_context_db_handle(p: Psqlite3_context): Psqlite3;
+function  sqlite3_vtab_nochange(p: Psqlite3_context): i32;
 function  sqlite3_get_auxdata(pCtx: Psqlite3_context; iArg: i32): Pointer;
 procedure sqlite3_set_auxdata(pCtx: Psqlite3_context; iArg: i32;
                               pAux: Pointer; xDelete: TxDelProc);
@@ -3700,6 +3701,15 @@ function sqlite3_context_db_handle(p: Psqlite3_context): Psqlite3;
 begin
   if p = nil then begin Result := nil; Exit; end;
   Result := p^.pOut^.db;
+end;
+
+{ sqlite3_vtab_nochange — vdbeapi.c:1008.  True when the column being
+  written by the current vtab xUpdate is unchanged from before the
+  update.  Forwards to sqlite3_value_nochange on pCtx^.pOut. }
+function sqlite3_vtab_nochange(p: Psqlite3_context): i32;
+begin
+  if p = nil then begin Result := 0; Exit; end;
+  Result := sqlite3_value_nochange(p^.pOut);
 end;
 
 function sqlite3_get_auxdata(pCtx: Psqlite3_context; iArg: i32): Pointer;

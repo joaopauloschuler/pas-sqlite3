@@ -372,6 +372,17 @@ Important: At the end of this document, please find:
         stub (folds into 6.9-bis 11g.2.b).  Real-world impact: typeof()
         round-trip wrong, secondary-index key bytes differ, future
         rowid/IPK lookups by integer fail when stored text is "42".
+      [ ] **e) `INDEXED BY` / `NOT INDEXED` against `WHERE a=1` returns
+        empty rowset** (DiagIndexing `indexed by ok`, `not indexed`,
+        2026-04-29).  Seed `CREATE TABLE t(a INTEGER, b TEXT); CREATE
+        INDEX ix_t_a ON t(a); INSERT INTO t VALUES(1,'x'),(2,'y');`.
+        Pas: `SELECT b FROM t INDEXED BY ix_t_a WHERE a=1` returns no
+        rows; `SELECT b FROM t NOT INDEXED WHERE a=1` likewise.
+        Sibling `WHERE a=2` (without INDEXED BY) PASSes — so the affinity-
+        comparison gap looks rowid-1-specific (likely the planner is
+        reading the index entry for a=1 and the row-1 indirection drops
+        because of the same affinity bug as (d)).  Likely cascades from
+        (d) once it lands; recheck then.
 
   [X] **6.10 step 25** Date/time `'now'` + strftime `%s` parity —
       closed 2026-04-29.
@@ -634,7 +645,9 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_vtab_distinct` — query-planner DISTINCT hint.
        [ ] `sqlite3_vtab_in` / `_in_first` / `_in_next` — IN-operator
             helpers.
-       [ ] `sqlite3_vtab_nochange` — true when UPDATE doesn't change col.
+       [X] `sqlite3_vtab_nochange` — ported 2026-04-29 (vdbeapi.c:1008).
+            One-liner forwarding to sqlite3_value_nochange on pCtx^.pOut;
+            nil-guarded.
        [ ] `sqlite3_vtab_rhs_value` — extract RHS value of a constraint.
 
 - [ ] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind).
