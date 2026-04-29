@@ -1513,6 +1513,7 @@ type
                                 iRow: i64; flags: i32;
                                 out ppBlob: Psqlite3_blob): i32;
   TBlobReopenFn      = function(pBlob: Psqlite3_blob; iRow: i64): i32;
+  TGetTokenFn        = function(z: PByte; tokenType: Pi32): i64;
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
@@ -1525,6 +1526,9 @@ var
   gAnalysisLoad:           TAnalysisLoadFn;
   gBlobOpenImpl:           TBlobOpenFn;
   gBlobReopenImpl:         TBlobReopenFn;
+  gGetTokenImpl:           TGetTokenFn;  { wired by passqlite3parser at init;
+                                            used by sqlite3VdbeExpandSql to scan
+                                            host-parameter tokens. }
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
@@ -5120,26 +5124,123 @@ end;
 { ============================================================================
   Phase 5.8 — vdbetrace.c EXPLAIN SQL expander
 
-  sqlite3VdbeExpandSql expands bound parameters in zRawSql for tracing.
-  Full implementation requires sqlite3GetToken (Phase 7 tokenizer).
-  This stub returns a heap-allocated copy of the raw SQL, which is correct
-  when there are no bound parameters (nVar=0) and is a safe degraded result
-  otherwise (the trace shows unexpanded SQL instead of crashing).
+  Faithful port of sqlite3VdbeExpandSql (vdbetrace.c:72..190).  Expands bound
+  ?, ?N, :name, $name, @name parameters into their current bindings as SQL
+  literals, suitable for tracing.  Requires sqlite3GetToken (parser); wired
+  via gGetTokenImpl to avoid a uses-cycle.
+
+  Notes vs. C:
+   * UTF-16 → UTF-8 conversion of bound text values is omitted; the trace
+     shows the raw bytes (we already call vdbeMemRenderNum-aware codecs
+     elsewhere, and tracing is debug-only).
+   * SQLITE_TRACE_SIZE_LIMIT is not defined in our build, so no truncation.
   ============================================================================ }
+
+const
+  TK_VARIABLE_TRACE = 157;  { matches passqlite3parser.TK_VARIABLE }
+
+function findNextHostParameter(zSql: PAnsiChar; pnToken: Pi64): i64;
+var
+  ttype: i32;
+  nTotal, n: i64;
+begin
+  pnToken^ := 0;
+  nTotal := 0;
+  if not Assigned(gGetTokenImpl) then
+  begin
+    { Tokenizer not yet wired (e.g. test programs that don't pull parser in):
+      no host parameters — caller copies the rest verbatim. }
+    while zSql[nTotal] <> #0 do Inc(nTotal);
+    Result := nTotal;
+    Exit;
+  end;
+  while zSql^ <> #0 do begin
+    n := gGetTokenImpl(PByte(zSql), @ttype);
+    if n <= 0 then Break;
+    if ttype = TK_VARIABLE_TRACE then begin
+      pnToken^ := n;
+      Break;
+    end;
+    Inc(nTotal, n);
+    Inc(zSql, n);
+  end;
+  Result := nTotal;
+end;
 
 function sqlite3VdbeExpandSql(p: PVdbe; zRawSql: PAnsiChar): PAnsiChar;
 var
-  n:   i32;
-  db:  PTsqlite3;
-  z:   PAnsiChar;
+  out_:       PSqlite3Str;
+  db:         PTsqlite3;
+  idx:        i32;
+  nextIndex:  i32;
+  n, nToken:  i64;
+  i:          i32;
+  pVar:       PMem;
+  zStart:     PAnsiChar;
 begin
-  if (p = nil) or (zRawSql = nil) then begin Result := nil; Exit; end;
-  db := PTsqlite3(p^.db);
-  n := sqlite3Strlen30(zRawSql);
-  z := PAnsiChar(sqlite3DbMallocZero(db, n + 1));
-  if z <> nil then
-    Move(zRawSql^, z^, n);
-  Result := z;
+  Result := nil;
+  if (p = nil) or (zRawSql = nil) then Exit;
+  db   := PTsqlite3(p^.db);
+  out_ := sqlite3_str_new(Psqlite3db(db));
+  if out_ = nil then Exit;
+
+  idx       := 0;
+  nextIndex := 1;
+
+  if db^.nVdbeExec > 1 then begin
+    { Re-entrant call (e.g. trigger fire): prefix every line with "-- ". }
+    while zRawSql^ <> #0 do begin
+      zStart := zRawSql;
+      while (zRawSql^ <> #0) and (zRawSql^ <> #10) do Inc(zRawSql);
+      if zRawSql^ = #10 then Inc(zRawSql);
+      sqlite3_str_append(out_, '-- ', 3);
+      sqlite3_str_append(out_, zStart, i32(zRawSql - zStart));
+    end;
+  end else if p^.nVar = 0 then begin
+    sqlite3_str_append(out_, zRawSql, sqlite3Strlen30(zRawSql));
+  end else begin
+    while zRawSql[0] <> #0 do begin
+      n := findNextHostParameter(zRawSql, @nToken);
+      sqlite3_str_append(out_, zRawSql, i32(n));
+      Inc(zRawSql, n);
+      if nToken = 0 then Break;
+      if zRawSql[0] = '?' then begin
+        if nToken > 1 then sqlite3GetInt32(zRawSql + 1, @idx)
+        else                 idx := nextIndex;
+      end else begin
+        idx := sqlite3VdbeParameterIndex(p, zRawSql, i32(nToken));
+      end;
+      Inc(zRawSql, nToken);
+      if idx + 1 > nextIndex then nextIndex := idx + 1;
+      if (idx <= 0) or (idx > p^.nVar) then Continue;
+      pVar := p^.aVar + (idx - 1);
+      if (pVar^.flags and MEM_Null) <> 0 then
+        sqlite3_str_append(out_, 'NULL', 4)
+      else if (pVar^.flags and (MEM_Int or MEM_IntReal)) <> 0 then
+        sqlite3_str_appendf(out_, '%lld', [pVar^.u.i])
+      else if (pVar^.flags and MEM_Real) <> 0 then
+        sqlite3_str_appendf(out_, '%!.15g', [pVar^.u.r])
+      else if (pVar^.flags and MEM_Str) <> 0 then begin
+        sqlite3_str_appendf(out_, '''%.*q''', [pVar^.n, pVar^.z]);
+      end else if (pVar^.flags and MEM_Zero) <> 0 then
+        sqlite3_str_appendf(out_, 'zeroblob(%d)', [pVar^.u.nZero])
+      else begin
+        { BLOB }
+        sqlite3_str_append(out_, 'x''', 2);
+        for i := 0 to pVar^.n - 1 do
+          sqlite3_str_appendf(out_, '%02x', [Byte(pVar^.z[i])]);
+        sqlite3_str_append(out_, '''', 1);
+      end;
+    end;
+  end;
+  if out_^.accError <> 0 then sqlite3_str_reset(out_);
+  Result := sqlite3_str_finish(out_);
+  { sqlite3_str_finish returns nil when nothing was appended; the C
+    sqlite3StrAccumFinish always returns a non-nil heap buffer (possibly
+    "" for empty input).  Mirror that. }
+  if Result = nil then begin
+    Result := PAnsiChar(sqlite3DbMallocZero(db, 1));
+  end;
 end;
 
 { ============================================================================

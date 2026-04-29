@@ -433,6 +433,13 @@ procedure addModuleArgument(pPse: PParse; pTable: PTable2; zArg: PAnsiChar);
 
 implementation
 
+{ Note: passqlite3vdbe is intentionally NOT added to the uses list here.
+  Adding it (in either interface or implementation) shadows codegen's
+  PParse = ^TParse with vdbe's opaque PParse = Pointer, breaking every
+  pParse^.field deref in this unit.  The gGetTokenImpl hook is wired
+  via a small registrar declared in passqlite3main.pas, which already
+  uses both units. }
+
 {$INCLUDE passqlite3parsertables.inc}
 
 { =========================================================================== }

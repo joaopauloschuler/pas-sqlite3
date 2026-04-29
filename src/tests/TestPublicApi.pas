@@ -64,10 +64,12 @@ begin
   Check(rc = SQLITE_OK, 'bind');
   zExp := sqlite3_expanded_sql(pStmt);
   Check(zExp <> nil, 'expanded_sql non-nil');
-  { Note: sqlite3VdbeExpandSql is currently a stub that returns the raw SQL
-    text without substituting bound parameters (vdbe.pas:5125 design note).
-    Once the full printf-based expander lands, tighten this to check for '41'. }
-  if zExp <> nil then sqlite3_free(zExp);
+  if zExp <> nil then begin
+    { Phase 5.8 — sqlite3VdbeExpandSql now substitutes bound parameters. }
+    Check(StrComp(zExp, 'SELECT 41+1') = 0,
+          'expanded_sql substitutes ?1 → 41');
+    sqlite3_free(zExp);
+  end;
 
   { sqlite3_next_stmt walk: nil → first; pStmt → next (nil if only one) }
   pNext := sqlite3_next_stmt(db, nil);

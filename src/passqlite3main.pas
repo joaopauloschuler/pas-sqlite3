@@ -4005,4 +4005,10 @@ end;
 initialization
   vdbeParseSchemaExec := @execParseSchemaImpl;
 
+  { Phase 5.8: wire the parser tokenizer into vdbetrace's ExpandSql so
+    bound-parameter scanning works.  Done here (not in passqlite3parser)
+    to avoid PParse-symbol shadowing inside the parser unit. }
+  passqlite3vdbe.gGetTokenImpl :=
+    passqlite3vdbe.TGetTokenFn(@passqlite3parser.sqlite3GetToken);
+
 end.
