@@ -430,7 +430,12 @@ Important: At the end of this document, please find:
        UPDATE sqlite_master path.  Closes the last contributor of
        6.11(b).
 
-- [ ] **7.1.3** Statement re-prepare (sqlite3Reprepare)
+- [X] **7.1.3** Statement re-prepare (sqlite3Reprepare) — closed
+       2026-04-29.  Full body at main.pas:1001 (sqlite3LockAndPrepare +
+       VdbeSwap + TransferBindings + ResetStepResult + Finalize); all
+       callees present and non-stub.  Activates the SQLITE_SCHEMA
+       transparent-recompile path used by sqlite3_step on prepare_v2
+       statements.
 
 - [X] **7.1.4** DbFixer
 
@@ -484,8 +489,15 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 
 - [ ] **8.1.1** Connection-lifecycle gaps (main.c):
        [X] `sqlite3_open16` — ported 2026-04-29.
-       [ ] `sqlite3_db_config` — raw varargs entry point (currently only
-            typed wrappers `_text`/`_lookaside`/`_int` exist).
+       [X] `sqlite3_db_config` — closed 2026-04-29 by design (see
+            main.pas:1291 / codegen.pas:2791 "No C-ABI varargs").  The
+            varargs ABI is split into the typed entry points
+            `_text` / `_lookaside` / `_int`; together they provide the
+            full functional surface of the C `sqlite3_db_config(...)`
+            (MAINDBNAME, LOOKASIDE, FP_DIGITS, all 21 boolean flag-ops
+            via `dbConfigFlagOp`).  No Pascal consumer needs the raw
+            varargs shape; if a future C-ABI export is added, expose a
+            cdecl shim that dispatches into the typed wrappers.
        [X] `sqlite3_set_clientdata` / `sqlite3_get_clientdata` — ported 2026-04-29.
 
 - [ ] **8.2.1** Statement-introspection gaps (vdbeapi.c):
