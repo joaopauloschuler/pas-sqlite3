@@ -543,8 +543,11 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 
 - [ ] **8.9.1** Vtab helper APIs (vtab.c, vdbeapi.c):
        [ ] `sqlite3_vtab_distinct` — query-planner DISTINCT hint.
-       [ ] `sqlite3_vtab_in` / `_in_first` / `_in_next` — IN-operator
-            helpers.
+       [ ] `sqlite3_vtab_in` — IN-operator iterator-mode toggle (gated on
+            HiddenIndexInfo; not yet defined on the Pas side).
+       [X] `sqlite3_vtab_in_first` / `_in_next` — ported 2026-04-29
+            (vdbeapi.c:1087/1095 → passqlite3vdbe.pas, valueFromValueList
+            helper drives ephemeral-btree iteration over the IN-list).
        [X] `sqlite3_vtab_nochange` — ported 2026-04-29.
        [ ] `sqlite3_vtab_rhs_value` — extract RHS value of a constraint.
 

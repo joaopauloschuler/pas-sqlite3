@@ -1374,6 +1374,8 @@ procedure sqlite3VdbeDelete(p: PVdbe);
 { --- vdbeapi.c — sqlite3_context introspection + auxdata (Phase 6.8.g) --- }
 function  sqlite3_context_db_handle(p: Psqlite3_context): Psqlite3;
 function  sqlite3_vtab_nochange(p: Psqlite3_context): i32;
+function  sqlite3_vtab_in_first(pVal: PMem; ppOut: PPMem): i32;
+function  sqlite3_vtab_in_next(pVal: PMem; ppOut: PPMem): i32;
 function  sqlite3_get_auxdata(pCtx: Psqlite3_context; iArg: i32): Pointer;
 procedure sqlite3_set_auxdata(pCtx: Psqlite3_context; iArg: i32;
                               pAux: Pointer; xDelete: TxDelProc);
@@ -3835,6 +3837,76 @@ function sqlite3_vtab_nochange(p: Psqlite3_context): i32;
 begin
   if p = nil then begin Result := 0; Exit; end;
   Result := sqlite3_value_nochange(p^.pOut);
+end;
+
+{ valueFromValueList — vdbeapi.c:1032.  Implementation of
+  sqlite3_vtab_in_first() (bNext=0) and sqlite3_vtab_in_next() (bNext=1).
+  Reads the next row of the ephemeral b-tree backing the IN-list value
+  and decodes the single-column record into pRhs^.pOut. }
+function valueFromValueList(pVal: PMem; ppOut: PPMem; bNext: i32): i32;
+var
+  pRhs:     PValueList;
+  rc:       i32;
+  dummy:    i32;
+  sz:       u32;
+  sMem:     TMem;
+  zBuf:     Pu8;
+  iSerial:  u32;
+  iOff:     i32;
+  consumed: u8;
+  pOut:     PMem;
+begin
+  ppOut^ := nil;
+  if pVal = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  if ((pVal^.flags and MEM_Dyn) = 0)
+     or (Pointer(pVal^.xDel) <> Pointer(@sqlite3VdbeValueListFree)) then
+  begin
+    Result := SQLITE_ERROR; Exit;
+  end;
+  pRhs := PValueList(pVal^.z);
+  if bNext <> 0 then
+    rc := sqlite3BtreeNext(pRhs^.pCsr, 0)
+  else begin
+    dummy := 0;
+    rc := sqlite3BtreeFirst(pRhs^.pCsr, @dummy);
+    if sqlite3BtreeEof(pRhs^.pCsr) <> 0 then rc := SQLITE_DONE;
+  end;
+  if rc = SQLITE_OK then begin
+    FillChar(sMem, SizeOf(sMem), 0);
+    sz := sqlite3BtreePayloadSize(pRhs^.pCsr);
+    rc := sqlite3VdbeMemFromBtreeZeroOffset(pRhs^.pCsr, sz, @sMem);
+    if rc = SQLITE_OK then begin
+      zBuf := Pu8(sMem.z);
+      iSerial := 0;
+      { getVarint32(&zBuf[1], iSerial) }
+      if (Pu8(zBuf + 1)^ and $80) = 0 then begin
+        iSerial  := u32(Pu8(zBuf + 1)^);
+        consumed := 1;
+      end else
+        consumed := sqlite3GetVarint32(Pu8(zBuf + 1), iSerial);
+      iOff := 1 + i32(consumed);
+      pOut := pRhs^.pOut;
+      sqlite3VdbeSerialGet(Pu8(zBuf + iOff), iSerial, pOut);
+      pOut^.enc := PTsqlite3(pOut^.db)^.enc;
+      if ((pOut^.flags and MEM_Ephem) <> 0)
+         and (sqlite3VdbeMemMakeWriteable(pOut) <> 0) then
+        rc := SQLITE_NOMEM
+      else
+        ppOut^ := pOut;
+    end;
+    sqlite3VdbeMemRelease(@sMem);
+  end;
+  Result := rc;
+end;
+
+function sqlite3_vtab_in_first(pVal: PMem; ppOut: PPMem): i32;
+begin
+  Result := valueFromValueList(pVal, ppOut, 0);
+end;
+
+function sqlite3_vtab_in_next(pVal: PMem; ppOut: PPMem): i32;
+begin
+  Result := valueFromValueList(pVal, ppOut, 1);
 end;
 
 function sqlite3_get_auxdata(pCtx: Psqlite3_context; iArg: i32): Pointer;
