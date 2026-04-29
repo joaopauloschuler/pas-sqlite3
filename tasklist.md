@@ -28,7 +28,7 @@ Important: At the end of this document, please find:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-- [ ] **6.8**  Pragma (pragma.c): `sqlite3PragmaVtabRegister` — returns `nil`; registers
+- [ ] **6.8.0**  Pragma (pragma.c): `sqlite3PragmaVtabRegister` — returns `nil`; registers
             `pragma_*` eponymous virtual tables via
             `sqlite3VtabCreateModule` + `pragmaVtabModule`.
 
@@ -479,7 +479,12 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        / `_step` / `_finish` exist; the remaining surface is missing):
        [X] `sqlite3_serialize` — ported 2026-04-29 (real-Btree path only;
             memdb VFS branch unreachable).  Gate: `src/tests/TestSerialize.pas`.
-       [ ] `sqlite3_deserialize` — open in-memory db from a buffer.
+       [X] `sqlite3_deserialize` — ported 2026-04-29 as the
+            SQLITE_OMIT_DESERIALIZE-equivalent stub: the memdb VFS is not
+            yet wired in, so the call cannot succeed; faithful semantics
+            return SQLITE_ERROR while honouring FREEONCLOSE on the
+            failure path (memdb.c:903).  Gate extended in TestSerialize
+            (T5/T6).
 
 - [ ] **8.8.1** Pre-update hook (preupdate.c — `SQLITE_ENABLE_PREUPDATE_HOOK`):
        [ ] `sqlite3_preupdate_count` / `_new` / `_old` / `_depth` /

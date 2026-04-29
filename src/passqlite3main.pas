@@ -457,6 +457,19 @@ const
 function sqlite3_serialize(db: PTsqlite3; zSchema: PAnsiChar;
   piSize: Pi64; mFlags: u32): Pu8; cdecl;
 
+{ Phase 8.7.2 — sqlite3_deserialize.  Reopens database zSchema using the
+  serialized image in pData.  Faithful to memdb.c:839 in the build mode
+  where the memdb VFS is unported: the function fails with SQLITE_ERROR
+  because the underlying memdb backing store is required to swap the
+  pData buffer in.  The FREEONCLOSE bit is honoured on failure (memdb.c
+  :903) so the caller's ownership-transfer contract still holds. }
+const
+  SQLITE_DESERIALIZE_FREEONCLOSE = 1;
+  SQLITE_DESERIALIZE_RESIZEABLE  = 2;
+  SQLITE_DESERIALIZE_READONLY    = 4;
+function sqlite3_deserialize(db: PTsqlite3; zSchema: PAnsiChar;
+  pData: Pu8; szDb, szBuf: i64; mFlags: u32): i32; cdecl;
+
 { Phase 8.7.1 — Snapshot public-API entry points (sqlite.h.in:11006..11136).
   Mirrors the SQLITE_OMIT_WAL build of main.c:5018..5147: snapshot machinery
   on top of WAL is not yet ported (sqlite3PagerSnapshotOpen/Get/Check/Recover
@@ -4039,6 +4052,30 @@ begin
     sqlite3PagerUnref(pPage);
   end;
   Result := pOut;
+end;
+
+{ memdb.c:839 — sqlite3_deserialize.  In the upstream build this would
+  ATTACH a fresh memdb VFS file and swap pData into its MemStore backing
+  buffer.  The memdb VFS is not yet ported here, so the operation cannot
+  succeed; mirror the SQLITE_OMIT_DESERIALIZE-equivalent semantics by
+  reporting SQLITE_ERROR.  The FREEONCLOSE flag still has to be honoured
+  on the failure path (memdb.c:903) so the caller's "we hand over the
+  buffer" contract remains intact. }
+function sqlite3_deserialize(db: PTsqlite3; zSchema: PAnsiChar;
+  pData: Pu8; szDb, szBuf: i64; mFlags: u32): i32; cdecl;
+begin
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  if (szDb < 0) or (szBuf < 0) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+{$ENDIF}
+  if (pData <> nil)
+     and ((mFlags and SQLITE_DESERIALIZE_FREEONCLOSE) <> 0) then
+    sqlite3_free(pData);
+  Result := SQLITE_ERROR;
 end;
 
 { ----------------------------------------------------------------------
