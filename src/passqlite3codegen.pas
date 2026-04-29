@@ -7479,17 +7479,28 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         end;
       end;
       { Unresolved bare identifier — try TK_ID → TK_TRUEFALSE rewrite
-        (resolve.c:747).  Otherwise leave as TK_ID; downstream codegen
-        will refuse the trivial gate and fall back to the SQLITE_OK
-        no-body stub. }
-      sqlite3ExprIdToTrueFalse(pE);
+        (resolve.c:747).  If that also fails, emit "no such column: X"
+        per resolve.c:784..795 (lookupName). }
+      if sqlite3ExprIdToTrueFalse(pE) = 0 then
+      begin
+        if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
+          sqlite3ErrorMsg(pParse,
+            PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+      end;
       Exit;
     end;
     { No FROM clause — still attempt the TK_ID → TK_TRUEFALSE rewrite
-      so bare `SELECT TRUE` / `SELECT FALSE` resolve. }
+      so bare `SELECT TRUE` / `SELECT FALSE` resolve.  If that fails,
+      emit "no such column: X" (resolve.c:784..795). }
     if pE^.op = TK_ID then
     begin
-      sqlite3ExprIdToTrueFalse(pE);
+      if sqlite3ExprIdToTrueFalse(pE) = 0 then
+      begin
+        if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
+          sqlite3ErrorMsg(pParse,
+            PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+        Exit;
+      end;
     end;
     ResolveExpr(pE^.pLeft);
     ResolveExpr(pE^.pRight);

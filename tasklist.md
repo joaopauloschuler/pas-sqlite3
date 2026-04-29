@@ -782,10 +782,11 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        337/0, TestDMLBasic 54/0, TestAuthBuiltins 34/0, TestPrintf
        105/0, DiagFunctions/Date/Cast 0 div.
 
-- [ ] **8.3.2-quater** Pre-existing parse/resolve error-message gaps
-       surfaced by `DiagErrMsg.pas`.  Each prepares cleanly on Pas
-       where C errors at prepare or step time — NOT error-routing
-       bugs, but catches in earlier phases:
+- [X] **8.3.2-quater** Pre-existing parse/resolve error-message gaps
+       surfaced by `DiagErrMsg.pas` — all six entries closed 2026-04-29;
+       DiagErrMsg now 10/0 PASS.  Each prepared cleanly on Pas where C
+       errored at prepare or step time — NOT error-routing bugs, but
+       catches in earlier phases:
        [X] `SLECT 1` — closed 2026-04-29.  Root cause: `yy_syntax_error`
             (passqlite3parser.pas) called `sqlite3ErrorMsg(pPse,
             'near "%T": syntax error')` but the existing one-arg
@@ -794,10 +795,14 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             sqlite3MPrintf with `[@yyminor]` + replicate the
             nErr/rc/zErrMsg bookkeeping.  DiagErrMsg `parse syntax`
             now PASS (`near "SLECT": syntax error`).
-       [ ] `SELECT z FROM t` (z not a column) — Pas accepts at prepare,
-            steps with no rows; C errors `no such column: z`.  Folds
-            into the resolver coverage gap (sqlite3ResolveExprListNames
-            in 6.8 or the trivial-stub gate in sqlite3Select).
+       [X] `SELECT z FROM t` (z not a column) — closed 2026-04-29.
+            Ported the resolve.c:784..795 lookupName "no such column"
+            arm into ResolveExpr (codegen.pas): when a TK_ID reaches
+            the bare-identifier branch and neither matches a FROM-clause
+            column / rowid nor rewrites to TK_TRUEFALSE, emit
+            `sqlite3ErrorMsg(pParse, "no such column: <token>")`.
+            Same arm added to the no-FROM branch so `SELECT sum` (next
+            entry) closes with the same fix.
        [X] `SELECT * FROM nonesuch` — closed 2026-04-29.  Lifted the
             `LOCATE_NOERR` flag in `sqlite3SelectExpand`'s FROM-clause
             resolution loop (codegen.pas) so a missing table now sets
@@ -822,8 +827,9 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             49/0, TestWhereBasic 52/0, TestBtreeCompat 337/0,
             TestDMLBasic 54/0, TestVdbeApi 57/0, DiagSumOverflow 12/0,
             TestAuthBuiltins 34/0.
-       [ ] `SELECT sum` — bare function name treated as column ref.
-            Pas reports "not an error", C reports `no such column: sum`.
+       [X] `SELECT sum` — closed 2026-04-29 as a side-effect of the
+            ResolveExpr "no such column" arm landed for `SELECT z FROM t`.
+            DiagErrMsg `open fail` now PASS (`no such column: sum`).
        [X] `SELECT group_concat(a, 'x', 'y') FROM t` — closed 2026-04-29
             as a side-effect of lifting `LOCATE_NOERR` in
             `sqlite3SelectExpand` (FROM-clause now resolves before the
