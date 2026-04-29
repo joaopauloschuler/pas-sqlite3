@@ -3291,17 +3291,21 @@ begin
     OP_Variable / sqlite3_bind_* can resolve `?N`/`:name`/`@name`/`$name`
     parameters.  Each slot is initialised to MEM_Null with a back-pointer
     to db (initMemArray contract). }
+  if vdbeDbMallocFailed(db) then
+    p^.nVar := 0
+  else
+    p^.nVar := ynVar(nVar);
   if (not vdbeDbMallocFailed(db)) and (nVar > 0) then begin
     p^.aVar := PMem(sqlite3DbMallocZero(db, u64(nVar) * SizeOf(TMem)));
     if p^.aVar <> nil then begin
-      p^.nVar := ynVar(nVar);
       n := 0;
       while n < nVar do begin
         (p^.aVar + n)^.db    := db;
         (p^.aVar + n)^.flags := MEM_Null;
         Inc(n);
       end;
-    end;
+    end else
+      p^.nVar := 0;
   end;
 
   sqlite3VdbeRewind(p);
@@ -3794,6 +3798,13 @@ begin
   if p^.pVList <> nil then begin
     sqlite3DbNNFreeNN(db, p^.pVList);
     p^.pVList := nil;
+  end;
+  { Release any bound parameter Mem cells.  Mirrors vdbeaux.c:3748 —
+    releaseMemArray(p->aVar, p->nVar).  Required so bind-pointer /
+    bind-text/blob destructors fire on finalize. }
+  if (p^.aVar <> nil) and (p^.nVar > 0) then begin
+    for i := 0 to p^.nVar - 1 do
+      sqlite3VdbeMemRelease(p^.aVar + i);
   end;
   if p^.pFree <> nil then
     sqlite3DbFree(db, p^.pFree);

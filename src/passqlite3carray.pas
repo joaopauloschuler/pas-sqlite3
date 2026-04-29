@@ -120,6 +120,22 @@ type
   name "carray" and returns the registry slot. }
 function sqlite3CarrayRegister(db: PTsqlite3): PVtabModule;
 
+{ carray.c:435 — sqlite3_carray_bind_v2.  Binds a C array to a single
+  parameter of a prepared statement so the carray() table-valued
+  function returns its elements.  When xDestroy = SQLITE_TRANSIENT the
+  data is duplicated and owned by the carray_bind object; otherwise the
+  caller retains ownership and xDestroy fires on pDestroy (or aData if
+  pDestroy = nil) once the binding is released. }
+function sqlite3_carray_bind_v2(pStmt: PVdbe; idx: i32;
+  aData: Pointer; nData: i32; mFlags: i32;
+  xDestroy: TxDelProc; pDestroy: Pointer): i32;
+
+{ carray.c:540 — single-arg form: pDestroy = aData (xDestroy fires on
+  the array buffer itself). }
+function sqlite3_carray_bind(pStmt: PVdbe; idx: i32;
+  aData: Pointer; nData: i32; mFlags: i32;
+  xDestroy: TxDelProc): i32;
+
 { Public Tsqlite3_module record (carrayModule, carray.c:381).  Exposed
   so gate tests can read its slot pointers without going through the
   registry. }
@@ -410,6 +426,154 @@ end;
 function sqlite3CarrayRegister(db: PTsqlite3): PVtabModule;
 begin
   Result := sqlite3VtabCreateModule(db, 'carray', @carrayModule, nil, nil);
+end;
+
+{ ============================================================
+  sqlite3_carray_bind / _v2 — carray.c:412..549
+  ============================================================ }
+
+{ carray.c:412 — destructor wired into sqlite3_bind_pointer.  Releases
+  the per-bind data (when not SQLITE_STATIC) then frees the
+  carray_bind record itself. }
+procedure carrayBindDel(pPtr: Pointer); cdecl;
+var
+  p: PCarrayBind;
+begin
+  p := PCarrayBind(pPtr);
+  if p = nil then Exit;
+  if (p^.xDel <> SQLITE_STATIC) and Assigned(p^.xDel) then
+    p^.xDel(p^.pDel);
+  sqlite3_free(p);
+end;
+
+{ Local cdecl free wrapper so we can hand a TxDelProc to
+  sqlite3_bind_pointer for the SQLITE_TRANSIENT-duplicated buffer. }
+procedure carrayFreeXDel(p: Pointer); cdecl;
+begin
+  sqlite3_free(p);
+end;
+
+function sqlite3_carray_bind_v2(pStmt: PVdbe; idx: i32;
+  aData: Pointer; nData: i32; mFlags: i32;
+  xDestroy: TxDelProc; pDestroy: Pointer): i32;
+var
+  pNew: PCarrayBind;
+  rc:   i32;
+  i:    i32;
+  sz:   i64;
+  z:    PByte;
+  zData: PAnsiChar;
+  az:   PPAnsiChar;
+  zStr: PAnsiChar;
+  n:    SizeUInt;
+  pIov: PIoVec;
+  srcIov: PIoVec;
+label
+  carray_bind_error;
+begin
+  pNew := nil;
+  rc := SQLITE_OK;
+
+  if (mFlags < CARRAY_INT32) or (mFlags > CARRAY_BLOB) then begin
+    rc := SQLITE_ERROR; goto carray_bind_error;
+  end;
+
+  pNew := PCarrayBind(sqlite3_malloc64(SizeOf(TCarrayBind)));
+  if pNew = nil then begin
+    rc := SQLITE_NOMEM; goto carray_bind_error;
+  end;
+
+  pNew^.nData  := nData;
+  pNew^.mFlags := mFlags;
+
+  if Pointer(xDestroy) = Pointer(SQLITE_TRANSIENT) then
+  begin
+    sz := nData;
+    case mFlags of
+      CARRAY_INT32:  sz := sz * 4;
+      CARRAY_INT64:  sz := sz * 8;
+      CARRAY_DOUBLE: sz := sz * 8;
+      CARRAY_TEXT:   sz := sz * SizeOf(PAnsiChar);
+    else
+      sz := sz * SizeOf(TIoVec);
+    end;
+    if mFlags = CARRAY_TEXT then
+    begin
+      for i := 0 to nData - 1 do begin
+        zData := (PPAnsiChar(aData))[i];
+        if zData <> nil then
+          sz := sz + i64(strlen(zData)) + 1;
+      end;
+    end
+    else if mFlags = CARRAY_BLOB then
+    begin
+      srcIov := PIoVec(aData);
+      for i := 0 to nData - 1 do
+        sz := sz + i64(srcIov[i].iov_len);
+    end;
+
+    pNew^.aData := sqlite3_malloc64(sz);
+    if pNew^.aData = nil then begin
+      rc := SQLITE_NOMEM; goto carray_bind_error;
+    end;
+
+    if mFlags = CARRAY_TEXT then
+    begin
+      az := PPAnsiChar(pNew^.aData);
+      zStr := PAnsiChar(@az[nData]);
+      for i := 0 to nData - 1 do begin
+        zData := (PPAnsiChar(aData))[i];
+        if zData = nil then begin az[i] := nil; Continue; end;
+        az[i] := zStr;
+        n := strlen(zData);
+        Move(zData^, zStr^, n + 1);
+        Inc(zStr, n + 1);
+      end;
+    end
+    else if mFlags = CARRAY_BLOB then
+    begin
+      pIov := PIoVec(pNew^.aData);
+      srcIov := PIoVec(aData);
+      z := PByte(@pIov[nData]);
+      for i := 0 to nData - 1 do begin
+        n := srcIov[i].iov_len;
+        pIov[i].iov_len  := n;
+        pIov[i].iov_base := z;
+        Move(srcIov[i].iov_base^, z^, n);
+        Inc(z, n);
+      end;
+    end
+    else
+      Move(aData^, pNew^.aData^, sz);
+
+    pNew^.xDel := @carrayFreeXDel;
+    pNew^.pDel := pNew^.aData;
+  end
+  else
+  begin
+    pNew^.aData := aData;
+    pNew^.xDel  := xDestroy;
+    pNew^.pDel  := pDestroy;
+  end;
+
+  Result := sqlite3_bind_pointer(pStmt, idx, pNew, 'carray-bind', @carrayBindDel);
+  Exit;
+
+carray_bind_error:
+  if (Pointer(xDestroy) <> Pointer(SQLITE_STATIC))
+     and (Pointer(xDestroy) <> Pointer(SQLITE_TRANSIENT))
+     and Assigned(xDestroy) then
+    xDestroy(pDestroy);
+  sqlite3_free(pNew);
+  Result := rc;
+end;
+
+function sqlite3_carray_bind(pStmt: PVdbe; idx: i32;
+  aData: Pointer; nData: i32; mFlags: i32;
+  xDestroy: TxDelProc): i32;
+begin
+  Result := sqlite3_carray_bind_v2(pStmt, idx, aData, nData, mFlags,
+                                   xDestroy, aData);
 end;
 
 initialization

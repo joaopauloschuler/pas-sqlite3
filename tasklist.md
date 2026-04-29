@@ -916,8 +916,25 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_vtab_rhs_value` — extract RHS value of a constraint.
 
 - [ ] **8.9.2** Carray / shared-cache / misc:
-       [ ] `sqlite3_carray_bind` / `_carray_bind_v2` (carray.c) — bind a
-            C array to a prepared stmt.
+       [X] `sqlite3_carray_bind` / `_carray_bind_v2` (carray.c) — ported
+            2026-04-29 (passqlite3carray.pas) — verbatim port of
+            carray.c:412..549 incl. SQLITE_TRANSIENT duplication arms for
+            INT32/INT64/DOUBLE/TEXT/BLOB and the carrayBindDel destructor;
+            wrapped via sqlite3_bind_pointer with type tag "carray-bind".
+            TestCarray now drives bind smoke (D1..D3): bad-mFlags →
+            SQLITE_ERROR, static-buffer round-trip, v2-with-destructor
+            fires xDestroy exactly once on finalize.  Side fixes:
+            (1) sqlite3VdbeMakeReady now sets `p^.nVar` unconditionally
+            (was only set when nVar>0 → uninitialised garbage when SQL
+            had no parameters, mirrors vdbeaux.c:2731..2737); (2)
+            sqlite3VdbeClearObject now releases aVar entries via
+            sqlite3VdbeMemRelease (mirrors vdbeaux.c:3748) so bind-
+            pointer / bind-text/blob destructors fire on finalize.
+            TestExplainParity 1016/10, TestCarray 74/0, DiagPubApi
+            163/0, TestVdbeApi 57/0, TestParser 45/0, TestSelectBasic
+            49/0, TestWhereBasic 52/0, TestBtreeCompat 337/0,
+            TestDMLBasic 54/0, TestVdbeAgg 11/0, DiagSumOverflow 12/0,
+            TestAuthBuiltins 34/0, TestPrintf 105/0 — no regressions.
        [ ] `sqlite3_enable_shared_cache` — process-wide shared-cache
             toggle.
        [ ] `sqlite3_activate_cerod` — CEROD extension activator
