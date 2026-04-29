@@ -1595,6 +1595,10 @@ function sqlite3_column_bytes(pStmt: PVdbe; i: i32): i32;
 function sqlite3_column_bytes16(pStmt: PVdbe; i: i32): i32;
 function sqlite3_column_value(pStmt: PVdbe; i: i32): Psqlite3_value;
 function sqlite3_column_name(pStmt: PVdbe; N: i32): PAnsiChar;
+function sqlite3_column_name16(pStmt: PVdbe; N: i32): Pointer;
+function sqlite3_column_decltype(pStmt: PVdbe; N: i32): PAnsiChar;
+function sqlite3_column_decltype16(pStmt: PVdbe; N: i32): Pointer;
+function sqlite3_column_text16(pStmt: PVdbe; i: i32): Pointer;
 
 { sqlite3_bind_* }
 function sqlite3_bind_int(pStmt: PVdbe; i: i32; iVal: i32): i32;
@@ -4495,14 +4499,51 @@ begin
   Result := pOut;
 end;
 
+{ vdbeapi.c:1492 — columnName(pStmt, N, useUtf16, useType).
+  Slot stored at aColName[N + useType*nResColumn]; encoding selected by
+  useUtf16. }
+function columnName(pStmt: PVdbe; N: i32; useUtf16, useType: i32): Pointer;
+var
+  pCell: PMem;
+  off:   PtrUInt;
+begin
+  Result := nil;
+  if pStmt = nil then Exit;
+  if (N < 0) or (N >= pStmt^.nResColumn) then Exit;
+  if pStmt^.aColName = nil then Exit;
+  if (useType < 0) or (useType >= COLNAME_N) then Exit;
+  off := PtrUInt(N + useType * i32(pStmt^.nResColumn)) * SizeOf(TMem);
+  pCell := PMem(PtrUInt(pStmt^.aColName) + off);
+  if useUtf16 <> 0 then
+    Result := sqlite3ValueText(pCell, SQLITE_UTF16NATIVE)
+  else
+    Result := sqlite3ValueText(pCell, SQLITE_UTF8);
+end;
+
 function sqlite3_column_name(pStmt: PVdbe; N: i32): PAnsiChar;
 begin
-  if (pStmt = nil) or (N < 0) or (N >= pStmt^.nResColumn) then begin
-    Result := nil; Exit;
-  end;
-  if pStmt^.aColName = nil then begin Result := nil; Exit; end;
-  Result := PAnsiChar(sqlite3ValueText(
-    pStmt^.aColName + N, SQLITE_UTF8));
+  Result := PAnsiChar(columnName(pStmt, N, 0, COLNAME_NAME));
+end;
+
+function sqlite3_column_name16(pStmt: PVdbe; N: i32): Pointer;
+begin
+  Result := columnName(pStmt, N, 1, COLNAME_NAME);
+end;
+
+function sqlite3_column_decltype(pStmt: PVdbe; N: i32): PAnsiChar;
+begin
+  Result := PAnsiChar(columnName(pStmt, N, 0, COLNAME_DECLTYPE));
+end;
+
+function sqlite3_column_decltype16(pStmt: PVdbe; N: i32): Pointer;
+begin
+  Result := columnName(pStmt, N, 1, COLNAME_DECLTYPE);
+end;
+
+{ vdbeapi.c:1431 — sqlite3_column_text16. }
+function sqlite3_column_text16(pStmt: PVdbe; i: i32): Pointer;
+begin
+  Result := sqlite3_value_text16(columnMem(pStmt, i));
 end;
 
 { --- vdbeUnbind helper (vdbeapi.c:1654) --- }
