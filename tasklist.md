@@ -388,9 +388,12 @@ Important: At the end of this document, please find:
   [ ] **6.23** port codegen.pas trigger stubs in full from C to pascal:
        [ ] `sqlite3BeginTrigger`
        [ ] `sqlite3FinishTrigger`
-       [ ] `sqlite3DropTrigger`
-       [ ] `sqlite3DropTriggerPtr`
-       [ ] `sqlite3UnlinkAndDeleteTrigger`
+       [X] `sqlite3DropTrigger` — ported 2026-04-29 (trigger.c:658).
+       [X] `sqlite3DropTriggerPtr` — ported 2026-04-29 (trigger.c:709;
+            tableOfTrigger inlined as trgTableOfTrigger; emits
+            DELETE FROM sqlite_master + ChangeCookie + OP_DropTrigger).
+            Dead-code until `sqlite3BeginTrigger` populates trigHash.
+       [X] `sqlite3UnlinkAndDeleteTrigger` — ported (trigger.c:747).
        [ ] `sqlite3CodeRowTriggerDirect`
        [ ] `sqlite3CodeRowTrigger`
        [ ] `sqlite3TriggerStepSrc`

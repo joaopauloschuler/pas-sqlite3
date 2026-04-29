@@ -20474,16 +20474,117 @@ begin
   sqlite3DeleteTriggerStep(pParse^.db, pStepList);
 end;
 
-{ sqlite3DropTrigger — DROP TRIGGER statement (Phase 6.4 stub) }
+{ sqlite3DropTrigger — port of trigger.c:658.
+  DROP TRIGGER statement: locate the trigger by name (searching TEMP before
+  MAIN, or in a specific database when zDb is set), then delegate to
+  sqlite3DropTriggerPtr.  Reports "no such trigger" when missing unless
+  noErr is set. }
 procedure sqlite3DropTrigger(pParse: PParse; pName: PSrcList; noErr: i32);
+label drop_trigger_cleanup;
+var
+  pTrg:     PTrigger;
+  i, j:     i32;
+  zDb:      PAnsiChar;
+  zName:    PAnsiChar;
+  db:       PTsqlite3;
+  pItem:    PSrcItem;
+  zErr:     AnsiString;
+  hashFind: passqlite3util.PHash;
 begin
+  pTrg := nil;
+  db := pParse^.db;
+  if db^.mallocFailed <> 0 then goto drop_trigger_cleanup;
+  if sqlite3ReadSchema(pParse) <> SQLITE_OK then goto drop_trigger_cleanup;
+
+  Assert(pName^.nSrc = 1, 'DropTrigger: nSrc=1');
+  pItem := SrcListItems(pName);
+  Assert(((pItem^.fg.fgBits3 and $01) = 0) and
+         ((pItem^.fg.fgBits and $10) = 0),
+         'DropTrigger: fixedSchema/isSubquery clear');
+  zDb   := pItem^.u4.zDatabase;
+  zName := pItem^.zName;
+  i := OMIT_TEMPDB;
+  while i < db^.nDb do begin
+    if i < 2 then j := i xor 1 else j := i;  { Search TEMP before MAIN }
+    if (zDb <> nil) and (sqlite3DbIsNamed(db, j, zDb) = 0) then begin
+      Inc(i);
+      Continue;
+    end;
+    if db^.aDb[j].pSchema <> nil then begin
+      hashFind := @db^.aDb[j].pSchema^.trigHash;
+      pTrg := PTrigger(sqlite3HashFind(hashFind, PChar(zName)));
+      if pTrg <> nil then Break;
+    end;
+    Inc(i);
+  end;
+  if pTrg = nil then begin
+    if noErr = 0 then begin
+      if zDb <> nil then
+        zErr := AnsiString('no such trigger: ') + AnsiString(zDb) +
+                '.' + AnsiString(zName)
+      else
+        zErr := AnsiString('no such trigger: ') + AnsiString(zName);
+      sqlite3ErrorMsg(pParse, PAnsiChar(zErr));
+    end else begin
+      sqlite3CodeVerifyNamedSchema(pParse, zDb);
+    end;
+    pParse^.parseFlags := pParse^.parseFlags or $200; { checkSchema bit }
+    goto drop_trigger_cleanup;
+  end;
+  sqlite3DropTriggerPtr(pParse, pTrg);
+
+drop_trigger_cleanup:
   sqlite3SrcListDelete(pParse^.db, pName);
 end;
 
-{ sqlite3DropTriggerPtr — DROP TRIGGER by pointer (Phase 6.4 stub) }
-procedure sqlite3DropTriggerPtr(pParse: PParse; pTrigger: PTrigger);
+{ tableOfTrigger — port of trigger.c:701 (static).
+  Look up the trigger's parent table in pTabSchema->tblHash. }
+function trgTableOfTrigger(pTrigger: PTrigger): PTable2;
+var
+  pH: passqlite3util.PHash;
 begin
-  { Phase 6.5: generate OP_DropTrigger VDBE instruction }
+  pH := @passqlite3util.PSchema(pTrigger^.pTabSchema)^.tblHash;
+  Result := PTable2(sqlite3HashFind(pH, PChar(pTrigger^.table)));
+end;
+
+{ sqlite3DropTriggerPtr — port of trigger.c:709.
+  Generate VDBE code to delete the trigger row from sqlite_master,
+  bump the schema cookie, and emit OP_DropTrigger. }
+procedure sqlite3DropTriggerPtr(pParse: PParse; pTrigger: PTrigger);
+var
+  pTable: PTable2;
+  v:      PVdbe;
+  db:     PTsqlite3;
+  iDb:    i32;
+  code:   i32;
+  zDb:    PAnsiChar;
+  zTab:   PAnsiChar;
+begin
+  db := pParse^.db;
+  iDb := sqlite3SchemaToIndex(pParse^.db, pTrigger^.pSchema);
+  Assert((iDb >= 0) and (iDb < db^.nDb), 'DropTriggerPtr: iDb in range');
+  pTable := trgTableOfTrigger(pTrigger);
+  Assert(((pTable <> nil) and (pTable^.pSchema = pTrigger^.pSchema)) or (iDb = 1),
+         'DropTriggerPtr: tableOfTrigger schema');
+  if pTable <> nil then begin
+    code := SQLITE_DROP_TRIGGER;
+    zDb := db^.aDb[iDb].zDbSName;
+    zTab := PAnsiChar(LEGACY_SCHEMA_TABLE);
+    if iDb = 1 then code := SQLITE_DROP_TEMP_TRIGGER;
+    if (sqlite3AuthCheck(pParse, code, pTrigger^.zName, pTable^.zName, zDb) <> 0)
+       or (sqlite3AuthCheck(pParse, SQLITE_DELETE_AUTH, zTab, nil, zDb) <> 0) then
+      Exit;
+  end;
+
+  v := sqlite3GetVdbe(pParse);
+  if v <> nil then begin
+    sqlite3NestedParse(pParse,
+      'DELETE FROM %Q.' + LEGACY_SCHEMA_TABLE +
+      ' WHERE name=%Q AND type=''trigger''',
+      [db^.aDb[iDb].zDbSName, pTrigger^.zName]);
+    sqlite3ChangeCookie(pParse, iDb);
+    sqlite3VdbeAddOp4(v, OP_DropTrigger, iDb, 0, 0, pTrigger^.zName, 0);
+  end;
 end;
 
 { sqlite3UnlinkAndDeleteTrigger — port of trigger.c:747.
