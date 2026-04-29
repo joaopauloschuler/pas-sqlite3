@@ -471,8 +471,13 @@ Important: At the end of this document, please find:
        [X] `sqlite3WhereExplainBloomFilter` — ported 2026-04-29
             (wherecode.c:280..320).  Wired into constructAutomaticIndex
             so auto-index Bloom filters now emit the EQP OP_Explain row.
-       [ ] `sqlite3WhereAddExplainText`, `sqlite3WindowCodeInit`,
-            `sqlite3WindowCodeStep`.
+       [X] `sqlite3WhereAddExplainText` — ported 2026-04-29
+            (wherecode.c:117..233).  Helpers `explainAppendTerm`
+            (wherecode.c:43..71) + `explainIndexRange` (wherecode.c:87..110)
+            ported alongside.  Back-patches the P4 string of an existing
+            OP_Explain opcode with "SCAN/SEARCH …" text.  TestExplainParity
+            unchanged at 1016/10 (P4 text not part of opcode-diff harness).
+       [ ] `sqlite3WindowCodeInit`, `sqlite3WindowCodeStep`.
   [ ] **6.27** port codegen.pas alter / attach / analyze / vacuum / FK /
        extension / scalar-function stubs in full from C to pascal:
        `sqlite3AlterRenameTable`, `sqlite3AlterFinishAddColumn`,

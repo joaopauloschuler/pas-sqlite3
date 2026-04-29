@@ -32359,14 +32359,179 @@ begin
   sqlite3VdbeScanStatus(v, sqlite3VdbeCurrentAddr(v) - 1, 0, 0, 0, nil);
 end;
 
+{ explainAppendTerm — wherecode.c:43..71.  Helper for explainIndexRange.
+  pStr is a StrAccum being built; emit "(c1,c2,...)<op>(?,?,...)" or
+  "c1<op>?" when nTerm=1.  Optionally prepend " AND " when bAnd<>0. }
+procedure explainAppendTerm(pStr: PSqlite3Str; pIdx: PIndex2;
+  nTerm: i32; iTerm: i32; bAnd: i32; zOp: PAnsiChar);
+var
+  i: i32;
+begin
+  Assert(nTerm >= 1);
+  if bAnd <> 0 then sqlite3_str_append(pStr, ' AND ', 5);
+  if nTerm > 1 then sqlite3_str_append(pStr, '(', 1);
+  for i := 0 to nTerm - 1 do
+  begin
+    if i <> 0 then sqlite3_str_append(pStr, ',', 1);
+    sqlite3_str_appendall(pStr, explainIndexColumnName(pIdx, iTerm + i));
+  end;
+  if nTerm > 1 then sqlite3_str_append(pStr, ')', 1);
+  sqlite3_str_append(pStr, zOp, 1);
+  if nTerm > 1 then sqlite3_str_append(pStr, '(', 1);
+  for i := 0 to nTerm - 1 do
+  begin
+    if i <> 0 then sqlite3_str_append(pStr, ',', 1);
+    sqlite3_str_append(pStr, '?', 1);
+  end;
+  if nTerm > 1 then sqlite3_str_append(pStr, ')', 1);
+end;
+
+{ explainIndexRange — wherecode.c:87..110.  Appends the "(a=? AND b>?)"
+  fragment describing the index-key prefix used by this WhereLoop. }
+procedure explainIndexRange(pStr: PSqlite3Str; pLoop: PWhereLoop);
+var
+  pIndex: PIndex2;
+  nEq, nSkip: u16;
+  i, j: i32;
+  z: PAnsiChar;
+begin
+  pIndex := pLoop^.u.btree.pIndex;
+  nEq    := pLoop^.u.btree.nEq;
+  nSkip  := pLoop^.nSkip;
+  if (nEq = 0) and ((pLoop^.wsFlags and (WHERE_BTM_LIMIT or WHERE_TOP_LIMIT)) = 0) then
+    Exit;
+  sqlite3_str_append(pStr, ' (', 2);
+  i := 0;
+  while i < nEq do
+  begin
+    z := explainIndexColumnName(pIndex, i);
+    if i <> 0 then sqlite3_str_append(pStr, ' AND ', 5);
+    if i >= nSkip then
+      sqlite3_str_appendf(pStr, '%s=?', [z])
+    else
+      sqlite3_str_appendf(pStr, 'ANY(%s)', [z]);
+    Inc(i);
+  end;
+  j := i;
+  if (pLoop^.wsFlags and WHERE_BTM_LIMIT) <> 0 then
+  begin
+    explainAppendTerm(pStr, pIndex, pLoop^.u.btree.nBtm, j, i, '>');
+    i := 1;
+  end;
+  if (pLoop^.wsFlags and WHERE_TOP_LIMIT) <> 0 then
+    explainAppendTerm(pStr, pIndex, pLoop^.u.btree.nTop, j, i, '<');
+  sqlite3_str_append(pStr, ')', 1);
+end;
+
+{ sqlite3WhereAddExplainText — wherecode.c:117..233.  Back-patches the P4
+  string of an existing OP_Explain opcode at `addr` with the rendered
+  scan-description text ("SCAN/SEARCH …"). }
 procedure sqlite3WhereAddExplainText(pParse: PParse; addr: i32;
   pTabList: PSrcList; pLevel: PWhereLevel; wctrlFlags: u16);
+var
+  pOp:     PVdbeOp;
+  pItem:   PSrcItem;
+  db:      PTsqlite3;
+  isSearch: i32;
+  pLoop:   PWhereLoop;
+  flags:   u32;
+  str:     PSqlite3Str;
+  zMsg:    PAnsiChar;
+  zRowid:  PAnsiChar;
+  cRangeOp: AnsiChar;
+  zFmt:    PAnsiChar;
+  pIdx:    PIndex2;
 begin
-  { sqlite3WhereExplainOneScan stubs out the OP_Explain emit, so addr never
-    points at a real opcode; this back-patcher has nothing to do.  Both lift
-    once the EQP corpus tests in 6.10 require real OP_Explain text. }
-  if (pParse = nil) and (addr = 0) and (pTabList = nil) and (pLevel = nil)
-     and (wctrlFlags = 0) then Exit;
+  if pParse = nil then Exit;
+  db := pParse^.db;
+  if (db <> nil) and (db^.mallocFailed <> 0) then Exit;
+  pOp := sqlite3VdbeGetOp(pParse^.pVdbe, addr);
+  pItem := @SrcListItems(pTabList)[pLevel^.iFrom];
+  pLoop := pLevel^.pWLoop;
+  flags := pLoop^.wsFlags;
+
+  if ((flags and (WHERE_BTM_LIMIT or WHERE_TOP_LIMIT)) <> 0)
+     or (((flags and WHERE_VIRTUALTABLE) = 0) and (pLoop^.u.btree.nEq > 0))
+     or ((wctrlFlags and (WHERE_ORDERBY_MIN or WHERE_ORDERBY_MAX)) <> 0) then
+    isSearch := 1
+  else
+    isSearch := 0;
+
+  str := sqlite3_str_new(db);
+  if str = nil then Exit;
+  if isSearch <> 0 then
+    sqlite3_str_appendall(str, 'SEARCH ')
+  else
+    sqlite3_str_appendall(str, 'SCAN ');
+  sqlite3_str_appendf(str, '%S', [pItem]);
+  if (pItem^.fg.fgBits3 and u8($04)) <> 0 then  { fromExists }
+    sqlite3_str_appendall(str, ' EXISTS');
+
+  if (flags and (WHERE_IPK or WHERE_VIRTUALTABLE)) = 0 then
+  begin
+    zFmt := nil;
+    pIdx := pLoop^.u.btree.pIndex;
+    Assert(pIdx <> nil);
+    if (pItem^.pSTab <> nil) and (not HasRowid(pItem^.pSTab))
+       and ((pIdx^.idxFlags and 3) = SQLITE_IDXTYPE_PRIMARYKEY) then
+    begin
+      if isSearch <> 0 then zFmt := 'PRIMARY KEY';
+    end
+    else if (flags and WHERE_PARTIALIDX) <> 0 then
+      zFmt := 'AUTOMATIC PARTIAL COVERING INDEX'
+    else if (flags and WHERE_AUTO_INDEX) <> 0 then
+      zFmt := 'AUTOMATIC COVERING INDEX'
+    else if (flags and (WHERE_IDX_ONLY or WHERE_EXPRIDX)) <> 0 then
+      zFmt := 'COVERING INDEX %s'
+    else
+      zFmt := 'INDEX %s';
+    if zFmt <> nil then
+    begin
+      sqlite3_str_append(str, ' USING ', 7);
+      sqlite3_str_appendf(str, zFmt, [pIdx^.zName]);
+      explainIndexRange(str, pLoop);
+    end;
+  end
+  else if ((flags and WHERE_IPK) <> 0) and ((flags and WHERE_CONSTRAINT) <> 0) then
+  begin
+    zRowid := 'rowid';
+    sqlite3_str_appendf(str, ' USING INTEGER PRIMARY KEY (%s', [zRowid]);
+    if (flags and (WHERE_COLUMN_EQ or WHERE_COLUMN_IN)) <> 0 then
+      cRangeOp := '='
+    else if (flags and WHERE_BOTH_LIMIT) = WHERE_BOTH_LIMIT then
+    begin
+      sqlite3_str_appendf(str, '>? AND %s', [zRowid]);
+      cRangeOp := '<';
+    end
+    else if (flags and WHERE_BTM_LIMIT) <> 0 then
+      cRangeOp := '>'
+    else
+    begin
+      Assert((flags and WHERE_TOP_LIMIT) <> 0);
+      cRangeOp := '<';
+    end;
+    sqlite3_str_appendf(str, '%c?)', [Integer(Ord(cRangeOp))]);
+  end
+  else if (flags and WHERE_VIRTUALTABLE) <> 0 then
+  begin
+    sqlite3_str_appendall(str, ' VIRTUAL TABLE INDEX ');
+    if (pLoop^.u.vtab.bFlags and u8($04)) <> 0 then  { bIdxNumHex }
+      sqlite3_str_appendf(str, '0x%x:%s',
+                          [pLoop^.u.vtab.idxNum, pLoop^.u.vtab.idxStr])
+    else
+      sqlite3_str_appendf(str, '%d:%s',
+                          [pLoop^.u.vtab.idxNum, pLoop^.u.vtab.idxStr]);
+  end;
+
+  if (pItem^.fg.jointype and JT_LEFT) <> 0 then
+    sqlite3_str_appendf(str, ' LEFT-JOIN', []);
+
+  Assert(pOp^.opcode = OP_Explain);
+  Assert((pOp^.p4type = P4_DYNAMIC) or (pOp^.p4.z = nil));
+  if pOp^.p4.z <> nil then sqlite3DbFree(db, pOp^.p4.z);
+  pOp^.p4type := P4_DYNAMIC;
+  zMsg := sqlite3_str_finish(str);
+  pOp^.p4.z := zMsg;
 end;
 
 { ---------------------------------------------------------------------------
