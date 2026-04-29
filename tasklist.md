@@ -81,8 +81,9 @@ Important: At the end of this document, please find:
       flags or corruption flagging.
       Partial 2026-04-29: aSortFlags KEYINFO_ORDER_DESC + BIGNULL
       inversion arm ported into sqlite3VdbeRecordCompare in btree.pas
-      (reads pKeyInfo offset 24 for the aSortFlags pointer).  Now active
-      whenever any caller's KeyInfo carries non-zero sort flags.
+      (reads pKeyInfo offset 24 for the aSortFlags pointer).  Active
+      end-to-end: GROUP BY ... ORDER BY DESC emits rows in DESC order
+      (DiagWindow `group order` PASS, verified 2026-04-29).
       Remaining: errCode-bearing corruption signalling + the codegen
       full-layout fields (u/n/r1/r2) that the slim layout still drops.
 
@@ -309,12 +310,11 @@ Important: At the end of this document, please find:
         + seekResult=p2.  Pre-fix, no caller had emitted OP_OpenPseudo
         so the bug was latent.  DiagWindow `group having`,
         `count by group` PASS; 15→14 divergences.
-      [ ] **h) `GROUP BY ... ORDER BY <col> DESC`** — partially closed
-        2026-04-29 by (g).  Rows now emitted in correct group order,
-        but DESC sort direction not honoured (output is ASC regardless).
-        Root cause: btree.pas `sqlite3VdbeRecordCompare` slim layout
-        ignores `aSortFlags` — folds into the open 6.9-complete (c)
-        TUnpackedRecord layout reconcile.
+      [X] **h) `GROUP BY ... ORDER BY <col> DESC`** — closed 2026-04-29
+        by the aSortFlags inversion arm in btree.pas
+        sqlite3VdbeRecordCompare (commit a6fc4b8).  Verified via
+        DiagWindow `group order` PASS and DiagGroupOrder fresh probe
+        (B|12, A|3 in DESC order).
 
   [X] **6.10 step 20** Host-parameter binding (`?`/`?N`/`:name`/
       `@name`/`$name`)
