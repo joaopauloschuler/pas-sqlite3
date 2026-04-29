@@ -419,6 +419,18 @@ function sqlite3_enable_shared_cache(enable: i32): i32; cdecl;
 procedure sqlite3_activate_cerod(zPassPhrase: PAnsiChar); cdecl;
 function sqlite3_setlk_timeout(db: PTsqlite3; ms: i32; flags: i32): i32; cdecl;
 
+{ Phase 8.7.1 — WAL public-API entry points.  See main.c:2470..2620. }
+type
+  TWalHookFn = function(p: Pointer; db: PTsqlite3;
+    zDb: PAnsiChar; nFrame: i32): i32; cdecl;
+
+function sqlite3_wal_hook(db: PTsqlite3; xCallback: TWalHookFn;
+  pArg: Pointer): Pointer; cdecl;
+function sqlite3_wal_autocheckpoint(db: PTsqlite3; nFrame: i32): i32; cdecl;
+function sqlite3_wal_checkpoint_v2(db: PTsqlite3; zDb: PAnsiChar;
+  eMode: i32; pnLog, pnCkpt: PInt32): i32; cdecl;
+function sqlite3_wal_checkpoint(db: PTsqlite3; zDb: PAnsiChar): i32; cdecl;
+
 implementation
 
 uses
@@ -3383,6 +3395,136 @@ begin
   if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
   if ms < -1 then begin Result := SQLITE_RANGE; Exit; end;
   Result := SQLITE_OK;
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 8.7.1 — WAL public-API entry points.
+
+  The Pascal port has no `SQLITE_OMIT_WAL`-equivalent compile flag.  The
+  underlying WAL machinery (`sqlite3WalCheckpoint`, `sqlite3PagerCheckpoint`,
+  `sqlite3BtreeCheckpoint`) is fully ported, so these wrappers do real
+  work when the connection has a WAL open and degrade to no-op when it
+  does not.
+  ---------------------------------------------------------------------- }
+
+const
+  SQLITE_MAX_DB_INTERNAL     = SQLITE_MAX_ATTACHED + 2;
+  SQLITE_CHECKPOINT_PASSIVE  = 0;
+  SQLITE_CHECKPOINT_TRUNCATE = 3;
+  SQLITE_CHECKPOINT_NOOP     = -1;
+
+{ main.c:2644 — sqlite3Checkpoint (internal).  Walks db^.aDb[] running a
+  checkpoint on each open Btree.  iDb = SQLITE_MAX_DB processes all. }
+function sqlite3Checkpoint(db: PTsqlite3; iDb, eMode: i32;
+  pnLog, pnCkpt: PInt32): i32;
+var
+  rc:    i32;
+  i:     i32;
+  bBusy: i32;
+begin
+  rc    := SQLITE_OK;
+  bBusy := 0;
+  i     := 0;
+  while (i < db^.nDb) and (rc = SQLITE_OK) do begin
+    if (i = iDb) or (iDb = SQLITE_MAX_DB_INTERNAL) then begin
+      rc := sqlite3BtreeCheckpoint(db^.aDb[i].pBt, eMode,
+                                   Pointer(pnLog), Pointer(pnCkpt));
+      pnLog  := nil;
+      pnCkpt := nil;
+      if rc = SQLITE_BUSY then begin
+        bBusy := 1;
+        rc    := SQLITE_OK;
+      end;
+    end;
+    Inc(i);
+  end;
+  if (rc = SQLITE_OK) and (bBusy <> 0) then
+    Result := SQLITE_BUSY
+  else
+    Result := rc;
+end;
+
+{ main.c:2470 — sqlite3WalDefaultHook.  Default callback installed by
+  sqlite3_wal_autocheckpoint; fires sqlite3_wal_checkpoint(db, zDb)
+  whenever the WAL has grown past pClientData frames. }
+function sqlite3WalDefaultHook(pClientData: Pointer; db: PTsqlite3;
+  zDb: PAnsiChar; nFrame: i32): i32; cdecl;
+begin
+  if nFrame >= i32(PtrUInt(pClientData)) then
+    sqlite3_wal_checkpoint(db, zDb);
+  Result := SQLITE_OK;
+end;
+
+{ main.c:2517 — sqlite3_wal_hook.  Replace the per-connection WAL hook;
+  return the previous pArg. }
+function sqlite3_wal_hook(db: PTsqlite3; xCallback: TWalHookFn;
+  pArg: Pointer): Pointer; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := nil; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  Result          := db^.pWalArg;
+  db^.xWalCallback := Pointer(xCallback);
+  db^.pWalArg     := pArg;
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+{ main.c:2496 — sqlite3_wal_autocheckpoint.  Wires the default hook on
+  positive nFrame, clears it otherwise. }
+function sqlite3_wal_autocheckpoint(db: PTsqlite3; nFrame: i32): i32; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  if nFrame > 0 then
+    sqlite3_wal_hook(db, @sqlite3WalDefaultHook, Pointer(PtrUInt(nFrame)))
+  else
+    sqlite3_wal_hook(db, nil, nil);
+  Result := SQLITE_OK;
+end;
+
+{ main.c:2547 — sqlite3_wal_checkpoint_v2. }
+function sqlite3_wal_checkpoint_v2(db: PTsqlite3; zDb: PAnsiChar;
+  eMode: i32; pnLog, pnCkpt: PInt32): i32; cdecl;
+var
+  rc:  i32;
+  iDb: i32;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  if pnLog  <> nil then pnLog^  := -1;
+  if pnCkpt <> nil then pnCkpt^ := -1;
+  if (eMode < SQLITE_CHECKPOINT_NOOP) or (eMode > SQLITE_CHECKPOINT_TRUNCATE) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  if (zDb <> nil) and (zDb[0] <> #0) then
+    iDb := sqlite3FindDbName(db, zDb)
+  else
+    iDb := SQLITE_MAX_DB_INTERNAL;
+  if iDb < 0 then begin
+    rc := SQLITE_ERROR;
+    sqlite3ErrorWithMsg(db, SQLITE_ERROR,
+      PAnsiChar(sqlite3MPrintf(db, 'unknown database: %s', [zDb])));
+  end else begin
+    db^.busyHandler.nBusy := 0;
+    rc := sqlite3Checkpoint(db, iDb, eMode, pnLog, pnCkpt);
+    sqlite3Error(db, rc);
+  end;
+  rc := sqlite3ApiExit(db, rc);
+  if db^.nVdbeActive = 0 then
+    db^.u1.isInterrupted := 0;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+{ main.c:2617 — sqlite3_wal_checkpoint.  PASSIVE-mode wrapper. }
+function sqlite3_wal_checkpoint(db: PTsqlite3; zDb: PAnsiChar): i32; cdecl;
+begin
+  Result := sqlite3_wal_checkpoint_v2(db, zDb, SQLITE_CHECKPOINT_PASSIVE,
+                                      nil, nil);
 end;
 
 initialization

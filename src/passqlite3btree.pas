@@ -472,6 +472,8 @@ function  sqlite3BtreeIntegerKey(pCur: PBtCursor): i64;
 function  sqlite3BtreePayloadSize(pCur: PBtCursor): u32;
 function  sqlite3BtreeOffset(pCur: PBtCursor): i64;
 function  sqlite3BtreeIsReadonly(p: PBtree): i32;
+function  sqlite3BtreeCheckpoint(p: PBtree; eMode: i32;
+                                 pnLog, pnCkpt: PcInt): i32;
 
 { ===========================================================================
   Phase 4.2 — payload access
@@ -2283,6 +2285,28 @@ begin
     Result := 1
   else
     Result := 0;
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3BtreeCheckpoint — btree.c:11320
+  Run a WAL checkpoint on the database that p is connected to.  No-op when
+  p is nil or no WAL is open.  SQLITE_LOCKED if a transaction is in flight.
+  --------------------------------------------------------------------------- }
+function sqlite3BtreeCheckpoint(p: PBtree; eMode: i32;
+                                pnLog, pnCkpt: PcInt): i32;
+var
+  pBt: PBtShared;
+begin
+  Result := SQLITE_OK;
+  if p = nil then Exit;
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  if pBt^.inTransaction <> TRANS_NONE then
+    Result := SQLITE_LOCKED
+  else
+    Result := sqlite3PagerCheckpoint(pBt^.pPager, p^.db, eMode,
+                                     nil, nil, pnLog, pnCkpt);
+  sqlite3BtreeLeave(p);
 end;
 
 { ---------------------------------------------------------------------------

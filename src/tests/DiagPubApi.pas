@@ -44,6 +44,12 @@ begin
   Inc(destrFires);
 end;
 
+function WalHookCb(p: Pointer; db: PTsqlite3;
+  zDb: PAnsiChar; nFrame: i32): i32; cdecl;
+begin
+  Result := 0;
+end;
+
 procedure Open16Test; forward;
 procedure Utf16WrappersTest; forward;
 
@@ -180,6 +186,7 @@ var
   highwater: i64;
   zType, zColl: PAnsiChar;
   nn, pk, ai, mrc: i32;
+  pPrev: Pointer;
 begin
   Check('libversion_number = 3053000',
         sqlite3_libversion_number = 3053000);
@@ -686,6 +693,41 @@ begin
           sqlite3_file_control(db, 'nosuch', SQLITE_FCNTL_FILE_POINTER, @pA) = SQLITE_ERROR);
     Check('file_control nil-db -> MISUSE',
           sqlite3_file_control(nil, nil, SQLITE_FCNTL_FILE_POINTER, @pA) = SQLITE_MISUSE);
+  end;
+
+  { Phase 8.7.1 — WAL public-API entry points (no WAL open on :memory:,
+    so checkpoint is a no-op but the API surface must validate inputs). }
+  begin
+    Check('wal_autocheckpoint(1000) OK',
+          sqlite3_wal_autocheckpoint(db, 1000) = SQLITE_OK);
+    Check('wal_autocheckpoint installed xWalCallback',
+          db^.xWalCallback <> nil);
+    Check('wal_autocheckpoint pWalArg=1000',
+          PtrUInt(db^.pWalArg) = 1000);
+    Check('wal_autocheckpoint(0) clears',
+          sqlite3_wal_autocheckpoint(db, 0) = SQLITE_OK);
+    Check('wal_autocheckpoint xWalCallback=nil',
+          db^.xWalCallback = nil);
+    pPrev := sqlite3_wal_hook(db, @WalHookCb, Pointer(PtrUInt($AB)));
+    Check('wal_hook prev=nil first time', pPrev = nil);
+    Check('wal_hook installed', db^.xWalCallback <> nil);
+    pPrev := sqlite3_wal_hook(db, nil, nil);
+    Check('wal_hook prev=$AB', PtrUInt(pPrev) = $AB);
+    Check('wal_hook cleared', db^.xWalCallback = nil);
+    Check('wal_autocheckpoint(nil db) MISUSE',
+          sqlite3_wal_autocheckpoint(nil, 100) = SQLITE_MISUSE);
+    rcs := sqlite3_wal_checkpoint(db, nil);
+    { :memory: has no WAL so the call is a no-op modulo any open read txn
+      from prior schema lookups -> SQLITE_OK or SQLITE_LOCKED both acceptable. }
+    Check('wal_checkpoint(nil zDb) OK or LOCKED',
+          (rcs = SQLITE_OK) or (rcs = SQLITE_LOCKED));
+    Check('wal_checkpoint_v2(bad eMode) MISUSE',
+          sqlite3_wal_checkpoint_v2(db, nil, 99, nil, nil) = SQLITE_MISUSE);
+    Check('wal_checkpoint(nosuch db) ERROR',
+          sqlite3_wal_checkpoint(db, 'no_such_db') = SQLITE_ERROR);
+    Check('wal_checkpoint_v2(nil db) MISUSE',
+          sqlite3_wal_checkpoint_v2(nil, nil, SQLITE_CHECKPOINT_PASSIVE,
+                                    nil, nil) = SQLITE_MISUSE);
   end;
 
   rc := sqlite3_close(db);

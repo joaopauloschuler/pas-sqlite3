@@ -987,8 +987,22 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 - [ ] **8.7.1** Snapshot / WAL APIs:
        [ ] `sqlite3_snapshot_get` / `_open` / `_free` / `_cmp` /
             `_recover`.
-       [ ] `sqlite3_wal_autocheckpoint`.
-       [ ] `sqlite3_wal_checkpoint` / `_v2`.
+       [X] `sqlite3_wal_autocheckpoint` / `sqlite3_wal_hook` /
+            `sqlite3_wal_checkpoint` / `_v2` — ported 2026-04-29
+            (passqlite3main.pas) — verbatim port of main.c:2470..2620 plus
+            sqlite3Checkpoint (main.c:2644).  Added sqlite3BtreeCheckpoint
+            (btree.c:11320) in passqlite3btree.pas; delegates to
+            sqlite3PagerCheckpoint with the existing nil-pBt and
+            inTransaction guards.  Default hook (sqlite3WalDefaultHook)
+            invokes sqlite3_wal_checkpoint when the WAL has grown past
+            the configured frame threshold.  DiagPubApi extended with 14
+            cases (set/clear/replace hook, autocheckpoint MISUSE on
+            nil-db, checkpoint with bad eMode -> MISUSE, unknown schema
+            -> ERROR, nil-zDb -> OK or LOCKED depending on residual
+            read-txn from earlier prepares); 231/0.  TestExplainParity
+            1016/10, TestWalCompat ALL PASS, TestVdbeApi 57/0,
+            TestSelectBasic 49/0, TestWhereBasic 52/0, TestBtreeCompat
+            337/0, TestDMLBasic 54/0, TestVdbeAgg 11/0 — no regressions.
 
 - [ ] **8.7.2** Backup / serialization (currently `sqlite3_backup_init`
        / `_step` / `_finish` exist; the remaining surface is missing):
