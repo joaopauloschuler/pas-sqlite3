@@ -534,6 +534,16 @@ function  sqlite3_preupdate_count(db: PTsqlite3): i32; cdecl;
 function  sqlite3_preupdate_depth(db: PTsqlite3): i32; cdecl;
 function  sqlite3_preupdate_blobwrite(db: PTsqlite3): i32; cdecl;
 
+{ main.c:3957..3973 — common error-reporting helpers.
+  sqlite3ReportError formats "<zType> at line <lineno> of [<sourceid>]"
+  via sqlite3_log and returns iErr unchanged so call sites can
+  `return sqlite3CorruptError(__LINE__);`.  Used widely from btree.c /
+  pager.c when a low-level error is first detected. }
+function sqlite3ReportError(iErr, lineno: i32; zType: PAnsiChar): i32;
+function sqlite3CorruptError(lineno: i32): i32;
+function sqlite3MisuseError(lineno: i32): i32;
+function sqlite3CantopenError(lineno: i32): i32;
+
 implementation
 
 uses
@@ -2714,6 +2724,52 @@ function sqlite3_threadsafe: i32; cdecl;
 begin
   { passqlite3util:848 sets bFullMutex=1 → SQLITE_THREADSAFE==1. }
   Result := 1;
+end;
+
+{ main.c:3957 — Generate an error log entry through sqlite3_log() and
+  return iErr unchanged so callers may write
+  `return sqlite3CorruptError(__LINE__);`.  zType is a short literal
+  ("database corruption", "misuse", "cannot open file") describing the
+  category; the message is "<zType> at line <lineno> of [<sourceid>]"
+  where sourceid is sqlite3_sourceid()+20 (skip the date prefix). }
+type
+  TSqlite3LogCb = procedure(pArg: Pointer; iErrCode: i32; zMsg: PAnsiChar); cdecl;
+
+function sqlite3ReportError(iErr, lineno: i32; zType: PAnsiChar): i32;
+var
+  zSrc: PAnsiChar;
+  zMsg: PAnsiChar;
+  xLog: TSqlite3LogCb;
+begin
+  if sqlite3GlobalConfig.xLog <> nil then begin
+    zSrc := sqlite3_sourceid;
+    if zSrc <> nil then Inc(zSrc, 20);
+    zMsg := sqlite3MPrintf(nil, '%s at line %d of [%.10s]',
+      [zType, lineno, zSrc]);
+    if zMsg <> nil then begin
+      xLog := TSqlite3LogCb(sqlite3GlobalConfig.xLog);
+      xLog(sqlite3GlobalConfig.pLogArg, iErr, zMsg);
+      sqlite3_free(zMsg);
+    end;
+  end;
+  Result := iErr;
+end;
+
+{ main.c:3962 / 3967 / 3973 — three thin wrappers around sqlite3ReportError
+  with the SQLite error code and category-name baked in. }
+function sqlite3CorruptError(lineno: i32): i32;
+begin
+  Result := sqlite3ReportError(SQLITE_CORRUPT, lineno, 'database corruption');
+end;
+
+function sqlite3MisuseError(lineno: i32): i32;
+begin
+  Result := sqlite3ReportError(SQLITE_MISUSE, lineno, 'misuse');
+end;
+
+function sqlite3CantopenError(lineno: i32): i32;
+begin
+  Result := sqlite3ReportError(SQLITE_CANTOPEN, lineno, 'cannot open file');
 end;
 
 { ctime.c:55..808 — names of compile-time options used to build the

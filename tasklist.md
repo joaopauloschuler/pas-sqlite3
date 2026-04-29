@@ -456,6 +456,16 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        returned `sqlite3_file*` matches `sqlite3PagerFile` of the
        backing pager.
 
+- [X] **8.x** `sqlite3ReportError` / `sqlite3CorruptError` /
+       `sqlite3MisuseError` / `sqlite3CantopenError` (main.c:3957..3973) —
+       ported 2026-04-29 in passqlite3main.pas.  Faithful translation of
+       the four error-reporting helpers used widely from btree.c / pager.c
+       when a low-level error is first detected: format
+       "<zType> at line <lineno> of [<sourceid>]" via sqlite3MPrintf and
+       dispatch to the configured xLog callback (sqlite3GlobalConfig.xLog),
+       returning iErr unchanged so callers can write
+       `return sqlite3CorruptError(__LINE__);`.
+
 - [X] **8.x** `sqlite3_errmsg16` (main.c:2775) — ported 2026-04-29 in
        passqlite3main.pas alongside the existing `sqlite3_errmsg`.
        Faithful UTF-16 sibling: returns the static UTF-16 "out of
