@@ -75,6 +75,12 @@ function csq_libversion_number: Int32;
 function csq_sourceid: PChar;
     cdecl; external LIBSQLITE3 name 'sqlite3_sourceid';
 
+function csq_compileoption_used(zOptName: PChar): Int32;
+    cdecl; external LIBSQLITE3 name 'sqlite3_compileoption_used';
+
+function csq_compileoption_get(N: Int32): PChar;
+    cdecl; external LIBSQLITE3 name 'sqlite3_compileoption_get';
+
 // ---------------------------------------------------------------------------
 // Initialisation / shutdown
 // ---------------------------------------------------------------------------

@@ -924,8 +924,16 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [X] `sqlite3_uri_int64` — ported 2026-04-28 (passqlite3util.pas)
             via sqlite3_uri_parameter + sqlite3DecOrHexToI64; mirrors
             main.c:4907 exactly.
-       [ ] `sqlite3_compileoption_used` (ctime.c) — also gated on the
-            6.10 step 12 task that touches the compile-options table.
+       [X] `sqlite3_compileoption_used` / `sqlite3_compileoption_get` —
+            ported 2026-04-29 (passqlite3main.pas) — verbatim port of
+            main.c:5158/5191 plus the ctime.c:809 `sqlite3CompileOptions`
+            accessor.  Pas options table is empty (no
+            ENABLE_/OMIT_ flag plumbing reachable from this entry yet),
+            so `_used()` always returns 0 and `_get(N)` always returns
+            nil — matches the C build with no SQLITE_ENABLE_*/SQLITE_OMIT_
+            defines.  DiagPubApi extended with 8 cases (nil/bogus/SQLITE_
+            prefix strip / negative N / out-of-range / C-side parity);
+            now 203/0.  TestExplainParity 1016/10 — no regression.
        [ ] `sqlite3_test_control` — testing back-door (subset).
        [X] `sqlite3_file_control` — ported 2026-04-29 (passqlite3main.pas) —
             verbatim port of main.c:4153.  Dispatches FILE_POINTER /

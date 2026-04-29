@@ -102,6 +102,28 @@ begin
   Check('sourceid non-nil',
         sqlite3_sourceid <> nil);
   Check('threadsafe = 1', sqlite3_threadsafe = 1);
+  { Compile-option enquiry — Pas table is empty so used()=0 and get()=nil
+    for any input.  Verifies the API surface exists and the C-side parity
+    on out-of-range / nil cases. }
+  Check('compileoption_used(nil) = 0',
+        sqlite3_compileoption_used(nil) = 0);
+  Check('compileoption_used("BOGUS_FLAG_XYZ") = 0',
+        sqlite3_compileoption_used('BOGUS_FLAG_XYZ') = 0);
+  Check('compileoption_used("SQLITE_BOGUS_FLAG_XYZ") = 0',
+        sqlite3_compileoption_used('SQLITE_BOGUS_FLAG_XYZ') = 0);
+  Check('compileoption_get(-1) = nil',
+        sqlite3_compileoption_get(-1) = nil);
+  Check('compileoption_get(0) = nil (table empty)',
+        sqlite3_compileoption_get(0) = nil);
+  Check('compileoption_get(99999) = nil',
+        sqlite3_compileoption_get(99999) = nil);
+  { C-side spot check: out-of-range probes return nil.  Listing varies
+    per build (e.g. THREADSAFE=1, ENABLE_FTS5, etc.) so we don't pin
+    a specific entry here. }
+  Check('csq_compileoption_get(-1) = nil',
+        csq_compileoption_get(-1) = nil);
+  Check('csq_compileoption_used(nil) = 0',
+        csq_compileoption_used(nil) = 0);
   Check('sleep(1) returns >= 0', sqlite3_sleep(1) >= 0);
   Check('release_memory(0) = 0', sqlite3_release_memory(0) = 0);
   highwater := sqlite3_memory_highwater(0);

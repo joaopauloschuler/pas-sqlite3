@@ -329,6 +329,14 @@ function sqlite3_libversion_number: i32; cdecl;
 function sqlite3_sourceid: PAnsiChar; cdecl;
 function sqlite3_threadsafe: i32; cdecl;
 
+{ ctime.c-equivalent compile-time option enquiry.  The Pas port keeps the
+  options table empty (matches a build with no extra ENABLE_/OMIT_ macros
+  beyond the upstream defaults the port mirrors); the API surface is
+  exposed regardless so client code that probes feature gates compiles. }
+function sqlite3CompileOptions(out pnOpt: i32): PPAnsiChar;
+function sqlite3_compileoption_used(zOptName: PAnsiChar): i32; cdecl;
+function sqlite3_compileoption_get(N: i32): PAnsiChar; cdecl;
+
 function sqlite3_last_insert_rowid(db: PTsqlite3): i64; cdecl;
 procedure sqlite3_set_last_insert_rowid(db: PTsqlite3; iRowid: i64); cdecl;
 function sqlite3_changes(db: PTsqlite3): i32; cdecl;
@@ -2420,6 +2428,57 @@ function sqlite3_threadsafe: i32; cdecl;
 begin
   { passqlite3util:848 sets bFullMutex=1 → SQLITE_THREADSAFE==1. }
   Result := 1;
+end;
+
+{ ctime.c:55..808 — names of compile-time options used to build the
+  library.  The Pas port currently has no ENABLE_/OMIT_ flag plumbing
+  reachable from this entry point, so the table is empty — matches the
+  C build with no SQLITE_ENABLE_*/SQLITE_OMIT_* defines.  Verbatim port
+  of ctime.c:809..812. }
+const
+  sqlite3azCompileOpt: array[0..0] of PAnsiChar = (nil);
+
+function sqlite3CompileOptions(out pnOpt: i32): PPAnsiChar;
+begin
+  pnOpt := 0;
+  Result := @sqlite3azCompileOpt[0];
+end;
+
+{ main.c:5158 — verbatim port. }
+function sqlite3_compileoption_used(zOptName: PAnsiChar): i32; cdecl;
+var
+  i, n, nOpt: i32;
+  azOpt: PPAnsiChar;
+  zCur: PAnsiChar;
+begin
+  if zOptName = nil then begin Result := 0; Exit; end;
+  azOpt := sqlite3CompileOptions(nOpt);
+  if sqlite3_strnicmp(zOptName, PAnsiChar('SQLITE_'), 7) = 0 then
+    Inc(zOptName, 7);
+  n := sqlite3Strlen30(zOptName);
+  for i := 0 to nOpt - 1 do begin
+    zCur := azOpt[i];
+    if (zCur <> nil)
+       and (sqlite3_strnicmp(zOptName, zCur, n) = 0)
+       and (sqlite3IsIdChar(u8((zCur + n)^)) = 0)
+    then begin
+      Result := 1; Exit;
+    end;
+  end;
+  Result := 0;
+end;
+
+{ main.c:5191 — verbatim port. }
+function sqlite3_compileoption_get(N: i32): PAnsiChar; cdecl;
+var
+  nOpt: i32;
+  azOpt: PPAnsiChar;
+begin
+  azOpt := sqlite3CompileOptions(nOpt);
+  if (N >= 0) and (N < nOpt) then
+    Result := azOpt[N]
+  else
+    Result := nil;
 end;
 
 function sqlite3_last_insert_rowid(db: PTsqlite3): i64; cdecl;
