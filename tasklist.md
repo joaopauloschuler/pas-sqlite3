@@ -495,7 +495,11 @@ Important: At the end of this document, please find:
   [ ] **6.12** port sqlite3Pragma in full.  Regression gate
        `src/tests/DiagPragma.pas` (run with
        `LD_LIBRARY_PATH=$PWD/src bin/DiagPragma`).  Baseline 49 DIVERGE
-       driven to 13 DIVERGE.  Existing PragTyp_FLAG arm (17 boolean
+       driven to 12 DIVERGE (cache_spill closed 2026-04-29 via
+       sqlite3PagerSetSpillsize / sqlite3BtreeSetSpillSize +
+       sqlite3BtreeSetCacheSize wrappers and PRAGMA cache_spill read
+       arm; seeds pcache szCache from schema cache_size on demand
+       since the prepare-path propagation isn't wired in the Pas port).  Existing PragTyp_FLAG arm (17 boolean
        pragmas: foreign_keys, recursive_triggers,
        reverse_unordered_selects, defer_foreign_keys, writable_schema,
        legacy_alter_table, cell_size_check, automatic_index,
@@ -512,11 +516,10 @@ Important: At the end of this document, please find:
        (BTREE_DATA_VERSION=15 read-only via OP_ReadCookie; writes
        silently no-op per the C ReadOnly flag).  SQLITE_CountRows/
        ReadUncommit HI() constants added to util.pas (HI(0x1)/HI(0x4)).
-       Remaining divergences (13): table-valued pragma_* introspection
+       Remaining divergences (12): table-valued pragma_* introspection
        functions (table_info, table_xinfo, index_list, foreign_key_list,
        database_list, collation_list, function_list, module_list,
-       pragma_list, compile_options), integrity_check / quick_check,
-       cache_spill.
+       pragma_list, compile_options), integrity_check / quick_check.
   [ ] **6.13** port sqlite3Vacuum in full
   [X] **6.14** port sqlite3WhereTabFuncArgs in full (whereexpr.c:1899..1944).
   [X] **6.15** port sqlite3WhereAddLimit + whereAddLimitExpr in full

@@ -355,6 +355,7 @@ procedure sqlite3PagerSetBusyHandler(pPager: PPager;
 function  sqlite3PagerSetPagesize(pPager: PPager; pPageSize: Pu32;
             nReserve: i32): i32;
 procedure sqlite3PagerSetCachesize(pPager: PPager; mxPage: i32);
+function  sqlite3PagerSetSpillsize(pPager: PPager; mxPage: i32): i32;
 procedure sqlite3PagerShrink(pPager: PPager);
 procedure sqlite3PagerSetFlags(pPager: PPager; pgFlags: u32);
 function  sqlite3PagerLockingMode(pPager: PPager; eMode: i32): i32;
@@ -2196,6 +2197,12 @@ end;
 procedure sqlite3PagerSetCachesize(pPager: PPager; mxPage: i32);
 begin
   sqlite3PcacheSetCachesize(pPager^.pPCache, mxPage);
+end;
+
+{ pager.c:3526 — sqlite3PagerSetSpillsize. }
+function sqlite3PagerSetSpillsize(pPager: PPager; mxPage: i32): i32;
+begin
+  Result := sqlite3PcacheSetSpillsize(pPager^.pPCache, mxPage);
 end;
 
 { pager.c:3557 — sqlite3PagerShrink. }

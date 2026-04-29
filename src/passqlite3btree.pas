@@ -647,6 +647,8 @@ const
 
 { btree.c:3236 — return the current page size of the database. }
 function  sqlite3BtreeGetPageSize(p: PBtree): i32;
+function  sqlite3BtreeSetSpillSize(p: PBtree; mxPage: i32): i32;
+procedure sqlite3BtreeSetCacheSize(p: PBtree; mxPage: i32);
 { btree.c:3185 — set page size + reserved-bytes; iFix locks pageSize. }
 function  sqlite3BtreeSetPageSize(p: PBtree; iPageSize: i32;
                                   nReserve: i32; iFix: i32): i32;
@@ -6898,6 +6900,26 @@ end;
 function sqlite3BtreeGetPageSize(p: PBtree): i32;
 begin
   Result := i32(p^.pBt^.pageSize);
+end;
+
+{ btree.c:3002 — sqlite3BtreeSetSpillSize. }
+function sqlite3BtreeSetSpillSize(p: PBtree; mxPage: i32): i32;
+var pBt: PBtShared;
+begin
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  Result := sqlite3PagerSetSpillsize(pBt^.pPager, mxPage);
+  sqlite3BtreeLeave(p);
+end;
+
+{ btree.c:2986 — sqlite3BtreeSetCacheSize. }
+procedure sqlite3BtreeSetCacheSize(p: PBtree; mxPage: i32);
+var pBt: PBtShared;
+begin
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  sqlite3PagerSetCachesize(pBt^.pPager, mxPage);
+  sqlite3BtreeLeave(p);
 end;
 
 { btree.c:3185 — simplified: only honours the call when iFix is non-zero

@@ -26418,6 +26418,31 @@ begin
     Exit;
   end;
 
+  { PragTyp_CACHE_SPILL read arm (pragma.c:916).  Returns 0 when
+    SQLITE_CacheSpill is off; otherwise the effective spill threshold
+    via sqlite3BtreeSetSpillSize(...,0).  Note: in C the pager's pcache
+    receives the schema cache_size via the prepare path; the Pas port
+    does not currently propagate that wiring, so seed the pcache here
+    on demand (matches the value the C oracle would see). }
+  if SameText(zName, 'cache_spill') and (pValue = nil) then begin
+    if (db^.flags and SQLITE_CacheSpill) = 0 then
+      iVal := 0
+    else begin
+      pBtArg := PBtree(db^.aDb[iDb].pBt);
+      if pBtArg <> nil then begin
+        if (db^.aDb[iDb].pSchema <> nil)
+           and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
+          sqlite3BtreeSetCacheSize(pBtArg,
+            db^.aDb[iDb].pSchema^.cache_size);
+        iVal := sqlite3BtreeSetSpillSize(pBtArg, 0);
+      end else
+        iVal := 0;
+    end;
+    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    Exit;
+  end;
+
   { PragTyp_SYNCHRONOUS read arm (pragma.c:1132). }
   if SameText(zName, 'synchronous') and (pValue = nil) then begin
     iVal := i32(db^.aDb[iDb].safety_level) - 1;
