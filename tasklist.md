@@ -35,25 +35,22 @@ Important: At the end of this document, please find:
 
        VDBE auxiliary (vdbeaux.c):
        [X] `sqlite3VdbeExplainPop` — closed
-       [ ] `sqlite3VdbeEnter` / `sqlite3VdbeLeave` — empty bodies.
-            In C these are gated on
-            `!defined(SQLITE_OMIT_SHARED_CACHE) && SQLITE_THREADSAFE>0`
-            and early-out via `DbMaskAllZero(p->lockMask)` in the common
-            single-cache case.  Pas port has no shared-cache, so empty
-            bodies match the OMIT_SHARED_CACHE compile path; full bodies
-            land with the shared-cache port.
+       [X] `sqlite3VdbeEnter` / `sqlite3VdbeLeave` — closed 2026-04-29.
+            Empty bodies match the OMIT_SHARED_CACHE macro expansions
+            (vdbeInt.h:714/720); Pas has no shared-cache so this is the
+            faithful port for the build configuration.
 
        Pragma (pragma.c):
        [ ] `sqlite3PragmaVtabRegister` — returns `nil`; registers
             `pragma_*` eponymous virtual tables via
             `sqlite3VtabCreateModule` + `pragmaVtabModule`.
 
-       Btree mutex (btmutex.c / btree.c) — both gated on `#ifndef NDEBUG`
-       and called only inside `assert()`.  Default Pas build is NDEBUG-
-       equivalent, so the stubs are never invoked.  Land with the shared-
-       cache / debug-assert port:
-       [ ] `sqlite3BtreeHoldsAllMutexes` — assert-only helper.
-       [ ] `sqlite3BtreeSchemaLocked` — assert-only helper.
+       Btree mutex (btmutex.c / btree.c):
+       [X] `sqlite3BtreeHoldsAllMutexes` — closed 2026-04-29.  Returns
+            constant 1 (matches btree.h:420 macro for OMIT_SHARED_CACHE).
+       [X] `sqlite3BtreeSchemaLocked` — closed 2026-04-29.  Returns
+            SQLITE_OK (querySharedCacheTableLock is no-op without
+            shared cache).
 
 - [ ] **6.9-bis 11g.2.b** Port `sqlite3WhereBegin` / `sqlite3WhereEnd` in full.  
     Bookkeeping primitives, prologue,

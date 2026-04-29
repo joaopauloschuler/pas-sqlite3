@@ -3083,9 +3083,13 @@ begin
   p^.btreeMask := p^.btreeMask or (yDbMask(1) shl i);
 end;
 
+{ sqlite3VdbeEnter / sqlite3VdbeLeave — OMIT_SHARED_CACHE no-ops.
+  C reference: vdbeaux.c:2066/2101 are bodied only when
+  !defined(SQLITE_OMIT_SHARED_CACHE) && SQLITE_THREADSAFE>0; otherwise
+  vdbeInt.h:714/720 expand them to empty macros.  The Pas port has no
+  shared-cache, so the empty body is the faithful port. }
 procedure sqlite3VdbeEnter(p: PVdbe);
 begin
-  { mutex acquisition — stub for Phase 5.2; full in Phase 8 }
 end;
 
 procedure sqlite3VdbeLeave(p: PVdbe);

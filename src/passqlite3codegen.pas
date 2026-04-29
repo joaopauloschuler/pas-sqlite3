@@ -26366,14 +26366,21 @@ begin
   end;
 end;
 
+{ sqlite3BtreeSchemaLocked — port of btree.c:11382.  In OMIT_SHARED_CACHE
+  builds querySharedCacheTableLock is a no-op returning SQLITE_OK, so the
+  function reduces to "return SQLITE_OK".  Pas has no shared-cache, so
+  this is the faithful port for the build configuration. }
 function sqlite3BtreeSchemaLocked(pBt: Pointer): i32;
 begin
-  Result := 0; { Phase 7 }
+  Result := 0; { SQLITE_OK }
 end;
 
+{ sqlite3BtreeHoldsAllMutexes — assert-only helper.  In OMIT_SHARED_CACHE
+  builds btree.h:420 expands it to the constant 1.  Pas has no
+  shared-cache, so the constant-1 body is the faithful port. }
 function sqlite3BtreeHoldsAllMutexes(db: PTsqlite3): i32;
 begin
-  Result := 1; { stub: assume always true }
+  Result := 1;
 end;
 
 procedure sqlite3OomFaultGeneric(db: PTsqlite3);
