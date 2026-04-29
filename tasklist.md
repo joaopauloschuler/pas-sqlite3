@@ -447,15 +447,16 @@ Important: At the end of this document, please find:
        `sqlite3AlterAddConstraint`, `sqlite3Detach`, `sqlite3Attach`,
        `sqlite3Analyze`, `sqlite3Vacuum`,
        `sqlite3FkCheck`, `sqlite3FkActions`.
-  [ ] **6.27a** port `sqlite3AddCollateType` (codegen.pas:23244) in full
-       from build.c:1751.  Currently a no-op stub, so
-       `COLUMN ... COLLATE <name>` never writes the collation name into
-       pCol^.zCnName / sets COLFLAG_HASCOLL.  Surfaced 2026-04-28 by the
-       new sqlite3_table_column_metadata path (DiagPubApi `metadata b`)
-       — declared NOCASE columns report "BINARY" instead.  Body should
-       mirror sqlite3ColumnSetColl: append name + NUL to zCnName tail,
-       OR flag with COLFLAG_HASCOLL.  Likely also affects per-column
-       collation pickup in WHERE/ORDER index lookups.
+  [X] **6.27a** `sqlite3AddCollateType` ported 2026-04-28 from
+       build.c:1938 (passqlite3codegen.pas).  Calls sqlite3LocateCollSeq
+       to validate the name, then sqlite3ColumnSetColl to pack the
+       collation into pCol^.zCnName + set COLFLAG_HASCOLL; also rewrites
+       azColl[0] of any single-key Index already attached to this column
+       (PRIMARY KEY COLLATE ordering arm).  IN_RENAME_OBJECT short-circuit
+       preserved.  DiagPubApi `metadata b coll=NOCASE` now PASS (was
+       BINARY); TestExplainParity 1016/10, TestVdbeAgg 11/0,
+       TestSelectBasic 49/0, TestWhereBasic 52/0, TestBtreeCompat 337/0,
+       TestVdbeRecord 13/0, TestParser 45/0 — no regressions.
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
        marked as "stub" that was missed by 6.16..6.27 (catch-all).

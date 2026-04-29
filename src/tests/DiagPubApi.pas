@@ -365,12 +365,8 @@ begin
       Check('metadata b OK', mrc = SQLITE_OK);
       Check('metadata b type=TEXT',
             (zType <> nil) and (StrComp(zType, 'TEXT') = 0));
-      { sqlite3AddCollateType is still a stub (codegen.pas:23244), so
-        COLFLAG_HASCOLL is never set on b and sqlite3ColumnColl returns
-        nil; sqlite3_table_column_metadata then falls back to "BINARY".
-        Once AddCollateType is ported this will read "NOCASE". }
-      Check('metadata b coll=BINARY (NOCASE pending AddCollateType port)',
-            (zColl <> nil) and (StrComp(zColl, 'BINARY') = 0));
+      Check('metadata b coll=NOCASE',
+            (zColl <> nil) and (StrComp(zColl, 'NOCASE') = 0));
       Check('metadata b notnull=1', nn = 1);
       Check('metadata b primarykey=0', pk = 0);
       Check('metadata b autoinc=0',    ai = 0);

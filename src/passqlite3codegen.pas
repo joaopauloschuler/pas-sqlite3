@@ -23241,9 +23241,53 @@ begin
   sqlite3ExprDelete(pParse^.db, pCheckExpr);
 end;
 
+{ sqlite3AddCollateType — port of build.c:1938.  Set the collation
+  function of the most recently parsed table column to the named CollSeq.
+  Mirrors sqlite3ColumnSetColl: appends name + NUL to zCnName tail and
+  ORs COLFLAG_HASCOLL.  Also rewrites azColl[0] of any single-key index
+  already attached to this column (PRIMARY KEY COLLATE ordering). }
 procedure sqlite3AddCollateType(pParse: PParse; pToken: PToken);
+var
+  p:     PTable2;
+  i:     i32;
+  zColl: PAnsiChar;
+  db:    PTsqlite3;
+  pIdx:  PIndex2;
+  pCol:  PColumn;
+  aiCol: Pi16;
+  azColl: PPAnsiChar;
 begin
-  { Phase 7 }
+  p := pParse^.pNewTable;
+  if (p = nil) or InRenameObject(pParse) then Exit;
+  i := p^.nCol - 1;
+  db := pParse^.db;
+  if pToken <> nil then begin
+    zColl := sqlite3DbStrNDup(db, pToken^.z, u64(pToken^.n));
+    sqlite3Dequote(zColl);
+  end else
+    zColl := nil;
+  if zColl = nil then Exit;
+
+  if sqlite3LocateCollSeq(pParse, zColl) <> nil then begin
+    pCol := p^.aCol; Inc(pCol, i);
+    sqlite3ColumnSetColl(db, pCol, zColl);
+
+    { If the column is declared as "<name> PRIMARY KEY COLLATE <type>",
+      then an index may have been created on this column before the
+      collation type was added.  Correct azColl[0] in that case. }
+    pIdx := p^.pIndex;
+    while pIdx <> nil do begin
+      AssertH(pIdx^.nKeyCol = 1, 'AddCollateType nKeyCol');
+      aiCol := pIdx^.aiColumn;
+      if (aiCol <> nil) and (aiCol[0] = i) then begin
+        azColl := PPAnsiChar(pIdx^.azColl);
+        if azColl <> nil then
+          azColl[0] := sqlite3ColumnColl(pCol);
+      end;
+      pIdx := pIdx^.pNext;
+    end;
+  end;
+  sqlite3DbFree(db, zColl);
 end;
 
 procedure sqlite3AddGenerated(pParse: PParse; pExpr: PExpr; pType: PToken);
