@@ -3285,6 +3285,19 @@ begin
 
   p^.vdbeFlags := p^.vdbeFlags and not (VDBF_UsesStmtJournal or VDBF_EXPIRED_MASK);
 
+  { Port of vdbeaux.c:2695..2699 — propagate Parse.explain into the Vdbe and
+    set the EXPLAIN result-column count.  EXPLAIN emits 8 columns
+    (addr, opcode, p1, p2, p3, p4, p5, comment); EXPLAIN QUERY PLAN emits 4
+    (id, parent, notused, detail).  The makeReady-ready aMem array must
+    have nMem>=10 so cell [9] is available as the SubProgram array slot
+    used by sqlite3VdbeNextOpcode when listing trigger subprograms. }
+  if PByte(PByte(pParse) + 299)^ <> 0 then begin
+    if nMem < 10 then nMem := 10;
+    p^.vdbeFlags := (p^.vdbeFlags and not u32(VDBF_EXPLAIN_MASK))
+                    or (u32(PByte(PByte(pParse) + 299)^) shl VDBF_EXPLAIN_SHIFT);
+    p^.nResColumn := u16(12 - 4 * i32(PByte(PByte(pParse) + 299)^));
+  end;
+
   { Reserve nCursor extra Mem cells at the top of aMem[] for VdbeCursor
     storage — allocateCursor() places cursor i at aMem[nMem-i] for i>0,
     so without this bump the cursor slot collides with a regular register
@@ -3567,11 +3580,110 @@ begin
   Result := vdbeFkError(p);
 end;
 
-{ --- VdbeList — EXPLAIN output (stub; Phase 5.8 vdbetrace.c) --- }
+{ --- VdbeList — EXPLAIN output (vdbeaux.c:2406).
+  Drives one row of EXPLAIN / EXPLAIN QUERY PLAN output per call.  Returns
+  SQLITE_ROW with p^.pResultRow filled in, SQLITE_DONE when the listing is
+  exhausted, SQLITE_ERROR on interrupt / OOM. }
 
 function sqlite3VdbeList(v: PVdbe): i32;
+var
+  pSub:          PMem;
+  db:            PTsqlite3;
+  i:             i32;
+  rc:            i32;
+  pMm:           PMem;
+  bListSubprogs: Boolean;
+  aOp:           PVdbeOp;
+  pOp:           PVdbeOp;
+  zP4:           PAnsiChar;
+  explainBits:   u32;
+  k:             i32;
+  pClk:          PMem;
 begin
-  Result := SQLITE_DONE;
+  pSub := nil;
+  db   := v^.db;
+  pMm  := @v^.aMem[1];
+  explainBits := (v^.vdbeFlags and VDBF_EXPLAIN_MASK) shr VDBF_EXPLAIN_SHIFT;
+  { SQLITE_TriggerEQP_Bit = $01000000 — inlined to avoid uses-cycle on main.pas. }
+  bListSubprogs := (explainBits = 1)
+                or ((db^.flags and u64($01000000)) <> 0);
+
+  Assert(explainBits <> 0);
+  Assert(v^.eVdbeState = VDBE_RUN_STATE);
+  Assert((v^.rc = SQLITE_OK) or (v^.rc = SQLITE_BUSY) or (v^.rc = SQLITE_NOMEM));
+
+  { Inlined releaseMemArray(pMm, 8) — see vdbeaux.c:2179.
+    The first 8 result-set Mem cells get the prior row's payload freed
+    so we can rewrite them below. }
+  for k := 0 to 7 do begin
+    pClk := PMem(PtrUInt(pMm) + PtrUInt(k) * SizeOf(TMem));
+    if (pClk^.flags and (MEM_Agg or MEM_Dyn)) <> 0 then begin
+      sqlite3VdbeMemRelease(pClk);
+      pClk^.flags := MEM_Undefined;
+    end else if pClk^.szMalloc > 0 then begin
+      sqlite3DbFree(db, pClk^.zMalloc);
+      pClk^.zMalloc := nil;
+      pClk^.szMalloc := 0;
+      pClk^.flags := MEM_Undefined;
+    end else begin
+      pClk^.flags := MEM_Undefined;
+    end;
+  end;
+
+  if v^.rc = SQLITE_NOMEM then begin
+    sqlite3OomFault(db);
+    Exit(SQLITE_ERROR);
+  end;
+
+  if bListSubprogs then begin
+    Assert(v^.nMem > 9);
+    pSub := @v^.aMem[9];
+  end;
+
+  rc := sqlite3VdbeNextOpcode(v, pSub, Ord(explainBits = 2),
+                              @v^.pc, @i, @aOp);
+
+  if rc = SQLITE_OK then begin
+    pOp := @aOp[i];
+    if db^.u1.isInterrupted <> 0 then begin
+      v^.rc := SQLITE_INTERRUPT;
+      rc := SQLITE_ERROR;
+      sqlite3VdbeError(v, sqlite3ErrStr(v^.rc));
+    end else begin
+      zP4 := sqlite3VdbeDisplayP4(db, pOp);
+      if explainBits = 2 then begin
+        sqlite3VdbeMemSetInt64(pMm, pOp^.p1);
+        sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 1*SizeOf(TMem))^, pOp^.p2);
+        sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 2*SizeOf(TMem))^, pOp^.p3);
+        sqlite3VdbeMemSetStr(@PMem(PtrUInt(pMm) + 3*SizeOf(TMem))^,
+                             zP4, -1, SQLITE_UTF8, SQLITE_DYNAMIC);
+        Assert(v^.nResColumn = 4);
+      end else begin
+        sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 0*SizeOf(TMem))^, i);
+        sqlite3VdbeMemSetStr(@PMem(PtrUInt(pMm) + 1*SizeOf(TMem))^,
+                             sqlite3OpcodeName(pOp^.opcode), -1,
+                             SQLITE_UTF8, SQLITE_STATIC);
+        sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 2*SizeOf(TMem))^, pOp^.p1);
+        sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 3*SizeOf(TMem))^, pOp^.p2);
+        sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 4*SizeOf(TMem))^, pOp^.p3);
+        sqlite3VdbeMemSetNull (@PMem(PtrUInt(pMm) + 6*SizeOf(TMem))^);
+        sqlite3VdbeMemSetNull (@PMem(PtrUInt(pMm) + 7*SizeOf(TMem))^);
+        sqlite3VdbeMemSetStr(@PMem(PtrUInt(pMm) + 5*SizeOf(TMem))^,
+                             zP4, -1, SQLITE_UTF8, SQLITE_DYNAMIC);
+        Assert(v^.nResColumn = 8);
+      end;
+      v^.pResultRow := pMm;
+      if db^.mallocFailed <> 0 then begin
+        v^.rc := SQLITE_NOMEM;
+        rc := SQLITE_ERROR;
+      end else begin
+        v^.rc := SQLITE_OK;
+        rc := SQLITE_ROW;
+      end;
+    end;
+  end;
+
+  Result := rc;
 end;
 
 procedure sqlite3VdbePrintSql(p: PVdbe);
@@ -4585,7 +4697,10 @@ begin
     pStmt^.eVdbeState := VDBE_RUN_STATE;
   end;
 
-  rc := sqlite3VdbeExec(pStmt);
+  if (pStmt^.vdbeFlags and VDBF_EXPLAIN_MASK) <> 0 then
+    rc := sqlite3VdbeList(pStmt)
+  else
+    rc := sqlite3VdbeExec(pStmt);
 
   if rc = SQLITE_ROW then begin
     if db <> nil then db^.errCode := SQLITE_ROW;

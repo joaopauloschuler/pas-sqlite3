@@ -440,7 +440,14 @@ Important: At the end of this document, please find:
        `sqlite3VdbeDisplayComment` (blocked: needs opcode-synopsis
        tables appended after each name in sqlite3OpcodeName — Pas
        OpcodeNames table is plain names only, defer),
-       `sqlite3VdbeList`, `sqlite3_blob_open`.
+       `sqlite3_blob_open`.
+       [X] `sqlite3VdbeList` — ported 2026-04-29 (vdbeaux.c:2406).
+            Wired through sqlite3_step (vdbeFlags & VDBF_EXPLAIN_MASK
+            routes to VdbeList instead of VdbeExec) and
+            sqlite3VdbeMakeReady now propagates Parse.explain into
+            the Vdbe vdbeFlags + nResColumn (8 cols for EXPLAIN, 4
+            for EXPLAIN QUERY PLAN).  New gate
+            `src/tests/DiagExplainList.pas`.
   [ ] **6.22** port codegen.pas rename / error-offset stubs in full from C
        to pascal:
        [ ] `sqlite3RenameExprUnmap`, `sqlite3RenameTokenMap` — only
