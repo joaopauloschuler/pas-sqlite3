@@ -7725,7 +7725,10 @@ begin
         pFdAgg^.xSFunc(pCtxAgg, pCtxAgg^.argc,
           PPMem(PByte(pCtxAgg) + ((SizeOf(Tsqlite3_context)+7) and not 7)));
       if pCtxAgg^.isError <> 0 then begin
-        rc := pCtxAgg^.isError;
+        if pCtxAgg^.isError > 0 then begin
+          sqlite3VdbeError(v, sqlite3_value_text(Psqlite3_value(pOut)));
+          rc := pCtxAgg^.isError;
+        end;
         pCtxAgg^.isError := 0;
         if rc <> 0 then goto abort_due_to_error;
       end;

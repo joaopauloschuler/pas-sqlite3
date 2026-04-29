@@ -27463,7 +27463,13 @@ begin
   esc := 0;
   if argc = 3 then begin
     zE := sqlite3_value_text(Psqlite3_value((argv+2)^));
-    if (zE <> nil) and (zE^ <> #0) then esc := Ord(zE^);
+    if zE = nil then Exit;
+    if sqlite3Utf8CharLen(zE, -1) <> 1 then begin
+      sqlite3_result_error(pCtx,
+        'ESCAPE expression must be a single character', -1);
+      Exit;
+    end;
+    if zE^ <> #0 then esc := Ord(zE^);
   end;
   rc := sqlite3_strlike(zPat, zStr, esc);
   sqlite3_result_int(pCtx, i32(rc = 0));

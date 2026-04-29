@@ -801,9 +801,22 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `SELECT * FROM nonesuch` — Pas accepts; C errors `no such
             table`.  Schema lookup at expand-from-clause time not
             firing for the trivial path.
-       [ ] `SELECT 'a' LIKE 'b' ESCAPE 'abc'` — Pas accepts; C errors
-            `ESCAPE expression must be a single character`.  Missing
-            ESCAPE-arg validation in the LIKE function dispatch.
+       [X] `SELECT 'a' LIKE 'b' ESCAPE 'abc'` — closed 2026-04-29.
+            Two fixes: (1) likeFunc (codegen.pas) now validates the
+            ESCAPE arg via sqlite3Utf8CharLen and raises
+            `sqlite3_result_error("ESCAPE expression must be a single
+            character")` when len<>1, mirroring func.c:947; (2) the
+            OP_Function arm in vdbe.pas was dropping the function
+            error message — now copies pCtx^.pOut into v^.zErrMsg via
+            sqlite3VdbeError, mirroring vdbe.c:8884.  The latter fix
+            also lifts every other sqlite3_result_error message into
+            sqlite3_errmsg (was previously surfacing as generic "SQL
+            logic error").  DiagErrMsg `like 3 args` PASS.
+            Regressions clean: TestExplainParity 1016/10, DiagPubApi
+            163/0, TestVdbeAgg 11/0, TestParser 45/0, TestSelectBasic
+            49/0, TestWhereBasic 52/0, TestBtreeCompat 337/0,
+            TestDMLBasic 54/0, TestVdbeApi 57/0, DiagSumOverflow 12/0,
+            TestAuthBuiltins 34/0.
        [ ] `SELECT sum` — bare function name treated as column ref.
             Pas reports "not an error", C reports `no such column: sum`.
        [ ] `SELECT group_concat(a, 'x', 'y') FROM t` — Pas reports
