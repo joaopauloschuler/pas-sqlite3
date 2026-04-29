@@ -618,6 +618,9 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             regression.
 
 - [ ] **8.3.2** Result / value variants (vdbeapi.c, vdbemem.c).
+       [X] `sqlite3_value_text16` / `_text16be` / `_text16le` — ported
+            2026-04-29 (vdbeapi.c:231..239).  Trivial sqlite3ValueText
+            wrappers with the requested encoding.
 
 - [X] **8.3.2-bis** Error-message routing.
 

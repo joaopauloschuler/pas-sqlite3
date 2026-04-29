@@ -1555,6 +1555,9 @@ function sqlite3_value_int(pVal: Psqlite3_value): i32;
 function sqlite3_value_int64(pVal: Psqlite3_value): i64;
 function sqlite3_value_double(pVal: Psqlite3_value): Double;
 function sqlite3_value_text(pVal: Psqlite3_value): PAnsiChar;
+function sqlite3_value_text16(pVal: Psqlite3_value): Pointer;
+function sqlite3_value_text16be(pVal: Psqlite3_value): Pointer;
+function sqlite3_value_text16le(pVal: Psqlite3_value): Pointer;
 function sqlite3_value_blob(pVal: Psqlite3_value): Pointer;
 function sqlite3_value_bytes(pVal: Psqlite3_value): i32;
 function sqlite3_value_bytes16(pVal: Psqlite3_value): i32;
@@ -4178,6 +4181,23 @@ end;
 function sqlite3_value_text(pVal: Psqlite3_value): PAnsiChar;
 begin
   Result := PAnsiChar(sqlite3ValueText(pVal, SQLITE_UTF8));
+end;
+
+{ vdbeapi.c:231..239 — sqlite3_value_text16 / _text16be / _text16le.
+  Trivial wrappers around sqlite3ValueText with the requested encoding. }
+function sqlite3_value_text16(pVal: Psqlite3_value): Pointer;
+begin
+  Result := sqlite3ValueText(pVal, SQLITE_UTF16NATIVE);
+end;
+
+function sqlite3_value_text16be(pVal: Psqlite3_value): Pointer;
+begin
+  Result := sqlite3ValueText(pVal, SQLITE_UTF16BE);
+end;
+
+function sqlite3_value_text16le(pVal: Psqlite3_value): Pointer;
+begin
+  Result := sqlite3ValueText(pVal, SQLITE_UTF16LE);
 end;
 
 function sqlite3_value_blob(pVal: Psqlite3_value): Pointer;
