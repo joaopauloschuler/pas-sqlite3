@@ -1578,6 +1578,8 @@ function sqlite3_bind_text(pStmt: PVdbe; i: i32; zData: PAnsiChar;
                            nData: i32; xDel: TxDelProc): i32;
 function sqlite3_bind_blob(pStmt: PVdbe; i: i32; zData: Pointer;
                            nData: i32; xDel: TxDelProc): i32;
+function sqlite3_bind_zeroblob(pStmt: PVdbe; i: i32; n: i32): i32;
+function sqlite3_bind_zeroblob64(pStmt: PVdbe; i: i32; n: u64): i32;
 function sqlite3_bind_value(pStmt: PVdbe; i: i32;
                             pValue: Psqlite3_value): i32;
 function sqlite3_bind_parameter_count(pStmt: PVdbe): i32;
@@ -4150,6 +4152,39 @@ begin
     rc := sqlite3VdbeMemSetStr(pVar, zData, nData, 0, xDel);
   end;
   Result := rc;
+end;
+
+{ vdbeapi.c:1894 — sqlite3_bind_zeroblob.
+  Binds an n-byte zero-blob placeholder to the i'th host parameter.
+  vdbeUnbind55 already validates the (pStmt, i) pair and returns
+  SQLITE_MISUSE for out-of-range indices, matching the C body's
+  behaviour without the sqlite3_mutex_leave call (this port has no
+  per-connection mutex).  The OMIT_INCRBLOB arm of the C body applies
+  here because passqlite3vdbe builds without incrblob; the return
+  value of MemSetZeroBlob is preserved. }
+function sqlite3_bind_zeroblob(pStmt: PVdbe; i: i32; n: i32): i32;
+var
+  rc: i32;
+begin
+  rc := vdbeUnbind55(pStmt, u32(i - 1));
+  if rc = SQLITE_OK then
+    sqlite3VdbeMemSetZeroBlob(pStmt^.aVar + (i - 1), n);
+  Result := rc;
+end;
+
+{ vdbeapi.c:1909 — sqlite3_bind_zeroblob64.
+  Same as sqlite3_bind_zeroblob but takes a u64 size; rejects n above
+  SQLITE_LIMIT_LENGTH with SQLITE_TOOBIG before delegating. }
+function sqlite3_bind_zeroblob64(pStmt: PVdbe; i: i32; n: u64): i32;
+var
+  db: PTsqlite3;
+begin
+  if pStmt = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  db := PTsqlite3(pStmt^.db);
+  if (db <> nil) and (n > u64(db^.aLimit[0])) then
+    Result := SQLITE_TOOBIG
+  else
+    Result := sqlite3_bind_zeroblob(pStmt, i, i32(n));
 end;
 
 function sqlite3_bind_value(pStmt: PVdbe; i: i32;

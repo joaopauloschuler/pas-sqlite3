@@ -181,6 +181,24 @@ begin
         sqlite3_value_encoding(nil) = SQLITE_UTF8);
   sqlite3_finalize(pStmt);
 
+  { Phase 8.3.1 — sqlite3_bind_zeroblob / _zeroblob64.
+    Pas parser does not yet recognise '?' / '?N' host parameters
+    (nVar=0 after prepare), so a positive-binding round-trip via
+    sqlite3_prepare_v2 is not yet possible.  Cover only the nil
+    and TOOBIG misuse paths the C body exposes; the full round-trip
+    will land alongside the parameter-parsing port. }
+  Check('bind_zeroblob(nil) = MISUSE',
+        sqlite3_bind_zeroblob(nil, 1, 8) = SQLITE_MISUSE);
+  Check('bind_zeroblob64(nil) = MISUSE',
+        sqlite3_bind_zeroblob64(nil, 1, 8) = SQLITE_MISUSE);
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT 1', -1, @pStmt, nil);
+  Check('bind_zeroblob no-params = RANGE',
+        sqlite3_bind_zeroblob(pStmt, 1, 8) = SQLITE_RANGE);
+  Check('bind_zeroblob64 over-LENGTH = TOOBIG',
+        sqlite3_bind_zeroblob64(pStmt, 1, u64(2) shl 40) = SQLITE_TOOBIG);
+  sqlite3_finalize(pStmt);
+
   { Phase 8.1.1 — sqlite3_db_release_memory / sqlite3_db_cacheflush. }
   Check('db_release_memory = OK',  sqlite3_db_release_memory(db)   = SQLITE_OK);
   Check('db_release_memory(nil) = MISUSE',

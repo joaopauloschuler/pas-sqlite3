@@ -571,7 +571,13 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_bind_blob64` — i64-length blob bind.
        [ ] `sqlite3_bind_text16` — UTF-16 text bind.
        [ ] `sqlite3_bind_text64` — i64-length text bind.
-       [ ] `sqlite3_bind_zeroblob` / `_zeroblob64` — zero-filled blob.
+       [X] `sqlite3_bind_zeroblob` / `_zeroblob64` — ported 2026-04-28
+            (passqlite3vdbe.pas) — vdbeUnbind55 + sqlite3VdbeMemSetZeroBlob;
+            64-bit variant gates on aLimit[LIMIT_LENGTH] for SQLITE_TOOBIG.
+            Misuse paths covered by DiagPubApi (nil → MISUSE, no-params
+            stmt → RANGE, over-LENGTH → TOOBIG).  Round-trip via prepared
+            statement deferred until parser recognises `?` / `?N` host
+            parameters (nVar=0 today).
        [ ] `sqlite3_bind_pointer` — typed pointer bind.
        [ ] `sqlite3_bind_parameter_index` — name → 1-based index.
 
