@@ -916,6 +916,61 @@ const
   SQLITE_PREPARE_NORMALIZE    = $02;
   SQLITE_PREPARE_NO_VTAB      = $04;
 
+{ prepare.c:492 — schemaIsValid.  For every attached database, open a
+  read transaction (if one is not already active), read the on-disk
+  schema cookie (BTREE_SCHEMA_VERSION), and compare it against the
+  in-memory pSchema^.schema_cookie.  When they diverge and the schema
+  was loaded, set pParse^.rc := SQLITE_SCHEMA so the caller (prepare
+  driver) can reload and retry; in any case reset the cached schema so
+  the next prepare reads fresh data.  Mirrors the C body line-for-line.
+
+  Note: this is the only call site of schemaIsValid in C — keeps it
+  local to the prepare unit, matching the C `static` qualifier. }
+procedure schemaIsValid(pParse: PParse);
+var
+  db: PTsqlite3;
+  iDb: i32;
+  rc: i32;
+  cookie: u32;
+  openedTransaction: i32;
+  pBt: PBtree;
+  pSchm: passqlite3util.PSchema;
+begin
+  db := pParse^.db;
+  Assert(sqlite3_mutex_held(db^.mutex) <> 0);
+  for iDb := 0 to db^.nDb - 1 do
+  begin
+    openedTransaction := 0;
+    pBt := PBtree(db^.aDb[iDb].pBt);
+    if pBt = nil then continue;
+
+    if sqlite3BtreeTxnState(pBt) = SQLITE_TXN_NONE then
+    begin
+      rc := sqlite3BtreeBeginTrans(pBt, 0, nil);
+      if (rc = SQLITE_NOMEM) or (rc = SQLITE_IOERR_NOMEM) then
+      begin
+        sqlite3OomFault(db);
+        pParse^.rc := SQLITE_NOMEM;
+      end;
+      if rc <> SQLITE_OK then Exit;
+      openedTransaction := 1;
+    end;
+
+    cookie := 0;
+    sqlite3BtreeGetMeta(pBt, BTREE_SCHEMA_VERSION, @cookie);
+    pSchm := passqlite3util.PSchema(db^.aDb[iDb].pSchema);
+    if (pSchm <> nil) and (i32(cookie) <> pSchm^.schema_cookie) then
+    begin
+      if (pSchm^.schemaFlags and DB_SchemaLoaded) <> 0 then
+        pParse^.rc := SQLITE_SCHEMA;
+      sqlite3ResetOneSchema(db, iDb);
+    end;
+
+    if openedTransaction <> 0 then
+      sqlite3BtreeCommit(pBt);
+  end;
+end;
+
 function sqlite3Prepare(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
                         prepFlags: u32; pReprepare: PVdbe;
                         ppStmt: PPointer; pzTail: PPAnsiChar): i32;
@@ -995,7 +1050,8 @@ begin
   end;
 
   if (sParse.rc <> SQLITE_OK) and (sParse.rc <> SQLITE_DONE) then begin
-    { schemaIsValid path skipped — no schema-cookie machinery yet. }
+    if ((sParse.parseFlags and $200) <> 0) and (db^.init.busy = 0) then
+      schemaIsValid(@sParse);
     if sParse.pVdbe <> nil then
       sqlite3VdbeFinalize(sParse.pVdbe);
     Assert(ppStmt^ = nil);

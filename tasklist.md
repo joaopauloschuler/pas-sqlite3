@@ -354,8 +354,17 @@ Important: At the end of this document, please find:
             `sqlite3NestedParse`.
        [ ] Port `sqlite3InitCallback` (main.pas:2063) — currently installs
             only system tables; full body parses each schema row.
-       [ ] Port `schemaIsValid`
-       [ ] Port `sqlite3SchemaToIndex` plumbing.
+       [X] Port `schemaIsValid` — ported 2026-04-29
+            (passqlite3main.pas, prepare.c:492).  Static helper local
+            to the prepare unit.  For each attached db, opens a read
+            transaction if needed, reads BTREE_SCHEMA_VERSION, and on
+            cookie mismatch sets pParse^.rc=SQLITE_SCHEMA (when the
+            schema was loaded) and calls sqlite3ResetOneSchema.  Wired
+            at the parse-error tail of sqlite3Prepare guarded by
+            (parseFlags & checkSchema) and db^.init.busy=0.  Dead-code
+            until live cookie bumps appear, but matches C 1:1.
+       [X] Port `sqlite3SchemaToIndex` plumbing — already ported
+            (codegen.pas:2455).
 
 - [ ] **7.1.2** `sqlite3NestedParse` full driver (build.c).  The
        current skeleton (codegen.pas:25041) early-exits when
