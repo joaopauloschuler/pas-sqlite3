@@ -52,6 +52,10 @@ Important: At the end of this document, please find:
             SQLITE_OK (querySharedCacheTableLock is no-op without
             shared cache).
 
+- [ ] **6.8.1** port `sqlite3Update`
+- [ ] **6.8.2** port `sqlite3GenerateConstraintChecks`
+- [ ] **6.8.3** port UNION-ALL arm of `sqlite3MultiValues`
+
 - [ ] **6.9-bis 11g.2.b** Port:  
     [ ] Port `sqlite3WhereBegin`
     [ ] Port `sqlite3WhereEnd`
@@ -61,8 +65,6 @@ Important: At the end of this document, please find:
     TK_COLLATE/TK_SPAN/TK_UPLUS arms, whereShortCut, allowedOp +
     operatorMask + exprMightBeIndexed + minimal-viable exprAnalyze)
     are already ported.
-- [ ] **6.9-bis 11g.2.c** port `sqlite3Update`
-- [ ] **6.9-bis 11g.2.d** port `sqlite3GenerateConstraintChecks`
 - [ ] **6.9-complete** complete the porting:
     - [ ] `sqlite3VdbeRecordCompare` in FULL in `passqlite3btree.pas`.
     - [ ] `sqlite3VdbeFindCompare` in FULL in `passqlite3btree.pas`.
@@ -87,12 +89,7 @@ Important: At the end of this document, please find:
       Remaining: errCode-bearing corruption signalling + the codegen
       full-layout fields (u/n/r1/r2) that the slim layout still drops.
 
-- [ ] **6.9-bis 11g.2.f** Audit + regression.  Tests run with
-        `LD_LIBRARY_PATH=$PWD/src` so the csq_* oracle resolves to
-        src/libsqlite3.so, not the system one.
-
-    - [ ] Port `sqlite3Update` body in full (skeleton-only today;
-      blocks DROP TABLE Δ=21 destroyRootPage and UPDATE rowid=1 Δ=14).
+- [ ] **6.9-bis** Finish porting `sqlite3Update`.
 
 - [ ] **6.10** `TestExplainParity.pas`
     - [ ] **6.10 step 6** Make these to work (port code when required):
@@ -364,11 +361,8 @@ Important: At the end of this document, please find:
        in full.
   [ ] **6.20** port remaining parser.pas stubs in full:
   [ ] **6.21** port vdbe.pas stubs in full from C to pascal:
-       [ ] `sqlite3VdbeMultiLoad` (blocked: only used by pragma.c and
-       requires va_list — defer until 6.12 sqlite3Pragma lands),
-       [ ] `sqlite3VdbeDisplayComment` (blocked: needs opcode-synopsis
-       tables appended after each name in sqlite3OpcodeName — Pas
-       OpcodeNames table is plain names only, defer),
+       [ ] `sqlite3VdbeMultiLoad`
+       [ ] `sqlite3VdbeDisplayComment`
        [X] `sqlite3_blob_open` / `sqlite3_blob_reopen` — ported 2026-04-29.
        [X] `OP_FilterAdd` / `OP_Filter` — ported 2026-04-29.
        [X] `sqlite3VdbeList` — ported 2026-04-29.
