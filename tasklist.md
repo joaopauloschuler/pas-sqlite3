@@ -336,6 +336,25 @@ Important: At the end of this document, please find:
       [X] **a) `max(val) FROM g` returns `0.0`** — closed 2026-04-28.
         minmaxStep's init branch must use `if pAgg^.flags = 0`, not
         `MEM_Null` flag (sqlite3_aggregate_context zero-inits Mem).
+      [X] **a-bis) `sum(int)` integer-overflow silently wraps; `total`
+        and `avg` over big ints lose precision** — closed 2026-04-28.
+        Reworked TSumAcc to mirror func.c:1846 SumCtx (rSum + rErr Kahan-
+        Babushka-Neumaier compensation, iSum, cnt, approx, ovrfl) and
+        ported sumStep / sumFinal / totalFinal / avgFinal verbatim from
+        func.c:1920..2032; sum() now raises "integer overflow" on i64
+        wrap, total/avg switch to compensated double summation.  avg now
+        shares the SumCtx accumulator via @sumStep (matches C wiring at
+        func.c:3352).  Side fix: vdbemem.c:524 sqlite3VdbeMemFinalize now
+        copies the result Mem into pMem unconditionally so the error
+        string set by sqlite3_result_error survives back to OP_AggFinal,
+        and OP_AggFinal recovers it via sqlite3_value_text(pMem) instead
+        of the hard-coded "aggregate finalize error" string.  New gate:
+        `src/tests/DiagSumOverflow.pas` (12 cases — empty/happy/overflow/
+        mixed/big variants of sum/total/avg, all PASS).  Discovered
+        side-issue: sqlite3ErrorWithMsg / sqlite3_errmsg are stubs that
+        only record errCode (codegen.pas:25562 + main.pas:1671), so the
+        nice "integer overflow" string still surfaces as generic "SQL
+        logic error" via sqlite3_errmsg — see new task 8.4.2 below.
       [ ] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** — the
         ORDER-BY-in-aggregate arm is not honoured; the unordered
         variant `group_concat(val,',')` PASSes.  Tracked under 6.24
@@ -704,6 +723,24 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [X] `sqlite3_column_bytes16` — ported 2026-04-28
             (passqlite3vdbe.pas) — `sqlite3_value_bytes16(columnMem(...))`.
             Covered by DiagPubApi.
+
+- [ ] **8.3.2-bis** Error-message routing.  `sqlite3ErrorWithMsg`
+       (codegen.pas:25562) and `sqlite3_errmsg` (main.pas:1671) are
+       stubs: the former only stores `errCode`, the latter returns
+       `sqlite3ErrStr(errCode)` and never consults the per-connection
+       error string.  Net effect: every runtime error message produced
+       by `sqlite3_result_error*`, `sqlite3VdbeError`, parser fixups,
+       etc. surfaces through `sqlite3_errmsg` as the generic
+       `sqlite3ErrStr(rc)` (e.g. "SQL logic error") instead of the
+       real cause (e.g. "integer overflow", "no such column: foo").
+       Discovered while closing 6.10 step 17(a-bis).  Fix needs:
+       (1) add `pErr: PMem` slot to `Tsqlite3` (util.pas:444); (2) port
+       `sqlite3ErrorWithMsg` to populate `db^.pErr` via
+       `sqlite3VdbeMemSetStr` mirroring main.c:1473; (3) port
+       `sqlite3_errmsg` to consult `db^.pErr` first per main.c:1654;
+       (4) wire `sqlite3_step` to call `sqlite3VdbeTransferError(v)`
+       (currently a stub at vdbe.pas:3543) so the per-statement
+       `v^.zErrMsg` flows into `db^.pErr`.
 
 - [ ] **8.3.3** Collation / function UTF-16 wrappers:
        [ ] `sqlite3_create_collation16`.

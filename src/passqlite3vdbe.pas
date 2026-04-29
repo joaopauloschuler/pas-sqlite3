@@ -7355,7 +7355,11 @@ begin
       end else begin
         rc := sqlite3VdbeMemFinalize(@aMem[pOp^.p1], pOp^.p4.pFunc);
         if rc <> SQLITE_OK then begin
-          sqlite3VdbeError(v, 'aggregate finalize error');
+          { Mirror vdbe.c:7993 — finalizer reported an error; the message
+            sits in pMem as TEXT (set by sqlite3_result_error in the
+            xFinalize callback). }
+          sqlite3VdbeError(v,
+            PAnsiChar(sqlite3_value_text(Psqlite3_value(@aMem[pOp^.p1]))));
           goto abort_due_to_error;
         end;
       end;
@@ -9700,20 +9704,17 @@ begin
     ctx.pMem  := pMem;
     ctx.pFunc := pFd;
     pFd^.xFinalize(@ctx);
-    if ctx.isError <> 0 then begin
-      pMem^.flags := MEM_Null;
-      Result := ctx.isError;
-    end else begin
-      { Direct release of zMalloc without going through MemRelease, which
-        would recurse via MEM_Agg → MemFinalize.  Mirrors vdbemem.c
-        sqlite3VdbeMemFinalize. }
-      if pMem^.szMalloc > 0 then begin
-        sqlite3DbFreeNN(pMem^.db, pMem^.zMalloc);
-        pMem^.szMalloc := 0;
-      end;
-      pMem^ := t;
-      Result := SQLITE_OK;
+    { Mirror vdbemem.c:524 — release the accumulator's zMalloc and copy
+      the result Mem (`t`) over `pMem^` unconditionally, even on error.
+      On error, `t` carries the error string set by sqlite3_result_error
+      via sqlite3VdbeMemSetStr, so OP_AggFinal can recover it via
+      sqlite3_value_text(pMem). }
+    if pMem^.szMalloc > 0 then begin
+      sqlite3DbFreeNN(pMem^.db, pMem^.zMalloc);
+      pMem^.szMalloc := 0;
     end;
+    pMem^ := t;
+    Result := ctx.isError;
   end else begin
     pMem^.flags := MEM_Null;
     Result := SQLITE_OK;

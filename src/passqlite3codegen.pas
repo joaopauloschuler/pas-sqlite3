@@ -27627,77 +27627,170 @@ begin
   else sqlite3_result_int64(pCtx, pCount^);
 end;
 
-{ Aggregate accumulator types — used by sum/avg functions }
+{ Aggregate accumulator type — port of func.c:1846 SumCtx.  Shared by
+  sum() / total() / avg() (all wired to sumStep).  Tracks running double
+  sum (rSum + rErr Kahan-Babushka-Neumaier compensation), running integer
+  sum (iSum), input count (cnt), the approx flag set on any non-integer
+  input or integer overflow, and ovrfl set on integer overflow. }
 type
-  { Mirrors func.c SumCtx — track both iVal and rVal each step, set approx
-    when any non-integer is added.  Result is integer iff !approx. }
-  TSumAcc = record approx: Boolean; iVal: i64; rVal: Double; cnt: i64; end;
+  TSumAcc = record
+    rSum:   Double;
+    rErr:   Double;
+    iSum:   i64;
+    cnt:    i64;
+    approx: u8;
+    ovrfl:  u8;
+  end;
   PSumAcc = ^TSumAcc;
-  TAvgAcc = record cnt: i64; sum: Double; end;
-  PAvgAcc = ^TAvgAcc;
 
-{ sumStep/sumFinal — SUM() aggregate }
+{ Kahan-Babushka-Neumaier compensated summation step (func.c:1864). }
+procedure kahanBabuskaNeumaierStep(pSum: PSumAcc; r: Double);
+var s, t: Double;
+begin
+  s := pSum^.rSum;
+  t := s + r;
+  if Abs(s) > Abs(r) then
+    pSum^.rErr := pSum^.rErr + ((s - t) + r)
+  else
+    pSum^.rErr := pSum^.rErr + ((r - t) + s);
+  pSum^.rSum := t;
+end;
+
+{ Add a (possibly large) integer to the Kahan running sum (func.c:1881). }
+procedure kahanBabuskaNeumaierStepInt64(pSum: PSumAcc; iVal: i64);
+var iBig, iSm: i64;
+begin
+  if (iVal <= -i64(4503599627370496)) or (iVal >= i64(4503599627370496)) then
+  begin
+    iSm  := iVal mod 16384;
+    iBig := iVal - iSm;
+    kahanBabuskaNeumaierStep(pSum, iBig);
+    kahanBabuskaNeumaierStep(pSum, iSm);
+  end else
+    kahanBabuskaNeumaierStep(pSum, Double(iVal));
+end;
+
+{ Initialise the Kahan running sum from a 64-bit integer (func.c:1896). }
+procedure kahanBabuskaNeumaierInit(p: PSumAcc; iVal: i64);
+var iSm: i64;
+begin
+  if (iVal <= -i64(4503599627370496)) or (iVal >= i64(4503599627370496)) then
+  begin
+    iSm := iVal mod 16384;
+    p^.rSum := Double(iVal - iSm);
+    p^.rErr := Double(iSm);
+  end else begin
+    p^.rSum := Double(iVal);
+    p^.rErr := 0.0;
+  end;
+end;
+
+{ True when x is NaN or +/-Inf (util.c:75 sqlite3IsOverflow + IsOvfl
+  macro at sqliteInt.h:4812: ((y & EXP754) == EXP754)). }
+function sumIsOverflow(x: Double): i32;
+var y: u64;
+begin
+  Move(x, y, SizeOf(y));
+  if (y and (u64($7FF) shl 52)) = (u64($7FF) shl 52) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ sumStep — port of func.c:1920.  Shared by sum() / total() / avg(). }
 procedure sumStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
-  pAcc: PSumAcc;
-  vt: i32;
+  p:    PSumAcc;
+  vt:   i32;
+  x:    i64;
+  v64:  i64;
 begin
-  pAcc := PSumAcc(sqlite3_aggregate_context(pCtx, SizeOf(TSumAcc)));
-  if (pAcc = nil) or
-     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then Exit;
-  vt := sqlite3_value_type(Psqlite3_value(argv^));
-  if vt = SQLITE_INTEGER then begin
-    sqlite3AddInt64(@pAcc^.iVal,
-      sqlite3_value_int64(Psqlite3_value(argv^)));
-    pAcc^.rVal := pAcc^.rVal +
-      sqlite3_value_double(Psqlite3_value(argv^));
+  Assert(argc = 1);
+  p := PSumAcc(sqlite3_aggregate_context(pCtx, SizeOf(TSumAcc)));
+  vt := sqlite3_value_numeric_type(Psqlite3_value(argv^));
+  if (p = nil) or (vt = SQLITE_NULL) then Exit;
+  Inc(p^.cnt);
+  if p^.approx = 0 then begin
+    if vt <> SQLITE_INTEGER then begin
+      kahanBabuskaNeumaierInit(p, p^.iSum);
+      p^.approx := 1;
+      kahanBabuskaNeumaierStep(p, sqlite3_value_double(Psqlite3_value(argv^)));
+    end else begin
+      x := p^.iSum;
+      v64 := sqlite3_value_int64(Psqlite3_value(argv^));
+      if sqlite3AddInt64(@x, v64) = 0 then
+        p^.iSum := x
+      else begin
+        p^.ovrfl := 1;
+        kahanBabuskaNeumaierInit(p, p^.iSum);
+        p^.approx := 1;
+        kahanBabuskaNeumaierStepInt64(p, v64);
+      end;
+    end;
   end else begin
-    pAcc^.approx := True;
-    pAcc^.rVal := pAcc^.rVal +
-      sqlite3_value_double(Psqlite3_value(argv^));
+    if vt = SQLITE_INTEGER then
+      kahanBabuskaNeumaierStepInt64(p,
+        sqlite3_value_int64(Psqlite3_value(argv^)))
+    else begin
+      p^.ovrfl := 0;
+      kahanBabuskaNeumaierStep(p,
+        sqlite3_value_double(Psqlite3_value(argv^)));
+    end;
   end;
-  Inc(pAcc^.cnt);
 end;
 
+{ sumFinal — port of func.c:1989 sumFinalize.  Empty input → NULL.
+  Integer-overflow seen during stepping → 'integer overflow' error. }
 procedure sumFinal(pCtx: Psqlite3_context); cdecl;
 var
-  pAcc: PSumAcc;
+  p: PSumAcc;
 begin
-  pAcc := PSumAcc(sqlite3_aggregate_context(pCtx, 0));
-  if (pAcc = nil) or (pAcc^.cnt = 0) then begin sqlite3_result_null(pCtx); Exit; end;
-  if not pAcc^.approx then sqlite3_result_int64(pCtx, pAcc^.iVal)
-  else sqlite3_result_double(pCtx, pAcc^.rVal);
+  p := PSumAcc(sqlite3_aggregate_context(pCtx, 0));
+  if (p = nil) or (p^.cnt <= 0) then Exit;
+  if p^.approx <> 0 then begin
+    if p^.ovrfl <> 0 then
+      sqlite3_result_error(pCtx, 'integer overflow', -1)
+    else if sumIsOverflow(p^.rErr) = 0 then
+      sqlite3_result_double(pCtx, p^.rSum + p^.rErr)
+    else
+      sqlite3_result_double(pCtx, p^.rSum);
+  end else
+    sqlite3_result_int64(pCtx, p^.iSum);
 end;
 
+{ totalFinal — port of func.c:2020 totalFinalize.  Empty input → 0.0. }
 procedure totalFinal(pCtx: Psqlite3_context); cdecl;
 var
-  pAcc: PSumAcc;
+  p: PSumAcc;
+  r: Double;
 begin
-  pAcc := PSumAcc(sqlite3_aggregate_context(pCtx, 0));
-  if pAcc = nil then begin sqlite3_result_double(pCtx, 0.0); Exit; end;
-  if not pAcc^.approx then sqlite3_result_double(pCtx, pAcc^.iVal)
-  else sqlite3_result_double(pCtx, pAcc^.rVal);
+  r := 0.0;
+  p := PSumAcc(sqlite3_aggregate_context(pCtx, 0));
+  if p <> nil then begin
+    if p^.approx <> 0 then begin
+      r := p^.rSum;
+      if sumIsOverflow(p^.rErr) = 0 then r := r + p^.rErr;
+    end else
+      r := Double(p^.iSum);
+  end;
+  sqlite3_result_double(pCtx, r);
 end;
 
-{ avgStep/avgFinal — AVG() aggregate }
-procedure avgStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
-var
-  pAcc: PAvgAcc;
-begin
-  pAcc := PAvgAcc(sqlite3_aggregate_context(pCtx, SizeOf(TAvgAcc)));
-  if (pAcc = nil) or
-     (sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL) then Exit;
-  pAcc^.sum := pAcc^.sum + sqlite3_value_double(Psqlite3_value(argv^));
-  Inc(pAcc^.cnt);
-end;
-
+{ avgFinal — port of func.c:2006 avgFinalize.  Uses SumCtx so it must
+  share the sumStep accumulator (wired below). }
 procedure avgFinal(pCtx: Psqlite3_context); cdecl;
 var
-  pAcc: PAvgAcc;
+  p: PSumAcc;
+  r: Double;
 begin
-  pAcc := PAvgAcc(sqlite3_aggregate_context(pCtx, 0));
-  if (pAcc = nil) or (pAcc^.cnt = 0) then begin sqlite3_result_null(pCtx); Exit; end;
-  sqlite3_result_double(pCtx, pAcc^.sum / pAcc^.cnt);
+  p := PSumAcc(sqlite3_aggregate_context(pCtx, 0));
+  if (p = nil) or (p^.cnt <= 0) then Exit;
+  if p^.approx <> 0 then begin
+    r := p^.rSum;
+    if sumIsOverflow(p^.rErr) = 0 then r := r + p^.rErr;
+  end else
+    r := Double(p^.iSum);
+  sqlite3_result_double(pCtx, r / Double(p^.cnt));
 end;
 
 { minmaxScalarFunc — scalar 2-or-more-arg min()/max() (func.c:49..74).
@@ -28517,7 +28610,7 @@ begin
   MakeAgg(aBuiltinAgg[1], 1, AGG_ENC or SQLITE_FUNC_COUNT, @countStep, @countFinal, 'count');
   MakeAgg(aBuiltinAgg[2], 1, AGG_ENC, @sumStep,  @sumFinal,   'sum');
   MakeAgg(aBuiltinAgg[3], 1, AGG_ENC, @sumStep,  @totalFinal, 'total');
-  MakeAgg(aBuiltinAgg[4], 1, AGG_ENC, @avgStep,  @avgFinal,   'avg');
+  MakeAgg(aBuiltinAgg[4], 1, AGG_ENC, @sumStep,  @avgFinal,   'avg');
   MakeAgg(aBuiltinAgg[5], 1, AGG_ENC or SQLITE_FUNC_MINMAX or SQLITE_FUNC_NEEDCOLL,
           @minStep, @minMaxFinal, 'min');
   MakeAgg(aBuiltinAgg[6], 1, AGG_ENC or SQLITE_FUNC_MINMAX or SQLITE_FUNC_NEEDCOLL,
