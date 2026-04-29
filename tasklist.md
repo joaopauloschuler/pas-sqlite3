@@ -369,8 +369,34 @@ Important: At the end of this document, please find:
         produces N rows.  Window-codegen sub-issue under 6.26; distinct
         from (c) because here the parse + prepare succeed.
       [ ] **e) `count(*) FILTER (WHERE …)` / `sum() FILTER` empty
-        result** — agg + FILTER-clause codegen not wired.  C reference:
-        select.c analyzeAggregate FILTER arm.
+        result** — agg + FILTER-clause codegen not wired.  Investigation
+        2026-04-29: parser's rule 343 already builds `pWin{eFrmType=
+        TK_FILTER, pFilter=expr}` and sqlite3WindowAttach hangs it on
+        the agg Expr with EP_WinFunc set.  Three concrete gaps before
+        the FILTER predicate can fire at runtime:
+          1. ResolveExpr (codegen.pas:7379) does not walk
+             pE^.y.pWin^.pFilter, so column refs inside the FILTER stay
+             as TK_ID (never become TK_COLUMN with y.pTab/iTable).
+             C reference: resolve.c:1334 walks pFilter inside the
+             TK_AGG_FUNCTION arm.
+          2. analyzeAggFuncArgs (codegen.pas:18529) does not call
+             sqlite3ExprAnalyzeAggregates on pWin^.pFilter, so the
+             FILTER's column refs are never converted to TK_AGG_COLUMN
+             nor added to pAggInfo^.aCol[].  C reference:
+             select.c:6534..6535 EP_WinFunc arm.
+          3. Both agg gates (codegen.pas:19058 / :19244) reject any
+             EP_WinFunc; should accept eFrmType=TK_FILTER.  Plus the
+             nAccumulator>0 bail at :19064 / :19280 must be lifted (or
+             a directMode column-emit pre-pass added) so a FILTER
+             whose predicate references a base column doesn't
+             re-bail.  Once nAccumulator>0 is honoured,
+             updateAccumulatorSimple needs the C 6826..6847 arm:
+             before each AggStep, when EP_WinFunc + pWin^.pFilter,
+             emit `addrNext := MakeLabel; ExprIfFalse(pFilter,
+             addrNext, JUMPIFNULL)`, and after AggStep
+             `ResolveLabel(addrNext)`.
+          C reference: select.c:6826..6847 (updateAccumulator FILTER
+          arm) + 6534..6535 (analyze) + resolve.c:1334 (resolve).
       [ ] **f) `count(DISTINCT col)` / `sum(DISTINCT col)` empty
         result** — agg-DISTINCT codegen path missing.  C reference:
         select.c codeDistinct.
