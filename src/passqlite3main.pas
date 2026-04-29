@@ -377,6 +377,7 @@ function sqlite3_limit(db: PTsqlite3; limitId: i32; newLimit: i32): i32; cdecl;
 
 function sqlite3_stmt_busy(pStmt: Pointer): i32; cdecl;
 function sqlite3_stmt_readonly(pStmt: Pointer): i32; cdecl;
+function sqlite3_stmt_explain(pStmt: Pointer; eMode: i32): i32; cdecl;
 
 function sqlite3_sleep(ms: i32): i32; cdecl;
 
@@ -2673,6 +2674,49 @@ begin
     Result := 1
   else
     Result := 0;
+end;
+
+{ vdbeapi.c:2038 — sqlite3_stmt_explain.  Switch a prepared statement
+  between normal / EXPLAIN / EXPLAIN QUERY PLAN modes, reprepare if
+  required, and adjust the result-column count accordingly. }
+function sqlite3_stmt_explain(pStmt: Pointer; eMode: i32): i32; cdecl;
+var
+  v: PVdbe;
+  curExplain: i32;
+begin
+  if pStmt = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  v := PVdbe(pStmt);
+  sqlite3_mutex_enter(PTsqlite3(v^.db)^.mutex);
+  curExplain := i32((v^.vdbeFlags and VDBF_EXPLAIN_MASK) shr VDBF_EXPLAIN_SHIFT);
+  if curExplain = eMode then
+    Result := SQLITE_OK
+  else if (eMode < 0) or (eMode > 2) then
+    Result := SQLITE_ERROR
+  else if (v^.prepFlags and SQLITE_PREPARE_SAVESQL) = 0 then
+    Result := SQLITE_ERROR
+  else if v^.eVdbeState <> VDBE_READY_STATE then
+    Result := SQLITE_BUSY
+  else if (v^.nMem >= 10) and ((eMode <> 2) or ((v^.vdbeFlags and VDBF_HaveEqpOps) <> 0)) then
+  begin
+    v^.vdbeFlags := (v^.vdbeFlags and (not u32(VDBF_EXPLAIN_MASK)))
+                    or (u32(eMode) shl VDBF_EXPLAIN_SHIFT);
+    Result := SQLITE_OK;
+  end
+  else begin
+    v^.vdbeFlags := (v^.vdbeFlags and (not u32(VDBF_EXPLAIN_MASK)))
+                    or (u32(eMode) shl VDBF_EXPLAIN_SHIFT);
+    Result := sqlite3Reprepare(v);
+    if eMode = 2 then
+      v^.vdbeFlags := v^.vdbeFlags or VDBF_HaveEqpOps
+    else
+      v^.vdbeFlags := v^.vdbeFlags and (not u32(VDBF_HaveEqpOps));
+  end;
+  curExplain := i32((v^.vdbeFlags and VDBF_EXPLAIN_MASK) shr VDBF_EXPLAIN_SHIFT);
+  if curExplain <> 0 then
+    v^.nResColumn := u16(12 - 4 * curExplain)
+  else
+    v^.nResColumn := v^.nResAlloc;
+  sqlite3_mutex_leave(PTsqlite3(v^.db)^.mutex);
 end;
 
 { vdbeapi.c:2023 — sqlite3_stmt_readonly. }

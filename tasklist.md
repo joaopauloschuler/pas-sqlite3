@@ -626,7 +626,15 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [X] `sqlite3_stmt_busy` (vdbeapi.c) — ported 2026-04-28
             (passqlite3main.pas) — `v <> nil and eVdbeState =
             VDBE_RUN_STATE`.
-       [ ] `sqlite3_stmt_explain` — current explain mode (0/1/2).
+       [X] `sqlite3_stmt_explain` — ported 2026-04-28 (passqlite3main.pas)
+            — verbatim port of vdbeapi.c:2038.  Decodes/encodes the
+            2-bit explain field via VDBF_EXPLAIN_MASK; no-reprepare
+            fast path when v^.nMem >= 10 and (eMode<>2 or
+            VDBF_HaveEqpOps already set); reprepare fall-through via
+            sqlite3Reprepare; nResColumn adjusted to 12-4*explain on
+            EXPLAIN modes, restored to nResAlloc on mode 0.  Misuse
+            (nil pStmt → MISUSE) and bad-mode (eMode<0/>2 → ERROR)
+            covered by DiagPubApi.
        [ ] `sqlite3_stmt_status` — per-stmt counters.
        [ ] `sqlite3_stmt_scanstatus` / `_scanstatus_v2` /
             `_scanstatus_reset` — gated on the 6.8

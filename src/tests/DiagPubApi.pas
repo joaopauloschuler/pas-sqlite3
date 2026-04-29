@@ -185,6 +185,19 @@ begin
   Check('stmt_busy after DONE = 0',    sqlite3_stmt_busy(pStmt) = 0);
   sqlite3_finalize(pStmt);
 
+  { Phase 8.2.1 — sqlite3_stmt_explain. }
+  Check('stmt_explain(nil) = MISUSE', sqlite3_stmt_explain(nil, 0) = SQLITE_MISUSE);
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT 1', -1, @pStmt, nil);
+  Check('stmt_explain prepare', rcs = SQLITE_OK);
+  Check('stmt_explain bad mode -1 = ERROR',
+        sqlite3_stmt_explain(pStmt, -1) = SQLITE_ERROR);
+  Check('stmt_explain bad mode 3 = ERROR',
+        sqlite3_stmt_explain(pStmt, 3) = SQLITE_ERROR);
+  Check('stmt_explain mode 0 (already 0) = OK',
+        sqlite3_stmt_explain(pStmt, 0) = SQLITE_OK);
+  sqlite3_finalize(pStmt);
+
   { Phase 8.3.2 — sqlite3_value_numeric_type / _encoding. }
   pStmt := nil;
   rcs := sqlite3_prepare_v2(db, 'SELECT ''42''', -1, @pStmt, nil);
