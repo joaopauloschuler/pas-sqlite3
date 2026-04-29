@@ -495,6 +495,28 @@ procedure sqlite3_snapshot_free(pSnapshot: Psqlite3_snapshot); cdecl;
 function  sqlite3_snapshot_cmp(p1, p2: Psqlite3_snapshot): i32; cdecl;
 function  sqlite3_snapshot_recover(db: PTsqlite3; zDb: PAnsiChar): i32; cdecl;
 
+{ Phase 8.8.1 — Pre-update hook public-API entry points
+  (sqlite.h.in:10897..10915).  The C reference gates every body on
+  SQLITE_ENABLE_PREUPDATE_HOOK; the default upstream build (and our
+  oracle) compiles without it, so the symbols are absent there.  We
+  expose them as faithful translations of the SQLITE_ENABLE_API_ARMOR
+  arms that fire when no preupdate is in flight (db->pPreUpdate == NULL):
+  count/depth return 0, blobwrite returns -1, old/new return SQLITE_MISUSE,
+  and _hook returns nil without installing a callback.  Brings the
+  public-API surface to parity even while the underlying preupdate
+  machinery (vdbeapi.c:2209..2400) stays unported.  C reference:
+  vdbeapi.c:2314 / 2337 / 2353 / 2209 / 2369 + main.c:4001 (_hook). }
+function  sqlite3_preupdate_hook(db: PTsqlite3;
+                                 xPreUpdate: Pointer;
+                                 pArg: Pointer): Pointer; cdecl;
+function  sqlite3_preupdate_old(db: PTsqlite3; iIdx: i32;
+                                ppValue: PPointer): i32; cdecl;
+function  sqlite3_preupdate_new(db: PTsqlite3; iIdx: i32;
+                                ppValue: PPointer): i32; cdecl;
+function  sqlite3_preupdate_count(db: PTsqlite3): i32; cdecl;
+function  sqlite3_preupdate_depth(db: PTsqlite3): i32; cdecl;
+function  sqlite3_preupdate_blobwrite(db: PTsqlite3): i32; cdecl;
+
 implementation
 
 uses
@@ -4131,6 +4153,65 @@ begin
   end;
 {$ENDIF}
   Result := SQLITE_ERROR;
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 8.8.1 — Pre-update hook public-API entry points.
+  Faithful translation of vdbeapi.c:2209..2400 + main.c:4001 in the
+  build mode where SQLITE_ENABLE_PREUPDATE_HOOK is off and therefore
+  db->pPreUpdate is permanently NULL.  Every SQLITE_ENABLE_API_ARMOR
+  guard reduces to its "no-preupdate-active" arm.
+  ---------------------------------------------------------------------- }
+
+function sqlite3_preupdate_hook(db: PTsqlite3;
+                                xPreUpdate: Pointer;
+                                pArg: Pointer): Pointer; cdecl;
+begin
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := nil; Exit; end;
+{$ENDIF}
+  { No callback storage in db (PreUpdate fields are gated out at compile
+    time in our build), so the previous registration is always nil. }
+  Result := nil;
+end;
+
+function sqlite3_preupdate_old(db: PTsqlite3; iIdx: i32;
+                               ppValue: PPointer): i32; cdecl;
+begin
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if (db = nil) or (ppValue = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+{$ENDIF}
+  if ppValue <> nil then ppValue^ := nil;
+  Result := SQLITE_MISUSE;
+end;
+
+function sqlite3_preupdate_new(db: PTsqlite3; iIdx: i32;
+                               ppValue: PPointer): i32; cdecl;
+begin
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if (db = nil) or (ppValue = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+{$ENDIF}
+  if ppValue <> nil then ppValue^ := nil;
+  Result := SQLITE_MISUSE;
+end;
+
+function sqlite3_preupdate_count(db: PTsqlite3): i32; cdecl;
+begin
+  Result := 0;
+end;
+
+function sqlite3_preupdate_depth(db: PTsqlite3): i32; cdecl;
+begin
+  Result := 0;
+end;
+
+function sqlite3_preupdate_blobwrite(db: PTsqlite3): i32; cdecl;
+begin
+  Result := -1;
 end;
 
 { OP_SqlExec hook (vdbe.c:7064).  Trampoline that adapts sqlite3_exec to

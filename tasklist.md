@@ -419,9 +419,15 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        (main.c, status.c):
        [ ] `sqlite3_test_control` — testing back-door (subset).
 
-- [ ] **8.8.1** Pre-update hook (preupdate.c — `SQLITE_ENABLE_PREUPDATE_HOOK`):
-       [ ] `sqlite3_preupdate_count` / `_new` / `_old` / `_depth` /
-            `_blobwrite`.
+- [X] **8.8.1** Pre-update hook public-API stubs (preupdate.c —
+       `SQLITE_ENABLE_PREUPDATE_HOOK`).  Ported 2026-04-29 in
+       passqlite3main.pas: `sqlite3_preupdate_hook` returns nil
+       (no callback storage), `_count` / `_depth` return 0,
+       `_blobwrite` returns -1, `_new` / `_old` return SQLITE_MISUSE
+       with `*ppValue := nil`.  Faithful to the
+       SQLITE_ENABLE_API_ARMOR / `db->pPreUpdate==NULL` arms in
+       vdbeapi.c:2209..2400.  Full preupdate machinery (PreUpdate
+       record, BTree column-payload unpack) stays unported.
 
 - [ ] **8.9.1** Vtab helper APIs (vtab.c, vdbeapi.c):
        [ ] `sqlite3_vtab_distinct` — query-planner DISTINCT hint.
