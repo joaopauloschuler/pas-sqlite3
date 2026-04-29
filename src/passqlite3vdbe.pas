@@ -3574,10 +3574,25 @@ begin
 end;
 
 function sqlite3VdbeReset(p: PVdbe): i32;
+var
+  db: PTsqlite3;
 begin
   if p = nil then begin Result := SQLITE_OK; Exit; end;
+  db := p^.db;
   if p^.eVdbeState = VDBE_RUN_STATE then
     sqlite3VdbeHalt(p);
+  { vdbeaux.c:3605 — if the VDBE has executed any instruction, transfer
+    the error code/message from the VDBE into the connection.  Otherwise
+    leave db^.errCode unchanged.  Without this arm, a clean SQLITE_DONE
+    leaks rc=SQLITE_DONE into db^.errCode, and a subsequent sqlite3_errmsg
+    falls through to sqlite3ErrStr(SQLITE_DONE)="no more rows available"
+    instead of "not an error". }
+  if (db <> nil) and (p^.pc >= 0) then begin
+    if (db^.pErr <> nil) or (p^.zErrMsg <> nil) then
+      sqlite3VdbeTransferError(p)
+    else
+      db^.errCode := p^.rc;
+  end;
   p^.eVdbeState := VDBE_READY_STATE;
   Result := p^.rc;
 end;

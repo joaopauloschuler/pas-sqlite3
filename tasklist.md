@@ -753,6 +753,50 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        DiagWindow 19, DiagDml 12/2, DiagTxn 8 — all match prior
        baselines.
 
+- [X] **8.3.2-ter** `sqlite3VdbeReset` errCode reset — closed 2026-04-29.
+       After a clean SQLITE_DONE step + finalize, `sqlite3_errmsg` was
+       returning "no more rows available" instead of "not an error"
+       because Pas's `sqlite3VdbeReset` skipped the vdbeaux.c:3605..3611
+       arm that syncs `db^.errCode := p^.rc` (or routes through
+       TransferError if a message exists) once the VDBE has executed
+       any instruction.  Fix: port the missing arm verbatim.  New gate
+       `src/tests/DiagErrMsg.pas` (run with `LD_LIBRARY_PATH=$PWD/src
+       bin/DiagErrMsg`): div0 / overflow / cast-bad now match C's
+       "not an error" verdict.  Remaining DiagErrMsg divergences
+       (parse-syntax token, unknown-col, unknown-tbl, ESCAPE arg
+       check, `SELECT sum`, group_concat-3-args) are pre-existing
+       parse/resolve gaps — not error-routing.  Regressions clean:
+       TestExplainParity 1016/10, DiagPubApi 156/0, DiagSumOverflow
+       12/0, TestVdbeApi 57/0, TestVdbeAgg 11/0, TestParser 45/0,
+       TestSelectBasic 49/0, TestWhereBasic 52/0, TestBtreeCompat
+       337/0, TestDMLBasic 54/0, TestAuthBuiltins 34/0, TestPrintf
+       105/0, DiagFunctions/Date/Cast 0 div.
+
+- [ ] **8.3.2-quater** Pre-existing parse/resolve error-message gaps
+       surfaced by `DiagErrMsg.pas`.  Each prepares cleanly on Pas
+       where C errors at prepare or step time — NOT error-routing
+       bugs, but catches in earlier phases:
+       [ ] `SLECT 1` — Pas reports `near "": syntax error`, missing
+            the offending token.  `parserSyntaxError` token capture is
+            losing `sParse.sLastToken` after the unrecognised TK_ID
+            shift; fix in passqlite3parser.pas.
+       [ ] `SELECT z FROM t` (z not a column) — Pas accepts at prepare,
+            steps with no rows; C errors `no such column: z`.  Folds
+            into the resolver coverage gap (sqlite3ResolveExprListNames
+            in 6.8 or the trivial-stub gate in sqlite3Select).
+       [ ] `SELECT * FROM nonesuch` — Pas accepts; C errors `no such
+            table`.  Schema lookup at expand-from-clause time not
+            firing for the trivial path.
+       [ ] `SELECT 'a' LIKE 'b' ESCAPE 'abc'` — Pas accepts; C errors
+            `ESCAPE expression must be a single character`.  Missing
+            ESCAPE-arg validation in the LIKE function dispatch.
+       [ ] `SELECT sum` — bare function name treated as column ref.
+            Pas reports "not an error", C reports `no such column: sum`.
+       [ ] `SELECT group_concat(a, 'x', 'y') FROM t` — Pas reports
+            `wrong number of arguments` first; C resolves the FROM
+            clause first and reports `no such table: t`.  Argument-
+            check vs. FROM-resolution ordering mismatch.
+
 - [ ] **8.3.3** Collation / function UTF-16 wrappers:
        [ ] `sqlite3_create_collation16`.
        [ ] `sqlite3_create_function16`.
