@@ -431,6 +431,16 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 
 - [ ] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind).
 
+- [X] **8.x** `sqlite3_database_file_object` (pager.c:5090) — ported
+       2026-04-29 in passqlite3pager.pas.  Walks back from any filename
+       pointer inside a pager-allocated buffer to the 4-byte zero prefix,
+       then reads the Pager* back-pointer that lives just before it and
+       returns `pPager^.fd`.  Differential probe
+       `src/tests/DiagDbFileObject.pas` opens an on-disk db, fetches the
+       main filename via `sqlite3_db_filename`, and confirms the
+       returned `sqlite3_file*` matches `sqlite3PagerFile` of the
+       backing pager.
+
 - [X] **8.x** `sqlite3_errmsg16` (main.c:2775) — ported 2026-04-29 in
        passqlite3main.pas alongside the existing `sqlite3_errmsg`.
        Faithful UTF-16 sibling: returns the static UTF-16 "out of

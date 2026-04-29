@@ -383,6 +383,13 @@ function  sqlite3PagerVfs(pPager: PPager): Psqlite3_vfs;
 function  sqlite3PagerFile(pPager: PPager): Psqlite3_file;
 function  sqlite3PagerJrnlFile(pPager: PPager): Psqlite3_file;
 
+{ pager.c:5090 — public API.  Given any filename pointer that lies inside
+  the buffer allocated by sqlite3PagerOpen (database, journal, or WAL
+  name), walk back to the 4-byte zero prefix that precedes the database
+  filename and read the back-pointer to the Pager that lives just before
+  it.  Returns the main database sqlite3_file. }
+function  sqlite3_database_file_object(zName: PChar): Psqlite3_file; cdecl;
+
 { 3.B.2b: Write transaction / journaling / commit / rollback }
 const
   SAVEPOINT_BEGIN    = 0;
@@ -2810,6 +2817,22 @@ end;
 function sqlite3PagerJrnlFile(pPager: PPager): Psqlite3_file;
 begin
   Result := pPager^.jfd;
+end;
+
+{ pager.c:5090 — sqlite3_database_file_object. }
+function sqlite3_database_file_object(zName: PChar): Psqlite3_file; cdecl;
+var
+  pPgr  : PPager;
+  pBack : Pu8;
+  pName : PChar;
+begin
+  pName := zName;
+  while (pName[-1] <> #0) or (pName[-2] <> #0) or
+        (pName[-3] <> #0) or (pName[-4] <> #0) do
+    Dec(pName);
+  pBack := Pu8(pName) - 4 - SQLITE_PTRSIZE;
+  Move(pBack^, pPgr, SQLITE_PTRSIZE);
+  Result := pPgr^.fd;
 end;
 
 { pager.c: pagerReleaseMapPage stub (mmap pages) }
