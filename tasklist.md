@@ -493,8 +493,9 @@ Important: At the end of this document, please find:
             main.pas:802 actually calls (u8-cast confirms the dispatch).
        [ ] `sqlite3Reprepare` (codegen.pas:25295) — re-prepare a
             statement after schema change.
-       [ ] `sqlite3TransferBindings` (codegen.pas:25216) — copy
-            bindings from old stmt to new.
+       [X] `sqlite3TransferBindings` — ported 2026-04-28 (codegen.pas)
+            — verbatim port of vdbeapi.c:1964; aVar[] entries moved via
+            sqlite3VdbeMemMove with same-db / matching-nVar asserts.
        [X] `sqlite3VdbeResetStepResult` — real body in vdbe.pas:3493
             (resets `p^.rc`).  The codegen.pas:25449 duplicate that
             also clears `pc:=-1` is dead.

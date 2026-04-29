@@ -25574,9 +25574,22 @@ begin
   db^.iSysErrno := rc;
 end;
 
+{ sqlite3TransferBindings — port of vdbeapi.c:1964.  Move every aVar[]
+  Mem from the source statement to the destination using
+  sqlite3VdbeMemMove (transfers ownership; source slot becomes MEM_Null).
+  Both statements must belong to the same connection and share nVar. }
 function sqlite3TransferBindings(pFromStmt: Pointer; pToStmt: Pointer): i32;
+var
+  pFrom, pTo: PVdbe;
+  i: i32;
 begin
-  Result := SQLITE_OK; { Phase 7 }
+  pFrom := PVdbe(pFromStmt);
+  pTo   := PVdbe(pToStmt);
+  Assert(pTo^.db = pFrom^.db,    'Transfer across different connections');
+  Assert(pTo^.nVar = pFrom^.nVar,'Transfer with mismatched nVar');
+  for i := 0 to pFrom^.nVar - 1 do
+    sqlite3VdbeMemMove(@pTo^.aVar[i], @pFrom^.aVar[i]);
+  Result := SQLITE_OK;
 end;
 
 { sqlite3BtreeEnterAll — port of btmutex.c:280..288 (single-threaded /
