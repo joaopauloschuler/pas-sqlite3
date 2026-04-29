@@ -22205,16 +22205,123 @@ begin
   pParse^.iSelfTab := 0;
 end;
 
-{ sqlite3AutoincrementBegin — emit AUTOINCREMENT init code (Phase 6.4 stub) }
+{ AUTOINCREMENT codegen — port of insert.c:385..573.
+  Three primitives:
+    autoIncBegin              — locate/create AutoincInfo for pTab.
+    sqlite3AutoincrementBegin — emit prologue that loads max ROWID into regCtr.
+    sqlite3AutoincrementEnd   — emit epilogue that writes the new max back to
+                                sqlite_sequence.
+  Dead-code today: TF_Autoincrement is set during CREATE TABLE parse, but
+  pSchema^.pSeqTab is never pinned (build.c:2935 sqlite_sequence creation
+  block at codegen.pas:24578 still elided), so autoIncBegin returns 0 and
+  the prologue/epilogue lists stay empty.  Activation lands when that
+  block + sqlite3GenerateConstraintChecks come online. }
+
+const
+  autoInc_OpCount = 12;
+  autoInc_aOp: array[0..autoInc_OpCount-1] of TVdbeOpList = (
+    { 0  }(opcode: OP_Null;    p1: 0; p2:  0; p3: 0),
+    { 1  }(opcode: OP_Rewind;  p1: 0; p2: 10; p3: 0),
+    { 2  }(opcode: OP_Column;  p1: 0; p2:  0; p3: 0),
+    { 3  }(opcode: OP_Ne;      p1: 0; p2:  9; p3: 0),
+    { 4  }(opcode: OP_Rowid;   p1: 0; p2:  0; p3: 0),
+    { 5  }(opcode: OP_Column;  p1: 0; p2:  1; p3: 0),
+    { 6  }(opcode: OP_AddImm;  p1: 0; p2:  0; p3: 0),
+    { 7  }(opcode: OP_Copy;    p1: 0; p2:  0; p3: 0),
+    { 8  }(opcode: OP_Goto;    p1: 0; p2: 11; p3: 0),
+    { 9  }(opcode: OP_Next;    p1: 0; p2:  2; p3: 0),
+    { 10 }(opcode: OP_Integer; p1: 0; p2:  0; p3: 0),
+    { 11 }(opcode: OP_Close;   p1: 0; p2:  0; p3: 0)
+  );
+
+  autoIncEnd_OpCount = 5;
+  autoIncEnd_aOp: array[0..autoIncEnd_OpCount-1] of TVdbeOpList = (
+    { 0 }(opcode: OP_NotNull;    p1: 0; p2: 2; p3: 0),
+    { 1 }(opcode: OP_NewRowid;   p1: 0; p2: 0; p3: 0),
+    { 2 }(opcode: OP_MakeRecord; p1: 0; p2: 2; p3: 0),
+    { 3 }(opcode: OP_Insert;     p1: 0; p2: 0; p3: 0),
+    { 4 }(opcode: OP_Close;      p1: 0; p2: 0; p3: 0)
+  );
+
 procedure sqlite3AutoincrementBegin(pParse: PParse);
+var
+  p:       PAutoincInfo;
+  db:      PTsqlite3;
+  pDb:     passqlite3util.PDb;
+  memId:   i32;
+  v:       PVdbe;
+  aOp:     PVdbeOp;
+  pSeqTab: PTable2;
 begin
-  { Phase 6.5 }
+  db := pParse^.db;
+  v  := pParse^.pVdbe;
+  if v = nil then Exit;
+  p := pParse^.pAinc;
+  while p <> nil do begin
+    pDb := @db^.aDb[p^.iDb];
+    memId := p^.regCtr;
+    pSeqTab := PTable2(pDb^.pSchema^.pSeqTab);
+    sqlite3OpenTable(pParse, 0, p^.iDb, pSeqTab, OP_OpenRead);
+    sqlite3VdbeLoadString(v, memId - 1, p^.pTab^.zName);
+    aOp := sqlite3VdbeAddOpList(v, autoInc_OpCount, @autoInc_aOp[0], 0);
+    if aOp = nil then Break;
+    aOp[0].p2 := memId;
+    aOp[0].p3 := memId + 2;
+    aOp[2].p3 := memId;
+    aOp[3].p1 := memId - 1;
+    aOp[3].p3 := memId;
+    aOp[3].p5 := SQLITE_JUMPIFNULL;
+    aOp[4].p2 := memId + 1;
+    aOp[5].p3 := memId;
+    aOp[6].p1 := memId;
+    aOp[7].p2 := memId + 2;
+    aOp[7].p1 := memId;
+    aOp[10].p2 := memId;
+    if pParse^.nTab = 0 then pParse^.nTab := 1;
+    p := p^.pNext;
+  end;
 end;
 
-{ sqlite3AutoincrementEnd — emit AUTOINCREMENT finalisation code (Phase 6.4 stub) }
+procedure autoIncrementEnd(pParse: PParse);
+var
+  p:       PAutoincInfo;
+  v:       PVdbe;
+  db:      PTsqlite3;
+  pDb:     passqlite3util.PDb;
+  aOp:     PVdbeOp;
+  iRec:    i32;
+  memId:   i32;
+  pSeqTab: PTable2;
+begin
+  db := pParse^.db;
+  v  := pParse^.pVdbe;
+  p := pParse^.pAinc;
+  while p <> nil do begin
+    pDb := @db^.aDb[p^.iDb];
+    memId := p^.regCtr;
+    iRec := sqlite3GetTempReg(pParse);
+    pSeqTab := PTable2(pDb^.pSchema^.pSeqTab);
+    sqlite3VdbeAddOp3(v, OP_Le, memId + 2,
+                      sqlite3VdbeCurrentAddr(v) + 7, memId);
+    sqlite3OpenTable(pParse, 0, p^.iDb, pSeqTab, OP_OpenWrite);
+    aOp := sqlite3VdbeAddOpList(v, autoIncEnd_OpCount,
+                                @autoIncEnd_aOp[0], 0);
+    if aOp = nil then Break;
+    aOp[0].p1 := memId + 1;
+    aOp[1].p2 := memId + 1;
+    aOp[2].p1 := memId - 1;
+    aOp[2].p3 := iRec;
+    aOp[3].p2 := iRec;
+    aOp[3].p3 := memId + 1;
+    aOp[3].p5 := OPFLAG_APPEND;
+    sqlite3ReleaseTempReg(pParse, iRec);
+    p := p^.pNext;
+  end;
+end;
+
 procedure sqlite3AutoincrementEnd(pParse: PParse);
 begin
-  { Phase 6.5 }
+  if pParse^.pAinc <> nil then autoIncrementEnd(pParse);
 end;
 
 { sqlite3MultiValuesEnd — port of insert.c:588.  Wraps up the co-routine
@@ -22518,14 +22625,58 @@ insert_cleanup:
   if aRegIdx <> nil then sqlite3DbNNFreeNN(db, aRegIdx);
 end;
 
-{ autoIncBegin — port of insert.c:159 (Phase 6.x stub).
-  C reference returns regAutoinc (memcell holding the AUTOINCREMENT counter)
-  for AUTOINCREMENT tables, 0 otherwise.  Until autoincrement codegen lands,
-  this returns 0 unconditionally — schema-row INSERTs produced by
-  sqlite3NestedParse never target AUTOINCREMENT tables. }
+{ autoIncBegin — port of insert.c:409.
+  Locate or create an AutoincInfo for pTab in database iDb.  Returns the
+  register number that holds the running max ROWID, or 0 when pTab is not
+  AUTOINCREMENT (or while VACUUMing).  Allocates four consecutive registers
+  on the toplevel Parse: name, regCtr (max ROWID), seq-rowid, original max. }
 function autoIncBegin(pParse: PParse; iDb: i32; pTab: PTable2): i32;
+var
+  memId:     i32;
+  pToplevel: PParse;
+  pInfo:     PAutoincInfo;
+  pSeqTab:   PTable2;
+  db:        PTsqlite3;
 begin
-  Result := 0;
+  memId := 0;
+  db := pParse^.db;
+  if ((pTab^.tabFlags and TF_Autoincrement) <> 0)
+     and ((db^.mDbFlags and u32(DBFLAG_Vacuum)) = 0) then
+  begin
+    pToplevel := sqlite3ParseToplevel(pParse);
+    pSeqTab := PTable2(db^.aDb[iDb].pSchema^.pSeqTab);
+    { Verify sqlite_sequence is a 2-column rowid table.  Virtual-table arm
+      of NEVER(IsVirtual(pSeqTab)) inlined as eTabType = TABTYP_VTAB. }
+    if (pSeqTab = nil)
+       or (not HasRowid(pSeqTab))
+       or (pSeqTab^.eTabType = TABTYP_VTAB)
+       or (pSeqTab^.nCol <> 2) then
+    begin
+      Inc(pParse^.nErr);
+      pParse^.rc := SQLITE_CORRUPT_SEQUENCE;
+      Result := 0;
+      Exit;
+    end;
+
+    pInfo := pToplevel^.pAinc;
+    while (pInfo <> nil) and (pInfo^.pTab <> pTab) do pInfo := pInfo^.pNext;
+    if pInfo = nil then begin
+      pInfo := PAutoincInfo(sqlite3DbMallocRawNN(db, SizeOf(TAutoincInfo)));
+      sqlite3ParserAddCleanup(pToplevel,
+        TParseCleanupFn(@sqlite3DbFree), pInfo);
+      if db^.mallocFailed <> 0 then begin Result := 0; Exit; end;
+      pInfo^.pNext := pToplevel^.pAinc;
+      pToplevel^.pAinc := pInfo;
+      pInfo^.pTab := pTab;
+      pInfo^.iDb  := iDb;
+      Inc(pToplevel^.nMem);             { register for the table name }
+      Inc(pToplevel^.nMem);             { regCtr — max ROWID }
+      pInfo^.regCtr := pToplevel^.nMem;
+      Inc(pToplevel^.nMem, 2);          { rowid in seq + original max }
+    end;
+    memId := pInfo^.regCtr;
+  end;
+  Result := memId;
 end;
 
 { Walker callback for sqlite3ExprReferencesUpdatedColumn — port of

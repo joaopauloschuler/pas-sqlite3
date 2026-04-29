@@ -406,10 +406,15 @@ Important: At the end of this document, please find:
   [ ] **6.24** port codegen.pas DML / insert stubs in full from C to pascal:
        [ ] `sqlite3UpsertAnalyzeTarget`
        [ ] `sqlite3UpsertDoUpdate`,
-       [ ] `sqlite3AutoincrementBegin`
-       [ ] `sqlite3AutoincrementEnd`,
+       [X] `sqlite3AutoincrementBegin` — ported 2026-04-29 (insert.c:460).
+       [X] `sqlite3AutoincrementEnd` + `autoIncrementEnd` — ported 2026-04-29
+            (insert.c:534/571).  Both lists (autoInc[12], autoIncEnd[5])
+            transcribed verbatim with VdbeOpList encoding.
        [ ] `sqlite3MultiValues`
-       [ ] `autoIncBegin`,
+       [X] `autoIncBegin` — ported 2026-04-29 (insert.c:409).  Allocates
+            AutoincInfo + reserves four registers on toplevel Parse.
+            Dead-code until pSchema^.pSeqTab is pinned at CREATE TABLE
+            time (codegen.pas:24578 still elided).
        [ ] `sqlite3GenerateConstraintChecks`.
        [X] `sqlite3MultiValuesEnd` — ported 2026-04-29.
        [X] `sqlite3ComputeGeneratedColumns` — ported 2026-04-29 (dead-code
