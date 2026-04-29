@@ -508,6 +508,12 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             is now a faithful port of vdbetrace.c:72 (host-parameter
             substitution via the parser tokenizer + sqlite3_str_appendf);
             TestPublicApi tightened to verify '?1 → 41' substitution.
+       [X] `sqlite3_db_filename` (main.c:4985) + `sqlite3BtreeGetFilename`
+            (btree.c:11284) — ported 2026-04-29.  Side-fix:
+            `sqlite3PagerFilename(pPager, 1)` now mirrors C by returning a
+            static empty string (not NULL) for memdb / temp pagers, so
+            `sqlite3_db_filename(db,'main')` on `:memory:` returns `""` (C
+            parity).  DiagPubApi extended with 4 new asserts (main/nil/bogus).
 
 - [ ] **8.2.1** Statement-introspection gaps (vdbeapi.c):
        [X] `sqlite3_stmt_busy` — ported 2026-04-28.

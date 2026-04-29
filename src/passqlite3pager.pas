@@ -378,7 +378,7 @@ function  sqlite3PagerMaxPageCount(pPager: PPager; mxPage: Pgno): Pgno;
 function  sqlite3PagerIsreadonly(pPager: PPager): u8;
 function  sqlite3PagerDataVersion(pPager: PPager): u32;
 function  sqlite3PagerIsMemdb(pPager: PPager): i32;
-function  sqlite3PagerFilename(pPager: PPager; nullIfTemp: i32): PChar;
+function  sqlite3PagerFilename(pPager: PPager; nullIfMemDb: i32): PChar;
 function  sqlite3PagerVfs(pPager: PPager): Psqlite3_vfs;
 function  sqlite3PagerFile(pPager: PPager): Psqlite3_file;
 function  sqlite3PagerJrnlFile(pPager: PPager): Psqlite3_file;
@@ -2784,10 +2784,15 @@ begin
   if pPager^.memDb <> 0 then Result := 1 else Result := 0;
 end;
 
-function sqlite3PagerFilename(pPager: PPager; nullIfTemp: i32): PChar;
+{ pager.c:7088 — sqlite3PagerFilename.  When nullIfMemDb is set, memory
+  / temp dbs report a static empty string (NOT NULL); callers such as
+  sqlite3_db_filename use that empty-string convention to distinguish
+  "no schema" (NULL) from "memory schema" (""). }
+function sqlite3PagerFilename(pPager: PPager; nullIfMemDb: i32): PChar;
+const zFake: array[0..0] of AnsiChar = (#0);
 begin
-  if (nullIfTemp <> 0) and (pPager^.tempFile <> 0) then
-    Result := nil
+  if (nullIfMemDb <> 0) and (pPager^.tempFile <> 0) then
+    Result := PChar(@zFake[0])
   else
     Result := pPager^.zFilename;
 end;

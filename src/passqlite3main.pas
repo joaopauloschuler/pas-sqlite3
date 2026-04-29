@@ -383,6 +383,7 @@ function sqlite3_system_errno(db: PTsqlite3): i32; cdecl;
 
 function sqlite3_get_autocommit(db: PTsqlite3): i32; cdecl;
 function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;
+function sqlite3_db_filename(db: PTsqlite3; zDbName: PAnsiChar): PAnsiChar; cdecl;
 function sqlite3_db_release_memory(db: PTsqlite3): i32; cdecl;
 function sqlite3_db_cacheflush(db: PTsqlite3): i32; cdecl;
 function sqlite3_db_status(db: PTsqlite3; op: i32; pCurrent, pHighwtr: Pi32;
@@ -3238,6 +3239,19 @@ begin
   pBt := db^.aDb[iDb].pBt;
   if pBt = nil then begin Result := -1; Exit; end;
   Result := sqlite3BtreeIsReadonly(PBtree(pBt));
+end;
+
+{ main.c:4985 — sqlite3_db_filename.  Return the full pathname of the
+  database file backing zDbName ("main"/"temp"/attached), or NULL if no
+  such schema is attached.  Temp / in-memory dbs report ''. }
+function sqlite3DbNameToBtree(db: PTsqlite3; zDbName: PAnsiChar): PBtree; forward;
+function sqlite3_db_filename(db: PTsqlite3; zDbName: PAnsiChar): PAnsiChar; cdecl;
+var pBt: PBtree;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := nil; Exit; end;
+  pBt := sqlite3DbNameToBtree(db, zDbName);
+  if pBt = nil then Result := nil
+  else            Result := sqlite3BtreeGetFilename(pBt);
 end;
 
 { main.c:897 — sqlite3_db_release_memory.  Free as much memory as we can

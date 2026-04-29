@@ -472,6 +472,7 @@ function  sqlite3BtreeIntegerKey(pCur: PBtCursor): i64;
 function  sqlite3BtreePayloadSize(pCur: PBtCursor): u32;
 function  sqlite3BtreeOffset(pCur: PBtCursor): i64;
 function  sqlite3BtreeIsReadonly(p: PBtree): i32;
+function  sqlite3BtreeGetFilename(p: PBtree): PAnsiChar;
 function  sqlite3BtreeCheckpoint(p: PBtree; eMode: i32;
                                  pnLog, pnCkpt: PcInt): i32;
 
@@ -6123,6 +6124,15 @@ end;
 function sqlite3BtreePager(p: PBtree): PPager;
 begin
   Result := p^.pBt^.pPager;
+end;
+
+{ btree.c:11284 — sqlite3BtreeGetFilename.  Return the full pathname of
+  the underlying database file.  nullIfTemp=1 mirrors C: temp/in-memory
+  files report the empty string. }
+function sqlite3BtreeGetFilename(p: PBtree): PAnsiChar;
+begin
+  Assert(p^.pBt^.pPager <> nil);
+  Result := PAnsiChar(sqlite3PagerFilename(p^.pBt^.pPager, 1));
 end;
 
 { ===========================================================================
