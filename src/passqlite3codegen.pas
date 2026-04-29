@@ -25846,7 +25846,7 @@ const
     flag bits).  Read arm emits ((db.flags & mask) <> 0); write arm
     sets/clears the bit at codegen time so a subsequent prepare picks up
     the new value. }
-  cFlagPragmas: array[0..13] of TFlagPragma = (
+  cFlagPragmas: array[0..16] of TFlagPragma = (
     (name: 'foreign_keys';             mask: SQLITE_ForeignKeys),
     (name: 'recursive_triggers';       mask: SQLITE_RecTriggers),
     (name: 'reverse_unordered_selects';mask: SQLITE_ReverseOrder),
@@ -25860,7 +25860,10 @@ const
     (name: 'checkpoint_fullfsync';     mask: SQLITE_CkptFullFSync),
     (name: 'fullfsync';                mask: SQLITE_FullFSync),
     (name: 'ignore_check_constraints'; mask: SQLITE_IgnoreChecks),
-    (name: 'query_only';               mask: SQLITE_QueryOnly)
+    (name: 'query_only';               mask: SQLITE_QueryOnly),
+    (name: 'count_changes';            mask: SQLITE_CountRows),
+    (name: 'read_uncommitted';         mask: SQLITE_ReadUncommit),
+    (name: 'empty_result_callbacks';   mask: SQLITE_NullCallback)
   );
   cFlagPragmasTrusted: TFlagPragma =
     (name: 'trusted_schema'; mask: SQLITE_TrustedSchema);
