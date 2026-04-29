@@ -406,21 +406,12 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 (`sqlite3_int64`, `sqlite3_uint64`, opaque struct names) are excluded.
 
 - [ ] **8.2.1** Statement-introspection gaps (vdbeapi.c):
-       [X] `sqlite3_stmt_busy` — ported 2026-04-28.
-       [X] `sqlite3_column_name16` / `sqlite3_column_decltype` /
-            `sqlite3_column_decltype16` / `sqlite3_column_text16` —
-            ported 2026-04-29 via shared `columnName(p,N,useUtf16,useType)`
-            helper (vdbeapi.c:1492 / :1431).  Note: the DECLTYPE slot is
-            still nil until codegen ports `generateColumnTypes`
-            (select.c:2070); API surface is plumbed and returns nil
-            rather than crashing.
        [ ] `sqlite3_stmt_scanstatus` / `_scanstatus_v2` /
             `_scanstatus_reset` — gated on the 6.8
             `sqlite3VdbeScanStatus*` arms landing first.
 
 - [ ] **8.4.1** Hooks / control / change-counter / errors / limits
        (main.c, status.c):
-       [X] `sqlite3_progress_handler` — ported 2026-04-28.
        [ ] `sqlite3_test_control` — testing back-door (subset).
 
 - [ ] **8.8.1** Pre-update hook (preupdate.c — `SQLITE_ENABLE_PREUPDATE_HOOK`):
