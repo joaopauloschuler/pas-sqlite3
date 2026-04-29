@@ -369,6 +369,11 @@ Important: At the end of this document, please find:
        [X] `sqlite3_blob_open` / `sqlite3_blob_reopen` — ported 2026-04-29.
        [X] `OP_FilterAdd` / `OP_Filter` — ported 2026-04-29.
        [X] `sqlite3VdbeList` — ported 2026-04-29.
+       [X] `OP_SqlExec` — ported 2026-04-29 (vdbe.c:7064).  Wired via
+            new `vdbeSqlExec` hook (same uses-cycle workaround as
+            `vdbeParseSchemaExec`); main.pas trampolines into
+            `sqlite3_exec`.  Honours pOp.p1 bits 0x01 (suppress
+            xAuth+mTrace) and 0x02 (override nAnalysisLimit).
   [ ] **6.22** port codegen.pas rename / error-offset stubs in full from C
        to pascal:
        [ ] `sqlite3RenameExprUnmap`, `sqlite3RenameTokenMap` — only

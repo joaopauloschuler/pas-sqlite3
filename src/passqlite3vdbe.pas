@@ -1707,6 +1707,17 @@ type
 var
   vdbeParseSchemaExec: TVdbeParseSchemaExec = nil;
 
+{ OP_SqlExec hook (vdbe.c:7064 → main.c sqlite3_exec).  Same uses-cycle
+  rationale as vdbeParseSchemaExec above; main.pas installs the pointer at
+  unit init.  Signature mirrors the productive subset of sqlite3_exec used
+  by OP_SqlExec — no callback, no callback context, just a plain SQL
+  string and an output zErrMsg slot. }
+type
+  TVdbeSqlExec = function(db: PTsqlite3; zSql: PAnsiChar;
+                          pzErrMsg: PPAnsiChar): i32;
+var
+  vdbeSqlExec: TVdbeSqlExec = nil;
+
 { --- vdbe.c Phase 5.4b helpers (exported for testing) --- }
 function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
 
@@ -6507,6 +6518,11 @@ var
   pRhsV:       PValueList;              { OP_VInitIn: ValueList object }
   pNameMem:    PMem;                    { OP_VRename: name register }
   pVCurNew:    passqlite3vtab.PSqlite3VtabCursor;  { OP_VOpen: xOpen out param }
+  { OP_SqlExec locals (vdbe.c:7064) }
+  sqlExecErr:                 PAnsiChar;
+  sqlExecXAuth:               Pointer;
+  sqlExecMTrace:              u8;
+  sqlExecSavedAnalysisLimit:  i32;
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -9311,9 +9327,34 @@ begin
       pOut^.u.i := 0;
     end;
 
-    { ────── OP_SqlExec ────── (vdbe.c:7064) — stub }
+    { ────── OP_SqlExec ────── (vdbe.c:7064) }
     OP_SqlExec: begin
-      { Stub: requires sqlite3_exec which needs Phase 6 }
+      sqlite3VdbeIncrWriteCounter(v, nil);
+      Inc(db^.nSqlExec);
+      sqlExecErr := nil;
+      sqlExecXAuth := db^.xAuth;
+      sqlExecMTrace := db^.mTrace;
+      sqlExecSavedAnalysisLimit := db^.nAnalysisLimit;
+      if (pOp^.p1 and $0001) <> 0 then begin
+        db^.xAuth := nil;
+        db^.mTrace := 0;
+      end;
+      if (pOp^.p1 and $0002) <> 0 then
+        db^.nAnalysisLimit := pOp^.p2;
+      if vdbeSqlExec <> nil then
+        rc := vdbeSqlExec(db, pOp^.p4.z, @sqlExecErr)
+      else
+        rc := SQLITE_OK;
+      Dec(db^.nSqlExec);
+      db^.xAuth := sqlExecXAuth;
+      db^.mTrace := sqlExecMTrace;
+      db^.nAnalysisLimit := sqlExecSavedAnalysisLimit;
+      if (sqlExecErr <> nil) or (rc <> SQLITE_OK) then begin
+        sqlite3VdbeError(v, sqlExecErr);
+        sqlite3_free(sqlExecErr);
+        if rc = SQLITE_NOMEM then goto no_mem;
+        goto abort_due_to_error;
+      end;
     end;
 
     { ────── OP_IntegrityCk ────── — stub }

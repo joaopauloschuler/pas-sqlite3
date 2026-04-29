@@ -4016,8 +4016,17 @@ begin
   Result := pOut;
 end;
 
+{ OP_SqlExec hook (vdbe.c:7064).  Trampoline that adapts sqlite3_exec to
+  the PVdbeSqlExec hook signature (no callback / no pArg). }
+function execSqlExecImpl(db: PTsqlite3; zSql: PAnsiChar;
+                         pzErrMsg: PPAnsiChar): i32;
+begin
+  Result := sqlite3_exec(db, zSql, nil, nil, pzErrMsg);
+end;
+
 initialization
   vdbeParseSchemaExec := @execParseSchemaImpl;
+  vdbeSqlExec := @execSqlExecImpl;
 
   { Phase 5.8: wire the parser tokenizer into vdbetrace's ExpandSql so
     bound-parameter scanning works.  Done here (not in passqlite3parser)
