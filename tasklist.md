@@ -434,6 +434,37 @@ Important: At the end of this document, please find:
            parseDateOrTime AtoF arm).  Lifts time()/datetime()/
            strftime() for numeric JD too.
 
+  [ ] **6.10 step 26** DiagIndexing probe (added 2026-04-29,
+      `src/tests/DiagIndexing.pas`).  44 cases, 15 DIVERGE — surfaced new
+      silent bugs not previously captured.  Run with
+      `LD_LIBRARY_PATH=$PWD/src bin/DiagIndexing`.
+      [ ] **a) `CREATE INDEX <name> ON t(col)` runtime SQL_LOGIC_ERROR.**
+        Prepare succeeds (rc=0); step returns rc=1 / "SQL logic error".
+        Side effect: any subsequent statements in the same `sqlite3_exec`
+        seed batch are silently skipped (this is *the* root cause of
+        `schema after create idx`, `select via idx`, `select range via
+        idx`, `indexed by ok`, `not indexed`, `rowid select`, `rowid
+        alias custom`, `drop idx then list` all reporting empty result
+        sets — the seed INSERTs never executed).  TestWhereCorpus header
+        comment notes "CREATE INDEX still flakes through sqlite3_exec
+        under the current 11g.2.e codegen" but no tasklist.md item
+        tracked it.  Likely `sqlite3CreateIndex` codegen tail emits an
+        OP_ParseSchema / OP_SqliteRewind that hits a stub.
+      [ ] **b) Partial index `CREATE INDEX ... ON t(a) WHERE b='y'`.**
+        Pas: prep=0 step=1.  Likely cascade of (a) — partial-index
+        WHERE-clause arm of sqlite3CreateIndex.
+      [ ] **c) Expression index `CREATE INDEX ... ON t(a*2)`.**
+        Same as (b) — expression-index arm of sqlite3CreateIndex.
+      [ ] **d) Affinity not applied at INSERT time.**
+        `INSERT INTO af(a INTEGER) VALUES('42')` stores TEXT '42'
+        instead of INTEGER 42; symmetric for TEXT/NUMERIC affinity from
+        non-matching literal type.  `sqlite3TableAffinity` (insert.c:179)
+        is fully ported at codegen.pas:21515 but never invoked — the C
+        call site is inside `sqlite3GenerateConstraintChecks`, still a
+        stub (folds into 6.9-bis 11g.2.b).  Real-world impact: typeof()
+        round-trip wrong, secondary-index key bytes differ, future
+        rowid/IPK lookups by integer fail when stored text is "42".
+
   [X] **6.10 step 25** Date/time `'now'` + strftime `%s` parity —
       closed 2026-04-29.  Gate `src/tests/DiagArith.pas` (124 cases,
       under-covered arithmetic / NULL / coercion / string / LIKE /
