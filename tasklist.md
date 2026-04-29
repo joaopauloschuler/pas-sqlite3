@@ -119,6 +119,11 @@ Important: At the end of this document, please find:
             suffix is accepted by the module's xShadowName callback
             with TF_Shadow.  Previously a no-op so shadow tables of
             iVersion>=3 modules were never marked.
+       [X] `sqlite3VtabUsesAllSchemas` — ported 2026-04-29
+            (where.c:4643).  Verify-cookies every attached db, and if
+            the toplevel parse has any bit in writeMask, also starts a
+            write transaction on every db.  Used by built-in vtabs
+            (sqlite_dbpage) that must touch every schema.
 
 ### Open Bugs
 

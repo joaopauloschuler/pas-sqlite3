@@ -2754,6 +2754,7 @@ procedure sqlite3CodeVerifyNamedSchema(pParse: PParse; zDb: PAnsiChar);
 procedure sqlite3ForceNotReadOnly(pParse: PParse);
 procedure sqlite3BeginWriteOperation(pParse: PParse;
   setStatement: i32; iDb: i32);
+procedure sqlite3VtabUsesAllSchemas(pParse: PParse);
 procedure sqlite3MultiWrite(pParse: PParse);
 procedure sqlite3MayAbort(pParse: PParse);
 function  sqlite3GetTempReg(pParse: PParse): i32;
@@ -26630,6 +26631,23 @@ end;
 procedure sqlite3MultiWrite(pParse: PParse);
 begin
   pParse^.isMultiWrite := 1;
+end;
+
+{ sqlite3VtabUsesAllSchemas — port of where.c:4643.  Used by built-in
+  virtual tables (e.g. sqlite_dbpage) that must touch every attached
+  schema: verify-cookie every db, and if the toplevel parse has any
+  bit in its writeMask, also start a write transaction on every db. }
+procedure sqlite3VtabUsesAllSchemas(pParse: PParse);
+var
+  nDb: i32;
+  i:   i32;
+begin
+  nDb := pParse^.db^.nDb;
+  for i := 0 to nDb - 1 do
+    sqlite3CodeVerifySchema(pParse, i);
+  if sqlite3DbMaskAllZero(pParse^.writeMask) = 0 then
+    for i := 0 to nDb - 1 do
+      sqlite3BeginWriteOperation(pParse, 0, i);
 end;
 
 { sqlite3MayAbort — port of build.c:5438.
