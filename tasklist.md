@@ -577,6 +577,33 @@ Important: At the end of this document, please find:
       1016/10, DiagFunctions/SumOverflow/Misc/Ops/PubApi/ErrMsg —
       no regressions.
 
+  [X] **6.10 step 24** Scalar built-in parity sweep — closed 2026-04-29.
+      New gate `src/tests/DiagScalarFunc.pas` (run with
+      `LD_LIBRARY_PATH=$PWD/src bin/DiagScalarFunc`) — ~85 cases over
+      printf %q/%Q/%w, format(), iif/nullif/coalesce, substr/substring,
+      trim/ltrim/rtrim with custom char-list, replace/instr edges,
+      hex/unhex/char/unicode, abs INT64 boundary, round precision,
+      randomblob/zeroblob, quote, LIKE/GLOB classes, json_*, date()
+      julianday arg, arithmetic edges.  Initial sweep flagged 3
+      divergences, all closed:
+        1. `unicode('')` returned 0 (INTEGER) — Pas now matches C
+           NULL-on-empty (func.c:1284 `if( z && z[0] )`).
+        2. `unhex(zHex, zIgnore)` 2-arg form was missing — registered
+           the 2-arg variant (func.c:3328) and ported the full body
+           with the `zIgnore`-codepoint allow-between-pairs arm
+           (func.c:1396..1447) plus a strContainsChar helper.
+        3. `date(2440587.5)` (Julian-Day numeric arg) returned NULL —
+           parseDateTime now falls back to sqlite3AtoF + fromJulianDay
+           when the input is a bare number (date.c:parseDateOrTime
+           AtoF arm).  Same fix lifts time()/datetime()/strftime() for
+           numeric JD inputs.
+      Regressions clean: DiagFunctions/Date/Misc/SumOverflow/PubApi/
+      PrintfFmt/FeatureProbe baselines unchanged; TestExplainParity
+      1016/10, TestVdbeAgg 11/0, TestSelectBasic 49/0, TestParser
+      45/0, TestBtreeCompat 337/0, TestDMLBasic 54/0, TestVdbeApi
+      57/0, TestWhereBasic 52/0, TestPrintf 105/0, TestAuthBuiltins
+      34/0, TestCarray 74/0, TestVdbeRecord 13/0.
+
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
         the sqlite_schema scrub now uses one-pass inline delete.

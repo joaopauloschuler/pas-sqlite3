@@ -27559,41 +27559,68 @@ begin
   sqlite3_free(zOut);
 end;
 
+{ func.c:1396 — unhex(zHex[, zIgnore]).  Returns NULL if the input
+  contains any character outside [0-9a-fA-F] (or, when zIgnore is given,
+  outside [0-9a-fA-F] ∪ codepoints(zIgnore)).  Ignored chars are not
+  permitted between the high and low nibbles of a single byte. }
+function strContainsChar(z: PAnsiChar; n: i32; ch: u32): i32;
+var
+  zEnd, p: PAnsiChar;
+  c: u32;
+begin
+  Result := 0;
+  if z = nil then Exit;
+  p := z; zEnd := z + n;
+  while p < zEnd do begin
+    c := sqlite3Utf8Read(@p);
+    if c = ch then begin Result := 1; Exit; end;
+  end;
+end;
+
 procedure unhexFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
-  pVal: PMem;
-  z: PAnsiChar;
-  zOut: Pu8;
-  n, i: i32;
-  hi, lo: i32;
+  zHex, zPass: PAnsiChar;
+  nHex, nPass: i32;
+  pBlob, p: Pu8;
+  c, d: u8;
+  ch: u32;
+  zHexCur: PAnsiChar;
 begin
-  pVal := argv^;
-  if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then begin
-    sqlite3_result_null(pCtx); Exit;
+  zPass := PAnsiChar(''); nPass := 0;
+  zHex := sqlite3_value_text(Psqlite3_value(argv^));
+  nHex := sqlite3_value_bytes(Psqlite3_value(argv^));
+  if argc = 2 then begin
+    zPass := sqlite3_value_text(Psqlite3_value((argv+1)^));
+    nPass := sqlite3_value_bytes(Psqlite3_value((argv+1)^));
   end;
-  z := sqlite3_value_text(Psqlite3_value(pVal));
-  if z = nil then begin sqlite3_result_null(pCtx); Exit; end;
-  n := sqlite3_value_bytes(Psqlite3_value(pVal));
-  if (n and 1) <> 0 then begin sqlite3_result_null(pCtx); Exit; end;
-  zOut := sqlite3_malloc(n div 2 + 1);
-  if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
-  i := 0;
-  while i < n do begin
-    hi := Ord((z + i)^);
-    lo := Ord((z + i + 1)^);
-    if (hi >= Ord('0')) and (hi <= Ord('9')) then hi := hi - Ord('0')
-    else if (hi >= Ord('A')) and (hi <= Ord('F')) then hi := hi - Ord('A') + 10
-    else if (hi >= Ord('a')) and (hi <= Ord('f')) then hi := hi - Ord('a') + 10
-    else begin sqlite3_free(zOut); sqlite3_result_null(pCtx); Exit; end;
-    if (lo >= Ord('0')) and (lo <= Ord('9')) then lo := lo - Ord('0')
-    else if (lo >= Ord('A')) and (lo <= Ord('F')) then lo := lo - Ord('A') + 10
-    else if (lo >= Ord('a')) and (lo <= Ord('f')) then lo := lo - Ord('a') + 10
-    else begin sqlite3_free(zOut); sqlite3_result_null(pCtx); Exit; end;
-    (zOut + i div 2)^ := u8(hi shl 4 or lo);
-    Inc(i, 2);
+  if (zHex = nil) or (zPass = nil) then Exit;
+  pBlob := sqlite3_malloc(nHex div 2 + 1);
+  if pBlob = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
+  p := pBlob;
+  zHexCur := zHex;
+  while True do begin
+    c := u8(zHexCur^);
+    if c = 0 then break;
+    while sqlite3Isxdigit(c) = 0 do begin
+      ch := sqlite3Utf8Read(@zHexCur);
+      if strContainsChar(zPass, nPass, ch) = 0 then begin
+        sqlite3_free(pBlob); Exit;
+      end;
+      c := u8(zHexCur^);
+      if c = 0 then begin
+        sqlite3_result_blob(pCtx, pBlob, p - pBlob, SQLITE_TRANSIENT);
+        sqlite3_free(pBlob); Exit;
+      end;
+    end;
+    Inc(zHexCur);
+    d := u8(zHexCur^);
+    if sqlite3Isxdigit(d) = 0 then begin sqlite3_free(pBlob); Exit; end;
+    Inc(zHexCur);
+    p^ := u8((sqlite3HexToInt(c) shl 4) or sqlite3HexToInt(d));
+    Inc(p);
   end;
-  sqlite3_result_blob(pCtx, zOut, n div 2, SQLITE_TRANSIENT);
-  sqlite3_free(zOut);
+  sqlite3_result_blob(pCtx, pBlob, p - pBlob, SQLITE_TRANSIENT);
+  sqlite3_free(pBlob);
 end;
 
 procedure zeroblobFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
@@ -27981,11 +28008,8 @@ var
   zTmp: PChar;
   c: u32;
 begin
-  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
-    sqlite3_result_null(pCtx); Exit;
-  end;
   zTmp := sqlite3_value_text(Psqlite3_value(argv^));
-  if zTmp = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  if (zTmp = nil) or (zTmp^ = #0) then Exit;
   pz := @zTmp;
   c := sqlite3Utf8Read(pz);
   sqlite3_result_int64(pCtx, i64(c));
@@ -28955,7 +28979,7 @@ const
   AGG_ENC  = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
 
 var
-  aBuiltinFuncs: array[0..78] of TFuncDef;
+  aBuiltinFuncs: array[0..79] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -29135,6 +29159,8 @@ begin
     Decodes Unicode escape sequences \XXXX / \uXXXX / \+XXXXXX / \UXXXXXXXX.
     Closes part of 6.10 step 12(i). }
   MakeFD(aBuiltinFuncs[78], 1, FUNC_ENC, @unistrFunc, nil, 'unistr');
+  { unhex 2-arg — func.c:3328: FUNCTION(unhex, 2, 0, 0, unhexFunc). }
+  MakeFD(aBuiltinFuncs[79], 2, FUNC_ENC, @unhexFunc, nil, 'unhex');
 end;
 
 var
@@ -29550,12 +29576,25 @@ var
     end;
     Result := True;
   end;
-var tpos: i32;
+var tpos: i32; rJD: Double;
 begin
   Result := False;
   if zStr = nil then Exit;
   s := AnsiString(zStr);
   h := 0; mn := 0; sec := 0.0;
+  { date.c:parseDateOrTime — numeric (Julian Day) fallback.  When the
+    input is a bare number, treat it as a Julian Day and decode via
+    fromJulianDay so dt.yr/mo/dy/hr/mi/s are populated for downstream
+    rendering.  Matches the C arm: `iJD = r*86400000.0 + 0.5;`. }
+  if (Length(s) > 0) and ((s[1] in ['0'..'9','+','-','.']))
+     and (sqlite3AtoF(zStr, rJD) > 0) then
+  begin
+    fromJulianDay(rJD, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+    dt.jd := rJD;
+    dt.validJD := True;
+    Result := True;
+    Exit;
+  end;
   if (Length(s) >= 5) and (s[3] = ':') then begin
     { Time-only form HH:MM... — date defaults to 2000-01-01 (date.c:269). }
     if not parseHhMmSs(1, h, mn, sec) then Exit;
