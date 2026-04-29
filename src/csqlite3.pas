@@ -75,6 +75,12 @@ function csq_libversion_number: Int32;
 function csq_sourceid: PChar;
     cdecl; external LIBSQLITE3 name 'sqlite3_sourceid';
 
+function csq_compileoption_used(zOptName: PChar): Int32;
+    cdecl; external LIBSQLITE3 name 'sqlite3_compileoption_used';
+
+function csq_compileoption_get(N: Int32): PChar;
+    cdecl; external LIBSQLITE3 name 'sqlite3_compileoption_get';
+
 // ---------------------------------------------------------------------------
 // Initialisation / shutdown
 // ---------------------------------------------------------------------------
@@ -95,6 +101,9 @@ function csq_open(zFilename: PChar; out ppDb: Pcsq_db): Int32;
 function csq_open_v2(zFilename: PChar; out ppDb: Pcsq_db;
     flags: Int32; zVfs: PChar): Int32;
     cdecl; external LIBSQLITE3 name 'sqlite3_open_v2';
+
+function csq_open16(zFilename: Pointer; out ppDb: Pcsq_db): Int32;
+    cdecl; external LIBSQLITE3 name 'sqlite3_open16';
 
 function csq_close(db: Pcsq_db): Int32;
     cdecl; external LIBSQLITE3 name 'sqlite3_close';
@@ -283,12 +292,19 @@ function csq_db_filename(db: Pcsq_db; zDbName: PChar): PChar;
 function csq_db_readonly(db: Pcsq_db; zDbName: PChar): Int32;
     cdecl; external LIBSQLITE3 name 'sqlite3_db_readonly';
 
+function csq_db_status(db: Pcsq_db; op: Int32; pCurrent, pHighwtr: PInt32;
+                       resetFlag: Int32): Int32;
+    cdecl; external LIBSQLITE3 name 'sqlite3_db_status';
+
 // ---------------------------------------------------------------------------
 // sqlite3_complete
 // ---------------------------------------------------------------------------
 
 function csq_complete(zSql: PChar): Int32;
     cdecl; external LIBSQLITE3 name 'sqlite3_complete';
+
+function csq_complete16(zSql: Pointer): Int32;
+    cdecl; external LIBSQLITE3 name 'sqlite3_complete16';
 
 // ---------------------------------------------------------------------------
 // Tracing
@@ -311,6 +327,35 @@ procedure csq_randomness(N: Int32; P: Pointer);
 
 function csq_extended_result_codes(db: Pcsq_db; onoff: Int32): Int32;
     cdecl; external LIBSQLITE3 name 'sqlite3_extended_result_codes';
+
+// ---------------------------------------------------------------------------
+// Dynamic string builder (sqlite3_str_*)
+// ---------------------------------------------------------------------------
+
+type
+  Pcsq_str = Pointer;
+
+function csq_str_new(db: Pcsq_db): Pcsq_str;
+    cdecl; external LIBSQLITE3 name 'sqlite3_str_new';
+function csq_str_finish(p: Pcsq_str): PChar;
+    cdecl; external LIBSQLITE3 name 'sqlite3_str_finish';
+procedure csq_str_reset(p: Pcsq_str);
+    cdecl; external LIBSQLITE3 name 'sqlite3_str_reset';
+{ Note: sqlite3_str_truncate / sqlite3_str_free are not exported by the
+  Debian-packaged libsqlite3 used at link time, so they are not bound
+  here.  The Pas implementations are still tested directly. }
+function csq_str_value(p: Pcsq_str): PChar;
+    cdecl; external LIBSQLITE3 name 'sqlite3_str_value';
+function csq_str_length(p: Pcsq_str): Int32;
+    cdecl; external LIBSQLITE3 name 'sqlite3_str_length';
+function csq_str_errcode(p: Pcsq_str): Int32;
+    cdecl; external LIBSQLITE3 name 'sqlite3_str_errcode';
+procedure csq_str_append(p: Pcsq_str; z: PChar; N: Int32);
+    cdecl; external LIBSQLITE3 name 'sqlite3_str_append';
+procedure csq_str_appendall(p: Pcsq_str; z: PChar);
+    cdecl; external LIBSQLITE3 name 'sqlite3_str_appendall';
+procedure csq_str_appendchar(p: Pcsq_str; N: Int32; c: AnsiChar);
+    cdecl; external LIBSQLITE3 name 'sqlite3_str_appendchar';
 
 implementation
 

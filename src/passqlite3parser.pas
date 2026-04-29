@@ -1459,12 +1459,30 @@ procedure yy_syntax_error(yypParser: PyyParser; yymajor: i32;
                           const yyminor: TToken);
 var
   pPse: PParse;
+  zMsg: PAnsiChar;
+  db: PTsqlite3;
 begin
   pPse := PParse(yypParser^.pParse);
   if pPse = nil then Exit;
-  if (yyminor.z <> nil) and (yyminor.z^ <> #0) then
-    sqlite3ErrorMsg(pPse, 'near "%T": syntax error')
-  else
+  db := pPse^.db;
+  if (yyminor.z <> nil) and (yyminor.z^ <> #0) then begin
+    { parse.c yy_syntax_error: sqlite3ErrorMsg(pParse, "near \"%T\": syntax error", &TOKEN);
+      sqlite3ErrorMsg in this codebase has no varargs overload — inline
+      sqlite3MPrintf with the token pointer + replicate the bookkeeping
+      (nErr++, rc:=SQLITE_ERROR, zErrMsg). }
+    if (db <> nil) and (db^.suppressErr <> 0) then begin
+      Inc(pPse^.nErr);
+      if pPse^.rc = SQLITE_OK then pPse^.rc := SQLITE_ERROR;
+    end else begin
+      zMsg := sqlite3MPrintf(db, 'near "%T": syntax error', [@yyminor]);
+      Inc(pPse^.nErr);
+      if pPse^.rc = SQLITE_OK then pPse^.rc := SQLITE_ERROR;
+      if zMsg <> nil then begin
+        if pPse^.zErrMsg <> nil then sqlite3DbFree(db, pPse^.zErrMsg);
+        pPse^.zErrMsg := zMsg;
+      end;
+    end;
+  end else
     sqlite3ErrorMsg(pPse, 'incomplete input');
   if yymajor = 0 then ;
 end;
@@ -1646,18 +1664,17 @@ begin
 end;
 
 { ---- sqlite3ExprAssignVarNumber (expr.c:1317) ---------------------------- }
-{ Assign a wildcard variable number.  Phase 7.2e.4 simplified port — handles }
-{ "?", "?N", and ":/@/$aaa".  Does NOT yet maintain pParse.pVList (which     }
-{ supports `sqlite3_bind_parameter_name`); de-duplication of named bind      }
-{ params is therefore disabled here — each occurrence gets a fresh slot.     }
-{ Phase 8 will replace this with the full util.c VList machinery.            }
+{ Assign a wildcard variable number.  Direct port — handles "?", "?N", and  }
+{ ":/@/$aaa", maintaining pParse.pVList for sqlite3_bind_parameter_name /    }
+{ _index lookup and de-duplicating named binds against prior occurrences.   }
 procedure sqlite3ExprAssignVarNumber(pPse: PParse; pExpr: PExpr; n: u32);
 var
-  db: PTsqlite3;
-  z:  PAnsiChar;
-  x:  i32;
-  ok: i32;
-  i:  i64;
+  db:    PTsqlite3;
+  z:     PAnsiChar;
+  x:     i32;
+  ok:    i32;
+  i:     i64;
+  doAdd: i32;
 begin
   if pExpr = nil then Exit;
   db := pPse^.db;
@@ -1666,25 +1683,38 @@ begin
   if z[1] = #0 then begin
     Inc(pPse^.nVar);
     x := pPse^.nVar;
-  end else if z[0] = '?' then begin
-    if n = 2 then begin
-      i := Ord(z[1]) - Ord('0');
-      ok := 1;
-    end else begin
-      ok := i32(Ord(sqlite3Atoi64(@z[1], i, i32(n) - 1, SQLITE_UTF8) = 0));
-    end;
-    if (ok = 0) or (i < 1) or (i > db^.aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]) then
-    begin
-      sqlite3ErrorMsg(pPse, 'variable number out of range');
-      sqlite3RecordErrorOffsetOfExpr(db, pExpr);
-      Exit;
-    end;
-    x := i32(i);
-    if x > pPse^.nVar then pPse^.nVar := x;
   end else begin
-    { ":aaa", "$aaa", "@aaa" — simplified: always allocate a new slot. }
-    Inc(pPse^.nVar);
-    x := pPse^.nVar;
+    doAdd := 0;
+    if z[0] = '?' then begin
+      if n = 2 then begin
+        i := Ord(z[1]) - Ord('0');
+        ok := 1;
+      end else begin
+        ok := i32(Ord(sqlite3Atoi64(@z[1], i, i32(n) - 1, SQLITE_UTF8) = 0));
+      end;
+      if (ok = 0) or (i < 1) or (i > db^.aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]) then
+      begin
+        sqlite3ErrorMsg(pPse, 'variable number out of range');
+        sqlite3RecordErrorOffsetOfExpr(db, pExpr);
+        Exit;
+      end;
+      x := i32(i);
+      if x > pPse^.nVar then begin
+        pPse^.nVar := x;
+        doAdd := 1;
+      end else if sqlite3VListNumToName(pPse^.pVList, x) = nil then
+        doAdd := 1;
+    end else begin
+      { ":aaa", "$aaa", "@aaa" — reuse prior slot if name seen before. }
+      x := sqlite3VListNameToNum(pPse^.pVList, z, i32(n));
+      if x = 0 then begin
+        Inc(pPse^.nVar);
+        x := pPse^.nVar;
+        doAdd := 1;
+      end;
+    end;
+    if doAdd <> 0 then
+      pPse^.pVList := sqlite3VListAdd(db, pPse^.pVList, z, i32(n), x);
   end;
   pExpr^.iColumn := i16(x);
   if x > db^.aLimit[SQLITE_LIMIT_VARIABLE_NUMBER] then begin

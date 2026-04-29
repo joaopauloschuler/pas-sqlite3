@@ -50,7 +50,9 @@ uses
   SysUtils,
   passqlite3types,
   passqlite3util,
-  passqlite3parser;
+  passqlite3parser,
+  passqlite3main,
+  csqlite3;
 
 var
   gPass: i32 = 0;
@@ -344,6 +346,51 @@ begin
 end;
 
 { =========================================================================== }
+{ T14b — sqlite3_complete16 differential vs csq_complete16                    }
+{ =========================================================================== }
+function Utf16LE(const s: AnsiString): TBytes;
+var
+  i, n: i32;
+begin
+  n := Length(s);
+  SetLength(Result, (n + 1) * 2);
+  for i := 1 to n do begin
+    Result[(i - 1) * 2] := Byte(s[i]);
+    Result[(i - 1) * 2 + 1] := 0;
+  end;
+  Result[n * 2] := 0;
+  Result[n * 2 + 1] := 0;
+end;
+
+procedure CheckCmpl16(const tag: string; const s: AnsiString);
+var
+  buf: TBytes;
+  pasR, cR: i32;
+begin
+  buf  := Utf16LE(s);
+  pasR := sqlite3_complete16(@buf[0]);
+  cR   := csq_complete16(@buf[0]);
+  Check(tag + ' parity', pasR = cR);
+end;
+
+procedure TestT14b;
+begin
+  WriteLn('T14b: sqlite3_complete16 differential');
+  CheckCmpl16('empty',      '');
+  CheckCmpl16('whitespace', '   ');
+  CheckCmpl16('no semi',    'SELECT 1');
+  CheckCmpl16('with semi',  'SELECT 1;');
+  CheckCmpl16('two stmts',  'SELECT 1; SELECT 2;');
+  CheckCmpl16('partial',    'SELECT 1; SELECT');
+  CheckCmpl16('comment',    '-- comment'#10'SELECT 1;');
+  CheckCmpl16('str w semi', 'SELECT ''a;b'';');
+  CheckCmpl16('trigger incomplete',
+    'CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; ');
+  CheckCmpl16('trigger complete',
+    'CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;');
+end;
+
+{ =========================================================================== }
 { T15 — sqlite3_complete with CREATE TRIGGER                                  }
 { =========================================================================== }
 procedure TestT15;
@@ -478,6 +525,7 @@ begin
   TestT12; WriteLn;
   TestT13; WriteLn;
   TestT14; WriteLn;
+  TestT14b; WriteLn;
   TestT15; WriteLn;
   TestT16; WriteLn;
   TestT17; WriteLn;

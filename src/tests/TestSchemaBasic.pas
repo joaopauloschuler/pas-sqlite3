@@ -112,7 +112,7 @@ end;
 
 procedure TestSizesOffsets;
 begin
-  ExpectEq(SizeOf(TDbFixer),       48, 'SizeOf(TDbFixer)=48');
+  ExpectEq(SizeOf(TDbFixer),       96, 'SizeOf(TDbFixer)=96');
   ExpectEq(SizeOf(TParseCleanup),  24, 'SizeOf(TParseCleanup)=24');
 end;
 

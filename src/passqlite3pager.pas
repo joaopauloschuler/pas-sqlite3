@@ -355,6 +355,8 @@ procedure sqlite3PagerSetBusyHandler(pPager: PPager;
 function  sqlite3PagerSetPagesize(pPager: PPager; pPageSize: Pu32;
             nReserve: i32): i32;
 procedure sqlite3PagerSetCachesize(pPager: PPager; mxPage: i32);
+function  sqlite3PagerSetSpillsize(pPager: PPager; mxPage: i32): i32;
+procedure sqlite3PagerShrink(pPager: PPager);
 procedure sqlite3PagerSetFlags(pPager: PPager; pgFlags: u32);
 function  sqlite3PagerLockingMode(pPager: PPager; eMode: i32): i32;
 
@@ -433,6 +435,25 @@ type
   TPagerBackupRestartProc = procedure(pBackupHead: Pointer);
 var
   sqlite3PagerBackupRestartFn: TPagerBackupRestartProc;
+
+{ SQLITE_DBSTATUS constants (sqlite.h.in:9194).  Public so that
+  sqlite3_db_status / sqlite3_db_status64 callers can name the verbs. }
+const
+  SQLITE_DBSTATUS_LOOKASIDE_USED      = 0;
+  SQLITE_DBSTATUS_CACHE_USED          = 1;
+  SQLITE_DBSTATUS_SCHEMA_USED         = 2;
+  SQLITE_DBSTATUS_STMT_USED           = 3;
+  SQLITE_DBSTATUS_LOOKASIDE_HIT       = 4;
+  SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE = 5;
+  SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL = 6;
+  SQLITE_DBSTATUS_CACHE_HIT           = 7;
+  SQLITE_DBSTATUS_CACHE_MISS          = 8;
+  SQLITE_DBSTATUS_CACHE_WRITE         = 9;
+  SQLITE_DBSTATUS_DEFERRED_FKS        = 10;
+  SQLITE_DBSTATUS_CACHE_USED_SHARED   = 11;
+  SQLITE_DBSTATUS_CACHE_SPILL         = 12;
+  SQLITE_DBSTATUS_TEMPBUF_SPILL       = 13;
+  SQLITE_DBSTATUS_MAX                 = 13;
 
 implementation
 
@@ -2178,6 +2199,18 @@ begin
   sqlite3PcacheSetCachesize(pPager^.pPCache, mxPage);
 end;
 
+{ pager.c:3526 — sqlite3PagerSetSpillsize. }
+function sqlite3PagerSetSpillsize(pPager: PPager; mxPage: i32): i32;
+begin
+  Result := sqlite3PcacheSetSpillsize(pPager^.pPCache, mxPage);
+end;
+
+{ pager.c:3557 — sqlite3PagerShrink. }
+procedure sqlite3PagerShrink(pPager: PPager);
+begin
+  sqlite3PcacheShrink(pPager^.pPCache);
+end;
+
 { pager.c ~3723: sqlite3PagerSetBusyHandler }
 procedure sqlite3PagerSetBusyHandler(pPager: PPager;
   xBusy: TBusyHandler; pArg: Pointer);
@@ -2789,12 +2822,6 @@ end;
 { ============================================================
   3.B.2b Implementation: rollback journaling write path
   ============================================================ }
-
-{ SQLITE_DBSTATUS constants (sqliteInt.h) }
-const
-  SQLITE_DBSTATUS_CACHE_HIT   = 7;
-  SQLITE_DBSTATUS_CACHE_MISS  = 8;
-  SQLITE_DBSTATUS_CACHE_WRITE = 9;
 
 { sqlite3Realloc: thin wrapper matching C sqlite3Realloc semantics }
 function sqlite3Realloc(p: Pointer; n: NativeUInt): Pointer;

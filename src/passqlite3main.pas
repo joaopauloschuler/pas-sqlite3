@@ -139,6 +139,9 @@ function sqlite3_prepare_v3(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
                             prepFlags: u32; ppStmt: PPointer;
                             pzTail: PPAnsiChar): i32;
 
+{ Phase 7.1.3 — re-prepare a v2 statement after schema change (prepare.c:886). }
+function sqlite3Reprepare(p: PVdbe): i32;
+
 { Phase 8.3 — registration APIs (main.c, vtab.c). }
 function sqlite3_create_function(db: PTsqlite3; zFunc: PAnsiChar;
   nArg: i32; enc: i32; pUserData: Pointer;
@@ -316,6 +319,136 @@ function sqlite3InitCallback(pInit: Pointer; argc: i32;
                              argv: PPAnsiChar;
                              NotUsed: PPAnsiChar): i32; cdecl;
 
+{ ----------------------------------------------------------------------
+  Phase 8.1.1 / 8.4.1 — informational + change-counter / interrupt /
+  errcode / autocommit / readonly / sleep / memory accessors.
+  Faithful ports of the corresponding main.c / malloc.c entry points.
+  ---------------------------------------------------------------------- }
+function sqlite3_libversion: PAnsiChar; cdecl;
+function sqlite3_libversion_number: i32; cdecl;
+function sqlite3_sourceid: PAnsiChar; cdecl;
+function sqlite3_threadsafe: i32; cdecl;
+
+{ ctime.c-equivalent compile-time option enquiry.  The Pas port keeps the
+  options table empty (matches a build with no extra ENABLE_/OMIT_ macros
+  beyond the upstream defaults the port mirrors); the API surface is
+  exposed regardless so client code that probes feature gates compiles. }
+function sqlite3CompileOptions(out pnOpt: i32): PPAnsiChar;
+function sqlite3_compileoption_used(zOptName: PAnsiChar): i32; cdecl;
+function sqlite3_compileoption_get(N: i32): PAnsiChar; cdecl;
+
+function sqlite3_last_insert_rowid(db: PTsqlite3): i64; cdecl;
+procedure sqlite3_set_last_insert_rowid(db: PTsqlite3; iRowid: i64); cdecl;
+function sqlite3_changes(db: PTsqlite3): i32; cdecl;
+function sqlite3_changes64(db: PTsqlite3): i64; cdecl;
+function sqlite3_total_changes(db: PTsqlite3): i32; cdecl;
+function sqlite3_total_changes64(db: PTsqlite3): i64; cdecl;
+
+procedure sqlite3_interrupt(db: PTsqlite3); cdecl;
+function sqlite3_is_interrupted(db: PTsqlite3): i32; cdecl;
+
+type
+  TProgressHandlerFn = function(p: Pointer): i32; cdecl;
+
+procedure sqlite3_progress_handler(db: PTsqlite3; nOps: i32;
+  xProgress: TProgressHandlerFn; pArg: Pointer); cdecl;
+
+type
+  TAutovacuumPagesFn = function(pArg: Pointer; zSchema: PAnsiChar;
+    nDbPage: u32; nFreePage: u32; nBytePerPage: u32): u32; cdecl;
+  TAutovacuumDestrFn = procedure(p: Pointer); cdecl;
+
+function sqlite3_autovacuum_pages(db: PTsqlite3; xCallback: TAutovacuumPagesFn;
+  pArg: Pointer; xDestructor: TAutovacuumDestrFn): i32; cdecl;
+
+function sqlite3_overload_function(db: PTsqlite3; zName: PAnsiChar;
+  nArg: i32): i32; cdecl;
+
+type
+  TClientDataDestrFn = procedure(p: Pointer); cdecl;
+
+function sqlite3_get_clientdata(db: PTsqlite3; zName: PAnsiChar): Pointer; cdecl;
+function sqlite3_set_clientdata(db: PTsqlite3; zName: PAnsiChar;
+  pData: Pointer; xDestructor: TClientDataDestrFn): i32; cdecl;
+
+function sqlite3_table_column_metadata(db: PTsqlite3;
+  zDbName: PAnsiChar; zTableName: PAnsiChar; zColumnName: PAnsiChar;
+  pzDataType: PPAnsiChar; pzCollSeq: PPAnsiChar;
+  pNotNull: Pi32; pPrimaryKey: Pi32; pAutoinc: Pi32): i32; cdecl;
+
+function sqlite3_errcode(db: PTsqlite3): i32; cdecl;
+function sqlite3_extended_errcode(db: PTsqlite3): i32; cdecl;
+function sqlite3_extended_result_codes(db: PTsqlite3; onoff: i32): i32; cdecl;
+function sqlite3_system_errno(db: PTsqlite3): i32; cdecl;
+
+function sqlite3_get_autocommit(db: PTsqlite3): i32; cdecl;
+function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;
+function sqlite3_db_release_memory(db: PTsqlite3): i32; cdecl;
+function sqlite3_db_cacheflush(db: PTsqlite3): i32; cdecl;
+function sqlite3_db_status(db: PTsqlite3; op: i32; pCurrent, pHighwtr: Pi32;
+                           resetFlag: i32): i32; cdecl;
+function sqlite3_db_status64(db: PTsqlite3; op: i32; pCurrent, pHighwtr: Pi64;
+                             resetFlag: i32): i32; cdecl;
+function sqlite3_file_control(db: PTsqlite3; zDbName: PAnsiChar; op: i32;
+                              pArg: Pointer): i32; cdecl;
+function sqlite3_txn_state(db: PTsqlite3; zSchema: PAnsiChar): i32; cdecl;
+function sqlite3_error_offset(db: PTsqlite3): i32; cdecl;
+function sqlite3_set_errmsg(db: PTsqlite3; errcode: i32; zMsg: PAnsiChar): i32; cdecl;
+function sqlite3_limit(db: PTsqlite3; limitId: i32; newLimit: i32): i32; cdecl;
+
+function sqlite3_complete16(zSql: Pointer): i32; cdecl;
+function sqlite3_open16(zFilename: Pointer; ppDb: PPTsqlite3): i32; cdecl;
+function sqlite3_create_collation16(db: PTsqlite3; zName: Pointer; enc: i32;
+  pCtx: Pointer; xCompare: Pointer): i32; cdecl;
+function sqlite3_collation_needed16(db: PTsqlite3; pCollNeededArg: Pointer;
+  xCollNeeded16: Pointer): i32; cdecl;
+function sqlite3_create_function16(db: PTsqlite3; zFunctionName: Pointer;
+  nArg: i32; eTextRep: i32; p: Pointer;
+  xSFunc: Pointer; xStep: Pointer; xFinal: Pointer): i32; cdecl;
+function sqlite3_prepare16(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPointer): i32; cdecl;
+function sqlite3_prepare16_v2(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPointer): i32; cdecl;
+function sqlite3_prepare16_v3(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  prepFlags: u32; ppStmt: PPointer; pzTail: PPointer): i32; cdecl;
+
+function sqlite3_stmt_busy(pStmt: Pointer): i32; cdecl;
+function sqlite3_stmt_readonly(pStmt: Pointer): i32; cdecl;
+function sqlite3_stmt_explain(pStmt: Pointer; eMode: i32): i32; cdecl;
+function sqlite3_stmt_status(pStmt: Pointer; op, resetFlag: i32): i32; cdecl;
+
+function sqlite3_sleep(ms: i32): i32; cdecl;
+
+function sqlite3_release_memory(n: i32): i32; cdecl;
+function sqlite3_memory_highwater(resetFlag: i32): i64; cdecl;
+function sqlite3_msize(p: Pointer): u64; cdecl;
+function sqlite3_soft_heap_limit64(n: i64): i64; cdecl;
+function sqlite3_hard_heap_limit64(n: i64): i64; cdecl;
+procedure sqlite3_soft_heap_limit(n: i32); cdecl;
+
+function sqlite3_enable_shared_cache(enable: i32): i32; cdecl;
+procedure sqlite3_activate_cerod(zPassPhrase: PAnsiChar); cdecl;
+function sqlite3_setlk_timeout(db: PTsqlite3; ms: i32; flags: i32): i32; cdecl;
+
+{ Phase 8.7.1 — WAL public-API entry points.  See main.c:2470..2620. }
+type
+  TWalHookFn = function(p: Pointer; db: PTsqlite3;
+    zDb: PAnsiChar; nFrame: i32): i32; cdecl;
+
+function sqlite3_wal_hook(db: PTsqlite3; xCallback: TWalHookFn;
+  pArg: Pointer): Pointer; cdecl;
+function sqlite3_wal_autocheckpoint(db: PTsqlite3; nFrame: i32): i32; cdecl;
+function sqlite3_wal_checkpoint_v2(db: PTsqlite3; zDb: PAnsiChar;
+  eMode: i32; pnLog, pnCkpt: PInt32): i32; cdecl;
+function sqlite3_wal_checkpoint(db: PTsqlite3; zDb: PAnsiChar): i32; cdecl;
+
+{ Phase 8.7.2 — sqlite3_serialize.  Real-Btree path only; the memdb branch
+  of memdb.c:750 is unreachable here because the memdb VFS is not wired in. }
+const
+  SQLITE_SERIALIZE_NOCOPY = $001;
+function sqlite3_serialize(db: PTsqlite3; zSchema: PAnsiChar;
+  piSize: Pi64; mFlags: u32): Pu8; cdecl;
+
 implementation
 
 uses
@@ -430,6 +563,8 @@ end;
   main.c:1254
   ---------------------------------------------------------------------- }
 function sqlite3Close(db: PTsqlite3; forceZombie: i32): i32;
+var
+  cdNode: PDbClientData;
 begin
   if db = nil then begin
     { R-63257-11740: NULL is a harmless no-op. }
@@ -447,6 +582,15 @@ begin
       'unable to close due to unfinalized statements or unfinished backups');
     Result := SQLITE_BUSY;
     Exit;
+  end;
+
+  { main.c:1297 — fire xDestructor on each pDbData entry, free node. }
+  while db^.pDbData <> nil do begin
+    cdNode  := db^.pDbData;
+    db^.pDbData := PDbClientData(cdNode^.pNext);
+    if Assigned(cdNode^.xDestroyData) then
+      cdNode^.xDestroyData(cdNode^.pData);
+    sqlite3_free(cdNode);
   end;
 
   db^.eOpenState := SQLITE_STATE_ZOMBIE;
@@ -536,7 +680,10 @@ begin
   db^.flags := db^.flags or
     (u64($00040) shl 32) or  { SQLITE_Comments — keep TestParser's flag bit }
     SQLITE_ShortColNames or  { LO(0x00000040) — main.c:3428 default }
-    SQLITE_AutoIndex;        { SQLITE_DEFAULT_AUTOMATIC_INDEX default-on }
+    SQLITE_AutoIndex or      { SQLITE_DEFAULT_AUTOMATIC_INDEX default-on }
+    SQLITE_CacheSpill or     { main.c:3428 default-on }
+    SQLITE_EnableTrigger or  { main.c:3428 default-on }
+    SQLITE_TrustedSchema;    { SQLITE_DEFAULT_TRUSTED_SCHEMA default-on }
 
   sqlite3HashInit(@db^.aCollSeq);
   sqlite3HashInit(@db^.aModule);
@@ -846,6 +993,39 @@ begin
               nil, ppStmt, pzTail);
 end;
 
+{ prepare.c:886 — sqlite3Reprepare.  Recompile a prepared statement after a
+  schema change so the next sqlite3_step() can transparently re-execute against
+  the new schema.  Only called for prepare_v2()/v3() statements (those that
+  retain zSql).  Returns SQLITE_OK on success, SQLITE_LOCKED if another
+  connection holds the schema lock, SQLITE_SCHEMA on any other error. }
+function sqlite3Reprepare(p: PVdbe): i32;
+var
+  rc:        i32;
+  pNew:      Pointer;
+  zSql:      PAnsiChar;
+  db:        PTsqlite3;
+  prepFlags: u8;
+begin
+  zSql := p^.zSql;
+  Assert(zSql <> nil, 'Reprepare on prepare_v2 stmt only');
+  db := p^.db;
+  prepFlags := p^.prepFlags;
+  pNew := nil;
+  rc := sqlite3LockAndPrepare(db, zSql, -1, prepFlags, p, @pNew, nil);
+  if rc <> 0 then begin
+    if rc = SQLITE_NOMEM then sqlite3OomFault(db);
+    Assert(pNew = nil, 'pNew must be nil on prepare error');
+    Result := rc;
+    Exit;
+  end;
+  Assert(pNew <> nil, 'pNew must be non-nil on prepare success');
+  sqlite3VdbeSwap(PVdbe(pNew), p);
+  sqlite3TransferBindings(pNew, Pointer(p));
+  sqlite3VdbeResetStepResult(PVdbe(pNew));
+  sqlite3VdbeFinalize(PVdbe(pNew));
+  Result := SQLITE_OK;
+end;
+
 { ----------------------------------------------------------------------
   Phase 8.3 — Registration APIs.
   Ported from main.c:1931..2230 (functions), main.c:2852..3848 (collations),
@@ -1126,8 +1306,8 @@ end;
       (Phase 8.1 already set bDisable=1, sz=0).  We record sz / nSlot
       / pBuf for future use but never actually serve allocations from
       the buffer.  If cnt <= 0 the subsystem is forcibly disabled.
-    * sqlite3_progress_handler is intentionally NOT exported (gated by
-      SQLITE_OMIT_PROGRESS_CALLBACK conventions; deferred to Phase 8.5+).
+    * sqlite3_progress_handler is exported (Phase 8.4.1).  Setter only;
+      the per-step xProgress invocation is in sqlite3VdbeExec.
     * SETLK_TIMEOUT (compile-time gated in C) is not built in.
     * Db-config flags that reference codegen state we have not yet
       wired (e.g. SQLITE_DqsDDL parser-side enforcement, SQLITE_Defensive
@@ -1551,7 +1731,11 @@ end;
   Faithful port of legacy.c (entire file) and table.c.
   ---------------------------------------------------------------------- }
 
+{ Port of main.c:2711 sqlite3_errmsg — consult db^.pErr first, fall
+  back to sqlite3ErrStr(errCode) if no per-connection message stored. }
 function sqlite3_errmsg(db: PTsqlite3): PAnsiChar;
+var
+  z: PAnsiChar;
 begin
   if db = nil then begin Result := sqlite3ErrStr(SQLITE_NOMEM); Exit; end;
   if sqlite3SafetyCheckSickOrOk(db) = 0 then begin
@@ -1560,7 +1744,12 @@ begin
   if db^.mallocFailed <> 0 then begin
     Result := sqlite3ErrStr(SQLITE_NOMEM); Exit;
   end;
-  Result := sqlite3ErrStr(db^.errCode and db^.errMask);
+  z := nil;
+  if db^.errCode <> 0 then
+    z := PAnsiChar(sqlite3_value_text(Psqlite3_value(db^.pErr)));
+  if z = nil then
+    z := sqlite3ErrStr(db^.errCode);
+  Result := z;
 end;
 
 type
@@ -2203,9 +2392,21 @@ begin
     OP_ParseSchema fires.  The %s zWhere argument is kept in the
     function signature for caller compatibility but ignored. }
   if zWhere = nil then ;  { unreferenced — see banner. }
-  zSql := sqlite3MPrintf(db,
-            'SELECT type,name,tbl_name,rootpage,sql FROM %s',
-            [LEGACY_SCHEMA_TABLE]);
+  { SCHEMA_TABLE(iDb) — temp DB (iDb=1) lives in sqlite_temp_master,
+    every other attached DB in sqlite_master.  Bootstrap installs
+    sqlite_master only in main and sqlite_temp_master only in temp,
+    so the bare name resolves unambiguously to the right btree.
+    (A qualified "<dbname>.<table>" form still trips the codegen's
+    silent-bail on qualified lookups; revisit when that gate is
+    closed.) }
+  if iDb = 1 then
+    zSql := sqlite3MPrintf(db,
+              'SELECT type,name,tbl_name,rootpage,sql FROM %s',
+              [LEGACY_TEMP_SCHEMA_TABLE])
+  else
+    zSql := sqlite3MPrintf(db,
+              'SELECT type,name,tbl_name,rootpage,sql FROM %s',
+              [LEGACY_SCHEMA_TABLE]);
   if zSql = nil then begin
     Result := SQLITE_NOMEM;
     Exit;
@@ -2239,6 +2440,1490 @@ begin
   //   rc := SQLITE_CORRUPT;
   sqlite3DbFree(db, zSql);
   Result := rc;
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 8.1.1 / 8.4.1 implementations — see interface comment.
+  ---------------------------------------------------------------------- }
+
+function sqlite3_libversion: PAnsiChar; cdecl;
+begin
+  Result := PAnsiChar(SQLITE_VERSION);
+end;
+
+function sqlite3_libversion_number: i32; cdecl;
+begin
+  Result := SQLITE_VERSION_NUMBER;
+end;
+
+function sqlite3_sourceid: PAnsiChar; cdecl;
+begin
+  Result := PAnsiChar(SQLITE_SOURCE_ID);
+end;
+
+function sqlite3_threadsafe: i32; cdecl;
+begin
+  { passqlite3util:848 sets bFullMutex=1 → SQLITE_THREADSAFE==1. }
+  Result := 1;
+end;
+
+{ ctime.c:55..808 — names of compile-time options used to build the
+  library.  The Pas port currently has no ENABLE_/OMIT_ flag plumbing
+  reachable from this entry point, so the table is empty — matches the
+  C build with no SQLITE_ENABLE_*/SQLITE_OMIT_* defines.  Verbatim port
+  of ctime.c:809..812. }
+const
+  sqlite3azCompileOpt: array[0..0] of PAnsiChar = (nil);
+
+function sqlite3CompileOptions(out pnOpt: i32): PPAnsiChar;
+begin
+  pnOpt := 0;
+  Result := @sqlite3azCompileOpt[0];
+end;
+
+{ main.c:5158 — verbatim port. }
+function sqlite3_compileoption_used(zOptName: PAnsiChar): i32; cdecl;
+var
+  i, n, nOpt: i32;
+  azOpt: PPAnsiChar;
+  zCur: PAnsiChar;
+begin
+  if zOptName = nil then begin Result := 0; Exit; end;
+  azOpt := sqlite3CompileOptions(nOpt);
+  if sqlite3_strnicmp(zOptName, PAnsiChar('SQLITE_'), 7) = 0 then
+    Inc(zOptName, 7);
+  n := sqlite3Strlen30(zOptName);
+  for i := 0 to nOpt - 1 do begin
+    zCur := azOpt[i];
+    if (zCur <> nil)
+       and (sqlite3_strnicmp(zOptName, zCur, n) = 0)
+       and (sqlite3IsIdChar(u8((zCur + n)^)) = 0)
+    then begin
+      Result := 1; Exit;
+    end;
+  end;
+  Result := 0;
+end;
+
+{ main.c:5191 — verbatim port. }
+function sqlite3_compileoption_get(N: i32): PAnsiChar; cdecl;
+var
+  nOpt: i32;
+  azOpt: PPAnsiChar;
+begin
+  azOpt := sqlite3CompileOptions(nOpt);
+  if (N >= 0) and (N < nOpt) then
+    Result := azOpt[N]
+  else
+    Result := nil;
+end;
+
+function sqlite3_last_insert_rowid(db: PTsqlite3): i64; cdecl;
+begin
+  if db = nil then begin Result := 0; Exit; end;
+  Result := db^.lastRowid;
+end;
+
+procedure sqlite3_set_last_insert_rowid(db: PTsqlite3; iRowid: i64); cdecl;
+begin
+  if db = nil then Exit;
+  sqlite3_mutex_enter(db^.mutex);
+  db^.lastRowid := iRowid;
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+function sqlite3_changes64(db: PTsqlite3): i64; cdecl;
+begin
+  if db = nil then begin Result := 0; Exit; end;
+  Result := db^.nChange;
+end;
+
+function sqlite3_changes(db: PTsqlite3): i32; cdecl;
+begin
+  Result := i32(sqlite3_changes64(db));
+end;
+
+function sqlite3_total_changes64(db: PTsqlite3): i64; cdecl;
+begin
+  if db = nil then begin Result := 0; Exit; end;
+  Result := db^.nTotalChange;
+end;
+
+function sqlite3_total_changes(db: PTsqlite3): i32; cdecl;
+begin
+  Result := i32(sqlite3_total_changes64(db));
+end;
+
+procedure sqlite3_interrupt(db: PTsqlite3); cdecl;
+begin
+  if db = nil then Exit;
+  db^.u1.isInterrupted := 1;
+end;
+
+function sqlite3_is_interrupted(db: PTsqlite3): i32; cdecl;
+begin
+  if db = nil then begin Result := 0; Exit; end;
+  if db^.u1.isInterrupted <> 0 then Result := 1 else Result := 0;
+end;
+
+{ main.c:1812 — sqlite3_progress_handler.  Sets per-connection progress
+  callback fired every nOps VDBE step opcodes.  When nOps<=0 the callback
+  is cleared.  The runtime invocation is already wired in
+  passqlite3vdbe.pas (xProgress is consulted in sqlite3VdbeExec). }
+procedure sqlite3_progress_handler(db: PTsqlite3; nOps: i32;
+  xProgress: TProgressHandlerFn; pArg: Pointer); cdecl;
+begin
+  if db = nil then Exit;
+  if nOps > 0 then begin
+    db^.xProgress    := xProgress;
+    db^.nProgressOps := u32(nOps);
+    db^.pProgressArg := pArg;
+  end else begin
+    db^.xProgress    := nil;
+    db^.nProgressOps := 0;
+    db^.pProgressArg := nil;
+  end;
+end;
+
+{ main.c:2439 — sqlite3_autovacuum_pages.  Per-connection autovacuum hook
+  invoked from the pager autovacuum path.  If a previous destructor was
+  registered, fire it for the previous pArg before installing the new
+  callback. }
+function sqlite3_autovacuum_pages(db: PTsqlite3; xCallback: TAutovacuumPagesFn;
+  pArg: Pointer; xDestructor: TAutovacuumDestrFn): i32; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    if Assigned(xDestructor) then xDestructor(pArg);
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  if Assigned(db^.xAutovacDestr) then
+    db^.xAutovacDestr(db^.pAutovacPagesArg);
+  db^.xAutovacPages    := Pointer(@xCallback);
+  db^.pAutovacPagesArg := pArg;
+  db^.xAutovacDestr    := xDestructor;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+{ main.c:2197 — sqlite3InvalidFunction.  Static helper used by
+  sqlite3_overload_function: when a virtual table claims to overload
+  a function but the runtime ends up calling the global stub directly,
+  this scalar emits the canonical "unable to use function NAME in the
+  requested context" error. }
+procedure sqlite3InvalidFunction(pCtx: Psqlite3_context; nArg: i32;
+  argv: PPsqlite3_value); cdecl;
+var
+  zName, zErr: PAnsiChar;
+begin
+  { sqlite3_mprintf is a single-fmt-arg wrapper in the Pas port (no real
+    varargs), so format the message inline rather than via "%s". }
+  zName := PAnsiChar(sqlite3_user_data(pCtx));
+  if zName <> nil then
+    zErr := PAnsiChar(sqlite3StrDup(PChar('unable to use function ' + StrPas(zName) + ' in the requested context')))
+  else
+    zErr := PAnsiChar(sqlite3StrDup(PChar('unable to use function in the requested context')));
+  sqlite3_result_error(pCtx, zErr, -1);
+  sqlite3_free(zErr);
+end;
+
+{ main.c:2223 — sqlite3_overload_function.  Declare that a function has
+  been overloaded by a virtual table.  If the function already exists as
+  a regular global function, this is a no-op.  Otherwise create a stub
+  that always errors at runtime; xFindFunction on the vtab is expected
+  to redirect lookups to the real implementation. }
+function sqlite3_overload_function(db: PTsqlite3; zName: PAnsiChar;
+  nArg: i32): i32; cdecl;
+var
+  rc:    i32;
+  zCopy: PAnsiChar;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (zName = nil) or (nArg < -2) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  if sqlite3FindFunction(db, zName, nArg, SQLITE_UTF8, 0) <> nil then
+    rc := 1
+  else
+    rc := 0;
+  sqlite3_mutex_leave(db^.mutex);
+  if rc <> 0 then begin Result := SQLITE_OK; Exit; end;
+  zCopy := PAnsiChar(sqlite3StrDup(PChar(zName)));
+  if zCopy = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  Result := sqlite3_create_function_v2(db, zName, nArg, SQLITE_UTF8,
+              zCopy, @sqlite3InvalidFunction, nil, nil, @sqlite3_free);
+end;
+
+{ main.c:4009 — sqlite3_table_column_metadata.  Return type, collation,
+  NOT NULL, PK and AUTOINCREMENT metadata for a table column.  When
+  zColumnName is nil, only existence of the table is checked.  rowid
+  aliases ("rowid", "oid", "_rowid_") resolve to the IPK column when
+  HasRowid; otherwise INTEGER + PRIMARY KEY are reported. }
+function sqlite3_table_column_metadata(db: PTsqlite3;
+  zDbName: PAnsiChar; zTableName: PAnsiChar; zColumnName: PAnsiChar;
+  pzDataType: PPAnsiChar; pzCollSeq: PPAnsiChar;
+  pNotNull: Pi32; pPrimaryKey: Pi32; pAutoinc: Pi32): i32; cdecl;
+label
+  error_out;
+var
+  rc:         i32;
+  iCol:       i32;
+  zErrMsg:    PAnsiChar;
+  pTab:       PTable2;
+  pCol:       PColumn;
+  zDataType:  PAnsiChar;
+  zCollSeq:   PAnsiChar;
+  notnull:    i32;
+  primarykey: i32;
+  autoinc:    i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (zTableName = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  rc         := SQLITE_OK;
+  zErrMsg    := nil;
+  pTab       := nil;
+  pCol       := nil;
+  iCol       := 0;
+  zDataType  := nil;
+  zCollSeq   := nil;
+  notnull    := 0;
+  primarykey := 0;
+  autoinc    := 0;
+
+  sqlite3_mutex_enter(db^.mutex);
+  sqlite3BtreeEnterAll(db);
+
+  pTab := sqlite3FindTable(db, zTableName, zDbName);
+  if (pTab = nil) or IsView(pTab) then begin
+    pTab := nil;
+    goto error_out;
+  end;
+
+  if zColumnName = nil then begin
+    { Existence check only. }
+  end else begin
+    iCol := sqlite3ColumnIndex(pTab, zColumnName);
+    if iCol >= 0 then
+      pCol := @pTab^.aCol[iCol]
+    else if HasRowid(pTab) and (sqlite3IsRowid(zColumnName) <> 0) then begin
+      iCol := pTab^.iPKey;
+      if iCol >= 0 then pCol := @pTab^.aCol[iCol] else pCol := nil;
+    end else begin
+      pTab := nil;
+      goto error_out;
+    end;
+  end;
+
+  if pCol <> nil then begin
+    zDataType  := sqlite3ColumnType(pCol, nil);
+    zCollSeq   := sqlite3ColumnColl(pCol);
+    if (pCol^.typeFlags and $0F) <> 0 then notnull := 1 else notnull := 0;
+    if (pCol^.colFlags and COLFLAG_PRIMKEY) <> 0 then primarykey := 1
+    else primarykey := 0;
+    if (pTab^.iPKey = iCol)
+       and ((pTab^.tabFlags and TF_Autoincrement) <> 0) then
+      autoinc := 1
+    else
+      autoinc := 0;
+  end else begin
+    zDataType  := 'INTEGER';
+    primarykey := 1;
+  end;
+  if zCollSeq = nil then zCollSeq := 'BINARY';
+
+error_out:
+  sqlite3BtreeLeaveAll(db);
+
+  if pzDataType  <> nil then pzDataType^  := zDataType;
+  if pzCollSeq   <> nil then pzCollSeq^   := zCollSeq;
+  if pNotNull    <> nil then pNotNull^    := notnull;
+  if pPrimaryKey <> nil then pPrimaryKey^ := primarykey;
+  if pAutoinc    <> nil then pAutoinc^    := autoinc;
+
+  if (rc = SQLITE_OK) and (pTab = nil) then begin
+    sqlite3DbFree(db, zErrMsg);
+    zErrMsg := sqlite3MPrintf(db, 'no such table column: %s.%s',
+                              [zTableName, zColumnName]);
+    rc := SQLITE_ERROR;
+  end;
+  if zErrMsg <> nil then sqlite3ErrorWithMsg(db, rc, zErrMsg)
+  else if rc <> SQLITE_OK then sqlite3ErrorWithMsg(db, rc, nil);
+  sqlite3DbFree(db, zErrMsg);
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+function sqlite3_errcode(db: PTsqlite3): i32; cdecl;
+begin
+  if (db <> nil) and (sqlite3SafetyCheckSickOrOk(db) = 0) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  if (db = nil) or (db^.mallocFailed <> 0) then begin
+    Result := SQLITE_NOMEM; Exit;
+  end;
+  Result := db^.errCode and db^.errMask;
+end;
+
+function sqlite3_extended_errcode(db: PTsqlite3): i32; cdecl;
+begin
+  if (db <> nil) and (sqlite3SafetyCheckSickOrOk(db) = 0) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  if (db = nil) or (db^.mallocFailed <> 0) then begin
+    Result := SQLITE_NOMEM; Exit;
+  end;
+  Result := db^.errCode;
+end;
+
+function sqlite3_extended_result_codes(db: PTsqlite3; onoff: i32): i32; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  if onoff <> 0 then db^.errMask := i32($FFFFFFFF) else db^.errMask := $FF;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+function sqlite3_system_errno(db: PTsqlite3): i32; cdecl;
+begin
+  if db = nil then Result := 0 else Result := db^.iSysErrno;
+end;
+
+function sqlite3_get_autocommit(db: PTsqlite3): i32; cdecl;
+begin
+  if db = nil then begin Result := 0; Exit; end;
+  Result := db^.autoCommit;
+end;
+
+{ complete.c:269 — sqlite3_complete16.  UTF-16 wrapper around sqlite3_complete:
+  wraps the input as a sqlite3_value with SQLITE_UTF16NATIVE encoding, asks
+  the value layer to transcode to UTF-8, then forwards. }
+function sqlite3_complete16(zSql: Pointer): i32; cdecl;
+var
+  pVal: Psqlite3_value;
+  zSql8: PAnsiChar;
+  rc: i32;
+begin
+  pVal := sqlite3ValueNew(nil);
+  if pVal = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  sqlite3ValueSetStr(pVal, -1, zSql, SQLITE_UTF16NATIVE, SQLITE_STATIC);
+  zSql8 := PAnsiChar(sqlite3ValueText(pVal, SQLITE_UTF8));
+  if zSql8 <> nil then
+    rc := sqlite3_complete(zSql8)
+  else
+    rc := SQLITE_NOMEM;
+  sqlite3ValueFree(pVal);
+  Result := rc and $FF;
+end;
+
+{ main.c:3706 — sqlite3_open16.  Open a new database handle from a UTF-16
+  filename.  Wraps the input as a sqlite3_value with SQLITE_UTF16NATIVE
+  encoding, transcodes to UTF-8, then forwards to openDatabase.  When the
+  open succeeds and the schema has not been loaded yet, force the
+  connection encoding (and the schema's own enc field) to UTF-16NATIVE so
+  subsequent prepares produce UTF-16 text. }
+function sqlite3_open16(zFilename: Pointer; ppDb: PPTsqlite3): i32; cdecl;
+const
+  zEmpty16: array[0..1] of Byte = (0, 0);
+var
+  pVal: Psqlite3_value;
+  zFilename8: PAnsiChar;
+  rc: i32;
+  pDb: PTsqlite3;
+begin
+  if ppDb = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  ppDb^ := nil;
+  if zFilename = nil then zFilename := @zEmpty16[0];
+  pVal := sqlite3ValueNew(nil);
+  if pVal = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  sqlite3ValueSetStr(pVal, -1, zFilename, SQLITE_UTF16NATIVE, SQLITE_STATIC);
+  zFilename8 := PAnsiChar(sqlite3ValueText(pVal, SQLITE_UTF8));
+  if zFilename8 <> nil then begin
+    rc := openDatabase(zFilename8, ppDb,
+                       SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE, nil);
+    pDb := ppDb^;
+    if (rc = SQLITE_OK) and (pDb <> nil) and (pDb^.aDb <> nil)
+       and (pDb^.aDb[0].pSchema <> nil)
+       and ((pDb^.aDb[0].pSchema^.schemaFlags and DB_SchemaLoaded) = 0) then
+    begin
+      pDb^.aDb[0].pSchema^.enc := SQLITE_UTF16NATIVE;
+      pDb^.enc := SQLITE_UTF16NATIVE;
+    end;
+  end else
+    rc := SQLITE_NOMEM;
+  sqlite3ValueFree(pVal);
+  Result := rc and $FF;
+end;
+
+{ prepare.c:983 — sqlite3Prepare16.  Transcode UTF-16 zSql to UTF-8 via a
+  sqlite3_value, forward to sqlite3LockAndPrepare, then translate the UTF-8
+  tail pointer back into a UTF-16 byte offset for *pzTail. }
+function utf16ByteLenForChars(zIn: Pointer; nByte: i32; nChar: i32): i32;
+{ Mirrors sqlite3Utf16ByteLen: count up to nChar codepoints in the UTF-16NATIVE
+  buffer zIn (length nByte; -1 = until U+0000), return their byte length. }
+var
+  p: PByte;
+  c: u32;
+  i, n: i32;
+begin
+  p := PByte(zIn);
+  i := 0;
+  n := 0;
+  while (nChar > 0) and ((nByte < 0) or (i + 1 < nByte)) do
+  begin
+    { Read one UTF-16LE code unit (Pas port is LE-only). }
+    c := u32(p[i]) or (u32(p[i + 1]) shl 8);
+    if (nByte < 0) and (c = 0) then break;
+    Inc(i, 2);
+    { High surrogate? Consume the trailing low surrogate too. }
+    if (c >= $D800) and (c < $DC00)
+       and ((nByte < 0) or (i + 1 < nByte)) then
+    begin
+      c := u32(p[i]) or (u32(p[i + 1]) shl 8);
+      if (c >= $DC00) and (c < $E000) then Inc(i, 2);
+    end;
+    Dec(nChar);
+    n := i;
+  end;
+  Result := n;
+end;
+
+function sqlite3Prepare16(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  prepFlags: u32; ppStmt: PPointer; pzTail: PPointer): i32;
+var
+  pVal: Psqlite3_value;
+  zSql8, zTail8: PAnsiChar;
+  rc: i32;
+  z: PByte;
+  sz: i32;
+  charsParsed: i32;
+begin
+  if ppStmt = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  ppStmt^ := nil;
+  if (sqlite3SafetyCheckOk(db) = 0) or (zSql = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+
+  { Find U+0000 terminator / clamp nBytes to even. }
+  z := PByte(zSql);
+  if nBytes >= 0 then begin
+    sz := 0;
+    while (sz < nBytes) and ((z[sz] <> 0) or (z[sz + 1] <> 0)) do Inc(sz, 2);
+    nBytes := sz;
+  end else begin
+    sz := 0;
+    while (z[sz] <> 0) or (z[sz + 1] <> 0) do Inc(sz, 2);
+    nBytes := sz;
+  end;
+
+  sqlite3_mutex_enter(db^.mutex);
+  zTail8 := nil;
+  pVal := sqlite3ValueNew(db);
+  if pVal = nil then begin
+    rc := SQLITE_NOMEM;
+  end else begin
+    sqlite3ValueSetStr(pVal, nBytes, zSql, SQLITE_UTF16NATIVE, SQLITE_STATIC);
+    zSql8 := PAnsiChar(sqlite3ValueText(pVal, SQLITE_UTF8));
+    if zSql8 <> nil then
+      rc := sqlite3LockAndPrepare(db, zSql8, -1, prepFlags, nil,
+                                  ppStmt, @zTail8)
+    else
+      rc := SQLITE_NOMEM;
+
+    if (zTail8 <> nil) and (pzTail <> nil) and (zSql8 <> nil) then
+    begin
+      charsParsed := sqlite3Utf8CharLen(zSql8,
+                                        i32(PtrUInt(zTail8) - PtrUInt(zSql8)));
+      pzTail^ := Pointer(PtrUInt(zSql)
+                         + PtrUInt(utf16ByteLenForChars(zSql, nBytes,
+                                                        charsParsed)));
+    end;
+    sqlite3ValueFree(pVal);
+  end;
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+function sqlite3_prepare16(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPointer): i32; cdecl;
+begin
+  Result := sqlite3Prepare16(db, zSql, nBytes, 0, ppStmt, pzTail);
+end;
+
+function sqlite3_prepare16_v2(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  ppStmt: PPointer; pzTail: PPointer): i32; cdecl;
+begin
+  Result := sqlite3Prepare16(db, zSql, nBytes, SQLITE_PREPARE_SAVESQL,
+                             ppStmt, pzTail);
+end;
+
+function sqlite3_prepare16_v3(db: PTsqlite3; zSql: Pointer; nBytes: i32;
+  prepFlags: u32; ppStmt: PPointer; pzTail: PPointer): i32; cdecl;
+begin
+  Result := sqlite3Prepare16(db, zSql, nBytes,
+              (prepFlags and SQLITE_PREPARE_MASK) or SQLITE_PREPARE_SAVESQL,
+              ppStmt, pzTail);
+end;
+
+{ main.c:3783 — sqlite3_create_collation16.  UTF-16 wrapper around
+  createCollation: transcode the name to UTF-8 via a sqlite3_value, then
+  forward.  Mirrors the !defined(SQLITE_OMIT_UTF16) arm. }
+function sqlite3_create_collation16(db: PTsqlite3; zName: Pointer; enc: i32;
+  pCtx: Pointer; xCompare: Pointer): i32; cdecl;
+var
+  pVal: Psqlite3_value;
+  zName8: PAnsiChar;
+  rc: i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (zName = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  rc := SQLITE_OK;
+  pVal := sqlite3ValueNew(db);
+  if pVal = nil then begin
+    rc := SQLITE_NOMEM;
+  end else begin
+    sqlite3ValueSetStr(pVal, -1, zName, SQLITE_UTF16NATIVE, SQLITE_STATIC);
+    zName8 := PAnsiChar(sqlite3ValueText(pVal, SQLITE_UTF8));
+    if zName8 <> nil then
+      rc := createCollation(db, zName8, u8(enc), pCtx, xCompare, nil)
+    else
+      rc := SQLITE_NOMEM;
+    sqlite3ValueFree(pVal);
+  end;
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+{ main.c:3834 — sqlite3_collation_needed16. }
+function sqlite3_collation_needed16(db: PTsqlite3; pCollNeededArg: Pointer;
+  xCollNeeded16: Pointer): i32; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  db^.xCollNeeded    := nil;
+  db^.xCollNeeded16  := xCollNeeded16;
+  db^.pCollNeededArg := pCollNeededArg;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+{ main.c:2161 — sqlite3_create_function16.  UTF-16 wrapper around
+  sqlite3CreateFunc: transcode the function name to UTF-8 via a sqlite3_value,
+  then forward through createFunctionApi. }
+function sqlite3_create_function16(db: PTsqlite3; zFunctionName: Pointer;
+  nArg: i32; eTextRep: i32; p: Pointer;
+  xSFunc: Pointer; xStep: Pointer; xFinal: Pointer): i32; cdecl;
+var
+  pVal: Psqlite3_value;
+  zFunc8: PAnsiChar;
+  rc: i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (zFunctionName = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  rc := SQLITE_OK;
+  pVal := sqlite3ValueNew(db);
+  if pVal = nil then begin
+    rc := SQLITE_NOMEM;
+  end else begin
+    sqlite3ValueSetStr(pVal, -1, zFunctionName, SQLITE_UTF16NATIVE, SQLITE_STATIC);
+    zFunc8 := PAnsiChar(sqlite3ValueText(pVal, SQLITE_UTF8));
+    if zFunc8 <> nil then
+      rc := sqlite3CreateFunc(db, zFunc8, nArg, eTextRep, p,
+              xSFunc, xStep, xFinal, nil, nil, nil)
+    else
+      rc := SQLITE_NOMEM;
+    sqlite3ValueFree(pVal);
+  end;
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+{ vdbeapi.c:2074 — sqlite3_stmt_busy. }
+function sqlite3_stmt_busy(pStmt: Pointer): i32; cdecl;
+var v: PVdbe;
+begin
+  v := PVdbe(pStmt);
+  if (v <> nil) and (v^.eVdbeState = VDBE_RUN_STATE) then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ vdbeapi.c:2106 — sqlite3_stmt_status.  Return (and optionally reset)
+  one of the per-stmt counters maintained in v^.aCounter[].  The
+  SQLITE_STMTSTATUS_MEMUSED branch reproduces the C trick of running
+  sqlite3VdbeDelete with db^.pnBytesFreed pointing at a local counter so
+  every freed allocation accumulates into v. }
+function sqlite3_stmt_status(pStmt: Pointer; op, resetFlag: i32): i32; cdecl;
+var
+  v: PVdbe;
+  db: PTsqlite3;
+  vCnt: u32;
+begin
+  if (pStmt = nil)
+     or ((op <> SQLITE_STMTSTATUS_MEMUSED)
+         and ((op < 0) or (op >= 9))) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  v := PVdbe(pStmt);
+  if op = SQLITE_STMTSTATUS_MEMUSED then
+  begin
+    db := PTsqlite3(v^.db);
+    sqlite3_mutex_enter(db^.mutex);
+    vCnt := 0;
+    db^.pnBytesFreed := Pi32(@vCnt);
+    db^.lookaside.pEnd := db^.lookaside.pStart;
+    sqlite3VdbeDelete(v);
+    db^.pnBytesFreed := nil;
+    db^.lookaside.pEnd := db^.lookaside.pTrueEnd;
+    sqlite3_mutex_leave(db^.mutex);
+  end
+  else
+  begin
+    vCnt := v^.aCounter[op];
+    if resetFlag <> 0 then
+      v^.aCounter[op] := 0;
+  end;
+  Result := i32(vCnt);
+end;
+
+{ vdbeapi.c:2038 — sqlite3_stmt_explain.  Switch a prepared statement
+  between normal / EXPLAIN / EXPLAIN QUERY PLAN modes, reprepare if
+  required, and adjust the result-column count accordingly. }
+function sqlite3_stmt_explain(pStmt: Pointer; eMode: i32): i32; cdecl;
+var
+  v: PVdbe;
+  curExplain: i32;
+begin
+  if pStmt = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  v := PVdbe(pStmt);
+  sqlite3_mutex_enter(PTsqlite3(v^.db)^.mutex);
+  curExplain := i32((v^.vdbeFlags and VDBF_EXPLAIN_MASK) shr VDBF_EXPLAIN_SHIFT);
+  if curExplain = eMode then
+    Result := SQLITE_OK
+  else if (eMode < 0) or (eMode > 2) then
+    Result := SQLITE_ERROR
+  else if (v^.prepFlags and SQLITE_PREPARE_SAVESQL) = 0 then
+    Result := SQLITE_ERROR
+  else if v^.eVdbeState <> VDBE_READY_STATE then
+    Result := SQLITE_BUSY
+  else if (v^.nMem >= 10) and ((eMode <> 2) or ((v^.vdbeFlags and VDBF_HaveEqpOps) <> 0)) then
+  begin
+    v^.vdbeFlags := (v^.vdbeFlags and (not u32(VDBF_EXPLAIN_MASK)))
+                    or (u32(eMode) shl VDBF_EXPLAIN_SHIFT);
+    Result := SQLITE_OK;
+  end
+  else begin
+    v^.vdbeFlags := (v^.vdbeFlags and (not u32(VDBF_EXPLAIN_MASK)))
+                    or (u32(eMode) shl VDBF_EXPLAIN_SHIFT);
+    Result := sqlite3Reprepare(v);
+    if eMode = 2 then
+      v^.vdbeFlags := v^.vdbeFlags or VDBF_HaveEqpOps
+    else
+      v^.vdbeFlags := v^.vdbeFlags and (not u32(VDBF_HaveEqpOps));
+  end;
+  curExplain := i32((v^.vdbeFlags and VDBF_EXPLAIN_MASK) shr VDBF_EXPLAIN_SHIFT);
+  if curExplain <> 0 then
+    v^.nResColumn := u16(12 - 4 * curExplain)
+  else
+    v^.nResColumn := v^.nResAlloc;
+  sqlite3_mutex_leave(PTsqlite3(v^.db)^.mutex);
+end;
+
+{ vdbeapi.c:2023 — sqlite3_stmt_readonly. }
+function sqlite3_stmt_readonly(pStmt: Pointer): i32; cdecl;
+begin
+  if pStmt = nil then begin Result := 1; Exit; end;
+  if (PVdbe(pStmt)^.vdbeFlags and VDBF_ReadOnly) <> 0 then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;
+var
+  iDb: i32;
+  pBt: Pointer;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := -1; Exit; end;
+  if zDbName <> nil then iDb := sqlite3FindDbName(db, zDbName) else iDb := 0;
+  if iDb < 0 then begin Result := -1; Exit; end;
+  pBt := db^.aDb[iDb].pBt;
+  if pBt = nil then begin Result := -1; Exit; end;
+  Result := sqlite3BtreeIsReadonly(PBtree(pBt));
+end;
+
+{ main.c:897 — sqlite3_db_release_memory.  Free as much memory as we can
+  from the given database connection. }
+function sqlite3_db_release_memory(db: PTsqlite3): i32; cdecl;
+var
+  i:      i32;
+  pBt:    PBtree;
+  pPgr:   Pointer;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  sqlite3BtreeEnterAll(db);
+  for i := 0 to db^.nDb - 1 do begin
+    pBt := PBtree(db^.aDb[i].pBt);
+    if pBt <> nil then begin
+      pPgr := sqlite3BtreePager(pBt);
+      sqlite3PagerShrink(pPgr);
+    end;
+  end;
+  sqlite3BtreeLeaveAll(db);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+{ main.c:921 — sqlite3_db_cacheflush.  Flush dirty pages in the pager
+  cache for any attached database that has an open write transaction. }
+function sqlite3_db_cacheflush(db: PTsqlite3): i32; cdecl;
+var
+  i, rc, bSeenBusy: i32;
+  pBt:    PBtree;
+  pPgr:   Pointer;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  rc        := SQLITE_OK;
+  bSeenBusy := 0;
+  sqlite3_mutex_enter(db^.mutex);
+  sqlite3BtreeEnterAll(db);
+  i := 0;
+  while (rc = SQLITE_OK) and (i < db^.nDb) do begin
+    pBt := PBtree(db^.aDb[i].pBt);
+    if (pBt <> nil) and (sqlite3BtreeTxnState(pBt) = SQLITE_TXN_WRITE) then begin
+      pPgr := sqlite3BtreePager(pBt);
+      rc := sqlite3PagerFlush(pPgr);
+      if rc = SQLITE_BUSY then begin
+        bSeenBusy := 1;
+        rc := SQLITE_OK;
+      end;
+    end;
+    Inc(i);
+  end;
+  sqlite3BtreeLeaveAll(db);
+  sqlite3_mutex_leave(db^.mutex);
+  if (rc = SQLITE_OK) and (bSeenBusy <> 0) then
+    Result := SQLITE_BUSY
+  else
+    Result := rc;
+end;
+
+{ status.c:188 — sqlite3LookasideUsed.  Count outstanding lookaside slots,
+  optionally returning the high-water mark in pHighwater. }
+function sqlite3LookasideUsed(db: PTsqlite3; pHighwater: Pi32): i32;
+  function countSlots(p: PLookasideSlot): u32;
+  var n: u32;
+  begin
+    n := 0;
+    while p <> nil do begin Inc(n); p := p^.pNext; end;
+    Result := n;
+  end;
+var
+  nInit, nFree: u32;
+begin
+  nInit := countSlots(db^.lookaside.pInit) + countSlots(db^.lookaside.pSmallInit);
+  nFree := countSlots(db^.lookaside.pFree) + countSlots(db^.lookaside.pSmallFree);
+  if pHighwater <> nil then pHighwater^ := i32(db^.lookaside.nSlot - nInit);
+  Result := i32(db^.lookaside.nSlot - (nInit + nFree));
+end;
+
+{ status.c:203 — sqlite3_db_status64.  Query per-connection status counters.
+  Verbs SCHEMA_USED and STMT_USED require the pnBytesFreed accounting plumbing
+  (drives sqlite3DbFree to count rather than free); not yet wired in this
+  port, so they fall through to SQLITE_ERROR. }
+function sqlite3_db_status64(db: PTsqlite3; op: i32; pCurrent, pHighwtr: Pi64;
+                             resetFlag: i32): i32; cdecl;
+var
+  rc: i32;
+  H:  i32;
+  p, pTail: PLookasideSlot;
+  i:  i32;
+  pBt: PBtree;
+  pPgr: PPager;
+  totalUsed: i64;
+  nByte: i32;
+  nRet: u64;
+  opLocal: i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (pCurrent = nil) or (pHighwtr = nil) then
+  begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  rc := SQLITE_OK;
+  sqlite3_mutex_enter(db^.mutex);
+  case op of
+    SQLITE_DBSTATUS_LOOKASIDE_USED:
+      begin
+        H := 0;
+        pCurrent^ := sqlite3LookasideUsed(db, @H);
+        pHighwtr^ := H;
+        if resetFlag <> 0 then
+        begin
+          { Reset HWM: append pFree at the tail of pInit, then clear pFree. }
+          p := db^.lookaside.pFree;
+          if p <> nil then
+          begin
+            pTail := p;
+            while pTail^.pNext <> nil do pTail := pTail^.pNext;
+            pTail^.pNext := db^.lookaside.pInit;
+            db^.lookaside.pInit := db^.lookaside.pFree;
+            db^.lookaside.pFree := nil;
+          end;
+          p := db^.lookaside.pSmallFree;
+          if p <> nil then
+          begin
+            pTail := p;
+            while pTail^.pNext <> nil do pTail := pTail^.pNext;
+            pTail^.pNext := db^.lookaside.pSmallInit;
+            db^.lookaside.pSmallInit := db^.lookaside.pSmallFree;
+            db^.lookaside.pSmallFree := nil;
+          end;
+        end;
+      end;
+    SQLITE_DBSTATUS_LOOKASIDE_HIT,
+    SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE,
+    SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL:
+      begin
+        pCurrent^ := 0;
+        pHighwtr^ := db^.lookaside.anStat[op - SQLITE_DBSTATUS_LOOKASIDE_HIT];
+        if resetFlag <> 0 then
+          db^.lookaside.anStat[op - SQLITE_DBSTATUS_LOOKASIDE_HIT] := 0;
+      end;
+    SQLITE_DBSTATUS_CACHE_USED, SQLITE_DBSTATUS_CACHE_USED_SHARED:
+      begin
+        totalUsed := 0;
+        sqlite3BtreeEnterAll(db);
+        for i := 0 to db^.nDb - 1 do
+        begin
+          pBt := PBtree(db^.aDb[i].pBt);
+          if pBt <> nil then
+          begin
+            pPgr := sqlite3BtreePager(pBt);
+            nByte := sqlite3PagerMemUsed(pPgr);
+            { No shared-cache in this port — connection count is always 1. }
+            totalUsed := totalUsed + nByte;
+          end;
+        end;
+        sqlite3BtreeLeaveAll(db);
+        pCurrent^ := totalUsed;
+        pHighwtr^ := 0;
+      end;
+    SQLITE_DBSTATUS_CACHE_SPILL,
+    SQLITE_DBSTATUS_CACHE_HIT,
+    SQLITE_DBSTATUS_CACHE_MISS,
+    SQLITE_DBSTATUS_CACHE_WRITE:
+      begin
+        opLocal := op;
+        if opLocal = SQLITE_DBSTATUS_CACHE_SPILL then
+          opLocal := SQLITE_DBSTATUS_CACHE_WRITE + 1;
+        nRet := 0;
+        for i := 0 to db^.nDb - 1 do
+          if db^.aDb[i].pBt <> nil then
+          begin
+            pPgr := sqlite3BtreePager(PBtree(db^.aDb[i].pBt));
+            nRet := nRet + sqlite3PagerCacheStat(pPgr, opLocal, resetFlag);
+          end;
+        pHighwtr^ := 0;
+        pCurrent^ := i64(nRet);
+      end;
+    SQLITE_DBSTATUS_TEMPBUF_SPILL:
+      begin
+        nRet := 0;
+        if (db^.nDb >= 2) and (db^.aDb[1].pBt <> nil) then
+        begin
+          pPgr := sqlite3BtreePager(PBtree(db^.aDb[1].pBt));
+          nRet := sqlite3PagerCacheStat(pPgr, SQLITE_DBSTATUS_CACHE_WRITE, resetFlag);
+          nRet := nRet * u64(sqlite3BtreeGetPageSize(PBtree(db^.aDb[1].pBt)));
+        end;
+        nRet := nRet + db^.nSpill;
+        if resetFlag <> 0 then db^.nSpill := 0;
+        pHighwtr^ := 0;
+        pCurrent^ := i64(nRet);
+      end;
+    SQLITE_DBSTATUS_DEFERRED_FKS:
+      begin
+        pHighwtr^ := 0;
+        if (db^.nDeferredImmCons > 0) or (db^.nDeferredCons > 0) then
+          pCurrent^ := 1
+        else
+          pCurrent^ := 0;
+      end;
+  else
+    rc := SQLITE_ERROR;
+  end;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+{ status.c:426 — sqlite3_db_status.  32-bit variant of sqlite3_db_status64. }
+function sqlite3_db_status(db: PTsqlite3; op: i32; pCurrent, pHighwtr: Pi32;
+                           resetFlag: i32): i32; cdecl;
+var
+  C, H: i64;
+  rc:   i32;
+begin
+  if (sqlite3SafetyCheckOk(db) = 0) or (pCurrent = nil) or (pHighwtr = nil) then
+  begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  C := 0; H := 0;
+  rc := sqlite3_db_status64(db, op, @C, @H, resetFlag);
+  if rc = SQLITE_OK then
+  begin
+    pCurrent^ := i32(C and $7FFFFFFF);
+    pHighwtr^ := i32(H and $7FFFFFFF);
+  end;
+  Result := rc;
+end;
+
+{ main.c:4958 — sqlite3DbNameToBtree.  Resolve a database name to its
+  Btree*, or nil if the name is unknown. }
+function sqlite3DbNameToBtree(db: PTsqlite3; zDbName: PAnsiChar): PBtree;
+var iDb: i32;
+begin
+  if zDbName <> nil then iDb := sqlite3FindDbName(db, zDbName)
+  else                   iDb := 0;
+  if iDb < 0 then Result := nil
+  else            Result := PBtree(db^.aDb[iDb].pBt);
+end;
+
+{ main.c:4153 — sqlite3_file_control.  Dispatch file-control opcodes to
+  the per-database pager / btree, falling through to the VFS xFileControl
+  for unknown opcodes. }
+function sqlite3_file_control(db: PTsqlite3; zDbName: PAnsiChar; op: i32;
+                              pArg: Pointer): i32; cdecl;
+var
+  rc:     i32;
+  pBt:    PBtree;
+  pPgr:   PPager;
+  fd:     Psqlite3_file;
+  iNew:   i32;
+  nSave:  i32;
+begin
+  rc := SQLITE_ERROR;
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  pBt := sqlite3DbNameToBtree(db, zDbName);
+  if pBt <> nil then begin
+    sqlite3BtreeEnter(pBt);
+    pPgr := sqlite3BtreePager(pBt);
+    fd   := sqlite3PagerFile(pPgr);
+    case op of
+      SQLITE_FCNTL_FILE_POINTER: begin
+        PPointer(pArg)^ := Pointer(fd);
+        rc := SQLITE_OK;
+      end;
+      SQLITE_FCNTL_VFS_POINTER: begin
+        PPointer(pArg)^ := Pointer(sqlite3PagerVfs(pPgr));
+        rc := SQLITE_OK;
+      end;
+      SQLITE_FCNTL_JOURNAL_POINTER: begin
+        PPointer(pArg)^ := Pointer(sqlite3PagerJrnlFile(pPgr));
+        rc := SQLITE_OK;
+      end;
+      SQLITE_FCNTL_DATA_VERSION: begin
+        Pu32(pArg)^ := sqlite3PagerDataVersion(pPgr);
+        rc := SQLITE_OK;
+      end;
+      SQLITE_FCNTL_RESERVE_BYTES: begin
+        iNew := Pi32(pArg)^;
+        Pi32(pArg)^ := sqlite3BtreeGetRequestedReserve(pBt);
+        if (iNew >= 0) and (iNew <= 255) then
+          sqlite3BtreeSetPageSize(pBt, 0, iNew, 0);
+        rc := SQLITE_OK;
+      end;
+      SQLITE_FCNTL_RESET_CACHE: begin
+        sqlite3BtreeClearCache(pBt);
+        rc := SQLITE_OK;
+      end;
+    else
+      nSave := db^.busyHandler.nBusy;
+      rc := sqlite3OsFileControl(fd, op, pArg);
+      db^.busyHandler.nBusy := nSave;
+    end;
+    sqlite3BtreeLeave(pBt);
+  end;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+{ Local case-sensitive C-string equality + length helpers.  Avoid pulling
+  SysUtils into main's interface for these tiny ASCII-byte routines. }
+function clientNameEq(a, b: PAnsiChar): Boolean;
+begin
+  while (a^ <> #0) and (a^ = b^) do begin Inc(a); Inc(b); end;
+  Result := a^ = b^;
+end;
+
+function clientNameLen(z: PAnsiChar): PtrUInt;
+var p: PAnsiChar;
+begin
+  p := z;
+  while p^ <> #0 do Inc(p);
+  Result := PtrUInt(p) - PtrUInt(z);
+end;
+
+{ main.c:3854 — sqlite3_get_clientdata.  Look up a client-data slot by name.
+  Returns the stored pointer or nil if missing. }
+function sqlite3_get_clientdata(db: PTsqlite3; zName: PAnsiChar): Pointer; cdecl;
+var
+  p: PDbClientData;
+  zSlot: PAnsiChar;
+begin
+  if (zName = nil) or (sqlite3SafetyCheckOk(db) = 0) then begin
+    Result := nil;
+    Exit;
+  end;
+  Result := nil;
+  sqlite3_mutex_enter(db^.mutex);
+  p := db^.pDbData;
+  while p <> nil do begin
+    zSlot := PAnsiChar(p) + SizeOf(TDbClientData);
+    if clientNameEq(zSlot, zName) then begin
+      Result := p^.pData;
+      break;
+    end;
+    p := PDbClientData(p^.pNext);
+  end;
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+{ main.c:3877 — sqlite3_set_clientdata.  Store/replace/remove a named pointer
+  on the connection.  Variable-length name is appended to the allocation. }
+function sqlite3_set_clientdata(db: PTsqlite3; zName: PAnsiChar;
+  pData: Pointer; xDestructor: TClientDataDestrFn): i32; cdecl;
+var
+  p, pPrev: PDbClientData;
+  zSlot: PAnsiChar;
+  n: PtrUInt;
+begin
+  sqlite3_mutex_enter(db^.mutex);
+  pPrev := nil;
+  p := db^.pDbData;
+  while p <> nil do begin
+    zSlot := PAnsiChar(p) + SizeOf(TDbClientData);
+    if clientNameEq(zSlot, zName) then break;
+    pPrev := p;
+    p := PDbClientData(p^.pNext);
+  end;
+  if p <> nil then begin
+    if Assigned(p^.xDestroyData) then
+      p^.xDestroyData(p^.pData);
+    if pData = nil then begin
+      if pPrev = nil then
+        db^.pDbData := PDbClientData(p^.pNext)
+      else
+        pPrev^.pNext := p^.pNext;
+      sqlite3_free(p);
+      sqlite3_mutex_leave(db^.mutex);
+      Result := SQLITE_OK;
+      Exit;
+    end;
+  end else if pData = nil then begin
+    sqlite3_mutex_leave(db^.mutex);
+    Result := SQLITE_OK;
+    Exit;
+  end else begin
+    n := clientNameLen(zName);
+    p := PDbClientData(sqlite3_malloc64(u64(SizeOf(TDbClientData) + n + 1)));
+    if p = nil then begin
+      if Assigned(xDestructor) then xDestructor(pData);
+      sqlite3_mutex_leave(db^.mutex);
+      Result := SQLITE_NOMEM;
+      Exit;
+    end;
+    zSlot := PAnsiChar(p) + SizeOf(TDbClientData);
+    Move(zName^, zSlot^, n + 1);
+    p^.pNext := db^.pDbData;
+    db^.pDbData := p;
+  end;
+  p^.pData := pData;
+  p^.xDestroyData := xDestructor;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+{ main.c — sqlite3_txn_state. }
+function sqlite3_txn_state(db: PTsqlite3; zSchema: PAnsiChar): i32; cdecl;
+var
+  iDb, nDb, x, iTxn: i32;
+  pBt: Pointer;
+begin
+  iTxn := -1;
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := -1; Exit; end;
+  sqlite3_mutex_enter(db^.mutex);
+  if zSchema <> nil then begin
+    iDb := sqlite3FindDbName(db, zSchema);
+    nDb := iDb;
+    if iDb < 0 then nDb := -1;
+  end else begin
+    iDb := 0;
+    nDb := db^.nDb - 1;
+  end;
+  while iDb <= nDb do begin
+    pBt := db^.aDb[iDb].pBt;
+    if pBt <> nil then begin
+      x := sqlite3BtreeTxnState(PBtree(pBt));
+      if x > iTxn then iTxn := x;
+    end;
+    Inc(iDb);
+  end;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := iTxn;
+end;
+
+{ main.c — sqlite3_error_offset. }
+function sqlite3_error_offset(db: PTsqlite3): i32; cdecl;
+begin
+  if (db <> nil) and (db^.errCode <> 0) and (db^.errByteOffset >= 0) then
+    Result := db^.errByteOffset
+  else
+    Result := -1;
+end;
+
+{ main.c:2741 — sqlite3_set_errmsg.  Public extension hook (called by the
+  Session extension); internal callers should use sqlite3Error /
+  sqlite3ErrorWithMsg directly.  Faithful one-to-one port. }
+function sqlite3_set_errmsg(db: PTsqlite3; errcode: i32; zMsg: PAnsiChar): i32; cdecl;
+var
+  rc: i32;
+begin
+  rc := SQLITE_OK;
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE;  { C uses SQLITE_MISUSE_BKPT — same value, debug breakpoint hook }
+    Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  if zMsg <> nil then
+    sqlite3ErrorWithMsg(db, errcode, zMsg)
+  else
+    sqlite3Error(db, errcode);
+  rc := sqlite3ApiExit(db, rc);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+{ main.c — sqlite3_limit.  Mirrors aHardLimit clamp + LENGTH floor. }
+function sqlite3_limit(db: PTsqlite3; limitId: i32; newLimit: i32): i32; cdecl;
+var
+  oldLimit: i32;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := -1; Exit; end;
+  if (limitId < 0) or (limitId >= Length(aHardLimit)) then begin
+    Result := -1; Exit;
+  end;
+  oldLimit := db^.aLimit[limitId];
+  if newLimit >= 0 then begin
+    if newLimit > aHardLimit[limitId] then newLimit := aHardLimit[limitId];
+    if (limitId = 0) and (newLimit < 100) then newLimit := 100;  { SQLITE_LIMIT_LENGTH floor }
+    db^.aLimit[limitId] := newLimit;
+  end;
+  Result := oldLimit;
+end;
+
+function sqlite3_sleep(ms: i32): i32; cdecl;
+var
+  pVfs: Psqlite3_vfs;
+  micros: i32;
+begin
+  pVfs := sqlite3_vfs_find(nil);
+  if pVfs = nil then begin Result := 0; Exit; end;
+  if ms < 0 then micros := 0 else micros := 1000 * ms;
+  Result := sqlite3OsSleep(pVfs, micros) div 1000;
+end;
+
+function sqlite3_release_memory(n: i32): i32; cdecl;
+begin
+  { SQLITE_ENABLE_MEMORY_MANAGEMENT is off in this build — match the C
+    no-op return path (malloc.c:30). }
+  if n = 0 then ;  { unused }
+  Result := 0;
+end;
+
+function sqlite3_memory_highwater(resetFlag: i32): i64; cdecl;
+var
+  res, mx: i64;
+begin
+  res := 0; mx := 0;
+  sqlite3_status64(SQLITE_STATUS_MEMORY_USED, @res, @mx, resetFlag);
+  Result := mx;
+end;
+
+function sqlite3_msize(p: Pointer): u64; cdecl;
+begin
+  if p = nil then Result := 0
+  else Result := u64(MemSize(p));
+end;
+
+{ malloc.c — soft/hard heap-limit accessors.  SQLITE_ENABLE_MEMORY_MANAGEMENT
+  is off in this build, so the no-op return path is the upstream contract:
+  return the previously-set limit (kept in unit-level state) without
+  installing a real alarm. }
+var
+  gSoftHeapLimit: i64 = 0;
+  gHardHeapLimit: i64 = 0;
+
+function sqlite3_soft_heap_limit64(n: i64): i64; cdecl;
+var
+  prior: i64;
+begin
+  prior := gSoftHeapLimit;
+  if n >= 0 then gSoftHeapLimit := n;
+  Result := prior;
+end;
+
+function sqlite3_hard_heap_limit64(n: i64): i64; cdecl;
+var
+  prior: i64;
+begin
+  prior := gHardHeapLimit;
+  if n >= 0 then gHardHeapLimit := n;
+  Result := prior;
+end;
+
+procedure sqlite3_soft_heap_limit(n: i32); cdecl;
+begin
+  if n < 0 then n := 0;
+  sqlite3_soft_heap_limit64(i64(n));
+end;
+
+{ btree.c:89 — sqlite3_enable_shared_cache.  This Pascal port is built
+  with the SQLITE_OMIT_SHARED_CACHE compile path: there is no
+  sqlite3GlobalConfig.sharedCacheEnabled to mutate.  Mirror the
+  loadext.c:91 omit-stub posture by accepting the call and returning
+  SQLITE_OK; future opens never enable shared cache regardless. }
+function sqlite3_enable_shared_cache(enable: i32): i32; cdecl;
+begin
+  Result := SQLITE_OK;
+end;
+
+{ sqlite.h.in:6780 — sqlite3_activate_cerod.  Deprecated CEROD
+  (Compressed Encrypted Read-Only Database) activator; only meaningful
+  under SQLITE_ENABLE_CEROD.  No-op stub here. }
+procedure sqlite3_activate_cerod(zPassPhrase: PAnsiChar); cdecl;
+begin
+end;
+
+{ main.c:1863 — sqlite3_setlk_timeout.  POSIX advisory-lock timeout.
+  Only productive under SQLITE_ENABLE_SETLK_TIMEOUT (not enabled in
+  this port).  Honour the C MISUSE / RANGE guards so callers see the
+  same return codes; the timeout itself is a no-op. }
+function sqlite3_setlk_timeout(db: PTsqlite3; ms: i32; flags: i32): i32; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
+  if ms < -1 then begin Result := SQLITE_RANGE; Exit; end;
+  Result := SQLITE_OK;
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 8.7.1 — WAL public-API entry points.
+
+  The Pascal port has no `SQLITE_OMIT_WAL`-equivalent compile flag.  The
+  underlying WAL machinery (`sqlite3WalCheckpoint`, `sqlite3PagerCheckpoint`,
+  `sqlite3BtreeCheckpoint`) is fully ported, so these wrappers do real
+  work when the connection has a WAL open and degrade to no-op when it
+  does not.
+  ---------------------------------------------------------------------- }
+
+const
+  SQLITE_MAX_DB_INTERNAL     = SQLITE_MAX_ATTACHED + 2;
+  SQLITE_CHECKPOINT_PASSIVE  = 0;
+  SQLITE_CHECKPOINT_TRUNCATE = 3;
+  SQLITE_CHECKPOINT_NOOP     = -1;
+
+{ main.c:2644 — sqlite3Checkpoint (internal).  Walks db^.aDb[] running a
+  checkpoint on each open Btree.  iDb = SQLITE_MAX_DB processes all. }
+function sqlite3Checkpoint(db: PTsqlite3; iDb, eMode: i32;
+  pnLog, pnCkpt: PInt32): i32;
+var
+  rc:    i32;
+  i:     i32;
+  bBusy: i32;
+begin
+  rc    := SQLITE_OK;
+  bBusy := 0;
+  i     := 0;
+  while (i < db^.nDb) and (rc = SQLITE_OK) do begin
+    if (i = iDb) or (iDb = SQLITE_MAX_DB_INTERNAL) then begin
+      rc := sqlite3BtreeCheckpoint(db^.aDb[i].pBt, eMode,
+                                   Pointer(pnLog), Pointer(pnCkpt));
+      pnLog  := nil;
+      pnCkpt := nil;
+      if rc = SQLITE_BUSY then begin
+        bBusy := 1;
+        rc    := SQLITE_OK;
+      end;
+    end;
+    Inc(i);
+  end;
+  if (rc = SQLITE_OK) and (bBusy <> 0) then
+    Result := SQLITE_BUSY
+  else
+    Result := rc;
+end;
+
+{ main.c:2470 — sqlite3WalDefaultHook.  Default callback installed by
+  sqlite3_wal_autocheckpoint; fires sqlite3_wal_checkpoint(db, zDb)
+  whenever the WAL has grown past pClientData frames. }
+function sqlite3WalDefaultHook(pClientData: Pointer; db: PTsqlite3;
+  zDb: PAnsiChar; nFrame: i32): i32; cdecl;
+begin
+  if nFrame >= i32(PtrUInt(pClientData)) then
+    sqlite3_wal_checkpoint(db, zDb);
+  Result := SQLITE_OK;
+end;
+
+{ main.c:2517 — sqlite3_wal_hook.  Replace the per-connection WAL hook;
+  return the previous pArg. }
+function sqlite3_wal_hook(db: PTsqlite3; xCallback: TWalHookFn;
+  pArg: Pointer): Pointer; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := nil; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  Result          := db^.pWalArg;
+  db^.xWalCallback := Pointer(xCallback);
+  db^.pWalArg     := pArg;
+  sqlite3_mutex_leave(db^.mutex);
+end;
+
+{ main.c:2496 — sqlite3_wal_autocheckpoint.  Wires the default hook on
+  positive nFrame, clears it otherwise. }
+function sqlite3_wal_autocheckpoint(db: PTsqlite3; nFrame: i32): i32; cdecl;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  if nFrame > 0 then
+    sqlite3_wal_hook(db, @sqlite3WalDefaultHook, Pointer(PtrUInt(nFrame)))
+  else
+    sqlite3_wal_hook(db, nil, nil);
+  Result := SQLITE_OK;
+end;
+
+{ main.c:2547 — sqlite3_wal_checkpoint_v2. }
+function sqlite3_wal_checkpoint_v2(db: PTsqlite3; zDb: PAnsiChar;
+  eMode: i32; pnLog, pnCkpt: PInt32): i32; cdecl;
+var
+  rc:  i32;
+  iDb: i32;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  if pnLog  <> nil then pnLog^  := -1;
+  if pnCkpt <> nil then pnCkpt^ := -1;
+  if (eMode < SQLITE_CHECKPOINT_NOOP) or (eMode > SQLITE_CHECKPOINT_TRUNCATE) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  if (zDb <> nil) and (zDb[0] <> #0) then
+    iDb := sqlite3FindDbName(db, zDb)
+  else
+    iDb := SQLITE_MAX_DB_INTERNAL;
+  if iDb < 0 then begin
+    rc := SQLITE_ERROR;
+    sqlite3ErrorWithMsg(db, SQLITE_ERROR,
+      PAnsiChar(sqlite3MPrintf(db, 'unknown database: %s', [zDb])));
+  end else begin
+    db^.busyHandler.nBusy := 0;
+    rc := sqlite3Checkpoint(db, iDb, eMode, pnLog, pnCkpt);
+    sqlite3Error(db, rc);
+  end;
+  rc := sqlite3ApiExit(db, rc);
+  if db^.nVdbeActive = 0 then
+    db^.u1.isInterrupted := 0;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+{ main.c:2617 — sqlite3_wal_checkpoint.  PASSIVE-mode wrapper. }
+function sqlite3_wal_checkpoint(db: PTsqlite3; zDb: PAnsiChar): i32; cdecl;
+begin
+  Result := sqlite3_wal_checkpoint_v2(db, zDb, SQLITE_CHECKPOINT_PASSIVE,
+                                      nil, nil);
+end;
+
+{ memdb.c:750 — sqlite3_serialize.  Returns a freshly malloc'ed buffer
+  containing the on-disk image of database zSchema (or NULL when it is
+  the main database).  Length is written to *piSize.  When
+  SQLITE_SERIALIZE_NOCOPY is set the function returns NULL for non-memdb
+  databases (we have no memdb backing store to point at).  The memdb
+  branch of the C source is omitted: the memdb VFS is not yet ported. }
+function sqlite3_serialize(db: PTsqlite3; zSchema: PAnsiChar;
+  piSize: Pi64; mFlags: u32): Pu8; cdecl;
+var
+  iDb:    i32;
+  pBt:    PBtree;
+  sz:     i64;
+  szPage: i32;
+  pOut:   Pu8;
+  pTo:    Pu8;
+  pPgr:   PPager;
+  nPage:  i32;
+  iPg:    i32;
+  pPage:  PDbPage;
+  rc:     i32;
+begin
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := nil; Exit;
+  end;
+{$ENDIF}
+  if zSchema = nil then zSchema := db^.aDb[0].zDbSName;
+  iDb := sqlite3FindDbName(db, zSchema);
+  if piSize <> nil then piSize^ := -1;
+  if iDb < 0 then begin Result := nil; Exit; end;
+  pBt := PBtree(db^.aDb[iDb].pBt);
+  if pBt = nil then begin Result := nil; Exit; end;
+  { C source preps "PRAGMA <db>.page_count"; the Pascal pragma dispatch
+    does not yet implement page_count, so go straight to the underlying
+    primitive.  Equivalent: sqlite3PagerPagecount on the schema's pager. }
+  pPgr  := sqlite3BtreePager(pBt);
+  nPage := 0;
+  sqlite3PagerPagecount(pPgr, @nPage);
+  szPage := sqlite3BtreeGetPageSize(pBt);
+  sz     := i64(nPage) * szPage;
+  if piSize <> nil then piSize^ := sz;
+  if (mFlags and SQLITE_SERIALIZE_NOCOPY) <> 0 then begin
+    Result := nil; Exit;
+  end;
+  if sz <= 0 then begin Result := nil; Exit; end;
+  pOut := Pu8(sqlite3_malloc64(u64(sz)));
+  if pOut = nil then begin Result := nil; Exit; end;
+  for iPg := 1 to nPage do begin
+    pPage := nil;
+    pTo   := pOut + szPage * (iPg - 1);
+    rc    := sqlite3PagerGet(pPgr, Pgno(iPg), @pPage, 0);
+    if rc = SQLITE_OK then
+      Move(sqlite3PagerGetData(pPage)^, pTo^, szPage)
+    else
+      FillChar(pTo^, szPage, 0);
+    sqlite3PagerUnref(pPage);
+  end;
+  Result := pOut;
 end;
 
 initialization
