@@ -28,6 +28,13 @@ uses
 var
   pass: i32 = 0;
   fail: i32 = 0;
+  progressCalls: i32 = 0;
+
+function ProgressCb(p: Pointer): i32; cdecl;
+begin
+  Inc(progressCalls);
+  Result := 0;
+end;
 
 procedure Check(name: string; cond: Boolean);
 begin
@@ -74,6 +81,18 @@ begin
   Check('is_interrupted=1 after interrupt',
         sqlite3_is_interrupted(db) = 1);
   db^.u1.isInterrupted := 0;
+
+  { progress_handler — set, verify db fields, then clear. }
+  sqlite3_progress_handler(db, 50, @ProgressCb, Pointer(PtrUInt($BEEF)));
+  Check('progress nProgressOps=50', db^.nProgressOps = 50);
+  Check('progress xProgress set', db^.xProgress = @ProgressCb);
+  Check('progress pProgressArg set',
+        db^.pProgressArg = Pointer(PtrUInt($BEEF)));
+  sqlite3_progress_handler(db, 0, nil, nil);
+  Check('progress cleared (nOps=0)', db^.xProgress = nil);
+  Check('progress nProgressOps=0', db^.nProgressOps = 0);
+  Check('progress pProgressArg=nil', db^.pProgressArg = nil);
+  sqlite3_progress_handler(nil, 1, @ProgressCb, nil);  { nil-db no-op }
 
   sqlite3_set_last_insert_rowid(db, 1234);
   Check('set_last_insert_rowid stores',

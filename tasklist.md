@@ -638,7 +638,11 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 
 - [ ] **8.4.1** Hooks / control / change-counter / errors / limits
        (main.c, status.c):
-       [ ] `sqlite3_progress_handler` — set per-vdbe progress callback.
+       [X] `sqlite3_progress_handler` — ported 2026-04-28
+            (passqlite3main.pas) — sets db^.{xProgress,nProgressOps,
+            pProgressArg}; nOps<=0 clears.  Runtime invocation arm in
+            sqlite3VdbeExec was already wired (vdbe.pas:8909..).
+            Covered by DiagPubApi (set / clear / nil-db guard).
        [ ] `sqlite3_autovacuum_pages` — per-db autovacuum hook.
        [X] `sqlite3_interrupt` / `sqlite3_is_interrupted` — ported
             2026-04-28 (passqlite3main.pas) — sets/reads

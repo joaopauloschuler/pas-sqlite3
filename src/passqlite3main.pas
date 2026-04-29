@@ -336,6 +336,12 @@ function sqlite3_total_changes64(db: PTsqlite3): i64; cdecl;
 procedure sqlite3_interrupt(db: PTsqlite3); cdecl;
 function sqlite3_is_interrupted(db: PTsqlite3): i32; cdecl;
 
+type
+  TProgressHandlerFn = function(p: Pointer): i32; cdecl;
+
+procedure sqlite3_progress_handler(db: PTsqlite3; nOps: i32;
+  xProgress: TProgressHandlerFn; pArg: Pointer); cdecl;
+
 function sqlite3_errcode(db: PTsqlite3): i32; cdecl;
 function sqlite3_extended_errcode(db: PTsqlite3): i32; cdecl;
 function sqlite3_extended_result_codes(db: PTsqlite3; onoff: i32): i32; cdecl;
@@ -1172,8 +1178,8 @@ end;
       (Phase 8.1 already set bDisable=1, sz=0).  We record sz / nSlot
       / pBuf for future use but never actually serve allocations from
       the buffer.  If cnt <= 0 the subsystem is forcibly disabled.
-    * sqlite3_progress_handler is intentionally NOT exported (gated by
-      SQLITE_OMIT_PROGRESS_CALLBACK conventions; deferred to Phase 8.5+).
+    * sqlite3_progress_handler is exported (Phase 8.4.1).  Setter only;
+      the per-step xProgress invocation is in sqlite3VdbeExec.
     * SETLK_TIMEOUT (compile-time gated in C) is not built in.
     * Db-config flags that reference codegen state we have not yet
       wired (e.g. SQLITE_DqsDDL parser-side enforcement, SQLITE_Defensive
@@ -2370,6 +2376,25 @@ function sqlite3_is_interrupted(db: PTsqlite3): i32; cdecl;
 begin
   if db = nil then begin Result := 0; Exit; end;
   if db^.u1.isInterrupted <> 0 then Result := 1 else Result := 0;
+end;
+
+{ main.c:1812 — sqlite3_progress_handler.  Sets per-connection progress
+  callback fired every nOps VDBE step opcodes.  When nOps<=0 the callback
+  is cleared.  The runtime invocation is already wired in
+  passqlite3vdbe.pas (xProgress is consulted in sqlite3VdbeExec). }
+procedure sqlite3_progress_handler(db: PTsqlite3; nOps: i32;
+  xProgress: TProgressHandlerFn; pArg: Pointer); cdecl;
+begin
+  if db = nil then Exit;
+  if nOps > 0 then begin
+    db^.xProgress    := xProgress;
+    db^.nProgressOps := u32(nOps);
+    db^.pProgressArg := pArg;
+  end else begin
+    db^.xProgress    := nil;
+    db^.nProgressOps := 0;
+    db^.pProgressArg := nil;
+  end;
 end;
 
 function sqlite3_errcode(db: PTsqlite3): i32; cdecl;
