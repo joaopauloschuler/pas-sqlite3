@@ -306,10 +306,46 @@ Important: At the end of this document, please find:
         `CREATE TABLE t(a CHECK(a > 0)); INSERT INTO t VALUES(-1)` is
         accepted by Pas; C rejects with SQLITE_CONSTRAINT (rc=19).
         Wraps 6.9-bis 11g.2.b (`sqlite3GenerateConstraintChecks`).
-      [ ] **i) GENERATED column virtual.**
-        Inserting into `(a INTEGER, b INTEGER GENERATED ALWAYS AS (a*2)
-        VIRTUAL)` and selecting `b` returns 0 instead of `a*2`.
-        Tracked under 6.24 (`sqlite3ComputeGeneratedColumns`).
+      [X] **i) GENERATED column virtual** — closed 2026-04-29.  Three
+        ports landed:
+          1. `sqlite3AddGenerated` (codegen.pas) — verbatim port of
+             build.c:1971: tags the most recently added column with
+             COLFLAG_VIRTUAL (default) or COLFLAG_STORED (explicit
+             "stored" type), updates pTab^.tabFlags via
+             TF_HasVirtual/TF_HasStored, decrements nNVCol for VIRTUAL,
+             wraps bare TK_ID in TK_UPLUS, sets pExpr^.affExpr from the
+             column affinity, then binds the AS expression via
+             sqlite3ColumnSetExpr.  Was a 1-liner that just deleted
+             pExpr.
+          2. `sqlite3ExprCodeGeneratedColumn` (codegen.pas) — verbatim
+             port of expr.c:4384: emits OP_IfNullRow guard around the
+             AS expression when iSelfTab>0, codes the AS expression
+             into regOut via sqlite3ExprCode, applies OP_TypeCheck
+             (STRICT) or OP_Affinity (>=TEXT) on the result.
+          3. `sqlite3ExprCodeGetColumnOfTable` (codegen.pas) — added
+             the COLFLAG_VIRTUAL arm (expr.c:4438..4452): under
+             COLFLAG_BUSY recursion guard, sets
+             pParse^.iSelfTab := iTabCur+1 and dispatches to
+             sqlite3ExprCodeGeneratedColumn.
+          4. `sqlite3EndTable` (codegen.pas) — added the
+             TF_HasGenerated resolve loop (build.c:2753..2780): each
+             AS expression is resolved against the new table via
+             sqlite3ResolveSelfReference(NC_GenCol); on resolve failure
+             the bound expression is replaced with TK_NULL via
+             sqlite3ColumnSetExpr; tables with TF_HasGenerated must
+             retain at least one non-generated column.
+        DiagFeatureProbe `GENERATED column virtual` now PASS (10 → 9
+        divergences).  Regressions clean: TestExplainParity 1016/10,
+        TestVdbeAgg 11/0, TestSelectBasic 49/0, TestParser 45/0,
+        TestBtreeCompat 337/0, TestDMLBasic 54/0, TestVdbeApi 57/0,
+        TestWhereBasic 52/0, DiagPubApi 240/0, TestAuthBuiltins 34/0,
+        TestCarray 74/0, TestPrintf 105/0, DiagSumOverflow 12/0,
+        TestVdbeRecord 13/0, TestVdbeCursor 27/0.  STORED columns + the
+        sqlite3ComputeGeneratedColumns post-INSERT dispatch (insert.c
+        callsites) remain deferred under 6.24 (only matters when STORED
+        is used or when a generated column is read after INSERT before
+        commit; VIRTUAL columns route through the SELECT-time path
+        landed here).
       [ ] **j) AFTER INSERT trigger does not fire.**
         Side-table populated by the trigger remains empty.  Tracked
         under 6.23 (trigger codegen stubs).

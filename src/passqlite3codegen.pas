@@ -21045,23 +21045,67 @@ begin
     sqlite3VdbeAddOp1(v, OP_RealAffinity, iReg);
 end;
 
+{ sqlite3ExprCodeGeneratedColumn — port of expr.c:4384.
+  Generate code that computes the value of generated column pCol and
+  stores the result in register regOut.  Wraps the AS expression in
+  OP_IfNullRow when iSelfTab>0 so the LEFT-JOIN-NULL-row case keeps
+  the column NULL instead of computing on bogus data. }
+procedure sqlite3ExprCodeGeneratedColumn(pPse: PParse; pTab: PTable2;
+  pCol: PColumn; regOut: i32);
+var
+  v:       PVdbe;
+  iAddr:   i32;
+  nErr:    i32;
+  pDup:    PExpr;
+  db:      PTsqlite3;
+begin
+  v    := pPse^.pVdbe;
+  nErr := pPse^.nErr;
+  Assert(v <> nil);
+  Assert(pPse^.iSelfTab <> 0);
+  if pPse^.iSelfTab > 0 then
+    iAddr := sqlite3VdbeAddOp3(v, OP_IfNullRow,
+                               pPse^.iSelfTab - 1, 0, regOut)
+  else
+    iAddr := 0;
+  db   := pPse^.db;
+  pDup := sqlite3ExprDup(db, sqlite3ColumnExpr(pTab, pCol), 0);
+  if db^.mallocFailed = 0 then
+    sqlite3ExprCode(pPse, pDup, regOut);
+  sqlite3ExprDelete(db, pDup);
+  if ((pCol^.colFlags and COLFLAG_VIRTUAL) <> 0)
+     and ((pTab^.tabFlags and TF_Strict) <> 0) then
+  begin
+    sqlite3VdbeAddOp4(v, OP_TypeCheck, regOut, 1,
+      2 + i32((PtrUInt(pCol) - PtrUInt(pTab^.aCol)) div SizeOf(TColumn)),
+      Pointer(pTab), P4_TABLE);
+  end
+  else if Byte(pCol^.affinity) >= SQLITE_AFF_TEXT then
+  begin
+    sqlite3VdbeAddOp4(v, OP_Affinity, regOut, 1, 0,
+                      @pCol^.affinity, 1);
+  end;
+  if iAddr <> 0 then sqlite3VdbeJumpHere(v, iAddr);
+  if pPse^.nErr > nErr then pPse^.db^.errByteOffset := -1;
+end;
+
 { sqlite3ExprCodeGetColumnOfTable — port of expr.c:4417..4465.
   Emits the opcode that fetches column iCol of pTab from cursor iTabCur into
   register regOut.  iCol<0 or iCol == pTab^.iPKey shortcuts to OP_Rowid.
   Virtual tables emit OP_VColumn keyed off the logical column index.
+  COLFLAG_VIRTUAL generated columns route through
+  sqlite3ExprCodeGeneratedColumn under COLFLAG_BUSY recursion guard.
   WITHOUT-ROWID tables resolve through the primary-key index via
   sqlite3TableColumnToIndex(sqlite3PrimaryKeyIndex(pTab), iCol).  Regular
   rowid tables use sqlite3TableColumnToStorage(pTab, iCol) so virtual
-  generated columns line up at their storage offset.
-  COLFLAG_VIRTUAL columns (computed/stored generated columns) require
-  sqlite3ExprCodeGeneratedColumn — still a Phase 6.x deferral; we land
-  the assert here so any caller that strays into the generated-column
-  arm is loud about it. }
+  generated columns line up at their storage offset. }
 procedure sqlite3ExprCodeGetColumnOfTable(v: PVdbe; pTab: PTable2;
   iTabCur: i32; iCol: i32; regOut: i32);
 var
-  pCol:        PColumn;
-  op, x:       i32;
+  pCol:         PColumn;
+  op, x:        i32;
+  pPse:         PParse;
+  savedSelfTab: i32;
 begin
   Assert(v <> nil);
   Assert(pTab <> nil);
@@ -21081,7 +21125,21 @@ begin
     pCol := @pTab^.aCol[iCol];
     if (pCol^.colFlags and COLFLAG_VIRTUAL) <> 0 then
     begin
-      Assert(False, 'sqlite3ExprCodeGeneratedColumn not yet ported');
+      pPse := sqlite3VdbeParser(v);
+      if (pCol^.colFlags and COLFLAG_BUSY) <> 0 then
+      begin
+        sqlite3ErrorMsg(pPse,
+          PAnsiChar('generated column loop'));
+      end
+      else
+      begin
+        savedSelfTab   := pPse^.iSelfTab;
+        pCol^.colFlags := pCol^.colFlags or COLFLAG_BUSY;
+        pPse^.iSelfTab := iTabCur + 1;
+        sqlite3ExprCodeGeneratedColumn(pPse, pTab, pCol, regOut);
+        pPse^.iSelfTab := savedSelfTab;
+        pCol^.colFlags := pCol^.colFlags and (not COLFLAG_BUSY);
+      end;
       Exit;
     end;
     if not HasRowid(pTab) then
@@ -23409,8 +23467,65 @@ begin
   sqlite3DbFree(db, zColl);
 end;
 
+{ sqlite3AddGenerated — port of build.c:1971.  Tag the most recently
+  added column on pNewTable as a GENERATED ALWAYS AS column (VIRTUAL
+  default; STORED with the explicit "stored" type token).  The AS
+  expression is bound to the column via sqlite3ColumnSetExpr, which
+  appends to pTab^.u.tab.pDfltList. }
 procedure sqlite3AddGenerated(pParse: PParse; pExpr: PExpr; pType: PToken);
+label
+  generated_error, generated_done;
+var
+  pTab:  PTable2;
+  pCol:  PColumn;
+  eType: u16;
 begin
+  eType := COLFLAG_VIRTUAL;
+  pTab  := pParse^.pNewTable;
+  if pTab = nil then goto generated_done;
+  pCol := @pTab^.aCol[pTab^.nCol - 1];
+  if pParse^.eParseMode = PARSE_MODE_DECLARE_VTAB then
+  begin
+    sqlite3ErrorMsg(pParse,
+      PAnsiChar('virtual tables cannot use computed columns'));
+    goto generated_done;
+  end;
+  if pCol^.iDflt > 0 then goto generated_error;
+  if pType <> nil then
+  begin
+    if (pType^.n = 7) and (sqlite3_strnicmp(PAnsiChar('virtual'), pType^.z, 7) = 0) then
+    begin
+      { no-op — VIRTUAL is the default }
+    end
+    else if (pType^.n = 6) and (sqlite3_strnicmp(PAnsiChar('stored'), pType^.z, 6) = 0) then
+    begin
+      eType := COLFLAG_STORED;
+    end
+    else
+      goto generated_error;
+  end;
+  if eType = COLFLAG_VIRTUAL then Dec(pTab^.nNVCol);
+  pCol^.colFlags := pCol^.colFlags or eType;
+  Assert(TF_HasVirtual = COLFLAG_VIRTUAL);
+  Assert(TF_HasStored  = COLFLAG_STORED);
+  pTab^.tabFlags := pTab^.tabFlags or u32(eType);
+  if (pCol^.colFlags and COLFLAG_PRIMKEY) <> 0 then
+    makeColumnPartOfPrimaryKey(pParse, pCol);  { for the error message }
+  if (pExpr <> nil) and (pExpr^.op = TK_ID) then
+  begin
+    { Wrap a bare TK_ID in TK_UPLUS so covering-index optimisations work. }
+    pExpr := sqlite3PExpr(pParse, TK_UPLUS, pExpr, nil);
+  end;
+  if (pExpr <> nil) and (pExpr^.op <> TK_RAISE) then
+    pExpr^.affExpr := pCol^.affinity;
+  sqlite3ColumnSetExpr(pParse, pTab, pCol, pExpr);
+  pExpr := nil;
+  goto generated_done;
+
+generated_error:
+  sqlite3ErrorMsg(pParse,
+    PAnsiChar('error in generated column'));
+generated_done:
   sqlite3ExprDelete(pParse^.db, pExpr);
 end;
 
@@ -23629,6 +23744,10 @@ var
   zStmt:   PAnsiChar;
   zReparse: PAnsiChar;
   pPk2:    PIndex2;
+  ii:      i32;
+  nNG:     i32;
+  pX:      PExpr;
+  colFlg:  u16;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -23670,7 +23789,38 @@ begin
       pTab^.tabFlags := pTab^.tabFlags or TF_Readonly;
   end;
 
-  { STRICT / GENERATED / CHECK loops omitted — see banner.
+  { GENERATED-column resolve loop — port of build.c:2753..2781.
+    Each AS expression is resolved against the new table itself
+    (NC_GenCol).  On resolve error, replace the bound expression with
+    TK_NULL so downstream codegen never sees lookaside-allocated nodes
+    on a schema record.  Tables with TF_HasGenerated must also have at
+    least one non-generated column. }
+  if (pTab^.tabFlags and TF_HasGenerated) <> 0 then
+  begin
+    nNG := 0;
+    for ii := 0 to pTab^.nCol - 1 do
+    begin
+      colFlg := pTab^.aCol[ii].colFlags;
+      if (colFlg and COLFLAG_GENERATED) <> 0 then
+      begin
+        pX := sqlite3ColumnExpr(pTab, @pTab^.aCol[ii]);
+        if sqlite3ResolveSelfReference(pParse, pTab, NC_GenCol, pX, nil) <> 0 then
+          sqlite3ColumnSetExpr(pParse, pTab, @pTab^.aCol[ii],
+            sqlite3ExprAlloc(db, TK_NULL, nil, 0));
+      end
+      else
+        Inc(nNG);
+    end;
+    if nNG = 0 then
+    begin
+      sqlite3ErrorMsg(pParse,
+        PAnsiChar('must have at least one non-generated column'));
+      sqlite3SelectDelete(db, pSelect);
+      Exit;
+    end;
+  end;
+
+  { STRICT / CHECK loops omitted — see banner.
 
     WITHOUT ROWID: in C this branch errors out when PRIMARY KEY is missing
     or AUTOINCREMENT is set, then calls convertToWithoutRowidTable.  All
