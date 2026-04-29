@@ -5539,14 +5539,24 @@ begin
       begin
         { Port of expr.c:4957..5004 (slim).  In non-directMode return the
           accumulator-column register (AggInfoColumnReg = iFirstReg + iAgg).
-          In directMode (set during updateAccumulator), fall through to
-          the TK_COLUMN OP_Column emission so arg evaluation reads from
-          the live cursor.  useSortingIdx arm omitted (GROUP BY only). }
+          In directMode + useSortingIdx (GROUP BY sorter loop), emit
+          OP_Column from the sortingIdxPTab pseudo-cursor.
+          Otherwise fall through to TK_COLUMN OP_Column from live cursor. }
         if (pExpr^.pAggInfo <> nil) and (pExpr^.iAgg >= 0)
            and (pExpr^.iAgg < pExpr^.pAggInfo^.nColumn)
            and (pExpr^.pAggInfo^.directMode = 0) then
         begin
           Result := pExpr^.pAggInfo^.iFirstReg + pExpr^.iAgg;
+          done := True;
+        end
+        else if (pExpr^.pAggInfo <> nil) and (pExpr^.iAgg >= 0)
+                and (pExpr^.iAgg < pExpr^.pAggInfo^.nColumn)
+                and (pExpr^.pAggInfo^.useSortingIdx <> 0) then
+        begin
+          sqlite3VdbeAddOp3(v, OP_Column,
+            pExpr^.pAggInfo^.sortingIdxPTab,
+            pExpr^.pAggInfo^.aCol[pExpr^.iAgg].iSorterColumn,
+            target);
           done := True;
         end
         else if (pExpr^.y.pTab <> nil) and (pExpr^.iTable >= 0) then
@@ -18699,6 +18709,17 @@ begin
   sqlite3WalkExprList(@w, pList);
 end;
 
+procedure markAggregateInExpr(pParse: PParse; pExpr: PExpr);
+var
+  w: TWalker;
+begin
+  if pExpr = nil then Exit;
+  FillChar(w, SizeOf(w), 0);
+  w.pParse        := pParse;
+  w.xExprCallback := @markAggregateExprNode;
+  sqlite3WalkExpr(@w, pExpr);
+end;
+
 { agginfoFree — select.c:7101.  Cleanup callback for AggInfo allocated
   via sqlite3DbMallocZero in the SF_Aggregate gate.  Frees the aCol[]
   and aFunc[] sub-arrays then the AggInfo record itself. }
@@ -19044,6 +19065,34 @@ var
   iTabTnct:    i32;
   pDistKey:    PKeyInfo2;
   rDistTmp:    i32;
+  { GROUP BY aggregate locals — select.c:8454..8669 (groupBySort=1 only). }
+  pGroupByLoc: PExprList;
+  pHavingLoc:  PExpr;
+  pKeyInfoGB:  PKeyInfo2;
+  orderByGrp:  i32;
+  addrEnd:     i32;
+  addrTopOfLoop: i32;
+  addrSetAbort: i32;
+  addr1:       i32;
+  addrOutputRow: i32;
+  addrReset:   i32;
+  regOutputRow: i32;
+  regReset:    i32;
+  iAMem:       i32;
+  iBMem:       i32;
+  iUseFlag:    i32;
+  iAbortFlag:  i32;
+  sortPTab:    i32;
+  sortOut:     i32;
+  regBase:     i32;
+  regRecord:   i32;
+  nGroupBy:    i32;
+  nColGB:      i32;
+  jj:          i32;
+  pColGB:      PAggInfoCol;
+  copyOK:      Boolean;
+  iiGB:        i32;
+  sfA, sfB:    u8;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -19202,6 +19251,259 @@ begin
       end;
       if pDest^.eDest = SRT_Output then
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+      if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
+      Exit;
+    end;
+  end;
+
+  { GROUP BY aggregate path — select.c:8454..8669 (groupBySort=1 only).
+    Single source table; no DISTINCT/Compound/Window; HAVING supported via
+    post-finalize ExprIfFalse; ORDER BY supported only when it matches
+    GROUP BY (orderByGrp arm via sqlite3CopySortOrder + ExprListCompare).
+    Always pushes rows through OP_SorterOpen (no whereIsOrdered shortcut). }
+  if ((p^.selFlags and SF_Aggregate) <> 0)
+     and (p^.pGroupBy <> nil)
+     and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
+     and (p^.pWin = nil)
+     and (p^.pSrc <> nil) and (p^.pSrc^.nSrc = 1)
+     and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem))
+  then
+  begin
+    pItem := SrcListItems(p^.pSrc);
+    pTab  := pItem^.pSTab;
+    if (pTab = nil)
+       or (pTab^.eTabType = TABTYP_VTAB)
+       or (pTab^.eTabType = TABTYP_VIEW)
+       or ((pTab^.tabFlags and TF_Ephemeral) <> 0)
+       or ((pItem^.fg.fgBits and $01) <> 0)
+    then begin Result := SQLITE_OK; Exit; end;
+
+    pGroupByLoc := p^.pGroupBy;
+    pHavingLoc  := p^.pHaving;
+    nGroupBy    := pGroupByLoc^.nExpr;
+
+    { ORDER BY handling — orderByGrp arm.  Mirror sqlite3CopySortOrder
+      (select.c:7516): when nExpr matches, copy sortFlags from ORDER BY
+      onto pGroupBy then ExprListCompare to confirm structural equality. }
+    orderByGrp := 0;
+    if p^.pOrderBy <> nil then
+    begin
+      copyOK := False;
+      if p^.pOrderBy^.nExpr = nGroupBy then
+      begin
+        for iiGB := 0 to nGroupBy - 1 do
+        begin
+          sfB := ExprListItems(p^.pOrderBy)[iiGB].fg.sortFlags and KEYINFO_ORDER_DESC;
+          ExprListItems(pGroupByLoc)[iiGB].fg.sortFlags := sfB;
+        end;
+        copyOK := True;
+      end;
+      if copyOK
+         and (sqlite3ExprListCompare(pGroupByLoc, p^.pOrderBy, -1) = 0) then
+      begin
+        orderByGrp := 1;
+      end
+      else
+      begin
+        Result := SQLITE_OK; Exit;
+      end;
+    end;
+
+    v := sqlite3GetVdbe(pParse);
+    if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
+
+    pAggI2 := PAggInfo(sqlite3DbMallocZero(pParse^.db, SizeOf(TAggInfo)));
+    if pAggI2 = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    sqlite3ParserAddCleanup(pParse, @agginfoFreeCleanup, pAggI2);
+    pAggI2^.selId          := p^.selId;
+    pAggI2^.pGroupBy       := pGroupByLoc;
+    pAggI2^.nSortingColumn := u32(nGroupBy);
+
+    FillChar(sNCAgg, SizeOf(sNCAgg), 0);
+    sNCAgg.pParse        := pParse;
+    sNCAgg.pSrcList      := p^.pSrc;
+    sNCAgg.uNC.pAggInfo  := pAggI2;
+    sNCAgg.ncFlags       := NC_UAggInfo;
+
+    markAggregateInExprList(pParse, p^.pEList);
+    if pHavingLoc <> nil then
+      markAggregateInExpr(pParse, pHavingLoc);
+    sqlite3ExprAnalyzeAggList(@sNCAgg, p^.pEList);
+    if pHavingLoc <> nil then
+      sqlite3ExprAnalyzeAggregates(@sNCAgg, pHavingLoc);
+    pAggI2^.nAccumulator := pAggI2^.nColumn;
+    analyzeAggFuncArgs(pAggI2, @sNCAgg);
+
+    { Bail on DISTINCT/iOBTab/EP_WinFunc/NEEDCOLL aggregates — those need
+      ephemeral tables / collation plumbing not in scope here. }
+    canUseAgg := True;
+    for jAgg := 0 to pAggI2^.nFunc - 1 do
+    begin
+      pAggFunc := @pAggI2^.aFunc[jAgg];
+      if pAggFunc^.iDistinct >= 0 then begin canUseAgg := False; break; end;
+      if pAggFunc^.iOBTab    >= 0 then begin canUseAgg := False; break; end;
+      if ((pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0)
+         and ((pAggFunc^.pFExpr^.y.pWin = nil)
+              or (pAggFunc^.pFExpr^.y.pWin^.eFrmType <> TK_FILTER))
+      then begin canUseAgg := False; break; end;
+      if (pAggFunc^.pFunc <> nil)
+         and ((PTFuncDef(pAggFunc^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0)
+      then begin canUseAgg := False; break; end;
+    end;
+
+    if canUseAgg and (pParse^.nErr = 0) then
+    begin
+      sqlite3GenerateColumnNames(pParse, p);
+      iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
+      sqlite3CodeVerifySchema(pParse, iDb);
+
+      { Allocate sorter cursor + KeyInfo from pGroupBy. }
+      pAggI2^.sortingIdx := pParse^.nTab; Inc(pParse^.nTab);
+      pKeyInfoGB := sqlite3KeyInfoFromExprList(pParse, pGroupByLoc, 0,
+                                               pAggI2^.nColumn);
+      sqlite3VdbeAddOp4(v, OP_SorterOpen, pAggI2^.sortingIdx, nGroupBy, 0,
+                        PAnsiChar(pKeyInfoGB), P4_KEYINFO);
+
+      { Register layout — match select.c:8514..8523. }
+      Inc(pParse^.nMem); iUseFlag    := pParse^.nMem;
+      Inc(pParse^.nMem); iAbortFlag  := pParse^.nMem;
+      Inc(pParse^.nMem); regOutputRow:= pParse^.nMem;
+      addrOutputRow := sqlite3VdbeMakeLabel(pParse);
+      Inc(pParse^.nMem); regReset    := pParse^.nMem;
+      addrReset := sqlite3VdbeMakeLabel(pParse);
+      iAMem := pParse^.nMem + 1; pParse^.nMem := pParse^.nMem + nGroupBy;
+      iBMem := pParse^.nMem + 1; pParse^.nMem := pParse^.nMem + nGroupBy;
+
+      addrEnd := sqlite3VdbeMakeLabel(pParse);
+
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, iAbortFlag);
+      sqlite3VdbeAddOp3(v, OP_Null, 0, iAMem, iAMem + nGroupBy - 1);
+
+      { Begin scan in GROUP BY order. }
+      sqlite3VdbeAddOp2(v, OP_Gosub, regReset, addrReset);
+      pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere, pGroupByLoc,
+                                  nil, p, WHERE_GROUPBY, 0);
+      if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+      assignAggregateRegisters(pParse, pAggI2);
+
+      { Push rows into sorter (always groupBySort=1).  Encode pGroupBy
+        terms first, then any accumulator columns whose iSorterColumn
+        falls past the GROUP BY range. }
+      nColGB := nGroupBy;
+      jj := nGroupBy;
+      for i := 0 to pAggI2^.nColumn - 1 do
+      begin
+        if pAggI2^.aCol[i].iSorterColumn >= jj then
+        begin
+          Inc(nColGB);
+          Inc(jj);
+        end;
+      end;
+      regBase := sqlite3GetTempRange(pParse, nColGB);
+      for i := 0 to nGroupBy - 1 do
+      begin
+        r1 := sqlite3ExprCodeTarget(pParse,
+                ExprListItems(pGroupByLoc)[i].pExpr, regBase + i);
+        if r1 <> regBase + i then
+          sqlite3VdbeAddOp2(v, OP_Copy, r1, regBase + i);
+      end;
+      pAggI2^.directMode := 1;
+      jj := nGroupBy;
+      for i := 0 to pAggI2^.nColumn - 1 do
+      begin
+        pColGB := @pAggI2^.aCol[i];
+        if pColGB^.iSorterColumn >= jj then
+        begin
+          sqlite3ExprCode(pParse, pColGB^.pCExpr, jj + regBase);
+          Inc(jj);
+        end;
+      end;
+      pAggI2^.directMode := 0;
+      regRecord := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, nColGB, regRecord);
+      sqlite3VdbeAddOp2(v, OP_SorterInsert, pAggI2^.sortingIdx, regRecord);
+      sqlite3ReleaseTempReg(pParse, regRecord);
+      sqlite3ReleaseTempRange(pParse, regBase, nColGB);
+      sqlite3WhereEnd(pWInfo);
+
+      pAggI2^.sortingIdxPTab := pParse^.nTab; Inc(pParse^.nTab);
+      sortPTab := pAggI2^.sortingIdxPTab;
+      sortOut  := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp3(v, OP_OpenPseudo, sortPTab, sortOut, nColGB);
+      sqlite3VdbeAddOp2(v, OP_SorterSort, pAggI2^.sortingIdx, addrEnd);
+      pAggI2^.useSortingIdx := 1;
+
+      { Top of input loop. }
+      addrTopOfLoop := sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp3(v, OP_SorterData, pAggI2^.sortingIdx,
+                        sortOut, sortPTab);
+      for jj := 0 to nGroupBy - 1 do
+        sqlite3VdbeAddOp3(v, OP_Column, sortPTab, jj, iBMem + jj);
+      sqlite3VdbeAddOp4(v, OP_Compare, iAMem, iBMem, nGroupBy,
+                        PAnsiChar(sqlite3KeyInfoRef(pKeyInfoGB)), P4_KEYINFO);
+      addr1 := sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp3(v, OP_Jump, addr1 + 1, 0, addr1 + 1);
+
+      { Group-changed code. }
+      sqlite3VdbeAddOp2(v, OP_Gosub, regOutputRow, addrOutputRow);
+      sqlite3VdbeAddOp3(v, OP_Move, iBMem, iAMem, nGroupBy);
+      sqlite3VdbeAddOp2(v, OP_IfPos, iAbortFlag, addrEnd);
+      sqlite3VdbeAddOp2(v, OP_Gosub, regReset, addrReset);
+
+      sqlite3VdbeJumpHere(v, addr1);
+      updateAccumulatorSimple(pParse, pAggI2);
+      sqlite3VdbeAddOp2(v, OP_Integer, 1, iUseFlag);
+
+      sqlite3VdbeAddOp2(v, OP_SorterNext, pAggI2^.sortingIdx, addrTopOfLoop);
+
+      { Final group output + jump to end. }
+      sqlite3VdbeAddOp2(v, OP_Gosub, regOutputRow, addrOutputRow);
+      sqlite3VdbeGoto(v, addrEnd);
+
+      { Subroutine: addrSetAbort. }
+      addrSetAbort := sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp2(v, OP_Integer, 1, iAbortFlag);
+      sqlite3VdbeAddOp1(v, OP_Return, regOutputRow);
+
+      { Subroutine: addrOutputRow. }
+      sqlite3VdbeResolveLabel(v, addrOutputRow);
+      addrOutputRow := sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp2(v, OP_IfPos, iUseFlag, addrOutputRow + 2);
+      sqlite3VdbeAddOp1(v, OP_Return, regOutputRow);
+      finalizeAggFunctionsSimple(pParse, pAggI2);
+      if pHavingLoc <> nil then
+        sqlite3ExprIfFalse(pParse, pHavingLoc, addrOutputRow + 1,
+                           SQLITE_JUMPIFNULL);
+      { Render result row (post-finalize so directMode=0; TK_AGG_COLUMN
+        reads from accumulator-col regs, TK_AGG_FUNCTION from func regs). }
+      nResultCol     := p^.pEList^.nExpr;
+      pDest^.nSdst   := nResultCol;
+      if pDest^.iSdst = 0 then
+      begin
+        pDest^.iSdst := pParse^.nMem + 1;
+        pParse^.nMem := pParse^.nMem + nResultCol;
+      end;
+      items := ExprListItems(p^.pEList);
+      for i := 0 to nResultCol - 1 do
+      begin
+        r1 := sqlite3ExprCodeTarget(pParse, items[i].pExpr, pDest^.iSdst + i);
+        if r1 <> pDest^.iSdst + i then
+          sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
+      end;
+      if pDest^.eDest = SRT_Output then
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+      sqlite3VdbeAddOp1(v, OP_Return, regOutputRow);
+
+      { Subroutine: addrReset. }
+      sqlite3VdbeResolveLabel(v, addrReset);
+      resetAccumulatorSimple(pParse, pAggI2);
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, iUseFlag);
+      sqlite3VdbeAddOp1(v, OP_Return, regReset);
+
+      sqlite3VdbeResolveLabel(v, addrEnd);
+
+      pAggI2^.useSortingIdx := 0;
       if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
       Exit;
     end;

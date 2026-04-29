@@ -8274,19 +8274,15 @@ begin
       pCur^.pgnoRoot := pCur^.uc.pCursor^.pgnoRoot;
     end;
 
-    { ────── OP_OpenPseudo ────── (vdbe.c:4590) }
-    { Open a new cursor P1 backed by the register P3 (which holds a serialised
-      row).  P2 is the number of fields.  When P3 is non-zero the cursor is an
-      index-format pseudo-cursor (isTable=0); when P3 is zero it is a rowid
-      pseudo-cursor (isTable=1).
-      Pascal note: seekResult stores P3 (the register index) so that
-      OP_Column can read the row with  pRegCol := @aMem[pCx^.seekResult]. }
+    { ────── OP_OpenPseudo ────── (vdbe.c:4683) }
+    { Open a new cursor P1 backed by register P2 (which holds the row).
+      P3 is the number of fields.  Mirrors C semantics exactly. }
     OP_OpenPseudo: begin
-      pCur := allocateCursor(v, pOp^.p1, pOp^.p2, CURTYPE_PSEUDO);
+      pCur := allocateCursor(v, pOp^.p1, pOp^.p3, CURTYPE_PSEUDO);
       if pCur = nil then goto no_mem;
       pCur^.nullRow    := 1;
-      pCur^.seekResult := pOp^.p3;           { register holding the row }
-      pCur^.isTable    := u8(ord(pOp^.p3 = 0));
+      pCur^.seekResult := pOp^.p2;           { register holding the row }
+      pCur^.isTable    := 1;
     end;
 
     { ────── OP_OpenDup ────── (vdbe.c:4600) }
