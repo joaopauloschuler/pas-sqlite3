@@ -2786,8 +2786,9 @@ function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
 procedure sqlite3ParseObjectInit(pParse: PParse; db: PTsqlite3);
 procedure sqlite3ParseObjectReset(pParse: PParse);
 function  sqlite3ReadSchema(pParse: PParse): i32;
-function  sqlite3Reprepare(p: PVdbe): i32;
-{ sqlite3_prepare, sqlite3_prepare_v2, sqlite3_prepare_v3 are now defined in
+{ sqlite3Reprepare is defined in passqlite3main (Phase 7.1.3) — it needs
+  sqlite3LockAndPrepare which lives there.
+  sqlite3_prepare, sqlite3_prepare_v2, sqlite3_prepare_v3 are now defined in
   passqlite3main (Phase 8.2).  The UTF-16 entry points remain stubs here. }
 function  sqlite3_prepare16(db: PTsqlite3; zSql: Pointer; nBytes: i32;
   ppStmt: PPointer; pzTail: PPointer): i32;
@@ -25686,10 +25687,7 @@ begin
   Result := sqlite3_prepare16(db, zSql, nBytes, ppStmt, pzTail);
 end;
 
-function sqlite3Reprepare(p: PVdbe): i32;
-begin
-  Result := SQLITE_OK; { Phase 7 }
-end;
+{ sqlite3Reprepare body lives in passqlite3main (needs sqlite3LockAndPrepare). }
 
 // ===========================================================================
 // Phase 6.5 — alter.c stubs

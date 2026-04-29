@@ -491,8 +491,14 @@ Important: At the end of this document, please find:
             `prepFlags`/`expmask`/`zSql`); the codegen.pas:25433
             duplicate is dead and shadowed by the vdbe.pas version that
             main.pas:802 actually calls (u8-cast confirms the dispatch).
-       [ ] `sqlite3Reprepare` (codegen.pas:25295) — re-prepare a
-            statement after schema change.
+       [X] `sqlite3Reprepare` — ported 2026-04-28 (passqlite3main.pas)
+            — verbatim port of prepare.c:886; relies on sqlite3LockAndPrepare
+            + sqlite3VdbeSwap + sqlite3TransferBindings + VdbeResetStepResult
+            + VdbeFinalize.  Codegen forward decl + stub body removed.
+            Build clean; TestExplainParity 1016/10, DiagPubApi 138/0 — no
+            regressions.  Not currently called by any prepared-step path
+            (sqlite3_step still re-runs without auto-reprepare on
+            SQLITE_SCHEMA), so runtime behaviour unchanged.
        [X] `sqlite3TransferBindings` — ported 2026-04-28 (codegen.pas)
             — verbatim port of vdbeapi.c:1964; aVar[] entries moved via
             sqlite3VdbeMemMove with same-db / matching-nVar asserts.

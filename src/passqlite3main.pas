@@ -139,6 +139,9 @@ function sqlite3_prepare_v3(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
                             prepFlags: u32; ppStmt: PPointer;
                             pzTail: PPAnsiChar): i32;
 
+{ Phase 7.1.3 — re-prepare a v2 statement after schema change (prepare.c:886). }
+function sqlite3Reprepare(p: PVdbe): i32;
+
 { Phase 8.3 — registration APIs (main.c, vtab.c). }
 function sqlite3_create_function(db: PTsqlite3; zFunc: PAnsiChar;
   nArg: i32; enc: i32; pUserData: Pointer;
@@ -912,6 +915,39 @@ begin
   Result := sqlite3LockAndPrepare(db, zSql, nBytes,
               (prepFlags and SQLITE_PREPARE_MASK) or SQLITE_PREPARE_SAVESQL,
               nil, ppStmt, pzTail);
+end;
+
+{ prepare.c:886 — sqlite3Reprepare.  Recompile a prepared statement after a
+  schema change so the next sqlite3_step() can transparently re-execute against
+  the new schema.  Only called for prepare_v2()/v3() statements (those that
+  retain zSql).  Returns SQLITE_OK on success, SQLITE_LOCKED if another
+  connection holds the schema lock, SQLITE_SCHEMA on any other error. }
+function sqlite3Reprepare(p: PVdbe): i32;
+var
+  rc:        i32;
+  pNew:      Pointer;
+  zSql:      PAnsiChar;
+  db:        PTsqlite3;
+  prepFlags: u8;
+begin
+  zSql := p^.zSql;
+  Assert(zSql <> nil, 'Reprepare on prepare_v2 stmt only');
+  db := p^.db;
+  prepFlags := p^.prepFlags;
+  pNew := nil;
+  rc := sqlite3LockAndPrepare(db, zSql, -1, prepFlags, p, @pNew, nil);
+  if rc <> 0 then begin
+    if rc = SQLITE_NOMEM then sqlite3OomFault(db);
+    Assert(pNew = nil, 'pNew must be nil on prepare error');
+    Result := rc;
+    Exit;
+  end;
+  Assert(pNew <> nil, 'pNew must be non-nil on prepare success');
+  sqlite3VdbeSwap(PVdbe(pNew), p);
+  sqlite3TransferBindings(pNew, Pointer(p));
+  sqlite3VdbeResetStepResult(PVdbe(pNew));
+  sqlite3VdbeFinalize(PVdbe(pNew));
+  Result := SQLITE_OK;
 end;
 
 { ----------------------------------------------------------------------
