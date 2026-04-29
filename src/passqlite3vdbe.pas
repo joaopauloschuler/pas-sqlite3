@@ -1283,7 +1283,8 @@ function  sqlite3VdbeAddOp4Dup8(v: PVdbe; op, p1, p2, p3: i32;
                                 pP4: Pu8; p4type: i32): i32;
 function  sqlite3VdbeGoto(v: PVdbe; iDest: i32): i32;
 function  sqlite3VdbeLoadString(p: PVdbe; iDest: i32; zStr: PAnsiChar): i32;
-procedure sqlite3VdbeMultiLoad(p: PVdbe; iDest: i32; zTypes: PAnsiChar);
+procedure sqlite3VdbeMultiLoad(p: PVdbe; iDest: i32; zTypes: PAnsiChar;
+                               const args: array of const);
 function  sqlite3VdbeAddFunctionCall(pParse: PParse; p1: i32; p2, p3: i32;
                                     nArg: i32; pFunc: PFuncDef; p5: i32): i32;
 function  sqlite3VdbeExplainParent(pParse: PParse): i32;
@@ -2307,9 +2308,62 @@ begin
   Result := sqlite3VdbeAddOp4(p, OP_String8, 0, iDest, 0, zStr, 0);
 end;
 
-procedure sqlite3VdbeMultiLoad(p: PVdbe; iDest: i32; zTypes: PAnsiChar);
+procedure sqlite3VdbeMultiLoad(p: PVdbe; iDest: i32; zTypes: PAnsiChar;
+                               const args: array of const);
+{ Port of vdbeaux.c:391 sqlite3VdbeMultiLoad.  Walk zTypes left-to-right,
+  emitting OP_Integer / OP_String8 / OP_Null per character, then close with
+  OP_ResultRow over the contiguous registers iDest..iDest+i-1.  An 'X' or
+  unknown character ends the loop early and skips the OP_ResultRow.  C
+  varargs are exposed in Pas via `array of const` (TVarRec); 'i' consumes
+  one integer slot, 's' consumes one string/pointer slot. }
+var
+  i, k: i32;
+  c:    AnsiChar;
+  vr:   TVarRec;
+  pStr: PAnsiChar;
+  iVal: i32;
 begin
-  { Stub — full implementation requires va_list support (Phase 6) }
+  i := 0;
+  k := 0;
+  while True do begin
+    c := zTypes[i];
+    if c = #0 then break;
+    if c = 's' then begin
+      pStr := nil;
+      if k <= High(args) then begin
+        vr := args[k];
+        case vr.VType of
+          vtString:     pStr := PAnsiChar(@vr.VString^[1]);
+          vtAnsiString: pStr := PAnsiChar(AnsiString(vr.VAnsiString));
+          vtPChar:      pStr := vr.VPChar;
+          vtPointer:    pStr := PAnsiChar(vr.VPointer);
+          vtChar:       pStr := nil;
+        end;
+        Inc(k);
+      end;
+      if pStr = nil then
+        sqlite3VdbeAddOp4(p, OP_Null, 0, iDest + i, 0, nil, 0)
+      else
+        sqlite3VdbeAddOp4(p, OP_String8, 0, iDest + i, 0, pStr, 0);
+    end else if c = 'i' then begin
+      iVal := 0;
+      if k <= High(args) then begin
+        vr := args[k];
+        case vr.VType of
+          vtInteger:  iVal := vr.VInteger;
+          vtInt64:    iVal := i32(vr.VInt64^);
+          vtBoolean:  if vr.VBoolean then iVal := 1 else iVal := 0;
+        end;
+        Inc(k);
+      end;
+      sqlite3VdbeAddOp2(p, OP_Integer, iVal, iDest + i);
+    end else begin
+      { 'X' or unknown: skip OP_ResultRow }
+      Exit;
+    end;
+    Inc(i);
+  end;
+  sqlite3VdbeAddOp2(p, OP_ResultRow, iDest, i);
 end;
 
 function sqlite3VdbeAddFunctionCall(pParse: PParse; p1: i32; p2, p3: i32;

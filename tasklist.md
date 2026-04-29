@@ -361,7 +361,11 @@ Important: At the end of this document, please find:
        in full.
   [ ] **6.20** port remaining parser.pas stubs in full:
   [ ] **6.21** port vdbe.pas stubs in full from C to pascal:
-       [ ] `sqlite3VdbeMultiLoad`
+       [X] `sqlite3VdbeMultiLoad` — ported 2026-04-29 (vdbeaux.c:391).
+            Variadic 'i'/'s'/'X' walker exposed via `array of const`
+            (TVarRec); emits OP_Integer / OP_String8 / OP_Null per slot,
+            closes with OP_ResultRow over iDest..iDest+i-1.  Dead-code
+            until pragma.c callers land (6.12).
        [ ] `sqlite3VdbeDisplayComment`
        [X] `sqlite3_blob_open` / `sqlite3_blob_reopen` — ported 2026-04-29.
        [X] `OP_FilterAdd` / `OP_Filter` — ported 2026-04-29.
