@@ -361,9 +361,9 @@ Important: At the end of this document, please find:
        in full.
   [ ] **6.20** port remaining parser.pas stubs in full:
   [ ] **6.21** port vdbe.pas stubs in full from C to pascal:
-       `sqlite3VdbeMultiLoad` (blocked: only used by pragma.c and
+       [ ] `sqlite3VdbeMultiLoad` (blocked: only used by pragma.c and
        requires va_list — defer until 6.12 sqlite3Pragma lands),
-       `sqlite3VdbeDisplayComment` (blocked: needs opcode-synopsis
+       [ ] `sqlite3VdbeDisplayComment` (blocked: needs opcode-synopsis
        tables appended after each name in sqlite3OpcodeName — Pas
        OpcodeNames table is plain names only, defer),
        [X] `sqlite3_blob_open` / `sqlite3_blob_reopen` — ported 2026-04-29.
@@ -376,28 +376,36 @@ Important: At the end of this document, please find:
             xAuth+mTrace) and 0x02 (override nAnalysisLimit).
   [ ] **6.22** port codegen.pas rename / error-offset stubs in full from C
        to pascal:
-       [ ] `sqlite3RenameExprUnmap`, `sqlite3RenameTokenMap` — only
+       [ ] `sqlite3RenameExprUnmap`
+       [ ] `sqlite3RenameTokenMap` — only
             productive under `PARSE_MODE_RENAME`.  Full bodies
             (`RenameToken` record + walker callbacks) deferred to land
             with `sqlite3AlterRenameTable` / `sqlite3AlterRenameColumn`
             in 6.27; current no-op matches C semantics whenever the
             parser is not in rename mode.
   [ ] **6.23** port codegen.pas trigger stubs in full from C to pascal:
-       `sqlite3BeginTrigger`, `sqlite3FinishTrigger`,
-       `sqlite3DropTrigger`, `sqlite3DropTriggerPtr`,
-       `sqlite3UnlinkAndDeleteTrigger`,
-       `sqlite3CodeRowTriggerDirect`, `sqlite3CodeRowTrigger`,
-       `sqlite3TriggerStepSrc`, `sqlite3TriggerColmask`.
+       [ ] `sqlite3BeginTrigger`
+       [ ] `sqlite3FinishTrigger`
+       [ ] `sqlite3DropTrigger`
+       [ ] `sqlite3DropTriggerPtr`
+       [ ] `sqlite3UnlinkAndDeleteTrigger`
+       [ ] `sqlite3CodeRowTriggerDirect`
+       [ ] `sqlite3CodeRowTrigger`
+       [ ] `sqlite3TriggerStepSrc`
+       [ ] `sqlite3TriggerColmask`.
        [X] `sqlite3TriggerList` — ported 2026-04-29 (trigger.c:50; walks
             temp schema's trigHash and prepends matching triggers).
        [X] `sqlite3TriggersExist` — ported 2026-04-29 (trigger.c:805/869;
             triggersReallyExist inlined).  Faithful no-op until
             `sqlite3BeginTrigger` populates the trigger schema.
   [ ] **6.24** port codegen.pas DML / insert stubs in full from C to pascal:
-       `sqlite3UpsertAnalyzeTarget`, `sqlite3UpsertDoUpdate`,
-       `sqlite3AutoincrementBegin`, `sqlite3AutoincrementEnd`,
-       `sqlite3MultiValues`, `autoIncBegin`,
-       `sqlite3GenerateConstraintChecks`.
+       [ ] `sqlite3UpsertAnalyzeTarget`
+       [ ] `sqlite3UpsertDoUpdate`,
+       [ ] `sqlite3AutoincrementBegin`
+       [ ] `sqlite3AutoincrementEnd`,
+       [ ] `sqlite3MultiValues`
+       [ ] `autoIncBegin`,
+       [ ] `sqlite3GenerateConstraintChecks`.
        [X] `sqlite3MultiValuesEnd` — ported 2026-04-29.
        [X] `sqlite3ComputeGeneratedColumns` — ported 2026-04-29 (dead-code
             until sqlite3Insert / sqlite3Update / GenerateConstraintChecks land).
