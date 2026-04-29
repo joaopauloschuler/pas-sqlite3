@@ -33484,6 +33484,286 @@ begin
   end;
 end;
 
+{ ============================================================================
+  Phase 6.21 — vdbeblob.c sqlite3_blob_open / blob_reopen full body port.
+  C reference: ../sqlite3/src/vdbeblob.c (blobSeekToRow, sqlite3_blob_open,
+  sqlite3_blob_reopen).  Lives here rather than in vdbe.pas because it
+  needs PTable2 / PIndex2 / PSchema / PParse types plus sqlite3LocateTable.
+  Hooked into vdbe.pas via gBlobOpenImpl / gBlobReopenImpl at unit init.
+  ============================================================================ }
+
+const
+  vdbeblob_OpCount = 6;
+  vdbeblob_aOp: array[0..vdbeblob_OpCount-1] of TVdbeOpList = (
+    (opcode: OP_TableLock; p1: 0; p2: 0; p3: 0),  { 0: read/write lock }
+    (opcode: OP_OpenRead;  p1: 0; p2: 0; p3: 0),  { 1: open cursor }
+    (opcode: OP_NotExists; p1: 0; p2: 5; p3: 1),  { 2: seek to rowid r[1] }
+    (opcode: OP_Column;    p1: 0; p2: 0; p3: 1),  { 3 }
+    (opcode: OP_ResultRow; p1: 1; p2: 0; p3: 0),  { 4 }
+    (opcode: OP_Halt;      p1: 0; p2: 0; p3: 0)   { 5 }
+  );
+
+function vdbeBlobSeekToRow(p: PIncrblob; iRow: i64; var pzErr: PAnsiChar): i32;
+var
+  v:    PVdbe;
+  rc:   i32;
+  pC:   PVdbeCursor;
+  iCol: i32;
+  tp:   u32;
+  aTypeArr: Pu32;
+  pMm:   PMem;
+  pStmt: PVdbe;
+begin
+  pzErr := nil;
+  v := p^.pStmt;
+  if (v = nil) or (v^.aMem = nil) then begin
+    Result := SQLITE_ABORT; Exit;
+  end;
+  pMm := PMem(Pu8(v^.aMem) + SizeOf(TMem) * 1);  { &v->aMem[1] }
+  sqlite3VdbeMemSetInt64(pMm, iRow);
+
+  if v^.pc > 4 then begin
+    v^.pc := 4;
+    rc := sqlite3VdbeExec(v);
+  end else
+    rc := sqlite3_step(p^.pStmt);
+
+  if rc = SQLITE_ROW then begin
+    pC := v^.apCsr[0];
+    if (pC = nil) or (pC^.eCurType <> CURTYPE_BTREE) then begin
+      rc := SQLITE_ERROR;
+    end else begin
+      iCol := p^.iCol;
+      if pC^.nHdrParsed > iCol then begin
+        aTypeArr := Pu32(Pu8(pC) + 120);  { pC->aType }
+        tp := aTypeArr[iCol];
+      end else
+        tp := 0;
+      if tp < 12 then begin
+        if tp = 0 then
+          pzErr := sqlite3MPrintf(p^.db, '%s', ['cannot open value of type null'])
+        else if tp = 7 then
+          pzErr := sqlite3MPrintf(p^.db, '%s', ['cannot open value of type real'])
+        else
+          pzErr := sqlite3MPrintf(p^.db, '%s', ['cannot open value of type integer']);
+        rc := SQLITE_ERROR;
+        pStmt := p^.pStmt;
+        sqlite3_finalize(pStmt);
+        p^.pStmt := nil;
+      end else begin
+        p^.iOffset := i32(pC^.aOffset[iCol]);
+        p^.nByte   := i32(sqlite3VdbeSerialTypeLen(tp));
+        p^.pCsr    := pC^.uc.pCursor;
+        sqlite3BtreeIncrblobCursor(p^.pCsr);
+      end;
+    end;
+  end;
+
+  if rc = SQLITE_ROW then
+    rc := SQLITE_OK
+  else if p^.pStmt <> nil then begin
+    pStmt := p^.pStmt;
+    rc := sqlite3_finalize(pStmt);
+    p^.pStmt := nil;
+    if rc = SQLITE_OK then begin
+      pzErr := sqlite3MPrintf(p^.db, 'no such rowid: %lld', [iRow]);
+      rc := SQLITE_ERROR;
+    end else
+      pzErr := sqlite3MPrintf(p^.db, '%s', [sqlite3ErrStr(rc)]);
+  end;
+  Result := rc;
+end;
+
+function vdbeBlobOpenImpl(db: PTsqlite3;
+  zDb, zTable, zColumn: PAnsiChar; iRow: i64; wrFlag: i32;
+  out ppBlob: Psqlite3_blob): i32;
+label blob_open_out;
+var
+  iCol:    i32;
+  rc:      i32;
+  zErr:    PAnsiChar;
+  pTab:    PTable2;
+  pBlob:   PIncrblob;
+  iDb:     i32;
+  sParse:  TParse;
+  v:       PVdbe;
+  aOp:     PVdbeOp;
+  pIdx:    PIndex2;
+  zFault:  PAnsiChar;
+  j:       i32;
+  aiCol:   Pi16;
+begin
+  ppBlob := nil;
+  zErr   := nil;
+  pBlob  := nil;
+
+  { Stub-db guard: no attached databases means no schema to look up.
+    Test infrastructure exercises the API with a zero-initialised
+    Tsqlite3, so guard before touching aDb / pParse / mutex paths. }
+  if (db^.aDb = nil) or (db^.nDb <= 0) then begin
+    Result := SQLITE_ERROR; Exit;
+  end;
+
+  FillChar(sParse, SizeOf(sParse), 0);
+  if wrFlag <> 0 then wrFlag := 1;
+
+  sqlite3_mutex_enter(db^.mutex);
+
+  pBlob := PIncrblob(sqlite3DbMallocZero(db, SizeOf(TIncrblob)));
+  if pBlob = nil then begin
+    rc := SQLITE_NOMEM; goto blob_open_out;
+  end;
+
+  sqlite3ParseObjectInit(@sParse, db);
+  sqlite3BtreeEnterAll(db);
+  pTab := sqlite3LocateTable(@sParse, 0, zTable, zDb);
+
+  if (pTab <> nil) and (pTab^.eTabType = TABTYP_VTAB) then begin
+    pTab := nil;
+    sqlite3ErrorMsg(@sParse, PAnsiChar(AnsiString('cannot open virtual table: ') + AnsiString(zTable)));
+  end;
+  if (pTab <> nil) and (not HasRowid(pTab)) then begin
+    pTab := nil;
+    sqlite3ErrorMsg(@sParse, PAnsiChar(AnsiString('cannot open table without rowid: ') + AnsiString(zTable)));
+  end;
+  if (pTab <> nil) and ((pTab^.tabFlags and TF_HasGenerated) <> 0) then begin
+    pTab := nil;
+    sqlite3ErrorMsg(@sParse, PAnsiChar(AnsiString('cannot open table with generated columns: ') + AnsiString(zTable)));
+  end;
+  if (pTab <> nil) and IsView(pTab) then begin
+    pTab := nil;
+    sqlite3ErrorMsg(@sParse, PAnsiChar(AnsiString('cannot open view: ') + AnsiString(zTable)));
+  end;
+
+  if pTab = nil then begin
+    rc := SQLITE_ERROR;
+    sqlite3BtreeLeaveAll(db);
+    goto blob_open_out;
+  end;
+  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  if iDb < 0 then begin
+    rc := SQLITE_ERROR;
+    sqlite3BtreeLeaveAll(db);
+    goto blob_open_out;
+  end;
+
+  pBlob^.pTab := Pointer(pTab);
+  pBlob^.zDb  := db^.aDb[iDb].zDbSName;
+
+  iCol := sqlite3ColumnIndex(pTab, zColumn);
+  if iCol < 0 then begin
+    zErr := sqlite3MPrintf(db, 'no such column: "%s"', [zColumn]);
+    rc := SQLITE_ERROR;
+    sqlite3BtreeLeaveAll(db);
+    goto blob_open_out;
+  end;
+
+  if wrFlag <> 0 then begin
+    zFault := nil;
+    pIdx := pTab^.pIndex;
+    while pIdx <> nil do begin
+      aiCol := pIdx^.aiColumn;
+      for j := 0 to i32(pIdx^.nKeyCol) - 1 do begin
+        if (aiCol[j] = iCol) or (aiCol[j] = XN_EXPR) then
+          zFault := 'indexed';
+      end;
+      pIdx := pIdx^.pNext;
+    end;
+    if zFault <> nil then begin
+      zErr := sqlite3MPrintf(db, 'cannot open %s column for writing', [zFault]);
+      rc := SQLITE_ERROR;
+      sqlite3BtreeLeaveAll(db);
+      goto blob_open_out;
+    end;
+  end;
+
+  pBlob^.pStmt := sqlite3VdbeCreate(@sParse);
+  if pBlob^.pStmt = nil then begin
+    rc := SQLITE_NOMEM;
+    sqlite3BtreeLeaveAll(db);
+    goto blob_open_out;
+  end;
+
+  v := pBlob^.pStmt;
+  sqlite3VdbeAddOp4Int(v, OP_Transaction, iDb, wrFlag,
+                       passqlite3util.PSchema(pTab^.pSchema)^.schema_cookie,
+                       passqlite3util.PSchema(pTab^.pSchema)^.iGeneration);
+  sqlite3VdbeChangeP5(v, 1);
+  aOp := sqlite3VdbeAddOpList(v, vdbeblob_OpCount, @vdbeblob_aOp[0], 0);
+  sqlite3VdbeUsesBtree(v, iDb);
+
+  if (db^.mallocFailed = 0) and (aOp <> nil) then begin
+    { OP_TableLock — degrade to OP_Noop in non-shared-cache build (default) }
+    aOp[0].opcode := OP_Noop;
+    { OpenRead/OpenWrite }
+    if wrFlag <> 0 then aOp[1].opcode := OP_OpenWrite;
+    aOp[1].p2 := pTab^.tnum;
+    aOp[1].p3 := iDb;
+    aOp[1].p4type := P4_INT32;
+    aOp[1].p4.i := pTab^.nCol + 1;
+    aOp[3].p2 := pTab^.nCol;
+
+    sParse.nVar := 0;
+    sParse.nMem := 1;
+    sParse.nTab := 1;
+    sqlite3VdbeMakeReady(v, @sParse);
+  end;
+
+  pBlob^.iCol := iCol;
+  pBlob^.db   := db;
+  sqlite3BtreeLeaveAll(db);
+  if db^.mallocFailed <> 0 then begin
+    rc := SQLITE_NOMEM; goto blob_open_out;
+  end;
+
+  rc := vdbeBlobSeekToRow(pBlob, iRow, zErr);
+
+blob_open_out:
+  if (rc = SQLITE_OK) and (db^.mallocFailed = 0) then begin
+    ppBlob := Psqlite3_blob(pBlob);
+  end else begin
+    if (pBlob <> nil) and (pBlob^.pStmt <> nil) then
+      sqlite3VdbeFinalize(pBlob^.pStmt);
+    sqlite3DbFree(db, pBlob);
+  end;
+  if zErr <> nil then begin
+    sqlite3ErrorWithMsg(db, rc, zErr);
+    sqlite3DbFree(db, zErr);
+  end else
+    sqlite3ErrorWithMsg(db, rc, nil);
+  sqlite3ParseObjectReset(@sParse);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
+function vdbeBlobReopenImpl(pBlob: Psqlite3_blob; iRow: i64): i32;
+var
+  rc:   i32;
+  db:   PTsqlite3;
+  zErr: PAnsiChar;
+  v:    PVdbe;
+begin
+  db := pBlob^.db;
+  sqlite3_mutex_enter(db^.mutex);
+  if pBlob^.pStmt = nil then
+    rc := SQLITE_ABORT
+  else begin
+    zErr := nil;
+    v := pBlob^.pStmt;
+    v^.rc := SQLITE_OK;
+    rc := vdbeBlobSeekToRow(pBlob, iRow, zErr);
+    if rc <> SQLITE_OK then begin
+      if zErr <> nil then begin
+        sqlite3ErrorWithMsg(db, rc, zErr);
+        sqlite3DbFree(db, zErr);
+      end else
+        sqlite3ErrorWithMsg(db, rc, nil);
+    end;
+  end;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
+end;
+
 initialization
   { Wire the schema-cleanup hooks declared by passqlite3vdbe.  The opcode
     handlers there (OP_DropTable, OP_DropIndex, OP_DropTrigger, OP_Destroy
@@ -33500,5 +33780,7 @@ initialization
   passqlite3vdbe.gResetAllSchemas        := @sqlite3ResetAllSchemasOfConnection;
   passqlite3vdbe.gDisplayP4              := passqlite3vdbe.TDisplayP4Fn(@displayP4Trampoline);
   passqlite3vdbe.gAnalysisLoad           := @analysisLoadTrampoline;
+  passqlite3vdbe.gBlobOpenImpl           := @vdbeBlobOpenImpl;
+  passqlite3vdbe.gBlobReopenImpl         := @vdbeBlobReopenImpl;
 
 end.

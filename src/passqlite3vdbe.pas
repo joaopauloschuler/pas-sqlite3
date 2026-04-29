@@ -1507,6 +1507,10 @@ type
   TResetAllSchemasFn = procedure(db: PTsqlite3);
   TDisplayP4Fn       = function(db: Psqlite3; pOp: PVdbeOp): PAnsiChar;
   TAnalysisLoadFn    = function(db: PTsqlite3; iDb: i32): i32;
+  TBlobOpenFn        = function(db: PTsqlite3; zDb, zTable, zColumn: PAnsiChar;
+                                iRow: i64; flags: i32;
+                                out ppBlob: Psqlite3_blob): i32;
+  TBlobReopenFn      = function(pBlob: Psqlite3_blob; iRow: i64): i32;
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
@@ -1517,6 +1521,8 @@ var
   gResetAllSchemas:        TResetAllSchemasFn;
   gDisplayP4:              TDisplayP4Fn;
   gAnalysisLoad:           TAnalysisLoadFn;
+  gBlobOpenImpl:           TBlobOpenFn;
+  gBlobReopenImpl:         TBlobReopenFn;
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
@@ -4971,9 +4977,14 @@ function sqlite3_blob_open(db: PTsqlite3; zDb, zTable, zColumn: PAnsiChar;
                            iRow: i64; flags: i32;
                            out ppBlob: Psqlite3_blob): i32;
 begin
-  { Stub: SQL compiler not yet available (Phase 7+). }
   ppBlob := nil;
-  Result := SQLITE_ERROR;
+  if (db = nil) or (zTable = nil) or (zColumn = nil) then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  if Assigned(gBlobOpenImpl) then
+    Result := gBlobOpenImpl(db, zDb, zTable, zColumn, iRow, flags, ppBlob)
+  else
+    Result := SQLITE_ERROR;
 end;
 
 function sqlite3_blob_close(pBlob: Psqlite3_blob): i32;
@@ -5024,8 +5035,10 @@ function sqlite3_blob_reopen(pBlob: Psqlite3_blob; iRow: i64): i32;
 begin
   if pBlob = nil then begin Result := SQLITE_MISUSE; Exit; end;
   if pBlob^.pStmt = nil then begin Result := SQLITE_ABORT; Exit; end;
-  { blobSeekToRow requires SQL compiler (Phase 7+) }
-  Result := SQLITE_ERROR;
+  if Assigned(gBlobReopenImpl) then
+    Result := gBlobReopenImpl(pBlob, iRow)
+  else
+    Result := SQLITE_ERROR;
 end;
 
 { ============================================================================

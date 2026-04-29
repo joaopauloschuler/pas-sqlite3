@@ -308,11 +308,7 @@ Important: At the end of this document, please find:
   [X] **6.10 step 24** Scalar built-in parity sweep — closed
 
   [X] **6.10 step 27** LIKE / GLOB / NOT LIKE / NOT GLOB / ESCAPE
-      parity sweep — closed 2026-04-29.  `src/tests/DiagLikeGlob.pas`
-      probes 55 cases (wildcards, character classes, ESCAPE, NULL
-      semantics, NOT-form, like()/glob() function form, UTF-8 input,
-      typeof, numeric coercion to TEXT, prefix-LIKE optimisation
-      result-set behaviour).  All 55 PASS; no divergence found.
+      parity sweep — closed 2026-04-29 (DiagLikeGlob, 55/55 PASS).
 
   [ ] **6.10 step 26** DiagIndexing probe (added 2026-04-29,
       `src/tests/DiagIndexing.pas`).  44 cases, 15 DIVERGE — surfaced new
@@ -384,16 +380,17 @@ Important: At the end of this document, please find:
        `sqlite3VdbeDisplayComment` (blocked: needs opcode-synopsis
        tables appended after each name in sqlite3OpcodeName — Pas
        OpcodeNames table is plain names only, defer),
-       [ ] `sqlite3_blob_open` — body still a stub at vdbe.pas:4970.
-            The read/write path is now functional (see below); only the
-            handle-creation step remains.  Full body needs the blobSeekToRow
-            helper plus the seven-op VDBE program emitted via
-            sqlite3VdbeAddOpList.  Foundation landed 2026-04-29: ported
-            sqlite3BtreeIncrblobCursor + sqlite3BtreePayloadChecked +
-            sqlite3BtreePutData + accessPayloadChecked in btree.pas, then
-            wired sqlite3_blob_read / _write to invoke them
-            (vdbe.pas:4990).  TestVdbeBlob stays 13/0 (handle still nil so
-            ABORT-arm tests dominate), TestExplainParity 1016/10 unchanged.
+       [X] `sqlite3_blob_open` / `sqlite3_blob_reopen` — bodies ported in
+            full 2026-04-29.  blobSeekToRow + the openBlob VdbeOpList
+            (OP_TableLock degraded to OP_Noop in non-shared-cache build,
+            OP_OpenRead/Write, OP_NotExists, OP_Column, OP_ResultRow,
+            OP_Halt) plus OP_Transaction prologue live in codegen.pas
+            (Phase 6.21 vdbeBlobOpenImpl / vdbeBlobReopenImpl) and are
+            wired into vdbe.pas via gBlobOpenImpl / gBlobReopenImpl
+            hooks.  Includes the C-side validations (virtual-table /
+            without-rowid / generated-columns / view rejections + index
+            check on write).  TestVdbeBlob 13/0, TestExplainParity
+            1016/10 unchanged.
        [X] `OP_FilterAdd` / `OP_Filter` — ported 2026-04-29.
        [X] `sqlite3VdbeList` — ported 2026-04-29.
   [ ] **6.22** port codegen.pas rename / error-offset stubs in full from C
