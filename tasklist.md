@@ -380,17 +380,7 @@ Important: At the end of this document, please find:
        `sqlite3VdbeDisplayComment` (blocked: needs opcode-synopsis
        tables appended after each name in sqlite3OpcodeName — Pas
        OpcodeNames table is plain names only, defer),
-       [X] `sqlite3_blob_open` / `sqlite3_blob_reopen` — bodies ported in
-            full 2026-04-29.  blobSeekToRow + the openBlob VdbeOpList
-            (OP_TableLock degraded to OP_Noop in non-shared-cache build,
-            OP_OpenRead/Write, OP_NotExists, OP_Column, OP_ResultRow,
-            OP_Halt) plus OP_Transaction prologue live in codegen.pas
-            (Phase 6.21 vdbeBlobOpenImpl / vdbeBlobReopenImpl) and are
-            wired into vdbe.pas via gBlobOpenImpl / gBlobReopenImpl
-            hooks.  Includes the C-side validations (virtual-table /
-            without-rowid / generated-columns / view rejections + index
-            check on write).  TestVdbeBlob 13/0, TestExplainParity
-            1016/10 unchanged.
+       [X] `sqlite3_blob_open` / `sqlite3_blob_reopen` — ported 2026-04-29.
        [X] `OP_FilterAdd` / `OP_Filter` — ported 2026-04-29.
        [X] `sqlite3VdbeList` — ported 2026-04-29.
   [ ] **6.22** port codegen.pas rename / error-offset stubs in full from C
@@ -413,10 +403,8 @@ Important: At the end of this document, please find:
        `sqlite3MultiValues`, `autoIncBegin`,
        `sqlite3GenerateConstraintChecks`.
        [X] `sqlite3MultiValuesEnd` — ported 2026-04-29.
-       [X] `sqlite3ComputeGeneratedColumns` — ported 2026-04-29.
-            Body lands ahead of its callers (sqlite3Insert / sqlite3Update /
-            sqlite3GenerateConstraintChecks are still skeletons), so the
-            function is dead-code today; it becomes live when those land.
+       [X] `sqlite3ComputeGeneratedColumns` — ported 2026-04-29 (dead-code
+            until sqlite3Insert / sqlite3Update / GenerateConstraintChecks land).
   [ ] **6.25** port codegen.pas schema / index stubs in full from C to pascal:
        `sqlite3ReadSchema`, `sqlite3RunParser`.
   [ ] **6.26** port codegen.pas where / select / window stubs in full from C

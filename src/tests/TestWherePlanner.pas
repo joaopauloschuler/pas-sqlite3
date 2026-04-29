@@ -4191,6 +4191,8 @@ var
   pWInfo:   TWhereInfo;
   pTabItem: TSrcItem;
   pTerm:    TWhereTerm;
+  pLoopFix: TWhereLoop;
+  addrExp:  i32;
   ret:      i32;
   rc:       i32;
 begin
@@ -4207,8 +4209,9 @@ begin
   FillChar(pWInfo,    SizeOf(pWInfo),    0);
   FillChar(pTabItem,  SizeOf(pTabItem),  0);
   FillChar(pTerm,     SizeOf(pTerm),     0);
-  pTabList := sqlite3DbMallocZero(db, SizeOf(TSrcList));
+  pTabList := sqlite3DbMallocZero(db, SizeOf(TSrcList) + SizeOf(TSrcItem));
   Check('CHX SrcList alloc', pTabList <> nil);
+  pTabList^.nSrc := 1;
 
   { ---- CCH1..CCH3: codeCursorHint must not deref any arg.  In particular,
        the all-nil call exercises the unused-arg short-circuit; the populated
@@ -4235,18 +4238,26 @@ begin
   ret := sqlite3WhereExplainOneScan(@parse, pTabList, @pLevel, WHERE_ORDERBY_MIN);
   Check('WEOS3 explain=2 stub still returns 0 (EQP text deferred)', ret = 0);
 
-  { ---- WEBF1..WEBF2: sqlite3WhereExplainBloomFilter mirrors WEOS — return
-       0 unconditionally until the EQP text path lands. ---- }
+  { ---- WEBF1..WEBF2: sqlite3WhereExplainBloomFilter (Phase 6.26 ported
+       2026-04-29).  WEBF1 now invokes the real body — needs a populated
+       pWLoop and a pre-existing OP_Explain to back-patch.  WEBF2 still
+       exercises the all-nil early-out. ---- }
   pWInfo.pParse   := @parse;
   pWInfo.pTabList := pTabList;
+  FillChar(pLoopFix, SizeOf(pLoopFix), 0);
+  pLoopFix.wsFlags := WHERE_IPK;
+  pLevel.pWLoop := @pLoopFix;
+  addrExp := sqlite3VdbeAddOp4(v, OP_Explain, 0, 0, 0, nil, P4_NOTUSED);
+  Check('WEBF prep: OP_Explain emitted', addrExp >= 0);
   ret := sqlite3WhereExplainBloomFilter(@parse, @pWInfo, @pLevel);
-  Check('WEBF1 BloomFilter stub returns 0', ret = 0);
+  Check('WEBF1 BloomFilter returns new OP_Explain addr', ret = addrExp + 1);
   ret := sqlite3WhereExplainBloomFilter(nil, nil, nil);
-  Check('WEBF2 BloomFilter(nil,...) returns 0', ret = 0);
+  Check('WEBF2 BloomFilter(nil,...) returns 0 (early-out)', ret = 0);
 
-  { ---- WAET1..WAET2: sqlite3WhereAddExplainText is a no-op back-patcher.
-       Both an all-nil and a populated invocation must return without effect. }
-  sqlite3WhereAddExplainText(@parse, 0, pTabList, @pLevel, 0);
+  { ---- WAET1..WAET2: sqlite3WhereAddExplainText (Phase 6.26 ported).
+       WAET1 back-patches the OP_Explain we emitted above.  WAET2 still
+       exercises the nil-pParse early-out. }
+  sqlite3WhereAddExplainText(@parse, addrExp, pTabList, @pLevel, 0);
   Check('WAET1 AddExplainText(populated) returned', True);
   sqlite3WhereAddExplainText(nil, 0, nil, nil, 0);
   Check('WAET2 AddExplainText(nil,...) returned', True);
