@@ -411,6 +411,17 @@ function sqlite3_vtab_distinct(pIdxInfo: PSqlite3IndexInfo): i32; cdecl;
 function sqlite3_vtab_in(pIdxInfo: PSqlite3IndexInfo;
   iCons: i32; bHandle: i32): i32; cdecl;
 
+{ where.c:4593 — sqlite3_vtab_rhs_value.  Public API callable from inside
+  xBestIndex.  C reads the trailing HiddenIndexInfo block (cached aRhs[]
+  + WhereClause + Parse) and lazily extracts the RHS sqlite3_value via
+  sqlite3ValueFromExpr.  HiddenIndexInfo is not yet defined on the Pas
+  side (see 8.9.1 task), so we degrade: validate iCons range and report
+  SQLITE_NOTFOUND with *ppVal=nil — the same answer C returns when the
+  RHS expression is non-constant or otherwise unobtainable.  Out-of-range
+  iCons returns SQLITE_MISUSE matching the C reference. }
+function sqlite3_vtab_rhs_value(pIdxInfo: PSqlite3IndexInfo;
+  iCons: i32; ppVal: passqlite3vdbe.PPMem): i32; cdecl;
+
 { ============================================================
   Phase 6.bis.1f — function overload + writable + eponymous tables
   (vtab.c:1153..1308)
@@ -1636,6 +1647,20 @@ function sqlite3_vtab_in(pIdxInfo: PSqlite3IndexInfo;
   iCons: i32; bHandle: i32): i32; cdecl;
 begin
   Result := 0;
+end;
+
+function sqlite3_vtab_rhs_value(pIdxInfo: PSqlite3IndexInfo;
+  iCons: i32; ppVal: passqlite3vdbe.PPMem): i32; cdecl;
+begin
+  if ppVal <> nil then ppVal^ := nil;
+  if (pIdxInfo = nil)
+     or (iCons < 0)
+     or (iCons >= pIdxInfo^.nConstraint) then
+  begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  Result := SQLITE_NOTFOUND;
 end;
 
 end.

@@ -441,7 +441,7 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        (main.c, status.c):
        [ ] `sqlite3_test_control` — testing back-door (subset).
 
-- [ ] **8.9.1** Vtab helper APIs (vtab.c, vdbeapi.c):
+- [X] **8.9.1** Vtab helper APIs (vtab.c, vdbeapi.c):
        [X] `sqlite3_vtab_distinct` — ported 2026-04-29 as a degraded
             stub returning 0 (no DISTINCT optimisation).  Full body
             requires HiddenIndexInfo on the Pas side.
@@ -451,8 +451,11 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [X] `sqlite3_vtab_in` — ported 2026-04-29 as a degraded stub
             returning 0 ("not an IN constraint").  Full body requires
             HiddenIndexInfo (mIn / mHandleIn bitmasks) on the Pas side.
-       [ ] `sqlite3_vtab_rhs_value` — extract RHS value of a constraint
-            (gated on HiddenIndexInfo).
+       [X] `sqlite3_vtab_rhs_value` — ported 2026-04-29 as a degraded
+            stub returning SQLITE_NOTFOUND with *ppVal=nil for in-range
+            iCons, SQLITE_MISUSE out-of-range.  Full body requires
+            HiddenIndexInfo (aRhs[] cache + WhereClause/Parse pointers)
+            on the Pas side.
 
 - [ ] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind).
 
