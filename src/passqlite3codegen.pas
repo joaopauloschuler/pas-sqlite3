@@ -451,6 +451,16 @@ type
     _pad: u32;
   end;
 
+  { alter.c:702 — RenameToken: maps a parse-tree element to the source
+    Token that produced it.  Used only when pParse^.eParseMode is
+    PARSE_MODE_RENAME (set by sqlite3AlterRenameTable / RenameColumn). }
+  PRenameToken = ^TRenameToken;
+  TRenameToken = record
+    p:     Pointer;        { parse-tree element created by token t }
+    t:     TToken;         { the token that created element p }
+    pNext: PRenameToken;   { next in pParse^.pRename list }
+  end;
+
   { --- TAggInfoCol, TAggInfoFunc, TAggInfo (sizeof=72) --- }
   TAggInfoCol = record
     pTab:          PTable2;
@@ -3340,20 +3350,37 @@ end;
 
 { sqlite3ParserAddCleanup implemented in Phase 6.5 section below }
 
-{ alter.c:914 / 776 — these only do non-trivial work when
-  pParse^.eParseMode is PARSE_MODE_RENAME (set by sqlite3AlterRenameTable
-  / sqlite3AlterRenameColumn, both still stubbed under task 6.27).  All
-  productive call sites in build.c / parser.pas guard with InRenameObject,
-  so under the current build this path is never reached and a no-op
-  matches the C reference exactly.  Full bodies (RenameToken record +
-  walker callbacks) land alongside ALTER TABLE RENAME in 6.27. }
+{ alter.c:914 — sqlite3RenameExprUnmap requires the renameUnmapExprCb
+  / renameUnmapSelectCb walker callbacks; those are deferred until
+  ALTER TABLE RENAME proper lands in 6.27.  Until eParseMode reaches
+  PARSE_MODE_RENAME (only set by sqlite3AlterRenameTable /
+  sqlite3AlterRenameColumn) every call site is guarded by
+  InRenameObject and this routine is never reached. }
 procedure sqlite3RenameExprUnmap(pParse: PParse; pExpr: PExpr);
 begin
 end;
 
+{ alter.c:776 — sqlite3RenameTokenMap.  Allocates a RenameToken record,
+  binds it to the parse-tree element pPtr and the source token pToken,
+  and prepends it to pParse^.pRename.  The C ALWAYS() guards out
+  PARSE_MODE_UNMAP (set transiently inside sqlite3RenameExprUnmap).
+  Even though no current corpus drives the parser into PARSE_MODE_RENAME,
+  the productive body lands here so the rename-token list is correctly
+  populated the moment ALTER TABLE RENAME (6.27) wires it up. }
 procedure sqlite3RenameTokenMap(pParse: PParse; pPtr: Pointer;
   const pToken: PToken);
+var
+  pNew: PRenameToken;
 begin
+  AssertH((pPtr <> nil) or (pParse^.db^.mallocFailed <> 0),
+    'sqlite3RenameTokenMap: pPtr=nil without mallocFailed');
+  if pParse^.eParseMode = PARSE_MODE_UNMAP then Exit;
+  pNew := PRenameToken(sqlite3DbMallocZero(pParse^.db, SizeOf(TRenameToken)));
+  if pNew = nil then Exit;
+  pNew^.p     := pPtr;
+  pNew^.t     := pToken^;
+  pNew^.pNext := PRenameToken(pParse^.pRename);
+  pParse^.pRename := pNew;
 end;
 
 { vdbeaux.c:84 — only emitted when SQLITE_ENABLE_NORMALIZE is defined.
@@ -27318,10 +27345,23 @@ begin
   { Phase 7 }
 end;
 
+{ alter.c:802 — sqlite3RenameTokenRemap.  Walks pParse^.pRename and
+  reassigns the first matching entry's parse-tree pointer (p) from
+  pFrom to pTo.  Used by the ALTER TABLE RENAME walker callbacks to
+  retarget mappings as the parse tree is rewritten in place. }
 procedure sqlite3RenameTokenRemap(pParse: PParse; pTo: Pointer;
   pFrom: Pointer);
+var
+  p: PRenameToken;
 begin
-  { Phase 7 }
+  p := PRenameToken(pParse^.pRename);
+  while p <> nil do begin
+    if p^.p = pFrom then begin
+      p^.p := pTo;
+      Exit;
+    end;
+    p := p^.pNext;
+  end;
 end;
 
 procedure sqlite3RenameExprlistUnmap(pParse: PParse; pEList: PExprList);

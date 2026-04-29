@@ -59,13 +59,17 @@ Important: At the end of this document, please find:
   [ ] **6.13** port `sqlite3Vacuum`
 
   [ ] **6.22** port codegen.pas rename:
-       [ ] `sqlite3RenameExprUnmap`
-       [ ] `sqlite3RenameTokenMap` — only
-            productive under `PARSE_MODE_RENAME`.  Full bodies
-            (`RenameToken` record + walker callbacks) deferred to land
-            with `sqlite3AlterRenameTable` / `sqlite3AlterRenameColumn`
-            in 6.27; current no-op matches C semantics whenever the
-            parser is not in rename mode.
+       [ ] `sqlite3RenameExprUnmap` — productive port deferred until the
+            renameUnmapExprCb / renameUnmapSelectCb walker callbacks
+            land alongside ALTER TABLE RENAME (6.27); no-op matches C
+            outside PARSE_MODE_RENAME.
+       [X] `sqlite3RenameTokenMap` — ported 2026-04-29 (alter.c:776).
+            Allocates a `TRenameToken` and prepends it to
+            `pParse^.pRename`; PARSE_MODE_UNMAP guard preserved.
+       [X] `sqlite3RenameTokenRemap` — ported 2026-04-29 (alter.c:802).
+            Walks `pParse^.pRename` and reassigns the first matching
+            entry's `p` from pFrom to pTo.  TRenameToken record now
+            defined alongside TToken in codegen.pas.
   
   [ ] **6.23** port codegen.pas trigger:
        [ ] Port `sqlite3BeginTrigger`
@@ -377,10 +381,10 @@ Important: At the end of this document, please find:
 
 - [ ] **7.1.7** Lemon parser tail (parse.c epilogue) — gaps inside
        `passqlite3parser.pas`:
-       [ ] Port `sqlite3RenameToken`
-       [ ] Port `sqlite3RenameTokenMap`
-       [ ] Port `sqlite3RenameExprUnmap` — needed for `PARSE_MODE_RENAME`
-            (currently no-ops; OK in normal mode).
+       [X] `sqlite3RenameTokenMap` / `sqlite3RenameTokenRemap` — ported
+            2026-04-29 (see 6.22).
+       [ ] Port `sqlite3RenameExprUnmap` — needs walker callbacks; lands
+            with 6.27 ALTER TABLE RENAME.
 
 - [ ] **7.1.8** ATTACH / DETACH (attach.c) — currently Phase 7 stubs
        at codegen.pas:25213/25218.  Must open the attached btree,
