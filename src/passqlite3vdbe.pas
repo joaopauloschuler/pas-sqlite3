@@ -6188,6 +6188,10 @@ var
   ii:      i32;
   nCellKey: i64;
   pMem5b:  TMem;
+  { OP_Filter / OP_FilterAdd locals }
+  hFilter: u64;
+  mxFilter: i32;
+  pMemFilter: PMem;
   { 5.4c locals — record I/O }
   pCol:    PVdbeCursor;   { OP_Column: cursor being read }
   p2col:   u32;           { OP_Column: column index }
@@ -9155,10 +9159,54 @@ begin
 
     { ────── OP_Filter / OP_FilterAdd ────── — Bloom filter (vdbe.c:8955/8991) }
     OP_FilterAdd: begin
-      { Stub: Bloom filter not yet ported (Phase 6) }
+      pIn1 := @aMem[pOp^.p1];
+      if ((pIn1^.flags and MEM_Blob) = 0) or (pIn1^.n <= 0) then
+        { Filter blob not initialized — fall through (no-op) }
+        else begin
+      { filterHash (vdbe.c:690): sum hashes of pOp.p4.i registers from p3 }
+      hFilter := 0;
+      ii := pOp^.p3;
+      mxFilter := ii + pOp^.p4.i;
+      while ii < mxFilter do begin
+        pMemFilter := @aMem[ii];
+        if (pMemFilter^.flags and (MEM_Int or MEM_IntReal)) <> 0 then
+          hFilter := hFilter + u64(pMemFilter^.u.i)
+        else if (pMemFilter^.flags and MEM_Real) <> 0 then
+          hFilter := hFilter + u64(sqlite3VdbeIntValue(pMemFilter))
+        else if (pMemFilter^.flags and (MEM_Str or MEM_Blob)) <> 0 then
+          hFilter := hFilter + 4093 + u64(pMemFilter^.flags and (MEM_Str or MEM_Blob));
+        Inc(ii);
+      end;
+      hFilter := hFilter mod u64(pIn1^.n * 8);
+      PByte(pIn1^.z)[hFilter shr 3] := PByte(pIn1^.z)[hFilter shr 3] or (Byte(1) shl (hFilter and 7));
+      end;
     end;
     OP_Filter: begin
-      { Stub: no filter → never skip any row }
+      pIn1 := @aMem[pOp^.p1];
+      if ((pIn1^.flags and MEM_Blob) = 0) or (pIn1^.n <= 0) then begin
+        { Filter blob not initialized — fall through (don't skip) }
+      end else begin
+      hFilter := 0;
+      ii := pOp^.p3;
+      mxFilter := ii + pOp^.p4.i;
+      while ii < mxFilter do begin
+        pMemFilter := @aMem[ii];
+        if (pMemFilter^.flags and (MEM_Int or MEM_IntReal)) <> 0 then
+          hFilter := hFilter + u64(pMemFilter^.u.i)
+        else if (pMemFilter^.flags and MEM_Real) <> 0 then
+          hFilter := hFilter + u64(sqlite3VdbeIntValue(pMemFilter))
+        else if (pMemFilter^.flags and (MEM_Str or MEM_Blob)) <> 0 then
+          hFilter := hFilter + 4093 + u64(pMemFilter^.flags and (MEM_Str or MEM_Blob));
+        Inc(ii);
+      end;
+      hFilter := hFilter mod u64(pIn1^.n * 8);
+      if (PByte(pIn1^.z)[hFilter shr 3] and (Byte(1) shl (hFilter and 7))) = 0 then begin
+        Inc(v^.aCounter[SQLITE_STMTSTATUS_FILTER_HIT]);
+        goto jump_to_p2;
+      end else begin
+        Inc(v^.aCounter[SQLITE_STMTSTATUS_FILTER_MISS]);
+      end;
+      end;
     end;
 
     { ────── OP_ColumnsUsed ────── — hint only, no-op }

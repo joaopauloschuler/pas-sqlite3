@@ -463,6 +463,19 @@ Important: At the end of this document, please find:
             wired sqlite3_blob_read / _write to invoke them
             (vdbe.pas:4990).  TestVdbeBlob stays 13/0 (handle still nil so
             ABORT-arm tests dominate), TestExplainParity 1016/10 unchanged.
+       [X] `OP_FilterAdd` / `OP_Filter` — Bloom filter opcodes ported
+            2026-04-29 (vdbe.c:8955 / 8991 + filterHash at vdbe.c:690).
+            Previous stubs no-op'd FilterAdd and never skipped on
+            Filter; runtime behaviour was correct (all rows fall
+            through) but the optimisation was inactive.  Now the bit
+            array in pIn1^.z is populated and probed; FILTER_HIT /
+            FILTER_MISS counters increment.  Guarded with
+            `pIn1^.n <= 0` fall-through so unwired filter blobs
+            (e.g. early Filter before its OP_Blob seed) keep the
+            previous "never skip" semantics rather than dividing by
+            zero.  TestExplainParity 1016/10 unchanged; DiagInnerJoin
+            bytecode parity preserved; DiagFeatureProbe / DiagAggWhere /
+            DiagWindow counts unchanged.
        [X] `sqlite3VdbeList` — ported 2026-04-29 (vdbeaux.c:2406).
             Wired through sqlite3_step (vdbeFlags & VDBF_EXPLAIN_MASK
             routes to VdbeList instead of VdbeExec) and
