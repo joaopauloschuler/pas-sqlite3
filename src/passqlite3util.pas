@@ -738,6 +738,7 @@ function  sqlite3_config(op: i32; pArg: Pointer): i32; overload;
 function sqlite3GetBoolean(z: PChar; dflt: u8): u8;
 function sqlite3_uri_parameter(zFilename: PChar; zParam: PChar): PChar;
 function sqlite3_uri_boolean(zFilename: PChar; zParam: PChar; bDflt: i32): i32;
+function sqlite3_uri_int64(zFilename: PChar; zParam: PChar; bDflt: i64): i64;
 function sqlite3Atoi(z: PChar): i32;
 
 { Alignment helpers (used by pcache and btree) }
@@ -2715,6 +2716,19 @@ begin
   if bDflt <> 0 then df := 1 else df := 0;
   if z <> nil then Result := sqlite3GetBoolean(z, df)
   else Result := df;
+end;
+
+{ main.c ~4907: sqlite3_uri_int64 }
+function sqlite3_uri_int64(zFilename: PChar; zParam: PChar; bDflt: i64): i64;
+var
+  z : PChar;
+  v : i64;
+begin
+  z := sqlite3_uri_parameter(zFilename, zParam);
+  if (z <> nil) and (sqlite3DecOrHexToI64(z, v) = 0) then
+    Result := v
+  else
+    Result := bDflt;
 end;
 
 { util.c ~1357: sqlite3Atoi -- parse integer from string }

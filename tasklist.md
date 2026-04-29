@@ -600,7 +600,9 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             2026-04-28 (passqlite3main.pas) — sets/reads
             db^.u1.isInterrupted.
        [ ] `sqlite3_setlk_timeout` — POSIX lock timeout.
-       [ ] `sqlite3_uri_int64` — URI-parameter integer accessor.
+       [X] `sqlite3_uri_int64` — ported 2026-04-28 (passqlite3util.pas)
+            via sqlite3_uri_parameter + sqlite3DecOrHexToI64; mirrors
+            main.c:4907 exactly.
        [ ] `sqlite3_compileoption_used` (ctime.c) — also gated on the
             6.10 step 12 task that touches the compile-options table.
        [ ] `sqlite3_test_control` — testing back-door (subset).
