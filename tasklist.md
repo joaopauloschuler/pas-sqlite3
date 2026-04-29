@@ -650,6 +650,13 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 
 - [ ] **8.7.2** Backup / serialization (currently `sqlite3_backup_init`
        / `_step` / `_finish` exist; the remaining surface is missing):
+       [X] `sqlite3_serialize` — ported 2026-04-29 (memdb.c:750).
+            Real-Btree path only; the memdb branch is unreachable
+            (memdb VFS not yet wired through openDatabase).  Bypasses
+            the `PRAGMA <db>.page_count` query (Pas pragma dispatch
+            does not yet implement page_count) and calls
+            sqlite3PagerPagecount + sqlite3BtreeGetPageSize directly.
+            New gate: `src/tests/TestSerialize.pas` (12/0).
        [ ] `sqlite3_deserialize` — open in-memory db from a buffer.
 
 - [ ] **8.8.1** Pre-update hook (preupdate.c — `SQLITE_ENABLE_PREUPDATE_HOOK`):

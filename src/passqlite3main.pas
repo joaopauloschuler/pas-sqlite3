@@ -442,6 +442,13 @@ function sqlite3_wal_checkpoint_v2(db: PTsqlite3; zDb: PAnsiChar;
   eMode: i32; pnLog, pnCkpt: PInt32): i32; cdecl;
 function sqlite3_wal_checkpoint(db: PTsqlite3; zDb: PAnsiChar): i32; cdecl;
 
+{ Phase 8.7.2 — sqlite3_serialize.  Real-Btree path only; the memdb branch
+  of memdb.c:750 is unreachable here because the memdb VFS is not wired in. }
+const
+  SQLITE_SERIALIZE_NOCOPY = $001;
+function sqlite3_serialize(db: PTsqlite3; zSchema: PAnsiChar;
+  piSize: Pi64; mFlags: u32): Pu8; cdecl;
+
 implementation
 
 uses
@@ -3857,6 +3864,66 @@ function sqlite3_wal_checkpoint(db: PTsqlite3; zDb: PAnsiChar): i32; cdecl;
 begin
   Result := sqlite3_wal_checkpoint_v2(db, zDb, SQLITE_CHECKPOINT_PASSIVE,
                                       nil, nil);
+end;
+
+{ memdb.c:750 — sqlite3_serialize.  Returns a freshly malloc'ed buffer
+  containing the on-disk image of database zSchema (or NULL when it is
+  the main database).  Length is written to *piSize.  When
+  SQLITE_SERIALIZE_NOCOPY is set the function returns NULL for non-memdb
+  databases (we have no memdb backing store to point at).  The memdb
+  branch of the C source is omitted: the memdb VFS is not yet ported. }
+function sqlite3_serialize(db: PTsqlite3; zSchema: PAnsiChar;
+  piSize: Pi64; mFlags: u32): Pu8; cdecl;
+var
+  iDb:    i32;
+  pBt:    PBtree;
+  sz:     i64;
+  szPage: i32;
+  pOut:   Pu8;
+  pTo:    Pu8;
+  pPgr:   PPager;
+  nPage:  i32;
+  iPg:    i32;
+  pPage:  PDbPage;
+  rc:     i32;
+begin
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := nil; Exit;
+  end;
+{$ENDIF}
+  if zSchema = nil then zSchema := db^.aDb[0].zDbSName;
+  iDb := sqlite3FindDbName(db, zSchema);
+  if piSize <> nil then piSize^ := -1;
+  if iDb < 0 then begin Result := nil; Exit; end;
+  pBt := PBtree(db^.aDb[iDb].pBt);
+  if pBt = nil then begin Result := nil; Exit; end;
+  { C source preps "PRAGMA <db>.page_count"; the Pascal pragma dispatch
+    does not yet implement page_count, so go straight to the underlying
+    primitive.  Equivalent: sqlite3PagerPagecount on the schema's pager. }
+  pPgr  := sqlite3BtreePager(pBt);
+  nPage := 0;
+  sqlite3PagerPagecount(pPgr, @nPage);
+  szPage := sqlite3BtreeGetPageSize(pBt);
+  sz     := i64(nPage) * szPage;
+  if piSize <> nil then piSize^ := sz;
+  if (mFlags and SQLITE_SERIALIZE_NOCOPY) <> 0 then begin
+    Result := nil; Exit;
+  end;
+  if sz <= 0 then begin Result := nil; Exit; end;
+  pOut := Pu8(sqlite3_malloc64(u64(sz)));
+  if pOut = nil then begin Result := nil; Exit; end;
+  for iPg := 1 to nPage do begin
+    pPage := nil;
+    pTo   := pOut + szPage * (iPg - 1);
+    rc    := sqlite3PagerGet(pPgr, Pgno(iPg), @pPage, 0);
+    if rc = SQLITE_OK then
+      Move(sqlite3PagerGetData(pPage)^, pTo^, szPage)
+    else
+      FillChar(pTo^, szPage, 0);
+    sqlite3PagerUnref(pPage);
+  end;
+  Result := pOut;
 end;
 
 initialization

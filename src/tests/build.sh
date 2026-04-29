@@ -156,6 +156,7 @@ compile_test TestConfigHooks
 compile_test TestInitShutdown
 compile_test TestExecGetTable
 compile_test TestBackup
+compile_test TestSerialize
 compile_test TestUnlockNotify
 compile_test TestLoadExt
 compile_test TestRowidIn
