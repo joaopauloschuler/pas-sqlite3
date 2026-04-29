@@ -375,13 +375,9 @@ Important: At the end of this document, please find:
       sqlite3VdbeMakeReady read pParse^.nVar but did not propagate to
       p^.nVar / allocate p^.aVar[].  Fix: vdbeaux.c:2714/2737-2738 arms.
 
-  [X] **6.10 step 21** DiagPrintfFmt probe (`src/tests/DiagPrintfFmt.pas`,
-      38 cases).  Closed 2026-04-29 by extending printfFunc:
-      alt-form `#` for `%x`/`%X`/`%o`, precision-pad-zeros for
-      `%d`/`%i`/`%u`, star width/precision, consume-and-ignore length
-      modifiers `l`/`ll`/`L`/`h`/`hh`/`j`/`z`/`t`, and a proper
-      `%g`/`%G` etGENERIC renderer (default precision 6, scientific
-      when exp<-4 or exp>=precision, rtz unless `#`).
+  [X] **6.10 step 21** DiagPrintfFmt probe — closed 2026-04-29.
+      Extended printfFunc with alt-form, precision-pad-zeros,
+      star width/precision, length modifiers, and etGENERIC `%g`/`%G`.
 
   [X] **6.10 step 18** TestAuthBuiltins 34/0 closed 2026-04-28 — guard
       each `sqlite3Register*Functions` (Builtin/DateTime/Json/Window)
@@ -409,15 +405,8 @@ Important: At the end of this document, please find:
         path (same codegen.pas:19756 TODO).
 
   [X] **6.10 step 22** Ephemeral b-tree dedup over TEXT/BLOB keys —
-      closed 2026-04-29.  Root cause: `sqlite3VdbeRecordCompare`
-      (btree.pas) re-decoded `serial_type` in the BT_MEM_Str/Blob arms
-      via `sqlite3GetVarint32` unconditionally, but that helper requires
-      the high bit of p[0] to be set.  For a 1-byte TEXT serial type
-      0x0F it read p[0..1] producing 1985 ("A"), so comparisons were
-      inconsistent and the last-cell skip-to-root cursor optimisation
-      latched on the first row.  Fix: drop the redundant re-read;
-      serial_type is already correctly decoded at the top of the loop
-      via the inline `aKey1[idx1] < $80` guard (vdbeaux.c:4839/4872).
+      closed 2026-04-29.  Fixed redundant `sqlite3GetVarint32` re-decode
+      of serial_type in `sqlite3VdbeRecordCompare` BT_MEM_Str/Blob arms.
 
   [X] **6.10 step 23** absFunc error-message parity — closed 2026-04-29.
       `SELECT abs(-9223372036854775808)` raises canonical "integer
@@ -564,9 +553,12 @@ Important: At the end of this document, please find:
   [ ] **6.24** port codegen.pas DML / insert stubs in full from C to pascal:
        `sqlite3UpsertAnalyzeTarget`, `sqlite3UpsertDoUpdate`,
        `sqlite3ComputeGeneratedColumns`, `sqlite3AutoincrementBegin`,
-       `sqlite3AutoincrementEnd`, `sqlite3MultiValuesEnd`,
+       `sqlite3AutoincrementEnd`,
        `sqlite3MultiValues`, `autoIncBegin`,
        `sqlite3GenerateConstraintChecks`.
+       [X] `sqlite3MultiValuesEnd` — ported 2026-04-29 (insert.c:588).
+            Becomes load-bearing once the co-routine arm of
+            `sqlite3MultiValues` lands; bytecode parity unchanged today.
   [ ] **6.25** port codegen.pas schema / index stubs in full from C to pascal:
        `sqlite3ReadSchema`, `sqlite3RunParser`.
   [ ] **6.26** port codegen.pas where / select / window stubs in full from C

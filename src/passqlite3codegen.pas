@@ -21588,10 +21588,24 @@ begin
   { Phase 6.5 }
 end;
 
-{ sqlite3MultiValuesEnd — finish multi-row VALUES construction (Phase 6.4 stub) }
+{ sqlite3MultiValuesEnd — port of insert.c:588.  Wraps up the co-routine
+  emitted by sqlite3MultiValues for the constant-VALUES path: emits
+  OP_EndCoroutine and back-patches the InitCoroutine jump-around to land
+  here (one before the addrFillSub entry).  Becomes load-bearing when
+  the sqlite3MultiValues co-routine arm is ported (6.10 step 19 b). }
 procedure sqlite3MultiValuesEnd(pParse: PParse; pVal: PSelect);
+var
+  pItem: PSrcItem;
 begin
-  { Phase 6.5 }
+  if (pVal <> nil) and (pVal^.pSrc <> nil) and (pVal^.pSrc^.nSrc > 0) then
+  begin
+    pItem := SrcListItems(pVal^.pSrc);
+    if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
+    begin
+      sqlite3VdbeEndCoroutine(pParse^.pVdbe, pItem^.u4.pSubq^.regReturn);
+      sqlite3VdbeJumpHere(pParse^.pVdbe, pItem^.u4.pSubq^.addrFillSub - 1);
+    end;
+  end;
 end;
 
 { sqlite3MultiValues — accumulate multi-row VALUES SELECT (Phase 6.4 stub) }
