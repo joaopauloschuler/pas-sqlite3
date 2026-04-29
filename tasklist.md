@@ -345,6 +345,16 @@ Important: At the end of this document, please find:
         rows.  Likely shares root cause with (g) — agg-with-trailing-
         clauses gate at codegen.pas:18968.
 
+  [X] **6.10 step 20** Host-parameter binding via `?` / `?N` / `:name` /
+      `@name` / `$name` closed 2026-04-28.  Root cause: `sqlite3VdbeMakeReady`
+      (vdbe.pas) read `pParse^.nVar` but never propagated it to `p^.nVar`
+      nor allocated `p^.aVar[]`, so `OP_Variable` dereferenced nil and
+      `sqlite3_bind_*` early-exited with SQLITE_RANGE.  Fix: add the
+      vdbeaux.c:2714/2737-2738 arms (allocate aVar, set p^.nVar, init each
+      slot to MEM_Null with db backref).  DiagPubApi now covers `SELECT ?`
+      and `SELECT :a + :b` round-trips.  Released the deferred follow-on
+      from the 8.3.1 sqlite3_bind_zeroblob entry.
+
   [X] **6.10 step 18** TestAuthBuiltins 34/0 closed 2026-04-28 — guard
       each `sqlite3Register*Functions` (Builtin/DateTime/Json/Window)
       with a one-shot `done` flag so re-entry doesn't FillChar
@@ -576,8 +586,8 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             64-bit variant gates on aLimit[LIMIT_LENGTH] for SQLITE_TOOBIG.
             Misuse paths covered by DiagPubApi (nil → MISUSE, no-params
             stmt → RANGE, over-LENGTH → TOOBIG).  Round-trip via prepared
-            statement deferred until parser recognises `?` / `?N` host
-            parameters (nVar=0 today).
+            statement closed 2026-04-28 — see "host-parameter binding"
+            below.
        [ ] `sqlite3_bind_pointer` — typed pointer bind.
        [ ] `sqlite3_bind_parameter_index` — name → 1-based index.
 

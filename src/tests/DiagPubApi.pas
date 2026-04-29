@@ -181,12 +181,7 @@ begin
         sqlite3_value_encoding(nil) = SQLITE_UTF8);
   sqlite3_finalize(pStmt);
 
-  { Phase 8.3.1 — sqlite3_bind_zeroblob / _zeroblob64.
-    Pas parser does not yet recognise '?' / '?N' host parameters
-    (nVar=0 after prepare), so a positive-binding round-trip via
-    sqlite3_prepare_v2 is not yet possible.  Cover only the nil
-    and TOOBIG misuse paths the C body exposes; the full round-trip
-    will land alongside the parameter-parsing port. }
+  { Phase 8.3.1 — sqlite3_bind_zeroblob / _zeroblob64. }
   Check('bind_zeroblob(nil) = MISUSE',
         sqlite3_bind_zeroblob(nil, 1, 8) = SQLITE_MISUSE);
   Check('bind_zeroblob64(nil) = MISUSE',
@@ -197,6 +192,30 @@ begin
         sqlite3_bind_zeroblob(pStmt, 1, 8) = SQLITE_RANGE);
   Check('bind_zeroblob64 over-LENGTH = TOOBIG',
         sqlite3_bind_zeroblob64(pStmt, 1, u64(2) shl 40) = SQLITE_TOOBIG);
+  sqlite3_finalize(pStmt);
+
+  { Host-parameter round-trip — verifies sqlite3VdbeMakeReady aVar/nVar
+    propagation (vdbeaux.c:2714/2737-2738).  Single `?`, indexed `?N`,
+    and named `:`/`@`/`$` forms all flow through OP_Variable. }
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT ?', -1, @pStmt, nil);
+  Check('prep SELECT ?', rcs = SQLITE_OK);
+  Check('bind_parameter_count(SELECT ?) = 1',
+        sqlite3_bind_parameter_count(pStmt) = 1);
+  Check('bind_int rc=OK', sqlite3_bind_int(pStmt, 1, 42) = SQLITE_OK);
+  Check('step ROW',       sqlite3_step(pStmt) = SQLITE_ROW);
+  Check('column_int = 42', sqlite3_column_int(pStmt, 0) = 42);
+  sqlite3_finalize(pStmt);
+
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT :a + :b', -1, @pStmt, nil);
+  Check('prep SELECT :a + :b', rcs = SQLITE_OK);
+  Check('bind_parameter_count(:a,:b) = 2',
+        sqlite3_bind_parameter_count(pStmt) = 2);
+  sqlite3_bind_int(pStmt, 1, 3);
+  sqlite3_bind_int(pStmt, 2, 4);
+  Check('step :a+:b ROW', sqlite3_step(pStmt) = SQLITE_ROW);
+  Check('column_int(:a+:b) = 7', sqlite3_column_int(pStmt, 0) = 7);
   sqlite3_finalize(pStmt);
 
   { Phase 8.1.1 — sqlite3_db_release_memory / sqlite3_db_cacheflush. }

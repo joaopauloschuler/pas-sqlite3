@@ -3256,6 +3256,23 @@ begin
     p^.nCursor := nCursor;
   end;
 
+  { Port of vdbeaux.c:2714/2737-2738 — allocate aVar[] and set nVar so
+    OP_Variable / sqlite3_bind_* can resolve `?N`/`:name`/`@name`/`$name`
+    parameters.  Each slot is initialised to MEM_Null with a back-pointer
+    to db (initMemArray contract). }
+  if (not vdbeDbMallocFailed(db)) and (nVar > 0) then begin
+    p^.aVar := PMem(sqlite3DbMallocZero(db, u64(nVar) * SizeOf(TMem)));
+    if p^.aVar <> nil then begin
+      p^.nVar := ynVar(nVar);
+      n := 0;
+      while n < nVar do begin
+        (p^.aVar + n)^.db    := db;
+        (p^.aVar + n)^.flags := MEM_Null;
+        Inc(n);
+      end;
+    end;
+  end;
+
   sqlite3VdbeRewind(p);
 end;
 
