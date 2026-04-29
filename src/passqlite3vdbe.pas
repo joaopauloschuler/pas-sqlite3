@@ -1381,6 +1381,13 @@ function  sqlite3_user_data(pCtx: Psqlite3_context): Pointer;
 procedure sqlite3_result_subtype(pCtx: Psqlite3_context; eSubtype: u32);
 procedure sqlite3_result_text64(pCtx: Psqlite3_context; z: PAnsiChar;
                                 n: u64; xDel: TxDelProc; enc: u8);
+procedure sqlite3_result_text16(pCtx: Psqlite3_context; z: Pointer;
+                                n: i32; xDel: TxDelProc);
+procedure sqlite3_result_text16be(pCtx: Psqlite3_context; z: Pointer;
+                                  n: i32; xDel: TxDelProc);
+procedure sqlite3_result_text16le(pCtx: Psqlite3_context; z: Pointer;
+                                  n: i32; xDel: TxDelProc);
+procedure sqlite3_result_error16(pCtx: Psqlite3_context; z: Pointer; n: i32);
 function  sqlite3VdbeFinishMoveto(p: PVdbeCursor): i32;
 function  sqlite3VdbeHandleMovedCursor(p: PVdbeCursor): i32;
 function  sqlite3VdbeCursorRestore(p: PVdbeCursor): i32;
@@ -4586,6 +4593,45 @@ begin
   if pCtx = nil then Exit;
   pCtx^.isError := SQLITE_ERROR;
   sqlite3VdbeMemSetStr(pCtx^.pOut, z, n, SQLITE_UTF8, SQLITE_TRANSIENT);
+end;
+
+{ vdbeapi.c:616 — sqlite3_result_text16.  UTF-16 result with native byte
+  order.  C masks n with ~(u64)1 to drop a stray low bit before delegating
+  to setResultStrOrError; we fold that mask in directly and call
+  sqlite3VdbeMemSetStr like the existing _text64 path. }
+procedure sqlite3_result_text16(pCtx: Psqlite3_context; z: Pointer;
+                                n: i32; xDel: TxDelProc);
+begin
+  if pCtx = nil then Exit;
+  sqlite3VdbeMemSetStr(pCtx^.pOut, PAnsiChar(z), i64(n) and (not i64(1)),
+                       SQLITE_UTF16NATIVE, xDel);
+end;
+
+{ vdbeapi.c:625 — sqlite3_result_text16be. }
+procedure sqlite3_result_text16be(pCtx: Psqlite3_context; z: Pointer;
+                                  n: i32; xDel: TxDelProc);
+begin
+  if pCtx = nil then Exit;
+  sqlite3VdbeMemSetStr(pCtx^.pOut, PAnsiChar(z), i64(n) and (not i64(1)),
+                       SQLITE_UTF16BE, xDel);
+end;
+
+{ vdbeapi.c:634 — sqlite3_result_text16le. }
+procedure sqlite3_result_text16le(pCtx: Psqlite3_context; z: Pointer;
+                                  n: i32; xDel: TxDelProc);
+begin
+  if pCtx = nil then Exit;
+  sqlite3VdbeMemSetStr(pCtx^.pOut, PAnsiChar(z), i64(n) and (not i64(1)),
+                       SQLITE_UTF16LE, xDel);
+end;
+
+{ vdbeapi.c:503 — sqlite3_result_error16.  UTF-16 error string. }
+procedure sqlite3_result_error16(pCtx: Psqlite3_context; z: Pointer; n: i32);
+begin
+  if pCtx = nil then Exit;
+  pCtx^.isError := SQLITE_ERROR;
+  sqlite3VdbeMemSetStr(pCtx^.pOut, PAnsiChar(z), n, SQLITE_UTF16NATIVE,
+                       SQLITE_TRANSIENT);
 end;
 
 procedure sqlite3_result_error_nomem(pCtx: Psqlite3_context);

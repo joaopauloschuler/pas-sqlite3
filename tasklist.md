@@ -701,8 +701,16 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             Mirrors existing `sqlite3_result_text64` shape: u64 length,
             n>0x7FFFFFFF routes to `sqlite3_result_error_toobig`,
             otherwise delegates to `sqlite3VdbeMemSetStr` with enc=0.
-       [ ] `sqlite3_result_text16` / `_text16be` / `_text16le`.
-       [ ] `sqlite3_result_error16` — UTF-16 error string.
+       [X] `sqlite3_result_text16` / `_text16be` / `_text16le` — ported
+            2026-04-28 (passqlite3vdbe.pas) — verbatim port of
+            vdbeapi.c:616/625/634; n masked with `not i64(1)` per the C
+            `n & ~(u64)1` arm before delegating to sqlite3VdbeMemSetStr
+            with SQLITE_UTF16NATIVE / SQLITE_UTF16BE / SQLITE_UTF16LE
+            respectively.
+       [X] `sqlite3_result_error16` — ported 2026-04-28
+            (passqlite3vdbe.pas) — sets isError=SQLITE_ERROR and stores
+            the UTF-16NATIVE message via sqlite3VdbeMemSetStr (mirrors
+            vdbeapi.c:503).
        [X] `sqlite3_result_error_code` — ported 2026-04-28
             (passqlite3vdbe.pas) — sets `pCtx^.isError`, falls back to
             sqlite3ErrStr on MEM_Null Mem.
