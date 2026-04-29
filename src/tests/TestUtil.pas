@@ -167,6 +167,20 @@ begin
   if sqlite3StrICmp('B', 'a') <= 0 then begin
     Fail('T3', '"B" should be > "a" (b > a)'); ok := False;
   end;
+  { Public-API wrapper sqlite3_stricmp adds NULL guards on top of
+    sqlite3StrICmp (util.c:408). }
+  if sqlite3_stricmp('Hello', 'HELLO') <> 0 then begin
+    Fail('T3', 'sqlite3_stricmp("Hello","HELLO") should be 0'); ok := False;
+  end;
+  if sqlite3_stricmp(nil, nil) <> 0 then begin
+    Fail('T3', 'sqlite3_stricmp(nil,nil) should be 0'); ok := False;
+  end;
+  if sqlite3_stricmp(nil, 'x') >= 0 then begin
+    Fail('T3', 'sqlite3_stricmp(nil,"x") should be < 0'); ok := False;
+  end;
+  if sqlite3_stricmp('x', nil) <= 0 then begin
+    Fail('T3', 'sqlite3_stricmp("x",nil) should be > 0'); ok := False;
+  end;
   if ok then Pass('T3: sqlite3StrICmp');
 end;
 

@@ -622,6 +622,7 @@ function  sqlite3HexToBlob(db: Psqlite3db; z: PAnsiChar; n: i32): Pointer;
 function  sqlite3Strlen30(z: PChar): i32;
 function  sqlite3Strlen30NN(z: PChar): i32;
 function  sqlite3StrICmp(zLeft, zRight: PChar): i32;
+function  sqlite3_stricmp(zLeft, zRight: PChar): i32;
 function  sqlite3_strnicmp(zLeft, zRight: PChar; N: i32): i32;
 function  sqlite3StrIHash(z: PChar): u8;
 function  sqlite3AtoF(zIn: PChar; out pResult: Double): i32;
@@ -944,6 +945,16 @@ begin
     Inc(a); Inc(b);
   until False;
   Result := c;
+end;
+
+{ util.c:408 — public-API wrapper around sqlite3StrICmp with NULL guards. }
+function sqlite3_stricmp(zLeft, zRight: PChar): i32;
+begin
+  if zLeft = nil then begin
+    if zRight <> nil then Exit(-1) else Exit(0);
+  end else if zRight = nil then
+    Exit(1);
+  Result := sqlite3StrICmp(zLeft, zRight);
 end;
 
 function sqlite3_strnicmp(zLeft, zRight: PChar; N: i32): i32;

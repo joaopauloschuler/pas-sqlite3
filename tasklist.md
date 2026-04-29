@@ -599,7 +599,9 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             `_appendf`, `_vappendf`.
        [ ] `sqlite3_str_errcode`, `_free`, `_length`, `_reset`,
             `_truncate`.
-       [ ] `sqlite3_stricmp` — case-insensitive ASCII strcmp helper.
+       [X] `sqlite3_stricmp` — case-insensitive ASCII strcmp helper
+            (passqlite3util.pas:957) — public-API wrapper around
+            sqlite3StrICmp with NULL guards; covered by TestUtil T3.
 
 - [ ] **8.7.1** Snapshot / WAL APIs:
        [ ] `sqlite3_snapshot_get` / `_open` / `_free` / `_cmp` /
