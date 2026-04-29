@@ -79,6 +79,12 @@ Important: At the end of this document, please find:
       arms.  Existing slim layout is the lowest common denominator and
       every caller writes through it; no current corpus exercises sort
       flags or corruption flagging.
+      Partial 2026-04-29: aSortFlags KEYINFO_ORDER_DESC + BIGNULL
+      inversion arm ported into sqlite3VdbeRecordCompare in btree.pas
+      (reads pKeyInfo offset 24 for the aSortFlags pointer).  Now active
+      whenever any caller's KeyInfo carries non-zero sort flags.
+      Remaining: errCode-bearing corruption signalling + the codegen
+      full-layout fields (u/n/r1/r2) that the slim layout still drops.
 
 - [ ] **6.9-bis 11g.2.f** Audit + regression.  Tests run with
         `LD_LIBRARY_PATH=$PWD/src` so the csq_* oracle resolves to

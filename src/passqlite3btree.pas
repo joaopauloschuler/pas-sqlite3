@@ -3006,6 +3006,9 @@ end;
 
 function sqlite3VdbeRecordCompare(nKey: i32; pKey: Pointer;
                                   pIdxKey: PUnpackedRecord): i32;
+const
+  BT_KEYINFO_ORDER_DESC    = 1;
+  BT_KEYINFO_ORDER_BIGNULL = 2;
 var
   pKey1:       Pointer;
   nKey1:       i32;
@@ -3019,6 +3022,9 @@ var
   vTmp32:      u32;
   rReal, rRhs: Double;
   nStr, nCmp:  i32;
+  pSortFlags:  Pu8;
+  sortFlag:    u8;
+  descBit, nullSide: i32;
 begin
   pKey1 := pKey;
   nKey1 := nKey;
@@ -3134,6 +3140,25 @@ begin
       rc := 0;
 
     if rc <> 0 then begin
+      { aSortFlags inversion — vdbeaux.c sqlite3VdbeRecordCompareWithSkip.
+        pKeyInfo is opaque (Pointer) here; aSortFlags lives at offset 24
+        in TKeyInfo (codegen.pas:1094). }
+      if pIdxKey^.pKeyInfo <> nil then begin
+        pSortFlags := Pu8(PPointer(PByte(pIdxKey^.pKeyInfo) + 24)^);
+        if pSortFlags <> nil then begin
+          sortFlag := pSortFlags[i];
+          if sortFlag <> 0 then begin
+            descBit  := i32(sortFlag) and BT_KEYINFO_ORDER_DESC;
+            nullSide := 0;
+            if (serial_type = 0)
+               or ((pRhs^.flags and BT_MEM_Null) <> 0) then
+              nullSide := 1;
+            if ((sortFlag and BT_KEYINFO_ORDER_BIGNULL) = 0)
+               or (descBit <> nullSide) then
+              rc := -rc;
+          end;
+        end;
+      end;
       Result := rc;
       Exit;
     end;
