@@ -424,9 +424,18 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 (`sqlite3_int64`, `sqlite3_uint64`, opaque struct names) are excluded.
 
 - [ ] **8.2.1** Statement-introspection gaps (vdbeapi.c):
-       [ ] `sqlite3_stmt_scanstatus` / `_scanstatus_v2` /
-            `_scanstatus_reset` — gated on the 6.8
-            `sqlite3VdbeScanStatus*` arms landing first.
+       [ ] `sqlite3_stmt_scanstatus` / `_scanstatus_v2` — gated on the
+            6.8 `sqlite3VdbeScanStatus*` arms landing first.
+       [X] `sqlite3_stmt_scanstatus_reset` — ported 2026-04-29 in
+            passqlite3main.pas as a no-op.  C body zeros nExec/nCycle
+            on each VdbeOp; this port does not carry those counters
+            (gated on SQLITE_ENABLE_STMT_SCANSTATUS), so the symbol is
+            exposed for dlsym/loadext parity only.
+       [X] `sqlite3_normalized_sql` — ported 2026-04-29 in
+            passqlite3main.pas as `return nil` stub.  C body is gated
+            on SQLITE_ENABLE_NORMALIZE which adds zNormSql to Vdbe;
+            without that field the symbol is exposed for dlsym parity
+            and consistently returns nil.
 
 - [ ] **8.4.1** Hooks / control / change-counter / errors / limits
        (main.c, status.c):
@@ -439,8 +448,9 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [X] `sqlite3_vtab_collation` — ported 2026-04-29 as a degraded
             stub returning "BINARY" for any in-range iCons (matches C
             step-3 fallback).  Full body requires HiddenIndexInfo.
-       [ ] `sqlite3_vtab_in` — IN-operator iterator-mode toggle (gated on
-            HiddenIndexInfo; not yet defined on the Pas side).
+       [X] `sqlite3_vtab_in` — ported 2026-04-29 as a degraded stub
+            returning 0 ("not an IN constraint").  Full body requires
+            HiddenIndexInfo (mIn / mHandleIn bitmasks) on the Pas side.
        [ ] `sqlite3_vtab_rhs_value` — extract RHS value of a constraint
             (gated on HiddenIndexInfo).
 

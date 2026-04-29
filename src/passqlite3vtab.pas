@@ -400,6 +400,17 @@ function sqlite3_vtab_collation(pIdxInfo: PSqlite3IndexInfo;
   rather than misleading the vtab. }
 function sqlite3_vtab_distinct(pIdxInfo: PSqlite3IndexInfo): i32; cdecl;
 
+{ where.c:4573 — sqlite3_vtab_in.  Public API for vtab xBestIndex
+  callbacks: returns 1 (and toggles HiddenIndexInfo.mHandleIn) if
+  constraint iCons is an IN(...) constraint that the vtab is willing
+  to evaluate one RHS at a time, 0 otherwise.  HiddenIndexInfo is not
+  yet defined on the Pas side (see 8.9.1 task), so we always return 0
+  — the safe degraded answer ("not an IN constraint, do not handle as
+  iterator"), matching the path the C function takes when SMASKBIT32(
+  iCons) is not set in pHidden^.mIn. }
+function sqlite3_vtab_in(pIdxInfo: PSqlite3IndexInfo;
+  iCons: i32; bHandle: i32): i32; cdecl;
+
 { ============================================================
   Phase 6.bis.1f — function overload + writable + eponymous tables
   (vtab.c:1153..1308)
@@ -1618,6 +1629,12 @@ end;
 function sqlite3_vtab_distinct(pIdxInfo: PSqlite3IndexInfo): i32; cdecl;
 begin
   if pIdxInfo = nil then begin Result := 0; Exit; end;
+  Result := 0;
+end;
+
+function sqlite3_vtab_in(pIdxInfo: PSqlite3IndexInfo;
+  iCons: i32; bHandle: i32): i32; cdecl;
+begin
   Result := 0;
 end;
 

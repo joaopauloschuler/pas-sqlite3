@@ -441,6 +441,8 @@ function sqlite3_errstr(rc: i32): PAnsiChar; cdecl;
 function sqlite3_next_stmt(pDb: PTsqlite3; pStmt: Pointer): Pointer; cdecl;
 function sqlite3_sql(pStmt: Pointer): PAnsiChar; cdecl;
 function sqlite3_expanded_sql(pStmt: Pointer): PAnsiChar; cdecl;
+function sqlite3_normalized_sql(pStmt: Pointer): PAnsiChar; cdecl;
+procedure sqlite3_stmt_scanstatus_reset(pStmt: Pointer); cdecl;
 
 function sqlite3_sleep(ms: i32): i32; cdecl;
 
@@ -3523,6 +3525,27 @@ begin
   sqlite3_mutex_enter(PTsqlite3(p^.db)^.mutex);
   Result := sqlite3VdbeExpandSql(p, zSrc);
   sqlite3_mutex_leave(PTsqlite3(p^.db)^.mutex);
+end;
+
+{ vdbeapi.c:2172 — sqlite3_normalized_sql.  Return the normalized SQL
+  associated with a prepared statement.  The C reference is gated on
+  SQLITE_ENABLE_NORMALIZE which adds a zNormSql field to Vdbe and a
+  sqlite3Normalize() helper.  This port is built without
+  SQLITE_ENABLE_NORMALIZE (no zNormSql field on PVdbe), so we return nil
+  unconditionally — matching the symbol's exported-but-unsupported
+  behaviour expected by drivers that probe for it via dlsym. }
+function sqlite3_normalized_sql(pStmt: Pointer): PAnsiChar; cdecl;
+begin
+  Result := nil;
+end;
+
+{ vdbeapi.c:2623 — sqlite3_stmt_scanstatus_reset.  Zero the per-op
+  nExec/nCycle counters used by sqlite3_stmt_scanstatus.  Gated on
+  SQLITE_ENABLE_STMT_SCANSTATUS in C; this port does not carry those
+  counters on VdbeOp, so the body is a no-op.  Exposed so dlsym/loadext
+  link order matches the C reference. }
+procedure sqlite3_stmt_scanstatus_reset(pStmt: Pointer); cdecl;
+begin
 end;
 
 function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;
