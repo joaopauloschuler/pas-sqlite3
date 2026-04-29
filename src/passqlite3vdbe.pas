@@ -2850,9 +2850,16 @@ end;
 { --- ParseSchema and EndCoroutine --- }
 
 procedure sqlite3VdbeAddParseSchemaOp(p: PVdbe; iDb: i32; zWhere: PAnsiChar; p5: u16);
+var
+  j: i32;
 begin
   sqlite3VdbeAddOp4(p, OP_ParseSchema, iDb, 0, 0, zWhere, P4_DYNAMIC);
   sqlite3VdbeChangeP5(p, p5);
+  { vdbeaux.c:562 — mark every attached btree as used so the prepared
+    statement claims their schema mutexes during sqlite3_step.  Caller is
+    responsible for the matching sqlite3MayAbort(pParse) since the Parse
+    structure lives in codegen.pas. }
+  for j := 0 to PTsqlite3(p^.db)^.nDb - 1 do sqlite3VdbeUsesBtree(p, j);
 end;
 
 procedure sqlite3VdbeEndCoroutine(v: PVdbe; regYield: i32);

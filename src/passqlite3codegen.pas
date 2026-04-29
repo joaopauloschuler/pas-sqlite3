@@ -23651,6 +23651,7 @@ begin
     zReparse := sqlite3MPrintf(db, 'tbl_name=''%q'' AND type!=''trigger''',
                                 [pTab^.zName]);
     sqlite3VdbeAddParseSchemaOp(v, iDb, zReparse, 0);
+    sqlite3MayAbort(pParse);
 
     { TF_HasGenerated post-emit check (OP_SqlExec) deferred. }
   end;
@@ -24545,6 +24546,7 @@ begin
         zStmtReparse := sqlite3MPrintf(db,
           'name=''%q'' AND type=''index''', [pIndex^.zName]);
         sqlite3VdbeAddParseSchemaOp(v, iDb, zStmtReparse, 0);
+        sqlite3MayAbort(pParse);
         sqlite3VdbeAddOp2(v, OP_Expire, 0, 1);
       end;
 
