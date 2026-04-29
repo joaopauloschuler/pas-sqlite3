@@ -422,9 +422,27 @@ Important: At the end of this document, please find:
           required for the count/sum FILTER shapes since the FILTER
           predicate's columns are added to aCol[] AFTER nAccumulator is
           set, leaving nAccumulator at 0 for these cases).
-      [ ] **f) `count(DISTINCT col)` / `sum(DISTINCT col)` empty
-        result** — agg-DISTINCT codegen path missing.  C reference:
-        select.c codeDistinct.
+      [X] **f) `count(DISTINCT col)` / `sum(DISTINCT col)` empty
+        result** — partially closed 2026-04-29.  Ported the agg-DISTINCT
+        codegen arm: `resetAccumulatorSimple` now opens an OP_OpenEphemeral
+        with KeyInfo built from the agg arg-list for each `iDistinct>=0`
+        function (mirrors select.c:6671..6685, including the "DISTINCT
+        aggregates must have exactly one argument" error).
+        `updateAccumulatorSimple` emits the WHERE_DISTINCT_UNORDERED dedup
+        before AggStep: `OP_Found(iDistinct, addrNext, regAgg, nArg);
+        OP_MakeRecord; OP_IdxInsert + OPFLAG_USESEEKRESULT` (mirrors
+        select.c:6902..6908 + codeDistinct default arm).  Lifted the
+        `iDistinct>=0` rejection in the agg-with-FROM gate
+        (codegen.pas:19312).  DiagWindow `sum distinct` now PASS
+        (17→16 divergences).  `count distinct` still DIVERGE because the
+        ephemeral b-tree comparison over TEXT keys is broken — see new
+        task **6.10 step 22** (`SELECT DISTINCT col` on TEXT/BLOB also
+        returns only the first row, so the bug is upstream of the agg
+        path).  Regressions clean: TestExplainParity 1016/10, TestVdbeAgg
+        11/0, TestSelectBasic 49/0, TestParser 45/0, TestBtreeCompat
+        337/0, TestDMLBasic 54/0, TestVdbeApi 57/0, TestWhereBasic 52/0,
+        DiagPubApi 240/0, DiagSumOverflow 12/0, TestAuthBuiltins 34/0,
+        TestCarray 74/0, TestPrintf 105/0.
       [ ] **g) `GROUP BY ... HAVING ...` returns no rows** —
         DiagWindow `group having`: HAVING clause filtering on aggregate
         result not emitted.
@@ -491,6 +509,34 @@ Important: At the end of this document, please find:
         coroutine path is bypassed.  Closing requires the UNION-ALL arm of
         `sqlite3MultiValues` (codegen.pas:21268) plus sqlite3Insert pSelect
         path (same codegen.pas:19756 TODO).
+
+  [ ] **6.10 step 22** Ephemeral b-tree dedup over TEXT/BLOB keys is
+      broken — surfaced 2026-04-29 while landing the agg-DISTINCT path
+      (6.10 step 17 f).  Minimal repro:
+      ```
+      CREATE TABLE g(grp TEXT);
+      INSERT INTO g VALUES('A'); INSERT INTO g VALUES('B');
+      INSERT INTO g VALUES('A');
+      SELECT DISTINCT grp FROM g;   -- Pas: row='A' only.  C: A,B.
+      ```
+      INTEGER `SELECT DISTINCT val` works correctly.  Affects every code
+      path that opens an ephemeral b-tree with a P4_KEYINFO containing a
+      TEXT/BLOB column and uses `OP_Found / OP_MakeRecord / OP_IdxInsert`
+      to dedup — including the existing selectInnerLoop DISTINCT arm
+      (codegen.pas:19452) and the new agg-DISTINCT arm
+      (resetAccumulatorSimple/updateAccumulatorSimple).  Symptom: every
+      OP_Found returns "found" after the first IdxInsert, so only the
+      first row gets a unique-row action.  Likely root cause: KeyInfo
+      collation / record-comparison plumbing for TEXT in the ephemeral
+      btree — sqlite3VdbeRecordCompare in btree.pas uses memcmp for
+      strings (see 6.9-complete b — non-BINARY collations punted) but the
+      bug reproduces with default BINARY collation, so it is more likely
+      that the OP_MakeRecord serialization of a TEXT Mem and the
+      OP_IdxInsert / OP_Found b-tree key path disagree on the encoded
+      record bytes (e.g. zero-length-prefix mismatch, or the index cursor
+      reading the record-length field at the wrong offset).  Worth
+      checking sqlite3BtreeIndexMoveto and the in-memory btree's payload
+      handling for non-fixed-width keys.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,

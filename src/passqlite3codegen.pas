@@ -18722,13 +18722,18 @@ begin
 end;
 
 { resetAccumulatorSimple — select.c:6658 (slim).  Emit OP_Null over the
-  accumulator register block.  The DISTINCT (iDistinct>=0) and ORDER BY
-  (iOBTab>=0) ephemeral-table arms are intentionally omitted; the gate
-  in sqlite3Select rejects those forms today. }
+  accumulator register block, then for each aggregate with iDistinct>=0
+  open an ephemeral b-tree to dedup its argument (mirrors select.c:6671).
+  The ORDER BY (iOBTab>=0) arm is still intentionally omitted; the gate
+  in sqlite3Select rejects that form today. }
 procedure resetAccumulatorSimple(pParse: PParse; pAggInfo: PAggInfo);
 var
   v:    PVdbe;
   nReg: i32;
+  i:    i32;
+  pF:   PAggInfoFunc;
+  pE:   PExpr;
+  pKI:  Pointer;
 begin
   v    := pParse^.pVdbe;
   nReg := pAggInfo^.nFunc + pAggInfo^.nColumn;
@@ -18737,6 +18742,27 @@ begin
   if pParse^.nErr <> 0 then Exit;
   sqlite3VdbeAddOp3(v, OP_Null, 0, pAggInfo^.iFirstReg,
                     pAggInfo^.iFirstReg + nReg - 1);
+  for i := 0 to pAggInfo^.nFunc - 1 do
+  begin
+    pF := @pAggInfo^.aFunc[i];
+    if pF^.iDistinct >= 0 then
+    begin
+      pE := pF^.pFExpr;
+      Assert(ExprUseXList(pE));
+      if (pE^.x.pList = nil) or (pE^.x.pList^.nExpr <> 1) then
+      begin
+        sqlite3ErrorMsg(pParse,
+          'DISTINCT aggregates must have exactly one argument');
+        pF^.iDistinct := -1;
+      end
+      else
+      begin
+        pKI := sqlite3KeyInfoFromExprList(pParse, pE^.x.pList, 0, 0);
+        pF^.iDistAddr := sqlite3VdbeAddOp4(v, OP_OpenEphemeral,
+          pF^.iDistinct, 0, 0, PAnsiChar(pKI), P4_KEYINFO);
+      end;
+    end;
+  end;
 end;
 
 { updateAccumulatorSimple — select.c:6799 (slim).  For each aggregate
@@ -18796,6 +18822,22 @@ begin
     begin
       nArg   := 0;
       regAgg := 0;
+    end;
+    { DISTINCT dedup — select.c:6902..6908 default WHERE_DISTINCT_UNORDERED
+      arm.  Skip the AggStep when the arg-record is already present in the
+      ephemeral table opened by resetAccumulatorSimple. }
+    if (pF^.iDistinct >= 0) and (pList <> nil) then
+    begin
+      if addrNext = 0 then
+        addrNext := sqlite3VdbeMakeLabel(pParse);
+      r1 := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp4Int(v, OP_Found, pF^.iDistinct, addrNext,
+                           regAgg, nArg);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regAgg, nArg, r1);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pF^.iDistinct, r1,
+                           regAgg, nArg);
+      sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+      sqlite3ReleaseTempReg(pParse, r1);
     end;
     { NEEDCOLL — select.c:6918..6932.  Aggregate functions flagged with
       SQLITE_FUNC_NEEDCOLL (min/max) need an OP_CollSeq immediately
@@ -19309,7 +19351,6 @@ begin
       for jAgg := 0 to pAggI2^.nFunc - 1 do
       begin
         pAggFunc := @pAggI2^.aFunc[jAgg];
-        if pAggFunc^.iDistinct >= 0 then begin canUseAgg := False; break; end;
         if pAggFunc^.iOBTab    >= 0 then begin canUseAgg := False; break; end;
         if ((pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0)
            and ((pAggFunc^.pFExpr^.y.pWin = nil)
