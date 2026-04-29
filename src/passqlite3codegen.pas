@@ -2977,6 +2977,7 @@ implementation
 
 uses
   DateUtils,
+  Unix, BaseUnix,
   Math,
   passqlite3printf,
   passqlite3json,
@@ -29530,11 +29531,14 @@ begin
   s  := ((F * 24.0 - h) * 60.0 - mn) * 60.0;
 end;
 
+function currentJD: Double; forward;
+
 { parseDateTime — parse a date/time string in ISO 8601 format.
   Faithful port of date.c:parseYyyyMmDd + parseHhMmSs + parseDateOrTime
   (date.c:207..442).  Accepts:
     YYYY-MM-DD [ T|space HH:MM[:SS[.FFF]] ]
     HH:MM[:SS[.FFF]]                        (time-only — date defaults to 2000-01-01)
+    now                                     (current UTC date/time)
 }
 function parseDateTime(zStr: PAnsiChar; var dt: TDateTime2): Boolean;
 var
@@ -29582,6 +29586,19 @@ begin
   if zStr = nil then Exit;
   s := AnsiString(zStr);
   h := 0; mn := 0; sec := 0.0;
+  { date.c:parseDateOrTime — `now` keyword: setDateTimeToCurrent. }
+  if (Length(s) = 3)
+     and ((s[1] = 'n') or (s[1] = 'N'))
+     and ((s[2] = 'o') or (s[2] = 'O'))
+     and ((s[3] = 'w') or (s[3] = 'W')) then
+  begin
+    rJD := currentJD;
+    fromJulianDay(rJD, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+    dt.jd := rJD;
+    dt.validJD := True;
+    Result := True;
+    Exit;
+  end;
   { date.c:parseDateOrTime — numeric (Julian Day) fallback.  When the
     input is a bare number, treat it as a Julian Day and decode via
     fromJulianDay so dt.yr/mo/dy/hr/mi/s are populated for downstream
@@ -29622,17 +29639,22 @@ begin
   Result := True;
 end;
 
-{ currentJD — get current UTC time as Julian Day Number. }
+{ currentJD — get current UTC time as Julian Day Number.  Mirrors
+  date.c:setDateTimeToCurrent / sqlite3OsCurrentTimeInt64: read epoch
+  milliseconds from the OS clock, convert to JD via
+  iJD := iEpoch_ms + 210866760000000  (= 2440587.5 * 86400000).
+  Compute in integer milliseconds first to avoid Double precision loss
+  on the ~2.46e6 + ~2e4 day add. }
 function currentJD: Double;
 var
-  now: TDateTime;
-  y, m, d, h, mn, s, ms: Word;
+  tv: TimeVal;
+  iJD: Int64;
 begin
-  now := EncodeDateTime(1970,1,1,0,0,0,0) +
-    (SysUtils.Now - EncodeDateTime(1970,1,1,0,0,0,0));
-  now := SysUtils.Now;
-  DecodeDateTime(now, y, m, d, h, mn, s, ms);
-  Result := toJulianDay(y, m, d, h, mn, s + ms/1000.0);
+  fpGetTimeOfDay(@tv, nil);
+  iJD := Int64(tv.tv_sec) * Int64(1000)
+         + (Int64(tv.tv_usec) div Int64(1000))
+         + Int64(210866760000000);
+  Result := Double(iJD) / Double(86400000.0);
 end;
 
 { applyModifier — Phase 6.10 step 11(i): subset port of parseModifier
@@ -29957,8 +29979,14 @@ begin
                while op^ <> #0 do Inc(op);
              end;
         's': begin
+               { date.c:1438 — iS = (i64)(iJD/1000 - 21086676*(i64)10000).
+                 C uses integer milliseconds throughout; Pas stores jd as
+                 Double days, so (jd-epoch)*86400 loses precision for
+                 whole-second values (e.g. 0.9999999... for 1s).  Round
+                 to integer ms first, then floor-divide by 1000. }
                epoch := toJulianDay(1970,1,1,0,0,0.0);
-               snpFmt(24, op, '%lld', [Trunc((jd-epoch)*86400.0)]);
+               snpFmt(24, op, '%lld',
+                 [Round((jd-epoch)*86400000.0) div Int64(1000)]);
                while op^ <> #0 do Inc(op);
              end;
         'e': begin snpFmt(4, op, '%2d', [d2]); while op^ <> #0 do Inc(op); end;

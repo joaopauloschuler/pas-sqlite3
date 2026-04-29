@@ -434,6 +434,30 @@ Important: At the end of this document, please find:
            parseDateOrTime AtoF arm).  Lifts time()/datetime()/
            strftime() for numeric JD too.
 
+  [X] **6.10 step 25** Date/time `'now'` + strftime `%s` parity —
+      closed 2026-04-29.  Gate `src/tests/DiagArith.pas` (124 cases,
+      under-covered arithmetic / NULL / coercion / string / LIKE /
+      bitwise / typeof / date surface).  Two fixes:
+        1. `date('now')` / `datetime('now')` / `strftime(..., 'now')`
+           returned NULL (no `'now'` arm in parseDateTime).  Ported
+           date.c:parseDateOrTime `'now'` keyword via setDateTimeToCurrent.
+        2. `currentJD` used local time via `SysUtils.Now` and dropped
+           seconds via Double-precision loss in
+           `(tv_sec + tv_usec/1e6)/86400`.  Reworked to integer-ms
+           accumulator (date.c:setDateTimeToCurrent +
+           sqlite3OsCurrentTimeInt64), `iJD := tv_sec*1000 +
+           tv_usec/1000 + 210866760000000`, `Result := Double(iJD) /
+           Double(86400000.0)`.  Explicit Double() cast required —
+           plain Int64/literal divides through Single in FPC's mixed
+           Int64/Double expression resolution and loses precision at
+           JD ~2.46e6 (manifested as 12:00:00 quantisation).
+        3. `strftime('%s', ...)` was off by 1 for whole-second timestamps
+           (e.g. `1970-01-01 00:00:01` returned 0).  Root cause:
+           `Trunc((jd-epoch)*86400)` rounds 0.99999... down to 0.
+           Switched to integer-ms path:
+           `Round((jd-epoch)*86400000) div 1000` (mirrors
+           date.c:1438 `iS = iJD/1000 - 21086676*10000`).
+
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
         the sqlite_schema scrub now uses one-pass inline delete.
