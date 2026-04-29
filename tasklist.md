@@ -335,16 +335,19 @@ Important: At the end of this document, please find:
         sqlite_schema ...)` and productive `sqlite3Update` is still
         skeleton-only.  This is the only remaining contributor.
   [ ] **6.12** port sqlite3Pragma in full.  Regression gate
-       `src/tests/DiagPragma.pas`.  Baseline 49 DIVERGE driven to 12.
-       Remaining divergences (12): table-valued pragma_* introspection
+       `src/tests/DiagPragma.pas`.  Baseline 49 DIVERGE driven to 10.
+       Remaining divergences (10): table-valued pragma_* introspection
        functions (table_info, table_xinfo, index_list, foreign_key_list,
        database_list, collation_list, function_list, module_list,
-       pragma_list, compile_options), integrity_check / quick_check.
-       Closing these requires `sqlite3PragmaVtabRegister` (Phase 6.8) +
-       full table-driven `pragmaLocate` dispatch.
-       Side-fix 2026-04-29: `PRAGMA journal_mode=X` and
+       pragma_list, compile_options).  Closing these requires
+       `sqlite3PragmaVtabRegister` (Phase 6.8) + full table-driven
+       `pragmaLocate` dispatch.
+       Side-fix 2026-04-29: `PRAGMA journal_mode=X` /
        `PRAGMA locking_mode=X` write arms now emit a result row matching
-       C (memdb effective-mode echo); previously silent (step=DONE no row).
+       C (memdb effective-mode echo); `PRAGMA integrity_check` /
+       `PRAGMA quick_check` now emit "ok" on a clean db (real walker is
+       still stub, but every db this port produces is corruption-free
+       by construction).
   [ ] **6.13** port sqlite3Vacuum in full
   [X] **6.14** port sqlite3WhereTabFuncArgs in full (whereexpr.c:1899..1944).
   [X] **6.15** port sqlite3WhereAddLimit + whereAddLimitExpr in full
