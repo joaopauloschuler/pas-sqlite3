@@ -10253,7 +10253,7 @@ begin
 end;
 
 { -----------------------------------------------------------------------
-  sqlite3VdbeMemFinalize — call aggregate finalizer (stub: FuncDef not ported)
+  sqlite3VdbeMemFinalize (vdbemem.c:506) — call aggregate finalizer.
   ----------------------------------------------------------------------- }
 function sqlite3VdbeMemFinalize(pMem: PMem; pFunc: PFuncDef): i32;
 var
@@ -10273,6 +10273,7 @@ begin
     ctx.pOut  := @t;       { separate output — accumulator stays intact }
     ctx.pMem  := pMem;
     ctx.pFunc := pFd;
+    if t.db <> nil then ctx.enc := PTsqlite3(t.db)^.enc;
     pFd^.xFinalize(@ctx);
     { Mirror vdbemem.c:524 — release the accumulator's zMalloc and copy
       the result Mem (`t`) over `pMem^` unconditionally, even on error.
@@ -10292,7 +10293,7 @@ begin
 end;
 
 { -----------------------------------------------------------------------
-  sqlite3VdbeMemAggValue — stub (window functions, Phase 6)
+  sqlite3VdbeMemAggValue (vdbemem.c:539) — call window xValue method.
   ----------------------------------------------------------------------- }
 function sqlite3VdbeMemAggValue(pAccum: PMem; pOut: PMem; pFunc: PFuncDef): i32;
 var
@@ -10306,6 +10307,7 @@ begin
     ctx.pOut  := pOut;
     ctx.pMem  := pAccum;
     ctx.pFunc := pFd;
+    if pAccum^.db <> nil then ctx.enc := PTsqlite3(pAccum^.db)^.enc;
     pFd^.xValue(@ctx);
     Result := ctx.isError;
   end else
