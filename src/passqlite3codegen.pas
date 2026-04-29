@@ -26205,23 +26205,28 @@ begin
 
   { PragTyp_HEADER_VALUE — pragma.c:2324.  Reads/writes a 4-byte slot in
     the database file header.  user_version is iCookie=BTREE_USER_VERSION,
-    application_id is iCookie=BTREE_APPLICATION_ID. }
-  if SameText(zName, 'user_version') or SameText(zName, 'application_id') then
+    application_id is iCookie=BTREE_APPLICATION_ID, data_version is
+    iCookie=BTREE_DATA_VERSION (virtual meta-value, ReadOnly). }
+  if SameText(zName, 'user_version') or SameText(zName, 'application_id')
+     or SameText(zName, 'data_version') then
   begin
     if SameText(zName, 'user_version') then
       iCookie := BTREE_USER_VERSION
+    else if SameText(zName, 'data_version') then
+      iCookie := BTREE_DATA_VERSION
     else
       iCookie := BTREE_APPLICATION_ID;
     sqlite3VdbeUsesBtree(v, iDb);
-    if pValue <> nil then begin
-      { Write arm — Transaction(write) + SetCookie(P5=1). }
+    if (pValue <> nil) and (iCookie <> BTREE_DATA_VERSION) then begin
+      { Write arm — Transaction(write) + SetCookie(P5=1).  data_version
+        is ReadOnly per pragma.h flags so writes silently no-op. }
       SetString(zRight, pValue^.z, pValue^.n);
       sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 1, 0);
       addrOp := sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, iCookie,
                                   sqlite3Atoi(PChar(zRight)));
       sqlite3VdbeChangeP5(v, 1);
       if addrOp = 0 then ;
-    end else begin
+    end else if pValue = nil then begin
       { Read arm. }
       sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 0, 0);
       sqlite3VdbeAddOp3(v, OP_ReadCookie,  iDb, 1, iCookie);

@@ -587,28 +587,28 @@ Important: At the end of this document, please find:
   [ ] **6.12** port sqlite3Pragma in full.  Regression gate
        `src/tests/DiagPragma.pas` (run with
        `LD_LIBRARY_PATH=$PWD/src bin/DiagPragma`).  Baseline 49 DIVERGE
-       driven to 14 DIVERGE.  Existing PragTyp_FLAG arm (17 boolean
+       driven to 13 DIVERGE.  Existing PragTyp_FLAG arm (17 boolean
        pragmas: foreign_keys, recursive_triggers,
        reverse_unordered_selects, defer_foreign_keys, writable_schema,
        legacy_alter_table, cell_size_check, automatic_index,
        full_column_names, short_column_names, checkpoint_fullfsync,
        fullfsync, ignore_check_constraints, query_only, trusted_schema,
        count_changes, read_uncommitted, empty_result_callbacks); plus
-       2026-04-29 default-value dispatch for 13 read-only pragmas
-       (secure_delete=0, temp_store=0, threads=0, soft_heap_limit=0,
-       hard_heap_limit=0, busy_timeout=0, analysis_limit=0,
-       wal_autocheckpoint=1000, journal_size_limit=-1, auto_vacuum=0,
-       freelist_count=0, schema_version=0, max_page_count via
-       OP_MaxPgcnt) plus journal_mode='memory', locking_mode='normal'.
-       SQLITE_CountRows/ReadUncommit HI() constants added to util.pas
-       (HI(0x1)/HI(0x4) — note: dead SQLITE_VdbeListing/SqlTrace
-       constants share these numeric values; harmless since unreferenced
-       elsewhere, but worth fixing alongside any debug-trace work).
-       Remaining divergences (14): table-valued pragma_* introspection
+       default-value dispatch for read-only pragmas (secure_delete=0,
+       temp_store=0, threads=0, soft_heap_limit=0, hard_heap_limit=0,
+       busy_timeout=0, analysis_limit=0, wal_autocheckpoint=1000,
+       journal_size_limit=-1, auto_vacuum=0, freelist_count=0,
+       schema_version=0, max_page_count via OP_MaxPgcnt) plus
+       journal_mode='memory', locking_mode='normal'; data_version
+       extension of the PragTyp_HEADER_VALUE arm landed 2026-04-29
+       (BTREE_DATA_VERSION=15 read-only via OP_ReadCookie; writes
+       silently no-op per the C ReadOnly flag).  SQLITE_CountRows/
+       ReadUncommit HI() constants added to util.pas (HI(0x1)/HI(0x4)).
+       Remaining divergences (13): table-valued pragma_* introspection
        functions (table_info, table_xinfo, index_list, foreign_key_list,
        database_list, collation_list, function_list, module_list,
        pragma_list, compile_options), integrity_check / quick_check,
-       cache_spill, data_version.
+       cache_spill.
   [ ] **6.13** port sqlite3Vacuum in full
   [X] **6.14** port sqlite3WhereTabFuncArgs in full (whereexpr.c:1899..1944).
   [X] **6.15** port sqlite3WhereAddLimit + whereAddLimitExpr in full
