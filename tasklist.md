@@ -210,9 +210,9 @@ Important: At the end of this document, please find:
       resolution, ROWID/IPK alias edges, BLOB literals, PRAGMA round-trips,
       typeof boundaries, NULL propagation).  Run with
       `LD_LIBRARY_PATH=$PWD/src bin/DiagTxn`.  Initial sweep (~52 cases)
-      reported 14 divergences; 1 fixed.  Most remaining fold into already-
-      tracked gaps (sqlite3Pragma, sqlite3GenerateConstraintChecks,
-      sqlite3Update body).
+      reported 14 divergences; 7 remain (verified 2026-04-29).  Most fold
+      into already-tracked gaps (sqlite3GenerateConstraintChecks,
+      sqlite3Update body, full VdbeHalt).
       [X] **a) `total_changes()` returned 0 after INSERT** — closed.
       [ ] **b) `BEGIN; ...; ROLLBACK` does not roll back changes** —
         DiagTxn `begin rollback insert`: Pas SELECT after rollback errors
@@ -239,13 +239,11 @@ Important: At the end of this document, please find:
         `changes() after update`.  Folds into `sqlite3Update` body
         skeleton (6.9-bis 11g.2.f); UPDATE never actually fires, so
         nChange stays 0 even with the new VdbeHalt accounting.
-      [ ] **g) `journal_mode` PRAGMA** — only remaining DiagTxn pragma
-        divergence.  Needs a real OP_JournalMode runtime arm
-        (currently 0-returning stub at vdbe.pas:8140) + per-db pager
-        journal-mode plumbing.  Other pragmas (application_id,
-        user_version, page_size, cache_size, synchronous) closed.
-        Full table-driven `pragmaLocate` dispatch still deferred
-        under 6.12.
+      [X] **g) `journal_mode` PRAGMA** — closed (DiagTxn `pragma
+        journal_mode memory default mem` PASSes; covered by the 6.12
+        PragTyp_JOURNAL read arm landed via the table-driven dispatch).
+        Full table-driven `pragmaLocate` (table-valued pragma_* etc.)
+        still deferred under 6.12.
 
   [ ] **6.10 step 17** Window-function and aggregate divergences surfaced
       by the new `src/tests/DiagWindow.pas` probe (run with
@@ -310,39 +308,27 @@ Important: At the end of this document, please find:
   [X] **6.10 step 27** LIKE / GLOB / NOT LIKE / NOT GLOB / ESCAPE
       parity sweep — closed 2026-04-29 (DiagLikeGlob, 55/55 PASS).
 
-  [ ] **6.10 step 26** DiagIndexing probe (added 2026-04-29,
-      `src/tests/DiagIndexing.pas`).  44 cases, 15 DIVERGE — surfaced new
-      silent bugs not previously captured.  Run with
-      `LD_LIBRARY_PATH=$PWD/src bin/DiagIndexing`.
-      [X] **a) `CREATE INDEX <name> ON t(col)` runtime SQL_LOGIC_ERROR**
-        — closed 2026-04-29.
-      [X] **b) Partial index `CREATE INDEX ... ON t(a) WHERE b='y'`** — closed 2026-04-29.
-      [X] **c) Expression index `CREATE INDEX ... ON t(a*2)`** — closed 2026-04-29.
-      [X] **d) Affinity not applied at INSERT time** — closed 2026-04-29.
-      [ ] **e) `INDEXED BY` / `NOT INDEXED` against `WHERE a=1` returns
-        empty rowset** (DiagIndexing `indexed by ok`, `not indexed`).
-        Root cause traced 2026-04-29: sqlite3WhereBegin's nTabList=1 gate
-        at codegen.pas:14991 unconditionally bails when whereShortCut
-        returns 0, but whereShortCut bails for any FROM item with the
-        INDEXED BY ($02) or NOT INDEXED ($01) flag (gate at
-        codegen.pas:14203).  Lifting the bail exposes downstream gaps
-        in single-table planner codegen (AV in sqlite3VdbeExec on the
-        emitted plan).  Blocked on full single-table planner port
-        (extension of the multi-table whereLoopAddAll / wherePathSolver /
-        sqlite3WhereCodeOneLoopStart path to nTabList=1 — overlaps
-        6.9-bis 11g.2.b open items).
-        Side fixes landed 2026-04-29:
-          (i) `$01 → SRCITEM_FG_IS_SUBQUERY ($04)` in four
-              sqlite3Select gates (codegen.pas:19288, :19566, :19623,
-              :19756) — the bits had been confused; $01 is NOT_INDEXED,
-              not IS_SUBQUERY.  Cascade: DiagWindow 14→13 divergences.
-          (ii) Ported `estimateTableWidth` (build.c:2613) inline at the
-              tail of `sqlite3EndTable` so `pTab^.szTabRow` gets a
-              non-zero LogEst on every CREATE TABLE — required by
-              whereLoopAddBtree's IPK / index-scan cost model
-              (codegen.pas:12428..12430 divides by szTabRow; previously
-              latent because the single-table planner gate kept that
-              path unreachable).
+  [ ] **6.10 step 26** DiagIndexing probe
+      (`src/tests/DiagIndexing.pas`, baseline 44 cases / 15 DIVERGE on
+      add).  35 PASS / 7 DIVERGE on 2026-04-29 re-run — a..d closed.
+      Run with `LD_LIBRARY_PATH=$PWD/src bin/DiagIndexing`.
+      [X] **a) `CREATE INDEX <name> ON t(col)`** — closed.
+      [X] **b) Partial index `... WHERE b='y'`** — closed.
+      [X] **c) Expression index `... ON t(a*2)`** — closed.
+      [X] **d) Affinity not applied at INSERT time** — closed.
+      [ ] **e) `INDEXED BY` / `NOT INDEXED`** — DiagIndexing `indexed
+        by ok`, `not indexed` return empty rowset.  Blocker:
+        sqlite3WhereBegin's nTabList=1 gate (codegen.pas:14991) bails
+        when whereShortCut returns 0; whereShortCut bails for any FROM
+        item carrying INDEXED BY ($02) / NOT INDEXED ($01) flags
+        (codegen.pas:14203).  Lifting the bail exposes downstream gaps
+        — full single-table planner port required (overlaps
+        6.9-bis 11g.2.b).
+      [ ] **f) Remaining 5 divergences** — `schema after create idx`,
+        `select range via idx`, `unique violation`, `rowid select`,
+        `rowid alias custom`.  Likely fold into single-table planner
+        and sqlite3GenerateConstraintChecks gaps (e + 6.9-bis 11g.2.b);
+        triage when those land.
 
   [X] **6.10 step 25** Date/time `'now'` + strftime `%s` parity —
       closed 2026-04-29.
