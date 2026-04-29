@@ -383,11 +383,16 @@ Important: At the end of this document, please find:
             in 6.27; current no-op matches C semantics whenever the
             parser is not in rename mode.
   [ ] **6.23** port codegen.pas trigger stubs in full from C to pascal:
-       `sqlite3TriggerList`, `sqlite3BeginTrigger`, `sqlite3FinishTrigger`,
+       `sqlite3BeginTrigger`, `sqlite3FinishTrigger`,
        `sqlite3DropTrigger`, `sqlite3DropTriggerPtr`,
-       `sqlite3UnlinkAndDeleteTrigger`, `sqlite3TriggersExist`,
+       `sqlite3UnlinkAndDeleteTrigger`,
        `sqlite3CodeRowTriggerDirect`, `sqlite3CodeRowTrigger`,
        `sqlite3TriggerStepSrc`, `sqlite3TriggerColmask`.
+       [X] `sqlite3TriggerList` — ported 2026-04-29 (trigger.c:50; walks
+            temp schema's trigHash and prepends matching triggers).
+       [X] `sqlite3TriggersExist` — ported 2026-04-29 (trigger.c:805/869;
+            triggersReallyExist inlined).  Faithful no-op until
+            `sqlite3BeginTrigger` populates the trigger schema.
   [ ] **6.24** port codegen.pas DML / insert stubs in full from C to pascal:
        `sqlite3UpsertAnalyzeTarget`, `sqlite3UpsertDoUpdate`,
        `sqlite3AutoincrementBegin`, `sqlite3AutoincrementEnd`,

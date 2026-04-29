@@ -20411,11 +20411,48 @@ begin
   sqlite3DbFree(db, pTrigger);
 end;
 
-{ sqlite3TriggerList — return list of triggers on table (Phase 6.4 stub) }
+{ sqlite3TriggerList — port of trigger.c:50.
+  Return all triggers attached to pTab.  Triggers in the same database as
+  pTab live on pTab^.pTrigger already; this routine prepends any TEMP
+  triggers that target pTab to that list and returns the combined chain.
+  RETURNING transient triggers (op=TK_RETURNING) are also injected. }
 function sqlite3TriggerList(pParse: PParse; pTab: PTable2): PTrigger;
+var
+  pTmpSchema: passqlite3util.PSchema;
+  pList:      PTrigger;
+  p:          passqlite3util.PHashElem;
+  pTrig:      PTrigger;
 begin
-  { Full trigger-schema lookup deferred to Phase 6.5 }
-  Result := nil;
+  if (pParse = nil) or (pTab = nil) or (pParse^.db = nil) then Exit(nil);
+  if pParse^.db^.nDb < 2 then Exit(pTab^.pTrigger);
+  pTmpSchema := pParse^.db^.aDb[1].pSchema;
+  pList := pTab^.pTrigger;
+  if pTmpSchema = nil then begin
+    Result := pList;
+    Exit;
+  end;
+  p := pTmpSchema^.trigHash.first;
+  while p <> nil do begin
+    pTrig := PTrigger(p^.data);
+    if (pTrig^.pTabSchema = pTab^.pSchema)
+       and (pTrig^.table <> nil)
+       and (sqlite3StrICmp(pTrig^.table, pTab^.zName) = 0)
+       and ((pTrig^.pTabSchema <> pTmpSchema) or (pTrig^.bReturning <> 0))
+    then begin
+      pTrig^.pNext := pList;
+      pList := pTrig;
+    end else if pTrig^.op = TK_RETURNING then begin
+      { RETURNING transient trigger: bind to current statement's table. }
+      if (pParse^.parseFlags and PARSEFLAG_BReturning) <> 0 then begin
+        pTrig^.table := pTab^.zName;
+        pTrig^.pTabSchema := pTab^.pSchema;
+        pTrig^.pNext := pList;
+        pList := pTrig;
+      end;
+    end;
+    p := passqlite3util.PHashElem(p^.next);
+  end;
+  Result := pList;
 end;
 
 { sqlite3BeginTrigger — parse CREATE TRIGGER header (Phase 6.4 stub) }
@@ -20490,12 +20527,95 @@ begin
   end;
 end;
 
-{ sqlite3TriggersExist — check for triggers on table (Phase 6.4 stub) }
+{ checkColumnOverlap — port of trigger.c:781.
+  Return true if any column in pIdList appears in pEList. }
+function trgCheckColumnOverlap(pIdList: PIdList; pEList: PExprList): i32;
+var
+  e: i32;
+  items: PExprListItem;
+begin
+  if (pIdList = nil) or (pEList = nil) then Exit(1);
+  items := ExprListItems(pEList);
+  for e := 0 to pEList^.nExpr - 1 do
+    if sqlite3IdListIndex(pIdList, items[e].zEName) >= 0 then
+      Exit(1);
+  Result := 0;
+end;
+
+{ tempTriggersExist — port of trigger.c:793. }
+function trgTempTriggersExist(db: PTsqlite3): i32;
+var pSch: passqlite3util.PSchema;
+begin
+  if db^.nDb < 2 then Exit(0);
+  pSch := db^.aDb[1].pSchema;
+  if pSch = nil then Exit(0);
+  if pSch^.trigHash.first = nil then Exit(0);
+  Result := 1;
+end;
+
+{ sqlite3TriggersExist — port of trigger.c:805 (triggersReallyExist inlined)
+  + trigger.c:869.  Returns the trigger list when at least one trigger of
+  the requested op fires; pMask receives the OR of TRIGGER_BEFORE /
+  TRIGGER_AFTER flags. }
 function sqlite3TriggersExist(pParse: PParse; pTab: PTable2; op: i32;
   pChanges: PExprList; pMask: Pu32): PTrigger;
+var
+  mask: u32;
+  pList, p: PTrigger;
+  db: PTsqlite3;
 begin
-  if pMask <> nil then pMask^ := 0;
-  Result := nil;
+  if (pParse = nil) or (pTab = nil) or (pParse^.db = nil) then begin
+    if pMask <> nil then pMask^ := 0;
+    Exit(nil);
+  end;
+  db := pParse^.db;
+  if ((pTab^.pTrigger = nil) and (trgTempTriggersExist(db) = 0))
+     or ((pParse^.parseFlags and PARSEFLAG_DisableTriggers) <> 0) then
+  begin
+    if pMask <> nil then pMask^ := 0;
+    Exit(nil);
+  end;
+
+  mask := 0;
+  pList := sqlite3TriggerList(pParse, pTab);
+  if pList <> nil then begin
+    p := pList;
+    if ((db^.flags and SQLITE_EnableTrigger) = 0)
+       and (pTab^.pTrigger <> nil)
+       and (sqlite3SchemaToIndex(db, pTab^.pTrigger^.pSchema) <> 1) then
+    begin
+      { Triggers disabled except for TEMP triggers. }
+      if pList = pTab^.pTrigger then begin
+        if pMask <> nil then pMask^ := 0;
+        Exit(nil);
+      end;
+      while (p^.pNext <> nil) and (p^.pNext <> pTab^.pTrigger) do
+        p := p^.pNext;
+      p^.pNext := nil;
+      p := pList;
+    end;
+    repeat
+      if (p^.op = op) and (trgCheckColumnOverlap(p^.pColumns, pChanges) <> 0)
+      then
+        mask := mask or u32(p^.tr_tm)
+      else if p^.op = TK_RETURNING then begin
+        p^.op := op;
+        if pTab^.eTabType = TABTYP_VTAB then begin
+          if op <> TK_INSERT then
+            sqlite3ErrorMsg(pParse,
+              'RETURNING is not available on virtual tables');
+          p^.tr_tm := TRIGGER_BEFORE;
+        end else
+          p^.tr_tm := TRIGGER_AFTER;
+        mask := mask or u32(p^.tr_tm);
+      end else if (p^.bReturning <> 0) and (p^.op = TK_INSERT)
+                  and (op = TK_UPDATE) then
+        mask := mask or u32(p^.tr_tm);
+      p := p^.pNext;
+    until p = nil;
+  end;
+  if pMask <> nil then pMask^ := mask;
+  if mask <> 0 then Result := pList else Result := nil;
 end;
 
 { sqlite3CodeRowTriggerDirect — emit VDBE for a specific trigger (Phase 6.4 stub) }
