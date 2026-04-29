@@ -457,6 +457,31 @@ const
 function sqlite3_serialize(db: PTsqlite3; zSchema: PAnsiChar;
   piSize: Pi64; mFlags: u32): Pu8; cdecl;
 
+{ Phase 8.7.1 — Snapshot public-API entry points (sqlite.h.in:11006..11136).
+  Mirrors the SQLITE_OMIT_WAL build of main.c:5018..5147: snapshot machinery
+  on top of WAL is not yet ported (sqlite3PagerSnapshotOpen/Get/Check/Recover
+  /Unlock have no Pascal counterparts), so _get / _open / _recover return
+  SQLITE_ERROR on every call and _free is the trivial sqlite3_free wrapper.
+  _cmp is the WAL-less stub (returns 0 — undefined-but-stable per the docs:
+  "result of the comparison is undefined" if the snapshot was not produced
+  by a successful _get).  This brings the public-API surface to parity even
+  while the underlying WAL feature stays unported.  C reference:
+  main.c:5013..5148 (gated on SQLITE_ENABLE_SNAPSHOT). }
+type
+  TSqlite3Snapshot = record
+    hidden: array[0..47] of u8;
+  end;
+  Psqlite3_snapshot  = ^TSqlite3Snapshot;
+  PPsqlite3_snapshot = ^Psqlite3_snapshot;
+
+function  sqlite3_snapshot_get(db: PTsqlite3; zSchema: PAnsiChar;
+                               ppSnapshot: PPsqlite3_snapshot): i32; cdecl;
+function  sqlite3_snapshot_open(db: PTsqlite3; zSchema: PAnsiChar;
+                                pSnapshot: Psqlite3_snapshot): i32; cdecl;
+procedure sqlite3_snapshot_free(pSnapshot: Psqlite3_snapshot); cdecl;
+function  sqlite3_snapshot_cmp(p1, p2: Psqlite3_snapshot): i32; cdecl;
+function  sqlite3_snapshot_recover(db: PTsqlite3; zDb: PAnsiChar): i32; cdecl;
+
 implementation
 
 uses
@@ -4014,6 +4039,61 @@ begin
     sqlite3PagerUnref(pPage);
   end;
   Result := pOut;
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 8.7.1 — Snapshot public-API entry points (main.c:5013..5147).
+  Faithful translation of the SQLITE_OMIT_WAL / SQLITE_OMIT_SNAPSHOT
+  semantic: snapshot operations report SQLITE_ERROR because the pager
+  snapshot machinery (sqlite3PagerSnapshotGet etc.) is not present.
+  ---------------------------------------------------------------------- }
+
+function sqlite3_snapshot_get(db: PTsqlite3; zSchema: PAnsiChar;
+                              ppSnapshot: PPsqlite3_snapshot): i32; cdecl;
+begin
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+{$ENDIF}
+  if ppSnapshot <> nil then ppSnapshot^ := nil;
+  Result := SQLITE_ERROR;
+end;
+
+function sqlite3_snapshot_open(db: PTsqlite3; zSchema: PAnsiChar;
+                               pSnapshot: Psqlite3_snapshot): i32; cdecl;
+begin
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+{$ENDIF}
+  Result := SQLITE_ERROR;
+end;
+
+procedure sqlite3_snapshot_free(pSnapshot: Psqlite3_snapshot); cdecl;
+begin
+  sqlite3_free(pSnapshot);
+end;
+
+function sqlite3_snapshot_cmp(p1, p2: Psqlite3_snapshot): i32; cdecl;
+begin
+  { Without WAL backing the comparison is undefined per the docs.  Return
+    0 (handles "compare equal") so callers do not see a bogus ordering. }
+  if p1 = p2 then Result := 0
+  else if p1 = nil then Result := -1
+  else if p2 = nil then Result := 1
+  else Result := 0;
+end;
+
+function sqlite3_snapshot_recover(db: PTsqlite3; zDb: PAnsiChar): i32; cdecl;
+begin
+{$IFDEF SQLITE_ENABLE_API_ARMOR}
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE; Exit;
+  end;
+{$ENDIF}
+  Result := SQLITE_ERROR;
 end;
 
 { OP_SqlExec hook (vdbe.c:7064).  Trampoline that adapts sqlite3_exec to

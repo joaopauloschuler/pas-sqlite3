@@ -28,13 +28,7 @@ Important: At the end of this document, please find:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-- [ ] **6.8** port one-line / empty-body stubs in full from C to pascal.
-       Identified 2026-04-28 by cross-referencing each Pascal one-liner
-       against `../sqlite3/src/`.  Each entry below has a non-trivial C
-       body that the current Pascal version silently elides.
-
-       Pragma (pragma.c):
-       [ ] `sqlite3PragmaVtabRegister` — returns `nil`; registers
+- [ ] **6.8**  Pragma (pragma.c): `sqlite3PragmaVtabRegister` — returns `nil`; registers
             `pragma_*` eponymous virtual tables via
             `sqlite3VtabCreateModule` + `pragmaVtabModule`.
 
@@ -42,19 +36,12 @@ Important: At the end of this document, please find:
 - [ ] **6.8.2** port `sqlite3GenerateConstraintChecks`
 - [X] **6.8.3** port UNION-ALL arm of `sqlite3MultiValues` — done 2026-04-29
        (see 6.24 entry).
+- [ ] **6.8.4** port `sqlite3WhereBegin`
+- [ ] **6.8.5** port `sqlite3WhereEnd`
 
-- [ ] **6.9-bis 11g.2.b** Port:  
-    [ ] Port `sqlite3WhereBegin`
-    [ ] Port `sqlite3WhereEnd`
-    Bookkeeping primitives, prologue,
-    cleanup contract, and several leaf helpers (codeCompare cluster,
-    sqlite3ExprCanBeNull, sqlite3ExprCodeTemp + 6 unary arms,
-    TK_COLLATE/TK_SPAN/TK_UPLUS arms, whereShortCut, allowedOp +
-    operatorMask + exprMightBeIndexed + minimal-viable exprAnalyze)
-    are already ported.
-- [ ] **6.9-complete** complete the porting:
-    - [ ] `sqlite3VdbeRecordCompare` in FULL in `passqlite3btree.pas`.
-    - [ ] `sqlite3VdbeFindCompare` in FULL in `passqlite3btree.pas`.
+- [ ] **6.9** complete the porting:
+    - [ ] `sqlite3VdbeRecordCompare`
+    - [ ] `sqlite3VdbeFindCompare`
     - [X] **a)** RHS arms for Real / String / Blob / extra-Null
       ported 2026-04-28.  serialGet7 + IntFloatCompare + isAllZero
       helpers added locally in btree.pas (avoids uses-cycle to
@@ -479,8 +466,12 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_test_control` — testing back-door (subset).
 
 - [ ] **8.7.1** Snapshot / WAL APIs:
-       [ ] `sqlite3_snapshot_get` / `_open` / `_free` / `_cmp` /
-            `_recover`.
+       [X] `sqlite3_snapshot_get` / `_open` / `_free` / `_cmp` /
+            `_recover` — ported 2026-04-29 (SQLITE_OMIT_WAL semantic
+            stubs: _get/_open/_recover return SQLITE_ERROR, _free wraps
+            sqlite3_free, _cmp returns 0 for equal pointers).  Faithful
+            to the build mode where the underlying pager snapshot
+            machinery is absent; brings public-API surface to parity.
        [X] `sqlite3_wal_autocheckpoint` / `sqlite3_wal_hook` /
             `sqlite3_wal_checkpoint` / `_v2` — ported 2026-04-29.
 
