@@ -14625,6 +14625,7 @@ begin
   sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pIdx));
   if OptimizationEnabled(db, SQLITE_BloomFilter) and (useBloomFilter <> 0) then
   begin
+    sqlite3WhereExplainBloomFilter(pParse, pWC^.pWInfo, pLevel);
     Inc(pParse^.nMem);
     pLevel^.regFilter := pParse^.nMem;
     sqlite3VdbeAddOp2(v, OP_Blob, 10000, pLevel^.regFilter);
@@ -32303,11 +32304,59 @@ end;
 
 function sqlite3WhereExplainBloomFilter(pParse: PParse; pWInfo: PWhereInfo;
   pLevel: PWhereLevel): i32;
+{ wherecode.c:280..320 — adds an OP_Explain opcode describing a Bloom filter.
+  Emits "BLOOM FILTER ON tabname (col=? AND col=?…)" via the StrAccum /
+  %S printf path.  The composed text becomes the P4 of the OP_Explain
+  (P4_DYNAMIC) so the VDBE owns the buffer and frees it on cleanup. }
+var
+  pItem: PSrcItem;
+  v:     PVdbe;
+  db:    PTsqlite3;
+  pTop:  PParse;
+  zMsg:  PAnsiChar;
+  i:     i32;
+  pLoop: PWhereLoop;
+  str:   PSqlite3Str;
+  pTab:  PTable2;
+  z:     PAnsiChar;
 begin
-  { Stubbed for the same reason as sqlite3WhereExplainOneScan — Bloom-filter
-    OP_Explain text composition needs StrAccum / %S printf, not yet ported. }
   Result := 0;
-  if (pParse = nil) and (pWInfo = nil) and (pLevel = nil) then Exit;
+  if pParse = nil then Exit;
+  if pWInfo = nil then Exit;
+  if pLevel = nil then Exit;
+  v := pParse^.pVdbe;
+  if v = nil then Exit;
+  db := pParse^.db;
+  pItem := @SrcListItems(pWInfo^.pTabList)[pLevel^.iFrom];
+  pLoop := pLevel^.pWLoop;
+  str := sqlite3_str_new(db);
+  if str = nil then Exit;
+  sqlite3_str_appendf(str, 'BLOOM FILTER ON %S (', [pItem]);
+  if (pLoop^.wsFlags and WHERE_IPK) <> 0 then
+  begin
+    pTab := pItem^.pSTab;
+    if (pTab <> nil) and (pTab^.iPKey >= 0) then
+      sqlite3_str_appendf(str, '%s=?', [pTab^.aCol[pTab^.iPKey].zCnName])
+    else
+      sqlite3_str_append(str, 'rowid=?', 7);
+  end
+  else
+  begin
+    i := pLoop^.nSkip;
+    while i < i32(pLoop^.u.btree.nEq) do
+    begin
+      z := explainIndexColumnName(pLoop^.u.btree.pIndex, i);
+      if i > pLoop^.nSkip then sqlite3_str_append(str, ' AND ', 5);
+      sqlite3_str_appendf(str, '%s=?', [z]);
+      Inc(i);
+    end;
+  end;
+  sqlite3_str_append(str, ')', 1);
+  zMsg := sqlite3_str_finish(str);
+  pTop := sqlite3ParseToplevel(pParse);
+  Result := sqlite3VdbeAddOp4(v, OP_Explain, sqlite3VdbeCurrentAddr(v),
+                              pTop^.addrExplain, 0, zMsg, P4_DYNAMIC);
+  sqlite3VdbeScanStatus(v, sqlite3VdbeCurrentAddr(v) - 1, 0, 0, 0, nil);
 end;
 
 procedure sqlite3WhereAddExplainText(pParse: PParse; addr: i32;

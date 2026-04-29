@@ -200,7 +200,11 @@ Important: At the end of this document, please find:
         OP_IdxGT then jumped past OP_AggStep, dropping every join row.
         Fixed by delegating the vdbe.pas wrappers to btree.pas.
         Cosmetic bytecode gap (missing "BLOOM FILTER ON u" OP_Explain)
-        remains.
+        closed 2026-04-29 — sqlite3WhereExplainBloomFilter now has the
+        full body (StrAccum + %S printf + AddOp4/P4_DYNAMIC) and is
+        invoked from constructAutomaticIndex right before the OP_Blob
+        seed.  DiagInnerJoin Pas op stream now matches C exactly
+        (3 OP_Explain ops at [4]/[8]/[19]).
       [ ] **e) UNION / compound SELECT.**
         `SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)`
         returns no row.  Compound-select codegen / sub-FROM
@@ -452,9 +456,12 @@ Important: At the end of this document, please find:
   [ ] **6.25** port codegen.pas schema / index stubs in full from C to pascal:
        `sqlite3ReadSchema`, `sqlite3RunParser`.
   [ ] **6.26** port codegen.pas where / select / window stubs in full from C
-       to pascal: `sqlite3WhereExplainBloomFilter`,
-       `sqlite3WhereAddExplainText`, `sqlite3WindowCodeInit`,
-       `sqlite3WindowCodeStep`.
+       to pascal:
+       [X] `sqlite3WhereExplainBloomFilter` — ported 2026-04-29
+            (wherecode.c:280..320).  Wired into constructAutomaticIndex
+            so auto-index Bloom filters now emit the EQP OP_Explain row.
+       [ ] `sqlite3WhereAddExplainText`, `sqlite3WindowCodeInit`,
+            `sqlite3WindowCodeStep`.
   [ ] **6.27** port codegen.pas alter / attach / analyze / vacuum / FK /
        extension / scalar-function stubs in full from C to pascal:
        `sqlite3AlterRenameTable`, `sqlite3AlterFinishAddColumn`,
