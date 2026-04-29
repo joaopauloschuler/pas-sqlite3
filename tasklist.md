@@ -531,11 +531,15 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_open16` — UTF-16 filename open.
        [X] `sqlite3_db_readonly` (main.c:5001) — ported 2026-04-28
             (passqlite3main.pas) via sqlite3FindDbName + sqlite3BtreeIsReadonly.
-       [ ] `sqlite3_db_release_memory` (main.c) — release pager / pcache
-            memory for a connection.
+       [X] `sqlite3_db_release_memory` (main.c:897) — ported 2026-04-28
+            (passqlite3main.pas) — sqlite3BtreeEnterAll + per-db
+            sqlite3PagerShrink loop; pager.pas wrapper added.
        [ ] `sqlite3_db_status` / `sqlite3_db_status64` (status.c) — per-
             connection counters (LOOKASIDE_USED, CACHE_HIT etc.).
-       [ ] `sqlite3_db_cacheflush` (main.c:1986) — flush dirty pages.
+       [X] `sqlite3_db_cacheflush` (main.c:921) — ported 2026-04-28
+            (passqlite3main.pas) — flushes dirty pages on every db with
+            an open write txn; folds SQLITE_BUSY into a single trailing
+            return as in the C body.
        [ ] `sqlite3_db_config` — raw varargs entry point (currently only
             typed wrappers `_text`/`_lookaside`/`_int` exist).
        [ ] `sqlite3_filename` / `sqlite3_free_filename` — VFS filename

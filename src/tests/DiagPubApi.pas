@@ -164,6 +164,14 @@ begin
   Check('stmt_busy after DONE = 0',    sqlite3_stmt_busy(pStmt) = 0);
   sqlite3_finalize(pStmt);
 
+  { Phase 8.1.1 — sqlite3_db_release_memory / sqlite3_db_cacheflush. }
+  Check('db_release_memory = OK',  sqlite3_db_release_memory(db)   = SQLITE_OK);
+  Check('db_release_memory(nil) = MISUSE',
+        sqlite3_db_release_memory(nil)  = SQLITE_MISUSE);
+  Check('db_cacheflush = OK',      sqlite3_db_cacheflush(db)       = SQLITE_OK);
+  Check('db_cacheflush(nil) = MISUSE',
+        sqlite3_db_cacheflush(nil)      = SQLITE_MISUSE);
+
   rc := sqlite3_close(db);
   Check('close', rc = SQLITE_OK);
 

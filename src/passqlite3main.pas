@@ -343,6 +343,8 @@ function sqlite3_system_errno(db: PTsqlite3): i32; cdecl;
 
 function sqlite3_get_autocommit(db: PTsqlite3): i32; cdecl;
 function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;
+function sqlite3_db_release_memory(db: PTsqlite3): i32; cdecl;
+function sqlite3_db_cacheflush(db: PTsqlite3): i32; cdecl;
 function sqlite3_txn_state(db: PTsqlite3; zSchema: PAnsiChar): i32; cdecl;
 function sqlite3_error_offset(db: PTsqlite3): i32; cdecl;
 function sqlite3_set_errmsg(db: PTsqlite3; errcode: i32; zMsg: PAnsiChar): i32; cdecl;
@@ -2444,6 +2446,69 @@ begin
   pBt := db^.aDb[iDb].pBt;
   if pBt = nil then begin Result := -1; Exit; end;
   Result := sqlite3BtreeIsReadonly(PBtree(pBt));
+end;
+
+{ main.c:897 — sqlite3_db_release_memory.  Free as much memory as we can
+  from the given database connection. }
+function sqlite3_db_release_memory(db: PTsqlite3): i32; cdecl;
+var
+  i:      i32;
+  pBt:    PBtree;
+  pPgr:   Pointer;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  sqlite3_mutex_enter(db^.mutex);
+  sqlite3BtreeEnterAll(db);
+  for i := 0 to db^.nDb - 1 do begin
+    pBt := PBtree(db^.aDb[i].pBt);
+    if pBt <> nil then begin
+      pPgr := sqlite3BtreePager(pBt);
+      sqlite3PagerShrink(pPgr);
+    end;
+  end;
+  sqlite3BtreeLeaveAll(db);
+  sqlite3_mutex_leave(db^.mutex);
+  Result := SQLITE_OK;
+end;
+
+{ main.c:921 — sqlite3_db_cacheflush.  Flush dirty pages in the pager
+  cache for any attached database that has an open write transaction. }
+function sqlite3_db_cacheflush(db: PTsqlite3): i32; cdecl;
+var
+  i, rc, bSeenBusy: i32;
+  pBt:    PBtree;
+  pPgr:   Pointer;
+begin
+  if sqlite3SafetyCheckOk(db) = 0 then begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  rc        := SQLITE_OK;
+  bSeenBusy := 0;
+  sqlite3_mutex_enter(db^.mutex);
+  sqlite3BtreeEnterAll(db);
+  i := 0;
+  while (rc = SQLITE_OK) and (i < db^.nDb) do begin
+    pBt := PBtree(db^.aDb[i].pBt);
+    if (pBt <> nil) and (sqlite3BtreeTxnState(pBt) = SQLITE_TXN_WRITE) then begin
+      pPgr := sqlite3BtreePager(pBt);
+      rc := sqlite3PagerFlush(pPgr);
+      if rc = SQLITE_BUSY then begin
+        bSeenBusy := 1;
+        rc := SQLITE_OK;
+      end;
+    end;
+    Inc(i);
+  end;
+  sqlite3BtreeLeaveAll(db);
+  sqlite3_mutex_leave(db^.mutex);
+  if (rc = SQLITE_OK) and (bSeenBusy <> 0) then
+    Result := SQLITE_BUSY
+  else
+    Result := rc;
 end;
 
 { main.c — sqlite3_txn_state. }
