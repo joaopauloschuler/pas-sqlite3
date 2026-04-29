@@ -23,7 +23,8 @@ uses
   passqlite3codegen,
   passqlite3parser,
   passqlite3vtab,
-  passqlite3main;
+  passqlite3main,
+  csqlite3;
 
 var
   pass: i32 = 0;
@@ -36,6 +37,8 @@ begin
   Result := 0;
 end;
 
+procedure Open16Test; forward;
+
 procedure Check(name: string; cond: Boolean);
 begin
   if cond then begin
@@ -43,6 +46,37 @@ begin
   end else begin
     Inc(fail); Writeln('  FAIL ', name);
   end;
+end;
+
+procedure Open16Test;
+const
+  fname8: AnsiString = ':memory:';
+var
+  db16: PTsqlite3;
+  cdb16: Pcsq_db;
+  buf16: array[0..31] of Byte;
+  i, rc: i32;
+begin
+  FillChar(buf16, SizeOf(buf16), 0);
+  for i := 1 to Length(fname8) do
+    buf16[(i - 1) * 2] := Byte(fname8[i]);
+  rc := sqlite3_open16(@buf16[0], @db16);
+  Check('open16 :memory: OK', rc = SQLITE_OK);
+  Check('open16 db non-nil', db16 <> nil);
+  Check('open16 enc=UTF16LE', (db16 <> nil) and (db16^.enc = SQLITE_UTF16LE));
+  if db16 <> nil then sqlite3_close(db16);
+
+  rc := csq_open16(@buf16[0], cdb16);
+  Check('csq_open16 :memory: OK', rc = SQLITE_OK);
+  Check('csq_open16 db non-nil', cdb16 <> nil);
+  if cdb16 <> nil then csq_close(cdb16);
+
+  rc := sqlite3_open16(nil, @db16);
+  Check('open16(nil) OK', rc = SQLITE_OK);
+  if db16 <> nil then sqlite3_close(db16);
+
+  rc := sqlite3_open16(@buf16[0], nil);
+  Check('open16(nil ppDb) MISUSE', rc = SQLITE_MISUSE);
 end;
 
 var
@@ -447,6 +481,9 @@ begin
 
   rc := sqlite3_close(db);
   Check('close', rc = SQLITE_OK);
+
+  { sqlite3_open16 — UTF-16NATIVE filename. }
+  Open16Test;
 
   Writeln;
   Writeln('Results: ', pass, ' passed, ', fail, ' failed');

@@ -96,6 +96,9 @@ function csq_open_v2(zFilename: PChar; out ppDb: Pcsq_db;
     flags: Int32; zVfs: PChar): Int32;
     cdecl; external LIBSQLITE3 name 'sqlite3_open_v2';
 
+function csq_open16(zFilename: Pointer; out ppDb: Pcsq_db): Int32;
+    cdecl; external LIBSQLITE3 name 'sqlite3_open16';
+
 function csq_close(db: Pcsq_db): Int32;
     cdecl; external LIBSQLITE3 name 'sqlite3_close';
 

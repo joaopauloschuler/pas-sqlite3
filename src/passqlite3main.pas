@@ -376,6 +376,7 @@ function sqlite3_set_errmsg(db: PTsqlite3; errcode: i32; zMsg: PAnsiChar): i32; 
 function sqlite3_limit(db: PTsqlite3; limitId: i32; newLimit: i32): i32; cdecl;
 
 function sqlite3_complete16(zSql: Pointer): i32; cdecl;
+function sqlite3_open16(zFilename: Pointer; ppDb: PPTsqlite3): i32; cdecl;
 
 function sqlite3_stmt_busy(pStmt: Pointer): i32; cdecl;
 function sqlite3_stmt_readonly(pStmt: Pointer): i32; cdecl;
@@ -2692,6 +2693,45 @@ begin
   if zSql8 <> nil then
     rc := sqlite3_complete(zSql8)
   else
+    rc := SQLITE_NOMEM;
+  sqlite3ValueFree(pVal);
+  Result := rc and $FF;
+end;
+
+{ main.c:3706 — sqlite3_open16.  Open a new database handle from a UTF-16
+  filename.  Wraps the input as a sqlite3_value with SQLITE_UTF16NATIVE
+  encoding, transcodes to UTF-8, then forwards to openDatabase.  When the
+  open succeeds and the schema has not been loaded yet, force the
+  connection encoding (and the schema's own enc field) to UTF-16NATIVE so
+  subsequent prepares produce UTF-16 text. }
+function sqlite3_open16(zFilename: Pointer; ppDb: PPTsqlite3): i32; cdecl;
+const
+  zEmpty16: array[0..1] of Byte = (0, 0);
+var
+  pVal: Psqlite3_value;
+  zFilename8: PAnsiChar;
+  rc: i32;
+  pDb: PTsqlite3;
+begin
+  if ppDb = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  ppDb^ := nil;
+  if zFilename = nil then zFilename := @zEmpty16[0];
+  pVal := sqlite3ValueNew(nil);
+  if pVal = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  sqlite3ValueSetStr(pVal, -1, zFilename, SQLITE_UTF16NATIVE, SQLITE_STATIC);
+  zFilename8 := PAnsiChar(sqlite3ValueText(pVal, SQLITE_UTF8));
+  if zFilename8 <> nil then begin
+    rc := openDatabase(zFilename8, ppDb,
+                       SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE, nil);
+    pDb := ppDb^;
+    if (rc = SQLITE_OK) and (pDb <> nil) and (pDb^.aDb <> nil)
+       and (pDb^.aDb[0].pSchema <> nil)
+       and ((pDb^.aDb[0].pSchema^.schemaFlags and DB_SchemaLoaded) = 0) then
+    begin
+      pDb^.aDb[0].pSchema^.enc := SQLITE_UTF16NATIVE;
+      pDb^.enc := SQLITE_UTF16NATIVE;
+    end;
+  end else
     rc := SQLITE_NOMEM;
   sqlite3ValueFree(pVal);
   Result := rc and $FF;

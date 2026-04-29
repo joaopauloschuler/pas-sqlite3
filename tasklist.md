@@ -620,7 +620,17 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 (`sqlite3_int64`, `sqlite3_uint64`, opaque struct names) are excluded.
 
 - [ ] **8.1.1** Connection-lifecycle gaps (main.c):
-       [ ] `sqlite3_open16` — UTF-16 filename open.
+       [X] `sqlite3_open16` — ported 2026-04-29 (passqlite3main.pas) —
+            verbatim port of main.c:3706.  Wraps the UTF-16NATIVE
+            filename in a sqlite3_value, transcodes via
+            sqlite3ValueText(UTF8), forwards to openDatabase
+            (READWRITE|CREATE).  When the open succeeds and the schema
+            has not been loaded yet, sets db^.aDb[0].pSchema^.enc and
+            db^.enc to SQLITE_UTF16NATIVE so subsequent prepares produce
+            UTF-16.  csq_open16 binding added; DiagPubApi 163/0
+            (was 156/0 — 7 new checks: :memory: OK + non-nil db +
+            enc=UTF16LE + csq_open16 round-trip + nil-filename +
+            nil-ppDb MISUSE).  TestExplainParity 1016/10 — no regression.
        [X] `sqlite3_db_readonly` (main.c:5001) — ported 2026-04-28
             (passqlite3main.pas) via sqlite3FindDbName + sqlite3BtreeIsReadonly.
        [X] `sqlite3_db_release_memory` (main.c:897) — ported 2026-04-28
