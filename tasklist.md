@@ -40,7 +40,8 @@ Important: At the end of this document, please find:
 
 - [ ] **6.8.1** port `sqlite3Update`
 - [ ] **6.8.2** port `sqlite3GenerateConstraintChecks`
-- [ ] **6.8.3** port UNION-ALL arm of `sqlite3MultiValues`
+- [X] **6.8.3** port UNION-ALL arm of `sqlite3MultiValues` — done 2026-04-29
+       (see 6.24 entry).
 
 - [ ] **6.9-bis 11g.2.b** Port:  
     [ ] Port `sqlite3WhereBegin`
@@ -336,7 +337,15 @@ Important: At the end of this document, please find:
        [ ] `sqlite3TriggerColmask`.
 
   [ ] **6.24** port codegen.pas DML / insert stubs in full from C to pascal:
-       [ ] `sqlite3MultiValues`
+       [X] `sqlite3MultiValues` — UNION-ALL fallback arm ported 2026-04-29
+            (insert.c:660).  Always takes the UNION-ALL fallback (the
+            co-routine arm needs sqlite3Select / sqlite3ExprCodeExprList /
+            OP_InitCoroutine / OP_Yield / sqlite3VdbeEndCoroutine wired
+            into the codegen pipeline first).  Helpers `exprListIsConstant`
+            / `exprListIsNoAffinity` ported alongside (insert.c:603/615).
+            Dead-code today — sqlite3Insert pSelect path is still a stub
+            at codegen.pas:19756; productive consumer arrives with
+            6.10 step 6 / step 9 (e).
        [ ] `sqlite3GenerateConstraintChecks`.
 
   [ ] **6.25** port codegen.pas schema / index stubs in full from C to pascal:

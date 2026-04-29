@@ -22660,12 +22660,90 @@ begin
   end;
 end;
 
-{ sqlite3MultiValues — accumulate multi-row VALUES SELECT (Phase 6.4 stub) }
+{ exprListIsConstant — port of insert.c:603.  True iff every expression in
+  pRow is constant (no column refs, no parameters, no functions other than
+  date-time at parse-time).  Driven by sqlite3ExprIsConstant. }
+function exprListIsConstant(pParse: PParse; pRow: PExprList): i32;
+var
+  ii:    i32;
+  pItem: PExprListItem;
+begin
+  Result := 0;
+  if (pRow = nil) or (pRow^.nExpr <= 0) then begin Result := 1; Exit; end;
+  pItem := ExprListItems(pRow);
+  for ii := 0 to pRow^.nExpr - 1 do
+  begin
+    if sqlite3ExprIsConstant(pParse, pItem[ii].pExpr) = 0 then Exit;
+  end;
+  Result := 1;
+end;
+
+{ exprListIsNoAffinity — port of insert.c:615.  True iff every expression in
+  pRow is constant AND has zero affinity (no CAST, etc.). }
+function exprListIsNoAffinity(pParse: PParse; pRow: PExprList): i32;
+var
+  ii:    i32;
+  pItem: PExprListItem;
+begin
+  Result := 0;
+  if exprListIsConstant(pParse, pRow) = 0 then Exit;
+  if (pRow = nil) or (pRow^.nExpr <= 0) then begin Result := 1; Exit; end;
+  pItem := ExprListItems(pRow);
+  for ii := 0 to pRow^.nExpr - 1 do
+  begin
+    if Ord(sqlite3ExprAffinity(pItem[ii].pExpr)) <> 0 then Exit;
+  end;
+  Result := 1;
+end;
+
+{ sqlite3MultiValues — port of insert.c:660.  UNION-ALL fallback arm.
+
+  The C reference picks between two strategies:
+    * a co-routine that yields each row at run-time (the fast path), or
+    * a compound "pLeft UNION ALL SELECT pRow" Select tree (the fallback).
+
+  The co-routine arm depends on sqlite3Select / sqlite3ExprCodeExprList /
+  OP_InitCoroutine / OP_Yield / sqlite3VdbeEndCoroutine, none of which are
+  yet wired into the codegen pipeline at this layer.  Until they land we
+  unconditionally take the UNION-ALL fallback — correct, just slower.
+  Conservative because sqlite3Insert's pSelect path is itself a stub
+  (codegen.pas:19756 TODO), so the chain currently still drops rows past
+  the first; the productive consumer arrives with the matching
+  sqlite3Insert + compound-SELECT codegen work in 6.10 step 6 / step 9 (e). }
 function sqlite3MultiValues(pParse: PParse; pLeft: PSelect;
   pRow: PExprList): PSelect;
+var
+  pSel: PSelect;
+  f:    u32;
 begin
-  sqlite3ExprListDelete(pParse^.db, pRow);
-  Result := pLeft; { Phase 6.5 }
+  Result := pLeft;
+  if pLeft = nil then
+  begin
+    sqlite3ExprListDelete(pParse^.db, pRow);
+    Exit;
+  end;
+
+  f := SF_Values or SF_MultiValue;
+  if (pLeft^.pSrc <> nil) and (pLeft^.pSrc^.nSrc > 0) then
+  begin
+    { pLeft is the special "read from co-routine" wrapper — close it. }
+    sqlite3MultiValuesEnd(pParse, pLeft);
+    f := SF_Values;
+  end
+  else if pLeft^.pPrior <> nil then
+  begin
+    { Inherit SF_MultiValue only if pLeft already had it. }
+    f := f and pLeft^.selFlags;
+  end;
+
+  pSel := sqlite3SelectNew(pParse, pRow, nil, nil, nil, nil, nil, f, nil);
+  pLeft^.selFlags := pLeft^.selFlags and (not u32(SF_MultiValue));
+  if pSel <> nil then
+  begin
+    pSel^.op := TK_ALL;
+    pSel^.pPrior := pLeft;
+    Result := pSel;
+  end;
 end;
 
 { autoIncBegin — port of insert.c:159 (Phase 6.x stub).
