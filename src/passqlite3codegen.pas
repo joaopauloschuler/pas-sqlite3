@@ -28257,8 +28257,20 @@ begin
   MakeAgg(aBuiltinAgg[8], 2, AGG_ENC, @groupConcatStep, @groupConcatFinal, 'group_concat');
 end;
 
+var
+  registerBuiltinFunctionsDone: Boolean = False;
+
 procedure sqlite3RegisterBuiltinFunctions;
 begin
+  { Idempotent: the static aBuiltinFuncs/aBuiltinAgg arrays carry the bucket-
+    chain links (`u`, `pNext`) that sqlite3InsertBuiltinFuncs writes into them
+    on first registration.  Re-running InitBuiltinFuncs would FillChar those
+    fields back to nil and orphan every entry that shares a bucket head with
+    a later-inserted entry (e.g. count/0 was unreachable after the test re-
+    invoked sqlite3RegisterDateTimeFunctions, because date occupies the same
+    bucket head and InitDateFuncs zeroed date.u, breaking the chain to count). }
+  if registerBuiltinFunctionsDone then Exit;
+  registerBuiltinFunctionsDone := True;
   InitBuiltinFuncs;
   InitBuiltinAgg;
   sqlite3InsertBuiltinFuncs(@aBuiltinFuncs, Length(aBuiltinFuncs));
@@ -28281,6 +28293,9 @@ end;
   Aggregates use WAGGREGATE: pUserData = arg (the JSON_BLOB switch only;
   no JSON_ABPATH / JSON_ISSET / JSON_AINS).
   =========================================================================== }
+
+var
+  registerJsonFunctionsDone: Boolean = False;
 
 const
   { Keep aligned with passqlite3json's JSON_* user-data flag block. }
@@ -28342,6 +28357,8 @@ procedure sqlite3RegisterJsonFunctions;
   end;
 
 begin
+  if registerJsonFunctionsDone then Exit;
+  registerJsonFunctionsDone := True;
   { Mirror json.c:5601 aJsonFunc[].
     Layout columns: nArg, bUseCache, bWS, bRS, bJsonB, iArg, xFunc. }
   JFn(aJsonFunc[ 0], 'json',                1, 1,1, 0,0,0,            @jsonRemoveFunc);
@@ -29029,8 +29046,13 @@ begin
   MakeFD(aDateFuncs[5], -1, @unixtimeFunc,  'unixepoch');
 end;
 
+var
+  registerDateTimeFunctionsDone: Boolean = False;
+
 procedure sqlite3RegisterDateTimeFunctions;
 begin
+  if registerDateTimeFunctionsDone then Exit;
+  registerDateTimeFunctionsDone := True;
   InitDateFuncs;
   sqlite3InsertBuiltinFuncs(@aDateFuncs, Length(aDateFuncs));
 end;
@@ -29679,8 +29701,13 @@ begin
   MakeWinNoop(aWindowFuncs[14], 3, lagName);
 end;
 
+var
+  registerWindowFunctionsDone: Boolean = False;
+
 procedure sqlite3WindowFunctions;
 begin
+  if registerWindowFunctionsDone then Exit;
+  registerWindowFunctionsDone := True;
   InitWindowFuncs;
   sqlite3InsertBuiltinFuncs(@aWindowFuncs, Length(aWindowFuncs));
 end;

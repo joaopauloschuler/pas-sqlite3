@@ -353,14 +353,21 @@ Important: At the end of this document, please find:
         rows.  Likely shares root cause with (g) — agg-with-trailing-
         clauses gate at codegen.pas:18968.
 
-  [ ] **6.10 step 18** TestAuthBuiltins regression: T8 FindFunction("abs",1)
-      and T12 FindFunction("count",0) now return nil where step 16 fix
-      had them PASSing.  Run: `LD_LIBRARY_PATH=$PWD/src bin/TestAuthBuiltins`
-      → 31 passed, 2 failed.  Confirmed pre-existing (reproduces with
-      `git stash` of unrelated work).  Likely landed in commit 2911267
-      or 72804a2 — bisect needed.  Other 31 cases still pass, so
-      sqlite3InsertBuiltinFuncs idempotence is intact; the regression
-      is selective per-name.
+  [X] **6.10 step 18** TestAuthBuiltins regression closed 2026-04-28
+      (34/0).  Root cause: each `Init*Funcs` (InitDateFuncs,
+      InitBuiltinFuncs, InitBuiltinAgg, InitWindowFuncs, JSON
+      registration) FillChars its module-static TFuncDef array on every
+      call, zeroing the `.u` bucket-chain link that
+      sqlite3InsertBuiltinFuncs writes on first registration.  The test
+      calls sqlite3RegisterDateTimeFunctions a second time after
+      sqlite3RegisterBuiltinFunctions had already invoked it
+      transitively → InitDateFuncs FillChar set date.u to nil,
+      orphaning every entry sharing date's bucket head (count/0 in
+      bucket 12; abs / octet_length in bucket 8 via strftime).
+      sqlite3FunctionSearch then walked only the new head and returned
+      nil for `abs`/`count`.  Fix: guard each `sqlite3Register*Functions`
+      (Builtin / DateTime / Json / Window) with a one-shot `done` flag
+      in passqlite3codegen.pas.  TestExplainParity 1016/10 unchanged.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (a) [X] ONEPASS_MULTI promotion landed in sqlite3WhereBegin,
