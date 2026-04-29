@@ -266,8 +266,8 @@ Important: At the end of this document, please find:
 
   [ ] **6.10 step 17** Window-function and aggregate divergences surfaced
       by the new `src/tests/DiagWindow.pas` probe (run with
-      `LD_LIBRARY_PATH=$PWD/src bin/DiagWindow`).  19 divergences open;
-      most fold into existing window/agg tasks.
+      `LD_LIBRARY_PATH=$PWD/src bin/DiagWindow`).  13 divergences open
+      (verified 2026-04-29); most fold into existing window/agg tasks.
       [ ] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** — the
         ORDER-BY-in-aggregate arm is not honoured; the unordered
         variant `group_concat(val,',')` PASSes.  Tracked under 6.24
@@ -433,10 +433,16 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [ ] `sqlite3_test_control` — testing back-door (subset).
 
 - [ ] **8.9.1** Vtab helper APIs (vtab.c, vdbeapi.c):
-       [ ] `sqlite3_vtab_distinct` — query-planner DISTINCT hint.
+       [X] `sqlite3_vtab_distinct` — ported 2026-04-29 as a degraded
+            stub returning 0 (no DISTINCT optimisation).  Full body
+            requires HiddenIndexInfo on the Pas side.
+       [X] `sqlite3_vtab_collation` — ported 2026-04-29 as a degraded
+            stub returning "BINARY" for any in-range iCons (matches C
+            step-3 fallback).  Full body requires HiddenIndexInfo.
        [ ] `sqlite3_vtab_in` — IN-operator iterator-mode toggle (gated on
             HiddenIndexInfo; not yet defined on the Pas side).
-       [ ] `sqlite3_vtab_rhs_value` — extract RHS value of a constraint.
+       [ ] `sqlite3_vtab_rhs_value` — extract RHS value of a constraint
+            (gated on HiddenIndexInfo).
 
 - [ ] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind).
 
