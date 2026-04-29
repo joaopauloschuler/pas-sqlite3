@@ -1548,6 +1548,7 @@ function sqlite3_value_double(pVal: Psqlite3_value): Double;
 function sqlite3_value_text(pVal: Psqlite3_value): PAnsiChar;
 function sqlite3_value_blob(pVal: Psqlite3_value): Pointer;
 function sqlite3_value_bytes(pVal: Psqlite3_value): i32;
+function sqlite3_value_bytes16(pVal: Psqlite3_value): i32;
 function sqlite3_value_subtype(pVal: Psqlite3_value): u32;
 function sqlite3_value_pointer(pVal: Psqlite3_value; zPType: PAnsiChar): Pointer;
 function sqlite3_value_dup(pOrig: Psqlite3_value): Psqlite3_value;
@@ -1567,6 +1568,7 @@ function sqlite3_column_double(pStmt: PVdbe; i: i32): Double;
 function sqlite3_column_text(pStmt: PVdbe; i: i32): PAnsiChar;
 function sqlite3_column_blob(pStmt: PVdbe; i: i32): Pointer;
 function sqlite3_column_bytes(pStmt: PVdbe; i: i32): i32;
+function sqlite3_column_bytes16(pStmt: PVdbe; i: i32): i32;
 function sqlite3_column_value(pStmt: PVdbe; i: i32): Psqlite3_value;
 function sqlite3_column_name(pStmt: PVdbe; N: i32): PAnsiChar;
 
@@ -3944,6 +3946,15 @@ begin
   Result := sqlite3ValueBytes(pVal, SQLITE_UTF8);
 end;
 
+{ vdbeapi.c:198 — sqlite3_value_bytes16.  Reports the byte count of the
+  value's UTF-16 (native byte order) representation, performing the
+  encoding conversion lazily inside sqlite3ValueBytes / valueToText
+  when the source Mem is UTF-8 text. }
+function sqlite3_value_bytes16(pVal: Psqlite3_value): i32;
+begin
+  Result := sqlite3ValueBytes(pVal, SQLITE_UTF16NATIVE);
+end;
+
 function sqlite3_value_subtype(pVal: Psqlite3_value): u32;
 begin
   if (pVal^.flags and MEM_Subtype) <> 0 then Result := pVal^.eSubtype
@@ -4098,6 +4109,12 @@ end;
 function sqlite3_column_bytes(pStmt: PVdbe; i: i32): i32;
 begin
   Result := sqlite3_value_bytes(columnMem(pStmt, i));
+end;
+
+{ vdbeapi.c:1396 — sqlite3_column_bytes16. }
+function sqlite3_column_bytes16(pStmt: PVdbe; i: i32): i32;
+begin
+  Result := sqlite3_value_bytes16(columnMem(pStmt, i));
 end;
 
 function sqlite3_column_value(pStmt: PVdbe; i: i32): Psqlite3_value;

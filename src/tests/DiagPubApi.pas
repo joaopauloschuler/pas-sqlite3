@@ -258,6 +258,23 @@ begin
         sqlite3_bind_parameter_name(pStmt, 1) = nil);
   sqlite3_finalize(pStmt);
 
+  { Phase 8.3.2 — sqlite3_value_bytes16 / sqlite3_column_bytes16.
+    For an N-char ASCII text source, the UTF-16 byte count is 2*N.  The
+    helper converts in place via valueToText, so a follow-up
+    sqlite3_value_bytes (UTF-8) reflects the new in-memory encoding. }
+  pStmt := nil;
+  rcs := sqlite3_prepare_v2(db, 'SELECT ''hi''', -1, @pStmt, nil);
+  Check('prep SELECT ''hi''', rcs = SQLITE_OK);
+  rcs := sqlite3_step(pStmt);
+  Check('step ''hi'' ROW', rcs = SQLITE_ROW);
+  Check('column_bytes(''hi'') = 2',
+        sqlite3_column_bytes(pStmt, 0) = 2);
+  Check('column_bytes16(''hi'') = 4',
+        sqlite3_column_bytes16(pStmt, 0) = 4);
+  Check('value_bytes16 on column = 4',
+        sqlite3_value_bytes16(sqlite3_column_value(pStmt, 0)) = 4);
+  sqlite3_finalize(pStmt);
+
   { Phase 8.1.1 — sqlite3_db_release_memory / sqlite3_db_cacheflush. }
   Check('db_release_memory = OK',  sqlite3_db_release_memory(db)   = SQLITE_OK);
   Check('db_release_memory(nil) = MISUSE',

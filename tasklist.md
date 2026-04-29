@@ -617,13 +617,18 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        [X] `sqlite3_result_zeroblob` — ported 2026-04-28
             (passqlite3vdbe.pas) — int wrapper around _zeroblob64,
             mapping negative n to 0 per C.
-       [ ] `sqlite3_value_bytes16`.
+       [X] `sqlite3_value_bytes16` — ported 2026-04-28 (passqlite3vdbe.pas)
+            wraps `sqlite3ValueBytes(pVal, SQLITE_UTF16NATIVE)`; added
+            `SQLITE_UTF16NATIVE = SQLITE_UTF16LE` constant in
+            passqlite3types.pas (LE-only port).  Covered by DiagPubApi.
        [X] `sqlite3_value_encoding` — ported 2026-04-28 (passqlite3vdbe.pas)
             returns `pVal^.enc`; UTF8 for nil. Covered by DiagPubApi.
        [X] `sqlite3_value_numeric_type` — ported 2026-04-28
             (passqlite3vdbe.pas) — applies numeric affinity for TEXT then
             re-reads `sqlite3_value_type`. Covered by DiagPubApi.
-       [ ] `sqlite3_column_bytes16`.
+       [X] `sqlite3_column_bytes16` — ported 2026-04-28
+            (passqlite3vdbe.pas) — `sqlite3_value_bytes16(columnMem(...))`.
+            Covered by DiagPubApi.
 
 - [ ] **8.3.3** Collation / function UTF-16 wrappers:
        [ ] `sqlite3_create_collation16`.
