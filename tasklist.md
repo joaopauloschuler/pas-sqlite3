@@ -236,11 +236,8 @@ Important: At the end of this document, please find:
         `changes() after update`.  Folds into `sqlite3Update` body
         skeleton (6.9-bis 11g.2.f); UPDATE never actually fires, so
         nChange stays 0 even with the new VdbeHalt accounting.
-      [X] **g) `journal_mode` PRAGMA** — closed (DiagTxn `pragma
-        journal_mode memory default mem` PASSes; covered by the 6.12
-        PragTyp_JOURNAL read arm landed via the table-driven dispatch).
-        Full table-driven `pragmaLocate` (table-valued pragma_* etc.)
-        still deferred under 6.12.
+      [X] **g) `journal_mode` PRAGMA** — closed.  Read + write arms
+        now both emit the effective mode (memdb echo).
 
   [ ] **6.10 step 17** Window-function and aggregate divergences surfaced
       by the new `src/tests/DiagWindow.pas` probe (run with
@@ -345,6 +342,9 @@ Important: At the end of this document, please find:
        pragma_list, compile_options), integrity_check / quick_check.
        Closing these requires `sqlite3PragmaVtabRegister` (Phase 6.8) +
        full table-driven `pragmaLocate` dispatch.
+       Side-fix 2026-04-29: `PRAGMA journal_mode=X` and
+       `PRAGMA locking_mode=X` write arms now emit a result row matching
+       C (memdb effective-mode echo); previously silent (step=DONE no row).
   [ ] **6.13** port sqlite3Vacuum in full
   [X] **6.14** port sqlite3WhereTabFuncArgs in full (whereexpr.c:1899..1944).
   [X] **6.15** port sqlite3WhereAddLimit + whereAddLimitExpr in full

@@ -26933,15 +26933,28 @@ begin
   { Constant-default string pragmas — pragma.c PragTyp_JOURNAL_MODE /
     PragTyp_LOCKING_MODE.  In-memory db default journal_mode is "memory"
     and locking_mode is "normal"; the Pas port does not maintain these
-    settings yet so emit the default text literal.  Writes ignored. }
-  if (pValue = nil) and SameText(zName, 'journal_mode') then begin
+    settings yet so emit the default text literal.  Both read AND write
+    forms must emit a result row: C's PragTyp_JOURNAL_MODE / _LOCKING_MODE
+    always end with `OP_ResultRow` carrying the (possibly updated) current
+    mode (pragma.c:770 / pragma.c:725). }
+  if SameText(zName, 'journal_mode') then begin
+    { memdb's pager rejects any non-"memory" mode, so the result is
+      always "memory" regardless of zRight.  Matches C's
+      sqlite3PagerJournalMode(...) outcome on memdb. }
     sqlite3VdbeLoadString(v, 1, 'memory');
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);
     Exit;
   end;
-  if (pValue = nil) and SameText(zName, 'locking_mode') then begin
-    sqlite3VdbeLoadString(v, 1, 'normal');
+  if SameText(zName, 'locking_mode') then begin
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      if SameText(zRight, 'exclusive') then
+        sqlite3VdbeLoadString(v, 1, 'exclusive')
+      else
+        sqlite3VdbeLoadString(v, 1, 'normal');
+    end else
+      sqlite3VdbeLoadString(v, 1, 'normal');
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);
     Exit;
