@@ -7504,6 +7504,13 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
     ResolveExpr(pE^.pLeft);
     ResolveExpr(pE^.pRight);
+    { resolve.c:1334 — walk pE^.y.pWin^.pFilter inside the TK_AGG_FUNCTION arm.
+      Without this, column refs inside a FILTER (WHERE …) clause stay as TK_ID
+      and never become TK_COLUMN, so the FILTER predicate cannot fire at
+      runtime.  Phase 6.10 step 17(e) sub-task (1). }
+    if ExprHasProperty(pE, EP_WinFunc) and (pE^.y.pWin <> nil)
+       and (pE^.y.pWin^.pFilter <> nil) then
+      ResolveExpr(pE^.y.pWin^.pFilter);
     if not ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then
     begin
       if (pE^.flags and EP_xIsSelect) = 0 then

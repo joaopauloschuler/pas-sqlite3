@@ -374,11 +374,12 @@ Important: At the end of this document, please find:
         TK_FILTER, pFilter=expr}` and sqlite3WindowAttach hangs it on
         the agg Expr with EP_WinFunc set.  Three concrete gaps before
         the FILTER predicate can fire at runtime:
-          1. ResolveExpr (codegen.pas:7379) does not walk
-             pE^.y.pWin^.pFilter, so column refs inside the FILTER stay
-             as TK_ID (never become TK_COLUMN with y.pTab/iTable).
-             C reference: resolve.c:1334 walks pFilter inside the
-             TK_AGG_FUNCTION arm.
+          1. [X] ResolveExpr (codegen.pas:7505) now walks
+             pE^.y.pWin^.pFilter when EP_WinFunc is set — closed
+             2026-04-29.  Mirrors resolve.c:1334.  Column refs inside a
+             FILTER (WHERE …) clause now become TK_COLUMN.  Sub-tasks 2
+             and 3 below are still required before FILTER fires at
+             runtime; no DiagWindow regression (19 div unchanged).
           2. analyzeAggFuncArgs (codegen.pas:18529) does not call
              sqlite3ExprAnalyzeAggregates on pWin^.pFilter, so the
              FILTER's column refs are never converted to TK_AGG_COLUMN
