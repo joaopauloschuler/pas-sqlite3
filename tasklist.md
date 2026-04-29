@@ -424,6 +424,26 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        (main.c, status.c):
        [ ] `sqlite3_test_control` — testing back-door (subset).
 
+- [X] **8.2.2** Column-metadata public APIs
+       (`SQLITE_ENABLE_COLUMN_METADATA`).  Ported 2026-04-29 in
+       passqlite3vdbe.pas as one-line wrappers around the existing
+       `columnName` helper (vdbeapi.c:1485): `sqlite3_column_database_name`,
+       `_database_name16`, `_table_name`, `_table_name16`, `_origin_name`,
+       `_origin_name16`.  The COLNAME_DATABASE/_TABLE/_COLUMN aColName
+       slots are populated at codegen time by sqlite3VdbeSetColName, so
+       these wrappers are productive end-to-end for callers that need
+       column-source introspection.
+
+- [X] **8.4.2** Deprecated public-API surface (one-liners that are
+       part of `sqlite.h.in` but `SQLITE_OMIT_DEPRECATED`-gated upstream).
+       Ported 2026-04-29 in passqlite3vdbe.pas:
+       `sqlite3_expired` (vdbeapi.c:29 — reads VDBF_EXPIRED_MASK out of
+       vdbeFlags since `expired` is a 2-bit field on the Pas side),
+       `sqlite3_aggregate_count` (vdbeapi.c:1257 — returns pCtx^.pMem^.n),
+       `sqlite3_transfer_bindings` (vdbeapi.c:1991 — inlines the aVar
+       MemMove loop because the underlying sqlite3TransferBindings lives
+       in passqlite3codegen which would create a uses-cycle).
+
 - [X] **8.8.1** Pre-update hook public-API stubs (preupdate.c —
        `SQLITE_ENABLE_PREUPDATE_HOOK`).  Ported 2026-04-29 in
        passqlite3main.pas: `sqlite3_preupdate_hook` returns nil

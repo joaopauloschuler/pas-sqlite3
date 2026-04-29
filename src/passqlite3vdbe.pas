@@ -1604,6 +1604,15 @@ function sqlite3_column_name(pStmt: PVdbe; N: i32): PAnsiChar;
 function sqlite3_column_name16(pStmt: PVdbe; N: i32): Pointer;
 function sqlite3_column_decltype(pStmt: PVdbe; N: i32): PAnsiChar;
 function sqlite3_column_decltype16(pStmt: PVdbe; N: i32): Pointer;
+function sqlite3_column_database_name(pStmt: PVdbe; N: i32): PAnsiChar;
+function sqlite3_column_database_name16(pStmt: PVdbe; N: i32): Pointer;
+function sqlite3_column_table_name(pStmt: PVdbe; N: i32): PAnsiChar;
+function sqlite3_column_table_name16(pStmt: PVdbe; N: i32): Pointer;
+function sqlite3_column_origin_name(pStmt: PVdbe; N: i32): PAnsiChar;
+function sqlite3_column_origin_name16(pStmt: PVdbe; N: i32): Pointer;
+function sqlite3_expired(pStmt: PVdbe): i32;
+function sqlite3_aggregate_count(pCtx: Psqlite3_context): i32;
+function sqlite3_transfer_bindings(pFromStmt: PVdbe; pToStmt: PVdbe): i32;
 function sqlite3_column_text16(pStmt: PVdbe; i: i32): Pointer;
 
 { sqlite3_bind_* }
@@ -4843,6 +4852,85 @@ end;
 function sqlite3_column_decltype16(pStmt: PVdbe; N: i32): Pointer;
 begin
   Result := columnName(pStmt, N, 1, COLNAME_DECLTYPE);
+end;
+
+{ vdbeapi.c:1589 — sqlite3_column_database_name (SQLITE_ENABLE_COLUMN_METADATA).
+  Returns the name of the database from which a result column derives, or nil
+  if the column is an expression / constant.  The aColName slot is populated
+  by sqlite3VdbeSetColName(COLNAME_DATABASE) at codegen time. }
+function sqlite3_column_database_name(pStmt: PVdbe; N: i32): PAnsiChar;
+begin
+  Result := PAnsiChar(columnName(pStmt, N, 0, COLNAME_DATABASE));
+end;
+
+function sqlite3_column_database_name16(pStmt: PVdbe; N: i32): Pointer;
+begin
+  Result := columnName(pStmt, N, 1, COLNAME_DATABASE);
+end;
+
+{ vdbeapi.c:1603 — sqlite3_column_table_name. }
+function sqlite3_column_table_name(pStmt: PVdbe; N: i32): PAnsiChar;
+begin
+  Result := PAnsiChar(columnName(pStmt, N, 0, COLNAME_TABLE));
+end;
+
+function sqlite3_column_table_name16(pStmt: PVdbe; N: i32): Pointer;
+begin
+  Result := columnName(pStmt, N, 1, COLNAME_TABLE);
+end;
+
+{ vdbeapi.c:1617 — sqlite3_column_origin_name. }
+function sqlite3_column_origin_name(pStmt: PVdbe; N: i32): PAnsiChar;
+begin
+  Result := PAnsiChar(columnName(pStmt, N, 0, COLNAME_COLUMN));
+end;
+
+function sqlite3_column_origin_name16(pStmt: PVdbe; N: i32): Pointer;
+begin
+  Result := columnName(pStmt, N, 1, COLNAME_COLUMN);
+end;
+
+{ vdbeapi.c:29 — sqlite3_expired (SQLITE_OMIT_DEPRECATED-gated upstream).
+  Returns true if the prepared statement has been invalidated by a schema
+  change since it was prepared.  Vdbe^.expired is the same flag set by
+  sqlite3ExpirePreparedStatements; we expose it for legacy callers. }
+function sqlite3_expired(pStmt: PVdbe): i32;
+begin
+  if pStmt = nil then
+    Result := 1
+  else if (pStmt^.vdbeFlags and VDBF_EXPIRED_MASK) <> 0 then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ vdbeapi.c:1257 — sqlite3_aggregate_count (deprecated).  Returns the
+  number of times the step function of an aggregate has been called for
+  the current row, taken from the n field of the aggregate's pMem cell. }
+function sqlite3_aggregate_count(pCtx: Psqlite3_context): i32;
+begin
+  Result := pCtx^.pMem^.n;
+end;
+
+{ vdbeapi.c:1991 — sqlite3_transfer_bindings (deprecated).  Move bindings
+  from one prepared statement to another that has the same number of
+  parameters.  Both statements are flagged expired if they have any
+  expmask bits set. }
+function sqlite3_transfer_bindings(pFromStmt: PVdbe; pToStmt: PVdbe): i32;
+var
+  i: i32;
+begin
+  if pFromStmt^.nVar <> pToStmt^.nVar then begin
+    Result := SQLITE_ERROR;
+    Exit;
+  end;
+  if pToStmt^.expmask <> 0 then
+    pToStmt^.vdbeFlags := (pToStmt^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
+  if pFromStmt^.expmask <> 0 then
+    pFromStmt^.vdbeFlags := (pFromStmt^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
+  for i := 0 to pFromStmt^.nVar - 1 do
+    sqlite3VdbeMemMove(pToStmt^.aVar + i, pFromStmt^.aVar + i);
+  Result := SQLITE_OK;
 end;
 
 { vdbeapi.c:1431 — sqlite3_column_text16. }
