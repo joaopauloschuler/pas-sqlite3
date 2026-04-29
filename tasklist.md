@@ -63,9 +63,19 @@ Important: At the end of this document, please find:
             is not defined (vdbe.h:423..425).  Pas build does not enable
             this option; bodies will land alongside any future
             `sqlite3_stmt_scanstatus` port (8.2.1).
-       [ ] `sqlite3VdbeExplain` — returns `0`; must emit `OP_Explain`
-            via `sqlite3VdbeAddOp4` and call `sqlite3VdbeScanStatus`.
-            Required for EXPLAIN QUERY PLAN.
+       [X] `sqlite3VdbeExplain` — closed 2026-04-29.  Verbatim port of
+            vdbeaux.c:517 in vdbe.pas: gates on Parse.explain==2 (NDEBUG
+            arm; no ENABLE_STMT_SCANSTATUS), formats the message via
+            sqlite3VMPrintf, emits OP_Explain via sqlite3VdbeAddOp4 with
+            P4_DYNAMIC ownership, optionally pushes the new addr onto
+            pParse^.addrExplain when bPush<>0, and calls
+            sqlite3VdbeScanStatus (currently a no-op stub matching the
+            !ENABLE_STMT_SCANSTATUS arm).  Signature gained an
+            `array of const` tail to match C's varargs; no callers exist
+            yet so safe to extend.  TestExplainParity 1016/10, TestVdbeApi
+            57/0, TestParser 45/0, TestSelectBasic 49/0, TestVdbeAgg 11/0,
+            TestBtreeCompat 337/0, TestDMLBasic 54/0, TestPrintf 105/0,
+            DiagPubApi 240/0, TestAuthBuiltins 34/0 — no regressions.
        [X] `sqlite3VdbeExplainPop` — closed 2026-04-28.  vdbe.pas now
             mirrors the C one-liner: `pParse^.addrExplain :=
             sqlite3VdbeExplainParent(pParse)`, reusing the existing

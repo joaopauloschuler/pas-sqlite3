@@ -1288,7 +1288,8 @@ function  sqlite3VdbeAddFunctionCall(pParse: PParse; p1: i32; p2, p3: i32;
                                     nArg: i32; pFunc: PFuncDef; p5: i32): i32;
 function  sqlite3VdbeExplainParent(pParse: PParse): i32;
 procedure sqlite3ExplainBreakpoint(z1, z2: PAnsiChar);
-function  sqlite3VdbeExplain(pParse: PParse; bPush: u8; zFmt: PAnsiChar): i32;
+function  sqlite3VdbeExplain(pParse: PParse; bPush: u8; zFmt: PAnsiChar;
+                             const args: array of const): i32;
 procedure sqlite3VdbeExplainPop(pParse: PParse);
 procedure sqlite3VdbeAddParseSchemaOp(p: PVdbe; iDb: i32; zWhere: PAnsiChar; p5: u16);
 procedure sqlite3VdbeEndCoroutine(v: PVdbe; regYield: i32);
@@ -2832,9 +2833,31 @@ begin
     default-build (NDEBUG) behaviour exactly. }
 end;
 
-function sqlite3VdbeExplain(pParse: PParse; bPush: u8; zFmt: PAnsiChar): i32;
+function sqlite3VdbeExplain(pParse: PParse; bPush: u8; zFmt: PAnsiChar;
+                            const args: array of const): i32;
+{ Port of vdbeaux.c:517.  Emit an OP_Explain opcode when EXPLAIN QUERY PLAN
+  mode is active (Parse.explain == 2).  In production builds (NDEBUG, no
+  ENABLE_STMT_SCANSTATUS — which matches our build) the body is gated on
+  the explain == 2 check; otherwise it is a no-op returning 0.
+
+  Pas signature exposes the variadic message via `array of const` so the
+  format string passes through sqlite3VMPrintf identically to the C body. }
+var
+  zMsg:  PAnsiChar;
+  v:     PVdbe;
+  iThis: i32;
 begin
   Result := 0;
+  if PByte(pParse)[299] <> 2 then Exit;     { Parse.explain }
+  zMsg := sqlite3VMPrintf(Psqlite3db(PPointer(pParse)^), zFmt, args);
+  v := vdbeParsePVdbe(pParse);
+  iThis := v^.nOp;
+  Result := sqlite3VdbeAddOp4(v, OP_Explain, iThis,
+                              PInt32(PByte(pParse) + 312)^, 0,
+                              zMsg, P4_DYNAMIC);
+  if bPush <> 0 then
+    PInt32(PByte(pParse) + 312)^ := iThis;
+  sqlite3VdbeScanStatus(v, iThis, -1, -1, 0, nil);
 end;
 
 procedure sqlite3VdbeExplainPop(pParse: PParse);
