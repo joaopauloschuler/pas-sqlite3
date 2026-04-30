@@ -2628,11 +2628,13 @@ begin
     end else begin
       if (sqlite3GetUInt32(zArg3, @pIndex^.tnum) = 0)
          or (pIndex^.tnum < 2)
-         or (pIndex^.tnum > pData^.mxPage) then begin
-        { sqlite3IndexHasDuplicateRootPage check + bExtraSchemaChecks
-          gate are still pending (see passqlite3codegen.pas:7379).
-          Leave silent for now — matches the C reference when
-          bExtraSchemaChecks is OFF. }
+         or (pIndex^.tnum > pData^.mxPage)
+         or (sqlite3IndexHasDuplicateRootPage(pIndex) <> 0) then begin
+        { bExtraSchemaChecks gate omitted (defaults to OFF in this port);
+          when enabled the reference reports corruptSchema(..., "invalid
+          rootpage").  The duplicate-root-page check is unconditional in C
+          (the if-test only short-circuits the corruptSchema call), so
+          calling the helper here matches the reference call graph. }
       end;
     end;
     end;

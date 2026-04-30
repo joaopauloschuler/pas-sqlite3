@@ -382,6 +382,14 @@ Important: At the end of this document, please find:
             `sqlite3NestedParse`.
        [ ] Port `sqlite3InitCallback` (main.pas:2063) — currently installs
             only system tables; full body parses each schema row.
+       [X] Port `sqlite3IndexHasDuplicateRootPage` — ported 2026-04-29
+            (prepare.c:62) in passqlite3codegen.pas.  Walks the sibling
+            index chain and returns 1 if any other index on the same
+            table shares pIndex^.tnum.  Wired into sqlite3CreateIndex
+            (init.busy + pTblName arm — emits "invalid rootpage" /
+            SQLITE_CORRUPT_BKPT on a sibling collision, matching
+            build.c:4394) and sqlite3InitCallback (auto-index branch,
+            prepare.c:181).  Tiny but closes both pending TODOs.
        [X] Port `schemaIsValid` — ported 2026-04-29
             (passqlite3main.pas, prepare.c:492).  Static helper local
             to the prepare unit.  For each attached db, opens a read

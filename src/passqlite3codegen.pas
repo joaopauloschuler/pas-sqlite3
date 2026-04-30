@@ -2794,6 +2794,11 @@ var
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
 
+{ prepare.c:62 — true when a sibling index of pIndex already shares its tnum.
+  Indicates a corrupt schema; used by sqlite3CreateIndex on the init.busy
+  re-parse path and by sqlite3InitCallback on the auto-index branch. }
+function  sqlite3IndexHasDuplicateRootPage(pIndex: PIndex2): i32;
+
 // ---------------------------------------------------------------------------
 // Phase 6.5 public API — prepare.c
 // ---------------------------------------------------------------------------
@@ -26219,6 +26224,22 @@ begin
   { Phase 7 }
 end;
 
+{ sqlite3IndexHasDuplicateRootPage — port of prepare.c:62.
+  Walks the sibling index chain of pIndex^.pTable and returns 1 if any
+  other index on the same table carries the same tnum (root page). }
+function sqlite3IndexHasDuplicateRootPage(pIndex: PIndex2): i32;
+var p: PIndex2;
+begin
+  p := pIndex^.pTable^.pIndex;
+  while p <> nil do begin
+    if (p^.tnum = pIndex^.tnum) and (p <> pIndex) then begin
+      Result := 1; Exit;
+    end;
+    p := p^.pNext;
+  end;
+  Result := 0;
+end;
+
 { sqlite3CreateIndex — port of build.c:3941.
   Code-gen for `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table(cols)`.
 
@@ -26492,8 +26513,14 @@ begin
   if not InRenameObject(pParse) then begin
     if db^.init.busy <> 0 then begin
       { Reading schema off-disk: link into idxHash. }
-      if pTblName <> nil then
+      if pTblName <> nil then begin
         pIndex^.tnum := db^.init.newTnum;
+        if sqlite3IndexHasDuplicateRootPage(pIndex) <> 0 then begin
+          sqlite3ErrorMsg(pParse, PAnsiChar('invalid rootpage'));
+          pParse^.rc := SQLITE_CORRUPT_BKPT;
+          goto exit_create_index;
+        end;
+      end;
       pSchemaT := passqlite3util.PSchema(pIndex^.pSchema);
       if sqlite3HashInsert(@pSchemaT^.idxHash,
            PChar(pIndex^.zName), pIndex) <> nil then begin
