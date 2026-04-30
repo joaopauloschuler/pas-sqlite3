@@ -206,6 +206,17 @@ Important: At the end of this document, please find:
             last SrcItem and tags it isTabFunc (fgBits bit 3) so the
             table-valued-function FROM-item arm of the planner sees
             the args.  TestExplainParity unchanged (1016/1026).
+       [X] `sqlite3FkDropTable` — ported 2026-04-30 (fkey.c:736) in
+            passqlite3codegen.pas.  Replaces the Phase 6.6 stub.  Emits
+            the implicit `DELETE FROM <tbl>` that runs before DROP TABLE
+            when foreign-keys are enabled and either pTab is the parent
+            of any FK (productive arm via sqlite3FkReferences) or
+            SQLITE_DeferFKs is set globally (approximation of the
+            per-FK isDeferred walk — TFKey internals still opaque, so
+            INITIALLY DEFERRED on individual FKs not detectable).
+            Triggers disabled around the DELETE; immediate violations
+            halt via OP_FkIfZero+sqlite3HaltConstraint.  TestExplainParity
+            unchanged (1016/1026).
        [X] `sqlite3LogEstFromDouble` + `sqlite3LogEstToInt` +
             `sqlite3ErrorToParser` — ported 2026-04-29 (util.c:2125 /
             :2139 / :273).  LogEst conversions are the inverse helpers
@@ -508,6 +519,18 @@ Important: At the end of this document, please find:
        [X] Port `sqlite3AlterBeginAddColumn` — ported 2026-04-30 (alter.c:483)
             in passqlite3codegen.pas.  Clones the target Table into
             pParse^.pNewTable under `sqlite_altertab_<orig>`.
+       [ ] **Bug** `AssertH FAILED: AlterFinishAddColumn: pDflt op not
+            TK_SPAN` — surfaced 2026-04-30 by DiagFeatureProbe (run with
+            `LD_LIBRARY_PATH=$PWD/src bin/DiagFeatureProbe`).  The
+            sqlite3AlterFinishAddColumn validator at codegen.pas:28153
+            fires before any schema mutation when ADD COLUMN reaches a
+            DEFAULT expression whose top op is not TK_SPAN.  Reproducible
+            with the probe; the assertion aborts the whole run, masking
+            any later probe rows.  Likely root cause: the assertion
+            inherits the C `assert(pDflt->op==TK_SPAN)` but the parser
+            arm that sets TK_SPAN on DEFAULT exprs (parse.y span action)
+            is not yet wired in this port — relax to a productive
+            non-TK_SPAN fallback or set TK_SPAN at the parser side.
        [X] Port `sqlite3AlterFinishAddColumn` — ported 2026-04-30
             (alter.c:313) in passqlite3codegen.pas.  Replaces the Phase 6.5
             stub.  Validates the new column (no PRIMARY KEY / UNIQUE,

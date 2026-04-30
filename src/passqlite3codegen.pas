@@ -32213,9 +32213,59 @@ begin
   { Phase 7 }
 end;
 
+{ fkey.c:736 — sqlite3FkDropTable.  Generates the implicit "DELETE FROM <tbl>"
+  that runs before DROP TABLE when foreign-keys are enabled and either (a)
+  pTab is the parent of any FK, or (b) pTab is the child of a deferred FK
+  and there are outstanding violations.  Triggers are disabled across the
+  DELETE; immediate FK violations halt the VDBE before the schema mutates.
+
+  Partial port: the parent-arm (sqlite3FkReferences(pTab) <> nil) is fully
+  productive.  The child-arm walk over `for(p=pTab->u.tab.pFKey; p; p=p->pNextFrom)`
+  cannot inspect p^.isDeferred because TFKey internals are still opaque
+  (PFKey = Pointer; codegen.pas:418); we approximate the chain with the
+  global SQLITE_DeferFKs gate (which forces *every* FK on this connection
+  to be treated as deferred).  Matches C semantically when DeferFKs is set;
+  the per-FK INITIALLY DEFERRED case still no-ops until TFKey lands. }
 procedure sqlite3FkDropTable(pParse: PParse; pName: PSrcList; pTab: PTable2);
+var
+  db:    PTsqlite3;
+  v:     PVdbe;
+  iSkip: i32;
 begin
-  { Phase 7 }
+  db := pParse^.db;
+  if ((db^.flags and SQLITE_ForeignKeys) = 0)
+     or (pTab = nil)
+     or (pTab^.eTabType <> TABTYP_NORM) then
+    Exit;
+
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then Exit;
+
+  iSkip := 0;
+  if sqlite3FkReferences(pTab) = nil then
+  begin
+    { Table is not parent of any FK.  Decide whether the deferred-child
+      arm needs the FkIfZero skip. }
+    if pTab^.u.tab.pFKey = nil then Exit;
+    if (db^.flags and SQLITE_DeferFKs) = 0 then Exit;  { partial: cannot inspect p^.isDeferred }
+    iSkip := sqlite3VdbeMakeLabel(pParse);
+    sqlite3VdbeAddOp2(v, OP_FkIfZero, 1, iSkip);
+  end;
+
+  pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_DisableTriggers;
+  sqlite3DeleteFrom(pParse, sqlite3SrcListDup(db, pName, 0), nil, nil, nil);
+  pParse^.parseFlags := pParse^.parseFlags and (not PARSEFLAG_DisableTriggers);
+
+  if (db^.flags and SQLITE_DeferFKs) = 0 then
+  begin
+    sqlite3VdbeVerifyAbortable(v, OE_Abort);
+    sqlite3VdbeAddOp2(v, OP_FkIfZero, 0, sqlite3VdbeCurrentAddr(v) + 2);
+    sqlite3HaltConstraint(pParse, SQLITE_CONSTRAINT_FOREIGNKEY,
+        OE_Abort, nil, P4_STATIC, P5_ConstraintFK);
+  end;
+
+  if iSkip <> 0 then
+    sqlite3VdbeResolveLabel(v, iSkip);
 end;
 
 procedure sqlite3FkOldmask(pParse: PParse; pTab: PTable2);
