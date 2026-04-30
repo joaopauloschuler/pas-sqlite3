@@ -1505,6 +1505,7 @@ procedure sqlite3FkClearTriggerCache(db: PTsqlite3; iDb: i32);
 type
   TUnlinkAndDeleteFn = procedure(db: PTsqlite3; iDb: i32; zName: PAnsiChar);
   TRootPageMovedFn   = procedure(db: PTsqlite3; iDb: i32; iFrom, iTo: i32);
+  TFkClearTriggerCacheFn = procedure(db: PTsqlite3; iDb: i32);
   TSetP4KeyInfoFn    = procedure(pParse: PParse; pIdx: PIndex);
   TResetOneSchemaFn  = procedure(db: PTsqlite3; iDb: i32);
   TResetAllSchemasFn = procedure(db: PTsqlite3);
@@ -1518,11 +1519,13 @@ type
   TValueFromExprFn   = function(db: Psqlite3; pExpr: Pointer;
                                 enc: u8; affinity: u8;
                                 out ppVal: Psqlite3_value): i32;
+  TKeyInfoUnrefFn    = procedure(p: Pointer);
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteTrigger: TUnlinkAndDeleteFn;
   gRootPageMoved:          TRootPageMovedFn;
+  gFkClearTriggerCache:    TFkClearTriggerCacheFn;
   gSetP4KeyInfo:           TSetP4KeyInfoFn;
   gResetOneSchema:         TResetOneSchemaFn;
   gResetAllSchemas:        TResetAllSchemasFn;
@@ -1535,6 +1538,8 @@ var
                                             host-parameter tokens. }
   gValueFromExprImpl:      TValueFromExprFn;  { wired by passqlite3codegen —
                                                  needs PExpr layout. }
+  gKeyInfoUnref:           TKeyInfoUnrefFn;  { wired by passqlite3codegen —
+                                                releases per-BtShared KeyInfo cache. }
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
@@ -9660,9 +9665,10 @@ begin
       end;
     end;
 
-    { ────── OP_FkCheck ────── — stub (vdbe.c:~8120) }
+    { ────── OP_FkCheck ────── (vdbe.c:1730) }
     OP_FkCheck: begin
-      { FK check requires Phase 6 schema/codegen }
+      rc := sqlite3VdbeCheckFkImmediate(v);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
     end;
 
     { ────── OP_RowSetAdd ────── (vdbe.c:7362) }
@@ -11830,7 +11836,10 @@ begin
 end;
 
 procedure sqlite3FkClearTriggerCache(db: PTsqlite3; iDb: i32);
-begin { Stub: FK trigger cache requires Phase 6 } end;
+begin
+  if Assigned(gFkClearTriggerCache) then
+    gFkClearTriggerCache(db, iDb);
+end;
 
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 begin
@@ -12352,9 +12361,47 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ sqlite3Stat4ProbeFree — port of vdbemem.c:2194.
+  Releases an UnpackedRecord built by sqlite3Stat4ProbeSetValue: walks the
+  per-column Mem array (length = pKeyInfo^.nAllField at byte offset 8 in
+  TKeyInfo), invokes sqlite3VdbeMemRelease on each cell, drops the KeyInfo
+  reference via the codegen-installed gKeyInfoUnref hook, and frees the
+  record itself.  Dead-code in the default build (gated on SQLITE_ENABLE_STAT4
+  in the C reference) but matches C 1:1 once where.c stat4 paths are wired. }
 procedure sqlite3Stat4ProbeFree(pRec: Pointer);
+var
+  p:        PUnpackedRecord;
+  nCol:     i32;
+  aMem:     PMem;
+  pCell:    PMem;
+  i:        i32;
+  db:       Psqlite3;
+  pKeyInfo: Pointer;
 begin
-  { Stub: full implementation deferred to Phase 6 }
+  if pRec = nil then Exit;
+  p := PUnpackedRecord(pRec);
+  pKeyInfo := p^.pKeyInfo;
+  { TKeyInfo.nAllField is at byte offset 8 (u16). }
+  nCol := i32(Pu16(PByte(pKeyInfo) + 8)^);
+  aMem := PMem(p^.aMem);
+  if (aMem <> nil) and (nCol > 0) then
+  begin
+    db := aMem^.db;
+    pCell := aMem;
+    for i := 0 to nCol - 1 do
+    begin
+      sqlite3VdbeMemRelease(pCell);
+      Inc(pCell);
+    end;
+  end
+  else
+    db := nil;
+  if Assigned(gKeyInfoUnref) then
+    gKeyInfoUnref(pKeyInfo);
+  if db <> nil then
+    sqlite3DbFreeNN(db, pRec)
+  else
+    sqlite3DbFree(nil, pRec);
 end;
 
 { btreeMovetoIndexImpl — registered into btree.pas as the index-cursor arm

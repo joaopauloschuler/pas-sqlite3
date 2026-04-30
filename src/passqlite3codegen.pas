@@ -2050,6 +2050,7 @@ function  propagateConstants(pParse: PParse; p: PSelect): i32;
 function  sqlite3Select(pParse: PParse; p: PSelect;
   pDest: PSelectDest): i32;
 procedure sqlite3DeleteTable(db: PTsqlite3; pTab: PTable2);
+procedure sqlite3DeleteColumnNames(db: PTsqlite3; pTable: PTable2);
 procedure sqlite3WithDelete(db: PTsqlite3; pWth: PWith);
 procedure sqlite3WithDeleteGeneric(db: PTsqlite3; p: Pointer);
 procedure sqlite3CteDelete(db: PTsqlite3; pCte: PCte);
@@ -2182,6 +2183,10 @@ function sqlite3ExprAddCollateString(pParse: PParse; p: PExpr;
   ends up in `target` via OP_Copy / OP_SCopy when ExprCodeTarget chose a
   different register. }
 procedure sqlite3ExprCode(pParse: PParse; pExpr: PExpr; target: i32);
+procedure sqlite3ExprCodeCopy(pParse: PParse; pExpr: PExpr; target: i32);
+procedure sqlite3ExprCodeFactorable(pParse: PParse; pExpr: PExpr; target: i32);
+procedure sqlite3ExprCodeMove(pParse: PParse; iFrom, iTo, nReg: i32);
+procedure sqlite3ExprNullRegisterRange(pParse: PParse; iReg, nReg: i32);
 function  sqlite3ExprCodeTarget(pParse: PParse; pExpr: PExpr;
   target: i32): i32;
 function  sqlite3CodeSubselect(pParse: PParse; pExpr: PExpr): i32;
@@ -2339,8 +2344,6 @@ procedure sqlite3CodeRowTriggerDirect(pParse: PParse; pTrigger: PTrigger;
 procedure sqlite3CodeRowTrigger(pParse: PParse; pTrigger: PTrigger;
   op: i32; pChanges: PExprList; tr_tm: i32; pTab: PTable2;
   reg: i32; orconf: i32; ignoreJump: i32);
-function  sqlite3TriggerStepSrc(pParse: PParse;
-  pStep: PTriggerStep): PSrcList;
 function  sqlite3TriggerColmask(pParse: PParse; pTrigger: PTrigger;
   pChanges: PExprList; isNew: i32; tr_tm: i32; pTab: PTable2;
   orconf: i32): u32;
@@ -2801,8 +2804,15 @@ procedure sqlite3NestedParse(pParse: PParse; zFormat: PAnsiChar;
   The signature mirrors the parser's real sqlite3RunParser. }
 type
   TNestedRunParserFn = function(pParse: Pointer; zSql: PAnsiChar): i32;
+  { Hook for createTableStmt (build.c:2112) — implemented in
+    passqlite3parser.pas because it needs sqlite3KeywordCode (private to
+    the parser unit).  Returns a freshly sqlite3DbMalloc'd buffer
+    containing the canonical "CREATE TABLE name(col TYPE,...)" text;
+    caller takes ownership.  Used by sqlite3EndTable on the AS SELECT arm. }
+  TCreateTableStmtFn = function(db: PTsqlite3; p: PTable2): PAnsiChar;
 var
-  gNestedRunParser: TNestedRunParserFn;
+  gNestedRunParser:  TNestedRunParserFn;
+  gCreateTableStmt:  TCreateTableStmtFn;
 
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
@@ -2980,8 +2990,10 @@ function  sqlite3FkRequired(pParse: PParse; pTab: PTable2;
   aChange: Pi32; chngRowid: i32): i32;
 procedure sqlite3FkDelete(db: PTsqlite3; pTab: PTable2);
 procedure sqlite3FkDropTable(pParse: PParse; pName: PSrcList; pTab: PTable2);
-procedure sqlite3FkOldmask(pParse: PParse; pTab: PTable2);
+function  sqlite3FkOldmask(pParse: PParse; pTab: PTable2): u32;
 function  sqlite3FkReferences(pTab: PTable2): Pointer;
+function  sqlite3FkLocateIndex(pParse: PParse; pParent: PTable2;
+  pFKey: Pointer; ppIdx: PPointer; ppaiCol: PPointer): i32;
 
 // ---------------------------------------------------------------------------
 // Phase 6.6 public API — date.c
@@ -4076,6 +4088,8 @@ function emitScalarFunctionCall(pParse: PParse; pExpr: PExpr;
 procedure exprCodeBetween(pParse: PParse; pExpr: PExpr; dest: i32;
   jumpKind: i32; jumpIfNull: i32); forward;
 function exprEvalRhsFirst(pExpr: PExpr): i32; forward;
+procedure codeVectorCompare(pParse: PParse; pExpr: PExpr; dest: i32;
+  op, p5: u8); forward;
 
 function exprDup_(db: PTsqlite3; const p: PExpr; dupFlags: i32;
   pEdupBuf: Pointer): PExpr;
@@ -5312,9 +5326,7 @@ begin
           addrIsNull := 0;
           if sqlite3ExprIsVector(pLeft) <> 0 then
           begin
-            { TODO(11g.2.b): port codeVectorCompare; for now degrade
-              to OP_Null so the dispatch is total. }
-            sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+            codeVectorCompare(pParse, pExpr, target, u8(op), u8(p5));
           end
           else
           begin
@@ -5793,6 +5805,61 @@ begin
       op := OP_SCopy;
     sqlite3VdbeAddOp2(v, op, inReg, target);
   end;
+end;
+
+{ sqlite3ExprCodeCopy — port of expr.c:5912.  Make a transient duplicate
+  of pExpr and code it via sqlite3ExprCode; the input expression is
+  guaranteed unchanged. }
+procedure sqlite3ExprCodeCopy(pParse: PParse; pExpr: PExpr; target: i32);
+var
+  db: PTsqlite3;
+begin
+  db := pParse^.db;
+  pExpr := sqlite3ExprDup(db, pExpr, 0);
+  if db^.mallocFailed = 0 then sqlite3ExprCode(pParse, pExpr, target);
+  sqlite3ExprDelete(db, pExpr);
+end;
+
+{ sqlite3ExprCodeFactorable — port of expr.c:5925.  Generate code that will
+  evaluate pExpr and store the result in register target.  When the
+  expression is constant and the parse context permits constant factoring
+  (PARSEFLAG_OkConstFactor — the okConstFactor flag in C), routes through
+  sqlite3ExprCodeRunJustOnce so the value is computed once at VM
+  initialisation; otherwise falls through to sqlite3ExprCodeCopy. }
+procedure sqlite3ExprCodeFactorable(pParse: PParse; pExpr: PExpr; target: i32);
+begin
+  if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
+     and (sqlite3ExprIsConstantNotJoin(pParse, pExpr) <> 0) then
+    sqlite3ExprCodeRunJustOnce(pParse, pExpr, target)
+  else
+    sqlite3ExprCodeCopy(pParse, pExpr, target);
+end;
+
+{ sqlite3ExprCodeMove — port of expr.c:4498.  Generate code to move
+  registers iFrom..iFrom+nReg-1 to iTo..iTo+nReg-1. }
+procedure sqlite3ExprCodeMove(pParse: PParse; iFrom, iTo, nReg: i32);
+begin
+  sqlite3VdbeAddOp3(pParse^.pVdbe, OP_Move, iFrom, iTo, nReg);
+end;
+
+{ sqlite3ExprNullRegisterRange — port of expr.c:5828.  Arrange for
+  OP_Null to be invoked over a range of registers during initialisation
+  by encoding a TK_NULLS expression and routing through
+  sqlite3ExprCodeRunJustOnce.  okConstFactor in C is the
+  PARSEFLAG_OkConstFactor bit on parseFlags in this port. }
+procedure sqlite3ExprNullRegisterRange(pParse: PParse; iReg, nReg: i32);
+var
+  t:          TExpr;
+  savedOkBit: u32;
+begin
+  FillChar(t, SizeOf(t), 0);
+  t.op := TK_NULLS;
+  t.y.nReg := nReg;
+  savedOkBit := pParse^.parseFlags and PARSEFLAG_OkConstFactor;
+  pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_OkConstFactor;
+  sqlite3ExprCodeRunJustOnce(pParse, @t, iReg);
+  pParse^.parseFlags :=
+    (pParse^.parseFlags and (not PARSEFLAG_OkConstFactor)) or savedOkBit;
 end;
 
 function sqlite3ExprAddCollateToken(pParse: PParse; p: PExpr;
@@ -14117,6 +14184,136 @@ begin
   Result := pVector;
 end;
 
+{ exprCodeSubselect — port of expr.c:631.  Code a TK_SELECT into registers
+  and return the first; non-TK_SELECT returns 0 (caller's regSelect base). }
+function exprCodeSubselect(pParse: PParse; pExpr: PExpr): i32;
+begin
+  Result := 0;
+  if pExpr^.op = TK_SELECT then
+    Result := sqlite3CodeSubselect(pParse, pExpr);
+end;
+
+{ exprVectorRegister — port of expr.c:659.  Return the register holding
+  field iField of a vector expression; for TK_VECTOR, codes the element
+  on demand into a temp register and reports it via pRegFree. }
+function exprVectorRegister(pParse: PParse; pVector: PExpr; iField: i32;
+  regSelect: i32; ppExpr: PPExpr; pRegFree: Pi32): i32;
+var
+  op: u8;
+begin
+  op := pVector^.op;
+  Assert((op = TK_VECTOR) or (op = TK_REGISTER) or (op = TK_SELECT)
+         or (op = TK_ERROR));
+  if op = TK_REGISTER then
+  begin
+    ppExpr^ := sqlite3VectorFieldSubexpr(pVector, iField);
+    Result := pVector^.iTable + iField;
+    Exit;
+  end;
+  if op = TK_SELECT then
+  begin
+    Assert(ExprUseXSelect(pVector));
+    ppExpr^ := ExprListItems(pVector^.x.pSelect^.pEList)[iField].pExpr;
+    Result := regSelect + iField;
+    Exit;
+  end;
+  if op = TK_VECTOR then
+  begin
+    Assert(ExprUseXList(pVector));
+    ppExpr^ := ExprListItems(pVector^.x.pList)[iField].pExpr;
+    Result := sqlite3ExprCodeTemp(pParse, ppExpr^, pRegFree);
+    Exit;
+  end;
+  Result := 0;
+end;
+
+{ codeVectorCompare — port of expr.c:697..784.  Emit row-value comparison
+  bytecode for vector EQ/NE/IS/ISNOT/LT/LE/GT/GE.  Result (1, 0, NULL) is
+  written into register dest. }
+procedure codeVectorCompare(pParse: PParse; pExpr: PExpr; dest: i32;
+  op, p5: u8);
+var
+  v:          PVdbe;
+  pLeft:     PExpr;
+  pRight:    PExpr;
+  nLeft:     i32;
+  i:         i32;
+  regLeft:   i32;
+  regRight:  i32;
+  opx:       u8;
+  addrCmp:   i32;
+  addrDone:  i32;
+  isCommuted: i32;
+  regFree1:  i32;
+  regFree2:  i32;
+  pL, pR:    PExpr;
+  r1, r2:    i32;
+begin
+  v := pParse^.pVdbe;
+  pLeft := pExpr^.pLeft;
+  pRight := pExpr^.pRight;
+  nLeft := sqlite3ExprVectorSize(pLeft);
+  regLeft := 0;
+  regRight := 0;
+  opx := op;
+  addrCmp := 0;
+  addrDone := sqlite3VdbeMakeLabel(pParse);
+  if ExprHasProperty(pExpr, EP_Commuted) then isCommuted := 1
+  else isCommuted := 0;
+
+  if pParse^.nErr <> 0 then Exit;
+  if nLeft <> sqlite3ExprVectorSize(pRight) then
+  begin
+    sqlite3ErrorMsg(pParse, 'row value misused');
+    Exit;
+  end;
+
+  if op = TK_LE then opx := TK_LT;
+  if op = TK_GE then opx := TK_GT_TK;
+  if op = TK_NE then opx := TK_EQ;
+
+  regLeft  := exprCodeSubselect(pParse, pLeft);
+  regRight := exprCodeSubselect(pParse, pRight);
+
+  sqlite3VdbeAddOp2(v, OP_Integer, 1, dest);
+  i := 0;
+  while True do
+  begin
+    regFree1 := 0;
+    regFree2 := 0;
+    pL := nil;
+    pR := nil;
+    Assert((i >= 0) and (i < nLeft));
+    if addrCmp <> 0 then sqlite3VdbeJumpHere(v, addrCmp);
+    r1 := exprVectorRegister(pParse, pLeft,  i, regLeft,  @pL, @regFree1);
+    r2 := exprVectorRegister(pParse, pRight, i, regRight, @pR, @regFree2);
+    addrCmp := sqlite3VdbeCurrentAddr(v);
+    codeCompare(pParse, pL, pR, opx, r1, r2, addrDone, p5, isCommuted);
+    sqlite3ReleaseTempReg(pParse, regFree1);
+    sqlite3ReleaseTempReg(pParse, regFree2);
+    if ((opx = TK_LT) or (opx = TK_GT_TK)) and (i < nLeft - 1) then
+      addrCmp := sqlite3VdbeAddOp0(v, OP_ElseEq);
+    if p5 = SQLITE_NULLEQ then
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, dest)
+    else
+      sqlite3VdbeAddOp3(v, OP_ZeroOrNull, r1, dest, r2);
+    if i = nLeft - 1 then break;
+    if opx = TK_EQ then
+      sqlite3VdbeAddOp2(v, OP_NotNull, dest, addrDone)
+    else
+    begin
+      Assert((op = TK_LT) or (op = TK_GT_TK) or (op = TK_LE) or (op = TK_GE));
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, addrDone);
+      if i = nLeft - 2 then opx := op;
+    end;
+    Inc(i);
+  end;
+  sqlite3VdbeJumpHere(v, addrCmp);
+  sqlite3VdbeResolveLabel(v, addrDone);
+  if op = TK_NE then
+    sqlite3VdbeAddOp2(v, OP_Not, dest, dest);
+end;
+
 function sqlite3ExprNeedsNoAffinityChange(const p: PExpr; aff: AnsiChar): i32;
 var
   op: u8;
@@ -20160,25 +20357,46 @@ begin
   else Result := SQLITE_OK;
 end;
 
-{ sqlite3DeleteTable — free a Table object and all its substructure }
-procedure sqlite3DeleteTable(db: PTsqlite3; pTab: PTable2);
+{ sqlite3DeleteColumnNames — port of build.c:760.  Free Table.aCol[] plus
+  any per-column zCnName allocations.  For ordinary tables, also free the
+  pDfltList (DEFAULT-expression list); when not in a tear-down sweep
+  (db^.pnBytesFreed=nil), zero out aCol/nCol/pDfltList so the Table object
+  remains in a consistent state. }
+procedure sqlite3DeleteColumnNames(db: PTsqlite3; pTable: PTable2);
 var
-  i: i32;
+  i:    i32;
   pCol: PColumn;
 begin
-  if pTab = nil then Exit;
-  Dec(pTab^.nTabRef);
-  if pTab^.nTabRef > 0 then Exit;
-  if pTab^.aCol <> nil then
+  Assert(pTable <> nil);
+  Assert(db <> nil);
+  pCol := pTable^.aCol;
+  if pCol <> nil then
   begin
-    pCol := pTab^.aCol;
-    for i := 0 to pTab^.nCol - 1 do
+    for i := 0 to pTable^.nCol - 1 do
     begin
       sqlite3DbFree(db, pCol^.zCnName);
       Inc(pCol);
     end;
-    sqlite3DbFree(db, pTab^.aCol);
+    sqlite3DbNNFreeNN(db, pTable^.aCol);
+    if pTable^.eTabType = TABTYP_NORM then
+      sqlite3ExprListDelete(db, pTable^.u.tab.pDfltList);
+    if db^.pnBytesFreed = nil then
+    begin
+      pTable^.aCol := nil;
+      pTable^.nCol := 0;
+      if pTable^.eTabType = TABTYP_NORM then
+        pTable^.u.tab.pDfltList := nil;
+    end;
   end;
+end;
+
+{ sqlite3DeleteTable — free a Table object and all its substructure }
+procedure sqlite3DeleteTable(db: PTsqlite3; pTab: PTable2);
+begin
+  if pTab = nil then Exit;
+  Dec(pTab^.nTabRef);
+  if pTab^.nTabRef > 0 then Exit;
+  sqlite3DeleteColumnNames(db, pTab);
   sqlite3DbFree(db, pTab^.zName);
   sqlite3DbFree(db, pTab^.zColAff);
   sqlite3DbFree(db, pTab);
@@ -21638,13 +21856,6 @@ begin
   end;
 end;
 
-{ sqlite3TriggerStepSrc — build a SrcList for a trigger step (Phase 6.4 stub) }
-function sqlite3TriggerStepSrc(pParse: PParse;
-  pStep: PTriggerStep): PSrcList;
-begin
-  Result := nil; { Phase 6.5 }
-end;
-
 { sqlite3TriggerColmask — port of trigger.c:1524.
 
   Returns a 32-bit bitmask of which columns of pTab's old.* (isNew=0) or
@@ -22366,14 +22577,13 @@ begin
   { OLD.* register array setup for triggers / FK old-row reference. }
   if (sqlite3FkRequired(pParse, pTab, nil, 0) <> 0) or (pTrigger <> nil) then
   begin
-    { TODO(Phase 6.5): sqlite3TriggerColmask / sqlite3FkOldmask are stubs
-      today (return 0 / void).  Use 0xffffffff to be conservative — we copy
-      every column, which is a faithful upper bound; matches C's
-      "mask==0xffffffff" early-exit branch. }
+    { sqlite3TriggerColmask still partial (returns 0 for ordinary triggers
+      until codeRowTrigger pipeline lands), but sqlite3FkOldmask is now
+      productive (Phase 6.28).  Combined upper-bound mask matches C 1:1. }
     mask := sqlite3TriggerColmask(pParse, pTrigger, nil, 0,
                                   TRIGGER_BEFORE or TRIGGER_AFTER, pTab,
                                   i32(onconf));
-    { mask |= sqlite3FkOldmask(pParse, pTab) — Phase 7 (FkOldmask is void). }
+    mask := mask or sqlite3FkOldmask(pParse, pTab);
     iOld := pParse^.nMem + 1;
     pParse^.nMem := pParse^.nMem + (1 + i32(pTab^.nCol));
 
@@ -23525,7 +23735,6 @@ var
   regOut:         i32;
   pListItems:     PExprListItem;
   pIdItems:       PIdListItem;
-  pDflt:          PExpr;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -23681,26 +23890,14 @@ begin
     begin
       j := (aTabColMap + i)^;
       if j = 0 then
-      begin
-        pDflt := sqlite3ColumnExpr(pTab, @pTab^.aCol[i]);
-        if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
-           and (sqlite3ExprIsConstantNotJoin(pParse, pDflt) <> 0) then
-          sqlite3ExprCodeRunJustOnce(pParse, pDflt, regData + i)
-        else
-          sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i);
-      end
+        sqlite3ExprCodeFactorable(pParse,
+          sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
       else
         sqlite3ExprCode(pParse, pListItems[j - 1].pExpr, regData + i);
     end
     else if pList = nil then
-    begin
-      pDflt := sqlite3ColumnExpr(pTab, @pTab^.aCol[i]);
-      if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
-         and (sqlite3ExprIsConstantNotJoin(pParse, pDflt) <> 0) then
-        sqlite3ExprCodeRunJustOnce(pParse, pDflt, regData + i)
-      else
-        sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i);
-    end
+      sqlite3ExprCodeFactorable(pParse,
+        sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
     else
       sqlite3ExprCode(pParse, pListItems[i].pExpr, regData + i);
   end;
@@ -25761,6 +25958,7 @@ var
   wTable:  u32;
   iCol:    i32;
   pColEW:  PColumn;
+  bAsSelect: i32;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -25893,8 +26091,11 @@ begin
     end;
 
     { CREATE TABLE ... AS SELECT body deferred to Phase 7.x.  Free the
-      input list here (the upstream branch consumes it). }
+      input list here (the upstream branch consumes it).  Capture whether
+      we had a SELECT first, so the createTableStmt branch below can fire. }
+    bAsSelect := 0;
     if pSelect <> nil then begin
+      bAsSelect := 1;
       sqlite3SelectDelete(db, pSelect);
       pSelect := nil;
     end;
@@ -25909,8 +26110,11 @@ begin
     end;
 
     { Compute the complete text of the CREATE statement (build.c:2886..2896). }
-    if pSelect <> nil then begin
-      { CREATE TABLE AS SELECT — createTableStmt() not yet ported. }
+    if (bAsSelect <> 0) and (gCreateTableStmt <> nil) then begin
+      zStmt := gCreateTableStmt(db, pTab);
+    end else if bAsSelect <> 0 then begin
+      { Hook not registered (codegen-only test programs).  Leave nil; the
+        schema-row sql column will be empty for the AS SELECT arm. }
       zStmt := nil;
     end else begin
       pEnd2 := pEnd;
@@ -28571,18 +28775,6 @@ exit_rename_table:
   sqlite3DbFree(db, zName);
 end;
 
-procedure sqlite3AlterRenameColumn(pParse: PParse; pSrc: PSrcList;
-  const pOld: PToken; const pNew: PToken);
-begin
-  sqlite3SrcListDelete(pParse^.db, pSrc);
-end;
-
-procedure sqlite3AlterDropColumn(pParse: PParse; pSrc: PSrcList;
-  const pName: PToken);
-begin
-  sqlite3SrcListDelete(pParse^.db, pSrc);
-end;
-
 { alter.c:566 — isRealTable.  Returns 1 (and posts an error) when the named
   table is a view or virtual table; the iOp index selects the verb in the
   emitted error message ("rename columns of" / "drop column from" /
@@ -28605,6 +28797,280 @@ begin
     Exit(1);
   end;
   Result := 0;
+end;
+
+{ alter.c:90 — renameFixQuotes.  Generate VM code (via sqlite3NestedParse) that
+  rewrites the `sql` column of sqlite_schema to replace double-quoted strings
+  (but not double-quoted identifiers) with their single-quoted equivalents.
+  Static in C; unit-level here.  Faithful 1:1. }
+procedure renameFixQuotes(pParse: PParse; zDb: PAnsiChar; bTemp: i32);
+begin
+  sqlite3NestedParse(pParse,
+    'UPDATE "%w".' + LEGACY_SCHEMA_TABLE
+    + ' SET sql = sqlite_rename_quotefix(%Q, sql)'
+    + ' WHERE name NOT LIKE ''sqliteX_%%'' ESCAPE ''X'''
+    + ' AND sql NOT LIKE ''create virtual%%''',
+    [zDb, zDb]);
+  if bTemp = 0 then
+    sqlite3NestedParse(pParse,
+      'UPDATE temp.' + LEGACY_SCHEMA_TABLE
+      + ' SET sql = sqlite_rename_quotefix(''temp'', sql)'
+      + ' WHERE name NOT LIKE ''sqliteX_%%'' ESCAPE ''X'''
+      + ' AND sql NOT LIKE ''create virtual%%''',
+      []);
+end;
+
+{ alter.c:2250 — sqlite3AlterDropColumn.  Generate VDBE code for
+  ALTER TABLE <pSrc> DROP COLUMN <pName>.  Locates the table, validates
+  alterable + real, resolves the column index, refuses PK/UNIQUE columns
+  and refuses dropping the last column, runs the rename test/quote-fix
+  passes, drives sqlite_drop_column() over sqlite_master via
+  sqlite3NestedParse, reloads the schema, then on a non-virtual column
+  rewrites the on-disk rows by scanning the table and re-inserting each
+  row with the dropped column elided.  Faithful 1:1. }
+procedure sqlite3AlterDropColumn(pParse: PParse; pSrc: PSrcList;
+  const pName: PToken);
+label
+  exit_drop_column;
+var
+  db:      PTsqlite3;
+  pTab:    PTable2;
+  iDb:     i32;
+  zDb:     PAnsiChar;
+  zCol:    PAnsiChar;
+  iCol:    i32;
+  sItems:  PSrcItem;
+  v:       PVdbe;
+  pPk:     PIndex2;
+  iCur:    i32;
+  addr:    i32;
+  reg:     i32;
+  regRec:  i32;
+  nField:  i32;
+  i:       i32;
+  iPos:    i32;
+  iColPos: i32;
+  regOut:  i32;
+  aff:     AnsiChar;
+begin
+  db   := pParse^.db;
+  zCol := nil;
+
+  AssertH(pParse^.pNewTable = nil, 'AlterDropColumn: pNewTable not nil');
+  if db^.mallocFailed <> 0 then goto exit_drop_column;
+  sItems := SrcListItems(pSrc);
+  pTab := sqlite3LocateTableItem(pParse, 0, @sItems[0]);
+  if pTab = nil then goto exit_drop_column;
+
+  if isAlterableTable(pParse, pTab) <> 0 then goto exit_drop_column;
+  if isRealTable(pParse, pTab, 1) <> 0 then goto exit_drop_column;
+
+  zCol := sqlite3DbStrNDup(db, pName^.z, u64(pName^.n));
+  if zCol = nil then begin
+    AssertH(db^.mallocFailed <> 0, 'AlterDropColumn: zCol nil w/o oom');
+    goto exit_drop_column;
+  end;
+  sqlite3Dequote(zCol);
+  iCol := sqlite3ColumnIndex(pTab, zCol);
+  if iCol < 0 then begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'no such column: "%T"', [pName]));
+    goto exit_drop_column;
+  end;
+
+  if (pTab^.aCol[iCol].colFlags and (COLFLAG_PRIMKEY or COLFLAG_UNIQUE)) <> 0 then
+  begin
+    if (pTab^.aCol[iCol].colFlags and COLFLAG_PRIMKEY) <> 0 then
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'cannot drop %s column: "%s"', [PAnsiChar('PRIMARY KEY'), zCol]))
+    else
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'cannot drop %s column: "%s"', [PAnsiChar('UNIQUE'), zCol]));
+    goto exit_drop_column;
+  end;
+
+  if pTab^.nCol <= 1 then begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'cannot drop column "%s": no other columns exist', [zCol]));
+    goto exit_drop_column;
+  end;
+
+  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  AssertH(iDb >= 0, 'AlterDropColumn: iDb<0');
+  zDb := db^.aDb[iDb].zDbSName;
+
+  if sqlite3AuthCheck(pParse, SQLITE_ALTER_TABLE, zDb, pTab^.zName, zCol) <> 0 then
+    goto exit_drop_column;
+
+  renameTestSchema(pParse, zDb, i32(Ord(iDb = 1)), '', 0);
+  renameFixQuotes(pParse, zDb, i32(Ord(iDb = 1)));
+  sqlite3NestedParse(pParse,
+    'UPDATE "%w".' + LEGACY_SCHEMA_TABLE + ' SET '
+    + 'sql = sqlite_drop_column(%d, sql, %d) '
+    + 'WHERE (type==''table'' AND tbl_name=%Q COLLATE nocase)',
+    [zDb, iDb, iCol, pTab^.zName]);
+
+  renameReloadSchema(pParse, iDb, INITFLAG_AlterDrop);
+  renameTestSchema(pParse, zDb, i32(Ord(iDb = 1)), 'after drop column', 1);
+
+  if (pParse^.nErr = 0)
+     and ((pTab^.aCol[iCol].colFlags and COLFLAG_VIRTUAL) = 0) then
+  begin
+    pPk := nil;
+    nField := 0;
+    v := sqlite3GetVdbe(pParse);
+    iCur := pParse^.nTab;
+    Inc(pParse^.nTab);
+    sqlite3OpenTable(pParse, iCur, iDb, pTab, OP_OpenWrite);
+    addr := sqlite3VdbeAddOp1(v, OP_Rewind, iCur);
+    Inc(pParse^.nMem);
+    reg := pParse^.nMem;
+    if HasRowid(pTab) then begin
+      sqlite3VdbeAddOp2(v, OP_Rowid, iCur, reg);
+      Inc(pParse^.nMem, pTab^.nCol);
+    end else begin
+      pPk := sqlite3PrimaryKeyIndex(pTab);
+      Inc(pParse^.nMem, pPk^.nColumn);
+      for i := 0 to i32(pPk^.nKeyCol) - 1 do
+        sqlite3VdbeAddOp3(v, OP_Column, iCur, i, reg + i + 1);
+      nField := i32(pPk^.nKeyCol);
+    end;
+    Inc(pParse^.nMem);
+    regRec := pParse^.nMem;
+    for i := 0 to pTab^.nCol - 1 do begin
+      if (i <> iCol)
+         and ((pTab^.aCol[i].colFlags and COLFLAG_VIRTUAL) = 0) then
+      begin
+        if pPk <> nil then begin
+          iPos    := sqlite3TableColumnToIndex(pPk, i);
+          iColPos := sqlite3TableColumnToIndex(pPk, iCol);
+          if iPos < i32(pPk^.nKeyCol) then continue;
+          if iPos > iColPos then
+            regOut := reg + 1 + iPos - 1
+          else
+            regOut := reg + 1 + iPos;
+        end else begin
+          regOut := reg + 1 + nField;
+        end;
+        if i = pTab^.iPKey then begin
+          sqlite3VdbeAddOp2(v, OP_Null, 0, regOut);
+        end else begin
+          aff := pTab^.aCol[i].affinity;
+          if aff = AnsiChar(SQLITE_AFF_REAL) then
+            pTab^.aCol[i].affinity := AnsiChar(SQLITE_AFF_NUMERIC);
+          sqlite3ExprCodeGetColumnOfTable(v, pTab, iCur, i, regOut);
+          pTab^.aCol[i].affinity := aff;
+        end;
+        Inc(nField);
+      end;
+    end;
+    if nField = 0 then begin
+      { dbsqlfuzz 5f09e7bcc78b4954d06bf9f2400d7715f48d1fef }
+      Inc(pParse^.nMem);
+      sqlite3VdbeAddOp2(v, OP_Null, 0, reg + 1);
+      nField := 1;
+    end;
+    sqlite3VdbeAddOp3(v, OP_MakeRecord, reg + 1, nField, regRec);
+    if pPk <> nil then
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iCur, regRec, reg + 1,
+                           i32(pPk^.nKeyCol))
+    else
+      sqlite3VdbeAddOp3(v, OP_Insert, iCur, regRec, reg);
+    sqlite3VdbeChangeP5(v, OPFLAG_SAVEPOSITION);
+
+    sqlite3VdbeAddOp2(v, OP_Next, iCur, addr + 1);
+    sqlite3VdbeJumpHere(v, addr);
+  end;
+
+exit_drop_column:
+  sqlite3DbFree(db, zCol);
+  sqlite3SrcListDelete(db, pSrc);
+end;
+
+{ alter.c:599 — sqlite3AlterRenameColumn.  Generate VDBE code for
+  ALTER TABLE <pSrc> RENAME COLUMN <pOld> TO <pNew>.  Locates the table,
+  validates alterable + real, resolves the column index, runs the rename
+  test/quote-fix passes, then issues two sqlite3NestedParse() UPDATEs that
+  drive sqlite_rename_column() over the schema (main + temp), and finishes
+  with renameReloadSchema + after-rename test.  Faithful 1:1. }
+procedure sqlite3AlterRenameColumn(pParse: PParse; pSrc: PSrcList;
+  const pOld: PToken; const pNew: PToken);
+label
+  exit_rename_column;
+var
+  db:      PTsqlite3;
+  pTab:    PTable2;
+  iCol:    i32;
+  zOld:    PAnsiChar;
+  zNew:    PAnsiChar;
+  zDb:     PAnsiChar;
+  iSchema: i32;
+  bQuote:  i32;
+  sItems:  PSrcItem;
+  c:       AnsiChar;
+begin
+  db   := pParse^.db;
+  zOld := nil;
+  zNew := nil;
+
+  sItems := SrcListItems(pSrc);
+  pTab := sqlite3LocateTableItem(pParse, 0, @sItems[0]);
+  if pTab = nil then goto exit_rename_column;
+
+  if isAlterableTable(pParse, pTab) <> 0 then goto exit_rename_column;
+  if isRealTable(pParse, pTab, 0) <> 0 then goto exit_rename_column;
+
+  iSchema := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  AssertH(iSchema >= 0, 'AlterRenameColumn: iSchema<0');
+  zDb := db^.aDb[iSchema].zDbSName;
+
+  if sqlite3AuthCheck(pParse, SQLITE_ALTER_TABLE, zDb, pTab^.zName, nil) <> 0 then
+    goto exit_rename_column;
+
+  zOld := sqlite3DbStrNDup(db, pOld^.z, u64(pOld^.n));
+  if zOld = nil then goto exit_rename_column;
+  sqlite3Dequote(zOld);
+  iCol := sqlite3ColumnIndex(pTab, zOld);
+  if iCol < 0 then begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'no such column: "%T"', [pOld]));
+    goto exit_rename_column;
+  end;
+
+  renameTestSchema(pParse, zDb, i32(Ord(iSchema = 1)), '', 0);
+  renameFixQuotes(pParse, zDb, i32(Ord(iSchema = 1)));
+
+  sqlite3MayAbort(pParse);
+  zNew := sqlite3DbStrNDup(db, pNew^.z, u64(pNew^.n));
+  if zNew = nil then goto exit_rename_column;
+  sqlite3Dequote(zNew);
+  AssertH(pNew^.n > 0, 'AlterRenameColumn: pNew^.n<=0');
+  c := pNew^.z[0];
+  if (c = '"') or (c = '''') or (c = '`') or (c = '[') then
+    bQuote := 1 else bQuote := 0;
+
+  sqlite3NestedParse(pParse,
+    'UPDATE "%w".' + LEGACY_SCHEMA_TABLE + ' SET '
+    + 'sql = sqlite_rename_column(sql, type, name, %Q, %Q, %d, %Q, %d, %d) '
+    + 'WHERE name NOT LIKE ''sqliteX_%%'' ESCAPE ''X'''
+    + ' AND (type != ''index'' OR tbl_name = %Q)',
+    [zDb,
+     zDb, pTab^.zName, iCol, zNew, bQuote, i32(Ord(iSchema = 1)),
+     pTab^.zName]);
+
+  sqlite3NestedParse(pParse,
+    'UPDATE temp.' + LEGACY_SCHEMA_TABLE + ' SET '
+    + 'sql = sqlite_rename_column(sql, type, name, %Q, %Q, %d, %Q, %d, 1) '
+    + 'WHERE type IN (''trigger'', ''view'')',
+    [zDb, pTab^.zName, iCol, zNew, bQuote]);
+
+  renameReloadSchema(pParse, iSchema, INITFLAG_AlterRename);
+  renameTestSchema(pParse, zDb, i32(Ord(iSchema = 1)), 'after rename', 1);
+
+exit_rename_column:
+  sqlite3SrcListDelete(db, pSrc);
+  sqlite3DbFree(db, zOld);
+  sqlite3DbFree(db, zNew);
 end;
 
 { alter.c:2742 — alterFindTable.  Look up the table named by the first entry
@@ -29541,9 +30007,13 @@ begin
   end;
 
   { PragTyp_CACHE_SIZE read arm (pragma.c:882).  Default is
-    SQLITE_DEFAULT_CACHE_SIZE (-2000) seeded by sqlite3SchemaGet. }
+    SQLITE_DEFAULT_CACHE_SIZE (-2000); C populates Schema.cache_size in
+    sqlite3InitOne (prepare.c:323) which is not yet ported, so a 0 here
+    means "uninitialised" and we substitute the default — matching the
+    fallback at prepare.c:326. }
   if SameText(zName, 'cache_size') and (pValue = nil) then begin
-    if (db^.aDb[iDb].pSchema <> nil) then
+    if (db^.aDb[iDb].pSchema <> nil)
+       and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
       iVal := db^.aDb[iDb].pSchema^.cache_size
     else
       iVal := SQLITE_DEFAULT_CACHE_SIZE;
@@ -29567,7 +30037,9 @@ begin
         if (db^.aDb[iDb].pSchema <> nil)
            and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
           sqlite3BtreeSetCacheSize(pBtArg,
-            db^.aDb[iDb].pSchema^.cache_size);
+            db^.aDb[iDb].pSchema^.cache_size)
+        else
+          sqlite3BtreeSetCacheSize(pBtArg, SQLITE_DEFAULT_CACHE_SIZE);
         iVal := sqlite3BtreeSetSpillSize(pBtArg, 0);
       end else
         iVal := 0;
@@ -30200,23 +30672,30 @@ begin
     not (DB_SchemaLoaded or DB_ResetWanted);
 end;
 
+{ callback.c:530 — Find/return the Schema associated with a Btree.  Allocates
+  a new Schema (via sqlite3BtreeSchema for btree-backed dbs, or plain
+  sqlite3DbMallocZero(0,...) for the temp/no-btree case).  Hashes are
+  initialised lazily on file_format==0 so a freshly-zeroed schema is
+  recognised vs. a re-fetched populated one. }
 function sqlite3SchemaGet(db: PTsqlite3; pBt: Pointer): PSchema;
 var
   p: passqlite3util.PSchema;
 begin
-  if pBt = nil then begin
-    p := passqlite3util.PSchema(sqlite3DbMallocZero(db, SizeOf(TSchema)));
-    if p <> nil then begin
-      sqlite3HashInit(@p^.tblHash);
-      sqlite3HashInit(@p^.idxHash);
-      sqlite3HashInit(@p^.trigHash);
-      sqlite3HashInit(@p^.fkeyHash);
-      p^.enc := SQLITE_UTF8;
-      p^.cache_size := SQLITE_DEFAULT_CACHE_SIZE;
-    end;
-    Result := p;
-  end else
-    Result := nil; { Phase 7: look up schema from btree }
+  if pBt <> nil then
+    p := passqlite3util.PSchema(passqlite3btree.sqlite3BtreeSchema(
+           passqlite3btree.PBtree(pBt), SizeOf(TSchema), @sqlite3SchemaClear))
+  else
+    p := passqlite3util.PSchema(sqlite3DbMallocZero(nil, SizeOf(TSchema)));
+  if p = nil then
+    sqlite3OomFault(db)
+  else if p^.file_format = 0 then begin
+    sqlite3HashInit(@p^.tblHash);
+    sqlite3HashInit(@p^.idxHash);
+    sqlite3HashInit(@p^.trigHash);
+    sqlite3HashInit(@p^.fkeyHash);
+    p^.enc := SQLITE_UTF8;
+  end;
+  Result := p;
 end;
 
 { sqlite3InstallSchemaTable — bootstrap sqlite_master into pSchema^.tblHash for
@@ -32682,9 +33161,108 @@ begin
   if bHaveFK <> 0 then Result := 1 else Result := 0;
 end;
 
-procedure sqlite3FkDelete(db: PTsqlite3; pTab: PTable2);
+{ fkey.c:688 — fkTriggerDelete.  Frees a CASCADE/SET NULL/SET DEFAULT
+  trigger Trigger object created by fkActionTrigger.  The trigger has
+  exactly one TriggerStep at step_list and no pColumns/zName/etc.  Mirrors
+  the C body 1:1 — only step_list's pSrc/pWhere/pExprList/pSelect get
+  freed, plus pWhen and the Trigger record itself. }
+procedure fkTriggerDelete(dbMem: PTsqlite3; p: PTrigger);
+var
+  pStep: PTriggerStep;
 begin
-  { Phase 7 }
+  if p = nil then Exit;
+  pStep := p^.step_list;
+  sqlite3SrcListDelete  (Psqlite3db(dbMem), pStep^.pSrc);
+  sqlite3ExprDelete     (Psqlite3db(dbMem), pStep^.pWhere);
+  sqlite3ExprListDelete (Psqlite3db(dbMem), pStep^.pExprList);
+  sqlite3SelectDelete   (Psqlite3db(dbMem), pStep^.pSelect);
+  sqlite3ExprDelete     (Psqlite3db(dbMem), p^.pWhen);
+  sqlite3DbFree         (Psqlite3db(dbMem), p);
+end;
+
+{ fkey.c:1451 — sqlite3FkDelete.  Frees the FKey list attached to pTab and
+  removes each entry from pSchema^.fkeyHash.  Operates via documented byte
+  offsets into the opaque PFKey blob (PFKey = Pointer in this port; layout
+  follows the C struct verbatim).  Skips the hash unlink when
+  db^.pnBytesFreed is non-nil (sqlite3LeaveMutexAndCloseZombie tear-down
+  path — the schema hash is being torn down too).  Faithful 1:1 of the C. }
+procedure sqlite3FkDelete(db: PTsqlite3; pTab: PTable2);
+const
+  FKEY_PNEXTFROM_OFFSET = 8;
+  FKEY_ZTO_OFFSET       = 16;
+  FKEY_PNEXTTO_OFFSET   = 24;
+  FKEY_PPREVTO_OFFSET   = 32;
+  FKEY_APTRIGGER0_OFFSET= 48;
+  FKEY_APTRIGGER1_OFFSET= 56;
+var
+  pFKey, pNext, pNextTo, pPrevTo: Pu8;
+  z:     PAnsiChar;
+  pSch:  passqlite3util.PSchema;
+begin
+  if pTab = nil then Exit;
+  if pTab^.eTabType <> TABTYP_NORM then Exit;
+  if db = nil then Exit;
+  pFKey := Pu8(pTab^.u.tab.pFKey);
+  while pFKey <> nil do begin
+    pNextTo := PPointer(pFKey + FKEY_PNEXTTO_OFFSET)^;
+    pPrevTo := PPointer(pFKey + FKEY_PPREVTO_OFFSET)^;
+    if db^.pnBytesFreed = nil then begin
+      pSch := passqlite3util.PSchema(pTab^.pSchema);
+      if pPrevTo <> nil then begin
+        PPointer(pPrevTo + FKEY_PNEXTTO_OFFSET)^ := pNextTo;
+      end else begin
+        if pNextTo <> nil then
+          z := PPointer(pNextTo + FKEY_ZTO_OFFSET)^
+        else
+          z := PPointer(pFKey + FKEY_ZTO_OFFSET)^;
+        if pSch <> nil then
+          sqlite3HashInsert(@pSch^.fkeyHash, z, pNextTo);
+      end;
+      if pNextTo <> nil then
+        PPointer(pNextTo + FKEY_PPREVTO_OFFSET)^ := pPrevTo;
+    end;
+    fkTriggerDelete(db, PTrigger(PPointer(pFKey + FKEY_APTRIGGER0_OFFSET)^));
+    fkTriggerDelete(db, PTrigger(PPointer(pFKey + FKEY_APTRIGGER1_OFFSET)^));
+    pNext := PPointer(pFKey + FKEY_PNEXTFROM_OFFSET)^;
+    sqlite3DbFree(Psqlite3db(db), pFKey);
+    pFKey := pNext;
+  end;
+end;
+
+{ fkey.c:705 — sqlite3FkClearTriggerCache.  Called when the schema for
+  database iDb changes; walks every ordinary table in the schema's tblHash
+  and frees the cached CASCADE / SET NULL / SET DEFAULT triggers stashed in
+  pFKey^.apTrigger[0..1], so they get rebuilt on next access by
+  fkActionTrigger.  Faithful 1:1 of the C body. }
+procedure sqlite3FkClearTriggerCacheImpl(db: PTsqlite3; iDb: i32);
+const
+  FKEY_PNEXTFROM_OFFSET = 8;
+  FKEY_APTRIGGER0_OFFSET= 48;
+  FKEY_APTRIGGER1_OFFSET= 56;
+var
+  pHash: passqlite3util.PHash;
+  pE:    passqlite3util.PHashElem;
+  pTab:  PTable2;
+  pFKey: Pu8;
+begin
+  if db = nil then Exit;
+  if db^.aDb[iDb].pSchema = nil then Exit;
+  pHash := @passqlite3util.PSchema(db^.aDb[iDb].pSchema)^.tblHash;
+  pE := pHash^.first;
+  while pE <> nil do begin
+    pTab := PTable2(pE^.data);
+    if (pTab <> nil) and (pTab^.eTabType = TABTYP_NORM) then begin
+      pFKey := Pu8(pTab^.u.tab.pFKey);
+      while pFKey <> nil do begin
+        fkTriggerDelete(db, PTrigger(PPointer(pFKey + FKEY_APTRIGGER0_OFFSET)^));
+        PPointer(pFKey + FKEY_APTRIGGER0_OFFSET)^ := nil;
+        fkTriggerDelete(db, PTrigger(PPointer(pFKey + FKEY_APTRIGGER1_OFFSET)^));
+        PPointer(pFKey + FKEY_APTRIGGER1_OFFSET)^ := nil;
+        pFKey := PPointer(pFKey + FKEY_PNEXTFROM_OFFSET)^;
+      end;
+    end;
+    pE := passqlite3util.PHashElem(pE^.next);
+  end;
 end;
 
 { fkey.c:736 — sqlite3FkDropTable.  Generates the implicit "DELETE FROM <tbl>"
@@ -32742,9 +33320,207 @@ begin
     sqlite3VdbeResolveLabel(v, iSkip);
 end;
 
-procedure sqlite3FkOldmask(pParse: PParse; pTab: PTable2);
+{ fkey.c:183 — sqlite3FkLocateIndex.  Search the parent table for the
+  unique index referenced by foreign key pFKey.  See the C reference for
+  the full semantics; output:
+    *ppIdx     - PIndex2 of the chosen UNIQUE/PK index, nil for IPK match
+    *ppaiCol   - i32[N] mapping pIdx column i -> child column index
+                 (only allocated for nCol > 1 composite FKs)
+  Returns 0 on success, 1 on mismatch (with an error loaded via
+  sqlite3ErrorMsg unless pParse->disableTriggers is set).
+
+  PFKey internals are accessed via the documented byte offsets used by
+  sqlite3FkDelete (see codegen.pas:32988): nCol@40, aCol[i].iFrom@64+i*16,
+  aCol[i].zCol@64+i*16+8, pFrom@0, zTo@16.
+  Each sColMap entry is 16 bytes (int iFrom + 4 pad + char* zCol). }
+function sqlite3FkLocateIndex(pParse: PParse; pParent: PTable2;
+  pFKey: Pointer; ppIdx: PPointer; ppaiCol: PPointer): i32;
+const
+  FKEY_NCOL_OFFSET = 40;
+  FKEY_PFROM_OFFSET = 0;
+  FKEY_ZTO_OFFSET = 16;
+  FKEY_ACOL_OFFSET = 64;
+  FKEY_SCOLMAP_SIZE = 16;
+  FKEY_SCOL_IFROM = 0;
+  FKEY_SCOL_ZCOL = 8;
+var
+  pIdx:    PIndex2;
+  aiCol:   Pi32;
+  nCol:    i32;
+  zKey:    PAnsiChar;
+  pFKb:    Pu8;
+  i, j:    i32;
+  iCol:    i16;
+  zDfltColl: PAnsiChar;
+  zIdxCol:   PAnsiChar;
+  zFKjCol:   PAnsiChar;
+  pFromTab:  PTable2;
+  azColl:    PPAnsiChar;
 begin
-  { Phase 7 }
+  pIdx := nil;
+  aiCol := nil;
+  pFKb := Pu8(pFKey);
+  nCol := PInt32(pFKb + FKEY_NCOL_OFFSET)^;
+  zKey := PPAnsiChar(pFKb + FKEY_ACOL_OFFSET + FKEY_SCOL_ZCOL)^;
+
+  if nCol = 1 then
+  begin
+    if pParent^.iPKey >= 0 then
+    begin
+      if zKey = nil then
+      begin
+        Result := 0;
+        Exit;
+      end;
+      if sqlite3StrICmp(pParent^.aCol[pParent^.iPKey].zCnName, zKey) = 0 then
+      begin
+        Result := 0;
+        Exit;
+      end;
+    end;
+  end
+  else if ppaiCol <> nil then
+  begin
+    aiCol := Pi32(sqlite3DbMallocRawNN(pParse^.db, nCol * SizeOf(i32)));
+    if aiCol = nil then
+    begin
+      Result := 1;
+      Exit;
+    end;
+    ppaiCol^ := aiCol;
+  end;
+
+  pIdx := pParent^.pIndex;
+  while pIdx <> nil do
+  begin
+    if (pIdx^.nKeyCol = u16(nCol))
+       and (pIdx^.onError <> OE_None)              { IsUniqueIndex }
+       and (pIdx^.pPartIdxWhere = nil) then
+    begin
+      if zKey = nil then
+      begin
+        if (pIdx^.idxFlags and 3) = SQLITE_IDXTYPE_PRIMARYKEY then
+        begin
+          if aiCol <> nil then
+            for i := 0 to nCol - 1 do
+              aiCol[i] := PInt32(pFKb + FKEY_ACOL_OFFSET + i * FKEY_SCOLMAP_SIZE + FKEY_SCOL_IFROM)^;
+          break;
+        end;
+      end
+      else
+      begin
+        i := 0;
+        while i < nCol do
+        begin
+          iCol := pIdx^.aiColumn[i];
+          if iCol < 0 then break;     { No FKs against expression indices }
+
+          zDfltColl := sqlite3ColumnColl(@pParent^.aCol[iCol]);
+          if zDfltColl = nil then zDfltColl := WhereStrBINARY;
+          azColl := PPAnsiChar(pIdx^.azColl);
+          if sqlite3StrICmp(azColl[i], zDfltColl) <> 0 then break;
+
+          zIdxCol := pParent^.aCol[iCol].zCnName;
+          j := 0;
+          while j < nCol do
+          begin
+            zFKjCol := PPAnsiChar(pFKb + FKEY_ACOL_OFFSET + j * FKEY_SCOLMAP_SIZE + FKEY_SCOL_ZCOL)^;
+            if sqlite3StrICmp(zFKjCol, zIdxCol) = 0 then
+            begin
+              if aiCol <> nil then
+                aiCol[i] := PInt32(pFKb + FKEY_ACOL_OFFSET + j * FKEY_SCOLMAP_SIZE + FKEY_SCOL_IFROM)^;
+              break;
+            end;
+            Inc(j);
+          end;
+          if j = nCol then break;
+          Inc(i);
+        end;
+        if i = nCol then break;     { pIdx is usable }
+      end;
+    end;
+    pIdx := pIdx^.pNext;
+  end;
+
+  if pIdx = nil then
+  begin
+    if (pParse^.parseFlags and PARSEFLAG_DisableTriggers) = 0 then
+    begin
+      pFromTab := PTable2(PPointer(pFKb + FKEY_PFROM_OFFSET)^);
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+        'foreign key mismatch - "%w" referencing "%w"',
+        [pFromTab^.zName, PPAnsiChar(pFKb + FKEY_ZTO_OFFSET)^]));
+    end;
+    sqlite3DbFree(Psqlite3db(pParse^.db), aiCol);
+    Result := 1;
+    Exit;
+  end;
+
+  ppIdx^ := pIdx;
+  Result := 0;
+end;
+
+{ fkey.c:1095 — sqlite3FkOldmask.  Compute the column-mask of OLD.* columns
+  required for FK processing on UPDATE/DELETE of a row in pTab.  Walks the
+  child-arm via pTab->u.tab.pFKey (the FKs where pTab is the child) and the
+  parent-arm via sqlite3FkReferences (the FKs where pTab is the parent),
+  using sqlite3FkLocateIndex to find the parent-side unique index for each
+  parent-arm FK. }
+function sqlite3FkOldmask(pParse: PParse; pTab: PTable2): u32;
+const
+  FKEY_PNEXTFROM_OFFSET = 8;
+  FKEY_PNEXTTO_OFFSET = 24;
+  FKEY_NCOL_OFFSET = 40;
+  FKEY_ACOL_OFFSET = 64;
+  FKEY_SCOLMAP_SIZE = 16;
+  FKEY_SCOL_IFROM = 0;
+var
+  mask: u32;
+  pFKb: Pu8;
+  nCol, i, iFrom: i32;
+  pIdx: PIndex2;
+begin
+  mask := 0;
+  if ((pParse^.db^.flags and SQLITE_ForeignKeys) <> 0)
+     and (pTab <> nil) and (pTab^.eTabType = TABTYP_NORM) then
+  begin
+    { Child arm — pTab is the child of these FKs. }
+    pFKb := Pu8(pTab^.u.tab.pFKey);
+    while pFKb <> nil do
+    begin
+      nCol := PInt32(pFKb + FKEY_NCOL_OFFSET)^;
+      for i := 0 to nCol - 1 do
+      begin
+        iFrom := PInt32(pFKb + FKEY_ACOL_OFFSET + i * FKEY_SCOLMAP_SIZE + FKEY_SCOL_IFROM)^;
+        if iFrom > 31 then
+          mask := $FFFFFFFF
+        else
+          mask := mask or (u32(1) shl iFrom);
+      end;
+      pFKb := PPointer(pFKb + FKEY_PNEXTFROM_OFFSET)^;
+    end;
+
+    { Parent arm — pTab is the parent of these FKs. }
+    pFKb := Pu8(sqlite3FkReferences(pTab));
+    while pFKb <> nil do
+    begin
+      pIdx := nil;
+      sqlite3FkLocateIndex(pParse, pTab, Pointer(pFKb), @pIdx, nil);
+      if pIdx <> nil then
+      begin
+        for i := 0 to i32(pIdx^.nKeyCol) - 1 do
+        begin
+          iFrom := pIdx^.aiColumn[i];
+          if iFrom > 31 then
+            mask := $FFFFFFFF
+          else
+            mask := mask or (u32(1) shl iFrom);
+        end;
+      end;
+      pFKb := PPointer(pFKb + FKEY_PNEXTTO_OFFSET)^;
+    end;
+  end;
+  Result := mask;
 end;
 
 function sqlite3FkReferences(pTab: PTable2): Pointer;
@@ -34990,22 +35766,20 @@ end;
 
 procedure codeExprOrVector(pParse: PParse; p: PExpr; iReg: i32; nReg: i32);
 var
-  v:     PVdbe;
-  pList: PExprList;
-  pItem: PExprListItem;
-  i:     i32;
+  v:       PVdbe;
+  pList:   PExprList;
+  pItem:   PExprListItem;
+  i:       i32;
+  iSelect: i32;
 begin
   Assert(nReg > 0);
   if (p <> nil) and (sqlite3ExprIsVector(p) <> 0) then begin
     if ExprUseXSelect(p) then begin
-      { TK_SELECT vector RHS — sqlite3CodeSubselect not yet ported.  When the
-        prerequisite lands (batch 6, alongside codeINTerm proper), restore the
-        OP_Copy(iSelect..iReg, nReg-1) path verbatim. }
+      { Port of wherecode.c:1320..1330 TK_SELECT vector RHS arm. }
       v := pParse^.pVdbe;
       Assert(p^.op = TK_SELECT);
-      Assert(False, 'codeExprOrVector: TK_SELECT subselect not yet ported');
-      { Suppress "unused" warning. }
-      if v = nil then Exit;
+      iSelect := sqlite3CodeSubselect(pParse, p);
+      sqlite3VdbeAddOp3(v, OP_Copy, iSelect, iReg, nReg - 1);
     end else begin
       Assert(ExprUseXList(p));
       pList := p^.x.pList;
@@ -36869,6 +37643,7 @@ initialization
   passqlite3vdbe.gUnlinkAndDeleteIndex   := @sqlite3UnlinkAndDeleteIndex;
   passqlite3vdbe.gUnlinkAndDeleteTrigger := @sqlite3UnlinkAndDeleteTrigger;
   passqlite3vdbe.gRootPageMoved          := @rootPageMovedTrampoline;
+  passqlite3vdbe.gFkClearTriggerCache    := @sqlite3FkClearTriggerCacheImpl;
   passqlite3vdbe.gSetP4KeyInfo           := passqlite3vdbe.TSetP4KeyInfoFn(@setP4KeyInfoTrampoline);
   passqlite3vdbe.gResetOneSchema         := @sqlite3ResetOneSchema;
   passqlite3vdbe.gResetAllSchemas        := @sqlite3ResetAllSchemasOfConnection;
@@ -36877,5 +37652,6 @@ initialization
   passqlite3vdbe.gBlobOpenImpl           := @vdbeBlobOpenImpl;
   passqlite3vdbe.gBlobReopenImpl         := @vdbeBlobReopenImpl;
   passqlite3vdbe.gValueFromExprImpl      := @valueFromExprTrampoline;
+  passqlite3vdbe.gKeyInfoUnref           := passqlite3vdbe.TKeyInfoUnrefFn(@sqlite3KeyInfoUnref);
 
 end.

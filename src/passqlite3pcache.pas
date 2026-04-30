@@ -126,6 +126,8 @@ function  sqlite3PcacheSetSpillsize(p: PPCache; mxPage: i32): i32;
 procedure sqlite3PcacheShrink(pCache: PPCache);
 function  sqlite3HeaderSizePcache: i32;
 function  sqlite3PCachePercentDirty(pCache: PPCache): i32;
+{ pcache.c:712 — return non-zero if the cache contains any dirty pages. }
+function  sqlite3PCacheIsDirty(pCache: PPCache): i32;
 
 { ============================================================
   pcache1_g.c -- default LRU backend public interface
@@ -703,6 +705,13 @@ begin
     Result := i32((i64(nDirty) * 100) div nCache)
   else
     Result := 0;
+end;
+
+{ pcache.c:712 — sqlite3PCacheIsDirty.
+  Return 1 if any page in the cache is dirty, else 0. }
+function sqlite3PCacheIsDirty(pCache: PPCache): i32;
+begin
+  if pCache^.pDirty <> nil then Result := 1 else Result := 0;
 end;
 
 { ============================================================
