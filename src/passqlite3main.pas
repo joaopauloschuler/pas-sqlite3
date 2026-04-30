@@ -1129,10 +1129,18 @@ begin
     Assert((rc = SQLITE_OK) or (ppStmt^ = nil));
     if (rc = SQLITE_OK) or (db^.mallocFailed <> 0) then Break;
     Inc(cnt);
-    { sqlite3ResetOneSchema not yet ported — bail after one retry on
-      SQLITE_ERROR_RETRY only. }
-    if (rc <> SQLITE_ERROR_RETRY) or (cnt > SQLITE_MAX_PREPARE_RETRY) then
-      Break;
+    { Match prepare.c:865-866: retry on SQLITE_ERROR_RETRY (up to
+      SQLITE_MAX_PREPARE_RETRY) OR on SQLITE_SCHEMA after one schema reset. }
+    if rc = SQLITE_ERROR_RETRY then begin
+      if cnt > SQLITE_MAX_PREPARE_RETRY then Break;
+      Continue;
+    end;
+    if rc = SQLITE_SCHEMA then begin
+      sqlite3ResetOneSchema(db, -1);
+      if cnt > 1 then Break;
+      Continue;
+    end;
+    Break;
   until False;
   sqlite3BtreeLeaveAll(db);
   rc := sqlite3ApiExit(db, rc);

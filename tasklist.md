@@ -404,6 +404,15 @@ Important: At the end of this document, please find:
             leak to faithful 1:1 once STAT4 is enabled.  TestExplainParity
             1016/1026 unchanged; TestDMLBasic 54/0; TestSchemaBasic 44/0;
             TestPager 12/12.
+       [X] Wire `sqlite3ResetOneSchema` retry into `sqlite3LockAndPrepare`
+            (prepare.c:865-866) — done 2026-04-30 in passqlite3main.pas.
+            Previously bailed after one retry on SQLITE_ERROR_RETRY only;
+            the SQLITE_SCHEMA arm is now wired to call
+            `sqlite3ResetOneSchema(db,-1)` and retry once, matching the C
+            do/while.  Function was already ported (codegen.pas:24818); only
+            the call site was missing.  TestExplainParity 1016/1026
+            unchanged; DiagFeatureProbe 9 unchanged; TestSchemaBasic 44/0;
+            TestDMLBasic 54/0.
 
 ### Open Bugs
 
