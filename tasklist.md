@@ -519,18 +519,19 @@ Important: At the end of this document, please find:
        [X] Port `sqlite3AlterBeginAddColumn` — ported 2026-04-30 (alter.c:483)
             in passqlite3codegen.pas.  Clones the target Table into
             pParse^.pNewTable under `sqlite_altertab_<orig>`.
-       [ ] **Bug** `AssertH FAILED: AlterFinishAddColumn: pDflt op not
-            TK_SPAN` — surfaced 2026-04-30 by DiagFeatureProbe (run with
-            `LD_LIBRARY_PATH=$PWD/src bin/DiagFeatureProbe`).  The
-            sqlite3AlterFinishAddColumn validator at codegen.pas:28153
-            fires before any schema mutation when ADD COLUMN reaches a
-            DEFAULT expression whose top op is not TK_SPAN.  Reproducible
-            with the probe; the assertion aborts the whole run, masking
-            any later probe rows.  Likely root cause: the assertion
-            inherits the C `assert(pDflt->op==TK_SPAN)` but the parser
-            arm that sets TK_SPAN on DEFAULT exprs (parse.y span action)
-            is not yet wired in this port — relax to a productive
-            non-TK_SPAN fallback or set TK_SPAN at the parser side.
+       [X] **Bug** `AssertH FAILED: AlterFinishAddColumn: pDflt op not
+            TK_SPAN` — fixed 2026-04-30.  Root cause: sqlite3AddDefaultValue
+            (codegen.pas:25287) was binding the parsed DEFAULT expression
+            directly via sqlite3ExprDup and skipping the build.c:1751
+            TK_SPAN wrapper that downstream consumers
+            (sqlite3AlterFinishAddColumn, EXPLAIN) rely on.  Fix introduces
+            `wrapTokenSpanExpr` (codegen.pas:25234) which calls
+            sqlite3ExprAlloc with a TToken carrying the trimmed source
+            span, so u.zToken sits in the wrapper's own tail buffer
+            (single-alloc lifetime, matches the EXPRDUP_REDUCE C path).
+            DiagFeatureProbe now runs to completion (9 divergences, no
+            assertion abort); TestExplainParity unchanged (1016/1026);
+            DiagDml unchanged (12 pass, 2 diverge).
        [X] Port `sqlite3AlterFinishAddColumn` — ported 2026-04-30
             (alter.c:313) in passqlite3codegen.pas.  Replaces the Phase 6.5
             stub.  Validates the new column (no PRIMARY KEY / UNIQUE,

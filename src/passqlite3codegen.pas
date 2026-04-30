@@ -25226,10 +25226,47 @@ begin
   end;
 end;
 
+{ wrapTokenSpanExpr — internal helper for sqlite3AddDefaultValue.
+  Returns a freshly-allocated TK_SPAN Expr whose u.zToken is the trimmed
+  source text from zStart..zEnd (inlined into the same allocation, matching
+  sqlite3ExprAlloc tail layout) and whose pLeft is a fresh ExprDup of pExpr.
+  pExpr is NOT consumed; the caller still owns it.  Returns nil on OOM. }
+function wrapTokenSpanExpr(db: PTsqlite3; pExpr: PExpr;
+  zStart: PAnsiChar; zEnd: PAnsiChar): PExpr;
+var
+  pNew:     PExpr;
+  zSpan:    PAnsiChar;
+  pLeftDup: PExpr;
+  tk:       TToken;
+begin
+  zSpan := sqlite3DbSpanDup(db, zStart, zEnd);
+  tk.z  := zSpan;
+  if zSpan <> nil then
+    tk.n := u32(strlen(zSpan))
+  else
+    tk.n := 0;
+  pLeftDup := sqlite3ExprDup(db, pExpr, EXPRDUP_REDUCE);
+  pNew := sqlite3ExprAlloc(db, TK_SPAN, @tk, 0);
+  sqlite3DbFree(db, zSpan);
+  if pNew = nil then
+  begin
+    sqlite3ExprDelete(db, pLeftDup);
+    Result := nil;
+    Exit;
+  end;
+  pNew^.flags := pNew^.flags or EP_Skip;
+  pNew^.pLeft := pLeftDup;
+  if pLeftDup <> nil then
+    pNew^.nHeight := pLeftDup^.nHeight + 1;
+  Result := pNew;
+end;
+
 { sqlite3AddDefaultValue — port of build.c:1729.  Validate and bind a DEFAULT
   expression to the most recently added column on pNewTable.  pExpr's tokens
-  point at volatile parser memory, so we ExprDup a wrapper TK_SPAN node that
-  carries the literal source text (zStart..zEnd) into the bound copy. }
+  point at volatile parser memory, so we wrap pExpr in a heap-allocated TK_SPAN
+  node that carries the literal source text (zStart..zEnd) into the bound
+  Expr.  This wrapper is what sqlite3AlterFinishAddColumn unwraps via its
+  `pDflt^.op = TK_SPAN` invariant. }
 procedure sqlite3AddDefaultValue(pParse: PParse; pExpr: PExpr;
   zStart: PAnsiChar; zEnd: PAnsiChar);
 var
@@ -25260,14 +25297,13 @@ begin
     end
     else
     begin
-      { Faithful port wraps pExpr in a TK_SPAN node that carries the source
-        text via sqlite3DbSpanDup so error messages and EXPLAIN can display
-        the original DEFAULT expression.  The Pas exprDup_ does not yet
-        correctly handle that stack-Expr-with-ExtraToken wrapper (deep
-        recursion through EXPRDUP_REDUCE buffers); for now we ExprDup
-        pExpr directly, sufficient for runtime semantics — only the
-        cosmetic source-text round-trip is lost. }
-      pDfltExpr := sqlite3ExprDup(db, pExpr, EXPRDUP_REDUCE);
+      { Wrap pExpr in a TK_SPAN node that carries the source text so
+        downstream consumers (sqlite3AlterFinishAddColumn, EXPLAIN) can
+        recover the original DEFAULT expression.  Matches build.c:1751.
+        We allocate the wrapper with the span string in its tail buffer
+        (same layout as sqlite3ExprAlloc) so a single sqlite3DbFree on
+        the wrapper releases u.zToken too. }
+      pDfltExpr := wrapTokenSpanExpr(db, pExpr, zStart, zEnd);
       sqlite3ColumnSetExpr(pParse, p, pCol, pDfltExpr);
     end;
   end;
