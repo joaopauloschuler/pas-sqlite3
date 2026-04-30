@@ -464,6 +464,12 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 
 - [ ] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind).
 
+- [X] **8.x** `unixCurrentTimeInt64` (os_unix.c:7193) — ported 2026-04-29 in
+       passqlite3os.pas.  Returns *piNow as Julian-day-times-86_400_000;
+       `unixCurrentTime` rewritten as the thin wrapper used in C.  VFS
+       `iVersion` bumped 1→2 so `xCurrentTimeInt64` is now reachable through
+       the shared `sqlite3OsCurrentTimeInt64` chain (memdb already wraps it).
+
 - [X] **8.x** `sqlite3_database_file_object` (pager.c:5090) — ported
        2026-04-29 in passqlite3pager.pas.  Walks back from any filename
        pointer inside a pager-allocated buffer to the 4-byte zero prefix,

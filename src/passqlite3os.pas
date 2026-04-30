@@ -2013,18 +2013,31 @@ begin
   Result := microseconds;
 end;
 
-{ os_unix.c ~7225: unixCurrentTime — Julian day number as a Double }
-function unixCurrentTime(pVfs: Psqlite3_vfs; pTime: PDouble): cint; cdecl;
+{ os_unix.c:7193 — unixCurrentTimeInt64.  Returns *piNow as the Julian-day
+  number times 86_400_000 (i.e. milliseconds since the proleptic Gregorian
+  epoch of noon, 24 Nov 4714 BC).  v2 VFS entry-point (iVersion>=2). }
+function unixCurrentTimeInt64(pVfs: Psqlite3_vfs; piNow: Pi64): cint; cdecl;
 const
-  unixEpoch : i64 = 210866760000000;
+  unixEpoch : i64 = 24405875 * i64(8640000);
 var
-  tv   : TTimeVal;
-  iNow : i64;
+  tv : TTimeVal;
 begin
   c_gettimeofday(@tv, nil);
-  iNow   := unixEpoch + i64(1000) * tv.tv_sec + tv.tv_usec div 1000;
-  pTime^ := iNow / 86400000.0;
+  piNow^ := unixEpoch + i64(1000) * tv.tv_sec + tv.tv_usec div 1000;
   Result := 0;
+end;
+
+{ os_unix.c:7225 — unixCurrentTime.  Julian day number as a Double; thin
+  wrapper around unixCurrentTimeInt64 (matches the C call graph 1:1). }
+function unixCurrentTime(pVfs: Psqlite3_vfs; pTime: PDouble): cint; cdecl;
+var
+  i  : i64;
+  rc : cint;
+begin
+  i := 0;
+  rc := unixCurrentTimeInt64(nil, @i);
+  pTime^ := i / 86400000.0;
+  Result := rc;
 end;
 
 { os_unix.c ~7243: unixGetLastError — return the errno from the last failed call }
@@ -2042,7 +2055,7 @@ function sqlite3_os_init: cint;
 begin
   { Fill in the singleton unixVfsObj (declared in interface section) }
   FillChar(unixVfsObj, SizeOf(unixVfsObj), 0);
-  unixVfsObj.iVersion        := 1;    { Phase 1: v1 only (no WAL/SHM/mmap) }
+  unixVfsObj.iVersion        := 2;    { v2: xCurrentTimeInt64 wired below }
   unixVfsObj.szOsFile        := SizeOf(unixFile);
   unixVfsObj.mxPathname      := MAX_PATHNAME;
   unixVfsObj.pNext           := nil;
@@ -2060,7 +2073,7 @@ begin
   unixVfsObj.xSleep          := @unixSleep;
   unixVfsObj.xCurrentTime    := @unixCurrentTime;
   unixVfsObj.xGetLastError   := @unixGetLastError;
-  unixVfsObj.xCurrentTimeInt64 := nil; { Phase 2 TODO }
+  unixVfsObj.xCurrentTimeInt64 := @unixCurrentTimeInt64;
   unixVfsObj.xSetSystemCall  := nil;
   unixVfsObj.xGetSystemCall  := nil;
   unixVfsObj.xNextSystemCall := nil;
