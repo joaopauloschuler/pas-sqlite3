@@ -6878,6 +6878,9 @@ var
   nSvptName5g: i32;           { OP_Savepoint: name length }
   iSvpt5g:     i32;           { OP_Savepoint: depth counter }
   isTxnSvpt5g: i32;           { OP_Savepoint: is this a transaction savepoint? }
+  iSvptii5g:   i32;           { OP_Savepoint: per-db loop index }
+  isSchemaChange5g: i32;      { OP_Savepoint: schema-change flag }
+  pTmpSvpt5g:  PSavepoint;    { OP_Savepoint: temporary for nested-savepoint pop }
   desiredAC5g: i32;           { OP_AutoCommit: desired autocommit state }
   iRollback5g: i32;           { OP_AutoCommit: rollback flag }
   { 5.4f locals — aggregate }
@@ -8856,25 +8859,39 @@ begin
     { ────── OP_Savepoint ────── (vdbe.c:3823)
       P1=SAVEPOINT_BEGIN(0)/RELEASE(1)/ROLLBACK(2), P4.z=name }
     OP_Savepoint: begin
+      { Faithful port of vdbe.c:3823.  Replaces the prior structural-only
+        port that omitted the actual sqlite3BtreeSavepoint /
+        sqlite3BtreeTripAllCursors calls (the per-db rollback/release work)
+        as well as the nVdbeWrite BUSY guards and the vtab-savepoint hook.
+        Closes 6.10 step 15(c). }
       zSvptName5g := pOp^.p4.z;
       if pOp^.p1 = SAVEPOINT_BEGIN then begin
-        nSvptName5g := sqlite3Strlen30(PChar(zSvptName5g));
-        pNewSvpt5g := PSavepoint(
-          sqlite3DbMallocRawNN(db, SizeOf(TSavepoint) + nSvptName5g + 1));
-        if pNewSvpt5g = nil then goto no_mem;
-        pNewSvpt5g^.zName := PAnsiChar(PByte(pNewSvpt5g) + SizeOf(TSavepoint));
-        Move(zSvptName5g^, pNewSvpt5g^.zName^, nSvptName5g + 1);
-        if db^.autoCommit <> 0 then begin
-          db^.autoCommit              := 0;
-          db^.isTransactionSavepoint  := 1;
-        end else
-          Inc(db^.nSavepoint);
-        pNewSvpt5g^.pNext           := db^.pSavepoint;
-        db^.pSavepoint              := pNewSvpt5g;
-        pNewSvpt5g^.nDeferredCons   := db^.nDeferredCons;
-        pNewSvpt5g^.nDeferredImmCons := db^.nDeferredImmCons;
+        if db^.nVdbeWrite > 0 then begin
+          sqlite3VdbeError(v, 'cannot open savepoint - SQL statements in progress');
+          rc := SQLITE_BUSY;
+        end else begin
+          nSvptName5g := sqlite3Strlen30(PChar(zSvptName5g));
+          rc := sqlite3VtabSavepoint(db, SAVEPOINT_BEGIN,
+                  db^.nStatement + db^.nSavepoint);
+          if rc <> SQLITE_OK then goto abort_due_to_error;
+          pNewSvpt5g := PSavepoint(
+            sqlite3DbMallocRawNN(db, SizeOf(TSavepoint) + nSvptName5g + 1));
+          if pNewSvpt5g <> nil then begin
+            pNewSvpt5g^.zName := PAnsiChar(PByte(pNewSvpt5g) + SizeOf(TSavepoint));
+            Move(zSvptName5g^, pNewSvpt5g^.zName^, nSvptName5g + 1);
+            if db^.autoCommit <> 0 then begin
+              db^.autoCommit              := 0;
+              db^.isTransactionSavepoint  := 1;
+            end else
+              Inc(db^.nSavepoint);
+            pNewSvpt5g^.pNext            := db^.pSavepoint;
+            db^.pSavepoint               := pNewSvpt5g;
+            pNewSvpt5g^.nDeferredCons    := db^.nDeferredCons;
+            pNewSvpt5g^.nDeferredImmCons := db^.nDeferredImmCons;
+          end;
+        end;
       end else begin
-        { RELEASE or ROLLBACK: find named savepoint }
+        Assert((pOp^.p1 = SAVEPOINT_RELEASE) or (pOp^.p1 = SAVEPOINT_ROLLBACK));
         iSvpt5g := 0;
         pSvpt5g := db^.pSavepoint;
         while (pSvpt5g <> nil) and
@@ -8885,41 +8902,83 @@ begin
         if pSvpt5g = nil then begin
           sqlite3VdbeError(v, 'no such savepoint');
           rc := SQLITE_ERROR;
-          goto abort_due_to_error;
-        end;
-        isTxnSvpt5g := ord((pSvpt5g^.pNext = nil) and (db^.isTransactionSavepoint <> 0));
-        if (isTxnSvpt5g <> 0) and (pOp^.p1 = SAVEPOINT_RELEASE) then begin
-          { Release of transaction savepoint: commit }
-          db^.autoCommit := 1;
-          if sqlite3VdbeHalt(v) = SQLITE_BUSY then begin
-            v^.pc := i32(pOp - aOp);
-            db^.autoCommit := 0;
-            v^.rc := SQLITE_BUSY;
-            goto vdbe_return;
-          end;
-          sqlite3CloseSavepoints(db);
-          rc := SQLITE_DONE;
-          goto vdbe_return;
+        end else if (db^.nVdbeWrite > 0) and (pOp^.p1 = SAVEPOINT_RELEASE) then begin
+          sqlite3VdbeError(v,
+            'cannot release savepoint - SQL statements in progress');
+          rc := SQLITE_BUSY;
         end else begin
-          { Pop savepoints down to and including pSvpt5g }
+          isTxnSvpt5g := ord((pSvpt5g^.pNext = nil)
+                          and (db^.isTransactionSavepoint <> 0));
+          if (isTxnSvpt5g <> 0) and (pOp^.p1 = SAVEPOINT_RELEASE) then begin
+            rc := sqlite3VdbeCheckFkDeferred(v);
+            if rc <> SQLITE_OK then goto vdbe_return;
+            db^.autoCommit := 1;
+            if sqlite3VdbeHalt(v) = SQLITE_BUSY then begin
+              v^.pc := i32(pOp - aOp);
+              db^.autoCommit := 0;
+              v^.rc := SQLITE_BUSY;
+              rc    := SQLITE_BUSY;
+              goto vdbe_return;
+            end;
+            rc := v^.rc;
+            if rc <> 0 then
+              db^.autoCommit := 0
+            else
+              db^.isTransactionSavepoint := 0;
+          end else begin
+            iSvpt5g := db^.nSavepoint - iSvpt5g - 1;
+            if pOp^.p1 = SAVEPOINT_ROLLBACK then begin
+              if (db^.mDbFlags and DBFLAG_SchemaChange) <> 0 then
+                isSchemaChange5g := 1
+              else
+                isSchemaChange5g := 0;
+              for iSvptii5g := 0 to db^.nDb - 1 do begin
+                rc := sqlite3BtreeTripAllCursors(PBtree(db^.aDb[iSvptii5g].pBt),
+                        SQLITE_ABORT_ROLLBACK,
+                        ord(isSchemaChange5g = 0));
+                if rc <> SQLITE_OK then goto abort_due_to_error;
+              end;
+            end else begin
+              isSchemaChange5g := 0;
+            end;
+            for iSvptii5g := 0 to db^.nDb - 1 do begin
+              rc := sqlite3BtreeSavepoint(PBtree(db^.aDb[iSvptii5g].pBt),
+                      pOp^.p1, iSvpt5g);
+              if rc <> SQLITE_OK then goto abort_due_to_error;
+            end;
+            if isSchemaChange5g <> 0 then begin
+              sqlite3ExpirePreparedStatements(db, 0);
+              sqlite3ResetAllSchemasOfConnection(db);
+              db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
+            end;
+          end;
+          if rc <> 0 then goto abort_due_to_error;
+
+          { Destroy any savepoints nested inside the one being operated on. }
           while db^.pSavepoint <> pSvpt5g do begin
-            pNewSvpt5g := db^.pSavepoint;
-            db^.pSavepoint := pNewSvpt5g^.pNext;
-            sqlite3DbFree(db, pNewSvpt5g);
+            pTmpSvpt5g       := db^.pSavepoint;
+            db^.pSavepoint   := pTmpSvpt5g^.pNext;
+            sqlite3DbFree(db, pTmpSvpt5g);
             Dec(db^.nSavepoint);
           end;
           if pOp^.p1 = SAVEPOINT_RELEASE then begin
-            { pop the named savepoint too }
+            Assert(pSvpt5g = db^.pSavepoint);
             db^.pSavepoint := pSvpt5g^.pNext;
             sqlite3DbFree(db, pSvpt5g);
-            Dec(db^.nSavepoint);
+            if isTxnSvpt5g = 0 then Dec(db^.nSavepoint);
           end else begin
-            { ROLLBACK: restore deferred cons, rollback btrees to this savepoint }
+            { ROLLBACK TO: restore deferred-FK counters from the snapshot. }
             db^.nDeferredCons    := pSvpt5g^.nDeferredCons;
             db^.nDeferredImmCons := pSvpt5g^.nDeferredImmCons;
           end;
+          if isTxnSvpt5g = 0 then begin
+            { Notify vtabs of the savepoint change. }
+            rc := sqlite3VtabSavepoint(db, pOp^.p1, iSvpt5g);
+            if rc <> SQLITE_OK then goto abort_due_to_error;
+          end;
         end;
       end;
+      if rc <> 0 then goto abort_due_to_error;
     end;
 
     { ────── OP_AutoCommit ────── (vdbe.c:4013)

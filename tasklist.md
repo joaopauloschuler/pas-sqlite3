@@ -328,8 +328,21 @@ Important: At the end of this document, please find:
         bookkeeping in `sqlite3VdbeHalt`); blocked on Phase 5.4 full
         VdbeHalt port.
       [ ] **c) `SAVEPOINT s; ...; ROLLBACK TO s` does not unwind** —
-        DiagTxn `savepoint rollback` reports Pas count=2 vs C=1.  Same
-        VdbeHalt root cause as (b) plus OP_Savepoint not wired.
+        DiagTxn `savepoint rollback`.  Partial 2026-04-29: OP_Savepoint
+        ported to a faithful 1:1 of vdbe.c:3823 (now calls
+        sqlite3BtreeTripAllCursors + sqlite3BtreeSavepoint per attached
+        db, plus sqlite3VtabSavepoint and the schema-change reload arm);
+        btreeBeginTrans (btree.c:3793) now passes db->nSavepoint to
+        sqlite3PagerOpenSavepoint instead of a hard-coded 0, so the
+        pager savepoint stack is actually populated.  Failure mode
+        flipped from "rollback no-op (count=2 vs 1)" to "subsequent
+        prepare fails with stale schema" — root cause is that
+        DBFLAG_SchemaChange is set by CREATE TABLE but never cleared at
+        commit (build.c:663/675 not yet ported into VdbeHalt /
+        sqlite3CommitInternal), so the rollback arm sees the flag and
+        triggers ResetAllSchemasOfConnection.  Closing this needs the
+        commit-time DBFLAG_SchemaChange clear plus likely memdb pager
+        savepoint reconciliation.
       [ ] **d) `INSERT OR IGNORE` / `OR REPLACE` / `OR FAIL` ignore
         conflict resolution** — DiagTxn `insert or ignore unique`,
         `insert or replace unique`, `insert or fail returns err` all

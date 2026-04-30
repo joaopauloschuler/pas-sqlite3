@@ -6302,8 +6302,16 @@ trans_begun:
   if rc = SQLITE_OK then begin
     if pSchemaVersion <> nil then
       pSchemaVersion^ := i32(get4byte(pBt^.pPage1^.aData + 40));
-    if wrflag <> 0 then
-      rc := sqlite3PagerOpenSavepoint(pPgr, 0);
+    if wrflag <> 0 then begin
+      { btree.c:3793 — make sure the pager has the correct number of open
+        savepoints.  Previously this call passed 0 unconditionally, so the
+        pager savepoint stack was never populated and ROLLBACK TO sN
+        could not unwind.  Closes 6.10 step 15(c). }
+      if (p^.db <> nil) and (PTsqlite3(p^.db)^.nSavepoint > 0) then
+        rc := sqlite3PagerOpenSavepoint(pPgr, PTsqlite3(p^.db)^.nSavepoint)
+      else
+        rc := sqlite3PagerOpenSavepoint(pPgr, 0);
+    end;
   end;
   sqlite3BtreeLeave(p);
   Result := rc;
@@ -6319,7 +6327,11 @@ begin
   else begin
     if pSchemaVersion <> nil then
       pSchemaVersion^ := i32(get4byte(p^.pBt^.pPage1^.aData + 40));
-    Result := SQLITE_OK;
+    if (wrflag <> 0) and (p^.db <> nil) then
+      Result := sqlite3PagerOpenSavepoint(p^.pBt^.pPager,
+                  PTsqlite3(p^.db)^.nSavepoint)
+    else
+      Result := SQLITE_OK;
   end;
 end;
 
