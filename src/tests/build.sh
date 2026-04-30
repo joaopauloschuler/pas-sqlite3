@@ -120,6 +120,7 @@ compile_test TestVdbeAgg
 compile_test TestVdbeTxn
 compile_test TestVdbeMisc
 compile_test TestVdbeApi
+compile_test TestPublicApi
 compile_test TestVdbeBlob
 compile_test TestVdbeSort
 compile_test TestVdbeTrace
@@ -165,6 +166,8 @@ compile_test TestWhereCorpus
 compile_test DiagPragma
 compile_test DiagPrintfFmt
 compile_test DiagExplainList
+compile_test DiagDbFileObject
+compile_test DiagDequoteToken
 compile_test TestSQLCorpus
 compile_test TestFuzzDiff
 compile_test TestReferenceVectors

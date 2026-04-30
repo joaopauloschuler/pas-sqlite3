@@ -102,6 +102,22 @@ begin
     sqlite3_finalize(pStmt);
   end;
 
+  { T5 — sqlite3_deserialize OMIT_DESERIALIZE-equivalent semantics:
+    memdb VFS is unported, so the call must fail with SQLITE_ERROR.
+    Pass nil pData/0 sizes so no FREEONCLOSE bookkeeping is exercised. }
+  ExpectEq(sqlite3_deserialize(db, 'main', nil, 0, 0, 0),
+           SQLITE_ERROR, 'T5 deserialize -> SQLITE_ERROR');
+
+  { T6 — FREEONCLOSE on failure path: pData must be freed by SQLite even
+    though deserialize fails (memdb.c:903).  Allocate via sqlite3_malloc
+    so the matched free path is exercised; nothing to assert directly,
+    but a leak would surface under valgrind / repeat runs. }
+  buf := sqlite3_malloc(64);
+  Expect(buf <> nil, 'T6 malloc');
+  ExpectEq(sqlite3_deserialize(db, 'main', buf, 0, 64,
+                               SQLITE_DESERIALIZE_FREEONCLOSE),
+           SQLITE_ERROR, 'T6 deserialize FREEONCLOSE -> SQLITE_ERROR');
+
   sqlite3_close(db);
 
   WriteLn('---');

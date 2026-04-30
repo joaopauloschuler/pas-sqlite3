@@ -294,6 +294,8 @@ const
   SQLITE_TRACE_ROW     = $04;
   SQLITE_TRACE_CLOSE   = $08;
   SQLITE_TRACE_LEGACY  = $40;
+  SQLITE_TRACE_XPROFILE        = $80;  { sqliteInt.h:1646 — legacy xProfile in use }
+  SQLITE_TRACE_NONLEGACY_MASK  = $0F;  { sqliteInt.h:1651 — public mTrace bits }
 
   { Conflict resolution actions }
   OE_None      = 0;
@@ -606,6 +608,13 @@ var
   sqlite3CtypeMap:     array[0..255] of u8;
   sqlite3GlobalConfig: TSqlite3Config;
 
+  { main.c:148 / :157 — public extern globals.  Application can override via
+    the deprecated SQLITE_DBCONFIG_TEMP_DIRECTORY / DATA_DIRECTORY pragmas
+    or by direct assignment.  C type is `char *` (mutable, may point to a
+    sqlite3_mprintf-allocated buffer that the app is expected to free). }
+  sqlite3_temp_directory: PAnsiChar = nil;
+  sqlite3_data_directory: PAnsiChar = nil;
+
 { ============================================================
   Exported function declarations
   ============================================================ }
@@ -634,6 +643,7 @@ function  sqlite3AtoF(zIn: PChar; out pResult: Double): i32;
 function  sqlite3Atoi64(zNum: PChar; out pNum: i64; length: i32; enc: u8): i32;
 function  sqlite3Int64ToText(v: i64; zOut: PChar): i32;
 function  sqlite3DecOrHexToI64(z: PChar; out pOut: i64): i32;
+function  sqlite3IsOverflow(x: Double): i32;
 
 { VList — variable name/number mapping (util.c:2155..2249).
   pVList is a packed int array; layout documented at util.c:2156. }
@@ -757,6 +767,8 @@ function sqlite3_filename_database(zFilename: PChar): PChar;
 function sqlite3_filename_journal(zFilename: PChar): PChar;
 function sqlite3_filename_wal(zFilename: PChar): PChar;
 procedure sqlite3_free_filename(p: PChar);
+function sqlite3_create_filename(zDatabase, zJournal, zWal: PChar;
+  nParam: i32; azParam: PPChar): PChar; cdecl;
 function sqlite3Atoi(z: PChar): i32;
 
 { Alignment helpers (used by pcache and btree) }
@@ -1241,6 +1253,19 @@ end;
 function sqlite3Strlen30NN(z: PChar): i32;
 begin
   Result := $3fffffff and i32(libc_strlen(z));
+end;
+
+{ sqlite3IsOverflow — port of util.c:75.  Returns 1 if the IEEE-754 double
+  is +Inf, -Inf, or NaN (exponent field == 0x7ff). }
+function sqlite3IsOverflow(x: Double): i32;
+var
+  y: u64;
+begin
+  Move(x, y, SizeOf(y));
+  if (y and (u64($7ff) shl 52)) = (u64($7ff) shl 52) then
+    Result := 1
+  else
+    Result := 0;
 end;
 
 { compare2pow63 — helper for sqlite3Atoi64 }
@@ -2877,6 +2902,53 @@ begin
   if p = nil then Exit;
   p := databaseName(p);
   sqlite3_free(p - 4);
+end;
+
+{ main.c:4806 — appendText: copy z (with terminator) into p, return p past
+  the terminator. }
+function appendText(p: PChar; z: PChar): PChar;
+var n: SizeInt;
+begin
+  n := sqlite3Strlen30(z);
+  Move(z^, p^, n + 1);
+  Result := p + n + 1;
+end;
+
+{ main.c:4821 — sqlite3_create_filename.  Build a filename buffer in the
+  layout expected by sqlite3_filename_database / _journal / _wal /
+  sqlite3_uri_parameter: 4 leading zero bytes, then the database name and
+  query parameter key/value pairs separated by NULs, an extra NUL, then
+  the journal name, the WAL name, and two trailing NULs. }
+function sqlite3_create_filename(zDatabase, zJournal, zWal: PChar;
+  nParam: i32; azParam: PPChar): PChar; cdecl;
+var
+  nByte   : i64;
+  i       : i32;
+  pResult : PChar;
+  p       : PChar;
+  azP     : PPChar;
+begin
+  nByte := sqlite3Strlen30(zDatabase) + sqlite3Strlen30(zJournal)
+         + sqlite3Strlen30(zWal) + 10;
+  azP := azParam;
+  for i := 0 to (nParam * 2) - 1 do
+    nByte := nByte + sqlite3Strlen30(azP[i]) + 1;
+  pResult := PChar(sqlite3_malloc64(u64(nByte)));
+  p := pResult;
+  if p = nil then begin Result := nil; Exit; end;
+  FillChar(p^, 4, 0);
+  p := p + 4;
+  p := appendText(p, zDatabase);
+  for i := 0 to (nParam * 2) - 1 do
+    p := appendText(p, azP[i]);
+  p^ := #0; Inc(p);
+  p := appendText(p, zJournal);
+  p := appendText(p, zWal);
+  p^ := #0; Inc(p);
+  p^ := #0; Inc(p);
+  AssertH((PtrUInt(p) - PtrUInt(pResult)) = PtrUInt(nByte),
+    'sqlite3_create_filename: byte-count mismatch');
+  Result := pResult + 4;
 end;
 
 { util.c ~1357: sqlite3Atoi -- parse integer from string }

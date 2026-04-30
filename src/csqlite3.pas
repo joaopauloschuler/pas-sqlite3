@@ -229,6 +229,9 @@ function csq_column_value(pStmt: Pcsq_stmt; i: Int32): Pcsq_value;
 function csq_errmsg(db: Pcsq_db): PChar;
     cdecl; external LIBSQLITE3 name 'sqlite3_errmsg';
 
+function csq_errmsg16(db: Pcsq_db): Pointer;
+    cdecl; external LIBSQLITE3 name 'sqlite3_errmsg16';
+
 function csq_errcode(db: Pcsq_db): Int32;
     cdecl; external LIBSQLITE3 name 'sqlite3_errcode';
 

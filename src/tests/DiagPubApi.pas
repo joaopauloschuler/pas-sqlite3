@@ -268,6 +268,18 @@ begin
   Check('db_readonly bogus = -1',
         sqlite3_db_readonly(db, 'no_such_db') = -1);
 
+  { db_filename — :memory: db reports empty path; bogus name returns nil. }
+  Check('db_filename main not nil',
+        sqlite3_db_filename(db, 'main') <> nil);
+  Check('db_filename main = ""',
+        (sqlite3_db_filename(db, 'main') <> nil) and
+        (sqlite3_db_filename(db, 'main')^ = #0));
+  Check('db_filename nil = ""',
+        (sqlite3_db_filename(db, nil) <> nil) and
+        (sqlite3_db_filename(db, nil)^ = #0));
+  Check('db_filename bogus = nil',
+        sqlite3_db_filename(db, 'no_such_db') = nil);
+
   { txn_state — fresh connection has no transaction on any attached db. }
   Check('txn_state main = NONE',
         sqlite3_txn_state(db, 'main') = 0);

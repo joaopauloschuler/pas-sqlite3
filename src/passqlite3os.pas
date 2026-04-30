@@ -575,6 +575,10 @@ function  sqlite3OsShmLock(id: Psqlite3_file; offset: cint; n: cint;
 procedure sqlite3OsShmBarrier(id: Psqlite3_file);
 function  sqlite3OsShmUnmap(id: Psqlite3_file; deleteFlag: cint): cint;
 function  sqlite3OsSleep(pVfs: Psqlite3_vfs; nMicrosec: cint): cint;
+function  sqlite3OsCurrentTimeInt64(pVfs: Psqlite3_vfs;
+                                    pTimeOut: Pi64): cint;
+function  sqlite3OsCurrentTime(pVfs: Psqlite3_vfs;
+                               pTimeOut: PDouble): cint;
 
 { ============================================================
   Section 13: VFS registration (os.c)
@@ -624,6 +628,9 @@ var
 
 implementation
 
+uses
+  passqlite3util;   { sqlite3_temp_directory, sqlite3_randomness, sqlite3_snprintf }
+
 { ============================================================
   Internal types
   ============================================================ }
@@ -657,6 +664,8 @@ function c_strerror(err: cint): PChar; cdecl;
   external 'c' name 'strerror';
 function c_fsync(fd: cint): cint; cdecl;
   external 'c' name 'fsync';
+function c_getenv(name: PAnsiChar): PAnsiChar; cdecl;
+  external 'c' name 'getenv';
 
 { ============================================================
   Private module-level variables
@@ -682,9 +691,6 @@ var
   { Per-file pthreadMutexMethods table returned by sqlite3DefaultMutex }
   pthreadMutexMethodsData : sqlite3_mutex_methods;
 
-  { Counter for generating unique temp-file names }
-  tempFileSeq : cint = 0;
-
 { ============================================================
   Forward declarations — unix I/O vtable methods (cdecl)
   ============================================================ }
@@ -705,6 +711,7 @@ function  unixFileControl_impl(pFile: Psqlite3_file; op: cint;
             pArg: Pointer): cint; cdecl; forward;
 function  unixSectorSize_impl(pFile: Psqlite3_file): cint; cdecl; forward;
 function  unixDeviceCharacteristics_impl(pFile: Psqlite3_file): cint; cdecl; forward;
+function  unixGetTempname(nBuf: cint; zBuf: PAnsiChar): cint; forward;
 
 { ============================================================
   Section 0: Memory helpers
@@ -1179,6 +1186,27 @@ end;
 function sqlite3OsSleep(pVfs: Psqlite3_vfs; nMicrosec: cint): cint;
 begin
   Result := pVfs^.xSleep(pVfs, nMicrosec);
+end;
+
+{ os.c:290 — sqlite3OsCurrentTimeInt64.  Prefer xCurrentTimeInt64 when the
+  VFS exposes iVersion>=2 with the slot wired; otherwise fall back through
+  xCurrentTime and scale the Julian-day double to milliseconds. }
+function sqlite3OsCurrentTimeInt64(pVfs: Psqlite3_vfs; pTimeOut: Pi64): cint;
+var
+  r: Double;
+begin
+  if (pVfs^.iVersion >= 2) and (pVfs^.xCurrentTimeInt64 <> nil) then
+    Result := pVfs^.xCurrentTimeInt64(pVfs, pTimeOut)
+  else begin
+    Result := pVfs^.xCurrentTime(pVfs, @r);
+    pTimeOut^ := i64(r * 86400000.0);
+  end;
+end;
+
+{ os.c — sqlite3OsCurrentTime: Julian-day-as-Double wrapper. }
+function sqlite3OsCurrentTime(pVfs: Psqlite3_vfs; pTimeOut: PDouble): cint;
+begin
+  Result := pVfs^.xCurrentTime(pVfs, pTimeOut);
 end;
 
 { ============================================================
@@ -1749,7 +1777,6 @@ var
   pInode     : PunixInodeInfo;
   ctrlFlags  : u16;
   tmpNameBuf : array[0..MAX_PATHNAME+1] of char;
-  tmpNameStr : String;
 begin
   p := PunixFile(pFile);
   FillChar(p^, SizeOf(unixFile), 0);
@@ -1767,11 +1794,14 @@ begin
 
   zName := zPath;
 
-  { Generate a temporary file name when zPath is nil (os_unix.c ~6616) }
+  { Generate a temporary file name when zPath is nil (os_unix.c:6649).  Now
+    routed through the faithful unixGetTempname port — honours
+    sqlite3_temp_directory + $SQLITE_TMPDIR + $TMPDIR + the fallback list. }
   if zName = nil then begin
-    Inc(tempFileSeq);
-    tmpNameStr := Format('/tmp/sqlite_%d_%d', [Integer(FpGetPid), tempFileSeq]);
-    StrLCopy(@tmpNameBuf[0], PChar(tmpNameStr), MAX_PATHNAME);
+    if unixGetTempname(pVfs^.mxPathname, @tmpNameBuf[0]) <> SQLITE_OK then begin
+      Result := SQLITE_IOERR_GETTEMPPATH;
+      Exit;
+    end;
     zName := @tmpNameBuf[0];
     isDelete := True;
   end;
@@ -2002,6 +2032,90 @@ begin
   Result := nByte;  { fallback: return nByte (zOut filled with zeros) }
 end;
 
+{ os_unix.c:6262 — fallback temp-directory list.  Indices [0,1] hold the
+  values of $SQLITE_TMPDIR and $TMPDIR captured at sqlite3_os_init time;
+  the remaining entries are static. }
+const
+  SQLITE_TEMP_FILE_PREFIX = 'etilqs_';
+  SQLITE_MUTEX_STATIC_TEMPDIR = SQLITE_MUTEX_STATIC_VFS1;  { sqliteInt.h:207 }
+
+var
+  azTempDirs : array[0..5] of PAnsiChar = (nil, nil,
+    '/var/tmp', '/usr/tmp', '/tmp', '.');
+
+{ os_unix.c:6274 — populate the first two slots of azTempDirs from the
+  environment.  Called once from sqlite3_os_init. }
+procedure unixTempFileInit;
+begin
+  azTempDirs[0] := c_getenv('SQLITE_TMPDIR');
+  azTempDirs[1] := c_getenv('TMPDIR');
+end;
+
+{ os_unix.c:6283 — first directory in the search order that exists, is a
+  directory, and is read-write accessible.  Mirrors the C loop exactly:
+  start with the application override, then walk azTempDirs[]. }
+function unixTempFileDir: PAnsiChar;
+var
+  i    : cuint;
+  buf  : Stat;
+  zDir : PAnsiChar;
+begin
+  i := 0;
+  zDir := sqlite3_temp_directory;
+  while True do begin
+    if (zDir <> nil)
+       and (FpStat(zDir, buf) = 0)
+       and ((buf.st_mode and S_IFMT) = S_IFDIR)
+       and (FpAccess(zDir, W_OK or X_OK) = 0) then begin
+      Result := zDir;
+      Exit;
+    end;
+    if i >= Length(azTempDirs) then break;
+    zDir := azTempDirs[i];
+    Inc(i);
+  end;
+  Result := nil;
+end;
+
+{ os_unix.c:6310 — generate a unique temporary file name in zBuf.  zBuf
+  must be allocated by the caller and at least nBuf bytes wide. }
+function unixGetTempname(nBuf: cint; zBuf: PAnsiChar): cint;
+var
+  zDir   : PAnsiChar;
+  iLimit : cint;
+  rc     : cint;
+  r      : QWord;
+  pMtx   : Psqlite3_mutex;
+begin
+  iLimit := 0;
+  rc := SQLITE_OK;
+  zBuf[0] := #0;
+  pMtx := sqlite3MutexAlloc(SQLITE_MUTEX_STATIC_TEMPDIR);
+  sqlite3_mutex_enter(pMtx);
+  zDir := unixTempFileDir;
+  if zDir = nil then begin
+    rc := SQLITE_IOERR_GETTEMPPATH;
+  end else begin
+    repeat
+      sqlite3_randomness(SizeOf(r), @r);
+      Assert(nBuf > 2);
+      { Build "<dir>/etilqs_<hex(r)>" — matches the C %s/etilqs_%llx%c
+        format (the trailing %c with arg 0 just NUL-terminates).  We
+        truncate by clamping with StrLCopy when the dir is too long. }
+      StrLCopy(zBuf, zDir, nBuf - 1);
+      StrLCat(zBuf, '/' + SQLITE_TEMP_FILE_PREFIX, nBuf - 1);
+      StrLCat(zBuf, PAnsiChar(LowerCase(IntToHex(Int64(r), 16))), nBuf - 1);
+      Inc(iLimit);
+      if iLimit > 10 then begin
+        rc := SQLITE_ERROR;
+        break;
+      end;
+    until FpAccess(zBuf, 0) <> 0;
+  end;
+  sqlite3_mutex_leave(pMtx);
+  Result := rc;
+end;
+
 { os_unix.c ~7147: unixSleep — sleep for microseconds using nanosleep }
 function unixSleep(pVfs: Psqlite3_vfs; microseconds: cint): cint; cdecl;
 var
@@ -2013,18 +2127,31 @@ begin
   Result := microseconds;
 end;
 
-{ os_unix.c ~7225: unixCurrentTime — Julian day number as a Double }
-function unixCurrentTime(pVfs: Psqlite3_vfs; pTime: PDouble): cint; cdecl;
+{ os_unix.c:7193 — unixCurrentTimeInt64.  Returns *piNow as the Julian-day
+  number times 86_400_000 (i.e. milliseconds since the proleptic Gregorian
+  epoch of noon, 24 Nov 4714 BC).  v2 VFS entry-point (iVersion>=2). }
+function unixCurrentTimeInt64(pVfs: Psqlite3_vfs; piNow: Pi64): cint; cdecl;
 const
-  unixEpoch : i64 = 210866760000000;
+  unixEpoch : i64 = 24405875 * i64(8640000);
 var
-  tv   : TTimeVal;
-  iNow : i64;
+  tv : TTimeVal;
 begin
   c_gettimeofday(@tv, nil);
-  iNow   := unixEpoch + i64(1000) * tv.tv_sec + tv.tv_usec div 1000;
-  pTime^ := iNow / 86400000.0;
+  piNow^ := unixEpoch + i64(1000) * tv.tv_sec + tv.tv_usec div 1000;
   Result := 0;
+end;
+
+{ os_unix.c:7225 — unixCurrentTime.  Julian day number as a Double; thin
+  wrapper around unixCurrentTimeInt64 (matches the C call graph 1:1). }
+function unixCurrentTime(pVfs: Psqlite3_vfs; pTime: PDouble): cint; cdecl;
+var
+  i  : i64;
+  rc : cint;
+begin
+  i := 0;
+  rc := unixCurrentTimeInt64(nil, @i);
+  pTime^ := i / 86400000.0;
+  Result := rc;
 end;
 
 { os_unix.c ~7243: unixGetLastError — return the errno from the last failed call }
@@ -2042,7 +2169,7 @@ function sqlite3_os_init: cint;
 begin
   { Fill in the singleton unixVfsObj (declared in interface section) }
   FillChar(unixVfsObj, SizeOf(unixVfsObj), 0);
-  unixVfsObj.iVersion        := 1;    { Phase 1: v1 only (no WAL/SHM/mmap) }
+  unixVfsObj.iVersion        := 2;    { v2: xCurrentTimeInt64 wired below }
   unixVfsObj.szOsFile        := SizeOf(unixFile);
   unixVfsObj.mxPathname      := MAX_PATHNAME;
   unixVfsObj.pNext           := nil;
@@ -2060,10 +2187,13 @@ begin
   unixVfsObj.xSleep          := @unixSleep;
   unixVfsObj.xCurrentTime    := @unixCurrentTime;
   unixVfsObj.xGetLastError   := @unixGetLastError;
-  unixVfsObj.xCurrentTimeInt64 := nil; { Phase 2 TODO }
+  unixVfsObj.xCurrentTimeInt64 := @unixCurrentTimeInt64;
   unixVfsObj.xSetSystemCall  := nil;
   unixVfsObj.xGetSystemCall  := nil;
   unixVfsObj.xNextSystemCall := nil;
+
+  { Capture $SQLITE_TMPDIR / $TMPDIR for unixTempFileDir's fallback list. }
+  unixTempFileInit;
 
   { Register as the default VFS }
   sqlite3_vfs_register(@unixVfsObj, 1);

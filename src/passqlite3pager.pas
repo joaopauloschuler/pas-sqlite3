@@ -339,6 +339,10 @@ type
 function isWalMode(x: i32): i32; inline;
 function isOpen(pFd: Psqlite3_file): i32; inline;
 
+{ Lowercase journal-mode name for PRAGMA journal_mode echo. Port of
+  pragma.c:289 sqlite3JournalModename. }
+function sqlite3JournalModename(eMode: i32): PAnsiChar;
+
 { 3.B.2a: Open/close/configure }
 function sqlite3PagerOpen(
   pVfs      : Psqlite3_vfs;
@@ -356,9 +360,15 @@ function  sqlite3PagerSetPagesize(pPager: PPager; pPageSize: Pu32;
             nReserve: i32): i32;
 procedure sqlite3PagerSetCachesize(pPager: PPager; mxPage: i32);
 function  sqlite3PagerSetSpillsize(pPager: PPager; mxPage: i32): i32;
+procedure sqlite3PagerSetMmapLimit(pPager: PPager; szMmap: i64);
 procedure sqlite3PagerShrink(pPager: PPager);
+function  sqlite3PagerTempSpace(pPager: PPager): Pointer;
 procedure sqlite3PagerSetFlags(pPager: PPager; pgFlags: u32);
 function  sqlite3PagerLockingMode(pPager: PPager; eMode: i32): i32;
+function  sqlite3PagerPagenumber(pPg: PDbPage): Pgno;
+function  sqlite3PagerIswriteable(pPg: PDbPage): i32;
+function  sqlite3PagerRefcount(pPager: PPager): i32;
+function  sqlite3PagerPageRefcount(pPg: PDbPage): i32;
 
 { 3.B.2a: Page access }
 function  sqlite3PagerSharedLock(pPager: PPager): i32;
@@ -378,10 +388,17 @@ function  sqlite3PagerMaxPageCount(pPager: PPager; mxPage: Pgno): Pgno;
 function  sqlite3PagerIsreadonly(pPager: PPager): u8;
 function  sqlite3PagerDataVersion(pPager: PPager): u32;
 function  sqlite3PagerIsMemdb(pPager: PPager): i32;
-function  sqlite3PagerFilename(pPager: PPager; nullIfTemp: i32): PChar;
+function  sqlite3PagerFilename(pPager: PPager; nullIfMemDb: i32): PChar;
 function  sqlite3PagerVfs(pPager: PPager): Psqlite3_vfs;
 function  sqlite3PagerFile(pPager: PPager): Psqlite3_file;
 function  sqlite3PagerJrnlFile(pPager: PPager): Psqlite3_file;
+
+{ pager.c:5090 — public API.  Given any filename pointer that lies inside
+  the buffer allocated by sqlite3PagerOpen (database, journal, or WAL
+  name), walk back to the 4-byte zero prefix that precedes the database
+  filename and read the back-pointer to the Pager that lives just before
+  it.  Returns the main database sqlite3_file. }
+function  sqlite3_database_file_object(zName: PChar): Psqlite3_file; cdecl;
 
 { 3.B.2b: Write transaction / journaling / commit / rollback }
 const
@@ -425,6 +442,10 @@ function  sqlite3PagerGetJournalMode(pPager: PPager): i32;
 function  sqlite3PagerBackupPtr(pPager: PPager): PPointer;
 { pager.c:6857 — drop every page out of the page cache. }
 procedure sqlite3PagerClearCache(pPager: PPager);
+{ pager.c:7460 — return 1 if it is safe to change the journal mode. }
+function  sqlite3PagerOkToChangeJournalMode(pPager: PPager): i32;
+{ pager.c:7473 — get/set the persistent-journal size limit (-1 = no limit). }
+function  sqlite3PagerJournalSizeLimit(pPager: PPager; iLimit: i64): i64;
 
 { Cross-unit hook: backup.c's sqlite3BackupRestart, installed by
   passqlite3backup at unit initialisation.  Faithful port of pager_reset
@@ -469,6 +490,31 @@ end;
 function isOpen(pFd: Psqlite3_file): i32; inline;
 begin
   if Assigned(pFd^.pMethods) then Result := 1 else Result := 0;
+end;
+
+{ sqlite3JournalModename — port of pragma.c:289.  Returns the lowercase
+  string name corresponding to a PAGER_JOURNALMODE_* constant, or nil
+  for an out-of-range index. }
+const
+  azJournalModeName: array[0..5] of PAnsiChar = (
+    'delete', 'persist', 'off', 'truncate', 'memory', 'wal'
+  );
+
+function sqlite3JournalModename(eMode: i32): PAnsiChar;
+begin
+  Assert(PAGER_JOURNALMODE_DELETE = 0);
+  Assert(PAGER_JOURNALMODE_PERSIST = 1);
+  Assert(PAGER_JOURNALMODE_OFF = 2);
+  Assert(PAGER_JOURNALMODE_TRUNCATE = 3);
+  Assert(PAGER_JOURNALMODE_MEMORY = 4);
+  Assert(PAGER_JOURNALMODE_WAL = 5);
+  Assert((eMode >= 0) and (eMode <= Length(azJournalModeName)));
+  if eMode = Length(azJournalModeName) then
+  begin
+    Result := nil;
+    Exit;
+  end;
+  Result := azJournalModeName[eMode];
 end;
 
 { ============================================================
@@ -2205,10 +2251,49 @@ begin
   Result := sqlite3PcacheSetSpillsize(pPager^.pPCache, mxPage);
 end;
 
+{ pager.c:3549 — sqlite3PagerSetMmapLimit. }
+procedure sqlite3PagerSetMmapLimit(pPager: PPager; szMmap: i64);
+begin
+  pPager^.szMmap := szMmap;
+  pagerFixMaplimit(pPager);
+end;
+
 { pager.c:3557 — sqlite3PagerShrink. }
 procedure sqlite3PagerShrink(pPager: PPager);
 begin
   sqlite3PcacheShrink(pPager^.pPCache);
+end;
+
+{ pager.c:3836 — sqlite3PagerTempSpace.  Returns the page-sized scratch
+  buffer allocated alongside the pager; used by btree.c freelist code. }
+function sqlite3PagerTempSpace(pPager: PPager): Pointer;
+begin
+  Result := pPager^.pTmpSpace;
+end;
+
+{ pager.c:4239 — sqlite3PagerPagenumber. }
+function sqlite3PagerPagenumber(pPg: PDbPage): Pgno;
+begin
+  Result := PPgHdr(pPg)^.pgno;
+end;
+
+{ pager.c:6258 — sqlite3PagerIswriteable. }
+function sqlite3PagerIswriteable(pPg: PDbPage): i32;
+begin
+  Result := i32(PPgHdr(pPg)^.flags and PGHDR_WRITEABLE);
+end;
+
+{ pager.c:6826 — sqlite3PagerRefcount (SQLITE_DEBUG only in C; exposed
+  unconditionally here since the Pas port has no SQLITE_DEBUG gate). }
+function sqlite3PagerRefcount(pPager: PPager): i32;
+begin
+  Result := i32(sqlite3PcacheRefCount(pPager^.pPCache));
+end;
+
+{ pager.c:6846 — sqlite3PagerPageRefcount. }
+function sqlite3PagerPageRefcount(pPg: PDbPage): i32;
+begin
+  Result := i32(sqlite3PcachePageRefcount(PPgHdr(pPg)));
 end;
 
 { pager.c ~3723: sqlite3PagerSetBusyHandler }
@@ -2784,10 +2869,15 @@ begin
   if pPager^.memDb <> 0 then Result := 1 else Result := 0;
 end;
 
-function sqlite3PagerFilename(pPager: PPager; nullIfTemp: i32): PChar;
+{ pager.c:7088 — sqlite3PagerFilename.  When nullIfMemDb is set, memory
+  / temp dbs report a static empty string (NOT NULL); callers such as
+  sqlite3_db_filename use that empty-string convention to distinguish
+  "no schema" (NULL) from "memory schema" (""). }
+function sqlite3PagerFilename(pPager: PPager; nullIfMemDb: i32): PChar;
+const zFake: array[0..0] of AnsiChar = (#0);
 begin
-  if (nullIfTemp <> 0) and (pPager^.tempFile <> 0) then
-    Result := nil
+  if (nullIfMemDb <> 0) and (pPager^.tempFile <> 0) then
+    Result := PChar(@zFake[0])
   else
     Result := pPager^.zFilename;
 end;
@@ -2805,6 +2895,22 @@ end;
 function sqlite3PagerJrnlFile(pPager: PPager): Psqlite3_file;
 begin
   Result := pPager^.jfd;
+end;
+
+{ pager.c:5090 — sqlite3_database_file_object. }
+function sqlite3_database_file_object(zName: PChar): Psqlite3_file; cdecl;
+var
+  pPgr  : PPager;
+  pBack : Pu8;
+  pName : PChar;
+begin
+  pName := zName;
+  while (pName[-1] <> #0) or (pName[-2] <> #0) or
+        (pName[-3] <> #0) or (pName[-4] <> #0) do
+    Dec(pName);
+  pBack := Pu8(pName) - 4 - SQLITE_PTRSIZE;
+  Move(pBack^, pPgr, SQLITE_PTRSIZE);
+  Result := pPgr^.fd;
 end;
 
 { pager.c: pagerReleaseMapPage stub (mmap pages) }
@@ -4635,6 +4741,32 @@ procedure sqlite3PagerClearCache(pPager: PPager);
 begin
   if pPager^.pPCache <> nil then
     sqlite3PcacheClear(pPager^.pPCache);
+end;
+
+{ pager.c:7460 — sqlite3PagerOkToChangeJournalMode.
+  Return TRUE iff it is currently safe to change the journal mode.
+  The journal mode cannot be changed once we have started writing. }
+function sqlite3PagerOkToChangeJournalMode(pPager: PPager): i32;
+begin
+  if pPager^.eState >= PAGER_WRITER_CACHEMOD then begin Result := 0; Exit; end;
+  if (isOpen(pPager^.jfd) <> 0) and (pPager^.journalOff > 0) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  Result := 1;
+end;
+
+{ pager.c:7473 — sqlite3PagerJournalSizeLimit.
+  Get or set the persistent-journal size limit.  iLimit = -1 disables. }
+function sqlite3PagerJournalSizeLimit(pPager: PPager; iLimit: i64): i64;
+begin
+  if iLimit >= -1 then
+  begin
+    pPager^.journalSizeLimit := iLimit;
+    sqlite3WalLimit(pPager^.pWal, iLimit);
+  end;
+  Result := pPager^.journalSizeLimit;
 end;
 
 { ============================================================

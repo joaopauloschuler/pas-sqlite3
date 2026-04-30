@@ -1283,7 +1283,8 @@ function  sqlite3VdbeAddOp4Dup8(v: PVdbe; op, p1, p2, p3: i32;
                                 pP4: Pu8; p4type: i32): i32;
 function  sqlite3VdbeGoto(v: PVdbe; iDest: i32): i32;
 function  sqlite3VdbeLoadString(p: PVdbe; iDest: i32; zStr: PAnsiChar): i32;
-procedure sqlite3VdbeMultiLoad(p: PVdbe; iDest: i32; zTypes: PAnsiChar);
+procedure sqlite3VdbeMultiLoad(p: PVdbe; iDest: i32; zTypes: PAnsiChar;
+                               const args: array of const);
 function  sqlite3VdbeAddFunctionCall(pParse: PParse; p1: i32; p2, p3: i32;
                                     nArg: i32; pFunc: PFuncDef; p5: i32): i32;
 function  sqlite3VdbeExplainParent(pParse: PParse): i32;
@@ -1374,6 +1375,8 @@ procedure sqlite3VdbeDelete(p: PVdbe);
 { --- vdbeapi.c — sqlite3_context introspection + auxdata (Phase 6.8.g) --- }
 function  sqlite3_context_db_handle(p: Psqlite3_context): Psqlite3;
 function  sqlite3_vtab_nochange(p: Psqlite3_context): i32;
+function  sqlite3_vtab_in_first(pVal: PMem; ppOut: PPMem): i32;
+function  sqlite3_vtab_in_next(pVal: PMem; ppOut: PPMem): i32;
 function  sqlite3_get_auxdata(pCtx: Psqlite3_context; iArg: i32): Pointer;
 procedure sqlite3_set_auxdata(pCtx: Psqlite3_context; iArg: i32;
                               pAux: Pointer; xDelete: TxDelProc);
@@ -1511,6 +1514,10 @@ type
                                 iRow: i64; flags: i32;
                                 out ppBlob: Psqlite3_blob): i32;
   TBlobReopenFn      = function(pBlob: Psqlite3_blob; iRow: i64): i32;
+  TGetTokenFn        = function(z: PByte; tokenType: Pi32): i64;
+  TValueFromExprFn   = function(db: Psqlite3; pExpr: Pointer;
+                                enc: u8; affinity: u8;
+                                out ppVal: Psqlite3_value): i32;
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
@@ -1523,12 +1530,19 @@ var
   gAnalysisLoad:           TAnalysisLoadFn;
   gBlobOpenImpl:           TBlobOpenFn;
   gBlobReopenImpl:         TBlobReopenFn;
+  gGetTokenImpl:           TGetTokenFn;  { wired by passqlite3parser at init;
+                                            used by sqlite3VdbeExpandSql to scan
+                                            host-parameter tokens. }
+  gValueFromExprImpl:      TValueFromExprFn;  { wired by passqlite3codegen —
+                                                 needs PExpr layout. }
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
 procedure sqlite3RollbackAll(pDb: PTsqlite3; tripCode: i32);
 function  sqlite3LogEst(n: u64): i16;
 function  sqlite3LogEstAdd(a: i16; b: i16): i16;
+function  sqlite3LogEstFromDouble(x: Double): i16;
+function  sqlite3LogEstToInt(x: i16): u64;
 
 procedure sqlite3ValueApplyAffinity(pVal: Psqlite3_value; aff: u8; enc: u8);
 function  sqlite3ValueText(pVal: Psqlite3_value; enc: u8): Pointer;
@@ -1589,6 +1603,19 @@ function sqlite3_column_bytes(pStmt: PVdbe; i: i32): i32;
 function sqlite3_column_bytes16(pStmt: PVdbe; i: i32): i32;
 function sqlite3_column_value(pStmt: PVdbe; i: i32): Psqlite3_value;
 function sqlite3_column_name(pStmt: PVdbe; N: i32): PAnsiChar;
+function sqlite3_column_name16(pStmt: PVdbe; N: i32): Pointer;
+function sqlite3_column_decltype(pStmt: PVdbe; N: i32): PAnsiChar;
+function sqlite3_column_decltype16(pStmt: PVdbe; N: i32): Pointer;
+function sqlite3_column_database_name(pStmt: PVdbe; N: i32): PAnsiChar;
+function sqlite3_column_database_name16(pStmt: PVdbe; N: i32): Pointer;
+function sqlite3_column_table_name(pStmt: PVdbe; N: i32): PAnsiChar;
+function sqlite3_column_table_name16(pStmt: PVdbe; N: i32): Pointer;
+function sqlite3_column_origin_name(pStmt: PVdbe; N: i32): PAnsiChar;
+function sqlite3_column_origin_name16(pStmt: PVdbe; N: i32): Pointer;
+function sqlite3_expired(pStmt: PVdbe): i32;
+function sqlite3_aggregate_count(pCtx: Psqlite3_context): i32;
+function sqlite3_transfer_bindings(pFromStmt: PVdbe; pToStmt: PVdbe): i32;
+function sqlite3_column_text16(pStmt: PVdbe; i: i32): Pointer;
 
 { sqlite3_bind_* }
 function sqlite3_bind_int(pStmt: PVdbe; i: i32; iVal: i32): i32;
@@ -1638,6 +1665,7 @@ procedure sqlite3_result_zeroblob(pCtx: Psqlite3_context; n: i32);
 function  sqlite3_result_zeroblob64(pCtx: Psqlite3_context; n: u64): i32;
 function  sqlite3_aggregate_context(pCtx: Psqlite3_context;
   nByte: i32): Pointer;
+function  sqlite3StmtCurrentTime(pCtx: Psqlite3_context): i64;
 
 { --- vdbeblob.c — incremental blob I/O (Phase 5.6) --- }
 function  sqlite3_blob_open(db: PTsqlite3; zDb, zTable, zColumn: PAnsiChar;
@@ -1700,6 +1728,17 @@ type
                                   zWhere: PAnsiChar; p5: u16): i32;
 var
   vdbeParseSchemaExec: TVdbeParseSchemaExec = nil;
+
+{ OP_SqlExec hook (vdbe.c:7064 → main.c sqlite3_exec).  Same uses-cycle
+  rationale as vdbeParseSchemaExec above; main.pas installs the pointer at
+  unit init.  Signature mirrors the productive subset of sqlite3_exec used
+  by OP_SqlExec — no callback, no callback context, just a plain SQL
+  string and an output zErrMsg slot. }
+type
+  TVdbeSqlExec = function(db: PTsqlite3; zSql: PAnsiChar;
+                          pzErrMsg: PPAnsiChar): i32;
+var
+  vdbeSqlExec: TVdbeSqlExec = nil;
 
 { --- vdbe.c Phase 5.4b helpers (exported for testing) --- }
 function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
@@ -2281,9 +2320,62 @@ begin
   Result := sqlite3VdbeAddOp4(p, OP_String8, 0, iDest, 0, zStr, 0);
 end;
 
-procedure sqlite3VdbeMultiLoad(p: PVdbe; iDest: i32; zTypes: PAnsiChar);
+procedure sqlite3VdbeMultiLoad(p: PVdbe; iDest: i32; zTypes: PAnsiChar;
+                               const args: array of const);
+{ Port of vdbeaux.c:391 sqlite3VdbeMultiLoad.  Walk zTypes left-to-right,
+  emitting OP_Integer / OP_String8 / OP_Null per character, then close with
+  OP_ResultRow over the contiguous registers iDest..iDest+i-1.  An 'X' or
+  unknown character ends the loop early and skips the OP_ResultRow.  C
+  varargs are exposed in Pas via `array of const` (TVarRec); 'i' consumes
+  one integer slot, 's' consumes one string/pointer slot. }
+var
+  i, k: i32;
+  c:    AnsiChar;
+  vr:   TVarRec;
+  pStr: PAnsiChar;
+  iVal: i32;
 begin
-  { Stub — full implementation requires va_list support (Phase 6) }
+  i := 0;
+  k := 0;
+  while True do begin
+    c := zTypes[i];
+    if c = #0 then break;
+    if c = 's' then begin
+      pStr := nil;
+      if k <= High(args) then begin
+        vr := args[k];
+        case vr.VType of
+          vtString:     pStr := PAnsiChar(@vr.VString^[1]);
+          vtAnsiString: pStr := PAnsiChar(AnsiString(vr.VAnsiString));
+          vtPChar:      pStr := vr.VPChar;
+          vtPointer:    pStr := PAnsiChar(vr.VPointer);
+          vtChar:       pStr := nil;
+        end;
+        Inc(k);
+      end;
+      if pStr = nil then
+        sqlite3VdbeAddOp4(p, OP_Null, 0, iDest + i, 0, nil, 0)
+      else
+        sqlite3VdbeAddOp4(p, OP_String8, 0, iDest + i, 0, pStr, 0);
+    end else if c = 'i' then begin
+      iVal := 0;
+      if k <= High(args) then begin
+        vr := args[k];
+        case vr.VType of
+          vtInteger:  iVal := vr.VInteger;
+          vtInt64:    iVal := i32(vr.VInt64^);
+          vtBoolean:  if vr.VBoolean then iVal := 1 else iVal := 0;
+        end;
+        Inc(k);
+      end;
+      sqlite3VdbeAddOp2(p, OP_Integer, iVal, iDest + i);
+    end else begin
+      { 'X' or unknown: skip OP_ResultRow }
+      Exit;
+    end;
+    Inc(i);
+  end;
+  sqlite3VdbeAddOp2(p, OP_ResultRow, iDest, i);
 end;
 
 function sqlite3VdbeAddFunctionCall(pParse: PParse; p1: i32; p2, p3: i32;
@@ -2967,11 +3059,257 @@ begin
   if onError = OE_Abort then sqlite3VdbeAddOp0(p, OP_Abortable);
 end;
 
-{ --- Display helpers (stubs — full implementation Phase 5.8 vdbetrace.c) --- }
+{ --- Display helpers --- }
+
+{ Phase 6.21 port — vdbeaux.c:1740 sqlite3VdbeDisplayComment.
+
+  Renders the EXPLAIN "comment" column for a single VDBE opcode.  The C
+  reference is gated on SQLITE_ENABLE_EXPLAIN_COMMENTS (which the oracle
+  build at src/tests/build.sh:53 enables); this port produces the same
+  synopsis-driven text so EXPLAIN output can be diffed against the C
+  reference once TestExplainParity expands its scope to include the
+  comment column (currently restricted to (op,p1,p2,p3,p5)).
+
+  The synopsis text is stored in a separate per-opcode table
+  (vdbeOpcodeSynopsis below) instead of being embedded in the opcode
+  name like in the C `opcodes.c` generated file — Pascal string-literal
+  arrays have no clean syntax for embedded NULs, and lookup tables of
+  192 entries are tractable enough on their own.
+
+  pOp^.zComment (the comment field carried by each opcode at codegen
+  time) is not present on the Pas TVdbeOp record (no SQLITE_DEBUG-style
+  per-instruction comments wired yet), so the zComment branches are
+  short-circuited.  When such a field is added, the corresponding
+  branches can simply be re-enabled. }
+function vdbeOpcodeSynopsis(op: i32): PAnsiChar;
+const Syn: array[0..191] of PAnsiChar = (
+  '', '', '', '', '', '',
+  'iplan=r[P3] zplan=''P4''',
+  'data=r[P3@P2]',
+  'Start at P2',
+  '', '', '', '', '', '', '', '', '',
+  'if typeof(P1.P3) in P5 goto P2',
+  'r[P2]= !r[P1]',
+  'if P1.nullRow then r[P3]=NULL, goto P2',
+  'key=r[P3@P4]', 'key=r[P3@P4]', 'key=r[P3@P4]', 'key=r[P3@P4]',
+  'if( !csr[P1] ) goto P2',
+  'key=r[P3@P4]', 'key=r[P3@P4]', 'key=r[P3@P4]', 'key=r[P3@P4]',
+  'intkey=r[P3]', 'intkey=r[P3]',
+  '', '', '', '', '',
+  'if( empty(P1) ) goto P2',
+  '', '', '',
+  'key=r[P3@P4]', 'key=r[P3@P4]',
+  'r[P3]=(r[P1] || r[P2])',
+  'r[P3]=(r[P1] && r[P2])',
+  'key=r[P3@P4]', 'key=r[P3@P4]',
+  '',
+  'r[P3]=rowset(P1)',
+  'if r[P3] in rowset(P1) goto P2',
+  '',
+  'if r[P1]==NULL goto P2',
+  'if r[P1]!=NULL goto P2',
+  'IF r[P3]!=r[P1]', 'IF r[P3]==r[P1]', 'IF r[P3]>r[P1]',
+  'IF r[P3]<=r[P1]', 'IF r[P3]<r[P1]', 'IF r[P3]>=r[P1]',
+  '',
+  'if fkctr[P1]==0 goto P2',
+  'if r[P1]>0 then r[P1]-=P3, goto P2',
+  'if r[P1]!=0 then r[P1]--, goto P2',
+  'if (--r[P1])==0 goto P2',
+  '', '',
+  'if key(P3@P4) not in filter(P1) goto P2',
+  'r[P3]=func(r[P2@NP])', 'r[P3]=func(r[P2@NP])',
+  '', '',
+  'if r[P3]=null halt',
+  '',
+  'r[P2]=P1', 'r[P2]=P4',
+  'r[P2]=''P4'' (len=P1)',
+  'r[P2]=NULL', 'r[P2..P3]=NULL', 'r[P1]=NULL',
+  'r[P2]=P4 (len=P1)',
+  'r[P2]=parameter(P1)',
+  'r[P2@P3]=r[P1@P3]', 'r[P2@P3+1]=r[P1@P3+1]',
+  'r[P2]=r[P1]', 'r[P2]=r[P1]',
+  '',
+  'output=r[P1@P2]',
+  '',
+  'r[P1]=r[P1]+P2',
+  '',
+  'affinity(r[P1])',
+  '',
+  'r[P1@P3] <-> r[P2@P3]',
+  'r[P2] = coalesce(r[P1]==TRUE,P3) ^ P4',
+  'r[P2] = 0 OR NULL',
+  'r[P3] = sqlite_offset(P1)',
+  'r[P3]=PX cursor P1 column P2',
+  'typecheck(r[P1@P2])',
+  'affinity(r[P1@P2])',
+  'r[P3]=mkrec(r[P1@P2])',
+  'r[P2]=count()',
+  '', '',
+  'r[P3]=r[P1]&r[P2]', 'r[P3]=r[P1]|r[P2]',
+  'r[P3]=r[P2]<<r[P1]', 'r[P3]=r[P2]>>r[P1]',
+  'r[P3]=r[P1]+r[P2]', 'r[P3]=r[P2]-r[P1]',
+  'r[P3]=r[P1]*r[P2]', 'r[P3]=r[P2]/r[P1]',
+  'r[P3]=r[P2]%r[P1]', 'r[P3]=r[P2]+r[P1]',
+  'root=P2 iDb=P3', 'root=P2 iDb=P3',
+  'r[P2]= ~r[P1]',
+  'root=P2 iDb=P3',
+  '',
+  'r[P2]=''P4''',
+  'nColumn=P2', 'nColumn=P2',
+  '',
+  'if( cursor[P1].ctr++ ) pc = P2',
+  'P3 columns in r[P2]',
+  '', '',
+  'Scan-ahead up to P1 rows',
+  'set P2<=seekHit<=P3',
+  'r[P2]=cursor[P1].ctr++',
+  'r[P2]=rowid',
+  'intkey=r[P3] data=r[P2]',
+  '', '', '',
+  'if key(P1)!=trim(r[P3],P4) goto P2',
+  'r[P2]=data', 'r[P2]=data',
+  'r[P2]=PX rowid of P1',
+  '', '',
+  'key=r[P2]', 'key=r[P2]',
+  'key=r[P2@P3]',
+  'Move P3 to P1.rowid if needed',
+  'r[P2]=rowid',
+  '', '', '', '',
+  'r[P2]=root iDb=P1 flags=P3',
+  '', '', '',
+  '',
+  'r[P2]=P4',
+  '', '', '',
+  'rowset(P1)=r[P2]',
+  '',
+  'fkctr[P1]+=P2',
+  'r[P1]=max(r[P1],r[P2])',
+  'if r[P1]>0 then r[P2]=r[P1]+max(0,r[P3]) else r[P2]=(-1)',
+  'accum=r[P3] inverse(r[P2@P5])',
+  'accum=r[P3] step(r[P2@P5])',
+  'accum=r[P3] step(r[P2@P5])',
+  'r[P3]=value N=P2',
+  'accum=r[P1] N=P2',
+  '', '', '',
+  'iDb=P1 root=P2 write=P3',
+  '', '', '', '', '',
+  'r[P2]=ValueList(P1,P3)',
+  'r[P3]=vcolumn(P2)',
+  '',
+  '', '',
+  'r[P1].subtype = 0',
+  'r[P2] = r[P1].subtype',
+  'r[P2].subtype = r[P1]',
+  'filter(P1) += key(P3@P4)',
+  '', '',
+  'release r[P1@P2] mask P3',
+  '', '', ''
+);
+begin
+  if (op >= 0) and (op <= 191) then
+    Result := Syn[op]
+  else
+    Result := '';
+end;
+
+function translateP(c: AnsiChar; pOp: PVdbeOp): i32; inline;
+begin
+  case c of
+    '1': Result := pOp^.p1;
+    '2': Result := pOp^.p2;
+    '3': Result := pOp^.p3;
+    '4': Result := pOp^.p4.i;
+  else   Result := i32(pOp^.p5);
+  end;
+end;
 
 function sqlite3VdbeDisplayComment(db: Psqlite3; pOp: PVdbeOp; zP4: PAnsiChar): PAnsiChar;
+var
+  zSynopsis: PAnsiChar;
+  zAlt:      array[0..49] of AnsiChar;
+  ii:        i32;
+  c:         AnsiChar;
+  v1, v2:    i32;
+  pStr:      PSqlite3Str;
+  pCtx:      Psqlite3_context;
 begin
   Result := nil;
+  zSynopsis := vdbeOpcodeSynopsis(pOp^.opcode);
+  if (zSynopsis = nil) or (zSynopsis[0] = #0) then Exit;
+
+  pStr := sqlite3_str_new(Psqlite3db(db));
+  if pStr = nil then Exit;
+
+  if (zSynopsis[0] = 'I') and (zSynopsis[1] = 'F') and (zSynopsis[2] = ' ') then begin
+    { Hand-rolled `snprintf("if %s goto P2", zSynopsis+3)` — sqlite3_snprintf
+      in this port handles only no-arg fmt strings. }
+    ii := 0;
+    zAlt[0] := 'i'; zAlt[1] := 'f'; zAlt[2] := ' ';
+    ii := 3;
+    while (zSynopsis[ii] <> #0) and (ii < SizeOf(zAlt) - 12) do begin
+      zAlt[ii] := zSynopsis[ii]; Inc(ii);
+    end;
+    zAlt[ii] := ' '; zAlt[ii+1] := 'g'; zAlt[ii+2] := 'o'; zAlt[ii+3] := 't';
+    zAlt[ii+4] := 'o'; zAlt[ii+5] := ' '; zAlt[ii+6] := 'P'; zAlt[ii+7] := '2';
+    zAlt[ii+8] := #0;
+    zSynopsis := @zAlt[0];
+  end;
+
+  ii := 0;
+  c := zSynopsis[ii];
+  while c <> #0 do begin
+    if c = 'P' then begin
+      Inc(ii);
+      c := zSynopsis[ii];
+      if c = '4' then begin
+        if zP4 <> nil then sqlite3_str_appendall(pStr, zP4);
+      end else if c = 'X' then begin
+        { pOp->zComment branch — not present in Pas TVdbeOp; skip }
+      end else begin
+        v1 := translateP(c, pOp);
+        if (zSynopsis[ii+1] = '@') and (zSynopsis[ii+2] = 'P') then begin
+          Inc(ii, 3);
+          v2 := translateP(zSynopsis[ii], pOp);
+          if (zSynopsis[ii+1] = '+') and (zSynopsis[ii+2] = '1') then begin
+            Inc(ii, 2);
+            Inc(v2);
+          end;
+          if v2 < 2 then
+            sqlite3_str_appendf(pStr, '%d', [v1])
+          else
+            sqlite3_str_appendf(pStr, '%d..%d', [v1, v1+v2-1]);
+        end else if (zSynopsis[ii+1] = '@') and (zSynopsis[ii+2] = 'N')
+                and (zSynopsis[ii+3] = 'P') then begin
+          pCtx := pOp^.p4.pCtx;
+          if (pOp^.p4type <> P4_FUNCCTX) or (pCtx^.argc = 1) then
+            sqlite3_str_appendf(pStr, '%d', [v1])
+          else if pCtx^.argc > 1 then
+            sqlite3_str_appendf(pStr, '%d..%d', [v1, v1 + i32(pCtx^.argc) - 1])
+          else if pStr^.accError = 0 then begin
+            Assert(pStr^.nChar > 2, 'DisplayComment: nChar>2 required for @NP rewind');
+            pStr^.nChar := pStr^.nChar - 2;
+            Inc(ii);
+          end;
+          Inc(ii, 3);
+        end else begin
+          sqlite3_str_appendf(pStr, '%d', [v1]);
+          if (zSynopsis[ii+1] = '.') and (zSynopsis[ii+2] = '.')
+             and (zSynopsis[ii+3] = 'P') and (zSynopsis[ii+4] = '3')
+             and (pOp^.p3 = 0) then
+            Inc(ii, 4);
+        end;
+      end;
+    end else begin
+      sqlite3_str_appendchar(pStr, 1, c);
+    end;
+    Inc(ii);
+    c := zSynopsis[ii];
+  end;
+
+  if (pStr^.accError and SQLITE_NOMEM) <> 0 then begin
+    if db <> nil then sqlite3OomFault(db);
+  end;
+  Result := sqlite3_str_finish(pStr);
 end;
 
 { sqlite3VdbeDisplayP4 — vdbeaux.c:1905.  Renders the P4 operand of an
@@ -3837,6 +4175,76 @@ begin
   Result := sqlite3_value_nochange(p^.pOut);
 end;
 
+{ valueFromValueList — vdbeapi.c:1032.  Implementation of
+  sqlite3_vtab_in_first() (bNext=0) and sqlite3_vtab_in_next() (bNext=1).
+  Reads the next row of the ephemeral b-tree backing the IN-list value
+  and decodes the single-column record into pRhs^.pOut. }
+function valueFromValueList(pVal: PMem; ppOut: PPMem; bNext: i32): i32;
+var
+  pRhs:     PValueList;
+  rc:       i32;
+  dummy:    i32;
+  sz:       u32;
+  sMem:     TMem;
+  zBuf:     Pu8;
+  iSerial:  u32;
+  iOff:     i32;
+  consumed: u8;
+  pOut:     PMem;
+begin
+  ppOut^ := nil;
+  if pVal = nil then begin Result := SQLITE_MISUSE; Exit; end;
+  if ((pVal^.flags and MEM_Dyn) = 0)
+     or (Pointer(pVal^.xDel) <> Pointer(@sqlite3VdbeValueListFree)) then
+  begin
+    Result := SQLITE_ERROR; Exit;
+  end;
+  pRhs := PValueList(pVal^.z);
+  if bNext <> 0 then
+    rc := sqlite3BtreeNext(pRhs^.pCsr, 0)
+  else begin
+    dummy := 0;
+    rc := sqlite3BtreeFirst(pRhs^.pCsr, @dummy);
+    if sqlite3BtreeEof(pRhs^.pCsr) <> 0 then rc := SQLITE_DONE;
+  end;
+  if rc = SQLITE_OK then begin
+    FillChar(sMem, SizeOf(sMem), 0);
+    sz := sqlite3BtreePayloadSize(pRhs^.pCsr);
+    rc := sqlite3VdbeMemFromBtreeZeroOffset(pRhs^.pCsr, sz, @sMem);
+    if rc = SQLITE_OK then begin
+      zBuf := Pu8(sMem.z);
+      iSerial := 0;
+      { getVarint32(&zBuf[1], iSerial) }
+      if (Pu8(zBuf + 1)^ and $80) = 0 then begin
+        iSerial  := u32(Pu8(zBuf + 1)^);
+        consumed := 1;
+      end else
+        consumed := sqlite3GetVarint32(Pu8(zBuf + 1), iSerial);
+      iOff := 1 + i32(consumed);
+      pOut := pRhs^.pOut;
+      sqlite3VdbeSerialGet(Pu8(zBuf + iOff), iSerial, pOut);
+      pOut^.enc := PTsqlite3(pOut^.db)^.enc;
+      if ((pOut^.flags and MEM_Ephem) <> 0)
+         and (sqlite3VdbeMemMakeWriteable(pOut) <> 0) then
+        rc := SQLITE_NOMEM
+      else
+        ppOut^ := pOut;
+    end;
+    sqlite3VdbeMemRelease(@sMem);
+  end;
+  Result := rc;
+end;
+
+function sqlite3_vtab_in_first(pVal: PMem; ppOut: PPMem): i32;
+begin
+  Result := valueFromValueList(pVal, ppOut, 0);
+end;
+
+function sqlite3_vtab_in_next(pVal: PMem; ppOut: PPMem): i32;
+begin
+  Result := valueFromValueList(pVal, ppOut, 1);
+end;
+
 function sqlite3_get_auxdata(pCtx: Psqlite3_context; iArg: i32): Pointer;
 var
   pAux: PAuxData;
@@ -4408,14 +4816,130 @@ begin
   Result := pOut;
 end;
 
+{ vdbeapi.c:1492 — columnName(pStmt, N, useUtf16, useType).
+  Slot stored at aColName[N + useType*nResColumn]; encoding selected by
+  useUtf16. }
+function columnName(pStmt: PVdbe; N: i32; useUtf16, useType: i32): Pointer;
+var
+  pCell: PMem;
+  off:   PtrUInt;
+begin
+  Result := nil;
+  if pStmt = nil then Exit;
+  if (N < 0) or (N >= pStmt^.nResColumn) then Exit;
+  if pStmt^.aColName = nil then Exit;
+  if (useType < 0) or (useType >= COLNAME_N) then Exit;
+  off := PtrUInt(N + useType * i32(pStmt^.nResColumn)) * SizeOf(TMem);
+  pCell := PMem(PtrUInt(pStmt^.aColName) + off);
+  if useUtf16 <> 0 then
+    Result := sqlite3ValueText(pCell, SQLITE_UTF16NATIVE)
+  else
+    Result := sqlite3ValueText(pCell, SQLITE_UTF8);
+end;
+
 function sqlite3_column_name(pStmt: PVdbe; N: i32): PAnsiChar;
 begin
-  if (pStmt = nil) or (N < 0) or (N >= pStmt^.nResColumn) then begin
-    Result := nil; Exit;
+  Result := PAnsiChar(columnName(pStmt, N, 0, COLNAME_NAME));
+end;
+
+function sqlite3_column_name16(pStmt: PVdbe; N: i32): Pointer;
+begin
+  Result := columnName(pStmt, N, 1, COLNAME_NAME);
+end;
+
+function sqlite3_column_decltype(pStmt: PVdbe; N: i32): PAnsiChar;
+begin
+  Result := PAnsiChar(columnName(pStmt, N, 0, COLNAME_DECLTYPE));
+end;
+
+function sqlite3_column_decltype16(pStmt: PVdbe; N: i32): Pointer;
+begin
+  Result := columnName(pStmt, N, 1, COLNAME_DECLTYPE);
+end;
+
+{ vdbeapi.c:1589 — sqlite3_column_database_name (SQLITE_ENABLE_COLUMN_METADATA).
+  Returns the name of the database from which a result column derives, or nil
+  if the column is an expression / constant.  The aColName slot is populated
+  by sqlite3VdbeSetColName(COLNAME_DATABASE) at codegen time. }
+function sqlite3_column_database_name(pStmt: PVdbe; N: i32): PAnsiChar;
+begin
+  Result := PAnsiChar(columnName(pStmt, N, 0, COLNAME_DATABASE));
+end;
+
+function sqlite3_column_database_name16(pStmt: PVdbe; N: i32): Pointer;
+begin
+  Result := columnName(pStmt, N, 1, COLNAME_DATABASE);
+end;
+
+{ vdbeapi.c:1603 — sqlite3_column_table_name. }
+function sqlite3_column_table_name(pStmt: PVdbe; N: i32): PAnsiChar;
+begin
+  Result := PAnsiChar(columnName(pStmt, N, 0, COLNAME_TABLE));
+end;
+
+function sqlite3_column_table_name16(pStmt: PVdbe; N: i32): Pointer;
+begin
+  Result := columnName(pStmt, N, 1, COLNAME_TABLE);
+end;
+
+{ vdbeapi.c:1617 — sqlite3_column_origin_name. }
+function sqlite3_column_origin_name(pStmt: PVdbe; N: i32): PAnsiChar;
+begin
+  Result := PAnsiChar(columnName(pStmt, N, 0, COLNAME_COLUMN));
+end;
+
+function sqlite3_column_origin_name16(pStmt: PVdbe; N: i32): Pointer;
+begin
+  Result := columnName(pStmt, N, 1, COLNAME_COLUMN);
+end;
+
+{ vdbeapi.c:29 — sqlite3_expired (SQLITE_OMIT_DEPRECATED-gated upstream).
+  Returns true if the prepared statement has been invalidated by a schema
+  change since it was prepared.  Vdbe^.expired is the same flag set by
+  sqlite3ExpirePreparedStatements; we expose it for legacy callers. }
+function sqlite3_expired(pStmt: PVdbe): i32;
+begin
+  if pStmt = nil then
+    Result := 1
+  else if (pStmt^.vdbeFlags and VDBF_EXPIRED_MASK) <> 0 then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ vdbeapi.c:1257 — sqlite3_aggregate_count (deprecated).  Returns the
+  number of times the step function of an aggregate has been called for
+  the current row, taken from the n field of the aggregate's pMem cell. }
+function sqlite3_aggregate_count(pCtx: Psqlite3_context): i32;
+begin
+  Result := pCtx^.pMem^.n;
+end;
+
+{ vdbeapi.c:1991 — sqlite3_transfer_bindings (deprecated).  Move bindings
+  from one prepared statement to another that has the same number of
+  parameters.  Both statements are flagged expired if they have any
+  expmask bits set. }
+function sqlite3_transfer_bindings(pFromStmt: PVdbe; pToStmt: PVdbe): i32;
+var
+  i: i32;
+begin
+  if pFromStmt^.nVar <> pToStmt^.nVar then begin
+    Result := SQLITE_ERROR;
+    Exit;
   end;
-  if pStmt^.aColName = nil then begin Result := nil; Exit; end;
-  Result := PAnsiChar(sqlite3ValueText(
-    pStmt^.aColName + N, SQLITE_UTF8));
+  if pToStmt^.expmask <> 0 then
+    pToStmt^.vdbeFlags := (pToStmt^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
+  if pFromStmt^.expmask <> 0 then
+    pFromStmt^.vdbeFlags := (pFromStmt^.vdbeFlags and not u32(VDBF_EXPIRED_MASK)) or 1;
+  for i := 0 to pFromStmt^.nVar - 1 do
+    sqlite3VdbeMemMove(pToStmt^.aVar + i, pFromStmt^.aVar + i);
+  Result := SQLITE_OK;
+end;
+
+{ vdbeapi.c:1431 — sqlite3_column_text16. }
+function sqlite3_column_text16(pStmt: PVdbe; i: i32): Pointer;
+begin
+  Result := sqlite3_value_text16(columnMem(pStmt, i));
 end;
 
 { --- vdbeUnbind helper (vdbeapi.c:1654) --- }
@@ -4969,6 +5493,26 @@ begin
   Result := pAggMem^.z;
 end;
 
+{ vdbeapi.c:1106 — sqlite3StmtCurrentTime.  Latch the current time for the
+  duration of one statement run so repeated calls within the same statement
+  observe the same value (e.g. multiple julianday('now') invocations in the
+  same SELECT row).  Returns 0 on VFS-side error. }
+function sqlite3StmtCurrentTime(pCtx: Psqlite3_context): i64;
+var
+  piTime: Pi64;
+  rc:     i32;
+  pVfs:   Psqlite3_vfs;
+begin
+  Assert(pCtx^.pVdbe <> nil);
+  piTime := @pCtx^.pVdbe^.iCurrentTime;
+  if piTime^ = 0 then begin
+    pVfs := Psqlite3_vfs(PTsqlite3(pCtx^.pOut^.db)^.pVfs);
+    rc := sqlite3OsCurrentTimeInt64(pVfs, piTime);
+    if rc <> 0 then piTime^ := 0;
+  end;
+  Result := piTime^;
+end;
+
 { ============================================================================
   Phase 5.6 — vdbeblob.c incremental blob I/O
 
@@ -5048,26 +5592,123 @@ end;
 { ============================================================================
   Phase 5.8 — vdbetrace.c EXPLAIN SQL expander
 
-  sqlite3VdbeExpandSql expands bound parameters in zRawSql for tracing.
-  Full implementation requires sqlite3GetToken (Phase 7 tokenizer).
-  This stub returns a heap-allocated copy of the raw SQL, which is correct
-  when there are no bound parameters (nVar=0) and is a safe degraded result
-  otherwise (the trace shows unexpanded SQL instead of crashing).
+  Faithful port of sqlite3VdbeExpandSql (vdbetrace.c:72..190).  Expands bound
+  ?, ?N, :name, $name, @name parameters into their current bindings as SQL
+  literals, suitable for tracing.  Requires sqlite3GetToken (parser); wired
+  via gGetTokenImpl to avoid a uses-cycle.
+
+  Notes vs. C:
+   * UTF-16 → UTF-8 conversion of bound text values is omitted; the trace
+     shows the raw bytes (we already call vdbeMemRenderNum-aware codecs
+     elsewhere, and tracing is debug-only).
+   * SQLITE_TRACE_SIZE_LIMIT is not defined in our build, so no truncation.
   ============================================================================ }
+
+const
+  TK_VARIABLE_TRACE = 157;  { matches passqlite3parser.TK_VARIABLE }
+
+function findNextHostParameter(zSql: PAnsiChar; pnToken: Pi64): i64;
+var
+  ttype: i32;
+  nTotal, n: i64;
+begin
+  pnToken^ := 0;
+  nTotal := 0;
+  if not Assigned(gGetTokenImpl) then
+  begin
+    { Tokenizer not yet wired (e.g. test programs that don't pull parser in):
+      no host parameters — caller copies the rest verbatim. }
+    while zSql[nTotal] <> #0 do Inc(nTotal);
+    Result := nTotal;
+    Exit;
+  end;
+  while zSql^ <> #0 do begin
+    n := gGetTokenImpl(PByte(zSql), @ttype);
+    if n <= 0 then Break;
+    if ttype = TK_VARIABLE_TRACE then begin
+      pnToken^ := n;
+      Break;
+    end;
+    Inc(nTotal, n);
+    Inc(zSql, n);
+  end;
+  Result := nTotal;
+end;
 
 function sqlite3VdbeExpandSql(p: PVdbe; zRawSql: PAnsiChar): PAnsiChar;
 var
-  n:   i32;
-  db:  PTsqlite3;
-  z:   PAnsiChar;
+  out_:       PSqlite3Str;
+  db:         PTsqlite3;
+  idx:        i32;
+  nextIndex:  i32;
+  n, nToken:  i64;
+  i:          i32;
+  pVar:       PMem;
+  zStart:     PAnsiChar;
 begin
-  if (p = nil) or (zRawSql = nil) then begin Result := nil; Exit; end;
-  db := PTsqlite3(p^.db);
-  n := sqlite3Strlen30(zRawSql);
-  z := PAnsiChar(sqlite3DbMallocZero(db, n + 1));
-  if z <> nil then
-    Move(zRawSql^, z^, n);
-  Result := z;
+  Result := nil;
+  if (p = nil) or (zRawSql = nil) then Exit;
+  db   := PTsqlite3(p^.db);
+  out_ := sqlite3_str_new(Psqlite3db(db));
+  if out_ = nil then Exit;
+
+  idx       := 0;
+  nextIndex := 1;
+
+  if db^.nVdbeExec > 1 then begin
+    { Re-entrant call (e.g. trigger fire): prefix every line with "-- ". }
+    while zRawSql^ <> #0 do begin
+      zStart := zRawSql;
+      while (zRawSql^ <> #0) and (zRawSql^ <> #10) do Inc(zRawSql);
+      if zRawSql^ = #10 then Inc(zRawSql);
+      sqlite3_str_append(out_, '-- ', 3);
+      sqlite3_str_append(out_, zStart, i32(zRawSql - zStart));
+    end;
+  end else if p^.nVar = 0 then begin
+    sqlite3_str_append(out_, zRawSql, sqlite3Strlen30(zRawSql));
+  end else begin
+    while zRawSql[0] <> #0 do begin
+      n := findNextHostParameter(zRawSql, @nToken);
+      sqlite3_str_append(out_, zRawSql, i32(n));
+      Inc(zRawSql, n);
+      if nToken = 0 then Break;
+      if zRawSql[0] = '?' then begin
+        if nToken > 1 then sqlite3GetInt32(zRawSql + 1, @idx)
+        else                 idx := nextIndex;
+      end else begin
+        idx := sqlite3VdbeParameterIndex(p, zRawSql, i32(nToken));
+      end;
+      Inc(zRawSql, nToken);
+      if idx + 1 > nextIndex then nextIndex := idx + 1;
+      if (idx <= 0) or (idx > p^.nVar) then Continue;
+      pVar := p^.aVar + (idx - 1);
+      if (pVar^.flags and MEM_Null) <> 0 then
+        sqlite3_str_append(out_, 'NULL', 4)
+      else if (pVar^.flags and (MEM_Int or MEM_IntReal)) <> 0 then
+        sqlite3_str_appendf(out_, '%lld', [pVar^.u.i])
+      else if (pVar^.flags and MEM_Real) <> 0 then
+        sqlite3_str_appendf(out_, '%!.15g', [pVar^.u.r])
+      else if (pVar^.flags and MEM_Str) <> 0 then begin
+        sqlite3_str_appendf(out_, '''%.*q''', [pVar^.n, pVar^.z]);
+      end else if (pVar^.flags and MEM_Zero) <> 0 then
+        sqlite3_str_appendf(out_, 'zeroblob(%d)', [pVar^.u.nZero])
+      else begin
+        { BLOB }
+        sqlite3_str_append(out_, 'x''', 2);
+        for i := 0 to pVar^.n - 1 do
+          sqlite3_str_appendf(out_, '%02x', [Byte(pVar^.z[i])]);
+        sqlite3_str_append(out_, '''', 1);
+      end;
+    end;
+  end;
+  if out_^.accError <> 0 then sqlite3_str_reset(out_);
+  Result := sqlite3_str_finish(out_);
+  { sqlite3_str_finish returns nil when nothing was appended; the C
+    sqlite3StrAccumFinish always returns a non-nil heap buffer (possibly
+    "" for empty input).  Mirror that. }
+  if Result = nil then begin
+    Result := PAnsiChar(sqlite3DbMallocZero(db, 1));
+  end;
 end;
 
 { ============================================================================
@@ -6260,6 +6901,9 @@ var
   nSvptName5g: i32;           { OP_Savepoint: name length }
   iSvpt5g:     i32;           { OP_Savepoint: depth counter }
   isTxnSvpt5g: i32;           { OP_Savepoint: is this a transaction savepoint? }
+  iSvptii5g:   i32;           { OP_Savepoint: per-db loop index }
+  isSchemaChange5g: i32;      { OP_Savepoint: schema-change flag }
+  pTmpSvpt5g:  PSavepoint;    { OP_Savepoint: temporary for nested-savepoint pop }
   desiredAC5g: i32;           { OP_AutoCommit: desired autocommit state }
   iRollback5g: i32;           { OP_AutoCommit: rollback flag }
   { 5.4f locals — aggregate }
@@ -6334,6 +6978,11 @@ var
   pRhsV:       PValueList;              { OP_VInitIn: ValueList object }
   pNameMem:    PMem;                    { OP_VRename: name register }
   pVCurNew:    passqlite3vtab.PSqlite3VtabCursor;  { OP_VOpen: xOpen out param }
+  { OP_SqlExec locals (vdbe.c:7064) }
+  sqlExecErr:                 PAnsiChar;
+  sqlExecXAuth:               Pointer;
+  sqlExecMTrace:              u8;
+  sqlExecSavedAnalysisLimit:  i32;
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -8233,25 +8882,39 @@ begin
     { ────── OP_Savepoint ────── (vdbe.c:3823)
       P1=SAVEPOINT_BEGIN(0)/RELEASE(1)/ROLLBACK(2), P4.z=name }
     OP_Savepoint: begin
+      { Faithful port of vdbe.c:3823.  Replaces the prior structural-only
+        port that omitted the actual sqlite3BtreeSavepoint /
+        sqlite3BtreeTripAllCursors calls (the per-db rollback/release work)
+        as well as the nVdbeWrite BUSY guards and the vtab-savepoint hook.
+        Closes 6.10 step 15(c). }
       zSvptName5g := pOp^.p4.z;
       if pOp^.p1 = SAVEPOINT_BEGIN then begin
-        nSvptName5g := sqlite3Strlen30(PChar(zSvptName5g));
-        pNewSvpt5g := PSavepoint(
-          sqlite3DbMallocRawNN(db, SizeOf(TSavepoint) + nSvptName5g + 1));
-        if pNewSvpt5g = nil then goto no_mem;
-        pNewSvpt5g^.zName := PAnsiChar(PByte(pNewSvpt5g) + SizeOf(TSavepoint));
-        Move(zSvptName5g^, pNewSvpt5g^.zName^, nSvptName5g + 1);
-        if db^.autoCommit <> 0 then begin
-          db^.autoCommit              := 0;
-          db^.isTransactionSavepoint  := 1;
-        end else
-          Inc(db^.nSavepoint);
-        pNewSvpt5g^.pNext           := db^.pSavepoint;
-        db^.pSavepoint              := pNewSvpt5g;
-        pNewSvpt5g^.nDeferredCons   := db^.nDeferredCons;
-        pNewSvpt5g^.nDeferredImmCons := db^.nDeferredImmCons;
+        if db^.nVdbeWrite > 0 then begin
+          sqlite3VdbeError(v, 'cannot open savepoint - SQL statements in progress');
+          rc := SQLITE_BUSY;
+        end else begin
+          nSvptName5g := sqlite3Strlen30(PChar(zSvptName5g));
+          rc := sqlite3VtabSavepoint(db, SAVEPOINT_BEGIN,
+                  db^.nStatement + db^.nSavepoint);
+          if rc <> SQLITE_OK then goto abort_due_to_error;
+          pNewSvpt5g := PSavepoint(
+            sqlite3DbMallocRawNN(db, SizeOf(TSavepoint) + nSvptName5g + 1));
+          if pNewSvpt5g <> nil then begin
+            pNewSvpt5g^.zName := PAnsiChar(PByte(pNewSvpt5g) + SizeOf(TSavepoint));
+            Move(zSvptName5g^, pNewSvpt5g^.zName^, nSvptName5g + 1);
+            if db^.autoCommit <> 0 then begin
+              db^.autoCommit              := 0;
+              db^.isTransactionSavepoint  := 1;
+            end else
+              Inc(db^.nSavepoint);
+            pNewSvpt5g^.pNext            := db^.pSavepoint;
+            db^.pSavepoint               := pNewSvpt5g;
+            pNewSvpt5g^.nDeferredCons    := db^.nDeferredCons;
+            pNewSvpt5g^.nDeferredImmCons := db^.nDeferredImmCons;
+          end;
+        end;
       end else begin
-        { RELEASE or ROLLBACK: find named savepoint }
+        Assert((pOp^.p1 = SAVEPOINT_RELEASE) or (pOp^.p1 = SAVEPOINT_ROLLBACK));
         iSvpt5g := 0;
         pSvpt5g := db^.pSavepoint;
         while (pSvpt5g <> nil) and
@@ -8262,41 +8925,83 @@ begin
         if pSvpt5g = nil then begin
           sqlite3VdbeError(v, 'no such savepoint');
           rc := SQLITE_ERROR;
-          goto abort_due_to_error;
-        end;
-        isTxnSvpt5g := ord((pSvpt5g^.pNext = nil) and (db^.isTransactionSavepoint <> 0));
-        if (isTxnSvpt5g <> 0) and (pOp^.p1 = SAVEPOINT_RELEASE) then begin
-          { Release of transaction savepoint: commit }
-          db^.autoCommit := 1;
-          if sqlite3VdbeHalt(v) = SQLITE_BUSY then begin
-            v^.pc := i32(pOp - aOp);
-            db^.autoCommit := 0;
-            v^.rc := SQLITE_BUSY;
-            goto vdbe_return;
-          end;
-          sqlite3CloseSavepoints(db);
-          rc := SQLITE_DONE;
-          goto vdbe_return;
+        end else if (db^.nVdbeWrite > 0) and (pOp^.p1 = SAVEPOINT_RELEASE) then begin
+          sqlite3VdbeError(v,
+            'cannot release savepoint - SQL statements in progress');
+          rc := SQLITE_BUSY;
         end else begin
-          { Pop savepoints down to and including pSvpt5g }
+          isTxnSvpt5g := ord((pSvpt5g^.pNext = nil)
+                          and (db^.isTransactionSavepoint <> 0));
+          if (isTxnSvpt5g <> 0) and (pOp^.p1 = SAVEPOINT_RELEASE) then begin
+            rc := sqlite3VdbeCheckFkDeferred(v);
+            if rc <> SQLITE_OK then goto vdbe_return;
+            db^.autoCommit := 1;
+            if sqlite3VdbeHalt(v) = SQLITE_BUSY then begin
+              v^.pc := i32(pOp - aOp);
+              db^.autoCommit := 0;
+              v^.rc := SQLITE_BUSY;
+              rc    := SQLITE_BUSY;
+              goto vdbe_return;
+            end;
+            rc := v^.rc;
+            if rc <> 0 then
+              db^.autoCommit := 0
+            else
+              db^.isTransactionSavepoint := 0;
+          end else begin
+            iSvpt5g := db^.nSavepoint - iSvpt5g - 1;
+            if pOp^.p1 = SAVEPOINT_ROLLBACK then begin
+              if (db^.mDbFlags and DBFLAG_SchemaChange) <> 0 then
+                isSchemaChange5g := 1
+              else
+                isSchemaChange5g := 0;
+              for iSvptii5g := 0 to db^.nDb - 1 do begin
+                rc := sqlite3BtreeTripAllCursors(PBtree(db^.aDb[iSvptii5g].pBt),
+                        SQLITE_ABORT_ROLLBACK,
+                        ord(isSchemaChange5g = 0));
+                if rc <> SQLITE_OK then goto abort_due_to_error;
+              end;
+            end else begin
+              isSchemaChange5g := 0;
+            end;
+            for iSvptii5g := 0 to db^.nDb - 1 do begin
+              rc := sqlite3BtreeSavepoint(PBtree(db^.aDb[iSvptii5g].pBt),
+                      pOp^.p1, iSvpt5g);
+              if rc <> SQLITE_OK then goto abort_due_to_error;
+            end;
+            if isSchemaChange5g <> 0 then begin
+              sqlite3ExpirePreparedStatements(db, 0);
+              sqlite3ResetAllSchemasOfConnection(db);
+              db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
+            end;
+          end;
+          if rc <> 0 then goto abort_due_to_error;
+
+          { Destroy any savepoints nested inside the one being operated on. }
           while db^.pSavepoint <> pSvpt5g do begin
-            pNewSvpt5g := db^.pSavepoint;
-            db^.pSavepoint := pNewSvpt5g^.pNext;
-            sqlite3DbFree(db, pNewSvpt5g);
+            pTmpSvpt5g       := db^.pSavepoint;
+            db^.pSavepoint   := pTmpSvpt5g^.pNext;
+            sqlite3DbFree(db, pTmpSvpt5g);
             Dec(db^.nSavepoint);
           end;
           if pOp^.p1 = SAVEPOINT_RELEASE then begin
-            { pop the named savepoint too }
+            Assert(pSvpt5g = db^.pSavepoint);
             db^.pSavepoint := pSvpt5g^.pNext;
             sqlite3DbFree(db, pSvpt5g);
-            Dec(db^.nSavepoint);
+            if isTxnSvpt5g = 0 then Dec(db^.nSavepoint);
           end else begin
-            { ROLLBACK: restore deferred cons, rollback btrees to this savepoint }
+            { ROLLBACK TO: restore deferred-FK counters from the snapshot. }
             db^.nDeferredCons    := pSvpt5g^.nDeferredCons;
             db^.nDeferredImmCons := pSvpt5g^.nDeferredImmCons;
           end;
+          if isTxnSvpt5g = 0 then begin
+            { Notify vtabs of the savepoint change. }
+            rc := sqlite3VtabSavepoint(db, pOp^.p1, iSvpt5g);
+            if rc <> SQLITE_OK then goto abort_due_to_error;
+          end;
         end;
       end;
+      if rc <> 0 then goto abort_due_to_error;
     end;
 
     { ────── OP_AutoCommit ────── (vdbe.c:4013)
@@ -9138,9 +9843,34 @@ begin
       pOut^.u.i := 0;
     end;
 
-    { ────── OP_SqlExec ────── (vdbe.c:7064) — stub }
+    { ────── OP_SqlExec ────── (vdbe.c:7064) }
     OP_SqlExec: begin
-      { Stub: requires sqlite3_exec which needs Phase 6 }
+      sqlite3VdbeIncrWriteCounter(v, nil);
+      Inc(db^.nSqlExec);
+      sqlExecErr := nil;
+      sqlExecXAuth := db^.xAuth;
+      sqlExecMTrace := db^.mTrace;
+      sqlExecSavedAnalysisLimit := db^.nAnalysisLimit;
+      if (pOp^.p1 and $0001) <> 0 then begin
+        db^.xAuth := nil;
+        db^.mTrace := 0;
+      end;
+      if (pOp^.p1 and $0002) <> 0 then
+        db^.nAnalysisLimit := pOp^.p2;
+      if vdbeSqlExec <> nil then
+        rc := vdbeSqlExec(db, pOp^.p4.z, @sqlExecErr)
+      else
+        rc := SQLITE_OK;
+      Dec(db^.nSqlExec);
+      db^.xAuth := sqlExecXAuth;
+      db^.mTrace := sqlExecMTrace;
+      db^.nAnalysisLimit := sqlExecSavedAnalysisLimit;
+      if (sqlExecErr <> nil) or (rc <> SQLITE_OK) then begin
+        sqlite3VdbeError(v, sqlExecErr);
+        sqlite3_free(sqlExecErr);
+        if rc = SQLITE_NOMEM then goto no_mem;
+        goto abort_due_to_error;
+      end;
     end;
 
     { ────── OP_IntegrityCk ────── — stub }
@@ -10548,16 +11278,19 @@ begin
 end;
 
 { -----------------------------------------------------------------------
-  sqlite3VdbeMemCast — cast value to affinity (stub for complex cases)
+  sqlite3VdbeMemCast — cast value to affinity (vdbemem.c:926).
+  Casting is different from applying affinity in that a cast is forced.
+  Used to implement the SQL "cast()" operator.
   ----------------------------------------------------------------------- }
 function sqlite3VdbeMemCast(pMem: PMem; aff: u8; encoding: u8): i32;
+var
+  rc: i32;
 begin
   if (pMem^.flags and MEM_Null) <> 0 then begin Result := SQLITE_OK; Exit; end;
   case aff of
     SQLITE_AFF_BLOB: begin
       if (pMem^.flags and MEM_Blob) = 0 then begin
-        { attempt text conversion then mark as blob }
-        sqlite3VdbeMemStringify(pMem, encoding, 0);
+        sqlite3ValueApplyAffinity(pMem, SQLITE_AFF_TEXT, encoding);
         if (pMem^.flags and MEM_Str) <> 0 then
           memSetTypeFlag(pMem, MEM_Blob);
       end else
@@ -10570,17 +11303,15 @@ begin
     SQLITE_AFF_REAL:
       sqlite3VdbeMemRealify(pMem);
     else begin { SQLITE_AFF_TEXT }
-      { vdbemem.c:951..962 — set MEM_Str via the MEM_Blob>>3 trick so a
-        BLOB is reinterpreted in place as TEXT, then ApplyAffinity-TEXT
-        only stringifies a numeric value (its MEM_Str|MEM_Blob early-out
-        leaves an existing string/blob payload untouched).  Calling
-        MemStringify directly was wrong: it always re-rendered as a
-        number and overwrote the blob bytes. }
+      { vdbemem.c:951..962 — assert( MEM_Str==(MEM_Blob>>3) ); reinterpret
+        a BLOB payload as TEXT via the bit-shift trick, then ApplyAffinity
+        only stringifies non-string/non-blob payloads. }
       pMem^.flags := pMem^.flags or ((pMem^.flags and MEM_Blob) shr 3);
       sqlite3ValueApplyAffinity(pMem, SQLITE_AFF_TEXT, encoding);
       pMem^.flags := pMem^.flags and not u16(MEM_Int or MEM_Real or MEM_IntReal or MEM_Blob or MEM_Zero);
       if encoding <> SQLITE_UTF8 then pMem^.n := pMem^.n and not 1;
-      sqlite3VdbeChangeEncoding(pMem, encoding);
+      rc := sqlite3VdbeChangeEncoding(pMem, encoding);
+      if rc <> 0 then begin Result := rc; Exit; end;
       sqlite3VdbeMemZeroTerminateIfAble(pMem);
     end;
   end;
@@ -11161,6 +11892,41 @@ begin
   end;
 end;
 
+{ util.c:2125 — Convert a double into a LogEst, i.e. compute an
+  approximation for 10*log2(x).  Uses the integer LogEst path for
+  values up to 2e9; above that, decode the IEEE-754 binary64 exponent
+  directly from the bit pattern. }
+function sqlite3LogEstFromDouble(x: Double): i16;
+var
+  a: u64;
+  e: i16;
+begin
+  if x <= 1 then begin Result := 0; Exit; end;
+  if x <= 2000000000 then begin Result := sqlite3LogEst(u64(Trunc(x))); Exit; end;
+  Move(x, a, 8);
+  e := i16((a shr 52) - 1022);
+  Result := i16(e * 10);
+end;
+
+{ util.c:2139 — Convert a LogEst into an integer.  Inverse of
+  sqlite3LogEst (within the rounding precision of LogEst). }
+function sqlite3LogEstToInt(x: i16): u64;
+var
+  n: u64;
+  xi: i32;
+begin
+  xi := x;
+  n  := u64(xi mod 10);
+  xi := xi div 10;
+  if n >= 5 then n := n - 2
+  else if n >= 1 then n := n - 1;
+  if xi > 60 then begin Result := u64(LARGEST_INT64); Exit; end;
+  if xi >= 3 then
+    Result := (n + 8) shl (xi - 3)
+  else
+    Result := (n + 8) shr (3 - xi);
+end;
+
 { -----------------------------------------------------------------------
   sqlite3ValueApplyAffinity — stub (affinity logic in codegen, Phase 6)
   ----------------------------------------------------------------------- }
@@ -11519,14 +12285,22 @@ begin
 end;
 
 { -----------------------------------------------------------------------
-  sqlite3ValueFromExpr — stub (Expr not yet ported, Phase 6)
+  sqlite3ValueFromExpr — vdbemem.c:1978.  Dispatches to the codegen
+  trampoline that has visibility into the PExpr layout.  When the hook
+  is unwired (codegen-less test harnesses) returns NULL — the documented
+  fallback for "expression cannot be converted to a value".  Body lives
+  at passqlite3codegen.valueFromExprTrampoline.
   ----------------------------------------------------------------------- }
 function sqlite3ValueFromExpr(db: Psqlite3; pExpr: Pointer;
                               enc: u8; affinity: u8;
                               out ppVal: Psqlite3_value): i32;
 begin
   ppVal := nil;
-  Result := SQLITE_OK;
+  if pExpr = nil then begin Result := 0; Exit; end;
+  if Assigned(gValueFromExprImpl) then
+    Result := gValueFromExprImpl(db, pExpr, enc, affinity, ppVal)
+  else
+    Result := SQLITE_OK;
 end;
 
 { -----------------------------------------------------------------------
