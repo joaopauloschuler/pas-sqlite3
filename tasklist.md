@@ -228,6 +228,18 @@ Important: At the end of this document, please find:
             tail-return through it.  Faithful 1:1; not yet wired into
             consumers (planner cost model + a few error sites still use
             inline equivalents) but exposed for downstream wiring.
+       [X] `sqlite3TouchRegister` + `sqlite3ClearTempRegCache` +
+            `sqlite3FirstAvailableRegister` (expr.c:7637/:7646/:7657) +
+            `sqlite3KeyInfoIsWriteable` (select.c:1581) +
+            `sqlite3JournalModename` (pragma.c:289) — ported 2026-04-30.
+            Tiny accessor batch.  Register helpers go in
+            passqlite3codegen.pas next to sqlite3GetTempReg/GetTempRange;
+            JournalModename lives in passqlite3pager.pas alongside
+            isWalMode.  Faithful 1:1; not yet wired into consumers (a
+            few inline `pParse^.nMem := ...` and explicit
+            nTempReg/nRangeReg resets remain in codegen) but exposed
+            for downstream wiring.  TestExplainParity unchanged
+            (1016/1026).
 
 ### Open Bugs
 

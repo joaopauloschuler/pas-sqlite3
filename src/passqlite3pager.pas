@@ -339,6 +339,10 @@ type
 function isWalMode(x: i32): i32; inline;
 function isOpen(pFd: Psqlite3_file): i32; inline;
 
+{ Lowercase journal-mode name for PRAGMA journal_mode echo. Port of
+  pragma.c:289 sqlite3JournalModename. }
+function sqlite3JournalModename(eMode: i32): PAnsiChar;
+
 { 3.B.2a: Open/close/configure }
 function sqlite3PagerOpen(
   pVfs      : Psqlite3_vfs;
@@ -486,6 +490,31 @@ end;
 function isOpen(pFd: Psqlite3_file): i32; inline;
 begin
   if Assigned(pFd^.pMethods) then Result := 1 else Result := 0;
+end;
+
+{ sqlite3JournalModename — port of pragma.c:289.  Returns the lowercase
+  string name corresponding to a PAGER_JOURNALMODE_* constant, or nil
+  for an out-of-range index. }
+const
+  azJournalModeName: array[0..5] of PAnsiChar = (
+    'delete', 'persist', 'off', 'truncate', 'memory', 'wal'
+  );
+
+function sqlite3JournalModename(eMode: i32): PAnsiChar;
+begin
+  Assert(PAGER_JOURNALMODE_DELETE = 0);
+  Assert(PAGER_JOURNALMODE_PERSIST = 1);
+  Assert(PAGER_JOURNALMODE_OFF = 2);
+  Assert(PAGER_JOURNALMODE_TRUNCATE = 3);
+  Assert(PAGER_JOURNALMODE_MEMORY = 4);
+  Assert(PAGER_JOURNALMODE_WAL = 5);
+  Assert((eMode >= 0) and (eMode <= Length(azJournalModeName)));
+  if eMode = Length(azJournalModeName) then
+  begin
+    Result := nil;
+    Exit;
+  end;
+  Result := azJournalModeName[eMode];
 end;
 
 { ============================================================

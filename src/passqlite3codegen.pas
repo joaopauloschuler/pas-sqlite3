@@ -2781,6 +2781,10 @@ function  sqlite3GetTempReg(pParse: PParse): i32;
 procedure sqlite3ReleaseTempReg(pParse: PParse; iReg: i32);
 function  sqlite3GetTempRange(pParse: PParse; nReg: i32): i32;
 procedure sqlite3ReleaseTempRange(pParse: PParse; iReg: i32; nReg: i32);
+procedure sqlite3TouchRegister(pParse: PParse; iReg: i32);
+procedure sqlite3ClearTempRegCache(pParse: PParse);
+function  sqlite3FirstAvailableRegister(pParse: PParse; iMin: i32): i32;
+function  sqlite3KeyInfoIsWriteable(p: PKeyInfo2): i32;
 procedure sqlite3HaltConstraint(pParse: PParse; errCode: i32;
   onError: i32; p4: PAnsiChar; p4type: i8; p5: u8);
 procedure sqlite3UniqueConstraint(pParse: PParse; onError: i32;
@@ -27554,6 +27558,46 @@ begin
     pParse^.nRangeReg := nReg;
     pParse^.iRangeReg := iReg;
   end;
+end;
+
+{ sqlite3TouchRegister — port of expr.c:7646. }
+procedure sqlite3TouchRegister(pParse: PParse; iReg: i32);
+begin
+  if pParse^.nMem < iReg then pParse^.nMem := iReg;
+end;
+
+{ sqlite3ClearTempRegCache — port of expr.c:7637. }
+procedure sqlite3ClearTempRegCache(pParse: PParse);
+begin
+  pParse^.nTempReg  := 0;
+  pParse^.nRangeReg := 0;
+end;
+
+{ sqlite3FirstAvailableRegister — port of expr.c:7657 (gated under
+  SQLITE_ENABLE_STAT4 || SQLITE_DEBUG in C; exposed unconditionally here). }
+function sqlite3FirstAvailableRegister(pParse: PParse; iMin: i32): i32;
+var
+  pList: PExprList;
+  pItems: PExprListItem;
+  i: i32;
+begin
+  pList := pParse^.pConstExpr;
+  if pList <> nil then
+  begin
+    pItems := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+      if pItems[i].u.iConstExprReg >= iMin then
+        iMin := pItems[i].u.iConstExprReg + 1;
+  end;
+  pParse^.nTempReg  := 0;
+  pParse^.nRangeReg := 0;
+  Result := iMin;
+end;
+
+{ sqlite3KeyInfoIsWriteable — port of select.c:1581. }
+function sqlite3KeyInfoIsWriteable(p: PKeyInfo2): i32;
+begin
+  if p^.nRef = 1 then Result := 1 else Result := 0;
 end;
 
 { sqlite3HaltConstraint — port of build.c:5448.
