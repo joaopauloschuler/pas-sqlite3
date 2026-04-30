@@ -519,7 +519,18 @@ Important: At the end of this document, please find:
             rename PASS→FAIL: prepare now exercises sqlite3NestedParse
             which is still skeleton (Phase 7.1.2), same trajectory as
             ADD COLUMN.  Closing depends on full sqlite3NestedParse.
-       [ ] Port `sqlite3AlterRenameColumn`
+       [X] Port `sqlite3AlterRenameColumn` — ported 2026-04-30 (alter.c:599)
+            in passqlite3codegen.pas.  Replaces the Phase 6.5 stub.  Locates
+            the target table, runs isAlterableTable + isRealTable, resolves
+            the column index via sqlite3ColumnIndex, then issues the
+            renameTestSchema/renameFixQuotes pair followed by two
+            sqlite3NestedParse() UPDATEs that drive sqlite_rename_column()
+            over the schema (main + temp), and finishes with
+            renameReloadSchema(..., INITFLAG_AlterRename) + after-rename
+            test.  Static helper `renameFixQuotes` (alter.c:90) ported
+            alongside.  Live alongside Phase 7.1.2 (full sqlite3NestedParse).
+            TestExplainParity unchanged (1016/1026); DiagFeatureProbe
+            unchanged (9 divergences).
        [ ] Port `sqlite3AlterDropColumn`
        [X] Port `sqlite3AlterDropConstraint` — ported 2026-04-30 (alter.c:2783)
             in passqlite3codegen.pas.  Replaces the Phase 7 stub.  Routes

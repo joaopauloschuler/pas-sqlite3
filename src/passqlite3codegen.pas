@@ -28571,12 +28571,6 @@ exit_rename_table:
   sqlite3DbFree(db, zName);
 end;
 
-procedure sqlite3AlterRenameColumn(pParse: PParse; pSrc: PSrcList;
-  const pOld: PToken; const pNew: PToken);
-begin
-  sqlite3SrcListDelete(pParse^.db, pSrc);
-end;
-
 procedure sqlite3AlterDropColumn(pParse: PParse; pSrc: PSrcList;
   const pName: PToken);
 begin
@@ -28605,6 +28599,113 @@ begin
     Exit(1);
   end;
   Result := 0;
+end;
+
+{ alter.c:90 — renameFixQuotes.  Generate VM code (via sqlite3NestedParse) that
+  rewrites the `sql` column of sqlite_schema to replace double-quoted strings
+  (but not double-quoted identifiers) with their single-quoted equivalents.
+  Static in C; unit-level here.  Faithful 1:1. }
+procedure renameFixQuotes(pParse: PParse; zDb: PAnsiChar; bTemp: i32);
+begin
+  sqlite3NestedParse(pParse,
+    'UPDATE "%w".' + LEGACY_SCHEMA_TABLE
+    + ' SET sql = sqlite_rename_quotefix(%Q, sql)'
+    + ' WHERE name NOT LIKE ''sqliteX_%%'' ESCAPE ''X'''
+    + ' AND sql NOT LIKE ''create virtual%%''',
+    [zDb, zDb]);
+  if bTemp = 0 then
+    sqlite3NestedParse(pParse,
+      'UPDATE temp.' + LEGACY_SCHEMA_TABLE
+      + ' SET sql = sqlite_rename_quotefix(''temp'', sql)'
+      + ' WHERE name NOT LIKE ''sqliteX_%%'' ESCAPE ''X'''
+      + ' AND sql NOT LIKE ''create virtual%%''',
+      []);
+end;
+
+{ alter.c:599 — sqlite3AlterRenameColumn.  Generate VDBE code for
+  ALTER TABLE <pSrc> RENAME COLUMN <pOld> TO <pNew>.  Locates the table,
+  validates alterable + real, resolves the column index, runs the rename
+  test/quote-fix passes, then issues two sqlite3NestedParse() UPDATEs that
+  drive sqlite_rename_column() over the schema (main + temp), and finishes
+  with renameReloadSchema + after-rename test.  Faithful 1:1. }
+procedure sqlite3AlterRenameColumn(pParse: PParse; pSrc: PSrcList;
+  const pOld: PToken; const pNew: PToken);
+label
+  exit_rename_column;
+var
+  db:      PTsqlite3;
+  pTab:    PTable2;
+  iCol:    i32;
+  zOld:    PAnsiChar;
+  zNew:    PAnsiChar;
+  zDb:     PAnsiChar;
+  iSchema: i32;
+  bQuote:  i32;
+  sItems:  PSrcItem;
+  c:       AnsiChar;
+begin
+  db   := pParse^.db;
+  zOld := nil;
+  zNew := nil;
+
+  sItems := SrcListItems(pSrc);
+  pTab := sqlite3LocateTableItem(pParse, 0, @sItems[0]);
+  if pTab = nil then goto exit_rename_column;
+
+  if isAlterableTable(pParse, pTab) <> 0 then goto exit_rename_column;
+  if isRealTable(pParse, pTab, 0) <> 0 then goto exit_rename_column;
+
+  iSchema := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  AssertH(iSchema >= 0, 'AlterRenameColumn: iSchema<0');
+  zDb := db^.aDb[iSchema].zDbSName;
+
+  if sqlite3AuthCheck(pParse, SQLITE_ALTER_TABLE, zDb, pTab^.zName, nil) <> 0 then
+    goto exit_rename_column;
+
+  zOld := sqlite3DbStrNDup(db, pOld^.z, u64(pOld^.n));
+  if zOld = nil then goto exit_rename_column;
+  sqlite3Dequote(zOld);
+  iCol := sqlite3ColumnIndex(pTab, zOld);
+  if iCol < 0 then begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'no such column: "%T"', [pOld]));
+    goto exit_rename_column;
+  end;
+
+  renameTestSchema(pParse, zDb, i32(Ord(iSchema = 1)), '', 0);
+  renameFixQuotes(pParse, zDb, i32(Ord(iSchema = 1)));
+
+  sqlite3MayAbort(pParse);
+  zNew := sqlite3DbStrNDup(db, pNew^.z, u64(pNew^.n));
+  if zNew = nil then goto exit_rename_column;
+  sqlite3Dequote(zNew);
+  AssertH(pNew^.n > 0, 'AlterRenameColumn: pNew^.n<=0');
+  c := pNew^.z[0];
+  if (c = '"') or (c = '''') or (c = '`') or (c = '[') then
+    bQuote := 1 else bQuote := 0;
+
+  sqlite3NestedParse(pParse,
+    'UPDATE "%w".' + LEGACY_SCHEMA_TABLE + ' SET '
+    + 'sql = sqlite_rename_column(sql, type, name, %Q, %Q, %d, %Q, %d, %d) '
+    + 'WHERE name NOT LIKE ''sqliteX_%%'' ESCAPE ''X'''
+    + ' AND (type != ''index'' OR tbl_name = %Q)',
+    [zDb,
+     zDb, pTab^.zName, iCol, zNew, bQuote, i32(Ord(iSchema = 1)),
+     pTab^.zName]);
+
+  sqlite3NestedParse(pParse,
+    'UPDATE temp.' + LEGACY_SCHEMA_TABLE + ' SET '
+    + 'sql = sqlite_rename_column(sql, type, name, %Q, %Q, %d, %Q, %d, 1) '
+    + 'WHERE type IN (''trigger'', ''view'')',
+    [zDb, pTab^.zName, iCol, zNew, bQuote]);
+
+  renameReloadSchema(pParse, iSchema, INITFLAG_AlterRename);
+  renameTestSchema(pParse, zDb, i32(Ord(iSchema = 1)), 'after rename', 1);
+
+exit_rename_column:
+  sqlite3SrcListDelete(db, pSrc);
+  sqlite3DbFree(db, zOld);
+  sqlite3DbFree(db, zNew);
 end;
 
 { alter.c:2742 — alterFindTable.  Look up the table named by the first entry
