@@ -306,6 +306,20 @@ Important: At the end of this document, please find:
             from no-op to faithful 1:1 once FK enforcement is on.
             TestExplainParity unchanged (1016/1026); DiagFeatureProbe
             unchanged (9 divergences).
+       [X] `sqlite3SchemaGet` (callback.c:530) — ported 2026-04-30 in
+            passqlite3codegen.pas.  Previously the pBt<>nil arm returned
+            nil ("Phase 7: look up schema from btree"); now wires through
+            sqlite3BtreeSchema (passqlite3btree:7185) with sqlite3SchemaClear
+            as the per-BtShared destructor, so re-entries on the same
+            connection return the same Schema.  Also moves the hash-init /
+            enc=UTF8 to the file_format==0 guard (matches C: a re-fetched
+            populated schema must not re-init its hashes), drops the
+            non-C SQLITE_DEFAULT_CACHE_SIZE assignment (cache_size is set
+            via PRAGMA dispatch and the readers at codegen.pas:29832/:29853
+            are already guarded by `<> 0`), and routes OOM through
+            sqlite3OomFault.  TestExplainParity unchanged (1016/1026);
+            DiagFeatureProbe unchanged (9 divergences); TestPager 12/12
+            PASS; TestSchemaBasic 44/0 PASS.
 
 ### Open Bugs
 

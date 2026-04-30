@@ -30485,23 +30485,30 @@ begin
     not (DB_SchemaLoaded or DB_ResetWanted);
 end;
 
+{ callback.c:530 — Find/return the Schema associated with a Btree.  Allocates
+  a new Schema (via sqlite3BtreeSchema for btree-backed dbs, or plain
+  sqlite3DbMallocZero(0,...) for the temp/no-btree case).  Hashes are
+  initialised lazily on file_format==0 so a freshly-zeroed schema is
+  recognised vs. a re-fetched populated one. }
 function sqlite3SchemaGet(db: PTsqlite3; pBt: Pointer): PSchema;
 var
   p: passqlite3util.PSchema;
 begin
-  if pBt = nil then begin
-    p := passqlite3util.PSchema(sqlite3DbMallocZero(db, SizeOf(TSchema)));
-    if p <> nil then begin
-      sqlite3HashInit(@p^.tblHash);
-      sqlite3HashInit(@p^.idxHash);
-      sqlite3HashInit(@p^.trigHash);
-      sqlite3HashInit(@p^.fkeyHash);
-      p^.enc := SQLITE_UTF8;
-      p^.cache_size := SQLITE_DEFAULT_CACHE_SIZE;
-    end;
-    Result := p;
-  end else
-    Result := nil; { Phase 7: look up schema from btree }
+  if pBt <> nil then
+    p := passqlite3util.PSchema(passqlite3btree.sqlite3BtreeSchema(
+           passqlite3btree.PBtree(pBt), SizeOf(TSchema), @sqlite3SchemaClear))
+  else
+    p := passqlite3util.PSchema(sqlite3DbMallocZero(nil, SizeOf(TSchema)));
+  if p = nil then
+    sqlite3OomFault(db)
+  else if p^.file_format = 0 then begin
+    sqlite3HashInit(@p^.tblHash);
+    sqlite3HashInit(@p^.idxHash);
+    sqlite3HashInit(@p^.trigHash);
+    sqlite3HashInit(@p^.fkeyHash);
+    p^.enc := SQLITE_UTF8;
+  end;
+  Result := p;
 end;
 
 { sqlite3InstallSchemaTable — bootstrap sqlite_master into pSchema^.tblHash for
