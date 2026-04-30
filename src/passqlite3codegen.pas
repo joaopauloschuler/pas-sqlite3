@@ -28070,9 +28070,97 @@ begin
   { Phase 7 }
 end;
 
-procedure sqlite3AlterBeginAddColumn(pParse: PParse; pSrc: PSrcList);
+{ alter.c:31 — isAlterableTable.  Returns 1 (and posts an error) when the
+  named table is a system table (sqlite_*), an eponymous virtual table, or
+  a write-protected shadow table.  Static in C; unit-level here. }
+function isAlterableTable(pParse: PParse; pTab: PTable2): i32;
 begin
-  sqlite3SrcListDelete(pParse^.db, pSrc);
+  if (sqlite3_strnicmp(pTab^.zName, 'sqlite_', 7) = 0)
+     or ((pTab^.tabFlags and TF_Eponymous) <> 0)
+     or (((pTab^.tabFlags and TF_Shadow) <> 0)
+         and (sqlite3ReadOnlyShadowTables(pParse^.db) <> 0)) then
+  begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+      'table %s may not be altered', [pTab^.zName]));
+    Exit(1);
+  end;
+  Result := 0;
+end;
+
+{ alter.c:483 — sqlite3AlterBeginAddColumn.  Parser-side handler for the
+  ALTER TABLE ... ADD COLUMN syntax: clone the target Table into
+  pParse^.pNewTable under the synthetic name "sqlite_altertab_<orig>" so
+  the column being added can be appended via the regular sqlite3AddColumn
+  pipeline; sqlite3AlterFinishAddColumn (still stub) commits the result. }
+procedure sqlite3AlterBeginAddColumn(pParse: PParse; pSrc: PSrcList);
+label
+  exit_begin_add_column;
+var
+  pNew:   PTable2;
+  pTab:   PTable2;
+  iDb:    i32;
+  i:      i32;
+  nAlloc: i32;
+  db:     PTsqlite3;
+  pCol:   PColumn;
+  sItems: PSrcItem;
+begin
+  db := pParse^.db;
+  AssertH(pParse^.pNewTable = nil, 'AlterBeginAddColumn: pNewTable not nil');
+  if db^.mallocFailed <> 0 then goto exit_begin_add_column;
+
+  sItems := SrcListItems(pSrc);
+  pTab := sqlite3LocateTableItem(pParse, 0, @sItems[0]);
+  if pTab = nil then goto exit_begin_add_column;
+
+  if pTab^.eTabType = TABTYP_VTAB then begin
+    sqlite3ErrorMsg(pParse, 'virtual tables may not be altered');
+    goto exit_begin_add_column;
+  end;
+  if IsView(pTab) then begin
+    sqlite3ErrorMsg(pParse, 'Cannot add a column to a view');
+    goto exit_begin_add_column;
+  end;
+  if isAlterableTable(pParse, pTab) <> 0 then
+    goto exit_begin_add_column;
+
+  sqlite3MayAbort(pParse);
+  AssertH(pTab^.eTabType = TABTYP_NORM, 'AlterBeginAddColumn: not ordinary');
+  AssertH(pTab^.u.tab.addColOffset > 0, 'AlterBeginAddColumn: addColOffset=0');
+  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+
+  pNew := PTable2(sqlite3DbMallocZero(db, SizeOf(TTable)));
+  if pNew = nil then goto exit_begin_add_column;
+  pParse^.pNewTable := pNew;
+  pNew^.nTabRef := 1;
+  pNew^.nCol    := pTab^.nCol;
+  AssertH(pNew^.nCol > 0, 'AlterBeginAddColumn: nCol<=0');
+  nAlloc := (((pNew^.nCol - 1) div 8) * 8) + 8;
+  AssertH((nAlloc >= pNew^.nCol) and ((nAlloc mod 8) = 0)
+          and ((nAlloc - pNew^.nCol) < 8),
+          'AlterBeginAddColumn: nAlloc invariant');
+  pNew^.aCol := PColumn(sqlite3DbMallocZero(db,
+                  u64(SizeOf(TColumn)) * u64(u32(nAlloc))));
+  pNew^.zName := sqlite3MPrintf(db, 'sqlite_altertab_%s', [pTab^.zName]);
+  if (pNew^.aCol = nil) or (pNew^.zName = nil) then begin
+    AssertH(db^.mallocFailed <> 0, 'AlterBeginAddColumn: alloc fail w/o oom');
+    goto exit_begin_add_column;
+  end;
+  Move(pTab^.aCol^, pNew^.aCol^,
+       SizeOf(TColumn) * PtrUInt(u32(pNew^.nCol)));
+  for i := 0 to pNew^.nCol - 1 do begin
+    pCol := @pNew^.aCol[i];
+    pCol^.zCnName := sqlite3DbStrDup(db, pCol^.zCnName);
+    pCol^.hName   := sqlite3StrIHash(pCol^.zCnName);
+  end;
+  AssertH(pNew^.eTabType = TABTYP_NORM, 'AlterBeginAddColumn: pNew not ord');
+  pNew^.u.tab.pDfltList := sqlite3ExprListDup(db, pTab^.u.tab.pDfltList, 0);
+  pNew^.pSchema := db^.aDb[iDb].pSchema;
+  pNew^.u.tab.addColOffset := pTab^.u.tab.addColOffset;
+  AssertH(pNew^.nTabRef = 1, 'AlterBeginAddColumn: nTabRef bumped');
+
+exit_begin_add_column:
+  sqlite3SrcListDelete(db, pSrc);
 end;
 
 procedure sqlite3AlterRenameColumn(pParse: PParse; pSrc: PSrcList;

@@ -505,7 +505,19 @@ Important: At the end of this document, please find:
        [ ] Port `sqlite3AlterDropConstraint`
        [ ] Port `sqlite3AlterSetNotNull`
        [ ] Port `sqlite3AlterAddConstraint`.
-       [ ] Port `sqlite3AlterBeginAddColumn`
+       [X] Port `sqlite3AlterBeginAddColumn` — ported 2026-04-30 (alter.c:483)
+            in passqlite3codegen.pas.  Replaces the Phase 6.5 stub.  Locates
+            the target table via sqlite3LocateTableItem, rejects
+            virtual/view/system/eponymous/shadow tables (via the new static
+            `isAlterableTable`, alter.c:31), runs sqlite3MayAbort, then
+            clones the Table into pParse^.pNewTable under the synthetic
+            name `sqlite_altertab_<orig>` so sqlite3AddColumn can append
+            the new column.  Allocates aCol rounded up to a multiple of 8,
+            duplicates each zCnName + recomputes hName, dups pDfltList,
+            inherits pSchema + addColOffset.  Dead-code today because
+            sqlite3AlterFinishAddColumn is still a stub (the cloned
+            Table is never committed to the schema), but every error arm
+            and the clone path are now live and match C 1:1.
        [ ] Port `sqlite3AlterFinishAddColumn`.
        [~] Port `sqlite3AlterFunctions` — registers the rename-helper SQL
             functions.  Partial 2026-04-30: `sqlite_fail` + `sqlite_add_constraint`
