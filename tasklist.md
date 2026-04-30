@@ -315,13 +315,28 @@ Important: At the end of this document, please find:
             enc=UTF8 to the file_format==0 guard (matches C: a re-fetched
             populated schema must not re-init its hashes), drops the
             non-C SQLITE_DEFAULT_CACHE_SIZE assignment (cache_size is set
-            via PRAGMA dispatch and the readers at codegen.pas:29832/:29853
-            are already guarded by `<> 0`), and routes OOM through
-            sqlite3OomFault.  TestExplainParity unchanged (1016/1026);
-            DiagFeatureProbe unchanged (9 divergences); TestPager 12/12
-            PASS; TestSchemaBasic 44/0 PASS.
+            via PRAGMA dispatch), and routes OOM through sqlite3OomFault.
+            Follow-up 2026-04-30: the pre-port reader at codegen.pas:29830
+            assumed Schema.cache_size was seeded; that assumption was wrong
+            for the ordinary `cache_size` reader (only the `cache_spill`
+            reader had the `<> 0` guard).  Reader now mirrors C
+            prepare.c:326 — when Schema.cache_size==0 (sqlite3InitOne not
+            yet ported), substitute SQLITE_DEFAULT_CACHE_SIZE.  Same
+            substitution applied to the cache_spill BtreeSetCacheSize
+            seed.  DiagPragma 12→10 divergences (regression closed);
+            TestExplainParity 1016/1026 unchanged; DiagFeatureProbe
+            9 unchanged; TestPager 12/12; TestSchemaBasic 44/0.
 
 ### Open Bugs
+
+- [ ] **TestDMLBasic crash** — `bin/TestDMLBasic` runs through dozens of
+       record-layout PASSes and Upsert/Trigger smoke checks, then aborts
+       with `EAccessViolation at $0000000000462CF1` after `PASS DeleteTrigger(nil) no crash`.
+       Pre-existing (reproduces both before and after the cache_size
+       reader fix on 2026-04-30); likely the next test step touches a
+       Trigger/SrcList helper that's still a stub.  Triage: re-run with
+       SIGSEGV symbols (`-gl`) to identify the exact line; probably
+       folds into 6.23 trigger-codegen stubs once isolated.
 
 - [ ] **6.10** `TestExplainParity.pas`
     - [ ] **6.10 step 6** Make these to work (port code when required):

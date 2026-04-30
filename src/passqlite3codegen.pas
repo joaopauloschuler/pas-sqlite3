@@ -29826,9 +29826,13 @@ begin
   end;
 
   { PragTyp_CACHE_SIZE read arm (pragma.c:882).  Default is
-    SQLITE_DEFAULT_CACHE_SIZE (-2000) seeded by sqlite3SchemaGet. }
+    SQLITE_DEFAULT_CACHE_SIZE (-2000); C populates Schema.cache_size in
+    sqlite3InitOne (prepare.c:323) which is not yet ported, so a 0 here
+    means "uninitialised" and we substitute the default — matching the
+    fallback at prepare.c:326. }
   if SameText(zName, 'cache_size') and (pValue = nil) then begin
-    if (db^.aDb[iDb].pSchema <> nil) then
+    if (db^.aDb[iDb].pSchema <> nil)
+       and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
       iVal := db^.aDb[iDb].pSchema^.cache_size
     else
       iVal := SQLITE_DEFAULT_CACHE_SIZE;
@@ -29852,7 +29856,9 @@ begin
         if (db^.aDb[iDb].pSchema <> nil)
            and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
           sqlite3BtreeSetCacheSize(pBtArg,
-            db^.aDb[iDb].pSchema^.cache_size);
+            db^.aDb[iDb].pSchema^.cache_size)
+        else
+          sqlite3BtreeSetCacheSize(pBtArg, SQLITE_DEFAULT_CACHE_SIZE);
         iVal := sqlite3BtreeSetSpillSize(pBtArg, 0);
       end else
         iVal := 0;
