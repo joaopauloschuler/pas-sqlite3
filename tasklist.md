@@ -56,7 +56,15 @@ Important: At the end of this document, please find:
       Remaining: errCode-bearing corruption signalling + the codegen
       full-layout fields (u/n/r1/r2) that the slim layout still drops.
 
-  [ ] **6.13** port `sqlite3Vacuum`
+  [X] **6.13** port `sqlite3Vacuum` — ported 2026-04-29 (vacuum.c:105) in
+       passqlite3codegen.pas.  Replaces the Phase 6.5 stub.  Resolves the
+       optional schema-name argument via sqlite3TwoPartName, codes the
+       VACUUM INTO target expression (sqlite3ResolveSelfReference + ExprCode
+       into a fresh memcell), then emits OP_Vacuum + sqlite3VdbeUsesBtree.
+       Runtime side (OP_Vacuum / sqlite3RunVacuum) still stubbed in
+       passqlite3vdbe.pas, so VACUUM is bytecode-parity but a runtime no-op.
+       Verified via `src/tests/DiagVacuum.pas`: VACUUM and VACUUM INTO 'x'
+       both emit opcode-by-opcode parity with the C reference.
 
   [X] **6.22** port codegen.pas rename:
        [X] `sqlite3RenameExprUnmap` — ported 2026-04-29 (alter.c:914).
@@ -149,7 +157,7 @@ Important: At the end of this document, please find:
        [ ] Port `sqlite3Detach`
        [ ] Port `sqlite3Attach`
        [ ] Port `sqlite3Analyze`
-       [ ] Port `sqlite3Vacuum`
+       [X] Port `sqlite3Vacuum` — done 2026-04-29 (see 6.13).
        [ ] Port `sqlite3FkCheck`
        [ ] Port `sqlite3FkActions`.
 

@@ -28624,11 +28624,53 @@ begin
 end;
 
 // ===========================================================================
-// Phase 6.5 — vacuum.c stub
+// Phase 6.13 — vacuum.c codegen (vacuum.c:105)
 // ===========================================================================
 
+{ sqlite3Vacuum — port of vacuum.c:105.  Parse-time codegen for VACUUM /
+  VACUUM INTO.  Resolves the optional schema-name argument via
+  sqlite3TwoPartName (treating an unrecognised name as an error, matching
+  the default non-SQLITE_BUG_COMPATIBLE_20160819 arm), evaluates the
+  optional INTO target expression, then emits OP_Vacuum.  The runtime
+  side (OP_Vacuum / sqlite3RunVacuum) is still stubbed in vdbe.pas, so
+  the emit is bytecode-parity with C even though execution is a no-op. }
 procedure sqlite3Vacuum(pParse: PParse; pNm: PToken; pInto: PExpr);
+var
+  v:        PVdbe;
+  iDb:      i32;
+  iIntoReg: i32;
+  pName:    PToken;
 begin
+  v   := sqlite3GetVdbe(pParse);
+  iDb := 0;
+  if v = nil then begin
+    sqlite3ExprDelete(pParse^.db, pInto);
+    Exit;
+  end;
+  if pParse^.nErr <> 0 then begin
+    sqlite3ExprDelete(pParse^.db, pInto);
+    Exit;
+  end;
+  if pNm <> nil then begin
+    pName := pNm;
+    iDb := sqlite3TwoPartName(pParse, pNm, pNm, @pName);
+    if iDb < 0 then begin
+      sqlite3ExprDelete(pParse^.db, pInto);
+      Exit;
+    end;
+  end;
+  if iDb <> 1 then begin
+    iIntoReg := 0;
+    if (pInto <> nil) and
+       (sqlite3ResolveSelfReference(pParse, nil, 0, pInto, nil) = 0) then
+    begin
+      Inc(pParse^.nMem);
+      iIntoReg := pParse^.nMem;
+      sqlite3ExprCode(pParse, pInto, iIntoReg);
+    end;
+    sqlite3VdbeAddOp2(v, OP_Vacuum, iDb, iIntoReg);
+    sqlite3VdbeUsesBtree(v, iDb);
+  end;
   sqlite3ExprDelete(pParse^.db, pInto);
 end;
 
