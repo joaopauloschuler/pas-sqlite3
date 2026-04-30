@@ -457,6 +457,13 @@ function sqlite3_enable_shared_cache(enable: i32): i32; cdecl;
 procedure sqlite3_activate_cerod(zPassPhrase: PAnsiChar); cdecl;
 function sqlite3_setlk_timeout(db: PTsqlite3; ms: i32; flags: i32): i32; cdecl;
 
+{ Phase 8.4.1 — sqlite3_test_control: testing back-door dispatcher.
+  Variadic in C; declared cdecl-only here.  Callers passing extra
+  arguments are well-defined under x86_64 SysV (the extra args sit
+  unread in registers/stack); we honour only the no-arg opcodes.
+  See main.c:4206. }
+function sqlite3_test_control(op: i32): i32; cdecl;
+
 { Phase 8.7.1 — WAL public-API entry points.  See main.c:2470..2620. }
 type
   TWalHookFn = function(p: Pointer; db: PTsqlite3;
@@ -4144,6 +4151,41 @@ begin
   if sqlite3SafetyCheckOk(db) = 0 then begin Result := SQLITE_MISUSE; Exit; end;
   if ms < -1 then begin Result := SQLITE_RANGE; Exit; end;
   Result := SQLITE_OK;
+end;
+
+{ Phase 8.4.1 — sqlite3_test_control(op, ...).  Faithful subset of the
+  variadic C dispatcher in main.c:4206.  Honours the no-arg opcodes
+  (PRNG_SAVE / PRNG_RESTORE / PRNG_RESET) for differential parity with
+  the C reference; returns 0 for every other opcode (matching the C
+  default initial value of `rc`).  Extra varargs passed by callers under
+  x86_64 SysV remain unread, which is benign because we never honour
+  them. }
+const
+  SQLITE_TESTCTRL_PRNG_SAVE_OP    = 5;
+  SQLITE_TESTCTRL_PRNG_RESTORE_OP = 6;
+  SQLITE_TESTCTRL_PRNG_RESET_OP   = 7;
+  SQLITE_TESTCTRL_BYTEORDER_OP    = 22;
+  SQLITE_TESTCTRL_ISINIT_OP       = 23;
+
+function sqlite3_test_control(op: i32): i32; cdecl;
+begin
+  Result := 0;
+  case op of
+    SQLITE_TESTCTRL_PRNG_SAVE_OP:    sqlite3PrngSaveState;
+    SQLITE_TESTCTRL_PRNG_RESTORE_OP: sqlite3PrngRestoreState;
+    SQLITE_TESTCTRL_PRNG_RESET_OP:   sqlite3_randomness(0, nil);
+    SQLITE_TESTCTRL_BYTEORDER_OP: begin
+      { main.c:4502 — return non-zero on big-endian platform.  FPC on
+        x86_64 is little-endian; report 0. }
+      Result := 0;
+    end;
+    SQLITE_TESTCTRL_ISINIT_OP: begin
+      { main.c:4582 — 0 if sqlite3_initialize has succeeded, SQLITE_ERROR
+        otherwise.  Probed via sqlite3GlobalConfig.isInit. }
+      if sqlite3GlobalConfig.isInit = 0 then
+        Result := SQLITE_ERROR;
+    end;
+  end;
 end;
 
 { ----------------------------------------------------------------------

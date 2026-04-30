@@ -439,7 +439,12 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 
 - [ ] **8.4.1** Hooks / control / change-counter / errors / limits
        (main.c, status.c):
-       [ ] `sqlite3_test_control` — testing back-door (subset).
+       [X] `sqlite3_test_control` — ported 2026-04-29 as a no-arg-opcode
+            subset (main.c:4206).  Honours PRNG_SAVE / PRNG_RESTORE /
+            PRNG_RESET / BYTEORDER / ISINIT; every other opcode falls
+            through to `Result := 0`.  Declared `cdecl` (no varargs);
+            extra arguments passed by callers under x86_64 SysV remain
+            unread and benign because we never honour them.
 
 - [X] **8.9.1** Vtab helper APIs (vtab.c, vdbeapi.c):
        [X] `sqlite3_vtab_distinct` — ported 2026-04-29 as a degraded
