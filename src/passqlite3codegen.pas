@@ -32944,9 +32944,72 @@ begin
   if bHaveFK <> 0 then Result := 1 else Result := 0;
 end;
 
-procedure sqlite3FkDelete(db: PTsqlite3; pTab: PTable2);
+{ fkey.c:688 — fkTriggerDelete.  Frees a CASCADE/SET NULL/SET DEFAULT
+  trigger Trigger object created by fkActionTrigger.  The trigger has
+  exactly one TriggerStep at step_list and no pColumns/zName/etc.  Mirrors
+  the C body 1:1 — only step_list's pSrc/pWhere/pExprList/pSelect get
+  freed, plus pWhen and the Trigger record itself. }
+procedure fkTriggerDelete(dbMem: PTsqlite3; p: PTrigger);
+var
+  pStep: PTriggerStep;
 begin
-  { Phase 7 }
+  if p = nil then Exit;
+  pStep := p^.step_list;
+  sqlite3SrcListDelete  (Psqlite3db(dbMem), pStep^.pSrc);
+  sqlite3ExprDelete     (Psqlite3db(dbMem), pStep^.pWhere);
+  sqlite3ExprListDelete (Psqlite3db(dbMem), pStep^.pExprList);
+  sqlite3SelectDelete   (Psqlite3db(dbMem), pStep^.pSelect);
+  sqlite3ExprDelete     (Psqlite3db(dbMem), p^.pWhen);
+  sqlite3DbFree         (Psqlite3db(dbMem), p);
+end;
+
+{ fkey.c:1451 — sqlite3FkDelete.  Frees the FKey list attached to pTab and
+  removes each entry from pSchema^.fkeyHash.  Operates via documented byte
+  offsets into the opaque PFKey blob (PFKey = Pointer in this port; layout
+  follows the C struct verbatim).  Skips the hash unlink when
+  db^.pnBytesFreed is non-nil (sqlite3LeaveMutexAndCloseZombie tear-down
+  path — the schema hash is being torn down too).  Faithful 1:1 of the C. }
+procedure sqlite3FkDelete(db: PTsqlite3; pTab: PTable2);
+const
+  FKEY_PNEXTFROM_OFFSET = 8;
+  FKEY_ZTO_OFFSET       = 16;
+  FKEY_PNEXTTO_OFFSET   = 24;
+  FKEY_PPREVTO_OFFSET   = 32;
+  FKEY_APTRIGGER0_OFFSET= 48;
+  FKEY_APTRIGGER1_OFFSET= 56;
+var
+  pFKey, pNext, pNextTo, pPrevTo: Pu8;
+  z:     PAnsiChar;
+  pSch:  passqlite3util.PSchema;
+begin
+  if pTab = nil then Exit;
+  if pTab^.eTabType <> TABTYP_NORM then Exit;
+  if db = nil then Exit;
+  pFKey := Pu8(pTab^.u.tab.pFKey);
+  while pFKey <> nil do begin
+    pNextTo := PPointer(pFKey + FKEY_PNEXTTO_OFFSET)^;
+    pPrevTo := PPointer(pFKey + FKEY_PPREVTO_OFFSET)^;
+    if db^.pnBytesFreed = nil then begin
+      pSch := passqlite3util.PSchema(pTab^.pSchema);
+      if pPrevTo <> nil then begin
+        PPointer(pPrevTo + FKEY_PNEXTTO_OFFSET)^ := pNextTo;
+      end else begin
+        if pNextTo <> nil then
+          z := PPointer(pNextTo + FKEY_ZTO_OFFSET)^
+        else
+          z := PPointer(pFKey + FKEY_ZTO_OFFSET)^;
+        if pSch <> nil then
+          sqlite3HashInsert(@pSch^.fkeyHash, z, pNextTo);
+      end;
+      if pNextTo <> nil then
+        PPointer(pNextTo + FKEY_PPREVTO_OFFSET)^ := pPrevTo;
+    end;
+    fkTriggerDelete(db, PTrigger(PPointer(pFKey + FKEY_APTRIGGER0_OFFSET)^));
+    fkTriggerDelete(db, PTrigger(PPointer(pFKey + FKEY_APTRIGGER1_OFFSET)^));
+    pNext := PPointer(pFKey + FKEY_PNEXTFROM_OFFSET)^;
+    sqlite3DbFree(Psqlite3db(db), pFKey);
+    pFKey := pNext;
+  end;
 end;
 
 { fkey.c:736 — sqlite3FkDropTable.  Generates the implicit "DELETE FROM <tbl>"

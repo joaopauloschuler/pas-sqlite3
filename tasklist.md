@@ -228,6 +228,20 @@ Important: At the end of this document, please find:
             tail-return through it.  Faithful 1:1; not yet wired into
             consumers (planner cost model + a few error sites still use
             inline equivalents) but exposed for downstream wiring.
+       [X] `sqlite3FkDelete` + `fkTriggerDelete` (fkey.c:1451 / :688) —
+            ported 2026-04-30 in passqlite3codegen.pas.  Replaces the
+            Phase 7 no-op stub.  Walks `pTab^.u.tab.pFKey` via documented
+            byte offsets (PFKey is still opaque PPointer in this port —
+            see codegen.pas:418), unlinks each entry from
+            pSchema^.fkeyHash (skipped when db^.pnBytesFreed<>nil per the
+            tear-down arm), invokes fkTriggerDelete on apTrigger[0/1] to
+            free CASCADE/SET NULL synthetic triggers, then sqlite3DbFree
+            the FKey itself.  fkTriggerDelete frees step_list's
+            pSrc/pWhere/pExprList/pSelect plus pWhen and the Trigger.
+            Closes a real memory-leak: prior to this, every CREATE TABLE
+            ... REFERENCES ... that survived to sqlite3DeleteTable leaked
+            its FKey + apTrigger trees.  TestExplainParity unchanged
+            (1016/1026).
        [X] `sqlite3TouchRegister` + `sqlite3ClearTempRegCache` +
             `sqlite3FirstAvailableRegister` (expr.c:7637/:7646/:7657) +
             `sqlite3KeyInfoIsWriteable` (select.c:1581) +
