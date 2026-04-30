@@ -404,6 +404,20 @@ Important: At the end of this document, please find:
             leak to faithful 1:1 once STAT4 is enabled.  TestExplainParity
             1016/1026 unchanged; TestDMLBasic 54/0; TestSchemaBasic 44/0;
             TestPager 12/12.
+       [X] `sqlite3ExprCodeFactorable` (expr.c:5925) — ported 2026-04-30 in
+            passqlite3codegen.pas.  Thin wrapper over the existing
+            sqlite3ExprCodeRunJustOnce / sqlite3ExprCodeCopy pair: when
+            PARSEFLAG_OkConstFactor is set and the expression is constant
+            (sqlite3ExprIsConstantNotJoin) routes through RunJustOnce, else
+            falls through to ExprCodeCopy.  Replaces the two duplicated
+            inline arms in `sqlite3Insert`'s VALUES emission loop
+            (codegen.pas:23867 and :23890) that had hard-coded an OP_Null
+            fallback when the column DEFAULT was non-constant — the
+            wrapper now correctly emits real codegen for non-constant
+            DEFAULT expressions, matching insert.c:1395..1418 1:1.
+            TestExplainParity 1016/1026 unchanged; DiagFeatureProbe 9
+            unchanged; TestDMLBasic 54/0; TestSchemaBasic 44/0; DiagDml
+            12/2 unchanged.
        [X] Wire `sqlite3ResetOneSchema` retry into `sqlite3LockAndPrepare`
             (prepare.c:865-866) — done 2026-04-30 in passqlite3main.pas.
             Previously bailed after one retry on SQLITE_ERROR_RETRY only;

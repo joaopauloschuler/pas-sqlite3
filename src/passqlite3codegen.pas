@@ -2184,6 +2184,7 @@ function sqlite3ExprAddCollateString(pParse: PParse; p: PExpr;
   different register. }
 procedure sqlite3ExprCode(pParse: PParse; pExpr: PExpr; target: i32);
 procedure sqlite3ExprCodeCopy(pParse: PParse; pExpr: PExpr; target: i32);
+procedure sqlite3ExprCodeFactorable(pParse: PParse; pExpr: PExpr; target: i32);
 procedure sqlite3ExprCodeMove(pParse: PParse; iFrom, iTo, nReg: i32);
 procedure sqlite3ExprNullRegisterRange(pParse: PParse; iReg, nReg: i32);
 function  sqlite3ExprCodeTarget(pParse: PParse; pExpr: PExpr;
@@ -5817,6 +5818,21 @@ begin
   pExpr := sqlite3ExprDup(db, pExpr, 0);
   if db^.mallocFailed = 0 then sqlite3ExprCode(pParse, pExpr, target);
   sqlite3ExprDelete(db, pExpr);
+end;
+
+{ sqlite3ExprCodeFactorable — port of expr.c:5925.  Generate code that will
+  evaluate pExpr and store the result in register target.  When the
+  expression is constant and the parse context permits constant factoring
+  (PARSEFLAG_OkConstFactor — the okConstFactor flag in C), routes through
+  sqlite3ExprCodeRunJustOnce so the value is computed once at VM
+  initialisation; otherwise falls through to sqlite3ExprCodeCopy. }
+procedure sqlite3ExprCodeFactorable(pParse: PParse; pExpr: PExpr; target: i32);
+begin
+  if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
+     and (sqlite3ExprIsConstantNotJoin(pParse, pExpr) <> 0) then
+    sqlite3ExprCodeRunJustOnce(pParse, pExpr, target)
+  else
+    sqlite3ExprCodeCopy(pParse, pExpr, target);
 end;
 
 { sqlite3ExprCodeMove — port of expr.c:4498.  Generate code to move
@@ -23719,7 +23735,6 @@ var
   regOut:         i32;
   pListItems:     PExprListItem;
   pIdItems:       PIdListItem;
-  pDflt:          PExpr;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -23875,26 +23890,14 @@ begin
     begin
       j := (aTabColMap + i)^;
       if j = 0 then
-      begin
-        pDflt := sqlite3ColumnExpr(pTab, @pTab^.aCol[i]);
-        if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
-           and (sqlite3ExprIsConstantNotJoin(pParse, pDflt) <> 0) then
-          sqlite3ExprCodeRunJustOnce(pParse, pDflt, regData + i)
-        else
-          sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i);
-      end
+        sqlite3ExprCodeFactorable(pParse,
+          sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
       else
         sqlite3ExprCode(pParse, pListItems[j - 1].pExpr, regData + i);
     end
     else if pList = nil then
-    begin
-      pDflt := sqlite3ColumnExpr(pTab, @pTab^.aCol[i]);
-      if ((pParse^.parseFlags and PARSEFLAG_OkConstFactor) <> 0)
-         and (sqlite3ExprIsConstantNotJoin(pParse, pDflt) <> 0) then
-        sqlite3ExprCodeRunJustOnce(pParse, pDflt, regData + i)
-      else
-        sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i);
-    end
+      sqlite3ExprCodeFactorable(pParse,
+        sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
     else
       sqlite3ExprCode(pParse, pListItems[i].pExpr, regData + i);
   end;
