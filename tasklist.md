@@ -506,19 +506,29 @@ Important: At the end of this document, please find:
        [ ] Port `sqlite3AlterSetNotNull`
        [ ] Port `sqlite3AlterAddConstraint`.
        [X] Port `sqlite3AlterBeginAddColumn` — ported 2026-04-30 (alter.c:483)
-            in passqlite3codegen.pas.  Replaces the Phase 6.5 stub.  Locates
-            the target table via sqlite3LocateTableItem, rejects
-            virtual/view/system/eponymous/shadow tables (via the new static
-            `isAlterableTable`, alter.c:31), runs sqlite3MayAbort, then
-            clones the Table into pParse^.pNewTable under the synthetic
-            name `sqlite_altertab_<orig>` so sqlite3AddColumn can append
-            the new column.  Allocates aCol rounded up to a multiple of 8,
-            duplicates each zCnName + recomputes hName, dups pDfltList,
-            inherits pSchema + addColOffset.  Dead-code today because
-            sqlite3AlterFinishAddColumn is still a stub (the cloned
-            Table is never committed to the schema), but every error arm
-            and the clone path are now live and match C 1:1.
-       [ ] Port `sqlite3AlterFinishAddColumn`.
+            in passqlite3codegen.pas.  Clones the target Table into
+            pParse^.pNewTable under `sqlite_altertab_<orig>`.
+       [X] Port `sqlite3AlterFinishAddColumn` — ported 2026-04-30
+            (alter.c:313) in passqlite3codegen.pas.  Replaces the Phase 6.5
+            stub.  Validates the new column (no PRIMARY KEY / UNIQUE,
+            REFERENCES with default, NOT NULL without default, non-constant
+            DEFAULT, STORED-generated), patches the CREATE TABLE source via
+            `sqlite3NestedParse('UPDATE %Q.sqlite_master ...')`, bumps the
+            file format cookie to >=3 via OP_ReadCookie/OP_AddImm/OP_IfPos/
+            OP_SetCookie, then `renameReloadSchema(..., INITFLAG_AlterAdd)`,
+            and emits the post-add `pragma_quick_check` raise SELECT when
+            CHECK / NOT NULL-generated / TF_Strict applies.  Static helpers
+            ported alongside: `renameReloadSchema` (alter.c:111) +
+            `sqlite3ErrorIfNotEmpty` (:293).  Constants normalised to the
+            C 1:1 INITFLAG_AlterMask/_AlterRename/_AlterDrop/_AlterAdd/
+            _AlterDropCons set; SQLITE_ALTER_TABLE auth code added.
+            Dead-code path today because the parser ALTER ADD arm still
+            runs through sqlite3AlterBeginAddColumn → sqlite3AddColumn
+            → sqlite3AlterFinishAddColumn but no caller wiring exercises
+            the schema reload (sqlite3NestedParse / sqlite3RunParser hook
+            still degrades to discard); structural body is now live.
+            TestExplainParity unchanged (1016/1026); DiagFeatureProbe
+            unchanged (9 divergences).
        [~] Port `sqlite3AlterFunctions` — registers the rename-helper SQL
             functions.  Partial 2026-04-30: `sqlite_fail` + `sqlite_add_constraint`
             (alter.c:2654 addConstraintFunc) + `sqlite_find_constraint`

@@ -2440,10 +2440,14 @@ const
   PARSE_RECURSE_SZ = 280; { offsetof(TParse, sLastToken) }
   PARSE_TAIL_SZ    = 136; { sizeof(TParse) - PARSE_RECURSE_SZ = 416-280 }
 
-  { sqlite3ReadSchema flags }
-  INITFLAG_AlterRename    = $01;
-  INITFLAG_AlterDrop      = $02;
-  INITFLAG_AlterAddColumn = $04;
+  { sqlite3ReadSchema flags — sqliteInt.h:4250 }
+  INITFLAG_AlterMask     = $07;
+  INITFLAG_AlterRename   = $01;  { Reparse after a RENAME }
+  INITFLAG_AlterDrop     = $02;  { Reparse after a DROP COLUMN }
+  INITFLAG_AlterAdd      = $03;  { Reparse after an ADD COLUMN }
+  INITFLAG_AlterDropCons = $04;  { Reparse after DROP CONSTRAINT }
+
+  SQLITE_ALTER_TABLE     = 26;   { sqlite.h.in:3529 (auth code) }
 
 type
   { ParseCleanup — prepare.c:3853 }
@@ -28065,9 +28069,172 @@ begin
   sqlite3SrcListDelete(pParse^.db, pSrc);
 end;
 
-procedure sqlite3AlterFinishAddColumn(pParse: PParse; pColDef: PToken);
+{ alter.c:111 — renameReloadSchema.  Generate code to reload the schema for
+  database iDb (and the temp database, when iDb<>1).  Static in C; unit-level
+  here.  Faithful 1:1. }
+procedure renameReloadSchema(pParse: PParse; iDb: i32; p5: u16);
+var
+  v: PVdbe;
 begin
-  { Phase 7 }
+  v := pParse^.pVdbe;
+  if v = nil then Exit;
+  sqlite3ChangeCookie(pParse, iDb);
+  sqlite3VdbeAddParseSchemaOp(pParse^.pVdbe, iDb, nil, p5);
+  if iDb <> 1 then
+    sqlite3VdbeAddParseSchemaOp(pParse^.pVdbe, 1, nil, p5);
+end;
+
+{ alter.c:293 — sqlite3ErrorIfNotEmpty.  Emit a SELECT that raises ABORT
+  with zErr if the named table contains any rows.  Static in C. }
+procedure sqlite3ErrorIfNotEmpty(pParse: PParse; zDb: PAnsiChar;
+  zTab: PAnsiChar; zErr: PAnsiChar);
+begin
+  sqlite3NestedParse(pParse,
+    'SELECT raise(ABORT,%Q) FROM "%w"."%w"',
+    [zErr, zDb, zTab]);
+end;
+
+{ alter.c:313 — sqlite3AlterFinishAddColumn.  Called by the parser after an
+  ALTER TABLE ... ADD COLUMN statement is parsed.  Validates the new column
+  (no PRIMARY KEY, no UNIQUE, NOT NULL must have a default, default must be
+  a constant, GENERATED-STORED forbidden when table non-empty, FK with
+  default forbidden when foreign_keys=on and table non-empty, REFERENCES
+  with default value), patches the CREATE TABLE source via sqlite3NestedParse
+  UPDATE sqlite_master, bumps the file format cookie to >=3, and reloads the
+  schema with INITFLAG_AlterAdd.  Faithful 1:1. }
+procedure sqlite3AlterFinishAddColumn(pParse: PParse; pColDef: PToken);
+var
+  pNew:  PTable2;
+  pTab:  PTable2;
+  iDb:   i32;
+  zDb:   PAnsiChar;
+  zTab:  PAnsiChar;
+  zCol:  PAnsiChar;
+  pCol:  PColumn;
+  pDflt: PExpr;
+  db:    PTsqlite3;
+  v:     PVdbe;
+  r1:    i32;
+  zEnd:  PAnsiChar;
+  pVal:  Psqlite3_value;
+  rc:    i32;
+begin
+  db := pParse^.db;
+  AssertH(db^.pParse = pParse, 'AlterFinishAddColumn: pParse mismatch');
+  if pParse^.nErr <> 0 then Exit;
+  AssertH(db^.mallocFailed = 0, 'AlterFinishAddColumn: oom on entry');
+  pNew := pParse^.pNewTable;
+  AssertH(pNew <> nil, 'AlterFinishAddColumn: pNew nil');
+
+  iDb  := sqlite3SchemaToIndex(db, pNew^.pSchema);
+  zDb  := db^.aDb[iDb].zDbSName;
+  zTab := pNew^.zName + 16;  { skip the "sqlite_altertab_" prefix (16 chars) }
+  pCol := @pNew^.aCol[pNew^.nCol - 1];
+  pDflt := sqlite3ColumnExpr(pNew, pCol);
+  pTab := sqlite3FindTable(db, zTab, zDb);
+  AssertH(pTab <> nil, 'AlterFinishAddColumn: target table not found');
+
+  if sqlite3AuthCheck(pParse, SQLITE_ALTER_TABLE, zDb, pTab^.zName, nil) <> 0 then
+    Exit;
+
+  if (pCol^.colFlags and COLFLAG_PRIMKEY) <> 0 then begin
+    sqlite3ErrorMsg(pParse, 'Cannot add a PRIMARY KEY column');
+    Exit;
+  end;
+  if pNew^.pIndex <> nil then begin
+    sqlite3ErrorMsg(pParse, 'Cannot add a UNIQUE column');
+    Exit;
+  end;
+
+  if (pCol^.colFlags and COLFLAG_GENERATED) = 0 then begin
+    { If the default value was specified as a literal NULL, treat as
+      "no default" so the NOT NULL check below catches it. }
+    AssertH((pDflt = nil) or (pDflt^.op = TK_SPAN),
+            'AlterFinishAddColumn: pDflt op not TK_SPAN');
+    if (pDflt <> nil) and (pDflt^.pLeft <> nil)
+       and (pDflt^.pLeft^.op = TK_NULL) then
+      pDflt := nil;
+    AssertH(pNew^.eTabType = TABTYP_NORM,
+            'AlterFinishAddColumn: pNew not ordinary');
+    if ((db^.flags and SQLITE_ForeignKeys) <> 0)
+       and (pNew^.u.tab.pFKey <> nil) and (pDflt <> nil) then
+      sqlite3ErrorIfNotEmpty(pParse, zDb, zTab,
+        'Cannot add a REFERENCES column with non-NULL default value');
+    if ((pCol^.typeFlags and $0F) <> 0) and (pDflt = nil) then
+      sqlite3ErrorIfNotEmpty(pParse, zDb, zTab,
+        'Cannot add a NOT NULL column with default value NULL');
+
+    { Default expression must be something sqlite3ValueFromExpr can handle. }
+    if pDflt <> nil then begin
+      pVal := nil;
+      rc := sqlite3ValueFromExpr(db, pDflt, SQLITE_UTF8,
+                                 SQLITE_AFF_BLOB, pVal);
+      AssertH((rc = SQLITE_OK) or (rc = SQLITE_NOMEM),
+              'AlterFinishAddColumn: ValueFromExpr unexpected rc');
+      if rc <> SQLITE_OK then begin
+        AssertH(db^.mallocFailed = 1,
+                'AlterFinishAddColumn: rc!=OK without OOM');
+        Exit;
+      end;
+      if pVal = nil then
+        sqlite3ErrorIfNotEmpty(pParse, zDb, zTab,
+          'Cannot add a column with non-constant default');
+      sqlite3ValueFree(pVal);
+    end;
+  end else if (pCol^.colFlags and COLFLAG_STORED) <> 0 then begin
+    sqlite3ErrorIfNotEmpty(pParse, zDb, zTab, 'cannot add a STORED column');
+  end;
+
+  { Modify the CREATE TABLE statement via UPDATE sqlite_master. }
+  zCol := sqlite3DbStrNDup(db, PAnsiChar(pColDef^.z), u64(pColDef^.n));
+  if zCol <> nil then begin
+    zEnd := zCol + pColDef^.n - 1;
+    while (zEnd > zCol)
+          and ((zEnd^ = ';') or (sqlite3Isspace(u8(zEnd^)) <> 0)) do begin
+      zEnd^ := #0;
+      Dec(zEnd);
+    end;
+    sqlite3NestedParse(pParse,
+      'UPDATE "%w".' + LEGACY_SCHEMA_TABLE + ' SET '
+        + 'sql = printf(''%%.%ds, '',sql) || %Q'
+        + ' || substr(sql,1+length(printf(''%%.%ds'',sql))) '
+        + 'WHERE type = ''table'' AND name = %Q',
+      [zDb, pNew^.u.tab.addColOffset, zCol,
+       pNew^.u.tab.addColOffset, zTab]);
+    sqlite3DbFree(db, zCol);
+  end;
+
+  v := sqlite3GetVdbe(pParse);
+  if v <> nil then begin
+    { Bump the file format cookie to at least 3 (but never above 4). }
+    r1 := sqlite3GetTempReg(pParse);
+    sqlite3VdbeAddOp3(v, OP_ReadCookie, iDb, r1, BTREE_FILE_FORMAT);
+    sqlite3VdbeUsesBtree(v, iDb);
+    sqlite3VdbeAddOp2(v, OP_AddImm, r1, -2);
+    sqlite3VdbeAddOp2(v, OP_IfPos, r1, sqlite3VdbeCurrentAddr(v) + 2);
+    sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, BTREE_FILE_FORMAT, 3);
+    sqlite3ReleaseTempReg(pParse, r1);
+
+    renameReloadSchema(pParse, iDb, INITFLAG_AlterAdd);
+
+    if (pNew^.pCheck <> nil)
+       or (((pCol^.typeFlags and $0F) <> 0)
+            and ((pCol^.colFlags and COLFLAG_GENERATED) <> 0))
+       or ((pTab^.tabFlags and TF_Strict) <> 0) then begin
+      sqlite3NestedParse(pParse,
+        'SELECT CASE WHEN quick_check GLOB ''CHECK*'''
+        + ' THEN raise(ABORT,''CHECK constraint failed'')'
+        + ' WHEN quick_check GLOB ''non-* value in*'''
+        + ' THEN raise(ABORT,''type mismatch on DEFAULT'')'
+        + ' ELSE raise(ABORT,''NOT NULL constraint failed'')'
+        + ' END'
+        + '  FROM pragma_quick_check(%Q,%Q)'
+        + ' WHERE quick_check GLOB ''CHECK*'''
+        + ' OR quick_check GLOB ''NULL*'''
+        + ' OR quick_check GLOB ''non-* value in*''',
+        [zTab, zDb]);
+    end;
+  end;
 end;
 
 { alter.c:31 — isAlterableTable.  Returns 1 (and posts an error) when the
