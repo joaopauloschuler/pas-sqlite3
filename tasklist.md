@@ -484,25 +484,6 @@ Important: At the end of this document, please find:
             `sqlite3NestedParse`.
        [ ] Port `sqlite3InitCallback` (main.pas:2063) — currently installs
             only system tables; full body parses each schema row.
-       [X] Port `sqlite3IndexHasDuplicateRootPage` — ported 2026-04-29
-            (prepare.c:62) in passqlite3codegen.pas.  Walks the sibling
-            index chain and returns 1 if any other index on the same
-            table shares pIndex^.tnum.  Wired into sqlite3CreateIndex
-            (init.busy + pTblName arm — emits "invalid rootpage" /
-            SQLITE_CORRUPT_BKPT on a sibling collision, matching
-            build.c:4394) and sqlite3InitCallback (auto-index branch,
-            prepare.c:181).  Tiny but closes both pending TODOs.
-       [X] Port `schemaIsValid` — ported 2026-04-29
-            (passqlite3main.pas, prepare.c:492).  Static helper local
-            to the prepare unit.  For each attached db, opens a read
-            transaction if needed, reads BTREE_SCHEMA_VERSION, and on
-            cookie mismatch sets pParse^.rc=SQLITE_SCHEMA (when the
-            schema was loaded) and calls sqlite3ResetOneSchema.  Wired
-            at the parse-error tail of sqlite3Prepare guarded by
-            (parseFlags & checkSchema) and db^.init.busy=0.  Dead-code
-            until live cookie bumps appear, but matches C 1:1.
-       [X] Port `sqlite3SchemaToIndex` plumbing — already ported
-            (codegen.pas:2455).
 
 - [ ] **7.1.2** `sqlite3NestedParse` full driver (build.c).  The
        current skeleton (codegen.pas:25041) early-exits when
@@ -512,9 +493,6 @@ Important: At the end of this document, please find:
        CREATE TABLE schema-row INSERT, and the destroyRootPage
        UPDATE sqlite_master path.  Closes the last contributor of
        6.11(b).
-
-- [X] **7.1.7** Lemon parser tail (parse.c epilogue) — all rename-token
-       callbacks now ported (see 6.22).
 
 - [ ] **7.1.8** ATTACH / DETACH (attach.c) — currently Phase 7 stubs
        at codegen.pas:25213/25218.  Must open the attached btree,
@@ -636,57 +614,6 @@ Public-API gap analysis 2026-04-28: `../sqlite3/src/sqlite.h.in` exports
 items below enumerate every missing symbol grouped by sub-phase.
 Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 (`sqlite3_int64`, `sqlite3_uint64`, opaque struct names) are excluded.
-
-- [ ] **8.2.1** Statement-introspection gaps (vdbeapi.c):
-       [X] `sqlite3_stmt_scanstatus` / `_scanstatus_v2` — ported 2026-04-29
-            in passqlite3main.pas as degraded stubs returning 1 (no
-            scan-status data).  Full bodies are gated on the 6.8
-            `sqlite3VdbeScanStatus*` arms landing first; symbols exposed
-            now for dlsym/loadext parity.  `_v2` is the canonical entry
-            point and `_scanstatus` is the thin wrapper through it,
-            matching vdbeapi.c:2611/:2457.
-       [X] `sqlite3_stmt_scanstatus_reset` — ported 2026-04-29 in
-            passqlite3main.pas as a no-op.  C body zeros nExec/nCycle
-            on each VdbeOp; this port does not carry those counters
-            (gated on SQLITE_ENABLE_STMT_SCANSTATUS), so the symbol is
-            exposed for dlsym/loadext parity only.
-       [X] `sqlite3_normalized_sql` — ported 2026-04-29 in
-            passqlite3main.pas as `return nil` stub.  C body is gated
-            on SQLITE_ENABLE_NORMALIZE which adds zNormSql to Vdbe;
-            without that field the symbol is exposed for dlsym parity
-            and consistently returns nil.
-
-- [ ] **8.4.1** Hooks / control / change-counter / errors / limits
-       (main.c, status.c):
-       [X] `sqlite3_test_control` — ported 2026-04-29 as a no-arg-opcode
-            subset (main.c:4206).  Honours PRNG_SAVE / PRNG_RESTORE /
-            PRNG_RESET / BYTEORDER / ISINIT; every other opcode falls
-            through to `Result := 0`.  Declared `cdecl` (no varargs);
-            extra arguments passed by callers under x86_64 SysV remain
-            unread and benign because we never honour them.
-       [X] `sqlite3InvokeBusyHandler` — ported 2026-04-30 in
-            passqlite3main.pas (main.c:1770).  Faithful 1:1 of the
-            BusyHandler state machine: returns 0 when handler is unset
-            or already latched (nBusy<0); otherwise calls xBusyHandler
-            with current nBusy and either latches to -1 on a 0 return
-            or increments nBusy.  Available for future btree/pager
-            wiring through the standard busy-retry loop.
-
-- [X] **8.9.1** Vtab helper APIs (vtab.c, vdbeapi.c):
-       [X] `sqlite3_vtab_distinct` — ported 2026-04-29 as a degraded
-            stub returning 0 (no DISTINCT optimisation).  Full body
-            requires HiddenIndexInfo on the Pas side.
-       [X] `sqlite3_vtab_collation` — ported 2026-04-29 as a degraded
-            stub returning "BINARY" for any in-range iCons (matches C
-            step-3 fallback).  Full body requires HiddenIndexInfo.
-       [X] `sqlite3_vtab_in` — ported 2026-04-29 as a degraded stub
-            returning 0 ("not an IN constraint").  Full body requires
-            HiddenIndexInfo (mIn / mHandleIn bitmasks) on the Pas side.
-       [X] `sqlite3_vtab_rhs_value` — ported 2026-04-29 as a degraded
-            stub returning SQLITE_NOTFOUND with *ppVal=nil for in-range
-            iCons, SQLITE_MISUSE out-of-range.  Full body requires
-            HiddenIndexInfo (aRhs[] cache + WhereClause/Parse pointers)
-            on the Pas side.
 
 - [ ] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind).
 
