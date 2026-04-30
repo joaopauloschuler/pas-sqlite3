@@ -432,6 +432,10 @@ function  sqlite3PagerGetJournalMode(pPager: PPager): i32;
 function  sqlite3PagerBackupPtr(pPager: PPager): PPointer;
 { pager.c:6857 — drop every page out of the page cache. }
 procedure sqlite3PagerClearCache(pPager: PPager);
+{ pager.c:7460 — return 1 if it is safe to change the journal mode. }
+function  sqlite3PagerOkToChangeJournalMode(pPager: PPager): i32;
+{ pager.c:7473 — get/set the persistent-journal size limit (-1 = no limit). }
+function  sqlite3PagerJournalSizeLimit(pPager: PPager; iLimit: i64): i64;
 
 { Cross-unit hook: backup.c's sqlite3BackupRestart, installed by
   passqlite3backup at unit initialisation.  Faithful port of pager_reset
@@ -4663,6 +4667,32 @@ procedure sqlite3PagerClearCache(pPager: PPager);
 begin
   if pPager^.pPCache <> nil then
     sqlite3PcacheClear(pPager^.pPCache);
+end;
+
+{ pager.c:7460 — sqlite3PagerOkToChangeJournalMode.
+  Return TRUE iff it is currently safe to change the journal mode.
+  The journal mode cannot be changed once we have started writing. }
+function sqlite3PagerOkToChangeJournalMode(pPager: PPager): i32;
+begin
+  if pPager^.eState >= PAGER_WRITER_CACHEMOD then begin Result := 0; Exit; end;
+  if (isOpen(pPager^.jfd) <> 0) and (pPager^.journalOff > 0) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  Result := 1;
+end;
+
+{ pager.c:7473 — sqlite3PagerJournalSizeLimit.
+  Get or set the persistent-journal size limit.  iLimit = -1 disables. }
+function sqlite3PagerJournalSizeLimit(pPager: PPager; iLimit: i64): i64;
+begin
+  if iLimit >= -1 then
+  begin
+    pPager^.journalSizeLimit := iLimit;
+    sqlite3WalLimit(pPager^.pWal, iLimit);
+  end;
+  Result := pPager^.journalSizeLimit;
 end;
 
 { ============================================================

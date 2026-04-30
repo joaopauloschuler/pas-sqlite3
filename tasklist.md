@@ -523,6 +523,17 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        returned `sqlite3_file*` matches `sqlite3PagerFile` of the
        backing pager.
 
+- [X] **8.x** `sqlite3PagerOkToChangeJournalMode` (pager.c:7460) +
+       `sqlite3PagerJournalSizeLimit` (pager.c:7473) — ported 2026-04-29
+       in passqlite3pager.pas.  Tiny accessor pair: the first guards
+       PRAGMA journal_mode writes (refuses once the pager is in
+       WRITER_CACHEMOD or has a non-zero journalOff with an open jfd);
+       the second is the get/set for the persistent-journal size limit
+       and propagates the new ceiling into the WAL via sqlite3WalLimit.
+       Both faithful 1:1 from the C, and now exposed for future PRAGMA
+       wiring (the journal_size_limit / journal_mode pragma codegen
+       still emits the constant default — wiring is downstream work).
+
 - [X] **8.x** `sqlite3ReportError` / `sqlite3CorruptError` /
        `sqlite3MisuseError` / `sqlite3CantopenError` (main.c:3957..3973) —
        ported 2026-04-29 in passqlite3main.pas.  Faithful translation of
