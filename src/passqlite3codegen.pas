@@ -2183,6 +2183,9 @@ function sqlite3ExprAddCollateString(pParse: PParse; p: PExpr;
   ends up in `target` via OP_Copy / OP_SCopy when ExprCodeTarget chose a
   different register. }
 procedure sqlite3ExprCode(pParse: PParse; pExpr: PExpr; target: i32);
+procedure sqlite3ExprCodeCopy(pParse: PParse; pExpr: PExpr; target: i32);
+procedure sqlite3ExprCodeMove(pParse: PParse; iFrom, iTo, nReg: i32);
+procedure sqlite3ExprNullRegisterRange(pParse: PParse; iReg, nReg: i32);
 function  sqlite3ExprCodeTarget(pParse: PParse; pExpr: PExpr;
   target: i32): i32;
 function  sqlite3CodeSubselect(pParse: PParse; pExpr: PExpr): i32;
@@ -5794,6 +5797,46 @@ begin
       op := OP_SCopy;
     sqlite3VdbeAddOp2(v, op, inReg, target);
   end;
+end;
+
+{ sqlite3ExprCodeCopy — port of expr.c:5912.  Make a transient duplicate
+  of pExpr and code it via sqlite3ExprCode; the input expression is
+  guaranteed unchanged. }
+procedure sqlite3ExprCodeCopy(pParse: PParse; pExpr: PExpr; target: i32);
+var
+  db: PTsqlite3;
+begin
+  db := pParse^.db;
+  pExpr := sqlite3ExprDup(db, pExpr, 0);
+  if db^.mallocFailed = 0 then sqlite3ExprCode(pParse, pExpr, target);
+  sqlite3ExprDelete(db, pExpr);
+end;
+
+{ sqlite3ExprCodeMove — port of expr.c:4498.  Generate code to move
+  registers iFrom..iFrom+nReg-1 to iTo..iTo+nReg-1. }
+procedure sqlite3ExprCodeMove(pParse: PParse; iFrom, iTo, nReg: i32);
+begin
+  sqlite3VdbeAddOp3(pParse^.pVdbe, OP_Move, iFrom, iTo, nReg);
+end;
+
+{ sqlite3ExprNullRegisterRange — port of expr.c:5828.  Arrange for
+  OP_Null to be invoked over a range of registers during initialisation
+  by encoding a TK_NULLS expression and routing through
+  sqlite3ExprCodeRunJustOnce.  okConstFactor in C is the
+  PARSEFLAG_OkConstFactor bit on parseFlags in this port. }
+procedure sqlite3ExprNullRegisterRange(pParse: PParse; iReg, nReg: i32);
+var
+  t:          TExpr;
+  savedOkBit: u32;
+begin
+  FillChar(t, SizeOf(t), 0);
+  t.op := TK_NULLS;
+  t.y.nReg := nReg;
+  savedOkBit := pParse^.parseFlags and PARSEFLAG_OkConstFactor;
+  pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_OkConstFactor;
+  sqlite3ExprCodeRunJustOnce(pParse, @t, iReg);
+  pParse^.parseFlags :=
+    (pParse^.parseFlags and (not PARSEFLAG_OkConstFactor)) or savedOkBit;
 end;
 
 function sqlite3ExprAddCollateToken(pParse: PParse; p: PExpr;

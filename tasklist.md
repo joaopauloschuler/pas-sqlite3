@@ -309,6 +309,20 @@ Important: At the end of this document, please find:
             into a caller (the prepare.c / vacuum.c sites that use it
             are still skeleton-only) but exposed for downstream wiring.
             TestUtil 7/7 PASS; TestExplainParity unchanged (1016/1026).
+       [X] `sqlite3ExprCodeMove` + `sqlite3ExprCodeCopy` +
+            `sqlite3ExprNullRegisterRange` (expr.c:4498/:5912/:5828) —
+            ported 2026-04-30 in passqlite3codegen.pas.  CodeMove emits
+            OP_Move(iFrom,iTo,nReg); CodeCopy is sqlite3ExprDup +
+            sqlite3ExprCode + sqlite3ExprDelete; NullRegisterRange
+            constructs a transient TK_NULLS expression with y.nReg=nReg
+            and routes through sqlite3ExprCodeRunJustOnce with the
+            PARSEFLAG_OkConstFactor bit forced on (the C okConstFactor
+            counterpart in this port).  Faithful 1:1; not yet wired into
+            consumers (callers currently inline OP_Move / sqlite3ExprCode
+            equivalents) but exposed for downstream wiring (sqlite3Update,
+            window codegen, sub-FROM coroutine path).  TestExplainParity
+            unchanged (1016/1026); DiagFeatureProbe unchanged (9
+            divergences); TestUtil 7/7; TestSchemaBasic 44/0.
        [X] `sqlite3SchemaGet` (callback.c:530) — ported 2026-04-30 in
             passqlite3codegen.pas.  Previously the pBt<>nil arm returned
             nil ("Phase 7: look up schema from btree"); now wires through
