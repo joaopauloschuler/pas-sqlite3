@@ -28106,9 +28106,49 @@ begin
   sqlite3SrcListDelete(pParse^.db, pSrc);
 end;
 
-procedure sqlite3AlterFunctions;
+{ alter.c:2826 — failConstraintFunc.  SQL function `sqlite_fail(MSG, ERR)`:
+  raises a runtime error with message MSG and error code ERR.  Used by the
+  ALTER TABLE rename helpers to abort a synthesised UPDATE when a rewritten
+  CREATE statement would violate an existing constraint.  Faithful 1:1 of
+  the C body. }
+procedure failConstraintFunc(pCtx: Psqlite3_context; argc: i32;
+  argv: PPMem); cdecl;
+var
+  zText: PAnsiChar;
+  err:   i32;
 begin
-  { Phase 7 }
+  zText := sqlite3_value_text(Psqlite3_value(argv^));
+  err   := sqlite3_value_int(Psqlite3_value((argv + 1)^));
+  sqlite3_result_error(pCtx, zText, -1);
+  sqlite3_result_error_code(pCtx, err);
+end;
+
+var
+  aAlterTableFuncs: array[0..0] of TFuncDef;
+  alterFuncsInited: Boolean = False;
+
+{ alter.c:3042 — sqlite3AlterFunctions.  Registers the SQL helpers used
+  by the ALTER TABLE rename / drop machinery.  Currently exposes only
+  `sqlite_fail` (the only helper whose body has been ported); the other
+  eight INTERNAL_FUNCTION rows from the C reference (sqlite_rename_*,
+  sqlite_drop_*, sqlite_add_constraint, sqlite_find_constraint) will be
+  added as their bodies land alongside Phase 7.1.9 ALTER TABLE work.
+  Idempotent — guarded by alterFuncsInited so the static FuncDef hash
+  links survive across repeated sqlite3RegisterBuiltinFunctions calls
+  (same convention as aBuiltinFuncs / aBuiltinAgg). }
+procedure sqlite3AlterFunctions;
+const
+  ALTER_FUNC_FLAGS = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN
+                  or SQLITE_FUNC_INTERNAL or SQLITE_FUNC_CONSTANT;
+begin
+  if alterFuncsInited then Exit;
+  alterFuncsInited := True;
+  FillChar(aAlterTableFuncs[0], SizeOf(aAlterTableFuncs[0]), 0);
+  aAlterTableFuncs[0].nArg      := 2;
+  aAlterTableFuncs[0].funcFlags := ALTER_FUNC_FLAGS;
+  aAlterTableFuncs[0].xSFunc    := @failConstraintFunc;
+  aAlterTableFuncs[0].zName     := 'sqlite_fail';
+  sqlite3InsertBuiltinFuncs(@aAlterTableFuncs, Length(aAlterTableFuncs));
 end;
 
 { alter.c:802 — sqlite3RenameTokenRemap.  Walks pParse^.pRename and
@@ -31451,6 +31491,7 @@ begin
   InitBuiltinAgg;
   sqlite3InsertBuiltinFuncs(@aBuiltinFuncs, Length(aBuiltinFuncs));
   sqlite3InsertBuiltinFuncs(@aBuiltinAgg,   Length(aBuiltinAgg));
+  sqlite3AlterFunctions;
   sqlite3RegisterJsonFunctions;
   sqlite3RegisterDateTimeFunctions;
 end;
