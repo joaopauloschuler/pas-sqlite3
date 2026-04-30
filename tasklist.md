@@ -373,6 +373,24 @@ Important: At the end of this document, please find:
             TestExplainParity 1016/1026 unchanged; DiagFeatureProbe 9
             unchanged; TestSchemaBasic 44/0; TestDMLBasic 54/0;
             TestParser unchanged.
+       [X] `codeVectorCompare` + `exprCodeSubselect` + `exprVectorRegister`
+            (expr.c:697/:631/:659) — ported 2026-04-30 in
+            passqlite3codegen.pas.  Replaces the OP_Null degrade arm in the
+            TK_LT/LE/GT/GE/EQ/NE/IS/ISNOT vector-LHS path
+            (codegen.pas:5326), and replaces the "subselect not yet ported"
+            assert in `codeExprOrVector` (codegen.pas:35643) with the
+            sqlite3CodeSubselect + OP_Copy(iSelect..iReg, nReg-1) emit per
+            wherecode.c:1320.  Faithful 1:1: regLeft/regRight via
+            exprCodeSubselect, per-element compare with TK_LE→TK_LT /
+            TK_GE→TK_GT_TK / TK_NE→TK_EQ opx swaps, OP_ElseEq chaining,
+            OP_ZeroOrNull (or OP_Integer 0 in NULLEQ mode) result write,
+            OP_NotNull short-circuit on TK_EQ, and final OP_Not flip on
+            TK_NE.  Active path: row-value comparisons inside WHERE/SELECT
+            (`(a,b)=(1,2)`, `(a,b)<(1,2)`, etc.) now emit real bytecode
+            instead of producing NULL or aborting.  TestExplainParity
+            unchanged (1016/1026); TestDMLBasic 54/0; TestSchemaBasic 44/0;
+            TestParser 43/2 (pre-existing baseline); TestVdbeArith 41/0;
+            TestVdbeMisc 45/0.
        [X] `sqlite3Stat4ProbeFree` (vdbemem.c:2194) — ported 2026-04-30 in
             passqlite3vdbe.pas.  Replaces the empty stub.  Walks the
             per-column Mem array (length read from pKeyInfo offset 8 =

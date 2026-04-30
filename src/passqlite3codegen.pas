@@ -4087,6 +4087,8 @@ function emitScalarFunctionCall(pParse: PParse; pExpr: PExpr;
 procedure exprCodeBetween(pParse: PParse; pExpr: PExpr; dest: i32;
   jumpKind: i32; jumpIfNull: i32); forward;
 function exprEvalRhsFirst(pExpr: PExpr): i32; forward;
+procedure codeVectorCompare(pParse: PParse; pExpr: PExpr; dest: i32;
+  op, p5: u8); forward;
 
 function exprDup_(db: PTsqlite3; const p: PExpr; dupFlags: i32;
   pEdupBuf: Pointer): PExpr;
@@ -5323,9 +5325,7 @@ begin
           addrIsNull := 0;
           if sqlite3ExprIsVector(pLeft) <> 0 then
           begin
-            { TODO(11g.2.b): port codeVectorCompare; for now degrade
-              to OP_Null so the dispatch is total. }
-            sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+            codeVectorCompare(pParse, pExpr, target, u8(op), u8(p5));
           end
           else
           begin
@@ -14166,6 +14166,136 @@ begin
     end;
   end;
   Result := pVector;
+end;
+
+{ exprCodeSubselect — port of expr.c:631.  Code a TK_SELECT into registers
+  and return the first; non-TK_SELECT returns 0 (caller's regSelect base). }
+function exprCodeSubselect(pParse: PParse; pExpr: PExpr): i32;
+begin
+  Result := 0;
+  if pExpr^.op = TK_SELECT then
+    Result := sqlite3CodeSubselect(pParse, pExpr);
+end;
+
+{ exprVectorRegister — port of expr.c:659.  Return the register holding
+  field iField of a vector expression; for TK_VECTOR, codes the element
+  on demand into a temp register and reports it via pRegFree. }
+function exprVectorRegister(pParse: PParse; pVector: PExpr; iField: i32;
+  regSelect: i32; ppExpr: PPExpr; pRegFree: Pi32): i32;
+var
+  op: u8;
+begin
+  op := pVector^.op;
+  Assert((op = TK_VECTOR) or (op = TK_REGISTER) or (op = TK_SELECT)
+         or (op = TK_ERROR));
+  if op = TK_REGISTER then
+  begin
+    ppExpr^ := sqlite3VectorFieldSubexpr(pVector, iField);
+    Result := pVector^.iTable + iField;
+    Exit;
+  end;
+  if op = TK_SELECT then
+  begin
+    Assert(ExprUseXSelect(pVector));
+    ppExpr^ := ExprListItems(pVector^.x.pSelect^.pEList)[iField].pExpr;
+    Result := regSelect + iField;
+    Exit;
+  end;
+  if op = TK_VECTOR then
+  begin
+    Assert(ExprUseXList(pVector));
+    ppExpr^ := ExprListItems(pVector^.x.pList)[iField].pExpr;
+    Result := sqlite3ExprCodeTemp(pParse, ppExpr^, pRegFree);
+    Exit;
+  end;
+  Result := 0;
+end;
+
+{ codeVectorCompare — port of expr.c:697..784.  Emit row-value comparison
+  bytecode for vector EQ/NE/IS/ISNOT/LT/LE/GT/GE.  Result (1, 0, NULL) is
+  written into register dest. }
+procedure codeVectorCompare(pParse: PParse; pExpr: PExpr; dest: i32;
+  op, p5: u8);
+var
+  v:          PVdbe;
+  pLeft:     PExpr;
+  pRight:    PExpr;
+  nLeft:     i32;
+  i:         i32;
+  regLeft:   i32;
+  regRight:  i32;
+  opx:       u8;
+  addrCmp:   i32;
+  addrDone:  i32;
+  isCommuted: i32;
+  regFree1:  i32;
+  regFree2:  i32;
+  pL, pR:    PExpr;
+  r1, r2:    i32;
+begin
+  v := pParse^.pVdbe;
+  pLeft := pExpr^.pLeft;
+  pRight := pExpr^.pRight;
+  nLeft := sqlite3ExprVectorSize(pLeft);
+  regLeft := 0;
+  regRight := 0;
+  opx := op;
+  addrCmp := 0;
+  addrDone := sqlite3VdbeMakeLabel(pParse);
+  if ExprHasProperty(pExpr, EP_Commuted) then isCommuted := 1
+  else isCommuted := 0;
+
+  if pParse^.nErr <> 0 then Exit;
+  if nLeft <> sqlite3ExprVectorSize(pRight) then
+  begin
+    sqlite3ErrorMsg(pParse, 'row value misused');
+    Exit;
+  end;
+
+  if op = TK_LE then opx := TK_LT;
+  if op = TK_GE then opx := TK_GT_TK;
+  if op = TK_NE then opx := TK_EQ;
+
+  regLeft  := exprCodeSubselect(pParse, pLeft);
+  regRight := exprCodeSubselect(pParse, pRight);
+
+  sqlite3VdbeAddOp2(v, OP_Integer, 1, dest);
+  i := 0;
+  while True do
+  begin
+    regFree1 := 0;
+    regFree2 := 0;
+    pL := nil;
+    pR := nil;
+    Assert((i >= 0) and (i < nLeft));
+    if addrCmp <> 0 then sqlite3VdbeJumpHere(v, addrCmp);
+    r1 := exprVectorRegister(pParse, pLeft,  i, regLeft,  @pL, @regFree1);
+    r2 := exprVectorRegister(pParse, pRight, i, regRight, @pR, @regFree2);
+    addrCmp := sqlite3VdbeCurrentAddr(v);
+    codeCompare(pParse, pL, pR, opx, r1, r2, addrDone, p5, isCommuted);
+    sqlite3ReleaseTempReg(pParse, regFree1);
+    sqlite3ReleaseTempReg(pParse, regFree2);
+    if ((opx = TK_LT) or (opx = TK_GT_TK)) and (i < nLeft - 1) then
+      addrCmp := sqlite3VdbeAddOp0(v, OP_ElseEq);
+    if p5 = SQLITE_NULLEQ then
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, dest)
+    else
+      sqlite3VdbeAddOp3(v, OP_ZeroOrNull, r1, dest, r2);
+    if i = nLeft - 1 then break;
+    if opx = TK_EQ then
+      sqlite3VdbeAddOp2(v, OP_NotNull, dest, addrDone)
+    else
+    begin
+      Assert((op = TK_LT) or (op = TK_GT_TK) or (op = TK_LE) or (op = TK_GE));
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, addrDone);
+      if i = nLeft - 2 then opx := op;
+    end;
+    Inc(i);
+  end;
+  sqlite3VdbeJumpHere(v, addrCmp);
+  sqlite3VdbeResolveLabel(v, addrDone);
+  if op = TK_NE then
+    sqlite3VdbeAddOp2(v, OP_Not, dest, dest);
 end;
 
 function sqlite3ExprNeedsNoAffinityChange(const p: PExpr; aff: AnsiChar): i32;
@@ -35633,22 +35763,20 @@ end;
 
 procedure codeExprOrVector(pParse: PParse; p: PExpr; iReg: i32; nReg: i32);
 var
-  v:     PVdbe;
-  pList: PExprList;
-  pItem: PExprListItem;
-  i:     i32;
+  v:       PVdbe;
+  pList:   PExprList;
+  pItem:   PExprListItem;
+  i:       i32;
+  iSelect: i32;
 begin
   Assert(nReg > 0);
   if (p <> nil) and (sqlite3ExprIsVector(p) <> 0) then begin
     if ExprUseXSelect(p) then begin
-      { TK_SELECT vector RHS — sqlite3CodeSubselect not yet ported.  When the
-        prerequisite lands (batch 6, alongside codeINTerm proper), restore the
-        OP_Copy(iSelect..iReg, nReg-1) path verbatim. }
+      { Port of wherecode.c:1320..1330 TK_SELECT vector RHS arm. }
       v := pParse^.pVdbe;
       Assert(p^.op = TK_SELECT);
-      Assert(False, 'codeExprOrVector: TK_SELECT subselect not yet ported');
-      { Suppress "unused" warning. }
-      if v = nil then Exit;
+      iSelect := sqlite3CodeSubselect(pParse, p);
+      sqlite3VdbeAddOp3(v, OP_Copy, iSelect, iReg, nReg - 1);
     end else begin
       Assert(ExprUseXList(p));
       pList := p^.x.pList;
