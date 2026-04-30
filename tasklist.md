@@ -543,9 +543,25 @@ Important: At the end of this document, please find:
             ADD COLUMN.  Closing depends on full sqlite3NestedParse.
        [ ] Port `sqlite3AlterRenameColumn`
        [ ] Port `sqlite3AlterDropColumn`
-       [ ] Port `sqlite3AlterDropConstraint`
-       [ ] Port `sqlite3AlterSetNotNull`
-       [ ] Port `sqlite3AlterAddConstraint`.
+       [X] Port `sqlite3AlterDropConstraint` — ported 2026-04-30 (alter.c:2783)
+            in passqlite3codegen.pas.  Replaces the Phase 7 stub.  Routes
+            through new `alterFindTable` (alter.c:2742) + `alterFindCol`
+            (alter.c:2701) helpers, builds the `sqlite_drop_constraint(sql,
+            <iCol|name>)` UPDATE on sqlite_master via sqlite3NestedParse,
+            then renameReloadSchema(...,INITFLAG_AlterDropCons).  Live once
+            sqlite3NestedParse leaves skeleton (Phase 7.1.2).
+       [X] Port `sqlite3AlterSetNotNull` — ported 2026-04-30 (alter.c:2881).
+            Emits the IS-NULL probe via sqlite_fail and the splice via
+            sqlite_add_constraint(sqlite_drop_constraint(sql,iCol),text,iCol).
+            Static helper `alterRtrimConstraint` (alter.c:2851) ported
+            alongside (rtrim trailing whitespace and `--` comments).
+            Live alongside Phase 7.1.2.
+       [X] Port `sqlite3AlterAddConstraint` — ported 2026-04-30 (alter.c:2983).
+            Emits the duplicate-name guard via sqlite_find_constraint, the
+            `(expr) IS NOT TRUE` violation probe via sqlite_fail, then the
+            sqlite_add_constraint(sql,text,-1) splice on sqlite_master.
+            Live alongside Phase 7.1.2.
+            Helper port: `isRealTable` (alter.c:566).
        [X] Port `sqlite3AlterBeginAddColumn` — ported 2026-04-30 (alter.c:483)
             in passqlite3codegen.pas.  Clones the target Table into
             pParse^.pNewTable under `sqlite_altertab_<orig>`.

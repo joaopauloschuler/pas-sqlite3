@@ -28583,24 +28583,257 @@ begin
   sqlite3SrcListDelete(pParse^.db, pSrc);
 end;
 
+{ alter.c:566 — isRealTable.  Returns 1 (and posts an error) when the named
+  table is a view or virtual table; the iOp index selects the verb in the
+  emitted error message ("rename columns of" / "drop column from" /
+  "edit constraints of").  Static in C; unit-level here. }
+function isRealTable(pParse: PParse; pTab: PTable2; iOp: i32): i32;
+const
+  azMsg: array[0..2] of PAnsiChar = (
+    'rename columns of', 'drop column from', 'edit constraints of'
+  );
+var
+  zType: PAnsiChar;
+begin
+  zType := nil;
+  if IsView(pTab) then zType := 'view'
+  else if pTab^.eTabType = TABTYP_VTAB then zType := 'virtual table';
+  if zType <> nil then begin
+    AssertH((iOp >= 0) and (iOp < 3), 'isRealTable: iOp out of range');
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+      'cannot %s %s "%s"', [azMsg[iOp], zType, pTab^.zName]));
+    Exit(1);
+  end;
+  Result := 0;
+end;
+
+{ alter.c:2742 — alterFindTable.  Look up the table named by the first entry
+  in source-list pSrc; on success writes *piDb and *pzDb, validates that the
+  table is alterable / real, runs the optional auth check, then deletes pSrc.
+  Returns the located Table* or nil. }
+function alterFindTable(pParse: PParse; pSrc: PSrcList;
+  piDb: Pi32; pzDb: PPAnsiChar; bAuth: i32): PTable2;
+var
+  db:     PTsqlite3;
+  pTab:   PTable2;
+  iDb:    i32;
+  sItems: PSrcItem;
+begin
+  db   := pParse^.db;
+  pTab := nil;
+  sItems := SrcListItems(pSrc);
+  pTab := sqlite3LocateTableItem(pParse, 0, @sItems[0]);
+  if pTab <> nil then begin
+    iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+    pzDb^ := db^.aDb[iDb].zDbSName;
+    piDb^ := iDb;
+    if (isRealTable(pParse, pTab, 2) <> 0)
+       or (isAlterableTable(pParse, pTab) <> 0) then
+      pTab := nil;
+  end;
+  if (pTab <> nil) and (bAuth <> 0) then begin
+    if sqlite3AuthCheck(pParse, SQLITE_ALTER_TABLE, pzDb^,
+                        pTab^.zName, nil) <> 0 then
+      pTab := nil;
+  end;
+  sqlite3SrcListDelete(db, pSrc);
+  Result := pTab;
+end;
+
+{ alter.c:2701 — alterFindCol.  Resolve column name pCol within pTab, write
+  the column index to *piCol and post "no such column" on miss.  Auth-
+  checks ALTER TABLE on the column when authorisation is enabled. }
+function alterFindCol(pParse: PParse; pTab: PTable2; pCol: PToken;
+  piCol: Pi32): i32;
+var
+  db:    PTsqlite3;
+  zName: PAnsiChar;
+  rc:    i32;
+  iCol:  i32;
+  zDb:   PAnsiChar;
+  zColN: PAnsiChar;
+begin
+  db := pParse^.db;
+  zName := nil;
+  if pCol <> nil then begin
+    zName := sqlite3DbStrNDup(db, pCol^.z, u64(pCol^.n));
+    if zName <> nil then sqlite3Dequote(zName);
+  end;
+  rc   := SQLITE_NOMEM;
+  iCol := -1;
+  if zName <> nil then begin
+    iCol := sqlite3ColumnIndex(pTab, zName);
+    if iCol < 0 then begin
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'no such column: %s', [zName]));
+      rc := SQLITE_ERROR;
+    end else
+      rc := SQLITE_OK;
+  end;
+  if rc = SQLITE_OK then begin
+    zDb   := db^.aDb[sqlite3SchemaToIndex(db, pTab^.pSchema)].zDbSName;
+    zColN := pTab^.aCol[iCol].zCnName;
+    if sqlite3AuthCheck(pParse, SQLITE_ALTER_TABLE, zDb,
+                        pTab^.zName, zColN) <> 0 then
+      pTab := nil;
+  end;
+  sqlite3DbFree(db, zName);
+  piCol^ := iCol;
+  Result := rc;
+end;
+
+{ alter.c:2851 — alterRtrimConstraint.  Return the byte length of pCons[]
+  with trailing whitespace and "--" line comments stripped (C-style
+  comments are kept).  Returns 0 on OOM. }
+function alterRtrimConstraint(db: PTsqlite3; pCons: PAnsiChar;
+  nCons: i32): i32;
+var
+  zTmp:   PByte;
+  iOff:   i32;
+  iEnd:   i32;
+  t:      i32;
+  nToken: i32;
+begin
+  zTmp := PByte(sqlite3MPrintf(db, '%.*s', [nCons, pCons]));
+  iOff := 0;
+  iEnd := 0;
+  if zTmp = nil then Exit(0);
+  while True do begin
+    t := 0;
+    nToken := i32(sqlite3GetToken(zTmp + iOff, @t));
+    if t = TK_ILLEGAL then break;
+    if (t <> TK_SPACE) and ((t <> TK_COMMENT) or ((zTmp + iOff)^ <> Ord('-'))) then
+      iEnd := iOff + nToken;
+    iOff := iOff + nToken;
+  end;
+  sqlite3DbFree(db, zTmp);
+  Result := iEnd;
+end;
+
+{ alter.c:2783 — sqlite3AlterDropConstraint.  Bytecode for either
+  `ALTER TABLE pSrc DROP CONSTRAINT pCons` or
+  `ALTER TABLE pSrc ALTER pCol DROP NOT NULL`; exactly one of pCons / pCol
+  is non-nil.  Edits the CREATE TABLE source via sqlite_drop_constraint and
+  reloads the schema. }
 procedure sqlite3AlterDropConstraint(pParse: PParse; pSrc: PSrcList;
   pType: PToken; pName: PToken);
+var
+  db:   PTsqlite3;
+  pTab: PTable2;
+  iDb:  i32;
+  zDb:  PAnsiChar;
+  zArg: PAnsiChar;
+  iCol: i32;
 begin
-  sqlite3SrcListDelete(pParse^.db, pSrc);
+  db   := pParse^.db;
+  iDb  := 0;
+  zDb  := nil;
+  zArg := nil;
+  AssertH((pName = nil) <> (pType = nil),
+    'AlterDropConstraint: exactly one of pType/pName');
+  AssertH(pSrc^.nSrc = 1, 'AlterDropConstraint: pSrc^.nSrc<>1');
+  pTab := alterFindTable(pParse, pSrc, @iDb, @zDb, i32(Ord(pType <> nil)));
+  if pTab = nil then Exit;
+  if pType <> nil then begin
+    zArg := sqlite3MPrintf(db, '%.*Q', [i32(pType^.n), pType^.z]);
+  end else begin
+    if alterFindCol(pParse, pTab, pName, @iCol) <> 0 then Exit;
+    zArg := sqlite3MPrintf(db, '%d', [iCol]);
+  end;
+  sqlite3NestedParse(pParse,
+    'UPDATE "%w".' + LEGACY_SCHEMA_TABLE + ' SET '
+    + 'sql = sqlite_drop_constraint(sql, %s) '
+    + 'WHERE type=''table'' AND tbl_name=%Q COLLATE nocase',
+    [zDb, zArg, pTab^.zName]);
+  sqlite3DbFree(db, zArg);
+  renameReloadSchema(pParse, iDb, INITFLAG_AlterDropCons);
 end;
 
+{ alter.c:2881 — sqlite3AlterSetNotNull.  Bytecode for
+  `ALTER TABLE pSrc ALTER pCol SET NOT NULL`: validates no existing row
+  violates the constraint, then patches the CREATE TABLE source by
+  splicing the trimmed constraint span into column iCol via
+  sqlite_add_constraint(sqlite_drop_constraint(sql, iCol), text, iCol). }
 procedure sqlite3AlterSetNotNull(pParse: PParse; pSrc: PSrcList;
   pName: PToken; pNot: PToken);
+var
+  pTab:  PTable2;
+  iCol:  i32;
+  iDb:   i32;
+  zDb:   PAnsiChar;
+  pCons: PAnsiChar;
+  nCons: i32;
 begin
-  sqlite3SrcListDelete(pParse^.db, pSrc);
+  iCol  := 0;
+  iDb   := 0;
+  zDb   := nil;
+  pCons := nil;
+  AssertH(pSrc^.nSrc = 1, 'AlterSetNotNull: pSrc^.nSrc<>1');
+  pTab := alterFindTable(pParse, pSrc, @iDb, @zDb, 0);
+  if pTab = nil then Exit;
+  if alterFindCol(pParse, pTab, pName, @iCol) <> 0 then Exit;
+  pCons := pNot^.z;
+  nCons := alterRtrimConstraint(pParse^.db, pCons,
+            i32(PtrUInt(pParse^.sLastToken.z) - PtrUInt(pCons)));
+  sqlite3NestedParse(pParse,
+    'SELECT sqlite_fail(''constraint failed'', %d) '
+    + 'FROM %Q.%Q AS x WHERE x.%.*s IS NULL',
+    [SQLITE_CONSTRAINT, zDb, pTab^.zName, i32(pName^.n), pName^.z]);
+  sqlite3NestedParse(pParse,
+    'UPDATE "%w".' + LEGACY_SCHEMA_TABLE + ' SET '
+    + 'sql = sqlite_add_constraint(sqlite_drop_constraint(sql, %d), %.*Q, %d) '
+    + 'WHERE type=''table'' AND tbl_name=%Q COLLATE nocase',
+    [zDb, iCol, nCons, pCons, iCol, pTab^.zName]);
+  renameReloadSchema(pParse, iDb, INITFLAG_AlterDropCons);
 end;
 
+{ alter.c:2983 — sqlite3AlterAddConstraint.  Bytecode for
+  `ALTER TABLE pSrc ADD [CONSTRAINT pName] CHECK(pExpr)`: rejects duplicate
+  named constraints, validates no existing row violates the predicate,
+  then patches the CREATE TABLE source via
+  sqlite_add_constraint(sql, text, -1). }
 procedure sqlite3AlterAddConstraint(pParse: PParse; pSrc: PSrcList;
   pCons: PToken; pName: PToken; zCheck: PAnsiChar; nCheck: i32);
+var
+  db:     PTsqlite3;
+  pTab:   PTable2;
+  iDb:    i32;
+  zDb:    PAnsiChar;
+  pSrcT:  PAnsiChar;
+  nSrcT:  i32;
+  zName:  PAnsiChar;
 begin
-  { Phase 7.2e.7 stub — full body lives in alter.c.  Until Phase 8 ports
-    the ALTER TABLE ADD CONSTRAINT path, drop the SrcList and return. }
-  sqlite3SrcListDelete(pParse^.db, pSrc);
+  db    := pParse^.db;
+  iDb   := 0;
+  zDb   := nil;
+  pSrcT := nil;
+  AssertH(pSrc^.nSrc = 1, 'AlterAddConstraint: pSrc^.nSrc<>1');
+  pTab := alterFindTable(pParse, pSrc, @iDb, @zDb, 1);
+  if pTab = nil then Exit;
+  if pName <> nil then begin
+    zName := sqlite3DbStrNDup(db, pName^.z, u64(pName^.n));
+    if zName <> nil then sqlite3Dequote(zName);
+    sqlite3NestedParse(pParse,
+      'SELECT sqlite_fail(''constraint %q already exists'', %d) '
+      + 'FROM "%w".' + LEGACY_SCHEMA_TABLE + ' '
+      + 'WHERE type=''table'' AND tbl_name=%Q COLLATE nocase '
+      + 'AND sqlite_find_constraint(sql, %Q)',
+      [zName, SQLITE_ERROR, zDb, pTab^.zName, zName]);
+    sqlite3DbFree(db, zName);
+  end;
+  sqlite3NestedParse(pParse,
+    'SELECT sqlite_fail(''constraint failed'', %d) '
+    + 'FROM %Q.%Q WHERE (%.*s) IS NOT TRUE',
+    [SQLITE_CONSTRAINT, zDb, pTab^.zName, nCheck, zCheck]);
+  pSrcT := pCons^.z;
+  nSrcT := alterRtrimConstraint(db, pSrcT,
+            i32(PtrUInt(pParse^.sLastToken.z) - PtrUInt(pSrcT)));
+  sqlite3NestedParse(pParse,
+    'UPDATE "%w".' + LEGACY_SCHEMA_TABLE + ' SET '
+    + 'sql = sqlite_add_constraint(sql, %.*Q, -1) '
+    + 'WHERE type=''table'' AND tbl_name=%Q COLLATE nocase',
+    [zDb, nSrcT, pSrcT, pTab^.zName]);
+  renameReloadSchema(pParse, iDb, INITFLAG_AlterDropCons);
 end;
 
 { alter.c:2826 — failConstraintFunc.  SQL function `sqlite_fail(MSG, ERR)`:
