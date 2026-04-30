@@ -356,9 +356,15 @@ function  sqlite3PagerSetPagesize(pPager: PPager; pPageSize: Pu32;
             nReserve: i32): i32;
 procedure sqlite3PagerSetCachesize(pPager: PPager; mxPage: i32);
 function  sqlite3PagerSetSpillsize(pPager: PPager; mxPage: i32): i32;
+procedure sqlite3PagerSetMmapLimit(pPager: PPager; szMmap: i64);
 procedure sqlite3PagerShrink(pPager: PPager);
+function  sqlite3PagerTempSpace(pPager: PPager): Pointer;
 procedure sqlite3PagerSetFlags(pPager: PPager; pgFlags: u32);
 function  sqlite3PagerLockingMode(pPager: PPager; eMode: i32): i32;
+function  sqlite3PagerPagenumber(pPg: PDbPage): Pgno;
+function  sqlite3PagerIswriteable(pPg: PDbPage): i32;
+function  sqlite3PagerRefcount(pPager: PPager): i32;
+function  sqlite3PagerPageRefcount(pPg: PDbPage): i32;
 
 { 3.B.2a: Page access }
 function  sqlite3PagerSharedLock(pPager: PPager): i32;
@@ -2216,10 +2222,49 @@ begin
   Result := sqlite3PcacheSetSpillsize(pPager^.pPCache, mxPage);
 end;
 
+{ pager.c:3549 — sqlite3PagerSetMmapLimit. }
+procedure sqlite3PagerSetMmapLimit(pPager: PPager; szMmap: i64);
+begin
+  pPager^.szMmap := szMmap;
+  pagerFixMaplimit(pPager);
+end;
+
 { pager.c:3557 — sqlite3PagerShrink. }
 procedure sqlite3PagerShrink(pPager: PPager);
 begin
   sqlite3PcacheShrink(pPager^.pPCache);
+end;
+
+{ pager.c:3836 — sqlite3PagerTempSpace.  Returns the page-sized scratch
+  buffer allocated alongside the pager; used by btree.c freelist code. }
+function sqlite3PagerTempSpace(pPager: PPager): Pointer;
+begin
+  Result := pPager^.pTmpSpace;
+end;
+
+{ pager.c:4239 — sqlite3PagerPagenumber. }
+function sqlite3PagerPagenumber(pPg: PDbPage): Pgno;
+begin
+  Result := PPgHdr(pPg)^.pgno;
+end;
+
+{ pager.c:6258 — sqlite3PagerIswriteable. }
+function sqlite3PagerIswriteable(pPg: PDbPage): i32;
+begin
+  Result := i32(PPgHdr(pPg)^.flags and PGHDR_WRITEABLE);
+end;
+
+{ pager.c:6826 — sqlite3PagerRefcount (SQLITE_DEBUG only in C; exposed
+  unconditionally here since the Pas port has no SQLITE_DEBUG gate). }
+function sqlite3PagerRefcount(pPager: PPager): i32;
+begin
+  Result := i32(sqlite3PcacheRefCount(pPager^.pPCache));
+end;
+
+{ pager.c:6846 — sqlite3PagerPageRefcount. }
+function sqlite3PagerPageRefcount(pPg: PDbPage): i32;
+begin
+  Result := i32(sqlite3PcachePageRefcount(PPgHdr(pPg)));
 end;
 
 { pager.c ~3723: sqlite3PagerSetBusyHandler }

@@ -523,6 +523,15 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        returned `sqlite3_file*` matches `sqlite3PagerFile` of the
        backing pager.
 
+- [X] **8.x** Small pager accessor batch — ported 2026-04-29 in
+       passqlite3pager.pas: `sqlite3PagerSetMmapLimit` (pager.c:3549),
+       `sqlite3PagerTempSpace` (:3836), `sqlite3PagerPagenumber` (:4239),
+       `sqlite3PagerIswriteable` (:6258), `sqlite3PagerRefcount` (:6826),
+       `sqlite3PagerPageRefcount` (:6846).  Faithful 1:1 thin wrappers
+       around the existing pcache + Pager fields; exposed for downstream
+       PRAGMA / debug / btree consumers (closes the corresponding
+       symbol-gap entries from the 2026-04-28 public-API audit).
+
 - [X] **8.x** `sqlite3PagerOkToChangeJournalMode` (pager.c:7460) +
        `sqlite3PagerJournalSizeLimit` (pager.c:7473) — ported 2026-04-29
        in passqlite3pager.pas.  Tiny accessor pair: the first guards
