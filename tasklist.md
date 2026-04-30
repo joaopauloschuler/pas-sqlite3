@@ -510,7 +510,25 @@ Important: At the end of this document, please find:
        here when ported.)
 
 - [ ] **7.1.9** ALTER TABLE (alter.c):
-       [ ] Port `sqlite3AlterRenameTable`
+       [X] Port `sqlite3AlterRenameTable` — ported 2026-04-30 (alter.c:124)
+            in passqlite3codegen.pas.  Replaces the Phase 6.5 stub.  Locates
+            the target table, dequotes the new name, runs the collision
+            (FindTable / FindIndex / IsShadowTableOf), system-table /
+            CheckObjectName / view / auth guards; emits the three core
+            sqlite3NestedParse passes (sqlite_rename_table over schema sql,
+            tbl_name/name CASE rewrite, sqlite_sequence rename, temp-schema
+            view/trigger fixup), the OP_VRename xRename dispatch for vtabs
+            with a non-nil xRename, and finishes with renameReloadSchema +
+            renameTestSchema('after rename', 0).  Ported alongside:
+            `renameTestSchema` (alter.c:53).  Note: pParse^.colNamesSet
+            assignment dropped (no Pascal counterpart yet — benign because
+            the diagnostic SELECT at top level emits no rows).
+            sqlite3NameFromToken inlined since it's parser-unit-private.
+            TestExplainParity unchanged (1016/1026); DiagFeatureProbe
+            unchanged (9 divergences).  TestParser flips ALTER TABLE
+            rename PASS→FAIL: prepare now exercises sqlite3NestedParse
+            which is still skeleton (Phase 7.1.2), same trajectory as
+            ADD COLUMN.  Closing depends on full sqlite3NestedParse.
        [ ] Port `sqlite3AlterRenameColumn`
        [ ] Port `sqlite3AlterDropColumn`
        [ ] Port `sqlite3AlterDropConstraint`

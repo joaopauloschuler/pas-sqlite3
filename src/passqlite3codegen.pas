@@ -28099,12 +28099,6 @@ end;
 // Phase 6.5 — alter.c stubs
 // ===========================================================================
 
-procedure sqlite3AlterRenameTable(pParse: PParse; pSrc: PSrcList;
-  const pName: PToken);
-begin
-  sqlite3SrcListDelete(pParse^.db, pSrc);
-end;
-
 { alter.c:111 — renameReloadSchema.  Generate code to reload the schema for
   database iDb (and the temp database, when iDb<>1).  Static in C; unit-level
   here.  Faithful 1:1. }
@@ -28364,6 +28358,173 @@ begin
 
 exit_begin_add_column:
   sqlite3SrcListDelete(db, pSrc);
+end;
+
+{ alter.c:53 — renameTestSchema.  Generate code that raises an error if any
+  remaining schema row fails to re-parse after a rename.  Static in C; unit-
+  level here.  bTemp/bNoDQS are 0/1 ints.  Note: pParse^.colNamesSet has no
+  Pascal counterpart yet; the SELECT we emit is a top-level NestedParse that
+  returns no rows on the success path, so the missing flag is benign. }
+procedure renameTestSchema(pParse: PParse; zDb: PAnsiChar; bTemp: i32;
+  zWhen: PAnsiChar; bNoDQS: i32);
+begin
+  sqlite3NestedParse(pParse,
+    'SELECT 1 '
+    + 'FROM "%w".' + LEGACY_SCHEMA_TABLE + ' '
+    + 'WHERE name NOT LIKE ''sqliteX_%%'' ESCAPE ''X'''
+    + ' AND sql NOT LIKE ''create virtual%%'''
+    + ' AND sqlite_rename_test(%Q, sql, type, name, %d, %Q, %d)=NULL ',
+    [zDb, zDb, bTemp, zWhen, bNoDQS]);
+  if bTemp = 0 then
+    sqlite3NestedParse(pParse,
+      'SELECT 1 '
+      + 'FROM temp.' + LEGACY_SCHEMA_TABLE + ' '
+      + 'WHERE name NOT LIKE ''sqliteX_%%'' ESCAPE ''X'''
+      + ' AND sql NOT LIKE ''create virtual%%'''
+      + ' AND sqlite_rename_test(%Q, sql, type, name, 1, %Q, %d)=NULL ',
+      [zDb, zWhen, bNoDQS]);
+end;
+
+{ alter.c:124 — sqlite3AlterRenameTable.  Generate VDBE code for
+  ALTER TABLE <pSrc> RENAME TO <pName>.  Patches every CREATE TABLE/INDEX/
+  TRIGGER/VIEW row in sqlite_schema via sqlite_rename_table(), updates the
+  sqlite_schema tbl_name/name columns, optionally rewrites sqlite_sequence
+  and the temp schema, fires a virtual-table xRename via OP_VRename when
+  applicable, then reloads the schema and runs the after-rename test.
+  Faithful 1:1 of the C body; sqlite3NameFromToken inlined here because the
+  parser's helper is implementation-private to that unit. }
+procedure sqlite3AlterRenameTable(pParse: PParse; pSrc: PSrcList;
+  const pName: PToken);
+label
+  exit_rename_table;
+var
+  iDb:      i32;
+  zDb:      PAnsiChar;
+  pTab:     PTable2;
+  zName:    PAnsiChar;
+  db:       PTsqlite3;
+  nTabName: i32;
+  zTabName: PAnsiChar;
+  v:        PVdbe;
+  pVTab:    passqlite3vtab.PVTable;
+  sItems:   PSrcItem;
+  pMod:     PVtabModule;
+  i:        i32;
+begin
+  zName := nil;
+  pVTab := nil;
+  db    := pParse^.db;
+  if db^.mallocFailed <> 0 then goto exit_rename_table;
+  AssertH(pSrc^.nSrc = 1, 'AlterRenameTable: pSrc^.nSrc<>1');
+
+  sItems := SrcListItems(pSrc);
+  pTab := sqlite3LocateTableItem(pParse, 0, @sItems[0]);
+  if pTab = nil then goto exit_rename_table;
+  iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
+  zDb := db^.aDb[iDb].zDbSName;
+
+  { Inline of sqlite3NameFromToken (parser.pas:1586). }
+  if pName <> nil then begin
+    zName := sqlite3DbStrNDup(db, pName^.z, u64(pName^.n));
+    sqlite3Dequote(zName);
+  end;
+  if zName = nil then goto exit_rename_table;
+
+  if (sqlite3FindTable(db, zName, zDb) <> nil)
+     or (sqlite3FindIndex(db, zName, zDb) <> nil)
+     or (sqlite3IsShadowTableOf(db, pTab, zName) <> 0) then begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'there is already another table or index with this name: %s',
+      [zName]));
+    goto exit_rename_table;
+  end;
+
+  if isAlterableTable(pParse, pTab) <> 0 then goto exit_rename_table;
+  if sqlite3CheckObjectName(pParse, zName, 'table', zName) <> SQLITE_OK then
+    goto exit_rename_table;
+
+  if IsView(pTab) then begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'view %s may not be altered', [pTab^.zName]));
+    goto exit_rename_table;
+  end;
+
+  if sqlite3AuthCheck(pParse, SQLITE_ALTER_TABLE, zDb, pTab^.zName, nil) <> 0 then
+    goto exit_rename_table;
+
+  if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then
+    goto exit_rename_table;
+  if pTab^.eTabType = TABTYP_VTAB then begin
+    pVTab := sqlite3GetVTable(db, pTab);
+    if pVTab <> nil then begin
+      pMod := PVtabModule(pVTab^.pMod);
+      if (pMod = nil) or (pMod^.pModule = nil)
+         or (pMod^.pModule^.xRename = nil) then
+        pVTab := nil;
+    end;
+  end;
+
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then goto exit_rename_table;
+  sqlite3MayAbort(pParse);
+
+  zTabName := pTab^.zName;
+  nTabName := sqlite3Utf8CharLen(PChar(zTabName), -1);
+
+  { Rewrite all CREATE TABLE/INDEX/TRIGGER/VIEW statements in the schema. }
+  sqlite3NestedParse(pParse,
+    'UPDATE "%w".' + LEGACY_SCHEMA_TABLE + ' SET '
+    + 'sql = sqlite_rename_table(%Q, type, name, sql, %Q, %Q, %d) '
+    + 'WHERE (type!=''index'' OR tbl_name=%Q COLLATE nocase)'
+    + 'AND   name NOT LIKE ''sqliteX_%%'' ESCAPE ''X''',
+    [zDb, zDb, zTabName, zName, i32(Ord(iDb = 1)), zTabName]);
+
+  { Update tbl_name and name columns of sqlite_schema. }
+  sqlite3NestedParse(pParse,
+    'UPDATE %Q.' + LEGACY_SCHEMA_TABLE + ' SET '
+    + 'tbl_name = %Q, '
+    + 'name = CASE '
+    +   'WHEN type=''table'' THEN %Q '
+    +   'WHEN name LIKE ''sqliteX_autoindex%%'' ESCAPE ''X'' '
+    +   '     AND type=''index'' THEN '
+    +    '''sqlite_autoindex_'' || %Q || substr(name,%d+18) '
+    +   'ELSE name END '
+    + 'WHERE tbl_name=%Q COLLATE nocase AND '
+    + '(type=''table'' OR type=''index'' OR type=''trigger'');',
+    [zDb, zName, zName, zName, nTabName, zTabName]);
+
+  { Update sqlite_sequence if present. }
+  if sqlite3FindTable(db, 'sqlite_sequence', zDb) <> nil then
+    sqlite3NestedParse(pParse,
+      'UPDATE "%w".sqlite_sequence set name = %Q WHERE name = %Q',
+      [zDb, zName, pTab^.zName]);
+
+  { If renamed table is not in temp, fix view/trigger defs in temp too. }
+  if iDb <> 1 then
+    sqlite3NestedParse(pParse,
+      'UPDATE sqlite_temp_schema SET '
+      + 'sql = sqlite_rename_table(%Q, type, name, sql, %Q, %Q, 1), '
+      + 'tbl_name = '
+      +   'CASE WHEN tbl_name=%Q COLLATE nocase AND '
+      +   '  sqlite_rename_test(%Q, sql, type, name, 1, ''after rename'', 0) '
+      +   'THEN %Q ELSE tbl_name END '
+      + 'WHERE type IN (''view'', ''trigger'')',
+      [zDb, zTabName, zName, zTabName, zDb, zName]);
+
+  { If this is a vtab with xRename, fire OP_VRename. }
+  if pVTab <> nil then begin
+    Inc(pParse^.nMem);
+    i := pParse^.nMem;
+    sqlite3VdbeLoadString(v, i, zName);
+    sqlite3VdbeAddOp4(v, OP_VRename, i, 0, 0, PAnsiChar(pVTab), P4_VTAB);
+  end;
+
+  renameReloadSchema(pParse, iDb, INITFLAG_AlterRename);
+  renameTestSchema(pParse, zDb, i32(Ord(iDb = 1)), 'after rename', 0);
+
+exit_rename_table:
+  sqlite3SrcListDelete(db, pSrc);
+  sqlite3DbFree(db, zName);
 end;
 
 procedure sqlite3AlterRenameColumn(pParse: PParse; pSrc: PSrcList;
