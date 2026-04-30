@@ -373,6 +373,19 @@ Important: At the end of this document, please find:
             TestExplainParity 1016/1026 unchanged; DiagFeatureProbe 9
             unchanged; TestSchemaBasic 44/0; TestDMLBasic 54/0;
             TestParser unchanged.
+       [X] `sqlite3Stat4ProbeFree` (vdbemem.c:2194) — ported 2026-04-30 in
+            passqlite3vdbe.pas.  Replaces the empty stub.  Walks the
+            per-column Mem array (length read from pKeyInfo offset 8 =
+            nAllField), invokes sqlite3VdbeMemRelease on each cell, drops
+            the KeyInfo reference via the new gKeyInfoUnref hook
+            (registered from passqlite3codegen at unit init alongside
+            gValueFromExprImpl), then sqlite3DbFreeNN the record itself.
+            Dead-code today (gated on SQLITE_ENABLE_STAT4 in C; the where.c
+            caller `sqlite3Stat4ProbeFree(pBuilder^.pRec)` runs only when
+            STAT4 stats are loaded), but flips the function from a silent
+            leak to faithful 1:1 once STAT4 is enabled.  TestExplainParity
+            1016/1026 unchanged; TestDMLBasic 54/0; TestSchemaBasic 44/0;
+            TestPager 12/12.
 
 ### Open Bugs
 

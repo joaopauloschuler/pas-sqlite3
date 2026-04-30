@@ -37521,5 +37521,6 @@ initialization
   passqlite3vdbe.gBlobOpenImpl           := @vdbeBlobOpenImpl;
   passqlite3vdbe.gBlobReopenImpl         := @vdbeBlobReopenImpl;
   passqlite3vdbe.gValueFromExprImpl      := @valueFromExprTrampoline;
+  passqlite3vdbe.gKeyInfoUnref           := passqlite3vdbe.TKeyInfoUnrefFn(@sqlite3KeyInfoUnref);
 
 end.
