@@ -343,6 +343,19 @@ Important: At the end of this document, please find:
             seed.  DiagPragma 12→10 divergences (regression closed);
             TestExplainParity 1016/1026 unchanged; DiagFeatureProbe
             9 unchanged; TestPager 12/12; TestSchemaBasic 44/0.
+       [X] `OP_FkCheck` opcode body — wired 2026-04-30 in passqlite3vdbe.pas
+            (vdbe.c:1730).  Replaces the no-op "Phase 6 schema/codegen" stub
+            with a faithful 1:1: dispatches to the existing
+            `sqlite3VdbeCheckFkImmediate` (already ported in vdbe.pas:3921)
+            and routes its return through `abort_due_to_error` on non-OK.
+            Active path: the FK-codegen stubs (`sqlite3FkCheck`/`sqlite3FkActions`)
+            remain Phase 7 no-ops, so OP_FkCheck still fires only via the
+            existing emit site in codegen.pas:21806; on a clean db the
+            check trivially returns SQLITE_OK (nFkConstraint=0), but the
+            opcode now correctly raises SQLITE_CONSTRAINT_FOREIGNKEY when
+            unresolved immediate FKs accumulate.  TestExplainParity
+            unchanged (1016/1026); DiagFeatureProbe unchanged (9 divergences);
+            TestDMLBasic 54/0; TestSchemaBasic 44/0.
        [X] `createTableStmt` + `identLength` + `identPut` (build.c:2112 /
             :2063 / :2084) — ported 2026-04-30.  Lives in
             passqlite3parser.pas because identPut needs sqlite3KeywordCode

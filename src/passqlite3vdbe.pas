@@ -9662,9 +9662,10 @@ begin
       end;
     end;
 
-    { ────── OP_FkCheck ────── — stub (vdbe.c:~8120) }
+    { ────── OP_FkCheck ────── (vdbe.c:1730) }
     OP_FkCheck: begin
-      { FK check requires Phase 6 schema/codegen }
+      rc := sqlite3VdbeCheckFkImmediate(v);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
     end;
 
     { ────── OP_RowSetAdd ────── (vdbe.c:7362) }
