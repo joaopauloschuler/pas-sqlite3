@@ -206,6 +206,17 @@ Important: At the end of this document, please find:
             last SrcItem and tags it isTabFunc (fgBits bit 3) so the
             table-valued-function FROM-item arm of the planner sees
             the args.  TestExplainParity unchanged (1016/1026).
+       [X] `sqlite3LogEstFromDouble` + `sqlite3LogEstToInt` +
+            `sqlite3ErrorToParser` — ported 2026-04-29 (util.c:2125 /
+            :2139 / :273).  LogEst conversions are the inverse helpers
+            of the existing sqlite3LogEst (fast double→LogEst via the
+            IEEE-754 exponent for x>2e9, otherwise the integer path;
+            LogEst→u64 reconstruction uses the n%10/n/10 shift table).
+            ErrorToParser propagates an error code into db^.pParse->rc
+            and bumps nErr; returns the code unchanged so callers can
+            tail-return through it.  Faithful 1:1; not yet wired into
+            consumers (planner cost model + a few error sites still use
+            inline equivalents) but exposed for downstream wiring.
 
 ### Open Bugs
 

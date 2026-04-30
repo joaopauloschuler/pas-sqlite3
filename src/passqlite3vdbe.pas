@@ -1541,6 +1541,8 @@ procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
 procedure sqlite3RollbackAll(pDb: PTsqlite3; tripCode: i32);
 function  sqlite3LogEst(n: u64): i16;
 function  sqlite3LogEstAdd(a: i16; b: i16): i16;
+function  sqlite3LogEstFromDouble(x: Double): i16;
+function  sqlite3LogEstToInt(x: i16): u64;
 
 procedure sqlite3ValueApplyAffinity(pVal: Psqlite3_value; aff: u8; enc: u8);
 function  sqlite3ValueText(pVal: Psqlite3_value; enc: u8): Pointer;
@@ -11867,6 +11869,41 @@ begin
     if b > a + 31 then Exit(i16(b + 1));
     Result := i16(b + x[b - a]);
   end;
+end;
+
+{ util.c:2125 — Convert a double into a LogEst, i.e. compute an
+  approximation for 10*log2(x).  Uses the integer LogEst path for
+  values up to 2e9; above that, decode the IEEE-754 binary64 exponent
+  directly from the bit pattern. }
+function sqlite3LogEstFromDouble(x: Double): i16;
+var
+  a: u64;
+  e: i16;
+begin
+  if x <= 1 then begin Result := 0; Exit; end;
+  if x <= 2000000000 then begin Result := sqlite3LogEst(u64(Trunc(x))); Exit; end;
+  Move(x, a, 8);
+  e := i16((a shr 52) - 1022);
+  Result := i16(e * 10);
+end;
+
+{ util.c:2139 — Convert a LogEst into an integer.  Inverse of
+  sqlite3LogEst (within the rounding precision of LogEst). }
+function sqlite3LogEstToInt(x: i16): u64;
+var
+  n: u64;
+  xi: i32;
+begin
+  xi := x;
+  n  := u64(xi mod 10);
+  xi := xi div 10;
+  if n >= 5 then n := n - 2
+  else if n >= 1 then n := n - 1;
+  if xi > 60 then begin Result := u64(LARGEST_INT64); Exit; end;
+  if xi >= 3 then
+    Result := (n + 8) shl (xi - 3)
+  else
+    Result := (n + 8) shr (3 - xi);
 end;
 
 { -----------------------------------------------------------------------

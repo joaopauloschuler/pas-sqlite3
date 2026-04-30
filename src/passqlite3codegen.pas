@@ -2819,6 +2819,7 @@ procedure sqlite3RunParser(pParse: PParse; zSql: PAnsiChar);
 function  sqlite3SafetyCheckOk(db: PTsqlite3): i32;
 function  sqlite3SafetyCheckSickOrOk(db: PTsqlite3): i32;
 procedure sqlite3Error(db: PTsqlite3; err_code: i32);
+function  sqlite3ErrorToParser(db: PTsqlite3; errCode: i32): i32;
 procedure sqlite3ErrorWithMsg(db: PTsqlite3; err_code: i32;
   zFmt: PAnsiChar);
 procedure sqlite3ErrorClear(db: PTsqlite3);
@@ -27899,6 +27900,23 @@ end;
 procedure sqlite3Error(db: PTsqlite3; err_code: i32);
 begin
   db^.errCode := err_code;
+end;
+
+{ util.c:273 — sqlite3ErrorToParser.  If db has a current Parse stack
+  top, propagate errCode into pParse^.rc and bump pParse^.nErr.  Used
+  by helpers that detect an error mid-parse and need the parser to
+  abort cleanly.  Returns errCode unchanged so callers can write
+  `return sqlite3ErrorToParser(db, SQLITE_FOO);`. }
+function sqlite3ErrorToParser(db: PTsqlite3; errCode: i32): i32;
+var
+  pPrs: PParse;
+begin
+  Result := errCode;
+  if db = nil then Exit;
+  pPrs := PParse(db^.pParse);
+  if pPrs = nil then Exit;
+  pPrs^.rc := errCode;
+  Inc(pPrs^.nErr);
 end;
 
 { Port of util.c:192 sqlite3ErrorWithMsg.  Pas callers pre-format the
