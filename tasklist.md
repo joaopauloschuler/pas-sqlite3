@@ -72,7 +72,17 @@ Important: At the end of this document, please find:
        [X] `sqlite3RenameTokenRemap` — ported 2026-04-29 (alter.c:802).
   
   [ ] **6.23** port codegen.pas trigger:
-       [ ] Port `sqlite3BeginTrigger`
+       [X] Port `sqlite3BeginTrigger` — ported 2026-04-29 (trigger.c:104).
+            Replaces the Phase 6.4 stub.  Resolves iDb (TwoPartName /
+            isTemp), runs FixSrcList, validates the target table (must
+            exist, not virtual, not shadow-when-readonly, not system,
+            view↔INSTEAD), runs auth, then allocates the Trigger object
+            on pParse^.pNewTrigger so FinishTrigger can finalise.
+            Dead-code today because sqlite3FinishTrigger is still a stub
+            (it frees pStepList and never installs the trigger), but
+            every error arm is now live and matches C 1:1.  Negative
+            paths verified via DiagFeatureProbe (CREATE TRIGGER → INSERT
+            still DIVERGE — pending FinishTrigger).
        [ ] Port `sqlite3FinishTrigger`
        [ ] Port `sqlite3CodeRowTriggerDirect`
        [ ] Port `sqlite3CodeRowTrigger`

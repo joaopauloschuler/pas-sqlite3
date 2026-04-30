@@ -20827,15 +20827,223 @@ begin
   Result := pList;
 end;
 
-{ sqlite3BeginTrigger — parse CREATE TRIGGER header (Phase 6.4 stub) }
+{ sqlite3BeginTrigger — port of trigger.c:104.
+  Parses the CREATE TRIGGER header.  Resolves the trigger's containing
+  database (iDb), validates the target table (must exist, must not be a
+  virtual table or shadow-table-when-readonly, must be a view iff INSTEAD,
+  must not be a system table), checks for name collisions, runs auth, and
+  finally allocates the Trigger object on pParse^.pNewTrigger so
+  sqlite3FinishTrigger can write the schema row. }
 procedure sqlite3BeginTrigger(pParse: PParse; const pName1: PToken;
   const pName2: PToken; tr_tm: i32; op: i32; pColumns: PIdList;
   pTableName: PSrcList; pWhen: PExpr; isTemp: i32; noErr: i32);
+label trigger_cleanup, trigger_orphan_error;
+var
+  pTrg:     PTrigger;
+  pTab:     PTable2;
+  zName:    PAnsiChar;
+  db:       PTsqlite3;
+  iDb:      i32;
+  pName:    PToken;
+  sFix:     TDbFixer;
+  pItem0:   PSrcItem;
+  iTabDb:   i32;
+  code:     i32;
+  zDb:      PAnsiChar;
+  zDbTrig:  PAnsiChar;
+  zAuthTbl: PAnsiChar;
+  zSysCmp:  i32;
 begin
-  { schema writes deferred to Phase 6.5 }
-  sqlite3IdListDelete(pParse^.db, pColumns);
-  sqlite3SrcListDelete(pParse^.db, pTableName);
-  sqlite3ExprDelete(pParse^.db, pWhen);
+  pTrg  := nil;
+  pTab  := nil;
+  zName := nil;
+  db    := pParse^.db;
+
+  Assert(pName1 <> nil, 'BeginTrigger: pName1 not nil');
+  Assert(pName2 <> nil, 'BeginTrigger: pName2 not nil');
+  Assert((op = TK_INSERT) or (op = TK_UPDATE) or (op = TK_DELETE),
+         'BeginTrigger: op in {INSERT,UPDATE,DELETE}');
+  Assert((op > 0) and (op < $ff), 'BeginTrigger: op fits u8');
+
+  if isTemp <> 0 then begin
+    if pName2^.n > 0 then begin
+      sqlite3ErrorMsg(pParse,
+        'temporary trigger may not have qualified name');
+      goto trigger_cleanup;
+    end;
+    iDb := 1;
+    pName := pName1;
+  end else begin
+    iDb := sqlite3TwoPartName(pParse, pName1, pName2, @pName);
+    if iDb < 0 then goto trigger_cleanup;
+  end;
+
+  if (pTableName = nil) or (db^.mallocFailed <> 0) then
+    goto trigger_cleanup;
+
+  { Long-standing parser-bug compatibility: when reparsing out of the
+    schema table, ignore the qualifying database name on pTableName. }
+  if (db^.init.busy <> 0) and (iDb <> 1) then begin
+    pItem0 := SrcListItems(pTableName);
+    Assert(((pItem0^.fg.fgBits3 and $01) = 0),
+           'BeginTrigger: fixedSchema clear');
+    Assert(((pItem0^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0),
+           'BeginTrigger: isSubquery clear');
+    sqlite3DbFree(db, pItem0^.u4.zDatabase);
+    pItem0^.u4.zDatabase := nil;
+  end;
+
+  { If the trigger name was unqualified and the table is a temp table,
+    redirect iDb to the temp database. }
+  pTab := sqlite3SrcListLookup(pParse, pTableName);
+  if (db^.init.busy = 0) and (pName2^.n = 0) and (pTab <> nil)
+     and (pTab^.pSchema = db^.aDb[1].pSchema) then
+    iDb := 1;
+
+  if db^.mallocFailed <> 0 then goto trigger_cleanup;
+  Assert(pTableName^.nSrc = 1, 'BeginTrigger: nSrc=1');
+  sqlite3FixInit(@sFix, pParse, iDb, PAnsiChar('trigger'), pName);
+  if sqlite3FixSrcList(@sFix, pTableName) <> 0 then goto trigger_cleanup;
+
+  pTab := sqlite3SrcListLookup(pParse, pTableName);
+  if pTab = nil then begin
+    { The table does not exist. }
+    goto trigger_orphan_error;
+  end;
+  if pTab^.eTabType = TABTYP_VTAB then begin
+    sqlite3ErrorMsg(pParse, 'cannot create triggers on virtual tables');
+    goto trigger_orphan_error;
+  end;
+  if ((pTab^.tabFlags and TF_Shadow) <> 0)
+     and (sqlite3ReadOnlyShadowTables(db) <> 0) then begin
+    sqlite3ErrorMsg(pParse, 'cannot create triggers on shadow tables');
+    goto trigger_orphan_error;
+  end;
+
+  { Check that the trigger name is not reserved and that no trigger of
+    the specified name exists. }
+  if pName <> nil then begin
+    zName := sqlite3DbStrNDup(db, pName^.z, u64(pName^.n));
+    if zName <> nil then sqlite3Dequote(zName);
+  end;
+  if zName = nil then begin
+    Assert(db^.mallocFailed <> 0, 'BeginTrigger: zName nil iff malloc failed');
+    goto trigger_cleanup;
+  end;
+  if sqlite3CheckObjectName(pParse, zName,
+       PAnsiChar('trigger'), pTab^.zName) <> 0 then
+    goto trigger_cleanup;
+  if not InRenameObject(pParse) then begin
+    if sqlite3HashFind(@db^.aDb[iDb].pSchema^.trigHash,
+                       PChar(zName)) <> nil then begin
+      if noErr = 0 then
+        sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+          'trigger %T already exists', [pName]))
+      else begin
+        Assert(db^.init.busy = 0, 'BeginTrigger: !init.busy on IF NOT EXISTS');
+        sqlite3CodeVerifySchema(pParse, iDb);
+      end;
+      goto trigger_cleanup;
+    end;
+  end;
+
+  { Reject CREATE TRIGGER on system tables (sqlite_*). }
+  zSysCmp := 7;
+  if (sqlite3_strnicmp(pTab^.zName, PAnsiChar('sqlite_'), zSysCmp) = 0) then
+  begin
+    sqlite3ErrorMsg(pParse, 'cannot create trigger on system table');
+    goto trigger_cleanup;
+  end;
+
+  { INSTEAD OF triggers are only for views; views only support INSTEAD OF. }
+  if IsView(pTab) and (tr_tm <> TK_INSTEAD) then begin
+    if tr_tm = TK_BEFORE then
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'cannot create BEFORE trigger on view: %S',
+        [SrcListItems(pTableName)]))
+    else
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'cannot create AFTER trigger on view: %S',
+        [SrcListItems(pTableName)]));
+    goto trigger_orphan_error;
+  end;
+  if (not IsView(pTab)) and (tr_tm = TK_INSTEAD) then begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'cannot create INSTEAD OF trigger on table: %S',
+      [SrcListItems(pTableName)]));
+    goto trigger_orphan_error;
+  end;
+
+  { Authorisation. }
+  if not InRenameObject(pParse) then begin
+    iTabDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+    code := SQLITE_CREATE_TRIGGER;
+    zDb := db^.aDb[iTabDb].zDbSName;
+    if isTemp <> 0 then
+      zDbTrig := db^.aDb[1].zDbSName
+    else
+      zDbTrig := zDb;
+    if (iTabDb = 1) or (isTemp <> 0) then code := SQLITE_CREATE_TEMP_TRIGGER;
+    if sqlite3AuthCheck(pParse, code, zName, pTab^.zName, zDbTrig) <> 0 then
+      goto trigger_cleanup;
+    if iTabDb = 1 then
+      zAuthTbl := PAnsiChar(LEGACY_TEMP_SCHEMA_TABLE)
+    else
+      zAuthTbl := PAnsiChar(LEGACY_SCHEMA_TABLE);
+    if sqlite3AuthCheck(pParse, SQLITE_INSERT_AUTH, zAuthTbl,
+                        nil, zDb) <> 0 then
+      goto trigger_cleanup;
+  end;
+
+  { Translate every INSTEAD OF trigger into a BEFORE trigger.  This
+    simplifies code elsewhere. }
+  if tr_tm = TK_INSTEAD then tr_tm := TK_BEFORE;
+
+  { Build the Trigger object. }
+  pTrg := PTrigger(sqlite3DbMallocZero(db, SizeOf(TTrigger)));
+  if pTrg = nil then goto trigger_cleanup;
+  pTrg^.zName := zName;
+  zName := nil;
+  pTrg^.table := sqlite3DbStrDup(db, SrcListItems(pTableName)^.zName);
+  pTrg^.pSchema := db^.aDb[iDb].pSchema;
+  pTrg^.pTabSchema := pTab^.pSchema;
+  pTrg^.op := u8(op);
+  if tr_tm = TK_BEFORE then
+    pTrg^.tr_tm := TRIGGER_BEFORE
+  else
+    pTrg^.tr_tm := TRIGGER_AFTER;
+  if InRenameObject(pParse) then begin
+    sqlite3RenameTokenRemap(pParse, pTrg^.table,
+                            SrcListItems(pTableName)^.zName);
+    pTrg^.pWhen := pWhen;
+    pWhen := nil;
+  end else begin
+    pTrg^.pWhen := sqlite3ExprDup(db, pWhen, EXPRDUP_REDUCE);
+  end;
+  pTrg^.pColumns := pColumns;
+  pColumns := nil;
+  Assert(pParse^.pNewTrigger = nil, 'BeginTrigger: pNewTrigger empty');
+  pParse^.pNewTrigger := pTrg;
+
+trigger_cleanup:
+  sqlite3DbFree(db, zName);
+  sqlite3SrcListDelete(db, pTableName);
+  sqlite3IdListDelete(db, pColumns);
+  sqlite3ExprDelete(db, pWhen);
+  if pParse^.pNewTrigger = nil then
+    sqlite3DeleteTrigger(db, pTrg)
+  else
+    Assert(pParse^.pNewTrigger = pTrg,
+           'BeginTrigger: pNewTrigger==pTrg on success');
+  Exit;
+
+trigger_orphan_error:
+  if db^.init.iDb = 1 then begin
+    { Ticket #3810: orphaned trigger arises when a TEMP trigger references
+      a non-TEMP table that has been dropped by a different connection. }
+    db^.init.flags := db^.init.flags or u8($01);
+  end;
+  goto trigger_cleanup;
 end;
 
 { sqlite3FinishTrigger — finish CREATE TRIGGER (Phase 6.4 stub) }
