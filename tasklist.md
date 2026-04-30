@@ -58,18 +58,18 @@ Important: At the end of this document, please find:
 
   [ ] **6.13** port `sqlite3Vacuum`
 
-  [ ] **6.22** port codegen.pas rename:
-       [ ] `sqlite3RenameExprUnmap` — productive port deferred until the
-            renameUnmapExprCb / renameUnmapSelectCb walker callbacks
-            land alongside ALTER TABLE RENAME (6.27); no-op matches C
-            outside PARSE_MODE_RENAME.
+  [X] **6.22** port codegen.pas rename:
+       [X] `sqlite3RenameExprUnmap` — ported 2026-04-29 (alter.c:914).
+            Productive walker now drives renameUnmapExprCb /
+            renameUnmapSelectCb under PARSE_MODE_UNMAP; helpers
+            (unmapColumnIdlistNames, renameWalkWith) and dependency
+            `sqlite3WithDup` (expr.c:1755) ported alongside.
+            `sqlite3RenameExprlistUnmap` likewise productive.  Dead-code
+            today (no caller drives PARSE_MODE_RENAME until 6.27 ALTER
+            TABLE RENAME lands), but matches C 1:1 and the rename list
+            stays empty so the walker is a clean no-op in practice.
        [X] `sqlite3RenameTokenMap` — ported 2026-04-29 (alter.c:776).
-            Allocates a `TRenameToken` and prepends it to
-            `pParse^.pRename`; PARSE_MODE_UNMAP guard preserved.
        [X] `sqlite3RenameTokenRemap` — ported 2026-04-29 (alter.c:802).
-            Walks `pParse^.pRename` and reassigns the first matching
-            entry's `p` from pFrom to pTo.  TRenameToken record now
-            defined alongside TToken in codegen.pas.
   
   [ ] **6.23** port codegen.pas trigger:
        [ ] Port `sqlite3BeginTrigger`
@@ -379,12 +379,8 @@ Important: At the end of this document, please find:
        UPDATE sqlite_master path.  Closes the last contributor of
        6.11(b).
 
-- [ ] **7.1.7** Lemon parser tail (parse.c epilogue) — gaps inside
-       `passqlite3parser.pas`:
-       [X] `sqlite3RenameTokenMap` / `sqlite3RenameTokenRemap` — ported
-            2026-04-29 (see 6.22).
-       [ ] Port `sqlite3RenameExprUnmap` — needs walker callbacks; lands
-            with 6.27 ALTER TABLE RENAME.
+- [X] **7.1.7** Lemon parser tail (parse.c epilogue) — all rename-token
+       callbacks now ported (see 6.22).
 
 - [ ] **7.1.8** ATTACH / DETACH (attach.c) — currently Phase 7 stubs
        at codegen.pas:25213/25218.  Must open the attached btree,

@@ -2131,6 +2131,7 @@ function sqlite3ExprListDup(db: PTsqlite3; const p: PExprList; flags: i32): PExp
 function sqlite3SrcListDup(db: PTsqlite3; const p: PSrcList; flags: i32): PSrcList;
 function sqlite3IdListDup(db: PTsqlite3; const p: PIdList): PIdList;
 function sqlite3SelectDup(db: PTsqlite3; const pDup: PSelect; flags: i32): PSelect;
+function sqlite3WithDup(db: PTsqlite3; p: PWith): PWith;
 
 { ExprList management }
 function  sqlite3ExprListAppendNew(db: PTsqlite3; pExpr: PExpr): PExprList;
@@ -3350,14 +3351,137 @@ end;
 
 { sqlite3ParserAddCleanup implemented in Phase 6.5 section below }
 
-{ alter.c:914 — sqlite3RenameExprUnmap requires the renameUnmapExprCb
-  / renameUnmapSelectCb walker callbacks; those are deferred until
-  ALTER TABLE RENAME proper lands in 6.27.  Until eParseMode reaches
-  PARSE_MODE_RENAME (only set by sqlite3AlterRenameTable /
-  sqlite3AlterRenameColumn) every call site is guarded by
-  InRenameObject and this routine is never reached. }
-procedure sqlite3RenameExprUnmap(pParse: PParse; pExpr: PExpr);
+{ alter.c:816 — Walker callback used by sqlite3RenameExprUnmap.  For each
+  Expr node visited, retarget any RenameToken pointing at the node (or at
+  its inline pTab back-pointer) so the rename list no longer references
+  parse-tree memory that the walker is rewriting. }
+function renameUnmapExprCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pPrs: PParse;
 begin
+  pPrs := pWalker^.pParse;
+  sqlite3RenameTokenRemap(pPrs, nil, Pointer(pExpr));
+  if (pExpr^.flags and (EP_WinFunc or EP_Subrtn)) = 0 then
+    sqlite3RenameTokenRemap(pPrs, nil, @pExpr^.y.pTab);
+  Result := WRC_Continue;
+end;
+
+{ alter.c:864 — Unmap every zName entry of an IdList. }
+procedure unmapColumnIdlistNames(pParse: PParse; pIdList: PIdList);
+var
+  ii: i32;
+  items: PIdListItem;
+begin
+  if pIdList = nil then Exit;
+  items := IdListItems(pIdList);
+  for ii := 0 to pIdList^.nId - 1 do
+    sqlite3RenameTokenRemap(pParse, nil, Pointer(items[ii].zName));
+end;
+
+{ alter.c:829 — Walk the WITH clause attached to a Select.  Duplicates the
+  With object onto a transient stack so sqlite3SelectPrep can resolve
+  CTE references without flipping flags on the original tree. }
+procedure renameWalkWith(pWalker: PWalker; pSelect: PSelect); forward;
+
+{ alter.c:878 — Walker callback used by sqlite3RenameExprUnmap. }
+function renameUnmapSelectCb(pWalker: PWalker; p: PSelect): i32; cdecl;
+var
+  pPrs: PParse;
+  i:      i32;
+  pList:  PExprList;
+  pSrc:   PSrcList;
+  items:  PExprListItem;
+  sItems: PSrcItem;
+begin
+  pPrs := pWalker^.pParse;
+  if pPrs^.nErr <> 0 then begin Result := WRC_Abort; Exit; end;
+  if (p^.selFlags and (SF_View or SF_CopyCte)) <> 0 then
+  begin
+    Result := WRC_Prune; Exit;
+  end;
+  pList := p^.pEList;
+  if pList <> nil then
+  begin
+    items := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+    begin
+      if (items[i].zEName <> nil)
+         and ((items[i].fg.eBits and $03) = ENAME_NAME) then
+        sqlite3RenameTokenRemap(pPrs, nil, Pointer(items[i].zEName));
+    end;
+  end;
+  pSrc := p^.pSrc;
+  if pSrc <> nil then
+  begin
+    sItems := SrcListItems(pSrc);
+    for i := 0 to pSrc^.nSrc - 1 do
+    begin
+      sqlite3RenameTokenRemap(pPrs, nil, Pointer(sItems[i].zName));
+      if (sItems[i].fg.fgBits2 and $08) = 0 then
+        sqlite3WalkExpr(pWalker, sItems[i].u3.pOn)
+      else
+        unmapColumnIdlistNames(pPrs, sItems[i].u3.pUsing);
+    end;
+  end;
+  renameWalkWith(pWalker, p);
+  Result := WRC_Continue;
+end;
+
+procedure renameWalkWith(pWalker: PWalker; pSelect: PSelect);
+var
+  pWth:   PWith;
+  pCpy:   PWith;
+  pPrs:   PParse;
+  i:      i32;
+  pBase:  PCte;
+  pCteItem: PCte;
+  pCSel:  PSelect;
+  sNC:    TNameContext;
+begin
+  pWth := pSelect^.pWith;
+  if pWth = nil then Exit;
+  pPrs := pWalker^.pParse;
+  pCpy := nil;
+  AssertH(pWth^.nCte > 0, 'renameWalkWith: empty WITH');
+  pBase := PCte(PByte(pWth) + SZ_WITH_HEADER);
+  pCSel := pBase[0].pSelect;
+  if (pCSel <> nil) and ((pCSel^.selFlags and SF_Expanded) = 0) then
+  begin
+    pCpy := sqlite3WithDup(pPrs^.db, pWth);
+    pCpy := sqlite3WithPush(pPrs, pCpy, 1);
+  end;
+  pBase := PCte(PByte(pWth) + SZ_WITH_HEADER);
+  for i := 0 to pWth^.nCte - 1 do
+  begin
+    pCteItem := @pBase[i];
+    FillChar(sNC, SizeOf(sNC), 0);
+    sNC.pParse := pPrs;
+    if pCpy <> nil then
+      sqlite3SelectPrep(sNC.pParse, pCteItem^.pSelect, @sNC);
+    if sNC.pParse^.db^.mallocFailed <> 0 then Exit;
+    sqlite3WalkSelect(pWalker, pCteItem^.pSelect);
+    sqlite3RenameExprlistUnmap(pPrs, pCteItem^.pCols);
+  end;
+  if (pCpy <> nil) and (pPrs^.pWith = pCpy) then
+    pPrs^.pWith := pCpy^.pOuter;
+end;
+
+{ alter.c:914 — Remove every RenameToken whose parse-tree pointer lives
+  inside the expression tree pExpr.  Outside PARSE_MODE_RENAME the rename
+  list is empty, so the walker is a no-op even when invoked. }
+procedure sqlite3RenameExprUnmap(pParse: PParse; pExpr: PExpr);
+var
+  eMode: u8;
+  sWalker: TWalker;
+begin
+  eMode := pParse^.eParseMode;
+  FillChar(sWalker, SizeOf(sWalker), 0);
+  sWalker.pParse          := pParse;
+  sWalker.xExprCallback   := @renameUnmapExprCb;
+  sWalker.xSelectCallback := @renameUnmapSelectCb;
+  pParse^.eParseMode := PARSE_MODE_UNMAP;
+  sqlite3WalkExpr(@sWalker, pExpr);
+  pParse^.eParseMode := eMode;
 end;
 
 { alter.c:776 — sqlite3RenameTokenMap.  Allocates a RenameToken record,
@@ -27364,9 +27488,54 @@ begin
   end;
 end;
 
+{ alter.c:930 — Remove every RenameToken whose parse-tree pointer lives
+  inside the expression-list pEList, plus each list-item alias zEName.
+  Outside PARSE_MODE_RENAME the rename list is empty, so the walker
+  is effectively a no-op. }
 procedure sqlite3RenameExprlistUnmap(pParse: PParse; pEList: PExprList);
+var
+  i: i32;
+  sWalker: TWalker;
+  items: PExprListItem;
 begin
-  { Phase 7 }
+  if pEList = nil then Exit;
+  FillChar(sWalker, SizeOf(sWalker), 0);
+  sWalker.pParse        := pParse;
+  sWalker.xExprCallback := @renameUnmapExprCb;
+  sqlite3WalkExprList(@sWalker, pEList);
+  items := ExprListItems(pEList);
+  for i := 0 to pEList^.nExpr - 1 do
+  begin
+    if (items[i].fg.eBits and $03) = ENAME_NAME then
+      sqlite3RenameTokenRemap(pParse, nil, Pointer(items[i].zEName));
+  end;
+end;
+
+{ expr.c:1755 — Deep-copy a With object.  Each CTE entry's Select and
+  ExprList are duplicated; the linked-list of outer With clauses
+  (pOuter) is left dangling for the caller to wire. }
+function sqlite3WithDup(db: PTsqlite3; p: PWith): PWith;
+var
+  i:    i32;
+  nByte: i64;
+  pSrc: PCte;
+  pDst: PCte;
+begin
+  Result := nil;
+  if p = nil then Exit;
+  nByte := SZ_WITH_HEADER + i64(p^.nCte) * SZ_CTE;
+  Result := PWith(sqlite3DbMallocZero(db, u64(nByte)));
+  if Result = nil then Exit;
+  Result^.nCte := p^.nCte;
+  pSrc := PCte(PByte(p)      + SZ_WITH_HEADER);
+  pDst := PCte(PByte(Result) + SZ_WITH_HEADER);
+  for i := 0 to p^.nCte - 1 do
+  begin
+    pDst[i].pSelect := sqlite3SelectDup  (db, pSrc[i].pSelect, 0);
+    pDst[i].pCols   := sqlite3ExprListDup(db, pSrc[i].pCols,   0);
+    pDst[i].zName   := sqlite3DbStrDup   (db, pSrc[i].zName);
+    pDst[i].eM10d   := pSrc[i].eM10d;
+  end;
 end;
 
 // ===========================================================================
