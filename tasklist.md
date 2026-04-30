@@ -303,6 +303,12 @@ Important: At the end of this document, please find:
             from no-op to faithful 1:1 once FK enforcement is on.
             TestExplainParity unchanged (1016/1026); DiagFeatureProbe
             unchanged (9 divergences).
+       [X] `sqlite3SetString` (malloc.c:808) — ported 2026-04-30 in
+            passqlite3util.pas.  Two-line helper (sqlite3DbStrDup of zNew,
+            sqlite3DbFree of pz^, store).  Faithful 1:1; not yet wired
+            into a caller (the prepare.c / vacuum.c sites that use it
+            are still skeleton-only) but exposed for downstream wiring.
+            TestUtil 7/7 PASS; TestExplainParity unchanged (1016/1026).
        [X] `sqlite3SchemaGet` (callback.c:530) — ported 2026-04-30 in
             passqlite3codegen.pas.  Previously the pBt<>nil arm returned
             nil ("Phase 7: look up schema from btree"); now wires through
@@ -727,7 +733,9 @@ items below enumerate every missing symbol grouped by sub-phase.
 Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 (`sqlite3_int64`, `sqlite3_uint64`, opaque struct names) are excluded.
 
-- [ ] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind).
+- [X] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind) — done
+       in passqlite3carray.pas:571 (calls sqlite3_carray_bind_v2 with
+       pDestroy=aData; matches carray.c:550..557 1:1).
 
 - [X] **8.x** `unixCurrentTimeInt64` (os_unix.c:7193) — ported 2026-04-29 in
        passqlite3os.pas.  Returns *piNow as Julian-day-times-86_400_000;

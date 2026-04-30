@@ -711,6 +711,7 @@ function  sqlite3DbStrNDup(db: Psqlite3db; z: PChar; n: u64): PChar;
 function  sqlite3DbRealloc(db: Psqlite3db; p: Pointer; n: u64): Pointer;
 function  sqlite3DbMallocSize(db: Psqlite3db; p: Pointer): i32;
 function  sqlite3DbReallocOrFree(db: Psqlite3db; p: Pointer; n: u64): Pointer;
+procedure sqlite3SetString(pz: PPChar; db: Psqlite3db; zNew: PChar);
 function  sqlite3ArrayAllocate(db: Psqlite3db; pArray: Pointer;
                                szEntry: i32; pnEntry: Pi32;
                                pIdx: Pi32): Pointer;
@@ -2411,6 +2412,18 @@ function sqlite3DbReallocOrFree(db: Psqlite3db; p: Pointer; n: u64): Pointer;
 begin
   Result := sqlite3_realloc64(p, n);
   if Result = nil then sqlite3_free(p);
+end;
+
+{ sqlite3SetString — port of malloc.c:808.  Free any prior content in pz^
+  and replace it with a copy of zNew (or nil if zNew is nil).  Used by
+  prepare.c / vacuum.c to populate sqlite3_exec-style **pzErrMsg
+  out-parameters. }
+procedure sqlite3SetString(pz: PPChar; db: Psqlite3db; zNew: PChar);
+var z: PChar;
+begin
+  z := sqlite3DbStrDup(db, zNew);
+  sqlite3DbFree(db, pz^);
+  pz^ := z;
 end;
 
 { sqlite3ArrayAllocate — port of build.c:4680.  Append a slot to a
