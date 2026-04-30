@@ -278,6 +278,16 @@ Important: At the end of this document, please find:
             wired into PRAGMA journal_mode write codegen (still emits a
             constant default echo) but exposed for downstream wiring.
             TestExplainParity unchanged (1016/1026); TestPager 12/12 PASS.
+       [X] `sqlite3DeleteColumnNames` (build.c:760) — ported 2026-04-30
+            in passqlite3codegen.pas.  Previously inlined inside
+            sqlite3DeleteTable, missing both the IsOrdinaryTable+pDfltList
+            free arm (silent leak of every `DEFAULT <expr>` AST) and the
+            tear-down vs live-Table guard (db^.pnBytesFreed=nil → zero
+            aCol/nCol/u.tab.pDfltList).  sqlite3DeleteTable refactored to
+            call the new helper, matching C 1:1.  Also wires the build.c:3221
+            `sqliteViewResetAll` TODO so it can drop the inline column-walk
+            once DB_UnresetViews lands.  TestExplainParity unchanged
+            (1016/1026); DiagFeatureProbe unchanged (9 divergences).
        [X] `sqlite3FkLocateIndex` (fkey.c:183) + `sqlite3FkOldmask`
             (fkey.c:1095) — ported 2026-04-30 in passqlite3codegen.pas.
             FkLocateIndex is the unique-index lookup for FK parent keys

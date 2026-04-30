@@ -2050,6 +2050,7 @@ function  propagateConstants(pParse: PParse; p: PSelect): i32;
 function  sqlite3Select(pParse: PParse; p: PSelect;
   pDest: PSelectDest): i32;
 procedure sqlite3DeleteTable(db: PTsqlite3; pTab: PTable2);
+procedure sqlite3DeleteColumnNames(db: PTsqlite3; pTable: PTable2);
 procedure sqlite3WithDelete(db: PTsqlite3; pWth: PWith);
 procedure sqlite3WithDeleteGeneric(db: PTsqlite3; p: Pointer);
 procedure sqlite3CteDelete(db: PTsqlite3; pCte: PCte);
@@ -20162,25 +20163,46 @@ begin
   else Result := SQLITE_OK;
 end;
 
-{ sqlite3DeleteTable — free a Table object and all its substructure }
-procedure sqlite3DeleteTable(db: PTsqlite3; pTab: PTable2);
+{ sqlite3DeleteColumnNames — port of build.c:760.  Free Table.aCol[] plus
+  any per-column zCnName allocations.  For ordinary tables, also free the
+  pDfltList (DEFAULT-expression list); when not in a tear-down sweep
+  (db^.pnBytesFreed=nil), zero out aCol/nCol/pDfltList so the Table object
+  remains in a consistent state. }
+procedure sqlite3DeleteColumnNames(db: PTsqlite3; pTable: PTable2);
 var
-  i: i32;
+  i:    i32;
   pCol: PColumn;
 begin
-  if pTab = nil then Exit;
-  Dec(pTab^.nTabRef);
-  if pTab^.nTabRef > 0 then Exit;
-  if pTab^.aCol <> nil then
+  Assert(pTable <> nil);
+  Assert(db <> nil);
+  pCol := pTable^.aCol;
+  if pCol <> nil then
   begin
-    pCol := pTab^.aCol;
-    for i := 0 to pTab^.nCol - 1 do
+    for i := 0 to pTable^.nCol - 1 do
     begin
       sqlite3DbFree(db, pCol^.zCnName);
       Inc(pCol);
     end;
-    sqlite3DbFree(db, pTab^.aCol);
+    sqlite3DbNNFreeNN(db, pTable^.aCol);
+    if pTable^.eTabType = TABTYP_NORM then
+      sqlite3ExprListDelete(db, pTable^.u.tab.pDfltList);
+    if db^.pnBytesFreed = nil then
+    begin
+      pTable^.aCol := nil;
+      pTable^.nCol := 0;
+      if pTable^.eTabType = TABTYP_NORM then
+        pTable^.u.tab.pDfltList := nil;
+    end;
   end;
+end;
+
+{ sqlite3DeleteTable — free a Table object and all its substructure }
+procedure sqlite3DeleteTable(db: PTsqlite3; pTab: PTable2);
+begin
+  if pTab = nil then Exit;
+  Dec(pTab^.nTabRef);
+  if pTab^.nTabRef > 0 then Exit;
+  sqlite3DeleteColumnNames(db, pTab);
   sqlite3DbFree(db, pTab^.zName);
   sqlite3DbFree(db, pTab^.zColAff);
   sqlite3DbFree(db, pTab);
