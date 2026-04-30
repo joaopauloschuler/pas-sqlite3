@@ -21444,12 +21444,60 @@ begin
   Result := nil; { Phase 6.5 }
 end;
 
-{ sqlite3TriggerColmask — mask of columns accessed by triggers (Phase 6.4 stub) }
+{ sqlite3TriggerColmask — port of trigger.c:1524.
+
+  Returns a 32-bit bitmask of which columns of pTab's old.* (isNew=0) or
+  new.* (isNew=1) pseudo-tables are referenced by any trigger of opcode
+  matching pChanges (TK_UPDATE if pChanges<>nil, else TK_DELETE) whose
+  tr_tm overlaps with the requested tr_tm.  Bit i set means column i is
+  read; if any column index is >=32 and live, returns 0xffffffff.
+
+  Views always return 0xffffffff (every column may be needed).  RETURNING
+  triggers also return 0xffffffff.  For ordinary triggers the per-column
+  mask comes from the compiled TriggerPrg (getRowTrigger).  In the
+  current port getRowTrigger is not yet ported (depends on the full
+  codeRowTrigger / sqlite3CodeRowTrigger pipeline — Phase 6.23 follow-on),
+  so its branch is a placeholder returning nil; the result for ordinary
+  triggers is therefore mask=0.  This is identical to the previous stub
+  for that arm but now correctly covers the IsView and bReturning paths. }
+function trgGetRowTrigger(pParse: PParse; p: PTrigger; pTab: PTable2;
+  orconf: i32): PTriggerPrg;
+begin
+  { TODO(Phase 6.23 follow-on): port codeRowTrigger / getRowTrigger.
+    Returns nil so the caller treats the per-trigger column contribution
+    as 0 (matches C's "if(pPrg)" guard when codeRowTrigger fails). }
+  Result := nil;
+end;
+
 function sqlite3TriggerColmask(pParse: PParse; pTrigger: PTrigger;
   pChanges: PExprList; isNew: i32; tr_tm: i32; pTab: PTable2;
   orconf: i32): u32;
+var
+  op:   i32;
+  mask: u32;
+  p:    PTrigger;
+  pPrg: PTriggerPrg;
 begin
-  Result := 0; { Phase 6.5 }
+  AssertH((isNew = 1) or (isNew = 0), 'TriggerColmask isNew');
+  if pChanges <> nil then op := TK_UPDATE else op := TK_DELETE;
+  if IsView(pTab) then Exit(u32($FFFFFFFF));
+  mask := 0;
+  p := pTrigger;
+  while p <> nil do begin
+    if (p^.op = op) and ((tr_tm and i32(p^.tr_tm)) <> 0)
+       and (trgCheckColumnOverlap(p^.pColumns, pChanges) <> 0) then
+    begin
+      if p^.bReturning <> 0 then begin
+        mask := u32($FFFFFFFF);
+      end else begin
+        pPrg := trgGetRowTrigger(pParse, p, pTab, orconf);
+        if pPrg <> nil then
+          mask := mask or pPrg^.aColmask[isNew];
+      end;
+    end;
+    p := p^.pNext;
+  end;
+  Result := mask;
 end;
 
 // ===========================================================================

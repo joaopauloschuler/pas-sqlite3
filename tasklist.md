@@ -101,7 +101,15 @@ Important: At the end of this document, please find:
        [ ] Port `sqlite3CodeRowTriggerDirect`
        [ ] Port `sqlite3CodeRowTrigger`
        [ ] Port `sqlite3TriggerStepSrc`
-       [ ] Port `sqlite3TriggerColmask`.
+       [X] Port `sqlite3TriggerColmask` — ported 2026-04-29 (trigger.c:1524).
+            IsView arm now correctly returns 0xffffffff and bReturning
+            arm returns 0xffffffff per matching trigger; ordinary
+            triggers fall through `trgGetRowTrigger` which is a nil-stub
+            (depends on full codeRowTrigger pipeline) so contribute 0
+            to the mask — identical to previous all-zero stub for that
+            arm but now correctly conservative on views/RETURNING.
+            Verified DiagFeatureProbe + TestExplainParity unchanged (9
+            and 10 divergences respectively).
 
   [ ] **6.24** port codegen.pas DML
        [ ] `sqlite3GenerateConstraintChecks`.
