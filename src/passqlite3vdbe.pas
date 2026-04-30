@@ -1665,6 +1665,7 @@ procedure sqlite3_result_zeroblob(pCtx: Psqlite3_context; n: i32);
 function  sqlite3_result_zeroblob64(pCtx: Psqlite3_context; n: u64): i32;
 function  sqlite3_aggregate_context(pCtx: Psqlite3_context;
   nByte: i32): Pointer;
+function  sqlite3StmtCurrentTime(pCtx: Psqlite3_context): i64;
 
 { --- vdbeblob.c — incremental blob I/O (Phase 5.6) --- }
 function  sqlite3_blob_open(db: PTsqlite3; zDb, zTable, zColumn: PAnsiChar;
@@ -5490,6 +5491,26 @@ begin
     end;
   end;
   Result := pAggMem^.z;
+end;
+
+{ vdbeapi.c:1106 — sqlite3StmtCurrentTime.  Latch the current time for the
+  duration of one statement run so repeated calls within the same statement
+  observe the same value (e.g. multiple julianday('now') invocations in the
+  same SELECT row).  Returns 0 on VFS-side error. }
+function sqlite3StmtCurrentTime(pCtx: Psqlite3_context): i64;
+var
+  piTime: Pi64;
+  rc:     i32;
+  pVfs:   Psqlite3_vfs;
+begin
+  Assert(pCtx^.pVdbe <> nil);
+  piTime := @pCtx^.pVdbe^.iCurrentTime;
+  if piTime^ = 0 then begin
+    pVfs := Psqlite3_vfs(PTsqlite3(pCtx^.pOut^.db)^.pVfs);
+    rc := sqlite3OsCurrentTimeInt64(pVfs, piTime);
+    if rc <> 0 then piTime^ := 0;
+  end;
+  Result := piTime^;
 end;
 
 { ============================================================================

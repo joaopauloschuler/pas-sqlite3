@@ -575,6 +575,10 @@ function  sqlite3OsShmLock(id: Psqlite3_file; offset: cint; n: cint;
 procedure sqlite3OsShmBarrier(id: Psqlite3_file);
 function  sqlite3OsShmUnmap(id: Psqlite3_file; deleteFlag: cint): cint;
 function  sqlite3OsSleep(pVfs: Psqlite3_vfs; nMicrosec: cint): cint;
+function  sqlite3OsCurrentTimeInt64(pVfs: Psqlite3_vfs;
+                                    pTimeOut: Pi64): cint;
+function  sqlite3OsCurrentTime(pVfs: Psqlite3_vfs;
+                               pTimeOut: PDouble): cint;
 
 { ============================================================
   Section 13: VFS registration (os.c)
@@ -1182,6 +1186,27 @@ end;
 function sqlite3OsSleep(pVfs: Psqlite3_vfs; nMicrosec: cint): cint;
 begin
   Result := pVfs^.xSleep(pVfs, nMicrosec);
+end;
+
+{ os.c:290 — sqlite3OsCurrentTimeInt64.  Prefer xCurrentTimeInt64 when the
+  VFS exposes iVersion>=2 with the slot wired; otherwise fall back through
+  xCurrentTime and scale the Julian-day double to milliseconds. }
+function sqlite3OsCurrentTimeInt64(pVfs: Psqlite3_vfs; pTimeOut: Pi64): cint;
+var
+  r: Double;
+begin
+  if (pVfs^.iVersion >= 2) and (pVfs^.xCurrentTimeInt64 <> nil) then
+    Result := pVfs^.xCurrentTimeInt64(pVfs, pTimeOut)
+  else begin
+    Result := pVfs^.xCurrentTime(pVfs, @r);
+    pTimeOut^ := i64(r * 86400000.0);
+  end;
+end;
+
+{ os.c — sqlite3OsCurrentTime: Julian-day-as-Double wrapper. }
+function sqlite3OsCurrentTime(pVfs: Psqlite3_vfs; pTimeOut: PDouble): cint;
+begin
+  Result := pVfs^.xCurrentTime(pVfs, pTimeOut);
 end;
 
 { ============================================================

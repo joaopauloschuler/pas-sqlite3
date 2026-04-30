@@ -595,6 +595,14 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        `iVersion` bumped 1→2 so `xCurrentTimeInt64` is now reachable through
        the shared `sqlite3OsCurrentTimeInt64` chain (memdb already wraps it).
 
+- [X] **8.x** `sqlite3OsCurrentTimeInt64` + `sqlite3OsCurrentTime` (os.c:290)
+       and `sqlite3StmtCurrentTime` (vdbeapi.c:1106) — ported 2026-04-29.
+       OS wrappers prefer the iVersion>=2 xCurrentTimeInt64 slot and fall back
+       through xCurrentTime * 86400000.  StmtCurrentTime latches the per-Vdbe
+       iCurrentTime so multiple julianday('now')/datetime('now') calls within
+       one statement run observe a single timestamp; the wired chain reaches
+       the existing unixCurrentTimeInt64 / memdbCurrentTimeInt64 backends.
+
 - [X] **8.x** `sqlite3_temp_directory` / `sqlite3_data_directory` public
        extern globals + `unixTempFileInit` / `unixTempFileDir` /
        `unixGetTempname` (main.c:148/:157, os_unix.c:6262..6342) — ported
