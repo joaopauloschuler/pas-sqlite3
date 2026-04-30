@@ -83,7 +83,21 @@ Important: At the end of this document, please find:
             every error arm is now live and matches C 1:1.  Negative
             paths verified via DiagFeatureProbe (CREATE TRIGGER → INSERT
             still DIVERGE — pending FinishTrigger).
-       [ ] Port `sqlite3FinishTrigger`
+       [X] Port `sqlite3FinishTrigger` — ported 2026-04-29 (trigger.c:323).
+            Replaces the Phase 6.4 stub.  Runs FixTriggerStep + FixExpr
+            on the parsed step list, then on a normal CREATE branch
+            emits the sqlite_schema row INSERT via sqlite3NestedParse,
+            bumps the cookie via sqlite3ChangeCookie, and queues a
+            ParseSchemaOp; on the schema-reload branch installs the
+            Trigger into pSchema^.trigHash and links it onto its
+            parent table's pTrigger list.  PARSE_MODE_RENAME re-hoists
+            the trigger to pParse^.pNewTrigger.  Also ported helper
+            `sqlite3TokenInit` (util.c:390).  Dead-code today because
+            sqlite3CodeRowTrigger / TriggerColmask / TriggerStepSrc are
+            still stubs (DiagFeatureProbe `CREATE TRIGGER → INSERT`
+            still DIVERGE: trigger registers but the row-handler is
+            never emitted), but parse + schema-cache install matches C
+            1:1 and unblocks the remaining trigger arms.
        [ ] Port `sqlite3CodeRowTriggerDirect`
        [ ] Port `sqlite3CodeRowTrigger`
        [ ] Port `sqlite3TriggerStepSrc`

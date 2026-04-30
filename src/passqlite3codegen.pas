@@ -21046,11 +21046,129 @@ trigger_orphan_error:
   goto trigger_cleanup;
 end;
 
-{ sqlite3FinishTrigger — finish CREATE TRIGGER (Phase 6.4 stub) }
+{ sqlite3TokenInit — port of util.c:390.  Build a Token from a NUL-terminated
+  string (z + sqlite3Strlen30(z)). }
+procedure sqlite3TokenInit(p: PToken; z: PAnsiChar);
+begin
+  p^.z := z;
+  if z <> nil then
+    p^.n := u32(sqlite3Strlen30(z))
+  else
+    p^.n := 0;
+  p^._pad := 0;
+end;
+
+{ sqlite3FinishTrigger — port of trigger.c:323.
+  Caps CREATE TRIGGER parsing: fixes the trigger's database references
+  (FixTriggerStep/FixExpr), then on a normal parse emits the
+  sqlite_schema row INSERT + cookie bump + ParseSchemaOp; or, when the
+  schema is being reloaded (db^.init.busy <> 0), inserts the trigger
+  into the schema-cache trigHash and links it onto its parent table's
+  pTrigger list.  Under PARSE_MODE_RENAME the trigger object is re-
+  hoisted to pParse^.pNewTrigger so the rename pass can walk it. }
 procedure sqlite3FinishTrigger(pParse: PParse; pStepList: PTriggerStep;
   const pAll: PToken);
+label triggerfinish_cleanup;
+var
+  pTrig:     PTrigger;
+  pStep:     PTriggerStep;
+  pTab:      PTable2;
+  pLink:     PTrigger;
+  pHash:     passqlite3util.PHash;
+  pInserted: PTrigger;
+  pSi:       PSrcItem;
+  zName:     PAnsiChar;
+  z:         PAnsiChar;
+  zReparse:  PAnsiChar;
+  zDbSName:  PAnsiChar;
+  db:        PTsqlite3;
+  iDb:       i32;
+  sFix:      TDbFixer;
+  nameToken: TToken;
+  v:         PVdbe;
 begin
-  { schema writes deferred to Phase 6.5 }
+  db    := pParse^.db;
+  pTrig := pParse^.pNewTrigger;
+  pParse^.pNewTrigger := nil;
+  if (pParse^.nErr <> 0) or (pTrig = nil) then goto triggerfinish_cleanup;
+  zName := pTrig^.zName;
+  iDb   := sqlite3SchemaToIndex(db, pTrig^.pSchema);
+  Assert((iDb >= 0) and (iDb < db^.nDb), 'FinishTrigger: iDb in range');
+  pTrig^.step_list := pStepList;
+  pStep := pStepList;
+  while pStep <> nil do begin
+    pStep^.pTrig := pTrig;
+    pStep := pStep^.pNext;
+  end;
+  sqlite3TokenInit(@nameToken, pTrig^.zName);
+  sqlite3FixInit(@sFix, pParse, iDb, PAnsiChar('trigger'), @nameToken);
+  if (sqlite3FixTriggerStep(@sFix, pTrig^.step_list) <> 0)
+     or (sqlite3FixExpr(@sFix, pTrig^.pWhen) <> 0) then
+    goto triggerfinish_cleanup;
+
+  if InRenameObject(pParse) then begin
+    Assert(db^.init.busy = 0, 'FinishTrigger: !init.busy in RenameObject');
+    pParse^.pNewTrigger := pTrig;
+    pTrig := nil;
+  end else begin
+    { If we are not initializing, build the sqlite_schema entry. }
+    if db^.init.busy = 0 then begin
+      { Reject triggers that write to a shadow table when shadow tables
+        are read-only (defence-in-depth for vtab modules). }
+      if sqlite3ReadOnlyShadowTables(db) <> 0 then begin
+        pStep := pTrig^.step_list;
+        while pStep <> nil do begin
+          if pStep^.pSrc <> nil then begin
+            pSi := SrcListItems(pStep^.pSrc);
+            if sqlite3ShadowTableName(db, pSi^.zName) <> 0 then begin
+              sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+                'trigger "%s" may not write to shadow table "%s"',
+                [pTrig^.zName, pSi^.zName]));
+              goto triggerfinish_cleanup;
+            end;
+          end;
+          pStep := pStep^.pNext;
+        end;
+      end;
+
+      v := sqlite3GetVdbe(pParse);
+      if v = nil then goto triggerfinish_cleanup;
+      sqlite3BeginWriteOperation(pParse, 0, iDb);
+      z := sqlite3DbStrNDup(db, pAll^.z, u64(pAll^.n));
+      zDbSName := db^.aDb[iDb].zDbSName;
+      sqlite3NestedParse(pParse,
+        'INSERT INTO %Q.' + LEGACY_SCHEMA_TABLE +
+          ' VALUES(''trigger'',%Q,%Q,0,''CREATE TRIGGER %q'')',
+        [zDbSName, zName, pTrig^.table, z]);
+      sqlite3DbFree(db, z);
+      sqlite3ChangeCookie(pParse, iDb);
+      zReparse := sqlite3MPrintf(db,
+        'type=''trigger'' AND name=''%q''', [zName]);
+      sqlite3VdbeAddParseSchemaOp(v, iDb, zReparse, 0);
+    end;
+
+    if db^.init.busy <> 0 then begin
+      pLink := pTrig;
+      pHash := @passqlite3util.PSchema(db^.aDb[iDb].pSchema)^.trigHash;
+      Assert(pLink <> nil, 'FinishTrigger: pLink not nil');
+      pInserted := PTrigger(sqlite3HashInsert(pHash, PChar(zName), pTrig));
+      if pInserted <> nil then begin
+        sqlite3OomFault(db);
+      end else if pLink^.pSchema = pLink^.pTabSchema then begin
+        pTab := PTable2(sqlite3HashFind(
+          @passqlite3util.PSchema(pLink^.pTabSchema)^.tblHash,
+          PChar(pLink^.table)));
+        Assert(pTab <> nil, 'FinishTrigger: parent table found in schema cache');
+        pLink^.pNext := pTab^.pTrigger;
+        pTab^.pTrigger := pLink;
+      end;
+    end;
+  end;
+
+triggerfinish_cleanup:
+  sqlite3DeleteTrigger(db, pTrig);
+  Assert(InRenameObject(pParse) or (pParse^.pNewTrigger = nil),
+         'FinishTrigger: pNewTrigger drained');
   sqlite3DeleteTriggerStep(pParse^.db, pStepList);
 end;
 
