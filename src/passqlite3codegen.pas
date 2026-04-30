@@ -3004,7 +3004,8 @@ uses
   passqlite3printf,
   passqlite3json,
   passqlite3jsoneach,
-  passqlite3vtab;
+  passqlite3vtab,
+  passqlite3parser;
 
 { snpFmt — format into a PAnsiChar buffer using Pascal Format(); same arg order as sqlite3_snprintf }
 { snpFmt — limited C-style snprintf replacement.  Supports %d / %lld
@@ -28123,8 +28124,232 @@ begin
   sqlite3_result_error_code(pCtx, err);
 end;
 
+{ alter.c:2136 — getConstraintToken.  Read one constraint-stream token,
+  skipping leading whitespace/comments; if it is TK_LP, swallow the
+  matching parenthesised group and report TK_LP for the whole span.
+  Returns the byte length consumed.  Faithful 1:1. }
+function getConstraintToken(z: PByte; piToken: Pi32): i32;
 var
-  aAlterTableFuncs: array[0..0] of TFuncDef;
+  iOff: i32;
+  t:    i32;
+  nNest: i32;
+begin
+  iOff := 0;
+  t    := 0;
+  repeat
+    iOff := iOff + i32(sqlite3GetToken(z + iOff, @t));
+  until (t <> TK_SPACE) and (t <> TK_COMMENT);
+
+  piToken^ := t;
+
+  if t = TK_LP then begin
+    nNest := 1;
+    while nNest > 0 do begin
+      iOff := iOff + i32(sqlite3GetToken(z + iOff, @t));
+      if t = TK_LP then
+        Inc(nNest)
+      else if t = TK_RP then begin
+        t := TK_LP;
+        Dec(nNest);
+      end else if t = TK_ILLEGAL then
+        break;
+    end;
+  end;
+
+  piToken^ := t;
+  Result   := iOff;
+end;
+
+{ alter.c:2397 — getWhitespace.  Bytes of leading whitespace/comments. }
+function getWhitespace(z: PByte): i32;
+var
+  nRet: i32;
+  t:    i32;
+  n:    i32;
+begin
+  nRet := 0;
+  while True do begin
+    t := 0;
+    n := i32(sqlite3GetToken(z + nRet, @t));
+    if (t <> TK_SPACE) and (t <> TK_COMMENT) then break;
+    nRet := nRet + n;
+  end;
+  Result := nRet;
+end;
+
+{ alter.c:2418 — getConstraint.  Length until next constraint-boundary
+  token (CONSTRAINT, PRIMARY, NOT, UNIQUE, CHECK, DEFAULT, COLLATE,
+  REFERENCES, FOREIGN, GENERATED, AS, RP, COMMA, ILLEGAL). }
+function getConstraint(z: PByte): i32;
+var
+  iOff: i32;
+  t:    i32;
+  n:    i32;
+begin
+  iOff := 0;
+  t    := 0;
+  while True do begin
+    n := getConstraintToken(z + iOff, @t);
+    if (t = TK_CONSTRAINT) or (t = TK_PRIMARY) or (t = TK_NOT)
+      or (t = TK_UNIQUE) or (t = TK_CHECK) or (t = TK_DEFAULT)
+      or (t = TK_COLLATE) or (t = TK_REFERENCES) or (t = TK_FOREIGN)
+      or (t = TK_RP) or (t = TK_COMMA) or (t = TK_ILLEGAL)
+      or (t = TK_AS) or (t = TK_GENERATED) then
+      break;
+    iOff := iOff + n;
+  end;
+  Result := iOff;
+end;
+
+{ alter.c:2456 — quotedCompare.  Compare possibly-quoted text against
+  a zero-terminated unquoted name.  *pRes := 0 if equal, non-zero if
+  unequal.  Returns SQLITE_OK normally, SQLITE_NOMEM_BKPT on OOM. }
+function quotedCompare(pCtx: Psqlite3_context; t: i32; zQuote: PByte;
+  nQuote: i32; zCmp: PByte; pRes: Pi32): i32;
+var
+  zCopy: PAnsiChar;
+begin
+  if t = TK_ILLEGAL then begin
+    pRes^  := 1;
+    Result := SQLITE_OK;
+    Exit;
+  end;
+  zCopy := PAnsiChar(sqlite3MallocZero(nQuote + 1));
+  if zCopy = nil then begin
+    sqlite3_result_error_nomem(pCtx);
+    Result := SQLITE_NOMEM;
+    Exit;
+  end;
+  Move(zQuote^, zCopy^, nQuote);
+  sqlite3Dequote(zCopy);
+  pRes^ := sqlite3_stricmp(zCopy, PAnsiChar(zCmp));
+  sqlite3_free(zCopy);
+  Result := SQLITE_OK;
+end;
+
+{ alter.c:2488 — skipCreateTable.  Advance past the leading
+  "CREATE TABLE ..." up to the first "(".  Sets SQLITE_CORRUPT on the
+  context if no "(" is found before TK_ILLEGAL. }
+function skipCreateTable(pCtx: Psqlite3_context; zSql: PByte;
+  piOff: Pi32): i32;
+var
+  iOff: i32;
+  t:    i32;
+begin
+  if zSql = nil then begin Result := SQLITE_ERROR; Exit; end;
+  iOff := 0;
+  while True do begin
+    t := 0;
+    iOff := iOff + i32(sqlite3GetToken(zSql + iOff, @t));
+    if t = TK_LP then break;
+    if t = TK_ILLEGAL then begin
+      sqlite3_result_error_code(pCtx, SQLITE_CORRUPT);
+      Result := SQLITE_ERROR;
+      Exit;
+    end;
+  end;
+  piOff^ := iOff;
+  Result := SQLITE_OK;
+end;
+
+{ alter.c:2654 — addConstraintFunc.  Internal SQL function
+  `sqlite_add_constraint(SQL, CONS, ICOL)`: rewrites a CREATE TABLE
+  statement to inject a new column-level (ICOL >= 0) or table-level
+  (ICOL = -1) constraint after the iCol-th column.  Faithful 1:1. }
+procedure addConstraintFunc(pCtx: Psqlite3_context; argc: i32;
+  argv: PPMem); cdecl;
+var
+  zSql:  PByte;
+  zCons: PAnsiChar;
+  iCol:  i32;
+  iOff:  i32;
+  ii:    i32;
+  zNew:  PAnsiChar;
+  t:     i32;
+  nTok:  i32;
+  db:    Psqlite3db;
+begin
+  zSql  := PByte(sqlite3_value_text(Psqlite3_value(argv^)));
+  zCons := PAnsiChar(sqlite3_value_text(Psqlite3_value((argv + 1)^)));
+  iCol  := sqlite3_value_int(Psqlite3_value((argv + 2)^));
+  iOff  := 0;
+  t     := 0;
+
+  if skipCreateTable(pCtx, zSql, @iOff) <> 0 then Exit;
+
+  ii := 0;
+  while (ii <= iCol) or ((iCol < 0) and (t <> TK_RP)) do begin
+    iOff := iOff + getConstraintToken(zSql + iOff, @t);
+    while True do begin
+      nTok := getConstraintToken(zSql + iOff, @t);
+      if (t = TK_COMMA) or (t = TK_RP) then break;
+      if t = TK_ILLEGAL then begin
+        sqlite3_result_error_code(pCtx, SQLITE_CORRUPT);
+        Exit;
+      end;
+      iOff := iOff + nTok;
+    end;
+    Inc(ii);
+  end;
+
+  iOff := iOff + getWhitespace(zSql + iOff);
+
+  db := sqlite3_context_db_handle(pCtx);
+  if iCol < 0 then
+    zNew := sqlite3MPrintf(db, '%.*s, %s%s',
+      [iOff, zSql, zCons, zSql + iOff])
+  else
+    zNew := sqlite3MPrintf(db, '%.*s %s%s',
+      [iOff, zSql, zCons, zSql + iOff]);
+  sqlite3_result_text(pCtx, zNew, -1, SQLITE_DYNAMIC);
+end;
+
+{ alter.c:2936 — findConstraintFunc.  Internal SQL function
+  `sqlite_find_constraint(SQL, NAME)`: returns 1 if a CONSTRAINT with
+  name NAME exists in the table-level constraint list of the given
+  CREATE TABLE statement, 0 otherwise.  Faithful 1:1. }
+procedure findConstraintFunc(pCtx: Psqlite3_context; argc: i32;
+  argv: PPMem); cdecl;
+var
+  zSql:  PByte;
+  zCons: PByte;
+  iOff:  i32;
+  t:     i32;
+  nTok:  i32;
+  cmp:   i32;
+begin
+  zSql  := PByte(sqlite3_value_text(Psqlite3_value(argv^)));
+  zCons := PByte(sqlite3_value_text(Psqlite3_value((argv + 1)^)));
+  iOff  := 0;
+  t     := 0;
+
+  if (zSql = nil) or (zCons = nil) then Exit;
+
+  while (t <> TK_LP) and (t <> TK_ILLEGAL) do
+    iOff := iOff + i32(sqlite3GetToken(zSql + iOff, @t));
+
+  while True do begin
+    iOff := iOff + getConstraintToken(zSql + iOff, @t);
+    if t = TK_CONSTRAINT then begin
+      iOff := iOff + getWhitespace(zSql + iOff);
+      nTok := getConstraintToken(zSql + iOff, @t);
+      cmp  := 0;
+      if quotedCompare(pCtx, t, zSql + iOff, nTok, zCons, @cmp) <> 0 then
+        Exit;
+      if cmp = 0 then begin
+        sqlite3_result_int(pCtx, 1);
+        Exit;
+      end;
+    end else if t = TK_ILLEGAL then begin
+      break;
+    end;
+  end;
+
+  sqlite3_result_int(pCtx, 0);
+end;
+
+var
+  aAlterTableFuncs: array[0..2] of TFuncDef;
   alterFuncsInited: Boolean = False;
 
 { alter.c:3042 — sqlite3AlterFunctions.  Registers the SQL helpers used
@@ -28143,11 +28368,19 @@ const
 begin
   if alterFuncsInited then Exit;
   alterFuncsInited := True;
-  FillChar(aAlterTableFuncs[0], SizeOf(aAlterTableFuncs[0]), 0);
+  FillChar(aAlterTableFuncs[0], SizeOf(aAlterTableFuncs), 0);
   aAlterTableFuncs[0].nArg      := 2;
   aAlterTableFuncs[0].funcFlags := ALTER_FUNC_FLAGS;
   aAlterTableFuncs[0].xSFunc    := @failConstraintFunc;
   aAlterTableFuncs[0].zName     := 'sqlite_fail';
+  aAlterTableFuncs[1].nArg      := 3;
+  aAlterTableFuncs[1].funcFlags := ALTER_FUNC_FLAGS;
+  aAlterTableFuncs[1].xSFunc    := @addConstraintFunc;
+  aAlterTableFuncs[1].zName     := 'sqlite_add_constraint';
+  aAlterTableFuncs[2].nArg      := 2;
+  aAlterTableFuncs[2].funcFlags := ALTER_FUNC_FLAGS;
+  aAlterTableFuncs[2].xSFunc    := @findConstraintFunc;
+  aAlterTableFuncs[2].zName     := 'sqlite_find_constraint';
   sqlite3InsertBuiltinFuncs(@aAlterTableFuncs, Length(aAlterTableFuncs));
 end;
 

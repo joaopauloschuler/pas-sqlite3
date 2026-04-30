@@ -508,16 +508,18 @@ Important: At the end of this document, please find:
        [ ] Port `sqlite3AlterBeginAddColumn`
        [ ] Port `sqlite3AlterFinishAddColumn`.
        [~] Port `sqlite3AlterFunctions` — registers the rename-helper SQL
-            functions.  Partial 2026-04-29: `sqlite_fail(MSG, ERR)`
-            (alter.c:2826 failConstraintFunc + INTERNAL_FUNCTION row)
-            ported into passqlite3codegen.pas; sqlite3AlterFunctions is
-            now wired into sqlite3RegisterBuiltinFunctions and registers
-            an `aAlterTableFuncs` static array (currently 1 of 9 rows).
-            Remaining 8 rows (sqlite_rename_column / _table /
-            renameTableTest, sqlite_drop_column, sqlite_rename_quotefix,
-            sqlite_drop_constraint, sqlite_add_constraint,
-            sqlite_find_constraint) land alongside their function bodies
-            during the rest of 7.1.9 ALTER TABLE work.
+            functions.  Partial 2026-04-30: `sqlite_fail` + `sqlite_add_constraint`
+            (alter.c:2654 addConstraintFunc) + `sqlite_find_constraint`
+            (alter.c:2936 findConstraintFunc) registered.  Static helpers
+            also ported: getConstraintToken (alter.c:2136), getWhitespace
+            (:2397), getConstraint (:2418), quotedCompare (:2456),
+            skipCreateTable (:2488).  Remaining 6 rows
+            (sqlite_rename_column / _table / renameTableTest,
+            sqlite_drop_column, sqlite_rename_quotefix,
+            sqlite_drop_constraint) land alongside their function bodies
+            during the rest of 7.1.9 ALTER TABLE work.  All functions are
+            SQLITE_FUNC_INTERNAL — only invoked by sqlite3NestedParse;
+            direct SQL invocation correctly returns SQLITE_ERROR.
        [X] Port `sqlite3RenameTokenRemap` — done 2026-04-29 (see 6.22).
        [X] Port `sqlite3RenameExprlistUnmap` — done 2026-04-29 (see 6.22).
 
