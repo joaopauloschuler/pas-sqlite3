@@ -179,6 +179,16 @@ Important: At the end of this document, please find:
             the toplevel parse has any bit in writeMask, also starts a
             write transaction on every db.  Used by built-in vtabs
             (sqlite_dbpage) that must touch every schema.
+       [X] `sqlite3ExprCollSeqMatch` + `sqlite3SubselectError` +
+            `sqlite3VectorErrorMsg` + `sqlite3ExprCheckIN` — ported
+            2026-04-29 in passqlite3codegen.pas (expr.c:331/:3495/
+            :3514/:3988).  CollSeqMatch compares the two collations'
+            zName via sqlite3StrICmp; the error helpers route through
+            sqlite3MPrintf + the existing sqlite3ErrorMsg suppressErr
+            logic.  ExprCheckIN validates IN-RHS column count vs LHS
+            vector size.  Faithful 1:1 ports; not yet wired into a
+            caller (parser/codegen IN paths still call the inline
+            checks they had pre-port), exposed for future wiring.
 
 ### Open Bugs
 

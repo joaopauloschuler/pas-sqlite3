@@ -2056,7 +2056,11 @@ procedure sqlite3CteDelete(db: PTsqlite3; pCte: PCte);
 { sqlite3WindowListDelete and sqlite3WindowUnlinkFromSelect declared in Phase 6.7 block below }
 function  sqlite3OomFault(db: PTsqlite3): Pointer;
 function  sqlite3ExprNNCollSeq(pParse: PParse; pE: PExpr): Pointer;
+function  sqlite3ExprCollSeqMatch(pParse: PParse; pE1, pE2: PExpr): i32;
 function  sqlite3ExprCollSeq(pParse: PParse; pE: PExpr): Pointer;
+procedure sqlite3SubselectError(pParse: PParse; nActual, nExpect: i32);
+procedure sqlite3VectorErrorMsg(pParse: PParse; pExpr: PExpr);
+function  sqlite3ExprCheckIN(pParse: PParse; pIn: PExpr): i32;
 procedure sqlite3ColumnSetColl(db: PTsqlite3; pCol: PColumn;
   zColl: PAnsiChar);
 function  sqlite3ColumnColl(pCol: PColumn): PAnsiChar;
@@ -20299,6 +20303,81 @@ begin
   if p = nil then p := pParse^.db^.pDfltColl;
   AssertH(p <> nil, 'ExprNNCollSeq pDfltColl');
   Result := p;
+end;
+
+{ sqlite3ExprCollSeqMatch — port of expr.c:331.  Returns 1 if both
+  expressions resolve to collations with the same name. }
+function sqlite3ExprCollSeqMatch(pParse: PParse; pE1, pE2: PExpr): i32;
+var
+  pColl1, pColl2: PTCollSeq;
+begin
+  pColl1 := PTCollSeq(sqlite3ExprNNCollSeq(pParse, pE1));
+  pColl2 := PTCollSeq(sqlite3ExprNNCollSeq(pParse, pE2));
+  if sqlite3StrICmp(pColl1^.zName, pColl2^.zName) = 0 then
+    Result := 1
+  else
+    Result := 0;
+end;
+
+{ sqlite3SubselectError — port of expr.c:3495.  Reports
+  "sub-select returns N columns - expected M" when nErr is still 0. }
+procedure sqlite3SubselectError(pParse: PParse; nActual, nExpect: i32);
+var
+  zMsg: PAnsiChar;
+  db: PTsqlite3;
+begin
+  if pParse^.nErr <> 0 then Exit;
+  db := pParse^.db;
+  zMsg := sqlite3MPrintf(db,
+    'sub-select returns %d columns - expected %d', [nActual, nExpect]);
+  if (db <> nil) and (db^.suppressErr <> 0) then begin
+    if zMsg <> nil then sqlite3DbFree(db, zMsg);
+    if db^.mallocFailed <> 0 then begin
+      Inc(pParse^.nErr);
+      pParse^.rc := SQLITE_NOMEM;
+    end;
+    Exit;
+  end;
+  Inc(pParse^.nErr);
+  if pParse^.rc = SQLITE_OK then pParse^.rc := SQLITE_ERROR;
+  if zMsg = nil then Exit;
+  if pParse^.zErrMsg <> nil then
+    sqlite3DbFree(db, pParse^.zErrMsg);
+  pParse^.zErrMsg := zMsg;
+end;
+
+{ sqlite3VectorErrorMsg — port of expr.c:3514.  Sub-select operands get
+  the SubselectError message; scalar vectors get "row value misused". }
+procedure sqlite3VectorErrorMsg(pParse: PParse; pExpr: PExpr);
+begin
+  if ExprUseXSelect(pExpr) then
+    sqlite3SubselectError(pParse,
+      pExpr^.x.pSelect^.pEList^.nExpr, 1)
+  else
+    sqlite3ErrorMsg(pParse, 'row value misused');
+end;
+
+{ sqlite3ExprCheckIN — port of expr.c:3988.  Validates that the LHS
+  vector size matches the RHS sub-select column count, or that the LHS
+  is a scalar when the RHS is a value list.  Returns 1 on error. }
+function sqlite3ExprCheckIN(pParse: PParse; pIn: PExpr): i32;
+var
+  nVector: i32;
+begin
+  nVector := sqlite3ExprVectorSize(pIn^.pLeft);
+  if ExprUseXSelect(pIn) and (pParse^.db^.mallocFailed = 0) then begin
+    if nVector <> pIn^.x.pSelect^.pEList^.nExpr then begin
+      sqlite3SubselectError(pParse,
+        pIn^.x.pSelect^.pEList^.nExpr, nVector);
+      Result := 1;
+      Exit;
+    end;
+  end else if nVector <> 1 then begin
+    sqlite3VectorErrorMsg(pParse, pIn^.pLeft);
+    Result := 1;
+    Exit;
+  end;
+  Result := 0;
 end;
 
 { sqlite3ColumnSetColl — port of build.c:720.  Append a NUL-terminated
