@@ -531,7 +531,25 @@ Important: At the end of this document, please find:
             alongside.  Live alongside Phase 7.1.2 (full sqlite3NestedParse).
             TestExplainParity unchanged (1016/1026); DiagFeatureProbe
             unchanged (9 divergences).
-       [ ] Port `sqlite3AlterDropColumn`
+       [X] Port `sqlite3AlterDropColumn` — ported 2026-04-30 (alter.c:2250)
+            in passqlite3codegen.pas.  Replaces the Phase 7 stub.  Locates
+            the table via sqlite3LocateTableItem, runs isAlterableTable +
+            isRealTable, resolves the column index, refuses
+            COLFLAG_PRIMKEY / COLFLAG_UNIQUE columns and refuses dropping
+            the last column, runs renameTestSchema + renameFixQuotes,
+            drives `sqlite_drop_column(iDb, sql, iCol)` over sqlite_master
+            via sqlite3NestedParse, then renameReloadSchema(...,
+            INITFLAG_AlterDrop) + after-drop test.  Non-virtual columns
+            additionally rewrite on-disk rows: scans the table via
+            OP_OpenWrite/OP_Rewind, materialises remaining columns
+            (HasRowid path emits OP_Rowid; WITHOUT-ROWID path emits
+            OP_Column reads of the PK key columns), uses
+            sqlite3ExprCodeGetColumnOfTable per surviving column with the
+            REAL→NUMERIC affinity flip per C, and re-inserts via
+            OP_MakeRecord + OP_Insert/OP_IdxInsert with OPFLAG_SAVEPOSITION.
+            Live alongside Phase 7.1.2 (sqlite3NestedParse).
+            TestExplainParity unchanged (1016/1026); DiagFeatureProbe
+            unchanged (9 divergences).
        [X] Port `sqlite3AlterDropConstraint` — ported 2026-04-30 (alter.c:2783)
             in passqlite3codegen.pas.  Replaces the Phase 7 stub.  Routes
             through new `alterFindTable` (alter.c:2742) + `alterFindCol`

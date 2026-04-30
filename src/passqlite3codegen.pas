@@ -28571,12 +28571,6 @@ exit_rename_table:
   sqlite3DbFree(db, zName);
 end;
 
-procedure sqlite3AlterDropColumn(pParse: PParse; pSrc: PSrcList;
-  const pName: PToken);
-begin
-  sqlite3SrcListDelete(pParse^.db, pSrc);
-end;
-
 { alter.c:566 — isRealTable.  Returns 1 (and posts an error) when the named
   table is a view or virtual table; the iOp index selects the verb in the
   emitted error message ("rename columns of" / "drop column from" /
@@ -28620,6 +28614,173 @@ begin
       + ' WHERE name NOT LIKE ''sqliteX_%%'' ESCAPE ''X'''
       + ' AND sql NOT LIKE ''create virtual%%''',
       []);
+end;
+
+{ alter.c:2250 — sqlite3AlterDropColumn.  Generate VDBE code for
+  ALTER TABLE <pSrc> DROP COLUMN <pName>.  Locates the table, validates
+  alterable + real, resolves the column index, refuses PK/UNIQUE columns
+  and refuses dropping the last column, runs the rename test/quote-fix
+  passes, drives sqlite_drop_column() over sqlite_master via
+  sqlite3NestedParse, reloads the schema, then on a non-virtual column
+  rewrites the on-disk rows by scanning the table and re-inserting each
+  row with the dropped column elided.  Faithful 1:1. }
+procedure sqlite3AlterDropColumn(pParse: PParse; pSrc: PSrcList;
+  const pName: PToken);
+label
+  exit_drop_column;
+var
+  db:      PTsqlite3;
+  pTab:    PTable2;
+  iDb:     i32;
+  zDb:     PAnsiChar;
+  zCol:    PAnsiChar;
+  iCol:    i32;
+  sItems:  PSrcItem;
+  v:       PVdbe;
+  pPk:     PIndex2;
+  iCur:    i32;
+  addr:    i32;
+  reg:     i32;
+  regRec:  i32;
+  nField:  i32;
+  i:       i32;
+  iPos:    i32;
+  iColPos: i32;
+  regOut:  i32;
+  aff:     AnsiChar;
+begin
+  db   := pParse^.db;
+  zCol := nil;
+
+  AssertH(pParse^.pNewTable = nil, 'AlterDropColumn: pNewTable not nil');
+  if db^.mallocFailed <> 0 then goto exit_drop_column;
+  sItems := SrcListItems(pSrc);
+  pTab := sqlite3LocateTableItem(pParse, 0, @sItems[0]);
+  if pTab = nil then goto exit_drop_column;
+
+  if isAlterableTable(pParse, pTab) <> 0 then goto exit_drop_column;
+  if isRealTable(pParse, pTab, 1) <> 0 then goto exit_drop_column;
+
+  zCol := sqlite3DbStrNDup(db, pName^.z, u64(pName^.n));
+  if zCol = nil then begin
+    AssertH(db^.mallocFailed <> 0, 'AlterDropColumn: zCol nil w/o oom');
+    goto exit_drop_column;
+  end;
+  sqlite3Dequote(zCol);
+  iCol := sqlite3ColumnIndex(pTab, zCol);
+  if iCol < 0 then begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'no such column: "%T"', [pName]));
+    goto exit_drop_column;
+  end;
+
+  if (pTab^.aCol[iCol].colFlags and (COLFLAG_PRIMKEY or COLFLAG_UNIQUE)) <> 0 then
+  begin
+    if (pTab^.aCol[iCol].colFlags and COLFLAG_PRIMKEY) <> 0 then
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'cannot drop %s column: "%s"', [PAnsiChar('PRIMARY KEY'), zCol]))
+    else
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'cannot drop %s column: "%s"', [PAnsiChar('UNIQUE'), zCol]));
+    goto exit_drop_column;
+  end;
+
+  if pTab^.nCol <= 1 then begin
+    sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+      'cannot drop column "%s": no other columns exist', [zCol]));
+    goto exit_drop_column;
+  end;
+
+  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  AssertH(iDb >= 0, 'AlterDropColumn: iDb<0');
+  zDb := db^.aDb[iDb].zDbSName;
+
+  if sqlite3AuthCheck(pParse, SQLITE_ALTER_TABLE, zDb, pTab^.zName, zCol) <> 0 then
+    goto exit_drop_column;
+
+  renameTestSchema(pParse, zDb, i32(Ord(iDb = 1)), '', 0);
+  renameFixQuotes(pParse, zDb, i32(Ord(iDb = 1)));
+  sqlite3NestedParse(pParse,
+    'UPDATE "%w".' + LEGACY_SCHEMA_TABLE + ' SET '
+    + 'sql = sqlite_drop_column(%d, sql, %d) '
+    + 'WHERE (type==''table'' AND tbl_name=%Q COLLATE nocase)',
+    [zDb, iDb, iCol, pTab^.zName]);
+
+  renameReloadSchema(pParse, iDb, INITFLAG_AlterDrop);
+  renameTestSchema(pParse, zDb, i32(Ord(iDb = 1)), 'after drop column', 1);
+
+  if (pParse^.nErr = 0)
+     and ((pTab^.aCol[iCol].colFlags and COLFLAG_VIRTUAL) = 0) then
+  begin
+    pPk := nil;
+    nField := 0;
+    v := sqlite3GetVdbe(pParse);
+    iCur := pParse^.nTab;
+    Inc(pParse^.nTab);
+    sqlite3OpenTable(pParse, iCur, iDb, pTab, OP_OpenWrite);
+    addr := sqlite3VdbeAddOp1(v, OP_Rewind, iCur);
+    Inc(pParse^.nMem);
+    reg := pParse^.nMem;
+    if HasRowid(pTab) then begin
+      sqlite3VdbeAddOp2(v, OP_Rowid, iCur, reg);
+      Inc(pParse^.nMem, pTab^.nCol);
+    end else begin
+      pPk := sqlite3PrimaryKeyIndex(pTab);
+      Inc(pParse^.nMem, pPk^.nColumn);
+      for i := 0 to i32(pPk^.nKeyCol) - 1 do
+        sqlite3VdbeAddOp3(v, OP_Column, iCur, i, reg + i + 1);
+      nField := i32(pPk^.nKeyCol);
+    end;
+    Inc(pParse^.nMem);
+    regRec := pParse^.nMem;
+    for i := 0 to pTab^.nCol - 1 do begin
+      if (i <> iCol)
+         and ((pTab^.aCol[i].colFlags and COLFLAG_VIRTUAL) = 0) then
+      begin
+        if pPk <> nil then begin
+          iPos    := sqlite3TableColumnToIndex(pPk, i);
+          iColPos := sqlite3TableColumnToIndex(pPk, iCol);
+          if iPos < i32(pPk^.nKeyCol) then continue;
+          if iPos > iColPos then
+            regOut := reg + 1 + iPos - 1
+          else
+            regOut := reg + 1 + iPos;
+        end else begin
+          regOut := reg + 1 + nField;
+        end;
+        if i = pTab^.iPKey then begin
+          sqlite3VdbeAddOp2(v, OP_Null, 0, regOut);
+        end else begin
+          aff := pTab^.aCol[i].affinity;
+          if aff = AnsiChar(SQLITE_AFF_REAL) then
+            pTab^.aCol[i].affinity := AnsiChar(SQLITE_AFF_NUMERIC);
+          sqlite3ExprCodeGetColumnOfTable(v, pTab, iCur, i, regOut);
+          pTab^.aCol[i].affinity := aff;
+        end;
+        Inc(nField);
+      end;
+    end;
+    if nField = 0 then begin
+      { dbsqlfuzz 5f09e7bcc78b4954d06bf9f2400d7715f48d1fef }
+      Inc(pParse^.nMem);
+      sqlite3VdbeAddOp2(v, OP_Null, 0, reg + 1);
+      nField := 1;
+    end;
+    sqlite3VdbeAddOp3(v, OP_MakeRecord, reg + 1, nField, regRec);
+    if pPk <> nil then
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iCur, regRec, reg + 1,
+                           i32(pPk^.nKeyCol))
+    else
+      sqlite3VdbeAddOp3(v, OP_Insert, iCur, regRec, reg);
+    sqlite3VdbeChangeP5(v, OPFLAG_SAVEPOSITION);
+
+    sqlite3VdbeAddOp2(v, OP_Next, iCur, addr + 1);
+    sqlite3VdbeJumpHere(v, addr);
+  end;
+
+exit_drop_column:
+  sqlite3DbFree(db, zCol);
+  sqlite3SrcListDelete(db, pSrc);
 end;
 
 { alter.c:599 — sqlite3AlterRenameColumn.  Generate VDBE code for
