@@ -98,9 +98,29 @@ Important: At the end of this document, please find:
             still DIVERGE: trigger registers but the row-handler is
             never emitted), but parse + schema-cache install matches C
             1:1 and unblocks the remaining trigger arms.
-       [ ] Port `sqlite3CodeRowTriggerDirect`
-       [ ] Port `sqlite3CodeRowTrigger`
-       [ ] Port `sqlite3TriggerStepSrc`
+       [X] Port `sqlite3CodeRowTriggerDirect` — ported 2026-04-29
+            (trigger.c:1382).  Emits OP_Program for the compiled trigger
+            sub-program, with P5 set when recursive-trigger invocation
+            must be suppressed (named trigger + SQLITE_RecTriggers
+            cleared).  Calls `trgGetRowTrigger` for the cached lookup;
+            that helper still returns nil today (gated on the full
+            `codeRowTrigger` compile pipeline), so the OP_Program emit
+            is dead-code until that lands but the structural port is
+            faithful 1:1.
+       [X] Port `sqlite3CodeRowTrigger` — ported 2026-04-29
+            (trigger.c:1454).  Walks the trigger chain matching op +
+            tr_tm + checkColumnOverlap, dispatches ordinary triggers to
+            `sqlite3CodeRowTriggerDirect` and RETURNING triggers to
+            `codeReturningTrigger` at top-level only; UPSERT bridge
+            (bReturning + INSERT trigger / UPDATE op) honoured.  Also
+            ported `codeReturningTrigger` skeleton (trigger.c:1020) —
+            early-out gates only; full body (SelectPrep + ExpandReturning
+            + ResolveExprListNames + MakeRecord/NewRowid/Insert) remains
+            TODO.  DiagFeatureProbe baseline unchanged (9 divergences),
+            TestExplainParity unchanged (1016/1026 pass, 10 diverge).
+       [ ] Port `sqlite3TriggerStepSrc` (no caller in current C tree —
+            symbol may have been removed upstream; revisit when the
+            full `codeRowTrigger` pipeline lands)
        [X] Port `sqlite3TriggerColmask` — ported 2026-04-29 (trigger.c:1524).
             IsView arm now correctly returns 0xffffffff and bReturning
             arm returns 0xffffffff per matching trigger; ordinary

@@ -21422,19 +21422,106 @@ begin
   if mask <> 0 then Result := pList else Result := nil;
 end;
 
-{ sqlite3CodeRowTriggerDirect — emit VDBE for a specific trigger (Phase 6.4 stub) }
-procedure sqlite3CodeRowTriggerDirect(pParse: PParse; pTrigger: PTrigger;
-  pTab: PTable2; reg: i32; orconf: i32; ignoreJump: i32);
+{ Forward declaration — body lives below alongside sqlite3TriggerColmask. }
+function trgGetRowTrigger(pParse: PParse; p: PTrigger; pTab: PTable2;
+  orconf: i32): PTriggerPrg; forward;
+
+{ codeReturningTrigger — port of trigger.c:1020.
+
+  Generates inline code for a RETURNING trigger.  Today this is a
+  TODO: depends on sqlite3ExpandReturning, sqlite3ResolveExprListNames
+  for NC_UBaseReg, sqlite3ProcessReturningSubqueries, OP_RealAffinity
+  emission with sqlite3ExprAffinity, plus OP_MakeRecord/NewRowid/Insert
+  into a dedicated retCur cursor.  Until those land, faithfully no-op
+  on the same early-out gates the C version uses (mismatched parse /
+  mismatched trigger object) so the dispatcher's call graph stays
+  correct. }
+procedure codeReturningTrigger(pParse: PParse; pTrigger: PTrigger;
+  pTab: PTable2; regIn: i32);
+var
+  pRet: PReturning;
 begin
-  { Phase 6.5+ }
+  if (pParse^.parseFlags and PARSEFLAG_BReturning) = 0 then Exit;
+  AssertH(pParse^.db^.pParse = pParse, 'codeReturningTrigger db^.pParse');
+  pRet := pParse^.u1.pReturning;
+  if pTrigger <> @pRet^.retTrig then Exit;
+  { TODO(Phase 6.23 follow-on): port the SelectPrep + GenerateColumnNames
+    + ExpandReturning + ResolveExprListNames body.  Until then the
+    RETURNING-clause projection is not emitted; downstream callers see
+    no rows on the RETURNING cursor.  The dispatcher correctly invokes
+    this only at top-level for the matching retTrig, so when the body
+    lands no further plumbing is needed. }
 end;
 
-{ sqlite3CodeRowTrigger — emit VDBE for matching triggers (Phase 6.4 stub) }
+{ sqlite3CodeRowTriggerDirect — port of trigger.c:1382.
+
+  Emit OP_Program for the compiled sub-program of trigger p, then set
+  P5 to non-zero when recursive invocation must be suppressed (named
+  trigger + SQLITE_RecTriggers cleared).  pPrg comes from trgGetRowTrigger
+  (the cache lookup + codeRowTrigger compile path).  Today
+  trgGetRowTrigger returns nil because codeRowTrigger is still a stub
+  (Phase 6.23 follow-on), so the OP_Program emit is dead-code; the
+  structural port is correct so it lights up the moment that lands. }
+procedure sqlite3CodeRowTriggerDirect(pParse: PParse; pTrigger: PTrigger;
+  pTab: PTable2; reg: i32; orconf: i32; ignoreJump: i32);
+var
+  v:          PVdbe;
+  pPrg:       PTriggerPrg;
+  bRecursive: i32;
+begin
+  v := sqlite3GetVdbe(pParse);
+  pPrg := trgGetRowTrigger(pParse, pTrigger, pTab, orconf);
+  AssertH((pPrg <> nil) or (pParse^.nErr <> 0), 'CodeRowTriggerDirect pPrg');
+  if pPrg <> nil then begin
+    if (pTrigger^.zName <> nil)
+       and ((pParse^.db^.flags and SQLITE_RecTriggers) = 0) then
+      bRecursive := 1
+    else
+      bRecursive := 0;
+    Inc(pParse^.nMem);
+    sqlite3VdbeAddOp4(v, OP_Program, reg, ignoreJump, pParse^.nMem,
+                      PAnsiChar(pPrg^.pProgram), P4_SUBPROGRAM);
+    sqlite3VdbeChangeP5(v, u16(bRecursive));
+  end;
+end;
+
+{ sqlite3CodeRowTrigger — port of trigger.c:1454.
+
+  Walks the trigger chain rooted at pTrigger.  For each trigger whose
+  op + tr_tm + pColumns overlap matches the current DML statement,
+  dispatches to sqlite3CodeRowTriggerDirect (ordinary triggers) or
+  codeReturningTrigger (RETURNING, top-level only).  bReturning + INSERT
+  triggers also match an ongoing UPDATE op (the UPSERT update arm). }
 procedure sqlite3CodeRowTrigger(pParse: PParse; pTrigger: PTrigger;
   op: i32; pChanges: PExprList; tr_tm: i32; pTab: PTable2;
   reg: i32; orconf: i32; ignoreJump: i32);
+var
+  p: PTrigger;
 begin
-  { Phase 6.5+ }
+  AssertH((op = TK_UPDATE) or (op = TK_INSERT) or (op = TK_DELETE),
+    'CodeRowTrigger op');
+  AssertH((tr_tm = TRIGGER_BEFORE) or (tr_tm = TRIGGER_AFTER),
+    'CodeRowTrigger tr_tm');
+  AssertH((op = TK_UPDATE) = (pChanges <> nil), 'CodeRowTrigger pChanges');
+  p := pTrigger;
+  while p <> nil do begin
+    AssertH(p^.pSchema <> nil, 'CodeRowTrigger pSchema');
+    AssertH(p^.pTabSchema <> nil, 'CodeRowTrigger pTabSchema');
+    AssertH((p^.pSchema = p^.pTabSchema)
+            or (p^.pSchema = pParse^.db^.aDb[1].pSchema),
+      'CodeRowTrigger schema match');
+    if ((i32(p^.op) = op)
+        or ((p^.bReturning <> 0) and (i32(p^.op) = TK_INSERT) and (op = TK_UPDATE)))
+       and (i32(p^.tr_tm) = tr_tm)
+       and (trgCheckColumnOverlap(p^.pColumns, pChanges) <> 0) then
+    begin
+      if p^.bReturning = 0 then
+        sqlite3CodeRowTriggerDirect(pParse, p, pTab, reg, orconf, ignoreJump)
+      else if pParse^.pToplevel = nil then
+        codeReturningTrigger(pParse, p, pTab, reg);
+    end;
+    p := p^.pNext;
+  end;
 end;
 
 { sqlite3TriggerStepSrc — build a SrcList for a trigger step (Phase 6.4 stub) }
