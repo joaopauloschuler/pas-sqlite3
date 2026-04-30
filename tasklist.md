@@ -197,6 +197,15 @@ Important: At the end of this document, please find:
             vector size.  Faithful 1:1 ports; not yet wired into a
             caller (parser/codegen IN paths still call the inline
             checks they had pre-port), exposed for future wiring.
+       [X] `sqlite3DeferForeignKey` + `sqlite3SrcListFuncArgs` —
+            ported 2026-04-29 in passqlite3codegen.pas (build.c:3749 /
+            :5184).  Previously Phase 7 stubs.  DeferForeignKey now
+            toggles the most recent FKey.isDeferred byte (offset 44)
+            on pParse^.pNewTable for INITIALLY DEFERRED parsing.
+            SrcListFuncArgs attaches the parsed argument list to the
+            last SrcItem and tags it isTabFunc (fgBits bit 3) so the
+            table-valued-function FROM-item arm of the planner sees
+            the args.  TestExplainParity unchanged (1016/1026).
 
 ### Open Bugs
 

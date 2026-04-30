@@ -26458,9 +26458,25 @@ begin
   sqlite3ExprListDelete(pParse^.db, pToCol);
 end;
 
+{ build.c:3749 — sqlite3DeferForeignKey.  Toggle the most recently added
+  FOREIGN KEY constraint between INITIALLY DEFERRED (1) and INITIALLY
+  IMMEDIATE (0).  PFKey is a Pointer-typed stub today (Phase 6.6), so
+  we write the FKey.isDeferred byte by explicit offset (44 bytes:
+  pFrom(8) + pNextFrom(8) + zTo(8) + pNextTo(8) + pPrevTo(8) + nCol(4)). }
 procedure sqlite3DeferForeignKey(pParse: PParse; isDeferred: i32);
+const
+  FKEY_ISDEFERRED_OFFSET = 44;
+var
+  pTab:  PTable2;
+  pFKey: Pu8;
 begin
-  { Phase 7 }
+  pTab := pParse^.pNewTable;
+  if pTab = nil then Exit;
+  if pTab^.eTabType <> TABTYP_NORM then Exit;  { IsOrdinaryTable + NEVER }
+  pFKey := Pu8(pTab^.u.tab.pFKey);
+  if pFKey = nil then Exit;
+  Assert((isDeferred = 0) or (isDeferred = 1));
+  pFKey[FKEY_ISDEFERRED_OFFSET] := u8(isDeferred);
 end;
 
 { sqlite3IndexHasDuplicateRootPage — port of prepare.c:62.
@@ -27108,11 +27124,27 @@ begin
   Result := pSrc;
 end;
 
+{ build.c:5184 — sqlite3SrcListFuncArgs.  Attach a parsed argument list
+  to the most recently added SrcItem and tag it as a table-valued
+  function call (`tab(args)` in the FROM clause).  When p is nil (caller
+  failed earlier) the list is freed. }
 procedure sqlite3SrcListFuncArgs(pParse: PParse; p: PSrcList;
   pList: PExprList);
+var
+  pItem: PSrcItem;
 begin
-  { Phase 7 }
-  sqlite3ExprListDelete(pParse^.db, pList);
+  if p <> nil then
+  begin
+    pItem := SrcListItems(p);
+    Inc(pItem, p^.nSrc - 1);
+    Assert((pItem^.fg.fgBits and u8($01)) = 0);  { notIndexed }
+    Assert((pItem^.fg.fgBits and u8($02)) = 0);  { isIndexedBy }
+    Assert((pItem^.fg.fgBits and u8($08)) = 0);  { isTabFunc }
+    pItem^.u1.pFuncArg := pList;
+    pItem^.fg.fgBits := pItem^.fg.fgBits or u8($08);  { isTabFunc }
+  end
+  else
+    sqlite3ExprListDelete(pParse^.db, pList);
 end;
 
 procedure sqlite3SrcListShiftJoinType(pParse: PParse; p: PSrcList);
