@@ -265,6 +265,19 @@ Important: At the end of this document, please find:
             gRootPageMoved / gResetAllSchemas pattern.  Reached from
             OP_ParseSchema (vdbe.pas:9425).  TestExplainParity unchanged
             (1016/1026); DiagFeatureProbe unchanged (9 divergences).
+       [X] `sqlite3PCacheIsDirty` (pcache.c:712) +
+            `sqlite3PagerJournalname` (pager.c:7128) +
+            `sqlite3PagerDirectReadOk` (pager.c:805) +
+            `sqlite3PagerSetJournalMode` (pager.c:7361) — ported 2026-04-30.
+            PCacheIsDirty added to passqlite3pcache.pas as the small
+            accessor consumed by DirectReadOk (returns 1 iff pCache^.pDirty
+            <> nil).  Pager batch added to passqlite3pager.pas; SetJournalMode
+            is the full body (handles MEMDB clamp, TRUNCATE/PERSIST → DELETE
+            transition with shared/reserved-lock-coordinated journal delete,
+            and OFF/MEMORY journal close).  Faithful 1:1 ports; not yet
+            wired into PRAGMA journal_mode write codegen (still emits a
+            constant default echo) but exposed for downstream wiring.
+            TestExplainParity unchanged (1016/1026); TestPager 12/12 PASS.
 
 ### Open Bugs
 

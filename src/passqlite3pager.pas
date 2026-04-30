@@ -447,6 +447,17 @@ function  sqlite3PagerOkToChangeJournalMode(pPager: PPager): i32;
 { pager.c:7473 — get/set the persistent-journal size limit (-1 = no limit). }
 function  sqlite3PagerJournalSizeLimit(pPager: PPager; iLimit: i64): i64;
 
+{ pager.c:7128 — return the full pathname of the journal file. }
+function  sqlite3PagerJournalname(pPager: PPager): PChar;
+
+{ pager.c:805 — return non-zero when the pager is in a state where pages
+  may be read directly from the database file rather than via the cache. }
+function  sqlite3PagerDirectReadOk(pPager: PPager; pgno: Pgno): i32;
+
+{ pager.c:7361 — switch the journal mode (PAGER_JOURNALMODE_*).  Returns
+  the new (or unchanged) journal mode. }
+function  sqlite3PagerSetJournalMode(pPager: PPager; eMode: i32): i32;
+
 { Cross-unit hook: backup.c's sqlite3BackupRestart, installed by
   passqlite3backup at unit initialisation.  Faithful port of pager_reset
   needs to call sqlite3BackupRestart, but passqlite3backup `uses`
@@ -4767,6 +4778,126 @@ begin
     sqlite3WalLimit(pPager^.pWal, iLimit);
   end;
   Result := pPager^.journalSizeLimit;
+end;
+
+{ pager.c:7128 — sqlite3PagerJournalname.
+  Return the full pathname of the journal file. }
+function sqlite3PagerJournalname(pPager: PPager): PChar;
+begin
+  Result := pPager^.zJournal;
+end;
+
+{ pager.c:805 — sqlite3PagerDirectReadOk.
+  Return non-zero iff:
+    (1) the database file is open,
+    (2) the VFS for the database is able to do unaligned sub-page reads,
+    (3) there are no dirty pages in the cache, and
+    (4) the desired page is not currently in the wal file. }
+function sqlite3PagerDirectReadOk(pPager: PPager; pgno: Pgno): i32;
+var
+  iRead: u32;
+begin
+  AssertH(pPager <> nil, 'PagerDirectReadOk: pPager nil');
+  AssertH(pPager^.fd <> nil, 'PagerDirectReadOk: fd nil');
+  if pPager^.fd^.pMethods = nil then begin Result := 0; Exit; end;  { Case (1) }
+  if sqlite3PCacheIsDirty(pPager^.pPCache) <> 0 then begin Result := 0; Exit; end;  { Case (3) }
+  if pPager^.pWal <> nil then
+  begin
+    iRead := 0;
+    sqlite3WalFindFrame(pPager^.pWal, pgno, @iRead);
+    if iRead <> 0 then begin Result := 0; Exit; end;  { Case (4) }
+  end;
+  AssertH(pPager^.fd^.pMethods^.xDeviceCharacteristics <> nil,
+    'PagerDirectReadOk: xDeviceCharacteristics nil');
+  if (pPager^.fd^.pMethods^.xDeviceCharacteristics(pPager^.fd)
+        and SQLITE_IOCAP_SUBPAGE_READ) = 0 then
+  begin
+    Result := 0;  { Case (2) }
+    Exit;
+  end;
+  Result := 1;
+end;
+
+{ pager.c:7361 — sqlite3PagerSetJournalMode.
+  Switch the journal mode and, when transitioning out of TRUNCATE/PERSIST
+  to a non-WAL mode (or into OFF/MEMORY), close and possibly delete the
+  rollback journal file. }
+function sqlite3PagerSetJournalMode(pPager: PPager; eMode: i32): i32;
+var
+  eOld:  u8;
+  rc:    i32;
+  state: i32;
+begin
+  eOld := pPager^.journalMode;
+
+  AssertH(    (eMode = PAGER_JOURNALMODE_DELETE)
+           or (eMode = PAGER_JOURNALMODE_PERSIST)
+           or (eMode = PAGER_JOURNALMODE_OFF)
+           or (eMode = PAGER_JOURNALMODE_TRUNCATE)
+           or (eMode = PAGER_JOURNALMODE_MEMORY)
+           or (eMode = PAGER_JOURNALMODE_WAL),
+        'PagerSetJournalMode: invalid eMode');
+
+  AssertH((pPager^.tempFile = 0) or (eMode <> PAGER_JOURNALMODE_WAL),
+    'PagerSetJournalMode: tempFile cannot use WAL');
+
+  { In-memory databases may only be set to MEMORY or OFF. }
+  if pPager^.memDb <> 0 then
+  begin
+    AssertH((eOld = PAGER_JOURNALMODE_MEMORY) or (eOld = PAGER_JOURNALMODE_OFF),
+      'PagerSetJournalMode: memDb prior mode must be MEMORY/OFF');
+    if (eMode <> PAGER_JOURNALMODE_MEMORY) and (eMode <> PAGER_JOURNALMODE_OFF) then
+      eMode := i32(eOld);
+  end;
+
+  if eMode <> i32(eOld) then
+  begin
+    AssertH(pPager^.eState <> PAGER_ERROR, 'PagerSetJournalMode: eState=ERROR');
+    pPager^.journalMode := u8(eMode);
+
+    AssertH(isOpen(pPager^.fd) <> 0, 'PagerSetJournalMode: fd closed and not exclusive');
+
+    { When transitioning from TRUNCATE or PERSIST (mask & 5 == 1) to any
+      mode whose low bit is 0 (DELETE/MEMORY/OFF), and not in exclusive
+      locking mode, delete the journal file. }
+    if (pPager^.exclusiveMode = 0)
+       and ((i32(eOld) and 5) = 1)
+       and ((eMode and 1) = 0) then
+    begin
+      sqlite3OsClose(pPager^.jfd);
+      if pPager^.eLock >= RESERVED_LOCK then
+      begin
+        sqlite3OsDelete(pPager^.pVfs, pPager^.zJournal, 0);
+      end
+      else
+      begin
+        rc    := SQLITE_OK;
+        state := pPager^.eState;
+        AssertH((state = PAGER_OPEN) or (state = PAGER_READER),
+          'PagerSetJournalMode: state must be OPEN or READER');
+        if state = PAGER_OPEN then
+          rc := sqlite3PagerSharedLock(pPager);
+        if pPager^.eState = PAGER_READER then
+        begin
+          AssertH(rc = SQLITE_OK, 'PagerSetJournalMode: shared lock rc');
+          rc := pagerLockDb(pPager, RESERVED_LOCK);
+        end;
+        if rc = SQLITE_OK then
+          sqlite3OsDelete(pPager^.pVfs, pPager^.zJournal, 0);
+        if (rc = SQLITE_OK) and (state = PAGER_READER) then
+          pagerUnlockDb(pPager, SHARED_LOCK)
+        else if state = PAGER_OPEN then
+          pager_unlock(pPager);
+        AssertH(state = pPager^.eState, 'PagerSetJournalMode: state mismatch');
+      end;
+    end
+    else if (eMode = PAGER_JOURNALMODE_OFF) or (eMode = PAGER_JOURNALMODE_MEMORY) then
+    begin
+      sqlite3OsClose(pPager^.jfd);
+    end;
+  end;
+
+  Result := i32(pPager^.journalMode);
 end;
 
 { ============================================================
