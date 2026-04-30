@@ -594,6 +594,13 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
             through to `Result := 0`.  Declared `cdecl` (no varargs);
             extra arguments passed by callers under x86_64 SysV remain
             unread and benign because we never honour them.
+       [X] `sqlite3InvokeBusyHandler` — ported 2026-04-30 in
+            passqlite3main.pas (main.c:1770).  Faithful 1:1 of the
+            BusyHandler state machine: returns 0 when handler is unset
+            or already latched (nBusy<0); otherwise calls xBusyHandler
+            with current nBusy and either latches to -1 on a 0 return
+            or increments nBusy.  Available for future btree/pager
+            wiring through the standard busy-retry loop.
 
 - [X] **8.9.1** Vtab helper APIs (vtab.c, vdbeapi.c):
        [X] `sqlite3_vtab_distinct` — ported 2026-04-29 as a degraded

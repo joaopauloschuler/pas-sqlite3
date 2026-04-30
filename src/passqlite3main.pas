@@ -174,6 +174,10 @@ function sqlite3_busy_handler(db: PTsqlite3;
   xBusy: Pointer; pArg: Pointer): i32;
 function sqlite3_busy_timeout(db: PTsqlite3; ms: i32): i32;
 
+{ main.c:1770 — invoke a previously-installed busy handler.  Returns
+  non-zero if the lock should be retried, 0 to abort with SQLITE_BUSY. }
+function sqlite3InvokeBusyHandler(p: passqlite3util.PBusyHandler): i32;
+
 { Hooks: each returns the previously-installed pArg (or nil). }
 function sqlite3_commit_hook(db: PTsqlite3;
   xCallback: Pointer; pArg: Pointer): Pointer;
@@ -1546,6 +1550,26 @@ begin
   db^.busyTimeout              := 0;
   sqlite3_mutex_leave(db^.mutex);
   Result := SQLITE_OK;
+end;
+
+{ Faithful 1:1 of main.c:1770.  When called from a lock-retry loop and the
+  busy handler returns non-zero, increment nBusy so the handler can scale
+  its sleep interval; on a 0 return latch nBusy to -1 so subsequent calls
+  in this transaction short-circuit (matching the C state machine). }
+function sqlite3InvokeBusyHandler(p: passqlite3util.PBusyHandler): i32;
+var
+  rc: i32;
+begin
+  if (p = nil) or not Assigned(p^.xBusyHandler) or (p^.nBusy < 0) then
+  begin
+    Result := 0; Exit;
+  end;
+  rc := p^.xBusyHandler(p^.pBusyArg, p^.nBusy);
+  if rc = 0 then
+    p^.nBusy := -1
+  else
+    Inc(p^.nBusy);
+  Result := rc;
 end;
 
 function sqlite3_busy_timeout(db: PTsqlite3; ms: i32): i32;
