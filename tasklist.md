@@ -254,6 +254,17 @@ Important: At the end of this document, please find:
             nTempReg/nRangeReg resets remain in codegen) but exposed
             for downstream wiring.  TestExplainParity unchanged
             (1016/1026).
+       [X] `sqlite3FkClearTriggerCache` (fkey.c:705) — ported 2026-04-30
+            in passqlite3codegen.pas; replaces the empty stub previously
+            living in passqlite3vdbe.pas.  Walks aDb[iDb].pSchema^.tblHash,
+            and for each ordinary table walks pTab^.u.tab.pFKey freeing
+            apTrigger[0/1] via fkTriggerDelete and zeroing both slots so
+            fkActionTrigger rebuilds them on next access.  Wired through
+            the new vdbe.pas hook `gFkClearTriggerCache` (registered in
+            codegen's initialization), matching the existing
+            gRootPageMoved / gResetAllSchemas pattern.  Reached from
+            OP_ParseSchema (vdbe.pas:9425).  TestExplainParity unchanged
+            (1016/1026); DiagFeatureProbe unchanged (9 divergences).
 
 ### Open Bugs
 

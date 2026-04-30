@@ -1505,6 +1505,7 @@ procedure sqlite3FkClearTriggerCache(db: PTsqlite3; iDb: i32);
 type
   TUnlinkAndDeleteFn = procedure(db: PTsqlite3; iDb: i32; zName: PAnsiChar);
   TRootPageMovedFn   = procedure(db: PTsqlite3; iDb: i32; iFrom, iTo: i32);
+  TFkClearTriggerCacheFn = procedure(db: PTsqlite3; iDb: i32);
   TSetP4KeyInfoFn    = procedure(pParse: PParse; pIdx: PIndex);
   TResetOneSchemaFn  = procedure(db: PTsqlite3; iDb: i32);
   TResetAllSchemasFn = procedure(db: PTsqlite3);
@@ -1523,6 +1524,7 @@ var
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteTrigger: TUnlinkAndDeleteFn;
   gRootPageMoved:          TRootPageMovedFn;
+  gFkClearTriggerCache:    TFkClearTriggerCacheFn;
   gSetP4KeyInfo:           TSetP4KeyInfoFn;
   gResetOneSchema:         TResetOneSchemaFn;
   gResetAllSchemas:        TResetAllSchemasFn;
@@ -11830,7 +11832,10 @@ begin
 end;
 
 procedure sqlite3FkClearTriggerCache(db: PTsqlite3; iDb: i32);
-begin { Stub: FK trigger cache requires Phase 6 } end;
+begin
+  if Assigned(gFkClearTriggerCache) then
+    gFkClearTriggerCache(db, iDb);
+end;
 
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 begin

@@ -33012,6 +33012,42 @@ begin
   end;
 end;
 
+{ fkey.c:705 — sqlite3FkClearTriggerCache.  Called when the schema for
+  database iDb changes; walks every ordinary table in the schema's tblHash
+  and frees the cached CASCADE / SET NULL / SET DEFAULT triggers stashed in
+  pFKey^.apTrigger[0..1], so they get rebuilt on next access by
+  fkActionTrigger.  Faithful 1:1 of the C body. }
+procedure sqlite3FkClearTriggerCacheImpl(db: PTsqlite3; iDb: i32);
+const
+  FKEY_PNEXTFROM_OFFSET = 8;
+  FKEY_APTRIGGER0_OFFSET= 48;
+  FKEY_APTRIGGER1_OFFSET= 56;
+var
+  pHash: passqlite3util.PHash;
+  pE:    passqlite3util.PHashElem;
+  pTab:  PTable2;
+  pFKey: Pu8;
+begin
+  if db = nil then Exit;
+  if db^.aDb[iDb].pSchema = nil then Exit;
+  pHash := @passqlite3util.PSchema(db^.aDb[iDb].pSchema)^.tblHash;
+  pE := pHash^.first;
+  while pE <> nil do begin
+    pTab := PTable2(pE^.data);
+    if (pTab <> nil) and (pTab^.eTabType = TABTYP_NORM) then begin
+      pFKey := Pu8(pTab^.u.tab.pFKey);
+      while pFKey <> nil do begin
+        fkTriggerDelete(db, PTrigger(PPointer(pFKey + FKEY_APTRIGGER0_OFFSET)^));
+        PPointer(pFKey + FKEY_APTRIGGER0_OFFSET)^ := nil;
+        fkTriggerDelete(db, PTrigger(PPointer(pFKey + FKEY_APTRIGGER1_OFFSET)^));
+        PPointer(pFKey + FKEY_APTRIGGER1_OFFSET)^ := nil;
+        pFKey := PPointer(pFKey + FKEY_PNEXTFROM_OFFSET)^;
+      end;
+    end;
+    pE := passqlite3util.PHashElem(pE^.next);
+  end;
+end;
+
 { fkey.c:736 — sqlite3FkDropTable.  Generates the implicit "DELETE FROM <tbl>"
   that runs before DROP TABLE when foreign-keys are enabled and either (a)
   pTab is the parent of any FK, or (b) pTab is the child of a deferred FK
@@ -37194,6 +37230,7 @@ initialization
   passqlite3vdbe.gUnlinkAndDeleteIndex   := @sqlite3UnlinkAndDeleteIndex;
   passqlite3vdbe.gUnlinkAndDeleteTrigger := @sqlite3UnlinkAndDeleteTrigger;
   passqlite3vdbe.gRootPageMoved          := @rootPageMovedTrampoline;
+  passqlite3vdbe.gFkClearTriggerCache    := @sqlite3FkClearTriggerCacheImpl;
   passqlite3vdbe.gSetP4KeyInfo           := passqlite3vdbe.TSetP4KeyInfoFn(@setP4KeyInfoTrampoline);
   passqlite3vdbe.gResetOneSchema         := @sqlite3ResetOneSchema;
   passqlite3vdbe.gResetAllSchemas        := @sqlite3ResetAllSchemasOfConnection;
