@@ -2803,8 +2803,15 @@ procedure sqlite3NestedParse(pParse: PParse; zFormat: PAnsiChar;
   The signature mirrors the parser's real sqlite3RunParser. }
 type
   TNestedRunParserFn = function(pParse: Pointer; zSql: PAnsiChar): i32;
+  { Hook for createTableStmt (build.c:2112) — implemented in
+    passqlite3parser.pas because it needs sqlite3KeywordCode (private to
+    the parser unit).  Returns a freshly sqlite3DbMalloc'd buffer
+    containing the canonical "CREATE TABLE name(col TYPE,...)" text;
+    caller takes ownership.  Used by sqlite3EndTable on the AS SELECT arm. }
+  TCreateTableStmtFn = function(db: PTsqlite3; p: PTable2): PAnsiChar;
 var
-  gNestedRunParser: TNestedRunParserFn;
+  gNestedRunParser:  TNestedRunParserFn;
+  gCreateTableStmt:  TCreateTableStmtFn;
 
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
@@ -25818,6 +25825,7 @@ var
   wTable:  u32;
   iCol:    i32;
   pColEW:  PColumn;
+  bAsSelect: i32;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -25950,8 +25958,11 @@ begin
     end;
 
     { CREATE TABLE ... AS SELECT body deferred to Phase 7.x.  Free the
-      input list here (the upstream branch consumes it). }
+      input list here (the upstream branch consumes it).  Capture whether
+      we had a SELECT first, so the createTableStmt branch below can fire. }
+    bAsSelect := 0;
     if pSelect <> nil then begin
+      bAsSelect := 1;
       sqlite3SelectDelete(db, pSelect);
       pSelect := nil;
     end;
@@ -25966,8 +25977,11 @@ begin
     end;
 
     { Compute the complete text of the CREATE statement (build.c:2886..2896). }
-    if pSelect <> nil then begin
-      { CREATE TABLE AS SELECT — createTableStmt() not yet ported. }
+    if (bAsSelect <> 0) and (gCreateTableStmt <> nil) then begin
+      zStmt := gCreateTableStmt(db, pTab);
+    end else if bAsSelect <> 0 then begin
+      { Hook not registered (codegen-only test programs).  Leave nil; the
+        schema-row sql column will be empty for the AS SELECT arm. }
       zStmt := nil;
     end else begin
       pEnd2 := pEnd;

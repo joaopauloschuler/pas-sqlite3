@@ -343,6 +343,23 @@ Important: At the end of this document, please find:
             seed.  DiagPragma 12→10 divergences (regression closed);
             TestExplainParity 1016/1026 unchanged; DiagFeatureProbe
             9 unchanged; TestPager 12/12; TestSchemaBasic 44/0.
+       [X] `createTableStmt` + `identLength` + `identPut` (build.c:2112 /
+            :2063 / :2084) — ported 2026-04-30.  Lives in
+            passqlite3parser.pas because identPut needs sqlite3KeywordCode
+            (private to that unit); exposed to codegen via the new
+            `gCreateTableStmt` hook (registered at unit-init alongside
+            gNestedRunParser).  sqlite3EndTable's CTAS branch
+            (codegen.pas:25969 dead-branch from before — pSelect was
+            freed before the `if pSelect <> nil` test) is now wired:
+            captures bAsSelect before freeing, then dispatches through
+            the hook to fill the schema-row sql column with the
+            canonical "CREATE TABLE name(col TYPE,...)" text.  Dead-code
+            today (sqlite3Insert pSelect early-exit at codegen.pas:19756
+            short-circuits CTAS before any rows are inserted) but flips
+            the schema-row text generation from nil to faithful 1:1.
+            TestExplainParity 1016/1026 unchanged; DiagFeatureProbe 9
+            unchanged; TestSchemaBasic 44/0; TestDMLBasic 54/0;
+            TestParser unchanged.
 
 ### Open Bugs
 
