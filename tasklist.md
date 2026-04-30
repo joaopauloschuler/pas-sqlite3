@@ -278,6 +278,24 @@ Important: At the end of this document, please find:
             wired into PRAGMA journal_mode write codegen (still emits a
             constant default echo) but exposed for downstream wiring.
             TestExplainParity unchanged (1016/1026); TestPager 12/12 PASS.
+       [X] `sqlite3FkLocateIndex` (fkey.c:183) + `sqlite3FkOldmask`
+            (fkey.c:1095) — ported 2026-04-30 in passqlite3codegen.pas.
+            FkLocateIndex is the unique-index lookup for FK parent keys
+            (single-column IPK fast-path, composite aiCol allocation,
+            UNIQUE/PK/no-partial scan, default-collation check, mismatch
+            error via sqlite3MPrintf+ErrorMsg) — all PFKey internals
+            accessed via the same byte offsets used by sqlite3FkDelete
+            (nCol@40, aCol[i].iFrom@64+i*16, aCol[i].zCol+8).  FkOldmask
+            switched from a void Phase-7 stub to `function ... : u32`
+            with the full child-arm + parent-arm body (parent arm uses
+            FkLocateIndex).  Caller in `sqlite3GenerateRowDelete`
+            (codegen.pas:22376) now ORs the returned mask into the
+            trigger-colmask upper bound, replacing the prior "FkOldmask
+            is void" comment.  Dead-code today (PRAGMA foreign_keys
+            defaults OFF and no test enables it) but flips the function
+            from no-op to faithful 1:1 once FK enforcement is on.
+            TestExplainParity unchanged (1016/1026); DiagFeatureProbe
+            unchanged (9 divergences).
 
 ### Open Bugs
 

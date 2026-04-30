@@ -2980,8 +2980,10 @@ function  sqlite3FkRequired(pParse: PParse; pTab: PTable2;
   aChange: Pi32; chngRowid: i32): i32;
 procedure sqlite3FkDelete(db: PTsqlite3; pTab: PTable2);
 procedure sqlite3FkDropTable(pParse: PParse; pName: PSrcList; pTab: PTable2);
-procedure sqlite3FkOldmask(pParse: PParse; pTab: PTable2);
+function  sqlite3FkOldmask(pParse: PParse; pTab: PTable2): u32;
 function  sqlite3FkReferences(pTab: PTable2): Pointer;
+function  sqlite3FkLocateIndex(pParse: PParse; pParent: PTable2;
+  pFKey: Pointer; ppIdx: PPointer; ppaiCol: PPointer): i32;
 
 // ---------------------------------------------------------------------------
 // Phase 6.6 public API — date.c
@@ -22366,14 +22368,13 @@ begin
   { OLD.* register array setup for triggers / FK old-row reference. }
   if (sqlite3FkRequired(pParse, pTab, nil, 0) <> 0) or (pTrigger <> nil) then
   begin
-    { TODO(Phase 6.5): sqlite3TriggerColmask / sqlite3FkOldmask are stubs
-      today (return 0 / void).  Use 0xffffffff to be conservative — we copy
-      every column, which is a faithful upper bound; matches C's
-      "mask==0xffffffff" early-exit branch. }
+    { sqlite3TriggerColmask still partial (returns 0 for ordinary triggers
+      until codeRowTrigger pipeline lands), but sqlite3FkOldmask is now
+      productive (Phase 6.28).  Combined upper-bound mask matches C 1:1. }
     mask := sqlite3TriggerColmask(pParse, pTrigger, nil, 0,
                                   TRIGGER_BEFORE or TRIGGER_AFTER, pTab,
                                   i32(onconf));
-    { mask |= sqlite3FkOldmask(pParse, pTab) — Phase 7 (FkOldmask is void). }
+    mask := mask or sqlite3FkOldmask(pParse, pTab);
     iOld := pParse^.nMem + 1;
     pParse^.nMem := pParse^.nMem + (1 + i32(pTab^.nCol));
 
@@ -33103,9 +33104,207 @@ begin
     sqlite3VdbeResolveLabel(v, iSkip);
 end;
 
-procedure sqlite3FkOldmask(pParse: PParse; pTab: PTable2);
+{ fkey.c:183 — sqlite3FkLocateIndex.  Search the parent table for the
+  unique index referenced by foreign key pFKey.  See the C reference for
+  the full semantics; output:
+    *ppIdx     - PIndex2 of the chosen UNIQUE/PK index, nil for IPK match
+    *ppaiCol   - i32[N] mapping pIdx column i -> child column index
+                 (only allocated for nCol > 1 composite FKs)
+  Returns 0 on success, 1 on mismatch (with an error loaded via
+  sqlite3ErrorMsg unless pParse->disableTriggers is set).
+
+  PFKey internals are accessed via the documented byte offsets used by
+  sqlite3FkDelete (see codegen.pas:32988): nCol@40, aCol[i].iFrom@64+i*16,
+  aCol[i].zCol@64+i*16+8, pFrom@0, zTo@16.
+  Each sColMap entry is 16 bytes (int iFrom + 4 pad + char* zCol). }
+function sqlite3FkLocateIndex(pParse: PParse; pParent: PTable2;
+  pFKey: Pointer; ppIdx: PPointer; ppaiCol: PPointer): i32;
+const
+  FKEY_NCOL_OFFSET = 40;
+  FKEY_PFROM_OFFSET = 0;
+  FKEY_ZTO_OFFSET = 16;
+  FKEY_ACOL_OFFSET = 64;
+  FKEY_SCOLMAP_SIZE = 16;
+  FKEY_SCOL_IFROM = 0;
+  FKEY_SCOL_ZCOL = 8;
+var
+  pIdx:    PIndex2;
+  aiCol:   Pi32;
+  nCol:    i32;
+  zKey:    PAnsiChar;
+  pFKb:    Pu8;
+  i, j:    i32;
+  iCol:    i16;
+  zDfltColl: PAnsiChar;
+  zIdxCol:   PAnsiChar;
+  zFKjCol:   PAnsiChar;
+  pFromTab:  PTable2;
+  azColl:    PPAnsiChar;
 begin
-  { Phase 7 }
+  pIdx := nil;
+  aiCol := nil;
+  pFKb := Pu8(pFKey);
+  nCol := PInt32(pFKb + FKEY_NCOL_OFFSET)^;
+  zKey := PPAnsiChar(pFKb + FKEY_ACOL_OFFSET + FKEY_SCOL_ZCOL)^;
+
+  if nCol = 1 then
+  begin
+    if pParent^.iPKey >= 0 then
+    begin
+      if zKey = nil then
+      begin
+        Result := 0;
+        Exit;
+      end;
+      if sqlite3StrICmp(pParent^.aCol[pParent^.iPKey].zCnName, zKey) = 0 then
+      begin
+        Result := 0;
+        Exit;
+      end;
+    end;
+  end
+  else if ppaiCol <> nil then
+  begin
+    aiCol := Pi32(sqlite3DbMallocRawNN(pParse^.db, nCol * SizeOf(i32)));
+    if aiCol = nil then
+    begin
+      Result := 1;
+      Exit;
+    end;
+    ppaiCol^ := aiCol;
+  end;
+
+  pIdx := pParent^.pIndex;
+  while pIdx <> nil do
+  begin
+    if (pIdx^.nKeyCol = u16(nCol))
+       and (pIdx^.onError <> OE_None)              { IsUniqueIndex }
+       and (pIdx^.pPartIdxWhere = nil) then
+    begin
+      if zKey = nil then
+      begin
+        if (pIdx^.idxFlags and 3) = SQLITE_IDXTYPE_PRIMARYKEY then
+        begin
+          if aiCol <> nil then
+            for i := 0 to nCol - 1 do
+              aiCol[i] := PInt32(pFKb + FKEY_ACOL_OFFSET + i * FKEY_SCOLMAP_SIZE + FKEY_SCOL_IFROM)^;
+          break;
+        end;
+      end
+      else
+      begin
+        i := 0;
+        while i < nCol do
+        begin
+          iCol := pIdx^.aiColumn[i];
+          if iCol < 0 then break;     { No FKs against expression indices }
+
+          zDfltColl := sqlite3ColumnColl(@pParent^.aCol[iCol]);
+          if zDfltColl = nil then zDfltColl := WhereStrBINARY;
+          azColl := PPAnsiChar(pIdx^.azColl);
+          if sqlite3StrICmp(azColl[i], zDfltColl) <> 0 then break;
+
+          zIdxCol := pParent^.aCol[iCol].zCnName;
+          j := 0;
+          while j < nCol do
+          begin
+            zFKjCol := PPAnsiChar(pFKb + FKEY_ACOL_OFFSET + j * FKEY_SCOLMAP_SIZE + FKEY_SCOL_ZCOL)^;
+            if sqlite3StrICmp(zFKjCol, zIdxCol) = 0 then
+            begin
+              if aiCol <> nil then
+                aiCol[i] := PInt32(pFKb + FKEY_ACOL_OFFSET + j * FKEY_SCOLMAP_SIZE + FKEY_SCOL_IFROM)^;
+              break;
+            end;
+            Inc(j);
+          end;
+          if j = nCol then break;
+          Inc(i);
+        end;
+        if i = nCol then break;     { pIdx is usable }
+      end;
+    end;
+    pIdx := pIdx^.pNext;
+  end;
+
+  if pIdx = nil then
+  begin
+    if (pParse^.parseFlags and PARSEFLAG_DisableTriggers) = 0 then
+    begin
+      pFromTab := PTable2(PPointer(pFKb + FKEY_PFROM_OFFSET)^);
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
+        'foreign key mismatch - "%w" referencing "%w"',
+        [pFromTab^.zName, PPAnsiChar(pFKb + FKEY_ZTO_OFFSET)^]));
+    end;
+    sqlite3DbFree(Psqlite3db(pParse^.db), aiCol);
+    Result := 1;
+    Exit;
+  end;
+
+  ppIdx^ := pIdx;
+  Result := 0;
+end;
+
+{ fkey.c:1095 — sqlite3FkOldmask.  Compute the column-mask of OLD.* columns
+  required for FK processing on UPDATE/DELETE of a row in pTab.  Walks the
+  child-arm via pTab->u.tab.pFKey (the FKs where pTab is the child) and the
+  parent-arm via sqlite3FkReferences (the FKs where pTab is the parent),
+  using sqlite3FkLocateIndex to find the parent-side unique index for each
+  parent-arm FK. }
+function sqlite3FkOldmask(pParse: PParse; pTab: PTable2): u32;
+const
+  FKEY_PNEXTFROM_OFFSET = 8;
+  FKEY_PNEXTTO_OFFSET = 24;
+  FKEY_NCOL_OFFSET = 40;
+  FKEY_ACOL_OFFSET = 64;
+  FKEY_SCOLMAP_SIZE = 16;
+  FKEY_SCOL_IFROM = 0;
+var
+  mask: u32;
+  pFKb: Pu8;
+  nCol, i, iFrom: i32;
+  pIdx: PIndex2;
+begin
+  mask := 0;
+  if ((pParse^.db^.flags and SQLITE_ForeignKeys) <> 0)
+     and (pTab <> nil) and (pTab^.eTabType = TABTYP_NORM) then
+  begin
+    { Child arm — pTab is the child of these FKs. }
+    pFKb := Pu8(pTab^.u.tab.pFKey);
+    while pFKb <> nil do
+    begin
+      nCol := PInt32(pFKb + FKEY_NCOL_OFFSET)^;
+      for i := 0 to nCol - 1 do
+      begin
+        iFrom := PInt32(pFKb + FKEY_ACOL_OFFSET + i * FKEY_SCOLMAP_SIZE + FKEY_SCOL_IFROM)^;
+        if iFrom > 31 then
+          mask := $FFFFFFFF
+        else
+          mask := mask or (u32(1) shl iFrom);
+      end;
+      pFKb := PPointer(pFKb + FKEY_PNEXTFROM_OFFSET)^;
+    end;
+
+    { Parent arm — pTab is the parent of these FKs. }
+    pFKb := Pu8(sqlite3FkReferences(pTab));
+    while pFKb <> nil do
+    begin
+      pIdx := nil;
+      sqlite3FkLocateIndex(pParse, pTab, Pointer(pFKb), @pIdx, nil);
+      if pIdx <> nil then
+      begin
+        for i := 0 to i32(pIdx^.nKeyCol) - 1 do
+        begin
+          iFrom := pIdx^.aiColumn[i];
+          if iFrom > 31 then
+            mask := $FFFFFFFF
+          else
+            mask := mask or (u32(1) shl iFrom);
+        end;
+      end;
+      pFKb := PPointer(pFKb + FKEY_PNEXTTO_OFFSET)^;
+    end;
+  end;
+  Result := mask;
 end;
 
 function sqlite3FkReferences(pTab: PTable2): Pointer;
