@@ -2220,6 +2220,7 @@ procedure sqlite3ExprIfFalseDup(pParse: PParse; pExpr: PExpr;
 
 { Dequoting }
 procedure sqlite3DequoteExpr(p: PExpr);
+procedure sqlite3DequoteToken(p: PToken);
 
 { Error reporting }
 procedure sqlite3ErrorMsg(pParse: PParse; zFormat: PAnsiChar);
@@ -21061,6 +21062,30 @@ begin
   else
     p^.n := 0;
   p^._pad := 0;
+end;
+
+{ sqlite3DequoteToken — port of util.c:376.  Strip a single matched pair of
+  surrounding quote characters from a Token in place by sliding p^.z forward
+  one byte and decreasing p^.n by 2.  No-op unless the token starts with a
+  quote and contains no other interior quote characters (so e.g. "ab""cd"
+  is left intact).  Quote chars per the sqlite3Isquote macro:
+  ", ', `, and [.  Faithful to the C version. }
+procedure sqlite3DequoteToken(p: PToken);
+var
+  i: u32;
+  c: AnsiChar;
+begin
+  if p^.n < 2 then Exit;
+  c := p^.z[0];
+  if (c <> '"') and (c <> '''') and (c <> '`') and (c <> '[') then Exit;
+  i := 1;
+  while i < p^.n - 1 do begin
+    c := p^.z[i];
+    if (c = '"') or (c = '''') or (c = '`') or (c = '[') then Exit;
+    Inc(i);
+  end;
+  Dec(p^.n, 2);
+  Inc(p^.z);
 end;
 
 { sqlite3FinishTrigger — port of trigger.c:323.

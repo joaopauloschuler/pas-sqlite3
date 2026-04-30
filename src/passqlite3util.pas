@@ -643,6 +643,7 @@ function  sqlite3AtoF(zIn: PChar; out pResult: Double): i32;
 function  sqlite3Atoi64(zNum: PChar; out pNum: i64; length: i32; enc: u8): i32;
 function  sqlite3Int64ToText(v: i64; zOut: PChar): i32;
 function  sqlite3DecOrHexToI64(z: PChar; out pOut: i64): i32;
+function  sqlite3IsOverflow(x: Double): i32;
 
 { VList — variable name/number mapping (util.c:2155..2249).
   pVList is a packed int array; layout documented at util.c:2156. }
@@ -1252,6 +1253,19 @@ end;
 function sqlite3Strlen30NN(z: PChar): i32;
 begin
   Result := $3fffffff and i32(libc_strlen(z));
+end;
+
+{ sqlite3IsOverflow — port of util.c:75.  Returns 1 if the IEEE-754 double
+  is +Inf, -Inf, or NaN (exponent field == 0x7ff). }
+function sqlite3IsOverflow(x: Double): i32;
+var
+  y: u64;
+begin
+  Move(x, y, SizeOf(y));
+  if (y and (u64($7ff) shl 52)) = (u64($7ff) shl 52) then
+    Result := 1
+  else
+    Result := 0;
 end;
 
 { compare2pow63 — helper for sqlite3Atoi64 }

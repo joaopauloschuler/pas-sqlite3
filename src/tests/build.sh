@@ -167,6 +167,7 @@ compile_test DiagPragma
 compile_test DiagPrintfFmt
 compile_test DiagExplainList
 compile_test DiagDbFileObject
+compile_test DiagDequoteToken
 compile_test TestSQLCorpus
 compile_test TestFuzzDiff
 compile_test TestReferenceVectors
