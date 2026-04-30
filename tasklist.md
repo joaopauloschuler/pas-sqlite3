@@ -531,6 +531,16 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        returned `sqlite3_file*` matches `sqlite3PagerFile` of the
        backing pager.
 
+- [X] **8.x** Btree accessor batch — ported 2026-04-29 in
+       passqlite3btree.pas: `sqlite3BtreeSchema` (btree.c:11365 — lazy
+       allocation of the per-BtShared schema blob with caller-supplied
+       xFree destructor; not yet wired into `openDatabase`, which still
+       allocates schemas via `sqlite3SchemaGet(db, nil)`),
+       `sqlite3BtreeIsInBackup` (:11339), `sqlite3HeaderSizeBtree`
+       (:11538), `sqlite3BtreeSharable` (:11555),
+       `sqlite3BtreeConnectionCount` (:11564).  Closes the corresponding
+       symbol-gap entries from the 2026-04-28 public-API audit.
+
 - [X] **8.x** Small pager accessor batch — ported 2026-04-29 in
        passqlite3pager.pas: `sqlite3PagerSetMmapLimit` (pager.c:3549),
        `sqlite3PagerTempSpace` (:3836), `sqlite3PagerPagenumber` (:4239),

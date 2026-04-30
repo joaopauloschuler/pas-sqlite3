@@ -671,6 +671,24 @@ procedure sqlite3BtreeClearCache(p: PBtree);
 { btree.c:7046 — set the database file format version (1 or 2 = WAL). }
 function  sqlite3BtreeSetVersion(p: PBtree; iVersion: i32): i32;
 
+{ btree.c:11365 — lazily allocate (or fetch) the per-BtShared schema blob.
+  Caller passes nBytes=SizeOf(TSchema) on first init and 0 thereafter.
+  xFree is invoked when the BtShared is torn down. }
+type TBtreeSchemaFree = procedure(p: Pointer);
+function  sqlite3BtreeSchema(p: PBtree; nBytes: i32;
+                              xFree: TBtreeSchemaFree): Pointer;
+
+{ btree.c:11339 — true if a sqlite3_backup is active on this Btree. }
+function  sqlite3BtreeIsInBackup(p: PBtree): i32;
+
+{ btree.c:11538 — bytes of per-page header overhead reserved by btree. }
+function  sqlite3HeaderSizeBtree: i32;
+
+{ btree.c:11555 / :11564 — shared-cache introspection helpers.  In the
+  no-shared-cache build the answers are constant: not sharable, refcount=1. }
+function  sqlite3BtreeSharable(p: PBtree): i32;
+function  sqlite3BtreeConnectionCount(p: PBtree): i32;
+
 implementation
 
 uses
@@ -7124,6 +7142,45 @@ begin
   end;
   sqlite3PagerUnref(pPage1);
   Result := rc;
+end;
+
+{ btree.c:11365 }
+function sqlite3BtreeSchema(p: PBtree; nBytes: i32;
+                            xFree: TBtreeSchemaFree): Pointer;
+var pBt: PBtShared;
+begin
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  if (pBt^.pSchema = nil) and (nBytes <> 0) then begin
+    pBt^.pSchema := sqlite3MallocZero(csize_t(nBytes));
+    pBt^.xFreeSchema := xFree;
+  end;
+  sqlite3BtreeLeave(p);
+  Result := pBt^.pSchema;
+end;
+
+{ btree.c:11339 }
+function sqlite3BtreeIsInBackup(p: PBtree): i32;
+begin
+  if p^.nBackup <> 0 then Result := 1 else Result := 0;
+end;
+
+{ btree.c:11538 }
+function sqlite3HeaderSizeBtree: i32;
+begin
+  Result := i32(ROUND8(SizeOf(TMemPage)));
+end;
+
+{ btree.c:11555 — no shared-cache build → never sharable. }
+function sqlite3BtreeSharable(p: PBtree): i32;
+begin
+  Result := i32(p^.sharable);
+end;
+
+{ btree.c:11564 — no shared-cache build → refcount is always 1. }
+function sqlite3BtreeConnectionCount(p: PBtree): i32;
+begin
+  Result := p^.pBt^.nRef;
 end;
 
 end.
