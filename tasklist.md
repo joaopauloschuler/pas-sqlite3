@@ -329,14 +329,15 @@ Important: At the end of this document, please find:
 
 ### Open Bugs
 
-- [ ] **TestDMLBasic crash** — `bin/TestDMLBasic` runs through dozens of
-       record-layout PASSes and Upsert/Trigger smoke checks, then aborts
-       with `EAccessViolation at $0000000000462CF1` after `PASS DeleteTrigger(nil) no crash`.
-       Pre-existing (reproduces both before and after the cache_size
-       reader fix on 2026-04-30); likely the next test step touches a
-       Trigger/SrcList helper that's still a stub.  Triage: re-run with
-       SIGSEGV symbols (`-gl`) to identify the exact line; probably
-       folds into 6.23 trigger-codegen stubs once isolated.
+- [X] **TestDMLBasic crash** — fixed 2026-04-30.  Root cause: T26
+       called `sqlite3TriggerColmask(...,nil pTab,...)`; the productive
+       6.23 port now reads `pTab^.eTabType` via IsView before the
+       trigger-list loop (matches C trigger.c:1524, which also requires
+       a real Table*).  Test updated to pass a zeroed local `TTable`
+       fixture (eTabType=0 → not VIEW); IsView returns false, the empty
+       trigger list yields mask=0 as expected.  TestDMLBasic now 54/54
+       PASS; TestExplainParity unchanged (1016/1026); DiagFeatureProbe
+       unchanged (9 divergences).
 
 - [ ] **6.10** `TestExplainParity.pas`
     - [ ] **6.10 step 6** Make these to work (port code when required):

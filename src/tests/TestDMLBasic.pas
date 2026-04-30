@@ -175,7 +175,9 @@ procedure TestTriggerStubs;
 var
   mask: u32;
   pList: PTrigger;
+  tabFixture: TTable;
 begin
+  FillChar(tabFixture, SizeOf(tabFixture), 0); { eTabType=0 → not VIEW }
   { T23: TriggerList returns nil for nil parse/table }
   pList := sqlite3TriggerList(nil, nil);
   Expect(pList = nil, 'TriggerList(nil,nil)=nil');
@@ -190,8 +192,11 @@ begin
   sqlite3DeleteTrigger(nil, nil);
   Expect(True, 'DeleteTrigger(nil) no crash');
 
-  { T26: TriggerColmask returns 0 }
-  Expect(sqlite3TriggerColmask(nil,nil,nil,0,0,nil,OE_Abort) = 0,
+  { T26: TriggerColmask returns 0 with empty trigger list (uses a zeroed
+    TTable fixture — non-VIEW — because the productive port now reads
+    pTab^.eTabType, matching C trigger.c:1524 which also requires a real
+    Table*).  Original stub-era call passed nil pTab and skipped the check. }
+  Expect(sqlite3TriggerColmask(nil,nil,nil,0,0,@tabFixture,OE_Abort) = 0,
     'TriggerColmask=0');
 end;
 
