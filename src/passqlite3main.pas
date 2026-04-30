@@ -443,6 +443,11 @@ function sqlite3_sql(pStmt: Pointer): PAnsiChar; cdecl;
 function sqlite3_expanded_sql(pStmt: Pointer): PAnsiChar; cdecl;
 function sqlite3_normalized_sql(pStmt: Pointer): PAnsiChar; cdecl;
 procedure sqlite3_stmt_scanstatus_reset(pStmt: Pointer); cdecl;
+function sqlite3_stmt_scanstatus(pStmt: Pointer; iScan: i32;
+                                 iScanStatusOp: i32; pOut: Pointer): i32; cdecl;
+function sqlite3_stmt_scanstatus_v2(pStmt: Pointer; iScan: i32;
+                                    iScanStatusOp: i32; flags: i32;
+                                    pOut: Pointer): i32; cdecl;
 
 function sqlite3_sleep(ms: i32): i32; cdecl;
 
@@ -3559,6 +3564,29 @@ end;
   link order matches the C reference. }
 procedure sqlite3_stmt_scanstatus_reset(pStmt: Pointer); cdecl;
 begin
+end;
+
+{ vdbeapi.c:2457 — sqlite3_stmt_scanstatus_v2.  Gated on
+  SQLITE_ENABLE_STMT_SCANSTATUS in C; this port does not carry the
+  per-loop ScanStatus aScan[] array on Vdbe (Phase 6.8 ScanStatus
+  arms not yet ported), so the symbol is exposed for dlsym/loadext
+  parity and unconditionally returns 1 (no scan-status data
+  available) — matches the C return value when iScan is out of
+  range, which it always is here. }
+function sqlite3_stmt_scanstatus_v2(pStmt: Pointer; iScan: i32;
+                                    iScanStatusOp: i32; flags: i32;
+                                    pOut: Pointer): i32; cdecl;
+begin
+  Result := 1;
+end;
+
+{ vdbeapi.c:2611 — sqlite3_stmt_scanstatus.  Thin wrapper that calls
+  through to the _v2 variant with flags=0, exactly matching the C
+  one-liner. }
+function sqlite3_stmt_scanstatus(pStmt: Pointer; iScan: i32;
+                                 iScanStatusOp: i32; pOut: Pointer): i32; cdecl;
+begin
+  Result := sqlite3_stmt_scanstatus_v2(pStmt, iScan, iScanStatusOp, 0, pOut);
 end;
 
 function sqlite3_db_readonly(db: PTsqlite3; zDbName: PAnsiChar): i32; cdecl;

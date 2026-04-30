@@ -484,8 +484,13 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 (`sqlite3_int64`, `sqlite3_uint64`, opaque struct names) are excluded.
 
 - [ ] **8.2.1** Statement-introspection gaps (vdbeapi.c):
-       [ ] `sqlite3_stmt_scanstatus` / `_scanstatus_v2` — gated on the
-            6.8 `sqlite3VdbeScanStatus*` arms landing first.
+       [X] `sqlite3_stmt_scanstatus` / `_scanstatus_v2` — ported 2026-04-29
+            in passqlite3main.pas as degraded stubs returning 1 (no
+            scan-status data).  Full bodies are gated on the 6.8
+            `sqlite3VdbeScanStatus*` arms landing first; symbols exposed
+            now for dlsym/loadext parity.  `_v2` is the canonical entry
+            point and `_scanstatus` is the thin wrapper through it,
+            matching vdbeapi.c:2611/:2457.
        [X] `sqlite3_stmt_scanstatus_reset` — ported 2026-04-29 in
             passqlite3main.pas as a no-op.  C body zeros nExec/nCycle
             on each VdbeOp; this port does not carry those counters
