@@ -608,6 +608,13 @@ var
   sqlite3CtypeMap:     array[0..255] of u8;
   sqlite3GlobalConfig: TSqlite3Config;
 
+  { main.c:148 / :157 — public extern globals.  Application can override via
+    the deprecated SQLITE_DBCONFIG_TEMP_DIRECTORY / DATA_DIRECTORY pragmas
+    or by direct assignment.  C type is `char *` (mutable, may point to a
+    sqlite3_mprintf-allocated buffer that the app is expected to free). }
+  sqlite3_temp_directory: PAnsiChar = nil;
+  sqlite3_data_directory: PAnsiChar = nil;
+
 { ============================================================
   Exported function declarations
   ============================================================ }

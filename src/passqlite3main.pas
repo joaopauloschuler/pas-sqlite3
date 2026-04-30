@@ -1833,8 +1833,9 @@ end;
     * sqlite3_reset_auto_extension is not ported (auto-extension subsystem
       not present); shutdown therefore omits the call.  Re-add with that
       subsystem in a later phase.
-    * sqlite3_data_directory / sqlite3_temp_directory globals are not
-      ported either, so the post-MallocEnd zeroing block is skipped.
+    * sqlite3_data_directory / sqlite3_temp_directory globals are now
+      ported (declared in passqlite3util.pas).  The post-MallocEnd
+      zeroing block in shutdown writes nil to both, matching main.c:405.
     * The NDEBUG NaN sanity check is omitted.
   ---------------------------------------------------------------------- }
 
@@ -1937,7 +1938,10 @@ begin
   if sqlite3GlobalConfig.isMallocInit <> 0 then begin
     sqlite3MallocEnd;
     sqlite3GlobalConfig.isMallocInit := 0;
-    { sqlite3_data_directory / sqlite3_temp_directory globals not ported. }
+    { main.c:405 — both globals are zeroed after MallocEnd so any
+      sqlite3_mprintf-allocated overrides do not dangle past shutdown. }
+    sqlite3_data_directory := nil;
+    sqlite3_temp_directory := nil;
   end;
   if sqlite3GlobalConfig.isMutexInit <> 0 then begin
     sqlite3MutexEnd;

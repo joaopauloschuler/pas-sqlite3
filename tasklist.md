@@ -470,6 +470,17 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        `iVersion` bumped 1→2 so `xCurrentTimeInt64` is now reachable through
        the shared `sqlite3OsCurrentTimeInt64` chain (memdb already wraps it).
 
+- [X] **8.x** `sqlite3_temp_directory` / `sqlite3_data_directory` public
+       extern globals + `unixTempFileInit` / `unixTempFileDir` /
+       `unixGetTempname` (main.c:148/:157, os_unix.c:6262..6342) — ported
+       2026-04-29.  Globals live in passqlite3util.pas and are zeroed by
+       `sqlite3_shutdown` (main.c:405 parity).  unixOpen no longer rolls
+       its own `/tmp/sqlite_<pid>_<seq>` name; on `zPath=nil` it routes
+       through unixGetTempname which honours the application override
+       global, then $SQLITE_TMPDIR / $TMPDIR (captured once at
+       sqlite3_os_init via unixTempFileInit), then the static fallback
+       list `/var/tmp`, `/usr/tmp`, `/tmp`, `.` — matching the C 1:1.
+
 - [X] **8.x** `sqlite3_database_file_object` (pager.c:5090) — ported
        2026-04-29 in passqlite3pager.pas.  Walks back from any filename
        pointer inside a pager-allocated buffer to the 4-byte zero prefix,
