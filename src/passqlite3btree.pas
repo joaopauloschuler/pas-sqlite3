@@ -689,6 +689,31 @@ function  sqlite3HeaderSizeBtree: i32;
 function  sqlite3BtreeSharable(p: PBtree): i32;
 function  sqlite3BtreeConnectionCount(p: PBtree): i32;
 
+{ btree.c:3177 — toggle BTS_SECURE_DELETE on the BtShared.  newFlag<0 leaves
+  the flag untouched and merely returns the current setting. }
+function  sqlite3BtreeSecureDelete(p: PBtree; newFlag: i32): i32;
+
+{ btree.c:3198 / :3222 — auto-vacuum get/set.  Honoured by PRAGMA auto_vacuum
+  on connection open; once BTS_PAGESIZE_FIXED is set Set returns READONLY. }
+function  sqlite3BtreeSetAutoVacuum(p: PBtree; autoVacuum: i32): i32;
+function  sqlite3BtreeGetAutoVacuum(p: PBtree): i32;
+
+{ btree.c:3017 — propagate the connection's mmap-size ceiling to the pager. }
+function  sqlite3BtreeSetMmapLimit(p: PBtree; szMmap: i64): i32;
+
+{ btree.c:3036 — propagate PRAGMA synchronous / cache-spill flags to the
+  pager.  Wraps sqlite3PagerSetFlags under the btree mutex. }
+function  sqlite3BtreeSetPagerFlags(p: PBtree; pgFlags: u32): i32;
+
+{ btree.c:11382 — read-lock the schema table; used by sqlite3LockAndPrepare
+  to surface SQLITE_LOCKED before parsing.  Without shared-cache this always
+  succeeds, matching querySharedCacheTableLock's stub. }
+function  sqlite3BtreeSchemaLocked(p: PBtree): i32;
+
+{ btree.c:4583 — open an anonymous savepoint to back a statement
+  sub-transaction. }
+function  sqlite3BtreeBeginStmt(p: PBtree; iStatement: i32): i32;
+
 implementation
 
 uses
@@ -7181,6 +7206,98 @@ end;
 function sqlite3BtreeConnectionCount(p: PBtree): i32;
 begin
   Result := p^.pBt^.nRef;
+end;
+
+{ btree.c:3177 }
+function sqlite3BtreeSecureDelete(p: PBtree; newFlag: i32): i32;
+var pBt: PBtShared;
+begin
+  if p = nil then begin Result := 0; Exit; end;
+  sqlite3BtreeEnter(p);
+  pBt := p^.pBt;
+  if newFlag >= 0 then begin
+    pBt^.btsFlags := pBt^.btsFlags and (not u16(BTS_FAST_SECURE));
+    pBt^.btsFlags := pBt^.btsFlags or u16(BTS_SECURE_DELETE * newFlag);
+  end;
+  Result := i32((pBt^.btsFlags and BTS_FAST_SECURE) div BTS_SECURE_DELETE);
+  sqlite3BtreeLeave(p);
+end;
+
+{ btree.c:3198 }
+function sqlite3BtreeSetAutoVacuum(p: PBtree; autoVacuum: i32): i32;
+var
+  pBt: PBtShared;
+  rc:  i32;
+  av:  u8;
+begin
+  pBt := p^.pBt;
+  rc  := SQLITE_OK;
+  av  := u8(autoVacuum);
+  sqlite3BtreeEnter(p);
+  if ((pBt^.btsFlags and BTS_PAGESIZE_FIXED) <> 0)
+     and (Ord(av <> 0) <> i32(pBt^.autoVacuum)) then
+  begin
+    rc := SQLITE_READONLY;
+  end
+  else begin
+    if av <> 0 then pBt^.autoVacuum := 1 else pBt^.autoVacuum := 0;
+    if av  = 2 then pBt^.incrVacuum := 1 else pBt^.incrVacuum := 0;
+  end;
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c:3222 }
+function sqlite3BtreeGetAutoVacuum(p: PBtree): i32;
+var rc: i32;
+begin
+  sqlite3BtreeEnter(p);
+  if p^.pBt^.autoVacuum = 0 then
+    rc := BTREE_AUTOVACUUM_NONE
+  else if p^.pBt^.incrVacuum = 0 then
+    rc := BTREE_AUTOVACUUM_FULL
+  else
+    rc := BTREE_AUTOVACUUM_INCR;
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c:3017 }
+function sqlite3BtreeSetMmapLimit(p: PBtree; szMmap: i64): i32;
+begin
+  sqlite3BtreeEnter(p);
+  sqlite3PagerSetMmapLimit(p^.pBt^.pPager, szMmap);
+  sqlite3BtreeLeave(p);
+  Result := SQLITE_OK;
+end;
+
+{ btree.c:3036 }
+function sqlite3BtreeSetPagerFlags(p: PBtree; pgFlags: u32): i32;
+begin
+  sqlite3BtreeEnter(p);
+  sqlite3PagerSetFlags(p^.pBt^.pPager, pgFlags);
+  sqlite3BtreeLeave(p);
+  Result := SQLITE_OK;
+end;
+
+{ btree.c:11382 — schema-lock probe.  No-shared-cache build:
+  querySharedCacheTableLock is a stub that always returns SQLITE_OK, so the
+  result is unconditionally SQLITE_OK after enter/leave bookkeeping. }
+function sqlite3BtreeSchemaLocked(p: PBtree): i32;
+begin
+  sqlite3BtreeEnter(p);
+  Result := SQLITE_OK;
+  sqlite3BtreeLeave(p);
+end;
+
+{ btree.c:4583 }
+function sqlite3BtreeBeginStmt(p: PBtree; iStatement: i32): i32;
+var rc: i32;
+begin
+  sqlite3BtreeEnter(p);
+  rc := sqlite3PagerOpenSavepoint(p^.pBt^.pPager, iStatement);
+  sqlite3BtreeLeave(p);
+  Result := rc;
 end;
 
 end.

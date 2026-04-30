@@ -570,6 +570,19 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        PRAGMA / debug / btree consumers (closes the corresponding
        symbol-gap entries from the 2026-04-28 public-API audit).
 
+- [X] **8.x** Btree pragma/transaction accessor batch — ported 2026-04-29
+       in passqlite3btree.pas: `sqlite3BtreeSecureDelete` (btree.c:3177),
+       `sqlite3BtreeSetAutoVacuum` (:3198), `sqlite3BtreeGetAutoVacuum`
+       (:3222), `sqlite3BtreeSetMmapLimit` (:3017),
+       `sqlite3BtreeSetPagerFlags` (:3036), `sqlite3BtreeSchemaLocked`
+       (:11382 — no-shared-cache build → unconditional SQLITE_OK after
+       enter/leave), `sqlite3BtreeBeginStmt` (:4583 — anonymous savepoint
+       wrapper).  Faithful 1:1 ports of the small btree-mutex accessors
+       used by PRAGMA dispatch (auto_vacuum / secure_delete /
+       mmap_size / synchronous), schema-lock probing in prepare, and
+       VDBE statement sub-transactions.  Closes the corresponding
+       symbol-gap entries from the 2026-04-28 public-API audit.
+
 - [X] **8.x** `sqlite3PagerOkToChangeJournalMode` (pager.c:7460) +
        `sqlite3PagerJournalSizeLimit` (pager.c:7473) — ported 2026-04-29
        in passqlite3pager.pas.  Tiny accessor pair: the first guards
