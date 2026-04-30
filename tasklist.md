@@ -126,9 +126,6 @@ Important: At the end of this document, please find:
             + ResolveExprListNames + MakeRecord/NewRowid/Insert) remains
             TODO.  DiagFeatureProbe baseline unchanged (9 divergences),
             TestExplainParity unchanged (1016/1026 pass, 10 diverge).
-       [ ] Port `sqlite3TriggerStepSrc` (no caller in current C tree —
-            symbol may have been removed upstream; revisit when the
-            full `codeRowTrigger` pipeline lands)
        [X] Port `sqlite3TriggerColmask` — ported 2026-04-29 (trigger.c:1524).
             IsView arm now correctly returns 0xffffffff and bReturning
             arm returns 0xffffffff per matching trigger; ordinary
@@ -328,16 +325,6 @@ Important: At the end of this document, please find:
             9 unchanged; TestPager 12/12; TestSchemaBasic 44/0.
 
 ### Open Bugs
-
-- [X] **TestDMLBasic crash** — fixed 2026-04-30.  Root cause: T26
-       called `sqlite3TriggerColmask(...,nil pTab,...)`; the productive
-       6.23 port now reads `pTab^.eTabType` via IsView before the
-       trigger-list loop (matches C trigger.c:1524, which also requires
-       a real Table*).  Test updated to pass a zeroed local `TTable`
-       fixture (eTabType=0 → not VIEW); IsView returns false, the empty
-       trigger list yields mask=0 as expected.  TestDMLBasic now 54/54
-       PASS; TestExplainParity unchanged (1016/1026); DiagFeatureProbe
-       unchanged (9 divergences).
 
 - [ ] **6.10** `TestExplainParity.pas`
     - [ ] **6.10 step 6** Make these to work (port code when required):

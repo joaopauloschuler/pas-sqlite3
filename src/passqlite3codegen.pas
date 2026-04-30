@@ -2340,8 +2340,6 @@ procedure sqlite3CodeRowTriggerDirect(pParse: PParse; pTrigger: PTrigger;
 procedure sqlite3CodeRowTrigger(pParse: PParse; pTrigger: PTrigger;
   op: i32; pChanges: PExprList; tr_tm: i32; pTab: PTable2;
   reg: i32; orconf: i32; ignoreJump: i32);
-function  sqlite3TriggerStepSrc(pParse: PParse;
-  pStep: PTriggerStep): PSrcList;
 function  sqlite3TriggerColmask(pParse: PParse; pTrigger: PTrigger;
   pChanges: PExprList; isNew: i32; tr_tm: i32; pTab: PTable2;
   orconf: i32): u32;
@@ -21660,13 +21658,6 @@ begin
     end;
     p := p^.pNext;
   end;
-end;
-
-{ sqlite3TriggerStepSrc — build a SrcList for a trigger step (Phase 6.4 stub) }
-function sqlite3TriggerStepSrc(pParse: PParse;
-  pStep: PTriggerStep): PSrcList;
-begin
-  Result := nil; { Phase 6.5 }
 end;
 
 { sqlite3TriggerColmask — port of trigger.c:1524.
