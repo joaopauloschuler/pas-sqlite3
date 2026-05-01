@@ -7065,9 +7065,17 @@ begin
 
     { ────── OP_EndCoroutine ────── (vdbe.c:1203) }
     OP_EndCoroutine: begin
+      { Faithful port of vdbe.c:1203..1213.  pIn1^.u.i holds the
+        address of the most-recent OP_Yield that resumed this
+        coroutine; jump to that Yield's p2 (addrEnd) so the outer
+        scan exits its loop.  Save this EndCoroutine - 1 in pIn1
+        so any later Yield against this regReturn lands back here
+        and re-jumps to the same addrEnd. }
       pIn1 := @aMem[pOp^.p1];
       if (pIn1^.flags and MEM_Int) <> 0 then begin
-        pOp := @aOp[pIn1^.u.i];
+        pcx := i32(pOp - aOp);  { addr of this EndCoroutine }
+        pOp := @aOp[aOp[pIn1^.u.i].p2 - 1];
+        pIn1^.u.i := i64(pcx) - 1;
       end;
     end;
 

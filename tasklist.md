@@ -669,10 +669,102 @@ skeleton.
                 piece 3 (materialise arm itself isn't reached).
                 Regression sweep stays green (TestExplainParity
                 1016/10, all single-test suites unchanged).
-              * Co-routine emission (`sqlite3CodeSubquery`) lands
-                last, replaces the materialise arm where the inner
-                isn't correlated, and unblocks the wider bail-lift
-                sweep at the five existing gate sites.
+              * [x] Co-routine emission (`sqlite3CodeSubquery`)
+                lands last, replaces the materialise arm where the
+                inner isn't correlated, and unblocks the wider
+                bail-lift sweep at the five existing gate sites.
+                Done 2026-05-01 (the emission half — the bail-lift
+                sweep at the five sites is deferred and tracked
+                below).  Faithful port of select.c tag-select-0482
+                (the fromClauseTermCanBeCoroutine branch around
+                select.c:8043..8062): for uncorrelated single-source
+                FROM (SELECT ...) we now prefer co-routine over
+                materialisation.  Arm landed in sqlite3Select just
+                before piece 3's materialise arm
+                (codegen.pas:20279), gated additionally on
+                `(pSubSel^.selFlags and SF_Correlated) = 0` and
+                `OptimizationEnabled(SQLITE_Coroutines)`.  Inner is
+                wrapped in OP_InitCoroutine + OP_EndCoroutine; outer
+                drives via OP_Yield; outer pEList is coded normally
+                then `translateColumnToCopy` (newly ported,
+                where.c:716..760) rewrites OP_Column iCsr,col into
+                OP_Copy regResult+col so result reads come from the
+                inner's regResult block instead of via a
+                materialised eph cursor.
+
+                Plumbing landed alongside:
+                  - `SQLITE_Coroutines = u32($02000000)` constant
+                    added (mirrors sqliteInt.h:1927).
+                  - SRT_Coroutine added to sqlite3Select's top dest
+                    gate (codegen.pas:19543) so recursive
+                    `sqlite3Select(... SRT_Coroutine ...)` doesn't
+                    fall through to the no-body stub.
+                  - SRT_Coroutine disposal arm in selectInnerLoop
+                    (codegen.pas:20546) emits `OP_Yield iSDParm`
+                    after the per-column emit, mirroring
+                    select.c:1441..1454.
+                  - Bug fix in `OP_EndCoroutine`
+                    (passqlite3vdbe.pas:7066): the prior pas port
+                    jumped to `aOp[pIn1^.u.i]` (the saved Yield
+                    itself) instead of to `aOp[savedYield.p2 - 1]`
+                    (the Yield's addrEnd parameter), so a
+                    co-routine that ran past its last row would
+                    spin instead of breaking out of the outer
+                    loop.  Re-port now matches vdbe.c:1203..1213
+                    exactly: jump to the saved Yield's `p2 - 1`
+                    and write `pIn1^.u.i = (this EndCoroutine
+                    addr) - 1` so any later Yield re-enters
+                    EndCoroutine and re-jumps to addrEnd.
+                  - Bug fix in the addrTop calculation: was
+                    `currentAddr+2` (off by one — skipped the
+                    inner's first opcode), now `currentAddr+1`
+                    matching select.c:8047 exactly.
+
+                Live-row smoke (off-tree, equivalent to piece 3's
+                smoke but now via co-routine path):
+                `SELECT a FROM (SELECT a FROM t)` returns [1,2,3];
+                `SELECT a+10 FROM (...)` returns [11,12,13];
+                `SELECT a FROM (SELECT a FROM t WHERE a>1)` returns
+                [2,3].  DiagFeatureProbe gate row
+                'Sub-SELECT FROM materialise' stays PASS (the
+                row name now lies — it's actually exercising the
+                co-routine arm — but the contract is "Pas matches
+                C", which still holds).
+
+                Bytecode shape does NOT match the C oracle yet
+                because C applies subquery flattening
+                (select.c:flattenSubquery) for the simple
+                uncorrelated case, producing a single flat scan;
+                our port emits the co-routine bytecode shape (4
+                opcodes for the inner skeleton + outer scan)
+                instead.  Both produce the same rows.  Flattening
+                is its own large port and is tracked under a
+                future 6.13 sub-arm — landing it would converge
+                the bytecode to the C oracle and likely flip a
+                few EXPLAIN parity rows.  TestExplainParity stays
+                at 1016/10 either way (no sub-SELECT FROM rows in
+                the current corpus).
+
+                Bail-lift sweep at the five `IS_SUBQUERY` gate
+                sites (codegen.pas:19686, :19964, :20021, :20165,
+                :20255) is NOT done in this piece — those gates
+                exit `sqlite3Select` before the new co-routine /
+                materialise hot-path arms reach them, so the
+                hot-path arms cover the simple shape but more
+                complex shapes (DISTINCT-on-subquery, aggregate-
+                on-subquery, multi-FROM with subquery items, etc.)
+                still bail.  Each of the five sites needs its own
+                gated, tested lift since the right behaviour
+                differs (some need to route through the
+                co-routine arm, some need WHERE-code integration).
+                Tracked as a follow-up subtask under 6.13(b).
+
+                Regression sweep stays green: TestExplainParity
+                1016/10, TestSelectBasic 60/0, TestDMLBasic 54/0,
+                TestSchemaBasic 44/0, TestWhereBasic 52/0,
+                TestVdbeCursor 29/0, TestSmoke pass.
+                DiagFeatureProbe stays at 10 divergences (the
+                VIEW gate row from piece 2; sub-SELECT row PASS).
        [ ] **c) Compound-SELECT / CTE arm** — UNION / INTERSECT /
             EXCEPT FROM-sources and `WITH … AS (…)` references.
             Once 6.13(b) lands, compound-SELECT-as-FROM-source

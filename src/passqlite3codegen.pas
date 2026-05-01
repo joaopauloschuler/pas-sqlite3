@@ -1540,6 +1540,7 @@ const
   SQLITE_PropagateConst = u32($00008000);  { Constant propagation optimization (sqliteInt.h:1915) }
   SQLITE_ExistsToJoin   = u32($40000000);  { EXISTS-to-JOIN optimization (sqliteInt.h:1932) }
   SQLITE_MinMaxOpt      = u32($00010000);  { The min/max optimization (sqliteInt.h:1916) }
+  SQLITE_Coroutines     = u32($02000000);  { Co-routines for subqueries (sqliteInt.h:1927) }
 
   { TOPBIT — top bit of a 64-bit Bitmask (sqliteInt.h:1414); used by
     whereLoopAddBtree's "covering by bitmask" check to detect the
@@ -14793,13 +14794,58 @@ begin
   Result := 0;
 end;
 
+{ translateColumnToCopy — port of where.c:716..760.
+  Walks bytecode in [iStart, currentAddr) and rewrites every OP_Column
+  whose p1 == iTabCur into OP_Copy iRegister+colIdx → destReg.  Used by
+  the viaCoroutine sub-SELECT path: after the outer pEList is coded with
+  the standard ExprCode emission (which produces OP_Column refs into the
+  sub-SELECT's iCursor), this rewrite redirects each column read at the
+  matching cursor to read directly from the regResult register block
+  populated by the inner coroutine's last OP_Yield.  iAutoidxCur arm
+  (OP_Rowid → OP_Sequence) is a no-op here — the simple sub-SELECT hot
+  path doesn't emit OP_Rowid against the subquery cursor. }
+procedure translateColumnToCopy(pParse: PParse; iStart: i32;
+  iTabCur: i32; iRegister: i32; iAutoidxCur: i32);
+var
+  v:    PVdbe;
+  pOp:  PVdbeOp;
+  iEnd: i32;
+begin
+  v := pParse^.pVdbe;
+  if pParse^.db^.mallocFailed <> 0 then Exit;
+  iEnd := sqlite3VdbeCurrentAddr(v);
+  if iStart >= iEnd then Exit;
+  pOp := sqlite3VdbeGetOp(v, iStart);
+  while iStart < iEnd do
+  begin
+    if pOp^.p1 = iTabCur then
+    begin
+      if pOp^.opcode = OP_Column then
+      begin
+        pOp^.opcode := OP_Copy;
+        pOp^.p1 := pOp^.p2 + iRegister;
+        pOp^.p2 := pOp^.p3;
+        pOp^.p3 := 0;
+        pOp^.p5 := 2;  { clear MEM_Subtype on copy }
+      end
+      else if (pOp^.opcode = OP_Rowid) and (iAutoidxCur <> 0) then
+      begin
+        pOp^.opcode := OP_Sequence;
+        pOp^.p1 := iAutoidxCur;
+      end;
+    end;
+    Inc(iStart);
+    Inc(pOp);
+  end;
+end;
+
 { constructAutomaticIndex — build a transient auto-index for one join level.
   Faithful port of where.c:986..1250.  pPartial path (partial auto-index)
   exercises sqlite3ExprIfFalse which is already ported; the viaCoroutine
   sub-path is guarded by Assert(False) since no corpus fixture uses it.
-  explainAutomaticIndex / sqlite3VdbeScanStatusCounters / translateColumnToCopy
-  are no-ops or deferred — they don't affect the opcode stream exercised by
-  the test corpus. }
+  explainAutomaticIndex / sqlite3VdbeScanStatusCounters are no-ops or
+  deferred — they don't affect the opcode stream exercised by the test
+  corpus. }
 procedure constructAutomaticIndex(pParse: PParse; pWC: PWhereClause;
   notReady: Bitmask; pLevel: PWhereLevel);
 var
@@ -19541,6 +19587,7 @@ begin
     rows emitted. }
   if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_Set) and
      (pDest^.eDest <> SRT_Mem) and (pDest^.eDest <> SRT_EphemTab) and
+     (pDest^.eDest <> SRT_Coroutine) and
      (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
   if p^.pPrior <> nil then begin Result := SQLITE_OK; Exit; end;
@@ -20233,6 +20280,120 @@ begin
     end;
   end;
 
+  { Sub-SELECT co-routine arm — Phase 6.13(b) piece 4.
+    Faithful port of select.c tag-select-0482 (the
+    fromClauseTermCanBeCoroutine branch around select.c:8043..8062).
+    For uncorrelated single-source FROM (SELECT ...) we prefer a
+    co-routine over materialisation: the inner SELECT is wrapped in
+    OP_InitCoroutine + OP_EndCoroutine, the outer scan drives it via
+    OP_Yield, and TK_COLUMN refs into the subquery cursor are
+    rewritten OP_Column → OP_Copy (translateColumnToCopy) so they
+    read directly from the inner's regResult block instead of through
+    a materialised eph cursor.  Mirrors the C bytecode shape (no
+    OpenEphemeral / NewRowid / Insert) and avoids the eph-table
+    allocation entirely.  Falls through to piece 3's materialise arm
+    when the inner is correlated. }
+  if (p^.pSrc^.nSrc = 1)
+     and (p^.pWhere = nil)
+     and ((p^.selFlags and SF_Distinct) = 0)
+     and (pDest^.eDest = SRT_Output)
+  then
+  begin
+    pItem := SrcListItems(p^.pSrc);
+    pTab  := pItem^.pSTab;
+    if (pTab <> nil)
+       and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+       and (pItem^.u4.pSubq <> nil)
+       and (pItem^.u4.pSubq^.pSelect <> nil)
+       and ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_Correlated) = 0)
+       and OptimizationEnabled(pParse^.db, SQLITE_Coroutines)
+    then
+    begin
+      v := sqlite3GetVdbe(pParse);
+      if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
+      sqlite3GenerateColumnNames(pParse, p);
+
+      if pItem^.iCursor < 0 then
+      begin
+        pItem^.iCursor := pParse^.nTab;
+        Inc(pParse^.nTab);
+      end;
+      iCsr := pItem^.iCursor;
+
+      { OP_InitCoroutine regReturn, jumpAfter, addrTop — primes the
+        coroutine to start at addrTop (the address of the first inner
+        opcode emitted right after this InitCoroutine) and jumps over
+        the inner body on first execution.  jumpAfter is patched once
+        the inner body and EndCoroutine have been emitted.  Mirrors
+        select.c:8047:  `int addrTop = sqlite3VdbeCurrentAddr(v)+1;`. }
+      Inc(pParse^.nMem);
+      pItem^.u4.pSubq^.regReturn := pParse^.nMem;
+      addrEnd := sqlite3VdbeCurrentAddr(v) + 1;  { = addrTop, repurposed temp }
+      addrTopOfLoop := sqlite3VdbeAddOp3(v, OP_InitCoroutine,
+                          pItem^.u4.pSubq^.regReturn, 0, addrEnd);
+      pItem^.u4.pSubq^.addrFillSub := addrEnd;
+
+      { Recursively code the inner with SRT_Coroutine.  Per-row OP_Yield
+        comes from the disposal arm above; the inner's first OP_Yield
+        transfers control back to the OP_Yield in the outer scan. }
+      sqlite3SelectDestInit(@innerDest, SRT_Coroutine,
+                            pItem^.u4.pSubq^.regReturn);
+      if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+      begin
+        Result := SQLITE_ERROR; Exit;
+      end;
+      { fg.viaCoroutine bit — visible to other paths that walk SrcItems
+        (e.g. the where-code viaCoroutine arm).  Not strictly required
+        for this hot-path arm but keeps the SrcItem state consistent
+        with the C oracle. }
+      pItem^.fg.fgBits := pItem^.fg.fgBits or SRCITEM_FG_VIA_COROUTINE;
+      pItem^.u4.pSubq^.regResult := innerDest.iSdst;
+
+      sqlite3VdbeEndCoroutine(v, pItem^.u4.pSubq^.regReturn);
+      { Patch the InitCoroutine jump-past target to skip over the
+        coroutine body on first entry. }
+      sqlite3VdbeChangeP2(v, addrTopOfLoop,
+                          sqlite3VdbeCurrentAddr(v));
+
+      { Outer scan — alloc result-register block, OP_Yield to drive,
+        emit pEList, translateColumnToCopy to redirect OP_Columns at
+        iCsr into OP_Copy from regResult, OP_ResultRow, loop. }
+      pEList     := p^.pEList;
+      nResultCol := pEList^.nExpr;
+      pDest^.nSdst := nResultCol;
+      if pDest^.iSdst = 0 then
+      begin
+        pDest^.iSdst := pParse^.nMem + 1;
+        pParse^.nMem := pParse^.nMem + nResultCol;
+      end;
+
+      addrEnd := sqlite3VdbeMakeLabel(pParse);
+      addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Yield,
+                          pItem^.u4.pSubq^.regReturn, addrEnd);
+      r2 := sqlite3VdbeCurrentAddr(v);  { start of body — for translate }
+
+      items := ExprListItems(pEList);
+      for i := 0 to nResultCol - 1 do
+      begin
+        r1 := sqlite3ExprCodeTarget(pParse, items[i].pExpr,
+                                    pDest^.iSdst + i);
+        if r1 <> pDest^.iSdst + i then
+          sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
+      end;
+      { Rewrite OP_Column iCsr,col,dest → OP_Copy regResult+col,dest. }
+      translateColumnToCopy(pParse, r2, iCsr,
+                            pItem^.u4.pSubq^.regResult, 0);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+
+      sqlite3VdbeAddOp2(v, OP_Goto, 0, addrTopOfLoop);
+      sqlite3VdbeResolveLabel(v, addrEnd);
+
+      if pParse^.nErr <> 0 then Result := SQLITE_ERROR
+                          else Result := SQLITE_OK;
+      Exit;
+    end;
+  end;
+
   { Sub-SELECT materialise arm — Phase 6.13(b) piece 3.
     Single-source FROM (SELECT ...) shape: open an ephemeral rowid
     table at the cursor selectExpander assigned, recursively code the
@@ -20535,6 +20696,17 @@ begin
       Assert(pDest^.iSdst = pDest^.iSDParm);
       if p^.iLimit <> 0 then
         sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, pWInfo^.iBreak);
+    end
+    else if pDest^.eDest = SRT_Coroutine then
+    begin
+      { selectInnerLoop:1441..1454 — SRT_Coroutine disposal.  Result
+        registers were coded into [iSdst..iSdst+nResultCol-1] by the
+        per-column emit above; OP_Yield iSDParm transfers control back
+        to whichever outer scan invoked OP_InitCoroutine, leaving the
+        result row visible to the consumer at iSdst.  The C source
+        treats SRT_Coroutine as a sibling of SRT_Output — same upstream
+        register block, different downstream sink. }
+      sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
     end
     else if pDest^.eDest = SRT_EphemTab then
     begin
