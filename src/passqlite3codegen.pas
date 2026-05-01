@@ -24790,9 +24790,13 @@ var
   aTabColMap:     Pi32;
   bIdListInOrder: u8;
   nColumn:        i32;
+  nIdx:           i32;
   i:              i32;
   j:              i32;
-  regOut:         i32;
+  iDataCur:       i32;
+  iIdxCur:        i32;
+  pIdx:           PIndex2;
+  bMayReplace:    Boolean;
   pListItems:     PExprListItem;
   pIdItems:       PIdListItem;
 begin
@@ -24924,8 +24928,37 @@ begin
     end;
   end;
 
+  { Allocate aRegIdx[nIdx + 1] (Phase 6.8.6 — replaces the inline four-op
+    shortcut so non-IPK indexes get populated by sqlite3CompleteInsertion).
+    aRegIdx[i] for i in 0..nIdx-1 := first reg of per-index key block;
+    aRegIdx[nIdx] := the table-record register OP_MakeRecord writes.
+    Layout matches sqlite3Update's update.c:566..595 pattern. }
+  nIdx := 0;
+  pIdx := pTab^.pIndex;
+  while pIdx <> nil do begin
+    Inc(nIdx);
+    pIdx := pIdx^.pNext;
+  end;
+  aRegIdx := Pi32(sqlite3DbMallocZero(db,
+                  u64(SizeOf(i32)) * u64(nIdx + 1)));
+  if (aRegIdx = nil) and (nIdx + 1 > 0) then goto insert_cleanup;
+  i := 0;
+  pIdx := pTab^.pIndex;
+  while pIdx <> nil do begin
+    Inc(pParse^.nMem);
+    (aRegIdx + i)^ := pParse^.nMem;
+    pParse^.nMem := pParse^.nMem + i32(pIdx^.nColumn);
+    Inc(i);
+    pIdx := pIdx^.pNext;
+  end;
+  Inc(pParse^.nMem);
+  (aRegIdx + nIdx)^ := pParse^.nMem;
+
+  iDataCur := 0;
+  iIdxCur  := 0;
   if not (isView <> 0) then
-    sqlite3OpenTable(pParse, 0, iDb, pTab, OP_OpenWrite);
+    sqlite3OpenTableAndIndices(pParse, pTab, OP_OpenWrite, 0, -1,
+                               nil, @iDataCur, @iIdxCur);
 
   { Evaluate column values into regData..regData+nCol-1, iterating in table
     storage order.  Three sub-cases per column:
@@ -24962,32 +24995,36 @@ begin
       sqlite3ExprCode(pParse, pListItems[i].pExpr, regData + i);
   end;
 
-  { OP_NewRowid -> regRowid (cursor 0).  C reference passes regAutoinc as P3;
-    today's stub returns 0 so this is structurally a no-op for AUTOINCREMENT
-    until that lands. }
-  sqlite3VdbeAddOp3(v, OP_NewRowid, 0, regRowid, regAutoinc);
+  { OP_NewRowid -> regRowid (insert.c:1488..1531).  IPK-alias rebinding
+    (where the user-provided value at regData+iPKey becomes the rowid)
+    is deferred — the existing simple path leaves regData+iPKey carrying
+    the user's value but OP_Column on iPKey reads the rowid at read
+    time, so the auto-generated rowid wins regardless.  Pre-existing
+    behaviour for `rowid alias custom`; tracked under 6.8.6 follow-up. }
+  if not (isView <> 0) then
+    sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
 
-  { Apply column affinities (or OP_TypeCheck for STRICT tables) before
-    packing the record.  Mirrors the call inside sqlite3GenerateConstraintChecks
-    at insert.c:2080 — the constraint-check body itself is still a stub but
-    the affinity application stands alone and is required for typeof()
-    parity (e.g. INSERT INTO af(a INTEGER) VALUES('42') must store INTEGER). }
-  sqlite3TableAffinity(v, pTab, regData);
-
-  { Pack the per-column regData block into a single record register.
-    Allocate from nMem (matching C's sqlite3CompleteInsertion frame), not
-    sqlite3GetTempReg — the temp-reg release would emit a spurious
-    OP_ReleaseReg under SQLITE_DEBUG that the C reference does not. }
-  Inc(pParse^.nMem);
-  regOut := pParse^.nMem;
-  sqlite3VdbeAddOp3(v, OP_MakeRecord, regData, i32(pTab^.nCol), regOut);
-  sqlite3SetMakeRecordP5(v, pTab);
-
-  { OP_Insert: cursor 0, record, rowid; P5 = standard insert-flag set used
-    by sqlite3NestedParse-emitted schema-row writes. }
-  sqlite3VdbeAddOp3(v, OP_Insert, 0, regOut, regRowid);
-  sqlite3VdbeChangeP5(v,
-    OPFLAG_NCHANGE or OPFLAG_LASTROWID or OPFLAG_APPEND or OPFLAG_USESEEKRESULT);
+  { Phase 6.8.6 — productive constraint-check + completion path.  Replaces
+    the prior inline OP_Affinity + OP_MakeRecord + OP_Insert shortcut.
+    sqlite3GenerateConstraintChecks emits NOT NULL / CHECK / UNIQUE /
+    PRIMARY KEY enforcement plus index-key encoding into aRegIdx[i]+1..,
+    and writes the packed table record into aRegIdx[nIdx].
+    sqlite3CompleteInsertion emits the per-index OP_IdxInsert chain plus
+    the final OP_Insert against the data cursor.  Together they are the
+    insert.c:2706..2855 reference (already 1:1 ported in 6.8.2 / 6.8.3). }
+  if not (isView <> 0) then
+  begin
+    bMayReplace := False;
+    { pkChng=0 — OP_NewRowid above guarantees the rowid is unique, so
+      sqlite3GenerateConstraintChecks can skip the rowid-uniqueness probe.
+      IPK-alias path (where user-provided rowid would set pkChng=1) is
+      deferred. }
+    sqlite3GenerateConstraintChecks(pParse, pTab, aRegIdx, iDataCur, iIdxCur,
+      regIns, 0, 0, u8(onError), 0,
+      @bMayReplace, nil, pUpsert);
+    sqlite3CompleteInsertion(pParse, pTab, iDataCur, iIdxCur, regIns,
+      aRegIdx, 0, 1, ord(not bMayReplace));
+  end;
 
   if (pParse^.nested = 0) and (regRowCount <> 0) then
     sqlite3CodeChangeCount(v, regRowCount, 'rows inserted');
