@@ -110,19 +110,52 @@ skeleton.
          `:24389..24393` with the canonical
          `GenerateConstraintChecks` + `CompleteInsertion` pair.
 
-- [ ] **6.8.4** port `sqlite3WhereBegin` (where.c).
+- [~] **6.8.4** port `sqlite3WhereBegin` (where.c).
      Gate: TestExplainParity SELECT-WHERE corpus + DiagIndexing
      `indexed by ok` / `not indexed` (closes 6.10 step 26(e)).
-     [ ] Allocate `WhereInfo` + per-loop `WhereLevel` array.
-     [ ] Drive `whereLoopAddAll` (already partially ported) +
-          `wherePathSolver` for the cost-based plan.
-     [ ] Single-table fast path: lift the current nTabList=1 gate
-          (codegen.pas:14991) and emit a real per-loop OP_OpenRead /
-          OP_OpenWrite + OP_SeekGE/OP_Rewind preamble.
-     [ ] Multi-table loop nesting + per-loop WHERE-clause splitting.
-     [ ] INDEXED BY / NOT INDEXED honour (codegen.pas:14203 bail).
+     [X] Allocate `WhereInfo` + per-loop `WhereLevel` array
+          (codegen.pas:15243..15280).
+     [X] Drive `whereLoopAddAll` + `wherePathSolver` for the
+          cost-based plan (codegen.pas:15429..15454).
+     [X] Single-table fast path: lift the nTabList=1 gate.  Site
+          #5 (a) lifted the viaCoroutine narrow case (commit
+          9861f05); site #5 (b) lifted the rest in commit 41167c7
+          (WHERE_OR_SUBCLAUSE recursion, virtual tables, INDEXED
+          BY / NOT INDEXED — every shape whereShortCut bails on
+          now routes through codeOneLoopStart).
+     [X] `not indexed` honour (DiagIndexing PASS, commit 41167c7).
+     [~] `INDEXED BY` honour: planner-side wired (commit 889ca4f
+          adds `sqlite3IndexedByLookup` from selectExpander,
+          populates `pIndex^.colNotIdxed` in `sqlite3CreateIndex`,
+          opens `iIdxCur` with `OPFLAG_SEEKEQ` in the planner-
+          branch cursor-open loop).  Bytecode now byte-identical
+          to C oracle.  End-to-end DiagIndexing `indexed by ok`
+          still divergent because the Pas `sqlite3Insert` shortcut
+          path (codegen.pas:24770..) does not emit `OP_IdxInsert`
+          for non-IPK indexes; ix_t_a stays empty after seed
+          INSERTs and the SELECT finds no rows.  Closing this
+          requires the `sqlite3Insert` rewrite (see 6.8.1
+          deferred-arm note line 88-91 + 6.10 step 9): drop the
+          inline four-op shortcut and call
+          `sqlite3OpenTableAndIndices` + `sqlite3CompleteInsertion`
+          with a real `aRegIdx[]`.  Tracked as **6.8.6**.
+     [ ] Multi-table loop nesting + per-loop WHERE-clause splitting
+          (codeOneLoopStart already supports it; corpus parity
+          deferred — TestExplainParity multi-table rows still
+          mostly diverging on join-order / explain-text edges).
      [ ] Bloom-filter and covering-index arms (covers 6.10 step 9
           d-INNER and the `SELECT p FROM u` planner Δ).
+
+- [ ] **6.8.6** port the productive `sqlite3Insert` body (insert.c).
+     Replaces the inline four-op shortcut at codegen.pas:24770..
+     with the canonical `sqlite3OpenTableAndIndices` +
+     `sqlite3GenerateConstraintChecks` (already ported, 6.8.2) +
+     `sqlite3CompleteInsertion` (already ported, 6.8.3) +
+     `sqlite3AutoincrementEnd` (already ported) cascade.
+     Gate: closes DiagIndexing `indexed by ok` (the planner
+     bytecode is already correct after 6.8.4 site #5 (c); only
+     the index population at insert time is missing) and unblocks
+     6.8.4 INDEXED BY end-to-end.
 
 - [ ] **6.8.5** port `sqlite3WhereEnd` (where.c).
      Gate: same as 6.8.4 — they land as a pair.
@@ -965,9 +998,31 @@ skeleton.
                   actual dispatcher emission as **site #5 (b)**
                   layered on top.
 
+                  **site #5 (b)** — full nTabList=1 bail lift
+                  LANDED 2026-05-01 (commit 41167c7).  Removes
+                  the explicit bail at codegen.pas:15422..15426 so
+                  every single-table case whereShortCut cannot
+                  classify (WHERE_OR_SUBCLAUSE recursion, virtual
+                  tables, INDEXED BY / NOT INDEXED) routes through
+                  the full planner instead of returning nil.
+                  Verified: TestExplainParity 1018/8/1026
+                  unchanged, no regressions across the test suite.
+
+                  **site #5 (c)** — INDEXED BY planner wiring
+                  LANDED 2026-05-01 (commit 889ca4f).  Three
+                  coupled fixes: (1) selectExpander now calls
+                  sqlite3IndexedByLookup for FROM items with
+                  fg.isIndexedBy set, (2) sqlite3CreateIndex
+                  populates pIndex^.colNotIdxed, (3) the planner-
+                  branch cursor-open loop allocates iIdxCur and
+                  emits OP_OpenRead with KeyInfo + OPFLAG_SEEKEQ.
+                  Net: DiagIndexing 7→6 (`not indexed` PASS).
+                  `indexed by ok` blocked on 6.8.6 (sqlite3Insert
+                  index-write rewrite).
+
                 Sites #2 and #4 close as no-op-needed because the
                 Pas gates are already faithful to C.  Sites #1,
-                #3, #5 remain open as separate gated lifts.
+                #3 remain open as separate gated lifts.
 
                 Regression sweep stays green: TestExplainParity
                 1016/10, TestSelectBasic 60/0, TestDMLBasic 54/0,
