@@ -9148,10 +9148,18 @@ begin
             pCur^.isTable := 0;
           end;
         end else begin
-          { Rowid table: use the auto-created table at SCHEMA_ROOT+1 }
-          rc := sqlite3BtreeCursor(pCur^.ub.pBtx, SCHEMA_ROOT + 1,
-                                   BTREE_WRCSR, nil, pCur^.uc.pCursor);
-          pCur^.isTable := 1;
+          { Rowid table: allocate a fresh INTKEY root page and open a cursor
+            on it.  In upstream C the comment "use the auto-created table at
+            SCHEMA_ROOT+1" applies because newDatabase pre-allocates that
+            page; this port's newDatabase only initialises page 1, so we
+            must call sqlite3BtreeCreateTable explicitly and capture the
+            assigned pgno (typically SCHEMA_ROOT+1 = 2 for a fresh eph). }
+          rc := sqlite3BtreeCreateTable(pCur^.ub.pBtx, @pgnoEph, BTREE_INTKEY);
+          if rc = SQLITE_OK then begin
+            rc := sqlite3BtreeCursor(pCur^.ub.pBtx, pgnoEph, BTREE_WRCSR,
+                                     nil, pCur^.uc.pCursor);
+            pCur^.isTable := 1;
+          end;
         end;
       end;
       if rc <> SQLITE_OK then goto abort_due_to_error;
