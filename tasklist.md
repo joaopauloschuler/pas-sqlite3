@@ -526,6 +526,71 @@ skeleton.
             6.10 step 9(c) note — once subqueries work, views fold in
             for free because selectExpander rewrites a VIEW FROM-item
             into a SUBQUERY FROM-item.
+            **2026-05-01 spike (reverted, kept here as a map for the
+            next attempt).**  A four-piece prototype landed and was
+            reverted on the same branch:
+              1. `SRT_EphemTab` accepted at the top dest gate
+                 (codegen.pas:19502) plus a disposal arm
+                 (`MakeRecord` + `NewRowid` + `Insert`/APPEND) right
+                 after the `SRT_Mem` arm in the regular path's inner
+                 loop disposal block.
+              2. selectExpander FROM-loop was extended so subquery
+                 SrcItems get a recursive `sqlite3SelectPrep` on the
+                 inner SELECT followed by `sqlite3ExpandSubquery`
+                 (without this, outer column refs into a subquery
+                 fail to resolve with "no such column").  Order
+                 matters — the new arm must run before the existing
+                 `if pItem^.zName = nil then Continue` skip.
+              3. A standalone "materialise sub-SELECT" arm was added
+                 in `sqlite3Select` right before the regular path's
+                 "all source items must be real base tables" gate at
+                 line 20104, gated on nSrc=1 / SRT_Output / no WHERE
+                 / no DISTINCT / no Aggregate / no Compound / pSubq
+                 non-nil / pSTab non-nil.  Allocates one cursor (the
+                 same iCursor selectExpander assigned, so resolved
+                 TK_COLUMN refs find the eph cursor), opens
+                 `OP_OpenEphemeral iEph, innerNCol`, recursively codes
+                 the inner via `sqlite3Select(... SRT_EphemTab ...)`,
+                 then hand-rolls a Rewind/Column/ResultRow/Next/Close
+                 outer scan.
+              4. Bytecode shape matched the C oracle for the simple
+                 `SELECT a FROM (SELECT a FROM t)` case.  But at
+                 runtime every materialised query hit
+                 `SQLITE_CORRUPT (11) "database disk image is
+                 malformed"` raised inside the OP_NewRowid →
+                 sqlite3BtreeLast → moveToRoot path on the eph
+                 cursor.  All existing OpenEphemeral usage in the
+                 port passes a `P4_KEYINFO` (indexed eph); this is
+                 the first rowid-table eph callsite, and the
+                 SCHEMA_ROOT+1 auto-root path in
+                 `passqlite3vdbe.pas:9152` appears to need an
+                 explicit `sqlite3BtreeCreateTable` before the
+                 cursor open.  DiagFeatureProbe also surfaced an
+                 EAccessViolation regression (CREATE VIEW + SELECT
+                 count) — the selectExpander subquery hook
+                 triggered some downstream NIL-deref on the
+                 view→subquery rewrite path.  Both issues are
+                 localized to the prototype and unrelated to
+                 6.13(a).  Reverted so main stays clean.
+            **Next attempt suggestions (in order of effort / value):**
+              * Fix `OP_OpenEphemeral` rowid-table path first
+                (passqlite3vdbe.pas:9150..9155) — likely needs
+                `sqlite3BtreeCreateTable` + capture of the assigned
+                pgno before `sqlite3BtreeCursor`.  Smoke via
+                hand-rolled bytecode in TestVdbeAux before retrying
+                the codegen layer.
+              * Re-land the SRT_EphemTab dest + disposal arm
+                (piece 1) with a unit test in TestSelectBasic
+                exercising it directly.
+              * Re-land the selectExpander subquery hook (piece 2)
+                separately, and add a DiagFeatureProbe gate-row to
+                lock the no-regression guarantee on VIEW.
+              * Then re-land the materialise arm (piece 3) — at
+                that point it should produce live rows.
+              * Co-routine emission (`sqlite3CodeSubquery`) lands
+                last, replaces the materialise arm where the inner
+                isn't correlated, and unblocks the wider bail-lift
+                sweep at the five existing gate sites.
        [ ] **c) Compound-SELECT / CTE arm** — UNION / INTERSECT /
             EXCEPT FROM-sources and `WITH … AS (…)` references.
             Once 6.13(b) lands, compound-SELECT-as-FROM-source
