@@ -24871,7 +24871,23 @@ begin
   { TODO(Phase 6.x): xferOptimization — INSERT INTO t1 SELECT * FROM t2.
     Omitted until sqlite3Select / xferOptimization are real. }
 
-  regAutoinc := autoIncBegin(pParse, iDb, pTab); { stub returns 0 today }
+  regAutoinc := autoIncBegin(pParse, iDb, pTab);
+
+  { regRowCount (insert.c:1245..1257).  SQLITE_CountRows = u64($100000000)
+    (sqliteInt.h:1863).  Allocate the running counter when the connection
+    has CountRows turned on, this is a top-level INSERT (not a trigger or
+    nested parse), and there is no RETURNING / UPSERT clause overriding
+    the change-count emission. }
+  if ((db^.flags and u64($100000000)) <> 0)
+     and (pParse^.pTriggerTab = nil)
+     and (pParse^.nested = 0)
+     and ((pParse^.parseFlags and PARSEFLAG_BReturning) = 0)
+     and (pUpsert = nil) then
+  begin
+    Inc(pParse^.nMem);
+    regRowCount := pParse^.nMem;
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, regRowCount);
+  end;
 
   { Allocate registers: rowid + nCol data slots. }
   regRowid := pParse^.nMem + 1;
@@ -25069,6 +25085,17 @@ begin
       aRegIdx, 0, appendBias, ord(not bMayReplace));
   end;
 
+  { Bump the running row count after each successful insert (insert.c:1612). }
+  if regRowCount <> 0 then
+    sqlite3VdbeAddOp2(v, OP_AddImm, regRowCount, 1);
+
+  { sqlite3AutoincrementEnd — emit the sqlite_sequence write-back epilogue
+    (insert.c:1640).  Skipped inside triggers and nested parses; the body
+    is a no-op when pParse^.pAinc is nil so we can call unconditionally
+    at the top-level INSERT entry. }
+  if (pParse^.nested = 0) and (pParse^.pTriggerTab = nil) then
+    sqlite3AutoincrementEnd(pParse);
+
   if (pParse^.nested = 0) and (regRowCount <> 0) then
     sqlite3CodeChangeCount(v, regRowCount, 'rows inserted');
 
@@ -25104,6 +25131,21 @@ begin
   begin
     pToplevel := sqlite3ParseToplevel(pParse);
     pSeqTab := PTable2(db^.aDb[iDb].pSchema^.pSeqTab);
+    { Lazy pSeqTab pin: when sqlite3CreateTable's init.busy reparse path
+      ran for the AUTOINCREMENT table BEFORE sqlite_sequence was added to
+      the schema (which happens for our test/exec ordering today since
+      the reparse callback processes rows in the order ParseSchema
+      enumerates them, and sqlite_sequence's ParseSchema row may land
+      after the AUTOINCREMENT table's), pSeqTab stays nil after CREATE
+      TABLE.  By the time the first INSERT prepares, sqlite_sequence is
+      in the schema — find it now and pin. }
+    if pSeqTab = nil then
+    begin
+      pSeqTab := sqlite3FindTable(db, PAnsiChar('sqlite_sequence'),
+                                  db^.aDb[iDb].zDbSName);
+      if pSeqTab <> nil then
+        passqlite3util.PSchema(db^.aDb[iDb].pSchema)^.pSeqTab := pSeqTab;
+    end;
     { Verify sqlite_sequence is a 2-column rowid table.  Virtual-table arm
       of NEVER(IsVirtual(pSeqTab)) inlined as eTabType = TABTYP_VTAB. }
     if (pSeqTab = nil)
@@ -28073,9 +28115,30 @@ begin
 
     sqlite3ChangeCookie(pParse, iDb);
 
-    { sqlite_sequence creation for AUTOINCREMENT — TF_Autoincrement is
-      never set today (parser stub), so this block is unreachable.
-      Structural placeholder kept as a comment for future wiring. }
+    { sqlite_sequence creation for AUTOINCREMENT (build.c:2935..2944).
+      When the just-created table is AUTOINCREMENT and the per-database
+      schema has no sqlite_sequence yet, recursively parse a CREATE TABLE
+      for it.  The recursive parse goes through gNestedRunParser, lands
+      back in sqlite3CreateTable (this function), and pins pSeqTab on
+      its init.busy reparse path. }
+    if (pTab^.tabFlags and TF_Autoincrement) <> 0 then
+    begin
+      if passqlite3util.PSchema(pTab^.pSchema)^.pSeqTab = nil then
+      begin
+        { build.c:2935..2944 emits `CREATE TABLE %Q.sqlite_sequence(name,
+          seq)`; the Pas parser does not yet accept a single-quoted
+          database qualifier in CREATE TABLE position, so drop the
+          qualifier for iDb=0 ('main') — the active database context at
+          this point is already `main` so there is no ambiguity. }
+        if iDb = 0 then
+          sqlite3NestedParse(pParse,
+            PAnsiChar('CREATE TABLE sqlite_sequence(name,seq)'), [])
+        else
+          sqlite3NestedParse(pParse,
+            PAnsiChar('CREATE TABLE %Q.sqlite_sequence(name,seq)'),
+            [db^.aDb[iDb].zDbSName]);
+      end;
+    end;
 
     { Reparse the table we just wrote (build.c:2935..2936). }
     zReparse := sqlite3MPrintf(db, 'tbl_name=''%q'' AND type!=''trigger''',
@@ -28097,7 +28160,18 @@ begin
     pParse^.pNewTable := nil;
     db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
 
-    { sqlite_sequence pSeqTab pin: TF_Autoincrement never set today. }
+    { sqlite_sequence pSeqTab pin (build.c:2952..2956).  During init.busy
+      reparse of the AUTOINCREMENT table, pin sqlite_sequence on the
+      schema so autoIncBegin can find it.  May resolve to nil if
+      sqlite_sequence has not yet been reparsed (depends on
+      ParseSchema callback order); autoIncBegin re-attempts the
+      lookup at insert-codegen time as a fallback. }
+    if (pTab^.tabFlags and TF_Autoincrement) <> 0 then
+    begin
+      passqlite3util.PSchema(pTab^.pSchema)^.pSeqTab :=
+        sqlite3FindTable(db, PAnsiChar('sqlite_sequence'),
+                         db^.aDb[iDb].zDbSName);
+    end;
   end;
 
   { ALTER TABLE addColOffset bookkeeping (build.c:2785). }
