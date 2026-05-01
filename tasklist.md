@@ -759,6 +759,40 @@ skeleton.
                 co-routine arm, some need WHERE-code integration).
                 Tracked as a follow-up subtask under 6.13(b).
 
+                **Sweep audit (post-piece-4):** the five sites
+                resolve into three categories — confirm-only,
+                materialise-lift, dispatcher-lift.  Mapped to
+                current passqlite3codegen.pas line numbers:
+
+                - Site #1 (codegen.pas:19733, GROUP BY agg arm):
+                  bails on IS_SUBQUERY.  Lift requires materialise
+                  pre-pass mirroring select.c:7983..8133 so the
+                  agg machinery sees a real eph cursor.  PENDING.
+                - Site #2 (codegen.pas:20011, simple count fast
+                  path): IS_SUBQUERY = 0 gate is C-faithful —
+                  matches `isSimpleCount` at select.c:5441 line
+                  for line, count(*)-on-subquery is excluded by
+                  C as well.  No lift needed; comment now cites
+                  the C source directly.  DONE.
+                - Site #3 (codegen.pas:20068, general agg arm):
+                  same shape as site #1.  Paired lift with #1.
+                  PENDING.
+                - Site #4 (codegen.pas:20212, eponymous-vtab arm):
+                  IS_SUBQUERY = 0 gate is correct — subquery
+                  items fall through to the co-routine /
+                  materialise arms immediately below (lines 20305,
+                  20416).  No lift needed.  DONE.
+                - Site #5 (codegen.pas:20488, final pre-regular-
+                  cursor-open bail): multi-FROM with subquery
+                  items.  Largest lift — needs per-pSrcItem
+                  dispatcher mirroring select.c:7983..8133 plus
+                  WHERE-code integration for the resulting eph
+                  cursor / regResult block.  PENDING.
+
+                Sites #2 and #4 close as no-op-needed because the
+                Pas gates are already faithful to C.  Sites #1,
+                #3, #5 remain open as separate gated lifts.
+
                 Regression sweep stays green: TestExplainParity
                 1016/10, TestSelectBasic 60/0, TestDMLBasic 54/0,
                 TestSchemaBasic 44/0, TestWhereBasic 52/0,

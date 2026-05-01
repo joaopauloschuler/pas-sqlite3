@@ -20008,7 +20008,7 @@ begin
        and (pTab^.eTabType <> TABTYP_VTAB)
        and (pTab^.eTabType <> TABTYP_VIEW)
        and ((pTab^.tabFlags and TF_Ephemeral) = 0)
-       and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)   { not a subquery }
+       and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)   { isSimpleCount@select.c:5441 }
     then begin
       pE := ExprListItems(p^.pEList)[0].pExpr;
       if (pE <> nil) and (pE^.op = TK_FUNCTION) and (pE^.u.zToken <> nil)
