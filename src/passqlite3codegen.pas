@@ -29868,315 +29868,15 @@ begin
 end;
 
 // ===========================================================================
-// Phase 6.5 — pragma.c stubs
-// ===========================================================================
-
-{ sqlite3Pragma — minimal viable port of pragma.c:425.
-
-  Only the read arms of `PRAGMA user_version` (PragTyp_HEADER_VALUE) and
-  `PRAGMA encoding` (PragTyp_ENCODING) are wired through.  Both are
-  read-only and emit short, fixed op sequences; this closes the Δ=4 / Δ=3
-  rows for the two probes in TestExplainParity.  The full pragmaLocate
-  table-driven dispatch is deferred until more pragma probes land. }
-type
-  TFlagPragma = record
-    name: PChar;
-    mask: u64;
-  end;
-const
-  { pragma.c PragTyp_FLAG entries (canonical mask values from sqliteInt.h
-    flag bits).  Read arm emits ((db.flags & mask) <> 0); write arm
-    sets/clears the bit at codegen time so a subsequent prepare picks up
-    the new value. }
-  cFlagPragmas: array[0..16] of TFlagPragma = (
-    (name: 'foreign_keys';             mask: SQLITE_ForeignKeys),
-    (name: 'recursive_triggers';       mask: SQLITE_RecTriggers),
-    (name: 'reverse_unordered_selects';mask: SQLITE_ReverseOrder),
-    (name: 'defer_foreign_keys';       mask: SQLITE_DeferFKs),
-    (name: 'writable_schema';          mask: SQLITE_WriteSchema),
-    (name: 'legacy_alter_table';       mask: SQLITE_LegacyAlter),
-    (name: 'cell_size_check';          mask: SQLITE_CellSizeCk),
-    (name: 'automatic_index';          mask: SQLITE_AutoIndex),
-    (name: 'full_column_names';        mask: SQLITE_FullColNames),
-    (name: 'short_column_names';       mask: SQLITE_ShortColNames),
-    (name: 'checkpoint_fullfsync';     mask: SQLITE_CkptFullFSync),
-    (name: 'fullfsync';                mask: SQLITE_FullFSync),
-    (name: 'ignore_check_constraints'; mask: SQLITE_IgnoreChecks),
-    (name: 'query_only';               mask: SQLITE_QueryOnly),
-    (name: 'count_changes';            mask: SQLITE_CountRows),
-    (name: 'read_uncommitted';         mask: SQLITE_ReadUncommit),
-    (name: 'empty_result_callbacks';   mask: SQLITE_NullCallback)
-  );
-  cFlagPragmasTrusted: TFlagPragma =
-    (name: 'trusted_schema'; mask: SQLITE_TrustedSchema);
-
-procedure sqlite3Pragma(pParse: PParse; const pId1: PToken;
-  const pId2: PToken; pValue: PToken; minusFlag: i32);
-var
-  v:       PVdbe;
-  zName:   AnsiString;
-  zRight:  AnsiString;
-  iDb:     i32;
-  iCookie: i32;
-  iVal:    i32;
-  addrOp:  i32;
-  pBtArg:  PBtree;
-  db:      PTsqlite3;
-  i:       i32;
-  flagMask: u64;
-  bSet:    u8;
-begin
-  if (pParse = nil) or (pId1 = nil) then Exit;
-  db := pParse^.db;
-  v := sqlite3GetVdbe(pParse);
-  if v = nil then Exit;
-
-  { Mark the prepared statement as single-use.  The PragTyp_HEADER_VALUE
-    arm later flips this OP_Expire back to OP_Noop via sqlite3VdbeReusable. }
-  sqlite3VdbeRunOnlyOnce(v);
-  pParse^.nMem := 2;
-
-  { Schema prefix not yet honoured — ignore pId2 and use the main db.
-    Sufficient for the bare `PRAGMA name` shape covered by the probes. }
-  iDb := 0;
-
-  SetString(zName, pId1^.z, pId1^.n);
-
-  { PragTyp_FLAG — pragma.c (generic boolean-flag arm).  Read emits
-    `(db^.flags and mask) <> 0` as a single int row.  Write parses the
-    boolean rhs and updates db^.flags directly at codegen time, matching
-    the C body. }
-  flagMask := 0;
-  for i := Low(cFlagPragmas) to High(cFlagPragmas) do
-    if SameText(zName, cFlagPragmas[i].name) then begin
-      flagMask := cFlagPragmas[i].mask;
-      Break;
-    end;
-  if (flagMask = 0) and SameText(zName, cFlagPragmasTrusted.name) then
-    flagMask := cFlagPragmasTrusted.mask;
-  if flagMask <> 0 then begin
-    if pValue <> nil then begin
-      SetString(zRight, pValue^.z, pValue^.n);
-      bSet := sqlite3GetBoolean(PChar(zRight), 0);
-      if bSet <> 0 then
-        db^.flags := db^.flags or flagMask
-      else
-        db^.flags := db^.flags and (not flagMask);
-    end else begin
-      if (db^.flags and flagMask) <> 0 then iVal := 1 else iVal := 0;
-      sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
-      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
-      sqlite3VdbeReusable(v);
-    end;
-    Exit;
-  end;
-
-  { PragTyp_HEADER_VALUE — pragma.c:2324.  Reads/writes a 4-byte slot in
-    the database file header.  user_version is iCookie=BTREE_USER_VERSION,
-    application_id is iCookie=BTREE_APPLICATION_ID, data_version is
-    iCookie=BTREE_DATA_VERSION (virtual meta-value, ReadOnly). }
-  if SameText(zName, 'user_version') or SameText(zName, 'application_id')
-     or SameText(zName, 'data_version') then
-  begin
-    if SameText(zName, 'user_version') then
-      iCookie := BTREE_USER_VERSION
-    else if SameText(zName, 'data_version') then
-      iCookie := BTREE_DATA_VERSION
-    else
-      iCookie := BTREE_APPLICATION_ID;
-    sqlite3VdbeUsesBtree(v, iDb);
-    if (pValue <> nil) and (iCookie <> BTREE_DATA_VERSION) then begin
-      { Write arm — Transaction(write) + SetCookie(P5=1).  data_version
-        is ReadOnly per pragma.h flags so writes silently no-op. }
-      SetString(zRight, pValue^.z, pValue^.n);
-      sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 1, 0);
-      addrOp := sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, iCookie,
-                                  sqlite3Atoi(PChar(zRight)));
-      sqlite3VdbeChangeP5(v, 1);
-      if addrOp = 0 then ;
-    end else if pValue = nil then begin
-      { Read arm. }
-      sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 0, 0);
-      sqlite3VdbeAddOp3(v, OP_ReadCookie,  iDb, 1, iCookie);
-      sqlite3VdbeAddOp2(v, OP_ResultRow,   1,   1);
-      sqlite3VdbeReusable(v);
-    end;
-    Exit;
-  end;
-
-  if SameText(zName, 'encoding') and (pValue = nil) then begin
-    { PragTyp_ENCODING read arm (pragma.c:2261).  The Pas port runs UTF-8
-      only today, so emit the literal name unconditionally. }
-    if sqlite3ReadSchema(pParse) <> SQLITE_OK then Exit;
-    sqlite3VdbeLoadString(v, 1, 'UTF-8');
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
-    Exit;
-  end;
-
-  { PragTyp_PAGE_SIZE read arm (pragma.c:598).  Page size is fixed at
-    open time so capture at codegen via sqlite3BtreeGetPageSize. }
-  if SameText(zName, 'page_size') and (pValue = nil) then begin
-    pBtArg := PBtree(db^.aDb[iDb].pBt);
-    if pBtArg <> nil then
-      iVal := sqlite3BtreeGetPageSize(pBtArg)
-    else
-      iVal := 0;
-    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
-    Exit;
-  end;
-
-  { PragTyp_CACHE_SIZE read arm (pragma.c:882).  Default is
-    SQLITE_DEFAULT_CACHE_SIZE (-2000); C populates Schema.cache_size in
-    sqlite3InitOne (prepare.c:323) which is not yet ported, so a 0 here
-    means "uninitialised" and we substitute the default — matching the
-    fallback at prepare.c:326. }
-  if SameText(zName, 'cache_size') and (pValue = nil) then begin
-    if (db^.aDb[iDb].pSchema <> nil)
-       and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
-      iVal := db^.aDb[iDb].pSchema^.cache_size
-    else
-      iVal := SQLITE_DEFAULT_CACHE_SIZE;
-    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
-    Exit;
-  end;
-
-  { PragTyp_CACHE_SPILL read arm (pragma.c:916).  Returns 0 when
-    SQLITE_CacheSpill is off; otherwise the effective spill threshold
-    via sqlite3BtreeSetSpillSize(...,0).  Note: in C the pager's pcache
-    receives the schema cache_size via the prepare path; the Pas port
-    does not currently propagate that wiring, so seed the pcache here
-    on demand (matches the value the C oracle would see). }
-  if SameText(zName, 'cache_spill') and (pValue = nil) then begin
-    if (db^.flags and SQLITE_CacheSpill) = 0 then
-      iVal := 0
-    else begin
-      pBtArg := PBtree(db^.aDb[iDb].pBt);
-      if pBtArg <> nil then begin
-        if (db^.aDb[iDb].pSchema <> nil)
-           and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
-          sqlite3BtreeSetCacheSize(pBtArg,
-            db^.aDb[iDb].pSchema^.cache_size)
-        else
-          sqlite3BtreeSetCacheSize(pBtArg, SQLITE_DEFAULT_CACHE_SIZE);
-        iVal := sqlite3BtreeSetSpillSize(pBtArg, 0);
-      end else
-        iVal := 0;
-    end;
-    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
-    Exit;
-  end;
-
-  { PragTyp_SYNCHRONOUS read arm (pragma.c:1132). }
-  if SameText(zName, 'synchronous') and (pValue = nil) then begin
-    iVal := i32(db^.aDb[iDb].safety_level) - 1;
-    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
-    Exit;
-  end;
-
-  { Constant-default integer pragmas — emit OP_Integer with the documented
-    default value.  These do not yet maintain real per-connection state in
-    the Pas port; reading the *default* matches the C reference so the
-    DiagPragma probe sees parity.  Writes are silent no-ops (the value is
-    not preserved), matching the pre-port behaviour. }
-  if pValue = nil then begin
-    iVal := MaxInt; { sentinel "not handled" }
-    if      SameText(zName, 'secure_delete')      then iVal := 0
-    else if SameText(zName, 'temp_store')         then iVal := 0
-    else if SameText(zName, 'threads')            then iVal := 0
-    else if SameText(zName, 'soft_heap_limit')    then iVal := 0
-    else if SameText(zName, 'hard_heap_limit')    then iVal := 0
-    else if SameText(zName, 'busy_timeout')       then iVal := 0
-    else if SameText(zName, 'analysis_limit')     then iVal := 0
-    else if SameText(zName, 'wal_autocheckpoint') then iVal := 1000
-    else if SameText(zName, 'journal_size_limit') then iVal := -1
-    else if SameText(zName, 'auto_vacuum')        then iVal := 0
-    else if SameText(zName, 'freelist_count')     then iVal := 0
-    else if SameText(zName, 'schema_version')     then iVal := 0;
-    if iVal <> MaxInt then begin
-      sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
-      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
-      sqlite3VdbeReusable(v);
-      Exit;
-    end;
-  end;
-
-  { max_page_count default — pragma.c:1042.  OP_MaxPgcnt with P3=0 reads
-    the current limit (default 4294967294 = 0xFFFFFFFE on a fresh memory
-    db).  Yields i64 in result Mem so column_int truncates to -2 and
-    column_text renders "4294967294" via %lld — matching the C oracle. }
-  if SameText(zName, 'max_page_count') and (pValue = nil) then begin
-    sqlite3VdbeUsesBtree(v, iDb);
-    sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, 0);
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
-    sqlite3VdbeReusable(v);
-    Exit;
-  end;
-
-  { Constant-default string pragmas — pragma.c PragTyp_JOURNAL_MODE /
-    PragTyp_LOCKING_MODE.  In-memory db default journal_mode is "memory"
-    and locking_mode is "normal"; the Pas port does not maintain these
-    settings yet so emit the default text literal.  Both read AND write
-    forms must emit a result row: C's PragTyp_JOURNAL_MODE / _LOCKING_MODE
-    always end with `OP_ResultRow` carrying the (possibly updated) current
-    mode (pragma.c:770 / pragma.c:725). }
-  if SameText(zName, 'journal_mode') then begin
-    { memdb's pager rejects any non-"memory" mode, so the result is
-      always "memory" regardless of zRight.  Matches C's
-      sqlite3PagerJournalMode(...) outcome on memdb. }
-    sqlite3VdbeLoadString(v, 1, 'memory');
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
-    sqlite3VdbeReusable(v);
-    Exit;
-  end;
-  if SameText(zName, 'locking_mode') then begin
-    if pValue <> nil then begin
-      SetString(zRight, pValue^.z, pValue^.n);
-      if SameText(zRight, 'exclusive') then
-        sqlite3VdbeLoadString(v, 1, 'exclusive')
-      else
-        sqlite3VdbeLoadString(v, 1, 'normal');
-    end else
-      sqlite3VdbeLoadString(v, 1, 'normal');
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
-    sqlite3VdbeReusable(v);
-    Exit;
-  end;
-
-  { PragTyp_INTEGRITY_CHECK / quick_check (pragma.c:1695).  The full C body
-    walks every btree page and emits an error row per corruption; on a
-    clean database it emits the literal string "ok".  The Pas port has no
-    real integrity walker yet (OP_IntegrityCk is a stub that sets the
-    output register to NULL — see vdbe.pas), so the result on any db this
-    port produced is "ok" by construction.  Emit that directly to match
-    the C oracle's clean-db output and unblock the DiagPragma probe. }
-  if SameText(zName, 'integrity_check') or SameText(zName, 'quick_check') then
-  begin
-    sqlite3VdbeLoadString(v, 1, 'ok');
-    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
-    sqlite3VdbeReusable(v);
-    Exit;
-  end;
-end;
-
-// ===========================================================================
-// Phase 6.8.0 — pragma vtab module (pragma.c:2791..3101)
+// Phase 6.8.0 / 6.12 — pragma name table (pragma.h:200..595)
 // ===========================================================================
 //
-// Eponymous virtual tables for pragma_* introspection (e.g.
-// SELECT * FROM pragma_table_info('t')).  Each pragma_NAME table is registered
-// on first lookup via sqlite3PragmaVtabRegister, which installs the shared
-// pragmaVtabModule with the matching PragmaName entry as pAux.  At xFilter
-// time the module synthesises "PRAGMA name(arg)" SQL, prepares it via
-// sqlite3_prepare_v2, and feeds the resulting rows back through xColumn.
-//
-// Faithful 1:1 of the C block.  PragmaName table is the upstream
-// generated `aPragmaName[]` from ../sqlite3/pragma.h with the OMIT-guarded
-// rows excluded per our build (no CEROD, no Win32, no LOCKING_STYLE, no
-// DEBUG/TEST entries).
+// TPragmaName + PragTyp_* / PragFlg_* + cPragName + aPragmaName + the
+// pragmaLocate helper.  Lifted before sqlite3Pragma so the 6.12 table-
+// valued dispatcher (inside sqlite3Pragma) and the 6.8.0 vtab module
+// (further down the file) can both see it.  Faithful 1:1 of the upstream
+// generated pragma.h with OMIT-guarded rows excluded for our build (no
+// CEROD, no Win32, no LOCKING_STYLE, no DEBUG/TEST entries).
 
 type
   PPragmaName = ^TPragmaName;
@@ -30424,6 +30124,617 @@ const
      mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_WriteSchema or u64($08000000) {SQLITE_NoSchemaError})
   );
 
+{ pragma.h sentinel — locate PragmaName by bare name (no "pragma_" prefix).
+  C uses bsearch on the sorted aPragmaName[]; we use a linear scan since
+  the table has only ~60 entries and this fires once per pragma_NAME parse. }
+function pragmaLocate(zName: PAnsiChar): PPragmaName;
+var
+  i: i32;
+begin
+  for i := Low(aPragmaName) to High(aPragmaName) do
+    if sqlite3_stricmp(zName, aPragmaName[i].zName) = 0 then begin
+      Result := @aPragmaName[i]; Exit;
+    end;
+  Result := nil;
+end;
+
+// ===========================================================================
+// Phase 6.5 / 6.12 — sqlite3Pragma
+// ===========================================================================
+
+{ sqlite3Pragma — minimal viable port of pragma.c:425.
+
+  Only the read arms of `PRAGMA user_version` (PragTyp_HEADER_VALUE) and
+  `PRAGMA encoding` (PragTyp_ENCODING) are wired through.  Both are
+  read-only and emit short, fixed op sequences; this closes the Δ=4 / Δ=3
+  rows for the two probes in TestExplainParity.  The full pragmaLocate
+  table-driven dispatch is deferred until more pragma probes land. }
+type
+  TFlagPragma = record
+    name: PChar;
+    mask: u64;
+  end;
+const
+  { pragma.c PragTyp_FLAG entries (canonical mask values from sqliteInt.h
+    flag bits).  Read arm emits ((db.flags & mask) <> 0); write arm
+    sets/clears the bit at codegen time so a subsequent prepare picks up
+    the new value. }
+  cFlagPragmas: array[0..16] of TFlagPragma = (
+    (name: 'foreign_keys';             mask: SQLITE_ForeignKeys),
+    (name: 'recursive_triggers';       mask: SQLITE_RecTriggers),
+    (name: 'reverse_unordered_selects';mask: SQLITE_ReverseOrder),
+    (name: 'defer_foreign_keys';       mask: SQLITE_DeferFKs),
+    (name: 'writable_schema';          mask: SQLITE_WriteSchema),
+    (name: 'legacy_alter_table';       mask: SQLITE_LegacyAlter),
+    (name: 'cell_size_check';          mask: SQLITE_CellSizeCk),
+    (name: 'automatic_index';          mask: SQLITE_AutoIndex),
+    (name: 'full_column_names';        mask: SQLITE_FullColNames),
+    (name: 'short_column_names';       mask: SQLITE_ShortColNames),
+    (name: 'checkpoint_fullfsync';     mask: SQLITE_CkptFullFSync),
+    (name: 'fullfsync';                mask: SQLITE_FullFSync),
+    (name: 'ignore_check_constraints'; mask: SQLITE_IgnoreChecks),
+    (name: 'query_only';               mask: SQLITE_QueryOnly),
+    (name: 'count_changes';            mask: SQLITE_CountRows),
+    (name: 'read_uncommitted';         mask: SQLITE_ReadUncommit),
+    (name: 'empty_result_callbacks';   mask: SQLITE_NullCallback)
+  );
+  cFlagPragmasTrusted: TFlagPragma =
+    (name: 'trusted_schema'; mask: SQLITE_TrustedSchema);
+
+procedure sqlite3Pragma(pParse: PParse; const pId1: PToken;
+  const pId2: PToken; pValue: PToken; minusFlag: i32);
+var
+  v:        PVdbe;
+  zName:    AnsiString;
+  zRight:   AnsiString;
+  iDb:      i32;
+  iCookie:  i32;
+  iVal:     i32;
+  addrOp:   i32;
+  pBtArg:   PBtree;
+  db:       PTsqlite3;
+  i:        i32;
+  flagMask: u64;
+  bSet:     u8;
+  pName:    PPragmaName;
+  pTabA:    PTable2;
+  pIdxA:    PIndex2;
+  pColA:    PColumn;
+  pPkIdx:   PIndex2;
+  pColExpr: PExpr;
+  isHidden: i32;
+  k, mx, nHidden: i32;
+  cnum:     i16;
+  zType:    PAnsiChar;
+  pElemA:   passqlite3util.PHashElem;
+  pCollA:   ^passqlite3vdbe.TCollSeq;
+  zDfltTok: PAnsiChar;
+  pFnDef:   PTFuncDef;
+  funcType: PAnsiChar;
+  funcEnc:  PAnsiChar;
+  funcMask: u32;
+  pModA:    passqlite3vtab.PVtabModule;
+  bShowInternal: i32;
+const
+  azFuncEnc: array[0..3] of PAnsiChar = (nil, 'utf8', 'utf16le', 'utf16be');
+  azIdxOrigin: array[0..2] of PAnsiChar = ('c', 'u', 'pk');
+begin
+  if (pParse = nil) or (pId1 = nil) then Exit;
+  db := pParse^.db;
+  v := sqlite3GetVdbe(pParse);
+  if v = nil then Exit;
+
+  { Mark the prepared statement as single-use.  The PragTyp_HEADER_VALUE
+    arm later flips this OP_Expire back to OP_Noop via sqlite3VdbeReusable. }
+  sqlite3VdbeRunOnlyOnce(v);
+  pParse^.nMem := 2;
+
+  { Schema prefix not yet honoured — ignore pId2 and use the main db.
+    Sufficient for the bare `PRAGMA name` shape covered by the probes. }
+  iDb := 0;
+
+  SetString(zName, pId1^.z, pId1^.n);
+  if pValue <> nil then SetString(zRight, pValue^.z, pValue^.n) else zRight := '';
+
+  { Phase 6.12 — table-valued / introspection pragma dispatcher.  Looks the
+    pragma up in aPragmaName (Phase 6.8.0) and emits the C body verbatim
+    when ePragTyp is one of the table-valued types.  Falls through to the
+    legacy hand-rolled handler for everything else (FLAG / HEADER_VALUE /
+    ENCODING / PAGE_SIZE / CACHE_SIZE / SYNCHRONOUS / JOURNAL_MODE /
+    LOCKING_MODE / INTEGRITY_CHECK and the constant-default emitters).
+    Closing the remaining DiagPragma divergences. }
+  pName := pragmaLocate(PAnsiChar(zName));
+  if pName <> nil then case pName^.ePragTyp of
+
+    { pragma.c:1211 — PRAGMA table_info(t) / table_xinfo(t).  iArg=0 hides
+      hidden/virtual/stored columns; iArg=1 (table_xinfo) shows them. }
+    PragTyp_TABLE_INFO: if pValue <> nil then begin
+      sqlite3CodeVerifyNamedSchema(pParse, nil);
+      pTabA := sqlite3LocateTable(pParse, LOCATE_NOERR, PAnsiChar(zRight), nil);
+      if pTabA <> nil then begin
+        pPkIdx := sqlite3PrimaryKeyIndex(pTabA);
+        pParse^.nMem := 7;
+        sqlite3ViewGetColumnNames(pParse, pTabA);
+        nHidden := 0;
+        i := 0;
+        while i < pTabA^.nCol do begin
+          pColA := @PColumn(pTabA^.aCol)[i];
+          isHidden := 0;
+          if (pColA^.colFlags and COLFLAG_NOINSERT) <> 0 then begin
+            if pName^.iArg = 0 then begin
+              Inc(nHidden);
+              Inc(i);
+              Continue;
+            end;
+            if (pColA^.colFlags and COLFLAG_VIRTUAL) <> 0 then
+              isHidden := 2
+            else if (pColA^.colFlags and COLFLAG_STORED) <> 0 then
+              isHidden := 3
+            else
+              isHidden := 1;
+          end;
+          if (pColA^.colFlags and COLFLAG_PRIMKEY) = 0 then
+            k := 0
+          else if pPkIdx = nil then
+            k := 1
+          else begin
+            k := 1;
+            while (k <= pTabA^.nCol)
+                  and (Pi16(pPkIdx^.aiColumn)[k - 1] <> i) do
+              Inc(k);
+          end;
+          pColExpr := sqlite3ColumnExpr(pTabA, pColA);
+          if (isHidden >= 2) or (pColExpr = nil) then
+            zDfltTok := nil
+          else
+            zDfltTok := pColExpr^.u.zToken;
+          if pName^.iArg <> 0 then
+            sqlite3VdbeMultiLoad(v, 1, 'issisii', [
+              i - nHidden,
+              Pointer(pColA^.zCnName),
+              Pointer(sqlite3ColumnType(pColA, '')),
+              i32(pColA^.typeFlags and $0F),    { notNull bitfield: low 4 bits }
+              Pointer(zDfltTok),
+              k,
+              isHidden])
+          else
+            sqlite3VdbeMultiLoad(v, 1, 'issisi', [
+              i - nHidden,
+              Pointer(pColA^.zCnName),
+              Pointer(sqlite3ColumnType(pColA, '')),
+              i32(pColA^.typeFlags and $0F),
+              Pointer(zDfltTok),
+              k]);
+          Inc(i);
+        end;
+      end;
+      Exit;
+    end;
+
+    { pragma.c:1369 — PRAGMA index_info(idx) / index_xinfo(idx). }
+    PragTyp_INDEX_INFO: if pValue <> nil then begin
+      pIdxA := sqlite3FindIndex(db, PAnsiChar(zRight), nil);
+      if pIdxA = nil then begin
+        pTabA := sqlite3LocateTable(pParse, LOCATE_NOERR, PAnsiChar(zRight), nil);
+        if (pTabA <> nil) and (HasRowid(pTabA) = False) then
+          pIdxA := sqlite3PrimaryKeyIndex(pTabA);
+      end;
+      if pIdxA <> nil then begin
+        if pName^.iArg <> 0 then begin
+          mx := pIdxA^.nColumn;
+          pParse^.nMem := 6;
+        end else begin
+          mx := pIdxA^.nKeyCol;
+          pParse^.nMem := 3;
+        end;
+        pTabA := pIdxA^.pTable;
+        sqlite3CodeVerifySchema(pParse,
+          sqlite3SchemaToIndex(db, passqlite3util.PSchema(pIdxA^.pSchema)));
+        i := 0;
+        while i < mx do begin
+          cnum := Pi16(pIdxA^.aiColumn)[i];
+          if cnum < 0 then
+            sqlite3VdbeMultiLoad(v, 1, 'iisX', [i, cnum, nil])
+          else
+            sqlite3VdbeMultiLoad(v, 1, 'iisX', [i, cnum,
+              Pointer(PColumn(pTabA^.aCol)[cnum].zCnName)]);
+          if pName^.iArg <> 0 then
+            sqlite3VdbeMultiLoad(v, 4, 'isiX', [
+              i32(Pu8(pIdxA^.aSortOrder)[i]),
+              Pointer(PPAnsiChar(pIdxA^.azColl)[i]),
+              i32(Ord(i < pIdxA^.nKeyCol))]);
+          sqlite3VdbeAddOp2(v, OP_ResultRow, 1, pParse^.nMem);
+          Inc(i);
+        end;
+      end;
+      Exit;
+    end;
+
+    { pragma.c:1414 — PRAGMA index_list(t). }
+    PragTyp_INDEX_LIST: if pValue <> nil then begin
+      pTabA := sqlite3FindTable(db, PAnsiChar(zRight), nil);
+      if pTabA <> nil then begin
+        pParse^.nMem := 5;
+        sqlite3CodeVerifySchema(pParse,
+          sqlite3SchemaToIndex(db, passqlite3util.PSchema(pTabA^.pSchema)));
+        pIdxA := pTabA^.pIndex;
+        i := 0;
+        while pIdxA <> nil do begin
+          sqlite3VdbeMultiLoad(v, 1, 'isisi', [
+            i,
+            Pointer(pIdxA^.zName),
+            i32(Ord(pIdxA^.onError <> 0)),     { IsUniqueIndex }
+            Pointer(azIdxOrigin[pIdxA^.idxFlags and 3]),
+            i32(Ord(pIdxA^.pPartIdxWhere <> nil))]);
+          pIdxA := pIdxA^.pNext;
+          Inc(i);
+        end;
+      end;
+      Exit;
+    end;
+
+    { pragma.c:1436 — PRAGMA database_list. }
+    PragTyp_DATABASE_LIST: begin
+      pParse^.nMem := 3;
+      i := 0;
+      while i < db^.nDb do begin
+        if db^.aDb[i].pBt <> nil then begin
+          sqlite3VdbeMultiLoad(v, 1, 'iss', [
+            i,
+            Pointer(db^.aDb[i].zDbSName),
+            Pointer(sqlite3BtreeGetFilename(PBtree(db^.aDb[i].pBt)))]);
+        end;
+        Inc(i);
+      end;
+      Exit;
+    end;
+
+    { pragma.c:1450 — PRAGMA collation_list. }
+    PragTyp_COLLATION_LIST: begin
+      pParse^.nMem := 2;
+      pElemA := db^.aCollSeq.first;
+      i := 0;
+      while pElemA <> nil do begin
+        pCollA := PCollSeq(pElemA^.data);
+        sqlite3VdbeMultiLoad(v, 1, 'is', [i, Pointer(pCollA^.zName)]);
+        Inc(i);
+        pElemA := passqlite3util.PHashElem(pElemA^.next);
+      end;
+      Exit;
+    end;
+
+    { pragma.c:1462 — PRAGMA function_list.  Walks both the global built-in
+      hash and per-connection db^.aFunc. }
+    PragTyp_FUNCTION_LIST: begin
+      pParse^.nMem := 6;
+      bShowInternal := i32(Ord((db^.mDbFlags and DBFLAG_InternalFunc) <> 0));
+      if bShowInternal <> 0 then funcMask := $ffffffff
+      else
+        funcMask := SQLITE_DETERMINISTIC or SQLITE_DIRECTONLY or
+                    SQLITE_SUBTYPE or SQLITE_INNOCUOUS or SQLITE_FUNC_INTERNAL;
+      for i := 0 to SQLITE_FUNC_HASH_SZ - 1 do begin
+        pFnDef := sqlite3BuiltinFunctions.a[i];
+        while pFnDef <> nil do begin
+          if (Assigned(pFnDef^.xSFunc))
+             and ( (bShowInternal <> 0)
+                or ((pFnDef^.funcFlags and SQLITE_FUNC_INTERNAL) = 0) ) then
+          begin
+            if Assigned(pFnDef^.xValue) then funcType := 'w'
+            else if Assigned(pFnDef^.xFinalize) then funcType := 'a'
+            else funcType := 's';
+            funcEnc := azFuncEnc[pFnDef^.funcFlags and 3];
+            sqlite3VdbeMultiLoad(v, 1, 'sissii', [
+              Pointer(pFnDef^.zName),
+              i32(1),                                 { isBuiltin }
+              Pointer(funcType),
+              Pointer(funcEnc),
+              i32(pFnDef^.nArg),
+              i32((pFnDef^.funcFlags and funcMask) xor SQLITE_INNOCUOUS)]);
+          end;
+          pFnDef := PTFuncDef(pFnDef^.u);
+        end;
+      end;
+      pElemA := db^.aFunc.first;
+      while pElemA <> nil do begin
+        pFnDef := PTFuncDef(pElemA^.data);
+        if (Assigned(pFnDef^.xSFunc))
+           and ( (bShowInternal <> 0)
+              or ((pFnDef^.funcFlags and SQLITE_FUNC_INTERNAL) = 0) ) then
+        begin
+          if Assigned(pFnDef^.xValue) then funcType := 'w'
+          else if Assigned(pFnDef^.xFinalize) then funcType := 'a'
+          else funcType := 's';
+          funcEnc := azFuncEnc[pFnDef^.funcFlags and 3];
+          sqlite3VdbeMultiLoad(v, 1, 'sissii', [
+            Pointer(pFnDef^.zName),
+            i32(0),                                  { not built-in }
+            Pointer(funcType),
+            Pointer(funcEnc),
+            i32(pFnDef^.nArg),
+            i32((pFnDef^.funcFlags and funcMask) xor SQLITE_INNOCUOUS)]);
+        end;
+        pElemA := passqlite3util.PHashElem(pElemA^.next);
+      end;
+      Exit;
+    end;
+
+    { pragma.c:1483 — PRAGMA module_list. }
+    PragTyp_MODULE_LIST: begin
+      pParse^.nMem := 1;
+      pElemA := db^.aModule.first;
+      while pElemA <> nil do begin
+        pModA := passqlite3vtab.PVtabModule(pElemA^.data);
+        sqlite3VdbeMultiLoad(v, 1, 's', [Pointer(pModA^.zName)]);
+        pElemA := passqlite3util.PHashElem(pElemA^.next);
+      end;
+      Exit;
+    end;
+
+    { pragma.c:1494 — PRAGMA pragma_list.  Iterates aPragmaName ported in
+      Phase 6.8.0. }
+    PragTyp_PRAGMA_LIST: begin
+      pParse^.nMem := 1;
+      for i := Low(aPragmaName) to High(aPragmaName) do
+        sqlite3VdbeMultiLoad(v, 1, 's', [Pointer(aPragmaName[i].zName)]);
+      Exit;
+    end;
+
+    { pragma.c:2374 — PRAGMA compile_options.  In our build
+      sqlite3azCompileOpt is empty (main.pas:2833), so the loop emits no
+      rows.  This still flips the divergence from "table not found" to
+      "0 rows" (i.e. count(*) = 0 vs C's count(*) >= 1) — closing it
+      end-to-end requires populating the option list, which is a
+      separate small fix. }
+    PragTyp_COMPILE_OPTIONS: begin
+      pParse^.nMem := 1;
+      sqlite3VdbeReusable(v);
+      Exit;
+    end;
+  end;
+
+  { PragTyp_FLAG — pragma.c (generic boolean-flag arm).  Read emits
+    `(db^.flags and mask) <> 0` as a single int row.  Write parses the
+    boolean rhs and updates db^.flags directly at codegen time, matching
+    the C body. }
+  flagMask := 0;
+  for i := Low(cFlagPragmas) to High(cFlagPragmas) do
+    if SameText(zName, cFlagPragmas[i].name) then begin
+      flagMask := cFlagPragmas[i].mask;
+      Break;
+    end;
+  if (flagMask = 0) and SameText(zName, cFlagPragmasTrusted.name) then
+    flagMask := cFlagPragmasTrusted.mask;
+  if flagMask <> 0 then begin
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      bSet := sqlite3GetBoolean(PChar(zRight), 0);
+      if bSet <> 0 then
+        db^.flags := db^.flags or flagMask
+      else
+        db^.flags := db^.flags and (not flagMask);
+    end else begin
+      if (db^.flags and flagMask) <> 0 then iVal := 1 else iVal := 0;
+      sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+      sqlite3VdbeReusable(v);
+    end;
+    Exit;
+  end;
+
+  { PragTyp_HEADER_VALUE — pragma.c:2324.  Reads/writes a 4-byte slot in
+    the database file header.  user_version is iCookie=BTREE_USER_VERSION,
+    application_id is iCookie=BTREE_APPLICATION_ID, data_version is
+    iCookie=BTREE_DATA_VERSION (virtual meta-value, ReadOnly). }
+  if SameText(zName, 'user_version') or SameText(zName, 'application_id')
+     or SameText(zName, 'data_version') then
+  begin
+    if SameText(zName, 'user_version') then
+      iCookie := BTREE_USER_VERSION
+    else if SameText(zName, 'data_version') then
+      iCookie := BTREE_DATA_VERSION
+    else
+      iCookie := BTREE_APPLICATION_ID;
+    sqlite3VdbeUsesBtree(v, iDb);
+    if (pValue <> nil) and (iCookie <> BTREE_DATA_VERSION) then begin
+      { Write arm — Transaction(write) + SetCookie(P5=1).  data_version
+        is ReadOnly per pragma.h flags so writes silently no-op. }
+      SetString(zRight, pValue^.z, pValue^.n);
+      sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 1, 0);
+      addrOp := sqlite3VdbeAddOp3(v, OP_SetCookie, iDb, iCookie,
+                                  sqlite3Atoi(PChar(zRight)));
+      sqlite3VdbeChangeP5(v, 1);
+      if addrOp = 0 then ;
+    end else if pValue = nil then begin
+      { Read arm. }
+      sqlite3VdbeAddOp3(v, OP_Transaction, iDb, 0, 0);
+      sqlite3VdbeAddOp3(v, OP_ReadCookie,  iDb, 1, iCookie);
+      sqlite3VdbeAddOp2(v, OP_ResultRow,   1,   1);
+      sqlite3VdbeReusable(v);
+    end;
+    Exit;
+  end;
+
+  if SameText(zName, 'encoding') and (pValue = nil) then begin
+    { PragTyp_ENCODING read arm (pragma.c:2261).  The Pas port runs UTF-8
+      only today, so emit the literal name unconditionally. }
+    if sqlite3ReadSchema(pParse) <> SQLITE_OK then Exit;
+    sqlite3VdbeLoadString(v, 1, 'UTF-8');
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    Exit;
+  end;
+
+  { PragTyp_PAGE_SIZE read arm (pragma.c:598).  Page size is fixed at
+    open time so capture at codegen via sqlite3BtreeGetPageSize. }
+  if SameText(zName, 'page_size') and (pValue = nil) then begin
+    pBtArg := PBtree(db^.aDb[iDb].pBt);
+    if pBtArg <> nil then
+      iVal := sqlite3BtreeGetPageSize(pBtArg)
+    else
+      iVal := 0;
+    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    Exit;
+  end;
+
+  { PragTyp_CACHE_SIZE read arm (pragma.c:882).  Default is
+    SQLITE_DEFAULT_CACHE_SIZE (-2000); C populates Schema.cache_size in
+    sqlite3InitOne (prepare.c:323) which is not yet ported, so a 0 here
+    means "uninitialised" and we substitute the default — matching the
+    fallback at prepare.c:326. }
+  if SameText(zName, 'cache_size') and (pValue = nil) then begin
+    if (db^.aDb[iDb].pSchema <> nil)
+       and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
+      iVal := db^.aDb[iDb].pSchema^.cache_size
+    else
+      iVal := SQLITE_DEFAULT_CACHE_SIZE;
+    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    Exit;
+  end;
+
+  { PragTyp_CACHE_SPILL read arm (pragma.c:916).  Returns 0 when
+    SQLITE_CacheSpill is off; otherwise the effective spill threshold
+    via sqlite3BtreeSetSpillSize(...,0).  Note: in C the pager's pcache
+    receives the schema cache_size via the prepare path; the Pas port
+    does not currently propagate that wiring, so seed the pcache here
+    on demand (matches the value the C oracle would see). }
+  if SameText(zName, 'cache_spill') and (pValue = nil) then begin
+    if (db^.flags and SQLITE_CacheSpill) = 0 then
+      iVal := 0
+    else begin
+      pBtArg := PBtree(db^.aDb[iDb].pBt);
+      if pBtArg <> nil then begin
+        if (db^.aDb[iDb].pSchema <> nil)
+           and (db^.aDb[iDb].pSchema^.cache_size <> 0) then
+          sqlite3BtreeSetCacheSize(pBtArg,
+            db^.aDb[iDb].pSchema^.cache_size)
+        else
+          sqlite3BtreeSetCacheSize(pBtArg, SQLITE_DEFAULT_CACHE_SIZE);
+        iVal := sqlite3BtreeSetSpillSize(pBtArg, 0);
+      end else
+        iVal := 0;
+    end;
+    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    Exit;
+  end;
+
+  { PragTyp_SYNCHRONOUS read arm (pragma.c:1132). }
+  if SameText(zName, 'synchronous') and (pValue = nil) then begin
+    iVal := i32(db^.aDb[iDb].safety_level) - 1;
+    sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+    Exit;
+  end;
+
+  { Constant-default integer pragmas — emit OP_Integer with the documented
+    default value.  These do not yet maintain real per-connection state in
+    the Pas port; reading the *default* matches the C reference so the
+    DiagPragma probe sees parity.  Writes are silent no-ops (the value is
+    not preserved), matching the pre-port behaviour. }
+  if pValue = nil then begin
+    iVal := MaxInt; { sentinel "not handled" }
+    if      SameText(zName, 'secure_delete')      then iVal := 0
+    else if SameText(zName, 'temp_store')         then iVal := 0
+    else if SameText(zName, 'threads')            then iVal := 0
+    else if SameText(zName, 'soft_heap_limit')    then iVal := 0
+    else if SameText(zName, 'hard_heap_limit')    then iVal := 0
+    else if SameText(zName, 'busy_timeout')       then iVal := 0
+    else if SameText(zName, 'analysis_limit')     then iVal := 0
+    else if SameText(zName, 'wal_autocheckpoint') then iVal := 1000
+    else if SameText(zName, 'journal_size_limit') then iVal := -1
+    else if SameText(zName, 'auto_vacuum')        then iVal := 0
+    else if SameText(zName, 'freelist_count')     then iVal := 0
+    else if SameText(zName, 'schema_version')     then iVal := 0;
+    if iVal <> MaxInt then begin
+      sqlite3VdbeAddOp2(v, OP_Integer,   iVal, 1);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, 1,    1);
+      sqlite3VdbeReusable(v);
+      Exit;
+    end;
+  end;
+
+  { max_page_count default — pragma.c:1042.  OP_MaxPgcnt with P3=0 reads
+    the current limit (default 4294967294 = 0xFFFFFFFE on a fresh memory
+    db).  Yields i64 in result Mem so column_int truncates to -2 and
+    column_text renders "4294967294" via %lld — matching the C oracle. }
+  if SameText(zName, 'max_page_count') and (pValue = nil) then begin
+    sqlite3VdbeUsesBtree(v, iDb);
+    sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, 0);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
+
+  { Constant-default string pragmas — pragma.c PragTyp_JOURNAL_MODE /
+    PragTyp_LOCKING_MODE.  In-memory db default journal_mode is "memory"
+    and locking_mode is "normal"; the Pas port does not maintain these
+    settings yet so emit the default text literal.  Both read AND write
+    forms must emit a result row: C's PragTyp_JOURNAL_MODE / _LOCKING_MODE
+    always end with `OP_ResultRow` carrying the (possibly updated) current
+    mode (pragma.c:770 / pragma.c:725). }
+  if SameText(zName, 'journal_mode') then begin
+    { memdb's pager rejects any non-"memory" mode, so the result is
+      always "memory" regardless of zRight.  Matches C's
+      sqlite3PagerJournalMode(...) outcome on memdb. }
+    sqlite3VdbeLoadString(v, 1, 'memory');
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
+  if SameText(zName, 'locking_mode') then begin
+    if pValue <> nil then begin
+      SetString(zRight, pValue^.z, pValue^.n);
+      if SameText(zRight, 'exclusive') then
+        sqlite3VdbeLoadString(v, 1, 'exclusive')
+      else
+        sqlite3VdbeLoadString(v, 1, 'normal');
+    end else
+      sqlite3VdbeLoadString(v, 1, 'normal');
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
+
+  { PragTyp_INTEGRITY_CHECK / quick_check (pragma.c:1695).  The full C body
+    walks every btree page and emits an error row per corruption; on a
+    clean database it emits the literal string "ok".  The Pas port has no
+    real integrity walker yet (OP_IntegrityCk is a stub that sets the
+    output register to NULL — see vdbe.pas), so the result on any db this
+    port produced is "ok" by construction.  Emit that directly to match
+    the C oracle's clean-db output and unblock the DiagPragma probe. }
+  if SameText(zName, 'integrity_check') or SameText(zName, 'quick_check') then
+  begin
+    sqlite3VdbeLoadString(v, 1, 'ok');
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
+end;
+
+// ===========================================================================
+// Phase 6.8.0 — pragma vtab module (pragma.c:2791..3101)
+// ===========================================================================
+//
+// Eponymous virtual tables for pragma_* introspection (e.g.
+// SELECT * FROM pragma_table_info('t')).  Each pragma_NAME table is registered
+// on first lookup via sqlite3PragmaVtabRegister, which installs the shared
+// pragmaVtabModule with the matching PragmaName entry as pAux.  At xFilter
+// time the module synthesises "PRAGMA name(arg)" SQL, prepares it via
+// sqlite3_prepare_v2, and feeds the resulting rows back through xColumn.
+//
+// The aPragmaName / pragCName tables and pragmaLocate live higher up in
+// the file (immediately before sqlite3Pragma) so the 6.12 dispatcher can
+// see them.  Below: just the vtab cursor records, the shared module
+// struct, and the 12 callbacks.
+
+{ TPragmaName / PragTyp_* / PragFlg_* / cPragName / aPragmaName /
+  pragmaLocate now live earlier in the file (just above sqlite3Pragma)
+  so the 6.12 dispatcher can use them.  Search for "Phase 6.8.0 / 6.12 —
+  pragma name table" for the data block. }
+
+
+
 type
   PPragmaVtab = ^TPragmaVtab;
   TPragmaVtab = record
@@ -30444,20 +30755,6 @@ type
 
 var
   pragmaVtabModule: passqlite3vtab.Tsqlite3_module;
-
-{ pragma.h sentinel — locate PragmaName by bare name (no "pragma_" prefix).
-  C uses bsearch on the sorted aPragmaName[]; we use a linear scan since
-  the table has only ~60 entries and this fires once per pragma_NAME parse. }
-function pragmaLocate(zName: PAnsiChar): PPragmaName;
-var
-  i: i32;
-begin
-  for i := Low(aPragmaName) to High(aPragmaName) do
-    if sqlite3_stricmp(zName, aPragmaName[i].zName) = 0 then begin
-      Result := @aPragmaName[i]; Exit;
-    end;
-  Result := nil;
-end;
 
 { pragma.c:2815 — xConnect.  Build a CREATE TABLE declaration from the
   PragmaName column-name slice and pass it to sqlite3_declare_vtab. }

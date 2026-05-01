@@ -438,14 +438,25 @@ skeleton.
         because `destroyRootPage` calls `sqlite3NestedParse(UPDATE
         sqlite_schema ...)` and productive `sqlite3Update` is still
         skeleton-only.  This is the only remaining contributor.
-  [ ] **6.12** port sqlite3Pragma in full.  Regression gate
+  [~] **6.12** port sqlite3Pragma in full.  Regression gate
        `src/tests/DiagPragma.pas`.  Baseline 49 DIVERGE driven to 10.
-       Remaining divergences (10): table-valued pragma_* introspection
-       functions (table_info, table_xinfo, index_list, foreign_key_list,
-       database_list, collation_list, function_list, module_list,
-       pragma_list, compile_options).  Closing these requires
-       `sqlite3PragmaVtabRegister` (Phase 6.8) + full table-driven
-       `pragmaLocate` dispatch.
+       Partial 2026-05-01: table-valued PragTyp dispatcher landed
+       (TABLE_INFO / INDEX_INFO / INDEX_LIST / DATABASE_LIST /
+       COLLATION_LIST / FUNCTION_LIST / MODULE_LIST / PRAGMA_LIST /
+       COMPILE_OPTIONS) — direct invocation works end-to-end (e.g.
+       `PRAGMA pragma_list` returns the expected 66 rows).
+       FOREIGN_KEY_LIST blocked on TFKey opaque (PFKey = Pointer,
+       codegen.pas:418); TABLE_LIST deferred.  The 10 DiagPragma
+       divergences DO NOT close: the underlying codegen now emits the
+       correct rows, but the eponymous-vtab path
+       (`SELECT count(*) FROM pragma_table_info('t')`) emits only
+       `Init/Halt/Goto` — same root cause as 6.10 step 9(c) view
+       materialisation, the SELECT codegen does not traverse
+       non-regular FROM items.  Closing the gate now requires the
+       sub-FROM materialise / eponymous-vtab traversal arm in
+       sqlite3Select (6.10 step 6 sub-FROM entry + step 9(c)), not
+       further Pragma work.  COMPILE_OPTIONS additionally needs
+       `sqlite3azCompileOpt` populated in main.pas:2833.
        Side-fix 2026-04-29: `PRAGMA journal_mode=X` /
        `PRAGMA locking_mode=X` write arms now emit a result row matching
        C (memdb effective-mode echo); `PRAGMA integrity_check` /
