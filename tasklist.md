@@ -34,22 +34,25 @@ Suggested order (driven by call-graph dependencies, not numbering): 6.8.0
 Landing 6.8.1 before 6.8.2/6.8.3/6.8.4/6.8.5 just produces another
 skeleton.
 
-- [ ] **6.8.0** Pragma (pragma.c): `sqlite3PragmaVtabRegister` — currently
-     returns `nil`; must register the `pragma_*` eponymous virtual tables
-     via `sqlite3VtabCreateModule` + `pragmaVtabModule`.
-     Gate: DiagPragma (closes the remaining 10 table-valued
-     `pragma_table_info` / `pragma_index_list` / `pragma_foreign_key_list`
-     / etc. divergences listed in 6.12).
-     [ ] Port `pragmaVtabModule` table (xConnect/xBestIndex/xOpen/
-          xClose/xFilter/xNext/xEof/xColumn/xRowid).
-     [ ] Port `pragmaVtabConnect` — synthesises the CREATE TABLE
-          declaration from `pragName` + the pragma column list.
-     [ ] Port `pragmaVtabBestIndex` — translates the schema-name and
-          argument constraints into the xFilter contract.
-     [ ] Port `pragmaVtabFilter` — runs the underlying `PRAGMA …` and
-          captures rows into the cursor.
-     [ ] Wire registration from `sqlite3Pragma` so each table-valued
-          pragma is auto-registered on first use.
+- [X] **6.8.0** Pragma (pragma.c): `sqlite3PragmaVtabRegister` — DONE
+     2026-05-01.  Stub at codegen.pas:30145 replaced with full 1:1 port of
+     pragma.c:2791..3101: aPragmaName table (66 entries from
+     ../sqlite3/pragma.h, OMIT-guarded rows excluded), pragCName column-
+     name pool, pragmaLocate, all 12 vtab callbacks (xConnect /
+     xDisconnect / xBestIndex / xOpen / xClose / xNext / xFilter / xEof
+     / xColumn / xRowid + cursor-clear helper), pragmaVtabModule struct
+     wired in initialization.  sqlite3LocateTable updated to call
+     PragmaVtabRegister + sqlite3VtabEponymousTableInit on `pragma_*`
+     lookups (build.c:427..451 arm).  Required gPrepareV2 trampoline in
+     vdbe.pas (codegen↔main is circular).  Verified: DiagPragma 10 rows
+     for `pragma_table_info` etc. flip from prepare-fail to prep=0
+     (table reachable, queries cleanly), no row data because the
+     underlying PRAGMA codegen arms (TABLE_INFO, INDEX_LIST,
+     FOREIGN_KEY_LIST, DATABASE_LIST, COLLATION_LIST, FUNCTION_LIST,
+     MODULE_LIST, PRAGMA_LIST, COMPILE_OPTIONS) remain stubs in
+     sqlite3Pragma — that's gap 6.12.  TestExplainParity 1016/1026
+     unchanged; DiagFeatureProbe 9 unchanged; TestDMLBasic 54/0;
+     TestSchemaBasic 44/0.
 
 - [ ] **6.8.2** port `sqlite3GenerateConstraintChecks` (insert.c).
      Gate: DiagDml + DiagTxn — closes 6.10 step 6 (autoindex INSERT,

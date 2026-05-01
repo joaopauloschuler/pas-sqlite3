@@ -1520,6 +1520,9 @@ type
                                 enc: u8; affinity: u8;
                                 out ppVal: Psqlite3_value): i32;
   TKeyInfoUnrefFn    = procedure(p: Pointer);
+  TPrepareV2Fn       = function(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+                                ppStmt: PPointer;
+                                pzTail: PPointer): i32; cdecl;
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
@@ -1540,6 +1543,11 @@ var
                                                  needs PExpr layout. }
   gKeyInfoUnref:           TKeyInfoUnrefFn;  { wired by passqlite3codegen —
                                                 releases per-BtShared KeyInfo cache. }
+  gPrepareV2:              TPrepareV2Fn;     { wired by passqlite3main — used
+                                                by pragmaVtab xFilter to prepare
+                                                the synthesised "PRAGMA name(arg)"
+                                                statement.  Codegen cannot import
+                                                main directly (circular). }
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);

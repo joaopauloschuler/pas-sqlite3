@@ -24408,9 +24408,10 @@ end;
 function sqlite3LocateTable(pParse: PParse; flags: u32;
   zName: PAnsiChar; zDbase: PAnsiChar): PTable2;
 var
-  db: PTsqlite3;
-  p: PTable2;
+  db:   PTsqlite3;
+  p:    PTable2;
   zMsg: PAnsiChar;
+  pMod: passqlite3vtab.PVtabModule;
 begin
   db := pParse^.db;
   if (db^.mDbFlags and DBFLAG_SchemaKnownOk) = 0 then begin
@@ -24420,6 +24421,25 @@ begin
   end;
   p := sqlite3FindTable(db, zName, zDbase);
   if p = nil then begin
+    { build.c:427..451 — eponymous-vtab arm.  When the name resolves to no
+      schema table and "pragma_*" matches, register the pragma module on
+      demand and ask sqlite3VtabEponymousTableInit to synthesize a Table*
+      pointing at it.  The SQLITE_PREPARE_NO_VTAB / init.busy guards match
+      C; without them, schema-load reentry would attempt to register vtabs
+      while the schema hash is half-populated. }
+    if ((pParse^.prepFlags and $04 {SQLITE_PREPARE_NO_VTAB}) = 0)
+       and (db^.init.busy = 0) then
+    begin
+      pMod := passqlite3vtab.PVtabModule(
+        passqlite3util.sqlite3HashFind(@db^.aModule, PChar(zName)));
+      if (pMod = nil) and (sqlite3_strnicmp(zName, 'pragma_', 7) = 0) then
+        pMod := passqlite3vtab.PVtabModule(sqlite3PragmaVtabRegister(db, zName));
+      if (pMod <> nil) and
+         (passqlite3vtab.sqlite3VtabEponymousTableInit(pParse, pMod) <> 0) then
+      begin
+        Result := PTable2(pMod^.pEpoTab); Exit;
+      end;
+    end;
     if (flags and LOCATE_NOERR) <> 0 then begin
       Result := nil; Exit;
     end;
@@ -30142,9 +30162,593 @@ begin
   end;
 end;
 
-function sqlite3PragmaVtabRegister(db: PTsqlite3; zName: PAnsiChar): Pointer;
+// ===========================================================================
+// Phase 6.8.0 — pragma vtab module (pragma.c:2791..3101)
+// ===========================================================================
+//
+// Eponymous virtual tables for pragma_* introspection (e.g.
+// SELECT * FROM pragma_table_info('t')).  Each pragma_NAME table is registered
+// on first lookup via sqlite3PragmaVtabRegister, which installs the shared
+// pragmaVtabModule with the matching PragmaName entry as pAux.  At xFilter
+// time the module synthesises "PRAGMA name(arg)" SQL, prepares it via
+// sqlite3_prepare_v2, and feeds the resulting rows back through xColumn.
+//
+// Faithful 1:1 of the C block.  PragmaName table is the upstream
+// generated `aPragmaName[]` from ../sqlite3/pragma.h with the OMIT-guarded
+// rows excluded per our build (no CEROD, no Win32, no LOCKING_STYLE, no
+// DEBUG/TEST entries).
+
+type
+  PPragmaName = ^TPragmaName;
+  TPragmaName = record
+    zName:      PAnsiChar;
+    ePragTyp:   u8;
+    mPragFlg:   u8;
+    iPragCName: u8;
+    nPragCName: u8;
+    iArg:       u64;
+  end;
+
+const
+  { Pragma type tags — pragma.h:8..52.  Numeric values match upstream so
+    this table can be diffed against the C reference. }
+  PragTyp_ACTIVATE_EXTENSIONS  = 0;
+  PragTyp_ANALYSIS_LIMIT       = 1;
+  PragTyp_HEADER_VALUE         = 2;
+  PragTyp_AUTO_VACUUM          = 3;
+  PragTyp_FLAG                 = 4;
+  PragTyp_BUSY_TIMEOUT         = 5;
+  PragTyp_CACHE_SIZE           = 6;
+  PragTyp_CACHE_SPILL          = 7;
+  PragTyp_CASE_SENSITIVE_LIKE  = 8;
+  PragTyp_COLLATION_LIST       = 9;
+  PragTyp_COMPILE_OPTIONS      = 10;
+  PragTyp_DATA_STORE_DIRECTORY = 11;
+  PragTyp_DATABASE_LIST        = 12;
+  PragTyp_DEFAULT_CACHE_SIZE   = 13;
+  PragTyp_ENCODING             = 14;
+  PragTyp_FOREIGN_KEY_CHECK    = 15;
+  PragTyp_FOREIGN_KEY_LIST     = 16;
+  PragTyp_FUNCTION_LIST        = 17;
+  PragTyp_HARD_HEAP_LIMIT      = 18;
+  PragTyp_INCREMENTAL_VACUUM   = 19;
+  PragTyp_INDEX_INFO           = 20;
+  PragTyp_INDEX_LIST           = 21;
+  PragTyp_INTEGRITY_CHECK      = 22;
+  PragTyp_JOURNAL_MODE         = 23;
+  PragTyp_JOURNAL_SIZE_LIMIT   = 24;
+  PragTyp_LOCK_PROXY_FILE      = 25;
+  PragTyp_LOCKING_MODE         = 26;
+  PragTyp_PAGE_COUNT           = 27;
+  PragTyp_MMAP_SIZE            = 28;
+  PragTyp_MODULE_LIST          = 29;
+  PragTyp_OPTIMIZE             = 30;
+  PragTyp_PAGE_SIZE            = 31;
+  PragTyp_PRAGMA_LIST          = 32;
+  PragTyp_SECURE_DELETE        = 33;
+  PragTyp_SHRINK_MEMORY        = 34;
+  PragTyp_SOFT_HEAP_LIMIT      = 35;
+  PragTyp_SYNCHRONOUS          = 36;
+  PragTyp_TABLE_INFO           = 37;
+  PragTyp_TABLE_LIST           = 38;
+  PragTyp_TEMP_STORE           = 39;
+  PragTyp_TEMP_STORE_DIRECTORY = 40;
+  PragTyp_THREADS              = 41;
+  PragTyp_WAL_AUTOCHECKPOINT   = 42;
+  PragTyp_WAL_CHECKPOINT       = 43;
+  PragTyp_LOCK_STATUS          = 44;
+  PragTyp_STATS                = 45;
+
+  { Pragma property flags — pragma.h:55..62. }
+  PragFlg_NeedSchema = $01;
+  PragFlg_NoColumns  = $02;
+  PragFlg_NoColumns1 = $04;
+  PragFlg_ReadOnly   = $08;
+  PragFlg_Result0    = $10;
+  PragFlg_Result1    = $20;
+  PragFlg_SchemaOpt  = $40;
+  PragFlg_SchemaReq  = $80;
+
+  { pragCName[] — pragma.h:64..198.  Column-name pool indexed by
+    PragmaName.iPragCName.  Faithful 1:1; do not renumber. }
+  cPragName: array[0..56] of PAnsiChar = (
+    {  0 } 'id',           {  1 } 'seq',         {  2 } 'table',
+    {  3 } 'from',         {  4 } 'to',          {  5 } 'on_update',
+    {  6 } 'on_delete',    {  7 } 'match',
+    {  8 } 'cid',          {  9 } 'name',        { 10 } 'type',
+    { 11 } 'notnull',      { 12 } 'dflt_value',  { 13 } 'pk',
+    { 14 } 'hidden',
+    { 15 } 'name',         { 16 } 'builtin',     { 17 } 'type',
+    { 18 } 'enc',          { 19 } 'narg',        { 20 } 'flags',
+    { 21 } 'schema',       { 22 } 'name',        { 23 } 'type',
+    { 24 } 'ncol',         { 25 } 'wr',          { 26 } 'strict',
+    { 27 } 'seqno',        { 28 } 'cid',         { 29 } 'name',
+    { 30 } 'desc',         { 31 } 'coll',        { 32 } 'key',
+    { 33 } 'seq',          { 34 } 'name',        { 35 } 'unique',
+    { 36 } 'origin',       { 37 } 'partial',
+    { 38 } 'tbl',          { 39 } 'idx',         { 40 } 'wdth',
+    { 41 } 'hght',         { 42 } 'flgs',
+    { 43 } 'table',        { 44 } 'rowid',       { 45 } 'parent',
+    { 46 } 'fkid',
+    { 47 } 'busy',         { 48 } 'log',         { 49 } 'checkpointed',
+    { 50 } 'seq',          { 51 } 'name',        { 52 } 'file',
+    { 53 } 'database',     { 54 } 'status',
+    { 55 } 'cache_size',
+    { 56 } 'timeout'
+  );
+
+  { aPragmaName[] — pragma.h:206..595.  Sorted alphabetically; pragmaLocate
+    relies on this order.  OMIT-guarded rows excluded for our build:
+    activate_extensions (CEROD), data_store_directory (Win32),
+    lock_proxy_file (LOCKING_STYLE), lock_status / parser_trace / sql_trace
+    / stats / vdbe_* (DEBUG/TEST only). }
+  aPragmaName: array[0..65] of TPragmaName = (
+    (zName: 'analysis_limit';            ePragTyp: PragTyp_ANALYSIS_LIMIT;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'application_id';            ePragTyp: PragTyp_HEADER_VALUE;
+     mPragFlg: PragFlg_NoColumns1 or PragFlg_Result0;                                 iPragCName:  0; nPragCName: 0; iArg: BTREE_APPLICATION_ID),
+    (zName: 'auto_vacuum';               ePragTyp: PragTyp_AUTO_VACUUM;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_SchemaReq or PragFlg_NoColumns1;
+                                                                                      iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'automatic_index';           ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_AutoIndex),
+    (zName: 'busy_timeout';              ePragTyp: PragTyp_BUSY_TIMEOUT;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName: 56; nPragCName: 1; iArg: 0),
+    (zName: 'cache_size';                ePragTyp: PragTyp_CACHE_SIZE;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_SchemaReq or PragFlg_NoColumns1;
+                                                                                      iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'cache_spill';               ePragTyp: PragTyp_CACHE_SPILL;
+     mPragFlg: PragFlg_Result0 or PragFlg_SchemaReq or PragFlg_NoColumns1;            iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'case_sensitive_like';       ePragTyp: PragTyp_CASE_SENSITIVE_LIKE;
+     mPragFlg: PragFlg_NoColumns;                                                     iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'cell_size_check';           ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_CellSizeCk),
+    (zName: 'checkpoint_fullfsync';      ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_CkptFullFSync),
+    (zName: 'collation_list';            ePragTyp: PragTyp_COLLATION_LIST;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName: 33; nPragCName: 2; iArg: 0),
+    (zName: 'compile_options';           ePragTyp: PragTyp_COMPILE_OPTIONS;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'count_changes';             ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_CountRows),
+    (zName: 'data_version';              ePragTyp: PragTyp_HEADER_VALUE;
+     mPragFlg: PragFlg_ReadOnly or PragFlg_Result0;                                   iPragCName:  0; nPragCName: 0; iArg: BTREE_DATA_VERSION),
+    (zName: 'database_list';             ePragTyp: PragTyp_DATABASE_LIST;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName: 50; nPragCName: 3; iArg: 0),
+    (zName: 'default_cache_size';        ePragTyp: PragTyp_DEFAULT_CACHE_SIZE;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_SchemaReq or PragFlg_NoColumns1;
+                                                                                      iPragCName: 55; nPragCName: 1; iArg: 0),
+    (zName: 'defer_foreign_keys';        ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_DeferFKs),
+    (zName: 'empty_result_callbacks';    ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_NullCallback),
+    (zName: 'encoding';                  ePragTyp: PragTyp_ENCODING;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'foreign_key_check';         ePragTyp: PragTyp_FOREIGN_KEY_CHECK;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_Result1 or PragFlg_SchemaOpt;
+                                                                                      iPragCName: 43; nPragCName: 4; iArg: 0),
+    (zName: 'foreign_key_list';          ePragTyp: PragTyp_FOREIGN_KEY_LIST;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result1 or PragFlg_SchemaOpt;            iPragCName:  0; nPragCName: 8; iArg: 0),
+    (zName: 'foreign_keys';              ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_ForeignKeys),
+    (zName: 'freelist_count';            ePragTyp: PragTyp_HEADER_VALUE;
+     mPragFlg: PragFlg_ReadOnly or PragFlg_Result0;                                   iPragCName:  0; nPragCName: 0; iArg: BTREE_FREE_PAGE_COUNT),
+    (zName: 'full_column_names';         ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_FullColNames),
+    (zName: 'fullfsync';                 ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_FullFSync),
+    (zName: 'function_list';             ePragTyp: PragTyp_FUNCTION_LIST;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName: 15; nPragCName: 6; iArg: 0),
+    (zName: 'hard_heap_limit';           ePragTyp: PragTyp_HARD_HEAP_LIMIT;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'ignore_check_constraints';  ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_IgnoreChecks),
+    (zName: 'incremental_vacuum';        ePragTyp: PragTyp_INCREMENTAL_VACUUM;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_NoColumns;                               iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'index_info';                ePragTyp: PragTyp_INDEX_INFO;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result1 or PragFlg_SchemaOpt;            iPragCName: 27; nPragCName: 3; iArg: 0),
+    (zName: 'index_list';                ePragTyp: PragTyp_INDEX_LIST;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result1 or PragFlg_SchemaOpt;            iPragCName: 33; nPragCName: 5; iArg: 0),
+    (zName: 'index_xinfo';               ePragTyp: PragTyp_INDEX_INFO;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result1 or PragFlg_SchemaOpt;            iPragCName: 27; nPragCName: 6; iArg: 1),
+    (zName: 'integrity_check';           ePragTyp: PragTyp_INTEGRITY_CHECK;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_Result1 or PragFlg_SchemaOpt;
+                                                                                      iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'journal_mode';              ePragTyp: PragTyp_JOURNAL_MODE;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_SchemaReq;            iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'journal_size_limit';        ePragTyp: PragTyp_JOURNAL_SIZE_LIMIT;
+     mPragFlg: PragFlg_Result0 or PragFlg_SchemaReq;                                  iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'legacy_alter_table';        ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_LegacyAlter),
+    (zName: 'locking_mode';              ePragTyp: PragTyp_LOCKING_MODE;
+     mPragFlg: PragFlg_Result0 or PragFlg_SchemaReq;                                  iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'max_page_count';            ePragTyp: PragTyp_PAGE_COUNT;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_SchemaReq;            iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'mmap_size';                 ePragTyp: PragTyp_MMAP_SIZE;
+     mPragFlg: 0;                                                                     iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'module_list';               ePragTyp: PragTyp_MODULE_LIST;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName:  9; nPragCName: 1; iArg: 0),
+    (zName: 'optimize';                  ePragTyp: PragTyp_OPTIMIZE;
+     mPragFlg: PragFlg_Result1 or PragFlg_NeedSchema;                                 iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'page_count';                ePragTyp: PragTyp_PAGE_COUNT;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_SchemaReq;            iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'page_size';                 ePragTyp: PragTyp_PAGE_SIZE;
+     mPragFlg: PragFlg_Result0 or PragFlg_SchemaReq or PragFlg_NoColumns1;            iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'pragma_list';               ePragTyp: PragTyp_PRAGMA_LIST;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName:  9; nPragCName: 1; iArg: 0),
+    (zName: 'query_only';                ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_QueryOnly),
+    (zName: 'quick_check';               ePragTyp: PragTyp_INTEGRITY_CHECK;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_Result1 or PragFlg_SchemaOpt;
+                                                                                      iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'read_uncommitted';          ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_ReadUncommit),
+    (zName: 'recursive_triggers';        ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_RecTriggers),
+    (zName: 'reverse_unordered_selects'; ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_ReverseOrder),
+    (zName: 'schema_version';            ePragTyp: PragTyp_HEADER_VALUE;
+     mPragFlg: PragFlg_NoColumns1 or PragFlg_Result0;                                 iPragCName:  0; nPragCName: 0; iArg: BTREE_SCHEMA_VERSION),
+    (zName: 'secure_delete';             ePragTyp: PragTyp_SECURE_DELETE;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'short_column_names';        ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_ShortColNames),
+    (zName: 'shrink_memory';             ePragTyp: PragTyp_SHRINK_MEMORY;
+     mPragFlg: PragFlg_NoColumns;                                                     iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'soft_heap_limit';           ePragTyp: PragTyp_SOFT_HEAP_LIMIT;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'synchronous';               ePragTyp: PragTyp_SYNCHRONOUS;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result0 or PragFlg_SchemaReq or PragFlg_NoColumns1;
+                                                                                      iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'table_info';                ePragTyp: PragTyp_TABLE_INFO;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result1 or PragFlg_SchemaOpt;            iPragCName:  8; nPragCName: 6; iArg: 0),
+    (zName: 'table_list';                ePragTyp: PragTyp_TABLE_LIST;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result1;                                 iPragCName: 21; nPragCName: 6; iArg: 0),
+    (zName: 'table_xinfo';               ePragTyp: PragTyp_TABLE_INFO;
+     mPragFlg: PragFlg_NeedSchema or PragFlg_Result1 or PragFlg_SchemaOpt;            iPragCName:  8; nPragCName: 7; iArg: 1),
+    (zName: 'temp_store';                ePragTyp: PragTyp_TEMP_STORE;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'temp_store_directory';      ePragTyp: PragTyp_TEMP_STORE_DIRECTORY;
+     mPragFlg: PragFlg_NoColumns1;                                                    iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'threads';                   ePragTyp: PragTyp_THREADS;
+     mPragFlg: PragFlg_Result0;                                                       iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'trusted_schema';            ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_TrustedSchema),
+    (zName: 'user_version';              ePragTyp: PragTyp_HEADER_VALUE;
+     mPragFlg: PragFlg_NoColumns1 or PragFlg_Result0;                                 iPragCName:  0; nPragCName: 0; iArg: BTREE_USER_VERSION),
+    (zName: 'wal_autocheckpoint';        ePragTyp: PragTyp_WAL_AUTOCHECKPOINT;
+     mPragFlg: 0;                                                                     iPragCName:  0; nPragCName: 0; iArg: 0),
+    (zName: 'wal_checkpoint';            ePragTyp: PragTyp_WAL_CHECKPOINT;
+     mPragFlg: PragFlg_NeedSchema;                                                    iPragCName: 47; nPragCName: 3; iArg: 0),
+    (zName: 'writable_schema';           ePragTyp: PragTyp_FLAG;
+     mPragFlg: PragFlg_Result0 or PragFlg_NoColumns1;                                 iPragCName:  0; nPragCName: 0; iArg: SQLITE_WriteSchema or u64($08000000) {SQLITE_NoSchemaError})
+  );
+
+type
+  PPragmaVtab = ^TPragmaVtab;
+  TPragmaVtab = record
+    base:    passqlite3vtab.Tsqlite3_vtab;
+    db:      PTsqlite3;
+    pName:   PPragmaName;
+    nHidden: u8;
+    iHidden: u8;
+  end;
+
+  PPragmaVtabCursor = ^TPragmaVtabCursor;
+  TPragmaVtabCursor = record
+    base:    passqlite3vtab.Tsqlite3_vtab_cursor;
+    pPragma: PVdbe;          { sqlite3_stmt — opaque to vtab.c }
+    iRowid:  i64;
+    azArg:   array[0..1] of PAnsiChar;
+  end;
+
+var
+  pragmaVtabModule: passqlite3vtab.Tsqlite3_module;
+
+{ pragma.h sentinel — locate PragmaName by bare name (no "pragma_" prefix).
+  C uses bsearch on the sorted aPragmaName[]; we use a linear scan since
+  the table has only ~60 entries and this fires once per pragma_NAME parse. }
+function pragmaLocate(zName: PAnsiChar): PPragmaName;
+var
+  i: i32;
 begin
+  for i := Low(aPragmaName) to High(aPragmaName) do
+    if sqlite3_stricmp(zName, aPragmaName[i].zName) = 0 then begin
+      Result := @aPragmaName[i]; Exit;
+    end;
   Result := nil;
+end;
+
+{ pragma.c:2815 — xConnect.  Build a CREATE TABLE declaration from the
+  PragmaName column-name slice and pass it to sqlite3_declare_vtab. }
+function pragmaVtabConnect(db: PTsqlite3; pAux: Pointer;
+  argc: i32; argv: PPAnsiChar; ppVtab: PPSqlite3Vtab;
+  pzErr: PPAnsiChar): i32; cdecl;
+var
+  pPragma: PPragmaName;
+  pTab:    PPragmaVtab;
+  rc:      i32;
+  i, j:    i32;
+  cSep:    AnsiChar;
+  sBuf:    AnsiString;
+begin
+  pPragma := PPragmaName(pAux);
+  pTab := nil;
+  cSep := '(';
+  sBuf := 'CREATE TABLE x';
+  i := 0;
+  j := pPragma^.iPragCName;
+  while i < pPragma^.nPragCName do begin
+    sBuf := sBuf + cSep + '"' + AnsiString(cPragName[j]) + '"';
+    cSep := ',';
+    Inc(i);
+    Inc(j);
+  end;
+  if i = 0 then begin
+    sBuf := sBuf + '("' + AnsiString(pPragma^.zName) + '"';
+    Inc(i);
+  end;
+  j := 0;
+  if (pPragma^.mPragFlg and PragFlg_Result1) <> 0 then begin
+    sBuf := sBuf + ',arg HIDDEN';
+    Inc(j);
+  end;
+  if (pPragma^.mPragFlg and (PragFlg_SchemaOpt or PragFlg_SchemaReq)) <> 0 then begin
+    sBuf := sBuf + ',schema HIDDEN';
+    Inc(j);
+  end;
+  sBuf := sBuf + ')';
+
+  rc := sqlite3_declare_vtab(db, PAnsiChar(sBuf));
+  if rc = SQLITE_OK then begin
+    pTab := PPragmaVtab(sqlite3_malloc(SizeOf(TPragmaVtab)));
+    if pTab = nil then begin
+      rc := SQLITE_NOMEM;
+    end else begin
+      FillChar(pTab^, SizeOf(TPragmaVtab), 0);
+      pTab^.pName   := pPragma;
+      pTab^.db      := db;
+      pTab^.iHidden := u8(i);
+      pTab^.nHidden := u8(j);
+    end;
+  end else begin
+    { sqlite3_errmsg lives in passqlite3main (circular wrt codegen);
+      sqlite3ErrStr is the static fallback. }
+    pzErr^ := sqlite3StrDup(PChar(sqlite3ErrStr(db^.errCode)));
+  end;
+
+  ppVtab^ := PSqlite3Vtab(pTab);
+  Result := rc;
+end;
+
+{ pragma.c:2877 — xDisconnect. }
+function pragmaVtabDisconnect(pVtab: PSqlite3Vtab): i32; cdecl;
+begin
+  sqlite3_free(pVtab);
+  Result := SQLITE_OK;
+end;
+
+{ pragma.c:2890 — xBestIndex.  Encourages the planner to bind hidden
+  arg/schema columns via == constraints; unconstrained hidden columns
+  raise the estimated cost so the planner prefers a constrained plan. }
+function pragmaVtabBestIndex(tab: PSqlite3Vtab;
+  pIdxInfo: PSqlite3IndexInfo): i32; cdecl;
+var
+  pTab:        PPragmaVtab;
+  pConstraint: PSqlite3IndexConstraint;
+  i, j:        i32;
+  seen:        array[0..1] of i32;
+begin
+  pTab := PPragmaVtab(tab);
+  pIdxInfo^.estimatedCost := 1.0;
+  if pTab^.nHidden = 0 then begin
+    Result := SQLITE_OK; Exit;
+  end;
+  pConstraint := pIdxInfo^.aConstraint;
+  seen[0] := 0;
+  seen[1] := 0;
+  for i := 0 to pIdxInfo^.nConstraint - 1 do begin
+    if pConstraint^.iColumn < pTab^.iHidden then begin
+      Inc(pConstraint); Continue;
+    end;
+    if pConstraint^.op <> SQLITE_INDEX_CONSTRAINT_EQ then begin
+      Inc(pConstraint); Continue;
+    end;
+    if pConstraint^.usable = 0 then begin
+      Result := SQLITE_CONSTRAINT; Exit;
+    end;
+    j := pConstraint^.iColumn - pTab^.iHidden;
+    Assert((j = 0) or (j = 1));
+    seen[j] := i + 1;
+    Inc(pConstraint);
+  end;
+  if seen[0] = 0 then begin
+    pIdxInfo^.estimatedCost := 2147483647.0;
+    pIdxInfo^.estimatedRows := 2147483647;
+    Result := SQLITE_OK; Exit;
+  end;
+  j := seen[0] - 1;
+  pIdxInfo^.aConstraintUsage[j].argvIndex := 1;
+  pIdxInfo^.aConstraintUsage[j].omit := 1;
+  pIdxInfo^.estimatedCost := 20.0;
+  pIdxInfo^.estimatedRows := 20;
+  if seen[1] <> 0 then begin
+    j := seen[1] - 1;
+    pIdxInfo^.aConstraintUsage[j].argvIndex := 2;
+    pIdxInfo^.aConstraintUsage[j].omit := 1;
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ pragma.c:2928 — xOpen. }
+function pragmaVtabOpen(pVtab: PSqlite3Vtab;
+  ppCursor: PPSqlite3VtabCursor): i32; cdecl;
+var
+  pCsr: PPragmaVtabCursor;
+begin
+  pCsr := PPragmaVtabCursor(sqlite3_malloc(SizeOf(TPragmaVtabCursor)));
+  if pCsr = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  FillChar(pCsr^, SizeOf(TPragmaVtabCursor), 0);
+  pCsr^.base.pVtab := pVtab;
+  ppCursor^ := PSqlite3VtabCursor(pCsr);
+  Result := SQLITE_OK;
+end;
+
+{ pragma.c:2939 — clear cursor row state.  Faithful 1:1. }
+procedure pragmaVtabCursorClear(pCsr: PPragmaVtabCursor);
+var
+  i: i32;
+begin
+  sqlite3_finalize(pCsr^.pPragma);
+  pCsr^.pPragma := nil;
+  pCsr^.iRowid := 0;
+  for i := Low(pCsr^.azArg) to High(pCsr^.azArg) do begin
+    sqlite3_free(pCsr^.azArg[i]);
+    pCsr^.azArg[i] := nil;
+  end;
+end;
+
+{ pragma.c:2951 — xClose. }
+function pragmaVtabClose(cur: PSqlite3VtabCursor): i32; cdecl;
+var
+  pCsr: PPragmaVtabCursor;
+begin
+  pCsr := PPragmaVtabCursor(cur);
+  pragmaVtabCursorClear(pCsr);
+  sqlite3_free(pCsr);
+  Result := SQLITE_OK;
+end;
+
+{ pragma.c:2959 — xNext.  Step the underlying PRAGMA statement; finalise
+  on non-ROW so xEof flips. }
+function pragmaVtabNext(pVtabCursor: PSqlite3VtabCursor): i32; cdecl;
+var
+  pCsr: PPragmaVtabCursor;
+  rc:   i32;
+begin
+  pCsr := PPragmaVtabCursor(pVtabCursor);
+  rc := SQLITE_OK;
+  Inc(pCsr^.iRowid);
+  Assert(pCsr^.pPragma <> nil);
+  if sqlite3_step(pCsr^.pPragma) <> SQLITE_ROW then begin
+    rc := sqlite3_finalize(pCsr^.pPragma);
+    pCsr^.pPragma := nil;
+    pragmaVtabCursorClear(pCsr);
+  end;
+  Result := rc;
+end;
+
+{ pragma.c:2977 — xFilter.  Synthesise the underlying "PRAGMA name(arg)"
+  SQL from xBestIndex-bound argv, prepare it, then prime the cursor by
+  calling xNext once. }
+function pragmaVtabFilter(pVtabCursor: PSqlite3VtabCursor;
+  idxNum: i32; idxStr: PAnsiChar; argc: i32;
+  argv: PPointer): i32; cdecl;
+var
+  pCsr: PPragmaVtabCursor;
+  pTab: PPragmaVtab;
+  rc:   i32;
+  i, j: i32;
+  zText: PAnsiChar;
+  pVal:  Psqlite3_value;
+  pArgv: ^Psqlite3_value;
+  sSql:  AnsiString;
+  zSql:  PAnsiChar;
+begin
+  pCsr := PPragmaVtabCursor(pVtabCursor);
+  pTab := PPragmaVtab(pVtabCursor^.pVtab);
+  pragmaVtabCursorClear(pCsr);
+  if (pTab^.pName^.mPragFlg and PragFlg_Result1) <> 0 then j := 0 else j := 1;
+  pArgv := Pointer(argv);
+  for i := 0 to argc - 1 do begin
+    pVal := pArgv^;
+    zText := sqlite3_value_text(pVal);
+    Assert(j < Length(pCsr^.azArg));
+    Assert(pCsr^.azArg[j] = nil);
+    if zText <> nil then begin
+      pCsr^.azArg[j] := sqlite3StrDup(PChar(zText));
+      if pCsr^.azArg[j] = nil then begin
+        Result := SQLITE_NOMEM; Exit;
+      end;
+    end;
+    Inc(pArgv);
+    Inc(j);
+  end;
+  sSql := 'PRAGMA ';
+  if pCsr^.azArg[1] <> nil then
+    sSql := sSql + '"' + AnsiString(pCsr^.azArg[1]) + '".';
+  sSql := sSql + AnsiString(pTab^.pName^.zName);
+  if pCsr^.azArg[0] <> nil then
+    sSql := sSql + '=''' + AnsiString(pCsr^.azArg[0]) + '''';
+  zSql := sqlite3StrDup(PChar(sSql));
+  if zSql = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  if not Assigned(passqlite3vdbe.gPrepareV2) then begin
+    sqlite3_free(zSql);
+    Result := SQLITE_MISUSE; Exit;
+  end;
+  rc := passqlite3vdbe.gPrepareV2(pTab^.db, zSql, -1,
+                                  PPointer(@pCsr^.pPragma), nil);
+  sqlite3_free(zSql);
+  if rc <> SQLITE_OK then begin
+    pTab^.base.zErrMsg := sqlite3StrDup(PChar(sqlite3ErrStr(pTab^.db^.errCode)));
+    Result := rc; Exit;
+  end;
+  Result := pragmaVtabNext(pVtabCursor);
+end;
+
+{ pragma.c:3027 — xEof. }
+function pragmaVtabEof(pVtabCursor: PSqlite3VtabCursor): i32; cdecl;
+var
+  pCsr: PPragmaVtabCursor;
+begin
+  pCsr := PPragmaVtabCursor(pVtabCursor);
+  if pCsr^.pPragma = nil then Result := 1 else Result := 0;
+end;
+
+{ pragma.c:3035 — xColumn.  Visible columns come straight from the
+  underlying PRAGMA cursor; hidden columns echo the bound argv strings. }
+function pragmaVtabColumn(pVtabCursor: PSqlite3VtabCursor;
+  ctx: Psqlite3_context; i: i32): i32; cdecl;
+var
+  pCsr: PPragmaVtabCursor;
+  pTab: PPragmaVtab;
+begin
+  pCsr := PPragmaVtabCursor(pVtabCursor);
+  pTab := PPragmaVtab(pVtabCursor^.pVtab);
+  if i < pTab^.iHidden then
+    sqlite3_result_value(ctx, sqlite3_column_value(pCsr^.pPragma, i))
+  else
+    sqlite3_result_text(ctx, pCsr^.azArg[i - pTab^.iHidden], -1,
+                        SQLITE_TRANSIENT);
+  Result := SQLITE_OK;
+end;
+
+{ pragma.c:3053 — xRowid. }
+function pragmaVtabRowid(pVtabCursor: PSqlite3VtabCursor;
+  p: PInt64): i32; cdecl;
+var
+  pCsr: PPragmaVtabCursor;
+begin
+  pCsr := PPragmaVtabCursor(pVtabCursor);
+  p^ := pCsr^.iRowid;
+  Result := SQLITE_OK;
+end;
+
+{ pragma.c:3093 — register the pragma_NAME virtual table on first lookup.
+  Caller has already verified zName begins with "pragma_". }
+function sqlite3PragmaVtabRegister(db: PTsqlite3; zName: PAnsiChar): Pointer;
+var
+  pName: PPragmaName;
+begin
+  Assert(sqlite3_strnicmp(zName, 'pragma_', 7) = 0);
+  pName := pragmaLocate(zName + 7);
+  if pName = nil then begin Result := nil; Exit; end;
+  if (pName^.mPragFlg and (PragFlg_Result0 or PragFlg_Result1)) = 0 then begin
+    Result := nil; Exit;
+  end;
+  Assert(passqlite3util.sqlite3HashFind(@db^.aModule, PChar(zName)) = nil);
+  Result := passqlite3vtab.sqlite3VtabCreateModule(
+    db, zName, @pragmaVtabModule, pName, nil);
 end;
 
 // ===========================================================================
@@ -37653,5 +38257,22 @@ initialization
   passqlite3vdbe.gBlobReopenImpl         := @vdbeBlobReopenImpl;
   passqlite3vdbe.gValueFromExprImpl      := @valueFromExprTrampoline;
   passqlite3vdbe.gKeyInfoUnref           := passqlite3vdbe.TKeyInfoUnrefFn(@sqlite3KeyInfoUnref);
+
+  { Phase 6.8.0 — pragmaVtabModule.  Mirror of pragma.c:3060 sqlite3_module
+    initializer.  iVersion=0, no xCreate / xDestroy / xUpdate / xBegin /
+    xSync / xCommit / xRollback / xFindFunction / xRename / xSavepoint
+    / xRelease / xRollbackTo / xShadowName / xIntegrity. }
+  FillChar(pragmaVtabModule, SizeOf(pragmaVtabModule), 0);
+  pragmaVtabModule.iVersion    := 0;
+  pragmaVtabModule.xConnect    := @pragmaVtabConnect;
+  pragmaVtabModule.xBestIndex  := @pragmaVtabBestIndex;
+  pragmaVtabModule.xDisconnect := @pragmaVtabDisconnect;
+  pragmaVtabModule.xOpen       := @pragmaVtabOpen;
+  pragmaVtabModule.xClose      := @pragmaVtabClose;
+  pragmaVtabModule.xFilter     := @pragmaVtabFilter;
+  pragmaVtabModule.xNext       := @pragmaVtabNext;
+  pragmaVtabModule.xEof        := @pragmaVtabEof;
+  pragmaVtabModule.xColumn     := @pragmaVtabColumn;
+  pragmaVtabModule.xRowid      := @pragmaVtabRowid;
 
 end.
