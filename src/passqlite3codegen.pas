@@ -15514,6 +15514,29 @@ begin
             sqlite3VdbeAddOp2(v, OP_IfEmpty, pTabItem^.iCursor, pWInfo^.iBreak);
           end;
         end;
+        { where.c:7373..7423 — open index cursor for WHERE_INDEXED /
+          WHERE_IDX_ONLY plans.  Allocates pLevel^.iIdxCur from
+          pParse^.nTab, emits OP_OpenRead with the index's tnum and
+          KeyInfo, and stamps OPFLAG_SEEKEQ on EQ-shape scans so the
+          btree layer can take the seek-equal fast path.  Bloom-filter
+          regFilter / filterPullDown decoration deferred. }
+        if (pLoop^.wsFlags and (WHERE_INDEXED or WHERE_IDX_ONLY)) <> 0 then
+        begin
+          pLevel^.iIdxCur := pParse^.nTab;
+          Inc(pParse^.nTab);
+          if pLoop^.u.btree.pIndex <> nil then
+          begin
+            sqlite3VdbeAddOp3(v, OP_OpenRead, pLevel^.iIdxCur,
+                              i32(pLoop^.u.btree.pIndex^.tnum), iDb);
+            sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pLoop^.u.btree.pIndex));
+            if ((pLoop^.wsFlags and WHERE_CONSTRAINT) <> 0)
+               and ((pLoop^.wsFlags
+                     and (WHERE_COLUMN_RANGE or WHERE_SKIPSCAN
+                          or WHERE_BIGNULL_SORT)) = 0)
+               and (pWInfo^.eDistinct <> WHERE_DISTINCT_ORDERED) then
+              sqlite3VdbeChangeP5(v, OPFLAG_SEEKEQ);
+          end;
+        end;
       end;
       if iDb >= 0 then
         sqlite3CodeVerifySchema(pParse, iDb);
@@ -18321,6 +18344,17 @@ begin
         Inc(pParse^.nTab);
       end;
       pItem^.colUsed := 0;
+
+      { Resolve INDEXED BY clause (selectExpander, select.c around 6105).
+        sqlite3SrcListLookup runs IndexedByLookup for DML; SELECT must do
+        it here, otherwise pIBIndex stays nil and whereLoopAddBtree
+        produces no candidate plans → "no query solution".
+        fg.isIndexedBy = bit 1 of fgBits. }
+      if ((pItem^.fg.fgBits and $02) <> 0)
+         and (pItem^.pSTab <> nil) then
+      begin
+        if sqlite3IndexedByLookup(pParse, pItem) <> SQLITE_OK then Exit;
+      end;
 
       { View-expansion arm — port of selectExpander view branch
         (select.c:6039..6073).  When the FROM item is a VIEW, attach the
@@ -28833,6 +28867,26 @@ begin
     (pIndex^.aiColumn + n)^ := i16(XN_ROWID);
     (PPAnsiChar(pIndex^.azColl) + n)^ := WhereStrBINARY;
     (pIndex^.aSortOrder + n)^ := 0;
+  end;
+
+  { Populate colNotIdxed bitmask (build.c around 4283).  Bit i set iff
+    column i of the table is NOT among this index's key columns.  Bit
+    BMS-1 (the saturation bit) is set whenever any column index >= BMS-1
+    appears.  Used by whereLoopAddBtree's coverage check (m=colUsed &
+    colNotIdxed); without it, every index falsely reports as covering
+    and WHERE_IDX_ONLY suppresses the table-cursor open. }
+  pIndex^.colNotIdxed := not Bitmask(0);  { TOPBIT included }
+  for n := 0 to i32(pIndex^.nKeyCol) - 1 do
+  begin
+    if (pIndex^.aiColumn + n)^ >= 0 then
+    begin
+      if (pIndex^.aiColumn + n)^ >= i16(BMS - 1) then
+        pIndex^.colNotIdxed := pIndex^.colNotIdxed
+                                or (Bitmask(1) shl (BMS - 1))
+      else
+        pIndex^.colNotIdxed := pIndex^.colNotIdxed
+                                and not (Bitmask(1) shl (pIndex^.aiColumn + n)^);
+    end;
   end;
 
   sqlite3DefaultRowEst(pIndex);
