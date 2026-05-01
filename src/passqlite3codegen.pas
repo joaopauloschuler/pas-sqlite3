@@ -15399,11 +15399,20 @@ begin
     on the (unopened) coroutine cursor, bypassing codeOneLoopStart's
     viaCoroutine arm at 16437.  Force the full-planner path for these
     so the InitCoroutine + Yield emission and the WhereEnd
-    OP_Column→OP_Copy rewrite (already landed) actually fire.  The full
-    lift (every single-table FROM through the planner — option
-    b-faithful in the tasklist) is deferred until codeOneLoopStart is
-    verified to cover every shape the inline block at 15686..15909
-    currently handles.
+    OP_Column→OP_Copy rewrite (already landed) actually fire.
+
+    Phase 6.13(b) site #5 (b) — full nTabList=1 bail lift.  When
+    whereShortCut returns 0 (WHERE_OR_SUBCLAUSE recursion, virtual
+    table, or INDEXED BY / NOT INDEXED clause), route the single-
+    table case through the full planner instead of returning nil.
+    codeOneLoopStart Cases 2/3/4/5/6 cover every shape the inline
+    block below (15568..15966) handles, plus WHERE_OR_SUBCLAUSE
+    (Case 5) and INDEXED BY (Case 4) that the inline block never
+    did.  No regression in TestExplainParity / TestWhereCorpus
+    expected: the inline block still owns whereShortCut=1 cases
+    (rowid-EQ / IPK-IN / IPK-RANGE / FULL-SCAN), and any plan
+    whereShortCut would have produced is also produced by
+    whereLoopAddBtree under the same TUNING.
     ------------------------------------------------------------------------ }
   fSingleTabCoroutine := (nTabList = 1)
     and ((SrcListItems(pTabList)[0].fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0);
@@ -15415,15 +15424,8 @@ begin
     { Full planner path — where.c:7079..7473.
       Covers multi-table FROM (nTabList>1), single-table viaCoroutine
       subqueries (forced via fSingleTabCoroutine), and single-table
-      shapes that whereShortCut cannot handle (non-rowid predicates,
-      index scans, etc.).  Bail only for the latter sub-case
-      (nTabList=1 and whereShortCut returned 0 and not viaCoroutine)
-      so no existing PASS rows regress. }
-    if (nTabList = 1) and (not fSingleTabCoroutine) then
-    begin
-      whereInfoFree(db, pWInfo);
-      Exit(nil);
-    end;
+      shapes that whereShortCut cannot handle (WHERE_OR_SUBCLAUSE
+      recursion, virtual tables, INDEXED BY / NOT INDEXED). }
 
     { where.c:7080 — build candidate WhereLoop list. }
     rc := whereLoopAddAll(@sWLB);
