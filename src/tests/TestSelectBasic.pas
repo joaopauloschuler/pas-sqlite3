@@ -37,8 +37,9 @@ program TestSelectBasic;
 }
 
 uses
+  SysUtils,
   passqlite3types, passqlite3internal, passqlite3util, passqlite3os,
-  passqlite3vdbe, passqlite3codegen;
+  passqlite3vdbe, passqlite3codegen, passqlite3main;
 
 var
   nPass, nFail: i32;
@@ -199,6 +200,139 @@ begin
 end;
 
 // -----------------------------------------------------------------------
+// T11: SRT_EphemTab disposal arm — 6.13(b) piece 1.
+//
+// Drive sqlite3MaterializeView (which constructs `SELECT * FROM <tab>`
+// with dest=SRT_EphemTab, iCur=iEph) against a real schema-resident
+// table.  Verifies that the regular-path inner-loop disposal block emits
+// the C-mirror MakeRecord+NewRowid+Insert(p5=OPFLAG_APPEND) triplet on
+// the eph cursor.  Pre-fix the gate at codegen.pas:19502 bailed out for
+// SRT_EphemTab and produced an empty (Init/Halt-only) program.
+// -----------------------------------------------------------------------
+procedure TestSRTEphemTabDisposal;
+var
+  db:           PTsqlite3;
+  pTab:         PTable2;
+  parse:        TParse;
+  v:            PVdbe;
+  iCur:         i32;
+  rc:           i32;
+  errMsg:       PAnsiChar;
+  i:            i32;
+  pop:          PVdbeOp;
+  iMakeRec:     i32;
+  iNewRowid:    i32;
+  iInsert:      i32;
+  insertP5:     u16;
+  pFrom:        passqlite3codegen.PSrcList;
+  pSrcItem:     passqlite3codegen.PSrcItem;
+  pSel:         passqlite3codegen.PSelect;
+  dest:         passqlite3codegen.TSelectDest;
+const
+  SETUP : PAnsiChar = 'CREATE TABLE base(a INT, b INT);';
+begin
+  WriteLn('T11: SRT_EphemTab disposal — MakeRecord/NewRowid/Insert(APPEND)');
+
+  db := nil;
+  rc := sqlite3_open(':memory:', @db);
+  if (rc <> SQLITE_OK) or (db = nil) then
+  begin Check('T11 open', False); Exit; end;
+
+  errMsg := nil;
+  rc := sqlite3_exec(db, SETUP, nil, nil, @errMsg);
+  if rc <> SQLITE_OK then
+  begin
+    if errMsg <> nil then WriteLn('  setup err=', AnsiString(errMsg));
+    Check('T11 CREATE TABLE base', False);
+    sqlite3_close(db); Exit;
+  end;
+
+  pTab := sqlite3FindTable(db, 'base', nil);
+  if pTab = nil then begin Check('T11 FindTable base', False); sqlite3_close(db); Exit; end;
+  Check('T11 found base table',  pTab^.nCol >= 1);
+
+  { Set up a fresh Parse the way the parser does; sqlite3VdbeCreate adds
+    OP_Init at pc=0.  iCur is the eph cursor that MaterializeView's caller
+    is conceptually responsible for opening — the disposal arm only writes
+    into it.  We don't need the OP_OpenEphemeral here because we're
+    inspecting the codegen output for the disposal pattern only. }
+  FillChar(parse, SizeOf(parse), 0);
+  parse.db          := db;
+  parse.eParseMode  := PARSE_MODE_NORMAL;
+  v := sqlite3VdbeCreate(@parse);
+  Check('T11 VdbeCreate non-nil', v <> nil);
+  if v = nil then begin sqlite3_close(db); Exit; end;
+  parse.pVdbe := v;
+
+  iCur := parse.nTab;  Inc(parse.nTab);
+
+  { Inline replica of sqlite3MaterializeView (delete.c:142) so we can
+    inspect the post-prep SrcList state if the codegen bails. }
+  pFrom := sqlite3SrcListAppend(@parse, nil, nil, nil);
+  if pFrom = nil then begin Check('T11 SrcListAppend', False); sqlite3VdbeDelete(v); sqlite3_close(db); Exit; end;
+  pSrcItem := SrcListItems(pFrom);
+  pSrcItem^.zName := sqlite3DbStrDup(db, pTab^.zName);
+  { Leave u4.zDatabase nil so sqlite3LocateTable searches all attached
+    databases (matches how the parser populates SrcItems for unqualified
+    table names). }
+
+  pSel := sqlite3SelectNew(@parse, nil, pFrom, nil, nil, nil, nil,
+                           SF_IncludeHidden, nil);
+  if pSel = nil then begin Check('T11 SelectNew', False); sqlite3VdbeDelete(v); sqlite3_close(db); Exit; end;
+
+  sqlite3SelectDestInit(@dest, SRT_EphemTab, iCur);
+  sqlite3Select(@parse, pSel, @dest);
+  sqlite3SelectDelete(db, pSel);
+
+  Check('T11 no parse error', parse.nErr = 0);
+  Check('T11 SrcItem^.pSTab bound by selectExpander',
+        SrcListItems(pSel^.pSrc)^.pSTab <> nil);
+  Check('T11 vdbe has > 2 ops (regular path engaged, not Init/Halt stub)',
+        v^.nOp > 5);
+
+  { Walk the program looking for the MakeRecord → NewRowid → Insert
+    triplet.  All three must reference iCur (iSDParm), and the Insert must
+    carry OPFLAG_APPEND (= $08) in p5. }
+  iMakeRec  := -1;
+  iNewRowid := -1;
+  iInsert   := -1;
+  insertP5  := 0;
+  for i := 0 to v^.nOp - 1 do
+  begin
+    pop := PVdbeOp(PtrUInt(v^.aOp) + PtrUInt(i) * SizeOf(TVdbeOp));
+    case pop^.opcode of
+      OP_MakeRecord:
+        if (iMakeRec < 0) then iMakeRec := i;
+      OP_NewRowid:
+        if (iNewRowid < 0) and (iMakeRec >= 0) and (pop^.p1 = iCur) then
+          iNewRowid := i;
+      OP_Insert:
+        if (iInsert < 0) and (iNewRowid >= 0) and (pop^.p1 = iCur) then
+        begin
+          iInsert  := i;
+          insertP5 := pop^.p5;
+        end;
+    end;
+  end;
+
+  Check('T11 disposal: OP_MakeRecord emitted',  iMakeRec  >= 0);
+  Check('T11 disposal: OP_NewRowid emitted (p1=iCur)',  iNewRowid >= 0);
+  Check('T11 disposal: OP_Insert emitted (p1=iCur)',    iInsert   >= 0);
+  Check('T11 disposal: NewRowid follows MakeRecord',
+        (iMakeRec >= 0) and (iNewRowid > iMakeRec));
+  Check('T11 disposal: Insert follows NewRowid',
+        (iNewRowid >= 0) and (iInsert > iNewRowid));
+  Check('T11 disposal: Insert.p5 carries OPFLAG_APPEND ($08)',
+        (insertP5 and OPFLAG_APPEND) <> 0);
+
+  { Don't sqlite3FinishCoding — we never opened the eph cursor and the
+    program isn't meant to run.  Just discard the half-built Vdbe with
+    sqlite3VdbeDelete; sqlite3_close cleans the schema. }
+  sqlite3VdbeDelete(v);
+  sqlite3_close(db);
+end;
+
+// -----------------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------------
 begin
@@ -211,6 +345,7 @@ begin
   TestKeyInfo;
   TestLogEst;
   TestColumnIndex;
+  TestSRTEphemTabDisposal;
   WriteLn;
   WriteLn('Results: ', nPass, ' passed, ', nFail, ' failed.');
   if nFail > 0 then Halt(1);

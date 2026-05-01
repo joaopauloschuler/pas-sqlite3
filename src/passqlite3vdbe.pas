@@ -1520,6 +1520,9 @@ type
                                 enc: u8; affinity: u8;
                                 out ppVal: Psqlite3_value): i32;
   TKeyInfoUnrefFn    = procedure(p: Pointer);
+  TPrepareV2Fn       = function(db: PTsqlite3; zSql: PAnsiChar; nBytes: i32;
+                                ppStmt: PPointer;
+                                pzTail: PPointer): i32; cdecl;
 var
   gUnlinkAndDeleteTable:   TUnlinkAndDeleteFn;
   gUnlinkAndDeleteIndex:   TUnlinkAndDeleteFn;
@@ -1540,6 +1543,11 @@ var
                                                  needs PExpr layout. }
   gKeyInfoUnref:           TKeyInfoUnrefFn;  { wired by passqlite3codegen —
                                                 releases per-BtShared KeyInfo cache. }
+  gPrepareV2:              TPrepareV2Fn;     { wired by passqlite3main — used
+                                                by pragmaVtab xFilter to prepare
+                                                the synthesised "PRAGMA name(arg)"
+                                                statement.  Codegen cannot import
+                                                main directly (circular). }
 procedure sqlite3ResetAllSchemasOfConnection(db: PTsqlite3);
 function  sqlite3SchemaMutexHeld(db: PTsqlite3; iDb: i32; pSchema: Pointer): i32;
 procedure sqlite3CloseSavepoints(pDb: PTsqlite3);
@@ -7057,9 +7065,17 @@ begin
 
     { ────── OP_EndCoroutine ────── (vdbe.c:1203) }
     OP_EndCoroutine: begin
+      { Faithful port of vdbe.c:1203..1213.  pIn1^.u.i holds the
+        address of the most-recent OP_Yield that resumed this
+        coroutine; jump to that Yield's p2 (addrEnd) so the outer
+        scan exits its loop.  Save this EndCoroutine - 1 in pIn1
+        so any later Yield against this regReturn lands back here
+        and re-jumps to the same addrEnd. }
       pIn1 := @aMem[pOp^.p1];
       if (pIn1^.flags and MEM_Int) <> 0 then begin
-        pOp := @aOp[pIn1^.u.i];
+        pcx := i32(pOp - aOp);  { addr of this EndCoroutine }
+        pOp := @aOp[aOp[pIn1^.u.i].p2 - 1];
+        pIn1^.u.i := i64(pcx) - 1;
       end;
     end;
 
@@ -9140,10 +9156,18 @@ begin
             pCur^.isTable := 0;
           end;
         end else begin
-          { Rowid table: use the auto-created table at SCHEMA_ROOT+1 }
-          rc := sqlite3BtreeCursor(pCur^.ub.pBtx, SCHEMA_ROOT + 1,
-                                   BTREE_WRCSR, nil, pCur^.uc.pCursor);
-          pCur^.isTable := 1;
+          { Rowid table: allocate a fresh INTKEY root page and open a cursor
+            on it.  In upstream C the comment "use the auto-created table at
+            SCHEMA_ROOT+1" applies because newDatabase pre-allocates that
+            page; this port's newDatabase only initialises page 1, so we
+            must call sqlite3BtreeCreateTable explicitly and capture the
+            assigned pgno (typically SCHEMA_ROOT+1 = 2 for a fresh eph). }
+          rc := sqlite3BtreeCreateTable(pCur^.ub.pBtx, @pgnoEph, BTREE_INTKEY);
+          if rc = SQLITE_OK then begin
+            rc := sqlite3BtreeCursor(pCur^.ub.pBtx, pgnoEph, BTREE_WRCSR,
+                                     nil, pCur^.uc.pCursor);
+            pCur^.isTable := 1;
+          end;
         end;
       end;
       if rc <> SQLITE_OK then goto abort_due_to_error;

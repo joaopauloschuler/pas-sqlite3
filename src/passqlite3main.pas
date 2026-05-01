@@ -4600,4 +4600,8 @@ initialization
   passqlite3vdbe.gGetTokenImpl :=
     passqlite3vdbe.TGetTokenFn(@passqlite3parser.sqlite3GetToken);
 
+  { Phase 6.8.0 — wire sqlite3_prepare_v2 trampoline so the pragma vtab
+    xFilter (codegen.pas) can prepare its synthesised PRAGMA statement. }
+  passqlite3vdbe.gPrepareV2 := passqlite3vdbe.TPrepareV2Fn(@sqlite3_prepare_v2);
+
 end.

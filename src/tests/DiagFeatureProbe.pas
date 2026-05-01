@@ -162,6 +162,19 @@ begin
         'CREATE TABLE t(a); INSERT INTO t VALUES(1); INSERT INTO t VALUES(2); CREATE VIEW v AS SELECT a FROM t',
         'SELECT 1',
         'SELECT count(*) FROM v');
+  // VIEW gate (Phase 6.13(b) piece 2): locks the no-regression guarantee
+  // on the view->subquery rewrite path.  A prior selectExpander subquery
+  // hook prototype regressed this with EAccessViolation; this row catches
+  // that class of NIL-deref independent of the count-aggregate path above.
+  Probe('CREATE VIEW + plain SELECT FROM v',
+        'CREATE TABLE t(a); INSERT INTO t VALUES(1); CREATE VIEW v AS SELECT a FROM t',
+        'SELECT 1',
+        'SELECT a FROM v');
+  // Sub-SELECT FROM-source (Phase 6.13(b) piece 3 materialise arm).
+  Probe('Sub-SELECT FROM materialise',
+        'CREATE TABLE t(a); INSERT INTO t VALUES(7); INSERT INTO t VALUES(8)',
+        'SELECT 1',
+        'SELECT a FROM (SELECT a FROM t WHERE a>7)');
   // CTE
   Probe('CTE simple',
         '',

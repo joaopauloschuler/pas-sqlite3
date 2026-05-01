@@ -28,14 +28,224 @@ Important: At the end of this document, please find:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-- [ ] **6.8.0**  Pragma (pragma.c): `sqlite3PragmaVtabRegister` — returns `nil`; registers`pragma_*` eponymous virtual tables via
-     `sqlite3VtabCreateModule` + `pragmaVtabModule`.
+Suggested order (driven by call-graph dependencies, not numbering): 6.8.0
+(independent) → 6.8.4 → 6.8.5 (Update needs a productive WHERE) → 6.8.2
+→ 6.8.3 (Update reuses both for the row-write path) → 6.8.1 last.
+Landing 6.8.1 before 6.8.2/6.8.3/6.8.4/6.8.5 just produces another
+skeleton.
 
-- [ ] **6.8.1** finish porting `sqlite3Update` from `tsrc/update.c`
-- [ ] **6.8.2** port `sqlite3GenerateConstraintChecks` from `tsrc/insert.c`
-- [ ] **6.8.4** port `sqlite3WhereBegin`
-- [ ] **6.8.5** port `sqlite3WhereEnd`
-- [ ] **6.9.6** Finish porting `sqlite3Update`.
+- [X] **6.8.0** Pragma (pragma.c): `sqlite3PragmaVtabRegister` — DONE
+     2026-05-01.  Stub at codegen.pas:30145 replaced with full 1:1 port of
+     pragma.c:2791..3101: aPragmaName table (66 entries from
+     ../sqlite3/pragma.h, OMIT-guarded rows excluded), pragCName column-
+     name pool, pragmaLocate, all 12 vtab callbacks (xConnect /
+     xDisconnect / xBestIndex / xOpen / xClose / xNext / xFilter / xEof
+     / xColumn / xRowid + cursor-clear helper), pragmaVtabModule struct
+     wired in initialization.  sqlite3LocateTable updated to call
+     PragmaVtabRegister + sqlite3VtabEponymousTableInit on `pragma_*`
+     lookups (build.c:427..451 arm).  Required gPrepareV2 trampoline in
+     vdbe.pas (codegen↔main is circular).  Verified: DiagPragma 10 rows
+     for `pragma_table_info` etc. flip from prepare-fail to prep=0
+     (table reachable, queries cleanly), no row data because the
+     underlying PRAGMA codegen arms (TABLE_INFO, INDEX_LIST,
+     FOREIGN_KEY_LIST, DATABASE_LIST, COLLATION_LIST, FUNCTION_LIST,
+     MODULE_LIST, PRAGMA_LIST, COMPILE_OPTIONS) remain stubs in
+     sqlite3Pragma — that's gap 6.12.  TestExplainParity 1016/1026
+     unchanged; DiagFeatureProbe 9 unchanged; TestDMLBasic 54/0;
+     TestSchemaBasic 44/0.
+
+- [~] **6.8.2** port `sqlite3GenerateConstraintChecks` (insert.c).
+     Body ported 2026-05-01 (codegen.pas:24529..25303); 1:1 with
+     insert.c:1895..2723.  Function is NOT yet called from
+     sqlite3Insert/sqlite3Update — wiring follows in 6.8.1 / 6.8.3.
+     TestDMLBasic 54/0, TestExplainParity 1016/1026, DiagDml unchanged.
+     Gate: DiagDml + DiagTxn — closes 6.10 step 6 (autoindex INSERT,
+     IPK alias auto-rowid), step 9(h) (CHECK not enforced), step 15(d)
+     (OR IGNORE/REPLACE/FAIL), step 15(e) (IPK alias next-rowid),
+     step 26 (UNIQUE violation, autoindex maintenance).
+     [X] NOT NULL arm (per-column abort/replace/ignore/fail).
+     [X] CHECK arm (compile pTab^.pCheck, OP_Halt with conflict
+          resolution in P5).
+     [X] PRIMARY KEY / UNIQUE arm: rowid uniqueness for IPK aliases,
+          index uniqueness for every implicit/explicit UNIQUE index
+          (incl. partial-index `pIdx^.pPartIdxWhere`).
+     [X] FOREIGN KEY arm (regTrigCnt allocation via sqlite3FkRequired
+          + deferred-constraint bookkeeping inside the unique loop).
+          The OP_FkCheck call itself is emitted by sqlite3Insert/
+          sqlite3Update around this routine, not inside it (per C).
+     [X] Conflict-resolution dispatch (ABORT / FAIL / IGNORE /
+          REPLACE / ROLLBACK) into OP_Halt P5, plus UPSERT OE_Update
+          dispatch via sqlite3UpsertDoUpdate.
+     [ ] Auto-rowid generation for IPK alias when NULL is supplied
+          (max(rowid)+1, AUTOINCREMENT honoured via sqlite_sequence).
+          Belongs to sqlite3Insert (insert.c:1454..1559), not this
+          routine — defer to 6.8.1 / 6.10-step-6 wiring.
+
+- [X] **6.8.3** port `sqlite3CompleteInsertion` (insert.c) — DONE
+     2026-04-27 in commit 28254e7 (Phase 6.9-bis 11g.2.b).  Body lives
+     at `passqlite3codegen.pas:25319..25395`, a 1:1 line-by-line port
+     of `insert.c:2782..2847`.  Companion to 6.8.2.  No callers yet —
+     `sqlite3Insert` still uses its inline four-op shortcut; wiring is
+     deferred to `sqlite3Insert` body work (see 6.8.1 sibling note
+     below).
+     Gate: DiagDml `unique violation`, DiagIndexing `schema after
+     create idx`, `select range via idx` — also unblocks the
+     implicit-autoindex Δ in TestExplainParity.  These remain pending
+     because they require the call-site wiring, not the function body.
+     [X] OP_Insert with correct P5 (LASTROWID / APPEND / USESEEKRESULT /
+          ISUPDATE / SAVEPOSITION) — `:25381..25394`.
+     [X] Per-index OP_IdxInsert loop honouring `aRegIdx[]` skip flags
+          and partial-index gates — `:25338..25375` (uniqNotNull bit 3
+          drives nKeyCol-vs-nColumn).
+     Bullets relocated to call-site wiring (not part of
+     `sqlite3CompleteInsertion` in C):
+       — sqlite_sequence update for AUTOINCREMENT (C calls
+         `sqlite3AutoincrementEnd` from `sqlite3Insert`,
+         `insert.c:1640`; helper already ported at
+         `passqlite3codegen.pas:24040`, called from `:22985`).
+       — AFTER INSERT trigger fire arm (C calls `sqlite3CodeRowTrigger`
+         from `sqlite3Insert`, `insert.c:1606`; helper already ported
+         at `passqlite3codegen.pas:22290`).  Closes 6.10 step 9(j) once
+         the `sqlite3Insert` rewrite replaces the inline shortcut at
+         `:24389..24393` with the canonical
+         `GenerateConstraintChecks` + `CompleteInsertion` pair.
+
+- [~] **6.8.4** port `sqlite3WhereBegin` (where.c).
+     Gate: TestExplainParity SELECT-WHERE corpus + DiagIndexing
+     `indexed by ok` / `not indexed` (closes 6.10 step 26(e)).
+     [X] Allocate `WhereInfo` + per-loop `WhereLevel` array
+          (codegen.pas:15243..15280).
+     [X] Drive `whereLoopAddAll` + `wherePathSolver` for the
+          cost-based plan (codegen.pas:15429..15454).
+     [X] Single-table fast path: lift the nTabList=1 gate.  Site
+          #5 (a) lifted the viaCoroutine narrow case (commit
+          9861f05); site #5 (b) lifted the rest in commit 41167c7
+          (WHERE_OR_SUBCLAUSE recursion, virtual tables, INDEXED
+          BY / NOT INDEXED — every shape whereShortCut bails on
+          now routes through codeOneLoopStart).
+     [X] `not indexed` honour (DiagIndexing PASS, commit 41167c7).
+     [X] `INDEXED BY` honour: planner-side wired in commit 889ca4f
+          (`sqlite3IndexedByLookup` from selectExpander,
+          `pIndex^.colNotIdxed` populated in `sqlite3CreateIndex`,
+          `iIdxCur` opened with `OPFLAG_SEEKEQ` in the planner-
+          branch cursor-open loop).  End-to-end closure landed
+          via 6.8.6 (commit 22188d5) — `sqlite3Insert` now
+          populates indexes at insert time so the planner finds
+          rows.  DiagIndexing `indexed by ok` PASS.
+     [ ] Multi-table loop nesting + per-loop WHERE-clause splitting
+          (codeOneLoopStart already supports it; corpus parity
+          deferred — TestExplainParity multi-table rows still
+          mostly diverging on join-order / explain-text edges).
+     [ ] Bloom-filter and covering-index arms (covers 6.10 step 9
+          d-INNER and the `SELECT p FROM u` planner Δ).
+
+- [~] **6.8.6** port the productive `sqlite3Insert` body (insert.c).
+     Single-row VALUES path DONE 2026-05-01 (commit 22188d5).
+     The inline four-op shortcut at codegen.pas:24770.. is
+     replaced by `sqlite3OpenTableAndIndices` + per-loop column
+     eval + `sqlite3GenerateConstraintChecks` (6.8.2) +
+     `sqlite3CompleteInsertion` (6.8.3) cascade with proper
+     aRegIdx[nIdx+1] allocation.  Closes DiagIndexing
+     `indexed by ok`; bytecode for single-row VALUES now byte-
+     identical to C oracle.
+     Deferred sub-arms (route to insert_cleanup or fall back to
+     OP_NewRowid + record assembly without bail today):
+     [X] IPK-alias rebinding (insert.c:1488..1531) — DONE
+          2026-05-01 (commit a820774).  IPK alias tables now
+          honour user-supplied rowids via SCopy+NotNull+NewRowid+
+          MustBeInt cascade with regData+iPKey nulled
+          post-rebind.  Verified: `INSERT INTO u VALUES(7,'a')`
+          with `u(id INTEGER PRIMARY KEY,x)` followed by
+          `SELECT id, x FROM u` now returns [7,a] (was empty).
+          TestExplainParity `INSERT IPK alias u` narrows from
+          off-by-11 to off-by-1 (a single OP_Noop placeholder
+          in GenerateConstraintChecks not yet emitted —
+          minor, deferred).  DiagIndexing `rowid alias custom`
+          stays divergent on a separate SELECT-ORDER-BY bail
+          unrelated to the IPK path.
+     [ ] Multi-row VALUES / INSERT FROM SELECT (insert.c:1115..)
+          — pSelect <> nil today bails to insert_cleanup (no
+          emission).
+     [~] AUTOINCREMENT — wired 2026-05-01 (commit 179597b).
+          `CREATE TABLE ... AUTOINCREMENT` now creates and pins
+          sqlite_sequence; `sqlite3AutoincrementEnd` is now called
+          from sqlite3Insert so the in-row write-back epilogue
+          actually fires; `regRowCount` is allocated and bumped
+          per insert.  Verified: AUTOINCREMENT INSERTs now
+          generate rowids correctly (1,2,3,...); previously
+          failed at autoIncBegin's pSeqTab=nil check with
+          SQLITE_CORRUPT_SEQUENCE.
+          Remaining: the sqlite_sequence row's `seq` column does
+          not yet update with the new max rowid after INSERT —
+          AutoincrementEnd's epilogue runs but the in-row update
+          loop may not be wiring p1/p2/p3 of OP_Insert to the
+          correct registers.  Trace pending.
+     [ ] BEFORE / AFTER INSERT triggers — already ported as
+          `sqlite3CodeRowTrigger` but not yet wired into this
+          path.
+     [ ] RETURNING clause emission — DiagDml RETURNING corpus.
+     [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
+     [ ] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
+          fast path).
+
+- [ ] **6.8.5** port `sqlite3WhereEnd` (where.c).
+     Gate: same as 6.8.4 — they land as a pair.
+     [ ] Per-loop tail (OP_Next / OP_Prev / OP_VNext + jump back to
+          loop top).
+     [ ] Cursor close + addrBrk/addrCont label patching.
+     [ ] Free `WhereInfo` and any `IdxStr` allocations.
+
+- [X] **6.8.1** finish porting `sqlite3Update` (update.c) — single-table
+     arm DONE 2026-05-01.  `passqlite3codegen.pas:23457..24115` replaces
+     the prior skeleton with a 1:1 port of `update.c:285..1163` covering
+     prologue (SrcListLookup, TriggersExist, ViewGetColumnNames,
+     IsReadOnly, cursor allocation, aXRef/aRegIdx/aToOpen single-block
+     malloc), column-name resolution with chngRowid/chngPk detection
+     and generated-column propagation, per-index aRegIdx[] alloc with
+     partial-index gating via the new helpers
+     `indexColumnIsBeingUpdated` / `indexWhereClauseMightChange`
+     (`:23399..23437`), CountChanges + BeginWriteOperation, register
+     block layout (regOldRowid / regNewRowid / regOld / regNew / regKey
+     / regRowSet), MaterializeView for non-FROM views, ResolveExprNames
+     over WHERE, ephemeral-rowset two-pass and ONEPASS_SINGLE/MULTI
+     paths, OpenTableAndIndices with the ONEPASS_MULTI Once gate, the
+     in-loop body (NotFound/IsNull/Rewind+RowData/NotExists row locate,
+     OLD/NEW register population, BEFORE UPDATE trigger fire + reload,
+     `sqlite3GenerateConstraintChecks`, optional reseek,
+     `sqlite3GenerateRowIndexDelete`, OP_FinishSeek, conditional
+     OP_Delete, `sqlite3CompleteInsertion`, AFTER UPDATE trigger fire),
+     loop tail, `sqlite3AutoincrementEnd`, `sqlite3CodeChangeCount`.
+     Verified: TestDMLBasic 54/54, TestExplainParity 1018/1026 (was
+     1016 — +2 new passes, 0 regressions), DiagDml 12/2 unchanged,
+     DiagIndexing 35/7 unchanged, DiagTxn 33/7 unchanged.
+     Gate (carried forward): DiagDml UPDATE corpus, DiagTxn
+     `changes() after update` (step 15(f)), TestExplainParity
+     `UPDATE t SET a=5 WHERE rowid=1` Δ=14, DROP TABLE Δ=26 follow-on
+     (6.11(b) via `sqlite3NestedParse`) — most still pending; Δ shrunk
+     from 10 to 8 already.
+     [X] Source-list resolve + WHERE-clause walk (`sqlite3WhereBegin`).
+     [X] OP_Rowid → OP_NotExists row-locate prologue.
+     [X] Old-row read into register block (incl. unchanged columns).
+     [X] BEFORE UPDATE trigger fire arm.
+     [X] New-row register assembly with `sqlite3ExprCode` per
+          assignment.
+     [X] `sqlite3GenerateConstraintChecks` invocation (6.8.2).
+     [X] Index-update loop: per-index delete-old + insert-new
+          honouring `aXRef[]` (no-change skip) — via
+          `sqlite3GenerateRowIndexDelete` + `sqlite3CompleteInsertion`.
+     [X] `sqlite3CompleteInsertion`-equivalent row write (6.8.3) +
+          `nChange` increment.
+     [X] AFTER UPDATE trigger fire arm.
+     Deferred (single-table arm scope; bail to update_cleanup with
+     no emission, free args cleanly):
+     [ ] UPDATE FROM arm (multi-table source) — needs 6.8.4
+          multi-table WHERE; `nChangeFrom>0` early bail.
+     [ ] Virtual-table dispatch (`updateVirtualTable`) — vtab xUpdate
+          path; `eTabType=TABTYP_VTAB` early bail.
+     [ ] RETURNING clause emission — call site for the productive
+          UPDATE path (DiagDml RETURNING corpus).
+     [ ] PREUPDATE_HOOK `OP_Delete OPFLAG_ISNOOP` arm — gated on
+          SQLITE_ENABLE_PREUPDATE_HOOK (not in the default build).
 
 - [ ] **6.9** complete the porting:
     - [ ] `sqlite3VdbeRecordCompare`
@@ -55,369 +265,73 @@ Important: At the end of this document, please find:
       (DiagWindow `group order` PASS, verified 2026-04-29).
       Remaining: errCode-bearing corruption signalling + the codegen
       full-layout fields (u/n/r1/r2) that the slim layout still drops.
-
-  [X] **6.13** port `sqlite3Vacuum` — ported 2026-04-29 (vacuum.c:105) in
-       passqlite3codegen.pas.  Replaces the Phase 6.5 stub.  Resolves the
-       optional schema-name argument via sqlite3TwoPartName, codes the
-       VACUUM INTO target expression (sqlite3ResolveSelfReference + ExprCode
-       into a fresh memcell), then emits OP_Vacuum + sqlite3VdbeUsesBtree.
-       Runtime side (OP_Vacuum / sqlite3RunVacuum) still stubbed in
-       passqlite3vdbe.pas, so VACUUM is bytecode-parity but a runtime no-op.
-       Verified via `src/tests/DiagVacuum.pas`: VACUUM and VACUUM INTO 'x'
-       both emit opcode-by-opcode parity with the C reference.
-
-  [X] **6.22** port codegen.pas rename:
-       [X] `sqlite3RenameExprUnmap` — ported 2026-04-29 (alter.c:914).
-            Productive walker now drives renameUnmapExprCb /
-            renameUnmapSelectCb under PARSE_MODE_UNMAP; helpers
-            (unmapColumnIdlistNames, renameWalkWith) and dependency
-            `sqlite3WithDup` (expr.c:1755) ported alongside.
-            `sqlite3RenameExprlistUnmap` likewise productive.  Dead-code
-            today (no caller drives PARSE_MODE_RENAME until 6.27 ALTER
-            TABLE RENAME lands), but matches C 1:1 and the rename list
-            stays empty so the walker is a clean no-op in practice.
-       [X] `sqlite3RenameTokenMap` — ported 2026-04-29 (alter.c:776).
-       [X] `sqlite3RenameTokenRemap` — ported 2026-04-29 (alter.c:802).
   
-  [ ] **6.23** port codegen.pas trigger:
-       [X] Port `sqlite3BeginTrigger` — ported 2026-04-29 (trigger.c:104).
-            Replaces the Phase 6.4 stub.  Resolves iDb (TwoPartName /
-            isTemp), runs FixSrcList, validates the target table (must
-            exist, not virtual, not shadow-when-readonly, not system,
-            view↔INSTEAD), runs auth, then allocates the Trigger object
-            on pParse^.pNewTrigger so FinishTrigger can finalise.
-            Dead-code today because sqlite3FinishTrigger is still a stub
-            (it frees pStepList and never installs the trigger), but
-            every error arm is now live and matches C 1:1.  Negative
-            paths verified via DiagFeatureProbe (CREATE TRIGGER → INSERT
-            still DIVERGE — pending FinishTrigger).
-       [X] Port `sqlite3FinishTrigger` — ported 2026-04-29 (trigger.c:323).
-            Replaces the Phase 6.4 stub.  Runs FixTriggerStep + FixExpr
-            on the parsed step list, then on a normal CREATE branch
-            emits the sqlite_schema row INSERT via sqlite3NestedParse,
-            bumps the cookie via sqlite3ChangeCookie, and queues a
-            ParseSchemaOp; on the schema-reload branch installs the
-            Trigger into pSchema^.trigHash and links it onto its
-            parent table's pTrigger list.  PARSE_MODE_RENAME re-hoists
-            the trigger to pParse^.pNewTrigger.  Also ported helper
-            `sqlite3TokenInit` (util.c:390).  Dead-code today because
-            sqlite3CodeRowTrigger / TriggerColmask / TriggerStepSrc are
-            still stubs (DiagFeatureProbe `CREATE TRIGGER → INSERT`
-            still DIVERGE: trigger registers but the row-handler is
-            never emitted), but parse + schema-cache install matches C
-            1:1 and unblocks the remaining trigger arms.
-       [X] Port `sqlite3CodeRowTriggerDirect` — ported 2026-04-29
-            (trigger.c:1382).  Emits OP_Program for the compiled trigger
-            sub-program, with P5 set when recursive-trigger invocation
-            must be suppressed (named trigger + SQLITE_RecTriggers
-            cleared).  Calls `trgGetRowTrigger` for the cached lookup;
-            that helper still returns nil today (gated on the full
-            `codeRowTrigger` compile pipeline), so the OP_Program emit
-            is dead-code until that lands but the structural port is
-            faithful 1:1.
-       [X] Port `sqlite3CodeRowTrigger` — ported 2026-04-29
-            (trigger.c:1454).  Walks the trigger chain matching op +
-            tr_tm + checkColumnOverlap, dispatches ordinary triggers to
-            `sqlite3CodeRowTriggerDirect` and RETURNING triggers to
-            `codeReturningTrigger` at top-level only; UPSERT bridge
-            (bReturning + INSERT trigger / UPDATE op) honoured.  Also
-            ported `codeReturningTrigger` skeleton (trigger.c:1020) —
-            early-out gates only; full body (SelectPrep + ExpandReturning
-            + ResolveExprListNames + MakeRecord/NewRowid/Insert) remains
-            TODO.  DiagFeatureProbe baseline unchanged (9 divergences),
-            TestExplainParity unchanged (1016/1026 pass, 10 diverge).
-       [X] Port `sqlite3TriggerColmask` — ported 2026-04-29 (trigger.c:1524).
-            IsView arm now correctly returns 0xffffffff and bReturning
-            arm returns 0xffffffff per matching trigger; ordinary
-            triggers fall through `trgGetRowTrigger` which is a nil-stub
-            (depends on full codeRowTrigger pipeline) so contribute 0
-            to the mask — identical to previous all-zero stub for that
-            arm but now correctly conservative on views/RETURNING.
-            Verified DiagFeatureProbe + TestExplainParity unchanged (9
-            and 10 divergences respectively).
+  [ ] **6.24** Aggregate-with-ORDER-BY codegen (select.c
+       `analyzeAggregate` + `generateAggSelect`).  The
+       ORDER-BY-inside-aggregate arm — `group_concat(val, ',' ORDER BY
+       val DESC)`, `string_agg(... ORDER BY ...)`, etc. — is not
+       honoured today; the unordered variant `group_concat(val,',')`
+       PASSes.  Distinct from 6.8.2 (constraint checks) — pure
+       SELECT-side codegen.
+       Gate: DiagWindow `group_concat ordered` (6.10 step 17(b)).
+       [ ] Per-aggregate `OrderByExpr` capture during
+            `sqlite3FuncDefRef` resolution.
+       [ ] Sorter open + key-encode in the inner-loop arm of
+            `generateAggSelect`.
+       [ ] Sorted-feed of values into the aggregate step function
+            (replaces the direct OP_AggStep path).
+       [ ] DISTINCT-aggregate variant (`count(DISTINCT x)` etc.) —
+            uses the same sorter machinery.
 
-  [ ] **6.24** port codegen.pas DML
-       [ ] `sqlite3GenerateConstraintChecks`.
+  [ ] **6.26** Window functions (window.c).
+       Gate: DiagWindow — closes 6.10 step 17(c) (rank, dense_rank,
+       lag, lead, first_value, ntile prepare-time failures) and step
+       17(d) (`sum() OVER (...)`, `row_number() OVER (...)` empty
+       result-set).
+       [ ] Port `sqlite3WindowCodeInit` — opens the window
+            ephemeral table, allocates partition / peer-group
+            registers, emits the partition-boundary detection
+            preamble.
+       [ ] Port `sqlite3WindowCodeStep` — per-row dispatch into
+            the active frame logic.
+       [ ] Frame-spec emission: ROWS / RANGE / GROUPS, with all
+            five bound types (UNBOUNDED PRECEDING, n PRECEDING,
+            CURRENT ROW, n FOLLOWING, UNBOUNDED FOLLOWING) and
+            EXCLUDE clauses (NO OTHERS / CURRENT ROW / GROUP / TIES).
+       [ ] Built-in window-function dispatch table:
+            `row_number` / `rank` / `dense_rank` / `percent_rank` /
+            `cume_dist` / `ntile` / `lag` / `lead` / `first_value` /
+            `last_value` / `nth_value`.
+       [ ] Aggregate-as-window arm (`sum(x) OVER (...)`,
+            `avg(x) OVER (...)`, etc.) — reuses the regular agg
+            step function inside the frame loop.
+       [ ] Multi-window arm (one SELECT with several distinct
+            OVER clauses sharing partitions).
 
-  [ ] **6.25** port codegen.pas schema:
-       [ ] Port `sqlite3ReadSchema`
-       [ ] Port `sqlite3RunParser`.
-
-  [ ] **6.26** port codegen.pas:
-       [ ] Port `sqlite3WindowCodeInit`
-       [ ] Port `sqlite3WindowCodeStep`.
-
-  [ ] **6.27** port codegen.pas:
-       [ ] Port `sqlite3AlterRenameTable`
-       [ ] Port `sqlite3AlterFinishAddColumn`
-       [ ] Port `sqlite3AlterAddConstraint`
-       [ ] Port `sqlite3Detach`
-       [ ] Port `sqlite3Attach`
-       [ ] Port `sqlite3Analyze`
-       [X] Port `sqlite3Vacuum` — done 2026-04-29 (see 6.13).
-       [ ] Port `sqlite3FkCheck`
-       [ ] Port `sqlite3FkActions`.
+  [ ] **6.27** codegen.pas schema-mutation + statistics.
+       Sub-rows that overlapped Phase 7 have been moved out
+       (ATTACH/DETACH → 7.1.8; the ALTER trio → 7.1.9).
+       [ ] Port `sqlite3Analyze` (analyze.c).  Emits the bytecode
+            that populates `sqlite_stat1` / `sqlite_stat4`; gates the
+            cost-based planner work in 6.8.4 (without ANALYZE rows
+            the planner falls back to heuristic costs and several
+            DiagIndexing cases pick the wrong plan).
+       [X] Port `sqlite3Vacuum` (vacuum.c).
+       [ ] Port `sqlite3FkCheck` (fkey.c).  Codegen-side emitter
+            that walks each FK constraint after a DELETE / UPDATE
+            and emits the OP_FkCheck calls.  The runtime opcode
+            body is already wired (commit 775ffc0); only the
+            codegen side at passqlite3codegen.pas:33122 is still a
+            stub.  Required for 6.10 step 9 and DiagFeatureProbe
+            FK-cascade cases.
+       [ ] Port `sqlite3FkActions` (fkey.c).  Synthesises the
+            ON DELETE / ON UPDATE CASCADE / SET NULL / SET DEFAULT /
+            RESTRICT / NO ACTION trigger programs.  Currently a
+            no-op at passqlite3codegen.pas:33128.
 
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
-       marked as "stub" that was missed by 6.16..6.27 (catch-all).
-       [X] `sqlite3LimitWhere` — ported 2026-04-29 (delete.c:182).
-            Builds the `WHERE rowid IN (SELECT rowid FROM ... LIMIT ...)`
-            rewrite for DELETE/UPDATE-with-LIMIT, including the WITHOUT
-            ROWID PK and PK-vector arms.  Dead-code today (parser
-            delete/update arms still drop pOrderBy/pLimit before reaching
-            here — gated on SQLITE_ENABLE_UPDATE_DELETE_LIMIT).  CTE arm
-            (pCteUse->nUse++) left as TODO until TCteUse record is defined.
-       [X] `sqlite3SubqueryDelete` + `sqlite3SubqueryDetach` — ported
-            2026-04-29 (build.c:4944 / :4956).  sqlite3SrcListDelete now
-            calls the standalone helper instead of inlining
-            sqlite3SelectDelete + sqlite3DbFree, matching the C call
-            graph 1:1.
-       [X] `sqlite3MarkAllShadowTablesOf` — ported 2026-04-29
-            (build.c:2538).  Walks pTab^.pSchema^.tblHash and tags any
-            ordinary table whose name is "<vtab>_<suffix>" and whose
-            suffix is accepted by the module's xShadowName callback
-            with TF_Shadow.  Previously a no-op so shadow tables of
-            iVersion>=3 modules were never marked.
-       [X] `sqlite3VtabUsesAllSchemas` — ported 2026-04-29
-            (where.c:4643).  Verify-cookies every attached db, and if
-            the toplevel parse has any bit in writeMask, also starts a
-            write transaction on every db.  Used by built-in vtabs
-            (sqlite_dbpage) that must touch every schema.
-       [X] `sqlite3ExprCollSeqMatch` + `sqlite3SubselectError` +
-            `sqlite3VectorErrorMsg` + `sqlite3ExprCheckIN` — ported
-            2026-04-29 in passqlite3codegen.pas (expr.c:331/:3495/
-            :3514/:3988).  CollSeqMatch compares the two collations'
-            zName via sqlite3StrICmp; the error helpers route through
-            sqlite3MPrintf + the existing sqlite3ErrorMsg suppressErr
-            logic.  ExprCheckIN validates IN-RHS column count vs LHS
-            vector size.  Faithful 1:1 ports; not yet wired into a
-            caller (parser/codegen IN paths still call the inline
-            checks they had pre-port), exposed for future wiring.
-       [X] `sqlite3DeferForeignKey` + `sqlite3SrcListFuncArgs` —
-            ported 2026-04-29 in passqlite3codegen.pas (build.c:3749 /
-            :5184).  Previously Phase 7 stubs.  DeferForeignKey now
-            toggles the most recent FKey.isDeferred byte (offset 44)
-            on pParse^.pNewTable for INITIALLY DEFERRED parsing.
-            SrcListFuncArgs attaches the parsed argument list to the
-            last SrcItem and tags it isTabFunc (fgBits bit 3) so the
-            table-valued-function FROM-item arm of the planner sees
-            the args.  TestExplainParity unchanged (1016/1026).
-       [X] `sqlite3FkDropTable` — ported 2026-04-30 (fkey.c:736) in
-            passqlite3codegen.pas.  Replaces the Phase 6.6 stub.  Emits
-            the implicit `DELETE FROM <tbl>` that runs before DROP TABLE
-            when foreign-keys are enabled and either pTab is the parent
-            of any FK (productive arm via sqlite3FkReferences) or
-            SQLITE_DeferFKs is set globally (approximation of the
-            per-FK isDeferred walk — TFKey internals still opaque, so
-            INITIALLY DEFERRED on individual FKs not detectable).
-            Triggers disabled around the DELETE; immediate violations
-            halt via OP_FkIfZero+sqlite3HaltConstraint.  TestExplainParity
-            unchanged (1016/1026).
-       [X] `sqlite3LogEstFromDouble` + `sqlite3LogEstToInt` +
-            `sqlite3ErrorToParser` — ported 2026-04-29 (util.c:2125 /
-            :2139 / :273).  LogEst conversions are the inverse helpers
-            of the existing sqlite3LogEst (fast double→LogEst via the
-            IEEE-754 exponent for x>2e9, otherwise the integer path;
-            LogEst→u64 reconstruction uses the n%10/n/10 shift table).
-            ErrorToParser propagates an error code into db^.pParse->rc
-            and bumps nErr; returns the code unchanged so callers can
-            tail-return through it.  Faithful 1:1; not yet wired into
-            consumers (planner cost model + a few error sites still use
-            inline equivalents) but exposed for downstream wiring.
-       [X] `sqlite3FkDelete` + `fkTriggerDelete` (fkey.c:1451 / :688) —
-            ported 2026-04-30 in passqlite3codegen.pas.  Replaces the
-            Phase 7 no-op stub.  Walks `pTab^.u.tab.pFKey` via documented
-            byte offsets (PFKey is still opaque PPointer in this port —
-            see codegen.pas:418), unlinks each entry from
-            pSchema^.fkeyHash (skipped when db^.pnBytesFreed<>nil per the
-            tear-down arm), invokes fkTriggerDelete on apTrigger[0/1] to
-            free CASCADE/SET NULL synthetic triggers, then sqlite3DbFree
-            the FKey itself.  fkTriggerDelete frees step_list's
-            pSrc/pWhere/pExprList/pSelect plus pWhen and the Trigger.
-            Closes a real memory-leak: prior to this, every CREATE TABLE
-            ... REFERENCES ... that survived to sqlite3DeleteTable leaked
-            its FKey + apTrigger trees.  TestExplainParity unchanged
-            (1016/1026).
-       [X] `sqlite3TouchRegister` + `sqlite3ClearTempRegCache` +
-            `sqlite3FirstAvailableRegister` (expr.c:7637/:7646/:7657) +
-            `sqlite3KeyInfoIsWriteable` (select.c:1581) +
-            `sqlite3JournalModename` (pragma.c:289) — ported 2026-04-30.
-            Tiny accessor batch.  Register helpers go in
-            passqlite3codegen.pas next to sqlite3GetTempReg/GetTempRange;
-            JournalModename lives in passqlite3pager.pas alongside
-            isWalMode.  Faithful 1:1; not yet wired into consumers (a
-            few inline `pParse^.nMem := ...` and explicit
-            nTempReg/nRangeReg resets remain in codegen) but exposed
-            for downstream wiring.  TestExplainParity unchanged
-            (1016/1026).
-       [X] `sqlite3FkClearTriggerCache` (fkey.c:705) — ported 2026-04-30
-            in passqlite3codegen.pas; replaces the empty stub previously
-            living in passqlite3vdbe.pas.  Walks aDb[iDb].pSchema^.tblHash,
-            and for each ordinary table walks pTab^.u.tab.pFKey freeing
-            apTrigger[0/1] via fkTriggerDelete and zeroing both slots so
-            fkActionTrigger rebuilds them on next access.  Wired through
-            the new vdbe.pas hook `gFkClearTriggerCache` (registered in
-            codegen's initialization), matching the existing
-            gRootPageMoved / gResetAllSchemas pattern.  Reached from
-            OP_ParseSchema (vdbe.pas:9425).  TestExplainParity unchanged
-            (1016/1026); DiagFeatureProbe unchanged (9 divergences).
-       [X] `sqlite3PCacheIsDirty` (pcache.c:712) +
-            `sqlite3PagerJournalname` (pager.c:7128) +
-            `sqlite3PagerDirectReadOk` (pager.c:805) +
-            `sqlite3PagerSetJournalMode` (pager.c:7361) — ported 2026-04-30.
-            PCacheIsDirty added to passqlite3pcache.pas as the small
-            accessor consumed by DirectReadOk (returns 1 iff pCache^.pDirty
-            <> nil).  Pager batch added to passqlite3pager.pas; SetJournalMode
-            is the full body (handles MEMDB clamp, TRUNCATE/PERSIST → DELETE
-            transition with shared/reserved-lock-coordinated journal delete,
-            and OFF/MEMORY journal close).  Faithful 1:1 ports; not yet
-            wired into PRAGMA journal_mode write codegen (still emits a
-            constant default echo) but exposed for downstream wiring.
-            TestExplainParity unchanged (1016/1026); TestPager 12/12 PASS.
-       [X] `sqlite3DeleteColumnNames` (build.c:760) — ported 2026-04-30
-            in passqlite3codegen.pas.  Previously inlined inside
-            sqlite3DeleteTable, missing both the IsOrdinaryTable+pDfltList
-            free arm (silent leak of every `DEFAULT <expr>` AST) and the
-            tear-down vs live-Table guard (db^.pnBytesFreed=nil → zero
-            aCol/nCol/u.tab.pDfltList).  sqlite3DeleteTable refactored to
-            call the new helper, matching C 1:1.  Also wires the build.c:3221
-            `sqliteViewResetAll` TODO so it can drop the inline column-walk
-            once DB_UnresetViews lands.  TestExplainParity unchanged
-            (1016/1026); DiagFeatureProbe unchanged (9 divergences).
-       [X] `sqlite3FkLocateIndex` (fkey.c:183) + `sqlite3FkOldmask`
-            (fkey.c:1095) — ported 2026-04-30 in passqlite3codegen.pas.
-            FkLocateIndex is the unique-index lookup for FK parent keys
-            (single-column IPK fast-path, composite aiCol allocation,
-            UNIQUE/PK/no-partial scan, default-collation check, mismatch
-            error via sqlite3MPrintf+ErrorMsg) — all PFKey internals
-            accessed via the same byte offsets used by sqlite3FkDelete
-            (nCol@40, aCol[i].iFrom@64+i*16, aCol[i].zCol+8).  FkOldmask
-            switched from a void Phase-7 stub to `function ... : u32`
-            with the full child-arm + parent-arm body (parent arm uses
-            FkLocateIndex).  Caller in `sqlite3GenerateRowDelete`
-            (codegen.pas:22376) now ORs the returned mask into the
-            trigger-colmask upper bound, replacing the prior "FkOldmask
-            is void" comment.  Dead-code today (PRAGMA foreign_keys
-            defaults OFF and no test enables it) but flips the function
-            from no-op to faithful 1:1 once FK enforcement is on.
-            TestExplainParity unchanged (1016/1026); DiagFeatureProbe
-            unchanged (9 divergences).
-       [X] `sqlite3SetString` (malloc.c:808) — ported 2026-04-30 in
-            passqlite3util.pas.  Two-line helper (sqlite3DbStrDup of zNew,
-            sqlite3DbFree of pz^, store).  Faithful 1:1; not yet wired
-            into a caller (the prepare.c / vacuum.c sites that use it
-            are still skeleton-only) but exposed for downstream wiring.
-            TestUtil 7/7 PASS; TestExplainParity unchanged (1016/1026).
-       [X] `sqlite3ExprCodeMove` + `sqlite3ExprCodeCopy` +
-            `sqlite3ExprNullRegisterRange` (expr.c:4498/:5912/:5828) —
-            ported 2026-04-30 in passqlite3codegen.pas.  CodeMove emits
-            OP_Move(iFrom,iTo,nReg); CodeCopy is sqlite3ExprDup +
-            sqlite3ExprCode + sqlite3ExprDelete; NullRegisterRange
-            constructs a transient TK_NULLS expression with y.nReg=nReg
-            and routes through sqlite3ExprCodeRunJustOnce with the
-            PARSEFLAG_OkConstFactor bit forced on (the C okConstFactor
-            counterpart in this port).  Faithful 1:1; not yet wired into
-            consumers (callers currently inline OP_Move / sqlite3ExprCode
-            equivalents) but exposed for downstream wiring (sqlite3Update,
-            window codegen, sub-FROM coroutine path).  TestExplainParity
-            unchanged (1016/1026); DiagFeatureProbe unchanged (9
-            divergences); TestUtil 7/7; TestSchemaBasic 44/0.
-       [X] `sqlite3SchemaGet` (callback.c:530) — ported 2026-04-30 in
-            passqlite3codegen.pas.  Previously the pBt<>nil arm returned
-            nil ("Phase 7: look up schema from btree"); now wires through
-            sqlite3BtreeSchema (passqlite3btree:7185) with sqlite3SchemaClear
-            as the per-BtShared destructor, so re-entries on the same
-            connection return the same Schema.  Also moves the hash-init /
-            enc=UTF8 to the file_format==0 guard (matches C: a re-fetched
-            populated schema must not re-init its hashes), drops the
-            non-C SQLITE_DEFAULT_CACHE_SIZE assignment (cache_size is set
-            via PRAGMA dispatch), and routes OOM through sqlite3OomFault.
-            Follow-up 2026-04-30: the pre-port reader at codegen.pas:29830
-            assumed Schema.cache_size was seeded; that assumption was wrong
-            for the ordinary `cache_size` reader (only the `cache_spill`
-            reader had the `<> 0` guard).  Reader now mirrors C
-            prepare.c:326 — when Schema.cache_size==0 (sqlite3InitOne not
-            yet ported), substitute SQLITE_DEFAULT_CACHE_SIZE.  Same
-            substitution applied to the cache_spill BtreeSetCacheSize
-            seed.  DiagPragma 12→10 divergences (regression closed);
-            TestExplainParity 1016/1026 unchanged; DiagFeatureProbe
-            9 unchanged; TestPager 12/12; TestSchemaBasic 44/0.
-       [X] `OP_FkCheck` opcode body — wired 2026-04-30 in passqlite3vdbe.pas
-            (vdbe.c:1730).  Replaces the no-op "Phase 6 schema/codegen" stub
-            with a faithful 1:1: dispatches to the existing
-            `sqlite3VdbeCheckFkImmediate` (already ported in vdbe.pas:3921)
-            and routes its return through `abort_due_to_error` on non-OK.
-            Active path: the FK-codegen stubs (`sqlite3FkCheck`/`sqlite3FkActions`)
-            remain Phase 7 no-ops, so OP_FkCheck still fires only via the
-            existing emit site in codegen.pas:21806; on a clean db the
-            check trivially returns SQLITE_OK (nFkConstraint=0), but the
-            opcode now correctly raises SQLITE_CONSTRAINT_FOREIGNKEY when
-            unresolved immediate FKs accumulate.  TestExplainParity
-            unchanged (1016/1026); DiagFeatureProbe unchanged (9 divergences);
-            TestDMLBasic 54/0; TestSchemaBasic 44/0.
-       [X] `createTableStmt` + `identLength` + `identPut` (build.c:2112 /
-            :2063 / :2084) — ported 2026-04-30.  Lives in
-            passqlite3parser.pas because identPut needs sqlite3KeywordCode
-            (private to that unit); exposed to codegen via the new
-            `gCreateTableStmt` hook (registered at unit-init alongside
-            gNestedRunParser).  sqlite3EndTable's CTAS branch
-            (codegen.pas:25969 dead-branch from before — pSelect was
-            freed before the `if pSelect <> nil` test) is now wired:
-            captures bAsSelect before freeing, then dispatches through
-            the hook to fill the schema-row sql column with the
-            canonical "CREATE TABLE name(col TYPE,...)" text.  Dead-code
-            today (sqlite3Insert pSelect early-exit at codegen.pas:19756
-            short-circuits CTAS before any rows are inserted) but flips
-            the schema-row text generation from nil to faithful 1:1.
-            TestExplainParity 1016/1026 unchanged; DiagFeatureProbe 9
-            unchanged; TestSchemaBasic 44/0; TestDMLBasic 54/0;
-            TestParser unchanged.
-       [X] `codeVectorCompare` + `exprCodeSubselect` + `exprVectorRegister`
-            (expr.c:697/:631/:659) — ported 2026-04-30 in
-            passqlite3codegen.pas.  Replaces the OP_Null degrade arm in the
-            TK_LT/LE/GT/GE/EQ/NE/IS/ISNOT vector-LHS path
-            (codegen.pas:5326), and replaces the "subselect not yet ported"
-            assert in `codeExprOrVector` (codegen.pas:35643) with the
-            sqlite3CodeSubselect + OP_Copy(iSelect..iReg, nReg-1) emit per
-            wherecode.c:1320.  Faithful 1:1: regLeft/regRight via
-            exprCodeSubselect, per-element compare with TK_LE→TK_LT /
-            TK_GE→TK_GT_TK / TK_NE→TK_EQ opx swaps, OP_ElseEq chaining,
-            OP_ZeroOrNull (or OP_Integer 0 in NULLEQ mode) result write,
-            OP_NotNull short-circuit on TK_EQ, and final OP_Not flip on
-            TK_NE.  Active path: row-value comparisons inside WHERE/SELECT
-            (`(a,b)=(1,2)`, `(a,b)<(1,2)`, etc.) now emit real bytecode
-            instead of producing NULL or aborting.  TestExplainParity
-            unchanged (1016/1026); TestDMLBasic 54/0; TestSchemaBasic 44/0;
-            TestParser 43/2 (pre-existing baseline); TestVdbeArith 41/0;
-            TestVdbeMisc 45/0.
-       [X] `sqlite3Stat4ProbeFree` (vdbemem.c:2194) — ported 2026-04-30 in
-            passqlite3vdbe.pas.  Replaces the empty stub.  Walks the
-            per-column Mem array (length read from pKeyInfo offset 8 =
-            nAllField), invokes sqlite3VdbeMemRelease on each cell, drops
-            the KeyInfo reference via the new gKeyInfoUnref hook
-            (registered from passqlite3codegen at unit init alongside
-            gValueFromExprImpl), then sqlite3DbFreeNN the record itself.
-            Dead-code today (gated on SQLITE_ENABLE_STAT4 in C; the where.c
-            caller `sqlite3Stat4ProbeFree(pBuilder^.pRec)` runs only when
-            STAT4 stats are loaded), but flips the function from a silent
-            leak to faithful 1:1 once STAT4 is enabled.  TestExplainParity
-            1016/1026 unchanged; TestDMLBasic 54/0; TestSchemaBasic 44/0;
-            TestPager 12/12.
-       [X] `sqlite3ExprCodeFactorable` (expr.c:5925) — ported 2026-04-30 in
-            passqlite3codegen.pas.  Thin wrapper over the existing
-            sqlite3ExprCodeRunJustOnce / sqlite3ExprCodeCopy pair: when
-            PARSEFLAG_OkConstFactor is set and the expression is constant
-            (sqlite3ExprIsConstantNotJoin) routes through RunJustOnce, else
-            falls through to ExprCodeCopy.  Replaces the two duplicated
-            inline arms in `sqlite3Insert`'s VALUES emission loop
-            (codegen.pas:23867 and :23890) that had hard-coded an OP_Null
-            fallback when the column DEFAULT was non-constant — the
-            wrapper now correctly emits real codegen for non-constant
-            DEFAULT expressions, matching insert.c:1395..1418 1:1.
-            TestExplainParity 1016/1026 unchanged; DiagFeatureProbe 9
-            unchanged; TestDMLBasic 54/0; TestSchemaBasic 44/0; DiagDml
-            12/2 unchanged.
+       marked as "stub" that was missed (catch-all).
        [X] Wire `sqlite3ResetOneSchema` retry into `sqlite3LockAndPrepare`
             (prepare.c:865-866) — done 2026-04-30 in passqlite3main.pas.
             Previously bailed after one retry on SQLITE_ERROR_RETRY only;
@@ -447,7 +361,7 @@ Important: At the end of this document, please find:
         [ ] `SELECT a FROM t GROUP BY a` — Δ=42 (aggregate-group
           path, not yet ported).
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
-          materialise / co-routine path not ported).
+          materialise / co-routine path not ported).  Folds into 6.13(b).
           Note 2026-04-28: `sqlite3SrcItemAttachSubquery` (build.c:5019)
           + the subquery branch of `sqlite3SrcListAppendFromTerm`
           (build.c:5102) are now real; the parser no longer drops the
@@ -492,7 +406,7 @@ Important: At the end of this document, please find:
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
       bin/DiagFeatureProbe`).  Most fold into existing tasks; the genuinely
       new silent-result bugs are listed first.
-      [ ] **c) View materialisation in SELECT.**
+      [ ] **c) View materialisation in SELECT.**  Folds into 6.13(b).
         `SELECT count(*) FROM v` returns no row on Pas.  Foundation
         landed 2026-04-28: ported `sqlite3CreateView` (build.c:2990) so
         CREATE VIEW now stores the duplicated SELECT in
@@ -512,7 +426,7 @@ Important: At the end of this document, please find:
         stub.  Closing this needs the sub-FROM materialise / co-routine
         codegen path (6.10 step 6 sub-FROM entry) — same blocker as
         non-view sub-FROM SELECTs.
-      [ ] **e) UNION / compound SELECT.**
+      [ ] **e) UNION / compound SELECT.**  Folds into 6.13(c).
         `SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)`
         returns no row.  Compound-select codegen / sub-FROM
         materialisation gap (overlaps step 6 sub-FROM Δ=7 entry).
@@ -522,7 +436,7 @@ Important: At the end of this document, please find:
         WithAdd stubs blocked on full TCte record).
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
-        do not modify the schema.  Tracked under 6.27.
+        do not modify the schema.  Tracked under 7.1.9.
       [ ] **h) CHECK constraint not enforced.**
         `CREATE TABLE t(a CHECK(a > 0)); INSERT INTO t VALUES(-1)` is
         accepted by Pas; C rejects with SQLITE_CONSTRAINT (rc=19).
@@ -641,20 +555,535 @@ Important: At the end of this document, please find:
         because `destroyRootPage` calls `sqlite3NestedParse(UPDATE
         sqlite_schema ...)` and productive `sqlite3Update` is still
         skeleton-only.  This is the only remaining contributor.
-  [ ] **6.12** port sqlite3Pragma in full.  Regression gate
+  [~] **6.12** port sqlite3Pragma in full.  Regression gate
        `src/tests/DiagPragma.pas`.  Baseline 49 DIVERGE driven to 10.
-       Remaining divergences (10): table-valued pragma_* introspection
-       functions (table_info, table_xinfo, index_list, foreign_key_list,
-       database_list, collation_list, function_list, module_list,
-       pragma_list, compile_options).  Closing these requires
-       `sqlite3PragmaVtabRegister` (Phase 6.8) + full table-driven
-       `pragmaLocate` dispatch.
+       Partial 2026-05-01: table-valued PragTyp dispatcher landed
+       (TABLE_INFO / INDEX_INFO / INDEX_LIST / DATABASE_LIST /
+       COLLATION_LIST / FUNCTION_LIST / MODULE_LIST / PRAGMA_LIST /
+       COMPILE_OPTIONS) — direct invocation works end-to-end (e.g.
+       `PRAGMA pragma_list` returns the expected 66 rows).
+       FOREIGN_KEY_LIST blocked on TFKey opaque (PFKey = Pointer,
+       codegen.pas:418); TABLE_LIST deferred.  The 10 DiagPragma
+       divergences DO NOT close: the underlying codegen now emits the
+       correct rows, but the eponymous-vtab path
+       (`SELECT count(*) FROM pragma_table_info('t')`) emits only
+       `Init/Halt/Goto` — same root cause as 6.10 step 9(c) view
+       materialisation, the SELECT codegen does not traverse
+       non-regular FROM items.  Closing the gate now requires the
+       sub-FROM materialise / eponymous-vtab traversal arm in
+       sqlite3Select (6.10 step 6 sub-FROM entry + step 9(c)), not
+       further Pragma work — see 6.13.  COMPILE_OPTIONS additionally
+       needs `sqlite3azCompileOpt` populated in main.pas:2833.
        Side-fix 2026-04-29: `PRAGMA journal_mode=X` /
        `PRAGMA locking_mode=X` write arms now emit a result row matching
        C (memdb effective-mode echo); `PRAGMA integrity_check` /
        `PRAGMA quick_check` now emit "ok" on a clean db (real walker is
        still stub, but every db this port produces is corruption-free
        by construction).
+
+  [ ] **6.13** Non-regular FROM-item codegen in `sqlite3Select`
+       (select.c).  Pas's SELECT codegen currently traverses regular
+       table cursors but falls through to a trivial `Init/Halt/Goto`
+       stub when the FROM list contains an eponymous virtual table,
+       a view, a sub-SELECT, a CTE, or a compound-SELECT source.
+       Verified 2026-05-01 via EXPLAIN
+       `SELECT * FROM pragma_pragma_list` → 3 ops total; the cursor
+       open + per-row loop never emits.  One function with three
+       new arms; landing them collectively unblocks several
+       previously-tracked rows.
+
+       **Gate reach (rows that close once 6.13 lands):**
+       - 6.10 step 6 sub-FROM (`SELECT a FROM (SELECT a FROM t)` Δ=7)
+       - 6.10 step 9(c) view materialisation (`count(*) FROM v`)
+       - 6.10 step 9(e) UNION compound source
+       - 6.10 step 9(f) WITH / CTE non-productive
+       - 6.10 step 19(a) compound-SELECT-as-INSERT-source
+       - 6.12 the 10 DiagPragma table-valued probes (eponymous-vtab
+         path through pragma_table_info / pragma_index_list / …)
+       - DiagFeatureProbe rows (c) view, (e) compound, (f) CTE.
+
+       **Sub-arms to port:**
+       [x] **a) Eponymous-vtab arm** — when `IsVirtual(pTab)` is true
+            on a `pSrcItem`, emit cursor-traversal: `OP_VOpen`
+            (p4=PVTable) → `OP_Integer 0,regIdxNum` → `OP_VFilter
+            cursor,addrEof,regIdxNum` → inner-loop body reading via
+            `OP_VColumn` → `OP_VNext cursor,addrLoopTop` → close at
+            `addrEof`.  All four runtime opcodes are already wired in
+            `passqlite3vdbe.pas` (OP_VOpen, OP_VFilter, OP_VNext,
+            OP_VColumn); only the codegen-side emission is missing.
+            Smallest of the three arms; should land first since it
+            unblocks the entire DiagPragma 6.12 gate on its own.
+            C reference: `sqlite3Select` per-pSrcItem cursor-open
+            switch (select.c roughly 5400..5500) + the vtab arm
+            around select.c:6100.
+            Landed 2026-05-01 at codegen.pas:20104 (just before the
+            "All source items must be real, non-virtual base tables"
+            gate): for nSrc=1 / SRT_Output|SRT_Mem / no WHERE / no
+            DISTINCT / no Aggregate / no Compound, emits
+            VOpen → Integer 0,r → Integer 0,r+1 → VFilter
+            (idxNum=0, argc=0, idxStr=nil) → per-row column emit via
+            sqlite3ExprCodeTarget (TK_COLUMN routes to OP_VColumn
+            through sqlite3ExprCodeGetColumnOfTable) → ResultRow →
+            VNext → Close.  Smoke: `SELECT name FROM
+            pragma_pragma_list` returns 66 rows.  count(*) /
+            arg-bound forms (pragma_table_info('t')) still bail —
+            those need either WhereBegin's vtab branch or a
+            count-on-vtab special case (deferred).
+       [ ] **b) Sub-SELECT / view arm** — when
+            `pSrcItem.fg.fgBits and SRCITEM_FG_IS_SUBQUERY` is set,
+            emit either a co-routine (preferred — yielded inner-VDBE
+            streams rows into the outer scan) or a materialise-into-
+            ephemeral fallback.  Lift the five existing bails at
+            codegen.pas:19646, :19924, :19981, :20114, :21203.
+            Port `sqlite3CodeSubquery` (select.c around 5800) for the
+            co-routine emission; the materialise arm is the older
+            ephemeral-table path used when the subquery cannot be
+            co-routined (correlated, etc.).  selectExpander view-arm
+            (select.c:6039..6073) is already partially landed per
+            6.10 step 9(c) note — once subqueries work, views fold in
+            for free because selectExpander rewrites a VIEW FROM-item
+            into a SUBQUERY FROM-item.
+            **2026-05-01 spike (reverted, kept here as a map for the
+            next attempt).**  A four-piece prototype landed and was
+            reverted on the same branch:
+              1. `SRT_EphemTab` accepted at the top dest gate
+                 (codegen.pas:19502) plus a disposal arm
+                 (`MakeRecord` + `NewRowid` + `Insert`/APPEND) right
+                 after the `SRT_Mem` arm in the regular path's inner
+                 loop disposal block.
+              2. selectExpander FROM-loop was extended so subquery
+                 SrcItems get a recursive `sqlite3SelectPrep` on the
+                 inner SELECT followed by `sqlite3ExpandSubquery`
+                 (without this, outer column refs into a subquery
+                 fail to resolve with "no such column").  Order
+                 matters — the new arm must run before the existing
+                 `if pItem^.zName = nil then Continue` skip.
+              3. A standalone "materialise sub-SELECT" arm was added
+                 in `sqlite3Select` right before the regular path's
+                 "all source items must be real base tables" gate at
+                 line 20104, gated on nSrc=1 / SRT_Output / no WHERE
+                 / no DISTINCT / no Aggregate / no Compound / pSubq
+                 non-nil / pSTab non-nil.  Allocates one cursor (the
+                 same iCursor selectExpander assigned, so resolved
+                 TK_COLUMN refs find the eph cursor), opens
+                 `OP_OpenEphemeral iEph, innerNCol`, recursively codes
+                 the inner via `sqlite3Select(... SRT_EphemTab ...)`,
+                 then hand-rolls a Rewind/Column/ResultRow/Next/Close
+                 outer scan.
+              4. Bytecode shape matched the C oracle for the simple
+                 `SELECT a FROM (SELECT a FROM t)` case.  But at
+                 runtime every materialised query hit
+                 `SQLITE_CORRUPT (11) "database disk image is
+                 malformed"` raised inside the OP_NewRowid →
+                 sqlite3BtreeLast → moveToRoot path on the eph
+                 cursor.  All existing OpenEphemeral usage in the
+                 port passes a `P4_KEYINFO` (indexed eph); this is
+                 the first rowid-table eph callsite, and the
+                 SCHEMA_ROOT+1 auto-root path in
+                 `passqlite3vdbe.pas:9152` appears to need an
+                 explicit `sqlite3BtreeCreateTable` before the
+                 cursor open.  DiagFeatureProbe also surfaced an
+                 EAccessViolation regression (CREATE VIEW + SELECT
+                 count) — the selectExpander subquery hook
+                 triggered some downstream NIL-deref on the
+                 view→subquery rewrite path.  Both issues are
+                 localized to the prototype and unrelated to
+                 6.13(a).  Reverted so main stays clean.
+            **Next attempt suggestions (in order of effort / value):**
+              * [x] Fix `OP_OpenEphemeral` rowid-table path
+                (passqlite3vdbe.pas:9150..9155) — done 2026-05-01.
+                The C comment "use the auto-created table at
+                SCHEMA_ROOT+1" relied on newDatabase pre-allocating
+                page 2; the port's newDatabase only initialises
+                page 1, so the rowid arm now calls
+                `sqlite3BtreeCreateTable(BTREE_INTKEY)` and captures
+                the assigned pgno before `sqlite3BtreeCursor`.
+                Index-table arm unchanged.  Smoke landed as
+                TestVdbeCursor T9: hand-rolled bytecode opens an
+                eph rowid table, inserts 3 rows via
+                NewRowid+MakeRecord+Insert, scans them back via
+                Rewind/Column/ResultRow/Next — produces 3 rows,
+                rc=SQLITE_DONE (was SQLITE_CORRUPT).  Unblocks the
+                materialise arm in piece 3.
+              * [x] Re-land the SRT_EphemTab dest + disposal arm
+                (piece 1) — done 2026-05-01.  Top dest gate at
+                codegen.pas:19510 now accepts SRT_EphemTab alongside
+                SRT_Output / SRT_Set / SRT_Mem.  Disposal arm slotted
+                in at codegen.pas:20420 (immediately after the
+                SRT_Mem branch) emits the C-mirror triplet:
+                `OP_MakeRecord iSdst, nResultCol, r1` →
+                `OP_NewRowid iSDParm, r2` →
+                `OP_Insert iSDParm, r1, r2` with
+                `p5 |= OPFLAG_APPEND`; both temp regs released.
+                Mirrors selectInnerLoop:1349..1370 (SRT_Table /
+                SRT_EphemTab branch).  Smoke landed as
+                TestSelectBasic T11: drives the existing
+                sqlite3MaterializeView path inline (CREATE TABLE
+                base; build SrcList(base); SelectNew(*); Select
+                with dest=SRT_EphemTab) and walks the resulting
+                bytecode to assert the triplet appears, in order,
+                with iSDParm on each cursor op and OPFLAG_APPEND on
+                the Insert.  All regression tests stay green
+                (TestExplainParity unchanged at 1016 pass / 10
+                diverge baseline).  This unblocks piece 3 (the
+                materialise arm) — once the cursor at iSDParm is
+                opened by the caller and the FROM dispatcher routes
+                a sub-SELECT here, rows will land in the eph table
+                via the disposal arm landed today.
+              * [x] Re-land the selectExpander subquery hook (piece 2)
+                separately, and add a DiagFeatureProbe gate-row to
+                lock the no-regression guarantee on VIEW.  Done
+                2026-05-01.  Hook landed in sqlite3SelectExpand
+                FROM-loop (codegen.pas:18157) just before the existing
+                zName/pSubq skips: when SrcItemIsSubquery(fg) and
+                pItem^.u4.pSubq <> nil, recursively run
+                sqlite3SelectPrep on the inner pSelect, then
+                sqlite3ExpandSubquery to materialise pSTab from the
+                inner result columns, then assign iCursor and
+                Continue (so the base-table arm below skips the now-
+                resolved item).  The prior spike's EAccessViolation
+                regression was driven by the same hook firing on a
+                view->subquery rewrite mid-iteration; this re-land
+                stays at the top of the loop and the view arm below
+                is unchanged, so the recursive sqlite3SelectExpand
+                the view arm triggers reaches this hook only via the
+                inner SELECT (not via re-entry on the same item).
+                Gate row landed in DiagFeatureProbe.pas:
+                'CREATE VIEW + plain SELECT FROM v' currently locks
+                at Pas chkPrep=1/val=-1 (preparable-view gate, will
+                flip to PASS once piece 3 lands the materialise arm).
+                Regression sweep stays at TestExplainParity 1016/10,
+                TestSelectBasic 60/0, TestDMLBasic 54/0,
+                TestSchemaBasic 44/0, TestWhereBasic 52/0,
+                TestVdbeCursor 29/0; DiagFeatureProbe goes from 9
+                to 10 divergences (the new gate row, both view rows
+                still diverge at chkPrep=1 — no crash, no
+                EAccessViolation).
+              * [x] Then re-land the materialise arm (piece 3) — at
+                that point it should produce live rows.  Done
+                2026-05-01.  Standalone arm landed in sqlite3Select
+                just before the "all source items must be real base
+                tables" gate (codegen.pas:20239), gated on nSrc=1 /
+                SRT_Output / no WHERE / no DISTINCT / IS_SUBQUERY /
+                pSubq non-nil / pSelect non-nil / pSTab non-nil
+                (the last guaranteed by piece 2).  Opens an eph
+                rowid table at the cursor selectExpander assigned,
+                recursively codes the inner via SRT_EphemTab so
+                piece 1's disposal arm appends each row, then
+                hand-rolls Rewind/Column/ResultRow/Next/Close on
+                the materialised rows.  Live-row smoke (off-tree):
+                `SELECT a FROM (SELECT a FROM t)` returns [1,2,3];
+                `SELECT a+10 FROM (...)` returns [11,12,13];
+                `SELECT a FROM (SELECT a FROM t WHERE a>1)` returns
+                [2,3].  DiagFeatureProbe gate row
+                'Sub-SELECT FROM materialise' flips to PASS.
+                count(*)-of-subquery still bails at the SF_Aggregate
+                gate above the materialise arm — that's a separate
+                aggregate-on-subquery lift not in piece 3 scope.
+                CREATE VIEW + SELECT rows still diverge at chkPrep=1
+                ("no such column: a") — pre-existing resolver-side
+                gap on the view->subquery rewrite, unrelated to
+                piece 3 (materialise arm itself isn't reached).
+                Regression sweep stays green (TestExplainParity
+                1016/10, all single-test suites unchanged).
+              * [x] Co-routine emission (`sqlite3CodeSubquery`)
+                lands last, replaces the materialise arm where the
+                inner isn't correlated, and unblocks the wider
+                bail-lift sweep at the five existing gate sites.
+                Done 2026-05-01 (the emission half — the bail-lift
+                sweep at the five sites is deferred and tracked
+                below).  Faithful port of select.c tag-select-0482
+                (the fromClauseTermCanBeCoroutine branch around
+                select.c:8043..8062): for uncorrelated single-source
+                FROM (SELECT ...) we now prefer co-routine over
+                materialisation.  Arm landed in sqlite3Select just
+                before piece 3's materialise arm
+                (codegen.pas:20279), gated additionally on
+                `(pSubSel^.selFlags and SF_Correlated) = 0` and
+                `OptimizationEnabled(SQLITE_Coroutines)`.  Inner is
+                wrapped in OP_InitCoroutine + OP_EndCoroutine; outer
+                drives via OP_Yield; outer pEList is coded normally
+                then `translateColumnToCopy` (newly ported,
+                where.c:716..760) rewrites OP_Column iCsr,col into
+                OP_Copy regResult+col so result reads come from the
+                inner's regResult block instead of via a
+                materialised eph cursor.
+
+                Plumbing landed alongside:
+                  - `SQLITE_Coroutines = u32($02000000)` constant
+                    added (mirrors sqliteInt.h:1927).
+                  - SRT_Coroutine added to sqlite3Select's top dest
+                    gate (codegen.pas:19543) so recursive
+                    `sqlite3Select(... SRT_Coroutine ...)` doesn't
+                    fall through to the no-body stub.
+                  - SRT_Coroutine disposal arm in selectInnerLoop
+                    (codegen.pas:20546) emits `OP_Yield iSDParm`
+                    after the per-column emit, mirroring
+                    select.c:1441..1454.
+                  - Bug fix in `OP_EndCoroutine`
+                    (passqlite3vdbe.pas:7066): the prior pas port
+                    jumped to `aOp[pIn1^.u.i]` (the saved Yield
+                    itself) instead of to `aOp[savedYield.p2 - 1]`
+                    (the Yield's addrEnd parameter), so a
+                    co-routine that ran past its last row would
+                    spin instead of breaking out of the outer
+                    loop.  Re-port now matches vdbe.c:1203..1213
+                    exactly: jump to the saved Yield's `p2 - 1`
+                    and write `pIn1^.u.i = (this EndCoroutine
+                    addr) - 1` so any later Yield re-enters
+                    EndCoroutine and re-jumps to addrEnd.
+                  - Bug fix in the addrTop calculation: was
+                    `currentAddr+2` (off by one — skipped the
+                    inner's first opcode), now `currentAddr+1`
+                    matching select.c:8047 exactly.
+
+                Live-row smoke (off-tree, equivalent to piece 3's
+                smoke but now via co-routine path):
+                `SELECT a FROM (SELECT a FROM t)` returns [1,2,3];
+                `SELECT a+10 FROM (...)` returns [11,12,13];
+                `SELECT a FROM (SELECT a FROM t WHERE a>1)` returns
+                [2,3].  DiagFeatureProbe gate row
+                'Sub-SELECT FROM materialise' stays PASS (the
+                row name now lies — it's actually exercising the
+                co-routine arm — but the contract is "Pas matches
+                C", which still holds).
+
+                Bytecode shape does NOT match the C oracle yet
+                because C applies subquery flattening
+                (select.c:flattenSubquery) for the simple
+                uncorrelated case, producing a single flat scan;
+                our port emits the co-routine bytecode shape (4
+                opcodes for the inner skeleton + outer scan)
+                instead.  Both produce the same rows.  Flattening
+                is its own large port and is tracked under a
+                future 6.13 sub-arm — landing it would converge
+                the bytecode to the C oracle and likely flip a
+                few EXPLAIN parity rows.  TestExplainParity stays
+                at 1016/10 either way (no sub-SELECT FROM rows in
+                the current corpus).
+
+                Bail-lift sweep at the five `IS_SUBQUERY` gate
+                sites (codegen.pas:19686, :19964, :20021, :20165,
+                :20255) is NOT done in this piece — those gates
+                exit `sqlite3Select` before the new co-routine /
+                materialise hot-path arms reach them, so the
+                hot-path arms cover the simple shape but more
+                complex shapes (DISTINCT-on-subquery, aggregate-
+                on-subquery, multi-FROM with subquery items, etc.)
+                still bail.  Each of the five sites needs its own
+                gated, tested lift since the right behaviour
+                differs (some need to route through the
+                co-routine arm, some need WHERE-code integration).
+                Tracked as a follow-up subtask under 6.13(b).
+
+                **Sweep audit (post-piece-4):** the five sites
+                resolve into three categories — confirm-only,
+                materialise-lift, dispatcher-lift.  Mapped to
+                current passqlite3codegen.pas line numbers:
+
+                - Site #1 (codegen.pas:19733, GROUP BY agg arm):
+                  bails on IS_SUBQUERY.  See sites #1+#3 design
+                  note below — the lift is NOT a surgical bail
+                  removal.  PENDING.
+                - Site #2 (codegen.pas:20011, simple count fast
+                  path): IS_SUBQUERY = 0 gate is C-faithful —
+                  matches `isSimpleCount` at select.c:5441 line
+                  for line, count(*)-on-subquery is excluded by
+                  C as well.  No lift needed; comment now cites
+                  the C source directly.  DONE.
+                - Site #3 (codegen.pas:20068, general agg arm):
+                  same shape as site #1.  Paired lift with #1.
+                  PENDING.
+
+                **Sites #1+#3 design note (post-C-oracle audit).**
+                The original framing — "lift the IS_SUBQUERY
+                bail" — is misleading.  C handles
+                agg-on-subquery via two entirely distinct paths,
+                neither of which is a localised lift in the agg
+                arm:
+
+                1. **Flattenable inner** (no DISTINCT, no
+                   aggregate, no compound, …): C's
+                   `flattenSubquery` (select.c:flattenSubquery)
+                   rewrites `SELECT agg FROM (SELECT cols FROM t
+                   WHERE …)` into `SELECT agg FROM t WHERE …`
+                   BEFORE the agg arm runs.  C oracle for
+                   `SELECT count(*) FROM (SELECT a FROM t)`
+                   produces the 5-op fast path against `t`
+                   directly (OpenRead/Count/Close/Copy/
+                   ResultRow) — identical to `SELECT count(*)
+                   FROM t`.  Same for `SELECT avg(a) FROM
+                   (SELECT a FROM t WHERE a>1)` — flattened to
+                   `SELECT avg(a) FROM t WHERE a>1`.
+
+                2. **Non-flattenable inner** (DISTINCT,
+                   aggregate-in-subquery, etc.): C's
+                   per-pSrcItem dispatcher (select.c:7983..8133)
+                   emits a **co-routine** (not materialise) for
+                   the inner.  `sqlite3WhereBegin`'s viaCoroutine
+                   arm then drives the outer agg path: the inner
+                   yields one row at a time, `AggStep` runs in
+                   the Yield-loop body, `AggFinal` after the
+                   loop.  C oracle for `SELECT count(*) FROM
+                   (SELECT DISTINCT a FROM t)`:
+                       InitCoroutine → inner DISTINCT body →
+                       EndCoroutine → Null accumulator →
+                       InitCoroutine → Yield+AggStep loop →
+                       AggFinal → Copy → ResultRow
+
+                Implications for the Pas port:
+
+                - Lifting only the IS_SUBQUERY bail at sites #1
+                  and #3 cannot produce C-faithful bytecode.
+                  The flattenable case needs `flattenSubquery`;
+                  the non-flattenable case needs the dispatcher
+                  to set up a co-routine FROM-item, then the agg
+                  arm's call to `sqlite3WhereBegin` would route
+                  through the existing viaCoroutine arm at
+                  codegen.pas:16395.
+
+                - Pas's `sqlite3WhereBegin` viaCoroutine arm
+                  (codegen.pas:16395..16404) is already in
+                  place from earlier porting; what is missing
+                  is wiring the agg arms so the dispatcher runs
+                  before them and so they no longer bail on
+                  IS_SUBQUERY for items the dispatcher has
+                  already handled.
+
+                **Re-scoped follow-ups** (replace the original
+                "sites #1+#3 lift"):
+
+                - **6.13(b)-fl**: port `flattenSubquery`
+                  (select.c:flattenSubquery, ~600 lines).  Once
+                  landed, the flattenable case of agg-on-subquery
+                  works end-to-end with bytecode parity, no
+                  changes to sites #1 or #3 needed.  This is the
+                  same future sub-arm noted in piece 4's commit
+                  message.
+
+                - **6.13(b)-coagg**: agg-arm + dispatcher
+                  integration for the non-flattenable case.
+                  Move the per-pSrcItem subquery dispatcher
+                  (currently the standalone arms at 20283 / 20397
+                  for SRT_Output) up to run as a pre-pass before
+                  the agg arms when SF_Aggregate is set.  Lift
+                  IS_SUBQUERY bails in the agg arms.  The
+                  existing WhereBegin viaCoroutine arm picks up
+                  the rest.  Requires careful review of the
+                  AggInfo column-resolution path
+                  (analyzeAggList) against coroutine FROM-items.
+
+                Site #1+#3 remain PENDING under these two
+                re-scoped follow-ups.  No code change in this
+                audit — diverging from C bytecode shape would
+                trade a passing IS_SUBQUERY bail for a worse
+                regression-test story (TestExplainParity would
+                gain new diverges).
+                - Site #4 (codegen.pas:20212, eponymous-vtab arm):
+                  IS_SUBQUERY = 0 gate is correct — subquery
+                  items fall through to the co-routine /
+                  materialise arms immediately below (lines 20305,
+                  20416).  No lift needed.  DONE.
+                - Site #5 (codegen.pas:20488, final pre-regular-
+                  cursor-open bail): multi-FROM with subquery
+                  items.  Largest lift — needs per-pSrcItem
+                  dispatcher mirroring select.c:7983..8133 plus
+                  WHERE-code integration for the resulting eph
+                  cursor / regResult block.  PENDING.
+
+                  **Prep landed (no behaviour change):**
+                  - WhereEnd OP_Column→OP_Copy rewrite for
+                    viaCoroutine items (where.c:7754..7761) —
+                    see codegen.pas:16126.
+                  - WhereBegin cursor-open guards on both the
+                    multi-level path (codegen.pas:15471) and
+                    the single-table rowid-shortcut path
+                    (codegen.pas:15611) — both now skip
+                    TF_Ephemeral / IsView / viaCoroutine items
+                    (where.c:7259).
+                  - **Site #5 (a)** narrow lift of the
+                    nTabList=1 bail for viaCoroutine FROM items
+                    (codegen.pas:15407..15426).  When the single
+                    FROM item is viaCoroutine, sqlite3WhereBegin
+                    now routes through the full-planner branch
+                    (whereLoopAddAll → wherePathSolver →
+                    codeOneLoopStart) so the InitCoroutine +
+                    Yield emission at codegen.pas:16437 and the
+                    WhereEnd OP_Column→OP_Copy rewrite actually
+                    fire instead of bypassing into the
+                    rowid-shortcut body emission at
+                    codegen.pas:15686..15909.  Dormant until
+                    site #5 (b) wires the per-pSrcItem dispatcher
+                    that actually produces a viaCoroutine
+                    single-table FROM — no SELECT in the corpus
+                    today exercises the new path, so no PASS
+                    rows move.  Wider lift (drop the bail
+                    entirely so every nTabList=1 plan goes
+                    through the planner — option b-faithful)
+                    deferred until codeOneLoopStart is verified
+                    to cover every shape the inline block at
+                    15686..15909 currently handles.
+
+                  Tracked as **site #5 (a)** — planner viaCoroutine
+                  support, narrow lift LANDED — with site #5's
+                  actual dispatcher emission as **site #5 (b)**
+                  layered on top.
+
+                  **site #5 (b)** — full nTabList=1 bail lift
+                  LANDED 2026-05-01 (commit 41167c7).  Removes
+                  the explicit bail at codegen.pas:15422..15426 so
+                  every single-table case whereShortCut cannot
+                  classify (WHERE_OR_SUBCLAUSE recursion, virtual
+                  tables, INDEXED BY / NOT INDEXED) routes through
+                  the full planner instead of returning nil.
+                  Verified: TestExplainParity 1018/8/1026
+                  unchanged, no regressions across the test suite.
+
+                  **site #5 (c)** — INDEXED BY planner wiring
+                  LANDED 2026-05-01 (commit 889ca4f).  Three
+                  coupled fixes: (1) selectExpander now calls
+                  sqlite3IndexedByLookup for FROM items with
+                  fg.isIndexedBy set, (2) sqlite3CreateIndex
+                  populates pIndex^.colNotIdxed, (3) the planner-
+                  branch cursor-open loop allocates iIdxCur and
+                  emits OP_OpenRead with KeyInfo + OPFLAG_SEEKEQ.
+                  Net: DiagIndexing 7→6 (`not indexed` PASS).
+                  `indexed by ok` blocked on 6.8.6 (sqlite3Insert
+                  index-write rewrite).
+
+                Sites #2 and #4 close as no-op-needed because the
+                Pas gates are already faithful to C.  Sites #1,
+                #3 remain open as separate gated lifts.
+
+                Regression sweep stays green: TestExplainParity
+                1016/10, TestSelectBasic 60/0, TestDMLBasic 54/0,
+                TestSchemaBasic 44/0, TestWhereBasic 52/0,
+                TestVdbeCursor 29/0, TestSmoke pass.
+                DiagFeatureProbe stays at 10 divergences (the
+                VIEW gate row from piece 2; sub-SELECT row PASS).
+       [ ] **c) Compound-SELECT / CTE arm** — UNION / INTERSECT /
+            EXCEPT FROM-sources and `WITH … AS (…)` references.
+            Once 6.13(b) lands, compound-SELECT-as-FROM-source
+            mostly folds in (compound is just a recursive call into
+            sqlite3Select on the inner SELECT), but CTE name
+            resolution needs the parser-side `WithAdd` / `CteNew`
+            to actually populate `pParse^.pWith` (tracked under 6.20)
+            so a SrcItem matching a CTE name binds correctly.
+
+       **Sizing:** the C `sqlite3Select` is ~1500 lines; most of the
+       regular-table path is already in pas.  The new code is the
+       per-pSrcItem dispatcher (~50 lines), the eponymous-vtab arm
+       (~80 lines), the co-routine emitter (`sqlite3CodeSubquery`,
+       ~250 lines), and the bail-lift sweep at the five existing
+       gate sites.  Total ~400-600 new lines, multi-commit.  Not a
+       quick win.
+
+       **Suggested order:** 6.13(a) first (smallest, unblocks the
+       full DiagPragma gate, validates the per-pSrcItem dispatcher
+       in isolation), then 6.13(b) (largest, but with the
+       dispatcher in place the bail-lift sweep is mechanical), then
+       6.13(c) (mostly mechanical once b is done, except for the
+       6.20-blocked CTE binding).
 
 ---
 
@@ -671,6 +1100,9 @@ Important: At the end of this document, please find:
             `sqlite3NestedParse`.
        [ ] Port `sqlite3InitCallback` (main.pas:2063) — currently installs
             only system tables; full body parses each schema row.
+       [ ] Port `sqlite3RunParser` (tokenize.c) — the underlying
+            parser entry that `sqlite3NestedParse` and the prepare
+            path both call.  (Moved here from old 6.25.)
 
 - [ ] **7.1.2** `sqlite3NestedParse` full driver (build.c).  The
        current skeleton (codegen.pas:25041) early-exits when
@@ -683,116 +1115,17 @@ Important: At the end of this document, please find:
 
 - [ ] **7.1.8** ATTACH / DETACH (attach.c) — currently Phase 7 stubs
        at codegen.pas:25213/25218.  Must open the attached btree,
-       allocate `aDb[]` slot, run schema load.  (Overlaps 6.27 — move
-       here when ported.)
+       allocate `aDb[]` slot, run schema load.  (Moved here from old
+       6.27.)
+       [ ] Port `sqlite3Attach` — opens the attached btree, grows
+            `db^.aDb[]`, runs the schema load via 7.1.1.
+       [ ] Port `sqlite3Detach` — flushes + closes the btree, frees
+            the `aDb[]` slot, invalidates cached statements.
+       [ ] Wire ATTACH/DETACH parser productions through the new
+            functions (currently the parse arms emit no-op
+            bytecode).
 
 - [ ] **7.1.9** ALTER TABLE (alter.c):
-       [X] Port `sqlite3AlterRenameTable` — ported 2026-04-30 (alter.c:124)
-            in passqlite3codegen.pas.  Replaces the Phase 6.5 stub.  Locates
-            the target table, dequotes the new name, runs the collision
-            (FindTable / FindIndex / IsShadowTableOf), system-table /
-            CheckObjectName / view / auth guards; emits the three core
-            sqlite3NestedParse passes (sqlite_rename_table over schema sql,
-            tbl_name/name CASE rewrite, sqlite_sequence rename, temp-schema
-            view/trigger fixup), the OP_VRename xRename dispatch for vtabs
-            with a non-nil xRename, and finishes with renameReloadSchema +
-            renameTestSchema('after rename', 0).  Ported alongside:
-            `renameTestSchema` (alter.c:53).  Note: pParse^.colNamesSet
-            assignment dropped (no Pascal counterpart yet — benign because
-            the diagnostic SELECT at top level emits no rows).
-            sqlite3NameFromToken inlined since it's parser-unit-private.
-            TestExplainParity unchanged (1016/1026); DiagFeatureProbe
-            unchanged (9 divergences).  TestParser flips ALTER TABLE
-            rename PASS→FAIL: prepare now exercises sqlite3NestedParse
-            which is still skeleton (Phase 7.1.2), same trajectory as
-            ADD COLUMN.  Closing depends on full sqlite3NestedParse.
-       [X] Port `sqlite3AlterRenameColumn` — ported 2026-04-30 (alter.c:599)
-            in passqlite3codegen.pas.  Replaces the Phase 6.5 stub.  Locates
-            the target table, runs isAlterableTable + isRealTable, resolves
-            the column index via sqlite3ColumnIndex, then issues the
-            renameTestSchema/renameFixQuotes pair followed by two
-            sqlite3NestedParse() UPDATEs that drive sqlite_rename_column()
-            over the schema (main + temp), and finishes with
-            renameReloadSchema(..., INITFLAG_AlterRename) + after-rename
-            test.  Static helper `renameFixQuotes` (alter.c:90) ported
-            alongside.  Live alongside Phase 7.1.2 (full sqlite3NestedParse).
-            TestExplainParity unchanged (1016/1026); DiagFeatureProbe
-            unchanged (9 divergences).
-       [X] Port `sqlite3AlterDropColumn` — ported 2026-04-30 (alter.c:2250)
-            in passqlite3codegen.pas.  Replaces the Phase 7 stub.  Locates
-            the table via sqlite3LocateTableItem, runs isAlterableTable +
-            isRealTable, resolves the column index, refuses
-            COLFLAG_PRIMKEY / COLFLAG_UNIQUE columns and refuses dropping
-            the last column, runs renameTestSchema + renameFixQuotes,
-            drives `sqlite_drop_column(iDb, sql, iCol)` over sqlite_master
-            via sqlite3NestedParse, then renameReloadSchema(...,
-            INITFLAG_AlterDrop) + after-drop test.  Non-virtual columns
-            additionally rewrite on-disk rows: scans the table via
-            OP_OpenWrite/OP_Rewind, materialises remaining columns
-            (HasRowid path emits OP_Rowid; WITHOUT-ROWID path emits
-            OP_Column reads of the PK key columns), uses
-            sqlite3ExprCodeGetColumnOfTable per surviving column with the
-            REAL→NUMERIC affinity flip per C, and re-inserts via
-            OP_MakeRecord + OP_Insert/OP_IdxInsert with OPFLAG_SAVEPOSITION.
-            Live alongside Phase 7.1.2 (sqlite3NestedParse).
-            TestExplainParity unchanged (1016/1026); DiagFeatureProbe
-            unchanged (9 divergences).
-       [X] Port `sqlite3AlterDropConstraint` — ported 2026-04-30 (alter.c:2783)
-            in passqlite3codegen.pas.  Replaces the Phase 7 stub.  Routes
-            through new `alterFindTable` (alter.c:2742) + `alterFindCol`
-            (alter.c:2701) helpers, builds the `sqlite_drop_constraint(sql,
-            <iCol|name>)` UPDATE on sqlite_master via sqlite3NestedParse,
-            then renameReloadSchema(...,INITFLAG_AlterDropCons).  Live once
-            sqlite3NestedParse leaves skeleton (Phase 7.1.2).
-       [X] Port `sqlite3AlterSetNotNull` — ported 2026-04-30 (alter.c:2881).
-            Emits the IS-NULL probe via sqlite_fail and the splice via
-            sqlite_add_constraint(sqlite_drop_constraint(sql,iCol),text,iCol).
-            Static helper `alterRtrimConstraint` (alter.c:2851) ported
-            alongside (rtrim trailing whitespace and `--` comments).
-            Live alongside Phase 7.1.2.
-       [X] Port `sqlite3AlterAddConstraint` — ported 2026-04-30 (alter.c:2983).
-            Emits the duplicate-name guard via sqlite_find_constraint, the
-            `(expr) IS NOT TRUE` violation probe via sqlite_fail, then the
-            sqlite_add_constraint(sql,text,-1) splice on sqlite_master.
-            Live alongside Phase 7.1.2.
-            Helper port: `isRealTable` (alter.c:566).
-       [X] Port `sqlite3AlterBeginAddColumn` — ported 2026-04-30 (alter.c:483)
-            in passqlite3codegen.pas.  Clones the target Table into
-            pParse^.pNewTable under `sqlite_altertab_<orig>`.
-       [X] **Bug** `AssertH FAILED: AlterFinishAddColumn: pDflt op not
-            TK_SPAN` — fixed 2026-04-30.  Root cause: sqlite3AddDefaultValue
-            (codegen.pas:25287) was binding the parsed DEFAULT expression
-            directly via sqlite3ExprDup and skipping the build.c:1751
-            TK_SPAN wrapper that downstream consumers
-            (sqlite3AlterFinishAddColumn, EXPLAIN) rely on.  Fix introduces
-            `wrapTokenSpanExpr` (codegen.pas:25234) which calls
-            sqlite3ExprAlloc with a TToken carrying the trimmed source
-            span, so u.zToken sits in the wrapper's own tail buffer
-            (single-alloc lifetime, matches the EXPRDUP_REDUCE C path).
-            DiagFeatureProbe now runs to completion (9 divergences, no
-            assertion abort); TestExplainParity unchanged (1016/1026);
-            DiagDml unchanged (12 pass, 2 diverge).
-       [X] Port `sqlite3AlterFinishAddColumn` — ported 2026-04-30
-            (alter.c:313) in passqlite3codegen.pas.  Replaces the Phase 6.5
-            stub.  Validates the new column (no PRIMARY KEY / UNIQUE,
-            REFERENCES with default, NOT NULL without default, non-constant
-            DEFAULT, STORED-generated), patches the CREATE TABLE source via
-            `sqlite3NestedParse('UPDATE %Q.sqlite_master ...')`, bumps the
-            file format cookie to >=3 via OP_ReadCookie/OP_AddImm/OP_IfPos/
-            OP_SetCookie, then `renameReloadSchema(..., INITFLAG_AlterAdd)`,
-            and emits the post-add `pragma_quick_check` raise SELECT when
-            CHECK / NOT NULL-generated / TF_Strict applies.  Static helpers
-            ported alongside: `renameReloadSchema` (alter.c:111) +
-            `sqlite3ErrorIfNotEmpty` (:293).  Constants normalised to the
-            C 1:1 INITFLAG_AlterMask/_AlterRename/_AlterDrop/_AlterAdd/
-            _AlterDropCons set; SQLITE_ALTER_TABLE auth code added.
-            Dead-code path today because the parser ALTER ADD arm still
-            runs through sqlite3AlterBeginAddColumn → sqlite3AddColumn
-            → sqlite3AlterFinishAddColumn but no caller wiring exercises
-            the schema reload (sqlite3NestedParse / sqlite3RunParser hook
-            still degrades to discard); structural body is now live.
-            TestExplainParity unchanged (1016/1026); DiagFeatureProbe
-            unchanged (9 divergences).
        [~] Port `sqlite3AlterFunctions` — registers the rename-helper SQL
             functions.  Partial 2026-04-30: `sqlite_fail` + `sqlite_add_constraint`
             (alter.c:2654 addConstraintFunc) + `sqlite_find_constraint`
@@ -808,6 +1141,24 @@ Important: At the end of this document, please find:
             direct SQL invocation correctly returns SQLITE_ERROR.
        [X] Port `sqlite3RenameTokenRemap` — done 2026-04-29 (see 6.22).
        [X] Port `sqlite3RenameExprlistUnmap` — done 2026-04-29 (see 6.22).
+       [ ] Port `sqlite3AlterRenameTable` (alter.c) — drives
+            RENAME TABLE: rewrites the schema row, fires the
+            sqlite_rename_table SQL function over every dependent
+            CREATE statement, invalidates cached statements.
+            (Moved here from old 6.27.)
+       [ ] Port `sqlite3AlterFinishAddColumn` (alter.c) — finalises
+            ADD COLUMN: appends the column to the schema row, runs
+            the new-column DEFAULT expression validation, bumps the
+            schema cookie.  Closes 6.10 step 9(g) ADD COLUMN.
+            (Moved here from old 6.27.)
+       [ ] Port `sqlite3AlterAddConstraint` (alter.c) — handles
+            ADD CONSTRAINT (CHECK / FOREIGN KEY / UNIQUE) by
+            re-emitting the schema row through sqlite_add_constraint.
+            (Moved here from old 6.27.)
+       [ ] Port `sqlite3AlterRenameColumn` (alter.c) — drives
+            RENAME COLUMN.  Closes 6.10 step 9(g) RENAME COLUMN.
+       [ ] Port `sqlite3AlterDropColumn` (alter.c) — drives DROP
+            COLUMN.
 
 - [ ] **7.4b** Bytecode-diff scope of `TestParser.pas`.  Now that
   Phase 8.2 wires `sqlite3_prepare_v2` end-to-end, extend `TestParser`
@@ -840,99 +1191,6 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
        `unixCurrentTime` rewritten as the thin wrapper used in C.  VFS
        `iVersion` bumped 1→2 so `xCurrentTimeInt64` is now reachable through
        the shared `sqlite3OsCurrentTimeInt64` chain (memdb already wraps it).
-
-- [X] **8.x** `sqlite3OsCurrentTimeInt64` + `sqlite3OsCurrentTime` (os.c:290)
-       and `sqlite3StmtCurrentTime` (vdbeapi.c:1106) — ported 2026-04-29.
-       OS wrappers prefer the iVersion>=2 xCurrentTimeInt64 slot and fall back
-       through xCurrentTime * 86400000.  StmtCurrentTime latches the per-Vdbe
-       iCurrentTime so multiple julianday('now')/datetime('now') calls within
-       one statement run observe a single timestamp; the wired chain reaches
-       the existing unixCurrentTimeInt64 / memdbCurrentTimeInt64 backends.
-
-- [X] **8.x** `sqlite3_temp_directory` / `sqlite3_data_directory` public
-       extern globals + `unixTempFileInit` / `unixTempFileDir` /
-       `unixGetTempname` (main.c:148/:157, os_unix.c:6262..6342) — ported
-       2026-04-29.  Globals live in passqlite3util.pas and are zeroed by
-       `sqlite3_shutdown` (main.c:405 parity).  unixOpen no longer rolls
-       its own `/tmp/sqlite_<pid>_<seq>` name; on `zPath=nil` it routes
-       through unixGetTempname which honours the application override
-       global, then $SQLITE_TMPDIR / $TMPDIR (captured once at
-       sqlite3_os_init via unixTempFileInit), then the static fallback
-       list `/var/tmp`, `/usr/tmp`, `/tmp`, `.` — matching the C 1:1.
-
-- [X] **8.x** `sqlite3_database_file_object` (pager.c:5090) — ported
-       2026-04-29 in passqlite3pager.pas.  Walks back from any filename
-       pointer inside a pager-allocated buffer to the 4-byte zero prefix,
-       then reads the Pager* back-pointer that lives just before it and
-       returns `pPager^.fd`.  Differential probe
-       `src/tests/DiagDbFileObject.pas` opens an on-disk db, fetches the
-       main filename via `sqlite3_db_filename`, and confirms the
-       returned `sqlite3_file*` matches `sqlite3PagerFile` of the
-       backing pager.
-
-- [X] **8.x** Btree accessor batch — ported 2026-04-29 in
-       passqlite3btree.pas: `sqlite3BtreeSchema` (btree.c:11365 — lazy
-       allocation of the per-BtShared schema blob with caller-supplied
-       xFree destructor; not yet wired into `openDatabase`, which still
-       allocates schemas via `sqlite3SchemaGet(db, nil)`),
-       `sqlite3BtreeIsInBackup` (:11339), `sqlite3HeaderSizeBtree`
-       (:11538), `sqlite3BtreeSharable` (:11555),
-       `sqlite3BtreeConnectionCount` (:11564).  Closes the corresponding
-       symbol-gap entries from the 2026-04-28 public-API audit.
-
-- [X] **8.x** Small pager accessor batch — ported 2026-04-29 in
-       passqlite3pager.pas: `sqlite3PagerSetMmapLimit` (pager.c:3549),
-       `sqlite3PagerTempSpace` (:3836), `sqlite3PagerPagenumber` (:4239),
-       `sqlite3PagerIswriteable` (:6258), `sqlite3PagerRefcount` (:6826),
-       `sqlite3PagerPageRefcount` (:6846).  Faithful 1:1 thin wrappers
-       around the existing pcache + Pager fields; exposed for downstream
-       PRAGMA / debug / btree consumers (closes the corresponding
-       symbol-gap entries from the 2026-04-28 public-API audit).
-
-- [X] **8.x** Btree pragma/transaction accessor batch — ported 2026-04-29
-       in passqlite3btree.pas: `sqlite3BtreeSecureDelete` (btree.c:3177),
-       `sqlite3BtreeSetAutoVacuum` (:3198), `sqlite3BtreeGetAutoVacuum`
-       (:3222), `sqlite3BtreeSetMmapLimit` (:3017),
-       `sqlite3BtreeSetPagerFlags` (:3036), `sqlite3BtreeSchemaLocked`
-       (:11382 — no-shared-cache build → unconditional SQLITE_OK after
-       enter/leave), `sqlite3BtreeBeginStmt` (:4583 — anonymous savepoint
-       wrapper).  Faithful 1:1 ports of the small btree-mutex accessors
-       used by PRAGMA dispatch (auto_vacuum / secure_delete /
-       mmap_size / synchronous), schema-lock probing in prepare, and
-       VDBE statement sub-transactions.  Closes the corresponding
-       symbol-gap entries from the 2026-04-28 public-API audit.
-
-- [X] **8.x** `sqlite3PagerOkToChangeJournalMode` (pager.c:7460) +
-       `sqlite3PagerJournalSizeLimit` (pager.c:7473) — ported 2026-04-29
-       in passqlite3pager.pas.  Tiny accessor pair: the first guards
-       PRAGMA journal_mode writes (refuses once the pager is in
-       WRITER_CACHEMOD or has a non-zero journalOff with an open jfd);
-       the second is the get/set for the persistent-journal size limit
-       and propagates the new ceiling into the WAL via sqlite3WalLimit.
-       Both faithful 1:1 from the C, and now exposed for future PRAGMA
-       wiring (the journal_size_limit / journal_mode pragma codegen
-       still emits the constant default — wiring is downstream work).
-
-- [X] **8.x** `sqlite3ReportError` / `sqlite3CorruptError` /
-       `sqlite3MisuseError` / `sqlite3CantopenError` (main.c:3957..3973) —
-       ported 2026-04-29 in passqlite3main.pas.  Faithful translation of
-       the four error-reporting helpers used widely from btree.c / pager.c
-       when a low-level error is first detected: format
-       "<zType> at line <lineno> of [<sourceid>]" via sqlite3MPrintf and
-       dispatch to the configured xLog callback (sqlite3GlobalConfig.xLog),
-       returning iErr unchanged so callers can write
-       `return sqlite3CorruptError(__LINE__);`.
-
-- [X] **8.x** `sqlite3_errmsg16` (main.c:2775) — ported 2026-04-29 in
-       passqlite3main.pas alongside the existing `sqlite3_errmsg`.
-       Faithful UTF-16 sibling: returns the static UTF-16 "out of
-       memory" / "bad parameter or other API misuse" buffers on the
-       error paths and routes through `sqlite3_value_text16(db^.pErr)`
-       when a per-connection error value is set; inlines the
-       `sqlite3OomClear` post-condition (malloc.c:854) since that
-       helper has no separate Pas port.  Differential probe
-       `src/tests/DiagErrMsg16.pas` confirms parity on nil-db /
-       clean-db / parse-error.
 
 - [ ] **8.10** Public-API sample-program gate.  Pascal
   transliterations of the sample programs in `../sqlite3/src/shell.c.in`
