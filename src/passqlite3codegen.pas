@@ -15125,6 +15125,7 @@ var
   startAddr:   i32;
   jRng:        i32;
   iInTabDummy: i32;
+  fSingleTabCoroutine: Boolean;
 
   { Phase 6.9-bis 11g.2.f sub-progress 21 — hoist nested helper.
     Walks every base WHERE term whose root is a TK_IN with a literal-list
@@ -15390,16 +15391,35 @@ begin
     N-way planner + multi-shape codegen lands in 11g.2.d / 11g.2.e.
 
     Cleanup contract: every error path frees pWInfo via whereInfoFree.
+
+    Phase 6.13(b) site #5 (a) — narrow lift of the nTabList=1 bail for
+    viaCoroutine FROM items.  whereShortCut accepts viaCoroutine items
+    as single-table SCAN / IPK-RANGE plans, but the rowid-shortcut body
+    emission below (15686..15909) emits Rewind / SeekGT / Next directly
+    on the (unopened) coroutine cursor, bypassing codeOneLoopStart's
+    viaCoroutine arm at 16437.  Force the full-planner path for these
+    so the InitCoroutine + Yield emission and the WhereEnd
+    OP_Column→OP_Copy rewrite (already landed) actually fire.  The full
+    lift (every single-table FROM through the planner — option
+    b-faithful in the tasklist) is deferred until codeOneLoopStart is
+    verified to cover every shape the inline block at 15686..15909
+    currently handles.
     ------------------------------------------------------------------------ }
-  if (nTabList <> 1) or (whereShortCut(@sWLB) = 0) then
+  fSingleTabCoroutine := (nTabList = 1)
+    and ((SrcListItems(pTabList)[0].fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0);
+
+  if fSingleTabCoroutine
+     or (nTabList <> 1)
+     or (whereShortCut(@sWLB) = 0) then
   begin
     { Full planner path — where.c:7079..7473.
-      Covers multi-table FROM (nTabList>1) and single-table shapes that
-      whereShortCut cannot handle (non-rowid predicates, index scans, etc.).
-      For now, bail if nTabList=1 and whereShortCut failed (existing behaviour
-      for those single-table shapes) so no PASS rows regress; only the
-      nTabList>1 branch proceeds to the planner. }
-    if nTabList = 1 then
+      Covers multi-table FROM (nTabList>1), single-table viaCoroutine
+      subqueries (forced via fSingleTabCoroutine), and single-table
+      shapes that whereShortCut cannot handle (non-rowid predicates,
+      index scans, etc.).  Bail only for the latter sub-case
+      (nTabList=1 and whereShortCut returned 0 and not viaCoroutine)
+      so no existing PASS rows regress. }
+    if (nTabList = 1) and (not fSingleTabCoroutine) then
     begin
       whereInfoFree(db, pWInfo);
       Exit(nil);

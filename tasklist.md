@@ -884,42 +884,33 @@ skeleton.
                     (codegen.pas:15611) — both now skip
                     TF_Ephemeral / IsView / viaCoroutine items
                     (where.c:7259).
-
-                  **Prerequisite work surfaced while prototyping
-                  the dispatcher (not yet started):**
-                  - whereShortCut accepts viaCoroutine subquery
-                    items as single-table SCAN / IPK-RANGE plans,
-                    but the rowid-shortcut body emission
-                    (codegen.pas:15686..15909) emits Rewind /
-                    SeekGT / Next directly on the (unopened)
-                    coroutine cursor, bypassing
-                    codeOneLoopStart's viaCoroutine arm at
-                    codegen.pas:16395.
-                  - The full-planner branch bails at
-                    codegen.pas:15402 when nTabList=1, so even
-                    sending viaCoroutine items past whereShortCut
-                    does not route them through
-                    codeOneLoopStart.
-                  - The planner therefore needs an explicit
-                    "viaCoroutine single-table" path that calls
-                    codeOneLoopStart so the InitCoroutine +
-                    Yield emission and the WhereEnd
-                    OP_Column→OP_Copy rewrite (already landed)
-                    actually fire.  Either: (a) extend
-                    whereShortCut to detect viaCoroutine and
-                    pick a "scan via coroutine" plan that
-                    routes through codeOneLoopStart; or (b)
-                    lift the nTabList=1 bail in the full
-                    planner branch so all viaCoroutine items go
-                    through the standard plan-and-codegen path.
-                    Option (b) is more C-faithful (C uses one
-                    code path for all FROM shapes).  Either
-                    requires planner work and is its own
-                    multi-piece subtask.
+                  - **Site #5 (a)** narrow lift of the
+                    nTabList=1 bail for viaCoroutine FROM items
+                    (codegen.pas:15407..15426).  When the single
+                    FROM item is viaCoroutine, sqlite3WhereBegin
+                    now routes through the full-planner branch
+                    (whereLoopAddAll → wherePathSolver →
+                    codeOneLoopStart) so the InitCoroutine +
+                    Yield emission at codegen.pas:16437 and the
+                    WhereEnd OP_Column→OP_Copy rewrite actually
+                    fire instead of bypassing into the
+                    rowid-shortcut body emission at
+                    codegen.pas:15686..15909.  Dormant until
+                    site #5 (b) wires the per-pSrcItem dispatcher
+                    that actually produces a viaCoroutine
+                    single-table FROM — no SELECT in the corpus
+                    today exercises the new path, so no PASS
+                    rows move.  Wider lift (drop the bail
+                    entirely so every nTabList=1 plan goes
+                    through the planner — option b-faithful)
+                    deferred until codeOneLoopStart is verified
+                    to cover every shape the inline block at
+                    15686..15909 currently handles.
 
                   Tracked as **site #5 (a)** — planner viaCoroutine
-                  support — with site #5's actual dispatcher
-                  emission as **site #5 (b)** layered on top.
+                  support, narrow lift LANDED — with site #5's
+                  actual dispatcher emission as **site #5 (b)**
+                  layered on top.
 
                 Sites #2 and #4 close as no-op-needed because the
                 Pas gates are already faithful to C.  Sites #1,
