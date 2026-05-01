@@ -28,14 +28,104 @@ Important: At the end of this document, please find:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-- [ ] **6.8.0**  Pragma (pragma.c): `sqlite3PragmaVtabRegister` — returns `nil`; registers`pragma_*` eponymous virtual tables via
-     `sqlite3VtabCreateModule` + `pragmaVtabModule`.
+Suggested order (driven by call-graph dependencies, not numbering): 6.8.0
+(independent) → 6.8.4 → 6.8.5 (Update needs a productive WHERE) → 6.8.2
+→ 6.8.3 (Update reuses both for the row-write path) → 6.8.1 last.
+Landing 6.8.1 before 6.8.2/6.8.3/6.8.4/6.8.5 just produces another
+skeleton.
 
-- [ ] **6.8.1** finish porting `sqlite3Update` from `tsrc/update.c`
-- [ ] **6.8.2** port `sqlite3GenerateConstraintChecks` from `tsrc/insert.c`
-- [ ] **6.8.4** port `sqlite3WhereBegin`
-- [ ] **6.8.5** port `sqlite3WhereEnd`
-- [ ] **6.9.6** Finish porting `sqlite3Update`.
+- [ ] **6.8.0** Pragma (pragma.c): `sqlite3PragmaVtabRegister` — currently
+     returns `nil`; must register the `pragma_*` eponymous virtual tables
+     via `sqlite3VtabCreateModule` + `pragmaVtabModule`.
+     Gate: DiagPragma (closes the remaining 10 table-valued
+     `pragma_table_info` / `pragma_index_list` / `pragma_foreign_key_list`
+     / etc. divergences listed in 6.12).
+     [ ] Port `pragmaVtabModule` table (xConnect/xBestIndex/xOpen/
+          xClose/xFilter/xNext/xEof/xColumn/xRowid).
+     [ ] Port `pragmaVtabConnect` — synthesises the CREATE TABLE
+          declaration from `pragName` + the pragma column list.
+     [ ] Port `pragmaVtabBestIndex` — translates the schema-name and
+          argument constraints into the xFilter contract.
+     [ ] Port `pragmaVtabFilter` — runs the underlying `PRAGMA …` and
+          captures rows into the cursor.
+     [ ] Wire registration from `sqlite3Pragma` so each table-valued
+          pragma is auto-registered on first use.
+
+- [ ] **6.8.2** port `sqlite3GenerateConstraintChecks` (insert.c).
+     Gate: DiagDml + DiagTxn — closes 6.10 step 6 (autoindex INSERT,
+     IPK alias auto-rowid), step 9(h) (CHECK not enforced), step 15(d)
+     (OR IGNORE/REPLACE/FAIL), step 15(e) (IPK alias next-rowid),
+     step 26 (UNIQUE violation, autoindex maintenance).
+     [ ] NOT NULL arm (per-column abort/replace/ignore/fail).
+     [ ] CHECK arm (compile pTab^.pCheck, OP_Halt with conflict
+          resolution in P5).
+     [ ] PRIMARY KEY / UNIQUE arm: rowid uniqueness for IPK aliases,
+          index uniqueness for every implicit/explicit UNIQUE index
+          (incl. partial-index `pIdx^.pPartIdxWhere`).
+     [ ] FOREIGN KEY arm (call `sqlite3FkCheck` — already wired as
+          OP_FkCheck — and emit deferred-constraint bookkeeping).
+     [ ] Conflict-resolution dispatch (ABORT / FAIL / IGNORE /
+          REPLACE / ROLLBACK) into OP_Halt P5.
+     [ ] Auto-rowid generation for IPK alias when NULL is supplied
+          (max(rowid)+1, AUTOINCREMENT honoured via sqlite_sequence).
+
+- [ ] **6.8.3** port `sqlite3CompleteInsertion` (insert.c).  Companion
+     to 6.8.2 — emits the OP_Insert + per-index OP_IdxInsert for every
+     non-skipped index after constraint-checks pass.
+     Gate: DiagDml `unique violation`, DiagIndexing `schema after
+     create idx`, `select range via idx` — also unblocks the
+     implicit-autoindex Δ in TestExplainParity.
+     [ ] OP_Insert with correct P5 (LASTROWID / APPEND / USESEEKRESULT /
+          ISUPDATE / SAVEPOSITION).
+     [ ] Per-index OP_IdxInsert loop honouring `aRegIdx[]` skip flags
+          and partial-index gates.
+     [ ] sqlite_sequence update for AUTOINCREMENT tables.
+     [ ] Trigger-fire arm (BEFORE INSERT already wired via 6.23;
+          AFTER INSERT must fire here — closes 6.10 step 9(j)).
+
+- [ ] **6.8.4** port `sqlite3WhereBegin` (where.c).
+     Gate: TestExplainParity SELECT-WHERE corpus + DiagIndexing
+     `indexed by ok` / `not indexed` (closes 6.10 step 26(e)).
+     [ ] Allocate `WhereInfo` + per-loop `WhereLevel` array.
+     [ ] Drive `whereLoopAddAll` (already partially ported) +
+          `wherePathSolver` for the cost-based plan.
+     [ ] Single-table fast path: lift the current nTabList=1 gate
+          (codegen.pas:14991) and emit a real per-loop OP_OpenRead /
+          OP_OpenWrite + OP_SeekGE/OP_Rewind preamble.
+     [ ] Multi-table loop nesting + per-loop WHERE-clause splitting.
+     [ ] INDEXED BY / NOT INDEXED honour (codegen.pas:14203 bail).
+     [ ] Bloom-filter and covering-index arms (covers 6.10 step 9
+          d-INNER and the `SELECT p FROM u` planner Δ).
+
+- [ ] **6.8.5** port `sqlite3WhereEnd` (where.c).
+     Gate: same as 6.8.4 — they land as a pair.
+     [ ] Per-loop tail (OP_Next / OP_Prev / OP_VNext + jump back to
+          loop top).
+     [ ] Cursor close + addrBrk/addrCont label patching.
+     [ ] Free `WhereInfo` and any `IdxStr` allocations.
+
+- [ ] **6.8.1** finish porting `sqlite3Update` (update.c).  Skeleton
+     today; full body needs 6.8.2/6.8.3/6.8.4/6.8.5 first.
+     Gate: DiagDml UPDATE corpus, DiagTxn `changes() after update`
+     (step 15(f)), TestExplainParity `UPDATE t SET a=5 WHERE rowid=1`
+     Δ=14, DROP TABLE Δ=26 follow-on (6.11(b) via `sqlite3NestedParse`).
+     [ ] Source-list resolve + WHERE-clause walk (`sqlite3WhereBegin`).
+     [ ] OP_Rowid → OP_NotExists row-locate prologue.
+     [ ] Old-row read into register block (incl. unchanged columns).
+     [ ] BEFORE UPDATE trigger fire arm.
+     [ ] New-row register assembly with `sqlite3ExprCode` per
+          assignment.
+     [ ] `sqlite3GenerateConstraintChecks` invocation (6.8.2).
+     [ ] Index-update loop: per-index delete-old + insert-new
+          honouring `aXRef[]` (no-change skip).
+     [ ] `sqlite3CompleteInsertion`-equivalent row write (6.8.3) +
+          `nChange` increment.
+     [ ] AFTER UPDATE trigger fire arm.
+     [ ] UPDATE FROM arm (multi-table source) — already partially
+          covered by DiagDml UPDATE-FROM PASS but verify under the
+          full body.
+     [ ] RETURNING clause emission (DiagDml RETURNING already PASS;
+          must continue to PASS after the rewrite).
 
 - [ ] **6.9** complete the porting:
     - [ ] `sqlite3VdbeRecordCompare`
@@ -56,27 +146,68 @@ Important: At the end of this document, please find:
       Remaining: errCode-bearing corruption signalling + the codegen
       full-layout fields (u/n/r1/r2) that the slim layout still drops.
   
-  [ ] **6.24** port codegen.pas DML
-       [ ] `sqlite3GenerateConstraintChecks`.
+  [ ] **6.24** Aggregate-with-ORDER-BY codegen (select.c
+       `analyzeAggregate` + `generateAggSelect`).  The
+       ORDER-BY-inside-aggregate arm — `group_concat(val, ',' ORDER BY
+       val DESC)`, `string_agg(... ORDER BY ...)`, etc. — is not
+       honoured today; the unordered variant `group_concat(val,',')`
+       PASSes.  Distinct from 6.8.2 (constraint checks) — pure
+       SELECT-side codegen.
+       Gate: DiagWindow `group_concat ordered` (6.10 step 17(b)).
+       [ ] Per-aggregate `OrderByExpr` capture during
+            `sqlite3FuncDefRef` resolution.
+       [ ] Sorter open + key-encode in the inner-loop arm of
+            `generateAggSelect`.
+       [ ] Sorted-feed of values into the aggregate step function
+            (replaces the direct OP_AggStep path).
+       [ ] DISTINCT-aggregate variant (`count(DISTINCT x)` etc.) —
+            uses the same sorter machinery.
 
-  [ ] **6.25** port codegen.pas schema:
-       [ ] Port `sqlite3ReadSchema`
-       [ ] Port `sqlite3RunParser`.
+  [ ] **6.26** Window functions (window.c).
+       Gate: DiagWindow — closes 6.10 step 17(c) (rank, dense_rank,
+       lag, lead, first_value, ntile prepare-time failures) and step
+       17(d) (`sum() OVER (...)`, `row_number() OVER (...)` empty
+       result-set).
+       [ ] Port `sqlite3WindowCodeInit` — opens the window
+            ephemeral table, allocates partition / peer-group
+            registers, emits the partition-boundary detection
+            preamble.
+       [ ] Port `sqlite3WindowCodeStep` — per-row dispatch into
+            the active frame logic.
+       [ ] Frame-spec emission: ROWS / RANGE / GROUPS, with all
+            five bound types (UNBOUNDED PRECEDING, n PRECEDING,
+            CURRENT ROW, n FOLLOWING, UNBOUNDED FOLLOWING) and
+            EXCLUDE clauses (NO OTHERS / CURRENT ROW / GROUP / TIES).
+       [ ] Built-in window-function dispatch table:
+            `row_number` / `rank` / `dense_rank` / `percent_rank` /
+            `cume_dist` / `ntile` / `lag` / `lead` / `first_value` /
+            `last_value` / `nth_value`.
+       [ ] Aggregate-as-window arm (`sum(x) OVER (...)`,
+            `avg(x) OVER (...)`, etc.) — reuses the regular agg
+            step function inside the frame loop.
+       [ ] Multi-window arm (one SELECT with several distinct
+            OVER clauses sharing partitions).
 
-  [ ] **6.26** port codegen.pas:
-       [ ] Port `sqlite3WindowCodeInit`
-       [ ] Port `sqlite3WindowCodeStep`.
-
-  [ ] **6.27** port codegen.pas:
-       [ ] Port `sqlite3AlterRenameTable`
-       [ ] Port `sqlite3AlterFinishAddColumn`
-       [ ] Port `sqlite3AlterAddConstraint`
-       [ ] Port `sqlite3Detach`
-       [ ] Port `sqlite3Attach`
-       [ ] Port `sqlite3Analyze`
-       [X] Port `sqlite3Vacuum`
-       [ ] Port `sqlite3FkCheck`
-       [ ] Port `sqlite3FkActions`.
+  [ ] **6.27** codegen.pas schema-mutation + statistics.
+       Sub-rows that overlapped Phase 7 have been moved out
+       (ATTACH/DETACH → 7.1.8; the ALTER trio → 7.1.9).
+       [ ] Port `sqlite3Analyze` (analyze.c).  Emits the bytecode
+            that populates `sqlite_stat1` / `sqlite_stat4`; gates the
+            cost-based planner work in 6.8.4 (without ANALYZE rows
+            the planner falls back to heuristic costs and several
+            DiagIndexing cases pick the wrong plan).
+       [X] Port `sqlite3Vacuum` (vacuum.c).
+       [ ] Port `sqlite3FkCheck` (fkey.c).  Codegen-side emitter
+            that walks each FK constraint after a DELETE / UPDATE
+            and emits the OP_FkCheck calls.  The runtime opcode
+            body is already wired (commit 775ffc0); only the
+            codegen side at passqlite3codegen.pas:33122 is still a
+            stub.  Required for 6.10 step 9 and DiagFeatureProbe
+            FK-cascade cases.
+       [ ] Port `sqlite3FkActions` (fkey.c).  Synthesises the
+            ON DELETE / ON UPDATE CASCADE / SET NULL / SET DEFAULT /
+            RESTRICT / NO ACTION trigger programs.  Currently a
+            no-op at passqlite3codegen.pas:33128.
 
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
@@ -185,7 +316,7 @@ Important: At the end of this document, please find:
         WithAdd stubs blocked on full TCte record).
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
-        do not modify the schema.  Tracked under 6.27.
+        do not modify the schema.  Tracked under 7.1.9.
       [ ] **h) CHECK constraint not enforced.**
         `CREATE TABLE t(a CHECK(a > 0)); INSERT INTO t VALUES(-1)` is
         accepted by Pas; C rejects with SQLITE_CONSTRAINT (rc=19).
@@ -334,6 +465,9 @@ Important: At the end of this document, please find:
             `sqlite3NestedParse`.
        [ ] Port `sqlite3InitCallback` (main.pas:2063) — currently installs
             only system tables; full body parses each schema row.
+       [ ] Port `sqlite3RunParser` (tokenize.c) — the underlying
+            parser entry that `sqlite3NestedParse` and the prepare
+            path both call.  (Moved here from old 6.25.)
 
 - [ ] **7.1.2** `sqlite3NestedParse` full driver (build.c).  The
        current skeleton (codegen.pas:25041) early-exits when
@@ -346,8 +480,15 @@ Important: At the end of this document, please find:
 
 - [ ] **7.1.8** ATTACH / DETACH (attach.c) — currently Phase 7 stubs
        at codegen.pas:25213/25218.  Must open the attached btree,
-       allocate `aDb[]` slot, run schema load.  (Overlaps 6.27 — move
-       here when ported.)
+       allocate `aDb[]` slot, run schema load.  (Moved here from old
+       6.27.)
+       [ ] Port `sqlite3Attach` — opens the attached btree, grows
+            `db^.aDb[]`, runs the schema load via 7.1.1.
+       [ ] Port `sqlite3Detach` — flushes + closes the btree, frees
+            the `aDb[]` slot, invalidates cached statements.
+       [ ] Wire ATTACH/DETACH parser productions through the new
+            functions (currently the parse arms emit no-op
+            bytecode).
 
 - [ ] **7.1.9** ALTER TABLE (alter.c):
        [~] Port `sqlite3AlterFunctions` — registers the rename-helper SQL
@@ -365,6 +506,24 @@ Important: At the end of this document, please find:
             direct SQL invocation correctly returns SQLITE_ERROR.
        [X] Port `sqlite3RenameTokenRemap` — done 2026-04-29 (see 6.22).
        [X] Port `sqlite3RenameExprlistUnmap` — done 2026-04-29 (see 6.22).
+       [ ] Port `sqlite3AlterRenameTable` (alter.c) — drives
+            RENAME TABLE: rewrites the schema row, fires the
+            sqlite_rename_table SQL function over every dependent
+            CREATE statement, invalidates cached statements.
+            (Moved here from old 6.27.)
+       [ ] Port `sqlite3AlterFinishAddColumn` (alter.c) — finalises
+            ADD COLUMN: appends the column to the schema row, runs
+            the new-column DEFAULT expression validation, bumps the
+            schema cookie.  Closes 6.10 step 9(g) ADD COLUMN.
+            (Moved here from old 6.27.)
+       [ ] Port `sqlite3AlterAddConstraint` (alter.c) — handles
+            ADD CONSTRAINT (CHECK / FOREIGN KEY / UNIQUE) by
+            re-emitting the schema row through sqlite_add_constraint.
+            (Moved here from old 6.27.)
+       [ ] Port `sqlite3AlterRenameColumn` (alter.c) — drives
+            RENAME COLUMN.  Closes 6.10 step 9(g) RENAME COLUMN.
+       [ ] Port `sqlite3AlterDropColumn` (alter.c) — drives DROP
+            COLUMN.
 
 - [ ] **7.4b** Bytecode-diff scope of `TestParser.pas`.  Now that
   Phase 8.2 wires `sqlite3_prepare_v2` end-to-end, extend `TestParser`
