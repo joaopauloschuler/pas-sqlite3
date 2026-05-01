@@ -765,9 +765,9 @@ skeleton.
                 current passqlite3codegen.pas line numbers:
 
                 - Site #1 (codegen.pas:19733, GROUP BY agg arm):
-                  bails on IS_SUBQUERY.  Lift requires materialise
-                  pre-pass mirroring select.c:7983..8133 so the
-                  agg machinery sees a real eph cursor.  PENDING.
+                  bails on IS_SUBQUERY.  See sites #1+#3 design
+                  note below — the lift is NOT a surgical bail
+                  removal.  PENDING.
                 - Site #2 (codegen.pas:20011, simple count fast
                   path): IS_SUBQUERY = 0 gate is C-faithful —
                   matches `isSimpleCount` at select.c:5441 line
@@ -777,6 +777,91 @@ skeleton.
                 - Site #3 (codegen.pas:20068, general agg arm):
                   same shape as site #1.  Paired lift with #1.
                   PENDING.
+
+                **Sites #1+#3 design note (post-C-oracle audit).**
+                The original framing — "lift the IS_SUBQUERY
+                bail" — is misleading.  C handles
+                agg-on-subquery via two entirely distinct paths,
+                neither of which is a localised lift in the agg
+                arm:
+
+                1. **Flattenable inner** (no DISTINCT, no
+                   aggregate, no compound, …): C's
+                   `flattenSubquery` (select.c:flattenSubquery)
+                   rewrites `SELECT agg FROM (SELECT cols FROM t
+                   WHERE …)` into `SELECT agg FROM t WHERE …`
+                   BEFORE the agg arm runs.  C oracle for
+                   `SELECT count(*) FROM (SELECT a FROM t)`
+                   produces the 5-op fast path against `t`
+                   directly (OpenRead/Count/Close/Copy/
+                   ResultRow) — identical to `SELECT count(*)
+                   FROM t`.  Same for `SELECT avg(a) FROM
+                   (SELECT a FROM t WHERE a>1)` — flattened to
+                   `SELECT avg(a) FROM t WHERE a>1`.
+
+                2. **Non-flattenable inner** (DISTINCT,
+                   aggregate-in-subquery, etc.): C's
+                   per-pSrcItem dispatcher (select.c:7983..8133)
+                   emits a **co-routine** (not materialise) for
+                   the inner.  `sqlite3WhereBegin`'s viaCoroutine
+                   arm then drives the outer agg path: the inner
+                   yields one row at a time, `AggStep` runs in
+                   the Yield-loop body, `AggFinal` after the
+                   loop.  C oracle for `SELECT count(*) FROM
+                   (SELECT DISTINCT a FROM t)`:
+                       InitCoroutine → inner DISTINCT body →
+                       EndCoroutine → Null accumulator →
+                       InitCoroutine → Yield+AggStep loop →
+                       AggFinal → Copy → ResultRow
+
+                Implications for the Pas port:
+
+                - Lifting only the IS_SUBQUERY bail at sites #1
+                  and #3 cannot produce C-faithful bytecode.
+                  The flattenable case needs `flattenSubquery`;
+                  the non-flattenable case needs the dispatcher
+                  to set up a co-routine FROM-item, then the agg
+                  arm's call to `sqlite3WhereBegin` would route
+                  through the existing viaCoroutine arm at
+                  codegen.pas:16395.
+
+                - Pas's `sqlite3WhereBegin` viaCoroutine arm
+                  (codegen.pas:16395..16404) is already in
+                  place from earlier porting; what is missing
+                  is wiring the agg arms so the dispatcher runs
+                  before them and so they no longer bail on
+                  IS_SUBQUERY for items the dispatcher has
+                  already handled.
+
+                **Re-scoped follow-ups** (replace the original
+                "sites #1+#3 lift"):
+
+                - **6.13(b)-fl**: port `flattenSubquery`
+                  (select.c:flattenSubquery, ~600 lines).  Once
+                  landed, the flattenable case of agg-on-subquery
+                  works end-to-end with bytecode parity, no
+                  changes to sites #1 or #3 needed.  This is the
+                  same future sub-arm noted in piece 4's commit
+                  message.
+
+                - **6.13(b)-coagg**: agg-arm + dispatcher
+                  integration for the non-flattenable case.
+                  Move the per-pSrcItem subquery dispatcher
+                  (currently the standalone arms at 20283 / 20397
+                  for SRT_Output) up to run as a pre-pass before
+                  the agg arms when SF_Aggregate is set.  Lift
+                  IS_SUBQUERY bails in the agg arms.  The
+                  existing WhereBegin viaCoroutine arm picks up
+                  the rest.  Requires careful review of the
+                  AggInfo column-resolution path
+                  (analyzeAggList) against coroutine FROM-items.
+
+                Site #1+#3 remain PENDING under these two
+                re-scoped follow-ups.  No code change in this
+                audit — diverging from C bytecode shape would
+                trade a passing IS_SUBQUERY bail for a worse
+                regression-test story (TestExplainParity would
+                gain new diverges).
                 - Site #4 (codegen.pas:20212, eponymous-vtab arm):
                   IS_SUBQUERY = 0 gate is correct — subquery
                   items fall through to the co-routine /
