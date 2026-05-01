@@ -24508,13 +24508,790 @@ begin
   if w.eCode <> 0 then Result := 1 else Result := 0;
 end;
 
-{ sqlite3GenerateConstraintChecks — emit constraint-checking VDBE (Phase 6.4 stub) }
+{ sqlite3GenerateConstraintChecks — port of insert.c:1895..2723.
+  Generate code to perform NOT NULL, CHECK, UNIQUE/PRIMARY KEY and FK
+  constraint checks prior to an INSERT or UPDATE on table pTab.
+
+  See the C banner at insert.c:1804 for the contract details.  The five
+  conflict-resolution strategies (ROLLBACK / ABORT / FAIL / IGNORE /
+  REPLACE) plus UPSERT's OE_Update are dispatched via OP_Halt P5 or via
+  jumps to ignoreDest / inline DELETE+retry.
+
+  The IndexIterator/IndexListTerm helpers (insert.c:1751..1802) are
+  inlined as local types + nested helpers to keep the call-graph local. }
+type
+  PIndexListTerm = ^TIndexListTerm;
+  TIndexListTerm = record
+    p:  PIndex2;   { the index }
+    ix: i32;       { entry-index in the original pTab^.pIndex list }
+  end;
+
 procedure sqlite3GenerateConstraintChecks(pParse: PParse; pTab: PTable2;
   aRegIdx: Pi32; iDataCur: i32; iIdxCur: i32; regNewData: i32;
   regOldData: i32; pkChng: u8; overrideError: u8; ignoreDest: i32;
   pbMayReplace: PBoolean; aiChng: Pi32; pUpsert: PUpsert);
+label
+  LContinueIdx;
+var
+  v:                PVdbe;
+  pIdx:             PIndex2;
+  pPk:              PIndex2;
+  db:               PTsqlite3;
+  i, ix:            i32;
+  nCol:             i32;
+  onError:          i32;
+  seenReplace:      i32;
+  nPkField:         i32;
+  pUpsertClause:    PUpsert;
+  isUpdate:         u8;
+  bAffinityDone:    u8;
+  upsertIpkReturn:  i32;
+  upsertIpkDelay:   i32;
+  ipkTop:           i32;
+  ipkBottom:        i32;
+  regTrigCnt:       i32;
+  addrRecheck:      i32;
+  lblRecheckOk:     i32;
+  pTrg:         PTrigger;
+  nReplaceTrig:     i32;
+
+  { IndexIterator state — eType=0 walks pTab^.pIndex via pNext;
+    eType=1 walks the IndexListTerm array allocated for UPSERT. }
+  iterEType:  i32;
+  iterI:      i32;
+  iterPIdx:   PIndex2;     { eType=0 cursor }
+  iterAIdx:   PIndexListTerm;
+  iterNIdx:   i32;
+
+  { NOT NULL pass scratch }
+  b2ndPass:   i32;
+  nSeenReplace: i32;
+  nGenerated: i32;
+  iReg:       i32;
+  isGenerated: i32;
+  pCol:       PColumn;
+  zMsg:       PAnsiChar;
+  addr1:      i32;
+
+  { CHECK pass scratch }
+  pCheck:     PExprList;
+  pCheckItems: PExprListItem;
+  pExp, pCopy: PExpr;
+  allOk:      i32;
+  zName:      PAnsiChar;
+
+  { rowid-uniqueness scratch }
+  addrRowidOk: i32;
+
+  { UNIQUE pass scratch }
+  regIdx:     i32;
+  regR:       i32;
+  iThisCur:   i32;
+  addrUniqueOk: i32;
+  addrConflictCk: i32;
+  iField:     i32;
+  x:          i32;
+  addrJump:   i32;
+  op:         i32;
+  regCmp:     i32;
+  pColl:      Pointer;
+  azC:        PPAnsiChar;
+  nConflictCk: i32;
+  addrBypass: i32;
+  pOpC:       PVdbeOp;
+  opP2:       i32;
+  opP4z:      PAnsiChar;
+  pTermU:     PUpsert;
+  jj:         i32;
+  nIdx:       i32;
+  bUsed:      Pu8;
+  nByte:      u64;
+  regRec:     i32;
+
 begin
-  { Phase 6.5 }
+  isUpdate := u8(Ord(regOldData <> 0));
+  db := pParse^.db;
+  v := pParse^.pVdbe;
+  AssertH(v <> nil, 'GenCnstChecks v');
+  AssertH(not IsView(pTab), 'GenCnstChecks not view');
+  nCol := pTab^.nCol;
+
+  if HasRowid(pTab) then begin
+    pPk := nil;
+    nPkField := 1;
+  end else begin
+    pPk := sqlite3PrimaryKeyIndex(pTab);
+    nPkField := pPk^.nKeyCol;
+  end;
+
+  seenReplace := 0;
+  pUpsertClause := nil;
+  bAffinityDone := 0;
+  upsertIpkReturn := 0;
+  upsertIpkDelay := 0;
+  ipkTop := 0;
+  ipkBottom := 0;
+  nReplaceTrig := 0;
+  pTrg := nil;
+  regTrigCnt := 0;
+  addrRecheck := 0;
+  lblRecheckOk := 0;
+  ix := 0;
+
+  {-----------------------------------------------------------------
+    NOT NULL constraints (insert.c:1959..2059)
+   ------------------------------------------------------------------}
+  if (pTab^.tabFlags and TF_HasNotNull) <> 0 then
+  begin
+    b2ndPass := 0;
+    nSeenReplace := 0;
+    nGenerated := 0;
+    while True do
+    begin
+      for i := 0 to nCol - 1 do
+      begin
+        pCol := @(PColumn(pTab^.aCol)[i]);
+        onError := i32(pCol^.typeFlags and $0F);    { notNull bitfield }
+        if onError = OE_None then Continue;
+        if i = pTab^.iPKey then Continue;            { ROWID never NULL }
+        isGenerated := i32(pCol^.colFlags and COLFLAG_GENERATED);
+        if (isGenerated <> 0) and (b2ndPass = 0) then
+        begin
+          Inc(nGenerated);
+          Continue;
+        end;
+        if (aiChng <> nil) and (Pi32(aiChng + i)^ < 0) and (isGenerated = 0) then
+          Continue;
+
+        if overrideError <> OE_Default then
+          onError := overrideError
+        else if onError = OE_Default then
+          onError := OE_Abort;
+
+        if onError = OE_Replace then
+        begin
+          if (b2ndPass <> 0) or (pCol^.iDflt = 0) then
+            onError := OE_Abort
+          { else assert(!isGenerated) };
+        end
+        else if (b2ndPass <> 0) and (isGenerated = 0) then
+          Continue;
+
+        AssertH((onError = OE_Rollback) or (onError = OE_Abort)
+             or (onError = OE_Fail) or (onError = OE_Ignore)
+             or (onError = OE_Replace), 'NotNull onError');
+
+        iReg := sqlite3TableColumnToStorage(pTab, i) + regNewData + 1;
+        case onError of
+          OE_Replace: begin
+            addr1 := sqlite3VdbeAddOp1(v, OP_NotNull, iReg);
+            Inc(nSeenReplace);
+            sqlite3ExprCodeCopy(pParse,
+              sqlite3ColumnExpr(pTab, pCol), iReg);
+            sqlite3VdbeJumpHere(v, addr1);
+          end;
+          OE_Abort, OE_Rollback, OE_Fail: begin
+            if onError = OE_Abort then sqlite3MayAbort(pParse);
+            zMsg := sqlite3MPrintf(db, '%s.%s',
+              [pTab^.zName, pCol^.zCnName]);
+            sqlite3VdbeAddOp3(v, OP_HaltIfNull, SQLITE_CONSTRAINT_NOTNULL,
+                              onError, iReg);
+            sqlite3VdbeAppendP4(v, zMsg, P4_DYNAMIC);
+            sqlite3VdbeChangeP5(v, P5_ConstraintNotNull);
+          end;
+        else
+          { OE_Ignore }
+          AssertH(onError = OE_Ignore, 'NotNull default Ignore');
+          sqlite3VdbeAddOp2(v, OP_IsNull, iReg, ignoreDest);
+        end;
+      end; { end for i }
+
+      if (nGenerated = 0) and (nSeenReplace = 0) then Break;
+      if b2ndPass <> 0 then Break;
+      b2ndPass := 1;
+      if (nSeenReplace > 0) and ((pTab^.tabFlags and TF_HasGenerated) <> 0) then
+        sqlite3ComputeGeneratedColumns(pParse, regNewData + 1, pTab);
+    end; { end while True }
+  end;
+
+  {-----------------------------------------------------------------
+    CHECK constraints (insert.c:2061..2104)
+   ------------------------------------------------------------------}
+  if (pTab^.pCheck <> nil) and ((db^.flags and SQLITE_IgnoreChecks) = 0) then
+  begin
+    pCheck := pTab^.pCheck;
+    pCheckItems := ExprListItems(pCheck);
+    pParse^.iSelfTab := -(regNewData + 1);
+    if overrideError <> OE_Default then onError := overrideError
+    else onError := OE_Abort;
+    for i := 0 to pCheck^.nExpr - 1 do
+    begin
+      pExp := pCheckItems[i].pExpr;
+      if (aiChng <> nil)
+         and (sqlite3ExprReferencesUpdatedColumn(pExp, aiChng, pkChng) = 0)
+      then
+        Continue;
+      if bAffinityDone = 0 then
+      begin
+        sqlite3TableAffinity(v, pTab, regNewData + 1);
+        bAffinityDone := 1;
+      end;
+      allOk := sqlite3VdbeMakeLabel(pParse);
+      sqlite3VdbeVerifyAbortable(v, onError);
+      pCopy := sqlite3ExprDup(db, pExp, 0);
+      if db^.mallocFailed = 0 then
+        sqlite3ExprIfTrue(pParse, pCopy, allOk, SQLITE_JUMPIFNULL);
+      sqlite3ExprDelete(db, pCopy);
+      if onError = OE_Ignore then
+        sqlite3VdbeGoto(v, ignoreDest)
+      else begin
+        zName := pCheckItems[i].zEName;
+        if onError = OE_Replace then onError := OE_Abort;
+        sqlite3HaltConstraint(pParse, SQLITE_CONSTRAINT_CHECK,
+                              onError, zName, P4_TRANSIENT,
+                              P5_ConstraintCheck);
+      end;
+      sqlite3VdbeResolveLabel(v, allOk);
+    end;
+    pParse^.iSelfTab := 0;
+  end;
+
+  {-----------------------------------------------------------------
+    Initialise the IndexIterator + UPSERT setup (insert.c:2134..2192)
+   ------------------------------------------------------------------}
+  iterEType := 0;
+  iterI := 0;
+  iterPIdx := pTab^.pIndex;
+  iterAIdx := nil;
+  iterNIdx := 0;
+  if pUpsert <> nil then
+  begin
+    if pUpsert^.pUpsertTarget = nil then
+    begin
+      AssertH(pUpsert^.pNextUpsert = nil, 'Upsert: solo target');
+      if pUpsert^.isDoUpdate = 0 then
+      begin
+        overrideError := OE_Ignore;
+        pUpsert := nil;
+      end
+      else
+        overrideError := OE_Update;
+    end
+    else if pTab^.pIndex <> nil then
+    begin
+      nIdx := 0;
+      pIdx := pTab^.pIndex;
+      while pIdx <> nil do
+      begin
+        AssertH(Pi32(aRegIdx + nIdx)^ > 0, 'Upsert aRegIdx');
+        pIdx := pIdx^.pNext;
+        Inc(nIdx);
+      end;
+      iterEType := 1;
+      iterNIdx := nIdx;
+      nByte := u64((SizeOf(TIndexListTerm) + 1) * nIdx + nIdx);
+      iterAIdx := PIndexListTerm(sqlite3DbMallocZero(db, nByte));
+      if iterAIdx = nil then Exit;     { OOM }
+      bUsed := Pu8(PByte(iterAIdx) + SizeOf(TIndexListTerm) * nIdx);
+      pUpsert^.pToFree := iterAIdx;
+      i := 0;
+      pTermU := pUpsert;
+      while pTermU <> nil do
+      begin
+        if pTermU^.pUpsertTarget = nil then Break;
+        if pTermU^.pUpsertIdx = nil then
+        begin
+          pTermU := pTermU^.pNextUpsert;
+          Continue;                      { skip ON CONFLICT for IPK }
+        end;
+        jj := 0;
+        pIdx := pTab^.pIndex;
+        while (pIdx <> nil) and (pIdx <> pTermU^.pUpsertIdx) do
+        begin
+          pIdx := pIdx^.pNext;
+          Inc(jj);
+        end;
+        if Pu8(bUsed + jj)^ <> 0 then
+        begin
+          pTermU := pTermU^.pNextUpsert;
+          Continue;
+        end;
+        Pu8(bUsed + jj)^ := 1;
+        iterAIdx[i].p  := pIdx;
+        iterAIdx[i].ix := jj;
+        Inc(i);
+        pTermU := pTermU^.pNextUpsert;
+      end;
+      jj := 0;
+      pIdx := pTab^.pIndex;
+      while pIdx <> nil do
+      begin
+        if Pu8(bUsed + jj)^ = 0 then
+        begin
+          iterAIdx[i].p  := pIdx;
+          iterAIdx[i].ix := jj;
+          Inc(i);
+        end;
+        pIdx := pIdx^.pNext;
+        Inc(jj);
+      end;
+      AssertH(i = nIdx, 'Upsert iter fill');
+    end;
+  end;
+
+  {-----------------------------------------------------------------
+    Replace-trigger / FK bookkeeping prep (insert.c:2214..2236)
+   ------------------------------------------------------------------}
+  if (db^.flags and (SQLITE_RecTriggers or SQLITE_ForeignKeys)) = 0 then
+  begin
+    pTrg := nil;
+    regTrigCnt := 0;
+  end
+  else
+  begin
+    if (db^.flags and SQLITE_RecTriggers) <> 0 then
+    begin
+      pTrg := sqlite3TriggersExist(pParse, pTab, TK_DELETE, nil, nil);
+      if (pTrg <> nil)
+         or (sqlite3FkRequired(pParse, pTab, nil, 0) <> 0) then
+        regTrigCnt := 1
+      else
+        regTrigCnt := 0;
+    end
+    else
+    begin
+      pTrg := nil;
+      regTrigCnt := sqlite3FkRequired(pParse, pTab, nil, 0);
+    end;
+    addrRecheck  := 0;
+    lblRecheckOk := 0;
+    if regTrigCnt <> 0 then
+    begin
+      Inc(pParse^.nMem);
+      regTrigCnt := pParse^.nMem;
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, regTrigCnt);
+      lblRecheckOk := sqlite3VdbeMakeLabel(pParse);
+      addrRecheck  := lblRecheckOk;
+    end
+    else
+      regTrigCnt := 0;
+  end;
+
+  {-----------------------------------------------------------------
+    Rowid uniqueness for IPK rowid tables (insert.c:2238..2380)
+   ------------------------------------------------------------------}
+  if (pkChng <> 0) and (pPk = nil) then
+  begin
+    addrRowidOk := sqlite3VdbeMakeLabel(pParse);
+    onError := pTab^.keyConf;
+    if overrideError <> OE_Default then onError := overrideError
+    else if onError = OE_Default then onError := OE_Abort;
+
+    if pUpsert <> nil then
+    begin
+      pUpsertClause := sqlite3UpsertOfIndex(pUpsert, nil);
+      if pUpsertClause <> nil then
+      begin
+        if pUpsertClause^.isDoUpdate = 0 then
+          onError := OE_Ignore
+        else
+          onError := OE_Update;
+      end;
+      if pUpsertClause <> pUpsert then
+        upsertIpkDelay := sqlite3VdbeAddOp0(v, OP_Goto);
+    end;
+
+    if (onError = OE_Replace)
+       and (onError <> overrideError)
+       and (pTab^.pIndex <> nil)
+       and (upsertIpkDelay = 0) then
+    begin
+      ipkTop := sqlite3VdbeAddOp0(v, OP_Goto) + 1;
+    end;
+
+    if isUpdate <> 0 then
+    begin
+      sqlite3VdbeAddOp3(v, OP_Eq, regNewData, addrRowidOk, regOldData);
+      sqlite3VdbeChangeP5(v, SQLITE_NOTNULL);
+    end;
+
+    sqlite3VdbeVerifyAbortable(v, onError);
+    sqlite3VdbeAddOp3(v, OP_NotExists, iDataCur, addrRowidOk, regNewData);
+
+    case onError of
+      OE_Rollback, OE_Abort, OE_Fail:
+        sqlite3RowidConstraint(pParse, onError, pTab);
+      OE_Replace: begin
+        if regTrigCnt <> 0 then
+        begin
+          sqlite3MultiWrite(pParse);
+          sqlite3GenerateRowDelete(pParse, pTab, pTrg, iDataCur, iIdxCur,
+                                   regNewData, 1, 0, OE_Replace, 1, -1);
+          sqlite3VdbeAddOp2(v, OP_AddImm, regTrigCnt, 1);
+          Inc(nReplaceTrig);
+        end
+        else
+        begin
+          if pTab^.pIndex <> nil then
+          begin
+            sqlite3MultiWrite(pParse);
+            sqlite3GenerateRowIndexDelete(pParse, pTab, iDataCur, iIdxCur,
+                                          nil, -1);
+          end;
+        end;
+        seenReplace := 1;
+      end;
+      OE_Update: begin
+        sqlite3UpsertDoUpdate(pParse, pUpsert, pTab, nil, iDataCur);
+        sqlite3VdbeGoto(v, ignoreDest);
+      end;
+      OE_Ignore:
+        sqlite3VdbeGoto(v, ignoreDest);
+    else
+      onError := OE_Abort;
+      sqlite3RowidConstraint(pParse, onError, pTab);
+    end;
+    sqlite3VdbeResolveLabel(v, addrRowidOk);
+    if (pUpsert <> nil) and (pUpsertClause <> pUpsert) then
+      upsertIpkReturn := sqlite3VdbeAddOp0(v, OP_Goto)
+    else if ipkTop <> 0 then
+    begin
+      ipkBottom := sqlite3VdbeAddOp0(v, OP_Goto);
+      sqlite3VdbeJumpHere(v, ipkTop - 1);
+    end;
+  end;
+
+  {-----------------------------------------------------------------
+    UNIQUE index loop (insert.c:2382..2681)
+   ------------------------------------------------------------------}
+  { Prime the iterator's first element. }
+  if iterEType = 1 then
+  begin
+    if iterNIdx > 0 then
+    begin
+      pIdx := iterAIdx[0].p;
+      ix   := iterAIdx[0].ix;
+    end
+    else
+    begin
+      pIdx := nil;
+      ix   := 0;
+    end;
+  end
+  else
+  begin
+    pIdx := iterPIdx;
+    ix   := 0;
+  end;
+
+  while pIdx <> nil do
+  begin
+    if Pi32(aRegIdx + ix)^ = 0 then
+    begin
+      { advance iterator and continue }
+      goto LContinueIdx;
+    end;
+    if pUpsert <> nil then
+    begin
+      pUpsertClause := sqlite3UpsertOfIndex(pUpsert, pIdx);
+      if (upsertIpkDelay <> 0) and (pUpsertClause = pUpsert) then
+        sqlite3VdbeJumpHere(v, upsertIpkDelay);
+    end
+    else
+      pUpsertClause := nil;
+    addrUniqueOk := sqlite3VdbeMakeLabel(pParse);
+    if bAffinityDone = 0 then
+    begin
+      sqlite3TableAffinity(v, pTab, regNewData + 1);
+      bAffinityDone := 1;
+    end;
+    iThisCur := iIdxCur + ix;
+
+    { Skip partial-index rows whose WHERE clause is not satisfied. }
+    if pIdx^.pPartIdxWhere <> nil then
+    begin
+      sqlite3VdbeAddOp2(v, OP_Null, 0, Pi32(aRegIdx + ix)^);
+      pParse^.iSelfTab := -(regNewData + 1);
+      sqlite3ExprIfFalseDup(pParse, pIdx^.pPartIdxWhere, addrUniqueOk,
+                            SQLITE_JUMPIFNULL);
+      pParse^.iSelfTab := 0;
+    end;
+
+    { Build the index entry record into aRegIdx[ix]. }
+    regIdx := Pi32(aRegIdx + ix)^ + 1;
+    for i := 0 to i32(pIdx^.nColumn) - 1 do
+    begin
+      iField := Pi16(pIdx^.aiColumn + i)^;
+      if iField = XN_EXPR then
+      begin
+        pParse^.iSelfTab := -(regNewData + 1);
+        sqlite3ExprCodeCopy(pParse,
+          ExprListItems(pIdx^.aColExpr)[i].pExpr, regIdx + i);
+        pParse^.iSelfTab := 0;
+      end
+      else if (iField = XN_ROWID) or (iField = pTab^.iPKey) then
+      begin
+        sqlite3VdbeAddOp2(v, OP_IntCopy, regNewData, regIdx + i);
+      end
+      else
+      begin
+        x := sqlite3TableColumnToStorage(pTab, iField) + regNewData + 1;
+        sqlite3VdbeAddOp2(v, OP_SCopy, x, regIdx + i);
+      end;
+    end;
+    sqlite3VdbeAddOp3(v, OP_MakeRecord, regIdx, pIdx^.nColumn,
+                      Pi32(aRegIdx + ix)^);
+    sqlite3VdbeReleaseRegisters(pParse, regIdx, pIdx^.nColumn, 0, 0);
+
+    { WITHOUT ROWID PK + unchanged PK ⇒ no collision possible. }
+    if (isUpdate <> 0) and (pPk = pIdx) and (pkChng = 0) then
+    begin
+      sqlite3VdbeResolveLabel(v, addrUniqueOk);
+      goto LContinueIdx;
+    end;
+
+    onError := pIdx^.onError;
+    if onError = OE_None then
+    begin
+      sqlite3VdbeResolveLabel(v, addrUniqueOk);
+      goto LContinueIdx;
+    end;
+    if overrideError <> OE_Default then
+      onError := overrideError
+    else if onError = OE_Default then
+      onError := OE_Abort;
+
+    if pUpsertClause <> nil then
+    begin
+      if pUpsertClause^.isDoUpdate = 0 then onError := OE_Ignore
+      else onError := OE_Update;
+    end;
+
+    { WITHOUT ROWID + REPLACE + only PK + no triggers/FK ⇒ can skip. }
+    if (ix = 0) and (pIdx^.pNext = nil)
+       and (pPk = pIdx)
+       and (onError = OE_Replace)
+       and ( ((db^.flags and SQLITE_RecTriggers) = 0)
+             or (sqlite3TriggersExist(pParse, pTab, TK_DELETE, nil, nil) = nil) )
+       and ( ((db^.flags and SQLITE_ForeignKeys) = 0)
+             or ((pTab^.u.tab.pFKey = nil)
+                 and (sqlite3FkReferences(pTab) = nil)) )
+    then
+    begin
+      sqlite3VdbeResolveLabel(v, addrUniqueOk);
+      goto LContinueIdx;
+    end;
+
+    sqlite3VdbeVerifyAbortable(v, onError);
+    addrConflictCk :=
+      sqlite3VdbeAddOp4Int(v, OP_NoConflict, iThisCur, addrUniqueOk,
+                           regIdx, pIdx^.nKeyCol);
+
+    { Collision handling: locate the conflicting PK in regR. }
+    if pIdx = pPk then regR := regIdx
+    else regR := sqlite3GetTempRange(pParse, nPkField);
+
+    if (isUpdate <> 0) or (onError = OE_Replace) then
+    begin
+      if HasRowid(pTab) then
+      begin
+        sqlite3VdbeAddOp2(v, OP_IdxRowid, iThisCur, regR);
+        if isUpdate <> 0 then
+        begin
+          sqlite3VdbeAddOp3(v, OP_Eq, regR, addrUniqueOk, regOldData);
+          sqlite3VdbeChangeP5(v, SQLITE_NOTNULL);
+        end;
+      end
+      else
+      begin
+        if pIdx <> pPk then
+        begin
+          for i := 0 to i32(pPk^.nKeyCol) - 1 do
+          begin
+            x := sqlite3TableColumnToIndex(pIdx, Pi16(pPk^.aiColumn + i)^);
+            sqlite3VdbeAddOp3(v, OP_Column, iThisCur, x, regR + i);
+          end;
+        end;
+        if isUpdate <> 0 then
+        begin
+          addrJump := sqlite3VdbeCurrentAddr(v) + i32(pPk^.nKeyCol);
+          op := OP_Ne;
+          if (pIdx^.idxFlags and 3) = SQLITE_IDXTYPE_PRIMARYKEY then
+            regCmp := regIdx
+          else
+            regCmp := regR;
+          for i := 0 to i32(pPk^.nKeyCol) - 1 do
+          begin
+            azC := PPAnsiChar(pPk^.azColl);
+            pColl := sqlite3LocateCollSeq(pParse, azC[i]);
+            x := i32(Pi16(pPk^.aiColumn + i)^);
+            if i = (i32(pPk^.nKeyCol) - 1) then
+            begin
+              addrJump := addrUniqueOk;
+              op := OP_Eq;
+            end;
+            x := sqlite3TableColumnToStorage(pTab, x);
+            sqlite3VdbeAddOp4(v, op,
+              regOldData + 1 + x, addrJump, regCmp + i,
+              PAnsiChar(pColl), P4_COLLSEQ);
+            sqlite3VdbeChangeP5(v, SQLITE_NOTNULL);
+          end;
+        end;
+      end;
+    end;
+
+    AssertH((onError = OE_Rollback) or (onError = OE_Abort)
+         or (onError = OE_Fail) or (onError = OE_Ignore)
+         or (onError = OE_Replace) or (onError = OE_Update),
+      'GenCnstChecks unique onError');
+    case onError of
+      OE_Rollback, OE_Abort, OE_Fail:
+        sqlite3UniqueConstraint(pParse, onError, pIdx);
+      OE_Update: begin
+        sqlite3UpsertDoUpdate(pParse, pUpsert, pTab, pIdx, iIdxCur + ix);
+        sqlite3VdbeGoto(v, ignoreDest);
+      end;
+      OE_Ignore:
+        sqlite3VdbeGoto(v, ignoreDest);
+    else
+      AssertH(onError = OE_Replace, 'GenCnstChecks default Replace');
+      nConflictCk := sqlite3VdbeCurrentAddr(v) - addrConflictCk;
+      if regTrigCnt <> 0 then
+      begin
+        sqlite3MultiWrite(pParse);
+        Inc(nReplaceTrig);
+      end;
+      if (pTrg <> nil) and (isUpdate <> 0) then
+        sqlite3VdbeAddOp1(v, OP_CursorLock, iDataCur);
+      if pIdx = pPk then
+        sqlite3GenerateRowDelete(pParse, pTab, pTrg, iDataCur, iIdxCur,
+          regR, nPkField, 0, OE_Replace, ONEPASS_SINGLE, iThisCur)
+      else
+        sqlite3GenerateRowDelete(pParse, pTab, pTrg, iDataCur, iIdxCur,
+          regR, nPkField, 0, OE_Replace, ONEPASS_OFF, iThisCur);
+      if (pTrg <> nil) and (isUpdate <> 0) then
+        sqlite3VdbeAddOp1(v, OP_CursorUnlock, iDataCur);
+      if regTrigCnt <> 0 then
+      begin
+        sqlite3VdbeAddOp2(v, OP_AddImm, regTrigCnt, 1);
+        addrBypass := sqlite3VdbeAddOp0(v, OP_Goto);
+        sqlite3VdbeResolveLabel(v, lblRecheckOk);
+        lblRecheckOk := sqlite3VdbeMakeLabel(pParse);
+        if pIdx^.pPartIdxWhere <> nil then
+          sqlite3VdbeAddOp2(v, OP_IsNull, regIdx - 1, lblRecheckOk);
+        while nConflictCk > 0 do
+        begin
+          pOpC := sqlite3VdbeGetOp(v, addrConflictCk);
+          if pOpC^.opcode <> OP_IdxRowid then
+          begin
+            if (sqlite3OpcodeProperty[pOpC^.opcode] and OPFLG_JUMP) <> 0 then
+              opP2 := lblRecheckOk
+            else
+              opP2 := pOpC^.p2;
+            if pOpC^.p4type = P4_INT32 then
+              opP4z := PAnsiChar(PtrInt(pOpC^.p4.i))
+            else
+              opP4z := pOpC^.p4.z;
+            sqlite3VdbeAddOp4(v, pOpC^.opcode, pOpC^.p1, opP2, pOpC^.p3,
+                              opP4z, pOpC^.p4type);
+            sqlite3VdbeChangeP5(v, pOpC^.p5);
+          end;
+          Dec(nConflictCk);
+          Inc(addrConflictCk);
+        end;
+        sqlite3UniqueConstraint(pParse, OE_Abort, pIdx);
+        sqlite3VdbeJumpHere(v, addrBypass);
+      end;
+      seenReplace := 1;
+    end;
+    sqlite3VdbeResolveLabel(v, addrUniqueOk);
+    if regR <> regIdx then sqlite3ReleaseTempRange(pParse, regR, nPkField);
+    if (pUpsertClause <> nil)
+       and (upsertIpkReturn <> 0)
+       and (sqlite3UpsertNextIsIPK(pUpsertClause) <> 0) then
+    begin
+      sqlite3VdbeGoto(v, upsertIpkDelay + 1);
+      sqlite3VdbeJumpHere(v, upsertIpkReturn);
+      upsertIpkReturn := 0;
+    end;
+
+  LContinueIdx:
+    { Advance iterator. }
+    if iterEType = 1 then
+    begin
+      Inc(iterI);
+      if iterI >= iterNIdx then
+      begin
+        pIdx := nil;
+      end
+      else
+      begin
+        ix   := iterAIdx[iterI].ix;
+        pIdx := iterAIdx[iterI].p;
+      end;
+    end
+    else
+    begin
+      Inc(ix);
+      iterPIdx := iterPIdx^.pNext;
+      pIdx := iterPIdx;
+    end;
+  end;
+
+  { If the IPK constraint is a deferred REPLACE, run it now. }
+  if ipkTop <> 0 then
+  begin
+    sqlite3VdbeGoto(v, ipkTop);
+    AssertH(ipkBottom > 0, 'ipkBottom');
+    sqlite3VdbeJumpHere(v, ipkBottom);
+  end;
+
+  {-----------------------------------------------------------------
+    Recheck loop after replace-triggers fired (insert.c:2691..2709)
+   ------------------------------------------------------------------}
+  AssertH((regTrigCnt <> 0) or (nReplaceTrig = 0), 'recheck regTrigCnt');
+  if nReplaceTrig <> 0 then
+  begin
+    sqlite3VdbeAddOp2(v, OP_IfNot, regTrigCnt, lblRecheckOk);
+    if pPk = nil then
+    begin
+      if isUpdate <> 0 then
+      begin
+        sqlite3VdbeAddOp3(v, OP_Eq, regNewData, addrRecheck, regOldData);
+        sqlite3VdbeChangeP5(v, SQLITE_NOTNULL);
+      end;
+      sqlite3VdbeAddOp3(v, OP_NotExists, iDataCur, addrRecheck, regNewData);
+      sqlite3RowidConstraint(pParse, OE_Abort, pTab);
+    end
+    else
+      sqlite3VdbeGoto(v, addrRecheck);
+    sqlite3VdbeResolveLabel(v, lblRecheckOk);
+  end;
+
+  {-----------------------------------------------------------------
+    Build the table-row record for rowid tables.
+   ------------------------------------------------------------------}
+  if HasRowid(pTab) then
+  begin
+    { aRegIdx[nIdx] holds the destination register for the row record.
+      ix already points at the first slot past the last index after the
+      iterator exhausted itself in linear-mode; in array-mode, ix was
+      reassigned per item, so recompute the trailing slot index. }
+    if iterEType = 1 then
+    begin
+      regRec := Pi32(aRegIdx + iterNIdx)^;
+    end
+    else
+    begin
+      regRec := Pi32(aRegIdx + ix)^;
+    end;
+    sqlite3VdbeAddOp3(v, OP_MakeRecord, regNewData + 1, pTab^.nNVCol, regRec);
+    sqlite3SetMakeRecordP5(v, pTab);
+    if bAffinityDone = 0 then
+      sqlite3TableAffinity(v, pTab, 0);
+  end;
+
+  pbMayReplace^ := seenReplace <> 0;
 end;
 
 { sqlite3SetMakeRecordP5 — port of insert.c:2732.

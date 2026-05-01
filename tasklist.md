@@ -54,23 +54,32 @@ skeleton.
      unchanged; DiagFeatureProbe 9 unchanged; TestDMLBasic 54/0;
      TestSchemaBasic 44/0.
 
-- [ ] **6.8.2** port `sqlite3GenerateConstraintChecks` (insert.c).
+- [~] **6.8.2** port `sqlite3GenerateConstraintChecks` (insert.c).
+     Body ported 2026-05-01 (codegen.pas:24529..25303); 1:1 with
+     insert.c:1895..2723.  Function is NOT yet called from
+     sqlite3Insert/sqlite3Update — wiring follows in 6.8.1 / 6.8.3.
+     TestDMLBasic 54/0, TestExplainParity 1016/1026, DiagDml unchanged.
      Gate: DiagDml + DiagTxn — closes 6.10 step 6 (autoindex INSERT,
      IPK alias auto-rowid), step 9(h) (CHECK not enforced), step 15(d)
      (OR IGNORE/REPLACE/FAIL), step 15(e) (IPK alias next-rowid),
      step 26 (UNIQUE violation, autoindex maintenance).
-     [ ] NOT NULL arm (per-column abort/replace/ignore/fail).
-     [ ] CHECK arm (compile pTab^.pCheck, OP_Halt with conflict
+     [X] NOT NULL arm (per-column abort/replace/ignore/fail).
+     [X] CHECK arm (compile pTab^.pCheck, OP_Halt with conflict
           resolution in P5).
-     [ ] PRIMARY KEY / UNIQUE arm: rowid uniqueness for IPK aliases,
+     [X] PRIMARY KEY / UNIQUE arm: rowid uniqueness for IPK aliases,
           index uniqueness for every implicit/explicit UNIQUE index
           (incl. partial-index `pIdx^.pPartIdxWhere`).
-     [ ] FOREIGN KEY arm (call `sqlite3FkCheck` — already wired as
-          OP_FkCheck — and emit deferred-constraint bookkeeping).
-     [ ] Conflict-resolution dispatch (ABORT / FAIL / IGNORE /
-          REPLACE / ROLLBACK) into OP_Halt P5.
+     [X] FOREIGN KEY arm (regTrigCnt allocation via sqlite3FkRequired
+          + deferred-constraint bookkeeping inside the unique loop).
+          The OP_FkCheck call itself is emitted by sqlite3Insert/
+          sqlite3Update around this routine, not inside it (per C).
+     [X] Conflict-resolution dispatch (ABORT / FAIL / IGNORE /
+          REPLACE / ROLLBACK) into OP_Halt P5, plus UPSERT OE_Update
+          dispatch via sqlite3UpsertDoUpdate.
      [ ] Auto-rowid generation for IPK alias when NULL is supplied
           (max(rowid)+1, AUTOINCREMENT honoured via sqlite_sequence).
+          Belongs to sqlite3Insert (insert.c:1454..1559), not this
+          routine — defer to 6.8.1 / 6.10-step-6 wiring.
 
 - [ ] **6.8.3** port `sqlite3CompleteInsertion` (insert.c).  Companion
      to 6.8.2 — emits the OP_Insert + per-index OP_IdxInsert for every
