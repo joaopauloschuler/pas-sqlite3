@@ -573,15 +573,46 @@ skeleton.
                  localized to the prototype and unrelated to
                  6.13(a).  Reverted so main stays clean.
             **Next attempt suggestions (in order of effort / value):**
-              * Fix `OP_OpenEphemeral` rowid-table path first
-                (passqlite3vdbe.pas:9150..9155) — likely needs
-                `sqlite3BtreeCreateTable` + capture of the assigned
-                pgno before `sqlite3BtreeCursor`.  Smoke via
-                hand-rolled bytecode in TestVdbeAux before retrying
-                the codegen layer.
-              * Re-land the SRT_EphemTab dest + disposal arm
-                (piece 1) with a unit test in TestSelectBasic
-                exercising it directly.
+              * [x] Fix `OP_OpenEphemeral` rowid-table path
+                (passqlite3vdbe.pas:9150..9155) — done 2026-05-01.
+                The C comment "use the auto-created table at
+                SCHEMA_ROOT+1" relied on newDatabase pre-allocating
+                page 2; the port's newDatabase only initialises
+                page 1, so the rowid arm now calls
+                `sqlite3BtreeCreateTable(BTREE_INTKEY)` and captures
+                the assigned pgno before `sqlite3BtreeCursor`.
+                Index-table arm unchanged.  Smoke landed as
+                TestVdbeCursor T9: hand-rolled bytecode opens an
+                eph rowid table, inserts 3 rows via
+                NewRowid+MakeRecord+Insert, scans them back via
+                Rewind/Column/ResultRow/Next — produces 3 rows,
+                rc=SQLITE_DONE (was SQLITE_CORRUPT).  Unblocks the
+                materialise arm in piece 3.
+              * [x] Re-land the SRT_EphemTab dest + disposal arm
+                (piece 1) — done 2026-05-01.  Top dest gate at
+                codegen.pas:19510 now accepts SRT_EphemTab alongside
+                SRT_Output / SRT_Set / SRT_Mem.  Disposal arm slotted
+                in at codegen.pas:20420 (immediately after the
+                SRT_Mem branch) emits the C-mirror triplet:
+                `OP_MakeRecord iSdst, nResultCol, r1` →
+                `OP_NewRowid iSDParm, r2` →
+                `OP_Insert iSDParm, r1, r2` with
+                `p5 |= OPFLAG_APPEND`; both temp regs released.
+                Mirrors selectInnerLoop:1349..1370 (SRT_Table /
+                SRT_EphemTab branch).  Smoke landed as
+                TestSelectBasic T11: drives the existing
+                sqlite3MaterializeView path inline (CREATE TABLE
+                base; build SrcList(base); SelectNew(*); Select
+                with dest=SRT_EphemTab) and walks the resulting
+                bytecode to assert the triplet appears, in order,
+                with iSDParm on each cursor op and OPFLAG_APPEND on
+                the Insert.  All regression tests stay green
+                (TestExplainParity unchanged at 1016 pass / 10
+                diverge baseline).  This unblocks piece 3 (the
+                materialise arm) — once the cursor at iSDParm is
+                opened by the caller and the FROM dispatcher routes
+                a sub-SELECT here, rows will land in the eph table
+                via the disposal arm landed today.
               * Re-land the selectExpander subquery hook (piece 2)
                 separately, and add a DiagFeatureProbe gate-row to
                 lock the no-regression guarantee on VIEW.

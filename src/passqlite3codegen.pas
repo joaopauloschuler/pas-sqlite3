@@ -19408,6 +19408,7 @@ var
   nResultCol:  i32;
   i:           i32;
   r1:          i32;
+  r2:          i32;
   pWInfo:      PWhereInfo;
   isExists:    Boolean;    { True when pDest^.eDest = SRT_Exists }
   iLimitReg:   i32;        { register holding LIMIT counter for SRT_Exists }
@@ -19499,8 +19500,15 @@ begin
     two destinations is handled inline at the end of the inner loop.
     Sub-progress (TK_EXISTS): accept SRT_Exists for correlated EXISTS subquery. }
   isExists := (pDest^.eDest = SRT_Exists);
+  { 6.13(b) piece 1 — SRT_EphemTab is the materialise destination used by
+    sub-FROM / view rewrites: caller has opened a rowid eph cursor at
+    iSDParm and inner rows are appended via NewRowid+MakeRecord+Insert
+    (disposal arm below).  Mirrors the C selectInnerLoop SRT_Table /
+    SRT_EphemTab branch (select.c:1349..1370).  Treated as SRT_Set's
+    cousin at this gate — both are internal materialisations, no result
+    rows emitted. }
   if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_Set) and
-     (pDest^.eDest <> SRT_Mem) and
+     (pDest^.eDest <> SRT_Mem) and (pDest^.eDest <> SRT_EphemTab) and
      (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
   if p^.pPrior <> nil then begin Result := SQLITE_OK; Exit; end;
@@ -20414,6 +20422,22 @@ begin
       Assert(pDest^.iSdst = pDest^.iSDParm);
       if p^.iLimit <> 0 then
         sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, pWInfo^.iBreak);
+    end
+    else if pDest^.eDest = SRT_EphemTab then
+    begin
+      { 6.13(b) piece 1 — selectInnerLoop:1349..1370 SRT_Table /
+        SRT_EphemTab disposal.  Caller has opened a rowid eph cursor at
+        iSDParm; append each result row via NewRowid+MakeRecord+Insert
+        with OPFLAG_APPEND.  The two temp regs (record / rowid) are
+        released to the pool immediately. }
+      r1 := sqlite3GetTempReg(pParse);
+      r2 := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+      sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
+      sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+      sqlite3ReleaseTempReg(pParse, r2);
+      sqlite3ReleaseTempReg(pParse, r1);
     end
     else
     begin
