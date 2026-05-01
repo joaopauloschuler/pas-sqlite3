@@ -642,8 +642,33 @@ skeleton.
                 to 10 divergences (the new gate row, both view rows
                 still diverge at chkPrep=1 — no crash, no
                 EAccessViolation).
-              * Then re-land the materialise arm (piece 3) — at
-                that point it should produce live rows.
+              * [x] Then re-land the materialise arm (piece 3) — at
+                that point it should produce live rows.  Done
+                2026-05-01.  Standalone arm landed in sqlite3Select
+                just before the "all source items must be real base
+                tables" gate (codegen.pas:20239), gated on nSrc=1 /
+                SRT_Output / no WHERE / no DISTINCT / IS_SUBQUERY /
+                pSubq non-nil / pSelect non-nil / pSTab non-nil
+                (the last guaranteed by piece 2).  Opens an eph
+                rowid table at the cursor selectExpander assigned,
+                recursively codes the inner via SRT_EphemTab so
+                piece 1's disposal arm appends each row, then
+                hand-rolls Rewind/Column/ResultRow/Next/Close on
+                the materialised rows.  Live-row smoke (off-tree):
+                `SELECT a FROM (SELECT a FROM t)` returns [1,2,3];
+                `SELECT a+10 FROM (...)` returns [11,12,13];
+                `SELECT a FROM (SELECT a FROM t WHERE a>1)` returns
+                [2,3].  DiagFeatureProbe gate row
+                'Sub-SELECT FROM materialise' flips to PASS.
+                count(*)-of-subquery still bails at the SF_Aggregate
+                gate above the materialise arm — that's a separate
+                aggregate-on-subquery lift not in piece 3 scope.
+                CREATE VIEW + SELECT rows still diverge at chkPrep=1
+                ("no such column: a") — pre-existing resolver-side
+                gap on the view->subquery rewrite, unrelated to
+                piece 3 (materialise arm itself isn't reached).
+                Regression sweep stays green (TestExplainParity
+                1016/10, all single-test suites unchanged).
               * Co-routine emission (`sqlite3CodeSubquery`) lands
                 last, replaces the materialise arm where the inner
                 isn't correlated, and unblocks the wider bail-lift
