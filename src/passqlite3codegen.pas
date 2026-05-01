@@ -16018,6 +16018,7 @@ var
   pOpR:   PVdbeOp;
   xCol:   i32;
   pPkR:   PIndex2;
+  viaCoroLevel: Boolean;
 begin
   { Phase 6.9-bis 11g.2.b — productive loop-tail.
 
@@ -16113,20 +16114,46 @@ begin
           sqlite3VdbeJumpHere(v, pIn^.addrInTop - 1);
         end;
       end;
+      { where.c:7754..7761 — viaCoroutine OP_Column → OP_Copy rewrite.
+        When the FROM-clause item for this level is a coroutine subquery
+        (fg.viaCoroutine bit set), the body's OP_Column refs into the
+        subquery's iTabCur are rewritten to OP_Copy from the coroutine's
+        regResult block.  Mirrors the C `if(pTabItem->fg.viaCoroutine)
+        translateColumnToCopy(...); continue;` clause; the `continue`
+        equivalent is the `not viaCoroLevel` gate on the index-rewrite
+        block immediately below. }
+      viaCoroLevel := False;
+      if pWInfo^.pTabList <> nil then
+      begin
+        pSrcR := @SrcListItems(pWInfo^.pTabList)[pLevel^.iFrom];
+        if (pSrcR^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0 then
+        begin
+          Assert((pSrcR^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0);
+          Assert(pSrcR^.u4.pSubq <> nil);
+          Assert(pSrcR^.u4.pSubq^.regResult >= 0);
+          translateColumnToCopy(pPrs, pLevel^.addrBody, pLevel^.iTabCur,
+                                pSrcR^.u4.pSubq^.regResult, 0);
+          viaCoroLevel := True;
+        end;
+      end;
+
       { Phase 6.9-bis 11g.2.f — Index→table column rewrite tail
         (where.c:7732..7886).  When the loop drives an index (or covering
         index for OR-decomposed scans), translate OP_Column / OP_Rowid /
         OP_IfNullRow opcodes that reference the table cursor into ones
         that pull from the index cursor instead.  Skipped arms (deferred):
           - RIGHT JOIN early-exit (where.c:7745..7748),
-          - viaCoroutine OP_Column→OP_Copy rewrite (where.c:7754..7761),
           - SQLITE_ENABLE_OFFSET_SQL_FUNC OP_Offset case,
           - pParse->pIdxEpr disable on bHasExpr indexes,
-          - WHERE_EXPRIDX explain-text rewrite on covering miss. }
+          - WHERE_EXPRIDX explain-text rewrite on covering miss.
+        viaCoroutine levels skip this block (mirrors C's `continue`
+        after translateColumnToCopy). }
       pIdxR := nil;
-      if (pLoop^.wsFlags and (WHERE_INDEXED or WHERE_IDX_ONLY)) <> 0 then
+      if (not viaCoroLevel)
+         and ((pLoop^.wsFlags and (WHERE_INDEXED or WHERE_IDX_ONLY)) <> 0) then
         pIdxR := pLoop^.u.btree.pIndex
-      else if (pLoop^.wsFlags and WHERE_MULTI_OR) <> 0 then
+      else if (not viaCoroLevel)
+              and ((pLoop^.wsFlags and WHERE_MULTI_OR) <> 0) then
         pIdxR := pLevel^.u.pCoveringIdx;
       if (pIdxR <> nil) and (db^.mallocFailed = 0) then
       begin
