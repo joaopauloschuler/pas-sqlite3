@@ -124,21 +124,14 @@ skeleton.
           BY / NOT INDEXED — every shape whereShortCut bails on
           now routes through codeOneLoopStart).
      [X] `not indexed` honour (DiagIndexing PASS, commit 41167c7).
-     [~] `INDEXED BY` honour: planner-side wired (commit 889ca4f
-          adds `sqlite3IndexedByLookup` from selectExpander,
-          populates `pIndex^.colNotIdxed` in `sqlite3CreateIndex`,
-          opens `iIdxCur` with `OPFLAG_SEEKEQ` in the planner-
-          branch cursor-open loop).  Bytecode now byte-identical
-          to C oracle.  End-to-end DiagIndexing `indexed by ok`
-          still divergent because the Pas `sqlite3Insert` shortcut
-          path (codegen.pas:24770..) does not emit `OP_IdxInsert`
-          for non-IPK indexes; ix_t_a stays empty after seed
-          INSERTs and the SELECT finds no rows.  Closing this
-          requires the `sqlite3Insert` rewrite (see 6.8.1
-          deferred-arm note line 88-91 + 6.10 step 9): drop the
-          inline four-op shortcut and call
-          `sqlite3OpenTableAndIndices` + `sqlite3CompleteInsertion`
-          with a real `aRegIdx[]`.  Tracked as **6.8.6**.
+     [X] `INDEXED BY` honour: planner-side wired in commit 889ca4f
+          (`sqlite3IndexedByLookup` from selectExpander,
+          `pIndex^.colNotIdxed` populated in `sqlite3CreateIndex`,
+          `iIdxCur` opened with `OPFLAG_SEEKEQ` in the planner-
+          branch cursor-open loop).  End-to-end closure landed
+          via 6.8.6 (commit 22188d5) — `sqlite3Insert` now
+          populates indexes at insert time so the planner finds
+          rows.  DiagIndexing `indexed by ok` PASS.
      [ ] Multi-table loop nesting + per-loop WHERE-clause splitting
           (codeOneLoopStart already supports it; corpus parity
           deferred — TestExplainParity multi-table rows still
@@ -146,16 +139,36 @@ skeleton.
      [ ] Bloom-filter and covering-index arms (covers 6.10 step 9
           d-INNER and the `SELECT p FROM u` planner Δ).
 
-- [ ] **6.8.6** port the productive `sqlite3Insert` body (insert.c).
-     Replaces the inline four-op shortcut at codegen.pas:24770..
-     with the canonical `sqlite3OpenTableAndIndices` +
-     `sqlite3GenerateConstraintChecks` (already ported, 6.8.2) +
-     `sqlite3CompleteInsertion` (already ported, 6.8.3) +
-     `sqlite3AutoincrementEnd` (already ported) cascade.
-     Gate: closes DiagIndexing `indexed by ok` (the planner
-     bytecode is already correct after 6.8.4 site #5 (c); only
-     the index population at insert time is missing) and unblocks
-     6.8.4 INDEXED BY end-to-end.
+- [~] **6.8.6** port the productive `sqlite3Insert` body (insert.c).
+     Single-row VALUES path DONE 2026-05-01 (commit 22188d5).
+     The inline four-op shortcut at codegen.pas:24770.. is
+     replaced by `sqlite3OpenTableAndIndices` + per-loop column
+     eval + `sqlite3GenerateConstraintChecks` (6.8.2) +
+     `sqlite3CompleteInsertion` (6.8.3) cascade with proper
+     aRegIdx[nIdx+1] allocation.  Closes DiagIndexing
+     `indexed by ok`; bytecode for single-row VALUES now byte-
+     identical to C oracle.
+     Deferred sub-arms (route to insert_cleanup or fall back to
+     OP_NewRowid + record assembly without bail today):
+     [ ] IPK-alias rebinding (insert.c:1490..1531) — when the
+          user-provided value at regData+iPKey should become the
+          rowid (`INSERT INTO u VALUES(7,'a')` with
+          `u(id INTEGER PRIMARY KEY)`).  Currently the
+          OP_NewRowid auto-pick wins; covers the
+          `rowid alias custom` divergence and TestExplainParity
+          `INSERT IPK alias u` row.
+     [ ] Multi-row VALUES / INSERT FROM SELECT (insert.c:1115..)
+          — pSelect <> nil today bails to insert_cleanup (no
+          emission).
+     [ ] AUTOINCREMENT — `autoIncBegin` returns 0 stub; needs
+          autoinc registers + sqlite_sequence update at end.
+     [ ] BEFORE / AFTER INSERT triggers — already ported as
+          `sqlite3CodeRowTrigger` but not yet wired into this
+          path.
+     [ ] RETURNING clause emission — DiagDml RETURNING corpus.
+     [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
+     [ ] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
+          fast path).
 
 - [ ] **6.8.5** port `sqlite3WhereEnd` (where.c).
      Gate: same as 6.8.4 — they land as a pair.
