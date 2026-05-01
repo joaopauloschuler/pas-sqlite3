@@ -24797,6 +24797,10 @@ var
   iIdxCur:        i32;
   pIdx:           PIndex2;
   bMayReplace:    Boolean;
+  ipkColumnPresent: Boolean;
+  pkChng:         u8;
+  appendBias:     i32;
+  addrIpkNotNull: i32;
   pListItems:     PExprListItem;
   pIdItems:       PIdListItem;
 begin
@@ -24995,14 +24999,48 @@ begin
       sqlite3ExprCode(pParse, pListItems[i].pExpr, regData + i);
   end;
 
-  { OP_NewRowid -> regRowid (insert.c:1488..1531).  IPK-alias rebinding
-    (where the user-provided value at regData+iPKey becomes the rowid)
-    is deferred — the existing simple path leaves regData+iPKey carrying
-    the user's value but OP_Column on iPKey reads the rowid at read
-    time, so the auto-generated rowid wins regardless.  Pre-existing
-    behaviour for `rowid alias custom`; tracked under 6.8.6 follow-up. }
+  { Determine whether the user supplied a value for the IPK alias column
+    (insert.c around 1213..1230).  ipkColumnPresent gates the user-rowid
+    path below; with no IPK alias or no user value, OP_NewRowid auto-picks. }
+  ipkColumnPresent := False;
+  if pTab^.iPKey >= 0 then
+  begin
+    if pColumn <> nil then
+      ipkColumnPresent := (aTabColMap + i32(pTab^.iPKey))^ <> 0
+    else
+      ipkColumnPresent := pList <> nil;  { positional VALUES — IPK is included.
+                                            DEFAULT VALUES (pList=nil) → no user value. }
+  end;
+
+  { Rowid emission (insert.c:1488..1531).
+    Three paths:
+      (a) IPK alias with user-supplied value: SCopy regData+iPKey to
+          regRowid; if NULL, fall back to OP_NewRowid.  OP_MustBeInt
+          enforces the integer constraint at runtime.
+      (b) IPK alias with no user value (DEFAULT VALUES, or named-column
+          INSERT that omits the IPK): OP_NewRowid auto-picks.
+      (c) No IPK alias (HasRowid table without explicit IPK): OP_NewRowid
+          auto-picks.
+    For (a) and (b), regData+iPKey is then NULLed because the rowid is
+    the canonical source — OP_Column on iPKey reads the rowid at read
+    time, so storing user's value in the column slot would be redundant
+    AND would diverge from the C oracle's record layout. }
   if not (isView <> 0) then
-    sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
+  begin
+    if (pTab^.iPKey >= 0) and ipkColumnPresent then
+    begin
+      sqlite3VdbeAddOp2(v, OP_SCopy, regData + i32(pTab^.iPKey), regRowid);
+      addrIpkNotNull := sqlite3VdbeAddOp1(v, OP_NotNull, regRowid);
+      sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
+      sqlite3VdbeJumpHere(v, addrIpkNotNull);
+      sqlite3VdbeAddOp1(v, OP_MustBeInt, regRowid);
+    end
+    else
+      sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
+
+    if pTab^.iPKey >= 0 then
+      sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i32(pTab^.iPKey));
+  end;
 
   { Phase 6.8.6 — productive constraint-check + completion path.  Replaces
     the prior inline OP_Affinity + OP_MakeRecord + OP_Insert shortcut.
@@ -25015,15 +25053,20 @@ begin
   if not (isView <> 0) then
   begin
     bMayReplace := False;
-    { pkChng=0 — OP_NewRowid above guarantees the rowid is unique, so
-      sqlite3GenerateConstraintChecks can skip the rowid-uniqueness probe.
-      IPK-alias path (where user-provided rowid would set pkChng=1) is
-      deferred. }
+    { pkChng=1 when IPK alias was user-supplied (rowid uniqueness probe
+      needed; the user-supplied rowid might collide).  pkChng=0 when
+      OP_NewRowid auto-picked (uniqueness guaranteed). }
+    if (pTab^.iPKey >= 0) and ipkColumnPresent then pkChng := 1 else pkChng := 0;
+    { appendBias=1 only when the rowid was unconditionally auto-picked
+      (insert.c: appendFlag = ipkColumn<0).  IPK-alias-user-value path
+      sets appendBias=0 because the user-supplied rowid may not be the
+      end of the table. }
+    if (pTab^.iPKey >= 0) and ipkColumnPresent then appendBias := 0 else appendBias := 1;
     sqlite3GenerateConstraintChecks(pParse, pTab, aRegIdx, iDataCur, iIdxCur,
-      regIns, 0, 0, u8(onError), 0,
+      regIns, 0, pkChng, u8(onError), 0,
       @bMayReplace, nil, pUpsert);
     sqlite3CompleteInsertion(pParse, pTab, iDataCur, iIdxCur, regIns,
-      aRegIdx, 0, 1, ord(not bMayReplace));
+      aRegIdx, 0, appendBias, ord(not bMayReplace));
   end;
 
   if (pParse^.nested = 0) and (regRowCount <> 0) then
