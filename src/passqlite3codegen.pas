@@ -23396,80 +23396,150 @@ begin
   sqlite3ColumnDefault(v, pTab, iCol, regOut);
 end;
 
-{ sqlite3Update — port of update.c:285 (structural skeleton).
+{ indexColumnIsBeingUpdated — port of update.c:97..113.
+  Returns true if column iCol of pIdx references any of the columns named
+  in aXRef[] or, when XN_EXPR, an expression that references them.
+  False-positives degrade performance; false-negatives corrupt indexes. }
+function indexColumnIsBeingUpdated(pIdx: PIndex2; iCol: i32;
+  aXRef: Pi32; chngRowid: i32): i32;
+var
+  iIdxCol: i16;
+  pELItems: PExprListItem;
+begin
+  iIdxCol := pIdx^.aiColumn[iCol];
+  AssertH(iIdxCol <> XN_ROWID, 'idxColIsBeingUpdated rowid');
+  if iIdxCol >= 0 then
+  begin
+    if (aXRef + iIdxCol)^ >= 0 then Result := 1 else Result := 0;
+    Exit;
+  end;
+  AssertH(iIdxCol = XN_EXPR, 'idxColIsBeingUpdated XN_EXPR');
+  AssertH(pIdx^.aColExpr <> nil, 'idxColIsBeingUpdated aColExpr');
+  pELItems := ExprListItems(pIdx^.aColExpr);
+  Result := sqlite3ExprReferencesUpdatedColumn(pELItems[iCol].pExpr,
+                                               aXRef, chngRowid);
+end;
 
-  Phase 6.9-bis step 11f.  Lays down the C-shaped prologue: nErr / eOpenState
-  gates, SrcListLookup -> SchemaToIndex -> TriggersExist -> isView ->
-  nChangeFrom -> ViewGetColumnNames -> IsReadOnly -> cursor allocation ->
-  GetVdbe.  The productive emission tail (column resolution loop,
-  sqlite3ResolveExprNames over pChanges + pWhere, sqlite3WhereBegin,
-  sqlite3GenerateConstraintChecks, sqlite3CompleteInsertion) remains a TODO
-  — those helpers are still Phase 6.4 stubs.
+{ indexWhereClauseMightChange — port of update.c:127..135.
+  Returns true if pIdx is a partial index whose WHERE clause references any
+  changing column. }
+function indexWhereClauseMightChange(pIdx: PIndex2; aXRef: Pi32;
+  chngRowid: i32): i32;
+begin
+  if pIdx^.pPartIdxWhere = nil then begin Result := 0; Exit; end;
+  Result := sqlite3ExprReferencesUpdatedColumn(pIdx^.pPartIdxWhere,
+                                               aXRef, chngRowid);
+end;
 
-  Note: the C reference allocates aXRef / aRegIdx / aToOpen via
-  sqlite3DbMallocRawNN; the skeleton skips that allocation because no
-  productive code path consumes those arrays yet.  Wiring will land alongside
-  the WHERE-loop port (next sub-step). }
+{ sqlite3Update — port of update.c:285..1163.
+
+  Single-table arm.  Emits the full canonical UPDATE pipeline:
+  cursor + register allocation, column-name resolution with
+  chngRowid/chngPk detection, generated-column propagation, aRegIdx[]
+  allocation honouring partial-index gates, BeginWriteOperation,
+  ephemeral-rowset two-pass (or ONEPASS_SINGLE/MULTI) row capture via
+  sqlite3WhereBegin, OpenTableAndIndices, the in-loop body
+  (Rowid/PK locate, OLD/NEW register population, BEFORE UPDATE trigger
+  fire + reload, sqlite3GenerateConstraintChecks, optional reseek,
+  GenerateRowIndexDelete, OP_FinishSeek, optional OP_Delete,
+  sqlite3CompleteInsertion, AFTER UPDATE trigger fire), loop tail,
+  sqlite3AutoincrementEnd and CodeChangeCount.
+
+  Deferred — bail to update_cleanup with no emission:
+    * UPDATE FROM (nChangeFrom > 0)         → 6.8.4 multi-table WHERE
+    * Virtual tables (updateVirtualTable)   → vtab xUpdate path
+    * SQLITE_ENABLE_PREUPDATE_HOOK arms     → not in the default build
+
+  FK helpers (sqlite3FkRequired/FkCheck/FkActions) are productive-where-
+  applicable and no-op otherwise; calls match the C verbatim.
+  C "pTrigger" is renamed to pTrg here (FPC case-insensitive var/type
+  conflict — see memory feedback_fpc_ptrigger_shadow.md). }
 procedure sqlite3Update(pParse: PParse; pTabList: PSrcList;
   pChanges: PExprList; pWhere: PExpr; onError: i32;
   pOrderBy: PExprList; pLimit: PExpr; pUpsert: PUpsert);
 label
   update_cleanup;
 var
-  db:           PTsqlite3;
-  pTab:         PTable2;
-  v:            PVdbe;
-  iDb:          i32;
-  iBaseCur:     i32;
-  iDataCur:     i32;
-  iIdxCur:      i32;
-  nIdx:         i32;
-  pIdx:         PIndex2;
-  pPk:          PIndex2;
-  pTrg:         PTrigger;
-  isView:       i32;
-  tmask:        u32;
-  nChangeFrom:  i32;
-  sContext:     TAuthContext;
-  saveNErr:     i32;
-  saveRc:       i32;
-  saveErrMsg:   PAnsiChar;
-  skelEntered:  Boolean;
+  i, j, k:              i32;
+  pTab:                 PTable2;
+  addrTop:              i32;
+  pWInfo:               PWhereInfo;
+  v:                    PVdbe;
+  pIdx:                 PIndex2;
+  pPk:                  PIndex2;
+  nIdx:                 i32;
+  nAllIdx:              i32;
+  iBaseCur:             i32;
+  iDataCur:             i32;
+  iIdxCur:              i32;
+  db:                   PTsqlite3;
+  aRegIdx:              Pi32;
+  aXRef:                Pi32;
+  aToOpen:              Pu8;
+  chngPk:               u8;
+  chngRowid:            u8;
+  chngKey:              u8;
+  pRowidExpr:           PExpr;
+  iRowidExpr:           i32;
+  sContext:             TAuthContext;
+  sNC:                  TNameContext;
+  iDb:                  i32;
+  eOnePass:             i32;
+  hasFK:                i32;
+  labelBreak:           i32;
+  labelContinue:        i32;
+  flags:                u16;
+  isView:               i32;
+  pTrg:                 PTrigger;
+  tmask:                u32;
+  newmask:              u32;
+  iEph:                 i32;
+  nKey:                 i32;
+  aiCurOnePass:         array[0..1] of i32;
+  addrOpen:             i32;
+  iPk:                  i32;
+  nPk:                  i16;
+  bReplace:             Boolean;
+  bFinishSeek:          i32;
+  nChangeFrom:          i32;
+  regRowCount:          i32;
+  regOldRowid:          i32;
+  regNewRowid:          i32;
+  regNew:               i32;
+  regOld:               i32;
+  regRowSet:            i32;
+  regKey:               i32;
+  pELItems:             PExprListItem;
+  pTabItems:            PSrcItem;
+  reg:                  i32;
+  nByteAlloc:           SizeInt;
+  oldmask:              u32;
+  iNotUsed1, iNotUsed2: i32;
+  addrOnce:             i32;
+  bProgress:            Boolean;
+  colFlags2:            u16;
+  pikFlags:             i32;
 begin
-  pTab        := nil;
-  v           := nil;
-  pTrg        := nil;
-  isView      := 0;
-  tmask       := 0;
-  nChangeFrom := 0;
-  iBaseCur    := 0;
-  iDataCur    := 0;
-  iIdxCur     := 0;
-  nIdx        := 0;
-  pPk         := nil;
+  pTab := nil; v := nil; pTrg := nil; isView := 0; tmask := 0;
+  nChangeFrom := 0; iBaseCur := 0; iDataCur := 0; iIdxCur := 0;
+  nIdx := 0; nAllIdx := 0; pPk := nil; aXRef := nil; aRegIdx := nil;
+  aToOpen := nil; chngPk := 0; chngRowid := 0; chngKey := 0;
+  pRowidExpr := nil; iRowidExpr := -1;
+  eOnePass := ONEPASS_OFF; hasFK := 0; addrTop := 0;
+  pWInfo := nil; iEph := 0; nKey := 0; addrOpen := 0; iPk := 0; nPk := 0;
+  bReplace := False; bFinishSeek := 1; regRowCount := 0;
+  regOldRowid := 0; regNewRowid := 0; regNew := 0; regOld := 0;
+  regRowSet := 0; regKey := 0; iDb := 0;
+  labelBreak := 0; labelContinue := 0;
+  aiCurOnePass[0] := -1; aiCurOnePass[1] := -1;
   FillChar(sContext, SizeOf(sContext), 0);
-  skelEntered := False;
-  saveNErr   := 0;
-  saveRc     := 0;
-  saveErrMsg := nil;
+  FillChar(sNC, SizeOf(sNC), 0);
 
   db := pParse^.db;
   if pParse^.nErr <> 0 then goto update_cleanup;
-  { Test-scaffold gate (TestParser, TestParserSmoke). }
+  { Test-scaffold gate (TestParser, TestParserSmoke run against a stub db
+    without a real schema; sqlite3SrcListLookup would otherwise set nErr). }
   if db^.eOpenState <> $76 then goto update_cleanup;
-  { Phase 6.9-bis step 11f: skeleton-only.  The prologue calls
-    sqlite3SrcListLookup -> sqlite3LocateTableItem productively, which can
-    set pParse^.nErr if schema isn't yet loaded for the target (e.g., the
-    nested UPDATE on sqlite_master fired by sqlite3EndTable).  Since this
-    step does NOT yet emit productive code, snapshot nErr / nested error
-    state on entry and restore at cleanup so the skeleton remains a true
-    no-op for outer parser state.  When the productive emission tail lands
-    in step 11g, this guard goes away. }
-  saveNErr   := pParse^.nErr;
-  saveRc     := pParse^.rc;
-  saveErrMsg := pParse^.zErrMsg;
-  pParse^.zErrMsg := nil;
-  skelEntered := True;
 
   { Locate target table (update.c:362). }
   pTab := sqlite3SrcListLookup(pParse, pTabList);
@@ -23479,21 +23549,19 @@ begin
   { update.c:370 — pick up UPDATE triggers (BEFORE/AFTER) on pTab. }
   pTrg := sqlite3TriggersExist(pParse, pTab, TK_UPDATE, pChanges, @tmask);
   if pTab^.eTabType = TABTYP_VIEW then isView := 1 else isView := 0;
+  AssertH((pTrg <> nil) or (tmask = 0), 'Update tmask without trigger');
 
-  { FROM clause detection.  pTabList^.nSrc > 1 implies UPDATE ... FROM,
-    in which case nChangeFrom = pChanges^.nExpr.  Schema-row UPDATEs from
-    sqlite3NestedParse never have a FROM clause, so nChangeFrom stays 0
-    on the productive path. }
-  if (pTabList <> nil) and (pTabList^.nSrc > 1) and (pChanges <> nil) then
+  { FROM clause detection (update.c:395). }
+  if (pTabList^.nSrc > 1) and (pChanges <> nil) then
     nChangeFrom := pChanges^.nExpr
   else
     nChangeFrom := 0;
+  AssertH((nChangeFrom = 0) or (pUpsert = nil), 'Update FROM with UPSERT');
 
-  { TODO(Phase 6.x): sqlite3LimitWhere call (update.c:399) — UPDATE LIMIT
-    support.  Helper is a no-op stub today; productive path never has LIMIT. }
+  { sqlite3LimitWhere — helper is a no-op stub today; productive path has
+    no LIMIT (update.c:398..406). }
 
   if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then goto update_cleanup;
-
   if sqlite3IsReadOnly(pParse, pTab, pTrg) <> 0 then goto update_cleanup;
 
   { Allocate cursors for the main table and all indices (update.c:420). }
@@ -23501,14 +23569,10 @@ begin
   iDataCur := iBaseCur;
   Inc(pParse^.nTab);
   iIdxCur := iDataCur + 1;
-  if (pTab^.tabFlags and TF_WithoutRowid) = 0 then
-    pPk := nil
-  else
-    pPk := sqlite3PrimaryKeyIndex(pTab);
+  if HasRowid(pTab) then pPk := nil else pPk := sqlite3PrimaryKeyIndex(pTab);
   pIdx := pTab^.pIndex;
   while pIdx <> nil do begin
-    if pPk = pIdx then
-      iDataCur := pParse^.nTab;
+    if pPk = pIdx then iDataCur := pParse^.nTab;
     Inc(pParse^.nTab);
     Inc(nIdx);
     pIdx := pIdx^.pNext;
@@ -23519,39 +23583,536 @@ begin
     iIdxCur  := pUpsert^.iIdxCur;
     pParse^.nTab := iBaseCur;
   end;
-  SrcListItems(pTabList)[0].iCursor := iDataCur;
+  pTabItems := SrcListItems(pTabList);
+  pTabItems[0].iCursor := iDataCur;
 
-  { Begin generating code. }
+  { Allocate aXRef / aRegIdx / aToOpen as a single block (update.c:441). }
+  nByteAlloc := SizeInt(SizeOf(i32)) * SizeInt(i32(pTab^.nCol) + nIdx + 1)
+              + SizeInt(nIdx + 2);
+  aXRef := Pi32(sqlite3DbMallocRawNN(db, u64(nByteAlloc)));
+  if aXRef = nil then goto update_cleanup;
+  aRegIdx := aXRef + i32(pTab^.nCol);
+  aToOpen := Pu8(aRegIdx + nIdx + 1);
+  FillChar(aToOpen^, nIdx + 1, 1);
+  aToOpen[nIdx + 1] := 0;
+  for i := 0 to i32(pTab^.nCol) - 1 do (aXRef + i)^ := -1;
+
+  { Initialise NameContext (update.c:450). }
+  sNC.pParse        := pParse;
+  sNC.pSrcList      := pTabList;
+  sNC.uNC.pUpsert   := pUpsert;
+  sNC.ncFlags       := NC_UUpsert;
+
   v := sqlite3GetVdbe(pParse);
   if v = nil then goto update_cleanup;
 
-  { TODO(Phase 6.9-bis step 11g): productive emission tail.  Requires:
-      - aXRef / aRegIdx / aToOpen allocation (update.c:441),
-      - column-resolution loop over pChanges + sqlite3ResolveExprNames,
-      - chngRowid / chngPk detection,
-      - SQLITE_CountRows regRowCount allocation,
-      - sqlite3VdbeCountChanges + sqlite3BeginWriteOperation,
-      - sqlite3WhereBegin / per-row update emission feeding
-        sqlite3GenerateConstraintChecks + sqlite3CompleteInsertion.
-    The schema-row UPDATE "main".sqlite_master SET ... statements emitted by
-    sqlite3NestedParse for CREATE TABLE / CREATE INDEX flow through this
-    path productively. }
+  { Resolve column names in pChanges and detect chngRowid / chngPk
+    (update.c:466..518).  Authorization arm omitted — OMIT_AUTHORIZATION
+    in the default build. }
+  pELItems := ExprListItems(pChanges);
+  for i := 0 to pChanges^.nExpr - 1 do
+  begin
+    if (nChangeFrom = 0)
+       and (sqlite3ResolveExprNames(@sNC, pELItems[i].pExpr) <> 0) then
+      goto update_cleanup;
+    j := sqlite3ColumnIndex(pTab, pELItems[i].zEName);
+    if j >= 0 then
+    begin
+      if j = i32(pTab^.iPKey) then
+      begin
+        chngRowid := 1;
+        pRowidExpr := pELItems[i].pExpr;
+        iRowidExpr := i;
+      end
+      else if (pPk <> nil)
+        and ((pTab^.aCol[j].colFlags and COLFLAG_PRIMKEY) <> 0) then
+        chngPk := 1
+      else if (pTab^.aCol[j].colFlags and COLFLAG_GENERATED) <> 0 then
+      begin
+        sqlite3ErrorMsg(pParse,
+          PAnsiChar('cannot UPDATE generated column'));
+        goto update_cleanup;
+      end;
+      (aXRef + j)^ := i;
+    end
+    else
+    begin
+      if (pPk = nil) and (sqlite3IsRowid(pELItems[i].zEName) <> 0) then
+      begin
+        j := -1;
+        chngRowid := 1;
+        pRowidExpr := pELItems[i].pExpr;
+        iRowidExpr := i;
+      end
+      else
+      begin
+        sqlite3ErrorMsg(pParse, PAnsiChar('no such column'));
+        pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_CheckSchema;
+        goto update_cleanup;
+      end;
+    end;
+  end;
+  AssertH((chngRowid and chngPk) = 0, 'Update both chngRowid and chngPk');
+  AssertH((chngRowid = 0) or (chngRowid = 1), 'Update chngRowid 0 or 1');
+  AssertH((chngPk = 0) or (chngPk = 1), 'Update chngPk 0 or 1');
+  chngKey := chngRowid + chngPk;
+
+  { Generated-column propagation (update.c:532..550). }
+  if (pTab^.tabFlags and TF_HasGenerated) <> 0 then
+  begin
+    repeat
+      bProgress := False;
+      for i := 0 to i32(pTab^.nCol) - 1 do
+      begin
+        if (aXRef + i)^ >= 0 then Continue;
+        if (pTab^.aCol[i].colFlags and COLFLAG_GENERATED) = 0 then Continue;
+        if sqlite3ExprReferencesUpdatedColumn(
+              sqlite3ColumnExpr(pTab, @pTab^.aCol[i]),
+              aXRef, i32(chngRowid)) <> 0 then
+        begin
+          (aXRef + i)^ := 99999;
+          bProgress := True;
+        end;
+      end;
+    until not bProgress;
+  end;
+
+  { Reset colUsed mask (update.c:558). }
+  if pTab^.eTabType = TABTYP_VTAB then
+    pTabItems[0].colUsed := Bitmask($FFFFFFFFFFFFFFFF)
+  else
+    pTabItems[0].colUsed := 0;
+
+  hasFK := sqlite3FkRequired(pParse, pTab, aXRef, i32(chngKey));
+
+  { Per-index aRegIdx[] allocation (update.c:566..595). }
+  if onError = OE_Replace then bReplace := True else bReplace := False;
+  pIdx := pTab^.pIndex;
+  while pIdx <> nil do
+  begin
+    if (chngKey <> 0) or (hasFK > 1) or (pIdx = pPk)
+       or (indexWhereClauseMightChange(pIdx, aXRef, i32(chngRowid)) <> 0) then
+    begin
+      Inc(pParse^.nMem);
+      reg := pParse^.nMem;
+      pParse^.nMem := pParse^.nMem + i32(pIdx^.nColumn);
+    end
+    else
+    begin
+      reg := 0;
+      for i := 0 to i32(pIdx^.nKeyCol) - 1 do
+      begin
+        if indexColumnIsBeingUpdated(pIdx, i, aXRef, i32(chngRowid)) <> 0 then
+        begin
+          Inc(pParse^.nMem);
+          reg := pParse^.nMem;
+          pParse^.nMem := pParse^.nMem + i32(pIdx^.nColumn);
+          if (onError = OE_Default) and (pIdx^.onError = OE_Replace) then
+            bReplace := True;
+          Break;
+        end;
+      end;
+    end;
+    if reg = 0 then aToOpen[nAllIdx + 1] := 0;
+    (aRegIdx + nAllIdx)^ := reg;
+    Inc(nAllIdx);
+    pIdx := pIdx^.pNext;
+  end;
+  Inc(pParse^.nMem);
+  (aRegIdx + nAllIdx)^ := pParse^.nMem;
+  if bReplace then FillChar(aToOpen^, nIdx + 1, 1);
+
+  if pParse^.nested = 0 then sqlite3VdbeCountChanges(v);
+  sqlite3BeginWriteOperation(pParse,
+    i32(ord((pTrg <> nil) or (hasFK <> 0))), iDb);
+
+  { Allocate registers for non-vtab path (update.c:600..619). }
+  if pTab^.eTabType <> TABTYP_VTAB then
+  begin
+    AssertH((aRegIdx + nAllIdx)^ = pParse^.nMem, 'Update reg layout');
+    regRowSet := (aRegIdx + nAllIdx)^;
+    Inc(pParse^.nMem);
+    regOldRowid := pParse^.nMem;
+    regNewRowid := regOldRowid;
+    if (chngPk <> 0) or (pTrg <> nil) or (hasFK <> 0) then
+    begin
+      regOld := pParse^.nMem + 1;
+      pParse^.nMem := pParse^.nMem + i32(pTab^.nCol);
+    end;
+    if (chngKey <> 0) or (pTrg <> nil) or (hasFK <> 0) then
+    begin
+      Inc(pParse^.nMem);
+      regNewRowid := pParse^.nMem;
+    end;
+    regNew := pParse^.nMem + 1;
+    pParse^.nMem := pParse^.nMem + i32(pTab^.nCol);
+  end;
+
+  if isView <> 0 then
+    sqlite3AuthContextPush(pParse, @sContext, pTab^.zName);
+
+  { MaterializeView for non-FROM updates of views (update.c:629..637). }
+  if (nChangeFrom = 0) and (isView <> 0) then
+  begin
+    sqlite3MaterializeView(pParse, pTab, pWhere, pOrderBy, pLimit, iDataCur);
+    pOrderBy := nil; pLimit := nil;
+  end;
+
+  { Resolve WHERE column names (update.c:642..644). }
+  if (nChangeFrom = 0) and (sqlite3ResolveExprNames(@sNC, pWhere) <> 0) then
+    goto update_cleanup;
+
+  { Virtual-table dispatch — bail; updateVirtualTable not yet ported. }
+  if pTab^.eTabType = TABTYP_VTAB then goto update_cleanup;
+
+  { UPDATE FROM dispatch — bail; updateFromSelect / multi-table WHERE
+    deferred until 6.8.4. }
+  if nChangeFrom <> 0 then goto update_cleanup;
+
+  labelBreak    := sqlite3VdbeMakeLabel(pParse);
+  labelContinue := labelBreak;
+
+  { regRowCount (update.c:660..668).  SQLITE_CountRows = HI(0x00001) =
+    u64($100000000) (sqliteInt.h:1863). }
+  if ((db^.flags and u64($100000000)) <> 0)
+     and (pParse^.pTriggerTab = nil)
+     and (pParse^.nested = 0)
+     and ((pParse^.parseFlags and PARSEFLAG_BReturning) = 0)
+     and (pUpsert = nil) then
+  begin
+    Inc(pParse^.nMem);
+    regRowCount := pParse^.nMem;
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, regRowCount);
+  end;
+
+  { Initial rowset / ephemeral PK index (update.c:670..702). }
+  if HasRowid(pTab) then
+  begin
+    sqlite3VdbeAddOp3(v, OP_Null, 0, regRowSet, regOldRowid);
+    iEph := pParse^.nTab; Inc(pParse^.nTab);
+    addrOpen := sqlite3VdbeAddOp3(v, OP_OpenEphemeral, iEph, 0, regRowSet);
+  end
+  else
+  begin
+    AssertH(pPk <> nil, 'Update WITHOUT ROWID needs pPk');
+    nPk := pPk^.nKeyCol;
+    iPk := pParse^.nMem + 1;
+    pParse^.nMem := pParse^.nMem + i32(nPk);
+    Inc(pParse^.nMem);
+    regKey := pParse^.nMem;
+    if pUpsert = nil then
+    begin
+      iEph := pParse^.nTab; Inc(pParse^.nTab);
+      sqlite3VdbeAddOp3(v, OP_Null, 0, iPk, iPk + i32(nPk) - 1);
+      addrOpen := sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iEph, i32(nPk));
+      sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pPk));
+    end;
+  end;
+
+  if pUpsert <> nil then
+  begin
+    pWInfo := nil;
+    eOnePass := ONEPASS_SINGLE;
+    sqlite3ExprIfFalse(pParse, pWhere, labelBreak, SQLITE_JUMPIFNULL);
+    bFinishSeek := 0;
+  end
+  else
+  begin
+    { update.c:720..766 — start the database scan. }
+    flags := WHERE_ONEPASS_DESIRED;
+    if (pParse^.nested = 0)
+       and (pTrg = nil)
+       and (hasFK = 0)
+       and (chngKey = 0)
+       and (not bReplace)
+       and ((pWhere = nil) or (not ExprHasProperty(pWhere, EP_Subquery))) then
+      flags := flags or WHERE_ONEPASS_MULTIROW;
+    pWInfo := sqlite3WhereBegin(pParse, pTabList, pWhere, nil, nil, nil,
+                                flags, iIdxCur);
+    if pWInfo = nil then goto update_cleanup;
+
+    eOnePass    := sqlite3WhereOkOnePass(pWInfo, @aiCurOnePass[0]);
+    bFinishSeek := sqlite3WhereUsesDeferredSeek(pWInfo);
+    if eOnePass <> ONEPASS_SINGLE then
+    begin
+      sqlite3MultiWrite(pParse);
+      if eOnePass = ONEPASS_MULTI then
+      begin
+        i := aiCurOnePass[1];
+        if (i >= 0) and (i <> iDataCur) and (aToOpen[i - iBaseCur] <> 0) then
+          eOnePass := ONEPASS_OFF;
+      end;
+    end;
+  end;
+
+  if HasRowid(pTab) then
+  begin
+    sqlite3VdbeAddOp2(v, OP_Rowid, iDataCur, regOldRowid);
+    if eOnePass = ONEPASS_OFF then
+    begin
+      Inc(pParse^.nMem);
+      (aRegIdx + nAllIdx)^ := pParse^.nMem;
+      sqlite3VdbeAddOp3(v, OP_Insert, iEph, regRowSet, regOldRowid);
+    end
+    else
+    begin
+      if addrOpen <> 0 then sqlite3VdbeChangeToNoop(v, addrOpen);
+    end;
+  end
+  else
+  begin
+    for i := 0 to i32(nPk) - 1 do
+    begin
+      AssertH(pPk^.aiColumn[i] >= 0, 'Update PK col');
+      sqlite3ExprCodeGetColumnOfTable(v, pTab, iDataCur,
+                                      pPk^.aiColumn[i], iPk + i);
+    end;
+    if eOnePass <> 0 then
+    begin
+      if addrOpen <> 0 then sqlite3VdbeChangeToNoop(v, addrOpen);
+      nKey := i32(nPk);
+      regKey := iPk;
+    end
+    else
+    begin
+      sqlite3VdbeAddOp4(v, OP_MakeRecord, iPk, i32(nPk), regKey,
+                        sqlite3IndexAffinityStr(db, pPk), i32(nPk));
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iEph, regKey, iPk, i32(nPk));
+    end;
+  end;
+
+  if pUpsert = nil then
+  begin
+    if (nChangeFrom = 0) and (eOnePass <> ONEPASS_MULTI) then
+      sqlite3WhereEnd(pWInfo);
+
+    if isView = 0 then
+    begin
+      addrOnce := 0;
+      iNotUsed1 := 0; iNotUsed2 := 0;
+      if eOnePass <> ONEPASS_OFF then
+      begin
+        if aiCurOnePass[0] >= 0 then aToOpen[aiCurOnePass[0] - iBaseCur] := 0;
+        if aiCurOnePass[1] >= 0 then aToOpen[aiCurOnePass[1] - iBaseCur] := 0;
+      end;
+      if (eOnePass = ONEPASS_MULTI)
+         and ((nIdx - i32(ord(aiCurOnePass[1] >= 0))) > 0) then
+        addrOnce := sqlite3VdbeAddOp0(v, OP_Once);
+      sqlite3OpenTableAndIndices(pParse, pTab, OP_OpenWrite, 0, iBaseCur,
+                                 aToOpen, @iNotUsed1, @iNotUsed2);
+      if addrOnce <> 0 then sqlite3VdbeJumpHereOrPopInst(v, addrOnce);
+    end;
+
+    { Top of the update loop (update.c:830..879). }
+    if eOnePass <> ONEPASS_OFF then
+    begin
+      if (aiCurOnePass[0] <> iDataCur) and (aiCurOnePass[1] <> iDataCur) then
+      begin
+        AssertH(pPk <> nil, 'Update onepass needs pPk for outer cur');
+        sqlite3VdbeAddOp4Int(v, OP_NotFound, iDataCur, labelBreak, regKey, nKey);
+      end;
+      if eOnePass <> ONEPASS_SINGLE then
+        labelContinue := sqlite3VdbeMakeLabel(pParse);
+      if pPk <> nil then
+        sqlite3VdbeAddOp2(v, OP_IsNull, regKey, labelBreak)
+      else
+        sqlite3VdbeAddOp2(v, OP_IsNull, regOldRowid, labelBreak);
+    end
+    else if pPk <> nil then
+    begin
+      labelContinue := sqlite3VdbeMakeLabel(pParse);
+      sqlite3VdbeAddOp2(v, OP_Rewind, iEph, labelBreak);
+      addrTop := sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp2(v, OP_RowData, iEph, regKey);
+      sqlite3VdbeAddOp4Int(v, OP_NotFound, iDataCur, labelContinue, regKey, 0);
+    end
+    else
+    begin
+      sqlite3VdbeAddOp2(v, OP_Rewind, iEph, labelBreak);
+      labelContinue := sqlite3VdbeMakeLabel(pParse);
+      addrTop := sqlite3VdbeAddOp2(v, OP_Rowid, iEph, regOldRowid);
+      sqlite3VdbeAddOp3(v, OP_NotExists, iDataCur, labelContinue, regOldRowid);
+    end;
+  end;
+
+  AssertH((chngKey <> 0) or (pTrg <> nil) or (hasFK <> 0)
+       or (regOldRowid = regNewRowid),
+       'Update regNewRowid alias when no chngKey/trigger/FK');
+  if chngRowid <> 0 then
+  begin
+    AssertH(iRowidExpr >= 0, 'Update chngRowid iRowidExpr');
+    sqlite3ExprCode(pParse, pRowidExpr, regNewRowid);
+    sqlite3VdbeAddOp1(v, OP_MustBeInt, regNewRowid);
+  end;
+
+  { OLD pre-update content (update.c:899..923). }
+  if (chngPk <> 0) or (hasFK <> 0) or (pTrg <> nil) then
+  begin
+    if hasFK <> 0 then oldmask := sqlite3FkOldmask(pParse, pTab) else oldmask := 0;
+    oldmask := oldmask or sqlite3TriggerColmask(pParse, pTrg, pChanges, 0,
+        i32(TRIGGER_BEFORE or TRIGGER_AFTER), pTab, onError);
+    for i := 0 to i32(pTab^.nCol) - 1 do
+    begin
+      colFlags2 := pTab^.aCol[i].colFlags;
+      k := i32(sqlite3TableColumnToStorage(pTab, i16(i))) + regOld;
+      if (oldmask = $FFFFFFFF)
+         or ((i < 32) and ((oldmask and (u32(1) shl i)) <> 0))
+         or ((colFlags2 and COLFLAG_PRIMKEY) <> 0) then
+        sqlite3ExprCodeGetColumnOfTable(v, pTab, iDataCur, i, k)
+      else
+        sqlite3VdbeAddOp2(v, OP_Null, 0, k);
+    end;
+    if (chngRowid = 0) and (pPk = nil) then
+      sqlite3VdbeAddOp2(v, OP_Copy, regOldRowid, regNewRowid);
+  end;
+
+  { NEW row population (update.c:938..970). }
+  newmask := sqlite3TriggerColmask(pParse, pTrg, pChanges, 1,
+      i32(TRIGGER_BEFORE), pTab, onError);
+  k := regNew;
+  for i := 0 to i32(pTab^.nCol) - 1 do
+  begin
+    if i = i32(pTab^.iPKey) then
+      sqlite3VdbeAddOp2(v, OP_Null, 0, k)
+    else if (pTab^.aCol[i].colFlags and COLFLAG_GENERATED) <> 0 then
+    begin
+      if (pTab^.aCol[i].colFlags and COLFLAG_VIRTUAL) <> 0 then Dec(k);
+    end
+    else
+    begin
+      j := (aXRef + i)^;
+      if j >= 0 then
+        sqlite3ExprCode(pParse, pELItems[j].pExpr, k)
+      else if ((tmask and TRIGGER_BEFORE) = 0) or (i > 31)
+            or ((newmask and (u32(1) shl i)) <> 0) then
+      begin
+        sqlite3ExprCodeGetColumnOfTable(v, pTab, iDataCur, i, k);
+        bFinishSeek := 0;
+      end
+      else
+        sqlite3VdbeAddOp2(v, OP_Null, 0, k);
+    end;
+    Inc(k);
+  end;
+  if (pTab^.tabFlags and TF_HasGenerated) <> 0 then
+    sqlite3ComputeGeneratedColumns(pParse, regNew, pTab);
+
+  { BEFORE UPDATE triggers (update.c:982..1026). }
+  if (tmask and TRIGGER_BEFORE) <> 0 then
+  begin
+    sqlite3TableAffinity(v, pTab, regNew);
+    sqlite3CodeRowTrigger(pParse, pTrg, TK_UPDATE, pChanges,
+        i32(TRIGGER_BEFORE), pTab, regOldRowid, i32(onError), labelContinue);
+    if isView = 0 then
+    begin
+      if pPk <> nil then
+        sqlite3VdbeAddOp4Int(v, OP_NotFound, iDataCur, labelContinue,
+                             regKey, nKey)
+      else
+        sqlite3VdbeAddOp3(v, OP_NotExists, iDataCur, labelContinue,
+                          regOldRowid);
+      { Reload unmodified columns after BEFORE trigger may have changed them. }
+      k := regNew;
+      for i := 0 to i32(pTab^.nCol) - 1 do
+      begin
+        if (pTab^.aCol[i].colFlags and COLFLAG_GENERATED) <> 0 then
+        begin
+          if (pTab^.aCol[i].colFlags and COLFLAG_VIRTUAL) <> 0 then Dec(k);
+        end
+        else if ((aXRef + i)^ < 0) and (i <> i32(pTab^.iPKey)) then
+          sqlite3ExprCodeGetColumnOfTable(v, pTab, iDataCur, i, k);
+        Inc(k);
+      end;
+      if (pTab^.tabFlags and TF_HasGenerated) <> 0 then
+        sqlite3ComputeGeneratedColumns(pParse, regNew, pTab);
+    end;
+  end;
+
+  if isView = 0 then
+  begin
+    AssertH(regOldRowid > 0, 'Update regOldRowid > 0');
+    sqlite3GenerateConstraintChecks(pParse, pTab, aRegIdx, iDataCur, iIdxCur,
+        regNewRowid, regOldRowid, chngKey, u8(onError), labelContinue,
+        @bReplace, aXRef, nil);
+
+    { Reseek if REPLACE or chngKey may have moved iDataCur. }
+    if bReplace or (chngKey <> 0) then
+    begin
+      if pPk <> nil then
+        sqlite3VdbeAddOp4Int(v, OP_NotFound, iDataCur, labelContinue,
+                             regKey, nKey)
+      else
+        sqlite3VdbeAddOp3(v, OP_NotExists, iDataCur, labelContinue,
+                          regOldRowid);
+    end;
+
+    if hasFK <> 0 then
+      sqlite3FkCheck(pParse, pTab, regOldRowid, 0, aXRef, i32(chngKey));
+
+    sqlite3GenerateRowIndexDelete(pParse, pTab, iDataCur, iIdxCur, aRegIdx, -1);
+
+    if bFinishSeek <> 0 then
+      sqlite3VdbeAddOp1(v, OP_FinishSeek, iDataCur);
+
+    AssertH(regNew = regNewRowid + 1, 'Update regNew = regNewRowid+1');
+    { OP_Delete for chngKey / hasFK>1.  PREUPDATE_HOOK arm omitted (default
+      build). }
+    if (hasFK > 1) or (chngKey <> 0) then
+      sqlite3VdbeAddOp2(v, OP_Delete, iDataCur, 0);
+
+    if hasFK <> 0 then
+      sqlite3FkCheck(pParse, pTab, 0, regNewRowid, aXRef, i32(chngKey));
+
+    if eOnePass = ONEPASS_MULTI then
+      pikFlags := i32(OPFLAG_ISUPDATE) or i32(OPFLAG_SAVEPOSITION)
+    else
+      pikFlags := i32(OPFLAG_ISUPDATE);
+    sqlite3CompleteInsertion(pParse, pTab, iDataCur, iIdxCur, regNewRowid,
+        aRegIdx, pikFlags, 0, 0);
+
+    if hasFK <> 0 then
+      sqlite3FkActions(pParse, pTab, pChanges, regOldRowid, aXRef, i32(chngKey));
+  end;
+
+  if regRowCount <> 0 then
+    sqlite3VdbeAddOp2(v, OP_AddImm, regRowCount, 1);
+
+  if pTrg <> nil then
+    sqlite3CodeRowTrigger(pParse, pTrg, TK_UPDATE, pChanges,
+        i32(TRIGGER_AFTER), pTab, regOldRowid, i32(onError), labelContinue);
+
+  { Loop tail (update.c:1124..1133). }
+  if eOnePass = ONEPASS_SINGLE then
+  begin
+    { single-pass: nothing }
+  end
+  else if eOnePass = ONEPASS_MULTI then
+  begin
+    sqlite3VdbeResolveLabel(v, labelContinue);
+    sqlite3WhereEnd(pWInfo);
+  end
+  else
+  begin
+    sqlite3VdbeResolveLabel(v, labelContinue);
+    sqlite3VdbeAddOp2(v, OP_Next, iEph, addrTop);
+  end;
+  sqlite3VdbeResolveLabel(v, labelBreak);
+
+  if (pParse^.nested = 0) and (pParse^.pTriggerTab = nil) and (pUpsert = nil) then
+    sqlite3AutoincrementEnd(pParse);
+
+  if regRowCount <> 0 then
+    sqlite3CodeChangeCount(v, regRowCount, PAnsiChar('rows updated'));
 
 update_cleanup:
-  { Restore parser error state — see snapshot comment above. }
-  if skelEntered then begin
-    if pParse^.zErrMsg <> nil then sqlite3DbFree(db, pParse^.zErrMsg);
-    pParse^.zErrMsg := saveErrMsg;
-    pParse^.nErr    := saveNErr;
-    pParse^.rc      := saveRc;
-  end;
   sqlite3AuthContextPop(@sContext);
-  sqlite3SrcListDelete(pParse^.db, pTabList);
-  sqlite3ExprListDelete(pParse^.db, pChanges);
-  sqlite3ExprDelete(pParse^.db, pWhere);
-  sqlite3ExprListDelete(pParse^.db, pOrderBy);
-  sqlite3ExprDelete(pParse^.db, pLimit);
-  sqlite3UpsertDelete(pParse^.db, pUpsert);
+  if aXRef <> nil then sqlite3DbFree(db, aXRef);
+  sqlite3SrcListDelete(db, pTabList);
+  sqlite3ExprListDelete(db, pChanges);
+  sqlite3ExprDelete(db, pWhere);
+  sqlite3ExprListDelete(db, pOrderBy);
+  sqlite3ExprDelete(db, pLimit);
+  sqlite3UpsertDelete(db, pUpsert);
 end;
 
 // ===========================================================================

@@ -81,19 +81,34 @@ skeleton.
           Belongs to sqlite3Insert (insert.c:1454..1559), not this
           routine — defer to 6.8.1 / 6.10-step-6 wiring.
 
-- [ ] **6.8.3** port `sqlite3CompleteInsertion` (insert.c).  Companion
-     to 6.8.2 — emits the OP_Insert + per-index OP_IdxInsert for every
-     non-skipped index after constraint-checks pass.
+- [X] **6.8.3** port `sqlite3CompleteInsertion` (insert.c) — DONE
+     2026-04-27 in commit 28254e7 (Phase 6.9-bis 11g.2.b).  Body lives
+     at `passqlite3codegen.pas:25319..25395`, a 1:1 line-by-line port
+     of `insert.c:2782..2847`.  Companion to 6.8.2.  No callers yet —
+     `sqlite3Insert` still uses its inline four-op shortcut; wiring is
+     deferred to `sqlite3Insert` body work (see 6.8.1 sibling note
+     below).
      Gate: DiagDml `unique violation`, DiagIndexing `schema after
      create idx`, `select range via idx` — also unblocks the
-     implicit-autoindex Δ in TestExplainParity.
-     [ ] OP_Insert with correct P5 (LASTROWID / APPEND / USESEEKRESULT /
-          ISUPDATE / SAVEPOSITION).
-     [ ] Per-index OP_IdxInsert loop honouring `aRegIdx[]` skip flags
-          and partial-index gates.
-     [ ] sqlite_sequence update for AUTOINCREMENT tables.
-     [ ] Trigger-fire arm (BEFORE INSERT already wired via 6.23;
-          AFTER INSERT must fire here — closes 6.10 step 9(j)).
+     implicit-autoindex Δ in TestExplainParity.  These remain pending
+     because they require the call-site wiring, not the function body.
+     [X] OP_Insert with correct P5 (LASTROWID / APPEND / USESEEKRESULT /
+          ISUPDATE / SAVEPOSITION) — `:25381..25394`.
+     [X] Per-index OP_IdxInsert loop honouring `aRegIdx[]` skip flags
+          and partial-index gates — `:25338..25375` (uniqNotNull bit 3
+          drives nKeyCol-vs-nColumn).
+     Bullets relocated to call-site wiring (not part of
+     `sqlite3CompleteInsertion` in C):
+       — sqlite_sequence update for AUTOINCREMENT (C calls
+         `sqlite3AutoincrementEnd` from `sqlite3Insert`,
+         `insert.c:1640`; helper already ported at
+         `passqlite3codegen.pas:24040`, called from `:22985`).
+       — AFTER INSERT trigger fire arm (C calls `sqlite3CodeRowTrigger`
+         from `sqlite3Insert`, `insert.c:1606`; helper already ported
+         at `passqlite3codegen.pas:22290`).  Closes 6.10 step 9(j) once
+         the `sqlite3Insert` rewrite replaces the inline shortcut at
+         `:24389..24393` with the canonical
+         `GenerateConstraintChecks` + `CompleteInsertion` pair.
 
 - [ ] **6.8.4** port `sqlite3WhereBegin` (where.c).
      Gate: TestExplainParity SELECT-WHERE corpus + DiagIndexing
@@ -116,28 +131,57 @@ skeleton.
      [ ] Cursor close + addrBrk/addrCont label patching.
      [ ] Free `WhereInfo` and any `IdxStr` allocations.
 
-- [ ] **6.8.1** finish porting `sqlite3Update` (update.c).  Skeleton
-     today; full body needs 6.8.2/6.8.3/6.8.4/6.8.5 first.
-     Gate: DiagDml UPDATE corpus, DiagTxn `changes() after update`
-     (step 15(f)), TestExplainParity `UPDATE t SET a=5 WHERE rowid=1`
-     Δ=14, DROP TABLE Δ=26 follow-on (6.11(b) via `sqlite3NestedParse`).
-     [ ] Source-list resolve + WHERE-clause walk (`sqlite3WhereBegin`).
-     [ ] OP_Rowid → OP_NotExists row-locate prologue.
-     [ ] Old-row read into register block (incl. unchanged columns).
-     [ ] BEFORE UPDATE trigger fire arm.
-     [ ] New-row register assembly with `sqlite3ExprCode` per
+- [X] **6.8.1** finish porting `sqlite3Update` (update.c) — single-table
+     arm DONE 2026-05-01.  `passqlite3codegen.pas:23457..24115` replaces
+     the prior skeleton with a 1:1 port of `update.c:285..1163` covering
+     prologue (SrcListLookup, TriggersExist, ViewGetColumnNames,
+     IsReadOnly, cursor allocation, aXRef/aRegIdx/aToOpen single-block
+     malloc), column-name resolution with chngRowid/chngPk detection
+     and generated-column propagation, per-index aRegIdx[] alloc with
+     partial-index gating via the new helpers
+     `indexColumnIsBeingUpdated` / `indexWhereClauseMightChange`
+     (`:23399..23437`), CountChanges + BeginWriteOperation, register
+     block layout (regOldRowid / regNewRowid / regOld / regNew / regKey
+     / regRowSet), MaterializeView for non-FROM views, ResolveExprNames
+     over WHERE, ephemeral-rowset two-pass and ONEPASS_SINGLE/MULTI
+     paths, OpenTableAndIndices with the ONEPASS_MULTI Once gate, the
+     in-loop body (NotFound/IsNull/Rewind+RowData/NotExists row locate,
+     OLD/NEW register population, BEFORE UPDATE trigger fire + reload,
+     `sqlite3GenerateConstraintChecks`, optional reseek,
+     `sqlite3GenerateRowIndexDelete`, OP_FinishSeek, conditional
+     OP_Delete, `sqlite3CompleteInsertion`, AFTER UPDATE trigger fire),
+     loop tail, `sqlite3AutoincrementEnd`, `sqlite3CodeChangeCount`.
+     Verified: TestDMLBasic 54/54, TestExplainParity 1018/1026 (was
+     1016 — +2 new passes, 0 regressions), DiagDml 12/2 unchanged,
+     DiagIndexing 35/7 unchanged, DiagTxn 33/7 unchanged.
+     Gate (carried forward): DiagDml UPDATE corpus, DiagTxn
+     `changes() after update` (step 15(f)), TestExplainParity
+     `UPDATE t SET a=5 WHERE rowid=1` Δ=14, DROP TABLE Δ=26 follow-on
+     (6.11(b) via `sqlite3NestedParse`) — most still pending; Δ shrunk
+     from 10 to 8 already.
+     [X] Source-list resolve + WHERE-clause walk (`sqlite3WhereBegin`).
+     [X] OP_Rowid → OP_NotExists row-locate prologue.
+     [X] Old-row read into register block (incl. unchanged columns).
+     [X] BEFORE UPDATE trigger fire arm.
+     [X] New-row register assembly with `sqlite3ExprCode` per
           assignment.
-     [ ] `sqlite3GenerateConstraintChecks` invocation (6.8.2).
-     [ ] Index-update loop: per-index delete-old + insert-new
-          honouring `aXRef[]` (no-change skip).
-     [ ] `sqlite3CompleteInsertion`-equivalent row write (6.8.3) +
+     [X] `sqlite3GenerateConstraintChecks` invocation (6.8.2).
+     [X] Index-update loop: per-index delete-old + insert-new
+          honouring `aXRef[]` (no-change skip) — via
+          `sqlite3GenerateRowIndexDelete` + `sqlite3CompleteInsertion`.
+     [X] `sqlite3CompleteInsertion`-equivalent row write (6.8.3) +
           `nChange` increment.
-     [ ] AFTER UPDATE trigger fire arm.
-     [ ] UPDATE FROM arm (multi-table source) — already partially
-          covered by DiagDml UPDATE-FROM PASS but verify under the
-          full body.
-     [ ] RETURNING clause emission (DiagDml RETURNING already PASS;
-          must continue to PASS after the rewrite).
+     [X] AFTER UPDATE trigger fire arm.
+     Deferred (single-table arm scope; bail to update_cleanup with
+     no emission, free args cleanly):
+     [ ] UPDATE FROM arm (multi-table source) — needs 6.8.4
+          multi-table WHERE; `nChangeFrom>0` early bail.
+     [ ] Virtual-table dispatch (`updateVirtualTable`) — vtab xUpdate
+          path; `eTabType=TABTYP_VTAB` early bail.
+     [ ] RETURNING clause emission — call site for the productive
+          UPDATE path (DiagDml RETURNING corpus).
+     [ ] PREUPDATE_HOOK `OP_Delete OPFLAG_ISNOOP` arm — gated on
+          SQLITE_ENABLE_PREUPDATE_HOOK (not in the default build).
 
 - [ ] **6.9** complete the porting:
     - [ ] `sqlite3VdbeRecordCompare`
