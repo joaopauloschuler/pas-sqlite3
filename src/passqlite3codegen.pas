@@ -19492,6 +19492,7 @@ var
   copyOK:      Boolean;
   iiGB:        i32;
   sfA, sfB:    u8;
+  innerDest:   TSelectDest;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -20223,6 +20224,87 @@ begin
         (the first body op after VFilter) when xNext yields a row. }
       sqlite3VdbeAddOp2(v, OP_VNext, iCsr, addrTopOfLoop + 1);
 
+      sqlite3VdbeResolveLabel(v, addrEnd);
+      sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+
+      if pParse^.nErr <> 0 then Result := SQLITE_ERROR
+                          else Result := SQLITE_OK;
+      Exit;
+    end;
+  end;
+
+  { Sub-SELECT materialise arm — Phase 6.13(b) piece 3.
+    Single-source FROM (SELECT ...) shape: open an ephemeral rowid
+    table at the cursor selectExpander assigned, recursively code the
+    inner SELECT into it via SRT_EphemTab (piece 1's disposal arm
+    appends each inner row), then emit a Rewind/Column/ResultRow/Next
+    /Close outer scan over the materialised rows.  Co-routine emission
+    (sqlite3CodeSubquery) lands later and replaces this for the
+    uncorrelated case; the materialise path is the older fallback that
+    always works.  pSTab is non-nil here because piece 2's selectExpander
+    subquery hook already ran sqlite3ExpandSubquery on this item. }
+  if (p^.pSrc^.nSrc = 1)
+     and (p^.pWhere = nil)
+     and ((p^.selFlags and SF_Distinct) = 0)
+     and (pDest^.eDest = SRT_Output)
+  then
+  begin
+    pItem := SrcListItems(p^.pSrc);
+    pTab  := pItem^.pSTab;
+    if (pTab <> nil)
+       and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+       and (pItem^.u4.pSubq <> nil)
+       and (pItem^.u4.pSubq^.pSelect <> nil)
+    then
+    begin
+      v := sqlite3GetVdbe(pParse);
+      if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
+      sqlite3GenerateColumnNames(pParse, p);
+
+      if pItem^.iCursor < 0 then
+      begin
+        pItem^.iCursor := pParse^.nTab;
+        Inc(pParse^.nTab);
+      end;
+      iCsr := pItem^.iCursor;
+
+      { Open an ephemeral rowid table sized to the inner result columns.
+        passqlite3vdbe.pas OP_OpenEphemeral rowid arm (Phase 6.13(b) prep)
+        calls sqlite3BtreeCreateTable(BTREE_INTKEY) so NewRowid works. }
+      sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iCsr, pTab^.nCol);
+
+      { Recursively code the inner into the eph table.  iSDParm = iCsr
+        so piece 1's SRT_EphemTab disposal arm appends rows here. }
+      sqlite3SelectDestInit(@innerDest, SRT_EphemTab, iCsr);
+      if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+      begin
+        Result := SQLITE_ERROR; Exit;
+      end;
+
+      { Outer scan — emit one OP_ResultRow per stored row. }
+      pEList     := p^.pEList;
+      nResultCol := pEList^.nExpr;
+      pDest^.nSdst := nResultCol;
+      if pDest^.iSdst = 0 then
+      begin
+        pDest^.iSdst := pParse^.nMem + 1;
+        pParse^.nMem := pParse^.nMem + nResultCol;
+      end;
+
+      addrEnd       := sqlite3VdbeMakeLabel(pParse);
+      addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrEnd);
+
+      items := ExprListItems(pEList);
+      for i := 0 to nResultCol - 1 do
+      begin
+        r1 := sqlite3ExprCodeTarget(pParse, items[i].pExpr,
+                                    pDest^.iSdst + i);
+        if r1 <> pDest^.iSdst + i then
+          sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
+      end;
+      sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+
+      sqlite3VdbeAddOp2(v, OP_Next, iCsr, addrTopOfLoop + 1);
       sqlite3VdbeResolveLabel(v, addrEnd);
       sqlite3VdbeAddOp1(v, OP_Close, iCsr);
 

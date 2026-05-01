@@ -170,6 +170,11 @@ begin
         'CREATE TABLE t(a); INSERT INTO t VALUES(1); CREATE VIEW v AS SELECT a FROM t',
         'SELECT 1',
         'SELECT a FROM v');
+  // Sub-SELECT FROM-source (Phase 6.13(b) piece 3 materialise arm).
+  Probe('Sub-SELECT FROM materialise',
+        'CREATE TABLE t(a); INSERT INTO t VALUES(7); INSERT INTO t VALUES(8)',
+        'SELECT 1',
+        'SELECT a FROM (SELECT a FROM t WHERE a>7)');
   // CTE
   Probe('CTE simple',
         '',
