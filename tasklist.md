@@ -613,9 +613,35 @@ skeleton.
                 opened by the caller and the FROM dispatcher routes
                 a sub-SELECT here, rows will land in the eph table
                 via the disposal arm landed today.
-              * Re-land the selectExpander subquery hook (piece 2)
+              * [x] Re-land the selectExpander subquery hook (piece 2)
                 separately, and add a DiagFeatureProbe gate-row to
-                lock the no-regression guarantee on VIEW.
+                lock the no-regression guarantee on VIEW.  Done
+                2026-05-01.  Hook landed in sqlite3SelectExpand
+                FROM-loop (codegen.pas:18157) just before the existing
+                zName/pSubq skips: when SrcItemIsSubquery(fg) and
+                pItem^.u4.pSubq <> nil, recursively run
+                sqlite3SelectPrep on the inner pSelect, then
+                sqlite3ExpandSubquery to materialise pSTab from the
+                inner result columns, then assign iCursor and
+                Continue (so the base-table arm below skips the now-
+                resolved item).  The prior spike's EAccessViolation
+                regression was driven by the same hook firing on a
+                view->subquery rewrite mid-iteration; this re-land
+                stays at the top of the loop and the view arm below
+                is unchanged, so the recursive sqlite3SelectExpand
+                the view arm triggers reaches this hook only via the
+                inner SELECT (not via re-entry on the same item).
+                Gate row landed in DiagFeatureProbe.pas:
+                'CREATE VIEW + plain SELECT FROM v' currently locks
+                at Pas chkPrep=1/val=-1 (preparable-view gate, will
+                flip to PASS once piece 3 lands the materialise arm).
+                Regression sweep stays at TestExplainParity 1016/10,
+                TestSelectBasic 60/0, TestDMLBasic 54/0,
+                TestSchemaBasic 44/0, TestWhereBasic 52/0,
+                TestVdbeCursor 29/0; DiagFeatureProbe goes from 9
+                to 10 divergences (the new gate row, both view rows
+                still diverge at chkPrep=1 — no crash, no
+                EAccessViolation).
               * Then re-land the materialise arm (piece 3) — at
                 that point it should produce live rows.
               * Co-routine emission (`sqlite3CodeSubquery`) lands

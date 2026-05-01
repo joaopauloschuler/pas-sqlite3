@@ -18136,6 +18136,7 @@ var
   i:        i32;
   pTab:     PTable2;
   joinFlag: u32;
+  pSubSel:  PSelect;
 begin
   FillChar(w, SizeOf(w), 0);
   w.pParse := pParse;
@@ -18155,6 +18156,36 @@ begin
     for i := 0 to pSrc^.nSrc - 1 do
     begin
       pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+
+      { Subquery FROM-item arm — when SrcItem is flagged as a subquery,
+        recursively prepare the inner SELECT then materialise a Table*
+        from its result columns via sqlite3ExpandSubquery.  Mirrors the
+        selectExpander subquery branch (select.c around 6000); without
+        this, outer column refs into a `(SELECT …)` FROM-source fail to
+        resolve.  Phase 6.13(b) piece 2.  Must run before the
+        zName/pSubq skips below since this is the ONE arm that actually
+        wants to handle subquery items. }
+      if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
+      begin
+        pSubSel := pItem^.u4.pSubq^.pSelect;
+        if pSubSel <> nil then
+        begin
+          sqlite3SelectPrep(pParse, pSubSel, nil);
+          if pParse^.nErr <> 0 then Exit;
+        end;
+        if pItem^.pSTab = nil then
+        begin
+          if sqlite3ExpandSubquery(pParse, pItem) <> SQLITE_OK then Exit;
+        end;
+        if pItem^.iCursor < 0 then
+        begin
+          pItem^.iCursor := pParse^.nTab;
+          Inc(pParse^.nTab);
+        end;
+        pItem^.colUsed := 0;
+        Continue;
+      end;
+
       { Skip non-base items — subquery / CTE source items have no
         zName, vtab items have a populated pSubq.  Their resolution
         is deferred. }
