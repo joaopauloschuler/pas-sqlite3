@@ -15467,8 +15467,14 @@ begin
       else
         pLevel^.addrHalt := whereInfoLevels(pWInfo)[ii - 1].addrHalt;
 
-      { Skip ephemeral / view tables (no cursor to open). }
-      if ((pTab^.tabFlags and TF_Ephemeral) = 0) and (not IsView(pTab)) then
+      { Skip ephemeral / view tables / coroutine subqueries (no cursor to
+        open).  Mirrors C where.c:7259 + the implicit viaCoroutine guard
+        (a coroutine subquery's pSTab carries TF_Ephemeral/TABTYP_VIEW
+        from sqlite3ExpandSubquery, but the explicit viaCoroutine check
+        documents intent and protects against a future pSTab variant
+        that doesn't set those flags). }
+      if ((pTab^.tabFlags and TF_Ephemeral) = 0) and (not IsView(pTab))
+         and ((pTabItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) = 0) then
       begin
         if (pLoop^.wsFlags and WHERE_IDX_ONLY) = 0 then
         begin
@@ -15599,11 +15605,20 @@ begin
   { Ensure schema cookie / OP_Transaction prologue is emitted for iDb. }
   sqlite3CodeVerifySchema(pParse, iDb);
 
-  if pWInfo^.eOnePass <> ONEPASS_OFF then
-    sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenWrite)
-  else
-    sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenRead);
-  sqlite3VdbeChangeP5(v, 0);
+  { Skip cursor-open for ephemeral / view tables / coroutine subqueries —
+    same gate as the multi-level path above (where.c:7259).  Coroutine
+    subqueries have no btree to OpenRead; the codeOneLoopStart
+    viaCoroutine arm (codegen.pas:16395) emits OP_InitCoroutine + OP_Yield
+    in place of OP_OpenRead + OP_Rewind. }
+  if ((pTab^.tabFlags and TF_Ephemeral) = 0) and (not IsView(pTab))
+     and ((pTabItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) = 0) then
+  begin
+    if pWInfo^.eOnePass <> ONEPASS_OFF then
+      sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenWrite)
+    else
+      sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenRead);
+    sqlite3VdbeChangeP5(v, 0);
+  end;
 
   { Phase 6.9-bis 11g.2.f sub-progress 20 — pre-allocate the rowid-seek
     register for IPK-IN scan plans, BEFORE the pre-loop IN-RHS hoist
