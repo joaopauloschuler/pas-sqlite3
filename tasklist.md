@@ -166,8 +166,20 @@ skeleton.
      [ ] Multi-row VALUES / INSERT FROM SELECT (insert.c:1115..)
           — pSelect <> nil today bails to insert_cleanup (no
           emission).
-     [ ] AUTOINCREMENT — `autoIncBegin` returns 0 stub; needs
-          autoinc registers + sqlite_sequence update at end.
+     [~] AUTOINCREMENT — wired 2026-05-01 (commit 179597b).
+          `CREATE TABLE ... AUTOINCREMENT` now creates and pins
+          sqlite_sequence; `sqlite3AutoincrementEnd` is now called
+          from sqlite3Insert so the in-row write-back epilogue
+          actually fires; `regRowCount` is allocated and bumped
+          per insert.  Verified: AUTOINCREMENT INSERTs now
+          generate rowids correctly (1,2,3,...); previously
+          failed at autoIncBegin's pSeqTab=nil check with
+          SQLITE_CORRUPT_SEQUENCE.
+          Remaining: the sqlite_sequence row's `seq` column does
+          not yet update with the new max rowid after INSERT —
+          AutoincrementEnd's epilogue runs but the in-row update
+          loop may not be wiring p1/p2/p3 of OP_Insert to the
+          correct registers.  Trace pending.
      [ ] BEFORE / AFTER INSERT triggers — already ported as
           `sqlite3CodeRowTrigger` but not yet wired into this
           path.
