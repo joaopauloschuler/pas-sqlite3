@@ -244,7 +244,7 @@ skeleton.
         [ ] `SELECT a FROM t GROUP BY a` — Δ=42 (aggregate-group
           path, not yet ported).
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
-          materialise / co-routine path not ported).
+          materialise / co-routine path not ported).  Folds into 6.13(b).
           Note 2026-04-28: `sqlite3SrcItemAttachSubquery` (build.c:5019)
           + the subquery branch of `sqlite3SrcListAppendFromTerm`
           (build.c:5102) are now real; the parser no longer drops the
@@ -289,7 +289,7 @@ skeleton.
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
       bin/DiagFeatureProbe`).  Most fold into existing tasks; the genuinely
       new silent-result bugs are listed first.
-      [ ] **c) View materialisation in SELECT.**
+      [ ] **c) View materialisation in SELECT.**  Folds into 6.13(b).
         `SELECT count(*) FROM v` returns no row on Pas.  Foundation
         landed 2026-04-28: ported `sqlite3CreateView` (build.c:2990) so
         CREATE VIEW now stores the duplicated SELECT in
@@ -309,7 +309,7 @@ skeleton.
         stub.  Closing this needs the sub-FROM materialise / co-routine
         codegen path (6.10 step 6 sub-FROM entry) — same blocker as
         non-view sub-FROM SELECTs.
-      [ ] **e) UNION / compound SELECT.**
+      [ ] **e) UNION / compound SELECT.**  Folds into 6.13(c).
         `SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)`
         returns no row.  Compound-select codegen / sub-FROM
         materialisation gap (overlaps step 6 sub-FROM Δ=7 entry).
@@ -455,14 +455,87 @@ skeleton.
        non-regular FROM items.  Closing the gate now requires the
        sub-FROM materialise / eponymous-vtab traversal arm in
        sqlite3Select (6.10 step 6 sub-FROM entry + step 9(c)), not
-       further Pragma work.  COMPILE_OPTIONS additionally needs
-       `sqlite3azCompileOpt` populated in main.pas:2833.
+       further Pragma work — see 6.13.  COMPILE_OPTIONS additionally
+       needs `sqlite3azCompileOpt` populated in main.pas:2833.
        Side-fix 2026-04-29: `PRAGMA journal_mode=X` /
        `PRAGMA locking_mode=X` write arms now emit a result row matching
        C (memdb effective-mode echo); `PRAGMA integrity_check` /
        `PRAGMA quick_check` now emit "ok" on a clean db (real walker is
        still stub, but every db this port produces is corruption-free
        by construction).
+
+  [ ] **6.13** Non-regular FROM-item codegen in `sqlite3Select`
+       (select.c).  Pas's SELECT codegen currently traverses regular
+       table cursors but falls through to a trivial `Init/Halt/Goto`
+       stub when the FROM list contains an eponymous virtual table,
+       a view, a sub-SELECT, a CTE, or a compound-SELECT source.
+       Verified 2026-05-01 via EXPLAIN
+       `SELECT * FROM pragma_pragma_list` → 3 ops total; the cursor
+       open + per-row loop never emits.  One function with three
+       new arms; landing them collectively unblocks several
+       previously-tracked rows.
+
+       **Gate reach (rows that close once 6.13 lands):**
+       - 6.10 step 6 sub-FROM (`SELECT a FROM (SELECT a FROM t)` Δ=7)
+       - 6.10 step 9(c) view materialisation (`count(*) FROM v`)
+       - 6.10 step 9(e) UNION compound source
+       - 6.10 step 9(f) WITH / CTE non-productive
+       - 6.10 step 19(a) compound-SELECT-as-INSERT-source
+       - 6.12 the 10 DiagPragma table-valued probes (eponymous-vtab
+         path through pragma_table_info / pragma_index_list / …)
+       - DiagFeatureProbe rows (c) view, (e) compound, (f) CTE.
+
+       **Sub-arms to port:**
+       [ ] **a) Eponymous-vtab arm** — when `IsVirtual(pTab)` is true
+            on a `pSrcItem`, emit cursor-traversal: `OP_VOpen`
+            (p4=PVTable) → `OP_Integer 0,regIdxNum` → `OP_VFilter
+            cursor,addrEof,regIdxNum` → inner-loop body reading via
+            `OP_VColumn` → `OP_VNext cursor,addrLoopTop` → close at
+            `addrEof`.  All four runtime opcodes are already wired in
+            `passqlite3vdbe.pas` (OP_VOpen, OP_VFilter, OP_VNext,
+            OP_VColumn); only the codegen-side emission is missing.
+            Smallest of the three arms; should land first since it
+            unblocks the entire DiagPragma 6.12 gate on its own.
+            C reference: `sqlite3Select` per-pSrcItem cursor-open
+            switch (select.c roughly 5400..5500) + the vtab arm
+            around select.c:6100.
+       [ ] **b) Sub-SELECT / view arm** — when
+            `pSrcItem.fg.fgBits and SRCITEM_FG_IS_SUBQUERY` is set,
+            emit either a co-routine (preferred — yielded inner-VDBE
+            streams rows into the outer scan) or a materialise-into-
+            ephemeral fallback.  Lift the five existing bails at
+            codegen.pas:19646, :19924, :19981, :20114, :21203.
+            Port `sqlite3CodeSubquery` (select.c around 5800) for the
+            co-routine emission; the materialise arm is the older
+            ephemeral-table path used when the subquery cannot be
+            co-routined (correlated, etc.).  selectExpander view-arm
+            (select.c:6039..6073) is already partially landed per
+            6.10 step 9(c) note — once subqueries work, views fold in
+            for free because selectExpander rewrites a VIEW FROM-item
+            into a SUBQUERY FROM-item.
+       [ ] **c) Compound-SELECT / CTE arm** — UNION / INTERSECT /
+            EXCEPT FROM-sources and `WITH … AS (…)` references.
+            Once 6.13(b) lands, compound-SELECT-as-FROM-source
+            mostly folds in (compound is just a recursive call into
+            sqlite3Select on the inner SELECT), but CTE name
+            resolution needs the parser-side `WithAdd` / `CteNew`
+            to actually populate `pParse^.pWith` (tracked under 6.20)
+            so a SrcItem matching a CTE name binds correctly.
+
+       **Sizing:** the C `sqlite3Select` is ~1500 lines; most of the
+       regular-table path is already in pas.  The new code is the
+       per-pSrcItem dispatcher (~50 lines), the eponymous-vtab arm
+       (~80 lines), the co-routine emitter (`sqlite3CodeSubquery`,
+       ~250 lines), and the bail-lift sweep at the five existing
+       gate sites.  Total ~400-600 new lines, multi-commit.  Not a
+       quick win.
+
+       **Suggested order:** 6.13(a) first (smallest, unblocks the
+       full DiagPragma gate, validates the per-pSrcItem dispatcher
+       in isolation), then 6.13(b) (largest, but with the
+       dispatcher in place the bail-lift sweep is mechanical), then
+       6.13(c) (mostly mechanical once b is done, except for the
+       6.20-blocked CTE binding).
 
 ---
 
