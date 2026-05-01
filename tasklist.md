@@ -150,13 +150,19 @@ skeleton.
      identical to C oracle.
      Deferred sub-arms (route to insert_cleanup or fall back to
      OP_NewRowid + record assembly without bail today):
-     [ ] IPK-alias rebinding (insert.c:1490..1531) — when the
-          user-provided value at regData+iPKey should become the
-          rowid (`INSERT INTO u VALUES(7,'a')` with
-          `u(id INTEGER PRIMARY KEY)`).  Currently the
-          OP_NewRowid auto-pick wins; covers the
-          `rowid alias custom` divergence and TestExplainParity
-          `INSERT IPK alias u` row.
+     [X] IPK-alias rebinding (insert.c:1488..1531) — DONE
+          2026-05-01 (commit a820774).  IPK alias tables now
+          honour user-supplied rowids via SCopy+NotNull+NewRowid+
+          MustBeInt cascade with regData+iPKey nulled
+          post-rebind.  Verified: `INSERT INTO u VALUES(7,'a')`
+          with `u(id INTEGER PRIMARY KEY,x)` followed by
+          `SELECT id, x FROM u` now returns [7,a] (was empty).
+          TestExplainParity `INSERT IPK alias u` narrows from
+          off-by-11 to off-by-1 (a single OP_Noop placeholder
+          in GenerateConstraintChecks not yet emitted —
+          minor, deferred).  DiagIndexing `rowid alias custom`
+          stays divergent on a separate SELECT-ORDER-BY bail
+          unrelated to the IPK path.
      [ ] Multi-row VALUES / INSERT FROM SELECT (insert.c:1115..)
           — pSelect <> nil today bails to insert_cleanup (no
           emission).
