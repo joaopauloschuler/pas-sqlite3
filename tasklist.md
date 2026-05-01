@@ -486,7 +486,7 @@ skeleton.
        - DiagFeatureProbe rows (c) view, (e) compound, (f) CTE.
 
        **Sub-arms to port:**
-       [ ] **a) Eponymous-vtab arm** — when `IsVirtual(pTab)` is true
+       [x] **a) Eponymous-vtab arm** — when `IsVirtual(pTab)` is true
             on a `pSrcItem`, emit cursor-traversal: `OP_VOpen`
             (p4=PVTable) → `OP_Integer 0,regIdxNum` → `OP_VFilter
             cursor,addrEof,regIdxNum` → inner-loop body reading via
@@ -499,6 +499,19 @@ skeleton.
             C reference: `sqlite3Select` per-pSrcItem cursor-open
             switch (select.c roughly 5400..5500) + the vtab arm
             around select.c:6100.
+            Landed 2026-05-01 at codegen.pas:20104 (just before the
+            "All source items must be real, non-virtual base tables"
+            gate): for nSrc=1 / SRT_Output|SRT_Mem / no WHERE / no
+            DISTINCT / no Aggregate / no Compound, emits
+            VOpen → Integer 0,r → Integer 0,r+1 → VFilter
+            (idxNum=0, argc=0, idxStr=nil) → per-row column emit via
+            sqlite3ExprCodeTarget (TK_COLUMN routes to OP_VColumn
+            through sqlite3ExprCodeGetColumnOfTable) → ResultRow →
+            VNext → Close.  Smoke: `SELECT name FROM
+            pragma_pragma_list` returns 66 rows.  count(*) /
+            arg-bound forms (pragma_table_info('t')) still bail —
+            those need either WhereBegin's vtab branch or a
+            count-on-vtab special case (deferred).
        [ ] **b) Sub-SELECT / view arm** — when
             `pSrcItem.fg.fgBits and SRCITEM_FG_IS_SUBQUERY` is set,
             emit either a co-routine (preferred — yielded inner-VDBE

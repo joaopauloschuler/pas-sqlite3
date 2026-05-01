@@ -20101,6 +20101,98 @@ begin
     Result := SQLITE_OK; Exit;
   end;
 
+  { Eponymous-vtab FROM-item arm — Phase 6.13(a).
+    Single-source TABTYP_VTAB scan: emit OP_VOpen + OP_Integer(idxNum=0)
+    + OP_Integer(argc=0) + OP_VFilter + per-row body + OP_VNext.  The
+    regular WHERE / cursor-open path below bails on TABTYP_VTAB because
+    sqlite3WhereBegin's vtab branch is not yet ported; this arm covers
+    the simple "SELECT … FROM <vtab>" shape (no WHERE / DISTINCT /
+    JOIN) directly, unblocking eponymous-vtab readers like
+    pragma_pragma_list.  C reference: select.c per-pSrcItem cursor-open
+    arm + the vtab branch in sqlite3WhereBegin (collapsed here).
+    Inner-loop columns route through sqlite3ExprCodeTarget →
+    sqlite3ExprCodeGetColumnOfTable, which already emits OP_VColumn for
+    TABTYP_VTAB. }
+  if (p^.pSrc^.nSrc = 1)
+     and (p^.pWhere = nil)
+     and ((p^.selFlags and SF_Distinct) = 0)
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem))
+  then
+  begin
+    pItem := SrcListItems(p^.pSrc);
+    pTab  := pItem^.pSTab;
+    if (pTab <> nil) and (pTab^.eTabType = TABTYP_VTAB)
+       and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)
+    then
+    begin
+      v := sqlite3GetVdbe(pParse);
+      if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
+      if pDest^.eDest = SRT_Output then
+        sqlite3GenerateColumnNames(pParse, p);
+      iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
+      if iDb >= 0 then sqlite3CodeVerifySchema(pParse, iDb);
+
+      { iCursor is normally assigned by sqlite3SrcListAssignCursors during
+        selectExpander; defensively allocate one if the resolver missed it. }
+      if pItem^.iCursor < 0 then
+      begin
+        pItem^.iCursor := pParse^.nTab;
+        Inc(pParse^.nTab);
+      end;
+      iCsr := pItem^.iCursor;
+
+      pEList     := p^.pEList;
+      nResultCol := pEList^.nExpr;
+      pDest^.nSdst := nResultCol;
+      if pDest^.iSdst = 0 then
+      begin
+        pDest^.iSdst := pParse^.nMem + 1;
+        pParse^.nMem := pParse^.nMem + nResultCol;
+      end;
+
+      { OP_VOpen iCsr, 0, 0, P4_VTAB(pVTable) — vdbe.c:8356. }
+      sqlite3VdbeAddOp4(v, OP_VOpen, iCsr, 0, 0,
+        PAnsiChar(passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab))),
+        P4_VTAB);
+
+      { Reserve two contiguous regs for VFilter: pQuery (idxNum) + pArgc. }
+      Inc(pParse^.nMem); regAgg := pParse^.nMem;
+      Inc(pParse^.nMem);
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg);
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg + 1);
+
+      { OP_VFilter iCsr, addrEof, regQuery — p4=NULL idxStr.  On EOF
+        jumps to addrEof; on first row falls through into the body. }
+      addrEnd := sqlite3VdbeMakeLabel(pParse);
+      addrTopOfLoop := sqlite3VdbeAddOp3(v, OP_VFilter, iCsr,
+                                         addrEnd, regAgg);
+
+      { Inner-loop body — emit each result column.  TK_COLUMN with
+        eTabType=TABTYP_VTAB routes through OP_VColumn. }
+      items := ExprListItems(pEList);
+      for i := 0 to nResultCol - 1 do
+      begin
+        r1 := sqlite3ExprCodeTarget(pParse, items[i].pExpr,
+                                    pDest^.iSdst + i);
+        if r1 <> pDest^.iSdst + i then
+          sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
+      end;
+      if pDest^.eDest = SRT_Output then
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+
+      { OP_VNext iCsr, addrLoopBody — jumps back to addrTopOfLoop+1
+        (the first body op after VFilter) when xNext yields a row. }
+      sqlite3VdbeAddOp2(v, OP_VNext, iCsr, addrTopOfLoop + 1);
+
+      sqlite3VdbeResolveLabel(v, addrEnd);
+      sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+
+      if pParse^.nErr <> 0 then Result := SQLITE_ERROR
+                          else Result := SQLITE_OK;
+      Exit;
+    end;
+  end;
+
   pTabList := p^.pSrc;
   pItem    := SrcListItems(pTabList);
   pTab     := pItem^.pSTab;
