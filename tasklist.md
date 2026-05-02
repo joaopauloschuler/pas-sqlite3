@@ -298,8 +298,9 @@ skeleton.
       [X] DISTINCT + ORDER BY — DONE.
       [ ] Top-N sorter — currently pushes all rows then trims with
           DecrJumpZero.
-      [ ] nOBSat shortcut — when the planner reports the loop already
-          delivers rows in ORDER BY order, skip the sorter.
+      [X] nOBSat shortcut — SorterOpen demoted to OP_Noop and sort tail
+          skipped when pWInfo^.nOBSat >= sortNKey (no-FROM ORDER BY and
+          any planner path that satisfies ordering naturally).
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)

@@ -20171,6 +20171,7 @@ var
   iSorterCsr:   i32;
   sortKeyInfo:  PKeyInfo2;
   sortNKey:     i32;
+  addrSorter:   i32;
   regSortBase:  i32;
   regSortRec:   i32;
   regSortOut:   i32;
@@ -21398,7 +21399,7 @@ begin
     OP_OpenEphemeral with KeyInfo, later promoted to OP_SorterOpen).
     Always sorts even when WhereBegin could satisfy ORDER BY through an
     index — the nOBSat shortcut is deferred. }
-  bSort := 0; iSorterCsr := -1; sortNKey := 0;
+  bSort := 0; iSorterCsr := -1; sortNKey := 0; addrSorter := -1;
   if (p^.pOrderBy <> nil) and (pDest^.eDest = SRT_Output)
      and (not isExists) then
   begin
@@ -21407,7 +21408,7 @@ begin
     sortNKey := p^.pOrderBy^.nExpr;
     sortKeyInfo := sqlite3KeyInfoFromExprList(pParse, p^.pOrderBy, 0,
                                               nResultCol);
-    sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorterCsr,
+    addrSorter := sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorterCsr,
                       sortNKey + nResultCol, 0,
                       PAnsiChar(sortKeyInfo), P4_KEYINFO);
   end;
@@ -21423,6 +21424,17 @@ begin
   if pWInfo = nil then
   begin
     Result := SQLITE_ERROR; Exit;
+  end;
+
+  { nOBSat shortcut (select.c:7470..7484) — when the planner already
+    delivers rows in ORDER BY order (e.g. ORDER BY on the IPK / leading
+    index column), demote SorterOpen to a no-op and skip the sort tail.
+    Inner loop will emit ResultRow directly. }
+  if (bSort = 1) and (pWInfo^.nOBSat >= sortNKey) then
+  begin
+    if addrSorter >= 0 then
+      sqlite3VdbeChangeToNoop(v, addrSorter);
+    bSort := 0;
   end;
 
   { ORDER BY bail — destinations / shapes the sorter slice does not
