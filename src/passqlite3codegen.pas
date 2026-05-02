@@ -21052,7 +21052,7 @@ begin
     index — the nOBSat shortcut is deferred. }
   bSort := 0; iSorterCsr := -1; sortNKey := 0;
   if (p^.pOrderBy <> nil) and (pDest^.eDest = SRT_Output)
-     and (not isExists) and (iTabTnct < 0) and (p^.pLimit = nil) then
+     and (not isExists) and (iTabTnct < 0) and (p^.iOffset = 0) then
   begin
     bSort := 1;
     iSorterCsr := pParse^.nTab; Inc(pParse^.nTab);
@@ -21278,6 +21278,11 @@ begin
       sqlite3VdbeAddOp3(v, OP_Column, iSortTab, sortNKey + i,
                         pDest^.iSdst + i);
     sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+    { LIMIT decrement after each emitted row (post-sort).  The inner-loop
+      body intentionally skips DecrJumpZero for the bSort path — all rows
+      must reach the sorter so the top-N is correct. }
+    if (p^.iLimit <> 0) and (not isExists) then
+      sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrSortBrk);
     sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterCsr, addrSortLoop);
     sqlite3VdbeResolveLabel(v, addrSortBrk);
   end;
