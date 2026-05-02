@@ -436,10 +436,41 @@ skeleton.
         `SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)`
         returns no row.  Compound-select codegen / sub-FROM
         materialisation gap (overlaps step 6 sub-FROM Δ=7 entry).
-      [ ] **f) WITH / CTE not productive.**
-        Both simple (`WITH c(x) AS (SELECT 7) SELECT x FROM c`) and
-        recursive forms return no row.  Tracked under 6.20 (CteNew /
-        WithAdd stubs blocked on full TCte record).
+      [~] **f) WITH / CTE not productive** — simple non-recursive CTE
+        DONE 2026-05-02.  `WITH c(x) AS (SELECT 7) SELECT x FROM c` now
+        returns 7 (DiagFeatureProbe `CTE simple` PASS, divergences
+        7→6).  Three coupled changes in passqlite3codegen.pas:
+        (1) ported `searchWith` (select.c:5601) and
+        `resolveFromTermToCte` (select.c:5670, non-recursive arm only)
+        — match a FROM-item against the in-scope WITH chain, allocate
+        an ephemeral Table, attach the CTE body via
+        `sqlite3SrcItemAttachSubquery` with a duplicate-on-attach so
+        each reference gets a fresh body, then run
+        `sqlite3ColumnsFromExprList` on the leftmost-SELECT result-set
+        for column name/affinity propagation.  Sets `pCt^.zCteErr` to
+        "circular reference: %s" around the inner SelectPrep so a
+        self-reference inside the CTE body trips the zCteErr arm on
+        re-entry instead of looping (mirrors select.c:5793..5840).
+        (2) Wired `sqlite3WithPush(pParse, pSelect^.pWith, 0)` at the
+        top of `sqlite3SelectExpand` so the parser-supplied WITH (set
+        on `pSelect^.pWith` by `attachWithToSelect` for the
+        `select ::= WITH wqlist selectnowith` reduction) becomes
+        visible to `pParse^.pWith` during FROM resolution; the existing
+        post-walk `sqlite3SelectPopWith` callback pops it.
+        (3) Extended the no-FROM fast path in `sqlite3Select`
+        (codegen.pas:20018) to honour `SRT_Coroutine` in addition to
+        `SRT_Output` — emits OP_Yield instead of OP_ResultRow — so the
+        CTE body inside the outer's co-routine arm actually emits its
+        per-column code (was emitting empty `InitCoroutine ;
+        EndCoroutine`).
+        Recursive CTE (`WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL
+        SELECT n+1 FROM r WHERE n<5) SELECT count(*) FROM r`) still
+        DIVERGEs — needs the recursive-CTE arm of resolveFromTermToCte
+        (select.c:5760..5839) plus compound SF_Recursive codegen.
+        Regressions green: TestExplainParity 1019/7, TestDMLBasic 54/0,
+        TestSchemaBasic 44/0, TestSelectBasic 60/0, TestWhereBasic
+        52/0, DiagDml 13/1, DiagIndexing 38/4, DiagMisc divergences
+        unchanged.
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.

@@ -18405,6 +18405,160 @@ begin
   p^.pEList := pNew;
 end;
 
+{ select.c:5582 — cannotBeFunction.  Returns 1 + sets parse error if pFrom
+  is a table-valued-function reference (`name(args)`), else 0. }
+function cannotBeFunction(pParse: PParse; pFrom: PSrcItem): i32;
+var zMsg: PAnsiChar;
+begin
+  if (pFrom^.fg.fgBits and u8($08)) <> 0 then  { isTabFunc bit 3 }
+  begin
+    zMsg := sqlite3MPrintf(pParse^.db, '''%s'' is not a function',
+                           [pFrom^.zName]);
+    if zMsg <> nil then begin
+      sqlite3ErrorMsg(pParse, zMsg);
+      sqlite3DbFree(pParse^.db, zMsg);
+    end;
+    Result := 1;
+    Exit;
+  end;
+  Result := 0;
+end;
+
+{ select.c:5601 — searchWith.  Walk the With chain (innermost-out) for a
+  CTE matching pItem^.zName.  Returns the matching Cte* or nil; on match,
+  sets ppContext^ to the With that owns it. }
+function searchWith(pWth: PWith; pItem: PSrcItem; ppContext: PPointer): PCte;
+var
+  zNm:  PAnsiChar;
+  p:    PWith;
+  i:    i32;
+  pBs:  PCte;
+  pSlt: PCte;
+begin
+  zNm := pItem^.zName;
+  p   := pWth;
+  while p <> nil do
+  begin
+    pBs := PCte(PByte(p) + SZ_WITH_HEADER);
+    for i := 0 to p^.nCte - 1 do
+    begin
+      pSlt := PCte(PByte(pBs) + PtrUInt(i) * SZ_CTE);
+      if sqlite3StrICmp(zNm, pSlt^.zName) = 0 then
+      begin
+        ppContext^ := p;
+        Result := pSlt;
+        Exit;
+      end;
+    end;
+    if p^.bView <> 0 then Break;
+    p := p^.pOuter;
+  end;
+  Result := nil;
+end;
+
+{ select.c:5670 — resolveFromTermToCte.  Match pFrom against an in-scope
+  CTE; on match, attach pCt^.pSelect as a subquery of pFrom and synthesise
+  the ephemeral Table* for column-resolution.  Returns 0 on no match,
+  1 on success, 2 on error.  Recursive-CTE arm is NOT yet ported — sets
+  parse error if SF_Compound is detected on the CTE body so the caller
+  surfaces a graceful failure rather than silently producing wrong rows. }
+function resolveFromTermToCte(pParse: PParse; pFrom: PSrcItem): i32;
+var
+  pCt:   PCte;
+  pWthC: Pointer;
+  db:    PTsqlite3;
+  pTab:  PTable2;
+  pEList: PExprList;
+  pSel:  PSelect;
+  pLeft: PSelect;
+  zMsg:  PAnsiChar;
+begin
+  if pParse^.pWith = nil then begin Result := 0; Exit; end;
+  if pParse^.nErr <> 0 then begin Result := 0; Exit; end;
+  { fixedSchema=0 and zDatabase set => schema-qualified, cannot be CTE. }
+  if ((pFrom^.fg.fgBits3 and u8($01)) = 0) and (pFrom^.u4.zDatabase <> nil) then
+  begin Result := 0; Exit; end;
+  { notCte = bit 2 of fgBits2. }
+  if (pFrom^.fg.fgBits2 and u8($04)) <> 0 then begin Result := 0; Exit; end;
+  pWthC := nil;
+  pCt := searchWith(pParse^.pWith, pFrom, @pWthC);
+  if pCt = nil then begin Result := 0; Exit; end;
+
+  db := pParse^.db;
+  if pCt^.zCteErr <> nil then
+  begin
+    zMsg := sqlite3MPrintf(db, pCt^.zCteErr, [pCt^.zName]);
+    if zMsg <> nil then begin
+      sqlite3ErrorMsg(pParse, zMsg);
+      sqlite3DbFree(db, zMsg);
+    end;
+    Result := 2;
+    Exit;
+  end;
+  if cannotBeFunction(pParse, pFrom) <> 0 then begin Result := 2; Exit; end;
+  Assert(pFrom^.pSTab = nil);
+  pTab := PTable2(sqlite3DbMallocZero(db, SizeOf(TTable)));
+  if pTab = nil then begin Result := 2; Exit; end;
+  pFrom^.pSTab     := pTab;
+  pTab^.nTabRef    := 1;
+  pTab^.zName      := sqlite3DbStrDup(db, pCt^.zName);
+  pTab^.iPKey      := -1;
+  pTab^.nRowLogEst := 200;
+  pTab^.tabFlags   := pTab^.tabFlags or TF_Ephemeral or TF_NoVisibleRowid;
+  if sqlite3SrcItemAttachSubquery(pParse, pFrom, pCt^.pSelect, 1) = 0 then
+  begin Result := 2; Exit; end;
+  if db^.mallocFailed <> 0 then begin Result := 2; Exit; end;
+  Assert(SrcItemIsSubquery(pFrom^.fg) and (pFrom^.u4.pSubq <> nil));
+  pSel := pFrom^.u4.pSubq^.pSelect;
+  Assert(pSel <> nil);
+  pSel^.selFlags := pSel^.selFlags or SF_CopyCte;
+  if (pFrom^.fg.fgBits and u8($02)) <> 0 then  { isIndexedBy }
+  begin
+    zMsg := sqlite3MPrintf(db, 'no such index: "%s"',
+                           [pFrom^.u1.zIndexedBy]);
+    if zMsg <> nil then begin
+      sqlite3ErrorMsg(pParse, zMsg);
+      sqlite3DbFree(db, zMsg);
+    end;
+    Result := 2;
+    Exit;
+  end;
+  { Mark isCte (bit 1 of fgBits2). }
+  pFrom^.fg.fgBits2 := pFrom^.fg.fgBits2 or u8($02);
+
+  { Recurse into the CTE's SELECT to resolve its FROM/expressions before
+    we read its result-set column names.  Set pCt^.zCteErr first so a
+    self-reference inside the CTE body trips the zCteErr arm above on
+    re-entry instead of looping forever (select.c:5793..5840). }
+  pCt^.zCteErr := PAnsiChar('circular reference: %s');
+  sqlite3SelectPrep(pParse, pSel, nil);
+  pCt^.zCteErr := nil;
+  if pParse^.nErr <> 0 then begin Result := 2; Exit; end;
+
+  { Walk to leftmost SELECT for the result-set column list. }
+  pLeft := pSel;
+  while pLeft^.pPrior <> nil do pLeft := pLeft^.pPrior;
+  pEList := pLeft^.pEList;
+  if pCt^.pCols <> nil then
+  begin
+    if (pEList <> nil) and (pEList^.nExpr <> pCt^.pCols^.nExpr) then
+    begin
+      zMsg := sqlite3MPrintf(db,
+        'table %s has %d values for %d columns',
+        [pCt^.zName, pEList^.nExpr, pCt^.pCols^.nExpr]);
+      if zMsg <> nil then begin
+        sqlite3ErrorMsg(pParse, zMsg);
+        sqlite3DbFree(db, zMsg);
+      end;
+      Result := 2;
+      Exit;
+    end;
+    pEList := pCt^.pCols;
+  end;
+  sqlite3ColumnsFromExprList(pParse, pEList, @pTab^.nCol, @pTab^.aCol);
+  Result := 1;
+end;
+
 procedure sqlite3SelectExpand(pParse: PParse; pSelect: PSelect);
 var
   w:        TWalker;
@@ -18415,6 +18569,7 @@ var
   pTab:     PTable2;
   joinFlag: u32;
   pSubSel:  PSelect;
+  rcCte:    i32;
 begin
   FillChar(w, SizeOf(w), 0);
   w.pParse := pParse;
@@ -18425,6 +18580,12 @@ begin
     w.xSelectCallback2 := nil;
     sqlite3WalkSelect(@w, pSelect);
   end;
+  { Push the SELECT's WITH onto pParse^.pWith for CTE name lookup
+    (select.c:5991).  bFree=0 — the WITH is owned by the Select, freed
+    when the Select is freed.  The post-walk sqlite3SelectPopWith pops
+    it back. }
+  if (pSelect <> nil) and (pSelect^.pWith <> nil) then
+    sqlite3WithPush(pParse, pSelect^.pWith, 0);
 
   { FROM-clause resolution loop — minimum viable selectExpander. }
   if (pSelect <> nil) and (pSelect^.pSrc <> nil) then
@@ -18474,6 +18635,23 @@ begin
       if pItem^.zName = nil then Continue;
       if pItem^.pSTab = nil then
       begin
+        { CTE-resolution arm (select.c:6019) — try to bind pItem to an
+          in-scope WITH-clause CTE before falling through to schema
+          lookup.  rcCte=1 means the SrcItem was rewritten into a
+          subquery FROM-item carrying the CTE body; recurse into the
+          subquery branch above by jumping back to start of iteration. }
+        rcCte := resolveFromTermToCte(pParse, pItem);
+        if rcCte > 1 then Exit;
+        if rcCte = 1 then
+        begin
+          if pItem^.iCursor < 0 then
+          begin
+            pItem^.iCursor := pParse^.nTab;
+            Inc(pParse^.nTab);
+          end;
+          pItem^.colUsed := 0;
+          Continue;
+        end;
         { Mirror selectExpander (select.c:6022) — locate the table by
           name and abort the expand pass with a parse error when it is
           not found.  Bare-error path; tests that need to defer schema
@@ -19846,7 +20024,7 @@ begin
     Mirrors the tail of selectInnerLoop for SRT_Output when WhereBegin
     is skipped (no cursor to iterate). }
   if ((p^.pSrc = nil) or (p^.pSrc^.nSrc = 0))
-     and (pDest^.eDest = SRT_Output)
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine))
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pOrderBy = nil) and (p^.pLimit = nil) and (p^.pWin = nil)
@@ -19855,7 +20033,7 @@ begin
   begin
     v := sqlite3GetVdbe(pParse);
     if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
-    sqlite3GenerateColumnNames(pParse, p);
+    if pDest^.eDest = SRT_Output then sqlite3GenerateColumnNames(pParse, p);
     pEList := p^.pEList;
     nResultCol := pEList^.nExpr;
     pDest^.nSdst := nResultCol;
@@ -19877,7 +20055,10 @@ begin
       if r1 <> pDest^.iSdst + i then
         sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
     end;
-    sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+    if pDest^.eDest = SRT_Output then
+      sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
+    else { SRT_Coroutine — yield the row to the outer scan. }
+      sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
     if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
     Exit;
   end;
