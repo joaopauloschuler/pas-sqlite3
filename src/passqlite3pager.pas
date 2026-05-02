@@ -426,6 +426,7 @@ function  sqlite3Realloc(p: Pointer; n: NativeUInt): Pointer;
 
 { WAL public API (Phase 3.B.3b) }
 function  sqlite3PagerOpenWal(pPager: PPager; pbOpen: PcInt): i32;
+function  sqlite3PagerCloseWal(pPager: PPager; db: Pointer): i32;
 function  sqlite3PagerWalSupported(pPager: PPager): i32;
 function  sqlite3PagerCheckpoint(pPager: PPager; db: Pointer; eMode: i32;
                                  xBusy: TxBusyCallback; pBusyArg: Pointer;
@@ -1880,6 +1881,48 @@ begin
   end
   else if pbOpen <> nil then
     pbOpen^ := 1;
+  Result := rc;
+end;
+
+{ pager.c ~7670: sqlite3PagerCloseWal — close the WAL connection prior to
+  switching out of WAL mode.  1:1 port. }
+function sqlite3PagerCloseWal(pPager: PPager; db: Pointer): i32;
+var
+  rc       : i32;
+  logexists: cint;
+begin
+  rc := SQLITE_OK;
+  Assert(pPager^.journalMode = PAGER_JOURNALMODE_WAL);
+
+  { If the log file is not already open, but does exist in the file-system,
+    it may need to be checkpointed before the connection can switch to
+    rollback mode. Open it now so this can happen. }
+  if pPager^.pWal = nil then
+  begin
+    logexists := 0;
+    rc := pagerLockDb(pPager, SHARED_LOCK);
+    if rc = SQLITE_OK then
+      rc := sqlite3OsAccess(pPager^.pVfs, pPager^.zWal,
+                            SQLITE_ACCESS_EXISTS, @logexists);
+    if (rc = SQLITE_OK) and (logexists <> 0) then
+      rc := pagerOpenWal(pPager);
+  end;
+
+  { Checkpoint and close the log. Because an EXCLUSIVE lock is held on
+    the database file, the log and log-summary files will be deleted. }
+  if (rc = SQLITE_OK) and (pPager^.pWal <> nil) then
+  begin
+    rc := pagerExclusiveLock(pPager);
+    if rc = SQLITE_OK then
+    begin
+      rc := sqlite3WalClose(pPager^.pWal, db, pPager^.walSyncFlags,
+                            pPager^.pageSize, Pu8(pPager^.pTmpSpace));
+      pPager^.pWal := nil;
+      pagerFixMaplimit(pPager);
+      if (rc <> 0) and (pPager^.exclusiveMode = 0) then
+        pagerUnlockDb(pPager, SHARED_LOCK);
+    end;
+  end;
   Result := rc;
 end;
 

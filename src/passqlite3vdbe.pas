@@ -7035,10 +7035,11 @@ var
   rcCk:      i32;
   iCk:       i32;
   { OP_JournalMode locals (vdbe.c:8054) }
-  jmEnew:    i32;
-  jmEold:    i32;
-  jmBt:      PBtree;
-  jmPager:   PPager;
+  jmEnew:      i32;
+  jmEold:      i32;
+  jmBt:        PBtree;
+  jmPager:     PPager;
+  jmZFilename: PChar;
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -9958,11 +9959,7 @@ begin
       pOut^.u.i := 0;
     end;
 
-    { ────── OP_JournalMode ────── (vdbe.c:8054) — port of the non-WAL-
-      transition arms of the C body.  WAL→other and other→WAL transitions
-      need sqlite3PagerCloseWal (pager.c, not ported); those silently demote
-      to the existing mode, matching the result that
-      sqlite3PagerOkToChangeJournalMode=0 path produces in C. }
+    { ────── OP_JournalMode ────── (vdbe.c:8054) — full 1:1 port. }
     OP_JournalMode: begin
       pOut := out2Prerelease(v, pOp);
       jmEnew := pOp^.p3;
@@ -9971,17 +9968,56 @@ begin
       jmEold := sqlite3PagerGetJournalMode(jmPager);
       if jmEnew = PAGER_JOURNALMODE_QUERY then jmEnew := jmEold;
       if sqlite3PagerOkToChangeJournalMode(jmPager) = 0 then jmEnew := jmEold;
-      { WAL transition arm omitted (pager.PagerCloseWal not ported);
-        if either side is WAL, keep the existing mode. }
-      if (jmEnew <> jmEold) and
-         ((jmEold = PAGER_JOURNALMODE_WAL) or (jmEnew = PAGER_JOURNALMODE_WAL))
+
+      { Do not allow a transition to journal_mode=WAL for a database
+        in temporary storage or if the VFS does not support shared memory. }
+      jmZFilename := sqlite3PagerFilename(jmPager, 1);
+      if (jmEnew = PAGER_JOURNALMODE_WAL)
+         and ((jmZFilename = nil) or (jmZFilename^ = #0)
+              or (sqlite3PagerWalSupported(jmPager) = 0))
       then jmEnew := jmEold;
+
+      if (jmEnew <> jmEold)
+         and ((jmEold = PAGER_JOURNALMODE_WAL) or (jmEnew = PAGER_JOURNALMODE_WAL))
+      then begin
+        if (db^.autoCommit = 0) or (db^.nVdbeRead > 1) then begin
+          rc := SQLITE_ERROR;
+          if jmEnew = PAGER_JOURNALMODE_WAL then
+            sqlite3VdbeError(v, 'cannot change into wal mode from within a transaction')
+          else
+            sqlite3VdbeError(v, 'cannot change out of wal mode from within a transaction');
+          goto abort_due_to_error;
+        end else begin
+          if jmEold = PAGER_JOURNALMODE_WAL then begin
+            { Leaving WAL mode — checkpoint and close the log. }
+            rc := sqlite3PagerCloseWal(jmPager, db);
+            if rc = SQLITE_OK then
+              sqlite3PagerSetJournalMode(jmPager, jmEnew);
+          end else if jmEold = PAGER_JOURNALMODE_MEMORY then begin
+            { Cannot transition directly from MEMORY to WAL.  Use mode OFF
+              as an intermediate. }
+            sqlite3PagerSetJournalMode(jmPager, PAGER_JOURNALMODE_OFF);
+          end;
+
+          { Open a transaction on the database file.  Regardless of the
+            journal mode, this transaction always uses a rollback journal. }
+          if rc = SQLITE_OK then begin
+            if jmEnew = PAGER_JOURNALMODE_WAL then
+              rc := sqlite3BtreeSetVersion(jmBt, 2)
+            else
+              rc := sqlite3BtreeSetVersion(jmBt, 1);
+          end;
+        end;
+      end;
+
+      if rc <> SQLITE_OK then jmEnew := jmEold;
       jmEnew := sqlite3PagerSetJournalMode(jmPager, jmEnew);
       pOut^.flags := MEM_Str or MEM_Static or MEM_Term;
       pOut^.z     := PAnsiChar(sqlite3JournalModename(jmEnew));
       pOut^.n     := sqlite3Strlen30(PChar(pOut^.z));
       pOut^.enc   := SQLITE_UTF8;
       sqlite3VdbeChangeEncoding(pOut, enc);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
     end;
 
     { ────── OP_SqlExec ────── (vdbe.c:7064) }
