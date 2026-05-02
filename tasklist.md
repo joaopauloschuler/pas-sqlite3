@@ -489,15 +489,18 @@ skeleton.
   [ ] **6.10 step 19** DiagDml runtime probe (added 2026-04-28,
       `src/tests/DiagDml.pas`, run `LD_LIBRARY_PATH=$PWD/src bin/DiagDml`).
       Sweep of UPSERT / RETURNING / INSERT-FROM-SELECT / UPDATE-FROM /
-      column-reorder / DEFAULT-expr / multi-row-VALUES variants.  13 PASS,
-      1 DIVERGE (verified 2026-05-01) — surprises noted below; UPSERT
-      (DO NOTHING + DO UPDATE +
-      excluded.b), RETURNING (INSERT/UPDATE/DELETE), INSERT INTO d SELECT
-      * FROM s, UPDATE...FROM, column-reorder all already PASS.
-      [ ] **a) `INSERT INTO t SELECT 1,2 UNION ALL SELECT 3,4`** —
-        Pas inserts 0 rows, C inserts 2.  Compound-SELECT-as-INSERT-source
-        gap; folds into 6.10 step 6 (sqlite3Insert pSelect early-exit at
-        codegen.pas:19756) + step 9(e) (compound-SELECT codegen).
+      column-reorder / DEFAULT-expr / multi-row-VALUES variants.  All
+      14 PASS as of 2026-05-02.
+      [X] **a) `INSERT INTO t SELECT 1,2 UNION ALL SELECT 3,4`** — DONE
+        2026-05-02.  sqlite3Insert's multi-row-VALUES inline-unrolled
+        emission path now also accepts compound `SELECT const-list
+        UNION ALL SELECT const-list` chains: every leaf has empty
+        FROM-clause and is linked through pPrior with op=TK_ALL, so the
+        same per-row pEList loop emits identical bytecode whether the
+        chain was built from `VALUES (…),(…)` or
+        `SELECT … UNION ALL SELECT …`.  Bytecode parity with C still
+        deferred (folds into the coroutine arm of sqlite3MultiValues
+        and the broader 6.10 step 6 sub-FROM SELECT path).
       [X] **b) Multi-row VALUES with non-constant exprs** — DONE
         2026-05-01.
 

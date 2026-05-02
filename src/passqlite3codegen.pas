@@ -25643,14 +25643,16 @@ begin
     VALUES is captured into pList above; pSelect is nil here. }
   if pSelect <> nil then
   begin
-    if ((pSelect^.selFlags and SF_Values) = 0) then goto insert_cleanup;
+    { Accept either SF_Values multi-row VALUES chains or compound
+      `SELECT const-list UNION ALL SELECT const-list` chains where every
+      leaf has an empty FROM-clause and is linked through pPrior with
+      op=TK_ALL.  Both reduce to the same inline-unrolled emission since
+      each leaf carries a constant pEList row. }
     rowsOk := True;
     nRows := 0;
     pTmp := pSelect;
     while pTmp <> nil do
     begin
-      if (pTmp^.selFlags and SF_Values) = 0 then
-        begin rowsOk := False; Break; end;
       if (pTmp^.pSrc = nil) or (pTmp^.pSrc^.nSrc <> 0) then
         begin rowsOk := False; Break; end;
       if (pTmp^.pPrior <> nil) and (pTmp^.op <> TK_ALL) then
