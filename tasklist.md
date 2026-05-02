@@ -307,14 +307,9 @@ skeleton.
         sqlite_schema ...)` and productive `sqlite3Update` is still
         skeleton-only.  This is the only remaining contributor.
   [~] **6.12** port sqlite3Pragma in full.  Gate `DiagPragma`.
-       2 DiagPragma divergences remain (was 5): TVF args now reach
-       xFilter (table_info / table_xinfo / index_list closed
-       2026-05-02 — eponymous-vtab arms evaluate pItem^.u1.pFuncArg
-       into OP_VFilter argv slots, and the Pragma codegen dequotes
-       pValue so the inner PRAGMA prepare sees bare identifiers).
-       Remaining gaps:
+       1 DiagPragma divergence remains (was 5).
+       Remaining gap:
        (a) FOREIGN_KEY_LIST blocked on TFKey opaque.
-       (b) COMPILE_OPTIONS needs `sqlite3azCompileOpt` populated.
 
   [ ] **6.13** Non-regular FROM-item codegen in `sqlite3Select`
        (select.c).  Pas's SELECT codegen currently traverses regular

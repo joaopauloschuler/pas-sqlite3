@@ -33461,6 +33461,16 @@ var
 const
   azFuncEnc: array[0..3] of PAnsiChar = (nil, 'utf8', 'utf16le', 'utf16be');
   azIdxOrigin: array[0..2] of PAnsiChar = ('c', 'u', 'pk');
+  { Mirror of sqlite3azCompileOpt in passqlite3main.pas — kept local
+    here because codegen cannot use passqlite3main (circular).  Reflects
+    the build configuration declared in passqlite3.inc. }
+  azBuildOpts: array[0..4] of PAnsiChar = (
+    'COMPILER=fpc',
+    'OMIT_AUTOINIT',
+    'OMIT_DEPRECATED',
+    'OMIT_LOAD_EXTENSION',
+    'THREADSAFE=1'
+  );
 begin
   if (pParse = nil) or (pId1 = nil) then Exit;
   db := pParse^.db;
@@ -33736,14 +33746,13 @@ begin
       Exit;
     end;
 
-    { pragma.c:2374 — PRAGMA compile_options.  In our build
-      sqlite3azCompileOpt is empty (main.pas:2833), so the loop emits no
-      rows.  This still flips the divergence from "table not found" to
-      "0 rows" (i.e. count(*) = 0 vs C's count(*) >= 1) — closing it
-      end-to-end requires populating the option list, which is a
-      separate small fix. }
+    { pragma.c:2374 — PRAGMA compile_options.  Iterates
+      sqlite3_compileoption_get / sqlite3azCompileOpt, emitting one row
+      per defined option (passqlite3main.pas:2833). }
     PragTyp_COMPILE_OPTIONS: begin
       pParse^.nMem := 1;
+      for i := Low(azBuildOpts) to High(azBuildOpts) do
+        sqlite3VdbeMultiLoad(v, 1, 's', [Pointer(azBuildOpts[i])]);
       sqlite3VdbeReusable(v);
       Exit;
     end;

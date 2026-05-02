@@ -197,9 +197,10 @@ begin
   Check('sourceid non-nil',
         sqlite3_sourceid <> nil);
   Check('threadsafe = 1', sqlite3_threadsafe = 1);
-  { Compile-option enquiry — Pas table is empty so used()=0 and get()=nil
-    for any input.  Verifies the API surface exists and the C-side parity
-    on out-of-range / nil cases. }
+  { Compile-option enquiry — Pas table reflects passqlite3.inc build
+    config (THREADSAFE=1, OMIT_AUTOINIT, OMIT_DEPRECATED,
+    OMIT_LOAD_EXTENSION, COMPILER=fpc).  Bogus / out-of-range inputs
+    must still match the C-side contract. }
   Check('compileoption_used(nil) = 0',
         sqlite3_compileoption_used(nil) = 0);
   Check('compileoption_used("BOGUS_FLAG_XYZ") = 0',
@@ -208,10 +209,12 @@ begin
         sqlite3_compileoption_used('SQLITE_BOGUS_FLAG_XYZ') = 0);
   Check('compileoption_get(-1) = nil',
         sqlite3_compileoption_get(-1) = nil);
-  Check('compileoption_get(0) = nil (table empty)',
-        sqlite3_compileoption_get(0) = nil);
+  Check('compileoption_get(0) <> nil',
+        sqlite3_compileoption_get(0) <> nil);
   Check('compileoption_get(99999) = nil',
         sqlite3_compileoption_get(99999) = nil);
+  Check('compileoption_used("THREADSAFE") = 1',
+        sqlite3_compileoption_used('THREADSAFE') = 1);
   { C-side spot check: out-of-range probes return nil.  Listing varies
     per build (e.g. THREADSAFE=1, ENABLE_FTS5, etc.) so we don't pin
     a specific entry here. }
