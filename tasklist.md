@@ -89,12 +89,13 @@ skeleton.
      [ ] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
           fast path).
 
-- [ ] **6.8.5** port `sqlite3WhereEnd` (where.c).
-     Gate: same as 6.8.4 — they land as a pair.
-     [ ] Per-loop tail (OP_Next / OP_Prev / OP_VNext + jump back to
-          loop top).
-     [ ] Cursor close + addrBrk/addrCont label patching.
-     [ ] Free `WhereInfo` and any `IdxStr` allocations.
+- [X] **6.8.5** port `sqlite3WhereEnd` (where.c) — DONE.
+     Body at codegen.pas:16461..16672.  Per-level addrCont resolution +
+     pLevel^.op iteration emit, addrBrk resolution, EXISTS-to-JOIN
+     break, IN-loop unwind, viaCoroutine OP_Column→OP_Copy rewrite,
+     index→table column rewrite, ljNullRowFixup, whereInfoFree
+     cleanup.  C reference does not emit OP_Close in WhereEnd — those
+     are emitted by sqlite3Select after the call, matching the port.
 
 - [X] **6.8.1** finish porting `sqlite3Update` (update.c) — single-table
      arm DONE.  `passqlite3codegen.pas:23457..24115`, 1:1 port of
@@ -108,8 +109,10 @@ skeleton.
           SQLITE_ENABLE_PREUPDATE_HOOK (not in the default build).
 
 - [ ] **6.9** complete the porting:
-    - [ ] `sqlite3VdbeRecordCompare`
-    - [ ] `sqlite3VdbeFindCompare`
+    - [X] `sqlite3VdbeRecordCompare` — full body in btree.pas:3130;
+      vdbe.pas wrappers (passqlite3vdbe.pas:2154/2174) delegate.
+    - [X] `sqlite3VdbeFindCompare` — full body in btree.pas:3310;
+      vdbe.pas wrapper (passqlite3vdbe.pas:2181) delegates.
     - [ ] **b)** Collation-aware string compare (vdbeCompareMemString
       hook from btree.pas → vdbe.pas) — required only for non-BINARY
       collated index lookups;

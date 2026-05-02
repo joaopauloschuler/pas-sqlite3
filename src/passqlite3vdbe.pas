@@ -9536,7 +9536,6 @@ begin
         pOut^.flags := MEM_Int;
         pOut^.u.i := iMoved;
         if rc <> SQLITE_OK then goto abort_due_to_error;
-        { OP_Destroy auto-vacuum: sqlite3RootPageMoved deferred to Phase 6 }
         if iMoved <> 0 then
           sqlite3RootPageMoved(db, pOp^.p3, iMoved, pOp^.p1);
       end;
@@ -10752,10 +10751,6 @@ begin
   p^.flags := MEM_Null;
 end;
 
-{ -----------------------------------------------------------------------
-  sqlite3VdbeMemTranslate — UTF encoding conversion stub (Phase 2 note)
-  Full port deferred to Phase 6 (needs Mem encoding fully wired).
-  ----------------------------------------------------------------------- }
 { sqlite3VdbeMemTranslate — convert pMem->z between SQLITE_UTF8 / UTF16LE /
   UTF16BE.  Faithful port of utf.c:242..423.  The UTF-16 ↔ UTF-16 byte-swap
   arm (utf.c:266..288) is in-place; UTF-8 ↔ UTF-16 arms allocate a new
