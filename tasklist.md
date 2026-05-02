@@ -270,14 +270,22 @@ skeleton.
         bare identifier.
 
   [ ] **6.10 step 15** Runtime divergences surfaced by `DiagTxn`
-      (transactions, savepoints, conflict resolution).  7 remain;
-      most fold into existing gaps (full VdbeHalt, sqlite3Update).
+      (transactions, savepoints, conflict resolution).  2 remain.
       [ ] **b) `BEGIN; ...; ROLLBACK` does not roll back** — BEGIN/
         ROLLBACK are no-ops on Pas side; blocked on Phase 5.4 full
         VdbeHalt port.
       [~] **c) `SAVEPOINT s; ROLLBACK TO s` does not unwind** —
         schema-cache side fixed.  Remaining: memdb pager savepoint
         reconciliation — btree pages not unwound on ROLLBACK TO.
+      [X] **d) `INSERT OR REPLACE` on UNIQUE column lookup fails** —
+        DONE 2026-05-02.  Root cause was unrelated to OR REPLACE:
+        `WHERE col=k` on a UNIQUE column was planned via the
+        whereShortCut rowid-EQ inline path (which only opens the
+        table cursor and emits SeekRowid treating k as a rowid),
+        because whereShortCut also matched the unique-EQ shape but
+        the inline shortcut had no codegen for WHERE_INDEXED.  Fix
+        at codegen.pas:15770 routes WHERE_INDEXED-positive plans
+        through the full planner instead.
 
   [ ] **6.10 step 17** Window-function and aggregate divergences
       surfaced by `DiagWindow`.  13 runtime empty-row divergences open.

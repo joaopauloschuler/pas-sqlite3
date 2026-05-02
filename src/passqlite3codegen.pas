@@ -15755,9 +15755,21 @@ begin
   fSingleTabCoroutine := (nTabList = 1)
     and ((SrcListItems(pTabList)[0].fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0);
 
+  { Phase 6.10 step 6.UNIQ-EQ — whereShortCut may return 1 with
+    WHERE_INDEXED set for the unique-index-EQ shape (`WHERE a=k` where
+    a has a UNIQUE constraint).  The inline rowid-EQ shortcut at
+    15921+ only opens the table cursor and emits SeekRowid (treating
+    the value as a rowid); it has no codegen for the index-cursor
+    open + OP_NotFound / OP_SeekGE path that WHERE_INDEXED requires.
+    Route those plans through the full planner, which handles
+    WHERE_INDEXED correctly via the cursor-open block at 15861 and
+    sqlite3WhereCodeOneLoopStart Case 4.  Without this gate,
+    `SELECT b FROM t WHERE a=N` silently returns 0 rows when N does
+    not happen to coincide with an existing rowid. }
   if fSingleTabCoroutine
      or (nTabList <> 1)
-     or (whereShortCut(@sWLB) = 0) then
+     or (whereShortCut(@sWLB) = 0)
+     or ((sWLB.pNew^.wsFlags and WHERE_INDEXED) <> 0) then
   begin
     { Full planner path — where.c:7079..7473.
       Covers multi-table FROM (nTabList>1), single-table viaCoroutine
