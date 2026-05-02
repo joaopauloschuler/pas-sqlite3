@@ -194,23 +194,40 @@ skeleton.
           now writes `seq=3` to sqlite_sequence (was 0); matches C
           reference exactly.
      [~] BEFORE / AFTER INSERT triggers — structurally wired into
-          sqlite3Insert 2026-05-01.  Per-row body now allocates a
-          per-iteration endOfLoop label, builds the NEW.* pseudo-
-          table at regCols when tmask & TRIGGER_BEFORE (rowid
-          placeholder + OP_Copy of nNVCol cols + sqlite3TableAffinity),
-          calls sqlite3CodeRowTrigger TRIGGER_BEFORE before rowid
-          emission, calls sqlite3CodeRowTrigger TRIGGER_AFTER after
-          regRowCount bump, and resolves endOfLoop at row tail.
-          Mirrors insert.c:1442..1499 + 1604..1608 1:1.
-          Dead code today: trgGetRowTrigger (codegen.pas:22374)
-          returns nil because codeRowTrigger / getRowTrigger
-          (trigger.c:1231 / :1347 — the trigger-body compiler that
-          builds TriggerPrg + SubProgram and recursively invokes
-          sqlite3Insert/Update/DeleteFrom for trigger steps) is still
-          a stub.  Closing those will light up triggers across the
-          board (this wiring + the matching wiring already present in
-          sqlite3Update/sqlite3DeleteFrom).  Tracked as Phase 6.23
-          follow-on.
+          sqlite3Insert 2026-05-01 + trigger-body compiler ported.
+          Per-row body in sqlite3Insert allocates a per-iteration
+          endOfLoop label, builds the NEW.* pseudo-table at regCols
+          when tmask & TRIGGER_BEFORE, calls sqlite3CodeRowTrigger for
+          BEFORE and AFTER (mirrors insert.c:1442..1499 + 1604..1608).
+          codeRowTrigger / codeTriggerProgram / transferParseError
+          (trigger.c:1231 / :1111 / :1215) are now ported faithfully:
+          codeRowTrigger spins up a sub-Parse, allocates TriggerPrg +
+          SubProgram, codes the WHEN clause + step list, terminates
+          with OP_Halt, takes the op array out via VdbeTakeOpArray
+          and installs it on the SubProgram.  trgGetRowTrigger does
+          the cache lookup + codeRowTrigger compile.
+          Two pre-existing parse-time bugs in sqlite3FinishTrigger
+          fixed in passing: (a) the C "drain pStepList while walking"
+          idiom was broken by an extra walker variable, causing a
+          double-free of the step chain via sqlite3DeleteTrigger +
+          tail DeleteTriggerStep; (b) the C `pTrig =
+          sqlite3HashInsert(...)` reassign was lost (result stored
+          only in pInserted), so the schema-owned trigger was freed
+          a second time at cleanup.  Verified: CREATE TRIGGER ... ON
+          t BEGIN SELECT 1; END now prepares + steps + finalizes +
+          closes cleanly (was EAccessViolation in DeleteTriggerStep).
+          KNOWN LEAK (DiagTrig sketch, not in suite): an INSERT that
+          actually fires the trigger crashes during finalize with
+          a double-free on the parent VDBE's op-array.  Symptom:
+          parent VDBE's aOp/nOp visible in gdb as small bogus values
+          (~0x95e4 / 6.8M) by the time vdbeClearObject runs.
+          Suspected: sub-vdbe ↔ parent-vdbe lifecycle interaction in
+          codeRowTrigger / nested DML codegen, OR sqlite3VdbeTakeOpArray
+          and parent's ops sharing state.  Tracking separately;
+          regression suite (TestExplainParity 1018/1026, TestDMLBasic
+          54/0, TestSchemaBasic 44/0, DiagDml 13/1, DiagMultiValues
+          count=3) stays green because no test in suite both creates
+          a trigger AND fires it.
      [ ] RETURNING clause emission — DiagDml RETURNING corpus.
      [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
      [ ] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`

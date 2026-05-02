@@ -21931,10 +21931,16 @@ begin
   iDb   := sqlite3SchemaToIndex(db, pTrig^.pSchema);
   Assert((iDb >= 0) and (iDb < db^.nDb), 'FinishTrigger: iDb in range');
   pTrig^.step_list := pStepList;
-  pStep := pStepList;
-  while pStep <> nil do begin
-    pStep^.pTrig := pTrig;
-    pStep := pStep^.pNext;
+  { C idiom (trigger.c:341..344): drain pStepList while walking — leaves
+    the parameter NIL so the triggerfinish_cleanup tail's defensive
+    sqlite3DeleteTriggerStep(pStepList) is a no-op.  The Pascal port
+    previously used a separate pStep walker, which left pStepList
+    pointing at the chain now owned by pTrig and caused a double-free
+    via sqlite3DeleteTrigger -> DeleteTriggerStep + tail
+    DeleteTriggerStep(pStepList). }
+  while pStepList <> nil do begin
+    pStepList^.pTrig := pTrig;
+    pStepList := pStepList^.pNext;
   end;
   sqlite3TokenInit(@nameToken, pTrig^.zName);
   sqlite3FixInit(@sFix, pParse, iDb, PAnsiChar('trigger'), @nameToken);
@@ -21998,6 +22004,14 @@ begin
         pLink^.pNext := pTab^.pTrigger;
         pTab^.pTrigger := pLink;
       end;
+      { C trigger.c:407 idiom: `pTrig = sqlite3HashInsert(...)` reassigns
+        pTrig to HashInsert's return — nil for fresh, displaced dup on
+        collision — so the cleanup tail's sqlite3DeleteTrigger is a
+        no-op on the new-insert path (the schema now owns it).  The
+        Pascal port had stored the result in pInserted but left pTrig
+        pointing at the trigger now owned by the schema's trigHash +
+        pTab->pTrigger.  Restore C semantics. }
+      pTrig := pInserted;
     end;
   end;
 
@@ -22284,15 +22298,203 @@ begin
     lands no further plumbing is needed. }
 end;
 
+{ transferParseError — port of trigger.c:1215.  After a sub-Parse used
+  to compile a trigger sub-vdbe completes, propagate any error state
+  (zErrMsg / nErr / rc) up to the caller's Parse.  If the caller is
+  already in error, drop the sub-Parse's error message instead. }
+procedure transferParseError(pTo: PParse; pFrom: PParse);
+begin
+  if pTo^.nErr = 0 then
+  begin
+    pTo^.zErrMsg := pFrom^.zErrMsg;
+    pTo^.nErr   := pFrom^.nErr;
+    pTo^.rc     := pFrom^.rc;
+  end
+  else
+    sqlite3DbFree(pFrom^.db, pFrom^.zErrMsg);
+end;
+
+{ codeTriggerProgram — port of trigger.c:1111.  Walk the linked list of
+  TriggerStep records and dispatch each step (TK_UPDATE / TK_INSERT /
+  TK_DELETE / TK_SELECT) to the matching DML codegen entry point.
+  Each DML entry takes ownership of the duplicated SrcList/ExprList/
+  Select/IdList/Upsert it receives (matching the C reference).  After
+  each non-SELECT step we emit OP_ResetCount so the trigger body's
+  changes() bookkeeping doesn't leak into the caller's row count. }
+procedure codeTriggerProgram(pParse: PParse; pStepList: PTriggerStep;
+  orconf: i32);
+var
+  pStep: PTriggerStep;
+  v:     PVdbe;
+  db:    PTsqlite3;
+  sDest: TSelectDest;
+  pSel:  PSelect;
+begin
+  v := pParse^.pVdbe;
+  db := pParse^.db;
+  AssertH((pParse^.pTriggerTab <> nil) and (pParse^.pToplevel <> nil),
+    'codeTriggerProgram pTriggerTab+pToplevel');
+  AssertH(pStepList <> nil, 'codeTriggerProgram pStepList');
+  AssertH(v <> nil, 'codeTriggerProgram v');
+  pStep := pStepList;
+  while pStep <> nil do
+  begin
+    if orconf = OE_Default then
+      pParse^.eOrconf := pStep^.orconf
+    else
+      pParse^.eOrconf := u8(orconf);
+
+    { OP_Trace for the original SQL span (debug aid).  The C reference
+      gates this on !SQLITE_OMIT_TRACE; our build keeps OP_Trace, so
+      mirror unconditionally. }
+    if pStep^.zSpan <> nil then
+      sqlite3VdbeAddOp4(v, OP_Trace, $7FFFFFFF, 1, 0,
+        sqlite3MPrintf(db, PAnsiChar('-- %s'), [pStep^.zSpan]),
+        P4_DYNAMIC);
+
+    case pStep^.op of
+      TK_UPDATE:
+        begin
+          sqlite3Update(pParse,
+            sqlite3SrcListDup(db, pStep^.pSrc, 0),
+            sqlite3ExprListDup(db, pStep^.pExprList, 0),
+            sqlite3ExprDup(db, pStep^.pWhere, 0),
+            i32(pParse^.eOrconf), nil, nil, nil);
+          sqlite3VdbeAddOp0(v, OP_ResetCount);
+        end;
+      TK_INSERT:
+        begin
+          sqlite3Insert(pParse,
+            sqlite3SrcListDup(db, pStep^.pSrc, 0),
+            sqlite3SelectDup(db, pStep^.pSelect, 0),
+            sqlite3IdListDup(db, pStep^.pIdList),
+            i32(pParse^.eOrconf),
+            sqlite3UpsertDup(db, pStep^.pUpsert));
+          sqlite3VdbeAddOp0(v, OP_ResetCount);
+        end;
+      TK_DELETE:
+        begin
+          sqlite3DeleteFrom(pParse,
+            sqlite3SrcListDup(db, pStep^.pSrc, 0),
+            sqlite3ExprDup(db, pStep^.pWhere, 0), nil, nil);
+          sqlite3VdbeAddOp0(v, OP_ResetCount);
+        end;
+    else
+      AssertH(pStep^.op = TK_SELECT, 'codeTriggerProgram TK_SELECT');
+      pSel := sqlite3SelectDup(db, pStep^.pSelect, 0);
+      sqlite3SelectDestInit(@sDest, SRT_Discard, 0);
+      sqlite3Select(pParse, pSel, @sDest);
+      sqlite3SelectDelete(db, pSel);
+    end;
+    pStep := pStep^.pNext;
+  end;
+end;
+
+{ codeRowTrigger — port of trigger.c:1231.  Compile a single trigger's
+  body into a freshly-allocated SubProgram.  Allocates the TriggerPrg
+  and SubProgram up-front, links them into the toplevel Parse so they
+  free correctly on error, spins up a sub-Parse with pTriggerTab /
+  pToplevel / eTriggerOp set, codes the WHEN clause (jumps to end on
+  false/null) plus the step list via codeTriggerProgram, terminates
+  with OP_Halt, then takes the op-array out of the sub-vdbe and
+  installs it into the SubProgram. }
+function codeRowTrigger(pParse: PParse; pTrigger: PTrigger;
+  pTab: PTable2; orconf: i32): PTriggerPrg;
+var
+  pTop:        PParse;
+  db:          PTsqlite3;
+  pPrg:        PTriggerPrg;
+  pWhen:       PExpr;
+  v:           PVdbe;
+  sNC:         TNameContext;
+  pProgram:    PSubProgram;
+  iEndTrigger: i32;
+  sSubParse:   TParse;
+begin
+  pTop  := sqlite3ParseToplevel(pParse);
+  db    := pParse^.db;
+  pWhen := nil;
+  iEndTrigger := 0;
+
+  AssertH(pTop^.pVdbe <> nil, 'codeRowTrigger pTop.pVdbe');
+
+  pPrg := PTriggerPrg(sqlite3DbMallocZero(db, SizeOf(TTriggerPrg)));
+  if pPrg = nil then begin Result := nil; Exit; end;
+  pPrg^.pNext := pTop^.pTriggerPrg;
+  pTop^.pTriggerPrg := pPrg;
+
+  pProgram := PSubProgram(sqlite3DbMallocZero(db, SizeOf(TSubProgram)));
+  if pProgram = nil then begin Result := nil; Exit; end;
+  pPrg^.pProgram := pProgram;
+
+  sqlite3VdbeLinkSubProgram(pTop^.pVdbe, pProgram);
+  pPrg^.pTrigger := pTrigger;
+  pPrg^.orconf   := orconf;
+  pPrg^.aColmask[0] := u32($FFFFFFFF);
+  pPrg^.aColmask[1] := u32($FFFFFFFF);
+
+  sqlite3ParseObjectInit(@sSubParse, db);
+  FillChar(sNC, SizeOf(sNC), 0);
+  sNC.pParse := @sSubParse;
+  sSubParse.pTriggerTab  := pTab;
+  sSubParse.pToplevel    := pTop;
+  sSubParse.zAuthContext := pTrigger^.zName;
+  sSubParse.eTriggerOp   := pTrigger^.op;
+  sSubParse.nQueryLoop   := pParse^.nQueryLoop;
+  sSubParse.prepFlags    := pParse^.prepFlags;
+  sSubParse.oldmask      := 0;
+  sSubParse.newmask      := 0;
+
+  v := sqlite3GetVdbe(@sSubParse);
+  if v <> nil then
+  begin
+    { WHEN clause — jump past trigger body if false or NULL. }
+    if pTrigger^.pWhen <> nil then
+    begin
+      pWhen := sqlite3ExprDup(db, pTrigger^.pWhen, 0);
+      if (db^.mallocFailed = 0)
+         and (sqlite3ResolveExprNames(@sNC, pWhen) = SQLITE_OK) then
+      begin
+        iEndTrigger := sqlite3VdbeMakeLabel(@sSubParse);
+        sqlite3ExprIfFalse(@sSubParse, pWhen, iEndTrigger,
+          SQLITE_JUMPIFNULL);
+      end;
+      sqlite3ExprDelete(db, pWhen);
+    end;
+
+    codeTriggerProgram(@sSubParse, pTrigger^.step_list, orconf);
+
+    if iEndTrigger <> 0 then
+      sqlite3VdbeResolveLabel(v, iEndTrigger);
+    sqlite3VdbeAddOp0(v, OP_Halt);
+    transferParseError(pParse, @sSubParse);
+
+    if pParse^.nErr = 0 then
+      pProgram^.aOp := sqlite3VdbeTakeOpArray(v, @pProgram^.nOp,
+                                              @pTop^.nMaxArg);
+    pProgram^.nMem  := sSubParse.nMem;
+    pProgram^.nCsr  := sSubParse.nTab;
+    pProgram^.token := pTrigger;
+    pPrg^.aColmask[0] := sSubParse.oldmask;
+    pPrg^.aColmask[1] := sSubParse.newmask;
+    sqlite3VdbeDelete(v);
+  end
+  else
+    transferParseError(pParse, @sSubParse);
+
+  AssertH((sSubParse.pTriggerPrg = nil) and (sSubParse.nMaxArg = 0),
+    'codeRowTrigger sub-Parse cleanup');
+  sqlite3ParseObjectReset(@sSubParse);
+  Result := pPrg;
+end;
+
 { sqlite3CodeRowTriggerDirect — port of trigger.c:1382.
 
   Emit OP_Program for the compiled sub-program of trigger p, then set
   P5 to non-zero when recursive invocation must be suppressed (named
   trigger + SQLITE_RecTriggers cleared).  pPrg comes from trgGetRowTrigger
-  (the cache lookup + codeRowTrigger compile path).  Today
-  trgGetRowTrigger returns nil because codeRowTrigger is still a stub
-  (Phase 6.23 follow-on), so the OP_Program emit is dead-code; the
-  structural port is correct so it lights up the moment that lands. }
+  (the cache lookup + codeRowTrigger compile path), now productive
+  via codeRowTrigger above. }
 procedure sqlite3CodeRowTriggerDirect(pParse: PParse; pTrigger: PTrigger;
   pTab: PTable2; reg: i32; orconf: i32; ignoreJump: i32);
 var
@@ -22373,11 +22575,23 @@ end;
   for that arm but now correctly covers the IsView and bReturning paths. }
 function trgGetRowTrigger(pParse: PParse; p: PTrigger; pTab: PTable2;
   orconf: i32): PTriggerPrg;
+var
+  pRoot: PParse;
+  pPrg:  PTriggerPrg;
 begin
-  { TODO(Phase 6.23 follow-on): port codeRowTrigger / getRowTrigger.
-    Returns nil so the caller treats the per-trigger column contribution
-    as 0 (matches C's "if(pPrg)" guard when codeRowTrigger fails). }
-  Result := nil;
+  pRoot := sqlite3ParseToplevel(pParse);
+  { Cache lookup — recursive trigger invocations and second-fire of the
+    same (trigger, orconf) pair reuse the existing TriggerPrg so the
+    sub-vdbe is built only once. }
+  pPrg := pRoot^.pTriggerPrg;
+  while (pPrg <> nil) and ((pPrg^.pTrigger <> p) or (pPrg^.orconf <> orconf)) do
+    pPrg := pPrg^.pNext;
+  if pPrg = nil then
+  begin
+    pPrg := codeRowTrigger(pParse, p, pTab, orconf);
+    pParse^.db^.errByteOffset := -1;
+  end;
+  Result := pPrg;
 end;
 
 function sqlite3TriggerColmask(pParse: PParse; pTrigger: PTrigger;
