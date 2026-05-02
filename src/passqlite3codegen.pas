@@ -20178,6 +20178,11 @@ var
   addrSortLoop: i32;
   addrSortBrk:  i32;
   addrSortContinue: i32;
+  { TVF (table-valued function) arg count for eponymous-vtab arms —
+    e.g. pragma_table_info('t').  Drives the regArgc / argv slots
+    handed to OP_VFilter so xFilter sees the user-supplied args. }
+  nFuncArg:     i32;
+  iFA:          i32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -20718,12 +20723,27 @@ begin
           PAnsiChar(passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab))),
           P4_VTAB);
 
+        { TVF args: e.g. count(*) FROM pragma_table_info('t').  Allocate
+          a contiguous regs block: idxNum, argc, argv[0..n-1], counter. }
+        nFuncArg := 0;
+        if ((pItem^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0)
+           and (pItem^.u1.pFuncArg <> nil) then
+          nFuncArg := pItem^.u1.pFuncArg^.nExpr;
         Inc(pParse^.nMem); regAgg := pParse^.nMem;   { idxNum }
         Inc(pParse^.nMem);                            { argc   }
+        for iFA := 0 to nFuncArg - 1 do Inc(pParse^.nMem);  { argv slots }
         Inc(pParse^.nMem); regCount := pParse^.nMem; { running counter }
 
         sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg);
-        sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg + 1);
+        sqlite3VdbeAddOp2(v, OP_Integer, nFuncArg, regAgg + 1);
+        for iFA := 0 to nFuncArg - 1 do
+        begin
+          r1 := sqlite3ExprCodeTarget(pParse,
+                  ExprListItems(pItem^.u1.pFuncArg)[iFA].pExpr,
+                  regAgg + 2 + iFA);
+          if r1 <> regAgg + 2 + iFA then
+            sqlite3VdbeAddOp2(v, OP_Copy, r1, regAgg + 2 + iFA);
+        end;
         sqlite3VdbeAddOp2(v, OP_Integer, 0, regCount);
 
         addrEnd := sqlite3VdbeMakeLabel(pParse);
@@ -20871,10 +20891,25 @@ begin
           sqlite3VdbeAddOp4(v, OP_VOpen, iCsr, 0, 0,
             PAnsiChar(passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab))),
             P4_VTAB);
+          { TVF args (pragma_table_info('t') etc.) — evaluate
+            pItem^.u1.pFuncArg into argv slots so xFilter sees them. }
+          nFuncArg := 0;
+          if ((pItem^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0)
+             and (pItem^.u1.pFuncArg <> nil) then
+            nFuncArg := pItem^.u1.pFuncArg^.nExpr;
           Inc(pParse^.nMem); regAgg := pParse^.nMem;
           Inc(pParse^.nMem);
+          for iFA := 0 to nFuncArg - 1 do Inc(pParse^.nMem);
           sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg);
-          sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg + 1);
+          sqlite3VdbeAddOp2(v, OP_Integer, nFuncArg, regAgg + 1);
+          for iFA := 0 to nFuncArg - 1 do
+          begin
+            r1 := sqlite3ExprCodeTarget(pParse,
+                    ExprListItems(pItem^.u1.pFuncArg)[iFA].pExpr,
+                    regAgg + 2 + iFA);
+            if r1 <> regAgg + 2 + iFA then
+              sqlite3VdbeAddOp2(v, OP_Copy, r1, regAgg + 2 + iFA);
+          end;
           addrEnd := sqlite3VdbeMakeLabel(pParse);
           addrTopOfLoop := sqlite3VdbeAddOp3(v, OP_VFilter, iCsr,
                                               addrEnd, regAgg);
@@ -20994,11 +21029,25 @@ begin
         PAnsiChar(passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab))),
         P4_VTAB);
 
-      { Reserve two contiguous regs for VFilter: pQuery (idxNum) + pArgc. }
+      { Reserve two contiguous regs for VFilter: pQuery (idxNum) + pArgc,
+        plus one slot per TVF argument (pragma_table_info('t') etc.). }
+      nFuncArg := 0;
+      if ((pItem^.fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0)
+         and (pItem^.u1.pFuncArg <> nil) then
+        nFuncArg := pItem^.u1.pFuncArg^.nExpr;
       Inc(pParse^.nMem); regAgg := pParse^.nMem;
       Inc(pParse^.nMem);
+      for iFA := 0 to nFuncArg - 1 do Inc(pParse^.nMem);
       sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg);
-      sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg + 1);
+      sqlite3VdbeAddOp2(v, OP_Integer, nFuncArg, regAgg + 1);
+      for iFA := 0 to nFuncArg - 1 do
+      begin
+        r1 := sqlite3ExprCodeTarget(pParse,
+                ExprListItems(pItem^.u1.pFuncArg)[iFA].pExpr,
+                regAgg + 2 + iFA);
+        if r1 <> regAgg + 2 + iFA then
+          sqlite3VdbeAddOp2(v, OP_Copy, r1, regAgg + 2 + iFA);
+      end;
 
       { OP_VFilter iCsr, addrEof, regQuery — p4=NULL idxStr.  On EOF
         jumps to addrEof; on first row falls through into the body. }
@@ -33429,6 +33478,20 @@ begin
 
   SetString(zName, pId1^.z, pId1^.n);
   if pValue <> nil then SetString(zRight, pValue^.z, pValue^.n) else zRight := '';
+  { Dequote pValue text — mirror C's sqlite3NameFromToken (pragma.c:466).
+    `PRAGMA table_info("t")` and `PRAGMA table_info='t'` both arrive with
+    the surrounding quote chars still attached; strip a single matched
+    pair (per sqlite3Isquote: ", ', `, [) so downstream LocateTable /
+    FindIndex see the bare identifier. }
+  if (Length(zRight) >= 2)
+     and ((zRight[1] = '"') or (zRight[1] = '''')
+          or (zRight[1] = '`') or (zRight[1] = '[')) then
+  begin
+    if (zRight[1] = '[') and (zRight[Length(zRight)] = ']') then
+      zRight := Copy(zRight, 2, Length(zRight) - 2)
+    else if zRight[Length(zRight)] = zRight[1] then
+      zRight := Copy(zRight, 2, Length(zRight) - 2);
+  end;
 
   { Phase 6.12 — table-valued / introspection pragma dispatcher.  Looks the
     pragma up in aPragmaName (Phase 6.8.0) and emits the C body verbatim

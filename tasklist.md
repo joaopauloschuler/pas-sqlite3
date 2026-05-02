@@ -262,9 +262,12 @@ skeleton.
         do not modify the schema.  Tracked under 7.1.9.
       [X] **h) CHECK constraint not enforced** — DONE 2026-05-01.
       [X] **j) AFTER INSERT trigger does not fire** — DONE 2026-05-01.
-      [ ] **k) `pragma_table_info(...)` table-valued function.**
-        `SELECT count(*) FROM pragma_table_info('t')` returns no row.
-        Tracked under 6.12 (sqlite3Pragma).
+      [X] **k) `pragma_table_info(...)` table-valued function** —
+        DONE 2026-05-02.  Eponymous-vtab arms now evaluate
+        pItem^.u1.pFuncArg into the OP_VFilter argv slots; PRAGMA
+        value tokens dequoted (sqlite3NameFromToken-equivalent) so the
+        inner `PRAGMA table_info='t'` from pragmaVtabFilter sees the
+        bare identifier.
 
   [ ] **6.10 step 15** Runtime divergences surfaced by `DiagTxn`
       (transactions, savepoints, conflict resolution).  7 remain;
@@ -304,20 +307,14 @@ skeleton.
         sqlite_schema ...)` and productive `sqlite3Update` is still
         skeleton-only.  This is the only remaining contributor.
   [~] **6.12** port sqlite3Pragma in full.  Gate `DiagPragma`.
-       Direct PragTyp dispatch landed (TABLE_INFO / INDEX_INFO /
-       INDEX_LIST / DATABASE_LIST / COLLATION_LIST / FUNCTION_LIST /
-       MODULE_LIST / PRAGMA_LIST / COMPILE_OPTIONS).  5 DiagPragma
-       divergences remain (was 9): the agg-no-GROUP-BY arm now branches
-       to a VOpen/VFilter/VNext loop for single-source eponymous-vtabs
-       so `count(*) >= N FROM pragma_*` shapes work (closed
-       function_list / module_list / pragma_list).  Remaining gaps:
-       (a) arg-bound vtabs (`pragma_table_info('t')`,
-       `pragma_table_xinfo('t')`, `pragma_index_list('t')`,
-       `pragma_foreign_key_list('c')`) need hidden-column WHERE binding
-       — TVF args populate `pItem^.u1.pFuncArg` but the vtab agg arm
-       doesn't yet pass them through to xFilter; FOREIGN_KEY_LIST also
-       blocked on TFKey opaque.  (b) COMPILE_OPTIONS needs
-       `sqlite3azCompileOpt` populated.
+       2 DiagPragma divergences remain (was 5): TVF args now reach
+       xFilter (table_info / table_xinfo / index_list closed
+       2026-05-02 — eponymous-vtab arms evaluate pItem^.u1.pFuncArg
+       into OP_VFilter argv slots, and the Pragma codegen dequotes
+       pValue so the inner PRAGMA prepare sees bare identifiers).
+       Remaining gaps:
+       (a) FOREIGN_KEY_LIST blocked on TFKey opaque.
+       (b) COMPILE_OPTIONS needs `sqlite3azCompileOpt` populated.
 
   [ ] **6.13** Non-regular FROM-item codegen in `sqlite3Select`
        (select.c).  Pas's SELECT codegen currently traverses regular

@@ -164,6 +164,7 @@ compile_test TestRowidIn
 compile_test TestExplainParity
 compile_test TestWhereCorpus
 compile_test DiagPragma
+compile_test DiagFeatureProbe
 compile_test DiagPrintfFmt
 compile_test DiagExplainList
 compile_test DiagDbFileObject
