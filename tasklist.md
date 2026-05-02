@@ -191,15 +191,6 @@ skeleton.
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
        marked as "stub" that was missed (catch-all).
-       [X] Wire `sqlite3ResetOneSchema` retry into `sqlite3LockAndPrepare`
-            (prepare.c:865-866) — DONE.
-       [X] Port OP_Offset body (vdbe.c:2931) — was a Phase-2 stub that
-            always wrote 0; now drives sqlite3VdbeFinishMoveto +
-            sqlite3BtreeEof + sqlite3BtreeOffset, matching the C reference.
-       [X] Port OP_Checkpoint body (vdbe.c:8015) — was sharing a no-op stub
-            with OP_Vacuum / OP_JournalMode; now inlines sqlite3Checkpoint
-            (per-aDb sqlite3BtreeCheckpoint loop) and writes the busy /
-            nLog / nCkpt triple into mem[p3..p3+2] per the C reference.
        [X] Port OP_JournalMode body (vdbe.c:8054) — full 1:1 port,
             including the WAL→rollback / rollback→WAL transition arms.
             sqlite3PagerCloseWal (pager.c:7670) ported alongside in
@@ -275,10 +266,6 @@ skeleton.
       [ ] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
         prepare cleanly but emit no rows** — `row_number() OVER (...)`
         same.  Window-codegen sub-issue under 6.26.
-
-  [X] **6.10 step 19** DiagDml runtime probe — all 14 PASS.
-
-  [X] **6.10 step 26** DiagIndexing + DiagOrderLimitTopN — DONE.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26):
     (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
