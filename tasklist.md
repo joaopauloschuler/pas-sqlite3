@@ -267,10 +267,10 @@ skeleton.
           (B-tree backed) and inner loop emits IfNotZero/Last/IdxLE/
           Delete + IdxInsert with bSeq=1; tail uses OP_Sort/OP_Next.
           Sorter mode unchanged when no LIMIT.  Gated by
-          DiagOrderLimitTopN (9/9 PASS).
-          Open follow-up: ORDER BY + LIMIT 0 still crashes (the early-
-          exit Goto interacts with the new B-tree open path); LIMIT 0
-          short-circuit is a separate bug from Top-N correctness.
+          DiagOrderLimitTopN (11/11 PASS, incl. LIMIT 0 / DESC LIMIT 0).
+          ORDER BY + LIMIT 0 short-circuit Goto now retargeted to
+          addrSortBrk so it skips past the sort tail (was landing on
+          OP_Sort against a sorter cursor the Goto itself had skipped).
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)

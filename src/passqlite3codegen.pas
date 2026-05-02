@@ -21584,10 +21584,16 @@ begin
   bSort := 0; iSorterCsr := -1; sortNKey := 0; addrSorter := -1;
   nPrefixReg := 0; bSortOmitRef := 0;
   bUseSorter := 1; bSeqExtra := 0;
+  addrSortBrk := 0;  { 0 = unallocated; valid labels are < 0 }
   if (p^.pOrderBy <> nil) and (pDest^.eDest = SRT_Output)
      and (not isExists) then
   begin
     bSort := 1;
+    { Pre-allocate the post-sort break label so the LIMIT-0 short-circuit
+      Goto can target it (the Goto must skip over the sort-tail body, not
+      land on the WHERE-loop's iBreak which would dispatch into OP_Sort
+      against a sorter cursor that the Goto itself just skipped). }
+    addrSortBrk := sqlite3VdbeMakeLabel(pParse);
     { Top-N path: when LIMIT is in effect we keep the cursor as a real
       ephemeral B-tree (CURTYPE_BTREE) so OP_Last/OP_IdxLE/OP_Delete are
       supported.  Mirrors C select.c:8246..8249 where SorterOpen is only
@@ -21682,10 +21688,17 @@ begin
   end;
 
 
-  { Patch the LIMIT-0 short-circuit Goto's target now that
-    pWInfo^.iBreak is allocated. }
+  { Patch the LIMIT-0 short-circuit Goto's target.  When a sort tail
+    will run, jump past it (addrSortBrk); otherwise land on the
+    WHERE-loop's break.  Mirrors C select.c:2533 which passes the
+    enclosing iBreak — the analogue here is "after every emit phase". }
   if iLimit0Goto >= 0 then
-    sqlite3VdbeChangeP2(v, iLimit0Goto, pWInfo^.iBreak);
+  begin
+    if bSort <> 0 then
+      sqlite3VdbeChangeP2(v, iLimit0Goto, addrSortBrk)
+    else
+      sqlite3VdbeChangeP2(v, iLimit0Goto, pWInfo^.iBreak);
+  end;
 
   { Allocate the iSdst result-register block unconditionally — mirrors
     selectInnerLoop:1179-1194 which bumps pDest->iSdst/pParse->nMem even
@@ -21934,7 +21947,8 @@ begin
                                      'USE TEMP B-TREE FOR %s',
                                      ['ORDER BY']),
                       P4_DYNAMIC);
-    addrSortBrk := sqlite3VdbeMakeLabel(pParse);
+    if addrSortBrk = 0 then
+      addrSortBrk := sqlite3VdbeMakeLabel(pParse);
     if bUseSorter <> 0 then
     begin
       Inc(pParse^.nMem); regSortOut := pParse^.nMem;

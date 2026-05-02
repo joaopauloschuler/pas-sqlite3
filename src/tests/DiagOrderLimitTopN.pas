@@ -69,8 +69,8 @@ begin
   RunOne('ORDER BY a LIMIT 100',   Setup, 'SELECT a FROM t ORDER BY a LIMIT 100');
   RunOne('ORDER BY a LIMIT 1',     Setup, 'SELECT a FROM t ORDER BY a LIMIT 1');
   RunOne('ORDER BY a (no LIMIT)',  Setup, 'SELECT a FROM t ORDER BY a');
-  { LIMIT 0 not yet exercised — skipped pending separate debug }
-  // RunOne('ORDER BY a LIMIT 0',     Setup, 'SELECT a FROM t ORDER BY a LIMIT 0');
+  RunOne('ORDER BY a LIMIT 0',     Setup, 'SELECT a FROM t ORDER BY a LIMIT 0');
+  RunOne('ORDER BY a DESC LIMIT 0',Setup, 'SELECT a FROM t ORDER BY a DESC LIMIT 0');
   RunOne('ORDER BY a LIMIT 2 (small)', Setup, 'SELECT a FROM t ORDER BY a LIMIT 2');
   RunOne('ORDER BY a LIMIT 8 (large)', Setup, 'SELECT a FROM t ORDER BY a LIMIT 8');
   RunOne('ORDER BY a LIMIT 11 (over)', Setup, 'SELECT a FROM t ORDER BY a LIMIT 11');
