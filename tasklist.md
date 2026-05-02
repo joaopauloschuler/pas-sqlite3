@@ -334,22 +334,19 @@ skeleton.
     - [ ] **6.10 step 6** Remaining TestExplainParity bytecode-Δ rows
        (7 diverges in 1019/1026 corpus):
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
-          asc/desc: C=19 Pas=21 (Δ=2); 2col: C=20 Pas=22 (Δ=2).
-          Sorter is now emitted (6.10 step 26) but pushOntoSorter
-          stores the ORDER BY key AND the result column separately
-          (extra `Column` + `SCopy` + `ReleaseReg` ops) and misses
-          the second `Explain "USE TEMP B-TREE FOR ORDER BY"`.  C
-          uses `sqlite3ExprCodeExprList(... SQLITE_ECEL_REF ...)`
-          to share registers when the ORDER BY expr matches a
-          result column, plus emits a per-sort Explain comment.
-          Naive register sharing with `nField=nResultCol` does NOT
-          match C bytecode shape: C uses `nField = nKey + bSeq +
-          nData = 3` (with stable-sort sequence number) while
-          packing only `nResultCol` regs into MakeRecord; the
-          KeyInfo carries `nKeyField=2 / nAllField=3` to extend the
-          comparator past the data section.  Closing this row
-          requires porting the `bSeq` / KeyInfo nExtra arms of
-          pushOntoSorter, not just register sharing.
+          asc/desc: C=19 Pas=20 (Δ=1); 2col: C=20 Pas=21 (Δ=1).
+          ReleaseReg removed 2026-05-02 by switching makeSorterRecord
+          allocation from sqlite3GetTempReg/Release to ++pParse^.nMem
+          (matches select.c:709 makeSorterRecord exactly).  Remaining
+          Δ=1: Pas reads the result column twice (once for ORDER BY,
+          once for the result register block) plus an SCopy; C uses
+          `SQLITE_ECEL_OMITREF | SQLITE_ECEL_REF` (select.c:1216) to
+          tag matching result columns with iOrderByCol so the inner
+          loop omits their Column read entirely, then pushOntoSorter
+          emits one combined SCopy/Column at regBase = regData -
+          nPrefixReg (select.c:771..782).  Closing requires porting
+          the OMITREF arm of sqlite3ExprCodeExprList plus the
+          nPrefixReg layout in selectInnerLoop.
         [ ] `SELECT a FROM t GROUP BY a` — C=45 vs Pas=3
           (aggregate-group path not yet ported).
         [ ] `SELECT a FROM (SELECT a FROM t)` — C=10 vs Pas=16.

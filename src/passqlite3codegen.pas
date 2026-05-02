@@ -21226,12 +21226,16 @@ begin
         for jj := 0 to nResultCol - 1 do
           sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
                             regSortBase + sortNKey + jj);
-        regSortRec := sqlite3GetTempReg(pParse);
+        { Match C's makeSorterRecord (select.c:709..724): allocate the
+          record register from pParse^.nMem rather than the temp pool, so
+          no OP_ReleaseReg is emitted on the inner-loop hot path.  The
+          register is naturally reclaimed at end-of-statement. }
+        Inc(pParse^.nMem);
+        regSortRec := pParse^.nMem;
         sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
                           sortNKey + nResultCol, regSortRec);
         sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
                              regSortBase, nResultCol);
-        sqlite3ReleaseTempReg(pParse, regSortRec);
       end
       else
       begin
