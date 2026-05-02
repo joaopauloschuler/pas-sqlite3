@@ -207,11 +207,15 @@ skeleton.
        (7 diverges in 1019/1026 corpus):
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
           asc/desc: C=19 Pas=20 (Δ=1); 2col: C=20 Pas=21 (Δ=1).
-          sqlite3ExprCodeExprList has all four ECEL arms; closing Δ=1
-          still requires the nPrefixReg layout in selectInnerLoop /
-          pushOntoSorter so ORDER BY result columns get tagged with
-          iOrderByCol and OMITREF drops the duplicate Column read
-          (select.c:1216 + select.c:771..782).
+          sqlite3ExprCodeExprList has all four ECEL arms;
+          structural-compare arm of resolveOrderGroupBy ported
+          2026-05-02 (resolve.c:1820..1833) — ORDER BY/GROUP BY terms
+          now get iOrderByCol set when their expr matches a result
+          column.  Closing Δ=1 still requires the nPrefixReg layout in
+          selectInnerLoop / pushOntoSorter so OMITREF drops the
+          duplicate Column read (select.c:1216 + select.c:771..782),
+          plus matching SorterOpen p2 (= nKey + nData + 1 for the
+          rowid/sequence slot).
         [ ] `SELECT a FROM t GROUP BY a` — C=45 vs Pas=3
           (aggregate-group path not yet ported).
         [ ] `SELECT a FROM (SELECT a FROM t)` — C=10 vs Pas=16.

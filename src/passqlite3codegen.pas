@@ -8193,6 +8193,36 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       ResolveExpr(items[i].pExpr);
   end;
 
+  { resolve.c:1820..1833 structural-compare arm — for any ORDER BY /
+    GROUP BY term still without an iOrderByCol tag, walk pEList looking
+    for a result-set expression that compares structurally equal.  When
+    found, set iOrderByCol = j+1 so sqlite3ResolveOrderGroupBy rewrites
+    the term into a copy of the matching result-set expression.  This
+    lets later codegen (selectInnerLoop's nPrefixReg / OMITREF arm)
+    avoid duplicate column reads on the inner-loop hot path. }
+  procedure ResolveStructuralOrderByCol(pList: PExprList);
+  var
+    i, j: i32;
+    pItems: PExprListItem;
+    pEItems: PExprListItem;
+    pE: PExpr;
+  begin
+    if (pList = nil) or (p^.pEList = nil) then Exit;
+    pItems  := ExprListItems(pList);
+    pEItems := ExprListItems(p^.pEList);
+    for i := 0 to pList^.nExpr - 1 do
+    begin
+      if pItems[i].u.x.iOrderByCol <> 0 then Continue;
+      pE := pItems[i].pExpr;
+      if pE = nil then Continue;
+      for j := 0 to p^.pEList^.nExpr - 1 do
+      begin
+        if sqlite3ExprCompare(nil, pE, pEItems[j].pExpr, -1) = 0 then
+          pItems[i].u.x.iOrderByCol := u16(j + 1);
+      end;
+    end;
+  end;
+
   { resolve.c:1778 integer-arm — for any ORDER BY / GROUP BY term that is
     an integer literal in [1, 0xffff], mark iOrderByCol so the subsequent
     sqlite3ResolveOrderGroupBy call rewrites it into a copy of the iCol-th
@@ -8231,15 +8261,20 @@ begin
   ResolveExpr    (p^.pHaving);
   ResolveExprList(p^.pOrderBy);
 
-  { Integer-arm tagging + alias rewrite for ORDER BY / GROUP BY (resolve.c:2042). }
+  { Integer-arm tagging + structural-compare match + alias rewrite for
+    ORDER BY / GROUP BY (resolve.c:1793..1834).  The structural-compare
+    pass runs after the integer arm so an explicit positional reference
+    is not overridden by a coincidental structural match. }
   if p^.pOrderBy <> nil then
   begin
     ResolveIntegerOrderByCol(p^.pOrderBy);
+    ResolveStructuralOrderByCol(p^.pOrderBy);
     sqlite3ResolveOrderGroupBy(pParse, p, p^.pOrderBy, 'ORDER');
   end;
   if p^.pGroupBy <> nil then
   begin
     ResolveIntegerOrderByCol(p^.pGroupBy);
+    ResolveStructuralOrderByCol(p^.pGroupBy);
     sqlite3ResolveOrderGroupBy(pParse, p, p^.pGroupBy, 'GROUP');
   end;
 
