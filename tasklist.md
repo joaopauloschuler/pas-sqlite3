@@ -193,15 +193,11 @@ skeleton.
 
 ### Open Bugs
 
-- [ ] **6.10** `TestExplainParity.pas` — 1022/1026 PASS as currently
-    measured (2026-05-02), after reverting the OP_Explain /
-    OP_ReleaseReg gating from commit 6c4d5dd.  That commit's premise
-    ("oracle is non-DEBUG") was wrong: `src/tests/build.sh` has built
-    the oracle with `-DSQLITE_DEBUG -DSQLITE_ENABLE_EXPLAIN_COMMENTS`
-    since Phase 0, so the oracle DOES emit OP_Explain / OP_ReleaseReg
-    (vdbeaux.c gates them under `#if !defined(SQLITE_DEBUG)`).  Pas now
-    emits them unconditionally again to match.  Only 4 corpus rows
-    still diverge (down from 762).
+- [ ] **6.10** `TestExplainParity.pas` — 1023/1026 PASS as currently
+    measured (2026-05-02).  Oracle is built with `-DSQLITE_DEBUG
+    -DSQLITE_ENABLE_EXPLAIN_COMMENTS`, so emits OP_Explain /
+    OP_ReleaseReg (vdbeaux.c gates them under `#if !defined(SQLITE_DEBUG)`);
+    Pas matches.  Only 3 corpus rows still diverge.
     - [ ] **6.10 step 6** Remaining TestExplainParity bytecode-Δ rows:
         [ ] `SELECT a FROM (SELECT a FROM t)` — Pas emits the co-routine
           path; C flattens via `flattenSubquery`.  Closes once

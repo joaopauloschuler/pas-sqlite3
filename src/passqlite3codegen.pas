@@ -20707,6 +20707,7 @@ begin
 
       sqlite3VdbeAddOp2(v, OP_Integer, 0, iAbortFlag);
       sqlite3VdbeAddOp3(v, OP_Null, 0, iAMem, iAMem + nGroupBy - 1);
+      sqlite3ExprNullRegisterRange(pParse, iAMem, nGroupBy);
 
       { Begin scan in GROUP BY order. }
       sqlite3VdbeAddOp2(v, OP_Gosub, regReset, addrReset);
@@ -20714,6 +20715,16 @@ begin
                                   nil, p, WHERE_GROUPBY, 0);
       if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
       assignAggregateRegisters(pParse, pAggI2);
+
+      { ExplainQueryPlan2(addrExp, "USE TEMP B-TREE FOR GROUP BY") —
+        select.c:8553..8556.  Emitted on the groupBySort=1 branch (always
+        taken in this port until WhereIsOrdered routing lands). }
+      i := sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+                        sqlite3MPrintf(pParse^.db,
+                                       'USE TEMP B-TREE FOR %s',
+                                       ['GROUP BY']),
+                        P4_DYNAMIC);
 
       { Push rows into sorter (always groupBySort=1).  Encode pGroupBy
         terms first, then any accumulator columns whose iSorterColumn
