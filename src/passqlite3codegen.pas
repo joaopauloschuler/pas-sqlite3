@@ -37940,13 +37940,151 @@ begin
 end;
 
 // ===========================================================================
-// Phase 6.6 — fkey.c stubs
+// Phase 6.6 — fkey.c (productive ports + remaining stubs)
 // ===========================================================================
+
+{ fkey.c:320..460 — fkLookupParent.  Generate VDBE code executed for an
+  INSERT or DELETE on the child table of FK pFKey to look up the matching
+  row in the parent table.  If the parent row is missing, INSERT increments
+  (nIncr=+1) / DELETE decrements (nIncr=-1) either the immediate or the
+  deferred FK constraint counter — or aborts immediately when the operation
+  is a single-row insert with no statement transaction.  Faithful 1:1.
+  pFKey is opaque (Pointer); fields read via the documented byte offsets
+  shared with sqlite3CreateForeignKey (codegen.pas:30412..). }
+procedure fkLookupParent(pParse: PParse; iDb: i32; pTab: PTable2; pIdx: PIndex2;
+  pFKey: Pointer; aiCol: Pi32; regData: i32; nIncr: i32; isIgnore: i32);
+const
+  FKEY_PFROM_OFFSET      = 0;
+  FKEY_NCOL_OFFSET       = 40;
+  FKEY_ISDEFERRED_OFFSET = 44;
+var
+  i, iCur, iOk, iMustBeInt: i32;
+  v: PVdbe;
+  pFKb: Pu8;
+  isDeferred: u8;
+  nCol, regTemp, iJump, iChild, iParent: i32;
+  pFrom: PTable2;
+  iReg: i32;
+  abort_or_ignore: i32;
+begin
+  v := sqlite3GetVdbe(pParse);
+  iCur := pParse^.nTab - 1;
+  iOk := sqlite3VdbeMakeLabel(pParse);
+
+  pFKb := Pu8(pFKey);
+  isDeferred := (pFKb + FKEY_ISDEFERRED_OFFSET)^;
+  pFrom := PTable2(PPointer(pFKb + FKEY_PFROM_OFFSET)^);
+  nCol := PInt32(pFKb + FKEY_NCOL_OFFSET)^;
+
+  if (isDeferred = 0)
+     and ((pParse^.db^.flags and SQLITE_DeferFKs) = 0)
+     and (pParse^.pToplevel = nil)
+     and (pParse^.isMultiWrite = 0) then
+    abort_or_ignore := OE_Abort
+  else
+    abort_or_ignore := OE_Ignore;
+  sqlite3VdbeVerifyAbortable(v, abort_or_ignore);
+
+  if nIncr < 0 then
+    sqlite3VdbeAddOp2(v, OP_FkIfZero, isDeferred, iOk);
+
+  for i := 0 to nCol - 1 do
+  begin
+    iReg := sqlite3TableColumnToStorage(pFrom, i16((aiCol + i)^))
+            + regData + 1;
+    sqlite3VdbeAddOp2(v, OP_IsNull, iReg, iOk);
+  end;
+
+  if isIgnore = 0 then
+  begin
+    if pIdx = nil then
+    begin
+      { Parent key is the INTEGER PRIMARY KEY of the parent table. }
+      regTemp := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp2(v, OP_SCopy,
+        sqlite3TableColumnToStorage(pFrom, i16(aiCol^)) + 1 + regData,
+        regTemp);
+      iMustBeInt := sqlite3VdbeAddOp2(v, OP_MustBeInt, regTemp, 0);
+
+      if (pTab = pFrom) and (nIncr = 1) then
+      begin
+        sqlite3VdbeAddOp3(v, OP_Eq, regData, iOk, regTemp);
+        sqlite3VdbeChangeP5(v, SQLITE_NOTNULL);
+      end;
+
+      sqlite3OpenTable(pParse, iCur, iDb, pTab, OP_OpenRead);
+      sqlite3VdbeAddOp3(v, OP_NotExists, iCur, 0, regTemp);
+      sqlite3VdbeGoto(v, iOk);
+      sqlite3VdbeJumpHere(v, sqlite3VdbeCurrentAddr(v) - 2);
+      sqlite3VdbeJumpHere(v, iMustBeInt);
+      sqlite3ReleaseTempReg(pParse, regTemp);
+    end
+    else
+    begin
+      regTemp := sqlite3GetTempRange(pParse, nCol);
+
+      sqlite3VdbeAddOp3(v, OP_OpenRead, iCur, i32(pIdx^.tnum), iDb);
+      sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pIdx));
+      for i := 0 to nCol - 1 do
+        sqlite3VdbeAddOp2(v, OP_Copy,
+          sqlite3TableColumnToStorage(pFrom, i16((aiCol + i)^)) + 1 + regData,
+          regTemp + i);
+
+      if (pTab = pFrom) and (nIncr = 1) then
+      begin
+        iJump := sqlite3VdbeCurrentAddr(v) + nCol + 1;
+        for i := 0 to nCol - 1 do
+        begin
+          iChild := sqlite3TableColumnToStorage(pFrom,
+                       i16((aiCol + i)^)) + 1 + regData;
+          iParent := 1 + regData
+                     + sqlite3TableColumnToStorage(pIdx^.pTable,
+                                                   pIdx^.aiColumn[i]);
+          Assert(pIdx^.aiColumn[i] >= 0,
+                 'fkLookupParent: aiColumn[i] < 0 (expression idx)');
+          Assert((aiCol + i)^ <> pTab^.iPKey,
+                 'fkLookupParent: child aiCol[i] = pTab->iPKey');
+          if pIdx^.aiColumn[i] = pTab^.iPKey then
+            iParent := regData;
+          sqlite3VdbeAddOp3(v, OP_Ne, iChild, iJump, iParent);
+          sqlite3VdbeChangeP5(v, SQLITE_JUMPIFNULL);
+        end;
+        sqlite3VdbeGoto(v, iOk);
+      end;
+
+      sqlite3VdbeAddOp4(v, OP_Affinity, regTemp, nCol, 0,
+                        sqlite3IndexAffinityStr(pParse^.db, pIdx), nCol);
+      sqlite3VdbeAddOp4Int(v, OP_Found, iCur, iOk, regTemp, nCol);
+      sqlite3ReleaseTempRange(pParse, regTemp, nCol);
+    end;
+  end;
+
+  if (isDeferred = 0)
+     and ((pParse^.db^.flags and SQLITE_DeferFKs) = 0)
+     and (pParse^.pToplevel = nil)
+     and (pParse^.isMultiWrite = 0) then
+  begin
+    Assert(nIncr = 1, 'fkLookupParent: single-row INSERT must have nIncr=1');
+    sqlite3HaltConstraint(pParse, SQLITE_CONSTRAINT_FOREIGNKEY,
+      OE_Abort, nil, P4_STATIC, P5_ConstraintFK);
+  end
+  else
+  begin
+    if (nIncr > 0) and (isDeferred = 0) then
+      sqlite3MayAbort(pParse);
+    sqlite3VdbeAddOp2(v, OP_FkCounter, isDeferred, nIncr);
+  end;
+
+  sqlite3VdbeResolveLabel(v, iOk);
+  sqlite3VdbeAddOp1(v, OP_Close, iCur);
+end;
 
 procedure sqlite3FkCheck(pParse: PParse; pTab: PTable2; regOld: i32;
   regNew: i32; aChange: Pi32; bChng: i32);
 begin
-  { Phase 7: foreign-key constraint checking deferred until parser is available }
+  { Phase 7: full FK constraint codegen still pending — fkLookupParent
+    helper above is the first piece in.  Body lands once fkScanChildren
+    is ported and the C dispatcher (fkey.c:889..1064) is wired up. }
 end;
 
 procedure sqlite3FkActions(pParse: PParse; pTab: PTable2; pChanges: PExprList;
