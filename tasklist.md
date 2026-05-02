@@ -621,20 +621,42 @@ skeleton.
         the consumer side in sqlite3Insert, which now walks the
         SF_Values pPrior chain and emits per-row inserts inline.
 
-  [ ] **6.10 step 26** DiagIndexing probe (4 diverges remain, verified
-      2026-05-01 — was 5; `unique violation` now PASSes via the
-      extended→primary errCode fold and OP_Halt P5 wiring landed with
-      the CHECK fix).
-      [X] **e) `INDEXED BY` / `NOT INDEXED`** — closed under 6.8.4
-        (`indexed by ok` / `not indexed` PASS).
-      [X] `unique violation`
-      [ ] `schema after create idx` — empty rowset; ORDER BY rowid path.
-      [ ] `select range via idx` — empty rowset; range scan + ORDER BY.
-      [ ] `rowid select` — empty rowset; ORDER BY rowid path.
-      [ ] `rowid alias custom` — empty rowset; ORDER BY rowid alias.
-      All four remaining fold into the same blocker: ORDER BY codegen
-      (sorter / ephemeral-key path) is not yet ported — same root cause
-      as 6.10 step 6 `SELECT a FROM t ORDER BY a` (C=19 vs Pas=3).
+  [X] **6.10 step 26** DiagIndexing probe — DONE 2026-05-02.  All
+      probes PASS (Total divergences: 0).  The four remaining empty-
+      rowset cases (`schema after create idx`, `select range via idx`,
+      `rowid select`, `rowid alias custom`) closed via a minimal
+      ORDER BY sorter port at sqlite3Select (codegen.pas:21066..21228).
+      Slice scope: SRT_Output destination only, no DISTINCT, no LIMIT,
+      no nOBSat shortcut, no SORTFLAG_UseSorter optimisation.  Emits
+      OP_SorterOpen pre-WhereBegin, pushOntoSorter inside the inner
+      loop (regBase = ORDER-BY exprs + SCopy of result columns +
+      OP_MakeRecord + OP_SorterInsert), and a generateSortTail body
+      after WhereEnd (OP_OpenPseudo + OP_SorterSort + OP_SorterData
+      loop + per-result OP_Column + OP_ResultRow + OP_SorterNext).
+      Bytecode for `SELECT a FROM t ORDER BY a` lifts from 3 ops to 19
+      and produces correct row order.  C reference: select.c:730
+      (pushOntoSorter) and select.c:1673 (generateSortTail).
+      Regressions green: TestDMLBasic 54/0, TestSchemaBasic 44/0,
+      TestSelectBasic 60/0, TestWhereBasic 52/0, TestExplainParity
+      1019/7, DiagFeatureProbe 6 div (was 6), DiagDml 13/1 unchanged,
+      DiagWindow 13 div unchanged.
+      Deferred sorter sub-arms (none in current corpus):
+      [ ] `ORDER BY <integer>` resolution — `resolveOrderGroupBy`
+          (resolve.c:1778) is defined but not wired into resolution
+          path; the integer arm sets pItem.u.x.iOrderByCol so
+          `sqlite3ResolveOrderGroupBy` (codegen.pas:8214) can rewrite
+          to a copy of the result-set expression.  Without it,
+          `ORDER BY 1` codes a literal Integer 1 and the sort becomes
+          a no-op.  Add to 6.10 step 9 silent-bug list when a corpus
+          row exercises it.
+      [ ] DISTINCT + ORDER BY — current slice bails when iTabTnct>=0.
+      [ ] LIMIT + ORDER BY pushdown (top-N sorter) — current slice
+          bails when pLimit<>nil.
+      [ ] nOBSat shortcut — when the planner reports the loop already
+          delivers rows in ORDER BY order (nOBSat=nExpr), skip the
+          sorter and route directly to OP_ResultRow.  Bytecode parity
+          gap with the C oracle on tests like
+          `SELECT a FROM t INDEXED BY ... ORDER BY a`.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)

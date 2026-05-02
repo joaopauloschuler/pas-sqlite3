@@ -19967,6 +19967,21 @@ var
   iiGB:        i32;
   sfA, sfB:    u8;
   innerDest:   TSelectDest;
+  { ORDER BY sorter locals (select.c pushOntoSorter / generateSortTail —
+    minimal slice: SRT_Output only, no nOBSat optimisation, no LIMIT
+    pushdown, no SORTFLAG_UseSorter shortcut).  bSort=1 means the inner
+    loop pushes rows into the sorter and a sort-tail is emitted after
+    sqlite3WhereEnd. }
+  bSort:        i32;
+  iSorterCsr:   i32;
+  sortKeyInfo:  PKeyInfo2;
+  sortNKey:     i32;
+  regSortBase:  i32;
+  regSortRec:   i32;
+  regSortOut:   i32;
+  iSortTab:     i32;
+  addrSortLoop: i32;
+  addrSortBrk:  i32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -20406,7 +20421,14 @@ begin
     emission, so any single-table WHERE shape produces a stepable body. }
   if p^.pGroupBy   <> nil then begin Result := SQLITE_OK; Exit; end;
   if p^.pHaving    <> nil then begin Result := SQLITE_OK; Exit; end;
-  if p^.pOrderBy   <> nil then begin Result := SQLITE_OK; Exit; end;
+  { ORDER BY gate lifted 2026-05-02 — when WhereBegin can satisfy the
+    ORDER BY through an index or rowid scan (pWInfo^.nOBSat == nExpr),
+    no sorter is needed and the existing inner-loop path produces
+    rows in the requested order.  When nOBSat < nExpr we still bail;
+    the sorter / generateSortTail port lands separately.  Closes the
+    four DiagIndexing rows that ride a natural rowid / index ordering
+    (`schema after create idx`, `select range via idx`, `rowid select`,
+    `rowid alias custom`). }
   { SRT_Exists: pLimit is set to LIMIT 1 by sqlite3CodeSubselect — allow it.
     Non-Exists: accept the constant-integer LIMIT shape, optionally with
     an OFFSET expression (any expr; coded via sqlite3ExprCode + MustBeInt).
@@ -21021,6 +21043,27 @@ begin
     end;
   end;
 
+  { ORDER BY sorter open — minimal slice: SRT_Output only, no DISTINCT,
+    no Exists, no LIMIT.  Open the sorter cursor BEFORE sqlite3WhereBegin
+    so the open executes once at the top of the program, not inside the
+    per-row loop body.  Mirrors C select.c:7470 (allocSortIndex /
+    OP_OpenEphemeral with KeyInfo, later promoted to OP_SorterOpen).
+    Always sorts even when WhereBegin could satisfy ORDER BY through an
+    index — the nOBSat shortcut is deferred. }
+  bSort := 0; iSorterCsr := -1; sortNKey := 0;
+  if (p^.pOrderBy <> nil) and (pDest^.eDest = SRT_Output)
+     and (not isExists) and (iTabTnct < 0) and (p^.pLimit = nil) then
+  begin
+    bSort := 1;
+    iSorterCsr := pParse^.nTab; Inc(pParse^.nTab);
+    sortNKey := p^.pOrderBy^.nExpr;
+    sortKeyInfo := sqlite3KeyInfoFromExprList(pParse, p^.pOrderBy, 0,
+                                              nResultCol);
+    sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorterCsr,
+                      sortNKey + nResultCol, 0,
+                      PAnsiChar(sortKeyInfo), P4_KEYINFO);
+  end;
+
   { Drive the WHERE machinery for the (single, no-WHERE) loop body.
     sqlite3WhereBegin emits OpenRead + Rewind for the only level. The
     WHERE codegen allocates whatever scratch registers the IPK / index
@@ -21033,6 +21076,18 @@ begin
   begin
     Result := SQLITE_ERROR; Exit;
   end;
+
+  { ORDER BY bail — destinations / shapes the sorter slice does not
+    handle yet (DISTINCT+ORDER BY, SRT_Set/EphemTab/Coroutine/Mem with
+    sorting, LIMIT-with-sort).  Bail cleanly via WhereEnd to avoid
+    emitting a body that returns rows in the wrong order. }
+  if (p^.pOrderBy <> nil) and (bSort = 0)
+     and (pWInfo^.nOBSat < p^.pOrderBy^.nExpr) then
+  begin
+    sqlite3WhereEnd(pWInfo);
+    Result := SQLITE_OK; Exit;
+  end;
+
 
   { Patch the LIMIT-0 short-circuit Goto's target now that
     pWInfo^.iBreak is allocated. }
@@ -21109,12 +21164,41 @@ begin
       affinity string in P4. }
     if pDest^.eDest = SRT_Output then
     begin
-      sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
-      { LIMIT decrement — selectInnerLoop:1522..1525.  Constant-integer
-        LIMIT case only (matched at the gate above); see computeLimitRegisters
-        block earlier in this function. }
-      if (p^.iLimit <> 0) and (not isExists) then
-        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, pWInfo^.iBreak);
+      if bSort <> 0 then
+      begin
+        { pushOntoSorter (select.c:730) — minimal slice.  Build a record
+          containing [orderByExprs ; resultColumns] and push it into the
+          sorter cursor.  No bSeq / nOBSat / nPrefixReg / LIMIT pushdown.
+          regBase is allocated fresh each iteration; pParse^.nMem grows. }
+        regSortBase := pParse^.nMem + 1;
+        Inc(pParse^.nMem, sortNKey + nResultCol);
+        for jj := 0 to sortNKey - 1 do
+        begin
+          r1 := sqlite3ExprCodeTarget(pParse,
+                  ExprListItems(p^.pOrderBy)[jj].pExpr,
+                  regSortBase + jj);
+          if r1 <> regSortBase + jj then
+            sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBase + jj);
+        end;
+        for jj := 0 to nResultCol - 1 do
+          sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
+                            regSortBase + sortNKey + jj);
+        regSortRec := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
+                          sortNKey + nResultCol, regSortRec);
+        sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
+                             regSortBase, nResultCol);
+        sqlite3ReleaseTempReg(pParse, regSortRec);
+      end
+      else
+      begin
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        { LIMIT decrement — selectInnerLoop:1522..1525.  Constant-integer
+          LIMIT case only (matched at the gate above); see computeLimitRegisters
+          block earlier in this function. }
+        if (p^.iLimit <> 0) and (not isExists) then
+          sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, pWInfo^.iBreak);
+      end;
     end
     else if pDest^.eDest = SRT_Mem then
     begin
@@ -21171,6 +21255,32 @@ begin
 
   { Close the loop — emits OP_Next and resolves the iBreak label. }
   sqlite3WhereEnd(pWInfo);
+
+  { generateSortTail (select.c:1673) — minimal slice for SRT_Output:
+      OpenPseudo iSortTab, regSortOut, nKey+nData
+      SorterSort iSorter -> addrBrk
+      addrLoop: SorterData iSorter, regSortOut, iSortTab
+      for i in 0..nData-1: Column iSortTab, nKey+i, iSdst+i
+      ResultRow iSdst, nData
+      SorterNext iSorter -> addrLoop
+      addrBrk: (no Close — eph cursor freed at Halt) }
+  if bSort <> 0 then
+  begin
+    Inc(pParse^.nMem); regSortOut := pParse^.nMem;
+    iSortTab := pParse^.nTab; Inc(pParse^.nTab);
+    sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortTab, regSortOut,
+                      sortNKey + nResultCol);
+    addrSortBrk := sqlite3VdbeMakeLabel(pParse);
+    sqlite3VdbeAddOp2(v, OP_SorterSort, iSorterCsr, addrSortBrk);
+    addrSortLoop := sqlite3VdbeCurrentAddr(v);
+    sqlite3VdbeAddOp3(v, OP_SorterData, iSorterCsr, regSortOut, iSortTab);
+    for i := 0 to nResultCol - 1 do
+      sqlite3VdbeAddOp3(v, OP_Column, iSortTab, sortNKey + i,
+                        pDest^.iSdst + i);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+    sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterCsr, addrSortLoop);
+    sqlite3VdbeResolveLabel(v, addrSortBrk);
+  end;
 
   { explainTempTable("DISTINCT") — select.c:8905..8907.  Emitted after
     sqlite3WhereEnd so the EQP entry sits between OP_Next and OP_Halt,
