@@ -26087,6 +26087,12 @@ begin
       sqlite3TableAffinity(v, pTab, regNewData + 1);
       bAffinityDone := 1;
     end;
+    { insert.c:2411 — VdbeNoopComment "prep index %s".  Under
+      SQLITE_ENABLE_EXPLAIN_COMMENTS (which the libsqlite3.so oracle
+      build enables) this expands to sqlite3VdbeAddOp0(v, OP_Noop) plus
+      a comment attach.  We emit the OP_Noop unconditionally so the
+      resulting bytecode lines up 1:1 with the oracle. }
+    sqlite3VdbeAddOp0(v, OP_Noop);
     iThisCur := iIdxCur + ix;
 
     { Skip partial-index rows whose WHERE clause is not satisfied. }

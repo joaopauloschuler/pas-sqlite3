@@ -153,9 +153,12 @@ skeleton.
      Deferred sub-arms (route to insert_cleanup or fall back to
      OP_NewRowid + record assembly without bail today):
      [X] IPK-alias rebinding (insert.c:1488..1531) — DONE 2026-05-01.
-          `INSERT IPK alias u` narrowed from off-by-11 to off-by-1
-          (a single OP_Noop placeholder in GenerateConstraintChecks
-          not yet emitted — minor, deferred).
+          `INSERT IPK alias u` byte-parity reached 2026-05-01: emit
+          `VdbeNoopComment "prep index %s"` (insert.c:2411) as
+          `OP_Noop` in `sqlite3GenerateConstraintChecks` per-index
+          loop so the bytecode lines up 1:1 with the
+          SQLITE_ENABLE_EXPLAIN_COMMENTS oracle.  Closed the last
+          off-by-one Δ.
      [~] Multi-row VALUES — runtime DONE 2026-05-01 (sqlite3Insert
           walks the SF_Values UNION-ALL chain inline-unrolled per row).
           DiagMultiValues count=3 matches C; DiagDml `multi-row values
@@ -341,7 +344,7 @@ skeleton.
 
 - [ ] **6.10** `TestExplainParity.pas`
     - [ ] **6.10 step 6** Remaining TestExplainParity bytecode-Δ rows
-       (8 diverges in 1018/1026 corpus):
+       (7 diverges in 1019/1026 corpus):
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
           C=19/19/20 vs Pas=3 (ORDER BY sorter / ephemeral-key path
           not ported).
@@ -356,9 +359,6 @@ skeleton.
           unrolls the rows inline, C emits a coroutine.  Bytecode
           parity needs the coroutine arm of sqlite3MultiValues if
           wanted (deferred — runtime is correct).
-        [ ] `INSERT IPK alias u` (`u(p PRIMARY KEY, q)` — non-INTEGER
-          PK) — C=21 vs Pas=20, off by one OP_Noop placeholder in
-          GenerateConstraintChecks.  Minor.
         [ ] `SELECT p FROM u;` — per-op divergence at op[1]
           (C `OpenRead p1=1 p2=5` autoindex covering scan vs Pas
           `p1=0 p2=4` table scan).  Root cause:
