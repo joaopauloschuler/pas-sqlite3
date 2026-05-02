@@ -358,8 +358,22 @@ skeleton.
     - [ ] **6.10 step 6** Remaining TestExplainParity bytecode-Δ rows
        (7 diverges in 1019/1026 corpus):
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
-          C=19/19/20 vs Pas=3 (ORDER BY sorter / ephemeral-key path
-          not ported).
+          asc/desc: C=19 Pas=21 (Δ=2); 2col: C=20 Pas=22 (Δ=2).
+          Sorter is now emitted (6.10 step 26) but pushOntoSorter
+          stores the ORDER BY key AND the result column separately
+          (extra `Column` + `SCopy` + `ReleaseReg` ops) and misses
+          the second `Explain "USE TEMP B-TREE FOR ORDER BY"`.  C
+          uses `sqlite3ExprCodeExprList(... SQLITE_ECEL_REF ...)`
+          to share registers when the ORDER BY expr matches a
+          result column, plus emits a per-sort Explain comment.
+          Naive register sharing with `nField=nResultCol` does NOT
+          match C bytecode shape: C uses `nField = nKey + bSeq +
+          nData = 3` (with stable-sort sequence number) while
+          packing only `nResultCol` regs into MakeRecord; the
+          KeyInfo carries `nKeyField=2 / nAllField=3` to extend the
+          comparator past the data section.  Closing this row
+          requires porting the `bSeq` / KeyInfo nExtra arms of
+          pushOntoSorter, not just register sharing.
         [ ] `SELECT a FROM t GROUP BY a` — C=45 vs Pas=3
           (aggregate-group path not yet ported).
         [ ] `SELECT a FROM (SELECT a FROM t)` — C=10 vs Pas=16.
