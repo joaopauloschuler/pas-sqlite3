@@ -24803,6 +24803,13 @@ var
   addrIpkNotNull: i32;
   pListItems:     PExprListItem;
   pIdItems:       PIdListItem;
+  pRowsList:      array of PExprList;
+  nRows:          i32;
+  iRow:           i32;
+  pCurRow:        PExprList;
+  pTmp:           PSelect;
+  isMulti:        Boolean;
+  rowsOk:         Boolean;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -24820,6 +24827,9 @@ begin
   pTab          := nil;
   v             := nil;
   bIdListInOrder := 0;
+  pRowsList     := nil;
+  nRows         := 1;
+  isMulti       := False;
 
   db := pParse^.db;
   if pParse^.nErr <> 0 then goto insert_cleanup;
@@ -24901,10 +24911,56 @@ begin
   bIdListInOrder := u8(ord(
     (pTab^.tabFlags and (TF_OOOHidden or TF_HasStored)) = 0));
 
-  { TODO(Phase 6.x): pSelect coroutine path (insert.c:1115..) — multi-row
-    VALUES and SELECT-as-source.  Single-row VALUES path is captured into
-    pList above and handled below. }
-  if pSelect <> nil then goto insert_cleanup;
+  { Multi-row VALUES detection (Phase 6.10 step 19).  After
+    sqlite3MultiValues' UNION-ALL fallback (the only arm wired today),
+    the parser emits a chain of SF_Values selects linked through pPrior
+    with op=TK_ALL, each carrying one row in pEList and an empty pSrc.
+    Walk the chain, validate the shape, and collect the row pELists in
+    insertion order (leaf-first since pPrior chains backwards).
+    Any other pSelect shape (true SELECT-as-source, sub-coroutine, etc.)
+    still bails — those are tracked under 6.10 step 6.  Single-row
+    VALUES is captured into pList above; pSelect is nil here. }
+  if pSelect <> nil then
+  begin
+    if ((pSelect^.selFlags and SF_Values) = 0) then goto insert_cleanup;
+    rowsOk := True;
+    nRows := 0;
+    pTmp := pSelect;
+    while pTmp <> nil do
+    begin
+      if (pTmp^.selFlags and SF_Values) = 0 then
+        begin rowsOk := False; Break; end;
+      if (pTmp^.pSrc = nil) or (pTmp^.pSrc^.nSrc <> 0) then
+        begin rowsOk := False; Break; end;
+      if (pTmp^.pPrior <> nil) and (pTmp^.op <> TK_ALL) then
+        begin rowsOk := False; Break; end;
+      Inc(nRows);
+      pTmp := pTmp^.pPrior;
+    end;
+    if (not rowsOk) or (nRows < 2) then goto insert_cleanup;
+    SetLength(pRowsList, nRows);
+    pTmp := pSelect;
+    iRow := nRows - 1;
+    while pTmp <> nil do
+    begin
+      pRowsList[iRow] := pTmp^.pEList;
+      Dec(iRow);
+      pTmp := pTmp^.pPrior;
+    end;
+    { Validate column-count parity across rows. }
+    for iRow := 1 to nRows - 1 do
+    begin
+      if (pRowsList[iRow] = nil)
+         or (pRowsList[0] = nil)
+         or (pRowsList[iRow]^.nExpr <> pRowsList[0]^.nExpr) then
+      begin
+        sqlite3ErrorMsg(pParse,
+          PAnsiChar('all VALUES must have the same number of terms'));
+        goto insert_cleanup;
+      end;
+    end;
+    isMulti := True;
+  end;
 
   { Single-row VALUES productive emission (Phase 6.9-bis step 11e).
     Hand-rolled inline of the schema-row INSERT path used by sqlite3NestedParse
@@ -24914,8 +24970,15 @@ begin
     sqlite3CompleteInsertion path (those still stubs) — emits the four-op
     OpenWrite / column-eval / NewRowid / MakeRecord / Insert sequence
     directly. }
-  { pList = nil  ⇔  INSERT … DEFAULT VALUES (insert.c:1213..1215). }
-  if pList <> nil then nColumn := pList^.nExpr else nColumn := 0;
+  { pList = nil  ⇔  INSERT … DEFAULT VALUES (insert.c:1213..1215).
+    For multi-row VALUES (isMulti), nColumn is taken from the first row;
+    parity across rows was already validated above. }
+  if isMulti then
+    nColumn := pRowsList[0]^.nExpr
+  else if pList <> nil then
+    nColumn := pList^.nExpr
+  else
+    nColumn := 0;
 
   { IDLIST resolution — port of insert.c:1077..1108.  Build aTabColMap so
     aTabColMap[i] = (1-based) index into pColumn for table column i, or 0
@@ -24992,102 +25055,94 @@ begin
     sqlite3ExprCodeFactorable.  sqlite3ColumnExpr returns the bound DEFAULT /
     AS expression for the column (or nil for columns without one — those
     fall through to OP_Null via the constant-factor short-circuit). }
-  if pList <> nil then
-    pListItems := ExprListItems(pList)
-  else
-    pListItems := nil;
-
-  for i := 0 to i32(pTab^.nCol) - 1 do
+  { Per-row emission loop.  For single-row / DEFAULT VALUES this runs once
+    with pCurRow = pList (which may be nil for DEFAULT VALUES).  For
+    multi-row VALUES (isMulti) this loops over pRowsList[0..nRows-1],
+    re-emitting the column eval + rowid + GenerateConstraintChecks +
+    CompleteInsertion sequence per row.  The C reference uses an
+    SRT_Coroutine yielded by sqlite3Select and a single bytecode loop;
+    our path emits inline-unrolled per-row blocks instead — equivalent at
+    runtime, larger bytecode, but it does not require sqlite3Select to
+    handle compound SF_Values (still pending). }
+  for iRow := 0 to nRows - 1 do
   begin
-    if pColumn <> nil then
+    if isMulti then
+      pCurRow := pRowsList[iRow]
+    else
+      pCurRow := pList;
+
+    if pCurRow <> nil then
+      pListItems := ExprListItems(pCurRow)
+    else
+      pListItems := nil;
+
+    for i := 0 to i32(pTab^.nCol) - 1 do
     begin
-      j := (aTabColMap + i)^;
-      if j = 0 then
+      if pColumn <> nil then
+      begin
+        j := (aTabColMap + i)^;
+        if j = 0 then
+          sqlite3ExprCodeFactorable(pParse,
+            sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
+        else
+          sqlite3ExprCode(pParse, pListItems[j - 1].pExpr, regData + i);
+      end
+      else if pCurRow = nil then
         sqlite3ExprCodeFactorable(pParse,
           sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
       else
-        sqlite3ExprCode(pParse, pListItems[j - 1].pExpr, regData + i);
-    end
-    else if pList = nil then
-      sqlite3ExprCodeFactorable(pParse,
-        sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
-    else
-      sqlite3ExprCode(pParse, pListItems[i].pExpr, regData + i);
-  end;
+        sqlite3ExprCode(pParse, pListItems[i].pExpr, regData + i);
+    end;
 
-  { Determine whether the user supplied a value for the IPK alias column
-    (insert.c around 1213..1230).  ipkColumnPresent gates the user-rowid
-    path below; with no IPK alias or no user value, OP_NewRowid auto-picks. }
-  ipkColumnPresent := False;
-  if pTab^.iPKey >= 0 then
-  begin
-    if pColumn <> nil then
-      ipkColumnPresent := (aTabColMap + i32(pTab^.iPKey))^ <> 0
-    else
-      ipkColumnPresent := pList <> nil;  { positional VALUES — IPK is included.
-                                            DEFAULT VALUES (pList=nil) → no user value. }
-  end;
-
-  { Rowid emission (insert.c:1488..1531).
-    Three paths:
-      (a) IPK alias with user-supplied value: SCopy regData+iPKey to
-          regRowid; if NULL, fall back to OP_NewRowid.  OP_MustBeInt
-          enforces the integer constraint at runtime.
-      (b) IPK alias with no user value (DEFAULT VALUES, or named-column
-          INSERT that omits the IPK): OP_NewRowid auto-picks.
-      (c) No IPK alias (HasRowid table without explicit IPK): OP_NewRowid
-          auto-picks.
-    For (a) and (b), regData+iPKey is then NULLed because the rowid is
-    the canonical source — OP_Column on iPKey reads the rowid at read
-    time, so storing user's value in the column slot would be redundant
-    AND would diverge from the C oracle's record layout. }
-  if not (isView <> 0) then
-  begin
-    if (pTab^.iPKey >= 0) and ipkColumnPresent then
-    begin
-      sqlite3VdbeAddOp2(v, OP_SCopy, regData + i32(pTab^.iPKey), regRowid);
-      addrIpkNotNull := sqlite3VdbeAddOp1(v, OP_NotNull, regRowid);
-      sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
-      sqlite3VdbeJumpHere(v, addrIpkNotNull);
-      sqlite3VdbeAddOp1(v, OP_MustBeInt, regRowid);
-    end
-    else
-      sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
-
+    { Determine whether the user supplied a value for the IPK alias column
+      (insert.c around 1213..1230).  ipkColumnPresent gates the user-rowid
+      path below; with no IPK alias or no user value, OP_NewRowid auto-picks. }
+    ipkColumnPresent := False;
     if pTab^.iPKey >= 0 then
-      sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i32(pTab^.iPKey));
-  end;
+    begin
+      if pColumn <> nil then
+        ipkColumnPresent := (aTabColMap + i32(pTab^.iPKey))^ <> 0
+      else
+        ipkColumnPresent := pCurRow <> nil;  { positional VALUES — IPK is
+                                                included.  DEFAULT VALUES
+                                                (pCurRow=nil) → no user value. }
+    end;
 
-  { Phase 6.8.6 — productive constraint-check + completion path.  Replaces
-    the prior inline OP_Affinity + OP_MakeRecord + OP_Insert shortcut.
-    sqlite3GenerateConstraintChecks emits NOT NULL / CHECK / UNIQUE /
-    PRIMARY KEY enforcement plus index-key encoding into aRegIdx[i]+1..,
-    and writes the packed table record into aRegIdx[nIdx].
-    sqlite3CompleteInsertion emits the per-index OP_IdxInsert chain plus
-    the final OP_Insert against the data cursor.  Together they are the
-    insert.c:2706..2855 reference (already 1:1 ported in 6.8.2 / 6.8.3). }
-  if not (isView <> 0) then
-  begin
-    bMayReplace := False;
-    { pkChng=1 when IPK alias was user-supplied (rowid uniqueness probe
-      needed; the user-supplied rowid might collide).  pkChng=0 when
-      OP_NewRowid auto-picked (uniqueness guaranteed). }
-    if (pTab^.iPKey >= 0) and ipkColumnPresent then pkChng := 1 else pkChng := 0;
-    { appendBias=1 only when the rowid was unconditionally auto-picked
-      (insert.c: appendFlag = ipkColumn<0).  IPK-alias-user-value path
-      sets appendBias=0 because the user-supplied rowid may not be the
-      end of the table. }
-    if (pTab^.iPKey >= 0) and ipkColumnPresent then appendBias := 0 else appendBias := 1;
-    sqlite3GenerateConstraintChecks(pParse, pTab, aRegIdx, iDataCur, iIdxCur,
-      regIns, 0, pkChng, u8(onError), 0,
-      @bMayReplace, nil, pUpsert);
-    sqlite3CompleteInsertion(pParse, pTab, iDataCur, iIdxCur, regIns,
-      aRegIdx, 0, appendBias, ord(not bMayReplace));
-  end;
+    { Rowid emission (insert.c:1488..1531).  See banner above the
+      single-row implementation for the (a)/(b)/(c) breakdown. }
+    if not (isView <> 0) then
+    begin
+      if (pTab^.iPKey >= 0) and ipkColumnPresent then
+      begin
+        sqlite3VdbeAddOp2(v, OP_SCopy, regData + i32(pTab^.iPKey), regRowid);
+        addrIpkNotNull := sqlite3VdbeAddOp1(v, OP_NotNull, regRowid);
+        sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
+        sqlite3VdbeJumpHere(v, addrIpkNotNull);
+        sqlite3VdbeAddOp1(v, OP_MustBeInt, regRowid);
+      end
+      else
+        sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
 
-  { Bump the running row count after each successful insert (insert.c:1612). }
-  if regRowCount <> 0 then
-    sqlite3VdbeAddOp2(v, OP_AddImm, regRowCount, 1);
+      if pTab^.iPKey >= 0 then
+        sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i32(pTab^.iPKey));
+    end;
+
+    { Phase 6.8.6 productive constraint-check + completion. }
+    if not (isView <> 0) then
+    begin
+      bMayReplace := False;
+      if (pTab^.iPKey >= 0) and ipkColumnPresent then pkChng := 1 else pkChng := 0;
+      if (pTab^.iPKey >= 0) and ipkColumnPresent then appendBias := 0 else appendBias := 1;
+      sqlite3GenerateConstraintChecks(pParse, pTab, aRegIdx, iDataCur, iIdxCur,
+        regIns, 0, pkChng, u8(onError), 0,
+        @bMayReplace, nil, pUpsert);
+      sqlite3CompleteInsertion(pParse, pTab, iDataCur, iIdxCur, regIns,
+        aRegIdx, 0, appendBias, ord(not bMayReplace));
+    end;
+
+    if regRowCount <> 0 then
+      sqlite3VdbeAddOp2(v, OP_AddImm, regRowCount, 1);
+  end;
 
   { sqlite3AutoincrementEnd — emit the sqlite_sequence write-back epilogue
     (insert.c:1640).  Skipped inside triggers and nested parses; the body

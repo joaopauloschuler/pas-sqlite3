@@ -163,9 +163,24 @@ skeleton.
           minor, deferred).  DiagIndexing `rowid alias custom`
           stays divergent on a separate SELECT-ORDER-BY bail
           unrelated to the IPK path.
-     [ ] Multi-row VALUES / INSERT FROM SELECT (insert.c:1115..)
-          — pSelect <> nil today bails to insert_cleanup (no
-          emission).
+     [~] Multi-row VALUES — DONE 2026-05-01 (multi-row VALUES arm).
+          sqlite3Insert now detects the SF_Values UNION-ALL chain
+          left by sqlite3MultiValues' fallback path, walks pPrior to
+          collect each row's pEList in insertion order, validates
+          column-count parity, and emits the per-row column-eval +
+          rowid + GenerateConstraintChecks + CompleteInsertion +
+          regRowCount-bump body in a Pascal-side loop (inline
+          unrolling — not the C coroutine).  Verified: DiagMultiValues
+          now reports count=3 (was 1); DiagDml `multi-row values expr`
+          flips DIVERGE→PASS; TestExplainParity 1018/1026 (was
+          1016/1026).  TestExplainParity `INSERT multi-row VALUES`
+          remains a bytecode-Δ entry (C=22 ops vs Pas=17) because
+          unrolling is structurally different from C's coroutine
+          loop, but the runtime behaviour is correct.
+          INSERT FROM SELECT (true compound-SELECT-as-source) still
+          bails — folds into 6.10 step 6 sub-FROM and step 9(e)
+          compound-SELECT codegen; coroutine arm of sqlite3MultiValues
+          also still TODO if byte-parity is wanted.
      [~] AUTOINCREMENT — wired 2026-05-01 (commit 179597b).
           `CREATE TABLE ... AUTOINCREMENT` now creates and pins
           sqlite_sequence; `sqlite3AutoincrementEnd` is now called
@@ -524,14 +539,15 @@ skeleton.
         Pas inserts 0 rows, C inserts 2.  Compound-SELECT-as-INSERT-source
         gap; folds into 6.10 step 6 (sqlite3Insert pSelect early-exit at
         codegen.pas:19756) + step 9(e) (compound-SELECT codegen).
-      [ ] **b) Multi-row VALUES with non-constant exprs** —
-        `INSERT INTO t VALUES(1,1+1),(2,2*2),(3,3+3)`: Pas count=1,
-        C count=3.  Distinct from the constant variant logged in
-        step 6 because non-constant rows force the C UNION-ALL fallback
-        path in `sqlite3MultiValues` (insert.c:679 condition (c)) — the
-        coroutine path is bypassed.  Closing requires the UNION-ALL arm of
-        `sqlite3MultiValues` (codegen.pas:21268) plus sqlite3Insert pSelect
-        path (same codegen.pas:19756 TODO).
+      [X] **b) Multi-row VALUES with non-constant exprs** — DONE
+        2026-05-01.  `INSERT INTO t VALUES(1,1+1),(2,2*2),(3,3+3)`
+        now reports Pas count=3 matching C (DiagDml flips the
+        `multi-row values expr` row from DIVERGE to PASS).  Closed by
+        wiring the multi-row VALUES arm into sqlite3Insert (see 6.8.6
+        "Multi-row VALUES" entry above) — the UNION-ALL fallback in
+        sqlite3MultiValues was already in place; the missing piece was
+        the consumer side in sqlite3Insert, which now walks the
+        SF_Values pPrior chain and emits per-row inserts inline.
 
   [ ] **6.10 step 26** DiagIndexing probe
       [ ] **e) `INDEXED BY` / `NOT INDEXED`** — DiagIndexing `indexed
