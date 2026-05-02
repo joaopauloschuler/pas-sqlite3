@@ -175,10 +175,11 @@ skeleton.
             and emits the OP_FkCheck calls.  Runtime opcode body
             already wired (commit 775ffc0); helpers
             fkChildIsModified / fkParentIsModified / isSetNullAction,
-            fkLookupParent and the productive sqlite3FkRequired
-            UPDATE arm landed.  Remaining: fkScanChildren and the
-            sqlite3FkCheck dispatcher body itself.  Required for
-            6.10 step 9 and DiagFeatureProbe FK-cascade cases.
+            fkLookupParent, exprTableRegister / exprTableColumn and
+            the productive sqlite3FkRequired UPDATE arm landed.
+            Remaining: fkScanChildren and the sqlite3FkCheck
+            dispatcher body itself.  Required for 6.10 step 9 and
+            DiagFeatureProbe FK-cascade cases.
        [ ] Port `sqlite3FkActions` (fkey.c).  Synthesises the
             ON DELETE / ON UPDATE CASCADE / SET NULL / SET DEFAULT /
             RESTRICT / NO ACTION trigger programs.  Currently a

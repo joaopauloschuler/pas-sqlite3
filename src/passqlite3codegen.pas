@@ -38079,12 +38079,67 @@ begin
   sqlite3VdbeAddOp1(v, OP_Close, iCur);
 end;
 
+{ fkey.c:471 — exprTableRegister.  Build an Expr (op=TK_REGISTER) that
+  refers to the register holding column iCol of pTab whose row data
+  begins at regBase (regBase = rowid; regBase+1 = col0; etc.).  iCol=-1
+  or iCol=pTab^.iPKey selects the rowid (INTEGER affinity).  Otherwise
+  we tag the expression with the column's affinity and collation so
+  downstream comparison ops use the parent's collation.  Faithful 1:1. }
+function exprTableRegister(pParse: PParse; pTab: PTable2; regBase: i32;
+  iCol: i16): PExpr;
+var
+  pE:    PExpr;
+  pCol:  PColumn;
+  zColl: PAnsiChar;
+  db:    PTsqlite3;
+begin
+  db := pParse^.db;
+  pE := sqlite3Expr(db, TK_REGISTER, nil);
+  if pE <> nil then
+  begin
+    if (iCol >= 0) and (iCol <> pTab^.iPKey) then
+    begin
+      pCol := @pTab^.aCol[iCol];
+      pE^.iTable := regBase + i32(sqlite3TableColumnToStorage(pTab, iCol)) + 1;
+      pE^.affExpr := pCol^.affinity;
+      zColl := sqlite3ColumnColl(pCol);
+      if zColl = nil then
+        zColl := PTCollSeq(db^.pDfltColl)^.zName;
+      pE := sqlite3ExprAddCollateString(pParse, pE, zColl);
+    end
+    else
+    begin
+      pE^.iTable := regBase;
+      pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+    end;
+  end;
+  Result := pE;
+end;
+
+{ fkey.c:503 — exprTableColumn.  Build an Expr (op=TK_COLUMN) referring
+  to column iCol of pTab opened on cursor iCursor.  Faithful 1:1. }
+function exprTableColumn(db: PTsqlite3; pTab: PTable2; iCursor: i32;
+  iCol: i16): PExpr;
+var
+  pE: PExpr;
+begin
+  pE := sqlite3Expr(db, TK_COLUMN, nil);
+  if pE <> nil then
+  begin
+    pE^.y.pTab := pTab;
+    pE^.iTable := iCursor;
+    pE^.iColumn := i32(iCol);
+  end;
+  Result := pE;
+end;
+
 procedure sqlite3FkCheck(pParse: PParse; pTab: PTable2; regOld: i32;
   regNew: i32; aChange: Pi32; bChng: i32);
 begin
   { Phase 7: full FK constraint codegen still pending — fkLookupParent
     helper above is the first piece in.  Body lands once fkScanChildren
-    is ported and the C dispatcher (fkey.c:889..1064) is wired up. }
+    is ported and the C dispatcher (fkey.c:889..1064) is wired up.
+    exprTableRegister / exprTableColumn helpers are now in place above. }
 end;
 
 procedure sqlite3FkActions(pParse: PParse; pTab: PTable2; pChanges: PExprList;
