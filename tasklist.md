@@ -306,17 +306,18 @@ skeleton.
   [~] **6.12** port sqlite3Pragma in full.  Gate `DiagPragma`.
        Direct PragTyp dispatch landed (TABLE_INFO / INDEX_INFO /
        INDEX_LIST / DATABASE_LIST / COLLATION_LIST / FUNCTION_LIST /
-       MODULE_LIST / PRAGMA_LIST / COMPILE_OPTIONS).  8 DiagPragma
-       divergences remain (was 10): a Pas-only `count(*) FROM
-       <eponymous-vtab>` fast path closed `database_list` /
-       `collation_list`.  Remaining gaps: (a) arg-bound vtabs
-       (`pragma_table_info('t')`, `pragma_table_xinfo('t')`,
-       `pragma_index_list('t')`, `pragma_foreign_key_list('c')`) need
-       hidden-column WHERE binding, blocked on WhereBegin's vtab branch;
-       (b) `count(*) >= N` shape (`function_list` / `module_list` /
-       `pragma_list` / `compile_options`) needs the general AggInfo
-       path over vtab.  FOREIGN_KEY_LIST also blocked on TFKey opaque.
-       COMPILE_OPTIONS also needs `sqlite3azCompileOpt` populated.
+       MODULE_LIST / PRAGMA_LIST / COMPILE_OPTIONS).  5 DiagPragma
+       divergences remain (was 9): the agg-no-GROUP-BY arm now branches
+       to a VOpen/VFilter/VNext loop for single-source eponymous-vtabs
+       so `count(*) >= N FROM pragma_*` shapes work (closed
+       function_list / module_list / pragma_list).  Remaining gaps:
+       (a) arg-bound vtabs (`pragma_table_info('t')`,
+       `pragma_table_xinfo('t')`, `pragma_index_list('t')`,
+       `pragma_foreign_key_list('c')`) need hidden-column WHERE binding
+       — TVF args populate `pItem^.u1.pFuncArg` but the vtab agg arm
+       doesn't yet pass them through to xFilter; FOREIGN_KEY_LIST also
+       blocked on TFKey opaque.  (b) COMPILE_OPTIONS needs
+       `sqlite3azCompileOpt` populated.
 
   [ ] **6.13** Non-regular FROM-item codegen in `sqlite3Select`
        (select.c).  Pas's SELECT codegen currently traverses regular

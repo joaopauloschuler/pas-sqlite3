@@ -20121,6 +20121,7 @@ var
   pAggI2:      PAggInfo;
   sNCAgg:      TNameContext;
   canUseAgg:   Boolean;
+  isVtabAgg:   Boolean;
   jAgg:        i32;
   pAggFunc:    PAggInfoFunc;
   pMinMaxOrderBy: PExprList;
@@ -20763,16 +20764,29 @@ begin
   then
   begin
     canUseAgg := True;
+    isVtabAgg := False;
     pItem := SrcListItems(p^.pSrc);
-    for jAgg := 0 to p^.pSrc^.nSrc - 1 do
-    begin
-      pTab := pItem[jAgg].pSTab;
-      if (pTab = nil)
-         or (pTab^.eTabType = TABTYP_VTAB)
-         or (pTab^.eTabType = TABTYP_VIEW)
-         or ((pTab^.tabFlags and TF_Ephemeral) <> 0)
-         or ((pItem[jAgg].fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
-      then begin canUseAgg := False; break; end;
+    { Allow single-source eponymous vtab — handled below by emitting
+      VOpen/VFilter/VNext directly instead of WhereBegin.  Lifts the
+      `count(*) >= N FROM <eponymous-vtab>` and similar shapes that the
+      existing fast paths only catch for the bare `count(*)` form. }
+    if (p^.pSrc^.nSrc = 1)
+       and (pItem^.pSTab <> nil)
+       and (pItem^.pSTab^.eTabType = TABTYP_VTAB)
+       and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)
+       and (p^.pWhere = nil) then
+      isVtabAgg := True
+    else begin
+      for jAgg := 0 to p^.pSrc^.nSrc - 1 do
+      begin
+        pTab := pItem[jAgg].pSTab;
+        if (pTab = nil)
+           or (pTab^.eTabType = TABTYP_VTAB)
+           or (pTab^.eTabType = TABTYP_VIEW)
+           or ((pTab^.tabFlags and TF_Ephemeral) <> 0)
+           or ((pItem[jAgg].fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+        then begin canUseAgg := False; break; end;
+      end;
     end;
     pTab := pItem^.pSTab;  { restore for downstream pTab uses }
     if canUseAgg then
@@ -20835,30 +20849,62 @@ begin
       begin
         sqlite3GenerateColumnNames(pParse, p);
         iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
-        sqlite3CodeVerifySchema(pParse, iDb);
+        if iDb >= 0 then sqlite3CodeVerifySchema(pParse, iDb);
 
         assignAggregateRegisters(pParse, pAggI2);
         resetAccumulatorSimple(pParse, pAggI2);
 
-        { MIN/MAX optimisation gate — select.c:8433.  When there is
-          exactly one aggregate, no GROUP BY, no HAVING, probe whether
-          it is min(x)/max(x) and if so synthesise a single-element
-          ORDER BY so sqlite3WhereBegin can ride an index in the
-          correct direction and trigger the early-out emitted by
-          sqlite3WhereMinMaxOptEarlyOut. }
-        pMinMaxOrderBy := nil;
-        minMaxFlag := WHERE_ORDERBY_NORMAL;
-        if pAggI2^.nFunc = 1 then
-          minMaxFlag := minMaxQuery(pParse^.db, pAggI2^.aFunc[0].pFExpr,
-                                    @pMinMaxOrderBy);
+        if isVtabAgg then
+        begin
+          { Eponymous-vtab agg arm — replace WhereBegin with a manual
+            VOpen/VFilter/VNext loop wrapping updateAccumulatorSimple.
+            Mirrors the eponymous-vtab simple-count fast path
+            (~codegen.pas:20690) but with AggInfo-driven aggregate
+            updates inside the body so non-bare aggregate shapes
+            (count(*) >= N, sum(x), etc.) work over vtabs. }
+          if pItem^.iCursor < 0 then
+          begin
+            pItem^.iCursor := pParse^.nTab;
+            Inc(pParse^.nTab);
+          end;
+          iCsr := pItem^.iCursor;
+          sqlite3VdbeAddOp4(v, OP_VOpen, iCsr, 0, 0,
+            PAnsiChar(passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab))),
+            P4_VTAB);
+          Inc(pParse^.nMem); regAgg := pParse^.nMem;
+          Inc(pParse^.nMem);
+          sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg);
+          sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg + 1);
+          addrEnd := sqlite3VdbeMakeLabel(pParse);
+          addrTopOfLoop := sqlite3VdbeAddOp3(v, OP_VFilter, iCsr,
+                                              addrEnd, regAgg);
+          updateAccumulatorSimple(pParse, pAggI2);
+          sqlite3VdbeAddOp2(v, OP_VNext, iCsr, addrTopOfLoop + 1);
+          sqlite3VdbeResolveLabel(v, addrEnd);
+          sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+        end
+        else
+        begin
+          { MIN/MAX optimisation gate — select.c:8433.  When there is
+            exactly one aggregate, no GROUP BY, no HAVING, probe whether
+            it is min(x)/max(x) and if so synthesise a single-element
+            ORDER BY so sqlite3WhereBegin can ride an index in the
+            correct direction and trigger the early-out emitted by
+            sqlite3WhereMinMaxOptEarlyOut. }
+          pMinMaxOrderBy := nil;
+          minMaxFlag := WHERE_ORDERBY_NORMAL;
+          if pAggI2^.nFunc = 1 then
+            minMaxFlag := minMaxQuery(pParse^.db, pAggI2^.aFunc[0].pFExpr,
+                                      @pMinMaxOrderBy);
 
-        pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere,
-                                    pMinMaxOrderBy, nil, p, minMaxFlag, 0);
-        if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
-        updateAccumulatorSimple(pParse, pAggI2);
-        if minMaxFlag <> WHERE_ORDERBY_NORMAL then
-          sqlite3WhereMinMaxOptEarlyOut(v, pWInfo);
-        sqlite3WhereEnd(pWInfo);
+          pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere,
+                                      pMinMaxOrderBy, nil, p, minMaxFlag, 0);
+          if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+          updateAccumulatorSimple(pParse, pAggI2);
+          if minMaxFlag <> WHERE_ORDERBY_NORMAL then
+            sqlite3WhereMinMaxOptEarlyOut(v, pWInfo);
+          sqlite3WhereEnd(pWInfo);
+        end;
         finalizeAggFunctionsSimple(pParse, pAggI2);
 
         { Render the result row — sqlite3ExprCodeTarget routes
