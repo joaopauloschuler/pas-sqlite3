@@ -2825,16 +2825,22 @@ begin
 end;
 
 { ctime.c:55..808 — names of compile-time options used to build the
-  library.  The Pas port currently has no ENABLE_/OMIT_ flag plumbing
-  reachable from this entry point, so the table is empty — matches the
-  C build with no SQLITE_ENABLE_*/SQLITE_OMIT_* defines.  Verbatim port
-  of ctime.c:809..812. }
+  library.  Pas-port subset reflecting the actual build configuration
+  declared in passqlite3.inc: THREADSAFE=1 (serialized), MATH_FUNCTIONS
+  enabled, deprecated/load-extension/autoinit omitted.  Names match the
+  upstream convention with the SQLITE_ prefix stripped. }
 const
-  sqlite3azCompileOpt: array[0..0] of PAnsiChar = (nil);
+  sqlite3azCompileOpt: array[0..4] of PAnsiChar = (
+    'COMPILER=fpc',
+    'OMIT_AUTOINIT',
+    'OMIT_DEPRECATED',
+    'OMIT_LOAD_EXTENSION',
+    'THREADSAFE=1'
+  );
 
 function sqlite3CompileOptions(out pnOpt: i32): PPAnsiChar;
 begin
-  pnOpt := 0;
+  pnOpt := Length(sqlite3azCompileOpt);
   Result := @sqlite3azCompileOpt[0];
 end;
 

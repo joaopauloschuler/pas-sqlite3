@@ -272,6 +272,7 @@ const
   { HI() flag bits — sqliteInt.h: HI(X) = u64(X)<<32 }
   SQLITE_CountRows      = u64($0000000100000000);  { HI(0x00001) }
   SQLITE_ReadUncommit   = u64($0000000400000000);  { HI(0x00004) }
+  SQLITE_FkNoAction     = u64($0000000800000000);  { HI(0x00008) }
   SQLITE_VdbeListing    = u64($0000000100000000);
   SQLITE_VdbeTrace      = u64($0000000200000000);
   SQLITE_VdbeEQP        = u64($0000001000000000);

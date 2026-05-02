@@ -2751,8 +2751,13 @@ begin
   if nOp = 0 then begin sqlite3DbFree(db, aOp); Exit; end;
   pOp := @aOp[nOp - 1];
   while True do begin
-    if pOp^.p4type <= P4_FREE_IF_LE then
+    if pOp^.p4type <= P4_FREE_IF_LE then begin
       freeP4(db, pOp^.p4type, pOp^.p4.p);
+      { Defensive: clear after free so a second visit (e.g. an aliased
+        SubProgram.aOp == parent.aOp) cannot double-free the same P4. }
+      pOp^.p4type := P4_NOTUSED;
+      pOp^.p4.p := nil;
+    end;
     if pOp = aOp then Break;
     Dec(pOp);
   end;
@@ -4085,6 +4090,20 @@ begin
     sqlite3VdbeSetChanges(v^.db, v^.nChange);
     v^.nChange := 0;
   end;
+  { vdbeaux.c:3435 — clear DBFLAG_SchemaChange after a successful commit.
+    The full sqlite3VdbeHalt commit/rollback bookkeeping (Phase 5.4) is not
+    yet ported, but the schema-change-flag clear is the load-bearing piece
+    for SAVEPOINT ROLLBACK after a prior CREATE TABLE: without it, the
+    OP_Savepoint rollback arm sees the stale flag from the long-since-
+    committed CREATE TABLE and fires sqlite3ResetAllSchemasOfConnection,
+    which invalidates the cached schema and breaks subsequent prepares.
+    Safe to clear unconditionally on halt: at this point the statement
+    has finished and any in-flight schema mutation is either committed
+    (flag should clear) or rolled back (flag is irrelevant). }
+  if (v <> nil) and (v^.db <> nil) and (v^.rc = SQLITE_OK)
+     and (PTsqlite3(v^.db)^.autoCommit <> 0) then
+    PTsqlite3(v^.db)^.mDbFlags :=
+      PTsqlite3(v^.db)^.mDbFlags and not u32(DBFLAG_SchemaChange);
   v^.eVdbeState := VDBE_HALT_STATE;
   Result := SQLITE_OK;
 end;
@@ -4390,21 +4409,30 @@ end;
 
 procedure sqlite3VdbeClearObject(db: Psqlite3db; p: PVdbe);
 var
-  pSub:  PSubProgram;
-  pNext: PSubProgram;
-  i:     i32;
+  pSub:    PSubProgram;
+  pNext:   PSubProgram;
+  i:       i32;
+  aliased: i32;
 begin
-  { Free sub-programs }
+  { Free sub-programs.  Track whether any sub-program's aOp aliases the
+    parent's aOp (a known-bug scenario in the trigger codegen path —
+    DiagTrig 6.8.6 KNOWN BUG); if so, skip the parent free below to avoid
+    a double-free of the same allocation. }
+  aliased := 0;
   pSub := p^.pProgram;
   while pSub <> nil do begin
     pNext := pSub^.pNext;
+    if (pSub^.aOp <> nil) and (pSub^.aOp = p^.aOp) then aliased := 1;
     vdbeFreeOpArray(db, pSub^.aOp, pSub^.nOp);
     sqlite3DbFree(db, pSub^.aOnce);
     sqlite3DbFree(db, pSub);
     pSub := pNext;
   end;
-  { Free op array }
-  vdbeFreeOpArray(db, p^.aOp, p^.nOp);
+  { Free op array (skip if aliased to a sub-program already freed). }
+  if aliased = 0 then
+    vdbeFreeOpArray(db, p^.aOp, p^.nOp)
+  else
+    p^.aOp := nil;
   { Free col names }
   if p^.aColName <> nil then begin
     vdbeReleaseColNames(p^.aColName, i32(p^.nResAlloc) * COLNAME_N);
@@ -5284,6 +5312,9 @@ begin
       rc := sqlite3VdbeTransferError(pStmt);
     db^.errCode := rc;
     Dec(db^.nVdbeActive);
+    { vdbeapi.c sqlite3Step tail — fold extended → primary unless the
+      app opted in via sqlite3_extended_result_codes(...,1). }
+    rc := rc and db^.errMask;
   end;
   Result := rc;
 end;
@@ -6996,6 +7027,19 @@ var
   sqlExecXAuth:               Pointer;
   sqlExecMTrace:              u8;
   sqlExecSavedAnalysisLimit:  i32;
+  { OP_Checkpoint locals (vdbe.c:8015) — inlined sqlite3Checkpoint loop. }
+  aResCk:    array[0..2] of i32;
+  pnLogCk:   Pi32;
+  pnCkptCk:  Pi32;
+  bBusyCk:   i32;
+  rcCk:      i32;
+  iCk:       i32;
+  { OP_JournalMode locals (vdbe.c:8054) }
+  jmEnew:      i32;
+  jmEold:      i32;
+  jmBt:        PBtree;
+  jmPager:     PPager;
+  jmZFilename: PChar;
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -7603,22 +7647,27 @@ begin
       if res > 0 then goto jump_to_p2;
     end;
 
-    { ────── OP_Init ────── (vdbe.c:9046) }
-    OP_Init: begin
+    { ────── OP_Trace / OP_Init ────── (vdbe.c:9020/9046) }
+    OP_Trace, OP_Init: begin
       i := 1;
       if pOp^.p1 >= sqlite3GlobalConfig.iOnceResetThreshold then begin
-        if pOp^.opcode = OP_Trace then begin { break equivalent — handled below }
+        if pOp^.opcode = OP_Trace then begin
+          { C `break;` — exit the case without jumping; advance to next op. }
         end else begin
           while i < v^.nOp do begin
             if aOp[i].opcode = OP_Once then aOp[i].p1 := 0;
             Inc(i);
           end;
           pOp^.p1 := 0;
+          Inc(pOp^.p1);
+          Inc(v^.aCounter[SQLITE_STMTSTATUS_RUN]);
+          goto jump_to_p2;
         end;
+      end else begin
+        Inc(pOp^.p1);
+        Inc(v^.aCounter[SQLITE_STMTSTATUS_RUN]);
+        goto jump_to_p2;
       end;
-      Inc(pOp^.p1);
-      Inc(v^.aCounter[SQLITE_STMTSTATUS_RUN]);
-      goto jump_to_p2;
     end;
 
     { ────── OP_Column ────── (vdbe.c:2975) }
@@ -9487,7 +9536,6 @@ begin
         pOut^.flags := MEM_Int;
         pOut^.u.i := iMoved;
         if rc <> SQLITE_OK then goto abort_due_to_error;
-        { OP_Destroy auto-vacuum: sqlite3RootPageMoved deferred to Phase 6 }
         if iMoved <> 0 then
           sqlite3RootPageMoved(db, pOp^.p3, iMoved, pOp^.p1);
       end;
@@ -9865,12 +9913,110 @@ begin
       pOut^.u.i := sqlite3BtreeMaxPageCount(pBtArg, newMax);
     end;
 
-    { ────── OP_Checkpoint ────── }
-    OP_Checkpoint, OP_Vacuum, OP_JournalMode: begin
-      { Stub: WAL checkpoint / vacuum / journal mode change require Phase 6 infra }
-      { For now return OK to avoid crashes during basic SQL testing }
+    { ────── OP_Checkpoint ────── (vdbe.c:8015) }
+    OP_Checkpoint: begin
+      { Inline of sqlite3Checkpoint (main.c) — match vdbe.c:8015..8038.
+        aResCk[0] = busy flag, aResCk[1] = nLog, aResCk[2] = nCkpt. }
+      aResCk[0] := 0;
+      aResCk[1] := -1;
+      aResCk[2] := -1;
+      rcCk     := SQLITE_OK;
+      bBusyCk  := 0;
+      pnLogCk  := @aResCk[1];
+      pnCkptCk := @aResCk[2];
+      iCk      := 0;
+      { SQLITE_MAX_DB_INTERNAL = SQLITE_MAX_ATTACHED + 2 (main.c) — sentinel
+        meaning "checkpoint every database".  Inlined here to avoid a uses
+        cycle through passqlite3main. }
+      while (iCk < db^.nDb) and (rcCk = SQLITE_OK) do begin
+        if (iCk = pOp^.p1) or (pOp^.p1 = SQLITE_MAX_ATTACHED + 2) then begin
+          rcCk := sqlite3BtreeCheckpoint(PBtree(db^.aDb[iCk].pBt), pOp^.p2,
+                                         Pointer(pnLogCk), Pointer(pnCkptCk));
+          pnLogCk  := nil;
+          pnCkptCk := nil;
+          if rcCk = SQLITE_BUSY then begin bBusyCk := 1; rcCk := SQLITE_OK; end;
+        end;
+        Inc(iCk);
+      end;
+      if (rcCk = SQLITE_OK) and (bBusyCk <> 0) then rcCk := SQLITE_BUSY;
+      if rcCk <> SQLITE_OK then begin
+        if rcCk <> SQLITE_BUSY then begin rc := rcCk; goto abort_due_to_error; end;
+        rcCk := SQLITE_OK;
+        aResCk[0] := 1;
+      end;
+      sqlite3VdbeMemSetInt64(@aMem[pOp^.p3],     i64(aResCk[0]));
+      sqlite3VdbeMemSetInt64(@aMem[pOp^.p3 + 1], i64(aResCk[1]));
+      sqlite3VdbeMemSetInt64(@aMem[pOp^.p3 + 2], i64(aResCk[2]));
+    end;
+
+    { ────── OP_Vacuum ────── stub.
+      OP_Vacuum needs sqlite3RunVacuum (vacuum.c — not yet ported); return
+      OK so basic SQL testing does not crash.  Full port tracked under
+      Phase 6.27. }
+    OP_Vacuum: begin
       pOut := out2Prerelease(v, pOp);
       pOut^.u.i := 0;
+    end;
+
+    { ────── OP_JournalMode ────── (vdbe.c:8054) — full 1:1 port. }
+    OP_JournalMode: begin
+      pOut := out2Prerelease(v, pOp);
+      jmEnew := pOp^.p3;
+      jmBt := PBtree(db^.aDb[pOp^.p1].pBt);
+      jmPager := sqlite3BtreePager(jmBt);
+      jmEold := sqlite3PagerGetJournalMode(jmPager);
+      if jmEnew = PAGER_JOURNALMODE_QUERY then jmEnew := jmEold;
+      if sqlite3PagerOkToChangeJournalMode(jmPager) = 0 then jmEnew := jmEold;
+
+      { Do not allow a transition to journal_mode=WAL for a database
+        in temporary storage or if the VFS does not support shared memory. }
+      jmZFilename := sqlite3PagerFilename(jmPager, 1);
+      if (jmEnew = PAGER_JOURNALMODE_WAL)
+         and ((jmZFilename = nil) or (jmZFilename^ = #0)
+              or (sqlite3PagerWalSupported(jmPager) = 0))
+      then jmEnew := jmEold;
+
+      if (jmEnew <> jmEold)
+         and ((jmEold = PAGER_JOURNALMODE_WAL) or (jmEnew = PAGER_JOURNALMODE_WAL))
+      then begin
+        if (db^.autoCommit = 0) or (db^.nVdbeRead > 1) then begin
+          rc := SQLITE_ERROR;
+          if jmEnew = PAGER_JOURNALMODE_WAL then
+            sqlite3VdbeError(v, 'cannot change into wal mode from within a transaction')
+          else
+            sqlite3VdbeError(v, 'cannot change out of wal mode from within a transaction');
+          goto abort_due_to_error;
+        end else begin
+          if jmEold = PAGER_JOURNALMODE_WAL then begin
+            { Leaving WAL mode — checkpoint and close the log. }
+            rc := sqlite3PagerCloseWal(jmPager, db);
+            if rc = SQLITE_OK then
+              sqlite3PagerSetJournalMode(jmPager, jmEnew);
+          end else if jmEold = PAGER_JOURNALMODE_MEMORY then begin
+            { Cannot transition directly from MEMORY to WAL.  Use mode OFF
+              as an intermediate. }
+            sqlite3PagerSetJournalMode(jmPager, PAGER_JOURNALMODE_OFF);
+          end;
+
+          { Open a transaction on the database file.  Regardless of the
+            journal mode, this transaction always uses a rollback journal. }
+          if rc = SQLITE_OK then begin
+            if jmEnew = PAGER_JOURNALMODE_WAL then
+              rc := sqlite3BtreeSetVersion(jmBt, 2)
+            else
+              rc := sqlite3BtreeSetVersion(jmBt, 1);
+          end;
+        end;
+      end;
+
+      if rc <> SQLITE_OK then jmEnew := jmEold;
+      jmEnew := sqlite3PagerSetJournalMode(jmPager, jmEnew);
+      pOut^.flags := MEM_Str or MEM_Static or MEM_Term;
+      pOut^.z     := PAnsiChar(sqlite3JournalModename(jmEnew));
+      pOut^.n     := sqlite3Strlen30(PChar(pOut^.z));
+      pOut^.enc   := SQLITE_UTF8;
+      sqlite3VdbeChangeEncoding(pOut, enc);
+      if rc <> SQLITE_OK then goto abort_due_to_error;
     end;
 
     { ────── OP_SqlExec ────── (vdbe.c:7064) }
@@ -9989,14 +10135,21 @@ begin
     { ────── OP_ColumnsUsed ────── — hint only, no-op }
     OP_ColumnsUsed: begin end;
 
-    { ────── OP_Offset ────── (vdbe.c:2931) }
+    { ────── OP_Offset ────── (vdbe.c:2931) — port of vdbe.c case OP_Offset }
     OP_Offset: begin
       pCur := v^.apCsr[pOp^.p1];
       if (pCur = nil) or (pCur^.eCurType <> CURTYPE_BTREE) then
         sqlite3VdbeMemSetNull(@aMem[pOp^.p3])
       else begin
-        sqlite3VdbeMemSetInt64(@aMem[pOp^.p3], 0);
-        { Full B-tree offset computation deferred to Phase 6 }
+        if pCur^.deferredMoveto <> 0 then begin
+          rc := sqlite3VdbeFinishMoveto(pCur);
+          if rc <> 0 then goto abort_due_to_error;
+        end;
+        if sqlite3BtreeEof(pCur^.uc.pCursor) <> 0 then
+          sqlite3VdbeMemSetNull(@aMem[pOp^.p3])
+        else
+          sqlite3VdbeMemSetInt64(@aMem[pOp^.p3],
+            sqlite3BtreeOffset(pCur^.uc.pCursor));
       end;
     end;
 
@@ -10598,10 +10751,6 @@ begin
   p^.flags := MEM_Null;
 end;
 
-{ -----------------------------------------------------------------------
-  sqlite3VdbeMemTranslate — UTF encoding conversion stub (Phase 2 note)
-  Full port deferred to Phase 6 (needs Mem encoding fully wired).
-  ----------------------------------------------------------------------- }
 { sqlite3VdbeMemTranslate — convert pMem->z between SQLITE_UTF8 / UTF16LE /
   UTF16BE.  Faithful port of utf.c:242..423.  The UTF-16 ↔ UTF-16 byte-swap
   arm (utf.c:266..288) is in-place; UTF-8 ↔ UTF-16 arms allocate a new
