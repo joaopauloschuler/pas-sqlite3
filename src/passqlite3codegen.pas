@@ -33727,7 +33727,10 @@ end;
 
 function sqlite3AnalysisLoad(db: PTsqlite3; iDb: i32): i32;
 begin
-  Result := SQLITE_OK;
+  { Delegate to the productive trampoline so a direct codegen-side caller
+    sees the same schema-iteration body as the OP_LoadAnalysis hook.
+    Previously a SQLITE_OK no-op stub that diverged from the hook target. }
+  Result := analysisLoadTrampoline(db, iDb);
 end;
 
 // ===========================================================================
