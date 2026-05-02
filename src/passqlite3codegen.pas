@@ -5060,14 +5060,19 @@ begin
     yet pair Push/Pop reliably). }
   db := pParse^.db;
   savedAddrExplain := pParse^.addrExplain;
-  if addrOnce <> 0 then
-    zMsg := sqlite3MPrintf(db, 'SCALAR SUBQUERY %d', [pSel^.selId])
-  else
-    zMsg := sqlite3MPrintf(db, 'CORRELATED SCALAR SUBQUERY %d', [pSel^.selId]);
-  addrExplain := sqlite3VdbeCurrentAddr(v);
-  sqlite3VdbeAddOp4(v, OP_Explain, addrExplain, savedAddrExplain, 0,
-                    zMsg, P4_DYNAMIC);
-  pParse^.addrExplain := addrExplain;
+  { Non-DEBUG gate: ExplainQueryPlan2 only emits in EQP/scanstatus mode. }
+  if (pParse^.explain = 2)
+     or ((db^.flags and u64($00000400)) <> 0) then
+  begin
+    if addrOnce <> 0 then
+      zMsg := sqlite3MPrintf(db, 'SCALAR SUBQUERY %d', [pSel^.selId])
+    else
+      zMsg := sqlite3MPrintf(db, 'CORRELATED SCALAR SUBQUERY %d', [pSel^.selId]);
+    addrExplain := sqlite3VdbeCurrentAddr(v);
+    sqlite3VdbeAddOp4(v, OP_Explain, addrExplain, savedAddrExplain, 0,
+                      zMsg, P4_DYNAMIC);
+    pParse^.addrExplain := addrExplain;
+  end;
 
   { Allocate result register(s) and initialise the SelectDest. }
   if pExpr^.op = TK_SELECT then
@@ -20455,7 +20460,9 @@ begin
       pDest^.iSdst := pParse^.nMem + 1;
       pParse^.nMem := pParse^.nMem + nResultCol;
     end;
-    sqlite3VdbeAddOp3(v, OP_Explain, sqlite3VdbeCurrentAddr(v), 0, 0);
+    if (pParse^.explain = 2)
+       or ((pParse^.db^.flags and u64($00000400)) <> 0) then
+      sqlite3VdbeAddOp3(v, OP_Explain, sqlite3VdbeCurrentAddr(v), 0, 0);
     sqlite3ExprCodeExprList(pParse, pEList, pDest^.iSdst, 0, SQLITE_ECEL_DUP);
     if pDest^.eDest = SRT_Output then
       sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
@@ -21956,12 +21963,16 @@ begin
       USE TEMP B-TREE banner near generateSortTail entry).  Emits the EQP
       annotation that distinguishes a sorter-driven ORDER BY from one
       satisfied by an index. }
-    i := sqlite3VdbeCurrentAddr(v);
-    sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
-                      sqlite3MPrintf(pParse^.db,
-                                     'USE TEMP B-TREE FOR %s',
-                                     ['ORDER BY']),
-                      P4_DYNAMIC);
+    if (pParse^.explain = 2)
+       or ((pParse^.db^.flags and u64($00000400)) <> 0) then
+    begin
+      i := sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+                        sqlite3MPrintf(pParse^.db,
+                                       'USE TEMP B-TREE FOR %s',
+                                       ['ORDER BY']),
+                        P4_DYNAMIC);
+    end;
     if addrSortBrk = 0 then
       addrSortBrk := sqlite3VdbeMakeLabel(pParse);
     if bUseSorter <> 0 then
@@ -22030,7 +22041,9 @@ begin
   { explainTempTable("DISTINCT") — select.c:8905..8907.  Emitted after
     sqlite3WhereEnd so the EQP entry sits between OP_Next and OP_Halt,
     matching the C oracle's bytecode order. }
-  if iTabTnct >= 0 then
+  if (iTabTnct >= 0)
+     and ((pParse^.explain = 2)
+          or ((pParse^.db^.flags and u64($00000400)) <> 0)) then
   begin
     i := sqlite3VdbeCurrentAddr(v);
     sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
@@ -29450,18 +29463,21 @@ begin
   sqlite3VdbeAddOp4Int(v, OP_OpenWrite, cur, SCHEMA_ROOT, iDb, 5);
 
   { OP_Explain — comment-style scan-description op the oracle emits via
-    sqlite3WhereExplainOneScan.  p1 = its own addr; p3 = wsFlags
-    (WHERE_COLUMN_EQ | WHERE_IPK | WHERE_ONEROW = 0x21 = 33). }
-  addrEx := sqlite3VdbeCurrentAddr(v);
-  zDbName := db^.aDb[iDb].zDbSName;
-  if zDbName = nil then zDbName := PAnsiChar('main');
-  zExplain := sqlite3MPrintf(db,
-    'SEARCH %s.sqlite_master USING INTEGER PRIMARY KEY (rowid=?)',
-    [zDbName]);
-  sqlite3VdbeAddOp4(v, OP_Explain, addrEx, 0, 33, zExplain, P4_DYNAMIC);
+    sqlite3WhereExplainOneScan.  Gated on EQP / scanstatus to match the
+    non-DEBUG system libsqlite3 oracle. }
+  if (pParse^.explain = 2)
+     or ((pParse^.db^.flags and u64($00000400)) <> 0) then
+  begin
+    addrEx := sqlite3VdbeCurrentAddr(v);
+    zDbName := db^.aDb[iDb].zDbSName;
+    if zDbName = nil then zDbName := PAnsiChar('main');
+    zExplain := sqlite3MPrintf(db,
+      'SEARCH %s.sqlite_master USING INTEGER PRIMARY KEY (rowid=?)',
+      [zDbName]);
+    sqlite3VdbeAddOp4(v, OP_Explain, addrEx, 0, 33, zExplain, P4_DYNAMIC);
+  end;
 
-  { OP_ReleaseReg — debug-only release of the WHERE-clause key reg. }
-  sqlite3VdbeAddOp3(v, OP_ReleaseReg, regKey, 1, 0);
+  { OP_ReleaseReg — DEBUG-only; suppressed in non-DEBUG builds. }
 
   addrSeek := sqlite3VdbeAddOp3(v, OP_SeekRowid, cur, 0, regRowid);
   sqlite3VdbeAddOp2(v, OP_Rowid, cur, regCurRow);
@@ -40563,10 +40579,16 @@ begin
   if pLevel^.pWLoop = nil then Exit;
   if (pLevel^.pWLoop^.wsFlags and WHERE_MULTI_OR) <> 0 then Exit;
   if (wctrlFlags and WHERE_OR_SUBCLAUSE) <> 0 then Exit;
+  pTop := sqlite3ParseToplevel(pParse);
+  { Non-DEBUG gate (wherecode.c:252..254): emit only when EQP mode (explain=2)
+    or when stmt-scanstatus is enabled.  Without the gate the Pas port
+    diverges from the system libsqlite3 oracle on every WHERE-clause scan. }
+  if (pTop^.explain <> 2)
+     and ((pParse^.db^.flags and u64($00000400)) = 0) then Exit;
+  { ^^^ SQLITE_StmtScanStatus_Bit, inlined to avoid uses-cycle on main.pas }
   v := pParse^.pVdbe;
   if v = nil then Exit;
   addr := sqlite3VdbeCurrentAddr(v);
-  pTop := sqlite3ParseToplevel(pParse);
   Result := sqlite3VdbeAddOp3(v, OP_Explain, addr,
               pTop^.addrExplain, i32(pLevel^.pWLoop^.rRun));
 end;
@@ -40593,6 +40615,11 @@ begin
   if pParse = nil then Exit;
   if pWInfo = nil then Exit;
   if pLevel = nil then Exit;
+  pTop := sqlite3ParseToplevel(pParse);
+  { Non-DEBUG gate (wherecode.c bloom-filter explain): only emit under EQP
+    or scanstatus.  Matches system libsqlite3 oracle. }
+  if (pTop^.explain <> 2)
+     and ((pParse^.db^.flags and u64($00000400)) = 0) then Exit;
   v := pParse^.pVdbe;
   if v = nil then Exit;
   db := pParse^.db;

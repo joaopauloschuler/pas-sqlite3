@@ -2887,38 +2887,16 @@ procedure sqlite3VdbeReleaseRegisters(pParse: PParse; iFstirst, nReg, mask: i32;
 { Port of vdbeaux.c:1501..1527 (under SQLITE_DEBUG).  Emits OP_ReleaseReg to
   flag a contiguous register range as no longer in use.  Trims leading and
   trailing bits set in `mask` (registers that must NOT be released) before
-  emission; if the trimmed range is empty, emits nothing. }
-var
-  v:    PVdbe;
-  uMask: u32;
-  N:    i32;
-  iFst:   i32;
+  emission; if the trimmed range is empty, emits nothing.
+
+  In C the entire body lives under #ifdef SQLITE_DEBUG; outside of DEBUG
+  builds the macro expands to an empty stmt.  The Pas port follows the
+  upstream non-DEBUG default (passqlite3.inc), so this routine must
+  emit nothing — match the system libsqlite3 oracle. }
 begin
-  if nReg = 0 then Exit;
-  v := vdbeParsePVdbe(pParse);
-  if v = nil then Exit;
-  uMask := u32(mask);
-  N := nReg;
-  iFst := iFstirst;
-  if (N <= 31) and (uMask <> 0) then
-  begin
-    while (N > 0) and ((uMask and 1) <> 0) do
-    begin
-      uMask := uMask shr 1;
-      Inc(iFst);
-      Dec(N);
-    end;
-    while (N > 0) and (N <= 32) and ((uMask and (u32(1) shl (N - 1))) <> 0) do
-    begin
-      uMask := uMask and (not (u32(1) shl (N - 1)));
-      Dec(N);
-    end;
-  end;
-  if N > 0 then
-  begin
-    sqlite3VdbeAddOp3(v, OP_ReleaseReg, iFst, N, i32(uMask));
-    if bUndefine <> 0 then sqlite3VdbeChangeP5(v, 1);
-  end;
+  { non-DEBUG: OP_ReleaseReg is suppressed (see vdbeaux.c #ifdef SQLITE_DEBUG). }
+  if (pParse = nil) or (iFstirst = 0) or (nReg = 0)
+     or (mask = 0) or (bUndefine = 0) then ; { silence unused-param }
 end;
 
 { --- TakeOpArray (returns the op array and zeroes v->aOp) --- }
