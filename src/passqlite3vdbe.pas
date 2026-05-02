@@ -7027,6 +7027,13 @@ var
   sqlExecXAuth:               Pointer;
   sqlExecMTrace:              u8;
   sqlExecSavedAnalysisLimit:  i32;
+  { OP_Checkpoint locals (vdbe.c:8015) — inlined sqlite3Checkpoint loop. }
+  aResCk:    array[0..2] of i32;
+  pnLogCk:   Pi32;
+  pnCkptCk:  Pi32;
+  bBusyCk:   i32;
+  rcCk:      i32;
+  iCk:       i32;
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -9901,10 +9908,48 @@ begin
       pOut^.u.i := sqlite3BtreeMaxPageCount(pBtArg, newMax);
     end;
 
-    { ────── OP_Checkpoint ────── }
-    OP_Checkpoint, OP_Vacuum, OP_JournalMode: begin
-      { Stub: WAL checkpoint / vacuum / journal mode change require Phase 6 infra }
-      { For now return OK to avoid crashes during basic SQL testing }
+    { ────── OP_Checkpoint ────── (vdbe.c:8015) }
+    OP_Checkpoint: begin
+      { Inline of sqlite3Checkpoint (main.c) — match vdbe.c:8015..8038.
+        aResCk[0] = busy flag, aResCk[1] = nLog, aResCk[2] = nCkpt. }
+      aResCk[0] := 0;
+      aResCk[1] := -1;
+      aResCk[2] := -1;
+      rcCk     := SQLITE_OK;
+      bBusyCk  := 0;
+      pnLogCk  := @aResCk[1];
+      pnCkptCk := @aResCk[2];
+      iCk      := 0;
+      { SQLITE_MAX_DB_INTERNAL = SQLITE_MAX_ATTACHED + 2 (main.c) — sentinel
+        meaning "checkpoint every database".  Inlined here to avoid a uses
+        cycle through passqlite3main. }
+      while (iCk < db^.nDb) and (rcCk = SQLITE_OK) do begin
+        if (iCk = pOp^.p1) or (pOp^.p1 = SQLITE_MAX_ATTACHED + 2) then begin
+          rcCk := sqlite3BtreeCheckpoint(PBtree(db^.aDb[iCk].pBt), pOp^.p2,
+                                         Pointer(pnLogCk), Pointer(pnCkptCk));
+          pnLogCk  := nil;
+          pnCkptCk := nil;
+          if rcCk = SQLITE_BUSY then begin bBusyCk := 1; rcCk := SQLITE_OK; end;
+        end;
+        Inc(iCk);
+      end;
+      if (rcCk = SQLITE_OK) and (bBusyCk <> 0) then rcCk := SQLITE_BUSY;
+      if rcCk <> SQLITE_OK then begin
+        if rcCk <> SQLITE_BUSY then begin rc := rcCk; goto abort_due_to_error; end;
+        rcCk := SQLITE_OK;
+        aResCk[0] := 1;
+      end;
+      sqlite3VdbeMemSetInt64(@aMem[pOp^.p3],     i64(aResCk[0]));
+      sqlite3VdbeMemSetInt64(@aMem[pOp^.p3 + 1], i64(aResCk[1]));
+      sqlite3VdbeMemSetInt64(@aMem[pOp^.p3 + 2], i64(aResCk[2]));
+    end;
+
+    { ────── OP_Vacuum / OP_JournalMode ────── stubs.
+      OP_Vacuum needs sqlite3RunVacuum (vacuum.c — not yet ported);
+      OP_JournalMode needs sqlite3PagerSetJournalMode wiring (pager.c —
+      partial).  Return OK with a dummy out2 register so basic SQL testing
+      does not crash; full ports tracked under Phase 6.27 / 6.28. }
+    OP_Vacuum, OP_JournalMode: begin
       pOut := out2Prerelease(v, pOp);
       pOut^.u.i := 0;
     end;

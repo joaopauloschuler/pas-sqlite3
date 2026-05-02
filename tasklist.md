@@ -193,6 +193,12 @@ skeleton.
        [X] Port OP_Offset body (vdbe.c:2931) — was a Phase-2 stub that
             always wrote 0; now drives sqlite3VdbeFinishMoveto +
             sqlite3BtreeEof + sqlite3BtreeOffset, matching the C reference.
+       [X] Port OP_Checkpoint body (vdbe.c:8015) — was sharing a no-op stub
+            with OP_Vacuum / OP_JournalMode; now inlines sqlite3Checkpoint
+            (per-aDb sqlite3BtreeCheckpoint loop) and writes the busy /
+            nLog / nCkpt triple into mem[p3..p3+2] per the C reference.
+            OP_Vacuum + OP_JournalMode keep the no-op stub (gated on
+            sqlite3RunVacuum / sqlite3PagerSetJournalMode wiring).
 
 ### Open Bugs
 
