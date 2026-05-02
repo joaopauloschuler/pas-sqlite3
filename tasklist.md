@@ -181,20 +181,18 @@ skeleton.
           bails — folds into 6.10 step 6 sub-FROM and step 9(e)
           compound-SELECT codegen; coroutine arm of sqlite3MultiValues
           also still TODO if byte-parity is wanted.
-     [~] AUTOINCREMENT — wired 2026-05-01 (commit 179597b).
-          `CREATE TABLE ... AUTOINCREMENT` now creates and pins
-          sqlite_sequence; `sqlite3AutoincrementEnd` is now called
-          from sqlite3Insert so the in-row write-back epilogue
-          actually fires; `regRowCount` is allocated and bumped
-          per insert.  Verified: AUTOINCREMENT INSERTs now
-          generate rowids correctly (1,2,3,...); previously
-          failed at autoIncBegin's pSeqTab=nil check with
-          SQLITE_CORRUPT_SEQUENCE.
-          Remaining: the sqlite_sequence row's `seq` column does
-          not yet update with the new max rowid after INSERT —
-          AutoincrementEnd's epilogue runs but the in-row update
-          loop may not be wiring p1/p2/p3 of OP_Insert to the
-          correct registers.  Trace pending.
+     [X] AUTOINCREMENT — DONE 2026-05-01.  `CREATE TABLE ...
+          AUTOINCREMENT` creates and pins sqlite_sequence;
+          `sqlite3AutoincrementEnd` is called from sqlite3Insert so
+          the in-row write-back epilogue fires; `regRowCount` is
+          allocated and bumped per insert; **autoIncStep**
+          (insert.c:521) is now emitted per-row in sqlite3Insert
+          (`OP_MemMax regAutoinc, regRowid`) so the running-max
+          register actually tracks the inserted rowid.  Verified:
+          `INSERT INTO t(x) VALUES('a'),('b'),('c')` against
+          `CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x)`
+          now writes `seq=3` to sqlite_sequence (was 0); matches C
+          reference exactly.
      [ ] BEFORE / AFTER INSERT triggers — already ported as
           `sqlite3CodeRowTrigger` but not yet wired into this
           path.

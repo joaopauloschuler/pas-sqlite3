@@ -25127,6 +25127,14 @@ begin
         sqlite3VdbeAddOp2(v, OP_Null, 0, regData + i32(pTab^.iPKey));
     end;
 
+    { autoIncStep — port of insert.c:521 + call site at insert.c:1542.
+      Updates the running-max regCtr (memId = regAutoinc) with the rowid
+      we just emitted, so sqlite3AutoincrementEnd writes the actual max
+      back into sqlite_sequence.seq.  No-op when regAutoinc=0 (table is
+      not AUTOINCREMENT). }
+    if regAutoinc > 0 then
+      sqlite3VdbeAddOp2(v, OP_MemMax, regAutoinc, regRowid);
+
     { Phase 6.8.6 productive constraint-check + completion. }
     if not (isView <> 0) then
     begin
