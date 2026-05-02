@@ -8,6 +8,8 @@ Inspiration for structure, tone, and workflow: `../pas-core-math/`, `../pas-bzip
 
 REMEMBER: You are porting code. DO NOT RANDOMLY ADD TESTS unless you are looking for a specific bug. If you are porting existing tests in C, mention the origin of the test that you are porting.
 
+If you don't have a house, you wont have a water leak in your house. If you build a house, you will not destroy the house because it has a water leak. If you can not solve the water leak, you'll keep the house and take note to fix it in a day that you can fix.
+
 DO NOT default to the same work pattern as recent commits without questioning whether actually move the project forward.
 
 BEFORE TRYING TO FIX A BUG, LOOK AT THE ORIGINAL C IMPLEMENTATION!!!
