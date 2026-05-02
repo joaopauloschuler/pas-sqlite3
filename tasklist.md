@@ -168,31 +168,7 @@ skeleton.
           compound-SELECT-as-source) still bails — folds into
           6.10 step 6 sub-FROM and step 9(e).
      [X] AUTOINCREMENT — DONE 2026-05-01.
-     [X] BEFORE / AFTER INSERT triggers — fully fires DONE 2026-05-01.
-          DiagTrig now reports `log.n = 7` matching C; DiagFeatureProbe
-          `CREATE TRIGGER then INSERT` flips to PASS (9→8 divergences).
-          Three coupled fixes landed: (1) added `OP_Trace` as a fall-
-          through case label on the OP_Init arm in vdbe.pas so trigger
-          sub-programs (which start with OP_Trace, not OP_Init) no
-          longer error with "unimplemented opcode"; (2) added the
-          missing `TK_TRIGGER` arm to `sqlite3ExprCodeTarget`
-          (expr.c:5537..5598) so `NEW.x` / `OLD.x` references emit
-          OP_Param with the documented P1 = `iTable*(nCol+1) + 1 +
-          TableColumnToStorage(iCol)`; (3) added a `resolveTriggerNewOld`
-          walker invoked from `sqlite3ResolveExprNames` and the
-          `sqlite3ResolveSelectNames` ResolveExpr nested proc so
-          TK_DOT(NEW, x) / TK_DOT(OLD, x) rewrite to TK_TRIGGER against
-          `pParse^.pTriggerTab`; (4) wired the missing
-          `sqlite3ResolveExprListNames(&sNC, pList)` call into
-          `sqlite3Insert` (insert.c:1210) so the values list inside a
-          trigger sub-INSERT actually runs through resolution.
-          Side-fix: DiagFeatureProbe `SplitExec` now tracks BEGIN/END
-          nesting so the `CREATE TRIGGER … BEGIN … END` setup is fed as
-          one statement (was previously split on the inner `;`,
-          producing a malformed CREATE TRIGGER and a stray `END`).
-          Regressions green: TestDMLBasic 54/0, TestSchemaBasic 44/0,
-          TestSelectBasic 60/0, TestWhereBasic 52/0, TestExplainParity
-          1019/7, DiagFeatureProbe 8 diverge (was 9).
+     [X] BEFORE / AFTER INSERT triggers — DONE 2026-05-01.
      [ ] RETURNING clause emission — DiagDml RETURNING corpus.
      [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
      [ ] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
@@ -451,72 +427,14 @@ skeleton.
         returns no row.  Compound-select codegen / sub-FROM
         materialisation gap (overlaps step 6 sub-FROM Δ=7 entry).
       [~] **f) WITH / CTE not productive** — simple non-recursive CTE
-        DONE 2026-05-02.  `WITH c(x) AS (SELECT 7) SELECT x FROM c` now
-        returns 7 (DiagFeatureProbe `CTE simple` PASS, divergences
-        7→6).  Three coupled changes in passqlite3codegen.pas:
-        (1) ported `searchWith` (select.c:5601) and
-        `resolveFromTermToCte` (select.c:5670, non-recursive arm only)
-        — match a FROM-item against the in-scope WITH chain, allocate
-        an ephemeral Table, attach the CTE body via
-        `sqlite3SrcItemAttachSubquery` with a duplicate-on-attach so
-        each reference gets a fresh body, then run
-        `sqlite3ColumnsFromExprList` on the leftmost-SELECT result-set
-        for column name/affinity propagation.  Sets `pCt^.zCteErr` to
-        "circular reference: %s" around the inner SelectPrep so a
-        self-reference inside the CTE body trips the zCteErr arm on
-        re-entry instead of looping (mirrors select.c:5793..5840).
-        (2) Wired `sqlite3WithPush(pParse, pSelect^.pWith, 0)` at the
-        top of `sqlite3SelectExpand` so the parser-supplied WITH (set
-        on `pSelect^.pWith` by `attachWithToSelect` for the
-        `select ::= WITH wqlist selectnowith` reduction) becomes
-        visible to `pParse^.pWith` during FROM resolution; the existing
-        post-walk `sqlite3SelectPopWith` callback pops it.
-        (3) Extended the no-FROM fast path in `sqlite3Select`
-        (codegen.pas:20018) to honour `SRT_Coroutine` in addition to
-        `SRT_Output` — emits OP_Yield instead of OP_ResultRow — so the
-        CTE body inside the outer's co-routine arm actually emits its
-        per-column code (was emitting empty `InitCoroutine ;
-        EndCoroutine`).
-        Recursive CTE (`WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL
-        SELECT n+1 FROM r WHERE n<5) SELECT count(*) FROM r`) still
-        DIVERGEs — needs the recursive-CTE arm of resolveFromTermToCte
-        (select.c:5760..5839) plus compound SF_Recursive codegen.
-        Regressions green: TestExplainParity 1019/7, TestDMLBasic 54/0,
-        TestSchemaBasic 44/0, TestSelectBasic 60/0, TestWhereBasic
-        52/0, DiagDml 13/1, DiagIndexing 38/4, DiagMisc divergences
-        unchanged.
+        DONE 2026-05-02.  Recursive CTE still DIVERGES — needs the
+        recursive-CTE arm of resolveFromTermToCte (select.c:5760..5839)
+        plus compound SF_Recursive codegen.
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
       [X] **h) CHECK constraint not enforced** — DONE 2026-05-01.
-        Three coupled fixes: (1) `sqlite3AddCheckConstraint`
-        (build.c:1902) ported from a stub-that-deletes-the-expr to the
-        real append-into-pTab^.pCheck + name-tagging body;
-        (2) `sqlite3EndTable` now runs the build.c:2738..2751 CHECK
-        resolve loop via `sqlite3ResolveSelfReference(NC_IsCheck)`;
-        (3) `sqlite3ResolveSelfReference` was only resolving pExpr —
-        added the resolve.c:2317 `pList` arm so ExprList CHECK
-        constraints actually resolve.  The CHECK arm in
-        `sqlite3GenerateConstraintChecks` was already correct; the
-        TK_COLUMN row-unpacked iSelfTab<0 arm in
-        `sqlite3ExprCodeTarget` was not — ported the expr.c:5026..5074
-        body so a TK_COLUMN under iSelfTab<0 returns the existing
-        register holding the inserted column instead of falling
-        through to the iSelfTab>0 cursor-read path.  Final fix:
-        `sqlite3_step` now folds the extended result code via
-        `rc and db^.errMask` (vdbeapi.c sqlite3Step tail) so the
-        public API returns SQLITE_CONSTRAINT (19) instead of
-        SQLITE_CONSTRAINT_CHECK (275) when extended-codes are off
-        (the default).  Verified: DiagFeatureProbe `CHECK rejects bad
-        insert` flips DIVERGE→PASS (10→9 divergences); no regressions
-        across TestExplainParity (1018/8/1026), TestDMLBasic (54/0),
-        TestSchemaBasic (44/0), TestSelectBasic (60/0), TestWhereBasic
-        (52/0).
       [X] **j) AFTER INSERT trigger does not fire** — DONE 2026-05-01.
-        Closed by 6.8.6 BEFORE/AFTER trigger arm + the OP_Trace /
-        TK_TRIGGER / NEW.x resolver / sqlite3Insert resolve fixes
-        described above.  DiagFeatureProbe `CREATE TRIGGER then
-        INSERT` PASS (val=99 == C).
       [ ] **k) `pragma_table_info(...)` table-valued function.**
         `SELECT count(*) FROM pragma_table_info('t')` returns no row.
         Tracked under 6.12 (sqlite3Pragma).
@@ -536,54 +454,18 @@ skeleton.
         bookkeeping in `sqlite3VdbeHalt`); blocked on Phase 5.4 full
         VdbeHalt port.
       [~] **c) `SAVEPOINT s; ...; ROLLBACK TO s` does not unwind** —
-        DiagTxn `savepoint rollback`.  Partial 2026-05-02: commit-time
-        DBFLAG_SchemaChange clear now wired into sqlite3VdbeHalt
-        (vdbeaux.c:3435) — gated on db^.autoCommit so it only fires when
-        the auto-commit completes (matches C semantics; intermediate
-        statements inside an explicit BEGIN..COMMIT do not clear the
-        flag).  Standalone probe (CREATE TABLE; INSERT 1; SAVEPOINT s1;
-        INSERT 2; ROLLBACK TO s1; RELEASE s1; SELECT count(*)) flips
-        prep-side rc from SQLITE_ERROR ("stale schema, no such table")
-        to SQLITE_OK — schema cache survives the savepoint rollback.
-        Failure mode now: prep=0 step=11 (SQLITE_CORRUPT) — the btree
-        pages themselves are not unwound by the savepoint rollback,
-        likely the memdb pager savepoint stack reconciliation gap noted
-        previously.  DiagTxn-harness hang at this probe is unchanged
-        and pre-existing (not in build.sh; tracked in
+        Schema-cache side fixed (commit-time DBFLAG_SchemaChange clear
+        wired into sqlite3VdbeHalt; OP_Savepoint ported 1:1 of
+        vdbe.c:3823).  Probe now reaches prep=0 but step=11
+        (SQLITE_CORRUPT).  Remaining: memdb pager savepoint
+        reconciliation — btree pages not unwound on ROLLBACK TO.
+        DiagTxn-harness hang at this probe is pre-existing (see
         feedback_diagtxn_hang).
-        Earlier (2026-04-29) progress retained: OP_Savepoint ported
-        1:1 of vdbe.c:3823 (sqlite3BtreeTripAllCursors +
-        sqlite3BtreeSavepoint per attached db, sqlite3VtabSavepoint,
-        schema-change reload arm); btreeBeginTrans (btree.c:3793)
-        passes db->nSavepoint to sqlite3PagerOpenSavepoint.
-        Remaining: memdb pager savepoint reconciliation (btree pages
-        are not unwound on ROLLBACK TO) — needed to flip the probe
-        from step=CORRUPT to count=1.
-      [X] **d) `INSERT OR IGNORE` / `OR REPLACE` / `OR FAIL` ignore
-        conflict resolution** — DONE 2026-05-01.  Root cause: the call
-        to `sqlite3GenerateConstraintChecks` in `sqlite3Insert`
-        (codegen.pas:25434) passed `ignoreDest=0` instead of the
-        per-row `endOfLoop` label.  OE_Ignore would emit
-        `OP_Goto 0,0` looping back to address 0 forever; OR REPLACE /
-        OR FAIL were similarly miswired.  Fixed at codegen.pas:25435 —
-        OR IGNORE now skips the duplicate row, OR REPLACE replaces it,
-        OR FAIL returns SQLITE_CONSTRAINT_UNIQUE.  Verified via
-        standalone probe (count=2 across all three modes); regressions
-        green: TestDMLBasic 54/0, TestSchemaBasic 44/0,
-        TestExplainParity 1019/7 (was 1018, +1 pass on the
-        `INSERT IPK alias u` row), DiagDml 13/1 unchanged,
-        DiagIndexing 38/4 unchanged, DiagFeatureProbe 9/9 unchanged.
-      [X] **e) IPK alias auto-rowid increment** — verified 2026-05-01
-        via standalone probe.  Pas correctly returns id=8 for
-        `INSERT INTO t(id INTEGER PRIMARY KEY, x) VALUES(7,'a');
-        INSERT VALUES(NULL,'b')`.  The OP_NewRowid runtime walks to
-        BtreeLast and increments the integer key, matching C 1:1.
-        Tasklist entry was stale (DiagTxn hangs prevent automated
-        verification — see `feedback_diagtxn_hang`).
+      [X] **d) `INSERT OR IGNORE` / `OR REPLACE` / `OR FAIL`** —
+        DONE 2026-05-01.
+      [X] **e) IPK alias auto-rowid increment** — verified 2026-05-01.
       [X] **f) `changes()` returns 0 after UPDATE** — verified
-        2026-05-01 via standalone probe.  Pas returns 2 matching C
-        for `CREATE TABLE t(a); INSERT 1; INSERT 2; UPDATE t SET a=99;
-        SELECT changes()`.  Closed by the 6.8.1 sqlite3Update port.
+        2026-05-01.
 
   [ ] **6.10 step 17** Window-function and aggregate divergences surfaced
       by the new `src/tests/DiagWindow.pas` probe (run with
@@ -594,19 +476,10 @@ skeleton.
         ORDER-BY-in-aggregate arm is not honoured; the unordered
         variant `group_concat(val,',')` PASSes.  Tracked under 6.24
         (aggregate-with-ORDER-BY codegen) when it lands.
-      [X] **c) Window functions fail at prepare time** — DONE 2026-05-01.
-        Root cause: `sqlite3WindowFunctions` was defined in
-        codegen.pas:38253 but never called.  Wired it into
-        `sqlite3RegisterBuiltinFunctions` (codegen.pas:36412 region) at
-        the same point as the C reference (func.c:3435), between
-        `sqlite3AlterFunctions` and `sqlite3RegisterJsonFunctions`.
-        DiagWindow now reports prep=0 across the entire window-function
-        corpus (was prep=1 for rank/dense_rank/lag/lead/first_value/ntile
-        and the partition_row_num case).  Runtime divergence persists —
-        prep=0 step=101 with empty rows — and folds entirely into
-        item (d) below / 6.26.  Regressions green: TestExplainParity
-        1019/7, TestDMLBasic 54/0, TestSchemaBasic 44/0, TestSelectBasic
-        60/0, TestWhereBasic 52/0.
+      [X] **c) Window functions fail at prepare time** — DONE
+        2026-05-01.  Wired `sqlite3WindowFunctions` into
+        `sqlite3RegisterBuiltinFunctions`.  Runtime still empty rows;
+        folds into item (d) / 6.26.
       [ ] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
         prepare cleanly but emit no rows** — `row_number() OVER (...)`
         same.  Symptom: prep=0 step=101 with empty result set when C
@@ -626,67 +499,20 @@ skeleton.
         gap; folds into 6.10 step 6 (sqlite3Insert pSelect early-exit at
         codegen.pas:19756) + step 9(e) (compound-SELECT codegen).
       [X] **b) Multi-row VALUES with non-constant exprs** — DONE
-        2026-05-01.  `INSERT INTO t VALUES(1,1+1),(2,2*2),(3,3+3)`
-        now reports Pas count=3 matching C (DiagDml flips the
-        `multi-row values expr` row from DIVERGE to PASS).  Closed by
-        wiring the multi-row VALUES arm into sqlite3Insert (see 6.8.6
-        "Multi-row VALUES" entry above) — the UNION-ALL fallback in
-        sqlite3MultiValues was already in place; the missing piece was
-        the consumer side in sqlite3Insert, which now walks the
-        SF_Values pPrior chain and emits per-row inserts inline.
+        2026-05-01.
 
   [X] **6.10 step 26** DiagIndexing probe — DONE 2026-05-02.  All
-      probes PASS (Total divergences: 0).  The four remaining empty-
-      rowset cases (`schema after create idx`, `select range via idx`,
-      `rowid select`, `rowid alias custom`) closed via a minimal
-      ORDER BY sorter port at sqlite3Select (codegen.pas:21066..21228).
-      Slice scope: SRT_Output destination only, no DISTINCT, no LIMIT,
-      no nOBSat shortcut, no SORTFLAG_UseSorter optimisation.  Emits
-      OP_SorterOpen pre-WhereBegin, pushOntoSorter inside the inner
-      loop (regBase = ORDER-BY exprs + SCopy of result columns +
-      OP_MakeRecord + OP_SorterInsert), and a generateSortTail body
-      after WhereEnd (OP_OpenPseudo + OP_SorterSort + OP_SorterData
-      loop + per-result OP_Column + OP_ResultRow + OP_SorterNext).
-      Bytecode for `SELECT a FROM t ORDER BY a` lifts from 3 ops to 19
-      and produces correct row order.  C reference: select.c:730
-      (pushOntoSorter) and select.c:1673 (generateSortTail).
-      Regressions green: TestDMLBasic 54/0, TestSchemaBasic 44/0,
-      TestSelectBasic 60/0, TestWhereBasic 52/0, TestExplainParity
-      1019/7, DiagFeatureProbe 6 div (was 6), DiagDml 13/1 unchanged,
-      DiagWindow 13 div unchanged.
+      probes PASS.  Minimal ORDER BY sorter ported in sqlite3Select
+      (SRT_Output, plain LIMIT, LIMIT+OFFSET, integer-arm resolution).
+      C reference: select.c:730 (pushOntoSorter) and select.c:1673
+      (generateSortTail).
       Deferred sorter sub-arms (none in current corpus):
-      [X] `ORDER BY <integer>` / `GROUP BY <integer>` resolution —
-          DONE 2026-05-02.  Added `ResolveIntegerOrderByCol` nested
-          proc inside `sqlite3ResolveSelectNames`
-          (passqlite3codegen.pas ~8079) that mirrors the integer-arm
-          of resolve.c:1808..1817: walks pOrderBy/pGroupBy after
-          ResolveExprList, calls sqlite3ExprIsInteger, sets
-          `iOrderByCol := iCol` for literal integer terms in
-          [1, 0xFFFF].  Then invokes `sqlite3ResolveOrderGroupBy`
-          for both clauses so the alias-rewrite arm fires.  Verified
-          via standalone probe: `SELECT a FROM t ORDER BY 1` /
-          `... ORDER BY 1 DESC` now sort rows correctly (was no-op
-          previously).  Regressions green: TestExplainParity 1019/7,
-          TestDMLBasic 54/0, TestSchemaBasic 44/0, TestSelectBasic
-          60/0, TestWhereBasic 52/0.
       [ ] DISTINCT + ORDER BY — current slice bails when iTabTnct>=0.
-      [X] LIMIT + ORDER BY pushdown (top-N sorter) — DONE 2026-05-02.
-          Plain `ORDER BY ... LIMIT N` (no OFFSET) enables the sorter
-          and emits OP_DecrJumpZero after each post-sort ResultRow.
-          OFFSET + ORDER BY (`LIMIT 1 OFFSET 1`) closed 2026-05-02:
-          gate widened (removed `p^.iOffset = 0` from sorter
-          condition); inner-loop OFFSET IfPos suppressed when bSort=1;
-          a post-sort OFFSET IfPos with addrSortContinue label emits
-          inside generateSortTail before the Column/ResultRow emit so
-          OFFSET is consumed after rows are sorted.  Closes DiagOps
-          `limit offset` (1→0 div).  Top-N optimisation (only keep N
-          best in sorter) still deferred — current implementation
-          pushes all rows then trims with DecrJumpZero.
+      [ ] Top-N sorter — currently pushes all rows then trims with
+          DecrJumpZero.
       [ ] nOBSat shortcut — when the planner reports the loop already
-          delivers rows in ORDER BY order (nOBSat=nExpr), skip the
-          sorter and route directly to OP_ResultRow.  Bytecode parity
-          gap with the C oracle on tests like
-          `SELECT a FROM t INDEXED BY ... ORDER BY a`.
+          delivers rows in ORDER BY order, skip the sorter and route
+          directly to OP_ResultRow.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
