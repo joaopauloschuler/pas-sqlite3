@@ -36410,6 +36410,7 @@ begin
   sqlite3InsertBuiltinFuncs(@aBuiltinFuncs, Length(aBuiltinFuncs));
   sqlite3InsertBuiltinFuncs(@aBuiltinAgg,   Length(aBuiltinAgg));
   sqlite3AlterFunctions;
+  sqlite3WindowFunctions;
   sqlite3RegisterJsonFunctions;
   sqlite3RegisterDateTimeFunctions;
 end;

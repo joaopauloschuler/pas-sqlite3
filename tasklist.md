@@ -530,15 +530,25 @@ skeleton.
   [ ] **6.10 step 17** Window-function and aggregate divergences surfaced
       by the new `src/tests/DiagWindow.pas` probe (run with
       `LD_LIBRARY_PATH=$PWD/src bin/DiagWindow`).  13 divergences open
-      (verified 2026-04-29); most fold into existing window/agg tasks.
+      (verified 2026-05-01 after window-funcs registration fix) — all
+      runtime empty-row symptoms; prep=1 prepare-time failures gone.
       [ ] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** — the
         ORDER-BY-in-aggregate arm is not honoured; the unordered
         variant `group_concat(val,',')` PASSes.  Tracked under 6.24
         (aggregate-with-ORDER-BY codegen) when it lands.
-      [ ] **c) Window functions fail at prepare time** —
-        `rank()`, `dense_rank()`, `lag()`, `lead()`, `first_value()`,
-        `ntile()` with OVER clauses all return prepRc=1.  Folds into
-        6.26 `sqlite3WindowCodeInit` / `sqlite3WindowCodeStep` stubs.
+      [X] **c) Window functions fail at prepare time** — DONE 2026-05-01.
+        Root cause: `sqlite3WindowFunctions` was defined in
+        codegen.pas:38253 but never called.  Wired it into
+        `sqlite3RegisterBuiltinFunctions` (codegen.pas:36412 region) at
+        the same point as the C reference (func.c:3435), between
+        `sqlite3AlterFunctions` and `sqlite3RegisterJsonFunctions`.
+        DiagWindow now reports prep=0 across the entire window-function
+        corpus (was prep=1 for rank/dense_rank/lag/lead/first_value/ntile
+        and the partition_row_num case).  Runtime divergence persists —
+        prep=0 step=101 with empty rows — and folds entirely into
+        item (d) below / 6.26.  Regressions green: TestExplainParity
+        1019/7, TestDMLBasic 54/0, TestSchemaBasic 44/0, TestSelectBasic
+        60/0, TestWhereBasic 52/0.
       [ ] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
         prepare cleanly but emit no rows** — `row_number() OVER (...)`
         same.  Symptom: prep=0 step=101 with empty result set when C
