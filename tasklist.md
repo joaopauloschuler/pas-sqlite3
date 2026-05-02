@@ -174,13 +174,31 @@ skeleton.
           Two pre-existing parse-time bugs in sqlite3FinishTrigger
           fixed in passing (step-list drain idiom + pTrig HashInsert
           reassign).  CREATE TRIGGER + non-firing INSERT path clean.
-          **KNOWN BUG (DiagTrig probe):** an INSERT that actually
-          fires the trigger crashes during sqlite3_finalize with
-          double-free.  gdb shows the parent VDBE's aOp/nOp corrupted
-          (~0x95e4 / 6.8M) by vdbeClearObject time.  Suspect: sub-vdbe
-          ↔ parent-vdbe lifecycle interaction in codeRowTrigger /
-          nested DML codegen.  Regression suite stays green because
-          no test in suite both creates a trigger AND fires it.
+          **CRASH FIXED 2026-05-01 (defensive):** the
+          DiagTrig double-free was masked by detecting the
+          `pSubProgram^.aOp == p^.aOp` aliasing in
+          `sqlite3VdbeClearObject` and skipping the second free.
+          vdbeFreeOpArray now also clears `p4type/p4` after free
+          so any later visit is a no-op.  ROOT CAUSE STILL OPEN:
+          tracing showed the parent INSERT vdbe ends prepare with
+          `aOp == pProgram^.aOp` (same pointer); how that aliasing
+          arises has not been pinned down.  Each prepare creates
+          two vdbes (parent + a second from a stack TParse at a
+          consistent offset that does NOT match codeRowTrigger's
+          sSubParse), and the second vdbe's aOp gets reused at the
+          same address as the SubProgram's aOp by malloc.  After
+          the workaround DiagTrig completes without crash but the
+          AFTER trigger still does not fire (log empty;
+          sqlite3_step rc=1).  Regressions green: TestDMLBasic
+          54/0, TestSchemaBasic 44/0, TestSelectBasic 60/0,
+          TestWhereBasic 52/0, TestExplainParity 1019/7,
+          DiagDml 13/1, DiagIndexing unchanged, DiagFeatureProbe
+          9 diverge unchanged.
+          Follow-ups: (1) find the source of the parent.aOp ==
+          pProgram.aOp alias (likely in growOpArray/realloc or a
+          stale VdbeFrame swap); (2) make the AFTER trigger
+          actually fire (sqlite3_step rc=1 indicates the OP_Program
+          execution path still has a runtime gap).
      [ ] RETURNING clause emission — DiagDml RETURNING corpus.
      [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
      [ ] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`

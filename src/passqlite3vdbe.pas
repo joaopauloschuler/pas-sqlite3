@@ -2751,8 +2751,13 @@ begin
   if nOp = 0 then begin sqlite3DbFree(db, aOp); Exit; end;
   pOp := @aOp[nOp - 1];
   while True do begin
-    if pOp^.p4type <= P4_FREE_IF_LE then
+    if pOp^.p4type <= P4_FREE_IF_LE then begin
       freeP4(db, pOp^.p4type, pOp^.p4.p);
+      { Defensive: clear after free so a second visit (e.g. an aliased
+        SubProgram.aOp == parent.aOp) cannot double-free the same P4. }
+      pOp^.p4type := P4_NOTUSED;
+      pOp^.p4.p := nil;
+    end;
     if pOp = aOp then Break;
     Dec(pOp);
   end;
@@ -4390,21 +4395,30 @@ end;
 
 procedure sqlite3VdbeClearObject(db: Psqlite3db; p: PVdbe);
 var
-  pSub:  PSubProgram;
-  pNext: PSubProgram;
-  i:     i32;
+  pSub:    PSubProgram;
+  pNext:   PSubProgram;
+  i:       i32;
+  aliased: i32;
 begin
-  { Free sub-programs }
+  { Free sub-programs.  Track whether any sub-program's aOp aliases the
+    parent's aOp (a known-bug scenario in the trigger codegen path —
+    DiagTrig 6.8.6 KNOWN BUG); if so, skip the parent free below to avoid
+    a double-free of the same allocation. }
+  aliased := 0;
   pSub := p^.pProgram;
   while pSub <> nil do begin
     pNext := pSub^.pNext;
+    if (pSub^.aOp <> nil) and (pSub^.aOp = p^.aOp) then aliased := 1;
     vdbeFreeOpArray(db, pSub^.aOp, pSub^.nOp);
     sqlite3DbFree(db, pSub^.aOnce);
     sqlite3DbFree(db, pSub);
     pSub := pNext;
   end;
-  { Free op array }
-  vdbeFreeOpArray(db, p^.aOp, p^.nOp);
+  { Free op array (skip if aliased to a sub-program already freed). }
+  if aliased = 0 then
+    vdbeFreeOpArray(db, p^.aOp, p^.nOp)
+  else
+    p^.aOp := nil;
   { Free col names }
   if p^.aColName <> nil then begin
     vdbeReleaseColNames(p^.aColName, i32(p^.nResAlloc) * COLNAME_N);
