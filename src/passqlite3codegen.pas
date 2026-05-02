@@ -20420,6 +20420,11 @@ var
     handed to OP_VFilter so xFilter sees the user-supplied args. }
   nFuncArg:     i32;
   iFA:          i32;
+  { Compound-SELECT UNION ALL recursion locals (multiSelect select.c:2998..3050). }
+  pPriorSel:    PSelect;
+  rcSel:        i32;
+  savedFlagsP:  u32;
+  savedFlagsPP: u32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -20471,13 +20476,47 @@ begin
      (pDest^.eDest <> SRT_Coroutine) and
      (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
-  if p^.pPrior <> nil then begin Result := SQLITE_OK; Exit; end;
+  if p^.pPrior <> nil then begin
+    { Compound-SELECT — minimal UNION ALL arm of multiSelect
+      (select.c:2998..3050).  The C reference dispatches to multiSelect for
+      every compound; we inline the TK_ALL / no-ORDER-BY / no-LIMIT /
+      non-recursive case here.  UNION / EXCEPT / INTERSECT and ORDER BY
+      still bail (multiSelectByMerge and the recursive-CTE arm not yet
+      ported — tracked under 6.10 step 9(e)/(f) and 6.13(c)).
+      Each leaf carries SF_Compound; clear it during the recursion so the
+      no-FROM / regular-FROM fast paths inside sqlite3Select fire normally. }
+    if (p^.op = TK_ALL) and (p^.pOrderBy = nil) and (p^.pLimit = nil)
+       and ((p^.selFlags and SF_Recursive) = 0)
+       and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
+            or (pDest^.eDest = SRT_Set) or (pDest^.eDest = SRT_Mem)
+            or (pDest^.eDest = SRT_Coroutine)) then
+    begin
+      pPriorSel    := p^.pPrior;
+      savedFlagsP  := p^.selFlags;
+      savedFlagsPP := pPriorSel^.selFlags;
+      p^.selFlags        := p^.selFlags        and (not u32(SF_Compound));
+      pPriorSel^.selFlags := pPriorSel^.selFlags and (not u32(SF_Compound));
+      rcSel := sqlite3Select(pParse, pPriorSel, pDest);
+      if rcSel = SQLITE_OK then
+      begin
+        p^.pPrior := nil;
+        rcSel := sqlite3Select(pParse, p, pDest);
+        p^.pPrior := pPriorSel;
+      end;
+      p^.selFlags         := savedFlagsP;
+      pPriorSel^.selFlags := savedFlagsPP;
+      Result := rcSel;
+      Exit;
+    end;
+    Result := SQLITE_OK; Exit;
+  end;
   { No-FROM fast path — `SELECT <expr-list>;` with no source table.
     Emit OP_Explain + per-result-col sqlite3ExprCode + OP_ResultRow.
     Mirrors the tail of selectInnerLoop for SRT_Output when WhereBegin
     is skipped (no cursor to iterate). }
   if ((p^.pSrc = nil) or (p^.pSrc^.nSrc = 0))
-     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine))
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
+          or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table))
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pOrderBy = nil) and (p^.pLimit = nil) and (p^.pWin = nil)
@@ -20499,8 +20538,21 @@ begin
     sqlite3ExprCodeExprList(pParse, pEList, pDest^.iSdst, 0, SQLITE_ECEL_DUP);
     if pDest^.eDest = SRT_Output then
       sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
-    else { SRT_Coroutine — yield the row to the outer scan. }
-      sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
+    else if pDest^.eDest = SRT_Coroutine then
+      sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+    else
+    begin
+      { SRT_EphemTab / SRT_Table — append the row to a rowid-keyed eph
+        cursor (selectInnerLoop SRT_Table arm, select.c:1349..1370). }
+      r1 := sqlite3GetTempReg(pParse);
+      r2 := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+      sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
+      sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+      sqlite3ReleaseTempReg(pParse, r2);
+      sqlite3ReleaseTempReg(pParse, r1);
+    end;
     if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
     Exit;
   end;

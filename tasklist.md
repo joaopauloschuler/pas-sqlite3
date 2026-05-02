@@ -237,10 +237,13 @@ skeleton.
         and drives Rewind/updateAccumulator/Next; `count(*) FROM v` and
         `count(*) FROM (SELECT ...)` PASS.  sum/min/max on subquery still
         bail (nAccumulator>0 — needs directMode column-store).
-      [ ] **e) UNION / compound SELECT.**  Folds into 6.13(c).
-        `SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)`
-        returns no row.  Compound-select codegen / sub-FROM
-        materialisation gap (overlaps step 6 sub-FROM Δ=7 entry).
+      [~] **e) UNION / compound SELECT.**  Partial — UNION ALL arm
+        of multiSelect (select.c:2998..3050) ported at codegen.pas
+        sqlite3Select compound dispatch; `SELECT 1 UNION ALL SELECT 2`
+        and `SELECT count(*) FROM (... UNION ALL ...)` PASS (no-FROM
+        leaf extended for SRT_EphemTab/SRT_Table).  Remaining: UNION /
+        INTERSECT / EXCEPT (need multiSelectByMerge), and
+        `SELECT 1 UNION SELECT 2` dedup.  Folds into 6.13(c).
       [~] **f) WITH / CTE not productive** — simple non-recursive CTE
         works.  Recursive CTE still DIVERGES — recursion-detection arm
         of resolveFromTermToCte ported (select.c:5760..5791): self-refs
@@ -323,10 +326,15 @@ skeleton.
               Remaining: sum/min/max on subquery (nAccumulator>0 bail —
               needs directMode column-store); flattenable case still
               wants 6.13(b)-fl.
-       [ ] **c) Compound-SELECT / CTE arm** — UNION / INTERSECT /
-            EXCEPT FROM-sources and `WITH … AS (…)` references.
-            CTE name resolution needs parser-side `WithAdd` / `CteNew`
-            to populate `pParse^.pWith` (tracked under 6.20).
+       [~] **c) Compound-SELECT / CTE arm** — UNION ALL arm of
+            multiSelect ported (select.c:2998..3050) at codegen.pas
+            sqlite3Select compound dispatch.  TK_ALL leaves recurse
+            with SF_Compound stripped; SRT_Output / SRT_Coroutine /
+            SRT_EphemTab / SRT_Table all populate.  Remaining:
+            UNION / INTERSECT / EXCEPT need multiSelectByMerge.
+            `WITH … AS (…)` non-recursive references still need
+            parser-side `WithAdd` / `CteNew` to populate
+            `pParse^.pWith` (tracked under 6.20).
 
 ---
 
