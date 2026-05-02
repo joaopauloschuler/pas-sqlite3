@@ -261,9 +261,12 @@ skeleton.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26):
     (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
-        because `destroyRootPage` calls `sqlite3NestedParse(UPDATE
-        sqlite_schema ...)` and productive `sqlite3Update` is still
-        skeleton-only.  This is the only remaining contributor.
+        because the `sqlite3NestedParse(UPDATE %Q.sqlite_schema SET
+        rootpage=%d WHERE …)` sub-statement emitted at codegen.pas:30076
+        runs through `gNestedRunParser` but the resulting program does
+        not productively rewrite sqlite_schema (sqlite3Update on system
+        tables is gated on Phase 7.1.1 schema reload).  Only remaining
+        contributor.
   [X] **6.12** port sqlite3Pragma in full.  Gate `DiagPragma` — all PASS.
        FOREIGN_KEY_LIST arm landed alongside a productive
        sqlite3CreateForeignKey body (FKey blob written via documented
@@ -353,32 +356,27 @@ skeleton.
             functions (currently the parse arms emit no-op
             bytecode).
 
-- [ ] **7.1.9** ALTER TABLE (alter.c):
-       [~] Port `sqlite3AlterFunctions` — `sqlite_fail`,
-            `sqlite_add_constraint`, `sqlite_find_constraint` registered.
-            Remaining 6 rows (sqlite_rename_column / _table /
-            renameTableTest, sqlite_drop_column, sqlite_rename_quotefix,
-            sqlite_drop_constraint) land with their bodies below.
+- [~] **7.1.9** ALTER TABLE (alter.c).  All five codegen entry points
+       are ported 1:1; end-to-end runtime parity is still gated on the
+       sqlite_rename_* SQL helpers (no bodies ported) and on Phase 7.1.1
+       (sqlite3InitOne — the schema reload after the NestedParse'd
+       UPDATE sqlite_master sub-statements is a no-op without it).
        [X] Port `sqlite3RenameTokenRemap`.
        [X] Port `sqlite3RenameExprlistUnmap`.
-       [ ] Port `sqlite3AlterRenameTable` (alter.c) — drives
-            RENAME TABLE: rewrites the schema row, fires the
-            sqlite_rename_table SQL function over every dependent
-            CREATE statement, invalidates cached statements.
-            (Moved here from old 6.27.)
-       [ ] Port `sqlite3AlterFinishAddColumn` (alter.c) — finalises
-            ADD COLUMN: appends the column to the schema row, runs
-            the new-column DEFAULT expression validation, bumps the
-            schema cookie.  Closes 6.10 step 9(g) ADD COLUMN.
-            (Moved here from old 6.27.)
-       [ ] Port `sqlite3AlterAddConstraint` (alter.c) — handles
-            ADD CONSTRAINT (CHECK / FOREIGN KEY / UNIQUE) by
-            re-emitting the schema row through sqlite_add_constraint.
-            (Moved here from old 6.27.)
-       [ ] Port `sqlite3AlterRenameColumn` (alter.c) — drives
-            RENAME COLUMN.  Closes 6.10 step 9(g) RENAME COLUMN.
-       [ ] Port `sqlite3AlterDropColumn` (alter.c) — drives DROP
-            COLUMN.
+       [X] Port `sqlite3AlterRenameTable` (codegen.pas:32527).
+       [X] Port `sqlite3AlterFinishAddColumn` (codegen.pas:32266).
+       [X] Port `sqlite3AlterAddConstraint` (codegen.pas:33144).
+       [X] Port `sqlite3AlterRenameColumn` (codegen.pas:32879).
+       [X] Port `sqlite3AlterDropColumn` (codegen.pas:32714).
+       [~] Port `sqlite3AlterFunctions` — `sqlite_fail`,
+            `sqlite_add_constraint`, `sqlite_find_constraint` registered.
+            Remaining 6 helpers (renameColumnFunc, renameTableFunc,
+            renameTableTest, dropColumnFunc, renameQuotefixFunc,
+            dropConstraintFunc — alter.c:1530..2519, each ~100-300 LOC
+            of CREATE-statement rewriting) still unregistered, so the
+            NestedParse'd `UPDATE sqlite_master SET sql =
+            sqlite_rename_*(...)` sub-statements emitted by the bodies
+            above fail at prepare time.  Closes 6.10 step 9(g).
 
 - [ ] **7.4b** Bytecode-diff scope of `TestParser.pas`.  Now that
   Phase 8.2 wires `sqlite3_prepare_v2` end-to-end, extend `TestParser`
