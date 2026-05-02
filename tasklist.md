@@ -302,10 +302,16 @@ skeleton.
   [~] **6.12** port sqlite3Pragma in full.  Gate `DiagPragma`.
        Direct PragTyp dispatch landed (TABLE_INFO / INDEX_INFO /
        INDEX_LIST / DATABASE_LIST / COLLATION_LIST / FUNCTION_LIST /
-       MODULE_LIST / PRAGMA_LIST / COMPILE_OPTIONS).  10 DiagPragma
-       divergences remain — all blocked on the eponymous-vtab path
-       (`SELECT … FROM pragma_table_info('t')`) which folds into 6.13
-       sub-FROM codegen.  FOREIGN_KEY_LIST blocked on TFKey opaque.
+       MODULE_LIST / PRAGMA_LIST / COMPILE_OPTIONS).  8 DiagPragma
+       divergences remain (was 10): a Pas-only `count(*) FROM
+       <eponymous-vtab>` fast path closed `database_list` /
+       `collation_list`.  Remaining gaps: (a) arg-bound vtabs
+       (`pragma_table_info('t')`, `pragma_table_xinfo('t')`,
+       `pragma_index_list('t')`, `pragma_foreign_key_list('c')`) need
+       hidden-column WHERE binding, blocked on WhereBegin's vtab branch;
+       (b) `count(*) >= N` shape (`function_list` / `module_list` /
+       `pragma_list` / `compile_options`) needs the general AggInfo
+       path over vtab.  FOREIGN_KEY_LIST also blocked on TFKey opaque.
        COMPILE_OPTIONS also needs `sqlite3azCompileOpt` populated.
 
   [ ] **6.13** Non-regular FROM-item codegen in `sqlite3Select`

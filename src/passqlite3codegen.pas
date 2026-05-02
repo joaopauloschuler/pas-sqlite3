@@ -20058,6 +20058,7 @@ var
   iDb:         i32;
   iCsr:        i32;
   regAgg:      i32;
+  regCount:    i32;
   { Aggregate-no-GROUP-BY locals — populated only when the SF_Aggregate
     path at codegen.pas:18696 lifts off (count(*) / sum / min / max with
     no GROUP BY / HAVING / DISTINCT / FILTER / ORDER-in-arg / NEEDCOLL). }
@@ -20612,6 +20613,75 @@ begin
         sqlite3VdbeAddOp2(v, OP_Count, iCsr, regAgg);
         sqlite3VdbeAddOp1(v, OP_Close, iCsr);
         sqlite3VdbeAddOp2(v, OP_Copy, regAgg, pDest^.iSdst);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, 1);
+        Result := SQLITE_OK; Exit;
+      end;
+    end;
+  end;
+
+  { Pas-only: count(*) FROM <eponymous-vtab> fast path.  C routes this
+    through the general agg path with WhereBegin's vtab branch (not yet
+    ported here).  Mirrors the eponymous-vtab arm below but accumulates
+    OP_AddImm into a counter register instead of emitting per-row
+    OP_ResultRow.  Closes the no-arg DiagPragma `count(*) FROM
+    pragma_xxx` divergences. }
+  if ((p^.selFlags and SF_Aggregate) <> 0)
+     and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
+     and (p^.pWhere = nil) and (p^.pGroupBy = nil) and (p^.pHaving = nil)
+     and (p^.pOrderBy = nil)
+     and (p^.pSrc <> nil) and (p^.pSrc^.nSrc = 1)
+     and (p^.pEList <> nil) and (p^.pEList^.nExpr = 1)
+     and (pDest^.eDest = SRT_Output)
+  then begin
+    pItem := SrcListItems(p^.pSrc);
+    pTab  := pItem^.pSTab;
+    if (pTab <> nil) and (pTab^.eTabType = TABTYP_VTAB)
+       and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)
+    then begin
+      pE := ExprListItems(p^.pEList)[0].pExpr;
+      if (pE <> nil) and (pE^.op = TK_FUNCTION) and (pE^.u.zToken <> nil)
+         and (sqlite3StrICmp(pE^.u.zToken, 'count') = 0)
+         and ((not ExprUseXList(pE)) or (pE^.x.pList = nil))
+         and ((pE^.flags and (EP_Distinct or EP_WinFunc)) = 0)
+      then begin
+        v := sqlite3GetVdbe(pParse);
+        if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
+        sqlite3GenerateColumnNames(pParse, p);
+        iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
+        if iDb >= 0 then sqlite3CodeVerifySchema(pParse, iDb);
+
+        if pItem^.iCursor < 0 then
+        begin
+          pItem^.iCursor := pParse^.nTab;
+          Inc(pParse^.nTab);
+        end;
+        iCsr := pItem^.iCursor;
+
+        sqlite3VdbeAddOp4(v, OP_VOpen, iCsr, 0, 0,
+          PAnsiChar(passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab))),
+          P4_VTAB);
+
+        Inc(pParse^.nMem); regAgg := pParse^.nMem;   { idxNum }
+        Inc(pParse^.nMem);                            { argc   }
+        Inc(pParse^.nMem); regCount := pParse^.nMem; { running counter }
+
+        sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg);
+        sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg + 1);
+        sqlite3VdbeAddOp2(v, OP_Integer, 0, regCount);
+
+        addrEnd := sqlite3VdbeMakeLabel(pParse);
+        addrTopOfLoop := sqlite3VdbeAddOp3(v, OP_VFilter, iCsr,
+                                           addrEnd, regAgg);
+        sqlite3VdbeAddOp2(v, OP_AddImm, regCount, 1);
+        sqlite3VdbeAddOp2(v, OP_VNext, iCsr, addrTopOfLoop + 1);
+
+        sqlite3VdbeResolveLabel(v, addrEnd);
+        sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+
+        pDest^.iSdst := pParse^.nMem + 1;
+        Inc(pParse^.nMem);
+        pDest^.nSdst := 1;
+        sqlite3VdbeAddOp2(v, OP_Copy, regCount, pDest^.iSdst);
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, 1);
         Result := SQLITE_OK; Exit;
       end;
