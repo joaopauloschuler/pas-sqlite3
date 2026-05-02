@@ -61,15 +61,11 @@ skeleton.
           (codegen.pas:15243..15280).
      [X] Drive `whereLoopAddAll` + `wherePathSolver` for the
           cost-based plan (codegen.pas:15429..15454).
-     [X] Single-table fast path: lift the nTabList=1 gate.  Site
-          #5 (a) lifted the viaCoroutine narrow case (commit
-          9861f05); site #5 (b) lifted the rest in commit 41167c7
-          (WHERE_OR_SUBCLAUSE recursion, virtual tables, INDEXED
-          BY / NOT INDEXED — every shape whereShortCut bails on
-          now routes through codeOneLoopStart).
-     [X] `not indexed` honour (DiagIndexing PASS, commit 41167c7).
-     [X] `INDEXED BY` honour — planner + codegen wired; DiagIndexing
-          `indexed by ok` PASS.
+     [X] Single-table fast path: every shape whereShortCut bails on
+          now routes through codeOneLoopStart (WHERE_OR_SUBCLAUSE
+          recursion, virtual tables, viaCoroutine, INDEXED BY / NOT
+          INDEXED).
+     [X] `not indexed` / `INDEXED BY` honour (DiagIndexing PASS).
      [ ] Multi-table loop nesting + per-loop WHERE-clause splitting
           (codeOneLoopStart already supports it; corpus parity
           deferred — TestExplainParity multi-table rows still
@@ -118,18 +114,11 @@ skeleton.
     - [ ] **b)** Collation-aware string compare (vdbeCompareMemString
       hook from btree.pas → vdbe.pas) — required only for non-BINARY
       collated index lookups;
-    - [ ] **c)** TUnpackedRecord layout reconcile (btree's slim record
-      vs. codegen's full record) for errCode/aSortFlags/BIGNULL/DESC
-      arms.  Existing slim layout is the lowest common denominator and
-      every caller writes through it; no current corpus exercises sort
-      flags or corruption flagging.
-      Partial 2026-04-29: aSortFlags KEYINFO_ORDER_DESC + BIGNULL
-      inversion arm ported into sqlite3VdbeRecordCompare in btree.pas
-      (reads pKeyInfo offset 24 for the aSortFlags pointer).  Active
-      end-to-end: GROUP BY ... ORDER BY DESC emits rows in DESC order
-      (DiagWindow `group order` PASS, verified 2026-04-29).
-      Remaining: errCode-bearing corruption signalling + the codegen
-      full-layout fields (u/n/r1/r2) that the slim layout still drops.
+    - [~] **c)** TUnpackedRecord layout reconcile (btree's slim record
+      vs. codegen's full record).  aSortFlags KEYINFO_ORDER_DESC +
+      BIGNULL inversion arm ported.  Remaining: errCode-bearing
+      corruption signalling + the full-layout fields (u/n/r1/r2) that
+      the slim layout still drops.
   
   [ ] **6.24** Aggregate-with-ORDER-BY codegen (select.c
        `analyzeAggregate` + `generateAggSelect`).  The
@@ -206,32 +195,21 @@ skeleton.
     - [ ] **6.10 step 6** Remaining TestExplainParity bytecode-Δ rows
        (7 diverges in 1019/1026 corpus):
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
-          asc/desc: C=19 Pas=20 (Δ=1); 2col: C=20 Pas=21 (Δ=1).
-          sqlite3ExprCodeExprList has all four ECEL arms;
-          structural-compare arm of resolveOrderGroupBy ported
-          2026-05-02 (resolve.c:1820..1833) — ORDER BY/GROUP BY terms
-          now get iOrderByCol set when their expr matches a result
-          column.  Closing Δ=1 still requires the nPrefixReg layout in
-          selectInnerLoop / pushOntoSorter so OMITREF drops the
-          duplicate Column read (select.c:1216 + select.c:771..782),
-          plus matching SorterOpen p2 (= nKey + nData + 1 for the
-          rowid/sequence slot).
+          Δ=1.  Closing requires nPrefixReg layout in selectInnerLoop /
+          pushOntoSorter so OMITREF drops the duplicate Column read
+          (select.c:1216 + select.c:771..782), plus matching SorterOpen
+          p2 (= nKey + nData + 1 for the rowid/sequence slot).
         [ ] `SELECT a FROM t GROUP BY a` — C=45 vs Pas=3
           (aggregate-group path not yet ported).
-        [ ] `SELECT a FROM (SELECT a FROM t)` — C=10 vs Pas=16.
-          Pas now emits the co-routine path (6.13(b) piece 4); C
-          flattens via `flattenSubquery`.  Closes once 6.13(b)-fl
-          lands.
-        [ ] `INSERT multi-row VALUES` — C=22 vs Pas=17.  Runtime
-          parity reached 2026-05-01 (DiagMultiValues count=3); Pas
-          unrolls the rows inline, C emits a coroutine.  Bytecode
-          parity needs the coroutine arm of sqlite3MultiValues if
-          wanted (deferred — runtime is correct).
-        [ ] `SELECT p FROM u;` — per-op divergence at op[1]
-          (C `OpenRead p1=1 p2=5` autoindex covering scan vs Pas
-          `p1=0 p2=4` table scan).  Root cause:
-          `whereLoopAddBtree` / `bestIndex` cost model not yet
-          considering covering indexes when no WHERE clause exists.
+        [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=6.  Pas emits the
+          co-routine path (6.13(b)); C flattens via `flattenSubquery`.
+          Closes once 6.13(b)-fl lands.
+        [ ] `INSERT multi-row VALUES` — Δ=5.  Runtime parity reached;
+          bytecode parity needs the coroutine arm of sqlite3MultiValues
+          (deferred — runtime is correct).
+        [ ] `SELECT p FROM u;` — `whereLoopAddBtree`/`bestIndex` cost
+          model does not yet pick a covering autoindex when there is no
+          WHERE clause; Pas emits a table scan, C emits autoindex.
   
   [ ] **6.10 step 7** Runtime divergences surfaced by `DiagMisc`.
       Silent result-set bugs (prep+step clean, wrong value).
@@ -254,20 +232,12 @@ skeleton.
         returns no row.  Compound-select codegen / sub-FROM
         materialisation gap (overlaps step 6 sub-FROM Δ=7 entry).
       [~] **f) WITH / CTE not productive** — simple non-recursive CTE
-        DONE 2026-05-02.  Recursive CTE still DIVERGES — needs the
-        recursive-CTE arm of resolveFromTermToCte (select.c:5760..5839)
-        plus compound SF_Recursive codegen.
+        works.  Recursive CTE still DIVERGES — needs the recursive-CTE
+        arm of resolveFromTermToCte (select.c:5760..5839) plus compound
+        SF_Recursive codegen.
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
-      [X] **h) CHECK constraint not enforced** — DONE 2026-05-01.
-      [X] **j) AFTER INSERT trigger does not fire** — DONE 2026-05-01.
-      [X] **k) `pragma_table_info(...)` table-valued function** —
-        DONE 2026-05-02.  Eponymous-vtab arms now evaluate
-        pItem^.u1.pFuncArg into the OP_VFilter argv slots; PRAGMA
-        value tokens dequoted (sqlite3NameFromToken-equivalent) so the
-        inner `PRAGMA table_info='t'` from pragmaVtabFilter sees the
-        bare identifier.
 
   [ ] **6.10 step 15** Runtime divergences surfaced by `DiagTxn`
       (transactions, savepoints, conflict resolution).  2 remain.
@@ -277,15 +247,6 @@ skeleton.
       [~] **c) `SAVEPOINT s; ROLLBACK TO s` does not unwind** —
         schema-cache side fixed.  Remaining: memdb pager savepoint
         reconciliation — btree pages not unwound on ROLLBACK TO.
-      [X] **d) `INSERT OR REPLACE` on UNIQUE column lookup fails** —
-        DONE 2026-05-02.  Root cause was unrelated to OR REPLACE:
-        `WHERE col=k` on a UNIQUE column was planned via the
-        whereShortCut rowid-EQ inline path (which only opens the
-        table cursor and emits SeekRowid treating k as a rowid),
-        because whereShortCut also matched the unique-EQ shape but
-        the inline shortcut had no codegen for WHERE_INDEXED.  Fix
-        at codegen.pas:15770 routes WHERE_INDEXED-positive plans
-        through the full planner instead.
 
   [ ] **6.10 step 17** Window-function and aggregate divergences
       surfaced by `DiagWindow`.  13 runtime empty-row divergences open.
@@ -295,20 +256,14 @@ skeleton.
         prepare cleanly but emit no rows** — `row_number() OVER (...)`
         same.  Window-codegen sub-issue under 6.26.
 
-  [ ] **6.10 step 19** DiagDml runtime probe — all 14 PASS.
-      [X] **a) `INSERT INTO t SELECT … UNION ALL SELECT …`** — DONE.
-        Bytecode parity deferred (coroutine arm of sqlite3MultiValues).
-      [X] **b) Multi-row VALUES with non-constant exprs** — DONE.
+  [X] **6.10 step 19** DiagDml runtime probe — all 14 PASS.
 
   [X] **6.10 step 26** DiagIndexing probe — DONE.  Minimal ORDER BY
-      sorter ported (SRT_Output, plain LIMIT, LIMIT+OFFSET).
-      Deferred sorter sub-arms (none in current corpus):
-      [X] DISTINCT + ORDER BY — DONE.
+      sorter ported (SRT_Output, plain LIMIT, LIMIT+OFFSET, DISTINCT,
+      nOBSat shortcut).
+      Deferred sub-arm (not in current corpus):
       [ ] Top-N sorter — currently pushes all rows then trims with
           DecrJumpZero.
-      [X] nOBSat shortcut — SorterOpen demoted to OP_Noop and sort tail
-          skipped when pWInfo^.nOBSat >= sortNKey (no-FROM ORDER BY and
-          any planner path that satisfies ordering naturally).
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
