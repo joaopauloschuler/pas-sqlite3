@@ -438,7 +438,17 @@ type
   { Remaining opaque stubs }
   PFuncDef2 = Pointer;   { FuncDef — Phase 6.6 }
   PIdList   = ^TIdList;  { IdList — defined below }
-  PCteUse   = Pointer;   { CteUse — Phase 6.5 }
+  PCteUse   = ^TCteUse;
+  { --- TCteUse (sizeof=20) — sqliteInt.h:4496 --- }
+  TCteUse = record
+    nUse:     i32;       { 4 @ 0  Number of users of this CTE }
+    addrM9e:  i32;       { 4 @ 4  Start of materialisation subroutine }
+    regRtn:   i32;       { 4 @ 8  Return-address register for addrM9e }
+    iCur:     i32;       { 4 @ 12 Ephemeral cursor holding materialisation }
+    nRowEst:  i16;       { 2 @ 16 LogEst row count }
+    eM10d:    u8;        { 1 @ 18 MATERIALIZED flag }
+    _pad:     u8;        { 1 @ 19 → record size 20 }
+  end;
   PSchema   = Pointer;   { Schema — opaque stub; use PSchemaTyped in implementation }
 
   { Phase 6.1: TParse forward pointer }
@@ -18677,6 +18687,7 @@ var
   pSel:  PSelect;
   pLeft: PSelect;
   zMsg:  PAnsiChar;
+  pCtUse: PCteUse;
 begin
   if pParse^.pWith = nil then begin Result := 0; Exit; end;
   if pParse^.nErr <> 0 then begin Result := 0; Exit; end;
@@ -18704,6 +18715,20 @@ begin
   Assert(pFrom^.pSTab = nil);
   pTab := PTable2(sqlite3DbMallocZero(db, SizeOf(TTable)));
   if pTab = nil then begin Result := 2; Exit; end;
+  pCtUse := pCt^.pUse;
+  if pCtUse = nil then
+  begin
+    pCtUse := PCteUse(sqlite3DbMallocZero(db, SizeOf(TCteUse)));
+    pCt^.pUse := pCtUse;
+    if (pCtUse = nil)
+       or (sqlite3ParserAddCleanup(pParse,
+             Pointer(@sqlite3DbFree), pCtUse) = nil) then
+    begin
+      sqlite3DbFree(db, pTab);
+      Result := 2; Exit;
+    end;
+    pCtUse^.eM10d := pCt^.eM10d;
+  end;
   pFrom^.pSTab     := pTab;
   pTab^.nTabRef    := 1;
   pTab^.zName      := sqlite3DbStrDup(db, pCt^.zName);
@@ -18730,6 +18755,8 @@ begin
   end;
   { Mark isCte (bit 1 of fgBits2). }
   pFrom^.fg.fgBits2 := pFrom^.fg.fgBits2 or u8($02);
+  pFrom^.u2.pCteUse := pCtUse;
+  Inc(pCtUse^.nUse);
 
   { Recurse into the CTE's SELECT to resolve its FROM/expressions before
     we read its result-set column names.  Set pCt^.zCteErr first so a
@@ -23761,8 +23788,8 @@ begin
     pItem^.fg.fgBits := pItem^.fg.fgBits and (not u8($02));
     sqlite3DbFree(db, pItem^.u1.zIndexedBy);
   end else if (pItem^.fg.fgBits2 and u8($02)) <> 0 then begin { isCte }
-    { TODO: pSrc->a[0].u2.pCteUse->nUse++ — TCteUse record not yet defined
-      in the Pas port; deferred until WITH/CTE codegen lands (Phase 6.20). }
+    if pItem^.u2.pCteUse <> nil then
+      Inc(pItem^.u2.pCteUse^.nUse);
   end;
 
   pSel := sqlite3SelectNew(pParse, pEList, pSelectSrc, pWhere,

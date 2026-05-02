@@ -234,7 +234,9 @@ skeleton.
       [~] **f) WITH / CTE not productive** — simple non-recursive CTE
         works.  Recursive CTE still DIVERGES — needs the recursive-CTE
         arm of resolveFromTermToCte (select.c:5760..5839) plus compound
-        SF_Recursive codegen.
+        SF_Recursive codegen.  TCteUse infrastructure ported (record
+        defined, pCteUse alloc + nUse++ wired in resolveFromTermToCte
+        and convertInRhsToSelect).
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
