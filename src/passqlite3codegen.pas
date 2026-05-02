@@ -24810,6 +24810,9 @@ var
   pTmp:           PSelect;
   isMulti:        Boolean;
   rowsOk:         Boolean;
+  endOfLoop:      i32;
+  regCols:        i32;
+  addrIpkBefore:  i32;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -25108,6 +25111,48 @@ begin
                                                 (pCurRow=nil) → no user value. }
     end;
 
+    { Per-row endOfLoop label (insert.c:1442).  Trigger jumps and
+      constraint-failure ignoreDest land here; OP_Next / yield-bottom
+      land just past it.  Allocated per Pascal-loop iteration so that
+      one row's BEFORE-trigger abort doesn't skip subsequent rows. }
+    endOfLoop := sqlite3VdbeMakeLabel(pParse);
+
+    { BEFORE / INSTEAD OF trigger fire (insert.c:1442..1499).
+      Build the NEW.* pseudo-table at regCols..regCols+nCol (rowid at
+      regCols, columns at regCols+1..), apply table affinity, then
+      dispatch via sqlite3CodeRowTrigger.  No-op today because
+      trgGetRowTrigger returns nil (codeRowTrigger / getRowTrigger
+      port pending — Phase 6.23), so the structural wiring lights up
+      automatically when that lands. }
+    if (tmask and TRIGGER_BEFORE) <> 0 then
+    begin
+      regCols := sqlite3GetTempRange(pParse, i32(pTab^.nCol) + 1);
+      if pTab^.iPKey < 0 then
+        sqlite3VdbeAddOp2(v, OP_Integer, -1, regCols)
+      else
+      begin
+        sqlite3VdbeAddOp2(v, OP_SCopy, regData + i32(pTab^.iPKey), regCols);
+        addrIpkBefore := sqlite3VdbeAddOp1(v, OP_NotNull, regCols);
+        sqlite3VdbeAddOp2(v, OP_Integer, -1, regCols);
+        sqlite3VdbeJumpHere(v, addrIpkBefore);
+        sqlite3VdbeAddOp1(v, OP_MustBeInt, regCols);
+      end;
+
+      { Copy NEW.* column values from regData..regData+nNVCol-1 into
+        regCols+1..  C uses OP_Copy with p3 = nNVCol-1 (count-1). }
+      if pTab^.nNVCol >= 1 then
+        sqlite3VdbeAddOp3(v, OP_Copy, regData, regCols + 1,
+                          i32(pTab^.nNVCol) - 1);
+
+      if not (isView <> 0) then
+        sqlite3TableAffinity(v, pTab, regCols + 1);
+
+      sqlite3CodeRowTrigger(pParse, pTrg, TK_INSERT, nil, TRIGGER_BEFORE,
+        pTab, regCols - i32(pTab^.nCol) - 1, onError, endOfLoop);
+
+      sqlite3ReleaseTempRange(pParse, regCols, i32(pTab^.nCol) + 1);
+    end;
+
     { Rowid emission (insert.c:1488..1531).  See banner above the
       single-row implementation for the (a)/(b)/(c) breakdown. }
     if not (isView <> 0) then
@@ -25150,6 +25195,16 @@ begin
 
     if regRowCount <> 0 then
       sqlite3VdbeAddOp2(v, OP_AddImm, regRowCount, 1);
+
+    { AFTER trigger fire (insert.c:1604..1608).  Base register layout:
+      reg = regData-2-nCol → NEW base = reg + nCol+1 = regRowid, with
+      rowid at regRowid and columns at regRowid+1..regRowid+nCol.
+      Same dead-code-today caveat as BEFORE; structurally faithful to C. }
+    if pTrg <> nil then
+      sqlite3CodeRowTrigger(pParse, pTrg, TK_INSERT, nil, TRIGGER_AFTER,
+        pTab, regData - 2 - i32(pTab^.nCol), onError, endOfLoop);
+
+    sqlite3VdbeResolveLabel(v, endOfLoop);
   end;
 
   { sqlite3AutoincrementEnd — emit the sqlite_sequence write-back epilogue

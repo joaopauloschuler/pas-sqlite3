@@ -193,9 +193,24 @@ skeleton.
           `CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x)`
           now writes `seq=3` to sqlite_sequence (was 0); matches C
           reference exactly.
-     [ ] BEFORE / AFTER INSERT triggers — already ported as
-          `sqlite3CodeRowTrigger` but not yet wired into this
-          path.
+     [~] BEFORE / AFTER INSERT triggers — structurally wired into
+          sqlite3Insert 2026-05-01.  Per-row body now allocates a
+          per-iteration endOfLoop label, builds the NEW.* pseudo-
+          table at regCols when tmask & TRIGGER_BEFORE (rowid
+          placeholder + OP_Copy of nNVCol cols + sqlite3TableAffinity),
+          calls sqlite3CodeRowTrigger TRIGGER_BEFORE before rowid
+          emission, calls sqlite3CodeRowTrigger TRIGGER_AFTER after
+          regRowCount bump, and resolves endOfLoop at row tail.
+          Mirrors insert.c:1442..1499 + 1604..1608 1:1.
+          Dead code today: trgGetRowTrigger (codegen.pas:22374)
+          returns nil because codeRowTrigger / getRowTrigger
+          (trigger.c:1231 / :1347 — the trigger-body compiler that
+          builds TriggerPrg + SubProgram and recursively invokes
+          sqlite3Insert/Update/DeleteFrom for trigger steps) is still
+          a stub.  Closing those will light up triggers across the
+          board (this wiring + the matching wiring already present in
+          sqlite3Update/sqlite3DeleteFrom).  Tracked as Phase 6.23
+          follow-on.
      [ ] RETURNING clause emission — DiagDml RETURNING corpus.
      [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
      [ ] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
