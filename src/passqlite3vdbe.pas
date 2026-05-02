@@ -7034,6 +7034,11 @@ var
   bBusyCk:   i32;
   rcCk:      i32;
   iCk:       i32;
+  { OP_JournalMode locals (vdbe.c:8054) }
+  jmEnew:    i32;
+  jmEold:    i32;
+  jmBt:      PBtree;
+  jmPager:   PPager;
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -9944,14 +9949,39 @@ begin
       sqlite3VdbeMemSetInt64(@aMem[pOp^.p3 + 2], i64(aResCk[2]));
     end;
 
-    { ────── OP_Vacuum / OP_JournalMode ────── stubs.
-      OP_Vacuum needs sqlite3RunVacuum (vacuum.c — not yet ported);
-      OP_JournalMode needs sqlite3PagerSetJournalMode wiring (pager.c —
-      partial).  Return OK with a dummy out2 register so basic SQL testing
-      does not crash; full ports tracked under Phase 6.27 / 6.28. }
-    OP_Vacuum, OP_JournalMode: begin
+    { ────── OP_Vacuum ────── stub.
+      OP_Vacuum needs sqlite3RunVacuum (vacuum.c — not yet ported); return
+      OK so basic SQL testing does not crash.  Full port tracked under
+      Phase 6.27. }
+    OP_Vacuum: begin
       pOut := out2Prerelease(v, pOp);
       pOut^.u.i := 0;
+    end;
+
+    { ────── OP_JournalMode ────── (vdbe.c:8054) — port of the non-WAL-
+      transition arms of the C body.  WAL→other and other→WAL transitions
+      need sqlite3PagerCloseWal (pager.c, not ported); those silently demote
+      to the existing mode, matching the result that
+      sqlite3PagerOkToChangeJournalMode=0 path produces in C. }
+    OP_JournalMode: begin
+      pOut := out2Prerelease(v, pOp);
+      jmEnew := pOp^.p3;
+      jmBt := PBtree(db^.aDb[pOp^.p1].pBt);
+      jmPager := sqlite3BtreePager(jmBt);
+      jmEold := sqlite3PagerGetJournalMode(jmPager);
+      if jmEnew = PAGER_JOURNALMODE_QUERY then jmEnew := jmEold;
+      if sqlite3PagerOkToChangeJournalMode(jmPager) = 0 then jmEnew := jmEold;
+      { WAL transition arm omitted (pager.PagerCloseWal not ported);
+        if either side is WAL, keep the existing mode. }
+      if (jmEnew <> jmEold) and
+         ((jmEold = PAGER_JOURNALMODE_WAL) or (jmEnew = PAGER_JOURNALMODE_WAL))
+      then jmEnew := jmEold;
+      jmEnew := sqlite3PagerSetJournalMode(jmPager, jmEnew);
+      pOut^.flags := MEM_Str or MEM_Static or MEM_Term;
+      pOut^.z     := PAnsiChar(sqlite3JournalModename(jmEnew));
+      pOut^.n     := sqlite3Strlen30(PChar(pOut^.z));
+      pOut^.enc   := SQLITE_UTF8;
+      sqlite3VdbeChangeEncoding(pOut, enc);
     end;
 
     { ────── OP_SqlExec ────── (vdbe.c:7064) }

@@ -197,8 +197,14 @@ skeleton.
             with OP_Vacuum / OP_JournalMode; now inlines sqlite3Checkpoint
             (per-aDb sqlite3BtreeCheckpoint loop) and writes the busy /
             nLog / nCkpt triple into mem[p3..p3+2] per the C reference.
-            OP_Vacuum + OP_JournalMode keep the no-op stub (gated on
-            sqlite3RunVacuum / sqlite3PagerSetJournalMode wiring).
+       [X] Port OP_JournalMode body (vdbe.c:8054) — non-WAL-transition arms
+            ported.  Calls sqlite3PagerGetJournalMode / OkToChangeJournalMode
+            / SetJournalMode, writes sqlite3JournalModename(eNew) to the
+            out2 register.  WAL→other and other→WAL transitions silently
+            keep the existing mode (sqlite3PagerCloseWal not ported);
+            matches the C result that sqlite3PagerOkToChangeJournalMode=0
+            produces.  OP_Vacuum keeps the no-op stub (sqlite3RunVacuum
+            unported).
 
 ### Open Bugs
 
