@@ -4995,15 +4995,18 @@ end;
   returned register directly as the expression value. }
 function sqlite3CodeSubselect(pParse: PParse; pExpr: PExpr): i32;
 var
-  v:         PVdbe;
-  addrOnce:  i32;
-  rReg:      i32;
-  pSel:      PSelect;
-  dest:      TSelectDest;
-  nReg:      i32;
-  pLimitE:   PExpr;   { new limit expression (avoids clash with pSel^.pLimit) }
-  pLeft:     PExpr;
-  db:        PTsqlite3;
+  v:               PVdbe;
+  addrOnce:        i32;
+  addrExplain:     i32;
+  savedAddrExplain:i32;
+  zMsg:            PAnsiChar;
+  rReg:            i32;
+  pSel:            PSelect;
+  dest:            TSelectDest;
+  nReg:            i32;
+  pLimitE:         PExpr;   { new limit expression (avoids clash with pSel^.pLimit) }
+  pLeft:           PExpr;
+  db:              PTsqlite3;
 begin
   v := pParse^.pVdbe;
   Assert(v <> nil);
@@ -5039,6 +5042,23 @@ begin
     addrOnce := sqlite3VdbeAddOp0(v, OP_Once);
   end;
 
+  { ExplainQueryPlan2 (expr.c:3903) — emit the per-subroutine
+    "[CORRELATED ]SCALAR SUBQUERY %d" OP_Explain so EQP-style children
+    inside the sub-SELECT can chain off this address via pParse^.addrExplain.
+    Save/restore addrExplain around the inner sqlite3Select so the parent
+    EQP context of the caller is preserved (Pas's sqlite3Select does not
+    yet pair Push/Pop reliably). }
+  db := pParse^.db;
+  savedAddrExplain := pParse^.addrExplain;
+  if addrOnce <> 0 then
+    zMsg := sqlite3MPrintf(db, 'SCALAR SUBQUERY %d', [pSel^.selId])
+  else
+    zMsg := sqlite3MPrintf(db, 'CORRELATED SCALAR SUBQUERY %d', [pSel^.selId]);
+  addrExplain := sqlite3VdbeCurrentAddr(v);
+  sqlite3VdbeAddOp4(v, OP_Explain, addrExplain, savedAddrExplain, 0,
+                    zMsg, P4_DYNAMIC);
+  pParse^.addrExplain := addrExplain;
+
   { Allocate result register(s) and initialise the SelectDest. }
   if pExpr^.op = TK_SELECT then
     nReg := pSel^.pEList^.nExpr
@@ -5069,7 +5089,6 @@ begin
 
   { Limit handling (expr.c:3933..3955).  Augment the sub-SELECT with
     LIMIT 1 so the engine stops after the first qualifying row. }
-  db := pParse^.db;
   if pSel^.pLimit <> nil then
   begin
     pLeft := pSel^.pLimit^.pLeft;
@@ -5095,11 +5114,13 @@ begin
   { Run the sub-SELECT. }
   if sqlite3Select(pParse, pSel, @dest) <> 0 then
   begin
+    pParse^.addrExplain := savedAddrExplain;
     pExpr^.op2 := pExpr^.op;
     pExpr^.op  := TK_ERROR;
     Result := 0;
     Exit;
   end;
+  pParse^.addrExplain := savedAddrExplain;
 
   pExpr^.iTable := dest.iSDParm;
   rReg          := dest.iSDParm;
