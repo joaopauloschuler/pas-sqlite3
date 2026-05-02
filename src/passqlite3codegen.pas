@@ -18752,6 +18752,77 @@ begin
   Result := 1;
 end;
 
+{ select.c:5513 — convertCompoundSelectToSubquery.  When a compound SELECT
+  has an ORDER BY whose terms include an explicit COLLATE clause, rewrite
+  the whole compound into `SELECT * FROM (compound) ORDER BY ...` so the
+  collation only applies to the outer ordering pass.  Faithful port; the
+  iOrderByCol pre-set guard guards against re-entry by the window-func
+  rewrite path (left in for parity even though pPrior=0 for window
+  rewrites in this build). }
+function convertCompoundSelectToSubquery(pWalker: PWalker; p: PSelect): i32; cdecl;
+var
+  i:       i32;
+  pNew:    PSelect;
+  pX:      PSelect;
+  db:      PTsqlite3;
+  a:       PExprListItem;
+  pNewSrc: PSrcList;
+  pPse:    PParse;
+  dummy:   TToken;
+begin
+  if p^.pPrior   = nil then begin Result := WRC_Continue; Exit; end;
+  if p^.pOrderBy = nil then begin Result := WRC_Continue; Exit; end;
+  pX := p;
+  while (pX <> nil) and ((pX^.op = TK_ALL) or (pX^.op = TK_SELECT)) do
+    pX := pX^.pPrior;
+  if pX = nil then begin Result := WRC_Continue; Exit; end;
+  a := ExprListItems(p^.pOrderBy);
+  if a[0].u.x.iOrderByCol <> 0 then begin Result := WRC_Continue; Exit; end;
+  i := p^.pOrderBy^.nExpr - 1;
+  while i >= 0 do
+  begin
+    if (a[i].pExpr^.flags and EP_Collate) <> 0 then break;
+    Dec(i);
+  end;
+  if i < 0 then begin Result := WRC_Continue; Exit; end;
+
+  { Transformation required. }
+  pPse  := pWalker^.pParse;
+  db    := pPse^.db;
+  pNew   := PSelect(sqlite3DbMallocZero(db, SizeOf(TSelect)));
+  if pNew = nil then begin Result := WRC_Abort; Exit; end;
+  FillChar(dummy, SizeOf(dummy), 0);
+  pNewSrc := sqlite3SrcListAppendFromTerm(pPse, nil, nil, nil, @dummy,
+                                          pNew, nil, nil);
+  Assert((pNewSrc <> nil) or (pPse^.nErr <> 0));
+  if pPse^.nErr <> 0 then
+  begin
+    sqlite3SrcListDelete(db, pNewSrc);
+    Result := WRC_Abort;
+    Exit;
+  end;
+  pNew^         := p^;
+  p^.pSrc       := pNewSrc;
+  p^.pEList     := sqlite3ExprListAppend(pPse, nil,
+                     sqlite3Expr(db, TK_ASTERISK, nil));
+  p^.op         := TK_SELECT;
+  p^.pWhere     := nil;
+  pNew^.pGroupBy := nil;
+  pNew^.pHaving  := nil;
+  pNew^.pOrderBy := nil;
+  p^.pPrior     := nil;
+  p^.pNext      := nil;
+  p^.pWith      := nil;
+  p^.pWinDefn   := nil;
+  p^.selFlags   := p^.selFlags and not SF_Compound;
+  Assert((p^.selFlags and SF_Converted) = 0);
+  p^.selFlags   := p^.selFlags or SF_Converted;
+  Assert(pNew^.pPrior <> nil);
+  pNew^.pPrior^.pNext := pNew;
+  pNew^.pLimit  := nil;
+  Result := WRC_Continue;
+end;
+
 procedure sqlite3SelectExpand(pParse: PParse; pSelect: PSelect);
 var
   w:        TWalker;
@@ -18769,7 +18840,7 @@ begin
   w.xExprCallback := TExprCallback(@sqlite3ExprWalkNoop);
   if pParse^.parseFlags and PARSEFLAG_HasCompound <> 0 then
   begin
-    w.xSelectCallback := nil; { convertCompoundSelectToSubquery stub }
+    w.xSelectCallback := @convertCompoundSelectToSubquery;
     w.xSelectCallback2 := nil;
     sqlite3WalkSelect(@w, pSelect);
   end;
