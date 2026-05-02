@@ -18855,7 +18855,25 @@ begin
   { Recurse into the CTE's SELECT to resolve its FROM/expressions before
     we read its result-set column names.  Set pCt^.zCteErr first so a
     self-reference inside the CTE body trips the zCteErr arm above on
-    re-entry instead of looping forever (select.c:5793..5840). }
+    re-entry instead of looping forever (select.c:5793..5840).
+
+    For SF_Recursive with explicit `r(col,...)` column list — populate
+    pTab^.aCol from pCt^.pCols BEFORE prep'ing the compound, so the
+    recursive arm's column references (e.g. `n` in `SELECT n+1 FROM r`)
+    resolve via the now-populated pTab^.aCol attached on the recursive
+    SrcItem.  Mirrors the C order in select.c:5793..5839: walk setup
+    term, set columns, walk whole compound.  In Pas we collapse that
+    to: set columns up-front (when explicit), then a single SelectPrep
+    of the whole compound.  When pCt^.pCols is nil (no explicit list)
+    we fall back to the prior single-pass path; that case still fails
+    for recursive CTEs but the explicit-column form covers the common
+    `WITH RECURSIVE r(...) AS (...)` shape. }
+  if ((pSel^.selFlags and SF_Recursive) <> 0) and (pCt^.pCols <> nil)
+     and (pTab^.nCol = 0) then
+  begin
+    sqlite3ColumnsFromExprList(pParse, pCt^.pCols, @pTab^.nCol, @pTab^.aCol);
+    if pParse^.nErr <> 0 then begin Result := 2; Exit; end;
+  end;
   pCt^.zCteErr := PAnsiChar('circular reference: %s');
   sqlite3SelectPrep(pParse, pSel, nil);
   pCt^.zCteErr := nil;
@@ -18881,7 +18899,9 @@ begin
     end;
     pEList := pCt^.pCols;
   end;
-  sqlite3ColumnsFromExprList(pParse, pEList, @pTab^.nCol, @pTab^.aCol);
+  { Skip if columns were already populated up-front for the recursive arm. }
+  if pTab^.nCol = 0 then
+    sqlite3ColumnsFromExprList(pParse, pEList, @pTab^.nCol, @pTab^.aCol);
   Result := 1;
 end;
 

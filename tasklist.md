@@ -245,10 +245,13 @@ skeleton.
         INTERSECT / EXCEPT (need multiSelectByMerge), and
         `SELECT 1 UNION SELECT 2` dedup.  Folds into 6.13(c).
       [~] **f) WITH / CTE not productive** — simple non-recursive CTE
-        works.  Recursive CTE still DIVERGES — recursion-detection arm
-        of resolveFromTermToCte ported (select.c:5760..5791): self-refs
-        get isRecursive + shared iRecTab cursor; multiple-references
-        error matches C.  Remaining: compound SF_Recursive codegen.
+        works.  Recursive CTE preps cleanly (recursion-detection arm of
+        resolveFromTermToCte + early pTab^.aCol from explicit pCt^.pCols
+        so recursive arm column refs resolve).  Runtime still DIVERGES:
+        compound SF_Recursive codegen (generateWithRecursiveQuery —
+        select.c:2680..2826) unported, so `WITH RECURSIVE r(n) AS
+        (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<5) SELECT count(*)
+        FROM r` returns 0 instead of 5.
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
