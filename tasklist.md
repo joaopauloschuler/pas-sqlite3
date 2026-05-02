@@ -510,7 +510,16 @@ skeleton.
       C reference: select.c:730 (pushOntoSorter) and select.c:1673
       (generateSortTail).
       Deferred sorter sub-arms (none in current corpus):
-      [ ] DISTINCT + ORDER BY — current slice bails when iTabTnct>=0.
+      [X] DISTINCT + ORDER BY — DONE 2026-05-02.  Lifted the
+          `iTabTnct < 0` gate at codegen.pas:21097 so the sorter opens
+          even when SF_Distinct is set.  DISTINCT dedup runs in the
+          inner loop on the result-register block before the row is
+          pushed onto the sorter; generateSortTail then emits one
+          OP_ResultRow per unique row in ORDER BY order.  Smoke:
+          `SELECT DISTINCT a FROM t ORDER BY a` over a 6-row table
+          (3,1,2,1,3,2) returns 1,2,3 — matches C oracle.  No
+          regressions: TestExplainParity 1019/1026, TestDMLBasic 54/0,
+          TestSchemaBasic 44/0, DiagIndexing 0 diverges.
       [ ] Top-N sorter — currently pushes all rows then trims with
           DecrJumpZero.
       [ ] nOBSat shortcut — when the planner reports the loop already

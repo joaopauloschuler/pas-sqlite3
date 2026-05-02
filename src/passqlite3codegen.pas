@@ -21094,7 +21094,7 @@ begin
     index — the nOBSat shortcut is deferred. }
   bSort := 0; iSorterCsr := -1; sortNKey := 0;
   if (p^.pOrderBy <> nil) and (pDest^.eDest = SRT_Output)
-     and (not isExists) and (iTabTnct < 0) then
+     and (not isExists) then
   begin
     bSort := 1;
     iSorterCsr := pParse^.nTab; Inc(pParse^.nTab);
