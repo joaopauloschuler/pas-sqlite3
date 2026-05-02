@@ -8076,6 +8076,35 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       ResolveExpr(items[i].pExpr);
   end;
 
+  { resolve.c:1778 integer-arm — for any ORDER BY / GROUP BY term that is
+    an integer literal in [1, 0xffff], mark iOrderByCol so the subsequent
+    sqlite3ResolveOrderGroupBy call rewrites it into a copy of the iCol-th
+    result-set expression.  Without this, "ORDER BY 1" codes a literal
+    Integer 1 and the sort becomes a no-op. }
+  procedure ResolveIntegerOrderByCol(pList: PExprList);
+  var
+    i, iCol: i32;
+    items: PExprListItem;
+    pE2: PExpr;
+  begin
+    if (pList = nil) or (p^.pEList = nil) then Exit;
+    items := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+    begin
+      if items[i].u.x.iOrderByCol <> 0 then Continue;
+      pE2 := sqlite3ExprSkipCollateAndLikely(items[i].pExpr);
+      if pE2 = nil then Continue;
+      if sqlite3ExprIsInteger(pE2, @iCol, nil) <> 0 then
+      begin
+        if (iCol >= 1) and (iCol <= $FFFF) then
+          items[i].u.x.iOrderByCol := u16(iCol);
+        { Out-of-range integers are left for sqlite3ResolveOrderGroupBy /
+          downstream codegen to flag; iOrderByCol stays 0 so the term keeps
+          its literal-Integer form. }
+      end;
+    end;
+  end;
+
 begin
   if (pParse = nil) or (p = nil) then Exit;
   if pParse^.db^.mallocFailed <> 0 then Exit;
@@ -8084,6 +8113,18 @@ begin
   ResolveExprList(p^.pGroupBy);
   ResolveExpr    (p^.pHaving);
   ResolveExprList(p^.pOrderBy);
+
+  { Integer-arm tagging + alias rewrite for ORDER BY / GROUP BY (resolve.c:2042). }
+  if p^.pOrderBy <> nil then
+  begin
+    ResolveIntegerOrderByCol(p^.pOrderBy);
+    sqlite3ResolveOrderGroupBy(pParse, p, p^.pOrderBy, 'ORDER');
+  end;
+  if p^.pGroupBy <> nil then
+  begin
+    ResolveIntegerOrderByCol(p^.pGroupBy);
+    sqlite3ResolveOrderGroupBy(pParse, p, p^.pGroupBy, 'GROUP');
+  end;
 
   { resolve.c:2079 — once ON clauses have been spliced into pWhere
     (selectExpander tags Select with SF_OnToWhere when it does this),

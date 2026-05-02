@@ -641,14 +641,20 @@ skeleton.
       1019/7, DiagFeatureProbe 6 div (was 6), DiagDml 13/1 unchanged,
       DiagWindow 13 div unchanged.
       Deferred sorter sub-arms (none in current corpus):
-      [ ] `ORDER BY <integer>` resolution — `resolveOrderGroupBy`
-          (resolve.c:1778) is defined but not wired into resolution
-          path; the integer arm sets pItem.u.x.iOrderByCol so
-          `sqlite3ResolveOrderGroupBy` (codegen.pas:8214) can rewrite
-          to a copy of the result-set expression.  Without it,
-          `ORDER BY 1` codes a literal Integer 1 and the sort becomes
-          a no-op.  Add to 6.10 step 9 silent-bug list when a corpus
-          row exercises it.
+      [X] `ORDER BY <integer>` / `GROUP BY <integer>` resolution —
+          DONE 2026-05-02.  Added `ResolveIntegerOrderByCol` nested
+          proc inside `sqlite3ResolveSelectNames`
+          (passqlite3codegen.pas ~8079) that mirrors the integer-arm
+          of resolve.c:1808..1817: walks pOrderBy/pGroupBy after
+          ResolveExprList, calls sqlite3ExprIsInteger, sets
+          `iOrderByCol := iCol` for literal integer terms in
+          [1, 0xFFFF].  Then invokes `sqlite3ResolveOrderGroupBy`
+          for both clauses so the alias-rewrite arm fires.  Verified
+          via standalone probe: `SELECT a FROM t ORDER BY 1` /
+          `... ORDER BY 1 DESC` now sort rows correctly (was no-op
+          previously).  Regressions green: TestExplainParity 1019/7,
+          TestDMLBasic 54/0, TestSchemaBasic 44/0, TestSelectBasic
+          60/0, TestWhereBasic 52/0.
       [ ] DISTINCT + ORDER BY — current slice bails when iTabTnct>=0.
       [X] LIMIT + ORDER BY pushdown (top-N sorter) — DONE 2026-05-02.
           Plain `ORDER BY ... LIMIT N` (no OFFSET) enables the sorter
