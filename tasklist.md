@@ -521,22 +521,30 @@ skeleton.
         statements are no-ops on the Pas side (no write-transaction
         bookkeeping in `sqlite3VdbeHalt`); blocked on Phase 5.4 full
         VdbeHalt port.
-      [ ] **c) `SAVEPOINT s; ...; ROLLBACK TO s` does not unwind** —
-        DiagTxn `savepoint rollback`.  Partial 2026-04-29: OP_Savepoint
-        ported to a faithful 1:1 of vdbe.c:3823 (now calls
-        sqlite3BtreeTripAllCursors + sqlite3BtreeSavepoint per attached
-        db, plus sqlite3VtabSavepoint and the schema-change reload arm);
-        btreeBeginTrans (btree.c:3793) now passes db->nSavepoint to
-        sqlite3PagerOpenSavepoint instead of a hard-coded 0, so the
-        pager savepoint stack is actually populated.  Failure mode
-        flipped from "rollback no-op (count=2 vs 1)" to "subsequent
-        prepare fails with stale schema" — root cause is that
-        DBFLAG_SchemaChange is set by CREATE TABLE but never cleared at
-        commit (build.c:663/675 not yet ported into VdbeHalt /
-        sqlite3CommitInternal), so the rollback arm sees the flag and
-        triggers ResetAllSchemasOfConnection.  Closing this needs the
-        commit-time DBFLAG_SchemaChange clear plus likely memdb pager
-        savepoint reconciliation.
+      [~] **c) `SAVEPOINT s; ...; ROLLBACK TO s` does not unwind** —
+        DiagTxn `savepoint rollback`.  Partial 2026-05-02: commit-time
+        DBFLAG_SchemaChange clear now wired into sqlite3VdbeHalt
+        (vdbeaux.c:3435) — gated on db^.autoCommit so it only fires when
+        the auto-commit completes (matches C semantics; intermediate
+        statements inside an explicit BEGIN..COMMIT do not clear the
+        flag).  Standalone probe (CREATE TABLE; INSERT 1; SAVEPOINT s1;
+        INSERT 2; ROLLBACK TO s1; RELEASE s1; SELECT count(*)) flips
+        prep-side rc from SQLITE_ERROR ("stale schema, no such table")
+        to SQLITE_OK — schema cache survives the savepoint rollback.
+        Failure mode now: prep=0 step=11 (SQLITE_CORRUPT) — the btree
+        pages themselves are not unwound by the savepoint rollback,
+        likely the memdb pager savepoint stack reconciliation gap noted
+        previously.  DiagTxn-harness hang at this probe is unchanged
+        and pre-existing (not in build.sh; tracked in
+        feedback_diagtxn_hang).
+        Earlier (2026-04-29) progress retained: OP_Savepoint ported
+        1:1 of vdbe.c:3823 (sqlite3BtreeTripAllCursors +
+        sqlite3BtreeSavepoint per attached db, sqlite3VtabSavepoint,
+        schema-change reload arm); btreeBeginTrans (btree.c:3793)
+        passes db->nSavepoint to sqlite3PagerOpenSavepoint.
+        Remaining: memdb pager savepoint reconciliation (btree pages
+        are not unwound on ROLLBACK TO) — needed to flip the probe
+        from step=CORRUPT to count=1.
       [X] **d) `INSERT OR IGNORE` / `OR REPLACE` / `OR FAIL` ignore
         conflict resolution** — DONE 2026-05-01.  Root cause: the call
         to `sqlite3GenerateConstraintChecks` in `sqlite3Insert`

@@ -4090,6 +4090,20 @@ begin
     sqlite3VdbeSetChanges(v^.db, v^.nChange);
     v^.nChange := 0;
   end;
+  { vdbeaux.c:3435 — clear DBFLAG_SchemaChange after a successful commit.
+    The full sqlite3VdbeHalt commit/rollback bookkeeping (Phase 5.4) is not
+    yet ported, but the schema-change-flag clear is the load-bearing piece
+    for SAVEPOINT ROLLBACK after a prior CREATE TABLE: without it, the
+    OP_Savepoint rollback arm sees the stale flag from the long-since-
+    committed CREATE TABLE and fires sqlite3ResetAllSchemasOfConnection,
+    which invalidates the cached schema and breaks subsequent prepares.
+    Safe to clear unconditionally on halt: at this point the statement
+    has finished and any in-flight schema mutation is either committed
+    (flag should clear) or rolled back (flag is irrelevant). }
+  if (v <> nil) and (v^.db <> nil) and (v^.rc = SQLITE_OK)
+     and (PTsqlite3(v^.db)^.autoCommit <> 0) then
+    PTsqlite3(v^.db)^.mDbFlags :=
+      PTsqlite3(v^.db)^.mDbFlags and not u32(DBFLAG_SchemaChange);
   v^.eVdbeState := VDBE_HALT_STATE;
   Result := SQLITE_OK;
 end;
