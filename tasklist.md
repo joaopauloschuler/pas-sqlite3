@@ -474,18 +474,31 @@ skeleton.
         triggers ResetAllSchemasOfConnection.  Closing this needs the
         commit-time DBFLAG_SchemaChange clear plus likely memdb pager
         savepoint reconciliation.
-      [ ] **d) `INSERT OR IGNORE` / `OR REPLACE` / `OR FAIL` ignore
-        conflict resolution** — DiagTxn `insert or ignore unique`,
-        `insert or replace unique`, `insert or fail returns err` all
-        diverge.  GenerateConstraintChecks now emits OP_Halt P5; the
-        remaining gap is wiring/runtime — re-triage post 6.8.6.
-      [ ] **e) IPK alias auto-rowid increment** — DiagTxn `integer
-        primary key alias`: `INSERT INTO t(id INTEGER PRIMARY KEY, x)
-        VALUES(7,'a'); INSERT VALUES(NULL,'b')` should set id=8 (next
-        rowid past max), Pas sets id=2 (sequential).
-      [ ] **f) `changes()` returns 0 after UPDATE** — DiagTxn
-        `changes() after update`.  sqlite3Update is now ported
-        (6.8.1 done); re-triage.
+      [X] **d) `INSERT OR IGNORE` / `OR REPLACE` / `OR FAIL` ignore
+        conflict resolution** — DONE 2026-05-01.  Root cause: the call
+        to `sqlite3GenerateConstraintChecks` in `sqlite3Insert`
+        (codegen.pas:25434) passed `ignoreDest=0` instead of the
+        per-row `endOfLoop` label.  OE_Ignore would emit
+        `OP_Goto 0,0` looping back to address 0 forever; OR REPLACE /
+        OR FAIL were similarly miswired.  Fixed at codegen.pas:25435 —
+        OR IGNORE now skips the duplicate row, OR REPLACE replaces it,
+        OR FAIL returns SQLITE_CONSTRAINT_UNIQUE.  Verified via
+        standalone probe (count=2 across all three modes); regressions
+        green: TestDMLBasic 54/0, TestSchemaBasic 44/0,
+        TestExplainParity 1019/7 (was 1018, +1 pass on the
+        `INSERT IPK alias u` row), DiagDml 13/1 unchanged,
+        DiagIndexing 38/4 unchanged, DiagFeatureProbe 9/9 unchanged.
+      [X] **e) IPK alias auto-rowid increment** — verified 2026-05-01
+        via standalone probe.  Pas correctly returns id=8 for
+        `INSERT INTO t(id INTEGER PRIMARY KEY, x) VALUES(7,'a');
+        INSERT VALUES(NULL,'b')`.  The OP_NewRowid runtime walks to
+        BtreeLast and increments the integer key, matching C 1:1.
+        Tasklist entry was stale (DiagTxn hangs prevent automated
+        verification — see `feedback_diagtxn_hang`).
+      [X] **f) `changes()` returns 0 after UPDATE** — verified
+        2026-05-01 via standalone probe.  Pas returns 2 matching C
+        for `CREATE TABLE t(a); INSERT 1; INSERT 2; UPDATE t SET a=99;
+        SELECT changes()`.  Closed by the 6.8.1 sqlite3Update port.
 
   [ ] **6.10 step 17** Window-function and aggregate divergences surfaced
       by the new `src/tests/DiagWindow.pas` probe (run with

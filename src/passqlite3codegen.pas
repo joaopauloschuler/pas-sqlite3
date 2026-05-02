@@ -25432,7 +25432,7 @@ begin
       if (pTab^.iPKey >= 0) and ipkColumnPresent then pkChng := 1 else pkChng := 0;
       if (pTab^.iPKey >= 0) and ipkColumnPresent then appendBias := 0 else appendBias := 1;
       sqlite3GenerateConstraintChecks(pParse, pTab, aRegIdx, iDataCur, iIdxCur,
-        regIns, 0, pkChng, u8(onError), 0,
+        regIns, 0, pkChng, u8(onError), endOfLoop,
         @bMayReplace, nil, pUpsert);
       sqlite3CompleteInsertion(pParse, pTab, iDataCur, iIdxCur, regIns,
         aRegIdx, 0, appendBias, ord(not bMayReplace));
