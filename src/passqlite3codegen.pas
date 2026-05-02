@@ -18688,6 +18688,12 @@ var
   pLeft: PSelect;
   zMsg:  PAnsiChar;
   pCtUse: PCteUse;
+  pRecTerm: PSelect;
+  bMayRecursive: i32;
+  iRecTab: i32;
+  pSrcItems: PSrcItem;
+  pRecItem:  PSrcItem;
+  ii:    i32;
 begin
   if pParse^.pWith = nil then begin Result := 0; Exit; end;
   if pParse^.nErr <> 0 then begin Result := 0; Exit; end;
@@ -18757,6 +18763,55 @@ begin
   pFrom^.fg.fgBits2 := pFrom^.fg.fgBits2 or u8($02);
   pFrom^.u2.pCteUse := pCtUse;
   Inc(pCtUse^.nUse);
+
+  { Recursive-CTE detection (select.c:5760..5791).  Walk the compound
+    chain looking for self-references; mark each as isRecursive and
+    assign the shared iRecTab cursor.  Multiple recursive references
+    on the same compound term are an error.  Codegen for SF_Recursive
+    is still pending (see 6.10 step 9(f)) — this arm only marks the
+    state so detection/error reporting matches the reference. }
+  iRecTab := -1;
+  pRecTerm := pSel;
+  if (pSel^.op = TK_ALL) or (pSel^.op = TK_UNION) then bMayRecursive := 1
+  else bMayRecursive := 0;
+  while (bMayRecursive <> 0) and (pRecTerm^.op = pSel^.op) do
+  begin
+    Assert(pRecTerm^.pPrior <> nil);
+    pSrcItems := SrcListItems(pRecTerm^.pSrc);
+    for ii := 0 to pRecTerm^.pSrc^.nSrc - 1 do
+    begin
+      pRecItem := PSrcItem(PByte(pSrcItems) + ii * SizeOf(TSrcItem));
+      if (pRecItem^.zName <> nil)
+         and ((pRecItem^.fg.fgBits3 and u8($02)) = 0)             { not hadSchema }
+         and ((pRecItem^.fg.fgBits and u8($04)) = 0)              { not isSubquery }
+         and (((pRecItem^.fg.fgBits3 and u8($01)) <> 0)           { fixedSchema }
+              or (pRecItem^.u4.zDatabase = nil))
+         and (sqlite3StrICmp(pRecItem^.zName, pCt^.zName) = 0) then
+      begin
+        pRecItem^.pSTab := pTab;
+        Inc(pTab^.nTabRef);
+        pRecItem^.fg.fgBits := pRecItem^.fg.fgBits or u8($80);   { isRecursive }
+        if (pRecTerm^.selFlags and SF_Recursive) <> 0 then
+        begin
+          zMsg := sqlite3MPrintf(db,
+            'multiple references to recursive table: %s', [pCt^.zName]);
+          if zMsg <> nil then begin
+            sqlite3ErrorMsg(pParse, zMsg);
+            sqlite3DbFree(db, zMsg);
+          end;
+          Result := 2; Exit;
+        end;
+        pRecTerm^.selFlags := pRecTerm^.selFlags or SF_Recursive;
+        if iRecTab < 0 then begin
+          iRecTab := pParse^.nTab;
+          Inc(pParse^.nTab);
+        end;
+        pRecItem^.iCursor := iRecTab;
+      end;
+    end;
+    if (pRecTerm^.selFlags and SF_Recursive) = 0 then break;
+    pRecTerm := pRecTerm^.pPrior;
+  end;
 
   { Recurse into the CTE's SELECT to resolve its FROM/expressions before
     we read its result-set column names.  Set pCt^.zCteErr first so a

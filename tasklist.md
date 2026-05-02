@@ -232,11 +232,10 @@ skeleton.
         returns no row.  Compound-select codegen / sub-FROM
         materialisation gap (overlaps step 6 sub-FROM Δ=7 entry).
       [~] **f) WITH / CTE not productive** — simple non-recursive CTE
-        works.  Recursive CTE still DIVERGES — needs the recursive-CTE
-        arm of resolveFromTermToCte (select.c:5760..5839) plus compound
-        SF_Recursive codegen.  TCteUse infrastructure ported (record
-        defined, pCteUse alloc + nUse++ wired in resolveFromTermToCte
-        and convertInRhsToSelect).
+        works.  Recursive CTE still DIVERGES — recursion-detection arm
+        of resolveFromTermToCte ported (select.c:5760..5791): self-refs
+        get isRecursive + shared iRecTab cursor; multiple-references
+        error matches C.  Remaining: compound SF_Recursive codegen.
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
