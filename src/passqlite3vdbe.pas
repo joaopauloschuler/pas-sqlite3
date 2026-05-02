@@ -10025,14 +10025,21 @@ begin
     { ────── OP_ColumnsUsed ────── — hint only, no-op }
     OP_ColumnsUsed: begin end;
 
-    { ────── OP_Offset ────── (vdbe.c:2931) }
+    { ────── OP_Offset ────── (vdbe.c:2931) — port of vdbe.c case OP_Offset }
     OP_Offset: begin
       pCur := v^.apCsr[pOp^.p1];
       if (pCur = nil) or (pCur^.eCurType <> CURTYPE_BTREE) then
         sqlite3VdbeMemSetNull(@aMem[pOp^.p3])
       else begin
-        sqlite3VdbeMemSetInt64(@aMem[pOp^.p3], 0);
-        { Full B-tree offset computation deferred to Phase 6 }
+        if pCur^.deferredMoveto <> 0 then begin
+          rc := sqlite3VdbeFinishMoveto(pCur);
+          if rc <> 0 then goto abort_due_to_error;
+        end;
+        if sqlite3BtreeEof(pCur^.uc.pCursor) <> 0 then
+          sqlite3VdbeMemSetNull(@aMem[pOp^.p3])
+        else
+          sqlite3VdbeMemSetInt64(@aMem[pOp^.p3],
+            sqlite3BtreeOffset(pCur^.uc.pCursor));
       end;
     end;
 

@@ -190,6 +190,9 @@ skeleton.
        marked as "stub" that was missed (catch-all).
        [X] Wire `sqlite3ResetOneSchema` retry into `sqlite3LockAndPrepare`
             (prepare.c:865-866) — DONE.
+       [X] Port OP_Offset body (vdbe.c:2931) — was a Phase-2 stub that
+            always wrote 0; now drives sqlite3VdbeFinishMoveto +
+            sqlite3BtreeEof + sqlite3BtreeOffset, matching the C reference.
 
 ### Open Bugs
 
