@@ -37913,34 +37913,177 @@ begin
   { Phase 7 }
 end;
 
-{ fkey.c:1145 — sqlite3FkRequired.  Returns non-zero if FK processing is
-  required for the DELETE/UPDATE on pTab.
+{ fkey.c:799 — fkChildIsModified.  Walk pFKey's child-side column map; return
+  non-zero if any child column referenced by the FK is being modified by the
+  current UPDATE (aChange[iCol] >= 0 means modified, -1 means untouched).
+  Rowid-aliased PK matches via bChngRowid.  Faithful 1:1.
+  PFKey is opaque (Pointer); access via byte offsets documented in
+  sqlite3FkLocateIndex (codegen.pas:38120). }
+function fkChildIsModified(pTab: PTable2; pFKey: Pointer;
+  aChange: Pi32; bChngRowid: i32): i32;
+const
+  FKEY_NCOL_OFFSET    = 40;
+  FKEY_ACOL_OFFSET    = 64;
+  FKEY_SCOLMAP_SIZE   = 16;
+  FKEY_SCOL_IFROM     = 0;
+var
+  i, iChildKey, n: i32;
+  pFKb: Pu8;
+begin
+  Result := 0;
+  pFKb := Pu8(pFKey);
+  n := PInt32(pFKb + FKEY_NCOL_OFFSET)^;
+  for i := 0 to n - 1 do
+  begin
+    iChildKey := PInt32(pFKb + FKEY_ACOL_OFFSET + i*FKEY_SCOLMAP_SIZE
+                         + FKEY_SCOL_IFROM)^;
+    if (aChange + iChildKey)^ >= 0 then begin Result := 1; Exit; end;
+    if (iChildKey = pTab^.iPKey) and (bChngRowid <> 0) then
+    begin Result := 1; Exit; end;
+  end;
+end;
 
-  Current scope: DELETE arm (aChange=nil) is fully ported.  UPDATE arm
-  requires per-FKey column-mask walks via fkChildIsModified /
-  fkParentIsModified, both of which need a fully-defined TFKey record
-  (TFKey is still PFKey = Pointer in this port — see codegen.pas:418).
-  Until TFKey lands, UPDATE returns 0 = "no FK action required".  Safe
-  because (a) PRAGMA foreign_keys defaults to OFF in the Pas port and
-  no current test enables it, and (b) sqlite3FkCheck/sqlite3FkActions
-  are still no-op stubs, so even an over-approximation here would not
-  emit real FK enforcement code. }
+{ fkey.c:826 — fkParentIsModified.  pTab is the parent of pFKey; return
+  non-zero if any parent-side column referenced by the FK is being modified
+  by the current UPDATE.  zCol=NULL means "PRIMARY KEY" — match any column
+  carrying COLFLAG_PRIMKEY.  Faithful 1:1. }
+function fkParentIsModified(pTab: PTable2; pFKey: Pointer;
+  aChange: Pi32; bChngRowid: i32): i32;
+const
+  FKEY_NCOL_OFFSET    = 40;
+  FKEY_ACOL_OFFSET    = 64;
+  FKEY_SCOLMAP_SIZE   = 16;
+  FKEY_SCOL_ZCOL      = 8;
+var
+  i, iKey, n: i32;
+  zKey: PAnsiChar;
+  pCol: PColumn;
+  pFKb: Pu8;
+begin
+  Result := 0;
+  pFKb := Pu8(pFKey);
+  n := PInt32(pFKb + FKEY_NCOL_OFFSET)^;
+  for i := 0 to n - 1 do
+  begin
+    zKey := PPAnsiChar(pFKb + FKEY_ACOL_OFFSET + i*FKEY_SCOLMAP_SIZE
+                        + FKEY_SCOL_ZCOL)^;
+    for iKey := 0 to i32(pTab^.nCol) - 1 do
+    begin
+      if ((aChange + iKey)^ >= 0)
+         or ((iKey = pTab^.iPKey) and (bChngRowid <> 0)) then
+      begin
+        pCol := @pTab^.aCol[iKey];
+        if zKey <> nil then
+        begin
+          if sqlite3StrICmp(pCol^.zCnName, zKey) = 0 then
+          begin Result := 1; Exit; end;
+        end
+        else if (pCol^.colFlags and COLFLAG_PRIMKEY) <> 0 then
+        begin Result := 1; Exit; end;
+      end;
+    end;
+  end;
+end;
+
+{ fkey.c:855 — isSetNullAction.  Returns 1 iff pParse is currently coding
+  the body of a SET NULL action trigger belonging to pFKey.  Used by the
+  child-side INSERT path to suppress NOT NULL constraint promotion when the
+  trigger is itself the source of the NULLs.  Faithful 1:1. }
+function isSetNullAction(pParse: PParse; pFKey: Pointer): i32;
+const
+  FKEY_AACTION_OFFSET   = 45;
+  FKEY_APTRIGGER0_OFFSET= 48;
+  FKEY_APTRIGGER1_OFFSET= 56;
+var
+  pTop: PParse;
+  pTrg: PTrigger;
+  pFKb: Pu8;
+  aAction0, aAction1: u8;
+  pTrigger0, pTrigger1: PTrigger;
+begin
+  Result := 0;
+  pTop := sqlite3ParseToplevel(pParse);
+  if pTop^.pTriggerPrg = nil then Exit;
+  pTrg := pTop^.pTriggerPrg^.pTrigger;
+  pFKb := Pu8(pFKey);
+  pTrigger0 := PPointer(pFKb + FKEY_APTRIGGER0_OFFSET)^;
+  pTrigger1 := PPointer(pFKb + FKEY_APTRIGGER1_OFFSET)^;
+  aAction0 := (pFKb + FKEY_AACTION_OFFSET)^;
+  aAction1 := (pFKb + FKEY_AACTION_OFFSET + 1)^;
+  if ((pTrg = pTrigger0) and (aAction0 = OE_SetNull))
+     or ((pTrg = pTrigger1) and (aAction1 = OE_SetNull)) then
+  begin
+    AssertH((pTop^.db^.flags and SQLITE_FkNoAction) = 0,
+            'isSetNullAction: SET NULL trigger reached with FkNoAction set');
+    Result := 1;
+  end;
+end;
+
+{ fkey.c:1145 — sqlite3FkRequired.  Returns non-zero if FK processing is
+  required for the DELETE/UPDATE on pTab.  DELETE arm = 1 if pTab is
+  parent or child of any FK.  UPDATE arm = 1 if any modified column is a
+  child- or parent-key column; promote to 2 (full check) when (a) a child
+  FK self-references pTab, or (b) a parent-side modification has any ON
+  UPDATE action other than NO ACTION (and FkNoAction is not forcing
+  silence).  Faithful 1:1 of fkey.c:1145..1186. }
 function sqlite3FkRequired(pParse: PParse; pTab: PTable2;
   aChange: Pi32; chngRowid: i32): i32;
+const
+  FKEY_PNEXTFROM_OFFSET = 8;
+  FKEY_ZTO_OFFSET       = 16;
+  FKEY_PNEXTTO_OFFSET   = 24;
+  FKEY_AACTION_OFFSET   = 45;
 var
   bHaveFK: i32;
+  eRet:    i32;
+  p:       Pu8;
+  zTo:     PAnsiChar;
+  aAction1: u8;
 begin
   bHaveFK := 0;
+  eRet    := 1;
   if ((pParse^.db^.flags and SQLITE_ForeignKeys) <> 0)
      and (pTab <> nil) and (pTab^.eTabType = TABTYP_NORM) then
   begin
-    if aChange = nil then begin
+    if aChange = nil then
+    begin
       if (sqlite3FkReferences(pTab) <> nil) or (pTab^.u.tab.pFKey <> nil) then
         bHaveFK := 1;
+    end
+    else
+    begin
+      { UPDATE arm — child-key modifications. }
+      p := Pu8(pTab^.u.tab.pFKey);
+      while p <> nil do
+      begin
+        if fkChildIsModified(pTab, p, aChange, chngRowid) <> 0 then
+        begin
+          zTo := PPAnsiChar(p + FKEY_ZTO_OFFSET)^;
+          if (zTo <> nil) and (sqlite3_stricmp(pTab^.zName, zTo) = 0) then
+            eRet := 2;
+          bHaveFK := 1;
+        end;
+        p := PPointer(p + FKEY_PNEXTFROM_OFFSET)^;
+      end;
+      { UPDATE arm — parent-key modifications. }
+      p := Pu8(sqlite3FkReferences(pTab));
+      while p <> nil do
+      begin
+        if fkParentIsModified(pTab, p, aChange, chngRowid) <> 0 then
+        begin
+          aAction1 := (p + FKEY_AACTION_OFFSET + 1)^;  { aAction[1] = ON UPDATE }
+          if ((pParse^.db^.flags and SQLITE_FkNoAction) = 0)
+             and (aAction1 <> OE_None) then
+          begin
+            Result := 2; Exit;
+          end;
+          bHaveFK := 1;
+        end;
+        p := PPointer(p + FKEY_PNEXTTO_OFFSET)^;
+      end;
     end;
-    { UPDATE arm deferred — see comment above. }
   end;
-  if bHaveFK <> 0 then Result := 1 else Result := 0;
+  if bHaveFK <> 0 then Result := eRet else Result := 0;
 end;
 
 { fkey.c:688 — fkTriggerDelete.  Frees a CASCADE/SET NULL/SET DEFAULT
