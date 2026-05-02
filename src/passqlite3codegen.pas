@@ -18434,7 +18434,6 @@ begin
     for i := 0 to pSrc^.nSrc - 1 do
     begin
       pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
-
       { Subquery FROM-item arm — when SrcItem is flagged as a subquery,
         recursively prepare the inner SELECT then materialise a Table*
         from its result columns via sqlite3ExpandSubquery.  Mirrors the
@@ -18465,10 +18464,14 @@ begin
       end;
 
       { Skip non-base items — subquery / CTE source items have no
-        zName, vtab items have a populated pSubq.  Their resolution
-        is deferred. }
+        zName.  IS_SUBQUERY items are handled in the arm above; reaching
+        here with no zName means a CTE / vtab source item whose resolution
+        is deferred.  Do NOT key on `pItem^.u4.pSubq <> nil` here — the
+        u4 union also holds pSchema / zDatabase when IS_SUBQUERY is clear,
+        so a non-nil u4 in a regular table item (e.g. one whose fixedSchema
+        bit is set) would otherwise skip LocateTableItem and leave pSTab
+        nil, breaking column resolution. }
       if pItem^.zName = nil then Continue;
-      if pItem^.u4.pSubq <> nil then Continue;
       if pItem^.pSTab = nil then
       begin
         { Mirror selectExpander (select.c:6022) — locate the table by

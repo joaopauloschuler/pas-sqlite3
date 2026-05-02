@@ -407,7 +407,20 @@ skeleton.
         (..., pTab^.u.view_pSelect, 1)` and recursively expanded.
         Verified: schema row "CREATE view v AS SELECT a FROM t" is
         written and on reload `pTab^.u.view_pSelect` is repopulated;
-        `SELECT * FROM v` prepares cleanly.  Remaining gap: the
+        `SELECT a FROM v` / `SELECT * FROM v` prepare cleanly
+        (DiagFeatureProbe `CREATE VIEW + plain SELECT FROM v` flips
+        chkPrep=1 → chkPrep=0 as of 2026-05-01; runtime still returns
+        no rows because the codegen sub-FROM materialise / co-routine
+        path is not driven for view items — same gap as below).
+        Side fix 2026-05-01: `sqlite3SelectExpand` was skipping
+        `LocateTableItem` for any FROM item whose `u4` slot read
+        non-nil, but `u4` is a union (pSubq / pSchema / zDatabase)
+        and the canonical gate is `fg.isSubquery` — the prior
+        `if pItem^.u4.pSubq <> nil then Continue` misfired whenever
+        a regular table item carried a fixedSchema pointer in `u4`
+        (the case after `sqlite3SelectDup` of a view body), leaving
+        pSTab nil and producing `no such column` at resolve time.
+        Remaining gap: the
         agg-no-GROUP-BY gates (codegen.pas:18968 / :19025) reject FROM
         items where `fgBits & SRCITEM_FG_IS_SUBQUERY`, so
         `count(*) FROM v` falls through to the Init/Halt/Goto trivial
