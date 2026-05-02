@@ -38469,10 +38469,285 @@ begin
   end;
 end;
 
+procedure fkTriggerDelete(dbMem: PTsqlite3; p: PTrigger); forward;
+
+{ fkey.c:1217 — fkActionTrigger.  Synthesise (and cache in
+  pFKey^.apTrigger[iAction]) the Trigger structure that implements the
+  ON DELETE / ON UPDATE action for one foreign key whose parent is pTab.
+  iAction = (pChanges<>nil): 0 for DELETE, 1 for UPDATE.
+
+  RESTRICT  → SELECT RAISE("FOREIGN KEY constraint failed") FROM child WHERE …
+  CASCADE   → DELETE / UPDATE child rows
+  SET NULL  → UPDATE child SET col = NULL WHERE …
+  SET DEFAULT → UPDATE child SET col = <default> WHERE …
+  NO ACTION → no trigger, returns nil.
+
+  Uses the documented PFKey byte-offset layout (PFKey is opaque Pointer in
+  this port; see codegen.pas:418 + sqlite3FkLocateIndex). }
+function fkActionTrigger(pParse: PParse; pTab: PTable2; pFKey: Pointer;
+  pChanges: PExprList): PTrigger;
+const
+  FKEY_PFROM_OFFSET     = 0;
+  FKEY_NCOL_OFFSET      = 40;
+  FKEY_AACTION_OFFSET   = 45;
+  FKEY_APTRIGGER0_OFFSET= 48;
+  FKEY_ACOL_OFFSET      = 64;
+  FKEY_SCOLMAP_SIZE     = 16;
+  FKEY_SCOL_IFROM       = 0;
+var
+  db:        PTsqlite3;
+  iAction:   i32;
+  action:    i32;
+  pTrg:      PTrigger;
+  pFKb:      Pu8;
+  pIdxL:     PIndex2;
+  aiCol:     Pi32;
+  pStep:     PTriggerStep;
+  pWhere:    PExpr;
+  pList:     PExprList;
+  pSel:      PSelect;
+  pWhen:     PExpr;
+  pFrom:     PTable2;
+  zFrom:     PAnsiChar;
+  nFrom:     i32;
+  i, nCol:   i32;
+  iFromCol:  i32;
+  iToCol:    i32;
+  tOld:      TToken;
+  tNew:      TToken;
+  tFromCol:  TToken;
+  tToCol:    TToken;
+  pEq:       PExpr;
+  pNew:      PExpr;
+  pCol:      PColumn;
+  pDflt:     PExpr;
+  pRaise:    PExpr;
+  pSrc:      PSrcList;
+  pItem:     PSrcItem;
+  pStepSrc:  PSrcList;
+  pStepItem: PSrcItem;
+  ppIdxRaw:  Pointer;
+  paiColRaw: Pointer;
+begin
+  Result   := nil;
+  db       := pParse^.db;
+  pFKb     := Pu8(pFKey);
+  if pChanges <> nil then iAction := 1 else iAction := 0;
+  action   := i32((pFKb + FKEY_AACTION_OFFSET + iAction)^);
+  if (db^.flags and SQLITE_FkNoAction) <> 0 then action := OE_None;
+  if (action = OE_Restrict) and ((db^.flags and SQLITE_DeferFKs) <> 0) then
+    Exit;
+  pTrg := PTrigger(PPointer(pFKb + FKEY_APTRIGGER0_OFFSET + iAction*8)^);
+
+  if (action <> OE_None) and (pTrg = nil) then
+  begin
+    pIdxL    := nil;
+    aiCol    := nil;
+    pStep    := nil;
+    pWhere   := nil;
+    pList    := nil;
+    pSel     := nil;
+    pWhen    := nil;
+    pFrom    := PTable2(PPointer(pFKb + FKEY_PFROM_OFFSET)^);
+    nCol     := PInt32(pFKb + FKEY_NCOL_OFFSET)^;
+
+    ppIdxRaw  := nil;
+    paiColRaw := nil;
+    if sqlite3FkLocateIndex(pParse, pTab, pFKey, @ppIdxRaw, @paiColRaw) <> 0 then
+      Exit;
+    pIdxL := PIndex2(ppIdxRaw);
+    aiCol := Pi32(paiColRaw);
+    AssertH((aiCol <> nil) or (nCol = 1), 'fkActionTrigger: aiCol invariant');
+
+    for i := 0 to nCol - 1 do
+    begin
+      tOld.z := 'old'; tOld.n := 3; tOld._pad := 0;
+      tNew.z := 'new'; tNew.n := 3; tNew._pad := 0;
+      if aiCol <> nil then
+        iFromCol := (aiCol + i)^
+      else
+        iFromCol := PInt32(pFKb + FKEY_ACOL_OFFSET +
+          0*FKEY_SCOLMAP_SIZE + FKEY_SCOL_IFROM)^;
+      AssertH(iFromCol >= 0, 'fkActionTrigger: iFromCol>=0');
+      AssertH((pIdxL <> nil) or ((pTab^.iPKey >= 0) and (pTab^.iPKey < i32(pTab^.nCol))),
+              'fkActionTrigger: pIdxL/iPKey');
+      if pIdxL <> nil then
+        iToCol := pIdxL^.aiColumn[i]
+      else
+        iToCol := pTab^.iPKey;
+      sqlite3TokenInit(@tToCol,   pTab^.aCol[iToCol].zCnName);
+      sqlite3TokenInit(@tFromCol, pFrom^.aCol[iFromCol].zCnName);
+
+      { OLD.zToCol = zFromCol  — parent term on LHS so parent affinity wins. }
+      pEq := sqlite3PExpr(pParse, TK_EQ,
+          sqlite3PExpr(pParse, TK_DOT,
+            sqlite3ExprAlloc(db, TK_ID, @tOld,   0),
+            sqlite3ExprAlloc(db, TK_ID, @tToCol, 0)),
+          sqlite3ExprAlloc(db, TK_ID, @tFromCol, 0));
+      pWhere := sqlite3ExprAnd(pParse, pWhere, pEq);
+
+      if pChanges <> nil then
+      begin
+        pEq := sqlite3PExpr(pParse, TK_IS,
+            sqlite3PExpr(pParse, TK_DOT,
+              sqlite3ExprAlloc(db, TK_ID, @tOld,   0),
+              sqlite3ExprAlloc(db, TK_ID, @tToCol, 0)),
+            sqlite3PExpr(pParse, TK_DOT,
+              sqlite3ExprAlloc(db, TK_ID, @tNew,   0),
+              sqlite3ExprAlloc(db, TK_ID, @tToCol, 0)));
+        pWhen := sqlite3ExprAnd(pParse, pWhen, pEq);
+      end;
+
+      if (action <> OE_Restrict)
+         and ((action <> OE_Cascade) or (pChanges <> nil)) then
+      begin
+        if action = OE_Cascade then
+        begin
+          pNew := sqlite3PExpr(pParse, TK_DOT,
+            sqlite3ExprAlloc(db, TK_ID, @tNew,   0),
+            sqlite3ExprAlloc(db, TK_ID, @tToCol, 0));
+        end
+        else if action = OE_SetDflt then
+        begin
+          pCol := @pFrom^.aCol[iFromCol];
+          if (pCol^.colFlags and COLFLAG_GENERATED) <> 0 then
+            pDflt := nil
+          else
+            pDflt := sqlite3ColumnExpr(pFrom, pCol);
+          if pDflt <> nil then
+            pNew := sqlite3ExprDup(db, pDflt, 0)
+          else
+            pNew := sqlite3ExprAlloc(db, TK_NULL, nil, 0);
+        end
+        else
+        begin
+          pNew := sqlite3ExprAlloc(db, TK_NULL, nil, 0);
+        end;
+        pList := sqlite3ExprListAppend(pParse, pList, pNew);
+        sqlite3ExprListSetName(pParse, pList, @tFromCol, 0);
+      end;
+    end;
+    sqlite3DbFree(Psqlite3db(db), aiCol);
+
+    zFrom := pFrom^.zName;
+    nFrom := sqlite3Strlen30(zFrom);
+
+    if action = OE_Restrict then
+    begin
+      pRaise := sqlite3Expr(db, TK_STRING, 'FOREIGN KEY constraint failed');
+      pRaise := sqlite3PExpr(pParse, TK_RAISE, pRaise, nil);
+      if pRaise <> nil then
+        pRaise^.affExpr := AnsiChar(OE_Abort);
+      pSrc := sqlite3SrcListAppend(pParse, nil, nil, nil);
+      if pSrc <> nil then
+      begin
+        pItem := SrcListItems(pSrc);
+        pItem^.zName := sqlite3DbStrDup(db, zFrom);
+        pItem^.fg.fgBits3 := pItem^.fg.fgBits3 or u8($01); { fixedSchema }
+        pItem^.u4.pSchema := pTab^.pSchema;
+      end;
+      pSel := sqlite3SelectNew(pParse,
+          sqlite3ExprListAppend(pParse, nil, pRaise),
+          pSrc, pWhere, nil, nil, nil, 0, nil);
+      pWhere := nil;
+    end;
+
+    { DisableLookaside — see passqlite3util.pas:2473 }
+    Inc(db^.lookaside.bDisable);
+    db^.lookaside.sz := 0;
+
+    pTrg := PTrigger(sqlite3DbMallocZero(db,
+      u64(SizeOf(TTrigger) + SizeOf(TTriggerStep))));
+    if pTrg <> nil then
+    begin
+      pStep := PTriggerStep(PByte(pTrg) + SizeOf(TTrigger));
+      pTrg^.step_list := pStep;
+      pStepSrc := sqlite3SrcListAppend(pParse, nil, nil, nil);
+      pStep^.pSrc := pStepSrc;
+      if pStepSrc <> nil then
+      begin
+        pStepItem := SrcListItems(pStepSrc);
+        pStepItem^.zName := sqlite3DbStrNDup(db, zFrom, u64(nFrom));
+        pStepItem^.u4.pSchema := pTab^.pSchema;
+        pStepItem^.fg.fgBits3 := pStepItem^.fg.fgBits3 or u8($01); { fixedSchema }
+      end;
+      pStep^.pWhere    := sqlite3ExprDup(db, pWhere, EXPRDUP_REDUCE);
+      pStep^.pExprList := sqlite3ExprListDup(db, pList, EXPRDUP_REDUCE);
+      pStep^.pSelect   := sqlite3SelectDup(db, pSel,   EXPRDUP_REDUCE);
+      if pWhen <> nil then
+      begin
+        pWhen := sqlite3PExpr(pParse, TK_NOT, pWhen, nil);
+        pTrg^.pWhen := sqlite3ExprDup(db, pWhen, EXPRDUP_REDUCE);
+      end;
+    end;
+
+    { EnableLookaside — see passqlite3util.pas:2493 }
+    if db^.lookaside.bDisable > 0 then
+      Dec(db^.lookaside.bDisable);
+    if db^.lookaside.bDisable = 0 then
+      db^.lookaside.sz := db^.lookaside.szTrue;
+
+    sqlite3ExprDelete(Psqlite3db(db), pWhere);
+    sqlite3ExprDelete(Psqlite3db(db), pWhen);
+    sqlite3ExprListDelete(Psqlite3db(db), pList);
+    sqlite3SelectDelete(Psqlite3db(db), pSel);
+    if db^.mallocFailed = 1 then
+    begin
+      fkTriggerDelete(db, pTrg);
+      Exit;
+    end;
+    AssertH(pStep <> nil, 'fkActionTrigger: pStep<>nil');
+    AssertH(pTrg <> nil, 'fkActionTrigger: pTrg<>nil');
+
+    case action of
+      OE_Restrict:
+        pStep^.op := TK_SELECT;
+      OE_Cascade:
+        if pChanges = nil then
+          pStep^.op := TK_DELETE
+        else
+          pStep^.op := TK_UPDATE;
+    else
+      pStep^.op := TK_UPDATE;
+    end;
+    pStep^.pTrig := pTrg;
+    pTrg^.pSchema := pTab^.pSchema;
+    pTrg^.pTabSchema := pTab^.pSchema;
+    PPointer(pFKb + FKEY_APTRIGGER0_OFFSET + iAction*8)^ := pTrg;
+    if pChanges <> nil then
+      pTrg^.op := TK_UPDATE
+    else
+      pTrg^.op := TK_DELETE;
+  end;
+
+  Result := pTrg;
+end;
+
+{ fkey.c:1419 — sqlite3FkActions.  When deleting / updating a row of pTab,
+  iterate every FK that references pTab; if the FK has an action and (for
+  UPDATE) the modified columns include a parent-key column, emit the
+  CASCADE / SET NULL / SET DEFAULT / RESTRICT trigger program. }
 procedure sqlite3FkActions(pParse: PParse; pTab: PTable2; pChanges: PExprList;
   regOld: i32; aChange: Pi32; bChng: i32);
+const
+  FKEY_PNEXTTO_OFFSET = 24;
+var
+  pFKey: Pu8;
+  pAct:  PTrigger;
 begin
-  { Phase 7 }
+  if (pParse^.db^.flags and SQLITE_ForeignKeys) = 0 then Exit;
+  pFKey := Pu8(sqlite3FkReferences(pTab));
+  while pFKey <> nil do
+  begin
+    if (aChange = nil)
+       or (fkParentIsModified(pTab, Pointer(pFKey), aChange, bChng) <> 0) then
+    begin
+      pAct := fkActionTrigger(pParse, pTab, Pointer(pFKey), pChanges);
+      if pAct <> nil then
+        sqlite3CodeRowTriggerDirect(pParse, pAct, pTab, regOld, OE_Abort, 0);
+    end;
+    pFKey := PPointer(pFKey + FKEY_PNEXTTO_OFFSET)^;
+  end;
 end;
 
 { fkey.c:799 — fkChildIsModified.  Walk pFKey's child-side column map; return

@@ -177,10 +177,13 @@ skeleton.
             (fkLookupParent) then every FK for which pTab is the
             parent (fkScanChildren).  Pairs with the runtime
             OP_FkCheck path wired in commit 775ffc0.
-       [ ] Port `sqlite3FkActions` (fkey.c).  Synthesises the
-            ON DELETE / ON UPDATE CASCADE / SET NULL / SET DEFAULT /
-            RESTRICT / NO ACTION trigger programs.  Currently a
-            no-op at passqlite3codegen.pas:33128.
+       [X] Port `sqlite3FkActions` + `fkActionTrigger` (fkey.c:1217..
+            1442) — DONE.  Body at codegen.pas, replaces the prior
+            no-op stub.  Synthesises CASCADE / SET NULL / SET DEFAULT /
+            RESTRICT trigger programs (NO ACTION returns nil).  Cached
+            in pFKey^.apTrigger[iAction] via the documented byte-offset
+            layout; freed by sqlite3FkClearTriggerCache /
+            sqlite3FkDelete.
 
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
