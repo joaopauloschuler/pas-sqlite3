@@ -650,20 +650,18 @@ skeleton.
           a no-op.  Add to 6.10 step 9 silent-bug list when a corpus
           row exercises it.
       [ ] DISTINCT + ORDER BY — current slice bails when iTabTnct>=0.
-      [~] LIMIT + ORDER BY pushdown (top-N sorter) — partial
-          2026-05-02.  Plain `ORDER BY ... LIMIT N` (no OFFSET) now
-          enables the sorter (codegen.pas:21055 gate widened: requires
-          `iOffset = 0` instead of `pLimit = nil`) and emits an
-          OP_DecrJumpZero after each post-sort ResultRow so the loop
-          stops once N rows have been emitted.  Inner-loop body still
-          skips DecrJumpZero for the bSort path so all rows reach the
-          sorter (correct top-N).  Closes DiagOps `select inline order`
-          / `select inline order desc` (4→1 div).  Top-N optimisation
-          (don't push rows past LIMIT into sorter, keep only N best)
-          deferred — current implementation pushes all rows then trims.
-          OFFSET + ORDER BY case (`LIMIT 1 OFFSET 1`) still diverges:
-          OFFSET IfPos sits in inner loop and skips rows pre-sort.
-          Needs OFFSET handling moved into generateSortTail.
+      [X] LIMIT + ORDER BY pushdown (top-N sorter) — DONE 2026-05-02.
+          Plain `ORDER BY ... LIMIT N` (no OFFSET) enables the sorter
+          and emits OP_DecrJumpZero after each post-sort ResultRow.
+          OFFSET + ORDER BY (`LIMIT 1 OFFSET 1`) closed 2026-05-02:
+          gate widened (removed `p^.iOffset = 0` from sorter
+          condition); inner-loop OFFSET IfPos suppressed when bSort=1;
+          a post-sort OFFSET IfPos with addrSortContinue label emits
+          inside generateSortTail before the Column/ResultRow emit so
+          OFFSET is consumed after rows are sorted.  Closes DiagOps
+          `limit offset` (1→0 div).  Top-N optimisation (only keep N
+          best in sorter) still deferred — current implementation
+          pushes all rows then trims with DecrJumpZero.
       [ ] nOBSat shortcut — when the planner reports the loop already
           delivers rows in ORDER BY order (nOBSat=nExpr), skip the
           sorter and route directly to OP_ResultRow.  Bytecode parity

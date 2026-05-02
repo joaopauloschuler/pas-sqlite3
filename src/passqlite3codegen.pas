@@ -19982,6 +19982,7 @@ var
   iSortTab:     i32;
   addrSortLoop: i32;
   addrSortBrk:  i32;
+  addrSortContinue: i32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -21052,7 +21053,7 @@ begin
     index — the nOBSat shortcut is deferred. }
   bSort := 0; iSorterCsr := -1; sortNKey := 0;
   if (p^.pOrderBy <> nil) and (pDest^.eDest = SRT_Output)
-     and (not isExists) and (iTabTnct < 0) and (p^.iOffset = 0) then
+     and (not isExists) and (iTabTnct < 0) then
   begin
     bSort := 1;
     iSorterCsr := pParse^.nTab; Inc(pParse^.nTab);
@@ -21121,8 +21122,9 @@ begin
     { Non-EXISTS path: emit result columns. iSdst was already allocated above. }
 
     { OFFSET skip — codeOffset (select.c:881..887): emit IfPos at top of
-      inner loop body so rows below the OFFSET threshold are skipped. }
-    if p^.iOffset > 0 then
+      inner loop body so rows below the OFFSET threshold are skipped.
+      Skip when bSort is on — OFFSET applies post-sort in generateSortTail. }
+    if (p^.iOffset > 0) and (bSort = 0) then
       sqlite3VdbeAddOp3(v, OP_IfPos, p^.iOffset, pWInfo^.iContinue, 1);
 
     { Inner loop body — one OP_Column per result column (selectInnerLoop:1197).
@@ -21274,6 +21276,16 @@ begin
     sqlite3VdbeAddOp2(v, OP_SorterSort, iSorterCsr, addrSortBrk);
     addrSortLoop := sqlite3VdbeCurrentAddr(v);
     sqlite3VdbeAddOp3(v, OP_SorterData, iSorterCsr, regSortOut, iSortTab);
+    { OFFSET skip post-sort — codeOffset (select.c:881..887) inside
+      generateSortTail.  IfPos decrements iOffset and jumps over the
+      ResultRow when the offset has not yet been consumed. }
+    if p^.iOffset > 0 then
+    begin
+      addrSortContinue := sqlite3VdbeMakeLabel(pParse);
+      sqlite3VdbeAddOp3(v, OP_IfPos, p^.iOffset, addrSortContinue, 1);
+    end
+    else
+      addrSortContinue := 0;
     for i := 0 to nResultCol - 1 do
       sqlite3VdbeAddOp3(v, OP_Column, iSortTab, sortNKey + i,
                         pDest^.iSdst + i);
@@ -21283,6 +21295,8 @@ begin
       must reach the sorter so the top-N is correct. }
     if (p^.iLimit <> 0) and (not isExists) then
       sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrSortBrk);
+    if addrSortContinue <> 0 then
+      sqlite3VdbeResolveLabel(v, addrSortContinue);
     sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterCsr, addrSortLoop);
     sqlite3VdbeResolveLabel(v, addrSortBrk);
   end;
