@@ -10088,6 +10088,47 @@ begin
   Result := c;
 end;
 
+{ whereexpr.c:1039..1066 — exprMightBeIndexed2.  Slow-path companion of
+  exprMightBeIndexed: walk every FROM entry from index j onwards and check
+  whether pExpr matches any indexed-expression slot of any index on that
+  table.  Returns 1 (with aiCurCol filled) on match, 0 otherwise.  Faithful
+  1:1 port of the C body. }
+function exprMightBeIndexed2(pFrom: PSrcList; aiCurCol: Pi32; pX: PExpr;
+  j: i32): i32;
+var
+  pIdx: PIndex2;
+  i, iCur: i32;
+  it:   PSrcItem;
+  pE:   PExpr;
+begin
+  repeat
+    it := @SrcListItems(pFrom)[j];
+    iCur := it^.iCursor;
+    pIdx := it^.pSTab^.pIndex;
+    while pIdx <> nil do
+    begin
+      if pIdx^.aColExpr <> nil then
+      begin
+        for i := 0 to i32(pIdx^.nKeyCol) - 1 do
+        begin
+          if pIdx^.aiColumn[i] <> XN_EXPR then continue;
+          pE := ExprListItems(pIdx^.aColExpr)[i].pExpr;
+          if (sqlite3ExprCompareSkip(pX, pE, iCur) = 0)
+             and (sqlite3ExprIsConstant(nil, pE) = 0) then
+          begin
+            aiCurCol[0] := iCur;
+            aiCurCol[1] := XN_EXPR;
+            Exit(1);
+          end;
+        end;
+      end;
+      pIdx := pIdx^.pNext;
+    end;
+    Inc(j);
+  until j >= pFrom^.nSrc;
+  Result := 0;
+end;
+
 function exprMightBeIndexed(pFrom: PSrcList; aiCurCol: Pi32; pX: PExpr;
   op: i32): i32;
 var
@@ -10129,9 +10170,10 @@ begin
     begin
       if pIdx^.aColExpr <> nil then
       begin
-        { TODO 11g.2.c: port exprMightBeIndexed2.  Returning 0 is safe
-          for the corpus today (no indexed-expression coverage). }
-        Exit(0);
+        { whereexpr.c:1095..1097 — once we know any FROM table carries
+          an indexed-expression, hand off to exprMightBeIndexed2 starting
+          from this entry and return its verdict directly. }
+        Exit(exprMightBeIndexed2(pFrom, aiCurCol, pX, i));
       end;
       pIdx := pIdx^.pNext;
     end;
