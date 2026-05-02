@@ -407,11 +407,16 @@ skeleton.
         (..., pTab^.u.view_pSelect, 1)` and recursively expanded.
         Verified: schema row "CREATE view v AS SELECT a FROM t" is
         written and on reload `pTab^.u.view_pSelect` is repopulated;
-        `SELECT a FROM v` / `SELECT * FROM v` prepare cleanly
-        (DiagFeatureProbe `CREATE VIEW + plain SELECT FROM v` flips
-        chkPrep=1 → chkPrep=0 as of 2026-05-01; runtime still returns
-        no rows because the codegen sub-FROM materialise / co-routine
-        path is not driven for view items — same gap as below).
+        `SELECT a FROM v` PASS as of 2026-05-01: the view-arm of
+        `sqlite3SelectExpand` (codegen.pas:18519..18527) now calls
+        `sqlite3SelectPrep` (full expand+resolve+typeinfo) on the
+        attached subquery instead of bare `sqlite3SelectExpand`, so
+        TK_COLUMN nodes inside the view body get re-resolved against
+        the freshly-assigned inner cursors.  Without the resolve step
+        the EXPRDUP_REDUCE'd Expr tree still had iTable/iColumn=0 (the
+        reduce truncates Expr beyond byte 44) and codegen emitted
+        `OP_Null` instead of `OP_Column` for `a`.  DiagFeatureProbe
+        `CREATE VIEW + plain SELECT FROM v` flips DIVERGE→PASS (8→7).
         Side fix 2026-05-01: `sqlite3SelectExpand` was skipping
         `LocateTableItem` for any FROM item whose `u4` slot read
         non-nil, but `u4` is a union (pSubq / pSchema / zDatabase)

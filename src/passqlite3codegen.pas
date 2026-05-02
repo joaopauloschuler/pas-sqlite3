@@ -18518,8 +18518,12 @@ begin
                                        pTab^.u.view_pSelect, 1);
         if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
         begin
-          { Recursively expand the view's SELECT body. }
-          sqlite3SelectExpand(pParse, pItem^.u4.pSubq^.pSelect);
+          { Recursively prepare the view's SELECT body — full expand+resolve
+            so inner TK_ID nodes bind against the view's FROM cursors.  An
+            earlier sqlite3SelectExpand-only call left TK_COLUMN with stale
+            iTable/iColumn from the EXPRDUP_REDUCE'd source, producing
+            OP_Null instead of OP_Column at codegen for `SELECT a FROM v`. }
+          sqlite3SelectPrep(pParse, pItem^.u4.pSubq^.pSelect, nil);
         end;
       end;
 
