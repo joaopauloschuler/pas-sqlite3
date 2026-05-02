@@ -266,9 +266,10 @@ skeleton.
         because `destroyRootPage` calls `sqlite3NestedParse(UPDATE
         sqlite_schema ...)` and productive `sqlite3Update` is still
         skeleton-only.  This is the only remaining contributor.
-  [~] **6.12** port sqlite3Pragma in full.  Gate `DiagPragma`.
-       1 DiagPragma divergence remains: FOREIGN_KEY_LIST, blocked on
-       TFKey opaque.
+  [X] **6.12** port sqlite3Pragma in full.  Gate `DiagPragma` — all PASS.
+       FOREIGN_KEY_LIST arm landed alongside a productive
+       sqlite3CreateForeignKey body (FKey blob written via documented
+       byte offsets, hashed into pSchema^.fkeyHash).
 
   [ ] **6.13** Non-regular FROM-item codegen in `sqlite3Select`
        (select.c).  Pas's SELECT codegen currently traverses regular

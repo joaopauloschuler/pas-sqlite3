@@ -30360,11 +30360,165 @@ exit_drop_index:
   sqlite3SrcListDelete(db, pName);
 end;
 
+{ build.c:3577 — sqlite3CreateForeignKey.  Allocate a FKey blob, populate
+  it from (pFromCol, pTo, pToCol, flags), link it onto pTab^.u.tab.pFKey
+  and into pSchema^.fkeyHash.  Faithful 1:1 of the C body, with the
+  IN_RENAME_OBJECT arms omitted (no codegen consumer yet) and pFKey
+  written via documented byte offsets — the rest of the port already
+  walks the FKey blob this way (see sqlite3FkDelete, FkClearTriggerCache,
+  sqlite3DeferForeignKey). }
 procedure sqlite3CreateForeignKey(pParse: PParse; pFromCol: PExprList;
   pTo: PToken; pToCol: PExprList; flags: i32);
+const
+  FKEY_PNEXTFROM_OFFSET  = 8;
+  FKEY_ZTO_OFFSET        = 16;
+  FKEY_PNEXTTO_OFFSET    = 24;
+  FKEY_PPREVTO_OFFSET    = 32;
+  FKEY_NCOL_OFFSET       = 40;
+  FKEY_ISDEFERRED_OFFSET = 44;
+  FKEY_AACTION0_OFFSET   = 45;
+  FKEY_AACTION1_OFFSET   = 46;
+  FKEY_ACOL_OFFSET       = 64;
+  COLMAP_SIZE            = 16;
+  COLMAP_ZCOL_OFFSET     = 8;
+label
+  fk_end;
+var
+  db:          PTsqlite3;
+  pFKey:       Pu8;
+  pNextTo:     Pu8;
+  p:           PTable2;
+  nByte:       SizeInt;
+  i, j, nCol:  i32;
+  iCol:        i32;
+  z:           PAnsiChar;
+  pSch:        passqlite3util.PSchema;
+  pColmap:     Pu8;
+  pFromItems:  PExprListItem;
+  pToItems:    PExprListItem;
+  nameLen:     i32;
 begin
-  sqlite3ExprListDelete(pParse^.db, pFromCol);
-  sqlite3ExprListDelete(pParse^.db, pToCol);
+  db    := pParse^.db;
+  pFKey := nil;
+  p     := pParse^.pNewTable;
+  pFromItems := nil;
+  pToItems   := nil;
+
+  Assert(pTo <> nil, 'CreateForeignKey pTo');
+  if (p = nil) or (pParse^.eParseMode = PARSE_MODE_DECLARE_VTAB) then goto fk_end;
+
+  if pFromCol = nil then
+  begin
+    iCol := i32(p^.nCol) - 1;
+    if iCol < 0 then goto fk_end;
+    if (pToCol <> nil) and (pToCol^.nExpr <> 1) then
+    begin
+      sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+        'foreign key on %s should reference only one column of table %T',
+        [Pointer(p^.aCol[iCol].zCnName), Pointer(pTo)]));
+      goto fk_end;
+    end;
+    nCol := 1;
+  end
+  else if (pToCol <> nil) and (pToCol^.nExpr <> pFromCol^.nExpr) then
+  begin
+    sqlite3ErrorMsg(pParse,
+      'number of columns in foreign key does not match the number of columns in the referenced table');
+    goto fk_end;
+  end
+  else
+    nCol := pFromCol^.nExpr;
+
+  nByte := FKEY_ACOL_OFFSET + SizeInt(nCol) * COLMAP_SIZE + SizeInt(pTo^.n) + 1;
+  if pToCol <> nil then
+  begin
+    pToItems := ExprListItems(pToCol);
+    for i := 0 to nCol - 1 do
+      Inc(nByte, sqlite3Strlen30(pToItems[i].zEName) + 1);
+  end;
+
+  pFKey := Pu8(sqlite3DbMallocZero(db, u64(nByte)));
+  if pFKey = nil then goto fk_end;
+
+  PPointer(pFKey)^ := p;                                          { pFrom }
+  PPointer(pFKey + FKEY_PNEXTFROM_OFFSET)^ := p^.u.tab.pFKey;     { pNextFrom }
+
+  z := PAnsiChar(pFKey + FKEY_ACOL_OFFSET + SizeInt(nCol) * COLMAP_SIZE);
+  PPointer(pFKey + FKEY_ZTO_OFFSET)^ := z;
+  Move(pTo^.z^, z^, pTo^.n);
+  z[pTo^.n] := #0;
+  sqlite3Dequote(z);
+  Inc(z, pTo^.n + 1);
+
+  Pi32(pFKey + FKEY_NCOL_OFFSET)^ := nCol;
+
+  pColmap := pFKey + FKEY_ACOL_OFFSET;
+  if pFromCol = nil then
+    Pi32(pColmap)^ := i32(p^.nCol) - 1
+  else
+  begin
+    pFromItems := ExprListItems(pFromCol);
+    for i := 0 to nCol - 1 do
+    begin
+      j := 0;
+      while j < i32(p^.nCol) do
+      begin
+        if sqlite3StrICmp(p^.aCol[j].zCnName, pFromItems[i].zEName) = 0 then
+        begin
+          Pi32(pColmap + SizeInt(i) * COLMAP_SIZE)^ := j;
+          break;
+        end;
+        Inc(j);
+      end;
+      if j >= i32(p^.nCol) then
+      begin
+        sqlite3ErrorMsg(pParse, sqlite3MPrintf(db,
+          'unknown column "%s" in foreign key definition',
+          [Pointer(pFromItems[i].zEName)]));
+        goto fk_end;
+      end;
+    end;
+  end;
+
+  if pToCol <> nil then
+  begin
+    for i := 0 to nCol - 1 do
+    begin
+      nameLen := sqlite3Strlen30(pToItems[i].zEName);
+      PPointer(pColmap + SizeInt(i) * COLMAP_SIZE + COLMAP_ZCOL_OFFSET)^ := z;
+      Move(pToItems[i].zEName^, z^, nameLen);
+      z[nameLen] := #0;
+      Inc(z, nameLen + 1);
+    end;
+  end;
+
+  pFKey[FKEY_ISDEFERRED_OFFSET] := 0;
+  pFKey[FKEY_AACTION0_OFFSET]   := u8(flags and $ff);             { ON DELETE }
+  pFKey[FKEY_AACTION1_OFFSET]   := u8((flags shr 8) and $ff);     { ON UPDATE }
+
+  pSch := passqlite3util.PSchema(p^.pSchema);
+  pNextTo := Pu8(sqlite3HashInsert(@pSch^.fkeyHash,
+    PChar(PPointer(pFKey + FKEY_ZTO_OFFSET)^), Pointer(pFKey)));
+  if pNextTo = pFKey then
+  begin
+    sqlite3OomFault(db);
+    goto fk_end;
+  end;
+  if pNextTo <> nil then
+  begin
+    Assert(PPointer(pNextTo + FKEY_PPREVTO_OFFSET)^ = nil,
+      'CreateForeignKey pNextTo->pPrevTo<>0');
+    PPointer(pFKey + FKEY_PNEXTTO_OFFSET)^ := pNextTo;
+    PPointer(pNextTo + FKEY_PPREVTO_OFFSET)^ := pFKey;
+  end;
+
+  p^.u.tab.pFKey := Pointer(pFKey);
+  pFKey := nil;
+
+fk_end:
+  if pFKey <> nil then sqlite3DbFree(db, pFKey);
+  sqlite3ExprListDelete(db, pFromCol);
+  sqlite3ExprListDelete(db, pToCol);
 end;
 
 { build.c:3749 — sqlite3DeferForeignKey.  Toggle the most recently added
@@ -33863,6 +34017,11 @@ var
   pColExpr: PExpr;
   isHidden: i32;
   k, mx, nHidden: i32;
+  pFKey:    Pu8;
+  iTabDb:   i32;
+  j, nFkCol: i32;
+  iFromCol: i32;
+  zToCol:   PAnsiChar;
   cnum:     i16;
   zType:    PAnsiChar;
   pElemA:   passqlite3util.PHashElem;
@@ -33877,6 +34036,12 @@ var
 const
   azFuncEnc: array[0..3] of PAnsiChar = (nil, 'utf8', 'utf16le', 'utf16be');
   azIdxOrigin: array[0..2] of PAnsiChar = ('c', 'u', 'pk');
+  { pragma.c:269 — actionName(): map ON DELETE/UPDATE action codes to text.
+    Indexed by the FK action byte directly (OE_None=0, OE_Restrict=7,
+    OE_SetNull=8, OE_SetDflt=9, OE_Cascade=10).  Slots 1..6 unused. }
+  azFkAction: array[0..10] of PAnsiChar = (
+    'NO ACTION', nil, nil, nil, nil, nil, nil,
+    'RESTRICT', 'SET NULL', 'SET DEFAULT', 'CASCADE');
   { Mirror of sqlite3azCompileOpt in passqlite3main.pas — kept local
     here because codegen cannot use passqlite3main (circular).  Reflects
     the build configuration declared in passqlite3.inc. }
@@ -34051,6 +34216,42 @@ begin
             i32(Ord(pIdxA^.pPartIdxWhere <> nil))]);
           pIdxA := pIdxA^.pNext;
           Inc(i);
+        end;
+      end;
+      Exit;
+    end;
+
+    { pragma.c:1506 — PRAGMA foreign_key_list(t).  Walks pTab^.u.tab.pFKey
+      (linked via FKEY_PNEXTFROM_OFFSET) emitting one row per (FK, column)
+      pair: id, seq, table, from, to, on_update, on_delete, match. }
+    PragTyp_FOREIGN_KEY_LIST: if pValue <> nil then begin
+      pTabA := sqlite3FindTable(db, PAnsiChar(zRight), nil);
+      if (pTabA <> nil) and (pTabA^.eTabType = TABTYP_NORM) then begin
+        pFKey := Pu8(pTabA^.u.tab.pFKey);
+        if pFKey <> nil then begin
+          iTabDb := sqlite3SchemaToIndex(db,
+            passqlite3util.PSchema(pTabA^.pSchema));
+          pParse^.nMem := 8;
+          sqlite3CodeVerifySchema(pParse, iTabDb);
+          i := 0;
+          while pFKey <> nil do begin
+            nFkCol := Pi32(pFKey + 40)^;       { FKEY_NCOL_OFFSET }
+            for j := 0 to nFkCol - 1 do begin
+              iFromCol := Pi32(pFKey + 64 + SizeInt(j) * 16)^;
+              zToCol := PAnsiChar(PPointer(pFKey + 64 + SizeInt(j) * 16 + 8)^);
+              sqlite3VdbeMultiLoad(v, 1, 'iissssss', [
+                i,
+                j,
+                Pointer(PPointer(pFKey + 16)^),                       { zTo }
+                Pointer(pTabA^.aCol[iFromCol].zCnName),
+                Pointer(zToCol),
+                Pointer(azFkAction[pFKey[46] and $0F]),               { ON UPDATE }
+                Pointer(azFkAction[pFKey[45] and $0F]),               { ON DELETE }
+                Pointer(PAnsiChar('NONE'))]);
+            end;
+            Inc(i);
+            pFKey := Pu8(PPointer(pFKey + 8)^);  { FKEY_PNEXTFROM_OFFSET }
+          end;
         end;
       end;
       Exit;
