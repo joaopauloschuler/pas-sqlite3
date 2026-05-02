@@ -84,7 +84,7 @@ skeleton.
           INSERT FROM SELECT bails — folds into 6.10 step 6 sub-FROM.
      [X] AUTOINCREMENT.
      [X] BEFORE / AFTER INSERT triggers.
-     [ ] RETURNING clause emission — DiagDml RETURNING corpus.
+     [X] RETURNING clause emission — DiagDml RETURNING corpus PASS.
      [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
      [ ] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
           fast path).
@@ -103,8 +103,7 @@ skeleton.
           multi-table WHERE; `nChangeFrom>0` early bail.
      [ ] Virtual-table dispatch (`updateVirtualTable`) — vtab xUpdate
           path; `eTabType=TABTYP_VTAB` early bail.
-     [ ] RETURNING clause emission — call site for the productive
-          UPDATE path (DiagDml RETURNING corpus).
+     [X] RETURNING clause emission — DiagDml UPDATE-RETURNING PASS.
      [ ] PREUPDATE_HOOK `OP_Delete OPFLAG_ISNOOP` arm — gated on
           SQLITE_ENABLE_PREUPDATE_HOOK (not in the default build).
 

@@ -15657,10 +15657,7 @@ begin
     until ii >= pTabList^.nSrc;
   end;
 
-  { Analyze all subexpressions (where.c:6986..6989).  sqlite3WhereExprAnalyze
-    and sqlite3WhereAddLimit are still stubs — the calls land here so once
-    they get productive bodies (11g.2.c) the prologue picks them up
-    automatically. }
+  { Analyze all subexpressions (where.c:6986..6989). }
   sqlite3WhereExprAnalyze(pTabList, @pWInfo^.sWC);
   if (pSelect <> nil) and (pSelect^.pLimit <> nil) then
     sqlite3WhereAddLimit(@pWInfo^.sWC, pSelect);
@@ -32369,7 +32366,7 @@ end;
   ALTER TABLE ... ADD COLUMN syntax: clone the target Table into
   pParse^.pNewTable under the synthetic name "sqlite_altertab_<orig>" so
   the column being added can be appended via the regular sqlite3AddColumn
-  pipeline; sqlite3AlterFinishAddColumn (still stub) commits the result. }
+  pipeline; sqlite3AlterFinishAddColumn commits the result. }
 procedure sqlite3AlterBeginAddColumn(pParse: PParse; pSrc: PSrcList);
 label
   exit_begin_add_column;
