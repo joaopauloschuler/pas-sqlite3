@@ -20301,6 +20301,7 @@ var
   sNCAgg:      TNameContext;
   canUseAgg:   Boolean;
   isVtabAgg:   Boolean;
+  isSubqueryAgg: Boolean;
   jAgg:        i32;
   pAggFunc:    PAggInfoFunc;
   pMinMaxOrderBy: PExprList;
@@ -20983,6 +20984,7 @@ begin
   begin
     canUseAgg := True;
     isVtabAgg := False;
+    isSubqueryAgg := False;
     pItem := SrcListItems(p^.pSrc);
     { Allow single-source eponymous vtab — handled below by emitting
       VOpen/VFilter/VNext directly instead of WhereBegin.  Lifts the
@@ -20994,6 +20996,21 @@ begin
        and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)
        and (p^.pWhere = nil) then
       isVtabAgg := True
+    { Pas-only: aggregate-on-subquery — Phase 6.13(b)-coagg.  Single-
+      source FROM (SELECT …) for an aggregate query: materialise the
+      subquery into an eph cursor first, then scan it with the agg
+      accumulation in the body.  Targets count(*) / sum / min / max
+      over a subquery shape (e.g. `SELECT count(*) FROM (SELECT a FROM
+      t WHERE a IS NULL)`) which the C code routes through WhereBegin
+      with viaCoroutine; we skip WhereBegin and emit the eph-table
+      scan directly. }
+    else if (p^.pSrc^.nSrc = 1)
+            and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+            and (pItem^.pSTab <> nil)
+            and (pItem^.u4.pSubq <> nil)
+            and (pItem^.u4.pSubq^.pSelect <> nil)
+            and (p^.pWhere = nil) then
+      isSubqueryAgg := True
     else begin
       for jAgg := 0 to p^.pSrc^.nSrc - 1 do
       begin
@@ -21113,6 +21130,30 @@ begin
                                               addrEnd, regAgg);
           updateAccumulatorSimple(pParse, pAggI2);
           sqlite3VdbeAddOp2(v, OP_VNext, iCsr, addrTopOfLoop + 1);
+          sqlite3VdbeResolveLabel(v, addrEnd);
+          sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+        end
+        else if isSubqueryAgg then
+        begin
+          { Aggregate-on-subquery arm — Phase 6.13(b)-coagg.  Materialise
+            the subquery into an ephemeral rowid table at pItem^.iCursor,
+            then drive a Rewind/updateAccumulator/Next/Close scan. }
+          if pItem^.iCursor < 0 then
+          begin
+            pItem^.iCursor := pParse^.nTab;
+            Inc(pParse^.nTab);
+          end;
+          iCsr := pItem^.iCursor;
+          sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iCsr, pTab^.nCol);
+          sqlite3SelectDestInit(@innerDest, SRT_EphemTab, iCsr);
+          if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+          begin
+            Result := SQLITE_ERROR; Exit;
+          end;
+          addrEnd := sqlite3VdbeMakeLabel(pParse);
+          addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrEnd);
+          updateAccumulatorSimple(pParse, pAggI2);
+          sqlite3VdbeAddOp2(v, OP_Next, iCsr, addrTopOfLoop + 1);
           sqlite3VdbeResolveLabel(v, addrEnd);
           sqlite3VdbeAddOp1(v, OP_Close, iCsr);
         end

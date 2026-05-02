@@ -222,11 +222,11 @@ skeleton.
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
       bin/DiagFeatureProbe`).  Most fold into existing tasks; the genuinely
       new silent-result bugs are listed first.
-      [ ] **c) View materialisation in SELECT.**  Folds into 6.13(b).
-        Plain `SELECT a FROM v` PASS; `count(*) FROM v` still bails
-        (the agg-no-GROUP-BY gates reject SRCITEM_FG_IS_SUBQUERY).
-        Closing needs sub-FROM materialise / co-routine codegen path
-        (6.10 step 6 sub-FROM entry).
+      [X] **c) View materialisation in SELECT.**  DONE — agg-on-subquery
+        arm (codegen.pas:21088..) materialises subquery into eph cursor
+        and drives Rewind/updateAccumulator/Next; `count(*) FROM v` and
+        `count(*) FROM (SELECT ...)` PASS.  sum/min/max on subquery still
+        bail (nAccumulator>0 — needs directMode column-store).
       [ ] **e) UNION / compound SELECT.**  Folds into 6.13(c).
         `SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)`
         returns no row.  Compound-select codegen / sub-FROM
@@ -303,9 +303,12 @@ skeleton.
             - **6.13(b)-fl**: port `flattenSubquery` (select.c, ~600
               lines).  Closes the flattenable agg-on-subquery case
               with bytecode parity.
-            - **6.13(b)-coagg**: agg-arm + dispatcher integration for
-              the non-flattenable case.  Lift IS_SUBQUERY bails in
-              agg arms; existing WhereBegin viaCoroutine picks up rest.
+            - **6.13(b)-coagg**: agg-arm subquery dispatch landed for
+              `count(*) FROM (SELECT…)` / `count(*) FROM v` via
+              materialise + Rewind scan (codegen.pas:21088..).
+              Remaining: sum/min/max on subquery (nAccumulator>0 bail —
+              needs directMode column-store); flattenable case still
+              wants 6.13(b)-fl.
        [ ] **c) Compound-SELECT / CTE arm** — UNION / INTERSECT /
             EXCEPT FROM-sources and `WITH … AS (…)` references.
             CTE name resolution needs parser-side `WithAdd` / `CteNew`
