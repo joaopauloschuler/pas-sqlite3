@@ -194,10 +194,13 @@ skeleton.
 - [ ] **6.10** `TestExplainParity.pas`
     - [ ] **6.10 step 6** Remaining TestExplainParity bytecode-Δ rows
        (4 diverges in 1022/1026 corpus):
-        [ ] `SELECT a FROM t GROUP BY a` — C=45 vs Pas=3.  GROUP BY
-          without aggregate function in pEList; Pas's GROUP BY codegen
-          arm gates on SF_Aggregate, but C handles pGroupBy!=0 even
-          with nFunc=0.
+        [~] `SELECT a FROM t GROUP BY a` — C=45 vs Pas=43 (was Δ=42).
+          GROUP BY arm SF_Aggregate gate lifted (codegen.pas:20537);
+          updateAccumulatorSimple regHit guard ported (OP_If iUseFlag
+          arm of select.c:6943..6951).  Remaining Δ=2: missing 2nd
+          OP_Explain (`USE TEMP B-TREE FOR GROUP BY` from
+          ExplainQueryPlan2 inside the loop) and tail Null on the
+          auto-init region.
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=6.  Pas emits the
           co-routine path; C flattens via `flattenSubquery`.  Closes
           once 6.13(b)-fl lands.

@@ -20026,11 +20026,14 @@ end;
   referenced by ordinary (non-agg) result-list expressions are
   populated.  Slim variant: no FILTER / DISTINCT / ORDER BY / NEEDCOLL
   arms (rejected by gate). }
-procedure updateAccumulatorSimple(pParse: PParse; pAggInfo: PAggInfo);
+procedure updateAccumulatorSimple(pParse: PParse; pAggInfo: PAggInfo;
+  regAcc: i32 = 0);
 var
   v:       PVdbe;
   i, j, nArg, r1: i32;
   regAgg:  i32;
+  regHit:  i32;
+  addrHitTest: i32;
   addrNext: i32;
   pF:      PAggInfoFunc;
   pC:      PAggInfoCol;
@@ -20118,6 +20121,16 @@ begin
     if addrNext <> 0 then sqlite3VdbeResolveLabel(v, addrNext);
     if pParse^.nErr <> 0 then begin pAggInfo^.directMode := 0; Exit; end;
   end;
+  { regHit guard — select.c:6943..6951.  When the caller passes regAcc
+    (the GROUP BY arm's iUseFlag), and there is at least one accumulator
+    column to populate, emit OP_If regHit, addrHitTest so the column
+    re-evaluation is skipped on subsequent rows of the same group (the
+    accumulator already holds the values from the first row). }
+  regHit := 0;
+  addrHitTest := 0;
+  if (regHit = 0) and (pAggInfo^.nAccumulator > 0) then regHit := regAcc;
+  if regHit <> 0 then
+    addrHitTest := sqlite3VdbeAddOp1(v, OP_If, regHit);
   for i := 0 to pAggInfo^.nAccumulator - 1 do
   begin
     pC := @pAggInfo^.aCol[i];
@@ -20125,6 +20138,7 @@ begin
     if pParse^.nErr <> 0 then begin pAggInfo^.directMode := 0; Exit; end;
   end;
   pAggInfo^.directMode := 0;
+  if addrHitTest <> 0 then sqlite3VdbeJumpHere(v, addrHitTest);
 end;
 
 { finalizeAggFunctions — select.c:6724 (slim).  Emit OP_AggFinal for
@@ -20533,9 +20547,10 @@ begin
     Single source table; no DISTINCT/Compound/Window; HAVING supported via
     post-finalize ExprIfFalse; ORDER BY supported only when it matches
     GROUP BY (orderByGrp arm via sqlite3CopySortOrder + ExprListCompare).
-    Always pushes rows through OP_SorterOpen (no whereIsOrdered shortcut). }
-  if ((p^.selFlags and SF_Aggregate) <> 0)
-     and (p^.pGroupBy <> nil)
+    Always pushes rows through OP_SorterOpen (no whereIsOrdered shortcut).
+    C runs this arm whenever pGroupBy != 0, even with no aggregate funcs
+    (`SELECT a FROM t GROUP BY a`); SF_Aggregate is not a precondition. }
+  if (p^.pGroupBy <> nil)
      and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
      and (p^.pWin = nil)
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc = 1)
@@ -20725,7 +20740,7 @@ begin
       sqlite3VdbeAddOp2(v, OP_Gosub, regReset, addrReset);
 
       sqlite3VdbeJumpHere(v, addr1);
-      updateAccumulatorSimple(pParse, pAggI2);
+      updateAccumulatorSimple(pParse, pAggI2, iUseFlag);
       sqlite3VdbeAddOp2(v, OP_Integer, 1, iUseFlag);
 
       sqlite3VdbeAddOp2(v, OP_SorterNext, pAggI2^.sortingIdx, addrTopOfLoop);
