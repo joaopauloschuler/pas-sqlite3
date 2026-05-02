@@ -484,10 +484,30 @@ skeleton.
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
-      [ ] **h) CHECK constraint not enforced.**
-        `CREATE TABLE t(a CHECK(a > 0)); INSERT INTO t VALUES(-1)` is
-        accepted by Pas; C rejects with SQLITE_CONSTRAINT (rc=19).
-        Wraps 6.9-bis 11g.2.b (`sqlite3GenerateConstraintChecks`).
+      [X] **h) CHECK constraint not enforced** — DONE 2026-05-01.
+        Three coupled fixes: (1) `sqlite3AddCheckConstraint`
+        (build.c:1902) ported from a stub-that-deletes-the-expr to the
+        real append-into-pTab^.pCheck + name-tagging body;
+        (2) `sqlite3EndTable` now runs the build.c:2738..2751 CHECK
+        resolve loop via `sqlite3ResolveSelfReference(NC_IsCheck)`;
+        (3) `sqlite3ResolveSelfReference` was only resolving pExpr —
+        added the resolve.c:2317 `pList` arm so ExprList CHECK
+        constraints actually resolve.  The CHECK arm in
+        `sqlite3GenerateConstraintChecks` was already correct; the
+        TK_COLUMN row-unpacked iSelfTab<0 arm in
+        `sqlite3ExprCodeTarget` was not — ported the expr.c:5026..5074
+        body so a TK_COLUMN under iSelfTab<0 returns the existing
+        register holding the inserted column instead of falling
+        through to the iSelfTab>0 cursor-read path.  Final fix:
+        `sqlite3_step` now folds the extended result code via
+        `rc and db^.errMask` (vdbeapi.c sqlite3Step tail) so the
+        public API returns SQLITE_CONSTRAINT (19) instead of
+        SQLITE_CONSTRAINT_CHECK (275) when extended-codes are off
+        (the default).  Verified: DiagFeatureProbe `CHECK rejects bad
+        insert` flips DIVERGE→PASS (10→9 divergences); no regressions
+        across TestExplainParity (1018/8/1026), TestDMLBasic (54/0),
+        TestSchemaBasic (44/0), TestSelectBasic (60/0), TestWhereBasic
+        (52/0).
       [ ] **j) AFTER INSERT trigger does not fire.**
         Side-table populated by the trigger remains empty.  Tracked
         under 6.23 (trigger codegen stubs).

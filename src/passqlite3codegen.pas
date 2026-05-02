@@ -5461,11 +5461,40 @@ begin
             Result := r1;
             done := True;
           end
+          { iSelfTab<0 row-unpacked arm — expr.c:5026..5074.
+            CHECK constraints, partial-index WHERE, generated-column
+            expressions and the inserter all unpack the row into a
+            register block at -pParse^.iSelfTab; the rowid (if any) sits
+            one register lower.  No opcode is emitted — the existing
+            register that holds the column value is returned directly,
+            except for SQLITE_AFF_REAL where SCopy + RealAffinity is
+            applied so a comparison sees a true REAL.  Generated columns
+            are out of scope here (deferred). }
+          else if (pExpr^.iTable < 0) and (pParse^.iSelfTab < 0)
+                  and (pExpr^.y.pTab <> nil) then
+          begin
+            { iCol = -1 → rowid, return the register just below the row block. }
+            if pExpr^.iColumn < 0 then begin
+              Result := -1 - pParse^.iSelfTab;
+              done := True;
+            end else begin
+              n := i32(sqlite3TableColumnToStorage(pExpr^.y.pTab,
+                                                  pExpr^.iColumn));
+              r1 := n - pParse^.iSelfTab;
+              if pExpr^.y.pTab^.aCol[pExpr^.iColumn].affinity
+                 = AnsiChar(SQLITE_AFF_REAL) then begin
+                sqlite3VdbeAddOp2(v, OP_SCopy, r1, target);
+                sqlite3VdbeAddOp1(v, OP_RealAffinity, target);
+                Result := target;
+              end else
+                Result := r1;
+              done := True;
+            end;
+          end
           { Partial-index / CHECK / generated-column context: iTable<0 plus
             pParse^.iSelfTab>0 routes the column read through cursor
-            (iSelfTab-1).  Faithful port of expr.c:5026..5076 (subset:
-            iSelfTab>0 arm only — the row-unpacked iSelfTab<0 path used by
-            sqlite3GenerateConstraintChecks remains deferred). }
+            (iSelfTab-1).  Faithful port of expr.c:5026..5076 (iSelfTab>0
+            arm — the index-side use). }
           else if (pExpr^.iTable < 0) and (pParse^.iSelfTab > 0)
                   and (pExpr^.y.pTab <> nil) then
           begin
@@ -7975,6 +8004,8 @@ begin
   sNC.pSrcList := pSrc;
   sNC.ncFlags  := type_ or NC_IsDDL;
   Result := sqlite3ResolveExprNames(@sNC, pExpr);
+  if (Result = SQLITE_OK) and (pList <> nil) then
+    Result := sqlite3ResolveExprListNames(@sNC, pList);
 end;
 
 { resolve.c:35 — incrAggDepth walker callback. }
@@ -27930,10 +27961,55 @@ primary_key_exit:
   sqlite3ExprListDelete(pParse^.db, pList);
 end;
 
+{ build.c:1902 — sqlite3AddCheckConstraint.  Append pCheckExpr to
+  pTab^.pCheck and tag the new entry with a name (either the explicit
+  CONSTRAINT name from pParse^.u1.cr.constraintName, or the trimmed
+  source span between zStart..zEnd).  When no table is open, when
+  inside DECLARE_VTAB, or when the schema btree is read-only, the
+  expression is freed instead. }
 procedure sqlite3AddCheckConstraint(pParse: PParse; pCheckExpr: PExpr;
   zStart: PAnsiChar; zEnd: PAnsiChar);
+var
+  pTab:  PTable2;
+  db:    PTsqlite3;
+  pBt:   PBtree;
+  iDb:   i32;
+  t:     TToken;
+  zS:    PAnsiChar;
+  zE:    PAnsiChar;
 begin
-  sqlite3ExprDelete(pParse^.db, pCheckExpr);
+  pTab := pParse^.pNewTable;
+  db   := pParse^.db;
+  iDb  := db^.init.iDb;
+  pBt  := nil;
+  if (iDb >= 0) and (iDb < db^.nDb) then
+    pBt := PBtree(db^.aDb[iDb].pBt);
+  if (pTab <> nil) and (db^.pVtabCtx = nil)
+     and ((pBt = nil) or (sqlite3BtreeIsReadonly(pBt) = 0)) then
+  begin
+    pTab^.pCheck := sqlite3ExprListAppend(pParse, pTab^.pCheck, pCheckExpr);
+    if pParse^.u1.cr.constraintName.n <> 0 then
+      sqlite3ExprListSetName(pParse, pTab^.pCheck,
+                             @pParse^.u1.cr.constraintName, 1)
+    else begin
+      zS := zStart;
+      zE := zEnd;
+      if zS <> nil then begin
+        Inc(zS);
+        while (zS^ <> #0) and (sqlite3Isspace(u8(zS^)) <> 0) do Inc(zS);
+      end;
+      if zE <> nil then begin
+        while (zE > zStart) and (sqlite3Isspace(u8((zE - 1)^)) <> 0) do Dec(zE);
+      end;
+      t.z := zS;
+      if (zS <> nil) and (zE <> nil) and (zE >= zS) then
+        t.n := u32(PtrUInt(zE) - PtrUInt(zS))
+      else
+        t.n := 0;
+      sqlite3ExprListSetName(pParse, pTab^.pCheck, @t, 1);
+    end;
+  end else
+    sqlite3ExprDelete(db, pCheckExpr);
 end;
 
 { sqlite3AddCollateType — port of build.c:1938.  Set the collation
@@ -28309,6 +28385,19 @@ begin
     pTab^.tnum := db^.init.newTnum;
     if pTab^.tnum = 1 then
       pTab^.tabFlags := pTab^.tabFlags or TF_Readonly;
+  end;
+
+  { CHECK resolve loop — port of build.c:2738..2751.  Resolve names
+    in all CHECK constraint expressions against the new table itself
+    (NC_IsCheck); on error, drop the CHECK list so writable_schema=ON
+    cannot try to use partially-resolved nodes. }
+  if pTab^.pCheck <> nil then
+  begin
+    sqlite3ResolveSelfReference(pParse, pTab, NC_IsCheck, nil, pTab^.pCheck);
+    if pParse^.nErr <> 0 then begin
+      sqlite3ExprListDelete(db, pTab^.pCheck);
+      pTab^.pCheck := nil;
+    end;
   end;
 
   { GENERATED-column resolve loop — port of build.c:2753..2781.

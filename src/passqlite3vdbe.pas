@@ -5284,6 +5284,9 @@ begin
       rc := sqlite3VdbeTransferError(pStmt);
     db^.errCode := rc;
     Dec(db^.nVdbeActive);
+    { vdbeapi.c sqlite3Step tail — fold extended → primary unless the
+      app opted in via sqlite3_extended_result_codes(...,1). }
+    rc := rc and db^.errMask;
   end;
   Result := rc;
 end;
