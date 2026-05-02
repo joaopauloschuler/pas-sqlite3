@@ -508,8 +508,9 @@ skeleton.
   [ ] **6.10 step 19** DiagDml runtime probe (added 2026-04-28,
       `src/tests/DiagDml.pas`, run `LD_LIBRARY_PATH=$PWD/src bin/DiagDml`).
       Sweep of UPSERT / RETURNING / INSERT-FROM-SELECT / UPDATE-FROM /
-      column-reorder / DEFAULT-expr / multi-row-VALUES variants.  12 PASS,
-      2 DIVERGE — surprises noted below; UPSERT (DO NOTHING + DO UPDATE +
+      column-reorder / DEFAULT-expr / multi-row-VALUES variants.  13 PASS,
+      1 DIVERGE (verified 2026-05-01) — surprises noted below; UPSERT
+      (DO NOTHING + DO UPDATE +
       excluded.b), RETURNING (INSERT/UPDATE/DELETE), INSERT INTO d SELECT
       * FROM s, UPDATE...FROM, column-reorder all already PASS.
       [ ] **a) `INSERT INTO t SELECT 1,2 UNION ALL SELECT 3,4`** —
@@ -526,22 +527,20 @@ skeleton.
         the consumer side in sqlite3Insert, which now walks the
         SF_Values pPrior chain and emits per-row inserts inline.
 
-  [ ] **6.10 step 26** DiagIndexing probe
-      [ ] **e) `INDEXED BY` / `NOT INDEXED`** — DiagIndexing `indexed
-        by ok`, `not indexed` return empty rowset.  Blocker:
-        sqlite3WhereBegin's nTabList=1 gate (codegen.pas:14991) bails
-        when whereShortCut returns 0; whereShortCut bails for any FROM
-        item carrying INDEXED BY ($02) / NOT INDEXED ($01) flags
-        (codegen.pas:14203).  Lifting the bail exposes downstream gaps
-        — full single-table planner port required (overlaps
-        6.9-bis 11g.2.b).
-      [ ] `schema after create idx`
-      [ ] `select range via idx`
-      [ ] `unique violation`
-      [ ] `rowid select`,
-      [ ] `rowid alias custom`.  Likely fold into single-table planner
-        and sqlite3GenerateConstraintChecks gaps (e + 6.9-bis 11g.2.b);
-        triage when those land.
+  [ ] **6.10 step 26** DiagIndexing probe (4 diverges remain, verified
+      2026-05-01 — was 5; `unique violation` now PASSes via the
+      extended→primary errCode fold and OP_Halt P5 wiring landed with
+      the CHECK fix).
+      [X] **e) `INDEXED BY` / `NOT INDEXED`** — closed under 6.8.4
+        (`indexed by ok` / `not indexed` PASS).
+      [X] `unique violation`
+      [ ] `schema after create idx` — empty rowset; ORDER BY rowid path.
+      [ ] `select range via idx` — empty rowset; range scan + ORDER BY.
+      [ ] `rowid select` — empty rowset; ORDER BY rowid path.
+      [ ] `rowid alias custom` — empty rowset; ORDER BY rowid alias.
+      All four remaining fold into the same blocker: ORDER BY codegen
+      (sorter / ephemeral-key path) is not yet ported — same root cause
+      as 6.10 step 6 `SELECT a FROM t ORDER BY a` (C=19 vs Pas=3).
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
