@@ -152,84 +152,32 @@ skeleton.
      identical to C oracle.
      Deferred sub-arms (route to insert_cleanup or fall back to
      OP_NewRowid + record assembly without bail today):
-     [X] IPK-alias rebinding (insert.c:1488..1531) — DONE
-          2026-05-01 (commit a820774).  IPK alias tables now
-          honour user-supplied rowids via SCopy+NotNull+NewRowid+
-          MustBeInt cascade with regData+iPKey nulled
-          post-rebind.  Verified: `INSERT INTO u VALUES(7,'a')`
-          with `u(id INTEGER PRIMARY KEY,x)` followed by
-          `SELECT id, x FROM u` now returns [7,a] (was empty).
-          TestExplainParity `INSERT IPK alias u` narrows from
-          off-by-11 to off-by-1 (a single OP_Noop placeholder
-          in GenerateConstraintChecks not yet emitted —
-          minor, deferred).  DiagIndexing `rowid alias custom`
-          stays divergent on a separate SELECT-ORDER-BY bail
-          unrelated to the IPK path.
-     [~] Multi-row VALUES — DONE 2026-05-01 (multi-row VALUES arm).
-          sqlite3Insert now detects the SF_Values UNION-ALL chain
-          left by sqlite3MultiValues' fallback path, walks pPrior to
-          collect each row's pEList in insertion order, validates
-          column-count parity, and emits the per-row column-eval +
-          rowid + GenerateConstraintChecks + CompleteInsertion +
-          regRowCount-bump body in a Pascal-side loop (inline
-          unrolling — not the C coroutine).  Verified: DiagMultiValues
-          now reports count=3 (was 1); DiagDml `multi-row values expr`
-          flips DIVERGE→PASS; TestExplainParity 1018/1026 (was
-          1016/1026).  TestExplainParity `INSERT multi-row VALUES`
-          remains a bytecode-Δ entry (C=22 ops vs Pas=17) because
-          unrolling is structurally different from C's coroutine
-          loop, but the runtime behaviour is correct.
-          INSERT FROM SELECT (true compound-SELECT-as-source) still
-          bails — folds into 6.10 step 6 sub-FROM and step 9(e)
-          compound-SELECT codegen; coroutine arm of sqlite3MultiValues
-          also still TODO if byte-parity is wanted.
-     [X] AUTOINCREMENT — DONE 2026-05-01.  `CREATE TABLE ...
-          AUTOINCREMENT` creates and pins sqlite_sequence;
-          `sqlite3AutoincrementEnd` is called from sqlite3Insert so
-          the in-row write-back epilogue fires; `regRowCount` is
-          allocated and bumped per insert; **autoIncStep**
-          (insert.c:521) is now emitted per-row in sqlite3Insert
-          (`OP_MemMax regAutoinc, regRowid`) so the running-max
-          register actually tracks the inserted rowid.  Verified:
-          `INSERT INTO t(x) VALUES('a'),('b'),('c')` against
-          `CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x)`
-          now writes `seq=3` to sqlite_sequence (was 0); matches C
-          reference exactly.
+     [X] IPK-alias rebinding (insert.c:1488..1531) — DONE 2026-05-01.
+          `INSERT IPK alias u` narrowed from off-by-11 to off-by-1
+          (a single OP_Noop placeholder in GenerateConstraintChecks
+          not yet emitted — minor, deferred).
+     [~] Multi-row VALUES — runtime DONE 2026-05-01 (sqlite3Insert
+          walks the SF_Values UNION-ALL chain inline-unrolled per row).
+          DiagMultiValues count=3 matches C; DiagDml `multi-row values
+          expr` PASS.  Bytecode-Δ remains (C=22 vs Pas=17, structural
+          difference) — coroutine arm of sqlite3MultiValues still
+          deferred for byte-parity.  INSERT FROM SELECT (true
+          compound-SELECT-as-source) still bails — folds into
+          6.10 step 6 sub-FROM and step 9(e).
+     [X] AUTOINCREMENT — DONE 2026-05-01.
      [~] BEFORE / AFTER INSERT triggers — structurally wired into
-          sqlite3Insert 2026-05-01 + trigger-body compiler ported.
-          Per-row body in sqlite3Insert allocates a per-iteration
-          endOfLoop label, builds the NEW.* pseudo-table at regCols
-          when tmask & TRIGGER_BEFORE, calls sqlite3CodeRowTrigger for
-          BEFORE and AFTER (mirrors insert.c:1442..1499 + 1604..1608).
-          codeRowTrigger / codeTriggerProgram / transferParseError
-          (trigger.c:1231 / :1111 / :1215) are now ported faithfully:
-          codeRowTrigger spins up a sub-Parse, allocates TriggerPrg +
-          SubProgram, codes the WHEN clause + step list, terminates
-          with OP_Halt, takes the op array out via VdbeTakeOpArray
-          and installs it on the SubProgram.  trgGetRowTrigger does
-          the cache lookup + codeRowTrigger compile.
+          sqlite3Insert 2026-05-01 + codeRowTrigger / codeTriggerProgram
+          / transferParseError ported (trigger.c:1231 / :1111 / :1215).
           Two pre-existing parse-time bugs in sqlite3FinishTrigger
-          fixed in passing: (a) the C "drain pStepList while walking"
-          idiom was broken by an extra walker variable, causing a
-          double-free of the step chain via sqlite3DeleteTrigger +
-          tail DeleteTriggerStep; (b) the C `pTrig =
-          sqlite3HashInsert(...)` reassign was lost (result stored
-          only in pInserted), so the schema-owned trigger was freed
-          a second time at cleanup.  Verified: CREATE TRIGGER ... ON
-          t BEGIN SELECT 1; END now prepares + steps + finalizes +
-          closes cleanly (was EAccessViolation in DeleteTriggerStep).
-          KNOWN LEAK (DiagTrig sketch, not in suite): an INSERT that
-          actually fires the trigger crashes during finalize with
-          a double-free on the parent VDBE's op-array.  Symptom:
-          parent VDBE's aOp/nOp visible in gdb as small bogus values
-          (~0x95e4 / 6.8M) by the time vdbeClearObject runs.
-          Suspected: sub-vdbe ↔ parent-vdbe lifecycle interaction in
-          codeRowTrigger / nested DML codegen, OR sqlite3VdbeTakeOpArray
-          and parent's ops sharing state.  Tracking separately;
-          regression suite (TestExplainParity 1018/1026, TestDMLBasic
-          54/0, TestSchemaBasic 44/0, DiagDml 13/1, DiagMultiValues
-          count=3) stays green because no test in suite both creates
-          a trigger AND fires it.
+          fixed in passing (step-list drain idiom + pTrig HashInsert
+          reassign).  CREATE TRIGGER + non-firing INSERT path clean.
+          **KNOWN BUG (DiagTrig probe):** an INSERT that actually
+          fires the trigger crashes during sqlite3_finalize with
+          double-free.  gdb shows the parent VDBE's aOp/nOp corrupted
+          (~0x95e4 / 6.8M) by vdbeClearObject time.  Suspect: sub-vdbe
+          ↔ parent-vdbe lifecycle interaction in codeRowTrigger /
+          nested DML codegen.  Regression suite stays green because
+          no test in suite both creates a trigger AND fires it.
      [ ] RETURNING clause emission — DiagDml RETURNING corpus.
      [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
      [ ] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
@@ -392,49 +340,30 @@ skeleton.
 ### Open Bugs
 
 - [ ] **6.10** `TestExplainParity.pas`
-    - [ ] **6.10 step 6** Make these to work (port code when required):
-        [ ] `INSERT INTO t VALUES(1,2,3),(4,5,6)` — Δ=11 (multi-row
-          VALUES path).  **Runtime impact (verified 2026-04-28 via
-          src/tests/DiagMultiValues.pas):** silent data loss — Pas
-          inserts only the first row (count=1), C inserts all three
-          (count=3).  Stub `sqlite3MultiValues` (codegen.pas:19613)
-          drops every pRow past the first; even if the UNION ALL
-          fallback were ported, `sqlite3Insert` early-exits when
-          `pSelect <> nil` (codegen.pas:19756 TODO) so the coroutine
-          path through sqlite3Insert is required too.
+    - [ ] **6.10 step 6** Remaining TestExplainParity bytecode-Δ rows
+       (8 diverges in 1018/1026 corpus):
         [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
-          Δ=16..18 (ORDER BY sorter / ephemeral-key path: Pas emits
-          only 3 ops, no sorter open / KeyInfo / sort-finalise loop).
-        [ ] `SELECT a FROM t GROUP BY a` — Δ=42 (aggregate-group
-          path, not yet ported).
-        [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=7 (sub-FROM
-          materialise / co-routine path not ported).  Folds into 6.13(b).
-          Note 2026-04-28: `sqlite3SrcItemAttachSubquery` (build.c:5019)
-          + the subquery branch of `sqlite3SrcListAppendFromTerm`
-          (build.c:5102) are now real; the parser no longer drops the
-          inner SELECT.  Remaining work: view-expansion arm of
-          selectExpander (select.c:6045 IsView path) + sub-FROM
-          codegen / co-routine emission in sqlite3Select.
-        [ ] `UPDATE t SET a=5 WHERE rowid=1` — Δ=14 (`sqlite3Update`
-          still skeleton-only — see 11g.2.f open follow-on).
-        [ ] `INSERT INTO u VALUES(1, 2);` (u declared `p PRIMARY KEY,
-          q` — non-INTEGER PK, so NOT a rowid alias) — Δ=11.  Diag
-          (`src/tests/DiagAutoIdx.pas`) confirms the implicit
-          `sqlite_autoindex_u_1` *is* registered at parse time
-          (sqlite_schema row, rootpage 5), so the gap is downstream:
-          the INSERT codegen does not maintain the autoindex because
-          `sqlite3GenerateConstraintChecks` + `sqlite3CompleteInsertion`
-          are still stubs (see 6.9-bis 11g.2.b open items).  Closing
-          those will close this row.
+          C=19/19/20 vs Pas=3 (ORDER BY sorter / ephemeral-key path
+          not ported).
+        [ ] `SELECT a FROM t GROUP BY a` — C=45 vs Pas=3
+          (aggregate-group path not yet ported).
+        [ ] `SELECT a FROM (SELECT a FROM t)` — C=10 vs Pas=16.
+          Pas now emits the co-routine path (6.13(b) piece 4); C
+          flattens via `flattenSubquery`.  Closes once 6.13(b)-fl
+          lands.
+        [ ] `INSERT multi-row VALUES` — C=22 vs Pas=17.  Runtime
+          parity reached 2026-05-01 (DiagMultiValues count=3); Pas
+          unrolls the rows inline, C emits a coroutine.  Bytecode
+          parity needs the coroutine arm of sqlite3MultiValues if
+          wanted (deferred — runtime is correct).
+        [ ] `INSERT IPK alias u` (`u(p PRIMARY KEY, q)` — non-INTEGER
+          PK) — C=21 vs Pas=20, off by one OP_Noop placeholder in
+          GenerateConstraintChecks.  Minor.
         [ ] `SELECT p FROM u;` — per-op divergence at op[1]
-          (`OpenRead p1=1 p2=5` in C vs `p1=0 p2=4` in Pas).  Same
-          fixture: u has the implicit autoindex on `p`.  C planner
-          picks the autoindex for a covering scan (rootpage 5);
-          Pas planner falls through to the table scan (rootpage 4).
-          Root cause: `whereLoopAddBtree` / `bestIndex` cost model
-          not yet considering covering indexes when no WHERE clause
-          exists.  Distinct from the INSERT row above — needs planner
-          work, not insert.c work.
+          (C `OpenRead p1=1 p2=5` autoindex covering scan vs Pas
+          `p1=0 p2=4` table scan).  Root cause:
+          `whereLoopAddBtree` / `bestIndex` cost model not yet
+          considering covering indexes when no WHERE clause exists.
   
   [ ] **6.10 step 7** Runtime divergences surfaced by
       `src/tests/DiagMisc.pas` (run with `LD_LIBRARY_PATH=$PWD/src
@@ -548,19 +477,15 @@ skeleton.
       [ ] **d) `INSERT OR IGNORE` / `OR REPLACE` / `OR FAIL` ignore
         conflict resolution** — DiagTxn `insert or ignore unique`,
         `insert or replace unique`, `insert or fail returns err` all
-        diverge.  Folds into the existing 6.9-bis 11g.2.b
-        `sqlite3GenerateConstraintChecks` gap — the conflict-resolution
-        action is encoded in OP_Halt P5 but currently not emitted.
+        diverge.  GenerateConstraintChecks now emits OP_Halt P5; the
+        remaining gap is wiring/runtime — re-triage post 6.8.6.
       [ ] **e) IPK alias auto-rowid increment** — DiagTxn `integer
         primary key alias`: `INSERT INTO t(id INTEGER PRIMARY KEY, x)
         VALUES(7,'a'); INSERT VALUES(NULL,'b')` should set id=8 (next
-        rowid past max), Pas sets id=2 (sequential).  Same root cause
-        as INSERT IPK alias u Δ in TestExplainParity — folds into
-        sqlite3GenerateConstraintChecks.
+        rowid past max), Pas sets id=2 (sequential).
       [ ] **f) `changes()` returns 0 after UPDATE** — DiagTxn
-        `changes() after update`.  Folds into `sqlite3Update` body
-        skeleton (6.9-bis 11g.2.f); UPDATE never actually fires, so
-        nChange stays 0 even with the new VdbeHalt accounting.
+        `changes() after update`.  sqlite3Update is now ported
+        (6.8.1 done); re-triage.
 
   [ ] **6.10 step 17** Window-function and aggregate divergences surfaced
       by the new `src/tests/DiagWindow.pas` probe (run with
@@ -711,424 +636,25 @@ skeleton.
             6.10 step 9(c) note — once subqueries work, views fold in
             for free because selectExpander rewrites a VIEW FROM-item
             into a SUBQUERY FROM-item.
-            **2026-05-01 spike (reverted, kept here as a map for the
-            next attempt).**  A four-piece prototype landed and was
-            reverted on the same branch:
-              1. `SRT_EphemTab` accepted at the top dest gate
-                 (codegen.pas:19502) plus a disposal arm
-                 (`MakeRecord` + `NewRowid` + `Insert`/APPEND) right
-                 after the `SRT_Mem` arm in the regular path's inner
-                 loop disposal block.
-              2. selectExpander FROM-loop was extended so subquery
-                 SrcItems get a recursive `sqlite3SelectPrep` on the
-                 inner SELECT followed by `sqlite3ExpandSubquery`
-                 (without this, outer column refs into a subquery
-                 fail to resolve with "no such column").  Order
-                 matters — the new arm must run before the existing
-                 `if pItem^.zName = nil then Continue` skip.
-              3. A standalone "materialise sub-SELECT" arm was added
-                 in `sqlite3Select` right before the regular path's
-                 "all source items must be real base tables" gate at
-                 line 20104, gated on nSrc=1 / SRT_Output / no WHERE
-                 / no DISTINCT / no Aggregate / no Compound / pSubq
-                 non-nil / pSTab non-nil.  Allocates one cursor (the
-                 same iCursor selectExpander assigned, so resolved
-                 TK_COLUMN refs find the eph cursor), opens
-                 `OP_OpenEphemeral iEph, innerNCol`, recursively codes
-                 the inner via `sqlite3Select(... SRT_EphemTab ...)`,
-                 then hand-rolls a Rewind/Column/ResultRow/Next/Close
-                 outer scan.
-              4. Bytecode shape matched the C oracle for the simple
-                 `SELECT a FROM (SELECT a FROM t)` case.  But at
-                 runtime every materialised query hit
-                 `SQLITE_CORRUPT (11) "database disk image is
-                 malformed"` raised inside the OP_NewRowid →
-                 sqlite3BtreeLast → moveToRoot path on the eph
-                 cursor.  All existing OpenEphemeral usage in the
-                 port passes a `P4_KEYINFO` (indexed eph); this is
-                 the first rowid-table eph callsite, and the
-                 SCHEMA_ROOT+1 auto-root path in
-                 `passqlite3vdbe.pas:9152` appears to need an
-                 explicit `sqlite3BtreeCreateTable` before the
-                 cursor open.  DiagFeatureProbe also surfaced an
-                 EAccessViolation regression (CREATE VIEW + SELECT
-                 count) — the selectExpander subquery hook
-                 triggered some downstream NIL-deref on the
-                 view→subquery rewrite path.  Both issues are
-                 localized to the prototype and unrelated to
-                 6.13(a).  Reverted so main stays clean.
-            **Next attempt suggestions (in order of effort / value):**
-              * [x] Fix `OP_OpenEphemeral` rowid-table path
-                (passqlite3vdbe.pas:9150..9155) — done 2026-05-01.
-                The C comment "use the auto-created table at
-                SCHEMA_ROOT+1" relied on newDatabase pre-allocating
-                page 2; the port's newDatabase only initialises
-                page 1, so the rowid arm now calls
-                `sqlite3BtreeCreateTable(BTREE_INTKEY)` and captures
-                the assigned pgno before `sqlite3BtreeCursor`.
-                Index-table arm unchanged.  Smoke landed as
-                TestVdbeCursor T9: hand-rolled bytecode opens an
-                eph rowid table, inserts 3 rows via
-                NewRowid+MakeRecord+Insert, scans them back via
-                Rewind/Column/ResultRow/Next — produces 3 rows,
-                rc=SQLITE_DONE (was SQLITE_CORRUPT).  Unblocks the
-                materialise arm in piece 3.
-              * [x] Re-land the SRT_EphemTab dest + disposal arm
-                (piece 1) — done 2026-05-01.  Top dest gate at
-                codegen.pas:19510 now accepts SRT_EphemTab alongside
-                SRT_Output / SRT_Set / SRT_Mem.  Disposal arm slotted
-                in at codegen.pas:20420 (immediately after the
-                SRT_Mem branch) emits the C-mirror triplet:
-                `OP_MakeRecord iSdst, nResultCol, r1` →
-                `OP_NewRowid iSDParm, r2` →
-                `OP_Insert iSDParm, r1, r2` with
-                `p5 |= OPFLAG_APPEND`; both temp regs released.
-                Mirrors selectInnerLoop:1349..1370 (SRT_Table /
-                SRT_EphemTab branch).  Smoke landed as
-                TestSelectBasic T11: drives the existing
-                sqlite3MaterializeView path inline (CREATE TABLE
-                base; build SrcList(base); SelectNew(*); Select
-                with dest=SRT_EphemTab) and walks the resulting
-                bytecode to assert the triplet appears, in order,
-                with iSDParm on each cursor op and OPFLAG_APPEND on
-                the Insert.  All regression tests stay green
-                (TestExplainParity unchanged at 1016 pass / 10
-                diverge baseline).  This unblocks piece 3 (the
-                materialise arm) — once the cursor at iSDParm is
-                opened by the caller and the FROM dispatcher routes
-                a sub-SELECT here, rows will land in the eph table
-                via the disposal arm landed today.
-              * [x] Re-land the selectExpander subquery hook (piece 2)
-                separately, and add a DiagFeatureProbe gate-row to
-                lock the no-regression guarantee on VIEW.  Done
-                2026-05-01.  Hook landed in sqlite3SelectExpand
-                FROM-loop (codegen.pas:18157) just before the existing
-                zName/pSubq skips: when SrcItemIsSubquery(fg) and
-                pItem^.u4.pSubq <> nil, recursively run
-                sqlite3SelectPrep on the inner pSelect, then
-                sqlite3ExpandSubquery to materialise pSTab from the
-                inner result columns, then assign iCursor and
-                Continue (so the base-table arm below skips the now-
-                resolved item).  The prior spike's EAccessViolation
-                regression was driven by the same hook firing on a
-                view->subquery rewrite mid-iteration; this re-land
-                stays at the top of the loop and the view arm below
-                is unchanged, so the recursive sqlite3SelectExpand
-                the view arm triggers reaches this hook only via the
-                inner SELECT (not via re-entry on the same item).
-                Gate row landed in DiagFeatureProbe.pas:
-                'CREATE VIEW + plain SELECT FROM v' currently locks
-                at Pas chkPrep=1/val=-1 (preparable-view gate, will
-                flip to PASS once piece 3 lands the materialise arm).
-                Regression sweep stays at TestExplainParity 1016/10,
-                TestSelectBasic 60/0, TestDMLBasic 54/0,
-                TestSchemaBasic 44/0, TestWhereBasic 52/0,
-                TestVdbeCursor 29/0; DiagFeatureProbe goes from 9
-                to 10 divergences (the new gate row, both view rows
-                still diverge at chkPrep=1 — no crash, no
-                EAccessViolation).
-              * [x] Then re-land the materialise arm (piece 3) — at
-                that point it should produce live rows.  Done
-                2026-05-01.  Standalone arm landed in sqlite3Select
-                just before the "all source items must be real base
-                tables" gate (codegen.pas:20239), gated on nSrc=1 /
-                SRT_Output / no WHERE / no DISTINCT / IS_SUBQUERY /
-                pSubq non-nil / pSelect non-nil / pSTab non-nil
-                (the last guaranteed by piece 2).  Opens an eph
-                rowid table at the cursor selectExpander assigned,
-                recursively codes the inner via SRT_EphemTab so
-                piece 1's disposal arm appends each row, then
-                hand-rolls Rewind/Column/ResultRow/Next/Close on
-                the materialised rows.  Live-row smoke (off-tree):
-                `SELECT a FROM (SELECT a FROM t)` returns [1,2,3];
-                `SELECT a+10 FROM (...)` returns [11,12,13];
-                `SELECT a FROM (SELECT a FROM t WHERE a>1)` returns
-                [2,3].  DiagFeatureProbe gate row
-                'Sub-SELECT FROM materialise' flips to PASS.
-                count(*)-of-subquery still bails at the SF_Aggregate
-                gate above the materialise arm — that's a separate
-                aggregate-on-subquery lift not in piece 3 scope.
-                CREATE VIEW + SELECT rows still diverge at chkPrep=1
-                ("no such column: a") — pre-existing resolver-side
-                gap on the view->subquery rewrite, unrelated to
-                piece 3 (materialise arm itself isn't reached).
-                Regression sweep stays green (TestExplainParity
-                1016/10, all single-test suites unchanged).
-              * [x] Co-routine emission (`sqlite3CodeSubquery`)
-                lands last, replaces the materialise arm where the
-                inner isn't correlated, and unblocks the wider
-                bail-lift sweep at the five existing gate sites.
-                Done 2026-05-01 (the emission half — the bail-lift
-                sweep at the five sites is deferred and tracked
-                below).  Faithful port of select.c tag-select-0482
-                (the fromClauseTermCanBeCoroutine branch around
-                select.c:8043..8062): for uncorrelated single-source
-                FROM (SELECT ...) we now prefer co-routine over
-                materialisation.  Arm landed in sqlite3Select just
-                before piece 3's materialise arm
-                (codegen.pas:20279), gated additionally on
-                `(pSubSel^.selFlags and SF_Correlated) = 0` and
-                `OptimizationEnabled(SQLITE_Coroutines)`.  Inner is
-                wrapped in OP_InitCoroutine + OP_EndCoroutine; outer
-                drives via OP_Yield; outer pEList is coded normally
-                then `translateColumnToCopy` (newly ported,
-                where.c:716..760) rewrites OP_Column iCsr,col into
-                OP_Copy regResult+col so result reads come from the
-                inner's regResult block instead of via a
-                materialised eph cursor.
-
-                Plumbing landed alongside:
-                  - `SQLITE_Coroutines = u32($02000000)` constant
-                    added (mirrors sqliteInt.h:1927).
-                  - SRT_Coroutine added to sqlite3Select's top dest
-                    gate (codegen.pas:19543) so recursive
-                    `sqlite3Select(... SRT_Coroutine ...)` doesn't
-                    fall through to the no-body stub.
-                  - SRT_Coroutine disposal arm in selectInnerLoop
-                    (codegen.pas:20546) emits `OP_Yield iSDParm`
-                    after the per-column emit, mirroring
-                    select.c:1441..1454.
-                  - Bug fix in `OP_EndCoroutine`
-                    (passqlite3vdbe.pas:7066): the prior pas port
-                    jumped to `aOp[pIn1^.u.i]` (the saved Yield
-                    itself) instead of to `aOp[savedYield.p2 - 1]`
-                    (the Yield's addrEnd parameter), so a
-                    co-routine that ran past its last row would
-                    spin instead of breaking out of the outer
-                    loop.  Re-port now matches vdbe.c:1203..1213
-                    exactly: jump to the saved Yield's `p2 - 1`
-                    and write `pIn1^.u.i = (this EndCoroutine
-                    addr) - 1` so any later Yield re-enters
-                    EndCoroutine and re-jumps to addrEnd.
-                  - Bug fix in the addrTop calculation: was
-                    `currentAddr+2` (off by one — skipped the
-                    inner's first opcode), now `currentAddr+1`
-                    matching select.c:8047 exactly.
-
-                Live-row smoke (off-tree, equivalent to piece 3's
-                smoke but now via co-routine path):
-                `SELECT a FROM (SELECT a FROM t)` returns [1,2,3];
-                `SELECT a+10 FROM (...)` returns [11,12,13];
-                `SELECT a FROM (SELECT a FROM t WHERE a>1)` returns
-                [2,3].  DiagFeatureProbe gate row
-                'Sub-SELECT FROM materialise' stays PASS (the
-                row name now lies — it's actually exercising the
-                co-routine arm — but the contract is "Pas matches
-                C", which still holds).
-
-                Bytecode shape does NOT match the C oracle yet
-                because C applies subquery flattening
-                (select.c:flattenSubquery) for the simple
-                uncorrelated case, producing a single flat scan;
-                our port emits the co-routine bytecode shape (4
-                opcodes for the inner skeleton + outer scan)
-                instead.  Both produce the same rows.  Flattening
-                is its own large port and is tracked under a
-                future 6.13 sub-arm — landing it would converge
-                the bytecode to the C oracle and likely flip a
-                few EXPLAIN parity rows.  TestExplainParity stays
-                at 1016/10 either way (no sub-SELECT FROM rows in
-                the current corpus).
-
-                Bail-lift sweep at the five `IS_SUBQUERY` gate
-                sites (codegen.pas:19686, :19964, :20021, :20165,
-                :20255) is NOT done in this piece — those gates
-                exit `sqlite3Select` before the new co-routine /
-                materialise hot-path arms reach them, so the
-                hot-path arms cover the simple shape but more
-                complex shapes (DISTINCT-on-subquery, aggregate-
-                on-subquery, multi-FROM with subquery items, etc.)
-                still bail.  Each of the five sites needs its own
-                gated, tested lift since the right behaviour
-                differs (some need to route through the
-                co-routine arm, some need WHERE-code integration).
-                Tracked as a follow-up subtask under 6.13(b).
-
-                **Sweep audit (post-piece-4):** the five sites
-                resolve into three categories — confirm-only,
-                materialise-lift, dispatcher-lift.  Mapped to
-                current passqlite3codegen.pas line numbers:
-
-                - Site #1 (codegen.pas:19733, GROUP BY agg arm):
-                  bails on IS_SUBQUERY.  See sites #1+#3 design
-                  note below — the lift is NOT a surgical bail
-                  removal.  PENDING.
-                - Site #2 (codegen.pas:20011, simple count fast
-                  path): IS_SUBQUERY = 0 gate is C-faithful —
-                  matches `isSimpleCount` at select.c:5441 line
-                  for line, count(*)-on-subquery is excluded by
-                  C as well.  No lift needed; comment now cites
-                  the C source directly.  DONE.
-                - Site #3 (codegen.pas:20068, general agg arm):
-                  same shape as site #1.  Paired lift with #1.
-                  PENDING.
-
-                **Sites #1+#3 design note (post-C-oracle audit).**
-                The original framing — "lift the IS_SUBQUERY
-                bail" — is misleading.  C handles
-                agg-on-subquery via two entirely distinct paths,
-                neither of which is a localised lift in the agg
-                arm:
-
-                1. **Flattenable inner** (no DISTINCT, no
-                   aggregate, no compound, …): C's
-                   `flattenSubquery` (select.c:flattenSubquery)
-                   rewrites `SELECT agg FROM (SELECT cols FROM t
-                   WHERE …)` into `SELECT agg FROM t WHERE …`
-                   BEFORE the agg arm runs.  C oracle for
-                   `SELECT count(*) FROM (SELECT a FROM t)`
-                   produces the 5-op fast path against `t`
-                   directly (OpenRead/Count/Close/Copy/
-                   ResultRow) — identical to `SELECT count(*)
-                   FROM t`.  Same for `SELECT avg(a) FROM
-                   (SELECT a FROM t WHERE a>1)` — flattened to
-                   `SELECT avg(a) FROM t WHERE a>1`.
-
-                2. **Non-flattenable inner** (DISTINCT,
-                   aggregate-in-subquery, etc.): C's
-                   per-pSrcItem dispatcher (select.c:7983..8133)
-                   emits a **co-routine** (not materialise) for
-                   the inner.  `sqlite3WhereBegin`'s viaCoroutine
-                   arm then drives the outer agg path: the inner
-                   yields one row at a time, `AggStep` runs in
-                   the Yield-loop body, `AggFinal` after the
-                   loop.  C oracle for `SELECT count(*) FROM
-                   (SELECT DISTINCT a FROM t)`:
-                       InitCoroutine → inner DISTINCT body →
-                       EndCoroutine → Null accumulator →
-                       InitCoroutine → Yield+AggStep loop →
-                       AggFinal → Copy → ResultRow
-
-                Implications for the Pas port:
-
-                - Lifting only the IS_SUBQUERY bail at sites #1
-                  and #3 cannot produce C-faithful bytecode.
-                  The flattenable case needs `flattenSubquery`;
-                  the non-flattenable case needs the dispatcher
-                  to set up a co-routine FROM-item, then the agg
-                  arm's call to `sqlite3WhereBegin` would route
-                  through the existing viaCoroutine arm at
-                  codegen.pas:16395.
-
-                - Pas's `sqlite3WhereBegin` viaCoroutine arm
-                  (codegen.pas:16395..16404) is already in
-                  place from earlier porting; what is missing
-                  is wiring the agg arms so the dispatcher runs
-                  before them and so they no longer bail on
-                  IS_SUBQUERY for items the dispatcher has
-                  already handled.
-
-                **Re-scoped follow-ups** (replace the original
-                "sites #1+#3 lift"):
-
-                - **6.13(b)-fl**: port `flattenSubquery`
-                  (select.c:flattenSubquery, ~600 lines).  Once
-                  landed, the flattenable case of agg-on-subquery
-                  works end-to-end with bytecode parity, no
-                  changes to sites #1 or #3 needed.  This is the
-                  same future sub-arm noted in piece 4's commit
-                  message.
-
-                - **6.13(b)-coagg**: agg-arm + dispatcher
-                  integration for the non-flattenable case.
-                  Move the per-pSrcItem subquery dispatcher
-                  (currently the standalone arms at 20283 / 20397
-                  for SRT_Output) up to run as a pre-pass before
-                  the agg arms when SF_Aggregate is set.  Lift
-                  IS_SUBQUERY bails in the agg arms.  The
-                  existing WhereBegin viaCoroutine arm picks up
-                  the rest.  Requires careful review of the
-                  AggInfo column-resolution path
-                  (analyzeAggList) against coroutine FROM-items.
-
-                Site #1+#3 remain PENDING under these two
-                re-scoped follow-ups.  No code change in this
-                audit — diverging from C bytecode shape would
-                trade a passing IS_SUBQUERY bail for a worse
-                regression-test story (TestExplainParity would
-                gain new diverges).
-                - Site #4 (codegen.pas:20212, eponymous-vtab arm):
-                  IS_SUBQUERY = 0 gate is correct — subquery
-                  items fall through to the co-routine /
-                  materialise arms immediately below (lines 20305,
-                  20416).  No lift needed.  DONE.
-                - Site #5 (codegen.pas:20488, final pre-regular-
-                  cursor-open bail): multi-FROM with subquery
-                  items.  Largest lift — needs per-pSrcItem
-                  dispatcher mirroring select.c:7983..8133 plus
-                  WHERE-code integration for the resulting eph
-                  cursor / regResult block.  PENDING.
-
-                  **Prep landed (no behaviour change):**
-                  - WhereEnd OP_Column→OP_Copy rewrite for
-                    viaCoroutine items (where.c:7754..7761) —
-                    see codegen.pas:16126.
-                  - WhereBegin cursor-open guards on both the
-                    multi-level path (codegen.pas:15471) and
-                    the single-table rowid-shortcut path
-                    (codegen.pas:15611) — both now skip
-                    TF_Ephemeral / IsView / viaCoroutine items
-                    (where.c:7259).
-                  - **Site #5 (a)** narrow lift of the
-                    nTabList=1 bail for viaCoroutine FROM items
-                    (codegen.pas:15407..15426).  When the single
-                    FROM item is viaCoroutine, sqlite3WhereBegin
-                    now routes through the full-planner branch
-                    (whereLoopAddAll → wherePathSolver →
-                    codeOneLoopStart) so the InitCoroutine +
-                    Yield emission at codegen.pas:16437 and the
-                    WhereEnd OP_Column→OP_Copy rewrite actually
-                    fire instead of bypassing into the
-                    rowid-shortcut body emission at
-                    codegen.pas:15686..15909.  Dormant until
-                    site #5 (b) wires the per-pSrcItem dispatcher
-                    that actually produces a viaCoroutine
-                    single-table FROM — no SELECT in the corpus
-                    today exercises the new path, so no PASS
-                    rows move.  Wider lift (drop the bail
-                    entirely so every nTabList=1 plan goes
-                    through the planner — option b-faithful)
-                    deferred until codeOneLoopStart is verified
-                    to cover every shape the inline block at
-                    15686..15909 currently handles.
-
-                  Tracked as **site #5 (a)** — planner viaCoroutine
-                  support, narrow lift LANDED — with site #5's
-                  actual dispatcher emission as **site #5 (b)**
-                  layered on top.
-
-                  **site #5 (b)** — full nTabList=1 bail lift
-                  LANDED 2026-05-01 (commit 41167c7).  Removes
-                  the explicit bail at codegen.pas:15422..15426 so
-                  every single-table case whereShortCut cannot
-                  classify (WHERE_OR_SUBCLAUSE recursion, virtual
-                  tables, INDEXED BY / NOT INDEXED) routes through
-                  the full planner instead of returning nil.
-                  Verified: TestExplainParity 1018/8/1026
-                  unchanged, no regressions across the test suite.
-
-                  **site #5 (c)** — INDEXED BY planner wiring
-                  LANDED 2026-05-01 (commit 889ca4f).  Three
-                  coupled fixes: (1) selectExpander now calls
-                  sqlite3IndexedByLookup for FROM items with
-                  fg.isIndexedBy set, (2) sqlite3CreateIndex
-                  populates pIndex^.colNotIdxed, (3) the planner-
-                  branch cursor-open loop allocates iIdxCur and
-                  emits OP_OpenRead with KeyInfo + OPFLAG_SEEKEQ.
-                  Net: DiagIndexing 7→6 (`not indexed` PASS).
-                  `indexed by ok` blocked on 6.8.6 (sqlite3Insert
-                  index-write rewrite).
-
-                Sites #2 and #4 close as no-op-needed because the
-                Pas gates are already faithful to C.  Sites #1,
-                #3 remain open as separate gated lifts.
-
-                Regression sweep stays green: TestExplainParity
-                1016/10, TestSelectBasic 60/0, TestDMLBasic 54/0,
-                TestSchemaBasic 44/0, TestWhereBasic 52/0,
-                TestVdbeCursor 29/0, TestSmoke pass.
-                DiagFeatureProbe stays at 10 divergences (the
-                VIEW gate row from piece 2; sub-SELECT row PASS).
+            **Status 2026-05-01:** four-piece port LANDED (rowid eph
+            fix, SRT_EphemTab disposal arm, selectExpander subquery
+            hook, materialise arm) plus co-routine emission.  Simple
+            uncorrelated `SELECT a FROM (SELECT a FROM t)` returns live
+            rows via co-routine.  Bytecode shape diverges from C oracle
+            because C applies subquery flattening — see 6.13(b)-fl.
+            Bail-lift sweep at five IS_SUBQUERY gate sites: sites #2/#4
+            confirmed C-faithful (no lift needed), site #5 (a/b/c)
+            landed (planner viaCoroutine support, full nTabList=1 lift,
+            INDEXED BY wiring).  Sites #1/#3 (agg-on-subquery) remain
+            open under re-scoped follow-ups:
+            - **6.13(b)-fl**: port `flattenSubquery` (select.c, ~600
+              lines).  Closes the flattenable agg-on-subquery case with
+              bytecode parity.
+            - **6.13(b)-coagg**: agg-arm + dispatcher integration for
+              non-flattenable case.  Move per-pSrcItem subquery
+              dispatcher to run as pre-pass before agg arms when
+              SF_Aggregate is set; lift IS_SUBQUERY bails in agg arms;
+              existing WhereBegin viaCoroutine arm picks up the rest.
        [ ] **c) Compound-SELECT / CTE arm** — UNION / INTERSECT /
             EXCEPT FROM-sources and `WITH … AS (…)` references.
             Once 6.13(b) lands, compound-SELECT-as-FROM-source
