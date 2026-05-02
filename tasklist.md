@@ -168,37 +168,31 @@ skeleton.
           compound-SELECT-as-source) still bails — folds into
           6.10 step 6 sub-FROM and step 9(e).
      [X] AUTOINCREMENT — DONE 2026-05-01.
-     [~] BEFORE / AFTER INSERT triggers — structurally wired into
-          sqlite3Insert 2026-05-01 + codeRowTrigger / codeTriggerProgram
-          / transferParseError ported (trigger.c:1231 / :1111 / :1215).
-          Two pre-existing parse-time bugs in sqlite3FinishTrigger
-          fixed in passing (step-list drain idiom + pTrig HashInsert
-          reassign).  CREATE TRIGGER + non-firing INSERT path clean.
-          **CRASH FIXED 2026-05-01 (defensive):** the
-          DiagTrig double-free was masked by detecting the
-          `pSubProgram^.aOp == p^.aOp` aliasing in
-          `sqlite3VdbeClearObject` and skipping the second free.
-          vdbeFreeOpArray now also clears `p4type/p4` after free
-          so any later visit is a no-op.  ROOT CAUSE STILL OPEN:
-          tracing showed the parent INSERT vdbe ends prepare with
-          `aOp == pProgram^.aOp` (same pointer); how that aliasing
-          arises has not been pinned down.  Each prepare creates
-          two vdbes (parent + a second from a stack TParse at a
-          consistent offset that does NOT match codeRowTrigger's
-          sSubParse), and the second vdbe's aOp gets reused at the
-          same address as the SubProgram's aOp by malloc.  After
-          the workaround DiagTrig completes without crash but the
-          AFTER trigger still does not fire (log empty;
-          sqlite3_step rc=1).  Regressions green: TestDMLBasic
-          54/0, TestSchemaBasic 44/0, TestSelectBasic 60/0,
-          TestWhereBasic 52/0, TestExplainParity 1019/7,
-          DiagDml 13/1, DiagIndexing unchanged, DiagFeatureProbe
-          9 diverge unchanged.
-          Follow-ups: (1) find the source of the parent.aOp ==
-          pProgram.aOp alias (likely in growOpArray/realloc or a
-          stale VdbeFrame swap); (2) make the AFTER trigger
-          actually fire (sqlite3_step rc=1 indicates the OP_Program
-          execution path still has a runtime gap).
+     [X] BEFORE / AFTER INSERT triggers — fully fires DONE 2026-05-01.
+          DiagTrig now reports `log.n = 7` matching C; DiagFeatureProbe
+          `CREATE TRIGGER then INSERT` flips to PASS (9→8 divergences).
+          Three coupled fixes landed: (1) added `OP_Trace` as a fall-
+          through case label on the OP_Init arm in vdbe.pas so trigger
+          sub-programs (which start with OP_Trace, not OP_Init) no
+          longer error with "unimplemented opcode"; (2) added the
+          missing `TK_TRIGGER` arm to `sqlite3ExprCodeTarget`
+          (expr.c:5537..5598) so `NEW.x` / `OLD.x` references emit
+          OP_Param with the documented P1 = `iTable*(nCol+1) + 1 +
+          TableColumnToStorage(iCol)`; (3) added a `resolveTriggerNewOld`
+          walker invoked from `sqlite3ResolveExprNames` and the
+          `sqlite3ResolveSelectNames` ResolveExpr nested proc so
+          TK_DOT(NEW, x) / TK_DOT(OLD, x) rewrite to TK_TRIGGER against
+          `pParse^.pTriggerTab`; (4) wired the missing
+          `sqlite3ResolveExprListNames(&sNC, pList)` call into
+          `sqlite3Insert` (insert.c:1210) so the values list inside a
+          trigger sub-INSERT actually runs through resolution.
+          Side-fix: DiagFeatureProbe `SplitExec` now tracks BEGIN/END
+          nesting so the `CREATE TRIGGER … BEGIN … END` setup is fed as
+          one statement (was previously split on the inner `;`,
+          producing a malformed CREATE TRIGGER and a stray `END`).
+          Regressions green: TestDMLBasic 54/0, TestSchemaBasic 44/0,
+          TestSelectBasic 60/0, TestWhereBasic 52/0, TestExplainParity
+          1019/7, DiagFeatureProbe 8 diverge (was 9).
      [ ] RETURNING clause emission — DiagDml RETURNING corpus.
      [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
      [ ] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
@@ -455,9 +449,11 @@ skeleton.
         across TestExplainParity (1018/8/1026), TestDMLBasic (54/0),
         TestSchemaBasic (44/0), TestSelectBasic (60/0), TestWhereBasic
         (52/0).
-      [ ] **j) AFTER INSERT trigger does not fire.**
-        Side-table populated by the trigger remains empty.  Tracked
-        under 6.23 (trigger codegen stubs).
+      [X] **j) AFTER INSERT trigger does not fire** — DONE 2026-05-01.
+        Closed by 6.8.6 BEFORE/AFTER trigger arm + the OP_Trace /
+        TK_TRIGGER / NEW.x resolver / sqlite3Insert resolve fixes
+        described above.  DiagFeatureProbe `CREATE TRIGGER then
+        INSERT` PASS (val=99 == C).
       [ ] **k) `pragma_table_info(...)` table-valued function.**
         `SELECT count(*) FROM pragma_table_info('t')` returns no row.
         Tracked under 6.12 (sqlite3Pragma).

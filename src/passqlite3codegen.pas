@@ -5784,6 +5784,27 @@ begin
           done := True;
         end;
       end;
+    TK_TRIGGER:
+      begin
+        { Port of expr.c:5537..5598.  Reference to NEW.* / OLD.* pseudo-table
+          column inside a trigger sub-program.  iTable = 1 → new.*, 0 → old.*;
+          iColumn = -1 → rowid.  Emit OP_Param with computed P1; OP_Param's
+          runtime then fetches the value from the parent VDBE frame using
+          OP_Program's P1 + this P1. }
+        if (pExpr^.y.pTab <> nil) then
+        begin
+          n := i32(sqlite3TableColumnToStorage(pExpr^.y.pTab, pExpr^.iColumn));
+          r1 := pExpr^.iTable * (pExpr^.y.pTab^.nCol + 1) + 1 + n;
+          sqlite3VdbeAddOp2(v, OP_Param, r1, target);
+          if (pExpr^.iColumn >= 0)
+             and (pExpr^.y.pTab^.aCol[pExpr^.iColumn].affinity
+                  = AnsiChar(SQLITE_AFF_REAL)) then
+            sqlite3VdbeAddOp1(v, OP_RealAffinity, target);
+        end
+        else
+          sqlite3VdbeAddOp2(v, OP_Null, 0, target);
+        done := True;
+      end;
     TK_AGG_FUNCTION:
       begin
         { Port of expr.c:5313..5325.  Aggregate-function read: return
@@ -7436,10 +7457,93 @@ begin
   end;
 end;
 
+{ resolveTriggerNewOld — partial port of resolve.c:524..604 (the
+  pParse^.pTriggerTab arm of lookupName).  Walks pE rewriting any TK_DOT
+  whose qualifier is "NEW" or "OLD" (case-insensitive) into a TK_TRIGGER
+  reference against pParse^.pTriggerTab, with iTable=1/0 and iColumn set
+  to the resolved column index (or -1 for the rowid alias).  Called
+  before the standard SrcList resolution so trigger pseudo-table refs
+  bind correctly. }
+procedure resolveTriggerNewOld(pParse: PParse; pE: PExpr);
+var
+  pTab:    PTable2;
+  iCol:    i32;
+  zTab:    PAnsiChar;
+  zCol:    PAnsiChar;
+  iTable:  i32;
+  i:       i32;
+  pList_:  PExprList;
+begin
+  if pE = nil then Exit;
+  if pParse = nil then Exit;
+  if pParse^.pTriggerTab = nil then Exit;
+  pTab := PTable2(pParse^.pTriggerTab);
+  if (pE^.op = TK_DOT)
+     and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+     and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID) then
+  begin
+    zTab := pE^.pLeft^.u.zToken;
+    zCol := pE^.pRight^.u.zToken;
+    iTable := -1;
+    if (pParse^.eTriggerOp <> TK_DELETE) and (sqlite3StrICmp(zTab, 'new') = 0) then
+      iTable := 1
+    else if (pParse^.eTriggerOp <> TK_INSERT) and (sqlite3StrICmp(zTab, 'old') = 0) then
+      iTable := 0;
+    if iTable >= 0 then
+    begin
+      iCol := sqlite3ColumnIndex(pTab, zCol);
+      if (iCol < 0) and (sqlite3IsRowid(zCol) <> 0) then
+        iCol := -1
+      else if iCol = pTab^.iPKey then
+        iCol := -1;
+      if (iCol >= -1) and (iCol < pTab^.nCol) then
+      begin
+        pE^.op      := TK_TRIGGER;
+        pE^.iTable  := iTable;
+        pE^.iColumn := i16(iCol);
+        pE^.y.pTab  := pTab;
+        pE^.pLeft   := nil;
+        pE^.pRight  := nil;
+        if iCol < 0 then
+          pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+        if iTable = 0 then
+        begin
+          if iCol >= 0 then
+            pParse^.oldmask := pParse^.oldmask or (u32(1) shl (iCol and 31))
+          else
+            pParse^.oldmask := $FFFFFFFF;
+        end else begin
+          if iCol >= 0 then
+            pParse^.newmask := pParse^.newmask or (u32(1) shl (iCol and 31))
+          else
+            pParse^.newmask := $FFFFFFFF;
+        end;
+      end;
+      Exit;
+    end;
+  end;
+  if not ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then
+  begin
+    resolveTriggerNewOld(pParse, pE^.pLeft);
+    resolveTriggerNewOld(pParse, pE^.pRight);
+    if (pE^.flags and EP_xIsSelect) = 0 then
+    begin
+      pList_ := pE^.x.pList;
+      if pList_ <> nil then
+        for i := 0 to pList_^.nExpr - 1 do
+          resolveTriggerNewOld(pParse, ExprListItems(pList_)[i].pExpr);
+    end;
+  end;
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
+  begin
+    if pNC^.pParse <> nil then
+      resolveTriggerNewOld(pNC^.pParse, pExpr);
     resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
+  end;
   Result := SQLITE_OK;
 end;
 
@@ -7708,6 +7812,16 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     bCorr:  Boolean;
   begin
     if pE = nil then Exit;
+    { NEW.x / OLD.x trigger pseudo-table refs — bind against
+      pParse^.pTriggerTab as TK_TRIGGER (resolve.c:524..604). }
+    if (pE^.op = TK_DOT)
+       and (pParse <> nil) and (pParse^.pTriggerTab <> nil)
+       and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+       and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID) then
+    begin
+      resolveTriggerNewOld(pParse, pE);
+      if pE^.op = TK_TRIGGER then Exit;
+    end;
     { Handle TK_DOT (qualified col ref: table.column) against current pSrc.
       Do this before the generic recursion to avoid incorrectly resolving
       the pLeft (table name TK_ID) and pRight (column name TK_ID) as
@@ -25058,6 +25172,7 @@ var
   endOfLoop:      i32;
   regCols:        i32;
   addrIpkBefore:  i32;
+  sNC:            TNameContext;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -25227,6 +25342,26 @@ begin
     nColumn := pList^.nExpr
   else
     nColumn := 0;
+
+  { Resolve names in the VALUES expression list (insert.c:1203..1212).
+    Required so NEW.x / OLD.x trigger refs in trigger sub-INSERTs bind to
+    TK_TRIGGER against pParse^.pTriggerTab. }
+  if pList <> nil then
+  begin
+    FillChar(sNC, SizeOf(sNC), 0);
+    sNC.pParse := pParse;
+    if sqlite3ResolveExprListNames(@sNC, pList) <> 0 then
+      goto insert_cleanup;
+  end;
+  if isMulti then
+  begin
+    FillChar(sNC, SizeOf(sNC), 0);
+    sNC.pParse := pParse;
+    for i := 0 to High(pRowsList) do
+      if (pRowsList[i] <> nil)
+         and (sqlite3ResolveExprListNames(@sNC, pRowsList[i]) <> 0) then
+        goto insert_cleanup;
+  end;
 
   { IDLIST resolution — port of insert.c:1077..1108.  Build aTabColMap so
     aTabColMap[i] = (1-based) index into pColumn for table column i, or 0

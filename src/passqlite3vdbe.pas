@@ -7620,22 +7620,27 @@ begin
       if res > 0 then goto jump_to_p2;
     end;
 
-    { ────── OP_Init ────── (vdbe.c:9046) }
-    OP_Init: begin
+    { ────── OP_Trace / OP_Init ────── (vdbe.c:9020/9046) }
+    OP_Trace, OP_Init: begin
       i := 1;
       if pOp^.p1 >= sqlite3GlobalConfig.iOnceResetThreshold then begin
-        if pOp^.opcode = OP_Trace then begin { break equivalent — handled below }
+        if pOp^.opcode = OP_Trace then begin
+          { C `break;` — exit the case without jumping; advance to next op. }
         end else begin
           while i < v^.nOp do begin
             if aOp[i].opcode = OP_Once then aOp[i].p1 := 0;
             Inc(i);
           end;
           pOp^.p1 := 0;
+          Inc(pOp^.p1);
+          Inc(v^.aCounter[SQLITE_STMTSTATUS_RUN]);
+          goto jump_to_p2;
         end;
+      end else begin
+        Inc(pOp^.p1);
+        Inc(v^.aCounter[SQLITE_STMTSTATUS_RUN]);
+        goto jump_to_p2;
       end;
-      Inc(pOp^.p1);
-      Inc(v^.aCounter[SQLITE_STMTSTATUS_RUN]);
-      goto jump_to_p2;
     end;
 
     { ────── OP_Column ────── (vdbe.c:2975) }

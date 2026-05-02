@@ -35,20 +35,70 @@ uses
 var
   diverged: i32 = 0;
 
+{ Splits `setup` on top-level semicolons but treats CREATE TRIGGER /
+  CREATE … BEGIN … END as a single statement (case-insensitive token
+  scan, depth-counting on BEGIN/END). }
 procedure SplitExec(db: PTsqlite3; const setup: AnsiString);
 var
   s, stmt2: AnsiString;
-  p: i32;
+  i, n, depth: i32;
   pStmt: PVdbe;
   rcs: i32;
+
+  function MatchKeyword(const src: AnsiString; idx: i32; const kw: AnsiString): Boolean;
+  var k: i32; c: AnsiChar;
+  begin
+    Result := False;
+    if idx + Length(kw) - 1 > Length(src) then Exit;
+    for k := 1 to Length(kw) do
+    begin
+      c := src[idx + k - 1];
+      if (c >= 'a') and (c <= 'z') then c := AnsiChar(Ord(c) - 32);
+      if c <> kw[k] then Exit;
+    end;
+    if (idx + Length(kw) <= Length(src)) then
+    begin
+      c := src[idx + Length(kw)];
+      if ((c >= 'A') and (c <= 'Z')) or ((c >= 'a') and (c <= 'z'))
+         or ((c >= '0') and (c <= '9')) or (c = '_') then Exit;
+    end;
+    if idx > 1 then
+    begin
+      c := src[idx - 1];
+      if ((c >= 'A') and (c <= 'Z')) or ((c >= 'a') and (c <= 'z'))
+         or ((c >= '0') and (c <= '9')) or (c = '_') then Exit;
+    end;
+    Result := True;
+  end;
+
 begin
   s := setup;
-  while s <> '' do
+  n := Length(s);
+  i := 1;
+  while i <= n do
   begin
-    p := Pos(';', s);
-    if p = 0 then begin stmt2 := s; s := ''; end
-    else begin stmt2 := Copy(s, 1, p - 1); s := Copy(s, p + 1, MaxInt); end;
-    stmt2 := Trim(stmt2);
+    depth := 0;
+    while i <= n do
+    begin
+      if MatchKeyword(s, i, 'BEGIN') then
+      begin
+        Inc(depth);
+        Inc(i, Length('BEGIN'));
+        Continue;
+      end;
+      if (depth > 0) and MatchKeyword(s, i, 'END') then
+      begin
+        Dec(depth);
+        Inc(i, Length('END'));
+        Continue;
+      end;
+      if (depth = 0) and (s[i] = ';') then
+        Break;
+      Inc(i);
+    end;
+    stmt2 := Trim(Copy(s, 1, i - 1));
+    if i <= n then s := Copy(s, i + 1, MaxInt) else s := '';
+    n := Length(s); i := 1;
     if stmt2 = '' then continue;
     pStmt := nil;
     if (sqlite3_prepare_v2(db, PAnsiChar(stmt2), -1, @pStmt, nil) = 0)
