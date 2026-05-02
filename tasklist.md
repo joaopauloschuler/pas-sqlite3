@@ -344,9 +344,15 @@ skeleton.
           tag matching result columns with iOrderByCol so the inner
           loop omits their Column read entirely, then pushOntoSorter
           emits one combined SCopy/Column at regBase = regData -
-          nPrefixReg (select.c:771..782).  Closing requires porting
-          the OMITREF arm of sqlite3ExprCodeExprList plus the
-          nPrefixReg layout in selectInnerLoop.
+          nPrefixReg (select.c:771..782).
+          sqlite3ExprCodeExprList ported 2026-05-02 with all four
+          ECEL arms (DUP / FACTOR / REF / OMITREF) plus the
+          OP_Copy-merge optimization (expr.c:5953..6006); the
+          SRT_Output inner-loop site at codegen.pas:20102 routes
+          through it.  Closing the Δ=1 still requires the nPrefixReg
+          layout in selectInnerLoop / pushOntoSorter so ORDER BY
+          result columns get tagged with iOrderByCol and OMITREF
+          can drop the duplicate Column read.
         [ ] `SELECT a FROM t GROUP BY a` — C=45 vs Pas=3
           (aggregate-group path not yet ported).
         [ ] `SELECT a FROM (SELECT a FROM t)` — C=10 vs Pas=16.

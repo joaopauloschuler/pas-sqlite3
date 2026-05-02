@@ -2217,6 +2217,15 @@ function  sqlite3ExprCodeRunJustOnce(pParse: PParse; pExpr: PExpr;
   regDest: i32): i32;
 function  sqlite3ExprCodeTemp(pParse: PParse; pExpr: PExpr;
   pReg: Pi32): i32;
+function  sqlite3ExprCodeExprList(pParse: PParse; pList: PExprList;
+  target, srcReg: i32; flags: u8): i32;
+
+{ sqlite3ExprCodeExprList flags — sqliteInt.h:5132..5135 }
+const
+  SQLITE_ECEL_DUP     = u8($01);  { Deep, not shallow copies }
+  SQLITE_ECEL_FACTOR  = u8($02);  { Factor out constant terms }
+  SQLITE_ECEL_REF     = u8($04);  { Use ExprList.u.x.iOrderByCol }
+  SQLITE_ECEL_OMITREF = u8($08);  { Omit if ExprList.u.x.iOrderByCol }
 
 { sqlite3ExprIfTrue / sqlite3ExprIfFalse / sqlite3ExprIfFalseDup —
   expr.c:6100..6469.  Generate code that jumps to dest depending on
@@ -6837,6 +6846,93 @@ begin
     end;
   end;
   Result := r2;
+end;
+
+{ sqlite3ExprCodeExprList — port of expr.c:5953..6006.  Generate code
+  that pushes a list of expressions into a sequence of registers, with
+  three flag-controlled arms:
+    * SQLITE_ECEL_DUP    — emit OP_Copy (deep copy) instead of OP_SCopy.
+    * SQLITE_ECEL_FACTOR — factor constant-not-join expressions through
+      sqlite3ExprCodeRunJustOnce so the value is computed once at VM
+      init.  Honoured only when ConstFactorOk is set.
+    * SQLITE_ECEL_REF    — list items with u.x.iOrderByCol>0 read from
+      `srcReg + iOrderByCol - 1` instead of recomputing.
+    * SQLITE_ECEL_OMITREF — combined with REF, REF-tagged items are
+      omitted entirely (and n shrinks accordingly).
+  Returns the number of result columns actually emitted.
+
+  The `pOp->p1+pOp->p3+1==inReg` arm merges adjacent OP_Copy ops into
+  a single OP_Copy with p3 set as count-1.  Saves one op for every
+  contiguous register range > 1. }
+function sqlite3ExprCodeExprList(pParse: PParse; pList: PExprList;
+  target, srcReg: i32; flags: u8): i32;
+var
+  items: PExprListItem;
+  pItem: PExprListItem;
+  pXp:   PExpr;
+  i, j, n, inReg: i32;
+  copyOp: u8;
+  v: PVdbe;
+  pOp: PVdbeOp;
+begin
+  Assert(pList <> nil, 'pList != 0');
+  Assert(target > 0, 'target > 0');
+  Assert(pParse^.pVdbe <> nil, 'pVdbe under construction');
+  v := pParse^.pVdbe;
+  if (flags and SQLITE_ECEL_DUP) <> 0 then
+    copyOp := OP_Copy
+  else
+    copyOp := OP_SCopy;
+  n := pList^.nExpr;
+  if (pParse^.parseFlags and PARSEFLAG_OkConstFactor) = 0 then
+    flags := flags and (not SQLITE_ECEL_FACTOR);
+  items := ExprListItems(pList);
+  i := 0;
+  while i < n do
+  begin
+    pItem := PExprListItem(PByte(items) + i * SZ_EXPRLIST_ITEM);
+    pXp := pItem^.pExpr;
+    if ((flags and SQLITE_ECEL_REF) <> 0)
+       and (pItem^.u.x.iOrderByCol > 0) then
+    begin
+      j := pItem^.u.x.iOrderByCol;
+      if (flags and SQLITE_ECEL_OMITREF) <> 0 then
+      begin
+        Dec(i);
+        Dec(n);
+      end
+      else
+        sqlite3VdbeAddOp2(v, copyOp, j + srcReg - 1, target + i);
+    end
+    else if ((flags and SQLITE_ECEL_FACTOR) <> 0)
+            and (sqlite3ExprIsConstantNotJoin(pParse, pXp) <> 0) then
+    begin
+      sqlite3ExprCodeRunJustOnce(pParse, pXp, target + i);
+    end
+    else
+    begin
+      inReg := sqlite3ExprCodeTarget(pParse, pXp, target + i);
+      if inReg <> target + i then
+      begin
+        if copyOp = OP_Copy then
+        begin
+          pOp := sqlite3VdbeGetLastOp(v);
+          if (pOp <> nil)
+             and (pOp^.opcode = OP_Copy)
+             and (pOp^.p1 + pOp^.p3 + 1 = inReg)
+             and (pOp^.p2 + pOp^.p3 + 1 = target + i)
+             and (pOp^.p5 = 0) then
+            Inc(pOp^.p3)
+          else
+            sqlite3VdbeAddOp2(v, copyOp, inReg, target + i);
+        end
+        else
+          sqlite3VdbeAddOp2(v, copyOp, inReg, target + i);
+      end;
+    end;
+    Inc(i);
+  end;
+  Result := n;
 end;
 
 { exprCodeBetween — port of expr.c:6058..6098 (Phase 6.9-bis 11g.2.f
@@ -20100,18 +20196,7 @@ begin
       pParse^.nMem := pParse^.nMem + nResultCol;
     end;
     sqlite3VdbeAddOp3(v, OP_Explain, sqlite3VdbeCurrentAddr(v), 0, 0);
-    items := ExprListItems(pEList);
-    { Mirrors sqlite3ExprCodeExprList(pEList, regResult, 0, SQLITE_ECEL_DUP)
-      called from selectInnerLoop / innerLoopLoadRow (select.c:693) for
-      eDest in {SRT_Mem, SRT_Output, SRT_Coroutine}: when an expression
-      lands in a different register than the result slot, emit OP_Copy
-      (ECEL_DUP), not OP_SCopy. }
-    for i := 0 to nResultCol - 1 do
-    begin
-      r1 := sqlite3ExprCodeTarget(pParse, items[i].pExpr, pDest^.iSdst + i);
-      if r1 <> pDest^.iSdst + i then
-        sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
-    end;
+    sqlite3ExprCodeExprList(pParse, pEList, pDest^.iSdst, 0, SQLITE_ECEL_DUP);
     if pDest^.eDest = SRT_Output then
       sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
     else { SRT_Coroutine — yield the row to the outer scan. }
