@@ -20344,6 +20344,17 @@ var
   addrSortLoop: i32;
   addrSortBrk:  i32;
   addrSortContinue: i32;
+  { OMITREF / nPrefixReg locals (select.c:1216..1265) — when every
+    pEList result column appears verbatim in pOrderBy (with the resolver
+    setting pOrderBy[i].iOrderByCol = j+1), the result column emit is
+    elided and the value is read back from the sorter's KEY area on
+    output.  bSortOmitRef=1 means the simple "all-columns-omitted" arm
+    applies; nPrefixReg = sortNKey reserved before iSdst so regBase =
+    iSdst - nPrefixReg overlaps with the pre-iSdst window. }
+  nPrefixReg:   i32;
+  bSortOmitRef: i32;
+  jOBC:         i32;
+  pELItm, pOBItm: PExprListItem;
   { TVF (table-valued function) arg count for eponymous-vtab arms —
     e.g. pragma_table_info('t').  Drives the regArgc / argv slots
     handed to OP_VFilter so xFilter sees the user-supplied args. }
@@ -21565,6 +21576,7 @@ begin
     Always sorts even when WhereBegin could satisfy ORDER BY through an
     index — the nOBSat shortcut is deferred. }
   bSort := 0; iSorterCsr := -1; sortNKey := 0; addrSorter := -1;
+  nPrefixReg := 0; bSortOmitRef := 0;
   if (p^.pOrderBy <> nil) and (pDest^.eDest = SRT_Output)
      and (not isExists) then
   begin
@@ -21573,8 +21585,43 @@ begin
     sortNKey := p^.pOrderBy^.nExpr;
     sortKeyInfo := sqlite3KeyInfoFromExprList(pParse, p^.pOrderBy, 0,
                                               nResultCol);
+    { OMITREF detect (select.c:1216..1238) — count whether every pEList
+      result column has a matching ORDER BY entry whose iOrderByCol points
+      back to it.  When true, set bSortOmitRef=1 so the inner loop and
+      sort tail emit the C-shape (no duplicate Column for the data side). }
+    if (pDest^.eDest = SRT_Output) and (iTabTnct < 0) then
+    begin
+      pOBItm := ExprListItems(p^.pOrderBy);
+      pELItm := items;
+      bSortOmitRef := 1;
+      { reset pEList iOrderByCol — sqlite3ResolveOrderGroupBy sets it for
+        ORDER BY items only; the propagation to pEList items is what
+        select.c:1224..1228 does. }
+      for i := 0 to pEList^.nExpr - 1 do
+        pELItm[i].u.x.iOrderByCol := 0;
+      for i := 0 to sortNKey - 1 do
+      begin
+        jOBC := pOBItm[i].u.x.iOrderByCol;
+        if (jOBC > 0) and (jOBC <= pEList^.nExpr) then
+          pELItm[jOBC - 1].u.x.iOrderByCol := u16(i + 1);
+      end;
+      for i := 0 to pEList^.nExpr - 1 do
+        if pELItm[i].u.x.iOrderByCol = 0 then begin
+          bSortOmitRef := 0;
+          break;
+        end;
+    end;
+    if bSortOmitRef <> 0 then
+    begin
+      nPrefixReg := sortNKey;
+      pParse^.nMem := pParse^.nMem + nPrefixReg;
+    end;
+    { OpenEphemeral p2 mirrors C select.c:8211 —
+      pOrderBy->nExpr + 1 + pEList->nExpr.  The +1 reserves the rowid /
+      sequence slot in the sorter row layout; later promoted to
+      OP_SorterOpen by allocSortIndex. }
     addrSorter := sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorterCsr,
-                      sortNKey + nResultCol, 0,
+                      sortNKey + 1 + nResultCol, 0,
                       PAnsiChar(sortKeyInfo), P4_KEYINFO);
   end;
 
@@ -21656,17 +21703,24 @@ begin
       (preserves the OP_Column-direct-to-target shape that the existing
       passing rows depend on).  For general expressions (TK_PLUS, literals,
       etc.) defer to sqlite3ExprCode, which walks sqlite3ExprCodeTarget
-      and handles the operator-table arms. }
-    for i := 0 to nResultCol - 1 do
-    begin
-      pE := items[i].pExpr;
-      if ((pE^.op = TK_COLUMN) or (pE^.op = TK_AGG_COLUMN))
-         and (pE^.y.pTab <> nil) then
-        sqlite3ExprCodeGetColumnOfTable(v, pE^.y.pTab, pE^.iTable, pE^.iColumn,
-                                        pDest^.iSdst + i)
-      else
-        sqlite3ExprCode(pParse, pE, pDest^.iSdst + i);
-    end;
+      and handles the operator-table arms.
+
+      OMITREF skip (select.c:1244..1252) — when the column was tagged with
+      iOrderByCol > 0 by the OMITREF setup loop above, it will be supplied
+      by the ORDER BY emit in pushOntoSorter (overlapping prefix region)
+      and read back from the sorter KEY on output.  Skip the duplicate
+      emit here. }
+    if bSortOmitRef = 0 then
+      for i := 0 to nResultCol - 1 do
+      begin
+        pE := items[i].pExpr;
+        if ((pE^.op = TK_COLUMN) or (pE^.op = TK_AGG_COLUMN))
+           and (pE^.y.pTab <> nil) then
+          sqlite3ExprCodeGetColumnOfTable(v, pE^.y.pTab, pE^.iTable, pE^.iColumn,
+                                          pDest^.iSdst + i)
+        else
+          sqlite3ExprCode(pParse, pE, pDest^.iSdst + i);
+      end;
 
     { DISTINCT dedup — codeDistinct WHERE_DISTINCT_UNORDERED
       (select.c:978..988).  Inserted before any disposal so the per-row
@@ -21692,33 +21746,53 @@ begin
     begin
       if bSort <> 0 then
       begin
-        { pushOntoSorter (select.c:730) — minimal slice.  Build a record
-          containing [orderByExprs ; resultColumns] and push it into the
-          sorter cursor.  No bSeq / nOBSat / nPrefixReg / LIMIT pushdown.
-          regBase is allocated fresh each iteration; pParse^.nMem grows. }
-        regSortBase := pParse^.nMem + 1;
-        Inc(pParse^.nMem, sortNKey + nResultCol);
-        for jj := 0 to sortNKey - 1 do
+        { pushOntoSorter (select.c:730..870) — minimal slice.
+          OMITREF arm (bSortOmitRef=1): regBase = iSdst - nPrefixReg
+          overlaps the prefix window reserved before iSdst; emit ORDER BY
+          exprs there and MakeRecord(regBase, sortNKey, regOut).  No
+          data section.
+          Non-OMITREF arm: keep the original [orderBy ; resultCols] layout
+          for compatibility with already-passing rows. }
+        if bSortOmitRef <> 0 then
         begin
-          r1 := sqlite3ExprCodeTarget(pParse,
-                  ExprListItems(p^.pOrderBy)[jj].pExpr,
-                  regSortBase + jj);
-          if r1 <> regSortBase + jj then
-            sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBase + jj);
+          regSortBase := pDest^.iSdst - nPrefixReg;
+          for jj := 0 to sortNKey - 1 do
+          begin
+            r1 := sqlite3ExprCodeTarget(pParse,
+                    ExprListItems(p^.pOrderBy)[jj].pExpr,
+                    regSortBase + jj);
+            if r1 <> regSortBase + jj then
+              sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBase + jj);
+          end;
+          Inc(pParse^.nMem);
+          regSortRec := pParse^.nMem;
+          sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
+                            sortNKey, regSortRec);
+          sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
+                               regSortBase, sortNKey);
+        end
+        else
+        begin
+          regSortBase := pParse^.nMem + 1;
+          Inc(pParse^.nMem, sortNKey + nResultCol);
+          for jj := 0 to sortNKey - 1 do
+          begin
+            r1 := sqlite3ExprCodeTarget(pParse,
+                    ExprListItems(p^.pOrderBy)[jj].pExpr,
+                    regSortBase + jj);
+            if r1 <> regSortBase + jj then
+              sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBase + jj);
+          end;
+          for jj := 0 to nResultCol - 1 do
+            sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
+                              regSortBase + sortNKey + jj);
+          Inc(pParse^.nMem);
+          regSortRec := pParse^.nMem;
+          sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
+                            sortNKey + nResultCol, regSortRec);
+          sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
+                               regSortBase, nResultCol);
         end;
-        for jj := 0 to nResultCol - 1 do
-          sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
-                            regSortBase + sortNKey + jj);
-        { Match C's makeSorterRecord (select.c:709..724): allocate the
-          record register from pParse^.nMem rather than the temp pool, so
-          no OP_ReleaseReg is emitted on the inner-loop hot path.  The
-          register is naturally reclaimed at end-of-statement. }
-        Inc(pParse^.nMem);
-        regSortRec := pParse^.nMem;
-        sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
-                          sortNKey + nResultCol, regSortRec);
-        sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
-                             regSortBase, nResultCol);
       end
       else
       begin
@@ -21796,10 +21870,20 @@ begin
       addrBrk: (no Close — eph cursor freed at Halt) }
   if bSort <> 0 then
   begin
+    { explainTempTable("ORDER BY") — select.c:8905..8907 (and the analogous
+      USE TEMP B-TREE banner near generateSortTail entry).  Emits the EQP
+      annotation that distinguishes a sorter-driven ORDER BY from one
+      satisfied by an index. }
+    i := sqlite3VdbeCurrentAddr(v);
+    sqlite3VdbeAddOp4(v, OP_Explain, i, 0, 0,
+                      sqlite3MPrintf(pParse^.db,
+                                     'USE TEMP B-TREE FOR %s',
+                                     ['ORDER BY']),
+                      P4_DYNAMIC);
     Inc(pParse^.nMem); regSortOut := pParse^.nMem;
     iSortTab := pParse^.nTab; Inc(pParse^.nTab);
     sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortTab, regSortOut,
-                      sortNKey + nResultCol);
+                      sortNKey + 1 + nResultCol);
     addrSortBrk := sqlite3VdbeMakeLabel(pParse);
     sqlite3VdbeAddOp2(v, OP_SorterSort, iSorterCsr, addrSortBrk);
     addrSortLoop := sqlite3VdbeCurrentAddr(v);
@@ -21814,9 +21898,22 @@ begin
     end
     else
       addrSortContinue := 0;
-    for i := 0 to nResultCol - 1 do
-      sqlite3VdbeAddOp3(v, OP_Column, iSortTab, sortNKey + i,
-                        pDest^.iSdst + i);
+    { OMITREF readback (select.c:1722..1737) — when bSortOmitRef=1, every
+      result column was tagged with iOrderByCol > 0, meaning it lives in
+      the sorter KEY area at index (iOrderByCol-1).  Read from there
+      instead of from the data area at sortNKey + i. }
+    if bSortOmitRef <> 0 then
+    begin
+      pELItm := items;
+      for i := 0 to nResultCol - 1 do
+        sqlite3VdbeAddOp3(v, OP_Column, iSortTab,
+                          i32(pELItm[i].u.x.iOrderByCol) - 1,
+                          pDest^.iSdst + i);
+    end
+    else
+      for i := 0 to nResultCol - 1 do
+        sqlite3VdbeAddOp3(v, OP_Column, iSortTab, sortNKey + i,
+                          pDest^.iSdst + i);
     sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
     { LIMIT decrement after each emitted row (post-sort).  The inner-loop
       body intentionally skips DecrJumpZero for the bSort path — all rows

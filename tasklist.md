@@ -193,12 +193,12 @@ skeleton.
 
 - [ ] **6.10** `TestExplainParity.pas`
     - [ ] **6.10 step 6** Remaining TestExplainParity bytecode-Δ rows
-       (7 diverges in 1019/1026 corpus):
-        [ ] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) —
-          Δ=1.  Closing requires nPrefixReg layout in selectInnerLoop /
-          pushOntoSorter so OMITREF drops the duplicate Column read
-          (select.c:1216 + select.c:771..782), plus matching SorterOpen
-          p2 (= nKey + nData + 1 for the rowid/sequence slot).
+       (4 diverges in 1022/1026 corpus):
+        [X] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) — DONE.
+          OMITREF/nPrefixReg arm ported (select.c:1216..1238 +
+          pushOntoSorter:771..784); SorterOpen p2 now `nKey+1+nData`,
+          OpenPseudo p3 matched.  USE TEMP B-TREE FOR ORDER BY Explain
+          banner emitted.  Closes 3 corpus rows.
         [ ] `SELECT a FROM t GROUP BY a` — C=45 vs Pas=3
           (aggregate-group path not yet ported).
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=6.  Pas emits the
