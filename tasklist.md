@@ -194,16 +194,13 @@ skeleton.
 - [ ] **6.10** `TestExplainParity.pas`
     - [ ] **6.10 step 6** Remaining TestExplainParity bytecode-Δ rows
        (4 diverges in 1022/1026 corpus):
-        [X] `SELECT a FROM t ORDER BY a` (asc/desc/multi-col) — DONE.
-          OMITREF/nPrefixReg arm ported (select.c:1216..1238 +
-          pushOntoSorter:771..784); SorterOpen p2 now `nKey+1+nData`,
-          OpenPseudo p3 matched.  USE TEMP B-TREE FOR ORDER BY Explain
-          banner emitted.  Closes 3 corpus rows.
-        [ ] `SELECT a FROM t GROUP BY a` — C=45 vs Pas=3
-          (aggregate-group path not yet ported).
+        [ ] `SELECT a FROM t GROUP BY a` — C=45 vs Pas=3.  GROUP BY
+          without aggregate function in pEList; Pas's GROUP BY codegen
+          arm gates on SF_Aggregate, but C handles pGroupBy!=0 even
+          with nFunc=0.
         [ ] `SELECT a FROM (SELECT a FROM t)` — Δ=6.  Pas emits the
-          co-routine path (6.13(b)); C flattens via `flattenSubquery`.
-          Closes once 6.13(b)-fl lands.
+          co-routine path; C flattens via `flattenSubquery`.  Closes
+          once 6.13(b)-fl lands.
         [ ] `INSERT multi-row VALUES` — Δ=5.  Runtime parity reached;
           bytecode parity needs the coroutine arm of sqlite3MultiValues
           (deferred — runtime is correct).
@@ -259,28 +256,16 @@ skeleton.
 
   [X] **6.10 step 19** DiagDml runtime probe — all 14 PASS.
 
-  [X] **6.10 step 26** DiagIndexing probe — DONE.  Minimal ORDER BY
-      sorter ported (SRT_Output, plain LIMIT, LIMIT+OFFSET, DISTINCT,
-      nOBSat shortcut).
-      [X] Top-N sorter (select.c pushOntoSorter:832..856) — DONE.
-          When LIMIT is set, sorter cursor opens via OP_OpenEphemeral
-          (B-tree backed) and inner loop emits IfNotZero/Last/IdxLE/
-          Delete + IdxInsert with bSeq=1; tail uses OP_Sort/OP_Next.
-          Sorter mode unchanged when no LIMIT.  Gated by
-          DiagOrderLimitTopN (11/11 PASS, incl. LIMIT 0 / DESC LIMIT 0).
-          ORDER BY + LIMIT 0 short-circuit Goto now retargeted to
-          addrSortBrk so it skips past the sort tail (was landing on
-          OP_Sort against a sorter cursor the Goto itself had skipped).
+  [X] **6.10 step 26** DiagIndexing + DiagOrderLimitTopN — DONE.
 
-  [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
+  [ ] **6.11** DROP TABLE remaining gap (current Δ=26):
     (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
         because `destroyRootPage` calls `sqlite3NestedParse(UPDATE
         sqlite_schema ...)` and productive `sqlite3Update` is still
         skeleton-only.  This is the only remaining contributor.
   [~] **6.12** port sqlite3Pragma in full.  Gate `DiagPragma`.
-       1 DiagPragma divergence remains (was 5).
-       Remaining gap:
-       (a) FOREIGN_KEY_LIST blocked on TFKey opaque.
+       1 DiagPragma divergence remains: FOREIGN_KEY_LIST, blocked on
+       TFKey opaque.
 
   [ ] **6.13** Non-regular FROM-item codegen in `sqlite3Select`
        (select.c).  Pas's SELECT codegen currently traverses regular
