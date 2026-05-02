@@ -38133,13 +38133,340 @@ begin
   Result := pE;
 end;
 
+function fkChildIsModified(pTab: PTable2; pFKey: Pointer;
+  aChange: Pi32; bChngRowid: i32): i32; forward;
+function fkParentIsModified(pTab: PTable2; pFKey: Pointer;
+  aChange: Pi32; bChngRowid: i32): i32; forward;
+function isSetNullAction(pParse: PParse; pFKey: Pointer): i32; forward;
+
+{ fkey.c:547 — fkScanChildren.  Generate VDBE that scans the rows of the
+  child table pSrc looking for child-side rows whose FK columns match the
+  parent key in registers regData..  For each matching row OP_FkCounter is
+  emitted to bump the deferred / immediate FK violation counter by nIncr.
+  When nIncr is negative the whole scan is fenced by OP_FkIfZero so the
+  scan is skipped if the deferred counter is already zero.
+
+  WHERE-clause is built as `<parent-key1>=<child-key1> AND ...`; for the
+  self-referential child=parent case (pTab=pFKey^.pFrom) an extra
+  `current-row<>scanned-row` term is appended so the scanner does not
+  match the row that triggered the check itself.
+
+  Faithful 1:1 of fkey.c:547..660.  pFKey is opaque (Pointer); fields
+  read via the documented byte offsets shared with sqlite3CreateForeignKey
+  (codegen.pas:30412..). }
+procedure fkScanChildren(pParse: PParse; pSrc: PSrcList; pTab: PTable2;
+  pIdx: PIndex2; pFKey: Pointer; aiCol: Pi32; regData: i32; nIncr: i32);
+const
+  FKEY_PFROM_OFFSET      = 0;
+  FKEY_NCOL_OFFSET       = 40;
+  FKEY_ISDEFERRED_OFFSET = 44;
+  FKEY_ACOL_OFFSET       = 64;
+  FKEY_SCOLMAP_SIZE      = 16;
+  FKEY_SCOL_IFROM        = 0;
+var
+  db: PTsqlite3;
+  i: i32;
+  pWhere, pLeft, pRight, pEq, pNe, pAll: PExpr;
+  sNameContext: TNameContext;
+  pWInfo: PWhereInfo;
+  iFkIfZero: i32;
+  v: PVdbe;
+  pFKb: Pu8;
+  isDeferred: u8;
+  pFrom: PTable2;
+  nCol: i32;
+  iCol: i16;
+  iColIdx: i32;
+  zCol: PAnsiChar;
+begin
+  db := pParse^.db;
+  pWhere := nil;
+  iFkIfZero := 0;
+  v := sqlite3GetVdbe(pParse);
+
+  pFKb := Pu8(pFKey);
+  isDeferred := (pFKb + FKEY_ISDEFERRED_OFFSET)^;
+  pFrom := PTable2(PPointer(pFKb + FKEY_PFROM_OFFSET)^);
+  nCol := PInt32(pFKb + FKEY_NCOL_OFFSET)^;
+
+  AssertH((pIdx = nil) or (pIdx^.pTable = pTab),
+          'fkScanChildren: pIdx->pTable mismatch');
+  AssertH((pIdx = nil) or (i32(pIdx^.nKeyCol) = nCol),
+          'fkScanChildren: pIdx->nKeyCol mismatch');
+  AssertH((pIdx <> nil) or (nCol = 1),
+          'fkScanChildren: nil pIdx requires nCol=1');
+  AssertH((pIdx <> nil) or HasRowid(pTab),
+          'fkScanChildren: nil pIdx requires HasRowid(pTab)');
+
+  if nIncr < 0 then
+    iFkIfZero := sqlite3VdbeAddOp2(v, OP_FkIfZero, isDeferred, 0);
+
+  for i := 0 to nCol - 1 do
+  begin
+    if pIdx <> nil then
+      iCol := pIdx^.aiColumn[i]
+    else
+      iCol := -1;
+    pLeft := exprTableRegister(pParse, pTab, regData, iCol);
+    if aiCol <> nil then
+      iColIdx := (aiCol + i)^
+    else
+      iColIdx := PInt32(pFKb + FKEY_ACOL_OFFSET
+                          + 0 * FKEY_SCOLMAP_SIZE + FKEY_SCOL_IFROM)^;
+    AssertH(iColIdx >= 0, 'fkScanChildren: aiCol[i] negative');
+    zCol := pFrom^.aCol[iColIdx].zCnName;
+    pRight := sqlite3Expr(db, TK_ID, zCol);
+    pEq := sqlite3PExpr(pParse, TK_EQ, pLeft, pRight);
+    pWhere := sqlite3ExprAnd(pParse, pWhere, pEq);
+  end;
+
+  if (pTab = pFrom) and (nIncr > 0) then
+  begin
+    if HasRowid(pTab) then
+    begin
+      pLeft := exprTableRegister(pParse, pTab, regData, -1);
+      pRight := exprTableColumn(db, pTab, SrcListItems(pSrc)[0].iCursor, -1);
+      pNe := sqlite3PExpr(pParse, TK_NE, pLeft, pRight);
+    end
+    else
+    begin
+      pAll := nil;
+      AssertH(pIdx <> nil, 'fkScanChildren: WITHOUT ROWID without pIdx');
+      for i := 0 to i32(pIdx^.nKeyCol) - 1 do
+      begin
+        iCol := pIdx^.aiColumn[i];
+        AssertH(iCol >= 0, 'fkScanChildren: WITHOUT ROWID expr-idx col');
+        pLeft := exprTableRegister(pParse, pTab, regData, iCol);
+        pRight := sqlite3Expr(db, TK_ID, pTab^.aCol[iCol].zCnName);
+        pEq := sqlite3PExpr(pParse, TK_IS, pLeft, pRight);
+        pAll := sqlite3ExprAnd(pParse, pAll, pEq);
+      end;
+      pNe := sqlite3PExpr(pParse, TK_NOT, pAll, nil);
+    end;
+    pWhere := sqlite3ExprAnd(pParse, pWhere, pNe);
+  end;
+
+  FillChar(sNameContext, SizeOf(sNameContext), 0);
+  sNameContext.pSrcList := pSrc;
+  sNameContext.pParse   := pParse;
+  sqlite3ResolveExprNames(@sNameContext, pWhere);
+
+  if pParse^.nErr = 0 then
+  begin
+    pWInfo := sqlite3WhereBegin(pParse, pSrc, pWhere, nil, nil, nil, 0, 0);
+    sqlite3VdbeAddOp2(v, OP_FkCounter, isDeferred, nIncr);
+    if pWInfo <> nil then
+      sqlite3WhereEnd(pWInfo);
+  end;
+
+  sqlite3ExprDelete(db, pWhere);
+  if iFkIfZero <> 0 then
+    sqlite3VdbeJumpHereOrPopInst(v, iFkIfZero);
+end;
+
+{ fkey.c:889 — sqlite3FkCheck.  Generate FK constraint codegen for an
+  INSERT (regNew<>0, regOld=0), DELETE (regOld<>0, regNew=0) or both
+  halves of an UPDATE on pTab.  Walks every FK for which pTab is the
+  child (calling fkLookupParent), then every FK for which pTab is the
+  parent (calling fkScanChildren).  Faithful 1:1 of fkey.c:889..1087. }
 procedure sqlite3FkCheck(pParse: PParse; pTab: PTable2; regOld: i32;
   regNew: i32; aChange: Pi32; bChng: i32);
+const
+  FKEY_PFROM_OFFSET      = 0;
+  FKEY_PNEXTFROM_OFFSET  = 8;
+  FKEY_ZTO_OFFSET        = 16;
+  FKEY_PNEXTTO_OFFSET    = 24;
+  FKEY_NCOL_OFFSET       = 40;
+  FKEY_ISDEFERRED_OFFSET = 44;
+  FKEY_AACTION_OFFSET    = 45;
+  FKEY_ACOL_OFFSET       = 64;
+  FKEY_SCOLMAP_SIZE      = 16;
+  FKEY_SCOL_IFROM        = 0;
+var
+  db: PTsqlite3;
+  pFKey: Pu8;
+  iDb: i32;
+  zDb: PAnsiChar;
+  isIgnoreErrors: i32;
+  pTo: PTable2;
+  pIdx: PIndex2;
+  aiFree, aiCol: Pi32;
+  iColLocal: i32;
+  i: i32;
+  bIgnore: i32;
+  v: PVdbe;
+  iJump: i32;
+  iFromCol, iReg: i32;
+  zTo: PAnsiChar;
+  isDeferred: u8;
+  pSrc: PSrcList;
+  pItem: PSrcItem;
+  eAction: i32;
+  pFromTab: PTable2;
+  nFkCol: i32;
 begin
-  { Phase 7: full FK constraint codegen still pending — fkLookupParent
-    helper above is the first piece in.  Body lands once fkScanChildren
-    is ported and the C dispatcher (fkey.c:889..1064) is wired up.
-    exprTableRegister / exprTableColumn helpers are now in place above. }
+  db := pParse^.db;
+  if (pParse^.parseFlags and PARSEFLAG_DisableTriggers) <> 0 then
+    isIgnoreErrors := 1
+  else
+    isIgnoreErrors := 0;
+
+  AssertH((regOld = 0) <> (regNew = 0), 'sqlite3FkCheck: exactly one of regOld/regNew');
+
+  if (db^.flags and SQLITE_ForeignKeys) = 0 then Exit;
+  if pTab^.eTabType <> TABTYP_NORM then Exit;
+
+  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  AssertH((iDb >= 0) and (iDb < db^.nDb), 'sqlite3FkCheck: iDb OOB');
+  zDb := db^.aDb[iDb].zDbSName;
+
+  { Loop through all FKs for which pTab is the child. }
+  pFKey := Pu8(pTab^.u.tab.pFKey);
+  while pFKey <> nil do
+  begin
+    pIdx := nil;
+    aiFree := nil;
+    bIgnore := 0;
+    zTo := PPAnsiChar(pFKey + FKEY_ZTO_OFFSET)^;
+    nFkCol := PInt32(pFKey + FKEY_NCOL_OFFSET)^;
+    pFromTab := PTable2(PPointer(pFKey + FKEY_PFROM_OFFSET)^);
+
+    if (aChange <> nil)
+       and (sqlite3_stricmp(pTab^.zName, zTo) <> 0)
+       and (fkChildIsModified(pTab, Pointer(pFKey), aChange, bChng) = 0) then
+    begin
+      pFKey := Pu8(PPointer(pFKey + FKEY_PNEXTFROM_OFFSET)^);
+      Continue;
+    end;
+
+    if (pParse^.parseFlags and PARSEFLAG_DisableTriggers) <> 0 then
+      pTo := sqlite3FindTable(db, zTo, zDb)
+    else
+      pTo := sqlite3LocateTable(pParse, 0, zTo, zDb);
+
+    if (pTo = nil)
+       or (sqlite3FkLocateIndex(pParse, pTo, Pointer(pFKey), @pIdx, @aiFree) <> 0) then
+    begin
+      AssertH((isIgnoreErrors = 0) or ((regOld <> 0) and (regNew = 0)),
+              'sqlite3FkCheck: ignoreErrors invariant');
+      if (isIgnoreErrors = 0) or (db^.mallocFailed <> 0) then Exit;
+      if pTo = nil then
+      begin
+        v := sqlite3GetVdbe(pParse);
+        iJump := sqlite3VdbeCurrentAddr(v) + nFkCol + 1;
+        for i := 0 to nFkCol - 1 do
+        begin
+          iFromCol := PInt32(pFKey + FKEY_ACOL_OFFSET
+                                + i * FKEY_SCOLMAP_SIZE + FKEY_SCOL_IFROM)^;
+          iReg := sqlite3TableColumnToStorage(pFromTab, i16(iFromCol)) + regOld + 1;
+          sqlite3VdbeAddOp2(v, OP_IsNull, iReg, iJump);
+        end;
+        isDeferred := (pFKey + FKEY_ISDEFERRED_OFFSET)^;
+        sqlite3VdbeAddOp2(v, OP_FkCounter, isDeferred, -1);
+      end;
+      pFKey := Pu8(PPointer(pFKey + FKEY_PNEXTFROM_OFFSET)^);
+      Continue;
+    end;
+    AssertH((nFkCol = 1) or ((aiFree <> nil) and (pIdx <> nil)),
+            'sqlite3FkCheck: aiFree/pIdx invariant');
+
+    if aiFree <> nil then
+      aiCol := aiFree
+    else
+    begin
+      iColLocal := PInt32(pFKey + FKEY_ACOL_OFFSET
+                            + 0 * FKEY_SCOLMAP_SIZE + FKEY_SCOL_IFROM)^;
+      aiCol := @iColLocal;
+    end;
+    for i := 0 to nFkCol - 1 do
+    begin
+      if (aiCol + i)^ = pTab^.iPKey then
+        (aiCol + i)^ := -1;
+      AssertH((pIdx = nil) or (pIdx^.aiColumn[i] >= 0),
+              'sqlite3FkCheck: pIdx->aiColumn[i] negative');
+      { SQLITE_OMIT_AUTHORIZATION: db^.xAuth check skipped — bIgnore stays 0. }
+    end;
+
+    { sqlite3TableLock — no-op under SQLITE_OMIT_SHARED_CACHE. }
+    Inc(pParse^.nTab);
+
+    if regOld <> 0 then
+      fkLookupParent(pParse, iDb, pTo, pIdx, Pointer(pFKey), aiCol,
+                     regOld, -1, bIgnore);
+    if (regNew <> 0) and (isSetNullAction(pParse, Pointer(pFKey)) = 0) then
+      fkLookupParent(pParse, iDb, pTo, pIdx, Pointer(pFKey), aiCol,
+                     regNew, +1, bIgnore);
+
+    sqlite3DbFree(db, aiFree);
+    pFKey := Pu8(PPointer(pFKey + FKEY_PNEXTFROM_OFFSET)^);
+  end;
+
+  { Loop through all FKs that refer to this table (pTab is the parent). }
+  pFKey := Pu8(sqlite3FkReferences(pTab));
+  while pFKey <> nil do
+  begin
+    pIdx := nil;
+    aiCol := nil;
+
+    if (aChange <> nil)
+       and (fkParentIsModified(pTab, Pointer(pFKey), aChange, bChng) = 0) then
+    begin
+      pFKey := Pu8(PPointer(pFKey + FKEY_PNEXTTO_OFFSET)^);
+      Continue;
+    end;
+
+    isDeferred := (pFKey + FKEY_ISDEFERRED_OFFSET)^;
+    if (isDeferred = 0) and ((db^.flags and SQLITE_DeferFKs) = 0)
+       and (pParse^.pToplevel = nil) and (pParse^.isMultiWrite = 0) then
+    begin
+      AssertH((regOld = 0) and (regNew <> 0),
+              'sqlite3FkCheck: parent-side immediate-insert invariant');
+      pFKey := Pu8(PPointer(pFKey + FKEY_PNEXTTO_OFFSET)^);
+      Continue;
+    end;
+
+    if sqlite3FkLocateIndex(pParse, pTab, Pointer(pFKey), @pIdx,
+                            PPointer(@aiCol)) <> 0 then
+    begin
+      if (isIgnoreErrors = 0) or (db^.mallocFailed <> 0) then Exit;
+      pFKey := Pu8(PPointer(pFKey + FKEY_PNEXTTO_OFFSET)^);
+      Continue;
+    end;
+    AssertH((aiCol <> nil) or (PInt32(pFKey + FKEY_NCOL_OFFSET)^ = 1),
+            'sqlite3FkCheck: aiCol invariant');
+
+    pSrc := sqlite3SrcListAppend(pParse, nil, nil, nil);
+    if pSrc <> nil then
+    begin
+      pItem := SrcListItems(pSrc);
+      pFromTab := PTable2(PPointer(pFKey + FKEY_PFROM_OFFSET)^);
+      pItem^.pSTab := pFromTab;
+      pItem^.zName := pFromTab^.zName;
+      Inc(pFromTab^.nTabRef);
+      pItem^.iCursor := pParse^.nTab;
+      Inc(pParse^.nTab);
+
+      if regNew <> 0 then
+        fkScanChildren(pParse, pSrc, pTab, pIdx, Pointer(pFKey), aiCol, regNew, -1);
+      if regOld <> 0 then
+      begin
+        if aChange <> nil then
+          eAction := (pFKey + FKEY_AACTION_OFFSET + 1)^
+        else
+          eAction := (pFKey + FKEY_AACTION_OFFSET + 0)^;
+        if (db^.flags and SQLITE_FkNoAction) <> 0 then
+          eAction := OE_None;
+        fkScanChildren(pParse, pSrc, pTab, pIdx, Pointer(pFKey), aiCol, regOld, 1);
+        if (isDeferred = 0) and (eAction <> OE_Cascade)
+           and (eAction <> OE_SetNull) then
+          sqlite3MayAbort(pParse);
+      end;
+      pItem^.zName := nil;
+      sqlite3SrcListDelete(db, pSrc);
+    end;
+    sqlite3DbFree(db, aiCol);
+    pFKey := Pu8(PPointer(pFKey + FKEY_PNEXTTO_OFFSET)^);
+  end;
 end;
 
 procedure sqlite3FkActions(pParse: PParse; pTab: PTable2; pChanges: PExprList;

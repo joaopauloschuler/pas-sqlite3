@@ -170,16 +170,13 @@ skeleton.
             the planner falls back to heuristic costs and several
             DiagIndexing cases pick the wrong plan).
        [X] Port `sqlite3Vacuum` (vacuum.c).
-       [ ] Port `sqlite3FkCheck` (fkey.c).  Codegen-side emitter
-            that walks each FK constraint after a DELETE / UPDATE
-            and emits the OP_FkCheck calls.  Runtime opcode body
-            already wired (commit 775ffc0); helpers
-            fkChildIsModified / fkParentIsModified / isSetNullAction,
-            fkLookupParent, exprTableRegister / exprTableColumn and
-            the productive sqlite3FkRequired UPDATE arm landed.
-            Remaining: fkScanChildren and the sqlite3FkCheck
-            dispatcher body itself.  Required for 6.10 step 9 and
-            DiagFeatureProbe FK-cascade cases.
+       [X] Port `sqlite3FkCheck` (fkey.c) — DONE.  fkScanChildren
+            (fkey.c:547..660) and the dispatcher body (fkey.c:889..
+            1087) ported at codegen.pas:38136..38470, replacing the
+            prior stub.  Walks every FK for which pTab is the child
+            (fkLookupParent) then every FK for which pTab is the
+            parent (fkScanChildren).  Pairs with the runtime
+            OP_FkCheck path wired in commit 775ffc0.
        [ ] Port `sqlite3FkActions` (fkey.c).  Synthesises the
             ON DELETE / ON UPDATE CASCADE / SET NULL / SET DEFAULT /
             RESTRICT / NO ACTION trigger programs.  Currently a
