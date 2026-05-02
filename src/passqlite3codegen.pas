@@ -20333,6 +20333,9 @@ var
     loop pushes rows into the sorter and a sort-tail is emitted after
     sqlite3WhereEnd. }
   bSort:        i32;
+  bUseSorter:   i32;            { 1 = SorterOpen/SorterInsert (no LIMIT);
+                                  0 = OpenEphemeral/IdxInsert (Top-N) }
+  bSeqExtra:    i32;            { 1 when bUseSorter=0 (sequence column slot) }
   iSorterCsr:   i32;
   sortKeyInfo:  PKeyInfo2;
   sortNKey:     i32;
@@ -20344,6 +20347,9 @@ var
   addrSortLoop: i32;
   addrSortBrk:  i32;
   addrSortContinue: i32;
+  iLimitTopN:   i32;
+  iSkipTopN:    i32;
+  regSeq:       i32;
   { OMITREF / nPrefixReg locals (select.c:1216..1265) — when every
     pEList result column appears verbatim in pOrderBy (with the resolver
     setting pOrderBy[i].iOrderByCol = j+1), the result column emit is
@@ -21577,10 +21583,16 @@ begin
     index — the nOBSat shortcut is deferred. }
   bSort := 0; iSorterCsr := -1; sortNKey := 0; addrSorter := -1;
   nPrefixReg := 0; bSortOmitRef := 0;
+  bUseSorter := 1; bSeqExtra := 0;
   if (p^.pOrderBy <> nil) and (pDest^.eDest = SRT_Output)
      and (not isExists) then
   begin
     bSort := 1;
+    { Top-N path: when LIMIT is in effect we keep the cursor as a real
+      ephemeral B-tree (CURTYPE_BTREE) so OP_Last/OP_IdxLE/OP_Delete are
+      supported.  Mirrors C select.c:8246..8249 where SorterOpen is only
+      installed when p->iLimit==0. }
+    if p^.pLimit <> nil then begin bUseSorter := 0; bSeqExtra := 1; end;
     iSorterCsr := pParse^.nTab; Inc(pParse^.nTab);
     sortNKey := p^.pOrderBy^.nExpr;
     sortKeyInfo := sqlite3KeyInfoFromExprList(pParse, p^.pOrderBy, 0,
@@ -21611,6 +21623,10 @@ begin
           break;
         end;
     end;
+    { Top-N (bUseSorter=0) emits a sequence column between keys and
+      data; the OMITREF prefix-register layout doesn't yet account for
+      that slot, so disable OMITREF on the LIMIT path. }
+    if bUseSorter = 0 then bSortOmitRef := 0;
     if bSortOmitRef <> 0 then
     begin
       nPrefixReg := sortNKey;
@@ -21619,10 +21635,15 @@ begin
     { OpenEphemeral p2 mirrors C select.c:8211 —
       pOrderBy->nExpr + 1 + pEList->nExpr.  The +1 reserves the rowid /
       sequence slot in the sorter row layout; later promoted to
-      OP_SorterOpen by allocSortIndex. }
-    addrSorter := sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorterCsr,
-                      sortNKey + 1 + nResultCol, 0,
-                      PAnsiChar(sortKeyInfo), P4_KEYINFO);
+      OP_SorterOpen by allocSortIndex when there is no LIMIT. }
+    if bUseSorter <> 0 then
+      addrSorter := sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorterCsr,
+                        sortNKey + 1 + nResultCol, 0,
+                        PAnsiChar(sortKeyInfo), P4_KEYINFO)
+    else
+      addrSorter := sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iSorterCsr,
+                        sortNKey + 1 + nResultCol, 0,
+                        PAnsiChar(sortKeyInfo), P4_KEYINFO);
   end;
 
   { Drive the WHERE machinery for the (single, no-WHERE) loop body.
@@ -21774,7 +21795,7 @@ begin
         else
         begin
           regSortBase := pParse^.nMem + 1;
-          Inc(pParse^.nMem, sortNKey + nResultCol);
+          Inc(pParse^.nMem, sortNKey + bSeqExtra + nResultCol);
           for jj := 0 to sortNKey - 1 do
           begin
             r1 := sqlite3ExprCodeTarget(pParse,
@@ -21783,15 +21804,48 @@ begin
             if r1 <> regSortBase + jj then
               sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBase + jj);
           end;
+          { bSeq=1 path (Top-N): emit OP_Sequence between keys and data
+            so duplicate sort-keys remain insertable into the B-tree. }
+          if bSeqExtra <> 0 then
+          begin
+            regSeq := regSortBase + sortNKey;
+            sqlite3VdbeAddOp2(v, OP_Sequence, iSorterCsr, regSeq);
+          end;
           for jj := 0 to nResultCol - 1 do
             sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
-                              regSortBase + sortNKey + jj);
+                              regSortBase + sortNKey + bSeqExtra + jj);
+          { Top-N gate (select.c pushOntoSorter:832..856).  When LIMIT
+            is set, cap the B-tree at LIMIT+OFFSET entries: when iLimit
+            > 0 there is room (skip the delete); otherwise compare new
+            key against largest (Last+IdxLE) — if new >= largest, jump
+            past IdxInsert; else delete the largest first. }
+          iSkipTopN := 0;
+          if (bUseSorter = 0) and (p^.iLimit <> 0) then
+          begin
+            if p^.iOffset <> 0 then iLimitTopN := p^.iOffset + 1
+                                else iLimitTopN := p^.iLimit;
+            sqlite3VdbeAddOp2(v, OP_IfNotZero, iLimitTopN,
+                              sqlite3VdbeCurrentAddr(v) + 4);
+            sqlite3VdbeAddOp2(v, OP_Last, iSorterCsr, 0);
+            iSkipTopN := sqlite3VdbeAddOp4Int(v, OP_IdxLE,
+                              iSorterCsr, 0,
+                              regSortBase + pWInfo^.nOBSat,
+                              sortNKey - pWInfo^.nOBSat);
+            sqlite3VdbeAddOp1(v, OP_Delete, iSorterCsr);
+          end;
           Inc(pParse^.nMem);
           regSortRec := pParse^.nMem;
           sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
-                            sortNKey + nResultCol, regSortRec);
-          sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
-                               regSortBase, nResultCol);
+                            sortNKey + bSeqExtra + nResultCol, regSortRec);
+          if bUseSorter <> 0 then
+            sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
+                                 regSortBase, nResultCol)
+          else
+            sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iSorterCsr, regSortRec,
+                                 regSortBase,
+                                 sortNKey + bSeqExtra + nResultCol);
+          if iSkipTopN > 0 then
+            sqlite3VdbeChangeP2(v, iSkipTopN, sqlite3VdbeCurrentAddr(v));
         end;
       end
       else
@@ -21880,14 +21934,26 @@ begin
                                      'USE TEMP B-TREE FOR %s',
                                      ['ORDER BY']),
                       P4_DYNAMIC);
-    Inc(pParse^.nMem); regSortOut := pParse^.nMem;
-    iSortTab := pParse^.nTab; Inc(pParse^.nTab);
-    sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortTab, regSortOut,
-                      sortNKey + 1 + nResultCol);
     addrSortBrk := sqlite3VdbeMakeLabel(pParse);
-    sqlite3VdbeAddOp2(v, OP_SorterSort, iSorterCsr, addrSortBrk);
-    addrSortLoop := sqlite3VdbeCurrentAddr(v);
-    sqlite3VdbeAddOp3(v, OP_SorterData, iSorterCsr, regSortOut, iSortTab);
+    if bUseSorter <> 0 then
+    begin
+      Inc(pParse^.nMem); regSortOut := pParse^.nMem;
+      iSortTab := pParse^.nTab; Inc(pParse^.nTab);
+      sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortTab, regSortOut,
+                        sortNKey + 1 + nResultCol);
+      sqlite3VdbeAddOp2(v, OP_SorterSort, iSorterCsr, addrSortBrk);
+      addrSortLoop := sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp3(v, OP_SorterData, iSorterCsr, regSortOut, iSortTab);
+    end
+    else
+    begin
+      { Top-N B-tree tail (select.c generateSortTail:1763..1771).  iSortTab
+        is the B-tree itself; OP_Sort acts like Rewind on the sorted
+        index. }
+      iSortTab := iSorterCsr;
+      sqlite3VdbeAddOp2(v, OP_Sort, iSorterCsr, addrSortBrk);
+      addrSortLoop := sqlite3VdbeCurrentAddr(v);
+    end;
     { OFFSET skip post-sort — codeOffset (select.c:881..887) inside
       generateSortTail.  IfPos decrements iOffset and jumps over the
       ResultRow when the offset has not yet been consumed. }
@@ -21901,7 +21967,7 @@ begin
     { OMITREF readback (select.c:1722..1737) — when bSortOmitRef=1, every
       result column was tagged with iOrderByCol > 0, meaning it lives in
       the sorter KEY area at index (iOrderByCol-1).  Read from there
-      instead of from the data area at sortNKey + i. }
+      instead of from the data area at sortNKey + bSeqExtra + i. }
     if bSortOmitRef <> 0 then
     begin
       pELItm := items;
@@ -21912,17 +21978,23 @@ begin
     end
     else
       for i := 0 to nResultCol - 1 do
-        sqlite3VdbeAddOp3(v, OP_Column, iSortTab, sortNKey + i,
+        sqlite3VdbeAddOp3(v, OP_Column, iSortTab,
+                          sortNKey + bSeqExtra + i,
                           pDest^.iSdst + i);
     sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
-    { LIMIT decrement after each emitted row (post-sort).  The inner-loop
-      body intentionally skips DecrJumpZero for the bSort path — all rows
-      must reach the sorter so the top-N is correct. }
-    if (p^.iLimit <> 0) and (not isExists) then
+    { LIMIT decrement after each emitted row (post-sort).  Sorter mode
+      only — in Top-N B-tree mode (bUseSorter=0) the cap was enforced
+      during insert via the IfNotZero/IdxLE/Delete gate, and the C
+      generateSortTail B-tree arm omits DecrJumpZero entirely
+      (select.c:1860..1890). }
+    if (p^.iLimit <> 0) and (not isExists) and (bUseSorter <> 0) then
       sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrSortBrk);
     if addrSortContinue <> 0 then
       sqlite3VdbeResolveLabel(v, addrSortContinue);
-    sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterCsr, addrSortLoop);
+    if bUseSorter <> 0 then
+      sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterCsr, addrSortLoop)
+    else
+      sqlite3VdbeAddOp2(v, OP_Next, iSorterCsr, addrSortLoop);
     sqlite3VdbeResolveLabel(v, addrSortBrk);
   end;
 

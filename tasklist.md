@@ -262,9 +262,15 @@ skeleton.
   [X] **6.10 step 26** DiagIndexing probe — DONE.  Minimal ORDER BY
       sorter ported (SRT_Output, plain LIMIT, LIMIT+OFFSET, DISTINCT,
       nOBSat shortcut).
-      Deferred sub-arm (not in current corpus):
-      [ ] Top-N sorter — currently pushes all rows then trims with
-          DecrJumpZero.
+      [X] Top-N sorter (select.c pushOntoSorter:832..856) — DONE.
+          When LIMIT is set, sorter cursor opens via OP_OpenEphemeral
+          (B-tree backed) and inner loop emits IfNotZero/Last/IdxLE/
+          Delete + IdxInsert with bSeq=1; tail uses OP_Sort/OP_Next.
+          Sorter mode unchanged when no LIMIT.  Gated by
+          DiagOrderLimitTopN (9/9 PASS).
+          Open follow-up: ORDER BY + LIMIT 0 still crashes (the early-
+          exit Goto interacts with the new B-tree open path); LIMIT 0
+          short-circuit is a separate bug from Top-N correctness.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26, was Δ=21):
     (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
