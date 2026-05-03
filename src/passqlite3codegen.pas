@@ -26642,6 +26642,45 @@ begin
   end;
 end;
 
+{ xferCompatibleIndex — port of insert.c:2951 (Phase 6.8.6 prep).
+  Returns 1 iff index pSrc can be used as the data source for index pDest in
+  an INSERT-FROM-SELECT transfer optimisation: same column count, same
+  conflict-resolution, same indexed columns / expressions / sort orders /
+  collations, and identical partial-index WHERE clauses.  Returns 0
+  otherwise.  Caller is xferOptimization (insert.c:3012, not yet ported);
+  the helper is exposed now so the future xferOptimization port can drop in
+  unchanged. }
+function xferCompatibleIndex(pDest, pSrc: PIndex2): i32;
+var
+  i:           i32;
+  azSrc, azDst: PPAnsiChar;
+  pColExSrc, pColExDst: PExprList;
+begin
+  Result := 0;
+  if (pDest = nil) or (pSrc = nil) then Exit;
+  if (pDest^.nKeyCol <> pSrc^.nKeyCol) or (pDest^.nColumn <> pSrc^.nColumn) then Exit;
+  if pDest^.onError <> pSrc^.onError then Exit;
+  azSrc     := PPAnsiChar(pSrc^.azColl);
+  azDst     := PPAnsiChar(pDest^.azColl);
+  pColExSrc := pSrc^.aColExpr;
+  pColExDst := pDest^.aColExpr;
+  for i := 0 to i32(pSrc^.nKeyCol) - 1 do
+  begin
+    if pSrc^.aiColumn[i] <> pDest^.aiColumn[i] then Exit;
+    if pSrc^.aiColumn[i] = XN_EXPR then
+    begin
+      if (pColExSrc = nil) or (pColExDst = nil) then Exit;
+      if sqlite3ExprCompare(nil,
+           ExprListItems(pColExSrc)[i].pExpr,
+           ExprListItems(pColExDst)[i].pExpr, -1) <> 0 then Exit;
+    end;
+    if pSrc^.aSortOrder[i] <> pDest^.aSortOrder[i] then Exit;
+    if sqlite3_stricmp(azSrc[i], azDst[i]) <> 0 then Exit;
+  end;
+  if sqlite3ExprCompare(nil, pSrc^.pPartIdxWhere, pDest^.pPartIdxWhere, -1) <> 0 then Exit;
+  Result := 1;
+end;
+
 { autoIncBegin — port of insert.c:159 (Phase 6.x stub).
   C reference returns regAutoinc (memcell holding the AUTOINCREMENT counter)
   for AUTOINCREMENT tables, 0 otherwise.  Until autoincrement codegen lands,

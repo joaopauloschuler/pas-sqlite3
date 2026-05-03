@@ -101,7 +101,8 @@ FPC porting traps that recur often enough to call out up-front:
           deferred — TestExplainParity multi-table rows still
           mostly diverging on join-order / explain-text edges).
      [ ] Bloom-filter and covering-index arms (covers 6.10 step 9
-          d-INNER and the `SELECT p FROM u` planner Δ).
+          d-INNER).  `SELECT p FROM u` planner Δ — closed under
+          6.10 step 6.
 
 - [~] **6.8.6** port the productive `sqlite3Insert` body (insert.c).
      Single-row VALUES path DONE.  Inline four-op shortcut replaced
@@ -117,7 +118,9 @@ FPC porting traps that recur often enough to call out up-front:
      [X] RETURNING clause emission — DiagDml RETURNING corpus PASS.
      [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
      [ ] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
-          fast path).
+          fast path).  Building block ported: `xferCompatibleIndex`
+          (insert.c:2951) at codegen.pas — index-pair compatibility
+          check used by xferOptimization.
 
 - [X] **6.8.5** port `sqlite3WhereEnd` (where.c) — DONE.
      Body at codegen.pas:16461..16672.  Per-level addrCont resolution +
