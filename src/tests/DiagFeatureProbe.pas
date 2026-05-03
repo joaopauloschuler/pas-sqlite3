@@ -225,6 +225,19 @@ begin
         'CREATE TABLE t(a); INSERT INTO t VALUES(7); INSERT INTO t VALUES(8)',
         'SELECT 1',
         'SELECT a FROM (SELECT a FROM t WHERE a>7)');
+  // Phase 6.13(b)-coagg follow-up: sum/min/max on subquery.
+  Probe('Sub-SELECT sum agg',
+        'CREATE TABLE t(a); INSERT INTO t VALUES(10),(20),(30)',
+        'SELECT 1',
+        'SELECT sum(a) FROM (SELECT a FROM t WHERE a>15)');
+  Probe('Sub-SELECT min agg',
+        'CREATE TABLE t(a); INSERT INTO t VALUES(10),(20),(30)',
+        'SELECT 1',
+        'SELECT min(a) FROM (SELECT a FROM t WHERE a>15)');
+  Probe('Sub-SELECT max agg',
+        'CREATE TABLE t(a); INSERT INTO t VALUES(10),(20),(30)',
+        'SELECT 1',
+        'SELECT max(a) FROM (SELECT a FROM t WHERE a>15)');
   // CTE
   Probe('CTE simple',
         '',

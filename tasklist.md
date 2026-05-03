@@ -233,9 +233,11 @@ skeleton.
       new silent-result bugs are listed first.
       [X] **c) View materialisation in SELECT.**  DONE — agg-on-subquery
         arm (codegen.pas:21088..) materialises subquery into eph cursor
-        and drives Rewind/updateAccumulator/Next; `count(*) FROM v` and
-        `count(*) FROM (SELECT ...)` PASS.  sum/min/max on subquery still
-        bail (nAccumulator>0 — needs directMode column-store).
+        and drives Rewind/updateAccumulator/Next; `count(*) FROM v`,
+        `count(*) FROM (SELECT ...)`, `sum(a) / min(a) / max(a) FROM
+        (SELECT a FROM t WHERE …)` all PASS.  nAccumulator>0 bail lifted
+        for the isSubqueryAgg arm (eph cursor is what the directMode
+        OP_Column reads).
       [~] **e) UNION / compound SELECT.**  Partial — UNION ALL arm
         of multiSelect (select.c:2998..3050) ported at codegen.pas
         sqlite3Select compound dispatch; `SELECT 1 UNION ALL SELECT 2`
@@ -319,11 +321,9 @@ skeleton.
               lines).  Closes the flattenable agg-on-subquery case
               with bytecode parity.
             - **6.13(b)-coagg**: agg-arm subquery dispatch landed for
-              `count(*) FROM (SELECT…)` / `count(*) FROM v` via
-              materialise + Rewind scan (codegen.pas:21088..).
-              Remaining: sum/min/max on subquery (nAccumulator>0 bail —
-              needs directMode column-store); flattenable case still
-              wants 6.13(b)-fl.
+              `count(*) / sum / min / max FROM (SELECT…)` and `… FROM v`
+              via materialise + Rewind scan (codegen.pas:21088..).
+              Flattenable case still wants 6.13(b)-fl for bytecode parity.
        [~] **c) Compound-SELECT / CTE arm** — UNION ALL arm of
             multiSelect ported (select.c:2998..3050) at codegen.pas
             sqlite3Select compound dispatch.  TK_ALL leaves recurse

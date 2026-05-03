@@ -21200,7 +21200,14 @@ begin
         nAccumulator > 0 we'd need the assignAggregateRegisters block
         plus the directMode column-store loop in updateAccumulator —
         deferred until the GROUP BY path lands. }
-      if canUseAgg and (pAggI2^.nAccumulator > 0) then canUseAgg := False;
+      { Phase 6.13(b)-coagg follow-up — for the subquery-FROM agg arm,
+        accumulator columns reference the materialised eph cursor (pTab is
+        ephemeral, iCursor=iCsr).  updateAccumulatorSimple's directMode
+        loop emits OP_Column from that cursor, which is exactly what the
+        eph table holds.  For the regular base-table arm we still bail
+        because GROUP BY result-list shapes need extra plumbing. }
+      if canUseAgg and (pAggI2^.nAccumulator > 0)
+         and (not isSubqueryAgg) then canUseAgg := False;
 
       if canUseAgg and (pParse^.nErr = 0) then
       begin
