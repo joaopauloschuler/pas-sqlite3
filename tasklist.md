@@ -229,7 +229,7 @@ FPC porting traps that recur often enough to call out up-front:
   [ ] **6.27** codegen.pas schema-mutation + statistics.
        Sub-rows that overlapped Phase 7 have been moved out
        (ATTACH/DETACH → 7.1.8; the ALTER trio → 7.1.9).
-       [ ] Port `sqlite3Analyze` (analyze.c).  Emits the bytecode
+       [~] Port `sqlite3Analyze` (analyze.c).  Emits the bytecode
             that populates `sqlite_stat1` / `sqlite_stat4`; gates the
             cost-based planner work in 6.8.4 (without ANALYZE rows
             the planner falls back to heuristic costs and several
@@ -240,8 +240,17 @@ FPC porting traps that recur often enough to call out up-front:
             (analyze.c:1593..1650 — sqlite3_exec callback for
             sqlite_stat1 rows), wired into `analysisLoadTrampoline`
             via the new `gStat1Exec` hook (passqlite3main installs
-            sqlite3_exec).  Productive the moment `sqlite3Analyze`
-            stops being a stub.
+            sqlite3_exec).
+            [X] Entry-stack ported (sqlite3Analyze, analyzeDatabase,
+                 analyzeTable, openStatTable, callStatGet,
+                 loadAnalysis) — analyze.c:166..251 + 935..946 +
+                 1384..1503.  ANALYZE now emits BeginWrite +
+                 openStatTable + LoadAnalysis + Expire framing.
+            [ ] Port the leaf `analyzeOneTable` (analyze.c:977..1378)
+                 — currently a stub; depends on the StatAccum SQL
+                 functions (statInit/statPush/statGet) which still
+                 need registration before the per-index OP_Function
+                 chain can fire productively.
        [X] Port `sqlite3Vacuum` (vacuum.c).
        [X] Port `sqlite3FkCheck` (fkey.c) — DONE.  fkScanChildren
             (fkey.c:547..660) and the dispatcher body (fkey.c:889..

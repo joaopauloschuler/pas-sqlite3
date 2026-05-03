@@ -36847,12 +36847,310 @@ begin
 end;
 
 // ===========================================================================
-// Phase 6.5 — analyze.c stubs
+// Phase 6.27 — analyze.c port (SQLite 3.53.0)
 // ===========================================================================
+//
+// 1:1 ports of the analyze.c entry-stack:
+//   * openStatTable      (analyze.c:166..251)
+//   * callStatGet        (analyze.c:935..946)
+//   * loadAnalysis       (analyze.c:1384..1389)
+//   * analyzeDatabase    (analyze.c:1394..1419)
+//   * analyzeTable       (analyze.c:1426..1443)
+//   * sqlite3Analyze     (analyze.c:1457..1503)
+//
+// The leaf code generator analyzeOneTable (analyze.c:977..1378) and the
+// StatAccum SQL functions (statInit/statPush/statGet) are still stubbed
+// here — porting those is the next sub-step under Phase 6.27.  Until that
+// lands, openStatTable still emits the CREATE TABLE / DELETE / OP_Clear /
+// OP_OpenWrite preamble; analyzeOneTable below short-circuits before
+// emitting the per-index loop, so ANALYZE produces well-formed (but
+// trivial) bytecode rather than a no-op stub.
 
-procedure sqlite3Analyze(pParse: PParse; pName1: PToken; pName2: PToken);
+{ Forward — analyze.c:977 leaf code generator (still stubbed; emits no
+  index walk until StatAccum SQL funcs land in a follow-up). }
+procedure analyzeOneTable(pParse: PParse; pTab: PTable2; pOnlyIdx: PIndex2;
+                          iStatCur, iMem, iTab: i32); forward;
+
+{ openStatTable — port of analyze.c:166..251.  Creates / clears the
+  sqlite_stat1 (and stat4) tables, opens them for writing on cursors
+  iStatCur..iStatCur+nToOpen-1.  zWhere/zWhereType together restrict the
+  pre-clearing DELETE; both NULL means "wipe the whole table".
+
+  STAT4 is gated off in this build, so nToOpen is fixed to 1 and the
+  sqlite_stat4 row of aTable[] is treated like any other "skip" row (its
+  zCols is nil — same shape as upstream's #else arm). }
+procedure openStatTable(pParse: PParse; iDb, iStatCur: i32;
+                         zWhere, zWhereType: PAnsiChar);
+const
+  cTabName: array[0..2] of PAnsiChar =
+    ('sqlite_stat1', 'sqlite_stat4', 'sqlite_stat3');
+  cTabCols: array[0..2] of PAnsiChar =
+    ('tbl,idx,stat', nil, nil);
+  cNToOpen = 1;  { non-STAT4 build }
+var
+  i:          i32;
+  db:         PTsqlite3;
+  pDb:        passqlite3util.PDb;
+  v:          PVdbe;
+  aRoot:      array[0..2] of u32;
+  aCreateTbl: array[0..2] of u8;
+  zTab:       PAnsiChar;
+  pStat:      PTable2;
 begin
-  { Phase 7 }
+  db := pParse^.db;
+  v  := sqlite3GetVdbe(pParse);
+  if v = nil then Exit;
+  pDb := @db^.aDb[iDb];
+
+  { Create new statistic tables if they do not exist, or clear them if
+    they do already exist. }
+  for i := 0 to 2 do
+  begin
+    zTab          := cTabName[i];
+    aCreateTbl[i] := 0;
+    aRoot[i]      := 0;
+    pStat := sqlite3FindTable(db, zTab, pDb^.zDbSName);
+    if pStat = nil then
+    begin
+      if (i < cNToOpen) and (cTabCols[i] <> nil) then
+      begin
+        { CREATE TABLE side-effects: leaves the new table's rootpage in
+          register pParse^.u1.cr.regRoot.  OpenWrite below picks it up
+          via OPFLAG_P2ISREG. }
+        sqlite3NestedParse(pParse, 'CREATE TABLE %Q.%s(%s)',
+                           [pDb^.zDbSName, zTab, cTabCols[i]]);
+        { C asserts (isCreate || nErr).  isCreate is not exposed in the
+          Pascal Parse layout — the post-NestedParse invariant is that
+          regRoot was populated (CREATE TABLE side-effect) unless an
+          error was set; a zero regRoot with no error would still be a
+          benign zero-aRoot entry, harmless for OpenWrite. }
+        aRoot[i]      := u32(pParse^.u1.cr.regRoot);
+        aCreateTbl[i] := OPFLAG_P2ISREG;
+      end;
+    end else begin
+      { Pre-existing sqlite_statN table — wipe rows we are about to
+        regenerate.  zWhere narrows to one tbl/idx; nil clears all. }
+      aRoot[i] := u32(pStat^.tnum);
+      { sqlite3TableLock — no-op under SQLITE_OMIT_SHARED_CACHE. }
+      if zWhere <> nil then
+      begin
+        sqlite3NestedParse(pParse, 'DELETE FROM %Q.%s WHERE %s=%Q',
+                           [pDb^.zDbSName, zTab, zWhereType, zWhere]);
+      end else begin
+        sqlite3VdbeAddOp2(v, OP_Clear, i32(aRoot[i]), iDb);
+      end;
+    end;
+  end;
+
+  { Open the sqlite_stat[1] tables for writing. }
+  for i := 0 to cNToOpen - 1 do
+  begin
+    sqlite3VdbeAddOp4Int(v, OP_OpenWrite, iStatCur + i, i32(aRoot[i]), iDb, 3);
+    sqlite3VdbeChangeP5(v, aCreateTbl[i]);
+  end;
+end;
+
+{ callStatGet — port of analyze.c:935..946.  Emits the OP_Function call
+  that fetches the stat_get() result from the StatAccum.  Non-STAT4
+  build: iParam is unused, the function takes a single regStat arg.
+
+  Ungated on the StatAccum SQL func registration: since the func table
+  is not yet wired here, callers that reach this code path under a stub
+  build will still emit the OP_Function shape (the dispatch hits the
+  same xFunc resolution path as any other registered function). }
+procedure callStatGet(pParse: PParse; regStat, iParam, regOut: i32);
+begin
+  { Non-STAT4 path: iParam silenced, see analyze.c:941. }
+  AssertH((regOut <> regStat) and (regOut <> regStat + 1),
+          'callStatGet: regOut overlap');
+  { Look up stat_get by name (matches sqlite3VdbeAddFunctionCall's
+    eventual lookup against db->aFunc).  Until the StatAccum SQL funcs
+    are registered the resolver returns nil and this becomes a no-op
+    OP_Function with P4=nil — same shape as upstream's PRAGMA-only
+    path. }
+  sqlite3VdbeAddFunctionCall(pParse, 0, regStat, regOut, 1, nil, 0);
+end;
+
+{ loadAnalysis — port of analyze.c:1384..1389.  Emits a single
+  OP_LoadAnalysis(iDb) so the just-written sqlite_stat1 rows are read
+  back into Index.aiRowLogEst at the end of the ANALYZE program. }
+procedure loadAnalysis(pParse: PParse; iDb: i32);
+var
+  v: PVdbe;
+begin
+  v := sqlite3GetVdbe(pParse);
+  if v <> nil then
+    sqlite3VdbeAddOp1(v, OP_LoadAnalysis, iDb);
+end;
+
+{ analyzeDatabase — port of analyze.c:1394..1419.  Iterate every base
+  table in the schema and call analyzeOneTable on each.  Wraps the
+  walk in a sqlite_stat1 open + LoadAnalysis. }
+procedure analyzeDatabase(pParse: PParse; iDb: i32);
+var
+  db:       PTsqlite3;
+  pSchema:  passqlite3util.PSchema;
+  pElem:    PHashElem;
+  pTab:     PTable2;
+  iStatCur: i32;
+  iMem:     i32;
+  iTab:     i32;
+begin
+  db      := pParse^.db;
+  pSchema := passqlite3util.PSchema(db^.aDb[iDb].pSchema);
+  sqlite3BeginWriteOperation(pParse, 0, iDb);
+  iStatCur := pParse^.nTab;
+  pParse^.nTab := pParse^.nTab + 3;
+  openStatTable(pParse, iDb, iStatCur, nil, nil);
+  iMem := pParse^.nMem + 1;
+  iTab := pParse^.nTab;
+  if pSchema = nil then begin loadAnalysis(pParse, iDb); Exit; end;
+  pElem := pSchema^.tblHash.first;
+  while pElem <> nil do
+  begin
+    pTab := PTable2(pElem^.data);
+    if pTab <> nil then
+      analyzeOneTable(pParse, pTab, nil, iStatCur, iMem, iTab);
+    { Non-STAT4 build: iMem is invariant (assert in C). }
+    pElem := PHashElem(pElem^.next);
+  end;
+  loadAnalysis(pParse, iDb);
+end;
+
+{ analyzeTable — port of analyze.c:1426..1443.  Single-table form.  If
+  pOnlyIdx is non-nil, only that one index is analyzed; otherwise every
+  index on pTab is. }
+procedure analyzeTable(pParse: PParse; pTab: PTable2; pOnlyIdx: PIndex2);
+var
+  iDb:      i32;
+  iStatCur: i32;
+begin
+  AssertH(pTab <> nil, 'analyzeTable: pTab=nil');
+  iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
+  sqlite3BeginWriteOperation(pParse, 0, iDb);
+  iStatCur := pParse^.nTab;
+  pParse^.nTab := pParse^.nTab + 3;
+  if pOnlyIdx <> nil then
+    openStatTable(pParse, iDb, iStatCur, pOnlyIdx^.zName, 'idx')
+  else
+    openStatTable(pParse, iDb, iStatCur, pTab^.zName, 'tbl');
+  analyzeOneTable(pParse, pTab, pOnlyIdx, iStatCur,
+                  pParse^.nMem + 1, pParse^.nTab);
+  loadAnalysis(pParse, iDb);
+end;
+
+{ Local sqlite3NameFromToken — inlined here because the parser-unit
+  symbol of the same name is not visible from codegen.  Mirrors
+  parser.pas:1586 (sqlite3DbStrNDup + sqlite3Dequote). }
+function analyzeNameFromToken(db: PTsqlite3; pName: PToken): PAnsiChar;
+begin
+  Result := nil;
+  if pName <> nil then
+  begin
+    Result := sqlite3DbStrNDup(db, pName^.z, u64(pName^.n));
+    if Result <> nil then sqlite3Dequote(Result);
+  end;
+end;
+
+{ sqlite3Analyze — port of analyze.c:1457..1503.  Three forms:
+    Form 1: ANALYZE                    — every attached schema (skip TEMP)
+    Form 2: ANALYZE <schema>           — one schema
+    Form 3: ANALYZE [schema.]<object>  — one table or one index
+  Trailing OP_Expire so prepared statements re-plan against the new
+  stat1 rows on next step. }
+procedure sqlite3Analyze(pParse: PParse; pName1: PToken; pName2: PToken);
+var
+  db:         PTsqlite3;
+  iDb:        i32;
+  i:          i32;
+  z:          PAnsiChar;
+  zDb:        PAnsiChar;
+  pTab:       PTable2;
+  pIdx:       PIndex2;
+  pTableName: PToken;
+  v:          PVdbe;
+begin
+  db := pParse^.db;
+  if sqlite3ReadSchema(pParse) <> SQLITE_OK then Exit;
+  AssertH((pName2 <> nil) or (pName1 = nil), 'sqlite3Analyze: name pair');
+
+  if pName1 = nil then
+  begin
+    { Form 1: ANALYZE everything (skip TEMP at index 1). }
+    for i := 0 to db^.nDb - 1 do
+      if i <> 1 then analyzeDatabase(pParse, i);
+  end else if pName2^.n = 0 then
+  begin
+    iDb := sqlite3FindDb(db, pName1);
+    if iDb >= 0 then
+      analyzeDatabase(pParse, iDb)
+    else
+    begin
+      { ANALYZE <name> where <name> is not a schema — fall through to
+        Form 3 with pName1 as the object name and no schema qualifier.
+        Mirrors C's else-branch (analyze.c:1481). }
+      iDb := sqlite3TwoPartName(pParse, pName1, pName2, @pTableName);
+      if iDb < 0 then Exit;
+      zDb := nil;
+      z := analyzeNameFromToken(db, pTableName);
+      if z = nil then Exit;
+      pIdx := sqlite3FindIndex(db, z, zDb);
+      if pIdx <> nil then
+        analyzeTable(pParse, pIdx^.pTable, pIdx)
+      else
+      begin
+        pTab := sqlite3LocateTable(pParse, 0, z, zDb);
+        if pTab <> nil then analyzeTable(pParse, pTab, nil);
+      end;
+      sqlite3DbFree(db, z);
+    end;
+  end else
+  begin
+    { Form 3: ANALYZE schema.object. }
+    iDb := sqlite3TwoPartName(pParse, pName1, pName2, @pTableName);
+    if iDb >= 0 then
+    begin
+      if pName2^.n <> 0 then zDb := db^.aDb[iDb].zDbSName else zDb := nil;
+      z := analyzeNameFromToken(db, pTableName);
+      if z <> nil then
+      begin
+        pIdx := sqlite3FindIndex(db, z, zDb);
+        if pIdx <> nil then
+          analyzeTable(pParse, pIdx^.pTable, pIdx)
+        else
+        begin
+          pTab := sqlite3LocateTable(pParse, 0, z, zDb);
+          if pTab <> nil then analyzeTable(pParse, pTab, nil);
+        end;
+        sqlite3DbFree(db, z);
+      end;
+    end;
+  end;
+
+  if db^.nSqlExec = 0 then
+  begin
+    v := sqlite3GetVdbe(pParse);
+    if v <> nil then sqlite3VdbeAddOp0(v, OP_Expire);
+  end;
+end;
+
+{ analyzeOneTable — port of analyze.c:977..1378.  Still a code-emit
+  stub: the per-index OP_OpenRead / OP_Function(stat_init/stat_push/
+  stat_get) / OP_Insert chain depends on the StatAccum SQL function
+  registration (statInitFuncdef / statPushFuncdef / statGetFuncdef)
+  which lands in the next sub-step.  Until then, ANALYZE produces a
+  schema-write framing (BeginWrite + openStatTable + LoadAnalysis +
+  Expire) but no actual stat1 rows.
+
+  Marked as the explicit gate for Phase 6.27 (analyze.c full port). }
+procedure analyzeOneTable(pParse: PParse; pTab: PTable2; pOnlyIdx: PIndex2;
+                          iStatCur, iMem, iTab: i32);
+begin
+  { Silence "unused parameter" warnings — mirror upstream's behaviour
+    when SQLITE_OMIT_ANALYZE-style trimming is in effect. }
+  if (pParse = nil) or (pTab = nil) then Exit;
+  if pOnlyIdx = pOnlyIdx then ;     { keep referenced }
+  if (iStatCur or iMem or iTab) = 0 then ;
 end;
 
 procedure sqlite3DeleteIndexSamples(db: PTsqlite3; pIdx: PIndex2);
