@@ -5024,6 +5024,13 @@ begin
   b.ixNx[NB*2-1] := $7fffffff;
   pBt := pParent^.pBt;
   rc  := SQLITE_OK;
+  { btree.c:8238..8249 — these are explicitly initialised in the C
+    reference; Pascal uninitialised stack locals would otherwise carry
+    forward random bytes from a prior frame. }
+  nMaxCells  := 0;
+  nNew       := 0;
+  iSpace1    := 0;
+  iOvflSpace := 0;
 
   if aOvflSpace = nil then begin
     Result := SQLITE_NOMEM_BKPT;
