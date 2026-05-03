@@ -18469,6 +18469,359 @@ begin
   Result := addr;
 end;
 
+{ multiSelectByMerge — port of select.c:3389..3722 (SQLite 3.53.0).
+  Merge-sort two co-routine SELECTs that share an ORDER BY.  Used by
+  sqlite3Select's compound-SELECT dispatch when the outer SELECT carries
+  an ORDER BY.  Splits the compound chain at pSplit (balanced when
+  SQLITE_BalancedMerge is on and the operator is TK_ALL or TK_UNION),
+  evaluates the left and right halves as SRT_Coroutine producers, and
+  weaves their rows by comparing the ORDER BY key registers via OP_Compare.
+  Closes 6.10 step 9(e) for UNION / INTERSECT / EXCEPT and the dedup arm
+  of `SELECT 1 UNION SELECT 2`. }
+function multiSelectByMerge(pParse: PParse; p: PSelect;
+  pDest: PSelectDest): i32;
+var
+  i, j:          i32;
+  pPrior:        PSelect;
+  pSplit:        PSelect;
+  nSelect:       i32;
+  v:             PVdbe;
+  destA, destB:  TSelectDest;
+  regAddrA:      i32;
+  regAddrB:      i32;
+  regOutA:       i32;
+  regOutB:       i32;
+  addrSelectA:   i32;
+  addrSelectB:   i32;
+  addrOutA:      i32;
+  addrOutB:      i32;
+  addrEofA:      i32;
+  addrEofA_noB:  i32;
+  addrEofB:      i32;
+  addrAltB:      i32;
+  addrAeqB:      i32;
+  addrAgtB:      i32;
+  regLimitA:     i32;
+  regLimitB:     i32;
+  regPrev:       i32;
+  savedLimit:    i32;
+  savedOffset:   i32;
+  labelCmpr:     i32;
+  labelEnd:      i32;
+  addr1:         i32;
+  op:            i32;
+  pKeyDup:       PKeyInfo2;
+  pKeyMerge:     PKeyInfo2;
+  db:            PTsqlite3;
+  pOrderBy:      PExprList;
+  nOrderBy:      i32;
+  aPermute:      Pu32;
+  pItem:         PExprListItem;
+  pNew:          PExpr;
+  bKeep:         i32;
+  nExpr:         i32;
+  aColl:         PPointer;
+begin
+  pKeyDup := nil;
+  AssertH(p^.pOrderBy <> nil, 'multiSelectByMerge: ORDER BY required');
+  db := pParse^.db;
+  v  := sqlite3GetVdbe(pParse);
+  AssertH(v <> nil, 'multiSelectByMerge: VDBE alloc failed');
+  labelEnd  := sqlite3VdbeMakeLabel(pParse);
+  labelCmpr := sqlite3VdbeMakeLabel(pParse);
+
+  { Patch up the ORDER BY clause. }
+  op       := p^.op;
+  AssertH(p^.pPrior^.pOrderBy = nil, 'multiSelectByMerge: pPrior^.pOrderBy<>nil');
+  pOrderBy := p^.pOrderBy;
+  AssertH(pOrderBy <> nil, 'multiSelectByMerge: pOrderBy=nil');
+  nOrderBy := pOrderBy^.nExpr;
+
+  { For operators other than UNION ALL we have to make sure that the ORDER BY
+    clause covers every term of the result set.  Add terms as necessary. }
+  if op <> TK_ALL then
+  begin
+    i := 1;
+    while (db^.mallocFailed = 0) and (i <= p^.pEList^.nExpr) do
+    begin
+      pItem := ExprListItems(pOrderBy);
+      j := 0;
+      while j < nOrderBy do
+      begin
+        AssertH(pItem^.u.x.iOrderByCol > 0,
+          'multiSelectByMerge: iOrderByCol<=0');
+        if i32(pItem^.u.x.iOrderByCol) = i then break;
+        Inc(j); Inc(pItem);
+      end;
+      if j = nOrderBy then
+      begin
+        pNew := sqlite3ExprInt32(db, i);
+        if pNew = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+        pOrderBy := sqlite3ExprListAppend(pParse, pOrderBy, pNew);
+        p^.pOrderBy := pOrderBy;
+        if pOrderBy <> nil then
+        begin
+          pItem := ExprListItems(pOrderBy);
+          Inc(pItem, nOrderBy);
+          pItem^.u.x.iOrderByCol := u16(i);
+          Inc(nOrderBy);
+        end;
+      end;
+      Inc(i);
+    end;
+  end;
+
+  { Compute the comparison permutation and KeyInfo. }
+  aPermute := sqlite3DbMallocRawNN(db, u64(SizeOf(u32) * (nOrderBy + 1)));
+  if aPermute <> nil then
+  begin
+    bKeep := 0;
+    aPermute[0] := u32(nOrderBy);
+    pItem := ExprListItems(pOrderBy);
+    for i := 1 to nOrderBy do
+    begin
+      AssertH(pItem^.u.x.iOrderByCol > 0,
+        'multiSelectByMerge: aPermute iOrderByCol<=0');
+      AssertH(i32(pItem^.u.x.iOrderByCol) <= p^.pEList^.nExpr,
+        'multiSelectByMerge: iOrderByCol>nExpr');
+      aPermute[i] := u32(pItem^.u.x.iOrderByCol) - 1;
+      if aPermute[i] <> u32(i - 1) then bKeep := 1;
+      Inc(pItem);
+    end;
+    if bKeep = 0 then
+    begin
+      sqlite3DbFreeNN(db, aPermute);
+      aPermute := nil;
+    end;
+  end;
+  pKeyMerge := multiSelectByMergeKeyInfo(pParse, p, 1);
+
+  { Allocate temp regs / KeyInfo for UNION/EXCEPT/INTERSECT duplicate removal. }
+  if op = TK_ALL then
+  begin
+    regPrev := 0;
+  end
+  else
+  begin
+    nExpr := p^.pEList^.nExpr;
+    AssertH((nOrderBy >= nExpr) or (db^.mallocFailed <> 0),
+      'multiSelectByMerge: nOrderBy<nExpr');
+    regPrev := pParse^.nMem + 1;
+    pParse^.nMem := pParse^.nMem + nExpr + 1;
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, regPrev);
+    pKeyDup := sqlite3KeyInfoAlloc(db, nExpr, 1);
+    if pKeyDup <> nil then
+    begin
+      aColl := PPointer(PByte(pKeyDup) + SizeOf(TKeyInfo));
+      for i := 0 to nExpr - 1 do
+      begin
+        aColl[i] := multiSelectCollSeq(pParse, p, i);
+        pKeyDup^.aSortFlags[i] := 0;
+      end;
+    end;
+  end;
+
+  { Separate the left and the right query. }
+  nSelect := 1;
+  if ((op = TK_ALL) or (op = TK_UNION))
+     and OptimizationEnabled(db, SQLITE_BalancedMerge) then
+  begin
+    pSplit := p;
+    while (pSplit^.pPrior <> nil) and (pSplit^.op = op) do
+    begin
+      Inc(nSelect);
+      AssertH(pSplit^.pPrior^.pNext = pSplit,
+        'multiSelectByMerge: pPrior^.pNext<>pSplit');
+      pSplit := pSplit^.pPrior;
+    end;
+  end;
+  if nSelect <= 3 then
+  begin
+    pSplit := p;
+  end
+  else
+  begin
+    pSplit := p;
+    i := 2;
+    while i < nSelect do
+    begin
+      pSplit := pSplit^.pPrior;
+      Inc(i, 2);
+    end;
+  end;
+  pPrior := pSplit^.pPrior;
+  AssertH(pPrior <> nil, 'multiSelectByMerge: pPrior=nil');
+  pSplit^.pPrior := nil;
+  pPrior^.pNext  := nil;
+  AssertH(p^.pOrderBy = pOrderBy,
+    'multiSelectByMerge: p^.pOrderBy mutated');
+  AssertH((pOrderBy <> nil) or (db^.mallocFailed <> 0),
+    'multiSelectByMerge: pOrderBy=nil');
+  pPrior^.pOrderBy := sqlite3ExprListDup(pParse^.db, pOrderBy, 0);
+  sqlite3ResolveOrderGroupBy(pParse, p,      p^.pOrderBy,      'ORDER');
+  sqlite3ResolveOrderGroupBy(pParse, pPrior, pPrior^.pOrderBy, 'ORDER');
+
+  { Compute the limit registers. }
+  computeLimitRegisters(pParse, p, labelEnd);
+  if (p^.iLimit <> 0) and (op = TK_ALL) then
+  begin
+    Inc(pParse^.nMem); regLimitA := pParse^.nMem;
+    Inc(pParse^.nMem); regLimitB := pParse^.nMem;
+    if p^.iOffset <> 0 then
+      sqlite3VdbeAddOp2(v, OP_Copy, p^.iOffset + 1, regLimitA)
+    else
+      sqlite3VdbeAddOp2(v, OP_Copy, p^.iLimit, regLimitA);
+    sqlite3VdbeAddOp2(v, OP_Copy, regLimitA, regLimitB);
+  end
+  else
+  begin
+    regLimitA := 0;
+    regLimitB := 0;
+  end;
+  sqlite3ExprDelete(db, p^.pLimit);
+  p^.pLimit := nil;
+
+  Inc(pParse^.nMem); regAddrA := pParse^.nMem;
+  Inc(pParse^.nMem); regAddrB := pParse^.nMem;
+  Inc(pParse^.nMem); regOutA  := pParse^.nMem;
+  Inc(pParse^.nMem); regOutB  := pParse^.nMem;
+  sqlite3SelectDestInit(@destA, SRT_Coroutine, regAddrA);
+  sqlite3SelectDestInit(@destB, SRT_Coroutine, regAddrB);
+
+  { ExplainQueryPlan("MERGE (op-name)") — debug-only macro, no-op in port. }
+
+  { Generate the "A" coroutine — the SELECT to the left of the operator.
+    Strip SF_Compound on the leaf so the per-arm fast paths in sqlite3Select
+    fire (Pas no-FROM fast path gates on SF_Compound=0; matches the inline
+    UNION ALL arm's strip-and-restore idiom). }
+  addrSelectA := sqlite3VdbeCurrentAddr(v) + 1;
+  addr1 := sqlite3VdbeAddOp3(v, OP_InitCoroutine, regAddrA, 0, addrSelectA);
+  pPrior^.iLimit := regLimitA;
+  savedLimit := i32(pPrior^.selFlags);  { reuse: stash flags }
+  pPrior^.selFlags := pPrior^.selFlags and (not u32(SF_Compound));
+  sqlite3Select(pParse, pPrior, @destA);
+  pPrior^.selFlags := u32(savedLimit);
+  sqlite3VdbeEndCoroutine(v, regAddrA);
+  sqlite3VdbeJumpHere(v, addr1);
+
+  { Generate the "B" coroutine — the SELECT to the right of the operator. }
+  addrSelectB := sqlite3VdbeCurrentAddr(v) + 1;
+  addr1 := sqlite3VdbeAddOp3(v, OP_InitCoroutine, regAddrB, 0, addrSelectB);
+  savedLimit  := p^.iLimit;
+  savedOffset := p^.iOffset;
+  p^.iLimit   := regLimitB;
+  p^.iOffset  := 0;
+  i := i32(p^.selFlags);  { stash flags in unused i }
+  p^.selFlags := p^.selFlags and (not u32(SF_Compound));
+  sqlite3Select(pParse, p, @destB);
+  p^.selFlags := u32(i);
+  p^.iLimit   := savedLimit;
+  p^.iOffset  := savedOffset;
+  sqlite3VdbeEndCoroutine(v, regAddrB);
+
+  { out-A subroutine: emit current row of A to pDest. }
+  addrOutA := generateOutputSubroutine(pParse, p, @destA, pDest, regOutA,
+                                       regPrev, pKeyDup, labelEnd);
+
+  { out-B subroutine (only for ALL / UNION). }
+  addrOutB := 0;
+  if (op = TK_ALL) or (op = TK_UNION) then
+  begin
+    addrOutB := generateOutputSubroutine(pParse, p, @destB, pDest, regOutB,
+                                         regPrev, pKeyDup, labelEnd);
+  end;
+  sqlite3KeyInfoUnref(pKeyDup);
+
+  { eof-A subroutine — A exhausted, drain B (ALL/UNION) or stop (EXCEPT/INTERSECT). }
+  if (op = TK_EXCEPT) or (op = TK_INTERSECT) then
+  begin
+    addrEofA     := labelEnd;
+    addrEofA_noB := labelEnd;
+  end
+  else
+  begin
+    addrEofA     := sqlite3VdbeAddOp2(v, OP_Gosub, regOutB, addrOutB);
+    addrEofA_noB := sqlite3VdbeAddOp2(v, OP_Yield, regAddrB, labelEnd);
+    sqlite3VdbeGoto(v, addrEofA);
+    p^.nSelectRow := sqlite3LogEstAdd(p^.nSelectRow, pPrior^.nSelectRow);
+  end;
+
+  { eof-B subroutine — B exhausted, drain A (or fold for INTERSECT). }
+  if op = TK_INTERSECT then
+  begin
+    addrEofB := addrEofA;
+    if p^.nSelectRow > pPrior^.nSelectRow then
+      p^.nSelectRow := pPrior^.nSelectRow;
+  end
+  else
+  begin
+    addrEofB := sqlite3VdbeAddOp2(v, OP_Gosub, regOutA, addrOutA);
+    sqlite3VdbeAddOp2(v, OP_Yield, regAddrA, labelEnd);
+    sqlite3VdbeGoto(v, addrEofB);
+  end;
+
+  { A<B case. }
+  addrAltB := sqlite3VdbeAddOp2(v, OP_Gosub, regOutA, addrOutA);
+  sqlite3VdbeAddOp2(v, OP_Yield, regAddrA, addrEofA);
+  sqlite3VdbeGoto(v, labelCmpr);
+
+  { A==B case. }
+  if op = TK_ALL then
+    addrAeqB := addrAltB
+  else if op = TK_INTERSECT then
+  begin
+    addrAeqB := addrAltB;
+    Inc(addrAltB);
+  end
+  else
+    addrAeqB := addrAltB + 1;
+
+  { A>B case. }
+  addrAgtB := sqlite3VdbeCurrentAddr(v);
+  if (op = TK_ALL) or (op = TK_UNION) then
+  begin
+    sqlite3VdbeAddOp2(v, OP_Gosub, regOutB, addrOutB);
+    sqlite3VdbeAddOp2(v, OP_Yield, regAddrB, addrEofB);
+    sqlite3VdbeGoto(v, labelCmpr);
+  end
+  else
+  begin
+    Inc(addrAgtB);  { Just do next-B; reuse next-B emission below. }
+  end;
+
+  { This code runs once to initialize everything. }
+  sqlite3VdbeJumpHere(v, addr1);
+  sqlite3VdbeAddOp2(v, OP_Yield, regAddrA, addrEofA_noB);
+  { v---  Also the A>B case for EXCEPT and INTERSECT }
+  sqlite3VdbeAddOp2(v, OP_Yield, regAddrB, addrEofB);
+
+  { Main merge loop. }
+  if aPermute <> nil then
+  begin
+    sqlite3VdbeAddOp4(v, OP_Permutation, 0, 0, 0, PAnsiChar(aPermute),
+      P4_INTARRAY);
+  end;
+  sqlite3VdbeResolveLabel(v, labelCmpr);
+  sqlite3VdbeAddOp4(v, OP_Compare, destA.iSdst, destB.iSdst, nOrderBy,
+    PAnsiChar(pKeyMerge), P4_KEYINFO);
+  if aPermute <> nil then
+    sqlite3VdbeChangeP5(v, OPFLAG_PERMUTE);
+  sqlite3VdbeAddOp3(v, OP_Jump, addrAltB, addrAeqB, addrAgtB);
+
+  { Terminate the query. }
+  sqlite3VdbeResolveLabel(v, labelEnd);
+
+  { Arrange to free the 2nd and subsequent arms of the compound after parse. }
+  if pSplit^.pPrior <> nil then
+    sqlite3ParserAddCleanup(pParse, @sqlite3SelectDeleteGeneric, pSplit^.pPrior);
+  pSplit^.pPrior := pPrior;
+  pPrior^.pNext  := pSplit;
+  sqlite3ExprListDelete(db, pPrior^.pOrderBy);
+  pPrior^.pOrderBy := nil;
+
+  if pParse^.nErr <> 0 then Result := 1 else Result := 0;
+end;
+
 { sqlite3SelectOpName — return string name of compound operator }
 function sqlite3SelectOpName(id: i32): PAnsiChar;
 begin
@@ -20848,6 +21201,18 @@ begin
       Result := rcSel;
       Exit;
     end;
+    { ORDER BY merge-sort dispatch — multiSelectByMerge (select.c:3389..3722).
+      Closes 6.10 step 9(e) for UNION / INTERSECT / EXCEPT and the dedup arm
+      of `SELECT 1 UNION SELECT 2`.  Non-recursive only; recursive CTEs go
+      through generateWithRecursiveQuery (6.10 step 9(f), still bailing). }
+    if (p^.pOrderBy <> nil)
+       and ((p^.selFlags and SF_Recursive) = 0)
+       and ((p^.op = TK_ALL) or (p^.op = TK_UNION)
+            or (p^.op = TK_EXCEPT) or (p^.op = TK_INTERSECT)) then
+    begin
+      Result := multiSelectByMerge(pParse, p, pDest);
+      Exit;
+    end;
     Result := SQLITE_OK; Exit;
   end;
   { No-FROM fast path — `SELECT <expr-list>;` with no source table.
@@ -20859,7 +21224,7 @@ begin
           or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table))
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
-     and (p^.pOrderBy = nil) and (p^.pLimit = nil) and (p^.pWin = nil)
+     and (p^.pLimit = nil) and (p^.pWin = nil)
      and ((p^.selFlags and (SF_Distinct or SF_Aggregate or SF_Compound)) = 0)
   then
   begin
