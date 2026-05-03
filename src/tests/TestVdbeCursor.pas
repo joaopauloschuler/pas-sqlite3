@@ -612,6 +612,95 @@ begin
   sqlite3BtreeClose(pBt);
 end;
 
+{ ===== T9: OP_OpenEphemeral rowid-table round-trip ========================= }
+
+{ Smoke for the rowid arm of OP_OpenEphemeral (passqlite3vdbe.pas:9150).
+  Hand-roll bytecode that opens a transient rowid table on a fresh ephemeral
+  btree (P4=nil → INTKEY path), inserts 3 rows via NewRowid+MakeRecord+Insert,
+  then scans with Rewind/ResultRow/Next.  Pre-fix this hit SQLITE_CORRUPT
+  raised in moveToRoot via OP_NewRowid → sqlite3BtreeLast because the rowid
+  path opened a cursor on SCHEMA_ROOT+1 before any page was written there.
+  Post-fix the eph rowid root is allocated explicitly via
+  sqlite3BtreeCreateTable(BTREE_INTKEY).
+  This is the gate the spike note in tasklist.md flagged for 6.13(b). }
+
+procedure TestOpenEphemeralRowid;
+var
+  md:    TMinDb;
+  v:     PVdbe;
+  rc:    i32;
+  nRows: i32;
+begin
+  WriteLn('T9: OP_OpenEphemeral rowid-table round-trip (fix for 6.13(b) spike)');
+
+  InitMinDb(md, nil);
+  md.db.pVfs       := sqlite3_vfs_find(nil);
+  md.db.aLimit[0]  := SQLITE_MAX_LENGTH;
+  md.db.aLimit[2]  := 2000;     { SQLITE_LIMIT_COLUMN }
+  md.db.aLimit[6]  := 127;      { SQLITE_LIMIT_FUNCTION_ARG }
+  md.db.aLimit[9]  := 32766;    { SQLITE_LIMIT_VARIABLE_NUMBER }
+
+  { Program (cursor 0 = ephemeral rowid table; r[1]=value, r[2]=rowid, r[3]=record):
+      0: OP_Init        0, 1, 0
+      1: OP_OpenEphemeral 0, 1, 0   { 1 column, P4 nil → rowid path }
+      2: OP_Integer     10, 1       { r[1] = 10 }
+      3: OP_NewRowid    0, 2        { r[2] = next rowid }
+      4: OP_MakeRecord  1, 1, 3     { r[3] = record(r[1]) }
+      5: OP_Insert      0, 3, 2     { ins (rowid=r[2], data=r[3]) }
+      6: OP_Integer     20, 1
+      7: OP_NewRowid    0, 2
+      8: OP_MakeRecord  1, 1, 3
+      9: OP_Insert      0, 3, 2
+     10: OP_Integer     30, 1
+     11: OP_NewRowid    0, 2
+     12: OP_MakeRecord  1, 1, 3
+     13: OP_Insert      0, 3, 2
+     14: OP_Rewind      0, 18       { jump past loop on empty }
+     15: OP_Column      0, 0, 4     { r[4] = col 0 }
+     16: OP_ResultRow   4, 1
+     17: OP_Next        0, 15
+     18: OP_Halt        0, 0, 0
+  }
+  v := CreateMinVdbe(@md.db, 8 {nMem}, 1 {nCsr});
+  if v = nil then begin Check('T9 create vdbe', False); Exit; end;
+
+  sqlite3VdbeAddOp2(v, OP_Init, 0, 1);
+  sqlite3VdbeAddOp2(v, OP_OpenEphemeral, 0, 1);
+
+  sqlite3VdbeAddOp2(v, OP_Integer, 10, 1);
+  sqlite3VdbeAddOp2(v, OP_NewRowid, 0, 2);
+  sqlite3VdbeAddOp3(v, OP_MakeRecord, 1, 1, 3);
+  sqlite3VdbeAddOp3(v, OP_Insert, 0, 3, 2);
+
+  sqlite3VdbeAddOp2(v, OP_Integer, 20, 1);
+  sqlite3VdbeAddOp2(v, OP_NewRowid, 0, 2);
+  sqlite3VdbeAddOp3(v, OP_MakeRecord, 1, 1, 3);
+  sqlite3VdbeAddOp3(v, OP_Insert, 0, 3, 2);
+
+  sqlite3VdbeAddOp2(v, OP_Integer, 30, 1);
+  sqlite3VdbeAddOp2(v, OP_NewRowid, 0, 2);
+  sqlite3VdbeAddOp3(v, OP_MakeRecord, 1, 1, 3);
+  sqlite3VdbeAddOp3(v, OP_Insert, 0, 3, 2);
+
+  sqlite3VdbeAddOp2(v, OP_Rewind, 0, 18);
+  sqlite3VdbeAddOp3(v, OP_Column, 0, 0, 4);
+  sqlite3VdbeAddOp2(v, OP_ResultRow, 4, 1);
+  sqlite3VdbeAddOp2(v, OP_Next, 0, 15);
+  sqlite3VdbeAddOp2(v, OP_Halt, 0, 0);
+  v^.eVdbeState := VDBE_RUN_STATE;
+
+  nRows := 0;
+  repeat
+    rc := sqlite3VdbeExec(v);
+    if rc = SQLITE_ROW then Inc(nRows);
+  until rc <> SQLITE_ROW;
+
+  Check('T9 rc=SQLITE_DONE (no SQLITE_CORRUPT regression)', rc = SQLITE_DONE);
+  Check('T9 3 rows scanned from ephemeral rowid table', nRows = 3);
+
+  sqlite3VdbeDelete(v);
+end;
+
 { ===== main ================================================================= }
 
 begin
@@ -636,6 +725,8 @@ begin
   TestSeekRowid;
   WriteLn;
   TestResultRowScan;
+  WriteLn;
+  TestOpenEphemeralRowid;
   WriteLn;
 
   WriteLn(Format('Results: %d passed, %d failed', [gPass, gFail]));

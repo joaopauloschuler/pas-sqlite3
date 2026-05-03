@@ -472,12 +472,20 @@ function  sqlite3BtreeIntegerKey(pCur: PBtCursor): i64;
 function  sqlite3BtreePayloadSize(pCur: PBtCursor): u32;
 function  sqlite3BtreeOffset(pCur: PBtCursor): i64;
 function  sqlite3BtreeIsReadonly(p: PBtree): i32;
+function  sqlite3BtreeGetFilename(p: PBtree): PAnsiChar;
+function  sqlite3BtreeCheckpoint(p: PBtree; eMode: i32;
+                                 pnLog, pnCkpt: PcInt): i32;
 
 { ===========================================================================
   Phase 4.2 — payload access
   =========================================================================== }
 function  sqlite3BtreePayload(pCur: PBtCursor; offset: u32; amt: u32;
                                pBuf: Pointer): i32;
+function  sqlite3BtreePayloadChecked(pCur: PBtCursor; offset: u32; amt: u32;
+                                     pBuf: Pointer): i32;
+function  sqlite3BtreePutData(pCsr: PBtCursor; offset: u32; amt: u32;
+                              z: Pointer): i32;
+procedure sqlite3BtreeIncrblobCursor(pCur: PBtCursor);
 { sqlite3BtreePayloadFetch: return pointer to in-page data if available.
   Sets pAmt to the number of contiguous bytes at the returned address.
   Returns nil if no in-page data is available (caller must use BtreePayload). }
@@ -506,6 +514,18 @@ function  sqlite3BtreePrevious(pCur: PBtCursor; flags: i32): i32;
 function  sqlite3VdbeFindCompare(pIdxKey: PUnpackedRecord): TRecordCompare;
 function  sqlite3VdbeRecordCompare(nKey: i32; pKey: Pointer;
                                    pIdxKey: PUnpackedRecord): i32;
+
+{ ---------------------------------------------------------------------------
+  btreeMovetoIndexHook — vdbe.pas registers a callback here at unit init
+  that allocates an UnpackedRecord, unpacks pKey into it, calls
+  sqlite3BtreeIndexMoveto, then frees the record.  Pulled out of
+  btreeMoveto to avoid a uses-cycle (vdbe.pas already uses btree.pas).
+  --------------------------------------------------------------------------- }
+type
+  TBtreeMovetoIndexFn = function(pCur: PBtCursor; pKey: Pointer; nKey: i64;
+                                 pRes: Pi32): i32;
+var
+  btreeMovetoIndexHook: TBtreeMovetoIndexFn;
 
 { ===========================================================================
   Phase 4.3 — Insert path public API
@@ -582,6 +602,7 @@ function  sqlite3BtreeCommitPhaseOne(p: PBtree; zSuperJrnl: PChar): i32;
 function  sqlite3BtreeCommitPhaseTwo(p: PBtree; bCleanup: i32): i32;
 function  sqlite3BtreeCommit(p: PBtree): i32;
 function  sqlite3BtreeRollback(p: PBtree; tripCode: i32; writeOnly: i32): i32;
+function  sqlite3BtreeSavepoint(p: PBtree; op: i32; iSavepoint: i32): i32;
 
 { ===========================================================================
   Phase 4.4 — Delete path
@@ -632,6 +653,8 @@ const
 
 { btree.c:3236 — return the current page size of the database. }
 function  sqlite3BtreeGetPageSize(p: PBtree): i32;
+function  sqlite3BtreeSetSpillSize(p: PBtree; mxPage: i32): i32;
+procedure sqlite3BtreeSetCacheSize(p: PBtree; mxPage: i32);
 { btree.c:3185 — set page size + reserved-bytes; iFix locks pageSize. }
 function  sqlite3BtreeSetPageSize(p: PBtree; iPageSize: i32;
                                   nReserve: i32; iFix: i32): i32;
@@ -639,8 +662,57 @@ function  sqlite3BtreeSetPageSize(p: PBtree; iPageSize: i32;
 function  sqlite3BtreeTxnState(p: PBtree): i32;
 { btree.c:3257 — number of bytes of unused space at the end of every page. }
 function  sqlite3BtreeGetReserveNoMutex(p: PBtree): i32;
+{ btree.c:3136 — return the larger of the current reserve and the most
+  recently requested reserve.  Mutex-aware variant. }
+function  sqlite3BtreeGetRequestedReserve(p: PBtree): i32;
+{ btree.c:11544 — clear the in-memory pager cache when no transaction is
+  active and the database is not a temp-db. }
+procedure sqlite3BtreeClearCache(p: PBtree);
 { btree.c:7046 — set the database file format version (1 or 2 = WAL). }
 function  sqlite3BtreeSetVersion(p: PBtree; iVersion: i32): i32;
+
+{ btree.c:11365 — lazily allocate (or fetch) the per-BtShared schema blob.
+  Caller passes nBytes=SizeOf(TSchema) on first init and 0 thereafter.
+  xFree is invoked when the BtShared is torn down. }
+type TBtreeSchemaFree = procedure(p: Pointer);
+function  sqlite3BtreeSchema(p: PBtree; nBytes: i32;
+                              xFree: TBtreeSchemaFree): Pointer;
+
+{ btree.c:11339 — true if a sqlite3_backup is active on this Btree. }
+function  sqlite3BtreeIsInBackup(p: PBtree): i32;
+
+{ btree.c:11538 — bytes of per-page header overhead reserved by btree. }
+function  sqlite3HeaderSizeBtree: i32;
+
+{ btree.c:11555 / :11564 — shared-cache introspection helpers.  In the
+  no-shared-cache build the answers are constant: not sharable, refcount=1. }
+function  sqlite3BtreeSharable(p: PBtree): i32;
+function  sqlite3BtreeConnectionCount(p: PBtree): i32;
+
+{ btree.c:3177 — toggle BTS_SECURE_DELETE on the BtShared.  newFlag<0 leaves
+  the flag untouched and merely returns the current setting. }
+function  sqlite3BtreeSecureDelete(p: PBtree; newFlag: i32): i32;
+
+{ btree.c:3198 / :3222 — auto-vacuum get/set.  Honoured by PRAGMA auto_vacuum
+  on connection open; once BTS_PAGESIZE_FIXED is set Set returns READONLY. }
+function  sqlite3BtreeSetAutoVacuum(p: PBtree; autoVacuum: i32): i32;
+function  sqlite3BtreeGetAutoVacuum(p: PBtree): i32;
+
+{ btree.c:3017 — propagate the connection's mmap-size ceiling to the pager. }
+function  sqlite3BtreeSetMmapLimit(p: PBtree; szMmap: i64): i32;
+
+{ btree.c:3036 — propagate PRAGMA synchronous / cache-spill flags to the
+  pager.  Wraps sqlite3PagerSetFlags under the btree mutex. }
+function  sqlite3BtreeSetPagerFlags(p: PBtree; pgFlags: u32): i32;
+
+{ btree.c:11382 — read-lock the schema table; used by sqlite3LockAndPrepare
+  to surface SQLITE_LOCKED before parsing.  Without shared-cache this always
+  succeeds, matching querySharedCacheTableLock's stub. }
+function  sqlite3BtreeSchemaLocked(p: PBtree): i32;
+
+{ btree.c:4583 — open an anonymous savepoint to back a statement
+  sub-transaction. }
+function  sqlite3BtreeBeginStmt(p: PBtree; iStatement: i32): i32;
 
 implementation
 
@@ -2268,6 +2340,28 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
+  sqlite3BtreeCheckpoint — btree.c:11320
+  Run a WAL checkpoint on the database that p is connected to.  No-op when
+  p is nil or no WAL is open.  SQLITE_LOCKED if a transaction is in flight.
+  --------------------------------------------------------------------------- }
+function sqlite3BtreeCheckpoint(p: PBtree; eMode: i32;
+                                pnLog, pnCkpt: PcInt): i32;
+var
+  pBt: PBtShared;
+begin
+  Result := SQLITE_OK;
+  if p = nil then Exit;
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  if pBt^.inTransaction <> TRANS_NONE then
+    Result := SQLITE_LOCKED
+  else
+    Result := sqlite3PagerCheckpoint(pBt^.pPager, p^.db, eMode,
+                                     nil, nil, pnLog, pnCkpt);
+  sqlite3BtreeLeave(p);
+end;
+
+{ ---------------------------------------------------------------------------
   copyPayload helper (internal, read-only path for Phase 4.2)
   btree.c lines 5106-5120
   --------------------------------------------------------------------------- }
@@ -2431,6 +2525,80 @@ function sqlite3BtreePayload(pCur: PBtCursor; offset: u32; amt: u32;
                               pBuf: Pointer): i32;
 begin
   Result := accessPayload(pCur, offset, amt, Pu8(pBuf), 0);
+end;
+
+{ ---------------------------------------------------------------------------
+  accessPayloadChecked — slow path of sqlite3BtreePayloadChecked.
+  btree.c lines 5346-5358.  Used by the incremental-blob read path when the
+  cursor may have been invalidated by an intervening write.
+  --------------------------------------------------------------------------- }
+function accessPayloadChecked(pCur: PBtCursor; offset: u32; amt: u32;
+                              pBuf: Pointer): i32;
+var
+  rc: i32;
+begin
+  if pCur^.eState = CURSOR_INVALID then begin
+    Result := SQLITE_ABORT;
+    Exit;
+  end;
+  rc := btreeRestoreCursorPosition(pCur);
+  if rc <> SQLITE_OK then
+    Result := rc
+  else
+    Result := accessPayload(pCur, offset, amt, Pu8(pBuf), 0);
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3BtreePayloadChecked
+  btree.c lines 5360-5367.  Like sqlite3BtreePayload but tolerates a cursor
+  whose state is not CURSOR_VALID (used only by sqlite3_blob_read).
+  --------------------------------------------------------------------------- }
+function sqlite3BtreePayloadChecked(pCur: PBtCursor; offset: u32; amt: u32;
+                                    pBuf: Pointer): i32;
+begin
+  if pCur^.eState = CURSOR_VALID then
+    Result := accessPayload(pCur, offset, amt, Pu8(pBuf), 0)
+  else
+    Result := accessPayloadChecked(pCur, offset, amt, pBuf);
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3BtreePutData — write into the data area of the row pCsr points at.
+  btree.c lines 11430-11473.  The cursor must be open for writing on an
+  INTKEY table.  The size of the data is not changed; writing past the end
+  returns SQLITE_CORRUPT.
+  --------------------------------------------------------------------------- }
+function sqlite3BtreePutData(pCsr: PBtCursor; offset: u32; amt: u32;
+                             z: Pointer): i32;
+var
+  rc: i32;
+begin
+  rc := restoreCursorPosition(pCsr);
+  if rc <> SQLITE_OK then begin
+    Result := rc;
+    Exit;
+  end;
+  if pCsr^.eState <> CURSOR_VALID then begin
+    Result := SQLITE_ABORT;
+    Exit;
+  end;
+  { saveAllCursors cannot fail on an INTKEY table; ignore its return value. }
+  saveAllCursors(pCsr^.pBt, pCsr^.pgnoRoot, pCsr);
+  if (pCsr^.curFlags and BTCF_WriteFlag) = 0 then begin
+    Result := SQLITE_READONLY;
+    Exit;
+  end;
+  Result := accessPayload(pCsr, offset, amt, Pu8(z), 1);
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3BtreeIncrblobCursor — mark this cursor as an incremental blob
+  cursor.  btree.c lines 11475-11481.
+  --------------------------------------------------------------------------- }
+procedure sqlite3BtreeIncrblobCursor(pCur: PBtCursor);
+begin
+  pCur^.curFlags := pCur^.curFlags or BTCF_Incrblob;
+  pCur^.pBtree^.hasIncrblobCur := 1;
 end;
 
 { ---------------------------------------------------------------------------
@@ -2961,6 +3129,9 @@ end;
 
 function sqlite3VdbeRecordCompare(nKey: i32; pKey: Pointer;
                                   pIdxKey: PUnpackedRecord): i32;
+const
+  BT_KEYINFO_ORDER_DESC    = 1;
+  BT_KEYINFO_ORDER_BIGNULL = 2;
 var
   pKey1:       Pointer;
   nKey1:       i32;
@@ -2974,6 +3145,9 @@ var
   vTmp32:      u32;
   rReal, rRhs: Double;
   nStr, nCmp:  i32;
+  pSortFlags:  Pu8;
+  sortFlag:    u8;
+  descBit, nullSide: i32;
 begin
   pKey1 := pKey;
   nKey1 := nKey;
@@ -3032,10 +3206,9 @@ begin
         rc := btreeIntFloatCompare(v1, rRhs);
       end;
     end else if (pRhs^.flags and BT_MEM_Str) <> 0 then begin
-      { RHS string — vdbeaux.c:4839.  Re-decode serial_type as varint
-        because string serial types are always >=12 (varint width >1
-        is possible). }
-      sqlite3GetVarint32(@aKey1[idx1], serial_type);
+      { RHS string — vdbeaux.c:4839.  serial_type already decoded above;
+        the C arm uses the value computed by getVarint32() at the top of
+        the loop and does not re-read it. }
       if serial_type < 12 then rc := -1
       else if (serial_type and 1) = 0 then rc := 1
       else begin
@@ -3060,8 +3233,7 @@ begin
         if rc = 0 then rc := nStr - pRhs^.n;
       end;
     end else if (pRhs^.flags and BT_MEM_Blob) <> 0 then begin
-      { RHS blob — vdbeaux.c:4872 }
-      sqlite3GetVarint32(@aKey1[idx1], serial_type);
+      { RHS blob — vdbeaux.c:4872.  serial_type already decoded above. }
       if (serial_type < 12) or ((serial_type and 1) <> 0) then rc := -1
       else begin
         nStr := i32((serial_type - 12) shr 1);
@@ -3091,6 +3263,25 @@ begin
       rc := 0;
 
     if rc <> 0 then begin
+      { aSortFlags inversion — vdbeaux.c sqlite3VdbeRecordCompareWithSkip.
+        pKeyInfo is opaque (Pointer) here; aSortFlags lives at offset 24
+        in TKeyInfo (codegen.pas:1094). }
+      if pIdxKey^.pKeyInfo <> nil then begin
+        pSortFlags := Pu8(PPointer(PByte(pIdxKey^.pKeyInfo) + 24)^);
+        if pSortFlags <> nil then begin
+          sortFlag := pSortFlags[i];
+          if sortFlag <> 0 then begin
+            descBit  := i32(sortFlag) and BT_KEYINFO_ORDER_DESC;
+            nullSide := 0;
+            if (serial_type = 0)
+               or ((pRhs^.flags and BT_MEM_Null) <> 0) then
+              nullSide := 1;
+            if ((sortFlag and BT_KEYINFO_ORDER_BIGNULL) = 0)
+               or (descBit <> nullSide) then
+              rc := -rc;
+          end;
+        end;
+      end;
       Result := rc;
       Exit;
     end;
@@ -3363,8 +3554,13 @@ function btreeMoveto(pCur: PBtCursor; pKey: Pointer; nKey: i64;
                      bias: i32; pRes: Pi32): i32;
 begin
   if pKey <> nil then begin
-    { Index cursor: would need sqlite3VdbeAllocUnpackedRecord (Phase 6) }
-    Result := SQLITE_INTERNAL;
+    { Index cursor: delegate to vdbe.pas via hook (port of btree.c:858..889
+      index-cursor arm, which calls sqlite3VdbeAllocUnpackedRecord +
+      sqlite3VdbeRecordUnpack + sqlite3BtreeIndexMoveto). }
+    if btreeMovetoIndexHook <> nil then
+      Result := btreeMovetoIndexHook(pCur, pKey, nKey, pRes)
+    else
+      Result := SQLITE_INTERNAL;
   end else begin
     Result := sqlite3BtreeTableMoveto(pCur, nKey, bias, pRes);
   end;
@@ -5973,6 +6169,15 @@ begin
   Result := p^.pBt^.pPager;
 end;
 
+{ btree.c:11284 — sqlite3BtreeGetFilename.  Return the full pathname of
+  the underlying database file.  nullIfTemp=1 mirrors C: temp/in-memory
+  files report the empty string. }
+function sqlite3BtreeGetFilename(p: PBtree): PAnsiChar;
+begin
+  Assert(p^.pBt^.pPager <> nil);
+  Result := PAnsiChar(sqlite3PagerFilename(p^.pBt^.pPager, 1));
+end;
+
 { ===========================================================================
   Phase 4.4 — Transaction lifecycle
   =========================================================================== }
@@ -6097,8 +6302,16 @@ trans_begun:
   if rc = SQLITE_OK then begin
     if pSchemaVersion <> nil then
       pSchemaVersion^ := i32(get4byte(pBt^.pPage1^.aData + 40));
-    if wrflag <> 0 then
-      rc := sqlite3PagerOpenSavepoint(pPgr, 0);
+    if wrflag <> 0 then begin
+      { btree.c:3793 — make sure the pager has the correct number of open
+        savepoints.  Previously this call passed 0 unconditionally, so the
+        pager savepoint stack was never populated and ROLLBACK TO sN
+        could not unwind.  Closes 6.10 step 15(c). }
+      if (p^.db <> nil) and (PTsqlite3(p^.db)^.nSavepoint > 0) then
+        rc := sqlite3PagerOpenSavepoint(pPgr, PTsqlite3(p^.db)^.nSavepoint)
+      else
+        rc := sqlite3PagerOpenSavepoint(pPgr, 0);
+    end;
   end;
   sqlite3BtreeLeave(p);
   Result := rc;
@@ -6114,7 +6327,11 @@ begin
   else begin
     if pSchemaVersion <> nil then
       pSchemaVersion^ := i32(get4byte(p^.pBt^.pPage1^.aData + 40));
-    Result := SQLITE_OK;
+    if (wrflag <> 0) and (p^.db <> nil) then
+      Result := sqlite3PagerOpenSavepoint(p^.pBt^.pPager,
+                  PTsqlite3(p^.db)^.nSavepoint)
+    else
+      Result := SQLITE_OK;
   end;
 end;
 
@@ -6200,6 +6417,35 @@ begin
   end;
   btreeEndTransaction(p);
   sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c:4614 — sqlite3BtreeSavepoint.
+  Release / rollback to the named statement-savepoint of a write txn.
+  No-op for read-only / no-txn btrees. }
+function sqlite3BtreeSavepoint(p: PBtree; op: i32; iSavepoint: i32): i32;
+var
+  rc  : i32;
+  pBt : PBtShared;
+  pP1 : PMemPage;
+begin
+  rc := SQLITE_OK;
+  if (p <> nil) and (p^.inTrans = TRANS_WRITE) then begin
+    pBt := p^.pBt;
+    sqlite3BtreeEnter(p);
+    if op = SAVEPOINT_ROLLBACK then
+      rc := saveAllCursors(pBt, 0, nil);
+    if rc = SQLITE_OK then
+      rc := sqlite3PagerSavepoint(pBt^.pPager, op, iSavepoint);
+    if rc = SQLITE_OK then begin
+      if (iSavepoint < 0) and ((pBt^.btsFlags and BTS_INITIALLY_EMPTY) <> 0) then
+        pBt^.nPage := 0;
+      rc := newDatabase(pBt);
+      pP1 := pBt^.pPage1;
+      if pP1 <> nil then btreeSetNPage(pBt, pP1);
+    end;
+    sqlite3BtreeLeave(p);
+  end;
   Result := rc;
 end;
 
@@ -6825,6 +7071,26 @@ begin
   Result := i32(p^.pBt^.pageSize);
 end;
 
+{ btree.c:3002 — sqlite3BtreeSetSpillSize. }
+function sqlite3BtreeSetSpillSize(p: PBtree; mxPage: i32): i32;
+var pBt: PBtShared;
+begin
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  Result := sqlite3PagerSetSpillsize(pBt^.pPager, mxPage);
+  sqlite3BtreeLeave(p);
+end;
+
+{ btree.c:2986 — sqlite3BtreeSetCacheSize. }
+procedure sqlite3BtreeSetCacheSize(p: PBtree; mxPage: i32);
+var pBt: PBtShared;
+begin
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  sqlite3PagerSetCachesize(pBt^.pPager, mxPage);
+  sqlite3BtreeLeave(p);
+end;
+
 { btree.c:3185 — simplified: only honours the call when iFix is non-zero
   or BTS_PAGESIZE_FIXED is not yet set.  nReserve<0 means "leave unchanged". }
 function sqlite3BtreeSetPageSize(p: PBtree; iPageSize: i32;
@@ -6872,6 +7138,26 @@ begin
   Result := i32(p^.pBt^.pageSize - p^.pBt^.usableSize);
 end;
 
+{ btree.c:3136 }
+function sqlite3BtreeGetRequestedReserve(p: PBtree): i32;
+var n1, n2: i32;
+begin
+  sqlite3BtreeEnter(p);
+  n1 := i32(p^.pBt^.nReserveWanted);
+  n2 := sqlite3BtreeGetReserveNoMutex(p);
+  sqlite3BtreeLeave(p);
+  if n1 > n2 then Result := n1 else Result := n2;
+end;
+
+{ btree.c:11544 }
+procedure sqlite3BtreeClearCache(p: PBtree);
+var pBt: PBtShared;
+begin
+  pBt := p^.pBt;
+  if pBt^.inTransaction = TRANS_NONE then
+    sqlite3PagerClearCache(pBt^.pPager);
+end;
+
 { btree.c:7046 — set page-1 byte 18 (file-format-write) and byte 19
   (file-format-read).  Both are clamped to MIN(2,iVersion).  Implemented as
   a direct page-1 write so it works without an open transaction layer. }
@@ -6892,6 +7178,137 @@ begin
     zData[19] := u8(iVersion);
   end;
   sqlite3PagerUnref(pPage1);
+  Result := rc;
+end;
+
+{ btree.c:11365 }
+function sqlite3BtreeSchema(p: PBtree; nBytes: i32;
+                            xFree: TBtreeSchemaFree): Pointer;
+var pBt: PBtShared;
+begin
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  if (pBt^.pSchema = nil) and (nBytes <> 0) then begin
+    pBt^.pSchema := sqlite3MallocZero(csize_t(nBytes));
+    pBt^.xFreeSchema := xFree;
+  end;
+  sqlite3BtreeLeave(p);
+  Result := pBt^.pSchema;
+end;
+
+{ btree.c:11339 }
+function sqlite3BtreeIsInBackup(p: PBtree): i32;
+begin
+  if p^.nBackup <> 0 then Result := 1 else Result := 0;
+end;
+
+{ btree.c:11538 }
+function sqlite3HeaderSizeBtree: i32;
+begin
+  Result := i32(ROUND8(SizeOf(TMemPage)));
+end;
+
+{ btree.c:11555 — no shared-cache build → never sharable. }
+function sqlite3BtreeSharable(p: PBtree): i32;
+begin
+  Result := i32(p^.sharable);
+end;
+
+{ btree.c:11564 — no shared-cache build → refcount is always 1. }
+function sqlite3BtreeConnectionCount(p: PBtree): i32;
+begin
+  Result := p^.pBt^.nRef;
+end;
+
+{ btree.c:3177 }
+function sqlite3BtreeSecureDelete(p: PBtree; newFlag: i32): i32;
+var pBt: PBtShared;
+begin
+  if p = nil then begin Result := 0; Exit; end;
+  sqlite3BtreeEnter(p);
+  pBt := p^.pBt;
+  if newFlag >= 0 then begin
+    pBt^.btsFlags := pBt^.btsFlags and (not u16(BTS_FAST_SECURE));
+    pBt^.btsFlags := pBt^.btsFlags or u16(BTS_SECURE_DELETE * newFlag);
+  end;
+  Result := i32((pBt^.btsFlags and BTS_FAST_SECURE) div BTS_SECURE_DELETE);
+  sqlite3BtreeLeave(p);
+end;
+
+{ btree.c:3198 }
+function sqlite3BtreeSetAutoVacuum(p: PBtree; autoVacuum: i32): i32;
+var
+  pBt: PBtShared;
+  rc:  i32;
+  av:  u8;
+begin
+  pBt := p^.pBt;
+  rc  := SQLITE_OK;
+  av  := u8(autoVacuum);
+  sqlite3BtreeEnter(p);
+  if ((pBt^.btsFlags and BTS_PAGESIZE_FIXED) <> 0)
+     and (Ord(av <> 0) <> i32(pBt^.autoVacuum)) then
+  begin
+    rc := SQLITE_READONLY;
+  end
+  else begin
+    if av <> 0 then pBt^.autoVacuum := 1 else pBt^.autoVacuum := 0;
+    if av  = 2 then pBt^.incrVacuum := 1 else pBt^.incrVacuum := 0;
+  end;
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c:3222 }
+function sqlite3BtreeGetAutoVacuum(p: PBtree): i32;
+var rc: i32;
+begin
+  sqlite3BtreeEnter(p);
+  if p^.pBt^.autoVacuum = 0 then
+    rc := BTREE_AUTOVACUUM_NONE
+  else if p^.pBt^.incrVacuum = 0 then
+    rc := BTREE_AUTOVACUUM_FULL
+  else
+    rc := BTREE_AUTOVACUUM_INCR;
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c:3017 }
+function sqlite3BtreeSetMmapLimit(p: PBtree; szMmap: i64): i32;
+begin
+  sqlite3BtreeEnter(p);
+  sqlite3PagerSetMmapLimit(p^.pBt^.pPager, szMmap);
+  sqlite3BtreeLeave(p);
+  Result := SQLITE_OK;
+end;
+
+{ btree.c:3036 }
+function sqlite3BtreeSetPagerFlags(p: PBtree; pgFlags: u32): i32;
+begin
+  sqlite3BtreeEnter(p);
+  sqlite3PagerSetFlags(p^.pBt^.pPager, pgFlags);
+  sqlite3BtreeLeave(p);
+  Result := SQLITE_OK;
+end;
+
+{ btree.c:11382 — schema-lock probe.  No-shared-cache build:
+  querySharedCacheTableLock is a stub that always returns SQLITE_OK, so the
+  result is unconditionally SQLITE_OK after enter/leave bookkeeping. }
+function sqlite3BtreeSchemaLocked(p: PBtree): i32;
+begin
+  sqlite3BtreeEnter(p);
+  Result := SQLITE_OK;
+  sqlite3BtreeLeave(p);
+end;
+
+{ btree.c:4583 }
+function sqlite3BtreeBeginStmt(p: PBtree; iStatement: i32): i32;
+var rc: i32;
+begin
+  sqlite3BtreeEnter(p);
+  rc := sqlite3PagerOpenSavepoint(p^.pBt^.pPager, iStatement);
+  sqlite3BtreeLeave(p);
   Result := rc;
 end;
 

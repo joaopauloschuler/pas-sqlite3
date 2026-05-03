@@ -87,6 +87,7 @@ interface
 
 uses
   passqlite3types,
+  passqlite3os,
   passqlite3util;
 
 { Heap (libc) variants — Pascal-side variadic; the cdecl one-arg stubs in
@@ -125,6 +126,40 @@ function sqlite3FormatStr(fmt: PAnsiChar;
   "1.2345678901234567e-308" representation. }
 function sqlite3RenderNumF(r: Double; iRound: i32;
   isAltform2: Boolean; zBuf: PAnsiChar; sz: i32): i32;
+
+{ ============================================================
+  Phase 8.5.1 — Dynamic string builder API (printf.c:1141..1341).
+  Mirrors the C `sqlite3_str` (StrAccum) public surface.  Backed by
+  raw libc malloc/realloc/free (printf.c uses sqlite3DbMalloc when a
+  db is supplied; here we always malloc, matching the
+  sqlite3_str_new(NULL) shape — db is retained only for the
+  aLimit[LIMIT_LENGTH] cap.)
+  ============================================================ }
+type
+  PSqlite3Str = ^TSqlite3Str;
+  TSqlite3Str = record
+    db:          Psqlite3db;     { connection (for length cap; may be nil) }
+    zText:       PAnsiChar;      { current buffer (libc-allocated) }
+    nAlloc:      u32;            { allocated capacity in bytes }
+    mxAlloc:     u32;            { max allowed capacity (0 = no growth) }
+    nChar:       u32;            { current text length }
+    accError:    u8;             { 0 / SQLITE_NOMEM / SQLITE_TOOBIG }
+    printfFlags: u8;             { SQLITE_PRINTF_* — unused here }
+  end;
+
+function  sqlite3_str_new(db: Psqlite3db): PSqlite3Str;
+function  sqlite3_str_finish(p: PSqlite3Str): PAnsiChar;
+procedure sqlite3_str_free(p: PSqlite3Str);
+procedure sqlite3_str_reset(p: PSqlite3Str);
+procedure sqlite3_str_truncate(p: PSqlite3Str; N: i32);
+function  sqlite3_str_value(p: PSqlite3Str): PAnsiChar;
+function  sqlite3_str_length(p: PSqlite3Str): i32;
+function  sqlite3_str_errcode(p: PSqlite3Str): i32;
+procedure sqlite3_str_append(p: PSqlite3Str; z: PAnsiChar; N: i32);
+procedure sqlite3_str_appendall(p: PSqlite3Str; z: PAnsiChar);
+procedure sqlite3_str_appendchar(p: PSqlite3Str; N: i32; c: AnsiChar);
+procedure sqlite3_str_appendf(p: PSqlite3Str; zFormat: PAnsiChar;
+  const args: array of const);
 
 implementation
 
@@ -1465,6 +1500,193 @@ end;
 function formatNoArgsImpl(zFormat: PAnsiChar): AnsiString;
 begin
   Result := sqlite3FormatStr(zFormat, []);
+end;
+
+{ ============================================================
+  Phase 8.5.1 — sqlite3_str_* implementation (printf.c:1141..1341).
+  ============================================================ }
+
+const
+  SQLITE_PRINTF_MALLOCED = $04;
+  SQLITE_MAX_LENGTH_DEF  = 1000000000;   { matches SQLITE_MAX_LENGTH }
+
+{ Singleton returned by sqlite3_str_new on OOM.  Refuses every append. }
+var
+  gOomStr: TSqlite3Str = (
+    db: nil; zText: nil; nAlloc: 0; mxAlloc: 0;
+    nChar: 0; accError: 7 { SQLITE_NOMEM }; printfFlags: 0
+  );
+
+function isMallocedStr(p: PSqlite3Str): Boolean; inline;
+begin
+  Result := (p^.printfFlags and SQLITE_PRINTF_MALLOCED) <> 0;
+end;
+
+procedure setStrError(p: PSqlite3Str; err: u8);
+begin
+  p^.accError := err;
+  if err = SQLITE_TOOBIG then
+    p^.nAlloc := 0
+  else if err = SQLITE_NOMEM then begin
+    p^.mxAlloc := 0; p^.nAlloc := 0;
+  end;
+end;
+
+{ Grow the buffer so it can accept N more bytes.  Returns the number of
+  bytes actually available (== N on success, less on truncation, 0 on
+  error).  Mirrors sqlite3StrAccumEnlarge (printf.c). }
+function strAccumEnlarge(p: PSqlite3Str; N: i32): i32;
+var
+  szNew: u64;
+  zNew:  PAnsiChar;
+begin
+  if p^.accError <> 0 then begin Result := 0; Exit; end;
+  if p^.mxAlloc = 0 then begin
+    setStrError(p, SQLITE_TOOBIG);
+    if p^.nAlloc > p^.nChar then
+      Result := i32(p^.nAlloc - p^.nChar - 1)
+    else
+      Result := 0;
+    if Result < 0 then Result := 0;
+    Exit;
+  end;
+  szNew := u64(p^.nChar) + u64(N) + 1;
+  if szNew + u64(p^.nChar) <= u64(p^.mxAlloc) then
+    szNew := szNew + u64(p^.nChar);
+  if szNew > u64(p^.mxAlloc) then szNew := u64(p^.mxAlloc);
+  if szNew <= u64(p^.nChar) then begin
+    setStrError(p, SQLITE_TOOBIG);
+    Result := 0; Exit;
+  end;
+  if isMallocedStr(p) then
+    zNew := PAnsiChar(sqlite3_realloc64(p^.zText, szNew))
+  else begin
+    zNew := PAnsiChar(sqlite3_malloc64(szNew));
+    if (zNew <> nil) and (p^.nChar > 0) and (p^.zText <> nil) then
+      Move(p^.zText^, zNew^, p^.nChar);
+  end;
+  if zNew = nil then begin
+    setStrError(p, SQLITE_NOMEM);
+    Result := 0; Exit;
+  end;
+  p^.zText  := zNew;
+  p^.nAlloc := u32(szNew);
+  p^.printfFlags := p^.printfFlags or SQLITE_PRINTF_MALLOCED;
+  Result := N;
+  if u64(p^.nChar) + u64(N) + 1 > szNew then
+    Result := i32(szNew - p^.nChar - 1);
+end;
+
+procedure sqlite3_str_appendchar(p: PSqlite3Str; N: i32; c: AnsiChar);
+var k: i32;
+begin
+  if (p = nil) or (N <= 0) then Exit;
+  if u64(p^.nChar) + u64(N) >= u64(p^.nAlloc) then begin
+    N := strAccumEnlarge(p, N);
+    if N <= 0 then Exit;
+  end;
+  for k := 0 to N - 1 do
+    p^.zText[p^.nChar + u32(k)] := c;
+  p^.nChar := p^.nChar + u32(N);
+end;
+
+procedure sqlite3_str_append(p: PSqlite3Str; z: PAnsiChar; N: i32);
+begin
+  if (p = nil) or (N <= 0) or (z = nil) then Exit;
+  if u64(p^.nChar) + u64(N) >= u64(p^.nAlloc) then begin
+    N := strAccumEnlarge(p, N);
+    if N <= 0 then Exit;
+  end;
+  Move(z^, p^.zText[p^.nChar], N);
+  p^.nChar := p^.nChar + u32(N);
+end;
+
+procedure sqlite3_str_appendall(p: PSqlite3Str; z: PAnsiChar);
+var n: PtrInt;
+begin
+  if (p = nil) or (z = nil) then Exit;
+  n := 0;
+  while z[n] <> #0 do Inc(n);
+  sqlite3_str_append(p, z, i32(n));
+end;
+
+procedure sqlite3_str_appendf(p: PSqlite3Str; zFormat: PAnsiChar;
+  const args: array of const);
+var s: AnsiString;
+begin
+  if (p = nil) or (zFormat = nil) then Exit;
+  s := sqlite3FormatStr(zFormat, args);
+  if Length(s) > 0 then
+    sqlite3_str_append(p, PAnsiChar(s), i32(Length(s)));
+end;
+
+function sqlite3_str_finish(p: PSqlite3Str): PAnsiChar;
+begin
+  Result := nil;
+  if (p = nil) or (p = @gOomStr) then Exit;
+  if p^.zText <> nil then begin
+    p^.zText[p^.nChar] := #0;
+    Result := p^.zText;
+  end;
+  sqlite3_free(p);
+end;
+
+function sqlite3_str_errcode(p: PSqlite3Str): i32;
+begin
+  if p = nil then Result := SQLITE_NOMEM
+  else Result := p^.accError;
+end;
+
+function sqlite3_str_length(p: PSqlite3Str): i32;
+begin
+  if p = nil then Result := 0
+  else Result := i32(p^.nChar);
+end;
+
+procedure sqlite3_str_truncate(p: PSqlite3Str; N: i32);
+begin
+  if (p = nil) or (N < 0) or (u32(N) >= p^.nChar) then Exit;
+  p^.nChar := u32(N);
+  if p^.zText <> nil then p^.zText[p^.nChar] := #0;
+end;
+
+function sqlite3_str_value(p: PSqlite3Str): PAnsiChar;
+begin
+  if (p = nil) or (p^.nChar = 0) or (p^.zText = nil) then begin
+    Result := nil; Exit;
+  end;
+  p^.zText[p^.nChar] := #0;
+  Result := p^.zText;
+end;
+
+procedure sqlite3_str_reset(p: PSqlite3Str);
+begin
+  if p = nil then Exit;
+  if isMallocedStr(p) then begin
+    sqlite3_free(p^.zText);
+    p^.printfFlags := p^.printfFlags and (not SQLITE_PRINTF_MALLOCED);
+  end;
+  p^.nAlloc := 0;
+  p^.nChar  := 0;
+  p^.zText  := nil;
+end;
+
+procedure sqlite3_str_free(p: PSqlite3Str);
+begin
+  if p = nil then Exit;
+  sqlite3_str_reset(p);
+  sqlite3_free(p);
+end;
+
+function sqlite3_str_new(db: Psqlite3db): PSqlite3Str;
+var p: PSqlite3Str;
+begin
+  p := PSqlite3Str(sqlite3_malloc64(SizeOf(TSqlite3Str)));
+  if p = nil then begin Result := @gOomStr; Exit; end;
+  FillChar(p^, SizeOf(p^), 0);
+  p^.db      := db;
+  p^.mxAlloc := SQLITE_MAX_LENGTH_DEF;
+  Result     := p;
 end;
 
 initialization

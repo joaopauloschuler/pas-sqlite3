@@ -209,6 +209,58 @@ begin
   ExpectEq(rc, SQLITE_OK, 'C6 xClose ok');
 end;
 
+{ Smoke: drive sqlite3_carray_bind / _v2 against a real prepared stmt.
+  We bind to a SELECT ?1 statement (slot 1 exists) and verify the bind
+  returns SQLITE_OK + the destructor fires on finalize.  Element data
+  is owned by the test; we use SQLITE_STATIC so no copy is made. }
+var
+  gDestroyHits: i32;
+
+procedure CntDestroy(p: Pointer); cdecl;
+begin
+  Inc(gDestroyHits);
+end;
+
+procedure TestCarrayBind(db: PTsqlite3);
+var
+  pStmt: PVdbe;
+  rc:    i32;
+  data:  array[0..3] of i32;
+  ownedBuf: PInt32;
+begin
+  data[0] := 11; data[1] := 22; data[2] := 33; data[3] := 44;
+
+  { D1 — bad mFlags (out of range) → SQLITE_ERROR. }
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(db, 'SELECT ?1', -1, @pStmt, nil);
+  ExpectEq(rc, SQLITE_OK, 'D1a prepare SELECT ?1');
+  rc := sqlite3_carray_bind(pStmt, 1, @data[0], 4, 99, nil);
+  ExpectEq(rc, SQLITE_ERROR, 'D1b bind bad mFlags');
+
+  { D2 — happy path with SQLITE_STATIC: bind succeeds, no destructor fires. }
+  rc := sqlite3_carray_bind(pStmt, 1, @data[0], 4, CARRAY_INT32, SQLITE_STATIC);
+  ExpectEq(rc, SQLITE_OK, 'D2 bind static');
+  rc := sqlite3_finalize(pStmt);
+  ExpectEq(rc, SQLITE_OK, 'D2b finalize');
+
+  { D3 — _v2 with caller-supplied destructor: destructor must fire on finalize.
+    We allocate a malloc'd buffer; the destructor frees it and increments
+    gDestroyHits.  pDestroy = the buffer itself (single-arg form). }
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(db, 'SELECT ?1', -1, @pStmt, nil);
+  ExpectEq(rc, SQLITE_OK, 'D3a prepare');
+  ownedBuf := PInt32(sqlite3_malloc64(4 * SizeOf(i32)));
+  ownedBuf[0] := 100; ownedBuf[1] := 200; ownedBuf[2] := 300; ownedBuf[3] := 400;
+  gDestroyHits := 0;
+  rc := sqlite3_carray_bind_v2(pStmt, 1, ownedBuf, 4, CARRAY_INT32,
+                               @CntDestroy, ownedBuf);
+  ExpectEq(rc, SQLITE_OK, 'D3b bind v2 with destructor');
+  rc := sqlite3_finalize(pStmt);
+  ExpectEq(rc, SQLITE_OK, 'D3c finalize');
+  ExpectEq(gDestroyHits, 1, 'D3d destructor fired exactly once');
+  sqlite3_free(ownedBuf);
+end;
+
 var
   db:      PTsqlite3;
   rc:      i32;
@@ -272,6 +324,9 @@ begin
   ExpectEq(CARRAY_COLUMN_POINTER, 1, 'K9  COLUMN_POINTER');
   ExpectEq(CARRAY_COLUMN_COUNT,   2, 'K10 COLUMN_COUNT');
   ExpectEq(CARRAY_COLUMN_CTYPE,   3, 'K11 COLUMN_CTYPE');
+
+  { ---- sqlite3_carray_bind smoke (carray.c:435..549). ---- }
+  TestCarrayBind(db);
 
   { Drop registry before close so we exit clean. }
   rc := sqlite3_drop_modules(db, nil);

@@ -120,6 +120,7 @@ compile_test TestVdbeAgg
 compile_test TestVdbeTxn
 compile_test TestVdbeMisc
 compile_test TestVdbeApi
+compile_test TestPublicApi
 compile_test TestVdbeBlob
 compile_test TestVdbeSort
 compile_test TestVdbeTrace
@@ -156,11 +157,29 @@ compile_test TestConfigHooks
 compile_test TestInitShutdown
 compile_test TestExecGetTable
 compile_test TestBackup
+compile_test TestSerialize
 compile_test TestUnlockNotify
 compile_test TestLoadExt
 compile_test TestRowidIn
 compile_test TestExplainParity
 compile_test TestWhereCorpus
+compile_test DiagPragma
+compile_test DiagFeatureProbe
+compile_test DiagPrintfFmt
+compile_test DiagExplainList
+compile_test DiagDbFileObject
+compile_test DiagDequoteToken
+compile_test DiagOrderLimitTopN
+compile_test DiagTrig          # Tasklist 6.23: AFTER INSERT trigger fire.
+                               # Compiles cleanly; running the binary
+                               # is expected to ABORT on the Pas side
+                               # with a double-free until the
+                               # sub-vdbe / parent-vdbe lifecycle
+                               # bisect lands.  Kept in the suite to
+                               # keep the bug visible.
+compile_test DiagMultiValues   # Tasklist 6.10 step 6: constant
+                               # multi-row VALUES — runtime PASS today
+                               # (count=3) since 6.8.6 follow-up.
 compile_test TestSQLCorpus
 compile_test TestFuzzDiff
 compile_test TestReferenceVectors

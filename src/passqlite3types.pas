@@ -311,6 +311,8 @@ const
   SQLITE_UTF16    = 4; { Use native byte order — SQLITE_UTF16NATIVE below }
   SQLITE_ANY      = 5; { Deprecated }
   SQLITE_UTF16_ALIGNED = 8; { sqlite3_create_collation only }
+  { Native byte order — Pas port targets little-endian (x86/x86_64). }
+  SQLITE_UTF16NATIVE = SQLITE_UTF16LE;
 
 // ---------------------------------------------------------------------------
 // sqlite3_create_function flags (sqlite3.h §4.8)

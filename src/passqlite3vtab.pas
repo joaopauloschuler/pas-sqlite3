@@ -381,6 +381,47 @@ function sqlite3_vtab_on_conflict(db: PTsqlite3): i32; cdecl;
   xCreate / xConnect callback (i.e. while db^.pVtabCtx is non-nil). }
 function sqlite3_vtab_config(db: PTsqlite3; op: i32; intArg: i32): i32; cdecl;
 
+{ where.c:4553 — sqlite3_vtab_collation.  Public API for vtab xBestIndex
+  callbacks to query the collation associated with a constraint.  The C
+  reference reads the trailing HiddenIndexInfo block following
+  sqlite3_index_info to recover the WHERE-clause Expr and dispatch to
+  sqlite3ExprCompareCollSeq.  HiddenIndexInfo is not yet defined on the
+  Pas side (see 8.9.1 task), so we degrade to step 3 of the C dispatch
+  ("Otherwise, return BINARY"): return "BINARY" for any in-range iCons.
+  This matches the canonical fallback whenever a column has no
+  alternative collation and no explicit COLLATE operator. }
+function sqlite3_vtab_collation(pIdxInfo: PSqlite3IndexInfo;
+  iCons: i32): PAnsiChar; cdecl;
+
+{ where.c:4628 — sqlite3_vtab_distinct.  Returns the eDistinct flag
+  (0..3) the planner has set on the trailing HiddenIndexInfo.  Without
+  HiddenIndexInfo on the Pas side, we always report 0 (no DISTINCT
+  optimisation hint) — the safe default that disables the optimisation
+  rather than misleading the vtab. }
+function sqlite3_vtab_distinct(pIdxInfo: PSqlite3IndexInfo): i32; cdecl;
+
+{ where.c:4573 — sqlite3_vtab_in.  Public API for vtab xBestIndex
+  callbacks: returns 1 (and toggles HiddenIndexInfo.mHandleIn) if
+  constraint iCons is an IN(...) constraint that the vtab is willing
+  to evaluate one RHS at a time, 0 otherwise.  HiddenIndexInfo is not
+  yet defined on the Pas side (see 8.9.1 task), so we always return 0
+  — the safe degraded answer ("not an IN constraint, do not handle as
+  iterator"), matching the path the C function takes when SMASKBIT32(
+  iCons) is not set in pHidden^.mIn. }
+function sqlite3_vtab_in(pIdxInfo: PSqlite3IndexInfo;
+  iCons: i32; bHandle: i32): i32; cdecl;
+
+{ where.c:4593 — sqlite3_vtab_rhs_value.  Public API callable from inside
+  xBestIndex.  C reads the trailing HiddenIndexInfo block (cached aRhs[]
+  + WhereClause + Parse) and lazily extracts the RHS sqlite3_value via
+  sqlite3ValueFromExpr.  HiddenIndexInfo is not yet defined on the Pas
+  side (see 8.9.1 task), so we degrade: validate iCons range and report
+  SQLITE_NOTFOUND with *ppVal=nil — the same answer C returns when the
+  RHS expression is non-constant or otherwise unobtainable.  Out-of-range
+  iCons returns SQLITE_MISUSE matching the C reference. }
+function sqlite3_vtab_rhs_value(pIdxInfo: PSqlite3IndexInfo;
+  iCons: i32; ppVal: passqlite3vdbe.PPMem): i32; cdecl;
+
 { ============================================================
   Phase 6.bis.1f — function overload + writable + eponymous tables
   (vtab.c:1153..1308)
@@ -1578,6 +1619,48 @@ begin
   if rc <> SQLITE_OK then sqlite3Error(db, rc);
   sqlite3_mutex_leave(db^.mutex);
   Result := rc;
+end;
+
+const
+  zBINARY: PAnsiChar = 'BINARY';
+
+function sqlite3_vtab_collation(pIdxInfo: PSqlite3IndexInfo;
+  iCons: i32): PAnsiChar; cdecl;
+begin
+  if (pIdxInfo = nil)
+     or (iCons < 0)
+     or (iCons >= pIdxInfo^.nConstraint) then
+  begin
+    Result := nil;
+    Exit;
+  end;
+  Result := zBINARY;
+end;
+
+function sqlite3_vtab_distinct(pIdxInfo: PSqlite3IndexInfo): i32; cdecl;
+begin
+  if pIdxInfo = nil then begin Result := 0; Exit; end;
+  Result := 0;
+end;
+
+function sqlite3_vtab_in(pIdxInfo: PSqlite3IndexInfo;
+  iCons: i32; bHandle: i32): i32; cdecl;
+begin
+  Result := 0;
+end;
+
+function sqlite3_vtab_rhs_value(pIdxInfo: PSqlite3IndexInfo;
+  iCons: i32; ppVal: passqlite3vdbe.PPMem): i32; cdecl;
+begin
+  if ppVal <> nil then ppVal^ := nil;
+  if (pIdxInfo = nil)
+     or (iCons < 0)
+     or (iCons >= pIdxInfo^.nConstraint) then
+  begin
+    Result := SQLITE_MISUSE;
+    Exit;
+  end;
+  Result := SQLITE_NOTFOUND;
 end;
 
 end.

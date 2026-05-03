@@ -382,10 +382,11 @@ function  sqlite3IsIdChar(c: u8): i32;
   Returns TK_ID if not a keyword, otherwise the TK_* code. }
 function  sqlite3KeywordCode(z: PByte; n: i32): i32;
 
-{ Keyword enumeration API (sqlite3.h public API). }
-function  sqlite3_keyword_name(idx: i32; out pzName: PAnsiChar; out pnName: i32): i32;
-function  sqlite3_keyword_count: i32;
-function  sqlite3_keyword_check(zName: PAnsiChar; nName: i32): i32;
+{ Keyword enumeration API (sqlite3.h public API).  Uses cdecl for ABI
+  parity with the C reference (keywordhash.h:472..482). }
+function  sqlite3_keyword_name(idx: i32; out pzName: PAnsiChar; out pnName: i32): i32; cdecl;
+function  sqlite3_keyword_count: i32; cdecl;
+function  sqlite3_keyword_check(zName: PAnsiChar; nName: i32): i32; cdecl;
 
 { Run the LALR(1) parser on zSql.  Phase 7.2f — drives the lexer through
   the Lemon engine.  Returns the number of errors encountered. }
@@ -432,6 +433,13 @@ procedure addModuleArgument(pPse: PParse; pTable: PTable2; zArg: PAnsiChar);
 { =========================================================================== }
 
 implementation
+
+{ Note: passqlite3vdbe is intentionally NOT added to the uses list here.
+  Adding it (in either interface or implementation) shadows codegen's
+  PParse = ^TParse with vdbe's opaque PParse = Pointer, breaking every
+  pParse^.field deref in this unit.  The gGetTokenImpl hook is wired
+  via a small registrar declared in passqlite3main.pas, which already
+  uses both units. }
 
 {$INCLUDE passqlite3parsertables.inc}
 
@@ -685,7 +693,7 @@ end;
 { Keyword API (sqlite3.h public surface)                                      }
 { =========================================================================== }
 
-function sqlite3_keyword_name(idx: i32; out pzName: PAnsiChar; out pnName: i32): i32;
+function sqlite3_keyword_name(idx: i32; out pzName: PAnsiChar; out pnName: i32): i32; cdecl;
 begin
   if (idx < 0) or (idx >= SQLITE_N_KEYWORD) then begin
     Result := SQLITE_ERROR; Exit;
@@ -696,12 +704,12 @@ begin
   Result := SQLITE_OK;
 end;
 
-function sqlite3_keyword_count: i32;
+function sqlite3_keyword_count: i32; cdecl;
 begin
   Result := SQLITE_N_KEYWORD;
 end;
 
-function sqlite3_keyword_check(zName: PAnsiChar; nName: i32): i32;
+function sqlite3_keyword_check(zName: PAnsiChar; nName: i32): i32; cdecl;
 begin
   if TK_ID <> sqlite3KeywordCode(PByte(zName), nName) then
     Result := 1
@@ -1459,12 +1467,30 @@ procedure yy_syntax_error(yypParser: PyyParser; yymajor: i32;
                           const yyminor: TToken);
 var
   pPse: PParse;
+  zMsg: PAnsiChar;
+  db: PTsqlite3;
 begin
   pPse := PParse(yypParser^.pParse);
   if pPse = nil then Exit;
-  if (yyminor.z <> nil) and (yyminor.z^ <> #0) then
-    sqlite3ErrorMsg(pPse, 'near "%T": syntax error')
-  else
+  db := pPse^.db;
+  if (yyminor.z <> nil) and (yyminor.z^ <> #0) then begin
+    { parse.c yy_syntax_error: sqlite3ErrorMsg(pParse, "near \"%T\": syntax error", &TOKEN);
+      sqlite3ErrorMsg in this codebase has no varargs overload — inline
+      sqlite3MPrintf with the token pointer + replicate the bookkeeping
+      (nErr++, rc:=SQLITE_ERROR, zErrMsg). }
+    if (db <> nil) and (db^.suppressErr <> 0) then begin
+      Inc(pPse^.nErr);
+      if pPse^.rc = SQLITE_OK then pPse^.rc := SQLITE_ERROR;
+    end else begin
+      zMsg := sqlite3MPrintf(db, 'near "%T": syntax error', [@yyminor]);
+      Inc(pPse^.nErr);
+      if pPse^.rc = SQLITE_OK then pPse^.rc := SQLITE_ERROR;
+      if zMsg <> nil then begin
+        if pPse^.zErrMsg <> nil then sqlite3DbFree(db, pPse^.zErrMsg);
+        pPse^.zErrMsg := zMsg;
+      end;
+    end;
+  end else
     sqlite3ErrorMsg(pPse, 'incomplete input');
   if yymajor = 0 then ;
 end;
@@ -1646,18 +1672,17 @@ begin
 end;
 
 { ---- sqlite3ExprAssignVarNumber (expr.c:1317) ---------------------------- }
-{ Assign a wildcard variable number.  Phase 7.2e.4 simplified port — handles }
-{ "?", "?N", and ":/@/$aaa".  Does NOT yet maintain pParse.pVList (which     }
-{ supports `sqlite3_bind_parameter_name`); de-duplication of named bind      }
-{ params is therefore disabled here — each occurrence gets a fresh slot.     }
-{ Phase 8 will replace this with the full util.c VList machinery.            }
+{ Assign a wildcard variable number.  Direct port — handles "?", "?N", and  }
+{ ":/@/$aaa", maintaining pParse.pVList for sqlite3_bind_parameter_name /    }
+{ _index lookup and de-duplicating named binds against prior occurrences.   }
 procedure sqlite3ExprAssignVarNumber(pPse: PParse; pExpr: PExpr; n: u32);
 var
-  db: PTsqlite3;
-  z:  PAnsiChar;
-  x:  i32;
-  ok: i32;
-  i:  i64;
+  db:    PTsqlite3;
+  z:     PAnsiChar;
+  x:     i32;
+  ok:    i32;
+  i:     i64;
+  doAdd: i32;
 begin
   if pExpr = nil then Exit;
   db := pPse^.db;
@@ -1666,25 +1691,38 @@ begin
   if z[1] = #0 then begin
     Inc(pPse^.nVar);
     x := pPse^.nVar;
-  end else if z[0] = '?' then begin
-    if n = 2 then begin
-      i := Ord(z[1]) - Ord('0');
-      ok := 1;
-    end else begin
-      ok := i32(Ord(sqlite3Atoi64(@z[1], i, i32(n) - 1, SQLITE_UTF8) = 0));
-    end;
-    if (ok = 0) or (i < 1) or (i > db^.aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]) then
-    begin
-      sqlite3ErrorMsg(pPse, 'variable number out of range');
-      sqlite3RecordErrorOffsetOfExpr(db, pExpr);
-      Exit;
-    end;
-    x := i32(i);
-    if x > pPse^.nVar then pPse^.nVar := x;
   end else begin
-    { ":aaa", "$aaa", "@aaa" — simplified: always allocate a new slot. }
-    Inc(pPse^.nVar);
-    x := pPse^.nVar;
+    doAdd := 0;
+    if z[0] = '?' then begin
+      if n = 2 then begin
+        i := Ord(z[1]) - Ord('0');
+        ok := 1;
+      end else begin
+        ok := i32(Ord(sqlite3Atoi64(@z[1], i, i32(n) - 1, SQLITE_UTF8) = 0));
+      end;
+      if (ok = 0) or (i < 1) or (i > db^.aLimit[SQLITE_LIMIT_VARIABLE_NUMBER]) then
+      begin
+        sqlite3ErrorMsg(pPse, 'variable number out of range');
+        sqlite3RecordErrorOffsetOfExpr(db, pExpr);
+        Exit;
+      end;
+      x := i32(i);
+      if x > pPse^.nVar then begin
+        pPse^.nVar := x;
+        doAdd := 1;
+      end else if sqlite3VListNumToName(pPse^.pVList, x) = nil then
+        doAdd := 1;
+    end else begin
+      { ":aaa", "$aaa", "@aaa" — reuse prior slot if name seen before. }
+      x := sqlite3VListNameToNum(pPse^.pVList, z, i32(n));
+      if x = 0 then begin
+        Inc(pPse^.nVar);
+        x := pPse^.nVar;
+        doAdd := 1;
+      end;
+    end;
+    if doAdd <> 0 then
+      pPse^.pVList := sqlite3VListAdd(db, pPse^.pVList, z, i32(n), x);
   end;
   pExpr^.iColumn := i16(x);
   if x > db^.aLimit[SQLITE_LIMIT_VARIABLE_NUMBER] then begin
@@ -4394,6 +4432,150 @@ begin
   if state = 1 then Result := 1 else Result := 0;
 end;
 
+{ =========================================================================== }
+{ build.c:2063 — identLength + identPut + createTableStmt                     }
+{                                                                              }
+{ Lives here (rather than in passqlite3codegen.pas where the call site is)    }
+{ because identPut needs sqlite3KeywordCode, which is unit-private to the     }
+{ parser.  Exposed to codegen via the gCreateTableStmt hook.                  }
+{ =========================================================================== }
+
+function identLength(z: PAnsiChar): i64;
+var
+  zz: PAnsiChar;
+begin
+  Result := 0;
+  if z = nil then begin Inc(Result, 2); Exit; end;
+  zz := z;
+  while zz^ <> #0 do begin
+    Inc(Result);
+    if zz^ = '"' then Inc(Result);
+    Inc(zz);
+  end;
+  Inc(Result, 2);
+end;
+
+procedure identPut(z: PAnsiChar; pIdx: Pi32; zSignedIdent: PAnsiChar);
+var
+  zIdent:    PByte;
+  i, j:      i32;
+  needQuote: i32;
+  jBreak:    i32;
+begin
+  zIdent := PByte(zSignedIdent);
+  i := pIdx^;
+
+  jBreak := -1;
+  j := 0;
+  while zIdent[j] <> 0 do begin
+    if (sqlite3Isalnum(zIdent[j]) = 0) and (zIdent[j] <> Ord('_')) then begin
+      jBreak := j;
+      Break;
+    end;
+    Inc(j);
+  end;
+  if jBreak < 0 then jBreak := j;
+
+  if (sqlite3Isdigit(zIdent[0]) <> 0)
+     or (sqlite3KeywordCode(zIdent, jBreak) <> TK_ID)
+     or (zIdent[jBreak] <> 0)
+     or (jBreak = 0) then
+    needQuote := 1
+  else
+    needQuote := 0;
+
+  if needQuote <> 0 then begin
+    z[i] := '"';
+    Inc(i);
+  end;
+  j := 0;
+  while zIdent[j] <> 0 do begin
+    z[i] := AnsiChar(zIdent[j]);
+    Inc(i);
+    if zIdent[j] = Ord('"') then begin
+      z[i] := '"';
+      Inc(i);
+    end;
+    Inc(j);
+  end;
+  if needQuote <> 0 then begin
+    z[i] := '"';
+    Inc(i);
+  end;
+  z[i] := #0;
+  pIdx^ := i;
+end;
+
+function createTableStmt(db: PTsqlite3; p: PTable2): PAnsiChar;
+const
+  azType: array[0..5] of PAnsiChar = (
+    '',       { SQLITE_AFF_BLOB    }
+    ' TEXT',  { SQLITE_AFF_TEXT    }
+    ' NUM',   { SQLITE_AFF_NUMERIC }
+    ' INT',   { SQLITE_AFF_INTEGER }
+    ' REAL',  { SQLITE_AFF_REAL    }
+    ' NUM'    { SQLITE_AFF_FLEXNUM }
+  );
+var
+  i, k, len: i32;
+  n:         i64;
+  zStmt:     PAnsiChar;
+  zSep, zSep2, zEnd: PAnsiChar;
+  pCol:      PColumn;
+  zType:     PAnsiChar;
+  affIdx:    i32;
+begin
+  n := 0;
+  pCol := p^.aCol;
+  for i := 0 to p^.nCol - 1 do begin
+    Inc(n, identLength(pCol^.zCnName) + 5);
+    Inc(pCol);
+  end;
+  Inc(n, identLength(p^.zName));
+  if n < 50 then begin
+    zSep  := '';
+    zSep2 := ',';
+    zEnd  := ')';
+  end else begin
+    zSep  := PAnsiChar(#10'  ');
+    zSep2 := PAnsiChar(','#10'  ');
+    zEnd  := PAnsiChar(#10')');
+  end;
+  Inc(n, 35 + 6 * p^.nCol);
+  zStmt := PAnsiChar(sqlite3DbMallocRaw(nil, u64(n)));
+  if zStmt = nil then begin
+    sqlite3OomFault(db);
+    Exit(nil);
+  end;
+  Move(PAnsiChar('CREATE TABLE ')^, zStmt^, 13);
+  k := 13;
+  identPut(zStmt, @k, p^.zName);
+  zStmt[k] := '(';
+  Inc(k);
+  pCol := p^.aCol;
+  for i := 0 to p^.nCol - 1 do begin
+    len := sqlite3Strlen30(zSep);
+    Move(zSep^, (zStmt + k)^, len);
+    Inc(k, len);
+    zSep := zSep2;
+    identPut(zStmt, @k, pCol^.zCnName);
+    { SQLITE_AFF_BLOB = 'A' = $41 (vdbe.pas:482).  Inlined here because the
+      parser unit intentionally does not import passqlite3vdbe. }
+    affIdx := i32(Ord(pCol^.affinity)) - $41;
+    if (affIdx < 0) or (affIdx > 5) then affIdx := 0;
+    zType := azType[affIdx];
+    len := sqlite3Strlen30(zType);
+    if len > 0 then begin
+      Move(zType^, (zStmt + k)^, len);
+      Inc(k, len);
+    end;
+    Inc(pCol);
+  end;
+  len := sqlite3Strlen30(zEnd);
+  Move(zEnd^, (zStmt + k)^, len + 1);
+  Result := zStmt;
+end;
+
 initialization
   { Phase 6.9-bis (step 9): wire the codegen NestedParse → real parser
     dispatch.  passqlite3parser depends on passqlite3codegen, so we
@@ -4402,5 +4584,7 @@ initialization
     nil hook and NestedParse becomes a no-op after formatting. }
   passqlite3codegen.gNestedRunParser :=
     passqlite3codegen.TNestedRunParserFn(@sqlite3RunParser);
+  passqlite3codegen.gCreateTableStmt :=
+    passqlite3codegen.TCreateTableStmtFn(@createTableStmt);
 
 end.

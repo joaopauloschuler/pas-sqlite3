@@ -259,6 +259,7 @@ const
   SQLITE_TrustedSchema  = u64($00000080);
   SQLITE_NullCallback   = u64($00000100);
   SQLITE_IgnoreChecks   = u64($00000200);
+  SQLITE_ReverseOrder   = u64($00001000);
   SQLITE_RecTriggers    = u64($00002000);
   SQLITE_ForeignKeys    = u64($00004000);
   SQLITE_AutoIndex      = u64($00008000);
@@ -267,6 +268,11 @@ const
   SQLITE_QueryOnly      = u64($00100000);
   SQLITE_CellSizeCk     = u64($00200000);
   SQLITE_CorruptRdOnly  = u64($02000000);  { internal flag }
+  SQLITE_LegacyAlter    = u64($04000000);
+  { HI() flag bits — sqliteInt.h: HI(X) = u64(X)<<32 }
+  SQLITE_CountRows      = u64($0000000100000000);  { HI(0x00001) }
+  SQLITE_ReadUncommit   = u64($0000000400000000);  { HI(0x00004) }
+  SQLITE_FkNoAction     = u64($0000000800000000);  { HI(0x00008) }
   SQLITE_VdbeListing    = u64($0000000100000000);
   SQLITE_VdbeTrace      = u64($0000000200000000);
   SQLITE_VdbeEQP        = u64($0000001000000000);
@@ -289,6 +295,8 @@ const
   SQLITE_TRACE_ROW     = $04;
   SQLITE_TRACE_CLOSE   = $08;
   SQLITE_TRACE_LEGACY  = $40;
+  SQLITE_TRACE_XPROFILE        = $80;  { sqliteInt.h:1646 — legacy xProfile in use }
+  SQLITE_TRACE_NONLEGACY_MASK  = $0F;  { sqliteInt.h:1651 — public mTrace bits }
 
   { Conflict resolution actions }
   OE_None      = 0;
@@ -601,6 +609,13 @@ var
   sqlite3CtypeMap:     array[0..255] of u8;
   sqlite3GlobalConfig: TSqlite3Config;
 
+  { main.c:148 / :157 — public extern globals.  Application can override via
+    the deprecated SQLITE_DBCONFIG_TEMP_DIRECTORY / DATA_DIRECTORY pragmas
+    or by direct assignment.  C type is `char *` (mutable, may point to a
+    sqlite3_mprintf-allocated buffer that the app is expected to free). }
+  sqlite3_temp_directory: PAnsiChar = nil;
+  sqlite3_data_directory: PAnsiChar = nil;
+
 { ============================================================
   Exported function declarations
   ============================================================ }
@@ -622,12 +637,22 @@ function  sqlite3HexToBlob(db: Psqlite3db; z: PAnsiChar; n: i32): Pointer;
 function  sqlite3Strlen30(z: PChar): i32;
 function  sqlite3Strlen30NN(z: PChar): i32;
 function  sqlite3StrICmp(zLeft, zRight: PChar): i32;
+function  sqlite3_stricmp(zLeft, zRight: PChar): i32;
 function  sqlite3_strnicmp(zLeft, zRight: PChar; N: i32): i32;
 function  sqlite3StrIHash(z: PChar): u8;
 function  sqlite3AtoF(zIn: PChar; out pResult: Double): i32;
 function  sqlite3Atoi64(zNum: PChar; out pNum: i64; length: i32; enc: u8): i32;
 function  sqlite3Int64ToText(v: i64; zOut: PChar): i32;
 function  sqlite3DecOrHexToI64(z: PChar; out pOut: i64): i32;
+function  sqlite3IsOverflow(x: Double): i32;
+
+{ VList — variable name/number mapping (util.c:2155..2249).
+  pVList is a packed int array; layout documented at util.c:2156. }
+function  sqlite3VListAdd(db: Psqlite3db; pIn: Pointer;
+                          zName: PAnsiChar; nName: i32; iVal: i32): Pointer;
+function  sqlite3VListNumToName(pIn: Pointer; iVal: i32): PAnsiChar;
+function  sqlite3VListNameToNum(pIn: Pointer;
+                                zName: PAnsiChar; nName: i32): i32;
 
 { Big-endian 4-byte accessors (util.c) }
 function  sqlite3Get4byte(p: Pu8): u32;
@@ -687,6 +712,7 @@ function  sqlite3DbStrNDup(db: Psqlite3db; z: PChar; n: u64): PChar;
 function  sqlite3DbRealloc(db: Psqlite3db; p: Pointer; n: u64): Pointer;
 function  sqlite3DbMallocSize(db: Psqlite3db; p: Pointer): i32;
 function  sqlite3DbReallocOrFree(db: Psqlite3db; p: Pointer; n: u64): Pointer;
+procedure sqlite3SetString(pz: PPChar; db: Psqlite3db; zNew: PChar);
 function  sqlite3ArrayAllocate(db: Psqlite3db; pArray: Pointer;
                                szEntry: i32; pnEntry: Pi32;
                                pIdx: Pi32): Pointer;
@@ -737,6 +763,14 @@ function  sqlite3_config(op: i32; pArg: Pointer): i32; overload;
 function sqlite3GetBoolean(z: PChar; dflt: u8): u8;
 function sqlite3_uri_parameter(zFilename: PChar; zParam: PChar): PChar;
 function sqlite3_uri_boolean(zFilename: PChar; zParam: PChar; bDflt: i32): i32;
+function sqlite3_uri_int64(zFilename: PChar; zParam: PChar; bDflt: i64): i64;
+function sqlite3_uri_key(zFilename: PChar; N: i32): PChar;
+function sqlite3_filename_database(zFilename: PChar): PChar;
+function sqlite3_filename_journal(zFilename: PChar): PChar;
+function sqlite3_filename_wal(zFilename: PChar): PChar;
+procedure sqlite3_free_filename(p: PChar);
+function sqlite3_create_filename(zDatabase, zJournal, zWal: PChar;
+  nParam: i32; azParam: PPChar): PChar; cdecl;
 function sqlite3Atoi(z: PChar): i32;
 
 { Alignment helpers (used by pcache and btree) }
@@ -946,6 +980,93 @@ begin
   Result := c;
 end;
 
+{ ============================================================
+  VList — packed int array carrying (iVal, nSlot, zName) triples.
+  Direct port of util.c:2155..2249.
+  ============================================================ }
+
+function sqlite3VListAdd(db: Psqlite3db; pIn: Pointer;
+                         zName: PAnsiChar; nName: i32; iVal: i32): Pointer;
+var
+  nInt:   i32;
+  i:      i32;
+  pa:     Pi32;
+  pOut:   Pointer;
+  nAlloc: i64;
+  z:      PAnsiChar;
+begin
+  nInt := nName div 4 + 3;
+  pa := Pi32(pIn);
+  Assert((pa = nil) or (pa[0] >= 3));
+  if (pa = nil) or (pa[1] + nInt > pa[0]) then begin
+    if pa <> nil then nAlloc := 2 * i64(pa[0]) + nInt
+    else              nAlloc := 10 + nInt;
+    pOut := sqlite3DbRealloc(db, pIn, u64(nAlloc) * SizeOf(i32));
+    if pOut = nil then begin Result := pIn; Exit; end;
+    if pa = nil then Pi32(pOut)[1] := 2;
+    pa := Pi32(pOut);
+    pa[0] := i32(nAlloc);
+    pIn := pOut;
+  end;
+  i := pa[1];
+  pa[i]     := iVal;
+  pa[i + 1] := nInt;
+  z := PAnsiChar(@pa[i + 2]);
+  pa[1] := i + nInt;
+  Assert(pa[1] <= pa[0]);
+  if nName > 0 then Move(zName^, z^, nName);
+  z[nName] := #0;
+  Result := pIn;
+end;
+
+function sqlite3VListNumToName(pIn: Pointer; iVal: i32): PAnsiChar;
+var pa: Pi32; i, mx: i32;
+begin
+  if pIn = nil then begin Result := nil; Exit; end;
+  pa := Pi32(pIn);
+  mx := pa[1];
+  i  := 2;
+  while True do begin
+    if pa[i] = iVal then begin
+      Result := PAnsiChar(@pa[i + 2]);
+      Exit;
+    end;
+    Inc(i, pa[i + 1]);
+    if i >= mx then Break;
+  end;
+  Result := nil;
+end;
+
+function sqlite3VListNameToNum(pIn: Pointer;
+                               zName: PAnsiChar; nName: i32): i32;
+var pa: Pi32; i, mx: i32; z: PAnsiChar;
+begin
+  if pIn = nil then begin Result := 0; Exit; end;
+  pa := Pi32(pIn);
+  mx := pa[1];
+  i  := 2;
+  while True do begin
+    z := PAnsiChar(@pa[i + 2]);
+    if (StrLComp(z, zName, nName) = 0) and (z[nName] = #0) then begin
+      Result := pa[i];
+      Exit;
+    end;
+    Inc(i, pa[i + 1]);
+    if i >= mx then Break;
+  end;
+  Result := 0;
+end;
+
+{ util.c:408 — public-API wrapper around sqlite3StrICmp with NULL guards. }
+function sqlite3_stricmp(zLeft, zRight: PChar): i32;
+begin
+  if zLeft = nil then begin
+    if zRight <> nil then Exit(-1) else Exit(0);
+  end else if zRight = nil then
+    Exit(1);
+  Result := sqlite3StrICmp(zLeft, zRight);
+end;
+
 function sqlite3_strnicmp(zLeft, zRight: PChar; N: i32): i32;
 var
   a, b: Pu8;
@@ -1134,6 +1255,19 @@ end;
 function sqlite3Strlen30NN(z: PChar): i32;
 begin
   Result := $3fffffff and i32(libc_strlen(z));
+end;
+
+{ sqlite3IsOverflow — port of util.c:75.  Returns 1 if the IEEE-754 double
+  is +Inf, -Inf, or NaN (exponent field == 0x7ff). }
+function sqlite3IsOverflow(x: Double): i32;
+var
+  y: u64;
+begin
+  Move(x, y, SizeOf(y));
+  if (y and (u64($7ff) shl 52)) = (u64($7ff) shl 52) then
+    Result := 1
+  else
+    Result := 0;
 end;
 
 { compare2pow63 — helper for sqlite3Atoi64 }
@@ -2281,6 +2415,18 @@ begin
   if Result = nil then sqlite3_free(p);
 end;
 
+{ sqlite3SetString — port of malloc.c:808.  Free any prior content in pz^
+  and replace it with a copy of zNew (or nil if zNew is nil).  Used by
+  prepare.c / vacuum.c to populate sqlite3_exec-style **pzErrMsg
+  out-parameters. }
+procedure sqlite3SetString(pz: PPChar; db: Psqlite3db; zNew: PChar);
+var z: PChar;
+begin
+  z := sqlite3DbStrDup(db, zNew);
+  sqlite3DbFree(db, pz^);
+  pz^ := z;
+end;
+
 { sqlite3ArrayAllocate — port of build.c:4680.  Append a slot to a
   power-of-two-sized array, growing the allocation when (n & (n-1))==0.
   *pIdx receives the new slot index (or -1 on OOM); *pnEntry is bumped. }
@@ -2704,6 +2850,119 @@ begin
   if bDflt <> 0 then df := 1 else df := 0;
   if z <> nil then Result := sqlite3GetBoolean(z, df)
   else Result := df;
+end;
+
+{ main.c ~4907: sqlite3_uri_int64 }
+function sqlite3_uri_int64(zFilename: PChar; zParam: PChar; bDflt: i64): i64;
+var
+  z : PChar;
+  v : i64;
+begin
+  z := sqlite3_uri_parameter(zFilename, zParam);
+  if (z <> nil) and (sqlite3DecOrHexToI64(z, v) = 0) then
+    Result := v
+  else
+    Result := bDflt;
+end;
+
+{ main.c ~4884: sqlite3_uri_key }
+function sqlite3_uri_key(zFilename: PChar; N: i32): PChar;
+begin
+  if (zFilename = nil) or (N < 0) then Exit(nil);
+  zFilename := databaseName(zFilename);
+  zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+  while (zFilename <> nil) and (zFilename[0] <> #0) and (N > 0) do
+  begin
+    Dec(N);
+    zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+    zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+  end;
+  if zFilename[0] <> #0 then Result := zFilename else Result := nil;
+end;
+
+{ main.c ~4930: sqlite3_filename_database }
+function sqlite3_filename_database(zFilename: PChar): PChar;
+begin
+  if zFilename = nil then Exit(nil);
+  Result := databaseName(zFilename);
+end;
+
+{ main.c ~4934: sqlite3_filename_journal }
+function sqlite3_filename_journal(zFilename: PChar): PChar;
+begin
+  if zFilename = nil then Exit(nil);
+  zFilename := databaseName(zFilename);
+  zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+  while (zFilename <> nil) and (zFilename[0] <> #0) do
+  begin
+    zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+    zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+  end;
+  Result := zFilename + 1;
+end;
+
+{ main.c ~4944: sqlite3_filename_wal — non-OMIT_WAL arm only. }
+function sqlite3_filename_wal(zFilename: PChar): PChar;
+begin
+  zFilename := sqlite3_filename_journal(zFilename);
+  if zFilename <> nil then
+    zFilename := zFilename + sqlite3Strlen30(zFilename) + 1;
+  Result := zFilename;
+end;
+
+{ main.c ~4857: sqlite3_free_filename — pair of sqlite3_create_filename. }
+procedure sqlite3_free_filename(p: PChar);
+begin
+  if p = nil then Exit;
+  p := databaseName(p);
+  sqlite3_free(p - 4);
+end;
+
+{ main.c:4806 — appendText: copy z (with terminator) into p, return p past
+  the terminator. }
+function appendText(p: PChar; z: PChar): PChar;
+var n: SizeInt;
+begin
+  n := sqlite3Strlen30(z);
+  Move(z^, p^, n + 1);
+  Result := p + n + 1;
+end;
+
+{ main.c:4821 — sqlite3_create_filename.  Build a filename buffer in the
+  layout expected by sqlite3_filename_database / _journal / _wal /
+  sqlite3_uri_parameter: 4 leading zero bytes, then the database name and
+  query parameter key/value pairs separated by NULs, an extra NUL, then
+  the journal name, the WAL name, and two trailing NULs. }
+function sqlite3_create_filename(zDatabase, zJournal, zWal: PChar;
+  nParam: i32; azParam: PPChar): PChar; cdecl;
+var
+  nByte   : i64;
+  i       : i32;
+  pResult : PChar;
+  p       : PChar;
+  azP     : PPChar;
+begin
+  nByte := sqlite3Strlen30(zDatabase) + sqlite3Strlen30(zJournal)
+         + sqlite3Strlen30(zWal) + 10;
+  azP := azParam;
+  for i := 0 to (nParam * 2) - 1 do
+    nByte := nByte + sqlite3Strlen30(azP[i]) + 1;
+  pResult := PChar(sqlite3_malloc64(u64(nByte)));
+  p := pResult;
+  if p = nil then begin Result := nil; Exit; end;
+  FillChar(p^, 4, 0);
+  p := p + 4;
+  p := appendText(p, zDatabase);
+  for i := 0 to (nParam * 2) - 1 do
+    p := appendText(p, azP[i]);
+  p^ := #0; Inc(p);
+  p := appendText(p, zJournal);
+  p := appendText(p, zWal);
+  p^ := #0; Inc(p);
+  p^ := #0; Inc(p);
+  AssertH((PtrUInt(p) - PtrUInt(pResult)) = PtrUInt(nByte),
+    'sqlite3_create_filename: byte-count mismatch');
+  Result := pResult + 4;
 end;
 
 { util.c ~1357: sqlite3Atoi -- parse integer from string }
