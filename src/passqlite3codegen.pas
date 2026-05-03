@@ -21732,6 +21732,10 @@ var
   rcSel:        i32;
   savedFlagsP:  u32;
   savedFlagsPP: u32;
+  { No-ORDER-BY UNION/INTERSECT/EXCEPT invented-ORDER-BY locals
+    (multiSelect select.c:2984..2994). }
+  pInvOne:      PExpr;
+  pInvItm:      PExprListItem;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -21824,6 +21828,26 @@ begin
        and ((p^.op = TK_ALL) or (p^.op = TK_UNION)
             or (p^.op = TK_EXCEPT) or (p^.op = TK_INTERSECT)) then
     begin
+      Result := multiSelectByMerge(pParse, p, pDest);
+      Exit;
+    end;
+    { No-ORDER-BY UNION / INTERSECT / EXCEPT — select.c:2984..2994.
+      The merge algorithm requires an ORDER BY, but for the unordered
+      UNION / INTERSECT / EXCEPT case the C reference invents one over
+      column 1 then routes through multiSelectByMerge.  Closes the
+      DiagFeatureProbe `UNION compound` no-ORDER-BY triple-UNION row. }
+    if (p^.pOrderBy = nil)
+       and ((p^.selFlags and SF_Recursive) = 0)
+       and (p^.op <> TK_ALL)
+       and ((p^.op = TK_UNION) or (p^.op = TK_EXCEPT)
+            or (p^.op = TK_INTERSECT)) then
+    begin
+      pInvOne := sqlite3ExprInt32(pParse^.db, 1);
+      p^.pOrderBy := sqlite3ExprListAppend(pParse, nil, pInvOne);
+      if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+      Assert(p^.pOrderBy <> nil);
+      pInvItm := PExprListItem(PByte(ExprListItems(p^.pOrderBy)));
+      pInvItm^.u.x.iOrderByCol := 1;
       Result := multiSelectByMerge(pParse, p, pDest);
       Exit;
     end;

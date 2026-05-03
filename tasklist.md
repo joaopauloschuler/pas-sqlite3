@@ -298,28 +298,13 @@ FPC porting traps that recur often enough to call out up-front:
         (SELECT a FROM t WHERE …)` all PASS.  nAccumulator>0 bail lifted
         for the isSubqueryAgg arm (eph cursor is what the directMode
         OP_Column reads).
-      [~] **e) UNION / compound SELECT.**  Partial — UNION ALL arm
-        of multiSelect (select.c:2998..3050) ported at codegen.pas
-        sqlite3Select compound dispatch; `SELECT 1 UNION ALL SELECT 2`
-        and `SELECT count(*) FROM (... UNION ALL ...)` PASS (no-FROM
-        leaf extended for SRT_EphemTab/SRT_Table).  Prereqs landed for
-        the merge arm: `multiSelectCollSeq` (select.c:2565..2580),
-        `multiSelectByMergeKeyInfo` (select.c:2591..2618),
-        `codeOffset` (select.c:879..888), `generateOutputSubroutine`
-        (select.c:3097..3303), `hasAnchor` (select.c:2890..2893), plus
-        `SQLITE_BalancedMerge` optimisation flag.  `multiSelectByMerge`
-        (select.c:3389..3722) ported at codegen.pas; wired into
-        sqlite3Select compound dispatch on the ORDER-BY arm.  Verified
-        end-to-end (Pas vs C): `SELECT 1 UNION ALL SELECT 2 ORDER BY 1`,
-        `SELECT 1 UNION SELECT 2 ORDER BY 1`,
-        `... UNION SELECT 2 UNION SELECT 1 ORDER BY 1`,
-        `SELECT 1 INTERSECT SELECT 1 ORDER BY 1`, and
-        `SELECT 2 EXCEPT SELECT 1 ORDER BY 1` all return identical rows.
-        Remaining: no-ORDER-BY UNION / INTERSECT / EXCEPT (Pas falls
-        through — uses the SRT_Union/SRT_Except ephemeral arm of
-        multiSelect, still unported); LIMIT propagation through UNION
-        ALL still bails.  DiagFeatureProbe `UNION compound` (no-ORDER-BY
-        triple-UNION) is the remaining open probe.
+      [~] **e) UNION / compound SELECT.**  ORDER-BY and no-ORDER-BY
+        UNION / INTERSECT / EXCEPT all dispatch through
+        multiSelectByMerge (the no-ORDER-BY non-TK_ALL arm invents an
+        ORDER BY 1 per select.c:2984..2994 before dispatch).
+        DiagFeatureProbe `UNION compound` PASS.  UNION ALL no-ORDER-BY
+        no-LIMIT inlined; LIMIT propagation through UNION ALL still
+        bails.
       [~] **f) WITH / CTE not productive** — simple non-recursive CTE
         works.  Recursive CTE preps cleanly (recursion-detection arm of
         resolveFromTermToCte + early pTab^.aCol from explicit pCt^.pCols
