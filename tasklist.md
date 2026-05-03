@@ -30,13 +30,8 @@ Important: At the end of this document, please find:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-> **2026-05-03 (a3):** TestExplainParity now reports **1024 / 1026 PASS**.
-> Closed `SELECT IPK alias u`: ported `estimateIndexWidth` so autoindex
-> rows carry the right `szIdxRow`, ported the canonical
-> `sqlite3DefaultRowEst` (a[0] tracks `pTable->nRowLogEst`, not the
-> hard-coded 210), and let the no-WHERE single-table case in
-> `whereShortCut` fall through to the cost-based planner when a
-> non-partial covering index exists.
+> **2026-05-03 (a3):** TestExplainParity reports **1024 / 1026 PASS**.
+> Two corpus rows still diverge (see 6.10 step 6).
 
 Suggested order (driven by call-graph dependencies, not numbering): 6.8.0
 (independent) → 6.8.4 → 6.8.5 (Update needs a productive WHERE) → 6.8.2
@@ -212,20 +207,6 @@ skeleton.
 
 ### Open Bugs
 
-- [X] **4.6-regress** `TestBtreeCompat.T30` — DONE (2026-05-03).  Root
-    cause: `balance_nonroot` (btree.pas:4965) declared `nMaxCells`,
-    `nNew`, `iSpace1`, `iOvflSpace` as plain `var` locals without
-    explicit initialisation; the C reference (btree.c:8238..8249)
-    initialises all four to `0` at declaration.  Stack-resident garbage
-    bled through `Inc(nMaxCells, ...)` (btree.pas:5068) and the
-    derived `szScratch` allocation, surfacing as ~50% `EAccessViolation`
-    runs only after a sufficiently-deep prior test had dirtied the
-    stack frame.  Valgrind confirmed every flagged use traced back to
-    that frame.  Fix: explicit `:= 0` for all four locals (btree.pas:
-    5026..5034).  TestBtreeCompat now PASS 12/12 at -O3 with debug
-    info, 8/8 at production -O3, and Valgrind reports zero
-    balance_nonroot uninitialised-value errors.
-
 - [ ] **6.10** `TestExplainParity.pas` — 1024/1026 PASS as currently
     measured (2026-05-03).  Oracle is built with `-DSQLITE_DEBUG
     -DSQLITE_ENABLE_EXPLAIN_COMMENTS`, so emits OP_Explain /
@@ -269,9 +250,13 @@ skeleton.
         of multiSelect (select.c:2998..3050) ported at codegen.pas
         sqlite3Select compound dispatch; `SELECT 1 UNION ALL SELECT 2`
         and `SELECT count(*) FROM (... UNION ALL ...)` PASS (no-FROM
-        leaf extended for SRT_EphemTab/SRT_Table).  Remaining: UNION /
-        INTERSECT / EXCEPT (need multiSelectByMerge), and
-        `SELECT 1 UNION SELECT 2` dedup.  Folds into 6.13(c).
+        leaf extended for SRT_EphemTab/SRT_Table).  Helper
+        `multiSelectCollSeq` (select.c:2565..2580) ported alongside
+        as a prerequisite for the dedup arms.  Remaining: UNION /
+        INTERSECT / EXCEPT (need multiSelectByMerge +
+        multiSelectByMergeKeyInfo) and `SELECT 1 UNION SELECT 2`
+        dedup.  Also LIMIT propagation through UNION ALL still bails.
+        Folds into 6.13(c).
       [~] **f) WITH / CTE not productive** — simple non-recursive CTE
         works.  Recursive CTE preps cleanly (recursion-detection arm of
         resolveFromTermToCte + early pTab^.aCol from explicit pCt^.pCols

@@ -2034,6 +2034,7 @@ procedure sqlite3KeyInfoUnref(p: PKeyInfo2);
 function  sqlite3KeyInfoRef(p: PKeyInfo2): PKeyInfo2;
 function  sqlite3KeyInfoFromExprList(pParse: PParse; pList: PExprList;
   iStart: i32; nExtra: i32): PKeyInfo2;
+function  multiSelectCollSeq(pParse: PParse; p: PSelect; iCol: i32): Pointer;
 function  sqlite3SelectOpName(id: i32): PAnsiChar;
 procedure sqlite3SelectWrongNumTermsError(pParse: PParse; p: PSelect);
 function  sqlite3GetVdbe(pParse: PParse): PVdbe;
@@ -18165,6 +18166,30 @@ begin
     end;
   end;
   Result := pInfo;
+end;
+
+{ multiSelectCollSeq — port of select.c:2565..2580.  Walk the compound-SELECT
+  pPrior chain looking for an explicit collation on the iCol-th expression of
+  any term; the left-most term that supplies one wins.  Falls through to
+  sqlite3ExprCollSeq on the current term's iCol-th expr when no prior wins.
+  Returns nil when no collation is present (caller substitutes db^.pDfltColl). }
+function multiSelectCollSeq(pParse: PParse; p: PSelect; iCol: i32): Pointer;
+var
+  pRet: Pointer;
+  pItem: PExprListItem;
+begin
+  if p^.pPrior <> nil then
+    pRet := multiSelectCollSeq(pParse, p^.pPrior, iCol)
+  else
+    pRet := nil;
+  AssertH(iCol >= 0, 'multiSelectCollSeq: iCol < 0');
+  if (pRet = nil) and (p^.pEList <> nil) and (iCol < p^.pEList^.nExpr) then
+  begin
+    pItem := ExprListItems(p^.pEList);
+    Inc(pItem, iCol);
+    pRet := sqlite3ExprCollSeq(pParse, pItem^.pExpr);
+  end;
+  Result := pRet;
 end;
 
 { sqlite3SelectOpName — return string name of compound operator }
