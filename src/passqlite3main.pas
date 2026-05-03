@@ -4610,4 +4610,10 @@ initialization
     xFilter (codegen.pas) can prepare its synthesised PRAGMA statement. }
   passqlite3vdbe.gPrepareV2 := passqlite3vdbe.TPrepareV2Fn(@sqlite3_prepare_v2);
 
+  { Phase 6.27 — wire sqlite3_exec into codegen's analysisLoadTrampoline so
+    the sqlite_stat1 SELECT (analyze.c:1974) lands real rows into the
+    schema. }
+  passqlite3codegen.gStat1Exec :=
+    passqlite3codegen.TStat1ExecFn(@sqlite3_exec);
+
 end.

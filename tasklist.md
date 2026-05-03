@@ -234,6 +234,14 @@ FPC porting traps that recur often enough to call out up-front:
             cost-based planner work in 6.8.4 (without ANALYZE rows
             the planner falls back to heuristic costs and several
             DiagIndexing cases pick the wrong plan).
+            Building blocks landed: `decodeIntArray`
+            (analyze.c:1520..1580 — int-list + unordered/sz=N/
+            noskipscan token scanner) and `analysisLoader`
+            (analyze.c:1593..1650 — sqlite3_exec callback for
+            sqlite_stat1 rows), wired into `analysisLoadTrampoline`
+            via the new `gStat1Exec` hook (passqlite3main installs
+            sqlite3_exec).  Productive the moment `sqlite3Analyze`
+            stops being a stub.
        [X] Port `sqlite3Vacuum` (vacuum.c).
        [X] Port `sqlite3FkCheck` (fkey.c) — DONE.  fkScanChildren
             (fkey.c:547..660) and the dispatcher body (fkey.c:889..

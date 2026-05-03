@@ -2955,6 +2955,23 @@ procedure sqlite3Analyze(pParse: PParse; pName1: PToken; pName2: PToken);
 procedure sqlite3DeleteIndexSamples(db: PTsqlite3; pIdx: PIndex2);
 function  sqlite3AnalysisLoad(db: PTsqlite3; iDb: i32): i32;
 
+{ Hook: sqlite_stat1 reader.  Installed by passqlite3main at unit-init so
+  analysisLoadTrampoline can drive `SELECT tbl,idx,stat FROM %Q.sqlite_stat1`
+  via sqlite3_exec without codegen.pas needing a `uses passqlite3main`
+  cycle.  Callback signature mirrors Tsqlite3_callback in main.pas.
+  zSql is a freshly mallocated string (caller must sqlite3DbFree it). }
+type
+  TStat1ExecCallback = function(pArg: Pointer; nCol: i32;
+                                argv: PPAnsiChar;
+                                colv: PPAnsiChar): i32; cdecl;
+  TStat1ExecFn = function(db: PTsqlite3; zSql: PAnsiChar;
+                          xCallback: TStat1ExecCallback;
+                          pArg: Pointer;
+                          pzErrMsg: PPAnsiChar): i32;
+
+var
+  gStat1Exec: TStat1ExecFn;
+
 // ---------------------------------------------------------------------------
 // Phase 6.5 public API — pragma.c
 // ---------------------------------------------------------------------------
@@ -29800,14 +29817,121 @@ begin
     aRowEst[i] := 23;
 end;
 
+{ decodeIntArray — port of analyze.c:1520..1580.
+  Decode a space-separated list of decimal integers into aLog[] (LogEst
+  form).  Then scan trailing tokens (`unordered`, `sz=N`, `noskipscan`)
+  and stamp the matching idxFlags bits / szIdxRow on pIndex.  STAT4 build
+  is off in this port, so aOut is always nil and pIndex is always non-nil
+  per the C #else assert. }
+procedure decodeIntArray(zIntArray: PAnsiChar; nOut: i32;
+                         aLog: PLogEst; pIndex: PIndex2);
+var
+  z: PAnsiChar;
+  c: AnsiChar;
+  i: i32;
+  v: u64;
+  sz: i32;
+begin
+  z := zIntArray;
+  if z = nil then Exit;  { defensive — C asserts non-nil in non-STAT4 build }
+  i := 0;
+  while (z^ <> #0) and (i < nOut) do
+  begin
+    v := 0;
+    while True do
+    begin
+      c := z^;
+      if (c < '0') or (c > '9') then Break;
+      v := v * 10 + u64(Ord(c) - Ord('0'));
+      Inc(z);
+    end;
+    if aLog <> nil then
+      aLog[i] := sqlite3LogEst(v);
+    if z^ = ' ' then Inc(z);
+    Inc(i);
+  end;
+  if pIndex = nil then Exit;
+  { Clear bUnordered (bit 2) and noSkipScan (bit 6). }
+  pIndex^.idxFlags := pIndex^.idxFlags and (not u16($04)) and (not u16($40));
+  while z^ <> #0 do
+  begin
+    if sqlite3_strglob('unordered*', z) = 0 then
+      pIndex^.idxFlags := pIndex^.idxFlags or u16($04)
+    else if sqlite3_strglob('sz=[0-9]*', z) = 0 then
+    begin
+      sz := sqlite3Atoi(PChar(z + 3));
+      if sz < 2 then sz := 2;
+      pIndex^.szIdxRow := sqlite3LogEst(u64(sz));
+    end
+    else if sqlite3_strglob('noskipscan*', z) = 0 then
+      pIndex^.idxFlags := pIndex^.idxFlags or u16($40);
+    while (z^ <> #0) and (z^ <> ' ') do Inc(z);
+    while z^ = ' ' do Inc(z);
+  end;
+end;
+
+type
+  TAnalysisInfo = record
+    db:        PTsqlite3;
+    zDatabase: PAnsiChar;
+  end;
+  PAnalysisInfo = ^TAnalysisInfo;
+
+{ analysisLoader — port of analyze.c:1593..1650.  sqlite3_exec callback
+  invoked once per sqlite_stat1 row.  argv[0]=tbl, argv[1]=idx (may be
+  NULL → table-stats row), argv[2]=stat string. }
+function analysisLoader(pData: Pointer; nCol: i32;
+                        argv: PPAnsiChar;
+                        colv: PPAnsiChar): i32; cdecl;
+var
+  pInfo:  PAnalysisInfo;
+  pIndex: PIndex2;
+  pTable: PTable2;
+  z:      PAnsiChar;
+  nKeyCol: i32;
+  fakeIdx: TIndex;
+begin
+  Result := 0;
+  pInfo := PAnalysisInfo(pData);
+  if (argv = nil) or (argv[0] = nil) or (argv[2] = nil) then Exit;
+  pTable := sqlite3FindTable(pInfo^.db, argv[0], pInfo^.zDatabase);
+  if pTable = nil then Exit;
+  if argv[1] = nil then
+    pIndex := nil
+  else if sqlite3_stricmp(PChar(argv[0]), PChar(argv[1])) = 0 then
+    pIndex := sqlite3PrimaryKeyIndex(pTable)
+  else
+    pIndex := sqlite3FindIndex(pInfo^.db, argv[1], pInfo^.zDatabase);
+  z := argv[2];
+  if pIndex <> nil then
+  begin
+    nKeyCol := pIndex^.nKeyCol + 1;
+    { Clear bUnordered (bit 2). }
+    pIndex^.idxFlags := pIndex^.idxFlags and (not u16($04));
+    decodeIntArray(z, nKeyCol, PLogEst(pIndex^.aiRowLogEst), pIndex);
+    { Set hasStat1 (bit 7). }
+    pIndex^.idxFlags := pIndex^.idxFlags or u16($80);
+    if pIndex^.pPartIdxWhere = nil then
+    begin
+      pTable^.nRowLogEst := pIndex^.aiRowLogEst[0];
+      pTable^.tabFlags := pTable^.tabFlags or TF_HasStat1;
+    end;
+  end
+  else
+  begin
+    FillChar(fakeIdx, SizeOf(fakeIdx), 0);
+    fakeIdx.szIdxRow := pTable^.szTabRow;
+    decodeIntArray(z, 1, PLogEst(@pTable^.nRowLogEst), @fakeIdx);
+    pTable^.szTabRow := fakeIdx.szIdxRow;
+    pTable^.tabFlags := pTable^.tabFlags or TF_HasStat1;
+  end;
+end;
+
 { sqlite3AnalysisLoad — port of analyze.c:1942.
-  Clear any prior stat1 flags on every Table/Index in pSchema, and re-seed
-  default row estimates on indexes that lack stat1.  The sqlite_stat1
-  SELECT/loader arm (analysisLoader + decodeIntArray) is omitted: the
-  current build never produces a sqlite_stat1 row (sqlite3Analyze is still
-  a stub), so sqlite3FindTable("sqlite_stat1") would return nil and skip
-  the SELECT regardless.  Wired into vdbe.pas via the gAnalysisLoad hook
-  registered at unit-init below. }
+  Clear any prior stat1 flags on every Table/Index in pSchema, drive the
+  sqlite_stat1 SELECT through gStat1Exec when the table exists, then
+  re-seed default row estimates on indexes that still lack stat1.  Wired
+  into vdbe.pas via the gAnalysisLoad hook registered at unit-init. }
 function analysisLoadTrampoline(db: PTsqlite3; iDb: i32): i32;
 var
   pSchema:  passqlite3util.PSchema;
@@ -29815,6 +29939,8 @@ var
   pTab:     PTable2;
   pIdx:     PIndex2;
   pStat1:   PTable2;
+  sInfo:    TAnalysisInfo;
+  zSql:     PAnsiChar;
 begin
   Result := SQLITE_OK;
   if db = nil then Exit;
@@ -29842,13 +29968,26 @@ begin
     pElem := PHashElem(pElem^.next);
   end;
 
-  { If sqlite_stat1 exists, the C reference loads stats here.  decodeIntArray
-    + analysisLoader are not yet ported; sqlite3Analyze is itself a stub, so
-    no row is ever written and this arm is unreachable today.  Match the
-    "table not found" no-op path of analyze.c:1971..1982. }
+  { Load new statistics out of sqlite_stat1 (analyze.c:1968..1982).  The
+    table is gated on IsOrdinaryTable (eTabType = TABTYP_NORM).  zSql is
+    formatted via sqlite3MPrintf / %Q so the database name is escaped. }
   pStat1 := sqlite3FindTable(db, 'sqlite_stat1', db^.aDb[iDb].zDbSName);
-  { Use pStat1 only as a presence probe; loader is deferred. }
-  if pStat1 = nil then ;
+  if (pStat1 <> nil) and (pStat1^.eTabType = TABTYP_NORM)
+     and Assigned(gStat1Exec) then
+  begin
+    sInfo.db        := db;
+    sInfo.zDatabase := db^.aDb[iDb].zDbSName;
+    zSql := sqlite3MPrintf(db,
+                'SELECT tbl,idx,stat FROM %Q.sqlite_stat1',
+                [Pointer(db^.aDb[iDb].zDbSName)]);
+    if zSql = nil then
+      Result := SQLITE_NOMEM
+    else
+    begin
+      Result := gStat1Exec(db, zSql, @analysisLoader, @sInfo, nil);
+      sqlite3DbFree(db, zSql);
+    end;
+  end;
 
   { Seed default row estimates on every index that lacks stat1. }
   pElem := pSchema^.idxHash.first;
