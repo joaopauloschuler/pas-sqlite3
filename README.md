@@ -6,12 +6,11 @@ from C to **Free Pascal (FPC 3.2.2+)** targeting x86-64 Linux.
 > **Status: Phases 0–5 complete; Phase 6 in flight; Phases 7–8
 > largely landed.**  The Pascal port now opens databases, parses SQL,
 > generates VDBE bytecode, and runs queries end-to-end against its own
-> pager / B-tree / VDBE.  `TestExplainParity` reports **1016 / 1026** SQL
+> pager / B-tree / VDBE.  `TestExplainParity` reports **1024 / 1026** SQL
 > statements producing byte-identical VDBE bytecode versus the C reference,
-> with the remaining 10 divergences enumerated in `tasklist.md` (mostly
-> ORDER BY sorter, GROUP BY, multi-row VALUES, sub-FROM materialisation,
-> the autovacuum DROP TABLE follow-on, and the `INNER JOIN` aggregate
-> bloom-filter KeyInfo gap).  Differential probes (`DiagOps`, `DiagCast`,
+> with the remaining 2 divergences enumerated in `tasklist.md`
+> (sub-FROM materialisation and INSERT multi-row VALUES coroutine arm).
+> Differential probes (`DiagOps`, `DiagCast`,
 > `DiagDate`, `DiagFunctions`, `DiagMoreFunc`, `DiagFeatureProbe`, ...)
 > drive the remaining runtime gaps.
 

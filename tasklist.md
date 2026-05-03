@@ -64,12 +64,6 @@ FPC porting traps that recur often enough to call out up-front:
 > **2026-05-03 (a3):** TestExplainParity reports **1024 / 1026 PASS**.
 > Two corpus rows still diverge (see 6.10 step 6).
 
-Suggested order (driven by call-graph dependencies, not numbering): 6.8.0
-(independent) → 6.8.4 → 6.8.5 (Update needs a productive WHERE) → 6.8.2
-→ 6.8.3 (Update reuses both for the row-write path) → 6.8.1 last.
-Landing 6.8.1 before 6.8.2/6.8.3/6.8.4/6.8.5 just produces another
-skeleton.
-
 - [X] **6.8.0** Pragma (pragma.c): `sqlite3PragmaVtabRegister` — DONE.
      1:1 port of pragma.c:2791..3101 (aPragmaName, pragCName, all 12
      vtab callbacks, pragmaVtabModule).  Underlying PRAGMA codegen arms
