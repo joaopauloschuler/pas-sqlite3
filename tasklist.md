@@ -177,11 +177,20 @@ FPC porting traps that recur often enough to call out up-front:
        [ ] DISTINCT-aggregate variant (`count(DISTINCT x)` etc.) —
             uses the same sorter machinery.
 
-  [ ] **6.26** Window functions (window.c).
+  [~] **6.26** Window functions (window.c).
        Gate: DiagWindow — closes 6.10 step 17(c) (rank, dense_rank,
        lag, lead, first_value, ntile prepare-time failures) and step
        17(d) (`sum() OVER (...)`, `row_number() OVER (...)` empty
        result-set).
+       [X] Port `sqlite3WindowRewrite` (window.c:958) — full body at
+            codegen.pas, replacing the SF_WinRewrite-only stub.  Builds
+            the per-window subquery, sets up nBufferCol / iEphCsr /
+            iArgCol / regAccum / regResult, walks pSub with
+            sqlite3WindowExtraAggFuncDepth (also ported) to bump
+            outer-agg depths.  Companion callback
+            disallowAggregatesInOrderByCb ported.  Not yet productively
+            reachable — sqlite3Select still bails on `p^.pWin <> nil`
+            (codegen.pas ~22252); CodeInit/Step land next.
        [ ] Port `sqlite3WindowCodeInit` — opens the window
             ephemeral table, allocates partition / peer-group
             registers, emits the partition-boundary detection
@@ -376,9 +385,17 @@ FPC porting traps that recur often enough to call out up-front:
               previously-landed substExpr/substSelect, recomputeColumnsUsed,
               findLeftmostExprlist, compoundHasDifferentAffinities, and
               renumberCursors helpers.  All 28 restriction arms 1:1.
-              Not yet wired into sqlite3Select's FROM-loop — wiring is
-              the next step and will close the sub-FROM bytecode-Δ row
-              under 6.10 step 6.
+              Wiring trial (2026-05-03) confirmed the body runs and
+              returns 1 for `SELECT a FROM (SELECT a FROM t)`, but the
+              flattened pSrc[0].iCursor lands at 0 instead of C's 1 —
+              Pas's sqlite3SelectExpand does not recursively assign
+              cursors to inner subqueries the way C does, so the inner
+              table item carries iCursor=-1/0 at flatten time.
+              Wiring blocked on an iCursor reconciliation step
+              (probably: drive sqlite3SrcListAssignCursors on the
+              inner pSrc before the flatten copy, or post-copy re-bump
+              into a fresh nTab slot).  Once that's fixed, sub-FROM
+              bytecode-Δ row under 6.10 step 6 closes.
             - **6.13(b)-coagg**: agg-arm subquery dispatch landed for
               `count(*) / sum / min / max FROM (SELECT…)` and `… FROM v`
               via materialise + Rewind scan (codegen.pas:21088..).

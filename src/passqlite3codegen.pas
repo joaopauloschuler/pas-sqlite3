@@ -42664,20 +42664,209 @@ end;
 function aggInfoNoopExprCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
 begin Result := WRC_Continue; end;
 
+{ sqlite3WindowExtraAggFuncDepth — window.c:933.  When rewriting a query, if
+  the new subquery in the FROM clause contains TK_AGG_FUNCTION nodes that
+  refer to an outer query, increase the Expr->op2 values of those nodes due
+  to the extra subquery layer that was added. }
+function sqlite3WindowExtraAggFuncDepth(pWalker: PWalker;
+  pExpr: PExpr): i32; cdecl;
+begin
+  if (pExpr^.op = TK_AGG_FUNCTION)
+     and (pExpr^.op2 >= u8(pWalker^.walkerDepth)) then
+    pExpr^.op2 := pExpr^.op2 + 1;
+  Result := WRC_Continue;
+end;
+
+{ disallowAggregatesInOrderByCb — window.c:942.  Aggregates inside ORDER BY
+  on a non-aggregate window-bearing SELECT are illegal; emit a parse error. }
+function disallowAggregatesInOrderByCb(pWalker: PWalker;
+  pExpr: PExpr): i32; cdecl;
+begin
+  if (pExpr^.op = TK_AGG_FUNCTION) and (pExpr^.pAggInfo = nil) then
+  begin
+    Assert(not ExprHasProperty(pExpr, EP_IntValue));
+    sqlite3ErrorMsg(pWalker^.pParse,
+      sqlite3MPrintf(pWalker^.pParse^.db,
+        'misuse of aggregate: %s()', [pExpr^.u.zToken]));
+  end;
+  Result := WRC_Continue;
+end;
+
 // ---------------------------------------------------------------------------
 // sqlite3WindowRewrite — rewrite SELECT for window functions (window.c:958)
-// Full rewrite logic deferred to Phase 7+ (requires complete SELECT engine).
-// Marks SF_WinRewrite so the caller knows we processed it.
+// Productive port: builds the sub-SELECT subquery used for window-function
+// row buffering.  Inner sqlite3WindowCodeInit/Step still stubs at this gate.
 // ---------------------------------------------------------------------------
 function sqlite3WindowRewrite(pParse: PParse; p: PSelect): i32;
+var
+  rc:        i32;
+  v:         PVdbe;
+  db:        PTsqlite3;
+  pSub:      PSelect;
+  pSrc:      PSrcList;
+  pWhere:    PExpr;
+  pGroupBy:  PExprList;
+  pHaving:   PExpr;
+  pSort:     PExprList;
+  pSublist:  PExprList;
+  pMWin:     PWindow;
+  pWin:      PWindow;
+  pTab, pTab2: PTable2;
+  pItemFlat: PSrcItem;
+  w:         TWalker;
+  selFlagsSaved: u32;
+  nSave:     i32;
+  pArgs:     PExprList;
+  pFilter:   PExpr;
+  srcNew:    PSrcList;
 begin
-  Result := SQLITE_OK;
-  if p = nil then Exit;
-  if (p^.pWin = nil) or (p^.pPrior <> nil) or
-     ((p^.selFlags and SF_WinRewrite) <> 0) then Exit;
-  { Mark as rewritten to avoid infinite re-entry; full implementation
-    deferred to Phase 7 when the Lemon parser and full SELECT engine exist. }
+  rc := SQLITE_OK;
+  if p = nil then begin Result := SQLITE_OK; Exit; end;
+  if (p^.pWin = nil) or (p^.pPrior <> nil)
+     or ((p^.selFlags and SF_WinRewrite) <> 0) then
+  begin Result := SQLITE_OK; Exit; end;
+
+  v        := sqlite3GetVdbe(pParse);
+  db       := pParse^.db;
+  pSub     := nil;
+  pSrc     := p^.pSrc;
+  pWhere   := p^.pWhere;
+  pGroupBy := p^.pGroupBy;
+  pHaving  := p^.pHaving;
+  pSort    := nil;
+  pSublist := nil;
+  pMWin    := p^.pWin;
+
+  selFlagsSaved := p^.selFlags;
+
+  pTab := PTable2(sqlite3DbMallocZero(db, u64(SizeOf(TTable))));
+  if pTab = nil then
+  begin Result := sqlite3ErrorToParser(db, SQLITE_NOMEM); Exit; end;
+
+  sqlite3AggInfoPersistWalkerInit(@w, pParse);
+  sqlite3WalkSelect(@w, p);
+  if (p^.selFlags and SF_Aggregate) = 0 then
+  begin
+    w.xExprCallback   := @disallowAggregatesInOrderByCb;
+    w.xSelectCallback := nil;
+    sqlite3WalkExprList(@w, p^.pOrderBy);
+  end;
+
+  p^.pSrc     := nil;
+  p^.pWhere   := nil;
+  p^.pGroupBy := nil;
+  p^.pHaving  := nil;
+  p^.selFlags := p^.selFlags and (not u32(SF_Aggregate));
   p^.selFlags := p^.selFlags or SF_WinRewrite;
+
+  { Build ORDER BY for sub-select = PARTITION BY ++ ORDER BY of main window. }
+  pSort := exprListAppendList(pParse, nil, pMWin^.pPartition, 1);
+  pSort := exprListAppendList(pParse, pSort, pMWin^.pOrderBy,  1);
+  if (pSort <> nil) and (p^.pOrderBy <> nil)
+     and (p^.pOrderBy^.nExpr <= pSort^.nExpr) then
+  begin
+    nSave := pSort^.nExpr;
+    pSort^.nExpr := p^.pOrderBy^.nExpr;
+    if sqlite3ExprListCompare(pSort, p^.pOrderBy, -1) = 0 then
+    begin
+      sqlite3ExprListDelete(db, p^.pOrderBy);
+      p^.pOrderBy := nil;
+    end;
+    pSort^.nExpr := nSave;
+  end;
+
+  { Cursor numbers for the ephemeral row-buffer table.  OpenEphemeral lands
+    later in sqlite3WindowCodeInit when nBufferCol is known. }
+  pMWin^.iEphCsr := pParse^.nTab;
+  Inc(pParse^.nTab, 4);
+
+  selectWindowRewriteEList(pParse, pMWin, pSrc, p^.pEList,   pTab, pSublist);
+  selectWindowRewriteEList(pParse, pMWin, pSrc, p^.pOrderBy, pTab, pSublist);
+  if pSublist <> nil then
+    pMWin^.nBufferCol := pSublist^.nExpr
+  else
+    pMWin^.nBufferCol := 0;
+
+  { Append PARTITION / ORDER BY to the sub-select expression list — needed
+    for partition-boundary and peer-row detection at run time. }
+  pSublist := exprListAppendList(pParse, pSublist, pMWin^.pPartition, 0);
+  pSublist := exprListAppendList(pParse, pSublist, pMWin^.pOrderBy,   0);
+
+  { Per-window-function args + accumulator/result registers + Null init. }
+  pWin := pMWin;
+  while pWin <> nil do
+  begin
+    Assert((pWin^.pOwner <> nil) and (pWin^.pWFunc <> nil));
+    pArgs := pWin^.pOwner^.x.pList;
+    if (PTFuncDef(pWin^.pWFunc)^.funcFlags and SQLITE_SUBTYPE) <> 0 then
+    begin
+      selectWindowRewriteEList(pParse, pMWin, pSrc, pArgs, pTab, pSublist);
+      if pSublist <> nil then pWin^.iArgCol := pSublist^.nExpr
+                         else pWin^.iArgCol := 0;
+      pWin^.bExprArgs := 1;
+    end
+    else
+    begin
+      if pSublist <> nil then pWin^.iArgCol := pSublist^.nExpr
+                         else pWin^.iArgCol := 0;
+      pSublist := exprListAppendList(pParse, pSublist, pArgs, 0);
+    end;
+    if pWin^.pFilter <> nil then
+    begin
+      pFilter := sqlite3ExprDup(db, pWin^.pFilter, 0);
+      pSublist := sqlite3ExprListAppend(pParse, pSublist, pFilter);
+    end;
+    Inc(pParse^.nMem); pWin^.regAccum  := pParse^.nMem;
+    Inc(pParse^.nMem); pWin^.regResult := pParse^.nMem;
+    if v <> nil then
+      sqlite3VdbeAddOp2(v, OP_Null, 0, pWin^.regAccum);
+    pWin := pWin^.pNextWin;
+  end;
+
+  { Empty pSublist guard — keep at least one column (constant 0). }
+  if pSublist = nil then
+    pSublist := sqlite3ExprListAppend(pParse, nil, sqlite3ExprInt32(db, 0));
+
+  pSub := sqlite3SelectNew(pParse, pSublist, pSrc, pWhere, pGroupBy, pHaving,
+                           pSort, 0, nil);
+  srcNew := sqlite3SrcListAppend(pParse, nil, nil, nil);
+  p^.pSrc := srcNew;
+  Assert((pSub <> nil) or (p^.pSrc = nil));
+  if p^.pSrc = nil then
+    sqlite3SelectDelete(db, pSub)
+  else
+  begin
+    pItemFlat := @SrcListItems(p^.pSrc)[0];
+    if sqlite3SrcItemAttachSubquery(pParse, pItemFlat, pSub, 0) <> 0 then
+    begin
+      pItemFlat^.fg.fgBits3 := pItemFlat^.fg.fgBits3 or u8($02); { isCorrelated }
+      sqlite3SrcListAssignCursors(pParse, p^.pSrc);
+      pSub^.selFlags := pSub^.selFlags or SF_Expanded or SF_OrderByReqd;
+      pTab2 := sqlite3ResultSetOfSelect(pParse, pSub, AnsiChar(SQLITE_AFF_NONE));
+      pSub^.selFlags := pSub^.selFlags or (selFlagsSaved and SF_Aggregate);
+      if pTab2 = nil then
+        rc := SQLITE_NOMEM
+      else
+      begin
+        Move(pTab2^, pTab^, SizeOf(TTable));
+        pTab^.tabFlags := pTab^.tabFlags or TF_Ephemeral;
+        pItemFlat^.pSTab := pTab;
+        pTab := pTab2;
+        FillChar(w, SizeOf(w), 0);
+        w.xExprCallback    := @sqlite3WindowExtraAggFuncDepth;
+        w.xSelectCallback  := @sqlite3WalkerDepthIncrease;
+        w.xSelectCallback2 := @sqlite3WalkerDepthDecrease;
+        sqlite3WalkSelect(@w, pSub);
+      end;
+    end;
+  end;
+  if db^.mallocFailed <> 0 then rc := SQLITE_NOMEM;
+
+  { Defer pTab cleanup — references may remain in p's result-set / ORDER BY. }
+  sqlite3ParserAddCleanup(pParse, TParseCleanupFn(@sqlite3DbFree), pTab);
+
+  Assert((rc = SQLITE_OK) or (pParse^.nErr <> 0));
+  Result := rc;
 end;
 
 // ---------------------------------------------------------------------------
