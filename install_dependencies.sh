@@ -48,7 +48,7 @@ then
     echo "unzip could not be found, installing..."
     sudo apt install -y unzip
 else
-    echo "wget is already installed"
+    echo "unzip is already installed"
 fi
 
 # ---- fpc ----
