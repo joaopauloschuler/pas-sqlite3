@@ -15163,6 +15163,24 @@ begin
     directly by the caller, with residuals interleaved. }
   if (pWInfo^.wctrlFlags and WHERE_OR_SUBCLAUSE) = 0 then
   begin
+    { Phase 6.10 step 6 — defer to the cost-based planner when the table has
+      a non-partial index whose key is narrower than the table.  Lets a
+      no-WHERE `SELECT col FROM tab` pick a covering index scan
+      (e.g. the autoindex on `u(p PRIMARY KEY)`), matching the C reference's
+      whereLoopAddBtree path 2 selection.  Without this, the synthetic
+      table-scan stand-in below would short-circuit the planner and pin the
+      plan to an OP_OpenRead on the heap, diverging from the C oracle. }
+    if pWC^.nTerm = 0 then
+    begin
+      pIdx := pTab^.pIndex;
+      while pIdx <> nil do
+      begin
+        if (pIdx^.pPartIdxWhere = nil)
+           and (pIdx^.nKeyCol < pTab^.nCol) then
+          Exit(0);
+        pIdx := pIdx^.pNext;
+      end;
+    end;
     pLoop^.wsFlags := 0; { plain scan — no IPK/INDEX/ONEROW hints }
     pLoop^.nLTerm := 0;
     pLoop^.u.btree.nEq := 0;
@@ -28388,19 +28406,36 @@ begin
 end;
 
 procedure sqlite3DefaultRowEst(pIdx: PIndex2);
+{ Port of build.c:4551 sqlite3DefaultRowEst.
+  Seeds aiRowLogEst[] with default LogEst values for an index lacking
+  sqlite_stat1 data.  a[0] tracks the table's nRowLogEst (clamped to >= 99
+  if any stat1 partial data is present, mirrored here unconditionally so
+  the planner cannot pick "no stat1" indexes over real-stat ones).  a[1..5]
+  follow the canonical aVal table (33,32,30,28,26 → LogEst of 10,9,8,7,6
+  duplicates per leading-key prefix); subsequent entries default to LogEst(5).
+  Partial-index a[0] is decremented by 10 (LogEst(2) discount). }
+const
+  aVal: array[0..4] of i16 = (33, 32, 30, 28, 26);
 var
   aRowEst: PLogEst;
-  i: i32;
+  i, nCopy: i32;
+  x: i16;
 begin
-  { Assign default LogEst row estimates for new index }
   aRowEst := pIdx^.aiRowLogEst;
   if aRowEst = nil then Exit;
-  aRowEst[0] := 210;
-  i := 1;
-  while i <= pIdx^.nColumn do begin
-    aRowEst[i] := 33;
-    Inc(i);
+  x := pIdx^.pTable^.nRowLogEst;
+  if x < 99 then begin
+    pIdx^.pTable^.nRowLogEst := 99;
+    x := 99;
   end;
+  if pIdx^.pPartIdxWhere <> nil then Dec(x, 10);
+  aRowEst[0] := x;
+  nCopy := pIdx^.nKeyCol;
+  if nCopy > 5 then nCopy := 5;
+  for i := 0 to nCopy - 1 do
+    aRowEst[i + 1] := aVal[i];
+  for i := nCopy + 1 to pIdx^.nKeyCol do
+    aRowEst[i] := 23;
 end;
 
 { sqlite3AnalysisLoad — port of analyze.c:1942.
@@ -29702,6 +29737,10 @@ var
   iCol:    i32;
   pColEW:  PColumn;
   bAsSelect: i32;
+  pIdxEW:  PIndex2;
+  wIndex:  u32;
+  iC:      i32;
+  xIC:     i16;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -29836,6 +29875,24 @@ begin
     end;
     if pTab^.iPKey < 0 then Inc(wTable);
     pTab^.szTabRow := sqlite3LogEst(u64(wTable) * 4);
+
+    { Per-index width — port of estimateIndexWidth (build.c:2236).
+      Walks pIdx->pNext chain populated by sqlite3AddPrimaryKey /
+      sqlite3CreateIndex.  Required by whereLoopAddBtree's covering-scan
+      cost arm (codegen.pas:13057 — `rSize+1+15*szIdxRow/szTabRow`).
+      Without this, autoindexes carry szIdxRow=0 and the planner under-
+      counts their full-scan cost vs the C oracle's EXPLAIN p3. }
+    pIdxEW := pTab^.pIndex;
+    while pIdxEW <> nil do begin
+      wIndex := 0;
+      for iC := 0 to pIdxEW^.nColumn - 1 do begin
+        xIC := pIdxEW^.aiColumn[iC];
+        if xIC < 0 then Inc(wIndex, 1)
+        else Inc(wIndex, pTab^.aCol[xIC].szEst);
+      end;
+      pIdxEW^.szIdxRow := sqlite3LogEst(u64(wIndex) * 4);
+      pIdxEW := pIdxEW^.pNext;
+    end;
   end;
 
   { Emit the schema-write epilogue when not parsing the schema-cache itself. }

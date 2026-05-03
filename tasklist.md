@@ -30,6 +30,14 @@ Important: At the end of this document, please find:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
+> **2026-05-03 (a3):** TestExplainParity now reports **1024 / 1026 PASS**.
+> Closed `SELECT IPK alias u`: ported `estimateIndexWidth` so autoindex
+> rows carry the right `szIdxRow`, ported the canonical
+> `sqlite3DefaultRowEst` (a[0] tracks `pTable->nRowLogEst`, not the
+> hard-coded 210), and let the no-WHERE single-table case in
+> `whereShortCut` fall through to the cost-based planner when a
+> non-partial covering index exists.
+
 Suggested order (driven by call-graph dependencies, not numbering): 6.8.0
 (independent) → 6.8.4 → 6.8.5 (Update needs a productive WHERE) → 6.8.2
 → 6.8.3 (Update reuses both for the row-write path) → 6.8.1 last.
@@ -204,11 +212,11 @@ skeleton.
 
 ### Open Bugs
 
-- [ ] **6.10** `TestExplainParity.pas` — 1023/1026 PASS as currently
-    measured (2026-05-02).  Oracle is built with `-DSQLITE_DEBUG
+- [ ] **6.10** `TestExplainParity.pas` — 1024/1026 PASS as currently
+    measured (2026-05-03).  Oracle is built with `-DSQLITE_DEBUG
     -DSQLITE_ENABLE_EXPLAIN_COMMENTS`, so emits OP_Explain /
     OP_ReleaseReg (vdbeaux.c gates them under `#if !defined(SQLITE_DEBUG)`);
-    Pas matches.  Only 3 corpus rows still diverge.
+    Pas matches.  Only 2 corpus rows still diverge.
     - [ ] **6.10 step 6** Remaining TestExplainParity bytecode-Δ rows:
         [ ] `SELECT a FROM (SELECT a FROM t)` — Pas emits the co-routine
           path; C flattens via `flattenSubquery`.  Closes once
@@ -216,9 +224,14 @@ skeleton.
         [ ] `INSERT multi-row VALUES` — Runtime parity reached; bytecode
           parity needs the coroutine arm of sqlite3MultiValues
           (deferred — runtime is correct).
-        [ ] `SELECT p FROM u;` — `whereLoopAddBtree`/`bestIndex` cost
-          model does not yet pick a covering autoindex when there is no
-          WHERE clause; Pas emits a table scan, C emits autoindex.
+        [X] `SELECT p FROM u;` — DONE (2026-05-03).  Ported
+          `estimateIndexWidth` (build.c:2236) so autoindex rows carry
+          a non-zero szIdxRow, replaced the hard-coded `210` in
+          `sqlite3DefaultRowEst` with the C reference's `pTable
+          ->nRowLogEst` lookup (build.c:4551), and lifted the
+          synthetic table-scan stand-in in `whereShortCut` for the
+          no-WHERE-non-partial-index case so the cost-based planner
+          can pick the covering autoindex.
   
   [ ] **6.10 step 7** Runtime divergences surfaced by `DiagMisc`.
       Silent result-set bugs (prep+step clean, wrong value).
