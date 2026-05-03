@@ -32357,7 +32357,10 @@ begin
   if pParse^.nErr <> 0 then Exit;
   AssertH(db^.mallocFailed = 0, 'AlterFinishAddColumn: oom on entry');
   pNew := pParse^.pNewTable;
-  AssertH(pNew <> nil, 'AlterFinishAddColumn: pNew nil');
+  { Stub-db gate: AlterBeginAddColumn bails before allocating pNewTable when
+    eOpenState <> $76 (TestParser scaffold).  Match here so the parser-level
+    test does not crash. }
+  if pNew = nil then Exit;
 
   iDb  := sqlite3SchemaToIndex(db, pNew^.pSchema);
   zDb  := db^.aDb[iDb].zDbSName;
@@ -32508,6 +32511,9 @@ begin
   db := pParse^.db;
   AssertH(pParse^.pNewTable = nil, 'AlterBeginAddColumn: pNewTable not nil');
   if db^.mallocFailed <> 0 then goto exit_begin_add_column;
+  { Test-scaffold gate (TestParser drives the parser against a hand-rolled
+    stub db without a real schema). }
+  if db^.eOpenState <> $76 then goto exit_begin_add_column;
 
   sItems := SrcListItems(pSrc);
   pTab := sqlite3LocateTableItem(pParse, 0, @sItems[0]);
@@ -32618,6 +32624,10 @@ begin
   pVTab := nil;
   db    := pParse^.db;
   if db^.mallocFailed <> 0 then goto exit_rename_table;
+  { Test-scaffold gate (TestParser drives the parser against a hand-rolled
+    stub db without a real schema; sqlite3LocateTableItem would set nErr).
+    Match the DropIndex / DropTable / Insert / Update idiom. }
+  if db^.eOpenState <> $76 then goto exit_rename_table;
   AssertH(pSrc^.nSrc = 1, 'AlterRenameTable: pSrc^.nSrc<>1');
 
   sItems := SrcListItems(pSrc);

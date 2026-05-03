@@ -370,10 +370,13 @@ skeleton.
             bytecode).
 
 - [~] **7.1.9** ALTER TABLE (alter.c).  All five codegen entry points
-       are ported 1:1; end-to-end runtime parity is still gated on the
-       sqlite_rename_* SQL helpers (no bodies ported) and on Phase 7.1.1
-       (sqlite3InitOne — the schema reload after the NestedParse'd
-       UPDATE sqlite_master sub-statements is a no-op without it).
+       are ported 1:1 and stub-db-tolerant (TestParser ALTER TABLE rows
+       now PASS — gated on `eOpenState <> $76` matching the
+       Insert/Update/DropIndex idiom).  End-to-end runtime parity is
+       still gated on the sqlite_rename_* SQL helpers (no bodies ported)
+       and on Phase 7.1.1 (sqlite3InitOne — the schema reload after the
+       NestedParse'd UPDATE sqlite_master sub-statements is a no-op
+       without it).
        [X] Port `sqlite3RenameTokenRemap`.
        [X] Port `sqlite3RenameExprlistUnmap`.
        [X] Port `sqlite3AlterRenameTable` (codegen.pas:32527).
