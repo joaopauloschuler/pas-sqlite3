@@ -371,14 +371,14 @@ FPC porting traps that recur often enough to call out up-front:
             simple `SELECT a FROM (SELECT a FROM t)` returns live rows.
             Bytecode shape diverges from C (subquery flattening).
             Open follow-ups:
-            - **6.13(b)-fl**: port `flattenSubquery` (select.c, ~600
-              lines).  Closes the flattenable agg-on-subquery case
-              with bytecode parity.  Prereqs landed at codegen.pas:
-              `SubstContext` typedef, `substExpr` / `substExprList` /
-              `substSelect` (select.c:3761..3933), `recomputeColumnsUsed`
-              (select.c:3953..3965), `findLeftmostExprlist`
-              (select.c:4072..4077), `compoundHasDifferentAffinities`
-              (select.c:4083..4101).
+            - **6.13(b)-fl**: `flattenSubquery` body ported
+              (select.c:4281..4712) at codegen.pas, using the
+              previously-landed substExpr/substSelect, recomputeColumnsUsed,
+              findLeftmostExprlist, compoundHasDifferentAffinities, and
+              renumberCursors helpers.  All 28 restriction arms 1:1.
+              Not yet wired into sqlite3Select's FROM-loop — wiring is
+              the next step and will close the sub-FROM bytecode-Δ row
+              under 6.10 step 6.
             - **6.13(b)-coagg**: agg-arm subquery dispatch landed for
               `count(*) / sum / min / max FROM (SELECT…)` and `… FROM v`
               via materialise + Rewind scan (codegen.pas:21088..).

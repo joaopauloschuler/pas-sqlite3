@@ -9028,6 +9028,365 @@ begin
   Result := 0;
 end;
 
+{ ----------------------------------------------------------------------------
+  flattenSubquery — port of select.c:4281..4712 (SQLite 3.53.0).
+  Attempt to flatten subquery pSrc->a[iFrom] of the outer SELECT p into
+  the outer FROM clause itself, eliminating the materialise step.
+  Returns 1 on success, 0 if any of restrictions (1)..(28) blocks the
+  rewrite.  Companion helpers (substExpr/substSelect, renumberCursors,
+  recomputeColumnsUsed, findLeftmostExprlist, compoundHasDifferentAffinities)
+  ported above.
+  ---------------------------------------------------------------------------- }
+procedure sqlite3AggInfoPersistWalkerInit(pWalker: PWalker; pParse: PParse); forward;
+
+function flattenSubquery(pParse: PParse; p: PSelect;
+                        iFrom: i32; isAgg: i32): i32;
+const
+  SQLITE_FlttnUnionAll = u32($00800000);  { sqliteInt.h:1924 }
+  SQLITE_AUTH_SELECT   = 21;              { sqlite3.h auth-action code for SELECT }
+var
+  zSavedAuthContext: PAnsiChar;
+  pParent:           PSelect;   { current UNION ALL term of the outer query }
+  pSub:              PSelect;   { the inner query (subquery) }
+  pSub1:             PSelect;   { rightmost select in sub-query }
+  pSrc, pSubSrc:     PSrcList;
+  iParent:           i32;
+  iNewParent:        i32;
+  isOuterJoin:       i32;
+  i, ii:             i32;
+  pWhere:            PExpr;
+  pSubitem:          PSrcItem;
+  db:                PTsqlite3;
+  w:                 TWalker;
+  aCsrMap:           Pi32;
+  pNew, pPriorSel:   PSelect;
+  pOrderBy:          PExprList;
+  pLimit:            PExpr;
+  pPrior2:           PSelect;
+  pItemTab:          PTable2;
+  pTabToDel:         PTable2;
+  pToplevel:         PParse;
+  pSrcItems:         PSrcItem;
+  pSubItems:         PSrcItem;
+  pItem:             PSrcItem;
+  nSubSrc:           i32;
+  jointype:          u8;
+  pOrderBy2:         PExprList;
+  pListItems:        PExprListItem;
+  x:                 TSubstContext;
+begin
+  iNewParent := -1;
+  isOuterJoin := 0;
+  aCsrMap := nil;
+  pSub1 := nil;
+  zSavedAuthContext := pParse^.zAuthContext;
+
+  { Check to see if flattening is permitted. }
+  Assert(p <> nil);
+  Assert(p^.pPrior = nil);
+  db := pParse^.db;
+  if (db^.dbOptFlags and SQLITE_QueryFlattener) <> 0 then
+  begin Result := 0; Exit; end;
+  pSrc := p^.pSrc;
+  Assert((pSrc <> nil) and (iFrom >= 0) and (iFrom < pSrc^.nSrc));
+  pSrcItems := SrcListItems(pSrc);
+  pSubitem := @pSrcItems[iFrom];
+  iParent := pSubitem^.iCursor;
+  Assert(SrcItemIsSubquery(pSubitem^.fg));
+  pSub := pSubitem^.u4.pSubq^.pSelect;
+  Assert(pSub <> nil);
+
+  { Restriction (25): window functions in either query block flattening. }
+  if (p^.pWin <> nil) or (pSub^.pWin <> nil) then
+  begin Result := 0; Exit; end;
+
+  pSubSrc := pSub^.pSrc;
+  Assert(pSubSrc <> nil);
+
+  if (pSub^.pLimit <> nil) and (p^.pLimit <> nil) then
+  begin Result := 0; Exit; end;                        { Restriction (13) }
+  if (pSub^.pLimit <> nil) and (pSub^.pLimit^.pRight <> nil) then
+  begin Result := 0; Exit; end;                        { Restriction (14) }
+  if ((p^.selFlags and SF_Compound) <> 0) and (pSub^.pLimit <> nil) then
+  begin Result := 0; Exit; end;                        { Restriction (15) }
+  if pSubSrc^.nSrc = 0 then
+  begin Result := 0; Exit; end;                        { Restriction (7)  }
+  if (pSub^.selFlags and SF_Distinct) <> 0 then
+  begin Result := 0; Exit; end;                        { Restriction (4)  }
+  if (pSub^.pLimit <> nil) and ((pSrc^.nSrc > 1) or (isAgg <> 0)) then
+  begin Result := 0; Exit; end;                        { Restrictions (8)(9) }
+  if (p^.pOrderBy <> nil) and (pSub^.pOrderBy <> nil) then
+  begin Result := 0; Exit; end;                        { Restriction (11) }
+  if (isAgg <> 0) and (pSub^.pOrderBy <> nil) then
+  begin Result := 0; Exit; end;                        { Restriction (16) }
+  if (pSub^.pLimit <> nil) and (p^.pWhere <> nil) then
+  begin Result := 0; Exit; end;                        { Restriction (19) }
+  if (pSub^.pLimit <> nil)
+     and ((p^.selFlags and SF_Distinct) <> 0) then
+  begin Result := 0; Exit; end;                        { Restriction (21) }
+  if (pSub^.selFlags and SF_Recursive) <> 0 then
+  begin Result := 0; Exit; end;                        { Restriction (22) }
+
+  pSubItems := SrcListItems(pSubSrc);
+
+  { Restrictions (3a), (3d), (26): if the subquery is the right operand of a
+    LEFT JOIN, the subquery may not itself be a join, etc. }
+  if (pSubitem^.fg.jointype and (JT_OUTER or JT_LTORJ)) <> 0 then
+  begin
+    if (pSubSrc^.nSrc > 1)                              { (3a) }
+       or ((p^.selFlags and SF_Distinct) <> 0)          { (3d) }
+       or ((pSubitem^.fg.jointype and JT_RIGHT) <> 0)   { (26) }
+    then
+    begin Result := 0; Exit; end;
+    isOuterJoin := 1;
+  end;
+
+  Assert(pSubSrc^.nSrc > 0);
+  if (iFrom > 0) and ((pSubItems[0].fg.jointype and JT_LTORJ) <> 0) then
+  begin Result := 0; Exit; end;                         { Restriction (27a) }
+
+  { Condition (28) is blocked by the caller. }
+
+  { Restriction (17): if the sub-query is a compound SELECT, then it must use
+    only the UNION ALL operator, and none of the simple selects may be
+    aggregate or distinct. }
+  if pSub^.pPrior <> nil then
+  begin
+    if pSub^.pOrderBy <> nil then
+    begin Result := 0; Exit; end;                       { Restriction (20) }
+    if (isAgg <> 0)
+       or ((p^.selFlags and SF_Distinct) <> 0)
+       or (isOuterJoin > 0) then
+    begin Result := 0; Exit; end;                       { (17d1)/(17d2)/(17f) }
+    pSub1 := pSub;
+    while pSub1 <> nil do
+    begin
+      Assert(pSub^.pSrc <> nil);
+      Assert((pSub^.selFlags and SF_Recursive) = 0);
+      Assert(pSub^.pEList^.nExpr = pSub1^.pEList^.nExpr);
+      if ((pSub1^.selFlags and (SF_Distinct or SF_Aggregate)) <> 0)  { (17b) }
+         or ((pSub1^.pPrior <> nil) and (pSub1^.op <> TK_ALL))       { (17a) }
+         or (pSub1^.pSrc^.nSrc < 1)                                  { (17c) }
+         or (pSub1^.pWin <> nil)                                     { (17e) }
+      then
+      begin Result := 0; Exit; end;
+      if (iFrom > 0)
+         and ((SrcListItems(pSub1^.pSrc)[0].fg.jointype and JT_LTORJ) <> 0)
+      then
+      begin Result := 0; Exit; end;                     { (17g)/(27b) }
+      pSub1 := pSub1^.pPrior;
+    end;
+
+    { Restriction (18). }
+    if p^.pOrderBy <> nil then
+    begin
+      pListItems := ExprListItems(p^.pOrderBy);
+      for ii := 0 to p^.pOrderBy^.nExpr - 1 do
+        if pListItems[ii].u.x.iOrderByCol = 0 then
+        begin Result := 0; Exit; end;
+    end;
+
+    { Restriction (23). }
+    if (p^.selFlags and SF_Recursive) <> 0 then
+    begin Result := 0; Exit; end;
+
+    { Restriction (17h). }
+    if compoundHasDifferentAffinities(pSub) <> 0 then
+    begin Result := 0; Exit; end;
+
+    if pSrc^.nSrc > 1 then
+    begin
+      if pParse^.nSelect > 500 then
+      begin Result := 0; Exit; end;
+      if (db^.dbOptFlags and SQLITE_FlttnUnionAll) <> 0 then
+      begin Result := 0; Exit; end;
+      aCsrMap := Pi32(sqlite3DbMallocZero(db,
+        u64(pParse^.nTab + 1) * SizeOf(i32)));
+      if aCsrMap <> nil then aCsrMap[0] := pParse^.nTab;
+    end;
+  end;
+
+  { ***** If we reach this point, flattening is permitted. ***** }
+
+  { Authorize the subquery. }
+  pParse^.zAuthContext := pSubitem^.zName;
+  sqlite3AuthCheck(pParse, SQLITE_AUTH_SELECT, nil, nil, nil);
+  pParse^.zAuthContext := zSavedAuthContext;
+
+  { Detach transient subquery structures. }
+  if SrcItemIsSubquery(pSubitem^.fg) then
+    pSub1 := sqlite3SubqueryDetach(db, pSubitem)
+  else
+    pSub1 := nil;
+  Assert(not SrcItemIsSubquery(pSubitem^.fg));
+  Assert((pSubitem^.fg.fgBits3 and $01) = 0);
+  sqlite3DbFree(db, pSubitem^.zName);
+  sqlite3DbFree(db, pSubitem^.zAlias);
+  pSubitem^.zName := nil;
+  pSubitem^.zAlias := nil;
+
+  { Compound-subquery flattening: clone the parent for each prior arm of
+    the inner UNION ALL, building a new compound out of the parent. }
+  pSub := pSub^.pPrior;
+  while pSub <> nil do
+  begin
+    pOrderBy := p^.pOrderBy;
+    pLimit   := p^.pLimit;
+    pPrior2  := p^.pPrior;
+    pItemTab := pSubitem^.pSTab;
+    pSubitem^.pSTab := nil;
+    p^.pOrderBy := nil;
+    p^.pPrior   := nil;
+    p^.pLimit   := nil;
+    pNew := sqlite3SelectDup(db, p, 0);
+    p^.pLimit   := pLimit;
+    p^.pOrderBy := pOrderBy;
+    p^.op       := TK_ALL;
+    pSubitem^.pSTab := pItemTab;
+    if pNew = nil then
+      p^.pPrior := pPrior2
+    else
+    begin
+      Inc(pParse^.nSelect);
+      pNew^.selId := pParse^.nSelect;
+      if (aCsrMap <> nil) and (db^.mallocFailed = 0) then
+        renumberCursors(pParse, pNew, iFrom, aCsrMap);
+      pNew^.pPrior := pPrior2;
+      if pPrior2 <> nil then pPrior2^.pNext := pNew;
+      pNew^.pNext := p;
+      p^.pPrior := pNew;
+    end;
+    Assert(not SrcItemIsSubquery(pSubitem^.fg));
+    pSub := pSub^.pPrior;
+  end;
+  if aCsrMap <> nil then sqlite3DbFree(db, aCsrMap);
+  if db^.mallocFailed <> 0 then
+  begin
+    Assert((pSubitem^.fg.fgBits3 and $01) = 0);
+    Assert(not SrcItemIsSubquery(pSubitem^.fg));
+    Assert(pSubitem^.u4.zDatabase = nil);
+    sqlite3SrcItemAttachSubquery(pParse, pSubitem, pSub1, 0);
+    Result := 1;
+    Exit;
+  end;
+
+  { Defer deleting the Table associated with the subquery. }
+  if pSubitem^.pSTab <> nil then
+  begin
+    pTabToDel := pSubitem^.pSTab;
+    if pTabToDel^.nTabRef = 1 then
+    begin
+      pToplevel := sqlite3ParseToplevel(pParse);
+      sqlite3ParserAddCleanup(pToplevel, @sqlite3DeleteTableGeneric, pTabToDel);
+    end
+    else
+      Dec(pTabToDel^.nTabRef);
+    pSubitem^.pSTab := nil;
+  end;
+
+  { Loop runs once per term of compound-subquery flattening (or once for a
+    plain non-compound flatten).  Moves all FROM elements of pSub into
+    pParent's FROM clause, then substitutes references to iParent. }
+  pSub := pSub1;
+  pParent := p;
+  while pParent <> nil do
+  begin
+    Assert(pSub <> nil);
+    pSubSrc := pSub^.pSrc;
+    nSubSrc := pSubSrc^.nSrc;
+    pSrc := pParent^.pSrc;
+    pSrcItems := SrcListItems(pSrc);
+    pSubitem := @pSrcItems[iFrom];
+    jointype := pSubitem^.fg.jointype;
+
+    if nSubSrc > 1 then
+    begin
+      pSrc := sqlite3SrcListEnlarge(pParse, pSrc, nSubSrc - 1, iFrom + 1);
+      if pSrc = nil then break;
+      pParent^.pSrc := pSrc;
+      pSrcItems := SrcListItems(pSrc);
+      pSubitem := @pSrcItems[iFrom];
+    end;
+
+    { Transfer the FROM clause terms from the subquery into the outer. }
+    pSubItems := SrcListItems(pSubSrc);
+    iNewParent := pSubItems[0].iCursor;
+    for i := 0 to nSubSrc - 1 do
+    begin
+      pItem := @pSrcItems[i + iFrom];
+      if (pItem^.fg.fgBits2 and u8($08)) <> 0 then  { isUsing }
+        sqlite3IdListDelete(db, pItem^.u3.pUsing);
+      pItem^ := pSubItems[i];
+      pItem^.fg.jointype := pItem^.fg.jointype or (jointype and JT_LTORJ);
+      FillChar(pSubItems[i], SizeOf(TSrcItem), 0);
+    end;
+    pSubitem^.fg.jointype := pSubitem^.fg.jointype or jointype;
+
+    { Substitute subquery result-set expressions for references to iParent. }
+    if pSub^.pOrderBy <> nil then
+    begin
+      pOrderBy2 := pSub^.pOrderBy;
+      pListItems := ExprListItems(pOrderBy2);
+      for i := 0 to pOrderBy2^.nExpr - 1 do
+        pListItems[i].u.x.iOrderByCol := 0;
+      Assert(pParent^.pOrderBy = nil);
+      pParent^.pOrderBy := pOrderBy2;
+      pSub^.pOrderBy := nil;
+    end;
+    pWhere := pSub^.pWhere;
+    pSub^.pWhere := nil;
+    if isOuterJoin > 0 then
+    begin
+      Assert(pSubSrc^.nSrc = 1);
+      sqlite3SetJoinExpr(pWhere, iNewParent, EP_OuterON);
+    end;
+    if pWhere <> nil then
+    begin
+      if pParent^.pWhere <> nil then
+        pParent^.pWhere := sqlite3PExpr(pParse, TK_AND,
+          pWhere, pParent^.pWhere)
+      else
+        pParent^.pWhere := pWhere;
+    end;
+    if db^.mallocFailed = 0 then
+    begin
+      x.pParse      := pParse;
+      x.iTable      := iParent;
+      x.iNewTable   := iNewParent;
+      x.isOuterJoin := isOuterJoin;
+      x.nSelDepth   := 0;
+      x.pEList      := pSub^.pEList;
+      x.pCList      := findLeftmostExprlist(pSub);
+      substSelect(@x, pParent, 0);
+    end;
+
+    pParent^.selFlags := pParent^.selFlags or
+      (pSub^.selFlags and SF_Compound);
+
+    if pSub^.pLimit <> nil then
+    begin
+      pParent^.pLimit := pSub^.pLimit;
+      pSub^.pLimit := nil;
+    end;
+
+    { Recompute the colUsed masks for the flattened tables. }
+    pSrcItems := SrcListItems(pParent^.pSrc);
+    for i := 0 to nSubSrc - 1 do
+      recomputeColumnsUsed(pParent, @pSrcItems[i + iFrom]);
+
+    pPriorSel := pParent^.pPrior;
+    pParent := pPriorSel;
+    if pSub <> nil then pSub := pSub^.pPrior;
+  end;
+
+  { Finally, delete what is left of the subquery and return success. }
+  FillChar(w, SizeOf(w), 0);
+  sqlite3AggInfoPersistWalkerInit(@w, pParse);
+  sqlite3WalkSelect(@w, pSub1);
+  sqlite3SelectDelete(db, pSub1);
+  Result := 1;
+end;
+
 { existsToJoin — port of select.c:7317..7378 (SQLite 3.53.0).
   Walks a WHERE clause for TK_EXISTS subqueries that match a tight
   eligibility profile, and rewrites them as additional FROM clause
