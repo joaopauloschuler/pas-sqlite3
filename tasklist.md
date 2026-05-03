@@ -44,13 +44,15 @@ skeleton.
      vtab callbacks, pragmaVtabModule).  Underlying PRAGMA codegen arms
      (TABLE_INFO, INDEX_LIST, …) still stubs — see 6.12.
 
-- [~] **6.8.2** port `sqlite3GenerateConstraintChecks` (insert.c).
+- [X] **6.8.2** port `sqlite3GenerateConstraintChecks` (insert.c).
      Body ported (codegen.pas:24529..25303); 1:1 with
      insert.c:1895..2723.  All arms ([X] NOT NULL, [X] CHECK,
      [X] PK/UNIQUE incl. partial-index, [X] FOREIGN KEY,
      [X] Conflict-resolution + UPSERT OE_Update).  Wired via 6.8.6.
-     [ ] Auto-rowid for IPK alias on NULL (max(rowid)+1, AUTOINCREMENT)
-          — belongs to sqlite3Insert (insert.c:1454..1559), not here.
+     [X] Auto-rowid for IPK alias on NULL (max(rowid)+1, AUTOINCREMENT)
+          — landed in sqlite3Insert at codegen.pas:26794..26819
+          (insert.c:1530..1545 1:1: ipkColumnPresent gate, OP_NotNull
+          short-circuit + OP_NewRowid auto-pick, autoIncStep MemMax).
 
 - [X] **6.8.3** port `sqlite3CompleteInsertion` (insert.c) — DONE.
      Body at `passqlite3codegen.pas:25319..25395`, 1:1 port of

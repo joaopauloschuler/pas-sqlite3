@@ -24726,7 +24726,9 @@ begin
       iIdxNoSeek := -1;
     end;
 
-    { FK constraint check (no-op stub — Phase 7). }
+    { FK constraint check.  delete.c:651 — sqlite3FkCheck walks the
+      FK chain (productive port at codegen.pas:38457) and emits
+      OP_FkCounter / OP_FkIfZero ops. }
     sqlite3FkCheck(pParse, pTab, iOld, 0, nil, 0);
   end;
 
@@ -24752,7 +24754,10 @@ begin
     sqlite3VdbeChangeP5(v, p5);
   end;
 
-  { ON CASCADE / SET NULL / SET DEFAULT FK actions (no-op stub — Phase 7). }
+  { ON CASCADE / SET NULL / SET DEFAULT FK actions.  delete.c:680 —
+    sqlite3FkActions (productive port at codegen.pas:38915) synthesises
+    the cascade / set-null / set-default trigger programs and dispatches
+    them via sqlite3CodeRowTriggerDirect. }
   sqlite3FkActions(pParse, pTab, nil, iOld, nil, 0);
 
   { AFTER DELETE triggers. }
