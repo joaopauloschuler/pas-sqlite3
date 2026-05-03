@@ -852,6 +852,7 @@ type
       8: (aiCol:    Pi32);    { CHECK-constraint changed-column map (insert.c:1727) }
       9: (pCheckOnCtx: Pointer);  { CheckOnCtx*  (select.c:7392) }
      10: (pFix:     PDbFixer);    { attach.c sqlite3FixAAAA() walker context }
+     11: (pSrcItem: PSrcItem);    { recomputeColumnsUsed (select.c:3947) }
   end;
 
   TWalker = record
@@ -863,6 +864,18 @@ type
     eCode:            u16;
     mWFlags:          u16;
     u:                TWalkerU;
+  end;
+
+  { --- TSubstContext — flattenSubquery substitution context (select.c:3761) --- }
+  PSubstContext = ^TSubstContext;
+  TSubstContext = record
+    pParse:      PParse;       { Parsing context }
+    iTable:      i32;          { Replace references to this table }
+    iNewTable:   i32;          { New table number }
+    isOuterJoin: i32;          { Add TK_IF_NULL_ROW opcodes on each replacement }
+    nSelDepth:   i32;          { Depth of sub-query recursion.  Top==1 }
+    pEList:      PExprList;    { Replacement expressions }
+    pCList:      PExprList;    { Collation sequences for replacement expr }
   end;
 
   { --- TIdListItem (sizeof=8), TIdList (sizeof=8) --- }
@@ -8771,6 +8784,248 @@ begin
   w.xExprCallback   := @renumberCursorsCb;
   w.xSelectCallback := @sqlite3SelectWalkNoop;
   sqlite3WalkSelect(@w, p);
+end;
+
+{ ----------------------------------------------------------------------------
+  flattenSubquery substitution infrastructure (select.c:3761..4101).
+  ---------------------------------------------------------------------------- }
+
+function substExpr(pSubst: PSubstContext; pExpr: PExpr): PExpr; forward;
+procedure substExprList(pSubst: PSubstContext; pList: PExprList); forward;
+procedure substSelect(pSubst: PSubstContext; p: PSelect; doPrior: i32); forward;
+
+{ substExpr — port of select.c:3788..3894.  Replace every reference to
+  the column whose cursor is pSubst^.iTable with a copy of the
+  corresponding entry from pSubst^.pEList.  Leaves ROWID references
+  alone (the iColumn<0 arm is omitted because SQLITE_ALLOW_ROWID_IN_VIEW
+  is not enabled in our build). }
+function substExpr(pSubst: PSubstContext; pExpr: PExpr): PExpr;
+var
+  iColumn: i32;
+  pCopy:   PExpr;
+  pNew:    PExpr;
+  ifNullRow: TExpr;
+  db:      PTsqlite3;
+  pNat:    Pointer;
+  pColl:   Pointer;
+  pCollName: PAnsiChar;
+  pWin:    PWindow;
+begin
+  if pExpr = nil then begin Result := nil; Exit; end;
+  if ExprHasProperty(pExpr, EP_OuterON or EP_InnerON)
+     and (pExpr^.w.iJoin = pSubst^.iTable) then
+    pExpr^.w.iJoin := pSubst^.iNewTable;
+  if (pExpr^.op = TK_COLUMN)
+     and (pExpr^.iTable = pSubst^.iTable)
+     and (not ExprHasProperty(pExpr, EP_FixedCol)) then
+  begin
+    iColumn := pExpr^.iColumn;
+    Assert(iColumn >= 0);
+    Assert((pSubst^.pEList <> nil) and (iColumn < pSubst^.pEList^.nExpr));
+    Assert(pExpr^.pRight = nil);
+    pCopy := ExprListItems(pSubst^.pEList)[iColumn].pExpr;
+    if sqlite3ExprIsVector(pCopy) <> 0 then
+      sqlite3VectorErrorMsg(pSubst^.pParse, pCopy)
+    else
+    begin
+      db := pSubst^.pParse^.db;
+      if (pSubst^.isOuterJoin <> 0)
+         and ((pCopy^.op <> TK_COLUMN) or (pCopy^.iTable <> pSubst^.iNewTable)) then
+      begin
+        FillChar(ifNullRow, SizeOf(ifNullRow), 0);
+        ifNullRow.op := TK_IF_NULL_ROW;
+        ifNullRow.pLeft := pCopy;
+        ifNullRow.iTable := pSubst^.iNewTable;
+        ifNullRow.iColumn := -99;
+        ifNullRow.flags := EP_IfNullRow;
+        pCopy := @ifNullRow;
+      end;
+      pNew := sqlite3ExprDup(db, pCopy, 0);
+      if db^.mallocFailed <> 0 then
+      begin
+        sqlite3ExprDelete(db, pNew);
+        Result := pExpr;
+        Exit;
+      end;
+      if pSubst^.isOuterJoin <> 0 then
+        ExprSetProperty(pNew, EP_CanBeNull);
+      if pNew^.op = TK_TRUEFALSE then
+      begin
+        pNew^.u.iValue := sqlite3ExprTruthValue(pNew);
+        pNew^.op := TK_INTEGER;
+        ExprSetProperty(pNew, EP_IntValue);
+      end;
+      { Re-attach an implicit collation sequence so semantics match the
+        original sub-/view-column reference. }
+      pNat  := sqlite3ExprCollSeq(pSubst^.pParse, pNew);
+      pColl := sqlite3ExprCollSeq(pSubst^.pParse,
+                  ExprListItems(pSubst^.pCList)[iColumn].pExpr);
+      if (pNat <> pColl)
+         or ((pNew^.op <> TK_COLUMN) and (pNew^.op <> TK_COLLATE)) then
+      begin
+        if pColl <> nil then
+          pCollName := PTCollSeq(pColl)^.zName
+        else
+          pCollName := 'BINARY';
+        pNew := sqlite3ExprAddCollateString(pSubst^.pParse, pNew, pCollName);
+      end;
+      ExprClearProperty(pNew, EP_Collate);
+      if ExprHasProperty(pExpr, EP_OuterON or EP_InnerON) then
+        sqlite3SetJoinExpr(pNew, pExpr^.w.iJoin,
+                           pExpr^.flags and (EP_OuterON or EP_InnerON));
+      sqlite3ExprDelete(db, pExpr);
+      pExpr := pNew;
+    end;
+  end
+  else
+  begin
+    if (pExpr^.op = TK_IF_NULL_ROW) and (pExpr^.iTable = pSubst^.iTable) then
+      pExpr^.iTable := pSubst^.iNewTable;
+    if (pExpr^.op = TK_AGG_FUNCTION) and (pExpr^.op2 >= pSubst^.nSelDepth) then
+      Dec(pExpr^.op2);
+    pExpr^.pLeft  := substExpr(pSubst, pExpr^.pLeft);
+    pExpr^.pRight := substExpr(pSubst, pExpr^.pRight);
+    if ExprUseXSelect(pExpr) then
+      substSelect(pSubst, pExpr^.x.pSelect, 1)
+    else
+      substExprList(pSubst, pExpr^.x.pList);
+    if ExprHasProperty(pExpr, EP_WinFunc) then
+    begin
+      pWin := pExpr^.y.pWin;
+      if pWin <> nil then
+      begin
+        pWin^.pFilter := substExpr(pSubst, pWin^.pFilter);
+        substExprList(pSubst, pWin^.pPartition);
+        substExprList(pSubst, pWin^.pOrderBy);
+      end;
+    end;
+  end;
+  Result := pExpr;
+end;
+
+{ substExprList — port of select.c:3895..3904. }
+procedure substExprList(pSubst: PSubstContext; pList: PExprList);
+var
+  i:    i32;
+  pIt:  PExprListItem;
+begin
+  if pList = nil then Exit;
+  for i := 0 to pList^.nExpr - 1 do
+  begin
+    pIt := @ExprListItems(pList)[i];
+    pIt^.pExpr := substExpr(pSubst, pIt^.pExpr);
+  end;
+end;
+
+{ substSelect — port of select.c:3905..3933.  Apply substitutions to every
+  expression in p (and optionally its pPrior chain).  Recurses into
+  sub-SELECTs in the FROM clause. }
+procedure substSelect(pSubst: PSubstContext; p: PSelect; doPrior: i32);
+var
+  pSrc:  PSrcList;
+  pItem: PSrcItem;
+  i, n:  i32;
+  pAItem: PSrcItem;
+begin
+  if p = nil then Exit;
+  Inc(pSubst^.nSelDepth);
+  while True do
+  begin
+    substExprList(pSubst, p^.pEList);
+    substExprList(pSubst, p^.pGroupBy);
+    substExprList(pSubst, p^.pOrderBy);
+    p^.pHaving := substExpr(pSubst, p^.pHaving);
+    p^.pWhere  := substExpr(pSubst, p^.pWhere);
+    pSrc := p^.pSrc;
+    Assert(pSrc <> nil);
+    n := pSrc^.nSrc;
+    pAItem := PSrcItem(SrcListItems(pSrc));
+    for i := 0 to n - 1 do
+    begin
+      pItem := @pAItem[i];
+      if (pItem^.fg.fgBits and u8($04)) <> 0 then  { isSubquery }
+      begin
+        if (pItem^.u4.pSubq <> nil) and (pItem^.u4.pSubq^.pSelect <> nil) then
+          substSelect(pSubst, pItem^.u4.pSubq^.pSelect, 1);
+      end;
+      if (pItem^.fg.fgBits and u8($08)) <> 0 then  { isTabFunc }
+        substExprList(pSubst, pItem^.u1.pFuncArg);
+    end;
+    if (doPrior = 0) or (p^.pPrior = nil) then break;
+    p := p^.pPrior;
+  end;
+  Dec(pSubst^.nSelDepth);
+end;
+
+{ recomputeColumnsUsedExpr — Walker callback for recomputeColumnsUsed
+  (select.c:3944..3952). }
+function recomputeColumnsUsedExpr(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  pItem: PSrcItem;
+begin
+  if pExpr^.op <> TK_COLUMN then begin Result := WRC_Continue; Exit; end;
+  pItem := pWalker^.u.pSrcItem;
+  if pItem^.iCursor <> pExpr^.iTable then begin Result := WRC_Continue; Exit; end;
+  if pExpr^.iColumn < 0 then begin Result := WRC_Continue; Exit; end;
+  pItem^.colUsed := pItem^.colUsed or sqlite3ExprColUsed(pExpr);
+  Result := WRC_Continue;
+end;
+
+{ recomputeColumnsUsed — port of select.c:3953..3965.  Re-scan a SELECT
+  statement and rebuild the colUsed mask on a single FROM-clause entry. }
+procedure recomputeColumnsUsed(pSelect: PSelect; pSrcItem: PSrcItem);
+var
+  w: TWalker;
+begin
+  if pSrcItem^.pSTab = nil then Exit;
+  FillChar(w, SizeOf(w), 0);
+  w.xExprCallback   := @recomputeColumnsUsedExpr;
+  w.xSelectCallback := @sqlite3SelectWalkNoop;
+  w.u.pSrcItem := pSrcItem;
+  pSrcItem^.colUsed := 0;
+  sqlite3WalkSelect(@w, pSelect);
+end;
+
+{ findLeftmostExprlist — port of select.c:4072..4077. }
+function findLeftmostExprlist(pSel: PSelect): PExprList;
+begin
+  while pSel^.pPrior <> nil do
+    pSel := pSel^.pPrior;
+  Result := pSel^.pEList;
+end;
+
+{ compoundHasDifferentAffinities — port of select.c:4083..4101.  True if
+  any column of a compound SELECT has incompatible affinities across arms. }
+function compoundHasDifferentAffinities(p: PSelect): i32;
+var
+  ii:    i32;
+  pList: PExprList;
+  aff:   AnsiChar;
+  pSub1: PSelect;
+begin
+  Assert(p <> nil);
+  Assert(p^.pEList <> nil);
+  Assert(p^.pPrior <> nil);
+  pList := p^.pEList;
+  for ii := 0 to pList^.nExpr - 1 do
+  begin
+    Assert(ExprListItems(pList)[ii].pExpr <> nil);
+    aff := sqlite3ExprAffinity(ExprListItems(pList)[ii].pExpr);
+    pSub1 := p^.pPrior;
+    while pSub1 <> nil do
+    begin
+      Assert(pSub1^.pEList <> nil);
+      Assert(pSub1^.pEList^.nExpr > ii);
+      Assert(ExprListItems(pSub1^.pEList)[ii].pExpr <> nil);
+      if sqlite3ExprAffinity(ExprListItems(pSub1^.pEList)[ii].pExpr) <> aff then
+      begin
+        Result := 1;
+        Exit;
+      end;
+      pSub1 := pSub1^.pPrior;
+    end;
+  end;
+  Result := 0;
 end;
 
 { existsToJoin — port of select.c:7317..7378 (SQLite 3.53.0).

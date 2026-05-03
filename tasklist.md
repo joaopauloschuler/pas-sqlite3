@@ -373,7 +373,12 @@ FPC porting traps that recur often enough to call out up-front:
             Open follow-ups:
             - **6.13(b)-fl**: port `flattenSubquery` (select.c, ~600
               lines).  Closes the flattenable agg-on-subquery case
-              with bytecode parity.
+              with bytecode parity.  Prereqs landed at codegen.pas:
+              `SubstContext` typedef, `substExpr` / `substExprList` /
+              `substSelect` (select.c:3761..3933), `recomputeColumnsUsed`
+              (select.c:3953..3965), `findLeftmostExprlist`
+              (select.c:4072..4077), `compoundHasDifferentAffinities`
+              (select.c:4083..4101).
             - **6.13(b)-coagg**: agg-arm subquery dispatch landed for
               `count(*) / sum / min / max FROM (SELECT…)` and `… FROM v`
               via materialise + Rewind scan (codegen.pas:21088..).
