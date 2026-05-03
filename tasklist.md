@@ -399,11 +399,12 @@ FPC porting traps that recur often enough to call out up-front:
               Pas's sqlite3SelectExpand does not recursively assign
               cursors to inner subqueries the way C does, so the inner
               table item carries iCursor=-1/0 at flatten time.
-              Wiring blocked on an iCursor reconciliation step
-              (probably: drive sqlite3SrcListAssignCursors on the
-              inner pSrc before the flatten copy, or post-copy re-bump
-              into a fresh nTab slot).  Once that's fixed, sub-FROM
-              bytecode-Δ row under 6.10 step 6 closes.
+              iCursor reconciliation now fixed — sqlite3SrcListAssignCursors
+              recurses into subquery FROM lists (matches build.c:4934..4940),
+              so flattenSubquery's pSubitem^.iCursor is live at copy time.
+              Remaining: the actual call to flattenSubquery is not yet wired
+              into sqlite3Select's per-FROM-item loop (select.c:7867).
+              Once wired, sub-FROM bytecode-Δ row under 6.10 step 6 closes.
             - **6.13(b)-coagg**: agg-arm subquery dispatch landed for
               `count(*) / sum / min / max FROM (SELECT…)` and `… FROM v`
               via materialise + Rewind scan (codegen.pas:21088..).

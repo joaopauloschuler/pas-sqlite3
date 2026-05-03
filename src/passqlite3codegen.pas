@@ -32720,13 +32720,20 @@ procedure sqlite3SrcListAssignCursors(pParse: PParse; pList: PSrcList);
 var
   i: i32;
   pItem: PSrcItem;
+  pSubSel: PSelect;
 begin
   if pList = nil then Exit;
   for i := 0 to pList^.nSrc - 1 do begin
     pItem := PSrcItem(PByte(SrcListItems(pList)) + i * SizeOf(TSrcItem));
-    if pItem^.iCursor < 0 then begin
-      pItem^.iCursor := pParse^.nTab;
-      Inc(pParse^.nTab);
+    if pItem^.iCursor >= 0 then Continue;
+    pItem^.iCursor := pParse^.nTab;
+    Inc(pParse^.nTab);
+    { build.c:4934 — recurse into subquery FROM lists so flattenSubquery and
+      friends find live iCursor on inner pSrc items. }
+    if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then begin
+      pSubSel := pItem^.u4.pSubq^.pSelect;
+      if (pSubSel <> nil) and (pSubSel^.pSrc <> nil) then
+        sqlite3SrcListAssignCursors(pParse, pSubSel^.pSrc);
     end;
   end;
 end;
