@@ -2036,6 +2036,7 @@ function  sqlite3KeyInfoFromExprList(pParse: PParse; pList: PExprList;
   iStart: i32; nExtra: i32): PKeyInfo2;
 function  multiSelectCollSeq(pParse: PParse; p: PSelect; iCol: i32): Pointer;
 function  multiSelectByMergeKeyInfo(pParse: PParse; p: PSelect; nExtra: i32): PKeyInfo2;
+procedure computeLimitRegisters(pParse: PParse; p: PSelect; iBreak: i32);
 function  sqlite3SelectOpName(id: i32): PAnsiChar;
 procedure sqlite3SelectWrongNumTermsError(pParse: PParse; p: PSelect);
 function  sqlite3GetVdbe(pParse: PParse): PVdbe;
@@ -18239,6 +18240,64 @@ begin
     end;
   end;
   Result := pRet;
+end;
+
+{ computeLimitRegisters — compute LIMIT / OFFSET registers (select.c:2508).
+  Allocates p^.iLimit (and p^.iOffset when present), emits the LIMIT counter
+  initialisation, MustBeInt / IfNot guards for non-constant LIMIT, OFFSET
+  expression coding, and the OP_OffsetLimit combiner.  No-op when p^.iLimit
+  is already set or p^.pLimit is nil.  iBreak is the label to jump to when
+  LIMIT evaluates to zero or NULL. }
+procedure computeLimitRegisters(pParse: PParse; p: PSelect; iBreak: i32);
+var
+  v:        PVdbe;
+  iLimit:   i32;
+  iOffset:  i32;
+  n:        i32;
+  pLimit:   PExpr;
+begin
+  v       := nil;
+  iLimit  := 0;
+  pLimit  := p^.pLimit;
+  if p^.iLimit <> 0 then Exit;
+  if pLimit <> nil then
+  begin
+    Assert(pLimit^.op = TK_LIMIT);
+    Assert(pLimit^.pLeft <> nil);
+    Inc(pParse^.nMem);
+    iLimit    := pParse^.nMem;
+    p^.iLimit := iLimit;
+    v := sqlite3GetVdbe(pParse);
+    Assert(v <> nil);
+    n := 0;
+    if sqlite3ExprIsInteger(pLimit^.pLeft, @n, pParse) <> 0 then
+    begin
+      sqlite3VdbeAddOp2(v, OP_Integer, n, iLimit);
+      if n = 0 then
+        sqlite3VdbeGoto(v, iBreak)
+      else if (n >= 0) and (p^.nSelectRow > sqlite3LogEst(u64(n))) then
+      begin
+        p^.nSelectRow := i16(sqlite3LogEst(u64(n)));
+        p^.selFlags   := p^.selFlags or SF_FixedLimit;
+      end;
+    end
+    else
+    begin
+      sqlite3ExprCode(pParse, pLimit^.pLeft, iLimit);
+      sqlite3VdbeAddOp1(v, OP_MustBeInt, iLimit);
+      sqlite3VdbeAddOp2(v, OP_IfNot, iLimit, iBreak);
+    end;
+    if pLimit^.pRight <> nil then
+    begin
+      Inc(pParse^.nMem);
+      iOffset    := pParse^.nMem;
+      p^.iOffset := iOffset;
+      Inc(pParse^.nMem);   { extra register for limit+offset }
+      sqlite3ExprCode(pParse, pLimit^.pRight, iOffset);
+      sqlite3VdbeAddOp1(v, OP_MustBeInt, iOffset);
+      sqlite3VdbeAddOp3(v, OP_OffsetLimit, iLimit, iOffset + 1, iOffset);
+    end;
+  end;
 end;
 
 { sqlite3SelectOpName — return string name of compound operator }

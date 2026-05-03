@@ -267,7 +267,13 @@ skeleton.
         compound SF_Recursive codegen (generateWithRecursiveQuery —
         select.c:2680..2826) unported, so `WITH RECURSIVE r(n) AS
         (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<5) SELECT count(*)
-        FROM r` returns 0 instead of 5.
+        FROM r` returns 0 instead of 5.  Building-block helper
+        `computeLimitRegisters` (select.c:2508..2554) ported as a
+        standalone procedure — full body including the non-constant
+        LIMIT arm (ExprCode + MustBeInt + IfNot) and the
+        SF_FixedLimit / nSelectRow tightening — ready for the
+        generateWithRecursiveQuery and multiSelect-LIMIT-propagation
+        arms when they land.
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
