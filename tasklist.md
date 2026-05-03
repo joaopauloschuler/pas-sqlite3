@@ -467,13 +467,22 @@ FPC porting traps that recur often enough to call out up-front:
        [X] Port `sqlite3AlterDropColumn` (codegen.pas:32714).
        [~] Port `sqlite3AlterFunctions` — `sqlite_fail`,
             `sqlite_add_constraint`, `sqlite_find_constraint` registered.
-            Remaining 6 helpers (renameColumnFunc, renameTableFunc,
+            Foundation now landed: TRenameCtx record + the 16 helpers
+            from alter.c:949..1732/1903 (renameTokenFree, renameTokenFind,
+            renameColumnTokenNext, renameColumn{Select,Expr}Cb,
+            renameTable{Expr,Select}Cb, renameQuotefixExprCb,
+            errorMPrintf, renameColumnParseError, renameColumn{Elist,
+            Idlist}Names, renameSetENames, renameParseSql, renameEditSql,
+            renameResolveTrigger, renameWalkTrigger, renameParseCleanup)
+            ported at codegen.pas alongside the existing rename
+            unmap/walker callbacks.  Not yet productively reachable —
+            the 6 SQL-function bodies (renameColumnFunc, renameTableFunc,
             renameTableTest, dropColumnFunc, renameQuotefixFunc,
-            dropConstraintFunc — alter.c:1530..2519, each ~100-300 LOC
-            of CREATE-statement rewriting) still unregistered, so the
-            NestedParse'd `UPDATE sqlite_master SET sql =
-            sqlite_rename_*(...)` sub-statements emitted by the bodies
-            above fail at prepare time.  Closes 6.10 step 9(g).
+            dropConstraintFunc — alter.c:1530..2519, each ~100-300 LOC)
+            still unregistered, so the NestedParse'd `UPDATE
+            sqlite_master SET sql = sqlite_rename_*(...)` sub-statements
+            emitted by the bodies above still fail at prepare time.
+            Closes 6.10 step 9(g) once those land.
 
 - [ ] **7.4b** Bytecode-diff scope of `TestParser.pas`.  Now that
   Phase 8.2 wires `sqlite3_prepare_v2` end-to-end, extend `TestParser`

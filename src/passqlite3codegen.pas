@@ -471,6 +471,19 @@ type
     pNext: PRenameToken;   { next in pParse^.pRename list }
   end;
 
+  { alter.c:712 — RenameCtx: walker context used by ALTER TABLE
+    RENAME COLUMN / RENAME TABLE.  Collects RenameToken records that
+    refer to the column or table being renamed so renameEditSql can
+    rewrite each occurrence in the original CREATE statement. }
+  PRenameCtx = ^TRenameCtx;
+  TRenameCtx = record
+    pList: PRenameToken;   { list of tokens to overwrite }
+    nList: i32;            { number of tokens in pList }
+    iCol:  i32;            { index of column being renamed }
+    pTab:  PTable2;        { table being ALTERed }
+    zOld:  PAnsiChar;      { old column name }
+  end;
+
   { --- TAggInfoCol, TAggInfoFunc, TAggInfo (sizeof=72) --- }
   TAggInfoCol = record
     pTab:          PTable2;
@@ -34997,6 +35010,635 @@ begin
     if (items[i].fg.eBits and $03) = ENAME_NAME then
       sqlite3RenameTokenRemap(pParse, nil, Pointer(items[i].zEName));
   end;
+end;
+
+{ alter.c:949 — Free the linked list of RenameToken records. }
+procedure renameTokenFree(db: PTsqlite3; pToken: PRenameToken);
+var
+  pNxt: PRenameToken;
+  p:    PRenameToken;
+begin
+  p := pToken;
+  while p <> nil do
+  begin
+    pNxt := p^.pNext;
+    sqlite3DbFree(db, p);
+    p := pNxt;
+  end;
+end;
+
+{ alter.c:967 — Search pParse^.pRename for a RenameToken whose parse-tree
+  pointer matches pPtr.  When pCtx is non-nil and a match is found, the
+  token is unlinked from pParse and prepended to pCtx^.pList (with nList
+  bumped) so the caller can run renameEditSql against it. }
+function renameTokenFind(pParse: PParse; pCtx: PRenameCtx;
+  pPtr: Pointer): PRenameToken;
+var
+  pPrev: PRenameToken;
+  pCur:  PRenameToken;
+begin
+  Result := nil;
+  if pPtr = nil then Exit;
+  pPrev := nil;
+  pCur  := PRenameToken(pParse^.pRename);
+  while pCur <> nil do
+  begin
+    if pCur^.p = pPtr then
+    begin
+      if pCtx <> nil then
+      begin
+        if pPrev = nil then
+          pParse^.pRename := Pointer(pCur^.pNext)
+        else
+          pPrev^.pNext := pCur^.pNext;
+        pCur^.pNext  := pCtx^.pList;
+        pCtx^.pList  := pCur;
+        Inc(pCtx^.nList);
+      end;
+      Result := pCur;
+      Exit;
+    end;
+    pPrev := pCur;
+    pCur  := pCur^.pNext;
+  end;
+end;
+
+{ alter.c:996 — Walker select callback for renameColumnFunc.  Skips
+  pre-resolved views / copy-CTEs (their tokens have already been
+  remapped); descends into WITH clauses so inner CTE bodies are walked. }
+function renameColumnSelectCb(pWalker: PWalker; p: PSelect): i32; cdecl;
+begin
+  if (p^.selFlags and (SF_View or SF_CopyCte)) <> 0 then
+  begin
+    Result := WRC_Prune;
+    Exit;
+  end;
+  renameWalkWith(pWalker, p);
+  Result := WRC_Continue;
+end;
+
+{ alter.c:1015 — Walker expression callback for renameColumnFunc.  When
+  the visited TK_COLUMN / TK_TRIGGER node references the column being
+  renamed, transfer the matching RenameToken from pParse onto the
+  RenameCtx attached at pWalker^.u.ptr. }
+function renameColumnExprCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  p: PRenameCtx;
+begin
+  p := PRenameCtx(pWalker^.u.ptr);
+  if (pExpr^.op = TK_TRIGGER)
+     and (pExpr^.iColumn = p^.iCol)
+     and (pWalker^.pParse^.pTriggerTab = p^.pTab) then
+  begin
+    renameTokenFind(pWalker^.pParse, p, Pointer(pExpr));
+  end
+  else if (pExpr^.op = TK_COLUMN)
+     and (pExpr^.iColumn = p^.iCol)
+     and ((pExpr^.flags and EP_xIsSelect) = 0)  { ExprUseYTab }
+     and (p^.pTab = pExpr^.y.pTab) then
+  begin
+    renameTokenFind(pWalker^.pParse, p, Pointer(pExpr));
+  end;
+  Result := WRC_Continue;
+end;
+
+{ alter.c:1041 — Pop the rightmost RenameToken from pCtx^.pList.  "Right-
+  most" means the token whose source span starts furthest into the
+  original SQL text.  Used by renameEditSql to walk replacements in
+  reverse text order so earlier offsets stay valid. }
+function renameColumnTokenNext(pCtx: PRenameCtx): PRenameToken;
+var
+  pBest: PRenameToken;
+  pTok:  PRenameToken;
+  pPrev: PRenameToken;
+  pCur:  PRenameToken;
+begin
+  pBest := pCtx^.pList;
+  pTok  := pBest^.pNext;
+  while pTok <> nil do
+  begin
+    if PtrUInt(pTok^.t.z) > PtrUInt(pBest^.t.z) then
+      pBest := pTok;
+    pTok := pTok^.pNext;
+  end;
+  pPrev := nil;
+  pCur  := pCtx^.pList;
+  while pCur <> pBest do
+  begin
+    pPrev := pCur;
+    pCur  := pCur^.pNext;
+  end;
+  if pPrev = nil then
+    pCtx^.pList := pBest^.pNext
+  else
+    pPrev^.pNext := pBest^.pNext;
+  Result := pBest;
+end;
+
+{ alter.c:1059 — sqlite3-context error formatter.  Format zFmt with the
+  variadic args via sqlite3VMPrintf, then attach the resulting message
+  to pCtx (or signal nomem if formatting allocated nothing). }
+procedure errorMPrintf(pCtx: Psqlite3_context; zFmt: PAnsiChar;
+  const ap: array of const);
+var
+  db:   PTsqlite3;
+  zErr: PAnsiChar;
+begin
+  db   := sqlite3_context_db_handle(pCtx);
+  zErr := sqlite3MPrintf(db, zFmt, ap);
+  if zErr <> nil then
+  begin
+    sqlite3_result_error(pCtx, zErr, -1);
+    sqlite3DbFree(db, zErr);
+  end
+  else
+    sqlite3_result_error_nomem(pCtx);
+end;
+
+{ alter.c:1081 — Wrap pParse's error message with object-context
+  ("error in <type> <name>[ <when>]: <msg>") and propagate it onto
+  pCtx as the SQL-function result error. }
+procedure renameColumnParseError(pCtx: Psqlite3_context;
+  zWhen: PAnsiChar; pType: Psqlite3_value; pObject: Psqlite3_value;
+  pParse: PParse);
+var
+  zT, zN: PAnsiChar;
+  zErr:   PAnsiChar;
+  zSep:   PAnsiChar;
+begin
+  zT := PAnsiChar(sqlite3_value_text(pType));
+  zN := PAnsiChar(sqlite3_value_text(pObject));
+  if (zWhen <> nil) and (zWhen[0] <> #0) then zSep := ' ' else zSep := '';
+  zErr := sqlite3MPrintf(pParse^.db, 'error in %s %s%s%s: %s',
+    [zT, zN, zSep, zWhen, pParse^.zErrMsg]);
+  sqlite3_result_error(pCtx, zErr, -1);
+  sqlite3DbFree(pParse^.db, zErr);
+end;
+
+{ alter.c:1106 — For every ENAME_NAME entry in pEList whose alias
+  matches zOld (case-insensitive), transfer its rename-token onto pCtx. }
+procedure renameColumnElistNames(pParse: PParse; pCtx: PRenameCtx;
+  pEList: PExprList; zOld: PAnsiChar);
+var
+  i:     i32;
+  items: PExprListItem;
+  zName: PAnsiChar;
+begin
+  if pEList = nil then Exit;
+  items := ExprListItems(pEList);
+  for i := 0 to pEList^.nExpr - 1 do
+  begin
+    zName := items[i].zEName;
+    if ((items[i].fg.eBits and $03) = ENAME_NAME)
+       and (zName <> nil)
+       and (sqlite3StrICmp(zName, zOld) = 0) then
+    begin
+      renameTokenFind(pParse, pCtx, Pointer(zName));
+    end;
+  end;
+end;
+
+{ alter.c:1131 — IdList variant of renameColumnElistNames. }
+procedure renameColumnIdlistNames(pParse: PParse; pCtx: PRenameCtx;
+  pIdList: PIdList; zOld: PAnsiChar);
+var
+  i:     i32;
+  items: PIdListItem;
+begin
+  if pIdList = nil then Exit;
+  items := IdListItems(pIdList);
+  for i := 0 to pIdList^.nId - 1 do
+  begin
+    if sqlite3StrICmp(items[i].zName, zOld) = 0 then
+      renameTokenFind(pParse, pCtx, Pointer(items[i].zName));
+  end;
+end;
+
+{ alter.c:1153 — Drive the parser over zSql in PARSE_MODE_RENAME so the
+  resulting parse tree carries RenameToken records on pParse^.pRename.
+  Caller (renameColumn / renameTable / renameQuotefix SQL functions)
+  uses those tokens to rewrite the matching spans in zSql. }
+function renameParseSql(p: PParse; zDb: PAnsiChar; db: PTsqlite3;
+  zSql: PAnsiChar; bTemp: i32): i32;
+const
+  RP_SQLITE_Comments = u64($00040) shl 32;  { passqlite3parser.SQLITE_Comments }
+var
+  rc:    i32;
+  flags: u64;
+  iDb:   i32;
+
+  function isCreate(z: PAnsiChar): Boolean;
+  const
+    upper: array[0..6] of AnsiChar = 'CREATE ';
+  var i: i32;
+  begin
+    Result := False;
+    if z = nil then Exit;
+    for i := 0 to 6 do
+    begin
+      if (z[i] = #0) then Exit;
+      if (UpCase(z[i]) <> upper[i]) then Exit;
+    end;
+    Result := True;
+  end;
+
+begin
+  sqlite3ParseObjectInit(p, db);
+  if zSql = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  if not isCreate(zSql) then begin Result := SQLITE_CORRUPT_BKPT; Exit; end;
+  if bTemp <> 0 then
+    db^.init.iDb := 1
+  else
+  begin
+    iDb := sqlite3FindDbName(db, zDb);
+    Assert((iDb >= 0) and (iDb <= $FF));
+    db^.init.iDb := u8(iDb);
+  end;
+  p^.eParseMode := PARSE_MODE_RENAME;
+  p^.db         := db;
+  p^.nQueryLoop := 1;
+  flags         := db^.flags;
+  db^.flags     := db^.flags or RP_SQLITE_Comments;
+  if gNestedRunParser <> nil then
+    rc := gNestedRunParser(p, zSql)
+  else
+    rc := SQLITE_ERROR;
+  db^.flags     := flags;
+  if db^.mallocFailed <> 0 then rc := SQLITE_NOMEM;
+  if (rc = SQLITE_OK)
+     and (p^.pNewTable = nil) and (p^.pNewIndex = nil)
+     and (p^.pNewTrigger = nil) then
+    rc := SQLITE_CORRUPT_BKPT;
+  db^.init.iDb := 0;
+  Result := rc;
+end;
+
+{ alter.c:1217 — Edit zSql by walking pRename^.pList right-to-left,
+  replacing each token span with zNew (or, when zNew is nil, with a
+  single-quoted version of the original token).  The result is loaded
+  onto pCtx as the SQL-function return value. }
+function renameEditSql(pCtx: Psqlite3_context; pRename: PRenameCtx;
+  zSql: PAnsiChar; zNew: PAnsiChar; bQuote: i32): i32;
+var
+  nNew, nSql, nQuot, nOut, nReplace: i64;
+  db:       PTsqlite3;
+  rc:       i32;
+  zQuot:    PAnsiChar;
+  zOut:     PAnsiChar;
+  zBuf1:    PAnsiChar;
+  zBuf2:    PAnsiChar;
+  zReplace: PAnsiChar;
+  pBest:    PRenameToken;
+  iOff:     i32;
+  trail:    AnsiChar;
+begin
+  nNew := sqlite3Strlen30(zNew);
+  nSql := sqlite3Strlen30(zSql);
+  db   := sqlite3_context_db_handle(pCtx);
+  rc   := SQLITE_OK;
+  zQuot := nil;
+  zBuf1 := nil;
+  zBuf2 := nil;
+  nQuot := 0;
+
+  if zNew <> nil then
+  begin
+    zQuot := sqlite3MPrintf(db, '"%w" ', [zNew]);
+    if zQuot = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    nQuot := sqlite3Strlen30(zQuot) - 1;
+    Assert((nQuot >= nNew) and (nSql >= 0) and (nNew >= 0));
+    zOut := PAnsiChar(sqlite3DbMallocZero(db, u64(nSql) + u64(pRename^.nList) * u64(nQuot) + 1));
+  end
+  else
+  begin
+    Assert(nSql > 0);
+    zOut := PAnsiChar(sqlite3DbMallocZero(db, (2 * u64(nSql) + 1) * 3));
+    if zOut <> nil then
+    begin
+      zBuf1 := zOut + nSql * 2 + 1;
+      zBuf2 := zOut + nSql * 4 + 2;
+    end;
+  end;
+
+  if zOut <> nil then
+  begin
+    nOut := nSql;
+    Assert(nSql > 0);
+    Move(zSql^, zOut^, nSql);
+    while pRename^.pList <> nil do
+    begin
+      pBest := renameColumnTokenNext(pRename);
+      if zNew <> nil then
+      begin
+        if (bQuote = 0) and (sqlite3IsIdChar(u8(pBest^.t.z[0])) <> 0) then
+        begin
+          nReplace := nNew;
+          zReplace := zNew;
+        end
+        else
+        begin
+          nReplace := nQuot;
+          zReplace := zQuot;
+          if pBest^.t.z[pBest^.t.n] = '"' then Inc(nReplace);
+        end;
+      end
+      else
+      begin
+        Move(pBest^.t.z^, zBuf1^, pBest^.t.n);
+        zBuf1[pBest^.t.n] := #0;
+        sqlite3Dequote(zBuf1);
+        Assert(nSql < $15555554);
+        if pBest^.t.z[pBest^.t.n] = '''' then trail := ' ' else trail := #0;
+        { mprintf into zBuf2 — Pascal's sqlite3_snprintf is non-variadic,
+          so build the quoted form via sqlite3MPrintf and copy back. }
+        if trail = ' ' then
+          zReplace := sqlite3MPrintf(db, '%Q ', [zBuf1])
+        else
+          zReplace := sqlite3MPrintf(db, '%Q',  [zBuf1]);
+        if zReplace = nil then begin rc := SQLITE_NOMEM; Break; end;
+        nReplace := sqlite3Strlen30(zReplace);
+        Move(zReplace^, zBuf2^, nReplace + 1);
+        sqlite3DbFree(db, zReplace);
+        zReplace := zBuf2;
+      end;
+
+      iOff := i32(PtrUInt(pBest^.t.z) - PtrUInt(zSql));
+      if i64(pBest^.t.n) <> nReplace then
+      begin
+        Move((zOut + iOff + pBest^.t.n)^, (zOut + iOff + nReplace)^,
+             nOut - (iOff + i64(pBest^.t.n)));
+        nOut := nOut + nReplace - i64(pBest^.t.n);
+        zOut[nOut] := #0;
+      end;
+      Move(zReplace^, (zOut + iOff)^, nReplace);
+      sqlite3DbFree(db, pBest);
+    end;
+    sqlite3_result_text(pCtx, zOut, -1, SQLITE_TRANSIENT);
+    sqlite3DbFree(db, zOut);
+  end
+  else
+    rc := SQLITE_NOMEM;
+
+  sqlite3_free(zQuot);
+  Result := rc;
+end;
+
+{ alter.c:1324 — Set every fg.eEName field in pEList to val. }
+procedure renameSetENames(pEList: PExprList; val: i32);
+var
+  i:     i32;
+  items: PExprListItem;
+begin
+  Assert((val = ENAME_NAME) or (val = ENAME_TAB) or (val = ENAME_SPAN));
+  if pEList = nil then Exit;
+  items := ExprListItems(pEList);
+  for i := 0 to pEList^.nExpr - 1 do
+  begin
+    items[i].fg.eBits := (items[i].fg.eBits and $FC) or u8(val and $03);
+  end;
+end;
+
+{ alter.c:1341 — Resolve every symbol in the trigger body just parsed
+  (pParse^.pNewTrigger).  Mirrors the per-step dispatch the productive
+  parse path goes through, then walks the WHEN clause and each
+  TriggerStep (SELECT/INSERT/UPDATE/DELETE/UPSERT) so column refs and
+  table refs bind for the subsequent rename walk. }
+function renameResolveTrigger(pParse: PParse): i32;
+var
+  db:    PTsqlite3;
+  pNew:  PTrigger;
+  pStep: PTriggerStep;
+  sNC:   TNameContext;
+  rc:    i32;
+  iDb:   i32;
+  pSrc:  PSrcList;
+  pSel:  PSelect;
+  i:     i32;
+  pItem: PSrcItem;
+  items: PSrcItem;
+  pUps:  PUpsert;
+begin
+  db   := pParse^.db;
+  pNew := pParse^.pNewTrigger;
+  rc   := SQLITE_OK;
+
+  FillChar(sNC, SizeOf(sNC), 0);
+  sNC.pParse := pParse;
+  Assert(pNew^.pTabSchema <> nil);
+  iDb := sqlite3SchemaToIndex(db, pNew^.pTabSchema);
+  pParse^.pTriggerTab := sqlite3FindTable(db, pNew^.table,
+    db^.aDb[iDb].zDbSName);
+  pParse^.eTriggerOp  := pNew^.op;
+  if pParse^.pTriggerTab <> nil then
+  begin
+    if sqlite3ViewGetColumnNames(pParse, pParse^.pTriggerTab) <> 0 then
+      rc := 1;
+  end;
+
+  if (rc = SQLITE_OK) and (pNew^.pWhen <> nil) then
+    rc := sqlite3ResolveExprNames(@sNC, pNew^.pWhen);
+
+  pStep := pNew^.step_list;
+  while (rc = SQLITE_OK) and (pStep <> nil) do
+  begin
+    if pStep^.pSelect <> nil then
+    begin
+      sqlite3SelectPrep(pParse, pStep^.pSelect, @sNC);
+      if pParse^.nErr <> 0 then rc := pParse^.rc;
+    end;
+    if (rc = SQLITE_OK) and (pStep^.pSrc <> nil) then
+    begin
+      pSrc := sqlite3SrcListDup(db, pStep^.pSrc, 0);
+      if pSrc <> nil then
+      begin
+        pSel := sqlite3SelectNew(pParse, pStep^.pExprList, pSrc, nil,
+                                 nil, nil, nil, 0, nil);
+        if pSel = nil then
+        begin
+          pStep^.pExprList := nil;
+          pSrc := nil;
+          rc   := SQLITE_NOMEM;
+        end
+        else
+        begin
+          renameSetENames(pStep^.pExprList, ENAME_SPAN);
+          sqlite3SelectPrep(pParse, pSel, nil);
+          renameSetENames(pStep^.pExprList, ENAME_NAME);
+          if pParse^.nErr <> 0 then rc := SQLITE_ERROR else rc := SQLITE_OK;
+          if pStep^.pExprList <> nil then pSel^.pEList := nil;
+          pSel^.pSrc := nil;
+          sqlite3SelectDelete(db, pSel);
+        end;
+        if pStep^.pSrc <> nil then
+        begin
+          items := SrcListItems(pStep^.pSrc);
+          i := 0;
+          while (i < pStep^.pSrc^.nSrc) and (rc = SQLITE_OK) do
+          begin
+            pItem := @items[i];
+            if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
+              sqlite3SelectPrep(pParse, pItem^.u4.pSubq^.pSelect, nil);
+            Inc(i);
+          end;
+        end;
+        if db^.mallocFailed <> 0 then rc := SQLITE_NOMEM;
+        sNC.pSrcList := pSrc;
+        if (rc = SQLITE_OK) and (pStep^.pWhere <> nil) then
+          rc := sqlite3ResolveExprNames(@sNC, pStep^.pWhere);
+        if rc = SQLITE_OK then
+          rc := sqlite3ResolveExprListNames(@sNC, pStep^.pExprList);
+        Assert((pStep^.pUpsert = nil)
+               or ((pStep^.pWhere = nil) and (pStep^.pExprList = nil)));
+        if (pStep^.pUpsert <> nil) and (rc = SQLITE_OK) then
+        begin
+          pUps := pStep^.pUpsert;
+          pUps^.pUpsertSrc := pSrc;
+          sNC.uNC.pUpsert  := pUps;
+          sNC.ncFlags      := NC_UUpsert;
+          rc := sqlite3ResolveExprListNames(@sNC, pUps^.pUpsertTarget);
+          if rc = SQLITE_OK then
+            rc := sqlite3ResolveExprListNames(@sNC, pUps^.pUpsertSet);
+          if rc = SQLITE_OK then
+            rc := sqlite3ResolveExprNames(@sNC, pUps^.pUpsertWhere);
+          if rc = SQLITE_OK then
+            rc := sqlite3ResolveExprNames(@sNC, pUps^.pUpsertTargetWhere);
+          sNC.ncFlags := 0;
+        end;
+        sNC.pSrcList := nil;
+        sqlite3SrcListDelete(db, pSrc);
+      end
+      else
+        rc := SQLITE_NOMEM;
+    end;
+    pStep := pStep^.pNext;
+  end;
+  Result := rc;
+end;
+
+{ alter.c:1454 — Walk every Select / Expr / ExprList contained in a
+  trigger so the supplied walker callbacks visit every parse-tree node
+  the original CREATE TRIGGER produced. }
+procedure renameWalkTrigger(pWalker: PWalker; pTrigger: PTrigger);
+var
+  pStep: PTriggerStep;
+  pUps:  PUpsert;
+  pSrc:  PSrcList;
+  i:     i32;
+  items: PSrcItem;
+begin
+  sqlite3WalkExpr(pWalker, pTrigger^.pWhen);
+  pStep := pTrigger^.step_list;
+  while pStep <> nil do
+  begin
+    sqlite3WalkSelect(pWalker, pStep^.pSelect);
+    sqlite3WalkExpr(pWalker, pStep^.pWhere);
+    sqlite3WalkExprList(pWalker, pStep^.pExprList);
+    if pStep^.pUpsert <> nil then
+    begin
+      pUps := pStep^.pUpsert;
+      sqlite3WalkExprList(pWalker, pUps^.pUpsertTarget);
+      sqlite3WalkExprList(pWalker, pUps^.pUpsertSet);
+      sqlite3WalkExpr(pWalker, pUps^.pUpsertWhere);
+      sqlite3WalkExpr(pWalker, pUps^.pUpsertTargetWhere);
+    end;
+    if pStep^.pSrc <> nil then
+    begin
+      pSrc  := pStep^.pSrc;
+      items := SrcListItems(pSrc);
+      for i := 0 to pSrc^.nSrc - 1 do
+      begin
+        if SrcItemIsSubquery(items[i].fg)
+           and (items[i].u4.pSubq <> nil) then
+          sqlite3WalkSelect(pWalker, items[i].u4.pSubq^.pSelect);
+      end;
+    end;
+    pStep := pStep^.pNext;
+  end;
+end;
+
+{ alter.c:1489 — Free every owned object on a transient Parse used by
+  the rename helpers, then reset the Parse header.  The underlying
+  storage is reused for the next helper call. }
+procedure renameParseCleanup(pParse: PParse);
+var
+  db:   PTsqlite3;
+  pIdx: PIndex2;
+begin
+  db := pParse^.db;
+  if pParse^.pVdbe <> nil then
+    sqlite3VdbeFinalize(pParse^.pVdbe);
+  sqlite3DeleteTable(db, pParse^.pNewTable);
+  while pParse^.pNewIndex <> nil do
+  begin
+    pIdx := pParse^.pNewIndex;
+    pParse^.pNewIndex := pIdx^.pNext;
+    sqlite3FreeIndex(db, pIdx);
+  end;
+  sqlite3DeleteTrigger(db, pParse^.pNewTrigger);
+  sqlite3DbFree(db, pParse^.zErrMsg);
+  renameTokenFree(db, PRenameToken(pParse^.pRename));
+  sqlite3ParseObjectReset(pParse);
+end;
+
+{ alter.c:1696 — Walker expression callback for renameTableFunc.  When
+  a TK_COLUMN node references the table being renamed, transfer its
+  pTab-anchor RenameToken (the one created at parse time for the
+  table's name) onto the RenameCtx attached at pWalker^.u.ptr. }
+function renameTableExprCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+var
+  p: PRenameCtx;
+begin
+  p := PRenameCtx(pWalker^.u.ptr);
+  if (pExpr^.op = TK_COLUMN)
+     and ((pExpr^.flags and EP_xIsSelect) = 0)
+     and (p^.pTab = pExpr^.y.pTab) then
+  begin
+    renameTokenFind(pWalker^.pParse, p, @pExpr^.y.pTab);
+  end;
+  Result := WRC_Continue;
+end;
+
+{ alter.c:1710 — Walker select callback for renameTableFunc. }
+function renameTableSelectCb(pWalker: PWalker; pSelect: PSelect): i32; cdecl;
+var
+  p:     PRenameCtx;
+  pSrc:  PSrcList;
+  items: PSrcItem;
+  i:     i32;
+begin
+  p := PRenameCtx(pWalker^.u.ptr);
+  pSrc := pSelect^.pSrc;
+  if (pSelect^.selFlags and (SF_View or SF_CopyCte)) <> 0 then
+  begin
+    Result := WRC_Prune; Exit;
+  end;
+  if pSrc = nil then
+  begin
+    Assert(pWalker^.pParse^.db^.mallocFailed <> 0);
+    Result := WRC_Abort; Exit;
+  end;
+  items := SrcListItems(pSrc);
+  for i := 0 to pSrc^.nSrc - 1 do
+  begin
+    if items[i].pSTab = p^.pTab then
+      renameTokenFind(pWalker^.pParse, p, Pointer(items[i].zName));
+  end;
+  renameWalkWith(pWalker, pSelect);
+  Result := WRC_Continue;
+end;
+
+{ alter.c:1903 — Walker expression callback for renameQuotefixFunc.
+  Records every double-quoted TK_STRING node into the RenameCtx so
+  renameEditSql can rewrite each into a single-quoted equivalent. }
+function renameQuotefixExprCb(pWalker: PWalker; pExpr: PExpr): i32; cdecl;
+begin
+  if (pExpr^.op = TK_STRING)
+     and ((pExpr^.flags and EP_DblQuoted) <> 0) then
+  begin
+    renameTokenFind(pWalker^.pParse,
+                    PRenameCtx(pWalker^.u.ptr), Pointer(pExpr));
+  end;
+  Result := WRC_Continue;
 end;
 
 { expr.c:1755 — Deep-copy a With object.  Each CTE entry's Select and
