@@ -28,6 +28,37 @@ Important: At the end of this document, please find:
 
 ---
 
+## Working on this codebase (orientation for new contributors)
+
+Correctness is defined **differentially against the C oracle**, not by hand-written
+assertions.  Two gates matter:
+
+* `bin/TestExplainParity` — the **bytecode** gate.  1024/1026 SQL statements
+  emit byte-identical VDBE vs C as of 2026-05-03.  The two open rows are
+  enumerated under "Open Bugs" (6.10 step 6).
+* `src/tests/Diag*.pas` (`DiagOps`, `DiagCast`, `DiagFunctions`, `DiagWindow`,
+  `DiagTxn`, `DiagFeatureProbe`, …) — the **runtime** gates.  Each probe pins a
+  narrow runtime divergence to a numbered "Open Bugs" bullet.  When a Diag
+  starts passing, tick the bullet.
+
+Build with `src/tests/build.sh`; run binaries with
+`LD_LIBRARY_PATH=src/ bin/<TestName>`.  **Always wrap `DiagTxn` in `timeout 10`** —
+it has a known hang at savepoint rollback (pre-existing, separate task).
+
+FPC porting traps that recur often enough to call out up-front:
+
+* Free Pascal identifiers are case-insensitive, so `var pPager: PPager` collides
+  with the type name — rename the local (e.g. `pPgr`).  Same pattern with
+  `pgno: Pgno` → `pg: Pgno`.
+* `pager_error` collides with the `PAGER_ERROR` constant — always call
+  `pagerSetError`.
+* `var pTrigger: PTrigger` shadows a record field — rename to `pTrg`.
+* The token `TK_GT` collides; use `TK_GT_TK` (and `WO_GT_WO`) when porting C arms.
+* Never commit binaries from `bin/` (or `*.o`, `*.ppu`); `git rm --cached` if
+  one slipped in.
+
+---
+
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
 > **2026-05-03 (a3):** TestExplainParity reports **1024 / 1026 PASS**.
