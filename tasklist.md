@@ -113,9 +113,14 @@ skeleton.
       vdbe.pas wrappers (passqlite3vdbe.pas:2154/2174) delegate.
     - [X] `sqlite3VdbeFindCompare` — full body in btree.pas:3310;
       vdbe.pas wrapper (passqlite3vdbe.pas:2181) delegates.
-    - [ ] **b)** Collation-aware string compare (vdbeCompareMemString
+    - [~] **b)** Collation-aware string compare (vdbeCompareMemString
       hook from btree.pas → vdbe.pas) — required only for non-BINARY
-      collated index lookups;
+      collated index lookups.  Same-encoding fast path landed at
+      btree.pas:3221 — pIdxKey^.pKeyInfo^.aColl[i] is consulted via
+      a TBtCollView opaque view (matches TCollSeq layout); xCmp is
+      called directly when collEnc == kiEnc == pRhs^.enc.  Encoding-
+      mismatch transcoding (vdbeCompareMemString:4450) still falls back
+      to BINARY — default UTF-8 build never reaches it.
     - [~] **c)** TUnpackedRecord layout reconcile (btree's slim record
       vs. codegen's full record).  aSortFlags KEYINFO_ORDER_DESC +
       BIGNULL inversion arm ported.  Remaining: errCode-bearing
