@@ -252,13 +252,14 @@ skeleton.
         of multiSelect (select.c:2998..3050) ported at codegen.pas
         sqlite3Select compound dispatch; `SELECT 1 UNION ALL SELECT 2`
         and `SELECT count(*) FROM (... UNION ALL ...)` PASS (no-FROM
-        leaf extended for SRT_EphemTab/SRT_Table).  Helper
-        `multiSelectCollSeq` (select.c:2565..2580) and
-        `multiSelectByMergeKeyInfo` (select.c:2591..2618) ported
-        alongside as prerequisites for the dedup arms.  Remaining:
-        UNION / INTERSECT / EXCEPT (need multiSelectByMerge) and
-        `SELECT 1 UNION SELECT 2` dedup.  Also LIMIT propagation
-        through UNION ALL still bails.
+        leaf extended for SRT_EphemTab/SRT_Table).  Helpers
+        `multiSelectCollSeq` (select.c:2565..2580),
+        `multiSelectByMergeKeyInfo` (select.c:2591..2618),
+        `codeOffset` (select.c:879..888) and `generateOutputSubroutine`
+        (select.c:3097..3303) ported alongside as prerequisites for
+        the dedup / merge arms.  Remaining: UNION / INTERSECT / EXCEPT
+        (need multiSelectByMerge) and `SELECT 1 UNION SELECT 2`
+        dedup.  Also LIMIT propagation through UNION ALL still bails.
         Folds into 6.13(c).
       [~] **f) WITH / CTE not productive** — simple non-recursive CTE
         works.  Recursive CTE preps cleanly (recursion-detection arm of

@@ -2037,6 +2037,10 @@ function  sqlite3KeyInfoFromExprList(pParse: PParse; pList: PExprList;
 function  multiSelectCollSeq(pParse: PParse; p: PSelect; iCol: i32): Pointer;
 function  multiSelectByMergeKeyInfo(pParse: PParse; p: PSelect; nExtra: i32): PKeyInfo2;
 procedure computeLimitRegisters(pParse: PParse; p: PSelect; iBreak: i32);
+procedure codeOffset(v: PVdbe; iOffset: i32; iContinue: i32);
+function  generateOutputSubroutine(pParse: PParse; p: PSelect;
+  pIn: PSelectDest; pDest: PSelectDest; regReturn: i32; regPrev: i32;
+  pKeyInfo: PKeyInfo2; iBreak: i32): i32;
 function  sqlite3SelectOpName(id: i32): PAnsiChar;
 procedure sqlite3SelectWrongNumTermsError(pParse: PParse; p: PSelect);
 function  sqlite3GetVdbe(pParse: PParse): PVdbe;
@@ -18298,6 +18302,158 @@ begin
       sqlite3VdbeAddOp3(v, OP_OffsetLimit, iLimit, iOffset + 1, iOffset);
     end;
   end;
+end;
+
+{ codeOffset — port of select.c:879..888.  When the OFFSET register holds a
+  positive value, decrement it and jump to iContinue (skipping the current
+  result row).  No-op when iOffset <= 0. }
+procedure codeOffset(v: PVdbe; iOffset: i32; iContinue: i32);
+begin
+  if iOffset > 0 then
+    sqlite3VdbeAddOp3(v, OP_IfPos, iOffset, iContinue, 1);
+end;
+
+{ generateOutputSubroutine — port of select.c:3097..3303.  Emit the body of a
+  per-row subroutine that takes one row from a co-routine source (pIn,
+  SRT_Coroutine) and dispatches it into pDest according to pDest^.eDest.
+  Used by multiSelectByMerge and generateWithRecursiveQuery.
+
+  When regPrev > 0 the function emits the UNION/EXCEPT/INTERSECT duplicate
+  suppression preamble (compare against regPrev+1..regPrev+nSdst, jump to
+  iContinue on match, else copy current row to regPrev+1 and set regPrev=1).
+
+  Returns the address of the first opcode of the subroutine. }
+function generateOutputSubroutine(pParse: PParse; p: PSelect;
+  pIn: PSelectDest; pDest: PSelectDest; regReturn: i32; regPrev: i32;
+  pKeyInfo: PKeyInfo2; iBreak: i32): i32;
+var
+  v:         PVdbe;
+  iContinue: i32;
+  addr:      i32;
+  addr1, addr2: i32;
+  r1, r2, r3: i32;
+  iParm:     i32;
+  pSO:       PExprList;
+  pSOItems:  PExprListItem;
+  nKey:      i32;
+  ii:        i32;
+begin
+  v := pParse^.pVdbe;
+  Assert(pIn^.eDest = SRT_Coroutine);
+  addr := sqlite3VdbeCurrentAddr(v);
+  iContinue := sqlite3VdbeMakeLabel(pParse);
+
+  { Suppress duplicates for UNION, EXCEPT, INTERSECT. }
+  if regPrev <> 0 then
+  begin
+    addr1 := sqlite3VdbeAddOp1(v, OP_IfNot, regPrev);
+    addr2 := sqlite3VdbeAddOp4(v, OP_Compare, pIn^.iSdst, regPrev + 1,
+      pIn^.nSdst, PAnsiChar(sqlite3KeyInfoRef(pKeyInfo)), P4_KEYINFO);
+    sqlite3VdbeAddOp3(v, OP_Jump, addr2 + 2, iContinue, addr2 + 2);
+    sqlite3VdbeJumpHere(v, addr1);
+    sqlite3VdbeAddOp3(v, OP_Copy, pIn^.iSdst, regPrev + 1, pIn^.nSdst - 1);
+    sqlite3VdbeAddOp2(v, OP_Integer, 1, regPrev);
+  end;
+  if pParse^.db^.mallocFailed <> 0 then begin Result := 0; Exit; end;
+
+  { Suppress the first OFFSET entries if there is an OFFSET clause. }
+  codeOffset(v, p^.iOffset, iContinue);
+
+  case pDest^.eDest of
+    SRT_Fifo, SRT_DistFifo, SRT_Table, SRT_EphemTab:
+    begin
+      r1 := sqlite3GetTempReg(pParse);
+      r2 := sqlite3GetTempReg(pParse);
+      iParm := pDest^.iSDParm;
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, pIn^.iSdst, pIn^.nSdst, r1);
+      if (pDest^.eDest = SRT_Table) and (pDest^.iSDParm2 <> 0) then
+        sqlite3VdbeChangeP5(v, OPFLAG_NOCHNG_MAGIC);
+      if pDest^.eDest = SRT_DistFifo then
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iParm + 1, r1,
+          pIn^.iSdst, pIn^.nSdst);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, iParm, r2);
+      sqlite3VdbeAddOp3(v, OP_Insert, iParm, r1, r2);
+      sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+      sqlite3ReleaseTempReg(pParse, r2);
+      sqlite3ReleaseTempReg(pParse, r1);
+    end;
+
+    SRT_Exists:
+    begin
+      sqlite3VdbeAddOp2(v, OP_Integer, 1, pDest^.iSDParm);
+    end;
+
+    SRT_Set:
+    begin
+      r1 := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp4(v, OP_MakeRecord, pIn^.iSdst, pIn^.nSdst,
+        r1, pDest^.zAffSdst, pIn^.nSdst);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+        pIn^.iSdst, pIn^.nSdst);
+      if pDest^.iSDParm2 > 0 then
+        sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pDest^.iSDParm2, 0,
+          pIn^.iSdst, pIn^.nSdst);
+      sqlite3ReleaseTempReg(pParse, r1);
+    end;
+
+    SRT_Mem:
+    begin
+      sqlite3ExprCodeMove(pParse, pIn^.iSdst, pDest^.iSDParm, pIn^.nSdst);
+    end;
+
+    SRT_Coroutine:
+    begin
+      if pDest^.iSdst = 0 then
+      begin
+        pDest^.iSdst := sqlite3GetTempRange(pParse, pIn^.nSdst);
+        pDest^.nSdst := pIn^.nSdst;
+      end;
+      sqlite3ExprCodeMove(pParse, pIn^.iSdst, pDest^.iSdst, pIn^.nSdst);
+      sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
+    end;
+
+    SRT_DistQueue, SRT_Queue:
+    begin
+      pSO := pDest^.pOrderBy;
+      Assert(pSO <> nil);
+      nKey := pSO^.nExpr;
+      iParm := pDest^.iSDParm;
+      r1 := sqlite3GetTempReg(pParse);
+      r2 := sqlite3GetTempRange(pParse, nKey + 2);
+      r3 := r2 + nKey + 1;
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, pIn^.iSdst, pIn^.nSdst, r3);
+      if pDest^.eDest = SRT_DistQueue then
+        sqlite3VdbeAddOp2(v, OP_IdxInsert, iParm + 1, r3);
+      pSOItems := ExprListItems(pSO);
+      for ii := 0 to nKey - 1 do
+        sqlite3VdbeAddOp2(v, OP_SCopy,
+          pIn^.iSdst + i32(pSOItems[ii].u.x.iOrderByCol) - 1, r2 + ii);
+      sqlite3VdbeAddOp2(v, OP_Sequence, iParm, r2 + nKey);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, r2, nKey + 2, r1);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iParm, r1, r2, nKey + 2);
+      sqlite3ReleaseTempReg(pParse, r1);
+      sqlite3ReleaseTempRange(pParse, r2, nKey + 2);
+    end;
+
+    SRT_Discard:
+    begin
+      { No output. }
+    end;
+
+  else
+    { Default: SRT_Output. }
+    Assert(pDest^.eDest = SRT_Output);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, pIn^.iSdst, pIn^.nSdst);
+  end;
+
+  { Jump to the end of the loop if the LIMIT is reached. }
+  if p^.iLimit <> 0 then
+    sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreak);
+
+  { Generate the subroutine return. }
+  sqlite3VdbeResolveLabel(v, iContinue);
+  sqlite3VdbeAddOp1(v, OP_Return, regReturn);
+  Result := addr;
 end;
 
 { sqlite3SelectOpName — return string name of compound operator }
