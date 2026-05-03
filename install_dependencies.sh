@@ -26,6 +26,31 @@ fail() { echo "  [FAIL] $*"; exit 1; }
 echo "=== pas-sqlite3 dependency check ==="
 echo
 
+# install git, wget
+if ! command -v git &> /dev/null
+then
+    echo "git could not be found, installing..."
+    sudo apt install -y git
+else
+    echo "git is already installed"
+fi
+
+if ! command -v wget &> /dev/null
+then
+    echo "wget could not be found, installing..."
+    sudo apt install -y wget
+else
+    echo "wget is already installed"
+fi
+
+if ! command -v unzip &> /dev/null
+then
+    echo "unzip could not be found, installing..."
+    sudo apt install -y unzip
+else
+    echo "wget is already installed"
+fi
+
 # ---- fpc ----
 if command -v fpc &>/dev/null; then
   FPC_VER="$(fpc -iV 2>/dev/null || true)"
@@ -38,13 +63,12 @@ else
 fi
 
 # ---- gcc ----
-if command -v gcc &>/dev/null; then
-  GCC_VER="$(gcc --version 2>/dev/null | head -1)"
-  ok "gcc found: $GCC_VER"
+if ! dpkg -s build-essential &> /dev/null
+then
+    echo "build-essential could not be found, installing..."
+    sudo apt install -y build-essential
 else
-  warn "gcc not found — installing via apt ..."
-  sudo apt-get install -y gcc
-  ok "gcc installed"
+    echo "build-essential is already installed"
 fi
 
 # ---- make ----
@@ -70,12 +94,7 @@ fi
 echo
 echo "Checking for upstream SQLite split source tree ..."
 if [ ! -d "$SQLITE3_DIR" ]; then
-  fail "$SQLITE3_DIR not found.
-Please place the upstream SQLite split source tree at:
-  $SQLITE3_DIR
-(Typically cloned or unpacked from https://sqlite.org/src/ or a release
-tarball — NOT the amalgamation.)
-The directory must contain src/*.c, test/*.test, tool/lemon.c, etc."
+  wget https://sqlite.org/2026/sqlite-src-3530000.zip && unzip sqlite-src-3530000.zip && mv sqlite-src-3530000.zip ../sqlite3
 fi
 
 if [ ! -f "$SQLITE3_DIR/auto.def" ] && [ ! -f "$SQLITE3_DIR/configure" ]; then
