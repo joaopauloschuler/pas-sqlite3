@@ -461,24 +461,22 @@ FPC porting traps that recur often enough to call out up-front:
        [X] Port `sqlite3AlterAddConstraint` (codegen.pas:33144).
        [X] Port `sqlite3AlterRenameColumn` (codegen.pas:32879).
        [X] Port `sqlite3AlterDropColumn` (codegen.pas:32714).
-       [~] Port `sqlite3AlterFunctions` — `sqlite_fail`,
-            `sqlite_add_constraint`, `sqlite_find_constraint` registered.
-            Foundation now landed: TRenameCtx record + the 16 helpers
-            from alter.c:949..1732/1903 (renameTokenFree, renameTokenFind,
-            renameColumnTokenNext, renameColumn{Select,Expr}Cb,
-            renameTable{Expr,Select}Cb, renameQuotefixExprCb,
-            errorMPrintf, renameColumnParseError, renameColumn{Elist,
-            Idlist}Names, renameSetENames, renameParseSql, renameEditSql,
-            renameResolveTrigger, renameWalkTrigger, renameParseCleanup)
-            ported at codegen.pas alongside the existing rename
-            unmap/walker callbacks.  Not yet productively reachable —
-            the 6 SQL-function bodies (renameColumnFunc, renameTableFunc,
-            renameTableTest, dropColumnFunc, renameQuotefixFunc,
-            dropConstraintFunc — alter.c:1530..2519, each ~100-300 LOC)
-            still unregistered, so the NestedParse'd `UPDATE
-            sqlite_master SET sql = sqlite_rename_*(...)` sub-statements
-            emitted by the bodies above still fail at prepare time.
-            Closes 6.10 step 9(g) once those land.
+       [~] Port `sqlite3AlterFunctions` — registered now: `sqlite_fail`,
+            `sqlite_add_constraint`, `sqlite_find_constraint`,
+            `sqlite_drop_column`, `sqlite_rename_quotefix`,
+            `sqlite_rename_test`.  Foundation (TRenameCtx + 16 helpers
+            from alter.c:949..1732/1903) was landed earlier.  Newly
+            ported bodies (alter.c:1937 renameQuotefixFunc,
+            alter.c:2050 renameTableTest, alter.c:2176 dropColumnFunc)
+            cover the AC arms of ADD/DROP COLUMN + the post-rename
+            schema validator.  Remaining bodies: renameColumnFunc
+            (alter.c:1530, ~162 LOC), renameTableFunc (alter.c:1754,
+            ~148 LOC), dropConstraintFunc (alter.c:2519, ~125 LOC).
+            End-to-end runtime parity for `ALTER TABLE ... RENAME
+            COLUMN` / `ADD COLUMN` / `DROP COLUMN` still gated on
+            Phase 7.1.1 (sqlite3InitOne — the schema reload after the
+            NestedParse'd UPDATE sqlite_master sub-statements is a
+            no-op without it).  Closes 6.10 step 9(g) once those land.
 
 - [ ] **7.4b** Bytecode-diff scope of `TestParser.pas`.  Now that
   Phase 8.2 wires `sqlite3_prepare_v2` end-to-end, extend `TestParser`

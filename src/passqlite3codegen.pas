@@ -35116,16 +35116,27 @@ begin
   sqlite3_result_int(pCtx, 0);
 end;
 
+{ Forward declarations — bodies live further down (after the rename
+  walker callbacks) but the registration table refers to them. }
+procedure dropColumnFunc(pCtx: Psqlite3_context; argc: i32;
+  argv: PPMem); cdecl; forward;
+procedure renameQuotefixFunc(pCtx: Psqlite3_context; argc: i32;
+  argv: PPMem); cdecl; forward;
+procedure renameTableTest(pCtx: Psqlite3_context; argc: i32;
+  argv: PPMem); cdecl; forward;
+
 var
-  aAlterTableFuncs: array[0..2] of TFuncDef;
+  aAlterTableFuncs: array[0..5] of TFuncDef;
   alterFuncsInited: Boolean = False;
 
 { alter.c:3042 — sqlite3AlterFunctions.  Registers the SQL helpers used
-  by the ALTER TABLE rename / drop machinery.  Currently exposes only
-  `sqlite_fail` (the only helper whose body has been ported); the other
-  eight INTERNAL_FUNCTION rows from the C reference (sqlite_rename_*,
-  sqlite_drop_*, sqlite_add_constraint, sqlite_find_constraint) will be
-  added as their bodies land alongside Phase 7.1.9 ALTER TABLE work.
+  by the ALTER TABLE rename / drop machinery.  Six of the nine
+  INTERNAL_FUNCTION rows from the C reference are wired:
+  `sqlite_fail`, `sqlite_add_constraint`, `sqlite_find_constraint`,
+  `sqlite_drop_column`, `sqlite_rename_quotefix`, `sqlite_rename_test`.
+  The three remaining (`sqlite_rename_column`, `sqlite_rename_table`,
+  `sqlite_drop_constraint`) land as their bodies are ported alongside
+  Phase 7.1.9 ALTER TABLE work.
   Idempotent — guarded by alterFuncsInited so the static FuncDef hash
   links survive across repeated sqlite3RegisterBuiltinFunctions calls
   (same convention as aBuiltinFuncs / aBuiltinAgg). }
@@ -35149,6 +35160,18 @@ begin
   aAlterTableFuncs[2].funcFlags := ALTER_FUNC_FLAGS;
   aAlterTableFuncs[2].xSFunc    := @findConstraintFunc;
   aAlterTableFuncs[2].zName     := 'sqlite_find_constraint';
+  aAlterTableFuncs[3].nArg      := 3;
+  aAlterTableFuncs[3].funcFlags := ALTER_FUNC_FLAGS;
+  aAlterTableFuncs[3].xSFunc    := @dropColumnFunc;
+  aAlterTableFuncs[3].zName     := 'sqlite_drop_column';
+  aAlterTableFuncs[4].nArg      := 2;
+  aAlterTableFuncs[4].funcFlags := ALTER_FUNC_FLAGS;
+  aAlterTableFuncs[4].xSFunc    := @renameQuotefixFunc;
+  aAlterTableFuncs[4].zName     := 'sqlite_rename_quotefix';
+  aAlterTableFuncs[5].nArg      := 7;
+  aAlterTableFuncs[5].funcFlags := ALTER_FUNC_FLAGS;
+  aAlterTableFuncs[5].xSFunc    := @renameTableTest;
+  aAlterTableFuncs[5].zName     := 'sqlite_rename_test';
   sqlite3InsertBuiltinFuncs(@aAlterTableFuncs, Length(aAlterTableFuncs));
 end;
 
@@ -35821,6 +35844,287 @@ begin
                     PRenameCtx(pWalker^.u.ptr), Pointer(pExpr));
   end;
   Result := WRC_Continue;
+end;
+
+{ alter.c:2176 — dropColumnFunc.  Internal SQL function
+  `sqlite_drop_column(iSchema, sql, iCol)`: returns the CREATE TABLE
+  statement zSql with column iCol removed.  Used by the NestedParse'd
+  UPDATE sqlite_master sub-statement that ALTER TABLE DROP COLUMN
+  emits.  Faithful 1:1 of the C body, including the trailing-comma
+  rewind for the last-column case via getConstraintToken.  Closes the
+  DROP COLUMN arm of 6.10 step 9(g). }
+procedure dropColumnFunc(pCtx: Psqlite3_context; argc: i32;
+  argv: PPMem); cdecl;
+label
+  drop_column_done;
+var
+  db:      PTsqlite3;
+  iSchema: i32;
+  zSql:    PAnsiChar;
+  iCol:    i32;
+  zDb:     PAnsiChar;
+  rc:      i32;
+  sParse:  TParse;
+  pCol:    PRenameToken;
+  pEnd:    PRenameToken;
+  pTab:    PTable2;
+  zEnd:    PAnsiChar;
+  zNew:    PAnsiChar;
+  bTemp:   i32;
+  eTok:    i32;
+  acol:    PColumn;
+  xAuthSave: Pointer;
+begin
+  if argc <> 0 then ;  { quiet unused-param }
+  db      := sqlite3_context_db_handle(pCtx);
+  iSchema := sqlite3_value_int(Psqlite3_value(argv^));
+  zSql    := PAnsiChar(sqlite3_value_text(Psqlite3_value((argv + 1)^)));
+  iCol    := sqlite3_value_int(Psqlite3_value((argv + 2)^));
+  if iSchema = 1 then bTemp := 1 else bTemp := 0;
+  zDb     := db^.aDb[iSchema].zDbSName;
+  zNew    := nil;
+
+  xAuthSave := db^.xAuth;
+  db^.xAuth := nil;
+
+  rc := renameParseSql(@sParse, zDb, db, zSql, bTemp);
+  if rc <> SQLITE_OK then goto drop_column_done;
+  pTab := sParse.pNewTable;
+  if (pTab = nil) or (pTab^.nCol = 1) or (iCol >= pTab^.nCol) then
+  begin
+    rc := SQLITE_CORRUPT_BKPT;
+    goto drop_column_done;
+  end;
+
+  acol := pTab^.aCol;
+  if iCol < pTab^.nCol - 1 then
+  begin
+    pCol := renameTokenFind(@sParse, nil,
+      Pointer(PColumn(PByte(acol) + iCol * SizeOf(TColumn))^.zCnName));
+    pEnd := renameTokenFind(@sParse, nil,
+      Pointer(PColumn(PByte(acol) + (iCol + 1) * SizeOf(TColumn))^.zCnName));
+    if (pCol = nil) or (pEnd = nil) then
+    begin
+      rc := SQLITE_CORRUPT_BKPT;
+      goto drop_column_done;
+    end;
+    zEnd := PAnsiChar(pEnd^.t.z);
+  end
+  else
+  begin
+    Assert(pTab^.eTabType = TABTYP_NORM);
+    Assert(iCol <> 0);
+    pCol := renameTokenFind(@sParse, nil,
+      Pointer(PColumn(PByte(acol) + (iCol - 1) * SizeOf(TColumn))^.zCnName));
+    if pCol = nil then
+    begin
+      rc := SQLITE_CORRUPT_BKPT;
+      goto drop_column_done;
+    end;
+    eTok := 0;
+    repeat
+      pCol^.t.z := PAnsiChar(PtrUInt(pCol^.t.z)
+                   + PtrUInt(getConstraintToken(PByte(pCol^.t.z), @eTok)));
+    until eTok = TK_COMMA;
+    pCol^.t.z := PAnsiChar(PtrUInt(pCol^.t.z) - 1);
+    zEnd := zSql + pTab^.u.tab.addColOffset;
+  end;
+
+  zNew := sqlite3MPrintf(db, '%.*s%s',
+    [i32(PtrUInt(pCol^.t.z) - PtrUInt(zSql)), zSql, zEnd]);
+  sqlite3_result_text(pCtx, zNew, -1, SQLITE_DYNAMIC);
+
+drop_column_done:
+  renameParseCleanup(@sParse);
+  db^.xAuth := xAuthSave;
+  if rc <> SQLITE_OK then
+    sqlite3_result_error_code(pCtx, rc);
+end;
+
+{ alter.c:1937 — renameQuotefixFunc.  Internal SQL function
+  `sqlite_rename_quotefix(zDb, zSql)`: rewrites zSql so any TK_STRING
+  with EP_DblQuoted is single-quoted instead.  Used by ALTER TABLE
+  RENAME COLUMN / ADD COLUMN to repair stored DDL after the schema
+  reload sees the rename.  Faithful 1:1 of the C body. }
+procedure renameQuotefixFunc(pCtx: Psqlite3_context; argc: i32;
+  argv: PPMem); cdecl;
+var
+  db:      PTsqlite3;
+  zDb:     PAnsiChar;
+  zInput:  PAnsiChar;
+  rc:      i32;
+  sParse:  TParse;
+  sCtx:    TRenameCtx;
+  sWalker: TWalker;
+  pTab:    PTable2;
+  pSel:    PSelect;
+  i:       i32;
+  pIdx:    PIndex2;
+  xAuthSave: Pointer;
+begin
+  if argc <> 0 then ;
+  db     := sqlite3_context_db_handle(pCtx);
+  zDb    := PAnsiChar(sqlite3_value_text(Psqlite3_value(argv^)));
+  zInput := PAnsiChar(sqlite3_value_text(Psqlite3_value((argv + 1)^)));
+
+  xAuthSave := db^.xAuth;
+  db^.xAuth := nil;
+  sqlite3BtreeEnterAll(db);
+
+  if (zDb <> nil) and (zInput <> nil) then
+  begin
+    rc := renameParseSql(@sParse, zDb, db, zInput, 0);
+    if rc = SQLITE_OK then
+    begin
+      FillChar(sCtx,    SizeOf(sCtx),    0);
+      FillChar(sWalker, SizeOf(sWalker), 0);
+      sWalker.pParse          := @sParse;
+      sWalker.xExprCallback   := @renameQuotefixExprCb;
+      sWalker.xSelectCallback := @renameColumnSelectCb;
+      sWalker.u.ptr           := @sCtx;
+
+      pTab := sParse.pNewTable;
+      if pTab <> nil then
+      begin
+        if IsView(pTab) then
+        begin
+          pSel := pTab^.u.view_pSelect;
+          pSel^.selFlags := pSel^.selFlags and (not u32(SF_View));
+          sParse.rc := SQLITE_OK;
+          sqlite3SelectPrep(@sParse, pSel, nil);
+          if db^.mallocFailed <> 0 then rc := SQLITE_NOMEM
+          else rc := sParse.rc;
+          if rc = SQLITE_OK then
+            sqlite3WalkSelect(@sWalker, pSel);
+        end
+        else
+        begin
+          sqlite3WalkExprList(@sWalker, pTab^.pCheck);
+          for i := 0 to pTab^.nCol - 1 do
+            sqlite3WalkExpr(@sWalker,
+              sqlite3ColumnExpr(pTab,
+                PColumn(PtrUInt(pTab^.aCol)
+                        + PtrUInt(i) * SizeOf(TColumn))));
+        end;
+      end
+      else
+      begin
+        pIdx := sParse.pNewIndex;
+        if pIdx <> nil then
+        begin
+          sqlite3WalkExprList(@sWalker, pIdx^.aColExpr);
+          sqlite3WalkExpr(@sWalker, pIdx^.pPartIdxWhere);
+        end
+        else
+        begin
+          rc := renameResolveTrigger(@sParse);
+          if rc = SQLITE_OK then
+            renameWalkTrigger(@sWalker, sParse.pNewTrigger);
+        end;
+      end;
+
+      if rc = SQLITE_OK then
+        rc := renameEditSql(pCtx, @sCtx, zInput, nil, 0);
+      renameTokenFree(db, sCtx.pList);
+    end;
+    if rc <> SQLITE_OK then
+    begin
+      if (sqlite3WritableSchema(db) <> 0) and (rc = SQLITE_ERROR) then
+        sqlite3_result_value(pCtx, Psqlite3_value((argv + 1)^))
+      else
+        sqlite3_result_error_code(pCtx, rc);
+    end;
+    renameParseCleanup(@sParse);
+  end;
+
+  db^.xAuth := xAuthSave;
+  sqlite3BtreeLeaveAll(db);
+end;
+
+{ alter.c:2050 — renameTableTest.  Internal SQL function
+  `sqlite_rename_test(zDb, zSql, zType, zName, bTemp, zWhen, bNoDQS)`:
+  re-parses zSql after a RENAME has been applied to the schema, to
+  verify it still resolves cleanly.  Returns 1 when zSql is a trigger
+  attached to a table in zDb (output case B), raises an error if the
+  re-parse fails outside writable_schema mode (case A), otherwise
+  returns NULL (case C).  Faithful 1:1 of the C body. }
+procedure renameTableTest(pCtx: Psqlite3_context; argc: i32;
+  argv: PPMem); cdecl;
+const
+  ALTER_DQS_BITS = u64($60000000);  { SQLITE_DqsDDL or SQLITE_DqsDML }
+var
+  db:        PTsqlite3;
+  zDb:       PAnsiChar;
+  zInput:    PAnsiChar;
+  bTemp:     i32;
+  isLegacy:  i32;
+  zWhen:     PAnsiChar;
+  bNoDQS:    i32;
+  rc:        i32;
+  sParse:    TParse;
+  flags:     u64;
+  pSel:      PSelect;
+  sNC:       TNameContext;
+  pTrg:      PTrigger;
+  i1, i2:    i32;
+  xAuthSave: Pointer;
+  parseInited: Boolean;
+begin
+  if argc <> 0 then ;
+  db     := sqlite3_context_db_handle(pCtx);
+  zDb    := PAnsiChar(sqlite3_value_text(Psqlite3_value(argv^)));
+  zInput := PAnsiChar(sqlite3_value_text(Psqlite3_value((argv + 1)^)));
+  bTemp  := sqlite3_value_int(Psqlite3_value((argv + 4)^));
+  isLegacy := i32((db^.flags and SQLITE_LegacyAlter) <> 0);
+  zWhen  := PAnsiChar(sqlite3_value_text(Psqlite3_value((argv + 5)^)));
+  bNoDQS := sqlite3_value_int(Psqlite3_value((argv + 6)^));
+
+  xAuthSave := db^.xAuth;
+  db^.xAuth := nil;
+
+  parseInited := False;
+  if (zDb <> nil) and (zInput <> nil) then
+  begin
+    flags := db^.flags;
+    if bNoDQS <> 0 then
+      db^.flags := db^.flags and (not ALTER_DQS_BITS);
+    rc := renameParseSql(@sParse, zDb, db, zInput, bTemp);
+    parseInited := True;
+    db^.flags := flags;
+    if rc = SQLITE_OK then
+    begin
+      if (isLegacy = 0) and (sParse.pNewTable <> nil)
+         and IsView(sParse.pNewTable) then
+      begin
+        FillChar(sNC, SizeOf(sNC), 0);
+        sNC.pParse := @sParse;
+        sqlite3SelectPrep(@sParse,
+          sParse.pNewTable^.u.view_pSelect, @sNC);
+        if sParse.nErr <> 0 then rc := sParse.rc;
+      end
+      else if sParse.pNewTrigger <> nil then
+      begin
+        if isLegacy = 0 then
+          rc := renameResolveTrigger(@sParse);
+        if rc = SQLITE_OK then
+        begin
+          pTrg := sParse.pNewTrigger;
+          i1 := sqlite3SchemaToIndex(db, pTrg^.pTabSchema);
+          i2 := sqlite3FindDbName(db, zDb);
+          if i1 = i2 then
+            sqlite3_result_int(pCtx, 1);
+        end;
+      end;
+    end;
+    if (rc <> SQLITE_OK) and (zWhen <> nil)
+       and (sqlite3WritableSchema(db) = 0) then
+      renameColumnParseError(pCtx, zWhen,
+        Psqlite3_value((argv + 2)^),
+        Psqlite3_value((argv + 3)^), @sParse);
+  end;
+
+  if parseInited then renameParseCleanup(@sParse);
+  db^.xAuth := xAuthSave;
 end;
 
 { expr.c:1755 — Deep-copy a With object.  Each CTE entry's Select and
