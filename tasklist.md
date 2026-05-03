@@ -205,10 +205,13 @@ FPC porting traps that recur often enough to call out up-front:
             windowIfNewPeer (2055).  Not yet productively wired —
             sqlite3Select still bails on `p^.pWin <> nil`; CodeStep
             below is next gate.
-       [ ] Port `sqlite3WindowCodeStep` — per-row dispatch into
-            the active frame logic.  Pending: windowCodeOp +
-            windowCodeRangeTest + windowFullScan + windowReturnOneRow
-            (window.c:1814..2382).
+       [X] Port `sqlite3WindowCodeStep` — full 1:1 body at codegen.pas
+            replacing the prior stub, alongside its helpers
+            windowExprGtZero (window.c:2437), windowFullScan (1814),
+            windowReturnOneRow (1920), windowCodeRangeTest (2101) and
+            windowCodeOp (2233).  Not yet productively wired —
+            sqlite3Select still bails on `p^.pWin <> nil`; wiring is
+            the next gate (closes 6.10 step 17(d)).
        [ ] Frame-spec emission: ROWS / RANGE / GROUPS, with all
             five bound types (UNBOUNDED PRECEDING, n PRECEDING,
             CURRENT ROW, n FOLLOWING, UNBOUNDED FOLLOWING) and
