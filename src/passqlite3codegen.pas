@@ -2035,6 +2035,7 @@ function  sqlite3KeyInfoRef(p: PKeyInfo2): PKeyInfo2;
 function  sqlite3KeyInfoFromExprList(pParse: PParse; pList: PExprList;
   iStart: i32; nExtra: i32): PKeyInfo2;
 function  multiSelectCollSeq(pParse: PParse; p: PSelect; iCol: i32): Pointer;
+function  multiSelectByMergeKeyInfo(pParse: PParse; p: PSelect; nExtra: i32): PKeyInfo2;
 function  sqlite3SelectOpName(id: i32): PAnsiChar;
 procedure sqlite3SelectWrongNumTermsError(pParse: PParse; p: PSelect);
 function  sqlite3GetVdbe(pParse: PParse): PVdbe;
@@ -18188,6 +18189,54 @@ begin
     pItem := ExprListItems(p^.pEList);
     Inc(pItem, iCol);
     pRet := sqlite3ExprCollSeq(pParse, pItem^.pExpr);
+  end;
+  Result := pRet;
+end;
+
+{ multiSelectByMergeKeyInfo — port of select.c:2591..2618.  Build a KeyInfo
+  for the ORDER BY of a compound SELECT: per-column collation comes from an
+  explicit COLLATE on the term (pTerm^.flags & EP_Collate) or from
+  multiSelectCollSeq on the iOrderByCol-th expression of any compound term;
+  pSortFlags carry through unchanged.  When no COLLATE was attached, the
+  ORDER BY term is rewritten in place to carry sqlite3ExprAddCollateString
+  so downstream codegen sees the resolved name. }
+function multiSelectByMergeKeyInfo(pParse: PParse; p: PSelect;
+  nExtra: i32): PKeyInfo2;
+var
+  pOrderBy: PExprList;
+  nOrderBy: i32;
+  db:       PTsqlite3;
+  pRet:     PKeyInfo2;
+  i:        i32;
+  pItem:    PExprListItem;
+  pTerm:    PExpr;
+  pColl:    Pointer;
+begin
+  pOrderBy := p^.pOrderBy;
+  if pOrderBy <> nil then nOrderBy := pOrderBy^.nExpr else nOrderBy := 0;
+  db := pParse^.db;
+  pRet := sqlite3KeyInfoAlloc(db, nOrderBy + nExtra, 1);
+  if pRet <> nil then
+  begin
+    pItem := ExprListItems(pOrderBy);
+    for i := 0 to nOrderBy - 1 do
+    begin
+      pTerm := pItem^.pExpr;
+      if (pTerm^.flags and EP_Collate) <> 0 then
+      begin
+        pColl := sqlite3ExprCollSeq(pParse, pTerm);
+      end
+      else
+      begin
+        pColl := multiSelectCollSeq(pParse, p, i32(pItem^.u.x.iOrderByCol) - 1);
+        if pColl = nil then pColl := db^.pDfltColl;
+        pItem^.pExpr := sqlite3ExprAddCollateString(pParse, pTerm,
+          PTCollSeq(pColl)^.zName);
+      end;
+      PPointer(PByte(pRet) + SizeOf(TKeyInfo))[i] := pColl;
+      pRet^.aSortFlags[i] := pItem^.fg.sortFlags;
+      Inc(pItem);
+    end;
   end;
   Result := pRet;
 end;
