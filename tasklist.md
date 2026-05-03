@@ -33,9 +33,9 @@ Important: At the end of this document, please find:
 Correctness is defined **differentially against the C oracle**, not by hand-written
 assertions.  Two gates matter:
 
-* `bin/TestExplainParity` — the **bytecode** gate.  1024/1026 SQL statements
-  emit byte-identical VDBE vs C as of 2026-05-03.  The two open rows are
-  enumerated under "Open Bugs" (6.10 step 6).
+* `bin/TestExplainParity` — the **bytecode** gate.  1025/1026 SQL statements
+  emit byte-identical VDBE vs C as of 2026-05-03.  Only the multi-row VALUES
+  coroutine arm row remains (see "Open Bugs" 6.10 step 6).
 * `src/tests/Diag*.pas` (`DiagOps`, `DiagCast`, `DiagFunctions`, `DiagWindow`,
   `DiagTxn`, `DiagFeatureProbe`, …) — the **runtime** gates.  Each probe pins a
   narrow runtime divergence to a numbered "Open Bugs" bullet.  When a Diag
@@ -61,8 +61,8 @@ FPC porting traps that recur often enough to call out up-front:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-> **2026-05-03 (a3):** TestExplainParity reports **1024 / 1026 PASS**.
-> Two corpus rows still diverge (see 6.10 step 6).
+> **2026-05-03 (a3):** TestExplainParity reports **1025 / 1026 PASS**.
+> Only the multi-row VALUES coroutine row diverges (see 6.10 step 6).
 
 - [X] **6.8.0** Pragma (pragma.c): `sqlite3PragmaVtabRegister` — DONE.
      1:1 port of pragma.c:2791..3101 (aPragmaName, pragCName, all 12
@@ -269,15 +269,18 @@ FPC porting traps that recur often enough to call out up-front:
 
 ### Open Bugs
 
-- [ ] **6.10** `TestExplainParity.pas` — 1024/1026 PASS as currently
+- [ ] **6.10** `TestExplainParity.pas` — 1025/1026 PASS as currently
     measured (2026-05-03).  Oracle is built with `-DSQLITE_DEBUG
     -DSQLITE_ENABLE_EXPLAIN_COMMENTS`, so emits OP_Explain /
     OP_ReleaseReg (vdbeaux.c gates them under `#if !defined(SQLITE_DEBUG)`);
-    Pas matches.  Only 2 corpus rows still diverge.
+    Pas matches.  Only 1 corpus row still diverges.
     - [ ] **6.10 step 6** Remaining TestExplainParity bytecode-Δ rows:
-        [ ] `SELECT a FROM (SELECT a FROM t)` — Pas emits the co-routine
-          path; C flattens via `flattenSubquery`.  Closes once
-          6.13(b)-fl lands.
+        [X] `SELECT a FROM (SELECT a FROM t)` — DONE (2026-05-03).
+          flattenSubquery wired into sqlite3Select before the co-routine
+          arm; selectExpander cursor-assignment order corrected to match
+          C (build.c:4926..4940 — outer iCursor before recursing into
+          inner pSrc) so the spliced-in inner item carries the expected
+          number.
         [ ] `INSERT multi-row VALUES` — Runtime parity reached; bytecode
           parity needs the coroutine arm of sqlite3MultiValues
           (deferred — runtime is correct).
@@ -384,31 +387,15 @@ FPC porting traps that recur often enough to call out up-front:
             pragma_pragma_list` returns 66 rows.  count(*) /
             arg-bound forms (pragma_table_info('t')) still bail —
             need WhereBegin's vtab branch or count-on-vtab special.
-       [~] **b) Sub-SELECT / view arm** — co-routine emission landed;
-            simple `SELECT a FROM (SELECT a FROM t)` returns live rows.
-            Bytecode shape diverges from C (subquery flattening).
-            Open follow-ups:
-            - **6.13(b)-fl**: `flattenSubquery` body ported
-              (select.c:4281..4712) at codegen.pas, using the
-              previously-landed substExpr/substSelect, recomputeColumnsUsed,
-              findLeftmostExprlist, compoundHasDifferentAffinities, and
-              renumberCursors helpers.  All 28 restriction arms 1:1.
-              Wiring trial (2026-05-03) confirmed the body runs and
-              returns 1 for `SELECT a FROM (SELECT a FROM t)`, but the
-              flattened pSrc[0].iCursor lands at 0 instead of C's 1 —
-              Pas's sqlite3SelectExpand does not recursively assign
-              cursors to inner subqueries the way C does, so the inner
-              table item carries iCursor=-1/0 at flatten time.
-              iCursor reconciliation now fixed — sqlite3SrcListAssignCursors
-              recurses into subquery FROM lists (matches build.c:4934..4940),
-              so flattenSubquery's pSubitem^.iCursor is live at copy time.
-              Remaining: the actual call to flattenSubquery is not yet wired
-              into sqlite3Select's per-FROM-item loop (select.c:7867).
-              Once wired, sub-FROM bytecode-Δ row under 6.10 step 6 closes.
-            - **6.13(b)-coagg**: agg-arm subquery dispatch landed for
-              `count(*) / sum / min / max FROM (SELECT…)` and `… FROM v`
-              via materialise + Rewind scan (codegen.pas:21088..).
-              Flattenable case still wants 6.13(b)-fl for bytecode parity.
+       [X] **b) Sub-SELECT / view arm** — flattenSubquery wired into
+            sqlite3Select before the co-routine arm; selectExpander now
+            assigns the outer iCursor before recursing into the subquery
+            (matches build.c:4926..4940), so the splice preserves the
+            expected cursor numbers.  Sub-FROM bytecode-Δ row under
+            6.10 step 6 closed (1025/1026).
+            [X] **6.13(b)-coagg**: agg-arm subquery dispatch (count(*) /
+                sum / min / max FROM (SELECT…) and … FROM v) via
+                materialise + Rewind scan (codegen.pas:21088..).
        [~] **c) Compound-SELECT / CTE arm** — UNION ALL arm of
             multiSelect ported (select.c:2998..3050) at codegen.pas
             sqlite3Select compound dispatch.  TK_ALL leaves recurse

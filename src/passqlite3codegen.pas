@@ -20339,6 +20339,16 @@ begin
         wants to handle subquery items. }
       if SrcItemIsSubquery(pItem^.fg) and (pItem^.u4.pSubq <> nil) then
       begin
+        { Mirror C selectExpander cursor-assignment order (build.c:4926..4940
+          via select.c:5996): outer item gets iCursor BEFORE recursing into
+          the subquery, so the inner pSrc items receive sequentially-higher
+          numbers.  Required for flattenSubquery bytecode parity — the
+          inner item's iCursor survives the splice over the outer slot. }
+        if pItem^.iCursor < 0 then
+        begin
+          pItem^.iCursor := pParse^.nTab;
+          Inc(pParse^.nTab);
+        end;
         pSubSel := pItem^.u4.pSubq^.pSelect;
         if pSubSel <> nil then
         begin
@@ -20348,11 +20358,6 @@ begin
         if pItem^.pSTab = nil then
         begin
           if sqlite3ExpandSubquery(pParse, pItem) <> SQLITE_OK then Exit;
-        end;
-        if pItem^.iCursor < 0 then
-        begin
-          pItem^.iCursor := pParse^.nTab;
-          Inc(pParse^.nTab);
         end;
         pItem^.colUsed := 0;
         Continue;
@@ -22799,6 +22804,37 @@ begin
       if pParse^.nErr <> 0 then Result := SQLITE_ERROR
                           else Result := SQLITE_OK;
       Exit;
+    end;
+  end;
+
+  { Phase 6.13(b)-fl wiring — try flattenSubquery on the single-source
+    subquery FROM item before the co-routine arm.  Mirrors C select.c
+    tag-select-0240 site at select.c:7867 in the narrow nSrc=1,
+    pPrior=nil, non-aggregate-outer, non-aggregate-inner, non-MATERIALIZED-
+    CTE case.  When flatten returns 1, p^.pSrc^.a[0] has been rewritten
+    into the inner's regular table source(s); subsequent paths
+    (co-routine, materialise, WhereBegin) fall through naturally and
+    behave as if the user had written the flattened SELECT directly.
+    Closes 6.10 step 6 sub-FROM bytecode-Δ row. }
+  if (p^.pPrior = nil) and (p^.pSrc <> nil) and (p^.pSrc^.nSrc = 1)
+     and ((p^.selFlags and SF_Aggregate) = 0)
+  then
+  begin
+    pItem := SrcListItems(p^.pSrc);
+    if (pItem^.pSTab <> nil)
+       and SrcItemIsSubquery(pItem^.fg)
+       and (pItem^.u4.pSubq <> nil)
+       and (pItem^.u4.pSubq^.pSelect <> nil)
+       and ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_Aggregate) = 0)
+    then
+    begin
+      if flattenSubquery(pParse, p, 0, 0) <> 0 then
+      begin
+        if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+        { Refresh pTabList — the subquery's source replaced the outer's
+          single FROM item.  Subsequent code paths read p^.pSrc directly. }
+        pTabList := p^.pSrc;
+      end;
     end;
   end;
 
