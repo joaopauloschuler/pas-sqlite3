@@ -1551,6 +1551,7 @@ const
   SQLITE_ExistsToJoin   = u32($40000000);  { EXISTS-to-JOIN optimization (sqliteInt.h:1932) }
   SQLITE_MinMaxOpt      = u32($00010000);  { The min/max optimization (sqliteInt.h:1916) }
   SQLITE_Coroutines     = u32($02000000);  { Co-routines for subqueries (sqliteInt.h:1927) }
+  SQLITE_BalancedMerge  = u32($00200000);  { Balance multi-way merges (sqliteInt.h:1922) }
 
   { TOPBIT — top bit of a 64-bit Bitmask (sqliteInt.h:1414); used by
     whereLoopAddBtree's "covering by bitmask" check to detect the
@@ -2036,6 +2037,7 @@ function  sqlite3KeyInfoFromExprList(pParse: PParse; pList: PExprList;
   iStart: i32; nExtra: i32): PKeyInfo2;
 function  multiSelectCollSeq(pParse: PParse; p: PSelect; iCol: i32): Pointer;
 function  multiSelectByMergeKeyInfo(pParse: PParse; p: PSelect; nExtra: i32): PKeyInfo2;
+function  hasAnchor(p: PSelect): i32;
 procedure computeLimitRegisters(pParse: PParse; p: PSelect; iBreak: i32);
 procedure codeOffset(v: PVdbe; iOffset: i32; iContinue: i32);
 function  generateOutputSubroutine(pParse: PParse; p: PSelect;
@@ -18244,6 +18246,17 @@ begin
     end;
   end;
   Result := pRet;
+end;
+
+{ hasAnchor — port of select.c:2890..2893.  Returns 1 if the recursive part
+  of a recursive CTE still has its anchor terms attached (i.e. the SF_Recursive
+  bit on the leaf chain has not yet been stripped).  Building block for the
+  generateWithRecursiveQuery dispatch in multiSelect (6.10 step 9(f)). }
+function hasAnchor(p: PSelect): i32;
+begin
+  while (p <> nil) and ((p^.selFlags and SF_Recursive) <> 0) do
+    p := p^.pPrior;
+  if p <> nil then Result := 1 else Result := 0;
 end;
 
 { computeLimitRegisters — compute LIMIT / OFFSET registers (select.c:2508).

@@ -261,12 +261,10 @@ skeleton.
           no-WHERE-non-partial-index case so the cost-based planner
           can pick the covering autoindex.
   
-  [ ] **6.10 step 7** Runtime divergences surfaced by `DiagMisc`.
-      Silent result-set bugs (prep+step clean, wrong value).
-      [ ] **c) Aggregate-no-GROUP-BY codegen path** — partial.  Common
-        cases PASS.  Remaining gaps fold into the open INNER-JOIN
-        bloom-filter case (6.10 step 9 d-INNER) and sub-FROM
-        materialise (step 6 sub-FROM).
+  [X] **6.10 step 7** `DiagMisc` runtime divergences — all PASS as of
+      2026-05-03.  Remaining aggregate-no-GROUP-BY corner cases fold
+      into the open INNER-JOIN bloom-filter case (6.10 step 9 d-INNER)
+      and sub-FROM materialise (step 6 sub-FROM).
 
   [ ] **6.10 step 9** Runtime divergences surfaced by
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
@@ -283,14 +281,15 @@ skeleton.
         of multiSelect (select.c:2998..3050) ported at codegen.pas
         sqlite3Select compound dispatch; `SELECT 1 UNION ALL SELECT 2`
         and `SELECT count(*) FROM (... UNION ALL ...)` PASS (no-FROM
-        leaf extended for SRT_EphemTab/SRT_Table).  Helpers
-        `multiSelectCollSeq` (select.c:2565..2580),
+        leaf extended for SRT_EphemTab/SRT_Table).  Prereqs landed for
+        the merge arm: `multiSelectCollSeq` (select.c:2565..2580),
         `multiSelectByMergeKeyInfo` (select.c:2591..2618),
-        `codeOffset` (select.c:879..888) and `generateOutputSubroutine`
-        (select.c:3097..3303) ported alongside as prerequisites for
-        the dedup / merge arms.  Remaining: UNION / INTERSECT / EXCEPT
-        (need multiSelectByMerge) and `SELECT 1 UNION SELECT 2`
-        dedup.  Also LIMIT propagation through UNION ALL still bails.
+        `codeOffset` (select.c:879..888), `generateOutputSubroutine`
+        (select.c:3097..3303), `hasAnchor` (select.c:2890..2893), plus
+        `SQLITE_BalancedMerge` optimisation flag.  Remaining: port
+        `multiSelectByMerge` (select.c:3390..3722, ~333 LOC) — closes
+        UNION / INTERSECT / EXCEPT and `SELECT 1 UNION SELECT 2` dedup
+        in one shot.  LIMIT propagation through UNION ALL still bails.
         Folds into 6.13(c).
       [~] **f) WITH / CTE not productive** — simple non-recursive CTE
         works.  Recursive CTE preps cleanly (recursion-detection arm of
@@ -299,13 +298,10 @@ skeleton.
         compound SF_Recursive codegen (generateWithRecursiveQuery —
         select.c:2680..2826) unported, so `WITH RECURSIVE r(n) AS
         (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<5) SELECT count(*)
-        FROM r` returns 0 instead of 5.  Building-block helper
-        `computeLimitRegisters` (select.c:2508..2554) ported as a
-        standalone procedure — full body including the non-constant
-        LIMIT arm (ExprCode + MustBeInt + IfNot) and the
-        SF_FixedLimit / nSelectRow tightening — ready for the
-        generateWithRecursiveQuery and multiSelect-LIMIT-propagation
-        arms when they land.
+        FROM r` returns 0 instead of 5.  Building-blocks ported and
+        ready: `computeLimitRegisters` (select.c:2508..2554, full body
+        incl. non-constant LIMIT arm + SF_FixedLimit/nSelectRow
+        tightening), `hasAnchor` (select.c:2890..2893).
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
