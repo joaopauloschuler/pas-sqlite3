@@ -212,6 +212,21 @@ skeleton.
 
 ### Open Bugs
 
+- [ ] **4.6-regress** `TestBtreeCompat.T30` — flaky `EAccessViolation`.
+    T30 (sorted descending corpus, N=500: insert keys 500..1 in reverse
+    order, then reopen+scan) was green at commit 1db05c8 ("Phase 4.6
+    complete: TestBtreeCompat T29-T35 all PASS") but now crashes ~50%
+    of runs at -O3 (consistently around addr $46F268 / $46C2F8).
+    Standalone reverse-insert reproductions do **not** crash — only
+    the full TestBtreeCompat sequence (T1..T29 then T30) does, and the
+    flake survives `rm /tmp/bt_t*.db` between runs, so it is not a
+    stale-DB-file artefact.  Non-determinism + previous-test-state
+    dependence points at uninitialised memory in the btree balance
+    path or in pcache, surfaced by the descending-key insert pattern.
+    37 btree/pager-touching commits sit between green and HEAD —
+    bisect deferred (50% flake rate makes a bisect step expensive).
+    T29 (ascending), T31 (random shuffle, N=200), T32..T35 all PASS.
+
 - [ ] **6.10** `TestExplainParity.pas` — 1024/1026 PASS as currently
     measured (2026-05-03).  Oracle is built with `-DSQLITE_DEBUG
     -DSQLITE_ENABLE_EXPLAIN_COMMENTS`, so emits OP_Explain /
