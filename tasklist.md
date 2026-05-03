@@ -191,12 +191,24 @@ FPC porting traps that recur often enough to call out up-front:
             disallowAggregatesInOrderByCb ported.  Not yet productively
             reachable — sqlite3Select still bails on `p^.pWin <> nil`
             (codegen.pas ~22252); CodeInit/Step land next.
-       [ ] Port `sqlite3WindowCodeInit` — opens the window
-            ephemeral table, allocates partition / peer-group
-            registers, emits the partition-boundary detection
-            preamble.
+       [X] Port `sqlite3WindowCodeInit` (window.c:1388) — full 1:1 body
+            replacing the prior stub.  Opens iEphCsr..iEphCsr+3, allocs
+            PARTITION BY register array + regOne, and per-window inline
+            machinery (min/max key store, nth_value/first_value frame
+            indices, lead/lag duplicate cursor).  Leaf helpers ported in
+            same drop: TWindowCodeArg/TWindowCsrAndReg types,
+            WINDOW_RETURN_ROW/AGGINVERSE/AGGSTEP + WINDOW_STARTING_*/
+            ENDING_* constants, windowArgCount (window.c:1527),
+            windowReadPeerValues (1619), windowCheckValue (1480),
+            windowAggStep (1656), windowAggFinal (1775),
+            windowInitAccum (1997), windowCacheFrame (2029),
+            windowIfNewPeer (2055).  Not yet productively wired —
+            sqlite3Select still bails on `p^.pWin <> nil`; CodeStep
+            below is next gate.
        [ ] Port `sqlite3WindowCodeStep` — per-row dispatch into
-            the active frame logic.
+            the active frame logic.  Pending: windowCodeOp +
+            windowCodeRangeTest + windowFullScan + windowReturnOneRow
+            (window.c:1814..2382).
        [ ] Frame-spec emission: ROWS / RANGE / GROUPS, with all
             five bound types (UNBOUNDED PRECEDING, n PRECEDING,
             CURRENT ROW, n FOLLOWING, UNBOUNDED FOLLOWING) and

@@ -42870,22 +42870,487 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// sqlite3WindowCodeInit — init VDBE for window processing (window.c:1388)
-// Stub: requires full SELECT engine (Phase 7+).
+// Window-codegen leaf helpers (window.c:1388..2076).
+// Phase 6.26 productive port — replaces the prior 6.7 stubs of CodeInit/Step.
+// CodeInit is full 1:1; CodeStep remains a stub pending the larger frame
+// dispatcher port (windowCodeOp / windowCodeRangeTest etc.).  These helpers
+// are reachable through CodeInit + windowFullScan / windowReturnOneRow.
+// ---------------------------------------------------------------------------
+
+type
+  TWindowCsrAndReg = record
+    csr: i32;
+    reg: i32;
+  end;
+  PWindowCodeArg = ^TWindowCodeArg;
+  TWindowCodeArg = record
+    pParse:    PParse;
+    pMWin:     PWindow;
+    pVdbe:     PVdbe;
+    addrGosub: i32;
+    regGosub:  i32;
+    regArg:    i32;
+    eDelete:   i32;
+    regRowid:  i32;
+    start:     TWindowCsrAndReg;
+    current:   TWindowCsrAndReg;
+    endRng:    TWindowCsrAndReg;   { renamed from C 'end' (reserved) }
+  end;
+
+const
+  WINDOW_RETURN_ROW    = 1;
+  WINDOW_AGGINVERSE    = 2;
+  WINDOW_AGGSTEP       = 3;
+  WINDOW_STARTING_INT  = 0;
+  WINDOW_ENDING_INT    = 1;
+  WINDOW_NTH_VALUE_INT = 2;
+  WINDOW_STARTING_NUM  = 3;
+  WINDOW_ENDING_NUM    = 4;
+
+  azWindowErr: array[0..4] of PAnsiChar = (
+    'frame starting offset must be a non-negative integer',
+    'frame ending offset must be a non-negative integer',
+    'second argument to nth_value must be a positive integer',
+    'frame starting offset must be a non-negative number',
+    'frame ending offset must be a non-negative number');
+  aWindowCheckOp: array[0..4] of i32 = (
+    OP_Ge, OP_Ge, OP_Gt, OP_Ge, OP_Ge);
+
+// windowArgCount — window.c:1527
+function windowArgCount(pWin: PWindow): i32;
+var
+  pList: PExprList;
+begin
+  Assert(ExprUseXList(pWin^.pOwner));
+  pList := pWin^.pOwner^.x.pList;
+  if pList <> nil then Result := pList^.nExpr else Result := 0;
+end;
+
+// windowReadPeerValues — window.c:1619
+procedure windowReadPeerValues(p: PWindowCodeArg; csr: i32; reg: i32);
+var
+  pMWin:    PWindow;
+  pOrderBy: PExprList;
+  pPart:    PExprList;
+  v:        PVdbe;
+  iColOff:  i32;
+  i:        i32;
+  partExpr: i32;
+begin
+  pMWin    := p^.pMWin;
+  pOrderBy := pMWin^.pOrderBy;
+  if pOrderBy <> nil then
+  begin
+    v       := sqlite3GetVdbe(p^.pParse);
+    pPart   := pMWin^.pPartition;
+    if pPart <> nil then partExpr := pPart^.nExpr else partExpr := 0;
+    iColOff := pMWin^.nBufferCol + partExpr;
+    for i := 0 to pOrderBy^.nExpr - 1 do
+      sqlite3VdbeAddOp3(v, OP_Column, csr, iColOff + i, reg + i);
+  end;
+end;
+
+// windowCheckValue — window.c:1480
+procedure windowCheckValue(pParse: PParse; reg: i32; eCond: i32);
+var
+  v:         PVdbe;
+  regZero:   i32;
+  regString: i32;
+begin
+  v       := sqlite3GetVdbe(pParse);
+  regZero := sqlite3GetTempReg(pParse);
+  Assert((eCond >= 0) and (eCond <= 4));
+  sqlite3VdbeAddOp2(v, OP_Integer, 0, regZero);
+  if eCond >= WINDOW_STARTING_NUM then
+  begin
+    regString := sqlite3GetTempReg(pParse);
+    sqlite3VdbeAddOp4(v, OP_String8, 0, regString, 0,
+                      PAnsiChar(''), P4_STATIC);
+    sqlite3VdbeAddOp3(v, OP_Ge, regString,
+                      sqlite3VdbeCurrentAddr(v) + 2, reg);
+    sqlite3VdbeChangeP5(v, SQLITE_AFF_NUMERIC or SQLITE_JUMPIFNULL);
+    { VdbeCoverage(v) — debug-only no-op }
+  end
+  else
+  begin
+    sqlite3VdbeAddOp2(v, OP_MustBeInt, reg,
+                      sqlite3VdbeCurrentAddr(v) + 2);
+    { VdbeCoverage(v) — debug-only no-op }
+  end;
+  sqlite3VdbeAddOp3(v, aWindowCheckOp[eCond], regZero,
+                    sqlite3VdbeCurrentAddr(v) + 2, reg);
+  sqlite3VdbeChangeP5(v, SQLITE_AFF_NUMERIC);
+  sqlite3MayAbort(pParse);
+  sqlite3VdbeAddOp2(v, OP_Halt, SQLITE_ERROR, OE_Abort);
+  sqlite3VdbeAppendP4(v, Pointer(azWindowErr[eCond]), P4_STATIC);
+  sqlite3ReleaseTempReg(pParse, regZero);
+end;
+
+// windowAggStep — window.c:1656
+procedure windowAggStep(p: PWindowCodeArg; pMWin: PWindow;
+  csr: i32; bInverse: i32; reg: i32);
+var
+  pPrs:    PParse;        { renamed from pParse — FPC case-insensitivity collides with PParse type }
+  v:       PVdbe;
+  pWin:    PWindow;
+  pFunc:   PTFuncDef;
+  regArg:  i32;
+  nArg:    i32;
+  i:       i32;
+  addrIf:  i32;
+  regTmp:  i32;
+  addrIsNull: i32;
+  iOp:     i32;
+  iEnd:    i32;
+  pOp:     PVdbeOp;
+  pColl:   Pointer;
+  invOp:   i32;
+begin
+  pPrs := p^.pParse;
+  v    := sqlite3GetVdbe(pPrs);
+  pWin := pMWin;
+  while pWin <> nil do
+  begin
+    pFunc := PTFuncDef(pWin^.pWFunc);
+    if pWin^.bExprArgs <> 0 then nArg := 0 else nArg := windowArgCount(pWin);
+    addrIf := 0;
+
+    Assert((bInverse = 0) or (pWin^.eStart <> TK_UNBOUNDED));
+
+    for i := 0 to nArg - 1 do
+    begin
+      if (i <> 1) or (pFunc^.zName <> nth_valueName) then
+        sqlite3VdbeAddOp3(v, OP_Column, csr, pWin^.iArgCol + i, reg + i)
+      else
+        sqlite3VdbeAddOp3(v, OP_Column, pMWin^.iEphCsr,
+                          pWin^.iArgCol + i, reg + i);
+    end;
+    regArg := reg;
+
+    if pWin^.pFilter <> nil then
+    begin
+      Assert(ExprUseXList(pWin^.pOwner));
+      regTmp := sqlite3GetTempReg(pPrs);
+      sqlite3VdbeAddOp3(v, OP_Column, csr, pWin^.iArgCol + nArg, regTmp);
+      addrIf := sqlite3VdbeAddOp3(v, OP_IfNot, regTmp, 0, 1);
+      { VdbeCoverage(v) }
+      sqlite3ReleaseTempReg(pPrs, regTmp);
+    end;
+
+    if  (pMWin^.regStartRowid = 0)
+    and ((pFunc^.funcFlags and SQLITE_FUNC_MINMAX) <> 0)
+    and (pWin^.eStart <> TK_UNBOUNDED) then
+    begin
+      addrIsNull := sqlite3VdbeAddOp1(v, OP_IsNull, regArg);
+      { VdbeCoverage(v) }
+      if bInverse = 0 then
+      begin
+        sqlite3VdbeAddOp2(v, OP_AddImm, pWin^.regApp + 1, 1);
+        sqlite3VdbeAddOp2(v, OP_SCopy, regArg, pWin^.regApp);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, pWin^.regApp, 2,
+                          pWin^.regApp + 2);
+        sqlite3VdbeAddOp2(v, OP_IdxInsert, pWin^.csrApp,
+                          pWin^.regApp + 2);
+      end
+      else
+      begin
+        sqlite3VdbeAddOp4Int(v, OP_SeekGE, pWin^.csrApp, 0, regArg, 1);
+        { VdbeCoverageNeverTaken(v) }
+        sqlite3VdbeAddOp1(v, OP_Delete, pWin^.csrApp);
+        sqlite3VdbeJumpHere(v, sqlite3VdbeCurrentAddr(v) - 2);
+      end;
+      sqlite3VdbeJumpHere(v, addrIsNull);
+    end
+    else if pWin^.regApp <> 0 then
+    begin
+      Assert(pWin^.pFilter = nil);
+      Assert((pFunc^.zName = nth_valueName) or (pFunc^.zName = first_valueName));
+      Assert((bInverse = 0) or (bInverse = 1));
+      sqlite3VdbeAddOp2(v, OP_AddImm, pWin^.regApp + 1 - bInverse, 1);
+    end
+    else if Pointer(@pFunc^.xSFunc) <> Pointer(@noopWindowStepFunc) then
+    begin
+      if pWin^.bExprArgs <> 0 then
+      begin
+        iOp  := sqlite3VdbeCurrentAddr(v);
+        Assert(ExprUseXList(pWin^.pOwner));
+        nArg := pWin^.pOwner^.x.pList^.nExpr;
+        regArg := sqlite3GetTempRange(pPrs, nArg);
+        sqlite3ExprCodeExprList(pPrs, pWin^.pOwner^.x.pList,
+                                regArg, 0, 0);
+        iEnd := sqlite3VdbeCurrentAddr(v);
+        while iOp < iEnd do
+        begin
+          pOp := sqlite3VdbeGetOp(v, iOp);
+          if (pOp^.opcode = OP_Column) and (pOp^.p1 = pMWin^.iEphCsr) then
+            pOp^.p1 := csr;
+          Inc(iOp);
+        end;
+      end;
+      if (pFunc^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0 then
+      begin
+        Assert(nArg > 0);
+        Assert(ExprUseXList(pWin^.pOwner));
+        pColl := sqlite3ExprNNCollSeq(pPrs,
+                  ExprListItems(pWin^.pOwner^.x.pList)[0].pExpr);
+        sqlite3VdbeAddOp4(v, OP_CollSeq, 0, 0, 0,
+                          PAnsiChar(pColl), P4_COLLSEQ);
+      end;
+      if bInverse <> 0 then invOp := OP_AggInverse else invOp := OP_AggStep;
+      sqlite3VdbeAddOp3(v, invOp, bInverse, regArg, pWin^.regAccum);
+      sqlite3VdbeAppendP4(v, pFunc, P4_FUNCDEF);
+      sqlite3VdbeChangeP5(v, u16(nArg));
+      if pWin^.bExprArgs <> 0 then
+        sqlite3ReleaseTempRange(pPrs, regArg, nArg);
+    end;
+
+    if addrIf <> 0 then sqlite3VdbeJumpHere(v, addrIf);
+    pWin := pWin^.pNextWin;
+  end;
+end;
+
+// windowAggFinal — window.c:1775
+procedure windowAggFinal(p: PWindowCodeArg; bFin: i32);
+var
+  pPrs:   PParse;          { renamed from pParse — FPC case-insensitivity }
+  pMWin:  PWindow;
+  v:      PVdbe;
+  pWin:   PWindow;
+  nArg:   i32;
+begin
+  pPrs   := p^.pParse;
+  pMWin  := p^.pMWin;
+  v      := sqlite3GetVdbe(pPrs);
+  pWin   := pMWin;
+  while pWin <> nil do
+  begin
+    if  (pMWin^.regStartRowid = 0)
+    and ((PTFuncDef(pWin^.pWFunc)^.funcFlags and SQLITE_FUNC_MINMAX) <> 0)
+    and (pWin^.eStart <> TK_UNBOUNDED) then
+    begin
+      sqlite3VdbeAddOp2(v, OP_Null, 0, pWin^.regResult);
+      sqlite3VdbeAddOp1(v, OP_Last, pWin^.csrApp);
+      { VdbeCoverage(v) }
+      sqlite3VdbeAddOp3(v, OP_Column, pWin^.csrApp, 0, pWin^.regResult);
+      sqlite3VdbeJumpHere(v, sqlite3VdbeCurrentAddr(v) - 2);
+    end
+    else if pWin^.regApp <> 0 then
+    begin
+      Assert(pMWin^.regStartRowid = 0);
+    end
+    else
+    begin
+      nArg := windowArgCount(pWin);
+      if bFin <> 0 then
+      begin
+        sqlite3VdbeAddOp2(v, OP_AggFinal, pWin^.regAccum, nArg);
+        sqlite3VdbeAppendP4(v, pWin^.pWFunc, P4_FUNCDEF);
+        sqlite3VdbeAddOp2(v, OP_Copy, pWin^.regAccum, pWin^.regResult);
+        sqlite3VdbeAddOp2(v, OP_Null, 0, pWin^.regAccum);
+      end
+      else
+      begin
+        sqlite3VdbeAddOp3(v, OP_AggValue, pWin^.regAccum, nArg,
+                          pWin^.regResult);
+        sqlite3VdbeAppendP4(v, pWin^.pWFunc, P4_FUNCDEF);
+      end;
+    end;
+    pWin := pWin^.pNextWin;
+  end;
+end;
+
+// windowInitAccum — window.c:1997
+function windowInitAccum(pParse: PParse; pMWin: PWindow): i32;
+var
+  v:      PVdbe;
+  regArg: i32;
+  nArg:   i32;
+  pWin:   PWindow;
+  pFunc:  PTFuncDef;
+  ac:     i32;
+begin
+  v    := sqlite3GetVdbe(pParse);
+  nArg := 0;
+  pWin := pMWin;
+  while pWin <> nil do
+  begin
+    pFunc := PTFuncDef(pWin^.pWFunc);
+    Assert(pWin^.regAccum <> 0);
+    sqlite3VdbeAddOp2(v, OP_Null, 0, pWin^.regAccum);
+    ac := windowArgCount(pWin);
+    if ac > nArg then nArg := ac;
+    if pMWin^.regStartRowid = 0 then
+    begin
+      if (pFunc^.zName = nth_valueName) or (pFunc^.zName = first_valueName) then
+      begin
+        sqlite3VdbeAddOp2(v, OP_Integer, 0, pWin^.regApp);
+        sqlite3VdbeAddOp2(v, OP_Integer, 0, pWin^.regApp + 1);
+      end;
+      if ((pFunc^.funcFlags and SQLITE_FUNC_MINMAX) <> 0)
+         and (pWin^.csrApp <> 0) then
+      begin
+        Assert(pWin^.eStart <> TK_UNBOUNDED);
+        sqlite3VdbeAddOp1(v, OP_ResetSorter, pWin^.csrApp);
+        sqlite3VdbeAddOp2(v, OP_Integer, 0, pWin^.regApp + 1);
+      end;
+    end;
+    pWin := pWin^.pNextWin;
+  end;
+  regArg := pParse^.nMem + 1;
+  pParse^.nMem := pParse^.nMem + nArg;
+  Result := regArg;
+end;
+
+// windowCacheFrame — window.c:2029
+function windowCacheFrame(pMWin: PWindow): i32;
+var
+  pWin:  PWindow;
+  pFunc: PTFuncDef;
+  nm:    PAnsiChar;
+begin
+  if pMWin^.regStartRowid <> 0 then begin Result := 1; Exit; end;
+  pWin := pMWin;
+  while pWin <> nil do
+  begin
+    pFunc := PTFuncDef(pWin^.pWFunc);
+    nm := pFunc^.zName;
+    if (nm = nth_valueName) or (nm = first_valueName)
+       or (nm = leadName) or (nm = lagName) then
+    begin Result := 1; Exit; end;
+    pWin := pWin^.pNextWin;
+  end;
+  Result := 0;
+end;
+
+// windowIfNewPeer — window.c:2055
+procedure windowIfNewPeer(pParse: PParse; pOrderBy: PExprList;
+  regNew: i32; regOld: i32; addr: i32);
+var
+  v:        PVdbe;
+  nVal:     i32;
+  pKeyInfo: PKeyInfo2;
+begin
+  v := sqlite3GetVdbe(pParse);
+  if pOrderBy <> nil then
+  begin
+    nVal := pOrderBy^.nExpr;
+    pKeyInfo := sqlite3KeyInfoFromExprList(pParse, pOrderBy, 0, 0);
+    sqlite3VdbeAddOp3(v, OP_Compare, regOld, regNew, nVal);
+    sqlite3VdbeAppendP4(v, pKeyInfo, P4_KEYINFO);
+    sqlite3VdbeAddOp3(v, OP_Jump,
+      sqlite3VdbeCurrentAddr(v) + 1, addr,
+      sqlite3VdbeCurrentAddr(v) + 1);
+    { VdbeCoverageEqNe(v) }
+    sqlite3VdbeAddOp3(v, OP_Copy, regNew, regOld, nVal - 1);
+  end
+  else
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, addr);
+end;
+
+// ---------------------------------------------------------------------------
+// sqlite3WindowCodeInit — full 1:1 port of window.c:1388.
+// Opens the four ephemeral cursors at iEphCsr..iEphCsr+3, allocates the
+// PARTITION BY register array, the regOne anchor, and any per-window
+// inline machinery (min/max key store, nth_value/first_value frame
+// indices, lead/lag duplicate cursor).  Pairs with sqlite3WindowRewrite
+// (already ported) — together they prepare every register/cursor that
+// CodeStep will later reference.
 // ---------------------------------------------------------------------------
 procedure sqlite3WindowCodeInit(pParse: PParse; pSelect: PSelect);
+var
+  pWin:     PWindow;
+  pMWin:    PWindow;
+  v:        PVdbe;
+  nEphExpr: i32;
+  pItem0:   PSrcItem;
+  p:        PTFuncDef;
+  pList:    PExprList;
+  pKI:      PKeyInfo2;
+  nExpr:    i32;
 begin
-  { Phase 6.7 stub — full VDBE window code generation deferred to Phase 7+ }
+  pItem0 := @SrcListItems(pSelect^.pSrc)[0];
+  Assert((pItem0^.fg.fgBits and u8($04)) <> 0);  { isSubquery }
+  nEphExpr := pItem0^.u4.pSubq^.pSelect^.pEList^.nExpr;
+  pMWin := pSelect^.pWin;
+  v := sqlite3GetVdbe(pParse);
+
+  sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pMWin^.iEphCsr, nEphExpr);
+  sqlite3VdbeAddOp2(v, OP_OpenDup, pMWin^.iEphCsr + 1, pMWin^.iEphCsr);
+  sqlite3VdbeAddOp2(v, OP_OpenDup, pMWin^.iEphCsr + 2, pMWin^.iEphCsr);
+  sqlite3VdbeAddOp2(v, OP_OpenDup, pMWin^.iEphCsr + 3, pMWin^.iEphCsr);
+
+  if pMWin^.pPartition <> nil then
+  begin
+    nExpr := pMWin^.pPartition^.nExpr;
+    pMWin^.regPart := pParse^.nMem + 1;
+    pParse^.nMem := pParse^.nMem + nExpr;
+    sqlite3VdbeAddOp3(v, OP_Null, 0, pMWin^.regPart,
+                      pMWin^.regPart + nExpr - 1);
+  end;
+
+  Inc(pParse^.nMem);
+  pMWin^.regOne := pParse^.nMem;
+  sqlite3VdbeAddOp2(v, OP_Integer, 1, pMWin^.regOne);
+
+  if pMWin^.eExclude <> 0 then
+  begin
+    Inc(pParse^.nMem); pMWin^.regStartRowid := pParse^.nMem;
+    Inc(pParse^.nMem); pMWin^.regEndRowid   := pParse^.nMem;
+    pMWin^.csrApp := pParse^.nTab; Inc(pParse^.nTab);
+    sqlite3VdbeAddOp2(v, OP_Integer, 1, pMWin^.regStartRowid);
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, pMWin^.regEndRowid);
+    sqlite3VdbeAddOp2(v, OP_OpenDup, pMWin^.csrApp, pMWin^.iEphCsr);
+    Exit;
+  end;
+
+  pWin := pMWin;
+  while pWin <> nil do
+  begin
+    p := PTFuncDef(pWin^.pWFunc);
+    if ((p^.funcFlags and SQLITE_FUNC_MINMAX) <> 0)
+       and (pWin^.eStart <> TK_UNBOUNDED) then
+    begin
+      Assert(ExprUseXList(pWin^.pOwner));
+      pList := pWin^.pOwner^.x.pList;
+      pKI   := sqlite3KeyInfoFromExprList(pParse, pList, 0, 0);
+      pWin^.csrApp := pParse^.nTab; Inc(pParse^.nTab);
+      pWin^.regApp := pParse^.nMem + 1;
+      pParse^.nMem := pParse^.nMem + 3;
+      if (pKI <> nil) and (PAnsiChar(p^.zName)[1] = 'i') then
+      begin
+        Assert(pKI^.aSortFlags[0] = 0);
+        pKI^.aSortFlags[0] := KEYINFO_ORDER_DESC;
+      end;
+      sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pWin^.csrApp, 2);
+      sqlite3VdbeAppendP4(v, pKI, P4_KEYINFO);
+      sqlite3VdbeAddOp2(v, OP_Integer, 0, pWin^.regApp + 1);
+    end
+    else if (p^.zName = nth_valueName) or (p^.zName = first_valueName) then
+    begin
+      pWin^.regApp := pParse^.nMem + 1;
+      pWin^.csrApp := pParse^.nTab; Inc(pParse^.nTab);
+      pParse^.nMem := pParse^.nMem + 2;
+      sqlite3VdbeAddOp2(v, OP_OpenDup, pWin^.csrApp, pMWin^.iEphCsr);
+    end
+    else if (p^.zName = leadName) or (p^.zName = lagName) then
+    begin
+      pWin^.csrApp := pParse^.nTab; Inc(pParse^.nTab);
+      sqlite3VdbeAddOp2(v, OP_OpenDup, pWin^.csrApp, pMWin^.iEphCsr);
+    end;
+    pWin := pWin^.pNextWin;
+  end;
 end;
 
 // ---------------------------------------------------------------------------
 // sqlite3WindowCodeStep — generate VDBE for one window step (window.c:2784)
-// Stub: requires full SELECT engine (Phase 7+).
+// Stub: pending the windowCodeOp / windowCodeRangeTest dispatcher port.
+// CodeInit + helpers above are reachable through windowFullScan and
+// windowReturnOneRow — wiring lands when CodeStep follows.
 // ---------------------------------------------------------------------------
 procedure sqlite3WindowCodeStep(pParse: PParse; p: PSelect;
   pWInfo: Pointer; regGosub: i32; addrGosub: i32);
 begin
-  { Phase 6.7 stub — full VDBE window code generation deferred to Phase 7+ }
+  { Phase 6.26 stub — windowCodeOp / RangeTest port pending. }
 end;
 
 { ---------------------------------------------------------------------------
