@@ -19506,6 +19506,7 @@ var
   regResult:   i32;
   k:           i32;
   r1:          i32;
+  r2:          i32;
 begin
   v := pParse^.pVdbe;
   if v = nil then Exit;
@@ -19537,10 +19538,12 @@ begin
     SRT_EphemTab, SRT_Table:
     begin
       r1 := sqlite3GetTempReg(pParse);
+      r2 := sqlite3GetTempReg(pParse);
       sqlite3VdbeAddOp3(v, OP_MakeRecord, regResult, nResultCol, r1);
-      sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r1 + 1);
-      sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r1 + 1);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+      sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
       sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+      sqlite3ReleaseTempReg(pParse, r2);
       sqlite3ReleaseTempReg(pParse, r1);
     end;
 
@@ -22111,6 +22114,16 @@ begin
      (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
   if p^.pPrior <> nil then begin
+    { Recursive-CTE arm of multiSelect (select.c:2976..2978).  Must come
+      first — the body inside generateWithRecursiveQuery rewrites the
+      pPrior chain (TK_ALL canonicalisation), so all the other arms
+      below must observe the rewrite ordering. }
+    if ((p^.selFlags and SF_Recursive) <> 0) and (hasAnchor(p) <> 0) then
+    begin
+      generateWithRecursiveQuery(pParse, p, pDest);
+      Result := SQLITE_OK;
+      Exit;
+    end;
     { Compound-SELECT — minimal UNION ALL arm of multiSelect
       (select.c:2998..3050).  The C reference dispatches to multiSelect for
       every compound; we inline the TK_ALL / no-ORDER-BY / no-LIMIT /

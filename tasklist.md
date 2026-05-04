@@ -347,12 +347,22 @@ FPC porting traps that recur often enough to call out up-front:
             SRT_EphemTab / SRT_Table / SRT_Set / SRT_Exists / SRT_Discard).
             Building-blocks already ported: `computeLimitRegisters`,
             `hasAnchor`.
-        [ ] Wire the dispatch into sqlite3Select's compound arm
-            (currently still bails on `(p^.selFlags and SF_Recursive) <> 0`
-            at codegen.pas:21835/21862/21875).  Gating: needs the outer
-            CTE materialise path to call the body with the right
-            destination, and the recursive sub-FROM expansion to expose
-            the iCursor of the self-reference for OP_OpenPseudo.
+        [X] Wire the dispatch into sqlite3Select's compound arm — DONE.
+            generateWithRecursiveQuery now fires from the compound arm
+            of sqlite3Select when SF_Recursive + hasAnchor; reaches the
+            body with eDest=SRT_EphemTab via the agg-on-subquery path.
+            Companion fix: recursiveInnerLoop's SRT_EphemTab/SRT_Table
+            arm allocated NewRowid into r1+1 (collision risk); now uses
+            two GetTempReg calls matching select.c:1346..1349.
+        [ ] Runtime parity gap remains — `WITH RECURSIVE r(n) AS (SELECT
+            1 UNION ALL SELECT n+1 FROM r WHERE n<5) SELECT count(*) FROM
+            r` returns 0 (C: 5).  Dispatch fires (verified with stderr
+            probe), body emits, but the recursive step does not append
+            rows back to Queue.  Suspected: the recursive sub-FROM `FROM
+            r` is not re-aimed at iCurrent (pseudo-cursor) when the inner
+            sqlite3Select recurses with anchor terms detached — the OP_
+            Column iCursor numbers may still point at the unmaterialised
+            CTE table.
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
