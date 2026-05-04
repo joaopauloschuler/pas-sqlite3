@@ -37146,16 +37146,16 @@ end;
 //   * analyzeTable       (analyze.c:1426..1443)
 //   * sqlite3Analyze     (analyze.c:1457..1503)
 //
-// The leaf code generator analyzeOneTable (analyze.c:977..1378) and the
-// StatAccum SQL functions (statInit/statPush/statGet) are still stubbed
-// here — porting those is the next sub-step under Phase 6.27.  Until that
-// lands, openStatTable still emits the CREATE TABLE / DELETE / OP_Clear /
-// OP_OpenWrite preamble; analyzeOneTable below short-circuits before
-// emitting the per-index loop, so ANALYZE produces well-formed (but
-// trivial) bytecode rather than a no-op stub.
+// analyzeOneTable (analyze.c:977..1378) is now ported in full (non-STAT4
+// non-PREUPDATE_HOOK build) — the leaf emits the per-index OP_OpenRead /
+// stat_init / stat_push / stat_get / sqlite_stat1 INSERT chain.  Runtime
+// stat collection still depends on the StatAccum SQL function triplet
+// (statInit / statPush / statGet) which is registered in a follow-up
+// sub-step; callStatGet hands sqlite3VdbeAddFunctionCall a nil pFuncDef
+// today (mirroring the pragma-only path), so the bytecode shape lands
+// but the resulting sqlite_stat1 rows are empty until the SQL funcs land.
 
-{ Forward — analyze.c:977 leaf code generator (still stubbed; emits no
-  index walk until StatAccum SQL funcs land in a follow-up). }
+{ Forward — analyze.c:977 leaf code generator. }
 procedure analyzeOneTable(pParse: PParse; pTab: PTable2; pOnlyIdx: PIndex2;
                           iStatCur, iMem, iTab: i32); forward;
 
@@ -37422,23 +37422,258 @@ begin
   end;
 end;
 
-{ analyzeOneTable — port of analyze.c:977..1378.  Still a code-emit
-  stub: the per-index OP_OpenRead / OP_Function(stat_init/stat_push/
-  stat_get) / OP_Insert chain depends on the StatAccum SQL function
-  registration (statInitFuncdef / statPushFuncdef / statGetFuncdef)
-  which lands in the next sub-step.  Until then, ANALYZE produces a
-  schema-write framing (BeginWrite + openStatTable + LoadAnalysis +
-  Expire) but no actual stat1 rows.
+{ analyzeVdbeCommentIndexWithColumnName — analyze.c:952..968.
+  Debug/EXPLAIN_COMMENTS-only annotation helper; this port does not
+  emit comment payloads (no EXPLAIN-comment plumbing in the Pascal
+  VDBE), so the body is a no-op.  Kept as a named entry point so the
+  call sites below mirror the C source shape verbatim. }
+procedure analyzeVdbeCommentIndexWithColumnName(v: PVdbe;
+  pIdx: PIndex2; k: i32); inline;
+begin
+  if (v = nil) or (pIdx = nil) or (k < 0) then ;  { silence "unused" }
+end;
 
-  Marked as the explicit gate for Phase 6.27 (analyze.c full port). }
+{ STAT_GET_* function selectors (analyze.c:793..797).  Non-STAT4 build
+  only references STAT_GET_STAT1; the others land for shape-parity. }
+const
+  STAT_GET_STAT1 = 0;
+  STAT_GET_ROWID = 1;
+  STAT_GET_NEQ   = 2;
+  STAT_GET_NLT   = 3;
+  STAT_GET_NDLT  = 4;
+  IsStat4        = 0;  { non-STAT4 build }
+
+{ analyzeOneTable — port of analyze.c:977..1378.  1:1 body (non-STAT4,
+  non-PREUPDATE_HOOK build) — emits the per-index OP_OpenRead /
+  stat_init / Rewind / next-row distinct-test / stat_push / Next /
+  stat_get / sqlite_stat1 INSERT chain.
+
+  Runtime ANALYZE remains a no-op until the StatAccum SQL function
+  triplet (statInit / statPush / statGet) is registered (callStatGet
+  hands sqlite3VdbeAddFunctionCall a nil pFuncDef today, mirroring the
+  pragma-only path).  Bytecode shape now matches C exactly so the
+  EXPLAIN gate surfaces the StatAccum gap as a runtime divergence,
+  not a structural one. }
 procedure analyzeOneTable(pParse: PParse; pTab: PTable2; pOnlyIdx: PIndex2;
                           iStatCur, iMem, iTab: i32);
+var
+  db:           PTsqlite3;
+  pIdx:         PIndex2;
+  iIdxCur:      i32;
+  iTabCur:      i32;
+  v:            PVdbe;
+  i:            i32;
+  jZeroRows:    i32;
+  iDb:          i32;
+  needTableCnt: u8;
+  regNewRowid:  i32;
+  regStat:      i32;
+  regChng:      i32;
+  regRowid:     i32;
+  regTemp:      i32;
+  regTemp2:     i32;
+  regTabname:   i32;
+  regIdxname:   i32;
+  regStat1:     i32;
+  regPrev:      i32;
+  iMemLocal:    i32;
+  iTabLocal:    i32;
+  nCol:         i32;
+  addrGotoEnd:  i32;
+  addrNextRow:  i32;
+  zIdxName:     PAnsiChar;
+  nColTest:     i32;
+  endDistinctTest: i32;
+  aGotoChng:    Pi32;
+  pColl:        PAnsiChar;
+  uniqNN:       u32;
+  azCollPP:     PPAnsiChar;
+  j1, j2, j3:   i32;
 begin
-  { Silence "unused parameter" warnings — mirror upstream's behaviour
-    when SQLITE_OMIT_ANALYZE-style trimming is in effect. }
-  if (pParse = nil) or (pTab = nil) then Exit;
-  if pOnlyIdx = pOnlyIdx then ;     { keep referenced }
-  if (iStatCur or iMem or iTab) = 0 then ;
+  iMemLocal := iMem;
+  iTabLocal := iTab;
+  jZeroRows := -1;
+  needTableCnt := 1;
+  db := pParse^.db;
+  regNewRowid := iMemLocal; Inc(iMemLocal);
+  regStat     := iMemLocal; Inc(iMemLocal);
+  regChng     := iMemLocal; Inc(iMemLocal);
+  regRowid    := iMemLocal; Inc(iMemLocal);
+  regTemp     := iMemLocal; Inc(iMemLocal);
+  regTemp2    := iMemLocal; Inc(iMemLocal);
+  regTabname  := iMemLocal; Inc(iMemLocal);
+  regIdxname  := iMemLocal; Inc(iMemLocal);
+  regStat1    := iMemLocal; Inc(iMemLocal);
+  regPrev     := iMemLocal;       { MUST BE LAST }
+
+  sqlite3TouchRegister(pParse, iMemLocal);
+  v := sqlite3GetVdbe(pParse);
+  if (v = nil) or (pTab = nil) then Exit;
+
+  { Skip views / virtual tables and system tables. }
+  if pTab^.eTabType <> TABTYP_NORM then Exit;  { IsOrdinaryTable }
+  if sqlite3_strlike('sqlite\_%', pTab^.zName, Ord('\')) = 0 then Exit;
+
+  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  AssertH(iDb >= 0, 'analyzeOneTable: iDb<0');
+
+  { sqlite3TableLock — no-op under SQLITE_OMIT_SHARED_CACHE. }
+  iTabCur := iTabLocal; Inc(iTabLocal);
+  iIdxCur := iTabLocal; Inc(iTabLocal);
+  if pParse^.nTab < iTabLocal then pParse^.nTab := iTabLocal;
+  sqlite3OpenTable(pParse, iTabCur, iDb, pTab, OP_OpenRead);
+  sqlite3VdbeLoadString(v, regTabname, pTab^.zName);
+
+  pIdx := pTab^.pIndex;
+  while pIdx <> nil do
+  begin
+    if (pOnlyIdx <> nil) and (pOnlyIdx <> pIdx) then
+    begin
+      pIdx := pIdx^.pNext;
+      Continue;
+    end;
+    if pIdx^.pPartIdxWhere = nil then needTableCnt := 0;
+
+    uniqNN := (pIdx^.idxFlags shr 3) and 1;  { uniqNotNull = bit 3 }
+    if (not HasRowid(pTab))
+       and ((pIdx^.idxFlags and 3) = 2) then  { idxType==IDXTYPE_PRIMARYKEY }
+    begin
+      nCol := i32(pIdx^.nKeyCol);
+      zIdxName := pTab^.zName;
+      nColTest := nCol - 1;
+    end else begin
+      nCol := i32(pIdx^.nColumn);
+      zIdxName := pIdx^.zName;
+      if uniqNN <> 0 then nColTest := i32(pIdx^.nKeyCol) - 1
+      else                nColTest := nCol - 1;
+    end;
+
+    sqlite3VdbeLoadString(v, regIdxname, zIdxName);
+
+    sqlite3TouchRegister(pParse, regPrev + nColTest);
+
+    { Open a read-only cursor on the index being analyzed. }
+    sqlite3VdbeAddOp3(v, OP_OpenRead, iIdxCur, i32(pIdx^.tnum), iDb);
+    sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pIdx));
+
+    {   regChng = 0
+        Rewind csr ; if eof goto end_of_scan
+        count() ; stat_init() }
+    AssertH(regTemp2 = regStat + 4, 'analyzeOneTable: regTemp2 layout');
+    sqlite3VdbeAddOp2(v, OP_Integer, db^.nAnalysisLimit, regTemp2);
+
+    sqlite3VdbeAddOp2(v, OP_Integer, nCol, regStat + 1);
+    AssertH(regRowid = regStat + 2, 'analyzeOneTable: regRowid layout');
+    sqlite3VdbeAddOp2(v, OP_Integer, i32(pIdx^.nKeyCol), regRowid);
+    if OptimizationDisabled(db, SQLITE_Stat4) then
+      sqlite3VdbeAddOp3(v, OP_Count, iIdxCur, regTemp, 1)
+    else
+      sqlite3VdbeAddOp3(v, OP_Count, iIdxCur, regTemp, 0);
+    sqlite3VdbeAddFunctionCall(pParse, 0, regStat + 1, regStat, 4,
+                               nil, 0);  { statInitFuncdef — not yet registered }
+    addrGotoEnd := sqlite3VdbeAddOp1(v, OP_Rewind, iIdxCur);
+
+    sqlite3VdbeAddOp2(v, OP_Integer, 0, regChng);
+    addrNextRow := sqlite3VdbeCurrentAddr(v);
+
+    if nColTest > 0 then
+    begin
+      endDistinctTest := sqlite3VdbeMakeLabel(pParse);
+      aGotoChng := Pi32(sqlite3DbMallocRawNN(db, SizeOf(i32) * nColTest));
+      if aGotoChng = nil then
+      begin
+        pIdx := pIdx^.pNext;
+        Continue;
+      end;
+
+      sqlite3VdbeAddOp0(v, OP_Goto);
+      addrNextRow := sqlite3VdbeCurrentAddr(v);
+      if (nColTest = 1) and (pIdx^.nKeyCol = 1)
+         and (pIdx^.onError <> OE_None) then  { IsUniqueIndex }
+      begin
+        { Single-column UNIQUE: once a non-NULL row is seen, distinctness
+          is guaranteed for the rest. }
+        sqlite3VdbeAddOp2(v, OP_NotNull, regPrev, endDistinctTest);
+      end;
+      azCollPP := PPAnsiChar(pIdx^.azColl);
+      for i := 0 to nColTest - 1 do
+      begin
+        pColl := PAnsiChar(sqlite3LocateCollSeq(pParse, azCollPP[i]));
+        sqlite3VdbeAddOp2(v, OP_Integer, i, regChng);
+        sqlite3VdbeAddOp3(v, OP_Column, iIdxCur, i, regTemp);
+        analyzeVdbeCommentIndexWithColumnName(v, pIdx, i);
+        Pi32(@aGotoChng[i])^ :=
+          sqlite3VdbeAddOp4(v, OP_Ne, regTemp, 0, regPrev + i,
+                            pColl, P4_COLLSEQ);
+        sqlite3VdbeChangeP5(v, SQLITE_NULLEQ);
+      end;
+      sqlite3VdbeAddOp2(v, OP_Integer, nColTest, regChng);
+      sqlite3VdbeGoto(v, endDistinctTest);
+
+      sqlite3VdbeJumpHere(v, addrNextRow - 1);
+      for i := 0 to nColTest - 1 do
+      begin
+        sqlite3VdbeJumpHere(v, aGotoChng[i]);
+        sqlite3VdbeAddOp3(v, OP_Column, iIdxCur, i, regPrev + i);
+        analyzeVdbeCommentIndexWithColumnName(v, pIdx, i);
+      end;
+      sqlite3VdbeResolveLabel(v, endDistinctTest);
+      sqlite3DbFree(db, aGotoChng);
+    end;
+
+    {   stat_push(P, regChng, regRowid)
+        Next csr ; if !eof goto next_row }
+    AssertH(regChng = regStat + 1, 'analyzeOneTable: regChng layout');
+    sqlite3VdbeAddFunctionCall(pParse, 1, regStat, regTemp, 2 + IsStat4,
+                               nil, 0);  { statPushFuncdef — not yet registered }
+    if db^.nAnalysisLimit <> 0 then
+    begin
+      j1 := sqlite3VdbeAddOp1(v, OP_IsNull, regTemp);
+      j2 := sqlite3VdbeAddOp1(v, OP_If, regTemp);
+      j3 := sqlite3VdbeAddOp4Int(v, OP_SeekGT, iIdxCur, 0, regPrev, 1);
+      sqlite3VdbeJumpHere(v, j1);
+      sqlite3VdbeAddOp2(v, OP_Next, iIdxCur, addrNextRow);
+      sqlite3VdbeJumpHere(v, j2);
+      sqlite3VdbeJumpHere(v, j3);
+    end else begin
+      sqlite3VdbeAddOp2(v, OP_Next, iIdxCur, addrNextRow);
+    end;
+
+    { Add the entry to the stat1 table. }
+    if pIdx^.pPartIdxWhere <> nil then
+    begin
+      sqlite3VdbeJumpHere(v, addrGotoEnd);
+      addrGotoEnd := 0;
+    end;
+    callStatGet(pParse, regStat, STAT_GET_STAT1, regStat1);
+    AssertH(AnsiChar('B') = AnsiChar(SQLITE_AFF_TEXT),
+            'analyzeOneTable: AFF_TEXT mismatch');
+    sqlite3VdbeAddOp4(v, OP_MakeRecord, regTabname, 3, regTemp,
+                      PAnsiChar('BBB'), 0);
+    sqlite3VdbeAddOp2(v, OP_NewRowid, iStatCur, regNewRowid);
+    sqlite3VdbeAddOp3(v, OP_Insert, iStatCur, regTemp, regNewRowid);
+    sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+
+    { End of analysis }
+    if addrGotoEnd <> 0 then sqlite3VdbeJumpHere(v, addrGotoEnd);
+
+    pIdx := pIdx^.pNext;
+  end;
+
+  { Single sqlite_stat1 entry containing NULL as the index name and the
+    row count as the content. }
+  if (pOnlyIdx = nil) and (needTableCnt <> 0) then
+  begin
+    sqlite3VdbeAddOp2(v, OP_Count, iTabCur, regStat1);
+    jZeroRows := sqlite3VdbeAddOp1(v, OP_IfNot, regStat1);
+    sqlite3VdbeAddOp2(v, OP_Null, 0, regIdxname);
+    sqlite3VdbeAddOp4(v, OP_MakeRecord, regTabname, 3, regTemp,
+                      PAnsiChar('BBB'), 0);
+    sqlite3VdbeAddOp2(v, OP_NewRowid, iStatCur, regNewRowid);
+    sqlite3VdbeAddOp3(v, OP_Insert, iStatCur, regTemp, regNewRowid);
+    sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+    sqlite3VdbeJumpHere(v, jZeroRows);
+  end;
 end;
 
 procedure sqlite3DeleteIndexSamples(db: PTsqlite3; pIdx: PIndex2);

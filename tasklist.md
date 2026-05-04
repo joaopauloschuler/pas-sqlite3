@@ -246,11 +246,19 @@ FPC porting traps that recur often enough to call out up-front:
                  loadAnalysis) — analyze.c:166..251 + 935..946 +
                  1384..1503.  ANALYZE now emits BeginWrite +
                  openStatTable + LoadAnalysis + Expire framing.
-            [ ] Port the leaf `analyzeOneTable` (analyze.c:977..1378)
-                 — currently a stub; depends on the StatAccum SQL
-                 functions (statInit/statPush/statGet) which still
-                 need registration before the per-index OP_Function
-                 chain can fire productively.
+            [X] Port the leaf `analyzeOneTable` (analyze.c:977..1378)
+                 — DONE.  Full 1:1 body (non-STAT4 non-PREUPDATE_HOOK
+                 build) at codegen.pas, plus
+                 `analyzeVdbeCommentIndexWithColumnName` (no-op port,
+                 EXPLAIN_COMMENTS-only) and the STAT_GET_* selector
+                 constants.  Emits per-index OpenRead / stat_init /
+                 distinct-test / stat_push / Next / stat_get /
+                 sqlite_stat1 INSERT chain plus the trailing
+                 row-count entry.  Runtime parity still gated on
+                 StatAccum SQL function registration (statInit/
+                 statPush/statGet) — callStatGet still passes nil
+                 pFuncDef so sqlite_stat1 rows remain empty until
+                 those are wired.
        [X] Port `sqlite3Vacuum` (vacuum.c).
        [X] Port `sqlite3FkCheck` (fkey.c) — DONE.  fkScanChildren
             (fkey.c:547..660) and the dispatcher body (fkey.c:889..
