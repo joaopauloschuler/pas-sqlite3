@@ -329,13 +329,21 @@ FPC porting traps that recur often enough to call out up-front:
         works.  Recursive CTE preps cleanly (recursion-detection arm of
         resolveFromTermToCte + early pTab^.aCol from explicit pCt^.pCols
         so recursive arm column refs resolve).  Runtime still DIVERGES:
-        compound SF_Recursive codegen (generateWithRecursiveQuery —
-        select.c:2680..2826) unported, so `WITH RECURSIVE r(n) AS
-        (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<5) SELECT count(*)
-        FROM r` returns 0 instead of 5.  Building-blocks ported and
-        ready: `computeLimitRegisters` (select.c:2508..2554, full body
-        incl. non-constant LIMIT arm + SF_FixedLimit/nSelectRow
-        tightening), `hasAnchor` (select.c:2890..2893).
+        `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r
+        WHERE n<5) SELECT count(*) FROM r` returns 0 instead of 5.
+        [X] Body ported: `generateWithRecursiveQuery` (select.c:2680..
+            2826) at codegen.pas, with companion `recursiveInnerLoop`
+            (select.c selectInnerLoop's srcTab>=0 arm — pseudo-cursor
+            row dispatch for SRT_Output / SRT_Coroutine / SRT_Mem /
+            SRT_EphemTab / SRT_Table / SRT_Set / SRT_Exists / SRT_Discard).
+            Building-blocks already ported: `computeLimitRegisters`,
+            `hasAnchor`.
+        [ ] Wire the dispatch into sqlite3Select's compound arm
+            (currently still bails on `(p^.selFlags and SF_Recursive) <> 0`
+            at codegen.pas:21835/21862/21875).  Gating: needs the outer
+            CTE materialise path to call the body with the right
+            destination, and the recursive sub-FROM expansion to expose
+            the iCursor of the self-reference for OP_OpenPseudo.
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.

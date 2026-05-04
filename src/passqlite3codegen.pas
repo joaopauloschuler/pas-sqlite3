@@ -2069,6 +2069,8 @@ procedure codeOffset(v: PVdbe; iOffset: i32; iContinue: i32);
 function  generateOutputSubroutine(pParse: PParse; p: PSelect;
   pIn: PSelectDest; pDest: PSelectDest; regReturn: i32; regPrev: i32;
   pKeyInfo: PKeyInfo2; iBreak: i32): i32;
+procedure generateWithRecursiveQuery(pParse: PParse; p: PSelect;
+  pDest: PSelectDest);
 function  sqlite3SelectOpName(id: i32): PAnsiChar;
 procedure sqlite3SelectWrongNumTermsError(pParse: PParse; p: PSelect);
 function  sqlite3GetVdbe(pParse: PParse): PVdbe;
@@ -19486,6 +19488,292 @@ begin
   else
     sqlite3ErrorMsg(pParse,
       'SELECTs to the left and right of %s do not have the same number of result columns');
+end;
+
+{ recursiveInnerLoop — minimal selectInnerLoop equivalent for the
+  generateWithRecursiveQuery case where srcTab>=0 (a pseudo-cursor).
+  Emits OP_Column iCurrent, k -> regOut+k for each result column,
+  applies LIMIT (DecrJumpZero), then dispatches to pDest by eDest.
+  Mirrors select.c selectInnerLoop's srcTab>=0 / pTabList=NULL arm
+  (the outer per-result-row dispatch on pDest^.eDest).  Supports the
+  destinations a recursive-CTE caller actually presents: Output,
+  Coroutine, Mem, Set, EphemTab/Table, Discard, Exists. }
+procedure recursiveInnerLoop(pParse: PParse; p: PSelect; iCurrent: i32;
+  pDest: PSelectDest; iContinue: i32; iBreak: i32);
+var
+  v:           PVdbe;
+  nResultCol:  i32;
+  regResult:   i32;
+  k:           i32;
+  r1:          i32;
+begin
+  v := pParse^.pVdbe;
+  if v = nil then Exit;
+  nResultCol := p^.pEList^.nExpr;
+
+  { Allocate the result-row register block if pDest hasn't already. }
+  if pDest^.iSdst = 0 then
+  begin
+    pDest^.iSdst := pParse^.nMem + 1;
+    pParse^.nMem := pParse^.nMem + nResultCol;
+  end;
+  pDest^.nSdst := nResultCol;
+  regResult := pDest^.iSdst;
+
+  { Read each result column from iCurrent. }
+  for k := 0 to nResultCol - 1 do
+    sqlite3VdbeAddOp3(v, OP_Column, iCurrent, k, regResult + k);
+
+  case pDest^.eDest of
+    SRT_Output:
+      sqlite3VdbeAddOp2(v, OP_ResultRow, regResult, nResultCol);
+
+    SRT_Coroutine:
+      sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
+
+    SRT_Mem:
+      sqlite3ExprCodeMove(pParse, regResult, pDest^.iSDParm, nResultCol);
+
+    SRT_EphemTab, SRT_Table:
+    begin
+      r1 := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regResult, nResultCol, r1);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r1 + 1);
+      sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r1 + 1);
+      sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+      sqlite3ReleaseTempReg(pParse, r1);
+    end;
+
+    SRT_Set:
+    begin
+      r1 := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp4(v, OP_MakeRecord, regResult, nResultCol, r1,
+        pDest^.zAffSdst, nResultCol);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+        regResult, nResultCol);
+      sqlite3ReleaseTempReg(pParse, r1);
+    end;
+
+    SRT_Exists:
+    begin
+      sqlite3VdbeAddOp2(v, OP_Integer, 1, pDest^.iSDParm);
+      sqlite3VdbeGoto(v, iBreak);
+    end;
+
+    SRT_Discard:
+      ;  { no output }
+  else
+    { Other destinations (SRT_Fifo / SRT_Queue) are not produced for
+      the outer pDest of a recursive CTE — generateWithRecursiveQuery
+      uses Fifo/Queue only for its internal destQueue. }
+    Assert(False);
+  end;
+
+  { LIMIT bookkeeping. }
+  if p^.iLimit <> 0 then
+    sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreak);
+
+  if iContinue >= 0 then
+    sqlite3VdbeResolveLabel(v, iContinue);
+end;
+
+{ generateWithRecursiveQuery — port of select.c:2680..2826 (SQLite 3.53.0).
+  Emit VDBE code for a WITH RECURSIVE compound of the form
+  "<setup> UNION [ALL] <recursive>".  The setup query runs once and
+  populates the Queue table; rows are dequeued one at a time into a
+  pseudo-cursor (Current), output to pDest, then the recursive query
+  re-runs against Current with results appended back into Queue.
+  Iteration ends when Queue is empty.  ORDER BY changes Queue from
+  FIFO to a sorted ephemeral; UNION (no ALL) adds an iDistinct
+  ephemeral to suppress duplicates.  LIMIT/OFFSET applied against
+  pDest output via standard codeOffset / DecrJumpZero machinery. }
+procedure generateWithRecursiveQuery(pParse: PParse; p: PSelect;
+  pDest: PSelectDest);
+var
+  pSrc:        PSrcList;
+  nCol:        i32;
+  v:           PVdbe;
+  pSetup:      PSelect;
+  pFirstRec:   PSelect;
+  addrTop:     i32;
+  addrCont:    i32;
+  addrBreak:   i32;
+  iCurrent:    i32;
+  regCurrent:  i32;
+  iQueue:      i32;
+  iDistinct:   i32;
+  eDest:       i32;
+  destQueue:   TSelectDest;
+  i:           i32;
+  rc:          i32;
+  pOrderBy:    PExprList;
+  pLimit:      PExpr;
+  regLimit:    i32;
+  regOffset:   i32;
+  pKeyInfo:    PKeyInfo2;
+  apColl:      PPointer;
+  pSItem:      PSrcItem;
+  base:        Pointer;
+label
+  end_of_recursive;
+begin
+  pSrc      := p^.pSrc;
+  nCol      := p^.pEList^.nExpr;
+  v         := pParse^.pVdbe;
+  iCurrent  := 0;
+  iDistinct := 0;
+  eDest     := SRT_Fifo;
+
+  if p^.pWin <> nil then
+  begin
+    sqlite3ErrorMsg(pParse,
+      'cannot use window functions in recursive queries');
+    Exit;
+  end;
+
+  if sqlite3AuthCheck(pParse, SQLITE_RECURSIVE_AUTH, nil, nil, nil) <> 0 then Exit;
+
+  { LIMIT / OFFSET. }
+  addrBreak     := sqlite3VdbeMakeLabel(pParse);
+  p^.nSelectRow := 320;  { ~4 billion rows; matches C reference }
+  computeLimitRegisters(pParse, p, addrBreak);
+  pLimit       := p^.pLimit;
+  regLimit     := p^.iLimit;
+  regOffset    := p^.iOffset;
+  p^.pLimit    := nil;
+  p^.iLimit    := 0;
+  p^.iOffset   := 0;
+  pOrderBy     := p^.pOrderBy;
+
+  { Locate the cursor of the recursive self-reference inside pSrc. }
+  base := SrcListItems(pSrc);
+  for i := 0 to pSrc^.nSrc - 1 do
+  begin
+    pSItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+    if (pSItem^.fg.fgBits and u8($80)) <> 0 then  { isRecursive (bit 7) }
+    begin
+      iCurrent := pSItem^.iCursor;
+      Break;
+    end;
+  end;
+
+  { Allocate cursors for Queue and (if UNION) Distinct.  iDistinct must
+    be exactly one greater than iQueue for SRT_DistFifo / SRT_DistQueue. }
+  iQueue := pParse^.nTab;
+  Inc(pParse^.nTab);
+  if p^.op = TK_UNION then
+  begin
+    if pOrderBy <> nil then eDest := SRT_DistQueue
+                       else eDest := SRT_DistFifo;
+    iDistinct := pParse^.nTab;
+    Inc(pParse^.nTab);
+  end
+  else
+  begin
+    if pOrderBy <> nil then eDest := SRT_Queue
+                       else eDest := SRT_Fifo;
+  end;
+  sqlite3SelectDestInit(@destQueue, eDest, iQueue);
+
+  { Allocate the regCurrent register and open the iCurrent pseudo-cursor. }
+  Inc(pParse^.nMem);
+  regCurrent := pParse^.nMem;
+  sqlite3VdbeAddOp3(v, OP_OpenPseudo, iCurrent, regCurrent, nCol);
+
+  { Open the Queue cursor.  When ORDER BY is present Queue is an
+    ephemeral btree keyed on the ORDER BY columns + sequence + payload;
+    otherwise it is a plain rowid-keyed ephemeral. }
+  if pOrderBy <> nil then
+  begin
+    pKeyInfo := multiSelectByMergeKeyInfo(pParse, p, 1);
+    sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iQueue, pOrderBy^.nExpr + 2, 0,
+      PAnsiChar(pKeyInfo), P4_KEYINFO);
+    destQueue.pOrderBy := pOrderBy;
+  end
+  else
+  begin
+    sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iQueue, nCol);
+  end;
+
+  { Open the Distinct cursor for UNION (no ALL). }
+  if iDistinct <> 0 then
+  begin
+    Assert(p^.pNext = nil);
+    Assert(p^.pEList <> nil);
+    nCol := p^.pEList^.nExpr;
+    pKeyInfo := sqlite3KeyInfoAlloc(pParse^.db, nCol, 1);
+    if pKeyInfo <> nil then
+    begin
+      apColl := PPointer(PByte(pKeyInfo) + SizeOf(TKeyInfo));
+      for i := 0 to nCol - 1 do
+      begin
+        apColl[i] := multiSelectCollSeq(pParse, p, i);
+        if apColl[i] = nil then apColl[i] := pParse^.db^.pDfltColl;
+      end;
+      sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iDistinct, nCol, 0,
+        PAnsiChar(pKeyInfo), P4_KEYINFO);
+    end
+    else
+      Assert(pParse^.nErr > 0);
+  end;
+
+  { Detach ORDER BY from p; Queue's order is enforced by destQueue. }
+  p^.pOrderBy := nil;
+
+  { Walk the prior chain to find the left-most recursive term and mark
+    each recursive term as TK_ALL (distinct enforcement is in iDistinct).
+    Reject SF_Aggregate inside a recursive arm. }
+  pFirstRec := p;
+  while pFirstRec <> nil do
+  begin
+    if (pFirstRec^.selFlags and SF_Aggregate) <> 0 then
+    begin
+      sqlite3ErrorMsg(pParse, 'recursive aggregate queries not supported');
+      goto end_of_recursive;
+    end;
+    pFirstRec^.op := TK_ALL;
+    if (pFirstRec^.pPrior^.selFlags and SF_Recursive) = 0 then Break;
+    pFirstRec := pFirstRec^.pPrior;
+  end;
+
+  { Run the setup query.  Detach pPrior to keep sqlite3Select from
+    walking back into the recursive chain; restore it after. }
+  pSetup        := pFirstRec^.pPrior;
+  pSetup^.pNext := nil;
+  rc := sqlite3Select(pParse, pSetup, @destQueue);
+  pSetup^.pNext := p;
+  if rc <> 0 then goto end_of_recursive;
+
+  { Top of the dequeue loop. }
+  addrTop := sqlite3VdbeAddOp2(v, OP_Rewind, iQueue, addrBreak);
+
+  { Move the next row from Queue into Current. }
+  sqlite3VdbeAddOp1(v, OP_NullRow, iCurrent);
+  if pOrderBy <> nil then
+    sqlite3VdbeAddOp3(v, OP_Column, iQueue, pOrderBy^.nExpr + 1, regCurrent)
+  else
+    sqlite3VdbeAddOp2(v, OP_RowData, iQueue, regCurrent);
+  sqlite3VdbeAddOp1(v, OP_Delete, iQueue);
+
+  { Output the row.  Apply OFFSET first, then run the inner loop. }
+  addrCont := sqlite3VdbeMakeLabel(pParse);
+  codeOffset(v, regOffset, addrCont);
+  recursiveInnerLoop(pParse, p, iCurrent, pDest, addrCont, addrBreak);
+
+  { Recursive step: re-run p (with anchor terms detached) into Queue. }
+  pFirstRec^.pPrior := nil;
+  sqlite3Select(pParse, p, @destQueue);
+  Assert(pFirstRec^.pPrior = nil);
+  pFirstRec^.pPrior := pSetup;
+
+  { Loop back to the next row. }
+  sqlite3VdbeGoto(v, addrTop);
+  sqlite3VdbeResolveLabel(v, addrBreak);
+
+end_of_recursive:
+  sqlite3ExprListDelete(pParse^.db, p^.pOrderBy);
+  p^.pOrderBy := pOrderBy;
+  p^.pLimit   := pLimit;
 end;
 
 { sqlite3GetVdbe — get or create a VDBE for this Parse context }
