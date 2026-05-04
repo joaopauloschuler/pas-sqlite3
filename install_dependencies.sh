@@ -29,26 +29,26 @@ echo
 # install git, wget
 if ! command -v git &> /dev/null
 then
-    echo "git could not be found, installing..."
+    warn "git could not be found, installing..."
     sudo apt install -y git
 else
-    echo "git is already installed"
+    ok "git is already installed"
 fi
 
 if ! command -v wget &> /dev/null
 then
-    echo "wget could not be found, installing..."
+    warn "wget could not be found, installing..."
     sudo apt install -y wget
 else
-    echo "wget is already installed"
+    ok "wget is already installed"
 fi
 
 if ! command -v unzip &> /dev/null
 then
-    echo "unzip could not be found, installing..."
+    warn "unzip could not be found, installing..."
     sudo apt install -y unzip
 else
-    echo "unzip is already installed"
+    ok "unzip is already installed"
 fi
 
 # ---- fpc ----
@@ -65,10 +65,10 @@ fi
 # ---- gcc ----
 if ! dpkg -s build-essential &> /dev/null
 then
-    echo "build-essential could not be found, installing..."
+    warn "build-essential could not be found, installing..."
     sudo apt install -y build-essential
 else
-    echo "build-essential is already installed"
+    ok "build-essential is already installed"
 fi
 
 # ---- make ----

@@ -3016,9 +3016,24 @@ type
     z:     PAnsiChar;  { offset  8 — Mem.z }
     n:     i32;        { offset 16 — Mem.n }
     flags: u16;        { offset 20 — Mem.flags }
+    enc:   u8;         { offset 22 — Mem.enc (used by collation hook) }
     { remainder unused by this comparator }
   end;
   PBtMemView = ^TBtMemView;
+
+  { Opaque view of TCollSeq (vdbe.pas) — used only for the collation hook
+    in sqlite3VdbeRecordCompare.  Layout matches TCollSeq exactly:
+    zName(8) + enc(1) + pad(7) + pUser(8) + xCmp(8) + xDel(8) = 40 bytes. }
+  TBtCollCmp = function(pUser: Pointer; nA: i32; pA: Pointer;
+                        nB: i32; pB: Pointer): i32; cdecl;
+  TBtCollView = packed record
+    zName: PAnsiChar;        { offset 0 }
+    enc:   u8;               { offset 8 }
+    _pad:  array[0..6] of u8;{ offset 9..15 }
+    pUser: Pointer;          { offset 16 }
+    xCmp:  TBtCollCmp;       { offset 24 }
+  end;
+  PBtCollView = ^TBtCollView;
 
 const
   BT_MEM_Null    = $0001;
@@ -3148,6 +3163,8 @@ var
   pSortFlags:  Pu8;
   sortFlag:    u8;
   descBit, nullSide: i32;
+  pColl:       PBtCollView;
+  collEnc, kiEnc: u8;
 begin
   pKey1 := pKey;
   nKey1 := nKey;
@@ -3218,19 +3235,41 @@ begin
           Result := 0;
           Exit;
         end;
-        { No collation hook from btree.pas (would require a vdbe.pas
-          callback — see 6.10 step 6.IPK-IN.b.full).  For BINARY
-          collation (default, aColl[i]==nil in C) the memcmp arm below
-          is exact; for explicit COLLATE clauses on non-rowid btrees
-          this still falls back to memcmp, which is wrong only when a
-          non-BINARY collation is attached.  No call site in the
-          current corpus exercises that. }
-        if nStr < pRhs^.n then nCmp := nStr else nCmp := pRhs^.n;
-        if nCmp > 0 then
-          rc := i32(CompareByte((@aKey1[d1])^, pRhs^.z^, nCmp))
-        else
-          rc := 0;
-        if rc = 0 then rc := nStr - pRhs^.n;
+        { Collation-aware compare — vdbeaux.c:4839.  pKeyInfo->aColl[i]
+          carries the collation pointer (NULL = BINARY).  TKeyInfo
+          layout: aColl[FLEXARRAY] starts at offset 32 (SizeOf(TKeyInfo)),
+          aColl[i] = PPointer(pKeyInfo + 32 + i*8).  Same-encoding fast
+          path only; encoding-mismatch falls back to BINARY compare
+          (vdbeCompareMemString transcoding arm not ported — default
+          UTF-8 build never reaches it). }
+        pColl := nil;
+        if pIdxKey^.pKeyInfo <> nil then
+        begin
+          pColl := PBtCollView(PPointer(PByte(pIdxKey^.pKeyInfo)
+                                        + 32 + i * 8)^);
+          if pColl <> nil then
+          begin
+            kiEnc   := PByte(pIdxKey^.pKeyInfo)[4];  { TKeyInfo.enc @4 }
+            collEnc := pColl^.enc;
+            if (collEnc <> kiEnc) or (kiEnc <> pRhs^.enc)
+               or (not Assigned(pColl^.xCmp)) then
+              pColl := nil;
+          end;
+        end;
+        if pColl <> nil then
+        begin
+          rc := pColl^.xCmp(pColl^.pUser,
+                            nStr,    @aKey1[d1],
+                            pRhs^.n, pRhs^.z);
+        end else
+        begin
+          if nStr < pRhs^.n then nCmp := nStr else nCmp := pRhs^.n;
+          if nCmp > 0 then
+            rc := i32(CompareByte((@aKey1[d1])^, pRhs^.z^, nCmp))
+          else
+            rc := 0;
+          if rc = 0 then rc := nStr - pRhs^.n;
+        end;
       end;
     end else if (pRhs^.flags and BT_MEM_Blob) <> 0 then begin
       { RHS blob — vdbeaux.c:4872.  serial_type already decoded above. }
@@ -4985,6 +5024,13 @@ begin
   b.ixNx[NB*2-1] := $7fffffff;
   pBt := pParent^.pBt;
   rc  := SQLITE_OK;
+  { btree.c:8238..8249 — these are explicitly initialised in the C
+    reference; Pascal uninitialised stack locals would otherwise carry
+    forward random bytes from a prior frame. }
+  nMaxCells  := 0;
+  nNew       := 0;
+  iSpace1    := 0;
+  iOvflSpace := 0;
 
   if aOvflSpace = nil then begin
     Result := SQLITE_NOMEM_BKPT;

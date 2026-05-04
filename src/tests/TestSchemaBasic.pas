@@ -167,6 +167,7 @@ var
   pIdx:   PIndex2;
   pExtra: PAnsiChar;
   i:      i32;
+  fakeTab: TTable;
 begin
   db := MakeDb;
   pIdx := sqlite3AllocateIndexObject(db, 3, 0, @pExtra);
@@ -186,10 +187,17 @@ begin
     Expect(i = 1, 'TableColumnToIndex(1)=1');
     i := sqlite3TableColumnToIndex(pIdx, 99);
     Expect(i = -1, 'TableColumnToIndex(99)=-1');
-    { Test sqlite3DefaultRowEst }
+    { Test sqlite3DefaultRowEst — port of build.c:4551.  a[0] tracks the
+      table's nRowLogEst (clamped to >= 99 = LogEst(1000)); a[1..nKeyCol]
+      follow the canonical aVal table (LogEst(10) = 33 leads). }
+    FillChar(fakeTab, SizeOf(fakeTab), 0);
+    fakeTab.nRowLogEst := 200;     { LogEst(1048576) — same default as
+                                     sqlite3CreateTable's stub initialiser }
+    pIdx^.pTable := @fakeTab;
     sqlite3DefaultRowEst(pIdx);
-    Expect(pIdx^.aiRowLogEst[0] = 210, 'DefaultRowEst[0]=210');
+    Expect(pIdx^.aiRowLogEst[0] = 200, 'DefaultRowEst[0]=200');
     Expect(pIdx^.aiRowLogEst[1] = 33,  'DefaultRowEst[1]=33');
+    pIdx^.pTable := nil;
     sqlite3DbFree(db, pIdx);
   end;
   FreeDb(db);
