@@ -19740,10 +19740,14 @@ begin
   end;
 
   { Run the setup query.  Detach pPrior to keep sqlite3Select from
-    walking back into the recursive chain; restore it after. }
+    walking back into the recursive chain; restore it after.  Clear
+    SF_Compound on the leaf so the Pas no-FROM/regular-FROM fast paths
+    (which gate on `selFlags and SF_Compound = 0`) fire normally. }
   pSetup        := pFirstRec^.pPrior;
   pSetup^.pNext := nil;
+  pSetup^.selFlags := pSetup^.selFlags and (not u32(SF_Compound));
   rc := sqlite3Select(pParse, pSetup, @destQueue);
+  pSetup^.selFlags := pSetup^.selFlags or SF_Compound;
   pSetup^.pNext := p;
   if rc <> 0 then goto end_of_recursive;
 
@@ -19763,9 +19767,13 @@ begin
   codeOffset(v, regOffset, addrCont);
   recursiveInnerLoop(pParse, p, iCurrent, pDest, addrCont, addrBreak);
 
-  { Recursive step: re-run p (with anchor terms detached) into Queue. }
+  { Recursive step: re-run p (with anchor terms detached) into Queue.
+    Clear SF_Compound on the recursive arm so the Pas single-select gate
+    fires normally; restore after. }
   pFirstRec^.pPrior := nil;
+  pFirstRec^.selFlags := pFirstRec^.selFlags and (not u32(SF_Compound));
   sqlite3Select(pParse, p, @destQueue);
+  pFirstRec^.selFlags := pFirstRec^.selFlags or SF_Compound;
   Assert(pFirstRec^.pPrior = nil);
   pFirstRec^.pPrior := pSetup;
 
@@ -22110,7 +22118,8 @@ begin
     rows emitted. }
   if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_Set) and
      (pDest^.eDest <> SRT_Mem) and (pDest^.eDest <> SRT_EphemTab) and
-     (pDest^.eDest <> SRT_Coroutine) and
+     (pDest^.eDest <> SRT_Coroutine)
+     and (pDest^.eDest <> SRT_Fifo) and (pDest^.eDest <> SRT_DistFifo) and
      (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
   if p^.pPrior <> nil then begin
@@ -22195,7 +22204,8 @@ begin
     is skipped (no cursor to iterate). }
   if ((p^.pSrc = nil) or (p^.pSrc^.nSrc = 0))
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
-          or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table))
+          or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table)
+          or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo))
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pLimit = nil) and (p^.pWin = nil)
@@ -22221,11 +22231,16 @@ begin
       sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
     else
     begin
-      { SRT_EphemTab / SRT_Table — append the row to a rowid-keyed eph
-        cursor (selectInnerLoop SRT_Table arm, select.c:1349..1370). }
+      { SRT_EphemTab / SRT_Table / SRT_Fifo / SRT_DistFifo — append the row
+        to a rowid-keyed eph cursor (selectInnerLoop SRT_Table arm,
+        select.c:1349..1370).  SRT_DistFifo also pre-emits IdxInsert into
+        the dedup cursor at iSDParm+1 (selectInnerLoop:1338..1346). }
       r1 := sqlite3GetTempReg(pParse);
       r2 := sqlite3GetTempReg(pParse);
       sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+      if pDest^.eDest = SRT_DistFifo then
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm + 1, r1,
+          pDest^.iSdst, nResultCol);
       sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
       sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
       sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
@@ -23769,16 +23784,24 @@ begin
         register block, different downstream sink. }
       sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
     end
-    else if pDest^.eDest = SRT_EphemTab then
+    else if (pDest^.eDest = SRT_EphemTab)
+         or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo) then
     begin
       { 6.13(b) piece 1 — selectInnerLoop:1349..1370 SRT_Table /
         SRT_EphemTab disposal.  Caller has opened a rowid eph cursor at
         iSDParm; append each result row via NewRowid+MakeRecord+Insert
         with OPFLAG_APPEND.  The two temp regs (record / rowid) are
-        released to the pool immediately. }
+        released to the pool immediately.
+
+        SRT_Fifo (recursive-CTE Queue) reuses the same shape; SRT_DistFifo
+        also pre-emits OP_IdxInsert into the iSDParm+1 dedup cursor
+        (selectInnerLoop:1338..1346). }
       r1 := sqlite3GetTempReg(pParse);
       r2 := sqlite3GetTempReg(pParse);
       sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+      if pDest^.eDest = SRT_DistFifo then
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm + 1, r1,
+          pDest^.iSdst, nResultCol);
       sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
       sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
       sqlite3VdbeChangeP5(v, OPFLAG_APPEND);

@@ -354,15 +354,28 @@ FPC porting traps that recur often enough to call out up-front:
             Companion fix: recursiveInnerLoop's SRT_EphemTab/SRT_Table
             arm allocated NewRowid into r1+1 (collision risk); now uses
             two GetTempReg calls matching select.c:1346..1349.
-        [ ] Runtime parity gap remains — `WITH RECURSIVE r(n) AS (SELECT
-            1 UNION ALL SELECT n+1 FROM r WHERE n<5) SELECT count(*) FROM
-            r` returns 0 (C: 5).  Dispatch fires (verified with stderr
-            probe), body emits, but the recursive step does not append
-            rows back to Queue.  Suspected: the recursive sub-FROM `FROM
-            r` is not re-aimed at iCurrent (pseudo-cursor) when the inner
-            sqlite3Select recurses with anchor terms detached — the OP_
-            Column iCursor numbers may still point at the unmaterialised
-            CTE table.
+        [~] Runtime parity gap — `WITH RECURSIVE r(n) AS (SELECT 1
+            UNION ALL SELECT n+1 FROM r WHERE n<5) SELECT count(*) FROM
+            r` now returns 1 (anchor row emits), C: 5.  Anchor setup
+            now emits because:
+              - sqlite3Select gate accepts SRT_Fifo / SRT_DistFifo
+                destinations (codegen.pas:22112, plus disposal arm
+                under the SRT_EphemTab branch).
+              - No-FROM fast path accepts SRT_Fifo / SRT_DistFifo
+                (codegen.pas:22198) and emits MakeRecord+NewRowid+
+                Insert (with optional dedup IdxInsert at iSDParm+1).
+              - SF_Compound is cleared on pSetup / pFirstRec around
+                the inner sqlite3Select calls inside generate-
+                WithRecursiveQuery so the no-FROM / regular gates fire.
+            Recursive step (`SELECT n+1 FROM r WHERE n<5` against the
+            iCurrent pseudo-cursor) still bails — the regular SELECT
+            path bails at the TF_Ephemeral check (codegen.pas:23365)
+            on r's synthesized table.  Lifting the bail emits Rewind/
+            Next on the pseudo-cursor (wrong: WhereBegin's isRecursive
+            arm at codegen.pas:18229 should fire OP_Noop, but the
+            broader scan path doesn't honour it yet — needs full
+            isRecursive plumbing in WhereBegin or a recursive-arm-
+            specific inline emit here).
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
