@@ -483,17 +483,25 @@ FPC porting traps that recur often enough to call out up-front:
        UPDATE sqlite_master path.  Closes the last contributor of
        6.11(b).
 
-- [ ] **7.1.8** ATTACH / DETACH (attach.c) — currently Phase 7 stubs
-       at codegen.pas:25213/25218.  Must open the attached btree,
-       allocate `aDb[]` slot, run schema load.  (Moved here from old
-       6.27.)
-       [ ] Port `sqlite3Attach` — opens the attached btree, grows
-            `db^.aDb[]`, runs the schema load via 7.1.1.
-       [ ] Port `sqlite3Detach` — flushes + closes the btree, frees
-            the `aDb[]` slot, invalidates cached statements.
-       [ ] Wire ATTACH/DETACH parser productions through the new
-            functions (currently the parse arms emit no-op
-            bytecode).
+- [~] **7.1.8** ATTACH / DETACH (attach.c) — codegen path productive
+       (closes the prior parse-time stubs).  Parser productions for
+       ATTACH/DETACH already wired through the codegen; runtime SQL
+       functions now do real work.
+       [X] Port `sqlite3Attach` — emits OP_Function via codeAttach,
+            attachFunc grows `db^.aDb[]`, opens the new btree, calls
+            sqlite3SchemaGet + SecureDelete plumbing.  URI parsing
+            and pager-flag plumbing deferred (sqlite3ParseUri unported,
+            passqlite3pager not in codegen's uses-list).
+       [X] Port `sqlite3Detach` — codeAttach emits OP_Function;
+            detachFunc closes the btree, frees the `aDb[]` slot, calls
+            sqlite3CollapseDatabaseArray.  TEMP-trigger pTabSchema
+            rewrite stub until full TTrigger layout settles.
+       [X] Wire ATTACH/DETACH parser productions — already routed
+            through codeAttach via the renamed sqlite3Attach /
+            sqlite3Detach.
+       [ ] Schema reload after ATTACH (sqlite3Init / sqlite3InitOne)
+            — gated on Phase 7.1.1.  Without it, the new aDb[] slot
+            is opened but the on-disk schema is not loaded.
 
 - [~] **7.1.9** ALTER TABLE (alter.c).  All five codegen entry points
        are ported 1:1 and stub-db-tolerant (TestParser ALTER TABLE rows

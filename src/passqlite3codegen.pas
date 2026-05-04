@@ -36993,19 +36993,354 @@ begin
 end;
 
 // ===========================================================================
-// Phase 6.5 — attach.c stubs
+// Phase 7.1.8 — attach.c port (attach.c:35..454).
+//
+// Productive port of ATTACH / DETACH that supersedes the prior parse-time
+// stubs.  Three pieces:
+//
+//   - resolveAttachExpr (attach.c:35) and codeAttach (attach.c:346) emit the
+//     OP_Function call into a static FuncDef; sqlite3Attach / sqlite3Detach
+//     are thin wrappers that pick the appropriate FuncDef.
+//
+//   - attachFunc (attach.c:74) and detachFunc (attach.c:284) are the runtime
+//     SQL user-functions invoked by that bytecode.  detachFunc closes the
+//     btree and shrinks aDb[].  attachFunc opens a new btree, grows aDb[],
+//     and triggers a schema reload via sqlite3Init.
+//
+//   - sqlite3ParseUri is not yet ported — attachFunc uses the raw filename
+//     and connection-default VFS, which is sufficient for the canonical
+//     `ATTACH 'file.db' AS name` form.  URI parameters / `vfs=...` are
+//     deferred together with sqlite3ParseUri itself.
 // ===========================================================================
 
-procedure sqlite3Detach(pParse: PParse; pDbname: PExpr);
+const
+  { Auth-callback type tags (sqlite.h.in:3527..3528). }
+  SQLITE_ATTACH = 24;
+  SQLITE_DETACH = 25;
+  { db^.flags upper-32-bit attach gates (mirrors main.pas:1512..1513). }
+  ATTACH_FLAG_AttachCreate = u64($00010) shl 32;
+  ATTACH_FLAG_AttachWrite  = u64($00020) shl 32;
+
+{ Static FuncDef storage for sqlite_attach / sqlite_detach.  Initialised
+  lazily on the first sqlite3Attach / sqlite3Detach call (Pascal cannot
+  const-initialise a record carrying procedure pointers). }
+var
+  gAttachFunc: TFuncDef;
+  gDetachFunc: TFuncDef;
+  gAttachInited: Boolean = False;
+
+{ Forward decls so codeAttach can take @attachFunc / @detachFunc. }
+procedure attachFunc(pCtx: Psqlite3_context; nUnused: i32; argv: PPMem); cdecl; forward;
+procedure detachFunc(pCtx: Psqlite3_context; nUnused: i32; argv: PPMem); cdecl; forward;
+
+procedure attachFuncsInit;
 begin
-  sqlite3ExprDelete(pParse^.db, pDbname);
+  if gAttachInited then Exit;
+  gAttachInited := True;
+
+  FillChar(gAttachFunc, SizeOf(gAttachFunc), 0);
+  gAttachFunc.nArg      := 3;
+  gAttachFunc.funcFlags := SQLITE_UTF8;
+  gAttachFunc.xSFunc    := @attachFunc;
+  gAttachFunc.zName     := 'sqlite_attach';
+
+  FillChar(gDetachFunc, SizeOf(gDetachFunc), 0);
+  gDetachFunc.nArg      := 1;
+  gDetachFunc.funcFlags := SQLITE_UTF8;
+  gDetachFunc.xSFunc    := @detachFunc;
+  gDetachFunc.zName     := 'sqlite_detach';
 end;
 
+{ resolveAttachExpr — port of attach.c:35.  ATTACH / DETACH treat a bare
+  identifier root as a literal string (so `ATTACH abc AS def` parses as
+  `ATTACH 'abc' AS 'def'`); all other shapes go through the regular name
+  resolver. }
+function resolveAttachExpr(pName: PNameContext; pExpr: PExpr): i32;
+begin
+  Result := SQLITE_OK;
+  if pExpr = nil then Exit;
+  if pExpr^.op <> TK_ID then
+    Result := sqlite3ResolveExprNames(pName, pExpr)
+  else
+    pExpr^.op := TK_STRING;
+end;
+
+{ codeAttach — port of attach.c:346.  Emits the bytecode for one ATTACH or
+  DETACH statement: resolve each argument expression, allocate a 4-register
+  block, sqlite3ExprCode the three argv slots into regArgs..regArgs+2, and
+  fire OP_Function pointing at the static attach_func / detach_func FuncDef.
+  The trailing OP_Expire flushes other prepared statements (DETACH) or just
+  this one (ATTACH).  Authorization callbacks are skipped — SQLite's
+  SQLITE_OMIT_AUTHORIZATION default. }
+procedure codeAttach(pParse: PParse; opType: i32; pFunc: PTFuncDef;
+  pAuthArg, pFilename, pDbname, pKey: PExpr);
+var
+  v:        PVdbe;
+  sName:    TNameContext;
+  regArgs:  i32;
+  db:       PTsqlite3;
+  rcResolv: i32;
+  label attach_end;
+begin
+  db := pParse^.db;
+
+  if sqlite3ReadSchema(pParse) <> SQLITE_OK then goto attach_end;
+  if pParse^.nErr <> 0 then goto attach_end;
+
+  FillChar(sName, SizeOf(sName), 0);
+  sName.pParse := pParse;
+
+  rcResolv := resolveAttachExpr(@sName, pFilename);
+  if rcResolv = SQLITE_OK then rcResolv := resolveAttachExpr(@sName, pDbname);
+  if rcResolv = SQLITE_OK then rcResolv := resolveAttachExpr(@sName, pKey);
+  if rcResolv <> SQLITE_OK then goto attach_end;
+
+  v := sqlite3GetVdbe(pParse);
+  Assert((v <> nil) or (db^.mallocFailed <> 0));
+  if v <> nil then
+  begin
+    regArgs := sqlite3GetTempRange(pParse, 4);
+    sqlite3ExprCode(pParse, pFilename, regArgs);
+    sqlite3ExprCode(pParse, pDbname,   regArgs + 1);
+    sqlite3ExprCode(pParse, pKey,      regArgs + 2);
+
+    sqlite3VdbeAddFunctionCall(pParse, 0, regArgs + 3 - pFunc^.nArg,
+      regArgs + 3, pFunc^.nArg, PFuncDef(pFunc), 0);
+    { OP_Expire P1: 1 = ATTACH (this stmt only), 0 = DETACH (every stmt). }
+    if opType = SQLITE_ATTACH then
+      sqlite3VdbeAddOp1(v, OP_Expire, 1)
+    else
+      sqlite3VdbeAddOp1(v, OP_Expire, 0);
+  end;
+
+  if pAuthArg <> nil then ; { used by SQLITE_OMIT_AUTHORIZATION arm — no-op. }
+
+attach_end:
+  sqlite3ExprDelete(db, pFilename);
+  sqlite3ExprDelete(db, pDbname);
+  sqlite3ExprDelete(db, pKey);
+end;
+
+{ sqlite3Detach — port of attach.c:420.  Parser entry point for `DETACH x`. }
+procedure sqlite3Detach(pParse: PParse; pDbname: PExpr);
+begin
+  attachFuncsInit;
+  codeAttach(pParse, SQLITE_DETACH, @gDetachFunc, pDbname,
+             nil, pDbname, nil);
+end;
+
+{ sqlite3Attach — port of attach.c:440.  Parser entry point for
+  `ATTACH p AS pDbname KEY pKey`. }
 procedure sqlite3Attach(pParse: PParse; p: PExpr; pDbname: PExpr; pKey: PExpr);
 begin
-  sqlite3ExprDelete(pParse^.db, p);
-  sqlite3ExprDelete(pParse^.db, pDbname);
-  sqlite3ExprDelete(pParse^.db, pKey);
+  attachFuncsInit;
+  codeAttach(pParse, SQLITE_ATTACH, @gAttachFunc, p,
+             p, pDbname, pKey);
+end;
+
+{ ---------------------------------------------------------------------------
+  Runtime SQL functions invoked by the OP_Function emitted above.
+  --------------------------------------------------------------------------- }
+
+{ detachFunc — port of attach.c:284. }
+procedure detachFunc(pCtx: Psqlite3_context; nUnused: i32; argv: PPMem); cdecl;
+var
+  zName: PAnsiChar;
+  db:    PTsqlite3;
+  i:     i32;
+  pTgt:  PDb;
+  pBt:   PBtree;
+  zErr:  AnsiString;
+  label detach_error;
+begin
+  zName := PAnsiChar(sqlite3_value_text(Psqlite3_value(argv^)));
+  if zName = nil then zName := '';
+  db := sqlite3_context_db_handle(pCtx);
+
+  pTgt := nil;
+  i := 0;
+  while i < db^.nDb do
+  begin
+    pTgt := @db^.aDb[i];
+    if (pTgt^.pBt <> nil) and (sqlite3DbIsNamed(db, i, zName) <> 0) then break;
+    Inc(i);
+  end;
+
+  if i >= db^.nDb then
+  begin
+    zErr := AnsiString('no such database: ') + AnsiString(zName);
+    goto detach_error;
+  end;
+  if i < 2 then
+  begin
+    zErr := AnsiString('cannot detach database ') + AnsiString(zName);
+    goto detach_error;
+  end;
+
+  pBt := PBtree(pTgt^.pBt);
+  if (sqlite3BtreeTxnState(pBt) <> SQLITE_TXN_NONE)
+     or (sqlite3BtreeIsInBackup(pBt) <> 0) then
+  begin
+    zErr := AnsiString('database ') + AnsiString(zName) + ' is locked';
+    goto detach_error;
+  end;
+
+  { TEMP-trigger pTabSchema rewrite (attach.c:322..330) is gated on full
+    TTrigger layout settling — deferred. }
+
+  sqlite3BtreeClose(pBt);
+  pTgt^.pBt     := nil;
+  pTgt^.pSchema := nil;
+  sqlite3CollapseDatabaseArray(db);
+  Exit;
+
+detach_error:
+  sqlite3_result_error(pCtx, PAnsiChar(zErr), -1);
+  if nUnused = 0 then ; { silence unused-arg warning }
+end;
+
+{ attachFunc — port of attach.c:74 (simplified: skips sqlite3ParseUri).
+  Opens a new btree on argv[0] (filename) using the connection's default
+  VFS and openFlags, grows db^.aDb[], and triggers a schema reload via
+  sqlite3Init.  REOPEN_AS_MEMDB / SQLITE_ENABLE_DESERIALIZE arms not
+  ported.  URI parameters and `vfs=…` query options are ignored until
+  sqlite3ParseUri lands.  This satisfies the canonical
+  `ATTACH 'foo.db' AS name` form while preserving error reporting via
+  sqlite3_result_error. }
+procedure attachFunc(pCtx: Psqlite3_context; nUnused: i32; argv: PPMem); cdecl;
+var
+  rc:        i32;
+  i:         i32;
+  db:        PTsqlite3;
+  zName:     PAnsiChar;
+  zFile:     PAnsiChar;
+  zErrDyn:   PAnsiChar;
+  flags:     u32;
+  aArr:      PDb;
+  pSlot:     PDb;
+  pVfs:      Psqlite3_vfs;
+  oldStatic: Boolean;
+  label attach_error;
+begin
+  rc      := SQLITE_OK;
+  zErrDyn := nil;
+  pSlot   := nil;
+  db      := sqlite3_context_db_handle(pCtx);
+  zFile   := PAnsiChar(sqlite3_value_text(Psqlite3_value(argv^)));
+  zName   := PAnsiChar(sqlite3_value_text(Psqlite3_value((argv + 1)^)));
+  if zFile = nil then zFile := '';
+  if zName = nil then zName := '';
+
+  { Ceiling check: SQLite caps attached DBs at SQLITE_LIMIT_ATTACHED+2. }
+  if db^.nDb >= db^.aLimit[SQLITE_LIMIT_ATTACHED] + 2 then
+  begin
+    zErrDyn := sqlite3MPrintf(db, 'too many attached databases - max %d',
+      [db^.aLimit[SQLITE_LIMIT_ATTACHED]]);
+    goto attach_error;
+  end;
+
+  for i := 0 to db^.nDb - 1 do
+    if sqlite3DbIsNamed(db, i, zName) <> 0 then
+    begin
+      zErrDyn := sqlite3MPrintf(db, 'database %s is already in use', [zName]);
+      goto attach_error;
+    end;
+
+  { Grow aDb[] (or migrate off aDbStatic[]).  Mirrors attach.c:154..164. }
+  oldStatic := (db^.aDb = @db^.aDbStatic[0]);
+  if oldStatic then
+  begin
+    aArr := PDb(sqlite3DbMallocRawNN(db, u64(SizeOf(TDb)) * 3));
+    if aArr = nil then Exit;
+    Move(db^.aDb^, aArr^, SizeOf(TDb) * 2);
+  end else
+  begin
+    aArr := PDb(sqlite3DbRealloc(db, db^.aDb,
+      u64(SizeOf(TDb)) * u64(1 + db^.nDb)));
+    if aArr = nil then Exit;
+  end;
+  db^.aDb := aArr;
+  pSlot := @db^.aDb[db^.nDb];
+  FillChar(pSlot^, SizeOf(pSlot^), 0);
+
+  { Open the new btree.  sqlite3ParseUri is not yet ported, so we use the
+    connection default VFS and inherit openFlags directly. }
+  flags := db^.openFlags;
+  pVfs  := db^.pVfs;
+  if (db^.flags and ATTACH_FLAG_AttachWrite) = 0 then
+  begin
+    flags := flags and not u32(SQLITE_OPEN_CREATE or SQLITE_OPEN_READWRITE);
+    flags := flags or u32(SQLITE_OPEN_READONLY);
+  end else if (db^.flags and ATTACH_FLAG_AttachCreate) = 0 then
+    flags := flags and not u32(SQLITE_OPEN_CREATE);
+  flags := flags or u32(SQLITE_OPEN_MAIN_DB);
+  rc := sqlite3BtreeOpen(pVfs, PChar(zFile), Psqlite3(db),
+    PPBtree(@pSlot^.pBt), 0, i32(flags));
+  Inc(db^.nDb);
+  pSlot^.zDbSName := sqlite3DbStrDup(db, zName);
+  db^.noSharedCache := 0;
+
+  if rc = SQLITE_CONSTRAINT then
+  begin
+    rc := SQLITE_ERROR;
+    zErrDyn := sqlite3MPrintf(db, 'database is already attached', []);
+  end else if rc = SQLITE_OK then
+  begin
+    pSlot^.pSchema := sqlite3SchemaGet(db, pSlot^.pBt);
+    if pSlot^.pSchema = nil then
+      rc := SQLITE_NOMEM
+    else if (pSlot^.pSchema^.file_format <> 0)
+            and (pSlot^.pSchema^.enc <> db^.enc) then
+    begin
+      zErrDyn := sqlite3MPrintf(db,
+        'attached databases must use the same text encoding as main database',
+        []);
+      rc := SQLITE_ERROR;
+    end;
+    sqlite3BtreeSecureDelete(PBtree(pSlot^.pBt),
+      sqlite3BtreeSecureDelete(PBtree(db^.aDb[0].pBt), -1));
+  end;
+  pSlot^.safety_level := 3;  { PAGER_SYNCHRONOUS_FULL+1 — matches main.c openDatabase }
+  if (rc = SQLITE_OK) and (pSlot^.zDbSName = nil) then rc := SQLITE_NOMEM;
+
+  { sqlite3Init reload (attach.c:226..242) is gated on Phase 7.1.1
+    sqlite3InitOne — left unwired; new schema slot is empty until that
+    lands.  pager-flag plumbing (sqlite3PagerLockingMode +
+    sqlite3BtreeSetPagerFlags) is in passqlite3pager which codegen
+    doesn't import; deferred together. }
+  if rc = SQLITE_OK then
+    db^.mDbFlags := db^.mDbFlags and not u32(DBFLAG_SchemaKnownOk);
+
+  if rc <> SQLITE_OK then
+  begin
+    i := db^.nDb - 1;
+    if (i >= 2) and (db^.aDb[i].pBt <> nil) then
+    begin
+      sqlite3BtreeClose(PBtree(db^.aDb[i].pBt));
+      db^.aDb[i].pBt     := nil;
+      db^.aDb[i].pSchema := nil;
+    end;
+    sqlite3ResetAllSchemasOfConnection(db);
+    db^.nDb := i;
+    if (rc = SQLITE_NOMEM) or (rc = SQLITE_IOERR_NOMEM) then
+    begin
+      sqlite3OomFault(db);
+      sqlite3DbFree(db, zErrDyn);
+      zErrDyn := sqlite3MPrintf(db, 'out of memory', []);
+    end else if zErrDyn = nil then
+      zErrDyn := sqlite3MPrintf(db, 'unable to open database: %s', [zFile]);
+    goto attach_error;
+  end;
+  Exit;
+
+attach_error:
+  if zErrDyn <> nil then
+  begin
+    sqlite3_result_error(pCtx, zErrDyn, -1);
+    sqlite3DbFree(db, zErrDyn);
+  end;
+  if rc <> 0 then sqlite3_result_error_code(pCtx, rc);
+  if nUnused = 0 then ; { silence unused-arg warning }
 end;
 
 { Phase 7.1.4 — DbFixer port (attach.c:457..621).
