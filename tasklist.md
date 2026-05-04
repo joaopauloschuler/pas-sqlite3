@@ -247,18 +247,19 @@ FPC porting traps that recur often enough to call out up-front:
                  1384..1503.  ANALYZE now emits BeginWrite +
                  openStatTable + LoadAnalysis + Expire framing.
             [X] Port the leaf `analyzeOneTable` (analyze.c:977..1378)
-                 — DONE.  Full 1:1 body (non-STAT4 non-PREUPDATE_HOOK
-                 build) at codegen.pas, plus
-                 `analyzeVdbeCommentIndexWithColumnName` (no-op port,
-                 EXPLAIN_COMMENTS-only) and the STAT_GET_* selector
-                 constants.  Emits per-index OpenRead / stat_init /
-                 distinct-test / stat_push / Next / stat_get /
-                 sqlite_stat1 INSERT chain plus the trailing
-                 row-count entry.  Runtime parity still gated on
-                 StatAccum SQL function registration (statInit/
-                 statPush/statGet) — callStatGet still passes nil
-                 pFuncDef so sqlite_stat1 rows remain empty until
-                 those are wired.
+                 — DONE.
+            [X] Port + register StatAccum SQL function triplet
+                 `stat_init` / `stat_push` / `stat_get` (analyze.c:401..923,
+                 non-STAT4 build).  TStatAccum record + statAccumDestructor
+                 + `sqlite3AnalyzeFunctions` registration hooked into
+                 `sqlite3RegisterBuiltinFunctions`.  callStatGet and the
+                 two analyzeOneTable call sites now pass the FuncDef
+                 pointers directly.  Gate `DiagAnalyze` (3/3 PASS with
+                 pre-created sqlite_stat1).  End-to-end ANALYZE on a
+                 fresh DB still gated on Phase 7.1.1 (sqlite3InitOne) —
+                 `sqlite3NestedParse('CREATE TABLE %Q.sqlite_stat1...')`
+                 in openStatTable runs but the schema cache is not
+                 reloaded so the subsequent OpenWrite fails.
        [X] Port `sqlite3Vacuum` (vacuum.c).
        [X] Port `sqlite3FkCheck` (fkey.c) — DONE.  fkScanChildren
             (fkey.c:547..660) and the dispatcher body (fkey.c:889..

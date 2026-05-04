@@ -37159,6 +37159,190 @@ end;
 procedure analyzeOneTable(pParse: PParse; pTab: PTable2; pOnlyIdx: PIndex2;
                           iStatCur, iMem, iTab: i32); forward;
 
+{ ============================================================
+  StatAccum — non-STAT4 layout, port of analyze.c:265..302.
+  Trailing tRowcnt[nCol] (anDLt) lives just past the record body,
+  set up by statInit (analyze.c:450).
+  ============================================================ }
+type
+  PStatAccum = ^TStatAccum;
+  TStatSampleSlim = record
+    anDLt: ^u64;          { tRowcnt = u64 in this build }
+  end;
+  TStatAccum = record
+    db:         Pointer;  { sqlite3* — Pointer keeps unit deps minimal }
+    nEst:       u64;      { tRowcnt nEst (set from sqlite3_value_int64) }
+    nRow:       u64;      { tRowcnt nRow }
+    nLimit:     i32;
+    nCol:       i32;
+    nKeyCol:    i32;
+    nSkipAhead: u8;
+    _pad0:      array[0..2] of Byte;  { align trailing pointer }
+    current:    TStatSampleSlim;
+  end;
+
+{ statAccumDestructor — analyze.c:366..377.  Non-STAT4 build: nothing
+  to free in StatSample, just the StatAccum block itself. }
+procedure statAccumDestructor(p: Pointer); cdecl;
+var pAcc: PStatAccum;
+begin
+  pAcc := PStatAccum(p);
+  if pAcc = nil then Exit;
+  sqlite3DbFree(pAcc^.db, pAcc);
+end;
+
+{ statInitImpl — analyze.c:401..486.  stat_init(N,K,C,L) — allocates
+  the StatAccum object (record body + nCol*tRowcnt for current.anDLt)
+  and returns it as a BLOB whose destructor reclaims the block.
+  Non-STAT4: no aBest[]/a[] arrays, no STAT_GET_ROWID/_NEQ paths. }
+procedure statInitImpl(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pAcc:    PStatAccum;
+  nCol:    i32;
+  nKeyCol: i32;
+  nColUp:  i32;
+  n:       u64;
+  db:      Pointer;
+begin
+  if argc < 4 then Exit;
+  db   := sqlite3_context_db_handle(pCtx);
+  nCol := sqlite3_value_int(Psqlite3_value(argv^));
+  AssertH(nCol > 0, 'statInit: nCol>0');
+  nColUp  := nCol;     { sizeof(tRowcnt)==8 here, so nColUp==nCol (analyze.c:421) }
+  nKeyCol := sqlite3_value_int(Psqlite3_value((argv + 1)^));
+  AssertH(nKeyCol <= nCol, 'statInit: nKeyCol<=nCol');
+  AssertH(nKeyCol > 0,     'statInit: nKeyCol>0');
+
+  n := u64(SizeOf(TStatAccum)) + u64(SizeOf(u64)) * u64(nColUp);
+  pAcc := PStatAccum(sqlite3DbMallocZero(db, n));
+  if pAcc = nil then
+  begin
+    sqlite3_result_error_nomem(pCtx);
+    Exit;
+  end;
+
+  pAcc^.db         := db;
+  pAcc^.nEst       := u64(sqlite3_value_int64(Psqlite3_value((argv + 2)^)));
+  pAcc^.nRow       := 0;
+  pAcc^.nLimit     := sqlite3_value_int(Psqlite3_value((argv + 3)^));
+  pAcc^.nCol       := nCol;
+  pAcc^.nKeyCol    := nKeyCol;
+  pAcc^.nSkipAhead := 0;
+  { current.anDLt = (tRowcnt*)&p[1] — first byte after the record. }
+  pAcc^.current.anDLt := Pointer(PByte(pAcc) + SizeOf(TStatAccum));
+
+  { Return the StatAccum pointer as a BLOB.  Only the pointer (the 2nd
+    parameter) matters; size is opaque to callers. }
+  sqlite3_result_blob(pCtx, pAcc, i32(SizeOf(TStatAccum)),
+                      @statAccumDestructor);
+end;
+
+{ statPushImpl — analyze.c:702..779.  stat_push(P, iChng [,R]).
+  Non-STAT4 build: third arg (rowid) is unused.  Updates anDLt[]
+  for columns >= iChng on every row except the first, and emits a
+  signal value if the per-loop scan budget is exhausted. }
+procedure statPushImpl(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pAcc:  PStatAccum;
+  iChng: i32;
+  i:     i32;
+  anDLt: ^u64;
+begin
+  if argc < 2 then Exit;
+  pAcc  := PStatAccum(sqlite3_value_blob(Psqlite3_value(argv^)));
+  if pAcc = nil then Exit;
+  iChng := sqlite3_value_int(Psqlite3_value((argv + 1)^));
+  AssertH(pAcc^.nCol > 0, 'statPush: nCol>0');
+  AssertH(iChng < pAcc^.nCol, 'statPush: iChng<nCol');
+
+  if pAcc^.nRow <> 0 then
+  begin
+    anDLt := pAcc^.current.anDLt;
+    for i := iChng to pAcc^.nCol - 1 do
+      Inc(anDLt[i]);
+  end;
+  Inc(pAcc^.nRow);
+
+  if (pAcc^.nLimit <> 0)
+     and (pAcc^.nRow > u64(pAcc^.nLimit) * (u64(pAcc^.nSkipAhead) + 1)) then
+  begin
+    Inc(pAcc^.nSkipAhead);
+    if pAcc^.current.anDLt[0] > 0 then
+      sqlite3_result_int(pCtx, 1)
+    else
+      sqlite3_result_int(pCtx, 0);
+  end;
+end;
+
+{ statGetImpl — analyze.c:818..922.  stat_get(P) — non-STAT4 build:
+  one-argument form, always returns the sqlite_stat1 "stat" string:
+    "<count> <est-for-1col> <est-for-2col> ..."
+  Uses (K+D-1)/D rounding with the I=2-near-1.0 special case
+  (analyze.c:864..874). }
+procedure statGetImpl(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pAcc:      PStatAccum;
+  i:         i32;
+  s:         AnsiString;
+  iVal:      u64;
+  nDistinct: u64;
+  nReport:   u64;
+begin
+  if argc < 1 then Exit;
+  pAcc := PStatAccum(sqlite3_value_blob(Psqlite3_value(argv^)));
+  if pAcc = nil then Exit;
+
+  if pAcc^.nSkipAhead <> 0 then nReport := pAcc^.nEst
+  else                          nReport := pAcc^.nRow;
+  s := IntToStr(QWord(nReport));
+  for i := 0 to pAcc^.nKeyCol - 1 do
+  begin
+    nDistinct := pAcc^.current.anDLt[i] + 1;
+    iVal := (pAcc^.nRow + nDistinct - 1) div nDistinct;
+    if (iVal = 2) and (pAcc^.nRow * 10 <= nDistinct * 11) then
+      iVal := 1;
+    s := s + ' ' + IntToStr(QWord(iVal));
+  end;
+  sqlite3_result_text(pCtx, PAnsiChar(s), i32(Length(s)), SQLITE_TRANSIENT);
+end;
+
+var
+  aStatFuncs:      array[0..2] of TFuncDef;
+  statFuncsInited: Boolean = False;
+
+{ sqlite3AnalyzeFunctions — register the stat_init / stat_push / stat_get
+  triplet used by ANALYZE-emitted bytecode (analyze.c:487/781/923).
+  These are addressed by direct FuncDef pointer at call-emission time
+  (callStatGet / analyzeOneTable), but we also insert them into the
+  builtin-func hash so they survive sqlite3RegisterBuiltinFunctions
+  resets the same way aBuiltinFuncs entries do. }
+procedure sqlite3AnalyzeFunctions;
+const
+  STAT_FUNC_FLAGS = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN
+                 or SQLITE_FUNC_INTERNAL or SQLITE_FUNC_CONSTANT;
+begin
+  if statFuncsInited then Exit;
+  statFuncsInited := True;
+  FillChar(aStatFuncs[0], SizeOf(aStatFuncs), 0);
+
+  aStatFuncs[0].nArg      := 4;
+  aStatFuncs[0].funcFlags := STAT_FUNC_FLAGS;
+  aStatFuncs[0].xSFunc    := @statInitImpl;
+  aStatFuncs[0].zName     := 'stat_init';
+
+  aStatFuncs[1].nArg      := 2;     { 2+IsStat4; non-STAT4 == 2 }
+  aStatFuncs[1].funcFlags := STAT_FUNC_FLAGS;
+  aStatFuncs[1].xSFunc    := @statPushImpl;
+  aStatFuncs[1].zName     := 'stat_push';
+
+  aStatFuncs[2].nArg      := 1;     { 1+IsStat4; non-STAT4 == 1 }
+  aStatFuncs[2].funcFlags := STAT_FUNC_FLAGS;
+  aStatFuncs[2].xSFunc    := @statGetImpl;
+  aStatFuncs[2].zName     := 'stat_get';
+
+  sqlite3InsertBuiltinFuncs(@aStatFuncs, Length(aStatFuncs));
+end;
+
 { openStatTable — port of analyze.c:166..251.  Creates / clears the
   sqlite_stat1 (and stat4) tables, opens them for writing on cursors
   iStatCur..iStatCur+nToOpen-1.  zWhere/zWhereType together restrict the
@@ -37256,7 +37440,9 @@ begin
     are registered the resolver returns nil and this becomes a no-op
     OP_Function with P4=nil — same shape as upstream's PRAGMA-only
     path. }
-  sqlite3VdbeAddFunctionCall(pParse, 0, regStat, regOut, 1, nil, 0);
+  sqlite3AnalyzeFunctions;  { idempotent — guarantees the FuncDef is set up }
+  sqlite3VdbeAddFunctionCall(pParse, 0, regStat, regOut, 1,
+                             @aStatFuncs[2], 0);  { statGetFuncdef }
 end;
 
 { loadAnalysis — port of analyze.c:1384..1389.  Emits a single
@@ -37569,8 +37755,9 @@ begin
       sqlite3VdbeAddOp3(v, OP_Count, iIdxCur, regTemp, 1)
     else
       sqlite3VdbeAddOp3(v, OP_Count, iIdxCur, regTemp, 0);
+    sqlite3AnalyzeFunctions;  { idempotent }
     sqlite3VdbeAddFunctionCall(pParse, 0, regStat + 1, regStat, 4,
-                               nil, 0);  { statInitFuncdef — not yet registered }
+                               @aStatFuncs[0], 0);  { statInitFuncdef }
     addrGotoEnd := sqlite3VdbeAddOp1(v, OP_Rewind, iIdxCur);
 
     sqlite3VdbeAddOp2(v, OP_Integer, 0, regChng);
@@ -37625,7 +37812,7 @@ begin
         Next csr ; if !eof goto next_row }
     AssertH(regChng = regStat + 1, 'analyzeOneTable: regChng layout');
     sqlite3VdbeAddFunctionCall(pParse, 1, regStat, regTemp, 2 + IsStat4,
-                               nil, 0);  { statPushFuncdef — not yet registered }
+                               @aStatFuncs[1], 0);  { statPushFuncdef }
     if db^.nAnalysisLimit <> 0 then
     begin
       j1 := sqlite3VdbeAddOp1(v, OP_IsNull, regTemp);
@@ -41728,6 +41915,7 @@ begin
   sqlite3InsertBuiltinFuncs(@aBuiltinFuncs, Length(aBuiltinFuncs));
   sqlite3InsertBuiltinFuncs(@aBuiltinAgg,   Length(aBuiltinAgg));
   sqlite3AlterFunctions;
+  sqlite3AnalyzeFunctions;
   sqlite3WindowFunctions;
   sqlite3RegisterJsonFunctions;
   sqlite3RegisterDateTimeFunctions;
