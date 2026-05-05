@@ -628,8 +628,15 @@ FPC porting traps that recur often enough to call out up-front:
             sqlite_master before InitOne runs.
        [X] Port `sqlite3InitCallback` — already complete in main.pas
             (re-prepare under init.busy=1 publishes to tblHash).
-       [ ] Port `sqlite3RunParser` (tokenize.c) — moved here from
-            6.25.  Independent of the InitOne path above.
+       [X] Port `sqlite3RunParser` (tokenize.c) — already landed in
+            passqlite3parser.pas:1156, productively wired through
+            passqlite3main.pas:1064.  zErrMsg fallback fill
+            (tokenize.c:736..738) and apVtabLock cleanup (746) ported
+            2026-05-05 to bring the tail of the function to 1:1.
+            Remaining omissions documented in the function header
+            comment (sqlite3_log, ParserTrace, printf-style error
+            formatting) are intentional — they are gated on facilities
+            the supporting units do not yet expose.
        [ ] Schema-row INSERT / UPDATE wiring — sqlite3Insert against
             sqlite_master still emits zero rows, so a re-open does
             not pick up Pascal-port-created user tables (gates
