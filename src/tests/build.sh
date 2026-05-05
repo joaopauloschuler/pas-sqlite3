@@ -170,6 +170,7 @@ compile_test DiagAutoIdx
 compile_test DiagBloom
 compile_test DiagCast
 compile_test DiagCollate
+compile_test DiagCovering
 compile_test DiagColName
 compile_test DiagConcat
 compile_test DiagCreateIdx

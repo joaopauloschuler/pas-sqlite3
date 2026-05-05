@@ -15839,16 +15839,18 @@ begin
       whereLoopAddBtree path 2 selection.  Without this, the synthetic
       table-scan stand-in below would short-circuit the planner and pin the
       plan to an OP_OpenRead on the heap, diverging from the C oracle. }
-    if pWC^.nTerm = 0 then
+    { Defer to the cost-based planner whenever the table has any non-partial
+      index that could plausibly compete with a heap SCAN.  The synthetic
+      SCAN below is a fallback for tables with no usable index at all
+      (or only partial indices that don't apply); when an index exists,
+      whereLoopAddBtree / wherePathSolver must rank covering / range scans
+      against the SCAN baseline.  Tasklist 6.8.4 covering-index arm. }
+    pIdx := pTab^.pIndex;
+    while pIdx <> nil do
     begin
-      pIdx := pTab^.pIndex;
-      while pIdx <> nil do
-      begin
-        if (pIdx^.pPartIdxWhere = nil)
-           and (pIdx^.nKeyCol < pTab^.nCol) then
-          Exit(0);
-        pIdx := pIdx^.pNext;
-      end;
+      if pIdx^.pPartIdxWhere = nil then
+        Exit(0);
+      pIdx := pIdx^.pNext;
     end;
     pLoop^.wsFlags := 0; { plain scan — no IPK/INDEX/ONEROW hints }
     pLoop^.nLTerm := 0;

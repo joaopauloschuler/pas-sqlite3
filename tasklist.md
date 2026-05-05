@@ -72,9 +72,10 @@ FPC porting traps that recur often enough to call out up-front:
 
 - [X] **6.8.3** port `sqlite3CompleteInsertion` (insert.c)
 
-- [~] **6.8.4** port `sqlite3WhereBegin` (where.c).
+- [X] **6.8.4** port `sqlite3WhereBegin` (where.c) — DONE.
      Gate: TestExplainParity SELECT-WHERE corpus + DiagIndexing
-     `indexed by ok` / `not indexed` (closes 6.10 step 26(e)).
+     `indexed by ok` / `not indexed` + DiagCovering (closes
+     6.10 step 26(e)).
      [X] Allocate `WhereInfo` + per-loop `WhereLevel` array.
      [X] Drive `whereLoopAddAll` + `wherePathSolver` for the
           cost-based plan.
@@ -85,35 +86,31 @@ FPC porting traps that recur often enough to call out up-front:
      [X] `not indexed` / `INDEXED BY` honour (DiagIndexing PASS).
      [X] Multi-table loop nesting + per-loop WHERE-clause splitting
           — sqlite3WhereBegin iterates `for ii := 0 to nTabList - 1`
-          (codegen.pas:16561, 16631) driving codeOneLoopStart per
-          level; TestExplainParity 1025/1026 with the only remaining
-          divergence being the INSERT VALUES coroutine (tracked under
-          6.10 step 6, unrelated to WHERE).
-     [~] Bloom-filter and covering-index arms (covers 6.10 step 9
-          d-INNER).
-          Bloom-filter machinery DONE: whereCheckIfBloomFilterIsUseful
+          driving codeOneLoopStart per level; TestExplainParity
+          1025/1026 with the only remaining divergence being the
+          INSERT VALUES coroutine (tracked under 6.10 step 6,
+          unrelated to WHERE).
+     [X] Bloom-filter and covering-index arms (covers 6.10 step 9
+          d-INNER).  Bloom-filter machinery: whereCheckIfBloomFilterIsUseful
           (where.c:6622) wired post-wherePathSolver, full
           sqlite3ConstructBloomFilter (where.c:1273) wired into the
           per-level loop in sqlite3WhereBegin alongside
-          constructAutomaticIndex.  DiagBloom probe lands as a tripwire;
-          gating corpus stays unaffected (no analyzed shapes trigger it).
-          Covering-index arm: in-place machinery exists
-          (whereIsCoveringIndex, WHERE_IDX_ONLY in whereLoopAddBtree,
-          omitTable honoured in OneLoopStart) but the planner DOES NOT
-          PICK any indexed plan today for canonical shapes.  Repro
-          (2026-05-05): `CREATE INDEX i1 ON t(a,b); SELECT a,b FROM t
-          WHERE a > 0` — C picks "SEARCH t USING COVERING INDEX i1
-          (a>?)" (OpenRead i1 + SeekGT + IdxGT + Column from index);
-          Pas emits OpenRead t + Rewind + Column from table.  Same
-          divergence on `WHERE a = 4`.  Root cause is upstream of
-          covering: wherePathSolver is not preferring any
-          whereLoopAddBtreeIndex output for these shapes.  Probable
-          culprits: whereShortCut fall-through cost mis-set, or the
-          rRun/nOut tally for indexed loops in whereLoopAddBtreeIndex
-          is bigger than the SCAN baseline so wherePathSolver picks
-          SCAN.  Investigation gate to open: dump the per-template
-          rRun/nOut from whereLoopAddBtree on this shape and compare
-          to C's WHERETRACE.
+          constructAutomaticIndex; DiagBloom probe lands as a tripwire.
+          Covering-index pick now lands too: whereShortCut's synthetic
+          SCAN fallback (codegen.pas:15842..15878) was firing whenever
+          its ONEROW probes failed, swallowing every shape that
+          should have flowed into wherePathSolver.  Fix: defer to the
+          cost-based planner whenever the table has any non-partial
+          index (regardless of pWC^.nTerm).  DiagCovering tripwire
+          asserts `CREATE INDEX i1 ON t(a,b); SELECT a,b FROM t
+          WHERE a > 0` and the WHERE a=4 variant now open the index
+          cursor and emit SeekGT / SeekGE+IdxGT (PASS, matches C
+          oracle "SEARCH t USING COVERING INDEX i1 (a>?)").
+          TestExplainParity unchanged at 1025/1026 — the EXPLAIN
+          corpus never fires DDL so its t/s/u tables stay
+          index-free, so the fix is functionally invisible there;
+          DiagCovering closes the gap for shapes that do see real
+          indices.
 
 - [~] **6.8.6** port the productive `sqlite3Insert` body (insert.c).
      Single-row VALUES path DONE.  Inline four-op shortcut replaced
