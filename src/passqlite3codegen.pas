@@ -1562,6 +1562,7 @@ const
     actually consulted from the where engine and codegen are mirrored
     here so far; the remainder land alongside their first reader. }
   SQLITE_QueryFlattener = u32($00000001);
+  SQLITE_WindowFunc     = u32($00000002);  { use xInverse for window functions (sqliteInt.h:1900) }
   SQLITE_CoverIdxScan   = u32($00000020);  { covering-index scan opt (sqliteInt.h:1904) }
   SQLITE_DistinctOpt    = u32($00000010);
   SQLITE_OrderByIdxJoin = u32($00000040);  { ORDER BY of joins via index (sqliteInt.h:1905) }
@@ -45962,14 +45963,25 @@ begin
   pWin^.eFrmType      := u8(eType);
   pWin^.eStart        := u8(eStart);
   pWin^.eEnd          := u8(eEnd);
+  { window.c:1227..1229 — when EXCLUDE is unspecified and the
+    SQLITE_WindowFunc optimisation has been disabled via TESTCTRL,
+    coerce eExclude to TK_NO so the slow-path windowFullScan body
+    runs (otherwise the xInverse fast path is silently selected). }
+  if (eExclude = 0) and OptimizationDisabled(pParse^.db, SQLITE_WindowFunc) then
+    eExclude := u8(TK_NO);
   pWin^.eExclude      := eExclude;
   pWin^.bImplicitFrame:= u8(bImplicitFrame);
-  { sqlite3WindowOffsetExpr: if not constant, replace with NULL }
+  { sqlite3WindowOffsetExpr (window.c:1163..1170): if not constant,
+    replace with NULL.  Honour IN_RENAME_OBJECT by routing the discarded
+    expression through sqlite3RenameExprUnmap so the rename map's stale
+    entries are pruned before sqlite3ExprDelete. }
   if (pEnd <> nil) and (sqlite3ExprIsConstant(nil, pEnd) = 0) then begin
+    if InRenameObject(pParse) then sqlite3RenameExprUnmap(pParse, pEnd);
     sqlite3ExprDelete(pParse^.db, pEnd);
     pEnd := sqlite3ExprAlloc(pParse^.db, TK_NULL, nil, 0);
   end;
   if (pStart <> nil) and (sqlite3ExprIsConstant(nil, pStart) = 0) then begin
+    if InRenameObject(pParse) then sqlite3RenameExprUnmap(pParse, pStart);
     sqlite3ExprDelete(pParse^.db, pStart);
     pStart := sqlite3ExprAlloc(pParse^.db, TK_NULL, nil, 0);
   end;
