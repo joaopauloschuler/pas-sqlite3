@@ -390,15 +390,30 @@ FPC porting traps that recur often enough to call out up-front:
 
   [ ] **6.10 step 8** EQP P4 text not emitted on OP_Explain.
       sqlite3WhereAddExplainText is fully ported but cannot be wired
-      from sqlite3WhereExplainOneScan today: doing so AVs immediately
-      under TestExplainParity at the TSrcItem.fg.fgBits3 access (or a
-      neighbouring offset).  TestExplainParity excludes P4 from its
-      diff so the regression is masked, but EXPLAIN QUERY PLAN text
-      and any future EQP corpus need this resolved.  Likely cause:
-      TSrcItem layout drift between the codegen.pas record definition
-      and the offsets sqlite3WhereAddExplainText / explainIndexRange
-      reach into.  Audit needed before re-enabling the wiring at
-      passqlite3codegen.pas sqlite3WhereExplainOneScan.
+      from sqlite3WhereExplainOneScan today.  2026-05-05 audit:
+      re-enabling the call (`if pTabList<>nil then AddExplainText(...)`)
+      produces an immediate EAccessViolation at the very first SQL on
+      both TestExplainParity and TestSelectBasic T11 (sqlite3MaterializeView
+      driver).  The AV happens inside emitSrcItem (passqlite3printf.pas:455)
+      via the `%S` formatter, which dereferences pItem^.zName / zAlias /
+      fg.fgBits / u4_ptr through the TSrcItemBlit overlay.  TSrcItem and
+      TSrcItemBlit offsets line up with the C SrcItem (zName=0, zAlias=8,
+      pSTab=16, jointype=24, fgBits=25, fgBits2=26, fgBits3=27, iCursor=28,
+      colUsed=32, u1.nRow=40, u2=48, u3=56, u4=64).  Likely culprits to
+      investigate next: (a) the `array of const` marshalling in
+      sqlite3_str_appendf — `[pItem]` may be passed as `vtObject` rather
+      than `vtPointer`, so NextArgPtr reads past the TVarRec; the working
+      sqlite3WhereExplainBloomFilter call site uses the same shape but
+      passes an already-validated pItem from pWInfo^.pTabList rather than
+      via the OneScan dispatch chain; (b) pParse^.addrExplain may need
+      sqlite3VdbeExplainParent treatment first; (c) sqlite3MaterializeView
+      synthesises a SrcList where pSrcItem^.pSTab is nil at the moment
+      OneScan fires (only zName is set), and emitSrcItem's u4_ptr deref
+      fires when fg_bits has neither fixedSchema nor isSubquery — that
+      arm reads u4_ptr as PAnsiChar zDatabase and calls AnsiString(...)
+      on the (potentially garbage) word.  TestExplainParity excludes P4
+      from its diff so the regression is masked there, but EXPLAIN QUERY
+      PLAN text and any future EQP corpus need this resolved.
 
   [ ] **6.10 step 9** Runtime divergences surfaced by
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
@@ -468,7 +483,13 @@ FPC porting traps that recur often enough to call out up-front:
       (transactions, savepoints, conflict resolution).  2 remain.
       [ ] **b) `BEGIN; ...; ROLLBACK` does not roll back** — BEGIN/
         ROLLBACK are no-ops on Pas side; blocked on Phase 5.4 full
-        VdbeHalt port.
+        VdbeHalt port.  2026-05-05: sqlite3RollbackAll body upgraded
+        from a thin BtreeRollback loop to a faithful 1:1 port of
+        main.c:1483 (DBFLAG_SchemaChange + init.busy gate, vtab
+        rollback, deferred-FK reset, DeferFKs/CorruptRdOnly clear,
+        xRollbackCallback dispatch).  Remaining gap: VdbeHalt itself
+        does not call RollbackAll on the autoCommit-with-error arm —
+        that's the load-bearing piece for `BEGIN; ...; ROLLBACK`.
       [~] **c) `SAVEPOINT s; ROLLBACK TO s` does not unwind** —
         schema-cache side fixed.  Remaining: memdb pager savepoint
         reconciliation — btree pages not unwound on ROLLBACK TO.

@@ -6796,18 +6796,59 @@ begin
 end;
 
 { ============================================================================
-  sqlite3RollbackAll — roll back all btrees in db->aDb (vdbeaux.c)
+  sqlite3RollbackAll — port of main.c:1483.
+
+  Roll back every attached btree, then handle schema-change rollback,
+  reset deferred-FK counters, clear DeferFKs / CorruptRdOnly flags,
+  and invoke the optional xRollbackCallback.
+
+  Deviations from the C reference (documented at the port site):
+    * sqlite3BtreeEnterAll / sqlite3BtreeLeaveAll are no-ops in this
+      OMIT_SHARED_CACHE port — same surface as C macros under the same
+      gate.
+    * Pas legacy-port behaviour: this procedure historically also set
+      pDb^.autoCommit := 1.  Upstream sets autoCommit elsewhere
+      (sqlite3VdbeHalt's special-error arm and OP_AutoCommit).  The
+      autoCommit assignment is retained here to preserve OP_AutoCommit's
+      observable behaviour while the full sqlite3VdbeHalt port is still
+      pending — without it, an immediate `BEGIN; ROLLBACK` cycle would
+      leave autoCommit unchanged and break the DiagTxn corpus.
   ============================================================================ }
 procedure sqlite3RollbackAll(pDb: PTsqlite3; tripCode: i32);
 var
-  ii:  i32;
-  pBt: PBtree;
+  ii:           i32;
+  pBt:          PBtree;
+  inTrans:      i32;
+  schemaChange: i32;
+  unwind:       i32;
 begin
+  inTrans := 0;
+  sqlite3BeginBenignMalloc;
+  schemaChange := 0;
+  if ((pDb^.mDbFlags and DBFLAG_SchemaChange) <> 0)
+     and (pDb^.init.busy = 0) then
+    schemaChange := 1;
+  if schemaChange <> 0 then unwind := 0 else unwind := 1;
   for ii := 0 to pDb^.nDb - 1 do begin
     pBt := PBtree(pDb^.aDb[ii].pBt);
-    if pBt <> nil then
-      sqlite3BtreeRollback(pBt, tripCode, 0);
+    if pBt <> nil then begin
+      if sqlite3BtreeTxnState(pBt) = SQLITE_TXN_WRITE then
+        inTrans := 1;
+      sqlite3BtreeRollback(pBt, tripCode, unwind);
+    end;
   end;
+  sqlite3VtabRollback(pDb);
+  sqlite3EndBenignMalloc;
+  if schemaChange <> 0 then begin
+    sqlite3ExpirePreparedStatements(pDb, 0);
+    sqlite3ResetAllSchemasOfConnection(pDb);
+  end;
+  pDb^.nDeferredCons    := 0;
+  pDb^.nDeferredImmCons := 0;
+  pDb^.flags := pDb^.flags and not (SQLITE_DeferFKs or SQLITE_CorruptRdOnly);
+  if Assigned(pDb^.xRollbackCallback)
+     and ((inTrans <> 0) or (pDb^.autoCommit = 0)) then
+    pDb^.xRollbackCallback(pDb^.pRollbackArg);
   pDb^.autoCommit := 1;
 end;
 
