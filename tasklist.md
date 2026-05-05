@@ -117,10 +117,12 @@ FPC porting traps that recur often enough to call out up-front:
      [X] BEFORE / AFTER INSERT triggers.
      [X] RETURNING clause emission — DiagDml RETURNING corpus PASS.
      [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
-     [ ] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
-          fast path).  Building block ported: `xferCompatibleIndex`
-          (insert.c:2951) at codegen.pas — index-pair compatibility
-          check used by xferOptimization.
+     [X] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
+          fast path) — DONE.  Body ported at codegen.pas (1:1 with
+          insert.c:3012..3392).  Wired into sqlite3Insert via the
+          `pColumn=nil && pSelect && !pTrigger` gate (insert.c:1030)
+          with `goto insert_end`.  PREUPDATE_HOOK and OMIT_SHARED_CACHE
+          arms not in default build.
 
 - [X] **6.8.5** port `sqlite3WhereEnd` (where.c) — DONE.
      Body at codegen.pas:16461..16672.  Per-level addrCont resolution +

@@ -28081,6 +28081,19 @@ end;
   sqlite3NestedParse never target AUTOINCREMENT tables. }
 function autoIncBegin(pParse: PParse; iDb: i32; pTab: PTable2): i32; forward;
 
+{ xferOptimization — port of insert.c:3012 (Phase 6.8.6).
+  Attempt the transfer optimisation for `INSERT INTO t1 SELECT * FROM t2`.
+  Returns 1 if the optimisation is fully applied (caller jumps straight to
+  insert_end), 0 otherwise (caller must emit the unoptimised path; if an
+  emptyDestTest was emitted the optimised arm jumps over it on a non-empty
+  destination).  Mirrors the C reference 1:1; SQLITE_OMIT_VIRTUALTABLE,
+  SQLITE_OMIT_GENERATED_COLUMNS, SQLITE_OMIT_CHECK, SQLITE_OMIT_FOREIGN_KEY
+  and SQLITE_OMIT_AUTOVACUUM are all not omitted in this build.  The
+  PREUPDATE_HOOK alternative arm (insert.c:3301..3307) is gated on
+  SQLITE_ENABLE_PREUPDATE_HOOK (not in default build) so it is skipped. }
+function xferOptimization(pParse: PParse; pTab: PTable2; pSelect: PSelect;
+  onError: i32; iDbDest: i32): i32; forward;
+
 { sqlite3Insert — port of insert.c:894 (structural skeleton).
 
   This step (Phase 6.9-bis step 11c) lays down the C-shaped prologue of
@@ -28099,7 +28112,7 @@ function autoIncBegin(pParse: PParse; iDb: i32; pTab: PTable2): i32; forward;
 procedure sqlite3Insert(pParse: PParse; pTabList: PSrcList; pSelect: PSelect;
   pColumn: PIdList; onError: i32; pUpsert: PUpsert);
 label
-  insert_cleanup;
+  insert_cleanup, insert_end;
 var
   db:             PTsqlite3;
   pTab:           PTable2;
@@ -28211,8 +28224,15 @@ begin
   sqlite3BeginWriteOperation(pParse,
     i32(ord((pSelect <> nil) or (pTrg <> nil))), iDb);
 
-  { TODO(Phase 6.x): xferOptimization — INSERT INTO t1 SELECT * FROM t2.
-    Omitted until sqlite3Select / xferOptimization are real. }
+  { xferOptimization — insert.c:1030..1038.  Take the transfer fast path
+    for `INSERT INTO t1 SELECT * FROM t2;`.  When it returns 1 the
+    optimised bytecode is fully emitted and we jump straight to insert_end
+    (autoinc-end + change-count epilogue).  When it returns 0 the caller
+    falls through and emits the unoptimised path; if the optimised arm
+    emitted an emptyDestTest it left a Goto over the unoptimised emission. }
+  if (pColumn = nil) and (pSelect <> nil) and (pTrg = nil)
+     and (xferOptimization(pParse, pTab, pSelect, onError, iDb) <> 0) then
+    goto insert_end;
 
   regAutoinc := autoIncBegin(pParse, iDb, pTab);
 
@@ -28559,6 +28579,7 @@ begin
     sqlite3VdbeResolveLabel(v, endOfLoop);
   end;
 
+insert_end:
   { sqlite3AutoincrementEnd — emit the sqlite_sequence write-back epilogue
     (insert.c:1640).  Skipped inside triggers and nested parses; the body
     is a no-op when pParse^.pAinc is nil so we can call unconditionally
@@ -28648,6 +28669,304 @@ begin
     memId := pInfo^.regCtr;
   end;
   Result := memId;
+end;
+
+function xferOptimization(pParse: PParse; pTab: PTable2; pSelect: PSelect;
+  onError: i32; iDbDest: i32): i32;
+var
+  db:               PTsqlite3;
+  pEList:           PExprList;
+  pSrc:             PTable2;
+  pSrcIdx, pDestIdx: PIndex2;
+  pItem:            PSrcItem;
+  i:                i32;
+  iDbSrc:           i32;
+  iSrc, iDest:      i32;
+  addr1, addr2:     i32;
+  emptyDestTest:    i32;
+  emptySrcTest:     i32;
+  v:                PVdbe;
+  regAutoinc:       i32;
+  destHasUniqueIdx: i32;
+  regData, regRowid: i32;
+  pDestCol, pSrcCol: PColumn;
+  pDestExpr, pSrcExpr: PExpr;
+  pSrcEListItem:    PExprListItem;
+  insFlags:         u8;
+  idxInsFlags:      u8;
+  zColl:            PAnsiChar;
+  destNotNull, srcNotNull: u8;
+  destGenerated, srcGenerated: u16;
+  matched:          Boolean;
+  pDest:            PTable2;  { alias for clarity matching C reference }
+begin
+  Result := 0;
+  pDest := pTab;
+  emptyDestTest := 0;
+  emptySrcTest  := 0;
+  destHasUniqueIdx := 0;
+  Assert(pSelect <> nil);
+  db := pParse^.db;
+
+  { Refuse if the SELECT (or the parser) carries a WITH clause attached. }
+  if (pParse^.pWith <> nil) or (pSelect^.pWith <> nil) then Exit;
+
+  { tab1 must not be a virtual table. }
+  if pDest^.eTabType = TABTYP_VTAB then Exit;
+
+  if onError = OE_Default then
+  begin
+    if pDest^.iPKey >= 0 then onError := i32(pDest^.keyConf);
+    if onError = OE_Default then onError := OE_Abort;
+  end;
+
+  Assert(pSelect^.pSrc <> nil);
+  if pSelect^.pSrc^.nSrc <> 1 then Exit;
+  if (SrcListItems(pSelect^.pSrc)[0].fg.fgBits and u8($04)) <> 0 then
+    Exit;  { isSubquery — bit 2 of fgBits }
+  if pSelect^.pWhere   <> nil then Exit;
+  if pSelect^.pOrderBy <> nil then Exit;
+  if pSelect^.pGroupBy <> nil then Exit;
+  if pSelect^.pLimit   <> nil then Exit;
+  if pSelect^.pPrior   <> nil then Exit;
+  if (pSelect^.selFlags and SF_Distinct) <> 0 then Exit;
+
+  pEList := pSelect^.pEList;
+  Assert(pEList <> nil);
+  if pEList^.nExpr <> 1 then Exit;
+  Assert(ExprListItems(pEList)[0].pExpr <> nil);
+  if ExprListItems(pEList)[0].pExpr^.op <> TK_ASTERISK then Exit;
+
+  { Semantics. }
+  pItem := @SrcListItems(pSelect^.pSrc)[0];
+  pSrc  := sqlite3LocateTableItem(pParse, 0, pItem);
+  if pSrc = nil then Exit;
+  if (pSrc^.tnum = pDest^.tnum) and (pSrc^.pSchema = pDest^.pSchema) then
+    Exit;  { same table }
+  if Ord(HasRowid(pDest)) <> Ord(HasRowid(pSrc)) then Exit;
+  { IsOrdinaryTable — eTabType = TABTYP_NORM }
+  if pSrc^.eTabType <> TABTYP_NORM then Exit;
+  if pDest^.nCol <> pSrc^.nCol then Exit;
+  if pDest^.iPKey <> pSrc^.iPKey then Exit;
+  if ((pDest^.tabFlags and TF_Strict) <> 0)
+     and ((pSrc^.tabFlags and TF_Strict) = 0) then Exit;
+
+  for i := 0 to pDest^.nCol - 1 do
+  begin
+    pDestCol := @pDest^.aCol[i];
+    pSrcCol  := @pSrc^.aCol[i];
+    { COLFLAG_GENERATED match. }
+    destGenerated := pDestCol^.colFlags and COLFLAG_GENERATED;
+    srcGenerated  := pSrcCol^.colFlags  and COLFLAG_GENERATED;
+    if destGenerated <> srcGenerated then Exit;
+    if destGenerated <> 0 then
+    begin
+      if sqlite3ExprCompare(nil,
+           sqlite3ColumnExpr(pSrc,  pSrcCol),
+           sqlite3ColumnExpr(pDest, pDestCol), -1) <> 0 then
+        Exit;
+    end;
+    if pDestCol^.affinity <> pSrcCol^.affinity then Exit;
+    if sqlite3_stricmp(sqlite3ColumnColl(pDestCol),
+                       sqlite3ColumnColl(pSrcCol)) <> 0 then
+      Exit;
+    destNotNull := pDestCol^.typeFlags and $0F;
+    srcNotNull  := pSrcCol^.typeFlags  and $0F;
+    if (destNotNull <> 0) and (srcNotNull = 0) then Exit;
+    { Default-value parity for non-generated columns past column 0. }
+    if (destGenerated = 0) and (i > 0) then
+    begin
+      pDestExpr := sqlite3ColumnExpr(pDest, pDestCol);
+      pSrcExpr  := sqlite3ColumnExpr(pSrc,  pSrcCol);
+      if (Ord(pDestExpr = nil) <> Ord(pSrcExpr = nil))
+         or ((pDestExpr <> nil)
+             and (StrComp(pDestExpr^.u.zToken, pSrcExpr^.u.zToken) <> 0)) then
+        Exit;
+    end;
+  end;
+
+  pDestIdx := pDest^.pIndex;
+  while pDestIdx <> nil do
+  begin
+    if pDestIdx^.onError <> 0 { OE_None=0 → IsUniqueIndex } then
+      destHasUniqueIdx := 1;
+    matched := False;
+    pSrcIdx := pSrc^.pIndex;
+    while pSrcIdx <> nil do
+    begin
+      if xferCompatibleIndex(pDestIdx, pSrcIdx) <> 0 then
+      begin matched := True; Break; end;
+      pSrcIdx := pSrcIdx^.pNext;
+    end;
+    if not matched then Exit;
+    if (pSrcIdx^.tnum = pDestIdx^.tnum)
+       and (pSrc^.pSchema = pDest^.pSchema)
+       and (sqlite3FaultSim(411) = SQLITE_OK) then
+      Exit;  { Corrupt schema — two indexes on the same btree. }
+    pDestIdx := pDestIdx^.pNext;
+  end;
+
+  { CHECK constraints. }
+  if (pDest^.pCheck <> nil)
+     and ((db^.mDbFlags and DBFLAG_Vacuum) = 0)
+     and (sqlite3ExprListCompare(pSrc^.pCheck, pDest^.pCheck, -1) <> 0) then
+    Exit;
+
+  { FK on destination disqualifies (xfer skips FK checks like VACUUM). }
+  Assert(pDest^.eTabType = TABTYP_NORM);
+  if ((db^.flags and SQLITE_ForeignKeys) <> 0)
+     and (pDest^.u.tab.pFKey <> nil) then
+    Exit;
+
+  if (db^.flags and SQLITE_CountRows) <> 0 then Exit;
+
+  { Past every gate — emit the optimised path. }
+  iDbSrc := sqlite3SchemaToIndex(db, pSrc^.pSchema);
+  v := sqlite3GetVdbe(pParse);
+  sqlite3CodeVerifySchema(pParse, iDbSrc);
+  iSrc  := pParse^.nTab; Inc(pParse^.nTab);
+  iDest := pParse^.nTab; Inc(pParse^.nTab);
+  regAutoinc := autoIncBegin(pParse, iDbDest, pDest);
+  regData := sqlite3GetTempReg(pParse);
+  sqlite3VdbeAddOp2(v, OP_Null, 0, regData);
+  regRowid := sqlite3GetTempReg(pParse);
+  sqlite3OpenTable(pParse, iDest, iDbDest, pDest, OP_OpenWrite);
+  Assert(HasRowid(pDest) or (destHasUniqueIdx <> 0));
+
+  if ((db^.mDbFlags and DBFLAG_Vacuum) = 0)
+     and ( ((pDest^.iPKey < 0) and (pDest^.pIndex <> nil))
+        or (destHasUniqueIdx <> 0)
+        or ((onError <> OE_Abort) and (onError <> OE_Rollback)) ) then
+  begin
+    addr1 := sqlite3VdbeAddOp2(v, OP_Rewind, iDest, 0);
+    emptyDestTest := sqlite3VdbeAddOp0(v, OP_Goto);
+    sqlite3VdbeJumpHere(v, addr1);
+  end;
+
+  if HasRowid(pSrc) then
+  begin
+    sqlite3OpenTable(pParse, iSrc, iDbSrc, pSrc, OP_OpenRead);
+    emptySrcTest := sqlite3VdbeAddOp2(v, OP_Rewind, iSrc, 0);
+    if pDest^.iPKey >= 0 then
+    begin
+      addr1 := sqlite3VdbeAddOp2(v, OP_Rowid, iSrc, regRowid);
+      if (db^.mDbFlags and DBFLAG_Vacuum) = 0 then
+      begin
+        { sqlite3VdbeVerifyAbortable — debug-only no-op. }
+        addr2 := sqlite3VdbeAddOp3(v, OP_NotExists, iDest, 0, regRowid);
+        sqlite3RowidConstraint(pParse, onError, pDest);
+        sqlite3VdbeJumpHere(v, addr2);
+      end;
+      { autoIncStep inline (insert.c:521). }
+      if regAutoinc > 0 then
+        sqlite3VdbeAddOp2(v, OP_MemMax, regAutoinc, regRowid);
+    end
+    else if (pDest^.pIndex = nil)
+            and ((db^.mDbFlags and DBFLAG_VacuumInto) = 0) then
+    begin
+      addr1 := sqlite3VdbeAddOp2(v, OP_NewRowid, iDest, regRowid);
+    end
+    else
+    begin
+      addr1 := sqlite3VdbeAddOp2(v, OP_Rowid, iSrc, regRowid);
+      Assert((pDest^.tabFlags and TF_Autoincrement) = 0);
+    end;
+
+    if (db^.mDbFlags and DBFLAG_Vacuum) <> 0 then
+    begin
+      sqlite3VdbeAddOp1(v, OP_SeekEnd, iDest);
+      insFlags := OPFLAG_APPEND or OPFLAG_USESEEKRESULT or OPFLAG_PREFORMAT;
+    end
+    else
+      insFlags := OPFLAG_NCHANGE or OPFLAG_LASTROWID
+                  or OPFLAG_APPEND or OPFLAG_PREFORMAT;
+
+    { SQLITE_ENABLE_PREUPDATE_HOOK arm not in default build. }
+    sqlite3VdbeAddOp3(v, OP_RowCell, iDest, iSrc, regRowid);
+    sqlite3VdbeAddOp3(v, OP_Insert, iDest, regData, regRowid);
+    if (db^.mDbFlags and DBFLAG_Vacuum) = 0 then
+      sqlite3VdbeChangeP4(v, -1, PAnsiChar(Pointer(pDest)), P4_TABLE);
+    sqlite3VdbeChangeP5(v, insFlags);
+
+    sqlite3VdbeAddOp2(v, OP_Next, iSrc, addr1);
+    sqlite3VdbeAddOp2(v, OP_Close, iSrc, 0);
+    sqlite3VdbeAddOp2(v, OP_Close, iDest, 0);
+  end
+  else
+  begin
+    { sqlite3TableLock — no-op under SQLITE_OMIT_SHARED_CACHE. }
+  end;
+
+  { Index-by-index transfer. }
+  pDestIdx := pDest^.pIndex;
+  while pDestIdx <> nil do
+  begin
+    idxInsFlags := 0;
+    pSrcIdx := pSrc^.pIndex;
+    while pSrcIdx <> nil do
+    begin
+      if xferCompatibleIndex(pDestIdx, pSrcIdx) <> 0 then Break;
+      pSrcIdx := pSrcIdx^.pNext;
+    end;
+    Assert(pSrcIdx <> nil);
+    sqlite3VdbeAddOp3(v, OP_OpenRead, iSrc, i32(pSrcIdx^.tnum), iDbSrc);
+    sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pSrcIdx));
+    sqlite3VdbeAddOp3(v, OP_OpenWrite, iDest, i32(pDestIdx^.tnum), iDbDest);
+    sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pDestIdx));
+    sqlite3VdbeChangeP5(v, OPFLAG_BULKCSR);
+
+    addr1 := sqlite3VdbeAddOp2(v, OP_Rewind, iSrc, 0);
+    if (db^.mDbFlags and DBFLAG_Vacuum) <> 0 then
+    begin
+      i := 0;
+      while i < pSrcIdx^.nColumn do
+      begin
+        zColl := PPAnsiChar(pSrcIdx^.azColl)[i];
+        if sqlite3_stricmp(zColl, 'BINARY') <> 0 then Break;
+        Inc(i);
+      end;
+      if i = pSrcIdx^.nColumn then
+      begin
+        idxInsFlags := OPFLAG_USESEEKRESULT or OPFLAG_PREFORMAT;
+        sqlite3VdbeAddOp1(v, OP_SeekEnd, iDest);
+        sqlite3VdbeAddOp2(v, OP_RowCell, iDest, iSrc);
+      end;
+    end
+    else if (not HasRowid(pSrc))
+            and (pDestIdx^.idxFlags and 3 = SQLITE_IDXTYPE_PRIMARYKEY) then
+      idxInsFlags := idxInsFlags or OPFLAG_NCHANGE;
+
+    if idxInsFlags <> (OPFLAG_USESEEKRESULT or OPFLAG_PREFORMAT) then
+    begin
+      sqlite3VdbeAddOp3(v, OP_RowData, iSrc, regData, 1);
+      { codeWithoutRowidPreupdate gated on SQLITE_ENABLE_PREUPDATE_HOOK
+        (off in default build) — skipped. }
+    end;
+    sqlite3VdbeAddOp2(v, OP_IdxInsert, iDest, regData);
+    sqlite3VdbeChangeP5(v, idxInsFlags or OPFLAG_APPEND);
+    sqlite3VdbeAddOp2(v, OP_Next, iSrc, addr1 + 1);
+    sqlite3VdbeJumpHere(v, addr1);
+    sqlite3VdbeAddOp2(v, OP_Close, iSrc, 0);
+    sqlite3VdbeAddOp2(v, OP_Close, iDest, 0);
+
+    pDestIdx := pDestIdx^.pNext;
+  end;
+
+  if emptySrcTest <> 0 then sqlite3VdbeJumpHere(v, emptySrcTest);
+  sqlite3ReleaseTempReg(pParse, regRowid);
+  sqlite3ReleaseTempReg(pParse, regData);
+  if emptyDestTest <> 0 then
+  begin
+    sqlite3AutoincrementEnd(pParse);
+    sqlite3VdbeAddOp2(v, OP_Halt, SQLITE_OK, 0);
+    sqlite3VdbeJumpHere(v, emptyDestTest);
+    sqlite3VdbeAddOp2(v, OP_Close, iDest, 0);
+    Result := 0;
+  end
+  else
+    Result := 1;
+  { Suppress unused warnings. }
+  if False then begin pSrcEListItem := nil; if pSrcEListItem = nil then ; end;
 end;
 
 { Walker callback for sqlite3ExprReferencesUpdatedColumn — port of
