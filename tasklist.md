@@ -276,18 +276,11 @@ FPC porting traps that recur often enough to call out up-front:
             new vdbeRunVacuum hook.  Faithful 1:1 with the
             !SQLITE_OMIT_VACUUM && !SQLITE_OMIT_ATTACH arm; PREUPDATE_HOOK
             and AUTHORIZATION arms left out (default build).
-            2026-05-05 (a3): with Phase 7.1.1 InitOne landed,
-            `VACUUM INTO 'file.db'` now works end-to-end — verified by
-            opening :memory:, CREATE+INSERT+VACUUM INTO, then re-opening
-            the destination file and reading back all rows.  Plain
-            `VACUUM` (in-place) still fails with rc=7 SQLITE_NOMEM and
-            leaves the source DB in a degraded state (post-VACUUM
-            count(*) returns 0 instead of the original row count), so
-            **plain VACUUM is the remaining gap** — most likely the
-            in-place finalize path that swaps the temp btree back into
-            the main aDb[0] slot (vacuum.c:343..366).  VACUUM INTO
-            takes the simpler "open dest btree, copy, close" path and
-            no longer touches the source schema cache.
+            `VACUUM INTO 'file.db'` works end-to-end.  Plain `VACUUM`
+            (in-place) still fails with rc=7 SQLITE_NOMEM and leaves
+            the source DB degraded (post-VACUUM count(*) returns 0).
+            Remaining gap is the in-place finalize path that swaps the
+            temp btree back into aDb[0] (vacuum.c:343..366).
        [X] Port `sqlite3FkCheck` (fkey.c) — DONE.  fkScanChildren
             (fkey.c:547..660) and the dispatcher body (fkey.c:889..
             1087) ported at codegen.pas:38136..38470, replacing the
@@ -475,16 +468,15 @@ FPC porting traps that recur often enough to call out up-front:
       (transactions, savepoints, conflict resolution).  2 remain.
       [ ] **b) `BEGIN; ...; ROLLBACK` does not roll back** — DiagTxn
         `begin rollback insert` (CREATE+INSERT(1)+BEGIN+INSERT(2)+
-        ROLLBACK on `:memory:`) returns count=2 instead of 1.  Sub-bug
-        (i) — nVdbeWrite/nVdbeRead counters not tracked — FIXED in
-        commit 1f67e38; auto-commit gate now reaches vdbeCommit for
-        INSERT(1).  Residual divergence sits deeper in the pager↔btree
-        commit path; next investigation is whether INSERT(1)'s
-        auto-commit drives sqlite3PagerWrite's WRITEABLE-clear via
-        pager_end_transaction → PcacheCleanAll, and if so whether the
-        bug is in INSERT(2)'s sqlite3PagerWrite early-return arm
-        (passqlite3pager.pas:4327) crossing the autocommit→explicit-txn
-        boundary with stale PGHDR_WRITEABLE.
+        ROLLBACK on `:memory:`) returns count=2 instead of 1.  Reproed
+        2026-05-05 in a standalone harness: `:memory:` uses
+        journalMode=PAGER_JOURNALMODE_MEMORY, so the rollback path
+        depends on jfd being opened (memjournal) at INSERT(2) time —
+        if the lazy `pager_open_journal` from sqlite3PagerWrite is not
+        firing across the autocommit→explicit-txn boundary, or the
+        memjournal records do not survive into pager_playback for
+        memdb, the transaction state never reverts.  Sub-bug (i) —
+        nVdbeWrite/nVdbeRead counters not tracked — fixed in 1f67e38.
       [~] **c) `SAVEPOINT s; ROLLBACK TO s` does not unwind** —
         schema-cache side fixed.  Remaining: memdb pager savepoint
         reconciliation — btree pages not unwound on ROLLBACK TO.
@@ -632,13 +624,14 @@ FPC porting traps that recur often enough to call out up-front:
             is opened but the on-disk schema is not loaded.
 
 - [~] **7.1.9** ALTER TABLE (alter.c).  All five codegen entry points
-       are ported 1:1 and stub-db-tolerant (TestParser ALTER TABLE rows
-       now PASS — gated on `eOpenState <> $76` matching the
-       Insert/Update/DropIndex idiom).  End-to-end runtime parity is
-       still gated on the sqlite_rename_* SQL helpers (no bodies ported)
-       and on Phase 7.1.1 (sqlite3InitOne — the schema reload after the
-       NestedParse'd UPDATE sqlite_master sub-statements is a no-op
-       without it).
+       and all nine sqlite_rename_* / sqlite_drop_* SQL helpers have
+       full bodies ported (TestParser ALTER TABLE rows PASS — gated on
+       `eOpenState <> $76` matching the Insert/Update/DropIndex idiom).
+       End-to-end runtime parity verified missing 2026-05-05 via local
+       repro: `ALTER TABLE t RENAME COLUMN a TO aa` returns rc=0 but
+       `SELECT aa FROM t` then fails with SQLITE_ERROR — purely gated
+       on the Phase 7.1.1 schema-row INSERT/UPDATE wiring (sqlite_master
+       mutations emit ops but rows do not persist or trigger reload).
        [X] Port `sqlite3RenameTokenRemap`.
        [X] Port `sqlite3RenameExprlistUnmap`.
        [X] Port `sqlite3AlterRenameTable` (codegen.pas:32527).
