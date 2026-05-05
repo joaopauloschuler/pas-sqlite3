@@ -481,21 +481,42 @@ FPC porting traps that recur often enough to call out up-front:
 
   [ ] **6.10 step 15** Runtime divergences surfaced by `DiagTxn`
       (transactions, savepoints, conflict resolution).  2 remain.
-      [ ] **b) `BEGIN; ...; ROLLBACK` does not roll back** — BEGIN/
-        ROLLBACK still observably no-op on Pas side.  2026-05-05:
-        sqlite3VdbeHalt now full 1:1 port of vdbeaux.c:3315 (special-
-        error rollback arm, FK immediate/deferred checks, autoCommit
-        commit/rollback dispatch via vdbeCommit, statement-savepoint
-        release/rollback, change-counter update); vdbeCommit ported
-        for the simple single-file case (multi-file super-journal arm
-        intentionally not yet productive — returns SQLITE_ERROR).
-        DiagTxn `begin rollback insert` still DIVERGES — the BEGIN
-        VM completes via SAVEPOINT_RELEASE and the subsequent INSERT
-        runs inside the explicit transaction correctly, but the
-        OP_Transaction wal-mode wakeup or the actual btree rollback
-        on OP_AutoCommit p2=1 still leaves the row visible.  Likely
-        culprit: btreeRollback reload-after-rollback path (separate
-        sub-bug from the VdbeHalt port).
+      [ ] **b) `BEGIN; ...; ROLLBACK` does not roll back** — pinned
+        2026-05-05 (a3) to a memdb-only pcache regression in
+        sqlite3PagerWrite's early-return arm (passqlite3pager.pas:4327).
+        Traced via temporary printf in pager_write / sqlite3PagerWrite /
+        pager_end_transaction / pagerAddPageToRollbackJournal /
+        sqlite3RollbackAll on the DiagTxn `begin rollback insert` corpus
+        (CREATE+INSERT(1)+BEGIN+INSERT(2)+ROLLBACK against
+        `:memory:`).  Sequence observed:
+          1. CREATE TABLE: inner pager_write journals nothing
+             (dbOrigSize=0); pages 1+2 acquire flags=0xE
+             (DIRTY|WRITEABLE|NEED_SYNC).
+          2. CREATE TABLE auto-commit fires pager_end_transaction
+             (bCommit=1); PcacheCleanAll clears flags → 0x01.
+          3. INSERT(1) opens fresh journal (dbOrigSize=2);
+             pagerAddPageToRollbackJournal records pgno=2; flags 0xE.
+          4. INSERT(1) auto-commit → **second pager_end_transaction
+             never observed** in the trace, so PcacheCleanAll does not
+             run, and page 2 keeps flags=0xE into the next txn.
+          5. BEGIN executes (OP_AutoCommit desired=0 rollback=0).
+          6. INSERT(2) modifies page 2; sqlite3PagerWrite hits the
+             EARLY-RETURN arm (`PGHDR_WRITEABLE` already set),
+             never reaches inner pager_write → no journal record added.
+          7. ROLLBACK: pager_playback runs but finds zero records →
+             page 2 retains the post-INSERT(2) state → count=2.
+        Two distinct sub-bugs are in play: (i) INSERT(1)'s sqlite3VdbeHalt
+        auto-commit gate at codegen.pas-equivalent
+        passqlite3vdbe.pas:4283..4286 isn't reaching vdbeCommit (or
+        vdbeCommit isn't reaching pager_end_transaction) — likely the
+        nVdbeWrite counter doesn't match the VDBF_ReadOnly state for
+        INSERT(1) when sqlite3_step decrements it.  (ii) Even if (i)
+        were fixed, sqlite3PcacheCleanAll's iteration over
+        `pCache^.pDirty` (passqlite3pcache.pas:506) needs verification
+        that the dirty-list head is non-nil at commit time for memdb.
+        C reference path (pager.c:6786..6798) takes the same branch
+        without the bug, so the divergence is in our pcache↔pager
+        interaction, not in the rollback dispatch.
       [~] **c) `SAVEPOINT s; ROLLBACK TO s` does not unwind** —
         schema-cache side fixed.  Remaining: memdb pager savepoint
         reconciliation — btree pages not unwound on ROLLBACK TO.
