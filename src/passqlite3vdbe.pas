@@ -4365,6 +4365,19 @@ begin
     sqlite3VdbeLeave(v);
   end;
 
+  { vdbeaux.c:3496..3500 — decrement the connection's nVdbeWrite/nVdbeRead
+    counters that were bumped by sqlite3_step at READY→RUN.  nVdbeActive's
+    Dec stays in sqlite3_step (Pascal-port deviation: many tests construct
+    a Vdbe directly and set eVdbeState:=RUN without going through step,
+    so the Inc never fired and an unconditional Dec here would underflow).
+    Guard the others with a `>0` check for the same reason. }
+  if v^.eVdbeState = VDBE_RUN_STATE then begin
+    if ((v^.vdbeFlags and VDBF_ReadOnly) = 0) and (db^.nVdbeWrite > 0) then
+      Dec(db^.nVdbeWrite);
+    if ((v^.vdbeFlags and VDBF_IsReader) <> 0) and (db^.nVdbeRead > 0) then
+      Dec(db^.nVdbeRead);
+  end;
+
   v^.eVdbeState := VDBE_HALT_STATE;
 
   if db^.mallocFailed <> 0 then v^.rc := SQLITE_NOMEM;
@@ -5549,9 +5562,13 @@ begin
     sqlite3VdbeReset(pStmt);
   end;
 
-  { Transition READY → RUN }
+  { Transition READY → RUN — vdbeapi.c:815..819 }
   if pStmt^.eVdbeState = VDBE_READY_STATE then begin
-    if db <> nil then Inc(db^.nVdbeActive);
+    if db <> nil then begin
+      Inc(db^.nVdbeActive);
+      if (pStmt^.vdbeFlags and VDBF_ReadOnly) = 0 then Inc(db^.nVdbeWrite);
+      if (pStmt^.vdbeFlags and VDBF_IsReader) <> 0 then Inc(db^.nVdbeRead);
+    end;
     pStmt^.pc := 0;
     pStmt^.eVdbeState := VDBE_RUN_STATE;
   end;

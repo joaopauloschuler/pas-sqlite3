@@ -528,18 +528,24 @@ FPC porting traps that recur often enough to call out up-front:
              never reaches inner pager_write → no journal record added.
           7. ROLLBACK: pager_playback runs but finds zero records →
              page 2 retains the post-INSERT(2) state → count=2.
-        Two distinct sub-bugs are in play: (i) INSERT(1)'s sqlite3VdbeHalt
-        auto-commit gate at codegen.pas-equivalent
-        passqlite3vdbe.pas:4283..4286 isn't reaching vdbeCommit (or
-        vdbeCommit isn't reaching pager_end_transaction) — likely the
-        nVdbeWrite counter doesn't match the VDBF_ReadOnly state for
-        INSERT(1) when sqlite3_step decrements it.  (ii) Even if (i)
-        were fixed, sqlite3PcacheCleanAll's iteration over
-        `pCache^.pDirty` (passqlite3pcache.pas:506) needs verification
-        that the dirty-list head is non-nil at commit time for memdb.
-        C reference path (pager.c:6786..6798) takes the same branch
-        without the bug, so the divergence is in our pcache↔pager
-        interaction, not in the rollback dispatch.
+        Sub-bug (i) — nVdbeWrite/nVdbeRead counters not tracked —
+        FIXED 2026-05-05 (a3): sqlite3_step now bumps nVdbeWrite/Read
+        at READY→RUN transition (vdbeapi.c:815..817) and
+        sqlite3VdbeHalt decrements them at the tail (vdbeaux.c:3496..
+        3500).  TestExplainParity 1025/1026 unchanged; no regressions
+        in TestPager / TestDMLBasic / TestSelectBasic / TestPrepare.
+        DiagTxn rollback still DIVERGES — auto-commit gate now reaches
+        vdbeCommit for INSERT(1), but the actual rollback bug persists,
+        meaning the divergence sits deeper in the pager↔btree commit
+        path (pcache CleanAll iteration matches C verbatim per
+        passqlite3pcache.pas:503..511).  Next investigation: trace
+        sqlite3BtreeCommitPhaseTwo → pager_end_transaction on the
+        INSERT(1) auto-commit to confirm whether vdbeCommit's caller
+        chain now drives PcacheCleanAll.  If yes, the residual bug is
+        in INSERT(2)'s sqlite3PagerWrite early-return arm
+        (passqlite3pager.pas:4327) — when journal-record-already-added
+        bit propagates incorrectly across the autocommit→explicit-txn
+        boundary.
       [~] **c) `SAVEPOINT s; ROLLBACK TO s` does not unwind** —
         schema-cache side fixed.  Remaining: memdb pager savepoint
         reconciliation — btree pages not unwound on ROLLBACK TO.
