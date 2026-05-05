@@ -154,10 +154,21 @@ FPC porting traps that recur often enough to call out up-front:
 - [X] **6.8.1** finish porting `sqlite3Update` (update.c) — single-table
      arm DONE.  `passqlite3codegen.pas:23457..24115`, 1:1 port of
      `update.c:285..1163`.  Deferred sub-arms (early-bail today):
-     [ ] UPDATE FROM arm (multi-table source) — `updateFromSelect`
-          (update.c:187) still pending; sqlite3Update keeps the
-          `nChangeFrom>0` bail.  6.8.4 multi-table WHERE is now
-          available, so this is unblocked.
+     [X] UPDATE FROM arm (multi-table source) — DONE.  `updateFromSelect`
+          (update.c:187..274) ported just before sqlite3Update; the
+          `nChangeFrom>0` early-bail is gone, and the C-reference
+          register/eph allocation (update.c:670..702), MultiWrite/
+          ONEPASS_OFF setup (update.c:704..708), inner-loop top
+          (update.c:847..871), chngRowid arm (update.c:887..893) and
+          NEW-row population from iEph (update.c:949..952) are now wired
+          1:1.  Companion lifts in sqlite3Select: SRT_Upfrom passes the
+          eDest gate and gets its own selectInnerLoop disposal arm
+          (select.c:1355..1377); resolveExprAgainstSrcList +
+          sqlite3ResolveSelectNames each grew the TK_ROW arm
+          (resolve.c:976..993) so exprRowColumn / bare TK_ROW resolve
+          to TK_COLUMN against pSrc->a[0].  DiagDml `update from` probe
+          rewritten to actually exercise the path (was false-PASS via
+          multi-statement SQL); now PASSes for real (sum=60).
      [X] Virtual-table dispatch (`updateVirtualTable`) — DONE.
           `exprRowColumn` (update.c:143) and `updateVirtualTable`
           (update.c:1196..1361) ported just before sqlite3Update; the

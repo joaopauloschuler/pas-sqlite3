@@ -2475,6 +2475,7 @@ procedure sqlite3CompleteInsertion(pParse: PParse; pTab: PTable2;
 function  sqlite3OpenTableAndIndices(pParse: PParse; pTab: PTable2;
   op: i32; p5: u8; iBase: i32; aToOpen: Pu8; piDataCur: Pi32;
   piIdxCur: Pi32): i32;
+function  sqlite3KeyInfoOfIndex(pParse: PParse; pIdx: PIndex2): PKeyInfo2;
 
 // ===========================================================================
 // Phase 6.5 public API — build.c, prepare.c, alter.c, attach.c,
@@ -7567,6 +7568,21 @@ var
   base:   PSrcItem;
 begin
   if pE = nil then Exit;
+  { TK_ROW — resolve.c:976..993.  Rewrites a TK_ROW pseudo-token (used by
+    UPDATE...FROM exprRowColumn / DELETE LIMIT) to TK_COLUMN against
+    pSrc->a[0]; iColumn is decremented (so a bare TK_ROW with iColumn=0
+    becomes the rowid sentinel -1, while exprRowColumn(iCol)=iCol+1 lands
+    at iColumn=iCol). }
+  if (pE^.op = TK_ROW) and (pSrc <> nil) and (pSrc^.nSrc >= 1) then
+  begin
+    pItem := SrcListItems(pSrc);
+    pE^.op      := TK_COLUMN;
+    pE^.y.pTab  := pItem^.pSTab;
+    pE^.iTable  := pItem^.iCursor;
+    pE^.iColumn := pE^.iColumn - 1;
+    pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+    Exit;
+  end;
   if (pE^.op = TK_DOT) and (pSrc <> nil)
      and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
      and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID) then
@@ -8007,6 +8023,19 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     bCorr:  Boolean;
   begin
     if pE = nil then Exit;
+    { TK_ROW — resolve.c:976..993.  UPDATE…FROM emits TK_ROW pseudo-tokens
+      via exprRowColumn / a bare TK_ROW for the rowid; rewrite to
+      TK_COLUMN against pSrc->a[0] (iColumn--, AFF_INTEGER). }
+    if (pE^.op = TK_ROW) and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1) then
+    begin
+      pItem := SrcListItems(p^.pSrc);
+      pE^.op      := TK_COLUMN;
+      pE^.y.pTab  := pItem^.pSTab;
+      pE^.iTable  := pItem^.iCursor;
+      pE^.iColumn := pE^.iColumn - 1;
+      pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+      Exit;
+    end;
     { NEW.x / OLD.x trigger pseudo-table refs — bind against
       pParse^.pTriggerTab as TK_TRIGGER (resolve.c:524..604). }
     if (pE^.op = TK_DOT)
@@ -22340,8 +22369,9 @@ begin
   if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_Set) and
      (pDest^.eDest <> SRT_Mem) and (pDest^.eDest <> SRT_EphemTab) and
      (pDest^.eDest <> SRT_Coroutine)
-     and (pDest^.eDest <> SRT_Fifo) and (pDest^.eDest <> SRT_DistFifo) and
-     (not isExists)
+     and (pDest^.eDest <> SRT_Fifo) and (pDest^.eDest <> SRT_DistFifo)
+     and (pDest^.eDest <> SRT_Upfrom)
+     and (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
   if p^.pPrior <> nil then begin
     { Recursive-CTE arm of multiSelect (select.c:2976..2978).  Must come
@@ -24027,6 +24057,29 @@ begin
       sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
       sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
       sqlite3ReleaseTempReg(pParse, r2);
+      sqlite3ReleaseTempReg(pParse, r1);
+    end
+    else if pDest^.eDest = SRT_Upfrom then
+    begin
+      { selectInnerLoop:1355..1377 — UPDATE FROM disposal.  iSDParm2 < 0
+        means the target table is rowid-based (column 0 of the result is
+        the rowid; OP_Insert keys by it).  iSDParm2 >= 0 means WITHOUT
+        ROWID (PK is the first iSDParm2 columns; OP_IdxInsert keys by
+        record).  The leading OP_IsNull skips empty aggregate rows. }
+      r1 := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp2(v, OP_IsNull, pDest^.iSdst, pWInfo^.iBreak);
+      if pDest^.iSDParm2 < 0 then
+      begin
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst + 1,
+                          nResultCol - 1, r1);
+        sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, pDest^.iSdst);
+      end
+      else
+      begin
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                             pDest^.iSdst, pDest^.iSDParm2);
+      end;
       sqlite3ReleaseTempReg(pParse, r1);
     end
     else
@@ -27371,6 +27424,103 @@ begin
   sqlite3VdbeAddOp2(v, OP_Close, ephemTab, 0);
 end;
 
+{ updateFromSelect — port of update.c:187..274.
+  Generate the SELECT that drives UPDATE...FROM: it produces, for each
+  row matching pTabList+pWhere, the PK (or rowid) of the target row
+  followed by the new column values.  Output rows are stored in the
+  caller's iEph ephemeral table (SRT_Upfrom for rowid/PK tables,
+  SRT_Table for vtab/View arms — vtab is irrelevant here, the vtab
+  arm goes through updateVirtualTable instead).
+  SQLITE_ENABLE_UPDATE_DELETE_LIMIT arm omitted — not in the default
+  build (so pOrderBy/pLimit are unused; UNUSED_PARAMETER in C). }
+procedure updateFromSelect(pParse: PParse; iEph: i32; pPk: PIndex2;
+  pChanges: PExprList; pTabList: PSrcList; pWhere: PExpr;
+  pOrderBy: PExprList; pLimit: PExpr);
+var
+  i:        i32;
+  dest:     TSelectDest;
+  pSel:     PSelect;
+  pList:    PExprList;
+  pGrp:     PExprList;
+  pLimit2:  PExpr;
+  pOrderBy2: PExprList;
+  db:       PTsqlite3;
+  pTab:     PTable2;
+  pSrc:     PSrcList;
+  pSrcItems: PSrcItem;
+  pWhere2:  PExpr;
+  eDest:    i32;
+  pNew:     PExpr;
+  pELItems: PExprListItem;
+begin
+  pSel := nil; pList := nil; pGrp := nil;
+  pLimit2 := nil; pOrderBy2 := nil;
+  db := pParse^.db;
+  pTab := SrcListItems(pTabList)[0].pSTab;
+
+  { SQLITE_ENABLE_UPDATE_DELETE_LIMIT arm omitted — UNUSED_PARAMETER. }
+
+  pSrc := sqlite3SrcListDup(db, pTabList, 0);
+  pWhere2 := sqlite3ExprDup(db, pWhere, 0);
+
+  AssertH(pTabList^.nSrc > 1, 'updateFromSelect requires nSrc>1');
+  if pSrc <> nil then
+  begin
+    pSrcItems := SrcListItems(pSrc);
+    { C asserts pSrc->a[0].fg.notCte; we don't enforce — best-effort. }
+    pSrcItems[0].iCursor := -1;
+    if pSrcItems[0].pSTab <> nil then
+    begin
+      Dec(pSrcItems[0].pSTab^.nTabRef);
+      pSrcItems[0].pSTab := nil;
+    end;
+  end;
+
+  if pPk <> nil then
+  begin
+    for i := 0 to i32(pPk^.nKeyCol) - 1 do
+    begin
+      pNew := exprRowColumn(pParse, pPk^.aiColumn[i]);
+      pList := sqlite3ExprListAppend(pParse, pList, pNew);
+    end;
+    if pTab^.eTabType = TABTYP_VTAB then eDest := SRT_Table else eDest := SRT_Upfrom;
+  end
+  else if pTab^.eTabType = TABTYP_VIEW then
+  begin
+    for i := 0 to i32(pTab^.nCol) - 1 do
+      pList := sqlite3ExprListAppend(pParse, pList, exprRowColumn(pParse, i));
+    eDest := SRT_Table;
+  end
+  else
+  begin
+    if pTab^.eTabType = TABTYP_VTAB then eDest := SRT_Table else eDest := SRT_Upfrom;
+    pList := sqlite3ExprListAppend(pParse, nil,
+        sqlite3PExpr(pParse, TK_ROW, nil, nil));
+  end;
+
+  AssertH((pChanges <> nil) or (db^.mallocFailed <> 0), 'updateFromSelect pChanges');
+  if pChanges <> nil then
+  begin
+    pELItems := ExprListItems(pChanges);
+    for i := 0 to pChanges^.nExpr - 1 do
+      pList := sqlite3ExprListAppend(pParse, pList,
+          sqlite3ExprDup(db, pELItems[i].pExpr, 0));
+  end;
+
+  pSel := sqlite3SelectNew(pParse, pList, pSrc, pWhere2, pGrp, nil,
+      pOrderBy2,
+      SF_UFSrcCheck or SF_IncludeHidden or SF_UpdateFrom,
+      pLimit2);
+  if pSel <> nil then
+    pSel^.selFlags := pSel^.selFlags or SF_OrderByReqd;
+
+  sqlite3SelectDestInit(@dest, eDest, iEph);
+  if pPk <> nil then dest.iSDParm2 := i32(pPk^.nKeyCol)
+  else                dest.iSDParm2 := -1;
+  sqlite3Select(pParse, pSel, @dest);
+  sqlite3SelectDelete(db, pSel);
+end;
+
 { sqlite3Update — port of update.c:285..1163.
 
   Single-table arm.  Emits the full canonical UPDATE pipeline:
@@ -27459,6 +27609,9 @@ var
   bProgress:            Boolean;
   colFlags2:            u16;
   pikFlags:             i32;
+  nEphCol:              i32;
+  pKeyInfoTmp:          PKeyInfo2;
+  nOff:                 i32;
 begin
   pTab := nil; v := nil; pTrg := nil; isView := 0; tmask := 0;
   nChangeFrom := 0; iBaseCur := 0; iDataCur := 0; iIdxCur := 0;
@@ -27711,10 +27864,6 @@ begin
     goto update_cleanup;
   end;
 
-  { UPDATE FROM dispatch — bail; updateFromSelect / multi-table WHERE
-    deferred until 6.8.4. }
-  if nChangeFrom <> 0 then goto update_cleanup;
-
   labelBreak    := sqlite3VdbeMakeLabel(pParse);
   labelContinue := labelBreak;
 
@@ -27732,7 +27881,7 @@ begin
   end;
 
   { Initial rowset / ephemeral PK index (update.c:670..702). }
-  if HasRowid(pTab) then
+  if (nChangeFrom = 0) and HasRowid(pTab) then
   begin
     sqlite3VdbeAddOp3(v, OP_Null, 0, regRowSet, regOldRowid);
     iEph := pParse^.nTab; Inc(pParse^.nTab);
@@ -27740,90 +27889,118 @@ begin
   end
   else
   begin
-    AssertH(pPk <> nil, 'Update WITHOUT ROWID needs pPk');
-    nPk := pPk^.nKeyCol;
+    AssertH((pPk <> nil) or HasRowid(pTab), 'Update needs pPk or rowid');
+    if pPk <> nil then nPk := pPk^.nKeyCol else nPk := 0;
     iPk := pParse^.nMem + 1;
     pParse^.nMem := pParse^.nMem + i32(nPk);
+    pParse^.nMem := pParse^.nMem + nChangeFrom;
     Inc(pParse^.nMem);
     regKey := pParse^.nMem;
     if pUpsert = nil then
     begin
+      nEphCol := i32(nPk) + nChangeFrom;
+      if isView <> 0 then nEphCol := nEphCol + i32(pTab^.nCol);
       iEph := pParse^.nTab; Inc(pParse^.nTab);
-      sqlite3VdbeAddOp3(v, OP_Null, 0, iPk, iPk + i32(nPk) - 1);
-      addrOpen := sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iEph, i32(nPk));
-      sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pPk));
-    end;
-  end;
-
-  if pUpsert <> nil then
-  begin
-    pWInfo := nil;
-    eOnePass := ONEPASS_SINGLE;
-    sqlite3ExprIfFalse(pParse, pWhere, labelBreak, SQLITE_JUMPIFNULL);
-    bFinishSeek := 0;
-  end
-  else
-  begin
-    { update.c:720..766 — start the database scan. }
-    flags := WHERE_ONEPASS_DESIRED;
-    if (pParse^.nested = 0)
-       and (pTrg = nil)
-       and (hasFK = 0)
-       and (chngKey = 0)
-       and (not bReplace)
-       and ((pWhere = nil) or (not ExprHasProperty(pWhere, EP_Subquery))) then
-      flags := flags or WHERE_ONEPASS_MULTIROW;
-    pWInfo := sqlite3WhereBegin(pParse, pTabList, pWhere, nil, nil, nil,
-                                flags, iIdxCur);
-    if pWInfo = nil then goto update_cleanup;
-
-    eOnePass    := sqlite3WhereOkOnePass(pWInfo, @aiCurOnePass[0]);
-    bFinishSeek := sqlite3WhereUsesDeferredSeek(pWInfo);
-    if eOnePass <> ONEPASS_SINGLE then
-    begin
-      sqlite3MultiWrite(pParse);
-      if eOnePass = ONEPASS_MULTI then
+      if pPk <> nil then
+        sqlite3VdbeAddOp3(v, OP_Null, 0, iPk, iPk + i32(nPk) - 1);
+      addrOpen := sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iEph, nEphCol);
+      if pPk <> nil then
       begin
-        i := aiCurOnePass[1];
-        if (i >= 0) and (i <> iDataCur) and (aToOpen[i - iBaseCur] <> 0) then
-          eOnePass := ONEPASS_OFF;
+        pKeyInfoTmp := sqlite3KeyInfoOfIndex(pParse, pPk);
+        if pKeyInfoTmp <> nil then
+        begin
+          pKeyInfoTmp^.nAllField := u16(nEphCol);
+          sqlite3VdbeAppendP4(v, Pointer(pKeyInfoTmp), P4_KEYINFO);
+        end;
+      end;
+      if nChangeFrom <> 0 then
+      begin
+        updateFromSelect(pParse, iEph, pPk, pChanges, pTabList, pWhere,
+                         pOrderBy, pLimit);
+        if isView <> 0 then iDataCur := iEph;
       end;
     end;
   end;
 
-  if HasRowid(pTab) then
+  if nChangeFrom <> 0 then
   begin
-    sqlite3VdbeAddOp2(v, OP_Rowid, iDataCur, regOldRowid);
-    if eOnePass = ONEPASS_OFF then
-    begin
-      Inc(pParse^.nMem);
-      (aRegIdx + nAllIdx)^ := pParse^.nMem;
-      sqlite3VdbeAddOp3(v, OP_Insert, iEph, regRowSet, regOldRowid);
-    end
-    else
-    begin
-      if addrOpen <> 0 then sqlite3VdbeChangeToNoop(v, addrOpen);
-    end;
+    sqlite3MultiWrite(pParse);
+    eOnePass := ONEPASS_OFF;
+    nKey := i32(nPk);
+    regKey := iPk;
   end
   else
   begin
-    for i := 0 to i32(nPk) - 1 do
+    if pUpsert <> nil then
     begin
-      AssertH(pPk^.aiColumn[i] >= 0, 'Update PK col');
-      sqlite3ExprCodeGetColumnOfTable(v, pTab, iDataCur,
-                                      pPk^.aiColumn[i], iPk + i);
-    end;
-    if eOnePass <> 0 then
-    begin
-      if addrOpen <> 0 then sqlite3VdbeChangeToNoop(v, addrOpen);
-      nKey := i32(nPk);
-      regKey := iPk;
+      pWInfo := nil;
+      eOnePass := ONEPASS_SINGLE;
+      sqlite3ExprIfFalse(pParse, pWhere, labelBreak, SQLITE_JUMPIFNULL);
+      bFinishSeek := 0;
     end
     else
     begin
-      sqlite3VdbeAddOp4(v, OP_MakeRecord, iPk, i32(nPk), regKey,
-                        sqlite3IndexAffinityStr(db, pPk), i32(nPk));
-      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iEph, regKey, iPk, i32(nPk));
+      { update.c:720..766 — start the database scan. }
+      flags := WHERE_ONEPASS_DESIRED;
+      if (pParse^.nested = 0)
+         and (pTrg = nil)
+         and (hasFK = 0)
+         and (chngKey = 0)
+         and (not bReplace)
+         and ((pWhere = nil) or (not ExprHasProperty(pWhere, EP_Subquery))) then
+        flags := flags or WHERE_ONEPASS_MULTIROW;
+      pWInfo := sqlite3WhereBegin(pParse, pTabList, pWhere, nil, nil, nil,
+                                  flags, iIdxCur);
+      if pWInfo = nil then goto update_cleanup;
+
+      eOnePass    := sqlite3WhereOkOnePass(pWInfo, @aiCurOnePass[0]);
+      bFinishSeek := sqlite3WhereUsesDeferredSeek(pWInfo);
+      if eOnePass <> ONEPASS_SINGLE then
+      begin
+        sqlite3MultiWrite(pParse);
+        if eOnePass = ONEPASS_MULTI then
+        begin
+          i := aiCurOnePass[1];
+          if (i >= 0) and (i <> iDataCur) and (aToOpen[i - iBaseCur] <> 0) then
+            eOnePass := ONEPASS_OFF;
+        end;
+      end;
+    end;
+
+    if HasRowid(pTab) then
+    begin
+      sqlite3VdbeAddOp2(v, OP_Rowid, iDataCur, regOldRowid);
+      if eOnePass = ONEPASS_OFF then
+      begin
+        Inc(pParse^.nMem);
+        (aRegIdx + nAllIdx)^ := pParse^.nMem;
+        sqlite3VdbeAddOp3(v, OP_Insert, iEph, regRowSet, regOldRowid);
+      end
+      else
+      begin
+        if addrOpen <> 0 then sqlite3VdbeChangeToNoop(v, addrOpen);
+      end;
+    end
+    else
+    begin
+      for i := 0 to i32(nPk) - 1 do
+      begin
+        AssertH(pPk^.aiColumn[i] >= 0, 'Update PK col');
+        sqlite3ExprCodeGetColumnOfTable(v, pTab, iDataCur,
+                                        pPk^.aiColumn[i], iPk + i);
+      end;
+      if eOnePass <> 0 then
+      begin
+        if addrOpen <> 0 then sqlite3VdbeChangeToNoop(v, addrOpen);
+        nKey := i32(nPk);
+        regKey := iPk;
+      end
+      else
+      begin
+        sqlite3VdbeAddOp4(v, OP_MakeRecord, iPk, i32(nPk), regKey,
+                          sqlite3IndexAffinityStr(db, pPk), i32(nPk));
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iEph, regKey, iPk, i32(nPk));
+      end;
     end;
   end;
 
@@ -27864,13 +28041,35 @@ begin
       else
         sqlite3VdbeAddOp2(v, OP_IsNull, regOldRowid, labelBreak);
     end
-    else if pPk <> nil then
+    else if (pPk <> nil) or (nChangeFrom <> 0) then
     begin
       labelContinue := sqlite3VdbeMakeLabel(pParse);
       sqlite3VdbeAddOp2(v, OP_Rewind, iEph, labelBreak);
       addrTop := sqlite3VdbeCurrentAddr(v);
-      sqlite3VdbeAddOp2(v, OP_RowData, iEph, regKey);
-      sqlite3VdbeAddOp4Int(v, OP_NotFound, iDataCur, labelContinue, regKey, 0);
+      if nChangeFrom <> 0 then
+      begin
+        if isView = 0 then
+        begin
+          if pPk <> nil then
+          begin
+            for i := 0 to i32(nPk) - 1 do
+              sqlite3VdbeAddOp3(v, OP_Column, iEph, i, iPk + i);
+            sqlite3VdbeAddOp4Int(v, OP_NotFound, iDataCur, labelContinue,
+                                 iPk, i32(nPk));
+          end
+          else
+          begin
+            sqlite3VdbeAddOp2(v, OP_Rowid, iEph, regOldRowid);
+            sqlite3VdbeAddOp3(v, OP_NotExists, iDataCur, labelContinue,
+                              regOldRowid);
+          end;
+        end;
+      end
+      else
+      begin
+        sqlite3VdbeAddOp2(v, OP_RowData, iEph, regKey);
+        sqlite3VdbeAddOp4Int(v, OP_NotFound, iDataCur, labelContinue, regKey, 0);
+      end;
     end
     else
     begin
@@ -27887,7 +28086,10 @@ begin
   if chngRowid <> 0 then
   begin
     AssertH(iRowidExpr >= 0, 'Update chngRowid iRowidExpr');
-    sqlite3ExprCode(pParse, pRowidExpr, regNewRowid);
+    if nChangeFrom = 0 then
+      sqlite3ExprCode(pParse, pRowidExpr, regNewRowid)
+    else
+      sqlite3VdbeAddOp3(v, OP_Column, iEph, iRowidExpr, regNewRowid);
     sqlite3VdbeAddOp1(v, OP_MustBeInt, regNewRowid);
   end;
 
@@ -27928,7 +28130,16 @@ begin
     begin
       j := (aXRef + i)^;
       if j >= 0 then
-        sqlite3ExprCode(pParse, pELItems[j].pExpr, k)
+      begin
+        if nChangeFrom <> 0 then
+        begin
+          if isView <> 0 then nOff := i32(pTab^.nCol) else nOff := i32(nPk);
+          AssertH(eOnePass = ONEPASS_OFF, 'UPDATE FROM expects ONEPASS_OFF');
+          sqlite3VdbeAddOp3(v, OP_Column, iEph, nOff + j, k);
+        end
+        else
+          sqlite3ExprCode(pParse, pELItems[j].pExpr, k);
+      end
       else if ((tmask and TRIGGER_BEFORE) = 0) or (i > 31)
             or ((newmask and (u32(1) shl i)) <> 0) then
       begin
