@@ -280,19 +280,99 @@ FPC porting traps that recur often enough to call out up-front:
             windowCodeOp (2233).  Not yet productively wired —
             sqlite3Select still bails on `p^.pWin <> nil`; wiring is
             the next gate (closes 6.10 step 17(d)).
+       [X] Wire window arm into sqlite3Select (commit 91dc50d).  Three
+            landings, all in passqlite3codegen.pas:
+              (a) `linkWindowsForSelect` (~22345) — pas-only stand-in
+                  for the resolve.c:1314..1325 arm.  Walks pEList /
+                  pOrderBy and for each EP_WinFunc-bearing TK_FUNCTION
+                  calls sqlite3WindowUpdate (frame-spec patch for
+                  built-ins) + sqlite3WindowLink (attaches pWin to
+                  pSel).  Skips eFrmType=TK_FILTER carriers so plain
+                  aggregates with FILTER aren't touched.  Without
+                  this, pSel^.pWin was always nil — the entire 6.26
+                  codepath was unreachable.
+              (b) TK_FUNCTION fast-path in sqlite3ExprCodeTarget
+                  (codegen.pas ~5638, mirrors expr.c:5358) — when
+                  EP_WinFunc set and pWin^.regResult>0, return
+                  pExpr^.y.pWin^.regResult directly so the inner-loop
+                  column emit reads the populated window-result reg
+                  instead of trying to evaluate as a scalar function.
+              (c) Window arm at the old bail (~23119) — replaces the
+                  `Result := SQLITE_OK; Exit;` with the C
+                  select.c:8265..8331 flow for the no-isAgg /
+                  no-pGroupBy pWin branch:
+                    sqlite3WindowRewrite
+                    materialise subquery FROM into eph rowid table
+                      (mirrors the isSubqueryAgg arm at ~23495 —
+                      pas's sqlite3WhereBegin doesn't yet auto-
+                      materialise subquery FROMs)
+                    sqlite3WindowCodeInit
+                    sqlite3WhereBegin
+                    sqlite3WindowCodeStep
+                    coroutine inner-loop subroutine
+                      (Goto iBreak / addrGosub /
+                       ExprCodeTarget+Copy* / ResultRow /
+                       Return regGosub / iBreak)
+                  Subset gates: SRT_Output only, no DISTINCT / no
+                  ORDER BY / no LIMIT.  No regressions across
+                  DiagWindow / DiagAggWhere / DiagFunctions /
+                  DiagFeatureProbe / DiagInnerJoin / DiagDml.
+       [ ] **OPEN BLOCKER — inner subquery projecting wrong column.**
+            DiagWindow still 12/12 divergences.  Window pipeline now
+            reaches step-time without crashing; rows are produced
+            but values are wrong because the rewritten inner sub
+            materialises the WRONG column.  For
+            `SELECT sum(b) OVER () FROM t` the bytecode shows
+            `OP_Column 0,0,4` (reading t.a, col 0) when it should be
+            `OP_Column 0,1,4` (reading t.b, col 1).
+            Cross-checked: WindowRewrite *does* correctly append [b]
+            to pSublist via the per-window pArgs loop at
+            codegen.pas:47419; pSublist becomes the inner sub's
+            pEList.  Hypotheses to check next session, in order:
+              1. WindowRewrite at codegen.pas:47383 ORs SF_Aggregate
+                 onto the inner pSub even when its pEList is bare
+                 columns (mirrors window.c:1085).  Pas's inner
+                 sqlite3Select then takes an SF_Aggregate fast-path
+                 that ignores the rewritten pEList and emits its
+                 own column ordering.  Try clearing SF_Aggregate
+                 on pSub before invoking sqlite3Select from the
+                 window arm — confirm via bytecode dump.
+              2. selectWindowRewriteExprCb may be re-walking the
+                 dup'd `b` after it's appended to pSublist and
+                 mutating its iColumn to 0 (the iEphCsr column
+                 index in the OUTER pEList rewrite).  Add a
+                 trace inside the walker dumping pExpr^.iColumn
+                 and pExpr^.iTable per visit to confirm.
+              3. pas's inner sqlite3Select may run the markAggregate
+                 / agg-codegen path which assumes accumulator-
+                 column order vs result-column order; check
+                 nAccumulator and the column-emit loop.
+            Quick repro: src/tests/DiagWindow `sum() OVER all` row.
+            Bytecode dump tool used last session lives at
+            /tmp/dwinmin.pas (one-shot fpc invocation).
        [ ] Frame-spec emission: ROWS / RANGE / GROUPS, with all
             five bound types (UNBOUNDED PRECEDING, n PRECEDING,
             CURRENT ROW, n FOLLOWING, UNBOUNDED FOLLOWING) and
             EXCLUDE clauses (NO OTHERS / CURRENT ROW / GROUP / TIES).
+            Likely already covered by the windowCodeOp /
+            windowCodeRangeTest ports — gate is the inner-EList
+            blocker above plus DiagWindow once rows materialise.
        [ ] Built-in window-function dispatch table:
             `row_number` / `rank` / `dense_rank` / `percent_rank` /
             `cume_dist` / `ntile` / `lag` / `lead` / `first_value` /
-            `last_value` / `nth_value`.
+            `last_value` / `nth_value`.  Already registered via
+            sqlite3WindowFunctions (codegen.pas:46550) at
+            connection-init.  Gate is the inner-EList blocker above.
        [ ] Aggregate-as-window arm (`sum(x) OVER (...)`,
             `avg(x) OVER (...)`, etc.) — reuses the regular agg
-            step function inside the frame loop.
+            step function inside the frame loop.  Same gate.
        [ ] Multi-window arm (one SELECT with several distinct
             OVER clauses sharing partitions).
+       [ ] Once the inner-EList blocker clears, lift the subset
+            gates in the window arm: SRT_Output→other dests,
+            then DISTINCT / ORDER BY / LIMIT (each is a separate
+            slice and probably maps onto reusing the existing
+            sorter / OFFSET machinery already in sqlite3Select).
 
   [ ] **6.27** codegen.pas schema-mutation + statistics.
        Sub-rows that overlapped Phase 7 have been moved out
