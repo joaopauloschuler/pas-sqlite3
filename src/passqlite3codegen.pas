@@ -46396,7 +46396,8 @@ end;
 // ---------------------------------------------------------------------------
 // sqlite3WindowRewrite — rewrite SELECT for window functions (window.c:958)
 // Productive port: builds the sub-SELECT subquery used for window-function
-// row buffering.  Inner sqlite3WindowCodeInit/Step still stubs at this gate.
+// row buffering.  Inner sqlite3WindowCodeInit/Step bodies fully ported below;
+// not yet wired through sqlite3Select (still bails on `p^.pWin <> nil`).
 // ---------------------------------------------------------------------------
 function sqlite3WindowRewrite(pParse: PParse; p: PSelect): i32;
 var
@@ -46573,9 +46574,9 @@ end;
 // ---------------------------------------------------------------------------
 // Window-codegen leaf helpers (window.c:1388..2076).
 // Phase 6.26 productive port — replaces the prior 6.7 stubs of CodeInit/Step.
-// CodeInit is full 1:1; CodeStep remains a stub pending the larger frame
-// dispatcher port (windowCodeOp / windowCodeRangeTest etc.).  These helpers
-// are reachable through CodeInit + windowFullScan / windowReturnOneRow.
+// Both CodeInit and CodeStep bodies are full 1:1 (windowCodeOp /
+// windowCodeRangeTest et al. ported below).  Productive wiring through
+// sqlite3Select still pending — caller bails on `p^.pWin <> nil`.
 // ---------------------------------------------------------------------------
 
 type
