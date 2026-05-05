@@ -117,6 +117,12 @@ FPC porting traps that recur often enough to call out up-front:
      [X] AUTOINCREMENT.
      [X] BEFORE / AFTER INSERT triggers.
      [X] RETURNING clause emission — DiagDml RETURNING corpus PASS.
+          codeReturningTrigger body now ports trigger.c:1020 1:1 (with
+          companion sqlite3ExpandReturning, sqlite3ProcessReturningSubqueries
+          and the two walker callbacks); sqlite3FinishCoding now emits the
+          OP_OpenEphemeral header and the Rewind/Column/ResultRow/Next tail
+          (build.c:171..192 + 252..259) so RETURNING actually surfaces rows
+          to step() instead of silently returning none.
      [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
      [X] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
           fast path) — DONE.  Body ported at codegen.pas (1:1 with

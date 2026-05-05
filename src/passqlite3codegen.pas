@@ -25337,31 +25337,229 @@ end;
 function trgGetRowTrigger(pParse: PParse; p: PTrigger; pTab: PTable2;
   orconf: i32): PTriggerPrg; forward;
 
+{ isAsteriskTerm — port of trigger.c:891.  Returns 1 if pTerm is a "*"
+  wildcard.  Reports an error and returns 1 for "table.*" (RETURNING does
+  not support qualified wildcards). }
+function isAsteriskTerm(pParse: PParse; pTerm: PExpr): i32;
+begin
+  AssertH(pTerm <> nil, 'isAsteriskTerm pTerm');
+  if pTerm^.op = TK_ASTERISK then begin Result := 1; Exit; end;
+  if pTerm^.op <> TK_DOT then begin Result := 0; Exit; end;
+  AssertH(pTerm^.pRight <> nil, 'isAsteriskTerm pRight');
+  AssertH(pTerm^.pLeft <> nil, 'isAsteriskTerm pLeft');
+  if pTerm^.pRight^.op <> TK_ASTERISK then begin Result := 0; Exit; end;
+  sqlite3ErrorMsg(pParse, 'RETURNING may not use "TABLE.*" wildcards');
+  Result := 1;
+end;
+
+{ sqlite3ExpandReturning — port of trigger.c:911.  Copies pList, expanding
+  any top-level "*" terms into the full set of non-hidden columns of pTab.
+  Returns a freshly-allocated ExprList; caller owns. }
+function sqlite3ExpandReturning(pParse: PParse;
+  pList: PExprList; pTab: PTable2): PExprList;
+var
+  pNew:     PExprList;
+  db:       PTsqlite3;
+  i, jj:    i32;
+  pOldExpr, pNewExpr: PExpr;
+  pOldItems, pNewItems: PExprListItem;
+  pOldItem, pNewItem:   PExprListItem;
+  aColPtr:  PColumn;
+begin
+  pNew := nil;
+  db := pParse^.db;
+  pOldItems := ExprListItems(pList);
+  for i := 0 to pList^.nExpr - 1 do begin
+    pOldItem := PExprListItem(PByte(pOldItems) + i * SZ_EXPRLIST_ITEM);
+    pOldExpr := pOldItem^.pExpr;
+    if pOldExpr = nil then continue;
+    if isAsteriskTerm(pParse, pOldExpr) <> 0 then begin
+      for jj := 0 to pTab^.nCol - 1 do begin
+        aColPtr := PColumn(PByte(pTab^.aCol) + SizeOf(TColumn) * jj);
+        if (aColPtr^.colFlags and COLFLAG_HIDDEN) <> 0 then continue;
+        pNewExpr := sqlite3Expr(db, TK_ID, aColPtr^.zCnName);
+        pNew := sqlite3ExprListAppend(pParse, pNew, pNewExpr);
+        if (db^.mallocFailed = 0) and (pNew <> nil) then begin
+          pNewItems := ExprListItems(pNew);
+          pNewItem := PExprListItem(PByte(pNewItems) +
+                                    (pNew^.nExpr - 1) * SZ_EXPRLIST_ITEM);
+          pNewItem^.zEName := sqlite3DbStrDup(db, aColPtr^.zCnName);
+          pNewItem^.fg.eBits :=
+            (pNewItem^.fg.eBits and not u8($03)) or u8(ENAME_NAME);
+        end;
+      end;
+    end else begin
+      pNewExpr := sqlite3ExprDup(db, pOldExpr, 0);
+      pNew := sqlite3ExprListAppend(pParse, pNew, pNewExpr);
+      if (db^.mallocFailed = 0) and (pNew <> nil)
+         and (pOldItem^.zEName <> nil) then begin
+        pNewItems := ExprListItems(pNew);
+        pNewItem := PExprListItem(PByte(pNewItems) +
+                                  (pNew^.nExpr - 1) * SZ_EXPRLIST_ITEM);
+        pNewItem^.zEName := sqlite3DbStrDup(db, pOldItem^.zEName);
+        pNewItem^.fg.eBits :=
+          (pNewItem^.fg.eBits and not u8($03))
+          or (pOldItem^.fg.eBits and u8($03));
+      end;
+    end;
+  end;
+  Result := pNew;
+end;
+
+{ sqlite3ReturningSubqueryVarSelect — trigger.c:953.  Walker xExprCallback
+  that marks correlated sub-SELECT-bearing exprs with EP_VarSelect. }
+function sqlite3ReturningSubqueryVarSelect(pWalker: PWalker;
+  pExpr: PExpr): i32; cdecl;
+begin
+  if pWalker = nil then ;  { unused }
+  if ExprUseXSelect(pExpr)
+     and ((pExpr^.x.pSelect^.selFlags and SF_Correlated) <> 0) then
+    pExpr^.flags := pExpr^.flags or EP_VarSelect;
+  Result := WRC_Continue;
+end;
+
+{ sqlite3ReturningSubqueryCorrelated — trigger.c:972.  Walker
+  xSelectCallback that flags a SELECT as SF_Correlated when it references
+  the table being modified.  Stores 1 in walker.eCode on hit. }
+function sqlite3ReturningSubqueryCorrelated(pWalker: PWalker;
+  pSelect: PSelect): i32; cdecl;
+var
+  i:    i32;
+  pSrc: PSrcList;
+  items: PSrcItem;
+  pTab: PTable2;
+begin
+  AssertH(pSelect <> nil, 'returningSubqueryCorrelated pSelect');
+  pSrc := pSelect^.pSrc;
+  AssertH(pSrc <> nil, 'returningSubqueryCorrelated pSrc');
+  pTab := PTable2(pWalker^.u.ptr);
+  items := SrcListItems(pSrc);
+  for i := 0 to pSrc^.nSrc - 1 do begin
+    if items[i].pSTab = pTab then begin
+      pSelect^.selFlags := pSelect^.selFlags or SF_Correlated;
+      pWalker^.eCode := 1;
+      Break;
+    end;
+  end;
+  Result := WRC_Continue;
+end;
+
+{ sqlite3ProcessReturningSubqueries — port of trigger.c:998. }
+procedure sqlite3ProcessReturningSubqueries(pEList: PExprList;
+  pTab: PTable2);
+var
+  w: TWalker;
+begin
+  FillChar(w, SizeOf(w), 0);
+  w.xExprCallback   := @sqlite3ExprWalkNoop;
+  w.xSelectCallback := @sqlite3ReturningSubqueryCorrelated;
+  w.u.ptr := pTab;
+  sqlite3WalkExprList(@w, pEList);
+  if w.eCode <> 0 then begin
+    w.xExprCallback   := @sqlite3ReturningSubqueryVarSelect;
+    w.xSelectCallback := @sqlite3SelectWalkNoop;
+    sqlite3WalkExprList(@w, pEList);
+  end;
+end;
+
 { codeReturningTrigger — port of trigger.c:1020.
 
-  Generates inline code for a RETURNING trigger.  Today this is a
-  TODO: depends on sqlite3ExpandReturning, sqlite3ResolveExprListNames
-  for NC_UBaseReg, sqlite3ProcessReturningSubqueries, OP_RealAffinity
-  emission with sqlite3ExprAffinity, plus OP_MakeRecord/NewRowid/Insert
-  into a dedicated retCur cursor.  Until those land, faithfully no-op
-  on the same early-out gates the C version uses (mismatched parse /
-  mismatched trigger object) so the dispatcher's call graph stays
-  correct. }
+  Faithful 1:1 body.  Builds a transient SrcList of one entry referencing
+  pTab (the table being modified), uses it to drive sqlite3SelectPrep so
+  the column-name machinery emits the right pColName output, then expands
+  the user's RETURNING list (sqlite3ExpandReturning) and resolves names
+  against an NC_UBaseReg context anchored at regIn (so "new"/"old" column
+  refs resolve as register offsets, not real cursors).  For each resolved
+  expression, emits sqlite3ExprCodeFactorable + an OP_RealAffinity nudge
+  for SQLITE_AFF_REAL columns, then OP_MakeRecord + OP_NewRowid +
+  OP_Insert into pRet^.iRetCur.  pParse^.eTriggerOp / pTriggerTab
+  are saved-restored to nil/0 around resolution so the trigger-context
+  rewrites in lookupName fire correctly. }
 procedure codeReturningTrigger(pParse: PParse; pTrg: PTrigger;
   pTab: PTable2; regIn: i32);
 var
-  pRet: PReturning;
+  v:        PVdbe;
+  db:       PTsqlite3;
+  pNew:     PExprList;
+  pRet:     PReturning;
+  sSelect:  TSelect;
+  uSrcBuf:  array[0..SizeOf(TSrcList) + SizeOf(TSrcItem) - 1] of u8;
+  pFrom:    PSrcList;
+  pFromItem: PSrcItem;
+  sNC:      TNameContext;
+  i, nCol, reg: i32;
+  pCol:     PExpr;
+  pNewItems, pNewItem: PExprListItem;
+  savedTrigOp: u8;
+  savedTrigTab: PTable2;
 begin
+  v := pParse^.pVdbe;
+  AssertH(v <> nil, 'codeReturningTrigger Vdbe');
   if (pParse^.parseFlags and PARSEFLAG_BReturning) = 0 then Exit;
   AssertH(pParse^.db^.pParse = pParse, 'codeReturningTrigger db^.pParse');
+  db := pParse^.db;
   pRet := pParse^.u1.pReturning;
   if pTrg <> @pRet^.retTrig then Exit;
-  { TODO(Phase 6.23 follow-on): port the SelectPrep + GenerateColumnNames
-    + ExpandReturning + ResolveExprListNames body.  Until then the
-    RETURNING-clause projection is not emitted; downstream callers see
-    no rows on the RETURNING cursor.  The dispatcher correctly invokes
-    this only at top-level for the matching retTrig, so when the body
-    lands no further plumbing is needed. }
+
+  FillChar(sSelect,  SizeOf(sSelect),  0);
+  FillChar(uSrcBuf,  SizeOf(uSrcBuf),  0);
+  pFrom := PSrcList(@uSrcBuf[0]);
+  sSelect.pEList := sqlite3ExprListDup(db, pRet^.pReturnEL, 0);
+  sSelect.pSrc := pFrom;
+  pFrom^.nSrc := 1;
+  pFromItem := SrcListItems(pFrom);
+  pFromItem^.pSTab := pTab;
+  pFromItem^.zName := pTab^.zName;
+  pFromItem^.iCursor := -1;
+  sqlite3SelectPrep(pParse, @sSelect, nil);
+  if pParse^.nErr = 0 then begin
+    AssertH(db^.mallocFailed = 0, 'codeReturningTrigger malloc');
+    sqlite3GenerateColumnNames(pParse, @sSelect);
+  end;
+  sqlite3ExprListDelete(db, sSelect.pEList);
+
+  pNew := sqlite3ExpandReturning(pParse, pRet^.pReturnEL, pTab);
+  if (pParse^.nErr = 0) and (pNew <> nil) then begin
+    FillChar(sNC, SizeOf(sNC), 0);
+    if pRet^.nRetCol = 0 then begin
+      pRet^.nRetCol := pNew^.nExpr;
+      pRet^.iRetCur := pParse^.nTab;
+      Inc(pParse^.nTab);
+    end;
+    sNC.pParse := pParse;
+    sNC.uNC.iBaseReg := regIn;
+    sNC.ncFlags := NC_UBaseReg;
+    savedTrigOp  := pParse^.eTriggerOp;
+    savedTrigTab := pParse^.pTriggerTab;
+    pParse^.eTriggerOp  := pTrg^.op;
+    pParse^.pTriggerTab := pTab;
+    if (sqlite3ResolveExprListNames(@sNC, pNew) = SQLITE_OK)
+       and (db^.mallocFailed = 0) then begin
+      nCol := pNew^.nExpr;
+      reg  := pParse^.nMem + 1;
+      sqlite3ProcessReturningSubqueries(pNew, pTab);
+      pParse^.nMem := pParse^.nMem + nCol + 2;
+      pRet^.iRetReg := reg;
+      pNewItems := ExprListItems(pNew);
+      for i := 0 to nCol - 1 do begin
+        pNewItem := PExprListItem(PByte(pNewItems) + i * SZ_EXPRLIST_ITEM);
+        pCol := pNewItem^.pExpr;
+        AssertH(pCol <> nil, 'codeReturningTrigger pCol');
+        sqlite3ExprCodeFactorable(pParse, pCol, reg + i);
+        if sqlite3ExprAffinity(pCol) = AnsiChar(SQLITE_AFF_REAL) then
+          sqlite3VdbeAddOp1(v, OP_RealAffinity, reg + i);
+      end;
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, reg, nCol, reg + nCol);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, pRet^.iRetCur, reg + nCol + 1);
+      sqlite3VdbeAddOp3(v, OP_Insert, pRet^.iRetCur,
+                           reg + nCol, reg + nCol + 1);
+    end;
+    pParse^.eTriggerOp  := savedTrigOp;
+    pParse^.pTriggerTab := savedTrigTab;
+  end;
+  sqlite3ExprListDelete(db, pNew);
+  pParse^.eTriggerOp  := 0;
+  pParse^.pTriggerTab := nil;
 end;
 
 { transferParseError — port of trigger.c:1215.  After a sub-Parse used
@@ -34107,13 +34305,35 @@ begin
                         P5_ConstraintUnique);
 end;
 
+{ emitReturningTail — port of build.c:171..192 inner block.  Emits the
+  Rewind/Column*N/ResultRow/Next loop that scans pRet^.iRetCur and
+  surfaces RETURNING rows after the DML body has finished writing into
+  the ephemeral cursor.  Caller must have already verified
+  pParse^.bReturning. }
+procedure emitReturningTail(pParse: PParse; v: PVdbe);
+var
+  pRet: PReturning;
+  addrRewind, reg, i: i32;
+begin
+  pRet := pParse^.u1.pReturning;
+  if (pRet = nil) or (pRet^.nRetCol <= 0) then Exit;
+  sqlite3VdbeAddOp0(v, OP_FkCheck);
+  addrRewind := sqlite3VdbeAddOp1(v, OP_Rewind, pRet^.iRetCur);
+  reg := pRet^.iRetReg;
+  for i := 0 to pRet^.nRetCol - 1 do
+    sqlite3VdbeAddOp3(v, OP_Column, pRet^.iRetCur, i, reg + i);
+  sqlite3VdbeAddOp2(v, OP_ResultRow, reg, pRet^.nRetCol);
+  sqlite3VdbeAddOp2(v, OP_Next, pRet^.iRetCur, addrRewind + 1);
+  sqlite3VdbeJumpHere(v, addrRewind);
+end;
+
 { sqlite3FinishCoding — emit termination/prologue and finalise the VDBE.
   Port of build.c:141.  Branches not yet wired through the parser path are
-  left as guarded TODOs (RETURNING, OMIT_VIRTUALTABLE vtab-lock, shared-cache
-  table locks, factored-out pConstExpr code).  These guards are the same
-  shape as the Phase-6/8 stubs already in this unit — they fall through
-  cleanly when their gating field/list is empty, which is the common case
-  for the statements the parser/codegen pipeline produces today. }
+  left as guarded TODOs (OMIT_VIRTUALTABLE vtab-lock, shared-cache
+  table locks).  These guards are the same shape as the Phase-6/8 stubs
+  already in this unit — they fall through cleanly when their gating
+  field/list is empty, which is the common case for the statements the
+  parser/codegen pipeline produces today. }
 procedure sqlite3FinishCoding(pParse: PParse);
 var
   db:      PTsqlite3;
@@ -34155,8 +34375,12 @@ begin
   end;
 
   if v <> nil then begin
-    { TODO(Phase 6.x): pParse^.bReturning branch — emit RETURNING tail.
-      Not reachable until trigger-based RETURNING coding lands. }
+    { Port of build.c:171..192 — RETURNING tail.  When pParse^.bReturning is
+      set and codeReturningTrigger has populated pRet^.iRetCur with
+      one row per emitted RETURNING projection, scan that ephemeral cursor
+      and emit OP_ResultRow per row before OP_Halt. }
+    if (pParse^.parseFlags and PARSEFLAG_BReturning) <> 0 then
+      emitReturningTail(pParse, v);
 
     sqlite3VdbeAddOp0(v, OP_Halt);
 
@@ -34238,8 +34462,17 @@ begin
       sqlite3ExprListDelete(db, pEL);
     end;
 
-    { TODO(Phase 6.x): second bReturning branch — emit OP_OpenEphemeral
-      for the RETURNING result row holder. }
+    { Port of build.c:252..259 — emit OP_OpenEphemeral that opens the
+      iRetCur cursor used by codeReturningTrigger as the RETURNING row
+      holder.  Only fires once nRetCol has actually been populated; if the
+      RETURNING list resolved to zero columns this is skipped and the
+      OP_Insert emissions inside codeReturningTrigger are likewise no-ops. }
+    if ((pParse^.parseFlags and PARSEFLAG_BReturning) <> 0)
+       and (pParse^.u1.pReturning <> nil)
+       and (pParse^.u1.pReturning^.nRetCol > 0) then
+      sqlite3VdbeAddOp2(v, OP_OpenEphemeral,
+                          pParse^.u1.pReturning^.iRetCur,
+                          pParse^.u1.pReturning^.nRetCol);
 
     { Jump back to the beginning of the executable code. }
     sqlite3VdbeGoto(v, 1);
