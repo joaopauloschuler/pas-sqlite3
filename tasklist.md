@@ -61,8 +61,9 @@ FPC porting traps that recur often enough to call out up-front:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-> **2026-05-03 (a3):** TestExplainParity reports **1025 / 1026 PASS**.
-> Only the multi-row VALUES coroutine row diverges (see 6.10 step 6).
+> **2026-05-05 (a3):** TestExplainParity reports **1025 / 1026 PASS**
+> (re-confirmed).  Only the multi-row VALUES coroutine row diverges
+> (C=22 vs Pas=17 ops; see 6.10 step 6).
 
 - [X] **6.8.0** Pragma (pragma.c): `sqlite3PragmaVtabRegister` — DONE.
      1:1 port of pragma.c:2791..3101 (aPragmaName, pragCName, all 12
@@ -317,6 +318,11 @@ FPC porting traps that recur often enough to call out up-front:
             no-op stub; OP_IdxDelete picks up the EIIB-bug fallback
             arm (vdbe.c:6658..6670) and reports SQLITE_CORRUPT_INDEX
             outside writable_schema mode.
+       [X] Port `sqlite3VdbePrintSql` (vdbeaux.c:2501) — body now mirrors
+            the SQLITE_DEBUG arm (zSql first, then OP_Init P4 fallback
+            with leading-whitespace skip).  `sqlite3VdbeIOTraceSql`
+            (vdbeaux.c:2520) remains a faithful no-op matching the
+            !SQLITE_ENABLE_IOTRACE branch.
        [X] Port `sqlite3BtreeIntegrityCheck` (btree.c:11126) plus the
             full helper stack (`checkOom`, `checkProgress`,
             `checkAppendMsg`, `getPageReferenced`, `setPageReferenced`,

@@ -4077,12 +4077,39 @@ begin
   Result := rc;
 end;
 
+{ Faithful port of vdbeaux.c:2501..2513 (SQLITE_DEBUG only).  Prints the
+  SQL that produced this VDBE.  Sources zSql first; if absent, peeks the
+  P4 string of the OP_Init opcode at slot 0. }
 procedure sqlite3VdbePrintSql(p: PVdbe);
+var
+  z:   PAnsiChar;
+  pOp: PVdbeOp;
 begin
+  if p = nil then Exit;
+  z := nil;
+  if p^.zSql <> nil then
+    z := p^.zSql
+  else if p^.nOp >= 1 then begin
+    pOp := @p^.aOp[0];
+    if (pOp^.opcode = OP_Init) and (pOp^.p4.z <> nil) then begin
+      z := pOp^.p4.z;
+      while (z <> nil) and (z^ <> #0) and (Byte(z^) <= Byte(' '))
+            and ((z^ = ' ') or (z^ = #9) or (z^ = #10)
+                 or (z^ = #11) or (z^ = #12) or (z^ = #13)) do
+        Inc(z);
+    end;
+  end;
+  if z <> nil then
+    Write('SQL: [', z, ']'#10);
 end;
 
+{ vdbeaux.c:2520..2543 — SQLITE_ENABLE_IOTRACE-gated.  This port does not
+  wire SQLITE_ENABLE_IOTRACE (no sqlite3IoTrace dispatch installed), so
+  the body is a faithful no-op matching the !ENABLE_IOTRACE branch. }
 procedure sqlite3VdbeIOTraceSql(p: PVdbe);
 begin
+  { sqlite3IoTrace is unset in this build; nothing to emit. }
+  if p = nil then Exit;
 end;
 
 { --- VdbeHalt, VdbeReset, VdbeFinalize (Phase 5.4 stubs) --- }
