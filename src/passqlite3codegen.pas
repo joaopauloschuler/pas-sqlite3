@@ -5637,6 +5637,16 @@ begin
         end;
       TK_FUNCTION:
         begin
+          { expr.c:5358..5360 — window function: value lives in
+            pExpr^.y.pWin^.regResult, populated by sqlite3WindowCodeStep
+            inside the per-row coroutine.  Just return that register. }
+          if ExprHasProperty(pExpr, EP_WinFunc)
+             and (pExpr^.y.pWin <> nil)
+             and (pExpr^.y.pWin^.regResult > 0) then
+          begin
+            Result := pExpr^.y.pWin^.regResult;
+            done := True;
+          end else
           { expr.c:5343..5349 — SQL functions can be expensive, so when
             ConstFactorOk(pParse) holds and the call is constant-not-join,
             hoist the evaluation to once-at-prepare time via
@@ -22342,6 +22352,84 @@ begin
     p^.selFlags := p^.selFlags or SF_Aggregate;
 end;
 
+{ Phase 6.26 helper — gather window functions in pSel and finish the
+  resolve-time wiring (sqlite3WindowUpdate + sqlite3WindowLink).  The
+  pas resolver doesn't yet implement the resolve.c:1314..1325 arm, so
+  this stand-in walks pEList nodes carrying EP_WinFunc and links each
+  window into pSel^.pWin.  Recursion keeps the obvious nested shapes
+  (TK_PLUS, TK_FUNCTION args, etc.) covered without porting the full
+  walker.
+
+  TK_FUNCTION → TK_AGG_FUNCTION rewrite happens here too, mirroring the
+  C resolve.c:1330 fallback path: window funcs are aggregates from the
+  agg-codegen perspective. }
+procedure linkWindowsForSelect(pParse: PParse; pSel: PSelect);
+
+  procedure walkExpr(pE: PExpr);
+  var
+    pDef: PTFuncDef;
+    nArg: i32;
+    items2: PExprListItem;
+    i:     i32;
+  begin
+    if pE = nil then Exit;
+    { Skip FILTER-only aggregates — TK_FILTER eFrmType means the pWin is
+      just a carrier for the FILTER predicate on a regular aggregate, not
+      a true window function (resolve.c keeps these on the agg path). }
+    if ((pE^.flags and EP_WinFunc) <> 0) and (pE^.y.pWin <> nil)
+       and (pE^.y.pWin^.eFrmType <> TK_FILTER) then
+    begin
+      if pE^.y.pWin^.pWFunc = nil then
+      begin
+        if ExprUseXList(pE) and (pE^.x.pList <> nil) then
+          nArg := pE^.x.pList^.nExpr
+        else
+          nArg := 0;
+        pDef := sqlite3FindFunction(pParse^.db, pE^.u.zToken, nArg,
+                                    pParse^.db^.enc, 0);
+        if pDef = nil then
+          pDef := sqlite3FindFunction(pParse^.db, pE^.u.zToken, -2,
+                                      pParse^.db^.enc, 0);
+        if pDef <> nil then
+          sqlite3WindowUpdate(pParse, pSel^.pWinDefn, pE^.y.pWin, pDef);
+      end;
+      if pE^.y.pWin^.pWFunc <> nil then
+        sqlite3WindowLink(pSel, pE^.y.pWin);
+      { Note: do NOT rewrite TK_FUNCTION → TK_AGG_FUNCTION here.  Window
+        funcs stay as TK_FUNCTION; selectWindowRewriteExprCb's TK_FUNCTION
+        arm prunes them out of the rewrite (so they survive in the outer
+        pEList) — flipping the op makes the walker take the column-rewrite
+        path which deletes the expr (and the attached pWin), breaking
+        the per-window loop in sqlite3WindowRewrite. }
+    end;
+    walkExpr(pE^.pLeft);
+    walkExpr(pE^.pRight);
+    if ((pE^.flags and EP_xIsSelect) = 0)
+       and ExprUseXList(pE) and (pE^.x.pList <> nil) then
+    begin
+      items2 := ExprListItems(pE^.x.pList);
+      for i := 0 to pE^.x.pList^.nExpr - 1 do
+        walkExpr(items2[i].pExpr);
+    end;
+  end;
+
+  procedure walkList(pList: PExprList);
+  var
+    items: PExprListItem;
+    i: i32;
+  begin
+    if pList = nil then Exit;
+    items := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+      walkExpr(items[i].pExpr);
+  end;
+
+begin
+  if pSel = nil then Exit;
+  walkList(pSel^.pEList);
+  walkList(pSel^.pOrderBy);
+end;
+
 function sqlite3Select(pParse: PParse; p: PSelect;
   pDest: PSelectDest): i32;
 var
@@ -22460,11 +22548,25 @@ var
     (multiSelect select.c:2984..2994). }
   pInvOne:      PExpr;
   pInvItm:      PExprListItem;
+  { Window-function arm locals (Phase 6.26 wiring) — mirrors the
+    sqlite3Select pWin branch at select.c:8265..8331. }
+  rcWin:        i32;
+  addrGosubW:   i32;
+  iContW:       i32;
+  iBreakW:      i32;
+  regGosubW:    i32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
   if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
   selectMarkAggregate(pParse, p);
+  { Phase 6.26 — pas-only pre-pass.  C's resolve.c:1314..1325 attaches each
+    window-function expression's pWin to the enclosing Select via
+    sqlite3WindowLink and patches its frame spec via sqlite3WindowUpdate.
+    Pas's resolver never did this, so p^.pWin stayed nil and the window
+    arm at the bail below was unreachable.  Walk the result-list (and a
+    couple of common nested shapes) to wire up. }
+  linkWindowsForSelect(pParse, p);
 
   { EXISTS-to-JOIN optimisation — select.c:7897..7902 (sub-progress 51).
     If the resolver flagged the SELECT as containing an EXISTS subquery,
@@ -23013,7 +23115,99 @@ begin
        or (sqlite3ExprIsInteger(p^.pLimit^.pLeft, nil, pParse) = 0) then
     begin Result := SQLITE_OK; Exit; end;
   end;
-  if p^.pWin       <> nil then begin Result := SQLITE_OK; Exit; end;
+  { Phase 6.26 — window-function arm.  Mirrors select.c:7686 (Rewrite) and
+    select.c:8265..8331 (the no-isAgg / no-pGroupBy pWin branch).  Subset:
+    no DISTINCT, no ORDER BY, no LIMIT, SRT_Output only.  Drives the
+    coroutine pattern: WindowCodeStep emits the frame loop and jumps to
+    addrGosubW per emitted row; the inline body below codes the result
+    columns + ResultRow then OP_Returns to Step.  Step calls WhereEnd
+    internally, so we don't. }
+  if p^.pWin <> nil then
+  begin
+    rcWin := sqlite3WindowRewrite(pParse, p);
+    if rcWin <> SQLITE_OK then begin Result := rcWin; Exit; end;
+    if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
+
+    { Subset gates — extend in later 6.26 sub-phases. }
+    if pDest^.eDest <> SRT_Output then
+    begin Result := SQLITE_OK; Exit; end;
+    if (p^.pOrderBy <> nil) or (p^.pLimit <> nil)
+       or ((p^.selFlags and SF_Distinct) <> 0) then
+    begin Result := SQLITE_OK; Exit; end;
+
+    v := sqlite3GetVdbe(pParse);
+    if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    sqlite3GenerateColumnNames(pParse, p);
+
+    pTabList   := p^.pSrc;
+    pEList     := p^.pEList;
+    nResultCol := pEList^.nExpr;
+    items      := ExprListItems(pEList);
+    pDest^.nSdst := nResultCol;
+    if pDest^.iSdst = 0 then
+    begin
+      pDest^.iSdst := pParse^.nMem + 1;
+      pParse^.nMem := pParse^.nMem + nResultCol;
+    end;
+
+    p^.nSelectRow := 320;
+
+    { Materialise the rewritten subquery FROM into an ephemeral rowid
+      table — same shape as the isSubqueryAgg arm at codegen.pas:23495.
+      Pas's sqlite3WhereBegin doesn't yet auto-materialise subquery
+      FROMs, so emit OpenEphemeral + sqlite3Select(SRT_EphemTab) here
+      and let WhereBegin scan the now-populated cursor. }
+    pItem := SrcListItems(p^.pSrc);
+    if pItem^.iCursor < 0 then
+    begin
+      pItem^.iCursor := pParse^.nTab;
+      Inc(pParse^.nTab);
+    end;
+    iCsr := pItem^.iCursor;
+    if (pItem^.pSTab <> nil) then
+      sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iCsr, pItem^.pSTab^.nCol)
+    else
+      sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iCsr, 1);
+    sqlite3SelectDestInit(@innerDest, SRT_EphemTab, iCsr);
+    if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+    begin
+      Result := SQLITE_ERROR; Exit;
+    end;
+
+    sqlite3WindowCodeInit(pParse, p);
+
+    pWInfo := sqlite3WhereBegin(pParse, pTabList, p^.pWhere, nil,
+                                pEList, p, 0, 0);
+    if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+
+    addrGosubW := sqlite3VdbeMakeLabel(pParse);
+    iContW     := sqlite3VdbeMakeLabel(pParse);
+    iBreakW    := sqlite3VdbeMakeLabel(pParse);
+    Inc(pParse^.nMem); regGosubW := pParse^.nMem;
+
+    sqlite3WindowCodeStep(pParse, p, pWInfo, regGosubW, addrGosubW);
+
+    sqlite3VdbeAddOp2(v, OP_Goto, 0, iBreakW);
+    sqlite3VdbeResolveLabel(v, addrGosubW);
+
+    { Inner-loop subroutine: emit each result column then OP_ResultRow.
+      For window-function exprs sqlite3ExprCodeTarget returns the
+      pre-populated regResult (no opcode emitted), so guard with OP_Copy
+      when the source register differs from the inner-loop slot. }
+    for i := 0 to nResultCol - 1 do
+    begin
+      pE := items[i].pExpr;
+      r1 := sqlite3ExprCodeTarget(pParse, pE, pDest^.iSdst + i);
+      if r1 <> pDest^.iSdst + i then
+        sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
+    end;
+    sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+
+    sqlite3VdbeResolveLabel(v, iContW);
+    sqlite3VdbeAddOp1(v, OP_Return, regGosubW);
+    sqlite3VdbeResolveLabel(v, iBreakW);
+    Result := SQLITE_OK; Exit;
+  end;
 
   { Simple-count optimization — select.c:8758..8818 (isSimpleCount + the
     inline OpenRead/Count/Close/Copy/ResultRow tail).  For
