@@ -2631,26 +2631,21 @@ function removeUnindexableInClauseTerms(pParse: PParse; iEq: i32;
   pLoop: PWhereLoop; pX: PExpr): PExpr;
 
 { Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers, batch 7.
-  Public-surface stubs gated under SQLITE_ENABLE_CURSOR_HINTS (off by default in
-  pas-sqlite3, so codeCursorHint matches upstream's `#else #define ... /*No-op*/`)
-  and SQLITE_OMIT_EXPLAIN / explain<>2 / IS_STMT_SCANSTATUS-disabled (the no-op
-  fall-through path in upstream's wherecode.c).  These exist so that
-  sqlite3WhereCodeOneLoopStart can be ported without forward references.
   codeCursorHint (wherecode.c:1146..1245) — emits OP_CursorHint when the
-  cursor-hint optimisation is active.  pas-sqlite3 does not enable this build
-  flag; the stub is unconditionally a no-op, matching upstream's `#else` define.
+  cursor-hint optimisation is active.  pas-sqlite3 does not enable
+  SQLITE_ENABLE_CURSOR_HINTS, so this remains a no-op matching upstream's
+  `#else` define.
   sqlite3WhereExplainOneScan (wherecode.c:245..268) — adds an OP_Explain opcode
-  describing one table scan.  Returns 0 (no opcode added) when toplevel.explain
-  <> 2 and stmt-scanstatus is disabled, which is the only case pas-sqlite3
-  currently exercises (EXPLAIN QUERY PLAN text generation lands once the
-  StrAccum / SrcItem-aware printf wiring is in place).
+  describing one table scan; emits opcode/p1/p2/p3 only.  Chaining into
+  sqlite3WhereAddExplainText is wired in C but currently bypassed in this port
+  (see body comment / Open Bugs 6.10 step 8).
   sqlite3WhereExplainBloomFilter (wherecode.c:280..320) — Bloom-filter EQP
-  describer.  Same fall-through (returns 0) until the EQP text path lands.
+  describer.  Builds "BLOOM FILTER ON tab (col=? AND …)" via the StrAccum /
+  %S printf path and emits OP_Explain p4=text.
   sqlite3WhereAddExplainText (wherecode.c:117..233) — back-patches the P4 of an
-  existing OP_Explain with the rendered scan-description text.  Stubbed as a
-  no-op until EQP support lands; sqlite3WhereExplainOneScan never adds the
-  OP_Explain in the first place, so there's nothing for this routine to fix
-  up. }
+  existing OP_Explain with the rendered scan-description text.  Body fully
+  ported; not currently called from OneScan (AV under TSrcItem.fg.fgBits3
+  layout; gated on a TSrcItem field-offset audit). }
 procedure codeCursorHint(pTabItem: PSrcItem; pWInfo: PWhereInfo;
   pLevel: PWhereLevel; pEndRange: PWhereTerm);
 function  sqlite3WhereExplainOneScan(pParse: PParse; pTabList: PSrcList;
@@ -48142,9 +48137,11 @@ begin
     scanstatus gate so OP_Explain is always emitted for non-OR-subclause,
     non-MULTI_OR scans.  Match that behaviour: emit OP_Explain p1=addr,
     p2=pParse^.addrExplain, p3=pLevel^.pWLoop^.rRun.  P4 (the EQP text
-    string) stays NULL until %S printf composition lands; TestExplainParity
-    diffs only opcode/p1/p2/p3/p5, so this is enough to close op-count
-    parity on single-table scan rows.
+    string) stays NULL for now — sqlite3WhereAddExplainText is fully
+    ported but wiring it from this site has surfaced a layout-sensitive
+    AV (TSrcItem fg.fgBits3 access path); revisit alongside an EQP-text
+    test corpus.  TestExplainParity diffs only opcode/p1/p2/p3/p5, so
+    this is enough to close op-count parity on single-table scan rows.
 
     Suppressed for OR-subclauses (WHERE_OR_SUBCLAUSE) and MULTI_OR
     composite plans, matching the C-side gate. }

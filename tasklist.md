@@ -388,6 +388,18 @@ FPC porting traps that recur often enough to call out up-front:
       into the open INNER-JOIN bloom-filter case (6.10 step 9 d-INNER)
       and sub-FROM materialise (step 6 sub-FROM).
 
+  [ ] **6.10 step 8** EQP P4 text not emitted on OP_Explain.
+      sqlite3WhereAddExplainText is fully ported but cannot be wired
+      from sqlite3WhereExplainOneScan today: doing so AVs immediately
+      under TestExplainParity at the TSrcItem.fg.fgBits3 access (or a
+      neighbouring offset).  TestExplainParity excludes P4 from its
+      diff so the regression is masked, but EXPLAIN QUERY PLAN text
+      and any future EQP corpus need this resolved.  Likely cause:
+      TSrcItem layout drift between the codegen.pas record definition
+      and the offsets sqlite3WhereAddExplainText / explainIndexRange
+      reach into.  Audit needed before re-enabling the wiring at
+      passqlite3codegen.pas sqlite3WhereExplainOneScan.
+
   [ ] **6.10 step 9** Runtime divergences surfaced by
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
       bin/DiagFeatureProbe`).  Most fold into existing tasks; the genuinely
