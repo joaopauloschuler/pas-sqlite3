@@ -317,6 +317,22 @@ FPC porting traps that recur often enough to call out up-front:
             no-op stub; OP_IdxDelete picks up the EIIB-bug fallback
             arm (vdbe.c:6658..6670) and reports SQLITE_CORRUPT_INDEX
             outside writable_schema mode.
+       [X] Port `sqlite3BtreeIntegrityCheck` (btree.c:11126) plus the
+            full helper stack (`checkOom`, `checkProgress`,
+            `checkAppendMsg`, `getPageReferenced`, `setPageReferenced`,
+            `checkRef`, `checkPtrmap`, `checkList`, `btreeHeapInsert`,
+            `btreeHeapPull`, `checkTreePage`).  OP_IntegrityCk in
+            vdbe.pas now drives the real check instead of the no-op
+            stub — `PRAGMA integrity_check` reports `ok` for green
+            DBs and surfaces real corruption messages otherwise.
+            Deviations from the C reference (documented at the port
+            site): StrAccum static-then-grow strategy is replaced by
+            sqlite3_str_new (libc malloc); the `aCnt: Mem*` parameter
+            is replaced by `aRowCnt: Pi64*` to keep btree.pas free
+            of the Mem layout dependency; `checkProgress` is reduced
+            to a no-op (db is opaque in btree.pas); the
+            SQLITE_CellSizeCk save/restore arm is dropped (perf
+            optimisation, not correctness).
 
 ### Open Bugs
 

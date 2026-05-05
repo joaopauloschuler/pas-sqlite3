@@ -7062,6 +7062,14 @@ var
   jmBt:        PBtree;
   jmPager:     PPager;
   jmZFilename: PChar;
+  { OP_IntegrityCk locals (vdbe.c:7263) }
+  icRoot:    PPgno;
+  icRowCnt:  Pi64;
+  icpnErr:   PMem;
+  icpzOut:   PAnsiChar;
+  icnRoot:   i32;
+  icnErr:    i32;
+  icIdx:     i32;
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -10103,10 +10111,46 @@ begin
       end;
     end;
 
-    { ────── OP_IntegrityCk ────── — stub }
+    { ────── OP_IntegrityCk ────── (vdbe.c:7263) — full integrity-check
+      driver.  Faithful 1:1 with the upstream arm: nRoot = pOp^.p2;
+      aRoot = pOp^.p4.ai (P4_INTARRAY); aRoot[0] is encoded as nRoot
+      for full checks, 0 for partial.  Per-tree row counts go into
+      aMem[pOp^.p3 .. pOp^.p3+nRoot-1]; the error message lands in
+      aMem[pOp^.p1+1]; the remaining-error counter is decremented in
+      aMem[pOp^.p1] by (nErr-1). }
     OP_IntegrityCk: begin
-      { Full integrity check deferred to Phase 6 }
+      icRoot := PPgno(pOp^.p4.ai);
+      icnRoot := pOp^.p2;
+      Assert(icnRoot > 0);
+      Assert(icRoot <> nil);
+      icpnErr := @aMem[pOp^.p1];
+      icpzOut := nil;
+      icnErr  := 0;
+      { Allocate a small i64[] for per-tree row counts.  The opcode
+        contract guarantees nRoot fits in i32. }
+      GetMem(icRowCnt, icnRoot * SizeOf(i64));
+      FillChar(icRowCnt^, PtrUInt(icnRoot) * SizeOf(i64), 0);
+      rc := sqlite3BtreeIntegrityCheck(db, db^.aDb[pOp^.p5].pBt,
+                                       icRoot, icRowCnt, icnRoot,
+                                       i32(icpnErr^.u.i) + 1,
+                                       @icnErr, @icpzOut);
+      { Marshal per-tree row counts into aMem[p3..]. }
+      for icIdx := 0 to icnRoot - 1 do
+        sqlite3MemSetArrayInt64(@aMem[pOp^.p3], icIdx, icRowCnt[icIdx]);
+      FreeMem(icRowCnt);
       sqlite3VdbeMemSetNull(@aMem[pOp^.p1 + 1]);
+      if icnErr = 0 then begin
+        Assert(icpzOut = nil);
+      end else if rc <> SQLITE_OK then begin
+        if icpzOut <> nil then sqlite3_free(icpzOut);
+        goto abort_due_to_error;
+      end else begin
+        icpnErr^.u.i := icpnErr^.u.i - (icnErr - 1);
+        sqlite3VdbeMemSetStr(@aMem[pOp^.p1 + 1], icpzOut, -1,
+                             SQLITE_UTF8, SQLITE_DYNAMIC);
+      end;
+      sqlite3VdbeChangeEncoding(@aMem[pOp^.p1 + 1], enc);
+      goto check_for_interrupt;
     end;
 
     { ────── OP_IFindKey ────── (vdbe.c:7301) — sub-search around the
