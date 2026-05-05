@@ -1753,6 +1753,16 @@ type
 var
   vdbeSqlExec: TVdbeSqlExec = nil;
 
+{ OP_Vacuum hook (vdbe.c → vacuum.c sqlite3RunVacuum).  Same uses-cycle
+  rationale as vdbeParseSchemaExec / vdbeSqlExec.  Signature mirrors the
+  C function: write any error message via *pzErrMsg, vacuum aDb[iDb], and
+  if pOut is non-nil treat the call as VACUUM INTO 'pOut->z'. }
+type
+  TVdbeRunVacuum = function(pzErrMsg: PPAnsiChar; db: PTsqlite3;
+                            iDb: i32; pOut: Psqlite3_value): i32;
+var
+  vdbeRunVacuum: TVdbeRunVacuum = nil;
+
 { --- vdbe.c Phase 5.4b helpers (exported for testing) --- }
 function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
 
@@ -9949,13 +9959,24 @@ begin
       sqlite3VdbeMemSetInt64(@aMem[pOp^.p3 + 2], i64(aResCk[2]));
     end;
 
-    { ────── OP_Vacuum ────── stub.
-      OP_Vacuum needs sqlite3RunVacuum (vacuum.c — not yet ported); return
-      OK so basic SQL testing does not crash.  Full port tracked under
-      Phase 6.27. }
+    { ────── OP_Vacuum ────── (vdbe.c:7188).  p1 selects the database to
+      VACUUM (0 = main; 1 cannot be VACUUMed and is rejected by the codegen
+      gate, so any non-zero p1 here is an attached DB).  When p2 is non-
+      zero, register p2 holds the VACUUM INTO target filename.  Delegates
+      to the vdbeRunVacuum hook installed by main.pas (sqlite3RunVacuum
+      port of vacuum.c:143).  When the hook is unbound (early bring-up /
+      tests linking vdbe without main) we degrade to the legacy no-op so
+      DiagOps and friends keep working. }
     OP_Vacuum: begin
-      pOut := out2Prerelease(v, pOp);
-      pOut^.u.i := 0;
+      Assert(pOp^.p1 <> 1);
+      sqlite3VdbeIncrWriteCounter(v, nil);
+      if vdbeRunVacuum <> nil then begin
+        if pOp^.p2 <> 0 then
+          rc := vdbeRunVacuum(@v^.zErrMsg, db, pOp^.p1, @aMem[pOp^.p2])
+        else
+          rc := vdbeRunVacuum(@v^.zErrMsg, db, pOp^.p1, nil);
+        if rc <> 0 then goto abort_due_to_error;
+      end;
     end;
 
     { ────── OP_JournalMode ────── (vdbe.c:8054) — full 1:1 port. }

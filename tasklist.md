@@ -263,6 +263,18 @@ FPC porting traps that recur often enough to call out up-front:
                  in openStatTable runs but the schema cache is not
                  reloaded so the subsequent OpenWrite fails.
        [X] Port `sqlite3Vacuum` (vacuum.c).
+       [~] Port `sqlite3RunVacuum` (vacuum.c:143) + execSql/execSqlF —
+            body landed in passqlite3main.pas, wired into OP_Vacuum via
+            new vdbeRunVacuum hook.  Faithful 1:1 with the
+            !SQLITE_OMIT_VACUUM && !SQLITE_OMIT_ATTACH arm; PREUPDATE_HOOK
+            and AUTHORIZATION arms left out (default build).  End-to-end
+            VACUUM still fails (out-of-memory or SQL-logic-error) because
+            ATTACH-side schema reload is gated on Phase 7.1.1 (sqlite3InitOne)
+            — the new aDb[] slot is opened but the on-disk schema is not
+            loaded, so the schema-mirror SELECTs run against an empty
+            target.  Skeleton is harmless: existing tests (TestExplainParity,
+            DiagVacuum, DiagOps, DiagPragma, …) all green; only direct
+            user-issued VACUUM degrades from silent-no-op to error.
        [X] Port `sqlite3FkCheck` (fkey.c) — DONE.  fkScanChildren
             (fkey.c:547..660) and the dispatcher body (fkey.c:889..
             1087) ported at codegen.pas:38136..38470, replacing the
@@ -284,8 +296,10 @@ FPC porting traps that recur often enough to call out up-front:
        [X] Port OP_JournalMode body (vdbe.c:8054) — full 1:1 port,
             including the WAL→rollback / rollback→WAL transition arms.
             sqlite3PagerCloseWal (pager.c:7670) ported alongside in
-            passqlite3pager.pas.  OP_Vacuum keeps the no-op stub
-            (sqlite3RunVacuum unported, gated on Phase 7.1.8 ATTACH).
+            passqlite3pager.pas.
+       [~] OP_Vacuum — wired to vdbeRunVacuum hook (sqlite3RunVacuum
+            ported in passqlite3main.pas).  End-to-end completion gated
+            on Phase 7.1.1 schema reload after ATTACH (see 6.27).
 
 ### Open Bugs
 
