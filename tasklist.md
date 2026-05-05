@@ -66,25 +66,11 @@ FPC porting traps that recur often enough to call out up-front:
 > multi-row VALUES coroutine row diverges (C=22 vs Pas=17 ops; see
 > 6.10 step 6).
 
-- [X] **6.8.0** Pragma (pragma.c): `sqlite3PragmaVtabRegister` — DONE.
-     1:1 port of pragma.c:2791..3101 (aPragmaName, pragCName, all 12
-     vtab callbacks, pragmaVtabModule).  Underlying PRAGMA codegen arms
-     (TABLE_INFO, INDEX_LIST, …) still stubs — see 6.12.
+- [X] **6.8.0** Pragma (pragma.c): `sqlite3PragmaVtabRegister`
 
-- [X] **6.8.2** port `sqlite3GenerateConstraintChecks` (insert.c).
-     Body ported (codegen.pas:24529..25303); 1:1 with
-     insert.c:1895..2723.  All arms ([X] NOT NULL, [X] CHECK,
-     [X] PK/UNIQUE incl. partial-index, [X] FOREIGN KEY,
-     [X] Conflict-resolution + UPSERT OE_Update).  Wired via 6.8.6.
-     [X] Auto-rowid for IPK alias on NULL (max(rowid)+1, AUTOINCREMENT)
-          — landed in sqlite3Insert at codegen.pas:26794..26819
-          (insert.c:1530..1545 1:1: ipkColumnPresent gate, OP_NotNull
-          short-circuit + OP_NewRowid auto-pick, autoIncStep MemMax).
+- [X] **6.8.2** port `sqlite3GenerateConstraintChecks`
 
-- [X] **6.8.3** port `sqlite3CompleteInsertion` (insert.c) — DONE.
-     Body at `passqlite3codegen.pas:25319..25395`, 1:1 port of
-     `insert.c:2782..2847`.  Companion to 6.8.2.  Wired into the
-     productive `sqlite3Insert` cascade via 6.8.6.
+- [X] **6.8.3** port `sqlite3CompleteInsertion` (insert.c)
 
 - [~] **6.8.4** port `sqlite3WhereBegin` (where.c).
      Gate: TestExplainParity SELECT-WHERE corpus + DiagIndexing
@@ -133,12 +119,6 @@ FPC porting traps that recur often enough to call out up-front:
           arms not in default build.
 
 - [X] **6.8.5** port `sqlite3WhereEnd` (where.c) — DONE.
-     Body at codegen.pas:16461..16672.  Per-level addrCont resolution +
-     pLevel^.op iteration emit, addrBrk resolution, EXISTS-to-JOIN
-     break, IN-loop unwind, viaCoroutine OP_Column→OP_Copy rewrite,
-     index→table column rewrite, ljNullRowFixup, whereInfoFree
-     cleanup.  C reference does not emit OP_Close in WhereEnd — those
-     are emitted by sqlite3Select after the call, matching the port.
 
 - [X] **6.8.1** finish porting `sqlite3Update` (update.c) — single-table
      arm DONE.  `passqlite3codegen.pas:23457..24115`, 1:1 port of
@@ -299,10 +279,6 @@ FPC porting traps that recur often enough to call out up-front:
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
        marked as "stub" that was missed (catch-all).
-       [X] Port OP_JournalMode body (vdbe.c:8054) — full 1:1 port,
-            including the WAL→rollback / rollback→WAL transition arms.
-            sqlite3PagerCloseWal (pager.c:7670) ported alongside in
-            passqlite3pager.pas.
        [~] OP_Vacuum — wired to vdbeRunVacuum hook (sqlite3RunVacuum
             ported in passqlite3main.pas).  End-to-end completion gated
             on Phase 7.1.1 schema reload after ATTACH (see 6.27).
@@ -315,55 +291,6 @@ FPC porting traps that recur often enough to call out up-front:
             but matching the upstream call shape.  incrVacuumStep /
             relocatePage / modifyPagePointer not ported (gated on a
             productive ptrmap that this port doesn't have).
-       [X] Port `sqlite3VdbeFindIndexKey` + `vdbeIsMatchingIndexKey` +
-            `vdbeSkipField` (vdbeaux.c:5400..5615).  Body lives in
-            passqlite3codegen (TIndex layout not visible to vdbe.pas);
-            wired into vdbe.pas via the new `vdbeFindIndexKey` hook.
-            OP_IFindKey now drives a real sub-search instead of the
-            no-op stub; OP_IdxDelete picks up the EIIB-bug fallback
-            arm (vdbe.c:6658..6670) and reports SQLITE_CORRUPT_INDEX
-            outside writable_schema mode.
-       [X] Port `sqlite3VdbePrintSql` (vdbeaux.c:2501) — body now mirrors
-            the SQLITE_DEBUG arm (zSql first, then OP_Init P4 fallback
-            with leading-whitespace skip).  `sqlite3VdbeIOTraceSql`
-            (vdbeaux.c:2520) remains a faithful no-op matching the
-            !SQLITE_ENABLE_IOTRACE branch.
-       [X] Port `sqlite3BtreeIntegrityCheck` (btree.c:11126) plus the
-            full helper stack (`checkOom`, `checkProgress`,
-            `checkAppendMsg`, `getPageReferenced`, `setPageReferenced`,
-            `checkRef`, `checkPtrmap`, `checkList`, `btreeHeapInsert`,
-            `btreeHeapPull`, `checkTreePage`).  OP_IntegrityCk in
-            vdbe.pas now drives the real check instead of the no-op
-            stub — `PRAGMA integrity_check` reports `ok` for green
-            DBs and surfaces real corruption messages otherwise.
-            Deviations from the C reference (documented at the port
-            site): StrAccum static-then-grow strategy is replaced by
-            sqlite3_str_new (libc malloc); the `aCnt: Mem*` parameter
-            is replaced by `aRowCnt: Pi64*` to keep btree.pas free
-            of the Mem layout dependency; `checkProgress` is reduced
-            to a no-op (db is opaque in btree.pas); the
-            SQLITE_CellSizeCk save/restore arm is dropped (perf
-            optimisation, not correctness).
-       [X] Port `vtabIsReadOnly` (delete.c:77) and wire it into
-            `tabIsReadOnly`'s vtab arm (codegen.pas).  Replaces the
-            "treat as writable for now" placeholder with the real
-            xUpdate-nil check + eVtabRisk threshold diagnostic
-            ("unsafe use of virtual table") inside trigger / DDL
-            prepare contexts.
-       [X] Port the OP_VBegin emission loop in `sqlite3FinishCoding`
-            (build.c:222..226).  Iterates `pParse^.apVtabLock`, looks
-            up each Table*'s VTable* via `sqlite3GetVTable`, and
-            emits OP_VBegin with P4_VTAB.  Replaces the "no-op until
-            apVtabLock is properly typed" placeholder.
-       [X] Port `sqlite3VtabFinishParse` init.busy=0 productive arm
-            (vtab.c:463..510).  New helper `sqlite3VtabFinishCreateOps`
-            in codegen.pas emits the UPDATE sqlite_schema row,
-            sqlite3ChangeCookie, OP_Expire, OP_ParseSchema reload, and
-            OP_VCreate sequence.  Replaces the long-standing TODO
-            stub in passqlite3parser.pas that only formatted zStmt
-            and freed it.  End-to-end CREATE VIRTUAL TABLE runtime
-            still gated on Phase 7.1.1 schema-row INSERT/UPDATE wiring
-            (sqlite_schema mutations emit ops but rows do not persist).
 
 ### Open Bugs
 
@@ -397,22 +324,22 @@ FPC porting traps that recur often enough to call out up-front:
           no-WHERE-non-partial-index case so the cost-based planner
           can pick the covering autoindex.
   
-  [X] **6.10 step 7** `DiagMisc` runtime divergences — all PASS as of
-      2026-05-03.  Remaining aggregate-no-GROUP-BY corner cases fold
-      into the open INNER-JOIN bloom-filter case (6.10 step 9 d-INNER)
-      and sub-FROM materialise (step 6 sub-FROM).
+  [X] **6.10 step 7** `DiagMisc` runtime divergences
 
-  [ ] **6.10 step 8** EQP P4 text not emitted on OP_Explain.
-      sqlite3WhereAddExplainText is fully ported but cannot be wired
-      from sqlite3WhereExplainOneScan — re-enabling produces an
-      EAccessViolation inside emitSrcItem (passqlite3printf.pas:455)
-      via the `%S` formatter dereferencing pItem^.zName/zAlias/fgBits/
-      u4_ptr.  TSrcItem layout matches C SrcItem (verified offsets).
-      Likely culprits: (a) `[pItem]` marshalled as vtObject rather than
-      vtPointer in sqlite3_str_appendf; (b) sqlite3MaterializeView
-      synthesises a SrcList where pSrcItem^.pSTab is nil so emitSrcItem's
-      u4_ptr-as-zDatabase arm reads garbage.  TestExplainParity excludes
-      P4 so the regression is masked there; needed for EQP corpus.
+  [~] **6.10 step 8** EQP P4 text now wired on OP_Explain.
+      sqlite3WhereAddExplainText is invoked from
+      sqlite3WhereExplainOneScan (codegen.pas:48437).  TestExplainParity
+      stays at 1025/1026 (P4 is stripped from the diff); no Diag
+      regressions.  The previously-reported AV root-caused at
+      `pIdx^.zName` deref (codegen.pas:48624) — the C reference asserts
+      `pLoop->u.btree.pIndex!=0` here but the Pas planner has a residual
+      gap on the autoindex / scan stand-in path where pIndex stays nil
+      (the 6.10 step 6 `SELECT p FROM u` fix lifted whereShortCut's
+      synthetic stand-in).  Workaround: bail with a freed partial buffer
+      when pIdx=nil (codegen.pas:48613..48618).
+      [ ] Chase the planner gap so pIndex is populated on every
+           non-IPK/non-vtab btree loop, then convert the nil guard
+           back to an Assert.
 
   [ ] **6.10 step 9** Runtime divergences surfaced by
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
@@ -498,9 +425,6 @@ FPC porting traps that recur often enough to call out up-front:
         tables is gated on Phase 7.1.1 schema reload).  Only remaining
         contributor.
   [X] **6.12** port sqlite3Pragma in full.  Gate `DiagPragma` — all PASS.
-       FOREIGN_KEY_LIST arm landed alongside a productive
-       sqlite3CreateForeignKey body (FKey blob written via documented
-       byte offsets, hashed into pSchema^.fkeyHash).
 
   [ ] **6.13** Non-regular FROM-item codegen in `sqlite3Select`
        (select.c).  Pas's SELECT codegen currently traverses regular
@@ -582,19 +506,7 @@ FPC porting traps that recur often enough to call out up-front:
             DROP TABLE 6.11(b), VACUUM 6.27, ATTACH-reload 7.1.8,
             ALTER TABLE 7.1.9).  Last load-bearing piece.
 
-- [X] **7.1.2** `sqlite3NestedParse` full driver (build.c).  Body at
-       codegen.pas:34537 — productive 1:1 port of build.c:293..323.
-       All call sites now pass real format strings (no remaining
-       `zFormat=nil` placeholders): destroyRootPage UPDATE
-       sqlite_schema (codegen.pas:32647), DROP TABLE / DROP INDEX
-       sqlite_statN cleanup (32685), CREATE TRIGGER schema-row INSERT
-       (25053), CREATE INDEX, CREATE VIEW, ALTER TABLE rename helpers.
-       Driven through `gNestedRunParser` hook installed by
-       passqlite3parser.  Remaining schema-mutation gaps (DROP TABLE
-       Δ=26, ALTER TABLE no-op) sit in the schema-cache reload path
-       (Phase 7.1.1 last item) — sqlite3Insert / sqlite3Update against
-       sqlite_master emit ops but the in-memory schema cache is not
-       reloaded, so the new rows aren't visible to the next prepare.
+- [X] **7.1.2** `sqlite3NestedParse` full driver (build.c).
 
 - [~] **7.1.8** ATTACH / DETACH (attach.c) — codegen path productive
        (closes the prior parse-time stubs).  Parser productions for
@@ -675,8 +587,6 @@ Windows-only entry points (`sqlite3_win32_*`) and pure typedefs
 (`sqlite3_int64`, `sqlite3_uint64`, opaque struct names) are excluded.
 
 - [X] **8.9.2** Carray / shared-cache / misc (sqlite3_carray_bind) — done
-       in passqlite3carray.pas:571 (calls sqlite3_carray_bind_v2 with
-       pDestroy=aData; matches carray.c:550..557 1:1).
 
 - [X] **8.x** `unixCurrentTimeInt64` (os_unix.c:7193) — ported 2026-04-29 in
        passqlite3os.pas.  Returns *piNow as Julian-day-times-86_400_000;
