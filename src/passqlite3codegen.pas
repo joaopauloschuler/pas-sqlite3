@@ -21905,19 +21905,20 @@ begin
   pParse^.nMem := pParse^.nMem + pAggInfo^.nColumn + pAggInfo^.nFunc;
 end;
 
-{ resetAccumulatorSimple — select.c:6658 (slim).  Emit OP_Null over the
-  accumulator register block, then for each aggregate with iDistinct>=0
-  open an ephemeral b-tree to dedup its argument (mirrors select.c:6671).
-  The ORDER BY (iOBTab>=0) arm is still intentionally omitted; the gate
-  in sqlite3Select rejects that form today. }
+{ resetAccumulatorSimple — select.c:6658.  Emit OP_Null over the
+  accumulator register block, then for each aggregate open an ephemeral
+  b-tree for DISTINCT dedup (iDistinct>=0, select.c:6671) and/or for
+  ORDER-BY-in-aggregate sorting (iOBTab>=0, select.c:6686). }
 procedure resetAccumulatorSimple(pParse: PParse; pAggInfo: PAggInfo);
 var
-  v:    PVdbe;
-  nReg: i32;
-  i:    i32;
-  pF:   PAggInfoFunc;
-  pE:   PExpr;
-  pKI:  Pointer;
+  v:        PVdbe;
+  nReg:     i32;
+  i:        i32;
+  pF:       PAggInfoFunc;
+  pE:       PExpr;
+  pKI:      PKeyInfo2;
+  pOBList:  PExprList;
+  nExtra:   i32;
 begin
   v    := pParse^.pVdbe;
   nReg := pAggInfo^.nFunc + pAggInfo^.nColumn;
@@ -21946,6 +21947,30 @@ begin
           pF^.iDistinct, 0, 0, PAnsiChar(pKI), P4_KEYINFO);
       end;
     end;
+    if pF^.iOBTab >= 0 then
+    begin
+      Assert(pF^.pFExpr^.pLeft <> nil);
+      Assert(pF^.pFExpr^.pLeft^.op = TK_ORDER);
+      Assert(ExprUseXList(pF^.pFExpr^.pLeft));
+      Assert(pF^.pFunc <> nil);
+      pOBList := pF^.pFExpr^.pLeft^.x.pList;
+      nExtra := 0;
+      if pF^.bOBUnique = 0 then Inc(nExtra);  { OP_Sequence column }
+      if pF^.bOBPayload <> 0 then
+      begin
+        Assert(ExprUseXList(pF^.pFExpr));
+        Assert(pF^.pFExpr^.x.pList <> nil);
+        nExtra := nExtra + pF^.pFExpr^.x.pList^.nExpr;
+      end;
+      if pF^.bUseSubtype <> 0 then
+        nExtra := nExtra + pF^.pFExpr^.x.pList^.nExpr;
+      pKI := sqlite3KeyInfoFromExprList(pParse, pOBList, 0, nExtra);
+      if (pF^.bOBUnique = 0) and (pParse^.nErr = 0) and (pKI <> nil) then
+        Inc(pKI^.nKeyField);
+      sqlite3VdbeAddOp4(v, OP_OpenEphemeral,
+        pF^.iOBTab, pOBList^.nExpr + nExtra, 0,
+        PAnsiChar(pKI), P4_KEYINFO);
+    end;
   end;
 end;
 
@@ -21962,12 +21987,17 @@ var
   v:       PVdbe;
   i, j, nArg, r1: i32;
   regAgg:  i32;
+  regAggSz: i32;
+  regDistinct: i32;
+  regBaseSub: i32;
+  jj, kk:  i32;
   regHit:  i32;
   addrHitTest: i32;
   addrNext: i32;
   pF:      PAggInfoFunc;
   pC:      PAggInfoCol;
   pList:   PExprList;
+  pOBList: PExprList;
   argItems: PExprListItem;
   pCollAgg: Pointer;
 begin
@@ -21993,10 +22023,57 @@ begin
       sqlite3ExprIfFalse(pParse, pF^.pFExpr^.y.pWin^.pFilter, addrNext,
                          SQLITE_JUMPIFNULL);
     end;
-    if pList <> nil then
+    if pF^.iOBTab >= 0 then
+    begin
+      { ORDER-BY-in-aggregate arm — select.c:6848..6892.  Defer AggStep:
+        encode the ORDER BY key (and optionally a Sequence tiebreaker,
+        the function arguments, and per-arg subtypes) into a sorter
+        record, then OP_IdxInsert into the iOBTab ephemeral. }
+      Assert(pList <> nil);
+      nArg := pList^.nExpr;
+      Assert(nArg > 0);
+      Assert(pF^.pFExpr^.pLeft <> nil);
+      Assert(pF^.pFExpr^.pLeft^.op = TK_ORDER);
+      Assert(ExprUseXList(pF^.pFExpr^.pLeft));
+      pOBList := pF^.pFExpr^.pLeft^.x.pList;
+      Assert(pOBList <> nil);
+      Assert(pOBList^.nExpr > 0);
+      regAggSz := pOBList^.nExpr;
+      if pF^.bOBUnique = 0 then Inc(regAggSz);
+      if pF^.bOBPayload <> 0 then regAggSz := regAggSz + nArg;
+      if pF^.bUseSubtype <> 0 then regAggSz := regAggSz + nArg;
+      Inc(regAggSz);  { extra slot for MakeRecord result }
+      regAgg := sqlite3GetTempRange(pParse, regAggSz);
+      regDistinct := regAgg;
+      sqlite3ExprCodeExprList(pParse, pOBList, regAgg, 0, SQLITE_ECEL_DUP);
+      jj := pOBList^.nExpr;
+      if pF^.bOBUnique = 0 then
+      begin
+        sqlite3VdbeAddOp2(v, OP_Sequence, pF^.iOBTab, regAgg + jj);
+        Inc(jj);
+      end;
+      if pF^.bOBPayload <> 0 then
+      begin
+        regDistinct := regAgg + jj;
+        sqlite3ExprCodeExprList(pParse, pList, regDistinct, 0, SQLITE_ECEL_DUP);
+        jj := jj + nArg;
+      end;
+      if pF^.bUseSubtype <> 0 then
+      begin
+        if pF^.bOBPayload <> 0 then regBaseSub := regDistinct
+        else regBaseSub := regAgg;
+        for kk := 0 to nArg - 1 do
+        begin
+          sqlite3VdbeAddOp2(v, OP_GetSubtype, regBaseSub + kk, regAgg + jj);
+          Inc(jj);
+        end;
+      end;
+    end
+    else if pList <> nil then
     begin
       nArg   := pList^.nExpr;
       regAgg := sqlite3GetTempRange(pParse, nArg);
+      regDistinct := regAgg;
       argItems := ExprListItems(pList);
       for j := 0 to nArg - 1 do
       begin
@@ -22009,6 +22086,7 @@ begin
     begin
       nArg   := 0;
       regAgg := 0;
+      regDistinct := 0;
     end;
     { DISTINCT dedup — select.c:6902..6908 default WHERE_DISTINCT_UNORDERED
       arm.  Skip the AggStep when the arg-record is already present in the
@@ -22019,35 +22097,48 @@ begin
         addrNext := sqlite3VdbeMakeLabel(pParse);
       r1 := sqlite3GetTempReg(pParse);
       sqlite3VdbeAddOp4Int(v, OP_Found, pF^.iDistinct, addrNext,
-                           regAgg, nArg);
-      sqlite3VdbeAddOp3(v, OP_MakeRecord, regAgg, nArg, r1);
+                           regDistinct, nArg);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regDistinct, nArg, r1);
       sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pF^.iDistinct, r1,
-                           regAgg, nArg);
+                           regDistinct, nArg);
       sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
       sqlite3ReleaseTempReg(pParse, r1);
     end;
-    { NEEDCOLL — select.c:6918..6932.  Aggregate functions flagged with
-      SQLITE_FUNC_NEEDCOLL (min/max) need an OP_CollSeq immediately
-      before OP_AggStep so the comparison helper picks up the resolved
-      collation.  regHit stays 0 here (nAccumulator=0 in the simple
-      gate), matching C bytecode for `SELECT min(a) FROM t`. }
-    if (pF^.pFunc <> nil) and (pList <> nil)
-       and ((PTFuncDef(pF^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0) then
+    if pF^.iOBTab >= 0 then
     begin
-      pCollAgg := nil;
-      for j := 0 to nArg - 1 do
+      { Insert the assembled key+payload record into the sorter ephemeral
+        table — select.c:6909..6915.  AggStep itself is deferred to
+        finalizeAggFunctionsSimple. }
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regAgg, regAggSz - 1,
+                        regAgg + regAggSz - 1);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pF^.iOBTab,
+                           regAgg + regAggSz - 1, regAgg, regAggSz - 1);
+      sqlite3ReleaseTempRange(pParse, regAgg, regAggSz);
+    end
+    else
+    begin
+      { NEEDCOLL — select.c:6918..6932.  Aggregate functions flagged with
+        SQLITE_FUNC_NEEDCOLL (min/max) need an OP_CollSeq immediately
+        before OP_AggStep so the comparison helper picks up the resolved
+        collation. }
+      if (pF^.pFunc <> nil) and (pList <> nil)
+         and ((PTFuncDef(pF^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0) then
       begin
-        pCollAgg := sqlite3ExprCollSeq(pParse, ExprListItems(pList)[j].pExpr);
-        if pCollAgg <> nil then break;
+        pCollAgg := nil;
+        for j := 0 to nArg - 1 do
+        begin
+          pCollAgg := sqlite3ExprCollSeq(pParse, ExprListItems(pList)[j].pExpr);
+          if pCollAgg <> nil then break;
+        end;
+        if pCollAgg = nil then pCollAgg := pParse^.db^.pDfltColl;
+        sqlite3VdbeAddOp4(v, OP_CollSeq, 0, 0, 0, PAnsiChar(pCollAgg), P4_COLLSEQ);
       end;
-      if pCollAgg = nil then pCollAgg := pParse^.db^.pDfltColl;
-      sqlite3VdbeAddOp4(v, OP_CollSeq, 0, 0, 0, PAnsiChar(pCollAgg), P4_COLLSEQ);
+      sqlite3VdbeAddOp3(v, OP_AggStep, 0, regAgg,
+        pAggInfo^.iFirstReg + pAggInfo^.nColumn + i);
+      sqlite3VdbeAppendP4(v, Pointer(pF^.pFunc), P4_FUNCDEF);
+      sqlite3VdbeChangeP5(v, u16(nArg));
+      if nArg > 0 then sqlite3ReleaseTempRange(pParse, regAgg, nArg);
     end;
-    sqlite3VdbeAddOp3(v, OP_AggStep, 0, regAgg,
-      pAggInfo^.iFirstReg + pAggInfo^.nColumn + i);
-    sqlite3VdbeAppendP4(v, Pointer(pF^.pFunc), P4_FUNCDEF);
-    sqlite3VdbeChangeP5(v, u16(nArg));
-    if nArg > 0 then sqlite3ReleaseTempRange(pParse, regAgg, nArg);
     if addrNext <> 0 then sqlite3VdbeResolveLabel(v, addrNext);
     if pParse^.nErr <> 0 then begin pAggInfo^.directMode := 0; Exit; end;
   end;
@@ -22071,16 +22162,25 @@ begin
   if addrHitTest <> 0 then sqlite3VdbeJumpHere(v, addrHitTest);
 end;
 
-{ finalizeAggFunctions — select.c:6724 (slim).  Emit OP_AggFinal for
-  each aggregate function with the FuncDef attached as P4.  Skips the
-  iOBTab>=0 ORDER BY arm (rejected by gate). }
+{ finalizeAggFunctions — select.c:6724.  Emit OP_AggFinal for each
+  aggregate.  For ORDER-BY-in-aggregate (iOBTab>=0), first walk the
+  sorter ephemeral in key order and call OP_AggStep on each row before
+  the OP_AggFinal — select.c:6733..6776. }
 procedure finalizeAggFunctionsSimple(pParse: PParse; pAggInfo: PAggInfo);
 var
-  v:     PVdbe;
-  i:     i32;
-  pF:    PAggInfoFunc;
-  pList: PExprList;
-  nArgP2: i32;
+  v:        PVdbe;
+  i:        i32;
+  pF:       PAggInfoFunc;
+  pList:    PExprList;
+  nArgP2:   i32;
+  iTop:     i32;
+  nArg:     i32;
+  nKey:     i32;
+  regAgg:   i32;
+  regSubtype: i32;
+  iBaseCol: i32;
+  j:        i32;
+  unique0:  i32;
 begin
   v := pParse^.pVdbe;
   for i := 0 to pAggInfo^.nFunc - 1 do
@@ -22089,6 +22189,46 @@ begin
     Assert(ExprUseXList(pF^.pFExpr));
     if pParse^.nErr <> 0 then Exit;
     pList := pF^.pFExpr^.x.pList;
+    if pF^.iOBTab >= 0 then
+    begin
+      Assert(pF^.pFunc <> nil);
+      Assert(pList <> nil);
+      nArg := pList^.nExpr;
+      regAgg := sqlite3GetTempRange(pParse, nArg);
+      if pF^.bOBPayload = 0 then
+        nKey := 0
+      else
+      begin
+        Assert(pF^.pFExpr^.pLeft <> nil);
+        Assert(ExprUseXList(pF^.pFExpr^.pLeft));
+        Assert(pF^.pFExpr^.pLeft^.x.pList <> nil);
+        nKey := pF^.pFExpr^.pLeft^.x.pList^.nExpr;
+        if pF^.bOBUnique = 0 then Inc(nKey);
+      end;
+      iTop := sqlite3VdbeAddOp1(v, OP_Rewind, pF^.iOBTab);
+      for j := nArg - 1 downto 0 do
+        sqlite3VdbeAddOp3(v, OP_Column, pF^.iOBTab, nKey + j, regAgg + j);
+      if pF^.bUseSubtype <> 0 then
+      begin
+        regSubtype := sqlite3GetTempReg(pParse);
+        if (pF^.bOBPayload = 0) and (pF^.bOBUnique = 0) then unique0 := 1
+        else unique0 := 0;
+        iBaseCol := nKey + nArg + unique0;
+        for j := nArg - 1 downto 0 do
+        begin
+          sqlite3VdbeAddOp3(v, OP_Column, pF^.iOBTab, iBaseCol + j, regSubtype);
+          sqlite3VdbeAddOp2(v, OP_SetSubtype, regSubtype, regAgg + j);
+        end;
+        sqlite3ReleaseTempReg(pParse, regSubtype);
+      end;
+      sqlite3VdbeAddOp3(v, OP_AggStep, 0, regAgg,
+        pAggInfo^.iFirstReg + pAggInfo^.nColumn + i);
+      sqlite3VdbeAppendP4(v, Pointer(pF^.pFunc), P4_FUNCDEF);
+      sqlite3VdbeChangeP5(v, u16(nArg));
+      sqlite3VdbeAddOp2(v, OP_Next, pF^.iOBTab, iTop + 1);
+      sqlite3VdbeJumpHere(v, iTop);
+      sqlite3ReleaseTempRange(pParse, regAgg, nArg);
+    end;
     if pList <> nil then nArgP2 := pList^.nExpr else nArgP2 := 0;
     sqlite3VdbeAddOp2(v, OP_AggFinal,
       pAggInfo^.iFirstReg + pAggInfo^.nColumn + i, nArgP2);
@@ -22540,7 +22680,6 @@ begin
     begin
       pAggFunc := @pAggI2^.aFunc[jAgg];
       if pAggFunc^.iDistinct >= 0 then begin canUseAgg := False; break; end;
-      if pAggFunc^.iOBTab    >= 0 then begin canUseAgg := False; break; end;
       if ((pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0)
          and ((pAggFunc^.pFExpr^.y.pWin = nil)
               or (pAggFunc^.pFExpr^.y.pWin^.eFrmType <> TK_FILTER))
@@ -22667,7 +22806,6 @@ begin
     begin
       pAggFunc := @pAggI2^.aFunc[jAgg];
       if pAggFunc^.iDistinct >= 0 then begin canUseAgg := False; break; end;
-      if pAggFunc^.iOBTab    >= 0 then begin canUseAgg := False; break; end;
       if ((pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0)
          and ((pAggFunc^.pFExpr^.y.pWin = nil)
               or (pAggFunc^.pFExpr^.y.pWin^.eFrmType <> TK_FILTER))
@@ -23112,7 +23250,6 @@ begin
       for jAgg := 0 to pAggI2^.nFunc - 1 do
       begin
         pAggFunc := @pAggI2^.aFunc[jAgg];
-        if pAggFunc^.iOBTab    >= 0 then begin canUseAgg := False; break; end;
         if ((pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0)
            and ((pAggFunc^.pFExpr^.y.pWin = nil)
                 or (pAggFunc^.pFExpr^.y.pWin^.eFrmType <> TK_FILTER))

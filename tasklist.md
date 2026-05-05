@@ -216,22 +216,34 @@ FPC porting traps that recur often enough to call out up-front:
       aSortFlags KEYINFO_ORDER_DESC + BIGNULL inversion arm was
       already in place.
   
-  [ ] **6.24** Aggregate-with-ORDER-BY codegen (select.c
+  [X] **6.24** Aggregate-with-ORDER-BY codegen (select.c
        `analyzeAggregate` + `generateAggSelect`).  The
        ORDER-BY-inside-aggregate arm — `group_concat(val, ',' ORDER BY
-       val DESC)`, `string_agg(... ORDER BY ...)`, etc. — is not
-       honoured today; the unordered variant `group_concat(val,',')`
-       PASSes.  Distinct from 6.8.2 (constraint checks) — pure
-       SELECT-side codegen.
-       Gate: DiagWindow `group_concat ordered` (6.10 step 17(b)).
-       [ ] Per-aggregate `OrderByExpr` capture during
-            `sqlite3FuncDefRef` resolution.
-       [ ] Sorter open + key-encode in the inner-loop arm of
-            `generateAggSelect`.
-       [ ] Sorted-feed of values into the aggregate step function
-            (replaces the direct OP_AggStep path).
-       [ ] DISTINCT-aggregate variant (`count(DISTINCT x)` etc.) —
-            uses the same sorter machinery.
+       val DESC)`, `string_agg(... ORDER BY ...)`, etc. — now honoured.
+       Gate: DiagWindow `group_concat order` PASSes (closes 6.10 step
+       17(b)); 13 → 12 divergences, the remaining twelve are pure
+       window-function rows under 6.26.
+       [X] Per-aggregate `OrderByExpr` capture during
+            `sqlite3FuncDefRef` resolution — analyzeAggregate at
+            codegen.pas:21647 sets iOBTab / bOBUnique / bOBPayload /
+            bUseSubtype off `pExpr^.pLeft` (TK_ORDER) per select.c:5475.
+       [X] Sorter open + key-encode in the inner-loop arm of
+            `generateAggSelect` — iOBTab>=0 arm in
+            resetAccumulatorSimple opens the per-Func ephemeral with
+            KeyInfo from the ORDER BY exprs (+ Sequence / payload /
+            subtype extras).  Mirrors select.c:6686..6716.
+       [X] Sorted-feed of values into the aggregate step function —
+            updateAccumulatorSimple's iOBTab arm encodes ORDER-BY key
+            (+ Sequence + payload + subtypes), MakeRecord, IdxInsert
+            into iOBTab; finalizeAggFunctionsSimple Rewinds the
+            ephemeral and emits OP_AggStep per row before the
+            OP_AggFinal.  Mirrors select.c:6848..6915 + 6733..6776.
+       [X] DISTINCT-aggregate variant (`count(DISTINCT x)` etc.) —
+            already PASSed via the iDistinct OP_Found dedup path
+            already in place (DiagWindow `count distinct` /
+            `sum distinct`).  C's "same sorter machinery" wording
+            describes its own factoring; the Pas iDistinct ephemeral
+            arm at resetAccumulatorSimple covers the same ground.
 
   [~] **6.26** Window functions (window.c).
        Gate: DiagWindow — closes 6.10 step 17(c) (rank, dense_rank,
@@ -469,8 +481,9 @@ FPC porting traps that recur often enough to call out up-front:
 
   [ ] **6.10 step 17** Window-function and aggregate divergences
       surfaced by `DiagWindow`.  13 runtime empty-row divergences open.
-      [ ] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** —
-        ORDER-BY-in-aggregate not honoured.  Tracked under 6.24.
+      [X] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** —
+        Closed by 6.24.  DiagWindow `group_concat order` PASSes;
+        runtime divergence count drops 13 → 12.
       [ ] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
         prepare cleanly but emit no rows** — `row_number() OVER (...)`
         same.  Window-codegen sub-issue under 6.26.
