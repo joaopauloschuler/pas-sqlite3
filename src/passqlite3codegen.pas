@@ -1571,6 +1571,7 @@ const
   SQLITE_SkipScan       = u32($00004000);
   SQLITE_SeekScan       = u32($00020000);
   SQLITE_BloomFilter    = u32($00080000);
+  SQLITE_BloomPulldown  = u32($00100000);  { Run Bloom filters early (sqliteInt.h:1921) }
   SQLITE_OnePass        = u32($08000000);
   SQLITE_OrderBySubq    = u32($10000000);  { ORDER BY in subquery helps outer (sqliteInt.h:1930) }
   SQLITE_StarQuery      = u32($20000000);  { Star-query heuristic in computeMxChoice (sqliteInt.h:1931) }
@@ -2438,6 +2439,8 @@ procedure sqlite3ResolvePartIdxLabel(pParse: PParse; iLabel: i32);
 procedure sqlite3ColumnDefault(v: PVdbe; pTab: PTable2; i: i32; iReg: i32);
 procedure sqlite3ExprCodeGetColumnOfTable(v: PVdbe; pTab: PTable2;
   iTabCur: i32; iCol: i32; regOut: i32);
+procedure sqlite3ExprCodeLoadIndexColumn(pParse: PParse; pIdx: PIndex2;
+  iTabCur: i32; iIdxCol: i32; regOut: i32);
 procedure sqlite3Update(pParse: PParse; pTabList: PSrcList;
   pChanges: PExprList; pWhere: PExpr; onError: i32;
   pOrderBy: PExprList; pLimit: PExpr; pUpsert: PUpsert);
@@ -16156,6 +16159,200 @@ begin
   sqlite3ExprDelete(db, pPartial);
 end;
 
+{ whereCheckIfBloomFilterIsUseful — port of where.c:6622..6655.
+
+  Walks the per-level WhereLoop array and tags inner SEARCH-on-EQ loops
+  with WHERE_BLOOMFILTER when the running search count exceeds the
+  table's analyzed row estimate.  Pure analysis pass: no codegen.  The
+  matching consumers (sqlite3ConstructBloomFilter, the Bloom-aware
+  arms of OneScan) land in a follow-up commit; until then the flag is
+  set but ignored, so corpus output is unchanged.
+
+  Conditions for tagging (from the C comment block):
+    (1) loop is not the outermost (i >= 1);
+    (2) wsFlags has both WHERE_SELFCULL and WHERE_COLUMN_EQ;
+    (3) wsFlags has WHERE_IPK or WHERE_INDEXED (always true given (2));
+    (4) the running search count exceeds pTab^.nRowLogEst.
+  TF_HasStat1 must be set on every level walked so far — without it
+  the row estimate is unreliable and the loop bails out.  Every walked
+  table is also stamped with TF_MaybeReanalyze (mirrors C). }
+procedure whereCheckIfBloomFilterIsUseful(pWInfo: PWhereInfo);
+const
+  reqFlags = WHERE_SELFCULL or WHERE_COLUMN_EQ;
+var
+  i:        i32;
+  nSearch:  i16;
+  pLoop:    PWhereLoop;
+  pItem:    PSrcItem;
+  pTab:     PTable2;
+begin
+  Assert(pWInfo^.nLevel >= 2);
+  Assert(OptimizationEnabled(pWInfo^.pParse^.db, SQLITE_BloomFilter));
+  nSearch := 0;
+  for i := 0 to i32(pWInfo^.nLevel) - 1 do
+  begin
+    pLoop := whereInfoLevels(pWInfo)[i].pWLoop;
+    pItem := @SrcListItems(pWInfo^.pTabList)[pLoop^.iTab];
+    pTab  := pItem^.pSTab;
+    if (pTab^.tabFlags and TF_HasStat1) = 0 then Break;
+    pTab^.tabFlags := pTab^.tabFlags or TF_MaybeReanalyze;
+    if (i >= 1)
+       and ((pLoop^.wsFlags and reqFlags) = reqFlags)
+       and ((pLoop^.wsFlags and (WHERE_IPK or WHERE_INDEXED)) <> 0) then
+    begin
+      if nSearch > pTab^.nRowLogEst then
+      begin
+        pLoop^.wsFlags := pLoop^.wsFlags or WHERE_BLOOMFILTER;
+        pLoop^.wsFlags := pLoop^.wsFlags and (not WHERE_IDX_ONLY);
+      end;
+    end;
+    nSearch := i16(nSearch + pLoop^.nOut);
+  end;
+end;
+
+{ sqlite3ConstructBloomFilter — port of where.c:1273..1390.
+
+  Emits the OP_Once-guarded Bloom-filter build for one outer level: a Blob
+  register sized off pTab^.nRowLogEst (clamped to [10000, 10000000]),
+  followed by a Rewind/Next loop over the source table that calls
+  OP_FilterAdd with either the rowid (WHERE_IPK) or the leading nEq index
+  columns.  Inner WHERE terms that constrain only this table are folded
+  into the loop body via sqlite3ExprIfFalse so the filter accumulates
+  only matching rows.
+
+  After the outer filter is built, walks deeper levels and pulls down
+  Bloom filters whose prereq mask is already satisfied by notReady — but
+  only when SQLITE_BloomPulldown is enabled and only for plain inner
+  joins without WHERE_COLUMN_IN.  Each level that gets pulled down has
+  its WHERE_BLOOMFILTER flag cleared (so the outer construction does the
+  work once instead of the inner level repeating it).
+
+  pParse^.pIdxEpr / pIdxPartExpr are saved + nilled around the build so
+  the inner WHERE codegen does not consult an indexed-expression replacement
+  table that targets a different cursor. }
+procedure sqlite3ConstructBloomFilter(pWInfo: PWhereInfo; iLevel: i32;
+  pLevel: PWhereLevel; notReady: Bitmask);
+var
+  addrOnce, addrTop, addrCont: i32;
+  pTerm, pWCEnd:     PWhereTerm;
+  pPrs:              PParse;
+  v:                 PVdbe;
+  pLoop:             PWhereLoop;
+  iCur:              i32;
+  saved_pIdxEpr:     Pointer;
+  saved_pIdxPartExpr: Pointer;
+  pTabList:          PSrcList;
+  pItem, pTabItem:   PSrcItem;
+  pTab:              PTable2;
+  sz:                u64;
+  iSrc:              i32;
+  pIdx:              PIndex2;
+  n, jj, r1:         i32;
+begin
+  pPrs := pWInfo^.pParse;
+  v    := pPrs^.pVdbe;
+  pLoop := pLevel^.pWLoop;
+  saved_pIdxEpr      := pPrs^.pIdxEpr;
+  saved_pIdxPartExpr := pPrs^.pIdxPartExpr;
+  pPrs^.pIdxEpr      := nil;
+  pPrs^.pIdxPartExpr := nil;
+
+  Assert(pLoop <> nil);
+  Assert(v <> nil);
+  Assert((pLoop^.wsFlags and WHERE_BLOOMFILTER) <> 0);
+  Assert((pLoop^.wsFlags and WHERE_IDX_ONLY) = 0);
+
+  addrOnce := sqlite3VdbeAddOp0(v, OP_Once);
+  repeat
+    sqlite3WhereExplainBloomFilter(pPrs, pWInfo, pLevel);
+    addrCont := sqlite3VdbeMakeLabel(pPrs);
+    iCur     := pLevel^.iTabCur;
+    Inc(pPrs^.nMem);
+    pLevel^.regFilter := pPrs^.nMem;
+
+    pTabList := pWInfo^.pTabList;
+    iSrc     := i32(pLevel^.iFrom);
+    pItem    := @SrcListItems(pTabList)[iSrc];
+    Assert(pItem <> nil);
+    pTab     := pItem^.pSTab;
+    Assert(pTab <> nil);
+    sz := sqlite3LogEstToInt(pTab^.nRowLogEst);
+    if sz < 10000 then sz := 10000
+    else if sz > 10000000 then sz := 10000000;
+    sqlite3VdbeAddOp2(v, OP_Blob, i32(sz), pLevel^.regFilter);
+
+    addrTop := sqlite3VdbeAddOp1(v, OP_Rewind, iCur);
+    pWCEnd := @pWInfo^.sWC.a[pWInfo^.sWC.nTerm];
+    pTerm  := @pWInfo^.sWC.a[0];
+    while PtrUInt(pTerm) < PtrUInt(pWCEnd) do
+    begin
+      if ((pTerm^.wtFlags and TERM_VIRTUAL) = 0)
+         and (sqlite3ExprIsSingleTableConstraint(pTerm^.pExpr,
+                                                 pTabList, iSrc, 0) <> 0) then
+      begin
+        sqlite3ExprIfFalse(pPrs, pTerm^.pExpr, addrCont, SQLITE_JUMPIFNULL);
+      end;
+      pTerm := PWhereTerm(PtrUInt(pTerm) + SizeOf(TWhereTerm));
+    end;
+    if (pLoop^.wsFlags and WHERE_IPK) <> 0 then
+    begin
+      r1 := sqlite3GetTempReg(pPrs);
+      sqlite3VdbeAddOp2(v, OP_Rowid, iCur, r1);
+      sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pLevel^.regFilter, 0, r1, 1);
+      sqlite3ReleaseTempReg(pPrs, r1);
+    end
+    else
+    begin
+      pIdx := pLoop^.u.btree.pIndex;
+      n    := i32(pLoop^.u.btree.nEq);
+      r1   := sqlite3GetTempRange(pPrs, n);
+      for jj := 0 to n - 1 do
+      begin
+        Assert(pIdx^.pTable = pItem^.pSTab);
+        sqlite3ExprCodeLoadIndexColumn(pPrs, pIdx, iCur, jj, r1 + jj);
+      end;
+      sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pLevel^.regFilter, 0, r1, n);
+      sqlite3ReleaseTempRange(pPrs, r1, n);
+    end;
+    sqlite3VdbeResolveLabel(v, addrCont);
+    sqlite3VdbeAddOp2(v, OP_Next, pLevel^.iTabCur, addrTop + 1);
+    sqlite3VdbeJumpHere(v, addrTop);
+    pLoop^.wsFlags := pLoop^.wsFlags and (not WHERE_BLOOMFILTER);
+    if OptimizationDisabled(pPrs^.db, SQLITE_BloomPulldown) then Break;
+
+    { Bloom-filter pull-down: walk deeper levels for an EQ-only inner
+      candidate whose prereq is already satisfied. }
+    Inc(iLevel);
+    while iLevel < i32(pWInfo^.nLevel) do
+    begin
+      pLevel   := @whereInfoLevels(pWInfo)[iLevel];
+      pTabItem := @SrcListItems(pWInfo^.pTabList)[pLevel^.iFrom];
+      if (pTabItem^.fg.jointype and (JT_LEFT or JT_LTORJ)) <> 0 then
+      begin
+        Inc(iLevel);
+        Continue;
+      end;
+      pLoop := pLevel^.pWLoop;
+      if pLoop = nil then
+      begin
+        Inc(iLevel);
+        Continue;
+      end;
+      if (pLoop^.prereq and notReady) <> 0 then
+      begin
+        Inc(iLevel);
+        Continue;
+      end;
+      if (pLoop^.wsFlags and (WHERE_BLOOMFILTER or WHERE_COLUMN_IN))
+         = WHERE_BLOOMFILTER then Break;
+      Inc(iLevel);
+    end;
+  until iLevel >= i32(pWInfo^.nLevel);
+  sqlite3VdbeJumpHere(v, addrOnce);
+  pPrs^.pIdxEpr      := saved_pIdxEpr;
+  pPrs^.pIdxPartExpr := saved_pIdxPartExpr;
+end;
+
 { Phase 6.9-bis step 11g.2.b — productive sqlite3WhereBegin prologue.
 
   Faithful port of where.c:6828..6993 — every line up to (but not including)
@@ -16544,6 +16741,16 @@ begin
       Exit(nil);
     end;
 
+    { where.c:7184..7188 — Bloom-filter eligibility pass.  Only meaningful
+      for joins of 2+ tables and only when the optimisation is enabled.
+      Sets WHERE_BLOOMFILTER on inner EQ-search loops whose target table is
+      smaller than the running outer-loop row estimate; the flag is consumed
+      by sqlite3ConstructBloomFilter (not yet productively reachable, so
+      this call is a no-op for the corpus today). }
+    if (pWInfo^.nLevel >= 2)
+       and OptimizationEnabled(db, SQLITE_BloomFilter) then
+      whereCheckIfBloomFilterIsUseful(pWInfo);
+
     { where.c:7197 — accumulate row-count estimate. }
     pParse^.nQueryLoop := i16(pParse^.nQueryLoop + pWInfo^.nRowOut);
 
@@ -16642,8 +16849,9 @@ begin
       if (pLoop^.wsFlags and (WHERE_AUTO_INDEX or WHERE_BLOOMFILTER)) <> 0 then
       begin
         if (pLoop^.wsFlags and WHERE_AUTO_INDEX) <> 0 then
-          constructAutomaticIndex(pParse, @pWInfo^.sWC, notReady, pLevel);
-        { WHERE_BLOOMFILTER-only path deferred (not exercised by corpus). }
+          constructAutomaticIndex(pParse, @pWInfo^.sWC, notReady, pLevel)
+        else
+          sqlite3ConstructBloomFilter(pWInfo, ii, pLevel, notReady);
         if db^.mallocFailed <> 0 then
         begin
           whereInfoFree(db, pWInfo);

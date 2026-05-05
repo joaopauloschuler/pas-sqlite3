@@ -83,9 +83,12 @@ FPC porting traps that recur often enough to call out up-front:
           recursion, virtual tables, viaCoroutine, INDEXED BY / NOT
           INDEXED).
      [X] `not indexed` / `INDEXED BY` honour (DiagIndexing PASS).
-     [ ] Multi-table loop nesting + per-loop WHERE-clause splitting
-          — TestExplainParity now at 1025/1026; remaining row is the
-          INSERT VALUES coroutine (6.10 step 6).
+     [X] Multi-table loop nesting + per-loop WHERE-clause splitting
+          — sqlite3WhereBegin iterates `for ii := 0 to nTabList - 1`
+          (codegen.pas:16561, 16631) driving codeOneLoopStart per
+          level; TestExplainParity 1025/1026 with the only remaining
+          divergence being the INSERT VALUES coroutine (tracked under
+          6.10 step 6, unrelated to WHERE).
      [ ] Bloom-filter and covering-index arms (covers 6.10 step 9
           d-INNER).
 
