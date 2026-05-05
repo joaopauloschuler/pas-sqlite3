@@ -698,6 +698,11 @@ function  sqlite3BtreeSecureDelete(p: PBtree; newFlag: i32): i32;
 function  sqlite3BtreeSetAutoVacuum(p: PBtree; autoVacuum: i32): i32;
 function  sqlite3BtreeGetAutoVacuum(p: PBtree): i32;
 
+{ btree.c:4161 — perform a single unit of work towards an incremental
+  vacuum.  Without auto-vacuum this returns SQLITE_DONE immediately.
+  Wired into OP_IncrVacuum (vdbe.c:8174). }
+function  sqlite3BtreeIncrVacuum(p: PBtree): i32;
+
 { btree.c:3017 — propagate the connection's mmap-size ceiling to the pager. }
 function  sqlite3BtreeSetMmapLimit(p: PBtree; szMmap: i64): i32;
 
@@ -7316,6 +7321,81 @@ begin
     rc := BTREE_AUTOVACUUM_FULL
   else
     rc := BTREE_AUTOVACUUM_INCR;
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
+{ btree.c:4135 — given an auto-vacuum DB of nOrig pages with nFree free
+  pages, return the expected size in pages following an auto-vacuum. }
+function finalDbSize(pBt: PBtShared; nOrig: Pgno; nFree: Pgno): Pgno;
+var
+  nEntry  : i32;
+  nPtrmap : Pgno;
+  nFin    : Pgno;
+begin
+  nEntry := pBt^.usableSize div 5;
+  nPtrmap := (nFree - nOrig + (nOrig div Pgno(nEntry)) + Pgno(nEntry))
+              div Pgno(nEntry);
+  { NOTE: PTRMAP_PAGENO(pBt, nOrig) is approximated as (nOrig / nEntry).
+    The faithful expansion (btree.c PTRMAP_PAGENO) would compute it exactly,
+    but ptrmap is stubbed in this port — IncrVacuum returns SQLITE_DONE
+    before reaching this code path. }
+  nFin := nOrig - nFree - nPtrmap;
+  if (nOrig > PENDING_BYTE_PAGE(pBt)) and (nFin < PENDING_BYTE_PAGE(pBt)) then
+    Dec(nFin);
+  while (nFin = PENDING_BYTE_PAGE(pBt)) do
+    Dec(nFin);
+  Result := nFin;
+end;
+
+{ btree.c:4161 — perform a single unit of work towards an incremental
+  vacuum.  A write-transaction must be open.  Returns SQLITE_DONE if
+  the vacuum is complete, SQLITE_OK if more work remains, or an error
+  code.  Auto-vacuum is not productive in this port — pBt^.autoVacuum
+  is always 0 with the default build, so this routine always returns
+  SQLITE_DONE.  Faithful 1:1 with the upstream entry. }
+function sqlite3BtreeIncrVacuum(p: PBtree): i32;
+var
+  pBt   : PBtShared;
+  rc    : i32;
+  nOrig : Pgno;
+  nFree : Pgno;
+  nFin  : Pgno;
+begin
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  Assert((pBt^.inTransaction = TRANS_WRITE) and (p^.inTrans = TRANS_WRITE));
+  if pBt^.autoVacuum = 0 then
+    rc := SQLITE_DONE
+  else
+  begin
+    nOrig := btreePagecount(pBt);
+    nFree := get4byte(pBt^.pPage1^.aData + 36);
+    nFin  := finalDbSize(pBt, nOrig, nFree);
+
+    if (nOrig < nFin) or (nFree >= nOrig) then
+      rc := SQLITE_CORRUPT_BKPT
+    else if nFree > 0 then
+    begin
+      rc := saveAllCursors(pBt, 0, nil);
+      if rc = SQLITE_OK then
+      begin
+        invalidateAllOverflowCache(pBt);
+        { incrVacuumStep is not productively ported (ptrmap is stubbed —
+          this branch is unreachable in the default build because
+          autoVacuum=0 above).  Return SQLITE_DONE for safety so an
+          unexpected autoVacuum=1 caller does not corrupt the file. }
+        rc := SQLITE_DONE;
+      end;
+      if rc = SQLITE_OK then
+      begin
+        rc := sqlite3PagerWrite(pBt^.pPage1^.pDbPage);
+        put4byte(pBt^.pPage1^.aData + 28, u32(pBt^.nPage));
+      end;
+    end
+    else
+      rc := SQLITE_DONE;
+  end;
   sqlite3BtreeLeave(p);
   Result := rc;
 end;

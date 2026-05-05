@@ -418,6 +418,8 @@ function  sqlite3PagerRollback(pPager: PPager): i32;
 function  sqlite3PagerOpenSavepoint(pPager: PPager; nSavepoint: i32): i32;
 function  sqlite3PagerSavepoint(pPager: PPager; op: i32; iSavepoint: i32): i32;
 function  sqlite3PagerFlush(pPager: PPager): i32;
+function  sqlite3PagerMovepage(pPager: PPager; pPg: PDbPage; pgno: Pgno;
+                               isCommit: i32): i32;
 procedure sqlite3PagerTruncateImage(pPager: PPager; nPage: Pgno);
 function  sqlite3PagerCacheStat(pPager: PPager; eStat: i32; reset: i32): u64;
 function  sqlite3PagerMemUsed(pPager: PPager): i32;
@@ -4705,6 +4707,80 @@ begin
     end;
   end;
   Result := rc;
+end;
+
+{ pager.c:7158 — Move open database page pPg to location pgno.
+  Faithful 1:1 port of sqlite3PagerMovepage.  The pPg reference
+  remains valid across the move.  See pager.c for full comments. }
+function sqlite3PagerMovepage(pPager: PPager; pPg: PDbPage; pgno: Pgno;
+                              isCommit: i32): i32;
+var
+  pPgOld    : PDbPage;
+  needSyncPgno : Pgno;
+  rc        : i32;
+  origPgno  : Pgno;
+  pPgHdr    : PDbPage;
+begin
+  needSyncPgno := 0;
+
+  if pPager^.tempFile <> 0 then
+  begin
+    rc := sqlite3PagerWrite(pPg);
+    if rc <> SQLITE_OK then Exit(rc);
+  end;
+
+  if ((pPg^.flags and PGHDR_DIRTY) <> 0) then
+  begin
+    rc := subjournalPageIfRequired(pPg);
+    if rc <> SQLITE_OK then Exit(rc);
+  end;
+
+  if ((pPg^.flags and PGHDR_NEED_SYNC) <> 0) and (isCommit = 0) then
+    needSyncPgno := pPg^.pgno;
+
+  pPg^.flags := pPg^.flags and (not PGHDR_NEED_SYNC);
+  pPgOld := sqlite3PagerLookup(pPager, pgno);
+  if pPgOld <> nil then
+  begin
+    if pPgOld^.nRef > 1 then
+    begin
+      sqlite3PagerUnrefNotNull(pPgOld);
+      Exit(SQLITE_CORRUPT);
+    end;
+    pPg^.flags := pPg^.flags or (pPgOld^.flags and PGHDR_NEED_SYNC);
+    if pPager^.tempFile <> 0 then
+      sqlite3PcacheMove(pPgOld, pPager^.dbSize + 1)
+    else
+      sqlite3PcacheDrop(pPgOld);
+  end;
+
+  origPgno := pPg^.pgno;
+  sqlite3PcacheMove(pPg, pgno);
+  sqlite3PcacheMakeDirty(pPg);
+
+  if (pPager^.tempFile <> 0) and (pPgOld <> nil) then
+  begin
+    sqlite3PcacheMove(pPgOld, origPgno);
+    sqlite3PagerUnrefNotNull(pPgOld);
+  end;
+
+  if needSyncPgno <> 0 then
+  begin
+    pPgHdr := nil;
+    rc := sqlite3PagerGet(pPager, needSyncPgno, @pPgHdr, 0);
+    if rc <> SQLITE_OK then
+    begin
+      if (needSyncPgno <= pPager^.dbOrigSize) and (pPager^.pTmpSpace <> nil) then
+        sqlite3BitvecClear(pPager^.pInJournal, needSyncPgno,
+                           pPager^.pTmpSpace);
+      Exit(rc);
+    end;
+    pPgHdr^.flags := pPgHdr^.flags or PGHDR_NEED_SYNC;
+    sqlite3PcacheMakeDirty(pPgHdr);
+    sqlite3PagerUnrefNotNull(pPgHdr);
+  end;
+
+  Result := SQLITE_OK;
 end;
 
 { pager.c: sqlite3PagerTruncateImage }

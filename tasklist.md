@@ -300,6 +300,15 @@ FPC porting traps that recur often enough to call out up-front:
        [~] OP_Vacuum — wired to vdbeRunVacuum hook (sqlite3RunVacuum
             ported in passqlite3main.pas).  End-to-end completion gated
             on Phase 7.1.1 schema reload after ATTACH (see 6.27).
+       [X] Port `sqlite3BtreeIncrVacuum` (btree.c:4161) + `finalDbSize`
+            (btree.c:4135) + `sqlite3PagerMovepage` (pager.c:7158).
+            OP_IncrVacuum (vdbe.c:8174) now calls the real btree entry
+            instead of unconditionally taking the jump.  With the default
+            build (autoVacuum=0) the entry returns SQLITE_DONE on the
+            first step — same observable behaviour as the prior stub
+            but matching the upstream call shape.  incrVacuumStep /
+            relocatePage / modifyPagePointer not ported (gated on a
+            productive ptrmap that this port doesn't have).
        [X] Port `sqlite3VdbeFindIndexKey` + `vdbeIsMatchingIndexKey` +
             `vdbeSkipField` (vdbeaux.c:5400..5615).  Body lives in
             passqlite3codegen (TIndex layout not visible to vdbe.pas);

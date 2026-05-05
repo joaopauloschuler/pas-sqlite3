@@ -10137,9 +10137,20 @@ begin
       pCur^.nullRow := 0;
     end;
 
-    { ────── OP_IncrVacuum ────── — stub }
+    { ────── OP_IncrVacuum ────── (vdbe.c:8174) — single step of an
+      incremental vacuum on db P1.  Jumps to P2 when the vacuum is
+      complete (SQLITE_DONE).  Faithful 1:1 with the upstream arm. }
     OP_IncrVacuum: begin
-      goto jump_to_p2;
+      Assert((pOp^.p1 >= 0) and (pOp^.p1 < db^.nDb));
+      Assert((v^.vdbeFlags and VDBF_ReadOnly) = 0);
+      pX := db^.aDb[pOp^.p1].pBt;
+      rc := sqlite3BtreeIncrVacuum(pX);
+      if rc <> SQLITE_OK then
+      begin
+        if rc <> SQLITE_DONE then goto abort_due_to_error;
+        rc := SQLITE_OK;
+        goto jump_to_p2;
+      end;
     end;
 
     { ────── OP_Abortable ────── (vdbe.c:9150) — debug-only, no-op in release }
