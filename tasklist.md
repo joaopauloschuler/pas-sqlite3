@@ -75,22 +75,19 @@ FPC porting traps that recur often enough to call out up-front:
 - [~] **6.8.4** port `sqlite3WhereBegin` (where.c).
      Gate: TestExplainParity SELECT-WHERE corpus + DiagIndexing
      `indexed by ok` / `not indexed` (closes 6.10 step 26(e)).
-     [X] Allocate `WhereInfo` + per-loop `WhereLevel` array
-          (codegen.pas:15243..15280).
+     [X] Allocate `WhereInfo` + per-loop `WhereLevel` array.
      [X] Drive `whereLoopAddAll` + `wherePathSolver` for the
-          cost-based plan (codegen.pas:15429..15454).
+          cost-based plan.
      [X] Single-table fast path: every shape whereShortCut bails on
           now routes through codeOneLoopStart (WHERE_OR_SUBCLAUSE
           recursion, virtual tables, viaCoroutine, INDEXED BY / NOT
           INDEXED).
      [X] `not indexed` / `INDEXED BY` honour (DiagIndexing PASS).
      [ ] Multi-table loop nesting + per-loop WHERE-clause splitting
-          (codeOneLoopStart already supports it; corpus parity
-          deferred — TestExplainParity multi-table rows still
-          mostly diverging on join-order / explain-text edges).
+          — TestExplainParity now at 1025/1026; remaining row is the
+          INSERT VALUES coroutine (6.10 step 6).
      [ ] Bloom-filter and covering-index arms (covers 6.10 step 9
-          d-INNER).  `SELECT p FROM u` planner Δ — closed under
-          6.10 step 6.
+          d-INNER).
 
 - [~] **6.8.6** port the productive `sqlite3Insert` body (insert.c).
      Single-row VALUES path DONE.  Inline four-op shortcut replaced
@@ -326,20 +323,13 @@ FPC porting traps that recur often enough to call out up-front:
   
   [X] **6.10 step 7** `DiagMisc` runtime divergences
 
-  [~] **6.10 step 8** EQP P4 text now wired on OP_Explain.
-      sqlite3WhereAddExplainText is invoked from
-      sqlite3WhereExplainOneScan (codegen.pas:48437).  TestExplainParity
-      stays at 1025/1026 (P4 is stripped from the diff); no Diag
-      regressions.  The previously-reported AV root-caused at
-      `pIdx^.zName` deref (codegen.pas:48624) — the C reference asserts
-      `pLoop->u.btree.pIndex!=0` here but the Pas planner has a residual
-      gap on the autoindex / scan stand-in path where pIndex stays nil
-      (the 6.10 step 6 `SELECT p FROM u` fix lifted whereShortCut's
-      synthetic stand-in).  Workaround: bail with a freed partial buffer
-      when pIdx=nil (codegen.pas:48613..48618).
-      [ ] Chase the planner gap so pIndex is populated on every
-           non-IPK/non-vtab btree loop, then convert the nil guard
-           back to an Assert.
+  [~] **6.10 step 8** EQP P4 text wired on OP_Explain via
+      sqlite3WhereAddExplainText.  TestExplainParity stays at 1025/1026
+      (P4 stripped from the diff); no Diag regressions.
+      [ ] Chase the residual planner gap on the autoindex / scan
+           stand-in path so `pLoop->u.btree.pIndex` is populated on every
+           non-IPK/non-vtab btree loop, then convert the nil guard in
+           sqlite3WhereAddExplainText back to an Assert (matches C).
 
   [ ] **6.10 step 9** Runtime divergences surfaced by
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src

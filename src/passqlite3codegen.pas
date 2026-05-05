@@ -48407,16 +48407,13 @@ var
   addr: i32;
   pTop: PParse;
 begin
-  { Phase 6.10 step 7 — port of wherecode.c:245..268.  The C oracle is
+  { Phase 6.10 steps 7 + 8 — port of wherecode.c:245..268.  The C oracle is
     built with SQLITE_DEBUG, which short-circuits the explain==2 /
     scanstatus gate so OP_Explain is always emitted for non-OR-subclause,
-    non-MULTI_OR scans.  Match that behaviour: emit OP_Explain p1=addr,
-    p2=pParse^.addrExplain, p3=pLevel^.pWLoop^.rRun.  P4 (the EQP text
-    string) stays NULL for now — sqlite3WhereAddExplainText is fully
-    ported but wiring it from this site has surfaced a layout-sensitive
-    AV (TSrcItem fg.fgBits3 access path); revisit alongside an EQP-text
-    test corpus.  TestExplainParity diffs only opcode/p1/p2/p3/p5, so
-    this is enough to close op-count parity on single-table scan rows.
+    non-MULTI_OR scans.  Emit OP_Explain p1=addr, p2=pParse^.addrExplain,
+    p3=pLevel^.pWLoop^.rRun, then call sqlite3WhereAddExplainText to
+    back-patch the rendered "SCAN/SEARCH … USING …" P4 string (TestExplain-
+    Parity strips P4 from the diff so the call costs nothing for the gate).
 
     Suppressed for OR-subclauses (WHERE_OR_SUBCLAUSE) and MULTI_OR
     composite plans, matching the C-side gate. }
