@@ -2323,18 +2323,13 @@ const
 { from the CREATE VIRTUAL TABLE clause and (when init.busy=1) insert the    }
 { table into its schema.                                                     }
 {                                                                            }
-{ Dependency note: the real sqlite3StartTable in passqlite3codegen is still }
-{ a Phase 7 stub, so pParse^.pNewTable will currently be nil after          }
-{ sqlite3VtabBeginParse returns.  Each helper below early-returns on a nil  }
-{ pNewTable, mirroring the C body's first guard, so the port is structurally}
-{ complete and will become observably useful as soon as StartTable lands.   }
 { The TestVtab gate exercises the leaf helpers directly with a manually-    }
 { constructed TTable, validating the azArg accumulation contract.            }
 {                                                                            }
-{ The init.busy=0 branch of FinishParse depends on sqlite3MPrintf and the   }
-{ sqlite3NestedParse stub (both Phase-7 deferred).  Until those land, the   }
-{ branch is preserved as a TODO comment; the init.busy=1 in-memory schema   }
-{ insertion path is fully ported.                                            }
+{ Both branches of FinishParse are now productive: init.busy=0 dispatches    }
+{ to sqlite3VtabFinishCreateOps (codegen.pas) for the UPDATE sqlite_schema / }
+{ OP_Expire / OP_ParseSchema / OP_VCreate sequence; init.busy=1 installs the }
+{ table in the in-memory schema cache via sqlite3HashInsert.                 }
 
 procedure addModuleArgument(pPse: PParse; pTable: PTable2; zArg: PAnsiChar);
 var
@@ -2430,17 +2425,10 @@ begin
   if pTab^.u.vtab.nArg < 1 then Exit;
 
   if db^.init.busy = 0 then begin
-    { Phase 6.bis.4b: the printf engine has landed, so the                 }
-    { sqlite3MPrintf("CREATE VIRTUAL TABLE %T", &sNameToken) call below    }
-    { is now real (was a TODO blocked on Phase 6.bis.4a).  The remaining   }
-    { wiring — sqlite3NestedParse to UPDATE sqlite_schema, then            }
-    { OP_Expire / sqlite3VdbeAddParseSchemaOp / OP_VCreate — still depends }
-    { on Phase-7 codegen helpers (sqlite3NestedParse, sqlite3GetVdbe,      }
-    { sqlite3ChangeCookie, sqlite3VdbeAddParseSchemaOp, sqlite3VdbeLoadString),
-      which are all stubs at this point.  We therefore compute zStmt to    }
-    { exercise the printf wiring (and to verify the %T conversion against  }
-    { the live parser-emitted sNameToken) and free it immediately; the     }
-    { schema-update side-effects land in the next sub-phase.              }
+    { Productive port of vtab.c:463..510.  sqlite3VtabFinishCreateOps
+      (codegen.pas) emits the UPDATE sqlite_schema row, OP_Expire,
+      OP_ParseSchema reload, and OP_VCreate sequence.  Lives in codegen
+      because PVdbe is not visible to this unit. }
     sqlite3MayAbort(pPse);
 
     if pEnd <> nil then begin
@@ -2449,7 +2437,7 @@ begin
     end;
     zStmt := sqlite3MPrintf(Psqlite3db(db),
                             'CREATE VIRTUAL TABLE %T', [@pPse^.sNameToken]);
-    if zStmt <> nil then sqlite3DbFree(Psqlite3db(db), zStmt);
+    sqlite3VtabFinishCreateOps(pPse, pTab, zStmt);
   end else begin
     { Re-reading sqlite_schema: install the table in the in-memory schema. }
     pSchemaT := passqlite3util.PSchema(pTab^.pSchema);

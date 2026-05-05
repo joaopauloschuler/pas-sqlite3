@@ -2849,6 +2849,15 @@ procedure sqlite3FinishCoding(pParse: PParse);
 procedure sqlite3NestedParse(pParse: PParse; zFormat: PAnsiChar;
   const args: array of const);
 
+{ vtab.c:447..512 — productive arm of sqlite3VtabFinishParse for the
+  init.busy=0 case.  Emits the UPDATE sqlite_schema row, the OP_Expire /
+  OP_VCreate sequence, and the OP_ParseSchema reload op.  Caller owns
+  zStmt before the call; the helper takes ownership and frees it on
+  exit.  Lives in codegen because it touches PVdbe ops, which the parser
+  unit cannot see (PParse type clash). }
+procedure sqlite3VtabFinishCreateOps(pParse: PParse; pTab: PTable2;
+  zStmt: PAnsiChar);
+
 { Hook installed by passqlite3parser to dispatch the recursive parse.
   Until the parser unit's initialization runs, this stays nil and
   sqlite3NestedParse becomes a no-op once it has formatted the SQL.
@@ -50250,6 +50259,72 @@ begin
 
   pRes^  := res;
   Result := rc;
+end;
+
+{ ---------------------------------------------------------------------------
+  sqlite3VtabFinishCreateOps — vtab.c:463..510 productive arm.
+
+  Emits, for `CREATE VIRTUAL TABLE` (init.busy=0):
+    1. UPDATE %Q.sqlite_schema SET type='table',name=%Q,tbl_name=%Q,
+       rootpage=0,sql=%Q WHERE rowid=#%d  (via sqlite3NestedParse —
+       fills in the placeholder schema row that sqlite3StartTable
+       allocated at pParse^.u1.cr.regRowid).
+    2. sqlite3ChangeCookie — bumps the schema cookie so any other
+       connection re-reads.
+    3. OP_Expire — invalidate prepared statements that referenced the
+       (formerly absent) virtual table.
+    4. OP_ParseSchema with zWhere "name=%Q AND sql=%Q" so the new row
+       is loaded into the in-memory schema cache after the UPDATE
+       commits.
+    5. OP_VCreate (iDb, regName) — invoke the module's xCreate at
+       runtime against the newly registered table name.
+
+  Takes ownership of zStmt (frees on exit, matching C's
+  sqlite3DbFree(db, zStmt) at vtab.c:506).
+  --------------------------------------------------------------------------- }
+procedure sqlite3VtabFinishCreateOps(pParse: PParse; pTab: PTable2;
+  zStmt: PAnsiChar);
+var
+  db:     PTsqlite3;
+  v:      PVdbe;
+  iDb:    i32;
+  iReg:   i32;
+  zWhere: PAnsiChar;
+begin
+  if (pParse = nil) or (pTab = nil) or (zStmt = nil) then Exit;
+  db := pParse^.db;
+  v  := sqlite3GetVdbe(pParse);
+  if v = nil then begin
+    sqlite3DbFree(db, zStmt);
+    Exit;
+  end;
+  iDb := sqlite3SchemaToIndex(db, pTab^.pSchema);
+  if iDb < 0 then begin
+    sqlite3DbFree(db, zStmt);
+    Exit;
+  end;
+
+  sqlite3NestedParse(pParse,
+    'UPDATE %Q.' + LEGACY_SCHEMA_TABLE +
+      ' SET type=''table'', name=%Q, tbl_name=%Q, rootpage=0, sql=%Q' +
+      ' WHERE rowid=#%d',
+    [db^.aDb[iDb].zDbSName, pTab^.zName, pTab^.zName, zStmt,
+     pParse^.u1.cr.regRowid]);
+
+  sqlite3ChangeCookie(pParse, iDb);
+
+  sqlite3VdbeAddOp0(v, OP_Expire);
+
+  zWhere := sqlite3MPrintf(db, 'name=%Q AND sql=%Q', [pTab^.zName, zStmt]);
+  sqlite3VdbeAddParseSchemaOp(v, iDb, zWhere, 0);
+  { sqlite3VdbeAddParseSchemaOp takes ownership of zWhere; see vdbeaux.c. }
+
+  sqlite3DbFree(db, zStmt);
+
+  Inc(pParse^.nMem);
+  iReg := pParse^.nMem;
+  sqlite3VdbeLoadString(v, iReg, pTab^.zName);
+  sqlite3VdbeAddOp2(v, OP_VCreate, iDb, iReg);
 end;
 
 initialization

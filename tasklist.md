@@ -362,6 +362,15 @@ FPC porting traps that recur often enough to call out up-front:
             up each Table*'s VTable* via `sqlite3GetVTable`, and
             emits OP_VBegin with P4_VTAB.  Replaces the "no-op until
             apVtabLock is properly typed" placeholder.
+       [X] Port `sqlite3VtabFinishParse` init.busy=0 productive arm
+            (vtab.c:463..510).  New helper `sqlite3VtabFinishCreateOps`
+            in codegen.pas emits the UPDATE sqlite_schema row,
+            sqlite3ChangeCookie, OP_Expire, OP_ParseSchema reload, and
+            OP_VCreate sequence.  Replaces the long-standing TODO
+            stub in passqlite3parser.pas that only formatted zStmt
+            and freed it.  End-to-end CREATE VIRTUAL TABLE runtime
+            still gated on Phase 7.1.1 schema-row INSERT/UPDATE wiring
+            (sqlite_schema mutations emit ops but rows do not persist).
 
 ### Open Bugs
 
@@ -402,30 +411,15 @@ FPC porting traps that recur often enough to call out up-front:
 
   [ ] **6.10 step 8** EQP P4 text not emitted on OP_Explain.
       sqlite3WhereAddExplainText is fully ported but cannot be wired
-      from sqlite3WhereExplainOneScan today.  2026-05-05 audit:
-      re-enabling the call (`if pTabList<>nil then AddExplainText(...)`)
-      produces an immediate EAccessViolation at the very first SQL on
-      both TestExplainParity and TestSelectBasic T11 (sqlite3MaterializeView
-      driver).  The AV happens inside emitSrcItem (passqlite3printf.pas:455)
-      via the `%S` formatter, which dereferences pItem^.zName / zAlias /
-      fg.fgBits / u4_ptr through the TSrcItemBlit overlay.  TSrcItem and
-      TSrcItemBlit offsets line up with the C SrcItem (zName=0, zAlias=8,
-      pSTab=16, jointype=24, fgBits=25, fgBits2=26, fgBits3=27, iCursor=28,
-      colUsed=32, u1.nRow=40, u2=48, u3=56, u4=64).  Likely culprits to
-      investigate next: (a) the `array of const` marshalling in
-      sqlite3_str_appendf — `[pItem]` may be passed as `vtObject` rather
-      than `vtPointer`, so NextArgPtr reads past the TVarRec; the working
-      sqlite3WhereExplainBloomFilter call site uses the same shape but
-      passes an already-validated pItem from pWInfo^.pTabList rather than
-      via the OneScan dispatch chain; (b) pParse^.addrExplain may need
-      sqlite3VdbeExplainParent treatment first; (c) sqlite3MaterializeView
-      synthesises a SrcList where pSrcItem^.pSTab is nil at the moment
-      OneScan fires (only zName is set), and emitSrcItem's u4_ptr deref
-      fires when fg_bits has neither fixedSchema nor isSubquery — that
-      arm reads u4_ptr as PAnsiChar zDatabase and calls AnsiString(...)
-      on the (potentially garbage) word.  TestExplainParity excludes P4
-      from its diff so the regression is masked there, but EXPLAIN QUERY
-      PLAN text and any future EQP corpus need this resolved.
+      from sqlite3WhereExplainOneScan — re-enabling produces an
+      EAccessViolation inside emitSrcItem (passqlite3printf.pas:455)
+      via the `%S` formatter dereferencing pItem^.zName/zAlias/fgBits/
+      u4_ptr.  TSrcItem layout matches C SrcItem (verified offsets).
+      Likely culprits: (a) `[pItem]` marshalled as vtObject rather than
+      vtPointer in sqlite3_str_appendf; (b) sqlite3MaterializeView
+      synthesises a SrcList where pSrcItem^.pSTab is nil so emitSrcItem's
+      u4_ptr-as-zDatabase arm reads garbage.  TestExplainParity excludes
+      P4 so the regression is masked there; needed for EQP corpus.
 
   [ ] **6.10 step 9** Runtime divergences surfaced by
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
@@ -465,87 +459,32 @@ FPC porting traps that recur often enough to call out up-front:
             Companion fix: recursiveInnerLoop's SRT_EphemTab/SRT_Table
             arm allocated NewRowid into r1+1 (collision risk); now uses
             two GetTempReg calls matching select.c:1346..1349.
-        [~] Runtime parity gap — `WITH RECURSIVE r(n) AS (SELECT 1
-            UNION ALL SELECT n+1 FROM r WHERE n<5) SELECT count(*) FROM
-            r` now returns 1 (anchor row emits), C: 5.  Anchor setup
-            now emits because:
-              - sqlite3Select gate accepts SRT_Fifo / SRT_DistFifo
-                destinations (codegen.pas:22112, plus disposal arm
-                under the SRT_EphemTab branch).
-              - No-FROM fast path accepts SRT_Fifo / SRT_DistFifo
-                (codegen.pas:22198) and emits MakeRecord+NewRowid+
-                Insert (with optional dedup IdxInsert at iSDParm+1).
-              - SF_Compound is cleared on pSetup / pFirstRec around
-                the inner sqlite3Select calls inside generate-
-                WithRecursiveQuery so the no-FROM / regular gates fire.
-            Recursive step (`SELECT n+1 FROM r WHERE n<5` against the
-            iCurrent pseudo-cursor) still bails — the regular SELECT
-            path bails at the TF_Ephemeral check (codegen.pas:23367)
-            on r's synthesized table.  WhereBegin's isRecursive arm at
-            codegen.pas:18231 already emits OP_Noop in case 6 (correct).
-            2026-05-05 audit (a3): narrowing the bail to skip when
-            `fg.fgBits and $80` (isRecursive bit) is set lets DiagFeatureProbe
-            reach the scan body but immediately AVs at runtime — DiagFeatureProbe
-            "CTE recursive" raises EAccessViolation before any other diagnostics
-            print, so the AV is upstream of the emission of OP_Noop.  Likely
-            culprits: (a) pTab^.aCol / nCol on the synthetic recursive table is
-            still partially populated so OP_Column resolution dereferences
-            through a stale Column*; (b) the per-row push-down WHERE walk
-            (codegen.pas:18272) tries to evaluate `n<5` against iCurrent
-            without the column-cache rewriting expected by C wherecode.c
-            ("isRecursive" branch around line 2568); (c) sqlite3GenerateColumnNames
-            for the outer SELECT may dereference items[i].pExpr.y.pTab where
-            pTab is freed when SF_Compound is cleared.  Reproducer: lift the
-            bail with `if (fgBits and $80) = 0` guard, then run
-            `LD_LIBRARY_PATH=src bin/DiagFeatureProbe`.
+        [~] Runtime parity gap — anchor row emits (`count(*) FROM r`
+            returns 1, C returns 5).  Recursive step bails at
+            sqlite3Select's TF_Ephemeral check (codegen.pas:23367) on
+            r's synthesized table.  Lifting the bail when isRecursive
+            bit ($80) is set reaches the scan body but AVs at runtime;
+            likely culprit is incomplete pTab^.aCol/nCol on the
+            synthetic recursive table or missing column-cache rewriting
+            (C's wherecode.c isRecursive arm) for refs against iCurrent.
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
 
   [ ] **6.10 step 15** Runtime divergences surfaced by `DiagTxn`
       (transactions, savepoints, conflict resolution).  2 remain.
-      [ ] **b) `BEGIN; ...; ROLLBACK` does not roll back** — pinned
-        2026-05-05 (a3) to a memdb-only pcache regression in
-        sqlite3PagerWrite's early-return arm (passqlite3pager.pas:4327).
-        Traced via temporary printf in pager_write / sqlite3PagerWrite /
-        pager_end_transaction / pagerAddPageToRollbackJournal /
-        sqlite3RollbackAll on the DiagTxn `begin rollback insert` corpus
-        (CREATE+INSERT(1)+BEGIN+INSERT(2)+ROLLBACK against
-        `:memory:`).  Sequence observed:
-          1. CREATE TABLE: inner pager_write journals nothing
-             (dbOrigSize=0); pages 1+2 acquire flags=0xE
-             (DIRTY|WRITEABLE|NEED_SYNC).
-          2. CREATE TABLE auto-commit fires pager_end_transaction
-             (bCommit=1); PcacheCleanAll clears flags → 0x01.
-          3. INSERT(1) opens fresh journal (dbOrigSize=2);
-             pagerAddPageToRollbackJournal records pgno=2; flags 0xE.
-          4. INSERT(1) auto-commit → **second pager_end_transaction
-             never observed** in the trace, so PcacheCleanAll does not
-             run, and page 2 keeps flags=0xE into the next txn.
-          5. BEGIN executes (OP_AutoCommit desired=0 rollback=0).
-          6. INSERT(2) modifies page 2; sqlite3PagerWrite hits the
-             EARLY-RETURN arm (`PGHDR_WRITEABLE` already set),
-             never reaches inner pager_write → no journal record added.
-          7. ROLLBACK: pager_playback runs but finds zero records →
-             page 2 retains the post-INSERT(2) state → count=2.
-        Sub-bug (i) — nVdbeWrite/nVdbeRead counters not tracked —
-        FIXED 2026-05-05 (a3): sqlite3_step now bumps nVdbeWrite/Read
-        at READY→RUN transition (vdbeapi.c:815..817) and
-        sqlite3VdbeHalt decrements them at the tail (vdbeaux.c:3496..
-        3500).  TestExplainParity 1025/1026 unchanged; no regressions
-        in TestPager / TestDMLBasic / TestSelectBasic / TestPrepare.
-        DiagTxn rollback still DIVERGES — auto-commit gate now reaches
-        vdbeCommit for INSERT(1), but the actual rollback bug persists,
-        meaning the divergence sits deeper in the pager↔btree commit
-        path (pcache CleanAll iteration matches C verbatim per
-        passqlite3pcache.pas:503..511).  Next investigation: trace
-        sqlite3BtreeCommitPhaseTwo → pager_end_transaction on the
-        INSERT(1) auto-commit to confirm whether vdbeCommit's caller
-        chain now drives PcacheCleanAll.  If yes, the residual bug is
-        in INSERT(2)'s sqlite3PagerWrite early-return arm
-        (passqlite3pager.pas:4327) — when journal-record-already-added
-        bit propagates incorrectly across the autocommit→explicit-txn
-        boundary.
+      [ ] **b) `BEGIN; ...; ROLLBACK` does not roll back** — DiagTxn
+        `begin rollback insert` (CREATE+INSERT(1)+BEGIN+INSERT(2)+
+        ROLLBACK on `:memory:`) returns count=2 instead of 1.  Sub-bug
+        (i) — nVdbeWrite/nVdbeRead counters not tracked — FIXED in
+        commit 1f67e38; auto-commit gate now reaches vdbeCommit for
+        INSERT(1).  Residual divergence sits deeper in the pager↔btree
+        commit path; next investigation is whether INSERT(1)'s
+        auto-commit drives sqlite3PagerWrite's WRITEABLE-clear via
+        pager_end_transaction → PcacheCleanAll, and if so whether the
+        bug is in INSERT(2)'s sqlite3PagerWrite early-return arm
+        (passqlite3pager.pas:4327) crossing the autocommit→explicit-txn
+        boundary with stale PGHDR_WRITEABLE.
       [~] **c) `SAVEPOINT s; ROLLBACK TO s` does not unwind** —
         schema-cache side fixed.  Remaining: memdb pager savepoint
         reconciliation — btree pages not unwound on ROLLBACK TO.
