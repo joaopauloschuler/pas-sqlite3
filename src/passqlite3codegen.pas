@@ -2574,9 +2574,9 @@ procedure sqlite3WhereAddScanStatus(v: PVdbe; pSrclist: PSrcList;
   codeEqualityTerm (wherecode.c:803..845) emits VDBE for one equality term
   (TK_EQ / TK_IS / TK_ISNULL); leaves the value in iTarget (or another
   register, returned).  TK_IN dispatches to codeINTerm.
-  codeINTerm (wherecode.c:668..784) IN-loop builder — currently a stub
-  (sqlite3FindInIndex not yet ported) — must not be hit by callers at this
-  point; defers the full port to the next sub-progress.
+  codeINTerm (wherecode.c:668..784) IN-loop builder — full body ported,
+  drives sqlite3FindInIndex(IN_INDEX_LOOP) and emits per-iteration
+  OP_Rowid/OP_Column + OP_IsNull preamble.
   codeAllEqualityTerms (wherecode.c:892..995) emits the contiguous register
   block for every == / IN / ISNULL term that the chosen index will use as
   a key prefix; computes the affinity string returned through pzAff (caller
@@ -2594,8 +2594,7 @@ function  codeAllEqualityTerms(pParse: PParse; pLevel: PWhereLevel;
 { Phase 6.9-bis (step 11g.2.e sub-progress) — wherecode.c leaf helpers, batch 5.
   codeExprOrVector (wherecode.c:1320..1346) emits a vector or scalar expression
   into nReg contiguous registers starting at iReg.  TK_SELECT vectors dispatch
-  through sqlite3CodeSubselect (not yet ported — assert if hit; gates on the
-  IN-subselect arm landing in batch 6 alongside codeINTerm proper); TK_VECTOR
+  through sqlite3CodeSubselect; TK_VECTOR
   RHS uses ExprUseXList and emits each child via sqlite3ExprCode; otherwise the
   scalar is coded with sqlite3ExprCode into iReg.
   filterPullDown (wherecode.c:1391..1439) walks the inner loops of pWInfo

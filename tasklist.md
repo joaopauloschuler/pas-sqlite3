@@ -600,12 +600,9 @@ FPC porting traps that recur often enough to call out up-front:
             [X] **6.13(b)-coagg**: agg-arm subquery dispatch (count(*) /
                 sum / min / max FROM (SELECT…) and … FROM v) via
                 materialise + Rewind scan (codegen.pas:21088..).
-       [~] **c) Compound-SELECT / CTE arm** — UNION ALL arm of
-            multiSelect ported (select.c:2998..3050) at codegen.pas
-            sqlite3Select compound dispatch.  TK_ALL leaves recurse
-            with SF_Compound stripped; SRT_Output / SRT_Coroutine /
-            SRT_EphemTab / SRT_Table all populate.  Remaining:
-            UNION / INTERSECT / EXCEPT need multiSelectByMerge.
+       [X] **c) Compound-SELECT / CTE arm** — UNION ALL inline +
+            multiSelectByMerge dispatch (with no-ORDER-BY ORDER BY 1
+            invention) all wired into sqlite3Select compound dispatch.
             `WITH … AS (…)` non-recursive references still need
             parser-side `WithAdd` / `CteNew` to populate
             `pParse^.pWith` (tracked under 6.20).
