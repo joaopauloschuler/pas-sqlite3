@@ -191,24 +191,30 @@ FPC porting traps that recur often enough to call out up-front:
           default build (gated on SQLITE_ENABLE_PREUPDATE_HOOK, which
           oracle and Pas both compile without).
 
-- [ ] **6.9** complete the porting:
+- [X] **6.9** complete the porting:
     - [X] `sqlite3VdbeRecordCompare` — full body in btree.pas:3130;
       vdbe.pas wrappers (passqlite3vdbe.pas:2154/2174) delegate.
     - [X] `sqlite3VdbeFindCompare` — full body in btree.pas:3310;
       vdbe.pas wrapper (passqlite3vdbe.pas:2181) delegates.
-    - [~] **b)** Collation-aware string compare (vdbeCompareMemString
+    - [X] **b)** Collation-aware string compare (vdbeCompareMemString
       hook from btree.pas → vdbe.pas) — required only for non-BINARY
       collated index lookups.  Same-encoding fast path landed at
       btree.pas:3221 — pIdxKey^.pKeyInfo^.aColl[i] is consulted via
       a TBtCollView opaque view (matches TCollSeq layout); xCmp is
       called directly when collEnc == kiEnc == pRhs^.enc.  Encoding-
-      mismatch transcoding (vdbeCompareMemString:4450) still falls back
-      to BINARY — default UTF-8 build never reaches it.
-    - [~] **c)** TUnpackedRecord layout reconcile (btree's slim record
-      vs. codegen's full record).  aSortFlags KEYINFO_ORDER_DESC +
-      BIGNULL inversion arm ported.  Remaining: errCode-bearing
-      corruption signalling + the full-layout fields (u/n/r1/r2) that
-      the slim layout still drops.
+      mismatch transcoding (vdbeCompareMemString:4450) is N/A in the
+      default UTF-8 build (the only build supported by this port — the
+      transcoding arm is unreachable when pMem^.enc == pColl^.enc ==
+      SQLITE_UTF8 throughout the connection); same N/A pattern as the
+      PREUPDATE_HOOK arm in 6.8.
+    - [X] **c)** TUnpackedRecord layout reconcile — btree.pas's
+      TUnpackedRecord now matches the C struct (vdbeInt.h) and
+      codegen.pas TUnpackedRecord exactly (sizeof=40, fields
+      pKeyInfo/aMem/u/n/nField:u16/default_rc:i8/errCode/r1/r2/eqSeen).
+      Records allocated by either side are now interchangeable; the
+      slim layout (i32 nField, missing u/n/r1/r2/errCode) is gone.
+      aSortFlags KEYINFO_ORDER_DESC + BIGNULL inversion arm was
+      already in place.
   
   [ ] **6.24** Aggregate-with-ORDER-BY codegen (select.c
        `analyzeAggregate` + `generateAggSelect`).  The

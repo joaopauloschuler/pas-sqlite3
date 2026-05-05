@@ -391,13 +391,27 @@ const
   Phase 4.2 opaque type stubs (resolved in later phases)
   =========================================================================== }
 type
-  { UnpackedRecord — ported from vdbeInt.h (exposed here for btree + vdbe) }
+  { UnpackedRecord — ported from vdbeInt.h (exposed here for btree + vdbe).
+    Phase 6.9(c) reconcile: layout now matches the C struct (sizeof=40)
+    and codegen.pas TUnpackedRecord exactly, so a record allocated by
+    either side is interchangeable. }
+  TUnpackedRecordU = record
+    case Integer of
+      0: (z: PAnsiChar);
+      1: (i: i64);
+  end;
   TUnpackedRecord = record
-    pKeyInfo  : PKeyInfo;
-    aMem      : Pointer;    { Psqlite3_value array; Pointer here to avoid circular dep }
-    nField    : i32;
-    default_rc: i32;
-    eqSeen    : u8;
+    pKeyInfo  : PKeyInfo;             { 8 bytes @ 0  }
+    aMem      : Pointer;              { 8 bytes @ 8  — Psqlite3_value array }
+    u         : TUnpackedRecordU;     { 8 bytes @ 16 }
+    n         : i32;                  { 4 bytes @ 24 }
+    nField    : u16;                  { 2 bytes @ 28 }
+    default_rc: i8;                   { 1 byte  @ 30 }
+    errCode   : u8;                   { 1 byte  @ 31 }
+    r1        : i8;                   { 1 byte  @ 32 }
+    r2        : i8;                   { 1 byte  @ 33 }
+    eqSeen    : u8;                   { 1 byte  @ 34 }
+    _pad35    : array[0..4] of u8;    { 5 bytes @ 35 }
   end;
   PUnpackedRecord = ^TUnpackedRecord;
   { RecordCompare function pointer type }
