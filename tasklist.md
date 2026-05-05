@@ -492,8 +492,15 @@ FPC porting traps that recur often enough to call out up-front:
        [X] Port `sqlite3Attach` — emits OP_Function via codeAttach,
             attachFunc grows `db^.aDb[]`, opens the new btree, calls
             sqlite3SchemaGet + SecureDelete plumbing.  URI parsing
-            and pager-flag plumbing deferred (sqlite3ParseUri unported,
-            passqlite3pager not in codegen's uses-list).
+            now honoured via sqlite3ParseUri (passqlite3util.pas);
+            pager-flag plumbing still deferred (passqlite3pager not in
+            codegen's uses-list).
+       [X] Port `sqlite3ParseUri` (main.c:3069..3308) — full 1:1 body
+            at passqlite3util.pas, including %HH decoding, vfs/cache/mode
+            option arms, SQLITE_OPEN_URI gating off bOpenUri, and the
+            non-URI verbatim-copy fallback.  Wired into attachFunc so
+            `ATTACH 'file:foo.db?mode=ro' AS x` and
+            `ATTACH 'file:foo.db?vfs=memdb' AS x` resolve correctly.
        [X] Port `sqlite3Detach` — codeAttach emits OP_Function;
             detachFunc closes the btree, frees the `aDb[]` slot, calls
             sqlite3CollapseDatabaseArray.  TEMP-trigger pTabSchema

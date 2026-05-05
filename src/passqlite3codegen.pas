@@ -37518,14 +37518,11 @@ detach_error:
   if nUnused = 0 then ; { silence unused-arg warning }
 end;
 
-{ attachFunc — port of attach.c:74 (simplified: skips sqlite3ParseUri).
-  Opens a new btree on argv[0] (filename) using the connection's default
-  VFS and openFlags, grows db^.aDb[], and triggers a schema reload via
-  sqlite3Init.  REOPEN_AS_MEMDB / SQLITE_ENABLE_DESERIALIZE arms not
-  ported.  URI parameters and `vfs=…` query options are ignored until
-  sqlite3ParseUri lands.  This satisfies the canonical
-  `ATTACH 'foo.db' AS name` form while preserving error reporting via
-  sqlite3_result_error. }
+{ attachFunc — port of attach.c:74.
+  Opens a new btree on argv[0] (filename) using sqlite3ParseUri to honour
+  ?vfs=, ?cache=, and ?mode= query options, grows db^.aDb[], and triggers a
+  schema reload via sqlite3Init.  REOPEN_AS_MEMDB / SQLITE_ENABLE_DESERIALIZE
+  arms not ported.  Preserves error reporting via sqlite3_result_error. }
 procedure attachFunc(pCtx: Psqlite3_context; nUnused: i32; argv: PPMem); cdecl;
 var
   rc:        i32;
@@ -37533,7 +37530,9 @@ var
   db:        PTsqlite3;
   zName:     PAnsiChar;
   zFile:     PAnsiChar;
+  zPath:     PAnsiChar;
   zErrDyn:   PAnsiChar;
+  zParseErr: PAnsiChar;
   flags:     u32;
   aArr:      PDb;
   pSlot:     PDb;
@@ -37582,10 +37581,9 @@ begin
   pSlot := @db^.aDb[db^.nDb];
   FillChar(pSlot^, SizeOf(pSlot^), 0);
 
-  { Open the new btree.  sqlite3ParseUri is not yet ported, so we use the
-    connection default VFS and inherit openFlags directly. }
+  { Compute open flags before sqlite3ParseUri sees them so URI options can
+    override the connection-default access mode.  Mirrors attach.c:166..173. }
   flags := db^.openFlags;
-  pVfs  := db^.pVfs;
   if (db^.flags and ATTACH_FLAG_AttachWrite) = 0 then
   begin
     flags := flags and not u32(SQLITE_OPEN_CREATE or SQLITE_OPEN_READWRITE);
@@ -37593,8 +37591,31 @@ begin
   end else if (db^.flags and ATTACH_FLAG_AttachCreate) = 0 then
     flags := flags and not u32(SQLITE_OPEN_CREATE);
   flags := flags or u32(SQLITE_OPEN_MAIN_DB);
-  rc := sqlite3BtreeOpen(pVfs, PChar(zFile), Psqlite3(db),
+
+  { sqlite3ParseUri canonicalises the filename (4-byte NUL prefix +
+    NUL-separated option key/value list + double-NUL terminator) and
+    resolves the VFS via ?vfs=.  attachFunc owns the returned zPath buffer
+    and frees it via sqlite3_free_filename on the failure paths. }
+  zPath     := nil;
+  zParseErr := nil;
+  pVfs      := nil;
+  rc := sqlite3ParseUri(Psqlite3_vfs(db^.pVfs)^.zName, zFile, @flags,
+    @pVfs, @zPath, @zParseErr);
+  if rc <> SQLITE_OK then
+  begin
+    if rc = SQLITE_NOMEM then sqlite3OomFault(db);
+    if zParseErr <> nil then
+      zErrDyn := sqlite3MPrintf(db, '%s', [zParseErr])
+    else
+      zErrDyn := sqlite3MPrintf(db, 'cannot parse URI', []);
+    sqlite3_free(zParseErr);
+    goto attach_error;
+  end;
+  AssertH(pVfs <> nil, 'attachFunc: ParseUri returned OK with nil VFS');
+
+  rc := sqlite3BtreeOpen(pVfs, zPath, Psqlite3(db),
     PPBtree(@pSlot^.pBt), 0, i32(flags));
+  sqlite3_free_filename(zPath);
   Inc(db^.nDb);
   pSlot^.zDbSName := sqlite3DbStrDup(db, zName);
   db^.noSharedCache := 0;
