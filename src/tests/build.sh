@@ -167,6 +167,7 @@ compile_test DiagAggWhere
 compile_test DiagAnalyze
 compile_test DiagArith
 compile_test DiagAutoIdx
+compile_test DiagBloom
 compile_test DiagCast
 compile_test DiagCollate
 compile_test DiagColName
