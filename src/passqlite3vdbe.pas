@@ -4112,21 +4112,127 @@ begin
   if p = nil then Exit;
 end;
 
-{ --- VdbeHalt, VdbeReset, VdbeFinalize (Phase 5.4 stubs) --- }
+{ --- VdbeHalt, VdbeReset, VdbeFinalize --- }
 
 procedure sqlite3VdbeSetChanges(db: Pointer; nChange: i64); forward;
+procedure sqlite3SystemError(db: Pointer; rc: i32); forward;
 
+{ vdbeaux.c:2919 — vdbeCommit.  Single-database simple-case is ported in
+  full (covers the entire default test corpus, which does not ATTACH writable
+  files).  The multi-file super-journal arm is intentionally deferred: with
+  no productive ATTACH-with-write workload it is unreachable today.  If a
+  future caller pushes nTrans>1 with a named main-file we early-return
+  SQLITE_ERROR rather than silently committing partially. }
+function vdbeCommit(db: PTsqlite3; p: PVdbe): i32;
+var
+  i:           i32;
+  nTrans:      i32;
+  rc:          i32;
+  needXcommit: i32;
+  pBt:         PBtree;
+  pPg:         PPager;
+  txn:         i32;
+  jm:          i32;
+  aMJNeeded:   array[0..5] of u8;
+  zMain:       PAnsiChar;
+const
+  PAGER_JM_DELETE   = 0; PAGER_JM_PERSIST = 1; PAGER_JM_OFF = 2;
+  PAGER_JM_TRUNCATE = 3; PAGER_JM_MEMORY  = 4; PAGER_JM_WAL = 5;
+begin
+  nTrans := 0;
+  needXcommit := 0;
+  aMJNeeded[PAGER_JM_DELETE]   := 1;
+  aMJNeeded[PAGER_JM_PERSIST]  := 1;
+  aMJNeeded[PAGER_JM_OFF]      := 0;
+  aMJNeeded[PAGER_JM_TRUNCATE] := 1;
+  aMJNeeded[PAGER_JM_MEMORY]   := 0;
+  aMJNeeded[PAGER_JM_WAL]      := 0;
+
+  { Sync vtabs first — may add attached databases to the transaction. }
+  rc := sqlite3VtabSync(db, p);
+
+  { Count write-transactions and acquire exclusive locks. }
+  i := 0;
+  while (rc = SQLITE_OK) and (i < db^.nDb) do begin
+    pBt := PBtree(db^.aDb[i].pBt);
+    if (pBt <> nil) and (sqlite3BtreeTxnState(pBt) = SQLITE_TXN_WRITE) then begin
+      needXcommit := 1;
+      pPg := sqlite3BtreePager(pBt);
+      jm := sqlite3PagerGetJournalMode(pPg);
+      if (db^.aDb[i].safety_level <> PAGER_SYNCHRONOUS_OFF)
+         and (jm >= 0) and (jm <= 5)
+         and (aMJNeeded[jm] <> 0)
+         and (sqlite3PagerIsMemdb(pPg) = 0) then
+        Inc(nTrans);
+      rc := sqlite3PagerExclusiveLock(pPg);
+    end;
+    Inc(i);
+  end;
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  { Invoke commit hook if any write-transaction is active. }
+  if (needXcommit <> 0) and Assigned(db^.xCommitCallback) then begin
+    if db^.xCommitCallback(db^.pCommitArg) <> 0 then begin
+      Result := SQLITE_CONSTRAINT_COMMITHOOK; Exit;
+    end;
+  end;
+
+  { Simple case: zero or one writable database (or main is :memory:/temp). }
+  zMain := nil;
+  if (db^.nDb > 0) and (db^.aDb[0].pBt <> nil) then
+    zMain := sqlite3BtreeGetFilename(PBtree(db^.aDb[0].pBt));
+  if (zMain = nil) or (zMain^ = #0) or (nTrans <= 1) then begin
+    if needXcommit <> 0 then begin
+      i := 0;
+      while (rc = SQLITE_OK) and (i < db^.nDb) do begin
+        pBt := PBtree(db^.aDb[i].pBt);
+        if (pBt <> nil) and (sqlite3BtreeTxnState(pBt) >= SQLITE_TXN_WRITE) then
+          rc := sqlite3BtreeCommitPhaseOne(pBt, nil);
+        Inc(i);
+      end;
+    end;
+    i := 0;
+    while (rc = SQLITE_OK) and (i < db^.nDb) do begin
+      pBt := PBtree(db^.aDb[i].pBt);
+      if pBt <> nil then begin
+        txn := sqlite3BtreeTxnState(pBt);
+        if txn <> SQLITE_TXN_NONE then
+          rc := sqlite3BtreeCommitPhaseTwo(pBt, 0);
+      end;
+      Inc(i);
+    end;
+    if rc = SQLITE_OK then sqlite3VtabCommit(db);
+  end else begin
+    { Multi-file commit needs a super-journal; not productive in this port. }
+    Result := SQLITE_ERROR; Exit;
+  end;
+  Result := rc;
+end;
+
+{ vdbeaux.c:3315 — sqlite3VdbeHalt.  Determines whether this VM's work is
+  committed or rolled back, runs the commit hook, and unwinds statement-
+  transactions on per-statement errors.  Faithful 1:1 port; only the
+  nVdbe{Active,Read,Write} decrements at the tail are skipped here because
+  the equivalent counters are decremented one-shot by sqlite3_step (Pas
+  divergence retained from the prior stub — moving the decrements would
+  require touching every caller site at once). }
 function sqlite3VdbeHalt(v: PVdbe): i32;
 var
-  i:  i32;
-  pC: PVdbeCursor;
+  i:               i32;
+  pC:              PVdbeCursor;
+  db:              PTsqlite3;
+  rc, mrc:         i32;
+  eStatementOp:    i32;
+  isSpecialError:  i32;
 begin
-  { Full implementation (transaction commit/rollback bookkeeping) is in
-    vdbeaux.c Phase 5.4.  closeAllCursors-equivalent loop wired here so
-    cursors (in particular CURTYPE_VTAB cursors) do not leak across
-    sqlite3_step → sqlite3_finalize.  Mirrors closeCursorsInFrame
-    (vdbeaux.c:2796) inlined the same way it is in sqlite3VdbeFrameRestoreFull. }
-  if (v <> nil) and (v^.apCsr <> nil) then begin
+  if v = nil then begin Result := SQLITE_OK; Exit; end;
+  db := v^.db;
+  if db = nil then begin v^.eVdbeState := VDBE_HALT_STATE; Result := SQLITE_OK; Exit; end;
+
+  if db^.mallocFailed <> 0 then v^.rc := SQLITE_NOMEM;
+
+  { closeAllCursors — free every per-cursor blob, including CURTYPE_VTAB. }
+  if v^.apCsr <> nil then begin
     for i := 0 to v^.nCursor - 1 do begin
       pC := v^.apCsr[i];
       if pC <> nil then begin
@@ -4135,26 +4241,135 @@ begin
       end;
     end;
   end;
-  if (v <> nil) and ((v^.vdbeFlags and VDBF_ChangeCntOn) <> 0) then begin
-    sqlite3VdbeSetChanges(v^.db, v^.nChange);
-    v^.nChange := 0;
+
+  if (v^.vdbeFlags and VDBF_IsReader) <> 0 then begin
+    eStatementOp   := 0;
+    sqlite3VdbeEnter(v);
+
+    { Detect special errors that may have left the cache inconsistent. }
+    if v^.rc <> SQLITE_OK then begin
+      mrc := v^.rc and $ff;
+      if (mrc = SQLITE_NOMEM) or (mrc = SQLITE_IOERR)
+         or (mrc = SQLITE_INTERRUPT) or (mrc = SQLITE_FULL) then
+        isSpecialError := 1
+      else
+        isSpecialError := 0;
+    end else begin
+      mrc            := 0;
+      isSpecialError := 0;
+    end;
+    if isSpecialError <> 0 then begin
+      if ((v^.vdbeFlags and VDBF_ReadOnly) = 0) or (mrc <> SQLITE_INTERRUPT) then
+      begin
+        if ((mrc = SQLITE_NOMEM) or (mrc = SQLITE_FULL))
+           and ((v^.vdbeFlags and VDBF_UsesStmtJournal) <> 0) then begin
+          eStatementOp := SAVEPOINT_ROLLBACK;
+        end else begin
+          sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
+          sqlite3CloseSavepoints(db);
+          db^.autoCommit := 1;
+          v^.nChange := 0;
+        end;
+      end;
+    end;
+
+    { Immediate FK violation check. }
+    if (v^.rc = SQLITE_OK) or
+       ((v^.errorAction = OE_Fail) and (isSpecialError = 0)) then
+      sqlite3VdbeCheckFkImmediate(v);
+
+    { Auto-commit arm: if this is the only writer VM and autoCommit is on,
+      do the commit (or rollback on error). }
+    if (sqlite3VtabInSync(db) = 0)
+       and (db^.autoCommit <> 0)
+       and (((v^.vdbeFlags and VDBF_ReadOnly) = 0) and (db^.nVdbeWrite = 1)
+            or ((v^.vdbeFlags and VDBF_ReadOnly) <> 0) and (db^.nVdbeWrite = 0)) then
+    begin
+      if (v^.rc = SQLITE_OK)
+         or ((v^.errorAction = OE_Fail) and (isSpecialError = 0)) then begin
+        rc := sqlite3VdbeCheckFkDeferred(v);
+        if rc <> SQLITE_OK then begin
+          if (v^.vdbeFlags and VDBF_ReadOnly) <> 0 then begin
+            sqlite3VdbeLeave(v);
+            Result := SQLITE_ERROR; Exit;
+          end;
+          rc := SQLITE_CONSTRAINT_FOREIGNKEY;
+        end else if (db^.flags and SQLITE_CorruptRdOnly) <> 0 then begin
+          rc := SQLITE_CORRUPT;
+          db^.flags := db^.flags and not SQLITE_CorruptRdOnly;
+        end else begin
+          rc := vdbeCommit(db, v);
+        end;
+        if (rc = SQLITE_BUSY) and ((v^.vdbeFlags and VDBF_ReadOnly) <> 0) then
+        begin
+          sqlite3VdbeLeave(v);
+          Result := SQLITE_BUSY; Exit;
+        end else if rc <> SQLITE_OK then begin
+          sqlite3SystemError(db, rc);
+          v^.rc := rc;
+          sqlite3RollbackAll(db, SQLITE_OK);
+          v^.nChange := 0;
+        end else begin
+          db^.nDeferredCons    := 0;
+          db^.nDeferredImmCons := 0;
+          db^.flags            := db^.flags and not SQLITE_DeferFKs;
+          { sqlite3CommitInternalChanges — inlined: clear schema-change. }
+          db^.mDbFlags := db^.mDbFlags and not u32(DBFLAG_SchemaChange);
+        end;
+      end else if (v^.rc = SQLITE_SCHEMA) and (db^.nVdbeActive > 1) then begin
+        v^.nChange := 0;
+      end else begin
+        sqlite3RollbackAll(db, SQLITE_OK);
+        v^.nChange := 0;
+      end;
+      db^.nStatement := 0;
+    end else if eStatementOp = 0 then begin
+      if (v^.rc = SQLITE_OK) or (v^.errorAction = OE_Fail) then
+        eStatementOp := SAVEPOINT_RELEASE
+      else if v^.errorAction = OE_Abort then
+        eStatementOp := SAVEPOINT_ROLLBACK
+      else begin
+        sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
+        sqlite3CloseSavepoints(db);
+        db^.autoCommit := 1;
+        v^.nChange := 0;
+      end;
+    end;
+
+    { Statement-transaction commit/rollback. }
+    if eStatementOp <> 0 then begin
+      rc := sqlite3VdbeCloseStatement(v, eStatementOp);
+      if rc <> 0 then begin
+        if (v^.rc = SQLITE_OK) or ((v^.rc and $ff) = SQLITE_CONSTRAINT) then
+        begin
+          v^.rc := rc;
+          sqlite3DbFree(db, v^.zErrMsg);
+          v^.zErrMsg := nil;
+        end;
+        sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
+        sqlite3CloseSavepoints(db);
+        db^.autoCommit := 1;
+        v^.nChange := 0;
+      end;
+    end;
+
+    { Update connection change counter. }
+    if (v^.vdbeFlags and VDBF_ChangeCntOn) <> 0 then begin
+      if eStatementOp <> SAVEPOINT_ROLLBACK then
+        sqlite3VdbeSetChanges(db, v^.nChange)
+      else
+        sqlite3VdbeSetChanges(db, 0);
+      v^.nChange := 0;
+    end;
+
+    sqlite3VdbeLeave(v);
   end;
-  { vdbeaux.c:3435 — clear DBFLAG_SchemaChange after a successful commit.
-    The full sqlite3VdbeHalt commit/rollback bookkeeping (Phase 5.4) is not
-    yet ported, but the schema-change-flag clear is the load-bearing piece
-    for SAVEPOINT ROLLBACK after a prior CREATE TABLE: without it, the
-    OP_Savepoint rollback arm sees the stale flag from the long-since-
-    committed CREATE TABLE and fires sqlite3ResetAllSchemasOfConnection,
-    which invalidates the cached schema and breaks subsequent prepares.
-    Safe to clear unconditionally on halt: at this point the statement
-    has finished and any in-flight schema mutation is either committed
-    (flag should clear) or rolled back (flag is irrelevant). }
-  if (v <> nil) and (v^.db <> nil) and (v^.rc = SQLITE_OK)
-     and (PTsqlite3(v^.db)^.autoCommit <> 0) then
-    PTsqlite3(v^.db)^.mDbFlags :=
-      PTsqlite3(v^.db)^.mDbFlags and not u32(DBFLAG_SchemaChange);
+
   v^.eVdbeState := VDBE_HALT_STATE;
-  Result := SQLITE_OK;
+
+  if db^.mallocFailed <> 0 then v^.rc := SQLITE_NOMEM;
+
+  if v^.rc = SQLITE_BUSY then Result := SQLITE_BUSY else Result := SQLITE_OK;
 end;
 
 procedure sqlite3VdbeResetStepResult(p: PVdbe);

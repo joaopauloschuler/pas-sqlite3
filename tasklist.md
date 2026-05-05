@@ -482,14 +482,20 @@ FPC porting traps that recur often enough to call out up-front:
   [ ] **6.10 step 15** Runtime divergences surfaced by `DiagTxn`
       (transactions, savepoints, conflict resolution).  2 remain.
       [ ] **b) `BEGIN; ...; ROLLBACK` does not roll back** — BEGIN/
-        ROLLBACK are no-ops on Pas side; blocked on Phase 5.4 full
-        VdbeHalt port.  2026-05-05: sqlite3RollbackAll body upgraded
-        from a thin BtreeRollback loop to a faithful 1:1 port of
-        main.c:1483 (DBFLAG_SchemaChange + init.busy gate, vtab
-        rollback, deferred-FK reset, DeferFKs/CorruptRdOnly clear,
-        xRollbackCallback dispatch).  Remaining gap: VdbeHalt itself
-        does not call RollbackAll on the autoCommit-with-error arm —
-        that's the load-bearing piece for `BEGIN; ...; ROLLBACK`.
+        ROLLBACK still observably no-op on Pas side.  2026-05-05:
+        sqlite3VdbeHalt now full 1:1 port of vdbeaux.c:3315 (special-
+        error rollback arm, FK immediate/deferred checks, autoCommit
+        commit/rollback dispatch via vdbeCommit, statement-savepoint
+        release/rollback, change-counter update); vdbeCommit ported
+        for the simple single-file case (multi-file super-journal arm
+        intentionally not yet productive — returns SQLITE_ERROR).
+        DiagTxn `begin rollback insert` still DIVERGES — the BEGIN
+        VM completes via SAVEPOINT_RELEASE and the subsequent INSERT
+        runs inside the explicit transaction correctly, but the
+        OP_Transaction wal-mode wakeup or the actual btree rollback
+        on OP_AutoCommit p2=1 still leaves the row visible.  Likely
+        culprit: btreeRollback reload-after-rollback path (separate
+        sub-bug from the VdbeHalt port).
       [~] **c) `SAVEPOINT s; ROLLBACK TO s` does not unwind** —
         schema-cache side fixed.  Remaining: memdb pager savepoint
         reconciliation — btree pages not unwound on ROLLBACK TO.
