@@ -300,6 +300,14 @@ FPC porting traps that recur often enough to call out up-front:
        [~] OP_Vacuum — wired to vdbeRunVacuum hook (sqlite3RunVacuum
             ported in passqlite3main.pas).  End-to-end completion gated
             on Phase 7.1.1 schema reload after ATTACH (see 6.27).
+       [X] Port `sqlite3VdbeFindIndexKey` + `vdbeIsMatchingIndexKey` +
+            `vdbeSkipField` (vdbeaux.c:5400..5615).  Body lives in
+            passqlite3codegen (TIndex layout not visible to vdbe.pas);
+            wired into vdbe.pas via the new `vdbeFindIndexKey` hook.
+            OP_IFindKey now drives a real sub-search instead of the
+            no-op stub; OP_IdxDelete picks up the EIIB-bug fallback
+            arm (vdbe.c:6658..6670) and reports SQLITE_CORRUPT_INDEX
+            outside writable_schema mode.
 
 ### Open Bugs
 

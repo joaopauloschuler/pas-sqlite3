@@ -1763,6 +1763,18 @@ type
 var
   vdbeRunVacuum: TVdbeRunVacuum = nil;
 
+{ OP_IFindKey / OP_IdxDelete hook — vdbeaux.c sqlite3VdbeFindIndexKey
+  (vdbeaux.c:5542).  Sub-search around the current index cursor for a
+  matching record where indexed-expression / virtual columns may differ
+  by tiny amounts (EIIB bug).  TIndex layout lives in passqlite3codegen
+  (PIndex is opaque here), so the body is installed via this hook. }
+type
+  TVdbeFindIndexKey = function(pCur: Pointer; pIdx: PIndex;
+                               p: Pointer; pRes: Pi32;
+                               bIntegrity: i32): i32;
+var
+  vdbeFindIndexKey: TVdbeFindIndexKey = nil;
+
 { --- vdbe.c Phase 5.4b helpers (exported for testing) --- }
 function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
 
@@ -8217,9 +8229,30 @@ begin
       rSeek.nField    := u16(pOp^.p3);
       rSeek.default_rc := 0;
       rSeek.aMem      := @aMem[pOp^.p2];
+      rSeek.eqSeen    := 0;
       rc := sqlite3BtreeIndexMoveto(pCrsr, @rSeek, @res);
       if rc <> SQLITE_OK then goto abort_due_to_error;
-      if res = 0 then begin
+      if res <> 0 then begin
+        { vdbe.c:6658..6670 — sub-search around the current cursor for an
+          EIIB-affected match (real-value index expression / virtual
+          column).  If still not found and not in writable_schema mode,
+          report SQLITE_CORRUPT_INDEX. }
+        if (vdbeFindIndexKey <> nil) and (pOp^.p4type = P4_INDEX) then begin
+          rc := vdbeFindIndexKey(pCrsr, pOp^.p4.pIdx, @rSeek, @res, 0);
+          if rc <> SQLITE_OK then goto abort_due_to_error;
+        end;
+        if res <> 0 then begin
+          if (db^.flags and u64($00000001)) = 0 then begin  { SQLITE_WriteSchema }
+            rc := SQLITE_CORRUPT_INDEX;
+            goto abort_due_to_error;
+          end;
+          pCur^.cacheStatus := CACHE_STALE;
+          pCur^.seekResult  := 0;
+        end else begin
+          rc := sqlite3BtreeDelete(pCrsr, BTREE_AUXDELETE);
+          if rc <> SQLITE_OK then goto abort_due_to_error;
+        end;
+      end else begin
         rc := sqlite3BtreeDelete(pCrsr, BTREE_AUXDELETE);
         if rc <> SQLITE_OK then goto abort_due_to_error;
       end;
@@ -10076,9 +10109,32 @@ begin
       sqlite3VdbeMemSetNull(@aMem[pOp^.p1 + 1]);
     end;
 
-    { ────── OP_IFindKey ────── — index find with key }
+    { ────── OP_IFindKey ────── (vdbe.c:7301) — sub-search around the
+      current index cursor for an entry whose non-EIIB-affected columns
+      match.  Used by OP_IdxDelete / integrity-check.  See vdbeaux.c
+      sqlite3VdbeFindIndexKey (5542).  Body lives in passqlite3codegen
+      via the vdbeFindIndexKey hook (TIndex layout not visible here). }
     OP_IFindKey: begin
-      { Stub: deferred to Phase 6 (requires full index/key infrastructure) }
+      pCur  := v^.apCsr[pOp^.p1];
+      pCrsr := pCur^.uc.pCursor;
+      rSeek.pKeyInfo  := pCur^.pKeyInfo;
+      rSeek.nField    := 0;            { hook fills from pIdx^.nColumn }
+      rSeek.default_rc := 0;
+      rSeek.aMem      := @aMem[pOp^.p3];
+      rSeek.eqSeen    := 0;
+      res := 0;
+      if vdbeFindIndexKey <> nil then
+        rc := vdbeFindIndexKey(pCrsr, pOp^.p4.pIdx, @rSeek, @res, 1)
+      else begin
+        rc  := SQLITE_OK;
+        res := 1;  { no hook → no match → take the jump (matches C's "not found" arm) }
+      end;
+      if rc <> SQLITE_OK then begin
+        rc := SQLITE_OK;
+        goto jump_to_p2;
+      end;
+      if res <> 0 then goto jump_to_p2;
+      pCur^.nullRow := 0;
     end;
 
     { ────── OP_IncrVacuum ────── — stub }

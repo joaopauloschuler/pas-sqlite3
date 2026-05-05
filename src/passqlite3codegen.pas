@@ -49718,6 +49718,241 @@ no_mem:
   Result := SQLITE_NOMEM_BKPT;
 end;
 
+{ ============================================================================
+  vdbeaux.c sqlite3VdbeFindIndexKey + helpers — port of vdbeaux.c:5400..5615.
+
+  Sub-search around the current index cursor for an entry whose
+  non-EIIB-affected columns match the supplied UnpackedRecord.  Used by
+  OP_IdxDelete (after BtreeIndexMoveto fails) and OP_IFindKey (PRAGMA
+  integrity_check).  See vdbeaux.c for the full C reference.
+
+  Lives here (not in passqlite3vdbe) because it needs full TIndex /
+  TTable / TKeyInfo layout access; the vdbe.pas type system keeps PIndex
+  opaque.  Wired in via the vdbeFindIndexKey hook installed at
+  initialization time.
+  ============================================================================ }
+
+const
+  BTREE_FDK_RANGE     = 10;  { vdbeaux.c:5549 }
+  BTREE_ULPDISTORTION = 2;   { vdbeaux.c:5418 }
+
+{ vdbeSkipField — vdbeaux.c:5411..5430.  Return 1 if the iCol field of
+  an unpacked record should be skipped during compare (indexed expr or
+  virtual column whose value differs only in the low ULPs of a real). }
+function vdbeSkipField(mask: Bitmask; iCol: i32; pMem1, pMem2: PMem;
+                       bIntegrity: i32): i32;
+var
+  m1, m2: u64;
+  diff:   u64;
+begin
+  if (iCol >= BMS) or ((mask and (Bitmask(1) shl iCol)) = 0) then
+  begin
+    Result := 0;
+    Exit;
+  end;
+  if bIntegrity = 0 then begin Result := 1; Exit; end;
+  if ((pMem1^.flags and MEM_Real) <> 0)
+     and ((pMem2^.flags and MEM_Real) <> 0) then
+  begin
+    Move(pMem1^.u.r, m1, 8);
+    Move(pMem2^.u.r, m2, 8);
+    if m1 < m2 then diff := m2 - m1 else diff := m1 - m2;
+    if diff <= BTREE_ULPDISTORTION then
+    begin
+      Result := 1;
+      Exit;
+    end;
+  end;
+  Result := 0;
+end;
+
+{ vdbeIsMatchingIndexKey — vdbeaux.c:5444..5515.  Compare the unpacked
+  record (*p) against the row at the cursor.  Skip fields whose mask
+  bit is set (per vdbeSkipField).  Returns 0 on a match in *piRes. }
+function vdbeIsMatchingIndexKey(pCur: PBtCursor; bInt: i32;
+                                mask: Bitmask; p: PUnpackedRecord;
+                                piRes: Pi32): i32;
+var
+  aRec:    Pu8;
+  nRec:    u32;
+  rc:      i32;
+  szHdr:   u32;
+  idxHdr:  u32;
+  idxRec:  u32;
+  iSerial: u32;
+  nSerial: i32;
+  ii:      i32;
+  nCol:    i32;
+  res:     i32;
+  mem:     TMem;
+  pCKI:    Pointer;
+  pColl:   Pointer;
+  aMemArr: PMem;
+  pCmpMem: PMem;
+begin
+  aRec := nil;
+  rc   := SQLITE_OK;
+  res  := 0;
+  FillChar(mem, SizeOf(mem), 0);
+  mem.enc := PByte(p^.pKeyInfo)[4];                { TKeyInfo.enc @4 }
+  mem.db  := PTsqlite3(PPointer(PByte(p^.pKeyInfo) + 16)^); { TKeyInfo.db @16 }
+
+  nRec := sqlite3BtreePayloadSize(pCur);
+  if nRec > $7fffffff then begin Result := SQLITE_CORRUPT_BKPT; Exit; end;
+
+  { Allocate 5 extra bytes — passqlite3util.sqlite3GetVarint32 may read slightly past end on a
+    corrupt record (vdbeaux.c:5464..5467). }
+  aRec := Pu8(sqlite3MallocZero(nRec + 5));
+  if aRec = nil then
+    rc := SQLITE_NOMEM_BKPT
+  else
+    rc := sqlite3BtreePayload(pCur, 0, nRec, aRec);
+
+  if rc = SQLITE_OK then
+  begin
+    szHdr  := 0;
+    idxHdr := passqlite3util.sqlite3GetVarint32(aRec, szHdr);
+    if szHdr > 98307 then
+      rc := SQLITE_CORRUPT
+    else
+    begin
+      idxRec  := szHdr;
+      nCol    := i32(PWord(PByte(p^.pKeyInfo) + 8)^);  { TKeyInfo.nAllField @8 }
+      ii      := 0;
+      aMemArr := PMem(p^.aMem);
+      while (ii < nCol) and (rc = SQLITE_OK) do
+      begin
+        iSerial := 0;
+        if idxHdr >= szHdr then
+        begin
+          rc := SQLITE_CORRUPT_BKPT;
+          break;
+        end;
+        Inc(idxHdr, passqlite3util.sqlite3GetVarint32(@aRec[idxHdr], iSerial));
+        nSerial := i32(passqlite3vdbe.sqlite3VdbeSerialTypeLen(iSerial));
+        if (idxRec + u32(nSerial)) > nRec then
+          rc := SQLITE_CORRUPT_BKPT
+        else
+        begin
+          passqlite3vdbe.sqlite3VdbeSerialGet(@aRec[idxRec], iSerial, @mem);
+          pCmpMem := aMemArr;
+          { aMemArr[ii] via pointer math }
+          pCmpMem := PMem(PByte(aMemArr) + ii * SizeOf(TMem));
+          if vdbeSkipField(mask, ii, pCmpMem, @mem, bInt) = 0 then
+          begin
+            { aColl[ii] starts at offset 32 in TKeyInfo (FLEXARRAY tail). }
+            pCKI  := PByte(p^.pKeyInfo) + 32 + ii * SizeOf(Pointer);
+            pColl := PPointer(pCKI)^;
+            res   := passqlite3vdbe.sqlite3MemCompare(@mem, pCmpMem, pColl);
+            if res <> 0 then break;
+          end;
+        end;
+        Inc(idxRec, u32(passqlite3vdbe.sqlite3VdbeSerialTypeLen(iSerial)));
+        Inc(ii);
+      end;
+      piRes^ := res;
+    end;
+  end;
+
+  if aRec <> nil then sqlite3_free(aRec);
+  { Release any heap allocated by sqlite3VdbeSerialGet for string/blob mem. }
+  if (mem.flags and (MEM_Dyn or MEM_Static or MEM_Ephem)) = MEM_Dyn then
+    if mem.zMalloc <> nil then sqlite3DbFree(mem.db, mem.zMalloc);
+  Result := rc;
+end;
+
+{ sqlite3VdbeFindIndexKey — vdbeaux.c:5542..5615.  Scan up to
+  BTREE_FDK_RANGE entries either side of the current cursor; if no match
+  and bIntegrity=0, then exhaust the index.  Returns *pRes=0 on match. }
+function sqlite3VdbeFindIndexKey(pCur: Pointer; pIdx: PIndex;
+                                 p: Pointer; pRes: Pi32;
+                                 bIntegrity: i32): i32;
+var
+  pCrsr:   PBtCursor;
+  pIx:     PIndex2;
+  pUR:     PUnpackedRecord;
+  nStep:   i32;
+  res:     i32;
+  rc:      i32;
+  ii:      i32;
+  iCol:    i32;
+  mask:    Bitmask;
+  nMaskCol:i32;
+  pTab:    PTable2;
+begin
+  pCrsr := PBtCursor(pCur);
+  pIx   := PIndex2(pIdx);
+  pUR   := PUnpackedRecord(p);
+  nStep := 0;
+  res   := 1;
+  rc    := SQLITE_OK;
+
+  { OP_IFindKey leaves nField=0 — fill from pIdx^.nColumn. }
+  if pUR^.nField = 0 then pUR^.nField := i32(pIx^.nColumn);
+
+  { Build mask of indexed-expression / virtual-column slots in the first
+    BMS columns (vdbeaux.c:5555..5566). }
+  mask := 0;
+  pTab := pIx^.pTable;
+  if pIx^.nColumn < BMS then nMaskCol := i32(pIx^.nColumn) else nMaskCol := BMS;
+  for ii := 0 to nMaskCol - 1 do
+  begin
+    iCol := i32(pIx^.aiColumn[ii]);
+    if (iCol = XN_EXPR)
+       or ((iCol >= 0) and (pTab <> nil)
+           and ((pTab^.aCol[iCol].colFlags and COLFLAG_VIRTUAL) <> 0)) then
+      mask := mask or (Bitmask(1) shl ii);
+  end;
+
+  { mask=0 → no expressions / virtual columns; caller may declare corrupt
+    immediately (vdbeaux.c:5568..5572). }
+  if mask <> 0 then
+  begin
+    { Step back BTREE_FDK_RANGE entries (vdbeaux.c:5579..5587). }
+    ii := 0;
+    while (sqlite3BtreeEof(pCrsr) = 0) and (ii < BTREE_FDK_RANGE) do
+    begin
+      rc := sqlite3BtreePrevious(pCrsr, 0);
+      if rc <> SQLITE_OK then break;
+      Inc(ii);
+    end;
+    if rc = SQLITE_DONE then
+    begin
+      rc    := sqlite3BtreeFirst(pCrsr, @res);
+      nStep := -1;
+    end else
+      nStep := BTREE_FDK_RANGE * 2;
+
+    { Outer loop runs at most twice; second iteration scans the whole
+      index (vdbeaux.c:5593..5610). }
+    while sqlite3BtreeCursorIsValidNN(pCrsr) <> 0 do
+    begin
+      ii := 0;
+      while (rc = SQLITE_OK) and ((ii < nStep) or (nStep < 0)) do
+      begin
+        rc := vdbeIsMatchingIndexKey(pCrsr, bIntegrity, mask, pUR, @res);
+        if (res = 0) or (rc <> SQLITE_OK) then break;
+        rc := sqlite3BtreeNext(pCrsr, 0);
+        Inc(ii);
+      end;
+      if rc = SQLITE_DONE then
+      begin
+        rc := SQLITE_OK;
+        Assert(res <> 0);
+      end;
+      if (nStep < 0) or (rc <> SQLITE_OK) or (res = 0) or (bIntegrity <> 0)
+        then break;
+
+      { First (windowed) scan failed — restart for an exhaustive scan. }
+      nStep := -1;
+      rc    := sqlite3BtreeFirst(pCrsr, @res);
+    end;
+  end;
+
+  pRes^  := res;
+  Result := rc;
+end;
+
 initialization
   { Wire the schema-cleanup hooks declared by passqlite3vdbe.  The opcode
     handlers there (OP_DropTable, OP_DropIndex, OP_DropTrigger, OP_Destroy
@@ -49739,6 +49974,11 @@ initialization
   passqlite3vdbe.gBlobReopenImpl         := @vdbeBlobReopenImpl;
   passqlite3vdbe.gValueFromExprImpl      := @valueFromExprTrampoline;
   passqlite3vdbe.gKeyInfoUnref           := passqlite3vdbe.TKeyInfoUnrefFn(@sqlite3KeyInfoUnref);
+
+  { vdbeaux.c sqlite3VdbeFindIndexKey hook — wires OP_IFindKey and the
+    OP_IdxDelete EIIB-fallback path through to the body above. }
+  passqlite3vdbe.vdbeFindIndexKey :=
+    passqlite3vdbe.TVdbeFindIndexKey(@sqlite3VdbeFindIndexKey);
 
   { Phase 6.8.0 — pragmaVtabModule.  Mirror of pragma.c:3060 sqlite3_module
     initializer.  iVersion=0, no xCreate / xDestroy / xUpdate / xBegin /
