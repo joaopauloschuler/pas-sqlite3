@@ -130,7 +130,18 @@ FPC porting traps that recur often enough to call out up-front:
           OP_OpenEphemeral header and the Rewind/Column/ResultRow/Next tail
           (build.c:171..192 + 252..259) so RETURNING actually surfaces rows
           to step() instead of silently returning none.
-     [ ] Vtab xUpdate dispatch (`IsVirtual(pTab)`).
+     [X] Vtab xUpdate dispatch (`IsVirtual(pTab)`) — DONE.
+          isVirtual flag added at the eTabType branch; register
+          allocation bumps regRowid + nMem by one (insert.c:1051..1054)
+          so regIns lands at argv[0].  Per-row loop now branches:
+          OP_Null at regIns + OP_Null at regRowid (no IDLIST IPK
+          rebinding yet — rare on vtabs), then sqlite3GetVTable +
+          sqlite3VtabMakeWritable + OP_VUpdate p1=1 p2=nCol+2 p3=regIns
+          p4=pVTab P4_VTAB, P5=onError (OE_Default folds to OE_Abort),
+          sqlite3MayAbort.  Mirrors insert.c:1502..1564 1:1.
+          GenerateConstraintChecks/CompleteInsertion are bypassed for
+          vtabs.  TestExplainParity holds at 1025/1026 (no vtab DML in
+          corpus); TestVtab + Test{Vdbe}Vtab{,Exec} green.
      [X] xferOptimization (`INSERT INTO t1 SELECT * FROM t2`
           fast path) — DONE.  Body ported at codegen.pas (1:1 with
           insert.c:3012..3392).  Wired into sqlite3Insert via the

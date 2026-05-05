@@ -28615,6 +28615,9 @@ var
   regCols:        i32;
   addrIpkBefore:  i32;
   sNC:            TNameContext;
+  isVirtual:      Boolean;
+  pVTab:          PAnsiChar;
+  p5Conflict:     u16;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -28635,6 +28638,9 @@ begin
   pRowsList     := nil;
   nRows         := 1;
   isMulti       := False;
+  isVirtual     := False;
+  pVTab         := nil;
+  p5Conflict    := 0;
 
   db := pParse^.db;
   if pParse^.nErr <> 0 then goto insert_cleanup;
@@ -28672,6 +28678,7 @@ begin
     receives the OR of TRIGGER_BEFORE / TRIGGER_AFTER flags. }
   pTrg := sqlite3TriggersExist(pParse, pTab, TK_INSERT, nil, @tmask);
   if pTab^.eTabType = TABTYP_VIEW then isView := 1 else isView := 0;
+  isVirtual := pTab^.eTabType = TABTYP_VTAB;
 
   if sqlite3ViewGetColumnNames(pParse, pTab) <> 0 then goto insert_cleanup;
 
@@ -28711,13 +28718,17 @@ begin
     sqlite3VdbeAddOp2(v, OP_Integer, 0, regRowCount);
   end;
 
-  { Allocate registers: rowid + nCol data slots. }
+  { Allocate registers: rowid + nCol data slots.  For vtab, prepend an extra
+    slot so regIns stays at argv[0] (delete-rowid, set to NULL for INSERT)
+    and regRowid steps forward to argv[1] — matches insert.c:1049..1055. }
   regRowid := pParse^.nMem + 1;
   regIns   := regRowid;
   pParse^.nMem := pParse^.nMem + i32(pTab^.nCol) + 1;
-  { TODO(Phase 6.x): IsVirtual(pTab) bumps regRowid + nMem by one extra slot
-    for the vtab argv[0]/argv[1] convention.  Vtab DML deferred (same choice
-    as step 11a's IsVirtual deferral). }
+  if isVirtual then
+  begin
+    Inc(regRowid);
+    Inc(pParse^.nMem);
+  end;
   regData := regRowid + 1;
 
   bIdListInOrder := u8(ord(
@@ -28985,8 +28996,19 @@ begin
     end;
 
     { Rowid emission (insert.c:1488..1531).  See banner above the
-      single-row implementation for the (a)/(b)/(c) breakdown. }
-    if not (isView <> 0) then
+      single-row implementation for the (a)/(b)/(c) breakdown.
+
+      Virtual-table arm (insert.c:1502..1537): emit OP_Null at regIns to
+      mark argv[0] as "no row to delete" for the OP_VUpdate, then emit
+      OP_Null at regRowid to leave argv[1] (new rowid) unset.  IPK-from-
+      IDLIST rebinding is not yet honoured here (rare on vtabs); the
+      regular VALUES path therefore yields a vtab-allocated rowid. }
+    if isVirtual then
+    begin
+      sqlite3VdbeAddOp2(v, OP_Null, 0, regIns);
+      sqlite3VdbeAddOp2(v, OP_Null, 0, regRowid);
+    end
+    else if not (isView <> 0) then
     begin
       if (pTab^.iPKey >= 0) and ipkColumnPresent then
       begin
@@ -29007,12 +29029,29 @@ begin
       Updates the running-max regCtr (memId = regAutoinc) with the rowid
       we just emitted, so sqlite3AutoincrementEnd writes the actual max
       back into sqlite_sequence.seq.  No-op when regAutoinc=0 (table is
-      not AUTOINCREMENT). }
+      not AUTOINCREMENT, including all vtab paths). }
     if regAutoinc > 0 then
       sqlite3VdbeAddOp2(v, OP_MemMax, regAutoinc, regRowid);
 
-    { Phase 6.8.6 productive constraint-check + completion. }
-    if not (isView <> 0) then
+    { Phase 6.8.6 productive constraint-check + completion (insert.c:1554..).
+      Vtab arm (insert.c:1557..1564) bypasses constraint/index machinery
+      entirely and dispatches the row through the module's xUpdate via
+      OP_VUpdate p1=1, p2=nCol+2 (argc), p3=regIns, p4=pVTab.  P5 carries
+      the conflict resolution (OE_Default folds to OE_Abort). }
+    if isVirtual then
+    begin
+      pVTab := PAnsiChar(passqlite3vtab.sqlite3GetVTable(db, Pointer(pTab)));
+      passqlite3vtab.sqlite3VtabMakeWritable(pParse, Pointer(pTab));
+      sqlite3VdbeAddOp4(v, OP_VUpdate, 1, i32(pTab^.nCol) + 2, regIns,
+                        pVTab, P4_VTAB);
+      if onError = OE_Default then
+        p5Conflict := OE_Abort
+      else
+        p5Conflict := u16(onError);
+      sqlite3VdbeChangeP5(v, p5Conflict);
+      sqlite3MayAbort(pParse);
+    end
+    else if not (isView <> 0) then
     begin
       bMayReplace := False;
       if (pTab^.iPKey >= 0) and ipkColumnPresent then pkChng := 1 else pkChng := 0;
