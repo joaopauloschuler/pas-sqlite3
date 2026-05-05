@@ -89,8 +89,31 @@ FPC porting traps that recur often enough to call out up-front:
           level; TestExplainParity 1025/1026 with the only remaining
           divergence being the INSERT VALUES coroutine (tracked under
           6.10 step 6, unrelated to WHERE).
-     [ ] Bloom-filter and covering-index arms (covers 6.10 step 9
+     [~] Bloom-filter and covering-index arms (covers 6.10 step 9
           d-INNER).
+          Bloom-filter machinery DONE: whereCheckIfBloomFilterIsUseful
+          (where.c:6622) wired post-wherePathSolver, full
+          sqlite3ConstructBloomFilter (where.c:1273) wired into the
+          per-level loop in sqlite3WhereBegin alongside
+          constructAutomaticIndex.  DiagBloom probe lands as a tripwire;
+          gating corpus stays unaffected (no analyzed shapes trigger it).
+          Covering-index arm: in-place machinery exists
+          (whereIsCoveringIndex, WHERE_IDX_ONLY in whereLoopAddBtree,
+          omitTable honoured in OneLoopStart) but the planner DOES NOT
+          PICK any indexed plan today for canonical shapes.  Repro
+          (2026-05-05): `CREATE INDEX i1 ON t(a,b); SELECT a,b FROM t
+          WHERE a > 0` — C picks "SEARCH t USING COVERING INDEX i1
+          (a>?)" (OpenRead i1 + SeekGT + IdxGT + Column from index);
+          Pas emits OpenRead t + Rewind + Column from table.  Same
+          divergence on `WHERE a = 4`.  Root cause is upstream of
+          covering: wherePathSolver is not preferring any
+          whereLoopAddBtreeIndex output for these shapes.  Probable
+          culprits: whereShortCut fall-through cost mis-set, or the
+          rRun/nOut tally for indexed loops in whereLoopAddBtreeIndex
+          is bigger than the SCAN baseline so wherePathSolver picks
+          SCAN.  Investigation gate to open: dump the per-template
+          rRun/nOut from whereLoopAddBtree on this shape and compare
+          to C's WHERETRACE.
 
 - [~] **6.8.6** port the productive `sqlite3Insert` body (insert.c).
      Single-row VALUES path DONE.  Inline four-op shortcut replaced
