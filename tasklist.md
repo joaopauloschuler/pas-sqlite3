@@ -154,13 +154,31 @@ FPC porting traps that recur often enough to call out up-front:
 - [X] **6.8.1** finish porting `sqlite3Update` (update.c) — single-table
      arm DONE.  `passqlite3codegen.pas:23457..24115`, 1:1 port of
      `update.c:285..1163`.  Deferred sub-arms (early-bail today):
-     [ ] UPDATE FROM arm (multi-table source) — needs 6.8.4
-          multi-table WHERE; `nChangeFrom>0` early bail.
-     [ ] Virtual-table dispatch (`updateVirtualTable`) — vtab xUpdate
-          path; `eTabType=TABTYP_VTAB` early bail.
+     [ ] UPDATE FROM arm (multi-table source) — `updateFromSelect`
+          (update.c:187) still pending; sqlite3Update keeps the
+          `nChangeFrom>0` bail.  6.8.4 multi-table WHERE is now
+          available, so this is unblocked.
+     [X] Virtual-table dispatch (`updateVirtualTable`) — DONE.
+          `exprRowColumn` (update.c:143) and `updateVirtualTable`
+          (update.c:1196..1361) ported just before sqlite3Update; the
+          single-source arm replaces the early bail at update.c:646..652.
+          Scan uses a manual VOpen + VFilter(idxNum=0,argc=0) full-scan
+          (mirrors codegen.pas:23253 eponymous-vtab arm) since the
+          Pas WhereBegin's vtab arm is not yet wired; pWhere is applied
+          in-loop via sqlite3ExprIfFalse to a per-row skip label.
+          Argv layout (oldRowid/PK + newRowid/PK + col0..colN-1) is
+          buffered through an ephemeral table (avoids invalidating the
+          vtab cursor mid-scan), then drained by a Rewind/Column loop
+          that emits OP_VUpdate per row with P5=onError (OE_Default
+          folds to OE_Abort) + sqlite3MayAbort.  Multi-source FROM is
+          a graceful no-op (depends on UPDATE FROM above).  Bytecode
+          diverges from C (no xBestIndex pushdown) until WhereBegin
+          gains its vtab arm; runtime parity for `UPDATE vtab SET …
+          [WHERE …]` is restored.
      [X] RETURNING clause emission — DiagDml UPDATE-RETURNING PASS.
-     [ ] PREUPDATE_HOOK `OP_Delete OPFLAG_ISNOOP` arm — gated on
-          SQLITE_ENABLE_PREUPDATE_HOOK (not in the default build).
+     [X] PREUPDATE_HOOK `OP_Delete OPFLAG_ISNOOP` arm — N/A in the
+          default build (gated on SQLITE_ENABLE_PREUPDATE_HOOK, which
+          oracle and Pas both compile without).
 
 - [ ] **6.9** complete the porting:
     - [X] `sqlite3VdbeRecordCompare` — full body in btree.pas:3130;
