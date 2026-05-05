@@ -25739,6 +25739,48 @@ begin
   sqlite3VdbeSetColName(v, 0, COLNAME_NAME, zColName, SQLITE_STATIC);
 end;
 
+{ vtabIsReadOnly — port of delete.c:77.  Returns 1 if the virtual table
+  pTab is read-only for the current parse, 0 otherwise.  A vtab is read-
+  only when its module's xUpdate method is nil.  Inside triggers / DDL
+  prepare contexts (pToplevel<>nil or PREPARE_FROM_DDL), eVtabRisk above
+  the SQLITE_TrustedSchema threshold also surfaces an "unsafe use of
+  virtual table" diagnostic — but the result code is still 0 (returning
+  1 from this branch would change DML dispatch). }
+function vtabIsReadOnly(pParse: PParse; pTab: PTable2): i32;
+var
+  pVT:  passqlite3vtab.PVTable;
+  pMod: passqlite3vtab.PVtabModule;
+  riskThreshold: u8;
+begin
+  Assert(pTab^.eTabType = TABTYP_VTAB,
+         'vtabIsReadOnly: pTab is not a virtual table');
+  pVT := passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab));
+  if pVT = nil then begin Result := 1; Exit; end;
+  pMod := passqlite3vtab.PVtabModule(pVT^.pMod);
+  if (pMod = nil) or (pMod^.pModule = nil)
+     or (pMod^.pModule^.xUpdate = nil) then
+  begin
+    Result := 1;
+    Exit;
+  end;
+
+  { Inside triggers / DDL prepare, reject writes to high-risk vtabs
+    unless the connection has SQLITE_TrustedSchema turned on. }
+  if (pParse^.pToplevel <> nil)
+     or ((pParse^.prepFlags and SQLITE_PREPARE_FROM_DDL) <> 0) then
+  begin
+    if (pParse^.db^.flags and u64($00000080)) <> 0 then  { SQLITE_TrustedSchema }
+      riskThreshold := 1
+    else
+      riskThreshold := 0;
+    if pVT^.eVtabRisk > riskThreshold then
+      sqlite3ErrorMsg(pParse,
+        PAnsiChar('unsafe use of virtual table "' +
+                  AnsiString(pTab^.zName) + '"'));
+  end;
+  Result := 0;
+end;
+
 { tabIsReadOnly — port of delete.c:98 (file-static helper).
   Returns 1 if pTab is a read-only system / shadow table for the current parse,
   0 otherwise.  Virtual-table arm omitted in this port — vtab xUpdate gating
@@ -25749,12 +25791,13 @@ var
   db: PTsqlite3;
 begin
   if pTab^.eTabType = TABTYP_VTAB then begin
-    { TODO(Phase 6.x): vtabIsReadOnly — needs sqlite3GetVTable + vtab risk
-      check (delete.c:77).  Treat as writable for now; vtab DML is not
-      exercised in the current corpus.  Avoids dragging passqlite3vtab into
-      codegen's implementation uses (same choice as step 11a's IsVirtual
-      assertion deferral). }
-    Result := 0;
+    { vtabIsReadOnly — port of delete.c:77.  A vtab is read-only when its
+      module has no xUpdate.  Within triggers / DDL prepare, also reject
+      writes to a vtab whose eVtabRisk exceeds SQLITE_TrustedSchema.  pTab
+      ->u.vtab.p resolves through sqlite3GetVTable; pMod is opaque (Pointer)
+      in this unit so we cast to passqlite3vtab.PVtabModule before reaching
+      pModule^.xUpdate. }
+    Result := vtabIsReadOnly(pParse, pTab);
     Exit;
   end;
   if (pTab^.tabFlags and (TF_Readonly or TF_Shadow)) = 0 then begin
@@ -34152,12 +34195,18 @@ begin
       Inc(iDb);
     until iDb >= db^.nDb;
 
-    { TODO(Phase 6.x): OMIT_VIRTUALTABLE — emit OP_VBegin for each
-      pParse^.apVtabLock entry.  Skipped while the typed apVtabLock field
-      is still a raw Pointer in TParse and nVtabLock stays 0. }
+    { OMIT_VIRTUALTABLE — emit OP_VBegin for each pParse^.apVtabLock entry.
+      Faithful port of build.c:222..226: each apVtabLock[i] is a Table*
+      whose VTable* (sqlite3GetVTable) is passed as the OP_VBegin P4 payload
+      (P4_VTAB).  apVtabLock is allocated as a raw pointer array by
+      sqlite3VtabMakeWritable (vtab.pas:1378). }
     if pParse^.nVtabLock > 0 then begin
-      { Placeholder — no-op until apVtabLock is properly typed and
-        sqlite3GetVTable casts to the OP_VBegin pVTab payload. }
+      for ix := 0 to pParse^.nVtabLock - 1 do begin
+        sqlite3VdbeAddOp4(v, OP_VBegin, 0, 0, 0,
+          PAnsiChar(passqlite3vtab.sqlite3GetVTable(db,
+                      PPointer(pParse^.apVtabLock)[ix])),
+          P4_VTAB);
+      end;
       pParse^.nVtabLock := 0;
     end;
 

@@ -339,6 +339,17 @@ FPC porting traps that recur often enough to call out up-front:
             to a no-op (db is opaque in btree.pas); the
             SQLITE_CellSizeCk save/restore arm is dropped (perf
             optimisation, not correctness).
+       [X] Port `vtabIsReadOnly` (delete.c:77) and wire it into
+            `tabIsReadOnly`'s vtab arm (codegen.pas).  Replaces the
+            "treat as writable for now" placeholder with the real
+            xUpdate-nil check + eVtabRisk threshold diagnostic
+            ("unsafe use of virtual table") inside trigger / DDL
+            prepare contexts.
+       [X] Port the OP_VBegin emission loop in `sqlite3FinishCoding`
+            (build.c:222..226).  Iterates `pParse^.apVtabLock`, looks
+            up each Table*'s VTable* via `sqlite3GetVTable`, and
+            emits OP_VBegin with P4_VTAB.  Replaces the "no-op until
+            apVtabLock is properly typed" placeholder.
 
 ### Open Bugs
 
