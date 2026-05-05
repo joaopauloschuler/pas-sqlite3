@@ -275,14 +275,19 @@ FPC porting traps that recur often enough to call out up-front:
             body landed in passqlite3main.pas, wired into OP_Vacuum via
             new vdbeRunVacuum hook.  Faithful 1:1 with the
             !SQLITE_OMIT_VACUUM && !SQLITE_OMIT_ATTACH arm; PREUPDATE_HOOK
-            and AUTHORIZATION arms left out (default build).  End-to-end
-            VACUUM still fails (out-of-memory or SQL-logic-error) because
-            ATTACH-side schema reload is gated on Phase 7.1.1 (sqlite3InitOne)
-            — the new aDb[] slot is opened but the on-disk schema is not
-            loaded, so the schema-mirror SELECTs run against an empty
-            target.  Skeleton is harmless: existing tests (TestExplainParity,
-            DiagVacuum, DiagOps, DiagPragma, …) all green; only direct
-            user-issued VACUUM degrades from silent-no-op to error.
+            and AUTHORIZATION arms left out (default build).
+            2026-05-05 (a3): with Phase 7.1.1 InitOne landed,
+            `VACUUM INTO 'file.db'` now works end-to-end — verified by
+            opening :memory:, CREATE+INSERT+VACUUM INTO, then re-opening
+            the destination file and reading back all rows.  Plain
+            `VACUUM` (in-place) still fails with rc=7 SQLITE_NOMEM and
+            leaves the source DB in a degraded state (post-VACUUM
+            count(*) returns 0 instead of the original row count), so
+            **plain VACUUM is the remaining gap** — most likely the
+            in-place finalize path that swaps the temp btree back into
+            the main aDb[0] slot (vacuum.c:343..366).  VACUUM INTO
+            takes the simpler "open dest btree, copy, close" path and
+            no longer touches the source schema cache.
        [X] Port `sqlite3FkCheck` (fkey.c) — DONE.  fkScanChildren
             (fkey.c:547..660) and the dispatcher body (fkey.c:889..
             1087) ported at codegen.pas:38136..38470, replacing the
