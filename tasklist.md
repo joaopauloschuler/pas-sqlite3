@@ -651,14 +651,19 @@ FPC porting traps that recur often enough to call out up-front:
             DROP TABLE 6.11(b), VACUUM 6.27, ATTACH-reload 7.1.8,
             ALTER TABLE 7.1.9).  Last load-bearing piece.
 
-- [ ] **7.1.2** `sqlite3NestedParse` full driver (build.c).  The
-       current skeleton (codegen.pas:25041) early-exits when
-       `zFormat=nil`; printf-formatted call sites for DROP/UPDATE
-       sqlite_master are still wired with `nil`.  Required for:
-       DROP TABLE autovacuum follow-on (current Δ=26 — see 6.11), the
-       CREATE TABLE schema-row INSERT, and the destroyRootPage
-       UPDATE sqlite_master path.  Closes the last contributor of
-       6.11(b).
+- [X] **7.1.2** `sqlite3NestedParse` full driver (build.c).  Body at
+       codegen.pas:34537 — productive 1:1 port of build.c:293..323.
+       All call sites now pass real format strings (no remaining
+       `zFormat=nil` placeholders): destroyRootPage UPDATE
+       sqlite_schema (codegen.pas:32647), DROP TABLE / DROP INDEX
+       sqlite_statN cleanup (32685), CREATE TRIGGER schema-row INSERT
+       (25053), CREATE INDEX, CREATE VIEW, ALTER TABLE rename helpers.
+       Driven through `gNestedRunParser` hook installed by
+       passqlite3parser.  Remaining schema-mutation gaps (DROP TABLE
+       Δ=26, ALTER TABLE no-op) sit in the schema-cache reload path
+       (Phase 7.1.1 last item) — sqlite3Insert / sqlite3Update against
+       sqlite_master emit ops but the in-memory schema cache is not
+       reloaded, so the new rows aren't visible to the next prepare.
 
 - [~] **7.1.8** ATTACH / DETACH (attach.c) — codegen path productive
        (closes the prior parse-time stubs).  Parser productions for

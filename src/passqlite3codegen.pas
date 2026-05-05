@@ -28560,10 +28560,10 @@ begin
     Hand-rolled inline of the schema-row INSERT path used by sqlite3NestedParse
     (CREATE INDEX / DROP INDEX / DROP TABLE / sqlite_statN cleanup).  Mirrors
     the C reference's "no triggers, no IDLIST, no view, no UPSERT, HasRowid"
-    shape but skips the full sqlite3GenerateConstraintChecks /
-    sqlite3CompleteInsertion path (those still stubs) — emits the four-op
-    OpenWrite / column-eval / NewRowid / MakeRecord / Insert sequence
-    directly. }
+    shape — emits the four-op OpenWrite / column-eval / NewRowid /
+    MakeRecord / Insert sequence directly.  sqlite3GenerateConstraintChecks
+    (6.8.2) and sqlite3CompleteInsertion (6.8.3) are now real bodies; the
+    productive sqlite3Insert cascade routes through them via 6.8.6. }
   { pList = nil  ⇔  INSERT … DEFAULT VALUES (insert.c:1213..1215).
     For multi-row VALUES (isMulti), nColumn is taken from the first row;
     parity across rows was already validated above. }
@@ -32667,10 +32667,8 @@ end;
 { sqlite3ClearStatTables — port of build.c:3364 (static).
   Emit DELETE-from-sqlite_statN sub-statements after a DROP TABLE / DROP
   INDEX.  zType is "tbl" or "idx", zName is the dropped object's name.
-  Walks N=1..4 and only fires for stat-tables that exist.
-  sqlite3NestedParse is still a stub today, so this currently emits no
-  ops; structural port lands now so callers don't need to be re-edited
-  when NestedParse goes real. }
+  Walks N=1..4 and only fires for stat-tables that exist.  sqlite3NestedParse
+  is now productive (Phase 7.1.2), so the emitted DELETEs reach the parser. }
 procedure sqlite3ClearStatTables(pParse: PParse; iDb: i32;
   zType: PAnsiChar; zName: PAnsiChar);
 var
