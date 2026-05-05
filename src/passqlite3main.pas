@@ -4913,10 +4913,254 @@ end_of_vacuum:
   Result := rc;
 end;
 
+{ ----------------------------------------------------------------------
+  Phase 7.1.1 — sqlite3InitOne / sqlite3Init / productive sqlite3ReadSchema.
+
+  Faithful port of prepare.c:199..464.  sqlite3ReadSchema's caller-side
+  delegation lives in passqlite3codegen (sqlite3ReadSchema body now
+  dispatches through gSqlite3Init); the bodies live here because they
+  drive sqlite3_exec on `SELECT*FROM <db>.<sqlite_master> ORDER BY rowid`
+  — already wired through main's sqlite3_exec / sqlite3InitCallback.
+
+  Source map (line-for-line with prepare.c):
+    sqlite3InitOne — prepare.c:199..427
+    sqlite3Init    — prepare.c:438..464
+
+  Deviations from the C reference (kept in sync with the surrounding
+  port surface):
+    * SCHEMA_TABLE(iDb) is hard-coded as LEGACY_(TEMP_)SCHEMA_TABLE per
+      execParseSchemaImpl's existing pattern.  PREFERRED_SCHEMA_TABLE
+      ("sqlite_schema") is not yet honoured at the SELECT site.
+    * SQLITE_OMIT_AUTHORIZATION arms left out (not in default build).
+    * SQLITE_OMIT_DEPRECATED's `size` accessor honoured — meta[2] still
+      drives cache_size when non-zero.
+    * sqlite3BtreeEnter/Leave reduce to no-ops in the no-shared-cache
+      build but the call shape is preserved for future re-enablement.
+    * The `sqlite3_xauth xAuth = db->xAuth; db->xAuth = 0` save/restore
+      is omitted (xAuth gating not in this port).
+    * The DBFLAG_EncodingFixed mask gymnastics are mirrored exactly:
+      db->mDbFlags &= mask after the bootstrap callback so encoding is
+      not pinned by the synthesised "table" row at iDb=0. }
+function sqlite3InitOne(db: PTsqlite3; iDb: i32; pzErrMsg: PPAnsiChar;
+                        mFlags: u32): i32;
+label
+  initone_error_out, error_out;
+const
+  DBFLAG_EncodingFixed_L = u32($0040);
+  SQLITE_MAX_FILE_FORMAT_L = 4;
+var
+  rc:                i32;
+  i:                 i32;
+  size:              i32;
+  pDb:               passqlite3util.PDb;
+  azArg:             array[0..5] of PAnsiChar;
+  meta:              array[0..4] of i32;
+  initData:          TInitData;
+  zSchemaTabName:    PAnsiChar;
+  zSchemaTabBuf:     AnsiString;
+  openedTransaction: i32;
+  mask:              u32;
+  pBt:               PBtree;
+  pSchm:             passqlite3util.PSchema;
+  zSql:              PAnsiChar;
+  encoding:          u8;
+  metaU32:           u32;
+begin
+  rc := SQLITE_OK;
+  openedTransaction := 0;
+  Assert((db^.mDbFlags and u32(DBFLAG_SchemaKnownOk)) = 0);
+  Assert((iDb >= 0) and (iDb < db^.nDb));
+  pDb := @db^.aDb[iDb];
+  Assert(pDb^.pSchema <> nil);
+
+  mask := (db^.mDbFlags and DBFLAG_EncodingFixed_L)
+          or (not DBFLAG_EncodingFixed_L);
+
+  db^.init.busy := 1;
+
+  { Bootstrap the in-memory sqlite_(temp_)schema table by hand.  The
+    Pascal port already pre-installs system tables via
+    sqlite3InstallSchemaTable in openDatabase, so this synthesised row
+    becomes a no-op (sqlite3InitCallback's branch (b) short-circuits on
+    sqlite3FindTable = non-nil).  Mirror the C reference for parity. }
+  if iDb = 1 then zSchemaTabBuf := LEGACY_TEMP_SCHEMA_TABLE
+              else zSchemaTabBuf := LEGACY_SCHEMA_TABLE;
+  zSchemaTabName := PAnsiChar(zSchemaTabBuf);
+  azArg[0] := PAnsiChar('table');
+  azArg[1] := zSchemaTabName;
+  azArg[2] := zSchemaTabName;
+  azArg[3] := PAnsiChar('1');
+  azArg[4] := PAnsiChar('CREATE TABLE x(type text,name text,tbl_name text,'
+                        + 'rootpage int,sql text)');
+  azArg[5] := nil;
+  initData.db         := db;
+  initData.iDb        := iDb;
+  initData.rc         := SQLITE_OK;
+  initData.pzErrMsg   := pzErrMsg;
+  initData.mInitFlags := mFlags;
+  initData.nInitRow   := 0;
+  initData.mxPage     := 0;
+  sqlite3InitCallback(@initData, 5, PPAnsiChar(@azArg[0]), nil);
+  db^.mDbFlags := db^.mDbFlags and mask;
+  if initData.rc <> SQLITE_OK then begin
+    rc := initData.rc;
+    goto error_out;
+  end;
+
+  pBt := PBtree(pDb^.pBt);
+  if pBt = nil then begin
+    Assert(iDb = 1);
+    pSchm := passqlite3util.PSchema(pDb^.pSchema);
+    if pSchm <> nil then
+      pSchm^.schemaFlags := pSchm^.schemaFlags or DB_SchemaLoaded;
+    rc := SQLITE_OK;
+    goto error_out;
+  end;
+
+  { Open a read transaction if not already inside one. }
+  if sqlite3BtreeTxnState(pBt) = SQLITE_TXN_NONE then begin
+    rc := sqlite3BtreeBeginTrans(pBt, 0, nil);
+    if rc <> SQLITE_OK then begin
+      sqlite3SetString(pzErrMsg, db, sqlite3ErrStr(rc));
+      goto initone_error_out;
+    end;
+    openedTransaction := 1;
+  end;
+
+  for i := 0 to 4 do begin
+    metaU32 := 0;
+    sqlite3BtreeGetMeta(pBt, i + 1, @metaU32);
+    meta[i] := i32(metaU32);
+  end;
+  if (db^.flags and SQLITE_ResetDatabase_Bit) <> 0 then
+    FillChar(meta, SizeOf(meta), 0);
+  pSchm := passqlite3util.PSchema(pDb^.pSchema);
+  if pSchm <> nil then
+    pSchm^.schema_cookie := meta[BTREE_SCHEMA_VERSION - 1];
+
+  { Encoding: meta[BTREE_TEXT_ENCODING-1] non-zero on a non-empty DB. }
+  if meta[BTREE_TEXT_ENCODING - 1] <> 0 then begin
+    if (iDb = 0)
+       and ((db^.mDbFlags and DBFLAG_EncodingFixed_L) = 0) then begin
+      encoding := u8(meta[BTREE_TEXT_ENCODING - 1] and 3);
+      if encoding = 0 then encoding := SQLITE_UTF8;
+      sqlite3SetTextEncoding(db, encoding);
+    end else begin
+      if u8(meta[BTREE_TEXT_ENCODING - 1] and 3) <> db^.enc then begin
+        sqlite3SetString(pzErrMsg, db,
+          PAnsiChar('attached databases must use the same'
+                    + ' text encoding as main database'));
+        rc := SQLITE_ERROR;
+        goto initone_error_out;
+      end;
+    end;
+  end;
+  if pSchm <> nil then
+    pSchm^.enc := db^.enc;
+
+  if (pSchm <> nil) and (pSchm^.cache_size = 0) then begin
+    size := meta[BTREE_DEFAULT_CACHE_SIZE - 1];
+    if size < 0 then size := -size;
+    if size = 0 then size := SQLITE_DEFAULT_CACHE_SIZE;
+    pSchm^.cache_size := size;
+    sqlite3BtreeSetCacheSize(pBt, pSchm^.cache_size);
+  end;
+
+  { File format. }
+  if pSchm <> nil then begin
+    pSchm^.file_format := u8(meta[BTREE_FILE_FORMAT - 1]);
+    if pSchm^.file_format = 0 then pSchm^.file_format := 1;
+    if pSchm^.file_format > SQLITE_MAX_FILE_FORMAT_L then begin
+      sqlite3SetString(pzErrMsg, db, PAnsiChar('unsupported file format'));
+      rc := SQLITE_ERROR;
+      goto initone_error_out;
+    end;
+  end;
+
+  if (iDb = 0) and (meta[BTREE_FILE_FORMAT - 1] >= 4) then
+    db^.flags := db^.flags and (not SQLITE_LegacyFileFmt);
+
+  Assert(db^.init.busy <> 0);
+  initData.mxPage := sqlite3BtreeLastPage(pBt);
+  zSql := sqlite3MPrintf(db,
+            'SELECT*FROM"%w".%s ORDER BY rowid',
+            [pDb^.zDbSName, zSchemaTabName]);
+  if zSql = nil then begin
+    rc := SQLITE_NOMEM;
+  end else begin
+    rc := sqlite3_exec(db, zSql, @sqlite3InitCallback, @initData, nil);
+    if rc = SQLITE_OK then rc := initData.rc;
+    sqlite3DbFree(db, zSql);
+    if rc = SQLITE_OK then
+      sqlite3AnalysisLoad(db, iDb);
+  end;
+
+  if db^.mallocFailed <> 0 then begin
+    rc := SQLITE_NOMEM;
+    sqlite3ResetAllSchemasOfConnection(db);
+    pDb := @db^.aDb[iDb];
+  end else if (rc = SQLITE_OK)
+              or (((db^.flags and SQLITE_NoSchemaError_Bit) <> 0)
+                  and (rc <> SQLITE_NOMEM)) then begin
+    pSchm := passqlite3util.PSchema(pDb^.pSchema);
+    if pSchm <> nil then
+      pSchm^.schemaFlags := pSchm^.schemaFlags or DB_SchemaLoaded;
+    rc := SQLITE_OK;
+  end;
+
+initone_error_out:
+  if openedTransaction <> 0 then
+    sqlite3BtreeCommit(pBt);
+
+error_out:
+  if rc <> SQLITE_OK then begin
+    if (rc = SQLITE_NOMEM) or (rc = SQLITE_IOERR or (12 shl 8)) then
+      sqlite3OomFault(db);
+    sqlite3ResetOneSchema(db, iDb);
+  end;
+  db^.init.busy := 0;
+  Result := rc;
+end;
+
+function sqlite3Init(db: PTsqlite3; pzErrMsg: PPAnsiChar): i32;
+var
+  i, rc:           i32;
+  commit_internal: i32;
+  pSchm:           passqlite3util.PSchema;
+begin
+  if (db^.mDbFlags and DBFLAG_SchemaChange) <> 0 then
+    commit_internal := 0
+  else
+    commit_internal := 1;
+  Assert(db^.init.busy = 0);
+  if db^.aDb[0].pSchema <> nil then
+    db^.enc := passqlite3util.PSchema(db^.aDb[0].pSchema)^.enc;
+  Assert(db^.nDb > 0);
+  { Main first. }
+  pSchm := passqlite3util.PSchema(db^.aDb[0].pSchema);
+  if (pSchm = nil) or ((pSchm^.schemaFlags and DB_SchemaLoaded) = 0) then begin
+    rc := sqlite3InitOne(db, 0, pzErrMsg, 0);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+  { All other schemas after the main schema; temp must be last. }
+  for i := db^.nDb - 1 downto 1 do begin
+    pSchm := passqlite3util.PSchema(db^.aDb[i].pSchema);
+    if (pSchm = nil) or ((pSchm^.schemaFlags and DB_SchemaLoaded) = 0) then begin
+      rc := sqlite3InitOne(db, i, pzErrMsg, 0);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+    end;
+  end;
+  if commit_internal <> 0 then
+    sqlite3CommitInternalChanges(db);
+  Result := SQLITE_OK;
+end;
+
 initialization
   vdbeParseSchemaExec := @execParseSchemaImpl;
   vdbeSqlExec := @execSqlExecImpl;
   vdbeRunVacuum := @runVacuumImpl;
+  passqlite3codegen.gSqlite3Init :=
+    passqlite3codegen.TSqlite3InitFn(@sqlite3Init);
 
   { Phase 5.8: wire the parser tokenizer into vdbetrace's ExpandSql so
     bound-parameter scanning works.  Done here (not in passqlite3parser)

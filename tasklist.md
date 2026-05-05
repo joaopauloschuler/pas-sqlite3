@@ -62,8 +62,9 @@ FPC porting traps that recur often enough to call out up-front:
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
 > **2026-05-05 (a3):** TestExplainParity reports **1025 / 1026 PASS**
-> (re-confirmed).  Only the multi-row VALUES coroutine row diverges
-> (C=22 vs Pas=17 ops; see 6.10 step 6).
+> (re-confirmed after Phase 7.1.1 InitOne/Init port lands).  Only the
+> multi-row VALUES coroutine row diverges (C=22 vs Pas=17 ops; see
+> 6.10 step 6).
 
 - [X] **6.8.0** Pragma (pragma.c): `sqlite3PragmaVtabRegister` — DONE.
      1:1 port of pragma.c:2791..3101 (aPragmaName, pragCName, all 12
@@ -597,20 +598,32 @@ FPC porting traps that recur often enough to call out up-front:
 
 ## Phase 7 — Parser
 
-- [ ] **7.1.1** Schema initialisation (prepare.c).  Currently
-       `sqlite3ReadSchema` (codegen.pas:21928) returns `SQLITE_OK`
-       without reading anything; tests pre-populate the schema.  Port
-       in full:
-       [ ] Port `sqlite3ReadSchema` — drive the schema-load query.
-       [ ] Port `sqlite3Init`
-       [ ] Port `sqlite3InitOne` (prepare.c) — read each
-            sqlite_master row and parse its CREATE statement via
-            `sqlite3NestedParse`.
-       [ ] Port `sqlite3InitCallback` (main.pas:2063) — currently installs
-            only system tables; full body parses each schema row.
-       [ ] Port `sqlite3RunParser` (tokenize.c) — the underlying
-            parser entry that `sqlite3NestedParse` and the prepare
-            path both call.  (Moved here from old 6.25.)
+- [~] **7.1.1** Schema initialisation (prepare.c).  Bodies for
+       sqlite3InitOne / sqlite3Init / sqlite3ReadSchema are now ported
+       1:1 with prepare.c:199..484.  TestExplainParity 1025/1026
+       holds; Diag suite stable (no regressions surfaced by activating
+       the productive path).  Remaining sub-arms below.
+       [X] Port `sqlite3ReadSchema` — productive body in
+            passqlite3codegen.pas (delegates through gSqlite3Init).
+       [X] Port `sqlite3Init` — passqlite3main.pas; iterates aDb[]
+            main-first / temp-last per prepare.c:438..464.
+       [X] Port `sqlite3InitOne` (prepare.c:199..427) — read meta
+            cookies (encoding, file_format, schema_cookie, cache_size),
+            run `SELECT*FROM "<dbname>".<sqlite_master> ORDER BY rowid`
+            via sqlite3_exec → sqlite3InitCallback, then
+            sqlite3AnalysisLoad.  The synthesised bootstrap "table"
+            row at iDb=0 is a no-op against the in-memory schema
+            because sqlite3InstallSchemaTable already pre-installs
+            sqlite_master before InitOne runs.
+       [X] Port `sqlite3InitCallback` — already complete in main.pas
+            (re-prepare under init.busy=1 publishes to tblHash).
+       [ ] Port `sqlite3RunParser` (tokenize.c) — moved here from
+            6.25.  Independent of the InitOne path above.
+       [ ] Schema-row INSERT / UPDATE wiring — sqlite3Insert against
+            sqlite_master still emits zero rows, so a re-open does
+            not pick up Pascal-port-created user tables (gates
+            DROP TABLE 6.11(b), VACUUM 6.27, ATTACH-reload 7.1.8,
+            ALTER TABLE 7.1.9).  Last load-bearing piece.
 
 - [ ] **7.1.2** `sqlite3NestedParse` full driver (build.c).  The
        current skeleton (codegen.pas:25041) early-exits when

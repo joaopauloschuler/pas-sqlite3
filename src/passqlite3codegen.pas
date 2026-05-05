@@ -2862,9 +2862,16 @@ type
     containing the canonical "CREATE TABLE name(col TYPE,...)" text;
     caller takes ownership.  Used by sqlite3EndTable on the AS SELECT arm. }
   TCreateTableStmtFn = function(db: PTsqlite3; p: PTable2): PAnsiChar;
+  { Phase 7.1.1 hook — installed by passqlite3main at unit init.  When
+    set, sqlite3ReadSchema delegates to the productive sqlite3Init body
+    (prepare.c:438..464) instead of returning SQLITE_OK unconditionally.
+    Allows codegen to drive on-disk schema reload without a circular
+    use clause back into passqlite3main. }
+  TSqlite3InitFn = function(db: PTsqlite3; pzErrMsg: PPAnsiChar): i32;
 var
   gNestedRunParser:  TNestedRunParserFn;
   gCreateTableStmt:  TCreateTableStmtFn;
+  gSqlite3Init:      TSqlite3InitFn;
 
 { Column helper from build.c }
 function  sqlite3ColumnExpr(pTab: PTable2; pCol: PColumn): PExpr;
@@ -30383,12 +30390,28 @@ begin
   end;
 end;
 
-{ sqlite3ReadSchema — ensure schema is loaded; stub returns SQLITE_OK (prepare.c:470) }
+{ sqlite3ReadSchema — prepare.c:470.  No-op when init.busy is set
+  (re-entry guard); otherwise delegate to gSqlite3Init (passqlite3main's
+  sqlite3Init port).  Mirrors the C reference's `if(!db->init.busy){…}`
+  control-flow including the noSharedCache short-circuit that sets
+  DBFLAG_SchemaKnownOk on success. }
 function sqlite3ReadSchema(pParse: PParse): i32;
+var
+  db: PTsqlite3;
+  rc: i32;
 begin
-  { Phase 7 will implement full schema initialisation from sqlite_master.
-    For now assume schema is already valid (test infrastructure pre-populates). }
-  Result := SQLITE_OK;
+  rc := SQLITE_OK;
+  db := pParse^.db;
+  if db^.init.busy = 0 then begin
+    if Assigned(gSqlite3Init) then
+      rc := gSqlite3Init(db, @pParse^.zErrMsg);
+    if rc <> SQLITE_OK then begin
+      pParse^.rc := rc;
+      Inc(pParse^.nErr);
+    end else if db^.noSharedCache <> 0 then
+      db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaKnownOk);
+  end;
+  Result := rc;
 end;
 
 { sqlite3LocateTable — find table, reporting error if not found (build.c:408) }
