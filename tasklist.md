@@ -316,8 +316,14 @@ FPC porting traps that recur often enough to call out up-front:
           inner pSrc) so the spliced-in inner item carries the expected
           number.
         [ ] `INSERT multi-row VALUES` — Runtime parity reached; bytecode
-          parity needs the coroutine arm of sqlite3MultiValues
-          (deferred — runtime is correct).
+          parity needs the coroutine arm of sqlite3MultiValues AND the
+          matching sqlite3Insert consumer for a Select with a
+          viaCoroutine SrcItem (reads pSubq^.regResult..+nSdst-1 in
+          place — insert.c:1030..1500 chunk).  All helpers ported
+          (sqlite3SrcItemAttachSubquery, sqlite3VdbeEndCoroutine,
+          OP_InitCoroutine/Yield, sqlite3SelectDestInit, etc.) — the
+          gap is purely the consumer side.  Deferred — runtime is
+          correct via UNION-ALL fallback.
         [X] `SELECT p FROM u;` — DONE (2026-05-03).  Ported
           `estimateIndexWidth` (build.c:2236) so autoindex rows carry
           a non-zero szIdxRow, replaced the hard-coded `210` in

@@ -27985,20 +27985,17 @@ begin
   Result := 1;
 end;
 
-{ sqlite3MultiValues — port of insert.c:660.  UNION-ALL fallback arm.
+{ sqlite3MultiValues — port of insert.c:679.  UNION-ALL fallback arm.
 
   The C reference picks between two strategies:
     * a co-routine that yields each row at run-time (the fast path), or
     * a compound "pLeft UNION ALL SELECT pRow" Select tree (the fallback).
 
-  The co-routine arm depends on sqlite3Select / sqlite3ExprCodeExprList /
-  OP_InitCoroutine / OP_Yield / sqlite3VdbeEndCoroutine, none of which are
-  yet wired into the codegen pipeline at this layer.  Until they land we
-  unconditionally take the UNION-ALL fallback — correct, just slower.
-  Conservative because sqlite3Insert's pSelect path is itself a stub
-  (codegen.pas:19756 TODO), so the chain currently still drops rows past
-  the first; the productive consumer arrives with the matching
-  sqlite3Insert + compound-SELECT codegen work in 6.10 step 6 / step 9 (e). }
+  The co-routine arm requires sqlite3Insert to consume a Select with a
+  viaCoroutine SrcItem in its pSrc — productively reading the iSdst
+  registers in place — which is not yet wired (see tasklist 6.10 step 6).
+  Until that lands we unconditionally take the UNION-ALL fallback —
+  correct, just slower, and runtime parity is preserved. }
 function sqlite3MultiValues(pParse: PParse; pLeft: PSelect;
   pRow: PExprList): PSelect;
 var
