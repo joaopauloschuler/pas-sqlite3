@@ -475,13 +475,24 @@ FPC porting traps that recur often enough to call out up-front:
                 WithRecursiveQuery so the no-FROM / regular gates fire.
             Recursive step (`SELECT n+1 FROM r WHERE n<5` against the
             iCurrent pseudo-cursor) still bails — the regular SELECT
-            path bails at the TF_Ephemeral check (codegen.pas:23365)
-            on r's synthesized table.  Lifting the bail emits Rewind/
-            Next on the pseudo-cursor (wrong: WhereBegin's isRecursive
-            arm at codegen.pas:18229 should fire OP_Noop, but the
-            broader scan path doesn't honour it yet — needs full
-            isRecursive plumbing in WhereBegin or a recursive-arm-
-            specific inline emit here).
+            path bails at the TF_Ephemeral check (codegen.pas:23367)
+            on r's synthesized table.  WhereBegin's isRecursive arm at
+            codegen.pas:18231 already emits OP_Noop in case 6 (correct).
+            2026-05-05 audit (a3): narrowing the bail to skip when
+            `fg.fgBits and $80` (isRecursive bit) is set lets DiagFeatureProbe
+            reach the scan body but immediately AVs at runtime — DiagFeatureProbe
+            "CTE recursive" raises EAccessViolation before any other diagnostics
+            print, so the AV is upstream of the emission of OP_Noop.  Likely
+            culprits: (a) pTab^.aCol / nCol on the synthetic recursive table is
+            still partially populated so OP_Column resolution dereferences
+            through a stale Column*; (b) the per-row push-down WHERE walk
+            (codegen.pas:18272) tries to evaluate `n<5` against iCurrent
+            without the column-cache rewriting expected by C wherecode.c
+            ("isRecursive" branch around line 2568); (c) sqlite3GenerateColumnNames
+            for the outer SELECT may dereference items[i].pExpr.y.pTab where
+            pTab is freed when SF_Compound is cleared.  Reproducer: lift the
+            bail with `if (fgBits and $80) = 0` guard, then run
+            `LD_LIBRARY_PATH=src bin/DiagFeatureProbe`.
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
