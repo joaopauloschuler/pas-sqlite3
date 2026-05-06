@@ -531,6 +531,36 @@ FPC porting traps that recur often enough to call out up-front:
        in C's sqlite3NestedParse(INSERT INTO sqlite_master ...).
        Lifts CREATE INDEX rows; remaining CREATE UNIQUE INDEX gap is
        a separate KeyInfo/nKeyField issue tracked in the test header.
+  [ ] **7.4b.4** CREATE UNIQUE INDEX SorterOpen KeyInfo nKeyField.
+       Surfaced 2026-05-06 by TestBytecodeParity.  For
+       `CREATE UNIQUE INDEX i2 ON t(b)` Pascal emits SorterOpen p4=
+       "k(1,)" (1 key field) while C emits "k(2,,)" (2 fields:
+       indexed col + rowid tail).  Pascal's `sqlite3KeyInfoOfIndex`
+       (codegen.pas:29065) takes the `uniqNotNull` branch and passes
+       `nKeyCol` to `sqlite3KeyInfoAlloc` — but C's build.c CreateIndex
+       passes `nColumn` (which already includes the rowid tail for
+       unique indexes on rowid tables).  Fix is local to the
+       KeyInfoAlloc call sites that target SorterOpen.
+  [ ] **7.4b.5** Implicit PK / WITHOUT ROWID index MakeRecord p4
+       affinity.  Surfaced 2026-05-06 by TestBytecodeParity (rows
+       parked).  `CREATE TABLE z7(a,b, PRIMARY KEY(a,b))` and
+       `CREATE TABLE z8(a PRIMARY KEY, b) WITHOUT ROWID` both emit
+       a real-PK-index MakeRecord whose p4 affinity is empty on
+       Pascal vs the table affinity string on C.  Distinct from
+       7.4b.3 (sqlite_master schema-row affinity, fixed): this is
+       the index-key MakeRecord at the Pascal equivalent of
+       insert.c:204..222, where `pTab->zColAff` should be looked up
+       and `sqlite3VdbeChangeP4` applied to the just-emitted
+       MakeRecord.  Once landed, fold composite PK / WITHOUT ROWID
+       rows back into TestBytecodeParity (currently EXCLUDED).
+  [ ] **7.4b.6** DiagCovering "prepare failed" on covering-index
+       lookup against `u(p PRIMARY KEY, q)`.  Surfaced 2026-05-06
+       (pre-existed before 7.4b but uncovered while sweeping the
+       test suite).  `SELECT a FROM u WHERE a=5` returns prepare
+       failure on the Pascal side; the rest of DiagCovering's
+       corpus runs cleanly.  Likely a WITHOUT-ROWID column-resolution
+       gap inside the covering-index plan path; investigate after
+       7.4b.5 since the two share the WITHOUT-ROWID surface.
 
 - [X] **7.4c** `TestVdbeTrace.pas` differential opcode-trace gate.  Done
   2026-05-06.  `passqlite3vdbe` exports `gVdbeTraceBuf` and the
