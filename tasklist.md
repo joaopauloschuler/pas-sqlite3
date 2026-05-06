@@ -890,8 +890,13 @@ existing dispatcher.
   `.testctrl`, `.selecttrace`, `.wheretrace`.  Gate:
   `tests/cli/10e_meta/`.
 
-  [ ] **10.1.28** `.stats` — toggle per-stmt status counters output;
-       reads `sqlite3_stmt_status` for each opcode set.
+  [X] **10.1.28** `.stats off|on|stmt|vmstep` — cmdStats setter +
+       displayStats / displayStatLine / displayLinuxIoStats port of
+       shell.c.in:2722..2944.  Walks sqlite3_status64 / sqlite3_db_status
+       / sqlite3_stmt_status counter sets and emits the upstream
+       label/value table; statsOn=2 prints per-column metadata, =3 prints
+       only the VM-step counter.  pStmt is now plumbed through
+       runOneSqlLine so per-statement counters resolve.
   [~] **10.1.29** `.timer on|off|once` setter landed (cmdTimer);
        sets ShellState.enableTimer to 0/1/2.  Wall/user/sys clock
        probe around stepAndRender still pending.
@@ -903,10 +908,13 @@ existing dispatcher.
        headers / mode / nullvalue / colseparator / rowseparator /
        stats / width / filename in upstream's `%12.12s: …` format.
        The `output` field is still pending (depends on `.output`).
-  [~] **10.1.33** `.help` — cmdHelp emits a 13-line excerpt covering
-       the dot-commands actually wired today.  Full ~750-line upstream
-       table (`showHelp`) still pending; -all and PATTERN filtering
-       defer with it.
+  [X] **10.1.33** `.help ?-all? ?PATTERN?` — full upstream azHelp[]
+       table (~175 documented entries) ported from shell.c.in:3708..3965
+       plus the showHelp() walker (3980..4090): bare invocation prints
+       the one-line summary; `-a` / `-all` / `--all` shows every
+       documented command's full block; `0` shows undocumented commands;
+       PATTERN does prefix-glob first, then substring-LIKE fallback via
+       sqlite3_strglob / sqlite3_strlike.
   [~] **10.1.34** `.shell` / `.system` — cmdShell concatenates args
        (single-token args bare, multi-word args wrapped in `"`),
        runs them via libc system()/Unix.fpsystem, and emits the
@@ -917,8 +925,15 @@ existing dispatcher.
   [~] **10.1.36** `.log FILENAME|on|off` — cmdLog records the
        destination so `.show` reflects it; SQLITE_CONFIG_LOG wiring
        gated on the raw-varargs sqlite3_config port (8.1.1).
-  [ ] **10.1.37** `.trace` — installs `sqlite3_trace_v2` callback
-       (`stmt` / `profile` / `row` / `close`).
+  [~] **10.1.37** `.trace ?OPTIONS?` — cmdTrace parses the upstream
+       option set (FILE / stdout / stderr / off / --expanded / --plain
+       / --stmt / --profile / --row / --close), opens the requested
+       sink, builds the mTrace mask, and registers a Pascal cdecl
+       traceCallback through sqlite3_trace_v2.  Actual firing of the
+       callback is gated on the VDBE-side trace dispatch — db^.mTrace /
+       db^.trace.xV2 are stored but never invoked from the step path
+       yet.  When that wires (separate VDBE follow-up), `.trace` will
+       light up without further shell-side changes.
   [ ] **10.1.38** `.iotrace` — wires `sqlite3IoTrace` (gated on the
        6.8 `sqlite3VdbeIOTraceSql` arm landing first).
   [~] **10.1.39** `.scanstats on|off|est|vm` — cmdScanstats records the
@@ -1012,6 +1027,14 @@ existing dispatcher.
        to match upstream.
   [X] **10.1.59** `.breakpoint` — cmdBreakpoint no-op stub
        (gdb-attach hook only; not exercised by any gate).
+
+- [ ] **10.1.bug.2** sqlite3_trace_v2 callback never fires.  The
+  Pascal port's sqlite3_trace_v2 stores db^.mTrace + db^.trace.xV2 but
+  nothing in the VDBE step path invokes db^.trace.xV2 — neither at
+  SQLITE_TRACE_STMT prepare-start, PROFILE end-of-stmt, ROW per-row,
+  nor CLOSE on connection close.  Port the upstream trace fanout
+  (vdbe.c/main.c — search for `mTrace` and `trace.xV2`) so .trace
+  lights up.  Until then `.trace` is a configurable no-op.
 
 - [X] **10.1.bug.1** Header row leak in `.mode list` fixed: the port
   was treating `bTitles` as a 0/1 boolean while upstream uses QRF

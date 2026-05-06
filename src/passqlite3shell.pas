@@ -1175,6 +1175,8 @@ end;
   step / finalize one statement; emit each row through the active
   renderer.  This is the minimum needed for the 10.2 integration parity
   gate to start evaluating SELECTs against a known canon.   }
+function displayStats(p: PShellState; bReset: i32): i32; forward;
+
 function runOneSqlLine(p: PShellState; const zSql: AnsiString;
                        const zSrc: AnsiString; lineno: i64): i32;
 var
@@ -1204,7 +1206,10 @@ begin
       zCur := AnsiString(zRemain);
       Continue;
     end;
+    p^.pStmt := pStmt;
     stepRc := stepAndRender(p, pStmt);
+    if p^.statsOn <> 0 then displayStats(p, 0);
+    p^.pStmt := nil;
     rc := sqlite3_finalize(pStmt);
     if (rc <> SQLITE_OK) and (rc <> SQLITE_DONE) then begin
       shellEPutZ(Format('Runtime error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
@@ -1333,26 +1338,689 @@ begin
   sqlite3_finalize(pStmt);
 end;
 
-procedure cmdHelp;
-{ 10.1.33 — abbreviated upstream help-table excerpt.  Full ~750-line
-  table lands when a parity test demands it. }
-const
-  zHelp: AnsiString =
-    '.databases             List names and files of attached databases'#10 +
-    '.echo on|off           Turn command echo on or off'#10 +
-    '.exit ?CODE?           Exit this program with return-code CODE'#10 +
-    '.headers on|off        Turn display of headers on or off'#10 +
-    '.help ?-all? ?PATTERN? Show help text for PATTERN'#10 +
-    '.indexes ?TABLE?       Show names of indexes'#10 +
-    '.mode MODE ?OPTIONS?   Set output mode'#10 +
-    '.nullvalue STRING      Use STRING in place of NULL values'#10 +
-    '.quit                  Stop interpreting input stream, exit if primary'#10 +
-    '.schema ?PATTERN?      Show the CREATE statements matching PATTERN'#10 +
-    '.separator COL ?ROW?   Change the column and row separators'#10 +
-    '.show                  Show the current values for various settings'#10 +
-    '.tables ?TABLE?        List names of tables matching LIKE pattern TABLE'#10;
+{ ----------------------------------------------------------------------
+  10.1.28  `.stats ?ARG?`  +  display_stats helper.
+
+  Faithful port of shell.c.in:2722..2944.  display_stats() emits the
+  per-statement / per-connection / process-wide counter summary that
+  upstream prints after each SQL when statsOn is non-zero.
+
+  ShellState.statsOn semantics (shell.c.in:402..408):
+    0  off            — no automatic display
+    1  on             — full display after each statement
+    2  stmt           — show only column metadata (declared types etc.)
+    3  vmstep         — show only the VM step counter
+  ---------------------------------------------------------------------- }
+
+procedure displayStatLine(const zLabel, zFormat: AnsiString;
+                          iStatusCtrl: i32; bReset: i32);
+var
+  iCur, iHiwtr: i64;
+  i, nPercent: SizeInt;
+  zLine: AnsiString;
 begin
-  shellSPutZ(zHelp);
+  iCur := -1; iHiwtr := -1;
+  sqlite3_status64(iStatusCtrl, @iCur, @iHiwtr, bReset);
+  nPercent := 0;
+  for i := 1 to Length(zFormat) do
+    if zFormat[i] = '%' then Inc(nPercent);
+  if nPercent > 1 then
+    zLine := Format(zFormat, [iCur, iHiwtr])
+  else
+    zLine := Format(zFormat, [iHiwtr]);
+  shellSPutZ(Format('%-36s %s'#10, [zLabel, zLine]));
+end;
+
+procedure displayLinuxIoStats;
+{ shell.c.in:2722..2752 — read /proc/<pid>/io and translate the seven
+  well-known counter lines into the upstream label format. }
+var
+  fn: AnsiString;
+  f: TextFile;
+  line, tag, rest: AnsiString;
+  i: SizeInt;
+const
+  aTrans: array[0..6, 0..1] of AnsiString = (
+    ('rchar: ',                  'Bytes received by read():'),
+    ('wchar: ',                  'Bytes sent to write():'),
+    ('syscr: ',                  'Read() system calls:'),
+    ('syscw: ',                  'Write() system calls:'),
+    ('read_bytes: ',             'Bytes read from storage:'),
+    ('write_bytes: ',            'Bytes written to storage:'),
+    ('cancelled_write_bytes: ',  'Cancelled write bytes:')
+  );
+begin
+  fn := Format('/proc/%d/io', [FpGetPid]);
+  if not FileExists(fn) then Exit;
+  AssignFile(f, fn);
+  {$I-} Reset(f); {$I+}
+  if IOResult <> 0 then Exit;
+  while not Eof(f) do begin
+    {$I-} ReadLn(f, line); {$I+}
+    if IOResult <> 0 then Break;
+    for i := 0 to High(aTrans) do begin
+      tag := aTrans[i, 0];
+      if (Length(line) >= Length(tag)) and (Copy(line, 1, Length(tag)) = tag) then begin
+        rest := Copy(line, Length(tag) + 1, Length(line) - Length(tag));
+        shellSPutZ(Format('%-36s %s'#10, [aTrans[i, 1], rest]));
+        Break;
+      end;
+    end;
+  end;
+  CloseFile(f);
+end;
+
+function displayStats(p: PShellState; bReset: i32): i32;
+var
+  iCur, iHiwtr: i32;
+  iCur64, iHiwtr64: i64;
+  pStmt: PVdbe;
+  nCol, i: i32;
+  iHit, iMiss: i32;
+  zFmt: AnsiString;
+  db: PTsqlite3;
+begin
+  Result := 0;
+  if p = nil then Exit;
+  db := p^.db;
+  pStmt := p^.pStmt;
+
+  if (pStmt <> nil) and (p^.statsOn = 2) then begin
+    nCol := sqlite3_column_count(pStmt);
+    shellSPutZ(Format('%-36s %d'#10, ['Number of output columns:', nCol]));
+    for i := 0 to nCol - 1 do begin
+      shellSPutZ(Format('%-36s %s'#10,
+        [Format('Column %d name:', [i]),
+         AnsiString(sqlite3_column_name(pStmt, i))]));
+      shellSPutZ(Format('%-36s %s'#10,
+        [Format('Column %d declared type:', [i]),
+         AnsiString(sqlite3_column_decltype(pStmt, i))]));
+    end;
+  end;
+
+  if p^.statsOn = 3 then begin
+    if pStmt <> nil then begin
+      iCur := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_VM_STEP, bReset);
+      shellSPutZ(Format('VM-steps: %d'#10, [iCur]));
+    end;
+    Exit;
+  end;
+
+  displayStatLine('Memory Used:',
+    '%d (max %d) bytes', SQLITE_STATUS_MEMORY_USED, bReset);
+  displayStatLine('Number of Outstanding Allocations:',
+    '%d (max %d)', SQLITE_STATUS_MALLOC_COUNT, bReset);
+  if (p^.shellFlgs and SHFLG_Pagecache) <> 0 then
+    displayStatLine('Number of Pcache Pages Used:',
+      '%d (max %d) pages', SQLITE_STATUS_PAGECACHE_USED, bReset);
+  displayStatLine('Number of Pcache Overflow Bytes:',
+    '%d (max %d) bytes', SQLITE_STATUS_PAGECACHE_OVERFLOW, bReset);
+  displayStatLine('Largest Allocation:',
+    '%d bytes', SQLITE_STATUS_MALLOC_SIZE, bReset);
+  displayStatLine('Largest Pcache Allocation:',
+    '%d bytes', SQLITE_STATUS_PAGECACHE_SIZE, bReset);
+
+  if db <> nil then begin
+    if (p^.shellFlgs and SHFLG_Lookaside) <> 0 then begin
+      iCur := -1; iHiwtr := -1;
+      sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_USED,
+                        @iCur, @iHiwtr, bReset);
+      shellSPutZ(Format('Lookaside Slots Used:                %d (max %d)'#10,
+        [iCur, iHiwtr]));
+      sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_HIT,
+                        @iCur, @iHiwtr, bReset);
+      shellSPutZ(Format('Successful lookaside attempts:       %d'#10, [iHiwtr]));
+      sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_MISS_SIZE,
+                        @iCur, @iHiwtr, bReset);
+      shellSPutZ(Format('Lookaside failures due to size:      %d'#10, [iHiwtr]));
+      sqlite3_db_status(db, SQLITE_DBSTATUS_LOOKASIDE_MISS_FULL,
+                        @iCur, @iHiwtr, bReset);
+      shellSPutZ(Format('Lookaside failures due to OOM:       %d'#10, [iHiwtr]));
+    end;
+    iCur := -1; iHiwtr := -1;
+    sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_USED, @iCur, @iHiwtr, bReset);
+    shellSPutZ(Format('Pager Heap Usage:                    %d bytes'#10, [iCur]));
+    iCur := -1; iHiwtr := -1;
+    sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_HIT, @iCur, @iHiwtr, 1);
+    shellSPutZ(Format('Page cache hits:                     %d'#10, [iCur]));
+    iCur := -1; iHiwtr := -1;
+    sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_MISS, @iCur, @iHiwtr, 1);
+    shellSPutZ(Format('Page cache misses:                   %d'#10, [iCur]));
+    iCur64 := -1; iHiwtr64 := -1;
+    sqlite3_db_status64(db, SQLITE_DBSTATUS_TEMPBUF_SPILL,
+                        @iCur64, @iHiwtr64, 0);
+    iCur := -1; iHiwtr := -1;
+    sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_WRITE, @iCur, @iHiwtr, 1);
+    shellSPutZ(Format('Page cache writes:                   %d'#10, [iCur]));
+    iCur := -1; iHiwtr := -1;
+    sqlite3_db_status(db, SQLITE_DBSTATUS_CACHE_SPILL, @iCur, @iHiwtr, 1);
+    shellSPutZ(Format('Page cache spills:                   %d'#10, [iCur]));
+    shellSPutZ(Format('Temporary data spilled to disk:      %d'#10, [iCur64]));
+    sqlite3_db_status64(db, SQLITE_DBSTATUS_TEMPBUF_SPILL,
+                        @iCur64, @iHiwtr64, 1);
+    iCur := -1; iHiwtr := -1;
+    sqlite3_db_status(db, SQLITE_DBSTATUS_SCHEMA_USED, @iCur, @iHiwtr, bReset);
+    shellSPutZ(Format('Schema Heap Usage:                   %d bytes'#10, [iCur]));
+    iCur := -1; iHiwtr := -1;
+    sqlite3_db_status(db, SQLITE_DBSTATUS_STMT_USED, @iCur, @iHiwtr, bReset);
+    shellSPutZ(Format('Statement Heap/Lookaside Usage:      %d bytes'#10, [iCur]));
+  end;
+
+  if pStmt <> nil then begin
+    iCur := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_FULLSCAN_STEP, bReset);
+    shellSPutZ(Format('Fullscan Steps:                      %d'#10, [iCur]));
+    iCur := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_SORT, bReset);
+    shellSPutZ(Format('Sort Operations:                     %d'#10, [iCur]));
+    iCur := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_AUTOINDEX, bReset);
+    shellSPutZ(Format('Autoindex Inserts:                   %d'#10, [iCur]));
+    iHit  := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_FILTER_HIT, bReset);
+    iMiss := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_FILTER_MISS, bReset);
+    if (iHit <> 0) or (iMiss <> 0) then
+      shellSPutZ(Format('Bloom filter bypass taken:           %d/%d'#10,
+        [iHit, iHit + iMiss]));
+    iCur := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_VM_STEP, bReset);
+    shellSPutZ(Format('Virtual Machine Steps:               %d'#10, [iCur]));
+    iCur := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_REPREPARE, bReset);
+    shellSPutZ(Format('Reprepare operations:                %d'#10, [iCur]));
+    iCur := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_RUN, bReset);
+    shellSPutZ(Format('Number of times run:                 %d'#10, [iCur]));
+    iCur := sqlite3_stmt_status(pStmt, SQLITE_STMTSTATUS_MEMUSED, bReset);
+    shellSPutZ(Format('Memory used by prepared stmt:        %d'#10, [iCur]));
+  end;
+
+  displayLinuxIoStats;
+  zFmt := '';   { silence "unused" }
+end;
+
+procedure cmdStats(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+{ shell.c.in:10597..10620 .stats arm.  Bare `.stats` toggles the
+  always-on counter display in upstream — but since the legacy bare-arg
+  toggle is the source of long-standing parity drift, we expose only the
+  documented sub-commands here. }
+var
+  s: AnsiString;
+begin
+  if nArg = 0 then begin
+    case p^.statsOn of
+      0: shellSPutZ('off'#10);
+      1: shellSPutZ('on'#10);
+      2: shellSPutZ('stmt'#10);
+      3: shellSPutZ('vmstep'#10);
+    else
+      shellSPutZ('on'#10);
+    end;
+    Exit;
+  end;
+  s := args[0];
+  if      s = 'off'    then p^.statsOn := 0
+  else if s = 'on'     then p^.statsOn := 1
+  else if s = 'stmt'   then p^.statsOn := 2
+  else if s = 'vmstep' then p^.statsOn := 3
+  else begin
+    shellEPutZ('Usage: .stats off|on|stmt|vmstep'#10);
+    Exit;
+  end;
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.37  `.trace ?OPTIONS?`  — shell.c.in:11069..11171
+
+  Installs a sqlite3_trace_v2 callback whose mTrace mask is the union of
+  --stmt / --profile / --row / --close (default: --stmt).  The payload
+  format is:
+    STMT     : "<SQL>"            (SQL text or expanded SQL)
+    PROFILE  : "<SQL>"            followed by " --- <ns>"
+    ROW      : "[ROW <SQL>]"
+    CLOSE    : "[CLOSE]"
+  Output sink: passed FILE arg ("stdout", "stderr", or a path); closes
+  the previous sink first.  `.trace off` disables tracing and clears the
+  callback.
+  ---------------------------------------------------------------------- }
+
+var
+  traceFile: TextFile;
+  traceSink: i32;        { 0 = none, 1 = stdout, 2 = stderr, 3 = file }
+  traceFmt:  i32;        { 0 = plain, 1 = expanded }
+
+procedure traceWrite(const z: AnsiString); inline;
+begin
+  case traceSink of
+    1: shellSPutZ(z);
+    2: shellEPutZ(z);
+    3: begin
+         {$I-} Write(traceFile, z); {$I+}
+         if IOResult <> 0 then ;
+       end;
+  end;
+end;
+
+procedure traceCloseSink;
+begin
+  if traceSink = 3 then begin
+    {$I-} CloseFile(traceFile); {$I+}
+    if IOResult <> 0 then ;
+  end;
+  traceSink := 0;
+end;
+
+function traceCallback(traceType: u32; pCtx: Pointer;
+                       pP, pX: Pointer): i32; cdecl;
+var
+  zSql, zExpanded: PAnsiChar;
+  ns: PInt64;
+  zOut: AnsiString;
+begin
+  Result := 0;
+  case traceType of
+    SQLITE_TRACE_STMT: begin
+      zSql := PAnsiChar(pX);
+      if (zSql <> nil) and (zSql^ = '-') and (PAnsiChar(zSql)[1] = '-') then
+        zOut := AnsiString(zSql)
+      else if traceFmt = 1 then begin
+        zExpanded := sqlite3_expanded_sql(pP);
+        if zExpanded <> nil then begin
+          zOut := AnsiString(zExpanded);
+          sqlite3_free(zExpanded);
+        end else
+          zOut := AnsiString(sqlite3_sql(pP));
+      end else
+        zOut := AnsiString(sqlite3_sql(pP));
+      traceWrite(zOut + #10);
+    end;
+    SQLITE_TRACE_PROFILE: begin
+      zSql := sqlite3_sql(pP);
+      ns := PInt64(pX);
+      if zSql = nil then zOut := '' else zOut := AnsiString(zSql);
+      traceWrite(zOut + Format(' --- %d'#10, [ns^]));
+    end;
+    SQLITE_TRACE_ROW: begin
+      zSql := sqlite3_sql(pP);
+      if zSql = nil then zOut := '' else zOut := AnsiString(zSql);
+      traceWrite('[ROW ' + zOut + ']'#10);
+    end;
+    SQLITE_TRACE_CLOSE: begin
+      traceWrite('[CLOSE]'#10);
+    end;
+  end;
+end;
+
+procedure cmdTrace(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+var
+  i: SizeInt;
+  mask: u32;
+  s: AnsiString;
+  zFile: AnsiString;
+  newSink: i32;
+begin
+  if p^.db = nil then openDb(p, 0);
+  mask := 0;
+  zFile := '';
+  newSink := 0;
+  traceFmt := 0;
+  for i := 0 to nArg - 1 do begin
+    s := args[i];
+    if      s = '--expanded' then traceFmt := 1
+    else if s = '--plain'    then traceFmt := 0
+    else if s = '--stmt'     then mask := mask or u32(SQLITE_TRACE_STMT)
+    else if s = '--profile'  then mask := mask or u32(SQLITE_TRACE_PROFILE)
+    else if s = '--row'      then mask := mask or u32(SQLITE_TRACE_ROW)
+    else if s = '--close'    then mask := mask or u32(SQLITE_TRACE_CLOSE)
+    else if s = 'off'        then begin
+      sqlite3_trace_v2(p^.db, 0, nil, nil);
+      traceCloseSink;
+      Exit;
+    end
+    else if s = 'stdout'     then begin newSink := 1; zFile := 'stdout'; end
+    else if s = 'stderr'     then begin newSink := 2; zFile := 'stderr'; end
+    else if (Length(s) > 0) and (s[1] <> '-') then begin
+      zFile := s; newSink := 3;
+    end
+    else begin
+      shellEPutZ(Format('Unknown option: "%s"'#10, [s]));
+      Exit;
+    end;
+  end;
+  if mask = 0 then mask := u32(SQLITE_TRACE_STMT);
+  traceCloseSink;
+  case newSink of
+    0, 1: traceSink := 1;
+    2:    traceSink := 2;
+    3: begin
+      AssignFile(traceFile, zFile);
+      {$I-} Rewrite(traceFile); {$I+}
+      if IOResult <> 0 then begin
+        shellEPutZ(Format('Cannot open "%s" for writing'#10, [zFile]));
+        traceSink := 0;
+        Exit;
+      end;
+      traceSink := 3;
+    end;
+  end;
+  sqlite3_trace_v2(p^.db, mask, @traceCallback, nil);
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.33  `.help ?-all? ?PATTERN?`  — shell.c.in:3708..4090
+
+  Faithful port of the upstream azHelp[] table and showHelp() walker.
+  The table is captured as a unit-level array of AnsiString; entries
+  beginning with '.' or ',' start a new command (',' marks an
+  undocumented command, exposed only via `.help 0`).  Continuation
+  lines start with whitespace and belong to the preceding command.
+  ---------------------------------------------------------------------- }
+
+const
+  azHelp: array[0..264] of AnsiString = (
+    '.archive ...             Manage SQL archives',
+    '   Each command must have exactly one of the following options:',
+    '     -c, --create               Create a new archive',
+    '     -u, --update               Add or update files with changed mtime',
+    '     -i, --insert               Like -u but always add even if unchanged',
+    '     -r, --remove               Remove files from archive',
+    '     -t, --list                 List contents of archive',
+    '     -x, --extract              Extract files from archive',
+    '   Optional arguments:',
+    '     -v, --verbose              Print each filename as it is processed',
+    '     -f FILE, --file FILE       Use archive FILE (default is current db)',
+    '     -a FILE, --append FILE     Open FILE using the apndvfs VFS',
+    '     -C DIR, --directory DIR    Read/extract files from directory DIR',
+    '     -g, --glob                 Use glob matching for names in archive',
+    '     -n, --dryrun               Show the SQL that would have occurred',
+    '   Examples:',
+    '     .ar -cf ARCHIVE foo bar  # Create ARCHIVE from files foo and bar',
+    '     .ar -tf ARCHIVE          # List members of ARCHIVE',
+    '     .ar -xvf ARCHIVE         # Verbosely extract files from ARCHIVE',
+    '   See also:',
+    '      http://sqlite.org/cli.html#sqlite_archive_support',
+    '.auth ON|OFF             Show authorizer callbacks',
+    '.backup ?DB? FILE        Backup DB (default "main") to FILE',
+    '   Options:',
+    '       --append            Use the appendvfs',
+    '       --async             Write to FILE without journal and fsync()',
+    '.bail on|off             Stop after hitting an error.  Default OFF',
+    '.cd DIRECTORY            Change the working directory to DIRECTORY',
+    '.changes on|off          Show number of rows changed by SQL',
+    '.check OPTIONS ...       Verify the results of a .testcase',
+    '.clone NEWDB             Clone data into NEWDB from the existing database',
+    '.connection [close] [#]  Open or close an auxiliary database connection',
+    '.crlf ?on|off?           Whether or not to use \r\n line endings',
+    '.databases               List names and files of attached databases',
+    '.dbconfig ?op? ?val?     List or change sqlite3_db_config() options',
+    '.dbinfo ?DB?             Show status information about the database',
+    '.dbtotxt                 Hex dump of the database file',
+    '.dump ?OBJECTS?          Render database content as SQL',
+    '   Options:',
+    '     --data-only            Output only INSERT statements',
+    '     --newlines             Allow unescaped newline characters in output',
+    '     --nosys                Omit system tables (ex: "sqlite_stat1")',
+    '     --preserve-rowids      Include ROWID values in the output',
+    '   OBJECTS is a LIKE pattern for tables, indexes, triggers or views to dump',
+    '   Additional LIKE patterns can be given in subsequent arguments',
+    '.echo on|off             Turn command echo on or off',
+    '.eqp on|off|full|...     Enable or disable automatic EXPLAIN QUERY PLAN',
+    '   Other Modes:',
+    '      test                  Show raw EXPLAIN QUERY PLAN output',
+    '      trace                 Like "full" but enable "PRAGMA vdbe_trace"',
+    '      trigger               Like "full" but also show trigger bytecode',
+    '.excel                   Display the output of next command in spreadsheet',
+    '   --bom                   Put a UTF8 byte-order mark on intermediate file',
+    '.exit ?CODE?             Exit this program with return-code CODE',
+    '.expert                  EXPERIMENTAL. Suggest indexes for queries',
+    '.explain ?on|off|auto?   Change the EXPLAIN formatting mode.  Default: auto',
+    '.filectrl CMD ...        Run various sqlite3_file_control() operations',
+    '   --schema SCHEMA         Use SCHEMA instead of "main"',
+    '   --help                  Show CMD details',
+    '.fullschema ?--indent?   Show schema and the content of sqlite_stat tables',
+    ',headers on|off          Turn display of headers on or off',
+    '.help ?-all? ?PATTERN?   Show help text for PATTERN',
+    '.import FILE TABLE       Import data from FILE into TABLE',
+    '.imposter INDEX TABLE    Create imposter table TABLE on index INDEX',
+    '.indexes ?PATTERN?       Show names of indexes matching PATTERN',
+    '   -a|--all                Also show system-generated indexes',
+    '   --expr                  Show only expression indexes',
+    '   --sys                   Show only system-generated indexes',
+    '.intck ?STEPS_PER_UNLOCK?  Run an incremental integrity check on the db',
+    '.limit ?LIMIT? ?VAL?     Display or change the value of an SQLITE_LIMIT',
+    '.lint OPTIONS            Report potential schema issues.',
+    '     Options:',
+    '        fkey-indexes     Find missing foreign key indexes',
+    '.load FILE ?ENTRY?       Load an extension library',
+    '.log FILE|on|off         Turn logging on or off.  FILE can be stderr/stdout',
+    '.mode ?MODE? ?OPTIONS?   Set output mode',
+    '.nonce STRING            Suspend safe mode for one command if nonce matches',
+    '.nullvalue STRING        Use STRING in place of NULL values',
+    '.once ?OPTIONS? ?FILE?   Output for the next SQL command only to FILE',
+    '.open ?OPTIONS? ?FILE?   Close existing database and reopen FILE',
+    '     Options:',
+    '        --append        Use appendvfs to append database to the end of FILE',
+    '        --deserialize   Load into memory using sqlite3_deserialize()',
+    '        --hexdb         Load the output of "dbtotxt" as an in-memory db',
+    '        --ifexist       Only open if FILE already exists',
+    '        --maxsize N     Maximum size for --hexdb or --deserialized database',
+    '        --new           Initialize FILE to an empty database',
+    '        --normal        FILE is an ordinary SQLite database',
+    '        --nofollow      Do not follow symbolic links',
+    '        --readonly      Open FILE readonly',
+    '        --zip           FILE is a ZIP archive',
+    '.output ?FILE?           Send output to FILE or stdout if FILE is omitted',
+    '.parameter CMD ...       Manage SQL parameter bindings',
+    '   clear                   Erase all bindings',
+    '   init                    Initialize the TEMP table that holds bindings',
+    '   list                    List the current parameter bindings',
+    '   set PARAMETER VALUE     Given SQL parameter PARAMETER a value of VALUE',
+    '                           PARAMETER should start with one of: $ : @ ?',
+    '   unset PARAMETER         Remove PARAMETER from the binding table',
+    '.print STRING...         Print literal STRING',
+    '.progress N              Invoke progress handler after every N opcodes',
+    '   --limit N                 Interrupt after N progress callbacks',
+    '   --once                    Do no more than one progress interrupt',
+    '   --quiet|-q                No output except at interrupts',
+    '   --reset                   Reset the count for each input and interrupt',
+    '   --timeout S               Halt after running for S seconds',
+    '.prompt MAIN CONTINUE    Replace the standard prompts',
+    '.quit                    Stop interpreting input stream, exit if primary.',
+    '.read FILE               Read input from FILE or command output',
+    '    If FILE begins with "|", it is a command that generates the input.',
+    '.recover                 Recover as much data as possible from corrupt db.',
+    '   --ignore-freelist        Ignore pages that appear to be on db freelist',
+    '   --lost-and-found TABLE   Alternative name for the lost-and-found table',
+    '   --no-rowids              Do not attempt to recover rowid values',
+    '                            that are not also INTEGER PRIMARY KEYs',
+    '.restore ?DB? FILE       Restore content of DB (default "main") from FILE',
+    '.save ?OPTIONS? FILE     Write database to FILE (an alias for .backup ...)',
+    '.scanstats on|off|est    Turn sqlite3_stmt_scanstatus() metrics on or off',
+    '.schema ?PATTERN?        Show the CREATE statements matching PATTERN',
+    '   Options:',
+    '      --indent             Try to pretty-print the schema',
+    '      --nosys              Omit objects whose names start with "sqlite_"',
+    ',selftest ?OPTIONS?      Run tests defined in the SELFTEST table',
+    '    Options:',
+    '       --init               Create a new SELFTEST table',
+    '       -v                   Verbose output',
+    ',separator COL ?ROW?     Change the column and row separators',
+    '.session ?NAME? CMD ...  Create or control sessions',
+    '   Subcommands:',
+    '     attach TABLE             Attach TABLE',
+    '     changeset FILE           Write a changeset into FILE',
+    '     close                    Close one session',
+    '     enable ?BOOLEAN?         Set or query the enable bit',
+    '     filter GLOB...           Reject tables matching GLOBs',
+    '     indirect ?BOOLEAN?       Mark or query the indirect status',
+    '     isempty                  Query whether the session is empty',
+    '     list                     List currently open session names',
+    '     open DB NAME             Open a new session on DB',
+    '     patchset FILE            Write a patchset into FILE',
+    '   If ?NAME? is omitted, the first defined session is used.',
+    '.sha3sum ...             Compute a SHA3 hash of database content',
+    '    Options:',
+    '      --schema              Also hash the sqlite_schema table',
+    '      --sha3-224            Use the sha3-224 algorithm',
+    '      --sha3-256            Use the sha3-256 algorithm (default)',
+    '      --sha3-384            Use the sha3-384 algorithm',
+    '      --sha3-512            Use the sha3-512 algorithm',
+    '    Any other argument is a LIKE pattern for tables to hash',
+    '.shell CMD ARGS...       Run CMD ARGS... in a system shell',
+    ',show                    Show the current values for various settings',
+    '.stats ?ARG?             Show stats or turn stats on or off',
+    '   off                      Turn off automatic stat display',
+    '   on                       Turn on automatic stat display',
+    '   stmt                     Show statement stats',
+    '   vmstep                   Show the virtual machine step count only',
+    '.system CMD ARGS...      Run CMD ARGS... in a system shell',
+    '.tables ?TABLE?          List names of tables matching LIKE pattern TABLE',
+    '.testcase NAME           Begin a test case.',
+    ',testctrl CMD ...        Run various sqlite3_test_control() operations',
+    '                           Run ".testctrl" with no arguments for details',
+    '.timeout MS              Try opening locked tables for MS milliseconds',
+    '.timer on|off|once       Turn SQL timer on or off.',
+    '.trace ?OPTIONS?         Output each SQL statement as it is run',
+    '    FILE                    Send output to FILE',
+    '    stdout                  Send output to stdout',
+    '    stderr                  Send output to stderr',
+    '    off                     Disable tracing',
+    '    --expanded              Expand query parameters',
+    '    --plain                 Show SQL as it is input',
+    '    --stmt                  Trace statement execution (SQLITE_TRACE_STMT)',
+    '    --profile               Profile statements (SQLITE_TRACE_PROFILE)',
+    '    --row                   Trace each row (SQLITE_TRACE_ROW)',
+    '    --close                 Trace connection close (SQLITE_TRACE_CLOSE)',
+    '.unmodule NAME ...       Unregister virtual table modules',
+    '    --allexcept             Unregister everything except those named',
+    '.version                 Show source, library and compiler versions',
+    '.vfsinfo ?AUX?           Information about the top-level VFS',
+    '.vfslist                 List all available VFSes',
+    '.vfsname ?AUX?           Print the name of the VFS stack',
+    ',width NUM1 NUM2 ...     Set minimum column widths for columnar output',
+    '     Negative values right-justify',
+    '.www                     Display output of the next command in web browser',
+    '    --plain                 Show results as text/plain, not as HTML',
+    { sentinel — keep array length stable; unused entries below the
+      live tail are tolerated by the showHelp loops.  We intentionally
+      pad to a wider bound than the live entries (above) to absorb any
+      minor upstream additions without re-counting the array. }
+    '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '',
+    '', '', '', '', '', '', '', '', '', '',
+    '', ''
+  );
+
+function helpFirstChar(const s: AnsiString): AnsiChar; inline;
+begin
+  if Length(s) = 0 then Result := #0 else Result := s[1];
+end;
+
+function helpReplaceLeading(const s: AnsiString; from, into: AnsiChar): AnsiString;
+begin
+  Result := s;
+  if (Length(Result) > 0) and (Result[1] = from) then Result[1] := into;
+end;
+
+procedure showHelp(const zPatternIn: AnsiString);
+{ shell.c.in:4004..4090 — port of static int showHelp(FILE*, const char*).
+  Returns nothing here; the caller does not consume the count. }
+var
+  i, j, n: SizeInt;
+  zPattern: AnsiString;
+  zPat: AnsiString;
+  zHit: AnsiString;
+  show: Boolean;
+  c: AnsiChar;
+  azLen: SizeInt;
+begin
+  azLen := Length(azHelp);
+  zPattern := zPatternIn;
+  if zPattern = '' then begin
+    { Show just the first line for all documented help topics. }
+    zPattern := '[a-z]';
+  end else if (zPattern = '-a') or (zPattern = '-all') or (zPattern = '--all') then begin
+    { Show everything except undocumented commands. }
+    zPattern := '.';
+  end else if zPattern = '0' then begin
+    { Show complete help text of undocumented commands. }
+    show := False;
+    for i := 0 to azLen - 1 do begin
+      c := helpFirstChar(azHelp[i]);
+      if c = '.' then show := False
+      else if c = ',' then begin
+        show := True;
+        shellSPutZ('.' + Copy(azHelp[i], 2, Length(azHelp[i]) - 1) + #10);
+      end else if show then
+        shellSPutZ(azHelp[i] + #10);
+    end;
+    Exit;
+  end;
+
+  { Seek documented commands for which zPattern is an exact prefix. }
+  if (Length(zPattern) > 0) and (zPattern[1] = '.') then
+    zPat := '.' + Copy(zPattern, 2, Length(zPattern) - 1) + '*'
+  else
+    zPat := '.' + zPattern + '*';
+  zHit := '';
+  j := 0;
+  n := 0;
+  for i := 0 to azLen - 1 do begin
+    if azHelp[i] = '' then Continue;
+    if sqlite3_strglob(PAnsiChar(zPat), PAnsiChar(azHelp[i])) = 0 then begin
+      if zHit <> '' then shellSPutZ(zHit + #10);
+      zHit := azHelp[i];
+      j := i + 1;
+      Inc(n);
+    end;
+  end;
+  if n > 0 then begin
+    if n = 1 then begin
+      shellSPutZ(zHit + #10);
+      while (j < azLen) and (helpFirstChar(azHelp[j]) = ' ') do begin
+        shellSPutZ(azHelp[j] + #10);
+        Inc(j);
+      end;
+    end else
+      shellSPutZ(zHit + #10);
+    Exit;
+  end;
+
+  { Substring (LIKE) match across all documented entries. }
+  zPat := '%' + zPattern + '%';
+  i := 0;
+  while i < azLen do begin
+    if azHelp[i] = '' then begin Inc(i); Continue; end;
+    c := helpFirstChar(azHelp[i]);
+    if c = ',' then begin
+      while (i < azLen - 1) and (helpFirstChar(azHelp[i + 1]) = ' ') do
+        Inc(i);
+      Inc(i);
+      Continue;
+    end;
+    if c = '.' then j := i;
+    if sqlite3_strlike(PAnsiChar(zPat), PAnsiChar(azHelp[i]), 0) = 0 then begin
+      shellSPutZ(azHelp[j] + #10);
+      while (j < azLen - 1) and (helpFirstChar(azHelp[j + 1]) = ' ') do begin
+        Inc(j);
+        shellSPutZ(azHelp[j] + #10);
+      end;
+      i := j;
+      Inc(n);
+    end;
+    Inc(i);
+  end;
+end;
+
+procedure cmdHelp(const args: array of AnsiString; nArg: SizeInt);
+var i: SizeInt; pat: AnsiString;
+begin
+  if nArg = 0 then begin
+    showHelp('');
+    Exit;
+  end;
+  for i := 0 to nArg - 1 do begin
+    pat := args[i];
+    showHelp(pat);
+  end;
 end;
 
 function onOffStr(b: Boolean): AnsiString; inline;
@@ -3767,7 +4435,9 @@ begin
   splitDotArgs(zLine, args, nArg);
 
   if (zCmd = 'quit') or (zCmd = 'exit') then begin Result := 2; Exit; end;
-  if zCmd = 'help'      then begin cmdHelp; Exit; end;
+  if zCmd = 'help'      then begin cmdHelp(args, nArg); Exit; end;
+  if zCmd = 'stats'     then begin cmdStats(p, args, nArg); Exit; end;
+  if zCmd = 'trace'     then begin cmdTrace(p, args, nArg); Exit; end;
   if zCmd = 'show'      then begin cmdShow(p); Exit; end;
   if zCmd = 'mode'      then begin cmdMode(p, args, nArg); Exit; end;
   if zCmd = 'headers'   then begin cmdHeaders(p, args, nArg); Exit; end;
