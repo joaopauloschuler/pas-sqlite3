@@ -1322,6 +1322,34 @@ existing dispatcher.
        db but never invoked when an unknown collation is encountered;
        logged as new bug **8.x.colneed**.
 
+  [X] **10.1.68** Three more small ext/misc helpers ported as new
+       units (~464 C lines total): noop.c (90 lines) →
+       `passqlite3noop.pas` (noop / noop_i / noop_do / noop_nd /
+       multitype_text — identity functions exercising the
+       DETERMINISTIC / INNOCUOUS / DIRECTONLY function-flag plumbing);
+       zorder.c (134 lines) → `passqlite3zorder.pas` (zorder(X0..XN)
+       interleaves the low bits of up to 24 i64 operands into a 63-bit
+       Morton code, plus the inverse unzorder(Z,N,K) extractor;
+       overflow message routed through SysUtils.Format because the
+       Pascal sqlite3_mprintf cdecl entry has no varargs); randomjson.c
+       (240 lines) → `passqlite3randomjson.pas` (random_json(SEED) and
+       random_json5(SEED) deterministic pseudo-random JSON / JSON5
+       generators backed by the upstream LFSR+LCG PRNG combo and the
+       azJsonAtoms[] / azJsonTemplate[] paired-literal tables; the
+       eType branch is selected through a per-registration user_data
+       i32, mirroring the &cZero / &cOne pattern from the C source).
+       All wired through sqlite3{Noop,Zorder,RandomJson}Init in shell
+       openDb.  Verified byte-identical against `.load /tmp/{noop,
+       zorder,randomjson}.so` running under the system sqlite3:
+       zorder(1,2,3)=53, unzorder(53,3,0..2)=(1,2,3), noop(42)=42,
+       multitype_text(7)=7, and the random_json(1) / random_json5(2)
+       documents reproduce the C output exactly (~1KB JSON each).
+       Implementation note: the prngInt LFSR uses C's `(1+~(x&1)) & MASK`
+       trick to branchlessly mask 0xd0000001 in/out; expanded into an
+       explicit if/else in the Pascal port so FPC's overflow checks
+       never see the deliberate u32 wrap.  TestExplainParity 1026/1026;
+       DiagFunctions / DiagOps / DiagFeatureProbe clean.
+
 - [ ] **8.x.colneed** sqlite3_collation_needed callback never fires.
   The pas-sqlite3 port stores `db^.xCollNeeded` / `db^.pCollNeededArg`
   but no call site walks the lookup-failure path that C invokes via

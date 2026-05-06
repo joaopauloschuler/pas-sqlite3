@@ -77,6 +77,9 @@ uses
   passqlite3nextchar,
   passqlite3remember,
   passqlite3stmtrand,
+  passqlite3noop,
+  passqlite3zorder,
+  passqlite3randomjson,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -567,6 +570,14 @@ begin
   sqlite3NextcharInit(p^.db);
   sqlite3RememberInit(p^.db);
   sqlite3StmtrandInit(p^.db);
+  { Phase 10.1.68 — three more small ext/misc helpers from
+    noop.c (noop / noop_i / noop_do / noop_nd / multitype_text),
+    zorder.c (zorder / unzorder Morton-code interleave),
+    randomjson.c (random_json / random_json5 deterministic
+    pseudo-random JSON for fuzz testing). }
+  sqlite3NoopInit(p^.db);
+  sqlite3ZorderInit(p^.db);
+  sqlite3RandomJsonInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
