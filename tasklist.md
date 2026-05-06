@@ -585,29 +585,36 @@ FPC porting traps that recur often enough to call out up-front:
        by 7.4b.3's emitSchemaRowInsert AddOp4 path.  Folded both
        rows back into TestBytecodeParity ('CREATE TABLE composite
        PK', 'CREATE TABLE WITHOUT ROWID'); corpus 30 → 32, all PASS.
-  [ ] **7.4b.6** "database disk image is malformed" after a CREATE
-       INDEX is followed by a subsequent btree-allocating statement
-       on the same connection.  Re-classified 2026-05-06 from the
-       prior "prepare failed on covering-index lookup" framing — the
-       original DiagCovering symptom (SELECT a FROM u WHERE a=5
-       reports "no such table: u") is a downstream effect: `u`
-       never gets created because the preceding `CREATE INDEX i1
-       ON t(a)` puts the database into a state where the next
-       btree-allocating statement fails with SQLITE_CORRUPT.
-       Minimal repro:
-         CREATE TABLE t(a,b,c);
-         CREATE INDEX  i1 ON t(a);    -- ok
-         CREATE TABLE  u(a,b,c);      -- rc=11 SQLITE_CORRUPT
-       Bytecode for the failing CREATE TABLE is byte-identical to
-       C (verified via EXPLAIN), so the regression is in runtime
-       VDBE / btree state, not in codegen.  PRAGMA integrity_check
-       between the two reports clean; sqlite_master shows t/2 and
-       i1/3 as expected; OP_CreateBtree on the next statement trips
-       a corruption check.  Investigate sqlite3BtreeCreateTable
-       (passqlite3btree.pas:6858) and the page-allocation path it
-       walks — likely a pointer-map / autovacuum bookkeeping miss
-       on the freshly allocated index root.  Pre-existed 7.4b;
-       independent of WITHOUT-ROWID surface.
+  [X] **7.4b.6** "database disk image is malformed" after a CREATE
+       INDEX is followed by a subsequent btree-allocating statement.
+       Closed 2026-05-06.  Root cause was NOT in btree at all — the
+       earlier "OP_CreateBtree trips a corruption check" framing
+       was wrong.  btreeCreateTable returned OK with pgno=4; the
+       corruption surfaced from OP_ParseSchema fired at the tail
+       of CREATE TABLE u.  execParseSchemaImpl
+       (passqlite3main.pas:2688) runs an unfiltered
+       `SELECT type,name,tbl_name,rootpage,sql FROM sqlite_master`
+       (the WHERE-filter elision documented in the surrounding
+       banner — Pascal sqlite3Select can't yet handle it
+       productively), and sqlite3InitCallback's "skip already-
+       published" gate only consulted sqlite3FindTable.  Rows of
+       type='index' fell through that gate, so on the third
+       ParseSchema fire (after CREATE TABLE u) row `i1` re-prepared
+       `CREATE INDEX i1 ON t(a)` against an already-populated
+       idxHash → "index already exists" → initCorruptSchema set
+       pData^.rc to SQLITE_CORRUPT, which the OP_ParseSchema worker
+       reported as "database disk image is malformed".  Fix:
+       passqlite3main.pas:2618 — extend the gate to also skip when
+       sqlite3FindIndex returns non-nil (sqlite3FindTable already
+       covers tables and views; triggers are not exposed via a
+       Find* helper in this port and don't currently surface in
+       the corpus).  Verification: minimal repro (CREATE TABLE t /
+       CREATE INDEX i1 / CREATE TABLE u) returns rc=0 on the
+       trailing CREATE TABLE; DiagCovering 0 div (was 1);
+       DiagCreateIdx / DiagIndexing / DiagDml / DiagPragma /
+       DiagDropTable / DiagTxn / DiagMisc / DiagOps / DiagAnalyze
+       / DiagFeatureProbe all 0 div; TestExplainParity 1026/1026;
+       TestBytecodeParity 32/32.
 
 - [X] **7.4c** `TestVdbeTrace.pas` differential opcode-trace gate.  Done
   2026-05-06.  `passqlite3vdbe` exports `gVdbeTraceBuf` and the

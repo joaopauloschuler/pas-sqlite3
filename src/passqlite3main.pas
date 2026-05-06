@@ -2616,8 +2616,17 @@ begin
         schema row each time it fires.  Already-published tables would
         otherwise trip StartTable's "table already exists" collision
         check on every subsequent CREATE TABLE step. }
+      { Phase 7.4b.6 fix: the gate must cover indexes too.  Without a
+        WHERE filter the SELECT enumerates every schema row each fire,
+        and a re-prepare of "CREATE INDEX i ON t(...)" against an
+        already-populated idxHash trips "index already exists" →
+        initCorruptSchema → pData^.rc=SQLITE_CORRUPT, blowing up the
+        next btree-allocating statement after any prior CREATE INDEX.
+        sqlite3FindTable handles tables and views (both live in
+        tblHash); sqlite3FindIndex handles indexes. }
       if (zArg1 <> nil)
-         and (sqlite3FindTable(db, zArg1, db^.aDb[iDb].zDbSName) <> nil) then
+         and ((sqlite3FindTable(db, zArg1, db^.aDb[iDb].zDbSName) <> nil)
+              or (sqlite3FindIndex(db, zArg1, db^.aDb[iDb].zDbSName) <> nil)) then
       begin
         Result := 0; Exit;
       end;
