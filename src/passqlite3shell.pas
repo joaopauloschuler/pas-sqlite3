@@ -61,6 +61,8 @@ uses
   passqlite3dbpage,
   passqlite3backup,
   passqlite3shathree,
+  passqlite3sha1,
+  passqlite3uuid,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -515,6 +517,10 @@ begin
   sqlite3DbpageRegister(p^.db);
   { 10.1.52 — sha3 / sha3_agg / sha3_query SQL functions backing .sha3sum. }
   sqlite3ShathreeInit(p^.db);
+  { Phase 10 ext/misc — sha1 / sha1b / sha1_query and uuid / uuid_str /
+    uuid_blob.  Auto-registered like upstream's `--shell` build. }
+  sqlite3ShaInit(p^.db);
+  sqlite3UuidInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
