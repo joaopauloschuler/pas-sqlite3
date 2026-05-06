@@ -342,56 +342,87 @@ FPC porting traps that recur often enough to call out up-front:
             was 0 even though AggStep accumulated correctly.  Closes
             DiagWindow `sum() OVER all` and `avg() OVER`; 12 → 10
             divergences.
-       [ ] **OPEN BLOCKER — inner sub ORDER BY support.**
-            All 10 remaining DiagWindow divergences (`sum() running`,
+       [X] Inner-sub ORDER BY support — bSort + generateSortTail
+            extended to fire for SRT_EphemTab destinations.  Path 1
+            from the prior open blocker (codegen.pas:24073 +
+            ~24264 + ~24514): bSort gate now accepts SRT_EphemTab,
+            body emit pushes ORDER BY exprs + result data into the
+            sorter (non-OMITREF, non-Top-N slice), and the sort tail
+            drains the sorter into the eph table via
+            MakeRecord+NewRowid+Insert(APPEND) instead of
+            OP_ResultRow.  Window inner sub now correctly populates
+            cur5 in (PARTITION BY ++ ORDER BY) order, so the entire
+            window pipeline produces rows for: `sum() running`,
             `partition sum`, `row_number basic`, `rank basic`,
-            `dense_rank`, `partition row_num`, `lag basic`,
-            `lead basic`, `first_value`, `ntile 2`) share one cause:
-            the rewritten inner pSub carries an ORDER BY (PARTITION
-            BY ++ ORDER BY of the OVER clause) and Pas's
-            sqlite3Select bails on `pOrderBy != nil` when
-            pDest^.eDest != SRT_Output (codegen.pas:24168 — the
-            ORDER-BY-bail emits OpenRead+Rewind+Next but no body, so
-            the eph cur 5 ends up empty and the window machinery
-            iterates zero rows).  The `bSort` gate at
-            codegen.pas:24073 only fires for SRT_Output; SRT_EphemTab
-            falls into the bail.
-            Two paths forward, in order of effort:
-              1. Extend `bSort` to also fire for SRT_EphemTab and
-                 emit the SRT_EphemTab disposal inside generateSortTail
-                 (mirror C's pattern: SorterInsert in body, sort tail
-                 drains sorter into the eph table).  Cleanest, opens
-                 sort-into-eph for any caller.
-              2. Wired window arm only: replace the inner
-                 `sqlite3Select(SRT_EphemTab)` with a direct
-                 SorterOpen + scan + SorterInsert + SorterSort + drain
-                 sequence so ORDER BY is honoured even though
-                 sqlite3Select itself doesn't yet support it for
-                 non-Output destinations.  Less general but a smaller
-                 diff.
-            Whole-frame aggregates (`OVER ()` with no ORDER BY) and
-            single-PARTITION queries already work via the AggValue
-            fix above — the failures all involve ORDER BY in the
-            OVER clause.
+            `dense_rank`, `lag basic`, `lead basic`, `first_value`,
+            `ntile 2`.  10 → 1 divergence.
+       [X] exprListAppendList — propagate `sortFlags` from source
+            list to dup'd item (codegen.pas:47370).  Mirrors
+            window.c:921; without this, DESC / NULLS FIRST clauses
+            on PARTITION BY / ORDER BY were stripped during
+            sub-select build.
+       [ ] **Last DiagWindow divergence: `partition row_num`.**
+            `SELECT grp, val, row_number() OVER (PARTITION BY grp
+            ORDER BY val) FROM g` returns
+            `[A,2,1];[A,1,2];[B,5,1];[B,4,2];[B,3,3]` — partition
+            boundaries are correct (A then B) and row_number is
+            correct, but `val` order *within* each partition is
+            wrong (DESC instead of ASC).  Cross-checked via a
+            standalone `SELECT grp,val FROM g ORDER BY grp, val` —
+            same partial bug occurs **without** any window code,
+            ruling out the window arm.  The pre-existing
+            multi-key sorter has a bug: with sortNKey=2 and
+            bSortOmitRef=1, vdbeSorterCompareRec returns 0 for many
+            pairs that differ on the second key (val).  Likely
+            culprits to investigate next session:
+              1. `sqlite3VdbeAllocUnpackedRecord` allocates
+                 nField=nKeyField+1 but `sqlite3VdbeRecordUnpack`
+                 reassigns `pUR^.nField := u` which can drop to
+                 fewer than nKeyField when the OMITREF record has
+                 only sortNKey serial-type bytes in its header
+                 (idx>=szHdr breaks the loop after exactly
+                 sortNKey fields).  Compare loop then exits at
+                 i==nField with default_rc=0 BEFORE inspecting the
+                 second key — but trace says nField stayed at 2,
+                 so this isn't the early-exit bug, which means the
+                 bug is inside RecordCompare's per-field branch.
+              2. RecordCompare's int-vs-int path for serial type
+                 8/9 (zero-byte int constants 0/1) may misread
+                 aKey1[d1] when d1 is past nKey1 — actual decode
+                 short-circuits in btreeDecodeInt but the
+                 surrounding `if d1>nKey1` guards may bail with
+                 rc=0 before reaching the per-field compare.
+              3. The OMITREF push records have variable size
+                 (5 bytes vs 4 bytes when val=1 encodes as type 9
+                 with no data byte).  The mixed-size compare may
+                 hit the corruption short-circuit at line 3215 /
+                 3266 / 3312 of btree.pas (returns 0 silently).
+            Quick repro: `SELECT grp,val FROM g ORDER BY grp,val`
+            against `(A,2),(A,1),(B,5),(B,3),(B,4)` — Pas returns
+            `[A,1,A,2,B,4,B,3,B,5]`, expected
+            `[A,1,A,2,B,3,B,4,B,5]`.  Bug is in
+            sqlite3VdbeRecordCompare (btree.pas:3178) or its
+            caller chain, NOT in the window arm.
        [ ] Frame-spec emission: ROWS / RANGE / GROUPS, with all
             five bound types (UNBOUNDED PRECEDING, n PRECEDING,
             CURRENT ROW, n FOLLOWING, UNBOUNDED FOLLOWING) and
             EXCLUDE clauses (NO OTHERS / CURRENT ROW / GROUP / TIES).
             Likely already covered by the windowCodeOp /
-            windowCodeRangeTest ports — gate is the inner-sub
-            ORDER BY blocker above.
-       [ ] Built-in window-function dispatch table:
-            `row_number` / `rank` / `dense_rank` / `percent_rank` /
-            `cume_dist` / `ntile` / `lag` / `lead` / `first_value` /
-            `last_value` / `nth_value`.  Already registered via
-            sqlite3WindowFunctions (codegen.pas:46550) at
-            connection-init.  Gate is the inner-sub ORDER BY blocker.
-       [~] Aggregate-as-window arm (`sum(x) OVER (...)`,
-            `avg(x) OVER (...)`, etc.) — reuses the regular agg
-            step function inside the frame loop.  Whole-frame case
-            (no ORDER BY in OVER) PASSes via MakeAgg xValue wiring;
-            running-sum / partition-sum cases gated on inner-sub
-            ORDER BY blocker.
+            windowCodeRangeTest ports.  No remaining DiagWindow
+            row exercises non-default frames; lift gate via
+            additional Diag rows when porting next.
+       [X] Built-in window-function dispatch table:
+            `row_number` / `rank` / `dense_rank` / `ntile` / `lag` /
+            `lead` / `first_value` all PASS now.  `percent_rank` /
+            `cume_dist` / `last_value` / `nth_value` not exercised
+            by DiagWindow yet — already registered via
+            sqlite3WindowFunctions (codegen.pas:46598) at
+            connection-init, expected to work once added to the
+            test matrix.
+       [X] Aggregate-as-window arm (`sum(x) OVER (...)`,
+            `avg(x) OVER (...)`, etc.) — whole-frame case PASSes
+            via MakeAgg xValue wiring; running-sum + partition-sum
+            cases PASS via the bSort SRT_EphemTab extension.
        [ ] Multi-window arm (one SELECT with several distinct
             OVER clauses sharing partitions).
        [ ] Once the inner-EList blocker clears, lift the subset

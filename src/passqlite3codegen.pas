@@ -24070,7 +24070,8 @@ begin
   nPrefixReg := 0; bSortOmitRef := 0;
   bUseSorter := 1; bSeqExtra := 0;
   addrSortBrk := 0;  { 0 = unallocated; valid labels are < 0 }
-  if (p^.pOrderBy <> nil) and (pDest^.eDest = SRT_Output)
+  if (p^.pOrderBy <> nil)
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab))
      and (not isExists) then
   begin
     bSort := 1;
@@ -24261,7 +24262,33 @@ begin
       OP_ResultRow; SRT_Set hashes the row into the eph cursor referenced
       by iSDParm via OP_MakeRecord + OP_IdxInsert with the per-row
       affinity string in P4. }
-    if pDest^.eDest = SRT_Output then
+    if (bSort <> 0) and (pDest^.eDest = SRT_EphemTab) then
+    begin
+      { pushOntoSorter for SRT_EphemTab — non-OMITREF, non-Top-N slice.
+        Mirrors the SRT_Output non-OMITREF arm below.  Sort tail drains
+        the sorter and re-emits MakeRecord+NewRowid+Insert into iSDParm
+        instead of OP_ResultRow. }
+      regSortBase := pParse^.nMem + 1;
+      Inc(pParse^.nMem, sortNKey + nResultCol);
+      for jj := 0 to sortNKey - 1 do
+      begin
+        r1 := sqlite3ExprCodeTarget(pParse,
+                ExprListItems(p^.pOrderBy)[jj].pExpr,
+                regSortBase + jj);
+        if r1 <> regSortBase + jj then
+          sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBase + jj);
+      end;
+      for jj := 0 to nResultCol - 1 do
+        sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
+                          regSortBase + sortNKey + jj);
+      Inc(pParse^.nMem);
+      regSortRec := pParse^.nMem;
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
+                        sortNKey + nResultCol, regSortRec);
+      sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
+                           regSortBase, nResultCol);
+    end
+    else if pDest^.eDest = SRT_Output then
     begin
       if bSort <> 0 then
       begin
@@ -24511,7 +24538,19 @@ begin
         sqlite3VdbeAddOp3(v, OP_Column, iSortTab,
                           sortNKey + bSeqExtra + i,
                           pDest^.iSdst + i);
-    sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+    if pDest^.eDest = SRT_EphemTab then
+    begin
+      r1 := sqlite3GetTempReg(pParse);
+      r2 := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+      sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
+      sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+      sqlite3ReleaseTempReg(pParse, r2);
+      sqlite3ReleaseTempReg(pParse, r1);
+    end
+    else
+      sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
     { LIMIT decrement after each emitted row (post-sort).  Sorter mode
       only — in Top-N B-tree mode (bUseSorter=0) the cap was enforced
       during insert via the IfNotZero/IdxLE/Delete gate, and the C
@@ -47306,12 +47345,14 @@ function exprListAppendList(pParse: PParse; pList: PExprList;
   pAppend: PExprList; bIntToNull: i32): PExprList;
 var
   i:     i32;
+  nInit: i32;
   db:    PTsqlite3;
   pDup:  PExpr;
   aItem: PExprListItem;
 begin
   Result := pList;
   if pAppend <> nil then begin
+    if pList <> nil then nInit := pList^.nExpr else nInit := 0;
     db := pParse^.db;
     aItem := ExprListItems(pAppend);
     for i := 0 to pAppend^.nExpr - 1 do begin
@@ -47323,6 +47364,10 @@ begin
         end;
       end;
       Result := sqlite3ExprListAppend(pParse, Result, pDup);
+      { Mirror window.c:921 — propagate sortFlags from source item so
+        DESC / NULLS FIRST etc. survive the dup. }
+      if Result <> nil then
+        ExprListItems(Result)[nInit + i].fg.sortFlags := aItem[i].fg.sortFlags;
     end;
   end;
 end;
