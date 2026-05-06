@@ -797,6 +797,8 @@ begin
     SQLITE_AutoIndex or      { SQLITE_DEFAULT_AUTOMATIC_INDEX default-on }
     SQLITE_CacheSpill or     { main.c:3428 default-on }
     SQLITE_EnableTrigger or  { main.c:3428 default-on }
+    (u64($00010) shl 32) or  { SQLITE_AttachCreate — main.c:3432 default-on }
+    (u64($00020) shl 32) or  { SQLITE_AttachWrite  — main.c:3433 default-on }
     SQLITE_TrustedSchema;    { SQLITE_DEFAULT_TRUSTED_SCHEMA default-on }
 
   sqlite3HashInit(@db^.aCollSeq);

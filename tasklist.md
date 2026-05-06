@@ -471,25 +471,36 @@ FPC porting traps that recur often enough to call out up-front:
 
 ## Phase 7 — Parser
 
-- [~] **7.1.1** Schema initialisation (prepare.c).  sqlite3InitOne /
-       sqlite3Init / sqlite3ReadSchema / sqlite3InitCallback /
-       sqlite3RunParser bodies all ported 1:1 with prepare.c:199..484.
-       TestExplainParity holds at 1025/1026.
-       [ ] **Schema-row INSERT / UPDATE wiring** — sqlite3Insert against
-            sqlite_master still emits zero rows, so a re-open does not
-            pick up Pascal-port-created user tables.  Gates DROP TABLE
-            6.11(b), VACUUM 6.27, ATTACH-reload 7.1.8, ALTER TABLE 7.1.9.
-            **Last load-bearing piece.**
+- [X] **7.1.1** Schema initialisation (prepare.c).  Closed 2026-05-06.
+       sqlite3InitOne / sqlite3Init / sqlite3ReadSchema /
+       sqlite3InitCallback / sqlite3RunParser bodies all ported 1:1 with
+       prepare.c:199..484.  Schema-row INSERT/UPDATE wiring landed
+       earlier through the direct `emitSchemaRowInsert` /
+       `emitSchemaRowUpdate` paths (CREATE TABLE/INDEX/TRIGGER all
+       round-trip across close+reopen — verified manually).
+       [X] **Schema reload after ATTACH** — closed by adding the
+            `sqlite3Init(db, &zErrDyn)` call inside `attachFunc`
+            (passqlite3codegen.pas:39626..) mirroring attach.c:225..242,
+            and by setting the `SQLITE_AttachCreate` / `SQLITE_AttachWrite`
+            default-on flags in `openDatabase` (passqlite3main.pas:794..)
+            to match main.c:3432..3433 — without these flags ATTACH
+            silently opened the auxiliary DB read-only and any subsequent
+            statement faulted with SQLITE_READONLY.  End-to-end:
+            `ATTACH '/tmp/aux.db' AS aux; SELECT a FROM aux.x` now
+            returns rows on the Pascal side.  TestExplainParity 1026/1026;
+            no regressions across DiagDml / DiagPragma / DiagFeatureProbe /
+            DiagTxn / DiagWindow / DiagMisc / DiagOps / DiagDropTable /
+            DiagCreateIdx / DiagAnalyze.  Closes the cross-cutting gate
+            for ATTACH-reload (7.1.8 below).
 
 - [X] **7.1.2** `sqlite3NestedParse` full driver (build.c).
 
-- [~] **7.1.8** ATTACH / DETACH (attach.c).  sqlite3Attach /
-       sqlite3Detach / sqlite3ParseUri (main.c:3069..3308) all ported
-       1:1; codegen path productive.  ATTACH 'file:…?mode=ro' /
-       'file:…?vfs=memdb' resolve correctly.
-       [ ] Schema reload after ATTACH — gated on 7.1.1.  Without it,
-            the new aDb[] slot is opened but the on-disk schema is
-            not loaded.
+- [X] **7.1.8** ATTACH / DETACH (attach.c).  Closed 2026-05-06.
+       sqlite3Attach / sqlite3Detach / sqlite3ParseUri
+       (main.c:3069..3308) all ported 1:1; codegen path productive.
+       ATTACH 'file:…?mode=ro' / 'file:…?vfs=memdb' resolve correctly.
+       Schema reload after ATTACH wired (see 7.1.1) — `aux.t` is now
+       readable end-to-end after `ATTACH 'file' AS aux`.
 
 - [~] **7.1.9** ALTER TABLE (alter.c).  All five codegen entry points
        (sqlite3AlterRenameTable / FinishAddColumn / AddConstraint /

@@ -39623,13 +39623,24 @@ begin
   pSlot^.safety_level := 3;  { PAGER_SYNCHRONOUS_FULL+1 — matches main.c openDatabase }
   if (rc = SQLITE_OK) and (pSlot^.zDbSName = nil) then rc := SQLITE_NOMEM;
 
-  { sqlite3Init reload (attach.c:226..242) is gated on Phase 7.1.1
-    sqlite3InitOne — left unwired; new schema slot is empty until that
-    lands.  pager-flag plumbing (sqlite3PagerLockingMode +
-    sqlite3BtreeSetPagerFlags) is in passqlite3pager which codegen
-    doesn't import; deferred together. }
+  { Phase 7.1.1 close — port of attach.c:225..242.  After btree-open and
+    Schema allocation succeed, drop DBFLAG_SchemaKnownOk and call
+    sqlite3Init via the gSqlite3Init hook so the just-attached slot's
+    sqlite_schema is parsed and its tables become visible to subsequent
+    statements.  Without this, SELECT against `aux.t` errors with
+    SQLITE_READONLY (planner falls into a write-cookie path because the
+    schema looks empty / dirty).  pager-flag plumbing
+    (sqlite3PagerLockingMode + sqlite3BtreeSetPagerFlags) lives in
+    passqlite3pager which codegen doesn't import — still deferred. }
   if rc = SQLITE_OK then
+  begin
+    sqlite3BtreeEnterAll(db);
+    db^.init.iDb := 0;
     db^.mDbFlags := db^.mDbFlags and not u32(DBFLAG_SchemaKnownOk);
+    if Assigned(gSqlite3Init) then
+      rc := gSqlite3Init(db, @zErrDyn);
+    sqlite3BtreeLeaveAll(db);
+  end;
 
   if rc <> SQLITE_OK then
   begin
