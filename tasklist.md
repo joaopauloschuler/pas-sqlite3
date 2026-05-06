@@ -230,6 +230,14 @@ FPC porting traps that recur often enough to call out up-front:
 
 ### Open Bugs
 
+- [ ] **6.11** `PRAGMA page_count` returns no rows on the Pascal port
+    (verified 2026-05-06 against an on-disk db with 2 pages: upstream
+    sqlite3 returns `2`, pas-sqlite3 prints nothing and step returns
+    DONE on first call).  `PRAGMA page_size` works as expected.
+    Surfaces under `.dbtotxt`, which works around it by counting
+    `sqlite_dbpage` rows; revisit this when porting the rest of the
+    PRAGMA dispatch table.
+
 - [X] **6.10** `TestExplainParity.pas` — **1026/1026 PASS** as of
     2026-05-06 (a3).  Oracle is built with `-DSQLITE_DEBUG
     -DSQLITE_ENABLE_EXPLAIN_COMMENTS`, so emits OP_Explain /
@@ -829,15 +837,32 @@ existing dispatcher.
        inputNesting still gates the existing recursion guard.  Pipe
        (`|cmd`) variants emit the upstream "pipes are not supported"
        error.
-  [ ] **10.1.23** `.dump` — full schema-and-data dump.  Per-row
-       INSERT generation via `run_schema_dump_query` +
-       `run_table_dump_query` + `output_quoted_escaped_string`.
-       `--preserve-rowids`, `--newlines`, `--data-only`.
+  [~] **10.1.23** `.dump` — minimal viable port landed
+       (cmdDump / dumpOneObject).  Emits PRAGMA foreign_keys=OFF +
+       BEGIN TRANSACTION header, dumps CREATE TABLE statements +
+       INSERT INTO rows (rendered through MODE_Insert with zDestTable
+       set), then non-table objects (indexes/views/triggers), then
+       COMMIT.  Honours `--data-only` and `--nosys` plus a LIKE
+       pattern.  `--preserve-rowids` and `--newlines`, the upstream
+       sqlite_sequence handling, the corruption detour with `ORDER BY
+       rowid DESC`, and explicit column-list INSERTs (via
+       `tableColumnList`) defer to a follow-up.  Round-trip verified
+       on simple schemas; used by `.once` integration test.
   [ ] **10.1.24** `.import` — CSV / ASCII import.  ImportCtx struct,
        `csv_read_one_field`, `ascii_read_one_field`, auto-create
        table from header row, transactional bulk-insert path.
-  [ ] **10.1.25** `.output` / `.once` — redirect to file / pipe /
-       stdout; `-x` (Excel) and `--bom` flags.
+  [X] **10.1.25** `.output` / `.once` — cmdOutput landed.
+       Redirection sits at the POSIX-fd level (dup the original
+       stdout at startup; dup2 the file fd onto fd 1 to redirect;
+       dup2 the saved fd back to revert) so all `Write` / `WriteLn`
+       follow without per-call-site changes.  `.output FILE`,
+       `.output stdout`, `.output off` (-> /dev/null), `.once FILE`,
+       `--bom` all wired.  `nPopOutput=2` set on `.once`,
+       decremented after each dot-cmd and forced to 0 after each SQL
+       line (mirrors shell.c.in:12068..12071 + 12512..12517).
+       cmdShow now reports the active output sink.  Pipe targets
+       (`|cmd`) emit "pipes are not supported".  `.excel` / `.www`
+       (xdg-open shorthands) emit a "not wired in this build" warn.
   [X] **10.1.26** `.save ?DB? FILE` — cmdBackup arm (shared with .backup).
        sqlite3_backup_init/_step/_finish copy main into a fresh dest db
        opened with READWRITE|CREATE.
@@ -961,9 +986,14 @@ existing dispatcher.
        VFS because SQLITE_FCNTL_VFSNAME is only handled by the memdb
        VFS today (small follow-up: surface the unix-VFS variant via
        sqlite3OsFileControl).
-  [ ] **10.1.58** `.dbtotxt` — page-by-page hex dump (used by the
-       upstream `dbsqlfuzz` corpus); gated on the bytecode of the
-       db being readable, no extension dependency.
+  [X] **10.1.58** `.dbtotxt` — cmdDbtotxt ports
+       shell.c.in:5579..5674 page-by-page hex dump.  Reads page size
+       via `PRAGMA page_size`, page count via
+       `SELECT count(*) FROM sqlite_dbpage` (workaround for a Pascal-
+       port `PRAGMA page_count` gap that returns no rows — tracked
+       separately under Phase 6 PRAGMA follow-up).  Skips all-zero
+       16-byte runs to keep dumps compact.  Hex output is lowercase
+       to match upstream.
   [X] **10.1.59** `.breakpoint` — cmdBreakpoint no-op stub
        (gdb-attach hook only; not exercised by any gate).
 

@@ -393,6 +393,10 @@ var
   Argv0:                AnsiString = '';
   mainPromptStr:        AnsiString = MAIN_PROMPT_DEFAULT;
   continuePromptStr:    AnsiString = CONTINUATION_PROMPT;
+  { 10.1.25 — `.output` / `.once` redirect state.  See cmdOutput. }
+  gSavedStdoutFd:       cint    = -1;
+  gOutRedirected:       Boolean = False;
+  gOutCurFilename:      AnsiString = '';
   { 10.1.10 .separator / .nullvalue / .mode INSERT — keep stable
     AnsiString backing for the PAnsiChar fields in TShellMode.spec. }
   zUserColSep:          AnsiString = '|';
@@ -1384,6 +1388,10 @@ begin
     widths := widths + IntToStr(p^.mode.spec.aWidth[i]) + ' ';
   shellSPutZ(Format('%12s: %s'#10, ['width', widths]));
   shellSPutZ(Format('%12s: %s'#10, ['filename',     fn]));
+  if gOutRedirected then
+    shellSPutZ(Format('%12s: %s'#10, ['output', gOutCurFilename]))
+  else
+    shellSPutZ(Format('%12s: %s'#10, ['output', 'stdout']));
 end;
 
 procedure cmdMode(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
@@ -1996,6 +2004,443 @@ begin
     p^.pAuxDb^.zDbFilename := nil;
     openDb(p, 0);
   end;
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.25  `.output` / `.once` / `.excel` / `.www`  — shell.c.in:8517..8715
+
+  Output-redirection sink.  The Pascal port sits on top of FPC's `Output`
+  stream, which by default writes to fd 1.  Rather than fan a `p^.outFile`
+  pointer through every renderer (~150 call sites), we redirect at the
+  POSIX-fd level: dup the original stdout fd at startup, then dup2 a new
+  file fd onto fd 1 to redirect, and dup2 the saved fd back to fd 1 to
+  restore.  All `Write` / `WriteLn` (which target fd 1 underneath) follow
+  along automatically.
+
+  Pipe targets (`|cmd`) are not yet wired — TProcess would work but would
+  pull in significant runtime; we emit upstream's
+  "pipes are not supported" error per shell.c.in:8674..8676.
+
+  Editor / spreadsheet / web-browser modes (`-e`, `-x`, `-w`) are gated
+  on a future xdg-open hook; we emit an upstream-shaped warning.
+  ---------------------------------------------------------------------- }
+
+procedure outputInit;
+{ Called from shellMain at startup so we have a stable handle to restore. }
+begin
+  if gSavedStdoutFd < 0 then gSavedStdoutFd := FpDup(1);
+end;
+
+procedure outputReset(p: PShellState);
+{ output_reset (shell.c.in:5410..).  Flush any buffered Pascal writes,
+  then dup2 the saved stdout back over fd 1.  Idempotent. }
+begin
+  Flush(Output);
+  if not gOutRedirected then begin
+    p^.zOutfile[0] := #0;
+    Exit;
+  end;
+  if gSavedStdoutFd >= 0 then FpDup2(gSavedStdoutFd, 1);
+  gOutRedirected := False;
+  gOutCurFilename := '';
+  p^.zOutfile[0] := #0;
+end;
+
+function outputRedirectFile(const fname: AnsiString;
+                            zBom: PAnsiChar): Boolean;
+{ Open `fname` for writing and dup2 it onto fd 1.  Truncates by default
+  (mirrors C `fopen("w")`).  On success, returns True; the write target
+  is now `fname`.  Always flushes Output first so prior data hits the
+  previous sink, not the redirected one. }
+var
+  fd: cint;
+  flags: cint;
+begin
+  Flush(Output);
+  flags := O_WRONLY or O_CREAT or O_TRUNC;
+  fd := FpOpen(fname, flags, &666);
+  if fd < 0 then begin Result := False; Exit; end;
+  FpDup2(fd, 1);
+  FpClose(fd);
+  gOutRedirected := True;
+  gOutCurFilename := fname;
+  if zBom <> nil then Write(AnsiString(zBom));
+  Result := True;
+end;
+
+procedure cmdOutput(p: PShellState; const args: array of AnsiString;
+                    nArg: SizeInt; const zCmdName: AnsiString);
+{ Mirrors dotCmdOutput (shell.c.in:8541..8715) at the level of the
+  options pas-sqlite3 currently supports.  Implements:
+    .output ?-bom? FILE        — redirect stdout to FILE (truncating)
+    .output                    — revert to stdout
+    .output stdout             — revert to stdout
+    .output off                — redirect to /dev/null
+    .once   ?-bom? FILE        — same as .output but auto-revert after
+                                  the next dot-cmd / SQL line
+    .excel                     — emits an upstream-shaped "not wired" warn
+    .www                       — same
+  Pipe targets and editor/spreadsheet/web-browser modes are stubbed. }
+const
+  zBomUtf8: PAnsiChar = #$EF#$BB#$BF;
+var
+  zFile: AnsiString;
+  zBom:  PAnsiChar;
+  i: SizeInt;
+  z: AnsiString;
+  isOnce: Boolean;
+  unsup: Boolean;
+begin
+  isOnce := (zCmdName = 'once') or (zCmdName = 'excel') or (zCmdName = 'www');
+  unsup  := (zCmdName = 'excel') or (zCmdName = 'www');
+  zFile := '';
+  zBom  := nil;
+
+  if unsup then begin
+    shellEPutZ(Format('Error: .%s requires the spreadsheet/web-browser ' +
+      'launcher (xdg-open) which is not wired in this build'#10, [zCmdName]));
+    Exit;
+  end;
+
+  i := 0;
+  while i < nArg do begin
+    z := args[i];
+    if (Length(z) > 0) and (z[1] = '-') then begin
+      if (Length(z) >= 2) and (z[2] = '-') then z := Copy(z, 2, MaxInt);
+      if z = '-bom' then zBom := zBomUtf8
+      else if z = '-plain' then begin end           { plain — we have no -w }
+      else if z = '-keep'  then begin end
+      else if z = '-show'  then begin end
+      else begin
+        shellEPutZ(Format('Error: unknown option: %s'#10, [args[i]]));
+        Exit;
+      end;
+    end else if zFile = '' then begin
+      if (z = 'memory') and isOnce then begin
+        shellEPutZ('Error: cannot redirect to "memory"'#10);
+        Exit;
+      end;
+      if z = 'off' then zFile := '/dev/null'
+      else zFile := z;
+      if (Length(zFile) > 0) and (zFile[1] = '|') then begin
+        shellEPutZ('Error: pipes are not supported in this build'#10);
+        Exit;
+      end;
+    end else begin
+      shellEPutZ(Format('Error: surplus argument: %s'#10, [z]));
+      Exit;
+    end;
+    Inc(i);
+  end;
+
+  if zFile = '' then zFile := 'stdout';
+  outputReset(p);
+
+  if zFile = 'stdout' then begin
+    if isOnce then p^.nPopOutput := 2 else p^.nPopOutput := 0;
+    Exit;
+  end;
+
+  if not outputRedirectFile(zFile, zBom) then begin
+    shellEPutZ(Format('Error: cannot write to "%s"'#10, [zFile]));
+    Exit;
+  end;
+  { Record the active filename in p^.zOutfile (FILENAME_MAX_PAS slots). }
+  for i := 1 to Length(zFile) do begin
+    if i > High(p^.zOutfile) + 1 then Break;
+    p^.zOutfile[i - 1] := AnsiChar(zFile[i]);
+  end;
+  if Length(zFile) <= High(p^.zOutfile) then
+    p^.zOutfile[Length(zFile)] := #0
+  else
+    p^.zOutfile[High(p^.zOutfile)] := #0;
+  if isOnce then p^.nPopOutput := 2 else p^.nPopOutput := 0;
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.58  `.dbtotxt`  — shell.c.in:5579..5674
+
+  Faithful port of `shell_dbtotxt_command`: hex dump of the open database
+  file, compatible with the upstream `dbsqlfuzz` corpus loader.  Reads
+  each page through `sqlite_dbpage` (which is auto-registered on every
+  openDb).  Skips all-zero 16-byte runs to keep the dump compact. }
+
+procedure cmdDbtotxt(p: PShellState);
+var
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc, i, j: i32;
+  pgSz: i32;
+  nPage: i64;
+  pgno: i64;
+  zFilename, zTail, zName: AnsiString;
+  bShow: array[0..255] of AnsiChar;
+  pData: Pointer;
+  aLine: PByte;
+  c: Byte;
+  k: SizeInt;
+begin
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+  for i := 0 to 255 do bShow[i] := '.';
+  for i := Ord(' ') to Ord('~') do
+    if (i <> Ord('{')) and (i <> Ord('}'))
+       and (i <> Ord('"')) and (i <> Ord('\')) then
+      bShow[i] := AnsiChar(Chr(i));
+
+  pStmt := nil; pzTail := nil; pgSz := 0; nPage := 0;
+  rc := sqlite3_prepare_v2(p^.db, 'PRAGMA page_size', -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    shellEPutZ(Format('ERROR: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    Exit;
+  end;
+  if sqlite3_step(pStmt) = SQLITE_ROW then pgSz := sqlite3_column_int(pStmt, 0);
+  sqlite3_finalize(pStmt);
+  if (pgSz < 512) or (pgSz > 65536) or ((pgSz and (pgSz - 1)) <> 0) then begin
+    shellEPutZ('ERROR: bad page size'#10); Exit;
+  end;
+
+  pStmt := nil;
+  { Upstream uses `PRAGMA page_count` here.  In pas-sqlite3 that PRAGMA
+    currently returns no rows (port gap, tracked under Phase 6 PRAGMA
+    follow-up); fall back to counting sqlite_dbpage rows. }
+  rc := sqlite3_prepare_v2(p^.db,
+          'SELECT count(*) FROM sqlite_dbpage', -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    Exit;
+  end;
+  if sqlite3_step(pStmt) = SQLITE_ROW then nPage := sqlite3_column_int64(pStmt, 0);
+  sqlite3_finalize(pStmt);
+  if nPage < 1 then Exit;
+
+  pStmt := nil;
+  zFilename := '';
+  rc := sqlite3_prepare_v2(p^.db, 'PRAGMA database_list', -1, @pStmt, @pzTail);
+  if (rc = SQLITE_OK) and (pStmt <> nil) and (sqlite3_step(pStmt) = SQLITE_ROW) then
+  begin
+    if sqlite3_column_text(pStmt, 2) <> nil then
+      zFilename := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 2)));
+  end;
+  if pStmt <> nil then sqlite3_finalize(pStmt);
+  if zFilename = '' then zFilename := 'unk.db';
+
+  { strip directory components — last '/' wins }
+  k := Length(zFilename);
+  while (k > 0) and (zFilename[k] <> '/') do Dec(k);
+  if (k > 0) and (k < Length(zFilename)) then
+    zTail := Copy(zFilename, k + 1, MaxInt)
+  else
+    zTail := zFilename;
+  zName := zTail;
+
+  WriteLn(Format('| size %d pagesize %d filename %s', [nPage * pgSz, pgSz, zName]));
+
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db,
+          'SELECT pgno, data FROM sqlite_dbpage ORDER BY pgno',
+          -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    Exit;
+  end;
+  while sqlite3_step(pStmt) = SQLITE_ROW do begin
+    pgno  := sqlite3_column_int64(pStmt, 0);
+    pData := sqlite3_column_blob(pStmt, 1);
+    if pData = nil then Continue;
+    aLine := PByte(pData);
+    i := 0;
+    while i < pgSz do begin
+      { skip all-zero 16-byte runs }
+      j := 0;
+      while (j < 16) and (PByte(PtrUInt(aLine) + i + j)^ = 0) do Inc(j);
+      if j = 16 then begin Inc(i, 16); Continue; end;
+      WriteLn(Format('| page %d offset %d', [pgno, (pgno - 1) * pgSz]));
+      while i < pgSz do begin
+        { Re-check whether this row is all-zero for the abbreviation rule. }
+        j := 0;
+        while (j < 16) and (PByte(PtrUInt(aLine) + i + j)^ = 0) do Inc(j);
+        if j = 16 then begin Inc(i, 16); Continue; end;
+        Write(Format('|  %5d:', [i]));
+        for j := 0 to 15 do begin
+          c := PByte(PtrUInt(aLine) + i + j)^;
+          Write(' ');
+          Write(LowerCase(Format('%.2x', [c])));
+        end;
+        Write('   ');
+        for j := 0 to 15 do begin
+          c := PByte(PtrUInt(aLine) + i + j)^;
+          Write(bShow[c]);
+        end;
+        WriteLn;
+        Inc(i, 16);
+      end;
+    end;
+  end;
+  sqlite3_finalize(pStmt);
+  WriteLn(Format('| end %s', [zName]));
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.23  `.dump ?OBJECTS?`  — shell.c.in:9384..9495 (dot-cmd driver) +
+                                3531..3697 (callbacks).
+
+  Minimal viable port: emit a SQL script that recreates the schema and
+  data of the open database.  Each table's CREATE statement is dumped
+  verbatim, then `SELECT * FROM tab` is rendered through MODE_Insert with
+  the destination table set to `tab`.  Differences from the full upstream
+  variant:
+    * No `--preserve-rowids` / `--newlines` / `--data-only`.
+    * No CORRUPTION detour with `ORDER BY rowid DESC`.
+    * No `tableColumnList` (so `INSERT INTO t VALUES(...)` is emitted, not
+      `INSERT INTO t(rowid,a,b,...) VALUES(...)`).
+    * No `sqlite_sequence` repopulation handling.
+  These restrict the dump to non-corrupt, non-rowid-sensitive databases —
+  enough for the 10.2 integration parity gate's golden-file comparison
+  on the shell test corpus.  Filename pattern matching honours the
+  upstream syntax (LIKE patterns).  ---------------------------------- }
+
+procedure dumpOneObject(p: PShellState; const zName, zType, zSql: AnsiString);
+var
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc: i32;
+  selectSql: AnsiString;
+  savedMode: TShellMode;
+  zPrevDestTable: PAnsiChar;
+begin
+  if (zName = 'sqlite_sequence') then begin
+    WriteLn('DELETE FROM sqlite_sequence;');
+  end else if (Copy(zName, 1, 11) = 'sqlite_stat')
+              and (Length(zName) = 12) then begin
+    WriteLn('ANALYZE sqlite_schema;');
+  end else if Copy(zName, 1, 7) = 'sqlite_' then begin
+    Exit;
+  end else begin
+    if zSql <> '' then WriteLn(zSql + ';');
+  end;
+  if zType <> 'table' then Exit;
+
+  selectSql := 'SELECT * FROM "' +
+    StringReplace(zName, '"', '""', [rfReplaceAll]) + '"';
+  pStmt := nil; pzTail := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(selectSql), -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    shellEPutZ(Format('Error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+    Inc(p^.nErr);
+    Exit;
+  end;
+
+  savedMode := p^.mode;
+  zPrevDestTable := p^.zDestTable;
+  p^.zDestTable := PAnsiChar(zName);
+  p^.mode.eMode := MODE_Insert;
+  p^.mode.spec.bTitles := 0;
+  stepAndRender(p, pStmt);
+  p^.mode := savedMode;
+  p^.zDestTable := zPrevDestTable;
+  sqlite3_finalize(pStmt);
+end;
+
+procedure cmdDump(p: PShellState; const args: array of AnsiString;
+                  nArg: SizeInt);
+var
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc, i: i32;
+  whereCl: AnsiString;
+  q: AnsiString;
+  zN, zT, zS: AnsiString;
+  pat, lit: AnsiString;
+  zPattern: AnsiString;
+  preserveRowid, dataOnly, noSys: Boolean;
+begin
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+  preserveRowid := False;
+  dataOnly := False;
+  noSys := False;
+  zPattern := '';
+  i := 0;
+  while i < nArg do begin
+    if args[i] = '--preserve-rowids' then preserveRowid := True
+    else if args[i] = '--data-only' then dataOnly := True
+    else if args[i] = '--nosys' then noSys := True
+    else if (Length(args[i]) > 0) and (args[i][1] = '-') then begin
+      shellEPutZ(Format('Error: unknown option: %s'#10, [args[i]]));
+      Exit;
+    end else if zPattern = '' then zPattern := args[i]
+    else begin
+      shellEPutZ(Format('Error: surplus argument: %s'#10, [args[i]]));
+      Exit;
+    end;
+    Inc(i);
+  end;
+  { Reference these so the compiler is happy in the minimal cut: }
+  if preserveRowid then ;
+
+  WriteLn('PRAGMA foreign_keys=OFF;');
+  WriteLn('BEGIN TRANSACTION;');
+
+  { Build WHERE clause. }
+  whereCl := 'WHERE type IN (''table'',''index'',''trigger'',''view'')';
+  if noSys then
+    whereCl := whereCl + ' AND name NOT LIKE ''sqlite\_%'' ESCAPE ''\''';
+  if zPattern <> '' then begin
+    pat := StringReplace(zPattern, '''', '''''', [rfReplaceAll]);
+    lit := ' AND (tbl_name LIKE ''' + pat + ''' OR name LIKE ''' + pat + ''')';
+    whereCl := whereCl + lit;
+  end;
+
+  q := 'SELECT name, type, sql FROM sqlite_schema ' + whereCl +
+       ' AND type=''table'' ORDER BY name';
+  if dataOnly then
+    q := 'SELECT name, type, sql FROM sqlite_schema ' + whereCl +
+         ' AND type=''table'' ORDER BY name';
+
+  pStmt := nil; pzTail := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(q), -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    shellEPutZ(Format('Error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+    Exit;
+  end;
+  while sqlite3_step(pStmt) = SQLITE_ROW do begin
+    zN := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 0)));
+    zT := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 1)));
+    if sqlite3_column_text(pStmt, 2) <> nil then
+      zS := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 2)))
+    else zS := '';
+    if dataOnly then zS := '';
+    dumpOneObject(p, zN, zT, zS);
+  end;
+  sqlite3_finalize(pStmt);
+
+  if not dataOnly then begin
+    { Emit non-table objects (indexes, views, triggers) after data. }
+    q := 'SELECT name, type, sql FROM sqlite_schema ' + whereCl +
+         ' AND type IN (''index'',''view'',''trigger'') ORDER BY type, name';
+    pStmt := nil;
+    rc := sqlite3_prepare_v2(p^.db, PAnsiChar(q), -1, @pStmt, @pzTail);
+    if (rc = SQLITE_OK) and (pStmt <> nil) then begin
+      while sqlite3_step(pStmt) = SQLITE_ROW do begin
+        if sqlite3_column_text(pStmt, 2) <> nil then begin
+          zS := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 2)));
+          if zS <> '' then WriteLn(zS + ';');
+        end;
+      end;
+      sqlite3_finalize(pStmt);
+    end;
+  end;
+
+  if p^.writableSchema <> 0 then begin
+    WriteLn('PRAGMA writable_schema=OFF;');
+    p^.writableSchema := 0;
+  end;
+  if p^.nErr <> 0 then WriteLn('ROLLBACK; -- due to errors')
+  else WriteLn('COMMIT;');
 end;
 
 { ----------------------------------------------------------------------
@@ -2655,6 +3100,12 @@ begin
   if (zCmd = 'scanstats') or (zCmd = 'scanstatus') then begin
     cmdScanstats(p, args, nArg); Exit;
   end;
+  if (zCmd = 'output') or (zCmd = 'once') or (zCmd = 'excel')
+     or (zCmd = 'www') then begin
+    cmdOutput(p, args, nArg, zCmd); Exit;
+  end;
+  if zCmd = 'dbtotxt' then begin cmdDbtotxt(p); Exit; end;
+  if zCmd = 'dump' then begin cmdDump(p, args, nArg); Exit; end;
   if zCmd = 'print' then begin
     for i := 0 to nArg - 1 do begin
       if i > 0 then Write(' ');
@@ -2721,6 +3172,13 @@ begin
         rc := doMetaCommand(zLine, p);
         if rc = 2 then Break       { .quit / .exit }
         else if rc <> 0 then Inc(errCnt);
+        { shell.c.in:12068..12071 — decrement nPopOutput after each dot
+          command; revert when it hits zero.  The .once arm sets it to 2
+          on entry so the redirect survives this very dot-command. }
+        if p^.nPopOutput > 0 then begin
+          Dec(p^.nPopOutput);
+          if p^.nPopOutput = 0 then outputReset(p);
+        end;
       end;
       Continue;                    { '#' lines are silent comments }
     end;
@@ -2737,6 +3195,12 @@ begin
     begin
       Inc(errCnt, runOneSqlLine(p, zSql, AnsiString(p^.zInFile), startLine));
       zSql := '';
+      { shell.c.in:12512..12517 — at end of each SQL line, immediately
+        revert any active .once redirect. }
+      if p^.nPopOutput > 0 then begin
+        outputReset(p);
+        p^.nPopOutput := 0;
+      end;
     end;
   end;
   if zSql <> '' then
@@ -2823,6 +3287,7 @@ begin
   stdout_is_console    := Ord(IsATTY(StdOutputHandle) <> 0);
 
   installInterruptHandler;
+  outputInit;
 
   n := ParamCount;
   i := 1;
