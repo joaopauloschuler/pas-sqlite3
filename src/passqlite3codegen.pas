@@ -22796,7 +22796,12 @@ begin
       pDest^.iSdst := pParse^.nMem + 1;
       pParse^.nMem := pParse^.nMem + nResultCol;
     end;
-    sqlite3VdbeAddOp3(v, OP_Explain, sqlite3VdbeCurrentAddr(v), 0, 0);
+    { Skip OP_Explain when this Select is the body of a multi-row VALUES
+      coroutine (SF_MultiValue set by sqlite3MultiValues recursion).  C
+      mirrors the suppression — multiSelectValues emits a single SCAN
+      Explain at the consumer level, not inside each coroutine body. }
+    if (p^.selFlags and SF_MultiValue) = 0 then
+      sqlite3VdbeAddOp3(v, OP_Explain, sqlite3VdbeCurrentAddr(v), 0, 0);
     sqlite3ExprCodeExprList(pParse, pEList, pDest^.iSdst, 0, SQLITE_ECEL_DUP);
     if pDest^.eDest = SRT_Output then
       sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
@@ -29432,22 +29437,29 @@ begin
   Result := 1;
 end;
 
-{ sqlite3MultiValues — port of insert.c:679.  UNION-ALL fallback arm.
+{ sqlite3MultiValues — port of insert.c:679.
 
   The C reference picks between two strategies:
     * a co-routine that yields each row at run-time (the fast path), or
     * a compound "pLeft UNION ALL SELECT pRow" Select tree (the fallback).
 
-  The co-routine arm requires sqlite3Insert to consume a Select with a
-  viaCoroutine SrcItem in its pSrc — productively reading the iSdst
-  registers in place — which is not yet wired (see tasklist 6.10 step 6).
-  Until that lands we unconditionally take the UNION-ALL fallback —
-  correct, just slower, and runtime parity is preserved. }
+  Conditions (a)..(d) + IN_SPECIAL_PARSE force the UNION-ALL fallback
+  (see insert.c:651..678 for the rationale).  Otherwise we take the
+  coroutine arm: on the 2nd-row call we wrap pLeft in a Select carrying
+  a viaCoroutine SrcItem and recurse sqlite3Select(SRT_Coroutine) to
+  emit row-1 + Yield; on 3rd+ rows we just bump u1.nRow.  In both arms
+  the tail emits ExprCodeExprList(pRow, regResult) + OP_Yield. }
 function sqlite3MultiValues(pParse: PParse; pLeft: PSelect;
   pRow: PExprList): PSelect;
 var
-  pSel: PSelect;
-  f:    u32;
+  pSel:    PSelect;
+  pRet:    PSelect;
+  f:       u32;
+  v:       PVdbe;
+  p:       PSrcItem;
+  pSubq:   PSubquery;
+  dest:    TSelectDest;
+  useCoroutine: Boolean;
 begin
   Result := pLeft;
   if pLeft = nil then
@@ -29456,27 +29468,136 @@ begin
     Exit;
   end;
 
-  f := SF_Values or SF_MultiValue;
-  if (pLeft^.pSrc <> nil) and (pLeft^.pSrc^.nSrc > 0) then
+  { Decide between the coroutine arm and the UNION-ALL fallback.
+    insert.c:681..687 — bail to UNION-ALL when:
+      (a) statement contains a WITH (PARSEFLAG_BHasWith);
+      (b) we're re-parsing the schema (init.busy);
+      (c) pRow has any non-constant term;
+      (d) first row is the wrapper (nSrc=0) AND pLeft->pEList carries
+          any expression with non-zero affinity (CAST, etc.);
+      or the parser is in PARSE_MODE_RENAME / DECLARE_VTAB / UNMAP. }
+  useCoroutine := True;
+  if (pParse^.parseFlags and PARSEFLAG_BHasWith) <> 0 then useCoroutine := False
+  else if pParse^.db^.init.busy <> 0 then useCoroutine := False
+  else if exprListIsConstant(pParse, pRow) = 0 then useCoroutine := False
+  else if (pLeft^.pSrc <> nil) and (pLeft^.pSrc^.nSrc = 0)
+          and (exprListIsNoAffinity(pParse, pLeft^.pEList) = 0) then
+    useCoroutine := False
+  else if pParse^.eParseMode <> PARSE_MODE_NORMAL then useCoroutine := False;
+
+  if not useCoroutine then
   begin
-    { pLeft is the special "read from co-routine" wrapper — close it. }
-    sqlite3MultiValuesEnd(pParse, pLeft);
-    f := SF_Values;
-  end
-  else if pLeft^.pPrior <> nil then
-  begin
-    { Inherit SF_MultiValue only if pLeft already had it. }
-    f := f and pLeft^.selFlags;
+    f := SF_Values or SF_MultiValue;
+    if (pLeft^.pSrc <> nil) and (pLeft^.pSrc^.nSrc > 0) then
+    begin
+      { pLeft is the special "read from co-routine" wrapper — close it. }
+      sqlite3MultiValuesEnd(pParse, pLeft);
+      f := SF_Values;
+    end
+    else if pLeft^.pPrior <> nil then
+    begin
+      { Inherit SF_MultiValue only if pLeft already had it. }
+      f := f and pLeft^.selFlags;
+    end;
+
+    pSel := sqlite3SelectNew(pParse, pRow, nil, nil, nil, nil, nil, f, nil);
+    pLeft^.selFlags := pLeft^.selFlags and (not u32(SF_MultiValue));
+    if pSel <> nil then
+    begin
+      pSel^.op := TK_ALL;
+      pSel^.pPrior := pLeft;
+      Result := pSel;
+    end;
+    Exit;
   end;
 
-  pSel := sqlite3SelectNew(pParse, pRow, nil, nil, nil, nil, nil, f, nil);
-  pLeft^.selFlags := pLeft^.selFlags and (not u32(SF_MultiValue));
-  if pSel <> nil then
+  { Coroutine arm — port of insert.c:705..783. }
+  p := nil;
+  if (pLeft^.pSrc <> nil) and (pLeft^.pSrc^.nSrc = 0) then
   begin
-    pSel^.op := TK_ALL;
-    pSel^.pPrior := pLeft;
-    Result := pSel;
+    { 2nd-row call: build the wrapper Select that reads from the
+      coroutine, attach viaCoroutine SrcItem, allocate regReturn /
+      addrFillSub, emit OP_InitCoroutine, recurse sqlite3Select to emit
+      row-1 + Yield. }
+    v := sqlite3GetVdbe(pParse);
+    pRet := sqlite3SelectNew(pParse, nil, nil, nil, nil, nil, nil, 0, nil);
+
+    { Ensure schema is loaded so text encoding is known. }
+    if (pParse^.db^.mDbFlags and DBFLAG_SchemaKnownOk) = 0 then
+      sqlite3ReadSchema(pParse);
+
+    if pRet <> nil then
+    begin
+      { Grow pRet->pSrc to one slot (zero-initialised). }
+      pRet^.pSrc := sqlite3SrcListEnlarge(pParse, pRet^.pSrc, 1, 0);
+      if (pRet^.pSrc = nil) or (pRet^.pSrc^.nSrc < 1) then
+      begin
+        sqlite3ExprListDelete(pParse^.db, pRow);
+        Exit;
+      end;
+      pRet^.pPrior := pLeft^.pPrior;
+      pRet^.op     := pLeft^.op;
+      if pRet^.pPrior <> nil then
+        pRet^.selFlags := pRet^.selFlags or SF_Values;
+      pLeft^.pPrior := nil;
+      pLeft^.op     := TK_SELECT;
+      Assert(pLeft^.pNext = nil);
+      Assert(pRet^.pNext = nil);
+
+      p := SrcListItems(pRet^.pSrc);
+      p^.fg.fgBits := p^.fg.fgBits or SRCITEM_FG_VIA_COROUTINE;
+      p^.iCursor := -1;
+      p^.u1.nRow := 2;
+      if sqlite3SrcItemAttachSubquery(pParse, p, pLeft, 0) <> 0 then
+      begin
+        pSubq := p^.u4.pSubq;
+        pSubq^.addrFillSub := sqlite3VdbeCurrentAddr(v) + 1;
+        Inc(pParse^.nMem);
+        pSubq^.regReturn := pParse^.nMem;
+        sqlite3VdbeAddOp3(v, OP_InitCoroutine,
+          pSubq^.regReturn, 0, pSubq^.addrFillSub);
+        sqlite3SelectDestInit(@dest, SRT_Coroutine, pSubq^.regReturn);
+
+        { Two unused regs in front of the coroutine result block — the
+          consumer (sqlite3Insert viaCoroutine arm) reuses these for
+          regRowid / regIns directly off regResult. }
+        dest.iSdst := pParse^.nMem + 3;
+        dest.nSdst := pLeft^.pEList^.nExpr;
+        pParse^.nMem := pParse^.nMem + 2 + dest.nSdst;
+
+        pLeft^.selFlags := pLeft^.selFlags or SF_MultiValue;
+        sqlite3Select(pParse, pLeft, @dest);
+        pSubq^.regResult := dest.iSdst;
+        Assert((pParse^.nErr <> 0) or (dest.iSdst > 0));
+      end;
+      pLeft := pRet;
+    end;
+  end
+  else if (pLeft^.pSrc <> nil) and (pLeft^.pSrc^.nSrc > 0) then
+  begin
+    { 3rd+ row — just bump the row counter on the existing wrapper. }
+    p := SrcListItems(pLeft^.pSrc);
+    p^.u1.nRow := p^.u1.nRow + 1;
   end;
+
+  if pParse^.nErr = 0 then
+  begin
+    Assert(p <> nil);
+    Assert(SrcItemIsSubquery(p^.fg));
+    pSubq := p^.u4.pSubq;
+    Assert(pSubq <> nil);
+    Assert(pSubq^.pSelect <> nil);
+    Assert(pSubq^.pSelect^.pEList <> nil);
+    if pSubq^.pSelect^.pEList^.nExpr <> pRow^.nExpr then
+      sqlite3SelectWrongNumTermsError(pParse, pSubq^.pSelect)
+    else
+    begin
+      sqlite3ExprCodeExprList(pParse, pRow, pSubq^.regResult, 0, 0);
+      sqlite3VdbeAddOp1(pParse^.pVdbe, OP_Yield, pSubq^.regReturn);
+    end;
+  end;
+  sqlite3ExprListDelete(pParse^.db, pRow);
+  Result := pLeft;
 end;
 
 { xferCompatibleIndex — port of insert.c:2951 (Phase 6.8.6 prep).
@@ -29603,6 +29724,15 @@ var
   isVirtual:      Boolean;
   pVTab:          PAnsiChar;
   p5Conflict:     u16;
+  useCoroutine:   Boolean;
+  regFromSelect:  i32;
+  regYield:       i32;
+  addrInsTop:     i32;
+  addrCont:       i32;
+  pSubqCoro:      PSubquery;
+  pCoroItem:      PSrcItem;
+  ipkInSelect:    Boolean;
+  k:              i32;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -29626,6 +29756,14 @@ begin
   isVirtual     := False;
   pVTab         := nil;
   p5Conflict    := 0;
+  useCoroutine  := False;
+  regFromSelect := 0;
+  regYield      := 0;
+  addrInsTop    := 0;
+  addrCont      := 0;
+  pSubqCoro     := nil;
+  pCoroItem     := nil;
+  ipkInSelect   := False;
 
   db := pParse^.db;
   if pParse^.nErr <> 0 then goto insert_cleanup;
@@ -29645,6 +29783,32 @@ begin
     pSelect^.pEList := nil;
     sqlite3SelectDelete(db, pSelect);
     pSelect := nil;
+  end;
+
+  { viaCoroutine consumer detection — port of insert.c:1120..1138.
+    sqlite3MultiValues' coroutine arm wraps pLeft in a Select carrying a
+    single SrcItem whose fg.viaCoroutine bit is set; the SrcItem's Subquery
+    holds regReturn / regResult.  When we see that shape, reuse the
+    coroutine's allocations directly: regData = regResult, regRowid =
+    regData-1, regIns = regRowid (or regRowid-1 for vtabs).  All later
+    register-allocation arms are then skipped. }
+  if (pSelect <> nil)
+     and (pSelect^.pSrc <> nil)
+     and (pSelect^.pSrc^.nSrc = 1)
+     and (pSelect^.pPrior = nil) then
+  begin
+    pCoroItem := SrcListItems(pSelect^.pSrc);
+    if (pCoroItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0 then
+    begin
+      Assert(SrcItemIsSubquery(pCoroItem^.fg));
+      pSubqCoro := pCoroItem^.u4.pSubq;
+      Assert(pSubqCoro <> nil);
+      Assert(pSubqCoro^.pSelect <> nil);
+      Assert(pSubqCoro^.pSelect^.pEList <> nil);
+      useCoroutine  := True;
+      regYield      := pSubqCoro^.regReturn;
+      regFromSelect := pSubqCoro^.regResult;
+    end;
   end;
 
   { Locate the target table. }
@@ -29705,7 +29869,9 @@ begin
 
   { Allocate registers: rowid + nCol data slots.  For vtab, prepend an extra
     slot so regIns stays at argv[0] (delete-rowid, set to NULL for INSERT)
-    and regRowid steps forward to argv[1] — matches insert.c:1049..1055. }
+    and regRowid steps forward to argv[1] — matches insert.c:1049..1055.
+    viaCoroutine consumer (insert.c:1134..1138) overrides these to point
+    at the coroutine's regResult block when bIdListInOrder + full-cols. }
   regRowid := pParse^.nMem + 1;
   regIns   := regRowid;
   pParse^.nMem := pParse^.nMem + i32(pTab^.nCol) + 1;
@@ -29727,8 +29893,10 @@ begin
     insertion order (leaf-first since pPrior chains backwards).
     Any other pSelect shape (true SELECT-as-source, sub-coroutine, etc.)
     still bails — those are tracked under 6.10 step 6.  Single-row
-    VALUES is captured into pList above; pSelect is nil here. }
-  if pSelect <> nil then
+    VALUES is captured into pList above; pSelect is nil here.
+    The viaCoroutine consumer arm (detected earlier) bypasses this
+    chain walk entirely. }
+  if (pSelect <> nil) and (not useCoroutine) then
   begin
     { Accept either SF_Values multi-row VALUES chains or compound
       `SELECT const-list UNION ALL SELECT const-list` chains where every
@@ -29783,7 +29951,9 @@ begin
   { pList = nil  ⇔  INSERT … DEFAULT VALUES (insert.c:1213..1215).
     For multi-row VALUES (isMulti), nColumn is taken from the first row;
     parity across rows was already validated above. }
-  if isMulti then
+  if useCoroutine then
+    nColumn := pSubqCoro^.pSelect^.pEList^.nExpr
+  else if isMulti then
     nColumn := pRowsList[0]^.nExpr
   else if pList <> nil then
     nColumn := pList^.nExpr
@@ -29841,6 +30011,20 @@ begin
     end;
   end;
 
+  { viaCoroutine register-reuse override (insert.c:1134..1138).  When the
+    IDLIST is in storage order and supplies every column, repoint regData /
+    regRowid / regIns at the coroutine's regResult block so OP_Yield writes
+    directly into the destination layout — saving the SCopy column-eval
+    pass and matching C's bytecode layout. }
+  if useCoroutine and (bIdListInOrder <> 0)
+     and (nColumn = i32(pTab^.nCol)) then
+  begin
+    regData  := regFromSelect;
+    regRowid := regData - 1;
+    if isVirtual then regIns := regRowid - 1
+    else regIns := regRowid;
+  end;
+
   { Allocate aRegIdx[nIdx + 1] (Phase 6.8.6 — replaces the inline four-op
     shortcut so non-IPK indexes get populated by sqlite3CompleteInsertion).
     aRegIdx[i] for i in 0..nIdx-1 := first reg of per-index key block;
@@ -29867,6 +30051,14 @@ begin
   Inc(pParse^.nMem);
   (aRegIdx + nIdx)^ := pParse^.nMem;
 
+  { ExplainQueryPlan SCAN announcement — insert.c:1133.  C emits this
+    before OpenWrite so the EQP marker leads the consumer block.  Done
+    here for the viaCoroutine arm only; the inline-unrolled multi-row
+    path doesn't need it (no run-time loop). }
+  if useCoroutine then
+    sqlite3VdbeAddOp3(v, OP_Explain, sqlite3VdbeCurrentAddr(v),
+      pParse^.addrExplain, 0);
+
   iDataCur := 0;
   iIdxCur  := 0;
   if not (isView <> 0) then
@@ -29885,29 +30077,89 @@ begin
     sqlite3ExprCodeFactorable.  sqlite3ColumnExpr returns the bound DEFAULT /
     AS expression for the column (or nil for columns without one — those
     fall through to OP_Null via the constant-factor short-circuit). }
+  { viaCoroutine bytecode-loop framing — port of insert.c:1343..1351.
+    Emit ReleaseRegisters over the destination block, OP_Yield(regYield)
+    as the loop top, and (if IPK column present) pre-load regRowid from
+    the coroutine's IPK slot — the rowid arm then skips the SCopy.
+    Yield drops to addrInsTop+1 on coroutine exhaustion (loop exit). }
+  if useCoroutine then
+  begin
+    nRows := 1;
+    sqlite3VdbeReleaseRegisters(pParse, regData, i32(pTab^.nCol), 0, 0);
+    addrInsTop := sqlite3VdbeAddOp1(v, OP_Yield, regYield);
+    addrCont   := addrInsTop;
+    if pTab^.iPKey >= 0 then
+    begin
+      ipkInSelect := False;
+      if pColumn <> nil then
+      begin
+        k := (aTabColMap + i32(pTab^.iPKey))^;
+        if k <> 0 then
+        begin
+          sqlite3VdbeAddOp2(v, OP_Copy,
+            regFromSelect + (k - 1), regRowid);
+          ipkInSelect := True;
+        end;
+      end
+      else
+      begin
+        sqlite3VdbeAddOp2(v, OP_Copy,
+          regFromSelect + i32(pTab^.iPKey), regRowid);
+        ipkInSelect := True;
+      end;
+    end;
+  end;
+
   { Per-row emission loop.  For single-row / DEFAULT VALUES this runs once
     with pCurRow = pList (which may be nil for DEFAULT VALUES).  For
     multi-row VALUES (isMulti) this loops over pRowsList[0..nRows-1],
     re-emitting the column eval + rowid + GenerateConstraintChecks +
-    CompleteInsertion sequence per row.  The C reference uses an
-    SRT_Coroutine yielded by sqlite3Select and a single bytecode loop;
-    our path emits inline-unrolled per-row blocks instead — equivalent at
-    runtime, larger bytecode, but it does not require sqlite3Select to
-    handle compound SF_Values (still pending). }
+    CompleteInsertion sequence per row.  For viaCoroutine this runs once
+    inside the bytecode loop framed above; the column-eval inner loop is
+    skipped (or emits SCopy when regData != regFromSelect) since values
+    arrive via OP_Yield. }
   for iRow := 0 to nRows - 1 do
   begin
-    if isMulti then
+    if useCoroutine then
+      pCurRow := nil
+    else if isMulti then
       pCurRow := pRowsList[iRow]
     else
       pCurRow := pList;
 
-    if pCurRow <> nil then
+    if (pCurRow <> nil) and (not useCoroutine) then
       pListItems := ExprListItems(pCurRow)
     else
       pListItems := nil;
 
     for i := 0 to i32(pTab^.nCol) - 1 do
     begin
+      if useCoroutine then
+      begin
+        { Coroutine streams values into regFromSelect..; copy into regData+i
+          only when the layouts diverge (IDLIST out-of-order or partial).
+          IPK slot stays NULL (will be re-loaded into regRowid in rowid arm). }
+        if i = i32(pTab^.iPKey) then
+        begin
+          if regData <> regFromSelect then
+            sqlite3VdbeAddOp1(v, OP_SoftNull, regData + i);
+          Continue;
+        end;
+        if regData = regFromSelect then Continue;
+        if pColumn <> nil then
+        begin
+          k := (aTabColMap + i)^;
+          if k = 0 then
+            sqlite3ExprCodeFactorable(pParse,
+              sqlite3ColumnExpr(pTab, @pTab^.aCol[i]), regData + i)
+          else
+            sqlite3VdbeAddOp2(v, OP_SCopy,
+              regFromSelect + (k - 1), regData + i);
+        end
+        else
+          sqlite3VdbeAddOp2(v, OP_SCopy, regFromSelect + i, regData + i);
+        Continue;
+      end;
       if pColumn <> nil then
       begin
         j := (aTabColMap + i)^;
@@ -29932,6 +30184,8 @@ begin
     begin
       if pColumn <> nil then
         ipkColumnPresent := (aTabColMap + i32(pTab^.iPKey))^ <> 0
+      else if useCoroutine then
+        ipkColumnPresent := True  { positional via SELECT — IPK column streams. }
       else
         ipkColumnPresent := pCurRow <> nil;  { positional VALUES — IPK is
                                                 included.  DEFAULT VALUES
@@ -29997,7 +30251,8 @@ begin
     begin
       if (pTab^.iPKey >= 0) and ipkColumnPresent then
       begin
-        sqlite3VdbeAddOp2(v, OP_SCopy, regData + i32(pTab^.iPKey), regRowid);
+        if not (useCoroutine and ipkInSelect) then
+          sqlite3VdbeAddOp2(v, OP_SCopy, regData + i32(pTab^.iPKey), regRowid);
         addrIpkNotNull := sqlite3VdbeAddOp1(v, OP_NotNull, regRowid);
         sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
         sqlite3VdbeJumpHere(v, addrIpkNotNull);
@@ -30060,6 +30315,14 @@ begin
         pTab, regData - 2 - i32(pTab^.nCol), onError, endOfLoop);
 
     sqlite3VdbeResolveLabel(v, endOfLoop);
+  end;
+
+  { viaCoroutine bytecode-loop tail — Goto to the OP_Yield at addrCont,
+    then resolve addrInsTop so coroutine exhaustion lands here. }
+  if useCoroutine then
+  begin
+    sqlite3VdbeGoto(v, addrCont);
+    sqlite3VdbeJumpHere(v, addrInsTop);
   end;
 
 insert_end:

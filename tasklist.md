@@ -86,30 +86,35 @@ FPC porting traps that recur often enough to call out up-front:
           Close-out plan (land steps 1+2 together — step 1 alone would
           break DiagMultiValues runtime since the parser would emit a
           viaCoroutine Select that sqlite3Insert can't yet consume):
-          [ ] 1. Port `sqlite3MultiValues` coroutine arm
-               (insert.c:705..783).  On 2nd-row call: allocate wrapper
-               Select, viaCoroutine SrcItem, attach pLeft as subquery,
-               allocate `pSubq->regReturn` (++nMem) and `addrFillSub`,
-               emit OP_InitCoroutine, set `dest.iSdst = nMem+3` /
-               `nMem += 2 + nSdst` (the "two unused regs in front"
-               that step 2 reuses for regRowid/regIns), set
-               SF_MultiValue on pLeft, recurse `sqlite3Select(pLeft,
-               SRT_Coroutine)` to emit row-1 Integer ops + Yield, set
-               `pSubq->regResult = dest.iSdst`.  On 3rd+ rows: bump
-               `p->u1.nRow`.  Always at tail: ExprCodeExprList(pRow,
-               regResult) + OP_Yield(regReturn).
-          [ ] 2. Port `sqlite3Insert` viaCoroutine consumer arm
-               (insert.c:1120..1138 + tail at 1343/1619).  Detect
-               `pSelect->pSrc[0].fg.viaCoroutine` and reuse the
-               coroutine's allocations directly: dest.iSDParm =
-               regReturn, regFromSelect = regResult, regData =
-               regFromSelect, regRowid = regData-1, regIns = regRowid.
-               Emit ExplainQueryPlan SCAN, OpenWrite,
-               sqlite3VdbeReleaseRegisters(regData, nCol), Yield
-               (loop top, addrInsTop = addrCont), then route through
-               existing GenerateConstraintChecks + CompleteInsertion
-               for NewRowid/MakeRecord/Insert, close with Goto(addrCont)
-               + JumpHere(addrInsTop).
+          [X] 1. `sqlite3MultiValues` coroutine arm landed
+               (codegen.pas:29446).  Conditions (a)..(d) + IN_SPECIAL_PARSE
+               gate the UNION-ALL fallback; otherwise: 2nd-row call
+               allocates wrapper Select + viaCoroutine SrcItem, attaches
+               pLeft as subquery, allocates regReturn/addrFillSub, emits
+               OP_InitCoroutine, recurses `sqlite3Select(pLeft,
+               SRT_Coroutine)` to emit row-1 Integer ops + Yield, sets
+               regResult = dest.iSdst.  3rd+ rows bump u1.nRow.  Tail
+               emits ExprCodeExprList(pRow, regResult) + OP_Yield.
+               Also gated OP_Explain in the no-FROM fast path
+               (codegen.pas:22799) on SF_MultiValue to suppress
+               the inside-coroutine Explain (mirrors C).
+          [X] 2. `sqlite3Insert` viaCoroutine consumer arm landed.
+               Detection at codegen.pas:29670 sets useCoroutine when
+               pSelect carries a single viaCoroutine SrcItem; reg-reuse
+               override at codegen.pas:30030 sets regData = regFromSelect,
+               regRowid = regData-1, regIns = regRowid (or -1 for vtab)
+               when bIdListInOrder + full-cols.  OP_Explain SCAN emitted
+               before OpenTableAndIndices, then ReleaseRegisters + Yield
+               loop-top + Copy regFromSelect+ipkColumn → regRowid (when
+               IPK in result block) frame the bytecode loop; tail emits
+               Goto(addrCont) + JumpHere(addrInsTop).  Column-eval inner
+               loop is skipped (or emits SCopy for IDLIST out-of-order).
+               Existing rowid arm skips its SCopy when regRowid was
+               pre-loaded.  Verification: DiagMultiValues runtime green;
+               DiagDml 14/14; TestExplainParity 1025/1026 (residual
+               diff is register-numbering — MakeRecord p3=11 vs 14 —
+               from C's selectInnerLoop temp-reg pattern not yet
+               mirrored in the no-FROM fast path; runtime-equivalent).
           [ ] 3. Remove the now-dead `isMulti` inline-unrolled path
                in sqlite3Insert (codegen.pas:29722..29773 detection +
                29897 per-row Pascal loop).  Existed only because the
@@ -119,6 +124,24 @@ FPC porting traps that recur often enough to call out up-front:
                PASS (1026/1026); no regressions across the other
                1025 rows or the wider test suite (DiagDml,
                DiagIndexing, etc.).
+          [ ] 5. Close the last register-numbering gap on
+               `INSERT multi-row VALUES` (TestExplainParity op[16]
+               MakeRecord p3=11 vs 14, runtime-equivalent).  Root
+               cause: the recursive `sqlite3Select(SRT_Coroutine)`
+               on row-1 takes codegen.pas:22778 no-FROM fast path
+               (direct `sqlite3ExprCodeExprList` into `pDest^.iSdst`)
+               instead of routing through `selectInnerLoop` /
+               `multiSelectValues` like C does.  C's selectInnerLoop
+               grabs+releases a few temp regs while emitting the
+               Integer/Yield body; those `sqlite3GetTempReg` calls
+               bump `pParse->nMem` (release returns to the pool but
+               not to nMem), so by the time `aRegIdx[0] = ++nMem`
+               runs in `sqlite3Insert`, oracle nMem is +3 vs ours.
+               Fix: in the no-FROM fast path, when SF_MultiValue is
+               set and dest is SRT_Coroutine, route through
+               selectInnerLoop (or pre-bump nMem by the same delta)
+               so the per-coroutine-row reg pattern matches C.
+               Gate: TestExplainParity flips to 1026/1026.
 
 - [X] **6.8.5** `sqlite3WhereEnd` — DONE.
 
