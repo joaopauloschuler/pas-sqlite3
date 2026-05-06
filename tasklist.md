@@ -1210,6 +1210,21 @@ existing dispatcher.
        digit '4' at position 15; uuid_str canonicalises hex-only,
        hyphenated, and {braced} inputs; uuid_blob round-trips through
        uuid_str byte-identical; bad input returns NULL.
+  [X] **10.1.62** ext/misc/ieee754.c port (361 C lines) — new unit
+       `passqlite3ieee754.pas` provides the full ieee754 family:
+       ieee754(X) / ieee754(M,E) / ieee754_mantissa(X) /
+       ieee754_exponent(X) / ieee754_to_blob(X) / ieee754_from_blob(B) /
+       ieee754_to_int(X) / ieee754_from_int(N) / ieee754_inc(R,N).
+       The dispatch user-data trick from the C source (one ieee754func
+       branch per registration row, keyed off `*(int*)sqlite3_user_data`)
+       is preserved via three module-level i32 sentinels (ieeeAux0/1/2).
+       Type-puns through a record-variant TBits64 (no memcpy needed).
+       Wired via `sqlite3IeeeInit(p^.db)` in shell openDb.  Verified
+       byte-identical against upstream `.load ieee754.so`: ieee754(2.0)
+       = 'ieee754(2,0)', ieee754(45.25) = 'ieee754(181,-2)',
+       ieee754(2,0) = 2.0, ieee754_to_blob(1.0) =
+       x'3FF0000000000000', ieee754_inc(0.0,+1) =
+       4.9406564584124654e-324, ieee754(0.0) = 'ieee754(0,-1075)'.
 
 - [X] **10.1.bug.2** sqlite3_trace_v2 callback fanout — closed 2026-05-06.
   Four call sites mirroring the C reference now invoke `db^.trace.xV2`:

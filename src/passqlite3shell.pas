@@ -63,6 +63,7 @@ uses
   passqlite3shathree,
   passqlite3sha1,
   passqlite3uuid,
+  passqlite3ieee754,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -521,6 +522,10 @@ begin
     uuid_blob.  Auto-registered like upstream's `--shell` build. }
   sqlite3ShaInit(p^.db);
   sqlite3UuidInit(p^.db);
+  { Phase 10.1.62 — ieee754() / ieee754_mantissa() / ieee754_exponent() /
+    ieee754_to_blob() / ieee754_from_blob() / ieee754_to_int() /
+    ieee754_from_int() / ieee754_inc() from ext/misc/ieee754.c. }
+  sqlite3IeeeInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
