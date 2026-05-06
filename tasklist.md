@@ -899,11 +899,24 @@ existing dispatcher.
        and `--deserialize` defer until those VFSes/extensions are
        ported.
 
-- [ ] **10.1e** Meta / diagnostic dot-commands.  `.stats`, `.timer`,
-  `.eqp`, `.explain`, `.show`, `.help`, `.shell`/`.system`, `.cd`,
-  `.log`, `.trace`, `.iotrace`, `.scanstats`, `.testcase`,
-  `.testctrl`, `.selecttrace`, `.wheretrace`.  Gate:
-  `tests/cli/10e_meta/`.
+- [ ] **10.1e** Meta / diagnostic dot-commands.  
+  - [ ] `.stats`
+  - [ ] `.timer`
+  - [ ] `.eqp`, 
+  - [ ] `.explain`, 
+  - [ ] `.show`, 
+  - [ ] `.help`, 
+  - [ ] `.shell`/`.system`, 
+  - [ ] `.cd`,
+  - [ ] `.log`, 
+  - [ ] `.trace`, 
+  - [ ] `.iotrace`, 
+  - [ ] `.scanstats`, 
+  - [ ] `.testcase`,
+  - [ ] `.testctrl`, 
+  - [ ] `.selecttrace`, 
+  - [ ] `.wheretrace`.  
+  Gate: `tests/cli/10e_meta/`.
 
   [X] **10.1.28** `.stats off|on|stmt|vmstep` — cmdStats setter +
        displayStats / displayStatLine / displayLinuxIoStats port of
