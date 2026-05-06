@@ -811,10 +811,14 @@ existing dispatcher.
   [X] **10.1.14** HTML writer helpers — `outputHtmlString` (escape
        <, >, &, ", ') wired into emitRowOne MODE_Html.
 
-- [ ] **10.1c** Schema introspection dot-commands.  `.schema`,
-  `.tables`, `.indexes`, `.databases`, `.fullschema`,
-  `.lint fkey-indexes`, `.expert` (read-only subset).  Gate:
-  `tests/cli/10c_schema/`.
+- [ ] **10.1c** Schema introspection dot-commands. Gate: `tests/cli/10c_schema/`. 
+  - [ ] `.schema`,
+  - [ ] `.tables`, 
+  - [ ] `.indexes`, 
+  - [ ] `.databases`, 
+  - [ ] `.fullschema`,
+  - [ ] `.lint fkey-indexes`, 
+  - [ ] `.expert` (read-only subset).  
 
   [~] **10.1.15** `.schema` arm landed (cmdSchema): pulls
        `SELECT sql FROM sqlite_schema [WHERE name LIKE pat] ORDER BY
@@ -899,7 +903,7 @@ existing dispatcher.
        and `--deserialize` defer until those VFSes/extensions are
        ported.
 
-- [ ] **10.1e** Meta / diagnostic dot-commands.  
+- [ ] **10.1e** Meta / diagnostic dot-commands. Gate: `tests/cli/10e_meta/`.  
   - [ ] `.stats`
   - [ ] `.timer`
   - [ ] `.eqp`, 
@@ -916,7 +920,6 @@ existing dispatcher.
   - [ ] `.testctrl`, 
   - [ ] `.selecttrace`, 
   - [ ] `.wheretrace`.  
-  Gate: `tests/cli/10e_meta/`.
 
   [X] **10.1.28** `.stats off|on|stmt|vmstep` — cmdStats setter +
        displayStats / displayStatLine / displayLinuxIoStats port of
@@ -980,7 +983,9 @@ existing dispatcher.
        sqlite3_test_control variant (deferred).
 
 - [ ] **10.1f** Long-tail / specialised dot-commands.  
-  - [ ] `.backup`,
+  Out-of-scope dependencies (session, archive, recover)
+  may stub with the upstream `SQLITE_OMIT_*` "feature not compiled
+  in" message.  Gate: `tests/cli/10f_misc/`.  - [ ] `.backup`,
   - [ ] `.restore`, 
   - [ ] `.clone`, 
   - [ ] `.archive`/`.ar`, 
@@ -997,9 +1002,7 @@ existing dispatcher.
   - [ ] `.vfsinfo`, 
   - [ ] `.vfslist`,
   - [ ] `.vfsname`. 
-  Out-of-scope dependencies (session, archive, recover)
-  may stub with the upstream `SQLITE_OMIT_*` "feature not compiled
-  in" message.  Gate: `tests/cli/10f_misc/`.
+  
 
   [X] **10.1.43** `.backup ?DB? ?-async? ?-append? FILE` — cmdBackup
        wraps sqlite3_backup_init/_step/_finish (100-page chunks).
