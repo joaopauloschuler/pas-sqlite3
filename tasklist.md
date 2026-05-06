@@ -230,12 +230,14 @@ FPC porting traps that recur often enough to call out up-front:
 
 ### Open Bugs
 
-- [~] **6.10** `TestExplainParity.pas` — **1026/1026 PASS** as of
+- [X] **6.10** `TestExplainParity.pas` — **1026/1026 PASS** as of
     2026-05-06 (a3).  Oracle is built with `-DSQLITE_DEBUG
     -DSQLITE_ENABLE_EXPLAIN_COMMENTS`, so emits OP_Explain /
     OP_ReleaseReg (vdbeaux.c gates them under `#if !defined(SQLITE_DEBUG)`);
-    Pas matches.  Bytecode gate fully closed; remaining sub-tasks below
-    track runtime divergences surfaced by the Diag* probes.
+    Pas matches.  Bytecode gate fully closed; all runtime sub-steps
+    (6, 7, 8, 9, 15, 17) closed 2026-05-06.  Verification: DiagFeatureProbe
+    0 divergences; DiagMisc / DiagTxn / DiagWindow / DiagDml / DiagPragma
+    / DiagIndexing / DiagOps / DiagMultiValues / DiagDropTable all green.
     - [X] **6.10 step 6** Remaining bytecode-Δ row:
         [X] `INSERT multi-row VALUES` — bytecode parity reached
           (22 ops, byte-identical to C) via the sqlite3MultiValues
@@ -264,10 +266,11 @@ FPC porting traps that recur often enough to call out up-front:
       / DiagIndexing / DiagSubsel / DiagAggWhere / DiagInnerJoin /
       DiagMultiValues green.
 
-  [ ] **6.10 step 9** Runtime divergences surfaced by
+  [X] **6.10 step 9** Runtime divergences surfaced by
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
-      bin/DiagFeatureProbe`).  Most fold into existing tasks; the genuinely
-      new silent-result bugs are listed first.
+      bin/DiagFeatureProbe`).  All sub-arms (c view, e UNION/LIMIT,
+      f recursive CTE, g ALTER TABLE) closed 2026-05-06; probe reports
+      0 divergences across all 26 rows.
 
       **Residual-work map across all open 6.10 sub-steps (2026-05-06, a3):**
 
