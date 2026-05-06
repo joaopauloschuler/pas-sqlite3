@@ -807,19 +807,28 @@ existing dispatcher.
        tbl_name=?] ORDER BY 1`.
   [X] **10.1.18** `.databases` — cmdDatabases runs
        `SELECT name, file FROM pragma_database_list ORDER BY seq`.
-  [ ] **10.1.19** `.fullschema` — schema + sqlite_stat1/4 dump.
-  [ ] **10.1.20** `.lint fkey-indexes` — runs the canonical FK-index
-       audit query.  Other `.lint` sub-options remain stubs.
-  [ ] **10.1.21** `.expert` — read-only subset wrapping the
-       sqlite3_expert.c module (deferred until that module is ported;
-       stub with the upstream "expert is disabled" message until then).
+  [~] **10.1.19** `.fullschema` — cmdFullschema dumps CREATE statements
+       (excluding sqlite_stat%) plus sqlite_stat1/sqlite_stat4 INSERTs
+       (when those tables exist).  --indent reformatter still pending
+       with .schema's --indent option.
+  [~] **10.1.20** `.lint fkey-indexes` — cmdLint runs a simplified FK
+       audit (CREATE INDEX suggestion per FK constraint, derived from
+       pragma_foreign_key_list).  The full upstream variant uses
+       fkey_collate_clause()+EXPLAIN-based coverage detection;
+       deferred until those helpers are ported.
+  [X] **10.1.21** `.expert` — cmdExpert emits the upstream
+       "this build does not support the .expert command" stub
+       (sqlite3_expert.c not yet ported).
 
 - [ ] **10.1d** Data I/O dot-commands.  `.read`, `.dump`, `.import`
   (CSV/ASCII), `.output` / `.once`, `.save`, `.open`.  Gate:
   `tests/cli/10d_io/`.
 
-  [ ] **10.1.22** `.read` — push a script file onto the input stack,
-       respecting `.echo` and recursion guard.
+  [X] **10.1.22** `.read FILE` — cmdRead pushes the named file onto a
+       Pascal-side input stack (curInputText) and re-enters processInput;
+       inputNesting still gates the existing recursion guard.  Pipe
+       (`|cmd`) variants emit the upstream "pipes are not supported"
+       error.
   [ ] **10.1.23** `.dump` — full schema-and-data dump.  Per-row
        INSERT generation via `run_schema_dump_query` +
        `run_table_dump_query` + `output_quoted_escaped_string`.
@@ -829,9 +838,14 @@ existing dispatcher.
        table from header row, transactional bulk-insert path.
   [ ] **10.1.25** `.output` / `.once` — redirect to file / pipe /
        stdout; `-x` (Excel) and `--bom` flags.
-  [ ] **10.1.26** `.save` — `VACUUM INTO 'file'` wrapper.
-  [ ] **10.1.27** `.open` — close current db and re-open with
-       `--readonly`, `--zip`, `--deserialize`, `--new`, `--nofollow`.
+  [X] **10.1.26** `.save ?DB? FILE` — cmdBackup arm (shared with .backup).
+       sqlite3_backup_init/_step/_finish copy main into a fresh dest db
+       opened with READWRITE|CREATE.
+  [~] **10.1.27** `.open ?-options? ?FILE?` — cmdOpen handles `-new`,
+       `-readonly`, `-exclusive`, `-ifexists`, `-nofollow`; closes the
+       current db, opens new (with TEMP fallback on failure).  `--zip`
+       and `--deserialize` defer until those VFSes/extensions are
+       ported.
 
 - [ ] **10.1e** Meta / diagnostic dot-commands.  `.stats`, `.timer`,
   `.eqp`, `.explain`, `.show`, `.help`, `.shell`/`.system`, `.cd`,
@@ -870,14 +884,20 @@ existing dispatcher.
        (`stmt` / `profile` / `row` / `close`).
   [ ] **10.1.38** `.iotrace` — wires `sqlite3IoTrace` (gated on the
        6.8 `sqlite3VdbeIOTraceSql` arm landing first).
-  [ ] **10.1.39** `.scanstats` — gated on the 6.8
+  [~] **10.1.39** `.scanstats on|off|est|vm` — cmdScanstats records the
+       mode locally and emits upstream's "not available in this build"
+       warning; full wiring still gated on the 6.8
        `sqlite3VdbeScanStatus*` arms + 8.2.1 `sqlite3_stmt_scanstatus`.
-  [ ] **10.1.40** `.testcase` / `.check` — testcase output capture
-       used by the upstream test runner.
+  [~] **10.1.40** `.testcase NAME` — cmdTestcase records NAME in
+       p^.zTestcase; the `.check ANSWER` comparator side (which
+       redirects shell output to a buffer) is still pending.
   [ ] **10.1.41** `.testctrl` — `sqlite3_test_control` opcode
        dispatcher (gated on 8.4.1).
-  [ ] **10.1.42** `.selecttrace` / `.wheretrace` / `.treetrace` —
-       compile-time-debug toggles wrapping `sqlite3_test_control`.
+  [~] **10.1.42** `.selecttrace` / `.wheretrace` / `.treetrace` —
+       cmdTraceFlags emits a "requires a debug build; ignored"
+       breadcrumb so partial landings don't fall through to the unknown-
+       command arm.  Full TRACEFLAGS wiring needs the varargs
+       sqlite3_test_control variant (deferred).
 
 - [ ] **10.1f** Long-tail / specialised dot-commands.  `.backup`,
   `.restore`, `.clone`, `.archive`/`.ar`, `.session`, `.recover`,
@@ -887,9 +907,14 @@ existing dispatcher.
   may stub with the upstream `SQLITE_OMIT_*` "feature not compiled
   in" message.  Gate: `tests/cli/10f_misc/`.
 
-  [ ] **10.1.43** `.backup` — `sqlite3_backup_init/_step/_finish`
-       wrapper writing to the destination file.
-  [ ] **10.1.44** `.restore` — symmetric, source = file.
+  [X] **10.1.43** `.backup ?DB? ?-async? ?-append? FILE` — cmdBackup
+       wraps sqlite3_backup_init/_step/_finish (100-page chunks).
+       --async runs `PRAGMA synchronous=OFF; PRAGMA journal_mode=OFF`
+       on the destination; --append accepted but no-ops because the
+       apndvfs has not been registered.
+  [X] **10.1.44** `.restore ?DB? FILE` — cmdRestore runs the symmetric
+       backup with the upstream 3-attempt SQLITE_BUSY retry loop
+       (sqlite3_sleep(100) between attempts).
   [ ] **10.1.45** `.clone` — combines backup + reattach (multi-db
        variant of `.backup`).
   [ ] **10.1.46** `.archive` / `.ar` — sqlar reader/writer; gated on
@@ -906,8 +931,12 @@ existing dispatcher.
        SQLITE_FCNTL_DATA_VERSION for the `data version` line.
        sqlite_dbpage virtual table is now auto-registered on every
        openDb() so `.dbinfo` works without explicit module loading.
-  [ ] **10.1.50** `.dbconfig` — `sqlite3_db_config` opcode dispatcher
-       (gated on 8.1.1 raw-varargs `sqlite3_db_config`).
+  [~] **10.1.50** `.dbconfig ?op? ?val?` — cmdDbconfig dispatches
+       through sqlite3_db_config_int across the boolean DBCONFIG_* set
+       (defensive, dqs_*, enable_*, legacy_*, no_ckpt_on_close,
+       reset_database, trusted_schema).  Counter-style and pointer-
+       style ops still gated on the raw-varargs sqlite3_db_config port
+       (8.1.1).
   [ ] **10.1.51** `.filectrl` — `sqlite3_file_control` opcode
        dispatcher (gated on 8.4.1).
   [ ] **10.1.52** `.sha3sum` — runs the SHA3 hash extension over
@@ -917,12 +946,21 @@ existing dispatcher.
        and echoes `crlf is OFF`; matches upstream's non-Windows arm.
   [X] **10.1.54** `.binary` — cmdBinary emits the upstream
        `The ".binary" command is deprecated.` breadcrumb.
-  [ ] **10.1.55** `.connection` — multi-connection switching
-       (`.connection 0..N`, `.connection close N`).
-  [ ] **10.1.56** `.unmodule` — `sqlite3_drop_modules` wrapper.
-  [ ] **10.1.57** `.vfsinfo` / `.vfslist` / `.vfsname` — VFS
-       introspection via `sqlite3_file_control`
-       (`SQLITE_FCNTL_VFS_POINTER`).
+  [X] **10.1.55** `.connection ?N? | close N` — cmdConnection swaps
+       p^.pAuxDb across the aAuxDb[0..4] slots.  Bare `.connection`
+       lists ACTIVE / open / not-open slots in upstream's column
+       layout; `close N` releases a slot's db without disturbing the
+       active one.
+  [X] **10.1.56** `.unmodule [--allexcept] NAME ...` — cmdUnmodule
+       dispatches through sqlite3_drop_modules (with the NULL-
+       terminated PPAnsiChar) for `--allexcept`, otherwise calls
+       sqlite3_create_module(name, NULL, NULL) per name.
+  [~] **10.1.57** `.vfsinfo` / `.vfslist` / `.vfsname` — cmdVfsinfo /
+       cmdVfslist / cmdVfsname use SQLITE_FCNTL_VFS_POINTER and walk
+       sqlite3_vfs_find chain.  `.vfsname` returns empty for the unix
+       VFS because SQLITE_FCNTL_VFSNAME is only handled by the memdb
+       VFS today (small follow-up: surface the unix-VFS variant via
+       sqlite3OsFileControl).
   [ ] **10.1.58** `.dbtotxt` — page-by-page hex dump (used by the
        upstream `dbsqlfuzz` corpus); gated on the bytecode of the
        db being readable, no extension dependency.

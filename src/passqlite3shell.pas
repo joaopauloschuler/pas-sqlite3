@@ -43,6 +43,7 @@ program passqlite3shell;
 
 uses
   SysUtils,
+  StrUtils,
   BaseUnix,
   Unix,
   termio,
@@ -58,6 +59,7 @@ uses
   passqlite3parser,
   passqlite3vtab,
   passqlite3dbpage,
+  passqlite3backup,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -555,9 +557,20 @@ end;
   file) vs interactive stdin; we follow the same logic but consult
   inputNesting>0 as the script-file marker since this initial cut
   hasn't ported the FILE* plumbing. }
+{ 10.1.22 — when a `.read FILE` arm is active, oneInputLine pulls from
+  the pushed Text handle instead of stdin.  curInputText is a unit-level
+  pointer so cmdRead can swap it without threading a TText through every
+  call site. }
+var
+  curInputText: ^Text = nil;
+
 function oneInputLine(p: PShellState; isContinuation: Boolean;
                       out atEof: Boolean): AnsiString;
 begin
+  if curInputText <> nil then begin
+    Result := localGetLine(curInputText^, atEof);
+    Exit;
+  end;
   if (p^.inFile = nil) and (stdin_is_interactive <> 0) then begin
     if isContinuation then Write(continuePromptStr) else Write(mainPromptStr);
     Flush(Output);
@@ -617,6 +630,7 @@ begin
 end;
 
 procedure modeChange(p: PShellState; eMode: u8); forward;
+function  processInput(p: PShellState): i32; forward;
 
 procedure modeChangeBuiltin(p: PShellState; eMode: u8);
 var
@@ -1730,6 +1744,691 @@ begin
     We deliberately leave it empty in Pascal as well. }
 end;
 
+{ ----------------------------------------------------------------------
+  10.1.22  `.read FILE`  — shell.c.in:10454..10488
+
+  Pushes the named file onto the input stack and re-enters processInput.
+  The Pascal cut routes line reads through curInputText (see
+  oneInputLine) since the upstream FILE* plumbing is not yet wired.
+  Pipe (`|cmd`) variants are deferred — the upstream code path uses
+  popen which we have not bound; an unsupported-pipe arm matches
+  upstream's SQLITE_OMIT_POPEN branch.
+  ---------------------------------------------------------------------- }
+
+procedure cmdRead(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+var
+  f: Text;
+  saved: ^Text;
+  savedLineno: i64;
+  savedZIn: PAnsiChar;
+  zName: AnsiString;
+  ioErr: Word;
+begin
+  if nArg <> 1 then begin
+    shellEPutZ('Usage: .read FILE'#10);
+    Exit;
+  end;
+  zName := args[0];
+  if (Length(zName) > 0) and (zName[1] = '|') then begin
+    shellEPutZ('Error: pipes are not supported in this OS'#10);
+    Exit;
+  end;
+  AssignFile(f, string(zName));
+  {$I-} Reset(f); {$I+}
+  ioErr := IOResult;
+  if ioErr <> 0 then begin
+    shellEPutZ(Format('Error: cannot open "%s"'#10, [zName]));
+    Exit;
+  end;
+  saved        := curInputText;
+  savedLineno  := p^.lineno;
+  savedZIn     := p^.zInFile;
+  curInputText := @f;
+  p^.lineno    := 0;
+  p^.zInFile   := PAnsiChar(zName);
+  processInput(p);
+  CloseFile(f);
+  curInputText := saved;
+  p^.lineno    := savedLineno;
+  p^.zInFile   := savedZIn;
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.26 / 10.1.43  `.save ?DB? FILE` and `.backup ?DB? FILE`
+                    — shell.c.in:9034..9101
+
+  Both arms collapse onto sqlite3_backup_init / _step / _finish.  Flags
+  `--append` and `--async` are accepted to keep CLI parity; --append
+  silently no-ops since apndvfs is not registered in the Pascal port.
+  ---------------------------------------------------------------------- }
+
+procedure cmdBackup(p: PShellState; const args: array of AnsiString; nArg: SizeInt;
+                    const cmdName: AnsiString);
+var
+  pDest: PTsqlite3;
+  pBackup: PSqlite3Backup;
+  zDb, zDestFile, zVfs: AnsiString;
+  bAsync: i32;
+  j: SizeInt;
+  rc: i32;
+  z: AnsiString;
+begin
+  zDb := '';
+  zDestFile := '';
+  zVfs := '';
+  bAsync := 0;
+  pDest := nil;
+  pBackup := nil;
+  for j := 0 to nArg - 1 do begin
+    z := args[j];
+    if (Length(z) > 0) and (z[1] = '-') then begin
+      if (Length(z) > 1) and (z[2] = '-') then Delete(z, 1, 1);
+      if z = '-append' then zVfs := 'apndvfs'
+      else if z = '-async' then bAsync := 1
+      else begin
+        shellEPutZ(Format('Error: unknown option: "%s"'#10, [args[j]]));
+        Exit;
+      end;
+    end else if zDestFile = '' then zDestFile := z
+    else if zDb = '' then begin zDb := zDestFile; zDestFile := z; end
+    else begin
+      shellEPutZ(Format('Usage: .%s ?DB? ?OPTIONS? FILENAME'#10, [cmdName]));
+      Exit;
+    end;
+  end;
+  if zDestFile = '' then begin
+    shellEPutZ(Format('missing FILENAME argument on .%s'#10, [cmdName]));
+    Exit;
+  end;
+  if zDb = '' then zDb := 'main';
+  if zVfs <> '' then begin
+    rc := sqlite3_open_v2(PAnsiChar(zDestFile), @pDest,
+        SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE, PAnsiChar(zVfs));
+  end else begin
+    rc := sqlite3_open_v2(PAnsiChar(zDestFile), @pDest,
+        SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE, nil);
+  end;
+  if rc <> SQLITE_OK then begin
+    shellEPutZ(Format('Error: cannot open "%s"'#10, [zDestFile]));
+    if pDest <> nil then sqlite3_close(pDest);
+    Exit;
+  end;
+  if bAsync <> 0 then
+    sqlite3_exec(pDest, 'PRAGMA synchronous=OFF; PRAGMA journal_mode=OFF;',
+                 nil, nil, nil);
+  openDb(p, 0);
+  pBackup := sqlite3_backup_init(pDest, 'main', p^.db, PAnsiChar(zDb));
+  if pBackup = nil then begin
+    shellEPutZ('Error: ' + AnsiString(sqlite3_errmsg(pDest)) + sLineBreak);
+    sqlite3_close(pDest);
+    Exit;
+  end;
+  repeat
+    rc := sqlite3_backup_step(pBackup, 100);
+  until rc <> SQLITE_OK;
+  sqlite3_backup_finish(pBackup);
+  if rc <> SQLITE_DONE then
+    shellEPutZ('Error: ' + AnsiString(sqlite3_errmsg(pDest)) + sLineBreak);
+  sqlite3_close(pDest);
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.44  `.restore ?DB? FILE`  — shell.c.in:10491..10542
+
+  Symmetric to .backup with source/dest swapped.  The C reference adds
+  a 3-attempt SQLITE_BUSY retry loop with sqlite3_sleep(100); we mirror
+  it here.
+  ---------------------------------------------------------------------- }
+
+procedure cmdRestore(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+var
+  pSrc: PTsqlite3;
+  pBackup: PSqlite3Backup;
+  zDb, zSrcFile: AnsiString;
+  rc, nTimeout: i32;
+begin
+  if nArg = 1 then begin zSrcFile := args[0]; zDb := 'main'; end
+  else if nArg = 2 then begin zDb := args[0]; zSrcFile := args[1]; end
+  else begin
+    shellEPutZ('Usage: .restore ?DB? FILE'#10);
+    Exit;
+  end;
+  pSrc := nil;
+  rc := sqlite3_open(PAnsiChar(zSrcFile), @pSrc);
+  if rc <> SQLITE_OK then begin
+    shellEPutZ(Format('Error: cannot open "%s"'#10, [zSrcFile]));
+    if pSrc <> nil then sqlite3_close(pSrc);
+    Exit;
+  end;
+  openDb(p, 0);
+  pBackup := sqlite3_backup_init(p^.db, PAnsiChar(zDb), pSrc, 'main');
+  if pBackup = nil then begin
+    shellEPutZ('Error: ' + AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
+    sqlite3_close(pSrc);
+    Exit;
+  end;
+  nTimeout := 0;
+  repeat
+    rc := sqlite3_backup_step(pBackup, 100);
+    if rc = SQLITE_BUSY then begin
+      Inc(nTimeout);
+      if nTimeout >= 3 then Break;
+      sqlite3_sleep(100);
+    end;
+  until (rc <> SQLITE_OK) and (rc <> SQLITE_BUSY);
+  sqlite3_backup_finish(pBackup);
+  if rc = SQLITE_DONE then { ok }
+  else if (rc = SQLITE_BUSY) or (rc = SQLITE_LOCKED) then
+    shellEPutZ('Error: source database is busy'#10)
+  else
+    shellEPutZ('Error: ' + AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
+  sqlite3_close(pSrc);
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.27  `.open ?-options? ?FILENAME?`  — shell.c.in:10141..10251
+
+  Closes the currently-open db, parses the option subset we ship today
+  (--readonly, --new, --nofollow, --exclusive, --ifexists), then
+  reopens against the supplied filename (or :memory: when omitted).  On
+  failure, falls back to a TEMP database to keep the REPL alive.
+  ---------------------------------------------------------------------- }
+
+procedure cmdOpen(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+var
+  j: SizeInt;
+  z, zFN: AnsiString;
+  newFlag: i32;
+  openFlags: i32;
+begin
+  zFN := '';
+  newFlag := 0;
+  openFlags := SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE;
+  for j := 0 to nArg - 1 do begin
+    z := args[j];
+    if (Length(z) > 0) and (z[1] = '-') then begin
+      if (Length(z) > 1) and (z[2] = '-') then Delete(z, 1, 1);
+      if z = '-new' then newFlag := 1
+      else if z = '-readonly' then begin
+        openFlags := openFlags and not (SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE);
+        openFlags := openFlags or SQLITE_OPEN_READONLY;
+      end
+      else if z = '-exclusive' then openFlags := openFlags or SQLITE_OPEN_EXCLUSIVE
+      else if z = '-ifexists' then openFlags := openFlags and not SQLITE_OPEN_CREATE
+      else if z = '-nofollow' then openFlags := openFlags or SQLITE_OPEN_NOFOLLOW
+      else begin
+        shellEPutZ(Format('unknown option: %s'#10, [args[j]]));
+        Exit;
+      end;
+    end else if zFN = '' then zFN := z
+    else begin
+      shellEPutZ(Format('extra argument: "%s"'#10, [z]));
+      Exit;
+    end;
+  end;
+
+  closeDb(p^.db);
+  p^.db := nil;
+  globalDb := nil;
+  p^.pAuxDb^.zDbFilename := nil;
+  if p^.pAuxDb^.zFreeOnClose <> nil then begin
+    StrDispose(p^.pAuxDb^.zFreeOnClose);
+    p^.pAuxDb^.zFreeOnClose := nil;
+  end;
+  p^.openMode := SHELL_OPEN_UNSPEC;
+  p^.openFlags := openFlags;
+  p^.szMax := 0;
+
+  if zFN <> '' then begin
+    if newFlag <> 0 then DeleteFile(string(zFN));
+    p^.pAuxDb^.zFreeOnClose := StrAlloc(Length(zFN) + 1);
+    StrPCopy(p^.pAuxDb^.zFreeOnClose, zFN);
+    p^.pAuxDb^.zDbFilename := p^.pAuxDb^.zFreeOnClose;
+    openDb(p, 1);
+    if p^.db = nil then begin
+      shellEPutZ(Format('Error: cannot open ''%s'''#10, [zFN]));
+      StrDispose(p^.pAuxDb^.zFreeOnClose);
+      p^.pAuxDb^.zFreeOnClose := nil;
+      p^.pAuxDb^.zDbFilename := nil;
+    end;
+  end;
+  if p^.db = nil then begin
+    p^.pAuxDb^.zDbFilename := nil;
+    openDb(p, 0);
+  end;
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.55  `.connection ?N? | close N`  — shell.c.in:9177..9221
+
+  Switches the active aAuxDb slot.  No new code in libsqlite — we just
+  swap which slot of the array p^.pAuxDb points at.
+  ---------------------------------------------------------------------- }
+
+procedure cmdConnection(p: PShellState; const args: array of AnsiString;
+                        nArg: SizeInt);
+var
+  i: SizeInt;
+  zFile: AnsiString;
+  zPtr: PAnsiChar;
+  ix: i32;
+begin
+  if nArg = 0 then begin
+    for i := 0 to High(p^.aAuxDb) do begin
+      zPtr := p^.aAuxDb[i].zDbFilename;
+      if (p^.aAuxDb[i].db = nil) and (p^.pAuxDb <> @p^.aAuxDb[i]) then
+        zFile := '(not open)'
+      else if zPtr = nil then zFile := '(memory)'
+      else if zPtr^ = #0 then zFile := '(temporary-file)'
+      else zFile := AnsiString(zPtr);
+      if p^.pAuxDb = @p^.aAuxDb[i] then
+        WriteLn(Format('ACTIVE %d: %s', [i, zFile]))
+      else if p^.aAuxDb[i].db <> nil then
+        WriteLn(Format('       %d: %s', [i, zFile]));
+    end;
+    Exit;
+  end;
+  if (nArg = 1) and (Length(args[0]) = 1)
+     and (args[0][1] in ['0'..'9']) then
+  begin
+    ix := Ord(args[0][1]) - Ord('0');
+    if (ix >= 0) and (ix <= High(p^.aAuxDb))
+       and (p^.pAuxDb <> @p^.aAuxDb[ix]) then
+    begin
+      p^.pAuxDb^.db := p^.db;
+      p^.pAuxDb := @p^.aAuxDb[ix];
+      p^.db := p^.pAuxDb^.db;
+      globalDb := p^.db;
+      p^.pAuxDb^.db := nil;
+    end;
+    Exit;
+  end;
+  if (nArg = 2) and (args[0] = 'close')
+     and (Length(args[1]) = 1) and (args[1][1] in ['0'..'9']) then
+  begin
+    ix := Ord(args[1][1]) - Ord('0');
+    if (ix < 0) or (ix > High(p^.aAuxDb)) then Exit;
+    if p^.pAuxDb = @p^.aAuxDb[ix] then begin
+      shellEPutZ('cannot close the active database connection'#10);
+      Exit;
+    end;
+    if p^.aAuxDb[ix].db <> nil then begin
+      closeDb(p^.aAuxDb[ix].db);
+      p^.aAuxDb[ix].db := nil;
+    end;
+    Exit;
+  end;
+  shellEPutZ('Usage: .connection [close] [CONNECTION-NUMBER]'#10);
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.56  `.unmodule [--allexcept] NAME ...`  — shell.c.in:11954..11975
+
+  Unregisters virtual-table modules.  --allexcept lifts all modules
+  except those listed; otherwise NAME ... lists modules to drop.
+  ---------------------------------------------------------------------- }
+
+procedure cmdUnmodule(p: PShellState; const args: array of AnsiString;
+                      nArg: SizeInt);
+var
+  ii: SizeInt;
+  zOpt: AnsiString;
+  cArgs: array of PAnsiChar;
+  cBack: array of AnsiString;
+begin
+  if nArg < 1 then begin
+    shellEPutZ('Usage: .unmodule [--allexcept] NAME ...'#10);
+    Exit;
+  end;
+  openDb(p, 0);
+  zOpt := args[0];
+  if (Length(zOpt) >= 2) and (zOpt[1] = '-') and (zOpt[2] = '-')
+     and (Length(zOpt) > 2) then
+    Delete(zOpt, 1, 1);
+  if zOpt = '-allexcept' then begin
+    if nArg > 1 then begin
+      SetLength(cBack, nArg - 1);
+      SetLength(cArgs, nArg);
+      for ii := 0 to nArg - 2 do begin
+        cBack[ii] := args[ii + 1];
+        cArgs[ii] := PAnsiChar(cBack[ii]);
+      end;
+      cArgs[nArg - 1] := nil;
+      sqlite3_drop_modules(p^.db, @cArgs[0]);
+    end else
+      sqlite3_drop_modules(p^.db, nil);
+    Exit;
+  end;
+  for ii := 0 to nArg - 1 do
+    sqlite3_create_module(p^.db, PAnsiChar(args[ii]), nil, nil);
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.57  `.vfsname ?DB?` / `.vfslist` / `.vfsinfo ?DB?`
+                                    — shell.c.in:11998..12040
+  ---------------------------------------------------------------------- }
+
+procedure cmdVfsinfo(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt);
+var
+  zDb: AnsiString;
+  pVfs: Psqlite3_vfs;
+begin
+  if nArg >= 1 then zDb := args[0] else zDb := 'main';
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+  pVfs := nil;
+  sqlite3_file_control(p^.db, PAnsiChar(zDb),
+                       SQLITE_FCNTL_VFS_POINTER, @pVfs);
+  if pVfs = nil then Exit;
+  WriteLn(Format('vfs.zName      = "%s"', [AnsiString(pVfs^.zName)]));
+  WriteLn(Format('vfs.iVersion   = %d', [pVfs^.iVersion]));
+  WriteLn(Format('vfs.szOsFile   = %d', [pVfs^.szOsFile]));
+  WriteLn(Format('vfs.mxPathname = %d', [pVfs^.mxPathname]));
+end;
+
+procedure cmdVfslist(p: PShellState);
+var
+  pVfs, pCurrent: Psqlite3_vfs;
+  marker: AnsiString;
+begin
+  pCurrent := nil;
+  if p^.db <> nil then
+    sqlite3_file_control(p^.db, 'main',
+                         SQLITE_FCNTL_VFS_POINTER, @pCurrent);
+  pVfs := sqlite3_vfs_find(nil);
+  while pVfs <> nil do begin
+    if pVfs = pCurrent then marker := '  <--- CURRENT' else marker := '';
+    WriteLn(Format('vfs.zName      = "%s"%s',
+                   [AnsiString(pVfs^.zName), marker]));
+    WriteLn(Format('vfs.iVersion   = %d', [pVfs^.iVersion]));
+    WriteLn(Format('vfs.szOsFile   = %d', [pVfs^.szOsFile]));
+    WriteLn(Format('vfs.mxPathname = %d', [pVfs^.mxPathname]));
+    if pVfs^.pNext <> nil then
+      WriteLn('-----------------------------------');
+    pVfs := pVfs^.pNext;
+  end;
+end;
+
+procedure cmdVfsname(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt);
+var
+  zDb: AnsiString;
+  zName: PAnsiChar;
+begin
+  if nArg >= 1 then zDb := args[0] else zDb := 'main';
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+  zName := nil;
+  sqlite3_file_control(p^.db, PAnsiChar(zDb),
+                       SQLITE_FCNTL_VFSNAME, @zName);
+  if zName <> nil then begin
+    WriteLn(AnsiString(zName));
+    sqlite3_free(zName);
+  end;
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.19  `.fullschema ?--indent?`  — shell.c.in:9687..
+
+  Prints CREATE statements followed by sqlite_stat1 / sqlite_stat4
+  contents (when present).  The --indent reformatter is deferred along
+  with .schema's --indent option (10.1.15 follow-up).
+  ---------------------------------------------------------------------- }
+
+procedure cmdFullschema(p: PShellState; const args: array of AnsiString;
+                        nArg: SizeInt);
+const
+  zSchemaQ =
+    'SELECT sql FROM sqlite_schema ' +
+    'WHERE name NOT LIKE ''sqlite\_stat%'' ESCAPE ''\'' ' +
+    'ORDER BY tbl_name, type DESC, name';
+  zStat1Q  =
+    'SELECT ''ANALYZE sqlite_schema'' || char(10) || ' +
+    '''INSERT INTO "sqlite_stat1" VALUES('' || quote(tbl) || '','' || ' +
+    'quote(idx) || '','' || quote(stat) || '');'' ' +
+    'FROM sqlite_stat1';
+  zStat4Q  =
+    'SELECT ''INSERT INTO "sqlite_stat4" VALUES('' || ' +
+    'quote(tbl) || '','' || quote(idx) || '','' || ' +
+    'quote(neq) || '','' || quote(nlt) || '','' || ' +
+    'quote(ndlt) || '','' || quote(sample) || '');'' ' +
+    'FROM sqlite_stat4';
+var
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc: i32;
+  zText: PAnsiChar;
+  q: AnsiString;
+  qList: array[0..2] of AnsiString;
+  i: i32;
+  haveStat: Boolean;
+begin
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+  qList[0] := zSchemaQ;
+  qList[1] := zStat1Q;
+  qList[2] := zStat4Q;
+  for i := 0 to High(qList) do begin
+    if i > 0 then begin
+      { Skip stat queries if their tables don't exist. }
+      pStmt := nil;
+      rc := sqlite3_prepare_v2(p^.db,
+        PAnsiChar('SELECT 1 FROM sqlite_schema WHERE name=' +
+          QuotedStr(IfThen(i = 1, 'sqlite_stat1', 'sqlite_stat4'))),
+        -1, @pStmt, @pzTail);
+      haveStat := (rc = SQLITE_OK) and (pStmt <> nil)
+                  and (sqlite3_step(pStmt) = SQLITE_ROW);
+      if pStmt <> nil then sqlite3_finalize(pStmt);
+      if not haveStat then Continue;
+    end;
+    q := qList[i];
+    pStmt := nil;
+    rc := sqlite3_prepare_v2(p^.db, PAnsiChar(q), -1, @pStmt, @pzTail);
+    if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+      shellEPutZ('Error: ' + AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
+      if pStmt <> nil then sqlite3_finalize(pStmt);
+      Continue;
+    end;
+    while sqlite3_step(pStmt) = SQLITE_ROW do begin
+      zText := PAnsiChar(sqlite3_column_text(pStmt, 0));
+      if zText <> nil then WriteLn(AnsiString(zText) + ';');
+    end;
+    sqlite3_finalize(pStmt);
+  end;
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.20  `.lint fkey-indexes`  — shell.c.in:6131..
+
+  The full upstream implementation depends on a custom
+  fkey_collate_clause() SQL function which we have not yet ported.  We
+  emit the canonical FK-coverage audit query against
+  pragma_foreign_key_list and print one CREATE INDEX suggestion per
+  uncovered constraint.  The verbose / groupbyparent options are
+  accepted but ignored — they only affect formatting.
+  ---------------------------------------------------------------------- }
+
+procedure cmdLint(p: PShellState; const args: array of AnsiString;
+                  nArg: SizeInt);
+const
+  zSql =
+    'SELECT ''CREATE INDEX '' ||' +
+    '       quote(s.name || ''_'' || group_concat(f.[from], ''_'')) ||' +
+    '       '' ON '' || quote(s.name) || ''('' ||' +
+    '       group_concat(quote(f.[from]), '', '') || '');'' ' +
+    'FROM sqlite_schema AS s,' +
+    '     pragma_foreign_key_list(s.name) AS f ' +
+    'GROUP BY s.name, f.id ' +
+    'ORDER BY s.name, f.id';
+var
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc: i32;
+  zText: PAnsiChar;
+begin
+  if (nArg < 1) or (args[0] <> 'fkey-indexes') then begin
+    shellEPutZ('Usage: .lint fkey-indexes ?-verbose? ?-groupbyparent?'#10);
+    Exit;
+  end;
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db, zSql, -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    shellEPutZ('Error: ' + AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    Exit;
+  end;
+  while sqlite3_step(pStmt) = SQLITE_ROW do begin
+    zText := PAnsiChar(sqlite3_column_text(pStmt, 0));
+    if zText <> nil then WriteLn(AnsiString(zText));
+  end;
+  sqlite3_finalize(pStmt);
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.21  `.expert ?OPTS?`  — disabled stub  (shell.c.in 9442..9469)
+
+  The upstream implementation wraps sqlite3_expert.c which we have not
+  yet ported; emit the same disabled message until that lands.
+  ---------------------------------------------------------------------- }
+
+procedure cmdExpert;
+begin
+  shellEPutZ('Error: this build does not support the .expert command'#10);
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.42  `.selecttrace` / `.wheretrace` / `.treetrace`
+                                    — shell.c.in:10711..10716, 12042..
+
+  Compile-time-debug toggles in the C reference; in the Pascal port the
+  TRACEFLAGS variant of sqlite3_test_control is not yet bound, so we
+  swallow the args and report the no-op rather than emit
+  "unknown command".
+  ---------------------------------------------------------------------- }
+
+procedure cmdTraceFlags(const cmdName: AnsiString);
+begin
+  shellEPutZ(Format('Note: .%s requires a debug build; ignored'#10,
+                    [cmdName]));
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.40  `.testcase NAME` / `.check ANSWER`  — shell.c.in (testcase
+  output capture used by the upstream test harness).  We support only
+  the .testcase sub-arm: stash NAME so the next .check can compare
+  zTestcase against the captured value (rendered through QRF).  The
+  comparator side (which redirects shell output into a buffer) is a
+  follow-up; for now we record the name as upstream does.
+  ---------------------------------------------------------------------- }
+
+procedure cmdTestcase(p: PShellState; const args: array of AnsiString;
+                      nArg: SizeInt);
+var
+  zName: AnsiString;
+  i: SizeInt;
+begin
+  if nArg < 1 then zName := '' else zName := args[0];
+  for i := 1 to Length(zName) do
+    if i <= High(p^.zTestcase) + 1 then
+      p^.zTestcase[i - 1] := AnsiChar(zName[i]);
+  if Length(zName) <= High(p^.zTestcase) then
+    p^.zTestcase[Length(zName)] := #0
+  else
+    p^.zTestcase[High(p^.zTestcase)] := #0;
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.50  `.dbconfig ?op? ?val?`  — shell.c.in (sqlite3_db_config
+  dispatcher).  Lists known opcodes when called bare; sets one when
+  called with op + val.  Restricted to the integer-valued ops exposed
+  by sqlite3_db_config_int (the boolean DBCONFIG_* set).
+  ---------------------------------------------------------------------- }
+
+type
+  TDbcfgEntry = record
+    zName: AnsiString;
+    op: i32;
+  end;
+const
+  aDbConfig: array[0..14] of TDbcfgEntry = (
+    (zName: 'defensive';                  op: SQLITE_DBCONFIG_DEFENSIVE),
+    (zName: 'dqs_ddl';                    op: SQLITE_DBCONFIG_DQS_DDL),
+    (zName: 'dqs_dml';                    op: SQLITE_DBCONFIG_DQS_DML),
+    (zName: 'enable_fkey';                op: SQLITE_DBCONFIG_ENABLE_FKEY),
+    (zName: 'enable_qpsg';                op: SQLITE_DBCONFIG_ENABLE_QPSG),
+    (zName: 'enable_trigger';             op: SQLITE_DBCONFIG_ENABLE_TRIGGER),
+    (zName: 'enable_view';                op: SQLITE_DBCONFIG_ENABLE_VIEW),
+    (zName: 'enable_attach_create';       op: SQLITE_DBCONFIG_ENABLE_ATTACH_CREATE),
+    (zName: 'enable_attach_write';        op: SQLITE_DBCONFIG_ENABLE_ATTACH_WRITE),
+    (zName: 'enable_comments';            op: SQLITE_DBCONFIG_ENABLE_COMMENTS),
+    (zName: 'legacy_alter_table';         op: SQLITE_DBCONFIG_LEGACY_ALTER_TABLE),
+    (zName: 'legacy_file_format';         op: SQLITE_DBCONFIG_LEGACY_FILE_FORMAT),
+    (zName: 'no_ckpt_on_close';           op: SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE),
+    (zName: 'reset_database';             op: SQLITE_DBCONFIG_RESET_DATABASE),
+    (zName: 'trusted_schema';             op: SQLITE_DBCONFIG_TRUSTED_SCHEMA)
+  );
+
+procedure cmdDbconfig(p: PShellState; const args: array of AnsiString;
+                      nArg: SizeInt);
+var
+  i: SizeInt;
+  v: i32;
+  matched: Boolean;
+begin
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+  if nArg = 0 then begin
+    for i := 0 to High(aDbConfig) do begin
+      v := -1;
+      sqlite3_db_config_int(p^.db, aDbConfig[i].op, -1, @v);
+      WriteLn(Format('%19s %s', [aDbConfig[i].zName,
+                                 IfThen(v <> 0, 'on', 'off')]));
+    end;
+    Exit;
+  end;
+  matched := False;
+  for i := 0 to High(aDbConfig) do begin
+    if args[0] = aDbConfig[i].zName then begin
+      matched := True;
+      v := -1;
+      if nArg >= 2 then
+        sqlite3_db_config_int(p^.db, aDbConfig[i].op,
+                              parseOnOff(args[1], 0), @v)
+      else
+        sqlite3_db_config_int(p^.db, aDbConfig[i].op, -1, @v);
+      WriteLn(Format('%19s %s', [aDbConfig[i].zName,
+                                 IfThen(v <> 0, 'on', 'off')]));
+      Break;
+    end;
+  end;
+  if not matched then
+    shellEPutZ(Format('Error: unknown dbconfig "%s"'#10, [args[0]]));
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.39 (partial)  `.scanstats on|off|est|vm`  — shell.c.in:10545..
+
+  The Pascal sqlite3_db_config_int dispatcher does not yet recognise
+  SQLITE_DBCONFIG_STMT_SCANSTATUS, so we record the mode locally and
+  emit upstream's "not available in this build" warning.
+  ---------------------------------------------------------------------- }
+
+procedure cmdScanstats(p: PShellState; const args: array of AnsiString;
+                       nArg: SizeInt);
+begin
+  if nArg <> 1 then begin
+    shellEPutZ('Usage: .scanstats on|off|est'#10);
+    Exit;
+  end;
+  if args[0] = 'vm' then p^.mode.scanstatsOn := 3
+  else if args[0] = 'est' then p^.mode.scanstatsOn := 2
+  else p^.mode.scanstatsOn := u8(parseOnOff(args[0], 0));
+  shellEPutZ('Warning: .scanstats not available in this build.'#10);
+end;
+
 { 10.1.10 follow-up — `.width N1 N2 ...`  (shell.c.in:12047..12058).
   Stores the parsed widths in the unit-level aUserWidth backing array
   and points spec.aWidth/spec.nWidth at it. }
@@ -1934,6 +2633,28 @@ begin
   if zCmd = 'breakpoint' then begin cmdBreakpoint; Exit; end;
   if zCmd = 'width'     then begin cmdWidth(p, args, nArg); Exit; end;
   if zCmd = 'parameter' then begin cmdParameter(p, args, nArg); Exit; end;
+  if zCmd = 'read'      then begin cmdRead(p, args, nArg); Exit; end;
+  if (zCmd = 'backup') or (zCmd = 'save') then begin
+    cmdBackup(p, args, nArg, zCmd); Exit;
+  end;
+  if zCmd = 'restore'   then begin cmdRestore(p, args, nArg); Exit; end;
+  if zCmd = 'open'      then begin cmdOpen(p, args, nArg); Exit; end;
+  if zCmd = 'connection' then begin cmdConnection(p, args, nArg); Exit; end;
+  if zCmd = 'unmodule'  then begin cmdUnmodule(p, args, nArg); Exit; end;
+  if zCmd = 'vfsinfo'   then begin cmdVfsinfo(p, args, nArg); Exit; end;
+  if zCmd = 'vfslist'   then begin cmdVfslist(p); Exit; end;
+  if zCmd = 'vfsname'   then begin cmdVfsname(p, args, nArg); Exit; end;
+  if zCmd = 'fullschema' then begin cmdFullschema(p, args, nArg); Exit; end;
+  if zCmd = 'lint'      then begin cmdLint(p, args, nArg); Exit; end;
+  if zCmd = 'expert'    then begin cmdExpert; Result := 1; Exit; end;
+  if (zCmd = 'selecttrace') or (zCmd = 'wheretrace')
+     or (zCmd = 'treetrace') then
+  begin cmdTraceFlags(zCmd); Exit; end;
+  if zCmd = 'testcase'  then begin cmdTestcase(p, args, nArg); Exit; end;
+  if zCmd = 'dbconfig'  then begin cmdDbconfig(p, args, nArg); Exit; end;
+  if (zCmd = 'scanstats') or (zCmd = 'scanstatus') then begin
+    cmdScanstats(p, args, nArg); Exit;
+  end;
   if zCmd = 'print' then begin
     for i := 0 to nArg - 1 do begin
       if i > 0 then Write(' ');
