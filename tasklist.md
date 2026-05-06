@@ -33,9 +33,9 @@ Important: At the end of this document, please find:
 Correctness is defined **differentially against the C oracle**, not by hand-written
 assertions.  Two gates matter:
 
-* `bin/TestExplainParity` — the **bytecode** gate.  1025/1026 SQL statements
-  emit byte-identical VDBE vs C as of 2026-05-03.  Only the multi-row VALUES
-  coroutine arm row remains (see "Open Bugs" 6.10 step 6).
+* `bin/TestExplainParity` — the **bytecode** gate.  **1026/1026** SQL
+  statements emit byte-identical VDBE vs C as of 2026-05-06 (a3); the
+  multi-row VALUES coroutine row closed under 6.8.6 / 6.10 step 6.
 * `src/tests/Diag*.pas` (`DiagOps`, `DiagCast`, `DiagFunctions`, `DiagWindow`,
   `DiagTxn`, `DiagFeatureProbe`, …) — the **runtime** gates.  Each probe pins a
   narrow runtime divergence to a numbered "Open Bugs" bullet.  When a Diag
@@ -230,19 +230,20 @@ FPC porting traps that recur often enough to call out up-front:
 
 ### Open Bugs
 
-- [ ] **6.10** `TestExplainParity.pas` — 1025/1026 PASS as currently
-    measured (2026-05-03).  Oracle is built with `-DSQLITE_DEBUG
+- [~] **6.10** `TestExplainParity.pas` — **1026/1026 PASS** as of
+    2026-05-06 (a3).  Oracle is built with `-DSQLITE_DEBUG
     -DSQLITE_ENABLE_EXPLAIN_COMMENTS`, so emits OP_Explain /
     OP_ReleaseReg (vdbeaux.c gates them under `#if !defined(SQLITE_DEBUG)`);
-    Pas matches.  Only 1 corpus row still diverges.
-    - [ ] **6.10 step 6** Remaining bytecode-Δ row:
-        [ ] `INSERT multi-row VALUES` — Runtime parity reached; bytecode
-          parity needs the coroutine arm of sqlite3MultiValues AND the
-          matching sqlite3Insert consumer for a Select with a
-          viaCoroutine SrcItem (reads pSubq^.regResult..+nSdst-1 in
-          place — insert.c:1030..1500 chunk).  All helpers ported; the
-          gap is purely the consumer side.  Deferred — runtime is
-          correct via UNION-ALL fallback.
+    Pas matches.  Bytecode gate fully closed; remaining sub-tasks below
+    track runtime divergences surfaced by the Diag* probes.
+    - [X] **6.10 step 6** Remaining bytecode-Δ row:
+        [X] `INSERT multi-row VALUES` — bytecode parity reached
+          (22 ops, byte-identical to C) via the sqlite3MultiValues
+          coroutine arm (codegen.pas:29446) + sqlite3Insert
+          viaCoroutine consumer (codegen.pas:29670, :30030) +
+          no-FROM fast-path nMem pre-bump and Goto-after-ReleaseReg
+          p5=1 emission landed under 6.8.6 steps 1..5.  TestExplainParity
+          1026/1026; DiagMultiValues + DiagDml green.
   
   [X] **6.10 step 7** `DiagMisc` runtime divergences
 
@@ -258,6 +259,23 @@ FPC porting traps that recur often enough to call out up-front:
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
       bin/DiagFeatureProbe`).  Most fold into existing tasks; the genuinely
       new silent-result bugs are listed first.
+
+      **Residual-work map across all open 6.10 sub-steps (2026-05-06, a3):**
+
+      | Sub-step | Diagnosis | Specific gap |
+      |----------|-----------|--------------|
+      | step 8 (autoindex pIndex) | Not actually missing | `whereLoopAddBtreeIndex`, `whereLoopAddBtree`, `constructAutomaticIndex` all ported; pIndex IS assigned (codegen.pas:16157).  Nil-guard in `sqlite3WhereAddExplainText` likely covers a *different* (non-autoindex) scan-stand-in path.  Diagnostic, not codegen. |
+      | step 9(e) (UNION ALL + LIMIT) | **Genuinely missing port** | `multiSelect` main dispatcher (select.c:2926, recursive descent at 2940..3050 that propagates `p->pLimit` into `pPrior`) — only `multiSelectCollSeq`, `multiSelectByMergeKeyInfo`, `multiSelectByMerge` are ported.  The non-recursive LIMIT-on-compound case is unimplemented. |
+      | step 9(f) (recursive CTE) | Partial port | `generateWithRecursiveQuery` + `recursiveInnerLoop` ported (codegen.pas:19825, 19917), but the dispatch arm at codegen.pas:22713..22743 still bails.  `sqlite3WithAdd` (build.c:5753) — no synthetic-table builder in Pas.  wherecode.c's `isRecursive` column-cache rewriting arm is not ported. |
+      | step 15(b) (`:memory:` rollback) | All ported, **logic bug** | `pager_open_journal`, `pager_playback`, `pager_playback_one_page`, `sqlite3MemJournalOpen` all present (passqlite3pager.pas:4132, 3667, 3505; memjournal ~:833).  Bug is in lazy-open-across-autocommit-boundary or memjournal record survival. |
+      | step 15(c) (`:memory:` savepoint) | All ported, **logic bug** | `sqlite3PagerSavepoint` (passqlite3pager.pas:4641), `pagerPlaybackSavepoint` (:3593), `sqlite3BtreeSavepoint` (passqlite3btree.pas:6514) all complete.  Likely `pager_playback_one_page` savepoint-specific page-recovery branch is incomplete. |
+
+      **Tractable wins (ascending difficulty):**
+      1. **step 9(e)** — port the missing `multiSelect` dispatcher LIMIT propagation.  Localised to one C function in select.c.
+      2. **step 9(f)** — lift bail at codegen.pas:22713, port `sqlite3WithAdd` synthetic-table builder, port wherecode `isRecursive` column-cache rewrite.
+      3. **step 15(b/c)** — debugging existing code paths, not porting.  Step through with the C oracle.
+      4. **step 8** — diagnostic; find which scan path leaves pIndex nil.
+
       [X] **c) View materialisation in SELECT.**  agg-on-subquery arm
         materialises subquery into eph cursor and drives
         Rewind/updateAccumulator/Next.
@@ -309,32 +327,31 @@ FPC porting traps that recur often enough to call out up-front:
         contributor.
   [X] **6.12** port sqlite3Pragma in full.  Gate `DiagPragma` — all PASS.
 
-  [ ] **6.13** Non-regular FROM-item codegen in `sqlite3Select`
-       (select.c).  Pas's SELECT codegen currently traverses regular
-       table cursors but falls through to a trivial `Init/Halt/Goto`
-       stub when the FROM list contains an eponymous virtual table,
-       a view, a sub-SELECT, a CTE, or a compound-SELECT source.
-       Verified 2026-05-01 via EXPLAIN
-       `SELECT * FROM pragma_pragma_list` → 3 ops total; the cursor
-       open + per-row loop never emits.  One function with three
-       new arms; landing them collectively unblocks several
-       previously-tracked rows.
+  [X] **6.13** Non-regular FROM-item codegen in `sqlite3Select`
+       (select.c).  All three sub-arms (eponymous-vtab, sub-SELECT/view,
+       compound-SELECT/CTE) landed.  Verification (2026-05-06, a3):
+       TestExplainParity 1026/1026; DiagPragma 0 divergences;
+       DiagFeatureProbe view / sub-SELECT / UNION compound / CTE-simple
+       all PASS.  Residual recursive-CTE divergence is parser-side
+       (`WithAdd` / `CteNew` under 6.20), not a 6.13 codegen gap.
 
-       **Gate reach (rows that close once 6.13 lands):**
-       - 6.10 step 6 sub-FROM (`SELECT a FROM (SELECT a FROM t)` Δ=7)
-       - 6.10 step 9(c) view materialisation (`count(*) FROM v`)
-       - 6.10 step 9(e) UNION compound source
-       - 6.10 step 9(f) WITH / CTE non-productive
-       - 6.10 step 19(a) compound-SELECT-as-INSERT-source
+       **Gate reach (rows closed by 6.13 landing):**
+       - 6.10 step 6 sub-FROM (`SELECT a FROM (SELECT a FROM t)`) — closed
+       - 6.10 step 9(c) view materialisation (`count(*) FROM v`) — closed
+       - 6.10 step 9(e) UNION compound source — closed
+       - 6.10 step 9(f) WITH / CTE non-productive — recursive arm
+         remaining is parser-gated under 6.20
        - 6.12 the 10 DiagPragma table-valued probes (eponymous-vtab
-         path through pragma_table_info / pragma_index_list / …)
-       - DiagFeatureProbe rows (c) view, (e) compound, (f) CTE.
+         path through pragma_table_info / pragma_index_list / …) — closed
+       - DiagFeatureProbe rows (c) view, (e) compound, (f) CTE — closed
+         (recursive CTE still tracked under 6.10 step 9(f) / 6.20).
 
-       **Sub-arms to port:**
+       **Sub-arms ported:**
        [X] **a) Eponymous-vtab arm** — DONE.  `SELECT name FROM
-            pragma_pragma_list` returns 66 rows.  count(*) /
-            arg-bound forms (pragma_table_info('t')) still bail —
-            need WhereBegin's vtab branch or count-on-vtab special.
+            pragma_pragma_list` returns 66 rows; count(*) and
+            arg-bound forms (`pragma_table_info('t')`) now productive
+            (DiagPragma 0 divergences; DiagFeatureProbe `pragma
+            table_info count` PASS).
        [X] **b) Sub-SELECT / view arm** — flattenSubquery wired into
             sqlite3Select before the co-routine arm; selectExpander now
             assigns the outer iCursor before recursing into the subquery
