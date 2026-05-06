@@ -80,6 +80,10 @@ uses
   passqlite3noop,
   passqlite3zorder,
   passqlite3randomjson,
+  passqlite3wholenumber,
+  passqlite3templatevtab,
+  passqlite3showauth,
+  passqlite3mmapwarm,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -578,6 +582,16 @@ begin
   sqlite3NoopInit(p^.db);
   sqlite3ZorderInit(p^.db);
   sqlite3RandomJsonInit(p^.db);
+  { Phase 10.1.69 — four more small ext/misc helpers from
+    wholenumber.c (eponymous wholenumber vtab over 1..2^32-1),
+    templatevtab.c (10-row read-only template vtab),
+    showauth.c (debug authorizer that traces requests to stdout),
+    mmapwarm.c (sqlite3_mmap_warm pre-fault walker — no-op on the
+    current Unix VFS which is iVersion=2). showauth is registered
+    only on user request via .auth on; sqlite3_mmap_warm is exposed
+    as a function, not auto-installed. }
+  sqlite3WholenumberInit(p^.db);
+  sqlite3TemplateVtabInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);

@@ -1348,6 +1348,33 @@ existing dispatcher.
        never see the deliberate u32 wrap.  TestExplainParity 1026/1026;
        DiagFunctions / DiagOps / DiagFeatureProbe clean.
 
+  [X] **10.1.69** Four more ext/misc helpers ported as new units
+       (~760 C lines total): wholenumber.c (280 lines) →
+       `passqlite3wholenumber.pas` (eponymous read-only vtab over the
+       whole numbers 1..2^32-1 with GT/GE/LT/LE constraint pushdown
+       through xBestIndex / xFilter); templatevtab.c (269 lines) →
+       `passqlite3templatevtab.pas` (10-row baseline read-only vtab
+       used as a vtab-plumbing sanity check); showauth.c (103 lines) →
+       `passqlite3showauth.pas` (debug authorizer that traces every
+       request to stdout via sqlite3_set_authorizer); mmapwarm.c
+       (108 lines) → `passqlite3mmapwarm.pas` (sqlite3_mmap_warm
+       page-walker; degrades cleanly to a BEGIN/END pair on the
+       current Unix VFS which is iVersion=2 with nil xFetch/xUnfetch).
+       wholenumber + templatevtab auto-registered in shell openDb;
+       showauth and sqlite3_mmap_warm are exported as functions but
+       not auto-installed (showauth would flood stdout, sqlite3_mmap_warm
+       is a one-shot user call).  Verified: `CREATE VIRTUAL TABLE w
+       USING wholenumber;` registers cleanly; templatevtab returns
+       its 9-row scan (1001..1009 / 2001..2009 — matches the C
+       reference; the upstream-documented "10 rows" is off-by-one
+       since xEof short-circuits at iRowid=10).  Runtime caveat for
+       wholenumber: the Pascal port's WhereBegin does not yet wire
+       vtab xBestIndex pushdown (codegen.pas:13938 / 28163), so a
+       bare `SELECT … FROM wholenumber WHERE value<6` walks all
+       2^32-1 rows.  The module is faithful end-to-end; once the
+       pushdown lands, constraints flow straight through.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps clean.
+
 - [X] **8.x.colneed** sqlite3_collation_needed callback now fires.
   Closed 2026-05-06.  `sqlite3GetCollSeq` (codegen.pas:42193) was
   missing the `callCollNeeded(db, enc, zName)` step from callback.c:222
