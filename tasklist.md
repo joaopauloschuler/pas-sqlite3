@@ -247,13 +247,22 @@ FPC porting traps that recur often enough to call out up-front:
   
   [X] **6.10 step 7** `DiagMisc` runtime divergences
 
-  [~] **6.10 step 8** EQP P4 text wired on OP_Explain via
-      sqlite3WhereAddExplainText.  TestExplainParity stays at 1025/1026
-      (P4 stripped from the diff); no Diag regressions.
-      [ ] Chase the residual planner gap on the autoindex / scan
-           stand-in path so `pLoop->u.btree.pIndex` is populated on every
-           non-IPK/non-vtab btree loop, then convert the nil guard in
-           sqlite3WhereAddExplainText back to an Assert (matches C).
+  [X] **6.10 step 8** Closed 2026-05-06.  Residual planner gap was the
+      synthetic full-table-scan stand-in in `whereShortCut` (codegen.pas
+      ~15958): it set `pLoop^.wsFlags := 0` instead of `WHERE_IPK`,
+      diverging from where.c:4150 where the IPK heap-walk arm assigns
+      `pNew->wsFlags = WHERE_IPK`.  With wsFlags=0, sqlite3WhereAddExplainText
+      entered the non-IPK/non-vtab branch and dereferenced a nil pIndex
+      (the IPK pseudo-index probe is not synthesized in pas-sqlite3).
+      Fix: stamp `WHERE_IPK` on the fallback (mirrors C); the runtime case
+      dispatch in sqlite3WhereCodeOneLoopStart still routes pure-WHERE_IPK
+      (no COLUMN_EQ/IN/RANGE/CONSTRAINT) past Cases 2/3 into Case 6 (full
+      scan), so the emitted bytecode is unchanged.  Soft nil-guard removed;
+      assert restored to match wherecode.c:117.  TestExplainParity holds
+      at 1026/1026; TestWherePlanner 679/679; DiagFeatureProbe / DiagAutoIdx
+      / DiagWindow / DiagTxn / DiagDml / DiagOps / DiagMisc / DiagPragma
+      / DiagIndexing / DiagSubsel / DiagAggWhere / DiagInnerJoin /
+      DiagMultiValues green.
 
   [ ] **6.10 step 9** Runtime divergences surfaced by
       `src/tests/DiagFeatureProbe.pas` (run with `LD_LIBRARY_PATH=$PWD/src
@@ -264,7 +273,7 @@ FPC porting traps that recur often enough to call out up-front:
 
       | Sub-step | Diagnosis | Specific gap |
       |----------|-----------|--------------|
-      | step 8 (autoindex pIndex) | Not actually missing | `whereLoopAddBtreeIndex`, `whereLoopAddBtree`, `constructAutomaticIndex` all ported; pIndex IS assigned (codegen.pas:16157).  Nil-guard in `sqlite3WhereAddExplainText` likely covers a *different* (non-autoindex) scan-stand-in path.  Diagnostic, not codegen. |
+      | step 8 (autoindex pIndex) | **CLOSED 2026-05-06** | Real culprit was the synthetic full-scan stand-in in whereShortCut (codegen.pas ~15958) setting `wsFlags := 0` instead of `WHERE_IPK`.  Mirrored where.c:4150; restored the assert in sqlite3WhereAddExplainText. |
       | step 9(e) (UNION ALL + LIMIT) | **CLOSED 2026-05-06** | Compound dispatch arm extended to port select.c:3007..3043 (LIMIT/OFFSET propagation onto pPrior via Expr-dup, OP_IfNot reuse, OP_OffsetLimit, JumpHere).  No-FROM fast path lifted its `pLimit=nil` gate — calls `computeLimitRegisters`, `codeOffset`, `OP_DecrJumpZero` around the single-row body. |
       | step 9(f) (recursive CTE) | **CLOSED 2026-05-06** | Two-line fix in `sqlite3Select` source-loop (codegen.pas:24279) and `sqlite3WhereCodeOneLoopStart` full-scan tail (codegen.pas:17312): allow TF_Ephemeral source items whose fgBits has the isRecursive bit ($80) set, and emit `pLevel^.op := OP_Noop` (no Rewind/Next) for the recursive pseudo-cursor.  Mirrors wherecode.c:2568..2571.  `count(*) FROM r` over `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<5)` now returns 5 (DiagFeatureProbe `CTE recursive` PASS). |
       | step 15(b) (`:memory:` rollback) | All ported, **logic bug** | `pager_open_journal`, `pager_playback`, `pager_playback_one_page`, `sqlite3MemJournalOpen` all present (passqlite3pager.pas:4132, 3667, 3505; memjournal ~:833).  Bug is in lazy-open-across-autocommit-boundary or memjournal record survival. |
@@ -274,7 +283,7 @@ FPC porting traps that recur often enough to call out up-front:
       1. ~~**step 9(e)**~~ — closed 2026-05-06.
       2. ~~**step 9(f)**~~ — closed 2026-05-06.
       3. ~~**step 15(b/c)**~~ — closed 2026-05-06.
-      4. **step 8** — diagnostic; find which scan path leaves pIndex nil.
+      4. ~~**step 8**~~ — closed 2026-05-06.
 
       [X] **c) View materialisation in SELECT.**  agg-on-subquery arm
         materialises subquery into eph cursor and drives

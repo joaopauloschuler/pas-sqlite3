@@ -15955,7 +15955,14 @@ begin
         Exit(0);
       pIdx := pIdx^.pNext;
     end;
-    pLoop^.wsFlags := 0; { plain scan — no IPK/INDEX/ONEROW hints }
+    { Mirror where.c:4150 — a full rowid heap walk is WHERE_IPK (the IPK
+      pseudo-index branch).  wsFlags=0 was Pas-only and left
+      sqlite3WhereAddExplainText looking for a non-existent btree.pIndex on
+      the non-IPK/non-vtab branch.  WHERE_IPK alone (no WHERE_COLUMN_EQ /
+      WHERE_COLUMN_IN / WHERE_COLUMN_RANGE / WHERE_CONSTRAINT) falls through
+      Cases 2/3 in sqlite3WhereCodeOneLoopStart and lands in Case 6 (full
+      scan), so the runtime shape is unchanged.  Closes 6.10 step 8. }
+    pLoop^.wsFlags := WHERE_IPK;
     pLoop^.nLTerm := 0;
     pLoop^.u.btree.nEq := 0;
     pLoop^.u.btree.pIndex := nil;
@@ -50270,17 +50277,6 @@ begin
     zFmt := nil;
     pIdx := pLoop^.u.btree.pIndex;
     Assert(pIdx <> nil);
-    { C reference's `assert( pLoop->u.btree.pIndex!=0 )` is load-bearing —
-      the planner is supposed to populate pIndex on every non-IPK/non-vtab
-      btree loop.  Pas's port has a residual gap on the autoindex / scan
-      stand-in path where pIndex stays nil; drop the index-name suffix in
-      that case rather than AV.  Tracked under 6.10 step 8. }
-    if pIdx = nil then
-    begin
-      zMsg := sqlite3_str_finish(str);
-      if zMsg <> nil then sqlite3DbFree(db, zMsg);
-      Exit;
-    end;
     if (pItem^.pSTab <> nil) and (not HasRowid(pItem^.pSTab))
        and ((pIdx^.idxFlags and 3) = SQLITE_IDXTYPE_PRIMARYKEY) then
     begin
