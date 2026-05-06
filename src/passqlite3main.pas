@@ -2680,6 +2680,9 @@ begin
   Result := 0;
 end;
 
+function sqlite3InitOne(db: PTsqlite3; iDb: i32; pzErrMsg: PPAnsiChar;
+                        mFlags: u32): i32; forward;
+
 function execParseSchemaImpl(db: PTsqlite3; iDb: i32;
                              zWhere: PAnsiChar; {%H-}p5: u16): i32;
 var
@@ -2689,8 +2692,24 @@ var
   savedBusy: u8;
 begin
   rc := SQLITE_OK;
-  if (db = nil) or (iDb < 0) or (iDb >= db^.nDb) or (zWhere = nil) then begin
+  if (db = nil) or (iDb < 0) or (iDb >= db^.nDb) then begin
     Result := SQLITE_ERROR;
+    Exit;
+  end;
+  { ALTER branch — vdbe.c:7137..7142.  When p4.z is NULL the caller
+    (renameReloadSchema) wants the *whole* schema cache for iDb to be
+    discarded and rebuilt from sqlite_master.  Clear the per-db
+    schema, then dispatch through sqlite3InitOne (which re-installs
+    the sqlite_master row before re-running the schema SELECT) so a
+    table whose CREATE text was just rewritten by ALTER TABLE picks
+    up the new column list. }
+  if zWhere = nil then begin
+    sqlite3SchemaClear(db^.aDb[iDb].pSchema);
+    db^.mDbFlags := db^.mDbFlags and not u32(DBFLAG_SchemaKnownOk);
+    rc := sqlite3InitOne(db, iDb, nil, p5);
+    if rc = SQLITE_OK then
+      db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
+    Result := rc;
     Exit;
   end;
   { Phase 6.9-bis 11g.2.f sub-progress 8: drop the WHERE/ORDER BY from

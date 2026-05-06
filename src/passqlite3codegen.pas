@@ -22553,6 +22553,7 @@ var
   orderByGrp:  i32;
   addrEnd:     i32;
   addrTopOfLoop: i32;
+  addrSkip:    i32;
   addrSetAbort: i32;
   addr1:       i32;
   addrOutputRow: i32;
@@ -23715,8 +23716,7 @@ begin
     if (p^.pSrc^.nSrc = 1)
        and (pItem^.pSTab <> nil)
        and (pItem^.pSTab^.eTabType = TABTYP_VTAB)
-       and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)
-       and (p^.pWhere = nil) then
+       and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0) then
       isVtabAgg := True
     { Pas-only: aggregate-on-subquery — Phase 6.13(b)-coagg.  Single-
       source FROM (SELECT …) for an aggregate query: materialise the
@@ -23856,7 +23856,16 @@ begin
           addrEnd := sqlite3VdbeMakeLabel(pParse);
           addrTopOfLoop := sqlite3VdbeAddOp3(v, OP_VFilter, iCsr,
                                               addrEnd, regAgg);
-          updateAccumulatorSimple(pParse, pAggI2);
+          if p^.pWhere <> nil then
+          begin
+            addrSkip := sqlite3VdbeMakeLabel(pParse);
+            sqlite3ExprIfFalse(pParse, p^.pWhere, addrSkip,
+                               SQLITE_JUMPIFNULL);
+            updateAccumulatorSimple(pParse, pAggI2);
+            sqlite3VdbeResolveLabel(v, addrSkip);
+          end
+          else
+            updateAccumulatorSimple(pParse, pAggI2);
           sqlite3VdbeAddOp2(v, OP_VNext, iCsr, addrTopOfLoop + 1);
           sqlite3VdbeResolveLabel(v, addrEnd);
           sqlite3VdbeAddOp1(v, OP_Close, iCsr);
@@ -23955,7 +23964,6 @@ begin
     sqlite3ExprCodeGetColumnOfTable, which already emits OP_VColumn for
     TABTYP_VTAB. }
   if (p^.pSrc^.nSrc = 1)
-     and (p^.pWhere = nil)
      and ((p^.selFlags and SF_Distinct) = 0)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem))
   then
@@ -24023,7 +24031,17 @@ begin
                                          addrEnd, regAgg);
 
       { Inner-loop body — emit each result column.  TK_COLUMN with
-        eTabType=TABTYP_VTAB routes through OP_VColumn. }
+        eTabType=TABTYP_VTAB routes through OP_VColumn.  When p^.pWhere
+        is present, evaluate it before the result emit and jump to the
+        VNext on false (skip the row). }
+      if p^.pWhere <> nil then
+      begin
+        addrSkip := sqlite3VdbeMakeLabel(pParse);
+        sqlite3ExprIfFalse(pParse, p^.pWhere, addrSkip,
+                           SQLITE_JUMPIFNULL);
+      end
+      else
+        addrSkip := 0;
       items := ExprListItems(pEList);
       for i := 0 to nResultCol - 1 do
       begin
@@ -24034,6 +24052,8 @@ begin
       end;
       if pDest^.eDest = SRT_Output then
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+      if addrSkip <> 0 then
+        sqlite3VdbeResolveLabel(v, addrSkip);
 
       { OP_VNext iCsr, addrLoopBody — jumps back to addrTopOfLoop+1
         (the first body op after VFilter) when xNext yields a row. }
@@ -33080,6 +33100,8 @@ begin
   else
     z := PAnsiChar(sqlite3DbMallocRaw(db, u64(nName) + 1));
   if z = nil then Exit;
+  if InRenameObject(pParse) then
+    sqlite3RenameTokenMap(pParse, Pointer(z), @sName);
 
   if nName > 0 then Move(sName.z^, z^, nName);
   z[nName] := #0;

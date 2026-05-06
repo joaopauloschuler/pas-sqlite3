@@ -310,9 +310,57 @@ FPC porting traps that recur often enough to call out up-front:
         DiagWindow / DiagTxn / DiagPragma / DiagDml / DiagIndexing /
         DiagSubsel / DiagAggWhere / DiagInnerJoin / DiagMisc / DiagOps
         / DiagMultiValues.
-      [ ] **g) ALTER TABLE no-op.**
-        `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
-        do not modify the schema.  Tracked under 7.1.9.
+      [X] **g) ALTER TABLE no-op.**  Closed 2026-05-06.  Three gaps,
+        all traced to faithful 1:1 omissions in the ported alter.c /
+        prepare.c / vdbe.c arms:
+
+        1. **`sqlite3AddColumn` skipped the IN_RENAME_OBJECT token-map.**
+           build.c:1546 calls `sqlite3RenameTokenMap(pParse, (void*)z,
+           &sName)` so `renameColumnFunc` (alter.c:1530) can later
+           locate the column-name token via `renameTokenFind`.  The
+           Pascal port (codegen.pas sqlite3AddColumn) had dropped that
+           call, so `sCtx.pList` was empty and `renameEditSql` produced
+           the input verbatim — `sqlite_rename_column(...)` returned
+           the *original* `CREATE TABLE` text, the
+           `sqlite3NestedParse(UPDATE %Q.sqlite_schema SET sql=...)`
+           wrote the same text back, and the row looked unchanged.
+           Restored the C call site verbatim
+           (codegen.pas:33082..33084).
+
+        2. **Eponymous-vtab WHERE was a `pWhere=nil` gate.**  Both the
+           agg arm (`isVtabAgg` at codegen.pas:~23715) and the FROM-item
+           arm (codegen.pas:~23957) bailed when `p^.pWhere` was non-nil
+           — `count(*) FROM pragma_table_info('t') WHERE name='c'`
+           emitted Init/Halt/Goto only.  Lifted both gates and threaded
+           `sqlite3ExprIfFalse(pWhere, addrSkip, JUMPIFNULL)` into the
+           `OP_VFilter` body (skip the row when WHERE is false, then
+           `OP_VNext`).  The check query that gates this row of the
+           probe (`SELECT count(*) FROM pragma_table_info('t') WHERE
+           name='c'`) now produces the expected count of 1 / 0.
+
+        3. **`OP_ParseSchema` ALTER branch (p4=NULL) was a no-op stub.**
+           vdbe.c:7137..7142 calls `sqlite3SchemaClear` + `sqlite3InitOne`
+           + `db->mDbFlags |= DBFLAG_SchemaChange` so the in-memory
+           `Schema` for iDb is rebuilt from the (just-rewritten)
+           `sqlite_master` row.  The Pas port left the branch as
+           `rc := SQLITE_OK` with a TODO; routed both p4 modes through
+           `vdbeParseSchemaExec` and added a nil-zWhere arm in
+           `execParseSchemaImpl` (main.pas:~2697) that calls
+           `sqlite3SchemaClear` then `sqlite3InitOne` so the renamed
+           column actually shows up in `pragma_table_info`.  Vdbe-side,
+           `OP_ParseSchema` now sets `DBFLAG_SchemaChange` after the
+           ALTER reload (passqlite3vdbe.pas:9924..).
+
+        Verification (2026-05-06, a3): DiagFeatureProbe — `ALTER TABLE
+        rename column` and `ALTER TABLE add column` both PASS;
+        TestExplainParity 1026/1026; no regressions across DiagPragma /
+        DiagDml / DiagIndexing / DiagSubsel / DiagAggWhere /
+        DiagInnerJoin / DiagMisc / DiagOps / DiagMultiValues / DiagTxn /
+        DiagWindow / DiagCreateIdx / DiagAutoIdx.  This also unblocks
+        the runtime side of 7.1.9 (ALTER end-to-end parity) for the
+        RENAME COLUMN and ADD COLUMN paths; RENAME TABLE and DROP
+        COLUMN follow the same OP_ParseSchema reload pattern so they
+        should now light up too.
 
   [X] **6.10 step 15** Runtime divergences surfaced by `DiagTxn`
       (transactions, savepoints, conflict resolution).  All PASS as of
