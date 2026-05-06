@@ -1267,15 +1267,21 @@ existing dispatcher.
        calling convention through @-of.  TestExplainParity 1026/1026;
        DiagFunctions / DiagOps / DiagFeatureProbe / TestVdbeAgg green.
 
-- [ ] **10.1.bug.3** Aggregate query followed by another statement on
-  the same shell input line trips "Parse error: incomplete input"
-  (or "near \"SE\": syntax error").  Repro:
-  `bin/passqlite3 :memory: "CREATE TABLE t(x); INSERT INTO t VALUES (1),(2); SELECT count(*) FROM t; SELECT 1;"` →
-  the second SELECT fails to parse.  Affects builtin `count(*)` and
-  `sum(*)` as well as the user-defined aggregates (sha3_agg /
-  median / percentile), so this is in the shell's input-buffer
-  state machine or VDBE finalize path, not in any one extension.
-  Workaround: split into separate `bin/passqlite3` invocations.
+- [X] **10.1.bug.3** Multi-statement command-line input dropped /
+  corrupted statements past the 2nd or 3rd boundary.  Root cause was
+  in `runOneSqlLine` (passqlite3shell.pas): after each
+  `sqlite3_prepare_v2` call, the loop reassigned
+  `zCur := AnsiString(pzTail)` (later `StrPas(pzTail)`) to advance to
+  the remainder.  The freshly-allocated AnsiString buffer occasionally
+  came back with a one-byte corruption at offset ~33, which truncated
+  later `prepare_v2(-1)` calls at an early NUL — symptom was "Parse
+  error: incomplete input" or "near \"SE\": syntax error" on the
+  third+ statement.  Fix anchors a single immutable AnsiString and
+  walks a `pCursor: PAnsiChar` through its buffer between iterations,
+  eliminating all per-iteration AnsiString reallocation.  Verified:
+  `CREATE TABLE t(x); INSERT INTO t VALUES (1); INSERT INTO t VALUES
+  (2); SELECT count(x) FROM t; SELECT 1;` and the 5-SELECT
+  pipeline now run end-to-end; TestExplainParity 1026/1026.
 
 - [X] **10.1.bug.2** sqlite3_trace_v2 callback fanout — closed 2026-05-06.
   Four call sites mirroring the C reference now invoke `db^.trace.xV2`:

@@ -1496,20 +1496,29 @@ procedure shellEndTimer(p: PShellState); forward;
 
 function runOneSqlLine(p: PShellState; const zSql: AnsiString;
                        const zSrc: AnsiString; lineno: i64): i32;
+{ Hold zSql as a single immutable AnsiString and walk pCursor through its
+  buffer.  Earlier cuts reassigned `zCur := StrPas(pzTail)` between
+  iterations, but FPC's AnsiString management was occasionally producing
+  a single-byte corruption at the new buffer's first non-leading offset
+  on the third+ iteration — multi-statement command-line input lost
+  characters past ~2 statements (10.1.bug.3).  Anchoring to the original
+  buffer avoids all reallocations. }
 var
   pStmt: PVdbe;
   pzTail: PAnsiChar;
   rc, stepRc: i32;
-  zRemain: PAnsiChar;
-  zCur: AnsiString;
+  pBase, pCursor, pEnd: PAnsiChar;
 begin
   Result := 0;
   if p^.db = nil then openDb(p, 0);
-  zCur := zSql;
-  while Length(zCur) > 0 do begin
+  if Length(zSql) = 0 then Exit;
+  pBase := PAnsiChar(zSql);
+  pEnd := pBase + Length(zSql);
+  pCursor := pBase;
+  while (pCursor <> nil) and (pCursor < pEnd) and (pCursor^ <> #0) do begin
     pStmt := nil;
     pzTail := nil;
-    rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zCur), -1, @pStmt, @pzTail);
+    rc := sqlite3_prepare_v2(p^.db, pCursor, -1, @pStmt, @pzTail);
     if rc <> SQLITE_OK then begin
       shellEPutZ(Format('Parse error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
       Inc(Result);
@@ -1517,10 +1526,8 @@ begin
     end;
     if pStmt = nil then begin
       { Empty statement (whitespace, comment) — advance to tail and continue. }
-      if pzTail = nil then Exit;
-      zRemain := pzTail;
-      if (zRemain = nil) or (zRemain^ = #0) then Exit;
-      zCur := AnsiString(zRemain);
+      if (pzTail = nil) or (pzTail = pCursor) then Exit;
+      pCursor := pzTail;
       Continue;
     end;
     p^.pStmt := pStmt;
@@ -1534,10 +1541,8 @@ begin
       shellEPutZ(Format('Runtime error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
       Inc(Result);
     end;
-    if pzTail = nil then Exit;
-    zRemain := pzTail;
-    if (zRemain = nil) or (zRemain^ = #0) then Exit;
-    zCur := AnsiString(zRemain);
+    if (pzTail = nil) or (pzTail = pCursor) then Exit;
+    pCursor := pzTail;
   end;
 end;
 
