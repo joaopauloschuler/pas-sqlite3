@@ -500,7 +500,7 @@ FPC porting traps that recur often enough to call out up-front:
        schema-row INSERT/UPDATE wiring.  Closes 6.10 step 9(g) once
        7.1.1 lands.
 
-- [X] **7.4b** Bytecode-diff scope landed via `TestBytecodeParity.pas`.
+- [~] **7.4b** Bytecode-diff scope landed via `TestBytecodeParity.pas`.
   Done 2026-05-06.  Drives `EXPLAIN <sql>` through `sqlite3_prepare_v2 /
   sqlite3_step` on BOTH sides and diffs (opcode, p1, p2, p3, p4, p5)
   byte-for-byte.  17/17 PASS today: CREATE TABLE simple/typed, DROP
