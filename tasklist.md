@@ -979,11 +979,25 @@ existing dispatcher.
        command arm.  Full TRACEFLAGS wiring needs the varargs
        sqlite3_test_control variant (deferred).
 
-- [ ] **10.1f** Long-tail / specialised dot-commands.  `.backup`,
-  `.restore`, `.clone`, `.archive`/`.ar`, `.session`, `.recover`,
-  `.dbinfo`, `.dbconfig`, `.filectrl`, `.sha3sum`, `.crnl`,
-  `.binary`, `.connection`, `.unmodule`, `.vfsinfo`, `.vfslist`,
-  `.vfsname`.  Out-of-scope dependencies (session, archive, recover)
+- [ ] **10.1f** Long-tail / specialised dot-commands.  
+  - [ ] `.backup`,
+  - [ ] `.restore`, 
+  - [ ] `.clone`, 
+  - [ ] `.archive`/`.ar`, 
+  - [ ] `.session`, 
+  - [ ] `.recover`,
+  - [ ] `.dbinfo`, 
+  - [ ] `.dbconfig`, 
+  - [ ] `.filectrl`, 
+  - [ ] `.sha3sum`, 
+  - [ ] `.crnl`,
+  - [ ] `.binary`, 
+  - [ ] `.connection`, 
+  - [ ] `.unmodule`, 
+  - [ ] `.vfsinfo`, 
+  - [ ] `.vfslist`,
+  - [ ] `.vfsname`. 
+  Out-of-scope dependencies (session, archive, recover)
   may stub with the upstream `SQLITE_OMIT_*` "feature not compiled
   in" message.  Gate: `tests/cli/10f_misc/`.
 
