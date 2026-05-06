@@ -7757,6 +7757,45 @@ begin
   end;
 end;
 
+{ flagUnresolvedTKID — Phase 7.4e companion.  After the SrcList-bound and
+  trigger-NEW/OLD passes, any surviving TK_ID is genuinely unresolved.
+  Mirror resolve.c:lookupName tail (resolve.c:784..795): try the
+  TK_ID → TK_TRUEFALSE rewrite (so bare `true`/`false`/`null` resolve);
+  if that fails too, emit "no such column: X" and pass parse->nErr up.
+  Without this, INSERT INTO t VALUES('k', hello) silently bound NULL
+  instead of raising "no such column: hello" the way the C reference
+  does (and the way SELECT hello FROM t already does via the heavier
+  sqlite3ResolveSelectNames walker). }
+procedure flagUnresolvedTKID(pParse: PParse; pE: PExpr);
+var
+  i:      i32;
+  pList_: PExprList;
+begin
+  if pE = nil then Exit;
+  if pParse = nil then Exit;
+  if pParse^.nErr > 0 then Exit;
+  if pE^.op = TK_ID then
+  begin
+    if sqlite3ExprIdToTrueFalse(pE) = 0 then
+    begin
+      if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
+        sqlite3ErrorMsg(pParse,
+          PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+    end;
+    Exit;
+  end;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  flagUnresolvedTKID(pParse, pE^.pLeft);
+  flagUnresolvedTKID(pParse, pE^.pRight);
+  if (pE^.flags and EP_xIsSelect) = 0 then
+  begin
+    pList_ := pE^.x.pList;
+    if pList_ <> nil then
+      for i := 0 to pList_^.nExpr - 1 do
+        flagUnresolvedTKID(pParse, ExprListItems(pList_)[i].pExpr);
+  end;
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
@@ -7764,6 +7803,14 @@ begin
     if pNC^.pParse <> nil then
       resolveTriggerNewOld(pNC^.pParse, pExpr);
     resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
+    if pNC^.pParse <> nil then
+    begin
+      flagUnresolvedTKID(pNC^.pParse, pExpr);
+      if pNC^.pParse^.nErr > 0 then
+      begin
+        Result := SQLITE_ERROR; Exit;
+      end;
+    end;
   end;
   Result := SQLITE_OK;
 end;

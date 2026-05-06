@@ -660,13 +660,31 @@ FPC porting traps that recur often enough to call out up-front:
   instead of the upstream WITHOUT ROWID variant.  Fix likely in the
   btree-cell payload assembly for a clustered-key insert.
 
-- [ ] **7.4e** Bare-bareword `INSERT INTO ... VALUES('k', hello)`
-  silently binds NULL instead of raising `no such column: hello`.
-  Reproduced via `.parameter set $name 'hello'` (the dot-cmd tokenizer
-  strips the quotes, then the SQL splice produces the above).
-  Worked around in cmdParameter via `looksLikeSqlLiteral`, but the
-  underlying parser/expr-resolver gap should be fixed: an unresolved
-  bare identifier in a value position must error, not coerce to NULL.
+- [X] **7.4e** Bare-bareword `INSERT INTO ... VALUES('k', hello)`
+  silently bound NULL instead of raising `no such column: hello`.
+  Closed 2026-05-06.  Root cause was in the resolver split: SELECT
+  drives `sqlite3ResolveSelectNames` (codegen.pas:7851) whose nested
+  `ResolveExpr` walker emits "no such column: X" when a TK_ID survives
+  the SrcList lookup (codegen.pas:8154); INSERT VALUES drives
+  `sqlite3ResolveExprListNames` → `sqlite3ResolveExprNames`
+  (codegen.pas:7779/7760) which only ran the silent
+  `resolveExprAgainstSrcList` walker — survivors stayed TK_ID and
+  the codegen path emitted them as bound NULL.  Added
+  `flagUnresolvedTKID(pParse, pExpr)` post-walk
+  (codegen.pas immediately above sqlite3ResolveExprNames): tries
+  `sqlite3ExprIdToTrueFalse` (so `SELECT TRUE/FALSE/NULL` still
+  works), otherwise emits the canonical error and propagates
+  SQLITE_ERROR up.  Mirrors resolve.c:784..795 (lookupName tail).
+  Verification (2026-05-06): the repro now reports
+  `Parse error: no such column: hello`.  TestExplainParity 1026/1026;
+  TestBytecodeParity 32/32; DiagDml / DiagFeatureProbe / DiagPragma /
+  DiagOps / DiagMisc / DiagDropTable / DiagWindow / DiagIndexing /
+  DiagSubsel / DiagAggWhere / DiagInnerJoin / DiagMultiValues /
+  DiagAnalyze / DiagCreateIdx / DiagAutoIdx / DiagBloom / DiagCovering
+  / DiagCast / DiagFunctions / DiagMoreFunc / DiagTxn / DiagSampleProg
+  all clean.  The cmdParameter `looksLikeSqlLiteral` workaround can
+  stay (it sidesteps the same upstream quirk in C and is now
+  belt-and-braces).
 
 - [X] **7.4c** `TestVdbeTrace.pas` differential opcode-trace gate.  Done
   2026-05-06.  `passqlite3vdbe` exports `gVdbeTraceBuf` and the
