@@ -233,7 +233,7 @@ end;
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 17;
+  N_CORPUS = 29;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -271,6 +271,24 @@ begin
   Add(i, 'ROLLBACK TO SAVEPOINT',        'ROLLBACK TO SAVEPOINT s1;');                    Inc(i);
   Add(i, 'BEGIN DEFERRED',               'BEGIN DEFERRED;');                              Inc(i);
 
+  { 7.4b.1 — no-FROM SELECT.  OP_Explain p4 narrator now matches. }
+  Add(i, 'SELECT 1',                     'SELECT 1;');                                    Inc(i);
+  Add(i, 'SELECT NULL',                  'SELECT NULL;');                                 Inc(i);
+  Add(i, 'SELECT 1+2',                   'SELECT 1+2;');                                  Inc(i);
+  Add(i, 'SELECT 1,2,3',                 'SELECT 1,2,3;');                                Inc(i);
+  Add(i, 'SELECT abs(-7)',               'SELECT abs(-7);');                              Inc(i);
+  Add(i, 'SELECT str literal',           'SELECT ''hello'';');                            Inc(i);
+
+  { 7.4b.2 — table-scan SELECT.  OP_OpenRead p4 nField now matches. }
+  Add(i, 'SELECT a FROM t',              'SELECT a FROM t;');                             Inc(i);
+  Add(i, 'SELECT a,b FROM t',            'SELECT a,b FROM t;');                           Inc(i);
+  Add(i, 'SELECT * FROM t',              'SELECT * FROM t;');                             Inc(i);
+  Add(i, 'SELECT a WHERE rowid=5',       'SELECT a FROM t WHERE rowid=5;');               Inc(i);
+
+  { 7.4b.3 — sqlite_master row affinity (BBBDB) on schema-row INSERT. }
+  Add(i, 'CREATE INDEX',                 'CREATE INDEX i1 ON t(a);');                     Inc(i);
+  Add(i, 'CREATE INDEX 2col',            'CREATE INDEX i3 ON t(a,b);');                   Inc(i);
+
   { ----- EXCLUDED — known 7.4b follow-up codegen gaps -----
     These rows produce identical (op, p1, p2, p3, p5) but diverge on p4
     rendering; they are tracked as 7.4b sub-items in tasklist.md.
@@ -281,10 +299,14 @@ begin
     * 'SELECT a FROM t', 'SELECT * FROM t', any table-scan SELECT —
       OP_OpenRead p4 (P4_INT32 nField) is full-column-count on Pascal
       (3) vs nField-actually-used (1) on C.
-    * 'CREATE INDEX i ON t(a)', 'CREATE TABLE ... PRIMARY KEY(a,b)',
-      'CREATE TABLE ... WITHOUT ROWID' — OP_MakeRecord p4 affinity
-      string empty on Pascal vs e.g. "BBBDB" on C.  KeyInfo.aColl heap
-      layout / Index.zColAff not set during the implicit-index codegen.
+    * 'CREATE TABLE ... PRIMARY KEY(a,b)', 'CREATE TABLE ... WITHOUT
+      ROWID' — implicit-index OP_MakeRecord p4 affinity still empty.
+      Distinct from 7.4b.3 (sqlite_master schema-row affinity), which
+      has been fixed.
+    * 'CREATE UNIQUE INDEX' — OP_SorterOpen p4 KeyInfo nKeyField is
+      `nKeyCol` (1) on Pascal vs `nKeyCol+1` (2, including the rowid
+      tail) on C.  Pascal's sqlite3KeyInfoOfIndex collapses the
+      uniqNotNull case differently than C's build.c CreateIndex.
     * INSERT-from-SELECT / multi-row VALUES, UPDATE ... FROM — pending
       the same OP_OpenRead nField alignment.
     --------------------------------------------------------- }

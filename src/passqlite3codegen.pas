@@ -16497,6 +16497,8 @@ var
   iRowidReg:   i32;
   notReadyResid: Bitmask;
   notReady:      Bitmask;
+  colUsedB:      Bitmask;
+  nP4Cols:       i32;
   rc:            i32;
   pStart, pEnd: PWhereTerm;
   pX:          PExpr;
@@ -16903,6 +16905,26 @@ begin
         if (pLoop^.wsFlags and WHERE_IDX_ONLY) = 0 then
         begin
           sqlite3OpenTable(pParse, pTabItem^.iCursor, iDb, pTab, OP_OpenRead);
+          { 7.4b.2 — reduce OP_OpenRead p4 (column count) to the highest
+            bit set in pTabItem^.colUsed when only a prefix is referenced.
+            Mirrors where.c:7284..7297. }
+          if (pWInfo^.eOnePass = ONEPASS_OFF)
+             and (i32(pTab^.nCol) < BMS)
+             and ((pTab^.tabFlags
+                   and (TF_HasGenerated or TF_WithoutRowid)) = 0)
+             and ((pLoop^.wsFlags
+                   and (WHERE_AUTO_INDEX or WHERE_BLOOMFILTER)) = 0) then
+          begin
+            { highest-set-bit count: shift colUsed right until zero,
+              counting iterations.  C does the same with `for(; b; b>>=1, n++) {}`. }
+            colUsedB := pTabItem^.colUsed;
+            nP4Cols  := 0;
+            while colUsedB <> 0 do begin
+              colUsedB := colUsedB shr 1;
+              Inc(nP4Cols);
+            end;
+            sqlite3VdbeChangeP4(v, -1, Pointer(PtrInt(nP4Cols)), P4_INT32);
+          end;
           sqlite3VdbeChangeP5(v, 0);
           { where.c:7310..7316 — for inner-join tables at level >= 2 whose
             addrHalt matches the outermost level, emit OP_IfEmpty so an
@@ -17065,6 +17087,24 @@ begin
       sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenWrite)
     else
       sqlite3OpenTable(pParse, pLevel^.iTabCur, iDb, pTab, OP_OpenRead);
+    { 7.4b.2 — reduce OP_OpenRead/Write p4 (column count) to the highest
+      bit set in pTabItem^.colUsed when only a prefix is referenced.
+      Mirrors where.c:7284..7297. }
+    if (pWInfo^.eOnePass = ONEPASS_OFF)
+       and (i32(pTab^.nCol) < BMS)
+       and ((pTab^.tabFlags
+             and (TF_HasGenerated or TF_WithoutRowid)) = 0)
+       and ((pLoop^.wsFlags
+             and (WHERE_AUTO_INDEX or WHERE_BLOOMFILTER)) = 0) then
+    begin
+      colUsedB := pTabItem^.colUsed;
+      nP4Cols  := 0;
+      while colUsedB <> 0 do begin
+        colUsedB := colUsedB shr 1;
+        Inc(nP4Cols);
+      end;
+      sqlite3VdbeChangeP4(v, -1, Pointer(PtrInt(nP4Cols)), P4_INT32);
+    end;
     sqlite3VdbeChangeP5(v, 0);
   end;
 
@@ -22891,7 +22931,14 @@ begin
       mirrors the suppression — multiSelectValues emits a single SCAN
       Explain at the consumer level, not inside each coroutine body. }
     if (p^.selFlags and SF_MultiValue) = 0 then
-      sqlite3VdbeAddOp3(v, OP_Explain, sqlite3VdbeCurrentAddr(v), 0, 0);
+      { 7.4b.1 — match the C oracle's narrator on no-FROM SELECT.  C
+        runs sqlite3WhereBegin even for an empty FROM clause and emits
+        ExplainQueryPlan(("SCAN CONSTANT ROW")) at where.c:6954.  The
+        Pascal no-FROM fast path bypasses WhereBegin entirely, so we
+        emit the p4 narrator inline. }
+      sqlite3VdbeAddOp4(v, OP_Explain, sqlite3VdbeCurrentAddr(v), 0, 0,
+                        sqlite3MPrintf(pParse^.db, 'SCAN CONSTANT ROW', []),
+                        P4_DYNAMIC);
     sqlite3ExprCodeExprList(pParse, pEList, pDest^.iSdst, 0, SQLITE_ECEL_DUP);
     { OFFSET — codeOffset emits IfPos to skip the row when iOffset>0.
       Jumps to addrEndNoFrom (i.e. past the row emission) so this single
@@ -33651,7 +33698,12 @@ begin
     sqlite3VdbeAddOp4(v, OP_String8, 0, regBase + 4, 0, zStmt, P4_DYNAMIC);
 
   sqlite3VdbeAddOp2(v, OP_NewRowid, iCursor, regRowid);
-  sqlite3VdbeAddOp3(v, OP_MakeRecord, regBase, 5, regOut);
+  { 7.4b.3 — sqlite_master row affinity.  C's sqlite3NestedParse
+    INSERT routes through sqlite3Insert + sqlite3TableAffinity, which
+    sets MakeRecord p4 to the schema-table affinity string ("BBBDB"
+    for type/name/tbl_name/rootpage/sql).  Hand-emit the same p4 here. }
+  sqlite3VdbeAddOp4(v, OP_MakeRecord, regBase, 5, regOut,
+                    PAnsiChar('BBBDB'), 5);
   sqlite3VdbeAddOp3(v, OP_Insert, iCursor, regOut, regRowid);
   sqlite3VdbeChangeP5(v, OPFLAG_APPEND or OPFLAG_USESEEKRESULT);
 end;

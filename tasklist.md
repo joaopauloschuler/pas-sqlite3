@@ -512,19 +512,25 @@ FPC porting traps that recur often enough to call out up-front:
   `aOp[]` directly on the Pascal side; new gate exposed it and the
   one-line fix in `passqlite3vdbe.pas` now mirrors `vdbeaux.c:2471`.
 
-  [ ] **7.4b.1** OP_Explain p4 string.  Pascal codegen emits OP_Explain
-       opcodes but never feeds the explain narrator, so p4 is empty for
-       e.g. `SELECT 1` (`SCAN CONSTANT ROW` on C).  Needed to add SELECT
-       literals back into the corpus.
-  [ ] **7.4b.2** OP_OpenRead p4 nField (P4_INT32) — Pascal emits the
-       full column count of the table (3 for `t(a,b,c)`); C emits
-       the field-count-actually-used (1 for `SELECT a FROM t`).  Gates
-       SELECT / DML over user tables back into the corpus.
-  [ ] **7.4b.3** OP_MakeRecord p4 affinity-string — empty on Pascal vs
-       e.g. `"BBBDB"` on C.  Triggered by any implicit/explicit index
-       build: CREATE INDEX, composite PRIMARY KEY, WITHOUT ROWID.
-       Needs `Index.zColAff` populated during `sqlite3IndexAffinityStr`
-       and threaded into the OP_MakeRecord emit site.
+  [X] **7.4b.1** OP_Explain p4 string for no-FROM SELECT.  Done
+       2026-05-06.  C runs `sqlite3WhereBegin` even on empty FROM
+       clause and emits `ExplainQueryPlan(("SCAN CONSTANT ROW"))`
+       at where.c:6954.  Pascal's no-FROM fast path
+       (codegen.pas:22894) bypasses WhereBegin, so the narrator is
+       now emitted inline via `sqlite3VdbeAddOp4(...,'SCAN CONSTANT ROW',
+       P4_DYNAMIC)`.  Lifts SELECT-literal rows in TestBytecodeParity.
+  [X] **7.4b.2** OP_OpenRead p4 nField (P4_INT32) — Pascal now reduces
+       the column count to MSB(pTabItem^.colUsed) when only a prefix
+       is referenced, mirroring where.c:7284..7297.  Applied at both
+       OpenTable sites in sqlite3WhereBegin (the multi-level loop and
+       the single-level fast path).  Lifts table-scan SELECT rows.
+  [X] **7.4b.3** OP_MakeRecord p4 affinity for sqlite_master row
+       insertion.  Done 2026-05-06.  `emitSchemaRowInsert`
+       (codegen.pas:33701) now emits MakeRecord with p4="BBBDB" via
+       AddOp4, mirroring sqlite3TableAffinity's iReg=0 ChangeP4 path
+       in C's sqlite3NestedParse(INSERT INTO sqlite_master ...).
+       Lifts CREATE INDEX rows; remaining CREATE UNIQUE INDEX gap is
+       a separate KeyInfo/nKeyField issue tracked in the test header.
 
 - [X] **7.4c** `TestVdbeTrace.pas` differential opcode-trace gate.  Done
   2026-05-06.  `passqlite3vdbe` exports `gVdbeTraceBuf` and the
