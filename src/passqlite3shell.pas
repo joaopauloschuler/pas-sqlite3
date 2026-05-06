@@ -1879,7 +1879,7 @@ begin
     1: shellSPutZ(z);
     2: shellEPutZ(z);
     3: begin
-         {$I-} Write(traceFile, z); {$I+}
+         {$I-} Write(traceFile, z); Flush(traceFile); {$I+}
          if IOResult <> 0 then ;
        end;
   end;

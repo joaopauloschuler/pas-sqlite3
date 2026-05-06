@@ -690,6 +690,12 @@ begin
     Exit;
   end;
 
+  { main.c:1264 — fire SQLITE_TRACE_CLOSE before tear-down. }
+  if (db^.mTrace and SQLITE_TRACE_CLOSE) <> 0 then begin
+    if Assigned(db^.trace.xV2) then
+      db^.trace.xV2(SQLITE_TRACE_CLOSE, db^.pTraceArg, db, nil);
+  end;
+
   { Legacy sqlite3_close() refuses if statements still pending. }
   if (forceZombie = 0) and (connectionIsBusy(db) <> 0) then begin
     sqlite3ErrorWithMsg(db, SQLITE_BUSY,

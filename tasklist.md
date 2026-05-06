@@ -1003,15 +1003,14 @@ existing dispatcher.
   [~] **10.1.36** `.log FILENAME|on|off` — cmdLog records the
        destination so `.show` reflects it; SQLITE_CONFIG_LOG wiring
        gated on the raw-varargs sqlite3_config port (8.1.1).
-  [~] **10.1.37** `.trace ?OPTIONS?` — cmdTrace parses the upstream
+  [X] **10.1.37** `.trace ?OPTIONS?` — cmdTrace parses the upstream
        option set (FILE / stdout / stderr / off / --expanded / --plain
        / --stmt / --profile / --row / --close), opens the requested
        sink, builds the mTrace mask, and registers a Pascal cdecl
-       traceCallback through sqlite3_trace_v2.  Actual firing of the
-       callback is gated on the VDBE-side trace dispatch — db^.mTrace /
-       db^.trace.xV2 are stored but never invoked from the step path
-       yet.  When that wires (separate VDBE follow-up), `.trace` will
-       light up without further shell-side changes.
+       traceCallback through sqlite3_trace_v2.  Trace fanout wired
+       into the VDBE step path under 10.1.bug.2 — STMT, ROW, PROFILE,
+       CLOSE all fire end-to-end.  File-sink Flush per write so the
+       trace file is durable on `.quit`.
   [ ] **10.1.38** `.iotrace` — wires `sqlite3IoTrace` (gated on the
        6.8 `sqlite3VdbeIOTraceSql` arm landing first).
   [~] **10.1.39** `.scanstats on|off|est|vm` — cmdScanstats records the
@@ -1131,13 +1130,25 @@ existing dispatcher.
   [X] **10.1.59** `.breakpoint` — cmdBreakpoint no-op stub
        (gdb-attach hook only; not exercised by any gate).
 
-- [ ] **10.1.bug.2** sqlite3_trace_v2 callback never fires.  The
-  Pascal port's sqlite3_trace_v2 stores db^.mTrace + db^.trace.xV2 but
-  nothing in the VDBE step path invokes db^.trace.xV2 — neither at
-  SQLITE_TRACE_STMT prepare-start, PROFILE end-of-stmt, ROW per-row,
-  nor CLOSE on connection close.  Port the upstream trace fanout
-  (vdbe.c/main.c — search for `mTrace` and `trace.xV2`) so .trace
-  lights up.  Until then `.trace` is a configurable no-op.
+- [X] **10.1.bug.2** sqlite3_trace_v2 callback fanout — closed 2026-05-06.
+  Four call sites mirroring the C reference now invoke `db^.trace.xV2`:
+  (1) `sqlite3Close` (passqlite3main.pas) for SQLITE_TRACE_CLOSE
+  (main.c:1264);
+  (2) OP_Trace/OP_Init in `sqlite3VdbeExec` (passqlite3vdbe.pas) for
+  SQLITE_TRACE_STMT, picking p4.z if non-NULL else `v^.zSql`, with the
+  nested-exec `-- %s` wrap when `db^.nVdbeExec > 1` (vdbe.c:9067..9085);
+  (3) OP_ResultRow for SQLITE_TRACE_ROW (vdbe.c:1770);
+  (4) `sqlite3_step` snapshots `pStmt^.startTime` via
+  `sqlite3OsCurrentTimeInt64` on READY→RUN when PROFILE/XPROFILE is set
+  (vdbeapi.c:806..813), increments/decrements `nVdbeExec` around
+  `sqlite3VdbeExec`, and fires SQLITE_TRACE_PROFILE with elapsed-ns
+  payload at end-of-step (vdbeapi.c:62..79).  Verified via
+  `bin/passqlite3 t.db` + `.trace stderr --stmt --row --profile --close`
+  — STMT lines, `[ROW …]`, profile elapsed, and `[CLOSE]` all fire.
+  Companion shell fix: traceWrite now `Flush(traceFile)` per record so
+  file sinks are durable on `.quit`.  TestExplainParity 1026/1026;
+  DiagOps / DiagDml / DiagFeatureProbe / DiagPragma / TestBytecodeParity
+  / TestConfigHooks all clean.
 
 - [X] **10.1.bug.1** Header row leak in `.mode list` fixed: the port
   was treating `bTitles` as a 0/1 boolean while upstream uses QRF
