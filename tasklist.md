@@ -616,6 +616,24 @@ FPC porting traps that recur often enough to call out up-front:
        / DiagFeatureProbe all 0 div; TestExplainParity 1026/1026;
        TestBytecodeParity 32/32.
 
+- [ ] **7.4d** WITHOUT ROWID runtime corruption.  Bytecode parity for
+  `CREATE TABLE x(k PRIMARY KEY, v) WITHOUT ROWID` was closed under
+  7.4b.5, but the runtime path corrupts the page on the first INSERT —
+  `INSERT INTO x VALUES('k','v'); SELECT * FROM x;` raises `database
+  disk image is malformed`.  Repro: `bin/passqlite3 t.db` followed by
+  the two statements above.  Workaround currently in passqlite3shell:
+  paramTableInit emits a plain rowid `temp.sqlite_parameters` table
+  instead of the upstream WITHOUT ROWID variant.  Fix likely in the
+  btree-cell payload assembly for a clustered-key insert.
+
+- [ ] **7.4e** Bare-bareword `INSERT INTO ... VALUES('k', hello)`
+  silently binds NULL instead of raising `no such column: hello`.
+  Reproduced via `.parameter set $name 'hello'` (the dot-cmd tokenizer
+  strips the quotes, then the SQL splice produces the above).
+  Worked around in cmdParameter via `looksLikeSqlLiteral`, but the
+  underlying parser/expr-resolver gap should be fixed: an unresolved
+  bare identifier in a value position must error, not coerce to NULL.
+
 - [X] **7.4c** `TestVdbeTrace.pas` differential opcode-trace gate.  Done
   2026-05-06.  `passqlite3vdbe` exports `gVdbeTraceBuf` and the
   `sqlite3VdbeExec` main loop appends one normalised line per executed
@@ -750,15 +768,18 @@ existing dispatcher.
        (Markdown + naive Column landed under 10.1.8; auto-width Table
        and Box still pending.)
   [X] **10.1.10** `.headers` / `.separator` / `.nullvalue` / `.echo`
-       / `.changes` setters landed in doMetaCommand (cmdHeaders /
-       cmdSeparator / cmdNullvalue / cmdEcho / cmdChanges).  Stable
+       / `.changes` / `.width` setters landed in doMetaCommand.
        AnsiString backing for the PAnsiChar fields lives in unit-level
-       zUserColSep / zUserRowSep / zUserNull.  `.width` still pending
-       (depends on per-column width state in TShellMode).
-  [ ] **10.1.11** `.print` / `.parameter` (formatting subset) —
-       `.parameter init / list / set / unset / clear`.  (`.print`
-       arm landed alongside 10.1.10 — args concatenated space-separated
-       to stdout; `.parameter` still pending.)
+       zUserColSep / zUserRowSep / zUserNull; `.width` stores parsed
+       widths in aUserWidth and points spec.aWidth/nWidth at it.
+  [X] **10.1.11** `.print` / `.parameter init|list|set|unset|clear`.
+       cmdParameter mirrors shell.c.in:10264..10367; paramTableInit
+       creates temp.sqlite_parameters (with-rowid; upstream's WITHOUT
+       ROWID variant is gated on a port bug logged separately).
+       paramSet uses looksLikeSqlLiteral to decide whether to splice
+       the value as a literal (digits / quotes / NULL / X'...') or
+       wrap it as text — sidesteps the upstream "bare bareword binds
+       NULL" quirk that the Pascal parser inherits.
   [X] **10.1.12** CSV writer helpers — `outputCsvField` mirrors
        `output_csv` (quote-on-{sep,",CR,LF}; embedded quotes doubled).
        Wired into emitRowOne MODE_Csv arm.
@@ -820,25 +841,31 @@ existing dispatcher.
 
   [ ] **10.1.28** `.stats` — toggle per-stmt status counters output;
        reads `sqlite3_stmt_status` for each opcode set.
-  [ ] **10.1.29** `.timer` — wall / user / sys clock around each
-       statement.
-  [ ] **10.1.30** `.eqp` — sets `EXPLAIN QUERY PLAN` auto-prefix mode.
-       (`off` / `on` / `trigger` / `full`).
-  [ ] **10.1.31** `.explain` — sets `EXPLAIN` auto-prefix mode and
-       formats the bytecode dump.
-  [X] **10.1.32** `.show` — cmdShow dumps echo / headers / mode /
-       nullvalue / colseparator / rowseparator / filename in upstream's
-       `%12s: …` format.  Full `.show` covers ~25 fields; remaining
-       (stats, eqp, explain, output) land alongside their setters.
+  [~] **10.1.29** `.timer on|off|once` setter landed (cmdTimer);
+       sets ShellState.enableTimer to 0/1/2.  Wall/user/sys clock
+       probe around stepAndRender still pending.
+  [X] **10.1.30** `.eqp off|on|trace|trigger|full` — cmdEqp updates
+       mode.autoEQP / autoEQPtrace, toggles `PRAGMA vdbe_trace`.
+  [X] **10.1.31** `.explain auto|on|off` — cmdExplain sets
+       mode.autoExplain.  Bytecode dump formatting deferred.
+  [X] **10.1.32** `.show` — cmdShow dumps echo / eqp / explain /
+       headers / mode / nullvalue / colseparator / rowseparator /
+       stats / width / filename in upstream's `%12.12s: …` format.
+       The `output` field is still pending (depends on `.output`).
   [~] **10.1.33** `.help` — cmdHelp emits a 13-line excerpt covering
        the dot-commands actually wired today.  Full ~750-line upstream
        table (`showHelp`) still pending; -all and PATTERN filtering
        defer with it.
-  [ ] **10.1.34** `.shell` / `.system` — fork+exec, `popen`, capture
-       output to current `.output` sink.
-  [ ] **10.1.35** `.cd` — `chdir` wrapper.
-  [ ] **10.1.36** `.log` — opens / closes a logging FILE* + wires
-       `sqlite3_config(SQLITE_CONFIG_LOG, …)`.
+  [~] **10.1.34** `.shell` / `.system` — cmdShell concatenates args
+       (single-token args bare, multi-word args wrapped in `"`),
+       runs them via libc system()/Unix.fpsystem, and emits the
+       upstream `System command returns N` breadcrumb on non-zero
+       exit.  Output capture into the `.output` sink pending.
+  [X] **10.1.35** `.cd DIRECTORY` — cmdCd wraps FpChdir; mirrors
+       upstream's `Cannot change to directory "…"` error string.
+  [~] **10.1.36** `.log FILENAME|on|off` — cmdLog records the
+       destination so `.show` reflects it; SQLITE_CONFIG_LOG wiring
+       gated on the raw-varargs sqlite3_config port (8.1.1).
   [ ] **10.1.37** `.trace` — installs `sqlite3_trace_v2` callback
        (`stmt` / `profile` / `row` / `close`).
   [ ] **10.1.38** `.iotrace` — wires `sqlite3IoTrace` (gated on the
@@ -873,8 +900,12 @@ existing dispatcher.
        with omit-message.
   [ ] **10.1.48** `.recover` — corruption-recovery extension dispatcher.
        Gated on recover extension; stub with omit-message.
-  [ ] **10.1.49** `.dbinfo` — runs the canonical
-       `pragma_database_list` + page-1 header dump.
+  [X] **10.1.49** `.dbinfo` — cmdDbinfo reads the 100-byte page-1
+       header via `SELECT data FROM sqlite_dbpage(?) WHERE pgno=1`
+       and prints the canonical field/query block; also calls
+       SQLITE_FCNTL_DATA_VERSION for the `data version` line.
+       sqlite_dbpage virtual table is now auto-registered on every
+       openDb() so `.dbinfo` works without explicit module loading.
   [ ] **10.1.50** `.dbconfig` — `sqlite3_db_config` opcode dispatcher
        (gated on 8.1.1 raw-varargs `sqlite3_db_config`).
   [ ] **10.1.51** `.filectrl` — `sqlite3_file_control` opcode
@@ -882,10 +913,10 @@ existing dispatcher.
   [ ] **10.1.52** `.sha3sum` — runs the SHA3 hash extension over
        schema + data.  Bundles a Pascal SHA3 implementation or links
        the existing extension.
-  [ ] **10.1.53** `.crnl` — toggles CR-NL translation on Windows
-       output (no-op on Linux).
-  [ ] **10.1.54** `.binary` — toggles binary stdout mode (no-op on
-       Linux).
+  [X] **10.1.53** `.crnl` — cmdCrnl on Linux always clears MFLG_CRLF
+       and echoes `crlf is OFF`; matches upstream's non-Windows arm.
+  [X] **10.1.54** `.binary` — cmdBinary emits the upstream
+       `The ".binary" command is deprecated.` breadcrumb.
   [ ] **10.1.55** `.connection` — multi-connection switching
        (`.connection 0..N`, `.connection close N`).
   [ ] **10.1.56** `.unmodule` — `sqlite3_drop_modules` wrapper.
@@ -895,8 +926,8 @@ existing dispatcher.
   [ ] **10.1.58** `.dbtotxt` — page-by-page hex dump (used by the
        upstream `dbsqlfuzz` corpus); gated on the bytecode of the
        db being readable, no extension dependency.
-  [ ] **10.1.59** `.breakpoint` — debug-only no-op breakpoint
-       target (one-line stub).
+  [X] **10.1.59** `.breakpoint` — cmdBreakpoint no-op stub
+       (gdb-attach hook only; not exercised by any gate).
 
 - [ ] **10.2** Integration parity: `bin/passqlite3 foo.db` ↔
   `sqlite3 foo.db` on a scripted corpus that unions all 10.1a..f

@@ -44,6 +44,7 @@ program passqlite3shell;
 uses
   SysUtils,
   BaseUnix,
+  Unix,
   termio,
   passqlite3types,
   passqlite3util,
@@ -56,6 +57,7 @@ uses
   passqlite3codegen,
   passqlite3parser,
   passqlite3vtab,
+  passqlite3dbpage,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -394,6 +396,12 @@ var
   zUserColSep:          AnsiString = '|';
   zUserRowSep:          AnsiString = #10;
   zUserNull:            AnsiString = '';
+  { 10.1.36 — track .log destination filename for cmdShow / future logger
+    plumbing.  '' / 'off' both mean disabled, 'stdout' / 'stderr' refer
+    to the standard streams; any other value is a regular pathname. }
+  zLogFile:             AnsiString = 'off';
+  { 10.1.10 follow-up — stable backing array for spec.aWidth. }
+  aUserWidth:           array of SmallInt;
 
 { ----------------------------------------------------------------------
   Helpers — small utilities that mirror the cli_* family
@@ -490,6 +498,10 @@ begin
   end;
   globalDb := p^.db;
   p^.pAuxDb^.db := p^.db;
+  { sqlite_dbpage virtual table — needed by .dbinfo / .recover.  Upstream
+    auto-registers this on the connection; the Pascal port leaves it
+    optional, so we hook it here. }
+  sqlite3DbpageRegister(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
@@ -1327,16 +1339,36 @@ begin
 end;
 
 procedure cmdShow(p: PShellState);
+const
+  azBool: array[0..3] of AnsiString = ('off', 'on', 'trigger', 'full');
 var
   fn: AnsiString;
+  i: SizeInt;
+  widths: AnsiString;
 begin
   if p^.pAuxDb^.zDbFilename = nil then fn := '' else fn := AnsiString(p^.pAuxDb^.zDbFilename);
   shellSPutZ(Format('%12s: %s'#10, ['echo',         onOffStr((p^.mode.mFlags and MFLG_ECHO) <> 0)]));
+  shellSPutZ(Format('%12s: %s'#10, ['eqp',          azBool[p^.mode.autoEQP and 3]]));
+  if p^.mode.autoExplain <> 0 then
+    shellSPutZ(Format('%12s: %s'#10, ['explain',    'auto']))
+  else
+    shellSPutZ(Format('%12s: %s'#10, ['explain',    'off']));
   shellSPutZ(Format('%12s: %s'#10, ['headers',      onOffStr(p^.mode.spec.bTitles <> 0)]));
   shellSPutZ(Format('%12s: %s'#10, ['mode',         StrPas(@aModeInfo[p^.mode.eMode].zName[0])]));
   shellSPutZ(Format('%12s: "%s"'#10, ['nullvalue',  specStr(p^.mode.spec.zNull)]));
   shellSPutZ(Format('%12s: "%s"'#10, ['colseparator', specStr(p^.mode.spec.zColumnSep)]));
   shellSPutZ(Format('%12s: "%s"'#10, ['rowseparator', specStr(p^.mode.spec.zRowSep)]));
+  case p^.statsOn of
+    0: shellSPutZ(Format('%12s: %s'#10, ['stats', 'off']));
+    2: shellSPutZ(Format('%12s: %s'#10, ['stats', 'stmt']));
+    3: shellSPutZ(Format('%12s: %s'#10, ['stats', 'vmstep']));
+  else
+    shellSPutZ(Format('%12s: %s'#10, ['stats', 'on']));
+  end;
+  widths := '';
+  for i := 0 to p^.mode.spec.nWidth - 1 do
+    widths := widths + IntToStr(p^.mode.spec.aWidth[i]) + ' ';
+  shellSPutZ(Format('%12s: %s'#10, ['width', widths]));
   shellSPutZ(Format('%12s: %s'#10, ['filename',     fn]));
 end;
 
@@ -1468,6 +1500,400 @@ begin
   runStatementVerbose(p, sql);
 end;
 
+{ ----------------------------------------------------------------------
+  10.1.29 — `.timer on|off|once`  (shell.c.in:11886..11901)
+
+  Sets ShellState.enableTimer to 0/1/2.  The wall-clock probe itself is
+  not yet wired into stepAndRender; this lands the setter so the
+  `.show` / round-trip parity tests behave correctly. }
+
+procedure cmdTimer(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+begin
+  if nArg < 1 then begin
+    shellEPutZ('Usage: .timer on|off|once'#10);
+    Exit;
+  end;
+  if args[0] = 'once' then p^.enableTimer := 1
+  else p^.enableTimer := 2 * parseOnOff(args[0], 0);
+end;
+
+{ 10.1.30 — `.eqp off|on|trace|trigger|full`  (shell.c.in:9479..9504) }
+
+procedure cmdEqp(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+begin
+  if nArg < 1 then begin
+    shellEPutZ('Usage: .eqp off|on|trace|trigger|full'#10);
+    Exit;
+  end;
+  if p^.mode.autoEQPtrace <> 0 then begin
+    if p^.db <> nil then sqlite3_exec(p^.db, 'PRAGMA vdbe_trace=OFF;', nil, nil, nil);
+    p^.mode.autoEQPtrace := 0;
+  end;
+  if args[0] = 'full' then p^.mode.autoEQP := AUTOEQP_full
+  else if args[0] = 'trigger' then p^.mode.autoEQP := AUTOEQP_trigger
+  else if args[0] = 'trace' then begin
+    p^.mode.autoEQP := AUTOEQP_full;
+    p^.mode.autoEQPtrace := 1;
+    openDb(p, 0);
+    if p^.db <> nil then begin
+      sqlite3_exec(p^.db, 'SELECT name FROM sqlite_schema LIMIT 1', nil, nil, nil);
+      sqlite3_exec(p^.db, 'PRAGMA vdbe_trace=ON;', nil, nil, nil);
+    end;
+  end else
+    p^.mode.autoEQP := u8(parseOnOff(args[0], 0));
+end;
+
+{ 10.1.31 — `.explain auto|on|off`  (shell.c.in:9515..9523) }
+
+procedure cmdExplain(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+begin
+  if nArg < 1 then begin
+    p^.mode.autoExplain := 1;
+    Exit;
+  end;
+  if args[0] = 'auto' then p^.mode.autoExplain := 1
+  else p^.mode.autoExplain := u8(parseOnOff(args[0], 0));
+end;
+
+{ 10.1.34 — `.shell` / `.system COMMAND ...`  (shell.c.in:11243..11264).
+  Concatenate args (quoting any token that contains a space), pass to
+  the underlying shell via libc system().  Mirrors the upstream
+  "System command returns N" stderr breadcrumb on non-zero exit. }
+
+procedure cmdShell(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+var
+  zCmd, tok: AnsiString;
+  i, x: i32;
+begin
+  if nArg < 1 then begin
+    shellEPutZ('Usage: .system COMMAND'#10);
+    Exit;
+  end;
+  zCmd := '';
+  for i := 0 to nArg - 1 do begin
+    if Pos(' ', args[i]) > 0 then tok := '"' + args[i] + '"' else tok := args[i];
+    if i = 0 then zCmd := tok else zCmd := zCmd + ' ' + tok;
+  end;
+  x := fpsystem(zCmd);
+  if x <> 0 then shellEPutZ(Format('System command returns %d'#10, [x]));
+end;
+
+{ 10.1.35 — `.cd DIRECTORY`  (shell.c.in:9127..9145) }
+
+procedure cmdCd(const args: array of AnsiString; nArg: SizeInt);
+var rc: i32;
+begin
+  if nArg <> 1 then begin
+    shellEPutZ('Usage: .cd DIRECTORY'#10);
+    Exit;
+  end;
+  rc := FpChdir(PAnsiChar(args[0]));
+  if rc <> 0 then
+    shellEPutZ(Format('Cannot change to directory "%s"'#10, [args[0]]));
+end;
+
+{ 10.1.36 — `.log FILENAME|on|off`  (shell.c.in:10091..10109).
+
+  Records the destination so `.show` and future logger plumbing have
+  a stable view.  Actually wiring SQLITE_CONFIG_LOG is gated on the
+  raw-varargs sqlite3_config port (out of phase-10 scope). }
+
+procedure cmdLog(const args: array of AnsiString; nArg: SizeInt);
+begin
+  if nArg <> 1 then begin
+    shellEPutZ('Usage: .log FILENAME'#10);
+    Exit;
+  end;
+  if args[0] = 'on' then zLogFile := 'stdout'
+  else zLogFile := args[0];
+end;
+
+{ 10.1.49 — `.dbinfo ?DB?`  (shell.c.in:5485..5575).  Reads the 100-byte
+  page-1 header via sqlite_dbpage(?), prints the named integer fields,
+  then runs the small set of count queries against sqlite_schema. }
+
+procedure cmdDbinfo(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+const
+  fieldName: array[0..11] of AnsiString = (
+    'file change counter:', 'database page count:', 'freelist page count:',
+    'schema cookie:', 'schema format:', 'default cache size:',
+    'autovacuum top root:', 'incremental vacuum:', 'text encoding:',
+    'user version:', 'application id:', 'software version:');
+  fieldOfst: array[0..11] of i32 =
+    (24, 28, 36, 40, 44, 48, 52, 64, 56, 60, 68, 96);
+  qName: array[0..4] of AnsiString = (
+    'number of tables:',  'number of indexes:', 'number of triggers:',
+    'number of views:',   'schema size:');
+  qSql: array[0..4] of AnsiString = (
+    'SELECT count(*) FROM %s WHERE type=''table''',
+    'SELECT count(*) FROM %s WHERE type=''index''',
+    'SELECT count(*) FROM %s WHERE type=''trigger''',
+    'SELECT count(*) FROM %s WHERE type=''view''',
+    'SELECT total(length(sql)) FROM %s');
+var
+  zDb, zSchemaTab, zSql: AnsiString;
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc, i, val, pageSz: i32;
+  iDataVer: u32;
+  pBlob, pHdr: PByte;
+  aHdr: array[0..99] of Byte;
+begin
+  if nArg >= 1 then zDb := args[0] else zDb := 'main';
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db,
+        'SELECT data FROM sqlite_dbpage(?1) WHERE pgno=1',
+        -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    shellEPutZ(Format('error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    Exit;
+  end;
+  sqlite3_bind_text(pStmt, 1, PAnsiChar(zDb), -1, SQLITE_STATIC);
+  if (sqlite3_step(pStmt) = SQLITE_ROW)
+     and (sqlite3_column_bytes(pStmt, 0) >= 100) then
+  begin
+    pBlob := PByte(sqlite3_column_blob(pStmt, 0));
+    Move(pBlob^, aHdr[0], 100);
+    sqlite3_finalize(pStmt);
+  end else begin
+    shellEPutZ('unable to read database header'#10);
+    sqlite3_finalize(pStmt);
+    Exit;
+  end;
+  pageSz := (i32(aHdr[16]) shl 8) or i32(aHdr[17]);
+  if pageSz = 1 then pageSz := 65536;
+  shellSPutZ(Format('%-20s %d'#10, ['database page size:', pageSz]));
+  shellSPutZ(Format('%-20s %d'#10, ['write format:',       aHdr[18]]));
+  shellSPutZ(Format('%-20s %d'#10, ['read format:',        aHdr[19]]));
+  shellSPutZ(Format('%-20s %d'#10, ['reserved bytes:',     aHdr[20]]));
+  for i := 0 to High(fieldOfst) do begin
+    pHdr := @aHdr[fieldOfst[i]];
+    val := (i32(pHdr[0]) shl 24) or (i32(pHdr[1]) shl 16)
+        or (i32(pHdr[2]) shl 8)  or i32(pHdr[3]);
+    Write(Format('%-20s %u', [fieldName[i], u32(val)]));
+    if fieldOfst[i] = 56 then begin
+      case val of
+        1: Write(' (utf8)');
+        2: Write(' (utf16le)');
+        3: Write(' (utf16be)');
+      end;
+    end;
+    WriteLn;
+  end;
+  if zDb = 'temp' then zSchemaTab := 'sqlite_temp_schema'
+  else zSchemaTab := '"' + StringReplace(zDb, '"', '""', [rfReplaceAll]) +
+                    '".sqlite_schema';
+  for i := 0 to High(qSql) do begin
+    zSql := StringReplace(qSql[i], '%s', zSchemaTab, []);
+    val := 0;
+    pStmt := nil;
+    rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zSql), -1, @pStmt, @pzTail);
+    if (rc = SQLITE_OK) and (pStmt <> nil)
+       and (sqlite3_step(pStmt) = SQLITE_ROW) then
+      val := sqlite3_column_int(pStmt, 0);
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    shellSPutZ(Format('%-20s %d'#10, [qName[i], val]));
+  end;
+  iDataVer := 0;
+  sqlite3_file_control(p^.db, PAnsiChar(zDb),
+                       SQLITE_FCNTL_DATA_VERSION, @iDataVer);
+  shellSPutZ(Format('%-20s %u'#10, ['data version', iDataVer]));
+end;
+
+{ 10.1.53 — `.crnl ?on|off?`  (shell.c.in:9223..9240).  CRLF translation
+  is a Windows-only feature; on Linux the flag stays cleared, but we
+  echo the current state to mirror upstream. }
+
+procedure cmdCrnl(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+begin
+  if nArg >= 1 then
+    p^.mode.mFlags := p^.mode.mFlags and not MFLG_CRLF;
+  if (p^.mode.mFlags and MFLG_CRLF) <> 0 then shellEPutZ('crlf is ON'#10)
+  else shellEPutZ('crlf is OFF'#10);
+end;
+
+{ 10.1.54 — `.binary` deprecated stub  (shell.c.in:9114..9117) }
+
+procedure cmdBinary;
+begin
+  shellEPutZ('The ".binary" command is deprecated.'#10);
+end;
+
+{ 10.1.59 — `.breakpoint` debug-only no-op  (shell.c.in:9119..9123) }
+
+procedure cmdBreakpoint;
+begin
+  { test_breakpoint() in C is a no-op kept for gdb to attach a hook.
+    We deliberately leave it empty in Pascal as well. }
+end;
+
+{ 10.1.10 follow-up — `.width N1 N2 ...`  (shell.c.in:12047..12058).
+  Stores the parsed widths in the unit-level aUserWidth backing array
+  and points spec.aWidth/spec.nWidth at it. }
+
+const
+  QRF_MAX_WIDTH = 32767;
+
+procedure cmdWidth(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+var
+  j: SizeInt;
+  w: i64;
+begin
+  SetLength(aUserWidth, nArg);
+  for j := 0 to nArg - 1 do begin
+    w := StrToInt64Def(args[j], 0);
+    if w < -QRF_MAX_WIDTH then w := -QRF_MAX_WIDTH;
+    if w >  QRF_MAX_WIDTH then w :=  QRF_MAX_WIDTH;
+    aUserWidth[j] := SmallInt(w);
+  end;
+  p^.mode.spec.nWidth := nArg;
+  if nArg > 0 then p^.mode.spec.aWidth := @aUserWidth[0]
+  else p^.mode.spec.aWidth := nil;
+end;
+
+{ 10.1.11 — `.parameter init|list|set|unset|clear`  (shell.c.in:10264..10367).
+
+  Bind-parameter table lives in TEMP.sqlite_parameters; the upstream
+  defensive/writable_schema toggles around bind_table_init are skipped
+  here — defensive mode is not engaged in this Pascal cut. }
+
+procedure paramTableInit(p: PShellState);
+const
+  { Upstream emits WITHOUT ROWID here, but the Pascal port's WITHOUT ROWID
+    arm is not yet wired (writes corrupt the page).  Plain rowid table is
+    behaviourally equivalent for the bind-parameter use case. }
+  zCreate: PAnsiChar =
+    'CREATE TABLE IF NOT EXISTS temp.sqlite_parameters('#10 +
+    '  key TEXT PRIMARY KEY,'#10 +
+    '  value'#10 +
+    ');';
+begin
+  if p^.db = nil then Exit;
+  sqlite3_exec(p^.db, zCreate, nil, nil, nil);
+end;
+
+function looksLikeSqlLiteral(const z: AnsiString): Boolean;
+{ Cheap classifier: does z appear to be a SQL literal (number / keyword /
+  X'...' blob / quoted string) versus a bare bareword that would parse
+  as a column reference?  Used by paramSet to decide whether to wrap. }
+var i: SizeInt; c: AnsiChar; up: AnsiString;
+begin
+  Result := False;
+  if z = '' then Exit;
+  c := z[1];
+  if (c in ['+', '-', '.']) or (c in ['0'..'9']) then begin Result := True; Exit; end;
+  if (c = '''') or (c = '"') then begin Result := True; Exit; end;
+  if ((c = 'x') or (c = 'X')) and (Length(z) >= 2) and (z[2] = '''') then begin
+    Result := True; Exit;
+  end;
+  up := UpperCase(z);
+  if (up = 'NULL') or (up = 'TRUE') or (up = 'FALSE') then begin
+    Result := True; Exit;
+  end;
+  i := 1;  { allow 0xDEAD-style hex, signed/unsigned numeric, etc. handled above }
+  Result := False;
+end;
+
+procedure paramSet(p: PShellState; const zKey, zValue: AnsiString);
+{ Mirrors shell.c.in:10319..10352.  When the caller's value looks like a
+  SQL literal (digit / quote / NULL / X'...') we splice it directly into
+  the VALUES clause; otherwise it is quoted as text.  This avoids the
+  upstream behaviour where a bare bareword silently binds NULL via the
+  "double-quote-as-string" quirk. }
+var
+  zSql, escKey: AnsiString;
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc: i32;
+begin
+  paramTableInit(p);
+  escKey := StringReplace(zKey, '''', '''''', [rfReplaceAll]);
+  if looksLikeSqlLiteral(zValue) then
+    zSql := 'REPLACE INTO temp.sqlite_parameters(key,value) VALUES(''' +
+            escKey + ''',' + zValue + ')'
+  else
+    zSql := 'REPLACE INTO temp.sqlite_parameters(key,value) VALUES(''' +
+            escKey + ''',''' +
+            StringReplace(zValue, '''', '''''', [rfReplaceAll]) + ''')';
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zSql), -1, @pStmt, @pzTail);
+  if rc <> SQLITE_OK then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    pStmt := nil;
+    zSql := 'REPLACE INTO temp.sqlite_parameters(key,value) VALUES(''' +
+            escKey + ''',''' +
+            StringReplace(zValue, '''', '''''', [rfReplaceAll]) + ''')';
+    rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zSql), -1, @pStmt, @pzTail);
+    if rc <> SQLITE_OK then begin
+      shellSPutZ(Format('Error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+      if pStmt <> nil then sqlite3_finalize(pStmt);
+      Exit;
+    end;
+  end;
+  sqlite3_step(pStmt);
+  sqlite3_finalize(pStmt);
+end;
+
+procedure cmdParameter(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+var
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc, len: i32;
+  zSql: AnsiString;
+begin
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+  if (nArg = 1) and (args[0] = 'clear') then begin
+    sqlite3_exec(p^.db, 'DROP TABLE IF EXISTS temp.sqlite_parameters;',
+                 nil, nil, nil);
+    Exit;
+  end;
+  if (nArg = 1) and (args[0] = 'init') then begin
+    paramTableInit(p);
+    Exit;
+  end;
+  if (nArg = 1) and (args[0] = 'list') then begin
+    pStmt := nil;
+    len := 0;
+    rc := sqlite3_prepare_v2(p^.db,
+            'SELECT max(length(key)) FROM temp.sqlite_parameters;',
+            -1, @pStmt, @pzTail);
+    if (rc = SQLITE_OK) and (pStmt <> nil)
+       and (sqlite3_step(pStmt) = SQLITE_ROW) then begin
+      len := sqlite3_column_int(pStmt, 0);
+      if len > 40 then len := 40;
+    end;
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    if len > 0 then begin
+      pStmt := nil;
+      rc := sqlite3_prepare_v2(p^.db,
+              'SELECT key, quote(value) FROM temp.sqlite_parameters;',
+              -1, @pStmt, @pzTail);
+      while (rc = SQLITE_OK) and (pStmt <> nil)
+            and (sqlite3_step(pStmt) = SQLITE_ROW) do
+        shellSPutZ(Format('%-*s %s'#10,
+          [len, AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 0))),
+                AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 1)))]));
+      if pStmt <> nil then sqlite3_finalize(pStmt);
+    end;
+    Exit;
+  end;
+  if (nArg = 3) and (args[0] = 'set') then begin
+    paramSet(p, args[1], args[2]);
+    Exit;
+  end;
+  if (nArg = 2) and (args[0] = 'unset') then begin
+    zSql := 'DELETE FROM temp.sqlite_parameters WHERE key=''' +
+            StringReplace(args[1], '''', '''''', [rfReplaceAll]) + '''';
+    sqlite3_exec(p^.db, PAnsiChar(zSql), nil, nil, nil);
+    Exit;
+  end;
+  shellEPutZ('Usage: .parameter init|list|set|unset|clear ?ARGS?'#10);
+end;
+
 function doMetaCommand(const zLine: AnsiString; p: PShellState): i32;
 var
   zCmd: AnsiString;
@@ -1494,6 +1920,20 @@ begin
   if zCmd = 'indexes'   then begin cmdIndexes(p, args, nArg); Exit; end;
   if zCmd = 'databases' then begin cmdDatabases(p); Exit; end;
   if zCmd = 'schema'    then begin cmdSchema(p, args, nArg); Exit; end;
+  if zCmd = 'timer'     then begin cmdTimer(p, args, nArg); Exit; end;
+  if zCmd = 'eqp'       then begin cmdEqp(p, args, nArg); Exit; end;
+  if zCmd = 'explain'   then begin cmdExplain(p, args, nArg); Exit; end;
+  if (zCmd = 'shell') or (zCmd = 'system') then begin
+    cmdShell(p, args, nArg); Exit;
+  end;
+  if zCmd = 'cd'        then begin cmdCd(args, nArg); Exit; end;
+  if zCmd = 'log'       then begin cmdLog(args, nArg); Exit; end;
+  if zCmd = 'dbinfo'    then begin cmdDbinfo(p, args, nArg); Exit; end;
+  if (zCmd = 'crlf') or (zCmd = 'crnl') then begin cmdCrnl(p, args, nArg); Exit; end;
+  if zCmd = 'binary'    then begin cmdBinary; Result := 1; Exit; end;
+  if zCmd = 'breakpoint' then begin cmdBreakpoint; Exit; end;
+  if zCmd = 'width'     then begin cmdWidth(p, args, nArg); Exit; end;
+  if zCmd = 'parameter' then begin cmdParameter(p, args, nArg); Exit; end;
   if zCmd = 'print' then begin
     for i := 0 to nArg - 1 do begin
       if i > 0 then Write(' ');
