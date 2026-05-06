@@ -770,11 +770,26 @@ existing dispatcher.
        / Split / Psql / Count fall through to a pipe-delimited
        fallback so the REPL stays usable; full QRF wiring lands when
        the QRF unit ports.
-  [ ] **10.1.9** Columnar renderers — `MODE_Column`, `MODE_Table`,
-       `MODE_Markdown`, `MODE_Box`.  Column-width auto-sizing,
-       `utf8_width` / `utf8_printf` helpers, box-drawing glyphs.
-       (Markdown + naive Column landed under 10.1.8; auto-width Table
-       and Box still pending.)
+  [X] **10.1.9** Columnar renderers — `MODE_Column`, `MODE_Table`,
+       `MODE_Markdown`, `MODE_Box`.  Buffered renderer (`emitColumnar`,
+       passqlite3shell.pas) computes per-column max display widths from
+       header + every row, honours `.width` minimums, then emits.
+       `utf8DispWidth` counts non-continuation UTF-8 bytes (one glyph
+       per code point); CJK wide-char support arrives with the full QRF
+       port.  Glyph sets: Box uses Unicode box-drawing (┌ ─ ┬ ┐ │ ├ ┼ ┤
+       └ ┴ ┘); Table uses MySQL-style `+ -- |`; Markdown uses pipes with
+       a `|---|` separator row; Column has no borders, two spaces between
+       columns and a `---` underline under each header.  Headers are
+       centered in Box / Table / Markdown, left-aligned in Column.
+       MODE_Line auto-width also closed (was hard-coded `width=20`; now
+       uses max column-name length + 1 like upstream).  Verification
+       (2026-05-06): 12-cell mode×headers matrix (column / table / box
+       / list / line / markdown × on / off) + edge-case suite (empty
+       result, single-column, NULL+nullvalue, .width override, long
+       values, UTF-8 data, multi-statement) all byte-identical to system
+       sqlite3.  TestExplainParity 1026/1026; DiagFeatureProbe / DiagDml
+       / DiagMisc / DiagTxn / DiagOps / DiagPragma / DiagDropTable green;
+       DiagWindow 2 divergences (pre-existing, unrelated).
   [X] **10.1.10** `.headers` / `.separator` / `.nullvalue` / `.echo`
        / `.changes` / `.width` setters landed in doMetaCommand.
        AnsiString backing for the PAnsiChar fields lives in unit-level

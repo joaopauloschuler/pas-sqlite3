@@ -882,12 +882,33 @@ type
     zColSep:     AnsiString;
     zRowSep:     AnsiString;
     insertTab:   AnsiString;        { MODE_Insert only }
+    lastStepRc:  i32;               { final step rc when columnar buffers }
+    lineMaxNameLen: i32;            { MODE_Line auto-width; 0 = uncomputed }
   end;
   PRenderState = ^TRenderState;
 
 function specStr(z: PAnsiChar): AnsiString; inline;
 begin
   if z = nil then Result := '' else Result := AnsiString(z);
+end;
+
+function utf8DispWidth(const s: AnsiString): i32;
+{ Approximate display width: count non-continuation UTF-8 bytes (one
+  glyph per code point, all glyphs treated as width 1).  Good enough
+  for ASCII / Latin / Greek / Cyrillic; CJK wide-char support arrives
+  with the full QRF port. }
+var
+  i, n: i32;
+  b: Byte;
+begin
+  n := 0;
+  i := 1;
+  while i <= Length(s) do begin
+    b := Byte(s[i]);
+    if (b and $C0) <> $80 then Inc(n);
+    Inc(i);
+  end;
+  Result := n;
 end;
 
 procedure renderInit(var rs: TRenderState; p: PShellState; pStmt: PVdbe);
@@ -903,6 +924,8 @@ begin
     rs.insertTab := AnsiString(p^.zDestTable)
   else
     rs.insertTab := 'table';
+  rs.lastStepRc      := SQLITE_DONE;
+  rs.lineMaxNameLen  := 0;
 end;
 
 function colNameStr(pStmt: PVdbe; i: i32): AnsiString; inline;
@@ -988,9 +1011,15 @@ begin
 
     MODE_Line:
       begin
+        if rs.lineMaxNameLen = 0 then begin
+          for i := 0 to rs.nCol - 1 do begin
+            ty := utf8DispWidth(colNameStr(pStmt, i));
+            if ty > rs.lineMaxNameLen then rs.lineMaxNameLen := ty;
+          end;
+        end;
         for i := 0 to rs.nCol - 1 do begin
           z := colTextStr(pStmt, i, isNull);
-          Write(Format('%*s = ', [20, colNameStr(pStmt, i)]));
+          Write(Format('%*s = ', [rs.lineMaxNameLen + 1, colNameStr(pStmt, i)]));
           if isNull then Write(rs.zNull) else Write(z);
           WriteLn;
         end;
@@ -1148,6 +1177,247 @@ begin
   end;
 end;
 
+{ ----------------------------------------------------------------------
+  10.1.9  Columnar renderers — MODE_Column, MODE_Table, MODE_Box.
+
+  These three modes need to know the maximum width of every column
+  before emitting the first row, so we buffer the result set into an
+  AnsiString matrix, scan it to compute per-column widths, then emit.
+
+  utf8DispWidth approximates display width by counting non-continuation
+  UTF-8 bytes (each glyph counted as width 1).  This matches upstream's
+  pre-3.50 behaviour and is good enough for ASCII / Latin-1 / typical
+  Greek / Cyrillic content; CJK wide-character support arrives with the
+  full QRF port.
+
+  Box-drawing glyphs are the upstream Unicode set:
+    ┌ ─ ┬ ┐  │   ├ ┼ ┤   └ ┴ ┘
+  Table mode mirrors MySQL: + and - and | only.
+  ---------------------------------------------------------------------- }
+
+procedure padCell(const s: AnsiString; w: i32);
+{ Write `s` followed by enough spaces to fill `w` display columns. }
+var pad: i32;
+begin
+  Write(s);
+  pad := w - utf8DispWidth(s);
+  if pad > 0 then Write(StringOfChar(' ', pad));
+end;
+
+function colCellText(pStmt: PVdbe; i: i32; const zNull: AnsiString): AnsiString;
+var
+  isNull: Boolean;
+  z: AnsiString;
+begin
+  z := colTextStr(pStmt, i, isNull);
+  if isNull then Result := zNull else Result := z;
+end;
+
+procedure emitColumnar(var rs: TRenderState; pStmt: PVdbe; firstRow: AnsiString);
+{ Buffer all remaining rows (`firstRow` already consumed via column-text
+  capture) and emit per-mode in MODE_Column / MODE_Table / MODE_Box.
+  `firstRow` is unused — kept for signature symmetry; the caller passes
+  '' and we read the current row from pStmt before stepping further. }
+var
+  matrix: array of array of AnsiString;
+  headers: array of AnsiString;
+  widths: array of i32;
+  i, c, w, rc, nCol: i32;
+  nRowBuf: i32;
+  rcStep: i32;
+  isBox, isTable, isCol, isMd: Boolean;
+  glyphTL, glyphTR, glyphBL, glyphBR: AnsiString;
+  glyphHB, glyphVB, glyphCx, glyphTU, glyphTD, glyphTL2, glyphTR2: AnsiString;
+  rowSep, hdrSep, footSep: AnsiString;
+  sb: AnsiString;
+  align: i32;
+begin
+  if firstRow = '' then ; { unused }
+  nCol := rs.nCol;
+  isBox   := rs.p^.mode.eMode = MODE_Box;
+  isTable := rs.p^.mode.eMode = MODE_Table;
+  isCol   := rs.p^.mode.eMode = MODE_Column;
+  isMd    := rs.p^.mode.eMode = MODE_Markdown;
+
+  SetLength(headers, nCol);
+  SetLength(widths,  nCol);
+  for i := 0 to nCol - 1 do begin
+    headers[i] := colNameStr(pStmt, i);
+    widths[i]  := utf8DispWidth(headers[i]);
+  end;
+
+  { User-supplied minimum widths via .width.  C uses the absolute value
+    for the cell padding; sign decides alignment (negative = left).
+    We honour magnitude here; alignment defaults match upstream
+    (text=left, numeric=right) but our per-cell text capture is
+    type-erased after sqlite3_column_text, so simplify to left-align
+    for now (matches upstream's MODE_Column when no .width is set). }
+  for i := 0 to nCol - 1 do
+    if (rs.p^.mode.spec.aWidth <> nil) and (i < rs.p^.mode.spec.nWidth) then begin
+      w := Abs(rs.p^.mode.spec.aWidth[i]);
+      if w > widths[i] then widths[i] := w;
+    end;
+
+  { Buffer rows.  Start with the row already at pStmt (caller stepped to
+    SQLITE_ROW once, then handed off without emitting). }
+  nRowBuf := 0;
+  SetLength(matrix, 16);
+  SetLength(matrix[0], nCol);
+  for c := 0 to nCol - 1 do begin
+    matrix[0, c] := colCellText(pStmt, c, rs.zNull);
+    w := utf8DispWidth(matrix[0, c]);
+    if w > widths[c] then widths[c] := w;
+  end;
+  nRowBuf := 1;
+
+  while True do begin
+    rcStep := sqlite3_step(pStmt);
+    if rcStep <> SQLITE_ROW then Break;
+    if nRowBuf >= Length(matrix) then SetLength(matrix, Length(matrix) * 2);
+    SetLength(matrix[nRowBuf], nCol);
+    for c := 0 to nCol - 1 do begin
+      matrix[nRowBuf, c] := colCellText(pStmt, c, rs.zNull);
+      w := utf8DispWidth(matrix[nRowBuf, c]);
+      if w > widths[c] then widths[c] := w;
+    end;
+    Inc(nRowBuf);
+  end;
+  rs.lastStepRc := rcStep;
+
+  { Glyphs. }
+  if isBox then begin
+    glyphTL  := #$E2#$94#$8C; { ┌ }
+    glyphTR  := #$E2#$94#$90; { ┐ }
+    glyphBL  := #$E2#$94#$94; { └ }
+    glyphBR  := #$E2#$94#$98; { ┘ }
+    glyphHB  := #$E2#$94#$80; { ─ }
+    glyphVB  := #$E2#$94#$82; { │ }
+    glyphCx  := #$E2#$94#$BC; { ┼ }
+    glyphTU  := #$E2#$94#$B4; { ┴ }
+    glyphTD  := #$E2#$94#$AC; { ┬ }
+    glyphTL2 := #$E2#$94#$9C; { ├ }
+    glyphTR2 := #$E2#$94#$A4; { ┤ }
+  end else if isTable then begin
+    glyphTL := '+'; glyphTR := '+'; glyphBL := '+'; glyphBR := '+';
+    glyphHB := '-'; glyphVB := '|';
+    glyphCx := '+'; glyphTU := '+'; glyphTD := '+';
+    glyphTL2 := '+'; glyphTR2 := '+';
+  end else if isMd then begin
+    { Markdown — pipe borders, no top/bottom rules; the only horizontal
+      rule sits between header and rows and uses '-'. }
+    glyphTL := ''; glyphTR := ''; glyphBL := ''; glyphBR := '';
+    glyphHB := '-'; glyphVB := '|';
+    glyphCx := '|'; glyphTU := ''; glyphTD := '';
+    glyphTL2 := '|'; glyphTR2 := '|';
+  end else begin
+    { Column mode — no borders. }
+    glyphTL := ''; glyphTR := ''; glyphBL := ''; glyphBR := '';
+    glyphHB := '-'; glyphVB := '';
+    glyphCx := ''; glyphTU := ''; glyphTD := '';
+    glyphTL2 := ''; glyphTR2 := '';
+  end;
+
+  { Helper to build the horizontal rule between rows (Box / Table). }
+  align := 0;
+  if align = 0 then ; { unused }
+
+  if isBox or isTable then begin
+    sb := glyphTL;
+    for c := 0 to nCol - 1 do begin
+      if c > 0 then sb := sb + glyphTD;
+      for i := 0 to widths[c] + 1 do sb := sb + glyphHB;
+    end;
+    sb := sb + glyphTR;
+    rowSep := sb;
+
+    sb := glyphTL2;
+    for c := 0 to nCol - 1 do begin
+      if c > 0 then sb := sb + glyphCx;
+      for i := 0 to widths[c] + 1 do sb := sb + glyphHB;
+    end;
+    sb := sb + glyphTR2;
+    hdrSep := sb;
+
+    sb := glyphBL;
+    for c := 0 to nCol - 1 do begin
+      if c > 0 then sb := sb + glyphTU;
+      for i := 0 to widths[c] + 1 do sb := sb + glyphHB;
+    end;
+    sb := sb + glyphBR;
+    footSep := sb;
+  end else if isMd then begin
+    sb := glyphTL2;
+    for c := 0 to nCol - 1 do begin
+      if c > 0 then sb := sb + glyphCx;
+      for i := 0 to widths[c] + 1 do sb := sb + glyphHB;
+    end;
+    sb := sb + glyphTR2;
+    hdrSep := sb;
+    rowSep := '';
+    footSep := '';
+  end else begin
+    rowSep := '';
+    hdrSep := '';
+    footSep := '';
+  end;
+
+  { Emit. }
+  if isBox or isTable then WriteLn(rowSep);
+
+  if rs.headersOn or isBox or isTable or isMd then begin
+    if isBox or isTable or isMd then begin
+      Write(glyphVB);
+      for c := 0 to nCol - 1 do begin
+        if c > 0 then Write(glyphVB);
+        Write(' ');
+        { Header text centered for Box / Table / Markdown. }
+        w := widths[c] - utf8DispWidth(headers[c]);
+        if w > 0 then Write(StringOfChar(' ', w div 2));
+        Write(headers[c]);
+        if w > 0 then Write(StringOfChar(' ', w - (w div 2)));
+        Write(' ');
+      end;
+      WriteLn(glyphVB);
+      WriteLn(hdrSep);
+    end else begin
+      { MODE_Column header row. }
+      for c := 0 to nCol - 1 do begin
+        if c > 0 then Write('  ');
+        padCell(headers[c], widths[c]);
+      end;
+      WriteLn;
+      for c := 0 to nCol - 1 do begin
+        if c > 0 then Write('  ');
+        Write(StringOfChar('-', widths[c]));
+      end;
+      WriteLn;
+    end;
+  end;
+
+  for rc := 0 to nRowBuf - 1 do begin
+    if isBox or isTable or isMd then begin
+      Write(glyphVB);
+      for c := 0 to nCol - 1 do begin
+        if c > 0 then Write(glyphVB);
+        Write(' ');
+        padCell(matrix[rc, c], widths[c]);
+        Write(' ');
+      end;
+      WriteLn(glyphVB);
+    end else begin
+      for c := 0 to nCol - 1 do begin
+        if c > 0 then Write('  ');
+        padCell(matrix[rc, c], widths[c]);
+      end;
+      WriteLn;
+    end;
+  end;
+
+  if isBox or isTable then WriteLn(footSep);
+
+  rs.rowsEmitted := nRowBuf;
+end;
+
 function stepAndRender(p: PShellState; pStmt: PVdbe): i32;
 { Step the prepared statement to completion, dispatching SQLITE_ROW
   through the per-mode renderer.  Returns the final step rc (DONE / err). }
@@ -1155,8 +1425,25 @@ var
   rs: TRenderState;
   headerEmitted: Boolean;
   rc: i32;
+  isColumnar: Boolean;
 begin
   renderInit(rs, p, pStmt);
+  rs.lastStepRc := SQLITE_DONE;
+  isColumnar := (p^.mode.eMode = MODE_Column)
+             or (p^.mode.eMode = MODE_Table)
+             or (p^.mode.eMode = MODE_Box)
+             or (p^.mode.eMode = MODE_Markdown);
+
+  if isColumnar then begin
+    rc := sqlite3_step(pStmt);
+    if rc = SQLITE_ROW then begin
+      emitColumnar(rs, pStmt, '');
+      Result := rs.lastStepRc;
+    end else
+      Result := rc;
+    Exit;
+  end;
+
   headerEmitted := False;
   while True do begin
     rc := sqlite3_step(pStmt);
