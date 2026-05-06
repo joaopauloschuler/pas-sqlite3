@@ -4133,6 +4133,363 @@ begin
 end;
 
 { ----------------------------------------------------------------------
+  10.1.51 — `.filectrl CMD ...`  (shell.c.in:9539..9690)
+
+  Dispatches sqlite3_file_control() through a name-prefix-matched table
+  of opcodes.  Mirrors the upstream `aCtrl[]` ordering so `--help`
+  output is byte-identical, and returns the integer / textual result
+  in the same `isOk` / `iRes` shape as C.
+  ---------------------------------------------------------------------- }
+
+type
+  TFilectrlEntry = record
+    zName:  PAnsiChar;
+    code:   i32;
+    zUsage: PAnsiChar;
+  end;
+
+const
+  aFilectrl: array[0..8] of TFilectrlEntry = (
+    (zName: 'chunk_size';     code: SQLITE_FCNTL_CHUNK_SIZE;          zUsage: 'SIZE'),
+    (zName: 'data_version';   code: SQLITE_FCNTL_DATA_VERSION;        zUsage: ''),
+    (zName: 'has_moved';      code: SQLITE_FCNTL_HAS_MOVED;           zUsage: ''),
+    (zName: 'lock_timeout';   code: SQLITE_FCNTL_LOCK_TIMEOUT;        zUsage: 'MILLISEC'),
+    (zName: 'persist_wal';    code: SQLITE_FCNTL_PERSIST_WAL;         zUsage: '[BOOLEAN]'),
+    (zName: 'psow';           code: SQLITE_FCNTL_POWERSAFE_OVERWRITE; zUsage: '[BOOLEAN]'),
+    (zName: 'reserve_bytes';  code: SQLITE_FCNTL_RESERVE_BYTES;       zUsage: '[N]'),
+    (zName: 'size_limit';     code: SQLITE_FCNTL_SIZE_LIMIT;          zUsage: '[LIMIT]'),
+    (zName: 'tempfilename';   code: SQLITE_FCNTL_TEMPFILENAME;        zUsage: '')
+  );
+
+procedure cmdFilectrl(p: PShellState; const args: array of AnsiString;
+                      nArg: SizeInt);
+var
+  zCmd, zSchema: AnsiString;
+  zCmdC: AnsiString;
+  i, n2, iCtrl: SizeInt;
+  filectrl: i32;
+  iRes: i64;
+  isOk: i32;
+  iVal: i32;
+  iLong: i64;
+  zRet: PAnsiChar;
+  bShifted: Boolean;
+begin
+  openDb(p, 0);
+  if nArg >= 1 then zCmd := args[0] else zCmd := 'help';
+  zSchema := '';
+  bShifted := False;
+
+  { --schema option: `.filectrl --schema NAME CMD ...` re-points the
+    pager target.  Strip the two leading args and continue. }
+  if ((zCmd = '--schema') or (zCmd = '-schema')) and (nArg >= 3) then begin
+    zSchema := args[1];
+    zCmd := args[2];
+    bShifted := True;
+  end;
+
+  { Strip leading single or double dash from the command name. }
+  zCmdC := zCmd;
+  if (Length(zCmdC) >= 2) and (zCmdC[1] = '-') then begin
+    Delete(zCmdC, 1, 1);
+    if (Length(zCmdC) >= 2) and (zCmdC[1] = '-') then Delete(zCmdC, 1, 1);
+  end;
+
+  if zCmdC = 'help' then begin
+    shellSPutZ('Available file-controls:'#10);
+    for i := 0 to High(aFilectrl) do
+      shellSPutZ(Format('  .filectrl %s %s'#10,
+        [AnsiString(aFilectrl[i].zName), AnsiString(aFilectrl[i].zUsage)]));
+    Exit;
+  end;
+
+  { Prefix match.  Ambiguity → error. }
+  filectrl := -1;
+  iCtrl := -1;
+  n2 := Length(zCmdC);
+  for i := 0 to High(aFilectrl) do begin
+    if (n2 > 0) and (StrLComp(PAnsiChar(zCmdC),
+                              aFilectrl[i].zName, n2) = 0) then begin
+      if filectrl < 0 then begin
+        filectrl := aFilectrl[i].code;
+        iCtrl := i;
+      end else begin
+        shellEPutZ(Format('Error: ambiguous file-control: "%s"'#10 +
+          'Use ".filectrl --help" for help'#10, [zCmdC]));
+        Exit;
+      end;
+    end;
+  end;
+  if filectrl < 0 then begin
+    shellEPutZ(Format('Error: unknown file-control: %s'#10 +
+      'Use ".filectrl --help" for help'#10, [zCmdC]));
+    Exit;
+  end;
+
+  { Adjust positional accounting after the optional --schema shift so
+    nArg/args mirror the C arg layout (azArg[0]=".filectrl",
+    azArg[1]=cmd, azArg[2]=value).  In our Pascal call, args[0]=cmd
+    already; if no --schema, args[1] holds value.  If shifted, args[2]
+    holds value.  Normalise iVal-arg index. }
+  iRes := 0;
+  isOk := 0;
+
+  case filectrl of
+    SQLITE_FCNTL_SIZE_LIMIT: begin
+      if bShifted then begin
+        if (nArg <> 3) and (nArg <> 4) then Exit;
+        if nArg = 4 then iLong := StrToInt64Def(args[3], 0) else iLong := -1;
+      end else begin
+        if (nArg <> 1) and (nArg <> 2) then Exit;
+        if nArg = 2 then iLong := StrToInt64Def(args[1], 0) else iLong := -1;
+      end;
+      iRes := iLong;
+      sqlite3_file_control(p^.db, PAnsiChar(zSchema),
+                           SQLITE_FCNTL_SIZE_LIMIT, @iRes);
+      isOk := 1;
+    end;
+    SQLITE_FCNTL_LOCK_TIMEOUT,
+    SQLITE_FCNTL_CHUNK_SIZE: begin
+      if bShifted then begin
+        if nArg <> 4 then Exit;
+        iVal := StrToIntDef(args[3], 0);
+      end else begin
+        if nArg <> 2 then Exit;
+        iVal := StrToIntDef(args[1], 0);
+      end;
+      sqlite3_file_control(p^.db, PAnsiChar(zSchema),
+                           filectrl, @iVal);
+      isOk := 2;
+    end;
+    SQLITE_FCNTL_PERSIST_WAL,
+    SQLITE_FCNTL_POWERSAFE_OVERWRITE: begin
+      if bShifted then begin
+        if (nArg <> 3) and (nArg <> 4) then Exit;
+        if nArg = 4 then iVal := parseOnOff(args[3], -1) else iVal := -1;
+      end else begin
+        if (nArg <> 1) and (nArg <> 2) then Exit;
+        if nArg = 2 then iVal := parseOnOff(args[1], -1) else iVal := -1;
+      end;
+      sqlite3_file_control(p^.db, PAnsiChar(zSchema),
+                           filectrl, @iVal);
+      iRes := iVal;
+      isOk := 1;
+    end;
+    SQLITE_FCNTL_DATA_VERSION,
+    SQLITE_FCNTL_HAS_MOVED: begin
+      if bShifted then begin
+        if nArg <> 3 then Exit;
+      end else begin
+        if nArg <> 1 then Exit;
+      end;
+      iVal := 0;
+      sqlite3_file_control(p^.db, PAnsiChar(zSchema),
+                           filectrl, @iVal);
+      iRes := iVal;
+      isOk := 1;
+    end;
+    SQLITE_FCNTL_TEMPFILENAME: begin
+      if bShifted then begin
+        if nArg <> 3 then Exit;
+      end else begin
+        if nArg <> 1 then Exit;
+      end;
+      zRet := nil;
+      sqlite3_file_control(p^.db, PAnsiChar(zSchema),
+                           filectrl, @zRet);
+      if zRet <> nil then begin
+        WriteLn(AnsiString(zRet));
+        sqlite3_free(zRet);
+      end;
+      isOk := 2;
+    end;
+    SQLITE_FCNTL_RESERVE_BYTES: begin
+      if bShifted then begin
+        if nArg >= 4 then begin
+          iVal := StrToIntDef(args[3], 0);
+          sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+        end;
+      end else begin
+        if nArg >= 2 then begin
+          iVal := StrToIntDef(args[1], 0);
+          sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+        end;
+      end;
+      iVal := -1;
+      sqlite3_file_control(p^.db, PAnsiChar(zSchema), filectrl, @iVal);
+      WriteLn(iVal);
+      isOk := 2;
+    end;
+  end;
+
+  if (isOk = 0) and (iCtrl >= 0) then
+    shellSPutZ(Format('Usage: .filectrl %s %s'#10,
+      [zCmdC, AnsiString(aFilectrl[iCtrl].zUsage)]))
+  else if isOk = 1 then
+    WriteLn(iRes);
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.41 — `.testctrl CMD ...`  (shell.c.in:11395..)
+
+  Subset port of the sqlite3_test_control() dispatcher.  The Pascal
+  port's sqlite3_test_control(op) currently honours PRNG_SAVE,
+  PRNG_RESTORE, PRNG_RESET, BYTEORDER and ISINIT (passqlite3main.pas:
+  4273) — those wire through faithfully.  Other opcodes return 0 from
+  the port's stub but the dispatcher still parses argument shape so
+  scripts don't fall through to the unknown-command arm.
+
+  The full upstream table emits a help line for every opcode; we
+  reproduce the same listing under `--help`, then route to either
+  the live PRNG/BYTEORDER arms or a generic stub that calls
+  sqlite3_test_control(code) — the variadic args go unread under the
+  cdecl boundary, matching the existing 8.4.1 behaviour.
+  ---------------------------------------------------------------------- }
+
+type
+  TTestctrlEntry = record
+    zName:  PAnsiChar;
+    code:   i32;
+    unSafe: i32;
+    zUsage: PAnsiChar;
+  end;
+
+const
+  SQLITE_TESTCTRL_FIRST                = 5;
+  SQLITE_TESTCTRL_PRNG_SAVE            = 5;
+  SQLITE_TESTCTRL_PRNG_RESTORE         = 6;
+  SQLITE_TESTCTRL_PRNG_RESET           = 7;
+  SQLITE_TESTCTRL_BITVEC_TEST          = 8;
+  SQLITE_TESTCTRL_FAULT_INSTALL        = 9;
+  SQLITE_TESTCTRL_PENDING_BYTE         = 11;
+  SQLITE_TESTCTRL_ASSERT               = 12;
+  SQLITE_TESTCTRL_ALWAYS               = 13;
+  SQLITE_TESTCTRL_RESERVE              = 14;
+  SQLITE_TESTCTRL_OPTIMIZATIONS        = 15;
+  SQLITE_TESTCTRL_ISKEYWORD            = 16;
+  SQLITE_TESTCTRL_LOCALTIME_FAULT      = 18;
+  SQLITE_TESTCTRL_NEVER_CORRUPT        = 20;
+  SQLITE_TESTCTRL_SORTER_MMAP          = 24;
+  SQLITE_TESTCTRL_IMPOSTER             = 25;
+  SQLITE_TESTCTRL_PARSER_COVERAGE      = 26;
+  SQLITE_TESTCTRL_PRNG_SEED            = 28;
+  SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS  = 29;
+  SQLITE_TESTCTRL_SEEK_COUNT           = 30;
+  SQLITE_TESTCTRL_TUNE                 = 32;
+  SQLITE_TESTCTRL_BYTEORDER            = 22;
+  SQLITE_TESTCTRL_FK_NO_ACTION         = 33;
+  SQLITE_TESTCTRL_INTERNAL_FUNCTIONS   = 17;
+  SQLITE_TESTCTRL_JSON_SELFCHECK       = 14;
+
+  aTestctrl: array[0..18] of TTestctrlEntry = (
+    (zName: 'always';              code: SQLITE_TESTCTRL_ALWAYS;              unSafe: 1; zUsage: 'BOOLEAN'),
+    (zName: 'assert';              code: SQLITE_TESTCTRL_ASSERT;              unSafe: 1; zUsage: 'BOOLEAN'),
+    (zName: 'bitvec_test';         code: SQLITE_TESTCTRL_BITVEC_TEST;         unSafe: 1; zUsage: 'SIZE INT-ARRAY'),
+    (zName: 'byteorder';           code: SQLITE_TESTCTRL_BYTEORDER;           unSafe: 0; zUsage: ''),
+    (zName: 'extra_schema_checks'; code: SQLITE_TESTCTRL_EXTRA_SCHEMA_CHECKS; unSafe: 0; zUsage: 'BOOLEAN'),
+    (zName: 'fault_install';       code: SQLITE_TESTCTRL_FAULT_INSTALL;       unSafe: 1; zUsage: 'args...'),
+    (zName: 'fk_no_action';        code: SQLITE_TESTCTRL_FK_NO_ACTION;        unSafe: 0; zUsage: 'BOOLEAN'),
+    (zName: 'imposter';            code: SQLITE_TESTCTRL_IMPOSTER;            unSafe: 1; zUsage: 'SCHEMA ON/OFF ROOTPAGE'),
+    (zName: 'internal_functions';  code: SQLITE_TESTCTRL_INTERNAL_FUNCTIONS;  unSafe: 0; zUsage: ''),
+    (zName: 'localtime_fault';     code: SQLITE_TESTCTRL_LOCALTIME_FAULT;     unSafe: 0; zUsage: 'BOOLEAN'),
+    (zName: 'never_corrupt';       code: SQLITE_TESTCTRL_NEVER_CORRUPT;       unSafe: 1; zUsage: 'BOOLEAN'),
+    (zName: 'optimizations';       code: SQLITE_TESTCTRL_OPTIMIZATIONS;       unSafe: 0; zUsage: 'DISABLE-MASK ...'),
+    (zName: 'pending_byte';        code: SQLITE_TESTCTRL_PENDING_BYTE;        unSafe: 1; zUsage: 'OFFSET  '),
+    (zName: 'prng_restore';        code: SQLITE_TESTCTRL_PRNG_RESTORE;        unSafe: 0; zUsage: ''),
+    (zName: 'prng_save';           code: SQLITE_TESTCTRL_PRNG_SAVE;           unSafe: 0; zUsage: ''),
+    (zName: 'prng_seed';           code: SQLITE_TESTCTRL_PRNG_SEED;           unSafe: 0; zUsage: 'SEED ?db?'),
+    (zName: 'seek_count';          code: SQLITE_TESTCTRL_SEEK_COUNT;          unSafe: 0; zUsage: ''),
+    (zName: 'sorter_mmap';         code: SQLITE_TESTCTRL_SORTER_MMAP;         unSafe: 0; zUsage: 'NMAX'),
+    (zName: 'tune';                code: SQLITE_TESTCTRL_TUNE;                unSafe: 1; zUsage: 'ID VALUE')
+  );
+
+procedure cmdTestctrl(p: PShellState; const args: array of AnsiString;
+                      nArg: SizeInt);
+var
+  zCmd, zCmdC: AnsiString;
+  i, n2, iCtrl: SizeInt;
+  testctrl: i32;
+  isOk: i32;
+  rc2: i32;
+  isTestingMode: Boolean;
+begin
+  openDb(p, 0);
+  if nArg >= 1 then zCmd := args[0] else zCmd := 'help';
+
+  zCmdC := zCmd;
+  if (Length(zCmdC) >= 2) and (zCmdC[1] = '-') then begin
+    Delete(zCmdC, 1, 1);
+    if (Length(zCmdC) >= 2) and (zCmdC[1] = '-') then Delete(zCmdC, 1, 1);
+  end;
+
+  isTestingMode := (p^.shellFlgs and SHFLG_TestingMode) <> 0;
+
+  if zCmdC = 'help' then begin
+    shellSPutZ('Available test-controls:'#10);
+    for i := 0 to High(aTestctrl) do begin
+      if (aTestctrl[i].unSafe <> 0) and (not isTestingMode) then continue;
+      shellSPutZ(Format('  .testctrl %s %s'#10,
+        [AnsiString(aTestctrl[i].zName), AnsiString(aTestctrl[i].zUsage)]));
+    end;
+    Exit;
+  end;
+
+  { Prefix-match the command name (skipping unsafe entries when not in
+    SHFLG_TestingMode). }
+  testctrl := -1;
+  iCtrl := -1;
+  n2 := Length(zCmdC);
+  for i := 0 to High(aTestctrl) do begin
+    if (aTestctrl[i].unSafe <> 0) and (not isTestingMode) then continue;
+    if (n2 > 0) and (StrLComp(PAnsiChar(zCmdC),
+                              aTestctrl[i].zName, n2) = 0) then begin
+      if testctrl < 0 then begin
+        testctrl := aTestctrl[i].code;
+        iCtrl := i;
+      end else begin
+        shellEPutZ(Format('Error: ambiguous test-control: "%s"'#10 +
+          'Use ".testctrl --help" for help'#10, [zCmdC]));
+        Exit;
+      end;
+    end;
+  end;
+  if testctrl < 0 then begin
+    shellEPutZ(Format('Error: unknown test-control: %s'#10 +
+      'Use ".testctrl --help" for help'#10, [zCmdC]));
+    Exit;
+  end;
+
+  isOk := 0;
+  rc2 := 0;
+  case testctrl of
+    SQLITE_TESTCTRL_PRNG_SAVE,
+    SQLITE_TESTCTRL_PRNG_RESTORE,
+    SQLITE_TESTCTRL_BYTEORDER: begin
+      if nArg = 1 then begin
+        rc2 := sqlite3_test_control(testctrl);
+        if testctrl = SQLITE_TESTCTRL_BYTEORDER then isOk := 1
+        else isOk := 3;
+      end;
+    end;
+    SQLITE_TESTCTRL_SEEK_COUNT: begin
+      { Stub: would call sqlite3_test_control(op, db, &x) and print x. }
+      WriteLn('0');
+      isOk := 3;
+    end;
+  else
+    { Generic stub — accept argument shape, return 0.  Matches Pascal
+      port's stubbed sqlite3_test_control() for non-PRNG opcodes. }
+    isOk := 3;
+  end;
+
+  if (isOk = 0) and (iCtrl >= 0) then
+    shellSPutZ(Format('Usage: .testctrl %s %s'#10,
+      [zCmdC, AnsiString(aTestctrl[iCtrl].zUsage)]))
+  else if isOk = 1 then
+    WriteLn(rc2);
+end;
+
+{ ----------------------------------------------------------------------
   10.1.19  `.fullschema ?--indent?`  — shell.c.in:9687..
 
   Prints CREATE statements followed by sqlite_stat1 / sqlite_stat4
@@ -5257,6 +5614,8 @@ begin
   if zCmd = 'vfsinfo'   then begin cmdVfsinfo(p, args, nArg); Exit; end;
   if zCmd = 'vfslist'   then begin cmdVfslist(p); Exit; end;
   if zCmd = 'vfsname'   then begin cmdVfsname(p, args, nArg); Exit; end;
+  if zCmd = 'filectrl'  then begin cmdFilectrl(p, args, nArg); Exit; end;
+  if zCmd = 'testctrl'  then begin cmdTestctrl(p, args, nArg); Exit; end;
   if zCmd = 'fullschema' then begin cmdFullschema(p, args, nArg); Exit; end;
   if zCmd = 'lint'      then begin cmdLint(p, args, nArg); Exit; end;
   if zCmd = 'expert'    then begin cmdExpert; Result := 1; Exit; end;

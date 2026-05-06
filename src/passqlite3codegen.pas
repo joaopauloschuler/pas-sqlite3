@@ -41477,6 +41477,16 @@ begin
     Exit;
   end;
 
+  { page_count — pragma.c:663 (PragTyp_PAGE_COUNT, 'p' branch).
+    OP_Pagecount returns sqlite3BtreeLastPage(pBt). }
+  if SameText(zName, 'page_count') and (pValue = nil) then begin
+    sqlite3VdbeUsesBtree(v, iDb);
+    sqlite3VdbeAddOp2(v, OP_Pagecount, iDb, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
+
   { Constant-default string pragmas — pragma.c PragTyp_JOURNAL_MODE /
     PragTyp_LOCKING_MODE.  In-memory db default journal_mode is "memory"
     and locking_mode is "normal"; the Pas port does not maintain these

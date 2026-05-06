@@ -230,13 +230,13 @@ FPC porting traps that recur often enough to call out up-front:
 
 ### Open Bugs
 
-- [ ] **6.11** `PRAGMA page_count` returns no rows on the Pascal port
-    (verified 2026-05-06 against an on-disk db with 2 pages: upstream
-    sqlite3 returns `2`, pas-sqlite3 prints nothing and step returns
-    DONE on first call).  `PRAGMA page_size` works as expected.
-    Surfaces under `.dbtotxt`, which works around it by counting
-    `sqlite_dbpage` rows; revisit this when porting the rest of the
-    PRAGMA dispatch table.
+- [X] **6.11** `PRAGMA page_count` returns no rows.  Closed 2026-05-06.
+    The Pas pragma dispatcher special-cased `max_page_count` (PragTyp_PAGE_COUNT
+    'max' branch) but had no arm for the bare `page_count` (zName starts
+    with 'p' lowercase in C — pragma.c:663..672 emits OP_Pagecount).
+    Added the missing arm in passqlite3codegen.pas immediately after the
+    max_page_count handler; emits `OP_Pagecount(iDb,1) / OP_ResultRow(1,1)`.
+    DiagPragma `page_count fresh` PASS.
 
 - [ ] **6.12** `LIKE … ESCAPE 'x'` raises `Error: ESCAPE expression
     must be a single character` once an outer `ORDER BY` is added to
@@ -1021,8 +1021,14 @@ existing dispatcher.
   [~] **10.1.40** `.testcase NAME` — cmdTestcase records NAME in
        p^.zTestcase; the `.check ANSWER` comparator side (which
        redirects shell output to a buffer) is still pending.
-  [ ] **10.1.41** `.testctrl` — `sqlite3_test_control` opcode
-       dispatcher (gated on 8.4.1).
+  [~] **10.1.41** `.testctrl` — dispatcher landed (cmdTestctrl mirrors
+       shell.c.in:11395..).  aTestctrl[] table populated with all 19
+       opcodes; `--help` filters unsafe entries on SHFLG_TestingMode;
+       prefix-match + ambiguity / unknown error paths match upstream.
+       PRNG_SAVE / PRNG_RESTORE / BYTEORDER route to the live
+       sqlite3_test_control() (passqlite3main.pas:4273); other opcodes
+       fall through to a generic stub that returns 0 (matches the
+       Phase 8.4.1 single-arg cdecl boundary — variadic args go unread).
   [~] **10.1.42** `.selecttrace` / `.wheretrace` / `.treetrace` —
        cmdTraceFlags emits a "requires a debug build; ignored"
        breadcrumb so partial landings don't fall through to the unknown-
@@ -1085,8 +1091,13 @@ existing dispatcher.
        reset_database, trusted_schema).  Counter-style and pointer-
        style ops still gated on the raw-varargs sqlite3_db_config port
        (8.1.1).
-  [ ] **10.1.51** `.filectrl` — `sqlite3_file_control` opcode
-       dispatcher (gated on 8.4.1).
+  [X] **10.1.51** `.filectrl` — cmdFilectrl mirrors shell.c.in:9539..9690.
+       Full aFilectrl[] table (chunk_size / data_version / has_moved /
+       lock_timeout / persist_wal / psow / reserve_bytes / size_limit /
+       tempfilename), `--schema NAME` arg-shift, leading-dash strip,
+       prefix-match w/ ambiguity reporting, and the per-opcode
+       isOk={0,1,2} formatting (Usage / %lld / no-result) all wired
+       through sqlite3_file_control() (passqlite3main.pas:3934).
   [ ] **10.1.52** `.sha3sum` — runs the SHA3 hash extension over
        schema + data.  Bundles a Pascal SHA3 implementation or links
        the existing extension.
@@ -1103,12 +1114,12 @@ existing dispatcher.
        dispatches through sqlite3_drop_modules (with the NULL-
        terminated PPAnsiChar) for `--allexcept`, otherwise calls
        sqlite3_create_module(name, NULL, NULL) per name.
-  [~] **10.1.57** `.vfsinfo` / `.vfslist` / `.vfsname` — cmdVfsinfo /
+  [X] **10.1.57** `.vfsinfo` / `.vfslist` / `.vfsname` — cmdVfsinfo /
        cmdVfslist / cmdVfsname use SQLITE_FCNTL_VFS_POINTER and walk
-       sqlite3_vfs_find chain.  `.vfsname` returns empty for the unix
-       VFS because SQLITE_FCNTL_VFSNAME is only handled by the memdb
-       VFS today (small follow-up: surface the unix-VFS variant via
-       sqlite3OsFileControl).
+       sqlite3_vfs_find chain.  Unix-VFS variant of SQLITE_FCNTL_VFSNAME
+       wired via unixFileControl (passqlite3os.pas:1733) — returns
+       sqlite3StrDup(pVfs^.zName) so `.vfsname` prints "unix" for a
+       file-backed db (matches os_unix.c:4191).
   [X] **10.1.58** `.dbtotxt` — cmdDbtotxt ports
        shell.c.in:5579..5674 page-by-page hex dump.  Reads page size
        via `PRAGMA page_size`, page count via
