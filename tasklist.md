@@ -245,7 +245,13 @@ FPC porting traps that recur often enough to call out up-front:
             describes its own factoring; the Pas iDistinct ephemeral
             arm at resetAccumulatorSimple covers the same ground.
 
-  [~] **6.26** Window functions (window.c).
+  [X] **6.26** Window functions (window.c).
+       DiagWindow now passes 0/26 divergences.  Open sub-rows below
+       (frame-spec emission beyond default ROWS BETWEEN UNBOUNDED
+       PRECEDING AND CURRENT ROW; multi-window arm; lifting the
+       SRT_Output / DISTINCT / ORDER BY / LIMIT subset gates) are
+       deferred — they are gated by additional DiagWindow rows or
+       new test programs, not by missing port work.
        Gate: DiagWindow — closes 6.10 step 17(c) (rank, dense_rank,
        lag, lead, first_value, ntile prepare-time failures) and step
        17(d) (`sum() OVER (...)`, `row_number() OVER (...)` empty
@@ -361,48 +367,20 @@ FPC porting traps that recur often enough to call out up-front:
             window.c:921; without this, DESC / NULLS FIRST clauses
             on PARTITION BY / ORDER BY were stripped during
             sub-select build.
-       [ ] **Last DiagWindow divergence: `partition row_num`.**
-            `SELECT grp, val, row_number() OVER (PARTITION BY grp
-            ORDER BY val) FROM g` returns
-            `[A,2,1];[A,1,2];[B,5,1];[B,4,2];[B,3,3]` — partition
-            boundaries are correct (A then B) and row_number is
-            correct, but `val` order *within* each partition is
-            wrong (DESC instead of ASC).  Cross-checked via a
-            standalone `SELECT grp,val FROM g ORDER BY grp, val` —
-            same partial bug occurs **without** any window code,
-            ruling out the window arm.  The pre-existing
-            multi-key sorter has a bug: with sortNKey=2 and
-            bSortOmitRef=1, vdbeSorterCompareRec returns 0 for many
-            pairs that differ on the second key (val).  Likely
-            culprits to investigate next session:
-              1. `sqlite3VdbeAllocUnpackedRecord` allocates
-                 nField=nKeyField+1 but `sqlite3VdbeRecordUnpack`
-                 reassigns `pUR^.nField := u` which can drop to
-                 fewer than nKeyField when the OMITREF record has
-                 only sortNKey serial-type bytes in its header
-                 (idx>=szHdr breaks the loop after exactly
-                 sortNKey fields).  Compare loop then exits at
-                 i==nField with default_rc=0 BEFORE inspecting the
-                 second key — but trace says nField stayed at 2,
-                 so this isn't the early-exit bug, which means the
-                 bug is inside RecordCompare's per-field branch.
-              2. RecordCompare's int-vs-int path for serial type
-                 8/9 (zero-byte int constants 0/1) may misread
-                 aKey1[d1] when d1 is past nKey1 — actual decode
-                 short-circuits in btreeDecodeInt but the
-                 surrounding `if d1>nKey1` guards may bail with
-                 rc=0 before reaching the per-field compare.
-              3. The OMITREF push records have variable size
-                 (5 bytes vs 4 bytes when val=1 encodes as type 9
-                 with no data byte).  The mixed-size compare may
-                 hit the corruption short-circuit at line 3215 /
-                 3266 / 3312 of btree.pas (returns 0 silently).
-            Quick repro: `SELECT grp,val FROM g ORDER BY grp,val`
-            against `(A,2),(A,1),(B,5),(B,3),(B,4)` — Pas returns
-            `[A,1,A,2,B,4,B,3,B,5]`, expected
-            `[A,1,A,2,B,3,B,4,B,5]`.  Bug is in
-            sqlite3VdbeRecordCompare (btree.pas:3178) or its
-            caller chain, NOT in the window arm.
+       [X] **Last DiagWindow divergence: `partition row_num`.**
+            Root cause: in `sqlite3VdbeRecordCompare` (btree.pas),
+            `pRhs` was declared `PBtMemView` (a 23-byte packed
+            view), but the underlying `aMem[]` array stride is
+            `SizeOf(passqlite3vdbe.TMem) = 56`.  `Inc(pRhs)` after
+            iter 0 advanced 23 bytes — landing inside the next
+            Mem cell — and the misread `flags` field fell through
+            to the final `else rc := 0` arm, so every multi-key
+            compare whose first key was equal silently returned 0.
+            Single-key sorts and most index probes worked because
+            they exit before the increment.  Fix: introduce
+            `BT_MEM_STRIDE = 56` and step `pRhs` by raw bytes
+            (`pRhs := PBtMemView(PByte(pRhs) + BT_MEM_STRIDE)`).
+            DiagWindow: 1 → 0 divergences.
        [ ] Frame-spec emission: ROWS / RANGE / GROUPS, with all
             five bound types (UNBOUNDED PRECEDING, n PRECEDING,
             CURRENT ROW, n FOLLOWING, UNBOUNDED FOLLOWING) and
