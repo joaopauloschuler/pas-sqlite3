@@ -253,20 +253,31 @@ FPC porting traps that recur often enough to call out up-front:
     to the iSdst allocation block, mirroring C exactly.  `.tables` /
     `.schema --nosys` LIKE filters now work without the GLOB workaround.
 
-- [ ] **6.14** Compound `SELECT … FROM sqlite_schema … UNION ALL
-    SELECT 'sqlite_schema' ORDER BY 1 collate nocase` returns zero rows
-    on the Pascal side (system `sqlite3` returns 2 rows: 't' +
-    'sqlite_schema' for a one-table DB).  Surfaces under
-    `.sha3sum --schema` (digest differs from C oracle because the
-    table-list CTE feeding sha3_query is empty, so `sha3_query` is
-    called with the empty string).  The non-`--schema` form of the
-    same query (without UNION ALL of the literal) works.  Suggests
-    the codegen path for `<aggregate query> UNION ALL <one-row constant
-    SELECT> ORDER BY <collation>` mishandles either the constant-row
-    arm or the COLLATE-aware sort.  Repro:
-      `SELECT name FROM sqlite_schema WHERE type='table' UNION ALL
-       SELECT 'lit' ORDER BY 1 COLLATE NOCASE;`
-    Pas returns no rows; C returns the table names plus 'lit'.
+- [~] **6.14** Compound `SELECT … FROM sqlite_schema … UNION ALL
+    SELECT 'sqlite_schema' ORDER BY 1 collate nocase`.  Two underlying
+    bugs identified.  **Sub-bug A closed 2026-05-06**: bare compound
+    queries like `SELECT 1 UNION ALL SELECT 2 ORDER BY 1` returned 2
+    blank rows because `sqlite3_column_count` was 0.  Root cause:
+    `sqlite3GenerateColumnNames` (codegen.pas:20232) had two issues —
+    (1) early-bail gate `if (v=nil) or (pTabList=nil) ...` rejected
+    no-FROM SELECTs even though the body never dereferences pTabList;
+    (2) the only call site for compound queries was inside the no-FROM
+    fast path (codegen.pas:22938), so multiSelectByMerge dispatch never
+    reached it and `nResColumn` stayed 0.  Fix: relax the gate to drop
+    pTabList=nil, and add an early `if pDest^.eDest=SRT_Output then
+    sqlite3GenerateColumnNames(pParse, p)` (gated on
+    `sqlite3GetVdbe(pParse) <> nil` because Pas defers VDBE alloc) at
+    the same spot in `sqlite3Select` as select.c:7682..7684.  Verified:
+    `SELECT 1 UNION ALL SELECT 2 ORDER BY 1` (and DESC, UNION dedup,
+    multi-arm UNION ALL, sub-FROM compound) all return correct rows;
+    TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
+    DiagOps / DiagPragma / DiagDml / DiagWindow no regressions.
+    **Sub-bug B still open**: `SELECT name FROM sqlite_schema WHERE
+    type='table' UNION ALL SELECT 'lit' ;` (no ORDER BY needed) now
+    yields just 'lit' — first arm (with FROM) is silenced when paired
+    with a no-FROM constant arm.  Mixed-FROM/no-FROM UNION ALL needs a
+    separate codegen probe.  Repro: create one table 't', then run
+    the above query — C returns `lit\nt`; Pas returns just `lit`.
 
 - [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
     valued PRAGMA functions) returns rows when called with a literal

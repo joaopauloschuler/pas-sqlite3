@@ -20254,7 +20254,7 @@ begin
   pEList   := pSel^.pEList;
   v        := pParse^.pVdbe;
   db       := pParse^.db;
-  if (v = nil) or (pTabList = nil) or (pEList = nil) then Exit;
+  if (v = nil) or (pEList = nil) then Exit;
   pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_ColNamesSet;
   fullName := (db^.flags and SQLITE_FullColNames) <> 0;
   srcName  := (db^.flags and SQLITE_ShortColNames) <> 0;
@@ -22807,6 +22807,17 @@ begin
      and (pDest^.eDest <> SRT_Upfrom)
      and (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
+  { Mirror select.c:7682..7684 — emit OP_ResultRow column names early, so
+    compound + multiSelectByMerge dispatch (and any path that recurses into
+    sqlite3Select with SRT_Coroutine destinations) still publishes nResColumn
+    on the top-level VDBE.  Without this, sqlite3_column_count returns 0
+    for `SELECT 1 UNION ALL SELECT 2 ORDER BY 1` and the shell renders
+    blank rows. }
+  if pDest^.eDest = SRT_Output then begin
+    if sqlite3GetVdbe(pParse) <> nil then
+      sqlite3GenerateColumnNames(pParse, p);
+  end;
+
   if p^.pPrior <> nil then begin
     { Recursive-CTE arm of multiSelect (select.c:2976..2978).  Must come
       first — the body inside generateWithRecursiveQuery rewrites the
