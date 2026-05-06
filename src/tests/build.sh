@@ -202,6 +202,10 @@ compile_test DiagPragma
 compile_test DiagPredicates
 compile_test DiagPrintfFmt
 compile_test DiagPubApi
+compile_test DiagSampleProg    # Phase 8.10: canonical SQLite quickstart /
+                               # cintro sample programs run through both
+                               # the C reference and the Pascal port; gate
+                               # asserts byte-identical transcripts.
 compile_test DiagScalarFunc
 compile_test DiagStrAccum
 compile_test DiagSubsel
