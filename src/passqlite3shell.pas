@@ -3038,6 +3038,495 @@ begin
   shellEPutZ('Usage: .parameter init|list|set|unset|clear ?ARGS?'#10);
 end;
 
+{ ----------------------------------------------------------------------
+  10.1.24  `.import FILE TABLE ?OPTIONS?`  — shell.c.in:4958..7848
+
+  Faithful port of ImportCtx + import_getc + import_append_char +
+  csv_read_one_field + ascii_read_one_field + dotCmdImport.  The
+  initial cut wires the file/CSV/ASCII reader paths and the bulk-insert
+  loop; the auto-create-table path (zAutoColumn), pipe input (`|cmd`),
+  and the in-script `<<MARK` heredoc are deferred — the table must
+  already exist for now and a clear "table does not exist" error is
+  emitted otherwise so partial landings cannot silently no-op.
+  ---------------------------------------------------------------------- }
+
+const
+  IMPORT_EOF = -1;
+  IMPORT_BUFSIZE = 4096;
+
+type
+  TImportCtx = record
+    zFile:     AnsiString;       { Display name of the input file }
+    inHandle:  THandle;
+    inOpen:    Boolean;
+    buf:       array[0..IMPORT_BUFSIZE - 1] of Byte;
+    bufPos:    SizeInt;
+    bufLen:    SizeInt;
+    atEof:     Boolean;
+    z:         AnsiString;       { Accumulated text for one field }
+    nLine:     i32;              { Current line number }
+    nRow:      i32;              { Number of rows imported }
+    nErr:      i32;              { Number of errors encountered }
+    bNotFirst: i32;              { 1 if at least one byte read }
+    cTerm:     i32;              { Char that ended last field (or EOF) }
+    cColSep:   i32;              { Column separator byte }
+    cRowSep:   i32;              { Row separator byte }
+    cQEscape:  i32;              { Escape inside "..."; 0 = none }
+    cUQEscape: i32;              { Escape outside "..."; 0 = none }
+  end;
+
+procedure importInit(out p: TImportCtx);
+begin
+  FillChar(p, SizeOf(p), 0);
+  p.inHandle := THandle(-1);
+end;
+
+procedure importCleanup(var p: TImportCtx);
+begin
+  if p.inOpen then begin
+    FpClose(p.inHandle);
+    p.inOpen := False;
+    p.inHandle := THandle(-1);
+  end;
+  p.z := '';
+  p.bufPos := 0;
+  p.bufLen := 0;
+end;
+
+function importGetc(var p: TImportCtx): i32;
+var n: SizeInt;
+begin
+  if p.bufPos >= p.bufLen then begin
+    if p.atEof then begin Result := IMPORT_EOF; Exit; end;
+    n := FpRead(p.inHandle, p.buf, SizeOf(p.buf));
+    if n <= 0 then begin
+      p.atEof := True;
+      Result := IMPORT_EOF;
+      Exit;
+    end;
+    p.bufLen := n;
+    p.bufPos := 0;
+  end;
+  Result := i32(p.buf[p.bufPos]);
+  Inc(p.bufPos);
+end;
+
+procedure importAppendChar(var p: TImportCtx; c: i32); inline;
+begin
+  p.z := p.z + AnsiChar(Byte(c and $FF));
+end;
+
+{ csv_read_one_field — shell.c.in:5031..5116.
+
+  Reads one rfc4180 CSV field.  Returns True if a field (possibly empty)
+  was produced; False only when the very first byte is EOF.  Field text
+  lives in p.z and the terminator in p.cTerm. }
+function csvReadOneField(var p: TImportCtx): Boolean;
+var
+  c, pc, ppc, cQuote, cEsc, cSep, rSep, startLine: i32;
+begin
+  cSep := p.cColSep and $FF;
+  rSep := p.cRowSep and $FF;
+  p.z := '';
+  c := importGetc(p);
+  if (c = IMPORT_EOF) or (seenInterrupt <> 0) then begin
+    p.cTerm := IMPORT_EOF;
+    Result := False;
+    Exit;
+  end;
+  if c = Ord('"') then begin
+    cQuote := c;
+    cEsc := p.cQEscape and $FF;
+    pc := 0; ppc := 0;
+    startLine := p.nLine;
+    while True do begin
+      c := importGetc(p);
+      if c = rSep then Inc(p.nLine);
+      if (c = cEsc) and (cEsc <> 0) then begin
+        c := importGetc(p);
+        importAppendChar(p, c);
+        ppc := 0; pc := 0;
+        Continue;
+      end;
+      if c = cQuote then begin
+        if pc = cQuote then begin
+          pc := 0;
+          Continue;
+        end;
+      end;
+      if ((c = cSep) and (pc = cQuote))
+         or ((c = rSep) and (pc = cQuote))
+         or ((c = rSep) and (pc = 13) and (ppc = cQuote))
+         or ((c = IMPORT_EOF) and (pc = cQuote)) then
+      begin
+        { Strip back to (and including) the close-quote. }
+        while (Length(p.z) > 0) and (Ord(p.z[Length(p.z)]) <> cQuote) do
+          SetLength(p.z, Length(p.z) - 1);
+        if Length(p.z) > 0 then SetLength(p.z, Length(p.z) - 1);
+        p.cTerm := c;
+        Break;
+      end;
+      if (pc = cQuote) and (c <> 13) then
+        shellEPutZ(Format('%s:%d: unescaped %s character'#10,
+          [p.zFile, p.nLine, AnsiChar(Byte(cQuote))]));
+      if c = IMPORT_EOF then begin
+        shellEPutZ(Format('%s:%d: unterminated %s-quoted field'#10,
+          [p.zFile, startLine, AnsiChar(Byte(cQuote))]));
+        p.cTerm := c;
+        Break;
+      end;
+      importAppendChar(p, c);
+      ppc := pc;
+      pc := c;
+    end;
+  end else begin
+    cEsc := p.cUQEscape and $FF;
+    if ((c and $FF) = $EF) and (p.bNotFirst = 0) then begin
+      importAppendChar(p, c);
+      c := importGetc(p);
+      if (c and $FF) = $BB then begin
+        importAppendChar(p, c);
+        c := importGetc(p);
+        if (c and $FF) = $BF then begin
+          p.bNotFirst := 1;
+          p.z := '';
+          Result := csvReadOneField(p);
+          Exit;
+        end;
+      end;
+    end;
+    while (c <> IMPORT_EOF) and (c <> cSep) and (c <> rSep) do begin
+      if (c = cEsc) and (cEsc <> 0) then c := importGetc(p);
+      importAppendChar(p, c);
+      c := importGetc(p);
+    end;
+    if c = rSep then begin
+      Inc(p.nLine);
+      if (Length(p.z) > 0) and (p.z[Length(p.z)] = #13) then
+        SetLength(p.z, Length(p.z) - 1);
+    end;
+    p.cTerm := c;
+  end;
+  p.bNotFirst := 1;
+  Result := True;
+end;
+
+{ ascii_read_one_field — shell.c.in:5130..5150.  ASCII-delimited mode
+  (column 0x1F, row 0x1E by default).  No quote handling. }
+function asciiReadOneField(var p: TImportCtx): Boolean;
+var c, cSep, rSep: i32;
+begin
+  cSep := p.cColSep and $FF;
+  rSep := p.cRowSep and $FF;
+  p.z := '';
+  c := importGetc(p);
+  if (c = IMPORT_EOF) or (seenInterrupt <> 0) then begin
+    p.cTerm := IMPORT_EOF;
+    Result := False;
+    Exit;
+  end;
+  while (c <> IMPORT_EOF) and (c <> cSep) and (c <> rSep) do begin
+    importAppendChar(p, c);
+    c := importGetc(p);
+  end;
+  if c = rSep then Inc(p.nLine);
+  p.cTerm := c;
+  p.bNotFirst := 1;
+  Result := True;
+end;
+
+type
+  TImportReader = function(var ctx: TImportCtx): Boolean;
+
+procedure cmdImport(p: PShellState; const args: array of AnsiString;
+                   nArg: SizeInt);
+var
+  sCtx: TImportCtx;
+  xRead: TImportReader;
+  zFile, zTable, zSchema: AnsiString;
+  zSql: AnsiString;
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc, nCol, eVerbose: i32;
+  nSkip: i64;
+  i, j: SizeInt;
+  z: AnsiString;
+  hasFile: Boolean;
+  startLine: i32;
+  ch: AnsiChar;
+  needCommit: i32;
+  exists: i32;
+  zArg: AnsiString;
+begin
+  importInit(sCtx);
+  if p^.mode.eMode = MODE_Ascii then
+    xRead := @asciiReadOneField
+  else
+    xRead := @csvReadOneField;
+  zFile := '';
+  zTable := '';
+  zSchema := '';
+  eVerbose := 0;
+  nSkip := 0;
+  i := 0;
+  while i < nArg do begin
+    zArg := args[i];
+    if (Length(zArg) >= 2) and (zArg[1] = '-') and (zArg[2] = '-') then
+      Delete(zArg, 1, 1);
+    if (Length(zArg) = 0) or (zArg[1] <> '-') then begin
+      if zFile = '' then zFile := args[i]
+      else if zTable = '' then zTable := args[i]
+      else begin
+        shellEPutZ(Format('Error: unknown argument: %s'#10, [args[i]]));
+        Exit;
+      end;
+    end else if zArg = '-v' then
+      Inc(eVerbose)
+    else if (zArg = '-schema') and (i < nArg - 1) then begin
+      Inc(i); zSchema := args[i];
+    end else if (zArg = '-skip') and (i < nArg - 1) then begin
+      Inc(i); nSkip := StrToInt64Def(string(args[i]), 0);
+    end else if zArg = '-ascii' then begin
+      if sCtx.cColSep = 0 then sCtx.cColSep := Ord(SEP_Unit);
+      if sCtx.cRowSep = 0 then sCtx.cRowSep := Ord(SEP_Record);
+      xRead := @asciiReadOneField;
+    end else if zArg = '-csv' then begin
+      if sCtx.cColSep = 0 then sCtx.cColSep := Ord(',');
+      if sCtx.cRowSep = 0 then sCtx.cRowSep := Ord(#10);
+      xRead := @csvReadOneField;
+    end else if (zArg = '-esc') and (i < nArg - 1) then begin
+      Inc(i);
+      if Length(args[i]) > 0 then sCtx.cUQEscape := Ord(args[i][1]);
+    end else if (zArg = '-qesc') and (i < nArg - 1) then begin
+      Inc(i);
+      if Length(args[i]) > 0 then sCtx.cQEscape := Ord(args[i][1]);
+    end else if zArg = '-colsep' then begin
+      if i = nArg - 1 then begin
+        shellEPutZ('Error: missing argument: -colsep'#10);
+        Exit;
+      end;
+      Inc(i);
+      if Length(args[i]) > 0 then sCtx.cColSep := Ord(args[i][1]);
+    end else if zArg = '-rowsep' then begin
+      if i = nArg - 1 then begin
+        shellEPutZ('Error: missing argument: -rowsep'#10);
+        Exit;
+      end;
+      Inc(i);
+      if Length(args[i]) > 0 then sCtx.cRowSep := Ord(args[i][1]);
+    end else begin
+      shellEPutZ(Format('Error: unknown option: %s'#10, [args[i]]));
+      Exit;
+    end;
+    Inc(i);
+  end;
+  if zTable = '' then begin
+    if zFile = '' then
+      shellEPutZ('Error: Missing FILE argument'#10)
+    else
+      shellEPutZ('Error: Missing TABLE argument'#10);
+    Exit;
+  end;
+  seenInterrupt := 0;
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+
+  if sCtx.cColSep = 0 then begin
+    if (p^.mode.spec.zColumnSep <> nil) and (p^.mode.spec.zColumnSep[0] <> #0)
+    then sCtx.cColSep := Ord(p^.mode.spec.zColumnSep[0])
+    else sCtx.cColSep := Ord(',');
+  end;
+  if (sCtx.cColSep and $80) <> 0 then begin
+    shellEPutZ('Error: .import column separator must be ASCII'#10);
+    Exit;
+  end;
+  if sCtx.cRowSep = 0 then begin
+    if (p^.mode.spec.zRowSep <> nil) and (p^.mode.spec.zRowSep[0] <> #0)
+    then sCtx.cRowSep := Ord(p^.mode.spec.zRowSep[0])
+    else sCtx.cRowSep := Ord(#10);
+  end;
+  if (sCtx.cRowSep = 13) and (xRead <> @asciiReadOneField) then
+    sCtx.cRowSep := 10;
+  if (sCtx.cRowSep and $80) <> 0 then begin
+    shellEPutZ('Error: .import row separator must be ASCII'#10);
+    Exit;
+  end;
+
+  sCtx.zFile := zFile;
+  sCtx.nLine := 1;
+
+  if (Length(zFile) > 0) and (zFile[1] = '|') then begin
+    shellEPutZ('Error: pipes are not supported in this build'#10);
+    Exit;
+  end;
+  if (Length(zFile) > 2) and (zFile[1] = '<') and (zFile[2] = '<') then begin
+    shellEPutZ('Error: heredoc input (<<MARK) is not supported in this build'#10);
+    Exit;
+  end;
+  sCtx.inHandle := FpOpen(string(zFile), O_RDONLY);
+  if sCtx.inHandle = THandle(-1) then begin
+    shellEPutZ(Format('Error: cannot open "%s"'#10, [zFile]));
+    Exit;
+  end;
+  sCtx.inOpen := True;
+
+  if eVerbose >= 1 then begin
+    ch := AnsiChar(Byte(sCtx.cColSep));
+    shellSPutZ(Format('Column separator "%s", row separator "%s"'#10,
+      [string(ch), string(AnsiChar(Byte(sCtx.cRowSep)))]));
+  end;
+
+  hasFile := True;
+  if hasFile then ;
+
+  { Skip leading rows. }
+  while nSkip > 0 do begin
+    Dec(nSkip);
+    while xRead(sCtx) and (sCtx.cTerm = sCtx.cColSep) do ;
+  end;
+
+  { The Pascal port currently requires the destination table to already
+    exist; the auto-create-from-header path (zAutoColumn) is deferred.
+    Probe via sqlite_schema rather than sqlite3_table_column_metadata so
+    we sidestep any port quirks in the latter when the schema is unset. }
+  if zSchema <> '' then
+    zSql := 'SELECT count(*) FROM "' +
+      StringReplace(zSchema, '"', '""', [rfReplaceAll]) +
+      '".sqlite_schema WHERE type=''table'' AND name=''' +
+      StringReplace(zTable, '''', '''''', [rfReplaceAll]) + ''''
+  else
+    zSql := 'SELECT count(*) FROM sqlite_schema WHERE type=''table''' +
+      ' AND name=''' + StringReplace(zTable, '''', '''''', [rfReplaceAll]) + '''';
+  pStmt := nil;
+  exists := 0;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zSql), -1, @pStmt, @pzTail);
+  if (rc = SQLITE_OK) and (pStmt <> nil)
+     and (sqlite3_step(pStmt) = SQLITE_ROW) then
+    exists := sqlite3_column_int(pStmt, 0);
+  if pStmt <> nil then sqlite3_finalize(pStmt);
+  if exists = 0 then begin
+    shellEPutZ(Format('Error: no such table: %s' +
+      ' (auto-create not supported in this build; CREATE TABLE first)'#10,
+      [zTable]));
+    importCleanup(sCtx);
+    Exit;
+  end;
+
+  { Discover column count via pragma_table_info. }
+  if zSchema <> '' then
+    zSql := 'SELECT count(*) FROM pragma_table_info(''' +
+      StringReplace(zTable,'''','''''',[rfReplaceAll]) + ''',''' +
+      StringReplace(zSchema,'''','''''',[rfReplaceAll]) + ''')'
+  else
+    zSql := 'SELECT count(*) FROM pragma_table_info(''' +
+      StringReplace(zTable,'''','''''',[rfReplaceAll]) + ''')';
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zSql), -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    shellEPutZ(Format('Error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+    importCleanup(sCtx);
+    Exit;
+  end;
+  if sqlite3_step(pStmt) = SQLITE_ROW then
+    nCol := sqlite3_column_int(pStmt, 0)
+  else
+    nCol := 0;
+  sqlite3_finalize(pStmt);
+  if nCol = 0 then begin importCleanup(sCtx); Exit; end;
+
+  { Build INSERT INTO "schema"."table" VALUES(?,?,...,?). }
+  if zSchema <> '' then
+    zSql := 'INSERT INTO "' +
+      StringReplace(zSchema, '"', '""', [rfReplaceAll]) + '"."' +
+      StringReplace(zTable, '"', '""', [rfReplaceAll]) + '" VALUES(?'
+  else
+    zSql := 'INSERT INTO "' +
+      StringReplace(zTable, '"', '""', [rfReplaceAll]) + '" VALUES(?';
+  for i := 1 to nCol - 1 do zSql := zSql + ',?';
+  zSql := zSql + ')';
+  if eVerbose >= 2 then
+    shellSPutZ('Insert using: ' + zSql + #10);
+
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zSql), -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    shellEPutZ(Format('Error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+    importCleanup(sCtx);
+    Exit;
+  end;
+
+  needCommit := sqlite3_get_autocommit(p^.db);
+  if needCommit <> 0 then sqlite3_exec(p^.db, 'BEGIN', nil, nil, nil);
+
+  repeat
+    startLine := sCtx.nLine;
+    i := 0;
+    while i < nCol do begin
+      if not xRead(sCtx) then begin
+        { EOF before any column on this row → stop quietly. }
+        if i = 0 then Break;
+        sqlite3_bind_null(pStmt, i + 1);
+        Inc(i);
+        Continue;
+      end;
+      z := sCtx.z;
+      if (p^.mode.eMode = MODE_Ascii) and (z = '') and (i = 0) then begin
+        i := -1; Break;
+      end;
+      sqlite3_bind_text(pStmt, i + 1, PAnsiChar(z), -1, SQLITE_TRANSIENT);
+      if (i < nCol - 1) and (sCtx.cTerm <> sCtx.cColSep) then begin
+        if (i = 0) and ((z = #10) or (z = #13#10)) then begin
+          { Trailing blank line under non-LF row separator — ignore. }
+          i := -1; Break;
+        end;
+        shellEPutZ(Format(
+          '%s:%d: expected %d columns but found %d - filling the rest with NULL'#10,
+          [sCtx.zFile, startLine, nCol, i + 1]));
+        j := i + 2;
+        while j <= nCol do begin
+          sqlite3_bind_null(pStmt, j);
+          Inc(j);
+        end;
+        i := nCol;
+        Break;
+      end;
+      Inc(i);
+    end;
+    if i < 0 then Break;
+    if (sCtx.cTerm = sCtx.cColSep) and (i = nCol) then begin
+      { Extra columns on the row — drain them and warn. }
+      j := i;
+      repeat
+        xRead(sCtx);
+        Inc(j);
+      until sCtx.cTerm <> sCtx.cColSep;
+      shellEPutZ(Format(
+        '%s:%d: expected %d columns but found %d - extras ignored'#10,
+        [sCtx.zFile, startLine, nCol, j]));
+    end;
+    if i >= nCol then begin
+      sqlite3_step(pStmt);
+      rc := sqlite3_reset(pStmt);
+      if rc <> SQLITE_OK then begin
+        shellEPutZ(Format('%s:%d: INSERT failed: %s'#10,
+          [sCtx.zFile, startLine, AnsiString(sqlite3_errmsg(p^.db))]));
+        Inc(sCtx.nErr);
+        if bail_on_error <> 0 then Break;
+      end else
+        Inc(sCtx.nRow);
+    end;
+  until sCtx.cTerm = IMPORT_EOF;
+
+  sqlite3_finalize(pStmt);
+  if needCommit <> 0 then sqlite3_exec(p^.db, 'COMMIT', nil, nil, nil);
+  if eVerbose > 0 then
+    shellSPutZ(Format('Added %d rows with %d errors using %d lines of input'#10,
+      [sCtx.nRow, sCtx.nErr, sCtx.nLine - 1]));
+  importCleanup(sCtx);
+end;
+
 function doMetaCommand(const zLine: AnsiString; p: PShellState): i32;
 var
   zCmd: AnsiString;
@@ -3079,6 +3568,7 @@ begin
   if zCmd = 'width'     then begin cmdWidth(p, args, nArg); Exit; end;
   if zCmd = 'parameter' then begin cmdParameter(p, args, nArg); Exit; end;
   if zCmd = 'read'      then begin cmdRead(p, args, nArg); Exit; end;
+  if zCmd = 'import'    then begin cmdImport(p, args, nArg); Exit; end;
   if (zCmd = 'backup') or (zCmd = 'save') then begin
     cmdBackup(p, args, nArg, zCmd); Exit;
   end;

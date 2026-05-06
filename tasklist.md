@@ -848,9 +848,21 @@ existing dispatcher.
        rowid DESC`, and explicit column-list INSERTs (via
        `tableColumnList`) defer to a follow-up.  Round-trip verified
        on simple schemas; used by `.once` integration test.
-  [ ] **10.1.24** `.import` — CSV / ASCII import.  ImportCtx struct,
-       `csv_read_one_field`, `ascii_read_one_field`, auto-create
-       table from header row, transactional bulk-insert path.
+  [~] **10.1.24** `.import` — initial cut landed (cmdImport):
+       ImportCtx + importGetc + importAppendChar + csvReadOneField +
+       asciiReadOneField mirror shell.c.in:4958..5150; the dispatcher
+       handles `-csv`, `-ascii`, `-schema`, `-skip N`, `-v`, `-esc`,
+       `-qesc`, `-colsep`, `-rowsep` and runs the bulk INSERT in a
+       single transaction (BEGIN/COMMIT gated on sqlite3_get_autocommit).
+       BOM strip, RFC-4180 quoted fields with embedded separators /
+       row terminators / doubled quotes, the per-row "expected N found
+       M — filling with NULL / extras ignored" warnings, and the final
+       `Added R rows with E errors using L lines` -v breadcrumb all
+       wired.  Deferred: the auto-create-from-header path (zAutoColumn,
+       shell.c.in:7165..7470 — needs the side-memory ColNames db),
+       the `<<MARK` heredoc input mode (shell.c.in:7601..7638), and
+       pipe input (`|cmd`).  Destination table must exist; clear
+       error otherwise.
   [X] **10.1.25** `.output` / `.once` — cmdOutput landed.
        Redirection sits at the POSIX-fd level (dup the original
        stdout at startup; dup2 the file fd onto fd 1 to redirect;
@@ -996,6 +1008,13 @@ existing dispatcher.
        to match upstream.
   [X] **10.1.59** `.breakpoint` — cmdBreakpoint no-op stub
        (gdb-attach hook only; not exercised by any gate).
+
+- [ ] **10.1.bug.1** Header row leaks into `.mode list` output even when
+  `.headers on` was never issued.  Upstream prints data rows only.
+  Found while gating .import (10.1.24) against system sqlite3:
+  `bin/passqlite3 foo.db <<<'CREATE TABLE t(...);.import --csv f.csv t;
+  SELECT * FROM t;'` emits the column titles before the rows.  Likely
+  in emitHeader/renderInit defaults (rs.headersOn from spec.bTitles).
 
 - [ ] **10.2** Integration parity: `bin/passqlite3 foo.db` ↔
   `sqlite3 foo.db` on a scripted corpus that unions all 10.1a..f
