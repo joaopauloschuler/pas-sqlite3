@@ -12936,11 +12936,9 @@ end;
 
   The C version asserts ALWAYS(p!=0) on the skipped expression and calls
   sqlite3ExprNNCollSeq() (non-null contract) for the match candidate.
-  Until the Phase 6.6 collation port lands, sqlite3ExprNNCollSeq is a
-  stub that returns nil.  We fall back to "treat unknown collation as
-  matching" so the BINARY-default corpus works without false negatives;
-  once Phase 6.6 wires real CollSeq objects, this fallback becomes a
-  dead branch (pColl is then never nil per the upstream contract). }
+  sqlite3ExprNNCollSeq is now ported with the C non-null contract
+  (codegen.pas:24956 — falls back to db^.pDfltColl), so pColl=nil here
+  is now defensive only. }
 function findIndexCol(pParse: PParse; pList: PExprList; iBase: i32;
   pIdx: PIndex2; iCol: i32): i32;
 var
@@ -47649,8 +47647,8 @@ end;
 // ---------------------------------------------------------------------------
 // sqlite3WindowRewrite — rewrite SELECT for window functions (window.c:958)
 // Productive port: builds the sub-SELECT subquery used for window-function
-// row buffering.  Inner sqlite3WindowCodeInit/Step bodies fully ported below;
-// not yet wired through sqlite3Select (still bails on `p^.pWin <> nil`).
+// row buffering.  Wired into sqlite3Select's window arm (codegen.pas
+// ~23207); inner sqlite3WindowCodeInit/Step bodies fully ported below.
 // ---------------------------------------------------------------------------
 function sqlite3WindowRewrite(pParse: PParse; p: PSelect): i32;
 var

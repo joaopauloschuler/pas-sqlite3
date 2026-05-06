@@ -422,9 +422,25 @@ FPC porting traps that recur often enough to call out up-front:
             PARTITION grp + sum PARTITION grp + rank ORDER val)
             returns empty result set.  Two-window same-partition
             case (`multi window same partition`) PASSes — gap
-            opens once the windows have incompatible specs.  C
-            handles via per-window sub-select chaining
-            (window.c:1119+ the second-window-and-onward arm).
+            opens once the windows have incompatible specs.
+            Root cause (verified 2026-05-06): `sqlite3WindowLink`
+            only links windows whose specs match the first one
+            already linked (`sqlite3WindowCompare(...)==0`,
+            i.e. *identical*); incompatible windows stay
+            orphaned with `pNextWin=nil`, never enter
+            `pSel^.pWin` chain, so `sqlite3WindowCodeInit/Step`
+            never populates their `regResult`.  At
+            `sqlite3ExprCodeTarget` (codegen.pas:~5638) the
+            EP_WinFunc fast-path falls through (regResult=0)
+            and the func evaluates as a scalar, producing the
+            empty result.  Fix path (matches C, but unported):
+            iterate over the orphaned windows and wrap them
+            in nested sub-SELECTs (like `sqlite3WindowRewrite`
+            does for the linked group), one rewrite layer per
+            distinct partition/order.  Substantial port —
+            requires extending `selectWindowRewriteEList` to
+            walk the orphan list and emit successive sub-
+            SELECT layers.
        [X] Subset-gate lift: outer ORDER BY (`SELECT ... OVER ...
             FROM t ORDER BY ...`).  Sorter opened before WhereBegin;
             gosub body emits SorterInsert (orderby keys ++ result
