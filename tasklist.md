@@ -670,33 +670,55 @@ landings cannot silently no-op.
 
 Sub-tasks 10.1.x decompose 10.1a..10.1f into one item per dot-command
 or helper.  Source references are line ranges in
-`../sqlite3/src/shell.c.in`.  No `passqlite3shell.pas` exists yet, so
-*every* item is missing — this list exists to break the 13 816-line
-file into reviewable chunks.
+`../sqlite3/src/shell.c.in`.  Skeleton landed 2026-05-06 in
+`src/passqlite3shell.pas` (~990 lines, built into `bin/passqlite3` by
+`src/tests/build.sh`); 10.1.7..10.1.59 hang per-command arms off the
+existing dispatcher.
 
-- [ ] **10.1a** Skeleton + arg parsing + REPL loop.  Entry point,
-  command-line flag parser, `ShellState` struct, line reader,
-  prompts, the read-eval-print loop, statement-completeness via
-  `sqlite3_complete`, exit codes.  Gate: `tests/cli/10a_repl/`.
+- [~] **10.1a** Skeleton + arg parsing + REPL loop.  Entry point,
+  command-line flag parser, `ShellState` struct, line reader, prompts,
+  the read-eval-print loop, statement-completeness via
+  `sqlite3_complete`, exit codes.  Skeleton landed 2026-05-06; full
+  arg-parser coverage pending under 10.1.3.  Gate: `tests/cli/10a_repl/`
+  (not yet created — 10.2 will scaffold it).
 
-  [ ] **10.1.1** `ShellState` record + global state (shell.c.in
-       `struct ShellState` ~3650).  Counters, mode flags, current
-       output FILE*, prompt strings, history settings.
-  [ ] **10.1.2** `process_input` / `one_input_line` REPL core
-       (~12530..12700).  Statement-completeness via `sqlite3_complete`,
-       continuation-prompt switching, `.echo` plumbing.
-  [ ] **10.1.3** `main` + `process_command_line` argument parser
-       (~13200..13816).  All `-bail`, `-batch`, `-cmd`, `-init`,
-       `-readonly`, `-newline`, `-mode`, `-separator`, `-nullvalue`,
-       `-header`, `-version`, etc.
-  [ ] **10.1.4** Line reader / readline integration
-       (`local_getline` + `shell_readline`).  Includes basic edit
-       support when linked without GNU readline.
-  [ ] **10.1.5** Exit-code mapping + `interrupt_handler` + signal wiring.
-  [ ] **10.1.6** `do_meta_command` dispatcher skeleton (~9100) —
-       parses `.foo` lines, splits into `azArg[]`, invokes per-command
-       handler.  Initially returns "unknown command" for everything;
-       per-command handlers land in the 10.1.7..10.1.42 sub-tasks.
+  [X] **10.1.1** `ShellState` record + global state (shell.c.in
+       `struct ShellState` ~363..441) — landed 2026-05-06 in
+       passqlite3shell.pas.  All non-FIDDLE non-SESSION fields ported
+       1:1, plus the Mode / ModeInfo / TDotCmdLine / TAuxDb /
+       TSavedMode satellites and the full constant blocks (AUTOEQP_*,
+       SHELL_OPEN_*, SHELL_TRACE_*, SHELL_PROGRESS_*, SHFLG_*,
+       MODE_*, MFLG_*, DFLT_*, SEP_*).  aModeInfo[] / aModeStr[] /
+       qrfEscNames / qrfQuoteNames carried verbatim from
+       shell.c.in:480..605.
+  [~] **10.1.2** `process_input` / `one_input_line` REPL core landed
+       2026-05-06 (passqlite3shell.pas processInput / oneInputLine).
+       Continuation prompt + sqlite3_complete-driven dispatch + dot/
+       hash early-exit + bail_on_error all wired.  `.echo` plumbing
+       and the upstream `quickscan` state machine (which gates the
+       buffer growth path more tightly) are deferred — current cut
+       falls back to raw sqlite3_complete on every accumulated
+       semicolon, matching upstream's pre-quickscan branch.
+  [~] **10.1.3** `main` + `process_command_line` argument parser —
+       initial cut (2026-05-06) handles `-bail`, `-batch`, `-readonly`,
+       `-version`, `-help`, `--`, plus a positional FILENAME and
+       optional trailing SQL string.  Remaining flags (`-cmd`, `-init`,
+       `-newline`, `-mode`, `-separator`, `-nullvalue`, `-header`, the
+       SHFLG_* toggles, `-vfs`, `-stats`, `-zip`, `-deserialize`, …)
+       still pending; tracked here.
+  [X] **10.1.4** Line reader / readline integration — basic
+       `localGetLine` (LF / CRLF aware) + `oneInputLine` landed
+       2026-05-06.  GNU readline integration (history, line editing)
+       deferred to a 10.1.4 follow-up; current cut uses FPC stdin.
+  [X] **10.1.5** Exit-code mapping + `interrupt_handler` + signal
+       wiring — `installInterruptHandler` (SIGINT → seenInterrupt +
+       sqlite3_interrupt(globalDb)) landed 2026-05-06.
+  [X] **10.1.6** `do_meta_command` dispatcher skeleton — landed
+       2026-05-06.  `.quit` / `.exit` exit cleanly; `.help` / `.show`
+       are minimal stubs; every other dot-command emits
+       `Error: unknown command or invalid arguments:  "<name>". Enter ".help" for help`
+       — verified byte-identical to system `sqlite3` for `.foo`.
+       Per-command handlers land in 10.1.7..10.1.59.
 
 - [ ] **10.1b** Output modes + formatting controls.  `.mode`
   (`list`, `line`, `column`, `csv`, `tabs`, `html`, `insert`, `quote`,
