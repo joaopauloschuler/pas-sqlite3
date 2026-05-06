@@ -17332,21 +17332,32 @@ begin
       For shapes with no IN-RHS to hoist (plain FULL scan, LIKE,
       MULTI_OR …), the Noop is suppressed so the existing PASS rows
       do not regress. }
-    sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrBrk);
-    pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
-    if HasInRhsToHoist then
+    if (pTabItem^.fg.fgBits and u8($80)) <> 0 then
     begin
-      sqlite3VdbeAddOp0(v, OP_Noop);
-      DoInRhsHoist;
+      { 6.10 step 9(f) — recursive-CTE pseudo-cursor (one row, populated
+        per outer dequeue iteration in generateWithRecursiveQuery).  No
+        Rewind/Next; mirrors wherecode.c:2568..2571 isRecursive arm. }
+      pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
+      pLevel^.op       := OP_Noop;
+    end
+    else
+    begin
+      sqlite3VdbeAddOp2(v, OP_Rewind, pLevel^.iTabCur, pLevel^.addrBrk);
+      pLevel^.addrBody := sqlite3VdbeCurrentAddr(v);
+      if HasInRhsToHoist then
+      begin
+        sqlite3VdbeAddOp0(v, OP_Noop);
+        DoInRhsHoist;
+      end;
+      pLevel^.op := OP_Next;
+      pLevel^.p1 := pLevel^.iTabCur;
+      pLevel^.p2 := pLevel^.addrBody;
+      { pLevel^.p5 = SQLITE_STMTSTATUS_FULLSCAN_STEP — stmt-status counter
+        bump emitted on every iteration of a no-index scan (wherecode.c:2221
+        and 2579 both set this for the table-scan / index-scan tail).
+        Without it the FULL row's OP_Next disagrees with C on p5 only. }
+      pLevel^.p5 := SQLITE_STMTSTATUS_FULLSCAN_STEP;
     end;
-    pLevel^.op := OP_Next;
-    pLevel^.p1 := pLevel^.iTabCur;
-    pLevel^.p2 := pLevel^.addrBody;
-    { pLevel^.p5 = SQLITE_STMTSTATUS_FULLSCAN_STEP — stmt-status counter
-      bump emitted on every iteration of a no-index scan (wherecode.c:2221
-      and 2579 both set this for the table-scan / index-scan tail).
-      Without it the FULL row's OP_Next disagrees with C on p5 only. }
-    pLevel^.p5 := SQLITE_STMTSTATUS_FULLSCAN_STEP;
   end;
 
   { Phase 6.9-bis 11g.2.f sub-progress 9 — per-row residual filter emission.
@@ -24276,7 +24287,15 @@ begin
     if SrcListItems(pTabList)[i].fg.fgBits and SRCITEM_FG_IS_SUBQUERY <> 0 then
       begin Result := SQLITE_OK; Exit; end;
     if pTab^.eTabType = TABTYP_VTAB then begin Result := SQLITE_OK; Exit; end;
-    if (pTab^.tabFlags and TF_Ephemeral) <> 0 then
+    { 6.10 step 9(f) — allow TF_Ephemeral source items that are recursive-CTE
+      pseudo-cursors (fgBits bit 7 set).  Their cursor is the OP_OpenPseudo
+      iCurrent opened by generateWithRecursiveQuery; WhereBegin's own open
+      prelude (codegen.pas:16887..16893) already skips opening it again, and
+      wherecode.c's isRecursive arm (codegen.pas:18553) makes the level a
+      no-op so no Rewind/Next is emitted.  Mirrors C select.c which lets
+      the standard scan path drive recursive sources. }
+    if ((pTab^.tabFlags and TF_Ephemeral) <> 0)
+       and ((SrcListItems(pTabList)[i].fg.fgBits and u8($80)) = 0) then
       begin Result := SQLITE_OK; Exit; end;
   end;
   { Restore pTab to the first source for legacy single-table code below. }

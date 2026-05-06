@@ -266,14 +266,14 @@ FPC porting traps that recur often enough to call out up-front:
       |----------|-----------|--------------|
       | step 8 (autoindex pIndex) | Not actually missing | `whereLoopAddBtreeIndex`, `whereLoopAddBtree`, `constructAutomaticIndex` all ported; pIndex IS assigned (codegen.pas:16157).  Nil-guard in `sqlite3WhereAddExplainText` likely covers a *different* (non-autoindex) scan-stand-in path.  Diagnostic, not codegen. |
       | step 9(e) (UNION ALL + LIMIT) | **CLOSED 2026-05-06** | Compound dispatch arm extended to port select.c:3007..3043 (LIMIT/OFFSET propagation onto pPrior via Expr-dup, OP_IfNot reuse, OP_OffsetLimit, JumpHere).  No-FROM fast path lifted its `pLimit=nil` gate — calls `computeLimitRegisters`, `codeOffset`, `OP_DecrJumpZero` around the single-row body. |
-      | step 9(f) (recursive CTE) | Partial port | `generateWithRecursiveQuery` + `recursiveInnerLoop` ported (codegen.pas:19825, 19917), but the dispatch arm at codegen.pas:22713..22743 still bails.  `sqlite3WithAdd` (build.c:5753) — no synthetic-table builder in Pas.  wherecode.c's `isRecursive` column-cache rewriting arm is not ported. |
+      | step 9(f) (recursive CTE) | **CLOSED 2026-05-06** | Two-line fix in `sqlite3Select` source-loop (codegen.pas:24279) and `sqlite3WhereCodeOneLoopStart` full-scan tail (codegen.pas:17312): allow TF_Ephemeral source items whose fgBits has the isRecursive bit ($80) set, and emit `pLevel^.op := OP_Noop` (no Rewind/Next) for the recursive pseudo-cursor.  Mirrors wherecode.c:2568..2571.  `count(*) FROM r` over `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<5)` now returns 5 (DiagFeatureProbe `CTE recursive` PASS). |
       | step 15(b) (`:memory:` rollback) | All ported, **logic bug** | `pager_open_journal`, `pager_playback`, `pager_playback_one_page`, `sqlite3MemJournalOpen` all present (passqlite3pager.pas:4132, 3667, 3505; memjournal ~:833).  Bug is in lazy-open-across-autocommit-boundary or memjournal record survival. |
       | step 15(c) (`:memory:` savepoint) | All ported, **logic bug** | `sqlite3PagerSavepoint` (passqlite3pager.pas:4641), `pagerPlaybackSavepoint` (:3593), `sqlite3BtreeSavepoint` (passqlite3btree.pas:6514) all complete.  Likely `pager_playback_one_page` savepoint-specific page-recovery branch is incomplete. |
 
       **Tractable wins (ascending difficulty):**
       1. ~~**step 9(e)**~~ — closed 2026-05-06.
-      2. **step 9(f)** — lift bail at codegen.pas:22713, port `sqlite3WithAdd` synthetic-table builder, port wherecode `isRecursive` column-cache rewrite.
-      3. **step 15(b/c)** — debugging existing code paths, not porting.  Step through with the C oracle.
+      2. ~~**step 9(f)**~~ — closed 2026-05-06.
+      3. ~~**step 15(b/c)**~~ — closed 2026-05-06.
       4. **step 8** — diagnostic; find which scan path leaves pIndex nil.
 
       [X] **c) View materialisation in SELECT.**  agg-on-subquery arm
@@ -291,15 +291,25 @@ FPC porting traps that recur often enough to call out up-front:
         before the row emission, and emits `OP_DecrJumpZero` after.
         DiagFeatureProbe rows `SELECT 1 LIMIT 1 (sub-FROM)`,
         `UNION ALL + LIMIT`, `UNION ALL + LIMIT + OFFSET` all PASS.
-      [~] **f) Recursive CTE not productive.**  Anchor row emits
-        (`count(*) FROM r` returns 1, C returns 5).  Bodies ported
-        (`generateWithRecursiveQuery` + `recursiveInnerLoop`); compound
-        dispatch wired.  Recursive step bails at TF_Ephemeral check
-        (codegen.pas:23367); lifting the bail when isRecursive bit
-        ($80) is set reaches the scan body but AVs at runtime — likely
-        culprit is incomplete pTab^.aCol/nCol on the synthetic table
-        or missing column-cache rewriting (wherecode.c isRecursive
-        arm) for refs against iCurrent.
+      [X] **f) Recursive CTE not productive.**  Closed 2026-05-06.
+        Anchor row emitted but recursive step `sqlite3Select(p, &destQueue)`
+        emitted no ops because the source-loop check at the top of
+        `sqlite3Select` (codegen.pas:24279) bailed on TF_Ephemeral for
+        every source.  Two-line fix:
+          - codegen.pas:24279 — allow TF_Ephemeral when the source item's
+            fgBits has the isRecursive bit ($80) set.  C dispatches the
+            recursive pseudo-cursor through the standard scan path; the
+            ephemeral guard was Pas-only.
+          - codegen.pas:17312 — full-scan tail in
+            `sqlite3WhereCodeOneLoopStart` was emitting OP_Rewind / OP_Next
+            unconditionally; gate that on `not isRecursive` and set
+            `pLevel^.op := OP_Noop` for recursive sources (mirrors
+            wherecode.c:2568..2571).
+        DiagFeatureProbe `CTE recursive` PASS (val=5).
+        TestExplainParity holds at 1026/1026.  No regressions across
+        DiagWindow / DiagTxn / DiagPragma / DiagDml / DiagIndexing /
+        DiagSubsel / DiagAggWhere / DiagInnerJoin / DiagMisc / DiagOps
+        / DiagMultiValues.
       [ ] **g) ALTER TABLE no-op.**
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
@@ -350,15 +360,15 @@ FPC porting traps that recur often enough to call out up-front:
        compound-SELECT/CTE) landed.  Verification (2026-05-06, a3):
        TestExplainParity 1026/1026; DiagPragma 0 divergences;
        DiagFeatureProbe view / sub-SELECT / UNION compound / CTE-simple
-       all PASS.  Residual recursive-CTE divergence is parser-side
-       (`WithAdd` / `CteNew` under 6.20), not a 6.13 codegen gap.
+       all PASS.  Recursive-CTE divergence closed 2026-05-06 under
+       6.10 step 9(f) (codegen-side, not parser-side).
 
        **Gate reach (rows closed by 6.13 landing):**
        - 6.10 step 6 sub-FROM (`SELECT a FROM (SELECT a FROM t)`) — closed
        - 6.10 step 9(c) view materialisation (`count(*) FROM v`) — closed
        - 6.10 step 9(e) UNION compound source — closed
-       - 6.10 step 9(f) WITH / CTE non-productive — recursive arm
-         remaining is parser-gated under 6.20
+       - 6.10 step 9(f) WITH / CTE non-productive — closed 2026-05-06
+         (recursive arm now PASS; was a codegen gap, not parser-gated)
        - 6.12 the 10 DiagPragma table-valued probes (eponymous-vtab
          path through pragma_table_info / pragma_index_list / …) — closed
        - DiagFeatureProbe rows (c) view, (e) compound, (f) CTE — closed
