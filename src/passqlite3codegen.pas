@@ -22555,6 +22555,8 @@ var
   iContW:       i32;
   iBreakW:      i32;
   regGosubW:    i32;
+  pSubSel:      PSelect;
+  selFlagsSavedW: u32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -23169,10 +23171,21 @@ begin
     else
       sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iCsr, 1);
     sqlite3SelectDestInit(@innerDest, SRT_EphemTab, iCsr);
-    if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+    { Window-rewrite OR'd SF_Aggregate from outer (window.c:1086) onto pSub.
+      Pas's sqlite3Select bails early on SF_Aggregate when no agg path matches
+      (the SRT_EphemTab dest doesn't fire the agg-no-GROUP-BY arm).  Strip
+      it for the materialise — the inner sub here is a plain row-by-row
+      scan; restore after so any later code that inspects pSub still sees
+      the C-faithful flag set. }
+    pSubSel := pItem^.u4.pSubq^.pSelect;
+    selFlagsSavedW := pSubSel^.selFlags;
+    pSubSel^.selFlags := pSubSel^.selFlags and (not u32(SF_Aggregate));
+    if sqlite3Select(pParse, pSubSel, @innerDest) <> SQLITE_OK then
     begin
+      pSubSel^.selFlags := selFlagsSavedW;
       Result := SQLITE_ERROR; Exit;
     end;
+    pSubSel^.selFlags := selFlagsSavedW;
 
     sqlite3WindowCodeInit(pParse, p);
 
@@ -43844,6 +43857,10 @@ begin
   fd.funcFlags := flgs;
   fd.xSFunc    := step;
   fd.xFinalize := final_;
+  { Window context (OP_AggValue) calls xValue.  C's WAGGREGATE registers
+    aggregates with xValue=xFinalize so `sum() OVER (...)` etc. work as
+    whole-frame window functions.  Wire the same here. }
+  fd.xValue    := final_;
   fd.zName     := nm;
 end;
 begin

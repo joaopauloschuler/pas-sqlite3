@@ -317,55 +317,81 @@ FPC porting traps that recur often enough to call out up-front:
                   ORDER BY / no LIMIT.  No regressions across
                   DiagWindow / DiagAggWhere / DiagFunctions /
                   DiagFeatureProbe / DiagInnerJoin / DiagDml.
-       [ ] **OPEN BLOCKER — inner subquery projecting wrong column.**
-            DiagWindow still 12/12 divergences.  Window pipeline now
-            reaches step-time without crashing; rows are produced
-            but values are wrong because the rewritten inner sub
-            materialises the WRONG column.  For
-            `SELECT sum(b) OVER () FROM t` the bytecode shows
-            `OP_Column 0,0,4` (reading t.a, col 0) when it should be
-            `OP_Column 0,1,4` (reading t.b, col 1).
-            Cross-checked: WindowRewrite *does* correctly append [b]
-            to pSublist via the per-window pArgs loop at
-            codegen.pas:47419; pSublist becomes the inner sub's
-            pEList.  Hypotheses to check next session, in order:
-              1. WindowRewrite at codegen.pas:47383 ORs SF_Aggregate
-                 onto the inner pSub even when its pEList is bare
-                 columns (mirrors window.c:1085).  Pas's inner
-                 sqlite3Select then takes an SF_Aggregate fast-path
-                 that ignores the rewritten pEList and emits its
-                 own column ordering.  Try clearing SF_Aggregate
-                 on pSub before invoking sqlite3Select from the
-                 window arm — confirm via bytecode dump.
-              2. selectWindowRewriteExprCb may be re-walking the
-                 dup'd `b` after it's appended to pSublist and
-                 mutating its iColumn to 0 (the iEphCsr column
-                 index in the OUTER pEList rewrite).  Add a
-                 trace inside the walker dumping pExpr^.iColumn
-                 and pExpr^.iTable per visit to confirm.
-              3. pas's inner sqlite3Select may run the markAggregate
-                 / agg-codegen path which assumes accumulator-
-                 column order vs result-column order; check
-                 nAccumulator and the column-emit loop.
-            Quick repro: src/tests/DiagWindow `sum() OVER all` row.
-            Bytecode dump tool used last session lives at
-            /tmp/dwinmin.pas (one-shot fpc invocation).
+       [X] Inner-subquery materialise: clear SF_Aggregate on pSub
+            before the inner `sqlite3Select(@innerDest=SRT_EphemTab)`
+            call in the wired window arm (codegen.pas:23172).
+            sqlite3WindowRewrite ORs SF_Aggregate from outer onto
+            pSub (mirrors window.c:1086) — Pas's sqlite3Select then
+            silently bails at the SF_Aggregate exit gate
+            (codegen.pas:23603, the path C handles via its general
+            agg codegen but Pas's agg arms gate on
+            eDest=SRT_Output|SRT_Mem).  Stripping SF_Aggregate for
+            the materialise restores the row-by-row eph-table fill;
+            the flag is restored after so any later inspector still
+            sees the C-faithful state.  Suspected previously to be
+            "wrong inner column" — the bytecode column indices were
+            actually correct all along; the materialise loop just
+            wasn't running.
+       [X] Aggregate xValue dispatch — `MakeAgg` now sets
+            `fd.xValue := final_` for every built-in aggregate
+            (codegen.pas:43864).  C's WAGGREGATE registers
+            sum/total/avg/count/min/max with xValue=xFinalize so
+            `sum(x) OVER (...)` etc. work as whole-frame window
+            functions (OP_AggValue calls xValue, not xFinalize).
+            Without this, AggValue produced NULL → ResultRow output
+            was 0 even though AggStep accumulated correctly.  Closes
+            DiagWindow `sum() OVER all` and `avg() OVER`; 12 → 10
+            divergences.
+       [ ] **OPEN BLOCKER — inner sub ORDER BY support.**
+            All 10 remaining DiagWindow divergences (`sum() running`,
+            `partition sum`, `row_number basic`, `rank basic`,
+            `dense_rank`, `partition row_num`, `lag basic`,
+            `lead basic`, `first_value`, `ntile 2`) share one cause:
+            the rewritten inner pSub carries an ORDER BY (PARTITION
+            BY ++ ORDER BY of the OVER clause) and Pas's
+            sqlite3Select bails on `pOrderBy != nil` when
+            pDest^.eDest != SRT_Output (codegen.pas:24168 — the
+            ORDER-BY-bail emits OpenRead+Rewind+Next but no body, so
+            the eph cur 5 ends up empty and the window machinery
+            iterates zero rows).  The `bSort` gate at
+            codegen.pas:24073 only fires for SRT_Output; SRT_EphemTab
+            falls into the bail.
+            Two paths forward, in order of effort:
+              1. Extend `bSort` to also fire for SRT_EphemTab and
+                 emit the SRT_EphemTab disposal inside generateSortTail
+                 (mirror C's pattern: SorterInsert in body, sort tail
+                 drains sorter into the eph table).  Cleanest, opens
+                 sort-into-eph for any caller.
+              2. Wired window arm only: replace the inner
+                 `sqlite3Select(SRT_EphemTab)` with a direct
+                 SorterOpen + scan + SorterInsert + SorterSort + drain
+                 sequence so ORDER BY is honoured even though
+                 sqlite3Select itself doesn't yet support it for
+                 non-Output destinations.  Less general but a smaller
+                 diff.
+            Whole-frame aggregates (`OVER ()` with no ORDER BY) and
+            single-PARTITION queries already work via the AggValue
+            fix above — the failures all involve ORDER BY in the
+            OVER clause.
        [ ] Frame-spec emission: ROWS / RANGE / GROUPS, with all
             five bound types (UNBOUNDED PRECEDING, n PRECEDING,
             CURRENT ROW, n FOLLOWING, UNBOUNDED FOLLOWING) and
             EXCLUDE clauses (NO OTHERS / CURRENT ROW / GROUP / TIES).
             Likely already covered by the windowCodeOp /
-            windowCodeRangeTest ports — gate is the inner-EList
-            blocker above plus DiagWindow once rows materialise.
+            windowCodeRangeTest ports — gate is the inner-sub
+            ORDER BY blocker above.
        [ ] Built-in window-function dispatch table:
             `row_number` / `rank` / `dense_rank` / `percent_rank` /
             `cume_dist` / `ntile` / `lag` / `lead` / `first_value` /
             `last_value` / `nth_value`.  Already registered via
             sqlite3WindowFunctions (codegen.pas:46550) at
-            connection-init.  Gate is the inner-EList blocker above.
-       [ ] Aggregate-as-window arm (`sum(x) OVER (...)`,
+            connection-init.  Gate is the inner-sub ORDER BY blocker.
+       [~] Aggregate-as-window arm (`sum(x) OVER (...)`,
             `avg(x) OVER (...)`, etc.) — reuses the regular agg
-            step function inside the frame loop.  Same gate.
+            step function inside the frame loop.  Whole-frame case
+            (no ORDER BY in OVER) PASSes via MakeAgg xValue wiring;
+            running-sum / partition-sum cases gated on inner-sub
+            ORDER BY blocker.
        [ ] Multi-window arm (one SELECT with several distinct
             OVER clauses sharing partitions).
        [ ] Once the inner-EList blocker clears, lift the subset
