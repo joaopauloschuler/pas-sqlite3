@@ -604,8 +604,9 @@ begin
     zOut  += nCopy;
     nRead -= iSpace;
     iChunkOffset := 0;
+    if nRead < 0 then break;
     pChunk := pChunk^.pNext;
-  until not ((nRead >= 0) and Assigned(pChunk) and (nRead > 0));
+  until (not Assigned(pChunk)) or (nRead <= 0);
 
   if Assigned(pChunk) then
     p^.readpoint.iOffset := iOfst + iAmt

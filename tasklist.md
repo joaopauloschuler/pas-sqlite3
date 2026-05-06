@@ -304,18 +304,28 @@ FPC porting traps that recur often enough to call out up-front:
         `RENAME COLUMN` and `ADD COLUMN` both prepare+step cleanly but
         do not modify the schema.  Tracked under 7.1.9.
 
-  [ ] **6.10 step 15** Runtime divergences surfaced by `DiagTxn`
-      (transactions, savepoints, conflict resolution).  2 remain.
-      [ ] **b) `BEGIN; ...; ROLLBACK` does not roll back on `:memory:`** —
-        DiagTxn `begin rollback insert` returns count=2 instead of 1.
-        `:memory:` uses journalMode=PAGER_JOURNALMODE_MEMORY; rollback
-        path depends on jfd being opened (memjournal) at write time.
-        Either lazy `pager_open_journal` is not firing across
-        autocommit→explicit-txn boundary, or memjournal records do not
-        survive into pager_playback for memdb.
-      [~] **c) `SAVEPOINT s; ROLLBACK TO s` does not unwind** —
-        schema-cache side fixed.  Remaining: memdb pager savepoint
-        reconciliation — btree pages not unwound on ROLLBACK TO.
+  [X] **6.10 step 15** Runtime divergences surfaced by `DiagTxn`
+      (transactions, savepoints, conflict resolution).  All PASS as of
+      2026-05-06 — DiagTxn 0 divergences; TestExplainParity 1026/1026;
+      TestPager / TestPagerRollback / TestPagerCompat all green.
+      [X] **b) `BEGIN; ...; ROLLBACK` does not roll back on `:memory:`** —
+      [X] **c) `SAVEPOINT s; ROLLBACK TO s` does not unwind** —
+        Both closed by single fix in `memjrnlRead`
+        (passqlite3pager.pas:599..610).  The Pas port advanced
+        `pChunk := pChunk^.pNext` unconditionally at the end of every
+        loop iteration; the C reference (memjournal.c) advances inside
+        the do-while condition only when more bytes remain.  After a
+        small read that fits in a single chunk, the Pas port cached a
+        `readpoint.pChunk` one chunk past the actual position, so the
+        next read at any offset within that chunk fell into the wrong
+        chunk and returned zero-filled bytes from page-record payload.
+        Concretely, `readJournalHdr` read nRec correctly at offset 8
+        but then read `dbOrigSize` (offset 16), `sectorSize` (offset 20)
+        and `pageSize` (offset 24) all as zero, failing the page-size
+        sanity check and returning SQLITE_DONE without playing back.
+        Replaced the unconditional advance with a conditional advance
+        matching C's `(pChunk = pChunk->pNext) != 0` semantics inside
+        the loop tail.
 
   [X] **6.10 step 17** Window-function and aggregate divergences
       surfaced by `DiagWindow`.  All PASS as of 2026-05-06 (multi-window
