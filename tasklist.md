@@ -500,12 +500,31 @@ FPC porting traps that recur often enough to call out up-front:
        schema-row INSERT/UPDATE wiring.  Closes 6.10 step 9(g) once
        7.1.1 lands.
 
-- [ ] **7.4b** Bytecode-diff scope of `TestParser.pas`.  Now that
-  Phase 8.2 wires `sqlite3_prepare_v2` end-to-end, extend `TestParser`
-  to dump and diff the resulting VDBE program (opcode + p1 + p2 + p3
-  + p4 + p5) byte-for-byte against `csq_prepare_v2`.  Reuses the 
-  corpus plus the SELECT / pragma / explain / commit / rollback /
-  analyze / vacuum / reindex statements.
+- [X] **7.4b** Bytecode-diff scope landed via `TestBytecodeParity.pas`.
+  Done 2026-05-06.  Drives `EXPLAIN <sql>` through `sqlite3_prepare_v2 /
+  sqlite3_step` on BOTH sides and diffs (opcode, p1, p2, p3, p4, p5)
+  byte-for-byte.  17/17 PASS today: CREATE TABLE simple/typed, DROP
+  TABLE/INDEX IF EXISTS, INSERT (VALUES + DEFAULT VALUES), UPDATE,
+  DELETE, BEGIN (default/IMMEDIATE/EXCLUSIVE/DEFERRED), COMMIT,
+  ROLLBACK, SAVEPOINT/RELEASE/ROLLBACK TO.  Companion fix: Pascal
+  `sqlite3VdbeList` (vdbe.c port) was setting EXPLAIN result column 6
+  to NULL instead of `pOp->p5` — TestExplainParity hid this by walking
+  `aOp[]` directly on the Pascal side; new gate exposed it and the
+  one-line fix in `passqlite3vdbe.pas` now mirrors `vdbeaux.c:2471`.
+
+  [ ] **7.4b.1** OP_Explain p4 string.  Pascal codegen emits OP_Explain
+       opcodes but never feeds the explain narrator, so p4 is empty for
+       e.g. `SELECT 1` (`SCAN CONSTANT ROW` on C).  Needed to add SELECT
+       literals back into the corpus.
+  [ ] **7.4b.2** OP_OpenRead p4 nField (P4_INT32) — Pascal emits the
+       full column count of the table (3 for `t(a,b,c)`); C emits
+       the field-count-actually-used (1 for `SELECT a FROM t`).  Gates
+       SELECT / DML over user tables back into the corpus.
+  [ ] **7.4b.3** OP_MakeRecord p4 affinity-string — empty on Pascal vs
+       e.g. `"BBBDB"` on C.  Triggered by any implicit/explicit index
+       build: CREATE INDEX, composite PRIMARY KEY, WITHOUT ROWID.
+       Needs `Index.zColAff` populated during `sqlite3IndexAffinityStr`
+       and threaded into the OP_MakeRecord emit site.
 
 - [X] **7.4c** `TestVdbeTrace.pas` differential opcode-trace gate.  Done
   2026-05-06.  `passqlite3vdbe` exports `gVdbeTraceBuf` and the

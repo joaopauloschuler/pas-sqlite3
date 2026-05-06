@@ -4067,7 +4067,10 @@ begin
         sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 2*SizeOf(TMem))^, pOp^.p1);
         sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 3*SizeOf(TMem))^, pOp^.p2);
         sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 4*SizeOf(TMem))^, pOp^.p3);
-        sqlite3VdbeMemSetNull (@PMem(PtrUInt(pMm) + 6*SizeOf(TMem))^);
+        { vdbeaux.c:2471 — column 6 is p5 as int64.  Was set to NULL here,
+          which made Pascal-side EXPLAIN report p5=0 always (TestExplainParity
+          worked around it by walking aOp[] directly on the Pascal side). }
+        sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 6*SizeOf(TMem))^, pOp^.p5);
         sqlite3VdbeMemSetNull (@PMem(PtrUInt(pMm) + 7*SizeOf(TMem))^);
         sqlite3VdbeMemSetStr(@PMem(PtrUInt(pMm) + 5*SizeOf(TMem))^,
                              zP4, -1, SQLITE_UTF8, SQLITE_DYNAMIC);

@@ -162,6 +162,7 @@ compile_test TestUnlockNotify
 compile_test TestLoadExt
 compile_test TestRowidIn
 compile_test TestExplainParity
+compile_test TestBytecodeParity
 compile_test TestWhereCorpus
 compile_test DiagAggWhere
 compile_test DiagAnalyze
