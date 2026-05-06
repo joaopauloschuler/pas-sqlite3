@@ -8307,7 +8307,65 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     if pList = nil then Exit;
     items := ExprListItems(pList);
     for i := 0 to pList^.nExpr - 1 do
+    begin
+      { Skip ORDER BY terms whose iOrderByCol was pre-tagged by the
+        alias / integer / structural-compare passes — sqlite3ResolveOrderGroupBy
+        will rewrite the term into a copy of the matching result-set
+        expression, so name-resolving the original (which may be a bare
+        alias not present in pSrcList) is unnecessary and would error
+        out.  Mirrors resolve.c:1798..1818 short-circuit. }
+      if items[i].u.x.iOrderByCol <> 0 then Continue;
       ResolveExpr(items[i].pExpr);
+    end;
+  end;
+
+  { resolve.c:1472 — resolveAsName.  When pE is a bare TK_ID, scan
+    pEList for a result-set item whose ENAME_NAME alias matches the
+    token (case-insensitive).  Returns iCol+1 on hit, 0 otherwise. }
+  function ResolveAsName(pEList: PExprList; pE: PExpr): i32;
+  var
+    i:    i32;
+    items: PExprListItem;
+    zCol: PAnsiChar;
+  begin
+    Result := 0;
+    if (pE = nil) or (pE^.op <> TK_ID) or (pEList = nil) then Exit;
+    if (pE^.flags and EP_IntValue) <> 0 then Exit;
+    zCol := pE^.u.zToken;
+    if zCol = nil then Exit;
+    items := ExprListItems(pEList);
+    for i := 0 to pEList^.nExpr - 1 do
+    begin
+      if (items[i].zEName <> nil)
+         and ((items[i].fg.eBits and $03) = ENAME_NAME)
+         and (sqlite3StrICmp(items[i].zEName, zCol) = 0) then
+      begin
+        Result := i + 1;
+        Exit;
+      end;
+    end;
+  end;
+
+  { resolve.c:1797..1806 — alias-arm tagging for ORDER BY terms.  Walks
+    pOrderBy and, for each bare-TK_ID term, sets u.x.iOrderByCol when an
+    AS-name match is found in p^.pEList.  GROUP BY skips this step. }
+  procedure ResolveAliasOrderByCol(pList: PExprList);
+  var
+    i, iCol: i32;
+    items: PExprListItem;
+    pE2: PExpr;
+  begin
+    if (pList = nil) or (p^.pEList = nil) then Exit;
+    items := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+    begin
+      if items[i].u.x.iOrderByCol <> 0 then Continue;
+      pE2 := sqlite3ExprSkipCollateAndLikely(items[i].pExpr);
+      if pE2 = nil then Continue;
+      iCol := ResolveAsName(p^.pEList, pE2);
+      if iCol > 0 then
+        items[i].u.x.iOrderByCol := u16(iCol);
+    end;
   end;
 
   { resolve.c:1820..1833 structural-compare arm — for any ORDER BY /
@@ -8376,6 +8434,14 @@ begin
   ResolveExpr    (p^.pWhere);
   ResolveExprList(p^.pGroupBy);
   ResolveExpr    (p^.pHaving);
+
+  { resolve.c:1797..1806 — alias-arm runs BEFORE ResolveExprList on
+    pOrderBy so a bare alias TK_ID gets tagged via iOrderByCol and is
+    skipped by name resolution (which would otherwise fail with
+    "no such column: rn"). }
+  if p^.pOrderBy <> nil then
+    ResolveAliasOrderByCol(p^.pOrderBy);
+
   ResolveExprList(p^.pOrderBy);
 
   { Integer-arm tagging + structural-compare match + alias rewrite for

@@ -246,9 +246,8 @@ FPC porting traps that recur often enough to call out up-front:
             arm at resetAccumulatorSimple covers the same ground.
 
   [X] **6.26** Window functions (window.c).
-       DiagWindow: 2 divergences open (multi-window arm,
-       outer-ORDER-BY-by-alias resolver gap).  All other rows
-       PASS.
+       DiagWindow: 1 divergence open (multi-window arm with
+       distinct partition/order specs).  All other rows PASS.
        Gate: DiagWindow — closes 6.10 step 17(c) (rank, dense_rank,
        lag, lead, first_value, ntile prepare-time failures) and step
        17(d) (`sum() OVER (...)`, `row_number() OVER (...)` empty
@@ -433,8 +432,10 @@ FPC porting traps that recur often enough to call out up-front:
             OpenPseudo + SorterSort + SorterData + per-col Column
             extract + ResultRow + SorterNext.  DiagWindow `window
             outer order` PASSes.  Outer-ORDER-BY-by-alias
-            (`AS rn ... ORDER BY rn`) is a *separate* resolve-side
-            gap — "no such column" at prepare time; still open.
+            (`AS rn ... ORDER BY rn`) closed via ResolveAsName
+            port (resolve.c:1472..1494) wired into sqlite3SelectExpr
+            ahead of ResolveExprList for pOrderBy.  DiagWindow
+            `window outer order alias` PASSes.
        [X] Subset-gate lift: outer DISTINCT (`SELECT DISTINCT
             ... OVER ...`).  Dedup ephemeral opened before
             WhereBegin; per-row OP_Found + IdxInsert in gosub
