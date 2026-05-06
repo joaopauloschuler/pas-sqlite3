@@ -83,6 +83,42 @@ FPC porting traps that recur often enough to call out up-front:
      [~] Multi-row VALUES — runtime DONE; bytecode-Δ remains (C=22 vs
           Pas=17 — coroutine arm of sqlite3MultiValues).  INSERT FROM
           SELECT bails — folds into 6.10 step 6 sub-FROM.
+          Close-out plan (land steps 1+2 together — step 1 alone would
+          break DiagMultiValues runtime since the parser would emit a
+          viaCoroutine Select that sqlite3Insert can't yet consume):
+          [ ] 1. Port `sqlite3MultiValues` coroutine arm
+               (insert.c:705..783).  On 2nd-row call: allocate wrapper
+               Select, viaCoroutine SrcItem, attach pLeft as subquery,
+               allocate `pSubq->regReturn` (++nMem) and `addrFillSub`,
+               emit OP_InitCoroutine, set `dest.iSdst = nMem+3` /
+               `nMem += 2 + nSdst` (the "two unused regs in front"
+               that step 2 reuses for regRowid/regIns), set
+               SF_MultiValue on pLeft, recurse `sqlite3Select(pLeft,
+               SRT_Coroutine)` to emit row-1 Integer ops + Yield, set
+               `pSubq->regResult = dest.iSdst`.  On 3rd+ rows: bump
+               `p->u1.nRow`.  Always at tail: ExprCodeExprList(pRow,
+               regResult) + OP_Yield(regReturn).
+          [ ] 2. Port `sqlite3Insert` viaCoroutine consumer arm
+               (insert.c:1120..1138 + tail at 1343/1619).  Detect
+               `pSelect->pSrc[0].fg.viaCoroutine` and reuse the
+               coroutine's allocations directly: dest.iSDParm =
+               regReturn, regFromSelect = regResult, regData =
+               regFromSelect, regRowid = regData-1, regIns = regRowid.
+               Emit ExplainQueryPlan SCAN, OpenWrite,
+               sqlite3VdbeReleaseRegisters(regData, nCol), Yield
+               (loop top, addrInsTop = addrCont), then route through
+               existing GenerateConstraintChecks + CompleteInsertion
+               for NewRowid/MakeRecord/Insert, close with Goto(addrCont)
+               + JumpHere(addrInsTop).
+          [ ] 3. Remove the now-dead `isMulti` inline-unrolled path
+               in sqlite3Insert (codegen.pas:29722..29773 detection +
+               29897 per-row Pascal loop).  Existed only because the
+               coroutine arm wasn't ported; redundant once 1+2 land.
+          [ ] 4. Verify: DiagMultiValues runtime stays green;
+               TestExplainParity flips `INSERT multi-row VALUES` to
+               PASS (1026/1026); no regressions across the other
+               1025 rows or the wider test suite (DiagDml,
+               DiagIndexing, etc.).
 
 - [X] **6.8.5** `sqlite3WhereEnd` — DONE.
 
