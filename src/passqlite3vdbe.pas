@@ -1415,6 +1415,15 @@ function  sqlite3VdbeFindCompare(pKey: Pointer): Pointer; { returns RecordCompar
 { Opcode name lookup (vdbeaux.c, used for EXPLAIN) }
 function  sqlite3OpcodeName(n: i32): PAnsiChar;
 
+{ Phase 7.4c — opcode-trace capture buffer.  When db^.flags has
+  SQLITE_VdbeTrace set, sqlite3VdbeExec appends one line per executed
+  opcode to gVdbeTraceBuf in the form '<pc> <opname> <p1> <p2> <p3> <p5>'#10.
+  The C reference (with SQLITE_DEBUG) writes the full trace to stdout via
+  sqlite3VdbePrintOp; TestVdbeTrace.pas captures the C stdout and parses
+  the same five fields per line for differential comparison. }
+var
+  gVdbeTraceBuf: AnsiString;
+
 { sqlite3BuiltinFunctions — global table of built-in SQL functions (callback.c).
   Initialized by sqlite3RegisterBuiltinFunctions. }
 var
@@ -1781,6 +1790,7 @@ function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
 implementation
 
 uses
+  SysUtils,        { Format — used by the Phase 7.4c trace capture }
   passqlite3vtab;  { Phase 6.bis.3a: VTable + sqlite3VtabBegin/CallCreate/CallDestroy/ImportErrmsg
                      — implementation-only to break the interface-side cycle (vtab uses vdbe). }
 
@@ -7414,6 +7424,14 @@ begin
   { ── Main interpreter loop ── }
   repeat
     Inc(nVmStep);
+
+    { Phase 7.4c — opcode-trace capture (mirrors C sqlite3VdbePrintOp call
+      gated by db->flags & SQLITE_VdbeTrace at vdbe.c:954). }
+    if (db^.flags and SQLITE_VdbeTrace) <> 0 then
+      gVdbeTraceBuf := gVdbeTraceBuf
+        + Format('%d %s %d %d %d %.2x'#10,
+                 [i32(pOp - aOp), sqlite3OpcodeName(pOp^.opcode),
+                  pOp^.p1, pOp^.p2, pOp^.p3, pOp^.p5]);
 
     { Dispatch }
     case pOp^.opcode of

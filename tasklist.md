@@ -507,10 +507,21 @@ FPC porting traps that recur often enough to call out up-front:
   corpus plus the SELECT / pragma / explain / commit / rollback /
   analyze / vacuum / reindex statements.
 
-- [ ] **7.4c** `TestVdbeTrace.pas` differential opcode-trace gate.
-  Needs SQL → VDBE end-to-end
-  through the Pascal pipeline so per-opcode traces can be diffed
-  against the C reference under `PRAGMA vdbe_trace=ON`.
+- [X] **7.4c** `TestVdbeTrace.pas` differential opcode-trace gate.  Done
+  2026-05-06.  `passqlite3vdbe` exports `gVdbeTraceBuf` and the
+  `sqlite3VdbeExec` main loop appends one normalised line per executed
+  opcode (`pc opname p1 p2 p3 p5`) when `db^.flags & SQLITE_VdbeTrace`
+  is set, mirroring the C reference's `sqlite3VdbePrintOp` call gated
+  on the same flag at vdbe.c:954.  The test enables the flag only for
+  the user statement's `sqlite3_step` (so schema-load bytecode emitted
+  during `prepare_v2` is excluded) and on the C side runs `PRAGMA
+  vdbe_trace=ON` after `csq_prepare_v2`, redirects libc fd-1 to a
+  temp file, parses the trace lines back out, and skips everything
+  before the last `VDBE Trace:` marker (the PRAGMA's own trace).
+  Corpus: 8 statements (`SELECT 1`, `SELECT 1+2`, `SELECT NULL`,
+  `SELECT 1,2,3`, `SELECT abs(-7)`, `SELECT 2*3+4`,
+  `SELECT length('hi')`, `SELECT 5>3`) — all pass byte-for-byte
+  on opcode/p1/p2/p3/p5.
 
 ---
 
