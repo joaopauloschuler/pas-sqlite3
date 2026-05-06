@@ -69,6 +69,9 @@ uses
   passqlite3uint,
   passqlite3base64,
   passqlite3totype,
+  passqlite3base85,
+  passqlite3eval,
+  passqlite3urifuncs,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -544,6 +547,12 @@ begin
   { Phase 10.1.65 — tointeger() / toreal() lossless conversion functions
     from ext/misc/totype.c. }
   sqlite3TotypeInit(p^.db);
+  { Phase 10.1.66 — base85() / is_base85() (ext/misc/base85.c),
+    eval(X) / eval(X,Y) (ext/misc/eval.c), and the sqlite3_uri_* /
+    sqlite3_filename_* SQL wrappers (ext/misc/urifuncs.c). }
+  sqlite3Base85Init(p^.db);
+  sqlite3EvalInit(p^.db);
+  sqlite3UrifuncsInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);

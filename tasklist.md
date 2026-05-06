@@ -1277,6 +1277,23 @@ existing dispatcher.
        rejected because FPC propagates `external 'c'` as register
        calling convention through @-of.  TestExplainParity 1026/1026;
        DiagFunctions / DiagOps / DiagFeatureProbe / TestVdbeAgg green.
+  [X] **10.1.66** ext/misc/base85.c (454 C lines), ext/misc/eval.c
+       (125 C lines), and ext/misc/urifuncs.c (209 C lines) ported as
+       three new units `passqlite3base85.pas`, `passqlite3eval.pas`,
+       `passqlite3urifuncs.pas` (~788 C lines total).  base85 provides
+       the base85() encoder/decoder + is_base85() checker (B85_DARK_MAX
+       80-char line breaks, RFC-style group framing); eval provides
+       eval(X) / eval(X,Y) recursive SQL runner with separator-joined
+       output; urifuncs provides the eight sqlite3_uri_* /
+       sqlite3_filename_* SQL wrappers for testing.  Wired via
+       sqlite3Base85Init / sqlite3EvalInit / sqlite3UrifuncsInit in
+       shell openDb.  Verified byte-identical against `.load
+       base85.so` / `.load eval.so` / `.load urifuncs.so`: base85
+       round-trip on 1..11 byte BLOBs, eval over multi-statement and
+       UNION pipelines (', ' separator), and the full uri/filename
+       set on a file-backed db.  TestExplainParity 1026/1026;
+       DiagFunctions / DiagFeatureProbe clean.
+
   [X] **10.1.65** ext/misc/totype.c port (528 C lines) — new unit
        `passqlite3totype.pas` provides tointeger(X) / toreal(X) lossless
        converters.  All helpers ported 1:1: totypeIsspace, totypeIsdigit,
