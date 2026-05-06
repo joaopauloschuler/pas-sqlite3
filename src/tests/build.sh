@@ -178,6 +178,7 @@ compile_test DiagDate
 compile_test DiagDbFileObject
 compile_test DiagDequoteToken
 compile_test DiagDml
+compile_test DiagDropTable
 compile_test DiagErrMsg
 compile_test DiagErrMsg16
 compile_test DiagExplainList

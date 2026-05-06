@@ -402,14 +402,25 @@ FPC porting traps that recur often enough to call out up-front:
       [X] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
         / `row_number() OVER (...)` empty rows** — Closed under 6.26.
 
-  [ ] **6.11** DROP TABLE remaining gap (current Δ=26):
-    (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
-        because the `sqlite3NestedParse(UPDATE %Q.sqlite_schema SET
-        rootpage=%d WHERE …)` sub-statement emitted at codegen.pas:30076
-        runs through `gNestedRunParser` but the resulting program does
-        not productively rewrite sqlite_schema (sqlite3Update on system
-        tables is gated on Phase 7.1.1 schema reload).  Only remaining
-        contributor.
+  [X] **6.11** DROP TABLE remaining gap.  Closed 2026-05-06.
+    (b) [X] Bytecode parity already at 1026/1026 in TestExplainParity
+        (DROP TABLE PASS at 49 ops vs C reference built with same
+        autovacuum settings).  Runtime parity now also clean: the
+        nested `DELETE FROM sqlite_master WHERE tbl_name=%Q` emitted
+        from `sqlite3CodeDropTable` is productively expanded
+        (where-loop DELETE arm via 6.5 ONEPASS_MULTI +
+        OpenTableAndIndices), and the trailing OP_ParseSchema reload
+        (closed under 6.10 step 9(g) — p4=NULL branch now
+        SchemaClear+InitOne) refreshes the in-memory schema so
+        re-CREATE / SELECT / INSERT against the same name behave
+        identically to C.  Verification (2026-05-06, a3): new
+        `DiagDropTable` probe — 9 / 9 PASS (drop+reselect,
+        drop+recreate, drop+recreate+insert content witness, drop
+        only, drop+select sqlite_master, drop indexed, drop two
+        tables one survives, drop indexed then recreate+insert).
+        TestExplainParity 1026/1026; no regressions across DiagDml /
+        DiagPragma / DiagFeatureProbe / DiagTxn / DiagWindow /
+        DiagMisc / DiagOps.
   [X] **6.12** port sqlite3Pragma in full.  Gate `DiagPragma` — all PASS.
 
   [X] **6.13** Non-regular FROM-item codegen in `sqlite3Select`
