@@ -1266,6 +1266,25 @@ existing dispatcher.
        rejected because FPC propagates `external 'c'` as register
        calling convention through @-of.  TestExplainParity 1026/1026;
        DiagFunctions / DiagOps / DiagFeatureProbe / TestVdbeAgg green.
+  [X] **10.1.65** ext/misc/totype.c port (528 C lines) — new unit
+       `passqlite3totype.pas` provides tointeger(X) / toreal(X) lossless
+       converters.  All helpers ported 1:1: totypeIsspace, totypeIsdigit,
+       totypeCompare2pow63 (compares 19-char run against 9223372036854775808
+       digit-by-digit, preserving last-digit signed delta), totypeAtoi64
+       (returns 0/1/2 for fits/overflow/exact-2^63), totypeAtoF (full
+       sign/significand/exponent state machine with the 22-then-308 power-
+       of-10 staging block), totypeDoubleToInt (clamped to the
+       ±9223372036854774784 INT64 endpoints to avoid UBSAN).  Endianness
+       guards collapse to little-endian (x86-64 Linux per README): integer
+       BLOBs are LE, float BLOBs are BE so they get reversed on x86.
+       Wired via `sqlite3TotypeInit(p^.db)` in shell openDb.  Verified
+       byte-identical against `.load /tmp/totype.so`: tointeger(123)=123,
+       tointeger(123.5)=NULL, tointeger('-9223372036854775808')=
+       -9223372036854775808, tointeger('9223372036854775808')=NULL (overflow),
+       tointeger(x'0100000000000000')=1 (LE), toreal(x'3ff0000000000000')=1.0
+       (BE), toreal('  0.5  ')=NULL (trailing-space rejection).
+       TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
+       DiagOps / DiagDml / DiagPragma all clean.
 
 - [X] **10.1.bug.3** Multi-statement command-line input dropped /
   corrupted statements past the 2nd or 3rd boundary.  Root cause was

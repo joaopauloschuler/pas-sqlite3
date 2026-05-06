@@ -68,6 +68,7 @@ uses
   passqlite3rot13,
   passqlite3uint,
   passqlite3base64,
+  passqlite3totype,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -540,6 +541,9 @@ begin
   sqlite3RotInit(p^.db);
   sqlite3UintInit(p^.db);
   sqlite3Base64Init(p^.db);
+  { Phase 10.1.65 — tointeger() / toreal() lossless conversion functions
+    from ext/misc/totype.c. }
+  sqlite3TotypeInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
