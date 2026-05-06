@@ -65,6 +65,9 @@ uses
   passqlite3uuid,
   passqlite3ieee754,
   passqlite3percentile,
+  passqlite3rot13,
+  passqlite3uint,
+  passqlite3base64,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -531,6 +534,12 @@ begin
     percentile_disc() aggregate / window functions from
     ext/misc/percentile.c. }
   sqlite3PercentileInit(p^.db);
+  { Phase 10.1.64 — rot13() function + rot13 collation
+    (ext/misc/rot13.c), uint collation (ext/misc/uint.c),
+    base64() function (ext/misc/base64.c). }
+  sqlite3RotInit(p^.db);
+  sqlite3UintInit(p^.db);
+  sqlite3Base64Init(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);

@@ -1248,6 +1248,24 @@ existing dispatcher.
        TestBytecodeParity 32/32; TestVdbeAgg 11/11; DiagFeatureProbe /
        DiagDml / DiagOps / DiagPragma / DiagFunctions / DiagAnalyze /
        DiagMisc / DiagCast / DiagCovering all clean.
+  [X] **10.1.64** ext/misc/rot13.c (115 C lines), ext/misc/uint.c
+       (92 C lines), and ext/misc/base64.c (297 C lines) ported as
+       three new units `passqlite3rot13.pas`, `passqlite3uint.pas`,
+       `passqlite3base64.pas` (~504 C lines, ~430 lines Pascal).
+       rot13() scalar + rot13 collation; uint collation (numeric-aware
+       lexicographic compare with arbitrary-length integer runs +
+       leading-zero handling); base64(X) scalar that toggles between
+       BLOB→base64-text and base64-text→BLOB per RFC 4648 with
+       72-char line breaks.  Wired via sqlite3RotInit / sqlite3UintInit
+       / sqlite3Base64Init in shell openDb.  Verified against RFC 4648
+       vectors ('' → empty, 'f' → 'Zg==', 'foobar' → 'Zm9vYmFy', and
+       round-trip), rot13(rot13(X))=X identity, and uint sort order
+       (a1, a2, a10, a100; z2, z9, z10).  Implementation note: the
+       destructor passed to sqlite3_result_text/_blob must be a cdecl
+       trampoline (`base64FreeDel`) — `@sqlite3_free` directly is
+       rejected because FPC propagates `external 'c'` as register
+       calling convention through @-of.  TestExplainParity 1026/1026;
+       DiagFunctions / DiagOps / DiagFeatureProbe / TestVdbeAgg green.
 
 - [ ] **10.1.bug.3** Aggregate query followed by another statement on
   the same shell input line trips "Parse error: incomplete input"
