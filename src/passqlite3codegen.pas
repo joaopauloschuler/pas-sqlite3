@@ -22796,6 +22796,21 @@ begin
       pDest^.iSdst := pParse^.nMem + 1;
       pParse^.nMem := pParse^.nMem + nResultCol;
     end;
+    { Multi-row VALUES coroutine register-numbering parity (Phase 6.8.6
+      step 5).  C's selectInnerLoop / multiSelectValues route allocates a
+      few transient temp regs while emitting the per-row Integer/Yield
+      body; sqlite3GetTempReg bumps pParse^.nMem and ReleaseTempReg
+      returns to the free pool but does NOT decrement nMem.  Our no-FROM
+      fast path bypasses selectInnerLoop entirely and so misses those
+      bumps — the downstream sqlite3Insert aRegIdx allocation then ends
+      up 3 registers below C, surfacing as MakeRecord p3 = 11 vs 14 on
+      `INSERT INTO t VALUES(...),(...)`.  Pre-bump nMem by the same
+      delta when the recursive Select is the body of a multi-row VALUES
+      coroutine (SF_MultiValue + SRT_Coroutine) so the consumer's
+      register layout aligns with C. }
+    if ((p^.selFlags and SF_MultiValue) <> 0)
+       and (pDest^.eDest = SRT_Coroutine) then
+      pParse^.nMem := pParse^.nMem + 3;
     { Skip OP_Explain when this Select is the body of a multi-row VALUES
       coroutine (SF_MultiValue set by sqlite3MultiValues recursion).  C
       mirrors the suppression — multiSelectValues emits a single SCAN
@@ -29885,24 +29900,17 @@ begin
   bIdListInOrder := u8(ord(
     (pTab^.tabFlags and (TF_OOOHidden or TF_HasStored)) = 0));
 
-  { Multi-row VALUES detection (Phase 6.10 step 19).  After
-    sqlite3MultiValues' UNION-ALL fallback (the only arm wired today),
-    the parser emits a chain of SF_Values selects linked through pPrior
-    with op=TK_ALL, each carrying one row in pEList and an empty pSrc.
-    Walk the chain, validate the shape, and collect the row pELists in
-    insertion order (leaf-first since pPrior chains backwards).
-    Any other pSelect shape (true SELECT-as-source, sub-coroutine, etc.)
-    still bails — those are tracked under 6.10 step 6.  Single-row
-    VALUES is captured into pList above; pSelect is nil here.
-    The viaCoroutine consumer arm (detected earlier) bypasses this
-    chain walk entirely. }
+  { Compound-SELECT-of-constants chain detection (Phase 6.8.6 narrowed scope).
+    Multi-row VALUES is now produced via sqlite3MultiValues' viaCoroutine
+    arm (caught above by useCoroutine), so the SF_Values fallback chain
+    no longer reaches here.  This block survives only to handle the
+    `INSERT INTO t SELECT a UNION ALL SELECT b ...` shape — every leaf
+    has empty FROM and is linked through pPrior with op=TK_ALL.  Any
+    other pSelect shape (true SELECT-as-source, etc.) bails — tracked
+    under 6.10 step 6.  Single-row VALUES is captured into pList above;
+    pSelect is nil here. }
   if (pSelect <> nil) and (not useCoroutine) then
   begin
-    { Accept either SF_Values multi-row VALUES chains or compound
-      `SELECT const-list UNION ALL SELECT const-list` chains where every
-      leaf has an empty FROM-clause and is linked through pPrior with
-      op=TK_ALL.  Both reduce to the same inline-unrolled emission since
-      each leaf carries a constant pEList row. }
     rowsOk := True;
     nRows := 0;
     pTmp := pSelect;
@@ -29925,7 +29933,6 @@ begin
       Dec(iRow);
       pTmp := pTmp^.pPrior;
     end;
-    { Validate column-count parity across rows. }
     for iRow := 1 to nRows - 1 do
     begin
       if (pRowsList[iRow] = nil)
@@ -29948,9 +29955,7 @@ begin
     MakeRecord / Insert sequence directly.  sqlite3GenerateConstraintChecks
     (6.8.2) and sqlite3CompleteInsertion (6.8.3) are now real bodies; the
     productive sqlite3Insert cascade routes through them via 6.8.6. }
-  { pList = nil  ⇔  INSERT … DEFAULT VALUES (insert.c:1213..1215).
-    For multi-row VALUES (isMulti), nColumn is taken from the first row;
-    parity across rows was already validated above. }
+  { pList = nil  ⇔  INSERT … DEFAULT VALUES (insert.c:1213..1215). }
   if useCoroutine then
     nColumn := pSubqCoro^.pSelect^.pEList^.nExpr
   else if isMulti then
@@ -30111,10 +30116,8 @@ begin
   end;
 
   { Per-row emission loop.  For single-row / DEFAULT VALUES this runs once
-    with pCurRow = pList (which may be nil for DEFAULT VALUES).  For
-    multi-row VALUES (isMulti) this loops over pRowsList[0..nRows-1],
-    re-emitting the column eval + rowid + GenerateConstraintChecks +
-    CompleteInsertion sequence per row.  For viaCoroutine this runs once
+    with pCurRow = pList.  For compound-SELECT-of-constants (isMulti) this
+    loops over pRowsList[0..nRows-1].  For viaCoroutine this runs once
     inside the bytecode loop framed above; the column-eval inner loop is
     skipped (or emits SCopy when regData != regFromSelect) since values
     arrive via OP_Yield. }
@@ -30318,10 +30321,20 @@ begin
   end;
 
   { viaCoroutine bytecode-loop tail — Goto to the OP_Yield at addrCont,
-    then resolve addrInsTop so coroutine exhaustion lands here. }
+    then resolve addrInsTop so coroutine exhaustion lands here.
+    insert.c:1619..1626 — when the op immediately before addrCont is
+    OP_ReleaseReg (our framing emits sqlite3VdbeReleaseRegisters just
+    before the Yield), set p5=1 on the Goto so the runtime knows the
+    register-release covers the loop body's working set. }
   if useCoroutine then
   begin
     sqlite3VdbeGoto(v, addrCont);
+    if (addrCont > 0)
+       and (sqlite3VdbeGetOp(v, addrCont - 1)^.opcode = OP_ReleaseReg) then
+    begin
+      Assert(sqlite3VdbeGetOp(v, addrCont)^.opcode = OP_Yield);
+      sqlite3VdbeChangeP5(v, 1);
+    end;
     sqlite3VdbeJumpHere(v, addrInsTop);
   end;
 

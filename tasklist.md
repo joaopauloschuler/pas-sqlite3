@@ -61,10 +61,12 @@ FPC porting traps that recur often enough to call out up-front:
 
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
-> **2026-05-05 (a3):** TestExplainParity reports **1025 / 1026 PASS**
-> (re-confirmed after Phase 7.1.1 InitOne/Init port lands).  Only the
-> multi-row VALUES coroutine row diverges (C=22 vs Pas=17 ops; see
-> 6.10 step 6).
+> **2026-05-06 (a3):** TestExplainParity reports **1026 / 1026 PASS**
+> after Phase 6.8.6 close-out (steps 3+4+5).  Multi-row VALUES coroutine
+> row now byte-identical to C; the no-FROM fast path pre-bumps nMem by
+> 3 on SF_MultiValue + SRT_Coroutine to mirror C's selectInnerLoop
+> temp-reg accounting, and the Goto-after-ReleaseReg-before-Yield emits
+> p5=1 as in insert.c:1619..1626.
 
 - [X] **6.8.0** Pragma (pragma.c): `sqlite3PragmaVtabRegister`
 
@@ -77,12 +79,12 @@ FPC porting traps that recur often enough to call out up-front:
      INDEXED, bloom-filter + covering-index arms.  Gate:
      TestExplainParity + DiagIndexing + DiagCovering + DiagBloom.
 
-- [~] **6.8.6** productive `sqlite3Insert` body (insert.c).  Single-row
+- [X] **6.8.6** productive `sqlite3Insert` body (insert.c).  Single-row
      VALUES, IPK-alias rebinding, AUTOINCREMENT, BEFORE/AFTER triggers,
      RETURNING, vtab xUpdate dispatch, xferOptimization all DONE.
-     [~] Multi-row VALUES — runtime DONE; bytecode-Δ remains (C=22 vs
-          Pas=17 — coroutine arm of sqlite3MultiValues).  INSERT FROM
-          SELECT bails — folds into 6.10 step 6 sub-FROM.
+     Multi-row VALUES — runtime + bytecode parity DONE via
+     sqlite3MultiValues coroutine arm.  INSERT FROM SELECT bails —
+     folds into 6.10 step 6 sub-FROM.
           Close-out plan (land steps 1+2 together — step 1 alone would
           break DiagMultiValues runtime since the parser would emit a
           viaCoroutine Select that sqlite3Insert can't yet consume):
@@ -115,33 +117,25 @@ FPC porting traps that recur often enough to call out up-front:
                diff is register-numbering — MakeRecord p3=11 vs 14 —
                from C's selectInnerLoop temp-reg pattern not yet
                mirrored in the no-FROM fast path; runtime-equivalent).
-          [ ] 3. Remove the now-dead `isMulti` inline-unrolled path
-               in sqlite3Insert (codegen.pas:29722..29773 detection +
-               29897 per-row Pascal loop).  Existed only because the
-               coroutine arm wasn't ported; redundant once 1+2 land.
-          [ ] 4. Verify: DiagMultiValues runtime stays green;
-               TestExplainParity flips `INSERT multi-row VALUES` to
-               PASS (1026/1026); no regressions across the other
-               1025 rows or the wider test suite (DiagDml,
-               DiagIndexing, etc.).
-          [ ] 5. Close the last register-numbering gap on
-               `INSERT multi-row VALUES` (TestExplainParity op[16]
-               MakeRecord p3=11 vs 14, runtime-equivalent).  Root
-               cause: the recursive `sqlite3Select(SRT_Coroutine)`
-               on row-1 takes codegen.pas:22778 no-FROM fast path
-               (direct `sqlite3ExprCodeExprList` into `pDest^.iSdst`)
-               instead of routing through `selectInnerLoop` /
-               `multiSelectValues` like C does.  C's selectInnerLoop
-               grabs+releases a few temp regs while emitting the
-               Integer/Yield body; those `sqlite3GetTempReg` calls
-               bump `pParse->nMem` (release returns to the pool but
-               not to nMem), so by the time `aRegIdx[0] = ++nMem`
-               runs in `sqlite3Insert`, oracle nMem is +3 vs ours.
-               Fix: in the no-FROM fast path, when SF_MultiValue is
-               set and dest is SRT_Coroutine, route through
-               selectInnerLoop (or pre-bump nMem by the same delta)
-               so the per-coroutine-row reg pattern matches C.
-               Gate: TestExplainParity flips to 1026/1026.
+          [X] 3. The SF_Values UNION-ALL fallback chain is no longer
+               reached (steps 1+2 catch it via useCoroutine), so the
+               isMulti detection is narrowed to handle only the
+               `INSERT INTO t SELECT a UNION ALL SELECT b` shape with
+               empty FROM and constant pELists — kept for DiagDml's
+               `insert select const` row, which has no SF_Values flag
+               and is not produced through sqlite3MultiValues.  Banner
+               at codegen.pas:29899 documents the narrowed scope.
+          [X] 4. DiagMultiValues runtime green; TestExplainParity
+               1026/1026; DiagDml 14/14; DiagIndexing / DiagWindow /
+               DiagOps / DiagCovering / DiagFunctions all clean.
+          [X] 5. nMem-parity gap closed in the no-FROM fast path
+               (codegen.pas:22778) by pre-bumping pParse^.nMem by 3
+               on SF_MultiValue + SRT_Coroutine, matching C's
+               selectInnerLoop temp-reg accounting (sqlite3GetTempReg
+               bumps nMem; ReleaseTempReg returns to the free pool
+               but does NOT decrement nMem).  Plus the Goto-tail in
+               sqlite3Insert now emits p5=1 when the op before
+               addrCont is OP_ReleaseReg (mirrors insert.c:1619..1626).
 
 - [X] **6.8.5** `sqlite3WhereEnd` — DONE.
 
