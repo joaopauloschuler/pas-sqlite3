@@ -139,6 +139,12 @@ const
   MFLG_CRLF  = $02;
   MFLG_HDR   = $04;
 
+  { QRF tri-state — qrf.h:142..147 }
+  QRF_SW_Off = 1;
+  QRF_SW_On  = 2;
+  QRF_No     = 1;
+  QRF_Yes    = 2;
+
   { Default values for QRF limits — shell.c.in:622..633 }
   DFLT_CHAR_LIMIT   = 300;
   DFLT_LINE_LIMIT   = 5;
@@ -461,11 +467,9 @@ begin
   { Mode defaults — shell.c.in main() roughly at 13072..13085 }
   p^.mode.eMode  := MODE_List;
   p^.mode.spec.eStyle := 12;          { QRF_STYLE_List }
-  p^.mode.spec.bTitles := 1;          { off by default in shell main() but
-                                        flipped on by .headers; keep at
-                                        1 here so the upcoming
-                                        .headers default test compares
-                                        cleanly. }
+  p^.mode.spec.bTitles := QRF_No;     { off by default; modeChangeBuiltin
+                                        will overwrite from aModeInfo.bHdr
+                                        unless MFLG_HDR pinned a user choice. }
   p^.mode.spec.zColumnSep := SEP_Column;
   p^.mode.spec.zRowSep := SEP_Row;
   p^.mode.spec.zNull := '';
@@ -891,7 +895,7 @@ begin
   rs.p           := p;
   rs.nCol        := sqlite3_column_count(pStmt);
   rs.rowsEmitted := 0;
-  rs.headersOn   := p^.mode.spec.bTitles <> 0;
+  rs.headersOn   := p^.mode.spec.bTitles = QRF_Yes;
   rs.zNull       := specStr(p^.mode.spec.zNull);
   rs.zColSep     := specStr(p^.mode.spec.zColumnSep);
   rs.zRowSep     := specStr(p^.mode.spec.zRowSep);
@@ -1371,7 +1375,7 @@ begin
     shellSPutZ(Format('%12s: %s'#10, ['explain',    'auto']))
   else
     shellSPutZ(Format('%12s: %s'#10, ['explain',    'off']));
-  shellSPutZ(Format('%12s: %s'#10, ['headers',      onOffStr(p^.mode.spec.bTitles <> 0)]));
+  shellSPutZ(Format('%12s: %s'#10, ['headers',      onOffStr(p^.mode.spec.bTitles = QRF_Yes)]));
   shellSPutZ(Format('%12s: %s'#10, ['mode',         StrPas(@aModeInfo[p^.mode.eMode].zName[0])]));
   shellSPutZ(Format('%12s: "%s"'#10, ['nullvalue',  specStr(p^.mode.spec.zNull)]));
   shellSPutZ(Format('%12s: "%s"'#10, ['colseparator', specStr(p^.mode.spec.zColumnSep)]));
@@ -1427,10 +1431,10 @@ begin
     Exit;
   end;
   if v <> 0 then begin
-    p^.mode.spec.bTitles := 1;
+    p^.mode.spec.bTitles := QRF_Yes;
     p^.mode.mFlags := p^.mode.mFlags or MFLG_HDR;
   end else begin
-    p^.mode.spec.bTitles := 0;
+    p^.mode.spec.bTitles := QRF_No;
     p^.mode.mFlags := p^.mode.mFlags and not MFLG_HDR;
   end;
 end;
@@ -1878,6 +1882,228 @@ begin
   if rc <> SQLITE_DONE then
     shellEPutZ('Error: ' + AnsiString(sqlite3_errmsg(pDest)) + sLineBreak);
   sqlite3_close(pDest);
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.45  `.clone NEWFILE`  — shell.c.in:5157..5368
+
+  Copies as much of the current "main" database as possible into a fresh
+  file at NEWFILE.  Unlike .backup, .clone runs through the SQL layer so
+  it can salvage rows from a partially-corrupt source: the schema is
+  replayed via sqlite3_exec(zSql), then each user table is enumerated by
+  SELECT * (with a fall-back to ORDER BY rowid DESC on read errors) and
+  re-inserted with INSERT OR IGNORE.  Faithful port of tryToClone /
+  tryToCloneSchema / tryToCloneData.
+  ---------------------------------------------------------------------- }
+
+type
+  TCloneForEachProc = procedure(p: PShellState; newDb: PTsqlite3;
+                                const zTable: AnsiString);
+
+procedure cloneTransferData(p: PShellState; newDb: PTsqlite3;
+                            const zTable: AnsiString); forward;
+
+procedure cloneTransferSchema(p: PShellState; newDb: PTsqlite3;
+                              const zWhere: AnsiString;
+                              xForEach: TCloneForEachProc);
+var
+  pQuery: PVdbe;
+  zQuery: AnsiString;
+  rc: i32;
+  zName, zSql: AnsiString;
+  pzErr: PAnsiChar;
+  zErrMsg: AnsiString;
+  pzTail: PAnsiChar;
+
+  function fetchText(col: i32): AnsiString;
+  var p2: PAnsiChar;
+  begin
+    p2 := PAnsiChar(sqlite3_column_text(pQuery, col));
+    if p2 = nil then Result := '' else Result := AnsiString(p2);
+  end;
+
+begin
+  pQuery := nil;
+  zQuery := 'SELECT name, sql FROM sqlite_schema WHERE ' + zWhere +
+            ' ORDER BY rowid ASC';
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zQuery), -1, @pQuery, @pzTail);
+  if rc <> SQLITE_OK then begin
+    shellEPutZ(Format('Error: (%d) %s on [%s]'#10,
+      [sqlite3_extended_errcode(p^.db),
+       AnsiString(sqlite3_errmsg(p^.db)), string(zQuery)]));
+    if pQuery <> nil then sqlite3_finalize(pQuery);
+    Exit;
+  end;
+  while True do begin
+    rc := sqlite3_step(pQuery);
+    if rc <> SQLITE_ROW then Break;
+    zName := fetchText(0);
+    zSql  := fetchText(1);
+    if (zName = '') or (zSql = '') then Continue;
+    if sqlite3_stricmp(PAnsiChar(zName), 'sqlite_sequence') <> 0 then begin
+      Write(zName, '... '); Flush(Output);
+      pzErr := nil;
+      sqlite3_exec(newDb, PAnsiChar(zSql), nil, nil, @pzErr);
+      if pzErr <> nil then begin
+        zErrMsg := AnsiString(pzErr);
+        shellEPutZ(Format('Error: %s'#10'SQL: [%s]'#10,
+          [string(zErrMsg), string(zSql)]));
+        sqlite3_free(pzErr);
+      end;
+    end;
+    if Assigned(xForEach) then xForEach(p, newDb, zName);
+    WriteLn('done');
+  end;
+  if rc <> SQLITE_DONE then begin
+    sqlite3_finalize(pQuery);
+    pQuery := nil;
+    zQuery := 'SELECT name, sql FROM sqlite_schema WHERE ' + zWhere +
+              ' ORDER BY rowid DESC';
+    rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zQuery), -1, @pQuery, @pzTail);
+    if rc <> SQLITE_OK then begin
+      shellEPutZ(Format('Error: (%d) %s on [%s]'#10,
+        [sqlite3_extended_errcode(p^.db),
+         AnsiString(sqlite3_errmsg(p^.db)), string(zQuery)]));
+      if pQuery <> nil then sqlite3_finalize(pQuery);
+      Exit;
+    end;
+    while sqlite3_step(pQuery) = SQLITE_ROW do begin
+      zName := fetchText(0);
+      zSql  := fetchText(1);
+      if (zName = '') or (zSql = '') then Continue;
+      if sqlite3_stricmp(PAnsiChar(zName), 'sqlite_sequence') = 0 then Continue;
+      Write(zName, '... '); Flush(Output);
+      pzErr := nil;
+      sqlite3_exec(newDb, PAnsiChar(zSql), nil, nil, @pzErr);
+      if pzErr <> nil then begin
+        zErrMsg := AnsiString(pzErr);
+        shellEPutZ(Format('Error: %s'#10'SQL: [%s]'#10,
+          [string(zErrMsg), string(zSql)]));
+        sqlite3_free(pzErr);
+      end;
+      if Assigned(xForEach) then xForEach(p, newDb, zName);
+      WriteLn('done');
+    end;
+  end;
+  sqlite3_finalize(pQuery);
+end;
+
+procedure cloneTransferData(p: PShellState; newDb: PTsqlite3;
+                            const zTable: AnsiString);
+label done;
+const
+  spinRate = 10000;
+var
+  pQuery, pInsert: PVdbe;
+  zQuery, zInsert: AnsiString;
+  rc, i, n, k: i32;
+  cnt: i64;
+  pzTail: PAnsiChar;
+  spinChars: array[0..3] of Char;
+begin
+  spinChars[0] := '|'; spinChars[1] := '/';
+  spinChars[2] := '-'; spinChars[3] := '\';
+  pQuery := nil;
+  pInsert := nil;
+  cnt := 0;
+  zQuery := 'SELECT * FROM "' + zTable + '"';
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zQuery), -1, @pQuery, @pzTail);
+  if rc <> SQLITE_OK then begin
+    shellEPutZ(Format('Error %d: %s on [%s]'#10,
+      [sqlite3_extended_errcode(p^.db),
+       AnsiString(sqlite3_errmsg(p^.db)), string(zQuery)]));
+    goto done;
+  end;
+  n := sqlite3_column_count(pQuery);
+  zInsert := 'INSERT OR IGNORE INTO "' + zTable + '" VALUES(?';
+  for i := 1 to n - 1 do zInsert := zInsert + ',?';
+  zInsert := zInsert + ');';
+  rc := sqlite3_prepare_v2(newDb, PAnsiChar(zInsert), -1, @pInsert, @pzTail);
+  if rc <> SQLITE_OK then begin
+    shellEPutZ(Format('Error %d: %s on [%s]'#10,
+      [sqlite3_extended_errcode(newDb),
+       AnsiString(sqlite3_errmsg(newDb)), string(zInsert)]));
+    goto done;
+  end;
+  for k := 0 to 1 do begin
+    while True do begin
+      rc := sqlite3_step(pQuery);
+      if rc <> SQLITE_ROW then Break;
+      for i := 0 to n - 1 do begin
+        case sqlite3_column_type(pQuery, i) of
+          SQLITE_NULL:    sqlite3_bind_null(pInsert, i + 1);
+          SQLITE_INTEGER: sqlite3_bind_int64(pInsert, i + 1,
+                                             sqlite3_column_int64(pQuery, i));
+          SQLITE_FLOAT:   sqlite3_bind_double(pInsert, i + 1,
+                                              sqlite3_column_double(pQuery, i));
+          SQLITE_TEXT:    sqlite3_bind_text(pInsert, i + 1,
+                            PAnsiChar(sqlite3_column_text(pQuery, i)),
+                            -1, SQLITE_STATIC);
+          SQLITE_BLOB:    sqlite3_bind_blob(pInsert, i + 1,
+                            sqlite3_column_blob(pQuery, i),
+                            sqlite3_column_bytes(pQuery, i),
+                            SQLITE_STATIC);
+        end;
+      end;
+      rc := sqlite3_step(pInsert);
+      if (rc <> SQLITE_OK) and (rc <> SQLITE_ROW) and (rc <> SQLITE_DONE) then
+        shellEPutZ(Format('Error %d: %s'#10,
+          [sqlite3_extended_errcode(newDb),
+           AnsiString(sqlite3_errmsg(newDb))]));
+      sqlite3_reset(pInsert);
+      Inc(cnt);
+      if (cnt mod spinRate) = 0 then begin
+        Write(spinChars[(cnt div spinRate) mod 4], #8);
+        Flush(Output);
+      end;
+    end;
+    if rc = SQLITE_DONE then Break;
+    sqlite3_finalize(pQuery);
+    pQuery := nil;
+    zQuery := 'SELECT * FROM "' + zTable + '" ORDER BY rowid DESC;';
+    rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zQuery), -1, @pQuery, @pzTail);
+    if rc <> SQLITE_OK then begin
+      shellEPutZ('Warning: cannot step "' + zTable + '" backwards');
+      Break;
+    end;
+  end;
+done:
+  if pQuery <> nil then sqlite3_finalize(pQuery);
+  if pInsert <> nil then sqlite3_finalize(pInsert);
+end;
+
+procedure cmdClone(p: PShellState; const args: array of AnsiString;
+                   nArg: SizeInt);
+var
+  zNewDb: AnsiString;
+  newDb: PTsqlite3;
+  rc: i32;
+begin
+  if nArg <> 1 then begin
+    shellEPutZ('Usage: .clone FILENAME'#10);
+    Exit;
+  end;
+  zNewDb := args[0];
+  if FileExists(string(zNewDb)) then begin
+    shellEPutZ(Format('File "%s" already exists.'#10, [string(zNewDb)]));
+    Exit;
+  end;
+  openDb(p, 0);
+  newDb := nil;
+  rc := sqlite3_open(PAnsiChar(zNewDb), @newDb);
+  if rc <> SQLITE_OK then begin
+    shellEPutZ('Cannot create output database: ' +
+               AnsiString(sqlite3_errmsg(newDb)) + sLineBreak);
+    if newDb <> nil then sqlite3_close(newDb);
+    Exit;
+  end;
+  sqlite3_exec(p^.db, 'PRAGMA writable_schema=ON;', nil, nil, nil);
+  sqlite3_exec(newDb, 'BEGIN EXCLUSIVE;', nil, nil, nil);
+  cloneTransferSchema(p, newDb, 'type=''table''', @cloneTransferData);
+  cloneTransferSchema(p, newDb, 'type!=''table''', nil);
+  sqlite3_exec(newDb, 'COMMIT;', nil, nil, nil);
+  sqlite3_exec(p^.db, 'PRAGMA writable_schema=OFF;', nil, nil, nil);
+  sqlite3_close(newDb);
 end;
 
 { ----------------------------------------------------------------------
@@ -2337,7 +2563,7 @@ begin
   zPrevDestTable := p^.zDestTable;
   p^.zDestTable := PAnsiChar(zName);
   p^.mode.eMode := MODE_Insert;
-  p^.mode.spec.bTitles := 0;
+  p^.mode.spec.bTitles := QRF_No;
   stepAndRender(p, pStmt);
   p^.mode := savedMode;
   p^.zDestTable := zPrevDestTable;
@@ -3573,6 +3799,7 @@ begin
     cmdBackup(p, args, nArg, zCmd); Exit;
   end;
   if zCmd = 'restore'   then begin cmdRestore(p, args, nArg); Exit; end;
+  if zCmd = 'clone'     then begin cmdClone(p, args, nArg); Exit; end;
   if zCmd = 'open'      then begin cmdOpen(p, args, nArg); Exit; end;
   if zCmd = 'connection' then begin cmdConnection(p, args, nArg); Exit; end;
   if zCmd = 'unmodule'  then begin cmdUnmodule(p, args, nArg); Exit; end;

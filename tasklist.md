@@ -952,8 +952,12 @@ existing dispatcher.
   [X] **10.1.44** `.restore ?DB? FILE` — cmdRestore runs the symmetric
        backup with the upstream 3-attempt SQLITE_BUSY retry loop
        (sqlite3_sleep(100) between attempts).
-  [ ] **10.1.45** `.clone` — combines backup + reattach (multi-db
-       variant of `.backup`).
+  [X] **10.1.45** `.clone NEWFILE` — cmdClone + cloneTransferSchema +
+       cloneTransferData mirror tryToClone / tryToCloneSchema /
+       tryToCloneData (shell.c.in:5157..5368).  Schema replayed via
+       sqlite3_exec; data copied through INSERT OR IGNORE with the
+       upstream `ORDER BY rowid DESC` retry on read errors.  Honours the
+       "File already exists" guard.
   [ ] **10.1.46** `.archive` / `.ar` — sqlar reader/writer; gated on
        sqlar extension.  Stub with omit-message until that lands.
   [ ] **10.1.47** `.session` — session-extension dispatcher
@@ -1009,12 +1013,13 @@ existing dispatcher.
   [X] **10.1.59** `.breakpoint` — cmdBreakpoint no-op stub
        (gdb-attach hook only; not exercised by any gate).
 
-- [ ] **10.1.bug.1** Header row leaks into `.mode list` output even when
-  `.headers on` was never issued.  Upstream prints data rows only.
-  Found while gating .import (10.1.24) against system sqlite3:
-  `bin/passqlite3 foo.db <<<'CREATE TABLE t(...);.import --csv f.csv t;
-  SELECT * FROM t;'` emits the column titles before the rows.  Likely
-  in emitHeader/renderInit defaults (rs.headersOn from spec.bTitles).
+- [X] **10.1.bug.1** Header row leak in `.mode list` fixed: the port
+  was treating `bTitles` as a 0/1 boolean while upstream uses QRF
+  tri-state semantics (QRF_No=1=off, QRF_Yes=2=on).  Defined the QRF_*
+  constants, switched `renderInit`/`cmdShow` to compare against
+  `QRF_Yes`, and updated `cmdHeaders` and the startup default to use
+  `QRF_No`/`QRF_Yes` so `aModeInfo[].bHdr` (which already follows the
+  upstream tri-state) flows through correctly.
 
 - [ ] **10.2** Integration parity: `bin/passqlite3 foo.db` ↔
   `sqlite3 foo.db` on a scripted corpus that unions all 10.1a..f
