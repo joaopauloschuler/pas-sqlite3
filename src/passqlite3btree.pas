@@ -3076,6 +3076,11 @@ const
   BT_MEM_Blob    = $0010;
   BT_MEM_IntReal = $0020;
   BT_MEM_Zero    = $0400;
+  { Stride between consecutive TMem cells in the aMem array.  Mirrors
+    SizeOf(passqlite3vdbe.TMem) — vdbe.pas is not visible to btree.pas
+    (would create a uses-cycle), so the size is hardcoded.  If TMem
+    layout changes, update this constant. }
+  BT_MEM_STRIDE  = 56;
 
 function btreeSerialTypeLen(t: u32): u32; inline;
 begin
@@ -3360,7 +3365,11 @@ begin
 
     Inc(i);
     if i = i32(pIdxKey^.nField) then break;
-    Inc(pRhs);
+    { Step pRhs by the actual TMem stride (vdbe.pas TMem = 56 bytes), NOT
+      by SizeOf(TBtMemView)=23 — the latter would land in the middle of
+      the next Mem cell and read garbage flags, silently returning rc=0
+      for every multi-key compare whose first key is equal. }
+    pRhs := PBtMemView(PByte(pRhs) + BT_MEM_STRIDE);
     d1 := d1 + btreeSerialTypeLen(serial_type);
     if d1 > u32(nKey1) then break;
     if aKey1[idx1] < $80 then

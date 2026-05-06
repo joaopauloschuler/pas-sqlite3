@@ -1415,6 +1415,15 @@ function  sqlite3VdbeFindCompare(pKey: Pointer): Pointer; { returns RecordCompar
 { Opcode name lookup (vdbeaux.c, used for EXPLAIN) }
 function  sqlite3OpcodeName(n: i32): PAnsiChar;
 
+{ Phase 7.4c — opcode-trace capture buffer.  When db^.flags has
+  SQLITE_VdbeTrace set, sqlite3VdbeExec appends one line per executed
+  opcode to gVdbeTraceBuf in the form '<pc> <opname> <p1> <p2> <p3> <p5>'#10.
+  The C reference (with SQLITE_DEBUG) writes the full trace to stdout via
+  sqlite3VdbePrintOp; TestVdbeTrace.pas captures the C stdout and parses
+  the same five fields per line for differential comparison. }
+var
+  gVdbeTraceBuf: AnsiString;
+
 { sqlite3BuiltinFunctions — global table of built-in SQL functions (callback.c).
   Initialized by sqlite3RegisterBuiltinFunctions. }
 var
@@ -1781,6 +1790,7 @@ function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
 implementation
 
 uses
+  SysUtils,        { Format — used by the Phase 7.4c trace capture }
   passqlite3vtab;  { Phase 6.bis.3a: VTable + sqlite3VtabBegin/CallCreate/CallDestroy/ImportErrmsg
                      — implementation-only to break the interface-side cycle (vtab uses vdbe). }
 
@@ -4057,7 +4067,10 @@ begin
         sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 2*SizeOf(TMem))^, pOp^.p1);
         sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 3*SizeOf(TMem))^, pOp^.p2);
         sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 4*SizeOf(TMem))^, pOp^.p3);
-        sqlite3VdbeMemSetNull (@PMem(PtrUInt(pMm) + 6*SizeOf(TMem))^);
+        { vdbeaux.c:2471 — column 6 is p5 as int64.  Was set to NULL here,
+          which made Pascal-side EXPLAIN report p5=0 always (TestExplainParity
+          worked around it by walking aOp[] directly on the Pascal side). }
+        sqlite3VdbeMemSetInt64(@PMem(PtrUInt(pMm) + 6*SizeOf(TMem))^, pOp^.p5);
         sqlite3VdbeMemSetNull (@PMem(PtrUInt(pMm) + 7*SizeOf(TMem))^);
         sqlite3VdbeMemSetStr(@PMem(PtrUInt(pMm) + 5*SizeOf(TMem))^,
                              zP4, -1, SQLITE_UTF8, SQLITE_DYNAMIC);
@@ -4419,11 +4432,21 @@ end;
 function sqlite3VdbeReset(p: PVdbe): i32;
 var
   db: PTsqlite3;
+  wasRun: Boolean;
 begin
   if p = nil then begin Result := SQLITE_OK; Exit; end;
   db := p^.db;
-  if p^.eVdbeState = VDBE_RUN_STATE then
+  wasRun := (p^.eVdbeState = VDBE_RUN_STATE);
+  if wasRun then
     sqlite3VdbeHalt(p);
+  { Reset/Finalize on a stmt paused at SQLITE_ROW must release the
+    nVdbeActive counter that step bumped on READY→RUN — otherwise
+    subsequent VACUUM/DDL falsely reports "SQL statements in progress".
+    Guarded with `>0` to match the nVdbeWrite/nVdbeRead pattern in
+    sqlite3VdbeHalt (some tests build a Vdbe directly without ever
+    routing through sqlite3_step, so the Inc never fired). }
+  if wasRun and (db <> nil) and (db^.nVdbeActive > 0) then
+    Dec(db^.nVdbeActive);
   { vdbeaux.c:3605 — if the VDBE has executed any instruction, transfer
     the error code/message from the VDBE into the connection.  Otherwise
     leave db^.errCode unchanged.  Without this arm, a clean SQLITE_DONE
@@ -7405,6 +7428,14 @@ begin
   repeat
     Inc(nVmStep);
 
+    { Phase 7.4c — opcode-trace capture (mirrors C sqlite3VdbePrintOp call
+      gated by db->flags & SQLITE_VdbeTrace at vdbe.c:954). }
+    if (db^.flags and SQLITE_VdbeTrace) <> 0 then
+      gVdbeTraceBuf := gVdbeTraceBuf
+        + Format('%d %s %d %d %d %.2x'#10,
+                 [i32(pOp - aOp), sqlite3OpcodeName(pOp^.opcode),
+                  pOp^.p1, pOp^.p2, pOp^.p3, pOp^.p5]);
+
     { Dispatch }
     case pOp^.opcode of
 
@@ -9915,18 +9946,19 @@ begin
       if vdbeParseSchemaExec = nil then begin
         { Fallback stub — schema already loaded by codegen's
           sqlite3InstallSchemaTable bootstrap (Phase 6.x). }
-      end else if pOp^.p4.z = nil then begin
-        { ALTER-branch (p4.z = NULL) — full sqlite3InitOne port lands in
-          Phase 7.  For now treat as success so callers that emit this
-          opcode shape (none, currently) don't trip an error. }
-        rc := SQLITE_OK;
       end else begin
+        { Both p4.z=nil (ALTER) and p4.z<>nil (general) paths route
+          through the hook.  vdbe.c:7136..7144 clears the schema and
+          re-runs sqlite3InitOne when p4 is nil; the hook implementation
+          in main.pas mirrors that distinction by detecting nil zWhere. }
         rc := vdbeParseSchemaExec(db, pOp^.p1, pOp^.p4.z, pOp^.p5);
         if rc <> SQLITE_OK then begin
           sqlite3ResetAllSchemasOfConnection(db);
           if rc = SQLITE_NOMEM then goto no_mem;
           goto abort_due_to_error;
         end;
+        if pOp^.p4.z = nil then
+          db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
       end;
     end;
 

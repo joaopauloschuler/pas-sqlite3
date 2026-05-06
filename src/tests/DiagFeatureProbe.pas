@@ -258,6 +258,35 @@ begin
         'CREATE TABLE t(a)',
         'ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 5',
         'SELECT count(*) FROM pragma_table_info(''t'')');
+  // 7.1.9 — RENAME COLUMN end-to-end: schema reload must let SELECT find new name.
+  Probe('ALTER TABLE rename column + SELECT renamed',
+        'CREATE TABLE t(a, b); INSERT INTO t VALUES(7, 8)',
+        'ALTER TABLE t RENAME COLUMN a TO aa',
+        'SELECT aa FROM t');
+  // 7.1.9 — ADD COLUMN end-to-end: SELECT new column should yield DEFAULT.
+  Probe('ALTER TABLE add column + SELECT new col',
+        'CREATE TABLE t(a); INSERT INTO t VALUES(1)',
+        'ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 5',
+        'SELECT b FROM t');
+  // 7.1.9 — RENAME TABLE end-to-end.
+  Probe('ALTER TABLE rename table + SELECT new name',
+        'CREATE TABLE t(a); INSERT INTO t VALUES(11)',
+        'ALTER TABLE t RENAME TO u',
+        'SELECT a FROM u');
+  // 7.1.9 — RENAME TABLE: pragma_table_info on new name should find row.
+  Probe('ALTER TABLE rename table + pragma',
+        'CREATE TABLE t(a, b)',
+        'ALTER TABLE t RENAME TO u',
+        'SELECT count(*) FROM pragma_table_info(''u'')');
+  // 7.1.9 — DROP COLUMN end-to-end.
+  Probe('ALTER TABLE drop column + pragma',
+        'CREATE TABLE t(a, b, c)',
+        'ALTER TABLE t DROP COLUMN b',
+        'SELECT count(*) FROM pragma_table_info(''t'')');
+  Probe('ALTER TABLE drop column + SELECT survivor',
+        'CREATE TABLE t(a, b); INSERT INTO t VALUES(3, 4)',
+        'ALTER TABLE t DROP COLUMN b',
+        'SELECT a FROM t');
   // CHECK constraint
   Probe('CHECK rejects bad insert',
         'CREATE TABLE t(a CHECK(a > 0))',
@@ -308,6 +337,30 @@ begin
         '',
         'SELECT 1',
         'SELECT count(*) FROM (SELECT 1 UNION SELECT 2 UNION SELECT 1)');
+  // 6.10 step 9(e) — LIMIT on no-FROM SELECT, top-level
+  Probe('SELECT 1 LIMIT 1 top',
+        '',
+        'SELECT 1 LIMIT 1',
+        'SELECT 1');
+  Probe('SELECT 1 LIMIT 0 top',
+        'CREATE TABLE z(x); INSERT INTO z VALUES(99);',
+        'SELECT * FROM z WHERE x IN (SELECT 1 LIMIT 0)',
+        'SELECT count(*) FROM z WHERE x IN (SELECT 1 LIMIT 0)');
+  // 6.10 step 9(e) — LIMIT on no-FROM SELECT (precondition for UNION ALL + LIMIT)
+  Probe('SELECT 1 LIMIT 1 (sub-FROM)',
+        '',
+        'SELECT 1',
+        'SELECT count(*) FROM (SELECT 1 LIMIT 1)');
+  // 6.10 step 9(e) — LIMIT propagation through UNION ALL
+  Probe('UNION ALL + LIMIT',
+        '',
+        'SELECT 1',
+        'SELECT count(*) FROM (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 2)');
+  // 6.10 step 9(e) — UNION ALL + LIMIT + OFFSET
+  Probe('UNION ALL + LIMIT + OFFSET',
+        '',
+        'SELECT 1',
+        'SELECT count(*) FROM (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 LIMIT 2 OFFSET 1)');
   // ORDER BY DESC + LIMIT (already known partially)
   Probe('SELECT 1 ORDER BY 1',
         '',

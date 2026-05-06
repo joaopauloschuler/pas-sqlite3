@@ -797,6 +797,8 @@ begin
     SQLITE_AutoIndex or      { SQLITE_DEFAULT_AUTOMATIC_INDEX default-on }
     SQLITE_CacheSpill or     { main.c:3428 default-on }
     SQLITE_EnableTrigger or  { main.c:3428 default-on }
+    (u64($00010) shl 32) or  { SQLITE_AttachCreate — main.c:3432 default-on }
+    (u64($00020) shl 32) or  { SQLITE_AttachWrite  — main.c:3433 default-on }
     SQLITE_TrustedSchema;    { SQLITE_DEFAULT_TRUSTED_SCHEMA default-on }
 
   sqlite3HashInit(@db^.aCollSeq);
@@ -2614,8 +2616,17 @@ begin
         schema row each time it fires.  Already-published tables would
         otherwise trip StartTable's "table already exists" collision
         check on every subsequent CREATE TABLE step. }
+      { Phase 7.4b.6 fix: the gate must cover indexes too.  Without a
+        WHERE filter the SELECT enumerates every schema row each fire,
+        and a re-prepare of "CREATE INDEX i ON t(...)" against an
+        already-populated idxHash trips "index already exists" →
+        initCorruptSchema → pData^.rc=SQLITE_CORRUPT, blowing up the
+        next btree-allocating statement after any prior CREATE INDEX.
+        sqlite3FindTable handles tables and views (both live in
+        tblHash); sqlite3FindIndex handles indexes. }
       if (zArg1 <> nil)
-         and (sqlite3FindTable(db, zArg1, db^.aDb[iDb].zDbSName) <> nil) then
+         and ((sqlite3FindTable(db, zArg1, db^.aDb[iDb].zDbSName) <> nil)
+              or (sqlite3FindIndex(db, zArg1, db^.aDb[iDb].zDbSName) <> nil)) then
       begin
         Result := 0; Exit;
       end;
@@ -2680,6 +2691,9 @@ begin
   Result := 0;
 end;
 
+function sqlite3InitOne(db: PTsqlite3; iDb: i32; pzErrMsg: PPAnsiChar;
+                        mFlags: u32): i32; forward;
+
 function execParseSchemaImpl(db: PTsqlite3; iDb: i32;
                              zWhere: PAnsiChar; {%H-}p5: u16): i32;
 var
@@ -2689,8 +2703,24 @@ var
   savedBusy: u8;
 begin
   rc := SQLITE_OK;
-  if (db = nil) or (iDb < 0) or (iDb >= db^.nDb) or (zWhere = nil) then begin
+  if (db = nil) or (iDb < 0) or (iDb >= db^.nDb) then begin
     Result := SQLITE_ERROR;
+    Exit;
+  end;
+  { ALTER branch — vdbe.c:7137..7142.  When p4.z is NULL the caller
+    (renameReloadSchema) wants the *whole* schema cache for iDb to be
+    discarded and rebuilt from sqlite_master.  Clear the per-db
+    schema, then dispatch through sqlite3InitOne (which re-installs
+    the sqlite_master row before re-running the schema SELECT) so a
+    table whose CREATE text was just rewritten by ALTER TABLE picks
+    up the new column list. }
+  if zWhere = nil then begin
+    sqlite3SchemaClear(db^.aDb[iDb].pSchema);
+    db^.mDbFlags := db^.mDbFlags and not u32(DBFLAG_SchemaKnownOk);
+    rc := sqlite3InitOne(db, iDb, nil, p5);
+    if rc = SQLITE_OK then
+      db^.mDbFlags := db^.mDbFlags or u32(DBFLAG_SchemaChange);
+    Result := rc;
     Exit;
   end;
   { Phase 6.9-bis 11g.2.f sub-progress 8: drop the WHERE/ORDER BY from
