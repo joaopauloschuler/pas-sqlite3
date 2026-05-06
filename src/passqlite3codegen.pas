@@ -24532,10 +24532,15 @@ begin
       that slot, so disable OMITREF on the LIMIT path. }
     if bUseSorter = 0 then bSortOmitRef := 0;
     if bSortOmitRef <> 0 then
-    begin
       nPrefixReg := sortNKey;
-      pParse^.nMem := pParse^.nMem + nPrefixReg;
-    end;
+    { Bug 6.12 fix: do NOT bump nMem here.  Mirror C select.c:1181..1186 —
+      the nPrefixReg slots are reserved *inside* selectInnerLoop, after
+      sqlite3WhereBegin has already emitted any WHERE-clause constants
+      (e.g. LIKE pattern / ESCAPE arg).  Reserving them early caused the
+      WHERE-LIKE escape constant register to overlap with the sorter
+      OMITREF prefix slot, so the sorter MakeRecord stomped the escape
+      between loop iterations and patternCompare raised "ESCAPE
+      expression must be a single character" on the second row. }
     { OpenEphemeral p2 mirrors C select.c:8211 —
       pOrderBy->nExpr + 1 + pEList->nExpr.  The +1 reserves the rowid /
       sequence slot in the sorter row layout; later promoted to
@@ -24604,6 +24609,12 @@ begin
     slot is still reserved, matching C's register-allocation order). }
   if pDest^.iSdst = 0 then
   begin
+    { Bug 6.12 fix: reserve the OMITREF prefix slots here, mirroring
+      C select.c:1181..1186, so they sit between the WHERE-clause
+      registers and iSdst (and never overlap with WHERE-LIKE
+      constants reserved during sqlite3WhereBegin). }
+    if (bSort <> 0) and (nPrefixReg > 0) then
+      pParse^.nMem := pParse^.nMem + nPrefixReg;
     pDest^.iSdst := pParse^.nMem + 1;
     pParse^.nMem := pParse^.nMem + nResultCol;
   end

@@ -238,17 +238,20 @@ FPC porting traps that recur often enough to call out up-front:
     max_page_count handler; emits `OP_Pagecount(iDb,1) / OP_ResultRow(1,1)`.
     DiagPragma `page_count fresh` PASS.
 
-- [ ] **6.12** `LIKE … ESCAPE 'x'` raises `Error: ESCAPE expression
-    must be a single character` once an outer `ORDER BY` is added to
-    the same SELECT (verified 2026-05-06: bare `SELECT name FROM
-    sqlite_schema WHERE name NOT LIKE 'sqlite\_%' ESCAPE '\\'` works,
-    adding `ORDER BY 1` or `ORDER BY name` triggers the error).  The
-    ESCAPE-arg validation in funcs.c:patternCompare is being re-run
-    against an unbound register after the sorter rewrites the
-    expression tree; trace OP_Function2 / OP_LikeOp during ORDER BY
-    materialisation.  Surfaces under `.tables` / `.schema --nosys`,
-    which currently work around it by switching to `NOT GLOB
-    'sqlite_*'`.
+- [X] **6.12** `LIKE … ESCAPE 'x'` raises `Error: ESCAPE expression
+    must be a single character` once an outer `ORDER BY` is added.
+    Closed 2026-05-06.  Root cause: `selectInnerLoop` in passqlite3codegen.pas
+    was reserving the OMITREF `nPrefixReg` slots BEFORE
+    `sqlite3WhereBegin`, but C select.c:1181..1186 reserves them
+    inside selectInnerLoop after WhereBegin.  In the early-reservation
+    path, the WHERE-clause LIKE/ESCAPE constants (factored as constMask
+    at `nMem+1..nMem+n`) ended up overlapping the sorter's OMITREF
+    prefix slot — sorter's MakeRecord then stomped the ESCAPE constant
+    register between iterations and patternCompare flagged the
+    multi-byte residue as an invalid escape.  Fix: move the
+    `pParse^.nMem += nPrefixReg` bump from the early sort-setup block
+    to the iSdst allocation block, mirroring C exactly.  `.tables` /
+    `.schema --nosys` LIKE filters now work without the GLOB workaround.
 
 - [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
     valued PRAGMA functions) returns rows when called with a literal
@@ -848,8 +851,9 @@ existing dispatcher.
        every attached database's sqlite_schema (with snum / sname
        columns), and emits the matching CREATE statements ordered by
        schema number then rowid.  Wired flags: `--debug` (dumps the
-       composed SQL), `--nosys` (filters via `NOT GLOB 'sqlite_*'`
-       around Bug 6.12), the literal/glob-pattern split (with `.`
+       composed SQL), `--nosys` (filters via the upstream
+       `name NOT LIKE 'sqlite__%' ESCAPE '_'` after Bug 6.12 close),
+       the literal/glob-pattern split (with `.`
        qualifying `sname.tbl_name`), and the
        `sqlite_master`/`sqlite_schema` self-description block.
        `--indent` accepted but currently a no-op — depends on the
@@ -861,9 +865,8 @@ existing dispatcher.
        names as `<db>.<name>`), collects matches into an in-memory
        array, then renders the upstream column-major layout with
        width = max(len)+2 and nCol = 80/width.  System tables filtered
-       via `name NOT GLOB 'sqlite_*'` because the more faithful
-       `LIKE 'sqlite\_%' ESCAPE '\'` filter trips Bug 6.12 once
-       ORDER BY is added.
+       via upstream's `name NOT LIKE 'sqlite__%' ESCAPE '_'` (Bug 6.12
+       closed 2026-05-06).
   [X] **10.1.17** `.indexes` — cmdIndexes runs
        `SELECT name FROM sqlite_schema WHERE type='index' [AND
        tbl_name=?] ORDER BY 1`.

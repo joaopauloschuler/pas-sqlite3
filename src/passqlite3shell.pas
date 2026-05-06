@@ -2487,8 +2487,8 @@ begin
                  + '''||''.''||name FROM ';
     sql := sql + '"' + StringReplace(AnsiString(zDbName), '"', '""',
                                      [rfReplaceAll]) + '".sqlite_schema'
-               + ' WHERE type IN (''table'',''view'') AND name NOT GLOB'
-               + ' ''sqlite_*''';
+               + ' WHERE type IN (''table'',''view'')'
+               + ' AND name NOT LIKE ''sqlite__%'' ESCAPE ''_''';
     if zPattern <> '' then
       sql := sql + ' AND name LIKE '''
                  + StringReplace(zPattern, '''', '''''', [rfReplaceAll])
@@ -2702,7 +2702,7 @@ begin
       sql := sql + ' LIKE ' + zNameQuoted + ' ESCAPE ''\'' AND ';
   end;
   if bNoSysTabs then
-    sql := sql + 'name NOT GLOB ''sqlite_*'' AND ';
+    sql := sql + 'name NOT LIKE ''sqlite__%'' ESCAPE ''_'' AND ';
   sql := sql + 'sql IS NOT NULL ORDER BY snum, rowid';
 
   if bDebug then begin
