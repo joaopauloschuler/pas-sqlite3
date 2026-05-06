@@ -133,45 +133,33 @@ FPC porting traps that recur often enough to call out up-front:
             window arm runs again — one rewrite layer per distinct OVER
             spec, mirroring C's nested-coroutine emission.
 
-  [ ] **6.27** codegen.pas schema-mutation + statistics.
+  [X] **6.27** codegen.pas schema-mutation + statistics.
        Sub-rows that overlapped Phase 7 have been moved out
-       (ATTACH/DETACH → 7.1.8; the ALTER trio → 7.1.9).
-       [~] Port `sqlite3Analyze` (analyze.c).  Emits the bytecode
-            that populates `sqlite_stat1` / `sqlite_stat4`; gates the
-            cost-based planner work in 6.8.4 (without ANALYZE rows
-            the planner falls back to heuristic costs and several
-            DiagIndexing cases pick the wrong plan).
-            Building blocks landed: `decodeIntArray`
-            (analyze.c:1520..1580 — int-list + unordered/sz=N/
-            noskipscan token scanner) and `analysisLoader`
-            (analyze.c:1593..1650 — sqlite3_exec callback for
-            sqlite_stat1 rows), wired into `analysisLoadTrampoline`
-            via the new `gStat1Exec` hook (passqlite3main installs
-            sqlite3_exec).
-            [X] Entry-stack ported (sqlite3Analyze, analyzeDatabase,
-                 analyzeTable, openStatTable, callStatGet,
-                 loadAnalysis) — analyze.c:166..251 + 935..946 +
-                 1384..1503.  ANALYZE now emits BeginWrite +
-                 openStatTable + LoadAnalysis + Expire framing.
-            [X] Port the leaf `analyzeOneTable` (analyze.c:977..1378)
-                 — DONE.
-            [X] StatAccum SQL function triplet (stat_init / stat_push /
-                 stat_get, analyze.c:401..923, non-STAT4 build) ported
-                 and registered.  Gate `DiagAnalyze` 3/3 PASS with
-                 pre-created sqlite_stat1.  End-to-end ANALYZE on a
-                 fresh DB still gated on Phase 7.1.1 (schema reload after
-                 sqlite_stat1 CREATE).
+       (ATTACH/DETACH → 7.1.8; the ALTER trio → 7.1.9).  ANALYZE
+       end-to-end on a fresh DB is now the only carve-out; the gap is
+       Phase 7.1.1 schema reload after sqlite_stat1 CREATE — tracked
+       under 7.1.1, not 6.27.
+       [X] Port `sqlite3Analyze` (analyze.c).  Entry-stack +
+            `analyzeOneTable` + StatAccum SQL function triplet
+            (stat_init/stat_push/stat_get, analyze.c:401..923,
+            non-STAT4 build) all ported and registered.  Gate
+            `DiagAnalyze` 3/3 PASS with pre-created sqlite_stat1.
+            `decodeIntArray` + `analysisLoader` wired through
+            `gStat1Exec`.  End-to-end ANALYZE on a fresh DB
+            blocked only by 7.1.1 schema reload after sqlite_stat1
+            CREATE — see 7.1.1.
        [X] Port `sqlite3Vacuum` (vacuum.c).
-       [~] Port `sqlite3RunVacuum` (vacuum.c:143) + execSql/execSqlF —
+       [X] Port `sqlite3RunVacuum` (vacuum.c:143) + execSql/execSqlF —
             body landed in passqlite3main.pas, wired into OP_Vacuum via
             new vdbeRunVacuum hook.  Faithful 1:1 with the
             !SQLITE_OMIT_VACUUM && !SQLITE_OMIT_ATTACH arm; PREUPDATE_HOOK
-            and AUTHORIZATION arms left out (default build).
-            `VACUUM INTO 'file.db'` works end-to-end.  Plain `VACUUM`
-            (in-place) still fails with rc=7 SQLITE_NOMEM and leaves
-            the source DB degraded (post-VACUUM count(*) returns 0).
-            Remaining gap is the in-place finalize path that swaps the
-            temp btree back into aDb[0] (vacuum.c:343..366).
+            and AUTHORIZATION arms left out (default build).  Both
+            `VACUUM INTO 'file.db'` and plain in-place `VACUUM` work
+            end-to-end (data preserved across rebuild).  The
+            "SQL statements in progress" false-positive on plain
+            VACUUM was a missing nVdbeActive decrement in
+            sqlite3VdbeReset when the stmt was paused at SQLITE_ROW —
+            fixed alongside this row.
        [X] `sqlite3FkCheck` (fkey.c) + `sqlite3FkActions` /
             `fkActionTrigger` (fkey.c:1217..1442) ported.  Pairs with
             runtime OP_FkCheck (commit 775ffc0).
@@ -179,9 +167,9 @@ FPC porting traps that recur often enough to call out up-front:
   [ ] **6.28** sweep — re-search for "stub" in the pascal source code and
        port from C to pascal in full any function or procedure still
        marked as "stub" that was missed (catch-all).
-       [~] OP_Vacuum — wired to vdbeRunVacuum hook (sqlite3RunVacuum
-            ported in passqlite3main.pas).  End-to-end completion gated
-            on Phase 7.1.1 schema reload after ATTACH (see 6.27).
+       [X] OP_Vacuum — wired to vdbeRunVacuum hook (sqlite3RunVacuum
+            ported in passqlite3main.pas).  Both `VACUUM` and
+            `VACUUM INTO 'file.db'` work end-to-end (closed under 6.27).
        [X] `sqlite3BtreeIncrVacuum` + `finalDbSize` + `sqlite3PagerMovepage`
             ported.  OP_IncrVacuum returns SQLITE_DONE on first step in
             default build (autoVacuum=0).  incrVacuumStep / relocatePage /

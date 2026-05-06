@@ -4419,11 +4419,21 @@ end;
 function sqlite3VdbeReset(p: PVdbe): i32;
 var
   db: PTsqlite3;
+  wasRun: Boolean;
 begin
   if p = nil then begin Result := SQLITE_OK; Exit; end;
   db := p^.db;
-  if p^.eVdbeState = VDBE_RUN_STATE then
+  wasRun := (p^.eVdbeState = VDBE_RUN_STATE);
+  if wasRun then
     sqlite3VdbeHalt(p);
+  { Reset/Finalize on a stmt paused at SQLITE_ROW must release the
+    nVdbeActive counter that step bumped on READY→RUN — otherwise
+    subsequent VACUUM/DDL falsely reports "SQL statements in progress".
+    Guarded with `>0` to match the nVdbeWrite/nVdbeRead pattern in
+    sqlite3VdbeHalt (some tests build a Vdbe directly without ever
+    routing through sqlite3_step, so the Inc never fired). }
+  if wasRun and (db <> nil) and (db^.nVdbeActive > 0) then
+    Dec(db^.nVdbeActive);
   { vdbeaux.c:3605 — if the VDBE has executed any instruction, transfer
     the error code/message from the VDBE into the connection.  Otherwise
     leave db^.errCode unchanged.  Without this arm, a clean SQLITE_DONE
