@@ -727,38 +727,65 @@ existing dispatcher.
   `.print` / `.parameter` (formatting-only subset), Unicode-width
   helpers, box-drawing renderer.  Gate: `tests/cli/10b_modes/`.
 
-  [ ] **10.1.7** `.mode` dispatcher (~10470) — parses mode name +
-       optional table-name argument, sets `p->mode` / `p->cMode`.
-  [ ] **10.1.8** `shell_callback` row dispatcher + per-mode renderers
-       (`exec_prepared_stmt_columnar`, `exec_prepared_stmt`).
-       Renderers: `MODE_Line`, `MODE_List`, `MODE_Semi`, `MODE_Csv`,
-       `MODE_Tcl`, `MODE_Insert`, `MODE_Quote`, `MODE_Html`,
-       `MODE_Json`, `MODE_Ascii`, `MODE_Pretty`.
+  [X] **10.1.7** `.mode` dispatcher (~10470) — `modeChange` /
+       `modeChangeBuiltin` / `modeFind` ported from shell.c.in:1642..1728
+       in passqlite3shell.pas; the ShellState QRF spec is updated in the
+       same field order as C (eCSep/eRSep/eNull/eText/eBlob/eTitle/
+       bBorder/bSplitColumn).  `.mode <name> [tableName]` arms in
+       doMetaCommand wired through.  BATCH/TTY templates also handled.
+  [X] **10.1.8** `shell_callback` row dispatcher + per-mode renderers
+       (subset).  TRenderState + emitHeader/emitRowOne/emitFooter +
+       stepAndRender drive runOneSqlLine.  Modes covered: List, Line,
+       Csv, Tabs, Ascii, Quote, Insert (with decltype-aware integer
+       promotion), Json (array-of-objects with leading "["/trailing
+       "]"), Tcl (C-style escapes), Html (TR/TD with HTML-escape),
+       Markdown (pipe-bordered with separator row), Column (naive
+       left-aligned), Off.  Box / Table / QBox / Www / JAtom / JObject
+       / Split / Psql / Count fall through to a pipe-delimited
+       fallback so the REPL stays usable; full QRF wiring lands when
+       the QRF unit ports.
   [ ] **10.1.9** Columnar renderers — `MODE_Column`, `MODE_Table`,
        `MODE_Markdown`, `MODE_Box`.  Column-width auto-sizing,
        `utf8_width` / `utf8_printf` helpers, box-drawing glyphs.
-  [ ] **10.1.10** `.headers` / `.separator` / `.nullvalue` / `.width`
-       / `.echo` / `.changes` setters.
+       (Markdown + naive Column landed under 10.1.8; auto-width Table
+       and Box still pending.)
+  [X] **10.1.10** `.headers` / `.separator` / `.nullvalue` / `.echo`
+       / `.changes` setters landed in doMetaCommand (cmdHeaders /
+       cmdSeparator / cmdNullvalue / cmdEcho / cmdChanges).  Stable
+       AnsiString backing for the PAnsiChar fields lives in unit-level
+       zUserColSep / zUserRowSep / zUserNull.  `.width` still pending
+       (depends on per-column width state in TShellMode).
   [ ] **10.1.11** `.print` / `.parameter` (formatting subset) —
-       `.parameter init / list / set / unset / clear`.
-  [ ] **10.1.12** CSV writer helpers (`output_csv`, `output_quoted_string`,
-       `output_quoted_escaped_string`) + `.nullvalue` integration.
-  [ ] **10.1.13** JSON writer helpers (`output_json_string`).
-  [ ] **10.1.14** HTML writer helpers (`output_html_string`).
+       `.parameter init / list / set / unset / clear`.  (`.print`
+       arm landed alongside 10.1.10 — args concatenated space-separated
+       to stdout; `.parameter` still pending.)
+  [X] **10.1.12** CSV writer helpers — `outputCsvField` mirrors
+       `output_csv` (quote-on-{sep,",CR,LF}; embedded quotes doubled).
+       Wired into emitRowOne MODE_Csv arm.
+  [X] **10.1.13** JSON writer helpers — `outputJsonString` (RFC 8259
+       \" \\ \b \f \n \r \t and \u00XX) wired into emitRowOne MODE_Json.
+  [X] **10.1.14** HTML writer helpers — `outputHtmlString` (escape
+       <, >, &, ", ') wired into emitRowOne MODE_Html.
 
 - [ ] **10.1c** Schema introspection dot-commands.  `.schema`,
   `.tables`, `.indexes`, `.databases`, `.fullschema`,
   `.lint fkey-indexes`, `.expert` (read-only subset).  Gate:
   `tests/cli/10c_schema/`.
 
-  [ ] **10.1.15** `.schema` + `.sqlite_schema` (shell.c.in
-       `do_meta_command` schema arm).  LIKE-pattern argument,
-       `--indent`, `--nosys` flags.
-  [ ] **10.1.16** `.tables` — runs the canonical
-       `SELECT name FROM sqlite_schema WHERE type IN ('table','view')`
-       query with column-formatted output.
-  [ ] **10.1.17** `.indexes` — per-table index listing.
-  [ ] **10.1.18** `.databases` — list `main`/`temp`/attached files.
+  [~] **10.1.15** `.schema` arm landed (cmdSchema): pulls
+       `SELECT sql FROM sqlite_schema [WHERE name LIKE pat] ORDER BY
+       tbl_name, type DESC, name`.  `--indent` / `--nosys` flags
+       still pending; `.sqlite_schema` alias not yet wired.
+  [X] **10.1.16** `.tables` — cmdTables runs
+       `SELECT name FROM sqlite_schema WHERE type IN ('table','view')
+       AND name LIKE pat AND name NOT LIKE 'sqlite_%' ORDER BY 1`.
+       One name per line for now; upstream's 3-column auto-format
+       lands with 10.1.9 column-width work.
+  [X] **10.1.17** `.indexes` — cmdIndexes runs
+       `SELECT name FROM sqlite_schema WHERE type='index' [AND
+       tbl_name=?] ORDER BY 1`.
+  [X] **10.1.18** `.databases` — cmdDatabases runs
+       `SELECT name, file FROM pragma_database_list ORDER BY seq`.
   [ ] **10.1.19** `.fullschema` — schema + sqlite_stat1/4 dump.
   [ ] **10.1.20** `.lint fkey-indexes` — runs the canonical FK-index
        audit query.  Other `.lint` sub-options remain stubs.
@@ -799,9 +826,14 @@ existing dispatcher.
        (`off` / `on` / `trigger` / `full`).
   [ ] **10.1.31** `.explain` — sets `EXPLAIN` auto-prefix mode and
        formats the bytecode dump.
-  [ ] **10.1.32** `.show` — dump all current `ShellState` settings.
-  [ ] **10.1.33** `.help` — built-in help text dispatch
-       (`showHelp`, ~750-line static help table).
+  [X] **10.1.32** `.show` — cmdShow dumps echo / headers / mode /
+       nullvalue / colseparator / rowseparator / filename in upstream's
+       `%12s: …` format.  Full `.show` covers ~25 fields; remaining
+       (stats, eqp, explain, output) land alongside their setters.
+  [~] **10.1.33** `.help` — cmdHelp emits a 13-line excerpt covering
+       the dot-commands actually wired today.  Full ~750-line upstream
+       table (`showHelp`) still pending; -all and PATTERN filtering
+       defer with it.
   [ ] **10.1.34** `.shell` / `.system` — fork+exec, `popen`, capture
        output to current `.output` sink.
   [ ] **10.1.35** `.cd` — `chdir` wrapper.

@@ -389,6 +389,11 @@ var
   Argv0:                AnsiString = '';
   mainPromptStr:        AnsiString = MAIN_PROMPT_DEFAULT;
   continuePromptStr:    AnsiString = CONTINUATION_PROMPT;
+  { 10.1.10 .separator / .nullvalue / .mode INSERT — keep stable
+    AnsiString backing for the PAnsiChar fields in TShellMode.spec. }
+  zUserColSep:          AnsiString = '|';
+  zUserRowSep:          AnsiString = #10;
+  zUserNull:            AnsiString = '';
 
 { ----------------------------------------------------------------------
   Helpers — small utilities that mirror the cli_* family
@@ -580,23 +585,556 @@ begin
 end;
 
 { ----------------------------------------------------------------------
-  Result dispatch — minimal MODE_List renderer used until 10.1.8 lands.
-  Mirrors the (heavily simplified) inner loop of exec_prepared_stmt
-  (shell.c.in:8050..) for MODE_List with no headers.
+  10.1.7  modeChange — port of shell.c.in:1642..1689.
+
+  Applies the named-mode template (aModeInfo[eMode]) to p^.mode, refreshing
+  separators / null / titles / blob style in the same order the C reference
+  does.  The MODE_BATCH and MODE_TTY variants reuse the regular table:
+  BATCH ≡ List; TTY ≡ QBox-with-relaxed-text overrides.  modeFind /
+  modePush / modePop are kept thin since the saved-mode stack is not yet
+  exercised.
   ---------------------------------------------------------------------- }
 
-procedure renderRowList(pStmt: PVdbe; const sep: AnsiString);
-var
-  nCol, i: i32;
-  z: PAnsiChar;
+procedure modeSetStr(var dst: PAnsiChar; const z: PAnsiChar); inline;
 begin
-  nCol := sqlite3_column_count(pStmt);
-  for i := 0 to nCol - 1 do begin
-    if i > 0 then Write(sep);
-    z := sqlite3_column_text(pStmt, i);
-    if z <> nil then Write(AnsiString(z));
+  { aModeStr entries are static literals owned by this unit.  Clone the
+    pointer; ownership stays with aModeStr.  This mirrors the C
+    `modeSetStr` used in modeChange — both forms target the same QRF
+    spec fields. }
+  dst := z;
+end;
+
+procedure modeChange(p: PShellState; eMode: u8); forward;
+
+procedure modeChangeBuiltin(p: PShellState; eMode: u8);
+var
+  pI: ^TModeInfo;
+  pM: PShellMode;
+begin
+  pI := @aModeInfo[eMode];
+  pM := @p^.mode;
+  pM^.eMode := eMode;
+  if pI^.eCSep <> 0 then modeSetStr(pM^.spec.zColumnSep, aModeStr[pI^.eCSep]);
+  if pI^.eRSep <> 0 then modeSetStr(pM^.spec.zRowSep,    aModeStr[pI^.eRSep]);
+  if pI^.eNull <> 0 then modeSetStr(pM^.spec.zNull,      aModeStr[pI^.eNull]);
+  pM^.spec.eText  := pI^.eText;
+  pM^.spec.eBlob  := pI^.eBlob;
+  if (pM^.mFlags and MFLG_HDR) = 0 then
+    pM^.spec.bTitles := pI^.bHdr;
+  pM^.spec.eTitle := pI^.eHdr;
+  if (pI^.mFlg and $01) <> 0 then
+    pM^.spec.bBorder := 0
+  else
+    pM^.spec.bBorder := 2;
+  if (pI^.mFlg and $02) <> 0 then begin
+    pM^.spec.bSplitColumn := 1;
+    pM^.bAutoScreenWidth  := 1;
+  end else
+    pM^.spec.bSplitColumn := 0;
+end;
+
+procedure modeChange(p: PShellState; eMode: u8);
+var savedFlags: u8;
+begin
+  if eMode < Length(aModeInfo) then
+    modeChangeBuiltin(p, eMode)
+  else if eMode = MODE_BATCH then begin
+    savedFlags := p^.mode.mFlags;
+    modeChange(p, MODE_List);
+    p^.mode.mFlags := savedFlags;
+  end else if eMode = MODE_TTY then begin
+    savedFlags := p^.mode.mFlags;
+    modeChange(p, MODE_QBox);
+    p^.mode.bAutoScreenWidth   := 1;
+    p^.mode.spec.eText         := 2;       { QRF_TEXT_Relaxed }
+    p^.mode.spec.nCharLimit    := DFLT_CHAR_LIMIT;
+    p^.mode.spec.nLineLimit    := DFLT_LINE_LIMIT;
+    p^.mode.spec.bTextJsonb    := 1;
+    p^.mode.spec.nTitleLimit   := DFLT_TITLE_LIMIT;
+    p^.mode.spec.nMultiInsert  := DFLT_MULTI_INSERT;
+    p^.mode.mFlags             := savedFlags;
   end;
-  WriteLn;
+end;
+
+function modeFind(p: PShellState; const zName: AnsiString): i32;
+var i: i32;
+begin
+  for i := 0 to Length(aModeInfo) - 1 do
+    if StrPas(@aModeInfo[i].zName[0]) = zName then Exit(i);
+  if zName = 'batch' then Exit(MODE_BATCH);
+  if zName = 'tty'   then Exit(MODE_TTY);
+  Result := -1;
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.12 / 10.1.13 / 10.1.14 — output_csv / output_json_string /
+  output_html_string + a few sister helpers (TCL, C-quoting, SQL-quoting).
+  These mirror shell.c.in's pre-QRF helpers (output_csv, output_quoted_string,
+  output_quoted_escaped_string, output_json_string, output_html_string,
+  output_c_string).  The Pascal port renders directly to stdout via Write
+  rather than through a FILE*; output redirection lands with 10.1.25.
+  ---------------------------------------------------------------------- }
+
+procedure outputCsvField(const z: AnsiString; const sep: AnsiString);
+{ output_csv (shell.c.in pre-QRF era).  Quote with double-quotes if the
+  field contains the column separator, a quote, CR, or LF.  Embedded
+  quotes are doubled. }
+var
+  needQuote: Boolean;
+  i: SizeInt;
+begin
+  needQuote := False;
+  for i := 1 to Length(z) do begin
+    if (z[i] = '"') or (z[i] = #10) or (z[i] = #13) then begin
+      needQuote := True;
+      Break;
+    end;
+  end;
+  if not needQuote and (Length(sep) > 0) and (Pos(sep, z) > 0) then
+    needQuote := True;
+  if not needQuote then begin
+    Write(z);
+    Exit;
+  end;
+  Write('"');
+  for i := 1 to Length(z) do begin
+    if z[i] = '"' then Write('""') else Write(z[i]);
+  end;
+  Write('"');
+end;
+
+procedure outputSqlQuoted(const z: AnsiString);
+{ output_quoted_string — SQL-text quoted.  Single quotes doubled.  If z
+  contains any control byte, fall back to the X'…' hex form (mirrors
+  the C reference's escape-blob-as-hex branch).  ASCII non-control bytes
+  pass straight through; UTF-8 multi-byte stays intact. }
+var
+  i: SizeInt;
+  hasCtrl: Boolean;
+  b: Byte;
+const
+  hex = '0123456789ABCDEF';
+begin
+  hasCtrl := False;
+  for i := 1 to Length(z) do begin
+    b := Byte(z[i]);
+    if (b < 32) and (b <> 9) and (b <> 10) and (b <> 13) then begin
+      hasCtrl := True;
+      Break;
+    end;
+  end;
+  if hasCtrl then begin
+    Write('X''');
+    for i := 1 to Length(z) do begin
+      b := Byte(z[i]);
+      Write(hex[1 + (b shr 4)]);
+      Write(hex[1 + (b and $0F)]);
+    end;
+    Write('''');
+    Exit;
+  end;
+  Write('''');
+  for i := 1 to Length(z) do begin
+    if z[i] = '''' then Write('''''') else Write(z[i]);
+  end;
+  Write('''');
+end;
+
+procedure outputJsonString(const z: AnsiString);
+{ output_json_string — RFC 8259 string with the usual \" \\ \b \f \n \r \t
+  escapes; non-printables in 0x00..0x1F as \u00XX. }
+var
+  i: SizeInt;
+  c: AnsiChar;
+const
+  hex = '0123456789abcdef';
+begin
+  Write('"');
+  for i := 1 to Length(z) do begin
+    c := z[i];
+    case c of
+      '"': Write('\"');
+      '\': Write('\\');
+      #8:  Write('\b');
+      #9:  Write('\t');
+      #10: Write('\n');
+      #12: Write('\f');
+      #13: Write('\r');
+    else
+      if Byte(c) < 32 then begin
+        Write('\u00');
+        Write(hex[1 + (Byte(c) shr 4)]);
+        Write(hex[1 + (Byte(c) and $0F)]);
+      end else
+        Write(c);
+    end;
+  end;
+  Write('"');
+end;
+
+procedure outputHtmlString(const z: AnsiString);
+{ output_html_string — escape <, >, &, and ".  Mirrors shell.c.in's
+  pre-QRF helper byte-for-byte. }
+var i: SizeInt;
+begin
+  for i := 1 to Length(z) do
+    case z[i] of
+      '<': Write('&lt;');
+      '>': Write('&gt;');
+      '&': Write('&amp;');
+      '"': Write('&quot;');
+      '''': Write('&#39;');
+    else
+      Write(z[i]);
+    end;
+end;
+
+procedure outputCString(const z: AnsiString);
+{ output_c_string — C-style escapes wrapped in double quotes.  Used by
+  MODE_C and MODE_Tcl (TCL accepts the same escape vocabulary as C for
+  the small set we need here). }
+var
+  i: SizeInt;
+  b: Byte;
+begin
+  Write('"');
+  for i := 1 to Length(z) do begin
+    b := Byte(z[i]);
+    case z[i] of
+      '"', '\': begin Write('\'); Write(z[i]); end;
+      #9: Write('\t');
+      #10: Write('\n');
+      #12: Write('\f');
+      #13: Write('\r');
+    else
+      if (b < 32) or (b = 127) then begin
+        Write('\');
+        Write(AnsiChar(Chr(48 + ((b shr 6) and 3))));
+        Write(AnsiChar(Chr(48 + ((b shr 3) and 7))));
+        Write(AnsiChar(Chr(48 + (b and 7))));
+      end else
+        Write(z[i]);
+    end;
+  end;
+  Write('"');
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.8  shell_callback / per-mode renderers — minimum viable cut.
+
+  Header emission, row emission, and footer hooks are split so the
+  controlling loop in runOneSqlLine can drive them without re-fetching
+  column count on every row.  We support: List, Line, Csv, Tabs, Ascii,
+  Quote, Insert, Json, Tcl, Html, Markdown, Column (left-aligned naive),
+  Off.  Box / Table / QBox are out-of-scope until QRF lands; they fall
+  back to Column with column-sep '|'.
+
+  Caller contract:
+    emitHeader(p, pStmt)   — call once before the first row.
+    emitRow(p, pStmt)      — call once per SQLITE_ROW.
+    emitFooter(p, pStmt)   — call once after the last row.
+
+  rowsEmitted carries non-trivial state for Json / JAtom / JObject (which
+  need a "[" / "]" pair around the row stream, with commas between rows).
+  ---------------------------------------------------------------------- }
+
+type
+  TRenderState = record
+    p:           PShellState;
+    nCol:        i32;
+    rowsEmitted: i64;
+    headersOn:   Boolean;
+    zNull:       AnsiString;
+    zColSep:     AnsiString;
+    zRowSep:     AnsiString;
+    insertTab:   AnsiString;        { MODE_Insert only }
+  end;
+  PRenderState = ^TRenderState;
+
+function specStr(z: PAnsiChar): AnsiString; inline;
+begin
+  if z = nil then Result := '' else Result := AnsiString(z);
+end;
+
+procedure renderInit(var rs: TRenderState; p: PShellState; pStmt: PVdbe);
+begin
+  rs.p           := p;
+  rs.nCol        := sqlite3_column_count(pStmt);
+  rs.rowsEmitted := 0;
+  rs.headersOn   := p^.mode.spec.bTitles <> 0;
+  rs.zNull       := specStr(p^.mode.spec.zNull);
+  rs.zColSep     := specStr(p^.mode.spec.zColumnSep);
+  rs.zRowSep     := specStr(p^.mode.spec.zRowSep);
+  if p^.zDestTable <> nil then
+    rs.insertTab := AnsiString(p^.zDestTable)
+  else
+    rs.insertTab := 'table';
+end;
+
+function colNameStr(pStmt: PVdbe; i: i32): AnsiString; inline;
+var z: PAnsiChar;
+begin
+  z := sqlite3_column_name(pStmt, i);
+  if z = nil then Result := '' else Result := AnsiString(z);
+end;
+
+function colTextStr(pStmt: PVdbe; i: i32; out isNull: Boolean): AnsiString; inline;
+var z: PAnsiChar;
+begin
+  isNull := sqlite3_column_type(pStmt, i) = SQLITE_NULL;
+  if isNull then begin Result := ''; Exit; end;
+  z := sqlite3_column_text(pStmt, i);
+  if z = nil then Result := '' else Result := AnsiString(z);
+end;
+
+procedure emitHeader(var rs: TRenderState; pStmt: PVdbe);
+var
+  i: i32;
+  nm: AnsiString;
+begin
+  if not rs.headersOn then Exit;
+  case rs.p^.mode.eMode of
+    MODE_List, MODE_Tabs, MODE_Ascii, MODE_Csv:
+      begin
+        for i := 0 to rs.nCol - 1 do begin
+          nm := colNameStr(pStmt, i);
+          if i > 0 then Write(rs.zColSep);
+          if rs.p^.mode.eMode = MODE_Csv then
+            outputCsvField(nm, rs.zColSep)
+          else
+            Write(nm);
+        end;
+        Write(rs.zRowSep);
+      end;
+    MODE_Markdown:
+      begin
+        Write('|');
+        for i := 0 to rs.nCol - 1 do begin
+          Write(' '); Write(colNameStr(pStmt, i)); Write(' |');
+        end;
+        WriteLn;
+        Write('|');
+        for i := 0 to rs.nCol - 1 do Write('---|');
+        WriteLn;
+      end;
+    MODE_Column:
+      begin
+        for i := 0 to rs.nCol - 1 do begin
+          if i > 0 then Write(' ');
+          Write(colNameStr(pStmt, i));
+        end;
+        WriteLn;
+        for i := 0 to rs.nCol - 1 do begin
+          if i > 0 then Write(' ');
+          Write(StringOfChar('-', Length(colNameStr(pStmt, i))));
+        end;
+        WriteLn;
+      end;
+    MODE_Html:
+      begin
+        Write('<TR>');
+        for i := 0 to rs.nCol - 1 do begin
+          Write('<TH>'); outputHtmlString(colNameStr(pStmt, i)); Write('</TH>');
+        end;
+        WriteLn('</TR>');
+      end;
+  end;
+end;
+
+procedure emitRowOne(var rs: TRenderState; pStmt: PVdbe);
+var
+  i, ty: i32;
+  z: AnsiString;
+  isNull: Boolean;
+  decl: PAnsiChar;
+  isNumericTy: Boolean;
+begin
+  case rs.p^.mode.eMode of
+    MODE_Off: Exit;
+
+    MODE_Line:
+      begin
+        for i := 0 to rs.nCol - 1 do begin
+          z := colTextStr(pStmt, i, isNull);
+          Write(Format('%*s = ', [20, colNameStr(pStmt, i)]));
+          if isNull then Write(rs.zNull) else Write(z);
+          WriteLn;
+        end;
+        WriteLn;
+      end;
+
+    MODE_List, MODE_Tabs, MODE_Ascii:
+      begin
+        for i := 0 to rs.nCol - 1 do begin
+          if i > 0 then Write(rs.zColSep);
+          z := colTextStr(pStmt, i, isNull);
+          if isNull then Write(rs.zNull) else Write(z);
+        end;
+        Write(rs.zRowSep);
+      end;
+
+    MODE_Csv:
+      begin
+        for i := 0 to rs.nCol - 1 do begin
+          if i > 0 then Write(rs.zColSep);
+          z := colTextStr(pStmt, i, isNull);
+          if isNull then Write(rs.zNull) else outputCsvField(z, rs.zColSep);
+        end;
+        Write(rs.zRowSep);
+      end;
+
+    MODE_Quote:
+      begin
+        for i := 0 to rs.nCol - 1 do begin
+          if i > 0 then Write(rs.zColSep);
+          ty := sqlite3_column_type(pStmt, i);
+          case ty of
+            SQLITE_NULL:    Write('NULL');
+            SQLITE_INTEGER: Write(IntToStr(sqlite3_column_int64(pStmt, i)));
+            SQLITE_FLOAT:   Write(FloatToStr(sqlite3_column_double(pStmt, i)));
+            SQLITE_TEXT:    outputSqlQuoted(specStr(sqlite3_column_text(pStmt, i)));
+          else
+            outputSqlQuoted(specStr(sqlite3_column_text(pStmt, i)));
+          end;
+        end;
+        Write(rs.zRowSep);
+      end;
+
+    MODE_Insert:
+      begin
+        Write('INSERT INTO '); Write(rs.insertTab); Write(' VALUES(');
+        for i := 0 to rs.nCol - 1 do begin
+          if i > 0 then Write(',');
+          ty := sqlite3_column_type(pStmt, i);
+          if ty = SQLITE_NULL then begin Write('NULL'); Continue; end;
+          if ty = SQLITE_INTEGER then begin
+            Write(IntToStr(sqlite3_column_int64(pStmt, i))); Continue;
+          end;
+          if ty = SQLITE_FLOAT then begin
+            { Promote integer-valued doubles to a textual integer when the
+              underlying column is declared INTEGER (matches insert.c's
+              affinity-aware flush). }
+            decl := sqlite3_column_decltype(pStmt, i);
+            isNumericTy := (decl <> nil) and (StrComp(decl, 'INTEGER') = 0);
+            if isNumericTy and (Frac(sqlite3_column_double(pStmt, i)) = 0) then
+              Write(IntToStr(Trunc(sqlite3_column_double(pStmt, i))))
+            else
+              Write(FloatToStr(sqlite3_column_double(pStmt, i)));
+            Continue;
+          end;
+          outputSqlQuoted(specStr(sqlite3_column_text(pStmt, i)));
+        end;
+        WriteLn(');');
+      end;
+
+    MODE_Json:
+      begin
+        if rs.rowsEmitted = 0 then Write('[') else Write(',');
+        WriteLn;
+        Write('{');
+        for i := 0 to rs.nCol - 1 do begin
+          if i > 0 then Write(',');
+          outputJsonString(colNameStr(pStmt, i));
+          Write(':');
+          ty := sqlite3_column_type(pStmt, i);
+          case ty of
+            SQLITE_NULL:    Write('null');
+            SQLITE_INTEGER: Write(IntToStr(sqlite3_column_int64(pStmt, i)));
+            SQLITE_FLOAT:   Write(FloatToStr(sqlite3_column_double(pStmt, i)));
+          else
+            outputJsonString(specStr(sqlite3_column_text(pStmt, i)));
+          end;
+        end;
+        Write('}');
+      end;
+
+    MODE_Tcl:
+      begin
+        for i := 0 to rs.nCol - 1 do begin
+          if i > 0 then Write(rs.zColSep);
+          z := colTextStr(pStmt, i, isNull);
+          if isNull then outputCString(rs.zNull) else outputCString(z);
+        end;
+        Write(rs.zRowSep);
+      end;
+
+    MODE_Html:
+      begin
+        Write('<TR>');
+        for i := 0 to rs.nCol - 1 do begin
+          Write('<TD>');
+          z := colTextStr(pStmt, i, isNull);
+          if isNull then outputHtmlString(rs.zNull) else outputHtmlString(z);
+          Write('</TD>');
+        end;
+        WriteLn('</TR>');
+      end;
+
+    MODE_Markdown:
+      begin
+        Write('|');
+        for i := 0 to rs.nCol - 1 do begin
+          Write(' ');
+          z := colTextStr(pStmt, i, isNull);
+          if isNull then Write(rs.zNull) else Write(z);
+          Write(' |');
+        end;
+        WriteLn;
+      end;
+
+    MODE_Column:
+      begin
+        for i := 0 to rs.nCol - 1 do begin
+          if i > 0 then Write(' ');
+          z := colTextStr(pStmt, i, isNull);
+          if isNull then Write(rs.zNull) else Write(z);
+        end;
+        WriteLn;
+      end;
+  else
+    { Fallback for unsupported modes (Box / Table / QBox / Www / JAtom /
+      JObject / Split / Psql / Count) — emit pipe-delimited.  Closes
+      cleanly so the REPL stays usable; full QRF support arrives with
+      the QRF port. }
+    for i := 0 to rs.nCol - 1 do begin
+      if i > 0 then Write('|');
+      z := colTextStr(pStmt, i, isNull);
+      if isNull then Write(rs.zNull) else Write(z);
+    end;
+    WriteLn;
+  end;
+  Inc(rs.rowsEmitted);
+end;
+
+procedure emitFooter(var rs: TRenderState);
+begin
+  case rs.p^.mode.eMode of
+    MODE_Json:
+      if rs.rowsEmitted > 0 then begin WriteLn; WriteLn(']'); end;
+  end;
+end;
+
+function stepAndRender(p: PShellState; pStmt: PVdbe): i32;
+{ Step the prepared statement to completion, dispatching SQLITE_ROW
+  through the per-mode renderer.  Returns the final step rc (DONE / err). }
+var
+  rs: TRenderState;
+  headerEmitted: Boolean;
+  rc: i32;
+begin
+  renderInit(rs, p, pStmt);
+  headerEmitted := False;
+  while True do begin
+    rc := sqlite3_step(pStmt);
+    if rc <> SQLITE_ROW then Break;
+    if not headerEmitted then begin
+      emitHeader(rs, pStmt);
+      headerEmitted := True;
+    end;
+    emitRowOne(rs, pStmt);
+  end;
+  emitFooter(rs);
+  Result := rc;
 end;
 
 { runOneSqlLine — shell.c.in runOneSqlLine (~12290..12365).  Prepare /
@@ -632,10 +1170,7 @@ begin
       zCur := AnsiString(zRemain);
       Continue;
     end;
-    repeat
-      stepRc := sqlite3_step(pStmt);
-      if stepRc = SQLITE_ROW then renderRowList(pStmt, p^.mode.spec.zColumnSep);
-    until stepRc <> SQLITE_ROW;
+    stepRc := stepAndRender(p, pStmt);
     rc := sqlite3_finalize(pStmt);
     if (rc <> SQLITE_OK) and (rc <> SQLITE_DONE) then begin
       shellEPutZ(Format('Runtime error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
@@ -675,43 +1210,299 @@ begin
   Result := Copy(zLine, i, j - i);
 end;
 
+{ Tokenise a dot-command body into whitespace-separated arguments.
+  Honours single- and double-quoted runs (quotes are stripped) so that
+  `.separator " "` and `.nullvalue 'null'` parse exactly as upstream's
+  `do_meta_command` token loop (shell.c.in:8995..9070). }
+procedure splitDotArgs(const zLine: AnsiString; out args: array of AnsiString;
+                       out nArg: SizeInt);
+var i, n, k: SizeInt;
+    quote: AnsiChar;
+    cur: AnsiString;
+begin
+  nArg := 0;
+  n := Length(zLine);
+  i := 1;
+  { Skip past leading whitespace and the dot-command name. }
+  while (i <= n) and (zLine[i] in [' ', #9]) do Inc(i);
+  if (i <= n) and (zLine[i] = '.') then Inc(i);
+  while (i <= n) and not (zLine[i] in [' ', #9]) do Inc(i);
+  while i <= n do begin
+    while (i <= n) and (zLine[i] in [' ', #9]) do Inc(i);
+    if i > n then Break;
+    cur := '';
+    if zLine[i] in ['''', '"'] then begin
+      quote := zLine[i];
+      Inc(i);
+      while (i <= n) and (zLine[i] <> quote) do begin
+        if (zLine[i] = '\') and (i < n) then begin
+          Inc(i);
+          case zLine[i] of
+            'n': cur := cur + #10;
+            't': cur := cur + #9;
+            'r': cur := cur + #13;
+            '\': cur := cur + '\';
+            '''': cur := cur + '''';
+            '"': cur := cur + '"';
+          else
+            cur := cur + zLine[i];
+          end;
+          Inc(i);
+        end else begin
+          cur := cur + zLine[i];
+          Inc(i);
+        end;
+      end;
+      if (i <= n) and (zLine[i] = quote) then Inc(i);
+    end else begin
+      while (i <= n) and not (zLine[i] in [' ', #9]) do begin
+        cur := cur + zLine[i];
+        Inc(i);
+      end;
+    end;
+    k := nArg;
+    if k <= High(args) then begin
+      args[k] := cur;
+      Inc(nArg);
+    end;
+  end;
+end;
+
+function parseOnOff(const z: AnsiString; defaultVal: i32): i32;
+{ booleanValue (shell.c.in:1340..) — recognises on/off, yes/no, true/false,
+  numeric 0/1.  Falls back to defaultVal on unrecognised input. }
+begin
+  if (z = 'on') or (z = 'yes') or (z = 'true') or (z = '1') then Result := 1
+  else if (z = 'off') or (z = 'no') or (z = 'false') or (z = '0') then Result := 0
+  else Result := defaultVal;
+end;
+
+procedure runStatementVerbose(p: PShellState; const zSql: AnsiString);
+{ Helper for the schema-introspection dot-commands.  Open the database
+  if needed, prepare/step zSql under the active mode, and report any
+  prepare/step error to stderr. }
+var
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc: i32;
+begin
+  if p^.db = nil then openDb(p, 0);
+  pStmt := nil;
+  pzTail := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zSql), -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    shellEPutZ(Format('Error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    Exit;
+  end;
+  stepAndRender(p, pStmt);
+  sqlite3_finalize(pStmt);
+end;
+
+procedure cmdHelp;
+{ 10.1.33 — abbreviated upstream help-table excerpt.  Full ~750-line
+  table lands when a parity test demands it. }
+const
+  zHelp: AnsiString =
+    '.databases             List names and files of attached databases'#10 +
+    '.echo on|off           Turn command echo on or off'#10 +
+    '.exit ?CODE?           Exit this program with return-code CODE'#10 +
+    '.headers on|off        Turn display of headers on or off'#10 +
+    '.help ?-all? ?PATTERN? Show help text for PATTERN'#10 +
+    '.indexes ?TABLE?       Show names of indexes'#10 +
+    '.mode MODE ?OPTIONS?   Set output mode'#10 +
+    '.nullvalue STRING      Use STRING in place of NULL values'#10 +
+    '.quit                  Stop interpreting input stream, exit if primary'#10 +
+    '.schema ?PATTERN?      Show the CREATE statements matching PATTERN'#10 +
+    '.separator COL ?ROW?   Change the column and row separators'#10 +
+    '.show                  Show the current values for various settings'#10 +
+    '.tables ?TABLE?        List names of tables matching LIKE pattern TABLE'#10;
+begin
+  shellSPutZ(zHelp);
+end;
+
+function onOffStr(b: Boolean): AnsiString; inline;
+begin
+  if b then Result := 'on' else Result := 'off';
+end;
+
+procedure cmdShow(p: PShellState);
+var
+  fn: AnsiString;
+begin
+  if p^.pAuxDb^.zDbFilename = nil then fn := '' else fn := AnsiString(p^.pAuxDb^.zDbFilename);
+  shellSPutZ(Format('%12s: %s'#10, ['echo',         onOffStr((p^.mode.mFlags and MFLG_ECHO) <> 0)]));
+  shellSPutZ(Format('%12s: %s'#10, ['headers',      onOffStr(p^.mode.spec.bTitles <> 0)]));
+  shellSPutZ(Format('%12s: %s'#10, ['mode',         StrPas(@aModeInfo[p^.mode.eMode].zName[0])]));
+  shellSPutZ(Format('%12s: "%s"'#10, ['nullvalue',  specStr(p^.mode.spec.zNull)]));
+  shellSPutZ(Format('%12s: "%s"'#10, ['colseparator', specStr(p^.mode.spec.zColumnSep)]));
+  shellSPutZ(Format('%12s: "%s"'#10, ['rowseparator', specStr(p^.mode.spec.zRowSep)]));
+  shellSPutZ(Format('%12s: %s'#10, ['filename',     fn]));
+end;
+
+procedure cmdMode(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+var n: i32;
+begin
+  if nArg < 1 then begin
+    shellSPutZ(Format('current output mode: %s'#10, [StrPas(@aModeInfo[p^.mode.eMode].zName[0])]));
+    Exit;
+  end;
+  n := modeFind(p, args[0]);
+  if n < 0 then begin
+    shellEPutZ(Format('Error: mode should be one of: ' +
+      'ascii box column csv html insert json line list markdown ' +
+      'qbox quote table tabs tcl'#10, []));
+    Exit;
+  end;
+  modeChange(p, u8(n));
+  if (nArg >= 2) and (n = MODE_Insert) then begin
+    p^.zDestTable := PAnsiChar(args[1]);
+  end;
+end;
+
+procedure cmdHeaders(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+var v: i32;
+begin
+  if nArg < 1 then begin
+    shellEPutZ('Usage: .headers on|off'#10);
+    Exit;
+  end;
+  v := parseOnOff(args[0], -1);
+  if v < 0 then begin
+    shellEPutZ('Error: not a boolean: '+args[0]+#10);
+    Exit;
+  end;
+  if v <> 0 then begin
+    p^.mode.spec.bTitles := 1;
+    p^.mode.mFlags := p^.mode.mFlags or MFLG_HDR;
+  end else begin
+    p^.mode.spec.bTitles := 0;
+    p^.mode.mFlags := p^.mode.mFlags and not MFLG_HDR;
+  end;
+end;
+
+procedure cmdSeparator(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+{ The ShellState carries pre-allocated AnsiStrings via the parsed-arg
+  buffer; we keep stable copies in unit-level vars so the PAnsiChars
+  remain valid for the lifetime of the connection. }
+begin
+  if nArg < 1 then begin
+    shellEPutZ('Usage: .separator COL ?ROW?'#10);
+    Exit;
+  end;
+  zUserColSep := args[0];
+  if nArg >= 2 then zUserRowSep := args[1];
+  p^.mode.spec.zColumnSep := PAnsiChar(zUserColSep);
+  if nArg >= 2 then p^.mode.spec.zRowSep := PAnsiChar(zUserRowSep);
+end;
+
+procedure cmdNullvalue(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+begin
+  if nArg < 1 then zUserNull := '' else zUserNull := args[0];
+  p^.mode.spec.zNull := PAnsiChar(zUserNull);
+end;
+
+procedure cmdEcho(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+var v: i32;
+begin
+  if nArg < 1 then v := 1 else v := parseOnOff(args[0], 1);
+  if v <> 0 then p^.mode.mFlags := p^.mode.mFlags or MFLG_ECHO
+              else p^.mode.mFlags := p^.mode.mFlags and not MFLG_ECHO;
+end;
+
+procedure cmdChanges(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+var v: i32;
+begin
+  if nArg < 1 then v := 1 else v := parseOnOff(args[0], 1);
+  if v <> 0 then p^.shellFlgs := p^.shellFlgs or SHFLG_CountChanges
+              else p^.shellFlgs := p^.shellFlgs and not SHFLG_CountChanges;
+end;
+
+procedure cmdTables(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+{ Mirror upstream `.tables` (shell.c.in ~10915): query sqlite_schema for
+  tables and views matching an optional LIKE pattern.  Upstream emits a
+  3-column-wide auto-formatted block; this initial cut emits one-name-
+  per-line, which is sufficient for the 10c gate to start running. }
+var sql, pattern: AnsiString;
+begin
+  if nArg >= 1 then pattern := args[0] else pattern := '%';
+  sql := 'SELECT name FROM sqlite_schema WHERE type IN (''table'',''view'')' +
+         ' AND name NOT LIKE ''sqlite_%'' AND name LIKE ''' +
+         StringReplace(pattern, '''', '''''', [rfReplaceAll]) +
+         ''' ORDER BY 1';
+  runStatementVerbose(p, sql);
+end;
+
+procedure cmdIndexes(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+{ shell.c.in ~10989..11020: list all indexes (or just those of the
+  named table) ordered by name. }
+var sql, tab: AnsiString;
+begin
+  if nArg >= 1 then begin
+    tab := StringReplace(args[0], '''', '''''', [rfReplaceAll]);
+    sql := 'SELECT name FROM sqlite_schema WHERE type=''index'' AND tbl_name=''' +
+           tab + ''' ORDER BY 1';
+  end else
+    sql := 'SELECT name FROM sqlite_schema WHERE type=''index'' ORDER BY 1';
+  runStatementVerbose(p, sql);
+end;
+
+procedure cmdDatabases(p: PShellState);
+{ shell.c.in ~10130: SELECT * FROM pragma_database_list. }
+begin
+  runStatementVerbose(p, 'SELECT name, file FROM pragma_database_list ORDER BY seq');
+end;
+
+procedure cmdSchema(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+{ shell.c.in ~10800..10860: dump CREATE statements from sqlite_schema.
+  Pattern-less form returns every row.  Newlines inside SQL are
+  preserved. }
+var sql, pat: AnsiString;
+begin
+  if nArg >= 1 then begin
+    pat := StringReplace(args[0], '''', '''''', [rfReplaceAll]);
+    sql := 'SELECT sql FROM sqlite_schema WHERE name LIKE ''' + pat +
+           ''' AND sql IS NOT NULL ORDER BY tbl_name, type DESC, name';
+  end else
+    sql := 'SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY tbl_name, type DESC, name';
+  runStatementVerbose(p, sql);
+end;
+
 function doMetaCommand(const zLine: AnsiString; p: PShellState): i32;
 var
   zCmd: AnsiString;
+  args: array[0..15] of AnsiString;
+  nArg: SizeInt;
+  i: SizeInt;
 begin
   Result := 0;
   zCmd := dotCmdName(zLine);
   if zCmd = '' then Exit;
+  for i := 0 to High(args) do args[i] := '';
+  splitDotArgs(zLine, args, nArg);
 
-  { .quit / .exit — minimal viable REPL termination.  Mirrors the C
-    arms in do_meta_command without --code support (10.1.5 follow-up). }
-  if (zCmd = 'quit') or (zCmd = 'exit') then begin
-    Result := 2;
+  if (zCmd = 'quit') or (zCmd = 'exit') then begin Result := 2; Exit; end;
+  if zCmd = 'help'      then begin cmdHelp; Exit; end;
+  if zCmd = 'show'      then begin cmdShow(p); Exit; end;
+  if zCmd = 'mode'      then begin cmdMode(p, args, nArg); Exit; end;
+  if zCmd = 'headers'   then begin cmdHeaders(p, args, nArg); Exit; end;
+  if (zCmd = 'separator') or (zCmd = 'sep') then begin cmdSeparator(p, args, nArg); Exit; end;
+  if zCmd = 'nullvalue' then begin cmdNullvalue(p, args, nArg); Exit; end;
+  if zCmd = 'echo'      then begin cmdEcho(p, args, nArg); Exit; end;
+  if zCmd = 'changes'   then begin cmdChanges(p, args, nArg); Exit; end;
+  if zCmd = 'tables'    then begin cmdTables(p, args, nArg); Exit; end;
+  if zCmd = 'indexes'   then begin cmdIndexes(p, args, nArg); Exit; end;
+  if zCmd = 'databases' then begin cmdDatabases(p); Exit; end;
+  if zCmd = 'schema'    then begin cmdSchema(p, args, nArg); Exit; end;
+  if zCmd = 'print' then begin
+    for i := 0 to nArg - 1 do begin
+      if i > 0 then Write(' ');
+      Write(args[i]);
+    end;
+    WriteLn;
     Exit;
   end;
 
-  { .help — stub.  10.1.33 will replace with the upstream help table. }
-  if zCmd = 'help' then begin
-    shellSPutZ('.help               Show this list of dot-commands' + sLineBreak);
-    shellSPutZ('.quit               Exit this program' + sLineBreak);
-    shellSPutZ('(other dot-commands not yet ported — see tasklist 10.1.7+)' + sLineBreak);
-    Exit;
-  end;
-
-  { .show — minimal so callers can sanity-check ShellState.  10.1.32
-    replaces with full coverage. }
-  if zCmd = 'show' then begin
-    shellSPutZ(Format('  filename: %s'#10,
-      [string(AnsiString(p^.pAuxDb^.zDbFilename))]));
-    shellSPutZ(Format('   bail on error: %d'#10, [bail_on_error]));
-    shellSPutZ(Format('   echo: %d'#10, [Ord((p^.mode.mFlags and MFLG_ECHO) <> 0)]));
-    shellSPutZ(Format('   mode: %s'#10, [aModeInfo[p^.mode.eMode].zName]));
-    Exit;
-  end;
-
-  { Default fall-through — match upstream phrasing exactly so that the
-    10.2 integration parity gate diff'ing bin/passqlite3 against
-    sqlite3 sees byte-identical stderr for unported commands. }
   shellEPutZ(Format('Error: unknown command or invalid arguments:  "%s". ' +
     'Enter ".help" for help'#10, [zCmd]));
   Result := 1;
