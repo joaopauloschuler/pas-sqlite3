@@ -84,6 +84,8 @@ uses
   passqlite3templatevtab,
   passqlite3showauth,
   passqlite3mmapwarm,
+  passqlite3prefixes,
+  passqlite3memstat,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -592,6 +594,11 @@ begin
     as a function, not auto-installed. }
   sqlite3WholenumberInit(p^.db);
   sqlite3TemplateVtabInit(p^.db);
+  { Phase 10.1.70 — prefixes() table-valued function + prefix_length()
+    scalar from ext/misc/prefixes.c, and the sqlite_memstat eponymous
+    vtab from ext/misc/memstat.c. }
+  sqlite3PrefixesInit(p^.db);
+  sqlite3MemstatVtabInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);

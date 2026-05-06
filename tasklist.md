@@ -1375,6 +1375,43 @@ existing dispatcher.
        pushdown lands, constraints flow straight through.
        TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps clean.
 
+  [X] **10.1.70** ext/misc/prefixes.c (321 C lines) +
+       ext/misc/memstat.c (435 C lines) ported as new units
+       `passqlite3prefixes.pas` and `passqlite3memstat.pas` (~756 C
+       lines total).  prefixes provides the `prefixes(STR)` table-
+       valued function that yields all prefixes of STR longest-to-
+       shortest plus the `prefix_length(L,R)` UTF-8-character common-
+       prefix scalar.  memstat provides the `sqlite_memstat`
+       eponymous vtab exposing the global sqlite3_status64() counters
+       (MEMORY_USED / MALLOC_SIZE / MALLOC_COUNT / PAGECACHE_*
+       / PARSER_STACK) and the per-connection sqlite3_db_status()
+       counters (DB_LOOKASIDE_* / DB_CACHE_* / DB_SCHEMA_USED /
+       DB_STMT_USED / DB_DEFERRED_FKS).  ZIPVFS rows skipped (no
+       ZIPVFS build).  DB_CACHE_USED_SHARED also skipped to match the
+       C build (its `#if SQLITE_VERSION_NUMBER >= 3140000` gate
+       evaluates false against 3.53's encoding 3053000 — likely an
+       upstream typo, but matched here for byte-identical output).
+       Wired via sqlite3PrefixesInit / sqlite3MemstatVtabInit in
+       shell openDb.  Verified byte-identical against `.load
+       /tmp/{prefixes,memstat}.so` running under the system sqlite3:
+       prefixes('hello') → 'hello' / 'hell' / 'hel' / 'he' / 'h' /
+       '', prefix_length('abcdxxx','abcyy')=3, prefix_length('ab',
+       'abcd')=2, prefix_length over multi-byte UTF-8 ('héllo',
+       'héllo')=5; sqlite_memstat name list matches exactly (18 rows).
+
+- [ ] **6.15** TestExplainParity regression to 224/802 (pre-existing,
+    independent of 10.1.70).  Verified by stashing all uncommitted
+    work (just prefixes/memstat additions) and re-running — same
+    802 divergences.  Symptom: Pas emits one extra OP_Explain at the
+    head of every prepared statement (Init p2 = ops+1 vs C ops+0).
+    Concretely on `CREATE TABLE simple`: C has SeekRowid at op[15],
+    Pas has Explain at op[15] then SeekRowid at op[16].  Likely
+    introduced after 10.1.69 close-out; the recent commits' "1026/
+    1026" claims are stale.  Probable suspect is a recent codegen
+    arm that grew an unconditional `OP_Explain` emission rather than
+    gating on `p->p4type==P4_DYNAMIC` or `pParse->explain`.  Probe
+    by bisecting a3..a4 around commit ee98a76 and earlier.
+
 - [X] **8.x.colneed** sqlite3_collation_needed callback now fires.
   Closed 2026-05-06.  `sqlite3GetCollSeq` (codegen.pas:42193) was
   missing the `callCollNeeded(db, enc, zName)` step from callback.c:222
