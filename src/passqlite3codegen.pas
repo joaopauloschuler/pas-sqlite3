@@ -23208,8 +23208,14 @@ begin
     if rcWin <> SQLITE_OK then begin Result := rcWin; Exit; end;
     if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
 
-    { Subset gates — extend in later 6.26 sub-phases. }
-    if pDest^.eDest <> SRT_Output then
+    { Subset gates — extend in later 6.26 sub-phases.
+      SRT_EphemTab admitted so the recursive sqlite3Select call from the
+      eph-materialise arm below (inner sub-SELECT carrying orphan windows
+      after multi-window rewrite) can run the window arm too — that's the
+      mechanism that makes `SELECT … w1() OVER A, w2() OVER B …` (mixed
+      partitions) emit nested co-routine layers, one per distinct OVER spec
+      (window.c:1332 sqlite3WindowLink chain + select.c:7686 recursion). }
+    if (pDest^.eDest <> SRT_Output) and (pDest^.eDest <> SRT_EphemTab) then
     begin Result := SQLITE_OK; Exit; end;
     { Outer ORDER BY combined with LIMIT not yet supported.  DISTINCT
       combined with ORDER BY needs OMITREF/sorter-key dedup that the
@@ -23373,6 +23379,21 @@ begin
       sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsrW, regSortRecW,
                            regSortBaseW, nResultCol);
     end
+    else if pDest^.eDest = SRT_EphemTab then
+    begin
+      { 6.26 multi-window — recursive sqlite3Select from outer eph-materialise
+        feeds an inner SELECT that itself runs the window arm.  Disposal here
+        mirrors selectInnerLoop SRT_EphemTab (codegen.pas:24609..24631):
+        MakeRecord + NewRowid + Insert (OPFLAG_APPEND) into pDest^.iSDParm. }
+      r1 := sqlite3GetTempReg(pParse);
+      r2 := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+      sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+      sqlite3VdbeAddOp3(v, OP_Insert,    pDest^.iSDParm, r1, r2);
+      sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+      sqlite3ReleaseTempReg(pParse, r2);
+      sqlite3ReleaseTempReg(pParse, r1);
+    end
     else
     begin
       { OFFSET skip — jump to iContW (which OP_Returns to Step) without emitting
@@ -23412,7 +23433,19 @@ begin
       for i := 0 to nResultCol - 1 do
         sqlite3VdbeAddOp3(v, OP_Column, iSortTabW,
                           sortNKeyW + i, pDest^.iSdst + i);
-      sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+      if pDest^.eDest = SRT_EphemTab then
+      begin
+        r1 := sqlite3GetTempReg(pParse);
+        r2 := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+        sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+        sqlite3VdbeAddOp3(v, OP_Insert,    pDest^.iSDParm, r1, r2);
+        sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+        sqlite3ReleaseTempReg(pParse, r2);
+        sqlite3ReleaseTempReg(pParse, r1);
+      end
+      else
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
       if addrSortContW <> 0 then
         sqlite3VdbeResolveLabel(v, addrSortContW);
       sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterCsrW, addrSortLoopW);

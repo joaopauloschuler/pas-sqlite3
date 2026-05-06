@@ -99,8 +99,12 @@ FPC porting traps that recur often enough to call out up-front:
        (analyzeAggregate + generateAggSelect ORDER-BY-inside-aggregate
        arm).  Gate: DiagWindow `group_concat order` PASSes.
 
-  [~] **6.26** Window functions (window.c).  DiagWindow: 1 divergence
-       open (multi-window arm).  Gate: DiagWindow.
+  [X] **6.26** Window functions (window.c).  DiagWindow: ALL PASS
+       (multi-window arm closed by lifting the window-arm SRT_Output gate
+       to admit SRT_EphemTab — recursive sqlite3Select from the outer
+       eph-materialise now runs the window arm again on the inner sub-
+       SELECT carrying orphan windows, mirroring the C nested-coroutine
+       layering one layer per distinct OVER spec).  Gate: DiagWindow.
        [X] sqlite3WindowRewrite / WindowCodeInit / WindowCodeStep
             ported with all helpers (windowArgCount, windowAggStep,
             windowAggFinal, windowFullScan, windowCodeRangeTest,
@@ -117,20 +121,17 @@ FPC porting traps that recur often enough to call out up-front:
             wiring + bSort SRT_EphemTab inner-sub ORDER BY.
        [X] Subset-gate lifts: outer ORDER BY (incl. ORDER-BY-by-alias
             via resolveAsName), outer DISTINCT, LIMIT / OFFSET.
-       [ ] **Multi-window arm** (several distinct OVER clauses with
-            incompatible partition/order).  `multi window` row in
-            DiagWindow returns empty.  Root cause: `sqlite3WindowLink`
-            only links windows matching the first linked spec
-            (sqlite3WindowCompare==0); orphans never enter `pSel^.pWin`
-            chain, so CodeInit/Step never populate their regResult,
-            and the EP_WinFunc fast-path at sqlite3ExprCodeTarget
-            (codegen.pas:~5638) falls through to scalar evaluation.
-            Fix path (matches C, unported): iterate orphans and wrap
-            each in nested sub-SELECTs as `sqlite3WindowRewrite` does
-            for the linked group, one rewrite layer per spec.
-            Substantial port — requires extending
-            `selectWindowRewriteEList` to walk the orphan list and
-            emit successive sub-SELECT layers.
+       [X] **Multi-window arm** (several distinct OVER clauses with
+            incompatible partition/order).  Closed by admitting
+            SRT_EphemTab in the window-arm gate at codegen.pas:23212 +
+            mirrored MakeRecord/NewRowid/Insert disposal in the inner
+            Gosub subroutine and bSort tail.  Orphan windows (those
+            not chained into pSel^.pWin via sqlite3WindowLink) ride out
+            on the rewritten sub-SELECT's pEList as TK_FUNCTION+EP_WinFunc
+            nodes; when the outer materialise calls sqlite3Select on
+            that sub-SELECT, linkWindowsForSelect picks them up and the
+            window arm runs again — one rewrite layer per distinct OVER
+            spec, mirroring C's nested-coroutine emission.
 
   [ ] **6.27** codegen.pas schema-mutation + statistics.
        Sub-rows that overlapped Phase 7 have been moved out
@@ -249,14 +250,13 @@ FPC porting traps that recur often enough to call out up-front:
         schema-cache side fixed.  Remaining: memdb pager savepoint
         reconciliation — btree pages not unwound on ROLLBACK TO.
 
-  [ ] **6.10 step 17** Window-function and aggregate divergences
-      surfaced by `DiagWindow`.  13 runtime empty-row divergences open.
+  [X] **6.10 step 17** Window-function and aggregate divergences
+      surfaced by `DiagWindow`.  All PASS as of 2026-05-06 (multi-window
+      arm closed under 6.26).
       [X] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** —
-        Closed by 6.24.  DiagWindow `group_concat order` PASSes;
-        runtime divergence count drops 13 → 12.
-      [ ] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
-        prepare cleanly but emit no rows** — `row_number() OVER (...)`
-        same.  Window-codegen sub-issue under 6.26.
+        Closed by 6.24.
+      [X] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
+        / `row_number() OVER (...)` empty rows** — Closed under 6.26.
 
   [ ] **6.11** DROP TABLE remaining gap (current Δ=26):
     (b) [ ] Pas elides the destroyRootPage autovacuum follow-on (~26 ops)
