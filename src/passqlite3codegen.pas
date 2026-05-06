@@ -35117,6 +35117,11 @@ begin
                + i * SizeOf(TExprListItem))^.pExpr^.u.zToken);
     end;
     if (n >= 0) and (n = pTab^.iPKey) then n := -1;  { rowid alias }
+    { Mirror build.c:4241..4243 — uniqNotNull only stays set when every
+      indexed column is declared NOT NULL.  rowid (n<0) is implicitly
+      NOT NULL so does not clear the bit. }
+    if (n >= 0) and ((PColumn(pTab^.aCol)[n].typeFlags and $0F) = OE_None) then
+      pIndex^.idxFlags := pIndex^.idxFlags and not u32($08);
     (pIndex^.aiColumn + i)^ := i16(n);
     (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY;
     (pIndex^.aSortOrder + i)^ := 0;
@@ -35973,11 +35978,15 @@ var
   v: PVdbe;
   errCode: i32;
   isPK: i32;
+  pTab: PTable2;
+  zErr, zPart: PAnsiChar;
+  j, iCol: i32;
 begin
-  { Faithful port of build.c:5470 sqlite3UniqueConstraint, omitting the
-    err-message build (P4 is not part of TestExplainParity's compare
-    surface, only opcode + p1/p2/p3/p5).  Emits OP_Halt with
-    SQLITE_CONSTRAINT_UNIQUE/PRIMARYKEY, p2=onError, p5=P5_ConstraintUnique. }
+  { Faithful port of build.c:5470 sqlite3UniqueConstraint.  Emits OP_Halt
+    with SQLITE_CONSTRAINT_UNIQUE/PRIMARYKEY, p2=onError,
+    p5=P5_ConstraintUnique, and a P4_DYNAMIC error string of the form
+    "tab.col1, tab.col2" — or "index 'name'" when the index is an
+    expression index. }
   v := sqlite3GetVdbe(pParse);
   if v = nil then Exit;
   if onError = OE_Abort then sqlite3MayAbort(pParse);
@@ -35986,7 +35995,26 @@ begin
     errCode := SQLITE_CONSTRAINT_PRIMARYKEY
   else
     errCode := SQLITE_CONSTRAINT_UNIQUE;
-  sqlite3VdbeAddOp4(v, OP_Halt, errCode, onError, 0, nil, 0);
+  pTab := pIdx^.pTable;
+  zErr := nil;
+  if pIdx^.aColExpr <> nil then
+    zErr := sqlite3MPrintf(pParse^.db, 'index ''%q''', [pIdx^.zName])
+  else if pTab <> nil then
+  begin
+    for j := 0 to i32(pIdx^.nKeyCol) - 1 do
+    begin
+      iCol := i32((pIdx^.aiColumn + j)^);
+      if iCol < 0 then Continue;  { defensive — C asserts iCol>=0 }
+      if zErr = nil then
+        zPart := sqlite3MPrintf(pParse^.db, '%s.%s',
+                  [pTab^.zName, PColumn(pTab^.aCol)[iCol].zCnName])
+      else
+        zPart := sqlite3MPrintf(pParse^.db, '%z, %s.%s',
+                  [zErr, pTab^.zName, PColumn(pTab^.aCol)[iCol].zCnName]);
+      zErr := zPart;
+    end;
+  end;
+  sqlite3VdbeAddOp4(v, OP_Halt, errCode, onError, 0, zErr, P4_DYNAMIC);
   sqlite3VdbeChangeP5(v, P5_ConstraintUnique);
 end;
 

@@ -502,14 +502,23 @@ FPC porting traps that recur often enough to call out up-front:
        Schema reload after ATTACH wired (see 7.1.1) — `aux.t` is now
        readable end-to-end after `ATTACH 'file' AS aux`.
 
-- [~] **7.1.9** ALTER TABLE (alter.c).  All five codegen entry points
-       (sqlite3AlterRenameTable / FinishAddColumn / AddConstraint /
-       RenameColumn / DropColumn) and all nine sqlite_rename_* /
-       sqlite_drop_* SQL helpers ported.  TestParser ALTER TABLE rows
-       PASS.  End-to-end runtime parity (`ALTER TABLE t RENAME COLUMN
-       a TO aa` followed by `SELECT aa FROM t`) gated on Phase 7.1.1
-       schema-row INSERT/UPDATE wiring.  Closes 6.10 step 9(g) once
-       7.1.1 lands.
+- [X] **7.1.9** ALTER TABLE (alter.c).  Closed 2026-05-06.  All five
+       codegen entry points (sqlite3AlterRenameTable / FinishAddColumn /
+       AddConstraint / RenameColumn / DropColumn) and all nine
+       sqlite_rename_* / sqlite_drop_* SQL helpers ported.  TestParser
+       ALTER TABLE rows PASS.  End-to-end runtime parity verified via
+       new DiagFeatureProbe rows (added 2026-05-06): RENAME COLUMN +
+       SELECT renamed, ADD COLUMN + SELECT new col, RENAME TABLE +
+       SELECT new name, RENAME TABLE + pragma_table_info, DROP COLUMN
+       + pragma_table_info, DROP COLUMN + SELECT survivor — all 8
+       ALTER probes PASS, total divergences 0.  Unblocked by the
+       OP_ParseSchema p4=NULL SchemaClear+InitOne reload landed under
+       6.10 step 9(g) / 7.1.1.  Regression sweep (2026-05-06, a3):
+       DiagDml / DiagPragma / DiagDropTable / DiagCreateIdx / DiagTxn /
+       DiagMisc / DiagOps / DiagAnalyze / DiagSubsel / DiagAggWhere /
+       DiagInnerJoin / DiagAutoIdx / DiagIndexing / DiagMultiValues all
+       clean; DiagWindow's 2 pre-existing sum/avg-OVER divergences
+       unchanged.
 
 - [~] **7.4b** Bytecode-diff scope landed via `TestBytecodeParity.pas`.
   Done 2026-05-06.  Drives `EXPLAIN <sql>` through `sqlite3_prepare_v2 /
@@ -542,36 +551,63 @@ FPC porting traps that recur often enough to call out up-front:
        in C's sqlite3NestedParse(INSERT INTO sqlite_master ...).
        Lifts CREATE INDEX rows; remaining CREATE UNIQUE INDEX gap is
        a separate KeyInfo/nKeyField issue tracked in the test header.
-  [ ] **7.4b.4** CREATE UNIQUE INDEX SorterOpen KeyInfo nKeyField.
-       Surfaced 2026-05-06 by TestBytecodeParity.  For
-       `CREATE UNIQUE INDEX i2 ON t(b)` Pascal emits SorterOpen p4=
-       "k(1,)" (1 key field) while C emits "k(2,,)" (2 fields:
-       indexed col + rowid tail).  Pascal's `sqlite3KeyInfoOfIndex`
-       (codegen.pas:29065) takes the `uniqNotNull` branch and passes
-       `nKeyCol` to `sqlite3KeyInfoAlloc` — but C's build.c CreateIndex
-       passes `nColumn` (which already includes the rowid tail for
-       unique indexes on rowid tables).  Fix is local to the
-       KeyInfoAlloc call sites that target SorterOpen.
-  [ ] **7.4b.5** Implicit PK / WITHOUT ROWID index MakeRecord p4
-       affinity.  Surfaced 2026-05-06 by TestBytecodeParity (rows
-       parked).  `CREATE TABLE z7(a,b, PRIMARY KEY(a,b))` and
-       `CREATE TABLE z8(a PRIMARY KEY, b) WITHOUT ROWID` both emit
-       a real-PK-index MakeRecord whose p4 affinity is empty on
-       Pascal vs the table affinity string on C.  Distinct from
-       7.4b.3 (sqlite_master schema-row affinity, fixed): this is
-       the index-key MakeRecord at the Pascal equivalent of
-       insert.c:204..222, where `pTab->zColAff` should be looked up
-       and `sqlite3VdbeChangeP4` applied to the just-emitted
-       MakeRecord.  Once landed, fold composite PK / WITHOUT ROWID
-       rows back into TestBytecodeParity (currently EXCLUDED).
-  [ ] **7.4b.6** DiagCovering "prepare failed" on covering-index
-       lookup against `u(p PRIMARY KEY, q)`.  Surfaced 2026-05-06
-       (pre-existed before 7.4b but uncovered while sweeping the
-       test suite).  `SELECT a FROM u WHERE a=5` returns prepare
-       failure on the Pascal side; the rest of DiagCovering's
-       corpus runs cleanly.  Likely a WITHOUT-ROWID column-resolution
-       gap inside the covering-index plan path; investigate after
-       7.4b.5 since the two share the WITHOUT-ROWID surface.
+  [X] **7.4b.4** CREATE UNIQUE INDEX SorterOpen KeyInfo nKeyField.
+       Closed 2026-05-06.  Root cause was in `sqlite3CreateIndex`
+       (codegen.pas:35107..), not in `sqlite3KeyInfoOfIndex` as the
+       header note guessed.  C's build.c:4241..4243 clears
+       `pIndex->uniqNotNull` whenever an indexed column is not
+       declared NOT NULL; the Pascal port set the bit unconditionally
+       when `onError != OE_None` and never cleared it.  Result:
+       sqlite3KeyInfoOfIndex took the `uniqNotNull` branch and
+       allocated `KeyInfoAlloc(nKeyCol=1, 0)` instead of
+       `KeyInfoAlloc(nColumn=2, 0)` — emitting SorterOpen p4="k(1,)"
+       instead of C's "k(2,,)".  Fix: clone the build.c clear inside
+       the column-resolution loop right after the column index is
+       resolved.  Companion fix: `sqlite3UniqueConstraint`
+       (codegen.pas:35976) emitted OP_Halt with a NULL p4; now builds
+       the "tab.col[, tab.col2]" zErr (or "index 'name'" for
+       expression indices) with sqlite3MPrintf and feeds it as
+       P4_DYNAMIC, mirroring build.c:5482..5495.
+       Verification: TestBytecodeParity row 'CREATE UNIQUE INDEX i2
+       ON t(b)' now PASS; corpus 29 → 30, all PASS.  Regression
+       sweep clean (TestExplainParity 1026/1026; DiagDml / DiagPragma
+       / DiagDropTable / DiagCreateIdx / DiagTxn / DiagMisc / DiagOps
+       / DiagAnalyze / DiagFeatureProbe / DiagIndexing all 0 div).
+  [X] **7.4b.5** Implicit PK / WITHOUT ROWID index MakeRecord p4
+       affinity.  Closed 2026-05-06.  Re-checking on a3 with the
+       7.4b.4 fix in place: both `CREATE TABLE z7(a,b, PRIMARY
+       KEY(a,b))` and `CREATE TABLE z8(a PRIMARY KEY, b) WITHOUT
+       ROWID` now emit byte-identical bytecode to C (MakeRecord p4
+       affinity included).  The header note's reference to
+       insert.c:204..222 was misdirection — that affinity comes
+       from sqlite3NestedParse on the schema-row INSERT, not from
+       any index-key MakeRecord — and the gap was lifted earlier
+       by 7.4b.3's emitSchemaRowInsert AddOp4 path.  Folded both
+       rows back into TestBytecodeParity ('CREATE TABLE composite
+       PK', 'CREATE TABLE WITHOUT ROWID'); corpus 30 → 32, all PASS.
+  [ ] **7.4b.6** "database disk image is malformed" after a CREATE
+       INDEX is followed by a subsequent btree-allocating statement
+       on the same connection.  Re-classified 2026-05-06 from the
+       prior "prepare failed on covering-index lookup" framing — the
+       original DiagCovering symptom (SELECT a FROM u WHERE a=5
+       reports "no such table: u") is a downstream effect: `u`
+       never gets created because the preceding `CREATE INDEX i1
+       ON t(a)` puts the database into a state where the next
+       btree-allocating statement fails with SQLITE_CORRUPT.
+       Minimal repro:
+         CREATE TABLE t(a,b,c);
+         CREATE INDEX  i1 ON t(a);    -- ok
+         CREATE TABLE  u(a,b,c);      -- rc=11 SQLITE_CORRUPT
+       Bytecode for the failing CREATE TABLE is byte-identical to
+       C (verified via EXPLAIN), so the regression is in runtime
+       VDBE / btree state, not in codegen.  PRAGMA integrity_check
+       between the two reports clean; sqlite_master shows t/2 and
+       i1/3 as expected; OP_CreateBtree on the next statement trips
+       a corruption check.  Investigate sqlite3BtreeCreateTable
+       (passqlite3btree.pas:6858) and the page-allocation path it
+       walks — likely a pointer-map / autovacuum bookkeeping miss
+       on the freshly allocated index root.  Pre-existed 7.4b;
+       independent of WITHOUT-ROWID surface.
 
 - [X] **7.4c** `TestVdbeTrace.pas` differential opcode-trace gate.  Done
   2026-05-06.  `passqlite3vdbe` exports `gVdbeTraceBuf` and the

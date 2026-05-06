@@ -233,7 +233,7 @@ end;
 { -------------------------------------------------------------------------- }
 
 const
-  N_CORPUS = 29;
+  N_CORPUS = 32;
 
 var
   CORPUS: array[0..N_CORPUS - 1] of TCorpusRow;
@@ -289,6 +289,15 @@ begin
   Add(i, 'CREATE INDEX',                 'CREATE INDEX i1 ON t(a);');                     Inc(i);
   Add(i, 'CREATE INDEX 2col',            'CREATE INDEX i3 ON t(a,b);');                   Inc(i);
 
+  { 7.4b.4 — CREATE UNIQUE INDEX SorterOpen KeyInfo nKeyField now matches.
+    Pascal's sqlite3CreateIndex now clears uniqNotNull when the indexed
+    column is not declared NOT NULL, mirroring build.c:4241..4243. }
+  Add(i, 'CREATE UNIQUE INDEX',          'CREATE UNIQUE INDEX i2 ON t(b);');              Inc(i);
+
+  { 7.4b.5 — composite PK on rowid table / WITHOUT ROWID schema-row. }
+  Add(i, 'CREATE TABLE composite PK',    'CREATE TABLE z7(a,b, PRIMARY KEY(a,b));');      Inc(i);
+  Add(i, 'CREATE TABLE WITHOUT ROWID',   'CREATE TABLE z8(a PRIMARY KEY, b) WITHOUT ROWID;'); Inc(i);
+
   { ----- EXCLUDED — known 7.4b follow-up codegen gaps -----
     These rows produce identical (op, p1, p2, p3, p5) but diverge on p4
     rendering; they are tracked as 7.4b sub-items in tasklist.md.
@@ -303,10 +312,6 @@ begin
       ROWID' — implicit-index OP_MakeRecord p4 affinity still empty.
       Distinct from 7.4b.3 (sqlite_master schema-row affinity), which
       has been fixed.
-    * 'CREATE UNIQUE INDEX' — OP_SorterOpen p4 KeyInfo nKeyField is
-      `nKeyCol` (1) on Pascal vs `nKeyCol+1` (2, including the rowid
-      tail) on C.  Pascal's sqlite3KeyInfoOfIndex collapses the
-      uniqNotNull case differently than C's build.c CreateIndex.
     * INSERT-from-SELECT / multi-row VALUES, UPDATE ... FROM — pending
       the same OP_OpenRead nField alignment.
     --------------------------------------------------------- }
