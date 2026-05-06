@@ -42422,10 +42422,18 @@ begin
                     SQLITE_DIRECTONLY or SQLITE_SUBTYPE or SQLITE_INNOCUOUS));
   p^.funcFlags  := p^.funcFlags or encByte;
   p^.pUserData  := pUserData;
-  p^.xSFunc     := TxSFuncProc(xSFunc);
+  { main.c:2050 — `p->xSFunc = xSFunc ? xSFunc : xStep;`.  The xStep
+    fallback is what makes aggregate-only registrations findable at
+    runtime: sqlite3FindFunction only returns a hit when xSFunc<>nil
+    (codegen.pas:42378). }
+  if xSFunc <> nil then
+    p^.xSFunc   := TxSFuncProc(xSFunc)
+  else
+    p^.xSFunc   := TxSFuncProc(xStep);
   p^.xFinalize  := TxFinalProc(xFinal);
   p^.xValue     := TxValueProc(xValue);
   p^.xInverse   := TxInverseProc(xInverse);
+  p^.nArg       := i16(nArg);
   if pDestructor <> nil then begin
     pDest := PTFuncDestructor(pDestructor);
     Inc(pDest^.nRef);

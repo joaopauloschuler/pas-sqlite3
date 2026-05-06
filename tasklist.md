@@ -1225,6 +1225,39 @@ existing dispatcher.
        ieee754(2,0) = 2.0, ieee754_to_blob(1.0) =
        x'3FF0000000000000', ieee754_inc(0.0,+1) =
        4.9406564584124654e-324, ieee754(0.0) = 'ieee754(0,-1075)'.
+  [X] **10.1.63** ext/misc/percentile.c port (503 C lines) — new unit
+       `passqlite3percentile.pas` provides the percentile family of
+       aggregate / window functions: median(Y), percentile(Y,P) with
+       P in [0..100], percentile_cont(Y,P) and percentile_disc(Y,P)
+       with P in [0..1].  All four are also valid window functions
+       (xInverse / xValue wired); the in-place insert-sort path
+       triggered by xInverse mirrors the C source.  Wired via
+       `sqlite3PercentileInit(p^.db)` in shell openDb.  Companion fix
+       to **sqlite3CreateFunc** (passqlite3codegen.pas:42421..) — the
+       Pascal port omitted main.c:2050's
+       `p->xSFunc = xSFunc ? xSFunc : xStep;` fallback, so any
+       aggregate-only registration left `xSFunc=nil` and
+       `sqlite3FindFunction` (codegen.pas:42378) returned NULL at
+       lookup → "no such function: median / percentile / sha3_agg".
+       Restored the fallback and added the missing `p^.nArg`
+       reassignment.  Verified byte-identical against upstream:
+       median over 1..10 = 5.5; percentile(x,0)=1.0,
+       percentile(x,50)=5.5, percentile(x,100)=10.0,
+       percentile_cont(x,0.25)=3.25, percentile_disc(x,0.25)=3.0,
+       percentile(x,73)=7.57.  TestExplainParity 1026/1026;
+       TestBytecodeParity 32/32; TestVdbeAgg 11/11; DiagFeatureProbe /
+       DiagDml / DiagOps / DiagPragma / DiagFunctions / DiagAnalyze /
+       DiagMisc / DiagCast / DiagCovering all clean.
+
+- [ ] **10.1.bug.3** Aggregate query followed by another statement on
+  the same shell input line trips "Parse error: incomplete input"
+  (or "near \"SE\": syntax error").  Repro:
+  `bin/passqlite3 :memory: "CREATE TABLE t(x); INSERT INTO t VALUES (1),(2); SELECT count(*) FROM t; SELECT 1;"` →
+  the second SELECT fails to parse.  Affects builtin `count(*)` and
+  `sum(*)` as well as the user-defined aggregates (sha3_agg /
+  median / percentile), so this is in the shell's input-buffer
+  state machine or VDBE finalize path, not in any one extension.
+  Workaround: split into separate `bin/passqlite3` invocations.
 
 - [X] **10.1.bug.2** sqlite3_trace_v2 callback fanout — closed 2026-05-06.
   Four call sites mirroring the C reference now invoke `db^.trace.xV2`:

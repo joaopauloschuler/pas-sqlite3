@@ -64,6 +64,7 @@ uses
   passqlite3sha1,
   passqlite3uuid,
   passqlite3ieee754,
+  passqlite3percentile,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -526,6 +527,10 @@ begin
     ieee754_to_blob() / ieee754_from_blob() / ieee754_to_int() /
     ieee754_from_int() / ieee754_inc() from ext/misc/ieee754.c. }
   sqlite3IeeeInit(p^.db);
+  { Phase 10.1.63 — median(), percentile(), percentile_cont(),
+    percentile_disc() aggregate / window functions from
+    ext/misc/percentile.c. }
+  sqlite3PercentileInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
