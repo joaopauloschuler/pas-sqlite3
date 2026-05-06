@@ -1294,6 +1294,41 @@ existing dispatcher.
        set on a file-backed db.  TestExplainParity 1026/1026;
        DiagFunctions / DiagFeatureProbe clean.
 
+  [X] **10.1.67** Bundle of five small ext/misc helpers ported as new
+       units (~693 C lines total): anycollseq.c (58 lines) →
+       `passqlite3anycollseq.pas` (registers a sqlite3_collation_needed
+       callback that synthesises BINARY-equivalent collations on demand);
+       blobio.c (152 lines) → `passqlite3blobio.pas` (readblob /
+       writeblob via sqlite3_blob_open / read / write / close);
+       nextchar.c (314 lines) → `passqlite3nextchar.pas` (next_char(A,T,F
+       [,W [,C]]) prefix-completion helper using a generated
+       SELECT … WHERE F>=(?1||?2) AND F<=(?1||char(1114111)) ORDER BY 1
+       LIMIT 1 driver loop with UTF-8 read/write); remember.c (72 lines)
+       → `passqlite3remember.pas` (remember(V,PTR) carry-through helper
+       via sqlite3_value_pointer / 'carray' tag); stmtrand.c (97 lines)
+       → `passqlite3stmtrand.pas` (per-statement repeatable PRNG via
+       sqlite3_set_auxdata key -4418371).  All wired through
+       sqlite3{Anycollseq,Blobio,Nextchar,Remember,Stmtrand}Init in
+       shell openDb.  Verification: stmtrand(7) emits the same triple
+       (476861750|1313754972|1316245715) as the C reference;
+       next_char('c','d','word') returns 'a' and next_char('ca','d',
+       'word') returns 'bprt' over a {cat,car,cab,cap,dog} dictionary;
+       readblob/writeblob round-trip works on a zeroblob(10) target;
+       remember(99,0) returns 99 and silently no-ops the write when the
+       pointer arg is not a valid carray pointer.  TestExplainParity
+       1026/1026.  Note: anycollseq registers correctly but the engine-
+       side callback dispatch (synthesizeCollation in C, callbacks.c)
+       is not yet wired in pas-sqlite3 — `xCollNeeded` is stored on the
+       db but never invoked when an unknown collation is encountered;
+       logged as new bug **8.x.colneed**.
+
+- [ ] **8.x.colneed** sqlite3_collation_needed callback never fires.
+  The pas-sqlite3 port stores `db^.xCollNeeded` / `db^.pCollNeededArg`
+  but no call site walks the lookup-failure path that C invokes via
+  `synthesizeCollation` (see callbacks.c:160..; called from
+  `sqlite3LocateCollSeq`).  Surfaces as anycollseq.c port being a
+  no-op even though `sqlite3AnycollseqInit` returns SQLITE_OK.
+
   [X] **10.1.65** ext/misc/totype.c port (528 C lines) — new unit
        `passqlite3totype.pas` provides tointeger(X) / toreal(X) lossless
        converters.  All helpers ported 1:1: totypeIsspace, totypeIsdigit,

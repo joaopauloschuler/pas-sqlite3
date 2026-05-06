@@ -72,6 +72,11 @@ uses
   passqlite3base85,
   passqlite3eval,
   passqlite3urifuncs,
+  passqlite3anycollseq,
+  passqlite3blobio,
+  passqlite3nextchar,
+  passqlite3remember,
+  passqlite3stmtrand,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -553,6 +558,15 @@ begin
   sqlite3Base85Init(p^.db);
   sqlite3EvalInit(p^.db);
   sqlite3UrifuncsInit(p^.db);
+  { Phase 10.1.67 — anycollseq fallback collation, blobio readblob/
+    writeblob, next_char(), remember(), and stmtrand() — small
+    ext/misc helpers from anycollseq.c, blobio.c, nextchar.c,
+    remember.c, stmtrand.c. }
+  sqlite3AnycollseqInit(p^.db);
+  sqlite3BlobioInit(p^.db);
+  sqlite3NextcharInit(p^.db);
+  sqlite3RememberInit(p^.db);
+  sqlite3StmtrandInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
