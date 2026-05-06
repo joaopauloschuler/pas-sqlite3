@@ -265,13 +265,13 @@ FPC porting traps that recur often enough to call out up-front:
       | Sub-step | Diagnosis | Specific gap |
       |----------|-----------|--------------|
       | step 8 (autoindex pIndex) | Not actually missing | `whereLoopAddBtreeIndex`, `whereLoopAddBtree`, `constructAutomaticIndex` all ported; pIndex IS assigned (codegen.pas:16157).  Nil-guard in `sqlite3WhereAddExplainText` likely covers a *different* (non-autoindex) scan-stand-in path.  Diagnostic, not codegen. |
-      | step 9(e) (UNION ALL + LIMIT) | **Genuinely missing port** | `multiSelect` main dispatcher (select.c:2926, recursive descent at 2940..3050 that propagates `p->pLimit` into `pPrior`) — only `multiSelectCollSeq`, `multiSelectByMergeKeyInfo`, `multiSelectByMerge` are ported.  The non-recursive LIMIT-on-compound case is unimplemented. |
+      | step 9(e) (UNION ALL + LIMIT) | **CLOSED 2026-05-06** | Compound dispatch arm extended to port select.c:3007..3043 (LIMIT/OFFSET propagation onto pPrior via Expr-dup, OP_IfNot reuse, OP_OffsetLimit, JumpHere).  No-FROM fast path lifted its `pLimit=nil` gate — calls `computeLimitRegisters`, `codeOffset`, `OP_DecrJumpZero` around the single-row body. |
       | step 9(f) (recursive CTE) | Partial port | `generateWithRecursiveQuery` + `recursiveInnerLoop` ported (codegen.pas:19825, 19917), but the dispatch arm at codegen.pas:22713..22743 still bails.  `sqlite3WithAdd` (build.c:5753) — no synthetic-table builder in Pas.  wherecode.c's `isRecursive` column-cache rewriting arm is not ported. |
       | step 15(b) (`:memory:` rollback) | All ported, **logic bug** | `pager_open_journal`, `pager_playback`, `pager_playback_one_page`, `sqlite3MemJournalOpen` all present (passqlite3pager.pas:4132, 3667, 3505; memjournal ~:833).  Bug is in lazy-open-across-autocommit-boundary or memjournal record survival. |
       | step 15(c) (`:memory:` savepoint) | All ported, **logic bug** | `sqlite3PagerSavepoint` (passqlite3pager.pas:4641), `pagerPlaybackSavepoint` (:3593), `sqlite3BtreeSavepoint` (passqlite3btree.pas:6514) all complete.  Likely `pager_playback_one_page` savepoint-specific page-recovery branch is incomplete. |
 
       **Tractable wins (ascending difficulty):**
-      1. **step 9(e)** — port the missing `multiSelect` dispatcher LIMIT propagation.  Localised to one C function in select.c.
+      1. ~~**step 9(e)**~~ — closed 2026-05-06.
       2. **step 9(f)** — lift bail at codegen.pas:22713, port `sqlite3WithAdd` synthetic-table builder, port wherecode `isRecursive` column-cache rewrite.
       3. **step 15(b/c)** — debugging existing code paths, not porting.  Step through with the C oracle.
       4. **step 8** — diagnostic; find which scan path leaves pIndex nil.
@@ -279,10 +279,18 @@ FPC porting traps that recur often enough to call out up-front:
       [X] **c) View materialisation in SELECT.**  agg-on-subquery arm
         materialises subquery into eph cursor and drives
         Rewind/updateAccumulator/Next.
-      [~] **e) UNION / compound SELECT.**  ORDER-BY and no-ORDER-BY
+      [X] **e) UNION / compound SELECT.**  ORDER-BY and no-ORDER-BY
         UNION / INTERSECT / EXCEPT dispatch through multiSelectByMerge.
-        DiagFeatureProbe `UNION compound` PASS.  LIMIT propagation
-        through UNION ALL still bails.
+        LIMIT/OFFSET propagation through UNION ALL closed (2026-05-06):
+        compound dispatch arm at codegen.pas:22717 now ports
+        select.c:3007..3043 (Expr-dup pLimit onto pPrior, recurse left,
+        delete dup, OP_IfNot guard reusing pPrior^.iLimit, OP_OffsetLimit
+        when iOffset, recurse right, JumpHere); plus the no-FROM fast
+        path at codegen.pas:22818 lifted its `pLimit=nil` gate, calls
+        `computeLimitRegisters` with a tail label, applies `codeOffset`
+        before the row emission, and emits `OP_DecrJumpZero` after.
+        DiagFeatureProbe rows `SELECT 1 LIMIT 1 (sub-FROM)`,
+        `UNION ALL + LIMIT`, `UNION ALL + LIMIT + OFFSET` all PASS.
       [~] **f) Recursive CTE not productive.**  Anchor row emits
         (`count(*) FROM r` returns 1, C returns 5).  Bodies ported
         (`generateWithRecursiveQuery` + `recursiveInnerLoop`); compound

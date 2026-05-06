@@ -22608,6 +22608,12 @@ var
   rcSel:        i32;
   savedFlagsP:  u32;
   savedFlagsPP: u32;
+  { LIMIT-propagation locals for the UNION ALL arm — select.c:3007..3043. }
+  pLimitDupCS:  PExpr;
+  addrLimJmp:   i32;
+  vdbeUA:       PVdbe;
+  { No-FROM fast-path LIMIT/OFFSET tail label (6.10 step 9(e)). }
+  addrEndNoFrom: i32;
   { No-ORDER-BY UNION/INTERSECT/EXCEPT invented-ORDER-BY locals
     (multiSelect select.c:2984..2994). }
   pInvOne:      PExpr;
@@ -22706,31 +22712,67 @@ begin
       Result := SQLITE_OK;
       Exit;
     end;
-    { Compound-SELECT — minimal UNION ALL arm of multiSelect
-      (select.c:2998..3050).  The C reference dispatches to multiSelect for
-      every compound; we inline the TK_ALL / no-ORDER-BY / no-LIMIT /
-      non-recursive case here.  UNION / EXCEPT / INTERSECT and ORDER BY
-      still bail (multiSelectByMerge and the recursive-CTE arm not yet
-      ported — tracked under 6.10 step 9(e)/(f) and 6.13(c)).
-      Each leaf carries SF_Compound; clear it during the recursion so the
-      no-FROM / regular-FROM fast paths inside sqlite3Select fire normally. }
-    if (p^.op = TK_ALL) and (p^.pOrderBy = nil) and (p^.pLimit = nil)
+    { Compound-SELECT — UNION ALL arm of multiSelect (select.c:2998..3050).
+      TK_ALL / no-ORDER-BY / non-recursive.  Optional LIMIT/OFFSET
+      propagated to the left arm by duplicating p^.pLimit onto pPrior;
+      the LIMIT register allocated during the left recursion is reused
+      to gate the right recursion via OP_IfNot (+ OP_OffsetLimit when
+      OFFSET is present).  Each leaf carries SF_Compound; clear it
+      during the recursion so the no-FROM / regular-FROM fast paths
+      inside sqlite3Select fire normally. }
+    if (p^.op = TK_ALL) and (p^.pOrderBy = nil)
        and ((p^.selFlags and SF_Recursive) = 0)
        and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
             or (pDest^.eDest = SRT_Set) or (pDest^.eDest = SRT_Mem)
             or (pDest^.eDest = SRT_Coroutine)) then
     begin
       pPriorSel    := p^.pPrior;
+      Assert(pPriorSel^.pLimit = nil);
       savedFlagsP  := p^.selFlags;
       savedFlagsPP := pPriorSel^.selFlags;
-      p^.selFlags        := p^.selFlags        and (not u32(SF_Compound));
+      p^.selFlags         := p^.selFlags         and (not u32(SF_Compound));
       pPriorSel^.selFlags := pPriorSel^.selFlags and (not u32(SF_Compound));
+
+      { Propagate LIMIT to left — register copy + Expr dup
+        (select.c:3007..3010). }
+      pPriorSel^.iLimit  := p^.iLimit;
+      pPriorSel^.iOffset := p^.iOffset;
+      pLimitDupCS := nil;
+      if p^.pLimit <> nil then
+        pLimitDupCS := sqlite3ExprDup(pParse^.db, p^.pLimit, 0);
+      pPriorSel^.pLimit := pLimitDupCS;
+
       rcSel := sqlite3Select(pParse, pPriorSel, pDest);
+
+      { Drop the duplicated LIMIT Expr (select.c:3013..3014). }
+      if pPriorSel^.pLimit <> nil then
+        sqlite3ExprDelete(pParse^.db, pPriorSel^.pLimit);
+      pPriorSel^.pLimit := nil;
+
+      addrLimJmp := 0;
       if rcSel = SQLITE_OK then
       begin
-        p^.pPrior := nil;
+        p^.pPrior  := nil;
+        p^.iLimit  := pPriorSel^.iLimit;
+        p^.iOffset := pPriorSel^.iOffset;
+        if p^.iLimit <> 0 then
+        begin
+          vdbeUA := sqlite3GetVdbe(pParse);
+          if vdbeUA <> nil then
+          begin
+            addrLimJmp := sqlite3VdbeAddOp1(vdbeUA, OP_IfNot, p^.iLimit);
+            if p^.iOffset <> 0 then
+              sqlite3VdbeAddOp3(vdbeUA, OP_OffsetLimit,
+                                p^.iLimit, p^.iOffset + 1, p^.iOffset);
+          end;
+        end;
         rcSel := sqlite3Select(pParse, p, pDest);
         p^.pPrior := pPriorSel;
+        if addrLimJmp <> 0 then
+        begin
+          vdbeUA := sqlite3GetVdbe(pParse);
+          if vdbeUA <> nil then sqlite3VdbeJumpHere(vdbeUA, addrLimJmp);
+        end;
       end;
       p^.selFlags         := savedFlagsP;
       pPriorSel^.selFlags := savedFlagsPP;
@@ -22781,7 +22823,7 @@ begin
           or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo))
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
-     and (p^.pLimit = nil) and (p^.pWin = nil)
+     and (p^.pWin = nil)
      and ((p^.selFlags and (SF_Distinct or SF_Aggregate or SF_Compound)) = 0)
   then
   begin
@@ -22795,6 +22837,20 @@ begin
     begin
       pDest^.iSdst := pParse^.nMem + 1;
       pParse^.nMem := pParse^.nMem + nResultCol;
+    end;
+    { LIMIT/OFFSET on no-FROM SELECT (6.10 step 9(e)).  Allocate a tail
+      label, run computeLimitRegisters (early-init for constant LIMIT,
+      MustBeInt+IfNot for non-constant; OP_OffsetLimit when OFFSET is
+      present), gate the row emission with codeOffset, and decrement
+      LIMIT after the row.  For a single-row body the per-row
+      DecrJumpZero is a no-op when LIMIT >= 1, but it correctly handles
+      the LIMIT 0 / fall-through-to-EndCoroutine case for SRT_Coroutine
+      consumers that retry. }
+    addrEndNoFrom := 0;
+    if p^.pLimit <> nil then
+    begin
+      addrEndNoFrom := sqlite3VdbeMakeLabel(pParse);
+      computeLimitRegisters(pParse, p, addrEndNoFrom);
     end;
     { Multi-row VALUES coroutine register-numbering parity (Phase 6.8.6
       step 5).  C's selectInnerLoop / multiSelectValues route allocates a
@@ -22818,6 +22874,11 @@ begin
     if (p^.selFlags and SF_MultiValue) = 0 then
       sqlite3VdbeAddOp3(v, OP_Explain, sqlite3VdbeCurrentAddr(v), 0, 0);
     sqlite3ExprCodeExprList(pParse, pEList, pDest^.iSdst, 0, SQLITE_ECEL_DUP);
+    { OFFSET — codeOffset emits IfPos to skip the row when iOffset>0.
+      Jumps to addrEndNoFrom (i.e. past the row emission) so this single
+      row is suppressed and the consumer sees zero rows for OFFSET>=1. }
+    if (p^.iOffset <> 0) and (addrEndNoFrom <> 0) then
+      codeOffset(v, p^.iOffset, addrEndNoFrom);
     if pDest^.eDest = SRT_Output then
       sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
     else if pDest^.eDest = SRT_Coroutine then
@@ -22840,6 +22901,11 @@ begin
       sqlite3ReleaseTempReg(pParse, r2);
       sqlite3ReleaseTempReg(pParse, r1);
     end;
+    { LIMIT — decrement and break when zero.  No-op when iLimit is unset. }
+    if p^.iLimit <> 0 then
+      sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrEndNoFrom);
+    if addrEndNoFrom <> 0 then
+      sqlite3VdbeResolveLabel(v, addrEndNoFrom);
     if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
     Exit;
   end;
