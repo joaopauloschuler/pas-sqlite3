@@ -1753,6 +1753,28 @@ type
 var
   vdbeSqlExec: TVdbeSqlExec = nil;
 
+{ OP_Vacuum hook (vdbe.c → vacuum.c sqlite3RunVacuum).  Same uses-cycle
+  rationale as vdbeParseSchemaExec / vdbeSqlExec.  Signature mirrors the
+  C function: write any error message via *pzErrMsg, vacuum aDb[iDb], and
+  if pOut is non-nil treat the call as VACUUM INTO 'pOut->z'. }
+type
+  TVdbeRunVacuum = function(pzErrMsg: PPAnsiChar; db: PTsqlite3;
+                            iDb: i32; pOut: Psqlite3_value): i32;
+var
+  vdbeRunVacuum: TVdbeRunVacuum = nil;
+
+{ OP_IFindKey / OP_IdxDelete hook — vdbeaux.c sqlite3VdbeFindIndexKey
+  (vdbeaux.c:5542).  Sub-search around the current index cursor for a
+  matching record where indexed-expression / virtual columns may differ
+  by tiny amounts (EIIB bug).  TIndex layout lives in passqlite3codegen
+  (PIndex is opaque here), so the body is installed via this hook. }
+type
+  TVdbeFindIndexKey = function(pCur: Pointer; pIdx: PIndex;
+                               p: Pointer; pRes: Pi32;
+                               bIntegrity: i32): i32;
+var
+  vdbeFindIndexKey: TVdbeFindIndexKey = nil;
+
 { --- vdbe.c Phase 5.4b helpers (exported for testing) --- }
 function  sqlite3IntFloatCompare(i: i64; r: Double): i32;
 
@@ -4055,29 +4077,162 @@ begin
   Result := rc;
 end;
 
+{ Faithful port of vdbeaux.c:2501..2513 (SQLITE_DEBUG only).  Prints the
+  SQL that produced this VDBE.  Sources zSql first; if absent, peeks the
+  P4 string of the OP_Init opcode at slot 0. }
 procedure sqlite3VdbePrintSql(p: PVdbe);
+var
+  z:   PAnsiChar;
+  pOp: PVdbeOp;
 begin
+  if p = nil then Exit;
+  z := nil;
+  if p^.zSql <> nil then
+    z := p^.zSql
+  else if p^.nOp >= 1 then begin
+    pOp := @p^.aOp[0];
+    if (pOp^.opcode = OP_Init) and (pOp^.p4.z <> nil) then begin
+      z := pOp^.p4.z;
+      while (z <> nil) and (z^ <> #0) and (Byte(z^) <= Byte(' '))
+            and ((z^ = ' ') or (z^ = #9) or (z^ = #10)
+                 or (z^ = #11) or (z^ = #12) or (z^ = #13)) do
+        Inc(z);
+    end;
+  end;
+  if z <> nil then
+    Write('SQL: [', z, ']'#10);
 end;
 
+{ vdbeaux.c:2520..2543 — SQLITE_ENABLE_IOTRACE-gated.  This port does not
+  wire SQLITE_ENABLE_IOTRACE (no sqlite3IoTrace dispatch installed), so
+  the body is a faithful no-op matching the !ENABLE_IOTRACE branch. }
 procedure sqlite3VdbeIOTraceSql(p: PVdbe);
 begin
+  { sqlite3IoTrace is unset in this build; nothing to emit. }
+  if p = nil then Exit;
 end;
 
-{ --- VdbeHalt, VdbeReset, VdbeFinalize (Phase 5.4 stubs) --- }
+{ --- VdbeHalt, VdbeReset, VdbeFinalize --- }
 
 procedure sqlite3VdbeSetChanges(db: Pointer; nChange: i64); forward;
+procedure sqlite3SystemError(db: Pointer; rc: i32); forward;
 
+{ vdbeaux.c:2919 — vdbeCommit.  Single-database simple-case is ported in
+  full (covers the entire default test corpus, which does not ATTACH writable
+  files).  The multi-file super-journal arm is intentionally deferred: with
+  no productive ATTACH-with-write workload it is unreachable today.  If a
+  future caller pushes nTrans>1 with a named main-file we early-return
+  SQLITE_ERROR rather than silently committing partially. }
+function vdbeCommit(db: PTsqlite3; p: PVdbe): i32;
+var
+  i:           i32;
+  nTrans:      i32;
+  rc:          i32;
+  needXcommit: i32;
+  pBt:         PBtree;
+  pPg:         PPager;
+  txn:         i32;
+  jm:          i32;
+  aMJNeeded:   array[0..5] of u8;
+  zMain:       PAnsiChar;
+const
+  PAGER_JM_DELETE   = 0; PAGER_JM_PERSIST = 1; PAGER_JM_OFF = 2;
+  PAGER_JM_TRUNCATE = 3; PAGER_JM_MEMORY  = 4; PAGER_JM_WAL = 5;
+begin
+  nTrans := 0;
+  needXcommit := 0;
+  aMJNeeded[PAGER_JM_DELETE]   := 1;
+  aMJNeeded[PAGER_JM_PERSIST]  := 1;
+  aMJNeeded[PAGER_JM_OFF]      := 0;
+  aMJNeeded[PAGER_JM_TRUNCATE] := 1;
+  aMJNeeded[PAGER_JM_MEMORY]   := 0;
+  aMJNeeded[PAGER_JM_WAL]      := 0;
+
+  { Sync vtabs first — may add attached databases to the transaction. }
+  rc := sqlite3VtabSync(db, p);
+
+  { Count write-transactions and acquire exclusive locks. }
+  i := 0;
+  while (rc = SQLITE_OK) and (i < db^.nDb) do begin
+    pBt := PBtree(db^.aDb[i].pBt);
+    if (pBt <> nil) and (sqlite3BtreeTxnState(pBt) = SQLITE_TXN_WRITE) then begin
+      needXcommit := 1;
+      pPg := sqlite3BtreePager(pBt);
+      jm := sqlite3PagerGetJournalMode(pPg);
+      if (db^.aDb[i].safety_level <> PAGER_SYNCHRONOUS_OFF)
+         and (jm >= 0) and (jm <= 5)
+         and (aMJNeeded[jm] <> 0)
+         and (sqlite3PagerIsMemdb(pPg) = 0) then
+        Inc(nTrans);
+      rc := sqlite3PagerExclusiveLock(pPg);
+    end;
+    Inc(i);
+  end;
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  { Invoke commit hook if any write-transaction is active. }
+  if (needXcommit <> 0) and Assigned(db^.xCommitCallback) then begin
+    if db^.xCommitCallback(db^.pCommitArg) <> 0 then begin
+      Result := SQLITE_CONSTRAINT_COMMITHOOK; Exit;
+    end;
+  end;
+
+  { Simple case: zero or one writable database (or main is :memory:/temp). }
+  zMain := nil;
+  if (db^.nDb > 0) and (db^.aDb[0].pBt <> nil) then
+    zMain := sqlite3BtreeGetFilename(PBtree(db^.aDb[0].pBt));
+  if (zMain = nil) or (zMain^ = #0) or (nTrans <= 1) then begin
+    if needXcommit <> 0 then begin
+      i := 0;
+      while (rc = SQLITE_OK) and (i < db^.nDb) do begin
+        pBt := PBtree(db^.aDb[i].pBt);
+        if (pBt <> nil) and (sqlite3BtreeTxnState(pBt) >= SQLITE_TXN_WRITE) then
+          rc := sqlite3BtreeCommitPhaseOne(pBt, nil);
+        Inc(i);
+      end;
+    end;
+    i := 0;
+    while (rc = SQLITE_OK) and (i < db^.nDb) do begin
+      pBt := PBtree(db^.aDb[i].pBt);
+      if pBt <> nil then begin
+        txn := sqlite3BtreeTxnState(pBt);
+        if txn <> SQLITE_TXN_NONE then
+          rc := sqlite3BtreeCommitPhaseTwo(pBt, 0);
+      end;
+      Inc(i);
+    end;
+    if rc = SQLITE_OK then sqlite3VtabCommit(db);
+  end else begin
+    { Multi-file commit needs a super-journal; not productive in this port. }
+    Result := SQLITE_ERROR; Exit;
+  end;
+  Result := rc;
+end;
+
+{ vdbeaux.c:3315 — sqlite3VdbeHalt.  Determines whether this VM's work is
+  committed or rolled back, runs the commit hook, and unwinds statement-
+  transactions on per-statement errors.  Faithful 1:1 port; only the
+  nVdbe{Active,Read,Write} decrements at the tail are skipped here because
+  the equivalent counters are decremented one-shot by sqlite3_step (Pas
+  divergence retained from the prior stub — moving the decrements would
+  require touching every caller site at once). }
 function sqlite3VdbeHalt(v: PVdbe): i32;
 var
-  i:  i32;
-  pC: PVdbeCursor;
+  i:               i32;
+  pC:              PVdbeCursor;
+  db:              PTsqlite3;
+  rc, mrc:         i32;
+  eStatementOp:    i32;
+  isSpecialError:  i32;
 begin
-  { Full implementation (transaction commit/rollback bookkeeping) is in
-    vdbeaux.c Phase 5.4.  closeAllCursors-equivalent loop wired here so
-    cursors (in particular CURTYPE_VTAB cursors) do not leak across
-    sqlite3_step → sqlite3_finalize.  Mirrors closeCursorsInFrame
-    (vdbeaux.c:2796) inlined the same way it is in sqlite3VdbeFrameRestoreFull. }
-  if (v <> nil) and (v^.apCsr <> nil) then begin
+  if v = nil then begin Result := SQLITE_OK; Exit; end;
+  db := v^.db;
+  if db = nil then begin v^.eVdbeState := VDBE_HALT_STATE; Result := SQLITE_OK; Exit; end;
+
+  if db^.mallocFailed <> 0 then v^.rc := SQLITE_NOMEM;
+
+  { closeAllCursors — free every per-cursor blob, including CURTYPE_VTAB. }
+  if v^.apCsr <> nil then begin
     for i := 0 to v^.nCursor - 1 do begin
       pC := v^.apCsr[i];
       if pC <> nil then begin
@@ -4086,26 +4241,148 @@ begin
       end;
     end;
   end;
-  if (v <> nil) and ((v^.vdbeFlags and VDBF_ChangeCntOn) <> 0) then begin
-    sqlite3VdbeSetChanges(v^.db, v^.nChange);
-    v^.nChange := 0;
+
+  if (v^.vdbeFlags and VDBF_IsReader) <> 0 then begin
+    eStatementOp   := 0;
+    sqlite3VdbeEnter(v);
+
+    { Detect special errors that may have left the cache inconsistent. }
+    if v^.rc <> SQLITE_OK then begin
+      mrc := v^.rc and $ff;
+      if (mrc = SQLITE_NOMEM) or (mrc = SQLITE_IOERR)
+         or (mrc = SQLITE_INTERRUPT) or (mrc = SQLITE_FULL) then
+        isSpecialError := 1
+      else
+        isSpecialError := 0;
+    end else begin
+      mrc            := 0;
+      isSpecialError := 0;
+    end;
+    if isSpecialError <> 0 then begin
+      if ((v^.vdbeFlags and VDBF_ReadOnly) = 0) or (mrc <> SQLITE_INTERRUPT) then
+      begin
+        if ((mrc = SQLITE_NOMEM) or (mrc = SQLITE_FULL))
+           and ((v^.vdbeFlags and VDBF_UsesStmtJournal) <> 0) then begin
+          eStatementOp := SAVEPOINT_ROLLBACK;
+        end else begin
+          sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
+          sqlite3CloseSavepoints(db);
+          db^.autoCommit := 1;
+          v^.nChange := 0;
+        end;
+      end;
+    end;
+
+    { Immediate FK violation check. }
+    if (v^.rc = SQLITE_OK) or
+       ((v^.errorAction = OE_Fail) and (isSpecialError = 0)) then
+      sqlite3VdbeCheckFkImmediate(v);
+
+    { Auto-commit arm: if this is the only writer VM and autoCommit is on,
+      do the commit (or rollback on error). }
+    if (sqlite3VtabInSync(db) = 0)
+       and (db^.autoCommit <> 0)
+       and (((v^.vdbeFlags and VDBF_ReadOnly) = 0) and (db^.nVdbeWrite = 1)
+            or ((v^.vdbeFlags and VDBF_ReadOnly) <> 0) and (db^.nVdbeWrite = 0)) then
+    begin
+      if (v^.rc = SQLITE_OK)
+         or ((v^.errorAction = OE_Fail) and (isSpecialError = 0)) then begin
+        rc := sqlite3VdbeCheckFkDeferred(v);
+        if rc <> SQLITE_OK then begin
+          if (v^.vdbeFlags and VDBF_ReadOnly) <> 0 then begin
+            sqlite3VdbeLeave(v);
+            Result := SQLITE_ERROR; Exit;
+          end;
+          rc := SQLITE_CONSTRAINT_FOREIGNKEY;
+        end else if (db^.flags and SQLITE_CorruptRdOnly) <> 0 then begin
+          rc := SQLITE_CORRUPT;
+          db^.flags := db^.flags and not SQLITE_CorruptRdOnly;
+        end else begin
+          rc := vdbeCommit(db, v);
+        end;
+        if (rc = SQLITE_BUSY) and ((v^.vdbeFlags and VDBF_ReadOnly) <> 0) then
+        begin
+          sqlite3VdbeLeave(v);
+          Result := SQLITE_BUSY; Exit;
+        end else if rc <> SQLITE_OK then begin
+          sqlite3SystemError(db, rc);
+          v^.rc := rc;
+          sqlite3RollbackAll(db, SQLITE_OK);
+          v^.nChange := 0;
+        end else begin
+          db^.nDeferredCons    := 0;
+          db^.nDeferredImmCons := 0;
+          db^.flags            := db^.flags and not SQLITE_DeferFKs;
+          { sqlite3CommitInternalChanges — inlined: clear schema-change. }
+          db^.mDbFlags := db^.mDbFlags and not u32(DBFLAG_SchemaChange);
+        end;
+      end else if (v^.rc = SQLITE_SCHEMA) and (db^.nVdbeActive > 1) then begin
+        v^.nChange := 0;
+      end else begin
+        sqlite3RollbackAll(db, SQLITE_OK);
+        v^.nChange := 0;
+      end;
+      db^.nStatement := 0;
+    end else if eStatementOp = 0 then begin
+      if (v^.rc = SQLITE_OK) or (v^.errorAction = OE_Fail) then
+        eStatementOp := SAVEPOINT_RELEASE
+      else if v^.errorAction = OE_Abort then
+        eStatementOp := SAVEPOINT_ROLLBACK
+      else begin
+        sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
+        sqlite3CloseSavepoints(db);
+        db^.autoCommit := 1;
+        v^.nChange := 0;
+      end;
+    end;
+
+    { Statement-transaction commit/rollback. }
+    if eStatementOp <> 0 then begin
+      rc := sqlite3VdbeCloseStatement(v, eStatementOp);
+      if rc <> 0 then begin
+        if (v^.rc = SQLITE_OK) or ((v^.rc and $ff) = SQLITE_CONSTRAINT) then
+        begin
+          v^.rc := rc;
+          sqlite3DbFree(db, v^.zErrMsg);
+          v^.zErrMsg := nil;
+        end;
+        sqlite3RollbackAll(db, SQLITE_ABORT_ROLLBACK);
+        sqlite3CloseSavepoints(db);
+        db^.autoCommit := 1;
+        v^.nChange := 0;
+      end;
+    end;
+
+    { Update connection change counter. }
+    if (v^.vdbeFlags and VDBF_ChangeCntOn) <> 0 then begin
+      if eStatementOp <> SAVEPOINT_ROLLBACK then
+        sqlite3VdbeSetChanges(db, v^.nChange)
+      else
+        sqlite3VdbeSetChanges(db, 0);
+      v^.nChange := 0;
+    end;
+
+    sqlite3VdbeLeave(v);
   end;
-  { vdbeaux.c:3435 — clear DBFLAG_SchemaChange after a successful commit.
-    The full sqlite3VdbeHalt commit/rollback bookkeeping (Phase 5.4) is not
-    yet ported, but the schema-change-flag clear is the load-bearing piece
-    for SAVEPOINT ROLLBACK after a prior CREATE TABLE: without it, the
-    OP_Savepoint rollback arm sees the stale flag from the long-since-
-    committed CREATE TABLE and fires sqlite3ResetAllSchemasOfConnection,
-    which invalidates the cached schema and breaks subsequent prepares.
-    Safe to clear unconditionally on halt: at this point the statement
-    has finished and any in-flight schema mutation is either committed
-    (flag should clear) or rolled back (flag is irrelevant). }
-  if (v <> nil) and (v^.db <> nil) and (v^.rc = SQLITE_OK)
-     and (PTsqlite3(v^.db)^.autoCommit <> 0) then
-    PTsqlite3(v^.db)^.mDbFlags :=
-      PTsqlite3(v^.db)^.mDbFlags and not u32(DBFLAG_SchemaChange);
+
+  { vdbeaux.c:3496..3500 — decrement the connection's nVdbeWrite/nVdbeRead
+    counters that were bumped by sqlite3_step at READY→RUN.  nVdbeActive's
+    Dec stays in sqlite3_step (Pascal-port deviation: many tests construct
+    a Vdbe directly and set eVdbeState:=RUN without going through step,
+    so the Inc never fired and an unconditional Dec here would underflow).
+    Guard the others with a `>0` check for the same reason. }
+  if v^.eVdbeState = VDBE_RUN_STATE then begin
+    if ((v^.vdbeFlags and VDBF_ReadOnly) = 0) and (db^.nVdbeWrite > 0) then
+      Dec(db^.nVdbeWrite);
+    if ((v^.vdbeFlags and VDBF_IsReader) <> 0) and (db^.nVdbeRead > 0) then
+      Dec(db^.nVdbeRead);
+  end;
+
   v^.eVdbeState := VDBE_HALT_STATE;
-  Result := SQLITE_OK;
+
+  if db^.mallocFailed <> 0 then v^.rc := SQLITE_NOMEM;
+
+  if v^.rc = SQLITE_BUSY then Result := SQLITE_BUSY else Result := SQLITE_OK;
 end;
 
 procedure sqlite3VdbeResetStepResult(p: PVdbe);
@@ -5285,9 +5562,13 @@ begin
     sqlite3VdbeReset(pStmt);
   end;
 
-  { Transition READY → RUN }
+  { Transition READY → RUN — vdbeapi.c:815..819 }
   if pStmt^.eVdbeState = VDBE_READY_STATE then begin
-    if db <> nil then Inc(db^.nVdbeActive);
+    if db <> nil then begin
+      Inc(db^.nVdbeActive);
+      if (pStmt^.vdbeFlags and VDBF_ReadOnly) = 0 then Inc(db^.nVdbeWrite);
+      if (pStmt^.vdbeFlags and VDBF_IsReader) <> 0 then Inc(db^.nVdbeRead);
+    end;
     pStmt^.pc := 0;
     pStmt^.eVdbeState := VDBE_RUN_STATE;
   end;
@@ -6747,18 +7028,59 @@ begin
 end;
 
 { ============================================================================
-  sqlite3RollbackAll — roll back all btrees in db->aDb (vdbeaux.c)
+  sqlite3RollbackAll — port of main.c:1483.
+
+  Roll back every attached btree, then handle schema-change rollback,
+  reset deferred-FK counters, clear DeferFKs / CorruptRdOnly flags,
+  and invoke the optional xRollbackCallback.
+
+  Deviations from the C reference (documented at the port site):
+    * sqlite3BtreeEnterAll / sqlite3BtreeLeaveAll are no-ops in this
+      OMIT_SHARED_CACHE port — same surface as C macros under the same
+      gate.
+    * Pas legacy-port behaviour: this procedure historically also set
+      pDb^.autoCommit := 1.  Upstream sets autoCommit elsewhere
+      (sqlite3VdbeHalt's special-error arm and OP_AutoCommit).  The
+      autoCommit assignment is retained here to preserve OP_AutoCommit's
+      observable behaviour while the full sqlite3VdbeHalt port is still
+      pending — without it, an immediate `BEGIN; ROLLBACK` cycle would
+      leave autoCommit unchanged and break the DiagTxn corpus.
   ============================================================================ }
 procedure sqlite3RollbackAll(pDb: PTsqlite3; tripCode: i32);
 var
-  ii:  i32;
-  pBt: PBtree;
+  ii:           i32;
+  pBt:          PBtree;
+  inTrans:      i32;
+  schemaChange: i32;
+  unwind:       i32;
 begin
+  inTrans := 0;
+  sqlite3BeginBenignMalloc;
+  schemaChange := 0;
+  if ((pDb^.mDbFlags and DBFLAG_SchemaChange) <> 0)
+     and (pDb^.init.busy = 0) then
+    schemaChange := 1;
+  if schemaChange <> 0 then unwind := 0 else unwind := 1;
   for ii := 0 to pDb^.nDb - 1 do begin
     pBt := PBtree(pDb^.aDb[ii].pBt);
-    if pBt <> nil then
-      sqlite3BtreeRollback(pBt, tripCode, 0);
+    if pBt <> nil then begin
+      if sqlite3BtreeTxnState(pBt) = SQLITE_TXN_WRITE then
+        inTrans := 1;
+      sqlite3BtreeRollback(pBt, tripCode, unwind);
+    end;
   end;
+  sqlite3VtabRollback(pDb);
+  sqlite3EndBenignMalloc;
+  if schemaChange <> 0 then begin
+    sqlite3ExpirePreparedStatements(pDb, 0);
+    sqlite3ResetAllSchemasOfConnection(pDb);
+  end;
+  pDb^.nDeferredCons    := 0;
+  pDb^.nDeferredImmCons := 0;
+  pDb^.flags := pDb^.flags and not (SQLITE_DeferFKs or SQLITE_CorruptRdOnly);
+  if Assigned(pDb^.xRollbackCallback)
+     and ((inTrans <> 0) or (pDb^.autoCommit = 0)) then
+    pDb^.xRollbackCallback(pDb^.pRollbackArg);
   pDb^.autoCommit := 1;
 end;
 
@@ -7040,6 +7362,14 @@ var
   jmBt:        PBtree;
   jmPager:     PPager;
   jmZFilename: PChar;
+  { OP_IntegrityCk locals (vdbe.c:7263) }
+  icRoot:    PPgno;
+  icRowCnt:  Pi64;
+  icpnErr:   PMem;
+  icpzOut:   PAnsiChar;
+  icnRoot:   i32;
+  icnErr:    i32;
+  icIdx:     i32;
 begin
   aOp    := v^.aOp;
   pOp    := @aOp[v^.pc];
@@ -8207,9 +8537,30 @@ begin
       rSeek.nField    := u16(pOp^.p3);
       rSeek.default_rc := 0;
       rSeek.aMem      := @aMem[pOp^.p2];
+      rSeek.eqSeen    := 0;
       rc := sqlite3BtreeIndexMoveto(pCrsr, @rSeek, @res);
       if rc <> SQLITE_OK then goto abort_due_to_error;
-      if res = 0 then begin
+      if res <> 0 then begin
+        { vdbe.c:6658..6670 — sub-search around the current cursor for an
+          EIIB-affected match (real-value index expression / virtual
+          column).  If still not found and not in writable_schema mode,
+          report SQLITE_CORRUPT_INDEX. }
+        if (vdbeFindIndexKey <> nil) and (pOp^.p4type = P4_INDEX) then begin
+          rc := vdbeFindIndexKey(pCrsr, pOp^.p4.pIdx, @rSeek, @res, 0);
+          if rc <> SQLITE_OK then goto abort_due_to_error;
+        end;
+        if res <> 0 then begin
+          if (db^.flags and u64($00000001)) = 0 then begin  { SQLITE_WriteSchema }
+            rc := SQLITE_CORRUPT_INDEX;
+            goto abort_due_to_error;
+          end;
+          pCur^.cacheStatus := CACHE_STALE;
+          pCur^.seekResult  := 0;
+        end else begin
+          rc := sqlite3BtreeDelete(pCrsr, BTREE_AUXDELETE);
+          if rc <> SQLITE_OK then goto abort_due_to_error;
+        end;
+      end else begin
         rc := sqlite3BtreeDelete(pCrsr, BTREE_AUXDELETE);
         if rc <> SQLITE_OK then goto abort_due_to_error;
       end;
@@ -9949,13 +10300,24 @@ begin
       sqlite3VdbeMemSetInt64(@aMem[pOp^.p3 + 2], i64(aResCk[2]));
     end;
 
-    { ────── OP_Vacuum ────── stub.
-      OP_Vacuum needs sqlite3RunVacuum (vacuum.c — not yet ported); return
-      OK so basic SQL testing does not crash.  Full port tracked under
-      Phase 6.27. }
+    { ────── OP_Vacuum ────── (vdbe.c:7188).  p1 selects the database to
+      VACUUM (0 = main; 1 cannot be VACUUMed and is rejected by the codegen
+      gate, so any non-zero p1 here is an attached DB).  When p2 is non-
+      zero, register p2 holds the VACUUM INTO target filename.  Delegates
+      to the vdbeRunVacuum hook installed by main.pas (sqlite3RunVacuum
+      port of vacuum.c:143).  When the hook is unbound (early bring-up /
+      tests linking vdbe without main) we degrade to the legacy no-op so
+      DiagOps and friends keep working. }
     OP_Vacuum: begin
-      pOut := out2Prerelease(v, pOp);
-      pOut^.u.i := 0;
+      Assert(pOp^.p1 <> 1);
+      sqlite3VdbeIncrWriteCounter(v, nil);
+      if vdbeRunVacuum <> nil then begin
+        if pOp^.p2 <> 0 then
+          rc := vdbeRunVacuum(@v^.zErrMsg, db, pOp^.p1, @aMem[pOp^.p2])
+        else
+          rc := vdbeRunVacuum(@v^.zErrMsg, db, pOp^.p1, nil);
+        if rc <> 0 then goto abort_due_to_error;
+      end;
     end;
 
     { ────── OP_JournalMode ────── (vdbe.c:8054) — full 1:1 port. }
@@ -10049,20 +10411,90 @@ begin
       end;
     end;
 
-    { ────── OP_IntegrityCk ────── — stub }
+    { ────── OP_IntegrityCk ────── (vdbe.c:7263) — full integrity-check
+      driver.  Faithful 1:1 with the upstream arm: nRoot = pOp^.p2;
+      aRoot = pOp^.p4.ai (P4_INTARRAY); aRoot[0] is encoded as nRoot
+      for full checks, 0 for partial.  Per-tree row counts go into
+      aMem[pOp^.p3 .. pOp^.p3+nRoot-1]; the error message lands in
+      aMem[pOp^.p1+1]; the remaining-error counter is decremented in
+      aMem[pOp^.p1] by (nErr-1). }
     OP_IntegrityCk: begin
-      { Full integrity check deferred to Phase 6 }
+      icRoot := PPgno(pOp^.p4.ai);
+      icnRoot := pOp^.p2;
+      Assert(icnRoot > 0);
+      Assert(icRoot <> nil);
+      icpnErr := @aMem[pOp^.p1];
+      icpzOut := nil;
+      icnErr  := 0;
+      { Allocate a small i64[] for per-tree row counts.  The opcode
+        contract guarantees nRoot fits in i32. }
+      GetMem(icRowCnt, icnRoot * SizeOf(i64));
+      FillChar(icRowCnt^, PtrUInt(icnRoot) * SizeOf(i64), 0);
+      rc := sqlite3BtreeIntegrityCheck(db, db^.aDb[pOp^.p5].pBt,
+                                       icRoot, icRowCnt, icnRoot,
+                                       i32(icpnErr^.u.i) + 1,
+                                       @icnErr, @icpzOut);
+      { Marshal per-tree row counts into aMem[p3..]. }
+      for icIdx := 0 to icnRoot - 1 do
+        sqlite3MemSetArrayInt64(@aMem[pOp^.p3], icIdx, icRowCnt[icIdx]);
+      FreeMem(icRowCnt);
       sqlite3VdbeMemSetNull(@aMem[pOp^.p1 + 1]);
+      if icnErr = 0 then begin
+        Assert(icpzOut = nil);
+      end else if rc <> SQLITE_OK then begin
+        if icpzOut <> nil then sqlite3_free(icpzOut);
+        goto abort_due_to_error;
+      end else begin
+        icpnErr^.u.i := icpnErr^.u.i - (icnErr - 1);
+        sqlite3VdbeMemSetStr(@aMem[pOp^.p1 + 1], icpzOut, -1,
+                             SQLITE_UTF8, SQLITE_DYNAMIC);
+      end;
+      sqlite3VdbeChangeEncoding(@aMem[pOp^.p1 + 1], enc);
+      goto check_for_interrupt;
     end;
 
-    { ────── OP_IFindKey ────── — index find with key }
+    { ────── OP_IFindKey ────── (vdbe.c:7301) — sub-search around the
+      current index cursor for an entry whose non-EIIB-affected columns
+      match.  Used by OP_IdxDelete / integrity-check.  See vdbeaux.c
+      sqlite3VdbeFindIndexKey (5542).  Body lives in passqlite3codegen
+      via the vdbeFindIndexKey hook (TIndex layout not visible here). }
     OP_IFindKey: begin
-      { Stub: deferred to Phase 6 (requires full index/key infrastructure) }
+      pCur  := v^.apCsr[pOp^.p1];
+      pCrsr := pCur^.uc.pCursor;
+      rSeek.pKeyInfo  := pCur^.pKeyInfo;
+      rSeek.nField    := 0;            { hook fills from pIdx^.nColumn }
+      rSeek.default_rc := 0;
+      rSeek.aMem      := @aMem[pOp^.p3];
+      rSeek.eqSeen    := 0;
+      res := 0;
+      if vdbeFindIndexKey <> nil then
+        rc := vdbeFindIndexKey(pCrsr, pOp^.p4.pIdx, @rSeek, @res, 1)
+      else begin
+        rc  := SQLITE_OK;
+        res := 1;  { no hook → no match → take the jump (matches C's "not found" arm) }
+      end;
+      if rc <> SQLITE_OK then begin
+        rc := SQLITE_OK;
+        goto jump_to_p2;
+      end;
+      if res <> 0 then goto jump_to_p2;
+      pCur^.nullRow := 0;
     end;
 
-    { ────── OP_IncrVacuum ────── — stub }
+    { ────── OP_IncrVacuum ────── (vdbe.c:8174) — single step of an
+      incremental vacuum on db P1.  Jumps to P2 when the vacuum is
+      complete (SQLITE_DONE).  Faithful 1:1 with the upstream arm. }
     OP_IncrVacuum: begin
-      goto jump_to_p2;
+      Assert((pOp^.p1 >= 0) and (pOp^.p1 < db^.nDb));
+      Assert((v^.vdbeFlags and VDBF_ReadOnly) = 0);
+      pX := db^.aDb[pOp^.p1].pBt;
+      rc := sqlite3BtreeIncrVacuum(pX);
+      if rc <> SQLITE_OK then
+      begin
+        if rc <> SQLITE_DONE then goto abort_due_to_error;
+        rc := SQLITE_OK;
+        goto jump_to_p2;
+      end;
     end;
 
     { ────── OP_Abortable ────── (vdbe.c:9150) — debug-only, no-op in release }

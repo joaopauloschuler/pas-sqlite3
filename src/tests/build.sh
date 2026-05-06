@@ -163,14 +163,48 @@ compile_test TestLoadExt
 compile_test TestRowidIn
 compile_test TestExplainParity
 compile_test TestWhereCorpus
-compile_test DiagPragma
+compile_test DiagAggWhere
 compile_test DiagAnalyze
-compile_test DiagFeatureProbe
-compile_test DiagPrintfFmt
-compile_test DiagExplainList
+compile_test DiagArith
+compile_test DiagAutoIdx
+compile_test DiagBloom
+compile_test DiagCast
+compile_test DiagCollate
+compile_test DiagCovering
+compile_test DiagColName
+compile_test DiagConcat
+compile_test DiagCreateIdx
+compile_test DiagDate
 compile_test DiagDbFileObject
 compile_test DiagDequoteToken
+compile_test DiagDml
+compile_test DiagErrMsg
+compile_test DiagErrMsg16
+compile_test DiagExplainList
+compile_test DiagFeatureProbe
+compile_test DiagFloatRender
+compile_test DiagFunctions
+compile_test DiagGroupOrder
+compile_test DiagIndexing
+compile_test DiagInnerJoin
+compile_test DiagJoinTrace
+compile_test DiagLikeGlob
+compile_test DiagMisc
+compile_test DiagMoreFunc
+compile_test DiagMultiValues   # Tasklist 6.10 step 6: constant
+                               # multi-row VALUES — runtime PASS today
+                               # (count=3) since 6.8.6 follow-up.
+compile_test DiagOps
 compile_test DiagOrderLimitTopN
+compile_test DiagPragma
+compile_test DiagPredicates
+compile_test DiagPrintfFmt
+compile_test DiagPubApi
+compile_test DiagScalarFunc
+compile_test DiagStrAccum
+compile_test DiagSubsel
+compile_test DiagSumOverflow
+compile_test DiagTempTbl
 compile_test DiagTrig          # Tasklist 6.23: AFTER INSERT trigger fire.
                                # Compiles cleanly; running the binary
                                # is expected to ABORT on the Pas side
@@ -178,9 +212,13 @@ compile_test DiagTrig          # Tasklist 6.23: AFTER INSERT trigger fire.
                                # sub-vdbe / parent-vdbe lifecycle
                                # bisect lands.  Kept in the suite to
                                # keep the bug visible.
-compile_test DiagMultiValues   # Tasklist 6.10 step 6: constant
-                               # multi-row VALUES — runtime PASS today
-                               # (count=3) since 6.8.6 follow-up.
+compile_test DiagTxn           # Tasklist 6.10 step 15(b)/(c):
+                               # BEGIN/ROLLBACK + savepoint rollback
+                               # divergences (memdb pager regression).
+                               # Always wrap runs with `timeout 10`.
+compile_test DiagVacuum
+compile_test DiagWindow        # Tasklist 6.10 step 17: 13 window-fn
+                               # divergences gated on 6.26 wiring.
 compile_test TestSQLCorpus
 compile_test TestFuzzDiff
 compile_test TestReferenceVectors

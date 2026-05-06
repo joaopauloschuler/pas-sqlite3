@@ -34,7 +34,7 @@ unit passqlite3parser;
   Phase 7.2f wires sqlite3RunParser to drive the lexer through the engine;
   the previous stub returning SQLITE_ERROR is gone.  See the comment on
   sqlite3RunParser below for the omissions vs. C (sqlite3_log, ParserTrace,
-  apVtabLock cleanup, printf-style error formatting).
+  printf-style error formatting).
 }
 
 interface
@@ -1138,8 +1138,8 @@ end;
 {   - sqlite3_log is a pager stub and is not on the parser's uses path,      }
 {     so the post-parse logging branch is omitted (Phase 8 will reinstate    }
 {     it together with the public-API logging hooks).                        }
-{   - apVtabLock cleanup is omitted — the Phase 6.bis virtual-table branch   }
-{     never assigns it, so it stays nil here.                                }
+{   - apVtabLock cleanup matches tokenize.c:746 1:1 — the Phase 6.bis       }
+{     virtual-table branch (sqlite3VtabMakeWritable) productively grows it. }
 {   - SQLITE_ParserTrace tracing is not ported (no debug build target).      }
 {                                                                             }
 { The function returns the number of errors encountered, exactly as C does. }
@@ -1152,6 +1152,51 @@ const
 
 { Forward to inRenameObject — defined later as a local re-export. }
 function inRenameObject(pPse: PParse): Boolean; forward;
+
+{ Local re-imports — passqlite3os / passqlite3vdbe are not on the uses chain
+  but the symbols are needed by sqlite3RunParser's tail to match
+  tokenize.c:600..763 1:1.  External 'c' name 'free' is the same import
+  passqlite3os already binds. }
+procedure runParser_free(p: Pointer); external 'c' name 'free';
+
+{ Inline copy of vdbe.pas:6426 sqlite3ErrStr.  Pascal `uses` does not
+  transit, so we keep a local switch table (matches main.c:1574
+  sqlite3ErrStr[] verbatim).  Local name avoids clashing with the
+  vdbe-side symbol when both are in the same final binary. }
+function runParser_errStr(rc: i32): PAnsiChar;
+begin
+  case rc of
+    SQLITE_OK:        Result := 'not an error';
+    SQLITE_ERROR:     Result := 'SQL logic error';
+    SQLITE_INTERNAL:  Result := 'internal SQLite error';
+    SQLITE_PERM:      Result := 'access permission denied';
+    SQLITE_ABORT:     Result := 'query aborted';
+    SQLITE_BUSY:      Result := 'database is locked';
+    SQLITE_LOCKED:    Result := 'database table is locked';
+    SQLITE_NOMEM:     Result := 'out of memory';
+    SQLITE_READONLY:  Result := 'attempt to write a readonly database';
+    SQLITE_INTERRUPT: Result := 'interrupted';
+    SQLITE_IOERR:     Result := 'disk I/O error';
+    SQLITE_CORRUPT:   Result := 'database disk image is malformed';
+    SQLITE_FULL:      Result := 'database or disk is full';
+    SQLITE_CANTOPEN:  Result := 'unable to open database file';
+    SQLITE_PROTOCOL:  Result := 'locking protocol';
+    SQLITE_SCHEMA:    Result := 'database schema has changed';
+    SQLITE_TOOBIG:    Result := 'string or blob too big';
+    SQLITE_CONSTRAINT:Result := 'constraint failed';
+    SQLITE_MISMATCH:  Result := 'datatype mismatch';
+    SQLITE_MISUSE:    Result := 'bad parameter or other API misuse';
+    SQLITE_NOLFS:     Result := 'large file support is disabled';
+    SQLITE_AUTH:      Result := 'authorization denied';
+    SQLITE_RANGE:     Result := 'column index out of range';
+    SQLITE_NOTADB:    Result := 'file is not a database';
+    SQLITE_NOTICE:    Result := 'notification message';
+    SQLITE_WARNING:   Result := 'warning message';
+    SQLITE_ROW:       Result := 'another row available';
+    SQLITE_DONE:      Result := 'no more rows available';
+  else                Result := 'unknown error';
+  end;
+end;
 
 function sqlite3RunParser(pParse: Pointer; zSql: PAnsiChar): i32;
 var
@@ -1255,9 +1300,24 @@ begin
   if db^.mallocFailed <> 0 then
     pPse^.rc := SQLITE_NOMEM_BKPT;
   if (pPse^.zErrMsg <> nil)
-     or ((pPse^.rc <> SQLITE_OK) and (pPse^.rc <> SQLITE_DONE)) then
+     or ((pPse^.rc <> SQLITE_OK) and (pPse^.rc <> SQLITE_DONE)) then begin
+    { tokenize.c:736..738 — fall back to sqlite3ErrStr(rc) when the lexer/
+      parser reported a non-OK rc but never installed a textual zErrMsg
+      (e.g. SQLITE_INTERRUPT, SQLITE_TOOBIG).  sqlite3_log is intentionally
+      skipped (see header comment). }
+    if pPse^.zErrMsg = nil then
+      pPse^.zErrMsg := sqlite3DbStrDup(db, runParser_errStr(pPse^.rc));
     Inc(nErr);
+  end;
   pPse^.zTail := zCur;
+
+  { tokenize.c:746 — release apVtabLock, now that vtab.c:1223 productively
+    grows it via sqlite3VtabMakeWritable.  Unconditional sqlite3_free
+    matches C; it tolerates nil. }
+  if pPse^.apVtabLock <> nil then begin
+    runParser_free(pPse^.apVtabLock);
+    pPse^.apVtabLock := nil;
+  end;
 
   if (pPse^.pNewTable <> nil) and (pPse^.eParseMode = PARSE_MODE_NORMAL) then
     sqlite3DeleteTable(db, pPse^.pNewTable);
@@ -2263,18 +2323,13 @@ const
 { from the CREATE VIRTUAL TABLE clause and (when init.busy=1) insert the    }
 { table into its schema.                                                     }
 {                                                                            }
-{ Dependency note: the real sqlite3StartTable in passqlite3codegen is still }
-{ a Phase 7 stub, so pParse^.pNewTable will currently be nil after          }
-{ sqlite3VtabBeginParse returns.  Each helper below early-returns on a nil  }
-{ pNewTable, mirroring the C body's first guard, so the port is structurally}
-{ complete and will become observably useful as soon as StartTable lands.   }
 { The TestVtab gate exercises the leaf helpers directly with a manually-    }
 { constructed TTable, validating the azArg accumulation contract.            }
 {                                                                            }
-{ The init.busy=0 branch of FinishParse depends on sqlite3MPrintf and the   }
-{ sqlite3NestedParse stub (both Phase-7 deferred).  Until those land, the   }
-{ branch is preserved as a TODO comment; the init.busy=1 in-memory schema   }
-{ insertion path is fully ported.                                            }
+{ Both branches of FinishParse are now productive: init.busy=0 dispatches    }
+{ to sqlite3VtabFinishCreateOps (codegen.pas) for the UPDATE sqlite_schema / }
+{ OP_Expire / OP_ParseSchema / OP_VCreate sequence; init.busy=1 installs the }
+{ table in the in-memory schema cache via sqlite3HashInsert.                 }
 
 procedure addModuleArgument(pPse: PParse; pTable: PTable2; zArg: PAnsiChar);
 var
@@ -2370,17 +2425,10 @@ begin
   if pTab^.u.vtab.nArg < 1 then Exit;
 
   if db^.init.busy = 0 then begin
-    { Phase 6.bis.4b: the printf engine has landed, so the                 }
-    { sqlite3MPrintf("CREATE VIRTUAL TABLE %T", &sNameToken) call below    }
-    { is now real (was a TODO blocked on Phase 6.bis.4a).  The remaining   }
-    { wiring — sqlite3NestedParse to UPDATE sqlite_schema, then            }
-    { OP_Expire / sqlite3VdbeAddParseSchemaOp / OP_VCreate — still depends }
-    { on Phase-7 codegen helpers (sqlite3NestedParse, sqlite3GetVdbe,      }
-    { sqlite3ChangeCookie, sqlite3VdbeAddParseSchemaOp, sqlite3VdbeLoadString),
-      which are all stubs at this point.  We therefore compute zStmt to    }
-    { exercise the printf wiring (and to verify the %T conversion against  }
-    { the live parser-emitted sNameToken) and free it immediately; the     }
-    { schema-update side-effects land in the next sub-phase.              }
+    { Productive port of vtab.c:463..510.  sqlite3VtabFinishCreateOps
+      (codegen.pas) emits the UPDATE sqlite_schema row, OP_Expire,
+      OP_ParseSchema reload, and OP_VCreate sequence.  Lives in codegen
+      because PVdbe is not visible to this unit. }
     sqlite3MayAbort(pPse);
 
     if pEnd <> nil then begin
@@ -2389,7 +2437,7 @@ begin
     end;
     zStmt := sqlite3MPrintf(Psqlite3db(db),
                             'CREATE VIRTUAL TABLE %T', [@pPse^.sNameToken]);
-    if zStmt <> nil then sqlite3DbFree(Psqlite3db(db), zStmt);
+    sqlite3VtabFinishCreateOps(pPse, pTab, zStmt);
   end else begin
     { Re-reading sqlite_schema: install the table in the in-memory schema. }
     pSchemaT := passqlite3util.PSchema(pTab^.pSchema);

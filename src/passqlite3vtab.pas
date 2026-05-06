@@ -335,6 +335,10 @@ function sqlite3VtabRollback(db: PTsqlite3): i32;
 { vtab.c:1029 — invoke xCommit on every entry, then clear aVTrans. }
 function sqlite3VtabCommit(db: PTsqlite3): i32;
 
+{ vtab.c:1051 macro — true iff a vtab module is currently inside an xSync
+  callback (callFinaliser/Sync nulled aVTrans while keeping nVTrans>0). }
+function sqlite3VtabInSync(db: PTsqlite3): i32;
+
 { vtab.c:1042 — open a transaction on pVTab if its module supports it and
   one is not already open.  On success appends pVTab to db^.aVTrans. }
 function sqlite3VtabBegin(db: PTsqlite3; pVTab: PVTable): i32;
@@ -1166,6 +1170,11 @@ end;
 function vtabInSync(db: PTsqlite3): Boolean; inline;
 begin
   Result := (db^.nVTrans > 0) and (db^.aVTrans = nil);
+end;
+
+function sqlite3VtabInSync(db: PTsqlite3): i32;
+begin
+  if vtabInSync(db) then Result := 1 else Result := 0;
 end;
 
 function sqlite3VtabBegin(db: PTsqlite3; pVTab: PVTable): i32;

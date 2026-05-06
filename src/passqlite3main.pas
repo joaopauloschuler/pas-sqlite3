@@ -64,7 +64,8 @@ uses
   passqlite3vdbe,
   passqlite3codegen,
   passqlite3parser,  { Phase 8.2 — real sqlite3RunParser }
-  passqlite3vtab;    { Phase 6.bis.1a — module/VTable lifecycle }
+  passqlite3vtab,    { Phase 6.bis.1a — module/VTable lifecycle }
+  passqlite3backup;  { Phase 6.27 — sqlite3BtreeCopyFile for VACUUM }
 
 type
   PPTsqlite3 = ^PTsqlite3;
@@ -4596,9 +4597,570 @@ begin
   Result := sqlite3_exec(db, zSql, nil, nil, pzErrMsg);
 end;
 
+{ ===========================================================================
+  Phase 6.27 / 7.1.8 — vacuum.c port
+
+  sqlite3RunVacuum (vacuum.c:143) — runtime body of OP_Vacuum.  Lives in
+  passqlite3main.pas because it depends on sqlite3_prepare_v2 / sqlite3_step
+  / sqlite3_exec / sqlite3VMPrintf, all of which are declared above.  Wired
+  into OP_Vacuum at unit init via vdbeRunVacuum.
+
+  Faithful 1:1 port of the upstream `!SQLITE_OMIT_VACUUM &&
+  !SQLITE_OMIT_ATTACH` arm.  PREUPDATE_HOOK and AUTHORIZATION arms gated
+  off (not in the default build).  AUTOVACUUM constants are honoured —
+  SQLITE_OMIT_AUTOVACUUM is *not* defined in the oracle build.
+  =========================================================================== }
+
+{ vacuumExecSql — vacuum.c:32.  Prepare zSql, step it; if it returns rows,
+  treat each row's first column as a CRE/INS sub-statement to recursively
+  execute (skipping any other prefixes — historical attack-mitigation per
+  the upstream comment). }
+function vacuumExecSql(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+                       zSql: PAnsiChar): i32;
+var
+  pStmt:    Pointer;
+  rc:       i32;
+  zSubSql:  PAnsiChar;
+begin
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(db, zSql, -1, @pStmt, nil);
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  while True do begin
+    rc := sqlite3_step(PVdbe(pStmt));
+    if rc <> SQLITE_ROW then Break;
+    zSubSql := sqlite3_column_text(PVdbe(pStmt), 0);
+    if (zSubSql <> nil)
+       and ( (sqlite3_strnicmp(zSubSql, 'CRE', 3) = 0)
+          or (sqlite3_strnicmp(zSubSql, 'INS', 3) = 0) ) then begin
+      rc := vacuumExecSql(db, pzErrMsg, zSubSql);
+      if rc <> SQLITE_OK then Break;
+    end;
+  end;
+  Assert(rc <> SQLITE_ROW);
+  if rc = SQLITE_DONE then rc := SQLITE_OK;
+  if rc <> SQLITE_OK then
+    sqlite3SetString(pzErrMsg, db, sqlite3_errmsg(db));
+  sqlite3_finalize(PVdbe(pStmt));
+  Result := rc;
+end;
+
+{ vacuumExecSqlF — vacuum.c:62.  Format zSql with args via sqlite3VMPrintf,
+  hand off to vacuumExecSql, free the buffer. }
+function vacuumExecSqlF(db: PTsqlite3; pzErrMsg: PPAnsiChar;
+                        fmt: PAnsiChar;
+                        const args: array of const): i32;
+var
+  z:  PAnsiChar;
+  rc: i32;
+begin
+  z := sqlite3VMPrintf(db, fmt, args);
+  if z = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  rc := vacuumExecSql(db, pzErrMsg, z);
+  sqlite3DbFree(db, z);
+  Result := rc;
+end;
+
+{ Bit subset of db^.flags that vacuum needs to manipulate.  Names mirror
+  sqliteInt.h SQLITE_* constants; many of these are already declared in
+  passqlite3util / passqlite3main but with `_Bit` suffixes.  Redeclare the
+  unsuffixed names locally so the body reads 1:1 with vacuum.c. }
+const
+  VAC_SQLITE_WriteSchema   = u64($00000001);
+  VAC_SQLITE_IgnoreChecks  = u64($00000200);
+  VAC_SQLITE_ForeignKeys   = u64($00004000);
+  VAC_SQLITE_ReverseOrder  = u64($00001000);
+  VAC_SQLITE_Defensive     = u64($10000000);
+  VAC_SQLITE_CountRows     = u64($0000000100000000);
+  VAC_SQLITE_AttachCreate  = u64($00010) shl 32;
+  VAC_SQLITE_AttachWrite   = u64($00020) shl 32;
+  VAC_SQLITE_Comments      = u64($00040) shl 32;
+  VAC_DBFLAG_PreferBuiltin = u32($0008);
+  VAC_DBFLAG_Vacuum        = u32($0100);
+  VAC_DBFLAG_VacuumInto    = u32($0200);
+
+{ runVacuumImpl — vacuum.c:143 sqlite3RunVacuum.  Faithful port. }
+function runVacuumImpl(pzErrMsg: PPAnsiChar; db: PTsqlite3;
+                       iDb: i32; pOut: Psqlite3_value): i32;
+var
+  rc:                i32;
+  pMain, pTemp:      PBtree;
+  saved_mDbFlags:    u32;
+  saved_flags:       u64;
+  saved_nChange:     i64;
+  saved_nTotalChange:i64;
+  saved_openFlags:   u32;
+  saved_mTrace:      u8;
+  pDbVac:            PDb;
+  isMemDb:           i32;
+  nRes:              i32;
+  nDb:               i32;
+  zDbMain:           PAnsiChar;
+  zOut:              PAnsiChar;
+  pgflags:           u32;
+  iRandom:           u64;
+  zDbVacuum:         array[0..41] of AnsiChar;
+  meta:              u32;
+  i, nNew:           i32;
+  iHexNibble:        i32;
+  hexDigits:         array[0..15] of AnsiChar;
+  pTempFile:         Psqlite3_file;
+  sz:                i64;
+  zFilename:         PAnsiChar;
+  aCopy: array[0..9] of u8 = (
+    BTREE_SCHEMA_VERSION,     1,
+    BTREE_DEFAULT_CACHE_SIZE, 0,
+    BTREE_TEXT_ENCODING,      0,
+    BTREE_USER_VERSION,       0,
+    BTREE_APPLICATION_ID,     0
+  );
+label
+  end_of_vacuum;
+begin
+  rc       := SQLITE_OK;
+  pTemp    := nil;
+  pDbVac   := nil;
+  pgflags  := PAGER_SYNCHRONOUS_OFF;
+
+  if db^.autoCommit = 0 then begin
+    sqlite3SetString(pzErrMsg, db, 'cannot VACUUM from within a transaction');
+    Result := SQLITE_ERROR; Exit;
+  end;
+  if db^.nVdbeActive > 1 then begin
+    sqlite3SetString(pzErrMsg, db, 'cannot VACUUM - SQL statements in progress');
+    Result := SQLITE_ERROR; Exit;
+  end;
+  saved_openFlags := db^.openFlags;
+  if pOut <> nil then begin
+    if sqlite3_value_type(pOut) <> SQLITE_TEXT then begin
+      sqlite3SetString(pzErrMsg, db, 'non-text filename');
+      Result := SQLITE_ERROR; Exit;
+    end;
+    zOut := PAnsiChar(sqlite3_value_text(pOut));
+    db^.openFlags := db^.openFlags and (not u32(SQLITE_OPEN_READONLY));
+    db^.openFlags := db^.openFlags or u32(SQLITE_OPEN_CREATE)
+                                   or u32(SQLITE_OPEN_READWRITE);
+  end else
+    zOut := '';
+
+  saved_flags        := db^.flags;
+  saved_mDbFlags     := db^.mDbFlags;
+  saved_nChange      := db^.nChange;
+  saved_nTotalChange := db^.nTotalChange;
+  saved_mTrace       := db^.mTrace;
+  db^.flags := db^.flags or VAC_SQLITE_WriteSchema or VAC_SQLITE_IgnoreChecks
+                         or VAC_SQLITE_Comments or VAC_SQLITE_AttachCreate
+                         or VAC_SQLITE_AttachWrite;
+  db^.mDbFlags := db^.mDbFlags or VAC_DBFLAG_PreferBuiltin or VAC_DBFLAG_Vacuum;
+  db^.flags := db^.flags and (not (VAC_SQLITE_ForeignKeys or VAC_SQLITE_ReverseOrder
+                                or VAC_SQLITE_Defensive or VAC_SQLITE_CountRows));
+  db^.mTrace := 0;
+
+  zDbMain := db^.aDb[iDb].zDbSName;
+  pMain   := PBtree(db^.aDb[iDb].pBt);
+  isMemDb := sqlite3PagerIsMemdb(sqlite3BtreePager(pMain));
+
+  sqlite3_randomness(SizeOf(iRandom), @iRandom);
+  { vacuum.c uses sqlite3_snprintf("vacuum_%016llx").  Reproduce with a
+    manual hex render — sqlite3_snprintf is a libc-style varargs helper
+    that doesn't take a Pascal `array of const`. }
+  hexDigits[ 0] := '0'; hexDigits[ 1] := '1'; hexDigits[ 2] := '2';
+  hexDigits[ 3] := '3'; hexDigits[ 4] := '4'; hexDigits[ 5] := '5';
+  hexDigits[ 6] := '6'; hexDigits[ 7] := '7'; hexDigits[ 8] := '8';
+  hexDigits[ 9] := '9'; hexDigits[10] := 'a'; hexDigits[11] := 'b';
+  hexDigits[12] := 'c'; hexDigits[13] := 'd'; hexDigits[14] := 'e';
+  hexDigits[15] := 'f';
+  zDbVacuum[0] := 'v'; zDbVacuum[1] := 'a'; zDbVacuum[2] := 'c';
+  zDbVacuum[3] := 'u'; zDbVacuum[4] := 'u'; zDbVacuum[5] := 'm';
+  zDbVacuum[6] := '_';
+  for i := 0 to 15 do begin
+    iHexNibble := i32((iRandom shr ((15 - i) * 4)) and $F);
+    zDbVacuum[7 + i] := hexDigits[iHexNibble];
+  end;
+  zDbVacuum[23] := #0;
+  nDb := db^.nDb;
+  rc := vacuumExecSqlF(db, pzErrMsg, 'ATTACH %Q AS %s', [zOut, PAnsiChar(@zDbVacuum[0])]);
+  db^.openFlags := saved_openFlags;
+  if rc <> SQLITE_OK then goto end_of_vacuum;
+  Assert((db^.nDb - 1) = nDb);
+  pDbVac := @db^.aDb[nDb];
+  pTemp := PBtree(pDbVac^.pBt);
+  nRes := sqlite3BtreeGetRequestedReserve(pMain);
+
+  if pOut <> nil then begin
+    pTempFile := sqlite3PagerFile(sqlite3BtreePager(pTemp));
+    sz := 0;
+    if (pTempFile^.pMethods <> nil)
+       and ((sqlite3OsFileSize(pTempFile, @sz) <> SQLITE_OK) or (sz > 0)) then begin
+      rc := SQLITE_ERROR;
+      sqlite3SetString(pzErrMsg, db, 'output file already exists');
+      goto end_of_vacuum;
+    end;
+    db^.mDbFlags := db^.mDbFlags or VAC_DBFLAG_VacuumInto;
+
+    pgflags := db^.aDb[iDb].safety_level
+               or u8(db^.flags and PAGER_FLAGS_MASK);
+    zFilename := sqlite3BtreeGetFilename(pTemp);
+    if zFilename <> nil then begin
+      nNew := i32(sqlite3_uri_int64(zFilename, PAnsiChar('reserve'), nRes));
+      if (nNew >= 0) and (nNew <= 255) then nRes := nNew;
+    end;
+  end;
+
+  sqlite3BtreeSetCacheSize(pTemp, db^.aDb[iDb].pSchema^.cache_size);
+  sqlite3BtreeSetSpillSize(pTemp, sqlite3BtreeSetSpillSize(pMain, 0));
+  sqlite3BtreeSetPagerFlags(pTemp, pgflags or PAGER_CACHESPILL);
+
+  rc := vacuumExecSql(db, pzErrMsg, 'BEGIN');
+  if rc <> SQLITE_OK then goto end_of_vacuum;
+  if pOut = nil then
+    rc := sqlite3BtreeBeginTrans(pMain, 2, nil)
+  else
+    rc := sqlite3BtreeBeginTrans(pMain, 0, nil);
+  if rc <> SQLITE_OK then goto end_of_vacuum;
+
+  if (sqlite3PagerGetJournalMode(sqlite3BtreePager(pMain)) = PAGER_JOURNALMODE_WAL)
+     and (pOut = nil) then
+    db^.nextPagesize := 0;
+
+  if (sqlite3BtreeSetPageSize(pTemp, sqlite3BtreeGetPageSize(pMain), nRes, 0) <> 0)
+     or ( (isMemDb = 0)
+          and (sqlite3BtreeSetPageSize(pTemp, db^.nextPagesize, nRes, 0) <> 0))
+     or (db^.mallocFailed <> 0) then begin
+    rc := SQLITE_NOMEM;
+    goto end_of_vacuum;
+  end;
+
+  if db^.nextAutovac >= 0 then
+    sqlite3BtreeSetAutoVacuum(pTemp, db^.nextAutovac)
+  else
+    sqlite3BtreeSetAutoVacuum(pTemp, sqlite3BtreeGetAutoVacuum(pMain));
+
+  { Mirror schema (tables + indices). }
+  db^.init.iDb := u8(nDb);
+  rc := vacuumExecSqlF(db, pzErrMsg,
+    'SELECT sql FROM "%w".sqlite_schema'
+    + ' WHERE type=''table''AND name<>''sqlite_sequence'''
+    + ' AND coalesce(rootpage,1)>0',
+    [zDbMain]);
+  if rc <> SQLITE_OK then goto end_of_vacuum;
+  rc := vacuumExecSqlF(db, pzErrMsg,
+    'SELECT sql FROM "%w".sqlite_schema WHERE type=''index''',
+    [zDbMain]);
+  if rc <> SQLITE_OK then goto end_of_vacuum;
+  db^.init.iDb := 0;
+
+  { Copy table contents. }
+  rc := vacuumExecSqlF(db, pzErrMsg,
+    'SELECT''INSERT INTO %s.''||quote(name)'
+    + '||'' SELECT*FROM"%w".''||quote(name)'
+    + 'FROM %s.sqlite_schema '
+    + 'WHERE type=''table''AND coalesce(rootpage,1)>0',
+    [PAnsiChar(@zDbVacuum[0]), zDbMain, PAnsiChar(@zDbVacuum[0])]);
+  Assert((db^.mDbFlags and VAC_DBFLAG_Vacuum) <> 0);
+  db^.mDbFlags := db^.mDbFlags and (not VAC_DBFLAG_Vacuum);
+  if rc <> SQLITE_OK then goto end_of_vacuum;
+
+  { Copy non-storage objects (views, triggers, virtual tables). }
+  rc := vacuumExecSqlF(db, pzErrMsg,
+    'INSERT INTO %s.sqlite_schema'
+    + ' SELECT*FROM "%w".sqlite_schema'
+    + ' WHERE type IN(''view'',''trigger'')'
+    + ' OR(type=''table''AND rootpage=0)',
+    [PAnsiChar(@zDbVacuum[0]), zDbMain]);
+  if rc <> SQLITE_OK then goto end_of_vacuum;
+
+  { Copy preserved meta values + bump schema cookie. }
+  i := 0;
+  while i < Length(aCopy) do begin
+    sqlite3BtreeGetMeta(pMain, aCopy[i], @meta);
+    rc := sqlite3BtreeUpdateMeta(pTemp, aCopy[i], meta + aCopy[i + 1]);
+    if rc <> SQLITE_OK then goto end_of_vacuum;
+    Inc(i, 2);
+  end;
+
+  if pOut = nil then
+    rc := sqlite3BtreeCopyFile(pMain, pTemp);
+  if rc <> SQLITE_OK then goto end_of_vacuum;
+  rc := sqlite3BtreeCommit(pTemp);
+  if rc <> SQLITE_OK then goto end_of_vacuum;
+  if pOut = nil then
+    sqlite3BtreeSetAutoVacuum(pMain, sqlite3BtreeGetAutoVacuum(pTemp));
+
+  Assert(rc = SQLITE_OK);
+  if pOut = nil then begin
+    nRes := sqlite3BtreeGetRequestedReserve(pTemp);
+    rc := sqlite3BtreeSetPageSize(pMain, sqlite3BtreeGetPageSize(pTemp), nRes, 1);
+  end;
+
+end_of_vacuum:
+  db^.init.iDb       := 0;
+  db^.mDbFlags       := saved_mDbFlags;
+  db^.flags          := saved_flags;
+  db^.nChange        := saved_nChange;
+  db^.nTotalChange   := saved_nTotalChange;
+  db^.mTrace         := saved_mTrace;
+  sqlite3BtreeSetPageSize(pMain, -1, 0, 1);
+
+  db^.autoCommit := 1;
+
+  if pDbVac <> nil then begin
+    sqlite3BtreeClose(PBtree(pDbVac^.pBt));
+    pDbVac^.pBt     := nil;
+    pDbVac^.pSchema := nil;
+  end;
+
+  sqlite3ResetAllSchemasOfConnection(db);
+  Result := rc;
+end;
+
+{ ----------------------------------------------------------------------
+  Phase 7.1.1 — sqlite3InitOne / sqlite3Init / productive sqlite3ReadSchema.
+
+  Faithful port of prepare.c:199..464.  sqlite3ReadSchema's caller-side
+  delegation lives in passqlite3codegen (sqlite3ReadSchema body now
+  dispatches through gSqlite3Init); the bodies live here because they
+  drive sqlite3_exec on `SELECT*FROM <db>.<sqlite_master> ORDER BY rowid`
+  — already wired through main's sqlite3_exec / sqlite3InitCallback.
+
+  Source map (line-for-line with prepare.c):
+    sqlite3InitOne — prepare.c:199..427
+    sqlite3Init    — prepare.c:438..464
+
+  Deviations from the C reference (kept in sync with the surrounding
+  port surface):
+    * SCHEMA_TABLE(iDb) is hard-coded as LEGACY_(TEMP_)SCHEMA_TABLE per
+      execParseSchemaImpl's existing pattern.  PREFERRED_SCHEMA_TABLE
+      ("sqlite_schema") is not yet honoured at the SELECT site.
+    * SQLITE_OMIT_AUTHORIZATION arms left out (not in default build).
+    * SQLITE_OMIT_DEPRECATED's `size` accessor honoured — meta[2] still
+      drives cache_size when non-zero.
+    * sqlite3BtreeEnter/Leave reduce to no-ops in the no-shared-cache
+      build but the call shape is preserved for future re-enablement.
+    * The `sqlite3_xauth xAuth = db->xAuth; db->xAuth = 0` save/restore
+      is omitted (xAuth gating not in this port).
+    * The DBFLAG_EncodingFixed mask gymnastics are mirrored exactly:
+      db->mDbFlags &= mask after the bootstrap callback so encoding is
+      not pinned by the synthesised "table" row at iDb=0. }
+function sqlite3InitOne(db: PTsqlite3; iDb: i32; pzErrMsg: PPAnsiChar;
+                        mFlags: u32): i32;
+label
+  initone_error_out, error_out;
+const
+  DBFLAG_EncodingFixed_L = u32($0040);
+  SQLITE_MAX_FILE_FORMAT_L = 4;
+var
+  rc:                i32;
+  i:                 i32;
+  size:              i32;
+  pDb:               passqlite3util.PDb;
+  azArg:             array[0..5] of PAnsiChar;
+  meta:              array[0..4] of i32;
+  initData:          TInitData;
+  zSchemaTabName:    PAnsiChar;
+  zSchemaTabBuf:     AnsiString;
+  openedTransaction: i32;
+  mask:              u32;
+  pBt:               PBtree;
+  pSchm:             passqlite3util.PSchema;
+  zSql:              PAnsiChar;
+  encoding:          u8;
+  metaU32:           u32;
+begin
+  rc := SQLITE_OK;
+  openedTransaction := 0;
+  Assert((db^.mDbFlags and u32(DBFLAG_SchemaKnownOk)) = 0);
+  Assert((iDb >= 0) and (iDb < db^.nDb));
+  pDb := @db^.aDb[iDb];
+  Assert(pDb^.pSchema <> nil);
+
+  mask := (db^.mDbFlags and DBFLAG_EncodingFixed_L)
+          or (not DBFLAG_EncodingFixed_L);
+
+  db^.init.busy := 1;
+
+  { Bootstrap the in-memory sqlite_(temp_)schema table by hand.  The
+    Pascal port already pre-installs system tables via
+    sqlite3InstallSchemaTable in openDatabase, so this synthesised row
+    becomes a no-op (sqlite3InitCallback's branch (b) short-circuits on
+    sqlite3FindTable = non-nil).  Mirror the C reference for parity. }
+  if iDb = 1 then zSchemaTabBuf := LEGACY_TEMP_SCHEMA_TABLE
+              else zSchemaTabBuf := LEGACY_SCHEMA_TABLE;
+  zSchemaTabName := PAnsiChar(zSchemaTabBuf);
+  azArg[0] := PAnsiChar('table');
+  azArg[1] := zSchemaTabName;
+  azArg[2] := zSchemaTabName;
+  azArg[3] := PAnsiChar('1');
+  azArg[4] := PAnsiChar('CREATE TABLE x(type text,name text,tbl_name text,'
+                        + 'rootpage int,sql text)');
+  azArg[5] := nil;
+  initData.db         := db;
+  initData.iDb        := iDb;
+  initData.rc         := SQLITE_OK;
+  initData.pzErrMsg   := pzErrMsg;
+  initData.mInitFlags := mFlags;
+  initData.nInitRow   := 0;
+  initData.mxPage     := 0;
+  sqlite3InitCallback(@initData, 5, PPAnsiChar(@azArg[0]), nil);
+  db^.mDbFlags := db^.mDbFlags and mask;
+  if initData.rc <> SQLITE_OK then begin
+    rc := initData.rc;
+    goto error_out;
+  end;
+
+  pBt := PBtree(pDb^.pBt);
+  if pBt = nil then begin
+    Assert(iDb = 1);
+    pSchm := passqlite3util.PSchema(pDb^.pSchema);
+    if pSchm <> nil then
+      pSchm^.schemaFlags := pSchm^.schemaFlags or DB_SchemaLoaded;
+    rc := SQLITE_OK;
+    goto error_out;
+  end;
+
+  { Open a read transaction if not already inside one. }
+  if sqlite3BtreeTxnState(pBt) = SQLITE_TXN_NONE then begin
+    rc := sqlite3BtreeBeginTrans(pBt, 0, nil);
+    if rc <> SQLITE_OK then begin
+      sqlite3SetString(pzErrMsg, db, sqlite3ErrStr(rc));
+      goto initone_error_out;
+    end;
+    openedTransaction := 1;
+  end;
+
+  for i := 0 to 4 do begin
+    metaU32 := 0;
+    sqlite3BtreeGetMeta(pBt, i + 1, @metaU32);
+    meta[i] := i32(metaU32);
+  end;
+  if (db^.flags and SQLITE_ResetDatabase_Bit) <> 0 then
+    FillChar(meta, SizeOf(meta), 0);
+  pSchm := passqlite3util.PSchema(pDb^.pSchema);
+  if pSchm <> nil then
+    pSchm^.schema_cookie := meta[BTREE_SCHEMA_VERSION - 1];
+
+  { Encoding: meta[BTREE_TEXT_ENCODING-1] non-zero on a non-empty DB. }
+  if meta[BTREE_TEXT_ENCODING - 1] <> 0 then begin
+    if (iDb = 0)
+       and ((db^.mDbFlags and DBFLAG_EncodingFixed_L) = 0) then begin
+      encoding := u8(meta[BTREE_TEXT_ENCODING - 1] and 3);
+      if encoding = 0 then encoding := SQLITE_UTF8;
+      sqlite3SetTextEncoding(db, encoding);
+    end else begin
+      if u8(meta[BTREE_TEXT_ENCODING - 1] and 3) <> db^.enc then begin
+        sqlite3SetString(pzErrMsg, db,
+          PAnsiChar('attached databases must use the same'
+                    + ' text encoding as main database'));
+        rc := SQLITE_ERROR;
+        goto initone_error_out;
+      end;
+    end;
+  end;
+  if pSchm <> nil then
+    pSchm^.enc := db^.enc;
+
+  if (pSchm <> nil) and (pSchm^.cache_size = 0) then begin
+    size := meta[BTREE_DEFAULT_CACHE_SIZE - 1];
+    if size < 0 then size := -size;
+    if size = 0 then size := SQLITE_DEFAULT_CACHE_SIZE;
+    pSchm^.cache_size := size;
+    sqlite3BtreeSetCacheSize(pBt, pSchm^.cache_size);
+  end;
+
+  { File format. }
+  if pSchm <> nil then begin
+    pSchm^.file_format := u8(meta[BTREE_FILE_FORMAT - 1]);
+    if pSchm^.file_format = 0 then pSchm^.file_format := 1;
+    if pSchm^.file_format > SQLITE_MAX_FILE_FORMAT_L then begin
+      sqlite3SetString(pzErrMsg, db, PAnsiChar('unsupported file format'));
+      rc := SQLITE_ERROR;
+      goto initone_error_out;
+    end;
+  end;
+
+  if (iDb = 0) and (meta[BTREE_FILE_FORMAT - 1] >= 4) then
+    db^.flags := db^.flags and (not SQLITE_LegacyFileFmt);
+
+  Assert(db^.init.busy <> 0);
+  initData.mxPage := sqlite3BtreeLastPage(pBt);
+  zSql := sqlite3MPrintf(db,
+            'SELECT*FROM"%w".%s ORDER BY rowid',
+            [pDb^.zDbSName, zSchemaTabName]);
+  if zSql = nil then begin
+    rc := SQLITE_NOMEM;
+  end else begin
+    rc := sqlite3_exec(db, zSql, @sqlite3InitCallback, @initData, nil);
+    if rc = SQLITE_OK then rc := initData.rc;
+    sqlite3DbFree(db, zSql);
+    if rc = SQLITE_OK then
+      sqlite3AnalysisLoad(db, iDb);
+  end;
+
+  if db^.mallocFailed <> 0 then begin
+    rc := SQLITE_NOMEM;
+    sqlite3ResetAllSchemasOfConnection(db);
+    pDb := @db^.aDb[iDb];
+  end else if (rc = SQLITE_OK)
+              or (((db^.flags and SQLITE_NoSchemaError_Bit) <> 0)
+                  and (rc <> SQLITE_NOMEM)) then begin
+    pSchm := passqlite3util.PSchema(pDb^.pSchema);
+    if pSchm <> nil then
+      pSchm^.schemaFlags := pSchm^.schemaFlags or DB_SchemaLoaded;
+    rc := SQLITE_OK;
+  end;
+
+initone_error_out:
+  if openedTransaction <> 0 then
+    sqlite3BtreeCommit(pBt);
+
+error_out:
+  if rc <> SQLITE_OK then begin
+    if (rc = SQLITE_NOMEM) or (rc = SQLITE_IOERR or (12 shl 8)) then
+      sqlite3OomFault(db);
+    sqlite3ResetOneSchema(db, iDb);
+  end;
+  db^.init.busy := 0;
+  Result := rc;
+end;
+
+function sqlite3Init(db: PTsqlite3; pzErrMsg: PPAnsiChar): i32;
+var
+  i, rc:           i32;
+  commit_internal: i32;
+  pSchm:           passqlite3util.PSchema;
+begin
+  if (db^.mDbFlags and DBFLAG_SchemaChange) <> 0 then
+    commit_internal := 0
+  else
+    commit_internal := 1;
+  Assert(db^.init.busy = 0);
+  if db^.aDb[0].pSchema <> nil then
+    db^.enc := passqlite3util.PSchema(db^.aDb[0].pSchema)^.enc;
+  Assert(db^.nDb > 0);
+  { Main first. }
+  pSchm := passqlite3util.PSchema(db^.aDb[0].pSchema);
+  if (pSchm = nil) or ((pSchm^.schemaFlags and DB_SchemaLoaded) = 0) then begin
+    rc := sqlite3InitOne(db, 0, pzErrMsg, 0);
+    if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+  end;
+  { All other schemas after the main schema; temp must be last. }
+  for i := db^.nDb - 1 downto 1 do begin
+    pSchm := passqlite3util.PSchema(db^.aDb[i].pSchema);
+    if (pSchm = nil) or ((pSchm^.schemaFlags and DB_SchemaLoaded) = 0) then begin
+      rc := sqlite3InitOne(db, i, pzErrMsg, 0);
+      if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+    end;
+  end;
+  if commit_internal <> 0 then
+    sqlite3CommitInternalChanges(db);
+  Result := SQLITE_OK;
+end;
+
 initialization
   vdbeParseSchemaExec := @execParseSchemaImpl;
   vdbeSqlExec := @execSqlExecImpl;
+  vdbeRunVacuum := @runVacuumImpl;
+  passqlite3codegen.gSqlite3Init :=
+    passqlite3codegen.TSqlite3InitFn(@sqlite3Init);
 
   { Phase 5.8: wire the parser tokenizer into vdbetrace's ExpandSql so
     bound-parameter scanning works.  Done here (not in passqlite3parser)

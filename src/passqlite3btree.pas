@@ -391,13 +391,27 @@ const
   Phase 4.2 opaque type stubs (resolved in later phases)
   =========================================================================== }
 type
-  { UnpackedRecord — ported from vdbeInt.h (exposed here for btree + vdbe) }
+  { UnpackedRecord — ported from vdbeInt.h (exposed here for btree + vdbe).
+    Phase 6.9(c) reconcile: layout now matches the C struct (sizeof=40)
+    and codegen.pas TUnpackedRecord exactly, so a record allocated by
+    either side is interchangeable. }
+  TUnpackedRecordU = record
+    case Integer of
+      0: (z: PAnsiChar);
+      1: (i: i64);
+  end;
   TUnpackedRecord = record
-    pKeyInfo  : PKeyInfo;
-    aMem      : Pointer;    { Psqlite3_value array; Pointer here to avoid circular dep }
-    nField    : i32;
-    default_rc: i32;
-    eqSeen    : u8;
+    pKeyInfo  : PKeyInfo;             { 8 bytes @ 0  }
+    aMem      : Pointer;              { 8 bytes @ 8  — Psqlite3_value array }
+    u         : TUnpackedRecordU;     { 8 bytes @ 16 }
+    n         : i32;                  { 4 bytes @ 24 }
+    nField    : u16;                  { 2 bytes @ 28 }
+    default_rc: i8;                   { 1 byte  @ 30 }
+    errCode   : u8;                   { 1 byte  @ 31 }
+    r1        : i8;                   { 1 byte  @ 32 }
+    r2        : i8;                   { 1 byte  @ 33 }
+    eqSeen    : u8;                   { 1 byte  @ 34 }
+    _pad35    : array[0..4] of u8;    { 5 bytes @ 35 }
   end;
   PUnpackedRecord = ^TUnpackedRecord;
   { RecordCompare function pointer type }
@@ -698,6 +712,11 @@ function  sqlite3BtreeSecureDelete(p: PBtree; newFlag: i32): i32;
 function  sqlite3BtreeSetAutoVacuum(p: PBtree; autoVacuum: i32): i32;
 function  sqlite3BtreeGetAutoVacuum(p: PBtree): i32;
 
+{ btree.c:4161 — perform a single unit of work towards an incremental
+  vacuum.  Without auto-vacuum this returns SQLITE_DONE immediately.
+  Wired into OP_IncrVacuum (vdbe.c:8174). }
+function  sqlite3BtreeIncrVacuum(p: PBtree): i32;
+
 { btree.c:3017 — propagate the connection's mmap-size ceiling to the pager. }
 function  sqlite3BtreeSetMmapLimit(p: PBtree; szMmap: i64): i32;
 
@@ -714,10 +733,24 @@ function  sqlite3BtreeSchemaLocked(p: PBtree): i32;
   sub-transaction. }
 function  sqlite3BtreeBeginStmt(p: PBtree; iStatement: i32): i32;
 
+{ btree.c:11126 — sqlite3BtreeIntegrityCheck.  PRAGMA integrity_check
+  body.  aRoot[0] == nRoot when the list is exhaustive (full check);
+  aRoot[0] == 0 indicates a "partial" check — only verify the listed
+  trees and skip freelist + page-coverage scans (except aRoot[1]==1
+  retains the freelist scan).  Writes the per-tree row count into
+  aRowCnt[i] (i in 0..nRoot-1).  *pnErr receives the error count;
+  *pzOut receives a libc-malloc'd error message (or nil on success).
+  Aim is byte-for-byte compatible reporting with the C oracle. }
+function  sqlite3BtreeIntegrityCheck(db: Psqlite3; p: PBtree;
+                                     aRoot: PPgno; aRowCnt: Pi64;
+                                     nRoot, mxErr: i32;
+                                     pnErr: Pi32;
+                                     pzOut: PPAnsiChar): i32;
+
 implementation
 
 uses
-  BaseUnix, UnixType, passqlite3internal;
+  BaseUnix, UnixType, passqlite3internal, passqlite3printf;
 
 { ===========================================================================
   Inline pager helpers
@@ -7320,6 +7353,81 @@ begin
   Result := rc;
 end;
 
+{ btree.c:4135 — given an auto-vacuum DB of nOrig pages with nFree free
+  pages, return the expected size in pages following an auto-vacuum. }
+function finalDbSize(pBt: PBtShared; nOrig: Pgno; nFree: Pgno): Pgno;
+var
+  nEntry  : i32;
+  nPtrmap : Pgno;
+  nFin    : Pgno;
+begin
+  nEntry := pBt^.usableSize div 5;
+  nPtrmap := (nFree - nOrig + (nOrig div Pgno(nEntry)) + Pgno(nEntry))
+              div Pgno(nEntry);
+  { NOTE: PTRMAP_PAGENO(pBt, nOrig) is approximated as (nOrig / nEntry).
+    The faithful expansion (btree.c PTRMAP_PAGENO) would compute it exactly,
+    but ptrmap is stubbed in this port — IncrVacuum returns SQLITE_DONE
+    before reaching this code path. }
+  nFin := nOrig - nFree - nPtrmap;
+  if (nOrig > PENDING_BYTE_PAGE(pBt)) and (nFin < PENDING_BYTE_PAGE(pBt)) then
+    Dec(nFin);
+  while (nFin = PENDING_BYTE_PAGE(pBt)) do
+    Dec(nFin);
+  Result := nFin;
+end;
+
+{ btree.c:4161 — perform a single unit of work towards an incremental
+  vacuum.  A write-transaction must be open.  Returns SQLITE_DONE if
+  the vacuum is complete, SQLITE_OK if more work remains, or an error
+  code.  Auto-vacuum is not productive in this port — pBt^.autoVacuum
+  is always 0 with the default build, so this routine always returns
+  SQLITE_DONE.  Faithful 1:1 with the upstream entry. }
+function sqlite3BtreeIncrVacuum(p: PBtree): i32;
+var
+  pBt   : PBtShared;
+  rc    : i32;
+  nOrig : Pgno;
+  nFree : Pgno;
+  nFin  : Pgno;
+begin
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  Assert((pBt^.inTransaction = TRANS_WRITE) and (p^.inTrans = TRANS_WRITE));
+  if pBt^.autoVacuum = 0 then
+    rc := SQLITE_DONE
+  else
+  begin
+    nOrig := btreePagecount(pBt);
+    nFree := get4byte(pBt^.pPage1^.aData + 36);
+    nFin  := finalDbSize(pBt, nOrig, nFree);
+
+    if (nOrig < nFin) or (nFree >= nOrig) then
+      rc := SQLITE_CORRUPT_BKPT
+    else if nFree > 0 then
+    begin
+      rc := saveAllCursors(pBt, 0, nil);
+      if rc = SQLITE_OK then
+      begin
+        invalidateAllOverflowCache(pBt);
+        { incrVacuumStep is not productively ported (ptrmap is stubbed —
+          this branch is unreachable in the default build because
+          autoVacuum=0 above).  Return SQLITE_DONE for safety so an
+          unexpected autoVacuum=1 caller does not corrupt the file. }
+        rc := SQLITE_DONE;
+      end;
+      if rc = SQLITE_OK then
+      begin
+        rc := sqlite3PagerWrite(pBt^.pPage1^.pDbPage);
+        put4byte(pBt^.pPage1^.aData + 28, u32(pBt^.nPage));
+      end;
+    end
+    else
+      rc := SQLITE_DONE;
+  end;
+  sqlite3BtreeLeave(p);
+  Result := rc;
+end;
+
 { btree.c:3017 }
 function sqlite3BtreeSetMmapLimit(p: PBtree; szMmap: i64): i32;
 begin
@@ -7356,6 +7464,573 @@ begin
   rc := sqlite3PagerOpenSavepoint(p^.pBt^.pPager, iStatement);
   sqlite3BtreeLeave(p);
   Result := rc;
+end;
+
+{ ============================================================================
+  Phase 6.28 — sqlite3BtreeIntegrityCheck (btree.c:11126) and helpers
+  (btree.c:10566..11100).  Faithful 1:1 port of the !SQLITE_OMIT_INTEGRITY_CHECK
+  arm.  Differences from the C reference:
+    * StrAccum static-buffer-then-grow strategy is replaced by libc-malloc
+      sqlite3_str_new (Pascal port already lacks the C StrAccumInit shape).
+    * `aCnt: Mem*` parameter is replaced by `aRowCnt: Pi64*` so this unit
+      stays free of the vdbe.pas Mem layout dependency; the OP_IntegrityCk
+      handler in vdbe.pas marshals the i64 array into Mem cells.
+    * Optional progress / interrupt hook (`checkProgress`) is reduced to
+      a no-op — db^.u1.isInterrupted and db^.xProgress live in the
+      codegen-side sqlite3 layout that btree.pas treats as opaque.
+    * SQLITE_CellSizeCk db^.flags save/restore arm is dropped (perf-only,
+      not correctness).
+  ============================================================================ }
+type
+  PIntegrityCk = ^TIntegrityCk;
+  TIntegrityCk = record
+    pBt     : PBtShared;     { The tree being checked }
+    pPager  : PPager;        { Same as pBt^.pPager }
+    aPgRef  : Pu8;           { 1 bit per page in db (cleared on init) }
+    nCkPage : Pgno;          { Pages in the database; 0 for partial check }
+    mxErr   : i32;           { Stop accumulating errors when this hits 0 }
+    nErr    : i32;           { Number of messages written so far }
+    rc      : i32;           { SQLITE_OK / SQLITE_NOMEM / SQLITE_INTERRUPT }
+    nStep   : u32;           { Steps into the integrity_check process }
+    zPfx    : PAnsiChar;     { Error-message prefix format }
+    v0      : Pgno;          { First %u substitution in zPfx (root page) }
+    v1      : Pgno;          { Second %u substitution in zPfx (current pg) }
+    v2      : i32;           { Third %d substitution in zPfx (cell index) }
+    errMsg  : PSqlite3Str;   { Accumulating libc-malloc'd error text }
+    heap    : Pu32;          { Min-heap for cell-coverage analysis }
+    db      : Psqlite3;      { Database connection (opaque here) }
+    nRow    : i64;           { Rows visited in the current tree }
+  end;
+
+{ btree.c:10566 }
+procedure checkOom(pCheck: PIntegrityCk);
+begin
+  pCheck^.rc := SQLITE_NOMEM;
+  pCheck^.mxErr := 0;
+  if pCheck^.nErr = 0 then Inc(pCheck^.nErr);
+end;
+
+{ btree.c:10576 — progress / interrupt hook.  Reduced to a no-op since
+  db^ is opaque in this unit.  The check still terminates cleanly because
+  callers honour mxErr; only progress callbacks and async interrupt are
+  dropped. }
+procedure checkProgress(pCheck: PIntegrityCk);
+begin
+  Inc(pCheck^.nStep);
+end;
+
+{ btree.c:10601 — checkAppendMsg.  Uses sqlite3_str_appendf (Pascal
+  array-of-const variadic) instead of va_list. }
+procedure checkAppendMsg(pCheck: PIntegrityCk; const zFormat: AnsiString;
+                         const args: array of const);
+var s: AnsiString;
+begin
+  checkProgress(pCheck);
+  if pCheck^.mxErr = 0 then Exit;
+  Dec(pCheck^.mxErr);
+  Inc(pCheck^.nErr);
+  if pCheck^.errMsg^.nChar <> 0 then
+    sqlite3_str_append(pCheck^.errMsg, PAnsiChar(#10), 1);
+  if pCheck^.zPfx <> nil then
+    sqlite3_str_appendf(pCheck^.errMsg, pCheck^.zPfx,
+                        [pCheck^.v0, pCheck^.v1, pCheck^.v2]);
+  s := zFormat;
+  sqlite3_str_appendf(pCheck^.errMsg, PAnsiChar(s), args);
+  if pCheck^.errMsg^.accError = SQLITE_NOMEM then
+    checkOom(pCheck);
+end;
+
+{ btree.c:10633 }
+function getPageReferenced(pCheck: PIntegrityCk; iPg: Pgno): i32;
+begin
+  Assert(pCheck^.aPgRef <> nil);
+  Assert(iPg <= pCheck^.nCkPage);
+  Result := i32(pCheck^.aPgRef[iPg shr 3]) and (1 shl (iPg and 7));
+end;
+
+{ btree.c:10642 }
+procedure setPageReferenced(pCheck: PIntegrityCk; iPg: Pgno);
+begin
+  Assert(pCheck^.aPgRef <> nil);
+  Assert(iPg <= pCheck^.nCkPage);
+  pCheck^.aPgRef[iPg shr 3] := pCheck^.aPgRef[iPg shr 3] or
+                                u8(1 shl (iPg and 7));
+end;
+
+{ btree.c:10657 }
+function checkRef(pCheck: PIntegrityCk; iPage: Pgno): i32;
+begin
+  if (iPage > pCheck^.nCkPage) or (iPage = 0) then begin
+    checkAppendMsg(pCheck, 'invalid page number %u', [iPage]);
+    Result := 1; Exit;
+  end;
+  if getPageReferenced(pCheck, iPage) <> 0 then begin
+    checkAppendMsg(pCheck, '2nd reference to page %u', [iPage]);
+    Result := 1; Exit;
+  end;
+  setPageReferenced(pCheck, iPage);
+  Result := 0;
+end;
+
+{ btree.c:10676 — checkPtrmap.  Auto-vacuum is not productively wired in
+  this port (autoVacuum is always 0), so this body is reachable only when
+  upstream-faithful builds enable it.  Implementation matches C 1:1. }
+procedure checkPtrmap(pCheck: PIntegrityCk; iChild: Pgno; eType: u8;
+                      iParent: Pgno);
+var rc: i32;
+    ePtrmapType: u8;
+    iPtrmapParent: Pgno;
+begin
+  rc := ptrmapGet(pCheck^.pBt, iChild, ePtrmapType, iPtrmapParent);
+  if rc <> SQLITE_OK then begin
+    if (rc = SQLITE_NOMEM) or (rc = SQLITE_IOERR_NOMEM) then checkOom(pCheck);
+    checkAppendMsg(pCheck, 'Failed to read ptrmap key=%u', [iChild]);
+    Exit;
+  end;
+  if (ePtrmapType <> eType) or (iPtrmapParent <> iParent) then
+    checkAppendMsg(pCheck,
+      'Bad ptr map entry key=%u expected=(%u,%u) got=(%u,%u)',
+      [iChild, eType, iParent, ePtrmapType, iPtrmapParent]);
+end;
+
+{ btree.c:10705 — checkList: validate freelist or overflow chain. }
+procedure checkList(pCheck: PIntegrityCk; isFreeList: i32; iPage: Pgno; nIn: u32);
+var i: i32;
+    expected: u32;
+    nErrAtStart: i32;
+    pOvflPage: PDbPage;
+    pOvflData: Pu8;
+    nLeaf: u32;
+    iFreePage: Pgno;
+begin
+  expected := nIn;
+  nErrAtStart := pCheck^.nErr;
+  while (iPage <> 0) and (pCheck^.mxErr <> 0) do begin
+    if checkRef(pCheck, iPage) <> 0 then break;
+    Dec(nIn);
+    if sqlite3PagerGet(pCheck^.pPager, iPage, @pOvflPage, 0) <> SQLITE_OK then
+    begin
+      checkAppendMsg(pCheck, 'failed to get page %u', [iPage]);
+      break;
+    end;
+    pOvflData := Pu8(sqlite3PagerGetData(pOvflPage));
+    if isFreeList <> 0 then begin
+      nLeaf := u32(sqlite3Get4byte(@pOvflData[4]));
+      if pCheck^.pBt^.autoVacuum <> 0 then
+        checkPtrmap(pCheck, iPage, PTRMAP_FREEPAGE, 0);
+      if nLeaf > pCheck^.pBt^.usableSize div 4 - 2 then begin
+        checkAppendMsg(pCheck,
+          'freelist leaf count too big on page %u', [iPage]);
+        Dec(nIn);
+      end else begin
+        for i := 0 to i32(nLeaf) - 1 do begin
+          iFreePage := sqlite3Get4byte(@pOvflData[8 + i * 4]);
+          if pCheck^.pBt^.autoVacuum <> 0 then
+            checkPtrmap(pCheck, iFreePage, PTRMAP_FREEPAGE, 0);
+          checkRef(pCheck, iFreePage);
+        end;
+        nIn := nIn - nLeaf;
+      end;
+    end else begin
+      { Overflow chain — auto-vacuum chains carry a ptrmap forward link. }
+      if (pCheck^.pBt^.autoVacuum <> 0) and (nIn > 0) then begin
+        i := i32(sqlite3Get4byte(pOvflData));
+        checkPtrmap(pCheck, Pgno(i), PTRMAP_OVERFLOW2, iPage);
+      end;
+    end;
+    iPage := sqlite3Get4byte(pOvflData);
+    sqlite3PagerUnref(pOvflPage);
+  end;
+  if (nIn <> 0) and (nErrAtStart = pCheck^.nErr) then begin
+    if isFreeList <> 0 then
+      checkAppendMsg(pCheck, 'size is %u but should be %u',
+                     [expected - nIn, expected])
+    else
+      checkAppendMsg(pCheck,
+                     'overflow list length is %u but should be %u',
+                     [expected - nIn, expected]);
+  end;
+end;
+
+{ btree.c:10794 — min-heap insert.  aHeap[0] is the count, aHeap[1] the
+  root.  Daughter nodes of aHeap[N] are aHeap[N*2] / aHeap[N*2+1]. }
+procedure btreeHeapInsert(aHeap: Pu32; x: u32);
+var i, j, t: u32;
+begin
+  Assert(aHeap <> nil);
+  Inc(aHeap[0]); i := aHeap[0];
+  aHeap[i] := x;
+  j := i div 2;
+  while (j > 0) and (aHeap[j] > aHeap[i]) do begin
+    t := aHeap[j]; aHeap[j] := aHeap[i]; aHeap[i] := t;
+    i := j; j := i div 2;
+  end;
+end;
+
+{ btree.c:10806 — min-heap pull. }
+function btreeHeapPull(aHeap: Pu32; pOut: Pu32): i32;
+var i, j, x, t: u32;
+begin
+  x := aHeap[0];
+  if x = 0 then begin Result := 0; Exit; end;
+  pOut^ := aHeap[1];
+  aHeap[1] := aHeap[x];
+  aHeap[x] := $FFFFFFFF;
+  Dec(aHeap[0]);
+  i := 1; j := i * 2;
+  while j <= aHeap[0] do begin
+    if (j < aHeap[0]) and (aHeap[j] > aHeap[j + 1]) then Inc(j);
+    if aHeap[i] < aHeap[j] then break;
+    t := aHeap[i]; aHeap[i] := aHeap[j]; aHeap[j] := t;
+    i := j; j := i * 2;
+  end;
+  Result := 1;
+end;
+
+{ btree.c:10840 — checkTreePage: walk a single tree page (table or
+  index, leaf or interior).  Recurses into children, validates cell
+  layout, integer-key ordering, overflow chains, and (via min-heap)
+  cell coverage.  Returns the depth (root = 1, parent of root = 2,
+  etc.; matching the C return value of `depth + 1`). }
+function checkTreePage(pCheck: PIntegrityCk; iPage: Pgno;
+                       piMinKey: Pi64; maxKey: i64): i32;
+label end_of_check;
+var pPage: PMemPage;
+    i, rc, depth, d2: i32;
+    iChildPg, nFrag, hdr, cellStart, nCell: i32;
+    doCoverageCheck, keyCanBeEqual: i32;
+    data, pCell, pCellIdx: Pu8;
+    pBt: PBtShared;
+    pc, usableSize, contentOffset, x, prev: u32;
+    heap: Pu32;
+    saved_zPfx: PAnsiChar;
+    saved_v1: Pgno;
+    saved_v2: i32;
+    savedIsInit: u8;
+    info: TCellInfo;
+    nPage: u32;
+    pgnoOvfl: Pgno;
+    size: u32;
+begin
+  pPage := nil;
+  depth := -1;
+  doCoverageCheck := 1;
+  keyCanBeEqual := 1;
+  saved_zPfx := pCheck^.zPfx;
+  saved_v1 := pCheck^.v1;
+  saved_v2 := pCheck^.v2;
+  savedIsInit := 0;
+  heap := nil;
+  prev := 0;
+  checkProgress(pCheck);
+  if pCheck^.mxErr = 0 then begin Result := 0; Exit; end;
+  pBt := pCheck^.pBt;
+  usableSize := pBt^.usableSize;
+  if iPage = 0 then begin Result := 0; Exit; end;
+  if checkRef(pCheck, iPage) <> 0 then begin Result := 0; Exit; end;
+  pCheck^.zPfx := PAnsiChar('Tree %u page %u: ');
+  pCheck^.v1 := iPage;
+  rc := btreeGetPage(pBt, iPage, pPage, 0);
+  if rc <> 0 then begin
+    checkAppendMsg(pCheck,
+      'unable to get the page. error code=%d', [rc]);
+    if rc = SQLITE_IOERR_NOMEM then pCheck^.rc := SQLITE_NOMEM;
+    goto end_of_check;
+  end;
+
+  { Force btreeInitPage to re-run so its corruption-detection arm
+    fires regardless of any cached isInit. }
+  savedIsInit := pPage^.isInit;
+  pPage^.isInit := 0;
+  rc := btreeInitPage(pPage);
+  if rc <> 0 then begin
+    Assert(rc = SQLITE_CORRUPT);
+    checkAppendMsg(pCheck,
+      'btreeInitPage() returns error code %d', [rc]);
+    goto end_of_check;
+  end;
+  rc := btreeComputeFreeSpace(pPage);
+  if rc <> 0 then begin
+    Assert(rc = SQLITE_CORRUPT);
+    checkAppendMsg(pCheck, 'free space corruption', []);
+    goto end_of_check;
+  end;
+  data := pPage^.aData;
+  hdr := pPage^.hdrOffset;
+
+  pCheck^.zPfx := PAnsiChar('Tree %u page %u cell %u: ');
+  contentOffset := u32(get2byte(@data[hdr + 5]));
+  if contentOffset = 0 then contentOffset := 65536;
+  Assert(contentOffset <= usableSize);
+
+  { Cell count is the 2-byte int at offset hdr+3. }
+  nCell := get2byte(@data[hdr + 3]);
+  Assert(pPage^.nCell = nCell);
+  if (pPage^.leaf <> 0) or (pPage^.intKey = 0) then
+    pCheck^.nRow := pCheck^.nRow + nCell;
+
+  { Cell-pointer array immediately follows the page header. }
+  cellStart := hdr + 12 - 4 * pPage^.leaf;
+  pCellIdx := @data[cellStart + 2 * (nCell - 1)];
+
+  if pPage^.leaf = 0 then begin
+    { Right-child page of an internal page. }
+    iChildPg := i32(sqlite3Get4byte(@data[hdr + 8]));
+    if pBt^.autoVacuum <> 0 then begin
+      pCheck^.zPfx := PAnsiChar('Tree %u page %u right child: ');
+      checkPtrmap(pCheck, Pgno(iChildPg), PTRMAP_BTREE, iPage);
+    end;
+    depth := checkTreePage(pCheck, Pgno(iChildPg), @maxKey, maxKey);
+    keyCanBeEqual := 0;
+  end else begin
+    { Initialise the coverage-check heap for leaf pages. }
+    heap := pCheck^.heap;
+    heap[0] := 0;
+  end;
+
+  { Walk the cells in reverse to mirror C. }
+  i := nCell - 1;
+  while (i >= 0) and (pCheck^.mxErr <> 0) do begin
+    pCheck^.v2 := i;
+    pc := u32(get2byteAligned(pCellIdx));
+    Dec(pCellIdx, 2);
+    if (pc < contentOffset) or (pc > usableSize - 4) then begin
+      checkAppendMsg(pCheck, 'Offset %u out of range %u..%u',
+                     [pc, contentOffset, usableSize - 4]);
+      doCoverageCheck := 0;
+      Dec(i); continue;
+    end;
+    pCell := @data[pc];
+    pPage^.xParseCell(pPage, pCell, @info);
+    if pc + info.nSize > usableSize then begin
+      checkAppendMsg(pCheck, 'Extends off end of page', []);
+      doCoverageCheck := 0;
+      Dec(i); continue;
+    end;
+
+    { Integer-PK out-of-order check. }
+    if pPage^.intKey <> 0 then begin
+      if (keyCanBeEqual <> 0) and (info.nKey > maxKey) then
+        checkAppendMsg(pCheck, 'Rowid %lld out of order', [info.nKey])
+      else if (keyCanBeEqual = 0) and (info.nKey >= maxKey) then
+        checkAppendMsg(pCheck, 'Rowid %lld out of order', [info.nKey]);
+      maxKey := info.nKey;
+      keyCanBeEqual := 0;
+    end;
+
+    { Overflow-chain validation. }
+    if info.nPayload > info.nLocal then begin
+      Assert(pc + info.nSize - 4 <= usableSize);
+      nPage := (info.nPayload - u32(info.nLocal) + usableSize - 5)
+               div (usableSize - 4);
+      pgnoOvfl := sqlite3Get4byte(@pCell[info.nSize - 4]);
+      if pBt^.autoVacuum <> 0 then
+        checkPtrmap(pCheck, pgnoOvfl, PTRMAP_OVERFLOW1, iPage);
+      checkList(pCheck, 0, pgnoOvfl, nPage);
+    end;
+
+    if pPage^.leaf = 0 then begin
+      iChildPg := i32(sqlite3Get4byte(pCell));
+      if pBt^.autoVacuum <> 0 then
+        checkPtrmap(pCheck, Pgno(iChildPg), PTRMAP_BTREE, iPage);
+      d2 := checkTreePage(pCheck, Pgno(iChildPg), @maxKey, maxKey);
+      keyCanBeEqual := 0;
+      if d2 <> depth then begin
+        checkAppendMsg(pCheck, 'Child page depth differs', []);
+        depth := d2;
+      end;
+    end else begin
+      btreeHeapInsert(heap, (pc shl 16) or (pc + info.nSize - 1));
+    end;
+    Dec(i);
+  end;
+  if piMinKey <> nil then piMinKey^ := maxKey;
+
+  { Cell-coverage / fragmentation cross-check. }
+  pCheck^.zPfx := nil;
+  if (doCoverageCheck <> 0) and (pCheck^.mxErr > 0) then begin
+    if pPage^.leaf = 0 then begin
+      heap := pCheck^.heap;
+      heap[0] := 0;
+      i := nCell - 1;
+      while i >= 0 do begin
+        pc := u32(get2byteAligned(@data[cellStart + i * 2]));
+        size := pPage^.xCellSize(pPage, @data[pc]);
+        btreeHeapInsert(heap, (pc shl 16) or (pc + size - 1));
+        Dec(i);
+      end;
+    end;
+    Assert(heap <> nil);
+    { Walk the freeblock chain (offset hdr+1 starts the chain). }
+    i := get2byte(@data[hdr + 1]);
+    while i > 0 do begin
+      Assert(u32(i) <= usableSize - 4);
+      size := u32(get2byte(@data[i + 2]));
+      Assert(u32(i) + size <= usableSize);
+      btreeHeapInsert(heap, (u32(i) shl 16) or (u32(i) + size - 1));
+      i := get2byte(@data[i]);
+      Assert(u32(i) <= usableSize - 4);
+    end;
+    nFrag := 0;
+    prev := contentOffset - 1;
+    while btreeHeapPull(heap, @x) <> 0 do begin
+      if (prev and $FFFF) >= (x shr 16) then begin
+        checkAppendMsg(pCheck, 'Multiple uses for byte %u of page %u',
+                       [x shr 16, iPage]);
+        break;
+      end else begin
+        nFrag := nFrag + i32((x shr 16) - (prev and $FFFF) - 1);
+        prev := x;
+      end;
+    end;
+    nFrag := nFrag + i32(usableSize - (prev and $FFFF) - 1);
+    if (heap[0] = 0) and (nFrag <> data[hdr + 7]) then
+      checkAppendMsg(pCheck,
+        'Fragmentation of %u bytes reported as %u on page %u',
+        [u32(nFrag), u32(data[hdr + 7]), iPage]);
+  end;
+
+end_of_check:
+  if doCoverageCheck = 0 then
+    if pPage <> nil then pPage^.isInit := savedIsInit;
+  releasePage(pPage);
+  pCheck^.zPfx := saved_zPfx;
+  pCheck^.v1 := saved_v1;
+  pCheck^.v2 := saved_v2;
+  Result := depth + 1;
+end;
+
+{ btree.c:11126 — sqlite3BtreeIntegrityCheck.  Walks every root in
+  aRoot[] and validates the resulting trees, freelist, and (for
+  full / non-partial checks) the page-coverage map.  See module
+  banner for the small set of port-specific deviations. }
+function sqlite3BtreeIntegrityCheck(db: Psqlite3; p: PBtree;
+                                    aRoot: PPgno; aRowCnt: Pi64;
+                                    nRoot, mxErr: i32;
+                                    pnErr: Pi32;
+                                    pzOut: PPAnsiChar): i32;
+label integrity_ck_cleanup;
+var
+  i: Pgno;
+  k: i32;
+  sCheck: TIntegrityCk;
+  pBt: PBtShared;
+  bPartial: i32;
+  bCkFreelist: i32;
+  notUsed: i64;
+  mx, mxInHdr: Pgno;
+begin
+  Assert(nRoot > 0);
+  bPartial := 0;
+  bCkFreelist := 1;
+  if aRoot[0] = 0 then begin
+    Assert(nRoot > 1);
+    bPartial := 1;
+    if aRoot[1] <> 1 then bCkFreelist := 0;
+  end;
+  pBt := p^.pBt;
+  sqlite3BtreeEnter(p);
+  Assert((p^.inTrans > TRANS_NONE) and (pBt^.inTransaction > TRANS_NONE));
+
+  FillChar(sCheck, SizeOf(sCheck), 0);
+  sCheck.db      := db;
+  sCheck.pBt     := pBt;
+  sCheck.pPager  := pBt^.pPager;
+  sCheck.nCkPage := btreePagecount(pBt);
+  sCheck.mxErr   := mxErr;
+  sCheck.errMsg  := sqlite3_str_new(nil);
+  if sCheck.errMsg = nil then begin
+    checkOom(@sCheck);
+    goto integrity_ck_cleanup;
+  end;
+  if sCheck.nCkPage = 0 then goto integrity_ck_cleanup;
+
+  sCheck.aPgRef := Pu8(sqlite3MallocZero64(u64(sCheck.nCkPage div 8) + 1));
+  if sCheck.aPgRef = nil then begin
+    checkOom(@sCheck);
+    goto integrity_ck_cleanup;
+  end;
+  sCheck.heap := Pu32(sqlite3PageMalloc(pBt^.pageSize));
+  if sCheck.heap = nil then begin
+    checkOom(@sCheck);
+    goto integrity_ck_cleanup;
+  end;
+
+  i := PENDING_BYTE_PAGE(pBt);
+  if i <= sCheck.nCkPage then setPageReferenced(@sCheck, i);
+
+  { Freelist integrity. }
+  if bCkFreelist <> 0 then begin
+    sCheck.zPfx := PAnsiChar('Freelist: ');
+    checkList(@sCheck, 1,
+              sqlite3Get4byte(@pBt^.pPage1^.aData[32]),
+              u32(sqlite3Get4byte(@pBt^.pPage1^.aData[36])));
+    sCheck.zPfx := nil;
+  end;
+
+  { Auto-vacuum cross-check on the rootpage list. }
+  if (bPartial = 0) and (pBt^.autoVacuum <> 0) then begin
+    mx := 0;
+    for k := 0 to nRoot - 1 do
+      if mx < aRoot[k] then mx := aRoot[k];
+    mxInHdr := sqlite3Get4byte(@pBt^.pPage1^.aData[52]);
+    if mx <> mxInHdr then
+      checkAppendMsg(@sCheck,
+        'max rootpage (%u) disagrees with header (%u)',
+        [mx, mxInHdr]);
+  end else if (bPartial = 0) and
+              (sqlite3Get4byte(@pBt^.pPage1^.aData[64]) <> 0) then
+    checkAppendMsg(@sCheck,
+      'incremental_vacuum enabled with a max rootpage of zero', []);
+
+  { Walk every listed tree. }
+  for k := 0 to nRoot - 1 do begin
+    if sCheck.mxErr = 0 then break;
+    sCheck.nRow := 0;
+    if aRoot[k] <> 0 then begin
+      if (pBt^.autoVacuum <> 0) and (aRoot[k] > 1) and (bPartial = 0) then
+        checkPtrmap(@sCheck, aRoot[k], PTRMAP_ROOTPAGE, 0);
+      sCheck.v0 := aRoot[k];
+      checkTreePage(@sCheck, aRoot[k], @notUsed, LARGEST_INT64);
+    end;
+    if aRowCnt <> nil then aRowCnt[k] := sCheck.nRow;
+  end;
+
+  { Page-coverage map (full check only). }
+  if bPartial = 0 then begin
+    i := 1;
+    while (i <= sCheck.nCkPage) and (sCheck.mxErr <> 0) do begin
+      if pBt^.autoVacuum = 0 then begin
+        if getPageReferenced(@sCheck, i) = 0 then
+          checkAppendMsg(@sCheck, 'Page %u: never used', [i]);
+      end else begin
+        { Auto-vacuum: pointer-map pages must be referenced exactly
+          when PTRMAP_PAGENO(pBt, i) == i.  The Pascal port treats
+          PTRMAP_PAGENO as approximate (per btree.pas:7340) so we
+          fall back to the !autoVacuum check, which is conservative. }
+        if getPageReferenced(@sCheck, i) = 0 then
+          checkAppendMsg(@sCheck, 'Page %u: never used', [i]);
+      end;
+      Inc(i);
+    end;
+  end;
+
+integrity_ck_cleanup:
+  if sCheck.heap <> nil then sqlite3PageFree(sCheck.heap);
+  if sCheck.aPgRef <> nil then sqlite3_free(sCheck.aPgRef);
+  if pnErr <> nil then pnErr^ := sCheck.nErr;
+  if pzOut <> nil then begin
+    if sCheck.nErr = 0 then begin
+      if sCheck.errMsg <> nil then sqlite3_str_reset(sCheck.errMsg);
+      pzOut^ := nil;
+    end else begin
+      pzOut^ := sqlite3_str_finish(sCheck.errMsg);
+      sCheck.errMsg := nil;
+    end;
+  end;
+  if sCheck.errMsg <> nil then sqlite3_str_free(sCheck.errMsg);
+  sqlite3BtreeLeave(p);
+  Result := sCheck.rc;
 end;
 
 end.

@@ -214,10 +214,13 @@ begin
         'SELECT count(*) FROM t');
 
   // --- UPDATE-FROM ---
+  // sqlite3_prepare_v2 only handles one statement, so seed s+d through
+  // the test setup array and exercise UPDATE...FROM as the probed SQL.
   Probe('update from',
-        CT_SRC,
-        'INSERT INTO s VALUES(1,10),(2,20); INSERT INTO d VALUES(1,0),(2,0); '
-        + 'UPDATE d SET y=s.y FROM s WHERE d.x=s.x',
+        ['CREATE TABLE s(x,y)', 'CREATE TABLE d(x,y)',
+         'INSERT INTO s VALUES(1,10),(2,20),(3,30)',
+         'INSERT INTO d VALUES(1,0),(2,0),(3,0)'],
+        'UPDATE d SET y=s.y FROM s WHERE d.x=s.x',
         'SELECT sum(y) FROM d');
 
   // --- INSERT column-list reorder ---

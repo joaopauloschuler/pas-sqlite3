@@ -771,6 +771,9 @@ function sqlite3_filename_wal(zFilename: PChar): PChar;
 procedure sqlite3_free_filename(p: PChar);
 function sqlite3_create_filename(zDatabase, zJournal, zWal: PChar;
   nParam: i32; azParam: PPChar): PChar; cdecl;
+function sqlite3ParseUri(zDefaultVfs: PChar; zUri: PChar;
+  pFlags: Pu32; ppVfs: Pointer; pzFile: PPChar;
+  pzErrMsg: PPChar): i32;
 function sqlite3Atoi(z: PChar): i32;
 
 { Alignment helpers (used by pcache and btree) }
@@ -814,6 +817,7 @@ function libc_memcpy(dst, src: Pointer; n: csize_t): Pointer; external 'c' name 
 procedure libc_memset(dst: Pointer; c: i32; n: csize_t); external 'c' name 'memset';
 function libc_vasprintf(out strp: PChar; fmt: PChar; ap: Pointer): i32; external 'c' name 'vasprintf';
 function libc_vsnprintf(str: PChar; size: csize_t; fmt: PChar; ap: Pointer): i32; external 'c' name 'vsnprintf';
+function libc_snprintf_uri(str: PChar; size: csize_t; fmt: PChar): i32; cdecl; varargs; external 'c' name 'snprintf';
 function libc_pow(base, exp: Double): Double; external 'c' name 'pow';
 
 { ============================================================
@@ -2963,6 +2967,273 @@ begin
   AssertH((PtrUInt(p) - PtrUInt(pResult)) = PtrUInt(nByte),
     'sqlite3_create_filename: byte-count mismatch');
   Result := pResult + 4;
+end;
+
+{ main.c:3069 — sqlite3ParseUri.  Parses a URI-form filename
+  ("file:..."?option=value&...) into the canonical zFile buffer (4 leading
+  zero bytes, NUL-separated database/option/value/option/value..., trailing
+  double-NUL) and updates *pFlags / *ppVfs accordingly.  When the input is
+  not a URI (zUri does not start with "file:" or SQLITE_OPEN_URI is off and
+  the global bOpenUri flag is off), the input is copied verbatim into the
+  same buffer layout with no option parsing. }
+function sqlite3ParseUri(zDefaultVfs: PChar; zUri: PChar;
+  pFlags: Pu32; ppVfs: Pointer; pzFile: PPChar;
+  pzErrMsg: PPChar): i32;
+type
+  TOpenMode = record
+    z:    PChar;
+    mode: i32;
+  end;
+const
+  aCacheMode: array[0..2] of TOpenMode = (
+    (z: 'shared';  mode: SQLITE_OPEN_SHAREDCACHE),
+    (z: 'private'; mode: SQLITE_OPEN_PRIVATECACHE),
+    (z: nil;       mode: 0));
+  aOpenMode: array[0..4] of TOpenMode = (
+    (z: 'ro';     mode: SQLITE_OPEN_READONLY),
+    (z: 'rw';     mode: SQLITE_OPEN_READWRITE),
+    (z: 'rwc';    mode: SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE),
+    (z: 'memory'; mode: SQLITE_OPEN_MEMORY),
+    (z: nil;      mode: 0));
+label
+  parse_uri_out;
+var
+  rc:       i32;
+  flags:    u32;
+  zVfs:     PChar;
+  zFile:    PChar;
+  c:        AnsiChar;
+  nUri:     i32;
+  iIn:      i32;
+  iOut:     i32;
+  eState:   i32;
+  nByte:    u64;
+  octet:    i32;
+  zOpt:     PChar;
+  nOpt:     i32;
+  zVal:     PChar;
+  nVal:     i32;
+  pAMode:   ^TOpenMode;
+  zModeType: PChar;
+  mask:     i32;
+  limit:    i32;
+  i:        i32;
+  mode:     i32;
+  ppV:      ^Psqlite3_vfs;
+  zEbuf:    array[0..255] of AnsiChar;
+begin
+  rc := SQLITE_OK;
+  flags := pFlags^;
+  zVfs := zDefaultVfs;
+  zFile := nil;
+  nUri := sqlite3Strlen30(zUri);
+  AssertH(pzErrMsg^ = nil, 'sqlite3ParseUri: *pzErrMsg=nil precondition');
+
+  if (((flags and SQLITE_OPEN_URI) <> 0)
+       or (sqlite3GlobalConfig.bOpenUri <> 0))
+     and (nUri >= 5)
+     and (CompareByte(zUri^, PChar('file:')^, 5) = 0) then
+  begin
+    flags := flags or SQLITE_OPEN_URI;
+    nByte := u64(nUri) + 8;
+    iIn := 0;
+    while iIn < nUri do
+    begin
+      if zUri[iIn] = '&' then Inc(nByte);
+      Inc(iIn);
+    end;
+    zFile := PChar(sqlite3_malloc64(i64(nByte)));
+    if zFile = nil then begin
+      Result := SQLITE_NOMEM_BKPT;
+      Exit;
+    end;
+    FillChar(zFile^, 4, 0);  { 4-byte zero prefix marks DB-name start }
+    Inc(zFile, 4);
+
+    iIn := 5;
+    { SQLITE_ALLOW_URI_AUTHORITY is off — discard scheme + authority }
+    if (zUri[5] = '/') and (zUri[6] = '/') then
+    begin
+      iIn := 7;
+      while (zUri[iIn] <> #0) and (zUri[iIn] <> '/') do Inc(iIn);
+      if (iIn <> 7)
+         and ((iIn <> 16)
+              or (CompareByte((zUri + 7)^, PChar('localhost')^, 9) <> 0)) then
+      begin
+        libc_snprintf_uri(@zEbuf[0], SizeOf(zEbuf),
+          'invalid uri authority: %.*s', iIn - 7, zUri + 7);
+        pzErrMsg^ := sqlite3StrDup(@zEbuf[0]);
+        rc := SQLITE_ERROR;
+        goto parse_uri_out;
+      end;
+    end;
+
+    iOut := 0;
+    eState := 0;
+    while True do
+    begin
+      c := zUri[iIn];
+      if (c = #0) or (c = '#') then Break;
+      Inc(iIn);
+      if (c = '%')
+         and (sqlite3Isxdigit(u8(zUri[iIn])) <> 0)
+         and (sqlite3Isxdigit(u8(zUri[iIn + 1])) <> 0) then
+      begin
+        octet := i32(sqlite3HexToInt(i32(zUri[iIn]))) shl 4;
+        Inc(iIn);
+        octet := octet + i32(sqlite3HexToInt(i32(zUri[iIn])));
+        Inc(iIn);
+        AssertH((octet >= 0) and (octet < 256), 'sqlite3ParseUri: octet range');
+        if octet = 0 then
+        begin
+          { Skip remainder of current path/name/value section.  Matches
+            the !SQLITE_ENABLE_URI_00_ERROR arm. }
+          while True do
+          begin
+            c := zUri[iIn];
+            if (c = #0) or (c = '#') then Break;
+            if (eState = 0) and (c = '?') then Break;
+            if (eState = 1) and ((c = '=') or (c = '&')) then Break;
+            if (eState = 2) and (c = '&') then Break;
+            Inc(iIn);
+          end;
+          Continue;
+        end;
+        c := AnsiChar(octet);
+      end
+      else if (eState = 1) and ((c = '&') or (c = '=')) then
+      begin
+        if zFile[iOut - 1] = #0 then
+        begin
+          { Empty option name — drop entire option }
+          while (zUri[iIn] <> #0) and (zUri[iIn] <> '#')
+                and (zUri[iIn - 1] <> '&') do
+            Inc(iIn);
+          Continue;
+        end;
+        if c = '&' then
+        begin
+          zFile[iOut] := #0;
+          Inc(iOut);
+        end
+        else
+          eState := 2;
+        c := #0;
+      end
+      else if ((eState = 0) and (c = '?'))
+              or ((eState = 2) and (c = '&')) then
+      begin
+        c := #0;
+        eState := 1;
+      end;
+      zFile[iOut] := c;
+      Inc(iOut);
+    end;
+    if eState = 1 then
+    begin
+      zFile[iOut] := #0;
+      Inc(iOut);
+    end;
+    FillChar(zFile[iOut], 4, 0);
+
+    { Walk the option list and apply known options. }
+    zOpt := zFile + sqlite3Strlen30(zFile) + 1;
+    while zOpt[0] <> #0 do
+    begin
+      nOpt := sqlite3Strlen30(zOpt);
+      zVal := zOpt + nOpt + 1;
+      nVal := sqlite3Strlen30(zVal);
+      if (nOpt = 3) and (CompareByte(zOpt^, PChar('vfs')^, 3) = 0) then
+        zVfs := zVal
+      else
+      begin
+        pAMode := nil;
+        zModeType := nil;
+        mask := 0;
+        limit := 0;
+        if (nOpt = 5) and (CompareByte(zOpt^, PChar('cache')^, 5) = 0) then
+        begin
+          mask := SQLITE_OPEN_SHAREDCACHE or SQLITE_OPEN_PRIVATECACHE;
+          pAMode := @aCacheMode[0];
+          limit := mask;
+          zModeType := 'cache';
+        end;
+        if (nOpt = 4) and (CompareByte(zOpt^, PChar('mode')^, 4) = 0) then
+        begin
+          mask := SQLITE_OPEN_READONLY or SQLITE_OPEN_READWRITE
+                  or SQLITE_OPEN_CREATE or SQLITE_OPEN_MEMORY;
+          pAMode := @aOpenMode[0];
+          limit := i32(mask and i32(flags));
+          zModeType := 'access';
+        end;
+        if pAMode <> nil then
+        begin
+          mode := 0;
+          i := 0;
+          while pAMode[i].z <> nil do
+          begin
+            if (nVal = sqlite3Strlen30(pAMode[i].z))
+               and (CompareByte(zVal^, pAMode[i].z^, nVal) = 0) then
+            begin
+              mode := pAMode[i].mode;
+              Break;
+            end;
+            Inc(i);
+          end;
+          if mode = 0 then
+          begin
+            libc_snprintf_uri(@zEbuf[0], SizeOf(zEbuf),
+              'no such %s mode: %s', zModeType, zVal);
+            pzErrMsg^ := sqlite3StrDup(@zEbuf[0]);
+            rc := SQLITE_ERROR;
+            goto parse_uri_out;
+          end;
+          if (mode and not SQLITE_OPEN_MEMORY) > limit then
+          begin
+            libc_snprintf_uri(@zEbuf[0], SizeOf(zEbuf),
+              '%s mode not allowed: %s', zModeType, zVal);
+            pzErrMsg^ := sqlite3StrDup(@zEbuf[0]);
+            rc := SQLITE_PERM;
+            goto parse_uri_out;
+          end;
+          flags := (flags and not u32(mask)) or u32(mode);
+        end;
+      end;
+      zOpt := zVal + nVal + 1;
+    end;
+  end
+  else
+  begin
+    zFile := PChar(sqlite3_malloc64(i64(nUri) + 8));
+    if zFile = nil then begin
+      Result := SQLITE_NOMEM_BKPT;
+      Exit;
+    end;
+    FillChar(zFile^, 4, 0);
+    Inc(zFile, 4);
+    if nUri > 0 then
+      Move(zUri^, zFile^, nUri);
+    FillChar((zFile + nUri)^, 4, 0);
+    flags := flags and not u32(SQLITE_OPEN_URI);
+  end;
+
+parse_uri_out:
+  ppV := ppVfs;
+  ppV^ := sqlite3_vfs_find(zVfs);
+  if ppV^ = nil then
+  begin
+    libc_snprintf_uri(@zEbuf[0], SizeOf(zEbuf), 'no such vfs: %s', zVfs);
+    pzErrMsg^ := sqlite3StrDup(@zEbuf[0]);
+    rc := SQLITE_ERROR;
+  end;
+  if rc <> SQLITE_OK then
+  begin
+    sqlite3_free_filename(zFile);
+    zFile := nil;
+  end;
+  pFlags^ := flags;
+  pzFile^ := zFile;
+  Result := rc;
 end;
 
 { util.c ~1357: sqlite3Atoi -- parse integer from string }
