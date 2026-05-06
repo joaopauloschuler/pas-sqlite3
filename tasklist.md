@@ -246,12 +246,9 @@ FPC porting traps that recur often enough to call out up-front:
             arm at resetAccumulatorSimple covers the same ground.
 
   [X] **6.26** Window functions (window.c).
-       DiagWindow now passes 0/26 divergences.  Open sub-rows below
-       (frame-spec emission beyond default ROWS BETWEEN UNBOUNDED
-       PRECEDING AND CURRENT ROW; multi-window arm; lifting the
-       SRT_Output / DISTINCT / ORDER BY / LIMIT subset gates) are
-       deferred — they are gated by additional DiagWindow rows or
-       new test programs, not by missing port work.
+       DiagWindow: 2 divergences open (multi-window arm,
+       outer-ORDER-BY-by-alias resolver gap).  All other rows
+       PASS.
        Gate: DiagWindow — closes 6.10 step 17(c) (rank, dense_rank,
        lag, lead, first_value, ntile prepare-time failures) and step
        17(d) (`sum() OVER (...)`, `row_number() OVER (...)` empty
@@ -429,18 +426,20 @@ FPC porting traps that recur often enough to call out up-front:
             opens once the windows have incompatible specs.  C
             handles via per-window sub-select chaining
             (window.c:1119+ the second-window-and-onward arm).
-       [ ] Subset-gate lift: outer ORDER BY (`SELECT ... OVER ...
-            FROM t ORDER BY ...`).  Window arm currently bails
-            with SQLITE_OK when `p^.pOrderBy <> nil`.  Needs
-            sorter open + push (ORDER BY keys + result data)
-            in the gosub body, drain via generateSortTail tail
-            after the step loop.  DiagWindow `window outer order`
-            currently empty.  Outer-ORDER-BY-by-alias (`AS rn ...
-            ORDER BY rn`) is a *separate* resolve-side gap —
-            "no such column" at prepare time.
-       [ ] Subset-gate lift: outer DISTINCT (`SELECT DISTINCT
-            ... OVER ...`).  Needs DISTINCT dedup ephemeral.
-            DiagWindow `window outer distinct` empty.
+       [X] Subset-gate lift: outer ORDER BY (`SELECT ... OVER ...
+            FROM t ORDER BY ...`).  Sorter opened before WhereBegin;
+            gosub body emits SorterInsert (orderby keys ++ result
+            cols) instead of OP_ResultRow; sort tail drains via
+            OpenPseudo + SorterSort + SorterData + per-col Column
+            extract + ResultRow + SorterNext.  DiagWindow `window
+            outer order` PASSes.  Outer-ORDER-BY-by-alias
+            (`AS rn ... ORDER BY rn`) is a *separate* resolve-side
+            gap — "no such column" at prepare time; still open.
+       [X] Subset-gate lift: outer DISTINCT (`SELECT DISTINCT
+            ... OVER ...`).  Dedup ephemeral opened before
+            WhereBegin; per-row OP_Found + IdxInsert in gosub
+            body before the ResultRow / SorterInsert.  DiagWindow
+            `window outer distinct` PASSes.
 
   [ ] **6.27** codegen.pas schema-mutation + statistics.
        Sub-rows that overlapped Phase 7 have been moved out

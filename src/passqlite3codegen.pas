@@ -22557,6 +22557,20 @@ var
   regGosubW:    i32;
   pSubSel:      PSelect;
   selFlagsSavedW: u32;
+  { Window outer-ORDER-BY subset gate (6.26) — sorter open + push +
+    sort tail.  Mirrors the pushOntoSorter / generateSortTail slice in
+    the regular SELECT path. }
+  bSortW:        i32;
+  iSorterCsrW:   i32;
+  sortNKeyW:     i32;
+  sortKeyInfoW:  PKeyInfo2;
+  regSortBaseW:  i32;
+  regSortRecW:   i32;
+  regSortOutW:   i32;
+  iSortTabW:     i32;
+  addrSortBrkW:  i32;
+  addrSortLoopW: i32;
+  addrSortContW: i32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -23133,8 +23147,14 @@ begin
     { Subset gates — extend in later 6.26 sub-phases. }
     if pDest^.eDest <> SRT_Output then
     begin Result := SQLITE_OK; Exit; end;
-    if (p^.pOrderBy <> nil)
-       or ((p^.selFlags and SF_Distinct) <> 0) then
+    { Outer ORDER BY combined with LIMIT not yet supported.  DISTINCT
+      combined with ORDER BY needs OMITREF/sorter-key dedup that the
+      simple inline arm here does not implement. }
+    bSortW := 0;
+    if p^.pOrderBy <> nil then bSortW := 1;
+    if (bSortW <> 0) and (p^.pLimit <> nil) then
+    begin Result := SQLITE_OK; Exit; end;
+    if (bSortW <> 0) and ((p^.selFlags and SF_Distinct) <> 0) then
     begin Result := SQLITE_OK; Exit; end;
 
     v := sqlite3GetVdbe(pParse);
@@ -23189,6 +23209,34 @@ begin
 
     sqlite3WindowCodeInit(pParse, p);
 
+    { Outer ORDER BY sorter open — must come before WhereBegin so the
+      SorterOpen lands outside the scan loop.  KeyInfo built from
+      p^.pOrderBy. }
+    iSorterCsrW := -1; sortNKeyW := 0;
+    if bSortW <> 0 then
+    begin
+      iSorterCsrW := pParse^.nTab; Inc(pParse^.nTab);
+      sortNKeyW := p^.pOrderBy^.nExpr;
+      sortKeyInfoW := sqlite3KeyInfoFromExprList(pParse, p^.pOrderBy, 0,
+                                                 nResultCol);
+      sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorterCsrW,
+                        sortNKeyW + 1 + nResultCol, 0,
+                        PAnsiChar(sortKeyInfoW), P4_KEYINFO);
+    end;
+
+    { Outer DISTINCT — open dedup ephemeral cursor.  Same shape as the
+      regular SELECT path (codegen.pas:24110); per-row dedup check goes
+      in the gosub body before OP_ResultRow. }
+    iTabTnct := -1;
+    if (p^.selFlags and SF_Distinct) <> 0 then
+    begin
+      iTabTnct := pParse^.nTab; Inc(pParse^.nTab);
+      pDistKey := sqlite3KeyInfoFromExprList(pParse, pEList, 0, 0);
+      sqlite3VdbeAddOp4(v, OP_OpenEphemeral, iTabTnct, 0, 0,
+                        PAnsiChar(pDistKey), P4_KEYINFO);
+      sqlite3VdbeChangeP5(v, BTREE_UNORDERED);
+    end;
+
     addrGosubW := sqlite3VdbeMakeLabel(pParse);
     iContW     := sqlite3VdbeMakeLabel(pParse);
     iBreakW    := sqlite3VdbeMakeLabel(pParse);
@@ -23197,8 +23245,10 @@ begin
     { LIMIT/OFFSET — allocate counters BEFORE WhereBegin so the OP_Integer
       init lands outside the scan loop.  Inner-loop subroutine below applies
       codeOffset + OP_DecrJumpZero around the OP_ResultRow.  Mirrors select.c
-      flow for window queries with LIMIT. }
-    computeLimitRegisters(pParse, p, iBreakW);
+      flow for window queries with LIMIT.  Bypassed when bSortW=1 (LIMIT is
+      gated off above; OFFSET applies post-sort in the sort tail). }
+    if bSortW = 0 then
+      computeLimitRegisters(pParse, p, iBreakW);
 
     pWInfo := sqlite3WhereBegin(pParse, pTabList, p^.pWhere, nil,
                                 pEList, p, 0, 0);
@@ -23220,19 +23270,91 @@ begin
       if r1 <> pDest^.iSdst + i then
         sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
     end;
-    { OFFSET skip — jump to iContW (which OP_Returns to Step) without emitting
-      ResultRow.  Mirrors select.c codeOffset placement. }
-    if p^.iOffset <> 0 then
-      codeOffset(v, p^.iOffset, iContW);
-    sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
-    { LIMIT — decrement counter, jump to iBreakW when it hits zero.  iBreakW
-      is *outside* the Gosub subroutine, so the Step coroutine never resumes. }
-    if p^.iLimit <> 0 then
-      sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreakW);
+
+    { DISTINCT dedup — gate ResultRow on per-row OP_Found.  Mirrors
+      codegen.pas:24355.  iContinue analogue here is iContW (Returns). }
+    if iTabTnct >= 0 then
+    begin
+      rDistTmp := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp4Int(v, OP_Found, iTabTnct, iContW,
+                           pDest^.iSdst, nResultCol);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol,
+                        rDistTmp);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iTabTnct, rDistTmp,
+                           pDest^.iSdst, nResultCol);
+      sqlite3ReleaseTempReg(pParse, rDistTmp);
+    end;
+
+    if bSortW <> 0 then
+    begin
+      { pushOntoSorter — encode (orderby keys ++ result cols) into the
+        sorter row.  Keys built via ExprCodeTarget against pOrderBy;
+        data block SCopy'd from the result-row slot just populated above. }
+      regSortBaseW := pParse^.nMem + 1;
+      Inc(pParse^.nMem, sortNKeyW + nResultCol);
+      for jj := 0 to sortNKeyW - 1 do
+      begin
+        r1 := sqlite3ExprCodeTarget(pParse,
+                ExprListItems(p^.pOrderBy)[jj].pExpr,
+                regSortBaseW + jj);
+        if r1 <> regSortBaseW + jj then
+          sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBaseW + jj);
+      end;
+      for jj := 0 to nResultCol - 1 do
+        sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
+                          regSortBaseW + sortNKeyW + jj);
+      Inc(pParse^.nMem); regSortRecW := pParse^.nMem;
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBaseW,
+                        sortNKeyW + nResultCol, regSortRecW);
+      sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsrW, regSortRecW,
+                           regSortBaseW, nResultCol);
+    end
+    else
+    begin
+      { OFFSET skip — jump to iContW (which OP_Returns to Step) without emitting
+        ResultRow.  Mirrors select.c codeOffset placement. }
+      if p^.iOffset <> 0 then
+        codeOffset(v, p^.iOffset, iContW);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+      { LIMIT — decrement counter, jump to iBreakW when it hits zero.  iBreakW
+        is *outside* the Gosub subroutine, so the Step coroutine never resumes. }
+      if p^.iLimit <> 0 then
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreakW);
+    end;
 
     sqlite3VdbeResolveLabel(v, iContW);
     sqlite3VdbeAddOp1(v, OP_Return, regGosubW);
     sqlite3VdbeResolveLabel(v, iBreakW);
+
+    if bSortW <> 0 then
+    begin
+      { generateSortTail — drain the sorter, emit ResultRow per row.
+        OFFSET applies post-sort via OP_IfPos; LIMIT not supported here
+        (gated off above). }
+      Inc(pParse^.nMem); regSortOutW := pParse^.nMem;
+      iSortTabW := pParse^.nTab; Inc(pParse^.nTab);
+      addrSortBrkW := sqlite3VdbeMakeLabel(pParse);
+      sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortTabW, regSortOutW,
+                        sortNKeyW + 1 + nResultCol);
+      sqlite3VdbeAddOp2(v, OP_SorterSort, iSorterCsrW, addrSortBrkW);
+      addrSortLoopW := sqlite3VdbeCurrentAddr(v);
+      sqlite3VdbeAddOp3(v, OP_SorterData, iSorterCsrW, regSortOutW, iSortTabW);
+      addrSortContW := 0;
+      if p^.iOffset > 0 then
+      begin
+        addrSortContW := sqlite3VdbeMakeLabel(pParse);
+        sqlite3VdbeAddOp3(v, OP_IfPos, p^.iOffset, addrSortContW, 1);
+      end;
+      for i := 0 to nResultCol - 1 do
+        sqlite3VdbeAddOp3(v, OP_Column, iSortTabW,
+                          sortNKeyW + i, pDest^.iSdst + i);
+      sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+      if addrSortContW <> 0 then
+        sqlite3VdbeResolveLabel(v, addrSortContW);
+      sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterCsrW, addrSortLoopW);
+      sqlite3VdbeResolveLabel(v, addrSortBrkW);
+    end;
+
     Result := SQLITE_OK; Exit;
   end;
 
