@@ -42190,21 +42190,47 @@ begin
   Result := SQLITE_ERROR;
 end;
 
+type
+  TCollNeededProc = procedure(pCtx: Pointer; db: PTsqlite3;
+    eTextRep: i32; zName: PAnsiChar); cdecl;
+
+procedure callCollNeeded(db: PTsqlite3; enc: u8; zName: PAnsiChar);
+var
+  zExternal: PAnsiChar;
+  cb: TCollNeededProc;
+begin
+  if db^.xCollNeeded <> nil then begin
+    zExternal := sqlite3DbStrDup(db, zName);
+    if zExternal = nil then Exit;
+    cb := TCollNeededProc(db^.xCollNeeded);
+    cb(db^.pCollNeededArg, db, enc, zExternal);
+    sqlite3DbFree(db, zExternal);
+  end;
+  { xCollNeeded16 path omitted: SQLITE_OMIT_UTF16-equivalent in Pas port. }
+end;
+
 function sqlite3GetCollSeq(pParse: PParse; enc: u8;
   pColl: Pointer; zName: PAnsiChar): Pointer;
 var
   db:  PTsqlite3;
   p:   PTCollSeq;
+  zErr: AnsiString;
 begin
   db := pParse^.db;
   p := PTCollSeq(pColl);
   if p = nil then
-    p := PTCollSeq(sqlite3FindCollSeq(db, enc, zName, 1));
+    p := PTCollSeq(sqlite3FindCollSeq(db, enc, zName, 0));
+  if (p = nil) or (p^.xCmp = nil) then begin
+    callCollNeeded(db, enc, zName);
+    p := PTCollSeq(sqlite3FindCollSeq(db, enc, zName, 0));
+  end;
   if (p <> nil) and (p^.xCmp = nil) and
      (synthCollSeq(db, p) <> SQLITE_OK) then begin
-    sqlite3ErrorMsg(pParse,
-      'no such collation sequence');
     p := nil;
+  end;
+  if p = nil then begin
+    zErr := 'no such collation sequence: ' + AnsiString(zName);
+    sqlite3ErrorMsg(pParse, PAnsiChar(zErr));
   end;
   Result := p;
 end;

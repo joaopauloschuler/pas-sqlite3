@@ -1316,11 +1316,9 @@ existing dispatcher.
        readblob/writeblob round-trip works on a zeroblob(10) target;
        remember(99,0) returns 99 and silently no-ops the write when the
        pointer arg is not a valid carray pointer.  TestExplainParity
-       1026/1026.  Note: anycollseq registers correctly but the engine-
-       side callback dispatch (synthesizeCollation in C, callbacks.c)
-       is not yet wired in pas-sqlite3 — `xCollNeeded` is stored on the
-       db but never invoked when an unknown collation is encountered;
-       logged as new bug **8.x.colneed**.
+       1026/1026.  Engine-side callback dispatch closed 2026-05-06
+       under bug 8.x.colneed — anycollseq's xCollNeeded now fires when
+       an unknown collation is encountered.
 
   [X] **10.1.68** Three more small ext/misc helpers ported as new
        units (~464 C lines total): noop.c (90 lines) →
@@ -1350,12 +1348,23 @@ existing dispatcher.
        never see the deliberate u32 wrap.  TestExplainParity 1026/1026;
        DiagFunctions / DiagOps / DiagFeatureProbe clean.
 
-- [ ] **8.x.colneed** sqlite3_collation_needed callback never fires.
-  The pas-sqlite3 port stores `db^.xCollNeeded` / `db^.pCollNeededArg`
-  but no call site walks the lookup-failure path that C invokes via
-  `synthesizeCollation` (see callbacks.c:160..; called from
-  `sqlite3LocateCollSeq`).  Surfaces as anycollseq.c port being a
-  no-op even though `sqlite3AnycollseqInit` returns SQLITE_OK.
+- [X] **8.x.colneed** sqlite3_collation_needed callback now fires.
+  Closed 2026-05-06.  `sqlite3GetCollSeq` (codegen.pas:42193) was
+  missing the `callCollNeeded(db, enc, zName)` step from callback.c:222
+  — the C reference invokes the registered factory between the initial
+  `sqlite3FindCollSeq` lookup and the `synthCollSeq` cross-encoding
+  fallback.  Added a `callCollNeeded` helper that dups the name into
+  db memory and invokes `db^.xCollNeeded` via a cdecl trampoline
+  (UTF-16 callback path omitted — matches SQLITE_OMIT_UTF16 stance of
+  the rest of the port).  Restructured `sqlite3GetCollSeq` to mirror
+  callback.c:205..234 step by step: lookup → if missing call factory
+  → re-lookup → synthCollSeq fallback → error.  Verified: with
+  anycollseq registered (auto-loaded by shell openDb),
+  `SELECT … ORDER BY x COLLATE WHATEVER` now sorts via the synthesised
+  BINARY-equivalent collation; without anycollseq the canonical
+  `no such collation sequence: NAME` error fires.  TestExplainParity
+  1026/1026; DiagPubApi 259/259; DiagFeatureProbe / DiagDml / DiagOps /
+  DiagPragma / DiagFunctions / DiagTxn / DiagMisc all clean.
 
   [X] **10.1.65** ext/misc/totype.c port (528 C lines) — new unit
        `passqlite3totype.pas` provides tointeger(X) / toreal(X) lossless
