@@ -60,6 +60,7 @@ uses
   passqlite3vtab,
   passqlite3dbpage,
   passqlite3backup,
+  passqlite3shathree,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -512,6 +513,8 @@ begin
     auto-registers this on the connection; the Pascal port leaves it
     optional, so we hook it here. }
   sqlite3DbpageRegister(p^.db);
+  { 10.1.52 — sha3 / sha3_agg / sha3_query SQL functions backing .sha3sum. }
+  sqlite3ShathreeInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
@@ -3863,6 +3866,118 @@ begin
   sqlite3_finalize(pStmt);
 end;
 
+{ ----------------------------------------------------------------------
+  10.1.52 — `.sha3sum ?OPTIONS? ?LIKE-PATTERN?` (shell.c.in:11064..11240)
+
+  Compose a `WITH [sha3sum$query](a,b) AS(VALUES(...))` CTE that pairs
+  per-table read SQL with table label, then runs the upstream
+  `sha3_query()` aggregator over it.  --schema includes sqlite_schema in
+  the digest.  The reversible-text-check tail (shathree.c:11177..11237)
+  is omitted in this initial cut — it adds a quality breadcrumb but is
+  not part of the digest itself.
+  ---------------------------------------------------------------------- }
+procedure cmdSha3sum(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt);
+var
+  zLike: AnsiString;
+  bSchema, bSeparate, bDebug: i32;
+  iSize: i32;
+  i, rc: i32;
+  pStmt: PVdbe;
+  zArg, zSrcSql, zSql, sQuery, sSql, zSep, zTab: AnsiString;
+  zPzTail: PAnsiChar;
+begin
+  if p^.db = nil then openDb(p, 0);
+  zLike := '';
+  bSchema := 0;
+  bSeparate := 0;
+  bDebug := 0;
+  iSize := 224;
+  i := 0;
+  while i < nArg do begin
+    zArg := args[i];
+    if (Length(zArg) > 0) and (zArg[1] = '-') then begin
+      Delete(zArg, 1, 1);
+      if (Length(zArg) > 0) and (zArg[1] = '-') then Delete(zArg, 1, 1);
+      if zArg = 'schema' then bSchema := 1
+      else if (zArg = 'sha3-224') or (zArg = 'sha3-256')
+           or (zArg = 'sha3-384') or (zArg = 'sha3-512') then
+        iSize := StrToInt(Copy(zArg, 6, 3))
+      else if zArg = 'debug' then bDebug := 1
+      else begin
+        shellEPutZ(Format('Unknown option "%s" on ".sha3sum"'#10, [args[i]]));
+        Exit;
+      end;
+    end
+    else if zLike <> '' then begin
+      shellEPutZ('Usage: .sha3sum ?OPTIONS? ?LIKE-PATTERN?'#10);
+      Exit;
+    end
+    else begin
+      zLike := zArg;
+      bSeparate := 1;
+      if sqlite3_strlike('sqlite\_%', PAnsiChar(zLike), Ord('\')) = 0 then
+        bSchema := 1;
+    end;
+    Inc(i);
+  end;
+  if bSchema <> 0 then
+    zSrcSql :=
+      'SELECT lower(name) as tname FROM sqlite_schema'
+      + ' WHERE type=''table'' AND coalesce(rootpage,0)>1'
+      + ' UNION ALL SELECT ''sqlite_schema'''
+      + ' ORDER BY 1 collate nocase'
+  else
+    zSrcSql :=
+      'SELECT lower(name) as tname FROM sqlite_schema'
+      + ' WHERE type=''table'' AND coalesce(rootpage,0)>1'
+      + ' AND name NOT LIKE ''sqlite\_%'' ESCAPE ''\'''
+      + ' ORDER BY 1 collate nocase';
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zSrcSql), -1, @pStmt, @zPzTail);
+  if rc <> SQLITE_OK then begin
+    shellEPutZ(Format('Parse error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+    Exit;
+  end;
+  sSql := 'WITH [sha3sum$query](a,b) AS(';
+  zSep := 'VALUES(';
+  while sqlite3_step(pStmt) = SQLITE_ROW do begin
+    zTab := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 0)));
+    if zTab = '' then Continue;
+    if (zLike <> '')
+       and (sqlite3_strlike(PAnsiChar(zLike), PAnsiChar(zTab), 0) <> 0) then
+      Continue;
+    if Copy(zTab, 1, 7) <> 'sqlite_' then
+      sQuery := 'SELECT * FROM "' + zTab + '" NOT INDEXED;'
+    else if zTab = 'sqlite_schema' then
+      sQuery := 'SELECT type,name,tbl_name,sql FROM sqlite_schema ORDER BY name;'
+    else if zTab = 'sqlite_sequence' then
+      sQuery := 'SELECT name,seq FROM sqlite_sequence ORDER BY name;'
+    else if zTab = 'sqlite_stat1' then
+      sQuery := 'SELECT tbl,idx,stat FROM sqlite_stat1 ORDER BY tbl,idx;'
+    else if zTab = 'sqlite_stat4' then
+      sQuery := 'SELECT * FROM ' + zTab + ' ORDER BY tbl, idx, rowid;'#10
+    else
+      Continue;
+    sSql := sSql + zSep + '''' + StringReplace(sQuery, '''', '''''', [rfReplaceAll]) + '''';
+    sSql := sSql + ',' + '''' + StringReplace(zTab, '''', '''''', [rfReplaceAll]) + '''';
+    zSep := '),(';
+  end;
+  sqlite3_finalize(pStmt);
+  if bSeparate <> 0 then
+    zSql := sSql + '))' +
+      ' SELECT lower(hex(sha3_query(a,' + IntToStr(iSize) + '))) AS hash, b AS label' +
+      '   FROM [sha3sum$query]'
+  else
+    zSql := sSql + '))' +
+      ' SELECT lower(hex(sha3_query(group_concat(a,''''),' + IntToStr(iSize) + '))) AS hash' +
+      '   FROM [sha3sum$query]';
+  if bDebug <> 0 then
+    WriteLn(zSql)
+  else
+    runOneSqlLine(p, zSql, '.sha3sum', 0);
+end;
+
 procedure cmdDump(p: PShellState; const args: array of AnsiString;
                   nArg: SizeInt);
 var
@@ -5633,6 +5748,7 @@ begin
   end;
   if zCmd = 'dbtotxt' then begin cmdDbtotxt(p); Exit; end;
   if zCmd = 'dump' then begin cmdDump(p, args, nArg); Exit; end;
+  if zCmd = 'sha3sum' then begin cmdSha3sum(p, args, nArg); Exit; end;
   if zCmd = 'print' then begin
     for i := 0 to nArg - 1 do begin
       if i > 0 then Write(' ');

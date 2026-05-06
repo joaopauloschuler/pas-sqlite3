@@ -253,6 +253,21 @@ FPC porting traps that recur often enough to call out up-front:
     to the iSdst allocation block, mirroring C exactly.  `.tables` /
     `.schema --nosys` LIKE filters now work without the GLOB workaround.
 
+- [ ] **6.14** Compound `SELECT … FROM sqlite_schema … UNION ALL
+    SELECT 'sqlite_schema' ORDER BY 1 collate nocase` returns zero rows
+    on the Pascal side (system `sqlite3` returns 2 rows: 't' +
+    'sqlite_schema' for a one-table DB).  Surfaces under
+    `.sha3sum --schema` (digest differs from C oracle because the
+    table-list CTE feeding sha3_query is empty, so `sha3_query` is
+    called with the empty string).  The non-`--schema` form of the
+    same query (without UNION ALL of the literal) works.  Suggests
+    the codegen path for `<aggregate query> UNION ALL <one-row constant
+    SELECT> ORDER BY <collation>` mishandles either the constant-row
+    arm or the COLLATE-aware sort.  Repro:
+      `SELECT name FROM sqlite_schema WHERE type='table' UNION ALL
+       SELECT 'lit' ORDER BY 1 COLLATE NOCASE;`
+    Pas returns no rows; C returns the table names plus 'lit'.
+
 - [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
     valued PRAGMA functions) returns rows when called with a literal
     argument but yields no rows when joined laterally against
@@ -1118,9 +1133,35 @@ existing dispatcher.
        prefix-match w/ ambiguity reporting, and the per-opcode
        isOk={0,1,2} formatting (Usage / %lld / no-result) all wired
        through sqlite3_file_control() (passqlite3main.pas:3934).
-  [ ] **10.1.52** `.sha3sum` — runs the SHA3 hash extension over
-       schema + data.  Bundles a Pascal SHA3 implementation or links
-       the existing extension.
+  [X] **10.1.52** `.sha3sum` — landed 2026-05-06.  New unit
+       `passqlite3shathree.pas` ports `../sqlite3/ext/misc/shathree.c`
+       (854 lines of C → ~570 lines of Pascal): KeccakF1600Step (the
+       4-rounds-per-iteration unrolled permutation), SHA3Init/Update/
+       Final, plus the three SQL functions sha3 / sha3_agg / sha3_query
+       and the `sha3UpdateFromValue` value-encoder.  Wired via
+       `sqlite3ShathreeInit(p^.db)` in shell `openDb`.  cmdSha3sum
+       composes the upstream `WITH [sha3sum$query](a,b) AS(VALUES(...))`
+       CTE and runs `lower(hex(sha3_query(...)))` over it; honours
+       --schema, --sha3-{224,256,384,512}, --debug, and a LIKE
+       pattern.  Critical fix during port: TSHA3State must allocate
+       1600 bytes (matching the C `union { u64 s[25]; unsigned char
+       x[1600]; }`) — not 200 bytes — because SHA3Final stores the
+       squeezed digest at u.x[nRate..2*nRate-1], spilling past the
+       Keccak lane footprint for sha3-224/256.  Verification:
+       sha3('abc'), sha3 with 224/384/512 sizes, sha3 over BLOB,
+       sha3(NULL) IS NULL, sha3('1')=sha3(1), sha3_query, and the
+       documented sha3_agg cross-checks all byte-identical to the C
+       extension.  `.sha3sum` and `.sha3sum --sha3-256` digests over
+       a fresh table match the system `sqlite3` output.  The
+       `.sha3sum --schema` variant returns a different (non-zero)
+       digest because the inner table-list query
+       `SELECT … FROM sqlite_schema … UNION ALL SELECT 'sqlite_schema'`
+       returns no rows in the Pascal port — a separate codegen gap
+       tracked under the new bug 6.14 below.  Reversible-text-check
+       tail (shell.c.in:11177..11237) is omitted in this initial cut;
+       it adds a quality breadcrumb but is not part of the digest.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagDml /
+       DiagOps all clean.
   [X] **10.1.53** `.crnl` — cmdCrnl on Linux always clears MFLG_CRLF
        and echoes `crlf is OFF`; matches upstream's non-Windows arm.
   [X] **10.1.54** `.binary` — cmdBinary emits the upstream
