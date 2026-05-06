@@ -220,6 +220,59 @@ begin
   Probe('max agg',           Seed2, 'SELECT max(val) FROM g');
   Probe('total agg',         Seed2, 'SELECT total(val) FROM g');
 
+  // --- Built-in window functions not yet exercised ---
+  Probe('percent_rank',      Seed1,
+    'SELECT a, percent_rank() OVER (ORDER BY a) FROM t');
+  Probe('cume_dist',         Seed1,
+    'SELECT a, cume_dist() OVER (ORDER BY a) FROM t');
+  Probe('last_value',        Seed1,
+    'SELECT a, last_value(b) OVER (ORDER BY a) FROM t');
+  Probe('nth_value 2',       Seed1,
+    'SELECT a, nth_value(b,2) OVER (ORDER BY a) FROM t');
+
+  // --- Multi-window: several distinct OVER clauses in one SELECT ---
+  Probe('multi window',      Seed2,
+    'SELECT grp, val,' +
+    ' row_number() OVER (PARTITION BY grp ORDER BY val),' +
+    ' sum(val) OVER (PARTITION BY grp),' +
+    ' rank() OVER (ORDER BY val) FROM g');
+  Probe('multi window same partition', Seed2,
+    'SELECT grp,' +
+    ' sum(val) OVER (PARTITION BY grp ORDER BY val),' +
+    ' avg(val) OVER (PARTITION BY grp ORDER BY val) FROM g');
+
+  // --- Frame-spec emission: ROWS/RANGE/GROUPS with bounds ---
+  Probe('rows preceding',    Seed1,
+    'SELECT a, sum(b) OVER (ORDER BY a ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t');
+  Probe('rows following',    Seed1,
+    'SELECT a, sum(b) OVER (ORDER BY a ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t');
+  Probe('rows unbounded',    Seed1,
+    'SELECT a, sum(b) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t');
+  Probe('range current',     Seed1,
+    'SELECT a, sum(b) OVER (ORDER BY a RANGE BETWEEN CURRENT ROW AND CURRENT ROW) FROM t');
+  Probe('range preceding',   Seed1,
+    'SELECT a, sum(b) OVER (ORDER BY a RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t');
+  Probe('groups',            Seed2,
+    'SELECT grp, val, sum(val) OVER (ORDER BY val GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM g');
+  Probe('exclude current',   Seed1,
+    'SELECT a, sum(b) OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE CURRENT ROW) FROM t');
+  Probe('exclude group',     Seed2,
+    'SELECT grp, val, sum(val) OVER (PARTITION BY grp ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM g');
+  Probe('exclude ties',      Seed2,
+    'SELECT grp, val, sum(val) OVER (PARTITION BY grp ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING EXCLUDE TIES) FROM g');
+
+  // --- Subset-gate lifts: outer ORDER BY / LIMIT / DISTINCT with windows ---
+  Probe('window outer order alias', Seed2,
+    'SELECT grp, row_number() OVER (PARTITION BY grp ORDER BY val) AS rn FROM g ORDER BY grp DESC, rn');
+  Probe('window outer order',  Seed2,
+    'SELECT grp, row_number() OVER (PARTITION BY grp ORDER BY val) FROM g ORDER BY grp DESC, val');
+  Probe('window outer limit', Seed1,
+    'SELECT a, row_number() OVER (ORDER BY a) FROM t LIMIT 2');
+  Probe('window outer offset',Seed1,
+    'SELECT a, row_number() OVER (ORDER BY a) FROM t LIMIT 2 OFFSET 1');
+  Probe('window outer distinct', Seed2,
+    'SELECT DISTINCT sum(val) OVER (PARTITION BY grp) FROM g');
+
   WriteLn('Total divergences: ', diverged);
   if diverged = 0 then Halt(0) else Halt(1);
 end.

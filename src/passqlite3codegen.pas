@@ -23133,7 +23133,7 @@ begin
     { Subset gates — extend in later 6.26 sub-phases. }
     if pDest^.eDest <> SRT_Output then
     begin Result := SQLITE_OK; Exit; end;
-    if (p^.pOrderBy <> nil) or (p^.pLimit <> nil)
+    if (p^.pOrderBy <> nil)
        or ((p^.selFlags and SF_Distinct) <> 0) then
     begin Result := SQLITE_OK; Exit; end;
 
@@ -23189,14 +23189,20 @@ begin
 
     sqlite3WindowCodeInit(pParse, p);
 
-    pWInfo := sqlite3WhereBegin(pParse, pTabList, p^.pWhere, nil,
-                                pEList, p, 0, 0);
-    if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
-
     addrGosubW := sqlite3VdbeMakeLabel(pParse);
     iContW     := sqlite3VdbeMakeLabel(pParse);
     iBreakW    := sqlite3VdbeMakeLabel(pParse);
     Inc(pParse^.nMem); regGosubW := pParse^.nMem;
+
+    { LIMIT/OFFSET — allocate counters BEFORE WhereBegin so the OP_Integer
+      init lands outside the scan loop.  Inner-loop subroutine below applies
+      codeOffset + OP_DecrJumpZero around the OP_ResultRow.  Mirrors select.c
+      flow for window queries with LIMIT. }
+    computeLimitRegisters(pParse, p, iBreakW);
+
+    pWInfo := sqlite3WhereBegin(pParse, pTabList, p^.pWhere, nil,
+                                pEList, p, 0, 0);
+    if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
 
     sqlite3WindowCodeStep(pParse, p, pWInfo, regGosubW, addrGosubW);
 
@@ -23214,7 +23220,15 @@ begin
       if r1 <> pDest^.iSdst + i then
         sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
     end;
+    { OFFSET skip — jump to iContW (which OP_Returns to Step) without emitting
+      ResultRow.  Mirrors select.c codeOffset placement. }
+    if p^.iOffset <> 0 then
+      codeOffset(v, p^.iOffset, iContW);
     sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+    { LIMIT — decrement counter, jump to iBreakW when it hits zero.  iBreakW
+      is *outside* the Gosub subroutine, so the Step coroutine never resumes. }
+    if p^.iLimit <> 0 then
+      sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreakW);
 
     sqlite3VdbeResolveLabel(v, iContW);
     sqlite3VdbeAddOp1(v, OP_Return, regGosubW);
@@ -42846,6 +42860,19 @@ begin
   else sqlite3_result_int64(pCtx, pCount^);
 end;
 
+{ countInverse — port of func.c:1196.  Window xInverse for COUNT(*) /
+  COUNT(x): decrement the running count when a row leaves the frame. }
+procedure countInverse(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  pCount: Pi64;
+begin
+  pCount := Pi64(sqlite3_aggregate_context(pCtx, SizeOf(i64)));
+  if pCount = nil then Exit;
+  if (argc = 0) or
+     (sqlite3_value_type(Psqlite3_value(argv^)) <> SQLITE_NULL) then
+    Dec(pCount^);
+end;
+
 { Aggregate accumulator type — port of func.c:1846 SumCtx.  Shared by
   sum() / total() / avg() (all wired to sumStep).  Tracks running double
   sum (rSum + rErr Kahan-Babushka-Neumaier compensation), running integer
@@ -42956,6 +42983,27 @@ begin
         sqlite3_value_double(Psqlite3_value(argv^)));
     end;
   end;
+end;
+
+{ sumInverse — port of func.c:1972.  Window xInverse for sum/total/avg:
+  reverses the effect of one prior sumStep.  Decrements cnt and subtracts
+  the value from the running sum (Kahan-compensated when approx). }
+procedure sumInverse(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  p:  PSumAcc;
+  vt: i32;
+begin
+  Assert(argc = 1);
+  p := PSumAcc(sqlite3_aggregate_context(pCtx, SizeOf(TSumAcc)));
+  vt := sqlite3_value_numeric_type(Psqlite3_value(argv^));
+  if (p = nil) or (vt = SQLITE_NULL) then Exit;
+  Assert(p^.cnt > 0);
+  Dec(p^.cnt);
+  if (vt <> SQLITE_INTEGER) or (p^.approx <> 0) then
+    kahanBabuskaNeumaierStep(p,
+      -sqlite3_value_double(Psqlite3_value(argv^)))
+  else
+    p^.iSum := p^.iSum - sqlite3_value_int64(Psqlite3_value(argv^));
 end;
 
 { sumFinal — port of func.c:1989 sumFinalize.  Empty input → NULL.
@@ -43889,7 +43937,8 @@ var
 
 procedure InitBuiltinAgg;
 procedure MakeAgg(var fd: TFuncDef; n: i16; flgs: u32;
-  step: TxSFuncProc; final_: TxFinalProc; nm: PAnsiChar); inline;
+  step: TxSFuncProc; final_: TxFinalProc; nm: PAnsiChar;
+  inv: TxSFuncProc = nil); inline;
 begin
   FillChar(fd, SizeOf(fd), 0);
   fd.nArg      := n;
@@ -43900,14 +43949,19 @@ begin
     aggregates with xValue=xFinalize so `sum() OVER (...)` etc. work as
     whole-frame window functions.  Wire the same here. }
   fd.xValue    := final_;
+  { xInverse — invoked by OP_AggInverse to roll back one prior xStep when a
+    row leaves the window frame.  Required for ROWS / RANGE / GROUPS frames
+    with non-default bounds; without it AggInverse is a no-op and the running
+    aggregate becomes a cumulative-from-partition-start total. }
+  if inv <> nil then fd.xInverse := TxInverseProc(inv);
   fd.zName     := nm;
 end;
 begin
-  MakeAgg(aBuiltinAgg[0], 0, AGG_ENC or SQLITE_FUNC_COUNT, @countStep, @countFinal, 'count');
-  MakeAgg(aBuiltinAgg[1], 1, AGG_ENC or SQLITE_FUNC_COUNT, @countStep, @countFinal, 'count');
-  MakeAgg(aBuiltinAgg[2], 1, AGG_ENC, @sumStep,  @sumFinal,   'sum');
-  MakeAgg(aBuiltinAgg[3], 1, AGG_ENC, @sumStep,  @totalFinal, 'total');
-  MakeAgg(aBuiltinAgg[4], 1, AGG_ENC, @sumStep,  @avgFinal,   'avg');
+  MakeAgg(aBuiltinAgg[0], 0, AGG_ENC or SQLITE_FUNC_COUNT, @countStep, @countFinal, 'count', @countInverse);
+  MakeAgg(aBuiltinAgg[1], 1, AGG_ENC or SQLITE_FUNC_COUNT, @countStep, @countFinal, 'count', @countInverse);
+  MakeAgg(aBuiltinAgg[2], 1, AGG_ENC, @sumStep,  @sumFinal,   'sum',   @sumInverse);
+  MakeAgg(aBuiltinAgg[3], 1, AGG_ENC, @sumStep,  @totalFinal, 'total', @sumInverse);
+  MakeAgg(aBuiltinAgg[4], 1, AGG_ENC, @sumStep,  @avgFinal,   'avg',   @sumInverse);
   MakeAgg(aBuiltinAgg[5], 1, AGG_ENC or SQLITE_FUNC_MINMAX or SQLITE_FUNC_NEEDCOLL,
           @minStep, @minMaxFinal, 'min');
   MakeAgg(aBuiltinAgg[6], 1, AGG_ENC or SQLITE_FUNC_MINMAX or SQLITE_FUNC_NEEDCOLL,

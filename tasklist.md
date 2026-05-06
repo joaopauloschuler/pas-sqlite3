@@ -381,33 +381,66 @@ FPC porting traps that recur often enough to call out up-front:
             `BT_MEM_STRIDE = 56` and step `pRhs` by raw bytes
             (`pRhs := PBtMemView(PByte(pRhs) + BT_MEM_STRIDE)`).
             DiagWindow: 1 → 0 divergences.
-       [ ] Frame-spec emission: ROWS / RANGE / GROUPS, with all
+       [X] Frame-spec emission: ROWS / RANGE / GROUPS, with all
             five bound types (UNBOUNDED PRECEDING, n PRECEDING,
             CURRENT ROW, n FOLLOWING, UNBOUNDED FOLLOWING) and
-            EXCLUDE clauses (NO OTHERS / CURRENT ROW / GROUP / TIES).
-            Likely already covered by the windowCodeOp /
-            windowCodeRangeTest ports.  No remaining DiagWindow
-            row exercises non-default frames; lift gate via
-            additional Diag rows when porting next.
+            EXCLUDE clauses.  DiagWindow rows added 2026-05-06:
+            `rows preceding` / `rows following` / `rows unbounded` /
+            `range current` / `range preceding` / `groups` /
+            `exclude current` / `exclude group` / `exclude ties` —
+            all PASS.  Root-cause fix landed in `MakeAgg`
+            (codegen.pas:43922): `xInverse` was nil for
+            count/sum/total/avg, so OP_AggInverse was a silent
+            no-op (vdbe.pas:8927 short-circuits on
+            `Assigned(pFdAgg^.xInverse)`).  Without the inverse,
+            every non-default ROWS/RANGE/GROUPS frame degenerated
+            to a running-sum from partition start.  Added
+            `sumInverse` (port of func.c:1972) and `countInverse`
+            (port of func.c:1196), wired both into MakeAgg, and
+            extended the registration call to take an optional
+            inverse fn.  min/max/group_concat still nil-inverse
+            (fall back to windowFullScan rescan path; not needed
+            by current DiagWindow rows).
        [X] Built-in window-function dispatch table:
             `row_number` / `rank` / `dense_rank` / `ntile` / `lag` /
-            `lead` / `first_value` all PASS now.  `percent_rank` /
-            `cume_dist` / `last_value` / `nth_value` not exercised
-            by DiagWindow yet — already registered via
-            sqlite3WindowFunctions (codegen.pas:46598) at
-            connection-init, expected to work once added to the
-            test matrix.
+            `lead` / `first_value` PASS.  `percent_rank` /
+            `cume_dist` / `last_value` / `nth_value` confirmed PASS
+            via DiagWindow rows added 2026-05-06.
        [X] Aggregate-as-window arm (`sum(x) OVER (...)`,
             `avg(x) OVER (...)`, etc.) — whole-frame case PASSes
             via MakeAgg xValue wiring; running-sum + partition-sum
-            cases PASS via the bSort SRT_EphemTab extension.
+            cases PASS via the bSort SRT_EphemTab extension;
+            non-default frames PASS via xInverse wiring (above).
+       [X] Subset-gate lift: LIMIT / OFFSET in window arm.
+            Moved `computeLimitRegisters` to BEFORE
+            `sqlite3WhereBegin` so the OP_Integer init lands
+            outside the partition scan loop (otherwise the OP_Next
+            at end of partition jumped back to the init opcode
+            and the limit counter reset every iteration).  Added
+            `codeOffset` + OP_DecrJumpZero around OP_ResultRow in
+            the gosub body.  DiagWindow `window outer limit` /
+            `window outer offset` PASS.
        [ ] Multi-window arm (one SELECT with several distinct
-            OVER clauses sharing partitions).
-       [ ] Once the inner-EList blocker clears, lift the subset
-            gates in the window arm: SRT_Output→other dests,
-            then DISTINCT / ORDER BY / LIMIT (each is a separate
-            slice and probably maps onto reusing the existing
-            sorter / OFFSET machinery already in sqlite3Select).
+            OVER clauses sharing different partition/order).
+            DiagWindow `multi window` (3 windows: row_number
+            PARTITION grp + sum PARTITION grp + rank ORDER val)
+            returns empty result set.  Two-window same-partition
+            case (`multi window same partition`) PASSes — gap
+            opens once the windows have incompatible specs.  C
+            handles via per-window sub-select chaining
+            (window.c:1119+ the second-window-and-onward arm).
+       [ ] Subset-gate lift: outer ORDER BY (`SELECT ... OVER ...
+            FROM t ORDER BY ...`).  Window arm currently bails
+            with SQLITE_OK when `p^.pOrderBy <> nil`.  Needs
+            sorter open + push (ORDER BY keys + result data)
+            in the gosub body, drain via generateSortTail tail
+            after the step loop.  DiagWindow `window outer order`
+            currently empty.  Outer-ORDER-BY-by-alias (`AS rn ...
+            ORDER BY rn`) is a *separate* resolve-side gap —
+            "no such column" at prepare time.
+       [ ] Subset-gate lift: outer DISTINCT (`SELECT DISTINCT
+            ... OVER ...`).  Needs DISTINCT dedup ephemeral.
+            DiagWindow `window outer distinct` empty.
 
   [ ] **6.27** codegen.pas schema-mutation + statistics.
        Sub-rows that overlapped Phase 7 have been moved out
