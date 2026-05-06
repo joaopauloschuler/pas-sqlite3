@@ -238,6 +238,29 @@ FPC porting traps that recur often enough to call out up-front:
     `sqlite_dbpage` rows; revisit this when porting the rest of the
     PRAGMA dispatch table.
 
+- [ ] **6.12** `LIKE … ESCAPE 'x'` raises `Error: ESCAPE expression
+    must be a single character` once an outer `ORDER BY` is added to
+    the same SELECT (verified 2026-05-06: bare `SELECT name FROM
+    sqlite_schema WHERE name NOT LIKE 'sqlite\_%' ESCAPE '\\'` works,
+    adding `ORDER BY 1` or `ORDER BY name` triggers the error).  The
+    ESCAPE-arg validation in funcs.c:patternCompare is being re-run
+    against an unbound register after the sorter rewrites the
+    expression tree; trace OP_Function2 / OP_LikeOp during ORDER BY
+    materialisation.  Surfaces under `.tables` / `.schema --nosys`,
+    which currently work around it by switching to `NOT GLOB
+    'sqlite_*'`.
+
+- [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
+    valued PRAGMA functions) returns rows when called with a literal
+    argument but yields no rows when joined laterally against
+    `sqlite_schema AS s`.  `f.*` projection also collapses to one
+    column under the literal-argument path.  Surfaces under
+    `.lint fkey-indexes` (the upstream SELECT relies on the lateral
+    join, so the dispatcher emits no suggestions even though the
+    fkey_collate_clause UDF and the EXPLAIN-based coverage detection
+    are wired).  Probe pragmaVtab xBestIndex to confirm hidden-arg
+    binding and reopen the column-list emission path.
+
 - [X] **6.10** `TestExplainParity.pas` — **1026/1026 PASS** as of
     2026-05-06 (a3).  Oracle is built with `-DSQLITE_DEBUG
     -DSQLITE_ENABLE_EXPLAIN_COMMENTS`, so emits OP_Explain /
@@ -820,15 +843,27 @@ existing dispatcher.
   - [ ] `.lint fkey-indexes`, 
   - [ ] `.expert` (read-only subset).  
 
-  [~] **10.1.15** `.schema` arm landed (cmdSchema): pulls
-       `SELECT sql FROM sqlite_schema [WHERE name LIKE pat] ORDER BY
-       tbl_name, type DESC, name`.  `--indent` / `--nosys` flags
-       still pending; `.sqlite_schema` alias not yet wired.
-  [X] **10.1.16** `.tables` — cmdTables runs
-       `SELECT name FROM sqlite_schema WHERE type IN ('table','view')
-       AND name LIKE pat AND name NOT LIKE 'sqlite_%' ORDER BY 1`.
-       One name per line for now; upstream's 3-column auto-format
-       lands with 10.1.9 column-width work.
+  [~] **10.1.15** `.schema` cmdSchema now mirrors shell.c.in:10575..
+       10711.  Walks pragma_database_list, builds a UNION ALL across
+       every attached database's sqlite_schema (with snum / sname
+       columns), and emits the matching CREATE statements ordered by
+       schema number then rowid.  Wired flags: `--debug` (dumps the
+       composed SQL), `--nosys` (filters via `NOT GLOB 'sqlite_*'`
+       around Bug 6.12), the literal/glob-pattern split (with `.`
+       qualifying `sname.tbl_name`), and the
+       `sqlite_master`/`sqlite_schema` self-description block.
+       `--indent` accepted but currently a no-op — depends on the
+       shell_format_schema / shell_add_schema UDFs which are not yet
+       ported.
+  [X] **10.1.16** `.tables` — cmdTables now mirrors shell.c.in:11341..
+       11386: walks pragma_database_list, builds a UNION ALL across
+       every attached database's sqlite_schema (qualifying non-main
+       names as `<db>.<name>`), collects matches into an in-memory
+       array, then renders the upstream column-major layout with
+       width = max(len)+2 and nCol = 80/width.  System tables filtered
+       via `name NOT GLOB 'sqlite_*'` because the more faithful
+       `LIKE 'sqlite\_%' ESCAPE '\'` filter trips Bug 6.12 once
+       ORDER BY is added.
   [X] **10.1.17** `.indexes` — cmdIndexes runs
        `SELECT name FROM sqlite_schema WHERE type='index' [AND
        tbl_name=?] ORDER BY 1`.
@@ -838,11 +873,17 @@ existing dispatcher.
        (excluding sqlite_stat%) plus sqlite_stat1/sqlite_stat4 INSERTs
        (when those tables exist).  --indent reformatter still pending
        with .schema's --indent option.
-  [~] **10.1.20** `.lint fkey-indexes` — cmdLint runs a simplified FK
-       audit (CREATE INDEX suggestion per FK constraint, derived from
-       pragma_foreign_key_list).  The full upstream variant uses
-       fkey_collate_clause()+EXPLAIN-based coverage detection;
-       deferred until those helpers are ported.
+  [~] **10.1.20** `.lint fkey-indexes` cmdLint now mirrors
+       shell.c.in:5899..6126: shellFkeyCollateClause registered as the
+       `fkey_collate_clause(parent, parentCol, child, childCol)` UDF,
+       the upstream SELECT joins sqlite_schema with
+       pragma_foreign_key_list and pragma_table_info, and per-row
+       EXPLAIN QUERY PLAN drives sqlite3_strglob coverage detection
+       (with the IPK shortcut).  `-verbose` and `-groupbyparent` are
+       wired.  Currently emits no suggestions because of Bug 6.13
+       (lateral join of pragma_foreign_key_list against
+       sqlite_schema returns no rows in the Pascal port); will start
+       working once that lands.
   [X] **10.1.21** `.expert` — cmdExpert emits the upstream
        "this build does not support the .expert command" stub
        (sqlite3_expert.c not yet ported).
@@ -928,9 +969,15 @@ existing dispatcher.
        label/value table; statsOn=2 prints per-column metadata, =3 prints
        only the VM-step counter.  pStmt is now plumbed through
        runOneSqlLine so per-statement counters resolve.
-  [~] **10.1.29** `.timer on|off|once` setter landed (cmdTimer);
-       sets ShellState.enableTimer to 0/1/2.  Wall/user/sys clock
-       probe around stepAndRender still pending.
+  [X] **10.1.29** `.timer on|off|once` — cmdTimer setter + the full
+       shell.c.in:1404..1456 Unix arm: shellBeginTimer / shellEndTimer
+       / shellTimeOfDayUs / shellTvDiffSec mirror beginTimer /
+       endTimer / timeOfDay / timeDiff, snapshotting struct rusage
+       (declared locally because BaseUnix doesn't surface getrusage)
+       + gettimeofday before each prepared statement and printing
+       `Run Time: real %.6f user %.6f sys %.6f` after.  Wired into
+       runOneSqlLine around stepAndRender; `.timer once` decays back
+       to off after one statement.
   [X] **10.1.30** `.eqp off|on|trace|trigger|full` — cmdEqp updates
        mode.autoEQP / autoEQPtrace, toggles `PRAGMA vdbe_trace`.
   [X] **10.1.31** `.explain auto|on|off` — cmdExplain sets

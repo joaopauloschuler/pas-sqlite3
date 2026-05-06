@@ -1463,6 +1463,8 @@ end;
   renderer.  This is the minimum needed for the 10.2 integration parity
   gate to start evaluating SELECTs against a known canon.   }
 function displayStats(p: PShellState; bReset: i32): i32; forward;
+procedure shellBeginTimer(p: PShellState); forward;
+procedure shellEndTimer(p: PShellState); forward;
 
 function runOneSqlLine(p: PShellState; const zSql: AnsiString;
                        const zSrc: AnsiString; lineno: i64): i32;
@@ -1494,7 +1496,9 @@ begin
       Continue;
     end;
     p^.pStmt := pStmt;
+    shellBeginTimer(p);
     stepRc := stepAndRender(p, pStmt);
+    shellEndTimer(p);
     if p^.statsOn <> 0 then displayStats(p, 0);
     p^.pStmt := nil;
     rc := sqlite3_finalize(pStmt);
@@ -2431,19 +2435,121 @@ begin
               else p^.shellFlgs := p^.shellFlgs and not SHFLG_CountChanges;
 end;
 
-procedure cmdTables(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
-{ Mirror upstream `.tables` (shell.c.in ~10915): query sqlite_schema for
-  tables and views matching an optional LIKE pattern.  Upstream emits a
-  3-column-wide auto-formatted block; this initial cut emits one-name-
-  per-line, which is sufficient for the 10c gate to start running. }
-var sql, pattern: AnsiString;
+procedure cmdTables(p: PShellState; const args: array of AnsiString;
+                    nArg: SizeInt);
+{ Mirror upstream `.tables` (shell.c.in:11341..11386).  Walk the
+  sqlite3_database_list and union one SELECT per attached database, then
+  collect every name with an in-memory list and emit it in the upstream
+  3-column auto-formatted block (shell.c.in's MODE_Split rendering of
+  the result).  Names are quoted "<db>.<name>" for non-main databases. }
+const
+  kInitCap = 16;
+var
+  zPattern: AnsiString;
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc: i32;
+  zDbName: PAnsiChar;
+  sql: AnsiString;
+  names: array of AnsiString;
+  nNames, capNames: SizeInt;
+  zText: PAnsiChar;
+  i, j, nRow, nCol, colW, idx, padLen: SizeInt;
+  maxLen: SizeInt;
+  line: AnsiString;
 begin
-  if nArg >= 1 then pattern := args[0] else pattern := '%';
-  sql := 'SELECT name FROM sqlite_schema WHERE type IN (''table'',''view'')' +
-         ' AND name NOT LIKE ''sqlite_%'' AND name LIKE ''' +
-         StringReplace(pattern, '''', '''''', [rfReplaceAll]) +
-         ''' ORDER BY 1';
-  runStatementVerbose(p, sql);
+  zPattern := '';
+  if nArg >= 1 then zPattern := args[0];
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db,
+          'SELECT seq, name, file FROM pragma_database_list ORDER BY seq',
+          -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    shellEPutZ(AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
+    Exit;
+  end;
+
+  sql := '';
+  while sqlite3_step(pStmt) = SQLITE_ROW do begin
+    zDbName := PAnsiChar(sqlite3_column_text(pStmt, 1));
+    if zDbName = nil then Continue;
+    if Length(sql) > 0 then sql := sql + ' UNION ALL ';
+    if sqlite3_stricmp(zDbName, 'main') = 0 then
+      sql := sql + 'SELECT name FROM '
+    else
+      sql := sql + 'SELECT '''
+                 + StringReplace(AnsiString(zDbName), '''', '''''',
+                                 [rfReplaceAll])
+                 + '''||''.''||name FROM ';
+    sql := sql + '"' + StringReplace(AnsiString(zDbName), '"', '""',
+                                     [rfReplaceAll]) + '".sqlite_schema'
+               + ' WHERE type IN (''table'',''view'') AND name NOT GLOB'
+               + ' ''sqlite_*''';
+    if zPattern <> '' then
+      sql := sql + ' AND name LIKE '''
+                 + StringReplace(zPattern, '''', '''''', [rfReplaceAll])
+                 + '''';
+  end;
+  sqlite3_finalize(pStmt);
+  if Length(sql) = 0 then Exit;
+  sql := sql + ' ORDER BY 1';
+
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(sql), -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    shellEPutZ(AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
+    Exit;
+  end;
+  nNames   := 0;
+  capNames := kInitCap;
+  SetLength(names, capNames);
+  rc := sqlite3_step(pStmt);
+  while rc = SQLITE_ROW do begin
+    zText := PAnsiChar(sqlite3_column_text(pStmt, 0));
+    if zText = nil then Continue;
+    if nNames >= capNames then begin
+      capNames := capNames * 2;
+      SetLength(names, capNames);
+    end;
+    names[nNames] := AnsiString(zText);
+    Inc(nNames);
+    rc := sqlite3_step(pStmt);
+  end;
+  sqlite3_finalize(pStmt);
+
+  if nNames = 0 then Exit;
+  { Layout: column-major, max name width as cell width, 2-space gap after
+    each cell; mirrors shell.c.in:11342..11386 plus the print loop just
+    after that range. }
+  maxLen := 0;
+  for i := 0 to nNames - 1 do
+    if Length(names[i]) > maxLen then maxLen := Length(names[i]);
+  colW := maxLen + 2;
+  if colW < 4 then colW := 4;
+  nCol := 80 div colW;
+  if nCol < 1 then nCol := 1;
+  nRow := (nNames + nCol - 1) div nCol;
+  idx := 0;
+  for i := 0 to nRow - 1 do begin
+    line := '';
+    j := i;
+    while j < nNames do begin
+      if j > i then line := line + '  ';
+      padLen := maxLen - Length(names[j]);
+      if (j + nRow < nNames) and (padLen > 0) then
+        line := line + names[j] + StringOfChar(' ', padLen)
+      else
+        line := line + names[j];
+      Inc(j, nRow);
+    end;
+    WriteLn(line);
+    Inc(idx);
+  end;
 end;
 
 procedure cmdIndexes(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
@@ -2466,27 +2572,257 @@ begin
   runStatementVerbose(p, 'SELECT name, file FROM pragma_database_list ORDER BY seq');
 end;
 
-procedure cmdSchema(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
-{ shell.c.in ~10800..10860: dump CREATE statements from sqlite_schema.
-  Pattern-less form returns every row.  Newlines inside SQL are
-  preserved. }
-var sql, pat: AnsiString;
+procedure cmdSchema(p: PShellState; const args: array of AnsiString;
+                    nArg: SizeInt);
+{ shell.c.in:10575..10711.  Walk pragma_database_list, build a UNION ALL
+  across each attached database's sqlite_schema, render the matching
+  CREATE statements.  This Pascal cut covers --nosys, a literal LIKE/GLOB
+  pattern, and the sqlite_schema/sqlite_master self-description block.
+  --indent and --debug are deferred (they need shell_format_schema /
+  shell_add_schema UDFs which are not yet ported).  --debug emits the
+  composed SQL just like upstream so external diff harnesses can pick
+  up the new shape. }
+const
+  zSelfSchema =
+    'CREATE TABLE %ssqlite_schema (' + sLineBreak +
+    '  type text,' + sLineBreak +
+    '  name text,' + sLineBreak +
+    '  tbl_name text,' + sLineBreak +
+    '  rootpage integer,' + sLineBreak +
+    '  sql text' + sLineBreak +
+    ');' + sLineBreak;
+var
+  bDebug, bNoSysTabs, bIndent, bGlob: Boolean;
+  zName, sql, zDb, zNameQuoted, zPattern: AnsiString;
+  zDiv: AnsiString;
+  ii: SizeInt;
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc: i32;
+  zDbName: PAnsiChar;
+  iSchema: i32;
+  zRow: PAnsiChar;
+  isSchema: Boolean;
 begin
-  if nArg >= 1 then begin
-    pat := StringReplace(args[0], '''', '''''', [rfReplaceAll]);
-    sql := 'SELECT sql FROM sqlite_schema WHERE name LIKE ''' + pat +
-           ''' AND sql IS NOT NULL ORDER BY tbl_name, type DESC, name';
-  end else
-    sql := 'SELECT sql FROM sqlite_schema WHERE sql IS NOT NULL ORDER BY tbl_name, type DESC, name';
-  runStatementVerbose(p, sql);
+  bDebug     := False;
+  bNoSysTabs := False;
+  bIndent    := False;
+  zName      := '';
+  for ii := 0 to nArg - 1 do begin
+    if (args[ii] = '--indent') or (args[ii] = '-indent') then
+      bIndent := True
+    else if (args[ii] = '--debug') or (args[ii] = '-debug') then
+      bDebug := True
+    else if (args[ii] = '--nosys') or (args[ii] = '-nosys') then
+      bNoSysTabs := True
+    else if (Length(args[ii]) > 0) and (args[ii][1] = '-') then begin
+      shellEPutZ(Format('Unknown option: "%s"'#10, [args[ii]]));
+      Exit;
+    end else if zName = '' then
+      zName := args[ii]
+    else begin
+      shellEPutZ('Usage: .schema ?--indent? ?--nosys? ?LIKE-PATTERN?'#10);
+      Exit;
+    end;
+  end;
+  if bIndent then begin
+    { --indent depends on the shell_format_schema/_add_schema UDFs that
+      are not yet ported; quietly ignore the flag rather than error so
+      `.dump`-style scripted gates keep working. }
+  end;
+
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+
+  if zName <> '' then begin
+    isSchema := (sqlite3_strlike('sqlite_master', PAnsiChar(zName), Ord('\')) = 0)
+              or (sqlite3_strlike('sqlite_schema', PAnsiChar(zName), Ord('\')) = 0)
+              or (sqlite3_strlike('sqlite_temp_master',
+                                  PAnsiChar(zName), Ord('\')) = 0)
+              or (sqlite3_strlike('sqlite_temp_schema',
+                                  PAnsiChar(zName), Ord('\')) = 0);
+    if isSchema then begin
+      if sqlite3_strlike('sqlite_t%', PAnsiChar(zName), 0) = 0 then
+        Write(Format(zSelfSchema, ['temp.']))
+      else
+        Write(Format(zSelfSchema, ['']));
+    end;
+  end;
+
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db,
+          'SELECT seq, name, file FROM pragma_database_list ORDER BY seq',
+          -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    shellEPutZ(AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
+    Exit;
+  end;
+  sql     := 'SELECT sql FROM (';
+  zDiv    := '';
+  iSchema := 0;
+  while sqlite3_step(pStmt) = SQLITE_ROW do begin
+    zDbName := PAnsiChar(sqlite3_column_text(pStmt, 1));
+    if zDbName = nil then Continue;
+    Inc(iSchema);
+    sql := sql + zDiv;
+    zDiv := ' UNION ALL ';
+    zDb  := AnsiString(zDbName);
+    if sqlite3_stricmp(zDbName, 'main') = 0 then
+      sql := sql + 'SELECT sql, type, tbl_name, name, rowid, '
+                 + IntToStr(iSchema) + ' AS snum, '
+                 + '''' + StringReplace(zDb, '''', '''''', [rfReplaceAll])
+                 + ''' AS sname'
+                 + ' FROM "' + StringReplace(zDb, '"', '""', [rfReplaceAll])
+                 + '".sqlite_schema'
+    else
+      sql := sql + 'SELECT sql, type, tbl_name, name, rowid, '
+                 + IntToStr(iSchema) + ' AS snum, '
+                 + '''' + StringReplace(zDb, '''', '''''', [rfReplaceAll])
+                 + ''' AS sname'
+                 + ' FROM "' + StringReplace(zDb, '"', '""', [rfReplaceAll])
+                 + '".sqlite_schema';
+  end;
+  sqlite3_finalize(pStmt);
+  if iSchema = 0 then Exit;
+
+  sql := sql + ') WHERE ';
+  if zName <> '' then begin
+    bGlob := (Pos('*', zName) > 0) or (Pos('?', zName) > 0)
+            or (Pos('[', zName) > 0);
+    zNameQuoted := '''' + StringReplace(zName, '''', '''''',
+                                        [rfReplaceAll]) + '''';
+    if Pos('.', zName) > 0 then
+      sql := sql + 'lower(format(''%s.%s'',sname,tbl_name))'
+    else
+      sql := sql + 'lower(tbl_name)';
+    if bGlob then
+      sql := sql + ' GLOB ' + zNameQuoted + ' AND '
+    else
+      sql := sql + ' LIKE ' + zNameQuoted + ' ESCAPE ''\'' AND ';
+  end;
+  if bNoSysTabs then
+    sql := sql + 'name NOT GLOB ''sqlite_*'' AND ';
+  sql := sql + 'sql IS NOT NULL ORDER BY snum, rowid';
+
+  if bDebug then begin
+    WriteLn(Format('SQL: %s;', [sql]));
+    Exit;
+  end;
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(sql), -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    shellEPutZ(AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
+    Exit;
+  end;
+  while sqlite3_step(pStmt) = SQLITE_ROW do begin
+    zRow := PAnsiChar(sqlite3_column_text(pStmt, 0));
+    if zRow <> nil then WriteLn(AnsiString(zRow) + ';');
+  end;
+  sqlite3_finalize(pStmt);
 end;
 
 { ----------------------------------------------------------------------
-  10.1.29 — `.timer on|off|once`  (shell.c.in:11886..11901)
+  10.1.29 — `.timer on|off|once` + the BEGIN_TIMER / END_TIMER probe
+  ports shell.c.in:1404..1456 (the Unix arm) plus the dispatcher arm at
+  11886..11901.  We declare getrusage / gettimeofday locally as cdecl
+  imports because BaseUnix doesn't surface getrusage and the upstream
+  layout (timeval seconds + microseconds) is what we need to mirror. }
 
-  Sets ShellState.enableTimer to 0/1/2.  The wall-clock probe itself is
-  not yet wired into stepAndRender; this lands the setter so the
-  `.show` / round-trip parity tests behave correctly. }
+const
+  RUSAGE_SELF_PAS = 0;
+
+type
+  TTVPas = record
+    tv_sec:  clong;
+    tv_usec: clong;
+  end;
+  TRUsagePas = record
+    ru_utime:    TTVPas;
+    ru_stime:    TTVPas;
+    ru_maxrss:   clong;
+    ru_ixrss:    clong;
+    ru_idrss:    clong;
+    ru_isrss:    clong;
+    ru_minflt:   clong;
+    ru_majflt:   clong;
+    ru_nswap:    clong;
+    ru_inblock:  clong;
+    ru_oublock:  clong;
+    ru_msgsnd:   clong;
+    ru_msgrcv:   clong;
+    ru_nsignals: clong;
+    ru_nvcsw:    clong;
+    ru_nivcsw:   clong;
+  end;
+  PRUsagePas = ^TRUsagePas;
+
+function shellGetRUsage(who: cint; usage: PRUsagePas): cint;
+  cdecl; external 'c' name 'getrusage';
+function shellGetTimeOfDay(tp: Pointer; tzp: Pointer): cint;
+  cdecl; external 'c' name 'gettimeofday';
+
+var
+  shellTimerBeginRU: TRUsagePas;
+  shellTimerBeginNs: i64;
+
+function shellTimeOfDayUs: i64;
+{ Microseconds since the Unix epoch; mirrors timeOfDay() in shell.c.in
+  (search for 'timeOfDay' near line 13950 — implemented via gettimeofday
+  on Unix). }
+var
+  tv: TTVPas;
+begin
+  tv.tv_sec  := 0;
+  tv.tv_usec := 0;
+  shellGetTimeOfDay(@tv, nil);
+  Result := (i64(tv.tv_sec) * 1000000) + i64(tv.tv_usec);
+end;
+
+procedure shellBeginTimer(p: PShellState);
+{ shell.c.in:1411..1416.  Snapshot user/sys CPU and wall clock when the
+  timer (or the soft-timeout progress hook) is armed. }
+begin
+  if (p^.enableTimer <> 0) or ((p^.flgProgress and SHELL_PROGRESS_TMOUT) <> 0) then
+  begin
+    FillChar(shellTimerBeginRU, SizeOf(shellTimerBeginRU), 0);
+    shellGetRUsage(RUSAGE_SELF_PAS, @shellTimerBeginRU);
+    shellTimerBeginNs := shellTimeOfDayUs;
+  end;
+end;
+
+function shellTvDiffSec(const tStart, tEnd: TTVPas): Double;
+{ shell.c.in:1419..1422.  timeDiff(): difference of two timevals as a
+  fractional number of seconds. }
+begin
+  Result := (tEnd.tv_usec - tStart.tv_usec) * 0.000001
+          + Double(tEnd.tv_sec - tStart.tv_sec);
+end;
+
+procedure shellEndTimer(p: PShellState);
+{ shell.c.in:1437..1450.  Print the wall/user/sys triple and decay
+  enableTimer=1 (`.timer once`) back to 0. }
+var
+  ruEnd: TRUsagePas;
+  iEndUs: i64;
+  realSec: Double;
+  s: AnsiString;
+begin
+  if p^.enableTimer = 0 then Exit;
+  iEndUs := shellTimeOfDayUs;
+  FillChar(ruEnd, SizeOf(ruEnd), 0);
+  shellGetRUsage(RUSAGE_SELF_PAS, @ruEnd);
+  realSec := (iEndUs - shellTimerBeginNs) * 0.000001;
+  p^.prevTimer := realSec;
+  s := Format('Run Time: real %.6f user %.6f sys %.6f'#10,
+              [realSec,
+               shellTvDiffSec(shellTimerBeginRU.ru_utime, ruEnd.ru_utime),
+               shellTvDiffSec(shellTimerBeginRU.ru_stime, ruEnd.ru_stime)]);
+  Write(s);
+  if p^.enableTimer = 1 then p^.enableTimer := 0;
+  shellTimerBeginNs := 0;
+end;
 
 procedure cmdTimer(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
 begin
@@ -3398,7 +3734,9 @@ begin
 
   pStmt := nil;
   zFilename := '';
-  rc := sqlite3_prepare_v2(p^.db, 'PRAGMA database_list', -1, @pStmt, @pzTail);
+  rc := sqlite3_prepare_v2(p^.db,
+          'SELECT seq, name, file FROM pragma_database_list ORDER BY seq',
+          -1, @pStmt, @pzTail);
   if (rc = SQLITE_OK) and (pStmt <> nil) and (sqlite3_step(pStmt) = SQLITE_ROW) then
   begin
     if sqlite3_column_text(pStmt, 2) <> nil then
@@ -3875,42 +4213,198 @@ end;
   accepted but ignored — they only affect formatting.
   ---------------------------------------------------------------------- }
 
+{ ----------------------------------------------------------------------
+  10.1.20  `.lint fkey-indexes` — full upstream variant
+                                        (shell.c.in:5899..6126).
+
+  Two pieces:
+
+    * shellFkeyCollateClause — the SQL UDF the SELECT below relies on to
+      decide whether the suggested CREATE INDEX needs a `COLLATE …`
+      suffix to actually cover the foreign-key lookup.  Returns ''
+      when both columns share a default collation, " COLLATE <parent>"
+      otherwise.
+
+    * lintFkeyIndexes — the dispatcher.  Builds an
+      `EXPLAIN QUERY PLAN SELECT 1 FROM child WHERE child_key=?` per
+      foreign-key constraint, runs each one, and asks sqlite3_strglob()
+      whether the resulting plan covers the lookup with an index (the
+      glob `SEARCH * USING COVERING INDEX*(*=? AND *=? …)` or the
+      `SEARCH * USING INTEGER PRIMARY KEY (rowid=?)` shortcut).  When
+      the plan does NOT match, emit the suggested CREATE INDEX; when it
+      does and `-verbose` was passed, emit a `/* no extra indexes
+      required */` breadcrumb.  `-groupbyparent` chunks the report by
+      the parent table.
+  ---------------------------------------------------------------------- }
+
+procedure shellFkeyCollateClause(pCtx: Psqlite3_context;
+                                 nVal: i32; apVal: PPMem); cdecl;
+{ shell.c.in:5914..5949 — fkey_collate_clause(parent, parentCol,
+  child, childCol).  Returns " COLLATE <parentCollation>" when the
+  parent and child column collations differ, '' otherwise. }
+type
+  TArgArr = array[0..3] of PMem;
+  PArgArr = ^TArgArr;
+var
+  db: Psqlite3;
+  zParent, zParentCol, zChild, zChildCol: PAnsiChar;
+  zParentSeq, zChildSeq: PAnsiChar;
+  rc: i32;
+  zOut: AnsiString;
+  pVals: PArgArr;
+begin
+  if nVal <> 4 then begin
+    sqlite3_result_text(pCtx, '', 0, nil);
+    Exit;
+  end;
+  pVals      := PArgArr(apVal);
+  db         := sqlite3_context_db_handle(pCtx);
+  zParent    := PAnsiChar(sqlite3_value_text(pVals^[0]));
+  zParentCol := PAnsiChar(sqlite3_value_text(pVals^[1]));
+  zChild     := PAnsiChar(sqlite3_value_text(pVals^[2]));
+  zChildCol  := PAnsiChar(sqlite3_value_text(pVals^[3]));
+  sqlite3_result_text(pCtx, '', 0, nil);
+  zParentSeq := nil;
+  zChildSeq  := nil;
+  rc := sqlite3_table_column_metadata(db, 'main', zParent, zParentCol,
+                                      nil, @zParentSeq, nil, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_table_column_metadata(db, 'main', zChild, zChildCol,
+                                        nil, @zChildSeq, nil, nil, nil);
+  if (rc = SQLITE_OK) and (zParentSeq <> nil) and (zChildSeq <> nil) and
+     (sqlite3_stricmp(zParentSeq, zChildSeq) <> 0) then begin
+    zOut := ' COLLATE ' + AnsiString(zParentSeq);
+    sqlite3_result_text(pCtx, PAnsiChar(zOut), Length(zOut), nil);
+  end;
+end;
+
 procedure cmdLint(p: PShellState; const args: array of AnsiString;
                   nArg: SizeInt);
 const
   zSql =
-    'SELECT ''CREATE INDEX '' ||' +
-    '       quote(s.name || ''_'' || group_concat(f.[from], ''_'')) ||' +
-    '       '' ON '' || quote(s.name) || ''('' ||' +
-    '       group_concat(quote(f.[from]), '', '') || '');'' ' +
-    'FROM sqlite_schema AS s,' +
-    '     pragma_foreign_key_list(s.name) AS f ' +
-    'GROUP BY s.name, f.id ' +
-    'ORDER BY s.name, f.id';
+    'SELECT '
+    + '     ''EXPLAIN QUERY PLAN SELECT 1 FROM '' || quote(s.name) || '' WHERE '''
+    + '  || group_concat(quote(s.name) || ''.'' || quote(f.[from]) || ''=?'' '
+    + '  || fkey_collate_clause('
+    + '       f.[table], COALESCE(f.[to], p.[name]), s.name, f.[from]),'' AND '')'
+    + ', '
+    + '     ''SEARCH '' || s.name || '' USING COVERING INDEX*('''
+    + '  || group_concat(''*=?'', '' AND '') || '')'''
+    + ', '
+    + '     s.name  || ''('' || group_concat(f.[from],  '', '') || '')'''
+    + ', '
+    + '     f.[table] || ''('' || group_concat(COALESCE(f.[to], p.[name])) || '')'''
+    + ', '
+    + '     ''CREATE INDEX '' || quote(s.name ||''_''|| group_concat(f.[from], ''_''))'
+    + '  || '' ON '' || quote(s.name) || ''('''
+    + '  || group_concat(quote(f.[from]) ||'
+    + '        fkey_collate_clause('
+    + '          f.[table], COALESCE(f.[to], p.[name]), s.name, f.[from]), '', '')'
+    + '  || '');'''
+    + ', '
+    + '     f.[table] '
+    + 'FROM sqlite_schema AS s, pragma_foreign_key_list(s.name) AS f '
+    + 'LEFT JOIN pragma_table_info AS p ON (pk-1=seq AND p.arg=f.[table]) '
+    + 'GROUP BY s.name, f.id '
+    + 'ORDER BY (CASE WHEN ? THEN f.[table] ELSE s.name END)';
+  zGlobIPK = 'SEARCH * USING INTEGER PRIMARY KEY (rowid=?)';
 var
-  pStmt: PVdbe;
+  bVerbose, bGroupByParent: Boolean;
+  zIndent: AnsiString;
+  i: SizeInt;
+  rc, res: i32;
+  pSql, pExplain: PVdbe;
   pzTail: PAnsiChar;
-  rc: i32;
-  zText: PAnsiChar;
+  zEQP, zGlob, zFrom, zTarget, zCI, zParent, zPlan, zPrev: PAnsiChar;
+  zPrevStr: AnsiString;
 begin
   if (nArg < 1) or (args[0] <> 'fkey-indexes') then begin
     shellEPutZ('Usage: .lint fkey-indexes ?-verbose? ?-groupbyparent?'#10);
     Exit;
   end;
+  bVerbose       := False;
+  bGroupByParent := False;
+  zIndent        := '';
+  for i := 1 to nArg - 1 do begin
+    if (args[i] = '-verbose') or (args[i] = '--verbose') then
+      bVerbose := True
+    else if (args[i] = '-groupbyparent') or (args[i] = '--groupbyparent') then
+    begin
+      bGroupByParent := True;
+      zIndent        := '    ';
+    end else begin
+      shellEPutZ(Format('Usage: .lint %s ?-verbose? ?-groupbyparent?'#10,
+                        [args[0]]));
+      Exit;
+    end;
+  end;
+
   openDb(p, 0);
   if p^.db = nil then Exit;
-  pStmt := nil;
-  rc := sqlite3_prepare_v2(p^.db, zSql, -1, @pStmt, @pzTail);
-  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
-    shellEPutZ('Error: ' + AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
-    if pStmt <> nil then sqlite3_finalize(pStmt);
+  rc := sqlite3_create_function(p^.db, 'fkey_collate_clause', 4,
+                                SQLITE_UTF8, nil,
+                                @shellFkeyCollateClause, nil, nil);
+  if rc <> SQLITE_OK then begin
+    shellEPutZ(AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
     Exit;
   end;
-  while sqlite3_step(pStmt) = SQLITE_ROW do begin
-    zText := PAnsiChar(sqlite3_column_text(pStmt, 0));
-    if zText <> nil then WriteLn(AnsiString(zText));
+  pSql := nil;
+  rc := sqlite3_prepare_v2(p^.db, zSql, -1, @pSql, @pzTail);
+  if (rc <> SQLITE_OK) or (pSql = nil) then begin
+    shellEPutZ(AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
+    if pSql <> nil then sqlite3_finalize(pSql);
+    Exit;
   end;
-  sqlite3_finalize(pStmt);
+  if bGroupByParent then sqlite3_bind_int(pSql, 1, 1)
+                    else sqlite3_bind_int(pSql, 1, 0);
+
+  zPrev    := nil;
+  zPrevStr := '';
+  while sqlite3_step(pSql) = SQLITE_ROW do begin
+    res     := -1;
+    zEQP    := PAnsiChar(sqlite3_column_text(pSql, 0));
+    zGlob   := PAnsiChar(sqlite3_column_text(pSql, 1));
+    zFrom   := PAnsiChar(sqlite3_column_text(pSql, 2));
+    zTarget := PAnsiChar(sqlite3_column_text(pSql, 3));
+    zCI     := PAnsiChar(sqlite3_column_text(pSql, 4));
+    zParent := PAnsiChar(sqlite3_column_text(pSql, 5));
+    if (zEQP = nil) or (zGlob = nil) then Continue;
+    pExplain := nil;
+    rc := sqlite3_prepare_v2(p^.db, zEQP, -1, @pExplain, @pzTail);
+    if rc <> SQLITE_OK then Break;
+    if sqlite3_step(pExplain) = SQLITE_ROW then begin
+      zPlan := PAnsiChar(sqlite3_column_text(pExplain, 3));
+      if zPlan <> nil then begin
+        if (sqlite3_strglob(zGlob, zPlan) = 0)
+           or (sqlite3_strglob(zGlobIPK, zPlan) = 0) then
+          res := 1
+        else
+          res := 0;
+      end;
+    end;
+    rc := sqlite3_finalize(pExplain);
+    if rc <> SQLITE_OK then Break;
+
+    if res < 0 then begin
+      shellEPutZ('Error: internal error');
+      Break;
+    end;
+    if bGroupByParent and (bVerbose or (res = 0)) and
+       ((zPrev = nil) or
+        (sqlite3_stricmp(zParent, PAnsiChar(zPrevStr)) <> 0)) then
+    begin
+      WriteLn(Format('-- Parent table %s', [AnsiString(zParent)]));
+      zPrevStr := AnsiString(zParent);
+      zPrev    := PAnsiChar(zPrevStr);
+    end;
+
+    if res = 0 then
+      WriteLn(zIndent + AnsiString(zCI) + ' --> ' + AnsiString(zTarget))
+    else if bVerbose then
+      WriteLn(Format('%s/* no extra indexes required for %s -> %s */',
+                     [zIndent, AnsiString(zFrom), AnsiString(zTarget)]));
+  end;
+  sqlite3_finalize(pSql);
 end;
 
 { ----------------------------------------------------------------------
