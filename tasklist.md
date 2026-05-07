@@ -1434,6 +1434,30 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.74** ext/misc/normalize.c (717 C lines) ported as new unit
+       `passqlite3normalize.pas` (~620 lines).  Provides the public helper
+       `sqlite3_normalize(zSql)` that returns a canonical form of SQL by
+       (1) rewriting every literal (string / blob / number / NULL) to '?',
+       (2) collapsing whitespace and comments to single spaces, (3)
+       lower-casing ASCII, and (4) rewriting `IN (v1,v2,...)` lists to
+       `IN (?,?,?)`.  The bundled tokenizer (sqlite3GetToken) is a
+       verbatim port of normalize.c:300..554; CC_KYWD / CC_X / CC_DOT
+       fall-throughs into the trailing IdChar / digit loops are
+       reconstructed inline since Pascal's case has no fall-through.
+       Wired via sqlite3NormalizeInit in shell openDb as the SQL
+       function `sqlite3_normalize(X)` (UTF-8, deterministic, innocuous)
+       — registration is a port convenience for differential testing;
+       the C source ships only the bare helper plus the optional
+       -DSQLITE_NORMALIZE_CLI standalone program.  Verified byte-
+       identical against the system `sqlite3` loading a
+       `usenorm.so` wrapper around upstream normalize.c on a 12-case
+       suite covering: comments + IN-list, IN-(SELECT)/IN-(WITH)
+       short-circuit, NULL-as-literal vs `IS NULL` / `NOT NULL`,
+       blob / float / hex / dot-prefixed numeric literals, $a / @b /
+       :c / ?1 variables, [bracket] and "double-quoted" identifiers,
+       single-arg IN, and the all-comment edge case.  TestExplainParity
+       1026/1026.
+
   [X] **10.1.73** ext/misc/decimal.c (952 C lines) ported as new unit
        `passqlite3decimal.pas` (~720 lines).  Provides arbitrary-precision
        decimal arithmetic backed by a `signed char[]` digit string with

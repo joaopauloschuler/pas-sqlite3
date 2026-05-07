@@ -89,6 +89,7 @@ uses
   passqlite3series,
   passqlite3completion,
   passqlite3decimal,
+  passqlite3normalize,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -614,6 +615,11 @@ begin
     decimal_add / decimal_sub / decimal_mul / decimal_pow2 / decimal_sum
     aggregate, plus the `decimal` collation. }
   sqlite3DecimalInit(p^.db);
+  { Phase 10.1.74 — sqlite3_normalize() helper from ext/misc/normalize.c
+    (717 C lines).  Registered as a SQL function `sqlite3_normalize(X)`
+    for differential testing; the underlying public C-style helper is
+    also exported by passqlite3normalize. }
+  sqlite3NormalizeInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
