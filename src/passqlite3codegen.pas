@@ -43431,9 +43431,10 @@ end;
 
 procedure roundFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
-  r, half, factor: Double;
+  r, half: Double;
   n: i64;
-  i: i32;
+  zBuf: PAnsiChar;
+  s: AnsiString;
 begin
   n := 0;
   if argc = 2 then begin
@@ -43452,14 +43453,11 @@ begin
       if r < 0 then half := -0.5 else half := +0.5;
       r := Double(i64(Trunc(r + half)));
     end else begin
-      { Approximate "%!.*f" + sqlite3AtoF round-trip via factor multiply.
-        Not byte-identical to C for pathological FP cases (TODO: switch
-        to sqlite3RenderNumF once a fixed-point %!.*f arm exists), but
-        matches for ordinary values used in tests. }
-      factor := 1.0;
-      for i := 0 to n - 1 do factor := factor * 10.0;
-      if r < 0 then half := -0.5 else half := +0.5;
-      r := Trunc(r * factor + half) / factor;
+      { Format as %!.*f then re-parse — mirrors func.c:464..470 exactly so
+        rounding matches C's IEEE-correct halfway behaviour (bug 10.1.bug.7). }
+      s := sqlite3FormatStr(PAnsiChar('%!.*f'), [Integer(n), r]);
+      zBuf := PAnsiChar(s);
+      sqlite3AtoF(zBuf, r);
     end;
   end;
   sqlite3_result_double(pCtx, r);
@@ -44249,122 +44247,19 @@ var
     Result := p^;
   end;
 
-  { Format a double using the captured width/precision metadata, mirroring
-    C printf semantics for %f / %e / %E / %g / %G via FloatToStrF.  When no
-    width or precision is given, fall back to FloatToStr for natural %g-like
-    output (matches the previous behaviour for unadorned specifiers). }
-  { C-style %e/%E render: 1 digit . prec digits e±NN.  prec defaults to 6
-    when not specified.  Matches `printf("%e",1234.5)` → "1.234500e+03". }
-  function FmtSciE(v: Double; prec: i32; upper: Boolean): AnsiString;
-  var
-    expN: i32;
-    mant: Double;
-    s, expStr, mantStr: AnsiString;
-    expSign: AnsiChar;
-  begin
-    if v = 0 then begin
-      mant := 0; expN := 0;
-    end else begin
-      expN := Trunc(Ln(Abs(v)) / Ln(10));
-      mant := v / Power(10.0, expN);
-      while Abs(mant) >= 10 do begin mant := mant / 10; Inc(expN); end;
-      while Abs(mant) < 1   do begin mant := mant * 10; Dec(expN); end;
-    end;
-    mantStr := FloatToStrF(mant, ffFixed, 15, prec);
-    if expN < 0 then begin expSign := '-'; expN := -expN; end
-    else expSign := '+';
-    expStr := IntToStr(expN);
-    if Length(expStr) < 2 then expStr := '0' + expStr;
-    if upper then s := mantStr + 'E' + expSign + expStr
-    else          s := mantStr + 'e' + expSign + expStr;
-    Result := s;
-  end;
-
-  { %g / %G implementation matching printf.c:530..617 etGENERIC arm.
-    prec defaults to 6, precision==0 → 1.  exp = floor(log10(|v|)).
-    if exp<-4 or exp>=prec → scientific with prec-1 fractional digits;
-    else fixed with (prec-1-exp) fractional digits.  Trailing zeros are
-    stripped (rtz) unless '#' alt-form flag is set; a trailing '.' is
-    always stripped when it has no fractional digits left. }
-  function FmtGeneric(v: Double; upper: Boolean): AnsiString;
-  var
-    prec, expN, fracDigits, k: i32;
-    mant: Double;
-    s: AnsiString;
-    keepTrailingZeros: Boolean;
-  begin
-    if metaHavePrec then prec := metaPrec else prec := 6;
-    if prec = 0 then prec := 1;
-    keepTrailingZeros := Pos('#', metaFlags) > 0;
-    if v = 0 then begin
-      expN := 0;
-    end else begin
-      expN := Trunc(Ln(Abs(v)) / Ln(10));
-      mant := Abs(v) / Power(10.0, expN);
-      if mant < 1 then begin Dec(expN); end
-      else if mant >= 10 then begin Inc(expN); end;
-    end;
-    if (expN < -4) or (expN >= prec) then begin
-      Result := FmtSciE(v, prec - 1, upper);
-    end else begin
-      fracDigits := prec - 1 - expN;
-      if fracDigits < 0 then fracDigits := 0;
-      Result := FloatToStrF(v, ffFixed, 15, fracDigits);
-    end;
-    if not keepTrailingZeros then begin
-      { strip trailing zeros after the decimal point, then a trailing '.' }
-      k := Pos('e', Result);
-      if k = 0 then k := Pos('E', Result);
-      if k = 0 then begin
-        if Pos('.', Result) > 0 then begin
-          while (Length(Result) > 0) and (Result[Length(Result)] = '0') do
-            SetLength(Result, Length(Result) - 1);
-          if (Length(Result) > 0) and (Result[Length(Result)] = '.') then
-            SetLength(Result, Length(Result) - 1);
-        end;
-      end else begin
-        s := Copy(Result, k, Length(Result) - k + 1);
-        SetLength(Result, k - 1);
-        if Pos('.', Result) > 0 then begin
-          while (Length(Result) > 0) and (Result[Length(Result)] = '0') do
-            SetLength(Result, Length(Result) - 1);
-          if (Length(Result) > 0) and (Result[Length(Result)] = '.') then
-            SetLength(Result, Length(Result) - 1);
-        end;
-        Result := Result + s;
-      end;
-    end;
-  end;
-
+  { Delegate %f / %e / %E / %g / %G to the canonical sqlite3FormatStr engine
+    (passqlite3printf), which uses sqlite3FpDecode / sqlite3Fp2Convert10 for
+    correct binary->decimal halfway rounding (matches printf.c byte-for-byte).
+    Avoids FPC's FloatToStrF, which rounds binary halfway values the wrong
+    direction (bug 10.1.bug.7). }
   function FmtFloat(spec: AnsiChar; v: Double): AnsiString;
-  var
-    prec, i: i32;
+  var fmt: AnsiString;
   begin
-    if (spec = 'e') or (spec = 'E') then begin
-      if metaHavePrec then prec := metaPrec else prec := 6;
-      Result := FmtSciE(v, prec, spec = 'E');
-    end else if (spec = 'g') or (spec = 'G') then begin
-      Result := FmtGeneric(v, spec = 'G');
-    end else begin
-      { %f }
-      if metaHavePrec then prec := metaPrec else prec := 6;
-      Result := FloatToStrF(v, ffFixed, 15, prec);
-      for i := 1 to Length(Result) - 1 do
-        if (Result[i] = 'e') or (Result[i] = 'E') then begin
-          if (i + 1 <= Length(Result))
-             and (Result[i + 1] <> '+') and (Result[i + 1] <> '-') then
-            Insert('+', Result, i + 1);
-          Break;
-        end;
-    end;
-    if metaHaveWidth and (Length(Result) < metaWidth) then begin
-      if Pos('-', metaFlags) > 0 then
-        Result := Result + StringOfChar(' ', metaWidth - Length(Result))
-      else if (Pos('0', metaFlags) > 0) and (Pos('-', metaFlags) = 0) then
-        Result := StringOfChar('0', metaWidth - Length(Result)) + Result
-      else
-        Result := StringOfChar(' ', metaWidth - Length(Result)) + Result;
-    end;
+    fmt := '%' + metaFlags;
+    if metaHaveWidth then fmt := fmt + IntToStr(metaWidth);
+    if metaHavePrec  then fmt := fmt + '.' + IntToStr(metaPrec);
+    fmt := fmt + spec;
+    Result := sqlite3FormatStr(PAnsiChar(fmt), [v]);
   end;
 
   { Apply width / flag padding to an integer-shaped digit string.
