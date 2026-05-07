@@ -2470,6 +2470,20 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.10**
+     ```
+     sqlite> .mode list --colsep "|"
+     sqlite> .output test_file_1.txt
+     sqlite> select * from tbl1;
+     sqlite> .exit
+     ```
+     Does not produce:
+     ```
+     $ cat test_file_1.txt
+     hello|10
+     goodbye|20
+     ```
+
 - [X] **10.1.bug.9** json_each / json_tree / jsonb_each / jsonb_tree
   raised `no such table: json_each` because the eponymous-vtab arm in
   `sqlite3LocateTable` (passqlite3codegen.pas:32271) only registered
