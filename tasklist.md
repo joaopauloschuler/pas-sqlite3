@@ -1454,6 +1454,49 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.98** ext/misc/zipfile.c (2293 C lines) ported as new unit
+       `passqlite3zipfile.pas` (~1100 lines).  Provides the `zipfile`
+       virtual table for reading and writing ZIP archives plus the
+       `zipfile()` aggregate function that assembles a ZIP archive image
+       into a single BLOB.  Vtab usage: `CREATE VIRTUAL TABLE z USING
+       zipfile('/path/to/archive.zip');` then INSERT/SELECT/UPDATE/DELETE
+       rows with (name, mode, mtime, sz, rawdata, data, method, z HIDDEN)
+       columns.  Aggregate usage: `SELECT zipfile(name,data) FROM src;`
+       returns a ZIP-format BLOB.  Same upstream limitations: no
+       encryption, no split archives, no zip64, only deflate (method 8)
+       and store (method 0) compression.  Faithful 1:1 port: ZipfileCDS /
+       ZipfileLFH / ZipfileEOCD / ZipfileEntry / ZipfileCsr / ZipfileTab
+       record layouts preserved; full vtab method set
+       (Connect/Disconnect/Open/Close/Filter/Next/Eof/Column/Update/Begin/
+       Commit/Rollback/BestIndex/FindFunction); the zipfile_cds JSON
+       inspection function wired through xFindFunction; CDS/LFH/EOCD
+       little-endian serialisation/deserialisation byte-identical.  The
+       DOS↔UNIX time-conversion arithmetic (zipfileMtime / zipfileMtimeToDos)
+       reworked into integer-only arithmetic from the C double-precision
+       julian-day formulas; mtime round-trips correctly across the
+       documented boundary cases.  Pascal-port adaptations: libc fopen/
+       fclose/fread/fwrite/fseek/ftell bound directly because BaseUnix's
+       FILE* surface is less ergonomic; zlib bindings via direct cdecl
+       (crc32, deflateInit2_/deflate/deflateEnd/deflateBound,
+       inflateInit2_/inflate/inflateEnd, zlibVersion); z_stream record
+       laid out for Linux x86-64 (uLong = 64-bit).  Wired via
+       `sqlite3ZipfileInit(p^.db)` in shell openDb so `CREATE VIRTUAL
+       TABLE … USING zipfile(...)` is available in the REPL.  Verified
+       end-to-end: write 2-row archive via vtab, read back via bound
+       vtab + via `unzip -l` (byte-identical schema), round-trip mode
+       string '-rw-r--r--' and explicit mtime (Unix epoch 1700000000)
+       both decode correctly in unzip and Pascal vtab; zipfile() aggregate
+       over a 2-row source table produces a 240-byte BLOB that unzip
+       extracts byte-identical.  Same caveat as the prior eponymous-vtab
+       series (10.1.69, 10.1.71, 10.1.72, 10.1.77, 10.1.80, 10.1.83,
+       10.1.86, 10.1.92, 10.1.94): the Pascal port does not yet wire
+       vtab xBestIndex argument-pushdown for the `zipfile($filename)`
+       table-valued form (codegen.pas:13938 / 28163) — the bound-CREATE
+       form works fully; the bare-function form raises the upstream
+       'zipfile() function requires an argument' error.  TestExplainParity
+       1026/1026; TestSmoke PASSED; DiagFeatureProbe / DiagOps / DiagDml
+       clean.
+
   [X] **10.1.97** ext/recover/dbdata.c (1023 C lines) ported as new unit
        `passqlite3dbdata.pas` (~620 lines).  Provides two eponymous virtual
        tables that read raw b-tree page bytes via the sqlite_dbpage vtab:
