@@ -1438,6 +1438,37 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.87** ext/misc/vfsstat.c (825 C lines) ported as new unit
+       `passqlite3vfsstat.pas` (~620 lines).  Provides the `vfsstat`
+       eponymous virtual table that exposes per-file-type I/O counters
+       (database / journal / wal / master-journal / sub-journal /
+       temp-database / temp-journal / transient-db / *) crossed with
+       the seven stat axes (bytes-in / bytes-out / read / write / sync
+       / open / lock for typed rows; access / delete / fullpathname /
+       randomness / sleep / currenttimestamp / not-used for the `*` row).
+       Counters live in a global u64[63] array; all 19 sqlite3_io_methods
+       and all 19 sqlite3_vfs entries pass through to the underlying
+       VFS via a REALVFS() inline helper.  vstattabUpdate honours
+       `UPDATE vfsstat SET count=N` (validates rowid range + non-negative
+       integer N), refusing INSERT / DELETE and any other column change.
+       Init wired through sqlite3VfsstatInit in shell openDb: the first
+       call also installs the VFS shim (zName="vfslog" — upstream typo
+       preserved byte-identical) as the new default VFS, layered on top
+       of whatever was previously default; subsequent calls only
+       register the vtab on the new connection.  Verified end-to-end:
+       `.open vss.db; CREATE TABLE t(x); INSERT INTO t VALUES(1),(2),(3);
+       SELECT * FROM vfsstat WHERE count>0;` returns the expected
+       database/journal/* row set with read/write/sync/lock/open
+       counters incrementing through the shim; `UPDATE vfsstat SET
+       count=42 WHERE rowid=1; SELECT count FROM vfsstat WHERE rowid=1;`
+       round-trips 42.  TestExplainParity 1026/1026; DiagFeatureProbe /
+       DiagOps clean.  Caveat: the shell's first openDb runs before
+       sqlite3VfsstatInit, so the very first connection on a shell
+       invocation sees only the xRandomness counter increment — the
+       VFS shim activates for every subsequent .open and on every
+       connection in embedders that call sqlite3_register_vfsstat()
+       before the first sqlite3_open.
+
   [X] **10.1.86** ext/misc/fileio.c (1234 C lines) ported as new unit
        `passqlite3fileio.pas` (~640 lines).  Provides the SQL functions
        readfile(X), writefile(F,D[,M[,T]]), lsmode(M), realpath(X) plus

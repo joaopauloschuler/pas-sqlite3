@@ -102,6 +102,7 @@ uses
   passqlite3closure,
   passqlite3appendvfs,
   passqlite3vfslog,
+  passqlite3vfsstat,
   passqlite3fileio,
   passqlite3main;
 
@@ -676,6 +677,11 @@ begin
     (1234 C lines).  fsdir is the backing storage for `.archive` and
     related shell features. }
   sqlite3FileioInit(p^.db);
+  { Phase 10.1.87 — vfsstat eponymous virtual table from
+    ext/misc/vfsstat.c (825 C lines).  The first call also installs the
+    "vfslog"-named (sic — upstream zName typo) VFS shim that increments
+    the underlying counters; the vtab itself is registered per-db. }
+  sqlite3VfsstatInit(p^.db);
   { vtablog (ext/misc/vtablog.c, 720 C lines) is exported but NOT
     auto-installed — every callback writes a trace line to stdout, so
     auto-registering would corrupt every shell session.  Loading it
