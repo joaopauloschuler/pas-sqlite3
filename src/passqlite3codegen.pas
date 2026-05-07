@@ -7796,12 +7796,70 @@ begin
   end;
 end;
 
+{ resolveBareIdToTrigger — RETURNING context companion to
+  resolveTriggerNewOld.  When NC_UBaseReg is set (codeReturningTrigger /
+  upsertDoUpdate path) and pTriggerTab is bound, bare TK_ID column refs
+  are treated as NEW.x (INSERT/UPDATE) or OLD.x (DELETE), matching
+  resolve.c lookupName's bareword fallback. }
+procedure resolveBareIdToTrigger(pParse: PParse; iBaseReg: i32; pE: PExpr);
+var
+  pTab:    PTable2;
+  iCol:    i32;
+  iTable:  i32;
+  storCol: i32;
+  i:       i32;
+  pList_:  PExprList;
+begin
+  if (pE = nil) or (pParse = nil) or (pParse^.pTriggerTab = nil) then Exit;
+  if pE^.op = TK_ID then
+  begin
+    if (pE^.u.zToken = nil) or (pE^.u.zToken^ = #0) then Exit;
+    pTab := PTable2(pParse^.pTriggerTab);
+    iCol := sqlite3ColumnIndex(pTab, pE^.u.zToken);
+    if (iCol < 0) and (sqlite3IsRowid(pE^.u.zToken) <> 0) then iCol := -1;
+    if (iCol >= 0) and (pTab^.iPKey = iCol) then iCol := -1;
+    if (iCol < -1) or (iCol >= pTab^.nCol) then Exit;
+    if pParse^.eTriggerOp = TK_DELETE then iTable := 0 else iTable := 1;
+    storCol := iCol;  { sqlite3TableColumnToStorage simplified — no GENERATED }
+    pE^.y.pTab  := pTab;
+    pE^.op      := TK_REGISTER;
+    pE^.op2     := TK_COLUMN;
+    pE^.iColumn := i16(iCol);
+    pE^.iTable  := iBaseReg + (i32(pTab^.nCol) + 1) * iTable + storCol + 1;
+    if iCol < 0 then pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+    if iTable = 0 then begin
+      if iCol >= 0 then
+        pParse^.oldmask := pParse^.oldmask or (u32(1) shl (iCol and 31))
+      else
+        pParse^.oldmask := $FFFFFFFF;
+    end else begin
+      if iCol >= 0 then
+        pParse^.newmask := pParse^.newmask or (u32(1) shl (iCol and 31))
+      else
+        pParse^.newmask := $FFFFFFFF;
+    end;
+    Exit;
+  end;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  resolveBareIdToTrigger(pParse, iBaseReg, pE^.pLeft);
+  resolveBareIdToTrigger(pParse, iBaseReg, pE^.pRight);
+  if (pE^.flags and EP_xIsSelect) = 0 then
+  begin
+    pList_ := pE^.x.pList;
+    if pList_ <> nil then
+      for i := 0 to pList_^.nExpr - 1 do
+        resolveBareIdToTrigger(pParse, iBaseReg, ExprListItems(pList_)[i].pExpr);
+  end;
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
   begin
     if pNC^.pParse <> nil then
       resolveTriggerNewOld(pNC^.pParse, pExpr);
+    if (pNC^.pParse <> nil) and ((pNC^.ncFlags and NC_UBaseReg) <> 0) then
+      resolveBareIdToTrigger(pNC^.pParse, pNC^.uNC.iBaseReg, pExpr);
     resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
     if pNC^.pParse <> nil then
     begin
@@ -33137,9 +33195,70 @@ begin_table_error:
   sqlite3DbFree(db, zName);
 end;
 
-procedure sqlite3AddReturning(pParse: PParse; pList: PExprList);
+{ sqlite3DeleteReturning — free a Returning struct.  ParserAddCleanup
+  callback so the allocation outlives sqlite3FinishCoding (the trigger is
+  kept in the temp-schema trigHash until the toplevel parse releases). }
+procedure sqlite3DeleteReturning(db: PTsqlite3; p: Pointer);
+var
+  pRet: PReturning;
+  pHash: passqlite3util.PHash;
 begin
-  sqlite3ExprListDelete(pParse^.db, pList);
+  if p = nil then Exit;
+  pRet := PReturning(p);
+  if (db <> nil) and (db^.nDb >= 2) and (db^.aDb[1].pSchema <> nil) then begin
+    pHash := @passqlite3util.PSchema(db^.aDb[1].pSchema)^.trigHash;
+    sqlite3HashInsert(pHash, PChar(@pRet^.zName[0]), nil);
+  end;
+  sqlite3ExprListDelete(db, pRet^.pReturnEL);
+  sqlite3DbFree(db, pRet);
+end;
+
+{ sqlite3AddReturning — port of build.c:1439.
+
+  Capture the RETURNING clause expression list and rig up a transient
+  AFTER trigger that codeReturningTrigger drives at codegen time.  The
+  trigger lives in the temp schema's trigHash under a per-Parse name so
+  sqlite3TriggerList can find and inject it for the active DML target.
+  Sets PARSEFLAG_BReturning so the BEFORE/AFTER trigger machinery,
+  emitReturningTail, and the OP_OpenEphemeral epilogue all light up. }
+procedure sqlite3AddReturning(pParse: PParse; pList: PExprList);
+var
+  pRet: PReturning;
+  pHash: passqlite3util.PHash;
+  db: PTsqlite3;
+  pPrev: Pointer;
+begin
+  db := pParse^.db;
+  if pParse^.pNewTrigger <> nil then begin
+    sqlite3ErrorMsg(pParse, 'cannot use RETURNING in a trigger');
+  end;
+  pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_BReturning;
+  pRet := PReturning(sqlite3DbMallocZero(db, SizeOf(TReturning)));
+  if pRet = nil then begin
+    sqlite3ExprListDelete(db, pList);
+    Exit;
+  end;
+  pParse^.u1.pReturning := pRet;
+  pRet^.pParse    := pParse;
+  pRet^.pReturnEL := pList;
+  sqlite3ParserAddCleanup(pParse, @sqlite3DeleteReturning, pRet);
+  if db^.mallocFailed <> 0 then Exit;
+  sqlite3PfSnprintf(SizeOf(pRet^.zName), @pRet^.zName[0],
+    PAnsiChar('sqlite_returning_%p'), [Pointer(pParse)]);
+  pRet^.retTrig.zName      := @pRet^.zName[0];
+  pRet^.retTrig.op         := TK_RETURNING;
+  pRet^.retTrig.tr_tm      := TRIGGER_AFTER;
+  pRet^.retTrig.bReturning := 1;
+  pRet^.retTrig.pSchema    := db^.aDb[1].pSchema;
+  pRet^.retTrig.pTabSchema := db^.aDb[1].pSchema;
+  pRet^.retTrig.step_list  := @pRet^.retTStep;
+  pRet^.retTStep.op        := TK_RETURNING;
+  pRet^.retTStep.pTrig     := @pRet^.retTrig;
+  pRet^.retTStep.pExprList := pList;
+  pHash := @passqlite3util.PSchema(db^.aDb[1].pSchema)^.trigHash;
+  pPrev := sqlite3HashInsert(pHash, PChar(@pRet^.zName[0]), @pRet^.retTrig);
+  if pPrev = @pRet^.retTrig then
+    sqlite3OomFault(db);
 end;
 
 { sqlite3AddColumn — port of build.c:1490 (Phase 6.9-bis 11g.2.f sub-progress 7).

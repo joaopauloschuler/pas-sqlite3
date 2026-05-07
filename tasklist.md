@@ -2331,6 +2331,51 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.5** RETURNING clause silently dropped — INSERT / UPDATE /
+  DELETE ... RETURNING produced no result rows because
+  `sqlite3AddReturning` (codegen.pas) was a stub that just freed the
+  expression list.  Closed 2026-05-07.  Fix has two parts:
+  (1) Ported `sqlite3AddReturning` from build.c:1439 — sets
+  PARSEFLAG_BReturning, allocates the Returning struct, builds the
+  transient `sqlite_returning_<ptr>` AFTER trigger (op=TK_RETURNING,
+  bReturning=1, pSchema/pTabSchema=temp), wires retTStep, and inserts
+  the trigger into the temp-schema trigHash so `sqlite3TriggerList`
+  injects it for the active DML target.  Companion ParserAddCleanup
+  callback `sqlite3DeleteReturning` removes the trigger from the hash
+  and frees the expression list.
+  (2) Added `resolveBareIdToTrigger` in `sqlite3ResolveExprNames` for
+  the NC_UBaseReg arm — bare TK_ID column refs in the RETURNING list
+  rewrite to TK_REGISTER (op2=TK_COLUMN) with iTable computed as
+  `iBaseReg + (nCol+1)*iTable + col + 1` (iTable=0 for DELETE/OLD,
+  iTable=1 for INSERT/UPDATE/NEW), mirroring resolve.c:591..596.
+  Verified byte-identical to system sqlite3 for INSERT...RETURNING *,
+  multi-row VALUES, RETURNING expressions/aliases (`x*10 AS x10`),
+  rowid in RETURNING, UPDATE...RETURNING (single row), DELETE single-
+  row...RETURNING.  Multi-row DELETE...RETURNING currently hangs in
+  the rowset-buffered path; tracked separately as bug 10.1.bug.6 below
+  (predates this fix — exposed by it because the same path activates
+  whenever any AFTER trigger is attached to the table).
+  TestExplainParity 1026/1026; TestSmoke PASSED; DiagFeatureProbe /
+  DiagOps / DiagDml / DiagPragma / DiagFunctions / DiagTxn / DiagMisc /
+  DiagCast / DiagDate / DiagAnalyze / DiagDropTable all clean.
+
+- [ ] **10.1.bug.6** Multi-row DELETE with any AFTER trigger (RETURNING
+  trigger included) hangs at runtime.  Reproducer:
+  `CREATE TABLE t(x); CREATE TRIGGER tr AFTER DELETE ON t BEGIN
+  INSERT INTO log VALUES(OLD.x); END;
+  INSERT INTO t VALUES(1),(2); DELETE FROM t;` — second iteration of
+  the rowset-buffered loop never terminates.  Single-row DELETE works
+  (rowset has one entry, `RowSetRead` returns empty on next call and
+  exits).  Without the trigger DELETE uses the simple Rewind/Next
+  shape and is fine.  Likely culprit: the buffered loop's `RowSetRead
+  → NotExists → ... → Goto` cycle in the Pas DELETE codegen does not
+  terminate when `RowSetAdd`'d rowids are processed, perhaps because
+  `OpenWrite` reopening cursor 0 after the rowset-collection pass
+  invalidates the rowset register.  Surfaced under bug 10.1.bug.5 —
+  multi-row `RETURNING` rows arrive in the trigger via the same path.
+  Investigation should compare the OP_RowSetAdd / OP_RowSetRead
+  semantics in passqlite3vdbe.pas against vdbe.c.
+
 - [X] **10.1.bug.4** Scalar PRAGMAs (`page_count`, `max_page_count`,
   `page_size`, `cache_size`, `synchronous`, `temp_store`, etc.)
   returned blank rows because `sqlite3Pragma` never called
