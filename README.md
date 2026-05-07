@@ -245,7 +245,7 @@ pas-sqlite3/
 | 6 | Code generators (SQL → VDBE) | 🧪 Ported — in testing |
 | 7 | Parser (tokenizer + Lemon grammar) | 🧪 Ported — in testing |
 | 8 | Public API | 🧪 Ported — in testing |
-| 10 | CLI tool (`shell.c` → `passqlite3shell.pas`) | 🔲 Pending |
+| 10 | CLI tool (`shell.c` → `passqlite3shell.pas`) | 🚧 In progress |
 | 11 | Benchmarks (Pascal `speedtest1` port) | 🔲 Pending |
 | 12 | Acceptance: differential + fuzz testing | 🔲 Pending |
 | 13 | Performance optimisation | 🔲 Pending |
