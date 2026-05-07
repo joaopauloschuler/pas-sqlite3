@@ -1143,8 +1143,40 @@ existing dispatcher.
        sqlite3_exec; data copied through INSERT OR IGNORE with the
        upstream `ORDER BY rowid DESC` retry on read errors.  Honours the
        "File already exists" guard.
-  [ ] **10.1.46** `.archive` / `.ar` — sqlar reader/writer; gated on
-       sqlar extension.  Stub with omit-message until that lands.
+  [~] **10.1.46** `.archive` / `.ar` — landed 2026-05-07.  ~720 lines
+       of new Pascal in passqlite3shell.pas porting shell.c.in:6234..7005.
+       Full sub-command set: -c create, -u update, -i insert, -t list,
+       -x extract, -r remove; full switch parser (traditional `tar`-style
+       single-arg short opts, `-cf`-style mixed shorts, long `--name`
+       form, `--`); --verbose / --file / --append / --directory /
+       --dryrun / --glob.  arParseCommand / arProcessSwitch /
+       arCheckEntries / arWhereClause / arListCommand / arRemoveCommand
+       / arExtractCommand / arExecSql / arCreateOrUpdateCommand /
+       arDotCommand all mirror the C source.  Backed by the already-
+       wired ext/misc helpers: sqlar (10.1.95), fileio (10.1.86),
+       zipfile (10.1.98), appendvfs (10.1.84).  Verified: `.archive
+       --help` byte-identical to upstream; `.archive -t/-tv -f FILE`
+       lists members of an existing sqlar archive (verified against an
+       archive built by the system sqlite3); `.archive --help` /
+       `--file` / `--directory` parse and dispatch correctly.
+       Caveats inherited from pre-existing engine gaps: (a) create /
+       insert / update can't populate the archive because `fsdir(...)`
+       table-valued form is gated on bug 6.13 (vtab xBestIndex argument-
+       pushdown not yet wired in WhereBegin); (b) extract emits the
+       upstream `WITH dest(dpath,dlen) AS (SELECT realpath($dir),...)
+       SELECT ... CROSS JOIN sqlar` query which currently returns 0
+       rows in the Pascal port (CTE-driven CROSS JOIN gap, same family
+       as 6.14 sub-bug B).  Two tactical adaptations from upstream:
+       (i) sqlite3_table_column_metadata replaced by a `SELECT 1 FROM
+       sqlar LIMIT 1` probe because the Pascal port loads schema lazily;
+       (ii) AR_CMD_LIST / AR_CMD_EXTRACT open the archive with
+       READWRITE flags rather than READONLY because the Pascal pager
+       currently rejects schema-load reads on a freshly-opened READONLY
+       db.  Both should fold back to upstream once the underlying
+       gaps close.  Verbose-list datetime() column shows blank in the
+       Pascal port (datetime function gap, separate task).
+       TestExplainParity 1026/1026; TestSmoke PASSED;
+       DiagFeatureProbe / DiagOps / DiagFunctions clean.
   [ ] **10.1.47** `.session` — session-extension dispatcher
        (`attach`, `enable`, `filter`, `indirect`, `isempty`, `list`,
        `changeset`, `patchset`).  Gated on session extension; stub

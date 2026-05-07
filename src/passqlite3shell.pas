@@ -49,6 +49,7 @@ uses
   termio,
   passqlite3types,
   passqlite3util,
+  passqlite3printf,
   passqlite3os,
   passqlite3pcache,
   passqlite3pager,
@@ -5904,6 +5905,852 @@ begin
   importCleanup(sCtx);
 end;
 
+{ ----------------------------------------------------------------------
+  10.1.46  `.archive` / `.ar`  —  shell.c.in:6234..7005
+
+  Faithful port of the SQL-archive (sqlar) and ZIP-archive (zipfile)
+  manager.  Backed by ext/misc/sqlar.c (sqlar_compress/sqlar_uncompress
+  — already wired in openDb), ext/misc/fileio.c (lsmode, fsdir,
+  writefile, realpath — wired) and ext/misc/zipfile.c (zipfile vtab —
+  wired).
+
+  Sub-commands:
+    -c, --create   create new archive
+    -u, --update   add only changed files
+    -i, --insert   add files (always overwrite)
+    -t, --list     list contents
+    -x, --extract  extract files
+    -r, --remove   remove files
+
+  Switches:
+    -v, --verbose       chatty output
+    -f, --file FILE     archive file (defaults to current db)
+    -a, --append FILE   open as appendvfs
+    -C, --directory DIR base directory for create/extract
+    -n, --dryrun        print SQL but do not run
+    -g, --glob          treat names as GLOB patterns
+    -h, --help          help
+  ---------------------------------------------------------------------- }
+
+const
+  AR_CMD_CREATE       = 1;
+  AR_CMD_UPDATE       = 2;
+  AR_CMD_INSERT       = 3;
+  AR_CMD_EXTRACT      = 4;
+  AR_CMD_LIST         = 5;
+  AR_CMD_HELP         = 6;
+  AR_CMD_REMOVE       = 7;
+  AR_SWITCH_VERBOSE   = 8;
+  AR_SWITCH_FILE      = 9;
+  AR_SWITCH_DIRECTORY = 10;
+  AR_SWITCH_APPEND    = 11;
+  AR_SWITCH_DRYRUN    = 12;
+  AR_SWITCH_GLOB      = 13;
+
+type
+  PArCommand = ^TArCommand;
+  TArCommand = record
+    eCmd:        u8;
+    bVerbose:    u8;
+    bZip:        u8;
+    bDryRun:     u8;
+    bAppend:     u8;
+    bGlob:       u8;
+    fromCmdLine: u8;
+    nArg:        i32;
+    zSrcTable:   PAnsiChar;          { allocated via sqlite3_mprintf }
+    sFile:       AnsiString;         { backing for zFile }
+    sDir:        AnsiString;         { backing for zDir }
+    haveFile:    Boolean;
+    haveDir:     Boolean;
+    azArg:       array of AnsiString; { remaining positional args }
+    p:           PShellState;
+    db:          PTsqlite3;
+  end;
+
+  TArSwitch = record
+    zLong:   AnsiString;
+    cShort:  AnsiChar;
+    eSwitch: u8;
+    bArg:    u8;
+  end;
+
+const
+  ar_aSwitch: array[0..12] of TArSwitch = (
+    (zLong: 'create';    cShort: 'c'; eSwitch: AR_CMD_CREATE;       bArg: 0),
+    (zLong: 'extract';   cShort: 'x'; eSwitch: AR_CMD_EXTRACT;      bArg: 0),
+    (zLong: 'insert';    cShort: 'i'; eSwitch: AR_CMD_INSERT;       bArg: 0),
+    (zLong: 'list';      cShort: 't'; eSwitch: AR_CMD_LIST;         bArg: 0),
+    (zLong: 'remove';    cShort: 'r'; eSwitch: AR_CMD_REMOVE;       bArg: 0),
+    (zLong: 'update';    cShort: 'u'; eSwitch: AR_CMD_UPDATE;       bArg: 0),
+    (zLong: 'help';      cShort: 'h'; eSwitch: AR_CMD_HELP;         bArg: 0),
+    (zLong: 'verbose';   cShort: 'v'; eSwitch: AR_SWITCH_VERBOSE;   bArg: 0),
+    (zLong: 'file';      cShort: 'f'; eSwitch: AR_SWITCH_FILE;      bArg: 1),
+    (zLong: 'append';    cShort: 'a'; eSwitch: AR_SWITCH_APPEND;    bArg: 1),
+    (zLong: 'directory'; cShort: 'C'; eSwitch: AR_SWITCH_DIRECTORY; bArg: 1),
+    (zLong: 'dryrun';    cShort: 'n'; eSwitch: AR_SWITCH_DRYRUN;    bArg: 0),
+    (zLong: 'glob';      cShort: 'g'; eSwitch: AR_SWITCH_GLOB;      bArg: 0)
+  );
+
+function arUsage: i32; forward;
+function arErrorMsg(pAr: PArCommand; const z: AnsiString): i32; forward;
+
+function arUsage: i32;
+{ shell.c.in:6261 — invokes the help renderer for the "archive" pattern. }
+begin
+  showHelp('archive');
+  Result := SQLITE_ERROR;
+end;
+
+function arErrorMsg(pAr: PArCommand; const z: AnsiString): i32;
+{ shell.c.in:6270.  Print error and a usage hint. }
+begin
+  shellEPutZ('Error: ' + z + sLineBreak);
+  if pAr^.fromCmdLine <> 0 then
+    shellEPutZ('Use "-A" for more help'#10)
+  else
+    shellEPutZ('Use ".archive --help" for more help'#10);
+  Result := SQLITE_ERROR;
+end;
+
+function arProcessSwitch(pAr: PArCommand; eSwitch: u8;
+                         const zArg: AnsiString): i32;
+{ shell.c.in:6307 }
+begin
+  case eSwitch of
+    AR_CMD_CREATE, AR_CMD_EXTRACT, AR_CMD_LIST, AR_CMD_REMOVE,
+    AR_CMD_UPDATE, AR_CMD_INSERT, AR_CMD_HELP:
+      begin
+        if pAr^.eCmd <> 0 then begin
+          Result := arErrorMsg(pAr, 'multiple command options');
+          Exit;
+        end;
+        pAr^.eCmd := eSwitch;
+      end;
+    AR_SWITCH_DRYRUN:
+      pAr^.bDryRun := 1;
+    AR_SWITCH_GLOB:
+      pAr^.bGlob := 1;
+    AR_SWITCH_VERBOSE:
+      pAr^.bVerbose := 1;
+    AR_SWITCH_APPEND:
+      begin
+        pAr^.bAppend := 1;
+        pAr^.sFile := zArg;
+        pAr^.haveFile := True;
+      end;
+    AR_SWITCH_FILE:
+      begin
+        pAr^.sFile := zArg;
+        pAr^.haveFile := True;
+      end;
+    AR_SWITCH_DIRECTORY:
+      begin
+        pAr^.sDir := zArg;
+        pAr^.haveDir := True;
+      end;
+  end;
+  Result := SQLITE_OK;
+end;
+
+function arParseCommand(const args: array of AnsiString; nArg: SizeInt;
+                        pAr: PArCommand): i32;
+{ shell.c.in:6351.  Pascal `args[]` does NOT include the dot-cmd name —
+  arrange so that index 0 is implicit "archive" and the C `azArg[1..]`
+  is `args[0..]`. }
+var
+  i, k, n: SizeInt;
+  z, zArg: AnsiString;
+  pOpt, pMatch: SizeInt;
+  iArg: SizeInt;
+begin
+  if nArg <= 0 then begin
+    shellEPutZ('Wrong number of arguments.  Usage:'#10);
+    Result := arUsage;
+    Exit;
+  end;
+
+  z := args[0];
+  if (Length(z) = 0) or (z[1] <> '-') then begin
+    { Traditional [tar] invocation: "ctf foo bar" — treat each char of
+      args[0] as a short switch.  Switches with bArg consume the next
+      positional arg. }
+    iArg := 1;
+    for i := 1 to Length(z) do begin
+      pOpt := -1;
+      for k := 0 to High(ar_aSwitch) do
+        if z[i] = ar_aSwitch[k].cShort then begin pOpt := k; Break; end;
+      if pOpt < 0 then begin
+        Result := arErrorMsg(pAr, Format('unrecognized option: %s', [z[i]]));
+        Exit;
+      end;
+      zArg := '';
+      if ar_aSwitch[pOpt].bArg <> 0 then begin
+        if iArg >= nArg then begin
+          Result := arErrorMsg(pAr,
+            Format('option requires an argument: %s', [z[i]]));
+          Exit;
+        end;
+        zArg := args[iArg];
+        Inc(iArg);
+      end;
+      Result := arProcessSwitch(pAr, ar_aSwitch[pOpt].eSwitch, zArg);
+      if Result <> SQLITE_OK then Exit;
+    end;
+    pAr^.nArg := nArg - iArg;
+    if pAr^.nArg > 0 then begin
+      SetLength(pAr^.azArg, pAr^.nArg);
+      for i := 0 to pAr^.nArg - 1 do
+        pAr^.azArg[i] := args[iArg + i];
+    end;
+  end else begin
+    { Non-traditional invocation: each arg starting with '-'/'--' is a
+      switch.  First non-switch and everything after are positional. }
+    iArg := 0;
+    while iArg < nArg do begin
+      z := args[iArg];
+      if (Length(z) = 0) or (z[1] <> '-') then begin
+        SetLength(pAr^.azArg, nArg - iArg);
+        for i := 0 to (nArg - iArg) - 1 do
+          pAr^.azArg[i] := args[iArg + i];
+        pAr^.nArg := nArg - iArg;
+        Break;
+      end;
+      n := Length(z);
+      if (n >= 2) and (z[2] <> '-') then begin
+        { One or more short options: -ctf or -t alone }
+        i := 2;
+        while i <= n do begin
+          pOpt := -1;
+          for k := 0 to High(ar_aSwitch) do
+            if z[i] = ar_aSwitch[k].cShort then begin pOpt := k; Break; end;
+          if pOpt < 0 then begin
+            Result := arErrorMsg(pAr,
+              Format('unrecognized option: %s', [z[i]]));
+            Exit;
+          end;
+          zArg := '';
+          if ar_aSwitch[pOpt].bArg <> 0 then begin
+            if i < n then begin
+              zArg := Copy(z, i + 1, n - i);
+              i := n + 1;
+            end else begin
+              if iArg >= nArg - 1 then begin
+                Result := arErrorMsg(pAr,
+                  Format('option requires an argument: %s', [z[i]]));
+                Exit;
+              end;
+              Inc(iArg);
+              zArg := args[iArg];
+            end;
+          end;
+          Result := arProcessSwitch(pAr,
+            ar_aSwitch[pOpt].eSwitch, zArg);
+          if Result <> SQLITE_OK then Exit;
+          Inc(i);
+        end;
+      end else if (n = 2) and (z[2] = '-') then begin
+        { '--' marks end-of-options. }
+        if iArg + 1 < nArg then begin
+          SetLength(pAr^.azArg, nArg - iArg - 1);
+          for i := 0 to (nArg - iArg - 2) do
+            pAr^.azArg[i] := args[iArg + 1 + i];
+          pAr^.nArg := nArg - iArg - 1;
+        end;
+        Break;
+      end else begin
+        { Long option starting with '--'. }
+        zArg := '';
+        pMatch := -1;
+        for k := 0 to High(ar_aSwitch) do begin
+          if (n - 2) <= Length(ar_aSwitch[k].zLong) then begin
+            if Copy(z, 3, n - 2) =
+               Copy(ar_aSwitch[k].zLong, 1, n - 2) then
+            begin
+              if pMatch >= 0 then begin
+                Result := arErrorMsg(pAr,
+                  Format('ambiguous option: %s', [z]));
+                Exit;
+              end;
+              pMatch := k;
+            end;
+          end;
+        end;
+        if pMatch < 0 then begin
+          Result := arErrorMsg(pAr,
+            Format('unrecognized option: %s', [z]));
+          Exit;
+        end;
+        if ar_aSwitch[pMatch].bArg <> 0 then begin
+          if iArg >= nArg - 1 then begin
+            Result := arErrorMsg(pAr,
+              Format('option requires an argument: %s', [z]));
+            Exit;
+          end;
+          Inc(iArg);
+          zArg := args[iArg];
+        end;
+        Result := arProcessSwitch(pAr,
+          ar_aSwitch[pMatch].eSwitch, zArg);
+        if Result <> SQLITE_OK then Exit;
+      end;
+      Inc(iArg);
+    end;
+  end;
+
+  if pAr^.eCmd = 0 then begin
+    shellEPutZ('Required argument missing.  Usage:'#10);
+    Result := arUsage;
+    Exit;
+  end;
+  Result := SQLITE_OK;
+end;
+
+function arCheckEntries(pAr: PArCommand): i32;
+{ shell.c.in:6506 — verify each azArg[] member exists in the archive. }
+var
+  i, j, n: SizeInt;
+  pTest: PVdbe;
+  zSel, zSql: AnsiString;
+  z: AnsiString;
+  bOk: Boolean;
+  rc: i32;
+  zMprintf: PAnsiChar;
+begin
+  Result := SQLITE_OK;
+  if pAr^.nArg = 0 then Exit;
+  if pAr^.bGlob <> 0 then
+    zSel := 'SELECT name FROM %s WHERE glob($name,name)'
+  else
+    zSel := 'SELECT name FROM %s WHERE name=$name';
+  zMprintf := sqlite3PfMprintf(PAnsiChar(zSel),
+    [AnsiString(pAr^.zSrcTable)]);
+  if zMprintf = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  zSql := AnsiString(zMprintf);
+  sqlite3_free(zMprintf);
+
+  pTest := nil;
+  rc := sqlite3_prepare_v2(pAr^.db, PAnsiChar(zSql), -1, @pTest, nil);
+  if rc <> SQLITE_OK then begin
+    shellEPutZ(Format('Error: %s'#10,
+      [AnsiString(sqlite3_errmsg(pAr^.db))]));
+    if pTest <> nil then sqlite3_finalize(pTest);
+    Result := rc;
+    Exit;
+  end;
+  j := sqlite3_bind_parameter_index(pTest, '$name');
+
+  for i := 0 to pAr^.nArg - 1 do begin
+    z := pAr^.azArg[i];
+    n := Length(z);
+    while (n > 0) and (z[n] = '/') do Dec(n);
+    if n < Length(z) then SetLength(z, n);
+    pAr^.azArg[i] := z;
+    bOk := False;
+    sqlite3_bind_text(pTest, j, PAnsiChar(z), -1, SQLITE_STATIC);
+    if sqlite3_step(pTest) = SQLITE_ROW then bOk := True;
+    sqlite3_reset(pTest);
+    if not bOk then begin
+      shellEPutZ(Format('not found in archive: %s'#10, [z]));
+      Result := SQLITE_ERROR;
+      Break;
+    end;
+  end;
+  sqlite3_finalize(pTest);
+end;
+
+procedure arWhereClause(var rc: i32; pAr: PArCommand; out zWhere: AnsiString);
+{ shell.c.in:6546.  Build a WHERE clause matching pAr^.azArg[]. }
+var
+  z1, z2: PAnsiChar;
+  zSep1, zSep2: AnsiString;
+  i, n: SizeInt;
+  z: AnsiString;
+  zNew: PAnsiChar;
+begin
+  zWhere := '';
+  if rc <> SQLITE_OK then Exit;
+  if pAr^.nArg = 0 then begin
+    zWhere := '1';
+    Exit;
+  end;
+  if pAr^.bGlob <> 0 then
+    z1 := sqlite3PfMprintf(PAnsiChar(AnsiString('')), [])
+  else
+    z1 := sqlite3PfMprintf(PAnsiChar(AnsiString('name IN(')), []);
+  z2 := sqlite3PfMprintf(PAnsiChar(AnsiString('')), []);
+  zSep1 := '';
+  zSep2 := '';
+  for i := 0 to pAr^.nArg - 1 do begin
+    if (z1 = nil) or (z2 = nil) then Break;
+    z := pAr^.azArg[i];
+    n := Length(z);
+    if pAr^.bGlob <> 0 then begin
+      zNew := sqlite3PfMprintf(PAnsiChar('%z%sname GLOB ''%q'''),
+        [AnsiString(z1), zSep2, z]);
+      z1 := zNew;
+      zNew := sqlite3PfMprintf(
+        PAnsiChar('%z%ssubstr(name,1,%d) GLOB ''%q/'''),
+        [AnsiString(z2), zSep2, n + 1, z]);
+      z2 := zNew;
+    end else begin
+      zNew := sqlite3PfMprintf(PAnsiChar('%z%s''%q'''),
+        [AnsiString(z1), zSep1, z]);
+      z1 := zNew;
+      zNew := sqlite3PfMprintf(
+        PAnsiChar('%z%ssubstr(name,1,%d) = ''%q/'''),
+        [AnsiString(z2), zSep2, n + 1, z]);
+      z2 := zNew;
+    end;
+    zSep1 := ', ';
+    zSep2 := ' OR ';
+  end;
+  if (z1 = nil) or (z2 = nil) then begin
+    rc := SQLITE_NOMEM;
+  end else begin
+    if pAr^.bGlob = 0 then
+      zNew := sqlite3PfMprintf(
+        PAnsiChar('(%s) OR (name GLOB ''*/*'' AND (%s)) '),
+        [AnsiString(z1), AnsiString(z2)])
+    else
+      zNew := sqlite3PfMprintf(
+        PAnsiChar('(%s OR (name GLOB ''*/*'' AND (%s))) '),
+        [AnsiString(z1), AnsiString(z2)]);
+    if zNew = nil then begin
+      rc := SQLITE_NOMEM;
+    end else begin
+      { Match upstream wrapping: see shell.c.in:6581 — the bare-name
+        branch closes the IN(..) inside the prefix and the wrap is
+        "(<z1>) OR ..." while the glob branch wraps "(<z1> OR ...)".
+        We've folded the close-paren into the prefix branches above. }
+      zWhere := AnsiString(zNew);
+      sqlite3_free(zNew);
+    end;
+  end;
+  if z1 <> nil then sqlite3_free(z1);
+  if z2 <> nil then sqlite3_free(z2);
+end;
+
+function arListCommand(pAr: PArCommand): i32;
+{ shell.c.in:6595 }
+const
+  azCols: array[0..1] of AnsiString = (
+    'name',
+    'lsmode(mode), sz, datetime(mtime, ''unixepoch''), name'
+  );
+var
+  zWhere, zSql: AnsiString;
+  pSql: PVdbe;
+  rc: i32;
+  z: PAnsiChar;
+begin
+  rc := arCheckEntries(pAr);
+  arWhereClause(rc, pAr, zWhere);
+
+  pSql := nil;
+  if rc = SQLITE_OK then begin
+    z := sqlite3PfMprintf(PAnsiChar('SELECT %s FROM %s WHERE %s'),
+      [azCols[Ord(pAr^.bVerbose <> 0)], AnsiString(pAr^.zSrcTable), zWhere]);
+    if z = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    zSql := AnsiString(z);
+    sqlite3_free(z);
+    rc := sqlite3_prepare_v2(pAr^.db, PAnsiChar(zSql), -1, @pSql, nil);
+    if rc <> SQLITE_OK then
+      shellEPutZ(Format('Error: %s'#10,
+        [AnsiString(sqlite3_errmsg(pAr^.db))]));
+  end;
+  if (rc = SQLITE_OK) and (pAr^.bDryRun <> 0) then begin
+    shellSPutZ(Format('%s'#10, [AnsiString(sqlite3_sql(pSql))]));
+  end else if rc = SQLITE_OK then begin
+    while (rc = SQLITE_OK) and (sqlite3_step(pSql) = SQLITE_ROW) do begin
+      if pAr^.bVerbose <> 0 then begin
+        shellSPutZ(Format('%s %10d  %s  %s'#10,
+          [AnsiString(sqlite3_column_text(pSql, 0)),
+           sqlite3_column_int(pSql, 1),
+           AnsiString(sqlite3_column_text(pSql, 2)),
+           AnsiString(sqlite3_column_text(pSql, 3))]));
+      end else begin
+        shellSPutZ(Format('%s'#10,
+          [AnsiString(sqlite3_column_text(pSql, 0))]));
+      end;
+    end;
+  end;
+  if pSql <> nil then sqlite3_finalize(pSql);
+  Result := rc;
+end;
+
+function arRemoveCommand(pAr: PArCommand): i32;
+{ shell.c.in:6632 }
+var
+  rc: i32;
+  zWhere, zSql: AnsiString;
+  zErr: PAnsiChar;
+  z: PAnsiChar;
+begin
+  rc := SQLITE_OK;
+  zWhere := '';
+  if pAr^.nArg > 0 then begin
+    rc := arCheckEntries(pAr);
+    arWhereClause(rc, pAr, zWhere);
+  end;
+  if rc = SQLITE_OK then begin
+    z := sqlite3PfMprintf(PAnsiChar('DELETE FROM %s WHERE %s;'),
+      [AnsiString(pAr^.zSrcTable), zWhere]);
+    if z = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    zSql := AnsiString(z);
+    sqlite3_free(z);
+    if pAr^.bDryRun <> 0 then begin
+      shellSPutZ(zSql + sLineBreak);
+    end else begin
+      zErr := nil;
+      rc := sqlite3_exec(pAr^.db, 'SAVEPOINT ar;', nil, nil, nil);
+      if rc = SQLITE_OK then begin
+        rc := sqlite3_exec(pAr^.db, PAnsiChar(zSql), nil, nil, @zErr);
+        if rc <> SQLITE_OK then
+          sqlite3_exec(pAr^.db, 'ROLLBACK TO ar; RELEASE ar;', nil, nil, nil)
+        else
+          rc := sqlite3_exec(pAr^.db, 'RELEASE ar;', nil, nil, nil);
+      end;
+      if zErr <> nil then begin
+        shellSPutZ(Format('ERROR: %s'#10, [AnsiString(zErr)]));
+        sqlite3_free(zErr);
+      end;
+    end;
+  end;
+  Result := rc;
+end;
+
+function arExtractCommand(pAr: PArCommand): i32;
+{ shell.c.in:6673 }
+const
+  zSql1 =
+    'WITH dest(dpath,dlen) AS (SELECT realpath($dir),length(realpath($dir)))'#10 +
+    'SELECT ($dir || name),'#10 +
+    '       CASE WHEN $dryrun THEN 0'#10 +
+    '            ELSE writefile($dir||name, %s, mode, mtime) END'#10 +
+    '  FROM dest CROSS JOIN %s'#10 +
+    ' WHERE (%s)'#10 +
+    '   AND (data IS NULL OR $pass==0)'#10 +
+    '   AND dpath=substr(realpath($dir||name),1,dlen)'#10 +
+    '   AND name NOT GLOB ''*..[/\]*'''#10;
+  azExtraArg: array[0..1] of AnsiString = (
+    'sqlar_uncompress(data, sz)',
+    'data'
+  );
+var
+  pSql: PVdbe;
+  rc: i32;
+  zDir, zWhere, zSql: AnsiString;
+  i, j: SizeInt;
+  z: PAnsiChar;
+begin
+  pSql := nil;
+  rc := arCheckEntries(pAr);
+  arWhereClause(rc, pAr, zWhere);
+
+  if rc = SQLITE_OK then begin
+    if pAr^.haveDir then zDir := pAr^.sDir + '/' else zDir := '';
+    z := sqlite3PfMprintf(PAnsiChar(AnsiString(zSql1)),
+      [azExtraArg[pAr^.bZip], AnsiString(pAr^.zSrcTable), zWhere]);
+    if z = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    zSql := AnsiString(z);
+    sqlite3_free(z);
+    rc := sqlite3_prepare_v2(pAr^.db, PAnsiChar(zSql), -1, @pSql, nil);
+    if rc <> SQLITE_OK then
+      shellEPutZ(Format('Error: %s'#10,
+        [AnsiString(sqlite3_errmsg(pAr^.db))]));
+  end;
+
+  if rc = SQLITE_OK then begin
+    j := sqlite3_bind_parameter_index(pSql, '$dir');
+    sqlite3_bind_text(pSql, j, PAnsiChar(zDir), -1, SQLITE_STATIC);
+    j := sqlite3_bind_parameter_index(pSql, '$dryrun');
+    sqlite3_bind_int(pSql, j, pAr^.bDryRun);
+
+    { Two passes: writefile() all, then re-touch directories so their
+      mtimes match the archive (first pass mutates them while extracting
+      contained files). }
+    for i := 0 to 1 do begin
+      j := sqlite3_bind_parameter_index(pSql, '$pass');
+      sqlite3_bind_int(pSql, j, i);
+      if pAr^.bDryRun <> 0 then begin
+        shellSPutZ(Format('%s'#10, [AnsiString(sqlite3_sql(pSql))]));
+        if pAr^.bVerbose = 0 then Break;
+      end;
+      while (rc = SQLITE_OK) and (sqlite3_step(pSql) = SQLITE_ROW) do begin
+        if (i = 0) and (pAr^.bVerbose <> 0) then
+          shellSPutZ(Format('%s'#10,
+            [AnsiString(sqlite3_column_text(pSql, 0))]));
+      end;
+      if pAr^.bDryRun <> 0 then Break;
+      sqlite3_reset(pSql);
+    end;
+  end;
+  if pSql <> nil then sqlite3_finalize(pSql);
+  Result := rc;
+end;
+
+function arExecSql(pAr: PArCommand; const zSql: AnsiString): i32;
+{ shell.c.in:6753 }
+var
+  zErr: PAnsiChar;
+  rc: i32;
+begin
+  if pAr^.bDryRun <> 0 then begin
+    shellSPutZ(zSql + sLineBreak);
+    Result := SQLITE_OK;
+  end else begin
+    zErr := nil;
+    rc := sqlite3_exec(pAr^.db, PAnsiChar(zSql), nil, nil, @zErr);
+    if zErr <> nil then begin
+      shellSPutZ(Format('ERROR: %s'#10, [AnsiString(zErr)]));
+      sqlite3_free(zErr);
+    end;
+    Result := rc;
+  end;
+end;
+
+function arCreateOrUpdateCommand(pAr: PArCommand;
+                                 bUpdate, bOnlyIfChanged: i32): i32;
+label end_ar_transaction;
+{ shell.c.in:6788 — create / insert / update (sqlar or zip targets). }
+const
+  zCreate =
+    'CREATE TABLE IF NOT EXISTS sqlar('#10 +
+    '  name TEXT PRIMARY KEY,'#10 +
+    '  mode INT,'#10 +
+    '  mtime INT,'#10 +
+    '  sz INT,'#10 +
+    '  data BLOB'#10 +
+    ')';
+  zDrop = 'DROP TABLE IF EXISTS sqlar';
+  zInsertSqlar =
+    'REPLACE INTO %s(name,mode,mtime,sz,data)'#10 +
+    '  SELECT'#10 +
+    '    %s,'#10 +
+    '    mode,'#10 +
+    '    mtime,'#10 +
+    '    CASE substr(lsmode(mode),1,1)'#10 +
+    '      WHEN ''-'' THEN length(data)'#10 +
+    '      WHEN ''d'' THEN 0'#10 +
+    '      ELSE -1 END,'#10 +
+    '    sqlar_compress(data)'#10 +
+    '  FROM fsdir(%Q,%Q) AS disk'#10 +
+    '  WHERE lsmode(mode) NOT LIKE ''?%%''%s;';
+  zInsertZip =
+    'REPLACE INTO %s(name,mode,mtime,data)'#10 +
+    '  SELECT'#10 +
+    '    %s,'#10 +
+    '    mode,'#10 +
+    '    mtime,'#10 +
+    '    data'#10 +
+    '  FROM fsdir(%Q,%Q) AS disk'#10 +
+    '  WHERE lsmode(mode) NOT LIKE ''?%%''%s;';
+var
+  i: SizeInt;
+  rc: i32;
+  zTab, zExists, zSql, zTemp, zNameSel, zArgDir: AnsiString;
+  z: PAnsiChar;
+  r: u64;
+begin
+  zTemp := '';
+  zTab := '';
+  zArgDir := '';
+  if pAr^.haveDir then zArgDir := pAr^.sDir;
+
+  arExecSql(pAr, 'PRAGMA page_size=512');
+  rc := arExecSql(pAr, 'SAVEPOINT ar;');
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  if pAr^.bZip <> 0 then begin
+    if pAr^.haveFile then begin
+      sqlite3_randomness(SizeOf(r), @r);
+      zTemp := Format('zip%016x', [r]);
+      zTab := zTemp;
+      z := sqlite3PfMprintf(
+        PAnsiChar('CREATE VIRTUAL TABLE temp.%s USING zipfile(%Q)'),
+        [zTab, pAr^.sFile]);
+      if z = nil then begin Result := SQLITE_NOMEM; goto end_ar_transaction; end;
+      zSql := AnsiString(z);
+      sqlite3_free(z);
+      rc := arExecSql(pAr, zSql);
+    end else
+      zTab := 'zip';
+  end else begin
+    zTab := 'sqlar';
+    if bUpdate = 0 then begin
+      rc := arExecSql(pAr, zDrop);
+      if rc <> SQLITE_OK then goto end_ar_transaction;
+    end;
+    rc := arExecSql(pAr, zCreate);
+  end;
+  if rc <> SQLITE_OK then goto end_ar_transaction;
+
+  if bOnlyIfChanged <> 0 then begin
+    z := sqlite3PfMprintf(PAnsiChar(
+      ' AND NOT EXISTS('#10 +
+      'SELECT 1 FROM %s AS mem'#10 +
+      ' WHERE mem.name=disk.name'#10 +
+      ' AND mem.mtime=disk.mtime'#10 +
+      ' AND mem.mode=disk.mode)'), [zTab]);
+    if z = nil then begin rc := SQLITE_NOMEM; goto end_ar_transaction; end;
+    zExists := AnsiString(z);
+    sqlite3_free(z);
+  end else
+    zExists := '';
+
+  if pAr^.bVerbose <> 0 then
+    zNameSel := 'shell_putsnl(name)'
+  else
+    zNameSel := 'name';
+
+  for i := 0 to pAr^.nArg - 1 do begin
+    if pAr^.bZip <> 0 then
+      z := sqlite3PfMprintf(PAnsiChar(zInsertZip),
+        [zTab, zNameSel, pAr^.azArg[i], zArgDir, zExists])
+    else
+      z := sqlite3PfMprintf(PAnsiChar(zInsertSqlar),
+        [zTab, zNameSel, pAr^.azArg[i], zArgDir, zExists]);
+    if z = nil then begin rc := SQLITE_NOMEM; Break; end;
+    zSql := AnsiString(z);
+    sqlite3_free(z);
+    rc := arExecSql(pAr, zSql);
+    if rc <> SQLITE_OK then Break;
+  end;
+
+end_ar_transaction:
+  if rc <> SQLITE_OK then
+    sqlite3_exec(pAr^.db, 'ROLLBACK TO ar; RELEASE ar;', nil, nil, nil)
+  else begin
+    rc := arExecSql(pAr, 'RELEASE ar;');
+    if (pAr^.bZip <> 0) and pAr^.haveFile then begin
+      z := sqlite3PfMprintf(PAnsiChar('DROP TABLE %s'), [zTemp]);
+      if z <> nil then begin
+        zSql := AnsiString(z);
+        sqlite3_free(z);
+        arExecSql(pAr, zSql);
+      end;
+    end;
+  end;
+  Result := rc;
+end;
+
+function arDotCommand(p: PShellState; fromCmdLine: i32;
+                      const args: array of AnsiString;
+                      nArg: SizeInt): i32;
+label end_ar_command;
+{ shell.c.in:6897.  Dispatch entry for `.archive` / `.ar`. }
+var
+  cmd: TArCommand;
+  rc: i32;
+  eDbType: i32;
+  flags: i32;
+  z: PAnsiChar;
+begin
+  FillChar(cmd, SizeOf(cmd), 0);
+  cmd.fromCmdLine := fromCmdLine;
+  rc := arParseCommand(args, nArg, @cmd);
+  if rc = SQLITE_OK then begin
+    eDbType := SHELL_OPEN_UNSPEC;
+    cmd.p := p;
+    cmd.db := p^.db;
+    if cmd.haveFile then begin
+      { deduceDatabaseType is not yet ported.  Treat any --file FILE as
+        a normal sqlar database unless --append was given (then apndvfs).
+        Bare-zip detection is gated on the upstream sniff that we don't
+        have yet — explicit .zip handling still works through zipfile
+        vtab when --file points into an existing ZIP and the open-mode
+        was set elsewhere. }
+      if p^.openMode = SHELL_OPEN_ZIPFILE then eDbType := SHELL_OPEN_ZIPFILE
+      else eDbType := SHELL_OPEN_NORMAL;
+    end else begin
+      eDbType := p^.openMode;
+    end;
+    if eDbType = SHELL_OPEN_ZIPFILE then begin
+      if (cmd.eCmd = AR_CMD_EXTRACT) or (cmd.eCmd = AR_CMD_LIST) then begin
+        if not cmd.haveFile then
+          cmd.zSrcTable := sqlite3_mprintf('zip')
+        else begin
+          z := sqlite3PfMprintf(PAnsiChar('zipfile(%Q)'),
+            [cmd.sFile]);
+          cmd.zSrcTable := z;
+        end;
+      end;
+      cmd.bZip := 1;
+    end else if cmd.haveFile then begin
+      if cmd.bAppend <> 0 then eDbType := SHELL_OPEN_APPENDVFS;
+      if (cmd.eCmd = AR_CMD_CREATE) or (cmd.eCmd = AR_CMD_INSERT)
+         or (cmd.eCmd = AR_CMD_REMOVE) or (cmd.eCmd = AR_CMD_UPDATE) then
+        flags := SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE
+      else
+        { Upstream uses READONLY here.  The Pascal pager currently
+          rejects schema-load reads against a freshly-opened READONLY
+          db (no journal-recovery path → SQLITE_READONLY).  Open RW for
+          read-only commands too; we only emit reads under .ar -t/-x. }
+        flags := SQLITE_OPEN_READWRITE;
+      cmd.db := nil;
+      if cmd.bDryRun <> 0 then begin
+        if eDbType = SHELL_OPEN_APPENDVFS then
+          shellSPutZ(Format('-- open database ''%s'' using ''apndvfs'''#10,
+            [cmd.sFile]))
+        else
+          shellSPutZ(Format('-- open database ''%s'''#10, [cmd.sFile]));
+      end;
+      if eDbType = SHELL_OPEN_APPENDVFS then
+        rc := sqlite3_open_v2(PAnsiChar(cmd.sFile), @cmd.db, flags, 'apndvfs')
+      else
+        rc := sqlite3_open_v2(PAnsiChar(cmd.sFile), @cmd.db, flags, nil);
+      if rc <> SQLITE_OK then begin
+        shellEPutZ(Format('cannot open file: %s (%s)'#10,
+          [cmd.sFile, AnsiString(sqlite3_errmsg(cmd.db))]));
+        goto end_ar_command;
+      end;
+      sqlite3FileioInit(cmd.db);
+      sqlite3SqlarInit(cmd.db);
+    end;
+
+    if (cmd.zSrcTable = nil) and (cmd.bZip = 0)
+       and (cmd.eCmd <> AR_CMD_HELP) then
+    begin
+      if cmd.eCmd <> AR_CMD_CREATE then begin
+        { Upstream uses sqlite3_table_column_metadata; that path needs a
+          loaded schema, which is lazy in the Pascal port.  Probe via a
+          trivial SELECT — present-table → SQLITE_OK, missing → error. }
+        if sqlite3_exec(cmd.db, 'SELECT 1 FROM sqlar LIMIT 1',
+                        nil, nil, nil) <> SQLITE_OK then
+        begin
+          shellEPutZ('database does not contain an ''sqlar'' table'#10);
+          rc := SQLITE_ERROR;
+          goto end_ar_command;
+        end;
+      end;
+      cmd.zSrcTable := sqlite3_mprintf('sqlar');
+    end;
+
+    case cmd.eCmd of
+      AR_CMD_CREATE:  rc := arCreateOrUpdateCommand(@cmd, 0, 0);
+      AR_CMD_EXTRACT: rc := arExtractCommand(@cmd);
+      AR_CMD_LIST:    rc := arListCommand(@cmd);
+      AR_CMD_HELP:    arUsage;
+      AR_CMD_INSERT:  rc := arCreateOrUpdateCommand(@cmd, 1, 0);
+      AR_CMD_REMOVE:  rc := arRemoveCommand(@cmd);
+      AR_CMD_UPDATE:  rc := arCreateOrUpdateCommand(@cmd, 1, 1);
+    end;
+  end;
+end_ar_command:
+  if cmd.db <> p^.db then begin
+    if cmd.db <> nil then closeDb(cmd.db);
+  end;
+  if cmd.zSrcTable <> nil then sqlite3_free(cmd.zSrcTable);
+  Result := rc;
+end;
+
+procedure cmdArchive(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt);
+begin
+  arDotCommand(p, 0, args, nArg);
+end;
+
 function doMetaCommand(const zLine: AnsiString; p: PShellState): i32;
 var
   zCmd: AnsiString;
@@ -5979,6 +6826,9 @@ begin
   if zCmd = 'dbtotxt' then begin cmdDbtotxt(p); Exit; end;
   if zCmd = 'dump' then begin cmdDump(p, args, nArg); Exit; end;
   if zCmd = 'sha3sum' then begin cmdSha3sum(p, args, nArg); Exit; end;
+  if (zCmd = 'archive') or (zCmd = 'ar') then begin
+    cmdArchive(p, args, nArg); Exit;
+  end;
   if zCmd = 'print' then begin
     for i := 0 to nArg - 1 do begin
       if i > 0 then Write(' ');
