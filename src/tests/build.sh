@@ -166,6 +166,7 @@ compile_test TestBytecodeParity
 compile_test TestWhereCorpus
 compile_test DiagAggWhere
 compile_test DiagAnalyze
+compile_test DiagAppendvfs
 compile_test DiagArith
 compile_test DiagAutoIdx
 compile_test DiagBloom

@@ -100,6 +100,7 @@ uses
   passqlite3fossildelta,
   passqlite3csv,
   passqlite3closure,
+  passqlite3appendvfs,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -664,6 +665,10 @@ begin
     transitive_closure(tablename=…, idcolumn=…, parentcolumn=…) computes
     the transitive closure of a parent/child relation in a real table. }
   sqlite3ClosureInit(p^.db);
+  { Phase 10.1.84 — appendvfs VFS shim from ext/misc/appendvfs.c (672 C
+    lines): allows opening a SQLite database appended at the end of
+    another file (e.g. an executable) via `sqlite3_open_v2(..., "apndvfs")`. }
+  sqlite3AppendvfsInit(p^.db);
   { vtablog (ext/misc/vtablog.c, 720 C lines) is exported but NOT
     auto-installed — every callback writes a trace line to stdout, so
     auto-registering would corrupt every shell session.  Loading it

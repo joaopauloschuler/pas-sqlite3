@@ -1434,6 +1434,35 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.84** ext/misc/appendvfs.c (672 C lines) ported as new unit
+       `passqlite3appendvfs.pas` (~530 lines).  Provides the `apndvfs`
+       VFS shim that allows opening a SQLite database appended onto the
+       end of another file (e.g. an executable).  Implements the
+       Start-Of-SQLite3-NNNNNNNN trailer protocol with NNNNNNNN as a
+       big-endian 64-bit offset to page 1, the APND_ROUNDUP=4096 page
+       boundary alignment, and the 1GiB combined-size cap.  All 19
+       sqlite3_io_methods entries (close/read/write/truncate/sync/
+       fileSize/lock/unlock/checkReservedLock/fileControl/sectorSize/
+       deviceCharacteristics/shmMap/shmLock/shmBarrier/shmUnmap/fetch/
+       unfetch) and all 19 sqlite3_vfs entries pass through to the
+       underlying VFS via the ORIGFILE/ORIGVFS macros (translated to
+       inline helpers).  Auto-registered via `sqlite3AppendvfsInit` in
+       shell openDb.  xOpen behaviour matches the upstream rule set:
+       (1) empty file is ordinary DB; (2) trailer-bearing file is
+       appended DB; (3) file starting with "SQLite format 3\0" is
+       ordinary; (4) with SQLITE_OPEN_CREATE, append after rounding
+       prefix size up to APND_ROUNDUP; (5) otherwise SQLITE_CANTOPEN.
+       Verified end-to-end via new `bin/DiagAppendvfs`: prefix file
+       (39-byte non-DB content) → open with CREATE → write 3-row table
+       → close → re-open with READWRITE via `apndvfs` → SELECT count(*)
+       and max() round-trip → confirm trailing Start-Of-SQLite3- marker
+       present and prefix bytes preserved at offset 0.  Implementation
+       note: a `pApndFile` local in `apndOpen` initially collided with
+       the `PApndFile` type alias because Pascal is case-insensitive —
+       renamed to `paf` to disambiguate (consistent with the C source's
+       own field name).  TestExplainParity 1026/1026; DiagFeatureProbe /
+       DiagOps clean.
+
   [X] **10.1.83** ext/misc/closure.c (971 C lines) ported as new unit
        `passqlite3closure.pas` (~640 lines).  Provides the
        `transitive_closure` virtual table for walking parent/child
