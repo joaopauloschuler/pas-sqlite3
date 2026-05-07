@@ -817,16 +817,16 @@ existing dispatcher.
        Per-command handlers land in 10.1.7..10.1.59.
 
 - [ ] **10.1b** Output modes + formatting controls. Gate: `tests/cli/10b_modes/`.  
-  - [ ] `.mode`
+  - [ ] **10.1b.1** `.mode`
   (`list`, `line`, `column`, `csv`, `tabs`, `html`, `insert`, `quote`,
   `json`, `markdown`, `table`, `box`, `tcl`, `ascii`), 
-  - [ ] `.headers`,
-  - [ ] `.separator`, 
-  - [ ] `.nullvalue`, 
-  - [ ] `.width`, 
-  - [ ] `.echo`, 
-  - [ ] `.changes`,
-  - [ ] `.print` / `.parameter` (formatting-only subset), Unicode-width
+  - [ ] **10.1b.2** `.headers`,
+  - [ ] **10.1b.3** `.separator`, 
+  - [ ] **10.1b.4** `.nullvalue`, 
+  - [ ] **10.1b.5** `.width`, 
+  - [ ] **10.1b.6** `.echo`, 
+  - [ ] **10.1b.7** `.changes`,
+  - [ ] **10.1b.8** `.print` / `.parameter` (formatting-only subset), Unicode-width
   helpers, box-drawing renderer.
 
   [X] **10.1.7** `.mode` dispatcher (~10470) — `modeChange` /
@@ -888,13 +888,13 @@ existing dispatcher.
        <, >, &, ", ') wired into emitRowOne MODE_Html.
 
 - [ ] **10.1c** Schema introspection dot-commands. Gate: `tests/cli/10c_schema/`. 
-  - [ ] `.schema`,
-  - [ ] `.tables`, 
-  - [ ] `.indexes`, 
-  - [ ] `.databases`, 
-  - [ ] `.fullschema`,
-  - [ ] `.lint fkey-indexes`, 
-  - [ ] `.expert` (read-only subset).  
+  - [ ] **10.1c.1** `.schema`,
+  - [ ] **10.1c.2** `.tables`, 
+  - [ ] **10.1c.3** `.indexes`, 
+  - [ ] **10.1c.4** `.databases`, 
+  - [ ] **10.1c.5** `.fullschema`,
+  - [ ] **10.1c.6** `.lint fkey-indexes`, 
+  - [ ] **10.1c.7** `.expert` (read-only subset).  
 
   [~] **10.1.15** `.schema` cmdSchema now mirrors shell.c.in:10575..
        10711.  Walks pragma_database_list, builds a UNION ALL across
