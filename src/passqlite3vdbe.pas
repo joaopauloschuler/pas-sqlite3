@@ -5576,6 +5576,7 @@ function sqlite3_step(pStmt: PVdbe): i32;
 var
   rc: i32;
   db: PTsqlite3;
+  iElapse, iNowProf: i64;
 begin
   if pStmt = nil then begin Result := SQLITE_MISUSE; Exit; end;
   db := pStmt^.db;
@@ -5592,18 +5593,39 @@ begin
       if (pStmt^.vdbeFlags and VDBF_ReadOnly) = 0 then Inc(db^.nVdbeWrite);
       if (pStmt^.vdbeFlags and VDBF_IsReader) <> 0 then Inc(db^.nVdbeRead);
     end;
+    { vdbeapi.c:806..813 — capture startTime for SQLITE_TRACE_PROFILE. }
+    if (db <> nil) and (pStmt^.zSql <> nil)
+       and ((db^.mTrace and (SQLITE_TRACE_PROFILE or SQLITE_TRACE_XPROFILE)) <> 0)
+       and (db^.init.busy = 0) then begin
+      sqlite3OsCurrentTimeInt64(Psqlite3_vfs(db^.pVfs), @pStmt^.startTime);
+    end else begin
+      pStmt^.startTime := 0;
+    end;
     pStmt^.pc := 0;
     pStmt^.eVdbeState := VDBE_RUN_STATE;
   end;
 
+  if db <> nil then Inc(db^.nVdbeExec);
   if (pStmt^.vdbeFlags and VDBF_EXPLAIN_MASK) <> 0 then
     rc := sqlite3VdbeList(pStmt)
   else
     rc := sqlite3VdbeExec(pStmt);
+  if db <> nil then Dec(db^.nVdbeExec);
 
   if rc = SQLITE_ROW then begin
     if db <> nil then db^.errCode := SQLITE_ROW;
     Result := SQLITE_ROW; Exit;
+  end;
+
+  { vdbeapi.c:62..79 — invoke SQLITE_TRACE_PROFILE callback at end of step. }
+  if (db <> nil) and (pStmt^.startTime > 0) then begin
+    iNowProf := 0;
+    sqlite3OsCurrentTimeInt64(Psqlite3_vfs(db^.pVfs), @iNowProf);
+    iElapse := (iNowProf - pStmt^.startTime) * 1000000;
+    if ((db^.mTrace and SQLITE_TRACE_PROFILE) <> 0)
+       and Assigned(db^.trace.xV2) then
+      db^.trace.xV2(SQLITE_TRACE_PROFILE, db^.pTraceArg, pStmt, @iElapse);
+    pStmt^.startTime := 0;
   end;
 
   pStmt^.pResultRow := nil;
@@ -7214,6 +7236,8 @@ var
   pX:      PBtree;
   pKInfo:  PKeyInfo; { renamed: pKeyInfo conflicts with PKeyInfo type }
   zErr:    PAnsiChar;
+  zTrcStmt: PAnsiChar;  { OP_Init/OP_Trace stmt-trace string }
+  zTrcDup:  PAnsiChar;  { "-- %s" wrap for nested-exec trace }
   nByte:   i32;
   n:       i32;
   i:       i32;
@@ -7708,6 +7732,11 @@ begin
       v^.nResColumn := u16(pOp^.p2);
       if db^.mallocFailed <> 0 then goto no_mem;
       v^.pc := i32(pOp - aOp) + 1;  { save resume point for next call }
+      { vdbe.c:1770 — SQLITE_TRACE_ROW fanout. }
+      if (db^.mTrace and SQLITE_TRACE_ROW) <> 0 then begin
+        if Assigned(db^.trace.xV2) then
+          db^.trace.xV2(SQLITE_TRACE_ROW, db^.pTraceArg, v, nil);
+      end;
       rc := SQLITE_ROW;
       goto vdbe_return;
     end;
@@ -8011,6 +8040,31 @@ begin
     { ────── OP_Trace / OP_Init ────── (vdbe.c:9020/9046) }
     OP_Trace, OP_Init: begin
       i := 1;
+      { vdbe.c:9067..9085 — SQLITE_TRACE_STMT / LEGACY fanout. }
+      if (db^.mTrace and (SQLITE_TRACE_STMT or SQLITE_TRACE_LEGACY)) <> 0 then begin
+        if v^.minWriteFileFormat <> 254 then begin
+          if pOp^.p4.z <> nil then
+            zTrcStmt := pOp^.p4.z
+          else
+            zTrcStmt := v^.zSql;
+          if zTrcStmt <> nil then begin
+            if (db^.mTrace and SQLITE_TRACE_LEGACY) <> 0 then begin
+              { Legacy xTrace receives expanded SQL.  No expander wired in
+                this build — pass zTrcStmt verbatim to keep call shape. }
+              if Assigned(db^.trace.xLegacy) then
+                db^.trace.xLegacy(db^.pTraceArg, zTrcStmt);
+            end else if db^.nVdbeExec > 1 then begin
+              zTrcDup := sqlite3MPrintf(db, '-- %s', [zTrcStmt]);
+              if Assigned(db^.trace.xV2) then
+                db^.trace.xV2(SQLITE_TRACE_STMT, db^.pTraceArg, v, zTrcDup);
+              sqlite3DbFree(db, zTrcDup);
+            end else begin
+              if Assigned(db^.trace.xV2) then
+                db^.trace.xV2(SQLITE_TRACE_STMT, db^.pTraceArg, v, zTrcStmt);
+            end;
+          end;
+        end;
+      end;
       if pOp^.p1 >= sqlite3GlobalConfig.iOnceResetThreshold then begin
         if pOp^.opcode = OP_Trace then begin
           { C `break;` — exit the case without jumping; advance to next op. }

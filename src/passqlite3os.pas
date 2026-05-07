@@ -1730,6 +1730,15 @@ begin
       PPointer(pArg)^ := pf^.pVfs;
       Result := SQLITE_OK;
     end;
+    SQLITE_FCNTL_VFSNAME: begin
+      { os_unix.c:4191 — return a sqlite3_malloc'd copy of the VFS name
+        through *pArg.  The shell uses this for `.vfsname`. }
+      if pf^.pVfs <> nil then
+        PPointer(pArg)^ := sqlite3StrDup(Psqlite3_vfs(pf^.pVfs)^.zName)
+      else
+        PPointer(pArg)^ := nil;
+      Result := SQLITE_OK;
+    end;
     else
       Result := SQLITE_NOTFOUND;
   end;

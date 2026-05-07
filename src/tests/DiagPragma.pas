@@ -160,6 +160,7 @@ begin
 
   // ---- numeric / size PRAGMAs ----
   Probe('page_size default',             '', 'PRAGMA page_size');
+  Probe('page_count fresh',              '', 'PRAGMA page_count');
   Probe('max_page_count',                '', 'PRAGMA max_page_count');
   Probe('cache_size default',            '', 'PRAGMA cache_size');
   Probe('cache_spill default',           '', 'PRAGMA cache_spill');

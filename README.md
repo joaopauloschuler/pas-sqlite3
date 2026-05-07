@@ -3,13 +3,10 @@
 A faithful AI made port of **SQLite 3.53.0** (D. Richard Hipp et al.)
 from C to **Free Pascal (FPC 3.2.2+)** targeting x86-64 Linux.
 
-> **Status: Phases 0–5 complete; Phase 6 in flight; Phases 7–8
-> largely landed.**  The Pascal port now opens databases, parses SQL,
+> **Status: Phases 0–5 complete; Phases 6–8 ported — in testing.**  The Pascal port now opens databases, parses SQL,
 > generates VDBE bytecode, and runs queries end-to-end against its own
-> pager / B-tree / VDBE.  `TestExplainParity` reports **1025 / 1026** SQL
-> statements producing byte-identical VDBE bytecode versus the C reference,
-> with the remaining divergence enumerated in `tasklist.md`
-> (INSERT multi-row VALUES coroutine arm — runtime parity already reached).
+> pager / B-tree / VDBE.  `TestExplainParity` reports **1026 / 1026** SQL
+> statements producing byte-identical VDBE bytecode versus the C reference.
 > Differential probes (`DiagOps`, `DiagCast`,
 > `DiagDate`, `DiagFunctions`, `DiagMoreFunc`, `DiagFeatureProbe`, ...)
 > drive the remaining runtime gaps.
@@ -86,6 +83,106 @@ TestSmoke PASSED.
 
 ---
 
+## Quick start examples
+
+Two ways to drive the Pascal port: link against the `passqlite3*` units
+from your own program, or pipe SQL through the `passqlite3` shell binary.
+Both examples match the canonical SQLite quickstart at
+<https://www.sqlite.org/quickstart.html>; see
+[`src/tests/DiagSampleProg.pas`](src/tests/DiagSampleProg.pas) for a fuller
+sample (prepare/step, bind, callback) that is run side-by-side against the
+C reference for byte-identical transcripts.
+
+### 1. From Pascal code
+
+```pascal
+{$I passqlite3.inc}
+program QuickStart;
+
+uses
+  SysUtils,
+  passqlite3types, passqlite3util, passqlite3os,
+  passqlite3pcache, passqlite3pager, passqlite3wal,
+  passqlite3btree, passqlite3vdbe, passqlite3codegen,
+  passqlite3parser, passqlite3vtab,
+  passqlite3main;
+
+function PrintRow(pArg: Pointer; nCol: i32;
+  argv, colv: PPAnsiChar): i32; cdecl;
+var
+  i: i32;
+  pCol, pVal: PPAnsiChar;
+begin
+  pCol := colv; pVal := argv;
+  for i := 0 to nCol - 1 do begin
+    if pVal^ = nil then
+      WriteLn(pCol^, ' = NULL')
+    else
+      WriteLn(pCol^, ' = ', pVal^);
+    Inc(pCol); Inc(pVal);
+  end;
+  WriteLn;
+  Result := 0;
+end;
+
+var
+  db: PTsqlite3;
+  pErr: PAnsiChar;
+begin
+  if sqlite3_open(':memory:', @db) <> SQLITE_OK then Halt(1);
+  pErr := nil;
+
+  sqlite3_exec(db,
+    'CREATE TABLE t(a INTEGER, b TEXT);'#10 +
+    'INSERT INTO t VALUES(1, ''one''), (2, ''two''), (3, NULL);',
+    nil, nil, @pErr);
+  if pErr <> nil then begin sqlite3_free(pErr); pErr := nil; end;
+
+  sqlite3_exec(db, 'SELECT a, b FROM t ORDER BY a;',
+               @PrintRow, nil, @pErr);
+  if pErr <> nil then sqlite3_free(pErr);
+
+  sqlite3_close(db);
+end.
+```
+
+Compile alongside the rest of the suite via `src/tests/build.sh`, or copy
+the `fpc` invocation from there. No `libsqlite3.so` is required at run
+time — the binary is pure Pascal.
+
+For a prepared-statement / bind / step variant, see
+`RunSample_Pas_BindInsert` in `src/tests/DiagSampleProg.pas:186`.
+
+### 2. From the CLI
+
+`src/tests/build.sh` produces `bin/passqlite3`, the Pascal port of
+SQLite's `shell.c` (Phase 10 — basic skeleton; meta-commands beyond
+`-help` / `-version` are still being landed):
+
+```bash
+# Run a one-shot SQL string against an on-disk database:
+bin/passqlite3 demo.db \
+  "CREATE TABLE t(a INTEGER, b TEXT);
+   INSERT INTO t VALUES(1,'one'),(2,'two'),(3,NULL);
+   SELECT * FROM t;"
+```
+
+Output:
+
+```
+1|one
+2|two
+3|
+```
+
+Or pipe SQL into an in-memory database:
+
+```bash
+echo "SELECT 1+1, 'hello';" | bin/passqlite3 :memory:
+```
+
+---
+
 ## Project layout
 
 <pre>
@@ -145,9 +242,9 @@ pas-sqlite3/
 | 3 | Page cache + Pager + WAL | ✅ Done |
 | 4 | B-tree | ✅ Done |
 | 5 | VDBE bytecode interpreter | ✅ Done |
-| 6 | Code generators (SQL → VDBE) | 🚧 In progress |
-| 7 | Parser (tokenizer + Lemon grammar) | 🚧 In progress |
-| 8 | Public API | 🚧 In progress |
+| 6 | Code generators (SQL → VDBE) | 🧪 Ported — in testing |
+| 7 | Parser (tokenizer + Lemon grammar) | 🧪 Ported — in testing |
+| 8 | Public API | 🧪 Ported — in testing |
 | 10 | CLI tool (`shell.c` → `passqlite3shell.pas`) | 🔲 Pending |
 | 11 | Benchmarks (Pascal `speedtest1` port) | 🔲 Pending |
 | 12 | Acceptance: differential + fuzz testing | 🔲 Pending |

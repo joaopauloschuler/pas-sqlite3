@@ -230,6 +230,17 @@ compile_test TestFuzzDiff
 compile_test TestReferenceVectors
 compile_test Benchmark
 
+# ---- Phase 10: passqlite3 CLI tool ----
+# Lives under src/, not src/tests/, so compile it directly here rather
+# than via compile_test().  Output binary lands at bin/passqlite3.
+SHELL_SRC="$SRC_DIR/passqlite3shell.pas"
+if [ -f "$SHELL_SRC" ]; then
+  echo
+  echo "Compiling passqlite3shell.pas ..."
+  fpc $FPC_FLAGS "$SHELL_SRC" -opassqlite3
+  echo "passqlite3shell compiled -> $BIN_DIR/passqlite3"
+fi
+
 # ---- Step 3: Clean compiled Pascal artefacts ----
 find "$SRC_DIR"    -maxdepth 3 \( -name '*.ppu' -o -name '*.o' -o -name '*.compiled' -o -name '*.s' \) -delete
 find "$BIN_DIR"    -maxdepth 1 \( -name '*.ppu' -o -name '*.o' -o -name '*.compiled' -o -name '*.s' \) -delete

@@ -7757,6 +7757,45 @@ begin
   end;
 end;
 
+{ flagUnresolvedTKID — Phase 7.4e companion.  After the SrcList-bound and
+  trigger-NEW/OLD passes, any surviving TK_ID is genuinely unresolved.
+  Mirror resolve.c:lookupName tail (resolve.c:784..795): try the
+  TK_ID → TK_TRUEFALSE rewrite (so bare `true`/`false`/`null` resolve);
+  if that fails too, emit "no such column: X" and pass parse->nErr up.
+  Without this, INSERT INTO t VALUES('k', hello) silently bound NULL
+  instead of raising "no such column: hello" the way the C reference
+  does (and the way SELECT hello FROM t already does via the heavier
+  sqlite3ResolveSelectNames walker). }
+procedure flagUnresolvedTKID(pParse: PParse; pE: PExpr);
+var
+  i:      i32;
+  pList_: PExprList;
+begin
+  if pE = nil then Exit;
+  if pParse = nil then Exit;
+  if pParse^.nErr > 0 then Exit;
+  if pE^.op = TK_ID then
+  begin
+    if sqlite3ExprIdToTrueFalse(pE) = 0 then
+    begin
+      if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
+        sqlite3ErrorMsg(pParse,
+          PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+    end;
+    Exit;
+  end;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  flagUnresolvedTKID(pParse, pE^.pLeft);
+  flagUnresolvedTKID(pParse, pE^.pRight);
+  if (pE^.flags and EP_xIsSelect) = 0 then
+  begin
+    pList_ := pE^.x.pList;
+    if pList_ <> nil then
+      for i := 0 to pList_^.nExpr - 1 do
+        flagUnresolvedTKID(pParse, ExprListItems(pList_)[i].pExpr);
+  end;
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
@@ -7764,6 +7803,14 @@ begin
     if pNC^.pParse <> nil then
       resolveTriggerNewOld(pNC^.pParse, pExpr);
     resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
+    if pNC^.pParse <> nil then
+    begin
+      flagUnresolvedTKID(pNC^.pParse, pExpr);
+      if pNC^.pParse^.nErr > 0 then
+      begin
+        Result := SQLITE_ERROR; Exit;
+      end;
+    end;
   end;
   Result := SQLITE_OK;
 end;
@@ -20207,7 +20254,7 @@ begin
   pEList   := pSel^.pEList;
   v        := pParse^.pVdbe;
   db       := pParse^.db;
-  if (v = nil) or (pTabList = nil) or (pEList = nil) then Exit;
+  if (v = nil) or (pEList = nil) then Exit;
   pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_ColNamesSet;
   fullName := (db^.flags and SQLITE_FullColNames) <> 0;
   srcName  := (db^.flags and SQLITE_ShortColNames) <> 0;
@@ -22760,6 +22807,17 @@ begin
      and (pDest^.eDest <> SRT_Upfrom)
      and (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
+  { Mirror select.c:7682..7684 — emit OP_ResultRow column names early, so
+    compound + multiSelectByMerge dispatch (and any path that recurses into
+    sqlite3Select with SRT_Coroutine destinations) still publishes nResColumn
+    on the top-level VDBE.  Without this, sqlite3_column_count returns 0
+    for `SELECT 1 UNION ALL SELECT 2 ORDER BY 1` and the shell renders
+    blank rows. }
+  if pDest^.eDest = SRT_Output then begin
+    if sqlite3GetVdbe(pParse) <> nil then
+      sqlite3GenerateColumnNames(pParse, p);
+  end;
+
   if p^.pPrior <> nil then begin
     { Recursive-CTE arm of multiSelect (select.c:2976..2978).  Must come
       first — the body inside generateWithRecursiveQuery rewrites the
@@ -24532,10 +24590,15 @@ begin
       that slot, so disable OMITREF on the LIMIT path. }
     if bUseSorter = 0 then bSortOmitRef := 0;
     if bSortOmitRef <> 0 then
-    begin
       nPrefixReg := sortNKey;
-      pParse^.nMem := pParse^.nMem + nPrefixReg;
-    end;
+    { Bug 6.12 fix: do NOT bump nMem here.  Mirror C select.c:1181..1186 —
+      the nPrefixReg slots are reserved *inside* selectInnerLoop, after
+      sqlite3WhereBegin has already emitted any WHERE-clause constants
+      (e.g. LIKE pattern / ESCAPE arg).  Reserving them early caused the
+      WHERE-LIKE escape constant register to overlap with the sorter
+      OMITREF prefix slot, so the sorter MakeRecord stomped the escape
+      between loop iterations and patternCompare raised "ESCAPE
+      expression must be a single character" on the second row. }
     { OpenEphemeral p2 mirrors C select.c:8211 —
       pOrderBy->nExpr + 1 + pEList->nExpr.  The +1 reserves the rowid /
       sequence slot in the sorter row layout; later promoted to
@@ -24604,6 +24667,12 @@ begin
     slot is still reserved, matching C's register-allocation order). }
   if pDest^.iSdst = 0 then
   begin
+    { Bug 6.12 fix: reserve the OMITREF prefix slots here, mirroring
+      C select.c:1181..1186, so they sit between the WHERE-clause
+      registers and iSdst (and never overlap with WHERE-LIKE
+      constants reserved during sqlite3WhereBegin). }
+    if (bSort <> 0) and (nPrefixReg > 0) then
+      pParse^.nMem := pParse^.nMem + nPrefixReg;
     pDest^.iSdst := pParse^.nMem + 1;
     pParse^.nMem := pParse^.nMem + nResultCol;
   end
@@ -41477,6 +41546,16 @@ begin
     Exit;
   end;
 
+  { page_count — pragma.c:663 (PragTyp_PAGE_COUNT, 'p' branch).
+    OP_Pagecount returns sqlite3BtreeLastPage(pBt). }
+  if SameText(zName, 'page_count') and (pValue = nil) then begin
+    sqlite3VdbeUsesBtree(v, iDb);
+    sqlite3VdbeAddOp2(v, OP_Pagecount, iDb, 1);
+    sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
+    sqlite3VdbeReusable(v);
+    Exit;
+  end;
+
   { Constant-default string pragmas — pragma.c PragTyp_JOURNAL_MODE /
     PragTyp_LOCKING_MODE.  In-memory db default journal_mode is "memory"
     and locking_mode is "normal"; the Pas port does not maintain these
@@ -42111,21 +42190,47 @@ begin
   Result := SQLITE_ERROR;
 end;
 
+type
+  TCollNeededProc = procedure(pCtx: Pointer; db: PTsqlite3;
+    eTextRep: i32; zName: PAnsiChar); cdecl;
+
+procedure callCollNeeded(db: PTsqlite3; enc: u8; zName: PAnsiChar);
+var
+  zExternal: PAnsiChar;
+  cb: TCollNeededProc;
+begin
+  if db^.xCollNeeded <> nil then begin
+    zExternal := sqlite3DbStrDup(db, zName);
+    if zExternal = nil then Exit;
+    cb := TCollNeededProc(db^.xCollNeeded);
+    cb(db^.pCollNeededArg, db, enc, zExternal);
+    sqlite3DbFree(db, zExternal);
+  end;
+  { xCollNeeded16 path omitted: SQLITE_OMIT_UTF16-equivalent in Pas port. }
+end;
+
 function sqlite3GetCollSeq(pParse: PParse; enc: u8;
   pColl: Pointer; zName: PAnsiChar): Pointer;
 var
   db:  PTsqlite3;
   p:   PTCollSeq;
+  zErr: AnsiString;
 begin
   db := pParse^.db;
   p := PTCollSeq(pColl);
   if p = nil then
-    p := PTCollSeq(sqlite3FindCollSeq(db, enc, zName, 1));
+    p := PTCollSeq(sqlite3FindCollSeq(db, enc, zName, 0));
+  if (p = nil) or (p^.xCmp = nil) then begin
+    callCollNeeded(db, enc, zName);
+    p := PTCollSeq(sqlite3FindCollSeq(db, enc, zName, 0));
+  end;
   if (p <> nil) and (p^.xCmp = nil) and
      (synthCollSeq(db, p) <> SQLITE_OK) then begin
-    sqlite3ErrorMsg(pParse,
-      'no such collation sequence');
     p := nil;
+  end;
+  if p = nil then begin
+    zErr := 'no such collation sequence: ' + AnsiString(zName);
+    sqlite3ErrorMsg(pParse, PAnsiChar(zErr));
   end;
   Result := p;
 end;
@@ -42354,10 +42459,18 @@ begin
                     SQLITE_DIRECTONLY or SQLITE_SUBTYPE or SQLITE_INNOCUOUS));
   p^.funcFlags  := p^.funcFlags or encByte;
   p^.pUserData  := pUserData;
-  p^.xSFunc     := TxSFuncProc(xSFunc);
+  { main.c:2050 — `p->xSFunc = xSFunc ? xSFunc : xStep;`.  The xStep
+    fallback is what makes aggregate-only registrations findable at
+    runtime: sqlite3FindFunction only returns a hit when xSFunc<>nil
+    (codegen.pas:42378). }
+  if xSFunc <> nil then
+    p^.xSFunc   := TxSFuncProc(xSFunc)
+  else
+    p^.xSFunc   := TxSFuncProc(xStep);
   p^.xFinalize  := TxFinalProc(xFinal);
   p^.xValue     := TxValueProc(xValue);
   p^.xInverse   := TxInverseProc(xInverse);
+  p^.nArg       := i16(nArg);
   if pDestructor <> nil then begin
     pDest := PTFuncDestructor(pDestructor);
     Inc(pDest^.nRef);

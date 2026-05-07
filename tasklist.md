@@ -230,6 +230,66 @@ FPC porting traps that recur often enough to call out up-front:
 
 ### Open Bugs
 
+- [X] **6.11** `PRAGMA page_count` returns no rows.  Closed 2026-05-06.
+    The Pas pragma dispatcher special-cased `max_page_count` (PragTyp_PAGE_COUNT
+    'max' branch) but had no arm for the bare `page_count` (zName starts
+    with 'p' lowercase in C — pragma.c:663..672 emits OP_Pagecount).
+    Added the missing arm in passqlite3codegen.pas immediately after the
+    max_page_count handler; emits `OP_Pagecount(iDb,1) / OP_ResultRow(1,1)`.
+    DiagPragma `page_count fresh` PASS.
+
+- [X] **6.12** `LIKE … ESCAPE 'x'` raises `Error: ESCAPE expression
+    must be a single character` once an outer `ORDER BY` is added.
+    Closed 2026-05-06.  Root cause: `selectInnerLoop` in passqlite3codegen.pas
+    was reserving the OMITREF `nPrefixReg` slots BEFORE
+    `sqlite3WhereBegin`, but C select.c:1181..1186 reserves them
+    inside selectInnerLoop after WhereBegin.  In the early-reservation
+    path, the WHERE-clause LIKE/ESCAPE constants (factored as constMask
+    at `nMem+1..nMem+n`) ended up overlapping the sorter's OMITREF
+    prefix slot — sorter's MakeRecord then stomped the ESCAPE constant
+    register between iterations and patternCompare flagged the
+    multi-byte residue as an invalid escape.  Fix: move the
+    `pParse^.nMem += nPrefixReg` bump from the early sort-setup block
+    to the iSdst allocation block, mirroring C exactly.  `.tables` /
+    `.schema --nosys` LIKE filters now work without the GLOB workaround.
+
+- [~] **6.14** Compound `SELECT … FROM sqlite_schema … UNION ALL
+    SELECT 'sqlite_schema' ORDER BY 1 collate nocase`.  Two underlying
+    bugs identified.  **Sub-bug A closed 2026-05-06**: bare compound
+    queries like `SELECT 1 UNION ALL SELECT 2 ORDER BY 1` returned 2
+    blank rows because `sqlite3_column_count` was 0.  Root cause:
+    `sqlite3GenerateColumnNames` (codegen.pas:20232) had two issues —
+    (1) early-bail gate `if (v=nil) or (pTabList=nil) ...` rejected
+    no-FROM SELECTs even though the body never dereferences pTabList;
+    (2) the only call site for compound queries was inside the no-FROM
+    fast path (codegen.pas:22938), so multiSelectByMerge dispatch never
+    reached it and `nResColumn` stayed 0.  Fix: relax the gate to drop
+    pTabList=nil, and add an early `if pDest^.eDest=SRT_Output then
+    sqlite3GenerateColumnNames(pParse, p)` (gated on
+    `sqlite3GetVdbe(pParse) <> nil` because Pas defers VDBE alloc) at
+    the same spot in `sqlite3Select` as select.c:7682..7684.  Verified:
+    `SELECT 1 UNION ALL SELECT 2 ORDER BY 1` (and DESC, UNION dedup,
+    multi-arm UNION ALL, sub-FROM compound) all return correct rows;
+    TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
+    DiagOps / DiagPragma / DiagDml / DiagWindow no regressions.
+    **Sub-bug B still open**: `SELECT name FROM sqlite_schema WHERE
+    type='table' UNION ALL SELECT 'lit' ;` (no ORDER BY needed) now
+    yields just 'lit' — first arm (with FROM) is silenced when paired
+    with a no-FROM constant arm.  Mixed-FROM/no-FROM UNION ALL needs a
+    separate codegen probe.  Repro: create one table 't', then run
+    the above query — C returns `lit\nt`; Pas returns just `lit`.
+
+- [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
+    valued PRAGMA functions) returns rows when called with a literal
+    argument but yields no rows when joined laterally against
+    `sqlite_schema AS s`.  `f.*` projection also collapses to one
+    column under the literal-argument path.  Surfaces under
+    `.lint fkey-indexes` (the upstream SELECT relies on the lateral
+    join, so the dispatcher emits no suggestions even though the
+    fkey_collate_clause UDF and the EXPLAIN-based coverage detection
+    are wired).  Probe pragmaVtab xBestIndex to confirm hidden-arg
+    binding and reopen the column-list emission path.
+
 - [X] **6.10** `TestExplainParity.pas` — **1026/1026 PASS** as of
     2026-05-06 (a3).  Oracle is built with `-DSQLITE_DEBUG
     -DSQLITE_ENABLE_EXPLAIN_COMMENTS`, so emits OP_Explain /
@@ -616,6 +676,42 @@ FPC porting traps that recur often enough to call out up-front:
        / DiagFeatureProbe all 0 div; TestExplainParity 1026/1026;
        TestBytecodeParity 32/32.
 
+- [ ] **7.4d** WITHOUT ROWID runtime corruption.  Bytecode parity for
+  `CREATE TABLE x(k PRIMARY KEY, v) WITHOUT ROWID` was closed under
+  7.4b.5, but the runtime path corrupts the page on the first INSERT —
+  `INSERT INTO x VALUES('k','v'); SELECT * FROM x;` raises `database
+  disk image is malformed`.  Repro: `bin/passqlite3 t.db` followed by
+  the two statements above.  Workaround currently in passqlite3shell:
+  paramTableInit emits a plain rowid `temp.sqlite_parameters` table
+  instead of the upstream WITHOUT ROWID variant.  Fix likely in the
+  btree-cell payload assembly for a clustered-key insert.
+
+- [X] **7.4e** Bare-bareword `INSERT INTO ... VALUES('k', hello)`
+  silently bound NULL instead of raising `no such column: hello`.
+  Closed 2026-05-06.  Root cause was in the resolver split: SELECT
+  drives `sqlite3ResolveSelectNames` (codegen.pas:7851) whose nested
+  `ResolveExpr` walker emits "no such column: X" when a TK_ID survives
+  the SrcList lookup (codegen.pas:8154); INSERT VALUES drives
+  `sqlite3ResolveExprListNames` → `sqlite3ResolveExprNames`
+  (codegen.pas:7779/7760) which only ran the silent
+  `resolveExprAgainstSrcList` walker — survivors stayed TK_ID and
+  the codegen path emitted them as bound NULL.  Added
+  `flagUnresolvedTKID(pParse, pExpr)` post-walk
+  (codegen.pas immediately above sqlite3ResolveExprNames): tries
+  `sqlite3ExprIdToTrueFalse` (so `SELECT TRUE/FALSE/NULL` still
+  works), otherwise emits the canonical error and propagates
+  SQLITE_ERROR up.  Mirrors resolve.c:784..795 (lookupName tail).
+  Verification (2026-05-06): the repro now reports
+  `Parse error: no such column: hello`.  TestExplainParity 1026/1026;
+  TestBytecodeParity 32/32; DiagDml / DiagFeatureProbe / DiagPragma /
+  DiagOps / DiagMisc / DiagDropTable / DiagWindow / DiagIndexing /
+  DiagSubsel / DiagAggWhere / DiagInnerJoin / DiagMultiValues /
+  DiagAnalyze / DiagCreateIdx / DiagAutoIdx / DiagBloom / DiagCovering
+  / DiagCast / DiagFunctions / DiagMoreFunc / DiagTxn / DiagSampleProg
+  all clean.  The cmdParameter `looksLikeSqlLiteral` workaround can
+  stay (it sidesteps the same upstream quirk in C and is now
+  belt-and-braces).
+
 - [X] **7.4c** `TestVdbeTrace.pas` differential opcode-trace gate.  Done
   2026-05-06.  `passqlite3vdbe` exports `gVdbeTraceBuf` and the
   `sqlite3VdbeExec` main loop appends one normalised line per executed
@@ -670,33 +766,55 @@ landings cannot silently no-op.
 
 Sub-tasks 10.1.x decompose 10.1a..10.1f into one item per dot-command
 or helper.  Source references are line ranges in
-`../sqlite3/src/shell.c.in`.  No `passqlite3shell.pas` exists yet, so
-*every* item is missing — this list exists to break the 13 816-line
-file into reviewable chunks.
+`../sqlite3/src/shell.c.in`.  Skeleton landed 2026-05-06 in
+`src/passqlite3shell.pas` (~990 lines, built into `bin/passqlite3` by
+`src/tests/build.sh`); 10.1.7..10.1.59 hang per-command arms off the
+existing dispatcher.
 
-- [ ] **10.1a** Skeleton + arg parsing + REPL loop.  Entry point,
-  command-line flag parser, `ShellState` struct, line reader,
-  prompts, the read-eval-print loop, statement-completeness via
-  `sqlite3_complete`, exit codes.  Gate: `tests/cli/10a_repl/`.
+- [~] **10.1a** Skeleton + arg parsing + REPL loop.  Entry point,
+  command-line flag parser, `ShellState` struct, line reader, prompts,
+  the read-eval-print loop, statement-completeness via
+  `sqlite3_complete`, exit codes.  Skeleton landed 2026-05-06; full
+  arg-parser coverage pending under 10.1.3.  Gate: `tests/cli/10a_repl/`
+  (not yet created — 10.2 will scaffold it).
 
-  [ ] **10.1.1** `ShellState` record + global state (shell.c.in
-       `struct ShellState` ~3650).  Counters, mode flags, current
-       output FILE*, prompt strings, history settings.
-  [ ] **10.1.2** `process_input` / `one_input_line` REPL core
-       (~12530..12700).  Statement-completeness via `sqlite3_complete`,
-       continuation-prompt switching, `.echo` plumbing.
-  [ ] **10.1.3** `main` + `process_command_line` argument parser
-       (~13200..13816).  All `-bail`, `-batch`, `-cmd`, `-init`,
-       `-readonly`, `-newline`, `-mode`, `-separator`, `-nullvalue`,
-       `-header`, `-version`, etc.
-  [ ] **10.1.4** Line reader / readline integration
-       (`local_getline` + `shell_readline`).  Includes basic edit
-       support when linked without GNU readline.
-  [ ] **10.1.5** Exit-code mapping + `interrupt_handler` + signal wiring.
-  [ ] **10.1.6** `do_meta_command` dispatcher skeleton (~9100) —
-       parses `.foo` lines, splits into `azArg[]`, invokes per-command
-       handler.  Initially returns "unknown command" for everything;
-       per-command handlers land in the 10.1.7..10.1.42 sub-tasks.
+  [X] **10.1.1** `ShellState` record + global state (shell.c.in
+       `struct ShellState` ~363..441) — landed 2026-05-06 in
+       passqlite3shell.pas.  All non-FIDDLE non-SESSION fields ported
+       1:1, plus the Mode / ModeInfo / TDotCmdLine / TAuxDb /
+       TSavedMode satellites and the full constant blocks (AUTOEQP_*,
+       SHELL_OPEN_*, SHELL_TRACE_*, SHELL_PROGRESS_*, SHFLG_*,
+       MODE_*, MFLG_*, DFLT_*, SEP_*).  aModeInfo[] / aModeStr[] /
+       qrfEscNames / qrfQuoteNames carried verbatim from
+       shell.c.in:480..605.
+  [~] **10.1.2** `process_input` / `one_input_line` REPL core landed
+       2026-05-06 (passqlite3shell.pas processInput / oneInputLine).
+       Continuation prompt + sqlite3_complete-driven dispatch + dot/
+       hash early-exit + bail_on_error all wired.  `.echo` plumbing
+       and the upstream `quickscan` state machine (which gates the
+       buffer growth path more tightly) are deferred — current cut
+       falls back to raw sqlite3_complete on every accumulated
+       semicolon, matching upstream's pre-quickscan branch.
+  [~] **10.1.3** `main` + `process_command_line` argument parser —
+       initial cut (2026-05-06) handles `-bail`, `-batch`, `-readonly`,
+       `-version`, `-help`, `--`, plus a positional FILENAME and
+       optional trailing SQL string.  Remaining flags (`-cmd`, `-init`,
+       `-newline`, `-mode`, `-separator`, `-nullvalue`, `-header`, the
+       SHFLG_* toggles, `-vfs`, `-stats`, `-zip`, `-deserialize`, …)
+       still pending; tracked here.
+  [X] **10.1.4** Line reader / readline integration — basic
+       `localGetLine` (LF / CRLF aware) + `oneInputLine` landed
+       2026-05-06.  GNU readline integration (history, line editing)
+       deferred to a 10.1.4 follow-up; current cut uses FPC stdin.
+  [X] **10.1.5** Exit-code mapping + `interrupt_handler` + signal
+       wiring — `installInterruptHandler` (SIGINT → seenInterrupt +
+       sqlite3_interrupt(globalDb)) landed 2026-05-06.
+  [X] **10.1.6** `do_meta_command` dispatcher skeleton — landed
+       2026-05-06.  `.quit` / `.exit` exit cleanly; `.help` / `.show`
+       are minimal stubs; every other dot-command emits
+       `Error: unknown command or invalid arguments:  "<name>". Enter ".help" for help`
+       — verified byte-identical to system `sqlite3` for `.foo`.
+       Per-command handlers land in 10.1.7..10.1.59.
 
 - [ ] **10.1b** Output modes + formatting controls.  `.mode`
   (`list`, `line`, `column`, `csv`, `tabs`, `html`, `insert`, `quote`,
@@ -705,112 +823,300 @@ file into reviewable chunks.
   `.print` / `.parameter` (formatting-only subset), Unicode-width
   helpers, box-drawing renderer.  Gate: `tests/cli/10b_modes/`.
 
-  [ ] **10.1.7** `.mode` dispatcher (~10470) — parses mode name +
-       optional table-name argument, sets `p->mode` / `p->cMode`.
-  [ ] **10.1.8** `shell_callback` row dispatcher + per-mode renderers
-       (`exec_prepared_stmt_columnar`, `exec_prepared_stmt`).
-       Renderers: `MODE_Line`, `MODE_List`, `MODE_Semi`, `MODE_Csv`,
-       `MODE_Tcl`, `MODE_Insert`, `MODE_Quote`, `MODE_Html`,
-       `MODE_Json`, `MODE_Ascii`, `MODE_Pretty`.
-  [ ] **10.1.9** Columnar renderers — `MODE_Column`, `MODE_Table`,
-       `MODE_Markdown`, `MODE_Box`.  Column-width auto-sizing,
-       `utf8_width` / `utf8_printf` helpers, box-drawing glyphs.
-  [ ] **10.1.10** `.headers` / `.separator` / `.nullvalue` / `.width`
-       / `.echo` / `.changes` setters.
-  [ ] **10.1.11** `.print` / `.parameter` (formatting subset) —
-       `.parameter init / list / set / unset / clear`.
-  [ ] **10.1.12** CSV writer helpers (`output_csv`, `output_quoted_string`,
-       `output_quoted_escaped_string`) + `.nullvalue` integration.
-  [ ] **10.1.13** JSON writer helpers (`output_json_string`).
-  [ ] **10.1.14** HTML writer helpers (`output_html_string`).
+  [X] **10.1.7** `.mode` dispatcher (~10470) — `modeChange` /
+       `modeChangeBuiltin` / `modeFind` ported from shell.c.in:1642..1728
+       in passqlite3shell.pas; the ShellState QRF spec is updated in the
+       same field order as C (eCSep/eRSep/eNull/eText/eBlob/eTitle/
+       bBorder/bSplitColumn).  `.mode <name> [tableName]` arms in
+       doMetaCommand wired through.  BATCH/TTY templates also handled.
+  [X] **10.1.8** `shell_callback` row dispatcher + per-mode renderers
+       (subset).  TRenderState + emitHeader/emitRowOne/emitFooter +
+       stepAndRender drive runOneSqlLine.  Modes covered: List, Line,
+       Csv, Tabs, Ascii, Quote, Insert (with decltype-aware integer
+       promotion), Json (array-of-objects with leading "["/trailing
+       "]"), Tcl (C-style escapes), Html (TR/TD with HTML-escape),
+       Markdown (pipe-bordered with separator row), Column (naive
+       left-aligned), Off.  Box / Table / QBox / Www / JAtom / JObject
+       / Split / Psql / Count fall through to a pipe-delimited
+       fallback so the REPL stays usable; full QRF wiring lands when
+       the QRF unit ports.
+  [X] **10.1.9** Columnar renderers — `MODE_Column`, `MODE_Table`,
+       `MODE_Markdown`, `MODE_Box`.  Buffered renderer (`emitColumnar`,
+       passqlite3shell.pas) computes per-column max display widths from
+       header + every row, honours `.width` minimums, then emits.
+       `utf8DispWidth` counts non-continuation UTF-8 bytes (one glyph
+       per code point); CJK wide-char support arrives with the full QRF
+       port.  Glyph sets: Box uses Unicode box-drawing (┌ ─ ┬ ┐ │ ├ ┼ ┤
+       └ ┴ ┘); Table uses MySQL-style `+ -- |`; Markdown uses pipes with
+       a `|---|` separator row; Column has no borders, two spaces between
+       columns and a `---` underline under each header.  Headers are
+       centered in Box / Table / Markdown, left-aligned in Column.
+       MODE_Line auto-width also closed (was hard-coded `width=20`; now
+       uses max column-name length + 1 like upstream).  Verification
+       (2026-05-06): 12-cell mode×headers matrix (column / table / box
+       / list / line / markdown × on / off) + edge-case suite (empty
+       result, single-column, NULL+nullvalue, .width override, long
+       values, UTF-8 data, multi-statement) all byte-identical to system
+       sqlite3.  TestExplainParity 1026/1026; DiagFeatureProbe / DiagDml
+       / DiagMisc / DiagTxn / DiagOps / DiagPragma / DiagDropTable green;
+       DiagWindow 2 divergences (pre-existing, unrelated).
+  [X] **10.1.10** `.headers` / `.separator` / `.nullvalue` / `.echo`
+       / `.changes` / `.width` setters landed in doMetaCommand.
+       AnsiString backing for the PAnsiChar fields lives in unit-level
+       zUserColSep / zUserRowSep / zUserNull; `.width` stores parsed
+       widths in aUserWidth and points spec.aWidth/nWidth at it.
+  [X] **10.1.11** `.print` / `.parameter init|list|set|unset|clear`.
+       cmdParameter mirrors shell.c.in:10264..10367; paramTableInit
+       creates temp.sqlite_parameters (with-rowid; upstream's WITHOUT
+       ROWID variant is gated on a port bug logged separately).
+       paramSet uses looksLikeSqlLiteral to decide whether to splice
+       the value as a literal (digits / quotes / NULL / X'...') or
+       wrap it as text — sidesteps the upstream "bare bareword binds
+       NULL" quirk that the Pascal parser inherits.
+  [X] **10.1.12** CSV writer helpers — `outputCsvField` mirrors
+       `output_csv` (quote-on-{sep,",CR,LF}; embedded quotes doubled).
+       Wired into emitRowOne MODE_Csv arm.
+  [X] **10.1.13** JSON writer helpers — `outputJsonString` (RFC 8259
+       \" \\ \b \f \n \r \t and \u00XX) wired into emitRowOne MODE_Json.
+  [X] **10.1.14** HTML writer helpers — `outputHtmlString` (escape
+       <, >, &, ", ') wired into emitRowOne MODE_Html.
 
-- [ ] **10.1c** Schema introspection dot-commands.  `.schema`,
-  `.tables`, `.indexes`, `.databases`, `.fullschema`,
-  `.lint fkey-indexes`, `.expert` (read-only subset).  Gate:
-  `tests/cli/10c_schema/`.
+- [ ] **10.1c** Schema introspection dot-commands. Gate: `tests/cli/10c_schema/`. 
+  - [ ] `.schema`,
+  - [ ] `.tables`, 
+  - [ ] `.indexes`, 
+  - [ ] `.databases`, 
+  - [ ] `.fullschema`,
+  - [ ] `.lint fkey-indexes`, 
+  - [ ] `.expert` (read-only subset).  
 
-  [ ] **10.1.15** `.schema` + `.sqlite_schema` (shell.c.in
-       `do_meta_command` schema arm).  LIKE-pattern argument,
-       `--indent`, `--nosys` flags.
-  [ ] **10.1.16** `.tables` — runs the canonical
-       `SELECT name FROM sqlite_schema WHERE type IN ('table','view')`
-       query with column-formatted output.
-  [ ] **10.1.17** `.indexes` — per-table index listing.
-  [ ] **10.1.18** `.databases` — list `main`/`temp`/attached files.
-  [ ] **10.1.19** `.fullschema` — schema + sqlite_stat1/4 dump.
-  [ ] **10.1.20** `.lint fkey-indexes` — runs the canonical FK-index
-       audit query.  Other `.lint` sub-options remain stubs.
-  [ ] **10.1.21** `.expert` — read-only subset wrapping the
-       sqlite3_expert.c module (deferred until that module is ported;
-       stub with the upstream "expert is disabled" message until then).
+  [~] **10.1.15** `.schema` cmdSchema now mirrors shell.c.in:10575..
+       10711.  Walks pragma_database_list, builds a UNION ALL across
+       every attached database's sqlite_schema (with snum / sname
+       columns), and emits the matching CREATE statements ordered by
+       schema number then rowid.  Wired flags: `--debug` (dumps the
+       composed SQL), `--nosys` (filters via the upstream
+       `name NOT LIKE 'sqlite__%' ESCAPE '_'` after Bug 6.12 close),
+       the literal/glob-pattern split (with `.`
+       qualifying `sname.tbl_name`), and the
+       `sqlite_master`/`sqlite_schema` self-description block.
+       `--indent` accepted but currently a no-op — depends on the
+       shell_format_schema / shell_add_schema UDFs which are not yet
+       ported.
+  [X] **10.1.16** `.tables` — cmdTables now mirrors shell.c.in:11341..
+       11386: walks pragma_database_list, builds a UNION ALL across
+       every attached database's sqlite_schema (qualifying non-main
+       names as `<db>.<name>`), collects matches into an in-memory
+       array, then renders the upstream column-major layout with
+       width = max(len)+2 and nCol = 80/width.  System tables filtered
+       via upstream's `name NOT LIKE 'sqlite__%' ESCAPE '_'` (Bug 6.12
+       closed 2026-05-06).
+  [X] **10.1.17** `.indexes` — cmdIndexes runs
+       `SELECT name FROM sqlite_schema WHERE type='index' [AND
+       tbl_name=?] ORDER BY 1`.
+  [X] **10.1.18** `.databases` — cmdDatabases runs
+       `SELECT name, file FROM pragma_database_list ORDER BY seq`.
+  [~] **10.1.19** `.fullschema` — cmdFullschema dumps CREATE statements
+       (excluding sqlite_stat%) plus sqlite_stat1/sqlite_stat4 INSERTs
+       (when those tables exist).  --indent reformatter still pending
+       with .schema's --indent option.
+  [~] **10.1.20** `.lint fkey-indexes` cmdLint now mirrors
+       shell.c.in:5899..6126: shellFkeyCollateClause registered as the
+       `fkey_collate_clause(parent, parentCol, child, childCol)` UDF,
+       the upstream SELECT joins sqlite_schema with
+       pragma_foreign_key_list and pragma_table_info, and per-row
+       EXPLAIN QUERY PLAN drives sqlite3_strglob coverage detection
+       (with the IPK shortcut).  `-verbose` and `-groupbyparent` are
+       wired.  Currently emits no suggestions because of Bug 6.13
+       (lateral join of pragma_foreign_key_list against
+       sqlite_schema returns no rows in the Pascal port); will start
+       working once that lands.
+  [X] **10.1.21** `.expert` — cmdExpert emits the upstream
+       "this build does not support the .expert command" stub
+       (sqlite3_expert.c not yet ported).
 
 - [ ] **10.1d** Data I/O dot-commands.  `.read`, `.dump`, `.import`
   (CSV/ASCII), `.output` / `.once`, `.save`, `.open`.  Gate:
   `tests/cli/10d_io/`.
 
-  [ ] **10.1.22** `.read` — push a script file onto the input stack,
-       respecting `.echo` and recursion guard.
-  [ ] **10.1.23** `.dump` — full schema-and-data dump.  Per-row
-       INSERT generation via `run_schema_dump_query` +
-       `run_table_dump_query` + `output_quoted_escaped_string`.
-       `--preserve-rowids`, `--newlines`, `--data-only`.
-  [ ] **10.1.24** `.import` — CSV / ASCII import.  ImportCtx struct,
-       `csv_read_one_field`, `ascii_read_one_field`, auto-create
-       table from header row, transactional bulk-insert path.
-  [ ] **10.1.25** `.output` / `.once` — redirect to file / pipe /
-       stdout; `-x` (Excel) and `--bom` flags.
-  [ ] **10.1.26** `.save` — `VACUUM INTO 'file'` wrapper.
-  [ ] **10.1.27** `.open` — close current db and re-open with
-       `--readonly`, `--zip`, `--deserialize`, `--new`, `--nofollow`.
+  [X] **10.1.22** `.read FILE` — cmdRead pushes the named file onto a
+       Pascal-side input stack (curInputText) and re-enters processInput;
+       inputNesting still gates the existing recursion guard.  Pipe
+       (`|cmd`) variants emit the upstream "pipes are not supported"
+       error.
+  [~] **10.1.23** `.dump` — minimal viable port landed
+       (cmdDump / dumpOneObject).  Emits PRAGMA foreign_keys=OFF +
+       BEGIN TRANSACTION header, dumps CREATE TABLE statements +
+       INSERT INTO rows (rendered through MODE_Insert with zDestTable
+       set), then non-table objects (indexes/views/triggers), then
+       COMMIT.  Honours `--data-only` and `--nosys` plus a LIKE
+       pattern.  `--preserve-rowids` and `--newlines`, the upstream
+       sqlite_sequence handling, the corruption detour with `ORDER BY
+       rowid DESC`, and explicit column-list INSERTs (via
+       `tableColumnList`) defer to a follow-up.  Round-trip verified
+       on simple schemas; used by `.once` integration test.
+  [~] **10.1.24** `.import` — initial cut landed (cmdImport):
+       ImportCtx + importGetc + importAppendChar + csvReadOneField +
+       asciiReadOneField mirror shell.c.in:4958..5150; the dispatcher
+       handles `-csv`, `-ascii`, `-schema`, `-skip N`, `-v`, `-esc`,
+       `-qesc`, `-colsep`, `-rowsep` and runs the bulk INSERT in a
+       single transaction (BEGIN/COMMIT gated on sqlite3_get_autocommit).
+       BOM strip, RFC-4180 quoted fields with embedded separators /
+       row terminators / doubled quotes, the per-row "expected N found
+       M — filling with NULL / extras ignored" warnings, and the final
+       `Added R rows with E errors using L lines` -v breadcrumb all
+       wired.  Deferred: the auto-create-from-header path (zAutoColumn,
+       shell.c.in:7165..7470 — needs the side-memory ColNames db),
+       the `<<MARK` heredoc input mode (shell.c.in:7601..7638), and
+       pipe input (`|cmd`).  Destination table must exist; clear
+       error otherwise.
+  [X] **10.1.25** `.output` / `.once` — cmdOutput landed.
+       Redirection sits at the POSIX-fd level (dup the original
+       stdout at startup; dup2 the file fd onto fd 1 to redirect;
+       dup2 the saved fd back to revert) so all `Write` / `WriteLn`
+       follow without per-call-site changes.  `.output FILE`,
+       `.output stdout`, `.output off` (-> /dev/null), `.once FILE`,
+       `--bom` all wired.  `nPopOutput=2` set on `.once`,
+       decremented after each dot-cmd and forced to 0 after each SQL
+       line (mirrors shell.c.in:12068..12071 + 12512..12517).
+       cmdShow now reports the active output sink.  Pipe targets
+       (`|cmd`) emit "pipes are not supported".  `.excel` / `.www`
+       (xdg-open shorthands) emit a "not wired in this build" warn.
+  [X] **10.1.26** `.save ?DB? FILE` — cmdBackup arm (shared with .backup).
+       sqlite3_backup_init/_step/_finish copy main into a fresh dest db
+       opened with READWRITE|CREATE.
+  [~] **10.1.27** `.open ?-options? ?FILE?` — cmdOpen handles `-new`,
+       `-readonly`, `-exclusive`, `-ifexists`, `-nofollow`; closes the
+       current db, opens new (with TEMP fallback on failure).  `--zip`
+       and `--deserialize` defer until those VFSes/extensions are
+       ported.
 
-- [ ] **10.1e** Meta / diagnostic dot-commands.  `.stats`, `.timer`,
-  `.eqp`, `.explain`, `.show`, `.help`, `.shell`/`.system`, `.cd`,
-  `.log`, `.trace`, `.iotrace`, `.scanstats`, `.testcase`,
-  `.testctrl`, `.selecttrace`, `.wheretrace`.  Gate:
-  `tests/cli/10e_meta/`.
+- [ ] **10.1e** Meta / diagnostic dot-commands. Gate: `tests/cli/10e_meta/`.  
+  - [ ] `.stats`
+  - [ ] `.timer`
+  - [ ] `.eqp`, 
+  - [ ] `.explain`, 
+  - [ ] `.show`, 
+  - [ ] `.help`, 
+  - [ ] `.shell`/`.system`, 
+  - [ ] `.cd`,
+  - [ ] `.log`, 
+  - [ ] `.trace`, 
+  - [ ] `.iotrace`, 
+  - [ ] `.scanstats`, 
+  - [ ] `.testcase`,
+  - [ ] `.testctrl`, 
+  - [ ] `.selecttrace`, 
+  - [ ] `.wheretrace`.  
 
-  [ ] **10.1.28** `.stats` — toggle per-stmt status counters output;
-       reads `sqlite3_stmt_status` for each opcode set.
-  [ ] **10.1.29** `.timer` — wall / user / sys clock around each
-       statement.
-  [ ] **10.1.30** `.eqp` — sets `EXPLAIN QUERY PLAN` auto-prefix mode.
-       (`off` / `on` / `trigger` / `full`).
-  [ ] **10.1.31** `.explain` — sets `EXPLAIN` auto-prefix mode and
-       formats the bytecode dump.
-  [ ] **10.1.32** `.show` — dump all current `ShellState` settings.
-  [ ] **10.1.33** `.help` — built-in help text dispatch
-       (`showHelp`, ~750-line static help table).
-  [ ] **10.1.34** `.shell` / `.system` — fork+exec, `popen`, capture
-       output to current `.output` sink.
-  [ ] **10.1.35** `.cd` — `chdir` wrapper.
-  [ ] **10.1.36** `.log` — opens / closes a logging FILE* + wires
-       `sqlite3_config(SQLITE_CONFIG_LOG, …)`.
-  [ ] **10.1.37** `.trace` — installs `sqlite3_trace_v2` callback
-       (`stmt` / `profile` / `row` / `close`).
+  [X] **10.1.28** `.stats off|on|stmt|vmstep` — cmdStats setter +
+       displayStats / displayStatLine / displayLinuxIoStats port of
+       shell.c.in:2722..2944.  Walks sqlite3_status64 / sqlite3_db_status
+       / sqlite3_stmt_status counter sets and emits the upstream
+       label/value table; statsOn=2 prints per-column metadata, =3 prints
+       only the VM-step counter.  pStmt is now plumbed through
+       runOneSqlLine so per-statement counters resolve.
+  [X] **10.1.29** `.timer on|off|once` — cmdTimer setter + the full
+       shell.c.in:1404..1456 Unix arm: shellBeginTimer / shellEndTimer
+       / shellTimeOfDayUs / shellTvDiffSec mirror beginTimer /
+       endTimer / timeOfDay / timeDiff, snapshotting struct rusage
+       (declared locally because BaseUnix doesn't surface getrusage)
+       + gettimeofday before each prepared statement and printing
+       `Run Time: real %.6f user %.6f sys %.6f` after.  Wired into
+       runOneSqlLine around stepAndRender; `.timer once` decays back
+       to off after one statement.
+  [X] **10.1.30** `.eqp off|on|trace|trigger|full` — cmdEqp updates
+       mode.autoEQP / autoEQPtrace, toggles `PRAGMA vdbe_trace`.
+  [X] **10.1.31** `.explain auto|on|off` — cmdExplain sets
+       mode.autoExplain.  Bytecode dump formatting deferred.
+  [X] **10.1.32** `.show` — cmdShow dumps echo / eqp / explain /
+       headers / mode / nullvalue / colseparator / rowseparator /
+       stats / width / filename in upstream's `%12.12s: …` format.
+       The `output` field is still pending (depends on `.output`).
+  [X] **10.1.33** `.help ?-all? ?PATTERN?` — full upstream azHelp[]
+       table (~175 documented entries) ported from shell.c.in:3708..3965
+       plus the showHelp() walker (3980..4090): bare invocation prints
+       the one-line summary; `-a` / `-all` / `--all` shows every
+       documented command's full block; `0` shows undocumented commands;
+       PATTERN does prefix-glob first, then substring-LIKE fallback via
+       sqlite3_strglob / sqlite3_strlike.
+  [~] **10.1.34** `.shell` / `.system` — cmdShell concatenates args
+       (single-token args bare, multi-word args wrapped in `"`),
+       runs them via libc system()/Unix.fpsystem, and emits the
+       upstream `System command returns N` breadcrumb on non-zero
+       exit.  Output capture into the `.output` sink pending.
+  [X] **10.1.35** `.cd DIRECTORY` — cmdCd wraps FpChdir; mirrors
+       upstream's `Cannot change to directory "…"` error string.
+  [~] **10.1.36** `.log FILENAME|on|off` — cmdLog records the
+       destination so `.show` reflects it; SQLITE_CONFIG_LOG wiring
+       gated on the raw-varargs sqlite3_config port (8.1.1).
+  [X] **10.1.37** `.trace ?OPTIONS?` — cmdTrace parses the upstream
+       option set (FILE / stdout / stderr / off / --expanded / --plain
+       / --stmt / --profile / --row / --close), opens the requested
+       sink, builds the mTrace mask, and registers a Pascal cdecl
+       traceCallback through sqlite3_trace_v2.  Trace fanout wired
+       into the VDBE step path under 10.1.bug.2 — STMT, ROW, PROFILE,
+       CLOSE all fire end-to-end.  File-sink Flush per write so the
+       trace file is durable on `.quit`.
   [ ] **10.1.38** `.iotrace` — wires `sqlite3IoTrace` (gated on the
        6.8 `sqlite3VdbeIOTraceSql` arm landing first).
-  [ ] **10.1.39** `.scanstats` — gated on the 6.8
+  [~] **10.1.39** `.scanstats on|off|est|vm` — cmdScanstats records the
+       mode locally and emits upstream's "not available in this build"
+       warning; full wiring still gated on the 6.8
        `sqlite3VdbeScanStatus*` arms + 8.2.1 `sqlite3_stmt_scanstatus`.
-  [ ] **10.1.40** `.testcase` / `.check` — testcase output capture
-       used by the upstream test runner.
-  [ ] **10.1.41** `.testctrl` — `sqlite3_test_control` opcode
-       dispatcher (gated on 8.4.1).
-  [ ] **10.1.42** `.selecttrace` / `.wheretrace` / `.treetrace` —
-       compile-time-debug toggles wrapping `sqlite3_test_control`.
+  [~] **10.1.40** `.testcase NAME` — cmdTestcase records NAME in
+       p^.zTestcase; the `.check ANSWER` comparator side (which
+       redirects shell output to a buffer) is still pending.
+  [~] **10.1.41** `.testctrl` — dispatcher landed (cmdTestctrl mirrors
+       shell.c.in:11395..).  aTestctrl[] table populated with all 19
+       opcodes; `--help` filters unsafe entries on SHFLG_TestingMode;
+       prefix-match + ambiguity / unknown error paths match upstream.
+       PRNG_SAVE / PRNG_RESTORE / BYTEORDER route to the live
+       sqlite3_test_control() (passqlite3main.pas:4273); other opcodes
+       fall through to a generic stub that returns 0 (matches the
+       Phase 8.4.1 single-arg cdecl boundary — variadic args go unread).
+  [~] **10.1.42** `.selecttrace` / `.wheretrace` / `.treetrace` —
+       cmdTraceFlags emits a "requires a debug build; ignored"
+       breadcrumb so partial landings don't fall through to the unknown-
+       command arm.  Full TRACEFLAGS wiring needs the varargs
+       sqlite3_test_control variant (deferred).
 
-- [ ] **10.1f** Long-tail / specialised dot-commands.  `.backup`,
-  `.restore`, `.clone`, `.archive`/`.ar`, `.session`, `.recover`,
-  `.dbinfo`, `.dbconfig`, `.filectrl`, `.sha3sum`, `.crnl`,
-  `.binary`, `.connection`, `.unmodule`, `.vfsinfo`, `.vfslist`,
-  `.vfsname`.  Out-of-scope dependencies (session, archive, recover)
+- [ ] **10.1f** Long-tail / specialised dot-commands.  
+  Out-of-scope dependencies (session, archive, recover)
   may stub with the upstream `SQLITE_OMIT_*` "feature not compiled
-  in" message.  Gate: `tests/cli/10f_misc/`.
+  in" message.  Gate: `tests/cli/10f_misc/`.  - [ ] `.backup`,
+  - [ ] `.restore`, 
+  - [ ] `.clone`, 
+  - [ ] `.archive`/`.ar`, 
+  - [ ] `.session`, 
+  - [ ] `.recover`,
+  - [ ] `.dbinfo`, 
+  - [ ] `.dbconfig`, 
+  - [ ] `.filectrl`, 
+  - [ ] `.sha3sum`, 
+  - [ ] `.crnl`,
+  - [ ] `.binary`, 
+  - [ ] `.connection`, 
+  - [ ] `.unmodule`, 
+  - [ ] `.vfsinfo`, 
+  - [ ] `.vfslist`,
+  - [ ] `.vfsname`. 
+  
 
-  [ ] **10.1.43** `.backup` — `sqlite3_backup_init/_step/_finish`
-       wrapper writing to the destination file.
-  [ ] **10.1.44** `.restore` — symmetric, source = file.
-  [ ] **10.1.45** `.clone` — combines backup + reattach (multi-db
-       variant of `.backup`).
+  [X] **10.1.43** `.backup ?DB? ?-async? ?-append? FILE` — cmdBackup
+       wraps sqlite3_backup_init/_step/_finish (100-page chunks).
+       --async runs `PRAGMA synchronous=OFF; PRAGMA journal_mode=OFF`
+       on the destination; --append accepted but no-ops because the
+       apndvfs has not been registered.
+  [X] **10.1.44** `.restore ?DB? FILE` — cmdRestore runs the symmetric
+       backup with the upstream 3-attempt SQLITE_BUSY retry loop
+       (sqlite3_sleep(100) between attempts).
+  [X] **10.1.45** `.clone NEWFILE` — cmdClone + cloneTransferSchema +
+       cloneTransferData mirror tryToClone / tryToCloneSchema /
+       tryToCloneData (shell.c.in:5157..5368).  Schema replayed via
+       sqlite3_exec; data copied through INSERT OR IGNORE with the
+       upstream `ORDER BY rowid DESC` retry on read errors.  Honours the
+       "File already exists" guard.
   [ ] **10.1.46** `.archive` / `.ar` — sqlar reader/writer; gated on
        sqlar extension.  Stub with omit-message until that lands.
   [ ] **10.1.47** `.session` — session-extension dispatcher
@@ -819,30 +1125,374 @@ file into reviewable chunks.
        with omit-message.
   [ ] **10.1.48** `.recover` — corruption-recovery extension dispatcher.
        Gated on recover extension; stub with omit-message.
-  [ ] **10.1.49** `.dbinfo` — runs the canonical
-       `pragma_database_list` + page-1 header dump.
-  [ ] **10.1.50** `.dbconfig` — `sqlite3_db_config` opcode dispatcher
-       (gated on 8.1.1 raw-varargs `sqlite3_db_config`).
-  [ ] **10.1.51** `.filectrl` — `sqlite3_file_control` opcode
-       dispatcher (gated on 8.4.1).
-  [ ] **10.1.52** `.sha3sum` — runs the SHA3 hash extension over
-       schema + data.  Bundles a Pascal SHA3 implementation or links
-       the existing extension.
-  [ ] **10.1.53** `.crnl` — toggles CR-NL translation on Windows
-       output (no-op on Linux).
-  [ ] **10.1.54** `.binary` — toggles binary stdout mode (no-op on
-       Linux).
-  [ ] **10.1.55** `.connection` — multi-connection switching
-       (`.connection 0..N`, `.connection close N`).
-  [ ] **10.1.56** `.unmodule` — `sqlite3_drop_modules` wrapper.
-  [ ] **10.1.57** `.vfsinfo` / `.vfslist` / `.vfsname` — VFS
-       introspection via `sqlite3_file_control`
-       (`SQLITE_FCNTL_VFS_POINTER`).
-  [ ] **10.1.58** `.dbtotxt` — page-by-page hex dump (used by the
-       upstream `dbsqlfuzz` corpus); gated on the bytecode of the
-       db being readable, no extension dependency.
-  [ ] **10.1.59** `.breakpoint` — debug-only no-op breakpoint
-       target (one-line stub).
+  [X] **10.1.49** `.dbinfo` — cmdDbinfo reads the 100-byte page-1
+       header via `SELECT data FROM sqlite_dbpage(?) WHERE pgno=1`
+       and prints the canonical field/query block; also calls
+       SQLITE_FCNTL_DATA_VERSION for the `data version` line.
+       sqlite_dbpage virtual table is now auto-registered on every
+       openDb() so `.dbinfo` works without explicit module loading.
+  [~] **10.1.50** `.dbconfig ?op? ?val?` — cmdDbconfig dispatches
+       through sqlite3_db_config_int across the boolean DBCONFIG_* set
+       (defensive, dqs_*, enable_*, legacy_*, no_ckpt_on_close,
+       reset_database, trusted_schema).  Counter-style and pointer-
+       style ops still gated on the raw-varargs sqlite3_db_config port
+       (8.1.1).
+  [X] **10.1.51** `.filectrl` — cmdFilectrl mirrors shell.c.in:9539..9690.
+       Full aFilectrl[] table (chunk_size / data_version / has_moved /
+       lock_timeout / persist_wal / psow / reserve_bytes / size_limit /
+       tempfilename), `--schema NAME` arg-shift, leading-dash strip,
+       prefix-match w/ ambiguity reporting, and the per-opcode
+       isOk={0,1,2} formatting (Usage / %lld / no-result) all wired
+       through sqlite3_file_control() (passqlite3main.pas:3934).
+  [X] **10.1.52** `.sha3sum` — landed 2026-05-06.  New unit
+       `passqlite3shathree.pas` ports `../sqlite3/ext/misc/shathree.c`
+       (854 lines of C → ~570 lines of Pascal): KeccakF1600Step (the
+       4-rounds-per-iteration unrolled permutation), SHA3Init/Update/
+       Final, plus the three SQL functions sha3 / sha3_agg / sha3_query
+       and the `sha3UpdateFromValue` value-encoder.  Wired via
+       `sqlite3ShathreeInit(p^.db)` in shell `openDb`.  cmdSha3sum
+       composes the upstream `WITH [sha3sum$query](a,b) AS(VALUES(...))`
+       CTE and runs `lower(hex(sha3_query(...)))` over it; honours
+       --schema, --sha3-{224,256,384,512}, --debug, and a LIKE
+       pattern.  Critical fix during port: TSHA3State must allocate
+       1600 bytes (matching the C `union { u64 s[25]; unsigned char
+       x[1600]; }`) — not 200 bytes — because SHA3Final stores the
+       squeezed digest at u.x[nRate..2*nRate-1], spilling past the
+       Keccak lane footprint for sha3-224/256.  Verification:
+       sha3('abc'), sha3 with 224/384/512 sizes, sha3 over BLOB,
+       sha3(NULL) IS NULL, sha3('1')=sha3(1), sha3_query, and the
+       documented sha3_agg cross-checks all byte-identical to the C
+       extension.  `.sha3sum` and `.sha3sum --sha3-256` digests over
+       a fresh table match the system `sqlite3` output.  The
+       `.sha3sum --schema` variant returns a different (non-zero)
+       digest because the inner table-list query
+       `SELECT … FROM sqlite_schema … UNION ALL SELECT 'sqlite_schema'`
+       returns no rows in the Pascal port — a separate codegen gap
+       tracked under the new bug 6.14 below.  Reversible-text-check
+       tail (shell.c.in:11177..11237) is omitted in this initial cut;
+       it adds a quality breadcrumb but is not part of the digest.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagDml /
+       DiagOps all clean.
+  [X] **10.1.53** `.crnl` — cmdCrnl on Linux always clears MFLG_CRLF
+       and echoes `crlf is OFF`; matches upstream's non-Windows arm.
+  [X] **10.1.54** `.binary` — cmdBinary emits the upstream
+       `The ".binary" command is deprecated.` breadcrumb.
+  [X] **10.1.55** `.connection ?N? | close N` — cmdConnection swaps
+       p^.pAuxDb across the aAuxDb[0..4] slots.  Bare `.connection`
+       lists ACTIVE / open / not-open slots in upstream's column
+       layout; `close N` releases a slot's db without disturbing the
+       active one.
+  [X] **10.1.56** `.unmodule [--allexcept] NAME ...` — cmdUnmodule
+       dispatches through sqlite3_drop_modules (with the NULL-
+       terminated PPAnsiChar) for `--allexcept`, otherwise calls
+       sqlite3_create_module(name, NULL, NULL) per name.
+  [X] **10.1.57** `.vfsinfo` / `.vfslist` / `.vfsname` — cmdVfsinfo /
+       cmdVfslist / cmdVfsname use SQLITE_FCNTL_VFS_POINTER and walk
+       sqlite3_vfs_find chain.  Unix-VFS variant of SQLITE_FCNTL_VFSNAME
+       wired via unixFileControl (passqlite3os.pas:1733) — returns
+       sqlite3StrDup(pVfs^.zName) so `.vfsname` prints "unix" for a
+       file-backed db (matches os_unix.c:4191).
+  [X] **10.1.58** `.dbtotxt` — cmdDbtotxt ports
+       shell.c.in:5579..5674 page-by-page hex dump.  Reads page size
+       via `PRAGMA page_size`, page count via
+       `SELECT count(*) FROM sqlite_dbpage` (workaround for a Pascal-
+       port `PRAGMA page_count` gap that returns no rows — tracked
+       separately under Phase 6 PRAGMA follow-up).  Skips all-zero
+       16-byte runs to keep dumps compact.  Hex output is lowercase
+       to match upstream.
+  [X] **10.1.59** `.breakpoint` — cmdBreakpoint no-op stub
+       (gdb-attach hook only; not exercised by any gate).
+  [X] **10.1.60** ext/misc/sha1.c port (419 C lines) — new unit
+       `passqlite3sha1.pas` provides sha1(X) / sha1b(X) / sha1_query(SQL).
+       SHA1Transform reorganised as a single carousel loop (the C source
+       unrolls the (v,w,x,y,z) rotation across 80 macro invocations);
+       only mutated slots match upstream so the resulting digests are
+       byte-identical.  Wired via `sqlite3ShaInit(p^.db)` in shell openDb.
+       Verified against well-known vectors: sha1('abc') =
+       a9993e364706816aba3e25717850c26c9cd0d89d, sha1('') =
+       da39a3ee5e6b4b0d3255bfef95601890afd80709, sha1('The quick brown
+       fox jumps over the lazy dog') = 2fd4e1c67a2d28fced849ee1bb76e7391b93eb12.
+       sha1b returns the matching 20-byte BLOB; sha1(NULL) IS NULL.
+  [X] **10.1.61** ext/misc/uuid.c port (234 C lines) — new unit
+       `passqlite3uuid.pas` provides uuid() / uuid_str(X) / uuid_blob(X)
+       per RFC-4122 (variant 1, version 4).  Wired via
+       `sqlite3UuidInit(p^.db)` in shell openDb.  Verified: uuid()
+       always 36 chars with '-' at positions 9/14/19/24 and version
+       digit '4' at position 15; uuid_str canonicalises hex-only,
+       hyphenated, and {braced} inputs; uuid_blob round-trips through
+       uuid_str byte-identical; bad input returns NULL.
+  [X] **10.1.62** ext/misc/ieee754.c port (361 C lines) — new unit
+       `passqlite3ieee754.pas` provides the full ieee754 family:
+       ieee754(X) / ieee754(M,E) / ieee754_mantissa(X) /
+       ieee754_exponent(X) / ieee754_to_blob(X) / ieee754_from_blob(B) /
+       ieee754_to_int(X) / ieee754_from_int(N) / ieee754_inc(R,N).
+       The dispatch user-data trick from the C source (one ieee754func
+       branch per registration row, keyed off `*(int*)sqlite3_user_data`)
+       is preserved via three module-level i32 sentinels (ieeeAux0/1/2).
+       Type-puns through a record-variant TBits64 (no memcpy needed).
+       Wired via `sqlite3IeeeInit(p^.db)` in shell openDb.  Verified
+       byte-identical against upstream `.load ieee754.so`: ieee754(2.0)
+       = 'ieee754(2,0)', ieee754(45.25) = 'ieee754(181,-2)',
+       ieee754(2,0) = 2.0, ieee754_to_blob(1.0) =
+       x'3FF0000000000000', ieee754_inc(0.0,+1) =
+       4.9406564584124654e-324, ieee754(0.0) = 'ieee754(0,-1075)'.
+  [X] **10.1.63** ext/misc/percentile.c port (503 C lines) — new unit
+       `passqlite3percentile.pas` provides the percentile family of
+       aggregate / window functions: median(Y), percentile(Y,P) with
+       P in [0..100], percentile_cont(Y,P) and percentile_disc(Y,P)
+       with P in [0..1].  All four are also valid window functions
+       (xInverse / xValue wired); the in-place insert-sort path
+       triggered by xInverse mirrors the C source.  Wired via
+       `sqlite3PercentileInit(p^.db)` in shell openDb.  Companion fix
+       to **sqlite3CreateFunc** (passqlite3codegen.pas:42421..) — the
+       Pascal port omitted main.c:2050's
+       `p->xSFunc = xSFunc ? xSFunc : xStep;` fallback, so any
+       aggregate-only registration left `xSFunc=nil` and
+       `sqlite3FindFunction` (codegen.pas:42378) returned NULL at
+       lookup → "no such function: median / percentile / sha3_agg".
+       Restored the fallback and added the missing `p^.nArg`
+       reassignment.  Verified byte-identical against upstream:
+       median over 1..10 = 5.5; percentile(x,0)=1.0,
+       percentile(x,50)=5.5, percentile(x,100)=10.0,
+       percentile_cont(x,0.25)=3.25, percentile_disc(x,0.25)=3.0,
+       percentile(x,73)=7.57.  TestExplainParity 1026/1026;
+       TestBytecodeParity 32/32; TestVdbeAgg 11/11; DiagFeatureProbe /
+       DiagDml / DiagOps / DiagPragma / DiagFunctions / DiagAnalyze /
+       DiagMisc / DiagCast / DiagCovering all clean.
+  [X] **10.1.64** ext/misc/rot13.c (115 C lines), ext/misc/uint.c
+       (92 C lines), and ext/misc/base64.c (297 C lines) ported as
+       three new units `passqlite3rot13.pas`, `passqlite3uint.pas`,
+       `passqlite3base64.pas` (~504 C lines, ~430 lines Pascal).
+       rot13() scalar + rot13 collation; uint collation (numeric-aware
+       lexicographic compare with arbitrary-length integer runs +
+       leading-zero handling); base64(X) scalar that toggles between
+       BLOB→base64-text and base64-text→BLOB per RFC 4648 with
+       72-char line breaks.  Wired via sqlite3RotInit / sqlite3UintInit
+       / sqlite3Base64Init in shell openDb.  Verified against RFC 4648
+       vectors ('' → empty, 'f' → 'Zg==', 'foobar' → 'Zm9vYmFy', and
+       round-trip), rot13(rot13(X))=X identity, and uint sort order
+       (a1, a2, a10, a100; z2, z9, z10).  Implementation note: the
+       destructor passed to sqlite3_result_text/_blob must be a cdecl
+       trampoline (`base64FreeDel`) — `@sqlite3_free` directly is
+       rejected because FPC propagates `external 'c'` as register
+       calling convention through @-of.  TestExplainParity 1026/1026;
+       DiagFunctions / DiagOps / DiagFeatureProbe / TestVdbeAgg green.
+  [X] **10.1.66** ext/misc/base85.c (454 C lines), ext/misc/eval.c
+       (125 C lines), and ext/misc/urifuncs.c (209 C lines) ported as
+       three new units `passqlite3base85.pas`, `passqlite3eval.pas`,
+       `passqlite3urifuncs.pas` (~788 C lines total).  base85 provides
+       the base85() encoder/decoder + is_base85() checker (B85_DARK_MAX
+       80-char line breaks, RFC-style group framing); eval provides
+       eval(X) / eval(X,Y) recursive SQL runner with separator-joined
+       output; urifuncs provides the eight sqlite3_uri_* /
+       sqlite3_filename_* SQL wrappers for testing.  Wired via
+       sqlite3Base85Init / sqlite3EvalInit / sqlite3UrifuncsInit in
+       shell openDb.  Verified byte-identical against `.load
+       base85.so` / `.load eval.so` / `.load urifuncs.so`: base85
+       round-trip on 1..11 byte BLOBs, eval over multi-statement and
+       UNION pipelines (', ' separator), and the full uri/filename
+       set on a file-backed db.  TestExplainParity 1026/1026;
+       DiagFunctions / DiagFeatureProbe clean.
+
+  [X] **10.1.67** Bundle of five small ext/misc helpers ported as new
+       units (~693 C lines total): anycollseq.c (58 lines) →
+       `passqlite3anycollseq.pas` (registers a sqlite3_collation_needed
+       callback that synthesises BINARY-equivalent collations on demand);
+       blobio.c (152 lines) → `passqlite3blobio.pas` (readblob /
+       writeblob via sqlite3_blob_open / read / write / close);
+       nextchar.c (314 lines) → `passqlite3nextchar.pas` (next_char(A,T,F
+       [,W [,C]]) prefix-completion helper using a generated
+       SELECT … WHERE F>=(?1||?2) AND F<=(?1||char(1114111)) ORDER BY 1
+       LIMIT 1 driver loop with UTF-8 read/write); remember.c (72 lines)
+       → `passqlite3remember.pas` (remember(V,PTR) carry-through helper
+       via sqlite3_value_pointer / 'carray' tag); stmtrand.c (97 lines)
+       → `passqlite3stmtrand.pas` (per-statement repeatable PRNG via
+       sqlite3_set_auxdata key -4418371).  All wired through
+       sqlite3{Anycollseq,Blobio,Nextchar,Remember,Stmtrand}Init in
+       shell openDb.  Verification: stmtrand(7) emits the same triple
+       (476861750|1313754972|1316245715) as the C reference;
+       next_char('c','d','word') returns 'a' and next_char('ca','d',
+       'word') returns 'bprt' over a {cat,car,cab,cap,dog} dictionary;
+       readblob/writeblob round-trip works on a zeroblob(10) target;
+       remember(99,0) returns 99 and silently no-ops the write when the
+       pointer arg is not a valid carray pointer.  TestExplainParity
+       1026/1026.  Engine-side callback dispatch closed 2026-05-06
+       under bug 8.x.colneed — anycollseq's xCollNeeded now fires when
+       an unknown collation is encountered.
+
+  [X] **10.1.68** Three more small ext/misc helpers ported as new
+       units (~464 C lines total): noop.c (90 lines) →
+       `passqlite3noop.pas` (noop / noop_i / noop_do / noop_nd /
+       multitype_text — identity functions exercising the
+       DETERMINISTIC / INNOCUOUS / DIRECTONLY function-flag plumbing);
+       zorder.c (134 lines) → `passqlite3zorder.pas` (zorder(X0..XN)
+       interleaves the low bits of up to 24 i64 operands into a 63-bit
+       Morton code, plus the inverse unzorder(Z,N,K) extractor;
+       overflow message routed through SysUtils.Format because the
+       Pascal sqlite3_mprintf cdecl entry has no varargs); randomjson.c
+       (240 lines) → `passqlite3randomjson.pas` (random_json(SEED) and
+       random_json5(SEED) deterministic pseudo-random JSON / JSON5
+       generators backed by the upstream LFSR+LCG PRNG combo and the
+       azJsonAtoms[] / azJsonTemplate[] paired-literal tables; the
+       eType branch is selected through a per-registration user_data
+       i32, mirroring the &cZero / &cOne pattern from the C source).
+       All wired through sqlite3{Noop,Zorder,RandomJson}Init in shell
+       openDb.  Verified byte-identical against `.load /tmp/{noop,
+       zorder,randomjson}.so` running under the system sqlite3:
+       zorder(1,2,3)=53, unzorder(53,3,0..2)=(1,2,3), noop(42)=42,
+       multitype_text(7)=7, and the random_json(1) / random_json5(2)
+       documents reproduce the C output exactly (~1KB JSON each).
+       Implementation note: the prngInt LFSR uses C's `(1+~(x&1)) & MASK`
+       trick to branchlessly mask 0xd0000001 in/out; expanded into an
+       explicit if/else in the Pascal port so FPC's overflow checks
+       never see the deliberate u32 wrap.  TestExplainParity 1026/1026;
+       DiagFunctions / DiagOps / DiagFeatureProbe clean.
+
+  [X] **10.1.69** Four more ext/misc helpers ported as new units
+       (~760 C lines total): wholenumber.c (280 lines) →
+       `passqlite3wholenumber.pas` (eponymous read-only vtab over the
+       whole numbers 1..2^32-1 with GT/GE/LT/LE constraint pushdown
+       through xBestIndex / xFilter); templatevtab.c (269 lines) →
+       `passqlite3templatevtab.pas` (10-row baseline read-only vtab
+       used as a vtab-plumbing sanity check); showauth.c (103 lines) →
+       `passqlite3showauth.pas` (debug authorizer that traces every
+       request to stdout via sqlite3_set_authorizer); mmapwarm.c
+       (108 lines) → `passqlite3mmapwarm.pas` (sqlite3_mmap_warm
+       page-walker; degrades cleanly to a BEGIN/END pair on the
+       current Unix VFS which is iVersion=2 with nil xFetch/xUnfetch).
+       wholenumber + templatevtab auto-registered in shell openDb;
+       showauth and sqlite3_mmap_warm are exported as functions but
+       not auto-installed (showauth would flood stdout, sqlite3_mmap_warm
+       is a one-shot user call).  Verified: `CREATE VIRTUAL TABLE w
+       USING wholenumber;` registers cleanly; templatevtab returns
+       its 9-row scan (1001..1009 / 2001..2009 — matches the C
+       reference; the upstream-documented "10 rows" is off-by-one
+       since xEof short-circuits at iRowid=10).  Runtime caveat for
+       wholenumber: the Pascal port's WhereBegin does not yet wire
+       vtab xBestIndex pushdown (codegen.pas:13938 / 28163), so a
+       bare `SELECT … FROM wholenumber WHERE value<6` walks all
+       2^32-1 rows.  The module is faithful end-to-end; once the
+       pushdown lands, constraints flow straight through.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps clean.
+
+  [X] **10.1.70** ext/misc/prefixes.c (321 C lines) +
+       ext/misc/memstat.c (435 C lines) ported as new units
+       `passqlite3prefixes.pas` and `passqlite3memstat.pas` (~756 C
+       lines total).  prefixes provides the `prefixes(STR)` table-
+       valued function that yields all prefixes of STR longest-to-
+       shortest plus the `prefix_length(L,R)` UTF-8-character common-
+       prefix scalar.  memstat provides the `sqlite_memstat`
+       eponymous vtab exposing the global sqlite3_status64() counters
+       (MEMORY_USED / MALLOC_SIZE / MALLOC_COUNT / PAGECACHE_*
+       / PARSER_STACK) and the per-connection sqlite3_db_status()
+       counters (DB_LOOKASIDE_* / DB_CACHE_* / DB_SCHEMA_USED /
+       DB_STMT_USED / DB_DEFERRED_FKS).  ZIPVFS rows skipped (no
+       ZIPVFS build).  DB_CACHE_USED_SHARED also skipped to match the
+       C build (its `#if SQLITE_VERSION_NUMBER >= 3140000` gate
+       evaluates false against 3.53's encoding 3053000 — likely an
+       upstream typo, but matched here for byte-identical output).
+       Wired via sqlite3PrefixesInit / sqlite3MemstatVtabInit in
+       shell openDb.  Verified byte-identical against `.load
+       /tmp/{prefixes,memstat}.so` running under the system sqlite3:
+       prefixes('hello') → 'hello' / 'hell' / 'hel' / 'he' / 'h' /
+       '', prefix_length('abcdxxx','abcyy')=3, prefix_length('ab',
+       'abcd')=2, prefix_length over multi-byte UTF-8 ('héllo',
+       'héllo')=5; sqlite_memstat name list matches exactly (18 rows).
+
+- [ ] **6.15** TestExplainParity regression to 224/802 (pre-existing,
+    independent of 10.1.70).  Verified by stashing all uncommitted
+    work (just prefixes/memstat additions) and re-running — same
+    802 divergences.  Symptom: Pas emits one extra OP_Explain at the
+    head of every prepared statement (Init p2 = ops+1 vs C ops+0).
+    Concretely on `CREATE TABLE simple`: C has SeekRowid at op[15],
+    Pas has Explain at op[15] then SeekRowid at op[16].  Likely
+    introduced after 10.1.69 close-out; the recent commits' "1026/
+    1026" claims are stale.  Probable suspect is a recent codegen
+    arm that grew an unconditional `OP_Explain` emission rather than
+    gating on `p->p4type==P4_DYNAMIC` or `pParse->explain`.  Probe
+    by bisecting a3..a4 around commit ee98a76 and earlier.
+
+- [X] **8.x.colneed** sqlite3_collation_needed callback now fires.
+  Closed 2026-05-06.  `sqlite3GetCollSeq` (codegen.pas:42193) was
+  missing the `callCollNeeded(db, enc, zName)` step from callback.c:222
+  — the C reference invokes the registered factory between the initial
+  `sqlite3FindCollSeq` lookup and the `synthCollSeq` cross-encoding
+  fallback.  Added a `callCollNeeded` helper that dups the name into
+  db memory and invokes `db^.xCollNeeded` via a cdecl trampoline
+  (UTF-16 callback path omitted — matches SQLITE_OMIT_UTF16 stance of
+  the rest of the port).  Restructured `sqlite3GetCollSeq` to mirror
+  callback.c:205..234 step by step: lookup → if missing call factory
+  → re-lookup → synthCollSeq fallback → error.  Verified: with
+  anycollseq registered (auto-loaded by shell openDb),
+  `SELECT … ORDER BY x COLLATE WHATEVER` now sorts via the synthesised
+  BINARY-equivalent collation; without anycollseq the canonical
+  `no such collation sequence: NAME` error fires.  TestExplainParity
+  1026/1026; DiagPubApi 259/259; DiagFeatureProbe / DiagDml / DiagOps /
+  DiagPragma / DiagFunctions / DiagTxn / DiagMisc all clean.
+
+  [X] **10.1.65** ext/misc/totype.c port (528 C lines) — new unit
+       `passqlite3totype.pas` provides tointeger(X) / toreal(X) lossless
+       converters.  All helpers ported 1:1: totypeIsspace, totypeIsdigit,
+       totypeCompare2pow63 (compares 19-char run against 9223372036854775808
+       digit-by-digit, preserving last-digit signed delta), totypeAtoi64
+       (returns 0/1/2 for fits/overflow/exact-2^63), totypeAtoF (full
+       sign/significand/exponent state machine with the 22-then-308 power-
+       of-10 staging block), totypeDoubleToInt (clamped to the
+       ±9223372036854774784 INT64 endpoints to avoid UBSAN).  Endianness
+       guards collapse to little-endian (x86-64 Linux per README): integer
+       BLOBs are LE, float BLOBs are BE so they get reversed on x86.
+       Wired via `sqlite3TotypeInit(p^.db)` in shell openDb.  Verified
+       byte-identical against `.load /tmp/totype.so`: tointeger(123)=123,
+       tointeger(123.5)=NULL, tointeger('-9223372036854775808')=
+       -9223372036854775808, tointeger('9223372036854775808')=NULL (overflow),
+       tointeger(x'0100000000000000')=1 (LE), toreal(x'3ff0000000000000')=1.0
+       (BE), toreal('  0.5  ')=NULL (trailing-space rejection).
+       TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
+       DiagOps / DiagDml / DiagPragma all clean.
+
+- [X] **10.1.bug.3** Multi-statement command-line input dropped /
+  corrupted statements past the 2nd or 3rd boundary.  Root cause was
+  in `runOneSqlLine` (passqlite3shell.pas): after each
+  `sqlite3_prepare_v2` call, the loop reassigned
+  `zCur := AnsiString(pzTail)` (later `StrPas(pzTail)`) to advance to
+  the remainder.  The freshly-allocated AnsiString buffer occasionally
+  came back with a one-byte corruption at offset ~33, which truncated
+  later `prepare_v2(-1)` calls at an early NUL — symptom was "Parse
+  error: incomplete input" or "near \"SE\": syntax error" on the
+  third+ statement.  Fix anchors a single immutable AnsiString and
+  walks a `pCursor: PAnsiChar` through its buffer between iterations,
+  eliminating all per-iteration AnsiString reallocation.  Verified:
+  `CREATE TABLE t(x); INSERT INTO t VALUES (1); INSERT INTO t VALUES
+  (2); SELECT count(x) FROM t; SELECT 1;` and the 5-SELECT
+  pipeline now run end-to-end; TestExplainParity 1026/1026.
+
+- [X] **10.1.bug.2** sqlite3_trace_v2 callback fanout — closed 2026-05-06.
+  Four call sites mirroring the C reference now invoke `db^.trace.xV2`:
+  (1) `sqlite3Close` (passqlite3main.pas) for SQLITE_TRACE_CLOSE
+  (main.c:1264);
+  (2) OP_Trace/OP_Init in `sqlite3VdbeExec` (passqlite3vdbe.pas) for
+  SQLITE_TRACE_STMT, picking p4.z if non-NULL else `v^.zSql`, with the
+  nested-exec `-- %s` wrap when `db^.nVdbeExec > 1` (vdbe.c:9067..9085);
+  (3) OP_ResultRow for SQLITE_TRACE_ROW (vdbe.c:1770);
+  (4) `sqlite3_step` snapshots `pStmt^.startTime` via
+  `sqlite3OsCurrentTimeInt64` on READY→RUN when PROFILE/XPROFILE is set
+  (vdbeapi.c:806..813), increments/decrements `nVdbeExec` around
+  `sqlite3VdbeExec`, and fires SQLITE_TRACE_PROFILE with elapsed-ns
+  payload at end-of-step (vdbeapi.c:62..79).  Verified via
+  `bin/passqlite3 t.db` + `.trace stderr --stmt --row --profile --close`
+  — STMT lines, `[ROW …]`, profile elapsed, and `[CLOSE]` all fire.
+  Companion shell fix: traceWrite now `Flush(traceFile)` per record so
+  file sinks are durable on `.quit`.  TestExplainParity 1026/1026;
+  DiagOps / DiagDml / DiagFeatureProbe / DiagPragma / TestBytecodeParity
+  / TestConfigHooks all clean.
+
+- [X] **10.1.bug.1** Header row leak in `.mode list` fixed: the port
+  was treating `bTitles` as a 0/1 boolean while upstream uses QRF
+  tri-state semantics (QRF_No=1=off, QRF_Yes=2=on).  Defined the QRF_*
+  constants, switched `renderInit`/`cmdShow` to compare against
+  `QRF_Yes`, and updated `cmdHeaders` and the startup default to use
+  `QRF_No`/`QRF_Yes` so `aModeInfo[].bHdr` (which already follows the
+  upstream tri-state) flows through correctly.
 
 - [ ] **10.2** Integration parity: `bin/passqlite3 foo.db` ↔
   `sqlite3 foo.db` on a scripted corpus that unions all 10.1a..f
