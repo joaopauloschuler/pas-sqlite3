@@ -1434,6 +1434,42 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.76** ext/misc/stmt.c (347 C lines) + ext/misc/explain.c
+       (323 C lines) ported as new units `passqlite3stmt.pas` and
+       `passqlite3explain.pas` (~670 C lines total).  stmt.c provides the
+       `sqlite_stmt` eponymous vtab (one row per still-open prepared
+       statement on the connection — sql / ncol / ro / busy / nscan /
+       nsort / naidx / nstep / reprep / run / mem); explain.c provides
+       the `explain(SQL)` eponymous table-valued function whose rows are
+       the EXPLAIN bytecode of the inner SQL (addr / opcode / p1..p5 /
+       comment / sql HIDDEN), with xBestIndex pushdown of the `==`
+       constraint against the hidden SQL column.  Both wired via
+       sqlite3StmtVtabInit / sqlite3ExplainVtabInit in shell openDb.
+       Verified: `SELECT * FROM sqlite_stmt` yields the active SELECT
+       row with the right column counts; `SELECT * FROM
+       explain('SELECT 1+2')` produces the 8-row Init/Explain/Add/
+       ResultRow/Halt/Integer/Integer/Goto stream byte-identical to
+       upstream `.load /tmp/explain.so`.  TestExplainParity 1026/1026;
+       DiagFeatureProbe / DiagOps clean.  Pascal-port limitation: the
+       MEM column is hard-coded to 0 because sqlite3_stmt_status(.,
+       MEMUSED, 0) currently calls sqlite3VdbeDelete on the live
+       statement (passqlite3main.pas:3480..) instead of running it
+       under the upstream `pnBytesFreed` dry-run accounting; tracked
+       below as bug 8.x.memused.
+
+- [ ] **8.x.memused** sqlite3_stmt_status(.., SQLITE_STMTSTATUS_MEMUSED,
+  0) destroys the live vdbe.  The C reference (vdbeapi.c:2106) calls
+  sqlite3VdbeDelete(v) with `db->pnBytesFreed = &nByte` so every
+  sqlite3DbFree path accumulates into nByte instead of actually freeing.
+  The Pascal port follows the C call shape (passqlite3main.pas:3480..)
+  but sqlite3VdbeDelete (passqlite3vdbe.pas:4766) and the underlying
+  sqlite3DbFree do not honour pnBytesFreed — so the live vdbe gets
+  unlinked + freed and the next OP_VNext step segfaults.  Surfaced when
+  porting the sqlite_stmt vtab (10.1.76); workaround there is to report
+  MEM=0.  Fix is to wire pnBytesFreed accounting through sqlite3DbFree /
+  sqlite3VdbeMemRelease so the dry-run delete is non-destructive, then
+  restore the MEMUSED arm in passqlite3stmt.pas.
+
   [X] **10.1.75** ext/misc/regexp.c (928 C lines) ported as new unit
        `passqlite3regexp.pas` (~770 lines).  Provides the SQL functions
        `regexp(PATTERN, STRING)` and the case-insensitive variant

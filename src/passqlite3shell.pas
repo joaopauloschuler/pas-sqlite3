@@ -91,6 +91,8 @@ uses
   passqlite3decimal,
   passqlite3normalize,
   passqlite3regexp,
+  passqlite3stmt,
+  passqlite3explain,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -625,6 +627,14 @@ begin
     operator from ext/misc/regexp.c (928 C lines).  POSIX-extended
     regular expressions over UTF-8 input via NFA matcher. }
   sqlite3RegexpInit(p^.db);
+  { Phase 10.1.76 — sqlite_stmt eponymous vtab from ext/misc/stmt.c
+    (347 C lines): one row per still-open prepared statement on the
+    connection, with sql + the sqlite3_stmt_status() counter set. }
+  sqlite3StmtVtabInit(p^.db);
+  { Phase 10.1.76 — explain eponymous vtab from ext/misc/explain.c
+    (323 C lines): SELECT … FROM explain('SELECT …') yields the
+    bytecode rows of the inner statement (addr/opcode/p1..p5/comment). }
+  sqlite3ExplainVtabInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
