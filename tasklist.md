@@ -2472,7 +2472,55 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
-- [ ] **10.1.bug.10**
+- [ ] **10.1.bug.13**
+     ```
+     sqlite> create table tbl1(one text, two int);
+     sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
+     sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
+     sqlite> select * from tbl1;
+     hello!|10
+     goodbye|20
+     hello!|10
+     goodbye|20
+     sqlite> create index x on tbl1 (two);
+     sqlite> explain select * from tbl1;
+     0|Init|0|9|0||0|
+     1|OpenRead|0|2|0|2|0|
+     2|Explain|2|0|216|SCAN tbl1|0|
+     3|Rewind|0|8|0||0|
+     4|Column|0|0|1||0|
+     5|Column|0|1|2||0|
+     6|ResultRow|1|2|0||0|
+     7|Next|0|4|0||1|
+     8|Halt|0|0|0||0|
+     9|Transaction|0|0|3|0|1|
+     10|Goto|0|1|0||0|
+     sqlite> .mode box
+     sqlite> explain select * from tbl1;
+     An unhandled exception occurred at $00000000004BC6F3:
+     EAccessViolation: Access violation
+     $00000000004BC6F3
+     ```
+
+- [ ] **10.1.bug.12**
+     ```
+     sqlite> create table tbl1(one text, two int);
+     sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
+     sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
+     sqlite> select * from tbl1;
+     hello!|10
+     goodbye|20
+     hello!|10
+     goodbye|20
+     sqlite> select one, sum(two) from tbl1 group by one order by one;
+     goodbye|40
+     hello!|20
+     sqlite> select one, sum(two) from tbl1 group by one order by two;    
+     sqlite> select one, sum(two) from tbl1 group by one order by sum(two);   
+     sqlite> 
+     ```
+
+- [ ] **10.1.bug.11**
      ```
      sqlite> create table tbl1(one text, two int);
      sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
