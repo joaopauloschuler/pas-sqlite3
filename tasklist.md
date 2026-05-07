@@ -1513,9 +1513,23 @@ existing dispatcher.
        'kitten'->'sitting' = 105, 'kitt*'->'kittenish' prefix match = 0,
        cleen/clean = 25, color/colour = 20; scriptcode across hello/
        Здра/αβγ/שלום.  Wired via `sqlite3SpellfixInit(p^.db)` in shell
-       openDb.  The full spellfix1 virtual table (vocabulary fuzzy
-       search) and the configurable-cost editdist3 family (~600 C lines
-       remaining) are NOT yet ported and remain in the source for a
+       openDb.  Editdist3 family landed 2026-05-07: ~530 new lines
+       porting spellfix.c:540..1231 (configurable-cost unicode edit
+       distance).  Provides editdist3(zTable) / editdist3(A,B) /
+       editdist3(A,B,iLang) backed by EditDist3Config + EditDist3Lang
+       + EditDist3Cost (allocated tail-extended via sqlite3_malloc64
+       to mimic the C `char a[4]` flexible array), the per-language
+       cost-mergesort 60-bin ladder, the EditDist3FromString /
+       EditDist3To pre-compute, and the Wagner matrix Core with
+       updateCost utf8Len matchFrom/matchTo/matchFromTo helpers.
+       editDist3ConfigDelete wired through sqlite3_create_function_v2
+       so the per-connection config is freed on close.  Verified
+       byte-identical against the C reference: editdist3('kitten',
+       'sitting')=400, prefix-match editdist3('abc*','abcdef')=0,
+       editdist3 with a 5-rule cost table (ph→f, ck→k) returns
+       10/5/300/225 across phone→fone / truck→truk / hello→world /
+       abc→def.  The full spellfix1 virtual table (vocabulary fuzzy
+       search) is still NOT ported and remains in the source for a
        future pass.
 
   [X] **10.1.98** ext/misc/zipfile.c (2293 C lines) ported as new unit

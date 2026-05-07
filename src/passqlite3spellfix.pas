@@ -57,6 +57,12 @@ uses
   passqlite3os,
   passqlite3printf;
 
+{$POINTERMATH ON}
+
+function strlen(s: PAnsiChar): SizeUInt; cdecl; external 'c' name 'strlen';
+function strncmp(a, b: PAnsiChar; n: SizeUInt): i32; cdecl;
+  external 'c' name 'strncmp';
+
 { Character classes — spellfix.c:42..70.  Identical numeric values so
   the const tables below carry over byte-for-byte. }
 const
@@ -1232,6 +1238,675 @@ begin
     sqlite3_result_text(pCtx, PAnsiChar(zOut), -1, @translitFreeDel);
 end;
 
+{ ===========================================================================
+  Configurable-cost unicode edit distance (spellfix.c:540..1231).
+
+  Provides the SQL function `editdist3()` with three forms:
+
+    editdist3(zTable)         loads the cost table from `zTable`
+                              (columns: iLang, cFrom, cTo, iCost)
+    editdist3(A, B)           computes cost(A → B) using language 0
+                              defaults (or table loaded earlier)
+    editdist3(A, B, iLang)    computes cost(A → B) for language iLang
+
+  All three registrations share the same EditDist3Config* user-data;
+  the 1-arg registration owns the destroy callback so the config is
+  freed on connection close.  Costs >= 10000 are treated as infinite
+  per the upstream comment.  The translit() helper above is unrelated
+  to this family — it carries its own fixed table.
+  =========================================================================== }
+
+type
+  PEditDist3Cost       = ^TEditDist3Cost;
+  PEditDist3Config     = ^TEditDist3Config;
+  PEditDist3Lang       = ^TEditDist3Lang;
+  PEditDist3FromString = ^TEditDist3FromString;
+  PEditDist3From       = ^TEditDist3From;
+  PEditDist3To         = ^TEditDist3To;
+
+  PPEditDist3Cost = ^PEditDist3Cost;
+
+  TEditDist3Cost = record
+    pNext:  PEditDist3Cost;
+    nFrom:  Byte;
+    nTo:    Byte;
+    iCost:  Word;
+    a:      array[0..3] of AnsiChar; { FROM bytes followed by TO bytes,
+                                       extended via sqlite3_malloc64 tail }
+  end;
+
+  TEditDist3Lang = record
+    iLang:    i32;
+    iInsCost: i32;
+    iDelCost: i32;
+    iSubCost: i32;
+    pCost:    PEditDist3Cost;
+  end;
+
+  TEditDist3From = record
+    nSubst:  i32;
+    nDel:    i32;
+    nByte:   i32;
+    apSubst: PPEditDist3Cost;
+    apDel:   PPEditDist3Cost;
+  end;
+
+  TEditDist3FromString = record
+    z:        PAnsiChar;
+    n:        i32;
+    isPrefix: i32;
+    a:        PEditDist3From;
+  end;
+
+  TEditDist3To = record
+    nIns:   i32;
+    nByte:  i32;
+    apIns:  PPEditDist3Cost;
+  end;
+
+  TEditDist3Config = record
+    nLang: i32;
+    a:     PEditDist3Lang;
+  end;
+
+const
+  editDist3LangDflt: TEditDist3Lang = (iLang: 0; iInsCost: 100;
+                                       iDelCost: 100; iSubCost: 150;
+                                       pCost: nil);
+
+procedure editDist3ConfigClear(p: PEditDist3Config);
+var
+  i: i32;
+  pCost, pNxt: PEditDist3Cost;
+  pLang: PEditDist3Lang;
+begin
+  if p = nil then Exit;
+  for i := 0 to p^.nLang - 1 do
+  begin
+    pLang := PEditDist3Lang(PtrUInt(p^.a) + PtrUInt(i)*SizeOf(TEditDist3Lang));
+    pCost := pLang^.pCost;
+    while pCost <> nil do
+    begin
+      pNxt := pCost^.pNext;
+      sqlite3_free(pCost);
+      pCost := pNxt;
+    end;
+  end;
+  sqlite3_free(p^.a);
+  FillChar(p^, SizeOf(p^), 0);
+end;
+
+procedure editDist3ConfigDelete(pIn: Pointer); cdecl;
+begin
+  editDist3ConfigClear(PEditDist3Config(pIn));
+  sqlite3_free(pIn);
+end;
+
+function editDist3CostCompare(pA, pB: PEditDist3Cost): i32;
+var n, rc: i32;
+begin
+  n := pA^.nFrom;
+  if n > pB^.nFrom then n := pB^.nFrom;
+  rc := 0;
+  if n > 0 then
+    rc := i32(strncmp(@pA^.a[0], @pB^.a[0], n));
+  if rc = 0 then rc := i32(pA^.nFrom) - i32(pB^.nFrom);
+  Result := rc;
+end;
+
+function editDist3CostMerge(pA, pB: PEditDist3Cost): PEditDist3Cost;
+var
+  pHead, p: PEditDist3Cost;
+  ppTail: PPEditDist3Cost;
+begin
+  pHead := nil;
+  ppTail := @pHead;
+  while (pA <> nil) and (pB <> nil) do
+  begin
+    if editDist3CostCompare(pA, pB) <= 0 then
+    begin
+      p := pA;
+      pA := pA^.pNext;
+    end
+    else
+    begin
+      p := pB;
+      pB := pB^.pNext;
+    end;
+    ppTail^ := p;
+    ppTail := @p^.pNext;
+  end;
+  if pA <> nil then ppTail^ := pA else ppTail^ := pB;
+  Result := pHead;
+end;
+
+function editDist3CostSort(pList: PEditDist3Cost): PEditDist3Cost;
+var
+  ap: array[0..59] of PEditDist3Cost;
+  p: PEditDist3Cost;
+  i, mx: i32;
+begin
+  FillChar(ap, SizeOf(ap), 0);
+  mx := 0;
+  while pList <> nil do
+  begin
+    p := pList;
+    pList := p^.pNext;
+    p^.pNext := nil;
+    i := 0;
+    while ap[i] <> nil do
+    begin
+      p := editDist3CostMerge(ap[i], p);
+      ap[i] := nil;
+      Inc(i);
+    end;
+    ap[i] := p;
+    if i > mx then mx := i;
+  end;
+  p := nil;
+  for i := 0 to mx do
+    if ap[i] <> nil then p := editDist3CostMerge(p, ap[i]);
+  Result := p;
+end;
+
+function editDist3ConfigLoad(p: PEditDist3Config; db: PTsqlite3;
+                             zTable: PAnsiChar): i32;
+var
+  pStmt: Pointer;
+  rc, rc2: i32;
+  zSql: PAnsiChar;
+  iLangPrev: i32;
+  pLang: PEditDist3Lang;
+  iLang, nFrom, nTo, iCost, nExtra, iLangIdx: i32;
+  zFrom, zTo: PAnsiChar;
+  pNew: Pointer;
+  pCost: PEditDist3Cost;
+begin
+  iLangPrev := -9999;
+  pLang := nil;
+  zSql := sqlite3PfMprintf(
+            'SELECT iLang, cFrom, cTo, iCost FROM "%w"' +
+            ' WHERE iLang>=0 ORDER BY iLang', [zTable]);
+  if zSql = nil then Exit(SQLITE_NOMEM);
+  pStmt := nil;
+  rc := sqlite3_prepare(db, zSql, -1, @pStmt, nil);
+  sqlite3_free(zSql);
+  if rc <> SQLITE_OK then Exit(rc);
+  editDist3ConfigClear(p);
+  while sqlite3_step(PVdbe(pStmt)) = SQLITE_ROW do
+  begin
+    iLang := sqlite3_column_int(PVdbe(pStmt), 0);
+    zFrom := PAnsiChar(sqlite3_column_text(PVdbe(pStmt), 1));
+    if zFrom <> nil then
+      nFrom := sqlite3_column_bytes(PVdbe(pStmt), 1)
+    else
+      nFrom := 0;
+    zTo := PAnsiChar(sqlite3_column_text(PVdbe(pStmt), 2));
+    if zTo <> nil then
+      nTo := sqlite3_column_bytes(PVdbe(pStmt), 2)
+    else
+      nTo := 0;
+    iCost := sqlite3_column_int(PVdbe(pStmt), 3);
+
+    if (nFrom > 100) or (nTo > 100) then continue;
+    if iCost < 0 then continue;
+    if iCost >= 10000 then continue;
+
+    if (pLang = nil) or (iLang <> iLangPrev) then
+    begin
+      pNew := sqlite3_realloc64(p^.a,
+                u64(p^.nLang + 1) * SizeOf(TEditDist3Lang));
+      if pNew = nil then begin rc := SQLITE_NOMEM; Break; end;
+      p^.a := PEditDist3Lang(pNew);
+      pLang := PEditDist3Lang(PtrUInt(p^.a)
+                + PtrUInt(p^.nLang)*SizeOf(TEditDist3Lang));
+      Inc(p^.nLang);
+      pLang^.iLang := iLang;
+      pLang^.iInsCost := 100;
+      pLang^.iDelCost := 100;
+      pLang^.iSubCost := 150;
+      pLang^.pCost := nil;
+      iLangPrev := iLang;
+    end;
+
+    if (nFrom = 1) and (zFrom[0] = '?') and (nTo = 0) then
+      pLang^.iDelCost := iCost
+    else if (nFrom = 0) and (nTo = 1) and (zTo[0] = '?') then
+      pLang^.iInsCost := iCost
+    else if (nFrom = 1) and (nTo = 1) and (zFrom[0] = '?')
+            and (zTo[0] = '?') then
+      pLang^.iSubCost := iCost
+    else
+    begin
+      nExtra := nFrom + nTo - 4;
+      if nExtra < 0 then nExtra := 0;
+      pCost := PEditDist3Cost(sqlite3_malloc64(
+                 u64(SizeOf(TEditDist3Cost) + nExtra)));
+      if pCost = nil then begin rc := SQLITE_NOMEM; Break; end;
+      pCost^.nFrom := Byte(nFrom);
+      pCost^.nTo := Byte(nTo);
+      pCost^.iCost := Word(iCost);
+      if nFrom > 0 then Move(zFrom^, pCost^.a[0], nFrom);
+      if nTo > 0 then Move(zTo^, pCost^.a[nFrom], nTo);
+      pCost^.pNext := pLang^.pCost;
+      pLang^.pCost := pCost;
+    end;
+  end;
+  rc2 := sqlite3_finalize(PVdbe(pStmt));
+  if rc = SQLITE_OK then rc := rc2;
+  if rc = SQLITE_OK then
+  begin
+    for iLangIdx := 0 to p^.nLang - 1 do
+    begin
+      pLang := PEditDist3Lang(PtrUInt(p^.a)
+               + PtrUInt(iLangIdx)*SizeOf(TEditDist3Lang));
+      pLang^.pCost := editDist3CostSort(pLang^.pCost);
+    end;
+  end;
+  Result := rc;
+end;
+
+function utf8Len(c: Byte; N: i32): i32;
+var len: i32;
+begin
+  len := 1;
+  if c > $7f then
+  begin
+    if (c and $e0) = $c0 then
+      len := 2
+    else if (c and $f0) = $e0 then
+      len := 3
+    else
+      len := 4;
+  end;
+  if len > N then len := N;
+  Result := len;
+end;
+
+function ed3MatchTo(p: PEditDist3Cost; z: PAnsiChar; n: i32): i32;
+begin
+  Assert(n > 0);
+  if p^.a[p^.nFrom] <> z[0] then Exit(0);
+  if p^.nTo > n then Exit(0);
+  if strncmp(@p^.a[p^.nFrom], z, p^.nTo) <> 0 then Exit(0);
+  Result := 1;
+end;
+
+function ed3MatchFrom(p: PEditDist3Cost; z: PAnsiChar; n: i32): i32;
+begin
+  Assert(p^.nFrom <= n);
+  if p^.nFrom <> 0 then
+  begin
+    if p^.a[0] <> z[0] then Exit(0);
+    if strncmp(@p^.a[0], z, p^.nFrom) <> 0 then Exit(0);
+  end;
+  Result := 1;
+end;
+
+function ed3MatchFromTo(pStr: PEditDist3FromString; n1: i32;
+                        z2: PAnsiChar; n2: i32): i32;
+var
+  b1: i32;
+  pa: PEditDist3From;
+begin
+  pa := PEditDist3From(PtrUInt(pStr^.a) + PtrUInt(n1)*SizeOf(TEditDist3From));
+  b1 := pa^.nByte;
+  if b1 > n2 then Exit(0);
+  Assert(b1 > 0);
+  if pStr^.z[n1] <> z2[0] then Exit(0);
+  if strncmp(@pStr^.z[n1], z2, b1) <> 0 then Exit(0);
+  Result := 1;
+end;
+
+procedure editDist3FromStringDelete(p: PEditDist3FromString);
+var
+  i: i32;
+  pa: PEditDist3From;
+begin
+  if p = nil then Exit;
+  for i := 0 to p^.n - 1 do
+  begin
+    pa := PEditDist3From(PtrUInt(p^.a) + PtrUInt(i)*SizeOf(TEditDist3From));
+    sqlite3_free(pa^.apDel);
+    sqlite3_free(pa^.apSubst);
+  end;
+  sqlite3_free(p);
+end;
+
+function editDist3FromStringNew(pLang: PEditDist3Lang;
+                                z: PAnsiChar; n: i32): PEditDist3FromString;
+var
+  pStr: PEditDist3FromString;
+  p: PEditDist3Cost;
+  i: i32;
+  pFrom: PEditDist3From;
+  apNew: Pointer;
+  bumped: Boolean;
+begin
+  if z = nil then Exit(nil);
+  if n < 0 then n := i32(strlen(z));
+  pStr := PEditDist3FromString(sqlite3_malloc64(
+            u64(SizeOf(TEditDist3FromString)
+                + SizeOf(TEditDist3From) * n
+                + n + 1)));
+  if pStr = nil then Exit(nil);
+  pStr^.a := PEditDist3From(PtrUInt(pStr) + PtrUInt(SizeOf(TEditDist3FromString)));
+  if n > 0 then
+    FillChar(pStr^.a^, SizeOf(TEditDist3From) * n, 0);
+  pStr^.n := n;
+  pStr^.z := PAnsiChar(PtrUInt(pStr^.a) + PtrUInt(SizeOf(TEditDist3From)) * PtrUInt(n));
+  Move(z^, pStr^.z^, n + 1);
+  if (n > 0) and (pStr^.z[n - 1] = '*') then
+  begin
+    pStr^.isPrefix := 1;
+    Dec(n);
+    Dec(pStr^.n);
+    pStr^.z[n] := #0;
+  end
+  else
+    pStr^.isPrefix := 0;
+
+  bumped := False;
+  for i := 0 to n - 1 do
+  begin
+    pFrom := PEditDist3From(PtrUInt(pStr^.a) + PtrUInt(i)*SizeOf(TEditDist3From));
+    FillChar(pFrom^, SizeOf(pFrom^), 0);
+    pFrom^.nByte := utf8Len(Byte(z[i]), n - i);
+    p := pLang^.pCost;
+    while p <> nil do
+    begin
+      if i + p^.nFrom > n then begin p := p^.pNext; continue; end;
+      if ed3MatchFrom(p, @z[i], n - i) = 0 then begin p := p^.pNext; continue; end;
+      if p^.nTo = 0 then
+      begin
+        apNew := sqlite3_realloc64(pFrom^.apDel,
+                   u64(SizeOf(PEditDist3Cost) * (pFrom^.nDel + 1)));
+        if apNew = nil then Break;
+        pFrom^.apDel := PPEditDist3Cost(apNew);
+        PPEditDist3Cost(PtrUInt(apNew) + PtrUInt(pFrom^.nDel)*SizeOf(PEditDist3Cost))^ := p;
+        Inc(pFrom^.nDel);
+      end
+      else
+      begin
+        apNew := sqlite3_realloc64(pFrom^.apSubst,
+                   u64(SizeOf(PEditDist3Cost) * (pFrom^.nSubst + 1)));
+        if apNew = nil then Break;
+        pFrom^.apSubst := PPEditDist3Cost(apNew);
+        PPEditDist3Cost(PtrUInt(apNew) + PtrUInt(pFrom^.nSubst)*SizeOf(PEditDist3Cost))^ := p;
+        Inc(pFrom^.nSubst);
+      end;
+      p := p^.pNext;
+    end;
+    if p <> nil then begin bumped := True; Break; end;
+  end;
+  if bumped then
+  begin
+    editDist3FromStringDelete(pStr);
+    Exit(nil);
+  end;
+  Result := pStr;
+end;
+
+procedure ed3UpdateCost(m: Pu32; i, j: i32; iCost: i32);
+var
+  b: u32;
+  pi, pj: Pu32;
+begin
+  Assert(iCost >= 0);
+  Assert(iCost < 10000);
+  pj := Pu32(PtrUInt(m) + PtrUInt(j)*SizeOf(u32));
+  pi := Pu32(PtrUInt(m) + PtrUInt(i)*SizeOf(u32));
+  b := pj^ + u32(iCost);
+  if b < pi^ then pi^ := b;
+end;
+
+const
+  SQLITE_SPELLFIX_STACKALLOC_SZ = 1024;
+
+function editDist3Core(pFrom: PEditDist3FromString; z2: PAnsiChar;
+                       n2: i32; pLang: PEditDist3Lang;
+                       pnMatch: Pi32): i32;
+label
+  Lbl_Abort;
+var
+  k, n, nMatch, nExtra: i32;
+  i1, b1, i2, b2: i32;
+  f: TEditDist3FromString;
+  a2: PEditDist3To;
+  m: Pu32;
+  pToFree: Pu32;
+  szRow: i32;
+  p: PEditDist3Cost;
+  res: i32;
+  nByte: u64;
+  stackSpace: array[0..(SQLITE_SPELLFIX_STACKALLOC_SZ div 4)-1] of u32;
+  pa: PEditDist3From;
+  pb: PEditDist3To;
+  rx, rxp, cx, cxp, cxd, cxu: i32;
+  apNew: Pointer;
+  ix: i32;
+begin
+  f := pFrom^;
+  n := (f.n + 1) * (n2 + 1);
+  n := (n + 1) and not 1;
+  nByte := u64(n) * SizeOf(u32) + u64(SizeOf(TEditDist3To)) * u64(n2);
+  if nByte <= SizeOf(stackSpace) then
+  begin
+    m := @stackSpace[0];
+    pToFree := nil;
+  end
+  else
+  begin
+    m := Pu32(sqlite3_malloc64(nByte));
+    pToFree := m;
+    if m = nil then Exit(-1);
+  end;
+  a2 := PEditDist3To(PtrUInt(m) + PtrUInt(n)*SizeOf(u32));
+  if n2 > 0 then FillChar(a2^, SizeOf(TEditDist3To)*n2, 0);
+
+  res := 0;
+  for i2 := 0 to n2 - 1 do
+  begin
+    pb := PEditDist3To(PtrUInt(a2) + PtrUInt(i2)*SizeOf(TEditDist3To));
+    pb^.nByte := utf8Len(Byte(z2[i2]), n2 - i2);
+    p := pLang^.pCost;
+    while p <> nil do
+    begin
+      if p^.nFrom > 0 then Break;
+      if i2 + p^.nTo > n2 then begin p := p^.pNext; continue; end;
+      if Byte(p^.a[0]) > Byte(z2[i2]) then Break;
+      if ed3MatchTo(p, @z2[i2], n2 - i2) = 0 then begin p := p^.pNext; continue; end;
+      Inc(pb^.nIns);
+      apNew := sqlite3_realloc64(pb^.apIns,
+                 u64(SizeOf(PEditDist3Cost) * pb^.nIns));
+      if apNew = nil then begin res := -1; goto Lbl_Abort; end;
+      pb^.apIns := PPEditDist3Cost(apNew);
+      PPEditDist3Cost(PtrUInt(apNew)
+        + PtrUInt(pb^.nIns - 1)*SizeOf(PEditDist3Cost))^ := p;
+      p := p^.pNext;
+    end;
+  end;
+
+  szRow := f.n + 1;
+  FillChar(m^, u64(n2 + 1) * u64(szRow) * SizeOf(u32), $01);
+  m^ := 0;
+
+  i1 := 0;
+  while i1 < f.n do
+  begin
+    pa := PEditDist3From(PtrUInt(f.a) + PtrUInt(i1)*SizeOf(TEditDist3From));
+    b1 := pa^.nByte;
+    ed3UpdateCost(m, i1 + b1, i1, pLang^.iDelCost);
+    for k := 0 to pa^.nDel - 1 do
+    begin
+      p := PPEditDist3Cost(PtrUInt(pa^.apDel)
+             + PtrUInt(k)*SizeOf(PEditDist3Cost))^;
+      ed3UpdateCost(m, i1 + p^.nFrom, i1, p^.iCost);
+    end;
+    Inc(i1, b1);
+  end;
+
+  i2 := 0;
+  while i2 < n2 do
+  begin
+    pb := PEditDist3To(PtrUInt(a2) + PtrUInt(i2)*SizeOf(TEditDist3To));
+    b2 := pb^.nByte;
+    rx := szRow * (i2 + b2);
+    rxp := szRow * i2;
+    ed3UpdateCost(m, rx, rxp, pLang^.iInsCost);
+    for k := 0 to pb^.nIns - 1 do
+    begin
+      p := PPEditDist3Cost(PtrUInt(pb^.apIns)
+             + PtrUInt(k)*SizeOf(PEditDist3Cost))^;
+      ed3UpdateCost(m, szRow * (i2 + p^.nTo), rxp, p^.iCost);
+    end;
+    i1 := 0;
+    while i1 < f.n do
+    begin
+      pa := PEditDist3From(PtrUInt(f.a) + PtrUInt(i1)*SizeOf(TEditDist3From));
+      b1 := pa^.nByte;
+      cxp := rx + i1;
+      cx := cxp + b1;
+      cxd := rxp + i1;
+      cxu := cxd + b1;
+      ed3UpdateCost(m, cx, cxp, pLang^.iDelCost);
+      for k := 0 to pa^.nDel - 1 do
+      begin
+        p := PPEditDist3Cost(PtrUInt(pa^.apDel)
+               + PtrUInt(k)*SizeOf(PEditDist3Cost))^;
+        ed3UpdateCost(m, cxp + p^.nFrom, cxp, p^.iCost);
+      end;
+      ed3UpdateCost(m, cx, cxu, pLang^.iInsCost);
+      if ed3MatchFromTo(@f, i1, @z2[i2], n2 - i2) <> 0 then
+        ed3UpdateCost(m, cx, cxd, 0);
+      ed3UpdateCost(m, cx, cxd, pLang^.iSubCost);
+      for k := 0 to pa^.nSubst - 1 do
+      begin
+        p := PPEditDist3Cost(PtrUInt(pa^.apSubst)
+               + PtrUInt(k)*SizeOf(PEditDist3Cost))^;
+        if ed3MatchTo(p, @z2[i2], n2 - i2) <> 0 then
+          ed3UpdateCost(m, cxd + p^.nFrom + szRow*p^.nTo, cxd, p^.iCost);
+      end;
+      Inc(i1, b1);
+    end;
+    Inc(i2, b2);
+  end;
+
+  res := i32(Pu32(PtrUInt(m) + PtrUInt(szRow*(n2+1) - 1)*SizeOf(u32))^);
+  nMatch := n2;
+  if f.isPrefix <> 0 then
+  begin
+    for i2 := 1 to n2 do
+    begin
+      ix := i32(Pu32(PtrUInt(m) + PtrUInt(szRow*i2 - 1)*SizeOf(u32))^);
+      if ix <= res then
+      begin
+        res := ix;
+        nMatch := i2 - 1;
+      end;
+    end;
+  end;
+  if pnMatch <> nil then
+  begin
+    nExtra := 0;
+    for k := 0 to nMatch - 1 do
+      if (Byte(z2[k]) and $c0) = $80 then Inc(nExtra);
+    pnMatch^ := nMatch - nExtra;
+  end;
+
+Lbl_Abort:
+  for i2 := 0 to n2 - 1 do
+  begin
+    pb := PEditDist3To(PtrUInt(a2) + PtrUInt(i2)*SizeOf(TEditDist3To));
+    sqlite3_free(pb^.apIns);
+  end;
+  sqlite3_free(pToFree);
+  Result := res;
+end;
+
+function editDist3FindLang(pConfig: PEditDist3Config;
+                           iLang: i32): PEditDist3Lang;
+var
+  i: i32;
+  pa: PEditDist3Lang;
+begin
+  for i := 0 to pConfig^.nLang - 1 do
+  begin
+    pa := PEditDist3Lang(PtrUInt(pConfig^.a)
+            + PtrUInt(i)*SizeOf(TEditDist3Lang));
+    if pa^.iLang = iLang then Exit(pa);
+  end;
+  Result := @editDist3LangDflt;
+end;
+
+procedure editDist3SqlFunc(pCtx: Psqlite3_context;
+                           argc: i32; argv: PPMem); cdecl;
+var
+  pConfig: PEditDist3Config;
+  db: PTsqlite3;
+  rc: i32;
+  zTable, zA, zB: PAnsiChar;
+  nA, nB, iLang, dist: i32;
+  pLang: PEditDist3Lang;
+  pFrom: PEditDist3FromString;
+begin
+  pConfig := PEditDist3Config(sqlite3_user_data(pCtx));
+  db := sqlite3_context_db_handle(pCtx);
+  if argc = 1 then
+  begin
+    zTable := PAnsiChar(sqlite3_value_text(argv[0]));
+    rc := editDist3ConfigLoad(pConfig, db, zTable);
+    if rc <> SQLITE_OK then sqlite3_result_error_code(pCtx, rc);
+  end
+  else
+  begin
+    zA := PAnsiChar(sqlite3_value_text(argv[0]));
+    zB := PAnsiChar(sqlite3_value_text(argv[1]));
+    nA := sqlite3_value_bytes(argv[0]);
+    nB := sqlite3_value_bytes(argv[1]);
+    if argc = 3 then
+      iLang := sqlite3_value_int(argv[2])
+    else
+      iLang := 0;
+    pLang := editDist3FindLang(pConfig, iLang);
+    pFrom := editDist3FromStringNew(pLang, zA, nA);
+    if pFrom = nil then
+    begin
+      sqlite3_result_error_nomem(pCtx);
+      Exit;
+    end;
+    dist := editDist3Core(pFrom, zB, nB, pLang, nil);
+    editDist3FromStringDelete(pFrom);
+    if dist = -1 then
+      sqlite3_result_error_nomem(pCtx)
+    else
+      sqlite3_result_int(pCtx, dist);
+  end;
+end;
+
+function editDist3Install(db: PTsqlite3): i32;
+const
+  FFlags = SQLITE_UTF8 or SQLITE_DETERMINISTIC;
+var
+  pConfig: PEditDist3Config;
+  rc: i32;
+begin
+  pConfig := PEditDist3Config(sqlite3_malloc64(SizeOf(TEditDist3Config)));
+  if pConfig = nil then Exit(SQLITE_NOMEM);
+  FillChar(pConfig^, SizeOf(pConfig^), 0);
+  rc := sqlite3_create_function_v2(db, 'editdist3', 2, FFlags, pConfig,
+          @editDist3SqlFunc, nil, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function_v2(db, 'editdist3', 3, FFlags, pConfig,
+            @editDist3SqlFunc, nil, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function_v2(db, 'editdist3', 1, FFlags, pConfig,
+            @editDist3SqlFunc, nil, nil, @editDist3ConfigDelete)
+  else
+    sqlite3_free(pConfig);
+  Result := rc;
+end;
+
 function sqlite3SpellfixInit(db: PTsqlite3): i32;
 const
   FFlags = SQLITE_UTF8 or SQLITE_DETERMINISTIC;
@@ -1249,6 +1924,8 @@ begin
   if rc = SQLITE_OK then
     rc := sqlite3_create_function(db, 'spellfix1_translit', 1, FFlags, nil,
                                   @transliterateSqlFunc, nil, nil);
+  if rc = SQLITE_OK then
+    rc := editDist3Install(db);
   Result := rc;
 end;
 
