@@ -1094,7 +1094,8 @@ existing dispatcher.
 - [ ] **10.1f** Long-tail / specialised dot-commands.  
   Out-of-scope dependencies (session, archive, recover)
   may stub with the upstream `SQLITE_OMIT_*` "feature not compiled
-  in" message.  Gate: `tests/cli/10f_misc/`.  - [ ] `.backup`,
+  in" message.  Gate: `tests/cli/10f_misc/`.  
+  - [ ] **10.1f.0** `.backup`,
   - [ ] **10.1f.1** `.restore`, 
   - [ ] **10.1f.2** `.clone`, 
   - [ ] **10.1f.3** `.archive`/`.ar`, 
