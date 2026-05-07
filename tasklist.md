@@ -152,7 +152,9 @@ FPC porting traps that recur often enough to call out up-front:
        (analyzeAggregate + generateAggSelect ORDER-BY-inside-aggregate
        arm).  Gate: DiagWindow `group_concat order` PASSes.
 
-  [X] **6.26** Window functions (window.c).  DiagWindow: ALL PASS
+  [~] **6.26** Window functions (window.c).  DiagWindow: 2 residual
+       divergences on bare `OVER ()` aggregates (`sum(b) OVER ()`,
+       `avg(b) OVER ()`) — see bug 6.29.  All other window paths PASS
        (multi-window arm closed by lifting the window-arm SRT_Output gate
        to admit SRT_EphemTab — recursive sqlite3Select from the outer
        eph-materialise now runs the window arm again on the inner sub-
@@ -283,6 +285,29 @@ FPC porting traps that recur often enough to call out up-front:
     TestVdbeRecord all pass.  Pre-existing multiSelectByMerge gap
     (UNION/EXCEPT/INTERSECT and ORDER BY merge across two real-FROM
     arms) is unaffected by this fix and tracked separately.
+
+- [ ] **6.29** `sum(b) OVER ()` / `avg(b) OVER ()` (no PARTITION BY,
+    no ORDER BY, no explicit frame) returns wrong values.  On a 3-row
+    `t(a INTEGER, b INTEGER)` with rows (1,10),(2,20),(3,30) the Pascal
+    port returns `[1,9];[null,9];[null,9]` instead of the C reference
+    `[1,60];[2,60];[3,60]`.  Bytecode (EXPLAIN) is byte-identical to C
+    apart from the source-iteration strategy (Pas uses an OpenEphemeral/
+    Sorter cursor 5; C uses InitCoroutine/Yield).  The structural
+    layout — outer scan inserting into eph cursor 1/2/3/4 (OpenDup
+    chain), inner second-pass `Rewind 2 / Column 4 1 / AggStep / Next 4`
+    sub-loop driving `AggValue`, then `Gosub / Delete / Next 1` to
+    output — is identical.  The same query rewritten with
+    `OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
+    FOLLOWING)` returns the correct sum=60, so the bug is gated on
+    "no ORDER BY" path (windowFullScan vs default-step dispatch).
+    Suspected: cursor 4 (OpenDup of the partition-eph) doesn't see the
+    rows inserted after its initial `Rewind 4` at first-row partition-
+    init time, so AggStep accumulates only the row that existed at
+    Rewind time.  Repro: `bin/passqlite3 :memory: <<<'CREATE TABLE
+    t(a INTEGER,b INTEGER); INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    SELECT a, sum(b) OVER () FROM t;'`.  Verified with `RANGE/ROWS
+    BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` (also fails)
+    and `PARTITION BY 1` (also fails) — common factor is "no ORDER BY".
 
 - [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
     valued PRAGMA functions) returns rows when called with a literal
@@ -462,13 +487,17 @@ FPC porting traps that recur often enough to call out up-front:
         matching C's `(pChunk = pChunk->pNext) != 0` semantics inside
         the loop tail.
 
-  [X] **6.10 step 17** Window-function and aggregate divergences
-      surfaced by `DiagWindow`.  All PASS as of 2026-05-06 (multi-window
-      arm closed under 6.26).
+  [~] **6.10 step 17** Window-function and aggregate divergences
+      surfaced by `DiagWindow`.  Multi-window arm closed under 6.26;
+      group_concat closed under 6.24; **2 residual runtime divergences**
+      remain on bare `OVER ()` aggregates — see bug 6.29.
       [X] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** —
         Closed by 6.24.
-      [X] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
-        / `row_number() OVER (...)` empty rows** — Closed under 6.26.
+      [~] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
+        / `row_number() OVER (...)` empty rows** — Mostly closed under
+        6.26, but two residual divergences remain in DiagWindow on
+        `sum(b) OVER ()` / `avg(b) OVER ()` (no PARTITION BY, no ORDER BY,
+        no explicit frame).  Tracked under bug 6.29 below.
 
   [X] **6.11** DROP TABLE remaining gap.  Closed 2026-05-06.
     (b) [X] Bytecode parity already at 1026/1026 in TestExplainParity
