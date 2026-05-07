@@ -176,6 +176,7 @@ compile_test DiagColName
 compile_test DiagConcat
 compile_test DiagCreateIdx
 compile_test DiagDate
+compile_test DiagDbdump
 compile_test DiagDbFileObject
 compile_test DiagDequoteToken
 compile_test DiagDml

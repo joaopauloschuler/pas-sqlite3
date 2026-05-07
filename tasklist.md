@@ -1434,6 +1434,33 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.81** ext/misc/dbdump.c (724 C lines) ported as new unit
+       `passqlite3dbdump.pas` (~658 lines).  Provides the public helper
+       `sqlite3_db_dump(db, zSchema, zTable, xCallback, pArg)` that
+       serialises an open SQLite connection into UTF-8 SQL text via a
+       `fputs`-compatible callback (CREATE / INSERT / index-trigger-view
+       blocks; rowid alias auto-detected through PRAGMA table_info +
+       PRAGMA index_list; embedded `\n` / `\r` payloads escaped through
+       `replace(...,char(10),...)` / `char(13)` so EOL translation can't
+       corrupt the dump; `sqlite_sequence` rewritten as a DELETE; CREATE
+       VIRTUAL TABLE replayed via writable_schema INSERT; `sqlite_stat?`
+       collapsed to ANALYZE).  Pascal port adaptations: dbdump.c's
+       `va_list` based output_formatted / output_sql_from_query /
+       run_schema_dump_query routed through `sqlite3PfMprintf` with
+       Pascal `array of const`; `goto col_oom` cleanup chain in
+       tableColumnList preserved 1:1 with a Pascal label; rowid alias
+       names ("rowid" / "_rowid_" / "oid") materialised as PAnsiChar
+       module-level constants so they survive past the function.
+       Verified byte-identical against the C reference: built a
+       1-table corpus (INTEGER PK + TEXT + BLOB columns; rows with
+       embedded \n, doubled '', NULL, and x'00ff' BLOBs; one CREATE
+       INDEX) and the Pascal `sqlite3_db_dump` output diff'd zero
+       against linking dbdump.c into a small C harness.  Smoke probe
+       `bin/DiagDbdump` builds the same corpus, asserts the canonical
+       statements appear in the dump, then replays into a fresh
+       :memory: connection and verifies the surviving row count.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps clean.
+
   [X] **10.1.80** ext/misc/fossildelta.c (1109 C lines) ported as new
        unit `passqlite3fossildelta.pas` (~700 lines).  Provides the
        Fossil delta encoder used by RBU: scalar SQL functions
