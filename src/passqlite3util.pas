@@ -104,6 +104,7 @@ type
     xShutdown: procedure(pAppData: Pointer); cdecl;
     pAppData:  Pointer;
   end;
+  PTsqlite3_mem_methods = ^Tsqlite3_mem_methods;
 
   { sqlite3_mutex_methods — mutex function table }
   Tsqlite3_mutex_methods = record
@@ -124,8 +125,11 @@ type
   ============================================================ }
 
 const
-  SQLITE_CONFIG_PAGECACHE = 7;   { sqlite3_config(SQLITE_CONFIG_PAGECACHE, pBuf, sz, N) }
-  SQLITE_CONFIG_PCACHE2   = 14;  { sqlite3_config(SQLITE_CONFIG_PCACHE2, &methods2) }
+  SQLITE_CONFIG_MALLOC     = 4;
+  SQLITE_CONFIG_GETMALLOC  = 5;
+  SQLITE_CONFIG_PAGECACHE  = 7;   { sqlite3_config(SQLITE_CONFIG_PAGECACHE, pBuf, sz, N) }
+  SQLITE_CONFIG_PCACHE2    = 14;  { sqlite3_config(SQLITE_CONFIG_PCACHE2, &methods2) }
+  SQLITE_CONFIG_GETPCACHE2 = 19;
 
 type
   Psqlite3_pcache_page = ^sqlite3_pcache_page;
@@ -2191,9 +2195,18 @@ function sqlite3_config(op: i32; pArg: Pointer): i32; overload;
 begin
   Result := SQLITE_OK;
   case op of
-    SQLITE_CONFIG_PCACHE2:
+    SQLITE_CONFIG_MALLOC:        { 4 }
+      if pArg <> nil then
+        sqlite3GlobalConfig.m := PTsqlite3_mem_methods(pArg)^;
+    SQLITE_CONFIG_GETMALLOC:     { 5 }
+      if pArg <> nil then
+        PTsqlite3_mem_methods(pArg)^ := sqlite3GlobalConfig.m;
+    SQLITE_CONFIG_PCACHE2:       { 14 }
       if pArg <> nil then
         sqlite3GlobalConfig.pcache2 := PTsqlite3_pcache_methods2(pArg)^;
+    SQLITE_CONFIG_GETPCACHE2:    { 19 }
+      if pArg <> nil then
+        PTsqlite3_pcache_methods2(pArg)^ := sqlite3GlobalConfig.pcache2;
     { All other ops silently accepted for now }
   end;
 end;

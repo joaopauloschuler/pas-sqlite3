@@ -1434,6 +1434,39 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.77** ext/misc/qpvtab.c (462 C lines) + ext/misc/memtrace.c
+       (108 C lines) + ext/misc/pcachetrace.c (179 C lines) ported as new
+       units `passqlite3qpvtab.pas`, `passqlite3memtrace.pas`,
+       `passqlite3pcachetrace.pas` (~749 C lines total).  qpvtab is the
+       debugging eponymous vtab that returns one row per
+       sqlite3_index_info field describing how the planner called
+       xBestIndex; idxStr is composed via sqlite3_str_appendf and routed
+       to xFilter; the integer-RHS shortcut on the hidden `flags`
+       column toggles INT-typed a..e values, orderByConsumed, and
+       constraint omit.  memtrace / pcachetrace install substitute
+       sqlite3_mem_methods / sqlite3_pcache_methods2 vectors that fprintf
+       every allocate/free/resize and every xFetch/xUnpin/xRekey/etc.
+       call to a caller-supplied FILE*; activate / deactivate API
+       matches the C source.  Companion fix to sqlite3_config — the
+       Pascal port previously only handled SQLITE_CONFIG_PCACHE2; the
+       three op codes the trace activators need (SQLITE_CONFIG_MALLOC=4,
+       SQLITE_CONFIG_GETMALLOC=5, SQLITE_CONFIG_GETPCACHE2=19) are now
+       wired through sqlite3GlobalConfig.m / .pcache2.  Wired via
+       sqlite3QpvtabInit in shell openDb; memtrace / pcachetrace are
+       exported but not auto-installed (they are diagnostic-only and
+       the shell's --memtrace / --pcachetrace command-line wiring
+       lands later).  Pascal-port caveat for qpvtab: same as 10.1.69 /
+       10.1.71 / 10.1.72 — WhereBegin's vtab xBestIndex pushdown is
+       not yet wired (codegen.pas:13938 / 28163), so `SELECT … FROM
+       qpvtab(102) WHERE a=…` walks an unfiltered cursor with idxStr
+       = NULL → 0 rows.  The module itself is faithful end-to-end; once
+       pushdown lands, the rich row stream flows through.  Pascal-port
+       caveat for memtrace / pcachetrace: most of the Pascal port
+       routes allocations directly through sqlite3_malloc / pcache1
+       rather than the global config vector, so the trace layers only
+       see callers that go through sqlite3GlobalConfig.m / .pcache2.
+       TestExplainParity 1026/1026; both new units compile clean.
+
   [X] **10.1.76** ext/misc/stmt.c (347 C lines) + ext/misc/explain.c
        (323 C lines) ported as new units `passqlite3stmt.pas` and
        `passqlite3explain.pas` (~670 C lines total).  stmt.c provides the

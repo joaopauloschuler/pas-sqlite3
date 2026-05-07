@@ -93,6 +93,7 @@ uses
   passqlite3regexp,
   passqlite3stmt,
   passqlite3explain,
+  passqlite3qpvtab,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -635,6 +636,10 @@ begin
     (323 C lines): SELECT … FROM explain('SELECT …') yields the
     bytecode rows of the inner statement (addr/opcode/p1..p5/comment). }
   sqlite3ExplainVtabInit(p^.db);
+  { Phase 10.1.77 — qpvtab eponymous vtab from ext/misc/qpvtab.c
+    (462 C lines): debugging vtab whose rows describe how the query
+    planner called xBestIndex. }
+  sqlite3QpvtabInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
