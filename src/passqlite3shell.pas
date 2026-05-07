@@ -96,6 +96,7 @@ uses
   passqlite3qpvtab,
   passqlite3btreeinfo,
   passqlite3vtablog,
+  passqlite3scrub,
   passqlite3main;
 
 { ----------------------------------------------------------------------

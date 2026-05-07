@@ -1434,6 +1434,28 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.79** ext/misc/scrub.c (610 C lines) ported as new unit
+       `passqlite3scrub.pas` (~590 lines).  Provides the public helper
+       `sqlite3_scrub_backup(zSrcFile, zDestFile, pzErr)` that copies a
+       whole SQLite database while zeroing out content in regions the
+       database considers free / unused: freelist trunk pages
+       (descendant leaves intentionally not copied — OS zero-fills the
+       gap on demand, mirroring scrub.c:323..338), the gap between the
+       cell-index array and the cell content area on each b-tree page,
+       free blocks inside b-tree pages, and the unused tail of the last
+       overflow page in each chain.  Recurses through the whole btree
+       set rooted in sqlite_schema (plus the schema btree itself);
+       walks ptrmap pages in autovacuum/incvacuum mode; preserves the
+       on-disk page count via a trailing zero page when iLastPage falls
+       short of nPage (last input page may be a freelist leaf).  Key
+       Pascal-port adaptations: sqlite3_vmprintf with C varargs replaced
+       by SysUtils.Format → sqlite3StrDup so the error buffer lives in
+       sqlite3_malloc memory; goto-driven btree_corrupt cleanup mirrored
+       1:1 via a single label per function.  Verified end-to-end via
+       new `bin/DiagScrub`: source db with 3 rows + 1 deletion → scrub
+       to fresh file → reopen → count(*)=2 + PRAGMA integrity_check =
+       'ok'.  TestExplainParity 1026/1026.
+
   [X] **10.1.78** ext/misc/btreeinfo.c (434 C lines) + ext/misc/vtablog.c
        (720 C lines) ported as new units `passqlite3btreeinfo.pas` (~330
        lines) and `passqlite3vtablog.pas` (~570 lines) — ~1154 C lines
