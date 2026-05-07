@@ -1438,6 +1438,34 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.92** ext/misc/fuzzer.c (1192 C lines) ported as new unit
+       `passqlite3fuzzer.pas` (~720 lines).  Provides the `fuzzer`
+       virtual table: `CREATE VIRTUAL TABLE f USING fuzzer(<rule-table>)`
+       reads a four-column (ruleset, cFrom, cTo, Cost) table at connect
+       time, then yields all variations of an input word reachable
+       through the costed character-rewrite rules in increasing distance
+       order.  Full port: fuzzerMergeRules / fuzzerLoadOneRule /
+       fuzzerLoadRules (with the upstream 15-bin merge-ladder cost
+       sort), fuzzerDequote, fuzzerConnect/Disconnect, fuzzerOpen/Close,
+       fuzzerClearCursor / fuzzerClearStemList, fuzzerRender, fuzzerHash,
+       fuzzerCost, fuzzerSeen, fuzzerSkipRule, fuzzerAdvance,
+       fuzzerMergeStems, fuzzerLowestCostStem, fuzzerInsert,
+       fuzzerNewStem, fuzzerNext, fuzzerFilter, fuzzerColumn / Rowid /
+       Eof, fuzzerBestIndex (idxNum bits 1=MATCH on word, 2=LT/LE on
+       distance, 4=EQ on ruleset).  Pascal-port adaptations: the
+       `fuzzer_rule.zTo[4]` flexible-array hack preserved as a
+       4-element AnsiChar array with allocation extended by nFrom+nTo
+       bytes; PAnsiChar offset arithmetic relies on
+       `{$POINTERMATH ON}`.  Wired via `sqlite3FuzzerInit` in shell
+       openDb.  Verified end-to-end: a 4-rule corpus with empty
+       starting term emits the expected 1..100-char 'a' progression
+       at increasing 100-cost steps.  Same caveat as the prior
+       eponymous-vtab series (10.1.69, 10.1.71, 10.1.72, 10.1.77,
+       10.1.80, 10.1.83, 10.1.86): WhereBegin's vtab MATCH /
+       constraint pushdown is not yet wired (codegen.pas:13938 / 28163),
+       so `WHERE word MATCH 'abc' AND distance<200` does not reach
+       fuzzerFilter — the module itself is faithful end-to-end.
+
   [X] **10.1.91** ext/misc/unionvtab.c (1383 C lines) ported as new unit
        `passqlite3unionvtab.pas` (~770 lines).  Provides the
        `unionvtab` and `swarmvtab` virtual tables: presents many rowid
@@ -1987,12 +2015,14 @@ existing dispatcher.
        end; once the pushdown lands the args flow through.
        TestExplainParity 1026/1026 (no regression).
 
-- [X] **6.15** TestExplainParity regression to 224/802 — not
-    reproduced on a4 @ 2026-05-07.  Re-ran `bin/TestExplainParity`
-    against a fresh build (with 10.1.71 series.pas applied) and got
-    1026 pass / 0 diverge / 0 error.  The earlier 802-divergence
-    report was likely a stale-binary read.  Re-open if the symptom
-    (extra OP_Explain at Init+1) shows up again on a clean build.
+- [ ] **6.15** TestExplainParity regression to 224/802 — REOPENED
+    2026-05-07.  Symptom is back on a clean build of a4: extra
+    OP_Explain row(s) shifting Init.p2 (e.g. Init p2=12 vs C's p2=10
+    on a SELECT, p2=8 vs p2=7 elsewhere).  Reproduced both before
+    and after 10.1.92 — independent of the new fuzzer port.  Likely
+    introduced by one of the post-10.1.71 codegen / vtab changes.
+    Bisect candidate set: 10.1.72..10.1.91 (or the engine-side
+    callback / collation / memused fixes 8.x.colneed / 8.x.memused).
 
 - [X] **8.x.colneed** sqlite3_collation_needed callback now fires.
   Closed 2026-05-06.  `sqlite3GetCollSeq` (codegen.pas:42193) was
