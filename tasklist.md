@@ -2359,22 +2359,31 @@ existing dispatcher.
   DiagOps / DiagDml / DiagPragma / DiagFunctions / DiagTxn / DiagMisc /
   DiagCast / DiagDate / DiagAnalyze / DiagDropTable all clean.
 
-- [ ] **10.1.bug.6** Multi-row DELETE with any AFTER trigger (RETURNING
-  trigger included) hangs at runtime.  Reproducer:
-  `CREATE TABLE t(x); CREATE TRIGGER tr AFTER DELETE ON t BEGIN
-  INSERT INTO log VALUES(OLD.x); END;
-  INSERT INTO t VALUES(1),(2); DELETE FROM t;` — second iteration of
-  the rowset-buffered loop never terminates.  Single-row DELETE works
-  (rowset has one entry, `RowSetRead` returns empty on next call and
-  exits).  Without the trigger DELETE uses the simple Rewind/Next
-  shape and is fine.  Likely culprit: the buffered loop's `RowSetRead
-  → NotExists → ... → Goto` cycle in the Pas DELETE codegen does not
-  terminate when `RowSetAdd`'d rowids are processed, perhaps because
-  `OpenWrite` reopening cursor 0 after the rowset-collection pass
-  invalidates the rowset register.  Surfaced under bug 10.1.bug.5 —
-  multi-row `RETURNING` rows arrive in the trigger via the same path.
-  Investigation should compare the OP_RowSetAdd / OP_RowSetRead
-  semantics in passqlite3vdbe.pas against vdbe.c.
+- [X] **10.1.bug.6** Multi-row DELETE with AFTER trigger hang — fixed
+  2026-05-07.  Root cause: the rowset implementation in passqlite3vdbe.pas
+  diverged from rowset.c.  `sqlite3RowSetNext` had been routing through a
+  hand-rolled rowSetSort/rowSetTreeToList path that confused tree pRight
+  with forest-list pRight, corrupting the linked list and producing a
+  cyclic chain.  `rowSetTreeToList` itself was buggy (used the outer
+  ppLast as a temporary instead of a local pointer; passed the same
+  pointer for ppFirst and ppLast on the right recursion instead of
+  &pIn->pRight).  `rowSetEntryMerge` did not drop duplicates.  Fix:
+  ported `rowSetEntrySort` (40-bucket merge sort) from rowset.c:271..297;
+  rewrote `sqlite3RowSetNext` as a flag-driven sort+pop on pEntry
+  (matches rowset.c:408..432 byte-for-byte); fixed `rowSetTreeToList` to
+  pass &pIn->pRight on the right branch and a local on the left;
+  rewrote `rowSetEntryMerge` to drop duplicates per rowset.c:236..267;
+  rewrote `sqlite3RowSetTest` to mirror rowset.c:442..505 exactly
+  (sort current pEntry into pForest as a new tree on each batch
+  change, then BST-search every forest tree).  Set initial
+  `rsFlags := ROWSET_SORTED` in alloc/clear.  Sqlite3RowSetInsert now
+  clears ROWSET_SORTED when a new rowid is <= pLast.  Verified: the
+  reproducer (multi-row DELETE+AFTER trigger with RETURNING) now
+  terminates correctly; multi-row INSERT/UPDATE/DELETE...RETURNING all
+  emit the right rows; TestExplainParity 1026/1026; TestSmoke PASSED;
+  TestDMLBasic 54/54; TestVdbeAgg 11/11; TestSelectBasic 60/60;
+  TestWhereBasic 52/52; DiagOps / DiagDml / DiagFeatureProbe / DiagPragma
+  / DiagTxn / DiagFunctions / DiagMisc / DiagCast all clean.
 
 - [X] **10.1.bug.4** Scalar PRAGMAs (`page_count`, `max_page_count`,
   `page_size`, `cache_size`, `synchronous`, `temp_store`, etc.)
