@@ -1438,6 +1438,43 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.96** ext/intck/sqlite3intck.c (941 C lines) ported as new unit
+       `passqlite3intck.pas` (~620 lines).  Provides the incremental
+       integrity-check API: `sqlite3_intck_open(db, zDb, ppOut)`,
+       `_step`, `_message`, `_unlock`, `_error`, `_close`, `_test_sql`.
+       The intck object resembles `PRAGMA integrity_check` but is
+       incremental — caller drives one step at a time, and may
+       `sqlite3_intck_unlock()` to release the read transaction
+       between steps.  Faithful 1:1 port: intckSaveErrmsg /
+       intckPrepare / intckPrepareFmt / intckFinalize / intckStep /
+       intckExec / intckMprintf, intckSaveKey (composes the resume-
+       vector SQL using quote() over the current pCheck columns;
+       handles the index-with-DESC/NULL case via the WITH wc(q)
+       VALUES-list ladder), intckFindObject (UNION ALL of
+       sqlite_schema rows + literal 'sqlite_schema' driving the
+       sweep), intckGetToken / intckIsSpace / intckParseCreateIndex
+       (skips quoted/bracket/identifier tokens, walks parens to find
+       the iCol'th column expression or trailing WHERE clause),
+       intckParseCreateIndexFunc (registers the SQL function
+       `parse_create_index(sql, icol)` used by the check-statement
+       composer), intckGetAutoIndex / intckIsIndex, intckCheckObjectSql
+       (the 100-line zCommon CTE block — without_rowid / idx_cols /
+       tabpk / idx / wrapper_with — plus the index-side and table-side
+       per-object check-SQL composers).  Pascal-port adaptations:
+       intckPrepareFmt / intckMprintf accept Pascal `array of const`
+       instead of C `va_list` and route through sqlite3PfMprintf;
+       the C `%z` printf extension auto-frees the input pointer, but
+       the Pascal `%z` keeps the string alive — every C `%z`-chain
+       in intckSaveKey / intckCheckObjectSql is rewritten to call
+       `sqlite3_free(zOld)` explicitly after each `%s`-based format,
+       preserving the original ownership semantics.  Wired into
+       `passqlite3shell` uses-clause so the unit is available to the
+       shell binary; not auto-installed as the API is caller-driven.
+       Verified end-to-end via new `bin/DiagIntck`: open :memory:,
+       create a table+index, run intck_open/step-loop/error/test_sql/
+       close — no corruption reported, no crash, no leaks.
+       TestExplainParity 1026/1026; TestSmoke PASSED.
+
   [X] **10.1.95** ext/misc/compress.c (131 C lines) and ext/misc/sqlar.c
        (126 C lines) ported as new units `passqlite3compress.pas` and
        `passqlite3sqlar.pas` (~257 C lines total).  Provides the SQL

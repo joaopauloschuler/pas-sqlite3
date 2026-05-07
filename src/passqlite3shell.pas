@@ -112,6 +112,7 @@ uses
   passqlite3amatch,
   passqlite3compress,
   passqlite3sqlar,
+  passqlite3intck,
   passqlite3main;
 
 { ----------------------------------------------------------------------
