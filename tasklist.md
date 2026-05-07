@@ -2360,6 +2360,33 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [ ] **10.1.bug.7** Fixed-point float printf rounds binary halfway values
+  in the wrong direction.  `printf('%.1f', 1.45)` returns `'1.5'` (C: `'1.4'`);
+  `printf('%!.1f', 1.45)` likewise.  Sweep:
+  ```
+                    Pas        C
+    round(1.15,1)   1.2        1.1
+    round(1.45,1)   1.5        1.4
+    round(1.65,1)   1.7        1.6
+    round(1.95,1)   2.0        1.9
+    round(2.675,2)  2.68       2.67
+  ```
+  Root cause: `fpDecode` / `fp2Convert10` (passqlite3printf.pas:680, 768)
+  produce a *lossy* decimal mantissa.  Example: 1.45 is stored as
+  1.4499999999999999556... in binary, so any high-precision decimal
+  reconstruction should yield `"144999999999999996..."` — but the Pascal
+  port emits `"15000000..."` and the rounding step at line 872
+  (`if z[iRound] >= '5' then ...round up...`) then rounds up to 1.5.
+  Affects every float→text path: `printf %f / %!.*f / %g`, the VDBE
+  float-render arm via `sqlite3RenderNumF`, `round(X, N)` (which goes
+  through `Trunc(r*factor+0.5)/factor` and inherits the same FP
+  imprecision but for a different reason — the upstream fix is to call
+  `%!.*f` + `sqlite3AtoF` round-trip).  Repro hidden from
+  TestExplainParity (bytecode parity unaffected); surfaces in any
+  diagnostic that compares text output of `round` / `printf` against
+  the C oracle.  Fix likely lives in `fp2Convert10` or in the
+  Karatsuba-style 128-bit multiply chain that drives it.
+
 - [X] **10.1.bug.5** RETURNING clause silently dropped — INSERT / UPDATE /
   DELETE ... RETURNING produced no result rows because
   `sqlite3AddReturning` (codegen.pas) was a stub that just freed the
