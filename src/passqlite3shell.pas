@@ -88,6 +88,7 @@ uses
   passqlite3memstat,
   passqlite3series,
   passqlite3completion,
+  passqlite3decimal,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -608,6 +609,11 @@ begin
     ext/misc/completion.c (522 C lines).  Powers SQL tab-completion
     (KEYWORDS / DATABASES / TABLES / COLUMNS phases). }
   sqlite3CompletionVtabInit(p^.db);
+  { Phase 10.1.73 — arbitrary-precision decimal arithmetic from
+    ext/misc/decimal.c (952 C lines): decimal / decimal_exp / decimal_cmp /
+    decimal_add / decimal_sub / decimal_mul / decimal_pow2 / decimal_sum
+    aggregate, plus the `decimal` collation. }
+  sqlite3DecimalInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);

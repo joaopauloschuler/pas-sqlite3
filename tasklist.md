@@ -1434,6 +1434,26 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.73** ext/misc/decimal.c (952 C lines) ported as new unit
+       `passqlite3decimal.pas` (~720 lines).  Provides arbitrary-precision
+       decimal arithmetic backed by a `signed char[]` digit string with
+       integer/frac split: decimal(X) / decimal(X,N) (exact text form),
+       decimal_exp(X) / decimal_exp(X,N) (`%+#e` style), decimal_cmp(X,Y),
+       decimal_add(X,Y), decimal_sub(X,Y), decimal_mul(X,Y), decimal_pow2(N),
+       decimal_sum(Y) aggregate/window function, plus the `decimal`
+       collation.  All goto-fault chains in decimalNewFromText / decimal_new
+       / decimalPow2 / decimalMul restructured to early-return cleanup
+       blocks.  IEEE754 conversion in decimalFromDouble preserves the C
+       `memcpy(&a,&r,sizeof(a))` type-pun via FPC's `Move`.  The
+       `e%+03d` formatter is hand-rolled because sqlite3_snprintf has no
+       Pascal cdecl entry that accepts varargs.  Wired via
+       `sqlite3DecimalInit(p^.db)` in shell openDb.  Verified
+       byte-identical against `.load /tmp/decimal.so`: decimal('0.1')+0.2
+       = 0.3 exactly, decimal(1.0/3.0) returns the full 54-digit
+       expansion, decimal_sum across 5 mixed values, COLLATE decimal
+       sort, and decimal_pow2(10)='+1.024e+03' / decimal_pow2(-3)=
+       '+1.25e-01' all match.  TestExplainParity 1026/1026.
+
   [X] **10.1.71** ext/misc/series.c (937 C lines) ported as new unit
        `passqlite3series.pas` (~627 lines).  Provides the
        eponymous `generate_series(start[, stop[, step]])` virtual
