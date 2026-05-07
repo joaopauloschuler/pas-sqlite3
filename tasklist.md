@@ -2472,7 +2472,31 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
-- [X] **10.1.bug.10**
+- [ ] **10.1.bug.10**
+     ```
+     sqlite> create table tbl1(one text, two int);
+     sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
+     sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
+     sqlite> select * from tbl1;
+     hello!|10
+     goodbye|20
+     hello!|10
+     goodbye|20
+     sqlite> select sum(two) from tlb1;
+     Parse error: no such table: tlb1
+     sqlite> select sum(two) from tbl1;
+     60
+     sqlite> select one, sum(two) from tbl1 group by one;
+     goodbye|40
+     hello!|20
+     sqlite> create table x as select * from tbl1;
+     An unhandled exception occurred at $00000000004C1164:
+     EAccessViolation: Access violation
+     $00000000004C1164
+     $000000000056A7D8
+     ```
+
+- [ ] **10.1.bug.10**
      ```
      sqlite> .mode list --colsep "|"
      sqlite> .output test_file_1.txt
