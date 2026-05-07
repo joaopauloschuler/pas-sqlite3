@@ -1434,6 +1434,32 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.80** ext/misc/fossildelta.c (1109 C lines) ported as new
+       unit `passqlite3fossildelta.pas` (~700 lines).  Provides the
+       Fossil delta encoder used by RBU: scalar SQL functions
+       `delta_create(X,Y)` / `delta_apply(X,D)` / `delta_output_size(D)`
+       plus the `delta_parse(D)` eponymous table-valued vtab whose rows
+       describe the SIZE / COPY / INSERT / CHECKSUM stream.  Includes
+       the rolling-hash matcher (NHASH=16 base-64 framing per
+       fossil-scm.org/fossil/doc/trunk/www/delta_format.wiki), the
+       little-endian arm of the big-endian checksum, and the deltaGetInt
+       / putInt / digit_count base-64 codec.  Wired via
+       `sqlite3FossildeltaInit(p^.db)` in shell openDb.  Verified
+       byte-identical against `.load /tmp/fossildelta.so` on length and
+       hex of delta_create over multi-line / repeating-byte / single-
+       byte-edit corpora; round-trip `delta_apply(X,delta_create(X,Y))=Y`
+       holds.  Caveat: the `delta_parse(D)` and
+       `… FROM delta_parse WHERE delta=D` filter forms return zero rows
+       in the Pascal port — same WhereBegin-vtab-pushdown gap as the
+       prior eponymous-vtab ports (10.1.69, 10.1.71, 10.1.72, 10.1.77);
+       the cursor implementation itself is faithful and yields rows once
+       the constraint flows through.  Implementation note: a `nHash`
+       local in `deltaCreate` initially shadowed the file-level
+       `NHASH=16` constant because Pascal is case-insensitive — the
+       constant was renamed to `NHASH_BYTES` to disambiguate.
+       TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe
+       clean.
+
   [X] **10.1.79** ext/misc/scrub.c (610 C lines) ported as new unit
        `passqlite3scrub.pas` (~590 lines).  Provides the public helper
        `sqlite3_scrub_backup(zSrcFile, zDestFile, pzErr)` that copies a

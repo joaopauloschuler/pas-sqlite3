@@ -97,6 +97,7 @@ uses
   passqlite3btreeinfo,
   passqlite3vtablog,
   passqlite3scrub,
+  passqlite3fossildelta,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -648,6 +649,10 @@ begin
     file, with type/name/tbl_name/rootpage/sql plus estimated
     nEntry/nPage/depth/szPage/hasRowid computed from sqlite_dbpage. }
   sqlite3BinfoRegister(p^.db);
+  { Phase 10.1.80 — fossil delta encoder from ext/misc/fossildelta.c
+    (1109 C lines): delta_create / delta_apply / delta_output_size SQL
+    functions plus the delta_parse(D) eponymous table-valued function. }
+  sqlite3FossildeltaInit(p^.db);
   { vtablog (ext/misc/vtablog.c, 720 C lines) is exported but NOT
     auto-installed — every callback writes a trace line to stdout, so
     auto-registering would corrupt every shell session.  Loading it
