@@ -2408,19 +2408,24 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
-- [ ] **10.1.bug.8** Parser rejects `CREATE TABLE "db"."tbl"(...)` and
-  `CREATE INDEX "db"."ixn" ON ...` with the upstream double-quoted
-  schema-qualified identifier form.  Surfaces as `Parse error: unknown
-  database "db"."tbl"(...)` (with the rest of the statement bleeding
-  past the NUL into the error message — unrelated parser-side mishandling
-  of the error-token span).  Other statement forms tolerate the same
-  syntax: bare-schema variants (`main.tbl`), DROP TABLE, ALTER TABLE,
-  and SELECT all parse fine; only CREATE TABLE / CREATE INDEX reject
-  the quoted schema prefix.  Workaround in spellfix1 vtab port
-  (10.1.99) uses `%s."%w_vocab"` for the shadow-table DDL.  Likely
-  isolated to the lemon grammar's CREATE-statement schema-name
-  reduction; investigate `nm DOT nm` arms in `parse.y` /
-  `passqlite3parser.pas`.
+- [X] **10.1.bug.8** Fixed 2026-05-07.  Root cause was in
+  `sqlite3FindDb` (passqlite3codegen.pas) — it called
+  `sqlite3DbStrNDup` directly without dequoting, so token `"main"`
+  became the literal name `"main"` (with quotes) and never matched
+  the bare `main` schema.  The C reference (build.c:951) routes through
+  `sqlite3NameFromToken`, which dequotes.  Fix: dup + sqlite3Dequote
+  inline (parser unit not visible from codegen).  Companion fix in
+  `sqlite3TwoPartName` — the `unknown database` error message used
+  `AnsiString(pName1^.z)` (walks past the token to the next NUL,
+  bleeding the rest of the SQL into the message); replaced with a
+  SetString bounded by `pName1^.n`.  Spellfix1 shadow-table DDL
+  workaround in passqlite3spellfix.pas reverted to upstream's
+  quoted `"%w"."%w_vocab"` form.  Verified: `CREATE TABLE
+  "main"."t"(x)` / `CREATE INDEX "main"."ix" ON t(x)` /
+  `INSERT INTO "main"."t" VALUES(42)` / `SELECT * FROM "main"."t"`
+  all work; bad name `"nope"."y"` errors with the bounded message
+  `Parse error: unknown database "nope"`; spellfix1 vtab still
+  registers cleanly.  TestExplainParity 1026/1026; TestSmoke PASSED.
 
 - [X] **10.1.bug.7** Fixed-point float printf / round rounded the wrong
   direction for binary halfway literals.  Closed 2026-05-07.  Two

@@ -32112,8 +32112,9 @@ begin
   Result := -1;
   if pName = nil then Exit;
   if pName^.n = 0 then Exit;
-  { Token may not be null-terminated — make a temporary string }
-  zName := sqlite3DbStrNDup(db, PChar(pName^.z), pName^.n);
+  { Token may be quoted; dup + dequote inline (parser unit not visible from codegen). }
+  zName := sqlite3DbStrNDup(db, pName^.z, u64(pName^.n));
+  if zName <> nil then sqlite3Dequote(zName);
   if zName = nil then Exit;
   Result := sqlite3FindDbName(db, zName);
   sqlite3DbFree(db, zName);
@@ -32372,6 +32373,7 @@ function sqlite3TwoPartName(pParse: PParse; const pName1: PToken;
 var
   iDb: i32;
   db: PTsqlite3;
+  sName: AnsiString;
 begin
   db := pParse^.db;
   if (pName2 <> nil) and (pName2^.n > 0) then begin
@@ -32379,8 +32381,11 @@ begin
     pUnqual^ := pName2;
     iDb := sqlite3FindDb(db, pName1);
     if iDb < 0 then begin
+      { Bound the token by pName1^.n — pName1^.z is a slice of the
+        live SQL stream (not NUL-terminated). }
+      SetString(sName, pName1^.z, pName1^.n);
       sqlite3ErrorMsg(pParse,
-        PAnsiChar('unknown database ' + AnsiString(pName1^.z)));
+        PAnsiChar('unknown database ' + sName));
       Result := -1; Exit;
     end;
   end else begin

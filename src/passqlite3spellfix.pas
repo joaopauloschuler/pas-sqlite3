@@ -2117,13 +2117,9 @@ begin
         + 'top HIDDEN, scope HIDDEN, srchcnt HIDDEN, '
         + 'soundslike HIDDEN, command HIDDEN)');
     end;
-    { Pascal-port: parser does not accept "db"."tbl" in CREATE TABLE
-      / CREATE INDEX, so use bare-db + quoted-tbl form (%s."%w").
-      The db name from pragma_database_list is always a plain identifier
-      so this is safe. }
     if (rc = SQLITE_OK) and (isCreate <> 0) then begin
       spellfix1DbExec(@rc, db,
-        'CREATE TABLE IF NOT EXISTS %s."%w_vocab"('#10
+        'CREATE TABLE IF NOT EXISTS "%w"."%w_vocab"('#10
         + '  id INTEGER PRIMARY KEY,'#10
         + '  rank INT,'#10
         + '  langid INT,'#10
@@ -2133,7 +2129,7 @@ begin
         + ');'#10,
         [zDbName, zTableName]);
       spellfix1DbExec(@rc, db,
-        'CREATE INDEX IF NOT EXISTS %s."%w_vocab_index_langid_k2" '
+        'CREATE INDEX IF NOT EXISTS "%w"."%w_vocab_index_langid_k2" '
         + 'ON "%w_vocab"(langid,k2);',
         [zDbName, zTableName, zTableName]);
     end;
