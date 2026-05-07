@@ -1095,23 +1095,22 @@ existing dispatcher.
   Out-of-scope dependencies (session, archive, recover)
   may stub with the upstream `SQLITE_OMIT_*` "feature not compiled
   in" message.  Gate: `tests/cli/10f_misc/`.  - [ ] `.backup`,
-  - [ ] `.restore`, 
-  - [ ] `.clone`, 
-  - [ ] `.archive`/`.ar`, 
-  - [ ] `.session`, 
-  - [ ] `.recover`,
-  - [ ] `.dbinfo`, 
-  - [ ] `.dbconfig`, 
-  - [ ] `.filectrl`, 
-  - [ ] `.sha3sum`, 
-  - [ ] `.crnl`,
-  - [ ] `.binary`, 
-  - [ ] `.connection`, 
-  - [ ] `.unmodule`, 
-  - [ ] `.vfsinfo`, 
-  - [ ] `.vfslist`,
-  - [ ] `.vfsname`. 
-  
+  - [ ] **10.1f.1** `.restore`, 
+  - [ ] **10.1f.2** `.clone`, 
+  - [ ] **10.1f.3** `.archive`/`.ar`, 
+  - [ ] **10.1f.4** `.session`, 
+  - [ ] **10.1f.5** `.recover`,
+  - [ ] **10.1f.6** `.dbinfo`, 
+  - [ ] **10.1f.7** `.dbconfig`, 
+  - [ ] **10.1f.8** `.filectrl`, 
+  - [ ] **10.1f.9** `.sha3sum`, 
+  - [ ] **10.1f.10** `.crnl`,
+  - [ ] **10.1f.11** `.binary`, 
+  - [ ] **10.1f.12** `.connection`, 
+  - [ ] **10.1f.13** `.unmodule`, 
+  - [ ] **10.1f.14** `.vfsinfo`, 
+  - [ ] **10.1f.15** `.vfslist`,
+  - [ ] **10.1f.16** `.vfsname`. 
 
   [X] **10.1.43** `.backup ?DB? ?-async? ?-append? FILE` — cmdBackup
        wraps sqlite3_backup_init/_step/_finish (100-page chunks).
