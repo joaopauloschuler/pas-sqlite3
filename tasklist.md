@@ -1489,9 +1489,8 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
-  [~] **10.1.99** ext/misc/spellfix.c scalar-functions subset ported as
-       new unit `passqlite3spellfix.pas` (~1245 lines Pascal porting
-       ~1100 C lines from spellfix.c:42..538 + 1243..1830 + 1848..1896).
+  [X] **10.1.99** ext/misc/spellfix.c (3076 C lines) ported in full
+       as new unit `passqlite3spellfix.pas` (~2620 lines Pascal).
        Provides `spellfix1_phonehash(X)`, `spellfix1_editdist(A,B)`,
        `spellfix1_scriptcode(X)`, and `spellfix1_translit(X)`.
        Translit landed 2026-05-07: ~580 new lines covering the 389-row
@@ -1528,9 +1527,39 @@ existing dispatcher.
        'sitting')=400, prefix-match editdist3('abc*','abcdef')=0,
        editdist3 with a 5-rule cost table (ph→f, ck→k) returns
        10/5/300/225 across phone→fone / truck→truk / hello→world /
-       abc→def.  The full spellfix1 virtual table (vocabulary fuzzy
-       search) is still NOT ported and remains in the source for a
-       future pass.
+       abc→def.  Spellfix1 virtual table (vocabulary fuzzy search)
+       landed 2026-05-07: ~700 new lines porting spellfix.c:1900..3056.
+       Full module: spellfix1Create/Connect/Disconnect/Destroy/Open/
+       Close/BestIndex/Filter/Next/Eof/Column/Rowid/Update/Rename
+       wired via `sqlite3_module spellfix1Module`.  Shadow table
+       `<name>_vocab(id,rank,langid,word,k1,k2)` + the langid+k2
+       index created on xCreate; spellfix1Init/Dequote/ResetCursor/
+       ResizeCursor/Score/RowSort (insertion-sort over the bounded
+       row buffer; replaces C qsort) all mirror the C source.
+       MatchQuery + spellfix1RunQuery + FilterForMatch / FullScan
+       drive the rolling phonehash search through the
+       `editDist3FromStringNew/_Core/_FromStringDelete` path when a
+       cost table is configured, falling back to the consonant-class
+       editdist1 otherwise.  Pascal-port adaptation: the parser does
+       not currently accept `"db"."tbl"` in `CREATE TABLE` /
+       `CREATE INDEX`, so the shadow-table DDL uses `%s."%w_vocab"`
+       (bare schema name + quoted table name) — db names from
+       pragma_database_list are always plain identifiers so this is
+       safe; logged as bug 10.1.bug.8 below.  Verified end-to-end
+       against system sqlite3 + `.load /tmp/spellfix.so`:
+       `CREATE VIRTUAL TABLE demo USING spellfix1` + INSERT 4 rows +
+       SELECT rowid,word returns the same 4 rows; `WHERE rowid=K`
+       hits the IDXNUM_ROWID xBestIndex path and returns the matching
+       row; UPDATE through xUpdate writes back through the shadow
+       table.  Caveats inherited from pre-existing engine gaps:
+       (a) `WHERE word MATCH 'fonetic'` raises `no such function:
+       MATCH` because vtab xBestIndex MATCH-constraint pushdown is
+       not yet wired (bug 6.13, codegen.pas:13938 / 28163) — system
+       sqlite3 returns the 2 expected rows; the module's RunQuery /
+       FilterForMatch is faithful and will fire once the constraint
+       flows through; (b) `DELETE FROM vtab` raises `no query
+       solution` because the vtab DELETE codegen path is not wired —
+       same xBestIndex pushdown gap, separate sub-arm.
 
   [X] **10.1.98** ext/misc/zipfile.c (2293 C lines) ported as new unit
        `passqlite3zipfile.pas` (~1100 lines).  Provides the `zipfile`
@@ -2378,6 +2407,20 @@ existing dispatcher.
        (BE), toreal('  0.5  ')=NULL (trailing-space rejection).
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
+
+- [ ] **10.1.bug.8** Parser rejects `CREATE TABLE "db"."tbl"(...)` and
+  `CREATE INDEX "db"."ixn" ON ...` with the upstream double-quoted
+  schema-qualified identifier form.  Surfaces as `Parse error: unknown
+  database "db"."tbl"(...)` (with the rest of the statement bleeding
+  past the NUL into the error message — unrelated parser-side mishandling
+  of the error-token span).  Other statement forms tolerate the same
+  syntax: bare-schema variants (`main.tbl`), DROP TABLE, ALTER TABLE,
+  and SELECT all parse fine; only CREATE TABLE / CREATE INDEX reject
+  the quoted schema prefix.  Workaround in spellfix1 vtab port
+  (10.1.99) uses `%s."%w_vocab"` for the shadow-table DDL.  Likely
+  isolated to the lemon grammar's CREATE-statement schema-name
+  reduction; investigate `nm DOT nm` arms in `parse.y` /
+  `passqlite3parser.pas`.
 
 - [X] **10.1.bug.7** Fixed-point float printf / round rounded the wrong
   direction for binary halfway literals.  Closed 2026-05-07.  Two

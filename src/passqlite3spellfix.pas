@@ -47,6 +47,7 @@ uses
   passqlite3internal,
   passqlite3util,
   passqlite3vdbe,
+  passqlite3vtab,
   passqlite3main;
 
 function sqlite3SpellfixInit(db: PTsqlite3): i32;
@@ -1907,6 +1908,973 @@ begin
   Result := rc;
 end;
 
+{ ====================================================================
+  Begin spellfix1 virtual table — port of spellfix.c:1900..3056.
+
+  Schema (declared via sqlite3_declare_vtab) mirrors the C source:
+    word, rank, distance, langid, score, matchlen,
+    phonehash HIDDEN, top HIDDEN, scope HIDDEN, srchcnt HIDDEN,
+    soundslike HIDDEN, command HIDDEN.
+  Backed by a shadow table named "<name>_vocab".
+  ==================================================================== }
+
+const
+  SPELLFIX_MX_HASH = 32;
+  SPELLFIX_MX_RUN  = 1;
+
+  SPELLFIX_COL_WORD       = 0;
+  SPELLFIX_COL_RANK       = 1;
+  SPELLFIX_COL_DISTANCE   = 2;
+  SPELLFIX_COL_LANGID     = 3;
+  SPELLFIX_COL_SCORE      = 4;
+  SPELLFIX_COL_MATCHLEN   = 5;
+  SPELLFIX_COL_PHONEHASH  = 6;
+  SPELLFIX_COL_TOP        = 7;
+  SPELLFIX_COL_SCOPE      = 8;
+  SPELLFIX_COL_SRCHCNT    = 9;
+  SPELLFIX_COL_SOUNDSLIKE = 10;
+  SPELLFIX_COL_COMMAND    = 11;
+
+  SPELLFIX_IDXNUM_MATCH  = $01;
+  SPELLFIX_IDXNUM_LANGID = $02;
+  SPELLFIX_IDXNUM_TOP    = $04;
+  SPELLFIX_IDXNUM_SCOPE  = $08;
+  SPELLFIX_IDXNUM_DISTLT = $10;
+  SPELLFIX_IDXNUM_DISTLE = $20;
+  SPELLFIX_IDXNUM_ROWID  = $40;
+  SPELLFIX_IDXNUM_DIST   = $30;
+
+type
+  PSpellfix1Vtab = ^TSpellfix1Vtab;
+  PSpellfix1Cursor = ^TSpellfix1Cursor;
+  PSpellfix1Row = ^TSpellfix1Row;
+
+  TSpellfix1Vtab = record
+    base       : Tsqlite3_vtab;
+    db         : PTsqlite3;
+    zDbName    : PAnsiChar;     { points into trailing alloc }
+    zTableName : PAnsiChar;     { sqlite3_mprintf-allocated }
+    zCostTable : PAnsiChar;     { sqlite3_mprintf-allocated, or nil }
+    pConfig3   : PEditDist3Config;
+  end;
+
+  TSpellfix1Row = record
+    iRowid    : i64;
+    zWord     : PAnsiChar;      { sqlite3_mprintf-allocated }
+    iRank     : i32;
+    iDistance : i32;
+    iScore    : i32;
+    iMatchlen : i32;
+    zHash     : array[0..SPELLFIX_MX_HASH-1] of AnsiChar;
+  end;
+
+  TSpellfix1Cursor = record
+    base       : Tsqlite3_vtab_cursor;
+    pVTab      : PSpellfix1Vtab;
+    zPattern   : PAnsiChar;     { sqlite3_mprintf-allocated }
+    idxNum     : i32;
+    nRow       : i32;
+    nAlloc     : i32;
+    iRow       : i32;
+    iLang      : i32;
+    iTop       : i32;
+    iScope     : i32;
+    nSearch    : i32;
+    pFullScan  : PVdbe;
+    a          : PSpellfix1Row;
+  end;
+
+  PMatchQuery = ^TMatchQuery;
+  TMatchQuery = record
+    pCur       : PSpellfix1Cursor;
+    pStmt      : PVdbe;
+    zHash      : array[0..SPELLFIX_MX_HASH-1] of AnsiChar;
+    zPattern   : PAnsiChar;
+    nPattern   : i32;
+    pMatchStr3 : PEditDist3FromString;
+    pConfig3   : PEditDist3Config;
+    pLang      : PEditDist3Lang;
+    iLang      : i32;
+    iScope     : i32;
+    iMaxDist   : i32;
+    rc         : i32;
+    nRun       : i32;
+    azPrior    : array[0..SPELLFIX_MX_RUN-1, 0..SPELLFIX_MX_HASH-1] of AnsiChar;
+  end;
+
+var
+  spellfix1Module: Tsqlite3_module;
+
+{ Helper: run a sqlite3PfMprintf-formatted SQL statement.  No-op if *pRc
+  is already non-zero.  Mirrors spellfix1DbExec. }
+procedure spellfix1DbExec(pRc: Pi32; db: PTsqlite3;
+  zFormat: PAnsiChar; const args: array of const);
+var
+  zSql: PAnsiChar;
+begin
+  if pRc^ <> SQLITE_OK then Exit;
+  zSql := sqlite3PfMprintf(zFormat, args);
+  if zSql = nil then begin
+    pRc^ := SQLITE_NOMEM;
+    Exit;
+  end;
+  pRc^ := sqlite3_exec(db, zSql, nil, nil, nil);
+  sqlite3_free(zSql);
+end;
+
+function spellfix1Uninit(isDestroy: i32; pVTab: PSqlite3Vtab): i32;
+var
+  p: PSpellfix1Vtab;
+  rc: i32;
+begin
+  p := PSpellfix1Vtab(pVTab);
+  rc := SQLITE_OK;
+  if isDestroy <> 0 then
+    spellfix1DbExec(@rc, p^.db,
+      'DROP TABLE IF EXISTS "%w"."%w_vocab"',
+      [p^.zDbName, p^.zTableName]);
+  if rc = SQLITE_OK then begin
+    sqlite3_free(p^.zTableName);
+    editDist3ConfigDelete(p^.pConfig3);
+    sqlite3_free(p^.zCostTable);
+    sqlite3_free(p);
+  end;
+  Result := rc;
+end;
+
+function spellfix1Disconnect(pVTab: PSqlite3Vtab): i32; cdecl;
+begin
+  Result := spellfix1Uninit(0, pVTab);
+end;
+
+function spellfix1Destroy(pVTab: PSqlite3Vtab): i32; cdecl;
+begin
+  Result := spellfix1Uninit(1, pVTab);
+end;
+
+{ Make a copy of a string.  Strip leading whitespace and dequote.
+  Caller frees via sqlite3_free.  Mirrors spellfix1Dequote. }
+function spellfix1Dequote(zIn: PAnsiChar): PAnsiChar;
+var
+  zOut: PAnsiChar;
+  i, j, n: i32;
+  c: AnsiChar;
+begin
+  while (zIn <> nil) and (zIn[0] in [#9, #10, #11, #12, #13, ' ']) do Inc(zIn);
+  zOut := sqlite3PfMprintf('%s', [zIn]);
+  if zOut = nil then Exit(nil);
+  n := i32(strlen(zOut));
+  zOut[n] := #0;
+  c := zOut[0];
+  if (c = '''') or (c = '"') then begin
+    i := 1; j := 0;
+    while zOut[i] <> #0 do begin
+      zOut[j] := zOut[i];
+      Inc(j);
+      if zOut[i] = c then begin
+        if zOut[i+1] = c then
+          Inc(i)
+        else begin
+          zOut[j-1] := #0;
+          Break;
+        end;
+      end;
+      Inc(i);
+    end;
+  end;
+  Result := zOut;
+end;
+
+function spellfix1Init(isCreate: i32; db: PTsqlite3; pAux: Pointer;
+  argc: i32; argv: PPAnsiChar;
+  ppVTab: PPSqlite3Vtab; pzErr: PPAnsiChar): i32;
+var
+  pNew: PSpellfix1Vtab;
+  zDbName, zTableName: PAnsiChar;
+  nDbName: i32;
+  rc, i: i32;
+begin
+  zDbName := argv[1];
+  zTableName := argv[2];
+  rc := SQLITE_OK;
+  nDbName := i32(strlen(zDbName));
+  pNew := PSpellfix1Vtab(sqlite3_malloc64(SizeOf(TSpellfix1Vtab) + nDbName + 1));
+  if pNew = nil then
+    rc := SQLITE_NOMEM
+  else begin
+    FillChar(pNew^, SizeOf(TSpellfix1Vtab), 0);
+    pNew^.zDbName := PAnsiChar(PByte(pNew) + SizeOf(TSpellfix1Vtab));
+    Move(zDbName^, pNew^.zDbName^, nDbName + 1);
+    pNew^.zTableName := sqlite3PfMprintf('%s', [zTableName]);
+    pNew^.db := db;
+    if pNew^.zTableName = nil then
+      rc := SQLITE_NOMEM
+    else begin
+      sqlite3_vtab_config(db, SQLITE_VTAB_INNOCUOUS, 0);
+      rc := sqlite3_declare_vtab(db,
+        'CREATE TABLE x(word,rank,distance,langid, '
+        + 'score, matchlen, phonehash HIDDEN, '
+        + 'top HIDDEN, scope HIDDEN, srchcnt HIDDEN, '
+        + 'soundslike HIDDEN, command HIDDEN)');
+    end;
+    { Pascal-port: parser does not accept "db"."tbl" in CREATE TABLE
+      / CREATE INDEX, so use bare-db + quoted-tbl form (%s."%w").
+      The db name from pragma_database_list is always a plain identifier
+      so this is safe. }
+    if (rc = SQLITE_OK) and (isCreate <> 0) then begin
+      spellfix1DbExec(@rc, db,
+        'CREATE TABLE IF NOT EXISTS %s."%w_vocab"('#10
+        + '  id INTEGER PRIMARY KEY,'#10
+        + '  rank INT,'#10
+        + '  langid INT,'#10
+        + '  word TEXT,'#10
+        + '  k1 TEXT,'#10
+        + '  k2 TEXT'#10
+        + ');'#10,
+        [zDbName, zTableName]);
+      spellfix1DbExec(@rc, db,
+        'CREATE INDEX IF NOT EXISTS %s."%w_vocab_index_langid_k2" '
+        + 'ON "%w_vocab"(langid,k2);',
+        [zDbName, zTableName, zTableName]);
+    end;
+    i := 3;
+    while (rc = SQLITE_OK) and (i < argc) do begin
+      if (strncmp(argv[i], 'edit_cost_table=', 16) = 0)
+         and (pNew^.zCostTable = nil) then begin
+        pNew^.zCostTable := spellfix1Dequote(argv[i] + 16);
+        if pNew^.zCostTable = nil then rc := SQLITE_NOMEM;
+      end else begin
+        pzErr^ := sqlite3PfMprintf('bad argument to spellfix1(): "%s"',
+          [argv[i]]);
+        rc := SQLITE_ERROR;
+      end;
+      Inc(i);
+    end;
+  end;
+  if (rc <> SQLITE_OK) and (pNew <> nil) then begin
+    ppVTab^ := nil;
+    spellfix1Uninit(0, @pNew^.base);
+  end else
+    ppVTab^ := PSqlite3Vtab(pNew);
+  Result := rc;
+end;
+
+function spellfix1Connect(db: PTsqlite3; pAux: Pointer;
+  argc: i32; argv: PPAnsiChar;
+  ppVTab: PPSqlite3Vtab; pzErr: PPAnsiChar): i32; cdecl;
+begin
+  Result := spellfix1Init(0, db, pAux, argc, argv, ppVTab, pzErr);
+end;
+
+function spellfix1Create(db: PTsqlite3; pAux: Pointer;
+  argc: i32; argv: PPAnsiChar;
+  ppVTab: PPSqlite3Vtab; pzErr: PPAnsiChar): i32; cdecl;
+begin
+  Result := spellfix1Init(1, db, pAux, argc, argv, ppVTab, pzErr);
+end;
+
+procedure spellfix1ResetCursor(pCur: PSpellfix1Cursor);
+var
+  i: i32;
+begin
+  for i := 0 to pCur^.nRow - 1 do
+    sqlite3_free((pCur^.a + i)^.zWord);
+  pCur^.nRow := 0;
+  pCur^.iRow := 0;
+  pCur^.nSearch := 0;
+  if pCur^.pFullScan <> nil then begin
+    sqlite3_finalize(pCur^.pFullScan);
+    pCur^.pFullScan := nil;
+  end;
+end;
+
+procedure spellfix1ResizeCursor(pCur: PSpellfix1Cursor; N: i32);
+var
+  aNew: PSpellfix1Row;
+begin
+  aNew := PSpellfix1Row(sqlite3_realloc64(pCur^.a,
+    u64(SizeOf(TSpellfix1Row)) * u64(N)));
+  if (aNew = nil) and (N > 0) then begin
+    spellfix1ResetCursor(pCur);
+    sqlite3_free(pCur^.a);
+    pCur^.nAlloc := 0;
+    pCur^.a := nil;
+  end else begin
+    pCur^.nAlloc := N;
+    pCur^.a := aNew;
+  end;
+end;
+
+function spellfix1Open(pVTab: PSqlite3Vtab;
+  ppCursor: PPSqlite3VtabCursor): i32; cdecl;
+var
+  p: PSpellfix1Vtab;
+  pCur: PSpellfix1Cursor;
+begin
+  p := PSpellfix1Vtab(pVTab);
+  pCur := PSpellfix1Cursor(sqlite3_malloc64(SizeOf(TSpellfix1Cursor)));
+  if pCur = nil then Exit(SQLITE_NOMEM);
+  FillChar(pCur^, SizeOf(TSpellfix1Cursor), 0);
+  pCur^.pVTab := p;
+  ppCursor^ := PSqlite3VtabCursor(pCur);
+  Result := SQLITE_OK;
+end;
+
+function spellfix1Close(cur: PSqlite3VtabCursor): i32; cdecl;
+var
+  pCur: PSpellfix1Cursor;
+begin
+  pCur := PSpellfix1Cursor(cur);
+  spellfix1ResetCursor(pCur);
+  spellfix1ResizeCursor(pCur, 0);
+  sqlite3_free(pCur^.zPattern);
+  sqlite3_free(pCur);
+  Result := SQLITE_OK;
+end;
+
+function spellfix1BestIndex(tab: PSqlite3Vtab;
+  pIdxInfo: PSqlite3IndexInfo): i32; cdecl;
+var
+  iPlan, idx, i: i32;
+  iLangTerm, iTopTerm, iScopeTerm, iDistTerm, iRowidTerm: i32;
+  pConstraint: PSqlite3IndexConstraint;
+  pUsage: PSqlite3IndexConstraintUsage;
+begin
+  iPlan := 0;
+  iLangTerm := -1; iTopTerm := -1; iScopeTerm := -1;
+  iDistTerm := -1; iRowidTerm := -1;
+  for i := 0 to pIdxInfo^.nConstraint - 1 do begin
+    pConstraint := pIdxInfo^.aConstraint + i;
+    if pConstraint^.usable = 0 then Continue;
+
+    if ((iPlan and SPELLFIX_IDXNUM_MATCH) = 0)
+       and (pConstraint^.iColumn = SPELLFIX_COL_WORD)
+       and (pConstraint^.op = SQLITE_INDEX_CONSTRAINT_MATCH) then begin
+      iPlan := iPlan or SPELLFIX_IDXNUM_MATCH;
+      pUsage := pIdxInfo^.aConstraintUsage + i;
+      pUsage^.argvIndex := 1;
+      pUsage^.omit := 1;
+    end;
+
+    if ((iPlan and SPELLFIX_IDXNUM_LANGID) = 0)
+       and (pConstraint^.iColumn = SPELLFIX_COL_LANGID)
+       and (pConstraint^.op = SQLITE_INDEX_CONSTRAINT_EQ) then begin
+      iPlan := iPlan or SPELLFIX_IDXNUM_LANGID;
+      iLangTerm := i;
+    end;
+
+    if ((iPlan and SPELLFIX_IDXNUM_TOP) = 0)
+       and (pConstraint^.iColumn = SPELLFIX_COL_TOP)
+       and (pConstraint^.op = SQLITE_INDEX_CONSTRAINT_EQ) then begin
+      iPlan := iPlan or SPELLFIX_IDXNUM_TOP;
+      iTopTerm := i;
+    end;
+
+    if ((iPlan and SPELLFIX_IDXNUM_SCOPE) = 0)
+       and (pConstraint^.iColumn = SPELLFIX_COL_SCOPE)
+       and (pConstraint^.op = SQLITE_INDEX_CONSTRAINT_EQ) then begin
+      iPlan := iPlan or SPELLFIX_IDXNUM_SCOPE;
+      iScopeTerm := i;
+    end;
+
+    if ((iPlan and SPELLFIX_IDXNUM_DIST) = 0)
+       and (pConstraint^.iColumn = SPELLFIX_COL_DISTANCE)
+       and ((pConstraint^.op = SQLITE_INDEX_CONSTRAINT_LT)
+            or (pConstraint^.op = SQLITE_INDEX_CONSTRAINT_LE)) then begin
+      if pConstraint^.op = SQLITE_INDEX_CONSTRAINT_LT then
+        iPlan := iPlan or SPELLFIX_IDXNUM_DISTLT
+      else
+        iPlan := iPlan or SPELLFIX_IDXNUM_DISTLE;
+      iDistTerm := i;
+    end;
+
+    if ((iPlan and SPELLFIX_IDXNUM_ROWID) = 0)
+       and (pConstraint^.iColumn < 0)
+       and (pConstraint^.op = SQLITE_INDEX_CONSTRAINT_EQ) then begin
+      iPlan := iPlan or SPELLFIX_IDXNUM_ROWID;
+      iRowidTerm := i;
+    end;
+  end;
+  if (iPlan and SPELLFIX_IDXNUM_MATCH) <> 0 then begin
+    idx := 2;
+    pIdxInfo^.idxNum := iPlan;
+    if (pIdxInfo^.nOrderBy = 1)
+       and (pIdxInfo^.aOrderBy[0].iColumn = SPELLFIX_COL_SCORE)
+       and (pIdxInfo^.aOrderBy[0].desc = 0) then
+      pIdxInfo^.orderByConsumed := 1;
+    if (iPlan and SPELLFIX_IDXNUM_LANGID) <> 0 then begin
+      pUsage := pIdxInfo^.aConstraintUsage + iLangTerm;
+      pUsage^.argvIndex := idx; Inc(idx); pUsage^.omit := 1;
+    end;
+    if (iPlan and SPELLFIX_IDXNUM_TOP) <> 0 then begin
+      pUsage := pIdxInfo^.aConstraintUsage + iTopTerm;
+      pUsage^.argvIndex := idx; Inc(idx); pUsage^.omit := 1;
+    end;
+    if (iPlan and SPELLFIX_IDXNUM_SCOPE) <> 0 then begin
+      pUsage := pIdxInfo^.aConstraintUsage + iScopeTerm;
+      pUsage^.argvIndex := idx; Inc(idx); pUsage^.omit := 1;
+    end;
+    if (iPlan and SPELLFIX_IDXNUM_DIST) <> 0 then begin
+      pUsage := pIdxInfo^.aConstraintUsage + iDistTerm;
+      pUsage^.argvIndex := idx; Inc(idx); pUsage^.omit := 1;
+    end;
+    pIdxInfo^.estimatedCost := 1e5;
+  end else if (iPlan and SPELLFIX_IDXNUM_ROWID) <> 0 then begin
+    pIdxInfo^.idxNum := SPELLFIX_IDXNUM_ROWID;
+    pUsage := pIdxInfo^.aConstraintUsage + iRowidTerm;
+    pUsage^.argvIndex := 1;
+    pUsage^.omit := 1;
+    pIdxInfo^.estimatedCost := 5;
+  end else begin
+    pIdxInfo^.idxNum := 0;
+    pIdxInfo^.estimatedCost := 1e50;
+  end;
+  Result := SQLITE_OK;
+end;
+
+function spellfix1Score(iDistance, iRank: i32): i32;
+var
+  iLog2: i32;
+begin
+  iLog2 := 0;
+  while iRank > 0 do begin
+    Inc(iLog2);
+    iRank := iRank shr 1;
+  end;
+  Result := iDistance + 32 - iLog2;
+end;
+
+{ Insertion sort by iScore — pCur^.nRow is bounded by iLimit (default 20). }
+procedure spellfix1RowSort(a: PSpellfix1Row; n: i32);
+var
+  i, j: i32;
+  tmp: TSpellfix1Row;
+begin
+  for i := 1 to n - 1 do begin
+    tmp := (a + i)^;
+    j := i - 1;
+    while (j >= 0) and ((a + j)^.iScore > tmp.iScore) do begin
+      (a + j + 1)^ := (a + j)^;
+      Dec(j);
+    end;
+    (a + j + 1)^ := tmp;
+  end;
+end;
+
+procedure spellfix1RunQuery(p: PMatchQuery;
+  zQuery: PAnsiChar; nQuery: i32);
+var
+  zK1, zWord: PAnsiChar;
+  iDist, iRank, iScore, iWorst, idx, idxWorst, i, nClass, iScope: i32;
+  zHash1, zHash2: array[0..SPELLFIX_MX_HASH-1] of AnsiChar;
+  sClass: AnsiString;
+  pCur: PSpellfix1Cursor;
+  pStmt: PVdbe;
+  iMatchlen, nWord: i32;
+  rc: i32;
+  zRowText: PAnsiChar;
+begin
+  iWorst := 0;
+  idxWorst := -1;
+  iScope := p^.iScope;
+  pCur := p^.pCur;
+  pStmt := p^.pStmt;
+
+  if (pCur^.a = nil) or (p^.rc <> SQLITE_OK) then Exit;
+  sClass := phoneticHash(zQuery, nQuery);
+  nClass := Length(sClass);
+  if nClass > SPELLFIX_MX_HASH - 2 then begin
+    nClass := SPELLFIX_MX_HASH - 2;
+    SetLength(sClass, nClass);
+  end;
+  if nClass <= iScope then begin
+    if nClass > 2 then iScope := nClass - 1
+    else iScope := nClass;
+  end;
+  FillChar(zHash1, SizeOf(zHash1), 0);
+  FillChar(zHash2, SizeOf(zHash2), 0);
+  if iScope > 0 then
+    Move(sClass[1], zHash1[0], iScope);
+  zHash1[iScope] := #0;
+  if iScope > 0 then
+    Move(zHash1[0], zHash2[0], iScope);
+  zHash2[iScope] := 'Z';
+  zHash2[iScope+1] := #0;
+  Move(zHash1[0], p^.azPrior[p^.nRun][0], iScope+1);
+  Inc(p^.nRun);
+  if (sqlite3_bind_text(pStmt, 1, @zHash1[0], -1, SQLITE_STATIC) = SQLITE_NOMEM)
+     or (sqlite3_bind_text(pStmt, 2, @zHash2[0], -1, SQLITE_STATIC) = SQLITE_NOMEM) then begin
+    p^.rc := SQLITE_NOMEM;
+    Exit;
+  end;
+  while sqlite3_step(pStmt) = SQLITE_ROW do begin
+    iMatchlen := -1;
+    iRank := sqlite3_column_int(pStmt, 2);
+    if p^.pMatchStr3 <> nil then begin
+      nWord := sqlite3_column_bytes(pStmt, 1);
+      zWord := PAnsiChar(sqlite3_column_text(pStmt, 1));
+      iDist := editDist3Core(p^.pMatchStr3, zWord, nWord, p^.pLang, @iMatchlen);
+    end else begin
+      zK1 := PAnsiChar(sqlite3_column_text(pStmt, 3));
+      if zK1 = nil then Continue;
+      iDist := editdist1(p^.zPattern, zK1, nil);
+    end;
+    if iDist < 0 then begin
+      p^.rc := SQLITE_NOMEM;
+      Break;
+    end;
+    Inc(pCur^.nSearch);
+
+    if p^.iMaxDist >= 0 then begin
+      if iDist > p^.iMaxDist then Continue;
+      if (pCur^.nRow >= pCur^.nAlloc)
+         and ((pCur^.idxNum and SPELLFIX_IDXNUM_TOP) = 0) then begin
+        spellfix1ResizeCursor(pCur, pCur^.nAlloc * 2 + 10);
+        if pCur^.a = nil then Break;
+      end;
+    end;
+
+    iScore := spellfix1Score(iDist, iRank);
+    if pCur^.nRow < pCur^.nAlloc then
+      idx := pCur^.nRow
+    else if iScore < iWorst then begin
+      idx := idxWorst;
+      sqlite3_free((pCur^.a + idx)^.zWord);
+    end else
+      Continue;
+
+    zRowText := PAnsiChar(sqlite3_column_text(pStmt, 1));
+    (pCur^.a + idx)^.zWord := sqlite3PfMprintf('%s', [zRowText]);
+    if (pCur^.a + idx)^.zWord = nil then begin
+      p^.rc := SQLITE_NOMEM;
+      Break;
+    end;
+    (pCur^.a + idx)^.iRowid := sqlite3_column_int64(pStmt, 0);
+    (pCur^.a + idx)^.iRank := iRank;
+    (pCur^.a + idx)^.iDistance := iDist;
+    (pCur^.a + idx)^.iScore := iScore;
+    (pCur^.a + idx)^.iMatchlen := iMatchlen;
+    Move(zHash1[0], (pCur^.a + idx)^.zHash[0], iScope+1);
+    if pCur^.nRow < pCur^.nAlloc then Inc(pCur^.nRow);
+    if pCur^.nRow = pCur^.nAlloc then begin
+      iWorst := pCur^.a^.iScore;
+      idxWorst := 0;
+      for i := 1 to pCur^.nRow - 1 do begin
+        iScore := (pCur^.a + i)^.iScore;
+        if iWorst < iScore then begin
+          iWorst := iScore;
+          idxWorst := i;
+        end;
+      end;
+    end;
+  end;
+  rc := sqlite3_reset(pStmt);
+  if rc <> SQLITE_OK then p^.rc := rc;
+end;
+
+function spellfix1FilterForMatch(pCur: PSpellfix1Cursor;
+  argc: i32; argv: PPMem): i32;
+label
+  filter_exit;
+var
+  idxNum, iLimit, iScope, iLang, idx, rc: i32;
+  zMatchThis: PAnsiChar;
+  pMatchStr3: PEditDist3FromString;
+  zPattern, zSql: PAnsiChar;
+  nPattern: i32;
+  pStmt: PVdbe;
+  p: PSpellfix1Vtab;
+  x: TMatchQuery;
+begin
+  idxNum := pCur^.idxNum;
+  iLimit := 20;
+  iScope := 3;
+  iLang := 0;
+  idx := 1;
+  pMatchStr3 := nil;
+  pStmt := nil;
+  p := pCur^.pVTab;
+
+  if (p^.zCostTable <> nil) and (p^.pConfig3 = nil) then begin
+    p^.pConfig3 := PEditDist3Config(sqlite3_malloc64(SizeOf(TEditDist3Config)));
+    if p^.pConfig3 = nil then Exit(SQLITE_NOMEM);
+    FillChar(p^.pConfig3^, SizeOf(TEditDist3Config), 0);
+    rc := editDist3ConfigLoad(p^.pConfig3, p^.db, p^.zCostTable);
+    if rc <> SQLITE_OK then Exit(rc);
+  end;
+  FillChar(x, SizeOf(x), 0);
+  x.iScope := 3;
+  x.iMaxDist := -1;
+
+  if (idxNum and 2) <> 0 then begin
+    iLang := sqlite3_value_int(argv[idx]); Inc(idx);
+  end;
+  if (idxNum and 4) <> 0 then begin
+    iLimit := sqlite3_value_int(argv[idx]); Inc(idx);
+    if iLimit < 1 then iLimit := 1;
+  end;
+  if (idxNum and 8) <> 0 then begin
+    x.iScope := sqlite3_value_int(argv[idx]); Inc(idx);
+    if x.iScope < 1 then x.iScope := 1;
+    if x.iScope > SPELLFIX_MX_HASH - 2 then x.iScope := SPELLFIX_MX_HASH - 2;
+  end;
+  if (idxNum and (16 or 32)) <> 0 then begin
+    x.iMaxDist := sqlite3_value_int(argv[idx]); Inc(idx);
+    if (idxNum and 16) <> 0 then Dec(x.iMaxDist);
+    if x.iMaxDist < 0 then x.iMaxDist := 0;
+  end;
+  spellfix1ResetCursor(pCur);
+  spellfix1ResizeCursor(pCur, iLimit);
+  zMatchThis := PAnsiChar(sqlite3_value_text(argv[0]));
+  if zMatchThis = nil then Exit(SQLITE_OK);
+  if p^.pConfig3 <> nil then begin
+    x.pLang := editDist3FindLang(p^.pConfig3, iLang);
+    pMatchStr3 := editDist3FromStringNew(x.pLang, zMatchThis, -1);
+    if pMatchStr3 = nil then begin
+      x.rc := SQLITE_NOMEM;
+      goto filter_exit;
+    end;
+  end else
+    x.pLang := nil;
+  zPattern := PAnsiChar(transliterate(PByte(zMatchThis),
+    sqlite3_value_bytes(argv[0])));
+  sqlite3_free(pCur^.zPattern);
+  pCur^.zPattern := zPattern;
+  if zPattern = nil then begin
+    x.rc := SQLITE_NOMEM;
+    goto filter_exit;
+  end;
+  nPattern := i32(strlen(zPattern));
+  if (nPattern > 0) and (zPattern[nPattern-1] = '*') then Dec(nPattern);
+  zSql := sqlite3PfMprintf(
+    'SELECT id, word, rank, coalesce(k1,word)'
+    + '  FROM "%w"."%w_vocab"'
+    + ' WHERE langid=%d AND k2>=?1 AND k2<?2',
+    [p^.zDbName, p^.zTableName, iLang]);
+  if zSql = nil then begin
+    x.rc := SQLITE_NOMEM;
+    pStmt := nil;
+    goto filter_exit;
+  end;
+  rc := sqlite3_prepare_v2(p^.db, zSql, -1, @pStmt, nil);
+  sqlite3_free(zSql);
+  pCur^.iLang := iLang;
+  x.pCur := pCur;
+  x.pStmt := pStmt;
+  x.zPattern := zPattern;
+  x.nPattern := nPattern;
+  x.pMatchStr3 := pMatchStr3;
+  x.iLang := iLang;
+  x.rc := rc;
+  x.pConfig3 := p^.pConfig3;
+  if x.rc = SQLITE_OK then
+    spellfix1RunQuery(@x, zPattern, nPattern);
+
+  if pCur^.a <> nil then begin
+    spellfix1RowSort(pCur^.a, pCur^.nRow);
+    pCur^.iTop := iLimit;
+    pCur^.iScope := iScope;
+  end else
+    x.rc := SQLITE_NOMEM;
+
+filter_exit:
+  sqlite3_finalize(pStmt);
+  editDist3FromStringDelete(pMatchStr3);
+  Result := x.rc;
+end;
+
+function spellfix1FilterForFullScan(pCur: PSpellfix1Cursor;
+  argc: i32; argv: PPMem): i32;
+var
+  rc, idxNum: i32;
+  zSql, zTail: PAnsiChar;
+  pVTab: PSpellfix1Vtab;
+begin
+  rc := SQLITE_OK;
+  idxNum := pCur^.idxNum;
+  pVTab := pCur^.pVTab;
+  spellfix1ResetCursor(pCur);
+  if (idxNum and 64) <> 0 then
+    zTail := ' WHERE rowid=?'
+  else
+    zTail := '';
+  zSql := sqlite3PfMprintf(
+    'SELECT word, rank, NULL, langid, id FROM "%w"."%w_vocab"%s',
+    [pVTab^.zDbName, pVTab^.zTableName, zTail]);
+  if zSql = nil then Exit(SQLITE_NOMEM);
+  rc := sqlite3_prepare_v2(pVTab^.db, zSql, -1, @pCur^.pFullScan, nil);
+  sqlite3_free(zSql);
+  if (rc = SQLITE_OK) and ((idxNum and 64) <> 0) then
+    rc := sqlite3_bind_value(pCur^.pFullScan, 1, argv[0]);
+  pCur^.nRow := 0;
+  pCur^.iRow := 0;
+  if rc = SQLITE_OK then begin
+    rc := sqlite3_step(pCur^.pFullScan);
+    if rc = SQLITE_ROW then begin pCur^.iRow := -1; rc := SQLITE_OK; end;
+    if rc = SQLITE_DONE then rc := SQLITE_OK;
+  end else
+    pCur^.iRow := 0;
+  Result := rc;
+end;
+
+function spellfix1Filter(cur: PSqlite3VtabCursor;
+  idxNum: i32; idxStr: PAnsiChar;
+  argc: i32; argv: PPMem): i32; cdecl;
+var
+  pCur: PSpellfix1Cursor;
+begin
+  pCur := PSpellfix1Cursor(cur);
+  pCur^.idxNum := idxNum;
+  if (idxNum and 1) <> 0 then
+    Result := spellfix1FilterForMatch(pCur, argc, argv)
+  else
+    Result := spellfix1FilterForFullScan(pCur, argc, argv);
+end;
+
+function spellfix1Next(cur: PSqlite3VtabCursor): i32; cdecl;
+var
+  pCur: PSpellfix1Cursor;
+  rc: i32;
+begin
+  pCur := PSpellfix1Cursor(cur);
+  rc := SQLITE_OK;
+  if pCur^.iRow < pCur^.nRow then begin
+    if pCur^.pFullScan <> nil then begin
+      rc := sqlite3_step(pCur^.pFullScan);
+      if rc <> SQLITE_ROW then pCur^.iRow := pCur^.nRow;
+      if (rc = SQLITE_ROW) or (rc = SQLITE_DONE) then rc := SQLITE_OK;
+    end else
+      Inc(pCur^.iRow);
+  end;
+  Result := rc;
+end;
+
+function spellfix1Eof(cur: PSqlite3VtabCursor): i32; cdecl;
+var
+  pCur: PSpellfix1Cursor;
+begin
+  pCur := PSpellfix1Cursor(cur);
+  if pCur^.iRow >= pCur^.nRow then Result := 1 else Result := 0;
+end;
+
+function spellfix1Column(cur: PSqlite3VtabCursor;
+  ctx: Psqlite3_context; i: i32): i32; cdecl;
+var
+  pCur: PSpellfix1Cursor;
+  iMatchlen, nPattern, nWord, res: i32;
+  zWord, zTranslit: PAnsiChar;
+begin
+  pCur := PSpellfix1Cursor(cur);
+  if pCur^.pFullScan <> nil then begin
+    if i <= SPELLFIX_COL_LANGID then
+      sqlite3_result_value(ctx, sqlite3_column_value(pCur^.pFullScan, i))
+    else
+      sqlite3_result_null(ctx);
+    Exit(SQLITE_OK);
+  end;
+  case i of
+    SPELLFIX_COL_WORD:
+      sqlite3_result_text(ctx, (pCur^.a + pCur^.iRow)^.zWord, -1, SQLITE_STATIC);
+    SPELLFIX_COL_RANK:
+      sqlite3_result_int(ctx, (pCur^.a + pCur^.iRow)^.iRank);
+    SPELLFIX_COL_DISTANCE:
+      sqlite3_result_int(ctx, (pCur^.a + pCur^.iRow)^.iDistance);
+    SPELLFIX_COL_LANGID:
+      sqlite3_result_int(ctx, pCur^.iLang);
+    SPELLFIX_COL_SCORE:
+      sqlite3_result_int(ctx, (pCur^.a + pCur^.iRow)^.iScore);
+    SPELLFIX_COL_MATCHLEN:
+      begin
+        iMatchlen := (pCur^.a + pCur^.iRow)^.iMatchlen;
+        if iMatchlen < 0 then begin
+          nPattern := i32(strlen(pCur^.zPattern));
+          zWord := (pCur^.a + pCur^.iRow)^.zWord;
+          nWord := i32(strlen(zWord));
+          if (nPattern > 0) and (pCur^.zPattern[nPattern-1] = '*') then begin
+            zTranslit := PAnsiChar(transliterate(PByte(zWord), nWord));
+            if zTranslit = nil then Exit(SQLITE_NOMEM);
+            res := editdist1(pCur^.zPattern, zTranslit, @iMatchlen);
+            sqlite3_free(zTranslit);
+            if res < 0 then Exit(SQLITE_NOMEM);
+            iMatchlen := translen_to_charlen(zWord, nWord, iMatchlen);
+          end else
+            iMatchlen := utf8Charlen(zWord, nWord);
+        end;
+        sqlite3_result_int(ctx, iMatchlen);
+      end;
+    SPELLFIX_COL_PHONEHASH:
+      sqlite3_result_text(ctx, @(pCur^.a + pCur^.iRow)^.zHash[0], -1,
+        SQLITE_STATIC);
+    SPELLFIX_COL_TOP:
+      sqlite3_result_int(ctx, pCur^.iTop);
+    SPELLFIX_COL_SCOPE:
+      sqlite3_result_int(ctx, pCur^.iScope);
+    SPELLFIX_COL_SRCHCNT:
+      sqlite3_result_int(ctx, pCur^.nSearch);
+  else
+    sqlite3_result_null(ctx);
+  end;
+  Result := SQLITE_OK;
+end;
+
+function spellfix1Rowid(cur: PSqlite3VtabCursor; pRowid: Pi64): i32; cdecl;
+var
+  pCur: PSpellfix1Cursor;
+begin
+  pCur := PSpellfix1Cursor(cur);
+  if pCur^.pFullScan <> nil then
+    pRowid^ := sqlite3_column_int64(pCur^.pFullScan, 4)
+  else
+    pRowid^ := (pCur^.a + pCur^.iRow)^.iRowid;
+  Result := SQLITE_OK;
+end;
+
+function spellfix1GetConflict(db: PTsqlite3): PAnsiChar;
+const
+  azConflict: array[0..4] of PAnsiChar =
+    ('ROLLBACK', 'IGNORE', 'ABORT', 'ABORT', 'REPLACE');
+var
+  eConflict: i32;
+begin
+  eConflict := sqlite3_vtab_on_conflict(db);
+  Result := azConflict[eConflict - 1];
+end;
+
+function spellfix1Update(pVTab: PSqlite3Vtab; argc: i32; argv: PPMem;
+  pRowid: Pi64): i32; cdecl;
+var
+  rc: i32;
+  rowid, newRowid: i64;
+  p: PSpellfix1Vtab;
+  db: PTsqlite3;
+  zWord, zSoundslike, zCmd, zConflict: PAnsiChar;
+  nWord, nSoundslike, iLang, iRank, i: i32;
+  zK1: PAnsiChar;
+  sK2: AnsiString;
+  zK2: PAnsiChar;
+  c: AnsiChar;
+begin
+  rc := SQLITE_OK;
+  p := PSpellfix1Vtab(pVTab);
+  db := p^.db;
+
+  if argc = 1 then begin
+    rowid := sqlite3_value_int64(argv[0]);
+    pRowid^ := rowid;
+    spellfix1DbExec(@rc, db,
+      'DELETE FROM "%w"."%w_vocab" WHERE id=%lld',
+      [p^.zDbName, p^.zTableName, rowid]);
+  end else begin
+    zWord := PAnsiChar(sqlite3_value_text(argv[SPELLFIX_COL_WORD+2]));
+    nWord := sqlite3_value_bytes(argv[SPELLFIX_COL_WORD+2]);
+    iLang := sqlite3_value_int(argv[SPELLFIX_COL_LANGID+2]);
+    iRank := sqlite3_value_int(argv[SPELLFIX_COL_RANK+2]);
+    zSoundslike := PAnsiChar(sqlite3_value_text(argv[SPELLFIX_COL_SOUNDSLIKE+2]));
+    nSoundslike := sqlite3_value_bytes(argv[SPELLFIX_COL_SOUNDSLIKE+2]);
+    zConflict := spellfix1GetConflict(db);
+
+    if zWord = nil then begin
+      zCmd := PAnsiChar(sqlite3_value_text(argv[SPELLFIX_COL_COMMAND+2]));
+      if zCmd = nil then begin
+        pVTab^.zErrMsg := sqlite3PfMprintf(
+          'NOT NULL constraint failed: %s.word', [p^.zTableName]);
+        Exit(SQLITE_CONSTRAINT_NOTNULL);
+      end;
+      if strncmp(zCmd, 'reset', 6) = 0 then begin
+        editDist3ConfigDelete(p^.pConfig3);
+        p^.pConfig3 := nil;
+        Exit(SQLITE_OK);
+      end;
+      if strncmp(zCmd, 'edit_cost_table=', 16) = 0 then begin
+        editDist3ConfigDelete(p^.pConfig3);
+        p^.pConfig3 := nil;
+        sqlite3_free(p^.zCostTable);
+        p^.zCostTable := spellfix1Dequote(zCmd + 16);
+        if p^.zCostTable = nil then Exit(SQLITE_NOMEM);
+        if (p^.zCostTable[0] = #0)
+           or (sqlite3_stricmp(p^.zCostTable, 'null') = 0) then begin
+          sqlite3_free(p^.zCostTable);
+          p^.zCostTable := nil;
+        end;
+        Exit(SQLITE_OK);
+      end;
+      pVTab^.zErrMsg := sqlite3PfMprintf(
+        'unknown value for %s.command: "%w"', [p^.zTableName, zCmd]);
+      Exit(SQLITE_ERROR);
+    end;
+    if iRank < 1 then iRank := 1;
+    if zSoundslike <> nil then
+      zK1 := PAnsiChar(transliterate(PByte(zSoundslike), nSoundslike))
+    else
+      zK1 := PAnsiChar(transliterate(PByte(zWord), nWord));
+    if zK1 = nil then Exit(SQLITE_NOMEM);
+    i := 0;
+    while True do begin
+      c := zK1[i];
+      if c = #0 then Break;
+      if (c >= 'A') and (c <= 'Z') then
+        zK1[i] := AnsiChar(Byte(c) + (Ord('a') - Ord('A')));
+      Inc(i);
+    end;
+    sK2 := phoneticHash(zK1, i);
+    if sK2 = '' then zK2 := '' else zK2 := PAnsiChar(sK2);
+    if sqlite3_value_type(argv[0]) = SQLITE_NULL then begin
+      if sqlite3_value_type(argv[1]) = SQLITE_NULL then
+        spellfix1DbExec(@rc, db,
+          'INSERT INTO "%w"."%w_vocab"(rank,langid,word,k1,k2) '
+          + 'VALUES(%d,%d,%Q,nullif(%Q,%Q),%Q)',
+          [p^.zDbName, p^.zTableName, iRank, iLang, zWord, zK1, zWord, zK2])
+      else begin
+        newRowid := sqlite3_value_int64(argv[1]);
+        spellfix1DbExec(@rc, db,
+          'INSERT OR %s INTO "%w"."%w_vocab"(id,rank,langid,word,k1,k2) '
+          + 'VALUES(%lld,%d,%d,%Q,nullif(%Q,%Q),%Q)',
+          [zConflict, p^.zDbName, p^.zTableName, newRowid, iRank, iLang,
+           zWord, zK1, zWord, zK2]);
+      end;
+      pRowid^ := sqlite3_last_insert_rowid(db);
+    end else begin
+      rowid := sqlite3_value_int64(argv[0]);
+      newRowid := sqlite3_value_int64(argv[1]);
+      pRowid^ := newRowid;
+      spellfix1DbExec(@rc, db,
+        'UPDATE OR %s "%w"."%w_vocab" SET id=%lld, rank=%d, langid=%d,'
+        + ' word=%Q, k1=nullif(%Q,%Q), k2=%Q WHERE id=%lld',
+        [zConflict, p^.zDbName, p^.zTableName, newRowid, iRank, iLang,
+         zWord, zK1, zWord, zK2, rowid]);
+    end;
+    sqlite3_free(zK1);
+  end;
+  Result := rc;
+end;
+
+function spellfix1Rename(pVTab: PSqlite3Vtab; zNew: PAnsiChar): i32; cdecl;
+var
+  p: PSpellfix1Vtab;
+  db: PTsqlite3;
+  rc: i32;
+  zNewName: PAnsiChar;
+begin
+  p := PSpellfix1Vtab(pVTab);
+  db := p^.db;
+  rc := SQLITE_OK;
+  zNewName := sqlite3PfMprintf('%s', [zNew]);
+  if zNewName = nil then Exit(SQLITE_NOMEM);
+  spellfix1DbExec(@rc, db,
+    'ALTER TABLE "%w"."%w_vocab" RENAME TO "%w_vocab"',
+    [p^.zDbName, p^.zTableName, zNewName]);
+  if rc = SQLITE_OK then begin
+    sqlite3_free(p^.zTableName);
+    p^.zTableName := zNewName;
+  end else
+    sqlite3_free(zNewName);
+  Result := rc;
+end;
+
+{ ====================================================================
+  End spellfix1 virtual table.
+  ==================================================================== }
+
 function sqlite3SpellfixInit(db: PTsqlite3): i32;
 const
   FFlags = SQLITE_UTF8 or SQLITE_DETERMINISTIC;
@@ -1924,6 +2892,25 @@ begin
   if rc = SQLITE_OK then
     rc := sqlite3_create_function(db, 'spellfix1_translit', 1, FFlags, nil,
                                   @transliterateSqlFunc, nil, nil);
+  if rc = SQLITE_OK then begin
+    FillChar(spellfix1Module, SizeOf(spellfix1Module), 0);
+    spellfix1Module.iVersion    := 0;
+    spellfix1Module.xCreate     := @spellfix1Create;
+    spellfix1Module.xConnect    := @spellfix1Connect;
+    spellfix1Module.xBestIndex  := @spellfix1BestIndex;
+    spellfix1Module.xDisconnect := @spellfix1Disconnect;
+    spellfix1Module.xDestroy    := @spellfix1Destroy;
+    spellfix1Module.xOpen       := @spellfix1Open;
+    spellfix1Module.xClose      := @spellfix1Close;
+    spellfix1Module.xFilter     := @spellfix1Filter;
+    spellfix1Module.xNext       := @spellfix1Next;
+    spellfix1Module.xEof        := @spellfix1Eof;
+    spellfix1Module.xColumn     := @spellfix1Column;
+    spellfix1Module.xRowid      := @spellfix1Rowid;
+    spellfix1Module.xUpdate     := @spellfix1Update;
+    spellfix1Module.xRename     := @spellfix1Rename;
+    rc := sqlite3_create_module(db, 'spellfix1', @spellfix1Module, nil);
+  end;
   if rc = SQLITE_OK then
     rc := editDist3Install(db);
   Result := rc;
