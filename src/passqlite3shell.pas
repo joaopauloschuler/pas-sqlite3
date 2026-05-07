@@ -110,6 +110,8 @@ uses
   passqlite3fuzzer,
   passqlite3tmstmpvfs,
   passqlite3amatch,
+  passqlite3compress,
+  passqlite3sqlar,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -717,6 +719,13 @@ begin
     are nearly the same as a single user-supplied input string,
     ranked by edit-distance under a costed character-rewrite ruleset. }
   sqlite3AmatchInit(p^.db);
+  { Phase 10.1.95 — compress() / uncompress() (ext/misc/compress.c) and
+    sqlar_compress() / sqlar_uncompress() (ext/misc/sqlar.c).  Both back
+    onto libz; provide zlib-format payloads with an out-of-band original-
+    size frame (compress prepends a 1..5 byte varint, sqlar carries SZ
+    in its caller's row schema). }
+  sqlite3CompressInit(p^.db);
+  sqlite3SqlarInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);

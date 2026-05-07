@@ -1438,6 +1438,29 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.95** ext/misc/compress.c (131 C lines) and ext/misc/sqlar.c
+       (126 C lines) ported as new units `passqlite3compress.pas` and
+       `passqlite3sqlar.pas` (~257 C lines total).  Provides the SQL
+       functions compress(X) / uncompress(X) and sqlar_compress(X) /
+       sqlar_uncompress(X,SZ).  All four functions back onto libz via
+       direct cdecl bindings (`compress` / `uncompress` / `compressBound`,
+       linked through `-k-lz` added to the FPC_FLAGS in
+       `src/tests/build.sh`).  compress() prepends a 1..5 byte
+       big-endian base-128 size frame (high bit set on the last byte)
+       to the zlib-format payload; uncompress() inverts the framing.
+       sqlar_compress() returns the input unchanged if compression does
+       not shrink it or if the input is not a BLOB; sqlar_uncompress()
+       short-circuits when SZ matches the blob length.  Wired via
+       sqlite3CompressInit / sqlite3SqlarInit in shell openDb.  Verified
+       byte-identical against `.load /tmp/compress.so` and `.load
+       /tmp/sqlar.so` on the system sqlite3 across cast-text BLOBs of
+       varying sizes (round-trip text intact); compress(zeroblob(...))
+       falls into "error in compress()" because the Pascal port's
+       sqlite3_value_blob does not materialise zeroblob to an actual
+       all-zero buffer when called from a function arg — pre-existing
+       gap unrelated to this port (randomblob, cast(...as blob) work
+       fine).  TestExplainParity 1026/1026; TestSmoke PASSED.
+
   [X] **10.1.94** ext/misc/amatch.c (1502 C lines) ported as new unit
        `passqlite3amatch.pas` (~700 lines).  Provides the
        `approximate_match` virtual table — a costed-rewrite spelling-

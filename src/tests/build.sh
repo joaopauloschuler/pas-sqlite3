@@ -84,7 +84,7 @@ else
 fi
 
 # ---- Step 2: Compile Pascal test binaries ----
-FPC_FLAGS="-O3 -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm $@"
+FPC_FLAGS="-O3 -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm -k-lz $@"
 
 compile_test() {
   local name="$1"
