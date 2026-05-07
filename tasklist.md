@@ -1434,6 +1434,33 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.78** ext/misc/btreeinfo.c (434 C lines) + ext/misc/vtablog.c
+       (720 C lines) ported as new units `passqlite3btreeinfo.pas` (~330
+       lines) and `passqlite3vtablog.pas` (~570 lines) — ~1154 C lines
+       total.  btreeinfo provides the `sqlite_btreeinfo` eponymous
+       read-only vtab whose rows mirror sqlite_schema (type / name /
+       tbl_name / rootpage / sql) and add five computed columns
+       (hasRowid / nEntry / nPage / depth / szPage) by walking from the
+       btree root through `sqlite_dbpage('main')` to a leaf, multiplying
+       cell counts at each interior level for the size estimate (see
+       btreeinfo.c:269..332).  Auto-registered in shell openDb via
+       sqlite3BinfoRegister; verified on a fresh table with one
+       int-pkey table + 3 rows + an index — `sqlite_btreeinfo` returns
+       the expected rootpage/hasRowid pattern (sqlite_schema=1/main_t=2,
+       index=0).  szPage column is always NULL because the upstream C
+       source omits it from the binfoColumn switch — port matches.
+       vtablog provides a debugging vtab that traces every xCreate /
+       xConnect / xBestIndex / xFilter / xNext / xColumn / xUpdate /
+       xBegin / xCommit / xShadowName / xIntegrity etc. call to stdout.
+       Exposes the upstream argument-key/value parser
+       (vtablog_string_parameter / vtablog_dequote /
+       vtablog_trim_whitespace) for `schema=`, `rows=`, and
+       `consume_order_by=`.  Exported but NOT auto-installed by shell
+       openDb because the trace output would corrupt every shell
+       session — callers wire it explicitly via sqlite3VtablogRegister.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps /
+       DiagFunctions clean.
+
   [X] **10.1.77** ext/misc/qpvtab.c (462 C lines) + ext/misc/memtrace.c
        (108 C lines) + ext/misc/pcachetrace.c (179 C lines) ported as new
        units `passqlite3qpvtab.pas`, `passqlite3memtrace.pas`,

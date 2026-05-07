@@ -94,6 +94,8 @@ uses
   passqlite3stmt,
   passqlite3explain,
   passqlite3qpvtab,
+  passqlite3btreeinfo,
+  passqlite3vtablog,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -640,6 +642,16 @@ begin
     (462 C lines): debugging vtab whose rows describe how the query
     planner called xBestIndex. }
   sqlite3QpvtabInit(p^.db);
+  { Phase 10.1.78 — sqlite_btreeinfo eponymous vtab from
+    ext/misc/btreeinfo.c (434 C lines): one row per btree in the
+    file, with type/name/tbl_name/rootpage/sql plus estimated
+    nEntry/nPage/depth/szPage/hasRowid computed from sqlite_dbpage. }
+  sqlite3BinfoRegister(p^.db);
+  { vtablog (ext/misc/vtablog.c, 720 C lines) is exported but NOT
+    auto-installed — every callback writes a trace line to stdout, so
+    auto-registering would corrupt every shell session.  Loading it
+    explicitly via `SELECT load_extension('vtablog');` (when wired) or
+    a host program is up to the caller. }
 end;
 
 procedure closeDb(db: PTsqlite3);
