@@ -1438,6 +1438,34 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.91** ext/misc/unionvtab.c (1383 C lines) ported as new unit
+       `passqlite3unionvtab.pas` (~770 lines).  Provides the
+       `unionvtab` and `swarmvtab` virtual tables: presents many rowid
+       tables behind a single schema, dispatched by rowid range.
+       `CREATE VIRTUAL TABLE temp.t USING unionvtab(<sql-statement>)`
+       evaluates <sql> at connect time; each row gives (zDb, zTab, iMin,
+       iMax) — and optionally a 5th context column for swarmvtab.  Full
+       AVL-free port: unionMalloc / unionStrdup / unionDequote /
+       unionPrepare / unionPreparePrintf / unionFinalize / unionInvoke
+       OpenClose / unionCloseSources / unionIsIntkeyTable /
+       unionSourceToStr / unionSourceCheck / unionOpenDatabase{Inner} /
+       unionIncrRefcount / unionFinalizeCsrStmt / unionConfigureVtab /
+       unionConnect / unionOpen/Close / doUnionNext / unionNext /
+       unionColumn / unionRowid / unionEof / unionFilter /
+       unionBestIndex.  swarmvtab options parsed: maxopen=N, missing=UDF,
+       openclose=UDF, :param=text, plus the legacy single-callback form.
+       xBestIndex pushes EQ / LE/LT / GE/GT on the IPK column into the
+       per-source SELECT composition.  Wired via sqlite3UnionvtabInit
+       in shell openDb.  Verified: single-source unionvtab with rowid=K
+       and rowid>=K filters returns exactly the matching rows;
+       no-such-rowid-table raises "no such rowid table: main.foo".
+       Caveat: bare scans with multiple sources surface a pre-existing
+       engine bug (UNION ALL of two real-FROM SELECTs collapses to a
+       single arm with truncated columns), tracked separately under
+       6.12 sub-bug B; the module itself composes the correct UNION
+       ALL — once that engine bug closes, multi-source scans flow.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps clean.
+
   [X] **10.1.90** ext/misc/cksumvfs.c (847 C lines) ported as new unit
        `passqlite3cksumvfs.pas` (~750 lines).  Provides a VFS shim
        ("cksmvfs") that maintains an Adler-style two-state 8-byte

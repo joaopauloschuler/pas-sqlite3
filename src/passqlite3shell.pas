@@ -106,6 +106,7 @@ uses
   passqlite3vfsstat,
   passqlite3fileio,
   passqlite3vtshim,
+  passqlite3unionvtab,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -696,6 +697,11 @@ begin
     auto-registering would corrupt every shell session.  Loading it
     explicitly via `SELECT load_extension('vtablog');` (when wired) or
     a host program is up to the caller. }
+  { Phase 10.1.91 — unionvtab / swarmvtab from ext/misc/unionvtab.c
+    (1383 C lines): CREATE VIRTUAL TABLE temp.t USING unionvtab(<sql>)
+    presents many rowid tables behind one schema; swarmvtab opens
+    per-source db files on demand bounded by maxopen=N. }
+  sqlite3UnionvtabInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
