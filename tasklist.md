@@ -1405,18 +1405,31 @@ existing dispatcher.
        'abcd')=2, prefix_length over multi-byte UTF-8 ('héllo',
        'héllo')=5; sqlite_memstat name list matches exactly (18 rows).
 
-- [ ] **6.15** TestExplainParity regression to 224/802 (pre-existing,
-    independent of 10.1.70).  Verified by stashing all uncommitted
-    work (just prefixes/memstat additions) and re-running — same
-    802 divergences.  Symptom: Pas emits one extra OP_Explain at the
-    head of every prepared statement (Init p2 = ops+1 vs C ops+0).
-    Concretely on `CREATE TABLE simple`: C has SeekRowid at op[15],
-    Pas has Explain at op[15] then SeekRowid at op[16].  Likely
-    introduced after 10.1.69 close-out; the recent commits' "1026/
-    1026" claims are stale.  Probable suspect is a recent codegen
-    arm that grew an unconditional `OP_Explain` emission rather than
-    gating on `p->p4type==P4_DYNAMIC` or `pParse->explain`.  Probe
-    by bisecting a3..a4 around commit ee98a76 and earlier.
+  [X] **10.1.71** ext/misc/series.c (937 C lines) ported as new unit
+       `passqlite3series.pas` (~627 lines).  Provides the
+       eponymous `generate_series(start[, stop[, step]])` virtual
+       table covering the full series.c xConnect/xDisconnect/xOpen/
+       xClose/xNext/xColumn/xRowid/xEof/xFilter/xBestIndex surface,
+       the SERIES_BIT_* idxNum bitmask plan encoding (BOTH/START/
+       STOP/STEP/REVERSE/LIMIT/OFFSET), and the wrap-tolerant
+       u64-arithmetic span64 / add64 / sub64 helpers (gated by a
+       local `{$Q-}{$R-}` block so FPC's overflow checks never see
+       the deliberate 2^63 wrap from series.c:155..164).  Wired via
+       sqlite3SeriesInit in shell openDb.  Same caveat as 10.1.69
+       wholenumber: WhereBegin's vtab xBestIndex pushdown is not yet
+       wired (codegen.pas:13938 / 28163), so a bare
+       `SELECT … FROM generate_series(1,5)` ignores the inline
+       constraint args and walks the unbounded default range
+       (0..2^32-1, step=1).  The module itself is faithful end-to-
+       end; once the pushdown lands the args flow through.
+       TestExplainParity 1026/1026 (no regression).
+
+- [X] **6.15** TestExplainParity regression to 224/802 — not
+    reproduced on a4 @ 2026-05-07.  Re-ran `bin/TestExplainParity`
+    against a fresh build (with 10.1.71 series.pas applied) and got
+    1026 pass / 0 diverge / 0 error.  The earlier 802-divergence
+    report was likely a stale-binary read.  Re-open if the symptom
+    (extra OP_Explain at Init+1) shows up again on a clean build.
 
 - [X] **8.x.colneed** sqlite3_collation_needed callback now fires.
   Closed 2026-05-06.  `sqlite3GetCollSeq` (codegen.pas:42193) was

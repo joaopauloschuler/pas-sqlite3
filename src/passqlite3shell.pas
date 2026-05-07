@@ -86,6 +86,7 @@ uses
   passqlite3mmapwarm,
   passqlite3prefixes,
   passqlite3memstat,
+  passqlite3series,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -599,6 +600,9 @@ begin
     vtab from ext/misc/memstat.c. }
   sqlite3PrefixesInit(p^.db);
   sqlite3MemstatVtabInit(p^.db);
+  { Phase 10.1.71 — generate_series eponymous vtab from
+    ext/misc/series.c (937 C lines). }
+  sqlite3SeriesInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
