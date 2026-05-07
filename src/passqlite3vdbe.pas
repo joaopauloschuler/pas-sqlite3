@@ -7733,6 +7733,12 @@ begin
         Inc(pOut);
         Inc(i);
       end;
+      { vdbe.c:1751 — bump column cache generation so Column reads refresh
+        from the underlying row.  Without this, eph-cursor reads under
+        windowing (windowFullScan / OpenDup chain) keep returning the first
+        row's data because cacheStatus stays equal to a never-bumped
+        cacheCtr. }
+      v^.cacheCtr := (v^.cacheCtr + 2) or 1;
       v^.pResultRow := @aMem[pOp^.p1];
       v^.nResColumn := u16(pOp^.p2);
       if db^.mallocFailed <> 0 then goto no_mem;

@@ -332,6 +332,16 @@ FPC porting traps that recur often enough to call out up-front:
     Sorter cursor 5 path — see the EXPLAIN structural delta noted
     above.
 
+    **Partial parity fix (2026-05-07):** Pascal's `OP_ResultRow`
+    (passqlite3vdbe.pas:7724) was missing `v^.cacheCtr := (v^.cacheCtr
+    + 2) or 1` from C vdbe.c:1751.  Added.  Does not close the bug on
+    its own — Next/Rewind already set `cacheStatus := CACHE_STALE` so
+    the column cache invalidates fine — but brings Pascal closer to
+    the C reference and rules out cache-staleness as a contributing
+    factor.  TestExplainParity 1026/1026; DiagWindow still 2 (sum / avg
+    OVER ()); no regression on Diag{FeatureProbe,Dml,Ops,Pragma,Txn,
+    Functions,Misc,Cast,Analyze,Date}.
+
 - [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
     valued PRAGMA functions) returns rows when called with a literal
     argument but yields no rows when joined laterally against
