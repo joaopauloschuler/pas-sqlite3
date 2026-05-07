@@ -1438,6 +1438,43 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.94** ext/misc/amatch.c (1502 C lines) ported as new unit
+       `passqlite3amatch.pas` (~700 lines).  Provides the
+       `approximate_match` virtual table — a costed-rewrite spelling-
+       correction reader.  CREATE VIRTUAL TABLE f USING
+       approximate_match(vocabulary_table=V, vocabulary_word=W,
+       vocabulary_language=L, edit_distances=E) loads the rule table E
+       at connect time (sorted via the upstream 15-bin merge ladder),
+       captures the generic '' → ? / ? → '' / ? → ? rules into rIns /
+       rDel / rSub, and exposes (word, distance, language, command
+       HIDDEN, nword HIDDEN).  Full string-keyed AVL implementation
+       (recompute height / rotate before+after / search / first /
+       insert / remove) plus the cost-keyed parallel tree, the
+       base-64 zCost cost-key encoder (10-byte rCost+iSeq tuple), and
+       the heart-of-the-search amatchNext / amatchAddWord that pull
+       the lowest-cost stem from the cost tree, walk the vocabulary
+       SELECT for partial-prefix continuations, and enqueue every
+       (rIns, rDel, rSub, custom-rule) successor.  xBestIndex
+       bit-encodes (1=word MATCH, 2=distance LT/LE, 4=language EQ);
+       orderByConsumed=1 when the only ORDER BY is `distance ASC`.
+       xUpdate rejects DELETE / UPDATE and accepts INSERT only into
+       the hidden command column (no-op, mirroring upstream).  Pascal-
+       port adaptations: variable-length zWord / zTo trailing buffers
+       sized via SizeOf(record)+nFrom+nTo (matches the C zTo[4] hack);
+       the C amatchEncodeInt static lookup table inlined as
+       amatchEncodeAlphabet const; %Q %w / sqlite3PfMprintf / Format
+       routes the C va_list mprintf chain.  Auto-registered via
+       sqlite3AmatchInit in shell openDb.  Verified: empty /
+       missing-edit-distances paths emit the exact upstream error
+       text; a 4-row vocab + 3-rule cost table connects clean and
+       declares the 5-column vtab schema.  Same caveat as 10.1.92 /
+       10.1.91 / 10.1.83 / 10.1.80 / 10.1.77 / 10.1.72 / 10.1.71 /
+       10.1.69: WhereBegin's vtab MATCH-constraint pushdown is not
+       yet wired (codegen.pas:13938 / 28163), so `WHERE word MATCH 'cat'`
+       does not flow into amatchFilter — the module itself is
+       faithful end-to-end.  TestExplainParity 1026/1026; DiagFeatureProbe
+       / DiagOps / DiagDml clean.
+
   [X] **10.1.93** ext/misc/tmstmpvfs.c (1042 C lines) ported as new unit
        `passqlite3tmstmpvfs.pas` (~826 lines).  Provides a VFS shim
        ("tmstmpvfs") that writes a 16-byte timestamp tag into the reserve

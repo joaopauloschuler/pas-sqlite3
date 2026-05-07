@@ -109,6 +109,7 @@ uses
   passqlite3unionvtab,
   passqlite3fuzzer,
   passqlite3tmstmpvfs,
+  passqlite3amatch,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -709,6 +710,13 @@ begin
     generates variations on a query word at increasing edit distances
     using costed character-rewrite rules. }
   sqlite3FuzzerInit(p^.db);
+  { Phase 10.1.94 — approximate_match virtual table from
+    ext/misc/amatch.c (1502 C lines): CREATE VIRTUAL TABLE f USING
+    approximate_match(vocabulary_table=…, vocabulary_word=…,
+    edit_distances=…) yields strings from a finite vocabulary that
+    are nearly the same as a single user-supplied input string,
+    ranked by edit-distance under a costed character-rewrite ruleset. }
+  sqlite3AmatchInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
