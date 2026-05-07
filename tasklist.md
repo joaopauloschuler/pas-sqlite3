@@ -941,9 +941,13 @@ existing dispatcher.
        "this build does not support the .expert command" stub
        (sqlite3_expert.c not yet ported).
 
-- [ ] **10.1d** Data I/O dot-commands.  `.read`, `.dump`, `.import`
-  (CSV/ASCII), `.output` / `.once`, `.save`, `.open`.  Gate:
-  `tests/cli/10d_io/`.
+- [ ] **10.1d** Data I/O dot-commands. Gate: `tests/cli/10d_io/`.  
+  - [ ] **10.1d.1** `.read` (CSV/ASCII) 
+  - [ ] **10.1d.2** `.dump` (CSV/ASCII)
+  - [ ] **10.1d.3** `.import` (CSV/ASCII)
+  - [ ] **10.1d.4** `.output` / `.once`, 
+  - [ ] **10.1d.5** `.save`, 
+  - [ ] **10.1d.6**`.open`.
 
   [X] **10.1.22** `.read FILE` — cmdRead pushes the named file onto a
        Pascal-side input stack (curInputText) and re-enters processInput;
