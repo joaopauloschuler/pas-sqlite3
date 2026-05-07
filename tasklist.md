@@ -796,12 +796,28 @@ existing dispatcher.
        falls back to raw sqlite3_complete on every accumulated
        semicolon, matching upstream's pre-quickscan branch.
   [~] **10.1.3** `main` + `process_command_line` argument parser —
-       initial cut (2026-05-06) handles `-bail`, `-batch`, `-readonly`,
-       `-version`, `-help`, `--`, plus a positional FILENAME and
-       optional trailing SQL string.  Remaining flags (`-cmd`, `-init`,
-       `-newline`, `-mode`, `-separator`, `-nullvalue`, `-header`, the
-       SHFLG_* toggles, `-vfs`, `-stats`, `-zip`, `-deserialize`, …)
-       still pending; tracked here.
+       expanded 2026-05-07 to a full two-pass parser mirroring
+       shell.c.in:13040..13520.  Pass 1 (pre-init): `-bail`, `-batch`,
+       `-init`, `-noinit`, `-interactive`, `-readonly`, `-nofollow`,
+       `-exclusive`, `-ifexists`, `-zip`, `-append`, `-deserialize`,
+       `-maxsize`, `-vfs`, `-vfstrace`, `-multiplex`, `-mmap`,
+       `-sorterref`, `-memtrace`, `-pcachetrace`, `-pagecache`,
+       `-lookaside`, `-threadsafe`, `-heap`, `-screenwidth`, `-utf8`,
+       `-no-utf8`, `-no-rowid-in-view`, `-nonce`, `-unsafe-testing`,
+       `-test-argv`, `--`, `-` (nOptsEnd), `-cmd`.  Pass 2 (post-init):
+       all `-mode-name` shortcuts (`-html`, `-list`, `-quote`, `-line`,
+       `-column`, `-json`, `-markdown`, `-table`, `-psql`, `-box`,
+       `-csv`, `-ascii`, `-tabs`), `-separator`, `-newline`,
+       `-nullvalue`, `-header`/`-noheader`, `-echo`, `-eqp`,
+       `-eqpfull`, `-stats`, `-scanstats`, `-backslash`, `-safe`,
+       `-escape`, `-version`, `-help`.  Deferred command queue (-cmd
+       runs before stdin REPL; trailing positional SQL/dot-commands
+       run too) wired through doMetaCommand / runOneSqlLine.  Unknown
+       flags now error in pass 2 with the upstream
+       `Error: unknown option: ...` + `Use -help for a list of options.`
+       text.  process_sqliterc / -init contents loading still deferred.
+       memtrace / pcachetrace are accepted but the FILE* sink is left
+       nil (libc stderr is not currently surfaced in the Pascal port).
   [X] **10.1.4** Line reader / readline integration — basic
        `localGetLine` (LF / CRLF aware) + `oneInputLine` landed
        2026-05-06.  GNU readline integration (history, line editing)
