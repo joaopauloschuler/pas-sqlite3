@@ -1551,6 +1551,8 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [ ] **10.1a.1** fill the next porting chunk here. 
+
   [X] **10.1.99** ext/misc/spellfix.c (3076 C lines) ported in full
        as new unit `passqlite3spellfix.pas` (~2620 lines Pascal).
        Provides `spellfix1_phonehash(X)`, `spellfix1_editdist(A,B)`,
