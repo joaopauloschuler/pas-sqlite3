@@ -1438,6 +1438,41 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.88** ext/misc/vfstrace.c (1211 C lines) ported as new unit
+       `passqlite3vfstrace.pas` (~1140 lines).  Provides the public
+       `vfstrace_register(zTraceName, zOldVfsName, xOut, pOutArg,
+       makeDefault)` / `vfstrace_unregister(zTraceName)` entry points
+       that install a strace-style VFS shim atop an existing VFS and
+       fan out a `<vfsname>.<method>(args) -> rc` line per VFS call
+       through the caller-supplied `xOut(zMsg, pAppData)` cdecl
+       callback.  All 19 sqlite3_io_methods (close/read/write/truncate/
+       sync/fileSize/lock/unlock/checkReservedLock/fileControl/
+       sectorSize/deviceCharacteristics/shmMap/shmLock/shmBarrier/
+       shmUnmap/fetch/unfetch) and all 19 sqlite3_vfs entries
+       (open/delete/access/fullPathname/dlOpen/dlError/dlSym/dlClose/
+       randomness/sleep/currentTime/getLastError/currentTimeInt64/
+       setSystemCall/getSystemCall/nextSystemCall) wrapped 1:1.
+       vfstraceFileControl mirrors the upstream FCNTL opcode table
+       plus the `PRAGMA vfstrace('+all,-read,…')` runtime mask updater
+       (aKw[] constant array preserved verbatim) and the
+       FCNTL_VFSNAME wrap-with-`vfstrace.<name>/%z` augmentation.
+       Pascal-port adaptations: `vfstrace_printf` uses sqlite3PfMprintf
+       with `array of const` instead of C va_list;
+       `vfstrace_errcode_name` expanded into a Pascal case statement;
+       `vfstrace_unregister` compares xOpen via Pointer() cast to
+       dodge FPC's "operator not overloaded" error on procedural-type
+       comparison.  Exported but NOT auto-installed by shell openDb
+       because trace output would corrupt every shell session — same
+       convention as memtrace / pcachetrace / showauth.  Verified
+       end-to-end via new `bin/DiagVfstrace`: vfstrace_register
+       ('vfstrace',nil,…) → sqlite3_open_v2 with vfs="vfstrace" →
+       CREATE/INSERT/SELECT → captured trace contains
+       `enabled_for("unix")`, xFullPathname / xOpen / xRead /
+       xDeviceCharacteristics / xLock / xAccess / xWrite / xClose
+       lines with the expected SQLITE_OK / SQLITE_IOERR_SHORT_READ /
+       SQLITE_NOTFOUND error symbols resolved by name.
+       TestExplainParity 1026/1026.
+
   [X] **10.1.87** ext/misc/vfsstat.c (825 C lines) ported as new unit
        `passqlite3vfsstat.pas` (~620 lines).  Provides the `vfsstat`
        eponymous virtual table that exposes per-file-type I/O counters
