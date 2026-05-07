@@ -102,6 +102,7 @@ uses
   passqlite3closure,
   passqlite3appendvfs,
   passqlite3vfslog,
+  passqlite3fileio,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -670,6 +671,11 @@ begin
     lines): allows opening a SQLite database appended at the end of
     another file (e.g. an executable) via `sqlite3_open_v2(..., "apndvfs")`. }
   sqlite3AppendvfsInit(p^.db);
+  { Phase 10.1.86 — readfile / writefile / lsmode / realpath SQL functions
+    plus the fsdir() eponymous virtual table from ext/misc/fileio.c
+    (1234 C lines).  fsdir is the backing storage for `.archive` and
+    related shell features. }
+  sqlite3FileioInit(p^.db);
   { vtablog (ext/misc/vtablog.c, 720 C lines) is exported but NOT
     auto-installed — every callback writes a trace line to stdout, so
     auto-registering would corrupt every shell session.  Loading it

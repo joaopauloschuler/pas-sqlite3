@@ -1438,6 +1438,32 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.86** ext/misc/fileio.c (1234 C lines) ported as new unit
+       `passqlite3fileio.pas` (~640 lines).  Provides the SQL functions
+       readfile(X), writefile(F,D[,M[,T]]), lsmode(M), realpath(X) plus
+       the eponymous `fsdir(D[,B[,L]])` virtual table.  Linux-only port:
+       Windows arms entirely omitted.  POSIX glue (stat / lstat / mkdir /
+       chmod / unlink / symlink / readlink / opendir / readdir / closedir)
+       routes through BaseUnix; libc bound directly for fopen / fread /
+       fwrite / fseek / ftell / rewind / utimes / realpath / time which
+       BaseUnix doesn't surface (FpUtime lacks usec precision).  ctxErrorMsg
+       and fsdirSetErrmsg routed through SysUtils.Format → sqlite3StrDup
+       (matching the existing port pattern in passqlite3csv / scrub).
+       Auto-registered via `sqlite3FileioInit` in shell openDb.  Verified
+       end-to-end: readfile('hello.txt') round-trips byte-identical;
+       writefile creates a 6-byte file; lsmode(33188)='-rw-r--r--',
+       lsmode(16877)='drwxr-xr-x', lsmode(41471)='lrwxrwxrwx';
+       realpath('/tmp')='/tmp'; realpath('/tmp/.././tmp')='/tmp' (the
+       /./ and /../ simplification path).  Caveat: bare
+       `SELECT … FROM fsdir('/path')` falls into fsdirFilter with
+       idxNum=0 → "table function fsdir requires an argument" — same
+       pre-existing WhereBegin vtab xBestIndex pushdown gap as 10.1.69 /
+       10.1.71 / 10.1.72 / 10.1.83 (codegen.pas:13938 / 28163).  The
+       module is faithful end-to-end; once pushdown lands the path/dir/
+       level constraints flow through.  TestExplainParity 1026/1026;
+       DiagFunctions / DiagOps / DiagFeatureProbe / DiagDml / DiagPragma
+       all clean.
+
   [X] **10.1.85** ext/misc/vfslog.c (760 C lines) ported as new unit
        `passqlite3vfslog.pas` (~640 lines).  Provides the `vfslog` VFS
        shim — when registered via `sqlite3_register_vfslog(zArg)` it
