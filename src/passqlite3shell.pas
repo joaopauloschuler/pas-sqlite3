@@ -87,6 +87,7 @@ uses
   passqlite3prefixes,
   passqlite3memstat,
   passqlite3series,
+  passqlite3completion,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -603,6 +604,10 @@ begin
   { Phase 10.1.71 — generate_series eponymous vtab from
     ext/misc/series.c (937 C lines). }
   sqlite3SeriesInit(p^.db);
+  { Phase 10.1.72 — completion eponymous vtab from
+    ext/misc/completion.c (522 C lines).  Powers SQL tab-completion
+    (KEYWORDS / DATABASES / TABLES / COLUMNS phases). }
+  sqlite3CompletionVtabInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);

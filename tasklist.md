@@ -1405,6 +1405,35 @@ existing dispatcher.
        'abcd')=2, prefix_length over multi-byte UTF-8 ('héllo',
        'héllo')=5; sqlite_memstat name list matches exactly (18 rows).
 
+  [X] **10.1.72** ext/misc/completion.c (522 C lines) ported as new unit
+       `passqlite3completion.pas` (~430 lines).  Eponymous-only virtual
+       table that drives the SQL tab-completion phases — KEYWORDS
+       (sqlite3_keyword_count + sqlite3_keyword_name walk), DATABASES
+       (PRAGMA database_list column 1), TABLES (UNION of
+       sqlite_schema.name across every attached database) and COLUMNS
+       (UNION of pragma_table_xinfo joined with sqlite_schema across
+       every attached database).  Hidden-column constraints prefix /
+       wholeline / phase declared via SQLITE_VTAB_INNOCUOUS-flagged
+       sqlite3_declare_vtab.  xBestIndex bit-encodes constraint
+       availability into idxNum (bit 0 = prefix, bit 1 = wholeline)
+       and assigns argvIndex in the order the constraints appear.
+       xFilter dups prefix/wholeline through sqlite3StrDup, derives a
+       trailing-identifier prefix from wholeline when none was bound
+       directly, then primes the cursor through completionNext.
+       Wired via sqlite3CompletionVtabInit in shell openDb.  Bare
+       `SELECT count(*) FROM completion;` returns 148 keywords + 1
+       database name on a fresh `:memory:`; with a `CREATE TABLE
+       foo(a,b);` the TABLES phase emits the row 'foo'.  Same caveat
+       as 10.1.69 wholenumber / 10.1.71 series: WhereBegin's vtab
+       xBestIndex pushdown is not yet wired (codegen.pas:13938 /
+       28163), so `completion('SE')` and `… WHERE prefix='SE'` both
+       walk the unfiltered cursor — the module itself is faithful
+       end-to-end and the prefix filter inside completionNext fires
+       once the constraint flows through; the COLUMNS phase
+       additionally needs bug 6.13 (lateral join of pragma_table_xinfo
+       against sqlite_schema returns no rows).  TestExplainParity
+       1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
+
   [X] **10.1.71** ext/misc/series.c (937 C lines) ported as new unit
        `passqlite3series.pas` (~627 lines).  Provides the
        eponymous `generate_series(start[, stop[, step]])` virtual
