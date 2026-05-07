@@ -1563,20 +1563,19 @@ existing dispatcher.
        MEMUSED, 0) currently calls sqlite3VdbeDelete on the live
        statement (passqlite3main.pas:3480..) instead of running it
        under the upstream `pnBytesFreed` dry-run accounting; tracked
-       below as bug 8.x.memused.
+       MEM column closed 2026-05-07 under 8.x.memused below.
 
-- [ ] **8.x.memused** sqlite3_stmt_status(.., SQLITE_STMTSTATUS_MEMUSED,
-  0) destroys the live vdbe.  The C reference (vdbeapi.c:2106) calls
-  sqlite3VdbeDelete(v) with `db->pnBytesFreed = &nByte` so every
-  sqlite3DbFree path accumulates into nByte instead of actually freeing.
-  The Pascal port follows the C call shape (passqlite3main.pas:3480..)
-  but sqlite3VdbeDelete (passqlite3vdbe.pas:4766) and the underlying
-  sqlite3DbFree do not honour pnBytesFreed — so the live vdbe gets
-  unlinked + freed and the next OP_VNext step segfaults.  Surfaced when
-  porting the sqlite_stmt vtab (10.1.76); workaround there is to report
-  MEM=0.  Fix is to wire pnBytesFreed accounting through sqlite3DbFree /
-  sqlite3VdbeMemRelease so the dry-run delete is non-destructive, then
-  restore the MEMUSED arm in passqlite3stmt.pas.
+- [X] **8.x.memused** Closed 2026-05-07.  `sqlite3DbFree` /
+  `sqlite3DbFreeNN` (passqlite3util.pas:2398..) now honour
+  `db^.pnBytesFreed`: when set, accumulate `sqlite3MallocSize(p)` into
+  the counter and skip the actual free, mirroring malloc.c:586.
+  `sqlite3VdbeDelete` (passqlite3vdbe.pas:4766) skips the pVdbe-list
+  unlink under the dry-run mode (matches vdbeaux.c:1156).  Restored the
+  MEMUSED arm in passqlite3stmt.pas:253: `SELECT mem FROM sqlite_stmt`
+  now reports the live vdbe's allocation footprint (~2000 bytes for a
+  bare SELECT) instead of the previous hard-coded 0.  TestExplainParity
+  1026/1026; DiagPubApi 259/259; DiagFeatureProbe / DiagOps / DiagDml /
+  DiagPragma / DiagTxn all clean.
 
   [X] **10.1.75** ext/misc/regexp.c (928 C lines) ported as new unit
        `passqlite3regexp.pas` (~770 lines).  Provides the SQL functions

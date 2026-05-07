@@ -244,13 +244,8 @@ begin
       sqlite3_stmt_status(p, SQLITE_STMTSTATUS_REPREPARE, 0);
     pNew^.aCol[STMT_COLUMN_RUN]    :=
       sqlite3_stmt_status(p, SQLITE_STMTSTATUS_RUN, 0);
-    { Pascal-port limitation: sqlite3_stmt_status(.., MEMUSED, 0) currently
-      calls sqlite3VdbeDelete on the live statement instead of running it
-      under the pnBytesFreed accounting mode (passqlite3main.pas:3480..).
-      Issuing the call from inside an active scan over sqlite3_next_stmt()
-      destroys the running vdbe and segfaults.  Report 0 until the
-      pnBytesFreed dry-run path is wired through sqlite3DbFree. }
-    pNew^.aCol[STMT_COLUMN_MEM]    := 0;
+    pNew^.aCol[STMT_COLUMN_MEM]    :=
+      sqlite3_stmt_status(p, SQLITE_STMTSTATUS_MEMUSED, 0);
     pNew^.iRowid := iRowid;
     Inc(iRowid);
     ppRow^ := pNew;

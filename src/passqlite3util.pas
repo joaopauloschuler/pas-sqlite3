@@ -2389,13 +2389,30 @@ begin
   Result := sqlite3_malloc64(n);
 end;
 
+{ Port of malloc.c:586 sqlite3DbFreeNN.  When db^.pnBytesFreed is set,
+  callers (sqlite3_stmt_status MEMUSED dry-run, db_status SCHEMA_USED /
+  STMT_USED, sqlite3LeaveMutexAndCloseZombie tear-down) want a "what
+  size would this free?" accounting pass without actually releasing
+  memory.  Mirror the C semantics: accumulate sqlite3MallocSize into
+  the counter and return without calling sqlite3_free. }
 procedure sqlite3DbFree(db: Psqlite3db; p: Pointer);
 begin
+  if p = nil then Exit;
+  if (db <> nil) and (PTsqlite3(db)^.pnBytesFreed <> nil) then
+  begin
+    Inc(PTsqlite3(db)^.pnBytesFreed^, sqlite3MallocSize(p));
+    Exit;
+  end;
   sqlite3_free(p);
 end;
 
 procedure sqlite3DbFreeNN(db: Psqlite3db; p: Pointer);
 begin
+  if (db <> nil) and (PTsqlite3(db)^.pnBytesFreed <> nil) then
+  begin
+    Inc(PTsqlite3(db)^.pnBytesFreed^, sqlite3MallocSize(p));
+    Exit;
+  end;
   sqlite3_free(p);
 end;
 

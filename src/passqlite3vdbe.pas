@@ -4770,11 +4770,16 @@ begin
   if p = nil then Exit;
   db := p^.db;
   sqlite3VdbeClearObject(db, p);
-  { Unlink from db->pVdbe list }
-  if p^.ppVPrev <> nil then
-    p^.ppVPrev^ := p^.pVNext;
-  if p^.pVNext <> nil then
-    p^.pVNext^.ppVPrev := p^.ppVPrev;
+  { vdbeaux.c:1156 — skip unlink under the pnBytesFreed dry-run so the
+    sqlite3_stmt_status(.., MEMUSED, 0) accounting pass does not
+    actually destroy the live vdbe. }
+  if (db = nil) or (PTsqlite3(db)^.pnBytesFreed = nil) then
+  begin
+    if p^.ppVPrev <> nil then
+      p^.ppVPrev^ := p^.pVNext;
+    if p^.pVNext <> nil then
+      p^.pVNext^.ppVPrev := p^.ppVPrev;
+  end;
   sqlite3DbFree(db, p);
 end;
 
