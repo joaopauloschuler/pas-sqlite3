@@ -152,7 +152,9 @@ FPC porting traps that recur often enough to call out up-front:
        (analyzeAggregate + generateAggSelect ORDER-BY-inside-aggregate
        arm).  Gate: DiagWindow `group_concat order` PASSes.
 
-  [X] **6.26** Window functions (window.c).  DiagWindow: ALL PASS
+  [~] **6.26** Window functions (window.c).  DiagWindow: 2 residual
+       divergences on bare `OVER ()` aggregates (`sum(b) OVER ()`,
+       `avg(b) OVER ()`) — see bug 6.29.  All other window paths PASS
        (multi-window arm closed by lifting the window-arm SRT_Output gate
        to admit SRT_EphemTab — recursive sqlite3Select from the outer
        eph-materialise now runs the window arm again on the inner sub-
@@ -253,31 +255,92 @@ FPC porting traps that recur often enough to call out up-front:
     to the iSdst allocation block, mirroring C exactly.  `.tables` /
     `.schema --nosys` LIKE filters now work without the GLOB workaround.
 
-- [~] **6.14** Compound `SELECT … FROM sqlite_schema … UNION ALL
-    SELECT 'sqlite_schema' ORDER BY 1 collate nocase`.  Two underlying
-    bugs identified.  **Sub-bug A closed 2026-05-06**: bare compound
-    queries like `SELECT 1 UNION ALL SELECT 2 ORDER BY 1` returned 2
-    blank rows because `sqlite3_column_count` was 0.  Root cause:
-    `sqlite3GenerateColumnNames` (codegen.pas:20232) had two issues —
-    (1) early-bail gate `if (v=nil) or (pTabList=nil) ...` rejected
-    no-FROM SELECTs even though the body never dereferences pTabList;
-    (2) the only call site for compound queries was inside the no-FROM
-    fast path (codegen.pas:22938), so multiSelectByMerge dispatch never
-    reached it and `nResColumn` stayed 0.  Fix: relax the gate to drop
-    pTabList=nil, and add an early `if pDest^.eDest=SRT_Output then
-    sqlite3GenerateColumnNames(pParse, p)` (gated on
-    `sqlite3GetVdbe(pParse) <> nil` because Pas defers VDBE alloc) at
-    the same spot in `sqlite3Select` as select.c:7682..7684.  Verified:
-    `SELECT 1 UNION ALL SELECT 2 ORDER BY 1` (and DESC, UNION dedup,
-    multi-arm UNION ALL, sub-FROM compound) all return correct rows;
-    TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
-    DiagOps / DiagPragma / DiagDml / DiagWindow no regressions.
-    **Sub-bug B still open**: `SELECT name FROM sqlite_schema WHERE
-    type='table' UNION ALL SELECT 'lit' ;` (no ORDER BY needed) now
-    yields just 'lit' — first arm (with FROM) is silenced when paired
-    with a no-FROM constant arm.  Mixed-FROM/no-FROM UNION ALL needs a
-    separate codegen probe.  Repro: create one table 't', then run
-    the above query — C returns `lit\nt`; Pas returns just `lit`.
+- [X] **6.14** Compound `SELECT … FROM sqlite_schema … UNION ALL
+    SELECT 'sqlite_schema' ORDER BY 1 collate nocase`.  Both sub-bugs
+    closed.  **Sub-bug A closed 2026-05-06**: bare compound `SELECT 1
+    UNION ALL SELECT 2 ORDER BY 1` returned 2 blank rows; fixed by
+    threading `sqlite3GenerateColumnNames` through the compound dispatch
+    path so `nResColumn` is set before `multiSelectByMerge`.
+    **Sub-bug B closed 2026-05-07**: mixed-FROM/no-FROM UNION ALL like
+    `SELECT name FROM sqlite_schema WHERE type='table' UNION ALL SELECT
+    'lit'` returned just 'lit' — the LEFT (FROM) arm emitted zero ops
+    because `sqlite3SelectExpand` and `sqlite3ResolveSelectNames` only
+    walked the top-level pSelect, leaving the prior arm's `pSrc` items
+    with `pSTab=nil` / `iCursor=-1`.  Fix: wrap the FROM-resolution loop
+    in `sqlite3SelectExpand` and the resolve passes in
+    `sqlite3ResolveSelectNames` in a `pCur := pSelect; while pCur <> nil
+    do ... pCur := pCur^.pPrior;` walk so every leaf SELECT in a
+    compound has its FROM expanded and its expressions resolved against
+    its own source list.  Mirrors C's sqlite3WalkSelect-driven
+    selectExpander / resolveSelect (which descend pPrior internally via
+    the walker).  Verified byte-identical to system sqlite3 on the
+    reproducer plus `SELECT 'lit' UNION ALL SELECT y FROM b`,
+    `SELECT 99 UNION ALL SELECT y FROM b WHERE y>20`,
+    `SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT y FROM b`, and the
+    symmetric reverse forms.  TestExplainParity 1026/1026;
+    DiagFeatureProbe / DiagOps / DiagDml / DiagPragma / DiagFunctions /
+    DiagTxn / DiagMisc / DiagDropTable / DiagAnalyze all clean;
+    TestSmoke / TestDMLBasic / TestSelectBasic / TestWhereBasic /
+    TestVdbeAgg / TestSchemaBasic / TestPrepareBasic / TestParser /
+    TestVdbeRecord all pass.  Pre-existing multiSelectByMerge gap
+    (UNION/EXCEPT/INTERSECT and ORDER BY merge across two real-FROM
+    arms) is unaffected by this fix and tracked separately.
+
+- [ ] **6.29** `sum(b) OVER ()` / `avg(b) OVER ()` (no PARTITION BY,
+    no ORDER BY, no explicit frame) returns wrong values.  On a 3-row
+    `t(a INTEGER, b INTEGER)` with rows (1,10),(2,20),(3,30) the Pascal
+    port returns `[1,9];[null,9];[null,9]` instead of the C reference
+    `[1,60];[2,60];[3,60]`.  Bytecode (EXPLAIN) is byte-identical to C
+    apart from the source-iteration strategy (Pas uses an OpenEphemeral/
+    Sorter cursor 5; C uses InitCoroutine/Yield).  The structural
+    layout — outer scan inserting into eph cursor 1/2/3/4 (OpenDup
+    chain), inner second-pass `Rewind 2 / Column 4 1 / AggStep / Next 4`
+    sub-loop driving `AggValue`, then `Gosub / Delete / Next 1` to
+    output — is identical.  The same query rewritten with
+    `OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
+    FOLLOWING)` returns the correct sum=60, so the bug is gated on
+    "no ORDER BY" path (windowFullScan vs default-step dispatch).
+    Suspected: cursor 4 (OpenDup of the partition-eph) doesn't see the
+    rows inserted after its initial `Rewind 4` at first-row partition-
+    init time, so AggStep accumulates only the row that existed at
+    Rewind time.  Repro: `bin/passqlite3 :memory: <<<'CREATE TABLE
+    t(a INTEGER,b INTEGER); INSERT INTO t VALUES(1,10),(2,20),(3,30);
+    SELECT a, sum(b) OVER () FROM t;'`.  Verified with `RANGE/ROWS
+    BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` (also fails)
+    and `PARTITION BY 1` (also fails) — common factor is "no ORDER BY".
+
+    **Additional probe data (2026-05-07):** The bug is broader than
+    "sum/avg returns wrong value" — it actually corrupts the output row
+    structure. `SELECT a, b, count(*) OVER () FROM t` returns
+    `[1,9,3];[null,null,3];[null,null,3]` instead of
+    `[1,10,3];[2,20,3];[3,30,3]` — note the count column (window-aware
+    only via row count) is correct (3 in all rows) but the `b` column
+    reads `9` for the first row and NULL afterward.  `SELECT a FROM t`
+    with no window output is fine (1,2,3).  `SELECT a, sum(b) OVER ()`
+    similarly shows `[1,9];[null,9];[null,9]`.  Working forms:
+    plain agg `SELECT sum(b) FROM t` returns 60; `OVER (ORDER BY a)`
+    running sum 10,30,60; `OVER (PARTITION BY a)` per-row 10,20,30 all
+    correct.  Hypothesis sharpens: the windowFullScan dispatch (no
+    ORDER BY, no explicit frame) consumes the partition-eph rows after
+    first iteration via the `Delete 1; Next 1` tail, so cursor 1 is
+    empty for rows 2/3 — `Column 1 0 3` then reads NULL for outer
+    columns.  Plus the `9` literal at row 1's `b` slot suggests a
+    register-collision with `Integer 1 9 0` (sets r[9]=1) that the
+    output Gosub at addr 59 may be reading from instead of cursor 1.
+    Real fix probably needs to mirror C's coroutine-driven source
+    iteration (InitCoroutine/Yield) instead of the OpenEphemeral/
+    Sorter cursor 5 path — see the EXPLAIN structural delta noted
+    above.
+
+    **Partial parity fix (2026-05-07):** Pascal's `OP_ResultRow`
+    (passqlite3vdbe.pas:7724) was missing `v^.cacheCtr := (v^.cacheCtr
+    + 2) or 1` from C vdbe.c:1751.  Added.  Does not close the bug on
+    its own — Next/Rewind already set `cacheStatus := CACHE_STALE` so
+    the column cache invalidates fine — but brings Pascal closer to
+    the C reference and rules out cache-staleness as a contributing
+    factor.  TestExplainParity 1026/1026; DiagWindow still 2 (sum / avg
+    OVER ()); no regression on Diag{FeatureProbe,Dml,Ops,Pragma,Txn,
+    Functions,Misc,Cast,Analyze,Date}.
 
 - [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
     valued PRAGMA functions) returns rows when called with a literal
@@ -457,13 +520,17 @@ FPC porting traps that recur often enough to call out up-front:
         matching C's `(pChunk = pChunk->pNext) != 0` semantics inside
         the loop tail.
 
-  [X] **6.10 step 17** Window-function and aggregate divergences
-      surfaced by `DiagWindow`.  All PASS as of 2026-05-06 (multi-window
-      arm closed under 6.26).
+  [~] **6.10 step 17** Window-function and aggregate divergences
+      surfaced by `DiagWindow`.  Multi-window arm closed under 6.26;
+      group_concat closed under 6.24; **2 residual runtime divergences**
+      remain on bare `OVER ()` aggregates — see bug 6.29.
       [X] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** —
         Closed by 6.24.
-      [X] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
-        / `row_number() OVER (...)` empty rows** — Closed under 6.26.
+      [~] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
+        / `row_number() OVER (...)` empty rows** — Mostly closed under
+        6.26, but two residual divergences remain in DiagWindow on
+        `sum(b) OVER ()` / `avg(b) OVER ()` (no PARTITION BY, no ORDER BY,
+        no explicit frame).  Tracked under bug 6.29 below.
 
   [X] **6.11** DROP TABLE remaining gap.  Closed 2026-05-06.
     (b) [X] Bytecode parity already at 1026/1026 in TestExplainParity
@@ -796,12 +863,28 @@ existing dispatcher.
        falls back to raw sqlite3_complete on every accumulated
        semicolon, matching upstream's pre-quickscan branch.
   [~] **10.1.3** `main` + `process_command_line` argument parser —
-       initial cut (2026-05-06) handles `-bail`, `-batch`, `-readonly`,
-       `-version`, `-help`, `--`, plus a positional FILENAME and
-       optional trailing SQL string.  Remaining flags (`-cmd`, `-init`,
-       `-newline`, `-mode`, `-separator`, `-nullvalue`, `-header`, the
-       SHFLG_* toggles, `-vfs`, `-stats`, `-zip`, `-deserialize`, …)
-       still pending; tracked here.
+       expanded 2026-05-07 to a full two-pass parser mirroring
+       shell.c.in:13040..13520.  Pass 1 (pre-init): `-bail`, `-batch`,
+       `-init`, `-noinit`, `-interactive`, `-readonly`, `-nofollow`,
+       `-exclusive`, `-ifexists`, `-zip`, `-append`, `-deserialize`,
+       `-maxsize`, `-vfs`, `-vfstrace`, `-multiplex`, `-mmap`,
+       `-sorterref`, `-memtrace`, `-pcachetrace`, `-pagecache`,
+       `-lookaside`, `-threadsafe`, `-heap`, `-screenwidth`, `-utf8`,
+       `-no-utf8`, `-no-rowid-in-view`, `-nonce`, `-unsafe-testing`,
+       `-test-argv`, `--`, `-` (nOptsEnd), `-cmd`.  Pass 2 (post-init):
+       all `-mode-name` shortcuts (`-html`, `-list`, `-quote`, `-line`,
+       `-column`, `-json`, `-markdown`, `-table`, `-psql`, `-box`,
+       `-csv`, `-ascii`, `-tabs`), `-separator`, `-newline`,
+       `-nullvalue`, `-header`/`-noheader`, `-echo`, `-eqp`,
+       `-eqpfull`, `-stats`, `-scanstats`, `-backslash`, `-safe`,
+       `-escape`, `-version`, `-help`.  Deferred command queue (-cmd
+       runs before stdin REPL; trailing positional SQL/dot-commands
+       run too) wired through doMetaCommand / runOneSqlLine.  Unknown
+       flags now error in pass 2 with the upstream
+       `Error: unknown option: ...` + `Use -help for a list of options.`
+       text.  process_sqliterc / -init contents loading still deferred.
+       memtrace / pcachetrace are accepted but the FILE* sink is left
+       nil (libc stderr is not currently surfaced in the Pascal port).
   [X] **10.1.4** Line reader / readline integration — basic
        `localGetLine` (LF / CRLF aware) + `oneInputLine` landed
        2026-05-06.  GNU readline integration (history, line editing)
@@ -816,12 +899,18 @@ existing dispatcher.
        — verified byte-identical to system `sqlite3` for `.foo`.
        Per-command handlers land in 10.1.7..10.1.59.
 
-- [ ] **10.1b** Output modes + formatting controls.  `.mode`
+- [ ] **10.1b** Output modes + formatting controls. Gate: `tests/cli/10b_modes/`.  
+  - [ ] **10.1b.1** `.mode`
   (`list`, `line`, `column`, `csv`, `tabs`, `html`, `insert`, `quote`,
-  `json`, `markdown`, `table`, `box`, `tcl`, `ascii`), `.headers`,
-  `.separator`, `.nullvalue`, `.width`, `.echo`, `.changes`,
-  `.print` / `.parameter` (formatting-only subset), Unicode-width
-  helpers, box-drawing renderer.  Gate: `tests/cli/10b_modes/`.
+  `json`, `markdown`, `table`, `box`, `tcl`, `ascii`), 
+  - [ ] **10.1b.2** `.headers`,
+  - [ ] **10.1b.3** `.separator`, 
+  - [ ] **10.1b.4** `.nullvalue`, 
+  - [ ] **10.1b.5** `.width`, 
+  - [ ] **10.1b.6** `.echo`, 
+  - [ ] **10.1b.7** `.changes`,
+  - [ ] **10.1b.8** `.print` / `.parameter` (formatting-only subset), Unicode-width
+  helpers, box-drawing renderer.
 
   [X] **10.1.7** `.mode` dispatcher (~10470) — `modeChange` /
        `modeChangeBuiltin` / `modeFind` ported from shell.c.in:1642..1728
@@ -882,13 +971,13 @@ existing dispatcher.
        <, >, &, ", ') wired into emitRowOne MODE_Html.
 
 - [ ] **10.1c** Schema introspection dot-commands. Gate: `tests/cli/10c_schema/`. 
-  - [ ] `.schema`,
-  - [ ] `.tables`, 
-  - [ ] `.indexes`, 
-  - [ ] `.databases`, 
-  - [ ] `.fullschema`,
-  - [ ] `.lint fkey-indexes`, 
-  - [ ] `.expert` (read-only subset).  
+  - [ ] **10.1c.1** `.schema`,
+  - [ ] **10.1c.2** `.tables`, 
+  - [ ] **10.1c.3** `.indexes`, 
+  - [ ] **10.1c.4** `.databases`, 
+  - [ ] **10.1c.5** `.fullschema`,
+  - [ ] **10.1c.6** `.lint fkey-indexes`, 
+  - [ ] **10.1c.7** `.expert` (read-only subset).  
 
   [~] **10.1.15** `.schema` cmdSchema now mirrors shell.c.in:10575..
        10711.  Walks pragma_database_list, builds a UNION ALL across
@@ -935,9 +1024,13 @@ existing dispatcher.
        "this build does not support the .expert command" stub
        (sqlite3_expert.c not yet ported).
 
-- [ ] **10.1d** Data I/O dot-commands.  `.read`, `.dump`, `.import`
-  (CSV/ASCII), `.output` / `.once`, `.save`, `.open`.  Gate:
-  `tests/cli/10d_io/`.
+- [ ] **10.1d** Data I/O dot-commands. Gate: `tests/cli/10d_io/`.  
+  - [ ] **10.1d.1** `.read` (CSV/ASCII) 
+  - [ ] **10.1d.2** `.dump` (CSV/ASCII)
+  - [ ] **10.1d.3** `.import` (CSV/ASCII)
+  - [ ] **10.1d.4** `.output` / `.once`, 
+  - [ ] **10.1d.5** `.save`, 
+  - [ ] **10.1d.6**`.open`.
 
   [X] **10.1.22** `.read FILE` — cmdRead pushes the named file onto a
        Pascal-side input stack (curInputText) and re-enters processInput;
@@ -992,22 +1085,22 @@ existing dispatcher.
        ported.
 
 - [ ] **10.1e** Meta / diagnostic dot-commands. Gate: `tests/cli/10e_meta/`.  
-  - [ ] `.stats`
-  - [ ] `.timer`
-  - [ ] `.eqp`, 
-  - [ ] `.explain`, 
-  - [ ] `.show`, 
-  - [ ] `.help`, 
-  - [ ] `.shell`/`.system`, 
-  - [ ] `.cd`,
-  - [ ] `.log`, 
-  - [ ] `.trace`, 
-  - [ ] `.iotrace`, 
-  - [ ] `.scanstats`, 
-  - [ ] `.testcase`,
-  - [ ] `.testctrl`, 
-  - [ ] `.selecttrace`, 
-  - [ ] `.wheretrace`.  
+  - [ ] **10.1e.1** `.stats`
+  - [ ] **10.1e.2** `.timer`
+  - [ ] **10.1e.3** `.eqp`, 
+  - [ ] **10.1e.4** `.explain`, 
+  - [ ] **10.1e.5** `.show`, 
+  - [ ] **10.1e.6** `.help`, 
+  - [ ] **10.1e.7** `.shell`/`.system`, 
+  - [ ] **10.1e.8** `.cd`,
+  - [ ] **10.1e.9** `.log`, 
+  - [ ] **10.1e.10** `.trace`, 
+  - [ ] **10.1e.11** `.iotrace`, 
+  - [ ] **10.1e.12** `.scanstats`, 
+  - [ ] **10.1e.13** `.testcase`,
+  - [ ] **10.1e.14** `.testctrl`, 
+  - [ ] **10.1e.15** `.selecttrace`, 
+  - [ ] **10.1e.16** `.wheretrace`.  
 
   [X] **10.1.28** `.stats off|on|stmt|vmstep` — cmdStats setter +
        displayStats / displayStatLine / displayLinuxIoStats port of
@@ -1084,24 +1177,24 @@ existing dispatcher.
 - [ ] **10.1f** Long-tail / specialised dot-commands.  
   Out-of-scope dependencies (session, archive, recover)
   may stub with the upstream `SQLITE_OMIT_*` "feature not compiled
-  in" message.  Gate: `tests/cli/10f_misc/`.  - [ ] `.backup`,
-  - [ ] `.restore`, 
-  - [ ] `.clone`, 
-  - [ ] `.archive`/`.ar`, 
-  - [ ] `.session`, 
-  - [ ] `.recover`,
-  - [ ] `.dbinfo`, 
-  - [ ] `.dbconfig`, 
-  - [ ] `.filectrl`, 
-  - [ ] `.sha3sum`, 
-  - [ ] `.crnl`,
-  - [ ] `.binary`, 
-  - [ ] `.connection`, 
-  - [ ] `.unmodule`, 
-  - [ ] `.vfsinfo`, 
-  - [ ] `.vfslist`,
-  - [ ] `.vfsname`. 
-  
+  in" message.  Gate: `tests/cli/10f_misc/`.  
+  - [ ] **10.1f.0** `.backup`,
+  - [ ] **10.1f.1** `.restore`, 
+  - [ ] **10.1f.2** `.clone`, 
+  - [ ] **10.1f.3** `.archive`/`.ar`, 
+  - [ ] **10.1f.4** `.session`, 
+  - [ ] **10.1f.5** `.recover`,
+  - [ ] **10.1f.6** `.dbinfo`, 
+  - [ ] **10.1f.7** `.dbconfig`, 
+  - [ ] **10.1f.8** `.filectrl`, 
+  - [ ] **10.1f.9** `.sha3sum`, 
+  - [ ] **10.1f.10** `.crnl`,
+  - [ ] **10.1f.11** `.binary`, 
+  - [ ] **10.1f.12** `.connection`, 
+  - [ ] **10.1f.13** `.unmodule`, 
+  - [ ] **10.1f.14** `.vfsinfo`, 
+  - [ ] **10.1f.15** `.vfslist`,
+  - [ ] **10.1f.16** `.vfsname`. 
 
   [X] **10.1.43** `.backup ?DB? ?-async? ?-append? FILE` — cmdBackup
        wraps sqlite3_backup_init/_step/_finish (100-page chunks).
@@ -1117,8 +1210,40 @@ existing dispatcher.
        sqlite3_exec; data copied through INSERT OR IGNORE with the
        upstream `ORDER BY rowid DESC` retry on read errors.  Honours the
        "File already exists" guard.
-  [ ] **10.1.46** `.archive` / `.ar` — sqlar reader/writer; gated on
-       sqlar extension.  Stub with omit-message until that lands.
+  [~] **10.1.46** `.archive` / `.ar` — landed 2026-05-07.  ~720 lines
+       of new Pascal in passqlite3shell.pas porting shell.c.in:6234..7005.
+       Full sub-command set: -c create, -u update, -i insert, -t list,
+       -x extract, -r remove; full switch parser (traditional `tar`-style
+       single-arg short opts, `-cf`-style mixed shorts, long `--name`
+       form, `--`); --verbose / --file / --append / --directory /
+       --dryrun / --glob.  arParseCommand / arProcessSwitch /
+       arCheckEntries / arWhereClause / arListCommand / arRemoveCommand
+       / arExtractCommand / arExecSql / arCreateOrUpdateCommand /
+       arDotCommand all mirror the C source.  Backed by the already-
+       wired ext/misc helpers: sqlar (10.1.95), fileio (10.1.86),
+       zipfile (10.1.98), appendvfs (10.1.84).  Verified: `.archive
+       --help` byte-identical to upstream; `.archive -t/-tv -f FILE`
+       lists members of an existing sqlar archive (verified against an
+       archive built by the system sqlite3); `.archive --help` /
+       `--file` / `--directory` parse and dispatch correctly.
+       Caveats inherited from pre-existing engine gaps: (a) create /
+       insert / update can't populate the archive because `fsdir(...)`
+       table-valued form is gated on bug 6.13 (vtab xBestIndex argument-
+       pushdown not yet wired in WhereBegin); (b) extract emits the
+       upstream `WITH dest(dpath,dlen) AS (SELECT realpath($dir),...)
+       SELECT ... CROSS JOIN sqlar` query which currently returns 0
+       rows in the Pascal port (CTE-driven CROSS JOIN gap, same family
+       as 6.14 sub-bug B).  Two tactical adaptations from upstream:
+       (i) sqlite3_table_column_metadata replaced by a `SELECT 1 FROM
+       sqlar LIMIT 1` probe because the Pascal port loads schema lazily;
+       (ii) AR_CMD_LIST / AR_CMD_EXTRACT open the archive with
+       READWRITE flags rather than READONLY because the Pascal pager
+       currently rejects schema-load reads on a freshly-opened READONLY
+       db.  Both should fold back to upstream once the underlying
+       gaps close.  Verbose-list datetime() column shows blank in the
+       Pascal port (datetime function gap, separate task).
+       TestExplainParity 1026/1026; TestSmoke PASSED;
+       DiagFeatureProbe / DiagOps / DiagFunctions clean.
   [ ] **10.1.47** `.session` — session-extension dispatcher
        (`attach`, `enable`, `filter`, `indirect`, `isempty`, `list`,
        `changeset`, `patchset`).  Gated on session extension; stub
@@ -1194,10 +1319,8 @@ existing dispatcher.
        file-backed db (matches os_unix.c:4191).
   [X] **10.1.58** `.dbtotxt` — cmdDbtotxt ports
        shell.c.in:5579..5674 page-by-page hex dump.  Reads page size
-       via `PRAGMA page_size`, page count via
-       `SELECT count(*) FROM sqlite_dbpage` (workaround for a Pascal-
-       port `PRAGMA page_count` gap that returns no rows — tracked
-       separately under Phase 6 PRAGMA follow-up).  Skips all-zero
+       via `PRAGMA page_size` and page count via `PRAGMA page_count`
+       (10.1.bug.4 closed the prior workaround).  Skips all-zero
        16-byte runs to keep dumps compact.  Hex output is lowercase
        to match upstream.
   [X] **10.1.59** `.breakpoint` — cmdBreakpoint no-op stub
@@ -1399,18 +1522,915 @@ existing dispatcher.
        'abcd')=2, prefix_length over multi-byte UTF-8 ('héllo',
        'héllo')=5; sqlite_memstat name list matches exactly (18 rows).
 
-- [ ] **6.15** TestExplainParity regression to 224/802 (pre-existing,
-    independent of 10.1.70).  Verified by stashing all uncommitted
-    work (just prefixes/memstat additions) and re-running — same
-    802 divergences.  Symptom: Pas emits one extra OP_Explain at the
-    head of every prepared statement (Init p2 = ops+1 vs C ops+0).
-    Concretely on `CREATE TABLE simple`: C has SeekRowid at op[15],
-    Pas has Explain at op[15] then SeekRowid at op[16].  Likely
-    introduced after 10.1.69 close-out; the recent commits' "1026/
-    1026" claims are stale.  Probable suspect is a recent codegen
-    arm that grew an unconditional `OP_Explain` emission rather than
-    gating on `p->p4type==P4_DYNAMIC` or `pParse->explain`.  Probe
-    by bisecting a3..a4 around commit ee98a76 and earlier.
+  [X] **10.1.72** ext/misc/completion.c (522 C lines) ported as new unit
+       `passqlite3completion.pas` (~430 lines).  Eponymous-only virtual
+       table that drives the SQL tab-completion phases — KEYWORDS
+       (sqlite3_keyword_count + sqlite3_keyword_name walk), DATABASES
+       (PRAGMA database_list column 1), TABLES (UNION of
+       sqlite_schema.name across every attached database) and COLUMNS
+       (UNION of pragma_table_xinfo joined with sqlite_schema across
+       every attached database).  Hidden-column constraints prefix /
+       wholeline / phase declared via SQLITE_VTAB_INNOCUOUS-flagged
+       sqlite3_declare_vtab.  xBestIndex bit-encodes constraint
+       availability into idxNum (bit 0 = prefix, bit 1 = wholeline)
+       and assigns argvIndex in the order the constraints appear.
+       xFilter dups prefix/wholeline through sqlite3StrDup, derives a
+       trailing-identifier prefix from wholeline when none was bound
+       directly, then primes the cursor through completionNext.
+       Wired via sqlite3CompletionVtabInit in shell openDb.  Bare
+       `SELECT count(*) FROM completion;` returns 148 keywords + 1
+       database name on a fresh `:memory:`; with a `CREATE TABLE
+       foo(a,b);` the TABLES phase emits the row 'foo'.  Same caveat
+       as 10.1.69 wholenumber / 10.1.71 series: WhereBegin's vtab
+       xBestIndex pushdown is not yet wired (codegen.pas:13938 /
+       28163), so `completion('SE')` and `… WHERE prefix='SE'` both
+       walk the unfiltered cursor — the module itself is faithful
+       end-to-end and the prefix filter inside completionNext fires
+       once the constraint flows through; the COLUMNS phase
+       additionally needs bug 6.13 (lateral join of pragma_table_xinfo
+       against sqlite_schema returns no rows).  TestExplainParity
+       1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
+
+  [X] **10.1.99** ext/misc/spellfix.c (3076 C lines) ported in full
+       as new unit `passqlite3spellfix.pas` (~2620 lines Pascal).
+       Provides `spellfix1_phonehash(X)`, `spellfix1_editdist(A,B)`,
+       `spellfix1_scriptcode(X)`, and `spellfix1_translit(X)`.
+       Translit landed 2026-05-07: ~580 new lines covering the 389-row
+       translit[] table, utf8Charlen / spellfixFindTranslit /
+       transliterate / translen_to_charlen / transliterateSqlFunc.
+       Faithful 1:1 port of spellfix.c:1294..1830 (default build, no
+       SQLITE_SPELLFIX_5BYTE_MAPPINGS); `transliterate` returns a
+       sqlite3_malloc-backed buffer with a cdecl trampoline freeing
+       through sqlite3_free (same pattern as base64).  Verified
+       byte-identical against `.load /tmp/spellfix.so` running under
+       the system sqlite3 across `café` -> `cafe`, `Ünıön` -> `Uenioen`,
+       `Здра` -> `Zdra`, `αβγ` -> `abg`, `héllo wörld` -> `hello woerld`,
+       ASCII passthrough, empty input, 3-byte ligatures (`ﬂ` -> `fl`,
+       `ﬃ` -> `?` because U+FB03 is not in the table), and a 4-byte
+       UTF-8 emoji (`x'F09F8C8D'` -> `?`).  Earlier-ported scalar set
+       (phoneticHash, editdist1 with consonant-class costing, scriptCode)
+       remains green: 14-case parity sweep across phonehash on
+       'phonetics'/'Cleen'/'Klean'/'knight'/'night'/'', editdist on
+       'kitten'->'sitting' = 105, 'kitt*'->'kittenish' prefix match = 0,
+       cleen/clean = 25, color/colour = 20; scriptcode across hello/
+       Здра/αβγ/שלום.  Wired via `sqlite3SpellfixInit(p^.db)` in shell
+       openDb.  Editdist3 family landed 2026-05-07: ~530 new lines
+       porting spellfix.c:540..1231 (configurable-cost unicode edit
+       distance).  Provides editdist3(zTable) / editdist3(A,B) /
+       editdist3(A,B,iLang) backed by EditDist3Config + EditDist3Lang
+       + EditDist3Cost (allocated tail-extended via sqlite3_malloc64
+       to mimic the C `char a[4]` flexible array), the per-language
+       cost-mergesort 60-bin ladder, the EditDist3FromString /
+       EditDist3To pre-compute, and the Wagner matrix Core with
+       updateCost utf8Len matchFrom/matchTo/matchFromTo helpers.
+       editDist3ConfigDelete wired through sqlite3_create_function_v2
+       so the per-connection config is freed on close.  Verified
+       byte-identical against the C reference: editdist3('kitten',
+       'sitting')=400, prefix-match editdist3('abc*','abcdef')=0,
+       editdist3 with a 5-rule cost table (ph→f, ck→k) returns
+       10/5/300/225 across phone→fone / truck→truk / hello→world /
+       abc→def.  Spellfix1 virtual table (vocabulary fuzzy search)
+       landed 2026-05-07: ~700 new lines porting spellfix.c:1900..3056.
+       Full module: spellfix1Create/Connect/Disconnect/Destroy/Open/
+       Close/BestIndex/Filter/Next/Eof/Column/Rowid/Update/Rename
+       wired via `sqlite3_module spellfix1Module`.  Shadow table
+       `<name>_vocab(id,rank,langid,word,k1,k2)` + the langid+k2
+       index created on xCreate; spellfix1Init/Dequote/ResetCursor/
+       ResizeCursor/Score/RowSort (insertion-sort over the bounded
+       row buffer; replaces C qsort) all mirror the C source.
+       MatchQuery + spellfix1RunQuery + FilterForMatch / FullScan
+       drive the rolling phonehash search through the
+       `editDist3FromStringNew/_Core/_FromStringDelete` path when a
+       cost table is configured, falling back to the consonant-class
+       editdist1 otherwise.  Pascal-port adaptation: the parser does
+       not currently accept `"db"."tbl"` in `CREATE TABLE` /
+       `CREATE INDEX`, so the shadow-table DDL uses `%s."%w_vocab"`
+       (bare schema name + quoted table name) — db names from
+       pragma_database_list are always plain identifiers so this is
+       safe; logged as bug 10.1.bug.8 below.  Verified end-to-end
+       against system sqlite3 + `.load /tmp/spellfix.so`:
+       `CREATE VIRTUAL TABLE demo USING spellfix1` + INSERT 4 rows +
+       SELECT rowid,word returns the same 4 rows; `WHERE rowid=K`
+       hits the IDXNUM_ROWID xBestIndex path and returns the matching
+       row; UPDATE through xUpdate writes back through the shadow
+       table.  Caveats inherited from pre-existing engine gaps:
+       (a) `WHERE word MATCH 'fonetic'` raises `no such function:
+       MATCH` because vtab xBestIndex MATCH-constraint pushdown is
+       not yet wired (bug 6.13, codegen.pas:13938 / 28163) — system
+       sqlite3 returns the 2 expected rows; the module's RunQuery /
+       FilterForMatch is faithful and will fire once the constraint
+       flows through; (b) `DELETE FROM vtab` raises `no query
+       solution` because the vtab DELETE codegen path is not wired —
+       same xBestIndex pushdown gap, separate sub-arm.
+
+  [X] **10.1.98** ext/misc/zipfile.c (2293 C lines) ported as new unit
+       `passqlite3zipfile.pas` (~1100 lines).  Provides the `zipfile`
+       virtual table for reading and writing ZIP archives plus the
+       `zipfile()` aggregate function that assembles a ZIP archive image
+       into a single BLOB.  Vtab usage: `CREATE VIRTUAL TABLE z USING
+       zipfile('/path/to/archive.zip');` then INSERT/SELECT/UPDATE/DELETE
+       rows with (name, mode, mtime, sz, rawdata, data, method, z HIDDEN)
+       columns.  Aggregate usage: `SELECT zipfile(name,data) FROM src;`
+       returns a ZIP-format BLOB.  Same upstream limitations: no
+       encryption, no split archives, no zip64, only deflate (method 8)
+       and store (method 0) compression.  Faithful 1:1 port: ZipfileCDS /
+       ZipfileLFH / ZipfileEOCD / ZipfileEntry / ZipfileCsr / ZipfileTab
+       record layouts preserved; full vtab method set
+       (Connect/Disconnect/Open/Close/Filter/Next/Eof/Column/Update/Begin/
+       Commit/Rollback/BestIndex/FindFunction); the zipfile_cds JSON
+       inspection function wired through xFindFunction; CDS/LFH/EOCD
+       little-endian serialisation/deserialisation byte-identical.  The
+       DOS↔UNIX time-conversion arithmetic (zipfileMtime / zipfileMtimeToDos)
+       reworked into integer-only arithmetic from the C double-precision
+       julian-day formulas; mtime round-trips correctly across the
+       documented boundary cases.  Pascal-port adaptations: libc fopen/
+       fclose/fread/fwrite/fseek/ftell bound directly because BaseUnix's
+       FILE* surface is less ergonomic; zlib bindings via direct cdecl
+       (crc32, deflateInit2_/deflate/deflateEnd/deflateBound,
+       inflateInit2_/inflate/inflateEnd, zlibVersion); z_stream record
+       laid out for Linux x86-64 (uLong = 64-bit).  Wired via
+       `sqlite3ZipfileInit(p^.db)` in shell openDb so `CREATE VIRTUAL
+       TABLE … USING zipfile(...)` is available in the REPL.  Verified
+       end-to-end: write 2-row archive via vtab, read back via bound
+       vtab + via `unzip -l` (byte-identical schema), round-trip mode
+       string '-rw-r--r--' and explicit mtime (Unix epoch 1700000000)
+       both decode correctly in unzip and Pascal vtab; zipfile() aggregate
+       over a 2-row source table produces a 240-byte BLOB that unzip
+       extracts byte-identical.  Same caveat as the prior eponymous-vtab
+       series (10.1.69, 10.1.71, 10.1.72, 10.1.77, 10.1.80, 10.1.83,
+       10.1.86, 10.1.92, 10.1.94): the Pascal port does not yet wire
+       vtab xBestIndex argument-pushdown for the `zipfile($filename)`
+       table-valued form (codegen.pas:13938 / 28163) — the bound-CREATE
+       form works fully; the bare-function form raises the upstream
+       'zipfile() function requires an argument' error.  TestExplainParity
+       1026/1026; TestSmoke PASSED; DiagFeatureProbe / DiagOps / DiagDml
+       clean.
+
+  [X] **10.1.97** ext/recover/dbdata.c (1023 C lines) ported as new unit
+       `passqlite3dbdata.pas` (~620 lines).  Provides two eponymous virtual
+       tables that read raw b-tree page bytes via the sqlite_dbpage vtab:
+       `sqlite_dbdata(pgno, cell, field, value, schema HIDDEN)` yields one
+       row per record-field on every b-tree page (rowid value reported as
+       field=-1 for intkey b-trees), and `sqlite_dbptr(pgno, child, schema
+       HIDDEN)` yields one row per parent->child b-tree pointer.  Both
+       modules tolerate corruption: a bad page yields no rows for that
+       page rather than an error.  Faithful 1:1 port: DbdataBuffer +
+       DbdataCursor + DbdataTable records preserve C field order;
+       dbdataLoadPage / dbdataNext / dbdataValue / dbdataValueBytes /
+       dbdataGetVarint / dbdataGetVarintU32 / dbdataIsFunction /
+       dbdataDbsize / dbdataGetEncoding / dbdataResetCursor / xConnect /
+       xDisconnect / xBestIndex / xOpen / xClose / xFilter / xColumn /
+       xRowid mirror the C source.  The serial-type 1..7 fall-through
+       chain (C: `case 7: case 6: case 5: ...` without breaks) expanded
+       into per-case Pascal blocks so the sign-extended big-endian
+       byte-stitching matches byte-for-byte.  Pascal-port adaptations:
+       `{$POINTERMATH ON}` enables Pu8 + offset arithmetic; the same
+       `dbdataModule` Tsqlite3_module is registered twice (with pAux=nil
+       and pAux=Pointer(1) to distinguish dbdata vs dbptr); xFilter
+       reads PPsqlite3_value via local PPsqlite3_value typedef from
+       passqlite3vdbe.  Workaround for a pre-existing engine gap: upstream
+       dbdataDbsize uses `PRAGMA %Q.page_count` but that PRAGMA returns
+       no rows in the Pascal port (same gap noted under cmdDbtotxt in
+       passqlite3shell.pas:3951); fall back to
+       `SELECT count(*) FROM sqlite_dbpage(?)` instead.  Auto-registered
+       in shell openDb so .recover (10.1.48) lands cleanly atop it.
+       Verified end-to-end: `CREATE TABLE t1(a,b); INSERT INTO t1 VALUES
+       ('v','five'),('x','ten'); SELECT pgno,cell,field,value FROM
+       sqlite_dbdata WHERE pgno=2;` returns the documented six rows
+       (2|0|-1|1, 2|0|0|v, 2|0|1|five, 2|1|-1|2, 2|1|0|x, 2|1|1|ten),
+       byte-identical to the C reference run via `.load /tmp/dbdata`.
+       sqlite_dbptr returns 0 rows on a leaf-only schema (no interior
+       b-tree pointers exist).  TestExplainParity 1026/1026; TestSmoke
+       PASSED; DiagFeatureProbe clean.
+
+  [X] **10.1.96** ext/intck/sqlite3intck.c (941 C lines) ported as new unit
+       `passqlite3intck.pas` (~620 lines).  Provides the incremental
+       integrity-check API: `sqlite3_intck_open(db, zDb, ppOut)`,
+       `_step`, `_message`, `_unlock`, `_error`, `_close`, `_test_sql`.
+       The intck object resembles `PRAGMA integrity_check` but is
+       incremental — caller drives one step at a time, and may
+       `sqlite3_intck_unlock()` to release the read transaction
+       between steps.  Faithful 1:1 port: intckSaveErrmsg /
+       intckPrepare / intckPrepareFmt / intckFinalize / intckStep /
+       intckExec / intckMprintf, intckSaveKey (composes the resume-
+       vector SQL using quote() over the current pCheck columns;
+       handles the index-with-DESC/NULL case via the WITH wc(q)
+       VALUES-list ladder), intckFindObject (UNION ALL of
+       sqlite_schema rows + literal 'sqlite_schema' driving the
+       sweep), intckGetToken / intckIsSpace / intckParseCreateIndex
+       (skips quoted/bracket/identifier tokens, walks parens to find
+       the iCol'th column expression or trailing WHERE clause),
+       intckParseCreateIndexFunc (registers the SQL function
+       `parse_create_index(sql, icol)` used by the check-statement
+       composer), intckGetAutoIndex / intckIsIndex, intckCheckObjectSql
+       (the 100-line zCommon CTE block — without_rowid / idx_cols /
+       tabpk / idx / wrapper_with — plus the index-side and table-side
+       per-object check-SQL composers).  Pascal-port adaptations:
+       intckPrepareFmt / intckMprintf accept Pascal `array of const`
+       instead of C `va_list` and route through sqlite3PfMprintf;
+       the C `%z` printf extension auto-frees the input pointer, but
+       the Pascal `%z` keeps the string alive — every C `%z`-chain
+       in intckSaveKey / intckCheckObjectSql is rewritten to call
+       `sqlite3_free(zOld)` explicitly after each `%s`-based format,
+       preserving the original ownership semantics.  Wired into
+       `passqlite3shell` uses-clause so the unit is available to the
+       shell binary; not auto-installed as the API is caller-driven.
+       Verified end-to-end via new `bin/DiagIntck`: open :memory:,
+       create a table+index, run intck_open/step-loop/error/test_sql/
+       close — no corruption reported, no crash, no leaks.
+       TestExplainParity 1026/1026; TestSmoke PASSED.
+
+  [X] **10.1.95** ext/misc/compress.c (131 C lines) and ext/misc/sqlar.c
+       (126 C lines) ported as new units `passqlite3compress.pas` and
+       `passqlite3sqlar.pas` (~257 C lines total).  Provides the SQL
+       functions compress(X) / uncompress(X) and sqlar_compress(X) /
+       sqlar_uncompress(X,SZ).  All four functions back onto libz via
+       direct cdecl bindings (`compress` / `uncompress` / `compressBound`,
+       linked through `-k-lz` added to the FPC_FLAGS in
+       `src/tests/build.sh`).  compress() prepends a 1..5 byte
+       big-endian base-128 size frame (high bit set on the last byte)
+       to the zlib-format payload; uncompress() inverts the framing.
+       sqlar_compress() returns the input unchanged if compression does
+       not shrink it or if the input is not a BLOB; sqlar_uncompress()
+       short-circuits when SZ matches the blob length.  Wired via
+       sqlite3CompressInit / sqlite3SqlarInit in shell openDb.  Verified
+       byte-identical against `.load /tmp/compress.so` and `.load
+       /tmp/sqlar.so` on the system sqlite3 across cast-text BLOBs of
+       varying sizes (round-trip text intact); compress(zeroblob(...))
+       falls into "error in compress()" because the Pascal port's
+       sqlite3_value_blob does not materialise zeroblob to an actual
+       all-zero buffer when called from a function arg — pre-existing
+       gap unrelated to this port (randomblob, cast(...as blob) work
+       fine).  TestExplainParity 1026/1026; TestSmoke PASSED.
+
+  [X] **10.1.94** ext/misc/amatch.c (1502 C lines) ported as new unit
+       `passqlite3amatch.pas` (~700 lines).  Provides the
+       `approximate_match` virtual table — a costed-rewrite spelling-
+       correction reader.  CREATE VIRTUAL TABLE f USING
+       approximate_match(vocabulary_table=V, vocabulary_word=W,
+       vocabulary_language=L, edit_distances=E) loads the rule table E
+       at connect time (sorted via the upstream 15-bin merge ladder),
+       captures the generic '' → ? / ? → '' / ? → ? rules into rIns /
+       rDel / rSub, and exposes (word, distance, language, command
+       HIDDEN, nword HIDDEN).  Full string-keyed AVL implementation
+       (recompute height / rotate before+after / search / first /
+       insert / remove) plus the cost-keyed parallel tree, the
+       base-64 zCost cost-key encoder (10-byte rCost+iSeq tuple), and
+       the heart-of-the-search amatchNext / amatchAddWord that pull
+       the lowest-cost stem from the cost tree, walk the vocabulary
+       SELECT for partial-prefix continuations, and enqueue every
+       (rIns, rDel, rSub, custom-rule) successor.  xBestIndex
+       bit-encodes (1=word MATCH, 2=distance LT/LE, 4=language EQ);
+       orderByConsumed=1 when the only ORDER BY is `distance ASC`.
+       xUpdate rejects DELETE / UPDATE and accepts INSERT only into
+       the hidden command column (no-op, mirroring upstream).  Pascal-
+       port adaptations: variable-length zWord / zTo trailing buffers
+       sized via SizeOf(record)+nFrom+nTo (matches the C zTo[4] hack);
+       the C amatchEncodeInt static lookup table inlined as
+       amatchEncodeAlphabet const; %Q %w / sqlite3PfMprintf / Format
+       routes the C va_list mprintf chain.  Auto-registered via
+       sqlite3AmatchInit in shell openDb.  Verified: empty /
+       missing-edit-distances paths emit the exact upstream error
+       text; a 4-row vocab + 3-rule cost table connects clean and
+       declares the 5-column vtab schema.  Same caveat as 10.1.92 /
+       10.1.91 / 10.1.83 / 10.1.80 / 10.1.77 / 10.1.72 / 10.1.71 /
+       10.1.69: WhereBegin's vtab MATCH-constraint pushdown is not
+       yet wired (codegen.pas:13938 / 28163), so `WHERE word MATCH 'cat'`
+       does not flow into amatchFilter — the module itself is
+       faithful end-to-end.  TestExplainParity 1026/1026; DiagFeatureProbe
+       / DiagOps / DiagDml clean.
+
+  [X] **10.1.93** ext/misc/tmstmpvfs.c (1042 C lines) ported as new unit
+       `passqlite3tmstmpvfs.pas` (~826 lines).  Provides a VFS shim
+       ("tmstmpvfs") that writes a 16-byte timestamp tag into the reserve
+       area of every database page when the file's reserve_bytes value is
+       16, and emits a binary log of WAL/DB events into a sibling
+       `<dbname>-tmstmp/<ISOtime>-<pid>-<rand>` file when that directory
+       exists next to the database.  All 18 sqlite3_io_methods (close /
+       read / write / truncate / sync / fileSize / lock / unlock /
+       checkReservedLock / fileControl / sectorSize / deviceCharacteristics
+       / shmMap / shmLock / shmBarrier / shmUnmap / fetch / unfetch) and
+       all 19 sqlite3_vfs entries (open / delete / access / fullPathname /
+       dlOpen / dlError / dlSym / dlClose / randomness / sleep /
+       currentTime / getLastError / currentTimeInt64 / setSystemCall /
+       getSystemCall / nextSystemCall) wrapped 1:1 atop the underlying
+       VFS via ORIGFILE/ORIGVFS inline helpers.  tmstmpFileControl
+       intercepts SQLITE_FCNTL_VFSNAME to wrap with `tmstmp/<orig>` and
+       SQLITE_FCNTL_CKPT_START / _DONE to emit ELOG_CKPT_* events on the
+       paired DB file; tmstmpDeviceCharacteristics masks
+       SQLITE_IOCAP_SUBPAGE_READ off so the page-tail timestamp slot is
+       always written through the VFS.  The DB↔WAL pairing uses
+       sqlite3_database_file_object() to find the DB-side TmstmpFile
+       when a WAL is opened (so its events route into the DB's log
+       buffer).  Pascal-port adaptations: the C trick of placing
+       `sqlite3_file* sub` immediately after `TmstmpFile` (`(sqlite3_file*)
+       (((TmstmpFile*)p)+1)`) is preserved via the `ORIGFILE` inline
+       helper that adds `SizeOf(TTmstmpFile)` to the pointer; libc fopen
+       / fclose / fwrite / fflush / getpid bound directly because
+       BaseUnix surfaces fopen-style streams less ergonomically than
+       FILE*; the upstream civil-from-days date arithmetic
+       (Howard Hinnant) ported verbatim into Pascal — variable names
+       changed from h/m/s/Y/M/D to hh/mm/ss/Y/Mo/D to dodge case-
+       insensitive collisions with the formal-arg `m` in adjacent funcs;
+       `goto tmstmp_open_done` mirrored 1:1 with a Pascal label.
+       Public entries `sqlite3_register_tmstmpvfs(zArg)` /
+       `sqlite3_unregister_tmstmpvfs` install/remove the layered VFS
+       (with makeDflt=1 so it becomes the new default).  Wired into
+       `passqlite3shell` uses-clause but NOT auto-installed in shell
+       openDb because making tmstmpvfs the default would intercept every
+       open() and corrupt sessions on databases without an exact
+       reserve=16 byte allocation — same convention as cksumvfs / vfslog
+       / vfstrace.  Verified via new `bin/DiagTmstmpvfs`: register →
+       open default-reserve DB → CREATE/INSERT/SELECT round-trip OK
+       (pass-through) → close → open reserve_bytes=16 DB → CREATE/INSERT/
+       SELECT round-trip OK (shim-active) → unregister.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps / DiagDml /
+       DiagPragma / DiagFunctions / DiagAppendvfs / DiagVfslog all clean.
+
+  [X] **10.1.92** ext/misc/fuzzer.c (1192 C lines) ported as new unit
+       `passqlite3fuzzer.pas` (~720 lines).  Provides the `fuzzer`
+       virtual table: `CREATE VIRTUAL TABLE f USING fuzzer(<rule-table>)`
+       reads a four-column (ruleset, cFrom, cTo, Cost) table at connect
+       time, then yields all variations of an input word reachable
+       through the costed character-rewrite rules in increasing distance
+       order.  Full port: fuzzerMergeRules / fuzzerLoadOneRule /
+       fuzzerLoadRules (with the upstream 15-bin merge-ladder cost
+       sort), fuzzerDequote, fuzzerConnect/Disconnect, fuzzerOpen/Close,
+       fuzzerClearCursor / fuzzerClearStemList, fuzzerRender, fuzzerHash,
+       fuzzerCost, fuzzerSeen, fuzzerSkipRule, fuzzerAdvance,
+       fuzzerMergeStems, fuzzerLowestCostStem, fuzzerInsert,
+       fuzzerNewStem, fuzzerNext, fuzzerFilter, fuzzerColumn / Rowid /
+       Eof, fuzzerBestIndex (idxNum bits 1=MATCH on word, 2=LT/LE on
+       distance, 4=EQ on ruleset).  Pascal-port adaptations: the
+       `fuzzer_rule.zTo[4]` flexible-array hack preserved as a
+       4-element AnsiChar array with allocation extended by nFrom+nTo
+       bytes; PAnsiChar offset arithmetic relies on
+       `{$POINTERMATH ON}`.  Wired via `sqlite3FuzzerInit` in shell
+       openDb.  Verified end-to-end: a 4-rule corpus with empty
+       starting term emits the expected 1..100-char 'a' progression
+       at increasing 100-cost steps.  Same caveat as the prior
+       eponymous-vtab series (10.1.69, 10.1.71, 10.1.72, 10.1.77,
+       10.1.80, 10.1.83, 10.1.86): WhereBegin's vtab MATCH /
+       constraint pushdown is not yet wired (codegen.pas:13938 / 28163),
+       so `WHERE word MATCH 'abc' AND distance<200` does not reach
+       fuzzerFilter — the module itself is faithful end-to-end.
+
+  [X] **10.1.91** ext/misc/unionvtab.c (1383 C lines) ported as new unit
+       `passqlite3unionvtab.pas` (~770 lines).  Provides the
+       `unionvtab` and `swarmvtab` virtual tables: presents many rowid
+       tables behind a single schema, dispatched by rowid range.
+       `CREATE VIRTUAL TABLE temp.t USING unionvtab(<sql-statement>)`
+       evaluates <sql> at connect time; each row gives (zDb, zTab, iMin,
+       iMax) — and optionally a 5th context column for swarmvtab.  Full
+       AVL-free port: unionMalloc / unionStrdup / unionDequote /
+       unionPrepare / unionPreparePrintf / unionFinalize / unionInvoke
+       OpenClose / unionCloseSources / unionIsIntkeyTable /
+       unionSourceToStr / unionSourceCheck / unionOpenDatabase{Inner} /
+       unionIncrRefcount / unionFinalizeCsrStmt / unionConfigureVtab /
+       unionConnect / unionOpen/Close / doUnionNext / unionNext /
+       unionColumn / unionRowid / unionEof / unionFilter /
+       unionBestIndex.  swarmvtab options parsed: maxopen=N, missing=UDF,
+       openclose=UDF, :param=text, plus the legacy single-callback form.
+       xBestIndex pushes EQ / LE/LT / GE/GT on the IPK column into the
+       per-source SELECT composition.  Wired via sqlite3UnionvtabInit
+       in shell openDb.  Verified: single-source unionvtab with rowid=K
+       and rowid>=K filters returns exactly the matching rows;
+       no-such-rowid-table raises "no such rowid table: main.foo".
+       Caveat: bare scans with multiple sources surface a pre-existing
+       engine bug (UNION ALL of two real-FROM SELECTs collapses to a
+       single arm with truncated columns), tracked separately under
+       6.12 sub-bug B; the module itself composes the correct UNION
+       ALL — once that engine bug closes, multi-source scans flow.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps clean.
+
+  [X] **10.1.90** ext/misc/cksumvfs.c (847 C lines) ported as new unit
+       `passqlite3cksumvfs.pas` (~750 lines).  Provides a VFS shim
+       ("cksmvfs") that maintains an Adler-style two-state 8-byte
+       checksum on the trailing reserve-bytes of every database page;
+       reads return SQLITE_IOERR_DATA on mismatch.  Activated only when
+       the file's reserve-bytes value is exactly 8 (default 0), so
+       checksum bytes are written into the standard reserve-byte tail
+       and never collide with data.  All 19 sqlite3_io_methods plus all
+       19 sqlite3_vfs entries wrapped 1:1; cksmFileControl intercepts
+       the SQLITE_FCNTL_PRAGMA arm so `PRAGMA checksum_verification`
+       can be queried/toggled, and rewrites SQLITE_FCNTL_VFSNAME to
+       wrap with `cksm/<orig>`.  cksmFetch returns NULL when checksums
+       are active so memory-mapped reads never bypass cksmRead.
+       Public entries: `sqlite3_register_cksumvfs(zArg)` /
+       `sqlite3_unregister_cksumvfs` install/remove the layered VFS
+       (with the auto_extension hook), plus a port-convenience
+       `sqlite3CksumvfsInit(db)` that registers only the
+       verify_checksum SQL function on a single connection.  Wired via
+       sqlite3CksumvfsInit in shell openDb so verify_checksum is
+       always available; the VFS shim itself is exported but NOT
+       auto-installed because making cksmvfs the default would
+       intercept every open() and corrupt sessions on databases without
+       an 8-byte reserve.  Pascal-port adaptations: BYTESWAP32 collapsed
+       to the little-endian arm only (x86-64 Linux target);
+       sqlite3_log() omitted because it's private to passqlite3pager
+       (the SQLITE_IOERR_DATA error code still propagates correctly);
+       cksmAutoExtension is a stub since the auto-extension dispatch
+       loop in passqlite3main is registered-but-not-invoked.  Verified
+       end-to-end: verify_checksum over a stored 1024-byte zero blob
+       returns 1, over a stored 1024-byte randomblob returns 0,
+       returns NULL for non-BLOB and out-of-range sizes.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps clean.
+
+  [X] **10.1.89** ext/misc/vtshim.c (553 C lines) ported as new unit
+       `passqlite3vtshim.pas` (~620 lines).  Provides the two public
+       entry points `sqlite3_create_disposable_module(db, zName, p,
+       pClientData, xDestroy)` and `sqlite3_dispose_module(pX)` —
+       a thin shim that wraps a caller-supplied sqlite3_module so the
+       caller can mass-disconnect every vtab and close every cursor in
+       one synchronous walk (originally written for GC-managed runtimes
+       where finalisation order is not guaranteed).  All 22 module
+       slots wrapped 1:1 (xCreate / xConnect / xBestIndex / xDisconnect /
+       xDestroy / xOpen / xClose / xFilter / xNext / xEof / xColumn /
+       xRowid / xUpdate / xBegin / xSync / xCommit / xRollback /
+       xFindFunction / xRename / xSavepoint / xRelease / xRollbackTo);
+       v3+ slots (xShadowName / xIntegrity) intentionally not exposed
+       because vtshim caps the wrapped iVersion at 2 to match upstream.
+       Pascal-port adaptations: VTSHIM_COPY_ERRMSG macro inlined as a
+       small helper that routes through `sqlite3PfMprintf('%s', ...)`;
+       the module-pointer typedef list is private to the unit and casts
+       Pascal `Pointer` slots back to typed function pointers per call;
+       `PPSqlite3Module` declared locally because the existing
+       `passqlite3vtab` only exports `PSqlite3Module`.  Wired into
+       `passqlite3shell` uses-clause so the unit is part of the shell
+       build but NOT auto-installed (vtshim is library plumbing — the
+       caller registers a disposable module explicitly).
+       TestExplainParity 1026/1026.
+
+  [X] **10.1.88** ext/misc/vfstrace.c (1211 C lines) ported as new unit
+       `passqlite3vfstrace.pas` (~1140 lines).  Provides the public
+       `vfstrace_register(zTraceName, zOldVfsName, xOut, pOutArg,
+       makeDefault)` / `vfstrace_unregister(zTraceName)` entry points
+       that install a strace-style VFS shim atop an existing VFS and
+       fan out a `<vfsname>.<method>(args) -> rc` line per VFS call
+       through the caller-supplied `xOut(zMsg, pAppData)` cdecl
+       callback.  All 19 sqlite3_io_methods (close/read/write/truncate/
+       sync/fileSize/lock/unlock/checkReservedLock/fileControl/
+       sectorSize/deviceCharacteristics/shmMap/shmLock/shmBarrier/
+       shmUnmap/fetch/unfetch) and all 19 sqlite3_vfs entries
+       (open/delete/access/fullPathname/dlOpen/dlError/dlSym/dlClose/
+       randomness/sleep/currentTime/getLastError/currentTimeInt64/
+       setSystemCall/getSystemCall/nextSystemCall) wrapped 1:1.
+       vfstraceFileControl mirrors the upstream FCNTL opcode table
+       plus the `PRAGMA vfstrace('+all,-read,…')` runtime mask updater
+       (aKw[] constant array preserved verbatim) and the
+       FCNTL_VFSNAME wrap-with-`vfstrace.<name>/%z` augmentation.
+       Pascal-port adaptations: `vfstrace_printf` uses sqlite3PfMprintf
+       with `array of const` instead of C va_list;
+       `vfstrace_errcode_name` expanded into a Pascal case statement;
+       `vfstrace_unregister` compares xOpen via Pointer() cast to
+       dodge FPC's "operator not overloaded" error on procedural-type
+       comparison.  Exported but NOT auto-installed by shell openDb
+       because trace output would corrupt every shell session — same
+       convention as memtrace / pcachetrace / showauth.  Verified
+       end-to-end via new `bin/DiagVfstrace`: vfstrace_register
+       ('vfstrace',nil,…) → sqlite3_open_v2 with vfs="vfstrace" →
+       CREATE/INSERT/SELECT → captured trace contains
+       `enabled_for("unix")`, xFullPathname / xOpen / xRead /
+       xDeviceCharacteristics / xLock / xAccess / xWrite / xClose
+       lines with the expected SQLITE_OK / SQLITE_IOERR_SHORT_READ /
+       SQLITE_NOTFOUND error symbols resolved by name.
+       TestExplainParity 1026/1026.
+
+  [X] **10.1.87** ext/misc/vfsstat.c (825 C lines) ported as new unit
+       `passqlite3vfsstat.pas` (~620 lines).  Provides the `vfsstat`
+       eponymous virtual table that exposes per-file-type I/O counters
+       (database / journal / wal / master-journal / sub-journal /
+       temp-database / temp-journal / transient-db / *) crossed with
+       the seven stat axes (bytes-in / bytes-out / read / write / sync
+       / open / lock for typed rows; access / delete / fullpathname /
+       randomness / sleep / currenttimestamp / not-used for the `*` row).
+       Counters live in a global u64[63] array; all 19 sqlite3_io_methods
+       and all 19 sqlite3_vfs entries pass through to the underlying
+       VFS via a REALVFS() inline helper.  vstattabUpdate honours
+       `UPDATE vfsstat SET count=N` (validates rowid range + non-negative
+       integer N), refusing INSERT / DELETE and any other column change.
+       Init wired through sqlite3VfsstatInit in shell openDb: the first
+       call also installs the VFS shim (zName="vfslog" — upstream typo
+       preserved byte-identical) as the new default VFS, layered on top
+       of whatever was previously default; subsequent calls only
+       register the vtab on the new connection.  Verified end-to-end:
+       `.open vss.db; CREATE TABLE t(x); INSERT INTO t VALUES(1),(2),(3);
+       SELECT * FROM vfsstat WHERE count>0;` returns the expected
+       database/journal/* row set with read/write/sync/lock/open
+       counters incrementing through the shim; `UPDATE vfsstat SET
+       count=42 WHERE rowid=1; SELECT count FROM vfsstat WHERE rowid=1;`
+       round-trips 42.  TestExplainParity 1026/1026; DiagFeatureProbe /
+       DiagOps clean.  Caveat: the shell's first openDb runs before
+       sqlite3VfsstatInit, so the very first connection on a shell
+       invocation sees only the xRandomness counter increment — the
+       VFS shim activates for every subsequent .open and on every
+       connection in embedders that call sqlite3_register_vfsstat()
+       before the first sqlite3_open.
+
+  [X] **10.1.86** ext/misc/fileio.c (1234 C lines) ported as new unit
+       `passqlite3fileio.pas` (~640 lines).  Provides the SQL functions
+       readfile(X), writefile(F,D[,M[,T]]), lsmode(M), realpath(X) plus
+       the eponymous `fsdir(D[,B[,L]])` virtual table.  Linux-only port:
+       Windows arms entirely omitted.  POSIX glue (stat / lstat / mkdir /
+       chmod / unlink / symlink / readlink / opendir / readdir / closedir)
+       routes through BaseUnix; libc bound directly for fopen / fread /
+       fwrite / fseek / ftell / rewind / utimes / realpath / time which
+       BaseUnix doesn't surface (FpUtime lacks usec precision).  ctxErrorMsg
+       and fsdirSetErrmsg routed through SysUtils.Format → sqlite3StrDup
+       (matching the existing port pattern in passqlite3csv / scrub).
+       Auto-registered via `sqlite3FileioInit` in shell openDb.  Verified
+       end-to-end: readfile('hello.txt') round-trips byte-identical;
+       writefile creates a 6-byte file; lsmode(33188)='-rw-r--r--',
+       lsmode(16877)='drwxr-xr-x', lsmode(41471)='lrwxrwxrwx';
+       realpath('/tmp')='/tmp'; realpath('/tmp/.././tmp')='/tmp' (the
+       /./ and /../ simplification path).  Caveat: bare
+       `SELECT … FROM fsdir('/path')` falls into fsdirFilter with
+       idxNum=0 → "table function fsdir requires an argument" — same
+       pre-existing WhereBegin vtab xBestIndex pushdown gap as 10.1.69 /
+       10.1.71 / 10.1.72 / 10.1.83 (codegen.pas:13938 / 28163).  The
+       module is faithful end-to-end; once pushdown lands the path/dir/
+       level constraints flow through.  TestExplainParity 1026/1026;
+       DiagFunctions / DiagOps / DiagFeatureProbe / DiagDml / DiagPragma
+       all clean.
+
+  [X] **10.1.85** ext/misc/vfslog.c (760 C lines) ported as new unit
+       `passqlite3vfslog.pas` (~640 lines).  Provides the `vfslog` VFS
+       shim — when registered via `sqlite3_register_vfslog(zArg)` it
+       becomes the new default VFS, layered on top of whatever VFS was
+       previously default, and writes a CSV-formatted trace of every
+       disk operation to a per-database log file named
+       `<dbpath>-debuglog-<usec-since-epoch>` next to the original db.
+       Each trace line has eight comma-separated fields:
+       `tStart,tElapsed,opcode,isJournal,iArg1,iArg2,zArg3,iResult`.
+       Paired VLogLog[2] layout preserved so a single connection's
+       writes to the database and its rollback journal land in the same
+       file (with isJournal=1 distinguishing the journal half).
+       WAL files (`-wal`) and master journals (`-mj??????9??`) are
+       skipped per upstream.  vlogSignature mirrors the C 16-byte hex
+       dump for short blocks plus the 64-bit rolling-sum digest tail
+       for longer ones; vlogRead/vlogWrite both decode the page-1
+       change-counter field and emit CHNGCTR-{READ,WRITE} lines per
+       upstream behaviour.  Pascal-port adaptations: libc fopen /
+       fclose / fprintf / gettimeofday / gethostname / getpid bound
+       directly; `sqlite3_mprintf("vlog/%z", ...)` simulated via a
+       hand-rolled prepend-and-take-ownership helper because the
+       Pascal sqlite3_mprintf cdecl entry has no varargs surface;
+       SQLITE_MUTEX_STATIC_MAIN used in place of the C alias
+       SQLITE_MUTEX_STATIC_MASTER (same id=2).  Verified end-to-end
+       via new `bin/DiagVfslog`: CREATE/INSERT/SELECT round-trip on a
+       fresh on-disk db produces a debuglog file containing IDENT /
+       OPEN / READ / WRITE / CLOSE / FILESIZE records.
+       TestExplainParity 1026/1026.
+
+  [X] **10.1.84** ext/misc/appendvfs.c (672 C lines) ported as new unit
+       `passqlite3appendvfs.pas` (~530 lines).  Provides the `apndvfs`
+       VFS shim that allows opening a SQLite database appended onto the
+       end of another file (e.g. an executable).  Implements the
+       Start-Of-SQLite3-NNNNNNNN trailer protocol with NNNNNNNN as a
+       big-endian 64-bit offset to page 1, the APND_ROUNDUP=4096 page
+       boundary alignment, and the 1GiB combined-size cap.  All 19
+       sqlite3_io_methods entries (close/read/write/truncate/sync/
+       fileSize/lock/unlock/checkReservedLock/fileControl/sectorSize/
+       deviceCharacteristics/shmMap/shmLock/shmBarrier/shmUnmap/fetch/
+       unfetch) and all 19 sqlite3_vfs entries pass through to the
+       underlying VFS via the ORIGFILE/ORIGVFS macros (translated to
+       inline helpers).  Auto-registered via `sqlite3AppendvfsInit` in
+       shell openDb.  xOpen behaviour matches the upstream rule set:
+       (1) empty file is ordinary DB; (2) trailer-bearing file is
+       appended DB; (3) file starting with "SQLite format 3\0" is
+       ordinary; (4) with SQLITE_OPEN_CREATE, append after rounding
+       prefix size up to APND_ROUNDUP; (5) otherwise SQLITE_CANTOPEN.
+       Verified end-to-end via new `bin/DiagAppendvfs`: prefix file
+       (39-byte non-DB content) → open with CREATE → write 3-row table
+       → close → re-open with READWRITE via `apndvfs` → SELECT count(*)
+       and max() round-trip → confirm trailing Start-Of-SQLite3- marker
+       present and prefix bytes preserved at offset 0.  Implementation
+       note: a `pApndFile` local in `apndOpen` initially collided with
+       the `PApndFile` type alias because Pascal is case-insensitive —
+       renamed to `paf` to disambiguate (consistent with the C source's
+       own field name).  TestExplainParity 1026/1026; DiagFeatureProbe /
+       DiagOps clean.
+
+  [X] **10.1.83** ext/misc/closure.c (971 C lines) ported as new unit
+       `passqlite3closure.pas` (~640 lines).  Provides the
+       `transitive_closure` virtual table for walking parent/child
+       relations in a real user table:
+       `CREATE VIRTUAL TABLE x USING transitive_closure(tablename=T,
+       idcolumn=X, parentcolumn=P)` plus per-query overrides through
+       hidden constraint columns (root / depth / tablename / idcolumn /
+       parentcolumn).  Full AVL-tree implementation ported 1:1
+       (recompute height / rotate before+after / from-ptr / balance /
+       search / first / next / insert / destroy) plus the BFS queue and
+       the rolling-hash xFilter that prepares
+       `SELECT "%w"."%w" FROM "%w" WHERE "%w"."%w"=?1` once and rebinds
+       the parent id per generation.  The bit-packed idxNum encoding
+       (root flag in bit 0, depth-LT bit in bit 1, four 4-bit argv-index
+       slots at shifts 4/8/12/16) preserved byte-identical to
+       closure.c:827..918, including the empty-set fallback when neither
+       CREATE nor WHERE binds tablename / idcolumn / parentcolumn.
+       Closure C source uses `goto closureConnectError`; preserved in
+       Pascal via `label ErrorExit` (one label per function, matching
+       prior ext/misc ports).  Auto-registered via `sqlite3ClosureInit`
+       in shell openDb.  Same caveat as the prior eponymous-vtab series
+       (10.1.69 / 10.1.71 / 10.1.72 / 10.1.77 / 10.1.80): the Pascal port
+       does not yet wire vtab xBestIndex constraint pushdown
+       (codegen.pas:13938 / 28163), so `SELECT id FROM ct WHERE root=?`
+       falls into closureFilter with idxNum=0 → empty set; the module
+       itself is faithful end-to-end and constraints flow through once
+       pushdown lands.  Verified: CREATE VIRTUAL TABLE registers cleanly
+       with and without arguments, and the populated AVL tree behaves
+       identically to the C reference once primed via direct test
+       harness.  TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps
+       / DiagFunctions clean.
+
+  [X] **10.1.82** ext/misc/csv.c (977 C lines) ported as new unit
+       `passqlite3csv.pas` (~610 lines).  Provides the `csv` virtual table
+       (CREATE VIRTUAL TABLE … USING csv(filename=…|data=…
+       [,schema=…][,columns=N][,header=YES|NO])) for reading RFC-4180 CSV
+       from a file or inline string.  Full CsvReader port (UTF-8 BOM
+       skip, RFC-4180 quoted fields with embedded commas / row
+       terminators / doubled quotes, `\r\n` and bare `\n` row
+       terminators).  fopen/fread/fclose/fseek/ftell bound directly via
+       libc.  csv_dequote / csv_trim_whitespace / csv_parameter /
+       csv_string_parameter / csv_boolean_parameter ported 1:1; the
+       schema-discovery branch composes the `CREATE TABLE x(...)` via
+       sqlite3_str / sqlite3_str_appendf with the `%w` identifier
+       quoter.  The C `goto csvtab_connect_oom / _error` cleanup chain
+       is preserved 1:1 with Pascal labels.  Auto-registered via
+       sqlite3CsvInit in shell openDb.  Verified byte-identical against
+       `.load /tmp/csv.so` running under the system sqlite3 across:
+       basic file load (3 rows × 3 cols), inline data= with header=YES,
+       schema= override with typed column projection, columns=N
+       projection, RFC-4180 quoted-field parsing including embedded
+       comma and doubled-quote (`"hello, world"`, `"quote""inside"`),
+       and the `bad parameter: 'xyz=foo'` error path.  TestExplainParity
+       1026/1026; DiagFeatureProbe / DiagOps / DiagFunctions / DiagDml /
+       DiagPragma / DiagTxn / DiagMisc / DiagCast / TestVdbeAgg /
+       DiagAnalyze all clean.
+
+  [X] **10.1.81** ext/misc/dbdump.c (724 C lines) ported as new unit
+       `passqlite3dbdump.pas` (~658 lines).  Provides the public helper
+       `sqlite3_db_dump(db, zSchema, zTable, xCallback, pArg)` that
+       serialises an open SQLite connection into UTF-8 SQL text via a
+       `fputs`-compatible callback (CREATE / INSERT / index-trigger-view
+       blocks; rowid alias auto-detected through PRAGMA table_info +
+       PRAGMA index_list; embedded `\n` / `\r` payloads escaped through
+       `replace(...,char(10),...)` / `char(13)` so EOL translation can't
+       corrupt the dump; `sqlite_sequence` rewritten as a DELETE; CREATE
+       VIRTUAL TABLE replayed via writable_schema INSERT; `sqlite_stat?`
+       collapsed to ANALYZE).  Pascal port adaptations: dbdump.c's
+       `va_list` based output_formatted / output_sql_from_query /
+       run_schema_dump_query routed through `sqlite3PfMprintf` with
+       Pascal `array of const`; `goto col_oom` cleanup chain in
+       tableColumnList preserved 1:1 with a Pascal label; rowid alias
+       names ("rowid" / "_rowid_" / "oid") materialised as PAnsiChar
+       module-level constants so they survive past the function.
+       Verified byte-identical against the C reference: built a
+       1-table corpus (INTEGER PK + TEXT + BLOB columns; rows with
+       embedded \n, doubled '', NULL, and x'00ff' BLOBs; one CREATE
+       INDEX) and the Pascal `sqlite3_db_dump` output diff'd zero
+       against linking dbdump.c into a small C harness.  Smoke probe
+       `bin/DiagDbdump` builds the same corpus, asserts the canonical
+       statements appear in the dump, then replays into a fresh
+       :memory: connection and verifies the surviving row count.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps clean.
+
+  [X] **10.1.80** ext/misc/fossildelta.c (1109 C lines) ported as new
+       unit `passqlite3fossildelta.pas` (~700 lines).  Provides the
+       Fossil delta encoder used by RBU: scalar SQL functions
+       `delta_create(X,Y)` / `delta_apply(X,D)` / `delta_output_size(D)`
+       plus the `delta_parse(D)` eponymous table-valued vtab whose rows
+       describe the SIZE / COPY / INSERT / CHECKSUM stream.  Includes
+       the rolling-hash matcher (NHASH=16 base-64 framing per
+       fossil-scm.org/fossil/doc/trunk/www/delta_format.wiki), the
+       little-endian arm of the big-endian checksum, and the deltaGetInt
+       / putInt / digit_count base-64 codec.  Wired via
+       `sqlite3FossildeltaInit(p^.db)` in shell openDb.  Verified
+       byte-identical against `.load /tmp/fossildelta.so` on length and
+       hex of delta_create over multi-line / repeating-byte / single-
+       byte-edit corpora; round-trip `delta_apply(X,delta_create(X,Y))=Y`
+       holds.  Caveat: the `delta_parse(D)` and
+       `… FROM delta_parse WHERE delta=D` filter forms return zero rows
+       in the Pascal port — same WhereBegin-vtab-pushdown gap as the
+       prior eponymous-vtab ports (10.1.69, 10.1.71, 10.1.72, 10.1.77);
+       the cursor implementation itself is faithful and yields rows once
+       the constraint flows through.  Implementation note: a `nHash`
+       local in `deltaCreate` initially shadowed the file-level
+       `NHASH=16` constant because Pascal is case-insensitive — the
+       constant was renamed to `NHASH_BYTES` to disambiguate.
+       TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe
+       clean.
+
+  [X] **10.1.79** ext/misc/scrub.c (610 C lines) ported as new unit
+       `passqlite3scrub.pas` (~590 lines).  Provides the public helper
+       `sqlite3_scrub_backup(zSrcFile, zDestFile, pzErr)` that copies a
+       whole SQLite database while zeroing out content in regions the
+       database considers free / unused: freelist trunk pages
+       (descendant leaves intentionally not copied — OS zero-fills the
+       gap on demand, mirroring scrub.c:323..338), the gap between the
+       cell-index array and the cell content area on each b-tree page,
+       free blocks inside b-tree pages, and the unused tail of the last
+       overflow page in each chain.  Recurses through the whole btree
+       set rooted in sqlite_schema (plus the schema btree itself);
+       walks ptrmap pages in autovacuum/incvacuum mode; preserves the
+       on-disk page count via a trailing zero page when iLastPage falls
+       short of nPage (last input page may be a freelist leaf).  Key
+       Pascal-port adaptations: sqlite3_vmprintf with C varargs replaced
+       by SysUtils.Format → sqlite3StrDup so the error buffer lives in
+       sqlite3_malloc memory; goto-driven btree_corrupt cleanup mirrored
+       1:1 via a single label per function.  Verified end-to-end via
+       new `bin/DiagScrub`: source db with 3 rows + 1 deletion → scrub
+       to fresh file → reopen → count(*)=2 + PRAGMA integrity_check =
+       'ok'.  TestExplainParity 1026/1026.
+
+  [X] **10.1.78** ext/misc/btreeinfo.c (434 C lines) + ext/misc/vtablog.c
+       (720 C lines) ported as new units `passqlite3btreeinfo.pas` (~330
+       lines) and `passqlite3vtablog.pas` (~570 lines) — ~1154 C lines
+       total.  btreeinfo provides the `sqlite_btreeinfo` eponymous
+       read-only vtab whose rows mirror sqlite_schema (type / name /
+       tbl_name / rootpage / sql) and add five computed columns
+       (hasRowid / nEntry / nPage / depth / szPage) by walking from the
+       btree root through `sqlite_dbpage('main')` to a leaf, multiplying
+       cell counts at each interior level for the size estimate (see
+       btreeinfo.c:269..332).  Auto-registered in shell openDb via
+       sqlite3BinfoRegister; verified on a fresh table with one
+       int-pkey table + 3 rows + an index — `sqlite_btreeinfo` returns
+       the expected rootpage/hasRowid pattern (sqlite_schema=1/main_t=2,
+       index=0).  szPage column is always NULL because the upstream C
+       source omits it from the binfoColumn switch — port matches.
+       vtablog provides a debugging vtab that traces every xCreate /
+       xConnect / xBestIndex / xFilter / xNext / xColumn / xUpdate /
+       xBegin / xCommit / xShadowName / xIntegrity etc. call to stdout.
+       Exposes the upstream argument-key/value parser
+       (vtablog_string_parameter / vtablog_dequote /
+       vtablog_trim_whitespace) for `schema=`, `rows=`, and
+       `consume_order_by=`.  Exported but NOT auto-installed by shell
+       openDb because the trace output would corrupt every shell
+       session — callers wire it explicitly via sqlite3VtablogRegister.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps /
+       DiagFunctions clean.
+
+  [X] **10.1.77** ext/misc/qpvtab.c (462 C lines) + ext/misc/memtrace.c
+       (108 C lines) + ext/misc/pcachetrace.c (179 C lines) ported as new
+       units `passqlite3qpvtab.pas`, `passqlite3memtrace.pas`,
+       `passqlite3pcachetrace.pas` (~749 C lines total).  qpvtab is the
+       debugging eponymous vtab that returns one row per
+       sqlite3_index_info field describing how the planner called
+       xBestIndex; idxStr is composed via sqlite3_str_appendf and routed
+       to xFilter; the integer-RHS shortcut on the hidden `flags`
+       column toggles INT-typed a..e values, orderByConsumed, and
+       constraint omit.  memtrace / pcachetrace install substitute
+       sqlite3_mem_methods / sqlite3_pcache_methods2 vectors that fprintf
+       every allocate/free/resize and every xFetch/xUnpin/xRekey/etc.
+       call to a caller-supplied FILE*; activate / deactivate API
+       matches the C source.  Companion fix to sqlite3_config — the
+       Pascal port previously only handled SQLITE_CONFIG_PCACHE2; the
+       three op codes the trace activators need (SQLITE_CONFIG_MALLOC=4,
+       SQLITE_CONFIG_GETMALLOC=5, SQLITE_CONFIG_GETPCACHE2=19) are now
+       wired through sqlite3GlobalConfig.m / .pcache2.  Wired via
+       sqlite3QpvtabInit in shell openDb; memtrace / pcachetrace are
+       exported but not auto-installed (they are diagnostic-only and
+       the shell's --memtrace / --pcachetrace command-line wiring
+       lands later).  Pascal-port caveat for qpvtab: same as 10.1.69 /
+       10.1.71 / 10.1.72 — WhereBegin's vtab xBestIndex pushdown is
+       not yet wired (codegen.pas:13938 / 28163), so `SELECT … FROM
+       qpvtab(102) WHERE a=…` walks an unfiltered cursor with idxStr
+       = NULL → 0 rows.  The module itself is faithful end-to-end; once
+       pushdown lands, the rich row stream flows through.  Pascal-port
+       caveat for memtrace / pcachetrace: most of the Pascal port
+       routes allocations directly through sqlite3_malloc / pcache1
+       rather than the global config vector, so the trace layers only
+       see callers that go through sqlite3GlobalConfig.m / .pcache2.
+       TestExplainParity 1026/1026; both new units compile clean.
+
+  [X] **10.1.76** ext/misc/stmt.c (347 C lines) + ext/misc/explain.c
+       (323 C lines) ported as new units `passqlite3stmt.pas` and
+       `passqlite3explain.pas` (~670 C lines total).  stmt.c provides the
+       `sqlite_stmt` eponymous vtab (one row per still-open prepared
+       statement on the connection — sql / ncol / ro / busy / nscan /
+       nsort / naidx / nstep / reprep / run / mem); explain.c provides
+       the `explain(SQL)` eponymous table-valued function whose rows are
+       the EXPLAIN bytecode of the inner SQL (addr / opcode / p1..p5 /
+       comment / sql HIDDEN), with xBestIndex pushdown of the `==`
+       constraint against the hidden SQL column.  Both wired via
+       sqlite3StmtVtabInit / sqlite3ExplainVtabInit in shell openDb.
+       Verified: `SELECT * FROM sqlite_stmt` yields the active SELECT
+       row with the right column counts; `SELECT * FROM
+       explain('SELECT 1+2')` produces the 8-row Init/Explain/Add/
+       ResultRow/Halt/Integer/Integer/Goto stream byte-identical to
+       upstream `.load /tmp/explain.so`.  TestExplainParity 1026/1026;
+       DiagFeatureProbe / DiagOps clean.  Pascal-port limitation: the
+       MEM column is hard-coded to 0 because sqlite3_stmt_status(.,
+       MEMUSED, 0) currently calls sqlite3VdbeDelete on the live
+       statement (passqlite3main.pas:3480..) instead of running it
+       under the upstream `pnBytesFreed` dry-run accounting; tracked
+       MEM column closed 2026-05-07 under 8.x.memused below.
+
+- [X] **8.x.memused** Closed 2026-05-07.  `sqlite3DbFree` /
+  `sqlite3DbFreeNN` (passqlite3util.pas:2398..) now honour
+  `db^.pnBytesFreed`: when set, accumulate `sqlite3MallocSize(p)` into
+  the counter and skip the actual free, mirroring malloc.c:586.
+  `sqlite3VdbeDelete` (passqlite3vdbe.pas:4766) skips the pVdbe-list
+  unlink under the dry-run mode (matches vdbeaux.c:1156).  Restored the
+  MEMUSED arm in passqlite3stmt.pas:253: `SELECT mem FROM sqlite_stmt`
+  now reports the live vdbe's allocation footprint (~2000 bytes for a
+  bare SELECT) instead of the previous hard-coded 0.  TestExplainParity
+  1026/1026; DiagPubApi 259/259; DiagFeatureProbe / DiagOps / DiagDml /
+  DiagPragma / DiagTxn all clean.
+
+  [X] **10.1.75** ext/misc/regexp.c (928 C lines) ported as new unit
+       `passqlite3regexp.pas` (~770 lines).  Provides the SQL functions
+       `regexp(PATTERN, STRING)` and the case-insensitive variant
+       `regexpi(PATTERN, STRING)`, which together implement the
+       `B REGEXP A` operator.  POSIX-extended RE syntax over UTF-8 input
+       (X*, X+, X?, X{m,n}, ., (X), X|Y, ^X, X$, [abc], [^abc], [a-z],
+       \b \w \W \d \D \s \S, \uXXXX, \xXX) compiled to the 18-opcode NFA
+       and matched in O(N*M) time — never exponential.  Compiled NFA is
+       cached on the function context via `sqlite3_set_auxdata` so a
+       constant pattern recompiles only once per statement; the deleter
+       trampoline (`re_free_voidptr`) chains through `sqlite3_free`.
+       The `goto re_op_cc_inc` fall-through from RE_OP_CC_EXC in the
+       C source is restructured into a unified case-arm; `[:posix:]`
+       classes correctly emit "POSIX character classes not supported".
+       Wired via `sqlite3RegexpInit(p^.db)` in shell openDb.  Verified
+       byte-identical against the system `sqlite3` running
+       `.load /tmp/regexp.so` on a 43-case suite covering: anchors,
+       quantifiers (greedy {m,n}), alternation, character classes,
+       inverted classes, ranges, perl classes (\d, \w, \s and
+       negations), word boundaries, hex escapes (\xNN), UTF-8
+       multibyte input, `regexpi` case-insensitive, the REGEXP
+       operator form, and degenerate empty-pattern.  TestExplainParity
+       1026/1026.
+  [X] **10.1.74** ext/misc/normalize.c (717 C lines) ported as new unit
+       `passqlite3normalize.pas` (~620 lines).  Provides the public helper
+       `sqlite3_normalize(zSql)` that returns a canonical form of SQL by
+       (1) rewriting every literal (string / blob / number / NULL) to '?',
+       (2) collapsing whitespace and comments to single spaces, (3)
+       lower-casing ASCII, and (4) rewriting `IN (v1,v2,...)` lists to
+       `IN (?,?,?)`.  The bundled tokenizer (sqlite3GetToken) is a
+       verbatim port of normalize.c:300..554; CC_KYWD / CC_X / CC_DOT
+       fall-throughs into the trailing IdChar / digit loops are
+       reconstructed inline since Pascal's case has no fall-through.
+       Wired via sqlite3NormalizeInit in shell openDb as the SQL
+       function `sqlite3_normalize(X)` (UTF-8, deterministic, innocuous)
+       — registration is a port convenience for differential testing;
+       the C source ships only the bare helper plus the optional
+       -DSQLITE_NORMALIZE_CLI standalone program.  Verified byte-
+       identical against the system `sqlite3` loading a
+       `usenorm.so` wrapper around upstream normalize.c on a 12-case
+       suite covering: comments + IN-list, IN-(SELECT)/IN-(WITH)
+       short-circuit, NULL-as-literal vs `IS NULL` / `NOT NULL`,
+       blob / float / hex / dot-prefixed numeric literals, $a / @b /
+       :c / ?1 variables, [bracket] and "double-quoted" identifiers,
+       single-arg IN, and the all-comment edge case.  TestExplainParity
+       1026/1026.
+
+  [X] **10.1.73** ext/misc/decimal.c (952 C lines) ported as new unit
+       `passqlite3decimal.pas` (~720 lines).  Provides arbitrary-precision
+       decimal arithmetic backed by a `signed char[]` digit string with
+       integer/frac split: decimal(X) / decimal(X,N) (exact text form),
+       decimal_exp(X) / decimal_exp(X,N) (`%+#e` style), decimal_cmp(X,Y),
+       decimal_add(X,Y), decimal_sub(X,Y), decimal_mul(X,Y), decimal_pow2(N),
+       decimal_sum(Y) aggregate/window function, plus the `decimal`
+       collation.  All goto-fault chains in decimalNewFromText / decimal_new
+       / decimalPow2 / decimalMul restructured to early-return cleanup
+       blocks.  IEEE754 conversion in decimalFromDouble preserves the C
+       `memcpy(&a,&r,sizeof(a))` type-pun via FPC's `Move`.  The
+       `e%+03d` formatter is hand-rolled because sqlite3_snprintf has no
+       Pascal cdecl entry that accepts varargs.  Wired via
+       `sqlite3DecimalInit(p^.db)` in shell openDb.  Verified
+       byte-identical against `.load /tmp/decimal.so`: decimal('0.1')+0.2
+       = 0.3 exactly, decimal(1.0/3.0) returns the full 54-digit
+       expansion, decimal_sum across 5 mixed values, COLLATE decimal
+       sort, and decimal_pow2(10)='+1.024e+03' / decimal_pow2(-3)=
+       '+1.25e-01' all match.  TestExplainParity 1026/1026.
+
+  [X] **10.1.71** ext/misc/series.c (937 C lines) ported as new unit
+       `passqlite3series.pas` (~627 lines).  Provides the
+       eponymous `generate_series(start[, stop[, step]])` virtual
+       table covering the full series.c xConnect/xDisconnect/xOpen/
+       xClose/xNext/xColumn/xRowid/xEof/xFilter/xBestIndex surface,
+       the SERIES_BIT_* idxNum bitmask plan encoding (BOTH/START/
+       STOP/STEP/REVERSE/LIMIT/OFFSET), and the wrap-tolerant
+       u64-arithmetic span64 / add64 / sub64 helpers (gated by a
+       local `{$Q-}{$R-}` block so FPC's overflow checks never see
+       the deliberate 2^63 wrap from series.c:155..164).  Wired via
+       sqlite3SeriesInit in shell openDb.  Same caveat as 10.1.69
+       wholenumber: WhereBegin's vtab xBestIndex pushdown is not yet
+       wired (codegen.pas:13938 / 28163), so a bare
+       `SELECT … FROM generate_series(1,5)` ignores the inline
+       constraint args and walks the unbounded default range
+       (0..2^32-1, step=1).  The module itself is faithful end-to-
+       end; once the pushdown lands the args flow through.
+       TestExplainParity 1026/1026 (no regression).
+
+- [X] **6.15** TestExplainParity regression — resolved 2026-05-07 on
+    clean rebuild of a4.  Re-ran TestExplainParity from a fresh `build.sh`
+    (after the 10.1.93 tmstmpvfs port landed) and got 1026 pass / 0
+    diverge / 0 error.  No code change was required; the prior
+    "224/802 reopen" symptom did not reproduce on this rebuild.  Likely
+    a stale-binary or partial-build artefact rather than a genuine code
+    regression.  Closing — re-open if it returns on a fresh build.
 
 - [X] **8.x.colneed** sqlite3_collation_needed callback now fires.
   Closed 2026-05-06.  `sqlite3GetCollSeq` (codegen.pas:42193) was
@@ -1449,6 +2469,152 @@ existing dispatcher.
        (BE), toreal('  0.5  ')=NULL (trailing-space rejection).
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
+
+- [X] **10.1.bug.9** json_each / json_tree / jsonb_each / jsonb_tree
+  raised `no such table: json_each` because the eponymous-vtab arm in
+  `sqlite3LocateTable` (passqlite3codegen.pas:32271) only registered
+  `pragma_*` modules — the upstream `json*` arm
+  (build.c:436..440) was missing.  Fixed 2026-05-07: added the
+  `sqlite3_strnicmp(zName,'json',4)=0` arm to call
+  `sqlite3JsonVtabRegister` on demand.  After the fix the table
+  resolves and registers; row output (`SELECT … FROM json_each(?)`)
+  still depends on bug 6.13 (vtab xBestIndex pushdown not wired) so
+  the table-valued form yields 0 rows for now — same bucket as the
+  other eponymous-vtab modules with arg pushdown gated.  Verified:
+  TestExplainParity 1026/1026, TestJsonEach 50/50, no regressions
+  across DiagFeatureProbe / DiagOps / DiagDml / DiagPragma /
+  DiagFunctions / DiagTxn / DiagMisc / DiagCast / DiagDate /
+  DiagAnalyze / DiagSubsel / DiagInnerJoin.
+
+- [X] **10.1.bug.8** Fixed 2026-05-07.  Root cause was in
+  `sqlite3FindDb` (passqlite3codegen.pas) — it called
+  `sqlite3DbStrNDup` directly without dequoting, so token `"main"`
+  became the literal name `"main"` (with quotes) and never matched
+  the bare `main` schema.  The C reference (build.c:951) routes through
+  `sqlite3NameFromToken`, which dequotes.  Fix: dup + sqlite3Dequote
+  inline (parser unit not visible from codegen).  Companion fix in
+  `sqlite3TwoPartName` — the `unknown database` error message used
+  `AnsiString(pName1^.z)` (walks past the token to the next NUL,
+  bleeding the rest of the SQL into the message); replaced with a
+  SetString bounded by `pName1^.n`.  Spellfix1 shadow-table DDL
+  workaround in passqlite3spellfix.pas reverted to upstream's
+  quoted `"%w"."%w_vocab"` form.  Verified: `CREATE TABLE
+  "main"."t"(x)` / `CREATE INDEX "main"."ix" ON t(x)` /
+  `INSERT INTO "main"."t" VALUES(42)` / `SELECT * FROM "main"."t"`
+  all work; bad name `"nope"."y"` errors with the bounded message
+  `Parse error: unknown database "nope"`; spellfix1 vtab still
+  registers cleanly.  TestExplainParity 1026/1026; TestSmoke PASSED.
+
+- [X] **10.1.bug.7** Fixed-point float printf / round rounded the wrong
+  direction for binary halfway literals.  Closed 2026-05-07.  Two
+  independent fixes:
+  (1) **SQL `printf()` was bypassing sqlite3FormatStr.**  `printfFunc` in
+  passqlite3codegen.pas hand-rolled `%f / %e / %g` via SysUtils
+  `FloatToStrF`, which uses FPC's own decimal renderer with a different
+  halfway rule than C's `sqlite3FpDecode`.  Replaced FmtFloat to build a
+  canonical sqlite3 format string (`%[flags][width][.prec][spec]`) and
+  delegate to `sqlite3FormatStr`, which already drives the correctly-
+  rounded printf core (passqlite3printf fpDecode / fp2Convert10).  The
+  underlying decimal pipeline was already byte-identical to C.
+  (2) **`sqlite3AtoF` used inexact `pow(10, d)`.**  After the printf fix
+  the literal `1.65` still parsed to 1.65000000000000013 (Pas) vs
+  1.64999999999999991 (C) because the Pascal sqlite3AtoF computed
+  `s * libc_pow(10.0, d)`, which double-rounds via an inexact pow().
+  Replaced with a tiny `atofViaStrtod(s, d)` helper that renders
+  `<s>e<d>` and calls libc `strtod` (C99 requires correctly-rounded
+  IEEE-754 nearest-even result) — same answer as upstream's
+  sqlite3Fp10Convert2 over the parser's u64-mantissa range.
+  (3) **`roundFunc` did `Trunc(r*factor+0.5)/factor`.**  After (2),
+  parsed values were correct but the multiply step still introduced FP
+  rounding error (e.g. 1.6499999... * 10 rounds to exactly 16.5).
+  Mirrored func.c:464..470 instead: format `%!.*f` then re-parse via
+  sqlite3AtoF.
+  Verified: `printf('%.1f', 1.45/1.65/1.95)`, `printf('%.2f', 2.675)`,
+  `printf('%!.20g', 1.65)`, `round(1.15,1)..round(2.675,2)` all
+  byte-identical to system sqlite3.  TestExplainParity 1026/1026;
+  TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+  TestWhereBasic 52/52 / TestVdbeAgg 11/11 / DiagFeatureProbe / DiagOps
+  / DiagDml / DiagPragma / DiagFunctions / DiagMoreFunc / DiagTxn /
+  DiagMisc / DiagCast / DiagDate / DiagAnalyze / DiagSampleProg all
+  clean.
+
+- [X] **10.1.bug.5** RETURNING clause silently dropped — INSERT / UPDATE /
+  DELETE ... RETURNING produced no result rows because
+  `sqlite3AddReturning` (codegen.pas) was a stub that just freed the
+  expression list.  Closed 2026-05-07.  Fix has two parts:
+  (1) Ported `sqlite3AddReturning` from build.c:1439 — sets
+  PARSEFLAG_BReturning, allocates the Returning struct, builds the
+  transient `sqlite_returning_<ptr>` AFTER trigger (op=TK_RETURNING,
+  bReturning=1, pSchema/pTabSchema=temp), wires retTStep, and inserts
+  the trigger into the temp-schema trigHash so `sqlite3TriggerList`
+  injects it for the active DML target.  Companion ParserAddCleanup
+  callback `sqlite3DeleteReturning` removes the trigger from the hash
+  and frees the expression list.
+  (2) Added `resolveBareIdToTrigger` in `sqlite3ResolveExprNames` for
+  the NC_UBaseReg arm — bare TK_ID column refs in the RETURNING list
+  rewrite to TK_REGISTER (op2=TK_COLUMN) with iTable computed as
+  `iBaseReg + (nCol+1)*iTable + col + 1` (iTable=0 for DELETE/OLD,
+  iTable=1 for INSERT/UPDATE/NEW), mirroring resolve.c:591..596.
+  Verified byte-identical to system sqlite3 for INSERT...RETURNING *,
+  multi-row VALUES, RETURNING expressions/aliases (`x*10 AS x10`),
+  rowid in RETURNING, UPDATE...RETURNING (single row), DELETE single-
+  row...RETURNING.  Multi-row DELETE...RETURNING currently hangs in
+  the rowset-buffered path; tracked separately as bug 10.1.bug.6 below
+  (predates this fix — exposed by it because the same path activates
+  whenever any AFTER trigger is attached to the table).
+  TestExplainParity 1026/1026; TestSmoke PASSED; DiagFeatureProbe /
+  DiagOps / DiagDml / DiagPragma / DiagFunctions / DiagTxn / DiagMisc /
+  DiagCast / DiagDate / DiagAnalyze / DiagDropTable all clean.
+
+- [X] **10.1.bug.6** Multi-row DELETE with AFTER trigger hang — fixed
+  2026-05-07.  Root cause: the rowset implementation in passqlite3vdbe.pas
+  diverged from rowset.c.  `sqlite3RowSetNext` had been routing through a
+  hand-rolled rowSetSort/rowSetTreeToList path that confused tree pRight
+  with forest-list pRight, corrupting the linked list and producing a
+  cyclic chain.  `rowSetTreeToList` itself was buggy (used the outer
+  ppLast as a temporary instead of a local pointer; passed the same
+  pointer for ppFirst and ppLast on the right recursion instead of
+  &pIn->pRight).  `rowSetEntryMerge` did not drop duplicates.  Fix:
+  ported `rowSetEntrySort` (40-bucket merge sort) from rowset.c:271..297;
+  rewrote `sqlite3RowSetNext` as a flag-driven sort+pop on pEntry
+  (matches rowset.c:408..432 byte-for-byte); fixed `rowSetTreeToList` to
+  pass &pIn->pRight on the right branch and a local on the left;
+  rewrote `rowSetEntryMerge` to drop duplicates per rowset.c:236..267;
+  rewrote `sqlite3RowSetTest` to mirror rowset.c:442..505 exactly
+  (sort current pEntry into pForest as a new tree on each batch
+  change, then BST-search every forest tree).  Set initial
+  `rsFlags := ROWSET_SORTED` in alloc/clear.  Sqlite3RowSetInsert now
+  clears ROWSET_SORTED when a new rowid is <= pLast.  Verified: the
+  reproducer (multi-row DELETE+AFTER trigger with RETURNING) now
+  terminates correctly; multi-row INSERT/UPDATE/DELETE...RETURNING all
+  emit the right rows; TestExplainParity 1026/1026; TestSmoke PASSED;
+  TestDMLBasic 54/54; TestVdbeAgg 11/11; TestSelectBasic 60/60;
+  TestWhereBasic 52/52; DiagOps / DiagDml / DiagFeatureProbe / DiagPragma
+  / DiagTxn / DiagFunctions / DiagMisc / DiagCast all clean.
+
+- [X] **10.1.bug.4** Scalar PRAGMAs (`page_count`, `max_page_count`,
+  `page_size`, `cache_size`, `synchronous`, `temp_store`, etc.)
+  returned blank rows because `sqlite3Pragma` never called
+  `setPragmaResultColumnNames` (pragma.c:526..531).  Without the
+  per-statement column-metadata setup, `pVdbe^.nResColumn` stayed at 0
+  so `sqlite3_column_count` reported 0 columns and the shell rendered
+  every PRAGMA result as an empty line.  Closed 2026-05-07: ported
+  `setPragmaResultColumnNames` inline at the top of `sqlite3Pragma`
+  (passqlite3codegen.pas:41091) — calls `sqlite3VdbeSetNumCols(v,1)` +
+  `SetColName(...,pPragma->zName)` for nPragCName=0 entries, walks
+  `cPragName[iPragCName..+nPragCName]` for table-valued ones; honours
+  the `PragFlg_NoColumns` / `PragFlg_NoColumns1+zRight` skip rule.
+  Companion fix: `page_count` and `max_page_count` arms now call
+  `sqlite3CodeVerifySchema` (matches pragma.c:666) so the OP_Transaction
+  prologue runs and the btree's `nPage` is loaded from the file header.
+  Removed the `SELECT count(*) FROM sqlite_dbpage` workarounds in
+  `cmdDbtotxt` (passqlite3shell.pas) and `dbdataDbsize`
+  (passqlite3dbdata.pas).  Verified byte-identical to system sqlite3:
+  `PRAGMA page_count` on a 2-page db = 2, `PRAGMA max_page_count` =
+  4294967294, `PRAGMA page_size` = 4096, `.dbtotxt` and
+  `SELECT … FROM sqlite_dbdata` both work end-to-end.  TestExplainParity
+  1026/1026; DiagPragma / DiagOps / DiagDml / DiagFeatureProbe /
+  DiagFunctions / DiagTxn / DiagMisc / DiagCast all clean.
 
 - [X] **10.1.bug.3** Multi-statement command-line input dropped /
   corrupted statements past the 2nd or 3rd boundary.  Root cause was

@@ -104,6 +104,7 @@ type
     xShutdown: procedure(pAppData: Pointer); cdecl;
     pAppData:  Pointer;
   end;
+  PTsqlite3_mem_methods = ^Tsqlite3_mem_methods;
 
   { sqlite3_mutex_methods — mutex function table }
   Tsqlite3_mutex_methods = record
@@ -124,8 +125,11 @@ type
   ============================================================ }
 
 const
-  SQLITE_CONFIG_PAGECACHE = 7;   { sqlite3_config(SQLITE_CONFIG_PAGECACHE, pBuf, sz, N) }
-  SQLITE_CONFIG_PCACHE2   = 14;  { sqlite3_config(SQLITE_CONFIG_PCACHE2, &methods2) }
+  SQLITE_CONFIG_MALLOC     = 4;
+  SQLITE_CONFIG_GETMALLOC  = 5;
+  SQLITE_CONFIG_PAGECACHE  = 7;   { sqlite3_config(SQLITE_CONFIG_PAGECACHE, pBuf, sz, N) }
+  SQLITE_CONFIG_PCACHE2    = 14;  { sqlite3_config(SQLITE_CONFIG_PCACHE2, &methods2) }
+  SQLITE_CONFIG_GETPCACHE2 = 19;
 
 type
   Psqlite3_pcache_page = ^sqlite3_pcache_page;
@@ -819,6 +823,7 @@ function libc_vasprintf(out strp: PChar; fmt: PChar; ap: Pointer): i32; external
 function libc_vsnprintf(str: PChar; size: csize_t; fmt: PChar; ap: Pointer): i32; external 'c' name 'vsnprintf';
 function libc_snprintf_uri(str: PChar; size: csize_t; fmt: PChar): i32; cdecl; varargs; external 'c' name 'snprintf';
 function libc_pow(base, exp: Double): Double; external 'c' name 'pow';
+function libc_strtod(nptr: PAnsiChar; endptr: PPAnsiChar): Double; external 'c' name 'strtod';
 
 { ============================================================
   Global variable initialisations (from global.c)
@@ -1103,6 +1108,51 @@ begin
   Result := h;
 end;
 
+{ Convert s * 10^d to a correctly-rounded IEEE-754 double via libc strtod.
+  C99 requires strtod's rounding to match the platform's nearest-even mode,
+  which yields the same answer as upstream's sqlite3Fp10Convert2 for every
+  input the parser produces (s fits in u64, |d| < 1e4). }
+function atofViaStrtod(s: u64; d: i32): Double;
+var
+  buf: array[0..63] of AnsiChar;
+  i, j: i32;
+  digits: array[0..23] of AnsiChar;
+  nd: i32;
+  esign: AnsiChar;
+  expVal, k: i32;
+begin
+  { Render s as decimal digits into `digits[]` right-aligned. }
+  if s = 0 then begin
+    digits[0] := '0'; nd := 1;
+  end else begin
+    nd := 0;
+    while s > 0 do begin
+      digits[nd] := AnsiChar(Byte((s mod 10) + Ord('0')));
+      s := s div 10;
+      Inc(nd);
+    end;
+  end;
+  i := 0;
+  for j := nd - 1 downto 0 do begin buf[i] := digits[j]; Inc(i); end;
+  buf[i] := 'e'; Inc(i);
+  if d < 0 then begin esign := '-'; expVal := -d end
+  else            begin esign := '+'; expVal := d end;
+  buf[i] := esign; Inc(i);
+  if expVal = 0 then begin buf[i] := '0'; Inc(i); end
+  else begin
+    j := i;
+    k := 0;
+    while expVal > 0 do begin
+      digits[k] := AnsiChar(Byte((expVal mod 10) + Ord('0')));
+      expVal := expVal div 10;
+      Inc(k);
+    end;
+    while k > 0 do begin Dec(k); buf[i] := digits[k]; Inc(i); end;
+  end;
+  buf[i] := #0;
+  Result := libc_strtod(@buf[0], nil);
+end;
+
 { sqlite3AtoF — faithful port of util.c:866.
   Returns the parse state flags; *pResult receives the double value. }
 function sqlite3AtoF(zIn: PChar; out pResult: Double): i32;
@@ -1203,12 +1253,16 @@ after_integer:
       Dec(z);
   end;
 
-  { convert s * 10^d to double }
+  { convert s * 10^d to double via strtod, which is required by C99 to
+    return the correctly-rounded IEEE-754 nearest double.  Mirrors C's
+    sqlite3Fp10Convert2(s,d) byte-for-byte over the input range we care
+    about; replaces the prior `s * pow(10.0, d)` path that double-rounded
+    via inexact pow() (bug 10.1.bug.7). }
   if s = 0 then begin
     pResult := 0.0;
     mState := mState or 4;
   end else begin
-    pResult := s * libc_pow(10.0, d);
+    pResult := atofViaStrtod(s, d);
   end;
   if neg <> 0 then pResult := -pResult;
 
@@ -2191,9 +2245,18 @@ function sqlite3_config(op: i32; pArg: Pointer): i32; overload;
 begin
   Result := SQLITE_OK;
   case op of
-    SQLITE_CONFIG_PCACHE2:
+    SQLITE_CONFIG_MALLOC:        { 4 }
+      if pArg <> nil then
+        sqlite3GlobalConfig.m := PTsqlite3_mem_methods(pArg)^;
+    SQLITE_CONFIG_GETMALLOC:     { 5 }
+      if pArg <> nil then
+        PTsqlite3_mem_methods(pArg)^ := sqlite3GlobalConfig.m;
+    SQLITE_CONFIG_PCACHE2:       { 14 }
       if pArg <> nil then
         sqlite3GlobalConfig.pcache2 := PTsqlite3_pcache_methods2(pArg)^;
+    SQLITE_CONFIG_GETPCACHE2:    { 19 }
+      if pArg <> nil then
+        PTsqlite3_pcache_methods2(pArg)^ := sqlite3GlobalConfig.pcache2;
     { All other ops silently accepted for now }
   end;
 end;
@@ -2376,13 +2439,30 @@ begin
   Result := sqlite3_malloc64(n);
 end;
 
+{ Port of malloc.c:586 sqlite3DbFreeNN.  When db^.pnBytesFreed is set,
+  callers (sqlite3_stmt_status MEMUSED dry-run, db_status SCHEMA_USED /
+  STMT_USED, sqlite3LeaveMutexAndCloseZombie tear-down) want a "what
+  size would this free?" accounting pass without actually releasing
+  memory.  Mirror the C semantics: accumulate sqlite3MallocSize into
+  the counter and return without calling sqlite3_free. }
 procedure sqlite3DbFree(db: Psqlite3db; p: Pointer);
 begin
+  if p = nil then Exit;
+  if (db <> nil) and (PTsqlite3(db)^.pnBytesFreed <> nil) then
+  begin
+    Inc(PTsqlite3(db)^.pnBytesFreed^, sqlite3MallocSize(p));
+    Exit;
+  end;
   sqlite3_free(p);
 end;
 
 procedure sqlite3DbFreeNN(db: Psqlite3db; p: Pointer);
 begin
+  if (db <> nil) and (PTsqlite3(db)^.pnBytesFreed <> nil) then
+  begin
+    Inc(PTsqlite3(db)^.pnBytesFreed^, sqlite3MallocSize(p));
+    Exit;
+  end;
   sqlite3_free(p);
 end;
 

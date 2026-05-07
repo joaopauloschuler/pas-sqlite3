@@ -49,6 +49,7 @@ uses
   termio,
   passqlite3types,
   passqlite3util,
+  passqlite3printf,
   passqlite3os,
   passqlite3pcache,
   passqlite3pager,
@@ -86,6 +87,38 @@ uses
   passqlite3mmapwarm,
   passqlite3prefixes,
   passqlite3memstat,
+  passqlite3series,
+  passqlite3completion,
+  passqlite3decimal,
+  passqlite3normalize,
+  passqlite3regexp,
+  passqlite3stmt,
+  passqlite3explain,
+  passqlite3qpvtab,
+  passqlite3btreeinfo,
+  passqlite3vtablog,
+  passqlite3scrub,
+  passqlite3fossildelta,
+  passqlite3csv,
+  passqlite3closure,
+  passqlite3appendvfs,
+  passqlite3cksumvfs,
+  passqlite3vfslog,
+  passqlite3vfsstat,
+  passqlite3fileio,
+  passqlite3vtshim,
+  passqlite3unionvtab,
+  passqlite3fuzzer,
+  passqlite3tmstmpvfs,
+  passqlite3amatch,
+  passqlite3compress,
+  passqlite3sqlar,
+  passqlite3zipfile,
+  passqlite3spellfix,
+  passqlite3intck,
+  passqlite3dbdata,
+  passqlite3memtrace,
+  passqlite3pcachetrace,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -434,6 +467,8 @@ var
   zUserColSep:          AnsiString = '|';
   zUserRowSep:          AnsiString = #10;
   zUserNull:            AnsiString = '';
+  { 10.1.3 — backing AnsiString for state.zNonce when -nonce sets it. }
+  gNonceBacking:        AnsiString = '';
   { 10.1.36 — track .log destination filename for cmdShow / future logger
     plumbing.  '' / 'off' both mean disabled, 'stdout' / 'stderr' refer
     to the standard streams; any other value is a regular pathname. }
@@ -599,6 +634,119 @@ begin
     vtab from ext/misc/memstat.c. }
   sqlite3PrefixesInit(p^.db);
   sqlite3MemstatVtabInit(p^.db);
+  { Phase 10.1.71 — generate_series eponymous vtab from
+    ext/misc/series.c (937 C lines). }
+  sqlite3SeriesInit(p^.db);
+  { Phase 10.1.72 — completion eponymous vtab from
+    ext/misc/completion.c (522 C lines).  Powers SQL tab-completion
+    (KEYWORDS / DATABASES / TABLES / COLUMNS phases). }
+  sqlite3CompletionVtabInit(p^.db);
+  { Phase 10.1.73 — arbitrary-precision decimal arithmetic from
+    ext/misc/decimal.c (952 C lines): decimal / decimal_exp / decimal_cmp /
+    decimal_add / decimal_sub / decimal_mul / decimal_pow2 / decimal_sum
+    aggregate, plus the `decimal` collation. }
+  sqlite3DecimalInit(p^.db);
+  { Phase 10.1.74 — sqlite3_normalize() helper from ext/misc/normalize.c
+    (717 C lines).  Registered as a SQL function `sqlite3_normalize(X)`
+    for differential testing; the underlying public C-style helper is
+    also exported by passqlite3normalize. }
+  sqlite3NormalizeInit(p^.db);
+  { Phase 10.1.75 — regexp() / regexpi() SQL functions and the REGEXP
+    operator from ext/misc/regexp.c (928 C lines).  POSIX-extended
+    regular expressions over UTF-8 input via NFA matcher. }
+  sqlite3RegexpInit(p^.db);
+  { Phase 10.1.76 — sqlite_stmt eponymous vtab from ext/misc/stmt.c
+    (347 C lines): one row per still-open prepared statement on the
+    connection, with sql + the sqlite3_stmt_status() counter set. }
+  sqlite3StmtVtabInit(p^.db);
+  { Phase 10.1.76 — explain eponymous vtab from ext/misc/explain.c
+    (323 C lines): SELECT … FROM explain('SELECT …') yields the
+    bytecode rows of the inner statement (addr/opcode/p1..p5/comment). }
+  sqlite3ExplainVtabInit(p^.db);
+  { Phase 10.1.77 — qpvtab eponymous vtab from ext/misc/qpvtab.c
+    (462 C lines): debugging vtab whose rows describe how the query
+    planner called xBestIndex. }
+  sqlite3QpvtabInit(p^.db);
+  { Phase 10.1.78 — sqlite_btreeinfo eponymous vtab from
+    ext/misc/btreeinfo.c (434 C lines): one row per btree in the
+    file, with type/name/tbl_name/rootpage/sql plus estimated
+    nEntry/nPage/depth/szPage/hasRowid computed from sqlite_dbpage. }
+  sqlite3BinfoRegister(p^.db);
+  { Phase 10.1.80 — fossil delta encoder from ext/misc/fossildelta.c
+    (1109 C lines): delta_create / delta_apply / delta_output_size SQL
+    functions plus the delta_parse(D) eponymous table-valued function. }
+  sqlite3FossildeltaInit(p^.db);
+  { Phase 10.1.82 — csv virtual table from ext/misc/csv.c (977 C lines):
+    CREATE VIRTUAL TABLE temp.t USING csv(filename=…) reads RFC-4180 CSV
+    either from a file or from an inline data= string. }
+  sqlite3CsvInit(p^.db);
+  { Phase 10.1.83 — transitive_closure virtual table from
+    ext/misc/closure.c (971 C lines): CREATE VIRTUAL TABLE … USING
+    transitive_closure(tablename=…, idcolumn=…, parentcolumn=…) computes
+    the transitive closure of a parent/child relation in a real table. }
+  sqlite3ClosureInit(p^.db);
+  { Phase 10.1.84 — appendvfs VFS shim from ext/misc/appendvfs.c (672 C
+    lines): allows opening a SQLite database appended at the end of
+    another file (e.g. an executable) via `sqlite3_open_v2(..., "apndvfs")`. }
+  sqlite3AppendvfsInit(p^.db);
+  { Phase 10.1.90 — verify_checksum SQL function from
+    ext/misc/cksumvfs.c (847 C lines).  Registers only the SQL helper on
+    every connection; the cksmvfs shim itself is exported as
+    sqlite3_register_cksumvfs() but not auto-installed because making
+    cksmvfs the default VFS would intercept every open() and corrupt
+    sessions on databases without an 8-byte reserve. }
+  sqlite3CksumvfsInit(p^.db);
+  { Phase 10.1.86 — readfile / writefile / lsmode / realpath SQL functions
+    plus the fsdir() eponymous virtual table from ext/misc/fileio.c
+    (1234 C lines).  fsdir is the backing storage for `.archive` and
+    related shell features. }
+  sqlite3FileioInit(p^.db);
+  { Phase 10.1.87 — vfsstat eponymous virtual table from
+    ext/misc/vfsstat.c (825 C lines).  The first call also installs the
+    "vfslog"-named (sic — upstream zName typo) VFS shim that increments
+    the underlying counters; the vtab itself is registered per-db. }
+  sqlite3VfsstatInit(p^.db);
+  { vtablog (ext/misc/vtablog.c, 720 C lines) is exported but NOT
+    auto-installed — every callback writes a trace line to stdout, so
+    auto-registering would corrupt every shell session.  Loading it
+    explicitly via `SELECT load_extension('vtablog');` (when wired) or
+    a host program is up to the caller. }
+  { Phase 10.1.91 — unionvtab / swarmvtab from ext/misc/unionvtab.c
+    (1383 C lines): CREATE VIRTUAL TABLE temp.t USING unionvtab(<sql>)
+    presents many rowid tables behind one schema; swarmvtab opens
+    per-source db files on demand bounded by maxopen=N. }
+  sqlite3UnionvtabInit(p^.db);
+  { Phase 10.1.92 — fuzzer virtual table from ext/misc/fuzzer.c
+    (1192 C lines): CREATE VIRTUAL TABLE f USING fuzzer(<rule-table>)
+    generates variations on a query word at increasing edit distances
+    using costed character-rewrite rules. }
+  sqlite3FuzzerInit(p^.db);
+  { Phase 10.1.94 — approximate_match virtual table from
+    ext/misc/amatch.c (1502 C lines): CREATE VIRTUAL TABLE f USING
+    approximate_match(vocabulary_table=…, vocabulary_word=…,
+    edit_distances=…) yields strings from a finite vocabulary that
+    are nearly the same as a single user-supplied input string,
+    ranked by edit-distance under a costed character-rewrite ruleset. }
+  sqlite3AmatchInit(p^.db);
+  { Phase 10.1.95 — compress() / uncompress() (ext/misc/compress.c) and
+    sqlar_compress() / sqlar_uncompress() (ext/misc/sqlar.c).  Both back
+    onto libz; provide zlib-format payloads with an out-of-band original-
+    size frame (compress prepends a 1..5 byte varint, sqlar carries SZ
+    in its caller's row schema). }
+  sqlite3CompressInit(p^.db);
+  sqlite3SqlarInit(p^.db);
+  { Phase 10.1.98 — zipfile() vtab + aggregate from ext/misc/zipfile.c
+    (2293 C lines).  Reads/writes ZIP archives via libz inflate/deflate. }
+  sqlite3ZipfileInit(p^.db);
+  { Phase 10.1.99 — spellfix1_editdist / spellfix1_phonehash /
+    spellfix1_scriptcode scalar SQL functions from ext/misc/spellfix.c
+    (the editdist1 + phoneticHash + scriptCode subset; the spellfix1
+    virtual table and editdist3 family are not yet ported). }
+  sqlite3SpellfixInit(p^.db);
+  { Phase 10.1.97 — sqlite_dbdata / sqlite_dbptr eponymous virtual tables
+    from ext/recover/dbdata.c (1023 C lines).  Reads raw b-tree page bytes
+    via sqlite_dbpage; backing storage for the upcoming .recover dot-cmd. }
+  sqlite3DbdataRegister(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
@@ -3811,11 +3959,7 @@ begin
   end;
 
   pStmt := nil;
-  { Upstream uses `PRAGMA page_count` here.  In pas-sqlite3 that PRAGMA
-    currently returns no rows (port gap, tracked under Phase 6 PRAGMA
-    follow-up); fall back to counting sqlite_dbpage rows. }
-  rc := sqlite3_prepare_v2(p^.db,
-          'SELECT count(*) FROM sqlite_dbpage', -1, @pStmt, @pzTail);
+  rc := sqlite3_prepare_v2(p^.db, 'PRAGMA page_count', -1, @pStmt, @pzTail);
   if (rc <> SQLITE_OK) or (pStmt = nil) then begin
     if pStmt <> nil then sqlite3_finalize(pStmt);
     Exit;
@@ -5763,6 +5907,852 @@ begin
   importCleanup(sCtx);
 end;
 
+{ ----------------------------------------------------------------------
+  10.1.46  `.archive` / `.ar`  —  shell.c.in:6234..7005
+
+  Faithful port of the SQL-archive (sqlar) and ZIP-archive (zipfile)
+  manager.  Backed by ext/misc/sqlar.c (sqlar_compress/sqlar_uncompress
+  — already wired in openDb), ext/misc/fileio.c (lsmode, fsdir,
+  writefile, realpath — wired) and ext/misc/zipfile.c (zipfile vtab —
+  wired).
+
+  Sub-commands:
+    -c, --create   create new archive
+    -u, --update   add only changed files
+    -i, --insert   add files (always overwrite)
+    -t, --list     list contents
+    -x, --extract  extract files
+    -r, --remove   remove files
+
+  Switches:
+    -v, --verbose       chatty output
+    -f, --file FILE     archive file (defaults to current db)
+    -a, --append FILE   open as appendvfs
+    -C, --directory DIR base directory for create/extract
+    -n, --dryrun        print SQL but do not run
+    -g, --glob          treat names as GLOB patterns
+    -h, --help          help
+  ---------------------------------------------------------------------- }
+
+const
+  AR_CMD_CREATE       = 1;
+  AR_CMD_UPDATE       = 2;
+  AR_CMD_INSERT       = 3;
+  AR_CMD_EXTRACT      = 4;
+  AR_CMD_LIST         = 5;
+  AR_CMD_HELP         = 6;
+  AR_CMD_REMOVE       = 7;
+  AR_SWITCH_VERBOSE   = 8;
+  AR_SWITCH_FILE      = 9;
+  AR_SWITCH_DIRECTORY = 10;
+  AR_SWITCH_APPEND    = 11;
+  AR_SWITCH_DRYRUN    = 12;
+  AR_SWITCH_GLOB      = 13;
+
+type
+  PArCommand = ^TArCommand;
+  TArCommand = record
+    eCmd:        u8;
+    bVerbose:    u8;
+    bZip:        u8;
+    bDryRun:     u8;
+    bAppend:     u8;
+    bGlob:       u8;
+    fromCmdLine: u8;
+    nArg:        i32;
+    zSrcTable:   PAnsiChar;          { allocated via sqlite3_mprintf }
+    sFile:       AnsiString;         { backing for zFile }
+    sDir:        AnsiString;         { backing for zDir }
+    haveFile:    Boolean;
+    haveDir:     Boolean;
+    azArg:       array of AnsiString; { remaining positional args }
+    p:           PShellState;
+    db:          PTsqlite3;
+  end;
+
+  TArSwitch = record
+    zLong:   AnsiString;
+    cShort:  AnsiChar;
+    eSwitch: u8;
+    bArg:    u8;
+  end;
+
+const
+  ar_aSwitch: array[0..12] of TArSwitch = (
+    (zLong: 'create';    cShort: 'c'; eSwitch: AR_CMD_CREATE;       bArg: 0),
+    (zLong: 'extract';   cShort: 'x'; eSwitch: AR_CMD_EXTRACT;      bArg: 0),
+    (zLong: 'insert';    cShort: 'i'; eSwitch: AR_CMD_INSERT;       bArg: 0),
+    (zLong: 'list';      cShort: 't'; eSwitch: AR_CMD_LIST;         bArg: 0),
+    (zLong: 'remove';    cShort: 'r'; eSwitch: AR_CMD_REMOVE;       bArg: 0),
+    (zLong: 'update';    cShort: 'u'; eSwitch: AR_CMD_UPDATE;       bArg: 0),
+    (zLong: 'help';      cShort: 'h'; eSwitch: AR_CMD_HELP;         bArg: 0),
+    (zLong: 'verbose';   cShort: 'v'; eSwitch: AR_SWITCH_VERBOSE;   bArg: 0),
+    (zLong: 'file';      cShort: 'f'; eSwitch: AR_SWITCH_FILE;      bArg: 1),
+    (zLong: 'append';    cShort: 'a'; eSwitch: AR_SWITCH_APPEND;    bArg: 1),
+    (zLong: 'directory'; cShort: 'C'; eSwitch: AR_SWITCH_DIRECTORY; bArg: 1),
+    (zLong: 'dryrun';    cShort: 'n'; eSwitch: AR_SWITCH_DRYRUN;    bArg: 0),
+    (zLong: 'glob';      cShort: 'g'; eSwitch: AR_SWITCH_GLOB;      bArg: 0)
+  );
+
+function arUsage: i32; forward;
+function arErrorMsg(pAr: PArCommand; const z: AnsiString): i32; forward;
+
+function arUsage: i32;
+{ shell.c.in:6261 — invokes the help renderer for the "archive" pattern. }
+begin
+  showHelp('archive');
+  Result := SQLITE_ERROR;
+end;
+
+function arErrorMsg(pAr: PArCommand; const z: AnsiString): i32;
+{ shell.c.in:6270.  Print error and a usage hint. }
+begin
+  shellEPutZ('Error: ' + z + sLineBreak);
+  if pAr^.fromCmdLine <> 0 then
+    shellEPutZ('Use "-A" for more help'#10)
+  else
+    shellEPutZ('Use ".archive --help" for more help'#10);
+  Result := SQLITE_ERROR;
+end;
+
+function arProcessSwitch(pAr: PArCommand; eSwitch: u8;
+                         const zArg: AnsiString): i32;
+{ shell.c.in:6307 }
+begin
+  case eSwitch of
+    AR_CMD_CREATE, AR_CMD_EXTRACT, AR_CMD_LIST, AR_CMD_REMOVE,
+    AR_CMD_UPDATE, AR_CMD_INSERT, AR_CMD_HELP:
+      begin
+        if pAr^.eCmd <> 0 then begin
+          Result := arErrorMsg(pAr, 'multiple command options');
+          Exit;
+        end;
+        pAr^.eCmd := eSwitch;
+      end;
+    AR_SWITCH_DRYRUN:
+      pAr^.bDryRun := 1;
+    AR_SWITCH_GLOB:
+      pAr^.bGlob := 1;
+    AR_SWITCH_VERBOSE:
+      pAr^.bVerbose := 1;
+    AR_SWITCH_APPEND:
+      begin
+        pAr^.bAppend := 1;
+        pAr^.sFile := zArg;
+        pAr^.haveFile := True;
+      end;
+    AR_SWITCH_FILE:
+      begin
+        pAr^.sFile := zArg;
+        pAr^.haveFile := True;
+      end;
+    AR_SWITCH_DIRECTORY:
+      begin
+        pAr^.sDir := zArg;
+        pAr^.haveDir := True;
+      end;
+  end;
+  Result := SQLITE_OK;
+end;
+
+function arParseCommand(const args: array of AnsiString; nArg: SizeInt;
+                        pAr: PArCommand): i32;
+{ shell.c.in:6351.  Pascal `args[]` does NOT include the dot-cmd name —
+  arrange so that index 0 is implicit "archive" and the C `azArg[1..]`
+  is `args[0..]`. }
+var
+  i, k, n: SizeInt;
+  z, zArg: AnsiString;
+  pOpt, pMatch: SizeInt;
+  iArg: SizeInt;
+begin
+  if nArg <= 0 then begin
+    shellEPutZ('Wrong number of arguments.  Usage:'#10);
+    Result := arUsage;
+    Exit;
+  end;
+
+  z := args[0];
+  if (Length(z) = 0) or (z[1] <> '-') then begin
+    { Traditional [tar] invocation: "ctf foo bar" — treat each char of
+      args[0] as a short switch.  Switches with bArg consume the next
+      positional arg. }
+    iArg := 1;
+    for i := 1 to Length(z) do begin
+      pOpt := -1;
+      for k := 0 to High(ar_aSwitch) do
+        if z[i] = ar_aSwitch[k].cShort then begin pOpt := k; Break; end;
+      if pOpt < 0 then begin
+        Result := arErrorMsg(pAr, Format('unrecognized option: %s', [z[i]]));
+        Exit;
+      end;
+      zArg := '';
+      if ar_aSwitch[pOpt].bArg <> 0 then begin
+        if iArg >= nArg then begin
+          Result := arErrorMsg(pAr,
+            Format('option requires an argument: %s', [z[i]]));
+          Exit;
+        end;
+        zArg := args[iArg];
+        Inc(iArg);
+      end;
+      Result := arProcessSwitch(pAr, ar_aSwitch[pOpt].eSwitch, zArg);
+      if Result <> SQLITE_OK then Exit;
+    end;
+    pAr^.nArg := nArg - iArg;
+    if pAr^.nArg > 0 then begin
+      SetLength(pAr^.azArg, pAr^.nArg);
+      for i := 0 to pAr^.nArg - 1 do
+        pAr^.azArg[i] := args[iArg + i];
+    end;
+  end else begin
+    { Non-traditional invocation: each arg starting with '-'/'--' is a
+      switch.  First non-switch and everything after are positional. }
+    iArg := 0;
+    while iArg < nArg do begin
+      z := args[iArg];
+      if (Length(z) = 0) or (z[1] <> '-') then begin
+        SetLength(pAr^.azArg, nArg - iArg);
+        for i := 0 to (nArg - iArg) - 1 do
+          pAr^.azArg[i] := args[iArg + i];
+        pAr^.nArg := nArg - iArg;
+        Break;
+      end;
+      n := Length(z);
+      if (n >= 2) and (z[2] <> '-') then begin
+        { One or more short options: -ctf or -t alone }
+        i := 2;
+        while i <= n do begin
+          pOpt := -1;
+          for k := 0 to High(ar_aSwitch) do
+            if z[i] = ar_aSwitch[k].cShort then begin pOpt := k; Break; end;
+          if pOpt < 0 then begin
+            Result := arErrorMsg(pAr,
+              Format('unrecognized option: %s', [z[i]]));
+            Exit;
+          end;
+          zArg := '';
+          if ar_aSwitch[pOpt].bArg <> 0 then begin
+            if i < n then begin
+              zArg := Copy(z, i + 1, n - i);
+              i := n + 1;
+            end else begin
+              if iArg >= nArg - 1 then begin
+                Result := arErrorMsg(pAr,
+                  Format('option requires an argument: %s', [z[i]]));
+                Exit;
+              end;
+              Inc(iArg);
+              zArg := args[iArg];
+            end;
+          end;
+          Result := arProcessSwitch(pAr,
+            ar_aSwitch[pOpt].eSwitch, zArg);
+          if Result <> SQLITE_OK then Exit;
+          Inc(i);
+        end;
+      end else if (n = 2) and (z[2] = '-') then begin
+        { '--' marks end-of-options. }
+        if iArg + 1 < nArg then begin
+          SetLength(pAr^.azArg, nArg - iArg - 1);
+          for i := 0 to (nArg - iArg - 2) do
+            pAr^.azArg[i] := args[iArg + 1 + i];
+          pAr^.nArg := nArg - iArg - 1;
+        end;
+        Break;
+      end else begin
+        { Long option starting with '--'. }
+        zArg := '';
+        pMatch := -1;
+        for k := 0 to High(ar_aSwitch) do begin
+          if (n - 2) <= Length(ar_aSwitch[k].zLong) then begin
+            if Copy(z, 3, n - 2) =
+               Copy(ar_aSwitch[k].zLong, 1, n - 2) then
+            begin
+              if pMatch >= 0 then begin
+                Result := arErrorMsg(pAr,
+                  Format('ambiguous option: %s', [z]));
+                Exit;
+              end;
+              pMatch := k;
+            end;
+          end;
+        end;
+        if pMatch < 0 then begin
+          Result := arErrorMsg(pAr,
+            Format('unrecognized option: %s', [z]));
+          Exit;
+        end;
+        if ar_aSwitch[pMatch].bArg <> 0 then begin
+          if iArg >= nArg - 1 then begin
+            Result := arErrorMsg(pAr,
+              Format('option requires an argument: %s', [z]));
+            Exit;
+          end;
+          Inc(iArg);
+          zArg := args[iArg];
+        end;
+        Result := arProcessSwitch(pAr,
+          ar_aSwitch[pMatch].eSwitch, zArg);
+        if Result <> SQLITE_OK then Exit;
+      end;
+      Inc(iArg);
+    end;
+  end;
+
+  if pAr^.eCmd = 0 then begin
+    shellEPutZ('Required argument missing.  Usage:'#10);
+    Result := arUsage;
+    Exit;
+  end;
+  Result := SQLITE_OK;
+end;
+
+function arCheckEntries(pAr: PArCommand): i32;
+{ shell.c.in:6506 — verify each azArg[] member exists in the archive. }
+var
+  i, j, n: SizeInt;
+  pTest: PVdbe;
+  zSel, zSql: AnsiString;
+  z: AnsiString;
+  bOk: Boolean;
+  rc: i32;
+  zMprintf: PAnsiChar;
+begin
+  Result := SQLITE_OK;
+  if pAr^.nArg = 0 then Exit;
+  if pAr^.bGlob <> 0 then
+    zSel := 'SELECT name FROM %s WHERE glob($name,name)'
+  else
+    zSel := 'SELECT name FROM %s WHERE name=$name';
+  zMprintf := sqlite3PfMprintf(PAnsiChar(zSel),
+    [AnsiString(pAr^.zSrcTable)]);
+  if zMprintf = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  zSql := AnsiString(zMprintf);
+  sqlite3_free(zMprintf);
+
+  pTest := nil;
+  rc := sqlite3_prepare_v2(pAr^.db, PAnsiChar(zSql), -1, @pTest, nil);
+  if rc <> SQLITE_OK then begin
+    shellEPutZ(Format('Error: %s'#10,
+      [AnsiString(sqlite3_errmsg(pAr^.db))]));
+    if pTest <> nil then sqlite3_finalize(pTest);
+    Result := rc;
+    Exit;
+  end;
+  j := sqlite3_bind_parameter_index(pTest, '$name');
+
+  for i := 0 to pAr^.nArg - 1 do begin
+    z := pAr^.azArg[i];
+    n := Length(z);
+    while (n > 0) and (z[n] = '/') do Dec(n);
+    if n < Length(z) then SetLength(z, n);
+    pAr^.azArg[i] := z;
+    bOk := False;
+    sqlite3_bind_text(pTest, j, PAnsiChar(z), -1, SQLITE_STATIC);
+    if sqlite3_step(pTest) = SQLITE_ROW then bOk := True;
+    sqlite3_reset(pTest);
+    if not bOk then begin
+      shellEPutZ(Format('not found in archive: %s'#10, [z]));
+      Result := SQLITE_ERROR;
+      Break;
+    end;
+  end;
+  sqlite3_finalize(pTest);
+end;
+
+procedure arWhereClause(var rc: i32; pAr: PArCommand; out zWhere: AnsiString);
+{ shell.c.in:6546.  Build a WHERE clause matching pAr^.azArg[]. }
+var
+  z1, z2: PAnsiChar;
+  zSep1, zSep2: AnsiString;
+  i, n: SizeInt;
+  z: AnsiString;
+  zNew: PAnsiChar;
+begin
+  zWhere := '';
+  if rc <> SQLITE_OK then Exit;
+  if pAr^.nArg = 0 then begin
+    zWhere := '1';
+    Exit;
+  end;
+  if pAr^.bGlob <> 0 then
+    z1 := sqlite3PfMprintf(PAnsiChar(AnsiString('')), [])
+  else
+    z1 := sqlite3PfMprintf(PAnsiChar(AnsiString('name IN(')), []);
+  z2 := sqlite3PfMprintf(PAnsiChar(AnsiString('')), []);
+  zSep1 := '';
+  zSep2 := '';
+  for i := 0 to pAr^.nArg - 1 do begin
+    if (z1 = nil) or (z2 = nil) then Break;
+    z := pAr^.azArg[i];
+    n := Length(z);
+    if pAr^.bGlob <> 0 then begin
+      zNew := sqlite3PfMprintf(PAnsiChar('%z%sname GLOB ''%q'''),
+        [AnsiString(z1), zSep2, z]);
+      z1 := zNew;
+      zNew := sqlite3PfMprintf(
+        PAnsiChar('%z%ssubstr(name,1,%d) GLOB ''%q/'''),
+        [AnsiString(z2), zSep2, n + 1, z]);
+      z2 := zNew;
+    end else begin
+      zNew := sqlite3PfMprintf(PAnsiChar('%z%s''%q'''),
+        [AnsiString(z1), zSep1, z]);
+      z1 := zNew;
+      zNew := sqlite3PfMprintf(
+        PAnsiChar('%z%ssubstr(name,1,%d) = ''%q/'''),
+        [AnsiString(z2), zSep2, n + 1, z]);
+      z2 := zNew;
+    end;
+    zSep1 := ', ';
+    zSep2 := ' OR ';
+  end;
+  if (z1 = nil) or (z2 = nil) then begin
+    rc := SQLITE_NOMEM;
+  end else begin
+    if pAr^.bGlob = 0 then
+      zNew := sqlite3PfMprintf(
+        PAnsiChar('(%s) OR (name GLOB ''*/*'' AND (%s)) '),
+        [AnsiString(z1), AnsiString(z2)])
+    else
+      zNew := sqlite3PfMprintf(
+        PAnsiChar('(%s OR (name GLOB ''*/*'' AND (%s))) '),
+        [AnsiString(z1), AnsiString(z2)]);
+    if zNew = nil then begin
+      rc := SQLITE_NOMEM;
+    end else begin
+      { Match upstream wrapping: see shell.c.in:6581 — the bare-name
+        branch closes the IN(..) inside the prefix and the wrap is
+        "(<z1>) OR ..." while the glob branch wraps "(<z1> OR ...)".
+        We've folded the close-paren into the prefix branches above. }
+      zWhere := AnsiString(zNew);
+      sqlite3_free(zNew);
+    end;
+  end;
+  if z1 <> nil then sqlite3_free(z1);
+  if z2 <> nil then sqlite3_free(z2);
+end;
+
+function arListCommand(pAr: PArCommand): i32;
+{ shell.c.in:6595 }
+const
+  azCols: array[0..1] of AnsiString = (
+    'name',
+    'lsmode(mode), sz, datetime(mtime, ''unixepoch''), name'
+  );
+var
+  zWhere, zSql: AnsiString;
+  pSql: PVdbe;
+  rc: i32;
+  z: PAnsiChar;
+begin
+  rc := arCheckEntries(pAr);
+  arWhereClause(rc, pAr, zWhere);
+
+  pSql := nil;
+  if rc = SQLITE_OK then begin
+    z := sqlite3PfMprintf(PAnsiChar('SELECT %s FROM %s WHERE %s'),
+      [azCols[Ord(pAr^.bVerbose <> 0)], AnsiString(pAr^.zSrcTable), zWhere]);
+    if z = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    zSql := AnsiString(z);
+    sqlite3_free(z);
+    rc := sqlite3_prepare_v2(pAr^.db, PAnsiChar(zSql), -1, @pSql, nil);
+    if rc <> SQLITE_OK then
+      shellEPutZ(Format('Error: %s'#10,
+        [AnsiString(sqlite3_errmsg(pAr^.db))]));
+  end;
+  if (rc = SQLITE_OK) and (pAr^.bDryRun <> 0) then begin
+    shellSPutZ(Format('%s'#10, [AnsiString(sqlite3_sql(pSql))]));
+  end else if rc = SQLITE_OK then begin
+    while (rc = SQLITE_OK) and (sqlite3_step(pSql) = SQLITE_ROW) do begin
+      if pAr^.bVerbose <> 0 then begin
+        shellSPutZ(Format('%s %10d  %s  %s'#10,
+          [AnsiString(sqlite3_column_text(pSql, 0)),
+           sqlite3_column_int(pSql, 1),
+           AnsiString(sqlite3_column_text(pSql, 2)),
+           AnsiString(sqlite3_column_text(pSql, 3))]));
+      end else begin
+        shellSPutZ(Format('%s'#10,
+          [AnsiString(sqlite3_column_text(pSql, 0))]));
+      end;
+    end;
+  end;
+  if pSql <> nil then sqlite3_finalize(pSql);
+  Result := rc;
+end;
+
+function arRemoveCommand(pAr: PArCommand): i32;
+{ shell.c.in:6632 }
+var
+  rc: i32;
+  zWhere, zSql: AnsiString;
+  zErr: PAnsiChar;
+  z: PAnsiChar;
+begin
+  rc := SQLITE_OK;
+  zWhere := '';
+  if pAr^.nArg > 0 then begin
+    rc := arCheckEntries(pAr);
+    arWhereClause(rc, pAr, zWhere);
+  end;
+  if rc = SQLITE_OK then begin
+    z := sqlite3PfMprintf(PAnsiChar('DELETE FROM %s WHERE %s;'),
+      [AnsiString(pAr^.zSrcTable), zWhere]);
+    if z = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    zSql := AnsiString(z);
+    sqlite3_free(z);
+    if pAr^.bDryRun <> 0 then begin
+      shellSPutZ(zSql + sLineBreak);
+    end else begin
+      zErr := nil;
+      rc := sqlite3_exec(pAr^.db, 'SAVEPOINT ar;', nil, nil, nil);
+      if rc = SQLITE_OK then begin
+        rc := sqlite3_exec(pAr^.db, PAnsiChar(zSql), nil, nil, @zErr);
+        if rc <> SQLITE_OK then
+          sqlite3_exec(pAr^.db, 'ROLLBACK TO ar; RELEASE ar;', nil, nil, nil)
+        else
+          rc := sqlite3_exec(pAr^.db, 'RELEASE ar;', nil, nil, nil);
+      end;
+      if zErr <> nil then begin
+        shellSPutZ(Format('ERROR: %s'#10, [AnsiString(zErr)]));
+        sqlite3_free(zErr);
+      end;
+    end;
+  end;
+  Result := rc;
+end;
+
+function arExtractCommand(pAr: PArCommand): i32;
+{ shell.c.in:6673 }
+const
+  zSql1 =
+    'WITH dest(dpath,dlen) AS (SELECT realpath($dir),length(realpath($dir)))'#10 +
+    'SELECT ($dir || name),'#10 +
+    '       CASE WHEN $dryrun THEN 0'#10 +
+    '            ELSE writefile($dir||name, %s, mode, mtime) END'#10 +
+    '  FROM dest CROSS JOIN %s'#10 +
+    ' WHERE (%s)'#10 +
+    '   AND (data IS NULL OR $pass==0)'#10 +
+    '   AND dpath=substr(realpath($dir||name),1,dlen)'#10 +
+    '   AND name NOT GLOB ''*..[/\]*'''#10;
+  azExtraArg: array[0..1] of AnsiString = (
+    'sqlar_uncompress(data, sz)',
+    'data'
+  );
+var
+  pSql: PVdbe;
+  rc: i32;
+  zDir, zWhere, zSql: AnsiString;
+  i, j: SizeInt;
+  z: PAnsiChar;
+begin
+  pSql := nil;
+  rc := arCheckEntries(pAr);
+  arWhereClause(rc, pAr, zWhere);
+
+  if rc = SQLITE_OK then begin
+    if pAr^.haveDir then zDir := pAr^.sDir + '/' else zDir := '';
+    z := sqlite3PfMprintf(PAnsiChar(AnsiString(zSql1)),
+      [azExtraArg[pAr^.bZip], AnsiString(pAr^.zSrcTable), zWhere]);
+    if z = nil then begin Result := SQLITE_NOMEM; Exit; end;
+    zSql := AnsiString(z);
+    sqlite3_free(z);
+    rc := sqlite3_prepare_v2(pAr^.db, PAnsiChar(zSql), -1, @pSql, nil);
+    if rc <> SQLITE_OK then
+      shellEPutZ(Format('Error: %s'#10,
+        [AnsiString(sqlite3_errmsg(pAr^.db))]));
+  end;
+
+  if rc = SQLITE_OK then begin
+    j := sqlite3_bind_parameter_index(pSql, '$dir');
+    sqlite3_bind_text(pSql, j, PAnsiChar(zDir), -1, SQLITE_STATIC);
+    j := sqlite3_bind_parameter_index(pSql, '$dryrun');
+    sqlite3_bind_int(pSql, j, pAr^.bDryRun);
+
+    { Two passes: writefile() all, then re-touch directories so their
+      mtimes match the archive (first pass mutates them while extracting
+      contained files). }
+    for i := 0 to 1 do begin
+      j := sqlite3_bind_parameter_index(pSql, '$pass');
+      sqlite3_bind_int(pSql, j, i);
+      if pAr^.bDryRun <> 0 then begin
+        shellSPutZ(Format('%s'#10, [AnsiString(sqlite3_sql(pSql))]));
+        if pAr^.bVerbose = 0 then Break;
+      end;
+      while (rc = SQLITE_OK) and (sqlite3_step(pSql) = SQLITE_ROW) do begin
+        if (i = 0) and (pAr^.bVerbose <> 0) then
+          shellSPutZ(Format('%s'#10,
+            [AnsiString(sqlite3_column_text(pSql, 0))]));
+      end;
+      if pAr^.bDryRun <> 0 then Break;
+      sqlite3_reset(pSql);
+    end;
+  end;
+  if pSql <> nil then sqlite3_finalize(pSql);
+  Result := rc;
+end;
+
+function arExecSql(pAr: PArCommand; const zSql: AnsiString): i32;
+{ shell.c.in:6753 }
+var
+  zErr: PAnsiChar;
+  rc: i32;
+begin
+  if pAr^.bDryRun <> 0 then begin
+    shellSPutZ(zSql + sLineBreak);
+    Result := SQLITE_OK;
+  end else begin
+    zErr := nil;
+    rc := sqlite3_exec(pAr^.db, PAnsiChar(zSql), nil, nil, @zErr);
+    if zErr <> nil then begin
+      shellSPutZ(Format('ERROR: %s'#10, [AnsiString(zErr)]));
+      sqlite3_free(zErr);
+    end;
+    Result := rc;
+  end;
+end;
+
+function arCreateOrUpdateCommand(pAr: PArCommand;
+                                 bUpdate, bOnlyIfChanged: i32): i32;
+label end_ar_transaction;
+{ shell.c.in:6788 — create / insert / update (sqlar or zip targets). }
+const
+  zCreate =
+    'CREATE TABLE IF NOT EXISTS sqlar('#10 +
+    '  name TEXT PRIMARY KEY,'#10 +
+    '  mode INT,'#10 +
+    '  mtime INT,'#10 +
+    '  sz INT,'#10 +
+    '  data BLOB'#10 +
+    ')';
+  zDrop = 'DROP TABLE IF EXISTS sqlar';
+  zInsertSqlar =
+    'REPLACE INTO %s(name,mode,mtime,sz,data)'#10 +
+    '  SELECT'#10 +
+    '    %s,'#10 +
+    '    mode,'#10 +
+    '    mtime,'#10 +
+    '    CASE substr(lsmode(mode),1,1)'#10 +
+    '      WHEN ''-'' THEN length(data)'#10 +
+    '      WHEN ''d'' THEN 0'#10 +
+    '      ELSE -1 END,'#10 +
+    '    sqlar_compress(data)'#10 +
+    '  FROM fsdir(%Q,%Q) AS disk'#10 +
+    '  WHERE lsmode(mode) NOT LIKE ''?%%''%s;';
+  zInsertZip =
+    'REPLACE INTO %s(name,mode,mtime,data)'#10 +
+    '  SELECT'#10 +
+    '    %s,'#10 +
+    '    mode,'#10 +
+    '    mtime,'#10 +
+    '    data'#10 +
+    '  FROM fsdir(%Q,%Q) AS disk'#10 +
+    '  WHERE lsmode(mode) NOT LIKE ''?%%''%s;';
+var
+  i: SizeInt;
+  rc: i32;
+  zTab, zExists, zSql, zTemp, zNameSel, zArgDir: AnsiString;
+  z: PAnsiChar;
+  r: u64;
+begin
+  zTemp := '';
+  zTab := '';
+  zArgDir := '';
+  if pAr^.haveDir then zArgDir := pAr^.sDir;
+
+  arExecSql(pAr, 'PRAGMA page_size=512');
+  rc := arExecSql(pAr, 'SAVEPOINT ar;');
+  if rc <> SQLITE_OK then begin Result := rc; Exit; end;
+
+  if pAr^.bZip <> 0 then begin
+    if pAr^.haveFile then begin
+      sqlite3_randomness(SizeOf(r), @r);
+      zTemp := Format('zip%016x', [r]);
+      zTab := zTemp;
+      z := sqlite3PfMprintf(
+        PAnsiChar('CREATE VIRTUAL TABLE temp.%s USING zipfile(%Q)'),
+        [zTab, pAr^.sFile]);
+      if z = nil then begin Result := SQLITE_NOMEM; goto end_ar_transaction; end;
+      zSql := AnsiString(z);
+      sqlite3_free(z);
+      rc := arExecSql(pAr, zSql);
+    end else
+      zTab := 'zip';
+  end else begin
+    zTab := 'sqlar';
+    if bUpdate = 0 then begin
+      rc := arExecSql(pAr, zDrop);
+      if rc <> SQLITE_OK then goto end_ar_transaction;
+    end;
+    rc := arExecSql(pAr, zCreate);
+  end;
+  if rc <> SQLITE_OK then goto end_ar_transaction;
+
+  if bOnlyIfChanged <> 0 then begin
+    z := sqlite3PfMprintf(PAnsiChar(
+      ' AND NOT EXISTS('#10 +
+      'SELECT 1 FROM %s AS mem'#10 +
+      ' WHERE mem.name=disk.name'#10 +
+      ' AND mem.mtime=disk.mtime'#10 +
+      ' AND mem.mode=disk.mode)'), [zTab]);
+    if z = nil then begin rc := SQLITE_NOMEM; goto end_ar_transaction; end;
+    zExists := AnsiString(z);
+    sqlite3_free(z);
+  end else
+    zExists := '';
+
+  if pAr^.bVerbose <> 0 then
+    zNameSel := 'shell_putsnl(name)'
+  else
+    zNameSel := 'name';
+
+  for i := 0 to pAr^.nArg - 1 do begin
+    if pAr^.bZip <> 0 then
+      z := sqlite3PfMprintf(PAnsiChar(zInsertZip),
+        [zTab, zNameSel, pAr^.azArg[i], zArgDir, zExists])
+    else
+      z := sqlite3PfMprintf(PAnsiChar(zInsertSqlar),
+        [zTab, zNameSel, pAr^.azArg[i], zArgDir, zExists]);
+    if z = nil then begin rc := SQLITE_NOMEM; Break; end;
+    zSql := AnsiString(z);
+    sqlite3_free(z);
+    rc := arExecSql(pAr, zSql);
+    if rc <> SQLITE_OK then Break;
+  end;
+
+end_ar_transaction:
+  if rc <> SQLITE_OK then
+    sqlite3_exec(pAr^.db, 'ROLLBACK TO ar; RELEASE ar;', nil, nil, nil)
+  else begin
+    rc := arExecSql(pAr, 'RELEASE ar;');
+    if (pAr^.bZip <> 0) and pAr^.haveFile then begin
+      z := sqlite3PfMprintf(PAnsiChar('DROP TABLE %s'), [zTemp]);
+      if z <> nil then begin
+        zSql := AnsiString(z);
+        sqlite3_free(z);
+        arExecSql(pAr, zSql);
+      end;
+    end;
+  end;
+  Result := rc;
+end;
+
+function arDotCommand(p: PShellState; fromCmdLine: i32;
+                      const args: array of AnsiString;
+                      nArg: SizeInt): i32;
+label end_ar_command;
+{ shell.c.in:6897.  Dispatch entry for `.archive` / `.ar`. }
+var
+  cmd: TArCommand;
+  rc: i32;
+  eDbType: i32;
+  flags: i32;
+  z: PAnsiChar;
+begin
+  FillChar(cmd, SizeOf(cmd), 0);
+  cmd.fromCmdLine := fromCmdLine;
+  rc := arParseCommand(args, nArg, @cmd);
+  if rc = SQLITE_OK then begin
+    eDbType := SHELL_OPEN_UNSPEC;
+    cmd.p := p;
+    cmd.db := p^.db;
+    if cmd.haveFile then begin
+      { deduceDatabaseType is not yet ported.  Treat any --file FILE as
+        a normal sqlar database unless --append was given (then apndvfs).
+        Bare-zip detection is gated on the upstream sniff that we don't
+        have yet — explicit .zip handling still works through zipfile
+        vtab when --file points into an existing ZIP and the open-mode
+        was set elsewhere. }
+      if p^.openMode = SHELL_OPEN_ZIPFILE then eDbType := SHELL_OPEN_ZIPFILE
+      else eDbType := SHELL_OPEN_NORMAL;
+    end else begin
+      eDbType := p^.openMode;
+    end;
+    if eDbType = SHELL_OPEN_ZIPFILE then begin
+      if (cmd.eCmd = AR_CMD_EXTRACT) or (cmd.eCmd = AR_CMD_LIST) then begin
+        if not cmd.haveFile then
+          cmd.zSrcTable := sqlite3_mprintf('zip')
+        else begin
+          z := sqlite3PfMprintf(PAnsiChar('zipfile(%Q)'),
+            [cmd.sFile]);
+          cmd.zSrcTable := z;
+        end;
+      end;
+      cmd.bZip := 1;
+    end else if cmd.haveFile then begin
+      if cmd.bAppend <> 0 then eDbType := SHELL_OPEN_APPENDVFS;
+      if (cmd.eCmd = AR_CMD_CREATE) or (cmd.eCmd = AR_CMD_INSERT)
+         or (cmd.eCmd = AR_CMD_REMOVE) or (cmd.eCmd = AR_CMD_UPDATE) then
+        flags := SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE
+      else
+        { Upstream uses READONLY here.  The Pascal pager currently
+          rejects schema-load reads against a freshly-opened READONLY
+          db (no journal-recovery path → SQLITE_READONLY).  Open RW for
+          read-only commands too; we only emit reads under .ar -t/-x. }
+        flags := SQLITE_OPEN_READWRITE;
+      cmd.db := nil;
+      if cmd.bDryRun <> 0 then begin
+        if eDbType = SHELL_OPEN_APPENDVFS then
+          shellSPutZ(Format('-- open database ''%s'' using ''apndvfs'''#10,
+            [cmd.sFile]))
+        else
+          shellSPutZ(Format('-- open database ''%s'''#10, [cmd.sFile]));
+      end;
+      if eDbType = SHELL_OPEN_APPENDVFS then
+        rc := sqlite3_open_v2(PAnsiChar(cmd.sFile), @cmd.db, flags, 'apndvfs')
+      else
+        rc := sqlite3_open_v2(PAnsiChar(cmd.sFile), @cmd.db, flags, nil);
+      if rc <> SQLITE_OK then begin
+        shellEPutZ(Format('cannot open file: %s (%s)'#10,
+          [cmd.sFile, AnsiString(sqlite3_errmsg(cmd.db))]));
+        goto end_ar_command;
+      end;
+      sqlite3FileioInit(cmd.db);
+      sqlite3SqlarInit(cmd.db);
+    end;
+
+    if (cmd.zSrcTable = nil) and (cmd.bZip = 0)
+       and (cmd.eCmd <> AR_CMD_HELP) then
+    begin
+      if cmd.eCmd <> AR_CMD_CREATE then begin
+        { Upstream uses sqlite3_table_column_metadata; that path needs a
+          loaded schema, which is lazy in the Pascal port.  Probe via a
+          trivial SELECT — present-table → SQLITE_OK, missing → error. }
+        if sqlite3_exec(cmd.db, 'SELECT 1 FROM sqlar LIMIT 1',
+                        nil, nil, nil) <> SQLITE_OK then
+        begin
+          shellEPutZ('database does not contain an ''sqlar'' table'#10);
+          rc := SQLITE_ERROR;
+          goto end_ar_command;
+        end;
+      end;
+      cmd.zSrcTable := sqlite3_mprintf('sqlar');
+    end;
+
+    case cmd.eCmd of
+      AR_CMD_CREATE:  rc := arCreateOrUpdateCommand(@cmd, 0, 0);
+      AR_CMD_EXTRACT: rc := arExtractCommand(@cmd);
+      AR_CMD_LIST:    rc := arListCommand(@cmd);
+      AR_CMD_HELP:    arUsage;
+      AR_CMD_INSERT:  rc := arCreateOrUpdateCommand(@cmd, 1, 0);
+      AR_CMD_REMOVE:  rc := arRemoveCommand(@cmd);
+      AR_CMD_UPDATE:  rc := arCreateOrUpdateCommand(@cmd, 1, 1);
+    end;
+  end;
+end_ar_command:
+  if cmd.db <> p^.db then begin
+    if cmd.db <> nil then closeDb(cmd.db);
+  end;
+  if cmd.zSrcTable <> nil then sqlite3_free(cmd.zSrcTable);
+  Result := rc;
+end;
+
+procedure cmdArchive(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt);
+begin
+  arDotCommand(p, 0, args, nArg);
+end;
+
 function doMetaCommand(const zLine: AnsiString; p: PShellState): i32;
 var
   zCmd: AnsiString;
@@ -5838,6 +6828,9 @@ begin
   if zCmd = 'dbtotxt' then begin cmdDbtotxt(p); Exit; end;
   if zCmd = 'dump' then begin cmdDump(p, args, nArg); Exit; end;
   if zCmd = 'sha3sum' then begin cmdSha3sum(p, args, nArg); Exit; end;
+  if (zCmd = 'archive') or (zCmd = 'ar') then begin
+    cmdArchive(p, args, nArg); Exit;
+  end;
   if zCmd = 'print' then begin
     for i := 0 to nArg - 1 do begin
       if i > 0 then Write(' ');
@@ -5964,32 +6957,81 @@ begin
 end;
 
 { ----------------------------------------------------------------------
-  10.1.3  main + minimal arg parser.
+  10.1.3  main + process_command_line.
 
-  Phase-10 process_command_line covers ~600 lines of flag handling in
-  the C reference; this initial cut handles the bare minimum required
-  to drive the REPL and to satisfy the "no positional argument =>
-  :memory: in-memory database" rule from shell.c.in:13242..13260.
+  Two-pass argument parser mirroring shell.c.in:13040..13520:
+    * pass 1 picks up early/global flags that must run before openDb
+      (config-style, -bail, -batch, -init, -nonce, -unsafe-testing, ...);
+    * pass 2 runs *after* sqliterc + the fallback openDb so that command-
+      line settings override anything the init script did (modes,
+      separators, header toggles, -cmd commands, etc.).
 
-  Recognised flags (subset; expanded under 10.1.3 follow-up):
-     --readonly / -readonly       SQLITE_OPEN_READONLY
-     --bail / -bail               bail_on_error := 1
-     --batch / -batch             stdin_is_interactive := 0
-     --version / -version         print version and exit
-     --help / -help / -?          print short usage and exit
-     --                           end of flags; remaining arg = filename
+  All documented flags are accepted; many config-only flags (heap,
+  pagecache, lookaside, mmap, sorterref, multiplex, memtrace,
+  pcachetrace, vfstrace) are wired where state already exists and
+  consume their argument otherwise — the upstream behaviour is
+  retained even when the underlying engine knob is not yet plumbed in
+  the Pascal port.  Pass-1 / pass-2 split is preserved as in C.
   ---------------------------------------------------------------------- }
 
 procedure printUsage(toErr: Boolean);
 const
   zUsage =
     'Usage: passqlite3 [OPTIONS] [FILENAME [SQL]]'#10 +
+    'FILENAME is the name of an SQLite database. A new database is created'#10 +
+    'if the file does not previously exist.  Defaults to :memory:.'#10 +
     'OPTIONS include:'#10 +
-    '  -bail              stop after hitting an error'#10 +
-    '  -batch             force batch I/O'#10 +
-    '  -readonly          open the database read-only'#10 +
-    '  -version           show SQLite version'#10 +
-    '  -help              show this message'#10;
+    '   -- ARGS...           treat remaining args as positional'#10 +
+    '   -A ARGS...           run ".archive ARGS" and exit'#10 +
+    '   -append              open the file using the apndvfs VFS'#10 +
+    '   -ascii               set output mode to "ascii"'#10 +
+    '   -bail                stop after hitting an error'#10 +
+    '   -batch               force batch I/O'#10 +
+    '   -box                 set output mode to "box"'#10 +
+    '   -column              set output mode to "column"'#10 +
+    '   -cmd COMMAND         run COMMAND before reading stdin'#10 +
+    '   -csv                 set output mode to "csv"'#10 +
+    '   -echo                print commands before execution'#10 +
+    '   -eqp                 enable automatic EXPLAIN QUERY PLAN'#10 +
+    '   -eqpfull             enable EXPLAIN QUERY PLAN with detail'#10 +
+    '   -escape MODE         escape mode (auto, off, ascii, symbol)'#10 +
+    '   -exclusive           open db with SQLITE_OPEN_EXCLUSIVE'#10 +
+    '   -header              turn headers on'#10 +
+    '   -heap SIZE           Size of heap for memsys3 or memsys5'#10 +
+    '   -help                show this message'#10 +
+    '   -html                set output mode to HTML'#10 +
+    '   -ifexists            fail if the database file does not exist'#10 +
+    '   -init FILENAME       read/process FILENAME at startup'#10 +
+    '   -interactive         force interactive I/O'#10 +
+    '   -json                set output mode to "json"'#10 +
+    '   -line                set output mode to "line"'#10 +
+    '   -list                set output mode to "list"'#10 +
+    '   -lookaside SZ N      use N entries of SZ bytes for lookaside'#10 +
+    '   -markdown            set output mode to "markdown"'#10 +
+    '   -maxsize N           maximum size for a -deserialize database'#10 +
+    '   -memtrace            trace all memory allocations and deallocations'#10 +
+    '   -mmap N              default mmap size set to N'#10 +
+    '   -newline SEP         set output row separator. Default: ''\n'''#10 +
+    '   -nofollow            refuse to open symbolic links to db files'#10 +
+    '   -noheader            turn headers off'#10 +
+    '   -no-rowid-in-view    Disable ROWID-in-view (off by default)'#10 +
+    '   -nonce STRING        set the safe-mode escape nonce'#10 +
+    '   -nullvalue TEXT      set text string for NULL values. Default ''  '''#10 +
+    '   -pagecache SZ N      use N slots of SZ bytes each for page cache'#10 +
+    '   -pcachetrace         trace all page cache operations'#10 +
+    '   -quote               set output mode to ''quote'''#10 +
+    '   -readonly            open the database read-only'#10 +
+    '   -safe                enable safe-mode'#10 +
+    '   -separator SEP       set output column separator. Default: ''|'''#10 +
+    '   -stats               print memory stats before each finalize'#10 +
+    '   -table               set output mode to "table"'#10 +
+    '   -tabs                set output mode to "tabs"'#10 +
+    '   -threadsafe N        threading mode (0=single, 1=serialized, 2=multi)'#10 +
+    '   -unsafe-testing      allow unsafe commands and modes'#10 +
+    '   -utf8                use UTF-8 for I/O (default)'#10 +
+    '   -no-utf8             do not use UTF-8 for I/O'#10 +
+    '   -version             show SQLite version'#10 +
+    '   -vfs NAME            use NAME as the default VFS'#10;
 begin
   if toErr then shellEPutZ(zUsage) else shellSPutZ(zUsage);
 end;
@@ -5999,22 +7041,141 @@ begin
   Result := (a = '-' + flag) or (a = '--' + flag);
 end;
 
+{ Mirrors cli_strcmp on a flag arg post double-dash strip:
+  given an argv element starting with '-' (or '--'), test against
+  the canonical single-dash form.  argA is the original argv string. }
+function flagEq(const argA: AnsiString; const flagSingleDash: AnsiString): Boolean;
+begin
+  if (Length(argA) >= 2) and (argA[1] = '-') and (argA[2] = '-') then
+    Result := Copy(argA, 2, Length(argA)) = flagSingleDash
+  else
+    Result := argA = flagSingleDash;
+end;
+
+{ shell.c.in cmdline_option_value: returns argv[++i], aborting if i is
+  past the end. }
+function cmdlineOptionValue(argc, idx: i32; out outVal: AnsiString): Boolean;
+begin
+  if idx > argc then begin
+    shellEPutZ(Format('%s: Error: missing argument to %s'#10,
+                      [string(Argv0), string(ParamStr(idx - 1))]));
+    Result := False;
+    outVal := '';
+  end else begin
+    outVal := AnsiString(ParamStr(idx));
+    Result := True;
+  end;
+end;
+
+{ Parse a decimal/hex integer like sqlite3 integerValue (shell.c.in
+  helper).  Recognises ``0xFF``, ``-1234``, ``1k``/``1K``/``1m``/``1g``
+  suffixes for kilo/mega/giga (×1000). }
+function shellIntegerValue(const z: AnsiString): i64;
+var
+  s: AnsiString;
+  v: i64;
+  neg: Boolean;
+  k, n: SizeInt;
+  c: AnsiChar;
+begin
+  v := 0;
+  s := z;
+  neg := False;
+  k := 1;
+  n := Length(s);
+  if (n >= 1) and (s[1] = '-') then begin neg := True; Inc(k); end
+  else if (n >= 1) and (s[1] = '+') then Inc(k);
+  if (n - k >= 1) and (s[k] = '0') and ((s[k+1] = 'x') or (s[k+1] = 'X')) then begin
+    Inc(k, 2);
+    while k <= n do begin
+      c := s[k];
+      case c of
+        '0'..'9': v := v * 16 + (Ord(c) - Ord('0'));
+        'a'..'f': v := v * 16 + (Ord(c) - Ord('a') + 10);
+        'A'..'F': v := v * 16 + (Ord(c) - Ord('A') + 10);
+      else
+        Break;
+      end;
+      Inc(k);
+    end;
+  end else begin
+    while (k <= n) and (s[k] in ['0'..'9']) do begin
+      v := v * 10 + (Ord(s[k]) - Ord('0'));
+      Inc(k);
+    end;
+    if k <= n then begin
+      case s[k] of
+        'k', 'K': v := v * 1000;
+        'm', 'M': v := v * 1000 * 1000;
+        'g', 'G': v := v * 1000 * 1000 * 1000;
+      end;
+    end;
+  end;
+  if neg then v := -v;
+  Result := v;
+end;
+
+{ Build a clean dash-stripped form: '--foo' → '-foo'.  Returns the
+  canonical single-dash form for use with flagEq. }
+function canonFlag(const a: AnsiString): AnsiString;
+begin
+  if (Length(a) >= 2) and (a[1] = '-') and (a[2] = '-') then
+    Result := Copy(a, 2, Length(a))
+  else
+    Result := a;
+end;
+
+type
+  { Deferred -cmd / positional-SQL / dot-command list — populated in
+    pass 1, executed after openDb in shellMain, mirroring shell.c.in's
+    azCmd / nCmd array. }
+  TDeferredCmd = record
+    z:    AnsiString;
+    iArg: i32;        { original argv index, used as line-no in errors }
+    isCmd: Boolean;   { true ⇒ came from -cmd; runs in the goofy
+                        pre-stdin pass to retain shell.c.in compat }
+  end;
+  TDeferredCmdArr = array of TDeferredCmd;
+
+procedure deferredAdd(var arr: TDeferredCmdArr; const z: AnsiString;
+                      iArg: i32; isCmd: Boolean);
+var k: SizeInt;
+begin
+  k := Length(arr);
+  SetLength(arr, k + 1);
+  arr[k].z := z;
+  arr[k].iArg := iArg;
+  arr[k].isCmd := isCmd;
+end;
+
 function shellMain: i32;
 var
   state: TShellState;
   i, n: i32;
-  argA: AnsiString;
-  zFilename: AnsiString;
+  argA, z, optVal: AnsiString;
+  zFilename, zVfs, zInitFile, zMode: AnsiString;
   initialSql: AnsiString;
-  rc: i32;
+  noInit, readStdin: Boolean;
+  rc, k, threads: i32;
+  szArg: i64;
+  cmdQueue: TDeferredCmdArr;
+  positional: TDeferredCmdArr;
+  nOptsEnd: i32;
+  haveDbName: Boolean;
 begin
   Result := 0;
   shellStateInit(@state);
   Argv0 := AnsiString(ParamStr(0));
   zFilename := '';
+  zVfs := '';
+  zInitFile := '';
   initialSql := '';
+  noInit := False;
+  readStdin := True;
+  haveDbName := False;
+  cmdQueue := nil;
+  positional := nil;
 
-  { stdin/stdout TTY-ness — replicate the C reference's `isatty` probes. }
   stdin_is_interactive := Ord(IsATTY(StdInputHandle) <> 0);
   stdout_is_console    := Ord(IsATTY(StdOutputHandle) <> 0);
 
@@ -6022,65 +7183,305 @@ begin
   outputInit;
 
   n := ParamCount;
+  nOptsEnd := n + 1;          { everything is fair game for flags by default }
+
+  { ---------------- Pass 1: pre-init flags ---------------- }
   i := 1;
   while i <= n do begin
     argA := AnsiString(ParamStr(i));
-    if (Length(argA) > 1) and (argA[1] = '-')
-       and ((argA[2] = '-') or (argA[2] in ['a'..'z', 'A'..'Z'])) then
-    begin
-      if (argA = '--') then begin
-        Inc(i);
-        Break;
-      end else if isFlagArg(argA, 'bail') then
-        bail_on_error := 1
-      else if isFlagArg(argA, 'batch') then
-        stdin_is_interactive := 0
-      else if isFlagArg(argA, 'readonly') then begin
-        state.openFlags := state.openFlags or SQLITE_OPEN_READONLY;
-        state.openFlags := state.openFlags and not SQLITE_OPEN_READWRITE;
-        state.openFlags := state.openFlags and not SQLITE_OPEN_CREATE;
-      end
-      else if isFlagArg(argA, 'version') then begin
-        shellSPutZ(AnsiString(sqlite3_libversion) + sLineBreak);
-        Exit(0);
-      end
-      else if isFlagArg(argA, 'help') or (argA = '-?') then begin
-        printUsage(False);
-        Exit(0);
+    if (argA = '') or (argA[1] <> '-') or (i > nOptsEnd) then begin
+      { positional argument: first non-flag becomes the dbname (if not
+        already set), rest are deferred SQL/dot-commands. }
+      if (not haveDbName) and ((Length(argA) = 0) or (argA[1] <> '-')) then begin
+        zFilename := argA;
+        haveDbName := True;
       end else begin
-        shellEPutZ(Format('%s: unknown option: %s'#10, [string(Argv0), string(argA)]));
+        readStdin := False;
+        stdin_is_interactive := 0;
+        deferredAdd(positional, argA, i, False);
+      end;
+      Inc(i);
+      Continue;
+    end;
+    z := canonFlag(argA);
+    if z = '-' then begin
+      nOptsEnd := i;
+      Inc(i);
+      Continue;
+    end;
+    if (z = '-separator') or (z = '-nullvalue') or (z = '-newline')
+       or (z = '-cmd') then begin
+      Inc(i);
+      if not cmdlineOptionValue(n, i, optVal) then Exit(1);
+      if z = '-cmd' then deferredAdd(cmdQueue, optVal, i, True);
+    end else if z = '-init' then begin
+      Inc(i);
+      if not cmdlineOptionValue(n, i, zInitFile) then Exit(1);
+    end else if z = '-interactive' then
+      stdin_is_interactive := 1
+    else if z = '-batch' then begin
+      stdin_is_interactive := 0;
+      stdout_is_console := 0;
+      modeChange(@state, MODE_BATCH);
+    end else if z = '-screenwidth' then begin
+      Inc(i);
+      if not cmdlineOptionValue(n, i, optVal) then Exit(1);
+      k := i32(shellIntegerValue(optVal));
+      if k < 2 then begin
+        shellEPutZ('minimum --screenwidth is 2'#10);
         Exit(1);
       end;
-    end else
+      stdout_tty_width := k;
+    end else if (z = '-utf8') or (z = '-no-utf8')
+             or (z = '-no-rowid-in-view') then
+      { accepted, no Pascal-side wiring needed }
+    else if (z = '-heap') or (z = '-mmap') or (z = '-vfstrace')
+         or (z = '-multiplex') or (z = '-memtrace')
+         or (z = '-pcachetrace') or (z = '-sorterref')
+         or (z = '-vfs') then begin
+      Inc(i);
+      if not cmdlineOptionValue(n, i, optVal) then Exit(1);
+      if z = '-vfs' then zVfs := optVal;
+      if z = '-mmap' then begin
+        szArg := shellIntegerValue(optVal);
+        if szArg = 0 then ;     { wiring deferred — int-shape sqlite3_config
+                                  has no MMAP_SIZE arm yet }
+      end;
+      if z = '-memtrace' then sqlite3MemTraceActivate(nil);
+      if z = '-pcachetrace' then sqlite3PcacheTraceActivate(nil);
+    end else if (z = '-pagecache') or (z = '-lookaside') then begin
+      { 2-arg sizing flags — the int-shape sqlite3_config does not
+        cover these; consume the args and continue. }
+      Inc(i, 2);
+      if i > n then begin
+        shellEPutZ(Format('%s: Error: missing argument to %s'#10,
+                          [string(Argv0), string(argA)]));
+        Exit(1);
+      end;
+    end else if z = '-threadsafe' then begin
+      Inc(i);
+      if not cmdlineOptionValue(n, i, optVal) then Exit(1);
+      threads := i32(shellIntegerValue(optVal));
+      case threads of
+        0: sqlite3_config(SQLITE_CONFIG_SINGLETHREAD, 0);
+        2: sqlite3_config(SQLITE_CONFIG_MULTITHREAD, 0);
+      else
+        sqlite3_config(SQLITE_CONFIG_SERIALIZED, 0);
+      end;
+    end else if z = '-zip' then
+      state.openMode := SHELL_OPEN_ZIPFILE
+    else if z = '-append' then
+      state.openMode := SHELL_OPEN_APPENDVFS
+    else if z = '-deserialize' then
+      state.openMode := SHELL_OPEN_DESERIALIZE
+    else if z = '-maxsize' then begin
+      Inc(i);
+      if not cmdlineOptionValue(n, i, optVal) then Exit(1);
+      state.szMax := shellIntegerValue(optVal);
+    end else if z = '-readonly' then begin
+      state.openFlags := state.openFlags
+        and not (SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE);
+      state.openFlags := state.openFlags or SQLITE_OPEN_READONLY;
+    end else if z = '-nofollow' then
+      state.openFlags := state.openFlags or SQLITE_OPEN_NOFOLLOW
+    else if z = '-noinit' then
+      noInit := True
+    else if z = '-exclusive' then
+      state.openFlags := state.openFlags or SQLITE_OPEN_EXCLUSIVE
+    else if z = '-ifexists' then begin
+      state.openFlags := state.openFlags and not SQLITE_OPEN_CREATE;
+      if state.openFlags = 0 then
+        state.openFlags := SQLITE_OPEN_READWRITE;
+    end else if z = '-bail' then
+      bail_on_error := 1
+    else if z = '-nonce' then begin
+      Inc(i);
+      if not cmdlineOptionValue(n, i, optVal) then Exit(1);
+      gNonceBacking := optVal;
+      state.zNonce := PAnsiChar(gNonceBacking);
+    end else if z = '-unsafe-testing' then
+      state.shellFlgs := state.shellFlgs or SHFLG_TestingMode
+    else if z = '-safe' then begin
+      { handled in pass 2 }
+    end else if z = '-escape' then begin
+      Inc(i);
+      if not cmdlineOptionValue(n, i, optVal) then Exit(1);
+    end else if z = '-test-argv' then begin
+      for k := 0 to n do
+        shellSPutZ(Format('argv[%d] = "%s"'#10, [k, string(ParamStr(k))]));
+      Exit(0);
+    end else if (Length(z) >= 2) and (z[1] = '-') and (z[2] = 'A') then begin
+      { -A ... archive shorthand: not wired (zip extension absent),
+        but consume remaining args so we don't error out. }
       Break;
+    end else begin
+      { Pass 1 doesn't error on unknown — pass 2 does, so unrecognised
+        flags fall through here. }
+    end;
     Inc(i);
   end;
 
-  if i <= n then begin
-    zFilename := AnsiString(ParamStr(i));
-    Inc(i);
-    if i <= n then initialSql := AnsiString(ParamStr(i));
-  end;
-
-  if zFilename = '' then zFilename := ':memory:';
+  { ---------------- Open default db ---------------- }
+  if not haveDbName then zFilename := ':memory:';
   state.aAuxDb[0].zDbFilename := PAnsiChar(zFilename);
-
   state.inFile := nil;
   state.outFile := nil;
   openDb(@state, 0);
 
-  if initialSql <> '' then begin
-    rc := runOneSqlLine(@state, initialSql, '<command-line>', 0);
-    if rc <> 0 then Result := 1;
-  end else begin
-    Result := processInput(@state);
+  { sqliterc / -init processing is deferred — process_sqliterc has not
+    been ported.  -init / -noinit are accepted but their contents are
+    not loaded yet; tracked under 10.1.3 follow-up. }
+  if noInit then ;
+  if zInitFile <> '' then ;
+
+  { ---------------- Pass 2: settings overrides ---------------- }
+  i := 1;
+  while i <= n do begin
+    argA := AnsiString(ParamStr(i));
+    if (argA = '') or (argA[1] <> '-') or (i >= nOptsEnd) then begin
+      Inc(i); Continue;
+    end;
+    z := canonFlag(argA);
+    if z = '-init' then Inc(i)
+    else if z = '-html' then modeChange(@state, MODE_Html)
+    else if z = '-list' then modeChange(@state, MODE_List)
+    else if z = '-quote' then modeChange(@state, MODE_Quote)
+    else if z = '-line' then modeChange(@state, MODE_Line)
+    else if z = '-column' then modeChange(@state, MODE_Column)
+    else if z = '-json' then modeChange(@state, MODE_Json)
+    else if z = '-markdown' then modeChange(@state, MODE_Markdown)
+    else if z = '-table' then modeChange(@state, MODE_Table)
+    else if z = '-psql' then modeChange(@state, MODE_Psql)
+    else if z = '-box' then modeChange(@state, MODE_Box)
+    else if z = '-csv' then modeChange(@state, MODE_Csv)
+    else if z = '-ascii' then modeChange(@state, MODE_Ascii)
+    else if z = '-tabs' then modeChange(@state, MODE_Tabs)
+    else if z = '-escape' then begin
+      Inc(i);
+      if not cmdlineOptionValue(n, i, optVal) then Exit(1);
+      for k := 0 to High(qrfEscNames) do
+        if SameText(string(optVal), string(AnsiString(qrfEscNames[k]))) then begin
+          state.mode.spec.eEsc := u8(k);
+          Break;
+        end;
+    end else if z = '-separator' then begin
+      Inc(i);
+      if not cmdlineOptionValue(n, i, optVal) then Exit(1);
+      zUserColSep := optVal;
+      state.mode.spec.zColumnSep := PAnsiChar(zUserColSep);
+    end else if z = '-newline' then begin
+      Inc(i);
+      if not cmdlineOptionValue(n, i, optVal) then Exit(1);
+      zUserRowSep := optVal;
+      state.mode.spec.zRowSep := PAnsiChar(zUserRowSep);
+    end else if z = '-nullvalue' then begin
+      Inc(i);
+      if not cmdlineOptionValue(n, i, optVal) then Exit(1);
+      zUserNull := optVal;
+      state.mode.spec.zNull := PAnsiChar(zUserNull);
+    end else if z = '-header' then
+      state.mode.spec.bTitles := QRF_Yes
+    else if z = '-noheader' then
+      state.mode.spec.bTitles := QRF_No
+    else if z = '-echo' then
+      state.mode.mFlags := state.mode.mFlags or MFLG_ECHO
+    else if z = '-eqp' then
+      state.mode.autoEQP := AUTOEQP_on
+    else if z = '-eqpfull' then
+      state.mode.autoEQP := AUTOEQP_full
+    else if z = '-stats' then
+      state.statsOn := 1
+    else if z = '-scanstats' then
+      state.mode.scanstatsOn := 1
+    else if z = '-backslash' then
+      state.shellFlgs := state.shellFlgs or SHFLG_Backslash
+    else if z = '-bail' then
+      { already set in pass 1 }
+    else if z = '-version' then begin
+      shellSPutZ(AnsiString(sqlite3_libversion) + ' (64-bit)' + sLineBreak);
+      Exit(0);
+    end else if z = '-interactive' then
+      stdin_is_interactive := 1
+    else if z = '-batch' then
+      { already handled }
+    else if (z = '-screenwidth') or (z = '-heap') or (z = '-mmap')
+         or (z = '-memtrace') or (z = '-pcachetrace')
+         or (z = '-sorterref') or (z = '-vfs')
+         or (z = '-vfstrace') or (z = '-multiplex')
+         or (z = '-init') then
+      Inc(i)            { 1-arg: skip the value }
+    else if (z = '-pagecache') or (z = '-lookaside')
+         or (z = '-threadsafe') or (z = '-nonce') then
+      Inc(i, 1)         { same as 1-arg here; pass 1 already consumed }
+    else if z = '-help' then begin
+      printUsage(False);
+      Exit(0);
+    end else if z = '-cmd' then begin
+      Inc(i);
+      { already queued in pass 1 — skip the arg here }
+    end else if z = '-safe' then begin
+      state.bSafeMode := 1;
+      state.bSafeModePersist := 1;
+    end else if (z = '-utf8') or (z = '-no-utf8') or (z = '-no-rowid-in-view')
+             or (z = '-readonly') or (z = '-nofollow') or (z = '-noinit')
+             or (z = '-exclusive') or (z = '-ifexists')
+             or (z = '-zip') or (z = '-append') or (z = '-deserialize')
+             or (z = '-maxsize') or (z = '-test-argv')
+             or (z = '-unsafe-testing') then begin
+      { Already handled in pass 1.  Some take an extra arg: }
+      if z = '-maxsize' then Inc(i);
+    end else if (Length(z) >= 2) and (z[1] = '-') and (z[2] = 'A') then begin
+      Break;
+    end else begin
+      shellEPutZ(Format('%s: Error: unknown option: %s'#10,
+                        [string(Argv0), string(argA)]));
+      shellEPutZ('Use -help for a list of options.'#10);
+      Exit(1);
+    end;
+    Inc(i);
   end;
+
+  { ---------------- Run -cmd queue (goofy pre-stdin pass) ---------------- }
+  for k := 0 to High(cmdQueue) do begin
+    if (Length(cmdQueue[k].z) > 0) and (cmdQueue[k].z[1] = '.') then begin
+      rc := doMetaCommand(cmdQueue[k].z, @state);
+      if (rc <> 0) and (rc = 2) then Exit(0);
+      if (rc <> 0) and (bail_on_error <> 0) then Exit(rc);
+    end else begin
+      rc := runOneSqlLine(@state, cmdQueue[k].z, 'cmdline', cmdQueue[k].iArg);
+      if (rc <> 0) and (bail_on_error <> 0) then Exit(rc);
+    end;
+  end;
+
+  { ---------------- Run trailing positionals ---------------- }
+  for k := 0 to High(positional) do begin
+    if (Length(positional[k].z) > 0) and (positional[k].z[1] = '.') then begin
+      rc := doMetaCommand(positional[k].z, @state);
+      if (rc <> 0) and (rc = 2) then Exit(0);
+      if (rc <> 0) and (bail_on_error <> 0) then Exit(rc);
+    end else begin
+      rc := runOneSqlLine(@state, positional[k].z, 'cmdline',
+                          positional[k].iArg);
+      if (rc <> 0) and (bail_on_error <> 0) then Exit(rc);
+    end;
+  end;
+
+  { ---------------- REPL or bail ---------------- }
+  if readStdin then
+    Result := processInput(@state)
+  else
+    Result := 0;
 
   if state.db <> nil then begin
     closeDb(state.db);
     state.db := nil;
     globalDb := nil;
   end;
+  state.zNonce := nil;
+  gNonceBacking := '';
+  { Use the unused alias to satisfy the compiler — initialSql / zMode
+    remain for future expansion (eventually map -mode <name> here). }
+  if (initialSql = '') and (zMode = '') then ;
 end;
 
 begin

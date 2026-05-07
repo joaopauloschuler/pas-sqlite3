@@ -84,7 +84,7 @@ else
 fi
 
 # ---- Step 2: Compile Pascal test binaries ----
-FPC_FLAGS="-O3 -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm $@"
+FPC_FLAGS="-O3 -Fu$SRC_DIR -Fi$SRC_DIR -FE$BIN_DIR -Fl$SRC_DIR -k-lm -k-lz $@"
 
 compile_test() {
   local name="$1"
@@ -166,6 +166,7 @@ compile_test TestBytecodeParity
 compile_test TestWhereCorpus
 compile_test DiagAggWhere
 compile_test DiagAnalyze
+compile_test DiagAppendvfs
 compile_test DiagArith
 compile_test DiagAutoIdx
 compile_test DiagBloom
@@ -176,6 +177,7 @@ compile_test DiagColName
 compile_test DiagConcat
 compile_test DiagCreateIdx
 compile_test DiagDate
+compile_test DiagDbdump
 compile_test DiagDbFileObject
 compile_test DiagDequoteToken
 compile_test DiagDml
@@ -223,6 +225,9 @@ compile_test DiagTxn           # Tasklist 6.10 step 15(b)/(c):
                                # divergences (memdb pager regression).
                                # Always wrap runs with `timeout 10`.
 compile_test DiagVacuum
+compile_test DiagTmstmpvfs
+compile_test DiagVfslog
+compile_test DiagVfstrace
 compile_test DiagWindow        # Tasklist 6.10 step 17: 13 window-fn
                                # divergences gated on 6.26 wiring.
 compile_test TestSQLCorpus

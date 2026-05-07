@@ -7796,12 +7796,70 @@ begin
   end;
 end;
 
+{ resolveBareIdToTrigger — RETURNING context companion to
+  resolveTriggerNewOld.  When NC_UBaseReg is set (codeReturningTrigger /
+  upsertDoUpdate path) and pTriggerTab is bound, bare TK_ID column refs
+  are treated as NEW.x (INSERT/UPDATE) or OLD.x (DELETE), matching
+  resolve.c lookupName's bareword fallback. }
+procedure resolveBareIdToTrigger(pParse: PParse; iBaseReg: i32; pE: PExpr);
+var
+  pTab:    PTable2;
+  iCol:    i32;
+  iTable:  i32;
+  storCol: i32;
+  i:       i32;
+  pList_:  PExprList;
+begin
+  if (pE = nil) or (pParse = nil) or (pParse^.pTriggerTab = nil) then Exit;
+  if pE^.op = TK_ID then
+  begin
+    if (pE^.u.zToken = nil) or (pE^.u.zToken^ = #0) then Exit;
+    pTab := PTable2(pParse^.pTriggerTab);
+    iCol := sqlite3ColumnIndex(pTab, pE^.u.zToken);
+    if (iCol < 0) and (sqlite3IsRowid(pE^.u.zToken) <> 0) then iCol := -1;
+    if (iCol >= 0) and (pTab^.iPKey = iCol) then iCol := -1;
+    if (iCol < -1) or (iCol >= pTab^.nCol) then Exit;
+    if pParse^.eTriggerOp = TK_DELETE then iTable := 0 else iTable := 1;
+    storCol := iCol;  { sqlite3TableColumnToStorage simplified — no GENERATED }
+    pE^.y.pTab  := pTab;
+    pE^.op      := TK_REGISTER;
+    pE^.op2     := TK_COLUMN;
+    pE^.iColumn := i16(iCol);
+    pE^.iTable  := iBaseReg + (i32(pTab^.nCol) + 1) * iTable + storCol + 1;
+    if iCol < 0 then pE^.affExpr := AnsiChar(SQLITE_AFF_INTEGER);
+    if iTable = 0 then begin
+      if iCol >= 0 then
+        pParse^.oldmask := pParse^.oldmask or (u32(1) shl (iCol and 31))
+      else
+        pParse^.oldmask := $FFFFFFFF;
+    end else begin
+      if iCol >= 0 then
+        pParse^.newmask := pParse^.newmask or (u32(1) shl (iCol and 31))
+      else
+        pParse^.newmask := $FFFFFFFF;
+    end;
+    Exit;
+  end;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  resolveBareIdToTrigger(pParse, iBaseReg, pE^.pLeft);
+  resolveBareIdToTrigger(pParse, iBaseReg, pE^.pRight);
+  if (pE^.flags and EP_xIsSelect) = 0 then
+  begin
+    pList_ := pE^.x.pList;
+    if pList_ <> nil then
+      for i := 0 to pList_^.nExpr - 1 do
+        resolveBareIdToTrigger(pParse, iBaseReg, ExprListItems(pList_)[i].pExpr);
+  end;
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
   begin
     if pNC^.pParse <> nil then
       resolveTriggerNewOld(pNC^.pParse, pExpr);
+    if (pNC^.pParse <> nil) and ((pNC^.ncFlags and NC_UBaseReg) <> 0) then
+      resolveBareIdToTrigger(pNC^.pParse, pNC^.uNC.iBaseReg, pExpr);
     resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
     if pNC^.pParse <> nil then
     begin
@@ -8474,9 +8532,17 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+var
+  pTopSel: PSelect;
 begin
   if (pParse = nil) or (p = nil) then Exit;
   if pParse^.db^.mallocFailed <> 0 then Exit;
+  { Walk the compound pPrior chain so every leaf SELECT in a UNION ALL
+    has its expressions resolved against its own FROM clause.  Mirrors
+    C resolve.c which dispatches per-Select via the walker. }
+  pTopSel := p;
+  while p <> nil do
+  begin
   ResolveExprList(p^.pEList);
   ResolveExpr    (p^.pWhere);
   ResolveExprList(p^.pGroupBy);
@@ -8516,6 +8582,9 @@ begin
   begin
     sqlite3SelectCheckOnClauses(pParse, p);
   end;
+  p := p^.pPrior;
+  end;
+  p := pTopSel;
 end;
 
 function sqlite3ResolveSelfReference(pParse: PParse; pTab: PTable2;
@@ -21032,6 +21101,7 @@ var
   joinFlag: u32;
   pSubSel:  PSelect;
   rcCte:    i32;
+  pCur:     PSelect;
 begin
   FillChar(w, SizeOf(w), 0);
   w.pParse := pParse;
@@ -21049,10 +21119,16 @@ begin
   if (pSelect <> nil) and (pSelect^.pWith <> nil) then
     sqlite3WithPush(pParse, pSelect^.pWith, 0);
 
-  { FROM-clause resolution loop — minimum viable selectExpander. }
-  if (pSelect <> nil) and (pSelect^.pSrc <> nil) then
+  { FROM-clause resolution loop — minimum viable selectExpander.  Walks
+    the compound pPrior chain so every leaf SELECT in a UNION ALL / etc.
+    has its FROM items expanded.  Mirrors C's sqlite3WalkSelect-driven
+    selectExpander which descends pPrior internally. }
+  pCur := pSelect;
+  while pCur <> nil do
   begin
-    pSrc := pSelect^.pSrc;
+  if (pCur <> nil) and (pCur^.pSrc <> nil) then
+  begin
+    pSrc := pCur^.pSrc;
     base := SrcListItems(pSrc);
     for i := 0 to pSrc^.nSrc - 1 do
     begin
@@ -21184,13 +21260,15 @@ begin
         else
           joinFlag := EP_InnerON;
         sqlite3SetJoinExpr(pItem^.u3.pOn, pItem^.iCursor, joinFlag);
-        pSelect^.pWhere := sqlite3ExprAnd(pParse, pSelect^.pWhere,
+        pCur^.pWhere := sqlite3ExprAnd(pParse, pCur^.pWhere,
                                           pItem^.u3.pOn);
         pItem^.u3.pOn  := nil;
         pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $10;  { isOn bit }
-        pSelect^.selFlags := pSelect^.selFlags or SF_OnToWhere;
+        pCur^.selFlags := pCur^.selFlags or SF_OnToWhere;
       end;
     end;
+  end;
+  pCur := pCur^.pPrior;
   end;
 
   { Star-expansion pass — minimal port of selectExpander's TK_ASTERISK
@@ -32034,8 +32112,9 @@ begin
   Result := -1;
   if pName = nil then Exit;
   if pName^.n = 0 then Exit;
-  { Token may not be null-terminated — make a temporary string }
-  zName := sqlite3DbStrNDup(db, PChar(pName^.z), pName^.n);
+  { Token may be quoted; dup + dequote inline (parser unit not visible from codegen). }
+  zName := sqlite3DbStrNDup(db, pName^.z, u64(pName^.n));
+  if zName <> nil then sqlite3Dequote(zName);
   if zName = nil then Exit;
   Result := sqlite3FindDbName(db, zName);
   sqlite3DbFree(db, zName);
@@ -32191,6 +32270,8 @@ begin
         passqlite3util.sqlite3HashFind(@db^.aModule, PChar(zName)));
       if (pMod = nil) and (sqlite3_strnicmp(zName, 'pragma_', 7) = 0) then
         pMod := passqlite3vtab.PVtabModule(sqlite3PragmaVtabRegister(db, zName));
+      if (pMod = nil) and (sqlite3_strnicmp(zName, 'json', 4) = 0) then
+        pMod := passqlite3jsoneach.sqlite3JsonVtabRegister(db, zName);
       if (pMod <> nil) and
          (passqlite3vtab.sqlite3VtabEponymousTableInit(pParse, pMod) <> 0) then
       begin
@@ -32294,6 +32375,7 @@ function sqlite3TwoPartName(pParse: PParse; const pName1: PToken;
 var
   iDb: i32;
   db: PTsqlite3;
+  sName: AnsiString;
 begin
   db := pParse^.db;
   if (pName2 <> nil) and (pName2^.n > 0) then begin
@@ -32301,8 +32383,11 @@ begin
     pUnqual^ := pName2;
     iDb := sqlite3FindDb(db, pName1);
     if iDb < 0 then begin
+      { Bound the token by pName1^.n — pName1^.z is a slice of the
+        live SQL stream (not NUL-terminated). }
+      SetString(sName, pName1^.z, pName1^.n);
       sqlite3ErrorMsg(pParse,
-        PAnsiChar('unknown database ' + AnsiString(pName1^.z)));
+        PAnsiChar('unknown database ' + sName));
       Result := -1; Exit;
     end;
   end else begin
@@ -33137,9 +33222,70 @@ begin_table_error:
   sqlite3DbFree(db, zName);
 end;
 
-procedure sqlite3AddReturning(pParse: PParse; pList: PExprList);
+{ sqlite3DeleteReturning — free a Returning struct.  ParserAddCleanup
+  callback so the allocation outlives sqlite3FinishCoding (the trigger is
+  kept in the temp-schema trigHash until the toplevel parse releases). }
+procedure sqlite3DeleteReturning(db: PTsqlite3; p: Pointer);
+var
+  pRet: PReturning;
+  pHash: passqlite3util.PHash;
 begin
-  sqlite3ExprListDelete(pParse^.db, pList);
+  if p = nil then Exit;
+  pRet := PReturning(p);
+  if (db <> nil) and (db^.nDb >= 2) and (db^.aDb[1].pSchema <> nil) then begin
+    pHash := @passqlite3util.PSchema(db^.aDb[1].pSchema)^.trigHash;
+    sqlite3HashInsert(pHash, PChar(@pRet^.zName[0]), nil);
+  end;
+  sqlite3ExprListDelete(db, pRet^.pReturnEL);
+  sqlite3DbFree(db, pRet);
+end;
+
+{ sqlite3AddReturning — port of build.c:1439.
+
+  Capture the RETURNING clause expression list and rig up a transient
+  AFTER trigger that codeReturningTrigger drives at codegen time.  The
+  trigger lives in the temp schema's trigHash under a per-Parse name so
+  sqlite3TriggerList can find and inject it for the active DML target.
+  Sets PARSEFLAG_BReturning so the BEFORE/AFTER trigger machinery,
+  emitReturningTail, and the OP_OpenEphemeral epilogue all light up. }
+procedure sqlite3AddReturning(pParse: PParse; pList: PExprList);
+var
+  pRet: PReturning;
+  pHash: passqlite3util.PHash;
+  db: PTsqlite3;
+  pPrev: Pointer;
+begin
+  db := pParse^.db;
+  if pParse^.pNewTrigger <> nil then begin
+    sqlite3ErrorMsg(pParse, 'cannot use RETURNING in a trigger');
+  end;
+  pParse^.parseFlags := pParse^.parseFlags or PARSEFLAG_BReturning;
+  pRet := PReturning(sqlite3DbMallocZero(db, SizeOf(TReturning)));
+  if pRet = nil then begin
+    sqlite3ExprListDelete(db, pList);
+    Exit;
+  end;
+  pParse^.u1.pReturning := pRet;
+  pRet^.pParse    := pParse;
+  pRet^.pReturnEL := pList;
+  sqlite3ParserAddCleanup(pParse, @sqlite3DeleteReturning, pRet);
+  if db^.mallocFailed <> 0 then Exit;
+  sqlite3PfSnprintf(SizeOf(pRet^.zName), @pRet^.zName[0],
+    PAnsiChar('sqlite_returning_%p'), [Pointer(pParse)]);
+  pRet^.retTrig.zName      := @pRet^.zName[0];
+  pRet^.retTrig.op         := TK_RETURNING;
+  pRet^.retTrig.tr_tm      := TRIGGER_AFTER;
+  pRet^.retTrig.bReturning := 1;
+  pRet^.retTrig.pSchema    := db^.aDb[1].pSchema;
+  pRet^.retTrig.pTabSchema := db^.aDb[1].pSchema;
+  pRet^.retTrig.step_list  := @pRet^.retTStep;
+  pRet^.retTStep.op        := TK_RETURNING;
+  pRet^.retTStep.pTrig     := @pRet^.retTrig;
+  pRet^.retTStep.pExprList := pList;
+  pHash := @passqlite3util.PSchema(db^.aDb[1].pSchema)^.trigHash;
+  pPrev := sqlite3HashInsert(pHash, PChar(@pRet^.zName[0]), @pRet^.retTrig);
+  if pPrev = @pRet^.retTrig then
+    sqlite3OomFault(db);
 end;
 
 { sqlite3AddColumn — port of build.c:1490 (Phase 6.9-bis 11g.2.f sub-progress 7).
@@ -41089,6 +41235,28 @@ begin
     LOCKING_MODE / INTEGRITY_CHECK and the constant-default emitters).
     Closing the remaining DiagPragma divergences. }
   pName := pragmaLocate(PAnsiChar(zName));
+
+  { Register the result column names for pragmas that return results
+    (pragma.c:526..531 setPragmaResultColumnNames).  Without this every
+    PRAGMA's OP_ResultRow yields a 0-column row that the shell renders
+    as a blank line.  Skip when PragFlg_NoColumns is set (commands like
+    `.changes`) or PragFlg_NoColumns1 is set and the pragma has a
+    right-hand-side argument (PRAGMA name = value form). }
+  if pName <> nil then begin
+    if ((pName^.mPragFlg and PragFlg_NoColumns) = 0)
+       and (((pName^.mPragFlg and PragFlg_NoColumns1) = 0) or (pValue = nil))
+    then begin
+      if pName^.nPragCName = 0 then begin
+        sqlite3VdbeSetNumCols(v, 1);
+        sqlite3VdbeSetColName(v, 0, COLNAME_NAME, pName^.zName, SQLITE_STATIC);
+      end else begin
+        sqlite3VdbeSetNumCols(v, pName^.nPragCName);
+        for i := 0 to i32(pName^.nPragCName) - 1 do
+          sqlite3VdbeSetColName(v, i, COLNAME_NAME,
+            cPragName[pName^.iPragCName + i], SQLITE_STATIC);
+      end;
+    end;
+  end;
   if pName <> nil then case pName^.ePragTyp of
 
     { pragma.c:1211 — PRAGMA table_info(t) / table_xinfo(t).  iArg=0 hides
@@ -41539,7 +41707,7 @@ begin
     db).  Yields i64 in result Mem so column_int truncates to -2 and
     column_text renders "4294967294" via %lld — matching the C oracle. }
   if SameText(zName, 'max_page_count') and (pValue = nil) then begin
-    sqlite3VdbeUsesBtree(v, iDb);
+    sqlite3CodeVerifySchema(pParse, iDb);
     sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, 0);
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);
@@ -41549,7 +41717,7 @@ begin
   { page_count — pragma.c:663 (PragTyp_PAGE_COUNT, 'p' branch).
     OP_Pagecount returns sqlite3BtreeLastPage(pBt). }
   if SameText(zName, 'page_count') and (pValue = nil) then begin
-    sqlite3VdbeUsesBtree(v, iDb);
+    sqlite3CodeVerifySchema(pParse, iDb);
     sqlite3VdbeAddOp2(v, OP_Pagecount, iDb, 1);
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);
@@ -43270,9 +43438,10 @@ end;
 
 procedure roundFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
-  r, half, factor: Double;
+  r, half: Double;
   n: i64;
-  i: i32;
+  zBuf: PAnsiChar;
+  s: AnsiString;
 begin
   n := 0;
   if argc = 2 then begin
@@ -43291,14 +43460,11 @@ begin
       if r < 0 then half := -0.5 else half := +0.5;
       r := Double(i64(Trunc(r + half)));
     end else begin
-      { Approximate "%!.*f" + sqlite3AtoF round-trip via factor multiply.
-        Not byte-identical to C for pathological FP cases (TODO: switch
-        to sqlite3RenderNumF once a fixed-point %!.*f arm exists), but
-        matches for ordinary values used in tests. }
-      factor := 1.0;
-      for i := 0 to n - 1 do factor := factor * 10.0;
-      if r < 0 then half := -0.5 else half := +0.5;
-      r := Trunc(r * factor + half) / factor;
+      { Format as %!.*f then re-parse — mirrors func.c:464..470 exactly so
+        rounding matches C's IEEE-correct halfway behaviour (bug 10.1.bug.7). }
+      s := sqlite3FormatStr(PAnsiChar('%!.*f'), [Integer(n), r]);
+      zBuf := PAnsiChar(s);
+      sqlite3AtoF(zBuf, r);
     end;
   end;
   sqlite3_result_double(pCtx, r);
@@ -44088,122 +44254,19 @@ var
     Result := p^;
   end;
 
-  { Format a double using the captured width/precision metadata, mirroring
-    C printf semantics for %f / %e / %E / %g / %G via FloatToStrF.  When no
-    width or precision is given, fall back to FloatToStr for natural %g-like
-    output (matches the previous behaviour for unadorned specifiers). }
-  { C-style %e/%E render: 1 digit . prec digits e±NN.  prec defaults to 6
-    when not specified.  Matches `printf("%e",1234.5)` → "1.234500e+03". }
-  function FmtSciE(v: Double; prec: i32; upper: Boolean): AnsiString;
-  var
-    expN: i32;
-    mant: Double;
-    s, expStr, mantStr: AnsiString;
-    expSign: AnsiChar;
-  begin
-    if v = 0 then begin
-      mant := 0; expN := 0;
-    end else begin
-      expN := Trunc(Ln(Abs(v)) / Ln(10));
-      mant := v / Power(10.0, expN);
-      while Abs(mant) >= 10 do begin mant := mant / 10; Inc(expN); end;
-      while Abs(mant) < 1   do begin mant := mant * 10; Dec(expN); end;
-    end;
-    mantStr := FloatToStrF(mant, ffFixed, 15, prec);
-    if expN < 0 then begin expSign := '-'; expN := -expN; end
-    else expSign := '+';
-    expStr := IntToStr(expN);
-    if Length(expStr) < 2 then expStr := '0' + expStr;
-    if upper then s := mantStr + 'E' + expSign + expStr
-    else          s := mantStr + 'e' + expSign + expStr;
-    Result := s;
-  end;
-
-  { %g / %G implementation matching printf.c:530..617 etGENERIC arm.
-    prec defaults to 6, precision==0 → 1.  exp = floor(log10(|v|)).
-    if exp<-4 or exp>=prec → scientific with prec-1 fractional digits;
-    else fixed with (prec-1-exp) fractional digits.  Trailing zeros are
-    stripped (rtz) unless '#' alt-form flag is set; a trailing '.' is
-    always stripped when it has no fractional digits left. }
-  function FmtGeneric(v: Double; upper: Boolean): AnsiString;
-  var
-    prec, expN, fracDigits, k: i32;
-    mant: Double;
-    s: AnsiString;
-    keepTrailingZeros: Boolean;
-  begin
-    if metaHavePrec then prec := metaPrec else prec := 6;
-    if prec = 0 then prec := 1;
-    keepTrailingZeros := Pos('#', metaFlags) > 0;
-    if v = 0 then begin
-      expN := 0;
-    end else begin
-      expN := Trunc(Ln(Abs(v)) / Ln(10));
-      mant := Abs(v) / Power(10.0, expN);
-      if mant < 1 then begin Dec(expN); end
-      else if mant >= 10 then begin Inc(expN); end;
-    end;
-    if (expN < -4) or (expN >= prec) then begin
-      Result := FmtSciE(v, prec - 1, upper);
-    end else begin
-      fracDigits := prec - 1 - expN;
-      if fracDigits < 0 then fracDigits := 0;
-      Result := FloatToStrF(v, ffFixed, 15, fracDigits);
-    end;
-    if not keepTrailingZeros then begin
-      { strip trailing zeros after the decimal point, then a trailing '.' }
-      k := Pos('e', Result);
-      if k = 0 then k := Pos('E', Result);
-      if k = 0 then begin
-        if Pos('.', Result) > 0 then begin
-          while (Length(Result) > 0) and (Result[Length(Result)] = '0') do
-            SetLength(Result, Length(Result) - 1);
-          if (Length(Result) > 0) and (Result[Length(Result)] = '.') then
-            SetLength(Result, Length(Result) - 1);
-        end;
-      end else begin
-        s := Copy(Result, k, Length(Result) - k + 1);
-        SetLength(Result, k - 1);
-        if Pos('.', Result) > 0 then begin
-          while (Length(Result) > 0) and (Result[Length(Result)] = '0') do
-            SetLength(Result, Length(Result) - 1);
-          if (Length(Result) > 0) and (Result[Length(Result)] = '.') then
-            SetLength(Result, Length(Result) - 1);
-        end;
-        Result := Result + s;
-      end;
-    end;
-  end;
-
+  { Delegate %f / %e / %E / %g / %G to the canonical sqlite3FormatStr engine
+    (passqlite3printf), which uses sqlite3FpDecode / sqlite3Fp2Convert10 for
+    correct binary->decimal halfway rounding (matches printf.c byte-for-byte).
+    Avoids FPC's FloatToStrF, which rounds binary halfway values the wrong
+    direction (bug 10.1.bug.7). }
   function FmtFloat(spec: AnsiChar; v: Double): AnsiString;
-  var
-    prec, i: i32;
+  var fmt: AnsiString;
   begin
-    if (spec = 'e') or (spec = 'E') then begin
-      if metaHavePrec then prec := metaPrec else prec := 6;
-      Result := FmtSciE(v, prec, spec = 'E');
-    end else if (spec = 'g') or (spec = 'G') then begin
-      Result := FmtGeneric(v, spec = 'G');
-    end else begin
-      { %f }
-      if metaHavePrec then prec := metaPrec else prec := 6;
-      Result := FloatToStrF(v, ffFixed, 15, prec);
-      for i := 1 to Length(Result) - 1 do
-        if (Result[i] = 'e') or (Result[i] = 'E') then begin
-          if (i + 1 <= Length(Result))
-             and (Result[i + 1] <> '+') and (Result[i + 1] <> '-') then
-            Insert('+', Result, i + 1);
-          Break;
-        end;
-    end;
-    if metaHaveWidth and (Length(Result) < metaWidth) then begin
-      if Pos('-', metaFlags) > 0 then
-        Result := Result + StringOfChar(' ', metaWidth - Length(Result))
-      else if (Pos('0', metaFlags) > 0) and (Pos('-', metaFlags) = 0) then
-        Result := StringOfChar('0', metaWidth - Length(Result)) + Result
-      else
-        Result := StringOfChar(' ', metaWidth - Length(Result)) + Result;
-    end;
+    fmt := '%' + metaFlags;
+    if metaHaveWidth then fmt := fmt + IntToStr(metaWidth);
+    if metaHavePrec  then fmt := fmt + '.' + IntToStr(metaPrec);
+    fmt := fmt + spec;
+    Result := sqlite3FormatStr(PAnsiChar(fmt), [v]);
   end;
 
   { Apply width / flag padding to an integer-shaped digit string.

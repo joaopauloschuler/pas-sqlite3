@@ -4770,11 +4770,16 @@ begin
   if p = nil then Exit;
   db := p^.db;
   sqlite3VdbeClearObject(db, p);
-  { Unlink from db->pVdbe list }
-  if p^.ppVPrev <> nil then
-    p^.ppVPrev^ := p^.pVNext;
-  if p^.pVNext <> nil then
-    p^.pVNext^.ppVPrev := p^.ppVPrev;
+  { vdbeaux.c:1156 — skip unlink under the pnBytesFreed dry-run so the
+    sqlite3_stmt_status(.., MEMUSED, 0) accounting pass does not
+    actually destroy the live vdbe. }
+  if (db = nil) or (PTsqlite3(db)^.pnBytesFreed = nil) then
+  begin
+    if p^.ppVPrev <> nil then
+      p^.ppVPrev^ := p^.pVNext;
+    if p^.pVNext <> nil then
+      p^.pVNext^.ppVPrev := p^.ppVPrev;
+  end;
   sqlite3DbFree(db, p);
 end;
 
@@ -7728,6 +7733,12 @@ begin
         Inc(pOut);
         Inc(i);
       end;
+      { vdbe.c:1751 — bump column cache generation so Column reads refresh
+        from the underlying row.  Without this, eph-cursor reads under
+        windowing (windowFullScan / OpenDup chain) keep returning the first
+        row's data because cacheStatus stays equal to a never-bumped
+        cacheCtr. }
+      v^.cacheCtr := (v^.cacheCtr + 2) or 1;
       v^.pResultRow := @aMem[pOp^.p1];
       v^.nResColumn := u16(pOp^.p2);
       if db^.mallocFailed <> 0 then goto no_mem;
@@ -12159,7 +12170,7 @@ begin
     Result^.pFresh  := nil;
     Result^.pForest := nil;
     Result^.iFstresh  := 0;
-    Result^.rsFlags := 0;
+    Result^.rsFlags := ROWSET_SORTED;
     Result^.iBatch  := 0;
   end;
 end;
@@ -12182,7 +12193,7 @@ begin
   pSet^.pFresh  := nil;
   pSet^.pForest := nil;
   pSet^.iFstresh  := 0;
-  pSet^.rsFlags := 0;
+  pSet^.rsFlags := ROWSET_SORTED;
 end;
 
 { rowset.c:sqlite3RowSetDelete }
@@ -12210,27 +12221,62 @@ begin
   Dec(pSet^.iFstresh);
 end;
 
-{ rowset.c internal: merge two sorted lists by v }
+{ rowset.c:rowSetEntryMerge — merge two sorted lists, drop duplicates. }
 function rowSetEntryMerge(pA: PRowSetEntry; pB: PRowSetEntry): PRowSetEntry;
 var
   head: TRowSetEntry;
   pTail: PRowSetEntry;
 begin
+  head.pRight := nil;
   pTail := @head;
-  while (pA <> nil) and (pB <> nil) do begin
-    if pA^.v < pB^.v then begin
-      pTail^.pRight := pA;
-      pTail := pA;
+  while True do begin
+    if pA^.v <= pB^.v then begin
+      if pA^.v < pB^.v then begin
+        pTail^.pRight := pA;
+        pTail := pA;
+      end;
       pA := pA^.pRight;
+      if pA = nil then begin pTail^.pRight := pB; Break; end;
     end else begin
       pTail^.pRight := pB;
       pTail := pB;
       pB := pB^.pRight;
+      if pB = nil then begin pTail^.pRight := pA; Break; end;
     end;
   end;
-  if pA <> nil then pTail^.pRight := pA
-  else             pTail^.pRight := pB;
   Result := head.pRight;
+end;
+
+{ rowset.c:rowSetEntrySort — bucket merge sort over the pRight linked list. }
+function rowSetEntrySort(pIn: PRowSetEntry): PRowSetEntry;
+var
+  i:        u32;
+  pNext:    PRowSetEntry;
+  aBucket:  array[0..39] of PRowSetEntry;
+begin
+  FillChar(aBucket, SizeOf(aBucket), 0);
+  while pIn <> nil do begin
+    pNext := pIn^.pRight;
+    pIn^.pRight := nil;
+    i := 0;
+    while (i < 40) and (aBucket[i] <> nil) do begin
+      pIn := rowSetEntryMerge(aBucket[i], pIn);
+      aBucket[i] := nil;
+      Inc(i);
+    end;
+    if i >= 40 then i := 39;
+    aBucket[i] := pIn;
+    pIn := pNext;
+  end;
+  pIn := aBucket[0];
+  for i := 1 to 39 do begin
+    if aBucket[i] = nil then continue;
+    if pIn <> nil then
+      pIn := rowSetEntryMerge(pIn, aBucket[i])
+    else
+      pIn := aBucket[i];
+  end;
+  Result := pIn;
 end;
 
 { rowset.c internal: convert sorted list to a balanced BST }
@@ -12271,173 +12317,125 @@ begin
   Result := rowSetNDeepTree(@pList, iDepth);
 end;
 
-{ rowset.c internal: sort the pEntry list and add as BST to pForest }
-procedure rowSetToList(pSet: PRowSet);
-var
-  pNext: PRowSetEntry;
-  pHead: PRowSetEntry;
-  pTail: PRowSetEntry;
-  pNew:  PRowSetEntry;
-  p:     PRowSetEntry;
-begin
-  { Step 1: reverse the pEntry list so it is sorted by rowid (insertion order) }
-  { Actually they were appended; sort them with merge sort }
-  { Simple insertion sort for small sets; use merge sort in production }
-  { Here we sort pEntry list by v ascending using a merge sort }
-  if pSet^.pEntry = nil then Exit;
-
-  { Use bottom-up merge sort on pEntry list }
-  pHead := pSet^.pEntry;
-  pSet^.pEntry := nil;
-  pSet^.pLast  := nil;
-  while pHead <> nil do begin
-    pNext := pHead^.pRight;
-    pHead^.pRight := nil;
-    pHead^.pLeft  := nil;
-    { Add as BST to pForest (simplified: just prepend as tree of depth 1) }
-    p := pSet^.pForest;
-    pNew := rowSetListToTree(pHead);
-    if p = nil then pSet^.pForest := pNew
-    else begin
-      { merge: find a tree with same depth or just put at front }
-      pNew^.pRight := pSet^.pForest;
-      pSet^.pForest := pNew;
-    end;
-    pHead := pNext;
-  end;
-end;
-
-{ rowset.c internal: in-order traverse tree to sorted list }
+{ rowset.c:rowSetTreeToList — in-order linearise a tree via pRight chain. }
 procedure rowSetTreeToList(pIn: PRowSetEntry; ppFirst: PPRowSetEntry;
                            ppLast: PPRowSetEntry);
+var
+  pInner: PRowSetEntry;
 begin
-  if pIn = nil then Exit;
+  Assert(pIn <> nil);
   if pIn^.pLeft <> nil then begin
-    rowSetTreeToList(pIn^.pLeft, ppFirst, ppLast);
-    ppLast^^.pRight := pIn;
+    pInner := nil;
+    rowSetTreeToList(pIn^.pLeft, ppFirst, @pInner);
+    pInner^.pRight := pIn;
   end else
     ppFirst^ := pIn;
-  pIn^.pLeft := nil;
-  ppLast^ := pIn;
   if pIn^.pRight <> nil then
-    rowSetTreeToList(pIn^.pRight, ppLast, ppLast)
+    rowSetTreeToList(pIn^.pRight, @pIn^.pRight, ppLast)
   else
-    pIn^.pRight := nil;
-end;
-
-{ rowset.c internal: merge all forest trees into one sorted list }
-procedure rowSetSort(pSet: PRowSet);
-var
-  p:      PRowSetEntry;
-  pList:  PRowSetEntry;
-  pLast:  PRowSetEntry;
-  pFst:   PRowSetEntry;
-  pLst:   PRowSetEntry;
-begin
-  pList := nil;
-  pLast := nil;
-  p := pSet^.pForest;
-  while p <> nil do begin
-    pFst  := nil;
-    pLst  := @pFst;
-    rowSetTreeToList(p, @pFst, @pLst);
-    pList := rowSetEntryMerge(pList, pFst);
-    p := p^.pRight;
-  end;
-  pSet^.pForest := nil;
-  pSet^.pEntry  := pList;
-  pSet^.pLast   := nil;
-  pSet^.rsFlags := pSet^.rsFlags or ROWSET_NEXT;
+    ppLast^ := pIn;
 end;
 
 { rowset.c:sqlite3RowSetInsert }
 procedure sqlite3RowSetInsert(pSet: PRowSet; rowid: i64);
 var
-  pEntry: PRowSetEntry;
+  pEntry, pLast: PRowSetEntry;
 begin
+  Assert((pSet^.rsFlags and ROWSET_NEXT) = 0);
   pEntry := rowSetEntryAlloc(pSet);
   if pEntry = nil then Exit;
   pEntry^.v      := rowid;
   pEntry^.pRight := nil;
-  pEntry^.pLeft  := nil;
-  if pSet^.pLast = nil then
-    pSet^.pEntry := pEntry
-  else
-    pSet^.pLast^.pRight := pEntry;
+  pLast := pSet^.pLast;
+  if pLast <> nil then begin
+    if rowid <= pLast^.v then
+      pSet^.rsFlags := pSet^.rsFlags and (not ROWSET_SORTED);
+    pLast^.pRight := pEntry;
+  end else
+    pSet^.pEntry := pEntry;
   pSet^.pLast := pEntry;
 end;
 
-{ rowset.c:sqlite3RowSetTest — return 1 if rowid exists in batch iBatch }
+{ rowset.c:sqlite3RowSetTest — sort entries into the forest on each new
+  batch, then search all forest trees for `rowid`. }
 function sqlite3RowSetTest(pSet: PRowSet; iBatch: i32; rowid: i64): i32;
 var
-  pTree: PRowSetEntry;
-  p:     PRowSetEntry;
+  pTree:        PRowSetEntry;
+  p:            PRowSetEntry;
+  pAux, pTail:  PRowSetEntry;
+  ppPrevTree:   PPRowSetEntry;
 begin
-  { If batch changed, move pEntry list into the forest as a new tree }
+  Assert(pSet <> nil);
+  Assert((pSet^.rsFlags and ROWSET_NEXT) = 0);
+
   if iBatch <> pSet^.iBatch then begin
-    if pSet^.pEntry <> nil then begin
-      { Sort pEntry and add as BST to pForest }
-      p := pSet^.pEntry;
-      { For simplicity, add all entries as individual nodes to forest }
-      while p <> nil do begin
-        pTree := p^.pRight;
-        p^.pLeft  := nil;
-        p^.pRight := pSet^.pForest;
-        pSet^.pForest := p;
-        p := pTree;
+    p := pSet^.pEntry;
+    if p <> nil then begin
+      ppPrevTree := @pSet^.pForest;
+      if (pSet^.rsFlags and ROWSET_SORTED) = 0 then
+        p := rowSetEntrySort(p);
+      pTree := pSet^.pForest;
+      while pTree <> nil do begin
+        ppPrevTree := @pTree^.pRight;
+        if pTree^.pLeft = nil then begin
+          pTree^.pLeft := rowSetListToTree(p);
+          break;
+        end else begin
+          pAux := nil; pTail := nil;
+          rowSetTreeToList(pTree^.pLeft, @pAux, @pTail);
+          pTree^.pLeft := nil;
+          p := rowSetEntryMerge(pAux, p);
+        end;
+        pTree := pTree^.pRight;
+      end;
+      if pTree = nil then begin
+        pTree := rowSetEntryAlloc(pSet);
+        ppPrevTree^ := pTree;
+        if pTree <> nil then begin
+          pTree^.v := 0;
+          pTree^.pRight := nil;
+          pTree^.pLeft := rowSetListToTree(p);
+        end;
       end;
       pSet^.pEntry := nil;
       pSet^.pLast  := nil;
+      pSet^.rsFlags := pSet^.rsFlags or ROWSET_SORTED;
     end;
     pSet^.iBatch := iBatch;
   end;
-  { Search all trees in pForest }
+
   pTree := pSet^.pForest;
   while pTree <> nil do begin
-    p := pTree;
+    p := pTree^.pLeft;
     while p <> nil do begin
-      if rowid < p^.v then p := p^.pLeft
-      else if rowid > p^.v then p := p^.pRight
+      if p^.v < rowid then p := p^.pRight
+      else if p^.v > rowid then p := p^.pLeft
       else begin Result := 1; Exit; end;
     end;
     pTree := pTree^.pRight;
-  end;
-  { Also search unsorted pEntry list }
-  p := pSet^.pEntry;
-  while p <> nil do begin
-    if p^.v = rowid then begin Result := 1; Exit; end;
-    p := p^.pRight;
   end;
   Result := 0;
 end;
 
 { rowset.c:sqlite3RowSetNext — extract smallest value, return 0 when empty }
 function sqlite3RowSetNext(pSet: PRowSet; pRowid: Pi64): i32;
-var
-  p: PRowSetEntry;
 begin
   { If NEXT mode not started, merge everything into a sorted list }
+  Assert(pSet <> nil);
+  Assert(pSet^.pForest = nil);
   if (pSet^.rsFlags and ROWSET_NEXT) = 0 then begin
-    { Add pEntry unsorted list to forest }
-    if pSet^.pEntry <> nil then begin
-      p := pSet^.pEntry;
-      while p <> nil do begin
-        pSet^.pEntry := p^.pRight;
-        p^.pLeft  := nil;
-        p^.pRight := pSet^.pForest;
-        pSet^.pForest := p;
-        p := pSet^.pEntry;
-      end;
-      pSet^.pLast := nil;
-    end;
-    rowSetSort(pSet);
+    if (pSet^.rsFlags and ROWSET_SORTED) = 0 then
+      pSet^.pEntry := rowSetEntrySort(pSet^.pEntry);
+    pSet^.rsFlags := pSet^.rsFlags or ROWSET_SORTED or ROWSET_NEXT;
   end;
-  if pSet^.pEntry = nil then begin
-    Result := 0; Exit;
-  end;
-  pRowid^ := pSet^.pEntry^.v;
-  pSet^.pEntry := pSet^.pEntry^.pRight;
-  Result := 1;
+  if pSet^.pEntry <> nil then begin
+    pRowid^ := pSet^.pEntry^.v;
+    pSet^.pEntry := pSet^.pEntry^.pRight;
+    if pSet^.pEntry = nil then
+      sqlite3RowSetClear(pSet);
+    Result := 1;
+  end else
+    Result := 0;
 end;
 
 { -----------------------------------------------------------------------
