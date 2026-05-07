@@ -1434,6 +1434,29 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.75** ext/misc/regexp.c (928 C lines) ported as new unit
+       `passqlite3regexp.pas` (~770 lines).  Provides the SQL functions
+       `regexp(PATTERN, STRING)` and the case-insensitive variant
+       `regexpi(PATTERN, STRING)`, which together implement the
+       `B REGEXP A` operator.  POSIX-extended RE syntax over UTF-8 input
+       (X*, X+, X?, X{m,n}, ., (X), X|Y, ^X, X$, [abc], [^abc], [a-z],
+       \b \w \W \d \D \s \S, \uXXXX, \xXX) compiled to the 18-opcode NFA
+       and matched in O(N*M) time — never exponential.  Compiled NFA is
+       cached on the function context via `sqlite3_set_auxdata` so a
+       constant pattern recompiles only once per statement; the deleter
+       trampoline (`re_free_voidptr`) chains through `sqlite3_free`.
+       The `goto re_op_cc_inc` fall-through from RE_OP_CC_EXC in the
+       C source is restructured into a unified case-arm; `[:posix:]`
+       classes correctly emit "POSIX character classes not supported".
+       Wired via `sqlite3RegexpInit(p^.db)` in shell openDb.  Verified
+       byte-identical against the system `sqlite3` running
+       `.load /tmp/regexp.so` on a 43-case suite covering: anchors,
+       quantifiers (greedy {m,n}), alternation, character classes,
+       inverted classes, ranges, perl classes (\d, \w, \s and
+       negations), word boundaries, hex escapes (\xNN), UTF-8
+       multibyte input, `regexpi` case-insensitive, the REGEXP
+       operator form, and degenerate empty-pattern.  TestExplainParity
+       1026/1026.
   [X] **10.1.74** ext/misc/normalize.c (717 C lines) ported as new unit
        `passqlite3normalize.pas` (~620 lines).  Provides the public helper
        `sqlite3_normalize(zSql)` that returns a canonical form of SQL by

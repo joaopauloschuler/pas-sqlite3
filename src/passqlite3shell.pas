@@ -90,6 +90,7 @@ uses
   passqlite3completion,
   passqlite3decimal,
   passqlite3normalize,
+  passqlite3regexp,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -620,6 +621,10 @@ begin
     for differential testing; the underlying public C-style helper is
     also exported by passqlite3normalize. }
   sqlite3NormalizeInit(p^.db);
+  { Phase 10.1.75 — regexp() / regexpi() SQL functions and the REGEXP
+    operator from ext/misc/regexp.c (928 C lines).  POSIX-extended
+    regular expressions over UTF-8 input via NFA matcher. }
+  sqlite3RegexpInit(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
