@@ -2470,6 +2470,22 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.9** json_each / json_tree / jsonb_each / jsonb_tree
+  raised `no such table: json_each` because the eponymous-vtab arm in
+  `sqlite3LocateTable` (passqlite3codegen.pas:32271) only registered
+  `pragma_*` modules — the upstream `json*` arm
+  (build.c:436..440) was missing.  Fixed 2026-05-07: added the
+  `sqlite3_strnicmp(zName,'json',4)=0` arm to call
+  `sqlite3JsonVtabRegister` on demand.  After the fix the table
+  resolves and registers; row output (`SELECT … FROM json_each(?)`)
+  still depends on bug 6.13 (vtab xBestIndex pushdown not wired) so
+  the table-valued form yields 0 rows for now — same bucket as the
+  other eponymous-vtab modules with arg pushdown gated.  Verified:
+  TestExplainParity 1026/1026, TestJsonEach 50/50, no regressions
+  across DiagFeatureProbe / DiagOps / DiagDml / DiagPragma /
+  DiagFunctions / DiagTxn / DiagMisc / DiagCast / DiagDate /
+  DiagAnalyze / DiagSubsel / DiagInnerJoin.
+
 - [X] **10.1.bug.8** Fixed 2026-05-07.  Root cause was in
   `sqlite3FindDb` (passqlite3codegen.pas) — it called
   `sqlite3DbStrNDup` directly without dequoting, so token `"main"`

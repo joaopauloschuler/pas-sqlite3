@@ -32270,6 +32270,8 @@ begin
         passqlite3util.sqlite3HashFind(@db^.aModule, PChar(zName)));
       if (pMod = nil) and (sqlite3_strnicmp(zName, 'pragma_', 7) = 0) then
         pMod := passqlite3vtab.PVtabModule(sqlite3PragmaVtabRegister(db, zName));
+      if (pMod = nil) and (sqlite3_strnicmp(zName, 'json', 4) = 0) then
+        pMod := passqlite3jsoneach.sqlite3JsonVtabRegister(db, zName);
       if (pMod <> nil) and
          (passqlite3vtab.sqlite3VtabEponymousTableInit(pParse, pMod) <> 0) then
       begin
