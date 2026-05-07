@@ -225,6 +225,7 @@ compile_test DiagTxn           # Tasklist 6.10 step 15(b)/(c):
                                # divergences (memdb pager regression).
                                # Always wrap runs with `timeout 10`.
 compile_test DiagVacuum
+compile_test DiagTmstmpvfs
 compile_test DiagVfslog
 compile_test DiagVfstrace
 compile_test DiagWindow        # Tasklist 6.10 step 17: 13 window-fn

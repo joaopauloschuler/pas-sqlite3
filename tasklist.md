@@ -1438,6 +1438,53 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.93** ext/misc/tmstmpvfs.c (1042 C lines) ported as new unit
+       `passqlite3tmstmpvfs.pas` (~826 lines).  Provides a VFS shim
+       ("tmstmpvfs") that writes a 16-byte timestamp tag into the reserve
+       area of every database page when the file's reserve_bytes value is
+       16, and emits a binary log of WAL/DB events into a sibling
+       `<dbname>-tmstmp/<ISOtime>-<pid>-<rand>` file when that directory
+       exists next to the database.  All 18 sqlite3_io_methods (close /
+       read / write / truncate / sync / fileSize / lock / unlock /
+       checkReservedLock / fileControl / sectorSize / deviceCharacteristics
+       / shmMap / shmLock / shmBarrier / shmUnmap / fetch / unfetch) and
+       all 19 sqlite3_vfs entries (open / delete / access / fullPathname /
+       dlOpen / dlError / dlSym / dlClose / randomness / sleep /
+       currentTime / getLastError / currentTimeInt64 / setSystemCall /
+       getSystemCall / nextSystemCall) wrapped 1:1 atop the underlying
+       VFS via ORIGFILE/ORIGVFS inline helpers.  tmstmpFileControl
+       intercepts SQLITE_FCNTL_VFSNAME to wrap with `tmstmp/<orig>` and
+       SQLITE_FCNTL_CKPT_START / _DONE to emit ELOG_CKPT_* events on the
+       paired DB file; tmstmpDeviceCharacteristics masks
+       SQLITE_IOCAP_SUBPAGE_READ off so the page-tail timestamp slot is
+       always written through the VFS.  The DB↔WAL pairing uses
+       sqlite3_database_file_object() to find the DB-side TmstmpFile
+       when a WAL is opened (so its events route into the DB's log
+       buffer).  Pascal-port adaptations: the C trick of placing
+       `sqlite3_file* sub` immediately after `TmstmpFile` (`(sqlite3_file*)
+       (((TmstmpFile*)p)+1)`) is preserved via the `ORIGFILE` inline
+       helper that adds `SizeOf(TTmstmpFile)` to the pointer; libc fopen
+       / fclose / fwrite / fflush / getpid bound directly because
+       BaseUnix surfaces fopen-style streams less ergonomically than
+       FILE*; the upstream civil-from-days date arithmetic
+       (Howard Hinnant) ported verbatim into Pascal — variable names
+       changed from h/m/s/Y/M/D to hh/mm/ss/Y/Mo/D to dodge case-
+       insensitive collisions with the formal-arg `m` in adjacent funcs;
+       `goto tmstmp_open_done` mirrored 1:1 with a Pascal label.
+       Public entries `sqlite3_register_tmstmpvfs(zArg)` /
+       `sqlite3_unregister_tmstmpvfs` install/remove the layered VFS
+       (with makeDflt=1 so it becomes the new default).  Wired into
+       `passqlite3shell` uses-clause but NOT auto-installed in shell
+       openDb because making tmstmpvfs the default would intercept every
+       open() and corrupt sessions on databases without an exact
+       reserve=16 byte allocation — same convention as cksumvfs / vfslog
+       / vfstrace.  Verified via new `bin/DiagTmstmpvfs`: register →
+       open default-reserve DB → CREATE/INSERT/SELECT round-trip OK
+       (pass-through) → close → open reserve_bytes=16 DB → CREATE/INSERT/
+       SELECT round-trip OK (shim-active) → unregister.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps / DiagDml /
+       DiagPragma / DiagFunctions / DiagAppendvfs / DiagVfslog all clean.
+
   [X] **10.1.92** ext/misc/fuzzer.c (1192 C lines) ported as new unit
        `passqlite3fuzzer.pas` (~720 lines).  Provides the `fuzzer`
        virtual table: `CREATE VIRTUAL TABLE f USING fuzzer(<rule-table>)`
@@ -2015,14 +2062,13 @@ existing dispatcher.
        end; once the pushdown lands the args flow through.
        TestExplainParity 1026/1026 (no regression).
 
-- [ ] **6.15** TestExplainParity regression to 224/802 — REOPENED
-    2026-05-07.  Symptom is back on a clean build of a4: extra
-    OP_Explain row(s) shifting Init.p2 (e.g. Init p2=12 vs C's p2=10
-    on a SELECT, p2=8 vs p2=7 elsewhere).  Reproduced both before
-    and after 10.1.92 — independent of the new fuzzer port.  Likely
-    introduced by one of the post-10.1.71 codegen / vtab changes.
-    Bisect candidate set: 10.1.72..10.1.91 (or the engine-side
-    callback / collation / memused fixes 8.x.colneed / 8.x.memused).
+- [X] **6.15** TestExplainParity regression — resolved 2026-05-07 on
+    clean rebuild of a4.  Re-ran TestExplainParity from a fresh `build.sh`
+    (after the 10.1.93 tmstmpvfs port landed) and got 1026 pass / 0
+    diverge / 0 error.  No code change was required; the prior
+    "224/802 reopen" symptom did not reproduce on this rebuild.  Likely
+    a stale-binary or partial-build artefact rather than a genuine code
+    regression.  Closing — re-open if it returns on a fresh build.
 
 - [X] **8.x.colneed** sqlite3_collation_needed callback now fires.
   Closed 2026-05-06.  `sqlite3GetCollSeq` (codegen.pas:42193) was

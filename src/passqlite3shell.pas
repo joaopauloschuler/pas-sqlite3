@@ -108,6 +108,7 @@ uses
   passqlite3vtshim,
   passqlite3unionvtab,
   passqlite3fuzzer,
+  passqlite3tmstmpvfs,
   passqlite3main;
 
 { ----------------------------------------------------------------------
