@@ -1438,6 +1438,31 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.89** ext/misc/vtshim.c (553 C lines) ported as new unit
+       `passqlite3vtshim.pas` (~620 lines).  Provides the two public
+       entry points `sqlite3_create_disposable_module(db, zName, p,
+       pClientData, xDestroy)` and `sqlite3_dispose_module(pX)` —
+       a thin shim that wraps a caller-supplied sqlite3_module so the
+       caller can mass-disconnect every vtab and close every cursor in
+       one synchronous walk (originally written for GC-managed runtimes
+       where finalisation order is not guaranteed).  All 22 module
+       slots wrapped 1:1 (xCreate / xConnect / xBestIndex / xDisconnect /
+       xDestroy / xOpen / xClose / xFilter / xNext / xEof / xColumn /
+       xRowid / xUpdate / xBegin / xSync / xCommit / xRollback /
+       xFindFunction / xRename / xSavepoint / xRelease / xRollbackTo);
+       v3+ slots (xShadowName / xIntegrity) intentionally not exposed
+       because vtshim caps the wrapped iVersion at 2 to match upstream.
+       Pascal-port adaptations: VTSHIM_COPY_ERRMSG macro inlined as a
+       small helper that routes through `sqlite3PfMprintf('%s', ...)`;
+       the module-pointer typedef list is private to the unit and casts
+       Pascal `Pointer` slots back to typed function pointers per call;
+       `PPSqlite3Module` declared locally because the existing
+       `passqlite3vtab` only exports `PSqlite3Module`.  Wired into
+       `passqlite3shell` uses-clause so the unit is part of the shell
+       build but NOT auto-installed (vtshim is library plumbing — the
+       caller registers a disposable module explicitly).
+       TestExplainParity 1026/1026.
+
   [X] **10.1.88** ext/misc/vfstrace.c (1211 C lines) ported as new unit
        `passqlite3vfstrace.pas` (~1140 lines).  Provides the public
        `vfstrace_register(zTraceName, zOldVfsName, xOut, pOutArg,

@@ -104,6 +104,7 @@ uses
   passqlite3vfslog,
   passqlite3vfsstat,
   passqlite3fileio,
+  passqlite3vtshim,
   passqlite3main;
 
 { ----------------------------------------------------------------------
