@@ -1489,6 +1489,30 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [~] **10.1.99** ext/misc/spellfix.c scalar-functions subset ported as
+       new unit `passqlite3spellfix.pas` (~480 lines Pascal porting
+       ~520 C lines from spellfix.c:42..538 + 1258..1896).  Provides
+       the SQL functions `spellfix1_phonehash(X)`, `spellfix1_editdist(A,B)`,
+       and `spellfix1_scriptcode(X)`.  Faithful 1:1 port of the
+       midClass[128] / initClass[128] / className[13] tables, the
+       phoneticHash silent-letter and vowel-elision pipeline (gn/kn-strip,
+       wr-skip, dj/dg-skip, tch-skip, no-vowels-beside-LR rule), the
+       characterClass / insertOrDeleteCost / substituteCost cost
+       functions, the editdist1 Wagner matrix with prefix-match
+       (zA ending in '*'), and the scriptCode UTF-8 walk over the
+       Latin/Cyrillic/Greek/Hebrew/Arabic Unicode ranges.  Wired via
+       `sqlite3SpellfixInit(p^.db)` in shell openDb.  Verified
+       byte-identical against `.load /tmp/spellfix` running under the
+       system sqlite3 across 14 test cases (phonehash on
+       'phonetics'/'Cleen'/'Klean'/'knight'/'night'/'', editdist on
+       'kitten'->'sitting' = 105, 'kitt*'->'kittenish' prefix match = 0,
+       cleen/clean = 25, color/colour = 20; scriptcode across hello/
+       Здра/αβγ/שלום).  The full spellfix1 virtual table (vocabulary
+       fuzzy search), the configurable-cost editdist3 family
+       (~600 C lines), and the transliterate machinery
+       (~700 C lines including the Transliteration table) are NOT yet
+       ported and remain in the source for a future pass.
+
   [X] **10.1.98** ext/misc/zipfile.c (2293 C lines) ported as new unit
        `passqlite3zipfile.pas` (~1100 lines).  Provides the `zipfile`
        virtual table for reading and writing ZIP archives plus the

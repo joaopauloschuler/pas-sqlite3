@@ -114,6 +114,7 @@ uses
   passqlite3compress,
   passqlite3sqlar,
   passqlite3zipfile,
+  passqlite3spellfix,
   passqlite3intck,
   passqlite3dbdata,
   passqlite3memtrace,
@@ -737,6 +738,11 @@ begin
   { Phase 10.1.98 — zipfile() vtab + aggregate from ext/misc/zipfile.c
     (2293 C lines).  Reads/writes ZIP archives via libz inflate/deflate. }
   sqlite3ZipfileInit(p^.db);
+  { Phase 10.1.99 — spellfix1_editdist / spellfix1_phonehash /
+    spellfix1_scriptcode scalar SQL functions from ext/misc/spellfix.c
+    (the editdist1 + phoneticHash + scriptCode subset; the spellfix1
+    virtual table and editdist3 family are not yet ported). }
+  sqlite3SpellfixInit(p^.db);
   { Phase 10.1.97 — sqlite_dbdata / sqlite_dbptr eponymous virtual tables
     from ext/recover/dbdata.c (1023 C lines).  Reads raw b-tree page bytes
     via sqlite_dbpage; backing storage for the upcoming .recover dot-cmd. }
