@@ -3953,11 +3953,7 @@ begin
   end;
 
   pStmt := nil;
-  { Upstream uses `PRAGMA page_count` here.  In pas-sqlite3 that PRAGMA
-    currently returns no rows (port gap, tracked under Phase 6 PRAGMA
-    follow-up); fall back to counting sqlite_dbpage rows. }
-  rc := sqlite3_prepare_v2(p^.db,
-          'SELECT count(*) FROM sqlite_dbpage', -1, @pStmt, @pzTail);
+  rc := sqlite3_prepare_v2(p^.db, 'PRAGMA page_count', -1, @pStmt, @pzTail);
   if (rc <> SQLITE_OK) or (pStmt = nil) then begin
     if pStmt <> nil then sqlite3_finalize(pStmt);
     Exit;

@@ -41089,6 +41089,28 @@ begin
     LOCKING_MODE / INTEGRITY_CHECK and the constant-default emitters).
     Closing the remaining DiagPragma divergences. }
   pName := pragmaLocate(PAnsiChar(zName));
+
+  { Register the result column names for pragmas that return results
+    (pragma.c:526..531 setPragmaResultColumnNames).  Without this every
+    PRAGMA's OP_ResultRow yields a 0-column row that the shell renders
+    as a blank line.  Skip when PragFlg_NoColumns is set (commands like
+    `.changes`) or PragFlg_NoColumns1 is set and the pragma has a
+    right-hand-side argument (PRAGMA name = value form). }
+  if pName <> nil then begin
+    if ((pName^.mPragFlg and PragFlg_NoColumns) = 0)
+       and (((pName^.mPragFlg and PragFlg_NoColumns1) = 0) or (pValue = nil))
+    then begin
+      if pName^.nPragCName = 0 then begin
+        sqlite3VdbeSetNumCols(v, 1);
+        sqlite3VdbeSetColName(v, 0, COLNAME_NAME, pName^.zName, SQLITE_STATIC);
+      end else begin
+        sqlite3VdbeSetNumCols(v, pName^.nPragCName);
+        for i := 0 to i32(pName^.nPragCName) - 1 do
+          sqlite3VdbeSetColName(v, i, COLNAME_NAME,
+            cPragName[pName^.iPragCName + i], SQLITE_STATIC);
+      end;
+    end;
+  end;
   if pName <> nil then case pName^.ePragTyp of
 
     { pragma.c:1211 — PRAGMA table_info(t) / table_xinfo(t).  iArg=0 hides
@@ -41539,7 +41561,7 @@ begin
     db).  Yields i64 in result Mem so column_int truncates to -2 and
     column_text renders "4294967294" via %lld — matching the C oracle. }
   if SameText(zName, 'max_page_count') and (pValue = nil) then begin
-    sqlite3VdbeUsesBtree(v, iDb);
+    sqlite3CodeVerifySchema(pParse, iDb);
     sqlite3VdbeAddOp3(v, OP_MaxPgcnt, iDb, 1, 0);
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);
@@ -41549,7 +41571,7 @@ begin
   { page_count — pragma.c:663 (PragTyp_PAGE_COUNT, 'p' branch).
     OP_Pagecount returns sqlite3BtreeLastPage(pBt). }
   if SameText(zName, 'page_count') and (pValue = nil) then begin
-    sqlite3VdbeUsesBtree(v, iDb);
+    sqlite3CodeVerifySchema(pParse, iDb);
     sqlite3VdbeAddOp2(v, OP_Pagecount, iDb, 1);
     sqlite3VdbeAddOp2(v, OP_ResultRow, 1, 1);
     sqlite3VdbeReusable(v);

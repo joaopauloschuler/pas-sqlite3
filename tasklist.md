@@ -1252,10 +1252,8 @@ existing dispatcher.
        file-backed db (matches os_unix.c:4191).
   [X] **10.1.58** `.dbtotxt` — cmdDbtotxt ports
        shell.c.in:5579..5674 page-by-page hex dump.  Reads page size
-       via `PRAGMA page_size`, page count via
-       `SELECT count(*) FROM sqlite_dbpage` (workaround for a Pascal-
-       port `PRAGMA page_count` gap that returns no rows — tracked
-       separately under Phase 6 PRAGMA follow-up).  Skips all-zero
+       via `PRAGMA page_size` and page count via `PRAGMA page_count`
+       (10.1.bug.4 closed the prior workaround).  Skips all-zero
        16-byte runs to keep dumps compact.  Hex output is lowercase
        to match upstream.
   [X] **10.1.59** `.breakpoint` — cmdBreakpoint no-op stub
@@ -2332,6 +2330,30 @@ existing dispatcher.
        (BE), toreal('  0.5  ')=NULL (trailing-space rejection).
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
+
+- [X] **10.1.bug.4** Scalar PRAGMAs (`page_count`, `max_page_count`,
+  `page_size`, `cache_size`, `synchronous`, `temp_store`, etc.)
+  returned blank rows because `sqlite3Pragma` never called
+  `setPragmaResultColumnNames` (pragma.c:526..531).  Without the
+  per-statement column-metadata setup, `pVdbe^.nResColumn` stayed at 0
+  so `sqlite3_column_count` reported 0 columns and the shell rendered
+  every PRAGMA result as an empty line.  Closed 2026-05-07: ported
+  `setPragmaResultColumnNames` inline at the top of `sqlite3Pragma`
+  (passqlite3codegen.pas:41091) — calls `sqlite3VdbeSetNumCols(v,1)` +
+  `SetColName(...,pPragma->zName)` for nPragCName=0 entries, walks
+  `cPragName[iPragCName..+nPragCName]` for table-valued ones; honours
+  the `PragFlg_NoColumns` / `PragFlg_NoColumns1+zRight` skip rule.
+  Companion fix: `page_count` and `max_page_count` arms now call
+  `sqlite3CodeVerifySchema` (matches pragma.c:666) so the OP_Transaction
+  prologue runs and the btree's `nPage` is loaded from the file header.
+  Removed the `SELECT count(*) FROM sqlite_dbpage` workarounds in
+  `cmdDbtotxt` (passqlite3shell.pas) and `dbdataDbsize`
+  (passqlite3dbdata.pas).  Verified byte-identical to system sqlite3:
+  `PRAGMA page_count` on a 2-page db = 2, `PRAGMA max_page_count` =
+  4294967294, `PRAGMA page_size` = 4096, `.dbtotxt` and
+  `SELECT … FROM sqlite_dbdata` both work end-to-end.  TestExplainParity
+  1026/1026; DiagPragma / DiagOps / DiagDml / DiagFeatureProbe /
+  DiagFunctions / DiagTxn / DiagMisc / DiagCast all clean.
 
 - [X] **10.1.bug.3** Multi-statement command-line input dropped /
   corrupted statements past the 2nd or 3rd boundary.  Root cause was

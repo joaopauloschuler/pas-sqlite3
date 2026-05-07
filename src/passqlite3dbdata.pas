@@ -749,12 +749,7 @@ begin
   if nFunc > 0 then
     zSql := sqlite3PfMprintf('SELECT %.*s(0)', [nFunc, zSchema])
   else
-    { Upstream uses `PRAGMA %Q.page_count`.  In pas-sqlite3 that PRAGMA
-      currently returns no rows — same gap noted in passqlite3shell.pas
-      cmdDbtotxt.  Fall back to counting sqlite_dbpage rows for the
-      target schema. }
-    zSql := sqlite3PfMprintf(
-      'SELECT count(*) FROM sqlite_dbpage(%Q)', [zSchema]);
+    zSql := sqlite3PfMprintf('PRAGMA %Q.page_count', [zSchema]);
   if zSql = nil then begin Result := SQLITE_NOMEM; Exit; end;
 
   rc := sqlite3_prepare_v2(pTab^.db, zSql, -1, @pStmt, nil);
