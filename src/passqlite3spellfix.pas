@@ -3,8 +3,9 @@
 
   Faithful port of the scalar SQL functions from
   ../sqlite3/ext/misc/spellfix.c (3076 lines in C, of which this unit
-  ports lines 38..538 and 1848..1896 — phoneticHash, editdist1, the
-  costing helpers, and scriptCode).
+  ports lines 38..538, 1243..1830, and 1848..1896 — phoneticHash,
+  editdist1, the costing helpers, scriptCode, and the full
+  transliterate machinery including the 389-row translit[] table).
 
   Provides the SQL functions:
 
@@ -20,13 +21,18 @@
                                (215 Latin / 220 Cyrillic / 200 Greek /
                                 125 Hebrew / 160 Arabic / 999 unknown /
                                 998 mixed).
+    spellfix1_translit(X)    — convert a UTF-8 string with non-ASCII
+                               Roman characters into pure ASCII via
+                               the upstream translit[] map (covers
+                               Latin extended, Cyrillic, Greek, plus
+                               selected Latin-extended-additional
+                               and ligature points).
 
-  The full spellfix1 virtual table (vocabulary fuzzy-search), the
-  configurable-cost editdist3 family, and the transliterate machinery
-  are NOT ported by this unit — they require ~2500 additional C lines
-  worth of state-machine code (Transliteration table, EditDist3*
-  cost-mergesort, the spellfix1_vocab shadow-table CRUD path) and will
-  land separately.
+  The full spellfix1 virtual table (vocabulary fuzzy-search) and the
+  configurable-cost editdist3 family are NOT ported by this unit —
+  they require ~1800 additional C lines worth of state-machine code
+  (EditDist3* cost-mergesort, the spellfix1_vocab shadow-table CRUD
+  path) and will land separately.
 
   Public entry: sqlite3SpellfixInit(db) — equivalent to the head of
   spellfix1Register() in C; safe to call multiple times.
@@ -48,6 +54,7 @@ function sqlite3SpellfixInit(db: PTsqlite3): i32;
 implementation
 
 uses
+  passqlite3os,
   passqlite3printf;
 
 { Character classes — spellfix.c:42..70.  Identical numeric values so
@@ -640,6 +647,591 @@ begin
   sqlite3_result_int(pCtx, res);
 end;
 
+
+{ ===== Transliteration table — spellfix.c:1294..1696. =====
+
+  Provides the spellfix1_translit(X) SQL function and supporting
+  utf8Charlen / spellfixFindTranslit / translen_to_charlen helpers.
+  Faithful 1:1 port of the C source: the 389-row translit[] table
+  is sorted by cFrom so transliterate() can binary-search per code
+  point.  SQLITE_SPELLFIX_5BYTE_MAPPINGS is not defined upstream
+  by default, so the cTo4 slot is omitted to match the default
+  build. }
+
+type
+  TTransliteration = packed record
+    cFrom: u16;
+    cTo0, cTo1, cTo2, cTo3: Byte;
+  end;
+  PTransliteration = ^TTransliteration;
+
+const
+  TRANSLIT_COUNT = 389;
+  translit: array[0..TRANSLIT_COUNT-1] of TTransliteration = (
+    (cFrom: $00A0; cTo0: $20; cTo1: $00; cTo2: $00; cTo3: $00),  //   to  
+    (cFrom: $00B5; cTo0: $75; cTo1: $00; cTo2: $00; cTo3: $00),  // µ to u
+    (cFrom: $00C0; cTo0: $41; cTo1: $00; cTo2: $00; cTo3: $00),  // À to A
+    (cFrom: $00C1; cTo0: $41; cTo1: $00; cTo2: $00; cTo3: $00),  // Á to A
+    (cFrom: $00C2; cTo0: $41; cTo1: $00; cTo2: $00; cTo3: $00),  // Â to A
+    (cFrom: $00C3; cTo0: $41; cTo1: $00; cTo2: $00; cTo3: $00),  // Ã to A
+    (cFrom: $00C4; cTo0: $41; cTo1: $65; cTo2: $00; cTo3: $00),  // Ä to Ae
+    (cFrom: $00C5; cTo0: $41; cTo1: $61; cTo2: $00; cTo3: $00),  // Å to Aa
+    (cFrom: $00C6; cTo0: $41; cTo1: $45; cTo2: $00; cTo3: $00),  // Æ to AE
+    (cFrom: $00C7; cTo0: $43; cTo1: $00; cTo2: $00; cTo3: $00),  // Ç to C
+    (cFrom: $00C8; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // È to E
+    (cFrom: $00C9; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // É to E
+    (cFrom: $00CA; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Ê to E
+    (cFrom: $00CB; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Ë to E
+    (cFrom: $00CC; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Ì to I
+    (cFrom: $00CD; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Í to I
+    (cFrom: $00CE; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Î to I
+    (cFrom: $00CF; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Ï to I
+    (cFrom: $00D0; cTo0: $44; cTo1: $00; cTo2: $00; cTo3: $00),  // Ð to D
+    (cFrom: $00D1; cTo0: $4E; cTo1: $00; cTo2: $00; cTo3: $00),  // Ñ to N
+    (cFrom: $00D2; cTo0: $4F; cTo1: $00; cTo2: $00; cTo3: $00),  // Ò to O
+    (cFrom: $00D3; cTo0: $4F; cTo1: $00; cTo2: $00; cTo3: $00),  // Ó to O
+    (cFrom: $00D4; cTo0: $4F; cTo1: $00; cTo2: $00; cTo3: $00),  // Ô to O
+    (cFrom: $00D5; cTo0: $4F; cTo1: $00; cTo2: $00; cTo3: $00),  // Õ to O
+    (cFrom: $00D6; cTo0: $4F; cTo1: $65; cTo2: $00; cTo3: $00),  // Ö to Oe
+    (cFrom: $00D7; cTo0: $78; cTo1: $00; cTo2: $00; cTo3: $00),  // × to x
+    (cFrom: $00D8; cTo0: $4F; cTo1: $00; cTo2: $00; cTo3: $00),  // Ø to O
+    (cFrom: $00D9; cTo0: $55; cTo1: $00; cTo2: $00; cTo3: $00),  // Ù to U
+    (cFrom: $00DA; cTo0: $55; cTo1: $00; cTo2: $00; cTo3: $00),  // Ú to U
+    (cFrom: $00DB; cTo0: $55; cTo1: $00; cTo2: $00; cTo3: $00),  // Û to U
+    (cFrom: $00DC; cTo0: $55; cTo1: $65; cTo2: $00; cTo3: $00),  // Ü to Ue
+    (cFrom: $00DD; cTo0: $59; cTo1: $00; cTo2: $00; cTo3: $00),  // Ý to Y
+    (cFrom: $00DE; cTo0: $54; cTo1: $68; cTo2: $00; cTo3: $00),  // Þ to Th
+    (cFrom: $00DF; cTo0: $73; cTo1: $73; cTo2: $00; cTo3: $00),  // ß to ss
+    (cFrom: $00E0; cTo0: $61; cTo1: $00; cTo2: $00; cTo3: $00),  // à to a
+    (cFrom: $00E1; cTo0: $61; cTo1: $00; cTo2: $00; cTo3: $00),  // á to a
+    (cFrom: $00E2; cTo0: $61; cTo1: $00; cTo2: $00; cTo3: $00),  // â to a
+    (cFrom: $00E3; cTo0: $61; cTo1: $00; cTo2: $00; cTo3: $00),  // ã to a
+    (cFrom: $00E4; cTo0: $61; cTo1: $65; cTo2: $00; cTo3: $00),  // ä to ae
+    (cFrom: $00E5; cTo0: $61; cTo1: $61; cTo2: $00; cTo3: $00),  // å to aa
+    (cFrom: $00E6; cTo0: $61; cTo1: $65; cTo2: $00; cTo3: $00),  // æ to ae
+    (cFrom: $00E7; cTo0: $63; cTo1: $00; cTo2: $00; cTo3: $00),  // ç to c
+    (cFrom: $00E8; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // è to e
+    (cFrom: $00E9; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // é to e
+    (cFrom: $00EA; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // ê to e
+    (cFrom: $00EB; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // ë to e
+    (cFrom: $00EC; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ì to i
+    (cFrom: $00ED; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // í to i
+    (cFrom: $00EE; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // î to i
+    (cFrom: $00EF; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ï to i
+    (cFrom: $00F0; cTo0: $64; cTo1: $00; cTo2: $00; cTo3: $00),  // ð to d
+    (cFrom: $00F1; cTo0: $6E; cTo1: $00; cTo2: $00; cTo3: $00),  // ñ to n
+    (cFrom: $00F2; cTo0: $6F; cTo1: $00; cTo2: $00; cTo3: $00),  // ò to o
+    (cFrom: $00F3; cTo0: $6F; cTo1: $00; cTo2: $00; cTo3: $00),  // ó to o
+    (cFrom: $00F4; cTo0: $6F; cTo1: $00; cTo2: $00; cTo3: $00),  // ô to o
+    (cFrom: $00F5; cTo0: $6F; cTo1: $00; cTo2: $00; cTo3: $00),  // õ to o
+    (cFrom: $00F6; cTo0: $6F; cTo1: $65; cTo2: $00; cTo3: $00),  // ö to oe
+    (cFrom: $00F7; cTo0: $3A; cTo1: $00; cTo2: $00; cTo3: $00),  // ÷ to :
+    (cFrom: $00F8; cTo0: $6F; cTo1: $00; cTo2: $00; cTo3: $00),  // ø to o
+    (cFrom: $00F9; cTo0: $75; cTo1: $00; cTo2: $00; cTo3: $00),  // ù to u
+    (cFrom: $00FA; cTo0: $75; cTo1: $00; cTo2: $00; cTo3: $00),  // ú to u
+    (cFrom: $00FB; cTo0: $75; cTo1: $00; cTo2: $00; cTo3: $00),  // û to u
+    (cFrom: $00FC; cTo0: $75; cTo1: $65; cTo2: $00; cTo3: $00),  // ü to ue
+    (cFrom: $00FD; cTo0: $79; cTo1: $00; cTo2: $00; cTo3: $00),  // ý to y
+    (cFrom: $00FE; cTo0: $74; cTo1: $68; cTo2: $00; cTo3: $00),  // þ to th
+    (cFrom: $00FF; cTo0: $79; cTo1: $00; cTo2: $00; cTo3: $00),  // ÿ to y
+    (cFrom: $0100; cTo0: $41; cTo1: $00; cTo2: $00; cTo3: $00),  // Ā to A
+    (cFrom: $0101; cTo0: $61; cTo1: $00; cTo2: $00; cTo3: $00),  // ā to a
+    (cFrom: $0102; cTo0: $41; cTo1: $00; cTo2: $00; cTo3: $00),  // Ă to A
+    (cFrom: $0103; cTo0: $61; cTo1: $00; cTo2: $00; cTo3: $00),  // ă to a
+    (cFrom: $0104; cTo0: $41; cTo1: $00; cTo2: $00; cTo3: $00),  // Ą to A
+    (cFrom: $0105; cTo0: $61; cTo1: $00; cTo2: $00; cTo3: $00),  // ą to a
+    (cFrom: $0106; cTo0: $43; cTo1: $00; cTo2: $00; cTo3: $00),  // Ć to C
+    (cFrom: $0107; cTo0: $63; cTo1: $00; cTo2: $00; cTo3: $00),  // ć to c
+    (cFrom: $0108; cTo0: $43; cTo1: $68; cTo2: $00; cTo3: $00),  // Ĉ to Ch
+    (cFrom: $0109; cTo0: $63; cTo1: $68; cTo2: $00; cTo3: $00),  // ĉ to ch
+    (cFrom: $010A; cTo0: $43; cTo1: $00; cTo2: $00; cTo3: $00),  // Ċ to C
+    (cFrom: $010B; cTo0: $63; cTo1: $00; cTo2: $00; cTo3: $00),  // ċ to c
+    (cFrom: $010C; cTo0: $43; cTo1: $00; cTo2: $00; cTo3: $00),  // Č to C
+    (cFrom: $010D; cTo0: $63; cTo1: $00; cTo2: $00; cTo3: $00),  // č to c
+    (cFrom: $010E; cTo0: $44; cTo1: $00; cTo2: $00; cTo3: $00),  // Ď to D
+    (cFrom: $010F; cTo0: $64; cTo1: $00; cTo2: $00; cTo3: $00),  // ď to d
+    (cFrom: $0110; cTo0: $44; cTo1: $00; cTo2: $00; cTo3: $00),  // Đ to D
+    (cFrom: $0111; cTo0: $64; cTo1: $00; cTo2: $00; cTo3: $00),  // đ to d
+    (cFrom: $0112; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Ē to E
+    (cFrom: $0113; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // ē to e
+    (cFrom: $0114; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Ĕ to E
+    (cFrom: $0115; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // ĕ to e
+    (cFrom: $0116; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Ė to E
+    (cFrom: $0117; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // ė to e
+    (cFrom: $0118; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Ę to E
+    (cFrom: $0119; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // ę to e
+    (cFrom: $011A; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Ě to E
+    (cFrom: $011B; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // ě to e
+    (cFrom: $011C; cTo0: $47; cTo1: $68; cTo2: $00; cTo3: $00),  // Ĝ to Gh
+    (cFrom: $011D; cTo0: $67; cTo1: $68; cTo2: $00; cTo3: $00),  // ĝ to gh
+    (cFrom: $011E; cTo0: $47; cTo1: $00; cTo2: $00; cTo3: $00),  // Ğ to G
+    (cFrom: $011F; cTo0: $67; cTo1: $00; cTo2: $00; cTo3: $00),  // ğ to g
+    (cFrom: $0120; cTo0: $47; cTo1: $00; cTo2: $00; cTo3: $00),  // Ġ to G
+    (cFrom: $0121; cTo0: $67; cTo1: $00; cTo2: $00; cTo3: $00),  // ġ to g
+    (cFrom: $0122; cTo0: $47; cTo1: $00; cTo2: $00; cTo3: $00),  // Ģ to G
+    (cFrom: $0123; cTo0: $67; cTo1: $00; cTo2: $00; cTo3: $00),  // ģ to g
+    (cFrom: $0124; cTo0: $48; cTo1: $68; cTo2: $00; cTo3: $00),  // Ĥ to Hh
+    (cFrom: $0125; cTo0: $68; cTo1: $68; cTo2: $00; cTo3: $00),  // ĥ to hh
+    (cFrom: $0126; cTo0: $48; cTo1: $00; cTo2: $00; cTo3: $00),  // Ħ to H
+    (cFrom: $0127; cTo0: $68; cTo1: $00; cTo2: $00; cTo3: $00),  // ħ to h
+    (cFrom: $0128; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Ĩ to I
+    (cFrom: $0129; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ĩ to i
+    (cFrom: $012A; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Ī to I
+    (cFrom: $012B; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ī to i
+    (cFrom: $012C; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Ĭ to I
+    (cFrom: $012D; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ĭ to i
+    (cFrom: $012E; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Į to I
+    (cFrom: $012F; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // į to i
+    (cFrom: $0130; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // İ to I
+    (cFrom: $0131; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ı to i
+    (cFrom: $0132; cTo0: $49; cTo1: $4A; cTo2: $00; cTo3: $00),  // Ĳ to IJ
+    (cFrom: $0133; cTo0: $69; cTo1: $6A; cTo2: $00; cTo3: $00),  // ĳ to ij
+    (cFrom: $0134; cTo0: $4A; cTo1: $68; cTo2: $00; cTo3: $00),  // Ĵ to Jh
+    (cFrom: $0135; cTo0: $6A; cTo1: $68; cTo2: $00; cTo3: $00),  // ĵ to jh
+    (cFrom: $0136; cTo0: $4B; cTo1: $00; cTo2: $00; cTo3: $00),  // Ķ to K
+    (cFrom: $0137; cTo0: $6B; cTo1: $00; cTo2: $00; cTo3: $00),  // ķ to k
+    (cFrom: $0138; cTo0: $6B; cTo1: $00; cTo2: $00; cTo3: $00),  // ĸ to k
+    (cFrom: $0139; cTo0: $4C; cTo1: $00; cTo2: $00; cTo3: $00),  // Ĺ to L
+    (cFrom: $013A; cTo0: $6C; cTo1: $00; cTo2: $00; cTo3: $00),  // ĺ to l
+    (cFrom: $013B; cTo0: $4C; cTo1: $00; cTo2: $00; cTo3: $00),  // Ļ to L
+    (cFrom: $013C; cTo0: $6C; cTo1: $00; cTo2: $00; cTo3: $00),  // ļ to l
+    (cFrom: $013D; cTo0: $4C; cTo1: $00; cTo2: $00; cTo3: $00),  // Ľ to L
+    (cFrom: $013E; cTo0: $6C; cTo1: $00; cTo2: $00; cTo3: $00),  // ľ to l
+    (cFrom: $013F; cTo0: $4C; cTo1: $2E; cTo2: $00; cTo3: $00),  // Ŀ to L.
+    (cFrom: $0140; cTo0: $6C; cTo1: $2E; cTo2: $00; cTo3: $00),  // ŀ to l.
+    (cFrom: $0141; cTo0: $4C; cTo1: $00; cTo2: $00; cTo3: $00),  // Ł to L
+    (cFrom: $0142; cTo0: $6C; cTo1: $00; cTo2: $00; cTo3: $00),  // ł to l
+    (cFrom: $0143; cTo0: $4E; cTo1: $00; cTo2: $00; cTo3: $00),  // Ń to N
+    (cFrom: $0144; cTo0: $6E; cTo1: $00; cTo2: $00; cTo3: $00),  // ń to n
+    (cFrom: $0145; cTo0: $4E; cTo1: $00; cTo2: $00; cTo3: $00),  // Ņ to N
+    (cFrom: $0146; cTo0: $6E; cTo1: $00; cTo2: $00; cTo3: $00),  // ņ to n
+    (cFrom: $0147; cTo0: $4E; cTo1: $00; cTo2: $00; cTo3: $00),  // Ň to N
+    (cFrom: $0148; cTo0: $6E; cTo1: $00; cTo2: $00; cTo3: $00),  // ň to n
+    (cFrom: $0149; cTo0: $27; cTo1: $6E; cTo2: $00; cTo3: $00),  // ŉ to 'n
+    (cFrom: $014A; cTo0: $4E; cTo1: $47; cTo2: $00; cTo3: $00),  // Ŋ to NG
+    (cFrom: $014B; cTo0: $6E; cTo1: $67; cTo2: $00; cTo3: $00),  // ŋ to ng
+    (cFrom: $014C; cTo0: $4F; cTo1: $00; cTo2: $00; cTo3: $00),  // Ō to O
+    (cFrom: $014D; cTo0: $6F; cTo1: $00; cTo2: $00; cTo3: $00),  // ō to o
+    (cFrom: $014E; cTo0: $4F; cTo1: $00; cTo2: $00; cTo3: $00),  // Ŏ to O
+    (cFrom: $014F; cTo0: $6F; cTo1: $00; cTo2: $00; cTo3: $00),  // ŏ to o
+    (cFrom: $0150; cTo0: $4F; cTo1: $00; cTo2: $00; cTo3: $00),  // Ő to O
+    (cFrom: $0151; cTo0: $6F; cTo1: $00; cTo2: $00; cTo3: $00),  // ő to o
+    (cFrom: $0152; cTo0: $4F; cTo1: $45; cTo2: $00; cTo3: $00),  // Œ to OE
+    (cFrom: $0153; cTo0: $6F; cTo1: $65; cTo2: $00; cTo3: $00),  // œ to oe
+    (cFrom: $0154; cTo0: $52; cTo1: $00; cTo2: $00; cTo3: $00),  // Ŕ to R
+    (cFrom: $0155; cTo0: $72; cTo1: $00; cTo2: $00; cTo3: $00),  // ŕ to r
+    (cFrom: $0156; cTo0: $52; cTo1: $00; cTo2: $00; cTo3: $00),  // Ŗ to R
+    (cFrom: $0157; cTo0: $72; cTo1: $00; cTo2: $00; cTo3: $00),  // ŗ to r
+    (cFrom: $0158; cTo0: $52; cTo1: $00; cTo2: $00; cTo3: $00),  // Ř to R
+    (cFrom: $0159; cTo0: $72; cTo1: $00; cTo2: $00; cTo3: $00),  // ř to r
+    (cFrom: $015A; cTo0: $53; cTo1: $00; cTo2: $00; cTo3: $00),  // Ś to S
+    (cFrom: $015B; cTo0: $73; cTo1: $00; cTo2: $00; cTo3: $00),  // ś to s
+    (cFrom: $015C; cTo0: $53; cTo1: $68; cTo2: $00; cTo3: $00),  // Ŝ to Sh
+    (cFrom: $015D; cTo0: $73; cTo1: $68; cTo2: $00; cTo3: $00),  // ŝ to sh
+    (cFrom: $015E; cTo0: $53; cTo1: $00; cTo2: $00; cTo3: $00),  // Ş to S
+    (cFrom: $015F; cTo0: $73; cTo1: $00; cTo2: $00; cTo3: $00),  // ş to s
+    (cFrom: $0160; cTo0: $53; cTo1: $00; cTo2: $00; cTo3: $00),  // Š to S
+    (cFrom: $0161; cTo0: $73; cTo1: $00; cTo2: $00; cTo3: $00),  // š to s
+    (cFrom: $0162; cTo0: $54; cTo1: $00; cTo2: $00; cTo3: $00),  // Ţ to T
+    (cFrom: $0163; cTo0: $74; cTo1: $00; cTo2: $00; cTo3: $00),  // ţ to t
+    (cFrom: $0164; cTo0: $54; cTo1: $00; cTo2: $00; cTo3: $00),  // Ť to T
+    (cFrom: $0165; cTo0: $74; cTo1: $00; cTo2: $00; cTo3: $00),  // ť to t
+    (cFrom: $0166; cTo0: $54; cTo1: $00; cTo2: $00; cTo3: $00),  // Ŧ to T
+    (cFrom: $0167; cTo0: $74; cTo1: $00; cTo2: $00; cTo3: $00),  // ŧ to t
+    (cFrom: $0168; cTo0: $55; cTo1: $00; cTo2: $00; cTo3: $00),  // Ũ to U
+    (cFrom: $0169; cTo0: $75; cTo1: $00; cTo2: $00; cTo3: $00),  // ũ to u
+    (cFrom: $016A; cTo0: $55; cTo1: $00; cTo2: $00; cTo3: $00),  // Ū to U
+    (cFrom: $016B; cTo0: $75; cTo1: $00; cTo2: $00; cTo3: $00),  // ū to u
+    (cFrom: $016C; cTo0: $55; cTo1: $00; cTo2: $00; cTo3: $00),  // Ŭ to U
+    (cFrom: $016D; cTo0: $75; cTo1: $00; cTo2: $00; cTo3: $00),  // ŭ to u
+    (cFrom: $016E; cTo0: $55; cTo1: $00; cTo2: $00; cTo3: $00),  // Ů to U
+    (cFrom: $016F; cTo0: $75; cTo1: $00; cTo2: $00; cTo3: $00),  // ů to u
+    (cFrom: $0170; cTo0: $55; cTo1: $00; cTo2: $00; cTo3: $00),  // Ű to U
+    (cFrom: $0171; cTo0: $75; cTo1: $00; cTo2: $00; cTo3: $00),  // ű to u
+    (cFrom: $0172; cTo0: $55; cTo1: $00; cTo2: $00; cTo3: $00),  // Ų to U
+    (cFrom: $0173; cTo0: $75; cTo1: $00; cTo2: $00; cTo3: $00),  // ų to u
+    (cFrom: $0174; cTo0: $57; cTo1: $00; cTo2: $00; cTo3: $00),  // Ŵ to W
+    (cFrom: $0175; cTo0: $77; cTo1: $00; cTo2: $00; cTo3: $00),  // ŵ to w
+    (cFrom: $0176; cTo0: $59; cTo1: $00; cTo2: $00; cTo3: $00),  // Ŷ to Y
+    (cFrom: $0177; cTo0: $79; cTo1: $00; cTo2: $00; cTo3: $00),  // ŷ to y
+    (cFrom: $0178; cTo0: $59; cTo1: $00; cTo2: $00; cTo3: $00),  // Ÿ to Y
+    (cFrom: $0179; cTo0: $5A; cTo1: $00; cTo2: $00; cTo3: $00),  // Ź to Z
+    (cFrom: $017A; cTo0: $7A; cTo1: $00; cTo2: $00; cTo3: $00),  // ź to z
+    (cFrom: $017B; cTo0: $5A; cTo1: $00; cTo2: $00; cTo3: $00),  // Ż to Z
+    (cFrom: $017C; cTo0: $7A; cTo1: $00; cTo2: $00; cTo3: $00),  // ż to z
+    (cFrom: $017D; cTo0: $5A; cTo1: $00; cTo2: $00; cTo3: $00),  // Ž to Z
+    (cFrom: $017E; cTo0: $7A; cTo1: $00; cTo2: $00; cTo3: $00),  // ž to z
+    (cFrom: $017F; cTo0: $73; cTo1: $00; cTo2: $00; cTo3: $00),  // ſ to s
+    (cFrom: $0192; cTo0: $66; cTo1: $00; cTo2: $00; cTo3: $00),  // ƒ to f
+    (cFrom: $0218; cTo0: $53; cTo1: $00; cTo2: $00; cTo3: $00),  // Ș to S
+    (cFrom: $0219; cTo0: $73; cTo1: $00; cTo2: $00; cTo3: $00),  // ș to s
+    (cFrom: $021A; cTo0: $54; cTo1: $00; cTo2: $00; cTo3: $00),  // Ț to T
+    (cFrom: $021B; cTo0: $74; cTo1: $00; cTo2: $00; cTo3: $00),  // ț to t
+    (cFrom: $0386; cTo0: $41; cTo1: $00; cTo2: $00; cTo3: $00),  // Ά to A
+    (cFrom: $0388; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Έ to E
+    (cFrom: $0389; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Ή to I
+    (cFrom: $038A; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Ί to I
+    (cFrom: $038C; cTo0: $4f; cTo1: $00; cTo2: $00; cTo3: $00),  // Ό to O
+    (cFrom: $038E; cTo0: $59; cTo1: $00; cTo2: $00; cTo3: $00),  // Ύ to Y
+    (cFrom: $038F; cTo0: $4f; cTo1: $00; cTo2: $00; cTo3: $00),  // Ώ to O
+    (cFrom: $0390; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ΐ to i
+    (cFrom: $0391; cTo0: $41; cTo1: $00; cTo2: $00; cTo3: $00),  // Α to A
+    (cFrom: $0392; cTo0: $42; cTo1: $00; cTo2: $00; cTo3: $00),  // Β to B
+    (cFrom: $0393; cTo0: $47; cTo1: $00; cTo2: $00; cTo3: $00),  // Γ to G
+    (cFrom: $0394; cTo0: $44; cTo1: $00; cTo2: $00; cTo3: $00),  // Δ to D
+    (cFrom: $0395; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Ε to E
+    (cFrom: $0396; cTo0: $5a; cTo1: $00; cTo2: $00; cTo3: $00),  // Ζ to Z
+    (cFrom: $0397; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Η to I
+    (cFrom: $0398; cTo0: $54; cTo1: $68; cTo2: $00; cTo3: $00),  // Θ to Th
+    (cFrom: $0399; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Ι to I
+    (cFrom: $039A; cTo0: $4b; cTo1: $00; cTo2: $00; cTo3: $00),  // Κ to K
+    (cFrom: $039B; cTo0: $4c; cTo1: $00; cTo2: $00; cTo3: $00),  // Λ to L
+    (cFrom: $039C; cTo0: $4d; cTo1: $00; cTo2: $00; cTo3: $00),  // Μ to M
+    (cFrom: $039D; cTo0: $4e; cTo1: $00; cTo2: $00; cTo3: $00),  // Ν to N
+    (cFrom: $039E; cTo0: $58; cTo1: $00; cTo2: $00; cTo3: $00),  // Ξ to X
+    (cFrom: $039F; cTo0: $4f; cTo1: $00; cTo2: $00; cTo3: $00),  // Ο to O
+    (cFrom: $03A0; cTo0: $50; cTo1: $00; cTo2: $00; cTo3: $00),  // Π to P
+    (cFrom: $03A1; cTo0: $52; cTo1: $00; cTo2: $00; cTo3: $00),  // Ρ to R
+    (cFrom: $03A3; cTo0: $53; cTo1: $00; cTo2: $00; cTo3: $00),  // Σ to S
+    (cFrom: $03A4; cTo0: $54; cTo1: $00; cTo2: $00; cTo3: $00),  // Τ to T
+    (cFrom: $03A5; cTo0: $59; cTo1: $00; cTo2: $00; cTo3: $00),  // Υ to Y
+    (cFrom: $03A6; cTo0: $46; cTo1: $00; cTo2: $00; cTo3: $00),  // Φ to F
+    (cFrom: $03A7; cTo0: $43; cTo1: $68; cTo2: $00; cTo3: $00),  // Χ to Ch
+    (cFrom: $03A8; cTo0: $50; cTo1: $73; cTo2: $00; cTo3: $00),  // Ψ to Ps
+    (cFrom: $03A9; cTo0: $4f; cTo1: $00; cTo2: $00; cTo3: $00),  // Ω to O
+    (cFrom: $03AA; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Ϊ to I
+    (cFrom: $03AB; cTo0: $59; cTo1: $00; cTo2: $00; cTo3: $00),  // Ϋ to Y
+    (cFrom: $03AC; cTo0: $61; cTo1: $00; cTo2: $00; cTo3: $00),  // ά to a
+    (cFrom: $03AD; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // έ to e
+    (cFrom: $03AE; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ή to i
+    (cFrom: $03AF; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ί to i
+    (cFrom: $03B1; cTo0: $61; cTo1: $00; cTo2: $00; cTo3: $00),  // α to a
+    (cFrom: $03B2; cTo0: $62; cTo1: $00; cTo2: $00; cTo3: $00),  // β to b
+    (cFrom: $03B3; cTo0: $67; cTo1: $00; cTo2: $00; cTo3: $00),  // γ to g
+    (cFrom: $03B4; cTo0: $64; cTo1: $00; cTo2: $00; cTo3: $00),  // δ to d
+    (cFrom: $03B5; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // ε to e
+    (cFrom: $03B6; cTo0: $7a; cTo1: $00; cTo2: $00; cTo3: $00),  // ζ to z
+    (cFrom: $03B7; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // η to i
+    (cFrom: $03B8; cTo0: $74; cTo1: $68; cTo2: $00; cTo3: $00),  // θ to th
+    (cFrom: $03B9; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ι to i
+    (cFrom: $03BA; cTo0: $6b; cTo1: $00; cTo2: $00; cTo3: $00),  // κ to k
+    (cFrom: $03BB; cTo0: $6c; cTo1: $00; cTo2: $00; cTo3: $00),  // λ to l
+    (cFrom: $03BC; cTo0: $6d; cTo1: $00; cTo2: $00; cTo3: $00),  // μ to m
+    (cFrom: $03BD; cTo0: $6e; cTo1: $00; cTo2: $00; cTo3: $00),  // ν to n
+    (cFrom: $03BE; cTo0: $78; cTo1: $00; cTo2: $00; cTo3: $00),  // ξ to x
+    (cFrom: $03BF; cTo0: $6f; cTo1: $00; cTo2: $00; cTo3: $00),  // ο to o
+    (cFrom: $03C0; cTo0: $70; cTo1: $00; cTo2: $00; cTo3: $00),  // π to p
+    (cFrom: $03C1; cTo0: $72; cTo1: $00; cTo2: $00; cTo3: $00),  // ρ to r
+    (cFrom: $03C3; cTo0: $73; cTo1: $00; cTo2: $00; cTo3: $00),  // σ to s
+    (cFrom: $03C4; cTo0: $74; cTo1: $00; cTo2: $00; cTo3: $00),  // τ to t
+    (cFrom: $03C5; cTo0: $79; cTo1: $00; cTo2: $00; cTo3: $00),  // υ to y
+    (cFrom: $03C6; cTo0: $66; cTo1: $00; cTo2: $00; cTo3: $00),  // φ to f
+    (cFrom: $03C7; cTo0: $63; cTo1: $68; cTo2: $00; cTo3: $00),  // χ to ch
+    (cFrom: $03C8; cTo0: $70; cTo1: $73; cTo2: $00; cTo3: $00),  // ψ to ps
+    (cFrom: $03C9; cTo0: $6f; cTo1: $00; cTo2: $00; cTo3: $00),  // ω to o
+    (cFrom: $03CA; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ϊ to i
+    (cFrom: $03CB; cTo0: $79; cTo1: $00; cTo2: $00; cTo3: $00),  // ϋ to y
+    (cFrom: $03CC; cTo0: $6f; cTo1: $00; cTo2: $00; cTo3: $00),  // ό to o
+    (cFrom: $03CD; cTo0: $79; cTo1: $00; cTo2: $00; cTo3: $00),  // ύ to y
+    (cFrom: $03CE; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ώ to i
+    (cFrom: $0400; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Ѐ to E
+    (cFrom: $0401; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Ё to E
+    (cFrom: $0402; cTo0: $44; cTo1: $00; cTo2: $00; cTo3: $00),  // Ђ to D
+    (cFrom: $0403; cTo0: $47; cTo1: $00; cTo2: $00; cTo3: $00),  // Ѓ to G
+    (cFrom: $0404; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Є to E
+    (cFrom: $0405; cTo0: $5a; cTo1: $00; cTo2: $00; cTo3: $00),  // Ѕ to Z
+    (cFrom: $0406; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // І to I
+    (cFrom: $0407; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Ї to I
+    (cFrom: $0408; cTo0: $4a; cTo1: $00; cTo2: $00; cTo3: $00),  // Ј to J
+    (cFrom: $0409; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Љ to I
+    (cFrom: $040A; cTo0: $4e; cTo1: $00; cTo2: $00; cTo3: $00),  // Њ to N
+    (cFrom: $040B; cTo0: $44; cTo1: $00; cTo2: $00; cTo3: $00),  // Ћ to D
+    (cFrom: $040C; cTo0: $4b; cTo1: $00; cTo2: $00; cTo3: $00),  // Ќ to K
+    (cFrom: $040D; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Ѝ to I
+    (cFrom: $040E; cTo0: $55; cTo1: $00; cTo2: $00; cTo3: $00),  // Ў to U
+    (cFrom: $040F; cTo0: $44; cTo1: $00; cTo2: $00; cTo3: $00),  // Џ to D
+    (cFrom: $0410; cTo0: $41; cTo1: $00; cTo2: $00; cTo3: $00),  // А to A
+    (cFrom: $0411; cTo0: $42; cTo1: $00; cTo2: $00; cTo3: $00),  // Б to B
+    (cFrom: $0412; cTo0: $56; cTo1: $00; cTo2: $00; cTo3: $00),  // В to V
+    (cFrom: $0413; cTo0: $47; cTo1: $00; cTo2: $00; cTo3: $00),  // Г to G
+    (cFrom: $0414; cTo0: $44; cTo1: $00; cTo2: $00; cTo3: $00),  // Д to D
+    (cFrom: $0415; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Е to E
+    (cFrom: $0416; cTo0: $5a; cTo1: $68; cTo2: $00; cTo3: $00),  // Ж to Zh
+    (cFrom: $0417; cTo0: $5a; cTo1: $00; cTo2: $00; cTo3: $00),  // З to Z
+    (cFrom: $0418; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // И to I
+    (cFrom: $0419; cTo0: $49; cTo1: $00; cTo2: $00; cTo3: $00),  // Й to I
+    (cFrom: $041A; cTo0: $4b; cTo1: $00; cTo2: $00; cTo3: $00),  // К to K
+    (cFrom: $041B; cTo0: $4c; cTo1: $00; cTo2: $00; cTo3: $00),  // Л to L
+    (cFrom: $041C; cTo0: $4d; cTo1: $00; cTo2: $00; cTo3: $00),  // М to M
+    (cFrom: $041D; cTo0: $4e; cTo1: $00; cTo2: $00; cTo3: $00),  // Н to N
+    (cFrom: $041E; cTo0: $4f; cTo1: $00; cTo2: $00; cTo3: $00),  // О to O
+    (cFrom: $041F; cTo0: $50; cTo1: $00; cTo2: $00; cTo3: $00),  // П to P
+    (cFrom: $0420; cTo0: $52; cTo1: $00; cTo2: $00; cTo3: $00),  // Р to R
+    (cFrom: $0421; cTo0: $53; cTo1: $00; cTo2: $00; cTo3: $00),  // С to S
+    (cFrom: $0422; cTo0: $54; cTo1: $00; cTo2: $00; cTo3: $00),  // Т to T
+    (cFrom: $0423; cTo0: $55; cTo1: $00; cTo2: $00; cTo3: $00),  // У to U
+    (cFrom: $0424; cTo0: $46; cTo1: $00; cTo2: $00; cTo3: $00),  // Ф to F
+    (cFrom: $0425; cTo0: $4b; cTo1: $68; cTo2: $00; cTo3: $00),  // Х to Kh
+    (cFrom: $0426; cTo0: $54; cTo1: $63; cTo2: $00; cTo3: $00),  // Ц to Tc
+    (cFrom: $0427; cTo0: $43; cTo1: $68; cTo2: $00; cTo3: $00),  // Ч to Ch
+    (cFrom: $0428; cTo0: $53; cTo1: $68; cTo2: $00; cTo3: $00),  // Ш to Sh
+    (cFrom: $0429; cTo0: $53; cTo1: $68; cTo2: $63; cTo3: $68),  // Щ to Shch
+    (cFrom: $042A; cTo0: $61; cTo1: $00; cTo2: $00; cTo3: $00),  //  to A
+    (cFrom: $042B; cTo0: $59; cTo1: $00; cTo2: $00; cTo3: $00),  // Ы to Y
+    (cFrom: $042C; cTo0: $59; cTo1: $00; cTo2: $00; cTo3: $00),  //  to Y
+    (cFrom: $042D; cTo0: $45; cTo1: $00; cTo2: $00; cTo3: $00),  // Э to E
+    (cFrom: $042E; cTo0: $49; cTo1: $75; cTo2: $00; cTo3: $00),  // Ю to Iu
+    (cFrom: $042F; cTo0: $49; cTo1: $61; cTo2: $00; cTo3: $00),  // Я to Ia
+    (cFrom: $0430; cTo0: $61; cTo1: $00; cTo2: $00; cTo3: $00),  // а to a
+    (cFrom: $0431; cTo0: $62; cTo1: $00; cTo2: $00; cTo3: $00),  // б to b
+    (cFrom: $0432; cTo0: $76; cTo1: $00; cTo2: $00; cTo3: $00),  // в to v
+    (cFrom: $0433; cTo0: $67; cTo1: $00; cTo2: $00; cTo3: $00),  // г to g
+    (cFrom: $0434; cTo0: $64; cTo1: $00; cTo2: $00; cTo3: $00),  // д to d
+    (cFrom: $0435; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // е to e
+    (cFrom: $0436; cTo0: $7a; cTo1: $68; cTo2: $00; cTo3: $00),  // ж to zh
+    (cFrom: $0437; cTo0: $7a; cTo1: $00; cTo2: $00; cTo3: $00),  // з to z
+    (cFrom: $0438; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // и to i
+    (cFrom: $0439; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // й to i
+    (cFrom: $043A; cTo0: $6b; cTo1: $00; cTo2: $00; cTo3: $00),  // к to k
+    (cFrom: $043B; cTo0: $6c; cTo1: $00; cTo2: $00; cTo3: $00),  // л to l
+    (cFrom: $043C; cTo0: $6d; cTo1: $00; cTo2: $00; cTo3: $00),  // м to m
+    (cFrom: $043D; cTo0: $6e; cTo1: $00; cTo2: $00; cTo3: $00),  // н to n
+    (cFrom: $043E; cTo0: $6f; cTo1: $00; cTo2: $00; cTo3: $00),  // о to o
+    (cFrom: $043F; cTo0: $70; cTo1: $00; cTo2: $00; cTo3: $00),  // п to p
+    (cFrom: $0440; cTo0: $72; cTo1: $00; cTo2: $00; cTo3: $00),  // р to r
+    (cFrom: $0441; cTo0: $73; cTo1: $00; cTo2: $00; cTo3: $00),  // с to s
+    (cFrom: $0442; cTo0: $74; cTo1: $00; cTo2: $00; cTo3: $00),  // т to t
+    (cFrom: $0443; cTo0: $75; cTo1: $00; cTo2: $00; cTo3: $00),  // у to u
+    (cFrom: $0444; cTo0: $66; cTo1: $00; cTo2: $00; cTo3: $00),  // ф to f
+    (cFrom: $0445; cTo0: $6b; cTo1: $68; cTo2: $00; cTo3: $00),  // х to kh
+    (cFrom: $0446; cTo0: $74; cTo1: $63; cTo2: $00; cTo3: $00),  // ц to tc
+    (cFrom: $0447; cTo0: $63; cTo1: $68; cTo2: $00; cTo3: $00),  // ч to ch
+    (cFrom: $0448; cTo0: $73; cTo1: $68; cTo2: $00; cTo3: $00),  // ш to sh
+    (cFrom: $0449; cTo0: $73; cTo1: $68; cTo2: $63; cTo3: $68),  // щ to shch
+    (cFrom: $044A; cTo0: $61; cTo1: $00; cTo2: $00; cTo3: $00),  //  to a
+    (cFrom: $044B; cTo0: $79; cTo1: $00; cTo2: $00; cTo3: $00),  // ы to y
+    (cFrom: $044C; cTo0: $79; cTo1: $00; cTo2: $00; cTo3: $00),  //  to y
+    (cFrom: $044D; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // э to e
+    (cFrom: $044E; cTo0: $69; cTo1: $75; cTo2: $00; cTo3: $00),  // ю to iu
+    (cFrom: $044F; cTo0: $69; cTo1: $61; cTo2: $00; cTo3: $00),  // я to ia
+    (cFrom: $0450; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // ѐ to e
+    (cFrom: $0451; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // ё to e
+    (cFrom: $0452; cTo0: $64; cTo1: $00; cTo2: $00; cTo3: $00),  // ђ to d
+    (cFrom: $0453; cTo0: $67; cTo1: $00; cTo2: $00; cTo3: $00),  // ѓ to g
+    (cFrom: $0454; cTo0: $65; cTo1: $00; cTo2: $00; cTo3: $00),  // є to e
+    (cFrom: $0455; cTo0: $7a; cTo1: $00; cTo2: $00; cTo3: $00),  // ѕ to z
+    (cFrom: $0456; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // і to i
+    (cFrom: $0457; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ї to i
+    (cFrom: $0458; cTo0: $6a; cTo1: $00; cTo2: $00; cTo3: $00),  // ј to j
+    (cFrom: $0459; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // љ to i
+    (cFrom: $045A; cTo0: $6e; cTo1: $00; cTo2: $00; cTo3: $00),  // њ to n
+    (cFrom: $045B; cTo0: $64; cTo1: $00; cTo2: $00; cTo3: $00),  // ћ to d
+    (cFrom: $045C; cTo0: $6b; cTo1: $00; cTo2: $00; cTo3: $00),  // ќ to k
+    (cFrom: $045D; cTo0: $69; cTo1: $00; cTo2: $00; cTo3: $00),  // ѝ to i
+    (cFrom: $045E; cTo0: $75; cTo1: $00; cTo2: $00; cTo3: $00),  // ў to u
+    (cFrom: $045F; cTo0: $64; cTo1: $00; cTo2: $00; cTo3: $00),  // џ to d
+    (cFrom: $1E02; cTo0: $42; cTo1: $00; cTo2: $00; cTo3: $00),  // Ḃ to B
+    (cFrom: $1E03; cTo0: $62; cTo1: $00; cTo2: $00; cTo3: $00),  // ḃ to b
+    (cFrom: $1E0A; cTo0: $44; cTo1: $00; cTo2: $00; cTo3: $00),  // Ḋ to D
+    (cFrom: $1E0B; cTo0: $64; cTo1: $00; cTo2: $00; cTo3: $00),  // ḋ to d
+    (cFrom: $1E1E; cTo0: $46; cTo1: $00; cTo2: $00; cTo3: $00),  // Ḟ to F
+    (cFrom: $1E1F; cTo0: $66; cTo1: $00; cTo2: $00; cTo3: $00),  // ḟ to f
+    (cFrom: $1E40; cTo0: $4D; cTo1: $00; cTo2: $00; cTo3: $00),  // Ṁ to M
+    (cFrom: $1E41; cTo0: $6D; cTo1: $00; cTo2: $00; cTo3: $00),  // ṁ to m
+    (cFrom: $1E56; cTo0: $50; cTo1: $00; cTo2: $00; cTo3: $00),  // Ṗ to P
+    (cFrom: $1E57; cTo0: $70; cTo1: $00; cTo2: $00; cTo3: $00),  // ṗ to p
+    (cFrom: $1E60; cTo0: $53; cTo1: $00; cTo2: $00; cTo3: $00),  // Ṡ to S
+    (cFrom: $1E61; cTo0: $73; cTo1: $00; cTo2: $00; cTo3: $00),  // ṡ to s
+    (cFrom: $1E6A; cTo0: $54; cTo1: $00; cTo2: $00; cTo3: $00),  // Ṫ to T
+    (cFrom: $1E6B; cTo0: $74; cTo1: $00; cTo2: $00; cTo3: $00),  // ṫ to t
+    (cFrom: $1E80; cTo0: $57; cTo1: $00; cTo2: $00; cTo3: $00),  // Ẁ to W
+    (cFrom: $1E81; cTo0: $77; cTo1: $00; cTo2: $00; cTo3: $00),  // ẁ to w
+    (cFrom: $1E82; cTo0: $57; cTo1: $00; cTo2: $00; cTo3: $00),  // Ẃ to W
+    (cFrom: $1E83; cTo0: $77; cTo1: $00; cTo2: $00; cTo3: $00),  // ẃ to w
+    (cFrom: $1E84; cTo0: $57; cTo1: $00; cTo2: $00; cTo3: $00),  // Ẅ to W
+    (cFrom: $1E85; cTo0: $77; cTo1: $00; cTo2: $00; cTo3: $00),  // ẅ to w
+    (cFrom: $1EF2; cTo0: $59; cTo1: $00; cTo2: $00; cTo3: $00),  // Ỳ to Y
+    (cFrom: $1EF3; cTo0: $79; cTo1: $00; cTo2: $00; cTo3: $00),  // ỳ to y
+    (cFrom: $FB00; cTo0: $66; cTo1: $66; cTo2: $00; cTo3: $00),  // ﬀ to ff
+    (cFrom: $FB01; cTo0: $66; cTo1: $69; cTo2: $00; cTo3: $00),  // ﬁ to fi
+    (cFrom: $FB02; cTo0: $66; cTo1: $6C; cTo2: $00; cTo3: $00),  // ﬂ to fl
+    (cFrom: $FB05; cTo0: $73; cTo1: $74; cTo2: $00; cTo3: $00),  // ﬅ to st
+    (cFrom: $FB06; cTo0: $73; cTo1: $74; cTo2: $00; cTo3: $00)   // ﬆ to st
+  );
+
+{ utf8Charlen — spellfix.c:1283..1292. }
+function utf8Charlen(zIn: PAnsiChar; nIn: i32): i32;
+var
+  i, sz, nChar: i32;
+begin
+  i := 0;
+  nChar := 0;
+  while i < nIn do
+  begin
+    utf8Read(PByte(zIn) + i, nIn - i, @sz);
+    Inc(i, sz);
+    Inc(nChar);
+  end;
+  Result := nChar;
+end;
+
+{ spellfixFindTranslit — spellfix.c:1698..1701.  Upstream simply
+  returns the full table; xTop receives the last index.  Kept as
+  a function (rather than inlined) so any future range-narrowing
+  optimisation can hook here. }
+function spellfixFindTranslit(c: i32; out xTop: i32): PTransliteration;
+begin
+  xTop := TRANSLIT_COUNT - 1;
+  Result := @translit[0];
+end;
+
+{ transliterate — spellfix.c:1713..1763.  Walks UTF-8 input one
+  code point at a time, copies ASCII straight through, binary-
+  searches the translit[] table for non-ASCII matches, emits '?'
+  for unmappable code points.  Result is a sqlite3_malloc-backed
+  NUL-terminated byte buffer; caller releases via sqlite3_free. }
+function transliterate(zIn: PByte; nIn: i32): PByte;
+var
+  zOut: PByte;
+  c, sz, nOut, xTop, xBtm, x: i32;
+  tbl: PTransliteration;
+  e: PTransliteration;
+begin
+  zOut := PByte(sqlite3_malloc64(u64(nIn) * 4 + 1));
+  if zOut = nil then begin Result := nil; Exit; end;
+  nOut := 0;
+  while nIn > 0 do
+  begin
+    c := utf8Read(zIn, nIn, @sz);
+    Inc(zIn, sz);
+    Dec(nIn, sz);
+    if c <= 127 then
+    begin
+      zOut[nOut] := Byte(c);
+      Inc(nOut);
+    end
+    else
+    begin
+      tbl := spellfixFindTranslit(c, xTop);
+      xBtm := 0;
+      while xTop >= xBtm do
+      begin
+        x := (xTop + xBtm) div 2;
+        e := tbl + x;
+        if i32(e^.cFrom) = c then
+        begin
+          zOut[nOut] := e^.cTo0; Inc(nOut);
+          if e^.cTo1 <> 0 then
+          begin
+            zOut[nOut] := e^.cTo1; Inc(nOut);
+            if e^.cTo2 <> 0 then
+            begin
+              zOut[nOut] := e^.cTo2; Inc(nOut);
+              if e^.cTo3 <> 0 then
+              begin
+                zOut[nOut] := e^.cTo3; Inc(nOut);
+              end;
+            end;
+          end;
+          c := 0;
+          Break;
+        end
+        else if i32(e^.cFrom) > c then
+          xTop := x - 1
+        else
+          xBtm := x + 1;
+      end;
+      if c <> 0 then
+      begin
+        zOut[nOut] := Byte(Ord('?'));
+        Inc(nOut);
+      end;
+    end;
+  end;
+  zOut[nOut] := 0;
+  Result := zOut;
+end;
+
+{ translen_to_charlen — spellfix.c:1771..1808.  Returns the number
+  of characters in the shortest input prefix that transliterates to
+  at least nTrans output bytes.  Used by the spellfix1 vtab when
+  truncating row matches to fixed-width output. }
+function translen_to_charlen(zIn: PAnsiChar; nIn, nTrans: i32): i32;
+var
+  i, c, sz, nOut, nChar, xTop, xBtm, x: i32;
+  tbl: PTransliteration;
+  e: PTransliteration;
+begin
+  i := 0;
+  nOut := 0;
+  nChar := 0;
+  while (i < nIn) and (nOut < nTrans) do
+  begin
+    c := utf8Read(PByte(zIn) + i, nIn - i, @sz);
+    Inc(i, sz);
+    Inc(nOut);
+    if c >= 128 then
+    begin
+      tbl := spellfixFindTranslit(c, xTop);
+      xBtm := 0;
+      while xTop >= xBtm do
+      begin
+        x := (xTop + xBtm) div 2;
+        e := tbl + x;
+        if i32(e^.cFrom) = c then
+        begin
+          if e^.cTo1 <> 0 then
+          begin
+            Inc(nOut);
+            if e^.cTo2 <> 0 then
+            begin
+              Inc(nOut);
+              if e^.cTo3 <> 0 then Inc(nOut);
+            end;
+          end;
+          Break;
+        end
+        else if i32(e^.cFrom) > c then
+          xTop := x - 1
+        else
+          xBtm := x + 1;
+      end;
+    end;
+    Inc(nChar);
+  end;
+  Result := nChar;
+end;
+
+{ cdecl trampoline so the destructor pointer matches TxDelProc.
+  Cannot reference @sqlite3_free directly because FPC propagates the
+  external 'c' calling convention as register through `@`. }
+procedure translitFreeDel(p: Pointer); cdecl;
+begin
+  sqlite3_free(p);
+end;
+
+{ transliterateSqlFunc — spellfix.c:1817..1830.
+
+    spellfix1_translit(X)
+
+  Convert a UTF-8 string with non-ASCII Roman characters into pure
+  ASCII via the translit[] map. }
+procedure transliterateSqlFunc(pCtx: Psqlite3_context; argc: i32;
+  argv: PPMem); cdecl;
+var
+  zIn: PByte;
+  nIn: i32;
+  zOut: PByte;
+begin
+  zIn := PByte(sqlite3_value_text(argv[0]));
+  nIn := sqlite3_value_bytes(argv[0]);
+  zOut := transliterate(zIn, nIn);
+  if zOut = nil then
+    sqlite3_result_error_nomem(pCtx)
+  else
+    sqlite3_result_text(pCtx, PAnsiChar(zOut), -1, @translitFreeDel);
+end;
+
 function sqlite3SpellfixInit(db: PTsqlite3): i32;
 const
   FFlags = SQLITE_UTF8 or SQLITE_DETERMINISTIC;
@@ -654,6 +1246,9 @@ begin
   if rc = SQLITE_OK then
     rc := sqlite3_create_function(db, 'spellfix1_scriptcode', 1, FFlags, nil,
                                   @scriptCodeSqlFunc, nil, nil);
+  if rc = SQLITE_OK then
+    rc := sqlite3_create_function(db, 'spellfix1_translit', 1, FFlags, nil,
+                                  @transliterateSqlFunc, nil, nil);
   Result := rc;
 end;
 

@@ -1490,28 +1490,33 @@ existing dispatcher.
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
   [~] **10.1.99** ext/misc/spellfix.c scalar-functions subset ported as
-       new unit `passqlite3spellfix.pas` (~480 lines Pascal porting
-       ~520 C lines from spellfix.c:42..538 + 1258..1896).  Provides
-       the SQL functions `spellfix1_phonehash(X)`, `spellfix1_editdist(A,B)`,
-       and `spellfix1_scriptcode(X)`.  Faithful 1:1 port of the
-       midClass[128] / initClass[128] / className[13] tables, the
-       phoneticHash silent-letter and vowel-elision pipeline (gn/kn-strip,
-       wr-skip, dj/dg-skip, tch-skip, no-vowels-beside-LR rule), the
-       characterClass / insertOrDeleteCost / substituteCost cost
-       functions, the editdist1 Wagner matrix with prefix-match
-       (zA ending in '*'), and the scriptCode UTF-8 walk over the
-       Latin/Cyrillic/Greek/Hebrew/Arabic Unicode ranges.  Wired via
-       `sqlite3SpellfixInit(p^.db)` in shell openDb.  Verified
-       byte-identical against `.load /tmp/spellfix` running under the
-       system sqlite3 across 14 test cases (phonehash on
+       new unit `passqlite3spellfix.pas` (~1245 lines Pascal porting
+       ~1100 C lines from spellfix.c:42..538 + 1243..1830 + 1848..1896).
+       Provides `spellfix1_phonehash(X)`, `spellfix1_editdist(A,B)`,
+       `spellfix1_scriptcode(X)`, and `spellfix1_translit(X)`.
+       Translit landed 2026-05-07: ~580 new lines covering the 389-row
+       translit[] table, utf8Charlen / spellfixFindTranslit /
+       transliterate / translen_to_charlen / transliterateSqlFunc.
+       Faithful 1:1 port of spellfix.c:1294..1830 (default build, no
+       SQLITE_SPELLFIX_5BYTE_MAPPINGS); `transliterate` returns a
+       sqlite3_malloc-backed buffer with a cdecl trampoline freeing
+       through sqlite3_free (same pattern as base64).  Verified
+       byte-identical against `.load /tmp/spellfix.so` running under
+       the system sqlite3 across `café` -> `cafe`, `Ünıön` -> `Uenioen`,
+       `Здра` -> `Zdra`, `αβγ` -> `abg`, `héllo wörld` -> `hello woerld`,
+       ASCII passthrough, empty input, 3-byte ligatures (`ﬂ` -> `fl`,
+       `ﬃ` -> `?` because U+FB03 is not in the table), and a 4-byte
+       UTF-8 emoji (`x'F09F8C8D'` -> `?`).  Earlier-ported scalar set
+       (phoneticHash, editdist1 with consonant-class costing, scriptCode)
+       remains green: 14-case parity sweep across phonehash on
        'phonetics'/'Cleen'/'Klean'/'knight'/'night'/'', editdist on
        'kitten'->'sitting' = 105, 'kitt*'->'kittenish' prefix match = 0,
        cleen/clean = 25, color/colour = 20; scriptcode across hello/
-       Здра/αβγ/שלום).  The full spellfix1 virtual table (vocabulary
-       fuzzy search), the configurable-cost editdist3 family
-       (~600 C lines), and the transliterate machinery
-       (~700 C lines including the Transliteration table) are NOT yet
-       ported and remain in the source for a future pass.
+       Здра/αβγ/שלום.  Wired via `sqlite3SpellfixInit(p^.db)` in shell
+       openDb.  The full spellfix1 virtual table (vocabulary fuzzy
+       search) and the configurable-cost editdist3 family (~600 C lines
+       remaining) are NOT yet ported and remain in the source for a
+       future pass.
 
   [X] **10.1.98** ext/misc/zipfile.c (2293 C lines) ported as new unit
        `passqlite3zipfile.pas` (~1100 lines).  Provides the `zipfile`
