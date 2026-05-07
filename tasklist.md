@@ -816,12 +816,18 @@ existing dispatcher.
        — verified byte-identical to system `sqlite3` for `.foo`.
        Per-command handlers land in 10.1.7..10.1.59.
 
-- [ ] **10.1b** Output modes + formatting controls.  `.mode`
+- [ ] **10.1b** Output modes + formatting controls. Gate: `tests/cli/10b_modes/`.  
+  - [ ] `.mode`
   (`list`, `line`, `column`, `csv`, `tabs`, `html`, `insert`, `quote`,
-  `json`, `markdown`, `table`, `box`, `tcl`, `ascii`), `.headers`,
-  `.separator`, `.nullvalue`, `.width`, `.echo`, `.changes`,
-  `.print` / `.parameter` (formatting-only subset), Unicode-width
-  helpers, box-drawing renderer.  Gate: `tests/cli/10b_modes/`.
+  `json`, `markdown`, `table`, `box`, `tcl`, `ascii`), 
+  - [ ] `.headers`,
+  - [ ] `.separator`, 
+  - [ ] `.nullvalue`, 
+  - [ ] `.width`, 
+  - [ ] `.echo`, 
+  - [ ] `.changes`,
+  - [ ] `.print` / `.parameter` (formatting-only subset), Unicode-width
+  helpers, box-drawing renderer.
 
   [X] **10.1.7** `.mode` dispatcher (~10470) — `modeChange` /
        `modeChangeBuiltin` / `modeFind` ported from shell.c.in:1642..1728
