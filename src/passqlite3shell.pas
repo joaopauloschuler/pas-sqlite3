@@ -98,6 +98,7 @@ uses
   passqlite3vtablog,
   passqlite3scrub,
   passqlite3fossildelta,
+  passqlite3csv,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -653,6 +654,10 @@ begin
     (1109 C lines): delta_create / delta_apply / delta_output_size SQL
     functions plus the delta_parse(D) eponymous table-valued function. }
   sqlite3FossildeltaInit(p^.db);
+  { Phase 10.1.82 — csv virtual table from ext/misc/csv.c (977 C lines):
+    CREATE VIRTUAL TABLE temp.t USING csv(filename=…) reads RFC-4180 CSV
+    either from a file or from an inline data= string. }
+  sqlite3CsvInit(p^.db);
   { vtablog (ext/misc/vtablog.c, 720 C lines) is exported but NOT
     auto-installed — every callback writes a trace line to stdout, so
     auto-registering would corrupt every shell session.  Loading it

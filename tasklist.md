@@ -1434,6 +1434,31 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.82** ext/misc/csv.c (977 C lines) ported as new unit
+       `passqlite3csv.pas` (~610 lines).  Provides the `csv` virtual table
+       (CREATE VIRTUAL TABLE … USING csv(filename=…|data=…
+       [,schema=…][,columns=N][,header=YES|NO])) for reading RFC-4180 CSV
+       from a file or inline string.  Full CsvReader port (UTF-8 BOM
+       skip, RFC-4180 quoted fields with embedded commas / row
+       terminators / doubled quotes, `\r\n` and bare `\n` row
+       terminators).  fopen/fread/fclose/fseek/ftell bound directly via
+       libc.  csv_dequote / csv_trim_whitespace / csv_parameter /
+       csv_string_parameter / csv_boolean_parameter ported 1:1; the
+       schema-discovery branch composes the `CREATE TABLE x(...)` via
+       sqlite3_str / sqlite3_str_appendf with the `%w` identifier
+       quoter.  The C `goto csvtab_connect_oom / _error` cleanup chain
+       is preserved 1:1 with Pascal labels.  Auto-registered via
+       sqlite3CsvInit in shell openDb.  Verified byte-identical against
+       `.load /tmp/csv.so` running under the system sqlite3 across:
+       basic file load (3 rows × 3 cols), inline data= with header=YES,
+       schema= override with typed column projection, columns=N
+       projection, RFC-4180 quoted-field parsing including embedded
+       comma and doubled-quote (`"hello, world"`, `"quote""inside"`),
+       and the `bad parameter: 'xyz=foo'` error path.  TestExplainParity
+       1026/1026; DiagFeatureProbe / DiagOps / DiagFunctions / DiagDml /
+       DiagPragma / DiagTxn / DiagMisc / DiagCast / TestVdbeAgg /
+       DiagAnalyze all clean.
+
   [X] **10.1.81** ext/misc/dbdump.c (724 C lines) ported as new unit
        `passqlite3dbdump.pas` (~658 lines).  Provides the public helper
        `sqlite3_db_dump(db, zSchema, zTable, xCallback, pArg)` that
