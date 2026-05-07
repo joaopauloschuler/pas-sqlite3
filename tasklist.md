@@ -1434,6 +1434,35 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.85** ext/misc/vfslog.c (760 C lines) ported as new unit
+       `passqlite3vfslog.pas` (~640 lines).  Provides the `vfslog` VFS
+       shim — when registered via `sqlite3_register_vfslog(zArg)` it
+       becomes the new default VFS, layered on top of whatever VFS was
+       previously default, and writes a CSV-formatted trace of every
+       disk operation to a per-database log file named
+       `<dbpath>-debuglog-<usec-since-epoch>` next to the original db.
+       Each trace line has eight comma-separated fields:
+       `tStart,tElapsed,opcode,isJournal,iArg1,iArg2,zArg3,iResult`.
+       Paired VLogLog[2] layout preserved so a single connection's
+       writes to the database and its rollback journal land in the same
+       file (with isJournal=1 distinguishing the journal half).
+       WAL files (`-wal`) and master journals (`-mj??????9??`) are
+       skipped per upstream.  vlogSignature mirrors the C 16-byte hex
+       dump for short blocks plus the 64-bit rolling-sum digest tail
+       for longer ones; vlogRead/vlogWrite both decode the page-1
+       change-counter field and emit CHNGCTR-{READ,WRITE} lines per
+       upstream behaviour.  Pascal-port adaptations: libc fopen /
+       fclose / fprintf / gettimeofday / gethostname / getpid bound
+       directly; `sqlite3_mprintf("vlog/%z", ...)` simulated via a
+       hand-rolled prepend-and-take-ownership helper because the
+       Pascal sqlite3_mprintf cdecl entry has no varargs surface;
+       SQLITE_MUTEX_STATIC_MAIN used in place of the C alias
+       SQLITE_MUTEX_STATIC_MASTER (same id=2).  Verified end-to-end
+       via new `bin/DiagVfslog`: CREATE/INSERT/SELECT round-trip on a
+       fresh on-disk db produces a debuglog file containing IDENT /
+       OPEN / READ / WRITE / CLOSE / FILESIZE records.
+       TestExplainParity 1026/1026.
+
   [X] **10.1.84** ext/misc/appendvfs.c (672 C lines) ported as new unit
        `passqlite3appendvfs.pas` (~530 lines).  Provides the `apndvfs`
        VFS shim that allows opening a SQLite database appended onto the

@@ -101,6 +101,7 @@ uses
   passqlite3csv,
   passqlite3closure,
   passqlite3appendvfs,
+  passqlite3vfslog,
   passqlite3main;
 
 { ----------------------------------------------------------------------
