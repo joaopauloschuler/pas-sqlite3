@@ -1454,6 +1454,43 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.97** ext/recover/dbdata.c (1023 C lines) ported as new unit
+       `passqlite3dbdata.pas` (~620 lines).  Provides two eponymous virtual
+       tables that read raw b-tree page bytes via the sqlite_dbpage vtab:
+       `sqlite_dbdata(pgno, cell, field, value, schema HIDDEN)` yields one
+       row per record-field on every b-tree page (rowid value reported as
+       field=-1 for intkey b-trees), and `sqlite_dbptr(pgno, child, schema
+       HIDDEN)` yields one row per parent->child b-tree pointer.  Both
+       modules tolerate corruption: a bad page yields no rows for that
+       page rather than an error.  Faithful 1:1 port: DbdataBuffer +
+       DbdataCursor + DbdataTable records preserve C field order;
+       dbdataLoadPage / dbdataNext / dbdataValue / dbdataValueBytes /
+       dbdataGetVarint / dbdataGetVarintU32 / dbdataIsFunction /
+       dbdataDbsize / dbdataGetEncoding / dbdataResetCursor / xConnect /
+       xDisconnect / xBestIndex / xOpen / xClose / xFilter / xColumn /
+       xRowid mirror the C source.  The serial-type 1..7 fall-through
+       chain (C: `case 7: case 6: case 5: ...` without breaks) expanded
+       into per-case Pascal blocks so the sign-extended big-endian
+       byte-stitching matches byte-for-byte.  Pascal-port adaptations:
+       `{$POINTERMATH ON}` enables Pu8 + offset arithmetic; the same
+       `dbdataModule` Tsqlite3_module is registered twice (with pAux=nil
+       and pAux=Pointer(1) to distinguish dbdata vs dbptr); xFilter
+       reads PPsqlite3_value via local PPsqlite3_value typedef from
+       passqlite3vdbe.  Workaround for a pre-existing engine gap: upstream
+       dbdataDbsize uses `PRAGMA %Q.page_count` but that PRAGMA returns
+       no rows in the Pascal port (same gap noted under cmdDbtotxt in
+       passqlite3shell.pas:3951); fall back to
+       `SELECT count(*) FROM sqlite_dbpage(?)` instead.  Auto-registered
+       in shell openDb so .recover (10.1.48) lands cleanly atop it.
+       Verified end-to-end: `CREATE TABLE t1(a,b); INSERT INTO t1 VALUES
+       ('v','five'),('x','ten'); SELECT pgno,cell,field,value FROM
+       sqlite_dbdata WHERE pgno=2;` returns the documented six rows
+       (2|0|-1|1, 2|0|0|v, 2|0|1|five, 2|1|-1|2, 2|1|0|x, 2|1|1|ten),
+       byte-identical to the C reference run via `.load /tmp/dbdata`.
+       sqlite_dbptr returns 0 rows on a leaf-only schema (no interior
+       b-tree pointers exist).  TestExplainParity 1026/1026; TestSmoke
+       PASSED; DiagFeatureProbe clean.
+
   [X] **10.1.96** ext/intck/sqlite3intck.c (941 C lines) ported as new unit
        `passqlite3intck.pas` (~620 lines).  Provides the incremental
        integrity-check API: `sqlite3_intck_open(db, zDb, ppOut)`,

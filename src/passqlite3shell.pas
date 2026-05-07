@@ -113,6 +113,7 @@ uses
   passqlite3compress,
   passqlite3sqlar,
   passqlite3intck,
+  passqlite3dbdata,
   passqlite3memtrace,
   passqlite3pcachetrace,
   passqlite3main;
@@ -731,6 +732,10 @@ begin
     in its caller's row schema). }
   sqlite3CompressInit(p^.db);
   sqlite3SqlarInit(p^.db);
+  { Phase 10.1.97 — sqlite_dbdata / sqlite_dbptr eponymous virtual tables
+    from ext/recover/dbdata.c (1023 C lines).  Reads raw b-tree page bytes
+    via sqlite_dbpage; backing storage for the upcoming .recover dot-cmd. }
+  sqlite3DbdataRegister(p^.db);
 end;
 
 procedure closeDb(db: PTsqlite3);
