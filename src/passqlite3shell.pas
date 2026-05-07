@@ -101,6 +101,7 @@ uses
   passqlite3csv,
   passqlite3closure,
   passqlite3appendvfs,
+  passqlite3cksumvfs,
   passqlite3vfslog,
   passqlite3vfsstat,
   passqlite3fileio,
@@ -673,6 +674,13 @@ begin
     lines): allows opening a SQLite database appended at the end of
     another file (e.g. an executable) via `sqlite3_open_v2(..., "apndvfs")`. }
   sqlite3AppendvfsInit(p^.db);
+  { Phase 10.1.90 — verify_checksum SQL function from
+    ext/misc/cksumvfs.c (847 C lines).  Registers only the SQL helper on
+    every connection; the cksmvfs shim itself is exported as
+    sqlite3_register_cksumvfs() but not auto-installed because making
+    cksmvfs the default VFS would intercept every open() and corrupt
+    sessions on databases without an 8-byte reserve. }
+  sqlite3CksumvfsInit(p^.db);
   { Phase 10.1.86 — readfile / writefile / lsmode / realpath SQL functions
     plus the fsdir() eponymous virtual table from ext/misc/fileio.c
     (1234 C lines).  fsdir is the backing storage for `.archive` and

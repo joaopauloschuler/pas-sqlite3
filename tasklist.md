@@ -1438,6 +1438,39 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.90** ext/misc/cksumvfs.c (847 C lines) ported as new unit
+       `passqlite3cksumvfs.pas` (~750 lines).  Provides a VFS shim
+       ("cksmvfs") that maintains an Adler-style two-state 8-byte
+       checksum on the trailing reserve-bytes of every database page;
+       reads return SQLITE_IOERR_DATA on mismatch.  Activated only when
+       the file's reserve-bytes value is exactly 8 (default 0), so
+       checksum bytes are written into the standard reserve-byte tail
+       and never collide with data.  All 19 sqlite3_io_methods plus all
+       19 sqlite3_vfs entries wrapped 1:1; cksmFileControl intercepts
+       the SQLITE_FCNTL_PRAGMA arm so `PRAGMA checksum_verification`
+       can be queried/toggled, and rewrites SQLITE_FCNTL_VFSNAME to
+       wrap with `cksm/<orig>`.  cksmFetch returns NULL when checksums
+       are active so memory-mapped reads never bypass cksmRead.
+       Public entries: `sqlite3_register_cksumvfs(zArg)` /
+       `sqlite3_unregister_cksumvfs` install/remove the layered VFS
+       (with the auto_extension hook), plus a port-convenience
+       `sqlite3CksumvfsInit(db)` that registers only the
+       verify_checksum SQL function on a single connection.  Wired via
+       sqlite3CksumvfsInit in shell openDb so verify_checksum is
+       always available; the VFS shim itself is exported but NOT
+       auto-installed because making cksmvfs the default would
+       intercept every open() and corrupt sessions on databases without
+       an 8-byte reserve.  Pascal-port adaptations: BYTESWAP32 collapsed
+       to the little-endian arm only (x86-64 Linux target);
+       sqlite3_log() omitted because it's private to passqlite3pager
+       (the SQLITE_IOERR_DATA error code still propagates correctly);
+       cksmAutoExtension is a stub since the auto-extension dispatch
+       loop in passqlite3main is registered-but-not-invoked.  Verified
+       end-to-end: verify_checksum over a stored 1024-byte zero blob
+       returns 1, over a stored 1024-byte randomblob returns 0,
+       returns NULL for non-BLOB and out-of-range sizes.
+       TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps clean.
+
   [X] **10.1.89** ext/misc/vtshim.c (553 C lines) ported as new unit
        `passqlite3vtshim.pas` (~620 lines).  Provides the two public
        entry points `sqlite3_create_disposable_module(db, zName, p,
