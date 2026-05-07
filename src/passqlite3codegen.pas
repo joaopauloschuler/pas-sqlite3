@@ -8532,9 +8532,17 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+var
+  pTopSel: PSelect;
 begin
   if (pParse = nil) or (p = nil) then Exit;
   if pParse^.db^.mallocFailed <> 0 then Exit;
+  { Walk the compound pPrior chain so every leaf SELECT in a UNION ALL
+    has its expressions resolved against its own FROM clause.  Mirrors
+    C resolve.c which dispatches per-Select via the walker. }
+  pTopSel := p;
+  while p <> nil do
+  begin
   ResolveExprList(p^.pEList);
   ResolveExpr    (p^.pWhere);
   ResolveExprList(p^.pGroupBy);
@@ -8574,6 +8582,9 @@ begin
   begin
     sqlite3SelectCheckOnClauses(pParse, p);
   end;
+  p := p^.pPrior;
+  end;
+  p := pTopSel;
 end;
 
 function sqlite3ResolveSelfReference(pParse: PParse; pTab: PTable2;
@@ -21090,6 +21101,7 @@ var
   joinFlag: u32;
   pSubSel:  PSelect;
   rcCte:    i32;
+  pCur:     PSelect;
 begin
   FillChar(w, SizeOf(w), 0);
   w.pParse := pParse;
@@ -21107,10 +21119,16 @@ begin
   if (pSelect <> nil) and (pSelect^.pWith <> nil) then
     sqlite3WithPush(pParse, pSelect^.pWith, 0);
 
-  { FROM-clause resolution loop — minimum viable selectExpander. }
-  if (pSelect <> nil) and (pSelect^.pSrc <> nil) then
+  { FROM-clause resolution loop — minimum viable selectExpander.  Walks
+    the compound pPrior chain so every leaf SELECT in a UNION ALL / etc.
+    has its FROM items expanded.  Mirrors C's sqlite3WalkSelect-driven
+    selectExpander which descends pPrior internally. }
+  pCur := pSelect;
+  while pCur <> nil do
   begin
-    pSrc := pSelect^.pSrc;
+  if (pCur <> nil) and (pCur^.pSrc <> nil) then
+  begin
+    pSrc := pCur^.pSrc;
     base := SrcListItems(pSrc);
     for i := 0 to pSrc^.nSrc - 1 do
     begin
@@ -21242,13 +21260,15 @@ begin
         else
           joinFlag := EP_InnerON;
         sqlite3SetJoinExpr(pItem^.u3.pOn, pItem^.iCursor, joinFlag);
-        pSelect^.pWhere := sqlite3ExprAnd(pParse, pSelect^.pWhere,
+        pCur^.pWhere := sqlite3ExprAnd(pParse, pCur^.pWhere,
                                           pItem^.u3.pOn);
         pItem^.u3.pOn  := nil;
         pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $10;  { isOn bit }
-        pSelect^.selFlags := pSelect^.selFlags or SF_OnToWhere;
+        pCur^.selFlags := pCur^.selFlags or SF_OnToWhere;
       end;
     end;
+  end;
+  pCur := pCur^.pPrior;
   end;
 
   { Star-expansion pass — minimal port of selectExpander's TK_ASTERISK
