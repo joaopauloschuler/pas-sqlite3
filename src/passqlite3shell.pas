@@ -99,6 +99,7 @@ uses
   passqlite3scrub,
   passqlite3fossildelta,
   passqlite3csv,
+  passqlite3closure,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -658,6 +659,11 @@ begin
     CREATE VIRTUAL TABLE temp.t USING csv(filename=…) reads RFC-4180 CSV
     either from a file or from an inline data= string. }
   sqlite3CsvInit(p^.db);
+  { Phase 10.1.83 — transitive_closure virtual table from
+    ext/misc/closure.c (971 C lines): CREATE VIRTUAL TABLE … USING
+    transitive_closure(tablename=…, idcolumn=…, parentcolumn=…) computes
+    the transitive closure of a parent/child relation in a real table. }
+  sqlite3ClosureInit(p^.db);
   { vtablog (ext/misc/vtablog.c, 720 C lines) is exported but NOT
     auto-installed — every callback writes a trace line to stdout, so
     auto-registering would corrupt every shell session.  Loading it

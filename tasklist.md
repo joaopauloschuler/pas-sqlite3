@@ -1434,6 +1434,38 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
+  [X] **10.1.83** ext/misc/closure.c (971 C lines) ported as new unit
+       `passqlite3closure.pas` (~640 lines).  Provides the
+       `transitive_closure` virtual table for walking parent/child
+       relations in a real user table:
+       `CREATE VIRTUAL TABLE x USING transitive_closure(tablename=T,
+       idcolumn=X, parentcolumn=P)` plus per-query overrides through
+       hidden constraint columns (root / depth / tablename / idcolumn /
+       parentcolumn).  Full AVL-tree implementation ported 1:1
+       (recompute height / rotate before+after / from-ptr / balance /
+       search / first / next / insert / destroy) plus the BFS queue and
+       the rolling-hash xFilter that prepares
+       `SELECT "%w"."%w" FROM "%w" WHERE "%w"."%w"=?1` once and rebinds
+       the parent id per generation.  The bit-packed idxNum encoding
+       (root flag in bit 0, depth-LT bit in bit 1, four 4-bit argv-index
+       slots at shifts 4/8/12/16) preserved byte-identical to
+       closure.c:827..918, including the empty-set fallback when neither
+       CREATE nor WHERE binds tablename / idcolumn / parentcolumn.
+       Closure C source uses `goto closureConnectError`; preserved in
+       Pascal via `label ErrorExit` (one label per function, matching
+       prior ext/misc ports).  Auto-registered via `sqlite3ClosureInit`
+       in shell openDb.  Same caveat as the prior eponymous-vtab series
+       (10.1.69 / 10.1.71 / 10.1.72 / 10.1.77 / 10.1.80): the Pascal port
+       does not yet wire vtab xBestIndex constraint pushdown
+       (codegen.pas:13938 / 28163), so `SELECT id FROM ct WHERE root=?`
+       falls into closureFilter with idxNum=0 → empty set; the module
+       itself is faithful end-to-end and constraints flow through once
+       pushdown lands.  Verified: CREATE VIRTUAL TABLE registers cleanly
+       with and without arguments, and the populated AVL tree behaves
+       identically to the C reference once primed via direct test
+       harness.  TestExplainParity 1026/1026; DiagFeatureProbe / DiagOps
+       / DiagFunctions clean.
+
   [X] **10.1.82** ext/misc/csv.c (977 C lines) ported as new unit
        `passqlite3csv.pas` (~610 lines).  Provides the `csv` virtual table
        (CREATE VIRTUAL TABLE … USING csv(filename=…|data=…
