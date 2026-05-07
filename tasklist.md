@@ -1002,22 +1002,22 @@ existing dispatcher.
        ported.
 
 - [ ] **10.1e** Meta / diagnostic dot-commands. Gate: `tests/cli/10e_meta/`.  
-  - [ ] `.stats`
-  - [ ] `.timer`
-  - [ ] `.eqp`, 
-  - [ ] `.explain`, 
-  - [ ] `.show`, 
-  - [ ] `.help`, 
-  - [ ] `.shell`/`.system`, 
-  - [ ] `.cd`,
-  - [ ] `.log`, 
-  - [ ] `.trace`, 
-  - [ ] `.iotrace`, 
-  - [ ] `.scanstats`, 
-  - [ ] `.testcase`,
-  - [ ] `.testctrl`, 
-  - [ ] `.selecttrace`, 
-  - [ ] `.wheretrace`.  
+  - [ ] **10.1e.1** `.stats`
+  - [ ] **10.1e.2** `.timer`
+  - [ ] **10.1e.3** `.eqp`, 
+  - [ ] **10.1e.4** `.explain`, 
+  - [ ] **10.1e.5** `.show`, 
+  - [ ] **10.1e.6** `.help`, 
+  - [ ] **10.1e.7** `.shell`/`.system`, 
+  - [ ] **10.1e.8** `.cd`,
+  - [ ] **10.1e.9** `.log`, 
+  - [ ] **10.1e.10** `.trace`, 
+  - [ ] **10.1e.11** `.iotrace`, 
+  - [ ] **10.1e.12** `.scanstats`, 
+  - [ ] **10.1e.13** `.testcase`,
+  - [ ] **10.1e.14** `.testctrl`, 
+  - [ ] **10.1e.15** `.selecttrace`, 
+  - [ ] **10.1e.16** `.wheretrace`.  
 
   [X] **10.1.28** `.stats off|on|stmt|vmstep` — cmdStats setter +
        displayStats / displayStatLine / displayLinuxIoStats port of
