@@ -309,6 +309,29 @@ FPC porting traps that recur often enough to call out up-front:
     BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` (also fails)
     and `PARTITION BY 1` (also fails) — common factor is "no ORDER BY".
 
+    **Additional probe data (2026-05-07):** The bug is broader than
+    "sum/avg returns wrong value" — it actually corrupts the output row
+    structure. `SELECT a, b, count(*) OVER () FROM t` returns
+    `[1,9,3];[null,null,3];[null,null,3]` instead of
+    `[1,10,3];[2,20,3];[3,30,3]` — note the count column (window-aware
+    only via row count) is correct (3 in all rows) but the `b` column
+    reads `9` for the first row and NULL afterward.  `SELECT a FROM t`
+    with no window output is fine (1,2,3).  `SELECT a, sum(b) OVER ()`
+    similarly shows `[1,9];[null,9];[null,9]`.  Working forms:
+    plain agg `SELECT sum(b) FROM t` returns 60; `OVER (ORDER BY a)`
+    running sum 10,30,60; `OVER (PARTITION BY a)` per-row 10,20,30 all
+    correct.  Hypothesis sharpens: the windowFullScan dispatch (no
+    ORDER BY, no explicit frame) consumes the partition-eph rows after
+    first iteration via the `Delete 1; Next 1` tail, so cursor 1 is
+    empty for rows 2/3 — `Column 1 0 3` then reads NULL for outer
+    columns.  Plus the `9` literal at row 1's `b` slot suggests a
+    register-collision with `Integer 1 9 0` (sets r[9]=1) that the
+    output Gosub at addr 59 may be reading from instead of cursor 1.
+    Real fix probably needs to mirror C's coroutine-driven source
+    iteration (InitCoroutine/Yield) instead of the OpenEphemeral/
+    Sorter cursor 5 path — see the EXPLAIN structural delta noted
+    above.
+
 - [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
     valued PRAGMA functions) returns rows when called with a literal
     argument but yields no rows when joined laterally against
