@@ -19545,7 +19545,7 @@ var
   v:         PVdbe;
   iContinue: i32;
   addr:      i32;
-  addr1, addr2: i32;
+  addr1, addr2, addrTest: i32;
   r1, r2, r3: i32;
   iParm:     i32;
   pSO:       PExprList;
@@ -19584,8 +19584,14 @@ begin
       if (pDest^.eDest = SRT_Table) and (pDest^.iSDParm2 <> 0) then
         sqlite3VdbeChangeP5(v, OPFLAG_NOCHNG_MAGIC);
       if pDest^.eDest = SRT_DistFifo then
+      begin
+        { select.c:1334..1338 — skip the IdxInsert + NewRowid + Insert
+          triple if the row is already present in the dedup index. }
+        sqlite3VdbeAddOp4Int(v, OP_Found, iParm + 1,
+                             sqlite3VdbeCurrentAddr(v) + 4, r1, 0);
         sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iParm + 1, r1,
           pIn^.iSdst, pIn^.nSdst);
+      end;
       sqlite3VdbeAddOp2(v, OP_NewRowid, iParm, r2);
       sqlite3VdbeAddOp3(v, OP_Insert, iParm, r1, r2);
       sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
@@ -19636,9 +19642,20 @@ begin
       r1 := sqlite3GetTempReg(pParse);
       r2 := sqlite3GetTempRange(pParse, nKey + 2);
       r3 := r2 + nKey + 1;
+      addrTest := 0;
+      if pDest^.eDest = SRT_DistQueue then
+      begin
+        { select.c:1479..1481 — Found short-circuits the entire DistQueue
+          insert when the row is already present in the dedup index. }
+        addrTest := sqlite3VdbeAddOp4Int(v, OP_Found, iParm + 1, 0,
+                                         pIn^.iSdst, pIn^.nSdst);
+      end;
       sqlite3VdbeAddOp3(v, OP_MakeRecord, pIn^.iSdst, pIn^.nSdst, r3);
       if pDest^.eDest = SRT_DistQueue then
+      begin
         sqlite3VdbeAddOp2(v, OP_IdxInsert, iParm + 1, r3);
+        sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+      end;
       pSOItems := ExprListItems(pSO);
       for ii := 0 to nKey - 1 do
         sqlite3VdbeAddOp2(v, OP_SCopy,
@@ -19646,6 +19663,7 @@ begin
       sqlite3VdbeAddOp2(v, OP_Sequence, iParm, r2 + nKey);
       sqlite3VdbeAddOp3(v, OP_MakeRecord, r2, nKey + 2, r1);
       sqlite3VdbeAddOp4Int(v, OP_IdxInsert, iParm, r1, r2, nKey + 2);
+      if addrTest <> 0 then sqlite3VdbeJumpHere(v, addrTest);
       sqlite3ReleaseTempReg(pParse, r1);
       sqlite3ReleaseTempRange(pParse, r2, nKey + 2);
     end;
@@ -23170,8 +23188,14 @@ begin
       r2 := sqlite3GetTempReg(pParse);
       sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
       if pDest^.eDest = SRT_DistFifo then
+      begin
+        { select.c:1334..1338 — Found short-circuits IdxInsert + NewRowid +
+          Insert when the row is already present in the dedup index. }
+        sqlite3VdbeAddOp4Int(v, OP_Found, pDest^.iSDParm + 1,
+                             sqlite3VdbeCurrentAddr(v) + 4, r1, 0);
         sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm + 1, r1,
           pDest^.iSdst, nResultCol);
+      end;
       sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
       sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
       sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
@@ -25215,8 +25239,14 @@ begin
       r2 := sqlite3GetTempReg(pParse);
       sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
       if pDest^.eDest = SRT_DistFifo then
+      begin
+        { select.c:1334..1338 — Found short-circuits IdxInsert + NewRowid +
+          Insert when the row is already present in the dedup index. }
+        sqlite3VdbeAddOp4Int(v, OP_Found, pDest^.iSDParm + 1,
+                             sqlite3VdbeCurrentAddr(v) + 4, r1, 0);
         sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm + 1, r1,
           pDest^.iSdst, nResultCol);
+      end;
       sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
       sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
       sqlite3VdbeChangeP5(v, OPFLAG_APPEND);

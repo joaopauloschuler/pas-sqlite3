@@ -2471,6 +2471,33 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [ ] **10.1.bug.22** `WITH RECURSIVE c(x) AS (SELECT 1 UNION SELECT x+1
+     FROM c WHERE x<5) SELECT * FROM c;` returns just the anchor row `1`
+     followed by `Runtime error: database disk image is malformed`.  Same
+     query with `UNION ALL` works fine (returns 1..5).  Bytecode now
+     matches C for the dedup pattern (Found+IdxInsert pair) after
+     10.1.bug.23 close — corruption is a separate runtime issue, suspected
+     in the iCurrent pseudo-cursor numbering (Pascal allocates iCurrent=0
+     vs C's iCurrent=1) or the OP_Found / IdxInsert path on the dedup
+     ephemeral cursor 3 during the second dequeue iteration.  Repro:
+     `bin/passqlite3 :memory: "WITH RECURSIVE c(x) AS (SELECT 1 UNION
+     SELECT x+1 FROM c WHERE x<5) SELECT * FROM c;"`.
+
+- [X] **10.1.bug.23** Fixed 2026-05-08.  Recursive CTE / generateOutputSubroutine
+     SRT_DistFifo and SRT_DistQueue arms missed the upstream OP_Found
+     short-circuit (select.c:1334..1338 and select.c:1479..1496).  Pascal
+     emitted IdxInsert + NewRowid + Insert unconditionally so a UNION
+     recursive CTE never deduplicated.  Three call sites fixed:
+     (1) selectInnerLoop's SRT_EphemTab/Fifo/DistFifo arm (codegen.pas
+     ~25217); (2) the no-FROM fast path's SRT_DistFifo arm (~23190);
+     (3) generateOutputSubroutine's SRT_Fifo/DistFifo and SRT_DistQueue
+     arms (~19586, ~19640).  After fix the bytecode for the anchor's
+     MakeRecord includes the `Found 3 12 4 0` short-circuit byte-identical
+     to C reference.  Corruption is a separate runtime issue — tracked
+     under 10.1.bug.22.  TestExplainParity 1026/1026; DiagFeatureProbe /
+     DiagOps / DiagFunctions / TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 all clean.
+
 - [X] **10.1.bug.18** Fixed 2026-05-08.  `hex(zeroblob(N))` (and any
      blob-consuming SQL function applied to a zeroblob with N>=1) crashed
      with EAccessViolation.  Root cause: `sqlite3_value_blob`
