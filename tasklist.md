@@ -2666,30 +2666,28 @@ existing dispatcher.
      TestSchemaBasic all clean; DiagWindow now 0 divergences (was 2);
      DiagFunctions / DiagFeatureProbe / DiagOps / DiagDml all 0.
 
-- [ ] **10.1.bug.41** Found 2026-05-08.  `INSERT OR REPLACE` (and
-     `INSERT ... ON CONFLICT DO UPDATE` UPSERT) is a silent no-op when
-     the target table has BOTH a `CHECK` constraint AND a `UNIQUE`
-     column constraint (or `UNIQUE` index).  Reproducer:
-     `CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE,
-                     c REAL CHECK (c >= 0));
-      INSERT INTO t VALUES(1,'a',1.5),(2,'b',2.5);
-      INSERT OR REPLACE INTO t VALUES(2,'b2',9.0);
-      SELECT * FROM t WHERE a=2;`
-     Pas returns `2|b|2.5` (unchanged); upstream returns `2|b2|9.0`.
-     Subsequent `INSERT ... ON CONFLICT(a) DO UPDATE` against the same
-     table also leaves the row unchanged, then any further DML
-     statement reports `Runtime error: unknown error`.
-     Removing either the CHECK constraint OR the UNIQUE column
-     constraint makes the bug disappear (verified independently —
-     both isolated cases match upstream byte-for-byte).
-     Verified against the locally-built libsqlite3.so (3.53) so this
-     is not a version difference — genuine codegen / VDBE divergence.
-     Suspected: CHECK-Halt path interaction with the
-     IdxDelete/NoConflict/Delete REPLACE chain leaves a cursor in a
-     state that breaks subsequent DML.  Likely a missing
-     `sqlite3VdbeAddOp0(v, OP_StackDepth)` or an off-by-one in the
-     OP_Halt p2 / OP_Affinity sequencing inside
-     `sqlite3GenerateConstraintChecks`; not yet root-caused.
+- [X] **10.1.bug.41** Fixed 2026-05-08.  `INSERT OR REPLACE` was a
+     silent no-op when the target table had BOTH a `CHECK` constraint
+     AND a non-NOT-NULL `UNIQUE` column.  Root cause: `sqlite3GenerateIndexKey`
+     (passqlite3codegen.pas:28515) ignored `uniqNotNull` when computing
+     the index-key column count.  C delete.c:993 uses
+     `nCol = (prefixOnly && pIdx->uniqNotNull) ? pIdx->nKeyCol : pIdx->nColumn`
+     — Pas was using `nKeyCol` whenever `prefixOnly` was set, regardless
+     of `uniqNotNull`.  For the autoindex on `b TEXT UNIQUE` (no NOT NULL),
+     uniqNotNull=0, so C loads 2 cols (b + rowid) but Pas was loading only
+     1 (just b), then OP_IdxDelete with `nIdxCol=2` (the OUTER caller
+     correctly uses `nColumn`) read uninitialised r[10] as the rowid key
+     half — IdxDelete missed, OR-REPLACE's existing row stayed put, and
+     the new INSERT silently collided.  Fix: gate `nKeyCol` selection on
+     both `prefixOnly` AND `uniqNotNull`, mirroring C exactly.  Verified:
+     reproducer now matches upstream (`2|b2|9.0`); UPSERT variant works;
+     NOT NULL UNIQUE variant unchanged; TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44
+     all clean; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma /
+     DiagFunctions / DiagTxn / DiagMisc / DiagWindow / DiagCast /
+     DiagDate / DiagAnalyze / DiagDropTable / DiagCovering /
+     DiagIndexing all 0 divergences.
 
 - [X] **10.1.bug.40** Fixed 2026-05-08.  `ORDER BY` on the outer
      SELECT against a recursive CTE was not applied — rows came out in

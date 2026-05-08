@@ -28512,7 +28512,7 @@ begin
     end else
       piPartIdxLabel^ := 0;
   end;
-  if prefixOnly <> 0 then
+  if (prefixOnly <> 0) and (((pIdx^.idxFlags shr 3) and 1) <> 0) then
     nCol := i32(pIdx^.nKeyCol)
   else
     nCol := i32(pIdx^.nColumn);
