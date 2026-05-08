@@ -2485,22 +2485,41 @@ existing dispatcher.
      hex(zeroblob(5))='0000000000' byte-identical to upstream;
      TestExplainParity 1026/1026; DiagFunctions / DiagOps clean.
 
-- [ ] **10.1.bug.21** SELECT … FROM (compound-subquery) WHERE … returns
-     no rows.  Repro: `SELECT * FROM (SELECT 1 a UNION ALL SELECT 2)
-     WHERE a>0;` returns nothing; without the WHERE it returns 1 and 2.
-     `SELECT count(*) FROM (compound)` works.  Same for `WITH t(x) AS
-     (SELECT 1 UNION SELECT 2) SELECT * FROM t WHERE x>1;`.  Pascal
-     EXPLAIN emits only Init/Halt/Goto (3 ops) instead of the
-     coroutine + filter loop the C reference produces.  Likely a missing
-     arm in sqlite3Select / WhereBegin for compound-FROM with a
-     non-empty WHERE clause.
+- [X] **10.1.bug.21** Fixed 2026-05-08.  `SELECT … FROM (compound-subquery)
+     WHERE …` returned no rows.  Root cause: both subquery-FROM arms in
+     `sqlite3Select` (the co-routine arm at codegen.pas ~24428 and the
+     materialise arm at ~24539) gated on `p^.pWhere = nil`, so any
+     outer WHERE caused fall-through to the eventual stub
+     (Init/Halt/Goto, 3 ops).  Fix: lift the gate in both arms and emit
+     `sqlite3ExprIfFalse(pWhere, addrSkip, JUMPIFNULL)` between OP_Yield
+     (or OP_Rewind) and the column copies — addrSkip points at OP_Yield
+     in the co-routine arm (re-fetch next row) and at OP_Next in the
+     materialise arm.  In the co-routine arm the WHERE expression sits
+     inside the (r2, currentAddr) range that `translateColumnToCopy`
+     walks, so OP_Column refs to iCsr in the predicate get rewritten
+     to OP_Copy from regResult alongside the result-list ones.
+     Verified: `SELECT * FROM (SELECT 1 a UNION ALL SELECT 2) WHERE a>0`
+     = 1, 2; `…WHERE a>1` = 2; `WITH t(x) AS (SELECT 1 UNION SELECT 2)
+     SELECT * FROM t WHERE x>1` = 2.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 all clean;
+     DiagFeatureProbe / DiagOps / DiagDml / DiagPragma / DiagFunctions /
+     DiagTxn / DiagMisc / DiagCast all 0 divergences.  Bug 10.1.bug.20
+     (row_number OVER on compound subquery FROM) is a separate runtime
+     issue — EXPLAIN now emits a full window pipeline but the result is
+     still empty; tracked separately.
 
 - [ ] **10.1.bug.20** `row_number() OVER (ORDER BY x) FROM (compound)`
      returns no rows.  Repro: `SELECT row_number() OVER (ORDER BY a)
      FROM (SELECT 'b' a UNION SELECT 'a' UNION SELECT 'c');` returns
      nothing; same with empty `OVER ()` and with `UNION ALL`.  Window
-     function over a concrete CREATE TABLE works fine.  Same root-cause
-     family as bug.21 (compound-subquery FROM source).
+     function over a concrete CREATE TABLE works fine.  After bug.21
+     fix (2026-05-08) the EXPLAIN now emits a full window pipeline
+     (~42 ops with InitCoroutine/AggStep/AggValue/Gosub) but the
+     scan still produces zero rows — runtime issue distinct from
+     bug.21's codegen gap.  Likely the window-arm's nested-coroutine
+     SRT_EphemTab path doesn't drive the inner compound-subquery
+     coroutine to completion before the outer Rewind on cursor 5.
 
 - [ ] **10.1.bug.19** Top-level `VALUES(1),(2),(3);` returns only the
      first row.  Same shape with `SELECT * FROM (VALUES(1),(2),(3))`

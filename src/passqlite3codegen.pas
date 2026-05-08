@@ -24426,7 +24426,6 @@ begin
     allocation entirely.  Falls through to piece 3's materialise arm
     when the inner is correlated. }
   if (p^.pSrc^.nSrc = 1)
-     and (p^.pWhere = nil)
      and ((p^.selFlags and SF_Distinct) = 0)
      and (pDest^.eDest = SRT_Output)
   then
@@ -24504,6 +24503,14 @@ begin
                           pItem^.u4.pSubq^.regReturn, addrEnd);
       r2 := sqlite3VdbeCurrentAddr(v);  { start of body — for translate }
 
+      { Outer WHERE filter — emit before pEList copies so OP_Column refs
+        in the predicate are rewritten by translateColumnToCopy alongside
+        the result-list ones.  Skip back to OP_Yield on false/NULL so the
+        next row is fetched from the coroutine. }
+      if p^.pWhere <> nil then
+        sqlite3ExprIfFalse(pParse, p^.pWhere, addrTopOfLoop,
+                           SQLITE_JUMPIFNULL);
+
       items := ExprListItems(pEList);
       for i := 0 to nResultCol - 1 do
       begin
@@ -24537,7 +24544,6 @@ begin
     always works.  pSTab is non-nil here because piece 2's selectExpander
     subquery hook already ran sqlite3ExpandSubquery on this item. }
   if (p^.pSrc^.nSrc = 1)
-     and (p^.pWhere = nil)
      and ((p^.selFlags and SF_Distinct) = 0)
      and (pDest^.eDest = SRT_Output)
   then
@@ -24586,6 +24592,15 @@ begin
 
       addrEnd       := sqlite3VdbeMakeLabel(pParse);
       addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrEnd);
+      addrSkip := sqlite3VdbeMakeLabel(pParse);
+
+      { Outer WHERE filter — when present, jump to the OP_Next on
+        false/NULL so the next row is examined.  pWhere references
+        columns of the materialised inner via OP_Column on iCsr — no
+        rewrite needed because the eph table is the actual storage. }
+      if p^.pWhere <> nil then
+        sqlite3ExprIfFalse(pParse, p^.pWhere, addrSkip,
+                           SQLITE_JUMPIFNULL);
 
       items := ExprListItems(pEList);
       for i := 0 to nResultCol - 1 do
@@ -24597,6 +24612,7 @@ begin
       end;
       sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
 
+      sqlite3VdbeResolveLabel(v, addrSkip);
       sqlite3VdbeAddOp2(v, OP_Next, iCsr, addrTopOfLoop + 1);
       sqlite3VdbeResolveLabel(v, addrEnd);
       sqlite3VdbeAddOp1(v, OP_Close, iCsr);
