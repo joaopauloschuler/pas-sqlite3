@@ -31109,6 +31109,12 @@ generic_coro_done:
     if regAutoinc > 0 then
       sqlite3VdbeAddOp2(v, OP_MemMax, regAutoinc, regRowid);
 
+    { insert.c:1544..1552 — compute generated columns after the rowid is
+      assigned and before constraint checks, so STORED expressions that
+      reference the new rowid resolve correctly. }
+    if (pTab^.tabFlags and TF_HasGenerated) <> 0 then
+      sqlite3ComputeGeneratedColumns(pParse, regRowid + 1, pTab);
+
     { Phase 6.8.6 productive constraint-check + completion (insert.c:1554..).
       Vtab arm (insert.c:1557..1564) bypasses constraint/index machinery
       entirely and dispatches the row through the module's xUpdate via

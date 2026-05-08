@@ -2474,6 +2474,28 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.38** Fixed 2026-05-08.  STORED generated columns
+     silently held NULL after INSERT.  Reproducer:
+     `CREATE TABLE q(v INTEGER, c INTEGER GENERATED ALWAYS AS (v*2)
+     VIRTUAL, d INTEGER GENERATED ALWAYS AS (v+1) STORED);
+     INSERT INTO q(v) VALUES(5); SELECT v,c,d FROM q;` returned `5|10|`
+     instead of `5|10|6`.  Root cause: `sqlite3Insert`
+     (passqlite3codegen.pas around 31110) was missing the
+     insert.c:1544..1552 unconditional `sqlite3ComputeGeneratedColumns
+     (pParse, regRowid+1, pTab)` call between autoIncStep and
+     `sqlite3GenerateConstraintChecks`.  The expression was therefore
+     never coded into the row image — only the post-REPLACE-conflict
+     follow-up path inside GenerateConstraintChecks (gated on
+     `nSeenReplace>0`) ever computed it, so VIRTUAL columns worked
+     (they're computed at read time) but STORED ones landed as NULL on
+     the freshly-inserted row.  Fix: add the unconditional call mirroring
+     the C source.  TestExplainParity 1026/1026; DiagFeatureProbe /
+     DiagOps / DiagDml / DiagFunctions / DiagDate / DiagCast / DiagPragma
+     / DiagTxn / DiagMisc / DiagWindow / DiagAnalyze / DiagCovering /
+     DiagIndexing / DiagDropTable all clean; TestSmoke / TestDMLBasic /
+     TestSelectBasic / TestWhereBasic / TestVdbeAgg / TestSchemaBasic /
+     TestPrepareBasic / TestParser all green.
+
 - [X] **10.1.bug.36** Fixed 2026-05-08.  Aggregate `FILTER (WHERE …)`
      clause silently inherited a sibling unfiltered aggregate's value.
      Reproducer: `SELECT sum(b) FILTER (WHERE a>2), sum(b) FROM t` —
