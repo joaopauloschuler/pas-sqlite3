@@ -47358,6 +47358,8 @@ type
     s: Double;
     validJD: Boolean;
     jd: Double;  { Julian Day Number }
+    nFloor: i32; { day-overflow accumulator for "floor" modifier (date.c) }
+    useSubsec: Boolean; { "subsec" / "subsecond" modifier flag (date.c) }
   end;
 
 function dateIsLeap(y: i32): Boolean; inline;
@@ -47479,6 +47481,8 @@ begin
   if zStr = nil then Exit;
   s := AnsiString(zStr);
   h := 0; mn := 0; sec := 0.0;
+  dt.nFloor := 0;
+  dt.useSubsec := False;
   { date.c:parseDateOrTime — `now` keyword: setDateTimeToCurrent. }
   if (Length(s) = 3)
      and ((s[1] = 'n') or (s[1] = 'N'))
@@ -47588,6 +47592,54 @@ begin
     Exit;
   end;
 
+  { weekday N — date.c:877..890.  Move the date forward (or stay if
+    already on weekday N) so that it falls on weekday N where 0=Sunday.
+    N must be an exact integer in [0,7). }
+  if sqlite3_strnicmp(zMod, 'weekday ', 8) = 0 then begin
+    if sqlite3AtoF(zMod + 8, r) <= 0 then Exit;
+    if (r < 0.0) or (r >= 7.0) then Exit;
+    iVal := Trunc(r);
+    if r <> iVal then Exit;
+    { Z = current weekday in 0..6; (jd + 1.5) at midnight = JD_noon + 1
+      so Trunc(jd + 1.5) mod 7 yields the same value as
+      ((iJD + 129600000)/86400000) % 7 in the C reference. }
+    nUsed := Trunc(dt.jd + 1.5) mod 7;
+    if nUsed > iVal then Dec(nUsed, 7);
+    dt.jd := dt.jd + (iVal - nUsed);
+    fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+    dt.validJD := True;
+    Result := True;
+    Exit;
+  end;
+
+  { ceiling — date.c:762..767.  Default day-overflow behaviour: clears
+    nFloor so a subsequent "floor" cannot reach back across the boundary. }
+  if sqlite3StrICmp(zMod, 'ceiling') = 0 then begin
+    dt.nFloor := 0;
+    Result := True; Exit;
+  end;
+
+  { floor — date.c:777..782.  Subtract nFloor days (set by the previous
+    +N month / +N year modifier when day-of-month overflowed) so the
+    result clips to the last day of the original target month. }
+  if sqlite3StrICmp(zMod, 'floor') = 0 then begin
+    if dt.nFloor <> 0 then begin
+      dt.jd := dt.jd - dt.nFloor;
+      fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+      dt.validJD := True;
+      dt.nFloor := 0;
+    end;
+    Result := True; Exit;
+  end;
+
+  { subsec / subsecond — date.c:907..911.  Sets the useSubsec flag so
+    datetime() / unixepoch() / strftime('%S') include fractional seconds. }
+  if (sqlite3StrICmp(zMod, 'subsec') = 0) or
+     (sqlite3StrICmp(zMod, 'subsecond') = 0) then begin
+    dt.useSubsec := True;
+    Result := True; Exit;
+  end;
+
   if (zMod^ <> '+') and (zMod^ <> '-') and ((zMod^ < '0') or (zMod^ > '9')) then
     Exit;
 
@@ -47641,6 +47693,14 @@ begin
 
   while dt.mo > 12 do begin Inc(dt.yr); Dec(dt.mo, 12); end;
   while dt.mo < 1  do begin Dec(dt.yr); Inc(dt.mo, 12); end;
+  { Capture day-of-month overflow into nFloor before the rollover loop;
+    a subsequent "floor" modifier rolls those days back to clip to the
+    last day of the original target month (date.c:computeFloor +
+    floor arm at date.c:777..782). }
+  if dt.dy > daysInMonth(dt.yr, dt.mo) then
+    dt.nFloor := dt.dy - daysInMonth(dt.yr, dt.mo)
+  else
+    dt.nFloor := 0;
   while dt.dy > daysInMonth(dt.yr, dt.mo) do begin
     dt.dy := dt.dy - daysInMonth(dt.yr, dt.mo);
     Inc(dt.mo);
@@ -47730,7 +47790,10 @@ begin
   if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
-  snpFmt(SizeOf(buf), buf, '%02d:%02d:%02d', [dt.hr, dt.mi, Trunc(dt.s)]);
+  if dt.useSubsec then
+    snpFmt(SizeOf(buf), buf, '%02d:%02d:%06.3f', [dt.hr, dt.mi, dt.s])
+  else
+    snpFmt(SizeOf(buf), buf, '%02d:%02d:%02d', [dt.hr, dt.mi, Trunc(dt.s)]);
   sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
 end;
 
@@ -47759,8 +47822,12 @@ begin
   if (argc > 1) and (not applyModifiers(argc, 1, argv, dt)) then begin
     sqlite3_result_null(pCtx); Exit;
   end;
-  snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%02d',
-    [dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, Trunc(dt.s)]);
+  if dt.useSubsec then
+    snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%06.3f',
+      [dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s])
+  else
+    snpFmt(SizeOf(buf), buf, '%04d-%02d-%02d %02d:%02d:%02d',
+      [dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, Trunc(dt.s)]);
   sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
 end;
 

@@ -2648,6 +2648,28 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.53** Fixed 2026-05-08.  Date modifiers `weekday N`,
+     `ceiling`, `floor`, `subsec`/`subsecond` were unrecognised and
+     forced the surrounding date function to return NULL.
+     Reproducers: `SELECT date('2024-06-15','weekday 0');` returned
+     NULL instead of `2024-06-16`; `SELECT date('2024-01-31','+1 month',
+     'floor');` returned NULL instead of `2024-02-29`;
+     `SELECT datetime('2024-01-01 00:00:00.500','subsec');` returned
+     NULL instead of `2024-01-01 00:00:00.500`.  Root cause: the Pascal
+     port's `applyModifier` (passqlite3codegen.pas:47553) only handled
+     `start of {day,month,year}` and `+/-N <unit>`; the four arms above
+     were missing.  Fix: ported the C arms verbatim — `weekday N`
+     mirrors date.c:877..890 (Z = (Trunc(jd+1.5) mod 7); shift forward
+     by `(n-Z)` days, with Z-=7 when Z>n); `ceiling` / `floor` track
+     a new `nFloor` field on TDateTime2 captured in the +month/+year
+     rollover (date.c:computeFloor + 777..782); `subsec`/`subsecond`
+     sets a useSubsec flag consumed by datetime/time renderers to
+     emit `%06.3f` for the seconds field.  Verified byte-identical to
+     the linked libsqlite3 across all four arms plus error cases
+     (`weekday 7`, `weekday 1.5`, `weekday -1` all → NULL).
+     TestExplainParity 1026/1026; DiagDate / DiagFunctions / DiagOps /
+     DiagDml / DiagPragma / DiagMisc / DiagFeatureProbe all 0 divergences.
+
 - [X] **10.1.bug.49** Fixed 2026-05-08.  `strftime()` silently echoed
      unsupported format tokens for the ISO-week family.  Reproducer:
      `SELECT strftime('%V','2024-01-15');` returned `%V` (the literal)
