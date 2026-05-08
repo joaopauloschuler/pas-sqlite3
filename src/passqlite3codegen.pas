@@ -23513,13 +23513,15 @@ begin
     pAggI2^.nAccumulator := pAggI2^.nColumn;
     analyzeAggFuncArgs(pAggI2, @sNCAgg);
 
-    { Bail on DISTINCT/iOBTab/EP_WinFunc/NEEDCOLL aggregates — those need
-      ephemeral tables / collation plumbing not in scope here. }
+    { Bail on iOBTab/EP_WinFunc/NEEDCOLL aggregates — those need
+      additional plumbing not in scope here.  DISTINCT aggregates are
+      handled: resetAccumulatorSimple re-opens the per-Func iDistinct
+      ephemeral on every addrReset (per-group), and updateAccumulatorSimple
+      emits OP_Found / OP_IdxInsert dedup before each AggStep. }
     canUseAgg := True;
     for jAgg := 0 to pAggI2^.nFunc - 1 do
     begin
       pAggFunc := @pAggI2^.aFunc[jAgg];
-      if pAggFunc^.iDistinct >= 0 then begin canUseAgg := False; break; end;
       if ((pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0)
          and ((pAggFunc^.pFExpr^.y.pWin = nil)
               or (pAggFunc^.pFExpr^.y.pWin^.eFrmType <> TK_FILTER))

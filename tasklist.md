@@ -2471,6 +2471,34 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.34** Fixed 2026-05-08.  DISTINCT aggregate combined
+     with GROUP BY silently produced no rows.  Reproducer:
+     `CREATE TABLE t(a,b); INSERT INTO t VALUES(1,'a'),(1,'b'),(2,'c');
+     SELECT a, count(DISTINCT b) FROM t GROUP BY a;` returned no rows in
+     Pas vs `1|2; 2|1` in C.  Same for `sum(DISTINCT a)`,
+     `group_concat(DISTINCT b)`, etc., when GROUP BY was present.  Plain
+     DISTINCT aggregates (no GROUP BY) worked because they took the
+     simple-agg arm.  Root cause: the GROUP BY agg path in
+     `sqlite3Select` (codegen.pas:23522) gated `canUseAgg := False`
+     whenever any aggregate had `iDistinct >= 0`, falling through to the
+     plain SELECT path which then bailed at the `pGroupBy <> nil` check
+     (codegen.pas:23775) — silently no-op.  The DISTINCT machinery was
+     already wired below: `resetAccumulatorSimple` (codegen.pas:22387)
+     emits OP_OpenEphemeral on the per-Func iDistinct cursor every
+     time addrReset fires (per-group reset), and
+     `updateAccumulatorSimple` (codegen.pas:22548) emits the OP_Found /
+     OP_IdxInsert dedup chain before each AggStep.  Fix: removed the
+     `iDistinct >= 0` arm from the canUseAgg gate.  Verified
+     byte-identical to system sqlite3 across `count(DISTINCT b)`,
+     `sum(DISTINCT a)`, `group_concat(DISTINCT b)`, multiple-DISTINCT
+     in same SELECT, DISTINCT in HAVING, NULL-only group, and the
+     2-arg `DISTINCT aggregates must have exactly one argument` error.
+     TestExplainParity 1026/1026; DiagFeatureProbe / DiagWindow /
+     DiagDml / DiagOps / DiagFunctions / DiagPragma / DiagMisc /
+     DiagAggWhere / DiagCovering / DiagAnalyze / DiagDropTable /
+     DiagIndexing / DiagMoreFunc / DiagOrderLimitTopN / DiagPredicates /
+     DiagLikeGlob / DiagTxn / DiagDate / DiagCast all clean.
+
 - [X] **10.1.bug.26** Fixed 2026-05-08.  Recursive CTE whose recursive
      arm joins the self-reference against another table corrupted rows
      when the inner JOIN produced more than one row per iteration.
