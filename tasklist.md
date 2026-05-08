@@ -743,15 +743,14 @@ FPC porting traps that recur often enough to call out up-front:
        / DiagFeatureProbe all 0 div; TestExplainParity 1026/1026;
        TestBytecodeParity 32/32.
 
-- [ ] **7.4d** WITHOUT ROWID runtime corruption.  Bytecode parity for
-  `CREATE TABLE x(k PRIMARY KEY, v) WITHOUT ROWID` was closed under
-  7.4b.5, but the runtime path corrupts the page on the first INSERT —
-  `INSERT INTO x VALUES('k','v'); SELECT * FROM x;` raises `database
-  disk image is malformed`.  Repro: `bin/passqlite3 t.db` followed by
-  the two statements above.  Workaround currently in passqlite3shell:
-  paramTableInit emits a plain rowid `temp.sqlite_parameters` table
-  instead of the upstream WITHOUT ROWID variant.  Fix likely in the
-  btree-cell payload assembly for a clustered-key insert.
+- [X] **7.4d** WITHOUT ROWID runtime corruption — closed by
+  **10.1.bug.16** (2026-05-08).  `CREATE TABLE x(k PRIMARY KEY, v)
+  WITHOUT ROWID; INSERT/SELECT/UPDATE/DELETE` now round-trips
+  byte-identical to upstream.  Verified 2026-05-08 (a4): `bin/passqlite3
+  :memory: "CREATE TABLE x(k PRIMARY KEY, v) WITHOUT ROWID;
+  INSERT INTO x VALUES('k','v'); SELECT * FROM x;"` returns `k|v`.
+  paramTableInit in passqlite3shell.pas restored to the upstream
+  `WITHOUT ROWID` form (workaround removed).
 
 - [X] **7.4e** Bare-bareword `INSERT INTO ... VALUES('k', hello)`
   silently bound NULL instead of raising `no such column: hello`.

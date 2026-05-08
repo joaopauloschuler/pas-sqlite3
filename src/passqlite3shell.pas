@@ -5286,14 +5286,11 @@ end;
 
 procedure paramTableInit(p: PShellState);
 const
-  { Upstream emits WITHOUT ROWID here, but the Pascal port's WITHOUT ROWID
-    arm is not yet wired (writes corrupt the page).  Plain rowid table is
-    behaviourally equivalent for the bind-parameter use case. }
   zCreate: PAnsiChar =
     'CREATE TABLE IF NOT EXISTS temp.sqlite_parameters('#10 +
     '  key TEXT PRIMARY KEY,'#10 +
     '  value'#10 +
-    ');';
+    ') WITHOUT ROWID;';
 begin
   if p^.db = nil then Exit;
   sqlite3_exec(p^.db, zCreate, nil, nil, nil);
