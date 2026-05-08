@@ -2512,19 +2512,19 @@ existing dispatcher.
      (codegen.pas:49003) builds the right pSub, sets pSort properly,
      sqlite3SelectNew with pOrderBy=pSort.  Recursive sqlite3Select on
      pSub with SRT_EphemTab does emit SorterOpen + pushOntoSorter +
-     sort tail (line 25260+, 25542+).  EXPLAIN shows the SorterInsert /
-     SorterSort / OpenPseudo chain.  But the materialised eph cursor 5
-     ends up containing rows in INPUT order, not sort order — the
-     window's main loop walks them, the partition compare always says
-     EQ (since key never changes when input is monotonic and adjacent
-     rows happen to compare-equal-by-accident or because partition
-     value is read off the wrong column).  Same family as bug.25 (3-col
-     projection with window function) and probably shares root cause:
-     the SRT_EphemTab sort tail + downstream materialisation inserts
-     rows into the consumer eph in some order that does not match the
-     sort key.  Estimated work: half-day; needs a vdbe-trace run to
-     confirm whether the sorter itself is wrong or the materialisation
-     drains in the wrong order.
+     sort tail (line 25260+, 25542+).  EXPLAIN confirms cursor 5 IS
+     drained in sort order and cursor 1 (window buffer) is filled
+     in that same order; the partition Compare reads the right
+     register.  Same root cause as **10.1.bug.25** above:  Pas's
+     pushOntoSorter SRT_EphemTab arm (codegen.pas:25260..25284) packs
+     `[sortKey ; pSublist...]` without deduping the sort-key against
+     iOrderByCol-tagged pSublist entries the way C's
+     `sqlite3ExprCodeExprList(... SQLITE_ECEL_REF)` chain does
+     (select.c:781..788 + the SortCtx-driven layout).  The +1 column
+     shift in the eph row layout misaligns the partition/peer compare
+     downstream so all rows compare-equal and fall into one partition.
+     Closing this requires the joint pushOntoSorter port — see bug.25
+     for the full fix-attempt log.
 
 - [X] **10.1.bug.35** Fixed 2026-05-08.  Date/time arithmetic dropped
      one second on every relative modifier (`+N seconds/minutes/hours`,
@@ -2834,6 +2834,32 @@ existing dispatcher.
      value by accident.  3+ col projections expose it.  DiagWindow does
      not exercise the 3-column shape (only 1 or 2 cols), so it
      slipped through.
+
+     **Re-confirmation (2026-05-08, a4 head):** Bug surface is much
+     wider than the 3-col lag form.  ANY window query where the outer
+     SELECT projects a column that is NOT itself in the ORDER BY /
+     PARTITION BY clause exhibits the wrong-aggregate result:
+       - `SELECT b, sum(b) OVER (ORDER BY a) FROM t` → all rows return
+         the global sum (60 over 3 rows of (1,10),(2,20),(3,30)) instead
+         of the running 10/30/60.
+       - `SELECT b, sum(b) OVER (PARTITION BY a%2) FROM t` → all rows
+         return the global sum (150 over (1,10)..(5,50)) instead of
+         per-partition 60/90.
+       - `SELECT a, sum(b) OVER (ORDER BY a) FROM t` → CORRECT (10/30/
+         60/100/150 running) because the projected column `a` happens
+         to coincide with the ORDER BY expression.
+     Pas `MakeRecord` packs `[sortKey ; pSublist...]` literally, while
+     C dedupes the sort-key column with the matching pSublist entry
+     (an iOrderByCol-tagged entry produced by ResolveStructuralOrderByCol
+     on the recursive sqlite3Select(pSub) call).  The +1 column shift
+     misaligns every downstream consumer cursor (the window's eph
+     buffer, the partition/peer compares, lag/lead seek-rowid arithmetic).
+     Fix-attempt log: tried mirroring SQLITE_ECEL_REF in the SRT_EphemTab
+     pushOntoSorter arm — runtime/byte-code unchanged because the column
+     count is the issue, not register-reuse.  Real fix needs the
+     pushOntoSorter SortCtx layout port that elides duplicate sort-key
+     data slots when iOrderByCol > 0.  Bug 10.1.bug.37 below is the
+     same root cause surfacing through a different probe shape.
 
 - [X] **10.1.bug.22** Fixed 2026-05-08.  `WITH RECURSIVE c(x) AS (SELECT 1
      UNION SELECT x+1 FROM c WHERE x<N) SELECT * FROM c;` now returns
