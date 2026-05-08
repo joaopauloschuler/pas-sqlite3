@@ -2558,6 +2558,53 @@ existing dispatcher.
      6.29); DiagFunctions / TestSmoke / TestVdbeAgg 11/11 clean.
      Open follow-up tracked as **10.1.bug.25** below.
 
+- [ ] **10.1.bug.30** `CREATE TABLE` issued after `CREATE TRIGGER` raises
+     `database disk image is malformed` and the new table never appears in
+     `sqlite_schema`.  Reproducer (in-memory or on-disk):
+
+     ```sql
+     CREATE TABLE t(a);
+     CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT 1; END;
+     CREATE TABLE u(k);          -- silently fails
+     SELECT name, type FROM sqlite_schema;  -- returns only t, trg
+     -- on close: "Runtime error: database disk image is malformed"
+     ```
+
+     Behaviour:
+     - The error is observed when the database is later read (e.g.
+       trailing SELECT on sqlite_schema) or on db close — not at the
+       `CREATE TABLE u` site itself.  Pas accepts the statement and
+       continues running subsequent SELECTs that touch only existing
+       schema objects.
+     - `PRAGMA integrity_check` after the trigger is `ok`; integrity_check
+       *after* the second CREATE TABLE raises the malformed error.
+     - Variants that work (no malformed error):
+       * `CREATE INDEX` instead of `CREATE TRIGGER` before the second
+         `CREATE TABLE`.
+       * `CREATE VIEW` instead of `CREATE TRIGGER`.
+       * `DROP TRIGGER` between `CREATE TRIGGER` and second `CREATE TABLE`.
+       * `INSERT INTO t VALUES(1); SELECT * FROM t;` (firing the trigger
+         is fine; only DDL after-trigger triggers the corruption).
+     - The resulting on-disk file shows `schema_cookie=2` (incremented
+       only twice, for t and trg), `database page count=2`,
+       `schema size=73` — i.e. the second CREATE TABLE never reached
+       sqlite_schema, even though Pas didn't raise the error at the
+       statement boundary.
+
+     Likely cause: post-CREATE-TRIGGER schema reload (OP_ParseSchema with
+     p4=NULL, the same arm closed under 6.10 step 9(g)) leaves
+     `db^.aDb[0]^.pSchema` in a state where the next DDL's
+     `sqlite3StartTable` / `sqlite3EndTable` writes a malformed
+     sqlite_master row (or fails to allocate a fresh root page) — the
+     ALTER reload arm uses `sqlite3SchemaClear` + `sqlite3InitOne` but
+     also forces `DBFLAG_SchemaChange`; the trigger-creation reload may
+     skip a sibling step (e.g. `Trigger`-list reattach to its parent
+     `Table`, or the `Table.pTrigger` chain not pointing back at the
+     reloaded Trigger record).  Investigate sqlite3FinishTrigger
+     (passqlite3codegen.pas) vs alter.c finishTrigger and the
+     OP_ParseSchema p4=NULL arm in passqlite3vdbe.pas / passqlite3main.pas
+     execParseSchemaImpl.
+
 - [ ] **10.1.bug.25** `lag(a,1) OVER (ORDER BY a)` returns wrong values
      when the outer SELECT projects a third column alongside `a` and the
      window expression.  Reproducer: `SELECT a, b, lag(a,1) OVER (ORDER
