@@ -2488,23 +2488,29 @@ existing dispatcher.
      `EXPLAIN SELECT …` now renders a properly bordered table; no
      regression in TestExplainParity (1026/1026).
 
-- [ ] **10.1.bug.12**
-     ```
-     sqlite> create table tbl1(one text, two int);
-     sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
-     sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
-     sqlite> select * from tbl1;
-     hello!|10
-     goodbye|20
-     hello!|10
-     goodbye|20
-     sqlite> select one, sum(two) from tbl1 group by one order by one;
-     goodbye|40
-     hello!|20
-     sqlite> select one, sum(two) from tbl1 group by one order by two;    
-     sqlite> select one, sum(two) from tbl1 group by one order by sum(two);   
-     sqlite> 
-     ```
+- [X] **10.1.bug.12** Fixed 2026-05-08.  `SELECT … GROUP BY one ORDER BY <expr>`
+     returned no rows whenever the ORDER BY clause did not structurally
+     match the GROUP BY clause (`ORDER BY two`, `ORDER BY sum(two)`,
+     `ORDER BY 2`, `ORDER BY length(one)` etc.).  Root cause: the
+     GROUP BY codegen arm in passqlite3codegen.pas:sqlite3Select bailed
+     to a 3-op stub (Init/Halt/Goto) whenever sqlite3ExprListCompare
+     between pGroupBy and pOrderBy returned non-zero.  Fix: extend the
+     arm to push per-group output rows into a secondary
+     OP_SorterOpen/OP_SorterInsert keyed by pOrderBy and drain it
+     after addrEnd via OpenPseudo / SorterSort / SorterData /
+     ResultRow / SorterNext.  markAggregateInExprList /
+     sqlite3ExprAnalyzeAggList are now also applied to p^.pOrderBy
+     (before nAccumulator is frozen) so aggregate functions and base
+     column refs in the ORDER BY clause resolve into the same
+     accumulator/func register block as the result list.
+     orderByGrp=1 (structural match) still keeps the inline ResultRow
+     fast-path.  Verified byte-identical to upstream sqlite3 across
+     all six variants (`ORDER BY one`, `two`, `sum(two)`, `2`,
+     `length(one)`, `1 DESC`).  TestExplainParity 1026/1026;
+     TestDMLBasic 54/54; TestSelectBasic 60/60; TestWhereBasic 52/52;
+     TestVdbeAgg 11/11; DiagOps / DiagDml / DiagFeatureProbe /
+     DiagPragma / DiagFunctions / DiagTxn / DiagMisc / DiagCast /
+     DiagAnalyze all clean.
 
 - [X] **10.1.bug.11** Crash fixed 2026-05-08.  `CREATE TABLE x AS
      SELECT …` raised EAccessViolation in sqlite3ExprDeleteNN.  Root

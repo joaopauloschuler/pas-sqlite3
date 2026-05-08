@@ -22825,6 +22825,20 @@ var
   addrSortBrkW:  i32;
   addrSortLoopW: i32;
   addrSortContW: i32;
+  { GROUP BY + ORDER BY (non-matching) drain locals.  When ORDER BY
+    differs from GROUP BY, the per-group output row is pushed into a
+    secondary sorter and drained at addrEnd — bug 10.1.bug.12 close. }
+  needSortOB:    Boolean;
+  iSorterOB:     i32;
+  pKeyInfoOB:    PKeyInfo2;
+  nOrderByOB:    i32;
+  regSortBaseOB: i32;
+  regSortRecOB:  i32;
+  iOB:           i32;
+  iSortPTabOB:   i32;
+  regSortOutOB:  i32;
+  addrSortBrkOB: i32;
+  addrSortLoopOB:i32;
 begin
   if (pParse = nil) or (p = nil) then begin Result := SQLITE_MISUSE; Exit; end;
   sqlite3SelectPrep(pParse, p, nil);
@@ -23221,6 +23235,7 @@ begin
       (select.c:7516): when nExpr matches, copy sortFlags from ORDER BY
       onto pGroupBy then ExprListCompare to confirm structural equality. }
     orderByGrp := 0;
+    needSortOB := False;
     if p^.pOrderBy <> nil then
     begin
       copyOK := False;
@@ -23240,7 +23255,16 @@ begin
       end
       else
       begin
-        Result := SQLITE_OK; Exit;
+        { Bug 10.1.bug.12 — instead of bailing when ORDER BY does not
+          match GROUP BY, push per-group output rows into a secondary
+          sorter keyed by pOrderBy and drain it after the group scan.
+          Only support SRT_Output here; other destinations stay on the
+          old bail path. }
+        if pDest^.eDest = SRT_Output then
+          needSortOB := True
+        else begin
+          Result := SQLITE_OK; Exit;
+        end;
       end;
     end;
 
@@ -23263,9 +23287,13 @@ begin
     markAggregateInExprList(pParse, p^.pEList);
     if pHavingLoc <> nil then
       markAggregateInExpr(pParse, pHavingLoc);
+    if needSortOB then
+      markAggregateInExprList(pParse, p^.pOrderBy);
     sqlite3ExprAnalyzeAggList(@sNCAgg, p^.pEList);
     if pHavingLoc <> nil then
       sqlite3ExprAnalyzeAggregates(@sNCAgg, pHavingLoc);
+    if needSortOB then
+      sqlite3ExprAnalyzeAggList(@sNCAgg, p^.pOrderBy);
     pAggI2^.nAccumulator := pAggI2^.nColumn;
     analyzeAggFuncArgs(pAggI2, @sNCAgg);
 
@@ -23297,6 +23325,22 @@ begin
                                                pAggI2^.nColumn);
       sqlite3VdbeAddOp4(v, OP_SorterOpen, pAggI2^.sortingIdx, nGroupBy, 0,
                         PAnsiChar(pKeyInfoGB), P4_KEYINFO);
+
+      { Bug 10.1.bug.12 — secondary sorter for ORDER BY when it does
+        not structurally match GROUP BY.  Payload = pOrderBy keys
+        followed by all result columns. }
+      iSorterOB     := -1;
+      pKeyInfoOB    := nil;
+      nOrderByOB    := 0;
+      if needSortOB then
+      begin
+        nOrderByOB := p^.pOrderBy^.nExpr;
+        iSorterOB  := pParse^.nTab; Inc(pParse^.nTab);
+        pKeyInfoOB := sqlite3KeyInfoFromExprList(pParse, p^.pOrderBy, 0,
+                                                 p^.pEList^.nExpr);
+        sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorterOB, nOrderByOB, 0,
+                          PAnsiChar(pKeyInfoOB), P4_KEYINFO);
+      end;
 
       { Register layout — match select.c:8514..8523. }
       Inc(pParse^.nMem); iUseFlag    := pParse^.nMem;
@@ -23435,7 +23479,34 @@ begin
         if r1 <> pDest^.iSdst + i then
           sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
       end;
-      if pDest^.eDest = SRT_Output then
+      if needSortOB then
+      begin
+        { Push (orderKeys + resultCols) into the ORDER BY sorter.
+          Per-row evaluation runs in directMode=0, so TK_AGG_FUNCTION
+          and TK_AGG_COLUMN reads land on the post-finalize accumulator
+          register block. }
+        regSortBaseOB := sqlite3GetTempRange(pParse,
+                                             nOrderByOB + nResultCol);
+        for iOB := 0 to nOrderByOB - 1 do
+        begin
+          r1 := sqlite3ExprCodeTarget(pParse,
+                  ExprListItems(p^.pOrderBy)[iOB].pExpr,
+                  regSortBaseOB + iOB);
+          if r1 <> regSortBaseOB + iOB then
+            sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBaseOB + iOB);
+        end;
+        for iOB := 0 to nResultCol - 1 do
+          sqlite3VdbeAddOp2(v, OP_Copy, pDest^.iSdst + iOB,
+                            regSortBaseOB + nOrderByOB + iOB);
+        regSortRecOB := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBaseOB,
+                          nOrderByOB + nResultCol, regSortRecOB);
+        sqlite3VdbeAddOp2(v, OP_SorterInsert, iSorterOB, regSortRecOB);
+        sqlite3ReleaseTempReg(pParse, regSortRecOB);
+        sqlite3ReleaseTempRange(pParse, regSortBaseOB,
+                                nOrderByOB + nResultCol);
+      end
+      else if pDest^.eDest = SRT_Output then
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
       sqlite3VdbeAddOp1(v, OP_Return, regOutputRow);
 
@@ -23446,6 +23517,28 @@ begin
       sqlite3VdbeAddOp1(v, OP_Return, regReset);
 
       sqlite3VdbeResolveLabel(v, addrEnd);
+
+      { Bug 10.1.bug.12 — drain the ORDER BY sorter and emit ResultRow
+        per row, reading result columns from the sorter payload. }
+      if needSortOB then
+      begin
+        iSortPTabOB    := pParse^.nTab; Inc(pParse^.nTab);
+        regSortOutOB   := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortPTabOB, regSortOutOB,
+                          nOrderByOB + nResultCol);
+        addrSortBrkOB  := sqlite3VdbeMakeLabel(pParse);
+        sqlite3VdbeAddOp2(v, OP_SorterSort, iSorterOB, addrSortBrkOB);
+        addrSortLoopOB := sqlite3VdbeCurrentAddr(v);
+        sqlite3VdbeAddOp3(v, OP_SorterData, iSorterOB, regSortOutOB,
+                          iSortPTabOB);
+        for iOB := 0 to nResultCol - 1 do
+          sqlite3VdbeAddOp3(v, OP_Column, iSortPTabOB,
+                            nOrderByOB + iOB, pDest^.iSdst + iOB);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterOB, addrSortLoopOB);
+        sqlite3VdbeResolveLabel(v, addrSortBrkOB);
+        sqlite3ReleaseTempReg(pParse, regSortOutOB);
+      end;
 
       pAggI2^.useSortingIdx := 0;
       if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
