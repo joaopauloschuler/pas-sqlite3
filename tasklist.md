@@ -2472,6 +2472,31 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.14** Fixed 2026-05-08.  `SELECT a, sum(a) FROM t`
+     (bare base column alongside an aggregate, no GROUP BY) emitted only
+     the 3-op stub (Init/Halt/Goto) and silently returned zero rows.
+     Same shape with `max(a), b` / `sum(a) FILTER (WHERE …)` / `count(*),
+     a` etc. — anywhere a non-aggregated column appeared in the result
+     list with no GROUP BY.  Root cause: the no-GROUP-BY agg arm in
+     passqlite3codegen.pas:sqlite3Select bailed unconditionally when
+     `pAggI2^.nAccumulator > 0`.  Fix: ported select.c:8836..8848 +
+     8887 — allocate `regAcc` (when at least one accumulator column
+     exists and no NEEDCOLL aggregate), emit `OP_Integer 0, regAcc`
+     before assignAggregateRegisters, pass regAcc into
+     updateAccumulatorSimple as the regHit guard, then emit
+     `OP_Integer 1, regAcc` after updateAccumulator (still inside the
+     scan loop) so the accumulator-column reads fire only on the first
+     row.  Applied uniformly to the base-table, vtab, and subquery arms.
+     Verified byte-equivalent to system sqlite3: `SELECT a, sum(a) FROM
+     t` = `1|6`; `SELECT max(a), b FROM t` = `3|z`; `SELECT a, sum(a)
+     FILTER (WHERE b='y') FROM t` = `1|2`; empty WHERE returns one
+     `|` row.  TestExplainParity 1026/1026; TestSmoke / TestDMLBasic
+     54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg
+     11/11 all clean; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma
+     / DiagFunctions / DiagTxn / DiagMisc / DiagCast / DiagAnalyze /
+     DiagDate / DiagMoreFunc / DiagSumOverflow / DiagOrderLimitTopN /
+     DiagPredicates / DiagIndexing / DiagCovering all green.
+
 - [X] **10.1.bug.13** Fixed 2026-05-08.  `.mode box` (and any other
      mode that calls sqlite3_column_name) crashed on EXPLAIN output
      with EAccessViolation in sqlite3VdbeMemStringify → sqlite3DbFreeNN.

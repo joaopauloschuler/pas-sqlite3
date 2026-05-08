@@ -22699,6 +22699,7 @@ var
   iCsr:        i32;
   regAgg:      i32;
   regCount:    i32;
+  regAcc:      i32;        { "have-we-populated-bare-cols" flag (select.c:8836). }
   { Aggregate-no-GROUP-BY locals — populated only when the SF_Aggregate
     path at codegen.pas:18696 lifts off (count(*) / sum / min / max with
     no GROUP BY / HAVING / DISTINCT / FILTER / ORDER-in-arg / NEEDCOLL). }
@@ -24082,20 +24083,41 @@ begin
         nAccumulator > 0 we'd need the assignAggregateRegisters block
         plus the directMode column-store loop in updateAccumulator —
         deferred until the GROUP BY path lands. }
-      { Phase 6.13(b)-coagg follow-up — for the subquery-FROM agg arm,
-        accumulator columns reference the materialised eph cursor (pTab is
-        ephemeral, iCursor=iCsr).  updateAccumulatorSimple's directMode
-        loop emits OP_Column from that cursor, which is exactly what the
-        eph table holds.  For the regular base-table arm we still bail
-        because GROUP BY result-list shapes need extra plumbing. }
-      if canUseAgg and (pAggI2^.nAccumulator > 0)
-         and (not isSubqueryAgg) then canUseAgg := False;
-
       if canUseAgg and (pParse^.nErr = 0) then
       begin
         sqlite3GenerateColumnNames(pParse, p);
         iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
         if iDb >= 0 then sqlite3CodeVerifySchema(pParse, iDb);
+
+        { regAcc — "have we populated bare accumulator columns yet" flag.
+          Mirrors select.c:8836..8848.  Allocate only when there is at
+          least one accumulator column AND no min/max-style NEEDCOLL
+          aggregate (those need their column read every iteration so the
+          collation-aware compare runs on every value).  Init to 0 here,
+          before the WhereBegin loop entry; updateAccumulatorSimple uses
+          it as the regHit guard so column reads fire only once. }
+        regAcc := 0;
+        if pAggI2^.nAccumulator > 0 then
+        begin
+          jAgg := 0;
+          while jAgg < pAggI2^.nFunc do
+          begin
+            pAggFunc := @pAggI2^.aFunc[jAgg];
+            if (pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0 then
+            begin
+              Inc(jAgg); continue;
+            end;
+            if (pAggFunc^.pFunc <> nil)
+               and ((PTFuncDef(pAggFunc^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0) then
+              break;
+            Inc(jAgg);
+          end;
+          if jAgg = pAggI2^.nFunc then
+          begin
+            Inc(pParse^.nMem); regAcc := pParse^.nMem;
+            sqlite3VdbeAddOp2(v, OP_Integer, 0, regAcc);
+          end;
+        end;
 
         assignAggregateRegisters(pParse, pAggI2);
         resetAccumulatorSimple(pParse, pAggI2);
@@ -24144,11 +24166,13 @@ begin
             addrSkip := sqlite3VdbeMakeLabel(pParse);
             sqlite3ExprIfFalse(pParse, p^.pWhere, addrSkip,
                                SQLITE_JUMPIFNULL);
-            updateAccumulatorSimple(pParse, pAggI2);
+            updateAccumulatorSimple(pParse, pAggI2, regAcc);
             sqlite3VdbeResolveLabel(v, addrSkip);
           end
           else
-            updateAccumulatorSimple(pParse, pAggI2);
+            updateAccumulatorSimple(pParse, pAggI2, regAcc);
+          if regAcc <> 0 then
+            sqlite3VdbeAddOp2(v, OP_Integer, 1, regAcc);
           sqlite3VdbeAddOp2(v, OP_VNext, iCsr, addrTopOfLoop + 1);
           sqlite3VdbeResolveLabel(v, addrEnd);
           sqlite3VdbeAddOp1(v, OP_Close, iCsr);
@@ -24172,7 +24196,9 @@ begin
           end;
           addrEnd := sqlite3VdbeMakeLabel(pParse);
           addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrEnd);
-          updateAccumulatorSimple(pParse, pAggI2);
+          updateAccumulatorSimple(pParse, pAggI2, regAcc);
+          if regAcc <> 0 then
+            sqlite3VdbeAddOp2(v, OP_Integer, 1, regAcc);
           sqlite3VdbeAddOp2(v, OP_Next, iCsr, addrTopOfLoop + 1);
           sqlite3VdbeResolveLabel(v, addrEnd);
           sqlite3VdbeAddOp1(v, OP_Close, iCsr);
@@ -24194,7 +24220,9 @@ begin
           pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere,
                                       pMinMaxOrderBy, nil, p, minMaxFlag, 0);
           if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
-          updateAccumulatorSimple(pParse, pAggI2);
+          updateAccumulatorSimple(pParse, pAggI2, regAcc);
+          if regAcc <> 0 then
+            sqlite3VdbeAddOp2(v, OP_Integer, 1, regAcc);
           if minMaxFlag <> WHERE_ORDERBY_NORMAL then
             sqlite3WhereMinMaxOptEarlyOut(v, pWInfo);
           sqlite3WhereEnd(pWInfo);
