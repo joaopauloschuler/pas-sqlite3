@@ -2626,6 +2626,40 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.46** Fixed 2026-05-08.  3+ way INNER/LEFT JOINs (and any
+     aggregate over them) silently emitted only the 3-op stub
+     (Init/Halt/Goto), returning no rows.  Reproducer:
+     `SELECT a.y FROM a JOIN b ON a.x=b.x JOIN c ON c.x=b.x` returned
+     no rows; `SELECT count(*) FROM a,b,c WHERE a.x=b.x AND b.x=c.x`
+     same.  Root cause: two `nSrc <= 2` gates in `sqlite3Select`
+     (passqlite3codegen.pas):
+     (1) Plain-SELECT path at codegen.pas:23759 had
+         `if p^.pSrc^.nSrc > 2 then begin Result := SQLITE_OK; Exit; end;`
+         — a leftover from earlier porting that bailed for any 3+ table FROM.
+     (2) Aggregate-no-GROUP-BY path at codegen.pas:24191 had
+         `and (p^.pSrc^.nSrc <= 2)` with the same effect for aggregates.
+     The downstream `sqlite3WhereBegin` already supports arbitrary nLevel
+     (mirrors where.c:6700+ multi-loop driver), and `analyzeAggregate`
+     handles the multi-source AggInfo population, so both gates were just
+     conservative caps.  Fix: lift both gates.  Verified byte-identical
+     to upstream sqlite3 across 3-way / 4-way INNER/LEFT JOINs (IPK +
+     non-IPK), comma-syntax `FROM a,b,c WHERE …`, aggregate-over-3-way
+     (count/sum/avg), and the WHERE-filtered variants.  TestExplainParity
+     1026/1026; TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13 /
+     TestBytecodeParity 32/32 / TestWindowBasic 34/34 all clean;
+     DiagBloom now reports `three-way: OP_Blob=1 OP_FilterAdd=1
+     OP_Filter=1` (the Bloom-filter optimisation actually fires now);
+     all Diag* probes (Aggwhere / Analyze / Arith / AutoIdx / Bloom /
+     Cast / Covering / CreateIdx / Date / Dml / DropTable / FeatureProbe
+     / Functions / GroupOrder / InnerJoin / JoinTrace / LikeGlob / Misc
+     / MoreFunc / MultiValues / Ops / OrderLimitTopN / Pragma /
+     Predicates / PrintfFmt / PubApi / Subsel / SumOverflow / Trig / Txn
+     / Window / SampleProg / Dbdump / Intck / Scrub / Appendvfs / Vfslog
+     / Vfstrace / Tmstmpvfs / DbFileObject / ExplainList) all 0
+     divergences.
+
 - [X] **10.1.bug.43** Fixed 2026-05-08.  Constraint-violation error
      messages dropped the "<TYPE> constraint failed: " prefix.
      Reproducer: `CREATE TABLE t(a INT NOT NULL); INSERT INTO t

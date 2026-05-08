@@ -23753,10 +23753,9 @@ begin
   end;
 
   if p^.pSrc = nil then begin Result := SQLITE_OK; Exit; end;
-  { Multi-table join gate: allow up to 2-table plain JOINs (nSrc=1 or 2).
-    Larger join counts, subqueries, and other shapes stay deferred. }
+  { Multi-table join gate: nSrc>=1.  3+ table gate lifted 2026-05-08;
+    sqlite3WhereBegin handles arbitrary nLevel via the multi-loop driver. }
   if p^.pSrc^.nSrc < 1 then begin Result := SQLITE_OK; Exit; end;
-  if p^.pSrc^.nSrc > 2 then begin Result := SQLITE_OK; Exit; end;
   if p^.pEList = nil then begin Result := SQLITE_OK; Exit; end;
   if p^.pEList^.nExpr < 1 then begin Result := SQLITE_OK; Exit; end;
   { p^.pWhere <> nil gate lifted in sub-progress 9 — sqlite3WhereBegin
@@ -24189,7 +24188,6 @@ begin
      and (p^.pWin     = nil)
      and (p^.pOrderBy = nil)
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
-     and (p^.pSrc^.nSrc <= 2)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem))
   then
