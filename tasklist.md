@@ -2580,16 +2580,44 @@ existing dispatcher.
      TestDMLBasic 54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52 /
      TestVdbeAgg 11/11 all clean.
 
-- [ ] **10.1.bug.17** UPSERT with `DO UPDATE` crashes with
-     EAccessViolation.  Repro: `CREATE TABLE t(id INTEGER PRIMARY KEY,
-     c INT); INSERT INTO t VALUES(1,5); INSERT INTO t VALUES(1,5) ON
-     CONFLICT DO UPDATE SET c=99;`.  `ON CONFLICT DO NOTHING` works
-     fine.  Crash addr 0x4F7B9E inside sqlite3UpsertDoUpdate ->
-     sqlite3Update path (passqlite3codegen.pas:25898 / 31639 / 31851).
-     Likely sqlite3Update does not yet honour the pUpsert hand-off; the
-     port-of comment at codegen.pas:25895 already flags "Dead-code today
-     because sqlite3Update is still a skeleton".  Verify against
-     upstream upsert.c:267 and update.c handling of pUpsert.
+- [X] **10.1.bug.17** Fixed 2026-05-08.  UPSERT with `DO UPDATE` crashed
+     with EAccessViolation.  Four faithful 1:1 omissions vs C:
+     1. **`sqlite3Insert` never wired pUpsert** — the upsert.c:267 head
+        runs `sqlite3UpsertDoUpdate` which calls `sqlite3SrcListDup(db,
+        pTop->pUpsertSrc, 0)`, but `pUpsertSrc` / `regData` / `iDataCur`
+        / `iIdxCur` were left at their zero-init defaults.  Ported the
+        insert.c:1289..1316 setup block (post-`OpenTableAndIndices`)
+        that runs `pTabList->a[0].iCursor = iDataCur`, walks the upsert
+        chain stamping the cursor / regData triple, and routes through
+        `sqlite3UpsertAnalyzeTarget` for each clause with a target.
+     2. **`sqlite3UpsertAnalyzeTarget` IPK acceptance** — the C reference
+        relies on resolve.c:466/562 rewriting `id` (the INTEGER PRIMARY
+        KEY alias) to `iColumn = XN_ROWID` (-1).  The Pas port's
+        lookupName leaves `iColumn = iPKey`, so the target-vs-rowid
+        check failed and emitted "ON CONFLICT clause does not match any
+        PRIMARY KEY or UNIQUE constraint".  Lifted the rowid match to
+        also accept `pTerm^.iColumn = pTab^.iPKey`.
+     3. **`excluded.<col>` resolution missing** — `NC_UUpsert` was set
+        on the NameContext in `sqlite3Update`, but the resolver had no
+        arm for resolve.c:547..587.  Added `resolveUpsertExcludedRefs`
+        (passqlite3codegen.pas) which walks the expression tree and
+        rewrites every `excluded.<col>` `TK_DOT` to `TK_REGISTER`
+        pointing at `pUpsert^.regData + iCol` — collapses straight to
+        the new-row data registers, mirroring the C `eNewExprOp =
+        TK_REGISTER` fold.  Wired into `sqlite3ResolveExprNames`.
+     4. **`sqlite3Update` double-freed pUpsert** — `update_cleanup`
+        called `sqlite3UpsertDelete(db, pUpsert)`, but C update.c:1152
+        does NOT free pUpsert (the outer `sqlite3Insert` owns it via
+        insert.c:1661).  Removed the spurious free.
+     Verification: byte-identical to system `sqlite3` on
+     `INSERT … ON CONFLICT DO UPDATE SET c=99`,
+     `ON CONFLICT(id) DO UPDATE SET c=excluded.c+1`,
+     `ON CONFLICT(name) DO UPDATE SET n=u.n+excluded.n` (UNIQUE
+     constraint), and multi-row VALUES with conflict.  TestExplainParity
+     1026/1026; TestDMLBasic 54/54; TestSelectBasic 60/60; TestWhereBasic
+     52/52; TestVdbeAgg 11/11; DiagOps / DiagDml / DiagFeatureProbe /
+     DiagPragma / DiagFunctions / DiagMisc / DiagCast / DiagDate /
+     DiagAnalyze / DiagDropTable / DiagTxn all 0 divergences.
 
 - [ ] **10.1.bug.16** WITHOUT ROWID INSERT corrupts the database image.
      Repro: `CREATE TABLE wr(k TEXT PRIMARY KEY, v INTEGER) WITHOUT

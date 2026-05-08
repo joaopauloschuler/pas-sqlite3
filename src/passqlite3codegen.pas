@@ -7852,6 +7852,60 @@ begin
   end;
 end;
 
+{ resolveUpsertExcludedRefs — walk pE rewriting any excluded.<col> qualified
+  references against pUpsert->pUpsertSrc->a[0].pSTab.  Mirrors resolve.c
+  lookupName's NC_UUpsert arm (resolve.c:547..588). }
+procedure resolveUpsertExcludedRefs(pUpsert: PUpsert; pE: PExpr);
+var
+  pItem:  PSrcItem;
+  iCol:   i32;
+  pList:  PExprList;
+  i:      i32;
+  items:  PExprListItem;
+begin
+  if (pE = nil) or (pUpsert = nil) or (pUpsert^.pUpsertSrc = nil) then Exit;
+  if (pE^.op = TK_DOT)
+     and (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+     and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
+     and (sqlite3StrICmp(pE^.pLeft^.u.zToken, 'excluded') = 0) then
+  begin
+    pItem := SrcListItems(pUpsert^.pUpsertSrc);
+    if (pItem <> nil) and (pItem^.pSTab <> nil) then
+    begin
+      iCol := sqlite3ColumnIndex(pItem^.pSTab, pE^.pRight^.u.zToken);
+      if (iCol < 0) and (sqlite3IsRowid(pE^.pRight^.u.zToken) <> 0)
+         and HasRowid(pItem^.pSTab) then
+        iCol := -1
+      else if (iCol >= 0) and (pItem^.pSTab^.iPKey = iCol) then
+        iCol := -1;
+      if (iCol >= -1) and (iCol < pItem^.pSTab^.nCol) then
+      begin
+        { Mirror resolve.c:574..587 — collapse excluded.<col> directly to
+          TK_REGISTER pointing at pUpsert->regData + iCol (storage order). }
+        pE^.op      := TK_REGISTER;
+        pE^.op2     := TK_COLUMN;
+        pE^.iColumn := i16(iCol);
+        pE^.y.pTab  := pItem^.pSTab;
+        { sqlite3TableColumnToStorage simplified — iCol<0 returns iCol;
+          TF_HasVirtual not exercised in the upsert path. }
+        pE^.iTable  := pUpsert^.regData + iCol;
+        pE^.pLeft   := nil;
+        pE^.pRight  := nil;
+        Exit;
+      end;
+    end;
+  end;
+  if pE^.pLeft  <> nil then resolveUpsertExcludedRefs(pUpsert, pE^.pLeft);
+  if pE^.pRight <> nil then resolveUpsertExcludedRefs(pUpsert, pE^.pRight);
+  if not ExprUseXSelect(pE) and (pE^.x.pList <> nil) then
+  begin
+    pList := pE^.x.pList;
+    items := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+      resolveUpsertExcludedRefs(pUpsert, items[i].pExpr);
+  end;
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
@@ -7860,6 +7914,8 @@ begin
       resolveTriggerNewOld(pNC^.pParse, pExpr);
     if (pNC^.pParse <> nil) and ((pNC^.ncFlags and NC_UBaseReg) <> 0) then
       resolveBareIdToTrigger(pNC^.pParse, pNC^.uNC.iBaseReg, pExpr);
+    if ((pNC^.ncFlags and NC_UUpsert) <> 0) and (pNC^.uNC.pUpsert <> nil) then
+      resolveUpsertExcludedRefs(pNC^.uNC.pUpsert, pExpr);
     resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
     if pNC^.pParse <> nil then
     begin
@@ -25816,8 +25872,13 @@ begin
        and (pTarget^.nExpr = 1) then
     begin
       pTerm := pTargetItems[0].pExpr;
+      { IPK alias acceptance — Pas port's lookupName leaves iColumn=iPKey
+        for the INTEGER PRIMARY KEY rather than rewriting it to XN_ROWID
+        (-1) like resolve.c:466 / :562 do.  Treat both forms as the
+        rowid-target match. }
       if (pTerm <> nil) and (pTerm^.op = TK_COLUMN)
-         and (pTerm^.iColumn = XN_ROWID) then
+         and ((pTerm^.iColumn = XN_ROWID)
+              or (pTerm^.iColumn = pTab^.iPKey)) then
       begin
         Assert(pUpsert^.pUpsertIdx = nil);
         pUpsert := pUpsert^.pNextUpsert;
@@ -29387,7 +29448,8 @@ update_cleanup:
   sqlite3ExprDelete(db, pWhere);
   sqlite3ExprListDelete(db, pOrderBy);
   sqlite3ExprDelete(db, pLimit);
-  sqlite3UpsertDelete(db, pUpsert);
+  { sqlite3UpsertDelete intentionally NOT called here — pUpsert is borrowed
+    from the outer INSERT, which owns it (insert.c:1661 frees it). }
 end;
 
 // ===========================================================================
@@ -30230,6 +30292,8 @@ var
   pCoroItem:      PSrcItem;
   ipkInSelect:    Boolean;
   k:              i32;
+  pNx:            PUpsert;
+  pTabItem0:      PSrcItem;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -30551,6 +30615,39 @@ begin
   if not (isView <> 0) then
     sqlite3OpenTableAndIndices(pParse, pTab, OP_OpenWrite, 0, -1,
                                nil, @iDataCur, @iIdxCur);
+
+  { UPSERT setup — port of insert.c:1289..1316.  Must run after
+    OpenTableAndIndices so iDataCur/iIdxCur are populated. }
+  if pUpsert <> nil then
+  begin
+    if isVirtual then
+    begin
+      sqlite3ErrorMsg(pParse,
+        PAnsiChar('UPSERT not implemented for virtual table "' +
+                  AnsiString(pTab^.zName) + '"'));
+      goto insert_cleanup;
+    end;
+    if pTab^.eTabType = TABTYP_VIEW then
+    begin
+      sqlite3ErrorMsg(pParse, 'cannot UPSERT a view');
+      goto insert_cleanup;
+    end;
+    if sqlite3HasExplicitNulls(pParse, pUpsert^.pUpsertTarget) <> 0 then
+      goto insert_cleanup;
+    pTabItem0 := SrcListItems(pTabList);
+    pTabItem0^.iCursor := iDataCur;
+    pNx := pUpsert;
+    repeat
+      pNx^.pUpsertSrc := pTabList;
+      pNx^.regData    := regData;
+      pNx^.iDataCur   := iDataCur;
+      pNx^.iIdxCur    := iIdxCur;
+      if pNx^.pUpsertTarget <> nil then
+        if sqlite3UpsertAnalyzeTarget(pParse, pTabList, pNx, pUpsert) <> 0 then
+          goto insert_cleanup;
+      pNx := pNx^.pNextUpsert;
+    until pNx = nil;
+  end;
 
   { Evaluate column values into regData..regData+nCol-1, iterating in table
     storage order.  Three sub-cases per column:
