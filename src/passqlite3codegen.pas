@@ -24766,6 +24766,29 @@ begin
         pParse^.nMem := pParse^.nMem + nResultCol;
       end;
 
+      { 10.1.bug.40 — outer ORDER BY against a viaCoroutine source.
+        Wrap the per-row body in pushOntoSorter (open sorter cursor
+        before the Yield loop, MakeRecord+SorterInsert in place of
+        ResultRow) and emit a generateSortTail (SorterSort + drain
+        loop) after the Goto/break.  Mirrors C select.c:6800..6890
+        which always runs the sort tail when pOrderBy is set on an
+        outer SRT_Output query. }
+      bSort := 0;
+      iSorterCsr := -1;
+      sortNKey := 0;
+      if (p^.pOrderBy <> nil) and (p^.pHaving = nil)
+         and (p^.pGroupBy = nil) and (p^.pLimit = nil) then
+      begin
+        bSort := 1;
+        iSorterCsr := pParse^.nTab; Inc(pParse^.nTab);
+        sortNKey := p^.pOrderBy^.nExpr;
+        sortKeyInfo := sqlite3KeyInfoFromExprList(pParse, p^.pOrderBy, 0,
+                                                  nResultCol);
+        sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorterCsr,
+                          sortNKey + 1 + nResultCol, 0,
+                          PAnsiChar(sortKeyInfo), P4_KEYINFO);
+      end;
+
       addrEnd := sqlite3VdbeMakeLabel(pParse);
       addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Yield,
                           pItem^.u4.pSubq^.regReturn, addrEnd);
@@ -24787,13 +24810,65 @@ begin
         if r1 <> pDest^.iSdst + i then
           sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
       end;
+
+      { ORDER BY key emit — must happen before translateColumnToCopy so
+        OP_Column refs into iCsr inside ORDER BY exprs are rewritten too. }
+      regSortBase := 0;
+      if bSort <> 0 then
+      begin
+        regSortBase := pParse^.nMem + 1;
+        Inc(pParse^.nMem, sortNKey + nResultCol);
+        for jj := 0 to sortNKey - 1 do
+        begin
+          r1 := sqlite3ExprCodeTarget(pParse,
+                  ExprListItems(p^.pOrderBy)[jj].pExpr,
+                  regSortBase + jj);
+          if r1 <> regSortBase + jj then
+            sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBase + jj);
+        end;
+      end;
+
       { Rewrite OP_Column iCsr,col,dest → OP_Copy regResult+col,dest. }
       translateColumnToCopy(pParse, r2, iCsr,
                             pItem^.u4.pSubq^.regResult, 0);
-      sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+
+      if bSort <> 0 then
+      begin
+        { pushOntoSorter — copy iSdst payload after the keys, then
+          MakeRecord + SorterInsert. }
+        for jj := 0 to nResultCol - 1 do
+          sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
+                            regSortBase + sortNKey + jj);
+        Inc(pParse^.nMem); regSortRec := pParse^.nMem;
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
+                          sortNKey + nResultCol, regSortRec);
+        sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
+                             regSortBase, nResultCol);
+      end
+      else
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
 
       sqlite3VdbeAddOp2(v, OP_Goto, 0, addrTopOfLoop);
       sqlite3VdbeResolveLabel(v, addrEnd);
+
+      if bSort <> 0 then
+      begin
+        { generateSortTail — drain sorter and emit ResultRow per row. }
+        Inc(pParse^.nMem); regSortOut := pParse^.nMem;
+        iSortTab := pParse^.nTab; Inc(pParse^.nTab);
+        sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortTab, regSortOut,
+                          sortNKey + 1 + nResultCol);
+        addrSortBrk := sqlite3VdbeMakeLabel(pParse);
+        sqlite3VdbeAddOp2(v, OP_SorterSort, iSorterCsr, addrSortBrk);
+        addrSortLoop := sqlite3VdbeCurrentAddr(v);
+        sqlite3VdbeAddOp3(v, OP_SorterData, iSorterCsr, regSortOut, iSortTab);
+        for i := 0 to nResultCol - 1 do
+          sqlite3VdbeAddOp3(v, OP_Column, iSortTab, sortNKey + i,
+                            pDest^.iSdst + i);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterCsr, addrSortLoop);
+        sqlite3VdbeResolveLabel(v, addrSortBrk);
+      end;
 
       if pParse^.nErr <> 0 then Result := SQLITE_ERROR
                           else Result := SQLITE_OK;

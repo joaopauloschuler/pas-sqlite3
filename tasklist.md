@@ -2691,27 +2691,37 @@ existing dispatcher.
      OP_Halt p2 / OP_Affinity sequencing inside
      `sqlite3GenerateConstraintChecks`; not yet root-caused.
 
-- [ ] **10.1.bug.40** Found 2026-05-08.  `ORDER BY` on the outer
-     SELECT against a recursive CTE is not applied — rows are emitted
-     in CTE production order rather than sorted.  Reproducer:
-     `CREATE TABLE org(id, parent, name);
-      INSERT INTO org VALUES(1,NULL,'CEO'),(2,1,'CTO'),(3,1,'CFO');
-      WITH RECURSIVE chain(id,parent,name,depth) AS (
-        SELECT id,parent,name,0 FROM org WHERE parent IS NULL
-        UNION ALL SELECT o.id,o.parent,o.name,c.depth+1
-                  FROM org o JOIN chain c ON o.parent=c.id
-      ) SELECT name FROM chain ORDER BY name;`
-     Pas returns `CEO; CTO; CFO`; upstream returns `CEO; CFO; CTO`.
-     Bytecode comparison: Pas emits
-     `EndCoroutine / Yield / Copy / ResultRow / Goto / Halt` for the
-     outer scan; the C reference emits
-     `EndCoroutine / SorterOpen / InitCoroutine / Yield / Copy /
-      MakeRecord / SorterInsert / Goto / SorterSort / SorterData /
-      Column / ResultRow / SorterNext / Halt`.
-     The outer SELECT codegen against a coroutine-driven CTE source
-     is skipping the `pushOntoSorter` / `generateSortTail` arm in
-     `selectInnerLoop`.  Likely cause: `viaCoroutine` path in
-     selectInnerLoop bypasses the sorter when pOrderBy is set.
+- [X] **10.1.bug.40** Fixed 2026-05-08.  `ORDER BY` on the outer
+     SELECT against a recursive CTE was not applied — rows came out in
+     CTE production order rather than sorted.  Root cause: the
+     "Sub-SELECT co-routine arm" in sqlite3Select (codegen.pas:24675)
+     short-circuited a single-source FROM-(SELECT) shape into a hand-
+     rolled `Yield → emit pEList → ResultRow → Goto` loop without ever
+     consulting `p^.pOrderBy`, so the outer ORDER BY was silently
+     dropped (the standard sqlite3WhereBegin path that owns
+     pushOntoSorter / generateSortTail was bypassed).  Fix: add a local
+     pushOntoSorter / generateSortTail wrapper around the Yield loop —
+     when `p^.pOrderBy <> nil` (and no GROUP BY / HAVING / LIMIT, which
+     stay deferred) open a sorter cursor before the Yield, code the
+     ORDER BY keys into a `regSortBase..` block before
+     `translateColumnToCopy` (so the iCsr→regResult rewrite covers them
+     too), `SCopy` the iSdst payload after the keys, and emit
+     `MakeRecord + SorterInsert` in place of `OP_ResultRow`.  After the
+     loop break label, drain the sorter via `OpenPseudo + SorterSort +
+     SorterData + Column*N + ResultRow + SorterNext`.  Mirrors the
+     equivalent slice in the standard sqlite3Select path
+     (codegen.pas:25249 pushOntoSorter, :25461 generateSortTail).
+     Verified: recursive CTE reproducer returns `CEO; CFO; CTO`
+     byte-identical to upstream; plain `SELECT b FROM (SELECT a,b FROM
+     t) ORDER BY b / b DESC / a` all match.  TestExplainParity
+     1026/1026; TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60
+     / TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic
+     44/44 / TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord
+     13/13 all clean; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma
+     / DiagFunctions / DiagWindow / DiagMisc / DiagCast / DiagDate /
+     DiagSubsel / DiagAggWhere / DiagInnerJoin / DiagMultiValues /
+     DiagDropTable / DiagCovering / DiagIndexing / DiagPredicates /
+     DiagOrderLimitTopN / DiagAnalyze all 0 divergences.
 
 - [ ] **10.1.bug.39** `.recover` on a clean (uncorrupted) db reports
      `database disk image is malformed (11)` after the
