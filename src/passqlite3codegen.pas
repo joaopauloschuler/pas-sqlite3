@@ -47697,6 +47697,10 @@ var
   y2, m2, d2, h2, mn2: i32;
   s2: Double;
   epoch: Double;
+  daySun, dayMon, dayJan01: i32;
+  thursJD: Double;
+  ty, tm, td, th, tmn: i32;
+  ts: Double;
 begin
   if argc < 2 then begin sqlite3_result_null(pCtx); Exit; end;
   zFmt  := sqlite3_value_text(Psqlite3_value(argv^));
@@ -47783,6 +47787,55 @@ begin
              end;
         'R': begin snpFmt(8, op, '%02d:%02d', [h2, mn2]); while op^ <> #0 do Inc(op); end;
         'T': begin snpFmt(12, op, '%02d:%02d:%02d', [h2, mn2, Trunc(s2)]); while op^ <> #0 do Inc(op); end;
+        'U': begin
+               { Week num 00-53; first Sun of the year is week 01.
+                 date.c:1535..1538: (daysAfterJan01 - daysAfterSunday + 7)/7. }
+               jan1 := toJulianDay(y2,1,1,0,0,0.0);
+               dayJan01 := Trunc(jd - jan1);
+               daySun := Trunc(jd + 1.5) mod 7;
+               snpFmt(4, op, '%02d', [(dayJan01 - daySun + 7) div 7]);
+               while op^ <> #0 do Inc(op);
+             end;
+        'W': begin
+               { Week num 00-53; first Mon of the year is week 01.
+                 date.c:1550..1553: (daysAfterJan01 - daysAfterMonday + 7)/7. }
+               jan1 := toJulianDay(y2,1,1,0,0,0.0);
+               dayJan01 := Trunc(jd - jan1);
+               daySun := Trunc(jd + 1.5) mod 7;
+               dayMon := (daySun + 6) mod 7;
+               snpFmt(4, op, '%02d', [(dayJan01 - dayMon + 7) div 7]);
+               while op^ <> #0 do Inc(op);
+             end;
+        'V': begin
+               { ISO week num 01-53; first week with a Thur is week 01.
+                 date.c:1540..1548: shift to Thursday in same week, then
+                 daysAfterJan01(y)/7 + 1. }
+               daySun := Trunc(jd + 1.5) mod 7;
+               dayMon := (daySun + 6) mod 7;
+               thursJD := jd + (3 - dayMon);
+               fromJulianDay(thursJD, ty, tm, td, th, tmn, ts);
+               jan1 := toJulianDay(ty,1,1,0,0,0.0);
+               dayJan01 := Trunc(thursJD - jan1);
+               snpFmt(4, op, '%02d', [(dayJan01 div 7) + 1]);
+               while op^ <> #0 do Inc(op);
+             end;
+        'G': begin
+               { ISO week-based year — year of the Thursday in same week. }
+               daySun := Trunc(jd + 1.5) mod 7;
+               dayMon := (daySun + 6) mod 7;
+               thursJD := jd + (3 - dayMon);
+               fromJulianDay(thursJD, ty, tm, td, th, tmn, ts);
+               snpFmt(8, op, '%04d', [ty]);
+               while op^ <> #0 do Inc(op);
+             end;
+        'g': begin
+               daySun := Trunc(jd + 1.5) mod 7;
+               dayMon := (daySun + 6) mod 7;
+               thursJD := jd + (3 - dayMon);
+               fromJulianDay(thursJD, ty, tm, td, th, tmn, ts);
+               snpFmt(4, op, '%02d', [ty mod 100]);
+               while op^ <> #0 do Inc(op);
+             end;
         '%': begin op^ := '%'; Inc(op); end;
         else begin op^ := '%'; Inc(op); op^ := c; Inc(op); end;
       end;

@@ -2648,6 +2648,42 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.49** Fixed 2026-05-08.  `strftime()` silently echoed
+     unsupported format tokens for the ISO-week family.  Reproducer:
+     `SELECT strftime('%V','2024-01-15');` returned `%V` (the literal)
+     instead of `03`; same shape for `%U`, `%W`, `%G`, `%g`.  Root
+     cause: the Pascal port's `strftimeFunc`
+     (passqlite3codegen.pas:47687) only had arms for Y/m/d/H/M/S/f/j/J/
+     w/u/s/e/F/k/I/l/p/P/R/T/% — the ISO-week-number /
+     Sunday/Monday-week-number / week-based-year arms documented at
+     date.c:1535..1554 were missing, so the default fall-through
+     (`op^ := '%'; op^ := c;`) emitted the literal token.  Fix: ported
+     all five arms 1:1, reusing the existing toJulianDay / fromJulianDay
+     helpers and the `Trunc(jd+1.5) mod 7` weekday encoder already used
+     by the `%w` arm.  `%U` = `(daysAfterJan01 - daysAfterSunday + 7)/7`;
+     `%W` = same with daysAfterMonday; `%V` / `%G` / `%g` shift to the
+     Thursday in the same week (`thursJD := jd + (3 - daysAfterMonday)`),
+     decompose, then format `daysAfterJan01(thurs)/7 + 1` for `%V` and
+     the Thursday's year for `%G` / `%g`.  Verified byte-identical to
+     the 3.53.0 oracle across 16 cases including the ISO edge years
+     (2021-01-01 → V=53/G=2020, 2023-01-01 → V=52/G=2022, 2024-01-01 →
+     V=01/G=2024, 2024-12-31 → V=01/G=2025).  TestExplainParity
+     1026/1026; DiagDate / DiagOps / DiagDml / DiagFunctions /
+     DiagPragma / DiagWindow / DiagMisc / DiagCast / DiagFeatureProbe /
+     DiagMoreFunc / DiagSampleProg all 0 divergences.
+
+- [ ] **10.1.bug.50** GROUP BY by SELECT-list column alias raises
+     `Parse error: no such column: <alias>`.  Reproducer:
+     `SELECT b%2 g, count(*) FROM t GROUP BY g;` works on the C oracle
+     (returns the grouped count) but errors out in the Pascal port.
+     Same shape for `ORDER BY <alias>` over an aggregate / computed
+     column when the alias doesn't match a real table column — that
+     path may already work via positional ordinals.  Likely fix site:
+     `resolveAsName` / `resolveOrderByTermToExprList` in
+     passqlite3codegen.pas — the GROUP BY alias arm of resolve.c
+     (`lookupName` falling back to `pNC->pAList`) is probably absent
+     or gated incorrectly.
+
 - [X] **10.1.bug.48** Fixed 2026-05-08.  Planner missed the IPK fast
      path when an INTEGER PRIMARY KEY column was referenced by its
      declared name (rather than by `rowid`).  Reproducer:
