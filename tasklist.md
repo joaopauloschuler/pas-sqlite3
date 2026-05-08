@@ -2558,6 +2558,32 @@ existing dispatcher.
      6.29); DiagFunctions / TestSmoke / TestVdbeAgg 11/11 clean.
      Open follow-up tracked as **10.1.bug.25** below.
 
+- [X] **10.1.bug.31** Fixed 2026-05-08.  `EXISTS(SELECT … with no FROM
+     clause)` always returned 0; `SELECT <expr> WHERE <falsey>` (no FROM)
+     wrongly returned the expression value.  Both bugs lived in the
+     no-FROM fast path in `sqlite3Select`
+     (passqlite3codegen.pas:23229..23339).  (a) The eDest gate did not
+     accept SRT_Exists — `sqlite3CodeSubselect` on an EXISTS subquery
+     with no source fell through past the fast path's emit, so iSDParm
+     was never flipped from its zero init.  Fix: extend the gate to
+     accept SRT_Exists, suppress the result-list ExprCode for it, and
+     emit `OP_Integer 1, iSDParm` in the disposal arm — mirrors
+     selectInnerLoop SRT_Exists (select.c:1412..1416).  (b) The fast
+     path skipped `pWhere` entirely (selectInnerLoop runs through
+     WhereBegin which evaluates the residual).  Fix: when pWhere is
+     non-nil, allocate `addrEndNoFrom` up front and emit
+     `sqlite3ExprIfFalse(pWhere, addrEndNoFrom, JUMPIFNULL)` before the
+     row-emit body.  Verified: `SELECT EXISTS(SELECT 1)` = 1,
+     `SELECT EXISTS(SELECT 1 WHERE 0)` = 0, `SELECT 5 WHERE 0` returns
+     no rows, `SELECT 5 WHERE 1` returns 5 — all byte-identical to
+     upstream.  TestExplainParity 1026/1026; TestSmoke / TestSelectBasic
+     60/60 / TestDMLBasic 54/54 / TestWhereBasic 52/52 / TestSchemaBasic
+     44/44 / TestVdbeAgg 11/11 / TestPrepareBasic 20/20 / TestParser
+     45/45 / TestVdbeRecord 13/13 / TestBytecodeParity 32/32 all clean;
+     DiagFeatureProbe / DiagOps / DiagDml / DiagFunctions / DiagMisc /
+     DiagWindow / DiagTxn / DiagPragma / DiagDropTable / DiagMoreFunc /
+     DiagCast all 0 divergences.
+
 - [X] **10.1.bug.30** Fixed 2026-05-08.  `CREATE TABLE` after `CREATE
      TRIGGER` raised `database disk image is malformed` because
      `sqlite3InitCallback` branch (b)'s already-published gate

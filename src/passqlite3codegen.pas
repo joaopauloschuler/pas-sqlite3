@@ -23229,7 +23229,8 @@ begin
   if ((p^.pSrc = nil) or (p^.pSrc^.nSrc = 0))
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
           or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table)
-          or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo))
+          or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo)
+          or (pDest^.eDest = SRT_Exists))
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pWin = nil)
@@ -23256,11 +23257,10 @@ begin
       the LIMIT 0 / fall-through-to-EndCoroutine case for SRT_Coroutine
       consumers that retry. }
     addrEndNoFrom := 0;
-    if p^.pLimit <> nil then
-    begin
+    if (p^.pLimit <> nil) or (p^.pWhere <> nil) then
       addrEndNoFrom := sqlite3VdbeMakeLabel(pParse);
+    if p^.pLimit <> nil then
       computeLimitRegisters(pParse, p, addrEndNoFrom);
-    end;
     { Multi-row VALUES coroutine register-numbering parity (Phase 6.8.6
       step 5).  C's selectInnerLoop / multiSelectValues route allocates a
       few transient temp regs while emitting the per-row Integer/Yield
@@ -23289,7 +23289,12 @@ begin
       sqlite3VdbeAddOp4(v, OP_Explain, sqlite3VdbeCurrentAddr(v), 0, 0,
                         sqlite3MPrintf(pParse^.db, 'SCAN CONSTANT ROW', []),
                         P4_DYNAMIC);
-    sqlite3ExprCodeExprList(pParse, pEList, pDest^.iSdst, 0, SQLITE_ECEL_DUP);
+    { WHERE — bypass body when pWhere is false (mirrors WhereBegin's
+      false-WHERE-term-bypass). }
+    if p^.pWhere <> nil then
+      sqlite3ExprIfFalse(pParse, p^.pWhere, addrEndNoFrom, SQLITE_JUMPIFNULL);
+    if pDest^.eDest <> SRT_Exists then
+      sqlite3ExprCodeExprList(pParse, pEList, pDest^.iSdst, 0, SQLITE_ECEL_DUP);
     { OFFSET — codeOffset emits IfPos to skip the row when iOffset>0.
       Jumps to addrEndNoFrom (i.e. past the row emission) so this single
       row is suppressed and the consumer sees zero rows for OFFSET>=1. }
@@ -23299,6 +23304,11 @@ begin
       sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
     else if pDest^.eDest = SRT_Coroutine then
       sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+    else if pDest^.eDest = SRT_Exists then
+      { selectInnerLoop SRT_Exists arm (select.c:1412..1416): the inner
+        SELECT produced a row, so flip iSDParm to 1.  No need to evaluate
+        the result list (suppressed above). }
+      sqlite3VdbeAddOp2(v, OP_Integer, 1, pDest^.iSDParm)
     else
     begin
       { SRT_EphemTab / SRT_Table / SRT_Fifo / SRT_DistFifo — append the row
