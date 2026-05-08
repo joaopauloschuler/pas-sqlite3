@@ -2648,6 +2648,35 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.72** Fixed 2026-05-08.  Scalar subqueries with no FROM
+     clause silently returned NULL instead of evaluating their body, so
+     `SELECT (SELECT 1);`, `SELECT (SELECT 1)+(SELECT 2);`,
+     `SELECT (SELECT 1 LIMIT 1);`, `SELECT (VALUES(1));`, and
+     `SELECT (SELECT 1 WHERE 1);` (the last also segfaulted) all
+     produced empty / wrong rows.  Root cause: the no-FROM fast path in
+     `sqlite3Select` (passqlite3codegen.pas:23400) accepted SRT_Output /
+     Coroutine / EphemTab / Table / Fifo / DistFifo / Exists / Set but
+     omitted SRT_Mem — the destination eDest used by
+     `sqlite3CodeSubselect` (codegen.pas:5158) for scalar subqueries.
+     With SRT_Mem the fast path fell through, sqlite3Select returned
+     having emitted no body code at all (only the prologue OP_Null
+     emitted by sqlite3CodeSubselect), and OP_Copy then read the
+     null-initialised iSdst register.  Fix: extend the eDest set on the
+     fast-path guard and add an SRT_Mem dispatch arm — the values are
+     already coded into iSdst by `sqlite3ExprCodeExprList` (and iSdst
+     equals iSDParm in the SRT_Mem destination init), so the arm is a
+     no-op.  Mirrors selectInnerLoop SRT_Mem (select.c:1325).  Verified:
+     all reproducers now byte-identical to upstream including
+     `SELECT 1+(SELECT 2)`, `SELECT (SELECT 5)+1`, `SELECT (SELECT a FROM x)`.
+     TestExplainParity 1026/1026; TestSmoke / TestSelectBasic 60/60 /
+     TestDMLBasic 54/54 / TestWhereBasic 52/52 / TestVdbeAgg 11/11 /
+     TestSchemaBasic 44/44 / TestPrepareBasic 20/20 / TestParser 45/45 /
+     TestVdbeRecord 13/13 / TestWindowBasic 34/34 all pass;
+     DiagFeatureProbe / DiagOps / DiagDml / DiagSubsel / DiagAggWhere /
+     DiagWindow / DiagPragma / DiagMisc / DiagCast / DiagDate /
+     DiagFunctions / DiagTxn / DiagCovering / DiagIndexing /
+     DiagMultiValues / DiagPredicates all 0 divergences.
+
 - [X] **10.1.bug.69** Fixed 2026-05-08.  `timediff(A,B)` was missing
      and Pascal's `fromJulianDay` decoded JD values for proleptic-
      Gregorian dates before 1582 incorrectly (e.g. `date(1721089.5)`

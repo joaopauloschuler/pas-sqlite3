@@ -23401,7 +23401,8 @@ begin
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
           or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table)
           or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo)
-          or (pDest^.eDest = SRT_Exists) or (pDest^.eDest = SRT_Set))
+          or (pDest^.eDest = SRT_Exists) or (pDest^.eDest = SRT_Set)
+          or (pDest^.eDest = SRT_Mem))
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pWin = nil)
@@ -23495,6 +23496,13 @@ begin
       sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
                            pDest^.iSdst, nResultCol);
       sqlite3ReleaseTempReg(pParse, r1);
+    end
+    else if pDest^.eDest = SRT_Mem then
+    begin
+      { SRT_Mem — values are already coded into iSdst (which equals iSDParm
+        in sqlite3CodeSubselect's destination init), so no further dispatch
+        is needed.  Mirrors selectInnerLoop SRT_Mem arm (select.c:1325) which
+        is a no-op when regResult == dest->iSDParm. }
     end
     else
     begin
