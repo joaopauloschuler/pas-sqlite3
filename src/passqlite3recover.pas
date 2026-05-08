@@ -768,6 +768,475 @@ begin
 end;
 
 { ---------------------------------------------------------------
+  recoverFindTable / recoverAddTable — schema synthesis (lines
+  1050..1138 / 1371..1375 of sqlite3recover.c).
+  --------------------------------------------------------------- }
+
+function recoverFindTable(p: Psqlite3_recover; iRoot: u32): PRecoverTable;
+var pRet: PRecoverTable;
+begin
+  pRet := p^.pTblList;
+  while (pRet <> nil) and (pRet^.iRoot <> iRoot) do
+    pRet := pRet^.pNext;
+  Result := pRet;
+end;
+
+procedure recoverAddTable(p: Psqlite3_recover; zName: PAnsiChar; iRoot: i64);
+var
+  pStmt: PVdbe;
+  iPk, iBind, nCol, nName, nByte: i32;
+  pNew: PRecoverTable;
+  i, iField, iPKF, n, eHidden: i32;
+  csr, z, zType: PAnsiChar;
+  iCol: i32;
+begin
+  pStmt := recoverPreparePrintf(p, p^.dbOut, 'PRAGMA table_xinfo(%Q)', [zName]);
+  if pStmt = nil then Exit;
+
+  iPk := -1;
+  iBind := 1;
+  pNew := nil;
+  nCol := 0;
+  nName := recoverStrlen(zName);
+  nByte := 0;
+
+  while sqlite3_step(pStmt) = SQLITE_ROW do begin
+    Inc(nCol);
+    Inc(nByte, sqlite3_column_bytes(pStmt, 1) + 1);
+  end;
+  Inc(nByte, SizeOf(TRecoverTable) + nCol * SizeOf(TRecoverColumn) + nName + 1);
+  recoverReset(p, pStmt);
+
+  pNew := PRecoverTable(recoverMalloc(p, nByte));
+  if pNew <> nil then begin
+    pNew^.aCol := PRecoverColumn(PByte(pNew) + SizeOf(TRecoverTable));
+    csr := PAnsiChar(pNew^.aCol) + nCol * SizeOf(TRecoverColumn);
+    pNew^.zTab := csr;
+    pNew^.nCol := nCol;
+    pNew^.iRoot := u32(iRoot);
+    if nName > 0 then Move(zName[0], csr[0], nName);
+    Inc(csr, nName + 1);
+
+    iField := 0;
+    i := 0;
+    while sqlite3_step(pStmt) = SQLITE_ROW do begin
+      iPKF := sqlite3_column_int(pStmt, 5);
+      n := sqlite3_column_bytes(pStmt, 1);
+      z := PAnsiChar(sqlite3_column_text(pStmt, 1));
+      zType := PAnsiChar(sqlite3_column_text(pStmt, 2));
+      eHidden := sqlite3_column_int(pStmt, 6);
+
+      if (iPk = -1) and (iPKF = 1) and (sqlite3_stricmp('integer', zType) = 0) then
+        iPk := i;
+      if iPKF > 1 then iPk := -2;
+
+      pNew^.aCol[i].zCol := csr;
+      pNew^.aCol[i].eHidden := eHidden;
+      if eHidden = RECOVER_EHIDDEN_VIRTUAL then begin
+        pNew^.aCol[i].iField := -1;
+      end else begin
+        pNew^.aCol[i].iField := iField;
+        Inc(iField);
+      end;
+      if (eHidden <> RECOVER_EHIDDEN_VIRTUAL) and
+         (eHidden <> RECOVER_EHIDDEN_STORED) then
+      begin
+        pNew^.aCol[i].iBind := iBind;
+        Inc(iBind);
+      end;
+
+      if n > 0 then Move(z[0], csr[0], n);
+      Inc(csr, n + 1);
+      Inc(i);
+    end;
+
+    pNew^.pNext := p^.pTblList;
+    p^.pTblList := pNew;
+    pNew^.bIntkey := 1;
+  end;
+
+  recoverFinalize(p, pStmt);
+
+  pStmt := recoverPreparePrintf(p, p^.dbOut, 'PRAGMA index_xinfo(%Q)', [zName]);
+  while (pStmt <> nil) and (sqlite3_step(pStmt) = SQLITE_ROW) do begin
+    iField := sqlite3_column_int(pStmt, 0);
+    iCol   := sqlite3_column_int(pStmt, 1);
+    if pNew <> nil then begin
+      Assert(iCol < pNew^.nCol);
+      pNew^.aCol[iCol].iField := iField;
+      pNew^.bIntkey := 0;
+    end;
+    iPk := -2;
+  end;
+  recoverFinalize(p, pStmt);
+
+  if (p^.errCode = SQLITE_OK) and (pNew <> nil) then begin
+    if iPk >= 0 then
+      pNew^.aCol[iPk].bIPK := 1
+    else if pNew^.bIntkey <> 0 then begin
+      pNew^.iRowidBind := iBind;
+      Inc(iBind);
+    end;
+  end;
+end;
+
+{ ---------------------------------------------------------------
+  recoverWriteSchema1 / recoverWriteSchema2 — emit recovered
+  CREATE TABLE / CREATE INDEX statements (lines 1159..1260).
+  --------------------------------------------------------------- }
+
+function recoverWriteSchema1(p: Psqlite3_recover): i32;
+var
+  pSelect, pTblname: PVdbe;
+  iRoot: i64;
+  bTable, bVirtual, rc: i32;
+  zName, zSql, zTbl: PAnsiChar;
+  zFree: PAnsiChar;
+begin
+  pSelect := recoverPrepare(p, p^.dbOut,
+    'WITH dbschema(rootpage, name, sql, tbl, isVirtual, isIndex) AS (' +
+    '  SELECT rootpage, name, sql, ' +
+    '    type=''table'', ' +
+    '    sql LIKE ''create virtual%'',' +
+    '    (type=''index'' AND (sql LIKE ''%unique%'' OR ?1))' +
+    '  FROM recovery.schema' +
+    ')' +
+    'SELECT rootpage, tbl, isVirtual, name, sql' +
+    ' FROM dbschema ' +
+    '  WHERE tbl OR isIndex' +
+    '  ORDER BY tbl DESC, name==''sqlite_sequence'' DESC');
+
+  pTblname := recoverPrepare(p, p^.dbOut,
+    'SELECT name FROM sqlite_schema ' +
+    'WHERE type=''table'' ORDER BY rowid DESC LIMIT 1');
+
+  if pSelect <> nil then begin
+    sqlite3_bind_int(pSelect, 1, p^.bSlowIndexes);
+    while sqlite3_step(pSelect) = SQLITE_ROW do begin
+      iRoot    := sqlite3_column_int64(pSelect, 0);
+      bTable   := sqlite3_column_int(pSelect, 1);
+      bVirtual := sqlite3_column_int(pSelect, 2);
+      zName    := PAnsiChar(sqlite3_column_text(pSelect, 3));
+      zSql     := PAnsiChar(sqlite3_column_text(pSelect, 4));
+      zFree    := nil;
+
+      if bVirtual <> 0 then begin
+        zFree := recoverMPrintf(p,
+          'INSERT INTO sqlite_schema VALUES(''table'', %Q, %Q, 0, %Q)',
+          [zName, zName, zSql]);
+        zSql := zFree;
+      end;
+      rc := sqlite3_exec(p^.dbOut, zSql, nil, nil, nil);
+      if rc = SQLITE_OK then begin
+        recoverSqlCallback(p, zSql);
+        if (bTable <> 0) and (bVirtual = 0) then begin
+          if sqlite3_step(pTblname) = SQLITE_ROW then begin
+            zTbl := PAnsiChar(sqlite3_column_text(pTblname, 0));
+            if zTbl <> nil then recoverAddTable(p, zTbl, iRoot);
+          end;
+          recoverReset(p, pTblname);
+        end;
+      end else if rc <> SQLITE_ERROR then
+        recoverDbError(p, p^.dbOut);
+      if zFree <> nil then sqlite3_free(zFree);
+    end;
+  end;
+  recoverFinalize(p, pSelect);
+  recoverFinalize(p, pTblname);
+  Result := p^.errCode;
+end;
+
+function recoverWriteSchema2(p: Psqlite3_recover): i32;
+var
+  pSelect: PVdbe;
+  zSql: PAnsiChar;
+  rc: i32;
+begin
+  if p^.bSlowIndexes <> 0 then
+    pSelect := recoverPrepare(p, p^.dbOut,
+      'SELECT rootpage, sql FROM recovery.schema ' +
+      '  WHERE type!=''table'' AND type!=''index''')
+  else
+    pSelect := recoverPrepare(p, p^.dbOut,
+      'SELECT rootpage, sql FROM recovery.schema ' +
+      '  WHERE type!=''table'' AND (type!=''index'' OR sql NOT LIKE ''%unique%'')');
+
+  if pSelect <> nil then begin
+    while sqlite3_step(pSelect) = SQLITE_ROW do begin
+      zSql := PAnsiChar(sqlite3_column_text(pSelect, 1));
+      rc := sqlite3_exec(p^.dbOut, zSql, nil, nil, nil);
+      if rc = SQLITE_OK then
+        recoverSqlCallback(p, zSql)
+      else if rc <> SQLITE_ERROR then
+        recoverDbError(p, p^.dbOut);
+    end;
+  end;
+  recoverFinalize(p, pSelect);
+  Result := p^.errCode;
+end;
+
+{ ---------------------------------------------------------------
+  recoverInsertStmt — synthesize per-table INSERT (lines 1297..1363).
+  --------------------------------------------------------------- }
+
+function recoverInsertStmt(p: Psqlite3_recover; pTab: PRecoverTable;
+  nField: i32): PVdbe;
+var
+  pRet: PVdbe;
+  zSep, zSqlSep: PAnsiChar;
+  zSql, zFinal, zBind, zTmp: PAnsiChar;
+  ii, eHidden, bSql: i32;
+begin
+  pRet := nil;
+  zSep := '';
+  zSqlSep := '';
+  zSql := nil;
+  zFinal := nil;
+  zBind := nil;
+  if Assigned(p^.xSql) then bSql := 1 else bSql := 0;
+
+  if nField <= 0 then begin Result := nil; Exit; end;
+  Assert(nField <= pTab^.nCol);
+
+  zSql := recoverMPrintf(p, 'INSERT OR IGNORE INTO %Q(', [pTab^.zTab]);
+
+  if pTab^.iRowidBind <> 0 then begin
+    Assert(pTab^.bIntkey <> 0);
+    zTmp := recoverMPrintf(p, '%s_rowid_', [zSql]);
+    sqlite3_free(zSql); zSql := zTmp;
+    if bSql <> 0 then
+      zBind := recoverMPrintf(p, 'quote(?%d)', [pTab^.iRowidBind])
+    else
+      zBind := recoverMPrintf(p, '?%d', [pTab^.iRowidBind]);
+    zSqlSep := '||'', ''||';
+    zSep := ', ';
+  end;
+
+  for ii := 0 to nField - 1 do begin
+    eHidden := pTab^.aCol[ii].eHidden;
+    if (eHidden <> RECOVER_EHIDDEN_VIRTUAL) and
+       (eHidden <> RECOVER_EHIDDEN_STORED) then
+    begin
+      Assert((pTab^.aCol[ii].iField >= 0) and (pTab^.aCol[ii].iBind >= 1));
+      zTmp := recoverMPrintf(p, '%s%s%Q', [zSql, zSep, pTab^.aCol[ii].zCol]);
+      sqlite3_free(zSql); zSql := zTmp;
+
+      if bSql <> 0 then begin
+        if zBind = nil then
+          zTmp := recoverMPrintf(p, 'escape_crlf(quote(?%d))', [pTab^.aCol[ii].iBind])
+        else
+          zTmp := recoverMPrintf(p, '%s%sescape_crlf(quote(?%d))',
+            [zBind, zSqlSep, pTab^.aCol[ii].iBind]);
+        if zBind <> nil then sqlite3_free(zBind);
+        zBind := zTmp;
+        zSqlSep := '||'', ''||';
+      end else begin
+        if zBind = nil then
+          zTmp := recoverMPrintf(p, '?%d', [pTab^.aCol[ii].iBind])
+        else
+          zTmp := recoverMPrintf(p, '%s%s?%d',
+            [zBind, zSep, pTab^.aCol[ii].iBind]);
+        if zBind <> nil then sqlite3_free(zBind);
+        zBind := zTmp;
+      end;
+      zSep := ', ';
+    end;
+  end;
+
+  if bSql <> 0 then
+    zFinal := recoverMPrintf(p,
+      'SELECT %Q || '') VALUES ('' || %s || '')''', [zSql, zBind])
+  else
+    zFinal := recoverMPrintf(p, '%s) VALUES (%s)', [zSql, zBind]);
+
+  pRet := recoverPrepare(p, p^.dbOut, zFinal);
+  if zSql <> nil then sqlite3_free(zSql);
+  if zBind <> nil then sqlite3_free(zBind);
+  if zFinal <> nil then sqlite3_free(zFinal);
+  Result := pRet;
+end;
+
+{ ---------------------------------------------------------------
+  recoverWriteDataInit / Cleanup / Step — table-by-table data extraction
+  (lines 1669..1853 of sqlite3recover.c).
+  --------------------------------------------------------------- }
+
+function recoverWriteDataInit(p: Psqlite3_recover): i32;
+var
+  p1: PRecoverStateW1;
+  pTbl: PRecoverTable;
+  nByte: i32;
+begin
+  p1 := @p^.w1;
+  Assert(p1^.nMax = 0);
+  pTbl := p^.pTblList;
+  while pTbl <> nil do begin
+    if pTbl^.nCol > p1^.nMax then p1^.nMax := pTbl^.nCol;
+    pTbl := pTbl^.pNext;
+  end;
+
+  nByte := SizeOf(Pointer) * (p1^.nMax + 1);
+  p1^.apVal := recoverMalloc(p, nByte);
+  if p1^.apVal = nil then begin Result := p^.errCode; Exit; end;
+
+  p1^.pTbls := recoverPrepare(p, p^.dbOut,
+    'SELECT rootpage FROM recovery.schema ' +
+    '  WHERE type=''table'' AND (sql NOT LIKE ''create virtual%'')' +
+    '  ORDER BY (tbl_name=''sqlite_sequence'') ASC');
+  p1^.pSel := recoverPrepare(p, p^.dbOut,
+    'WITH RECURSIVE pages(page) AS (' +
+    '  SELECT ?1' +
+    '    UNION' +
+    '  SELECT child FROM sqlite_dbptr(''getpage()''), pages ' +
+    '    WHERE pgno=page' +
+    ') ' +
+    'SELECT page, cell, field, value ' +
+    'FROM sqlite_dbdata(''getpage()'') d, pages p WHERE p.page=d.pgno ' +
+    'UNION ALL ' +
+    'SELECT 0, 0, 0, 0');
+
+  Result := p^.errCode;
+end;
+
+procedure recoverWriteDataCleanup(p: Psqlite3_recover);
+var
+  p1: PRecoverStateW1;
+  apVal: PPsqlite3_value;
+  ii: i32;
+begin
+  p1 := @p^.w1;
+  apVal := PPsqlite3_value(p1^.apVal);
+  if apVal <> nil then begin
+    for ii := 0 to p1^.nVal - 1 do
+      sqlite3_value_free(apVal[ii]);
+    sqlite3_free(apVal);
+  end;
+  recoverFinalize(p, p1^.pInsert);
+  recoverFinalize(p, p1^.pTbls);
+  recoverFinalize(p, p1^.pSel);
+  FillChar(p1^, SizeOf(p1^), 0);
+end;
+
+function recoverWriteDataStep(p: Psqlite3_recover): i32;
+var
+  p1: PRecoverStateW1;
+  pSel, pInsert: PVdbe;
+  apVal: PPsqlite3_value;
+  iRoot, iPage: i64;
+  iCell, iField, ii, iBind: i32;
+  pVal: Psqlite3_value;
+  bNewCell: i32;
+  pTab: PRecoverTable;
+  pCol: PRecoverColumn;
+  z: PAnsiChar;
+begin
+  p1 := @p^.w1;
+  pSel := p1^.pSel;
+  apVal := PPsqlite3_value(p1^.apVal);
+
+  if (p^.errCode = SQLITE_OK) and (p1^.pTab = nil) then begin
+    if sqlite3_step(p1^.pTbls) = SQLITE_ROW then begin
+      iRoot := sqlite3_column_int64(p1^.pTbls, 0);
+      p1^.pTab := recoverFindTable(p, u32(iRoot));
+
+      recoverFinalize(p, p1^.pInsert);
+      p1^.pInsert := nil;
+
+      if p1^.pTab = nil then begin Result := p^.errCode; Exit; end;
+
+      if sqlite3_stricmp('sqlite_sequence', p1^.pTab^.zTab) = 0 then begin
+        recoverExec(p, p^.dbOut, 'DELETE FROM sqlite_sequence');
+        recoverSqlCallback(p, 'DELETE FROM sqlite_sequence');
+      end;
+
+      sqlite3_bind_int64(pSel, 1, iRoot);
+      p1^.nVal := 0;
+      p1^.bHaveRowid := 0;
+      p1^.iPrevPage := -1;
+      p1^.iPrevCell := -1;
+    end else begin
+      Result := SQLITE_DONE;
+      Exit;
+    end;
+  end;
+
+  Assert((p^.errCode <> SQLITE_OK) or (p1^.pTab <> nil));
+
+  if (p^.errCode = SQLITE_OK) and (sqlite3_step(pSel) = SQLITE_ROW) then begin
+    pTab := p1^.pTab;
+    iPage := sqlite3_column_int64(pSel, 0);
+    iCell := sqlite3_column_int(pSel, 1);
+    iField := sqlite3_column_int(pSel, 2);
+    pVal := sqlite3_column_value(pSel, 3);
+    if (p1^.iPrevPage <> iPage) or (p1^.iPrevCell <> iCell) then
+      bNewCell := 1
+    else
+      bNewCell := 0;
+
+    if bNewCell <> 0 then begin
+      if p1^.nVal >= 0 then begin
+        if (p1^.pInsert = nil) or (p1^.nVal <> p1^.nInsert) then begin
+          recoverFinalize(p, p1^.pInsert);
+          p1^.pInsert := recoverInsertStmt(p, pTab, p1^.nVal);
+          p1^.nInsert := p1^.nVal;
+        end;
+        if p1^.nVal > 0 then begin
+          pInsert := p1^.pInsert;
+          for ii := 0 to pTab^.nCol - 1 do begin
+            pCol := @pTab^.aCol[ii];
+            iBind := pCol^.iBind;
+            if iBind > 0 then begin
+              if pCol^.bIPK <> 0 then
+                sqlite3_bind_int64(pInsert, iBind, p1^.iRowid)
+              else if pCol^.iField < p1^.nVal then
+                recoverBindValue(p, pInsert, iBind, apVal[pCol^.iField]);
+            end;
+          end;
+          if (p^.bRecoverRowid <> 0) and (pTab^.iRowidBind > 0) and
+             (p1^.bHaveRowid <> 0) then
+            sqlite3_bind_int64(pInsert, pTab^.iRowidBind, p1^.iRowid);
+          if sqlite3_step(pInsert) = SQLITE_ROW then begin
+            z := PAnsiChar(sqlite3_column_text(pInsert, 0));
+            recoverSqlCallback(p, z);
+          end;
+          recoverReset(p, pInsert);
+          if pInsert <> nil then sqlite3_clear_bindings(pInsert);
+        end;
+      end;
+      for ii := 0 to p1^.nVal - 1 do begin
+        sqlite3_value_free(apVal[ii]);
+        apVal[ii] := nil;
+      end;
+      p1^.nVal := -1;
+      p1^.bHaveRowid := 0;
+    end;
+
+    if iPage <> 0 then begin
+      if iField < 0 then begin
+        p1^.iRowid := sqlite3_column_int64(pSel, 3);
+        Assert(p1^.nVal = -1);
+        p1^.nVal := 0;
+        p1^.bHaveRowid := 1;
+      end else if iField < pTab^.nCol then begin
+        Assert(apVal[iField] = nil);
+        apVal[iField] := sqlite3_value_dup(pVal);
+        if apVal[iField] = nil then
+          recoverError(p, SQLITE_NOMEM, nil, []);
+        p1^.nVal := iField + 1;
+      end else if pTab^.nCol = 0 then
+        p1^.nVal := pTab^.nCol;
+      p1^.iPrevCell := iCell;
+      p1^.iPrevPage := iPage;
+    end;
+  end else begin
+    recoverReset(p, pSel);
+    p1^.pTab := nil;
+  end;
+
+  Result := p^.errCode;
+end;
+
+{ ---------------------------------------------------------------
   recoverStep — initial-cut state machine.
 
   The full upstream pipeline is:
@@ -808,11 +1277,27 @@ begin
           recoverOpenRecovery(p);
           recoverCacheSchema(p);
         end;
-
-        { recoverWriteSchema1 / WRITING / SCHEMA2 deferred — short
-          circuit to DONE so callers see SQLITE_DONE. }
         if p^.errCode = SQLITE_OK then begin
           recoverExec(p, p^.dbOut, 'BEGIN');
+          recoverWriteSchema1(p);
+          recoverWriteDataInit(p);
+        end;
+        p^.eState := RECOVER_STATE_WRITING;
+      end;
+    RECOVER_STATE_WRITING:
+      begin
+        if recoverWriteDataStep(p) = SQLITE_DONE then begin
+          recoverWriteDataCleanup(p);
+          { Lost-and-found pipeline (RECOVER_STATE_LOSTANDFOUND*) is not
+            yet ported — skip directly to SCHEMA2 once data extraction
+            completes. }
+          p^.eState := RECOVER_STATE_SCHEMA2;
+        end;
+      end;
+    RECOVER_STATE_SCHEMA2:
+      begin
+        recoverWriteSchema2(p);
+        if p^.errCode = SQLITE_OK then begin
           recoverExec(p, p^.dbOut, 'COMMIT');
           rc := sqlite3_exec(p^.dbIn, 'END', nil, nil, nil);
           if p^.errCode = SQLITE_OK then p^.errCode := rc;

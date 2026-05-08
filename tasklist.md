@@ -1297,20 +1297,38 @@ existing dispatcher.
            explicit prefix/tail/separator buffers (Pascal `Move(...)`
            calls take addressable PAnsiChar locals rather than C's
            `memcpy(dst, "literal", N)` shortcut).
+       Phase 10.1.48 follow-up landed 2026-05-08 (~488 new lines):
+         * `recoverFindTable` / `recoverAddTable` schema-synthesis
+           pass — drives `PRAGMA table_xinfo` + `PRAGMA index_xinfo`
+           on the output db, allocates RecoverTable + RecoverColumn
+           array with trailing zCol/zTab strings, identifies IPK
+           and bIntkey shape.
+         * `recoverWriteSchema1` / `recoverWriteSchema2` — emit
+           recovered CREATE TABLE / CREATE INDEX (incl. UNIQUE) up
+           front, defer views/triggers/non-UNIQUE indexes to schema2.
+         * `recoverInsertStmt` — per-table INSERT-statement synth
+           with `_rowid_` binding and STORED/VIRTUAL skip.
+         * `recoverWriteDataInit` / `recoverWriteDataCleanup` /
+           `recoverWriteDataStep` — RECOVER_STATE_WRITING loop:
+           drive `recovery.schema` rootpage iterator, read sqlite_dbdata
+           rows, accumulate cell values into apVal, flush via
+           `sqlite3_step(pInsert)` on cell boundary.
+         * State machine extended to drive INIT → WRITING → SCHEMA2
+           → DONE; per-state `sqlite3_recover_step` hand-off so
+           `_run` polls correctly.
        Deferred (subsequent commits):
-         * `recoverNewTable` / `recoverAddTable` / `recoverFindTable`
-           schema-synthesis pass.
-         * `recoverWriteSchema1` / `recoverWriteSchema2` /
-           `recoverInsertStmt` per-table emit pipeline.
-         * `recoverWriteDataInit` / `recoverWriteDataStep` /
-           `recoverWriteDataCleanup` data-extraction loop
-           (RECOVER_STATE_WRITING).
          * `recoverLostAndFound{1,2,3}{Init,Step}` orphan recovery
-           pipeline.
+           pipeline (RECOVER_STATE_LOSTANDFOUND*).
          * `recoverVfs*` shim for page-1 header validation +
            `recoverInstallWrapper` / `recoverUninstallWrapper`.
          * `recoverIsValidPage` + `recoverGetU16` / `U32` / `Varint`
            helpers used by the wrapper VFS.
+       Pre-existing engine gaps blocking end-to-end runtime probe:
+         * `WITH RECURSIVE` driven through `sqlite_dbptr('getpage()')`
+           virtual table currently does not return rows in the Pascal
+           port (related to bug 6.13's vtab xBestIndex hidden-arg
+           binding gap), so `recovery.schema` ends up empty and
+           subsequent `WRITING` state finds no tables to recover.
        The shell `.recover` dispatcher (`cmdRecover`) still emits
        the upstream "this build does not support .recover" stub
        because the engine state machine is incomplete.  Once the
