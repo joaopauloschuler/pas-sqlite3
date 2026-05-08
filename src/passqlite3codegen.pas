@@ -34082,23 +34082,30 @@ begin
     transfers to the codegen path on success, but on early-out we must
     still free the input. }
   if (pEnd = nil) and (pSelect = nil) then begin
-    sqlite3SelectDelete(pParse^.db, pSelect);
     Exit;
   end;
 
   pTab := pParse^.pNewTable;
   if pTab = nil then begin
-    sqlite3SelectDelete(pParse^.db, pSelect);
     Exit;
   end;
 
   db := pParse^.db;
 
+  { CREATE TABLE ... AS SELECT body codegen is deferred to Phase 7.x.
+    Without it we would write a CREATE-table schema row with no column
+    list, leaving sqlite_schema malformed.  Surface a clean parse error
+    instead and skip the entire emit path. }
+  if pSelect <> nil then begin
+    sqlite3ErrorMsg(pParse,
+      PAnsiChar('CREATE TABLE AS SELECT not yet supported in this build'));
+    Exit;
+  end;
+
   { Test-scaffold gate: the synthetic dbs used by TestParserSmoke /
     TestVtab leave eOpenState=1 and have no working aDb[].pSchema /
     sqlite3GetVdbe path.  Real sqlite3_open_v2 sets $76. }
   if db^.eOpenState <> $76 then begin
-    sqlite3SelectDelete(db, pSelect);
     Exit;
   end;
 
@@ -34110,7 +34117,6 @@ begin
     if (pSelect <> nil)
        or ((pTab^.eTabType <> TABTYP_NORM) and (db^.init.newTnum <> 0)) then begin
       sqlite3ErrorMsg(pParse, '');
-      sqlite3SelectDelete(db, pSelect);
       Exit;
     end;
     pTab^.tnum := db^.init.newTnum;
@@ -34157,7 +34163,6 @@ begin
     begin
       sqlite3ErrorMsg(pParse,
         PAnsiChar('must have at least one non-generated column'));
-      sqlite3SelectDelete(db, pSelect);
       Exit;
     end;
   end;
@@ -34235,18 +34240,15 @@ begin
   if db^.init.busy = 0 then begin
     v := sqlite3GetVdbe(pParse);
     if v = nil then begin
-      sqlite3SelectDelete(db, pSelect);
       Exit;
     end;
 
-    { CREATE TABLE ... AS SELECT body deferred to Phase 7.x.  Free the
-      input list here (the upstream branch consumes it).  Capture whether
-      we had a SELECT first, so the createTableStmt branch below can fire. }
+    { CREATE TABLE ... AS SELECT body deferred to Phase 7.x.  Parser owns
+      pSelect and frees it after EndTable returns; we only note whether
+      a SELECT was present so the createTableStmt branch below can fire. }
     bAsSelect := 0;
     if pSelect <> nil then begin
       bAsSelect := 1;
-      sqlite3SelectDelete(db, pSelect);
-      pSelect := nil;
     end;
 
     { Determine zType / zType2 (build.c:2811..2820): regular table vs view. }
@@ -34324,7 +34326,6 @@ begin
     if sqlite3HashInsert(@passqlite3util.PSchema(pTab^.pSchema)^.tblHash,
          PChar(pTab^.zName), pTab) <> nil then begin
       sqlite3OomFault(db);
-      sqlite3SelectDelete(db, pSelect);
       Exit;
     end;
     pParse^.pNewTable := nil;
@@ -34354,7 +34355,6 @@ begin
     end;
   end;
 
-  sqlite3SelectDelete(db, pSelect);
 end;
 
 { sqlite3CreateView — port of build.c:2990.

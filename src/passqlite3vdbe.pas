@@ -5165,14 +5165,35 @@ end;
 { vdbeapi.c:1492 — columnName(pStmt, N, useUtf16, useType).
   Slot stored at aColName[N + useType*nResColumn]; encoding selected by
   useUtf16. }
+const
+  azExplainColNames8: array[0..11] of PAnsiChar = (
+    'addr', 'opcode', 'p1', 'p2', 'p3', 'p4', 'p5', 'comment',
+    'id', 'parent', 'notused', 'detail'
+  );
+
 function columnName(pStmt: PVdbe; N: i32; useUtf16, useType: i32): Pointer;
 var
-  pCell: PMem;
-  off:   PtrUInt;
+  pCell:       PMem;
+  off:         PtrUInt;
+  explainBits: u32;
+  nExp:        i32;
 begin
   Result := nil;
   if pStmt = nil then Exit;
-  if (N < 0) or (N >= pStmt^.nResColumn) then Exit;
+  if N < 0 then Exit;
+  { vdbeapi.c:1505..1518 — EXPLAIN / EXPLAIN QUERY PLAN return canonical
+    static column names regardless of any aColName setup performed by
+    the inner SELECT codegen. }
+  explainBits := (pStmt^.vdbeFlags and VDBF_EXPLAIN_MASK) shr VDBF_EXPLAIN_SHIFT;
+  if explainBits <> 0 then begin
+    if useType > 0 then Exit;
+    if explainBits = 1 then nExp := 8 else nExp := 4;
+    if N >= nExp then Exit;
+    if useUtf16 = 0 then
+      Result := Pointer(azExplainColNames8[N + 8 * i32(explainBits) - 8]);
+    Exit;
+  end;
+  if N >= pStmt^.nResColumn then Exit;
   if pStmt^.aColName = nil then Exit;
   if (useType < 0) or (useType >= COLNAME_N) then Exit;
   off := PtrUInt(N + useType * i32(pStmt^.nResColumn)) * SizeOf(TMem);

@@ -2472,35 +2472,21 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
-- [ ] **10.1.bug.13**
-     ```
-     sqlite> create table tbl1(one text, two int);
-     sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
-     sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
-     sqlite> select * from tbl1;
-     hello!|10
-     goodbye|20
-     hello!|10
-     goodbye|20
-     sqlite> create index x on tbl1 (two);
-     sqlite> explain select * from tbl1;
-     0|Init|0|9|0||0|
-     1|OpenRead|0|2|0|2|0|
-     2|Explain|2|0|216|SCAN tbl1|0|
-     3|Rewind|0|8|0||0|
-     4|Column|0|0|1||0|
-     5|Column|0|1|2||0|
-     6|ResultRow|1|2|0||0|
-     7|Next|0|4|0||1|
-     8|Halt|0|0|0||0|
-     9|Transaction|0|0|3|0|1|
-     10|Goto|0|1|0||0|
-     sqlite> .mode box
-     sqlite> explain select * from tbl1;
-     An unhandled exception occurred at $00000000004BC6F3:
-     EAccessViolation: Access violation
-     $00000000004BC6F3
-     ```
+- [X] **10.1.bug.13** Fixed 2026-05-08.  `.mode box` (and any other
+     mode that calls sqlite3_column_name) crashed on EXPLAIN output
+     with EAccessViolation in sqlite3VdbeMemStringify → sqlite3DbFreeNN.
+     Root cause: passqlite3vdbe.pas:columnName lacked the upstream
+     vdbeapi.c:1505..1518 EXPLAIN short-circuit, so it walked the
+     SELECT's aColName array (sized for the inner SELECT's nResColumn,
+     e.g. 2) using the EXPLAIN-rewritten nResColumn (8 / 4), reading
+     past the end into uninitialised TMem cells.  Fixed by porting the
+     upstream `if( p->explain ) { ret = azExplainColNames8[...] }` arm:
+     added the static azExplainColNames8 table and a leading explain-
+     mode branch in columnName that returns the canonical
+     addr/opcode/p1..p5/comment (or id/parent/notused/detail) names
+     directly without consulting aColName.  Verified: `.mode box` +
+     `EXPLAIN SELECT …` now renders a properly bordered table; no
+     regression in TestExplainParity (1026/1026).
 
 - [ ] **10.1.bug.12**
      ```
@@ -2520,43 +2506,31 @@ existing dispatcher.
      sqlite> 
      ```
 
-- [ ] **10.1.bug.11**
-     ```
-     sqlite> create table tbl1(one text, two int);
-     sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
-     sqlite> insert into tbl1 values('hello!',10),('goodbye',20);
-     sqlite> select * from tbl1;
-     hello!|10
-     goodbye|20
-     hello!|10
-     goodbye|20
-     sqlite> select sum(two) from tlb1;
-     Parse error: no such table: tlb1
-     sqlite> select sum(two) from tbl1;
-     60
-     sqlite> select one, sum(two) from tbl1 group by one;
-     goodbye|40
-     hello!|20
-     sqlite> create table x as select * from tbl1;
-     An unhandled exception occurred at $00000000004C1164:
-     EAccessViolation: Access violation
-     $00000000004C1164
-     $000000000056A7D8
-     ```
+- [X] **10.1.bug.11** Crash fixed 2026-05-08.  `CREATE TABLE x AS
+     SELECT …` raised EAccessViolation in sqlite3ExprDeleteNN.  Root
+     cause: a double-free of the parsed Select tree.  The Lemon arm
+     `create_table_args ::= AS select` calls
+     `sqlite3EndTable(...,S); sqlite3SelectDelete(db, S);` exactly as
+     upstream — the parser owns S — but the Pascal port of
+     `sqlite3EndTable` (passqlite3codegen.pas) called
+     `sqlite3SelectDelete(db, pSelect)` itself on every early-out and
+     also as a tail statement, so by the time the parser ran its
+     SelectDelete, the pEList already pointed at freed memory and the
+     Mem-cell walk crashed.  Removed all internal SelectDelete calls
+     in sqlite3EndTable (the parser is the sole owner per the C
+     source).  Full CTAS body codegen is still deferred to Phase 7.x;
+     to avoid writing a malformed sqlite_schema row (no column list),
+     EndTable now surfaces a clean parse error
+     `CREATE TABLE AS SELECT not yet supported in this build` when
+     pSelect <> nil.  TestExplainParity 1026/1026 unaffected.
 
-- [ ] **10.1.bug.10**
-     ```
-     sqlite> .mode list --colsep "|"
-     sqlite> .output test_file_1.txt
-     sqlite> select * from tbl1;
-     sqlite> .exit
-     ```
-     Does not produce:
-     ```
-     $ cat test_file_1.txt
-     hello|10
-     goodbye|20
-     ```
+- [X] **10.1.bug.10** Verified 2026-05-08: cannot reproduce.
+     `.mode list --colsep "|"` + `.output FILE` + `SELECT …` now
+     writes the expected `hello|10` / `goodbye|20` lines into FILE
+     byte-identical to upstream.  Likely closed by a prior fix in
+     the .output / dup2 plumbing landed under 10.1.25 or the QRF
+     setter chain in 10.1.10.  Probe sweep covered both relative
+     (`test_file_1.txt`) and absolute (`/tmp/...`) paths.
 
 - [X] **10.1.bug.9** json_each / json_tree / jsonb_each / jsonb_tree
   raised `no such table: json_each` because the eponymous-vtab arm in
