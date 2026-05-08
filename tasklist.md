@@ -2648,6 +2648,68 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.55** Fixed 2026-05-08.  `DELETE FROM <parent>` on a table
+     referenced by a foreign key crashed the shell with
+     `EAccessViolation: Access violation` whenever `PRAGMA foreign_keys=ON`
+     was active, regardless of action (CASCADE / SET NULL / NO ACTION).
+     Reproducer: `PRAGMA foreign_keys=ON; CREATE TABLE p(id INTEGER PRIMARY
+     KEY); CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES
+     p(id) ON DELETE CASCADE); INSERT INTO p VALUES(1); INSERT INTO c
+     VALUES(10,1); DELETE FROM p WHERE id=1;` — Pas crashed during codegen;
+     C deletes both rows cleanly.  Root cause: `sqlite3DeleteTable`
+     (passqlite3codegen.pas:25862) was a 4-line stub freeing only the
+     Table struct, column names, zName, and zColAff — missing the index
+     list walk + idxHash unlink, the sqlite3FkDelete call, and the pCheck
+     ExprList free that build.c:799..854's `deleteTable` performs.  When
+     CREATE TABLE c was first parsed (init.busy=0), `sqlite3CreateForeignKey`
+     allocated an FKey and inserted it into pSchema^.fkeyHash.  The
+     subsequent OP_ParseSchema reload runs init.busy=1 and re-parses
+     CREATE TABLE c (because tblHash hadn't seen "c" yet — the
+     init.busy=0 path doesn't add to tblHash), creating a SECOND FKey
+     and chaining it onto the same hash bucket via pNextTo.  When the
+     init.busy=0 Parse object's pNewTable was eventually freed, the
+     stub `sqlite3DeleteTable` did NOT call sqlite3FkDelete, so the
+     orphan first FKey stayed live in fkeyHash with a dangling pNextTo
+     pointer to the second FKey.  Later, `sqlite3FkActions`/`sqlite3FkCheck`
+     iterating sqlite3FkReferences(p) walked the orphan chain and
+     dereferenced freed memory inside fkScanChildren on the second
+     iteration.  Fix: ported build.c:799..854 deleteTable verbatim into
+     sqlite3DeleteTable — walks pTab^.pIndex calling
+     sqlite3HashInsert(idxHash, name, nil) + sqlite3FreeIndex per
+     index (skipping the hash unlink for virtual tables); dispatches
+     by eTabType to sqlite3FkDelete (TABTYP_NORM) /
+     passqlite3vtab.sqlite3VtabClear (TABTYP_VTAB) /
+     sqlite3SelectDelete on u.view_pSelect (TABTYP_VIEW); then
+     sqlite3DeleteColumnNames + sqlite3DbFree(zName, zColAff) +
+     sqlite3ExprListDelete(pCheck) + sqlite3DbFree(pTab).  Verified
+     byte-identical to upstream across DELETE CASCADE / SET NULL /
+     NO ACTION; FK-violating INSERT still raises constraint failed.
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11 /
+     TestSchemaBasic 44/44 / TestPrepareBasic 20/20 / TestParser 45/45 /
+     TestVdbeRecord 13/13 / TestWindowBasic 34/34 / TestBytecodeParity
+     32/32 / TestWherePlanner 679/679 / TestUtil all clean;
+     DiagDml / DiagPragma / DiagFeatureProbe / DiagOps / DiagFunctions /
+     DiagWindow / DiagDate / DiagCast / DiagMisc / DiagDropTable /
+     DiagAnalyze / DiagIndexing / DiagCovering / DiagPredicates /
+     DiagCreateIdx / DiagMoreFunc / DiagSampleProg / DiagTxn 0
+     divergences.
+
+- [ ] **10.1.bug.56** `UPDATE <parent> SET <pk-col>=<value>` on a table
+     referenced by an `ON UPDATE CASCADE` foreign key crashes the shell
+     with `EAccessViolation: Access violation` even when the parent
+     row has no children.  Reproducer:
+     `PRAGMA foreign_keys=ON; CREATE TABLE p(id INTEGER PRIMARY KEY);
+     CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id)
+     ON UPDATE CASCADE); INSERT INTO p VALUES(1); UPDATE p SET id=99
+     WHERE id=1;` — Pas crashes; C completes successfully.  The
+     ON DELETE codepath was fixed under 10.1.bug.55 (sqlite3DeleteTable
+     missing FK / index / pCheck cleanup), but the UPDATE codegen path
+     trips a different access violation — likely fkActionTrigger
+     pChanges arm (insert.c update path) or fkScanChildren UPDATE-side
+     register layout.  Crash addresses differ from 10.1.bug.55's, so a
+     separate gap.
+
 - [X] **10.1.bug.54** Fixed 2026-05-08.  Casting / parsing a float literal
      whose magnitude exceeds the IEEE-754 double range crashed the shell
      with `EOverflow: Floating point overflow` instead of returning Inf /

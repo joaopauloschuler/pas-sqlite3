@@ -25858,15 +25858,44 @@ begin
   end;
 end;
 
-{ sqlite3DeleteTable — free a Table object and all its substructure }
+{ sqlite3DeleteTable — port of build.c:799..864.  Frees a Table object and
+  all its substructure: the index list (with idxHash unlink for non-virtual
+  tables), the FK chain (sqlite3FkDelete unlinks fkeyHash), check expressions,
+  column metadata, and the Table struct itself. }
 procedure sqlite3DeleteTable(db: PTsqlite3; pTab: PTable2);
+var
+  pIndex, pNext: PIndex2;
+  pIdxSchema: passqlite3util.PSchema;
 begin
   if pTab = nil then Exit;
   Dec(pTab^.nTabRef);
   if pTab^.nTabRef > 0 then Exit;
+
+  { Walk the index list and free each, unlinking from idxHash for
+    non-virtual tables (mirrors build.c:817..830). }
+  pIndex := pTab^.pIndex;
+  while pIndex <> nil do begin
+    pNext := pIndex^.pNext;
+    if (pTab^.eTabType <> TABTYP_VTAB) and (pIndex^.zName <> nil) then begin
+      pIdxSchema := passqlite3util.PSchema(pIndex^.pSchema);
+      if pIdxSchema <> nil then
+        sqlite3HashInsert(@pIdxSchema^.idxHash, PChar(pIndex^.zName), nil);
+    end;
+    sqlite3FreeIndex(db, pIndex);
+    pIndex := pNext;
+  end;
+
+  if pTab^.eTabType = TABTYP_NORM then
+    sqlite3FkDelete(db, pTab)
+  else if pTab^.eTabType = TABTYP_VTAB then
+    passqlite3vtab.sqlite3VtabClear(db, Pointer(pTab))
+  else { TABTYP_VIEW }
+    sqlite3SelectDelete(db, pTab^.u.view_pSelect);
+
   sqlite3DeleteColumnNames(db, pTab);
   sqlite3DbFree(db, pTab^.zName);
   sqlite3DbFree(db, pTab^.zColAff);
+  sqlite3ExprListDelete(db, pTab^.pCheck);
   sqlite3DbFree(db, pTab);
 end;
 
