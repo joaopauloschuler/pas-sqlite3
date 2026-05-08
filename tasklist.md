@@ -2648,6 +2648,36 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.54** Fixed 2026-05-08.  Casting / parsing a float literal
+     whose magnitude exceeds the IEEE-754 double range crashed the shell
+     with `EOverflow: Floating point overflow` instead of returning Inf /
+     -Inf as upstream does.  Reproducers: `SELECT cast('1e1000' AS REAL);`,
+     `SELECT cast('1e309' AS REAL);`, `SELECT 1e1000;` all aborted with
+     a libc-level EOverflow trap — system sqlite3 returns `Inf`.  Root
+     cause: `atofViaStrtod` (passqlite3util.pas:1153) calls libc strtod,
+     which on overflow returns HUGE_VAL and sets errno=ERANGE per C99 —
+     a valid IEEE-754 value, not an exception.  FPC compiles with the
+     x87 control word leaving FE_OVERFLOW unmasked by default, so the
+     overflow flag set inside strtod (or on the next FP op that touches
+     the Inf result) is converted into a SIGFPE → Pascal EOverflow
+     exception that the shell does not catch.  The C reference relies
+     on strtod's "set errno, return HUGE_VAL" contract and never sees a
+     trap.  Fix: install `SetExceptionMask([exInvalidOp, exDenormalized,
+     exZeroDivide, exOverflow, exUnderflow, exPrecision])` in
+     passqlite3util's initialization section so FPC's runtime treats FP
+     overflow / NaN / div-by-zero as silent (matching C semantics that
+     the rest of the engine assumes).  Verified byte-identical to
+     upstream: `cast('1e1000' AS REAL)` → `Inf`, `cast('-1e1000' AS
+     REAL)` → `-Inf`, `cast('1e308' AS REAL)` → `1.0e+308`,
+     `cast('1e309' AS REAL)` → `Inf`, `1e1000` literal → `Inf`,
+     `cast('1e1000' AS REAL) * 0` → NaN.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13 /
+     TestWindowBasic 34/34 / TestBytecodeParity 32/32 / TestUtil all
+     clean; DiagDate / DiagFunctions / DiagOps / DiagFeatureProbe /
+     DiagCast / DiagFloatRender all 0 divergences.
+
 - [X] **10.1.bug.53** Fixed 2026-05-08.  Date modifiers `weekday N`,
      `ceiling`, `floor`, `subsec`/`subsecond` were unrecognised and
      forced the surrounding date function to return NULL.

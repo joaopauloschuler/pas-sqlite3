@@ -3490,6 +3490,13 @@ end;
   ============================================================ }
 
 initialization
+  { Mirror C semantics: floating-point overflow / underflow / invalid-op /
+    divide-by-zero return Inf / NaN rather than raising a signal.  Without
+    this, `cast('1e1000' AS REAL)` (libc strtod returns +Inf) trips FPC's
+    default exOverflow trap.  C99 strtod is required to return HUGE_VAL on
+    overflow and set errno; SQLite expects that contract. }
+  SetExceptionMask([exInvalidOp, exDenormalized, exZeroDivide,
+                    exOverflow, exUnderflow, exPrecision]);
   InitUpperToLower;
   InitCtypeMap;
   InitGlobalConfig;
