@@ -44070,6 +44070,58 @@ begin
   sqlite3_result_text(pCtx, SQLITE_SOURCE_ID, -1, SQLITE_STATIC);
 end;
 
+{ Build-time compile-option list mirroring sqlite3azCompileOpt in
+  passqlite3main.pas — kept local because codegen cannot use that unit
+  (circular).  Update both sites in lockstep. }
+const
+  azCompileOpt2: array[0..4] of PAnsiChar = (
+    'COMPILER=fpc',
+    'OMIT_AUTOINIT',
+    'OMIT_DEPRECATED',
+    'OMIT_LOAD_EXTENSION',
+    'THREADSAFE=1'
+  );
+
+{ func.c:1042 — wrapper around sqlite3_compileoption_used. }
+procedure compileoptionusedFunc(pCtx: Psqlite3_context; argc: i32;
+  argv: PPMem); cdecl;
+var
+  zOpt: PAnsiChar;
+  i, n: i32;
+  zCur: PAnsiChar;
+  rc: i32;
+begin
+  zOpt := PAnsiChar(sqlite3_value_text(Psqlite3_value(argv^)));
+  if zOpt = nil then begin sqlite3_result_int(pCtx, 0); Exit; end;
+  if sqlite3_strnicmp(zOpt, PAnsiChar('SQLITE_'), 7) = 0 then
+    Inc(zOpt, 7);
+  n := sqlite3Strlen30(zOpt);
+  rc := 0;
+  for i := 0 to High(azCompileOpt2) do begin
+    zCur := azCompileOpt2[i];
+    if (zCur <> nil)
+       and (sqlite3_strnicmp(zOpt, zCur, n) = 0)
+       and (sqlite3IsIdChar(u8((zCur + n)^)) = 0)
+    then begin
+      rc := 1; Break;
+    end;
+  end;
+  sqlite3_result_int(pCtx, rc);
+end;
+
+{ func.c:1066 — wrapper around sqlite3_compileoption_get. }
+procedure compileoptiongetFunc(pCtx: Psqlite3_context; argc: i32;
+  argv: PPMem); cdecl;
+var
+  N: i32;
+begin
+  N := sqlite3_value_int(Psqlite3_value(argv^));
+  if (N >= 0) and (N <= High(azCompileOpt2)) then
+    sqlite3_result_text(pCtx, azCompileOpt2[N], -1, SQLITE_STATIC)
+  else
+    sqlite3_result_null(pCtx);
+end;
+
 { func.c:1026 — sqlite_log(iErrCode, zMsg) wrapper around sqlite3_log.  C uses
   sqlite3_log(code, "%s", text); the Pas sqlite3_log already takes a finished
   message string, so we dispatch the configured xLog callback directly with
@@ -45327,7 +45379,7 @@ const
   AGG_ENC  = SQLITE_UTF8 or SQLITE_FUNC_BUILTIN;
 
 var
-  aBuiltinFuncs: array[0..79] of TFuncDef;
+  aBuiltinFuncs: array[0..81] of TFuncDef;
 
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
@@ -45509,6 +45561,15 @@ begin
   MakeFD(aBuiltinFuncs[78], 1, FUNC_ENC, @unistrFunc, nil, 'unistr');
   { unhex 2-arg — func.c:3328: FUNCTION(unhex, 2, 0, 0, unhexFunc). }
   MakeFD(aBuiltinFuncs[79], 2, FUNC_ENC, @unhexFunc, nil, 'unhex');
+  { sqlite_compileoption_used / sqlite_compileoption_get — func.c:3281..3282.
+    DFUNCTION in C uses SQLITE_FUNC_BUILTIN|SQLITE_FUNC_SLOCHNG|SQLITE_UTF8;
+    matched here via FUNC_ENC + SQLITE_FUNC_SLOCHNG (FUNC_ENC carries
+    BUILTIN|UTF8|CONSTANT — CONSTANT is harmless for these wrappers since
+    the result is genuinely build-time invariant). }
+  MakeFD(aBuiltinFuncs[80], 1, FUNC_ENC or SQLITE_FUNC_SLOCHNG,
+    @compileoptionusedFunc, nil, 'sqlite_compileoption_used');
+  MakeFD(aBuiltinFuncs[81], 1, FUNC_ENC or SQLITE_FUNC_SLOCHNG,
+    @compileoptiongetFunc, nil, 'sqlite_compileoption_get');
 end;
 
 var

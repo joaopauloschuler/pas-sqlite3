@@ -2674,15 +2674,19 @@ existing dispatcher.
      special focus on the regFromSelect/regNewData copy after the
      yield/jump-back inside the coroutine body.
 
-- [ ] **10.1.bug.44** `sqlite_compileoption_used(X)` /
-     `sqlite_compileoption_get(N)` not registered.  Reproducer:
-     `SELECT sqlite_compileoption_used('THREADSAFE');` raises
-     `Parse error: no such function: sqlite_compileoption_used`.  Both
-     functions are documented public scalar functions.  Fix path:
-     port func.c registration in sqlite3RegisterBuiltinFunctions to
-     wire the two scalar entries; return value derives from
-     sqlite3_compileoption_used (already present as a public API
-     stub) and a static table of compile-time options.
+- [X] **10.1.bug.44** Fixed 2026-05-08.  Registered the SQL functions
+     `sqlite_compileoption_used(X)` / `sqlite_compileoption_get(N)` in
+     `aBuiltinFuncs` (passqlite3codegen.pas), mirroring func.c:3281..3282
+     (DFUNCTION).  Trampolines `compileoptionusedFunc` /
+     `compileoptiongetFunc` reproduce func.c:1042/1066 logic against a
+     local copy of `sqlite3azCompileOpt` (codegen cannot use
+     passqlite3main due to circular dep).  Verified: SELECT
+     sqlite_compileoption_used('THREADSAFE') / 'SQLITE_THREADSAFE' = 1,
+     unknown option = 0; sqlite_compileoption_get(N) returns the Nth
+     option string and NULL past the end.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestSchemaBasic 44/44 / TestVdbeAgg 11/11 clean; DiagFunctions /
+     DiagOps / DiagFeatureProbe / DiagPragma all 0 divergences.
 
 - [X] **10.1.bug.38** Fixed 2026-05-08.  STORED generated columns
      silently held NULL after INSERT.  Reproducer:
