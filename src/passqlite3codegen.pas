@@ -17097,11 +17097,7 @@ begin
               colUsedB := colUsedB shr 1;
               Inc(nP4Cols);
             end;
-            { Bug 6.29 guard: see twin comment below — when colUsed=0 the
-              reduction would zero p4, leading to aType[]/aOffset[] overlap
-              in OP_Column.  Keep the initial nNVCol value in that case. }
-            if nP4Cols > 0 then
-              sqlite3VdbeChangeP4(v, -1, Pointer(PtrInt(nP4Cols)), P4_INT32);
+            sqlite3VdbeChangeP4(v, -1, Pointer(PtrInt(nP4Cols)), P4_INT32);
           end;
           sqlite3VdbeChangeP5(v, 0);
           { where.c:7310..7316 — for inner-join tables at level >= 2 whose
@@ -17321,16 +17317,7 @@ begin
         colUsedB := colUsedB shr 1;
         Inc(nP4Cols);
       end;
-      { Bug 6.29 guard: when colUsed propagation breaks (e.g. window rewrite
-        replaces pSrc and the new src item never has its colUsed bits marked
-        by name resolution), nP4Cols comes out as 0.  An OP_OpenRead with
-        p4=nField=0 leads to allocateCursor reserving 0 slots in aType[]; the
-        OP_Column lazy header parser then writes aType[0..N-1] over aOffset[0],
-        corrupting the header offsets on the second column read.  When the
-        reduction would yield 0, leave the initial nNVCol value emitted by
-        sqlite3OpenTable. }
-      if nP4Cols > 0 then
-        sqlite3VdbeChangeP4(v, -1, Pointer(PtrInt(nP4Cols)), P4_INT32);
+      sqlite3VdbeChangeP4(v, -1, Pointer(PtrInt(nP4Cols)), P4_INT32);
     end;
     sqlite3VdbeChangeP5(v, 0);
   end;
@@ -49022,6 +49009,8 @@ var
   pArgs:     PExprList;
   pFilter:   PExpr;
   srcNew:    PSrcList;
+  iSubSrc:   i32;
+  pSubSrcArr: PSrcItem;
 begin
   rc := SQLITE_OK;
   if p = nil then begin Result := SQLITE_OK; Exit; end;
@@ -49164,6 +49153,21 @@ begin
     end;
   end;
   if db^.mallocFailed <> 0 then rc := SQLITE_NOMEM;
+
+  { 6.29.followup: recompute colUsed bits for pSub's source items.  Name
+    resolution ran on the outer SELECT before the rewrite, so the original
+    src items inherited colUsed from p^.pEList — but selectWindowRewriteEList
+    has since moved column refs into pSub^.pEList (pSublist) and replaced
+    p^.pEList exprs with cursor refs to the eph window-buffer.  Without a
+    rewalk, pSub's src items can carry stale or zero colUsed bits, and
+    sqlite3WhereCodeOneLoopStart's OpenRead p4 reduction (where.c:7284..7297)
+    emits p4=0, which leaves aType[]/aOffset[] overlapping in allocateCursor. }
+  if (rc = SQLITE_OK) and (pSub <> nil) and (pSub^.pSrc <> nil) then
+  begin
+    pSubSrcArr := SrcListItems(pSub^.pSrc);
+    for iSubSrc := 0 to pSub^.pSrc^.nSrc - 1 do
+      recomputeColumnsUsed(pSub, @pSubSrcArr[iSubSrc]);
+  end;
 
   { Defer pTab cleanup — references may remain in p's result-set / ORDER BY. }
   sqlite3ParserAddCleanup(pParse, TParseCleanupFn(@sqlite3DbFree), pTab);

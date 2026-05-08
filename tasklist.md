@@ -325,22 +325,25 @@ FPC porting traps that recur often enough to call out up-front:
     DiagDropTable / DiagMultiValues / DiagIndexing / DiagCovering /
     DiagCreateIdx all 0 divergences.
 
-- [ ] **6.29.followup** Fix colUsed propagation across window rewrite
-    so the sub-SELECT's source SrcItem ends up with the same colUsed
-    bits as the original.  Currently a guard in
-    `sqlite3WhereCodeOneLoopStart` at codegen.pas:17285 (and twin at
-    :17100) skips the `ChangeP4(... n=0 ...)` reduction when
-    `colUsed=0` so the `OpenRead` keeps the conservative `nNVCol` value
-    from `sqlite3OpenTable`.  This dodges the OP_Column aType/aOffset
-    overlap (see closed bug 6.29) but it leaves the bytecode at
-    `OpenRead p4=nNVCol` instead of upstream's
-    `OpenRead p4=highestSetBit(colUsed)` for window-rewritten plans.
-    Not user-visible, but a TestExplainParity row for a window query
-    over a wide table could surface as a parity diff once added.
-    Likely fix: call `recomputeColumnsUsed(pSubSel, pSrcItem)` after
-    `sqlite3WindowRewrite` finishes its pEList swap, or extend
-    `selectExpander` / `sqlite3ResolveSelectNames` to walk into the
-    rewritten pEList and re-mark colUsed.
+- [X] **6.29.followup** Fixed 2026-05-08.  `sqlite3WindowRewrite`
+    (codegen.pas:49003) now walks pSub^.pSrc after the rewrite and
+    calls `recomputeColumnsUsed` on each src item, mirroring the
+    flattenSubquery cleanup (codegen.pas:9697..9700).  This restores
+    upstream colUsed propagation across the window-rewrite boundary
+    so OpenRead's p4-reduction (where.c:7284..7297) emits
+    `highestSetBit(colUsed)` instead of falling through to a 0-field
+    OpenRead.  The two `nP4Cols > 0` guards added by the original
+    6.29 fix (codegen.pas:17103/17324) are removed — colUsed now
+    propagates correctly so the guard would never fire anyway, and
+    keeping it would silently mask future regressions.  Verified:
+    TestExplainParity 1026/1026; DiagWindow / DiagFunctions /
+    DiagFeatureProbe / DiagOps / DiagDml / DiagPragma / DiagMisc /
+    DiagCast / DiagAggWhere / DiagCovering / DiagAnalyze /
+    DiagIndexing / DiagPredicates all 0 divergences; TestSmoke /
+    TestDMLBasic 54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52
+    / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 / TestPrepareBasic
+    20/20 / TestParser 45/45 / TestVdbeRecord 13/13 / TestWindowBasic
+    34/34 all clean.
 
 - [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
     valued PRAGMA functions) returns rows when called with a literal
