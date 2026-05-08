@@ -24566,7 +24566,7 @@ begin
     subquery hook already ran sqlite3ExpandSubquery on this item. }
   if (p^.pSrc^.nSrc = 1)
      and ((p^.selFlags and SF_Distinct) = 0)
-     and (pDest^.eDest = SRT_Output)
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab))
   then
   begin
     pItem := SrcListItems(p^.pSrc);
@@ -24579,7 +24579,8 @@ begin
     begin
       v := sqlite3GetVdbe(pParse);
       if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
-      sqlite3GenerateColumnNames(pParse, p);
+      if pDest^.eDest = SRT_Output then
+        sqlite3GenerateColumnNames(pParse, p);
 
       if pItem^.iCursor < 0 then
       begin
@@ -24631,7 +24632,22 @@ begin
         if r1 <> pDest^.iSdst + i then
           sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
       end;
-      sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+      if pDest^.eDest = SRT_EphemTab then
+      begin
+        { Disposal mirrors selectInnerLoop SRT_EphemTab arm
+          (codegen.pas:25128): MakeRecord + NewRowid + Insert(APPEND)
+          into the caller's eph cursor at iSDParm. }
+        r1 := sqlite3GetTempReg(pParse);
+        r2 := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+        sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+        sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
+        sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+        sqlite3ReleaseTempReg(pParse, r2);
+        sqlite3ReleaseTempReg(pParse, r1);
+      end
+      else
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
 
       sqlite3VdbeResolveLabel(v, addrSkip);
       sqlite3VdbeAddOp2(v, OP_Next, iCsr, addrTopOfLoop + 1);

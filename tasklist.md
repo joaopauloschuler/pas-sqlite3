@@ -2509,17 +2509,33 @@ existing dispatcher.
      issue — EXPLAIN now emits a full window pipeline but the result is
      still empty; tracked separately.
 
-- [ ] **10.1.bug.20** `row_number() OVER (ORDER BY x) FROM (compound)`
-     returns no rows.  Repro: `SELECT row_number() OVER (ORDER BY a)
-     FROM (SELECT 'b' a UNION SELECT 'a' UNION SELECT 'c');` returns
-     nothing; same with empty `OVER ()` and with `UNION ALL`.  Window
-     function over a concrete CREATE TABLE works fine.  After bug.21
-     fix (2026-05-08) the EXPLAIN now emits a full window pipeline
-     (~42 ops with InitCoroutine/AggStep/AggValue/Gosub) but the
-     scan still produces zero rows — runtime issue distinct from
-     bug.21's codegen gap.  Likely the window-arm's nested-coroutine
-     SRT_EphemTab path doesn't drive the inner compound-subquery
-     coroutine to completion before the outer Rewind on cursor 5.
+- [X] **10.1.bug.20** Fixed 2026-05-08.  `row_number() OVER (ORDER BY x)
+     FROM (compound)` returned no rows.  Root cause: after
+     sqlite3WindowRewrite, the window arm's outer call is
+     `sqlite3Select(pSub, SRT_EphemTab)` where pSub is a single SELECT
+     (no pPrior) whose only source is a sub-SELECT (the user's original
+     compound).  pSub falls through compound dispatch (no pPrior),
+     skips the no-FROM fast path, then hits both the coroutine arm
+     (codegen.pas:24430) and the materialise arm (codegen.pas:24557)
+     which were gated on `pDest^.eDest = SRT_Output`, so neither fired
+     for SRT_EphemTab.  sqlite3Select returned SQLITE_OK without
+     emitting any population code → cursor 5 was opened by the window
+     arm but never inserted into → outer `Rewind 5` jumped straight
+     to EOF.  Fix: extend the materialise arm gate at codegen.pas:24569
+     to accept SRT_EphemTab in addition to SRT_Output, and branch the
+     disposal (was unconditional `OP_ResultRow`) so SRT_EphemTab emits
+     `MakeRecord + NewRowid + Insert(APPEND)` into pDest^.iSDParm
+     (mirrors selectInnerLoop SRT_EphemTab arm at codegen.pas:25128).
+     Also gate `sqlite3GenerateColumnNames` on SRT_Output only.
+     Verified: `row_number() OVER (ORDER BY a) FROM (compound)` now
+     returns 1,2,3 byte-identical to upstream; same for `OVER ()`,
+     UNION ALL, and `row_number(), a FROM (compound)`.
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11
+     all clean; DiagOps / DiagDml / DiagPragma / DiagFunctions /
+     DiagFeatureProbe / DiagTxn / DiagMisc / DiagCast all 0
+     divergences.  DiagWindow 2 (pre-existing bug 6.29 — bare `sum()
+     OVER ()` / `avg() OVER ()` no-PARTITION-no-ORDER, unrelated).
 
 - [X] **10.1.bug.19** Fixed 2026-05-08.  Top-level `VALUES(1),(2),(3);`
      and `SELECT * FROM (VALUES(1),(2),(3))` now return all three rows
