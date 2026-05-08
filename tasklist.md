@@ -2648,6 +2648,34 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.62** Fixed 2026-05-08.  `SELECT * FROM (VALUES(1),...) LIMIT n
+     OFFSET k` ignored both LIMIT and OFFSET, returning every row from the
+     coroutine.  Reproducer: `SELECT * FROM (VALUES(1),(2),(3),(4),(5))
+     LIMIT 2 OFFSET 2` returned 1..5 instead of 3,4.  Same shape with any
+     coroutine-materialised sub-FROM (UNION ALL no-FROM ladders, multi-row
+     VALUES, etc.).  Root cause: the viaCoroutine fast-path arm in
+     `sqlite3Select` (passqlite3codegen.pas:24929..) bypasses the regular
+     WhereBegin/selectInnerLoop path and emits its own
+     OP_Yield/Copy/ResultRow/Goto loop, but never called
+     `computeLimitRegisters` or wired in `codeOffset` / OP_DecrJumpZero.
+     C's select.c always invokes computeLimitRegisters before WhereBegin
+     (select.c:8245) and selectInnerLoop applies codeOffset + DecrJumpZero
+     uniformly across all FROM shapes.  Fix: in the viaCoroutine arm,
+     call `computeLimitRegisters(pParse, p, addrEnd)` after addrEnd is
+     allocated and before the OP_Yield top, emit `codeOffset(v, p^.iOffset,
+     addrTopOfLoop)` before pWhere/pEList code, and add `OP_DecrJumpZero
+     p^.iLimit, addrEnd` after the OP_ResultRow.  Verified byte-identical
+     to upstream across LIMIT-only, OFFSET-only, LIMIT+OFFSET, LIMIT 0,
+     and LIMIT -1 OFFSET k forms.  TestExplainParity 1026/1026; TestSmoke
+     / TestDMLBasic 54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52
+     / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 / TestPrepareBasic 20/20
+     / TestParser 45/45 / TestVdbeRecord 13/13 / TestWindowBasic 34/34 /
+     TestBytecodeParity 32/32 / TestWherePlanner 679/679 all clean;
+     DiagFunctions / DiagMoreFunc / DiagFeatureProbe / DiagOps / DiagDml /
+     DiagPragma / DiagWindow / DiagDate / DiagCast / DiagMisc /
+     DiagCovering / DiagAnalyze / DiagCreateIdx / DiagOrderLimitTopN /
+     DiagMultiValues / DiagPredicates / DiagIndexing all 0 divergences.
+
 - [X] **10.1.bug.61** Fixed 2026-05-08.  `DETACH <name>` always reported
      `no such database: ` (empty name) and could leave the engine in a
      state that crashed a subsequent statement with EAccessViolation.

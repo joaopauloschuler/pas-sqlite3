@@ -24996,9 +24996,22 @@ begin
       end;
 
       addrEnd := sqlite3VdbeMakeLabel(pParse);
+
+      { LIMIT / OFFSET register setup — mirrors C select.c:8245 which
+        always invokes computeLimitRegisters before scan begin. Without
+        this, outer `SELECT ... FROM (VALUES...) LIMIT n OFFSET k` ignored
+        both clauses entirely. }
+      if (bSort = 0) and (p^.pLimit <> nil) then
+        computeLimitRegisters(pParse, p, addrEnd);
+
       addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Yield,
                           pItem^.u4.pSubq^.regReturn, addrEnd);
       r2 := sqlite3VdbeCurrentAddr(v);  { start of body — for translate }
+
+      { OFFSET skip — codeOffset emits IfPos that jumps back to OP_Yield
+        for the next row when iOffset>0 (and decrements iOffset). }
+      if (bSort = 0) and (p^.iOffset <> 0) then
+        codeOffset(v, p^.iOffset, addrTopOfLoop);
 
       { Outer WHERE filter — emit before pEList copies so OP_Column refs
         in the predicate are rewritten by translateColumnToCopy alongside
@@ -25052,7 +25065,15 @@ begin
                              regSortBase, nResultCol);
       end
       else
+      begin
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        { LIMIT decrement — mirrors C selectInnerLoop tail
+          (select.c:1402..1408): emit OP_DecrJumpZero so the loop
+          terminates after p^.iLimit rows.  Only fires on the non-sort
+          path (bSort=0) since pLimit forces bSort=0 above. }
+        if (bSort = 0) and (p^.iLimit <> 0) then
+          sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrEnd);
+      end;
 
       sqlite3VdbeAddOp2(v, OP_Goto, 0, addrTopOfLoop);
       sqlite3VdbeResolveLabel(v, addrEnd);
