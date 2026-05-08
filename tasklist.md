@@ -342,6 +342,34 @@ FPC porting traps that recur often enough to call out up-front:
     OVER ()); no regression on Diag{FeatureProbe,Dml,Ops,Pragma,Txn,
     Functions,Misc,Cast,Analyze,Date}.
 
+    **Further investigation (2026-05-08):** Bytecode emitted by Pas
+    is structurally byte-identical to C reference for
+    `SELECT sum(b) OVER () FROM t` (verified addr-by-addr against
+    `sqlite3 :memory: < EXPLAIN ...`); both have the source-loop
+    AGGSTEP+RETURN_ROW dead arm (skipped via Goto), the post-source-
+    tail Rewind 2 + AGGSTEP loop + RETURN_ROW + Gosub output sub.
+    Yet the C build returns `[1,60];[2,60];[3,60]` and the Pas build
+    returns `[1,9];[null,9];[null,9]` — the constant 9 surfaces even
+    when b values are 100/200/300 (so it is not the b value at all).
+    Inserting an explicit `OP_Rewind, s.endRng.csr` at the head of
+    the tail aggregation (line 50180) does NOT change the result —
+    cursor 4, even after a fresh Rewind, only sees a single row with
+    value 9.  count(b) OVER () = 1 (also wrong; should be 3) confirms
+    AggStep is invoked exactly once with one non-null arg.  Plain
+    subquery materialise paths (`SELECT b FROM (SELECT b FROM t)`,
+    `SELECT sum(b) FROM (SELECT b FROM t)`) all work — so the
+    cursor-5-into-cursor-2 OpenDup path is the unique trigger.
+    Hypothesis: either OP_MakeRecord encodes the register number
+    instead of the value when nField=1 + intkey eph cursor with
+    OpenDup siblings, or sqlite3BtreeFirst/Next on a freshly-opened
+    OpenDup cursor doesn't see records inserted via a sibling cursor
+    (despite saveAllCursors firing on Insert via cursor 2 with
+    BTCF_Multiple set).  Cursor invalidation dance in
+    `restoreCursorPosition` → `btreeMoveto` is suspect.  Next probe:
+    add a TestBtreeOpenDupShared diagnostic that opens an eph table
+    with an OpenDup, inserts via the dup, and walks the master to see
+    if all rows are surfaced.
+
 - [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
     valued PRAGMA functions) returns rows when called with a literal
     argument but yields no rows when joined laterally against
