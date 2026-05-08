@@ -2618,6 +2618,72 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.43** Fixed 2026-05-08.  Constraint-violation error
+     messages dropped the "<TYPE> constraint failed: " prefix.
+     Reproducer: `CREATE TABLE t(a INT NOT NULL); INSERT INTO t
+     VALUES(NULL);` reported `Runtime error: t.a` (Pas) vs
+     `NOT NULL constraint failed: t.a` (C); same shape for CHECK and
+     UNIQUE.  Two missing pieces in passqlite3vdbe.pas:
+     (1) OP_Halt arm at vdbe.pas:7574..7580 emitted only the prefix
+         when `pOp^.p5<>0` and ignored the `pOp^.p4.z` suffix — vdbe.c:
+         1345..1349 calls `sqlite3MPrintf(db, "%z: %s", p->zErrMsg,
+         pOp->p4.z)` to stitch the column/check tail onto the prefix.
+     (2) OP_HaltIfNull (vdbe.pas:9099..) had a private simplified halt
+         body that emitted only `pOp^.p4.z` (no p5 prefix lookup), so
+         NOT NULL violations — which use OP_HaltIfNull — surfaced just
+         "t.a".  vdbe.c:1257 falls through to OP_Halt, so the Pas arm
+         is rewritten to mirror the same prefix+suffix logic plus
+         sqlite3VdbeLogAbort + sqlite3VdbeHalt sequencing.
+     Fix verified end-to-end: `NOT NULL constraint failed: t.a`,
+     `CHECK constraint failed: a>0`, and `UNIQUE constraint failed: t.a`
+     now match upstream byte-for-byte.  TestExplainParity 1026/1026;
+     TestDMLBasic 54/54; TestSchemaBasic 44/44; DiagFunctions / DiagOps /
+     DiagDml / DiagPragma / DiagFeatureProbe / DiagMisc / DiagCast /
+     DiagWindow / DiagDropTable / DiagTxn / DiagCovering / DiagIndexing /
+     DiagPredicates all 0 divergences.
+
+- [X] **10.1.bug.42** Fixed 2026-05-08.  `1 IN ()` returned the literal
+     text `'false'` (with type text) instead of integer `0`; symmetrically
+     `1 NOT IN ()` returned `'true'` instead of integer `1`.  Root cause:
+     `sqlite3ExprIdToTrueFalse` (passqlite3codegen.pas:6085) gated on
+     `pExpr^.op = TK_ID` only, but the parser's empty-IN reduction
+     (parse.y:1502) constructs the bool literal as a `TK_STRING` node
+     and then asks `sqlite3ExprIdToTrueFalse` to convert it.  In C the
+     function asserts `op==TK_ID || op==TK_STRING`; the Pascal port
+     dropped the TK_STRING arm so the conversion failed and the parser
+     returned a TK_STRING literal verbatim.  Fix: accept both TK_ID and
+     TK_STRING (matching expr.c:2334..2345) and gate on
+     `EP_Quoted | EP_IntValue` to skip already-quoted bareword cases.
+     EXPLAIN now emits `Integer 0 1 0` for `SELECT 1 IN ()` instead of
+     `String8 0 1 0 false`.  TestExplainParity 1026/1026; all Diag*
+     probes 0 divergences; TestDMLBasic / TestSchemaBasic / TestSelectBasic
+     all green.
+
+- [ ] **10.1.bug.45** `INSERT INTO t VALUES(...) , (...)` against a
+     `UNIQUE(...) ON CONFLICT REPLACE` table corrupts the rows.
+     Reproducer: `CREATE TABLE t(a INT, b INT, UNIQUE(a,b) ON CONFLICT
+     REPLACE); INSERT INTO t VALUES(1,1); INSERT INTO t VALUES(1,1),(1,2);
+     SELECT * FROM t;` returns `0.0|0.0; 0.0|0.0` (Pas) vs `1|1; 1|2` (C).
+     Single-row INSERT with REPLACE works; only multi-row VALUES via the
+     coroutine arm is affected.  Suspected upstream: the multi-row
+     coroutine consumer (sqlite3MultiValues + viaCoroutine arm in
+     sqlite3Insert) does not re-prime the regNewData slots between
+     yields when the upsert REPLACE path fires, so the second iteration
+     reads stale REAL-coerced zero values.  Fix path: trace the
+     `viaCoroutine` arm in sqlite3Insert against insert.c:957..1040 with
+     special focus on the regFromSelect/regNewData copy after the
+     yield/jump-back inside the coroutine body.
+
+- [ ] **10.1.bug.44** `sqlite_compileoption_used(X)` /
+     `sqlite_compileoption_get(N)` not registered.  Reproducer:
+     `SELECT sqlite_compileoption_used('THREADSAFE');` raises
+     `Parse error: no such function: sqlite_compileoption_used`.  Both
+     functions are documented public scalar functions.  Fix path:
+     port func.c registration in sqlite3RegisterBuiltinFunctions to
+     wire the two scalar entries; return value derives from
+     sqlite3_compileoption_used (already present as a public API
+     stub) and a static table of compile-time options.
+
 - [X] **10.1.bug.38** Fixed 2026-05-08.  STORED generated columns
      silently held NULL after INSERT.  Reproducer:
      `CREATE TABLE q(v INTEGER, c INTEGER GENERATED ALWAYS AS (v*2)

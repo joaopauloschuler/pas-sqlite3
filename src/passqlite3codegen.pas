@@ -6085,8 +6085,9 @@ end;
 function sqlite3ExprIdToTrueFalse(pExpr: PExpr): i32;
 var v: u32;
 begin
-  if pExpr^.op <> TK_ID then begin Result := 0; Exit; end;
-  if ExprHasProperty(pExpr, EP_IntValue) then begin Result := 0; Exit; end;
+  Assert((pExpr^.op = TK_ID) or (pExpr^.op = TK_STRING));
+  if ExprHasProperty(pExpr, EP_Quoted or EP_IntValue) then
+  begin Result := 0; Exit; end;
   v := sqlite3IsTrueOrFalse(pExpr^.u.zToken);
   if v <> 0 then
   begin

@@ -7577,7 +7577,9 @@ begin
               4: sqlite3VdbeError(v, 'FOREIGN KEY constraint failed');
             else sqlite3VdbeError(v, 'constraint failed');
             end;
-            { TODO Phase 5.5: append pOp^.p4.z suffix via sqlite3MPrintf }
+            if pOp^.p4.z <> nil then
+              v^.zErrMsg := sqlite3MPrintf(db, '%z: %s',
+                              [v^.zErrMsg, pOp^.p4.z]);
           end else begin
             sqlite3VdbeError(v, pOp^.p4.z);
           end;
@@ -9101,22 +9103,30 @@ begin
       if (pIn3^.flags and MEM_Null) = 0 then begin
         { not NULL — do nothing }
       end else begin
-        { NULL — execute halt logic }
-        if pOp^.p1 <> 0 then begin
-          { error halt }
-          v^.pc := i32(pOp - aOp);
-          v^.rc := pOp^.p1;
-          if pOp^.p4.z <> nil then
+        { NULL — execute halt logic, mirroring OP_Halt fall-through (vdbe.c:1257) }
+        v^.rc := pOp^.p1;
+        v^.errorAction := u8(pOp^.p2);
+        if v^.rc <> 0 then begin
+          if pOp^.p5 <> 0 then begin
+            case pOp^.p5 of
+              1: sqlite3VdbeError(v, 'NOT NULL constraint failed');
+              2: sqlite3VdbeError(v, 'UNIQUE constraint failed');
+              3: sqlite3VdbeError(v, 'CHECK constraint failed');
+              4: sqlite3VdbeError(v, 'FOREIGN KEY constraint failed');
+            else sqlite3VdbeError(v, 'constraint failed');
+            end;
+            if pOp^.p4.z <> nil then
+              v^.zErrMsg := sqlite3MPrintf(db, '%z: %s',
+                              [v^.zErrMsg, pOp^.p4.z]);
+          end else if pOp^.p4.z <> nil then
             sqlite3VdbeError(v, pOp^.p4.z);
-          if v^.eVdbeState = VDBE_RUN_STATE then sqlite3VdbeHalt(v);
-          rc := pOp^.p1;
-          goto vdbe_return;
-        end else begin
-          v^.pc := i32(pOp - aOp);
-          if v^.eVdbeState = VDBE_RUN_STATE then sqlite3VdbeHalt(v);
-          rc := SQLITE_DONE;
-          goto vdbe_return;
+          sqlite3VdbeLogAbort(v, pOp^.p1, pOp, aOp);
         end;
+        rc := sqlite3VdbeHalt(v);
+        if rc = SQLITE_BUSY then v^.rc := SQLITE_BUSY
+        else if v^.rc <> 0 then rc := SQLITE_ERROR
+        else rc := SQLITE_DONE;
+        goto vdbe_return;
       end;
     end;
 
