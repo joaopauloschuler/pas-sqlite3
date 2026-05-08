@@ -2666,6 +2666,53 @@ existing dispatcher.
      TestSchemaBasic all clean; DiagWindow now 0 divergences (was 2);
      DiagFunctions / DiagFeatureProbe / DiagOps / DiagDml all 0.
 
+- [ ] **10.1.bug.41** Found 2026-05-08.  `INSERT OR REPLACE` (and
+     `INSERT ... ON CONFLICT DO UPDATE` UPSERT) is a silent no-op when
+     the target table has BOTH a `CHECK` constraint AND a `UNIQUE`
+     column constraint (or `UNIQUE` index).  Reproducer:
+     `CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT UNIQUE,
+                     c REAL CHECK (c >= 0));
+      INSERT INTO t VALUES(1,'a',1.5),(2,'b',2.5);
+      INSERT OR REPLACE INTO t VALUES(2,'b2',9.0);
+      SELECT * FROM t WHERE a=2;`
+     Pas returns `2|b|2.5` (unchanged); upstream returns `2|b2|9.0`.
+     Subsequent `INSERT ... ON CONFLICT(a) DO UPDATE` against the same
+     table also leaves the row unchanged, then any further DML
+     statement reports `Runtime error: unknown error`.
+     Removing either the CHECK constraint OR the UNIQUE column
+     constraint makes the bug disappear (verified independently —
+     both isolated cases match upstream byte-for-byte).
+     Verified against the locally-built libsqlite3.so (3.53) so this
+     is not a version difference — genuine codegen / VDBE divergence.
+     Suspected: CHECK-Halt path interaction with the
+     IdxDelete/NoConflict/Delete REPLACE chain leaves a cursor in a
+     state that breaks subsequent DML.  Likely a missing
+     `sqlite3VdbeAddOp0(v, OP_StackDepth)` or an off-by-one in the
+     OP_Halt p2 / OP_Affinity sequencing inside
+     `sqlite3GenerateConstraintChecks`; not yet root-caused.
+
+- [ ] **10.1.bug.40** Found 2026-05-08.  `ORDER BY` on the outer
+     SELECT against a recursive CTE is not applied — rows are emitted
+     in CTE production order rather than sorted.  Reproducer:
+     `CREATE TABLE org(id, parent, name);
+      INSERT INTO org VALUES(1,NULL,'CEO'),(2,1,'CTO'),(3,1,'CFO');
+      WITH RECURSIVE chain(id,parent,name,depth) AS (
+        SELECT id,parent,name,0 FROM org WHERE parent IS NULL
+        UNION ALL SELECT o.id,o.parent,o.name,c.depth+1
+                  FROM org o JOIN chain c ON o.parent=c.id
+      ) SELECT name FROM chain ORDER BY name;`
+     Pas returns `CEO; CTO; CFO`; upstream returns `CEO; CFO; CTO`.
+     Bytecode comparison: Pas emits
+     `EndCoroutine / Yield / Copy / ResultRow / Goto / Halt` for the
+     outer scan; the C reference emits
+     `EndCoroutine / SorterOpen / InitCoroutine / Yield / Copy /
+      MakeRecord / SorterInsert / Goto / SorterSort / SorterData /
+      Column / ResultRow / SorterNext / Halt`.
+     The outer SELECT codegen against a coroutine-driven CTE source
+     is skipping the `pushOntoSorter` / `generateSortTail` arm in
+     `selectInnerLoop`.  Likely cause: `viaCoroutine` path in
+     selectInnerLoop bypasses the sorter when pOrderBy is set.
+
 - [ ] **10.1.bug.39** `.recover` on a clean (uncorrupted) db reports
      `database disk image is malformed (11)` after the
      `BEGIN; PRAGMA writable_schema = on; PRAGMA foreign_keys = off;`
