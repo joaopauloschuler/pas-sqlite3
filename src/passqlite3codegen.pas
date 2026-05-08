@@ -22935,13 +22935,15 @@ var
 begin
   if p = nil then Exit;
   if (p^.selFlags and SF_Aggregate) <> 0 then Exit;
-  if p^.pEList = nil then Exit;
   FillChar(w, SizeOf(w), 0);
   w.eCode           := 0;
   w.pParse          := pParse;
   w.xExprCallback   := @exprNodeHasAggFunc;
   w.xSelectCallback := @sqlite3SelectWalkFail;
-  sqlite3WalkExprList(@w, p^.pEList);
+  if p^.pEList <> nil then
+    sqlite3WalkExprList(@w, p^.pEList);
+  if (w.eCode = 0) and (p^.pHaving <> nil) then
+    sqlite3WalkExpr(@w, p^.pHaving);
   if w.eCode = 1 then
     p^.selFlags := p^.selFlags or SF_Aggregate;
 end;
@@ -23194,6 +23196,20 @@ begin
   sqlite3SelectPrep(pParse, p, nil);
   if pParse^.nErr <> 0 then begin Result := SQLITE_ERROR; Exit; end;
   selectMarkAggregate(pParse, p);
+  { resolve.c:1980..1986 — HAVING without GROUP BY and without any aggregate
+    function is an error.  C raises this during resolveSelectStep; Pas's
+    resolver doesn't track NC_HasAgg, so do the check here after
+    selectMarkAggregate has set SF_Aggregate based on agg funcs in pEList /
+    pHaving.  pGroupBy alone also implies aggregate semantics in C
+    (resolve.c:1961). }
+  if (p^.pHaving <> nil)
+     and (p^.pGroupBy = nil)
+     and ((p^.selFlags and SF_Aggregate) = 0) then
+  begin
+    sqlite3ErrorMsg(pParse, PAnsiChar('HAVING clause on a non-aggregate query'));
+    Result := SQLITE_ERROR;
+    Exit;
+  end;
   { Phase 6.26 — pas-only pre-pass.  C's resolve.c:1314..1325 attaches each
     window-function expression's pWin to the enclosing Select via
     sqlite3WindowLink and patches its frame spec via sqlite3WindowUpdate.

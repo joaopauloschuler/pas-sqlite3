@@ -2648,6 +2648,35 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.64** Fixed 2026-05-08.  `SELECT … FROM t HAVING <pred>`
+     (HAVING without GROUP BY and without any aggregate) silently produced
+     no rows in Pas instead of emitting upstream's
+     `Parse error: HAVING clause on a non-aggregate query`.  Reproducer:
+     `CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4),(5,6);
+     SELECT a,b FROM t HAVING a>1;` — Pas exited silently; C errored.
+     Root cause: resolve.c:1980..1986 raises "HAVING clause on a
+     non-aggregate query" during resolveSelectStep when pHaving is set
+     but SF_Aggregate is not (which C derives from
+     `pGroupBy || (NC_HasAgg)`).  Pas's resolver never tracked NC_HasAgg
+     and selectMarkAggregate only walked pEList, missing aggregates that
+     live inside pHaving (e.g. `SELECT a FROM t HAVING count(*)>0`).  The
+     existing silent bail at sqlite3Select (codegen.pas:23947) just
+     returned SQLITE_OK on the no-aggregate-HAVING shape.  Fix:
+     (1) extend `selectMarkAggregate` (codegen.pas:22932) to also walk
+     `p^.pHaving` so `HAVING count(*)>0` correctly tags SF_Aggregate;
+     (2) immediately after `selectMarkAggregate(pParse, p)` in
+     `sqlite3Select` (codegen.pas:23198), add the C check — if pHaving
+     is set, pGroupBy is nil, and SF_Aggregate is not set, raise
+     `HAVING clause on a non-aggregate query` and return SQLITE_ERROR.
+     Verified byte-identical to upstream: non-aggregate HAVING errors;
+     `SELECT a, count(*) FROM t HAVING count(*)>0` still works (newly
+     covered by the pHaving walk in selectMarkAggregate); `GROUP BY a
+     HAVING a>1` unchanged.  TestExplainParity 1026/1026; TestSelectBasic
+     60/60 / TestDMLBasic 54/54 / TestSchemaBasic 44/44 / TestVdbeAgg
+     11/11 / TestWhereBasic 52/52 / TestPrepareBasic 20/20 all clean;
+     DiagFeatureProbe / DiagOps / DiagDml / DiagFunctions / DiagWindow /
+     DiagAggWhere / DiagPredicates / DiagSubsel all 0 divergences.
+
 - [X] **10.1.bug.63** Fixed 2026-05-08.  `group_concat()` / `string_agg()`
      window-function variants returned cumulative-from-partition-start text
      instead of frame-bounded text; the bare `string_agg(x,sep)` SQL function
