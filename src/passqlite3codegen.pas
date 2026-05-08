@@ -11104,6 +11104,23 @@ begin
   begin
     aiCurCol[0] := pX^.iTable;
     aiCurCol[1] := i32(pX^.iColumn);
+    { IPK alias normalisation — Pas port's lookupName (unlike C resolve.c
+      :466/:562) does not rewrite an INTEGER PRIMARY KEY column reference
+      to XN_ROWID (-1).  Without this, whereScanInit/whereShortCut's
+      rowid-EQ probe (iColumn=-1) misses `WHERE ipk_col=val` and the
+      planner falls back to a SCAN.  Walk the FROM list to find the
+      cursor's table and substitute -1 when iColumn matches iPKey. }
+    if aiCurCol[1] >= 0 then
+      for i := 0 to pFrom^.nSrc - 1 do
+      begin
+        it := @SrcListItems(pFrom)[i];
+        if (it^.iCursor = aiCurCol[0]) and (it^.pSTab <> nil)
+           and (i32(it^.pSTab^.iPKey) = aiCurCol[1]) then
+        begin
+          aiCurCol[1] := -1;
+          Break;
+        end;
+      end;
     Exit(1);
   end;
 

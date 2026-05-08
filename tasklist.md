@@ -2626,6 +2626,46 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.48** Fixed 2026-05-08.  Planner missed the IPK fast
+     path when an INTEGER PRIMARY KEY column was referenced by its
+     declared name (rather than by `rowid`).  Reproducer:
+     `CREATE TABLE x(a INTEGER PRIMARY KEY); EXPLAIN SELECT * FROM x
+     WHERE a=2;` emitted a full `Rewind/Rowid/Ne/Next` SCAN of the
+     table; `WHERE rowid=2` (same column, different spelling) emitted
+     the expected `SeekRowid` SEARCH.  Result rows still matched —
+     only the strategy diverged — but every IPK lookup paid O(n)
+     instead of O(log n).  Root cause: the Pas resolver (unlike C
+     resolve.c:466 / :562 lookupName) does not rewrite an IPK alias
+     reference's `iColumn` to `XN_ROWID` (-1).  Downstream callers
+     (sqlite3WhereCodeOneLoopStart, generateUpdateSubroutine, etc.)
+     were carrying ad-hoc `(iCol = pTab^.iPKey)` workarounds, but
+     `whereShortCut`'s rowid-EQ probe at codegen.pas:15913 calls
+     `whereScanInit(scan, pWC, iCur, -1, WO_EQ or WO_IS, nil)` which
+     matches against `pTerm^.u.leftColumn = iColumn` directly — and
+     the term carried `leftColumn=iPKey` (e.g. 0), so the probe
+     missed and the planner fell through to the full-scan fallback.
+     Fix: in `exprMightBeIndexed` (codegen.pas:11103), normalise
+     `aiCurCol[1]` from `iPKey` to `-1` when the cursor's source
+     table has the matching IPK.  This is the same rewrite the C
+     resolver does at name-resolution time, just performed at
+     analysis time so every WhereTerm spawned through exprAnalyze
+     gets a rowid-shaped `leftColumn`.  Verified byte-identical to
+     upstream: `WHERE a=2`, `WHERE a IN (1,3)`, `UPDATE … WHERE a=1`,
+     `DELETE … WHERE a=1`, two-table joins on IPK aliases all use
+     SeekRowid now.  TestExplainParity 1026/1026; TestSmoke /
+     TestDMLBasic 54/54 / TestSelectBasic 60/60 / TestWhereBasic
+     52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord
+     13/13 / TestWindowBasic 34/34 / TestWherePlanner 679/679 /
+     TestBytecodeParity 32/32 all clean; DiagFeatureProbe /
+     DiagWindow / DiagDml / DiagFunctions / DiagPragma / DiagOps /
+     DiagMisc / DiagCast / DiagDate / DiagDropTable /
+     DiagOrderLimitTopN / DiagAnalyze / DiagCovering / DiagIndexing /
+     DiagPredicates / DiagLikeGlob / DiagAggWhere / DiagMultiValues /
+     DiagTxn / DiagAutoIdx / DiagBloom / DiagMoreFunc / DiagSubsel /
+     DiagInnerJoin / DiagSumOverflow / DiagCreateIdx /
+     DiagScalarFunc / DiagArith / DiagFloatRender all 0 divergences.
+
 - [X] **10.1.bug.47** Fixed 2026-05-08.  Multi-source FROM containing
      sub-SELECT items returned no rows.  Reproducer:
      `SELECT x.a, y.b FROM (SELECT 1 a) x, (SELECT 2 b) y;` emitted only
