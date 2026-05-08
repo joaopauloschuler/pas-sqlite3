@@ -2706,20 +2706,45 @@ existing dispatcher.
      result-set expression.  TestExplainParity 1026/1026; main test
      suite + diag probes all clean.
 
-- [ ] **10.1.bug.52** HAVING in a non-GROUP-BY aggregate query returns
-     no rows even when the predicate is true.  Reproducers:
-     `SELECT count(*) c FROM t HAVING count(*) > 0;` returns no rows
-     (C oracle: `3`); `SELECT count(*) FROM t HAVING 1;` likewise
-     empty (C: `3`).  Adding `GROUP BY <col>` makes Pas behave
-     correctly, so the implicit single-group aggregate emit-path
-     misses the HAVING test, or the post-aggregate output coroutine
-     treats no-rows-from-source as "skip HAVING entirely".  Likely
-     site: codegen.pas non-GROUP-BY aggregate arm of sqlite3Select
-     (look for the `pHaving` test that gates the OP_ResultRow emit
-     in the aggregate-no-GROUP-BY pseudo-loop).  Compare with
-     select.c around the implicit-aggregate Yield path (the C arm
-     emits the row whenever pHaving is non-zero and evaluates true,
-     including the empty-input case for count()).
+- [X] **10.1.bug.52** Fixed 2026-05-08.  HAVING in a non-GROUP-BY
+     aggregate query returned no rows even when the predicate was true.
+     Root cause: a top-level early-exit in `sqlite3Select`
+     (codegen.pas:23875) bailed unconditionally to the 3-op stub
+     whenever `p^.pHaving <> nil`, so the aggregate-no-GROUP-BY arm
+     downstream (codegen.pas:24297) never had a chance to run.  Fix
+     across three sites in passqlite3codegen.pas:
+       (1) Top-level pHaving gate restricted to non-aggregate queries
+           (HAVING without an aggregate is meaningless and stays
+           stub-only): `(p^.pHaving<>nil) and ((selFlags and SF_Aggregate)=0)`.
+       (2) Simple-count fast path (codegen.pas:24161) gained an
+           `and (p^.pHaving = nil)` gate so it falls through to the
+           general aggregate arm when HAVING is present (otherwise it
+           would emit OP_Count + OP_ResultRow without testing HAVING).
+       (3) General aggregate-no-GROUP-BY arm (codegen.pas:24297)
+           lifted its `(p^.pHaving = nil)` gate, captures `pHavingLoc`,
+           calls `markAggregateInExpr(pHavingLoc)` after pEList marking
+           and `sqlite3ExprAnalyzeAggregates(@sNCAgg, pHavingLoc)` after
+           pEList analysis (mirrors select.c:8422..8430), then gates
+           the result-row emission with
+           `sqlite3ExprIfFalse(pParse, pHavingLoc, addrSkip, JUMPIFNULL)`
+           after `finalizeAggFunctionsSimple` and resolves `addrSkip`
+           after the OP_ResultRow (mirrors select.c:8897).
+     Verified byte-identical against the upstream `../sqlite3/sqlite3`
+     oracle on the two repros plus six edge cases:
+       SELECT count(*) c FROM t HAVING count(*) > 0       -> 3
+       SELECT count(*) FROM t HAVING 1                    -> 3
+       SELECT count(*) FROM t HAVING 0                    -> ()
+       SELECT count(*) FROM t HAVING count(*) > 100       -> ()
+       SELECT sum(a) FROM t HAVING sum(a) > 5             -> 6
+       SELECT count(*) FROM t WHERE a>1 HAVING count(*)>0 -> 2
+       SELECT count(*) FROM t HAVING NULL                 -> ()
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11 /
+     TestSchemaBasic 44/44 / TestPrepareBasic 20/20 / TestParser 45/45 /
+     TestVdbeRecord 13/13 / TestBytecodeParity 32/32 / TestWindowBasic
+     34/34 all clean; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma /
+     DiagFunctions / DiagWindow / DiagMisc / DiagCovering / DiagIndexing /
+     DiagPredicates all 0 divergences.
 
 - [X] **10.1.bug.48** Fixed 2026-05-08.  Planner missed the IPK fast
      path when an INTEGER PRIMARY KEY column was referenced by its

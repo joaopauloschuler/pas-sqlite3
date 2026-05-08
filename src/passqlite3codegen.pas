@@ -23872,7 +23872,12 @@ begin
     now drives whereShortCut → IPK / SCAN with per-row residual filter
     emission, so any single-table WHERE shape produces a stepable body. }
   if p^.pGroupBy   <> nil then begin Result := SQLITE_OK; Exit; end;
-  if p^.pHaving    <> nil then begin Result := SQLITE_OK; Exit; end;
+  { 10.1.bug.52 — HAVING in non-GROUP-BY aggregate query.  Allow the
+    aggregate-no-GROUP-BY arm at codegen.pas:24297 to handle pHaving
+    when SF_Aggregate is set.  Non-aggregate HAVING is still a no-op
+    (mirrors C: HAVING without aggregates is meaningless). }
+  if (p^.pHaving <> nil) and ((p^.selFlags and SF_Aggregate) = 0) then
+    begin Result := SQLITE_OK; Exit; end;
   { ORDER BY gate lifted 2026-05-02 — when WhereBegin can satisfy the
     ORDER BY through an index or rowid scan (pWInfo^.nOBSat == nExpr),
     no sorter is needed and the existing inner-loop path produces
@@ -24161,6 +24166,7 @@ begin
   if ((p^.selFlags and SF_Aggregate) <> 0)
      and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
      and (p^.pWhere = nil)
+     and (p^.pHaving = nil)
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc = 1)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr = 1)
      and (pDest^.eDest = SRT_Output)
@@ -24294,7 +24300,7 @@ begin
     table / collation plumbing not yet ported. }
   if ((p^.selFlags and SF_Aggregate) <> 0)
      and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
-     and (p^.pGroupBy = nil) and (p^.pHaving = nil)
+     and (p^.pGroupBy = nil)
      and (p^.pWin     = nil)
      and (p^.pOrderBy = nil)
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
@@ -24306,6 +24312,7 @@ begin
     isVtabAgg := False;
     isSubqueryAgg := False;
     pItem := SrcListItems(p^.pSrc);
+    pHavingLoc := p^.pHaving;
     { Allow single-source eponymous vtab — handled below by emitting
       VOpen/VFilter/VNext directly instead of WhereBegin.  Lifts the
       `count(*) >= N FROM <eponymous-vtab>` and similar shapes that the
@@ -24367,10 +24374,17 @@ begin
         arm fires.  The C resolver does this in resolve.c per node;
         Pas's resolver only sets SF_Aggregate. }
       markAggregateInExprList(pParse, p^.pEList);
+      { 10.1.bug.52 — mark HAVING aggregates so analyzeAggregates registers
+        them in pAggI2; HAVING is then evaluated post-finalize via
+        ExprIfFalse below.  Mirrors select.c:8422..8430. }
+      if pHavingLoc <> nil then
+        markAggregateInExpr(pParse, pHavingLoc);
 
       { analyzeAggList — populates pAggI2->aCol[] / aFunc[]
         (select.c:8420). }
       sqlite3ExprAnalyzeAggList(@sNCAgg, p^.pEList);
+      if pHavingLoc <> nil then
+        sqlite3ExprAnalyzeAggregates(@sNCAgg, pHavingLoc);
       pAggI2^.nAccumulator := pAggI2^.nColumn;
       analyzeAggFuncArgs(pAggI2, @sNCAgg);
 
@@ -24587,6 +24601,19 @@ begin
         end;
         finalizeAggFunctionsSimple(pParse, pAggI2);
 
+        { 10.1.bug.52 — HAVING gate.  Mirror select.c:8897:
+          sqlite3ExprIfFalse(pParse, pHaving, addrEnd, JUMPIFNULL).
+          Evaluates HAVING against the now-finalized accumulator
+          registers; jumps past the result-row emission when false
+          or NULL. }
+        addrSkip := 0;
+        if pHavingLoc <> nil then
+        begin
+          addrSkip := sqlite3VdbeMakeLabel(pParse);
+          sqlite3ExprIfFalse(pParse, pHavingLoc, addrSkip,
+                             SQLITE_JUMPIFNULL);
+        end;
+
         { Render the result row — sqlite3ExprCodeTarget routes
           TK_AGG_FUNCTION through the AggInfoFuncReg arm (added above)
           so result columns read directly from accumulators. }
@@ -24606,6 +24633,8 @@ begin
         end;
         if pDest^.eDest = SRT_Output then
           sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        if addrSkip <> 0 then
+          sqlite3VdbeResolveLabel(v, addrSkip);
         if pParse^.nErr <> 0 then Result := SQLITE_ERROR else Result := SQLITE_OK;
         Exit;
       end;
