@@ -30543,10 +30543,28 @@ begin
   if db^.eOpenState <> $76 then goto insert_cleanup;
 
   { If pSelect is just a single-row VALUES list, capture pEList as pList and
-    discard the wrapping Select. }
+    discard the wrapping Select.  Phase 10.1.bug.32: also catch the bare
+    no-FROM single-row SELECT shape (`INSERT INTO t SELECT <exprs>` with no
+    FROM / WHERE / GROUP / ORDER / LIMIT / window) — semantically a
+    single-row VALUES, and the rest of sqlite3Insert handles it via pList. }
   if (pSelect <> nil)
      and ((pSelect^.selFlags and SF_Values) <> 0)
      and (pSelect^.pPrior = nil) then
+  begin
+    pList := pSelect^.pEList;
+    pSelect^.pEList := nil;
+    sqlite3SelectDelete(db, pSelect);
+    pSelect := nil;
+  end
+  else if (pSelect <> nil)
+     and (pSelect^.pPrior = nil)
+     and ((pSelect^.pSrc = nil) or (pSelect^.pSrc^.nSrc = 0))
+     and (pSelect^.pWhere = nil)
+     and (pSelect^.pGroupBy = nil)
+     and (pSelect^.pHaving = nil)
+     and (pSelect^.pOrderBy = nil)
+     and (pSelect^.pLimit = nil)
+     and (pSelect^.pWin = nil) then
   begin
     pList := pSelect^.pEList;
     pSelect^.pEList := nil;

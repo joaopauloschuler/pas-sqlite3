@@ -2558,6 +2558,48 @@ existing dispatcher.
      6.29); DiagFunctions / TestSmoke / TestVdbeAgg 11/11 clean.
      Open follow-up tracked as **10.1.bug.25** below.
 
+- [X] **10.1.bug.32** Fixed 2026-05-08.  `INSERT INTO t SELECT <exprs>`
+     (single no-FROM SELECT) silently dropped the row — VDBE shrank to
+     just `Init / Halt / Transaction / Goto`.  Root cause: the
+     SF_Values capture in `sqlite3Insert`
+     (passqlite3codegen.pas:30547..30555) only fired when `SF_Values`
+     was set on the wrapping Select; but bare `SELECT 1` doesn't carry
+     SF_Values (only true `VALUES(…)` syntax does).  So pSelect fell
+     through to the multi-row compound chain at :30666..30702 which
+     bailed via `nRows < 2`, jumping straight to insert_cleanup
+     without emitting any insert body.  Fix: add a sibling capture
+     (else-if) for the `pPrior=nil` + (pSrc=nil OR nSrc=0) + no
+     WHERE/GROUP/HAVING/ORDER/LIMIT/window shape — convert pEList
+     to pList and discard the wrapping Select, letting the existing
+     single-row VALUES emission path handle it.  Verified
+     byte-identical to upstream: `INSERT INTO x SELECT 99`,
+     `INSERT INTO x SELECT 2+3, 'b'||'c'`,
+     `INSERT INTO x SELECT NULL, NULL`,
+     `INSERT INTO x SELECT 99, hex(zeroblob(2))` all round-trip.
+     Open follow-up: `INSERT INTO t SELECT a UNION SELECT b` (UNION
+     dedup, not UNION ALL) still drops rows — needs proper compound-
+     SELECT-of-constants support in the INSERT path.  TestExplainParity
+     1026/1026; TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestSchemaBasic 44/44 / TestVdbeAgg 11/11 / TestPrepareBasic 20/20 /
+     TestParser 45/45 / TestVdbeRecord 13/13 / TestWhereBasic 52/52 /
+     TestBytecodeParity 32/32 all clean; DiagFeatureProbe / DiagDml /
+     DiagOps / DiagPragma / DiagDropTable / DiagMisc / DiagTxn /
+     DiagFunctions / DiagCast / DiagAnalyze / DiagWindow /
+     DiagMultiValues / DiagIndexing / DiagCovering / DiagPredicates /
+     DiagMoreFunc / DiagSumOverflow / DiagLikeGlob / DiagPrintfFmt all
+     0 divergences.
+
+- [ ] **10.1.bug.33** `INSERT INTO t SELECT a UNION SELECT b` (UNION
+     without ALL) silently drops rows.  Bug.32 closed the
+     single-no-FROM-SELECT case but the compound chain at
+     passqlite3codegen.pas:30671..30679 still requires `pTmp^.op =
+     TK_ALL` for every prior link — UNION (TK_UNION op) bails to
+     insert_cleanup.  Needs either compound-SELECT-of-constants
+     support with a dedup eph cursor, or full sqlite3Select-as-source
+     dispatch through the standard FROM-less path.  Reproducer:
+     `CREATE TABLE x(v); INSERT INTO x SELECT 1 UNION SELECT 2; SELECT
+     * FROM x;` returns 0 rows in Pas vs `1, 2` in upstream.
+
 - [X] **10.1.bug.31** Fixed 2026-05-08.  `EXISTS(SELECT … with no FROM
      clause)` always returned 0; `SELECT <expr> WHERE <falsey>` (no FROM)
      wrongly returned the expression value.  Both bugs lived in the
