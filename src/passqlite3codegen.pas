@@ -8012,6 +8012,9 @@ end;
       it (table not found) — that item is silently skipped.  The
       sqlite3SelectExpand caller already raised the missing-table
       error in that case. }
+procedure resolveAlias(pParse: PParse; pEList: PExprList; iCol: i32;
+  pExpr: PExpr; nSubquery: i32); forward;
+
 procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
   pOuterNC: PNameContext);
 
@@ -8594,6 +8597,82 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  { resolve.c:658..698 NC_UEList fallback for HAVING.  HAVING is a single
+    boolean expression rather than an ExprList, so the iOrderByCol pre-tag
+    used for ORDER BY / GROUP BY does not apply.  Walk pHaving's tree and
+    rewrite each bare TK_ID that (a) does not match any FROM column and
+    (b) matches a result-set ENAME_NAME alias into a copy of the matching
+    pEList expression, via resolveAlias (the C `resolveAlias` swap).  The
+    pEList items are already resolved (TK_COLUMN, etc.) by the time this
+    runs, so the swapped-in expr needs no further name resolution. }
+  procedure ResolveAliasInHaving(pE: PExpr); forward;
+
+  function ColumnInFromClause(zName: PAnsiChar): Boolean;
+  var
+    pSrc:  PSrcList;
+    base:  PSrcItem;
+    pIt:   PSrcItem;
+    j:     i32;
+  begin
+    Result := False;
+    if (zName = nil) or (zName^ = #0) then Exit;
+    pSrc := p^.pSrc;
+    if pSrc = nil then Exit;
+    base := SrcListItems(pSrc);
+    for j := 0 to pSrc^.nSrc - 1 do
+    begin
+      pIt := PSrcItem(PByte(base) + j * SizeOf(TSrcItem));
+      if pIt^.pSTab = nil then Continue;
+      if sqlite3ColumnIndex(pIt^.pSTab, zName) >= 0 then
+      begin
+        Result := True;
+        Exit;
+      end;
+    end;
+  end;
+
+  procedure ResolveAliasInHavingList(pList: PExprList);
+  var
+    i:     i32;
+    items: PExprListItem;
+  begin
+    if pList = nil then Exit;
+    items := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+      ResolveAliasInHaving(items[i].pExpr);
+  end;
+
+  procedure ResolveAliasInHaving(pE: PExpr);
+  var
+    iCol: i32;
+  begin
+    if pE = nil then Exit;
+    if pE^.op = TK_DOT then Exit;
+    if (pE^.op = TK_ID)
+       and ((pE^.flags and EP_IntValue) = 0)
+       and (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
+    begin
+      if ColumnInFromClause(pE^.u.zToken) then Exit;
+      if sqlite3IsRowid(pE^.u.zToken) <> 0 then Exit;
+      iCol := ResolveAsName(p^.pEList, pE);
+      if iCol > 0 then
+        resolveAlias(pParse, p^.pEList, iCol - 1, pE, 0);
+      Exit;
+    end;
+    ResolveAliasInHaving(pE^.pLeft);
+    ResolveAliasInHaving(pE^.pRight);
+    if not ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then
+    begin
+      if not ExprHasProperty(pE, EP_xIsSelect) then
+        ResolveAliasInHavingList(pE^.x.pList);
+      { Subselects: skip — they have their own pEList scope; avoid
+        accidentally rebinding a correlated alias reference. }
+      if ExprHasProperty(pE, EP_WinFunc) and (pE^.y.pWin <> nil)
+         and (pE^.y.pWin^.pFilter <> nil) then
+        ResolveAliasInHaving(pE^.y.pWin^.pFilter);
+    end;
+  end;
+
 var
   pTopSel: PSelect;
 begin
@@ -8617,6 +8696,8 @@ begin
   if p^.pGroupBy <> nil then
     ResolveAliasOrderByCol(p^.pGroupBy);
   ResolveExprList(p^.pGroupBy);
+  if p^.pHaving <> nil then
+    ResolveAliasInHaving(p^.pHaving);
   ResolveExpr    (p^.pHaving);
 
   { resolve.c:1797..1806 — alias-arm runs BEFORE ResolveExprList on

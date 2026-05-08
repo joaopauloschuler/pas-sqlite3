@@ -2693,18 +2693,33 @@ existing dispatcher.
      TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13 /
      TestWindowBasic 34/34 all clean.
 
-- [ ] **10.1.bug.51** HAVING by SELECT-list column alias raises
-     `Parse error: no such column: <alias>`.  Reproducer:
-     `SELECT b%2 g, count(*) c FROM t GROUP BY g HAVING c>0;` errors;
-     C oracle accepts.  Same root cause family as bug 50: the Pas
-     port's simplified ResolveExpr does not implement the lookupName
-     NC_UEList fallback (resolve.c:658..698).  HAVING is not amenable
-     to the iOrderByCol pre-tag trick used for ORDER/GROUP because
-     HAVING is a single boolean expression, not a list of terms;
-     this needs the proper NC_UEList plumbing inside ResolveExpr's
-     bareword fallback at codegen.pas:~8312, scanning p^.pEList for
-     an ENAME_NAME match and copying the result-set expression in
-     place via something equivalent to C's `resolveAlias`.
+- [X] **10.1.bug.51** Fixed 2026-05-08.  HAVING by SELECT-list column
+     alias raised `Parse error: no such column: <alias>`.  Reproducer:
+     `SELECT b%2 g, count(*) c FROM t GROUP BY g HAVING c>0;`.  The
+     iOrderByCol pre-tag trick used for ORDER/GROUP BY does not apply
+     to HAVING (a single boolean expression, not a list of terms).
+     Fix: a dedicated pre-walk (`ResolveAliasInHaving`) traverses
+     pHaving's tree before name resolution and, for each bare TK_ID
+     that does not match any FROM column and does match an ENAME_NAME
+     alias in p^.pEList, calls the existing `resolveAlias` swap
+     (resolve.c:68) to replace the node with a copy of the matching
+     result-set expression.  TestExplainParity 1026/1026; main test
+     suite + diag probes all clean.
+
+- [ ] **10.1.bug.52** HAVING in a non-GROUP-BY aggregate query returns
+     no rows even when the predicate is true.  Reproducers:
+     `SELECT count(*) c FROM t HAVING count(*) > 0;` returns no rows
+     (C oracle: `3`); `SELECT count(*) FROM t HAVING 1;` likewise
+     empty (C: `3`).  Adding `GROUP BY <col>` makes Pas behave
+     correctly, so the implicit single-group aggregate emit-path
+     misses the HAVING test, or the post-aggregate output coroutine
+     treats no-rows-from-source as "skip HAVING entirely".  Likely
+     site: codegen.pas non-GROUP-BY aggregate arm of sqlite3Select
+     (look for the `pHaving` test that gates the OP_ResultRow emit
+     in the aggregate-no-GROUP-BY pseudo-loop).  Compare with
+     select.c around the implicit-aggregate Yield path (the C arm
+     emits the row whenever pHaving is non-zero and evaluates true,
+     including the empty-input case for count()).
 
 - [X] **10.1.bug.48** Fixed 2026-05-08.  Planner missed the IPK fast
      path when an INTEGER PRIMARY KEY column was referenced by its
