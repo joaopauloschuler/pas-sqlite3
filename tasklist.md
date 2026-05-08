@@ -2648,6 +2648,32 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.57** Fixed 2026-05-08.  SQL `printf()` / `format()` diverged
+     from upstream on three rare format-spec arms.  (a) Unknown specifier
+     (`%b`, `%a`, `%n`, …) — Pas emitted the literal `%c` verbatim, while
+     printf.c:1009..1012 hits the `etINVALID` default which `return`s out
+     of the format engine, so the result is whatever was accumulated up
+     to (but not including) the offending `%`.  Reproducer: `printf('%b',5)`
+     now returns `''` (was `'%b'`); `printf('xx%byy',5)` returns `'xx'`.
+     (b) Trailing `%` at end of format — Pas dropped it; printf.c:255..258
+     emits a literal `%`.  Reproducer: `printf('%')` now returns `'%'`.
+     (c) `,` thousand-separator flag (printf.c:476..492) — captured in
+     metaFlags but never applied; now `%,d` / `%,u` insert ',' every 3
+     trailing digits.  Reproducer: `printf('%,d',1234567)` returns
+     `'1,234,567'`.  (d) `!` alt-form-2 flag on `%s` (printf.c:769..776,
+     838..844) — width / precision counted bytes; now they count UTF-8
+     glyphs.  Reproducer: `printf('%!5s','é')` pads to 4 spaces+'é' (was
+     3 spaces).  Fix in `printfFunc` (passqlite3codegen.pas:45147..) —
+     end-of-string `%` arm emits literal, default branch in case statement
+     `Break`s, `InsertThousandSep` helper added and called from `'d'`/`'i'`
+     /`'u'` branches, `'s'` branch grows a `'!'` arm that walks UTF-8 to
+     count glyphs for both truncation and pad.  Verified: 12-case probe
+     sweep against the C library byte-identical; TestExplainParity
+     1026/1026; DiagPrintfFmt / DiagFunctions / DiagMoreFunc / DiagFeatureProbe
+     / DiagOps / DiagDml / DiagPragma / DiagWindow / DiagDate / DiagCast
+     / DiagPredicates / DiagLikeGlob / DiagOrderLimitTopN / DiagIndexing
+     / DiagCovering / DiagAnalyze / DiagDropTable / DiagMisc all 0 divergences.
+
 - [X] **10.1.bug.55** Fixed 2026-05-08.  `DELETE FROM <parent>` on a table
      referenced by a foreign key crashed the shell with
      `EAccessViolation: Access violation` whenever `PRAGMA foreign_keys=ON`

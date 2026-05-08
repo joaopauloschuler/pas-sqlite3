@@ -45262,6 +45262,21 @@ var
       Result := StringOfChar(' ', pad) + body;
   end;
 
+  { Insert thousand-separator commas into a digit string (no sign).
+    Mirrors printf.c:476..492 — every group of 3 trailing digits gets a
+    leading ',' inserted (only valid for radix-10). }
+  function InsertThousandSep(const digits: AnsiString): AnsiString;
+  var i, n: i32;
+  begin
+    n := Length(digits);
+    if n <= 3 then begin Result := digits; Exit; end;
+    Result := '';
+    for i := 1 to n do begin
+      if (i > 1) and (((n - i + 1) mod 3) = 0) then Result := Result + ',';
+      Result := Result + digits[i];
+    end;
+  end;
+
   function FmtSignedInt(v: i64): AnsiString;
   var
     sign: AnsiChar;
@@ -45277,6 +45292,7 @@ var
     end;
     if metaHavePrec and (Length(digits) < metaPrec) then
       digits := StringOfChar('0', metaPrec - Length(digits)) + digits;
+    if Pos(',', metaFlags) > 0 then digits := InsertThousandSep(digits);
     Result := ApplyIntWidth(digits, sign);
   end;
 
@@ -45333,7 +45349,11 @@ begin
       Continue;
     end;
     Inc(p); { skip '%' }
-    if p^ = #0 then Break;
+    if p^ = #0 then begin
+      { printf.c:255..258 — '%' at end of string emits a literal '%'. }
+      result_ := result_ + '%';
+      Break;
+    end;
     if p^ = '%' then begin
       result_ := result_ + '%';
       Inc(p);
@@ -45357,7 +45377,9 @@ begin
         Inc(p);
         if pVal <> nil then v64 := sqlite3_value_int64(Psqlite3_value(pVal))
         else v64 := 0;
-        App(ApplyIntWidth(IntToStr(u64(v64)), #0));
+        s := IntToStr(u64(v64));
+        if Pos(',', metaFlags) > 0 then s := InsertThousandSep(s);
+        App(ApplyIntWidth(s, #0));
       end;
       'x': begin
         Inc(p);
@@ -45393,18 +45415,47 @@ begin
       's': begin
         { %s — honour width / precision per printf.c et_STRING.  Precision
           truncates the source string to that many bytes; width pads
-          (left-aligned with '-' flag, otherwise right-aligned with spaces). }
+          (left-aligned with '-' flag, otherwise right-aligned with spaces).
+          The '!' alt-form-2 flag (printf.c:769..776, 838..844) treats
+          width / precision as UTF-8 character counts instead of bytes. }
         Inc(p);
         if pVal <> nil then begin
           zStr := sqlite3_value_text(Psqlite3_value(pVal));
           if zStr = nil then s := '' else s := AnsiString(zStr);
-          if metaHavePrec and (Length(s) > metaPrec) then
-            SetLength(s, metaPrec);
-          if metaHaveWidth and (Length(s) < metaWidth) then begin
-            if Pos('-', metaFlags) > 0 then
-              s := s + StringOfChar(' ', metaWidth - Length(s))
-            else
-              s := StringOfChar(' ', metaWidth - Length(s)) + s;
+          if Pos('!', metaFlags) > 0 then begin
+            { Truncate by character count: walk UTF-8 and stop at metaPrec. }
+            if metaHavePrec then begin
+              i := 1; nOut := 0;
+              while (i <= Length(s)) and (nOut < metaPrec) do begin
+                Inc(i);
+                while (i <= Length(s)) and ((Byte(s[i]) and $C0) = $80) do Inc(i);
+                Inc(nOut);
+              end;
+              SetLength(s, i - 1);
+            end;
+            if metaHaveWidth then begin
+              { Count glyphs in s. }
+              i := 1; nOut := 0;
+              while i <= Length(s) do begin
+                Inc(nOut); Inc(i);
+                while (i <= Length(s)) and ((Byte(s[i]) and $C0) = $80) do Inc(i);
+              end;
+              if nOut < metaWidth then begin
+                if Pos('-', metaFlags) > 0 then
+                  s := s + StringOfChar(' ', metaWidth - nOut)
+                else
+                  s := StringOfChar(' ', metaWidth - nOut) + s;
+              end;
+            end;
+          end else begin
+            if metaHavePrec and (Length(s) > metaPrec) then
+              SetLength(s, metaPrec);
+            if metaHaveWidth and (Length(s) < metaWidth) then begin
+              if Pos('-', metaFlags) > 0 then
+                s := s + StringOfChar(' ', metaWidth - Length(s))
+              else
+                s := StringOfChar(' ', metaWidth - Length(s)) + s;
+            end;
           end;
           App(s);
         end;
@@ -45484,9 +45535,10 @@ begin
         end;
       end;
     else
-      { Unknown specifier — emit '%' + char verbatim }
-      Inc(p);
-      result_ := result_ + '%' + c;
+      { Unknown specifier — printf.c:1009..1012 (default xtype==etINVALID)
+        returns out of the format engine, so the SQL printf result is
+        whatever was accumulated up to (but not including) the '%'. }
+      Break;
     end;
   end;
 
