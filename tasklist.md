@@ -2648,6 +2648,42 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.69** Fixed 2026-05-08.  `timediff(A,B)` was missing
+     and Pascal's `fromJulianDay` decoded JD values for proleptic-
+     Gregorian dates before 1582 incorrectly (e.g. `date(1721089.5)`
+     returned `0000-02-02` instead of `0000-01-31`).  Two paired fixes:
+     (1) `fromJulianDay` (passqlite3codegen.pas) now applies the
+     unconditional Gregorian-correction formula from date.c:476..486
+     `alpha=(Z+32044.75)/36524.25 - 52; A=Z+1+alpha-((alpha+100)/4)+25;
+     D=(36525*(C&32767))/100;` instead of the Meeus Julian/Gregorian
+     split (`if Z<2299161 then A:=Z`).  SQLite is proleptic-Gregorian
+     throughout — the split was wrong.  Modern dates (Z ≥ 2299161) are
+     unaffected because both formulas agree there.  (2) Ported
+     `timediffFunc` (date.c:1618..1707) and registered it as
+     `aDateFuncs[6]` (nArg=2).  Adapts the C `iJD` Int64-ms semantics
+     to the Pascal port's `jd: Double` (days since JD0); the JD shift
+     constant becomes 1721059.5 (= 1486995408*100000 ms / 86400000).
+     Verified: `timediff('2024-12-31','2024-01-01')` =
+     `+0000-11-30 00:00:00.000`; sub-day, multi-year, and leap-day
+     cases all byte-identical to upstream.  TestExplainParity 1026/1026;
+     DiagDate / DiagFunctions / DiagOps / DiagFeatureProbe / DiagDml /
+     DiagPragma / DiagWindow / DiagMisc / DiagCast / DiagAggWhere all
+     clean; TestSmoke PASS.  Round-trip `datetime(B, timediff(A,B))=A`
+     still fails — Pascal `applyModifier` doesn't accept the
+     `+YYYY-MM-DD HH:MM:SS.SSS` modifier shape (separate gap; date.c
+     parseModifier YMD-modifier arm).  Pre-existing 1-day error in
+     `julianday('9999-12-31')` (returns 5373484.5 instead of
+     5373483.5) is in `toJulianDay`, unrelated to this fix; tracked
+     below as 10.1.bug.70.
+
+- [ ] **10.1.bug.70** `julianday('9999-12-31')` returns 5373484.5;
+     upstream returns 5373483.5.  Off-by-one for the very-end-of-range
+     date.  Suspect: `toJulianDay` (passqlite3codegen.pas) integer-
+     truncation pattern around `Trunc(365.25 * (y + 4716))` accumulates
+     a 1-day error for the largest supported year.  `date('9999-12-31')`
+     itself prints fine (parse path); only `julianday` is affected.
+     `date(julianday('9999-12-31'))` round-trips to `9999-12-30`.
+
 - [X] **10.1.bug.68** Fixed 2026-05-08.  Step-time errors (e.g.
      `SELECT abs(-9223372036854775808);` with stdin pipe) printed
      `Error near line 1: integer overflow` instead of upstream's

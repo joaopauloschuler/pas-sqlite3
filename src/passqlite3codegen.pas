@@ -47748,14 +47748,16 @@ begin
     Inc(ms_in_day, 86400000);
     Dec(Z);
   end;
-  if Z < 2299161 then A := Z
-  else begin
-    alpha := Trunc((Z - 1867216.25) / 36524.25);
-    A := Z + 1 + alpha - (alpha div 4);
-  end;
+  { Proleptic-Gregorian unconditional Meeus correction — mirrors
+    date.c:476..486 computeYMD.  The earlier Pascal port branched on
+    `Z < 2299161` (Gregorian reform 1582), which gives wrong Y/M/D for
+    dates before 1582 (e.g. 0000-01-31 → 0000-02-02).  SQLite is
+    proleptic-Gregorian throughout, so apply the correction always. }
+  alpha := Trunc((Z + 32044.75) / 36524.25) - 52;
+  A := Z + 1 + alpha - ((alpha + 100) div 4) + 25;
   B  := A + 1524;
   C  := Trunc((B - 122.1) / 365.25);
-  D2 := Trunc(365.25 * C);
+  D2 := (36525 * (C and 32767)) div 100;
   E  := Trunc((B - D2) / 30.6001);
   d  := B - D2 - Trunc(30.6001 * E);
   if E < 14 then m := E - 1 else m := E - 13;
@@ -48376,8 +48378,85 @@ begin
   sqlite3_result_text(pCtx, out_, op - out_, SQLITE_TRANSIENT);
 end;
 
+{ timediffFunc — port of date.c:1618..1707.
+  Returns the +YYYY-MM-DD HH:MM:SS.SSS interval such that
+  datetime(B, timediff(A,B)) == datetime(A).  Both args must parse as
+  ISO-8601 / julian-day; unix timestamps are not accepted.
+  Pascal port works over TDateTime2.jd (Double days) instead of C's
+  iJD (Int64 ms); JD shift constant 1721059.5 = 1486995408*100000 ms / 86400000. }
+procedure timediffFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
-  aDateFuncs: array[0..5] of TFuncDef;
+  d1, d2: TDateTime2;
+  z: PAnsiChar;
+  buf: array[0..63] of AnsiChar;
+  body: array[0..63] of AnsiChar;
+  sign: AnsiChar;
+  Y, M: i32;
+const
+  JD_OFFSET: Double = 1721059.5;
+begin
+  if argc < 2 then begin sqlite3_result_null(pCtx); Exit; end;
+  z := sqlite3_value_text(Psqlite3_value(argv^));
+  if (z = nil) or not parseDateTime(z, d1) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  z := sqlite3_value_text(Psqlite3_value((argv+1)^));
+  if (z = nil) or not parseDateTime(z, d2) then begin
+    sqlite3_result_null(pCtx); Exit;
+  end;
+  if d1.jd >= d2.jd then begin
+    sign := '+';
+    Y := d1.yr - d2.yr;
+    if Y <> 0 then begin
+      d2.yr := d1.yr;
+      d2.jd := toJulianDay(d2.yr, d2.mo, d2.dy, d2.hr, d2.mi, d2.s);
+    end;
+    M := d1.mo - d2.mo;
+    if M < 0 then begin Dec(Y); Inc(M, 12); end;
+    if M <> 0 then begin
+      d2.mo := d1.mo;
+      d2.jd := toJulianDay(d2.yr, d2.mo, d2.dy, d2.hr, d2.mi, d2.s);
+    end;
+    while d1.jd < d2.jd do begin
+      Dec(M);
+      if M < 0 then begin M := 11; Dec(Y); end;
+      Dec(d2.mo);
+      if d2.mo < 1 then begin d2.mo := 12; Dec(d2.yr); end;
+      d2.jd := toJulianDay(d2.yr, d2.mo, d2.dy, d2.hr, d2.mi, d2.s);
+    end;
+    d1.jd := d1.jd - d2.jd + JD_OFFSET;
+  end else begin
+    sign := '-';
+    Y := d2.yr - d1.yr;
+    if Y <> 0 then begin
+      d2.yr := d1.yr;
+      d2.jd := toJulianDay(d2.yr, d2.mo, d2.dy, d2.hr, d2.mi, d2.s);
+    end;
+    M := d2.mo - d1.mo;
+    if M < 0 then begin Dec(Y); Inc(M, 12); end;
+    if M <> 0 then begin
+      d2.mo := d1.mo;
+      d2.jd := toJulianDay(d2.yr, d2.mo, d2.dy, d2.hr, d2.mi, d2.s);
+    end;
+    while d1.jd > d2.jd do begin
+      Dec(M);
+      if M < 0 then begin M := 11; Dec(Y); end;
+      Inc(d2.mo);
+      if d2.mo > 12 then begin d2.mo := 1; Inc(d2.yr); end;
+      d2.jd := toJulianDay(d2.yr, d2.mo, d2.dy, d2.hr, d2.mi, d2.s);
+    end;
+    d1.jd := d2.jd - d1.jd + JD_OFFSET;
+  end;
+  fromJulianDay(d1.jd, d1.yr, d1.mo, d1.dy, d1.hr, d1.mi, d1.s);
+  buf[0] := sign;
+  snpFmt(SizeOf(body), body, '%04d-%02d-%02d %02d:%02d:%06.3f',
+    [Y, M, d1.dy - 1, d1.hr, d1.mi, d1.s]);
+  Move(body[0], buf[1], StrLen(PAnsiChar(@body[0])) + 1);
+  sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
+end;
+
+var
+  aDateFuncs: array[0..6] of TFuncDef;
 
 procedure InitDateFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; sfunc: TxSFuncProc;
@@ -48390,13 +48469,15 @@ begin
   fd.zName     := nm;
 end;
 begin
-  { date.c:1808..1813 — all date funcs are variadic (PURE_DATE nArg=-1). }
+  { date.c:1808..1814 — all date funcs are variadic (PURE_DATE nArg=-1)
+    except timediff (nArg=2). }
   MakeFD(aDateFuncs[0], -1, @dateFunc,      'date');
   MakeFD(aDateFuncs[1], -1, @timeFunc,      'time');
   MakeFD(aDateFuncs[2], -1, @datetimeFunc,  'datetime');
   MakeFD(aDateFuncs[3], -1, @juliandayFunc, 'julianday');
   MakeFD(aDateFuncs[4], -1, @strftimeFunc,  'strftime');
   MakeFD(aDateFuncs[5], -1, @unixtimeFunc,  'unixepoch');
+  MakeFD(aDateFuncs[6],  2, @timediffFunc,  'timediff');
 end;
 
 var
