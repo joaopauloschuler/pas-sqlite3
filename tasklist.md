@@ -2648,6 +2648,46 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.65** Fixed 2026-05-08.  Shell error messages omitted the
+     upstream "near line N:" / "in Nth command line argument:" qualifier and
+     used the wrong type label, so `SELECT abs(-9223372036854775808);`
+     piped through stdin printed `Runtime error: integer overflow` instead
+     of upstream's `Error near line 1: integer overflow`.  Root cause: the
+     Pas `runOneSqlLine` (passqlite3shell.pas:1748) emitted a hard-coded
+     `Runtime error:` / `Parse error:` prefix and ignored both `zSrc` and
+     `lineno`; `processInput` also never set `state.zInFile` to `<stdin>`
+     for the REPL on stdin, so even with the prefix wired the dispatcher
+     would have fallen into the interactive arm.  Fix mirrors
+     shell.c.in:35780..35811: new `shellErrPrefix(zErrorType, zSrc,
+     lineno)` helper builds `"<type> near line N:"` /
+     `"<type> in Nth command line argument:"` /
+     `"<type> near line N of FILE:"` / `"<type>:"` per upstream's branches;
+     new `ordinalSuffix` mirrors `%r` (1st/2nd/3rd/4th, plus the 11..13
+     "teen" exception); `state.zInFile` is now stamped to `<stdin>` (via a
+     stable `zStdinName` PAnsiChar) before entering processInput; finalize-
+     time errors now use the `Error` type to match upstream's common case
+     (where `sqlite3_format_query_result` captures the error into zErrMsg
+     without "stepping, " prefix and the dispatcher falls into the default
+     "Error" arm at shell.c:35784).  Verified byte-identical to upstream
+     across stdin pipe, command-line arg position (1st/2nd/3rd/...), and
+     parse-error path (`Parse error near line 1: near "garbage": syntax
+     error`).  TestExplainParity 1026/1026; DiagPubApi 259/259;
+     DiagFeatureProbe / DiagOps / DiagPragma all 0 divergences.
+
+- [ ] **10.1.bug.66** `SELECT * FRO;` is silently accepted by Pas (treated
+     as `SELECT * <alias-of-nothing>;` with `*` followed by a bare
+     identifier) but upstream raises a syntax error
+     (`near "FRO": syntax error`).  Reproducer: `echo 'SELECT * FRO;' |
+     bin/passqlite3 :memory:` exits 0 with no output; C exits 1 with the
+     parse error.  Likely a Lemon-grammar gap: the result-column rule allows
+     `*` to be followed by an alias-like identifier where the upstream
+     grammar requires `*` to be terminal (or followed by `,` / `FROM`).
+     Single-column variants are unaffected (`SELECT 1 FRO;` returns 1 in
+     both — implicit alias syntax is intentional).  Surface during 10.2
+     integration parity sweeps.  Investigation start: passqlite3parser.pas
+     `selcollist` / `sclp` rules vs sqlite3-3.53.0/src/parse.y:1240..1252
+     (`scanpt sclp(A) ::= sclp(A) DISTINCT|FROM scanpt expr ...`).
+
 - [X] **10.1.bug.64** Fixed 2026-05-08.  `SELECT … FROM t HAVING <pred>`
      (HAVING without GROUP BY and without any aggregate) silently produced
      no rows in Pas instead of emitting upstream's

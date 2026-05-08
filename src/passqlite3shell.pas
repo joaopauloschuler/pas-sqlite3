@@ -467,6 +467,8 @@ var
     AnsiString backing for the PAnsiChar fields in TShellMode.spec. }
   zUserColSep:          AnsiString = '|';
   zUserRowSep:          AnsiString = #10;
+  { Stable backing for state.zInFile when running the REPL on stdin. }
+  zStdinName:           PAnsiChar = '<stdin>';
   zUserNull:            AnsiString = '';
   { 10.1.3 — backing AnsiString for state.zNonce when -nonce sets it. }
   gNonceBacking:        AnsiString = '';
@@ -1702,6 +1704,50 @@ function displayStats(p: PShellState; bReset: i32): i32; forward;
 procedure shellBeginTimer(p: PShellState); forward;
 procedure shellEndTimer(p: PShellState); forward;
 
+{ Format the error prefix exactly as upstream's runOneSqlLine
+  (shell.c.in:35797..35810).  zErrorType is "Error" / "Parse error" /
+  "Runtime error"; zSrc is the current input source name (e.g.
+  "<stdin>" / "cmdline" / a filename).  Interactive stdin emits just
+  "<type>:"; everything else gets a "near line N" / "in N command line
+  argument" / "near line N of FILE" qualifier. }
+{ Mirrors `%r` in sqlite3_snprintf — the upstream ordinal-suffix
+  formatter used by save_err_msg.  1->1st, 2->2nd, 3->3rd, 4..20->th,
+  21->st, 22->nd, 23->rd, 24..30->th, ... }
+function ordinalSuffix(n: i64): AnsiString;
+var t: i64;
+begin
+  if n < 0 then n := -n;
+  t := n mod 100;
+  if (t >= 11) and (t <= 13) then begin
+    Result := IntToStr(n) + 'th';
+    Exit;
+  end;
+  case n mod 10 of
+    1: Result := IntToStr(n) + 'st';
+    2: Result := IntToStr(n) + 'nd';
+    3: Result := IntToStr(n) + 'rd';
+  else
+    Result := IntToStr(n) + 'th';
+  end;
+end;
+
+function shellErrPrefix(const zErrorType, zSrc: AnsiString;
+                        lineno: i64): AnsiString;
+begin
+  if (zSrc <> '') or (stdin_is_interactive = 0) then begin
+    if zSrc = 'cmdline' then
+      Result := Format('%s in %s command line argument:',
+                       [string(zErrorType), string(ordinalSuffix(lineno))])
+    else if zSrc = '<stdin>' then
+      Result := Format('%s near line %d:',
+                       [string(zErrorType), Int64(lineno)])
+    else
+      Result := Format('%s near line %d of %s:',
+                       [string(zErrorType), Int64(lineno), string(zSrc)]);
+  end else
+    Result := Format('%s:', [string(zErrorType)]);
+end;
+
 function runOneSqlLine(p: PShellState; const zSql: AnsiString;
                        const zSrc: AnsiString; lineno: i64): i32;
 { Hold zSql as a single immutable AnsiString and walk pCursor through its
@@ -1728,7 +1774,9 @@ begin
     pzTail := nil;
     rc := sqlite3_prepare_v2(p^.db, pCursor, -1, @pStmt, @pzTail);
     if rc <> SQLITE_OK then begin
-      shellEPutZ(Format('Parse error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+      shellEPutZ(Format('%s %s'#10,
+        [string(shellErrPrefix('Parse error', zSrc, lineno)),
+         AnsiString(sqlite3_errmsg(p^.db))]));
       Inc(Result);
       Exit;
     end;
@@ -1746,7 +1794,15 @@ begin
     p^.pStmt := nil;
     rc := sqlite3_finalize(pStmt);
     if (rc <> SQLITE_OK) and (rc <> SQLITE_DONE) then begin
-      shellEPutZ(Format('Runtime error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+      { Upstream's `sqlite3_format_query_result` captures the error into
+        zErrMsg (without "stepping, " prefix) before finalize is called,
+        so shell.c's dispatcher falls into the default "Error" arm
+        (shell.c:35784..35795).  "Runtime error" is reserved for the
+        narrow case where finalize fails *and* zErrMsg was not already
+        set — which we don't currently distinguish here. }
+      shellEPutZ(Format('%s %s'#10,
+        [string(shellErrPrefix('Error', zSrc, lineno)),
+         AnsiString(sqlite3_errmsg(p^.db))]));
       Inc(Result);
     end;
     if (pzTail = nil) or (pzTail = pCursor) then Exit;
@@ -7897,9 +7953,10 @@ begin
   end;
 
   { ---------------- REPL or bail ---------------- }
-  if readStdin then
-    Result := processInput(@state)
-  else
+  if readStdin then begin
+    state.zInFile := zStdinName;
+    Result := processInput(@state);
+  end else
     Result := 0;
 
   if state.db <> nil then begin
