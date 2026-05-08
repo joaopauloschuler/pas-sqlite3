@@ -4270,9 +4270,14 @@ begin
     begin
       if p^.op = TK_SELECT_COLUMN then
         pNew^.pLeft := p^.pLeft
+      else if p^.pLeft <> nil then
+        pNew^.pLeft := exprDup_(db, p^.pLeft, EXPRDUP_REDUCE, @sEdupBuf)
       else
-        pNew^.pLeft := exprDup_(db, p^.pLeft, EXPRDUP_REDUCE, @sEdupBuf);
-      pNew^.pRight := exprDup_(db, p^.pRight, EXPRDUP_REDUCE, @sEdupBuf);
+        pNew^.pLeft := nil;
+      if p^.pRight <> nil then
+        pNew^.pRight := exprDup_(db, p^.pRight, EXPRDUP_REDUCE, @sEdupBuf)
+      else
+        pNew^.pRight := nil;
     end else
     begin
       if p^.op = TK_SELECT_COLUMN then

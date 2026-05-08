@@ -2695,20 +2695,32 @@ existing dispatcher.
      DiagCreateIdx / DiagMoreFunc / DiagSampleProg / DiagTxn 0
      divergences.
 
-- [ ] **10.1.bug.56** `UPDATE <parent> SET <pk-col>=<value>` on a table
-     referenced by an `ON UPDATE CASCADE` foreign key crashes the shell
-     with `EAccessViolation: Access violation` even when the parent
-     row has no children.  Reproducer:
-     `PRAGMA foreign_keys=ON; CREATE TABLE p(id INTEGER PRIMARY KEY);
-     CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id)
-     ON UPDATE CASCADE); INSERT INTO p VALUES(1); UPDATE p SET id=99
-     WHERE id=1;` — Pas crashes; C completes successfully.  The
-     ON DELETE codepath was fixed under 10.1.bug.55 (sqlite3DeleteTable
-     missing FK / index / pCheck cleanup), but the UPDATE codegen path
-     trips a different access violation — likely fkActionTrigger
-     pChanges arm (insert.c update path) or fkScanChildren UPDATE-side
-     register layout.  Crash addresses differ from 10.1.bug.55's, so a
-     separate gap.
+- [X] **10.1.bug.56** Fixed 2026-05-08.  `UPDATE <parent> SET <pk-col>=<value>`
+     on a table referenced by an `ON UPDATE CASCADE` (or SET NULL)
+     foreign key crashed the shell with `EAccessViolation` inside
+     `dupedExprStructSize_` (codegen.pas:4133), reached via fkActionTrigger
+     → sqlite3ExprDup(EXPRDUP_REDUCE) on the synthesised trigger AST.
+     Root cause: `exprDup_` recursive children dup at codegen.pas:4274..4275
+     was missing the nil-guards that expr.c:1726..1730 has — when a leaf
+     TK_ID expression (no pLeft / no pRight) was duped under EXPRDUP_REDUCE,
+     `exprDup_(db, p^.pLeft=nil, …)` was invoked and crashed on
+     `dupedExprStructSize_(nil, …)` immediately on `ExprHasProperty(nil, …)`.
+     The TK_DOT(NEW, col)/TK_DOT(OLD, col) tree built inside fkActionTrigger
+     hits this path under any UPDATE-side FK action whose synth trigger
+     duplicates leaf TK_ID nodes; ON DELETE CASCADE didn't fire it because
+     its trigger synth follows a different shape.  Fix: ported the C
+     ternary `p->pLeft ? exprDup(...) : 0` (and the symmetric pRight)
+     into the dupFlags<>0 arm.  Verified byte-identical to upstream:
+     CASCADE updates 10's `pid` to 99; SET NULL nulls it; non-PK column
+     UPDATE still untouched.  TestExplainParity 1026/1026; TestSmoke /
+     TestDMLBasic 54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52 /
+     TestVdbeAgg 11/11 / TestSchemaBasic 44/44 / TestPrepareBasic 20/20 /
+     TestParser 45/45 / TestVdbeRecord 13/13 / TestWindowBasic 34/34 /
+     TestBytecodeParity 32/32 / TestWherePlanner 679/679 all clean;
+     DiagDml / DiagPragma / DiagFeatureProbe / DiagOps / DiagFunctions /
+     DiagWindow / DiagDate / DiagCast / DiagMisc / DiagDropTable /
+     DiagAnalyze / DiagIndexing / DiagCovering / DiagPredicates /
+     DiagCreateIdx / DiagMoreFunc / DiagSampleProg 0 divergences.
 
 - [X] **10.1.bug.54** Fixed 2026-05-08.  Casting / parsing a float literal
      whose magnitude exceeds the IEEE-754 double range crashed the shell
