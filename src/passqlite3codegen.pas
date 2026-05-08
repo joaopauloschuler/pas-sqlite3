@@ -21060,10 +21060,22 @@ begin
     we fall back to the prior single-pass path; that case still fails
     for recursive CTEs but the explicit-column form covers the common
     `WITH RECURSIVE r(...) AS (...)` shape. }
-  if ((pSel^.selFlags and SF_Recursive) <> 0) and (pCt^.pCols <> nil)
-     and (pTab^.nCol = 0) then
+  if ((pSel^.selFlags and SF_Recursive) <> 0) and (pTab^.nCol = 0) then
   begin
-    sqlite3ColumnsFromExprList(pParse, pCt^.pCols, @pTab^.nCol, @pTab^.aCol);
+    if pCt^.pCols <> nil then
+      sqlite3ColumnsFromExprList(pParse, pCt^.pCols, @pTab^.nCol, @pTab^.aCol)
+    else
+    begin
+      { Inferred-column form `WITH RECURSIVE r AS (...)`: derive column
+        names from the leftmost (anchor) SELECT's pEList BEFORE running
+        SelectPrep on the compound, so the recursive arm's `r.col`
+        references can resolve against pTab^.aCol. }
+      pLeft := pSel;
+      while pLeft^.pPrior <> nil do pLeft := pLeft^.pPrior;
+      if pLeft^.pEList <> nil then
+        sqlite3ColumnsFromExprList(pParse, pLeft^.pEList,
+                                   @pTab^.nCol, @pTab^.aCol);
+    end;
     if pParse^.nErr <> 0 then begin Result := 2; Exit; end;
   end;
   pCt^.zCteErr := PAnsiChar('circular reference: %s');

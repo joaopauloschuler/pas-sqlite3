@@ -2541,20 +2541,28 @@ existing dispatcher.
      Follow-up bug 10.1.bug.27 below tracks the residual implicit-name
      resolution gap.
 
-- [ ] **10.1.bug.27** Recursive CTE without explicit column-name list
-     loses the recursive arm.  Reproducer: `CREATE TABLE p(a INT,b INT);
-     INSERT INTO p VALUES(1,NULL),(2,1),(3,1); WITH RECURSIVE r AS
+- [X] **10.1.bug.27** Fixed 2026-05-08.  Recursive CTE without explicit
+     column-name list lost the recursive arm: `WITH RECURSIVE r AS
      (SELECT a,b FROM p WHERE b IS NULL UNION ALL SELECT p.a,p.b FROM p
-     JOIN r ON p.b=r.a) SELECT * FROM r;` returns just the anchor row
-     `[1,]`; the explicit `WITH RECURSIVE r(a,b) AS (...)` form returns
-     `[1,];[2,1];[3,1]` correctly.  Same two SQLs differ only by whether
-     the CTE column-name list is spelled out.  Hypothesis: when columns
-     are inferred from the first SELECT (rather than declared via the
-     `r(a,b)` parenthesised list), the recursive arm's `r.a` reference
-     resolves against the wrong scope or fails to bind the recursive
-     pseudo cursor.  Likely a name-resolution gap in
-     `sqlite3WithAdd`/`resolveFromTermToCte` where the inferred-column
-     path doesn't seed pTab^.aCol the way the explicit path does.
+     JOIN r ON p.b=r.a) SELECT * FROM r;` returned just the anchor row
+     `[1,]`.  Root cause: `resolveFromTermToCte` (passqlite3codegen.pas
+     ~21063) only pre-populated pTab^.aCol from `pCt^.pCols` when the
+     explicit `r(a,b)` list was present; for the inferred form pTab^.aCol
+     was empty during `sqlite3SelectPrep`, so the recursive arm's `r.a`
+     reference could not bind to a column.  Mirrors C select.c:5793..5839
+     where the SETUP-term walk + column derivation happens BEFORE the
+     full-compound walk re-traverses the recursive arm.  Fix: extend the
+     pre-populate arm to fall back to the leftmost SELECT's pEList when
+     `pCt^.pCols` is nil — column names come from `Expr.u.zToken` for the
+     typical TK_ID anchor expressions, which is set during parsing
+     (pre-resolution).  Verified: inferred-column form now returns
+     `[1,];[2,1];[3,1]` byte-identical to upstream.  TestExplainParity
+     1026/1026; TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13
+     all clean; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma /
+     DiagFunctions / DiagTxn / DiagMisc / DiagCast all 0 divergences;
+     DiagWindow holds at the pre-existing 2 (bug 6.29).
 
 - [X] **10.1.bug.24** Fixed 2026-05-08.  `lag()` and `lead()` window
      functions returned incorrect values (literal `0` for first row, and
