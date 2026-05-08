@@ -9745,8 +9745,14 @@ begin
       p2    := sqlite3BtreePayloadSize(pCrsr);
       if p2 >= u32(db^.aLimit[0]) { SQLITE_LIMIT_LENGTH } then goto too_big;
       if sqlite3VdbeMemFromBtreeZeroOffset(pCrsr, p2, pDest) <> 0 then goto no_mem;
-      if pOp^.p3 = 0 then
-        pDest^.flags := pDest^.flags and not MEM_Zero;
+      { vdbe.c:6138 — when p3=0, Deephemeralize the result so the row data
+        survives subsequent cursor mutations (e.g. OP_Delete on the same
+        cursor immediately after, as the recursive-CTE FIFO consumer does). }
+      if pOp^.p3 = 0 then begin
+        if (pDest^.flags and MEM_Ephem) <> 0 then begin
+          if sqlite3VdbeMemMakeWriteable(pDest) <> SQLITE_OK then goto no_mem;
+        end;
+      end;
     end;
 
     { ────── OP_RowCell ────── (vdbe.c:5847) }

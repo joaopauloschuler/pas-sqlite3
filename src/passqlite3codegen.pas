@@ -21207,6 +21207,14 @@ begin
   if (pCur <> nil) and (pCur^.pSrc <> nil) then
   begin
     pSrc := pCur^.pSrc;
+    { select.c:5996 — assign cursors to every FROM item BEFORE diving into
+      withExpand / resolveFromTermToCte.  Without this pre-pass, the recursive
+      arm of a CTE allocates its iRecTab from pParse^.nTab while the outer
+      reference still has iCursor=-1, so the recursive table ends up with a
+      lower cursor index than the outer.  The mismatch corrupts cursor state
+      when the outer SELECT * FROM tree path-touches cursor 0 (which is also
+      the recursive-tree pseudo cursor). }
+    sqlite3SrcListAssignCursors(pParse, pSrc);
     base := SrcListItems(pSrc);
     for i := 0 to pSrc^.nSrc - 1 do
     begin

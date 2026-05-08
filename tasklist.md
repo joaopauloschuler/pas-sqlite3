@@ -2499,6 +2499,63 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.26** Fixed 2026-05-08.  Recursive CTE whose recursive
+     arm joins the self-reference against another table corrupted rows
+     when the inner JOIN produced more than one row per iteration.
+     Reproducer: `WITH RECURSIVE tree(id,parent) AS (SELECT id,parent
+     FROM p WHERE parent IS NULL UNION ALL SELECT p.id,p.parent FROM
+     tree JOIN p ON p.parent=tree.id) SELECT * FROM tree;` on a 3-row
+     parent/child table — Pas returned `[1,];[NULL,NULL];[3,1]` instead
+     of `[1,];[2,1];[3,1]`.  Cross-join variants (`SELECT p.id FROM tree,p
+     WHERE tree.x<5`) returned `1, blank, 20` instead of `1, 10, 20`.
+     Two faithful 1:1 omissions vs C:
+     1. **`OP_RowData` skipped Deephemeralize** — vdbe.c:6138
+        `if (!pOp->p3) Deephemeralize(pOut);` calls
+        sqlite3VdbeMemMakeWriteable when MEM_Ephem is set so the row
+        data survives subsequent cursor mutations.  Pas only cleared
+        MEM_Zero (an unrelated flag), leaving the destination register
+        pointing into the btree page payload.  When OP_Delete on the
+        same cursor immediately followed (the recursive-CTE FIFO
+        consumer pattern), the page rearranged its cell area and the
+        ephemeral pointer started reading garbage / overwritten bytes.
+        Restored Deephemeralize: when p3=0 and flags has MEM_Ephem, call
+        sqlite3VdbeMemMakeWriteable to copy into owned memory.
+     2. **selectExpander missed sqlite3SrcListAssignCursors pre-pass** —
+        select.c:5996 assigns iCursor to every FROM item BEFORE the
+        loop that calls resolveFromTermToCte / withExpand.  Without
+        this, a recursive CTE's inner self-reference allocated its
+        cursor index ahead of the outer reference, producing a
+        bytecode-level cursor numbering shift (Pas had pseudo cursor=0
+        instead of cursor=1).  Cursor 0 then collided with aMem[0]
+        cursor-storage.  Added the pre-pass call at the top of the
+        FROM-resolution loop in sqlite3SelectExpand.
+     Verified: 5-row tree-traversal returns full path correctly;
+     cross-join recursive emits all rows.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13
+     all clean; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma /
+     DiagFunctions / DiagTxn / DiagMisc / DiagCast / DiagAnalyze /
+     DiagDate / DiagDropTable / DiagCovering / DiagIndexing all 0
+     divergences; DiagWindow holds at the pre-existing 2 (bug 6.29).
+     Follow-up bug 10.1.bug.27 below tracks the residual implicit-name
+     resolution gap.
+
+- [ ] **10.1.bug.27** Recursive CTE without explicit column-name list
+     loses the recursive arm.  Reproducer: `CREATE TABLE p(a INT,b INT);
+     INSERT INTO p VALUES(1,NULL),(2,1),(3,1); WITH RECURSIVE r AS
+     (SELECT a,b FROM p WHERE b IS NULL UNION ALL SELECT p.a,p.b FROM p
+     JOIN r ON p.b=r.a) SELECT * FROM r;` returns just the anchor row
+     `[1,]`; the explicit `WITH RECURSIVE r(a,b) AS (...)` form returns
+     `[1,];[2,1];[3,1]` correctly.  Same two SQLs differ only by whether
+     the CTE column-name list is spelled out.  Hypothesis: when columns
+     are inferred from the first SELECT (rather than declared via the
+     `r(a,b)` parenthesised list), the recursive arm's `r.a` reference
+     resolves against the wrong scope or fails to bind the recursive
+     pseudo cursor.  Likely a name-resolution gap in
+     `sqlite3WithAdd`/`resolveFromTermToCte` where the inferred-column
+     path doesn't seed pTab^.aCol the way the explicit path does.
+
 - [X] **10.1.bug.24** Fixed 2026-05-08.  `lag()` and `lead()` window
      functions returned incorrect values (literal `0` for first row, and
      constant `1` for subsequent rows).  Root cause: in `windowAggStep`
