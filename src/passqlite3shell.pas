@@ -5148,6 +5148,45 @@ begin
   Result := SQLITE_OK;
 end;
 
+{ 10.1.47 — `.session ?NAME? CMD ...` (shell.c.in:10719..10918).
+
+  Session-extension dispatcher.  The session extension itself
+  (../sqlite3/ext/session/sqlite3session.c) is not yet ported, so every
+  sub-command emits the upstream "session not compiled in" breadcrumb
+  via the same idiom the upstream code uses when SQLITE_ENABLE_SESSION
+  is undefined: silently no-op the unknown-name fall-through with a
+  showHelp-equivalent line.  Once the session extension lands, this
+  stub will be expanded into the full attach / changeset / patchset /
+  close / enable / filter / indirect / isempty / list / open matrix. }
+
+procedure cmdSession(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt);
+begin
+  if (p = nil) or (nArg = 0) then
+    ;
+  if Length(args) > 0 then
+    ; { suppress unused-param warning }
+  shellEPutZ('Error: session extension not compiled in to this build.'#10);
+end;
+
+{ 10.1.38 — `.iotrace FILE|off|on` (shell.c.in:8946..8993).
+
+  Wires sqlite3IoTrace to the named file (or stdout on `on`, /dev/null
+  on `off`).  The upstream global is gated on SQLITE_ENABLE_IOTRACE; the
+  Pascal port has the dispatch surface (passqlite3vdbe.pas:4122) but no
+  installed sink because sqlite3VdbeIOTraceSql is a no-op stub.  Stub
+  here matches the convention used by .scanstats — record the request
+  and emit a "not available" breadcrumb so partial landings don't fall
+  through to the unknown-command arm. }
+
+procedure cmdIotrace(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt);
+begin
+  if (p = nil) or (nArg = 0) or (Length(args) = 0) then
+    ;
+  shellEPutZ('Warning: .iotrace not available in this build.'#10);
+end;
+
 procedure cmdRecover(p: PShellState; const args: array of AnsiString;
                     nArg: SizeInt);
 var
@@ -6908,6 +6947,8 @@ begin
   if zCmd = 'lint'      then begin cmdLint(p, args, nArg); Exit; end;
   if zCmd = 'expert'    then begin cmdExpert; Result := 1; Exit; end;
   if zCmd = 'recover'   then begin cmdRecover(p, args, nArg); Exit; end;
+  if zCmd = 'session'   then begin cmdSession(p, args, nArg); Exit; end;
+  if zCmd = 'iotrace'   then begin cmdIotrace(p, args, nArg); Exit; end;
   if (zCmd = 'selecttrace') or (zCmd = 'wheretrace')
      or (zCmd = 'treetrace') then
   begin cmdTraceFlags(zCmd); Exit; end;

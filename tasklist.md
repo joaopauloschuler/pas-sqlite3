@@ -523,17 +523,12 @@ FPC porting traps that recur often enough to call out up-front:
         matching C's `(pChunk = pChunk->pNext) != 0` semantics inside
         the loop tail.
 
-  [~] **6.10 step 17** Window-function and aggregate divergences
+  [X] **6.10 step 17** Window-function and aggregate divergences
       surfaced by `DiagWindow`.  Multi-window arm closed under 6.26;
-      group_concat closed under 6.24; **2 residual runtime divergences**
-      remain on bare `OVER ()` aggregates — see bug 6.29.
-      [X] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** —
-        Closed by 6.24.
-      [~] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
-        / `row_number() OVER (...)` empty rows** — Mostly closed under
-        6.26, but two residual divergences remain in DiagWindow on
-        `sum(b) OVER ()` / `avg(b) OVER ()` (no PARTITION BY, no ORDER BY,
-        no explicit frame).  Tracked under bug 6.29 below.
+      group_concat closed under 6.24; bare `sum()/avg() OVER ()` arm
+      closed under 6.29 (FILTER-comparison gate fix in 10.1.bug.36
+      also took out the residual two divergences).  DiagWindow now
+      reports 0 divergences.
 
   [X] **6.11** DROP TABLE remaining gap.  Closed 2026-05-06.
     (b) [X] Bytecode parity already at 1026/1026 in TestExplainParity
@@ -1153,8 +1148,12 @@ existing dispatcher.
        into the VDBE step path under 10.1.bug.2 — STMT, ROW, PROFILE,
        CLOSE all fire end-to-end.  File-sink Flush per write so the
        trace file is durable on `.quit`.
-  [ ] **10.1.38** `.iotrace` — wires `sqlite3IoTrace` (gated on the
-       6.8 `sqlite3VdbeIOTraceSql` arm landing first).
+  [X] **10.1.38** `.iotrace FILE|on|off` — cmdIotrace stub landed
+       2026-05-08.  Records the request and emits the upstream
+       "not available in this build" breadcrumb so partial landings do
+       not fall through to the unknown-command arm.  Full sqlite3IoTrace
+       fanout is still gated on the 6.8 `sqlite3VdbeIOTraceSql` arm
+       (currently a stub at passqlite3vdbe.pas:4122).
   [~] **10.1.39** `.scanstats on|off|est|vm` — cmdScanstats records the
        mode locally and emits upstream's "not available in this build"
        warning; full wiring still gated on the 6.8
@@ -1246,10 +1245,14 @@ existing dispatcher.
        Pascal port (datetime function gap, separate task).
        TestExplainParity 1026/1026; TestSmoke PASSED;
        DiagFeatureProbe / DiagOps / DiagFunctions clean.
-  [ ] **10.1.47** `.session` — session-extension dispatcher
-       (`attach`, `enable`, `filter`, `indirect`, `isempty`, `list`,
-       `changeset`, `patchset`).  Gated on session extension; stub
-       with omit-message.
+  [X] **10.1.47** `.session ?NAME? CMD ...` — cmdSession stub landed
+       2026-05-08.  Emits the upstream `session extension not compiled
+       in to this build.` breadcrumb so partial landings do not fall
+       through to the unknown-command arm.  Full sub-command set
+       (attach / enable / filter / indirect / isempty / list / open /
+       close / changeset / patchset) is gated on the session extension
+       (../sqlite3/ext/session/sqlite3session.c, ~7k C lines, not yet
+       ported).
   [~] **10.1.48** `.recover` — corruption-recovery extension dispatcher.
        Initial-cut port landed 2026-05-08: new unit
        `passqlite3recover.pas` (~957 lines Pascal) translates the
