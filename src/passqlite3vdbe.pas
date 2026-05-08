@@ -11671,6 +11671,15 @@ function sqlite3VdbeMemExpandBlob(pMem: PMem): i32;
 var
   nByte: i32;
 begin
+  { Mirror the upstream `ExpandBlob` macro guard (vdbeInt.h):
+    only act when MEM_Zero is set.  Without this, calls from
+    OP_IdxInsert / OP_MakeRecord / OP_String8 etc. that pass a plain
+    blob would expand by `pMem^.u.nZero` bytes of garbage from the
+    Mem union, growing `.n` past the actual blob length and
+    triggering "database disk image is malformed" downstream. }
+  if (pMem^.flags and MEM_Zero) = 0 then begin
+    Result := SQLITE_OK; Exit;
+  end;
   nByte := pMem^.n + pMem^.u.nZero;
   if nByte <= 0 then begin
     if (pMem^.flags and MEM_Blob) = 0 then begin Result := SQLITE_OK; Exit; end;

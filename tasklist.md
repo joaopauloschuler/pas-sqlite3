@@ -2471,17 +2471,28 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
-- [ ] **10.1.bug.22** `WITH RECURSIVE c(x) AS (SELECT 1 UNION SELECT x+1
-     FROM c WHERE x<5) SELECT * FROM c;` returns just the anchor row `1`
-     followed by `Runtime error: database disk image is malformed`.  Same
-     query with `UNION ALL` works fine (returns 1..5).  Bytecode now
-     matches C for the dedup pattern (Found+IdxInsert pair) after
-     10.1.bug.23 close — corruption is a separate runtime issue, suspected
-     in the iCurrent pseudo-cursor numbering (Pascal allocates iCurrent=0
-     vs C's iCurrent=1) or the OP_Found / IdxInsert path on the dedup
-     ephemeral cursor 3 during the second dequeue iteration.  Repro:
-     `bin/passqlite3 :memory: "WITH RECURSIVE c(x) AS (SELECT 1 UNION
-     SELECT x+1 FROM c WHERE x<5) SELECT * FROM c;"`.
+- [X] **10.1.bug.22** Fixed 2026-05-08.  `WITH RECURSIVE c(x) AS (SELECT 1
+     UNION SELECT x+1 FROM c WHERE x<N) SELECT * FROM c;` now returns
+     1..N byte-identical to upstream.  Root cause: `sqlite3VdbeMemExpandBlob`
+     (passqlite3vdbe.pas:11712) ran unconditionally instead of checking
+     `MEM_Zero` first like the upstream `ExpandBlob` macro
+     (vdbeInt.h).  Without the guard the function read garbage from
+     `pMem^.u.nZero` (the union slot is shared with `u.i` for plain
+     blobs) and grew `.n` by that amount, padding the MakeRecord
+     output with stale zero bytes.  In the recursive-CTE path
+     OP_IdxInsert calls ExpandBlob on the dedup-key blob in reg 4,
+     which then wrote a 4-byte payload into the FIFO ephemeral
+     instead of 3 bytes; on the next dequeue iteration OP_Column
+     parsed the trailing zero as off-the-end and raised
+     SQLITE_CORRUPT_BKPT ("database disk image is malformed").  Fix:
+     early-return SQLITE_OK from `sqlite3VdbeMemExpandBlob` when
+     `MEM_Zero` is not set, matching the C macro semantics.  Verified:
+     UNION recursive CTE returns 1..5; UNION ALL still works;
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11 /
+     TestSchemaBasic 44/44 all clean; DiagFeatureProbe / DiagOps /
+     DiagFunctions / DiagDml / DiagPragma / DiagCast / DiagMisc /
+     DiagTxn all 0 divergences.
 
 - [X] **10.1.bug.23** Fixed 2026-05-08.  Recursive CTE / generateOutputSubroutine
      SRT_DistFifo and SRT_DistQueue arms missed the upstream OP_Found
