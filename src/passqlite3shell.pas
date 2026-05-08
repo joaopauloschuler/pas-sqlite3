@@ -1794,15 +1794,21 @@ begin
     p^.pStmt := nil;
     rc := sqlite3_finalize(pStmt);
     if (rc <> SQLITE_OK) and (rc <> SQLITE_DONE) then begin
-      { Upstream's `sqlite3_format_query_result` captures the error into
-        zErrMsg (without "stepping, " prefix) before finalize is called,
-        so shell.c's dispatcher falls into the default "Error" arm
-        (shell.c:35784..35795).  "Runtime error" is reserved for the
-        narrow case where finalize fails *and* zErrMsg was not already
-        set — which we don't currently distinguish here. }
-      shellEPutZ(Format('%s %s'#10,
-        [string(shellErrPrefix('Error', zSrc, lineno)),
-         AnsiString(sqlite3_errmsg(p^.db))]));
+      { Upstream shell_exec (shell.c.in:3376) saves step errors with a
+        "stepping, " prefix into zErrMsg; the dispatcher
+        (shell.c.in:12328..12330) then promotes that to "Runtime error".
+        Mirror that here: when the step rc itself is an error the user
+        sees "Runtime error"; when only finalize fails (no step error)
+        we fall through to the generic "Error" arm. }
+      if (stepRc <> SQLITE_DONE) and (stepRc <> SQLITE_ROW)
+         and (stepRc <> SQLITE_OK) then
+        shellEPutZ(Format('%s %s'#10,
+          [string(shellErrPrefix('Runtime error', zSrc, lineno)),
+           AnsiString(sqlite3_errmsg(p^.db))]))
+      else
+        shellEPutZ(Format('%s %s'#10,
+          [string(shellErrPrefix('Error', zSrc, lineno)),
+           AnsiString(sqlite3_errmsg(p^.db))]));
       Inc(Result);
     end;
     if (pzTail = nil) or (pzTail = pCursor) then Exit;

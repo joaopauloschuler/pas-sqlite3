@@ -2648,6 +2648,25 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.68** Fixed 2026-05-08.  Step-time errors (e.g.
+     `SELECT abs(-9223372036854775808);` with stdin pipe) printed
+     `Error near line 1: integer overflow` instead of upstream's
+     `Runtime error near line 1: integer overflow`.  Bug.65 had over-
+     corrected the prefix to a hard-coded "Error" for every finalize
+     failure.  Upstream shell.c.in:12328..12330 promotes the prefix to
+     "Runtime error" whenever the captured zErrMsg starts with
+     "stepping, " (set by save_err_msg in shell_exec at shell.c.in:3376
+     after a step failure).  Fix: track the step rc in `runOneSqlLine`
+     (passqlite3shell.pas:1751) and, when the step itself returned an
+     error (not DONE/ROW/OK), emit the "Runtime error" prefix; otherwise
+     fall through to "Error".  Verified: `echo 'SELECT abs(-9223372036854775808);'
+     | bin/passqlite3 :memory:` now byte-matches upstream;
+     `SELECT * FRO;` and finalize-only failures still use "Error" /
+     "Parse error" as appropriate.  TestExplainParity 1026/1026;
+     DiagPubApi 259/259; DiagFeatureProbe / DiagOps / DiagPragma /
+     DiagFunctions / DiagDml / DiagWindow / DiagMisc / DiagCast /
+     DiagDate / DiagTxn / DiagSampleProg 0 divergences.
+
 - [X] **10.1.bug.65** Fixed 2026-05-08.  Shell error messages omitted the
      upstream "near line N:" / "in Nth command line argument:" qualifier and
      used the wrong type label, so `SELECT abs(-9223372036854775808);`
