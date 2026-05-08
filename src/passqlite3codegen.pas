@@ -21085,14 +21085,19 @@ begin
         pNew := sqlite3ExprListAppend(pParse, pNew, pColExpr);
       end;
     end;
-    if (zTName <> nil) and (not tableSeen) then
+    if not tableSeen then
     begin
-      zMsg := sqlite3MPrintf(db, 'no such table: %s', [zTName]);
-      if zMsg <> nil then
+      if zTName <> nil then
       begin
-        sqlite3ErrorMsg(pParse, zMsg);
-        sqlite3DbFree(db, zMsg);
-      end;
+        zMsg := sqlite3MPrintf(db, 'no such table: %s', [zTName]);
+        if zMsg <> nil then
+        begin
+          sqlite3ErrorMsg(pParse, zMsg);
+          sqlite3DbFree(db, zMsg);
+        end;
+      end
+      else
+        sqlite3ErrorMsg(pParse, 'no tables specified');
     end;
   end;
 
@@ -21623,7 +21628,7 @@ begin
     with one TK_COLUMN entry per visible (non-HIDDEN, non-VIRTUAL)
     column of every resolved FROM item.  T.* form is not yet handled. }
   if (pSelect <> nil) and (pSelect^.pEList <> nil)
-     and (pSelect^.pSrc <> nil) and (pSelect^.pSrc^.nSrc > 0)
+     and (pSelect^.pSrc <> nil)
   then
     expandStar(pParse, pSelect);
 

@@ -2706,13 +2706,24 @@ existing dispatcher.
      DiagDate / DiagPredicates / DiagAnalyze / DiagIndexing /
      DiagTxn 0 divergences.
 
-- [ ] **10.1.bug.67** `SELECT *;` (bare star with no FROM clause) is
-     silently accepted by Pas (returns nothing, exit 0).  Upstream
-     raises `Parse error near line 1: no tables specified`
-     (select.c:6320 — `expandStar` arm where `tableSeen` stays 0
-     after the SELECT-list walk and `zTName==NULL`).  The Pas port
-     of `expandStar` does not emit this error.  Surface during
-     10.2 integration parity sweeps.
+- [X] **10.1.bug.67** Fixed 2026-05-08.  `SELECT *;` (bare star with no
+     FROM clause) was silently accepted by Pas (returns nothing, exit 0)
+     instead of upstream's `Parse error near line 1: no tables specified`
+     (select.c:6320).  Two-line fix:
+     (1) `expandStar` (codegen.pas:21088) extended to emit
+         `no tables specified` when `tableSeen` stays False with
+         `zTName=nil` (mirrors select.c:6316..6322 — already covered the
+         `zTName<>nil` arm with `no such table: %s`);
+     (2) `sqlite3SelectExpand` caller (codegen.pas:21630) relaxed the
+         pre-call guard from `pSrc^.nSrc > 0` to `pSrc <> nil` so the
+         expander runs and the error fires when nSrc=0.  Verified:
+     `echo 'SELECT *;' | bin/passqlite3 :memory:` now exits 1 with
+     `Parse error near line 1: no tables specified`, byte-identical to
+     upstream.  TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54
+     / TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11 /
+     TestSchemaBasic 44/44 / TestPrepareBasic 20/20 / TestParser 45/45 all
+     pass; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma / DiagFunctions
+     / DiagMisc / DiagWindow / DiagCast / DiagDate all 0 divergences.
 
 - [X] **10.1.bug.64** Fixed 2026-05-08.  `SELECT … FROM t HAVING <pred>`
      (HAVING without GROUP BY and without any aggregate) silently produced
