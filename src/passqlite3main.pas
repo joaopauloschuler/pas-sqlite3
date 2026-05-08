@@ -2632,7 +2632,11 @@ begin
         tblHash); sqlite3FindIndex handles indexes. }
       if (zArg1 <> nil)
          and ((sqlite3FindTable(db, zArg1, db^.aDb[iDb].zDbSName) <> nil)
-              or (sqlite3FindIndex(db, zArg1, db^.aDb[iDb].zDbSName) <> nil)) then
+              or (sqlite3FindIndex(db, zArg1, db^.aDb[iDb].zDbSName) <> nil)
+              or ((db^.aDb[iDb].pSchema <> nil)
+                  and (sqlite3HashFind(
+                         @passqlite3util.PSchema(db^.aDb[iDb].pSchema)^.trigHash,
+                         PChar(zArg1)) <> nil))) then
       begin
         Result := 0; Exit;
       end;
