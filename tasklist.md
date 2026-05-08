@@ -1250,8 +1250,77 @@ existing dispatcher.
        (`attach`, `enable`, `filter`, `indirect`, `isempty`, `list`,
        `changeset`, `patchset`).  Gated on session extension; stub
        with omit-message.
-  [ ] **10.1.48** `.recover` — corruption-recovery extension dispatcher.
-       Gated on recover extension; stub with omit-message.
+  [~] **10.1.48** `.recover` — corruption-recovery extension dispatcher.
+       Initial-cut port landed 2026-05-08: new unit
+       `passqlite3recover.pas` (~957 lines Pascal) translates the
+       foundation of `../sqlite3/ext/recover/sqlite3recover.c` (~2901
+       lines C).  Coverage:
+         * Public API surface — `sqlite3_recover_init`,
+           `sqlite3_recover_init_sql`, `sqlite3_recover_config`,
+           `sqlite3_recover_step`, `sqlite3_recover_run`,
+           `sqlite3_recover_errcode`, `sqlite3_recover_errmsg`,
+           `sqlite3_recover_finish`.
+         * All public types — `sqlite3_recover`, `RecoverTable`,
+           `RecoverColumn`, `RecoverBitmap`, `RecoverStateW1`,
+           `RecoverStateLAF` — plus the `RECOVER_STATE_*` /
+           `RECOVER_EHIDDEN_*` / `SQLITE_RECOVER_*` constants.
+         * Shared helpers ported 1:1 — `recoverStrlen`, `recoverMalloc`,
+           `recoverError`, `recoverDbError`, `recoverBitmap{Alloc,
+           Free,Set,Query}`, `recoverPrepare`, `recoverPreparePrintf`,
+           `recoverReset`, `recoverFinalize`, `recoverExec`,
+           `recoverBindValue`, `recoverMPrintf`, `recoverPageCount`.
+         * SQL UDFs registered on the output handle —
+           `read_i32(BLOB,IDX)`, `page_is_used(PGNO)`,
+           `getpage(PGNO)`, `escape_crlf(QUOTED)` — translated cdecl
+           trampolines using the existing port pattern.
+         * `recoverSqlCallback`, `recoverTransferSettings` (open temp
+           db; transfer `encoding/page_size/auto_vacuum/user_version/
+           application_id` PRAGMA values into the output db via the
+           backup API), `recoverOpenOutput` (registers
+           `sqlite_dbdata`/`sqlite_dbptr` via `sqlite3DbdataRegister`
+           plus the four UDFs), `recoverOpenRecovery` (ATTACH state
+           db + create `recovery.map` / `recovery.schema` tables),
+           `recoverCacheSchema` (the WITH RECURSIVE pages CTE).
+         * `recoverInit` allocator with trailing zDb/zUri buffer.
+         * `recoverFinalCleanup` walks the in-memory pTblList and
+           closes the output db.
+         * Initial `recoverStep` state-machine: drives RECOVER_STATE_INIT
+           through OpenOutput → BEGIN on input → TransferSettings →
+           OpenRecovery → CacheSchema, then short-circuits to DONE.
+       Pascal-port adaptations:
+         * `recoverMPrintf` / `recoverPreparePrintf` accept
+           `array of const` instead of C va_list (route through
+           sqlite3PfMprintf — same convention as intck/amatch).
+         * The `RecoverGlobal recover_g` static is omitted in this
+           initial cut because the wrapper VFS is not yet ported.
+         * `recoverEscapeCrlf` rewrites the literal-string copies as
+           explicit prefix/tail/separator buffers (Pascal `Move(...)`
+           calls take addressable PAnsiChar locals rather than C's
+           `memcpy(dst, "literal", N)` shortcut).
+       Deferred (subsequent commits):
+         * `recoverNewTable` / `recoverAddTable` / `recoverFindTable`
+           schema-synthesis pass.
+         * `recoverWriteSchema1` / `recoverWriteSchema2` /
+           `recoverInsertStmt` per-table emit pipeline.
+         * `recoverWriteDataInit` / `recoverWriteDataStep` /
+           `recoverWriteDataCleanup` data-extraction loop
+           (RECOVER_STATE_WRITING).
+         * `recoverLostAndFound{1,2,3}{Init,Step}` orphan recovery
+           pipeline.
+         * `recoverVfs*` shim for page-1 header validation +
+           `recoverInstallWrapper` / `recoverUninstallWrapper`.
+         * `recoverIsValidPage` + `recoverGetU16` / `U32` / `Varint`
+           helpers used by the wrapper VFS.
+       The shell `.recover` dispatcher (`cmdRecover`) still emits
+       the upstream "this build does not support .recover" stub
+       because the engine state machine is incomplete.  Once the
+       deferred pieces land, the shell command can be wired through
+       `sqlite3_recover_init` → `_run` → `_finish`.
+       Verified: full src/tests/build.sh green; TestExplainParity
+       1026/1026; TestSmoke PASS; sanity probe (open input db,
+       `recover_init` + `recover_run` + `recover_finish`) walks
+       the INIT state cleanly and reports a recover error message
+       when the state-db ATTACH fails (expected pre-engine-port).
   [X] **10.1.49** `.dbinfo` — cmdDbinfo reads the 100-byte page-1
        header via `SELECT data FROM sqlite_dbpage(?) WHERE pgno=1`
        and prints the canonical field/query block; also calls
