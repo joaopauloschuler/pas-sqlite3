@@ -17097,7 +17097,11 @@ begin
               colUsedB := colUsedB shr 1;
               Inc(nP4Cols);
             end;
-            sqlite3VdbeChangeP4(v, -1, Pointer(PtrInt(nP4Cols)), P4_INT32);
+            { Bug 6.29 guard: see twin comment below — when colUsed=0 the
+              reduction would zero p4, leading to aType[]/aOffset[] overlap
+              in OP_Column.  Keep the initial nNVCol value in that case. }
+            if nP4Cols > 0 then
+              sqlite3VdbeChangeP4(v, -1, Pointer(PtrInt(nP4Cols)), P4_INT32);
           end;
           sqlite3VdbeChangeP5(v, 0);
           { where.c:7310..7316 — for inner-join tables at level >= 2 whose
@@ -17277,7 +17281,16 @@ begin
         colUsedB := colUsedB shr 1;
         Inc(nP4Cols);
       end;
-      sqlite3VdbeChangeP4(v, -1, Pointer(PtrInt(nP4Cols)), P4_INT32);
+      { Bug 6.29 guard: when colUsed propagation breaks (e.g. window rewrite
+        replaces pSrc and the new src item never has its colUsed bits marked
+        by name resolution), nP4Cols comes out as 0.  An OP_OpenRead with
+        p4=nField=0 leads to allocateCursor reserving 0 slots in aType[]; the
+        OP_Column lazy header parser then writes aType[0..N-1] over aOffset[0],
+        corrupting the header offsets on the second column read.  When the
+        reduction would yield 0, leave the initial nNVCol value emitted by
+        sqlite3OpenTable. }
+      if nP4Cols > 0 then
+        sqlite3VdbeChangeP4(v, -1, Pointer(PtrInt(nP4Cols)), P4_INT32);
     end;
     sqlite3VdbeChangeP5(v, 0);
   end;

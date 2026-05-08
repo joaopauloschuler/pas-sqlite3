@@ -286,89 +286,62 @@ FPC porting traps that recur often enough to call out up-front:
     (UNION/EXCEPT/INTERSECT and ORDER BY merge across two real-FROM
     arms) is unaffected by this fix and tracked separately.
 
-- [ ] **6.29** `sum(b) OVER ()` / `avg(b) OVER ()` (no PARTITION BY,
-    no ORDER BY, no explicit frame) returns wrong values.  On a 3-row
-    `t(a INTEGER, b INTEGER)` with rows (1,10),(2,20),(3,30) the Pascal
-    port returns `[1,9];[null,9];[null,9]` instead of the C reference
-    `[1,60];[2,60];[3,60]`.  Bytecode (EXPLAIN) is byte-identical to C
-    apart from the source-iteration strategy (Pas uses an OpenEphemeral/
-    Sorter cursor 5; C uses InitCoroutine/Yield).  The structural
-    layout — outer scan inserting into eph cursor 1/2/3/4 (OpenDup
-    chain), inner second-pass `Rewind 2 / Column 4 1 / AggStep / Next 4`
-    sub-loop driving `AggValue`, then `Gosub / Delete / Next 1` to
-    output — is identical.  The same query rewritten with
-    `OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
-    FOLLOWING)` returns the correct sum=60, so the bug is gated on
-    "no ORDER BY" path (windowFullScan vs default-step dispatch).
-    Suspected: cursor 4 (OpenDup of the partition-eph) doesn't see the
-    rows inserted after its initial `Rewind 4` at first-row partition-
-    init time, so AggStep accumulates only the row that existed at
-    Rewind time.  Repro: `bin/passqlite3 :memory: <<<'CREATE TABLE
-    t(a INTEGER,b INTEGER); INSERT INTO t VALUES(1,10),(2,20),(3,30);
-    SELECT a, sum(b) OVER () FROM t;'`.  Verified with `RANGE/ROWS
-    BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` (also fails)
-    and `PARTITION BY 1` (also fails) — common factor is "no ORDER BY".
+- [X] **6.29** Fixed 2026-05-08.  `sum(b) OVER ()` / `avg(b) OVER ()`
+    (and any aggregate-over-window with no PARTITION BY / ORDER BY)
+    returned `[1,9];[null,9];[null,9]` instead of `[1,sum];[2,sum];[3,sum]`.
+    Root cause: not the windowFullScan / OpenDup arms (those were
+    fine), but a colUsed-propagation gap that surfaced one layer down.
+    The window-rewrite path leaves the rewritten sub-SELECT's source
+    SrcItem with `colUsed = 0` because name resolution against the
+    rewritten pEList never re-marks the original src item's bits.
+    `sqlite3WhereCodeOneLoopStart` (codegen.pas:17285 single-level path
+    + :17100 multi-level path) then ports where.c:7284..7297 verbatim:
+    `Bitmask b = pTabItem->colUsed; for(; b; b>>=1, n++){};
+    sqlite3VdbeChangeP4(v, -1, n, P4_INT32);`.  With colUsed=0 it sets
+    `n=0` and `OpenRead` ends up with `nField=0`.  `allocateCursor`
+    then reserves `(nField+1)*sizeof(u64)/2 = 4` bytes for `aType[]`
+    (zero entries) followed by `aOffset[]` (one entry) — and they
+    overlap because `aOffset := pCx + 120 + nField*4` collapses to
+    base+120 when nField=0.  On the second column read, the lazy
+    header parser at OP_Column writes `aType[i]` at byte 120, which
+    stomps `aOffset[0]` (the cached header-size byte of the row).
+    Reading col 1 then walks the header from a corrupted starting
+    offset and returns 9 (the contents of the now-overwritten
+    aOffset[0]).  Fix: in both `sqlite3WhereCodeOneLoopStart` p4
+    reductions, skip the `ChangeP4` when the would-be n=0 — leave
+    the initial `nNVCol` value emitted by `sqlite3OpenTable`.  The
+    upstream C reference doesn't hit this because its colUsed
+    propagation is intact; this guard is a defensive backstop pending
+    a follow-up to fix colUsed marking on the window-rewrite sub-SELECT.
+    Verified: `SELECT a, sum(b) OVER () FROM t` now returns
+    `[1,600];[2,600];[3,600]` (was `[1,9];[null,9];[null,9]`); same for
+    `count(*) / count(b) / avg(b) / OVER (PARTITION BY 1) /
+    OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)`.
+    DiagWindow 0 divergences (was 2); TestExplainParity 1026/1026;
+    TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+    TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+    TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13
+    all clean; DiagOps / DiagFunctions / DiagDml / DiagPragma /
+    DiagFeatureProbe / DiagMisc / DiagCast / DiagAnalyze / DiagDate /
+    DiagDropTable / DiagMultiValues / DiagIndexing / DiagCovering /
+    DiagCreateIdx all 0 divergences.
 
-    **Additional probe data (2026-05-07):** The bug is broader than
-    "sum/avg returns wrong value" — it actually corrupts the output row
-    structure. `SELECT a, b, count(*) OVER () FROM t` returns
-    `[1,9,3];[null,null,3];[null,null,3]` instead of
-    `[1,10,3];[2,20,3];[3,30,3]` — note the count column (window-aware
-    only via row count) is correct (3 in all rows) but the `b` column
-    reads `9` for the first row and NULL afterward.  `SELECT a FROM t`
-    with no window output is fine (1,2,3).  `SELECT a, sum(b) OVER ()`
-    similarly shows `[1,9];[null,9];[null,9]`.  Working forms:
-    plain agg `SELECT sum(b) FROM t` returns 60; `OVER (ORDER BY a)`
-    running sum 10,30,60; `OVER (PARTITION BY a)` per-row 10,20,30 all
-    correct.  Hypothesis sharpens: the windowFullScan dispatch (no
-    ORDER BY, no explicit frame) consumes the partition-eph rows after
-    first iteration via the `Delete 1; Next 1` tail, so cursor 1 is
-    empty for rows 2/3 — `Column 1 0 3` then reads NULL for outer
-    columns.  Plus the `9` literal at row 1's `b` slot suggests a
-    register-collision with `Integer 1 9 0` (sets r[9]=1) that the
-    output Gosub at addr 59 may be reading from instead of cursor 1.
-    Real fix probably needs to mirror C's coroutine-driven source
-    iteration (InitCoroutine/Yield) instead of the OpenEphemeral/
-    Sorter cursor 5 path — see the EXPLAIN structural delta noted
-    above.
-
-    **Partial parity fix (2026-05-07):** Pascal's `OP_ResultRow`
-    (passqlite3vdbe.pas:7724) was missing `v^.cacheCtr := (v^.cacheCtr
-    + 2) or 1` from C vdbe.c:1751.  Added.  Does not close the bug on
-    its own — Next/Rewind already set `cacheStatus := CACHE_STALE` so
-    the column cache invalidates fine — but brings Pascal closer to
-    the C reference and rules out cache-staleness as a contributing
-    factor.  TestExplainParity 1026/1026; DiagWindow still 2 (sum / avg
-    OVER ()); no regression on Diag{FeatureProbe,Dml,Ops,Pragma,Txn,
-    Functions,Misc,Cast,Analyze,Date}.
-
-    **Further investigation (2026-05-08):** Bytecode emitted by Pas
-    is structurally byte-identical to C reference for
-    `SELECT sum(b) OVER () FROM t` (verified addr-by-addr against
-    `sqlite3 :memory: < EXPLAIN ...`); both have the source-loop
-    AGGSTEP+RETURN_ROW dead arm (skipped via Goto), the post-source-
-    tail Rewind 2 + AGGSTEP loop + RETURN_ROW + Gosub output sub.
-    Yet the C build returns `[1,60];[2,60];[3,60]` and the Pas build
-    returns `[1,9];[null,9];[null,9]` — the constant 9 surfaces even
-    when b values are 100/200/300 (so it is not the b value at all).
-    Inserting an explicit `OP_Rewind, s.endRng.csr` at the head of
-    the tail aggregation (line 50180) does NOT change the result —
-    cursor 4, even after a fresh Rewind, only sees a single row with
-    value 9.  count(b) OVER () = 1 (also wrong; should be 3) confirms
-    AggStep is invoked exactly once with one non-null arg.  Plain
-    subquery materialise paths (`SELECT b FROM (SELECT b FROM t)`,
-    `SELECT sum(b) FROM (SELECT b FROM t)`) all work — so the
-    cursor-5-into-cursor-2 OpenDup path is the unique trigger.
-    Hypothesis: either OP_MakeRecord encodes the register number
-    instead of the value when nField=1 + intkey eph cursor with
-    OpenDup siblings, or sqlite3BtreeFirst/Next on a freshly-opened
-    OpenDup cursor doesn't see records inserted via a sibling cursor
-    (despite saveAllCursors firing on Insert via cursor 2 with
-    BTCF_Multiple set).  Cursor invalidation dance in
-    `restoreCursorPosition` → `btreeMoveto` is suspect.  Next probe:
-    add a TestBtreeOpenDupShared diagnostic that opens an eph table
-    with an OpenDup, inserts via the dup, and walks the master to see
-    if all rows are surfaced.
+- [ ] **6.29.followup** Fix colUsed propagation across window rewrite
+    so the sub-SELECT's source SrcItem ends up with the same colUsed
+    bits as the original.  Currently a guard in
+    `sqlite3WhereCodeOneLoopStart` at codegen.pas:17285 (and twin at
+    :17100) skips the `ChangeP4(... n=0 ...)` reduction when
+    `colUsed=0` so the `OpenRead` keeps the conservative `nNVCol` value
+    from `sqlite3OpenTable`.  This dodges the OP_Column aType/aOffset
+    overlap (see closed bug 6.29) but it leaves the bytecode at
+    `OpenRead p4=nNVCol` instead of upstream's
+    `OpenRead p4=highestSetBit(colUsed)` for window-rewritten plans.
+    Not user-visible, but a TestExplainParity row for a window query
+    over a wide table could surface as a parity diff once added.
+    Likely fix: call `recomputeColumnsUsed(pSubSel, pSrcItem)` after
+    `sqlite3WindowRewrite` finishes its pEList swap, or extend
+    `selectExpander` / `sqlite3ResolveSelectNames` to walk into the
+    rewritten pEList and re-mark colUsed.
 
 - [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
     valued PRAGMA functions) returns rows when called with a literal
