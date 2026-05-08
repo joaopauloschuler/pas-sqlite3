@@ -2713,6 +2713,31 @@ existing dispatcher.
      divergences.  DiagWindow 2 (pre-existing bug 6.29 — bare `sum()
      OVER ()` / `avg() OVER ()` no-PARTITION-no-ORDER, unrelated).
 
+- [X] **10.1.bug.28** Fixed 2026-05-08.  `SELECT max(column1) FROM
+     (VALUES(1),(2),(3))` returned `1` instead of `3` (and similarly for
+     min/sum/count and other aggregates).  Same root pattern as bug
+     10.1.bug.19 but in a different code path: the aggregate-on-subquery
+     arm (isSubqueryAgg) in `sqlite3Select` (passqlite3codegen.pas
+     ~24297) opened an eph table via `OP_OpenEphemeral` and then ran
+     `sqlite3Select(pItem^.u4.pSubq^.pSelect, SRT_EphemTab)` to
+     materialise the subquery.  When that subquery is the multi-VALUES
+     wrapper produced by `sqlite3MultiValues`, the recursive call walks
+     into the materialise arm whose own recursion hits the now-detached
+     single-row `pLeft` and produces an eph populated with literal `1`.
+     The pre-emitted coroutine that actually yields 1, 2, 3 is never
+     consumed.  Fix: in the isSubqueryAgg arm, peek at the inner
+     subquery's `pSrc[0]` for the `SRCITEM_FG_VIA_COROUTINE` bit; when
+     set, emit `OP_InitCoroutine` to reset the existing coroutine, drive
+     a Yield/AggStep loop, and use `translateColumnToCopy` to redirect
+     `OP_Column` refs at iCsr to `OP_Copy` from the inner coroutine's
+     `regResult`.  Mirrors C `select.c` viaCoroutine handling at the
+     aggregate consumer site.  Verified: `SELECT max/min/sum/count(*)
+     FROM (VALUES(1),(2),(3),(4),(5))` now returns `5|1|15|5`
+     byte-identical to upstream.  TestExplainParity 1026/1026;
+     DiagOps / DiagDml / DiagFunctions / DiagFeatureProbe / DiagTxn /
+     DiagPragma / DiagWindow / DiagSubsel / DiagMisc / DiagCast /
+     DiagMultiValues all clean; full Diag* sweep clean.
+
 - [X] **10.1.bug.19** Fixed 2026-05-08.  Top-level `VALUES(1),(2),(3);`
      and `SELECT * FROM (VALUES(1),(2),(3))` now return all three rows
      byte-identical to upstream.  Root cause: the sub-SELECT co-routine
@@ -2734,10 +2759,8 @@ existing dispatcher.
      TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54 /
      TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11
      all clean; DiagOps / DiagDml / DiagFeatureProbe / DiagFunctions
-     0 divergences.  `SELECT max(column1) FROM (VALUES…)` still returns
-     empty — that's the aggregate codegen path emitting OpenEphemeral
-     + Rewind on a never-populated cursor instead of going through the
-     coroutine; tracked separately as a follow-up sub-arm.
+     0 divergences.  Aggregate-over-VALUES follow-up closed under
+     bug 10.1.bug.28.
 
 - [X] **10.1.bug.15** Fixed 2026-05-08.  `SELECT * FROM t` silently
      dropped VIRTUAL generated columns.  On `CREATE TABLE g(a,b,c INT

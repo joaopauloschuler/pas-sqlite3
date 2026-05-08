@@ -22819,6 +22819,8 @@ var
   canUseAgg:   Boolean;
   isVtabAgg:   Boolean;
   isSubqueryAgg: Boolean;
+  pInnerSel:   PSelect;
+  pCoroItem:   PSrcItem;
   jAgg:        i32;
   pAggFunc:    PAggInfoFunc;
   pMinMaxOrderBy: PExprList;
@@ -24296,29 +24298,74 @@ begin
         end
         else if isSubqueryAgg then
         begin
-          { Aggregate-on-subquery arm — Phase 6.13(b)-coagg.  Materialise
-            the subquery into an ephemeral rowid table at pItem^.iCursor,
-            then drive a Rewind/updateAccumulator/Next/Close scan. }
           if pItem^.iCursor < 0 then
           begin
             pItem^.iCursor := pParse^.nTab;
             Inc(pParse^.nTab);
           end;
           iCsr := pItem^.iCursor;
-          sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iCsr, pTab^.nCol);
-          sqlite3SelectDestInit(@innerDest, SRT_EphemTab, iCsr);
-          if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+          { 10.1.bug.28 — when the inner subquery is the multi-VALUES
+            wrapper produced by sqlite3MultiValues, its pSrc[0] carries
+            SRCITEM_FG_VIA_COROUTINE and the coroutine body has already
+            been emitted during parse.  Recursing through sqlite3Select
+            with SRT_EphemTab walks the now-detached single-row pLeft
+            and produces a stub yielding only the first row.  Detect that
+            shape via pSubq^.pSelect^.pSrc[0]'s viaCoroutine bit and
+            instead reset the existing coroutine, drain it through
+            OP_Yield, and run updateAccumulatorSimple on each yielded
+            row with translateColumnToCopy redirecting OP_Column refs at
+            iCsr to OP_Copy from the inner coroutine's regResult.
+            Mirrors C select.c viaCoroutine handling. }
+          pInnerSel := pItem^.u4.pSubq^.pSelect;
+          pCoroItem := nil;
+          if (pInnerSel <> nil) and (pInnerSel^.pSrc <> nil)
+             and (pInnerSel^.pSrc^.nSrc = 1) then
           begin
-            Result := SQLITE_ERROR; Exit;
+            pCoroItem := SrcListItems(pInnerSel^.pSrc);
+            if (pCoroItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) = 0 then
+              pCoroItem := nil;
           end;
-          addrEnd := sqlite3VdbeMakeLabel(pParse);
-          addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrEnd);
-          updateAccumulatorSimple(pParse, pAggI2, regAcc);
-          if regAcc <> 0 then
-            sqlite3VdbeAddOp2(v, OP_Integer, 1, regAcc);
-          sqlite3VdbeAddOp2(v, OP_Next, iCsr, addrTopOfLoop + 1);
-          sqlite3VdbeResolveLabel(v, addrEnd);
-          sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+          if pCoroItem <> nil then
+          begin
+            Assert(pCoroItem^.u4.pSubq <> nil);
+            Assert(pCoroItem^.u4.pSubq^.regReturn <> 0);
+            Assert(pCoroItem^.u4.pSubq^.regResult <> 0);
+            Assert(pCoroItem^.u4.pSubq^.addrFillSub > 0);
+            sqlite3VdbeAddOp3(v, OP_InitCoroutine,
+              pCoroItem^.u4.pSubq^.regReturn, 0,
+              pCoroItem^.u4.pSubq^.addrFillSub);
+            addrEnd := sqlite3VdbeMakeLabel(pParse);
+            addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Yield,
+                                pCoroItem^.u4.pSubq^.regReturn, addrEnd);
+            r2 := sqlite3VdbeCurrentAddr(v);
+            updateAccumulatorSimple(pParse, pAggI2, regAcc);
+            translateColumnToCopy(pParse, r2, iCsr,
+                                  pCoroItem^.u4.pSubq^.regResult, 0);
+            if regAcc <> 0 then
+              sqlite3VdbeAddOp2(v, OP_Integer, 1, regAcc);
+            sqlite3VdbeAddOp2(v, OP_Goto, 0, addrTopOfLoop);
+            sqlite3VdbeResolveLabel(v, addrEnd);
+          end
+          else
+          begin
+            { Aggregate-on-subquery arm — Phase 6.13(b)-coagg.  Materialise
+              the subquery into an ephemeral rowid table at pItem^.iCursor,
+              then drive a Rewind/updateAccumulator/Next/Close scan. }
+            sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iCsr, pTab^.nCol);
+            sqlite3SelectDestInit(@innerDest, SRT_EphemTab, iCsr);
+            if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+            begin
+              Result := SQLITE_ERROR; Exit;
+            end;
+            addrEnd := sqlite3VdbeMakeLabel(pParse);
+            addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrEnd);
+            updateAccumulatorSimple(pParse, pAggI2, regAcc);
+            if regAcc <> 0 then
+              sqlite3VdbeAddOp2(v, OP_Integer, 1, regAcc);
+            sqlite3VdbeAddOp2(v, OP_Next, iCsr, addrTopOfLoop + 1);
+            sqlite3VdbeResolveLabel(v, addrEnd);
+            sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+          end;
         end
         else
         begin
