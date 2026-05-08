@@ -65,6 +65,7 @@ unit passqlite3recover;
 interface
 
 uses
+  ctypes,
   passqlite3types,
   passqlite3util,
   passqlite3printf,

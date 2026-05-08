@@ -1376,16 +1376,23 @@ existing dispatcher.
            port (related to bug 6.13's vtab xBestIndex hidden-arg
            binding gap), so `recovery.schema` ends up empty and
            subsequent `WRITING` state finds no tables to recover.
-       The shell `.recover` dispatcher (`cmdRecover`) still emits
-       the upstream "this build does not support .recover" stub
-       because the engine state machine is incomplete.  Once the
-       deferred pieces land, the shell command can be wired through
-       `sqlite3_recover_init` → `_run` → `_finish`.
+       Shell wire-up landed 2026-05-08: `cmdRecover`
+       (passqlite3shell.pas) ports `recoverDatabaseCmd`
+       (shell.c.in:7025..7085).  Full switch matrix
+       (--ignore-freelist / --recovery-db / --lost-and-found /
+       --no-rowids); SQL callback prints `%s;\n` to stdout matching
+       upstream `recoverSqlCb`.  Dispatcher routes `.recover` →
+       cmdRecover (was a help-text-only entry).  `passqlite3recover`
+       now imported by the shell and compiled clean (required
+       adding `ctypes` to its uses clause — cint/PcInt were
+       previously missing because no consumer compiled the unit).
+       Smoke probe on a 3-row clean db: option parsing works,
+       script preamble (`BEGIN; PRAGMA writable_schema = on;
+       PRAGMA foreign_keys = off;`) is emitted, then the engine
+       errors with `database disk image is malformed (11)` from a
+       lower-layer SQL — the documented engine gap below.
        Verified: full src/tests/build.sh green; TestExplainParity
-       1026/1026; TestSmoke PASS; sanity probe (open input db,
-       `recover_init` + `recover_run` + `recover_finish`) walks
-       the INIT state cleanly and reports a recover error message
-       when the state-db ATTACH fails (expected pre-engine-port).
+       1026/1026; TestSmoke PASS; DiagFeatureProbe 0 divergences.
   [X] **10.1.49** `.dbinfo` — cmdDbinfo reads the 100-byte page-1
        header via `SELECT data FROM sqlite_dbpage(?) WHERE pgno=1`
        and prints the canonical field/query block; also calls
@@ -2655,6 +2662,27 @@ existing dispatcher.
      TestSmoke / TestDMLBasic / TestSelectBasic / TestVdbeAgg /
      TestSchemaBasic all clean; DiagWindow now 0 divergences (was 2);
      DiagFunctions / DiagFeatureProbe / DiagOps / DiagDml all 0.
+
+- [ ] **10.1.bug.39** `.recover` on a clean (uncorrupted) db reports
+     `database disk image is malformed (11)` after the
+     `BEGIN; PRAGMA writable_schema = on; PRAGMA foreign_keys = off;`
+     preamble has been emitted.  Reproducer: build a 3-row table with
+     `bin/passqlite3 demo.db "CREATE TABLE t(a,b); INSERT ...";`
+     then run `bin/passqlite3 demo.db ".recover"` — Pas exits with the
+     CORRUPT error after the preamble; upstream `sqlite3` emits the
+     full `CREATE TABLE t(...);` + `INSERT INTO t VALUES(...)` script.
+     Suspected upstream of the error: the `WITH RECURSIVE pages(i,...)
+     AS (... SELECT ... FROM sqlite_dbptr('getpage(...)') ...)` query
+     used by `recoverCacheSchema` returns no rows in the Pascal port
+     (same vtab-hidden-arg / xBestIndex pushdown gap tracked under
+     bug 6.13), so `recovery.schema` never populates and
+     `recoverWriteDataStep` walks an empty tree.  The CORRUPT comes
+     from a downstream `sqlite_dbdata` read against the input db, but
+     the engine surface is reachable from the shell now (10.1.48 wire-
+     up).  Fix path: chase 6.13's vtab-arg pushdown first; once
+     sqlite_dbdata / sqlite_dbptr accept hidden-arg values from CTEs,
+     the schema cache should populate and the engine should walk to
+     the WRITING / SCHEMA2 / DONE states cleanly.
 
 - [ ] **10.1.bug.37** `sum(b) OVER (PARTITION BY a%2)` (and other
      PARTITION BY shapes where the partition expression is not in the

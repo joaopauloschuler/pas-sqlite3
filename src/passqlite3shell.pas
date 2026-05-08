@@ -119,6 +119,7 @@ uses
   passqlite3dbdata,
   passqlite3memtrace,
   passqlite3pcachetrace,
+  passqlite3recover,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -5125,6 +5126,102 @@ begin
 end;
 
 { ----------------------------------------------------------------------
+  10.1.48  `.recover ?OPTS?`  — corruption-recovery dot-command
+                                       (shell.c.in:7011..7086)
+
+  Drives the sqlite3_recover_* engine (passqlite3recover) against the
+  currently-open database, streaming the recovered CREATE/INSERT script
+  to stdout via the SQL callback.  Mirrors the upstream switch matrix:
+    --ignore-freelist            (FREELIST_CORRUPT = 0)
+    --recovery-db NAME           (op 789 — debug-only ATTACH name)
+    --lost-and-found TABLE       (LOST_AND_FOUND = TABLE)
+    --no-rowids                  (ROWIDS = 0)
+  ---------------------------------------------------------------------- }
+
+function recoverSqlCb(pCtx: Pointer; zSql: PAnsiChar): i32; cdecl;
+begin
+  { Mirror upstream `cli_printf(pState->out, "%s;\n", zSql);`. }
+  if zSql <> nil then begin
+    Write(StdOut, AnsiString(zSql));
+    Write(StdOut, ';'#10);
+  end;
+  Result := SQLITE_OK;
+end;
+
+procedure cmdRecover(p: PShellState; const args: array of AnsiString;
+                    nArg: SizeInt);
+var
+  i, n: SizeInt;
+  z: AnsiString;
+  zRecoveryDb: AnsiString;
+  zLAF: AnsiString;
+  bFreelist, bRowids: i32;
+  zErr: PAnsiChar;
+  errCode: i32;
+  pRec: Psqlite3_recover;
+begin
+  zRecoveryDb := '';
+  zLAF        := 'lost_and_found';
+  bFreelist   := 1;
+  bRowids     := 1;
+
+  i := 0;
+  while i < nArg do begin
+    z := args[i];
+    if (Length(z) >= 2) and (z[1] = '-') and (z[2] = '-') then
+      Delete(z, 1, 1);
+    n := Length(z);
+    if (n <= 16) and (LeftStr(z, n) = LeftStr('-ignore-freelist', n)) then
+      bFreelist := 0
+    else if (n <= 12) and (LeftStr(z, n) = LeftStr('-recovery-db', n))
+            and (i < nArg - 1) then
+    begin
+      Inc(i);
+      zRecoveryDb := args[i];
+    end
+    else if (n <= 15) and (LeftStr(z, n) = LeftStr('-lost-and-found', n))
+            and (i < nArg - 1) then
+    begin
+      Inc(i);
+      zLAF := args[i];
+    end
+    else if (n <= 10) and (LeftStr(z, n) = LeftStr('-no-rowids', n)) then
+      bRowids := 0
+    else begin
+      shellEPutZ('unexpected option: ' + args[i] + sLineBreak);
+      Exit;
+    end;
+    Inc(i);
+  end;
+
+  openDb(p, 0);
+
+  pRec := sqlite3_recover_init_sql(p^.db, 'main', @recoverSqlCb, p);
+  if pRec = nil then begin
+    shellEPutZ('Error: out of memory in .recover'#10);
+    Exit;
+  end;
+
+  if (p^.bSafeMode = 0) and (zRecoveryDb <> '') then
+    sqlite3_recover_config(pRec, 789, PAnsiChar(zRecoveryDb));
+  sqlite3_recover_config(pRec, SQLITE_RECOVER_LOST_AND_FOUND,
+                         PAnsiChar(zLAF));
+  sqlite3_recover_config(pRec, SQLITE_RECOVER_ROWIDS, @bRowids);
+  sqlite3_recover_config(pRec, SQLITE_RECOVER_FREELIST_CORRUPT,
+                         @bFreelist);
+
+  Write(StdOut, '.dbconfig defensive off'#10);
+  sqlite3_recover_run(pRec);
+  if sqlite3_recover_errcode(pRec) <> SQLITE_OK then begin
+    zErr := sqlite3_recover_errmsg(pRec);
+    errCode := sqlite3_recover_errcode(pRec);
+    shellEPutZ(Format('sql error: %s (%d)'#10,
+                      [AnsiString(zErr), errCode]));
+  end;
+  sqlite3_recover_finish(pRec);
+end;
+
+{ ----------------------------------------------------------------------
   10.1.42  `.selecttrace` / `.wheretrace` / `.treetrace`
                                     — shell.c.in:10711..10716, 12042..
 
@@ -6810,6 +6907,7 @@ begin
   if zCmd = 'fullschema' then begin cmdFullschema(p, args, nArg); Exit; end;
   if zCmd = 'lint'      then begin cmdLint(p, args, nArg); Exit; end;
   if zCmd = 'expert'    then begin cmdExpert; Result := 1; Exit; end;
+  if zCmd = 'recover'   then begin cmdRecover(p, args, nArg); Exit; end;
   if (zCmd = 'selecttrace') or (zCmd = 'wheretrace')
      or (zCmd = 'treetrace') then
   begin cmdTraceFlags(zCmd); Exit; end;
