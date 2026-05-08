@@ -2700,18 +2700,25 @@ existing dispatcher.
      DiagAggWhere / DiagInnerJoin / DiagMultiValues / DiagAnalyze
      all 0 divergences.
 
-- [ ] **10.1.bug.59** `SELECT t.*, x.p FROM t, (SELECT 'X' p) x` returns
-     NULL for every t column even though `SELECT *` from the same join
-     works.  Reproducer: `CREATE TABLE t(a,b,c); INSERT INTO t VALUES
-     (1,2,3),(4,5,6); SELECT t.*, x.p FROM t, (SELECT 'X' p) x;` returns
-     `|X` three times in Pas vs `1|2|3|X / 4|5|6|X` in C.  Same shape
-     when joining with a CTE: `WITH c(p) AS (SELECT 'X') SELECT t.*, p
-     FROM t, c;`.  Root cause: presumably qualified-star expansion in
-     selectExpander / expandStar does not refresh after the multi-source
-     subquery materialisation pass added under bug.47 — the t.* slot
-     resolves to a TK_NULL or a stale cursor reference.  Fix path:
-     trace expandStar walking pSrc when one source is a sub-SELECT;
-     compare with C select.c:6571..6618 `expandStar`.
+- [X] **10.1.bug.59** Fixed 2026-05-08.  `SELECT t.*, x.p FROM t, (SELECT
+     'X' p) x` returned NULL for every `t` column (Pas emitted `|X`
+     twice instead of `1|2|3|X / 4|5|6|X`).  Same shape with CTEs:
+     `WITH c(p) AS (SELECT 'X') SELECT t.*, p FROM t, c;`.  Root cause:
+     Pas `expandStar` (passqlite3codegen.pas:20967) only handled bare
+     `TK_ASTERISK`, not `TK_DOT(zTName, TK_ASTERISK)` (the parser shape
+     for `T.*`).  Unrecognised TK_DOT-star entries were carried into
+     pNew untouched; the resolver later treated them as TK_NULL.  Fix:
+     port the C select.c:6090..6326 detection (TK_DOT with right=TK_
+     ASTERISK) and the qualified-name match arm — only items whose
+     `zAlias` (or `pSTab^.zName` when alias is nil) ICmp-matches zTName
+     contribute columns.  Hidden cols still skipped; NOEXPAND still
+     skipped only when zTName is nil (matches select.c:6241..6246).
+     Also raises `no such table: T` when zTName matches no source.
+     Verified: TestExplainParity 1026/1026; TestSmoke / TestSelectBasic
+     60 / TestDMLBasic 54 / TestWhereBasic 52 / TestVdbeAgg 11 /
+     TestSchemaBasic 44 / TestPrepareBasic 20 / TestParser 45 all
+     clean; DiagOps / DiagDml / DiagFunctions / DiagSubsel /
+     DiagInnerJoin / DiagPredicates 0 divergences.
 
 - [X] **10.1.bug.57** Fixed 2026-05-08.  SQL `printf()` / `format()` diverged
      from upstream on three rare format-spec arms.  (a) Unknown specifier

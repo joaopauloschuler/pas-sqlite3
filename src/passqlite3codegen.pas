@@ -20965,13 +20965,13 @@ end;
     * Fails fast on missing-table — sqlite3LocateTableItem already
       raises sqlite3ErrorMsg, so we just propagate via pParse^.nErr. }
 { expandStar — minimum-viable port of the TK_ASTERISK expansion arm
-  inside selectExpander (select.c:830..980).  Builds a fresh pEList
-  by replacing each top-level `*` with one TK_COLUMN expr per visible
-  (non-HIDDEN, non-VIRTUAL) column of every resolved FROM item.
+  inside selectExpander (select.c:830..980 / 6090..6326).  Builds a
+  fresh pEList by replacing each top-level `*` (plain or `T.*`) with
+  one TK_COLUMN expr per visible (non-HIDDEN, non-NOEXPAND) column of
+  the resolved FROM items that match.
 
   Restrictions of this slice:
-    * Only plain TK_ASTERISK at top level — TK_DOT/T.* form not yet
-      handled (no current corpus row exercises it).
+    * NestedFrom / USING / longNames arms not yet ported.
     * Result column names (zEName) are not synthesised here — the
       codegen path uses sqlite3GenerateColumnNames which derives names
       from the underlying Table->aCol[].zCnName, so leaving zEName=nil
@@ -20991,18 +20991,27 @@ var
   hasStar:   Boolean;
   pColExpr:  PExpr;
   db:        PTsqlite3;
+  zTName:    PAnsiChar;
+  zItemName: PAnsiChar;
+  isStar:    Boolean;
+  tableSeen: Boolean;
+  zMsg:      PAnsiChar;
 begin
   pEList := p^.pEList;
   pSrc   := p^.pSrc;
   if (pEList = nil) or (pEList^.nExpr < 1) then Exit;
 
-  { Probe for any plain TK_ASTERISK at top level. }
+  { Probe for any TK_ASTERISK or TK_DOT(_, TK_ASTERISK) at top level. }
   hasStar := False;
   items := ExprListItems(pEList);
   for k := 0 to pEList^.nExpr - 1 do
   begin
     pE := items[k].pExpr;
-    if (pE <> nil) and (pE^.op = TK_ASTERISK) then begin hasStar := True; Break; end;
+    if pE = nil then Continue;
+    if pE^.op = TK_ASTERISK then begin hasStar := True; Break; end;
+    if (pE^.op = TK_DOT) and (pE^.pRight <> nil) and
+       (pE^.pRight^.op = TK_ASTERISK) then
+    begin hasStar := True; Break; end;
   end;
   if not hasStar then Exit;
 
@@ -21011,7 +21020,23 @@ begin
   for k := 0 to pEList^.nExpr - 1 do
   begin
     pE := items[k].pExpr;
-    if (pE = nil) or (pE^.op <> TK_ASTERISK) then
+    isStar := False;
+    zTName := nil;
+    if pE <> nil then
+    begin
+      if pE^.op = TK_ASTERISK then
+        isStar := True
+      else if (pE^.op = TK_DOT) and (pE^.pRight <> nil) and
+              (pE^.pRight^.op = TK_ASTERISK) then
+      begin
+        isStar := True;
+        if (pE^.pLeft <> nil) and
+           ((pE^.pLeft^.flags and EP_IntValue) = 0) then
+          zTName := pE^.pLeft^.u.zToken;
+      end;
+    end;
+
+    if not isStar then
     begin
       { Carry the original entry intact — transfer ownership to pNew. }
       pNew := sqlite3ExprListAppend(pParse, pNew, pE);
@@ -21020,7 +21045,9 @@ begin
     end;
 
     { Expand: walk every resolved FROM item, append one TK_COLUMN per
-      visible column. }
+      visible column.  When zTName is set (T.*), only items whose alias
+      or table name matches zTName contribute columns. }
+    tableSeen := False;
     base := SrcListItems(pSrc);
     for i := 0 to pSrc^.nSrc - 1 do
     begin
@@ -21028,13 +21055,24 @@ begin
       pTab  := pItem^.pSTab;
       if pTab = nil then Continue;
       if pTab^.aCol = nil then Continue;
+      if zTName <> nil then
+      begin
+        if pItem^.zAlias <> nil then
+          zItemName := pItem^.zAlias
+        else
+          zItemName := pTab^.zName;
+        if (zItemName = nil) or
+           (sqlite3StrICmp(zTName, zItemName) <> 0) then Continue;
+      end;
+      tableSeen := True;
       for j := 0 to pTab^.nCol - 1 do
       begin
         pCol := PColumn(PByte(pTab^.aCol) + j * SizeOf(TColumn));
         { select.c:6232 — only hidden columns are omitted from `*`.
           VIRTUAL generated columns must still appear. }
         if (pCol^.colFlags and COLFLAG_HIDDEN) <> 0 then Continue;
-        if (pCol^.colFlags and COLFLAG_NOEXPAND) <> 0 then Continue;
+        if ((pCol^.colFlags and COLFLAG_NOEXPAND) <> 0) and
+           (zTName = nil) then Continue;
         pColExpr := sqlite3ExprAlloc(db, TK_COLUMN, nil, 0);
         if pColExpr = nil then Continue;
         pColExpr^.iTable  := pItem^.iCursor;
@@ -21045,6 +21083,15 @@ begin
         else
           pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl (BMS - 1));
         pNew := sqlite3ExprListAppend(pParse, pNew, pColExpr);
+      end;
+    end;
+    if (zTName <> nil) and (not tableSeen) then
+    begin
+      zMsg := sqlite3MPrintf(db, 'no such table: %s', [zTName]);
+      if zMsg <> nil then
+      begin
+        sqlite3ErrorMsg(pParse, zMsg);
+        sqlite3DbFree(db, zMsg);
       end;
     end;
   end;
