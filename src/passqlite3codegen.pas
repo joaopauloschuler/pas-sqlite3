@@ -3667,7 +3667,7 @@ begin
     Exit;
   end;
   Inc(pParse^.nErr);
-  if pParse^.rc = SQLITE_OK then pParse^.rc := SQLITE_ERROR;
+  pParse^.rc := SQLITE_ERROR;
   if zMsg = nil then Exit;
   if pParse^.zErrMsg <> nil then
     sqlite3DbFree(db, pParse^.zErrMsg);

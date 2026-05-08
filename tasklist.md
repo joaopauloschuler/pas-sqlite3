@@ -2674,19 +2674,45 @@ existing dispatcher.
      error`).  TestExplainParity 1026/1026; DiagPubApi 259/259;
      DiagFeatureProbe / DiagOps / DiagPragma all 0 divergences.
 
-- [ ] **10.1.bug.66** `SELECT * FRO;` is silently accepted by Pas (treated
-     as `SELECT * <alias-of-nothing>;` with `*` followed by a bare
-     identifier) but upstream raises a syntax error
-     (`near "FRO": syntax error`).  Reproducer: `echo 'SELECT * FRO;' |
-     bin/passqlite3 :memory:` exits 0 with no output; C exits 1 with the
-     parse error.  Likely a Lemon-grammar gap: the result-column rule allows
-     `*` to be followed by an alias-like identifier where the upstream
-     grammar requires `*` to be terminal (or followed by `,` / `FROM`).
-     Single-column variants are unaffected (`SELECT 1 FRO;` returns 1 in
-     both — implicit alias syntax is intentional).  Surface during 10.2
-     integration parity sweeps.  Investigation start: passqlite3parser.pas
-     `selcollist` / `sclp` rules vs sqlite3-3.53.0/src/parse.y:1240..1252
-     (`scanpt sclp(A) ::= sclp(A) DISTINCT|FROM scanpt expr ...`).
+- [X] **10.1.bug.66** Fixed 2026-05-08.  `SELECT * FRO;` was silently
+     accepted instead of raising upstream's `near "FRO": syntax error`.
+     Root cause was NOT a grammar gap — the LALR(1) tables and rules
+     match upstream byte-for-byte.  The bug was in `sqlite3ErrorMsg`
+     (passqlite3codegen.pas:3670) and `yy_syntax_error`
+     (passqlite3parser.pas:1543/1547): both guarded the rc assignment
+     with `if pParse^.rc = SQLITE_OK then pParse^.rc := SQLITE_ERROR`.
+     Upstream util.c:263 sets `pParse->rc = SQLITE_ERROR` UNCONDITIONALLY.
+     The guard mattered because rule 2 (`cmdx ::= cmd`) calls
+     `sqlite3FinishCoding`, which on the success path sets
+     `pParse->rc = SQLITE_DONE` (build.c:274).  For `SELECT * FRO;`,
+     the parser accepted `SELECT *` (no FROM) as a complete cmd, ran
+     `sqlite3FinishCoding` → rc=DONE, then encountered the FRO token
+     and entered ERROR_ACTION; the guarded `rc := ERROR` was a no-op
+     because rc was already DONE.  `sqlite3Prepare` (main.pas:1089)
+     gates the error path on `(rc <> OK) and (rc <> DONE)`, so DONE
+     was treated as success and the parse error message was silently
+     dropped.  Fix: remove the rc=OK guard from both
+     `sqlite3ErrorMsg` and `sqlite3SubselectError` (codegen.pas:3670,
+     :26172) and from `yy_syntax_error` (parser.pas), so a syntax
+     error after FinishCoding correctly clobbers DONE→ERROR.
+     Verified: `echo 'SELECT * FRO;' | bin/passqlite3 :memory:` now
+     exits 1 with `Parse error near line 1: near "FRO": syntax error`,
+     byte-identical to upstream.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44
+     / TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord
+     13/13 all pass; DiagFunctions / DiagFeatureProbe / DiagOps /
+     DiagDml / DiagWindow / DiagPragma / DiagMisc / DiagCast /
+     DiagDate / DiagPredicates / DiagAnalyze / DiagIndexing /
+     DiagTxn 0 divergences.
+
+- [ ] **10.1.bug.67** `SELECT *;` (bare star with no FROM clause) is
+     silently accepted by Pas (returns nothing, exit 0).  Upstream
+     raises `Parse error near line 1: no tables specified`
+     (select.c:6320 — `expandStar` arm where `tableSeen` stays 0
+     after the SELECT-list walk and `zTName==NULL`).  The Pas port
+     of `expandStar` does not emit this error.  Surface during
+     10.2 integration parity sweeps.
 
 - [X] **10.1.bug.64** Fixed 2026-05-08.  `SELECT … FROM t HAVING <pred>`
      (HAVING without GROUP BY and without any aggregate) silently produced
