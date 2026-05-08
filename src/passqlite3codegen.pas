@@ -23333,7 +23333,7 @@ begin
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
           or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table)
           or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo)
-          or (pDest^.eDest = SRT_Exists))
+          or (pDest^.eDest = SRT_Exists) or (pDest^.eDest = SRT_Set))
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and (p^.pGroupBy = nil) and (p^.pHaving = nil)
      and (p^.pWin = nil)
@@ -23412,6 +23412,22 @@ begin
         SELECT produced a row, so flip iSDParm to 1.  No need to evaluate
         the result list (suppressed above). }
       sqlite3VdbeAddOp2(v, OP_Integer, 1, pDest^.iSDParm)
+    else if pDest^.eDest = SRT_Set then
+    begin
+      { selectInnerLoop SRT_Set arm (select.c:1384..1407): MakeRecord the
+        result columns with the affinity stored in dest.zAffSdst, then
+        IdxInsert into iParm.  Bloom-filter side-write skipped — no-FROM
+        path doesn't allocate iSDParm2.  This closes the codegen gap that
+        prevented `(a,b) IN (VALUES(1,2),(3,4))` from materialising rows
+        into the eph table when the compound UNION ALL recurses into each
+        leaf no-FROM SELECT with SRT_Set. }
+      r1 := sqlite3GetTempReg(pParse);
+      sqlite3VdbeAddOp4(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1,
+                        pDest^.zAffSdst, nResultCol);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                           pDest^.iSdst, nResultCol);
+      sqlite3ReleaseTempReg(pParse, r1);
+    end
     else
     begin
       { SRT_EphemTab / SRT_Table / SRT_Fifo / SRT_DistFifo — append the row
@@ -52229,18 +52245,28 @@ begin
              IN_INDEX_MEMBERSHIP or IN_INDEX_NOOP_OK,
              prRhs, nil, @iTab);
 
-  { Code the LHS scalar value into rLhs.  Must not const-factor — the
-    OP_Affinity path may need to mutate the register. }
+  { Code the LHS into a register block: rLhs..rLhs+nVector-1.  Must not
+    const-factor — the OP_Affinity path may need to mutate the register.
+    Mirror C's exprCodeVector (expr.c:4530..4554): nVector=1 → ExprCodeTemp;
+    nVector>1 → allocate contiguous block via nMem bump + code each
+    sub-expression individually.  The TK_SELECT branch dispatches through
+    sqlite3CodeSubselect — not reached by literal/Values RHS shapes. }
   savedOk := pParse^.parseFlags and PARSEFLAG_OkConstFactor;
   pParse^.parseFlags := pParse^.parseFlags and (not PARSEFLAG_OkConstFactor);
   iDummy := 0;
   regFree1 := 0;
-  { Mirror C's exprCodeVector(.., &iDummy) on the scalar/nVector=1 fast
-    path: the temp reg is intentionally not released by sqlite3ExprCodeIN
-    (expr.c:4100), so don't capture it into regFree1 here either —
-    otherwise the trailing sqlite3ReleaseTempReg would emit an extra
-    OP_ReleaseReg under SQLITE_DEBUG that the C oracle never produces. }
-  rLhs := sqlite3ExprCodeTemp(pParse, pLeft, @iDummy);
+  if nVector = 1 then
+    rLhs := sqlite3ExprCodeTemp(pParse, pLeft, @iDummy)
+  else if pLeft^.op = TK_SELECT then
+    rLhs := sqlite3CodeSubselect(pParse, pLeft)
+  else begin
+    rLhs := pParse^.nMem + 1;
+    pParse^.nMem := pParse^.nMem + nVector;
+    Assert(ExprUseXList(pLeft));
+    for ii := 0 to nVector - 1 do
+      sqlite3ExprCodeFactorable(pParse,
+        ExprListItems(pLeft^.x.pList)[ii].pExpr, rLhs + ii);
+  end;
   pParse^.parseFlags := pParse^.parseFlags or savedOk;
 
   if eType = IN_INDEX_NOOP then begin

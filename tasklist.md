@@ -2648,6 +2648,71 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.58** Fixed 2026-05-08.  Row-value `IN ((v1,w1),(v2,w2))`
+     and `(a,b) IN (VALUES(...),...)` always returned zero rows; symmetric
+     `NOT IN` always returned all rows.  Reproducer:
+     `CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4),(5,6);
+     SELECT * FROM t WHERE (a,b) IN ((1,2),(5,6));` returned nothing instead
+     of `1|2; 5|6`.  Same shape for `(1,2) IN (SELECT 1,2 UNION ALL SELECT 3,4)`.
+     Root cause: two compounding gaps in passqlite3codegen.pas:
+     (1) **Compound-leaf SRT_Set materialisation missing.**  The literal
+         row-value list `((1,2),(3,4))` is rewritten by the parser
+         (sqlite3ExprListToValues, parser.pas:1958) into a UNION ALL of
+         no-FROM SELECTs.  `sqlite3CodeRhsOfIN` Case 1 then dispatches
+         `sqlite3Select(pParse, pCopy, &destSet)` with destSet.eDest=SRT_Set
+         to materialise into the eph table.  But the no-FROM fast path
+         (codegen.pas:23332..23341) gated on a destination set that
+         omitted SRT_Set, so each compound leaf bailed silently — the
+         eph table was opened (line 7 of EXPLAIN) but never populated
+         (no MakeRecord / IdxInsert).  Fix: add SRT_Set to the gate
+         and emit the canonical SRT_Set disposal arm (mirrors
+         selectInnerLoop select.c:1384..1407 — `MakeRecord regResult,
+         nResultCol, r1, zAffSdst` then `IdxInsert iParm, r1, regResult,
+         nResultCol`; Bloom-filter side-write skipped because no-FROM
+         path doesn't allocate iSDParm2).
+     (2) **LHS vector not coded into contiguous registers.**
+         `sqlite3ExprCodeIN` (codegen.pas:52158..) used
+         `sqlite3ExprCodeTemp(pParse, pLeft, @iDummy)` for the LHS,
+         which for a TK_VECTOR returns one Null-initialised register.
+         The downstream `OP_NotFound iTab, ?, rLhs, nVector` then
+         compared garbage and either always-jumped (NULL key) or
+         never-found (binary search of nothing).  Fix: mirror C's
+         exprCodeVector (expr.c:4530..4554) inline — for nVector=1
+         keep ExprCodeTemp; for nVector>1 with TK_SELECT dispatch
+         through sqlite3CodeSubselect; otherwise allocate `nVector`
+         contiguous regs by bumping pParse^.nMem and code each
+         x.pList element via sqlite3ExprCodeFactorable.
+     With both fixes, the bytecode now matches C: every literal RHS row
+     emits its own MakeRecord+IdxInsert into the eph table, and the LHS
+     columns are loaded into the same contiguous register block the
+     NotFound binary search expects.  Verified byte-identical to upstream
+     across `(a,b) IN ((1,2),(5,6))`, `(a,b) NOT IN ((1,2))`,
+     `(a,b) IN (VALUES(3,4),(5,6))`, `(1,2) IN (SELECT 1,2 UNION ALL
+     SELECT 3,4)`, and the `(9,9)` non-match form; scalar `a IN (1,5)`
+     unchanged.  TestExplainParity 1026/1026; TestSmoke / TestDMLBasic
+     54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg
+     11/11 / TestSchemaBasic 44/44 / TestPrepareBasic 20/20 / TestParser
+     45/45 / TestVdbeRecord 13/13 / TestWindowBasic 34/34 /
+     TestBytecodeParity 32/32 / TestWherePlanner 679/679 all clean;
+     DiagOps / DiagDml / DiagFunctions / DiagPragma / DiagFeatureProbe /
+     DiagWindow / DiagMisc / DiagCast / DiagDate / DiagSubsel /
+     DiagIndexing / DiagCovering / DiagPredicates / DiagMoreFunc /
+     DiagAggWhere / DiagInnerJoin / DiagMultiValues / DiagAnalyze
+     all 0 divergences.
+
+- [ ] **10.1.bug.59** `SELECT t.*, x.p FROM t, (SELECT 'X' p) x` returns
+     NULL for every t column even though `SELECT *` from the same join
+     works.  Reproducer: `CREATE TABLE t(a,b,c); INSERT INTO t VALUES
+     (1,2,3),(4,5,6); SELECT t.*, x.p FROM t, (SELECT 'X' p) x;` returns
+     `|X` three times in Pas vs `1|2|3|X / 4|5|6|X` in C.  Same shape
+     when joining with a CTE: `WITH c(p) AS (SELECT 'X') SELECT t.*, p
+     FROM t, c;`.  Root cause: presumably qualified-star expansion in
+     selectExpander / expandStar does not refresh after the multi-source
+     subquery materialisation pass added under bug.47 — the t.* slot
+     resolves to a TK_NULL or a stale cursor reference.  Fix path:
+     trace expandStar walking pSrc when one source is a sub-SELECT;
+     compare with C select.c:6571..6618 `expandStar`.
+
 - [X] **10.1.bug.57** Fixed 2026-05-08.  SQL `printf()` / `format()` diverged
      from upstream on three rare format-spec arms.  (a) Unknown specifier
      (`%b`, `%a`, `%n`, …) — Pas emitted the literal `%c` verbatim, while
