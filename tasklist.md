@@ -345,16 +345,38 @@ FPC porting traps that recur often enough to call out up-front:
     20/20 / TestParser 45/45 / TestVdbeRecord 13/13 / TestWindowBasic
     34/34 all clean.
 
-- [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
-    valued PRAGMA functions) returns rows when called with a literal
-    argument but yields no rows when joined laterally against
-    `sqlite_schema AS s`.  `f.*` projection also collapses to one
-    column under the literal-argument path.  Surfaces under
-    `.lint fkey-indexes` (the upstream SELECT relies on the lateral
-    join, so the dispatcher emits no suggestions even though the
-    fkey_collate_clause UDF and the EXPLAIN-based coverage detection
-    are wired).  Probe pragmaVtab xBestIndex to confirm hidden-arg
-    binding and reopen the column-list emission path.
+- [~] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
+    valued PRAGMA functions).  **Sub-bug A (column-list emission)
+    closed 2026-05-08**: `SELECT * FROM pragma_foreign_key_list('c')`
+    no longer leaks the hidden `arg` / `schema` columns into the
+    result projection.  Root cause: `vtabCallConstructor`
+    (passqlite3vtab.pas) explicitly skipped the vtab.c:653..682
+    hidden-column-token scan with a TODO note from the 6.bis.1e
+    landing.  Ported the loop into a new helper `vtabHiddenColumnScan`
+    that walks `pTab^.aCol`, looks for the keyword "hidden" delimited
+    by whitespace or end-of-string in each column's type string, and
+    sets `COLFLAG_HIDDEN` / `TF_HasHidden` / `TF_OOOHidden` while
+    excising the keyword from the in-place type buffer (matches
+    vtab.c byte-for-byte).  Verified: `pragma_foreign_key_list('c')`,
+    `pragma_table_info('sqlite_master')` direct calls now return
+    upstream-shape rows; `expandStar` / `selectStarColumnExpand`
+    correctly skip hidden columns from `*`.  TestExplainParity
+    1026/1026; TestVtab 216/216; TestJsonEach 50/50; TestCarray
+    74/74; TestDbpage 68/68; TestDbstat 83/83; all Diag* probes
+    0 divergences.
+    **Sub-bug B (lateral join with hidden-arg pushdown) still open**:
+    `SELECT s.name, f.* FROM sqlite_schema s, pragma_foreign_key_list(s.name) f`
+    yields zero rows because `whereLoopAddVirtual`
+    (passqlite3codegen.pas:14094) is still a stub — the planner does
+    not call `xBestIndex` to push the lateral arg through to xFilter.
+    Same gap also caps `generate_series(1,3)`, `json_each(blob)`,
+    `fsdir(...)`, `zipfile(file)`, `wholenumber WHERE value<6`,
+    `completion('SE')`, etc.  Fix path: port where.c:1413..1701
+    (allocateIndexInfo / freeIdxStr / freeIndexInfo / vtabBestIndex)
+    plus the four-pass driver where.c:4357..4803
+    (whereLoopAddVirtualOne / whereLoopAddVirtual) and the
+    HiddenIndexInfo trailing struct.  Surfaces under
+    `.lint fkey-indexes` and bug 10.1.bug.39 `.recover`.
 
 - [X] **6.10** `TestExplainParity.pas` — **1026/1026 PASS** as of
     2026-05-06 (a3).  Oracle is built with `-DSQLITE_DEBUG
