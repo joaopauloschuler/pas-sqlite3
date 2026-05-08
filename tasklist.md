@@ -2687,34 +2687,20 @@ existing dispatcher.
      the schema cache should populate and the engine should walk to
      the WRITING / SCHEMA2 / DONE states cleanly.
 
-- [ ] **10.1.bug.37** `sum(b) OVER (PARTITION BY a%2)` (and other
-     PARTITION BY shapes where the partition expression is not in the
-     outer SELECT's result list) returns the global aggregate value for
-     every row — partitioning is silently ignored.  Reproducer on a
-     5-row `t(a,b)` with values (1,10)..(5,50):
-     `SELECT b, sum(b) OVER (PARTITION BY a%2) FROM t;` — Pas returns
-     `10|150, 20|150, 30|150, 40|150, 50|150` (in input order, all 150)
-     vs C's `20|60, 40|60, 10|90, 30|90, 50|90`.  When partition expr
-     == agg arg (e.g. `sum(a) OVER (PARTITION BY a%2)`), result is
-     correct because the dedup happens to align registers; when projection
-     omits intermediate columns or the agg input differs from the
-     partition expr the bug fires.  Investigation so far: sqlite3WindowRewrite
-     (codegen.pas:49003) builds the right pSub, sets pSort properly,
-     sqlite3SelectNew with pOrderBy=pSort.  Recursive sqlite3Select on
-     pSub with SRT_EphemTab does emit SorterOpen + pushOntoSorter +
-     sort tail (line 25260+, 25542+).  EXPLAIN confirms cursor 5 IS
-     drained in sort order and cursor 1 (window buffer) is filled
-     in that same order; the partition Compare reads the right
-     register.  Same root cause as **10.1.bug.25** above:  Pas's
-     pushOntoSorter SRT_EphemTab arm (codegen.pas:25260..25284) packs
-     `[sortKey ; pSublist...]` without deduping the sort-key against
-     iOrderByCol-tagged pSublist entries the way C's
-     `sqlite3ExprCodeExprList(... SQLITE_ECEL_REF)` chain does
-     (select.c:781..788 + the SortCtx-driven layout).  The +1 column
-     shift in the eph row layout misaligns the partition/peer compare
-     downstream so all rows compare-equal and fall into one partition.
-     Closing this requires the joint pushOntoSorter port — see bug.25
-     for the full fix-attempt log.
+- [X] **10.1.bug.37** Fixed (verified 2026-05-08, a4 head).  Confirmed
+     fixed indirectly by Phase 6.29.followup (commit 1f0be03 — restore
+     colUsed propagation across window rewrite).  All previously broken
+     PARTITION BY shapes now match upstream byte-for-byte:
+     `SELECT b, sum(b) OVER (PARTITION BY a%2) FROM t;` returns
+     `20|60, 40|60, 10|90, 30|90, 50|90`; `SELECT b, sum(b) OVER
+     (ORDER BY a) FROM t;` returns the correct running 10/30/60/100/150;
+     multi-window / partition-by-c / lead/lag with 3+ projected cols
+     all match.  Bug surface (window queries projecting non-PARTITION /
+     non-ORDER-BY columns) was repaired when window rewrite started
+     propagating correct colUsed bits to the OpenRead p4 reduction —
+     the misaligned eph row layout described in the original analysis
+     no longer reproduces.  TestExplainParity 1026/1026; DiagWindow
+     0 divergences.
 
 - [X] **10.1.bug.35** Fixed 2026-05-08.  Date/time arithmetic dropped
      one second on every relative modifier (`+N seconds/minutes/hours`,
@@ -2974,82 +2960,14 @@ existing dispatcher.
      DiagPragma / DiagDropTable / DiagTrig / DiagMisc / DiagWindow all
      0 divergences.
 
-- [ ] **10.1.bug.25** `lag(a,1) OVER (ORDER BY a)` returns wrong values
-     when the outer SELECT projects a third column alongside `a` and the
-     window expression.  Reproducer: `SELECT a, b, lag(a,1) OVER (ORDER
-     BY a) FROM t ORDER BY a;` on `t(a INTEGER, b TEXT)` with
-     (1,'a'),(2,'b'),(3,'c'),(4,'a'),(5,'b') — Pas returns
-     `[1,a,0];[2,b,];[3,c,1];[4,a,1];[5,b,1]` vs C reference
-     `[1,a,];[2,b,1];[3,c,2];[4,a,3];[5,b,4]`.
-
-     **Deeper investigation (2026-05-08, a4):** The earlier
-     "selectWindowRewriteEList not deduplicating" hypothesis is WRONG.
-     pSub is built byte-identically on both sides — both produce
-     `[a, b, a, a, 1]` (5 entries) for the 3-col case.  EXPLAIN
-     diff (3-col case):
-       - C  `MakeRecord 4,5,10` (5 cols incl. sort key)
-       - Pas `MakeRecord 11,6,17` (6 cols incl. sort key)
-     The +1 col Pas emits is an extra `Column 0,0,r9` (a) at addr 10
-     of Pas EXPLAIN that C does not emit.  In the resulting eph table,
-     the columns shift so lag's runtime read (addr 64 `Column 1,4,20`,
-     addr 68 `Column 1,3,2`) lands on the wrong source columns —
-     reading `a` (=1) where it expected the literal `1`, so the offset-
-     subtract for SeekRowid becomes (rowid - rowVal) instead of
-     (rowid - 1).  That explains the consistent `0/1/1/1/1` lag output.
-
-     Real root cause: the window-rewrite sub-SELECT runs
-     `sqlite3Select(pSubSel, SRT_EphemTab)` (Pas codegen.pas:23739).
-     The OMITREF dedup at codegen.pas:24902 is gated on
-     `pDest^.eDest = SRT_Output` only.  C's gate
-     (select.c:1216) is the broader `eDest!=SRT_EphemTab &&
-     eDest!=SRT_Table`, which still excludes SRT_EphemTab — so OMITREF
-     is OFF in BOTH builds for this path.  Yet C still emits 5 cols
-     and Pas emits 6.  Difference must be in how each side composes
-     the record at the SRT_EphemTab pushOntoSorter slice (Pas
-     codegen.pas:25082..25107, C select.c:730..870).  Pas's slice
-     unconditionally lays out `[sortKey ; nResultCol]` via SCopy, while
-     C's pushOntoSorter folds sort keys into the result-col region
-     when the sort key already appears in pSub (via `iOrderByCol`-tagged
-     entries from sqlite3ResolveOrderGroupBy or similar set during
-     SelectNew).  Fix likely needs to either (a) extend OMITREF to
-     SRT_EphemTab + tag pSort items' iOrderByCol against pSublist
-     before the recursive sqlite3Select call, or (b) mirror C's
-     pushOntoSorter SortCtx-driven layout in the SRT_EphemTab arm to
-     dedup sort keys against result cols.  Estimated work: half a day
-     of careful select.c port re-read + bytecode parity preservation.
-
-     2-col projection (`SELECT a, lag(a,1) OVER (ORDER BY a)`) works
-     because the bug-induced column shift happens to fall between cols
-     that hold the same value (both are `a`), so lag reads the right
-     value by accident.  3+ col projections expose it.  DiagWindow does
-     not exercise the 3-column shape (only 1 or 2 cols), so it
-     slipped through.
-
-     **Re-confirmation (2026-05-08, a4 head):** Bug surface is much
-     wider than the 3-col lag form.  ANY window query where the outer
-     SELECT projects a column that is NOT itself in the ORDER BY /
-     PARTITION BY clause exhibits the wrong-aggregate result:
-       - `SELECT b, sum(b) OVER (ORDER BY a) FROM t` → all rows return
-         the global sum (60 over 3 rows of (1,10),(2,20),(3,30)) instead
-         of the running 10/30/60.
-       - `SELECT b, sum(b) OVER (PARTITION BY a%2) FROM t` → all rows
-         return the global sum (150 over (1,10)..(5,50)) instead of
-         per-partition 60/90.
-       - `SELECT a, sum(b) OVER (ORDER BY a) FROM t` → CORRECT (10/30/
-         60/100/150 running) because the projected column `a` happens
-         to coincide with the ORDER BY expression.
-     Pas `MakeRecord` packs `[sortKey ; pSublist...]` literally, while
-     C dedupes the sort-key column with the matching pSublist entry
-     (an iOrderByCol-tagged entry produced by ResolveStructuralOrderByCol
-     on the recursive sqlite3Select(pSub) call).  The +1 column shift
-     misaligns every downstream consumer cursor (the window's eph
-     buffer, the partition/peer compares, lag/lead seek-rowid arithmetic).
-     Fix-attempt log: tried mirroring SQLITE_ECEL_REF in the SRT_EphemTab
-     pushOntoSorter arm — runtime/byte-code unchanged because the column
-     count is the issue, not register-reuse.  Real fix needs the
-     pushOntoSorter SortCtx layout port that elides duplicate sort-key
-     data slots when iOrderByCol > 0.  Bug 10.1.bug.37 below is the
-     same root cause surfacing through a different probe shape.
+- [X] **10.1.bug.25** Fixed (verified 2026-05-08, a4 head).  Confirmed
+     fixed indirectly by Phase 6.29.followup (commit 1f0be03 — colUsed
+     propagation across window rewrite).  All previously broken shapes
+     now match upstream byte-for-byte: `SELECT a, b, lag(a,1) OVER
+     (ORDER BY a) FROM t` returns `[1,a,];[2,b,1];[3,c,2];[4,a,3];
+     [5,b,4]` matching C; partition-by-non-projected-col, window rows
+     with 3+ projected cols, multi-window, and lead/lag/avg combos all
+     match.  TestExplainParity 1026/1026; DiagWindow 0 divergences.
 
 - [X] **10.1.bug.22** Fixed 2026-05-08.  `WITH RECURSIVE c(x) AS (SELECT 1
      UNION SELECT x+1 FROM c WHERE x<N) SELECT * FROM c;` now returns
