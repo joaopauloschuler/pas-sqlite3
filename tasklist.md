@@ -1034,17 +1034,25 @@ existing dispatcher.
        inputNesting still gates the existing recursion guard.  Pipe
        (`|cmd`) variants emit the upstream "pipes are not supported"
        error.
-  [~] **10.1.23** `.dump` — minimal viable port landed
-       (cmdDump / dumpOneObject).  Emits PRAGMA foreign_keys=OFF +
-       BEGIN TRANSACTION header, dumps CREATE TABLE statements +
-       INSERT INTO rows (rendered through MODE_Insert with zDestTable
-       set), then non-table objects (indexes/views/triggers), then
-       COMMIT.  Honours `--data-only` and `--nosys` plus a LIKE
-       pattern.  `--preserve-rowids` and `--newlines`, the upstream
-       sqlite_sequence handling, the corruption detour with `ORDER BY
-       rowid DESC`, and explicit column-list INSERTs (via
-       `tableColumnList`) defer to a follow-up.  Round-trip verified
-       on simple schemas; used by `.once` integration test.
+  [X] **10.1.23** `.dump` — full port landed 2026-05-08.  cmdDump now
+       mirrors shell.c.in:9344..9460 and dumpOneObject mirrors
+       dump_callback (3531..3659).  New helpers in passqlite3shell.pas:
+       dumpQuoteChar (1217..1225), dumpAppendQuoted, dumpPrintSchemaLine
+       (2315..2342), dumpOutputWarning (7349..7364),
+       dumpTableColumnList (3414..3503), dumpRunTableDumpQuery
+       (2648..2690).  Honours --preserve-rowids, --data-only, --nosys,
+       --newlines (upstream-stub no-op), the LIKE pattern with the
+       virtual-table shadow EXISTS clause (9389..9396), the
+       SAVEPOINT dump + writable_schema=ON wrap, sqlite_sequence
+       repopulation gating on count>0, the CREATE VIRTUAL TABLE
+       INSERT-INTO-sqlite_schema arm, IPK pragma_index_list disambig,
+       and `tbl_name='sqlite_sequence', rowid` ORDER BY.  Verified
+       byte-identical to the 3.53.0 oracle for plain dumps,
+       --preserve-rowids (both IPK + rowid-named tables),
+       --data-only, --nosys, sqlite_sequence dumps, view+trigger
+       dumps, and keyword-named-table dumps.  CORRUPT detour with
+       `ORDER BY rowid DESC` still deferred (engine doesn't surface
+       SQLITE_CORRUPT mid-step yet).
   [~] **10.1.24** `.import` — initial cut landed (cmdImport):
        ImportCtx + importGetc + importAppendChar + csvReadOneField +
        asciiReadOneField mirror shell.c.in:4958..5150; the dispatcher
@@ -2659,20 +2667,14 @@ existing dispatcher.
      probes 0 divergences; TestDMLBasic / TestSchemaBasic / TestSelectBasic
      all green.
 
-- [ ] **10.1.bug.45** `INSERT INTO t VALUES(...) , (...)` against a
-     `UNIQUE(...) ON CONFLICT REPLACE` table corrupts the rows.
-     Reproducer: `CREATE TABLE t(a INT, b INT, UNIQUE(a,b) ON CONFLICT
-     REPLACE); INSERT INTO t VALUES(1,1); INSERT INTO t VALUES(1,1),(1,2);
-     SELECT * FROM t;` returns `0.0|0.0; 0.0|0.0` (Pas) vs `1|1; 1|2` (C).
-     Single-row INSERT with REPLACE works; only multi-row VALUES via the
-     coroutine arm is affected.  Suspected upstream: the multi-row
-     coroutine consumer (sqlite3MultiValues + viaCoroutine arm in
-     sqlite3Insert) does not re-prime the regNewData slots between
-     yields when the upsert REPLACE path fires, so the second iteration
-     reads stale REAL-coerced zero values.  Fix path: trace the
-     `viaCoroutine` arm in sqlite3Insert against insert.c:957..1040 with
-     special focus on the regFromSelect/regNewData copy after the
-     yield/jump-back inside the coroutine body.
+- [X] **10.1.bug.45** Resolved 2026-05-08 by the cumulative effect of
+     bug.41 (sqlite3GenerateIndexKey uniqNotNull gating) and bug.42
+     (TK_STRING in sqlite3ExprIdToTrueFalse).  Original reproducer
+     `CREATE TABLE t(a INT, b INT, UNIQUE(a,b) ON CONFLICT REPLACE);
+     INSERT INTO t VALUES(1,1); INSERT INTO t VALUES(1,1),(1,2);
+     SELECT * FROM t;` now returns `1|1; 1|2` byte-identical to the C
+     oracle.  Verified across multi-row variations
+     (3-row insert with REPLACE, mixed-types UNIQUE(a,b)).
 
 - [X] **10.1.bug.44** Fixed 2026-05-08.  Registered the SQL functions
      `sqlite_compileoption_used(X)` / `sqlite_compileoption_get(N)` in
