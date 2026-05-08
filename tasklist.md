@@ -2471,6 +2471,61 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.36** Fixed 2026-05-08.  Aggregate `FILTER (WHERE …)`
+     clause silently inherited a sibling unfiltered aggregate's value.
+     Reproducer: `SELECT sum(b) FILTER (WHERE a>2), sum(b) FROM t` —
+     Pas returned `120|120` (the filtered value duplicated) instead of
+     C's `120|150`.  Same shape across `count(*) FILTER (...) , count(*)`
+     and any peer pair where the only difference is the FILTER clause.
+     Root cause: `sqlite3ExprCompare` (passqlite3codegen.pas:48304)
+     omitted the EP_WinFunc / FILTER comparison gate that the C reference
+     carries at expr.c:6584..6594.  With FILTER stored on
+     `Expr.y.pWin->pFilter` and EP_WinFunc set, two
+     `agg(x) FILTER(p1)` and `agg(x) FILTER(p2)` (or one with FILTER and
+     one without) compared equal, so analyzeAggregate's pAggInfo dedup
+     loop merged them into one slot — the unfiltered call inherited the
+     filtered call's pAggInfo.iMem and AggStep wiring.  Fix: add the
+     `(pA->flags^pB->flags)&EP_WinFunc != 0 → 2` divergence check inside
+     the TK_FUNCTION/TK_AGG_FUNCTION arm, plus `EP_WinFunc on both →
+     sqlite3WindowCompare(pParse, pA->y.pWin, pB->y.pWin, /*bFilter*/1)`
+     dispatch.  sqlite3WindowCompare was already ported (codegen.pas
+     :48667) with the bFilter=1 path comparing pFilter expressions.
+     Side effect: also closes bug 6.29's two DiagWindow divergences,
+     which were the same dedup-too-aggressive shape applied to window-
+     function FILTER variants.  Verified: TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic / TestSelectBasic / TestVdbeAgg /
+     TestSchemaBasic all clean; DiagWindow now 0 divergences (was 2);
+     DiagFunctions / DiagFeatureProbe / DiagOps / DiagDml all 0.
+
+- [ ] **10.1.bug.37** `sum(b) OVER (PARTITION BY a%2)` (and other
+     PARTITION BY shapes where the partition expression is not in the
+     outer SELECT's result list) returns the global aggregate value for
+     every row — partitioning is silently ignored.  Reproducer on a
+     5-row `t(a,b)` with values (1,10)..(5,50):
+     `SELECT b, sum(b) OVER (PARTITION BY a%2) FROM t;` — Pas returns
+     `10|150, 20|150, 30|150, 40|150, 50|150` (in input order, all 150)
+     vs C's `20|60, 40|60, 10|90, 30|90, 50|90`.  When partition expr
+     == agg arg (e.g. `sum(a) OVER (PARTITION BY a%2)`), result is
+     correct because the dedup happens to align registers; when projection
+     omits intermediate columns or the agg input differs from the
+     partition expr the bug fires.  Investigation so far: sqlite3WindowRewrite
+     (codegen.pas:49003) builds the right pSub, sets pSort properly,
+     sqlite3SelectNew with pOrderBy=pSort.  Recursive sqlite3Select on
+     pSub with SRT_EphemTab does emit SorterOpen + pushOntoSorter +
+     sort tail (line 25260+, 25542+).  EXPLAIN shows the SorterInsert /
+     SorterSort / OpenPseudo chain.  But the materialised eph cursor 5
+     ends up containing rows in INPUT order, not sort order — the
+     window's main loop walks them, the partition compare always says
+     EQ (since key never changes when input is monotonic and adjacent
+     rows happen to compare-equal-by-accident or because partition
+     value is read off the wrong column).  Same family as bug.25 (3-col
+     projection with window function) and probably shares root cause:
+     the SRT_EphemTab sort tail + downstream materialisation inserts
+     rows into the consumer eph in some order that does not match the
+     sort key.  Estimated work: half-day; needs a vdbe-trace run to
+     confirm whether the sorter itself is wrong or the materialisation
+     drains in the wrong order.
+
 - [X] **10.1.bug.35** Fixed 2026-05-08.  Date/time arithmetic dropped
      one second on every relative modifier (`+N seconds/minutes/hours`,
      `-N minutes`, etc.).  Reproducers:

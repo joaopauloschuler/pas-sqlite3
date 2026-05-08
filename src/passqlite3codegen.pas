@@ -48340,6 +48340,19 @@ begin
       if sqlite3StrICmp(pA^.u.zToken, pB^.u.zToken) <> 0 then begin
         Result := 2; Exit;
       end;
+      { expr.c:6584..6594 — window-function and FILTER comparison.  Two
+        aggregate calls with different FILTER (WHERE …) clauses (or one
+        with FILTER and one without) must NOT compare equal, otherwise
+        analyzeAggregate dedups them and the unfiltered call inherits
+        the filtered call's pAggInfo slot. }
+      if (((pA^.flags xor pB^.flags) and EP_WinFunc) <> 0) then begin
+        Result := 2; Exit;
+      end;
+      if (pA^.flags and EP_WinFunc) <> 0 then begin
+        if sqlite3WindowCompare(pParse, pA^.y.pWin, pB^.y.pWin, 1) <> 0 then begin
+          Result := 2; Exit;
+        end;
+      end;
     end else if pA^.op = TK_NULL then begin
       Result := 0; Exit;
     end else if pA^.op = TK_COLLATE then begin
