@@ -2589,16 +2589,36 @@ existing dispatcher.
      DiagMoreFunc / DiagSumOverflow / DiagLikeGlob / DiagPrintfFmt all
      0 divergences.
 
-- [ ] **10.1.bug.33** `INSERT INTO t SELECT a UNION SELECT b` (UNION
-     without ALL) silently drops rows.  Bug.32 closed the
-     single-no-FROM-SELECT case but the compound chain at
-     passqlite3codegen.pas:30671..30679 still requires `pTmp^.op =
-     TK_ALL` for every prior link — UNION (TK_UNION op) bails to
-     insert_cleanup.  Needs either compound-SELECT-of-constants
-     support with a dedup eph cursor, or full sqlite3Select-as-source
-     dispatch through the standard FROM-less path.  Reproducer:
-     `CREATE TABLE x(v); INSERT INTO x SELECT 1 UNION SELECT 2; SELECT
-     * FROM x;` returns 0 rows in Pas vs `1, 2` in upstream.
+- [X] **10.1.bug.33** Fixed 2026-05-08.  `INSERT INTO t SELECT a UNION
+     SELECT b` (and any compound SELECT-as-source the inline
+     viaCoroutine pattern doesn't cover) now inserts the deduplicated
+     rows.  Root cause: when the isMulti detection fell through (chain
+     contained a non-TK_ALL op such as TK_UNION / TK_EXCEPT /
+     TK_INTERSECT, or the leaves had non-empty FROM), `sqlite3Insert`
+     bailed straight to `insert_cleanup`.  Fix: ported insert.c:1108..
+     1153 branch B (the non-viaCoroutine arm) — emit
+     `OP_InitCoroutine`, drive `sqlite3Select(pSelect, SRT_Coroutine)`
+     with `dest.iSdst := regData` (when bIdListInOrder), then
+     `OP_EndCoroutine` + `JumpHere`.  Sets `useCoroutine := True` so
+     the existing consumer path (Yield loop / SCopy / NewRowid /
+     Insert) handles the rest.  New label `generic_coro_done` skips
+     the isMulti-only block.  Companion fix to the
+     `nColumn := pSubqCoro^.pSelect^.pEList^.nExpr` dispatch — guard
+     on `pSubqCoro <> nil` and reuse the already-set `nColumn` for
+     the new generic path.  Verified byte-identical to upstream:
+     `INSERT INTO x SELECT 1 UNION SELECT 2` = 1, 2;
+     `INSERT INTO x SELECT 1 UNION SELECT 1 UNION SELECT 2` = 1, 2;
+     `INSERT INTO x SELECT 'a' UNION SELECT 'b' ORDER BY 1 DESC` =
+     b, a; UNION ALL regression and single-row no-FROM SELECT both
+     still work.  TestExplainParity 1026/1026; TestSmoke / TestDMLBasic
+     54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg
+     11/11 / TestSchemaBasic 44/44 / TestPrepareBasic 20/20 / TestParser
+     45/45 / TestVdbeRecord 13/13 all clean; DiagFeatureProbe / DiagOps
+     / DiagDml / DiagPragma / DiagFunctions / DiagMisc / DiagCast /
+     DiagTxn / DiagDropTable / DiagMultiValues / DiagWindow /
+     DiagAnalyze all 0 divergences.  Caveat: readsTable / useTempTable
+     check from C is not ported, so `INSERT INTO t SELECT … FROM t`
+     (self-referential) may misbehave — separate work item if surfaced.
 
 - [X] **10.1.bug.31** Fixed 2026-05-08.  `EXISTS(SELECT … with no FROM
      clause)` always returned 0; `SELECT <expr> WHERE <falsey>` (no FROM)

@@ -30444,7 +30444,7 @@ function xferOptimization(pParse: PParse; pTab: PTable2; pSelect: PSelect;
 procedure sqlite3Insert(pParse: PParse; pTabList: PSrcList; pSelect: PSelect;
   pColumn: PIdList; onError: i32; pUpsert: PUpsert);
 label
-  insert_cleanup, insert_end;
+  insert_cleanup, insert_end, generic_coro_done;
 var
   db:             PTsqlite3;
   pTab:           PTable2;
@@ -30502,6 +30502,10 @@ var
   k:              i32;
   pNx:            PUpsert;
   pTabItem0:      PSrcItem;
+  needsGenericCoro: Boolean;
+  addrTopCoro:    i32;
+  rcSel:          i32;
+  destCoro:       TSelectDest;
 begin
   pList         := nil;
   pTrg          := nil;
@@ -30677,10 +30681,11 @@ begin
     arm (caught above by useCoroutine), so the SF_Values fallback chain
     no longer reaches here.  This block survives only to handle the
     `INSERT INTO t SELECT a UNION ALL SELECT b ...` shape — every leaf
-    has empty FROM and is linked through pPrior with op=TK_ALL.  Any
-    other pSelect shape (true SELECT-as-source, etc.) bails — tracked
-    under 6.10 step 6.  Single-row VALUES is captured into pList above;
-    pSelect is nil here. }
+    has empty FROM and is linked through pPrior with op=TK_ALL.  Phase
+    10.1.bug.33: the non-TK_ALL case (UNION / EXCEPT / INTERSECT compound)
+    now falls through to the generic SRT_Coroutine emission below.
+    Single-row VALUES is captured into pList above; pSelect is nil here. }
+  needsGenericCoro := False;
   if (pSelect <> nil) and (not useCoroutine) then
   begin
     rowsOk := True;
@@ -30695,7 +30700,35 @@ begin
       Inc(nRows);
       pTmp := pTmp^.pPrior;
     end;
-    if (not rowsOk) or (nRows < 2) then goto insert_cleanup;
+    if (not rowsOk) or (nRows < 2) then
+    begin
+      { Generic SELECT-as-source path — port of insert.c:1108..1153
+        (the non-viaCoroutine arm).  Emit OP_InitCoroutine, drive
+        sqlite3Select with SRT_Coroutine, then OP_EndCoroutine + jump
+        back-patch.  After this, useCoroutine=True so the existing
+        consumer path (Yield loop / SCopy / NewRowid / Insert) handles
+        it.  Constraints relative to C: readsTable / useTempTable not
+        ported — self-referential `INSERT INTO t SELECT … FROM t` may
+        misbehave (separate work item). }
+      Inc(pParse^.nMem);
+      regYield := pParse^.nMem;
+      addrTopCoro := sqlite3VdbeCurrentAddr(v) + 1;
+      sqlite3VdbeAddOp3(v, OP_InitCoroutine, regYield, 0, addrTopCoro);
+      sqlite3SelectDestInit(@destCoro, SRT_Coroutine, regYield);
+      if bIdListInOrder <> 0 then destCoro.iSdst := regData
+      else destCoro.iSdst := 0;
+      destCoro.nSdst := i32(pTab^.nCol);
+      rcSel := sqlite3Select(pParse, pSelect, @destCoro);
+      if (rcSel <> 0) or (pParse^.nErr <> 0) then goto insert_cleanup;
+      regFromSelect := destCoro.iSdst;
+      sqlite3VdbeEndCoroutine(v, regYield);
+      sqlite3VdbeJumpHere(v, addrTopCoro - 1);
+      Assert(pSelect^.pEList <> nil);
+      nColumn := pSelect^.pEList^.nExpr;
+      useCoroutine := True;
+      needsGenericCoro := True;
+      goto generic_coro_done;
+    end;
     SetLength(pRowsList, nRows);
     pTmp := pSelect;
     iRow := nRows - 1;
@@ -30719,6 +30752,7 @@ begin
     isMulti := True;
   end;
 
+generic_coro_done:
   { Single-row VALUES productive emission (Phase 6.9-bis step 11e).
     Hand-rolled inline of the schema-row INSERT path used by sqlite3NestedParse
     (CREATE INDEX / DROP INDEX / DROP TABLE / sqlite_statN cleanup).  Mirrors
@@ -30728,8 +30762,11 @@ begin
     (6.8.2) and sqlite3CompleteInsertion (6.8.3) are now real bodies; the
     productive sqlite3Insert cascade routes through them via 6.8.6. }
   { pList = nil  ⇔  INSERT … DEFAULT VALUES (insert.c:1213..1215). }
-  if useCoroutine then
+  if useCoroutine and (pSubqCoro <> nil) then
     nColumn := pSubqCoro^.pSelect^.pEList^.nExpr
+  else if useCoroutine then
+    { needsGenericCoro path — nColumn already set above. }
+    nColumn := nColumn
   else if isMulti then
     nColumn := pRowsList[0]^.nExpr
   else if pList <> nil then
