@@ -47918,8 +47918,8 @@ function applyModifier(z: PAnsiChar; var dt: TDateTime2): Boolean;
 var
   zMod, unit_: PAnsiChar;
   buf: array[0..31] of AnsiChar;
-  i, nUsed, nUnit, iVal: i32;
-  r: Double;
+  i, nUsed, nUnit, iVal, dadd: i32;
+  r, rScale, msFrac: Double;
 begin
   Result := False;
   if z = nil then Exit;
@@ -47988,6 +47988,99 @@ begin
      (sqlite3StrICmp(zMod, 'subsecond') = 0) then begin
     dt.useSubsec := True;
     Result := True; Exit;
+  end;
+
+  { +/-YYYY-MM-DD [ HH:MM[:SS[.FFF]] ] form (date.c:972..1038).
+    Adds/subtracts Y years, M months (0..11), D days (0..30) and
+    optionally HH:MM[:SS[.FFF]] of time-of-day to the current instant. }
+  if (zMod^ = '+') or (zMod^ = '-') then begin
+    i := 1;
+    while (zMod[i] >= '0') and (zMod[i] <= '9') do Inc(i);
+    if (zMod[i] = '-') and ((i = 5) or (i = 6)) then begin
+      iVal := 0;
+      for nUsed := 1 to i - 1 do
+        iVal := iVal * 10 + (Ord(zMod[nUsed]) - Ord('0'));
+      if (zMod[i+3] <> '-') or
+         (zMod[i+1] < '0') or (zMod[i+1] > '9') or
+         (zMod[i+2] < '0') or (zMod[i+2] > '9') or
+         (zMod[i+4] < '0') or (zMod[i+4] > '9') or
+         (zMod[i+5] < '0') or (zMod[i+5] > '9') then Exit;
+      nUnit := (Ord(zMod[i+1]) - Ord('0')) * 10
+             + (Ord(zMod[i+2]) - Ord('0'));     { M }
+      dadd  := (Ord(zMod[i+4]) - Ord('0')) * 10
+             + (Ord(zMod[i+5]) - Ord('0'));     { D }
+      if (nUnit >= 12) or (dadd >= 31) then Exit;
+      if zMod^ = '-' then begin
+        dt.yr := dt.yr - iVal;
+        dt.mo := dt.mo - nUnit;
+        dadd  := -dadd;
+      end else begin
+        dt.yr := dt.yr + iVal;
+        dt.mo := dt.mo + nUnit;
+      end;
+      if dt.mo > 0 then iVal := (dt.mo - 1) div 12
+      else iVal := (dt.mo - 12) div 12;
+      dt.yr := dt.yr + iVal;
+      dt.mo := dt.mo - iVal * 12;
+      if dt.dy > daysInMonth(dt.yr, dt.mo) then
+        dt.nFloor := dt.dy - daysInMonth(dt.yr, dt.mo)
+      else
+        dt.nFloor := 0;
+      while dt.dy > daysInMonth(dt.yr, dt.mo) do begin
+        dt.dy := dt.dy - daysInMonth(dt.yr, dt.mo);
+        Inc(dt.mo);
+        if dt.mo > 12 then begin dt.mo := 1; Inc(dt.yr); end;
+      end;
+      if (dt.yr < -4713) or (dt.yr > 9999) then Exit;
+      dt.jd := toJulianDay(dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+      dt.jd := dt.jd + dadd;
+      fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+      dt.validJD := True;
+      nUsed := i + 6;  { byte after the trailing DD }
+      if zMod[nUsed] = #0 then begin Result := True; Exit; end;
+      if (zMod[nUsed] <> ' ') and
+         (sqlite3Isspace(u8(zMod[nUsed])) = 0) then Exit;
+      Inc(nUsed);
+      if (zMod[nUsed] < '0') or (zMod[nUsed] > '9') or
+         (zMod[nUsed+1] < '0') or (zMod[nUsed+1] > '9') or
+         (zMod[nUsed+2] <> ':') or
+         (zMod[nUsed+3] < '0') or (zMod[nUsed+3] > '9') or
+         (zMod[nUsed+4] < '0') or (zMod[nUsed+4] > '9') then Exit;
+      iVal := (Ord(zMod[nUsed])   - Ord('0')) * 10
+            + (Ord(zMod[nUsed+1]) - Ord('0'));    { h }
+      nUnit := (Ord(zMod[nUsed+3]) - Ord('0')) * 10
+             + (Ord(zMod[nUsed+4]) - Ord('0'));   { m }
+      r := iVal * 3600.0 + nUnit * 60.0;
+      Inc(nUsed, 5);
+      if zMod[nUsed] = ':' then begin
+        Inc(nUsed);
+        if (zMod[nUsed] < '0') or (zMod[nUsed] > '9') or
+           (zMod[nUsed+1] < '0') or (zMod[nUsed+1] > '9') then Exit;
+        iVal := (Ord(zMod[nUsed]) - Ord('0')) * 10
+              + (Ord(zMod[nUsed+1]) - Ord('0')); { s }
+        r := r + iVal;
+        Inc(nUsed, 2);
+        if (zMod[nUsed] = '.')
+           and (zMod[nUsed+1] >= '0') and (zMod[nUsed+1] <= '9') then begin
+          Inc(nUsed);
+          rScale := 1.0; msFrac := 0.0;
+          while (zMod[nUsed] >= '0') and (zMod[nUsed] <= '9') do begin
+            msFrac := msFrac * 10.0 + (Ord(zMod[nUsed]) - Ord('0'));
+            rScale := rScale * 10.0;
+            Inc(nUsed);
+          end;
+          msFrac := msFrac / rScale;
+          if msFrac > 0.999 then msFrac := 0.999;
+          r := r + msFrac;
+        end;
+      end;
+      if zMod^ = '-' then r := -r;
+      dt.jd := dt.jd + r / 86400.0;
+      fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+      dt.validJD := True;
+      Result := True;
+      Exit;
+    end;
   end;
 
   if (zMod^ <> '+') and (zMod^ <> '-') and ((zMod^ < '0') or (zMod^ > '9')) then

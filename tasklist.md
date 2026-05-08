@@ -2669,12 +2669,34 @@ existing dispatcher.
      DiagDate / DiagFunctions / DiagOps / DiagFeatureProbe / DiagDml /
      DiagPragma / DiagWindow / DiagMisc / DiagCast / DiagAggWhere all
      clean; TestSmoke PASS.  Round-trip `datetime(B, timediff(A,B))=A`
-     still fails — Pascal `applyModifier` doesn't accept the
-     `+YYYY-MM-DD HH:MM:SS.SSS` modifier shape (separate gap; date.c
-     parseModifier YMD-modifier arm).  Pre-existing 1-day error in
+     closed under 10.1.bug.71 below.  Pre-existing 1-day error in
      `julianday('9999-12-31')` (returns 5373484.5 instead of
      5373483.5) is in `toJulianDay`, unrelated to this fix; tracked
      below as 10.1.bug.70.
+
+- [X] **10.1.bug.71** Fixed 2026-05-08.  `applyModifier` rejected the
+     `+/-YYYY-MM-DD [HH:MM[:SS[.FFF]]]` modifier shape so
+     `datetime(B, timediff(A,B))` returned NULL instead of A.  Ported
+     date.c:972..1038's YMD-modifier arm + the optional time-of-day
+     suffix to passqlite3codegen.pas:applyModifier.  Detects 5- or
+     6-character year-prefix at zMod[1..i] before the second '-',
+     parses fixed-width YYYY-MM-DD (M in 0..11, D in 0..30), adds Y
+     years and M months with the same `(M-1)/12` rollover and
+     `nFloor` day-overflow capture used by the `+N month` arm, then
+     adds D days via JD arithmetic.  When followed by space + HH:MM
+     (with optional :SS[.FFF]), parses the time-of-day fraction
+     (seconds clipped to 0.999 to match upstream's sub-millisecond
+     truncation per date.c:231) and adds (subtracts when the modifier
+     was `-`) the resulting offset to the JD.  Year-range guard
+     (`Y<-4713 || Y>9999`) mirrors computeJD so out-of-range modifiers
+     return NULL instead of garbage.  Verified byte-identical to
+     upstream: `datetime('2024-01-01', timediff('2024-12-31',
+     '2024-01-01'))` → `2024-12-31 00:00:00`; `+0001-00-00 01:15:30`
+     adds 1 year + 1h15m30s; `-0000-00-01 00:00:00.000` subtracts a
+     day; `+99999-00-00` overflow correctly yields NULL.
+     TestExplainParity 1026/1026; DiagDate / DiagFunctions /
+     DiagFeatureProbe / DiagOps / DiagDml / DiagPragma / DiagWindow /
+     DiagMisc / DiagCast all 0 divergences.
 
 - [X] **10.1.bug.70** Fixed 2026-05-08.  `julianday('9999-12-31')`
      returned 5373484.5 instead of upstream's 5373483.5 (off by +1 day
