@@ -2471,6 +2471,35 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.35** Fixed 2026-05-08.  Date/time arithmetic dropped
+     one second on every relative modifier (`+N seconds/minutes/hours`,
+     `-N minutes`, etc.).  Reproducers:
+     `datetime('2024-01-01 00:00:00','+10 hours')` returned
+     `2024-01-01 09:59:59` instead of `10:00:00`;
+     `datetime('2024-01-01 00:00:00','+30 seconds')` returned `00:00:29`
+     instead of `00:00:30`; `strftime('%H:%M:%S', ..., '+10 hours',
+     '-30 minutes')` returned `09:29:59` instead of `09:30:00`.  Root
+     cause: `fromJulianDay` (passqlite3codegen.pas:47084) decomposed a
+     Double Julian Day via `Trunc(F*24.0)` etc.  The C reference
+     (date.c) carries time as `iJD` — integer milliseconds since the
+     JD epoch — so `+10 hours` is exact.  Pascal's chain
+     `dt.jd := dt.jd + r/24.0;  fromJulianDay(dt.jd, ...);` accumulated
+     enough Double error that 86400000 ms × n fractions came out as
+     just-under, and `Trunc` rounded the missing 1 ms down to a missing
+     1 second.  Fix: reroute `fromJulianDay` through integer
+     millisecond arithmetic — `Round((jd+0.5)*86400000.0)` then
+     decompose by `div`/`mod` against 86400000/3600000/60000.  Mirrors
+     C's `iJD = (sqlite3_int64)((... + 0.5)*86400000)` /
+     `computeYMD_HMS`.  Verified: every previously-broken modifier now
+     matches upstream byte-for-byte (datetime/date/strftime/julianday
+     across +/- seconds/minutes/hours, including end-of-month carry
+     '2000-02-28','+1 day' → '2000-02-29').  Residual: `julianday()`
+     printf precision still differs (16 vs 15 digits) — a separate
+     `%g` formatting concern, not a date-math bug.  TestExplainParity
+     1026/1026; TestSmoke / DiagDate / DiagFunctions / DiagMoreFunc /
+     DiagFeatureProbe / DiagWindow / DiagCast / DiagPragma / DiagDml /
+     DiagOps / DiagTxn / DiagMisc / DiagSampleProg all 0 divergences.
+
 - [X] **10.1.bug.34** Fixed 2026-05-08.  DISTINCT aggregate combined
      with GROUP BY silently produced no rows.  Reproducer:
      `CREATE TABLE t(a,b); INSERT INTO t VALUES(1,'a'),(1,'b'),(2,'c');

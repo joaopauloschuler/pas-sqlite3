@@ -47081,15 +47081,23 @@ begin
   Result := jd;
 end;
 
-{ fromJulianDay — convert Julian Day Number to Y-M-D h:m:s. }
+{ fromJulianDay — convert Julian Day Number to Y-M-D h:m:s.  Mirrors
+  C's date.c iJD semantics: round JD to nearest millisecond before
+  decomposing so accumulated Double error from JD arithmetic does not
+  produce off-by-one second values like 09:29:59 instead of 09:30:00. }
 procedure fromJulianDay(jd: Double; var y, m, d: i32;
   var h, mn: i32; var s: Double);
 var
   Z, A, B, C, D2, E, alpha: i32;
-  F: Double;
+  iJD, ms_in_day: Int64;
 begin
-  Z  := Trunc(jd + 0.5);
-  F  := (jd + 0.5) - Z;
+  iJD := Round((jd + 0.5) * 86400000.0);
+  Z := Integer(iJD div Int64(86400000));
+  ms_in_day := iJD - Int64(Z) * Int64(86400000);
+  if ms_in_day < 0 then begin
+    Inc(ms_in_day, 86400000);
+    Dec(Z);
+  end;
   if Z < 2299161 then A := Z
   else begin
     alpha := Trunc((Z - 1867216.25) / 36524.25);
@@ -47102,9 +47110,11 @@ begin
   d  := B - D2 - Trunc(30.6001 * E);
   if E < 14 then m := E - 1 else m := E - 13;
   if m > 2 then y := C - 4716 else y := C - 4715;
-  h  := Trunc(F * 24.0);
-  mn := Trunc((F * 24.0 - h) * 60.0);
-  s  := ((F * 24.0 - h) * 60.0 - mn) * 60.0;
+  h  := Integer(ms_in_day div Int64(3600000));
+  ms_in_day := ms_in_day - Int64(h) * Int64(3600000);
+  mn := Integer(ms_in_day div Int64(60000));
+  ms_in_day := ms_in_day - Int64(mn) * Int64(60000);
+  s := Double(ms_in_day) / 1000.0;
 end;
 
 function currentJD: Double; forward;
