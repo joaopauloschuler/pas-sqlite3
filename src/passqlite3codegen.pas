@@ -47715,18 +47715,25 @@ begin
   else Result := DIM[m];
 end;
 
-{ toJulianDay — convert Y-M-D h:m:s to Julian Day Number.
-  Formula from SQLite's date.c. }
+{ toJulianDay — convert Y-M-D h:m:s to Julian Day Number.  Mirrors
+  date.c:computeJD (date.c:260..298) byte-for-byte using integer
+  arithmetic.  Earlier port used `Trunc(365.25 * (y+4716))` and
+  `Trunc(30.6001 * (m+1))`; FPC's default literal precision rounded
+  365.25 * 14715 to 5374654.0 (single-precision) instead of the exact
+  5374653.75, giving julianday('9999-12-31') = 5373484.5 instead of
+  5373483.5.  C uses pure integer math (X1 = 36525*(Y+4716)/100,
+  X2 = 306001*(M+1)/10000), which sidesteps the FP rounding entirely. }
 function toJulianDay(y, m, d: i32; h, min: i32; s: Double): Double;
 var
-  Y2, A, B, X1: i32;
+  A, B, X1, X2: i32;
   jd: Double;
 begin
   if m <= 2 then begin dec(y); inc(m, 12); end;
-  A := y div 100;
-  B := 2 - A + (A div 4);
-  X1 := Trunc(365.25 * (y + 4716));
-  jd := X1 + Trunc(30.6001 * (m + 1)) + d + B - 1524.5;
+  A := (y + 4800) div 100;
+  B := 38 - A + (A div 4);
+  X1 := (36525 * (y + 4716)) div 100;
+  X2 := (306001 * (m + 1)) div 10000;
+  jd := X1 + X2 + d + B - 1524.5;
   jd := jd + (h + (min + s/60.0)/60.0)/24.0;
   Result := jd;
 end;

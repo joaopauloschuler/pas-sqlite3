@@ -2676,13 +2676,25 @@ existing dispatcher.
      5373483.5) is in `toJulianDay`, unrelated to this fix; tracked
      below as 10.1.bug.70.
 
-- [ ] **10.1.bug.70** `julianday('9999-12-31')` returns 5373484.5;
-     upstream returns 5373483.5.  Off-by-one for the very-end-of-range
-     date.  Suspect: `toJulianDay` (passqlite3codegen.pas) integer-
-     truncation pattern around `Trunc(365.25 * (y + 4716))` accumulates
-     a 1-day error for the largest supported year.  `date('9999-12-31')`
-     itself prints fine (parse path); only `julianday` is affected.
-     `date(julianday('9999-12-31'))` round-trips to `9999-12-30`.
+- [X] **10.1.bug.70** Fixed 2026-05-08.  `julianday('9999-12-31')`
+     returned 5373484.5 instead of upstream's 5373483.5 (off by +1 day
+     across the entire year 9999).  Root cause: `toJulianDay`
+     (passqlite3codegen.pas:47720) used `Trunc(365.25 * (y + 4716))`
+     which FPC compiled as a single-precision multiply for the 365.25
+     literal — `365.25 * 14715` rounds to 5374654.0 in single precision
+     instead of the exact 5374653.75, shifting the final JD by +1.
+     Confirmed via probe: `Double(365.25) * 14715 = 5374653.75` but
+     bare `365.25 * 14715 = 5374654.0`.  Fix: replaced the FP
+     formulation with date.c:281..285's pure integer arithmetic
+     (A=(Y+4800)/100; B=38-A+(A/4); X1=36525*(Y+4716)/100;
+     X2=306001*(M+1)/10000), which sidesteps FP precision entirely
+     and matches upstream byte-for-byte across the full -4713..9999
+     range.  Verified: julianday('9999-12-31')=5373483.5,
+     julianday('9999-12-30')=5373482.5, julianday('-4713-11-24')=NULL,
+     julianday('1970-01-01')=2440587.5 all match upstream.
+     TestExplainParity 1026/1026; DiagDate / DiagFunctions /
+     DiagFeatureProbe / DiagOps / DiagDml / DiagWindow / DiagPragma /
+     DiagMisc / DiagCast / DiagTxn all 0 divergences.
 
 - [X] **10.1.bug.68** Fixed 2026-05-08.  Step-time errors (e.g.
      `SELECT abs(-9223372036854775808);` with stdin pipe) printed
