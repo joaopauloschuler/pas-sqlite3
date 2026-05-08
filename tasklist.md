@@ -2648,6 +2648,42 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.61** Fixed 2026-05-08.  `DETACH <name>` always reported
+     `no such database: ` (empty name) and could leave the engine in a
+     state that crashed a subsequent statement with EAccessViolation.
+     Reproducer: `DETACH bogus;` returned `Runtime error: no such
+     database: ` instead of `... bogus`; `ATTACH ':memory:' AS aux;
+     ... DETACH aux;` followed by another statement could AV.
+     Root cause: `sqlite3Detach` (passqlite3codegen.pas:40643) called
+     `codeAttach(...,pAuthArg=pDbname, pFilename=nil, pDbname=pDbname,
+     pKey=nil)`.  C upstream (attach.c:445) passes `pKey=pDbname`, not
+     `pDbname=pDbname` — the dbname-expression slot is `pKey` because
+     codeAttach codes `pFilename`, `pDbname`, `pKey` into
+     `regArgs+0..2` and detachFunc has `nArg=1`, so the function call
+     reads `argv[0]` from `regArgs+3-1 = regArgs+2` (the pKey slot).
+     Pas was coding the dbname into the `pDbname` slot (regArgs+1) and
+     leaving regArgs+2 as a NULL Mem, so `detachFunc` saw an empty zName
+     and bailed via the `no such database: ` error path.  Fix: pass
+     `pKey=pDbname` and `pDbname=nil` to match attach.c:445.
+     Verified: `DETACH bogus;` now reports `no such database: bogus`;
+     `ATTACH ':memory:' AS aux; SELECT name FROM pragma_database_list;
+     DETACH aux; SELECT 'ok';` returns `main / aux / ok` byte-identical
+     to upstream.  TestExplainParity 1026/1026; TestSmoke PASS;
+     DiagFunctions / DiagFeatureProbe / DiagOps / DiagDml / DiagWindow
+     / DiagMoreFunc / DiagPragma all 0 divergences.
+
+- [X] **10.1.bug.60** Fixed 2026-05-08.  `log(100)` and `log10(100)`
+     returned `1.9999999999999998` instead of `2.0`; `log2` similarly
+     skewed.  Root cause: `logFunc` (passqlite3codegen.pas:43964)
+     approximated log10 via `Ln(x) * 0.4342944819032517867` and log2 via
+     `Ln(x) * 1.442695040888963456`.  C upstream (func.c:2536..2552)
+     calls libm's `log10()` / `log2()` directly, which give exact
+     results for power-of-base inputs.  Fix: route through FPC's
+     `Math.Log10` / `Math.Log2`, which delegate to libm.  Verified:
+     `SELECT log(100), log10(100), log2(8)` now returns `2.0|2.0|3.0`
+     byte-identical to upstream 3.53.0.  TestExplainParity 1026/1026;
+     DiagFunctions / DiagMoreFunc / DiagFeatureProbe all 0 divergences.
+
 - [X] **10.1.bug.58** Fixed 2026-05-08.  Row-value `IN ((v1,w1),(v2,w2))`
      and `(a,b) IN (VALUES(...),...)` always returned zero rows; symmetric
      `NOT IN` always returned all rows.  Reproducer:

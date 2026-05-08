@@ -40645,7 +40645,7 @@ procedure sqlite3Detach(pParse: PParse; pDbname: PExpr);
 begin
   attachFuncsInit;
   codeAttach(pParse, SQLITE_DETACH, @gDetachFunc, pDbname,
-             nil, pDbname, nil);
+             nil, nil, pDbname);
 end;
 
 { sqlite3Attach — port of attach.c:440.  Parser entry point for
@@ -43983,8 +43983,8 @@ begin
   end else begin
     tag := PtrInt(sqlite3_user_data(pCtx));
     case tag of
-      MATH_TAG_LOG10: ans := System.Ln(x) * 0.4342944819032517867;
-      MATH_TAG_LOG2:  ans := System.Ln(x) * 1.442695040888963456;
+      MATH_TAG_LOG10: ans := Math.Log10(x);
+      MATH_TAG_LOG2:  ans := Math.Log2(x);
     else
       ans := System.Ln(x);
     end;
