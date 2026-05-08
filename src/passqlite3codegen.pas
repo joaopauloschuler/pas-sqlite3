@@ -24985,24 +24985,64 @@ begin
   pItem    := SrcListItems(pTabList);
   pTab     := pItem^.pSTab;
 
-  { All source items must be real, non-virtual base tables — no subqueries,
-    no vtabs, no view expansion in this slice. }
+  { 10.1.bug.47 — Multi-source FROM with subquery items: pre-materialise
+    each sub-SELECT into an ephemeral rowid table BEFORE the multi-table
+    scan loop.  WhereBegin's open prologue at codegen.pas:17077 skips
+    re-opening cursors with TF_Ephemeral so the eph populated here is
+    scanned in place.  Mirrors C select.c per-source coroutine/eph fan-out
+    inside sqlite3WhereBegin.  Without this pass, SELECT … FROM (SELECT …) x,
+    (SELECT …) y emits the 3-op stub (Init/Halt/Goto). }
+  if pTabList^.nSrc > 1 then
+  begin
+    v := sqlite3GetVdbe(pParse);
+    if v <> nil then
+    begin
+      for i := 0 to pTabList^.nSrc - 1 do
+      begin
+        pItem := @SrcListItems(pTabList)[i];
+        if ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+           and ((pItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) = 0)
+           and (pItem^.u4.pSubq <> nil)
+           and (pItem^.u4.pSubq^.pSelect <> nil)
+           and (pItem^.pSTab <> nil) then
+        begin
+          if pItem^.iCursor < 0 then
+          begin
+            pItem^.iCursor := pParse^.nTab;
+            Inc(pParse^.nTab);
+          end;
+          sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pItem^.iCursor,
+                            pItem^.pSTab^.nCol);
+          sqlite3SelectDestInit(@innerDest, SRT_EphemTab, pItem^.iCursor);
+          if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+          begin
+            Result := SQLITE_ERROR; Exit;
+          end;
+        end;
+      end;
+    end;
+    pItem := SrcListItems(pTabList);
+    pTab  := pItem^.pSTab;
+  end;
+
+  { All source items must be real, non-virtual base tables — no vtabs,
+    no view expansion in this slice.  Subquery sources are allowed when
+    the pre-materialisation pass above has populated their eph cursor.  }
   for i := 0 to pTabList^.nSrc - 1 do
   begin
     pTab := SrcListItems(pTabList)[i].pSTab;
     if pTab = nil then begin Result := SQLITE_OK; Exit; end;
-    if SrcListItems(pTabList)[i].fg.fgBits and SRCITEM_FG_IS_SUBQUERY <> 0 then
-      begin Result := SQLITE_OK; Exit; end;
     if pTab^.eTabType = TABTYP_VTAB then begin Result := SQLITE_OK; Exit; end;
     { 6.10 step 9(f) — allow TF_Ephemeral source items that are recursive-CTE
-      pseudo-cursors (fgBits bit 7 set).  Their cursor is the OP_OpenPseudo
-      iCurrent opened by generateWithRecursiveQuery; WhereBegin's own open
-      prelude (codegen.pas:16887..16893) already skips opening it again, and
-      wherecode.c's isRecursive arm (codegen.pas:18553) makes the level a
-      no-op so no Rewind/Next is emitted.  Mirrors C select.c which lets
-      the standard scan path drive recursive sources. }
+      pseudo-cursors (fgBits bit 7 set), or post-materialisation subquery
+      sources (SRCITEM_FG_IS_SUBQUERY set, materialised by the pre-pass
+      above).  Their cursor is opened independently; WhereBegin's open
+      prelude (codegen.pas:17077) skips opening TF_Ephemeral cursors so
+      no double-open occurs.  Mirrors C select.c which lets the standard
+      scan path drive ephemeral sources. }
     if ((pTab^.tabFlags and TF_Ephemeral) <> 0)
-       and ((SrcListItems(pTabList)[i].fg.fgBits and u8($80)) = 0) then
+       and ((SrcListItems(pTabList)[i].fg.fgBits
+             and (u8($80) or SRCITEM_FG_IS_SUBQUERY)) = 0) then
       begin Result := SQLITE_OK; Exit; end;
   end;
   { Restore pTab to the first source for legacy single-table code below. }

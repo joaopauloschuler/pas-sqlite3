@@ -2626,6 +2626,41 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.47** Fixed 2026-05-08.  Multi-source FROM containing
+     sub-SELECT items returned no rows.  Reproducer:
+     `SELECT x.a, y.b FROM (SELECT 1 a) x, (SELECT 2 b) y;` emitted only
+     the 3-op stub (Init/Halt/Goto); same shape for any cross-join /
+     comma-join / explicit JOIN where one or more FROM items is a
+     sub-SELECT (compound or non-compound).  Root cause: the multi-source
+     bail loop in `sqlite3Select` (passqlite3codegen.pas:24988) early-
+     returned SQLITE_OK when ANY source had `SRCITEM_FG_IS_SUBQUERY` set,
+     and again when `TF_Ephemeral` was set on the synthetic pTab built
+     by selectExpander.  The single-source materialise / co-routine arms
+     (codegen.pas:24661/24878) cover the nSrc=1 case but bailed for
+     nSrc>1.  Fix: add a pre-materialisation pass before the multi-source
+     loop that walks every SrcItem with `SRCITEM_FG_IS_SUBQUERY` (and not
+     already viaCoroutine), allocates an iCursor when needed, emits
+     `OP_OpenEphemeral iCsr, pTab^.nCol`, and recursively codes the inner
+     SELECT into it via SRT_EphemTab.  WhereBegin's open prologue
+     (codegen.pas:17077) already skips re-opening cursors with
+     TF_Ephemeral, so no double-open occurs and the standard multi-table
+     scan path then drives Rewind/Next over the populated eph table.
+     The bail check is also relaxed to admit subquery sources (which now
+     have valid iCursor + populated eph backing).  Verified byte-
+     identical to upstream for `(SELECT N) x, (SELECT M) y`,
+     `(SELECT … UNION SELECT …) x, (SELECT … UNION ALL SELECT …) y`,
+     mixed `subq, real-table` cross-join, and 3-way mixes.
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic / TestSelectBasic
+     / TestWhereBasic / TestVdbeAgg / TestSchemaBasic / TestPrepareBasic /
+     TestParser / TestVdbeRecord / TestBytecodeParity / TestWindowBasic
+     all clean; DiagOps / DiagDml / DiagFunctions / DiagFeatureProbe /
+     DiagWindow / DiagPragma / DiagMisc / DiagTxn / DiagCast / DiagDate /
+     DiagAnalyze / DiagDropTable / DiagCovering / DiagIndexing /
+     DiagPredicates / DiagSubsel / DiagAggWhere / DiagInnerJoin /
+     DiagMultiValues / DiagMoreFunc / DiagLikeGlob / DiagOrderLimitTopN /
+     DiagPrintfFmt / DiagSumOverflow / DiagBloom / DiagAutoIdx /
+     DiagJoinTrace / DiagCreateIdx / DiagSampleProg all 0 divergences.
+
 - [X] **10.1.bug.46** Fixed 2026-05-08.  3+ way INNER/LEFT JOINs (and any
      aggregate over them) silently emitted only the 3-op stub
      (Init/Halt/Goto), returning no rows.  Reproducer:
