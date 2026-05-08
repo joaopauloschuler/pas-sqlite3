@@ -746,10 +746,15 @@ end;
   Cleanup
   --------------------------------------------------------------- }
 
+procedure recoverWriteDataCleanup(p: Psqlite3_recover); forward;
+procedure recoverLostAndFoundCleanup(p: Psqlite3_recover); forward;
+
 procedure recoverFinalCleanup(p: Psqlite3_recover);
 var pTab, pNext: PRecoverTable;
 begin
   if p = nil then Exit;
+  recoverWriteDataCleanup(p);
+  recoverLostAndFoundCleanup(p);
   pTab := p^.pTblList;
   while pTab <> nil do begin
     pNext := pTab^.pNext;
@@ -1237,6 +1242,434 @@ begin
 end;
 
 { ---------------------------------------------------------------
+  Lost-and-found pipeline (sqlite3recover.c:1386..2019).
+
+  Three RECOVER_STATE_LOSTANDFOUND states cooperate:
+    LAF1 — drive recovery.map with the seed page set so every
+           input page that is reachable through the recovered
+           schema (or, when bFreelistCorrupt=0, the freelist) is
+           marked in pUsed.
+    LAF2 — for every (parent, child) pair in sqlite_dbptr —
+           plus every page from 1..nPg as a fallback — if the
+           page is not already in pUsed, insert it into
+           recovery.map and update nMaxField.
+    LAF3 — once nMaxField is known, create the lost_and_found
+           output table (with rootpgno/pgno/nfield/id/c0..cN
+           columns) and walk every page not in pUsed, emitting
+           one row per recovered cell.
+  --------------------------------------------------------------- }
+
+function recoverLostAndFoundCreate(p: Psqlite3_recover; nField: i32): PAnsiChar;
+var
+  zTbl: PAnsiChar;
+  pProbe: PVdbe;
+  ii: i32;
+  bFail: i32;
+  zSep, zField, zSql, zOld: PAnsiChar;
+begin
+  zTbl := nil;
+  pProbe := recoverPrepare(p, p^.dbOut,
+    'SELECT 1 FROM sqlite_schema WHERE name=?');
+  ii := -1;
+  while (zTbl = nil) and (p^.errCode = SQLITE_OK) and (ii < 1000) do begin
+    bFail := 0;
+    if ii < 0 then
+      zTbl := recoverMPrintf(p, '%s', [p^.zLostAndFound])
+    else
+      zTbl := recoverMPrintf(p, '%s_%d', [p^.zLostAndFound, ii]);
+
+    if p^.errCode = SQLITE_OK then begin
+      sqlite3_bind_text(pProbe, 1, zTbl, -1, SQLITE_STATIC);
+      if sqlite3_step(pProbe) = SQLITE_ROW then bFail := 1;
+      recoverReset(p, pProbe);
+    end;
+
+    if bFail <> 0 then begin
+      sqlite3_clear_bindings(pProbe);
+      sqlite3_free(zTbl);
+      zTbl := nil;
+    end;
+    Inc(ii);
+  end;
+  recoverFinalize(p, pProbe);
+
+  if zTbl <> nil then begin
+    zField := nil;
+    zSep := 'rootpgno INTEGER, pgno INTEGER, nfield INTEGER, id INTEGER, ';
+    ii := 0;
+    while (p^.errCode = SQLITE_OK) and (ii < nField) do begin
+      zOld := zField;
+      if zOld <> nil then
+        zField := recoverMPrintf(p, '%s%sc%d', [zOld, zSep, ii])
+      else
+        zField := recoverMPrintf(p, '%sc%d', [zSep, ii]);
+      if zOld <> nil then sqlite3_free(zOld);
+      zSep := ', ';
+      Inc(ii);
+    end;
+
+    zSql := recoverMPrintf(p, 'CREATE TABLE %s(%s)', [zTbl, zField]);
+    if zField <> nil then sqlite3_free(zField);
+
+    recoverExec(p, p^.dbOut, zSql);
+    recoverSqlCallback(p, zSql);
+    if zSql <> nil then sqlite3_free(zSql);
+  end else if p^.errCode = SQLITE_OK then begin
+    recoverError(p, SQLITE_ERROR,
+      'failed to create %s output table', [p^.zLostAndFound]);
+  end;
+
+  Result := zTbl;
+end;
+
+function recoverLostAndFoundInsert(p: Psqlite3_recover;
+  zTab: PAnsiChar; nField: i32): PVdbe;
+var
+  nTotal, ii: i32;
+  zBind, zOld, zSep: PAnsiChar;
+  pRet: PVdbe;
+begin
+  nTotal := nField + 4;
+  zBind := nil;
+  pRet := nil;
+
+  if not Assigned(p^.xSql) then begin
+    for ii := 0 to nTotal - 1 do begin
+      zOld := zBind;
+      if zOld <> nil then
+        zBind := recoverMPrintf(p, '%s, ?', [zOld])
+      else
+        zBind := recoverMPrintf(p, '?', []);
+      if zOld <> nil then sqlite3_free(zOld);
+    end;
+    pRet := recoverPreparePrintf(p, p^.dbOut,
+      'INSERT INTO %s VALUES(%s)', [zTab, zBind]);
+  end else begin
+    zSep := '';
+    for ii := 0 to nTotal - 1 do begin
+      zOld := zBind;
+      if zOld <> nil then
+        zBind := recoverMPrintf(p, '%s%squote(?)', [zOld, zSep])
+      else
+        zBind := recoverMPrintf(p, 'quote(?)', []);
+      if zOld <> nil then sqlite3_free(zOld);
+      zSep := '|| '', '' ||';
+    end;
+    pRet := recoverPreparePrintf(p, p^.dbOut,
+      'SELECT ''INSERT INTO %s VALUES('' || %s || '')''',
+      [zTab, zBind]);
+  end;
+
+  if zBind <> nil then sqlite3_free(zBind);
+  Result := pRet;
+end;
+
+function recoverLostAndFoundFindRoot(p: Psqlite3_recover;
+  iPg: i64; var iRoot: i64): i32;
+var pLaf: PRecoverStateLAF;
+begin
+  pLaf := @p^.laf;
+  if pLaf^.pFindRoot = nil then begin
+    pLaf^.pFindRoot := recoverPrepare(p, p^.dbOut,
+      'WITH RECURSIVE p(pgno) AS (' +
+      '  SELECT ?' +
+      '    UNION' +
+      '  SELECT parent FROM recovery.map AS m, p WHERE m.pgno=p.pgno' +
+      ') ' +
+      'SELECT p.pgno FROM p, recovery.map m WHERE m.pgno=p.pgno ' +
+      '    AND m.parent IS NULL');
+  end;
+  if p^.errCode = SQLITE_OK then begin
+    sqlite3_bind_int64(pLaf^.pFindRoot, 1, iPg);
+    if sqlite3_step(pLaf^.pFindRoot) = SQLITE_ROW then
+      iRoot := sqlite3_column_int64(pLaf^.pFindRoot, 0)
+    else
+      iRoot := iPg;
+    recoverReset(p, pLaf^.pFindRoot);
+  end;
+  Result := p^.errCode;
+end;
+
+procedure recoverLostAndFoundOnePage(p: Psqlite3_recover; iPage: i64);
+var
+  pLaf: PRecoverStateLAF;
+  apVal: PPsqlite3_value;
+  pPageData, pInsert: PVdbe;
+  nVal, iPrevCell, bHaveRowid, ii, iCell, iField: i32;
+  iRoot, iRowid: i64;
+  pVal: Psqlite3_value;
+begin
+  pLaf := @p^.laf;
+  apVal := PPsqlite3_value(pLaf^.apVal);
+  pPageData := pLaf^.pPageData;
+  pInsert := pLaf^.pInsert;
+  nVal := -1;
+  iPrevCell := 0;
+  iRoot := 0;
+  bHaveRowid := 0;
+  iRowid := 0;
+
+  if recoverLostAndFoundFindRoot(p, iPage, iRoot) <> 0 then Exit;
+  sqlite3_bind_int64(pPageData, 1, iPage);
+  while (p^.errCode = SQLITE_OK) and (sqlite3_step(pPageData) = SQLITE_ROW) do begin
+    iCell  := sqlite3_column_int64(pPageData, 0);
+    iField := sqlite3_column_int64(pPageData, 1);
+
+    if (iPrevCell <> iCell) and (nVal >= 0) then begin
+      sqlite3_bind_int64(pInsert, 1, iRoot);
+      sqlite3_bind_int64(pInsert, 2, iPage);
+      sqlite3_bind_int(pInsert, 3, nVal);
+      if bHaveRowid <> 0 then
+        sqlite3_bind_int64(pInsert, 4, iRowid);
+      for ii := 0 to nVal - 1 do
+        recoverBindValue(p, pInsert, 5 + ii, apVal[ii]);
+      if sqlite3_step(pInsert) = SQLITE_ROW then
+        recoverSqlCallback(p, PAnsiChar(sqlite3_column_text(pInsert, 0)));
+      recoverReset(p, pInsert);
+
+      for ii := 0 to nVal - 1 do begin
+        sqlite3_value_free(apVal[ii]);
+        apVal[ii] := nil;
+      end;
+      sqlite3_clear_bindings(pInsert);
+      bHaveRowid := 0;
+      nVal := -1;
+    end;
+
+    if iCell < 0 then Break;
+
+    if iField < 0 then begin
+      Assert(nVal = -1);
+      iRowid := sqlite3_column_int64(pPageData, 2);
+      bHaveRowid := 1;
+      nVal := 0;
+    end else if iField < pLaf^.nMaxField then begin
+      pVal := sqlite3_column_value(pPageData, 2);
+      apVal[iField] := sqlite3_value_dup(pVal);
+      Assert((iField = nVal) or ((nVal = -1) and (iField = 0)));
+      nVal := iField + 1;
+      if apVal[iField] = nil then
+        recoverError(p, SQLITE_NOMEM, nil, []);
+    end;
+
+    iPrevCell := iCell;
+  end;
+  recoverReset(p, pPageData);
+
+  for ii := 0 to nVal - 1 do begin
+    sqlite3_value_free(apVal[ii]);
+    apVal[ii] := nil;
+  end;
+end;
+
+procedure recoverLostAndFound1Init(p: Psqlite3_recover);
+var
+  pLaf: PRecoverStateLAF;
+  pStmt: PVdbe;
+begin
+  pLaf := @p^.laf;
+  Assert(p^.laf.pUsed = nil);
+  pLaf^.nPg := recoverPageCount(p);
+  pLaf^.pUsed := recoverBitmapAlloc(p, pLaf^.nPg);
+
+  pStmt := recoverPrepare(p, p^.dbOut,
+    'WITH trunk(pgno) AS (' +
+    '  SELECT read_i32(getpage(1), 8) AS x WHERE x>0' +
+    '    UNION' +
+    '  SELECT read_i32(getpage(trunk.pgno), 0) AS x FROM trunk WHERE x>0' +
+    '),' +
+    'trunkdata(pgno, data) AS (' +
+    '  SELECT pgno, getpage(pgno) FROM trunk' +
+    '),' +
+    'freelist(data, n, freepgno) AS (' +
+    '  SELECT data, min(16384, read_i32(data, 1)-1), pgno FROM trunkdata' +
+    '    UNION ALL' +
+    '  SELECT data, n-1, read_i32(data, 2+n) FROM freelist WHERE n>=0' +
+    '),' +
+    '' +
+    'roots(r) AS (' +
+    '  SELECT 1 UNION ALL' +
+    '  SELECT rootpage FROM recovery.schema WHERE rootpage>0' +
+    '),' +
+    'used(page) AS (' +
+    '  SELECT r FROM roots' +
+    '    UNION' +
+    '  SELECT child FROM sqlite_dbptr(''getpage()''), used ' +
+    '    WHERE pgno=page' +
+    ') ' +
+    'SELECT page FROM used' +
+    ' UNION ALL ' +
+    'SELECT freepgno FROM freelist WHERE NOT ?');
+  if pStmt <> nil then sqlite3_bind_int(pStmt, 1, p^.bFreelistCorrupt);
+  pLaf^.pUsedPages := pStmt;
+end;
+
+function recoverLostAndFound1Step(p: Psqlite3_recover): i32;
+var
+  pLaf: PRecoverStateLAF;
+  rc: i32;
+  iPg: i64;
+begin
+  pLaf := @p^.laf;
+  rc := p^.errCode;
+  if rc = SQLITE_OK then begin
+    rc := sqlite3_step(pLaf^.pUsedPages);
+    if rc = SQLITE_ROW then begin
+      iPg := sqlite3_column_int64(pLaf^.pUsedPages, 0);
+      recoverBitmapSet(pLaf^.pUsed, iPg);
+      rc := SQLITE_OK;
+    end else begin
+      recoverFinalize(p, pLaf^.pUsedPages);
+      pLaf^.pUsedPages := nil;
+    end;
+  end;
+  Result := rc;
+end;
+
+procedure recoverLostAndFound2Init(p: Psqlite3_recover);
+var pLaf: PRecoverStateLAF;
+begin
+  pLaf := @p^.laf;
+  Assert(p^.laf.pAllAndParent = nil);
+  Assert(p^.laf.pMapInsert = nil);
+  Assert(p^.laf.pMaxField = nil);
+  Assert(p^.laf.nMaxField = 0);
+
+  pLaf^.pMapInsert := recoverPrepare(p, p^.dbOut,
+    'INSERT OR IGNORE INTO recovery.map(pgno, parent) VALUES(?, ?)');
+  pLaf^.pAllAndParent := recoverPreparePrintf(p, p^.dbOut,
+    'WITH RECURSIVE seq(ii) AS (' +
+    '  SELECT 1 UNION ALL SELECT ii+1 FROM seq WHERE ii<%lld' +
+    ')' +
+    'SELECT pgno, child FROM sqlite_dbptr(''getpage()'') ' +
+    ' UNION ALL ' +
+    'SELECT NULL, ii FROM seq', [p^.laf.nPg]);
+  pLaf^.pMaxField := recoverPreparePrintf(p, p^.dbOut,
+    'SELECT max(field)+1 FROM sqlite_dbdata(''getpage'') WHERE pgno = ?',
+    []);
+end;
+
+function recoverLostAndFound2Step(p: Psqlite3_recover): i32;
+var
+  pLaf: PRecoverStateLAF;
+  res: i32;
+  iChild: i64;
+  nMax: i32;
+begin
+  pLaf := @p^.laf;
+  if p^.errCode = SQLITE_OK then begin
+    res := sqlite3_step(pLaf^.pAllAndParent);
+    if res = SQLITE_ROW then begin
+      iChild := sqlite3_column_int(pLaf^.pAllAndParent, 1);
+      if recoverBitmapQuery(pLaf^.pUsed, iChild) = 0 then begin
+        sqlite3_bind_int64(pLaf^.pMapInsert, 1, iChild);
+        sqlite3_bind_value(pLaf^.pMapInsert, 2,
+          sqlite3_column_value(pLaf^.pAllAndParent, 0));
+        sqlite3_step(pLaf^.pMapInsert);
+        recoverReset(p, pLaf^.pMapInsert);
+        sqlite3_bind_int64(pLaf^.pMaxField, 1, iChild);
+        if sqlite3_step(pLaf^.pMaxField) = SQLITE_ROW then begin
+          nMax := sqlite3_column_int(pLaf^.pMaxField, 0);
+          if nMax > pLaf^.nMaxField then pLaf^.nMaxField := nMax;
+        end;
+        recoverReset(p, pLaf^.pMaxField);
+      end;
+    end else begin
+      recoverFinalize(p, pLaf^.pAllAndParent);
+      pLaf^.pAllAndParent := nil;
+      Result := SQLITE_DONE;
+      Exit;
+    end;
+  end;
+  Result := p^.errCode;
+end;
+
+procedure recoverLostAndFound3Init(p: Psqlite3_recover);
+var
+  pLaf: PRecoverStateLAF;
+  zTab: PAnsiChar;
+begin
+  pLaf := @p^.laf;
+  if pLaf^.nMaxField > 0 then begin
+    zTab := recoverLostAndFoundCreate(p, pLaf^.nMaxField);
+    pLaf^.pInsert := recoverLostAndFoundInsert(p, zTab, pLaf^.nMaxField);
+    if zTab <> nil then sqlite3_free(zTab);
+
+    pLaf^.pAllPage := recoverPreparePrintf(p, p^.dbOut,
+      'WITH RECURSIVE seq(ii) AS (' +
+      '  SELECT 1 UNION ALL SELECT ii+1 FROM seq WHERE ii<%lld' +
+      ')' +
+      'SELECT ii FROM seq', [p^.laf.nPg]);
+    pLaf^.pPageData := recoverPrepare(p, p^.dbOut,
+      'SELECT cell, field, value ' +
+      'FROM sqlite_dbdata(''getpage()'') d WHERE d.pgno=? ' +
+      'UNION ALL ' +
+      'SELECT -1, -1, -1');
+
+    pLaf^.apVal := recoverMalloc(p, pLaf^.nMaxField * SizeOf(Pointer));
+  end;
+end;
+
+function recoverLostAndFound3Step(p: Psqlite3_recover): i32;
+var
+  pLaf: PRecoverStateLAF;
+  res: i32;
+  iPage: i64;
+begin
+  pLaf := @p^.laf;
+  if p^.errCode = SQLITE_OK then begin
+    if pLaf^.pInsert = nil then begin
+      Result := SQLITE_DONE; Exit;
+    end else begin
+      if p^.errCode = SQLITE_OK then begin
+        res := sqlite3_step(pLaf^.pAllPage);
+        if res = SQLITE_ROW then begin
+          iPage := sqlite3_column_int64(pLaf^.pAllPage, 0);
+          if recoverBitmapQuery(pLaf^.pUsed, iPage) = 0 then
+            recoverLostAndFoundOnePage(p, iPage);
+        end else begin
+          recoverReset(p, pLaf^.pAllPage);
+          Result := SQLITE_DONE; Exit;
+        end;
+      end;
+    end;
+  end;
+  Result := SQLITE_OK;
+end;
+
+procedure recoverLostAndFoundCleanup(p: Psqlite3_recover);
+var
+  apVal: PPsqlite3_value;
+  ii: i32;
+begin
+  recoverBitmapFree(p^.laf.pUsed);
+  p^.laf.pUsed := nil;
+  sqlite3_finalize(p^.laf.pUsedPages);
+  sqlite3_finalize(p^.laf.pAllAndParent);
+  sqlite3_finalize(p^.laf.pMapInsert);
+  sqlite3_finalize(p^.laf.pMaxField);
+  sqlite3_finalize(p^.laf.pFindRoot);
+  sqlite3_finalize(p^.laf.pInsert);
+  sqlite3_finalize(p^.laf.pAllPage);
+  sqlite3_finalize(p^.laf.pPageData);
+  p^.laf.pUsedPages    := nil;
+  p^.laf.pAllAndParent := nil;
+  p^.laf.pMapInsert    := nil;
+  p^.laf.pMaxField     := nil;
+  p^.laf.pFindRoot     := nil;
+  p^.laf.pInsert       := nil;
+  p^.laf.pAllPage      := nil;
+  p^.laf.pPageData     := nil;
+  apVal := PPsqlite3_value(p^.laf.apVal);
+  if apVal <> nil then begin
+    for ii := 0 to p^.laf.nMaxField - 1 do
+      if apVal[ii] <> nil then sqlite3_value_free(apVal[ii]);
+    sqlite3_free(apVal);
+  end;
+  p^.laf.apVal := nil;
+end;
+
+{ ---------------------------------------------------------------
   recoverStep — initial-cut state machine.
 
   The full upstream pipeline is:
@@ -1288,11 +1721,32 @@ begin
       begin
         if recoverWriteDataStep(p) = SQLITE_DONE then begin
           recoverWriteDataCleanup(p);
-          { Lost-and-found pipeline (RECOVER_STATE_LOSTANDFOUND*) is not
-            yet ported — skip directly to SCHEMA2 once data extraction
-            completes. }
-          p^.eState := RECOVER_STATE_SCHEMA2;
+          if p^.zLostAndFound <> nil then begin
+            recoverLostAndFound1Init(p);
+            p^.eState := RECOVER_STATE_LOSTANDFOUND1;
+          end else begin
+            p^.eState := RECOVER_STATE_SCHEMA2;
+          end;
         end;
+      end;
+    RECOVER_STATE_LOSTANDFOUND1:
+      begin
+        if recoverLostAndFound1Step(p) = SQLITE_DONE then begin
+          recoverLostAndFound2Init(p);
+          p^.eState := RECOVER_STATE_LOSTANDFOUND2;
+        end;
+      end;
+    RECOVER_STATE_LOSTANDFOUND2:
+      begin
+        if recoverLostAndFound2Step(p) = SQLITE_DONE then begin
+          recoverLostAndFound3Init(p);
+          p^.eState := RECOVER_STATE_LOSTANDFOUND3;
+        end;
+      end;
+    RECOVER_STATE_LOSTANDFOUND3:
+      begin
+        if recoverLostAndFound3Step(p) = SQLITE_DONE then
+          p^.eState := RECOVER_STATE_SCHEMA2;
       end;
     RECOVER_STATE_SCHEMA2:
       begin

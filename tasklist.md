@@ -1316,9 +1316,38 @@ existing dispatcher.
          * State machine extended to drive INIT → WRITING → SCHEMA2
            → DONE; per-state `sqlite3_recover_step` hand-off so
            `_run` polls correctly.
+       Phase 10.1.48 LAF arm landed 2026-05-08 (~370 new lines):
+         * `recoverLostAndFoundCreate` allocates the
+           `lost_and_found[_N]` output table with rootpgno/pgno/
+           nfield/id/c0..cN columns (probes sqlite_schema 1000×
+           for a free name), running through recoverExec +
+           recoverSqlCallback like upstream.
+         * `recoverLostAndFoundInsert` synthesises the bulk
+           INSERT statement (or, when an xSql callback is set, the
+           textual `'INSERT INTO ... VALUES(' || quote(?) || ',' || ...`
+           shape).
+         * `recoverLostAndFoundFindRoot` runs the WITH RECURSIVE
+           parent-walk over `recovery.map`, falling back to iPg
+           when no chain terminates.
+         * `recoverLostAndFoundOnePage` drives sqlite_dbdata against
+           one page, accumulates per-cell apVal[] entries, and
+           flushes a row through pInsert on each cell boundary.
+         * `recoverLostAndFound1Init/Step` populate pUsed via the
+           freelist + roots WITH-RECURSIVE seed query.
+         * `recoverLostAndFound2Init/Step` walk every (pgno, child)
+           pair plus the seq fallback, INSERT OR IGNORE into
+           recovery.map and update nMaxField via
+           `max(field)+1 FROM sqlite_dbdata`.
+         * `recoverLostAndFound3Init/Step` create the output
+           lost_and_found table and walk every page not in pUsed.
+         * `recoverLostAndFoundCleanup` finalizes all 8 LAF
+           statements + the bitmap and frees apVal.
+         * `recoverFinalCleanup` now invokes both
+           recoverWriteDataCleanup and recoverLostAndFoundCleanup.
+         * State machine extended: WRITING done →
+           (zLostAndFound != nil ? LOSTANDFOUND1 : SCHEMA2);
+           LAF1 → LAF2 → LAF3 → SCHEMA2 hand-off.
        Deferred (subsequent commits):
-         * `recoverLostAndFound{1,2,3}{Init,Step}` orphan recovery
-           pipeline (RECOVER_STATE_LOSTANDFOUND*).
          * `recoverVfs*` shim for page-1 header validation +
            `recoverInstallWrapper` / `recoverUninstallWrapper`.
          * `recoverIsValidPage` + `recoverGetU16` / `U32` / `Varint`
