@@ -2728,6 +2728,8 @@ procedure sqlite3UnlinkAndDeleteIndex(db: PTsqlite3; iDb: i32;
   zIdxName: PAnsiChar);
 function  sqlite3AllocateIndexObject(db: PTsqlite3; nCol: i16;
   nExtra: i32; ppExtra: PPAnsiChar): PIndex2;
+function  resizeIndexObject(pParse: PParse; pIdx: PIndex2; N: i32): i32;
+function  hasColumn(aiCol: Pi16; nCol: i32; x: i16): Boolean;
 function  sqlite3HasExplicitNulls(pParse: PParse; pList: PExprList): i32;
 procedure sqlite3DefaultRowEst(pIdx: PIndex2);
 
@@ -30840,6 +30842,8 @@ begin
         sqlite3VdbeJumpHere(v, addrIpkNotNull);
         sqlite3VdbeAddOp1(v, OP_MustBeInt, regRowid);
       end
+      else if withoutRowid <> 0 then
+        sqlite3VdbeAddOp2(v, OP_Null, 0, regRowid)
       else
         sqlite3VdbeAddOp3(v, OP_NewRowid, iDataCur, regRowid, regAutoinc);
 
@@ -32802,6 +32806,61 @@ begin
   Result := p;
 end;
 
+{ resizeIndexObject — port of build.c:2190.  Grow the parallel arrays of
+  pIdx (azColl / aiRowLogEst / aiColumn / aSortOrder) to N entries.  No-op
+  when pIdx^.nColumn >= N.  Used by the WITHOUT ROWID converter to append
+  the trailing non-PK columns to the PK index so the row record carries
+  every table column, not just the PK ones. }
+function resizeIndexObject(pParse: PParse; pIdx: PIndex2; N: i32): i32;
+var
+  zExtra: PByte;
+  nByte:  u64;
+  db:     PTsqlite3;
+begin
+  if i32(pIdx^.nColumn) >= N then begin
+    Result := SQLITE_OK;
+    Exit;
+  end;
+  db := pParse^.db;
+  AssertH(N > 0, 'resizeIndexObject N>0');
+  nByte := (u64(SizeOf(Pointer)) + u64(SizeOf(i16)) + u64(SizeOf(i16))
+            + u64(1)) * u64(N);
+  zExtra := PByte(sqlite3DbMallocZero(db, nByte));
+  if zExtra = nil then begin
+    Result := SQLITE_NOMEM;
+    Exit;
+  end;
+  Move(pIdx^.azColl^, zExtra^, SizeOf(Pointer) * u64(pIdx^.nColumn));
+  pIdx^.azColl := zExtra;
+  Inc(zExtra, u64(SizeOf(Pointer)) * u64(N));
+  Move(pIdx^.aiRowLogEst^, zExtra^,
+       SizeOf(i16) * u64(pIdx^.nKeyCol + 1));
+  pIdx^.aiRowLogEst := Pi16(zExtra);
+  Inc(zExtra, u64(SizeOf(i16)) * u64(N));
+  Move(pIdx^.aiColumn^, zExtra^, SizeOf(i16) * u64(pIdx^.nColumn));
+  pIdx^.aiColumn := Pi16(zExtra);
+  Inc(zExtra, u64(SizeOf(i16)) * u64(N));
+  Move(pIdx^.aSortOrder^, zExtra^, u64(pIdx^.nColumn));
+  pIdx^.aSortOrder := zExtra;
+  pIdx^.nColumn := u16(N);
+  pIdx^.idxFlags := pIdx^.idxFlags or u32($10);  { isResized = bit 4 }
+  Result := SQLITE_OK;
+end;
+
+{ hasColumn — port of build.c:2252.  True iff column index x appears in
+  the first nCol entries of aiCol[]. }
+function hasColumn(aiCol: Pi16; nCol: i32; x: i16): Boolean;
+var
+  i: i32;
+begin
+  Result := False;
+  for i := 0 to nCol - 1 do
+    if (aiCol + i)^ = x then begin
+      Result := True;
+      Exit;
+    end;
+end;
+
 function sqlite3HasExplicitNulls(pParse: PParse; pList: PExprList): i32;
 var
   i: i32;
@@ -34350,6 +34409,10 @@ var
   wIndex:  u32;
   iC:      i32;
   xIC:     i16;
+  nPk:     i32;
+  nExtraPk: i32;
+  jPk:     i32;
+  zCollPk: PAnsiChar;
 begin
   { Match the parse-driven sequencing of the C body: pSelect ownership
     transfers to the codegen path on success, but on early-out we must
@@ -34464,12 +34527,47 @@ begin
       schema-row INSERT sequence; converting that Noop to OP_Goto jumps
       over the whole sub-sequence so the WITHOUT-ROWID PK shares the
       table's root page (set just below: pPk^.tnum := pTab^.tnum). }
+    pPk2 := sqlite3PrimaryKeyIndex(pTab);
     if (db^.init.busy = 0) then begin
       v := sqlite3GetVdbe(pParse);
-      pPk2 := sqlite3PrimaryKeyIndex(pTab);
-      if (v <> nil) and (pPk2 <> nil) and (pPk2^.tnum > 0) then begin
+      if (v <> nil) and (pPk2 <> nil) and (pPk2^.tnum > 0) then
         sqlite3VdbeChangeOpcode(v, i32(pPk2^.tnum), OP_Goto);
-        pPk2^.tnum := u32(pTab^.tnum);
+    end;
+    { Mirror build.c:2449 — root page of the PK index is the table root
+      page.  Runs unconditionally (including during schema reload) so a
+      reconnect resolves the in-memory PK index correctly. }
+    if pPk2 <> nil then
+      pPk2^.tnum := u32(pTab^.tnum);
+
+    { Mark PK index covering, uniqNotNull, and clamp nColumn to nKeyCol
+      before the column expansion (build.c:2431..2433). }
+    if pPk2 <> nil then begin
+      pPk2^.idxFlags := pPk2^.idxFlags or u32($28); { isCovering=bit5, uniqNotNull=bit3 }
+      pPk2^.nColumn := pPk2^.nKeyCol;
+    end;
+
+    { Append all non-PK, non-VIRTUAL table columns to the PK index so the
+      stored row record carries every value (build.c:2484..2510). }
+    if (pPk2 <> nil) and (pTab^.aCol <> nil) then begin
+      nPk := i32(pPk2^.nKeyCol);
+      nExtraPk := 0;
+      for ii := 0 to pTab^.nCol - 1 do
+        if (not hasColumn(pPk2^.aiColumn, nPk, i16(ii)))
+           and ((pTab^.aCol[ii].colFlags and COLFLAG_VIRTUAL) = 0) then
+          Inc(nExtraPk);
+      if nExtraPk > 0 then begin
+        if resizeIndexObject(pParse, pPk2, nPk + nExtraPk) = SQLITE_OK then begin
+          jPk := nPk;
+          for ii := 0 to pTab^.nCol - 1 do
+            if (not hasColumn(pPk2^.aiColumn, jPk, i16(ii)))
+               and ((pTab^.aCol[ii].colFlags and COLFLAG_VIRTUAL) = 0) then begin
+              (pPk2^.aiColumn + jPk)^ := i16(ii);
+              zCollPk := sqlite3ColumnColl(@pTab^.aCol[ii]);
+              if zCollPk = nil then zCollPk := WhereStrBINARY;
+              (PPAnsiChar(pPk2^.azColl) + jPk)^ := zCollPk;
+              Inc(jPk);
+            end;
+        end;
       end;
     end;
   end;

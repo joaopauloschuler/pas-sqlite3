@@ -2619,13 +2619,43 @@ existing dispatcher.
      DiagPragma / DiagFunctions / DiagMisc / DiagCast / DiagDate /
      DiagAnalyze / DiagDropTable / DiagTxn all 0 divergences.
 
-- [ ] **10.1.bug.16** WITHOUT ROWID INSERT corrupts the database image.
-     Repro: `CREATE TABLE wr(k TEXT PRIMARY KEY, v INTEGER) WITHOUT
-     ROWID; INSERT INTO wr VALUES('k1',1);` raises `Runtime error:
-     database disk image is malformed`.  Same shape on `:memory:` and
-     file-backed db.  Listed as a known carry-over under 7.4d (WITHOUT
-     ROWID runtime corruption); promoting to a stand-alone bug item so
-     it is not lost behind 7.4d's parsing/codegen bullets.
+- [X] **10.1.bug.16** Fixed 2026-05-08.  WITHOUT ROWID tables now
+     accept INSERT / UPDATE / DELETE / SELECT round-trip byte-identical
+     to upstream.  Three faithful-to-C omissions in
+     passqlite3codegen.pas's `convertToWithoutRowidTable`-equivalent
+     arm:
+     1. **OP_NewRowid emitted instead of OP_Null** — sqlite3Insert's
+        non-IPK / non-vtab arm at codegen.pas:30843 unconditionally
+        called `sqlite3VdbeAddOp3(v, OP_NewRowid, ...)`, but C
+        insert.c:1536 emits `OP_Null` when `withoutRowid` is set.
+        NewRowid against an OpenWrite for an INDEX-typed cursor (rather
+        than TABLE) walked into uninitialised b-tree state and surfaced
+        as `database disk image is malformed`.  Added a `withoutRowid`
+        gate that emits `OP_Null 0 regRowid` instead.
+     2. **PK index tnum never propagated on schema reload** — the
+        `pPk2^.tnum := pTab^.tnum` assignment in sqlite3EndTable was
+        nested inside `if db^.init.busy = 0`, so a reconnect left the
+        synthetic PK index pointing at root page 0.  C build.c:2449
+        runs the assignment unconditionally.  Lifted the assignment
+        out of the gate.
+     3. **PK index missing trailing data columns** — sqlite3CreateIndex
+        allocated the PK index with just `nKeyCol + 1` slots (room for
+        a single trailing rowid).  C convertToWithoutRowidTable
+        (build.c:2484..2510) appends every non-PK, non-VIRTUAL column
+        to the PK index so the row record carries every value.  Ported
+        `resizeIndexObject` (build.c:2190) and `hasColumn` (build.c:2252)
+        as standalone helpers; added the column-expansion loop to the
+        `if (tabOpts and TF_WithoutRowid) <> 0` arm in sqlite3EndTable.
+        Also marks `isCovering = 1` and `uniqNotNull = 1` on the PK
+        index per build.c:2431..2433.
+     Verified: `(k TEXT PRIMARY KEY) WITHOUT ROWID` round-trips
+     byte-identical to system sqlite3 across INSERT / SELECT / UPDATE /
+     DELETE; multi-column PK `PRIMARY KEY(b,a)` works; UNIQUE conflict
+     fires on duplicate PK insert.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44
+     all clean; DiagOps / DiagDml / DiagFunctions / DiagFeatureProbe /
+     DiagPragma all 0 divergences.
 
 - [X] **10.1.bug.14** Fixed 2026-05-08.  `SELECT a, sum(a) FROM t`
      (bare base column alongside an aggregate, no GROUP BY) emitted only
