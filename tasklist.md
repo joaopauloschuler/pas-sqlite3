@@ -1347,11 +1347,29 @@ existing dispatcher.
          * State machine extended: WRITING done →
            (zLostAndFound != nil ? LOSTANDFOUND1 : SCHEMA2);
            LAF1 → LAF2 → LAF3 → SCHEMA2 hand-off.
-       Deferred (subsequent commits):
-         * `recoverVfs*` shim for page-1 header validation +
-           `recoverInstallWrapper` / `recoverUninstallWrapper`.
-         * `recoverIsValidPage` + `recoverGetU16` / `U32` / `Varint`
-           helpers used by the wrapper VFS.
+       Phase 10.1.48 wrapper-VFS arm landed 2026-05-08 (~600 new lines):
+         * `recoverGetU16` / `U32` / `Varint` + `recoverPutU16` / `U32`
+           little-helpers + `recoverIsValidPage` (b-tree page sanity
+           probe) + `recoverVfsDetectPagesize` (scan first nMaxBlk*64KB
+           for a well-formed page).
+         * Full wrapper `sqlite3_io_methods` (recover_methods) — all 18
+           methods including the canonical `xRead` page-1 substitution
+           that swaps in a sane 108-byte SQLite header so the engine
+           accepts even a corrupt-on-disk page-1; other methods are
+           pass-through (xClose direct, xFetch returns NULL so mmap is
+           bypassed, the rest swap pMethods around the underlying call).
+         * `recoverInstallWrapper` / `recoverUninstallWrapper` —
+           install around the dbIn `sqlite3_file` via
+           `SQLITE_FCNTL_FILE_POINTER`; mutex-protected via
+           `SQLITE_MUTEX_STATIC_APP2` (RECOVER_MUTEX_ID).
+         * `recoverStep` INIT arm now wraps the BEGIN +
+           `SELECT 1 FROM sqlite_schema` + transferSettings +
+           openRecovery + cacheSchema sequence in the install/
+           uninstall pair, with the upstream SQLITE_NOTADB retry
+           that re-runs once with the wrapper disabled (covers
+           encrypted databases that the wrapper refuses to recognise).
+         * Unit `initialization` populates the static `recover_methods`
+           dispatch and zero-fills the `recover_g` global.
        Pre-existing engine gaps blocking end-to-end runtime probe:
          * `WITH RECURSIVE` driven through `sqlite_dbptr('getpage()')`
            virtual table currently does not return rows in the Pascal

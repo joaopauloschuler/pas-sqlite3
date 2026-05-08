@@ -1,8 +1,8 @@
 {
   SPDX-License-Identifier: blessing
 
-  Faithful initial-cut port of ../sqlite3/ext/recover/sqlite3recover.c
-  (~2901 lines C → ~700 lines Pascal scaffold).
+  Faithful port of ../sqlite3/ext/recover/sqlite3recover.c
+  (~2901 lines C → ~2400 lines Pascal).
 
   Provides the recover-extension public API:
 
@@ -1670,6 +1670,616 @@ begin
 end;
 
 { ---------------------------------------------------------------
+  Wrapper VFS — port of sqlite3recover.c lines 2050..2580.
+
+  Installed by recoverInstallWrapper around the sqlite3_file held by
+  the input db.  Its sole purpose is to intercept xRead() of page 1
+  and substitute a sane header so sqlite3 can open even a database
+  whose own header is corrupt.  All other methods pass through to the
+  underlying VFS unchanged.
+
+  RECOVER_MUTEX_ID protects the unit-level recover_g singleton so two
+  recover handles do not stomp on each other while a wrapper is
+  installed.  We use SQLITE_MUTEX_STATIC_APP2 to match upstream.
+  --------------------------------------------------------------- }
+
+const
+  RECOVER_MUTEX_ID = SQLITE_MUTEX_STATIC_APP2;
+
+type
+  TRecoverGlobal = record
+    pMethods: Psqlite3_io_methods;  { Saved upstream pMethods }
+    p:        Psqlite3_recover;     { Owning recover handle }
+  end;
+
+var
+  recover_g: TRecoverGlobal;
+  recover_methods: sqlite3_io_methods;
+
+procedure recoverEnterMutex; inline;
+begin
+  sqlite3_mutex_enter(sqlite3MutexAlloc(RECOVER_MUTEX_ID));
+end;
+
+procedure recoverLeaveMutex; inline;
+begin
+  sqlite3_mutex_leave(sqlite3MutexAlloc(RECOVER_MUTEX_ID));
+end;
+
+procedure recoverAssertMutexHeld; inline;
+begin
+  { No-op — Pascal port omits the upstream `assert(sqlite3_mutex_held(...))`
+    diagnostic.  Same convention as backup / cksumvfs / vfslog ports. }
+end;
+
+function recoverGetU16(a: PByte): u32; inline;
+begin
+  Result := (u32(a[0]) shl 8) + u32(a[1]);
+end;
+
+function recoverGetU32(a: PByte): u32; inline;
+begin
+  Result := (u32(a[0]) shl 24) + (u32(a[1]) shl 16)
+          + (u32(a[2]) shl 8) + u32(a[3]);
+end;
+
+function recoverGetVarint(a: PByte; out v: i64): i32;
+var u: u64; i: i32;
+begin
+  u := 0;
+  for i := 0 to 7 do begin
+    u := (u shl 7) + (a[i] and $7F);
+    if (a[i] and $80) = 0 then begin
+      v := i64(u); Result := i + 1; Exit;
+    end;
+  end;
+  u := (u shl 8) + a[8];
+  v := i64(u);
+  Result := 9;
+end;
+
+procedure recoverPutU16(a: PByte; v: u32); inline;
+begin
+  a[0] := u8((v shr 8) and $FF);
+  a[1] := u8(v and $FF);
+end;
+
+procedure recoverPutU32(a: PByte; v: u32); inline;
+begin
+  a[0] := u8((v shr 24) and $FF);
+  a[1] := u8((v shr 16) and $FF);
+  a[2] := u8((v shr 8) and $FF);
+  a[3] := u8(v and $FF);
+end;
+
+{ Probe a candidate b-tree page; returns 1 (true) if a[0..n-1] looks like
+  a valid leaf/interior page, 0 otherwise.  aTmp is a scratch buffer of
+  the same size used to track byte usage. }
+function recoverIsValidPage(aTmp, a: PByte; n: i32): i32;
+var
+  aUsed: PByte;
+  nFrag, nActual, iFree, nCell, iCellOff, iContent, eType, ii: i32;
+  iNext, nByte, iByte, iOff: i32;
+  X, M, K: i32;
+  nPayload, dummy: i64;
+begin
+  aUsed := aTmp;
+  nFrag := 0; nActual := 0; iFree := 0; nCell := 0; iCellOff := 0;
+  iContent := 0; eType := 0; ii := 0;
+
+  eType := i32(a[0]);
+  if (eType <> $02) and (eType <> $05) and (eType <> $0A) and (eType <> $0D) then
+  begin Result := 0; Exit; end;
+
+  iFree    := i32(recoverGetU16(a + 1));
+  nCell    := i32(recoverGetU16(a + 3));
+  iContent := i32(recoverGetU16(a + 5));
+  if iContent = 0 then iContent := 65536;
+  nFrag    := i32(a[7]);
+
+  if iContent > n then begin Result := 0; Exit; end;
+
+  FillChar(aUsed^, n, 0);
+  FillChar(aUsed^, iContent, $FF);
+
+  if (iFree <> 0) and (iFree <= iContent) then begin Result := 0; Exit; end;
+  while iFree <> 0 do begin
+    iNext := 0; nByte := 0;
+    if iFree > (n - 4) then begin Result := 0; Exit; end;
+    iNext := i32(recoverGetU16(a + iFree));
+    nByte := i32(recoverGetU16(a + iFree + 2));
+    if (iFree + nByte > n) or (nByte < 4) then begin Result := 0; Exit; end;
+    if (iNext <> 0) and (iNext < iFree + nByte) then begin Result := 0; Exit; end;
+    FillChar((aUsed + iFree)^, nByte, $FF);
+    iFree := iNext;
+  end;
+
+  if (eType = $02) or (eType = $05) then iCellOff := 12 else iCellOff := 8;
+  if (iCellOff + 2 * nCell) > iContent then begin Result := 0; Exit; end;
+
+  for ii := 0 to nCell - 1 do begin
+    nPayload := 0;
+    nByte := 0;
+    iOff := i32(recoverGetU16(a + iCellOff + 2 * ii));
+    if (iOff < iContent) or (iOff > n) then begin Result := 0; Exit; end;
+    if (eType = $05) or (eType = $02) then nByte := nByte + 4;
+    nByte := nByte + recoverGetVarint(a + iOff + nByte, nPayload);
+    if eType = $0D then begin
+      dummy := 0;
+      nByte := nByte + recoverGetVarint(a + iOff + nByte, dummy);
+    end;
+    if eType <> $05 then begin
+      if eType = $0D then X := n - 35
+      else                X := ((n - 12) * 64 div 255) - 23;
+      M := ((n - 12) * 32 div 255) - 23;
+      K := M + i32((nPayload - M) mod (n - 4));
+      if nPayload < X then
+        nByte := nByte + i32(nPayload)
+      else if K <= X then
+        nByte := nByte + K + 4
+      else
+        nByte := nByte + M + 4;
+    end;
+    if iOff + nByte > n then begin Result := 0; Exit; end;
+    iByte := iOff;
+    while iByte < (iOff + nByte) do begin
+      if aUsed[iByte] <> 0 then begin Result := 0; Exit; end;
+      aUsed[iByte] := $FF;
+      Inc(iByte);
+    end;
+  end;
+
+  nActual := 0;
+  for ii := 0 to n - 1 do
+    if aUsed[ii] = 0 then Inc(nActual);
+  if nActual = nFrag then Result := 1 else Result := 0;
+end;
+
+{ Forward decls for the io_methods table. }
+function recoverVfsClose(pFd: Psqlite3_file): cint; cdecl; forward;
+function recoverVfsRead(pFd: Psqlite3_file; aBuf: Pointer; nByte: cint;
+  iOff: i64): cint; cdecl; forward;
+function recoverVfsWrite(pFd: Psqlite3_file; aBuf: Pointer; nByte: cint;
+  iOff: i64): cint; cdecl; forward;
+function recoverVfsTruncate(pFd: Psqlite3_file; size: i64): cint; cdecl; forward;
+function recoverVfsSync(pFd: Psqlite3_file; flags: cint): cint; cdecl; forward;
+function recoverVfsFileSize(pFd: Psqlite3_file; pSize: Pi64): cint; cdecl; forward;
+function recoverVfsLock(pFd: Psqlite3_file; eLock: cint): cint; cdecl; forward;
+function recoverVfsUnlock(pFd: Psqlite3_file; eLock: cint): cint; cdecl; forward;
+function recoverVfsCheckReservedLock(pFd: Psqlite3_file; pResOut: PcInt): cint; cdecl; forward;
+function recoverVfsFileControl(pFd: Psqlite3_file; op: cint; pArg: Pointer): cint; cdecl; forward;
+function recoverVfsSectorSize(pFd: Psqlite3_file): cint; cdecl; forward;
+function recoverVfsDeviceCharacteristics(pFd: Psqlite3_file): cint; cdecl; forward;
+function recoverVfsShmMap(pFd: Psqlite3_file; iPg, pgsz, bExtend: cint;
+  pp: PPointer): cint; cdecl; forward;
+function recoverVfsShmLock(pFd: Psqlite3_file; offset, n, flags: cint): cint; cdecl; forward;
+procedure recoverVfsShmBarrier(pFd: Psqlite3_file); cdecl; forward;
+function recoverVfsShmUnmap(pFd: Psqlite3_file; deleteFlag: cint): cint; cdecl; forward;
+function recoverVfsFetch(pFd: Psqlite3_file; iOff: i64; iAmt: cint;
+  pp: PPointer): cint; cdecl; forward;
+function recoverVfsUnfetch(pFd: Psqlite3_file; iOff: i64; pVal: Pointer): cint; cdecl; forward;
+
+function recoverVfsClose(pFd: Psqlite3_file): cint; cdecl;
+begin
+  Assert(pFd^.pMethods <> @recover_methods);
+  Result := pFd^.pMethods^.xClose(pFd);
+end;
+
+{ Detect the page-size of the input db by scanning the first nMaxBlk*64KB
+  for a well-formed b-tree page.  Walks descending pgsz candidates (nMin
+  up to nMax = 65536); a hit at any pgsz2 sets p^.detected_pgsz. }
+function recoverVfsDetectPagesize(p: Psqlite3_recover; pFd: Psqlite3_file;
+  nReserve: u32; nSz: i64): cint;
+const
+  nMin = 512;
+  nMax = 65536;
+  nMaxBlk = 4;
+var
+  rc: cint;
+  pgsz: u32;
+  iBlk, nBlk, nByte, pgsz2, iOff: cint;
+  aPg, aTmp: PByte;
+  hit: Boolean;
+begin
+  rc := SQLITE_OK;
+  pgsz := 0;
+  aPg := PByte(sqlite3_malloc(2 * nMax));
+  if aPg = nil then begin Result := SQLITE_NOMEM; Exit; end;
+  aTmp := aPg + nMax;
+
+  nBlk := cint((nSz + nMax - 1) div nMax);
+  if nBlk > nMaxBlk then nBlk := nMaxBlk;
+
+  repeat
+    iBlk := 0;
+    while (rc = SQLITE_OK) and (iBlk < nBlk) do begin
+      if nSz >= ((iBlk + 1) * nMax) then nByte := nMax
+      else nByte := cint(nSz mod nMax);
+      FillChar(aPg^, nMax, 0);
+      rc := pFd^.pMethods^.xRead(pFd, aPg, nByte, iBlk * nMax);
+      if rc = SQLITE_OK then begin
+        if pgsz <> 0 then pgsz2 := cint(pgsz * 2) else pgsz2 := nMin;
+        while pgsz2 <= nMax do begin
+          iOff := 0;
+          hit := False;
+          while iOff < nMax do begin
+            if recoverIsValidPage(aTmp, aPg + iOff,
+                                  pgsz2 - cint(nReserve)) <> 0 then
+            begin
+              pgsz := u32(pgsz2);
+              hit := True;
+              break;
+            end;
+            iOff := iOff + pgsz2;
+          end;
+          if hit then break;
+          pgsz2 := pgsz2 * 2;
+        end;
+      end;
+      Inc(iBlk);
+    end;
+    if pgsz > u32(p^.detected_pgsz) then begin
+      p^.detected_pgsz := i32(pgsz);
+      p^.nReserve      := i32(nReserve);
+    end;
+    if nReserve = 0 then break;
+    nReserve := 0;
+  until False;
+
+  p^.detected_pgsz := i32(pgsz);
+  sqlite3_free(aPg);
+  Result := rc;
+end;
+
+function recoverVfsRead(pFd: Psqlite3_file; aBuf: Pointer; nByte: cint;
+  iOff: i64): cint; cdecl;
+const
+  aPreserve: array[0..5] of i32 = (32, 36, 52, 60, 64, 68);
+var
+  rc: cint;
+  a: PByte;
+  pgsz, nReserve, enc, dbsz: u32;
+  dbFileSize: i64;
+  ii: i32;
+  p: Psqlite3_recover;
+  aHdr: array[0..107] of u8;
+begin
+  rc := SQLITE_OK;
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xRead(pFd, aBuf, nByte, iOff);
+    if nByte = 16 then begin
+      sqlite3_randomness(16, aBuf);
+    end
+    else if (rc = SQLITE_OK) and (iOff = 0) and (nByte >= 108) then begin
+      { Canonical sane page-1 header (108 bytes): keep enough of the
+        on-disk header to drive recovery while ensuring the file looks
+        well-formed to the engine. }
+      FillChar(aHdr, SizeOf(aHdr), 0);
+      aHdr[0] := $53; aHdr[1] := $51; aHdr[2] := $4c; aHdr[3] := $69;
+      aHdr[4] := $74; aHdr[5] := $65; aHdr[6] := $20; aHdr[7] := $66;
+      aHdr[8] := $6f; aHdr[9] := $72; aHdr[10] := $6d; aHdr[11] := $61;
+      aHdr[12] := $74; aHdr[13] := $20; aHdr[14] := $33; aHdr[15] := $00;
+      aHdr[16] := $FF; aHdr[17] := $FF; aHdr[18] := $01; aHdr[19] := $01;
+      aHdr[20] := $00; aHdr[21] := $40; aHdr[22] := $20; aHdr[23] := $20;
+      aHdr[28] := $00; aHdr[29] := $00; aHdr[30] := $00; aHdr[31] := $00;
+      aHdr[32] := $FF; aHdr[33] := $FF; aHdr[34] := $FF; aHdr[35] := $FF;
+      aHdr[36] := $FF; aHdr[37] := $FF; aHdr[38] := $FF; aHdr[39] := $FF;
+      aHdr[40] := $FF; aHdr[41] := $FF; aHdr[42] := $FF; aHdr[43] := $FF;
+      aHdr[47] := $04;
+      aHdr[50] := $10;
+      aHdr[52] := $FF; aHdr[53] := $FF; aHdr[54] := $FF; aHdr[55] := $FF;
+      aHdr[56] := $FF; aHdr[57] := $FF; aHdr[58] := $FF; aHdr[59] := $FF;
+      aHdr[60] := $FF; aHdr[61] := $FF; aHdr[62] := $FF; aHdr[63] := $FF;
+      aHdr[64] := $FF; aHdr[65] := $FF; aHdr[66] := $FF; aHdr[67] := $FF;
+      aHdr[68] := $FF; aHdr[69] := $FF; aHdr[70] := $FF; aHdr[71] := $FF;
+      aHdr[101] := $2e; aHdr[102] := $5b; aHdr[103] := $30;
+      aHdr[104] := $0D; aHdr[105] := $00; aHdr[106] := $00; aHdr[107] := $00;
+      { (the sentinel 0xFF/0xFF at 105/106 is overwritten below.) }
+
+      a := PByte(aBuf);
+      pgsz     := recoverGetU16(a + 16);
+      nReserve := a[20];
+      enc      := recoverGetU32(a + 56);
+      dbsz     := 0;
+      dbFileSize := 0;
+      p := recover_g.p;
+
+      if pgsz = $01 then pgsz := 65536;
+      rc := pFd^.pMethods^.xFileSize(pFd, @dbFileSize);
+
+      if (rc = SQLITE_OK) and (p^.detected_pgsz = 0) then
+        rc := recoverVfsDetectPagesize(p, pFd, nReserve, dbFileSize);
+      if p^.detected_pgsz <> 0 then begin
+        pgsz := u32(p^.detected_pgsz);
+        nReserve := u32(p^.nReserve);
+      end;
+
+      if pgsz <> 0 then dbsz := u32(dbFileSize div pgsz);
+      if (enc <> SQLITE_UTF8) and (enc <> SQLITE_UTF16BE)
+         and (enc <> SQLITE_UTF16LE) then enc := SQLITE_UTF8;
+
+      if p^.pPage1Cache <> nil then sqlite3_free(p^.pPage1Cache);
+      p^.pPage1Cache := nil;
+      p^.pPage1Disk  := nil;
+
+      p^.pgsz := nByte;
+      p^.pPage1Cache := PByte(recoverMalloc(p, i64(nByte) * 2));
+      if p^.pPage1Cache <> nil then begin
+        p^.pPage1Disk := p^.pPage1Cache + nByte;
+        Move(aBuf^, p^.pPage1Disk^, nByte);
+        aHdr[18] := a[18];
+        aHdr[19] := a[19];
+        recoverPutU32(@aHdr[28], dbsz);
+        recoverPutU32(@aHdr[56], enc);
+        recoverPutU16(@aHdr[105], pgsz - nReserve);
+        if pgsz = 65536 then pgsz := 1;
+        recoverPutU16(@aHdr[16], pgsz);
+        aHdr[20] := u8(nReserve);
+        for ii := 0 to High(aPreserve) do
+          Move(a[aPreserve[ii]], aHdr[aPreserve[ii]], 4);
+        Move(aHdr[0], PByte(aBuf)^, SizeOf(aHdr));
+        FillChar((PByte(aBuf) + SizeOf(aHdr))^, nByte - SizeOf(aHdr), 0);
+
+        Move(PByte(aBuf)^, p^.pPage1Cache^, nByte);
+      end else begin
+        rc := p^.errCode;
+      end;
+    end;
+    pFd^.pMethods := @recover_methods;
+  end else begin
+    rc := pFd^.pMethods^.xRead(pFd, aBuf, nByte, iOff);
+  end;
+  Result := rc;
+end;
+
+function recoverVfsWrite(pFd: Psqlite3_file; aBuf: Pointer; nByte: cint;
+  iOff: i64): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xWrite(pFd, aBuf, nByte, iOff);
+    pFd^.pMethods := @recover_methods;
+  end else
+    rc := pFd^.pMethods^.xWrite(pFd, aBuf, nByte, iOff);
+  Result := rc;
+end;
+
+function recoverVfsTruncate(pFd: Psqlite3_file; size: i64): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xTruncate(pFd, size);
+    pFd^.pMethods := @recover_methods;
+  end else
+    rc := pFd^.pMethods^.xTruncate(pFd, size);
+  Result := rc;
+end;
+
+function recoverVfsSync(pFd: Psqlite3_file; flags: cint): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xSync(pFd, flags);
+    pFd^.pMethods := @recover_methods;
+  end else
+    rc := pFd^.pMethods^.xSync(pFd, flags);
+  Result := rc;
+end;
+
+function recoverVfsFileSize(pFd: Psqlite3_file; pSize: Pi64): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xFileSize(pFd, pSize);
+    pFd^.pMethods := @recover_methods;
+  end else
+    rc := pFd^.pMethods^.xFileSize(pFd, pSize);
+  Result := rc;
+end;
+
+function recoverVfsLock(pFd: Psqlite3_file; eLock: cint): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xLock(pFd, eLock);
+    pFd^.pMethods := @recover_methods;
+  end else
+    rc := pFd^.pMethods^.xLock(pFd, eLock);
+  Result := rc;
+end;
+
+function recoverVfsUnlock(pFd: Psqlite3_file; eLock: cint): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xUnlock(pFd, eLock);
+    pFd^.pMethods := @recover_methods;
+  end else
+    rc := pFd^.pMethods^.xUnlock(pFd, eLock);
+  Result := rc;
+end;
+
+function recoverVfsCheckReservedLock(pFd: Psqlite3_file; pResOut: PcInt): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xCheckReservedLock(pFd, pResOut);
+    pFd^.pMethods := @recover_methods;
+  end else
+    rc := pFd^.pMethods^.xCheckReservedLock(pFd, pResOut);
+  Result := rc;
+end;
+
+function recoverVfsFileControl(pFd: Psqlite3_file; op: cint; pArg: Pointer): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    if pFd^.pMethods <> nil then
+      rc := pFd^.pMethods^.xFileControl(pFd, op, pArg)
+    else
+      rc := SQLITE_NOTFOUND;
+    pFd^.pMethods := @recover_methods;
+  end else begin
+    if pFd^.pMethods <> nil then
+      rc := pFd^.pMethods^.xFileControl(pFd, op, pArg)
+    else
+      rc := SQLITE_NOTFOUND;
+  end;
+  Result := rc;
+end;
+
+function recoverVfsSectorSize(pFd: Psqlite3_file): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xSectorSize(pFd);
+    pFd^.pMethods := @recover_methods;
+  end else
+    rc := pFd^.pMethods^.xSectorSize(pFd);
+  Result := rc;
+end;
+
+function recoverVfsDeviceCharacteristics(pFd: Psqlite3_file): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xDeviceCharacteristics(pFd);
+    pFd^.pMethods := @recover_methods;
+  end else
+    rc := pFd^.pMethods^.xDeviceCharacteristics(pFd);
+  Result := rc;
+end;
+
+function recoverVfsShmMap(pFd: Psqlite3_file; iPg, pgsz, bExtend: cint;
+  pp: PPointer): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xShmMap(pFd, iPg, pgsz, bExtend, pp);
+    pFd^.pMethods := @recover_methods;
+  end else
+    rc := pFd^.pMethods^.xShmMap(pFd, iPg, pgsz, bExtend, pp);
+  Result := rc;
+end;
+
+function recoverVfsShmLock(pFd: Psqlite3_file; offset, n, flags: cint): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xShmLock(pFd, offset, n, flags);
+    pFd^.pMethods := @recover_methods;
+  end else
+    rc := pFd^.pMethods^.xShmLock(pFd, offset, n, flags);
+  Result := rc;
+end;
+
+procedure recoverVfsShmBarrier(pFd: Psqlite3_file); cdecl;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    pFd^.pMethods^.xShmBarrier(pFd);
+    pFd^.pMethods := @recover_methods;
+  end else
+    pFd^.pMethods^.xShmBarrier(pFd);
+end;
+
+function recoverVfsShmUnmap(pFd: Psqlite3_file; deleteFlag: cint): cint; cdecl;
+var rc: cint;
+begin
+  if pFd^.pMethods = @recover_methods then begin
+    pFd^.pMethods := recover_g.pMethods;
+    rc := pFd^.pMethods^.xShmUnmap(pFd, deleteFlag);
+    pFd^.pMethods := @recover_methods;
+  end else
+    rc := pFd^.pMethods^.xShmUnmap(pFd, deleteFlag);
+  Result := rc;
+end;
+
+function recoverVfsFetch(pFd: Psqlite3_file; iOff: i64; iAmt: cint;
+  pp: PPointer): cint; cdecl;
+begin
+  pp^ := nil;
+  Result := SQLITE_OK;
+end;
+
+function recoverVfsUnfetch(pFd: Psqlite3_file; iOff: i64; pVal: Pointer): cint; cdecl;
+begin
+  Result := SQLITE_OK;
+end;
+
+procedure recoverInstallWrapper(p: Psqlite3_recover);
+var
+  pFd: Psqlite3_file;
+  iVersion: cint;
+begin
+  pFd := nil;
+  Assert(recover_g.pMethods = nil);
+  recoverAssertMutexHeld;
+  sqlite3_file_control(p^.dbIn, p^.zDb, SQLITE_FCNTL_FILE_POINTER, @pFd);
+  Assert((pFd = nil) or (pFd^.pMethods <> @recover_methods));
+  if (pFd <> nil) and (pFd^.pMethods <> nil) then begin
+    if (pFd^.pMethods^.iVersion > 1) and (Pointer(pFd^.pMethods^.xShmMap) <> nil) then
+      iVersion := 2
+    else
+      iVersion := 1;
+    recover_g.pMethods := pFd^.pMethods;
+    recover_g.p := p;
+    recover_methods.iVersion := iVersion;
+    pFd^.pMethods := @recover_methods;
+  end;
+end;
+
+procedure recoverUninstallWrapper(p: Psqlite3_recover);
+var pFd: Psqlite3_file;
+begin
+  pFd := nil;
+  recoverAssertMutexHeld;
+  sqlite3_file_control(p^.dbIn, p^.zDb, SQLITE_FCNTL_FILE_POINTER, @pFd);
+  if (pFd <> nil) and (pFd^.pMethods <> nil) then begin
+    pFd^.pMethods := recover_g.pMethods;
+    recover_g.pMethods := nil;
+    recover_g.p := nil;
+  end;
+end;
+
+procedure recoverInitMethods;
+begin
+  FillChar(recover_methods, SizeOf(recover_methods), 0);
+  recover_methods.iVersion             := 2;
+  recover_methods.xClose               := @recoverVfsClose;
+  recover_methods.xRead                := @recoverVfsRead;
+  recover_methods.xWrite               := @recoverVfsWrite;
+  recover_methods.xTruncate            := @recoverVfsTruncate;
+  recover_methods.xSync                := @recoverVfsSync;
+  recover_methods.xFileSize            := @recoverVfsFileSize;
+  recover_methods.xLock                := @recoverVfsLock;
+  recover_methods.xUnlock              := @recoverVfsUnlock;
+  recover_methods.xCheckReservedLock   := @recoverVfsCheckReservedLock;
+  recover_methods.xFileControl         := @recoverVfsFileControl;
+  recover_methods.xSectorSize          := @recoverVfsSectorSize;
+  recover_methods.xDeviceCharacteristics := @recoverVfsDeviceCharacteristics;
+  recover_methods.xShmMap              := @recoverVfsShmMap;
+  recover_methods.xShmLock             := @recoverVfsShmLock;
+  recover_methods.xShmBarrier          := @recoverVfsShmBarrier;
+  recover_methods.xShmUnmap            := @recoverVfsShmUnmap;
+  recover_methods.xFetch               := @recoverVfsFetch;
+  recover_methods.xUnfetch             := @recoverVfsUnfetch;
+end;
+
+{ ---------------------------------------------------------------
   recoverStep — initial-cut state machine.
 
   The full upstream pipeline is:
@@ -1688,7 +2298,10 @@ end;
   --------------------------------------------------------------- }
 
 procedure recoverStep(p: Psqlite3_recover);
-var rc: i32;
+var
+  rc: i32;
+  bUseWrapper: i32;
+  bRetry: Boolean;
 begin
   Assert((p <> nil) and (p^.errCode = SQLITE_OK));
   case p^.eState of
@@ -1698,18 +2311,41 @@ begin
         recoverSqlCallback(p, 'PRAGMA writable_schema = on');
         recoverSqlCallback(p, 'PRAGMA foreign_keys = off');
 
+        recoverEnterMutex;
         recoverOpenOutput(p);
 
         if p^.errCode = SQLITE_OK then begin
-          sqlite3_file_control(p^.dbIn, p^.zDb, SQLITE_FCNTL_RESET_CACHE, nil);
-          recoverExec(p, p^.dbIn, 'PRAGMA writable_schema = on');
-          recoverExec(p, p^.dbIn, 'BEGIN');
-          if p^.errCode = SQLITE_OK then p^.bCloseTransaction := 1;
-          recoverExec(p, p^.dbIn, 'SELECT 1 FROM sqlite_schema');
-          recoverTransferSettings(p);
-          recoverOpenRecovery(p);
-          recoverCacheSchema(p);
+          { Two attempts — first with the wrapper installed, then again
+            without it on SQLITE_NOTADB.  Mirrors recoverStep upstream
+            (sqlite3recover.c:2604..2629). }
+          bUseWrapper := 1;
+          repeat
+            p^.errCode := SQLITE_OK;
+            if bUseWrapper <> 0 then recoverInstallWrapper(p);
+
+            sqlite3_file_control(p^.dbIn, p^.zDb,
+                                 SQLITE_FCNTL_RESET_CACHE, nil);
+            recoverExec(p, p^.dbIn, 'PRAGMA writable_schema = on');
+            recoverExec(p, p^.dbIn, 'BEGIN');
+            if p^.errCode = SQLITE_OK then p^.bCloseTransaction := 1;
+            recoverExec(p, p^.dbIn, 'SELECT 1 FROM sqlite_schema');
+            recoverTransferSettings(p);
+            recoverOpenRecovery(p);
+            recoverCacheSchema(p);
+
+            if bUseWrapper <> 0 then recoverUninstallWrapper(p);
+            bRetry := False;
+            if (p^.errCode = SQLITE_NOTADB) and (bUseWrapper <> 0) then begin
+              if SQLITE_OK = sqlite3_exec(p^.dbIn, 'ROLLBACK',
+                                          nil, nil, nil) then begin
+                Dec(bUseWrapper);
+                bRetry := True;
+              end;
+            end;
+          until not bRetry;
         end;
+
+        recoverLeaveMutex;
         if p^.errCode = SQLITE_OK then begin
           recoverExec(p, p^.dbOut, 'BEGIN');
           recoverWriteSchema1(p);
@@ -1892,5 +2528,9 @@ begin
   sqlite3_free(p);
   Result := rc;
 end;
+
+initialization
+  recoverInitMethods;
+  FillChar(recover_g, SizeOf(recover_g), 0);
 
 end.
