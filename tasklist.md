@@ -2472,6 +2472,50 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.18** Fixed 2026-05-08.  `hex(zeroblob(N))` (and any
+     blob-consuming SQL function applied to a zeroblob with N>=1) crashed
+     with EAccessViolation.  Root cause: `sqlite3_value_blob`
+     (passqlite3vdbe.pas:4967) returned the raw `pVal^.z` for any
+     MEM_Blob/MEM_Str value without first expanding MEM_Zero.  Zeroblobs
+     have flags=MEM_Blob|MEM_Zero, n=0, z=NULL, u.nZero=N — the function
+     returned NULL but `sqlite3_value_bytes` correctly returned N, so
+     hexFunc walked a NULL pointer for N bytes.  Fix: when MEM_Zero is
+     set, call sqlite3VdbeMemExpandBlob first (mirrors C
+     vdbeapi.c:sqlite3_value_blob's ExpandBlob() prologue).  Verified:
+     hex(zeroblob(5))='0000000000' byte-identical to upstream;
+     TestExplainParity 1026/1026; DiagFunctions / DiagOps clean.
+
+- [ ] **10.1.bug.21** SELECT … FROM (compound-subquery) WHERE … returns
+     no rows.  Repro: `SELECT * FROM (SELECT 1 a UNION ALL SELECT 2)
+     WHERE a>0;` returns nothing; without the WHERE it returns 1 and 2.
+     `SELECT count(*) FROM (compound)` works.  Same for `WITH t(x) AS
+     (SELECT 1 UNION SELECT 2) SELECT * FROM t WHERE x>1;`.  Pascal
+     EXPLAIN emits only Init/Halt/Goto (3 ops) instead of the
+     coroutine + filter loop the C reference produces.  Likely a missing
+     arm in sqlite3Select / WhereBegin for compound-FROM with a
+     non-empty WHERE clause.
+
+- [ ] **10.1.bug.20** `row_number() OVER (ORDER BY x) FROM (compound)`
+     returns no rows.  Repro: `SELECT row_number() OVER (ORDER BY a)
+     FROM (SELECT 'b' a UNION SELECT 'a' UNION SELECT 'c');` returns
+     nothing; same with empty `OVER ()` and with `UNION ALL`.  Window
+     function over a concrete CREATE TABLE works fine.  Same root-cause
+     family as bug.21 (compound-subquery FROM source).
+
+- [ ] **10.1.bug.19** Top-level `VALUES(1),(2),(3);` returns only the
+     first row.  Same shape with `SELECT * FROM (VALUES(1),(2),(3))`
+     and any aggregate over the wrapped form (`SELECT max(column1)
+     FROM (VALUES(1),(2),(3))` returns NULL/0).  Pascal EXPLAIN shows
+     a double-coroutine wrap: the inner coroutine yields 3 rows, but
+     the outer wrapper at addr 9 emits `InitCoroutine 8 13 10` (a
+     second coroutine) whose body just yields the constant 1 once.
+     Upstream 3.53 emits a single coroutine driven by a Yield-loop —
+     the issue is the second InitCoroutine should `InitCoroutine 1 0 2`
+     (re-using the inner coroutine register, no jump-around).  Trace
+     the SrcItem.fg.viaCoroutine arm in sqlite3Select; the wrapper
+     Select returned by sqlite3MultiValues is being treated as if it
+     were a plain subquery rather than a viaCoroutine consumer.
+
 - [X] **10.1.bug.15** Fixed 2026-05-08.  `SELECT * FROM t` silently
      dropped VIRTUAL generated columns.  On `CREATE TABLE g(a,b,c INT
      GENERATED ALWAYS AS (a+b) VIRTUAL)` + INSERT(3,4), the port emitted

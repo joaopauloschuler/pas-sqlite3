@@ -4968,6 +4968,11 @@ function sqlite3_value_blob(pVal: Psqlite3_value): Pointer;
 begin
   if pVal = nil then begin Result := nil; Exit; end;
   if (pVal^.flags and (MEM_Blob or MEM_Str)) <> 0 then begin
+    if (pVal^.flags and MEM_Zero) <> 0 then begin
+      if sqlite3VdbeMemExpandBlob(pVal) <> SQLITE_OK then begin
+        Result := nil; Exit;
+      end;
+    end;
     pVal^.flags := pVal^.flags or MEM_Blob;
     if pVal^.n <> 0 then Result := pVal^.z
     else Result := nil;
