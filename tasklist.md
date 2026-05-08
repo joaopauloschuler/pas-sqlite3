@@ -2527,19 +2527,50 @@ existing dispatcher.
      BY a) FROM t ORDER BY a;` on `t(a INTEGER, b TEXT)` with
      (1,'a'),(2,'b'),(3,'c'),(4,'a'),(5,'b') — Pas returns
      `[1,a,0];[2,b,];[3,c,1];[4,a,1];[5,b,1]` vs C reference
-     `[1,a,];[2,b,1];[3,c,2];[4,a,3];[5,b,4]`.  EXPLAIN shows Pas's
-     window-rewrite sub-SELECT pSublist contains an extra duplicate
-     `a` column between the output b and lag's args, so the sorter
-     record has 5 cols instead of C's 4 — register positions for
-     subsequent reads are off by one.  Drop to a 2-column projection
-     (`SELECT a, lag(a,1) OVER (ORDER BY a)`) and the bug disappears.
-     Suspected root cause: `selectWindowRewriteEList` /
-     `exprListAppendList` for window pOrderBy not deduplicating against
-     the already-rewritten pEList entries, or `sqlite3ExprCompare`
-     returning "different" between an already-rewritten TK_COLUMN
-     pointing at iEphCsr and an unrewritten TK_COLUMN pointing at the
-     source cursor.  Investigation deferred — DiagWindow does not
-     exercise this 3-column shape, so it slipped through.
+     `[1,a,];[2,b,1];[3,c,2];[4,a,3];[5,b,4]`.
+
+     **Deeper investigation (2026-05-08, a4):** The earlier
+     "selectWindowRewriteEList not deduplicating" hypothesis is WRONG.
+     pSub is built byte-identically on both sides — both produce
+     `[a, b, a, a, 1]` (5 entries) for the 3-col case.  EXPLAIN
+     diff (3-col case):
+       - C  `MakeRecord 4,5,10` (5 cols incl. sort key)
+       - Pas `MakeRecord 11,6,17` (6 cols incl. sort key)
+     The +1 col Pas emits is an extra `Column 0,0,r9` (a) at addr 10
+     of Pas EXPLAIN that C does not emit.  In the resulting eph table,
+     the columns shift so lag's runtime read (addr 64 `Column 1,4,20`,
+     addr 68 `Column 1,3,2`) lands on the wrong source columns —
+     reading `a` (=1) where it expected the literal `1`, so the offset-
+     subtract for SeekRowid becomes (rowid - rowVal) instead of
+     (rowid - 1).  That explains the consistent `0/1/1/1/1` lag output.
+
+     Real root cause: the window-rewrite sub-SELECT runs
+     `sqlite3Select(pSubSel, SRT_EphemTab)` (Pas codegen.pas:23739).
+     The OMITREF dedup at codegen.pas:24902 is gated on
+     `pDest^.eDest = SRT_Output` only.  C's gate
+     (select.c:1216) is the broader `eDest!=SRT_EphemTab &&
+     eDest!=SRT_Table`, which still excludes SRT_EphemTab — so OMITREF
+     is OFF in BOTH builds for this path.  Yet C still emits 5 cols
+     and Pas emits 6.  Difference must be in how each side composes
+     the record at the SRT_EphemTab pushOntoSorter slice (Pas
+     codegen.pas:25082..25107, C select.c:730..870).  Pas's slice
+     unconditionally lays out `[sortKey ; nResultCol]` via SCopy, while
+     C's pushOntoSorter folds sort keys into the result-col region
+     when the sort key already appears in pSub (via `iOrderByCol`-tagged
+     entries from sqlite3ResolveOrderGroupBy or similar set during
+     SelectNew).  Fix likely needs to either (a) extend OMITREF to
+     SRT_EphemTab + tag pSort items' iOrderByCol against pSublist
+     before the recursive sqlite3Select call, or (b) mirror C's
+     pushOntoSorter SortCtx-driven layout in the SRT_EphemTab arm to
+     dedup sort keys against result cols.  Estimated work: half a day
+     of careful select.c port re-read + bytecode parity preservation.
+
+     2-col projection (`SELECT a, lag(a,1) OVER (ORDER BY a)`) works
+     because the bug-induced column shift happens to fall between cols
+     that hold the same value (both are `a`), so lag reads the right
+     value by accident.  3+ col projections expose it.  DiagWindow does
+     not exercise the 3-column shape (only 1 or 2 cols), so it
+     slipped through.
 
 - [X] **10.1.bug.22** Fixed 2026-05-08.  `WITH RECURSIVE c(x) AS (SELECT 1
      UNION SELECT x+1 FROM c WHERE x<N) SELECT * FROM c;` now returns
