@@ -152,9 +152,8 @@ FPC porting traps that recur often enough to call out up-front:
        (analyzeAggregate + generateAggSelect ORDER-BY-inside-aggregate
        arm).  Gate: DiagWindow `group_concat order` PASSes.
 
-  [~] **6.26** Window functions (window.c).  DiagWindow: 2 residual
-       divergences on bare `OVER ()` aggregates (`sum(b) OVER ()`,
-       `avg(b) OVER ()`) — see bug 6.29.  All other window paths PASS
+  [~] **6.26** Window functions (window.c).  DiagWindow: 0 divergences
+       (was 2 pre bug 6.29 close).  All window paths PASS
        (multi-window arm closed by lifting the window-arm SRT_Output gate
        to admit SRT_EphemTab — recursive sqlite3Select from the outer
        eph-materialise now runs the window arm again on the inner sub-
@@ -2712,6 +2711,27 @@ existing dispatcher.
      DiagFeatureProbe / DiagTxn / DiagMisc / DiagCast all 0
      divergences.  DiagWindow 2 (pre-existing bug 6.29 — bare `sum()
      OVER ()` / `avg() OVER ()` no-PARTITION-no-ORDER, unrelated).
+
+- [ ] **10.1.bug.29** RIGHT JOIN and FULL OUTER JOIN drop unmatched
+     right-side rows — behave as INNER JOIN.  Reproducer: on
+     `a(x)=[1,2]`, `b(y)=[2,3]`, `SELECT * FROM a RIGHT JOIN b ON x=y`
+     returns just `2|2` instead of `2|2 / |3`; `FULL JOIN` likewise
+     omits the right-only rows.  Root cause: the unmatched-rows pass
+     is not invoked.  `sqlite3WhereRightJoinLoop` is fully ported in
+     passqlite3codegen.pas:19049 but has **no caller** — the call
+     site in `sqlite3WhereEnd` (where.c:7539..7552, 7675..7678) is
+     listed as deferred at codegen.pas:17735 ("RIGHT JOIN subroutine
+     return").  Need to: (1) wire the per-level call from
+     sqlite3WhereEnd when `pLevel^.pRJ <> nil` to drive the
+     synthesised single-table inner scan; (2) verify pRJ is being
+     allocated in the planner for RIGHT JOIN levels (check
+     where.c around mPrereq / WHERE_RIGHT_JOIN flag handling).
+     LEFT JOIN already works correctly, so the divergence is
+     specifically the RIGHT-side null-extended row emission.  Visible
+     to any user but not exercised by TestExplainParity (corpus is
+     LEFT-JOIN heavy).  DiagJoinTrace and DiagInnerJoin do not
+     currently exercise RIGHT JOIN either — adding a coverage test
+     would prevent regression once the fix lands.
 
 - [X] **10.1.bug.28** Fixed 2026-05-08.  `SELECT max(column1) FROM
      (VALUES(1),(2),(3))` returned `1` instead of `3` (and similarly for
