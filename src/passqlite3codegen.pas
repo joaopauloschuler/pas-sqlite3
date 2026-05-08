@@ -45162,59 +45162,203 @@ begin
   end;
 end;
 
+{ TGroupConcatCtx — port of func.c:2163 GroupConcatCtx.  Holds the running
+  concatenation buffer plus the bookkeeping required for window xInverse:
+  number of accumulated entries, the first separator length used, and (if
+  separators ever vary in length) a per-entry array of separator lengths. }
+type
+  PIntArr = ^TIntArr;
+  TIntArr = array[0..(MaxInt div SizeOf(i32)) - 1] of i32;
+  PGroupConcatCtx = ^TGroupConcatCtx;
+  TGroupConcatCtx = record
+    z:               PAnsiChar;  { malloc'd buffer holding concatenated string }
+    nChar:           i32;        { length of accumulated text (bytes) }
+    nAlloc:          i32;        { allocated size of z (>= nChar+1 when z<>nil) }
+    accError:        i32;        { SQLITE_NOMEM / TOOBIG sticky error }
+    nAccum:          i32;        { number of strings presently concatenated }
+    nFirstSepLength: i32;        { separator length used for the first append }
+    pnSepLengths:    PIntArr;    { per-entry sep lengths once length varies }
+  end;
+
+procedure groupConcatGrow(p: PGroupConcatCtx; nNeed: i32);
+var
+  nNew:  i32;
+  zNew:  PAnsiChar;
+begin
+  if p^.accError <> 0 then Exit;
+  if p^.nAlloc >= nNeed + 1 then Exit;
+  nNew := p^.nAlloc;
+  if nNew < 64 then nNew := 64;
+  while nNew < nNeed + 1 do nNew := nNew * 2;
+  zNew := PAnsiChar(sqlite3_realloc64(p^.z, u64(nNew)));
+  if zNew = nil then begin
+    p^.accError := SQLITE_NOMEM;
+    Exit;
+  end;
+  p^.z      := zNew;
+  p^.nAlloc := nNew;
+end;
+
+procedure groupConcatAppend(p: PGroupConcatCtx; zSrc: PAnsiChar; n: i32);
+begin
+  if (n <= 0) or (p^.accError <> 0) then Exit;
+  groupConcatGrow(p, p^.nChar + n);
+  if p^.accError <> 0 then Exit;
+  Move(zSrc^, (p^.z + p^.nChar)^, n);
+  Inc(p^.nChar, n);
+  (p^.z + p^.nChar)^ := #0;
+end;
+
 procedure groupConcatStep(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
 var
-  pAgg: PMem;
-  zVal, zSep: PAnsiChar;
-  nVal, nSep: i32;
-  zOut: PAnsiChar;
-  nCur: i32;
+  p:        PGroupConcatCtx;
+  zVal:     PAnsiChar;
+  zSep:     PAnsiChar;
+  nVal:     i32;
+  nSep:     i32;
+  firstTerm:Boolean;
+  pnsl:     PIntArr;
+  i, nA:    i32;
 begin
+  Assert((argc = 1) or (argc = 2));
   if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
-  pAgg := PMem(sqlite3_aggregate_context(pCtx, SizeOf(TMem)));
-  if pAgg = nil then Exit;
-  zVal := sqlite3_value_text(Psqlite3_value(argv^));
-  nVal := sqlite3_value_bytes(Psqlite3_value(argv^));
-  if argc = 2 then begin
-    zSep := sqlite3_value_text(Psqlite3_value((argv+1)^));
-    nSep := sqlite3_value_bytes(Psqlite3_value((argv+1)^));
-  end else begin
+  p := PGroupConcatCtx(sqlite3_aggregate_context(pCtx, SizeOf(TGroupConcatCtx)));
+  if p = nil then Exit;
+
+  { firstTerm: true if no prior xStep has appended.  C marks "uninitialised"
+    by str.mxAlloc==0; we use nAlloc==0 as the equivalent — sqlite3_aggregate_
+    context zero-fills on first call, so this flips to non-zero at the first
+    groupConcatGrow. }
+  firstTerm := (p^.nAlloc = 0) and (p^.nChar = 0);
+
+  if argc = 1 then begin
     zSep := ',';
     nSep := 1;
-  end;
-  if pAgg^.flags = 0 then begin
-    { First value — sqlite3_aggregate_context zero-fills the buffer; flags=0
-      means we have not yet stored anything.  C uses a custom GroupConcatCtx
-      (func.c:1083) with an fAdd sentinel bit; here we overlay TMem on the
-      buffer and use flags=0 as the "blank" marker. }
-    zOut := sqlite3_malloc(nVal + 1);
-    if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
-    Move(zVal^, zOut^, nVal);
-    (zOut + nVal)^ := #0;
-    sqlite3VdbeMemSetStr(pAgg, zOut, nVal, SQLITE_UTF8, SQLITE_DYNAMIC);
+    if firstTerm then p^.nFirstSepLength := 1
+    else groupConcatAppend(p, zSep, nSep);
   end else begin
-    nCur := sqlite3_value_bytes(Psqlite3_value(Psqlite3_value(pAgg)));
-    zOut := sqlite3_malloc(nCur + nSep + nVal + 1);
-    if zOut = nil then begin sqlite3_result_error_nomem(pCtx); Exit; end;
-    Move(sqlite3_value_text(Psqlite3_value(pAgg))^, zOut^, nCur);
-    Move(zSep^, (zOut + nCur)^, nSep);
-    Move(zVal^, (zOut + nCur + nSep)^, nVal);
-    (zOut + nCur + nSep + nVal)^ := #0;
-    sqlite3VdbeMemSetStr(pAgg, zOut, nCur + nSep + nVal,
-      SQLITE_UTF8, SQLITE_DYNAMIC);
+    zSep := sqlite3_value_text(Psqlite3_value((argv+1)^));
+    nSep := sqlite3_value_bytes(Psqlite3_value((argv+1)^));
+    if firstTerm then begin
+      p^.nFirstSepLength := nSep;
+    end else begin
+      if zSep <> nil then groupConcatAppend(p, zSep, nSep)
+      else nSep := 0;
+      { Track separator length variation when needed (func.c:2212..2232). }
+      if (nSep <> p^.nFirstSepLength) or (p^.pnSepLengths <> nil) then begin
+        pnsl := p^.pnSepLengths;
+        if pnsl = nil then begin
+          pnsl := PIntArr(sqlite3_malloc64(u64((p^.nAccum + 1) * SizeOf(i32))));
+          if pnsl <> nil then begin
+            i := 0; nA := p^.nAccum - 1;
+            while i < nA do begin pnsl^[i] := p^.nFirstSepLength; Inc(i); end;
+          end;
+        end else begin
+          pnsl := PIntArr(sqlite3_realloc64(pnsl,
+            u64(p^.nAccum * SizeOf(i32))));
+        end;
+        if pnsl <> nil then begin
+          if p^.nAccum > 0 then pnsl^[p^.nAccum - 1] := nSep;
+          p^.pnSepLengths := pnsl;
+        end else
+          p^.accError := SQLITE_NOMEM;
+      end;
+    end;
+  end;
+
+  Inc(p^.nAccum);
+  zVal := sqlite3_value_text(Psqlite3_value(argv^));
+  nVal := sqlite3_value_bytes(Psqlite3_value(argv^));
+  if zVal <> nil then groupConcatAppend(p, zVal, nVal);
+end;
+
+{ groupConcatInverse — port of func.c:2248.  Removes the front-most
+  accumulated string (and the separator that joined it to the next one)
+  when a row leaves the window frame. }
+procedure groupConcatInverse(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+var
+  p:    PGroupConcatCtx;
+  nVS:  i32;
+begin
+  Assert((argc = 1) or (argc = 2));
+  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then Exit;
+  p := PGroupConcatCtx(sqlite3_aggregate_context(pCtx, SizeOf(TGroupConcatCtx)));
+  if p = nil then Exit;
+  { Force conversion to text first, in case the value is BLOB/numeric. }
+  sqlite3_value_text(Psqlite3_value(argv^));
+  nVS := sqlite3_value_bytes(Psqlite3_value(argv^));
+  Dec(p^.nAccum);
+  if p^.pnSepLengths <> nil then begin
+    Assert(p^.nAccum >= 0);
+    if p^.nAccum > 0 then begin
+      Inc(nVS, p^.pnSepLengths^[0]);
+      Move(p^.pnSepLengths^[1], p^.pnSepLengths^[0],
+        (p^.nAccum - 1) * SizeOf(i32));
+    end;
+  end else begin
+    { Single-length separator path: harmlessly over-deduct when we are
+      removing the last entry — z gets reset below either way. }
+    Inc(nVS, p^.nFirstSepLength);
+  end;
+  if nVS >= p^.nChar then
+    p^.nChar := 0
+  else begin
+    Dec(p^.nChar, nVS);
+    Move((p^.z + nVS)^, p^.z^, p^.nChar);
+  end;
+  if p^.z <> nil then (p^.z + p^.nChar)^ := #0;
+  if p^.nChar = 0 then begin
+    sqlite3_free(p^.z);
+    p^.z := nil;
+    p^.nAlloc := 0;
+    sqlite3_free(p^.pnSepLengths);
+    p^.pnSepLengths := nil;
   end;
 end;
 
 procedure groupConcatFinal(pCtx: Psqlite3_context); cdecl;
 var
-  pAgg: PMem;
+  p: PGroupConcatCtx;
 begin
-  pAgg := PMem(sqlite3_aggregate_context(pCtx, 0));
-  if (pAgg = nil) or ((pAgg^.flags and MEM_Null) <> 0) then begin
+  p := PGroupConcatCtx(sqlite3_aggregate_context(pCtx, 0));
+  if p = nil then begin
     sqlite3_result_null(pCtx);
-  end else begin
-    sqlite3_result_value(pCtx, Psqlite3_value(pAgg));
+    Exit;
   end;
+  if p^.accError = SQLITE_NOMEM then
+    sqlite3_result_error_nomem(pCtx)
+  else if p^.accError = SQLITE_TOOBIG then
+    sqlite3_result_error_toobig(pCtx)
+  else if (p^.z = nil) or (p^.nChar = 0) then
+    sqlite3_result_null(pCtx)
+  else
+    sqlite3_result_text(pCtx, p^.z, p^.nChar, SQLITE_TRANSIENT);
+  sqlite3_free(p^.z);          p^.z := nil;
+  sqlite3_free(p^.pnSepLengths); p^.pnSepLengths := nil;
+end;
+
+{ groupConcatValue — port of func.c:2305.  Window xValue: emit current
+  accumulator without finalising the context (xStep / xInverse may keep
+  modifying it). }
+procedure groupConcatValue(pCtx: Psqlite3_context); cdecl;
+var
+  p: PGroupConcatCtx;
+begin
+  p := PGroupConcatCtx(sqlite3_aggregate_context(pCtx, 0));
+  if p = nil then begin
+    sqlite3_result_null(pCtx);
+    Exit;
+  end;
+  if p^.accError = SQLITE_NOMEM then
+    sqlite3_result_error_nomem(pCtx)
+  else if p^.accError = SQLITE_TOOBIG then
+    sqlite3_result_error_toobig(pCtx)
+  else if (p^.nAccum > 0) and (p^.nChar = 0) then
+    sqlite3_result_text(pCtx, '', 0, SQLITE_STATIC)
+  else if (p^.z = nil) or (p^.nChar = 0) then
+    sqlite3_result_null(pCtx)
+  else
+    sqlite3_result_text(pCtx, p^.z, p^.nChar, SQLITE_TRANSIENT);
 end;
 
 { Phase 6.9-bis 11g.2.f sub-progress 34 — printf() / format() SQL function.
@@ -45920,12 +46064,12 @@ begin
 end;
 
 var
-  aBuiltinAgg: array[0..8] of TFuncDef;
+  aBuiltinAgg: array[0..9] of TFuncDef;
 
 procedure InitBuiltinAgg;
 procedure MakeAgg(var fd: TFuncDef; n: i16; flgs: u32;
   step: TxSFuncProc; final_: TxFinalProc; nm: PAnsiChar;
-  inv: TxSFuncProc = nil); inline;
+  inv: TxSFuncProc = nil; valueP: TxFinalProc = nil); inline;
 begin
   FillChar(fd, SizeOf(fd), 0);
   fd.nArg      := n;
@@ -45933,9 +46077,11 @@ begin
   fd.xSFunc    := step;
   fd.xFinalize := final_;
   { Window context (OP_AggValue) calls xValue.  C's WAGGREGATE registers
-    aggregates with xValue=xFinalize so `sum() OVER (...)` etc. work as
-    whole-frame window functions.  Wire the same here. }
-  fd.xValue    := final_;
+    aggregates with xValue=xFinalize when no separate non-finalising emit
+    is needed (e.g. count, sum), or with a dedicated xValue (group_concat).
+    Honour an explicit valueP override so xFinalize can free the buffer. }
+  if valueP <> nil then fd.xValue := valueP
+                  else fd.xValue := final_;
   { xInverse — invoked by OP_AggInverse to roll back one prior xStep when a
     row leaves the window frame.  Required for ROWS / RANGE / GROUPS frames
     with non-default bounds; without it AggInverse is a no-op and the running
@@ -45953,8 +46099,12 @@ begin
           @minStep, @minMaxFinal, 'min');
   MakeAgg(aBuiltinAgg[6], 1, AGG_ENC or SQLITE_FUNC_MINMAX or SQLITE_FUNC_NEEDCOLL,
           @maxStep, @minMaxFinal, 'max');
-  MakeAgg(aBuiltinAgg[7], 1, AGG_ENC, @groupConcatStep, @groupConcatFinal, 'group_concat');
-  MakeAgg(aBuiltinAgg[8], 2, AGG_ENC, @groupConcatStep, @groupConcatFinal, 'group_concat');
+  MakeAgg(aBuiltinAgg[7], 1, AGG_ENC, @groupConcatStep, @groupConcatFinal, 'group_concat',
+          @groupConcatInverse, @groupConcatValue);
+  MakeAgg(aBuiltinAgg[8], 2, AGG_ENC, @groupConcatStep, @groupConcatFinal, 'group_concat',
+          @groupConcatInverse, @groupConcatValue);
+  MakeAgg(aBuiltinAgg[9], 2, AGG_ENC, @groupConcatStep, @groupConcatFinal, 'string_agg',
+          @groupConcatInverse, @groupConcatValue);
 end;
 
 var

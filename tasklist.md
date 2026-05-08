@@ -2648,6 +2648,34 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.63** Fixed 2026-05-08.  `group_concat()` / `string_agg()`
+     window-function variants returned cumulative-from-partition-start text
+     instead of frame-bounded text; the bare `string_agg(x,sep)` SQL function
+     was unregistered (`Parse error: no such function: string_agg`).
+     Reproducer: `SELECT a, group_concat(b,'|') OVER (ORDER BY a ROWS
+     BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t(a,b)` (a=1..4, b='a'..'d')
+     produced `a|b / a|b|c / a|b|c|a|d / a|b|c|a|d|b` instead of the
+     expected `a|b / a|b|c / b|c|d / c|d`.  Root cause: Pas registered
+     groupConcatStep/Final via MakeAgg with no `xInverse` and no
+     `xValue`, so OP_AggInverse was a silent no-op (each row leaving the
+     frame did nothing) while OP_AggStep kept appending; xValue defaulted
+     to xFinalize but the prior xFinalize relied on a TMem buffer overlay
+     that had no per-entry separator bookkeeping.  string_agg was missing
+     from aBuiltinAgg entirely.  Fix: ported func.c:2150..2324 1:1 — new
+     `TGroupConcatCtx` record (z/nChar/nAlloc/nAccum/nFirstSepLength/
+     pnSepLengths) replaces the TMem overlay; `groupConcatStep` /
+     `groupConcatInverse` / `groupConcatFinal` / `groupConcatValue` mirror
+     C; `pnSepLengths` per-entry sep array kicks in when separator length
+     varies.  Extended `MakeAgg` with an explicit xValue parameter so
+     finalize (which frees z) is distinct from the windowed value emit.
+     Wired three registrations: group_concat/1, group_concat/2, and
+     `string_agg/2` (alias used by upstream WAGGREGATE at func.c:3362).
+     Verified byte-identical to upstream across plain group_concat,
+     group_concat with custom / NULL separator, ROWS / RANGE windows,
+     string_agg() plain and windowed.  TestExplainParity 1026/1026;
+     DiagWindow / DiagFunctions / DiagOps / DiagDml / DiagFeatureProbe /
+     DiagAggWhere / DiagPragma / DiagMisc all 0 divergences.
+
 - [X] **10.1.bug.62** Fixed 2026-05-08.  `SELECT * FROM (VALUES(1),...) LIMIT n
      OFFSET k` ignored both LIMIT and OFFSET, returning every row from the
      coroutine.  Reproducer: `SELECT * FROM (VALUES(1),(2),(3),(4),(5))
