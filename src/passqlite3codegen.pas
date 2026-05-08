@@ -48555,6 +48555,7 @@ var
   pDup:     PExpr;
   aItems:   PExprListItem;
   bHandleCol: Boolean;
+  f:        u32;
 begin
   p := PWindowRewrite(pWalker^.u.ptr);
   pPrs := pWalker^.pParse;
@@ -48617,6 +48618,7 @@ begin
     p^.pSub := sqlite3ExprListAppend(pPrs, p^.pSub, pDup);
   end;
   if p^.pSub <> nil then begin
+    f := pExpr^.flags and EP_Collate;
     pExpr^.flags := pExpr^.flags or EP_Static;
     sqlite3ExprDelete(pPrs^.db, pExpr);
     pExpr^.flags := pExpr^.flags and not EP_Static;
@@ -48626,6 +48628,7 @@ begin
     else pExpr^.iColumn := i16(iCol);
     pExpr^.iTable := p^.pWin^.iEphCsr;
     pExpr^.y.pTab := p^.pTab;
+    pExpr^.flags := f;
   end;
   if pPrs^.db^.mallocFailed <> 0 then begin
     Result := WRC_Abort; Exit;
@@ -49112,7 +49115,7 @@ begin
       Assert((bInverse = 0) or (bInverse = 1));
       sqlite3VdbeAddOp2(v, OP_AddImm, pWin^.regApp + 1 - bInverse, 1);
     end
-    else if Pointer(@pFunc^.xSFunc) <> Pointer(@noopWindowStepFunc) then
+    else if Pointer(pFunc^.xSFunc) <> Pointer(@noopWindowStepFunc) then
     begin
       if pWin^.bExprArgs <> 0 then
       begin

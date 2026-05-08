@@ -2499,6 +2499,48 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.24** Fixed 2026-05-08.  `lag()` and `lead()` window
+     functions returned incorrect values (literal `0` for first row, and
+     constant `1` for subsequent rows).  Root cause: in `windowAggStep`
+     (passqlite3codegen.pas ~49115), the upstream `pFunc->xSFunc !=
+     noopStepFunc` guard was ported as
+     `Pointer(@pFunc^.xSFunc) <> Pointer(@noopWindowStepFunc)` — the
+     stray `@` returned the address of the FuncDef field rather than the
+     stored function pointer, so the comparison was always true and Pas
+     emitted `OP_AggStep lag(2)` even though lag/lead's xSFunc is the
+     noop.  AggStep then ran lag's no-op body on the regAccum and
+     subsequent AggValue read garbage.  In OBJFPC `@procVar` is the
+     variable address, not the function pointer; correct form is
+     `Pointer(pFunc^.xSFunc)`.  Companion fix to
+     `selectWindowRewriteExprCb` (passqlite3codegen.pas ~48619): port
+     the missing `int f = pExpr->flags & EP_Collate` save/restore around
+     the `memset` (window.c:808/819) so EP_Collate survives the rewrite.
+     Verified: `SELECT a, lag(a,1) OVER (ORDER BY a) FROM t` now
+     byte-identical to upstream.  TestExplainParity 1026/1026;
+     DiagWindow still shows the same 2 pre-existing divergences (bug
+     6.29); DiagFunctions / TestSmoke / TestVdbeAgg 11/11 clean.
+     Open follow-up tracked as **10.1.bug.25** below.
+
+- [ ] **10.1.bug.25** `lag(a,1) OVER (ORDER BY a)` returns wrong values
+     when the outer SELECT projects a third column alongside `a` and the
+     window expression.  Reproducer: `SELECT a, b, lag(a,1) OVER (ORDER
+     BY a) FROM t ORDER BY a;` on `t(a INTEGER, b TEXT)` with
+     (1,'a'),(2,'b'),(3,'c'),(4,'a'),(5,'b') — Pas returns
+     `[1,a,0];[2,b,];[3,c,1];[4,a,1];[5,b,1]` vs C reference
+     `[1,a,];[2,b,1];[3,c,2];[4,a,3];[5,b,4]`.  EXPLAIN shows Pas's
+     window-rewrite sub-SELECT pSublist contains an extra duplicate
+     `a` column between the output b and lag's args, so the sorter
+     record has 5 cols instead of C's 4 — register positions for
+     subsequent reads are off by one.  Drop to a 2-column projection
+     (`SELECT a, lag(a,1) OVER (ORDER BY a)`) and the bug disappears.
+     Suspected root cause: `selectWindowRewriteEList` /
+     `exprListAppendList` for window pOrderBy not deduplicating against
+     the already-rewritten pEList entries, or `sqlite3ExprCompare`
+     returning "different" between an already-rewritten TK_COLUMN
+     pointing at iEphCsr and an unrewritten TK_COLUMN pointing at the
+     source cursor.  Investigation deferred — DiagWindow does not
+     exercise this 3-column shape, so it slipped through.
+
 - [X] **10.1.bug.22** Fixed 2026-05-08.  `WITH RECURSIVE c(x) AS (SELECT 1
      UNION SELECT x+1 FROM c WHERE x<N) SELECT * FROM c;` now returns
      1..N byte-identical to upstream.  Root cause: `sqlite3VdbeMemExpandBlob`
