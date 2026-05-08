@@ -2712,26 +2712,35 @@ existing dispatcher.
      divergences.  DiagWindow 2 (pre-existing bug 6.29 — bare `sum()
      OVER ()` / `avg() OVER ()` no-PARTITION-no-ORDER, unrelated).
 
-- [ ] **10.1.bug.29** RIGHT JOIN and FULL OUTER JOIN drop unmatched
-     right-side rows — behave as INNER JOIN.  Reproducer: on
-     `a(x)=[1,2]`, `b(y)=[2,3]`, `SELECT * FROM a RIGHT JOIN b ON x=y`
-     returns just `2|2` instead of `2|2 / |3`; `FULL JOIN` likewise
-     omits the right-only rows.  Root cause: the unmatched-rows pass
-     is not invoked.  `sqlite3WhereRightJoinLoop` is fully ported in
-     passqlite3codegen.pas:19049 but has **no caller** — the call
-     site in `sqlite3WhereEnd` (where.c:7539..7552, 7675..7678) is
-     listed as deferred at codegen.pas:17735 ("RIGHT JOIN subroutine
-     return").  Need to: (1) wire the per-level call from
-     sqlite3WhereEnd when `pLevel^.pRJ <> nil` to drive the
-     synthesised single-table inner scan; (2) verify pRJ is being
-     allocated in the planner for RIGHT JOIN levels (check
-     where.c around mPrereq / WHERE_RIGHT_JOIN flag handling).
-     LEFT JOIN already works correctly, so the divergence is
-     specifically the RIGHT-side null-extended row emission.  Visible
-     to any user but not exercised by TestExplainParity (corpus is
-     LEFT-JOIN heavy).  DiagJoinTrace and DiagInnerJoin do not
-     currently exercise RIGHT JOIN either — adding a coverage test
-     would prevent regression once the fix lands.
+- [X] **10.1.bug.29** Fixed 2026-05-08.  `RIGHT JOIN` / `FULL OUTER
+     JOIN` now emit the right-side unmatched rows.  Two faithful-to-C
+     omissions in passqlite3codegen.pas:
+     1. **Planner never allocated `pLevel^.pRJ`** — the cursor-open
+        loop in `sqlite3WhereBegin` (codegen.pas ~17144) ran
+        `sqlite3CodeVerifySchema` and stopped, skipping
+        where.c:7392..7422.  Added the JT_RIGHT block: malloc
+        TWhereRightJoin, allocate iMatch / regBloom / regReturn,
+        emit `OP_Blob 65536`, `OP_Null 0`, `OP_OpenEphemeral` (with
+        sqlite3KeyInfoAlloc(1,0) for HasRowid / PK KeyInfo
+        otherwise), clear WHERE_IDX_ONLY on the loop, and force
+        nOBSat=0 / eDistinct=WHERE_DISTINCT_UNORDERED.
+     2. **`sqlite3WhereEnd` never drove the subroutine** — the
+        per-level closure loop now (a) emits the body subroutine end
+        at the top: `ResolveLabel(addrCont) / addrCont = MakeLabel /
+        endSubrtn = CurrentAddr / OP_Return regReturn,addrSubrtn,1`;
+        (b) emits `OP_Return regReturn,0,1` after `addrBrk` resolution
+        so the recording-pass falls through and the replay-pass jumps
+        back; (c) after all levels close, walks forward and calls
+        `sqlite3WhereRightJoinLoop(pWInfo, i, pLevel)` for each pRJ
+        level; (d) decrements `pParse^.withinRJSubrtn` by nRJ at the
+        tail.  Verified byte-identical to system sqlite3 on `a RIGHT
+        JOIN b ON x=y`, `a FULL OUTER JOIN b ON x=y`, `a RIGHT JOIN b
+        ON x=y WHERE y>2`, multi-column right joins, and INNER/LEFT
+        JOIN regression cases.  TestExplainParity 1026/1026;
+        TestSelectBasic 60/60; TestWhereBasic 52/52; TestDMLBasic 54/54;
+        DiagOps / DiagDml / DiagFunctions / DiagFeatureProbe /
+        DiagPragma / DiagWindow / DiagMisc / DiagCast all 0
+        divergences.
 
 - [X] **10.1.bug.28** Fixed 2026-05-08.  `SELECT max(column1) FROM
      (VALUES(1),(2),(3))` returned `1` instead of `3` (and similarly for

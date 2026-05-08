@@ -17142,6 +17142,46 @@ begin
       end;
       if iDb >= 0 then
         sqlite3CodeVerifySchema(pParse, iDb);
+      { where.c:7392..7422 — allocate WhereRightJoin for RIGHT JOIN levels.
+        Sets up the iMatch ephemeral b-tree that records which right-table
+        rows matched, the regBloom Bloom filter that fast-paths the post-
+        scan unmatched probe, and regReturn for the OP_Gosub/OP_Return
+        round-trip into the level-body subroutine.  The unmatched-rows
+        pass itself is driven from sqlite3WhereEnd via
+        sqlite3WhereRightJoinLoop (where.c:7745..7747). }
+      if (pTabItem^.fg.jointype and JT_RIGHT) <> 0 then
+      begin
+        pLevel^.pRJ := PWhereRightJoin(sqlite3WhereMalloc(pWInfo,
+                          SizeOf(TWhereRightJoin)));
+        if pLevel^.pRJ <> nil then
+        begin
+          pLevel^.pRJ^.iMatch := pParse^.nTab;
+          Inc(pParse^.nTab);
+          Inc(pParse^.nMem);
+          pLevel^.pRJ^.regBloom := pParse^.nMem;
+          sqlite3VdbeAddOp2(v, OP_Blob, 65536, pLevel^.pRJ^.regBloom);
+          Inc(pParse^.nMem);
+          pLevel^.pRJ^.regReturn := pParse^.nMem;
+          sqlite3VdbeAddOp2(v, OP_Null, 0, pLevel^.pRJ^.regReturn);
+          Assert(pTab = pTabItem^.pSTab);
+          if HasRowid(pTab) then
+          begin
+            sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pLevel^.pRJ^.iMatch, 1);
+            { sqlite3KeyInfoAlloc zeroes aColl[]/aSortFlags[] already. }
+            sqlite3VdbeAppendP4(v,
+              sqlite3KeyInfoAlloc(pParse^.db, 1, 0), P4_KEYINFO);
+          end else
+          begin
+            sqlite3VdbeAddOp2(v, OP_OpenEphemeral, pLevel^.pRJ^.iMatch,
+                              i32(sqlite3PrimaryKeyIndex(pTab)^.nKeyCol));
+            sqlite3VdbeSetP4KeyInfo(pParse,
+              Pointer(sqlite3PrimaryKeyIndex(pTab)));
+          end;
+          pLoop^.wsFlags := pLoop^.wsFlags and (not WHERE_IDX_ONLY);
+          pWInfo^.nOBSat   := 0;
+          pWInfo^.eDistinct := WHERE_DISTINCT_UNORDERED;
+        end;
+      end;
     end;
     pWInfo^.iTop := sqlite3VdbeCurrentAddr(v);
 
@@ -17720,6 +17760,8 @@ var
   xCol:   i32;
   pPkR:   PIndex2;
   viaCoroLevel: Boolean;
+  nRJ:    i32;
+  pRJ2:   PWhereRightJoin;
 begin
   { Phase 6.9-bis 11g.2.b — productive loop-tail.
 
@@ -17748,12 +17790,29 @@ begin
   v    := pPrs^.pVdbe;
   db   := pPrs^.db;
 
+  nRJ := 0;
   if v <> nil then
   begin
     iEnd := sqlite3VdbeCurrentAddr(v);
     for i := pWInfo^.nLevel - 1 downto 0 do
     begin
       pLevel := @whereInfoLevels(pWInfo)[i];
+      { where.c:7539..7552 — terminate the RIGHT JOIN body subroutine.
+        Resolves the level's addrCont (which the body's iteration jumps
+        target), reissues a never-used label so the canonical
+        addrCont resolution below has something to land on, stamps
+        endSubrtn, and emits OP_Return back to the OP_Gosub site (set up
+        in sqlite3WhereCodeOneLoopStart's BeginSubrtn pair). }
+      if pLevel^.pRJ <> nil then
+      begin
+        pRJ2 := pLevel^.pRJ;
+        sqlite3VdbeResolveLabel(v, pLevel^.addrCont);
+        pLevel^.addrCont := sqlite3VdbeMakeLabel(pPrs);
+        pRJ2^.endSubrtn := sqlite3VdbeCurrentAddr(v);
+        sqlite3VdbeAddOp3(v, OP_Return, pRJ2^.regReturn,
+                          pRJ2^.addrSubrtn, 1);
+        Inc(nRJ);
+      end;
       { where.c:7586..7607 — innermost-of-group EXISTS-to-JOIN break.
         If this level's source has fromExists=1 and either it's the
         innermost level or the next level is NOT fromExists, emit
@@ -17904,13 +17963,40 @@ begin
         end;
       end;
       sqlite3VdbeResolveLabel(v, pLevel^.addrBrk);
+      { where.c:7675..7678 — when this level was a RIGHT JOIN body, emit
+        OP_Return back to the unmatched-rows driver; the second arg is 0
+        so OP_Return falls through on the first hit (recording-pass) and
+        then jumps to addrSubrtn on the second hit (replay-pass).  See
+        sqlite3WhereRightJoinLoop's OP_Gosub at codegen.pas:19174. }
+      if pLevel^.pRJ <> nil then
+      begin
+        sqlite3VdbeAddOp3(v, OP_Return, pLevel^.pRJ^.regReturn, 0, 1);
+      end;
       ljNullRowFixup(pPrs, v, pWInfo, pLevel);
     end;
     sqlite3VdbeResolveLabel(v, pWInfo^.iBreak);
+
+    { where.c:7732..7748 — RIGHT JOIN unmatched-rows pass.  After all
+      level-bodies are closed, walk forward and emit
+      sqlite3WhereRightJoinLoop for every level whose pRJ is set.  This
+      drives a child sqlite3WhereBegin/End scan over the right-table to
+      surface NULL-extended rows for keys that the body never recorded
+      into the iMatch eph index. }
+    if nRJ > 0 then
+    begin
+      for i := 0 to pWInfo^.nLevel - 1 do
+      begin
+        pLevel := @whereInfoLevels(pWInfo)[i];
+        if pLevel^.pRJ <> nil then
+          sqlite3WhereRightJoinLoop(pWInfo, i, pLevel);
+      end;
+    end;
   end;
 
   pPrs^.nQueryLoop := i16(pWInfo^.savedNQueryLoop);
   whereInfoFree(db, pWInfo);
+  if nRJ > 0 then
+    Dec(pPrs^.withinRJSubrtn, u8(nRJ));
 end;
 
 { ---------------------------------------------------------------------------
