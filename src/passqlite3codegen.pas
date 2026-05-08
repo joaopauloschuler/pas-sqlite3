@@ -20753,8 +20753,10 @@ begin
       for j := 0 to pTab^.nCol - 1 do
       begin
         pCol := PColumn(PByte(pTab^.aCol) + j * SizeOf(TColumn));
-        if (pCol^.colFlags and (COLFLAG_HIDDEN or COLFLAG_VIRTUAL)) <> 0 then
-          Continue;
+        { select.c:6232 — only hidden columns are omitted from `*`.
+          VIRTUAL generated columns must still appear. }
+        if (pCol^.colFlags and COLFLAG_HIDDEN) <> 0 then Continue;
+        if (pCol^.colFlags and COLFLAG_NOEXPAND) <> 0 then Continue;
         pColExpr := sqlite3ExprAlloc(db, TK_COLUMN, nil, 0);
         if pColExpr = nil then Continue;
         pColExpr^.iTable  := pItem^.iCursor;

@@ -2472,6 +2472,42 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.15** Fixed 2026-05-08.  `SELECT * FROM t` silently
+     dropped VIRTUAL generated columns.  On `CREATE TABLE g(a,b,c INT
+     GENERATED ALWAYS AS (a+b) VIRTUAL)` + INSERT(3,4), the port emitted
+     `3|4` instead of `3|4|7`; explicit `SELECT a,b,c FROM g` worked.
+     Root cause: the wildcard expand in passqlite3codegen.pas:expandStar
+     skipped any column whose colFlags had `COLFLAG_HIDDEN OR
+     COLFLAG_VIRTUAL` set.  Upstream select.c:6232 only excludes hidden
+     columns (`IsHiddenColumn(...)`), then separately drops
+     `COLFLAG_NOEXPAND` columns when no explicit table prefix is present.
+     Fix: split the predicate into two `Continue` arms — drop only
+     COLFLAG_HIDDEN, then COLFLAG_NOEXPAND.  Verified byte-identical to
+     upstream for VIRTUAL and default-VIRTUAL forms.  TestExplainParity
+     1026/1026; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma /
+     DiagFunctions / DiagTxn / DiagMisc / DiagCast / DiagAnalyze /
+     TestDMLBasic 54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52 /
+     TestVdbeAgg 11/11 all clean.
+
+- [ ] **10.1.bug.17** UPSERT with `DO UPDATE` crashes with
+     EAccessViolation.  Repro: `CREATE TABLE t(id INTEGER PRIMARY KEY,
+     c INT); INSERT INTO t VALUES(1,5); INSERT INTO t VALUES(1,5) ON
+     CONFLICT DO UPDATE SET c=99;`.  `ON CONFLICT DO NOTHING` works
+     fine.  Crash addr 0x4F7B9E inside sqlite3UpsertDoUpdate ->
+     sqlite3Update path (passqlite3codegen.pas:25898 / 31639 / 31851).
+     Likely sqlite3Update does not yet honour the pUpsert hand-off; the
+     port-of comment at codegen.pas:25895 already flags "Dead-code today
+     because sqlite3Update is still a skeleton".  Verify against
+     upstream upsert.c:267 and update.c handling of pUpsert.
+
+- [ ] **10.1.bug.16** WITHOUT ROWID INSERT corrupts the database image.
+     Repro: `CREATE TABLE wr(k TEXT PRIMARY KEY, v INTEGER) WITHOUT
+     ROWID; INSERT INTO wr VALUES('k1',1);` raises `Runtime error:
+     database disk image is malformed`.  Same shape on `:memory:` and
+     file-backed db.  Listed as a known carry-over under 7.4d (WITHOUT
+     ROWID runtime corruption); promoting to a stand-alone bug item so
+     it is not lost behind 7.4d's parsing/codegen bullets.
+
 - [X] **10.1.bug.14** Fixed 2026-05-08.  `SELECT a, sum(a) FROM t`
      (bare base column alongside an aggregate, no GROUP BY) emitted only
      the 3-op stub (Init/Halt/Goto) and silently returned zero rows.
