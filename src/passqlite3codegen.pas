@@ -8512,7 +8512,10 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
 
   { resolve.c:1797..1806 — alias-arm tagging for ORDER BY terms.  Walks
     pOrderBy and, for each bare-TK_ID term, sets u.x.iOrderByCol when an
-    AS-name match is found in p^.pEList.  GROUP BY skips this step. }
+    AS-name match is found in p^.pEList.  In C, GROUP BY skips this step
+    because lookupName's NC_UEList fallback handles it; the Pas port
+    invokes this for GROUP BY too because its simplified ResolveExpr
+    lacks the NC_UEList fallback. }
   procedure ResolveAliasOrderByCol(pList: PExprList);
   var
     i, iCol: i32;
@@ -8604,6 +8607,15 @@ begin
   begin
   ResolveExprList(p^.pEList);
   ResolveExpr    (p^.pWhere);
+  { Pas-port deviation from resolve.c:1797 (which skips alias-tagging for
+    GROUP BY because lookupName's NC_UEList fallback handles it during
+    sqlite3ResolveExprNames).  This port lacks the NC_UEList fallback in
+    its simplified ResolveExpr, so a bare TK_ID alias in GROUP BY would
+    otherwise hit "no such column: <alias>".  Pre-tag aliases via the
+    same iOrderByCol mechanism used for ORDER BY; sqlite3ResolveOrderGroupBy
+    below rewrites the term into a copy of the matching result-set expr. }
+  if p^.pGroupBy <> nil then
+    ResolveAliasOrderByCol(p^.pGroupBy);
   ResolveExprList(p^.pGroupBy);
   ResolveExpr    (p^.pHaving);
 

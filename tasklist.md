@@ -2672,17 +2672,39 @@ existing dispatcher.
      DiagPragma / DiagWindow / DiagMisc / DiagCast / DiagFeatureProbe /
      DiagMoreFunc / DiagSampleProg all 0 divergences.
 
-- [ ] **10.1.bug.50** GROUP BY by SELECT-list column alias raises
+- [X] **10.1.bug.50** Fixed 2026-05-08.  GROUP BY by SELECT-list column
+     alias raised `Parse error: no such column: <alias>`.  Reproducer:
+     `SELECT b%2 g, count(*) FROM t GROUP BY g;` errored.  Root cause:
+     C resolves GROUP BY aliases via lookupName's NC_UEList fallback
+     (resolve.c:658..698), but the Pas port's simplified ResolveExpr
+     does not implement NC_UEList.  ORDER BY aliases were already
+     handled by pre-tagging `iOrderByCol` via `ResolveAliasOrderByCol`
+     before `ResolveExprList`; GROUP BY pre-tagging was missing.
+     Fix: invoke `ResolveAliasOrderByCol(p^.pGroupBy)` before
+     `ResolveExprList(p^.pGroupBy)` in resolveSelectStep
+     (passqlite3codegen.pas:8606..).  `sqlite3ResolveOrderGroupBy`
+     downstream rewrites the tagged term into a copy of the matching
+     result-set expression.  Verified byte-identical to C oracle.
+     TestExplainParity 1026/1026; DiagFeatureProbe / DiagWindow /
+     DiagDml / DiagFunctions / DiagPragma / DiagOps / DiagMisc /
+     DiagCast / DiagAnalyze all 0 divergences;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13 /
+     TestWindowBasic 34/34 all clean.
+
+- [ ] **10.1.bug.51** HAVING by SELECT-list column alias raises
      `Parse error: no such column: <alias>`.  Reproducer:
-     `SELECT b%2 g, count(*) FROM t GROUP BY g;` works on the C oracle
-     (returns the grouped count) but errors out in the Pascal port.
-     Same shape for `ORDER BY <alias>` over an aggregate / computed
-     column when the alias doesn't match a real table column — that
-     path may already work via positional ordinals.  Likely fix site:
-     `resolveAsName` / `resolveOrderByTermToExprList` in
-     passqlite3codegen.pas — the GROUP BY alias arm of resolve.c
-     (`lookupName` falling back to `pNC->pAList`) is probably absent
-     or gated incorrectly.
+     `SELECT b%2 g, count(*) c FROM t GROUP BY g HAVING c>0;` errors;
+     C oracle accepts.  Same root cause family as bug 50: the Pas
+     port's simplified ResolveExpr does not implement the lookupName
+     NC_UEList fallback (resolve.c:658..698).  HAVING is not amenable
+     to the iOrderByCol pre-tag trick used for ORDER/GROUP because
+     HAVING is a single boolean expression, not a list of terms;
+     this needs the proper NC_UEList plumbing inside ResolveExpr's
+     bareword fallback at codegen.pas:~8312, scanning p^.pEList for
+     an ENAME_NAME match and copying the result-set expression in
+     place via something equivalent to C's `resolveAlias`.
 
 - [X] **10.1.bug.48** Fixed 2026-05-08.  Planner missed the IPK fast
      path when an INTEGER PRIMARY KEY column was referenced by its
