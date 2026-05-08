@@ -24451,40 +24451,61 @@ begin
       end;
       iCsr := pItem^.iCursor;
 
-      { OP_InitCoroutine regReturn, jumpAfter, addrTop — primes the
-        coroutine to start at addrTop (the address of the first inner
-        opcode emitted right after this InitCoroutine) and jumps over
-        the inner body on first execution.  jumpAfter is patched once
-        the inner body and EndCoroutine have been emitted.  Mirrors
-        select.c:8047:  `int addrTop = sqlite3VdbeCurrentAddr(v)+1;`. }
-      Inc(pParse^.nMem);
-      pItem^.u4.pSubq^.regReturn := pParse^.nMem;
-      addrEnd := sqlite3VdbeCurrentAddr(v) + 1;  { = addrTop, repurposed temp }
-      addrTopOfLoop := sqlite3VdbeAddOp3(v, OP_InitCoroutine,
-                          pItem^.u4.pSubq^.regReturn, 0, addrEnd);
-      pItem^.u4.pSubq^.addrFillSub := addrEnd;
-
-      { Recursively code the inner with SRT_Coroutine.  Per-row OP_Yield
-        comes from the disposal arm above; the inner's first OP_Yield
-        transfers control back to the OP_Yield in the outer scan. }
-      sqlite3SelectDestInit(@innerDest, SRT_Coroutine,
-                            pItem^.u4.pSubq^.regReturn);
-      if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+      { 10.1.bug.19 — when sqlite3MultiValues already emitted the
+        coroutine body during parse (VALUES(1),(2),(3) wrapper), the
+        SrcItem carries SRCITEM_FG_VIA_COROUTINE and pSubq holds the
+        existing regReturn / regResult / addrFillSub.  Re-emitting via
+        a recursive sqlite3Select would walk a single-row pLeft (the
+        wrapper detached pPrior) and produce a stub coroutine with
+        only the first row.  Instead, just emit a reset
+        InitCoroutine pointing at the existing addrFillSub and fall
+        through to the outer Yield loop.  Mirrors C select.c handling
+        of viaCoroutine FROM items at the consumer site. }
+      if (pItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0 then
       begin
-        Result := SQLITE_ERROR; Exit;
-      end;
-      { fg.viaCoroutine bit — visible to other paths that walk SrcItems
-        (e.g. the where-code viaCoroutine arm).  Not strictly required
-        for this hot-path arm but keeps the SrcItem state consistent
-        with the C oracle. }
-      pItem^.fg.fgBits := pItem^.fg.fgBits or SRCITEM_FG_VIA_COROUTINE;
-      pItem^.u4.pSubq^.regResult := innerDest.iSdst;
+        Assert(pItem^.u4.pSubq^.regReturn <> 0);
+        Assert(pItem^.u4.pSubq^.regResult <> 0);
+        Assert(pItem^.u4.pSubq^.addrFillSub > 0);
+        sqlite3VdbeAddOp3(v, OP_InitCoroutine,
+          pItem^.u4.pSubq^.regReturn, 0, pItem^.u4.pSubq^.addrFillSub);
+      end
+      else
+      begin
+        { OP_InitCoroutine regReturn, jumpAfter, addrTop — primes the
+          coroutine to start at addrTop (the address of the first inner
+          opcode emitted right after this InitCoroutine) and jumps over
+          the inner body on first execution.  jumpAfter is patched once
+          the inner body and EndCoroutine have been emitted.  Mirrors
+          select.c:8047:  `int addrTop = sqlite3VdbeCurrentAddr(v)+1;`. }
+        Inc(pParse^.nMem);
+        pItem^.u4.pSubq^.regReturn := pParse^.nMem;
+        addrEnd := sqlite3VdbeCurrentAddr(v) + 1;  { = addrTop, repurposed temp }
+        addrTopOfLoop := sqlite3VdbeAddOp3(v, OP_InitCoroutine,
+                            pItem^.u4.pSubq^.regReturn, 0, addrEnd);
+        pItem^.u4.pSubq^.addrFillSub := addrEnd;
 
-      sqlite3VdbeEndCoroutine(v, pItem^.u4.pSubq^.regReturn);
-      { Patch the InitCoroutine jump-past target to skip over the
-        coroutine body on first entry. }
-      sqlite3VdbeChangeP2(v, addrTopOfLoop,
-                          sqlite3VdbeCurrentAddr(v));
+        { Recursively code the inner with SRT_Coroutine.  Per-row OP_Yield
+          comes from the disposal arm above; the inner's first OP_Yield
+          transfers control back to the OP_Yield in the outer scan. }
+        sqlite3SelectDestInit(@innerDest, SRT_Coroutine,
+                              pItem^.u4.pSubq^.regReturn);
+        if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+        begin
+          Result := SQLITE_ERROR; Exit;
+        end;
+        { fg.viaCoroutine bit — visible to other paths that walk SrcItems
+          (e.g. the where-code viaCoroutine arm).  Not strictly required
+          for this hot-path arm but keeps the SrcItem state consistent
+          with the C oracle. }
+        pItem^.fg.fgBits := pItem^.fg.fgBits or SRCITEM_FG_VIA_COROUTINE;
+        pItem^.u4.pSubq^.regResult := innerDest.iSdst;
+
+        sqlite3VdbeEndCoroutine(v, pItem^.u4.pSubq^.regReturn);
+        { Patch the InitCoroutine jump-past target to skip over the
+          coroutine body on first entry. }
+        sqlite3VdbeChangeP2(v, addrTopOfLoop,
+                            sqlite3VdbeCurrentAddr(v));
+      end;
 
       { Outer scan — alloc result-register block, OP_Yield to drive,
         emit pEList, translateColumnToCopy to redirect OP_Columns at

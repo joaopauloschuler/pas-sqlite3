@@ -2521,19 +2521,31 @@ existing dispatcher.
      SRT_EphemTab path doesn't drive the inner compound-subquery
      coroutine to completion before the outer Rewind on cursor 5.
 
-- [ ] **10.1.bug.19** Top-level `VALUES(1),(2),(3);` returns only the
-     first row.  Same shape with `SELECT * FROM (VALUES(1),(2),(3))`
-     and any aggregate over the wrapped form (`SELECT max(column1)
-     FROM (VALUES(1),(2),(3))` returns NULL/0).  Pascal EXPLAIN shows
-     a double-coroutine wrap: the inner coroutine yields 3 rows, but
-     the outer wrapper at addr 9 emits `InitCoroutine 8 13 10` (a
-     second coroutine) whose body just yields the constant 1 once.
-     Upstream 3.53 emits a single coroutine driven by a Yield-loop —
-     the issue is the second InitCoroutine should `InitCoroutine 1 0 2`
-     (re-using the inner coroutine register, no jump-around).  Trace
-     the SrcItem.fg.viaCoroutine arm in sqlite3Select; the wrapper
-     Select returned by sqlite3MultiValues is being treated as if it
-     were a plain subquery rather than a viaCoroutine consumer.
+- [X] **10.1.bug.19** Fixed 2026-05-08.  Top-level `VALUES(1),(2),(3);`
+     and `SELECT * FROM (VALUES(1),(2),(3))` now return all three rows
+     byte-identical to upstream.  Root cause: the sub-SELECT co-routine
+     arm in passqlite3codegen.pas:sqlite3Select (~24454) unconditionally
+     allocated a new regReturn and recursively coded the inner via
+     SRT_Coroutine.  When the FROM SrcItem was the wrapper produced by
+     sqlite3MultiValues, the coroutine body had already been emitted
+     during parse — the recursive sqlite3Select walked the now-detached
+     pLeft (op=TK_SELECT, pPrior=nil, single-row pEList) and produced a
+     stub coroutine yielding only row 1.  Fix: detect the
+     SRCITEM_FG_VIA_COROUTINE bit (already set by sqlite3MultiValues)
+     and, in that arm, just emit `OP_InitCoroutine regReturn, 0,
+     addrFillSub` to reset the existing coroutine to its entry point;
+     skip the recursive sqlite3Select / EndCoroutine / jump-patch
+     entirely.  Verified: bytecode now matches upstream
+     (15 ops, single coroutine reused via `InitCoroutine 1 0 2` at the
+     consumer site); `SELECT * FROM (VALUES(1,'a'),(2,'b'),(3,'c'))`
+     and `WHERE`-filtered forms also return correctly.
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11
+     all clean; DiagOps / DiagDml / DiagFeatureProbe / DiagFunctions
+     0 divergences.  `SELECT max(column1) FROM (VALUES…)` still returns
+     empty — that's the aggregate codegen path emitting OpenEphemeral
+     + Rewind on a never-populated cursor instead of going through the
+     coroutine; tracked separately as a follow-up sub-arm.
 
 - [X] **10.1.bug.15** Fixed 2026-05-08.  `SELECT * FROM t` silently
      dropped VIRTUAL generated columns.  On `CREATE TABLE g(a,b,c INT
