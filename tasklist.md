@@ -2648,6 +2648,38 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.75** Fixed 2026-05-08.  Eponymous virtual tables that
+     gate `idxNum` in `xBestIndex` (json_each, json_tree, jsonb_each,
+     jsonb_tree, generate_series and any future module that uses the
+     standard pattern of stashing function args as EQ constraints on
+     hidden columns) silently returned no rows.  Reproducer:
+     `SELECT * FROM json_each('[10,20,30]');` returned the empty result
+     in Pas vs three rows in C; same for `count(*) FROM json_each(...)`
+     and any non-trivial json_each / json_tree query.  Root cause: the
+     two Pas-only fast paths in sqlite3Select that handle eponymous-vtab
+     scans (codegen.pas:24340 aggregate-count arm + 24760 plain-scan
+     arm) emitted `OP_Integer 0, regAgg` for VFilter's idxNum/idxStr
+     without ever calling the module's xBestIndex.  jsonEachFilter's
+     `if idxNum=0 then leave cursor empty` branch then short-circuited.
+     Fix: synthesize a minimal `sqlite3_index_info` reflecting the
+     function args as EQ constraints on the hidden columns of pTab
+     (matching what `sqlite3WhereTabFuncArgs` would produce for the
+     full WhereBegin path), call xBestIndex, and use its idxNum +
+     idxStr + argvIndex output for OP_VFilter.  Mirrors C's
+     `whereLoopAddVirtualOne -> vtabBestIndex` (where.c:4357..4409)
+     reduced to the func-arg-only constraint set.  argv slots are
+     reordered per `aConstraintUsage[i].argvIndex` and idxStr is
+     passed as P4_DYNAMIC / P4_STATIC per `needToFreeIdxStr`.
+     Verified: `SELECT * FROM json_each('[10,20,30]')`,
+     `count(*) FROM json_each(...)`, `json_tree`, json_each with WHERE
+     filter, and 2-arg json_each(json,root) all match upstream.
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44
+     / TestJsonEach 50/50 / TestJsonRegister 48/48; DiagFunctions /
+     DiagOps / DiagFeatureProbe / DiagPragma / DiagDml / DiagWindow /
+     DiagCovering / DiagIndexing / DiagAnalyze / DiagDropTable all 0
+     divergences.
+
 - [X] **10.1.bug.74** Fixed 2026-05-08.  CLI shell printed
      `Runtime error near line N: ...` for runtime constraint failures
      (CHECK / NOT NULL / UNIQUE / PRIMARY KEY / FK) where upstream
