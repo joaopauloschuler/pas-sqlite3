@@ -2056,6 +2056,8 @@ procedure sqlite3SelectDeleteGeneric(db: PTsqlite3; p: Pointer);
 function  sqlite3JoinType(pParse: PParse; pA: PToken; pB: PToken;
   pC: PToken): i32;
 function  sqlite3ColumnIndex(pTab: PTable2; zCol: PAnsiChar): i32;
+function  tableAndColumnIndex(pSrc: PSrcList; iStart, iEnd: i32;
+  zCol: PAnsiChar; piTab, piCol: Pi32; bIgnoreHidden: i32): i32;
 procedure sqlite3SrcItemColumnUsed(pItem: PSrcItem; iCol: i32);
 procedure sqlite3SetJoinExpr(p: PExpr; iTable: i32; joinFlag: u32);
 function  sqlite3KeyInfoAlloc(db: PTsqlite3; N: i32; X: i32): PKeyInfo2;
@@ -19462,6 +19464,47 @@ begin
   Result := -1;
 end;
 
+{ tableAndColumnIndex — search FROM items iStart..iEnd (inclusive) of pSrc
+  for a column named zCol.  Mirrors select.c:379..409.  When piTab/piCol are
+  non-nil and a match is found, write the matching FROM index and column
+  index back through them and mark the column as used.  bIgnoreHidden=1
+  skips hidden columns. }
+function tableAndColumnIndex(pSrc: PSrcList; iStart, iEnd: i32;
+  zCol: PAnsiChar; piTab, piCol: Pi32; bIgnoreHidden: i32): i32;
+var
+  i, iCol: i32;
+  base: PSrcItem;
+  pItem: PSrcItem;
+  pTab: PTable2;
+  pColArr: PColumn;
+begin
+  base := SrcListItems(pSrc);
+  for i := iStart to iEnd do
+  begin
+    pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+    pTab := pItem^.pSTab;
+    if pTab = nil then Continue;
+    iCol := sqlite3ColumnIndex(pTab, zCol);
+    if iCol >= 0 then
+    begin
+      pColArr := pTab^.aCol;
+      if (bIgnoreHidden = 0) or
+         ((pColArr[iCol].colFlags and COLFLAG_HIDDEN) = 0) then
+      begin
+        if piTab <> nil then
+        begin
+          sqlite3SrcItemColumnUsed(pItem, iCol);
+          piTab^ := i;
+          piCol^ := iCol;
+        end;
+        Result := 1;
+        Exit;
+      end;
+    end;
+  end;
+  Result := 0;
+end;
+
 { sqlite3SrcItemColumnUsed — mark a subquery result column as used }
 procedure sqlite3SrcItemColumnUsed(pItem: PSrcItem; iCol: i32);
 var
@@ -21073,6 +21116,16 @@ begin
         if (pCol^.colFlags and COLFLAG_HIDDEN) <> 0 then Continue;
         if ((pCol^.colFlags and COLFLAG_NOEXPAND) <> 0) and
            (zTName = nil) then Continue;
+        { select.c:6251..6258 — for non-T.* expansion of a non-first FROM
+          item that is part of a USING-style join, omit any column whose
+          name appears in the USING IdList.  This is what NATURAL JOIN
+          and JOIN ... USING(col) need to coalesce duplicate columns. }
+        if (i > 0) and (zTName = nil) and
+           ((pItem^.fg.fgBits2 and $08) <> 0) and
+           (pItem^.u3.pUsing <> nil) and
+           (sqlite3IdListIndex(pItem^.u3.pUsing,
+                               pCol^.zCnName) >= 0) then
+          Continue;
         pColExpr := sqlite3ExprAlloc(db, TK_COLUMN, nil, 0);
         if pColExpr = nil then Continue;
         pColExpr^.iTable  := pItem^.iCursor;
@@ -21440,12 +21493,22 @@ var
   pSrc:     PSrcList;
   pItem:    PSrcItem;
   base:     PSrcItem;
-  i:        i32;
+  i, j:     i32;
   pTab:     PTable2;
   joinFlag: u32;
   pSubSel:  PSelect;
   rcCte:    i32;
   pCur:     PSelect;
+  pRightTab: PTable2;
+  pSynthUsing: PIdList;
+  pUsingList: PIdList;
+  pUsingItems: PIdListItem;
+  zSynthName: PAnsiChar;
+  synthTok: TToken;
+  iLeftTab, iLeftCol, iRightCol: i32;
+  bSynthUsing: i32;
+  pE1, pE2, pEq: PExpr;
+  pLeftSrc: PSrcItem;
 begin
   FillChar(w, SizeOf(w), 0);
   w.pParse := pParse;
@@ -21600,12 +21663,145 @@ begin
         end;
       end;
 
-      { Merge ON clause into pSelect->pWhere (select.c selectExpander:641..660).
-        For each non-first FROM item with a pOn expression, tag it with
-        EP_OuterON (LEFT/FULL JOIN) or EP_InnerON (INNER/CROSS) so the WHERE
-        machinery can enforce it correctly for outer-join null-row semantics,
-        then splice it into the SELECT's WHERE clause. }
-      if (i > 0) and (pItem^.u3.pOn <> nil) then
+    end;
+  end;
+
+  { Second pass — sqlite3ProcessJoin (select.c:516..668).  Runs after every
+    FROM item in this SELECT has been resolved (table/subquery/CTE/view) so
+    pSTab is populated for all sides.  Each non-first FROM item with
+    JT_NATURAL is converted to a USING list, USING-listed columns are turned
+    into LEFT.col=RIGHT.col WHERE predicates, and ON expressions are spliced
+    into the SELECT's WHERE.  Skipping this pass is what previously caused
+    NATURAL JOIN to degenerate into a cross join (rows unfiltered) and JOIN
+    USING(col) to access-violate at codegen time. }
+  if (pCur <> nil) and (pCur^.pSrc <> nil) then
+  begin
+    pSrc := pCur^.pSrc;
+    base := SrcListItems(pSrc);
+    for i := 0 to pSrc^.nSrc - 1 do
+    begin
+      pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
+
+      { NATURAL JOIN -> USING synthesis (select.c:535..562). }
+      if (i > 0) and ((pItem^.fg.jointype and JT_NATURAL) <> 0) then
+      begin
+        pRightTab := pItem^.pSTab;
+        if pRightTab <> nil then
+        begin
+          if ((pItem^.fg.fgBits2 and $08) <> 0) or (pItem^.u3.pOn <> nil) then
+          begin
+            sqlite3ErrorMsg(pParse,
+              'a NATURAL join may not have an ON or USING clause');
+            Exit;
+          end;
+          pSynthUsing := nil;
+          for j := 0 to pRightTab^.nCol - 1 do
+          begin
+            if (pRightTab^.aCol[j].colFlags and COLFLAG_HIDDEN) <> 0 then
+              Continue;
+            zSynthName := pRightTab^.aCol[j].zCnName;
+            if zSynthName = nil then Continue;
+            if tableAndColumnIndex(pSrc, 0, i - 1, zSynthName,
+                                   nil, nil, 1) <> 0 then
+            begin
+              synthTok.z := zSynthName;
+              synthTok.n := u32(strlen(zSynthName));
+              synthTok._pad := 0;
+              pSynthUsing := sqlite3IdListAppend(pParse, pSynthUsing,
+                                                 @synthTok);
+            end;
+          end;
+          if pSynthUsing <> nil then
+          begin
+            pItem^.u3.pUsing := pSynthUsing;
+            pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $08 or $20;
+          end;
+          if pParse^.nErr <> 0 then Exit;
+        end;
+      end;
+
+      { USING clause -> EQ predicates (select.c:571..650). }
+      if (i > 0)
+         and ((pItem^.fg.fgBits2 and $08) <> 0)
+         and (pItem^.u3.pUsing <> nil) then
+      begin
+        pRightTab := pItem^.pSTab;
+        if pRightTab <> nil then
+        begin
+          pUsingList := pItem^.u3.pUsing;
+          pUsingItems := IdListItems(pUsingList);
+          bSynthUsing := i32(Ord((pItem^.fg.fgBits2 and $20) <> 0));
+          if (pItem^.fg.jointype and JT_OUTER) <> 0 then
+            joinFlag := EP_OuterON
+          else
+            joinFlag := EP_InnerON;
+          for j := 0 to pUsingList^.nId - 1 do
+          begin
+            zSynthName := pUsingItems[j].zName;
+            iRightCol := sqlite3ColumnIndex(pRightTab, zSynthName);
+            if (iRightCol < 0)
+               or (tableAndColumnIndex(pSrc, 0, i - 1, zSynthName,
+                                       @iLeftTab, @iLeftCol,
+                                       bSynthUsing) = 0) then
+            begin
+              sqlite3ErrorMsg(pParse, PAnsiChar(AnsiString(
+                'cannot join using column ' + string(zSynthName) +
+                ' - column not present in both tables')));
+              Exit;
+            end;
+            pLeftSrc := PSrcItem(PByte(base) + iLeftTab * SizeOf(TSrcItem));
+            pE1 := sqlite3ExprAlloc(pParse^.db, TK_COLUMN, nil, 0);
+            if pE1 = nil then Exit;
+            pE1^.iTable := pLeftSrc^.iCursor;
+            pE1^.y.pTab := pLeftSrc^.pSTab;
+            if (pLeftSrc^.pSTab <> nil)
+               and (pLeftSrc^.pSTab^.iPKey = i16(iLeftCol)) then
+              pE1^.iColumn := -1
+            else
+            begin
+              pE1^.iColumn := i16(iLeftCol);
+              if iLeftCol < BMS - 1 then
+                pLeftSrc^.colUsed := pLeftSrc^.colUsed or
+                                       (Bitmask(1) shl iLeftCol)
+              else
+                pLeftSrc^.colUsed := pLeftSrc^.colUsed or
+                                       (Bitmask(1) shl (BMS - 1));
+            end;
+            sqlite3SrcItemColumnUsed(pLeftSrc, iLeftCol);
+            if (pItem^.fg.jointype and JT_LEFT) <> 0 then
+              pE1^.flags := pE1^.flags or EP_CanBeNull;
+            pE2 := sqlite3ExprAlloc(pParse^.db, TK_COLUMN, nil, 0);
+            if pE2 = nil then
+            begin sqlite3ExprDelete(pParse^.db, pE1); Exit; end;
+            pE2^.iTable := pItem^.iCursor;
+            pE2^.y.pTab := pRightTab;
+            if pRightTab^.iPKey = i16(iRightCol) then
+              pE2^.iColumn := -1
+            else
+            begin
+              pE2^.iColumn := i16(iRightCol);
+              if iRightCol < BMS - 1 then
+                pItem^.colUsed := pItem^.colUsed or
+                                    (Bitmask(1) shl iRightCol)
+              else
+                pItem^.colUsed := pItem^.colUsed or
+                                    (Bitmask(1) shl (BMS - 1));
+            end;
+            sqlite3SrcItemColumnUsed(pItem, iRightCol);
+            pEq := sqlite3PExpr(pParse, TK_EQ, pE1, pE2);
+            if pEq <> nil then
+            begin
+              sqlite3SetJoinExpr(pEq, pItem^.iCursor, joinFlag);
+              pCur^.pWhere := sqlite3ExprAnd(pParse, pCur^.pWhere, pEq);
+            end;
+          end;
+        end;
+      end;
+
+      { ON clause -> WHERE (select.c:655..661). }
+      if (i > 0)
+         and ((pItem^.fg.fgBits2 and $08) = 0)
+         and (pItem^.u3.pOn <> nil) then
       begin
         if (pItem^.fg.jointype and JT_OUTER) <> 0 then
           joinFlag := EP_OuterON
@@ -21614,7 +21810,7 @@ begin
         sqlite3SetJoinExpr(pItem^.u3.pOn, pItem^.iCursor, joinFlag);
         pCur^.pWhere := sqlite3ExprAnd(pParse, pCur^.pWhere,
                                           pItem^.u3.pOn);
-        pItem^.u3.pOn  := nil;
+        pItem^.u3.pOn := nil;
         pItem^.fg.fgBits2 := pItem^.fg.fgBits2 or $10;  { isOn bit }
         pCur^.selFlags := pCur^.selFlags or SF_OnToWhere;
       end;

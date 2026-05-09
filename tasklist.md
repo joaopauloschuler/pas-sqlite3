@@ -2648,6 +2648,40 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.77** Fixed 2026-05-08.  NATURAL JOIN silently degenerated
+     into a cross join (no rows filtered) and `JOIN ... USING(col)`
+     access-violated at codegen time.  Reproducers:
+     `CREATE TABLE l(x,y); INSERT INTO l VALUES(1,'a'),(2,'b'),(3,'c');
+      CREATE TABLE r(x,z); INSERT INTO r VALUES(2,'B'),(3,'C'),(4,'D');
+      SELECT * FROM l NATURAL JOIN r;` returned the 9-row Cartesian
+     product in Pas vs the 2 expected matched rows in C; `SELECT * FROM
+     l JOIN r USING(x);` raised `EAccessViolation`.  Root cause:
+     `sqlite3ProcessJoin` (select.c:516..668) was not ported — the
+     selectExpander only spliced ON clauses into pSelect->pWhere; it
+     never synthesised a USING IdList from JT_NATURAL nor turned USING
+     into LEFT.col=RIGHT.col equality predicates, and downstream code
+     read the unconverted `pItem->u3.pUsing` through the pOn slot of
+     the same union (crash).  Fix in passqlite3codegen.pas: ported
+     `tableAndColumnIndex` (select.c:379..409) and added a second pass
+     over each pCur->pSrc inside `sqlite3SelectExpand` that mirrors
+     ProcessJoin's three arms — NATURAL synth (pSynthUsing built from
+     right-table cols whose names appear on the left, marked
+     isUsing|isSynthUsing), USING -> EQ predicates (TK_COLUMN pair on
+     left/right cursors, tagged with EP_OuterON/EP_InnerON +
+     w.iJoin = right cursor via sqlite3SetJoinExpr, ANDed into pWhere;
+     LEFT-JOIN left side gets EP_CanBeNull), and the existing ON-arm
+     gated with `not isUsing` so the union slot is not misread as Expr.
+     `expandStar` also now skips USING-listed columns from non-first
+     FROM items (select.c:6251..6258 minimum-viable arm) so `SELECT *`
+     coalesces duplicate join columns.  Verified end-to-end against
+     the 3.53.0 oracle: NATURAL JOIN / NATURAL LEFT JOIN / JOIN USING /
+     T.* with USING / 3-way NATURAL chain (table+table+subquery) /
+     subquery NATURAL JOIN / WHERE-after-NATURAL / IPK-column NATURAL
+     JOIN all byte-identical.  TestExplainParity 1026/1026;
+     DiagFeatureProbe / DiagOps / DiagDml / DiagFunctions / DiagPragma /
+     DiagDropTable / DiagCovering / DiagInnerJoin / DiagSubsel /
+     DiagAggWhere all clean.
+
 - [X] **10.1.bug.76** Fixed 2026-05-08.  Compound queries (UNION /
      INTERSECT / EXCEPT — non-ALL forms) silently dropped every row
      produced by an arm with a real FROM-table.  Reproducer:
