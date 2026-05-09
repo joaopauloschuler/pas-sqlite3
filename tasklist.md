@@ -2680,21 +2680,28 @@ existing dispatcher.
      DiagDropTable / DiagPredicates / DiagOrderLimitTopN / DiagMultiValues
      all 0 divergences.
 
-- [ ] **10.1.bug.79** CLI shell residual mode-render gaps surfaced
-     under bug.78 but left for a follow-up:
-       * `.mode html` should emit `null` (literal) for SQL NULL values
-         even when zNull (eNull=9 → "") is empty — upstream behaviour
-         is hardcoded in the QRF html style; pas currently emits the
-         configured zNull.
-       * `.mode tcl` writes the configured zNull (`""` for the eNull=12
-         default) through `outputCString` which double-quotes the
-         literal — should emit zNull verbatim, like upstream.
-       * `.mode insert` with `.headers on` should emit the column list
-         `(a,b,c)` between table name and `VALUES(...)`; upstream gates
-         this on bTitles=QRF_Yes.
-     Evidence (Pas vs C with `.headers on` then `.mode insert tab`):
-     `INSERT INTO tab VALUES(1,'one',1.5);` vs
-     `INSERT INTO tab(a,b,c) VALUES(1,'one',1.5);`.
+- [X] **10.1.bug.79** Fixed 2026-05-08.  Three CLI shell mode-render gaps
+     closed in passqlite3shell.pas emitRowOne:
+       * MODE_Html NULL: now emits the literal text 'null' (mirrors
+         qrf.c:2766..2769 which unconditionally sets
+         `p->spec.zNull = "null"` for QRF_STYLE_Html, overriding any
+         user-configured nullvalue).
+       * MODE_Tcl NULL: now writes rs.zNull verbatim instead of routing
+         through outputCString (mirrors qrf.c:1197..1199 which calls
+         sqlite3_str_appendall on zNull without applying the eText
+         encoding).  Default tcl zNull is the literal `""`.
+       * MODE_Insert + bTitles=QRF_Yes: emits `(col,col,...)` between
+         table name and VALUES(...), with each column name routed
+         through the new identNeedsQuote / outputSqlIdent helpers
+         (mirrors qrf.c:2581..2592).  Table name is also now
+         double-quoted when it would not parse as a bareword.
+     Verified byte-identical to the 3.53.0 oracle for `.mode html`
+     SELECT-with-NULL, `.mode tcl` SELECT-with-NULL, and `.headers on`
+     + `.mode insert tab` + INSERT-then-SELECT.  TestExplainParity
+     1026/1026; TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60
+     / TestSchemaBasic 44/44 / TestParser 45/45 all pass; DiagOps /
+     DiagDml / DiagFeatureProbe / DiagPragma / DiagFunctions all 0
+     divergences.
 
 - [X] **10.1.bug.77** Fixed 2026-05-08.  NATURAL JOIN silently degenerated
      into a cross join (no rows filtered) and `JOIN ... USING(col)`

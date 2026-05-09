@@ -951,6 +951,38 @@ end;
   rather than through a FILE*; output redirection lands with 10.1.25.
   ---------------------------------------------------------------------- }
 
+function identNeedsQuote(const z: AnsiString): Boolean;
+{ Mirrors qrf_need_quote — quote if empty, starts with non-alpha/_, or
+  contains anything other than [A-Za-z0-9_].  No keyword check (upstream
+  qrf_need_quote also skips keywords; quoting a keyword identifier is
+  always safe). }
+var
+  i: SizeInt;
+  c: AnsiChar;
+begin
+  if Length(z) = 0 then begin Result := True; Exit; end;
+  c := z[1];
+  if not ((c in ['A'..'Z', 'a'..'z', '_'])) then begin Result := True; Exit; end;
+  for i := 2 to Length(z) do begin
+    c := z[i];
+    if not (c in ['A'..'Z', 'a'..'z', '0'..'9', '_']) then begin
+      Result := True; Exit;
+    end;
+  end;
+  Result := False;
+end;
+
+procedure outputSqlIdent(const z: AnsiString);
+var i: SizeInt;
+begin
+  if not identNeedsQuote(z) then begin Write(z); Exit; end;
+  Write('"');
+  for i := 1 to Length(z) do begin
+    if z[i] = '"' then Write('""') else Write(z[i]);
+  end;
+  Write('"');
+end;
+
 procedure outputCsvField(const z: AnsiString; const sep: AnsiString);
 { output_csv (shell.c.in pre-QRF era).  Quote with double-quotes if the
   field contains the column separator, a quote, CR, or LF.  Embedded
@@ -1307,7 +1339,23 @@ begin
 
     MODE_Insert:
       begin
-        Write('INSERT INTO '); Write(rs.insertTab); Write(' VALUES(');
+        Write('INSERT INTO ');
+        if identNeedsQuote(rs.insertTab) then begin
+          Write('"');
+          for i := 1 to Length(rs.insertTab) do begin
+            if rs.insertTab[i] = '"' then Write('""') else Write(rs.insertTab[i]);
+          end;
+          Write('"');
+        end else
+          Write(rs.insertTab);
+        if rs.headersOn then begin
+          for i := 0 to rs.nCol - 1 do begin
+            if i = 0 then Write('(') else Write(',');
+            outputSqlIdent(colNameStr(pStmt, i));
+          end;
+          Write(')');
+        end;
+        Write(' VALUES(');
         for i := 0 to rs.nCol - 1 do begin
           if i > 0 then Write(',');
           ty := sqlite3_column_type(pStmt, i);
@@ -1361,15 +1409,16 @@ begin
       end;
 
     MODE_Tcl:
-      { Upstream MODE_Tcl: integers and floats emit raw, NULL/text/blob
-        as C-quoted strings.  Pas previously quoted everything via
-        outputCString which broke integer parity (`"1" "x"` vs `1 "x"`). }
+      { Upstream MODE_Tcl: integers and floats emit raw, NULL emits zNull
+        verbatim (no C-quoting — matches qrf.c:1197..1199 which calls
+        sqlite3_str_appendall on zNull without encoding), text/blob through
+        the C-style escape vocabulary. }
       begin
         for i := 0 to rs.nCol - 1 do begin
           if i > 0 then Write(rs.zColSep);
           ty := sqlite3_column_type(pStmt, i);
           case ty of
-            SQLITE_NULL:    outputCString(rs.zNull);
+            SQLITE_NULL:    Write(rs.zNull);
             SQLITE_INTEGER: Write(IntToStr(sqlite3_column_int64(pStmt, i)));
             SQLITE_FLOAT:   Write(FloatToStr(sqlite3_column_double(pStmt, i)));
           else
@@ -1381,12 +1430,15 @@ begin
       end;
 
     MODE_Html:
+      { Upstream qrf.c:2766..2769 unconditionally sets p->spec.zNull = "null"
+        for QRF_STYLE_Html, overriding any user-configured nullvalue.  Mirror
+        that here — the literal text 'null' regardless of rs.zNull. }
       begin
         WriteLn('<TR>');
         for i := 0 to rs.nCol - 1 do begin
           Write('<TD>');
           z := colTextStr(pStmt, i, isNull);
-          if isNull then outputHtmlString(rs.zNull) else outputHtmlString(z);
+          if isNull then Write('null') else outputHtmlString(z);
           WriteLn;
         end;
         WriteLn('</TR>');
