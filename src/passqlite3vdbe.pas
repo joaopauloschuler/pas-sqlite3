@@ -4968,6 +4968,11 @@ function sqlite3_value_blob(pVal: Psqlite3_value): Pointer;
 begin
   if pVal = nil then begin Result := nil; Exit; end;
   if (pVal^.flags and (MEM_Blob or MEM_Str)) <> 0 then begin
+    if (pVal^.flags and MEM_Zero) <> 0 then begin
+      if sqlite3VdbeMemExpandBlob(pVal) <> SQLITE_OK then begin
+        Result := nil; Exit;
+      end;
+    end;
     pVal^.flags := pVal^.flags or MEM_Blob;
     if pVal^.n <> 0 then Result := pVal^.z
     else Result := nil;
@@ -5165,14 +5170,35 @@ end;
 { vdbeapi.c:1492 — columnName(pStmt, N, useUtf16, useType).
   Slot stored at aColName[N + useType*nResColumn]; encoding selected by
   useUtf16. }
+const
+  azExplainColNames8: array[0..11] of PAnsiChar = (
+    'addr', 'opcode', 'p1', 'p2', 'p3', 'p4', 'p5', 'comment',
+    'id', 'parent', 'notused', 'detail'
+  );
+
 function columnName(pStmt: PVdbe; N: i32; useUtf16, useType: i32): Pointer;
 var
-  pCell: PMem;
-  off:   PtrUInt;
+  pCell:       PMem;
+  off:         PtrUInt;
+  explainBits: u32;
+  nExp:        i32;
 begin
   Result := nil;
   if pStmt = nil then Exit;
-  if (N < 0) or (N >= pStmt^.nResColumn) then Exit;
+  if N < 0 then Exit;
+  { vdbeapi.c:1505..1518 — EXPLAIN / EXPLAIN QUERY PLAN return canonical
+    static column names regardless of any aColName setup performed by
+    the inner SELECT codegen. }
+  explainBits := (pStmt^.vdbeFlags and VDBF_EXPLAIN_MASK) shr VDBF_EXPLAIN_SHIFT;
+  if explainBits <> 0 then begin
+    if useType > 0 then Exit;
+    if explainBits = 1 then nExp := 8 else nExp := 4;
+    if N >= nExp then Exit;
+    if useUtf16 = 0 then
+      Result := Pointer(azExplainColNames8[N + 8 * i32(explainBits) - 8]);
+    Exit;
+  end;
+  if N >= pStmt^.nResColumn then Exit;
   if pStmt^.aColName = nil then Exit;
   if (useType < 0) or (useType >= COLNAME_N) then Exit;
   off := PtrUInt(N + useType * i32(pStmt^.nResColumn)) * SizeOf(TMem);
@@ -7551,7 +7577,9 @@ begin
               4: sqlite3VdbeError(v, 'FOREIGN KEY constraint failed');
             else sqlite3VdbeError(v, 'constraint failed');
             end;
-            { TODO Phase 5.5: append pOp^.p4.z suffix via sqlite3MPrintf }
+            if pOp^.p4.z <> nil then
+              v^.zErrMsg := sqlite3MPrintf(db, '%z: %s',
+                              [v^.zErrMsg, pOp^.p4.z]);
           end else begin
             sqlite3VdbeError(v, pOp^.p4.z);
           end;
@@ -9075,22 +9103,30 @@ begin
       if (pIn3^.flags and MEM_Null) = 0 then begin
         { not NULL — do nothing }
       end else begin
-        { NULL — execute halt logic }
-        if pOp^.p1 <> 0 then begin
-          { error halt }
-          v^.pc := i32(pOp - aOp);
-          v^.rc := pOp^.p1;
-          if pOp^.p4.z <> nil then
+        { NULL — execute halt logic, mirroring OP_Halt fall-through (vdbe.c:1257) }
+        v^.rc := pOp^.p1;
+        v^.errorAction := u8(pOp^.p2);
+        if v^.rc <> 0 then begin
+          if pOp^.p5 <> 0 then begin
+            case pOp^.p5 of
+              1: sqlite3VdbeError(v, 'NOT NULL constraint failed');
+              2: sqlite3VdbeError(v, 'UNIQUE constraint failed');
+              3: sqlite3VdbeError(v, 'CHECK constraint failed');
+              4: sqlite3VdbeError(v, 'FOREIGN KEY constraint failed');
+            else sqlite3VdbeError(v, 'constraint failed');
+            end;
+            if pOp^.p4.z <> nil then
+              v^.zErrMsg := sqlite3MPrintf(db, '%z: %s',
+                              [v^.zErrMsg, pOp^.p4.z]);
+          end else if pOp^.p4.z <> nil then
             sqlite3VdbeError(v, pOp^.p4.z);
-          if v^.eVdbeState = VDBE_RUN_STATE then sqlite3VdbeHalt(v);
-          rc := pOp^.p1;
-          goto vdbe_return;
-        end else begin
-          v^.pc := i32(pOp - aOp);
-          if v^.eVdbeState = VDBE_RUN_STATE then sqlite3VdbeHalt(v);
-          rc := SQLITE_DONE;
-          goto vdbe_return;
+          sqlite3VdbeLogAbort(v, pOp^.p1, pOp, aOp);
         end;
+        rc := sqlite3VdbeHalt(v);
+        if rc = SQLITE_BUSY then v^.rc := SQLITE_BUSY
+        else if v^.rc <> 0 then rc := SQLITE_ERROR
+        else rc := SQLITE_DONE;
+        goto vdbe_return;
       end;
     end;
 
@@ -9719,8 +9755,14 @@ begin
       p2    := sqlite3BtreePayloadSize(pCrsr);
       if p2 >= u32(db^.aLimit[0]) { SQLITE_LIMIT_LENGTH } then goto too_big;
       if sqlite3VdbeMemFromBtreeZeroOffset(pCrsr, p2, pDest) <> 0 then goto no_mem;
-      if pOp^.p3 = 0 then
-        pDest^.flags := pDest^.flags and not MEM_Zero;
+      { vdbe.c:6138 — when p3=0, Deephemeralize the result so the row data
+        survives subsequent cursor mutations (e.g. OP_Delete on the same
+        cursor immediately after, as the recursive-CTE FIFO consumer does). }
+      if pOp^.p3 = 0 then begin
+        if (pDest^.flags and MEM_Ephem) <> 0 then begin
+          if sqlite3VdbeMemMakeWriteable(pDest) <> SQLITE_OK then goto no_mem;
+        end;
+      end;
     end;
 
     { ────── OP_RowCell ────── (vdbe.c:5847) }
@@ -11645,6 +11687,15 @@ function sqlite3VdbeMemExpandBlob(pMem: PMem): i32;
 var
   nByte: i32;
 begin
+  { Mirror the upstream `ExpandBlob` macro guard (vdbeInt.h):
+    only act when MEM_Zero is set.  Without this, calls from
+    OP_IdxInsert / OP_MakeRecord / OP_String8 etc. that pass a plain
+    blob would expand by `pMem^.u.nZero` bytes of garbage from the
+    Mem union, growing `.n` past the actual blob length and
+    triggering "database disk image is malformed" downstream. }
+  if (pMem^.flags and MEM_Zero) = 0 then begin
+    Result := SQLITE_OK; Exit;
+  end;
   nByte := pMem^.n + pMem^.u.nZero;
   if nByte <= 0 then begin
     if (pMem^.flags and MEM_Blob) = 0 then begin Result := SQLITE_OK; Exit; end;

@@ -1540,11 +1540,11 @@ begin
       (nErr++, rc:=SQLITE_ERROR, zErrMsg). }
     if (db <> nil) and (db^.suppressErr <> 0) then begin
       Inc(pPse^.nErr);
-      if pPse^.rc = SQLITE_OK then pPse^.rc := SQLITE_ERROR;
+      pPse^.rc := SQLITE_ERROR;
     end else begin
       zMsg := sqlite3MPrintf(db, 'near "%T": syntax error', [@yyminor]);
       Inc(pPse^.nErr);
-      if pPse^.rc = SQLITE_OK then pPse^.rc := SQLITE_ERROR;
+      pPse^.rc := SQLITE_ERROR;
       if zMsg <> nil then begin
         if pPse^.zErrMsg <> nil then sqlite3DbFree(db, pPse^.zErrMsg);
         pPse^.zErrMsg := zMsg;

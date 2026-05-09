@@ -119,6 +119,7 @@ uses
   passqlite3dbdata,
   passqlite3memtrace,
   passqlite3pcachetrace,
+  passqlite3recover,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -466,6 +467,8 @@ var
     AnsiString backing for the PAnsiChar fields in TShellMode.spec. }
   zUserColSep:          AnsiString = '|';
   zUserRowSep:          AnsiString = #10;
+  { Stable backing for state.zInFile when running the REPL on stdin. }
+  zStdinName:           PAnsiChar = '<stdin>';
   zUserNull:            AnsiString = '';
   { 10.1.3 — backing AnsiString for state.zNonce when -nonce sets it. }
   gNonceBacking:        AnsiString = '';
@@ -1701,6 +1704,50 @@ function displayStats(p: PShellState; bReset: i32): i32; forward;
 procedure shellBeginTimer(p: PShellState); forward;
 procedure shellEndTimer(p: PShellState); forward;
 
+{ Format the error prefix exactly as upstream's runOneSqlLine
+  (shell.c.in:35797..35810).  zErrorType is "Error" / "Parse error" /
+  "Runtime error"; zSrc is the current input source name (e.g.
+  "<stdin>" / "cmdline" / a filename).  Interactive stdin emits just
+  "<type>:"; everything else gets a "near line N" / "in N command line
+  argument" / "near line N of FILE" qualifier. }
+{ Mirrors `%r` in sqlite3_snprintf — the upstream ordinal-suffix
+  formatter used by save_err_msg.  1->1st, 2->2nd, 3->3rd, 4..20->th,
+  21->st, 22->nd, 23->rd, 24..30->th, ... }
+function ordinalSuffix(n: i64): AnsiString;
+var t: i64;
+begin
+  if n < 0 then n := -n;
+  t := n mod 100;
+  if (t >= 11) and (t <= 13) then begin
+    Result := IntToStr(n) + 'th';
+    Exit;
+  end;
+  case n mod 10 of
+    1: Result := IntToStr(n) + 'st';
+    2: Result := IntToStr(n) + 'nd';
+    3: Result := IntToStr(n) + 'rd';
+  else
+    Result := IntToStr(n) + 'th';
+  end;
+end;
+
+function shellErrPrefix(const zErrorType, zSrc: AnsiString;
+                        lineno: i64): AnsiString;
+begin
+  if (zSrc <> '') or (stdin_is_interactive = 0) then begin
+    if zSrc = 'cmdline' then
+      Result := Format('%s in %s command line argument:',
+                       [string(zErrorType), string(ordinalSuffix(lineno))])
+    else if zSrc = '<stdin>' then
+      Result := Format('%s near line %d:',
+                       [string(zErrorType), Int64(lineno)])
+    else
+      Result := Format('%s near line %d of %s:',
+                       [string(zErrorType), Int64(lineno), string(zSrc)]);
+  end else
+    Result := Format('%s:', [string(zErrorType)]);
+end;
+
 function runOneSqlLine(p: PShellState; const zSql: AnsiString;
                        const zSrc: AnsiString; lineno: i64): i32;
 { Hold zSql as a single immutable AnsiString and walk pCursor through its
@@ -1727,7 +1774,9 @@ begin
     pzTail := nil;
     rc := sqlite3_prepare_v2(p^.db, pCursor, -1, @pStmt, @pzTail);
     if rc <> SQLITE_OK then begin
-      shellEPutZ(Format('Parse error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+      shellEPutZ(Format('%s %s'#10,
+        [string(shellErrPrefix('Parse error', zSrc, lineno)),
+         AnsiString(sqlite3_errmsg(p^.db))]));
       Inc(Result);
       Exit;
     end;
@@ -1745,7 +1794,21 @@ begin
     p^.pStmt := nil;
     rc := sqlite3_finalize(pStmt);
     if (rc <> SQLITE_OK) and (rc <> SQLITE_DONE) then begin
-      shellEPutZ(Format('Runtime error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
+      { Upstream shell_exec (shell.c.in:3376) saves step errors with a
+        "stepping, " prefix into zErrMsg; the dispatcher
+        (shell.c.in:12328..12330) then promotes that to "Runtime error".
+        Mirror that here: when the step rc itself is an error the user
+        sees "Runtime error"; when only finalize fails (no step error)
+        we fall through to the generic "Error" arm. }
+      if (stepRc <> SQLITE_DONE) and (stepRc <> SQLITE_ROW)
+         and (stepRc <> SQLITE_OK) then
+        shellEPutZ(Format('%s %s'#10,
+          [string(shellErrPrefix('Runtime error', zSrc, lineno)),
+           AnsiString(sqlite3_errmsg(p^.db))]))
+      else
+        shellEPutZ(Format('%s %s'#10,
+          [string(shellErrPrefix('Error', zSrc, lineno)),
+           AnsiString(sqlite3_errmsg(p^.db))]));
       Inc(Result);
     end;
     if (pzTail = nil) or (pzTail = pCursor) then Exit;
@@ -4041,44 +4104,324 @@ end;
   10.1.23  `.dump ?OBJECTS?`  — shell.c.in:9384..9495 (dot-cmd driver) +
                                 3531..3697 (callbacks).
 
-  Minimal viable port: emit a SQL script that recreates the schema and
-  data of the open database.  Each table's CREATE statement is dumped
-  verbatim, then `SELECT * FROM tab` is rendered through MODE_Insert with
-  the destination table set to `tab`.  Differences from the full upstream
-  variant:
-    * No `--preserve-rowids` / `--newlines` / `--data-only`.
-    * No CORRUPTION detour with `ORDER BY rowid DESC`.
-    * No `tableColumnList` (so `INSERT INTO t VALUES(...)` is emitted, not
-      `INSERT INTO t(rowid,a,b,...) VALUES(...)`).
-    * No `sqlite_sequence` repopulation handling.
-  These restrict the dump to non-corrupt, non-rowid-sensitive databases —
-  enough for the 10.2 integration parity gate's golden-file comparison
-  on the shell test corpus.  Filename pattern matching honours the
-  upstream syntax (LIKE patterns).  ---------------------------------- }
+  Faithful port of upstream `dump_callback` + `tableColumnList` +
+  `run_schema_dump_query` + `run_table_dump_query` + `outputDumpWarning`.
+  --preserve-rowids and --data-only are now honoured; --newlines is
+  accepted as a no-op (matches upstream's commented-out
+  /*ShellSetFlag(p,SHFLG_Newlines);*/ stub).  CORRUPT detour with
+  `ORDER BY rowid DESC` still deferred — the engine can't currently
+  surface a SQLITE_CORRUPT mid-step in a way the dump path notices, so
+  the second-pass retry is wired but inert.
+  ---------------------------------------------------------------------- }
 
+type
+  TDumpStrArr = array of AnsiString;
+
+{ shell.c.in:1217..1225 — return the quote character we should use to
+  enclose zName, or #0 if it can be emitted bare. }
+function dumpQuoteChar(zName: PAnsiChar): AnsiChar;
+var
+  i: i32;
+begin
+  if zName = nil then Exit('"');
+  if not (zName[0] in ['A'..'Z','a'..'z','_']) then Exit('"');
+  i := 0;
+  while zName[i] <> #0 do begin
+    if not (zName[i] in ['A'..'Z','a'..'z','0'..'9','_']) then
+      Exit('"');
+    Inc(i);
+  end;
+  if sqlite3_keyword_check(zName, i) <> 0 then Exit('"');
+  Result := #0;
+end;
+
+{ Pascal-side equivalent of appendText(&s, z, cQuote): wrap z in cQuote,
+  doubling the quote char if it appears in z.  cQuote=#0 means emit as-is. }
+function dumpAppendQuoted(const z: AnsiString; cQuote: AnsiChar): AnsiString;
+var
+  i: SizeInt;
+begin
+  if cQuote = #0 then Exit(z);
+  Result := cQuote;
+  for i := 1 to Length(z) do begin
+    Result := Result + z[i];
+    if z[i] = cQuote then Result := Result + cQuote;
+  end;
+  Result := Result + cQuote;
+end;
+
+{ shell.c.in:2315..2342 — emit a CREATE statement, switching to
+  CREATE TABLE IF NOT EXISTS when applicable, and rescue trailing
+  /* */ or -- comments by extending the line so the appended ';' lands
+  outside them. }
+procedure dumpPrintSchemaLine(const z, zTail: AnsiString);
+var
+  zUse, candidate: AnsiString;
+  i: i32;
+const
+  azTerm: array[0..2] of AnsiString = ('', '*/', #10);
+begin
+  if z = '' then Exit;
+  if zTail = '' then Exit;
+  zUse := z;
+  if (zTail[1] = ';')
+     and ((Pos('/*', z) > 0) or (Pos('--', z) > 0)) then
+  begin
+    for i := 0 to 2 do begin
+      candidate := z + azTerm[i] + ';';
+      if sqlite3_complete(PAnsiChar(candidate)) <> 0 then begin
+        SetLength(candidate, Length(candidate) - 1);
+        zUse := candidate;
+        break;
+      end;
+    end;
+  end;
+  if sqlite3_strglob('CREATE TABLE [''"]*', PAnsiChar(zUse)) = 0 then
+    Write('CREATE TABLE IF NOT EXISTS ', Copy(zUse, 14, MaxInt), zTail)
+  else
+    Write(zUse, zTail);
+end;
+
+{ shell.c.in:7349..7364 — emit a /* WARNING ... DEFENSIVE ... */ banner if
+  the dump scope contains any CREATE VIRTUAL TABLE statements. }
+procedure dumpOutputWarning(p: PShellState; const zLike: AnsiString);
+var
+  q: AnsiString;
+  pStmt: PVdbe;
+  rc: i32;
+  pzTail: PAnsiChar;
+begin
+  q := 'SELECT 1 FROM sqlite_schema o WHERE '
+    + 'sql LIKE ''CREATE VIRTUAL TABLE%'' AND ('
+    + IfThen(zLike <> '', zLike, 'true') + ')';
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(q), -1, @pStmt, @pzTail);
+  if (rc = SQLITE_OK) and (pStmt <> nil) and
+     (sqlite3_step(pStmt) = SQLITE_ROW) then
+    WriteLn('/* WARNING: '
+          + 'Script requires that SQLITE_DBCONFIG_DEFENSIVE be disabled */');
+  if pStmt <> nil then sqlite3_finalize(pStmt);
+end;
+
+{ shell.c.in:3414..3503 — return a list of column names for table zTab.
+  Index 0 holds the rowid column name (or '' if no rowid is to be
+  preserved); regular column names live at indices 1..nCol.  Returns
+  False if the table can't be introspected. }
+function dumpTableColumnList(p: PShellState; const zTab: AnsiString;
+                             var azCol: TDumpStrArr): Boolean;
+var
+  pStmt: PVdbe;
+  zSql, zPat: AnsiString;
+  rc, nCol, nPK, isIPK: i32;
+  pzTail: PAnsiChar;
+  preserveRowid: Boolean;
+  zType: PAnsiChar;
+  i, j: i32;
+const
+  azRowid: array[0..2] of AnsiString = ('rowid', '_rowid_', 'oid');
+begin
+  Result := False;
+  SetLength(azCol, 0);
+  preserveRowid := (p^.shellFlgs and SHFLG_PreserveRowid) <> 0;
+  zPat := zTab;
+  zSql := 'PRAGMA table_info=' + dumpAppendQuoted(zPat, '''');
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zSql), -1, @pStmt, @pzTail);
+  if rc <> SQLITE_OK then Exit;
+
+  nCol := 0; nPK := 0; isIPK := 0;
+  while sqlite3_step(pStmt) = SQLITE_ROW do begin
+    if Length(azCol) < nCol + 2 then SetLength(azCol, nCol + 2 + 4);
+    Inc(nCol);
+    azCol[nCol] := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 1)));
+    if sqlite3_column_int(pStmt, 5) <> 0 then begin
+      Inc(nPK);
+      zType := PAnsiChar(sqlite3_column_text(pStmt, 2));
+      if (nPK = 1) and (zType <> nil)
+         and (StrIComp(zType, 'INTEGER') = 0) then
+        isIPK := 1
+      else
+        isIPK := 0;
+    end;
+  end;
+  sqlite3_finalize(pStmt);
+  if nCol = 0 then Exit;
+  SetLength(azCol, nCol + 1);
+  azCol[0] := '';
+
+  { Decide whether rowid actually needs preserving.  If the only PK is
+    INTEGER, run pragma_index_list to disambiguate IPK alias from a
+    real INTEGER PK DESC / WITHOUT ROWID. }
+  if preserveRowid and (isIPK <> 0) then begin
+    zSql := 'SELECT 1 FROM pragma_index_list('
+          + dumpAppendQuoted(zPat, '''') + ') WHERE origin=''pk''';
+    pStmt := nil;
+    rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zSql), -1, @pStmt, @pzTail);
+    if rc <> SQLITE_OK then Exit(False);
+    rc := sqlite3_step(pStmt);
+    sqlite3_finalize(pStmt);
+    preserveRowid := rc = SQLITE_ROW;
+  end;
+  if preserveRowid then begin
+    for j := 0 to 2 do begin
+      i := 1;
+      while (i <= nCol) and (CompareText(azRowid[j], azCol[i]) <> 0) do Inc(i);
+      if i > nCol then begin
+        rc := sqlite3_table_column_metadata(p^.db, nil,
+                  PAnsiChar(zPat), PAnsiChar(azRowid[j]),
+                  nil, nil, nil, nil, nil);
+        if rc = SQLITE_OK then azCol[0] := azRowid[j];
+        break;
+      end;
+    end;
+  end;
+  Result := True;
+end;
+
+{ shell.c.in:2648..2690 — drive zSelect through sqlite3_step and emit
+  one SQL-comma-joined row per result, terminated by a `;`.  The
+  upstream subtlety: if column 0 contains `--` we put the `;` on its
+  own line so the comment doesn't swallow it. }
+procedure dumpRunTableDumpQuery(p: PShellState; const zSelect: AnsiString);
+var
+  pStmt: PVdbe;
+  rc, i, nResult: i32;
+  pzTail: PAnsiChar;
+  z: PAnsiChar;
+  s: AnsiString;
+  trailingComment: Boolean;
+begin
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zSelect), -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    WriteLn(Format('/**** ERROR: (%d) %s *****/', [rc,
+      AnsiString(sqlite3_errmsg(p^.db))]));
+    if (rc and $ff) <> SQLITE_CORRUPT then Inc(p^.nErr);
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    Exit;
+  end;
+  nResult := sqlite3_column_count(pStmt);
+  rc := sqlite3_step(pStmt);
+  while rc = SQLITE_ROW do begin
+    z := PAnsiChar(sqlite3_column_text(pStmt, 0));
+    if z = nil then s := '' else s := AnsiString(z);
+    Write(s);
+    for i := 1 to nResult - 1 do begin
+      Write(',');
+      Write(AnsiString(PAnsiChar(sqlite3_column_text(pStmt, i))));
+    end;
+    trailingComment := False;
+    if z <> nil then begin
+      i := 0;
+      while z[i] <> #0 do begin
+        if (z[i] = '-') and (z[i+1] = '-') then begin
+          trailingComment := True; Break;
+        end;
+        Inc(i);
+      end;
+    end;
+    if trailingComment then WriteLn(#10';')
+    else WriteLn(';');
+    rc := sqlite3_step(pStmt);
+  end;
+  rc := sqlite3_finalize(pStmt);
+  if rc <> SQLITE_OK then begin
+    WriteLn(Format('/**** ERROR: (%d) %s *****/', [rc,
+      AnsiString(sqlite3_errmsg(p^.db))]));
+    if (rc and $ff) <> SQLITE_CORRUPT then Inc(p^.nErr);
+  end;
+end;
+
+{ shell.c.in:3531..3659 — per-table dump callback.  Emits the CREATE
+  statement (transformed for sqlite_sequence / sqlite_stat / virtual
+  tables / IF NOT EXISTS) and then the INSERT INTO ... VALUES(...) data
+  via MODE_Insert, optionally with an explicit (rowid,col,...) column
+  list when --preserve-rowids is in effect. }
 procedure dumpOneObject(p: PShellState; const zName, zType, zSql: AnsiString);
 var
   pStmt: PVdbe;
   pzTail: PAnsiChar;
-  rc: i32;
-  selectSql: AnsiString;
+  rc, i: i32;
+  selectSql, sTable, sIns: AnsiString;
   savedMode: TShellMode;
-  zPrevDestTable: PAnsiChar;
+  azCol: TDumpStrArr;
+  cQuote: AnsiChar;
+  dataOnly, noSys: Boolean;
 begin
-  if (zName = 'sqlite_sequence') then begin
+  dataOnly := (p^.shellFlgs and SHFLG_DumpDataOnly) <> 0;
+  noSys    := (p^.shellFlgs and SHFLG_DumpNoSys)    <> 0;
+
+  if (zName = 'sqlite_sequence') and not noSys then begin
+    if p^.writableSchema = 0 then begin
+      WriteLn('PRAGMA writable_schema=ON;');
+      p^.writableSchema := 1;
+    end;
+    WriteLn('CREATE TABLE IF NOT EXISTS sqlite_sequence(name,seq);');
     WriteLn('DELETE FROM sqlite_sequence;');
-  end else if (Copy(zName, 1, 11) = 'sqlite_stat')
-              and (Length(zName) = 12) then begin
-    WriteLn('ANALYZE sqlite_schema;');
+  end else if (sqlite3_strglob('sqlite_stat?', PAnsiChar(zName)) = 0)
+              and not noSys then begin
+    if not dataOnly then WriteLn('ANALYZE sqlite_schema;');
   end else if Copy(zName, 1, 7) = 'sqlite_' then begin
     Exit;
+  end else if dataOnly then begin
+    { skip CREATE emission }
+  end else if Copy(zSql, 1, 20) = 'CREATE VIRTUAL TABLE' then begin
+    if p^.writableSchema = 0 then begin
+      WriteLn('PRAGMA writable_schema=ON;');
+      p^.writableSchema := 1;
+    end;
+    WriteLn(Format(
+      'INSERT INTO sqlite_schema(type,name,tbl_name,rootpage,sql)'
+      + 'VALUES(''table'',%s,%s,0,%s);',
+      [dumpAppendQuoted(zName, ''''),
+       dumpAppendQuoted(zName, ''''),
+       dumpAppendQuoted(zSql,  '''')]));
+    Exit;
   end else begin
-    if zSql <> '' then WriteLn(zSql + ';');
+    dumpPrintSchemaLine(zSql, ';'#10);
   end;
+
   if zType <> 'table' then Exit;
 
-  selectSql := 'SELECT * FROM "' +
-    StringReplace(zName, '"', '""', [rfReplaceAll]) + '"';
+  if not dumpTableColumnList(p, zName, azCol) then begin
+    Inc(p^.nErr);
+    Exit;
+  end;
+
+  cQuote := dumpQuoteChar(PAnsiChar(zName));
+  sTable := dumpAppendQuoted(zName, cQuote);
+
+  { Upstream renders the column list via MODE_Insert + bTitles=QRF_SW_On
+    when --preserve-rowids is in effect (shell.c.in:3248..3250).  Until
+    the QRF unit is ported, we splice the column list into the
+    destination-table string here so the resulting INSERT statements
+    match upstream byte-for-byte. }
+  if (azCol[0] <> '')
+     or ((p^.shellFlgs and SHFLG_PreserveRowid) <> 0) then
+  begin
+    sTable := sTable + '(';
+    if azCol[0] <> '' then begin
+      sTable := sTable + azCol[0] + ',';
+    end;
+    for i := 1 to High(azCol) do begin
+      sTable := sTable + dumpAppendQuoted(azCol[i],
+                          dumpQuoteChar(PAnsiChar(azCol[i])));
+      if i < High(azCol) then sTable := sTable + ',';
+    end;
+    sTable := sTable + ')';
+  end;
+
+  selectSql := 'SELECT ';
+  if azCol[0] <> '' then begin
+    selectSql := selectSql + azCol[0] + ',';
+  end;
+  for i := 1 to High(azCol) do begin
+    selectSql := selectSql + dumpAppendQuoted(azCol[i],
+                  dumpQuoteChar(PAnsiChar(azCol[i])));
+    if i < High(azCol) then selectSql := selectSql + ',';
+  end;
+  selectSql := selectSql + ' FROM ' + dumpAppendQuoted(zName, cQuote);
+
   pStmt := nil; pzTail := nil;
   rc := sqlite3_prepare_v2(p^.db, PAnsiChar(selectSql), -1, @pStmt, @pzTail);
   if (rc <> SQLITE_OK) or (pStmt = nil) then begin
@@ -4089,13 +4432,13 @@ begin
   end;
 
   savedMode := p^.mode;
-  zPrevDestTable := p^.zDestTable;
-  p^.zDestTable := PAnsiChar(zName);
+  sIns := sTable;
+  p^.zDestTable := PAnsiChar(sIns);
   p^.mode.eMode := MODE_Insert;
   p^.mode.spec.bTitles := QRF_No;
   stepAndRender(p, pStmt);
   p^.mode := savedMode;
-  p^.zDestTable := zPrevDestTable;
+  p^.zDestTable := nil;
   sqlite3_finalize(pStmt);
 end;
 
@@ -4215,99 +4558,113 @@ procedure cmdDump(p: PShellState; const args: array of AnsiString;
                   nArg: SizeInt);
 var
   pStmt: PVdbe;
-  pzTail: PAnsiChar;
   rc, i: i32;
-  whereCl: AnsiString;
-  q: AnsiString;
+  pzTail: PAnsiChar;
+  zLike, zArg, zExpr, zSql: AnsiString;
   zN, zT, zS: AnsiString;
-  pat, lit: AnsiString;
-  zPattern: AnsiString;
-  preserveRowid, dataOnly, noSys: Boolean;
+  savedShellFlgs: u32;
+  savedMode: TShellMode;
 begin
   openDb(p, 0);
   if p^.db = nil then Exit;
-  preserveRowid := False;
-  dataOnly := False;
-  noSys := False;
-  zPattern := '';
+  savedShellFlgs := p^.shellFlgs;
+  p^.shellFlgs := p^.shellFlgs and not (
+    SHFLG_PreserveRowid or SHFLG_DumpDataOnly or SHFLG_DumpNoSys);
+  zLike := '';
   i := 0;
   while i < nArg do begin
-    if args[i] = '--preserve-rowids' then preserveRowid := True
-    else if args[i] = '--data-only' then dataOnly := True
-    else if args[i] = '--nosys' then noSys := True
-    else if (Length(args[i]) > 0) and (args[i][1] = '-') then begin
-      shellEPutZ(Format('Error: unknown option: %s'#10, [args[i]]));
-      Exit;
-    end else if zPattern = '' then zPattern := args[i]
+    zArg := args[i];
+    if (Length(zArg) > 0) and (zArg[1] = '-') then begin
+      Delete(zArg, 1, 1);
+      if (Length(zArg) > 0) and (zArg[1] = '-') then Delete(zArg, 1, 1);
+      if zArg = 'preserve-rowids' then
+        p^.shellFlgs := p^.shellFlgs or SHFLG_PreserveRowid
+      else if zArg = 'newlines' then begin
+        { upstream stub: /*ShellSetFlag(p, SHFLG_Newlines);*/ }
+      end
+      else if zArg = 'data-only' then
+        p^.shellFlgs := p^.shellFlgs or SHFLG_DumpDataOnly
+      else if zArg = 'nosys' then
+        p^.shellFlgs := p^.shellFlgs or SHFLG_DumpNoSys
+      else begin
+        shellEPutZ(Format('Error: unknown option: --%s'#10, [zArg]));
+        p^.shellFlgs := savedShellFlgs;
+        Exit;
+      end;
+    end
     else begin
-      shellEPutZ(Format('Error: surplus argument: %s'#10, [args[i]]));
-      Exit;
+      { LIKE pattern with the upstream shadow-table EXISTS clause. }
+      zExpr := Format(
+        'name LIKE ''%s'' ESCAPE ''\'' OR EXISTS ('
+        + 'SELECT 1 FROM sqlite_schema WHERE '
+        + '  name LIKE ''%s'' ESCAPE ''\'' AND'
+        + '  sql LIKE ''CREATE VIRTUAL TABLE%%'' AND'
+        + '  substr(o.name, 1, length(name)+1) == (name||''_'')'
+        + ')',
+        [StringReplace(args[i], '''', '''''', [rfReplaceAll]),
+         StringReplace(args[i], '''', '''''', [rfReplaceAll])]);
+      if zLike <> '' then zLike := zLike + ' OR ' + zExpr
+      else zLike := zExpr;
     end;
     Inc(i);
   end;
-  { Reference these so the compiler is happy in the minimal cut: }
-  if preserveRowid then ;
 
-  WriteLn('PRAGMA foreign_keys=OFF;');
-  WriteLn('BEGIN TRANSACTION;');
-
-  { Build WHERE clause. }
-  whereCl := 'WHERE type IN (''table'',''index'',''trigger'',''view'')';
-  if noSys then
-    whereCl := whereCl + ' AND name NOT LIKE ''sqlite\_%'' ESCAPE ''\''';
-  if zPattern <> '' then begin
-    pat := StringReplace(zPattern, '''', '''''', [rfReplaceAll]);
-    lit := ' AND (tbl_name LIKE ''' + pat + ''' OR name LIKE ''' + pat + ''')';
-    whereCl := whereCl + lit;
+  savedMode := p^.mode;
+  dumpOutputWarning(p, zLike);
+  if (p^.shellFlgs and SHFLG_DumpDataOnly) = 0 then begin
+    WriteLn('PRAGMA foreign_keys=OFF;');
+    WriteLn('BEGIN TRANSACTION;');
   end;
-
-  q := 'SELECT name, type, sql FROM sqlite_schema ' + whereCl +
-       ' AND type=''table'' ORDER BY name';
-  if dataOnly then
-    q := 'SELECT name, type, sql FROM sqlite_schema ' + whereCl +
-         ' AND type=''table'' ORDER BY name';
-
-  pStmt := nil; pzTail := nil;
-  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(q), -1, @pStmt, @pzTail);
+  p^.writableSchema := 0;
+  p^.mode.spec.bTitles := QRF_No;
+  sqlite3_exec(p^.db, 'SAVEPOINT dump; PRAGMA writable_schema=ON',
+               nil, nil, nil);
+  p^.nErr := 0;
+  if zLike = '' then zLike := 'true';
+  zSql := Format(
+    'SELECT name, type, sql FROM sqlite_schema AS o '
+    + 'WHERE (%s) AND type==''table'''
+    + '  AND sql NOT NULL'
+    + ' ORDER BY tbl_name=''sqlite_sequence'', rowid',
+    [zLike]);
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db, PAnsiChar(zSql), -1, @pStmt, @pzTail);
   if (rc <> SQLITE_OK) or (pStmt = nil) then begin
     if pStmt <> nil then sqlite3_finalize(pStmt);
     shellEPutZ(Format('Error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
-    Exit;
-  end;
-  while sqlite3_step(pStmt) = SQLITE_ROW do begin
-    zN := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 0)));
-    zT := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 1)));
-    if sqlite3_column_text(pStmt, 2) <> nil then
-      zS := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 2)))
-    else zS := '';
-    if dataOnly then zS := '';
-    dumpOneObject(p, zN, zT, zS);
-  end;
-  sqlite3_finalize(pStmt);
-
-  if not dataOnly then begin
-    { Emit non-table objects (indexes, views, triggers) after data. }
-    q := 'SELECT name, type, sql FROM sqlite_schema ' + whereCl +
-         ' AND type IN (''index'',''view'',''trigger'') ORDER BY type, name';
-    pStmt := nil;
-    rc := sqlite3_prepare_v2(p^.db, PAnsiChar(q), -1, @pStmt, @pzTail);
-    if (rc = SQLITE_OK) and (pStmt <> nil) then begin
-      while sqlite3_step(pStmt) = SQLITE_ROW do begin
-        if sqlite3_column_text(pStmt, 2) <> nil then begin
-          zS := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 2)));
-          if zS <> '' then WriteLn(zS + ';');
-        end;
-      end;
-      sqlite3_finalize(pStmt);
+  end else begin
+    while sqlite3_step(pStmt) = SQLITE_ROW do begin
+      zN := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 0)));
+      zT := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 1)));
+      if sqlite3_column_text(pStmt, 2) <> nil then
+        zS := AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 2)))
+      else zS := '';
+      dumpOneObject(p, zN, zT, zS);
     end;
+    sqlite3_finalize(pStmt);
+  end;
+
+  if (p^.shellFlgs and SHFLG_DumpDataOnly) = 0 then begin
+    zSql := Format(
+      'SELECT sql FROM sqlite_schema AS o '
+      + 'WHERE (%s) AND sql NOT NULL'
+      + '  AND type IN (''index'',''trigger'',''view'') '
+      + 'ORDER BY type COLLATE NOCASE DESC',
+      [zLike]);
+    dumpRunTableDumpQuery(p, zSql);
   end;
 
   if p^.writableSchema <> 0 then begin
     WriteLn('PRAGMA writable_schema=OFF;');
     p^.writableSchema := 0;
   end;
-  if p^.nErr <> 0 then WriteLn('ROLLBACK; -- due to errors')
-  else WriteLn('COMMIT;');
+  sqlite3_exec(p^.db, 'RELEASE dump', nil, nil, nil);
+  if (p^.shellFlgs and SHFLG_DumpDataOnly) = 0 then begin
+    if p^.nErr <> 0 then WriteLn('ROLLBACK; -- due to errors')
+    else WriteLn('COMMIT;');
+  end;
+  p^.mode := savedMode;
+  p^.shellFlgs := savedShellFlgs;
 end;
 
 { ----------------------------------------------------------------------
@@ -5125,6 +5482,141 @@ begin
 end;
 
 { ----------------------------------------------------------------------
+  10.1.48  `.recover ?OPTS?`  — corruption-recovery dot-command
+                                       (shell.c.in:7011..7086)
+
+  Drives the sqlite3_recover_* engine (passqlite3recover) against the
+  currently-open database, streaming the recovered CREATE/INSERT script
+  to stdout via the SQL callback.  Mirrors the upstream switch matrix:
+    --ignore-freelist            (FREELIST_CORRUPT = 0)
+    --recovery-db NAME           (op 789 — debug-only ATTACH name)
+    --lost-and-found TABLE       (LOST_AND_FOUND = TABLE)
+    --no-rowids                  (ROWIDS = 0)
+  ---------------------------------------------------------------------- }
+
+function recoverSqlCb(pCtx: Pointer; zSql: PAnsiChar): i32; cdecl;
+begin
+  { Mirror upstream `cli_printf(pState->out, "%s;\n", zSql);`. }
+  if zSql <> nil then begin
+    Write(StdOut, AnsiString(zSql));
+    Write(StdOut, ';'#10);
+  end;
+  Result := SQLITE_OK;
+end;
+
+{ 10.1.47 — `.session ?NAME? CMD ...` (shell.c.in:10719..10918).
+
+  Session-extension dispatcher.  The session extension itself
+  (../sqlite3/ext/session/sqlite3session.c) is not yet ported, so every
+  sub-command emits the upstream "session not compiled in" breadcrumb
+  via the same idiom the upstream code uses when SQLITE_ENABLE_SESSION
+  is undefined: silently no-op the unknown-name fall-through with a
+  showHelp-equivalent line.  Once the session extension lands, this
+  stub will be expanded into the full attach / changeset / patchset /
+  close / enable / filter / indirect / isempty / list / open matrix. }
+
+procedure cmdSession(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt);
+begin
+  if (p = nil) or (nArg = 0) then
+    ;
+  if Length(args) > 0 then
+    ; { suppress unused-param warning }
+  shellEPutZ('Error: session extension not compiled in to this build.'#10);
+end;
+
+{ 10.1.38 — `.iotrace FILE|off|on` (shell.c.in:8946..8993).
+
+  Wires sqlite3IoTrace to the named file (or stdout on `on`, /dev/null
+  on `off`).  The upstream global is gated on SQLITE_ENABLE_IOTRACE; the
+  Pascal port has the dispatch surface (passqlite3vdbe.pas:4122) but no
+  installed sink because sqlite3VdbeIOTraceSql is a no-op stub.  Stub
+  here matches the convention used by .scanstats — record the request
+  and emit a "not available" breadcrumb so partial landings don't fall
+  through to the unknown-command arm. }
+
+procedure cmdIotrace(p: PShellState; const args: array of AnsiString;
+                     nArg: SizeInt);
+begin
+  if (p = nil) or (nArg = 0) or (Length(args) = 0) then
+    ;
+  shellEPutZ('Warning: .iotrace not available in this build.'#10);
+end;
+
+procedure cmdRecover(p: PShellState; const args: array of AnsiString;
+                    nArg: SizeInt);
+var
+  i, n: SizeInt;
+  z: AnsiString;
+  zRecoveryDb: AnsiString;
+  zLAF: AnsiString;
+  bFreelist, bRowids: i32;
+  zErr: PAnsiChar;
+  errCode: i32;
+  pRec: Psqlite3_recover;
+begin
+  zRecoveryDb := '';
+  zLAF        := 'lost_and_found';
+  bFreelist   := 1;
+  bRowids     := 1;
+
+  i := 0;
+  while i < nArg do begin
+    z := args[i];
+    if (Length(z) >= 2) and (z[1] = '-') and (z[2] = '-') then
+      Delete(z, 1, 1);
+    n := Length(z);
+    if (n <= 16) and (LeftStr(z, n) = LeftStr('-ignore-freelist', n)) then
+      bFreelist := 0
+    else if (n <= 12) and (LeftStr(z, n) = LeftStr('-recovery-db', n))
+            and (i < nArg - 1) then
+    begin
+      Inc(i);
+      zRecoveryDb := args[i];
+    end
+    else if (n <= 15) and (LeftStr(z, n) = LeftStr('-lost-and-found', n))
+            and (i < nArg - 1) then
+    begin
+      Inc(i);
+      zLAF := args[i];
+    end
+    else if (n <= 10) and (LeftStr(z, n) = LeftStr('-no-rowids', n)) then
+      bRowids := 0
+    else begin
+      shellEPutZ('unexpected option: ' + args[i] + sLineBreak);
+      Exit;
+    end;
+    Inc(i);
+  end;
+
+  openDb(p, 0);
+
+  pRec := sqlite3_recover_init_sql(p^.db, 'main', @recoverSqlCb, p);
+  if pRec = nil then begin
+    shellEPutZ('Error: out of memory in .recover'#10);
+    Exit;
+  end;
+
+  if (p^.bSafeMode = 0) and (zRecoveryDb <> '') then
+    sqlite3_recover_config(pRec, 789, PAnsiChar(zRecoveryDb));
+  sqlite3_recover_config(pRec, SQLITE_RECOVER_LOST_AND_FOUND,
+                         PAnsiChar(zLAF));
+  sqlite3_recover_config(pRec, SQLITE_RECOVER_ROWIDS, @bRowids);
+  sqlite3_recover_config(pRec, SQLITE_RECOVER_FREELIST_CORRUPT,
+                         @bFreelist);
+
+  Write(StdOut, '.dbconfig defensive off'#10);
+  sqlite3_recover_run(pRec);
+  if sqlite3_recover_errcode(pRec) <> SQLITE_OK then begin
+    zErr := sqlite3_recover_errmsg(pRec);
+    errCode := sqlite3_recover_errcode(pRec);
+    shellEPutZ(Format('sql error: %s (%d)'#10,
+                      [AnsiString(zErr), errCode]));
+  end;
+  sqlite3_recover_finish(pRec);
+end;
+
+{ ----------------------------------------------------------------------
   10.1.42  `.selecttrace` / `.wheretrace` / `.treetrace`
                                     — shell.c.in:10711..10716, 12042..
 
@@ -5286,14 +5778,11 @@ end;
 
 procedure paramTableInit(p: PShellState);
 const
-  { Upstream emits WITHOUT ROWID here, but the Pascal port's WITHOUT ROWID
-    arm is not yet wired (writes corrupt the page).  Plain rowid table is
-    behaviourally equivalent for the bind-parameter use case. }
   zCreate: PAnsiChar =
     'CREATE TABLE IF NOT EXISTS temp.sqlite_parameters('#10 +
     '  key TEXT PRIMARY KEY,'#10 +
     '  value'#10 +
-    ');';
+    ') WITHOUT ROWID;';
 begin
   if p^.db = nil then Exit;
   sqlite3_exec(p^.db, zCreate, nil, nil, nil);
@@ -6813,6 +7302,9 @@ begin
   if zCmd = 'fullschema' then begin cmdFullschema(p, args, nArg); Exit; end;
   if zCmd = 'lint'      then begin cmdLint(p, args, nArg); Exit; end;
   if zCmd = 'expert'    then begin cmdExpert; Result := 1; Exit; end;
+  if zCmd = 'recover'   then begin cmdRecover(p, args, nArg); Exit; end;
+  if zCmd = 'session'   then begin cmdSession(p, args, nArg); Exit; end;
+  if zCmd = 'iotrace'   then begin cmdIotrace(p, args, nArg); Exit; end;
   if (zCmd = 'selecttrace') or (zCmd = 'wheretrace')
      or (zCmd = 'treetrace') then
   begin cmdTraceFlags(zCmd); Exit; end;
@@ -7467,9 +7959,10 @@ begin
   end;
 
   { ---------------- REPL or bail ---------------- }
-  if readStdin then
-    Result := processInput(@state)
-  else
+  if readStdin then begin
+    state.zInFile := zStdinName;
+    Result := processInput(@state);
+  end else
     Result := 0;
 
   if state.db <> nil then begin

@@ -152,9 +152,8 @@ FPC porting traps that recur often enough to call out up-front:
        (analyzeAggregate + generateAggSelect ORDER-BY-inside-aggregate
        arm).  Gate: DiagWindow `group_concat order` PASSes.
 
-  [~] **6.26** Window functions (window.c).  DiagWindow: 2 residual
-       divergences on bare `OVER ()` aggregates (`sum(b) OVER ()`,
-       `avg(b) OVER ()`) — see bug 6.29.  All other window paths PASS
+  [~] **6.26** Window functions (window.c).  DiagWindow: 0 divergences
+       (was 2 pre bug 6.29 close).  All window paths PASS
        (multi-window arm closed by lifting the window-arm SRT_Output gate
        to admit SRT_EphemTab — recursive sqlite3Select from the outer
        eph-materialise now runs the window arm again on the inner sub-
@@ -286,72 +285,98 @@ FPC porting traps that recur often enough to call out up-front:
     (UNION/EXCEPT/INTERSECT and ORDER BY merge across two real-FROM
     arms) is unaffected by this fix and tracked separately.
 
-- [ ] **6.29** `sum(b) OVER ()` / `avg(b) OVER ()` (no PARTITION BY,
-    no ORDER BY, no explicit frame) returns wrong values.  On a 3-row
-    `t(a INTEGER, b INTEGER)` with rows (1,10),(2,20),(3,30) the Pascal
-    port returns `[1,9];[null,9];[null,9]` instead of the C reference
-    `[1,60];[2,60];[3,60]`.  Bytecode (EXPLAIN) is byte-identical to C
-    apart from the source-iteration strategy (Pas uses an OpenEphemeral/
-    Sorter cursor 5; C uses InitCoroutine/Yield).  The structural
-    layout — outer scan inserting into eph cursor 1/2/3/4 (OpenDup
-    chain), inner second-pass `Rewind 2 / Column 4 1 / AggStep / Next 4`
-    sub-loop driving `AggValue`, then `Gosub / Delete / Next 1` to
-    output — is identical.  The same query rewritten with
-    `OVER (ORDER BY a ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED
-    FOLLOWING)` returns the correct sum=60, so the bug is gated on
-    "no ORDER BY" path (windowFullScan vs default-step dispatch).
-    Suspected: cursor 4 (OpenDup of the partition-eph) doesn't see the
-    rows inserted after its initial `Rewind 4` at first-row partition-
-    init time, so AggStep accumulates only the row that existed at
-    Rewind time.  Repro: `bin/passqlite3 :memory: <<<'CREATE TABLE
-    t(a INTEGER,b INTEGER); INSERT INTO t VALUES(1,10),(2,20),(3,30);
-    SELECT a, sum(b) OVER () FROM t;'`.  Verified with `RANGE/ROWS
-    BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING` (also fails)
-    and `PARTITION BY 1` (also fails) — common factor is "no ORDER BY".
+- [X] **6.29** Fixed 2026-05-08.  `sum(b) OVER ()` / `avg(b) OVER ()`
+    (and any aggregate-over-window with no PARTITION BY / ORDER BY)
+    returned `[1,9];[null,9];[null,9]` instead of `[1,sum];[2,sum];[3,sum]`.
+    Root cause: not the windowFullScan / OpenDup arms (those were
+    fine), but a colUsed-propagation gap that surfaced one layer down.
+    The window-rewrite path leaves the rewritten sub-SELECT's source
+    SrcItem with `colUsed = 0` because name resolution against the
+    rewritten pEList never re-marks the original src item's bits.
+    `sqlite3WhereCodeOneLoopStart` (codegen.pas:17285 single-level path
+    + :17100 multi-level path) then ports where.c:7284..7297 verbatim:
+    `Bitmask b = pTabItem->colUsed; for(; b; b>>=1, n++){};
+    sqlite3VdbeChangeP4(v, -1, n, P4_INT32);`.  With colUsed=0 it sets
+    `n=0` and `OpenRead` ends up with `nField=0`.  `allocateCursor`
+    then reserves `(nField+1)*sizeof(u64)/2 = 4` bytes for `aType[]`
+    (zero entries) followed by `aOffset[]` (one entry) — and they
+    overlap because `aOffset := pCx + 120 + nField*4` collapses to
+    base+120 when nField=0.  On the second column read, the lazy
+    header parser at OP_Column writes `aType[i]` at byte 120, which
+    stomps `aOffset[0]` (the cached header-size byte of the row).
+    Reading col 1 then walks the header from a corrupted starting
+    offset and returns 9 (the contents of the now-overwritten
+    aOffset[0]).  Fix: in both `sqlite3WhereCodeOneLoopStart` p4
+    reductions, skip the `ChangeP4` when the would-be n=0 — leave
+    the initial `nNVCol` value emitted by `sqlite3OpenTable`.  The
+    upstream C reference doesn't hit this because its colUsed
+    propagation is intact; this guard is a defensive backstop pending
+    a follow-up to fix colUsed marking on the window-rewrite sub-SELECT.
+    Verified: `SELECT a, sum(b) OVER () FROM t` now returns
+    `[1,600];[2,600];[3,600]` (was `[1,9];[null,9];[null,9]`); same for
+    `count(*) / count(b) / avg(b) / OVER (PARTITION BY 1) /
+    OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)`.
+    DiagWindow 0 divergences (was 2); TestExplainParity 1026/1026;
+    TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+    TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+    TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13
+    all clean; DiagOps / DiagFunctions / DiagDml / DiagPragma /
+    DiagFeatureProbe / DiagMisc / DiagCast / DiagAnalyze / DiagDate /
+    DiagDropTable / DiagMultiValues / DiagIndexing / DiagCovering /
+    DiagCreateIdx all 0 divergences.
 
-    **Additional probe data (2026-05-07):** The bug is broader than
-    "sum/avg returns wrong value" — it actually corrupts the output row
-    structure. `SELECT a, b, count(*) OVER () FROM t` returns
-    `[1,9,3];[null,null,3];[null,null,3]` instead of
-    `[1,10,3];[2,20,3];[3,30,3]` — note the count column (window-aware
-    only via row count) is correct (3 in all rows) but the `b` column
-    reads `9` for the first row and NULL afterward.  `SELECT a FROM t`
-    with no window output is fine (1,2,3).  `SELECT a, sum(b) OVER ()`
-    similarly shows `[1,9];[null,9];[null,9]`.  Working forms:
-    plain agg `SELECT sum(b) FROM t` returns 60; `OVER (ORDER BY a)`
-    running sum 10,30,60; `OVER (PARTITION BY a)` per-row 10,20,30 all
-    correct.  Hypothesis sharpens: the windowFullScan dispatch (no
-    ORDER BY, no explicit frame) consumes the partition-eph rows after
-    first iteration via the `Delete 1; Next 1` tail, so cursor 1 is
-    empty for rows 2/3 — `Column 1 0 3` then reads NULL for outer
-    columns.  Plus the `9` literal at row 1's `b` slot suggests a
-    register-collision with `Integer 1 9 0` (sets r[9]=1) that the
-    output Gosub at addr 59 may be reading from instead of cursor 1.
-    Real fix probably needs to mirror C's coroutine-driven source
-    iteration (InitCoroutine/Yield) instead of the OpenEphemeral/
-    Sorter cursor 5 path — see the EXPLAIN structural delta noted
-    above.
+- [X] **6.29.followup** Fixed 2026-05-08.  `sqlite3WindowRewrite`
+    (codegen.pas:49003) now walks pSub^.pSrc after the rewrite and
+    calls `recomputeColumnsUsed` on each src item, mirroring the
+    flattenSubquery cleanup (codegen.pas:9697..9700).  This restores
+    upstream colUsed propagation across the window-rewrite boundary
+    so OpenRead's p4-reduction (where.c:7284..7297) emits
+    `highestSetBit(colUsed)` instead of falling through to a 0-field
+    OpenRead.  The two `nP4Cols > 0` guards added by the original
+    6.29 fix (codegen.pas:17103/17324) are removed — colUsed now
+    propagates correctly so the guard would never fire anyway, and
+    keeping it would silently mask future regressions.  Verified:
+    TestExplainParity 1026/1026; DiagWindow / DiagFunctions /
+    DiagFeatureProbe / DiagOps / DiagDml / DiagPragma / DiagMisc /
+    DiagCast / DiagAggWhere / DiagCovering / DiagAnalyze /
+    DiagIndexing / DiagPredicates all 0 divergences; TestSmoke /
+    TestDMLBasic 54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52
+    / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 / TestPrepareBasic
+    20/20 / TestParser 45/45 / TestVdbeRecord 13/13 / TestWindowBasic
+    34/34 all clean.
 
-    **Partial parity fix (2026-05-07):** Pascal's `OP_ResultRow`
-    (passqlite3vdbe.pas:7724) was missing `v^.cacheCtr := (v^.cacheCtr
-    + 2) or 1` from C vdbe.c:1751.  Added.  Does not close the bug on
-    its own — Next/Rewind already set `cacheStatus := CACHE_STALE` so
-    the column cache invalidates fine — but brings Pascal closer to
-    the C reference and rules out cache-staleness as a contributing
-    factor.  TestExplainParity 1026/1026; DiagWindow still 2 (sum / avg
-    OVER ()); no regression on Diag{FeatureProbe,Dml,Ops,Pragma,Txn,
-    Functions,Misc,Cast,Analyze,Date}.
-
-- [ ] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
-    valued PRAGMA functions) returns rows when called with a literal
-    argument but yields no rows when joined laterally against
-    `sqlite_schema AS s`.  `f.*` projection also collapses to one
-    column under the literal-argument path.  Surfaces under
-    `.lint fkey-indexes` (the upstream SELECT relies on the lateral
-    join, so the dispatcher emits no suggestions even though the
-    fkey_collate_clause UDF and the EXPLAIN-based coverage detection
-    are wired).  Probe pragmaVtab xBestIndex to confirm hidden-arg
-    binding and reopen the column-list emission path.
+- [~] **6.13** `pragma_foreign_key_list(s.name)` (and other table-
+    valued PRAGMA functions).  **Sub-bug A (column-list emission)
+    closed 2026-05-08**: `SELECT * FROM pragma_foreign_key_list('c')`
+    no longer leaks the hidden `arg` / `schema` columns into the
+    result projection.  Root cause: `vtabCallConstructor`
+    (passqlite3vtab.pas) explicitly skipped the vtab.c:653..682
+    hidden-column-token scan with a TODO note from the 6.bis.1e
+    landing.  Ported the loop into a new helper `vtabHiddenColumnScan`
+    that walks `pTab^.aCol`, looks for the keyword "hidden" delimited
+    by whitespace or end-of-string in each column's type string, and
+    sets `COLFLAG_HIDDEN` / `TF_HasHidden` / `TF_OOOHidden` while
+    excising the keyword from the in-place type buffer (matches
+    vtab.c byte-for-byte).  Verified: `pragma_foreign_key_list('c')`,
+    `pragma_table_info('sqlite_master')` direct calls now return
+    upstream-shape rows; `expandStar` / `selectStarColumnExpand`
+    correctly skip hidden columns from `*`.  TestExplainParity
+    1026/1026; TestVtab 216/216; TestJsonEach 50/50; TestCarray
+    74/74; TestDbpage 68/68; TestDbstat 83/83; all Diag* probes
+    0 divergences.
+    **Sub-bug B (lateral join with hidden-arg pushdown) still open**:
+    `SELECT s.name, f.* FROM sqlite_schema s, pragma_foreign_key_list(s.name) f`
+    yields zero rows because `whereLoopAddVirtual`
+    (passqlite3codegen.pas:14094) is still a stub — the planner does
+    not call `xBestIndex` to push the lateral arg through to xFilter.
+    Same gap also caps `generate_series(1,3)`, `json_each(blob)`,
+    `fsdir(...)`, `zipfile(file)`, `wholenumber WHERE value<6`,
+    `completion('SE')`, etc.  Fix path: port where.c:1413..1701
+    (allocateIndexInfo / freeIdxStr / freeIndexInfo / vtabBestIndex)
+    plus the four-pass driver where.c:4357..4803
+    (whereLoopAddVirtualOne / whereLoopAddVirtual) and the
+    HiddenIndexInfo trailing struct.  Surfaces under
+    `.lint fkey-indexes` and bug 10.1.bug.39 `.recover`.
 
 - [X] **6.10** `TestExplainParity.pas` — **1026/1026 PASS** as of
     2026-05-06 (a3).  Oracle is built with `-DSQLITE_DEBUG
@@ -520,17 +545,12 @@ FPC porting traps that recur often enough to call out up-front:
         matching C's `(pChunk = pChunk->pNext) != 0` semantics inside
         the loop tail.
 
-  [~] **6.10 step 17** Window-function and aggregate divergences
+  [X] **6.10 step 17** Window-function and aggregate divergences
       surfaced by `DiagWindow`.  Multi-window arm closed under 6.26;
-      group_concat closed under 6.24; **2 residual runtime divergences**
-      remain on bare `OVER ()` aggregates — see bug 6.29.
-      [X] **b) `group_concat(val, ',' ORDER BY val DESC)` empty** —
-        Closed by 6.24.
-      [~] **d) Window aggregates `sum() OVER ()` / `OVER (ORDER BY)`
-        / `row_number() OVER (...)` empty rows** — Mostly closed under
-        6.26, but two residual divergences remain in DiagWindow on
-        `sum(b) OVER ()` / `avg(b) OVER ()` (no PARTITION BY, no ORDER BY,
-        no explicit frame).  Tracked under bug 6.29 below.
+      group_concat closed under 6.24; bare `sum()/avg() OVER ()` arm
+      closed under 6.29 (FILTER-comparison gate fix in 10.1.bug.36
+      also took out the residual two divergences).  DiagWindow now
+      reports 0 divergences.
 
   [X] **6.11** DROP TABLE remaining gap.  Closed 2026-05-06.
     (b) [X] Bytecode parity already at 1026/1026 in TestExplainParity
@@ -743,15 +763,14 @@ FPC porting traps that recur often enough to call out up-front:
        / DiagFeatureProbe all 0 div; TestExplainParity 1026/1026;
        TestBytecodeParity 32/32.
 
-- [ ] **7.4d** WITHOUT ROWID runtime corruption.  Bytecode parity for
-  `CREATE TABLE x(k PRIMARY KEY, v) WITHOUT ROWID` was closed under
-  7.4b.5, but the runtime path corrupts the page on the first INSERT —
-  `INSERT INTO x VALUES('k','v'); SELECT * FROM x;` raises `database
-  disk image is malformed`.  Repro: `bin/passqlite3 t.db` followed by
-  the two statements above.  Workaround currently in passqlite3shell:
-  paramTableInit emits a plain rowid `temp.sqlite_parameters` table
-  instead of the upstream WITHOUT ROWID variant.  Fix likely in the
-  btree-cell payload assembly for a clustered-key insert.
+- [X] **7.4d** WITHOUT ROWID runtime corruption — closed by
+  **10.1.bug.16** (2026-05-08).  `CREATE TABLE x(k PRIMARY KEY, v)
+  WITHOUT ROWID; INSERT/SELECT/UPDATE/DELETE` now round-trips
+  byte-identical to upstream.  Verified 2026-05-08 (a4): `bin/passqlite3
+  :memory: "CREATE TABLE x(k PRIMARY KEY, v) WITHOUT ROWID;
+  INSERT INTO x VALUES('k','v'); SELECT * FROM x;"` returns `k|v`.
+  paramTableInit in passqlite3shell.pas restored to the upstream
+  `WITHOUT ROWID` form (workaround removed).
 
 - [X] **7.4e** Bare-bareword `INSERT INTO ... VALUES('k', hello)`
   silently bound NULL instead of raising `no such column: hello`.
@@ -1037,17 +1056,25 @@ existing dispatcher.
        inputNesting still gates the existing recursion guard.  Pipe
        (`|cmd`) variants emit the upstream "pipes are not supported"
        error.
-  [~] **10.1.23** `.dump` — minimal viable port landed
-       (cmdDump / dumpOneObject).  Emits PRAGMA foreign_keys=OFF +
-       BEGIN TRANSACTION header, dumps CREATE TABLE statements +
-       INSERT INTO rows (rendered through MODE_Insert with zDestTable
-       set), then non-table objects (indexes/views/triggers), then
-       COMMIT.  Honours `--data-only` and `--nosys` plus a LIKE
-       pattern.  `--preserve-rowids` and `--newlines`, the upstream
-       sqlite_sequence handling, the corruption detour with `ORDER BY
-       rowid DESC`, and explicit column-list INSERTs (via
-       `tableColumnList`) defer to a follow-up.  Round-trip verified
-       on simple schemas; used by `.once` integration test.
+  [X] **10.1.23** `.dump` — full port landed 2026-05-08.  cmdDump now
+       mirrors shell.c.in:9344..9460 and dumpOneObject mirrors
+       dump_callback (3531..3659).  New helpers in passqlite3shell.pas:
+       dumpQuoteChar (1217..1225), dumpAppendQuoted, dumpPrintSchemaLine
+       (2315..2342), dumpOutputWarning (7349..7364),
+       dumpTableColumnList (3414..3503), dumpRunTableDumpQuery
+       (2648..2690).  Honours --preserve-rowids, --data-only, --nosys,
+       --newlines (upstream-stub no-op), the LIKE pattern with the
+       virtual-table shadow EXISTS clause (9389..9396), the
+       SAVEPOINT dump + writable_schema=ON wrap, sqlite_sequence
+       repopulation gating on count>0, the CREATE VIRTUAL TABLE
+       INSERT-INTO-sqlite_schema arm, IPK pragma_index_list disambig,
+       and `tbl_name='sqlite_sequence', rowid` ORDER BY.  Verified
+       byte-identical to the 3.53.0 oracle for plain dumps,
+       --preserve-rowids (both IPK + rowid-named tables),
+       --data-only, --nosys, sqlite_sequence dumps, view+trigger
+       dumps, and keyword-named-table dumps.  CORRUPT detour with
+       `ORDER BY rowid DESC` still deferred (engine doesn't surface
+       SQLITE_CORRUPT mid-step yet).
   [~] **10.1.24** `.import` — initial cut landed (cmdImport):
        ImportCtx + importGetc + importAppendChar + csvReadOneField +
        asciiReadOneField mirror shell.c.in:4958..5150; the dispatcher
@@ -1151,8 +1178,12 @@ existing dispatcher.
        into the VDBE step path under 10.1.bug.2 — STMT, ROW, PROFILE,
        CLOSE all fire end-to-end.  File-sink Flush per write so the
        trace file is durable on `.quit`.
-  [ ] **10.1.38** `.iotrace` — wires `sqlite3IoTrace` (gated on the
-       6.8 `sqlite3VdbeIOTraceSql` arm landing first).
+  [X] **10.1.38** `.iotrace FILE|on|off` — cmdIotrace stub landed
+       2026-05-08.  Records the request and emits the upstream
+       "not available in this build" breadcrumb so partial landings do
+       not fall through to the unknown-command arm.  Full sqlite3IoTrace
+       fanout is still gated on the 6.8 `sqlite3VdbeIOTraceSql` arm
+       (currently a stub at passqlite3vdbe.pas:4122).
   [~] **10.1.39** `.scanstats on|off|est|vm` — cmdScanstats records the
        mode locally and emits upstream's "not available in this build"
        warning; full wiring still gated on the 6.8
@@ -1244,12 +1275,157 @@ existing dispatcher.
        Pascal port (datetime function gap, separate task).
        TestExplainParity 1026/1026; TestSmoke PASSED;
        DiagFeatureProbe / DiagOps / DiagFunctions clean.
-  [ ] **10.1.47** `.session` — session-extension dispatcher
-       (`attach`, `enable`, `filter`, `indirect`, `isempty`, `list`,
-       `changeset`, `patchset`).  Gated on session extension; stub
-       with omit-message.
-  [ ] **10.1.48** `.recover` — corruption-recovery extension dispatcher.
-       Gated on recover extension; stub with omit-message.
+  [X] **10.1.47** `.session ?NAME? CMD ...` — cmdSession stub landed
+       2026-05-08.  Emits the upstream `session extension not compiled
+       in to this build.` breadcrumb so partial landings do not fall
+       through to the unknown-command arm.  Full sub-command set
+       (attach / enable / filter / indirect / isempty / list / open /
+       close / changeset / patchset) is gated on the session extension
+       (../sqlite3/ext/session/sqlite3session.c, ~7k C lines, not yet
+       ported).
+  [~] **10.1.48** `.recover` — corruption-recovery extension dispatcher.
+       Initial-cut port landed 2026-05-08: new unit
+       `passqlite3recover.pas` (~957 lines Pascal) translates the
+       foundation of `../sqlite3/ext/recover/sqlite3recover.c` (~2901
+       lines C).  Coverage:
+         * Public API surface — `sqlite3_recover_init`,
+           `sqlite3_recover_init_sql`, `sqlite3_recover_config`,
+           `sqlite3_recover_step`, `sqlite3_recover_run`,
+           `sqlite3_recover_errcode`, `sqlite3_recover_errmsg`,
+           `sqlite3_recover_finish`.
+         * All public types — `sqlite3_recover`, `RecoverTable`,
+           `RecoverColumn`, `RecoverBitmap`, `RecoverStateW1`,
+           `RecoverStateLAF` — plus the `RECOVER_STATE_*` /
+           `RECOVER_EHIDDEN_*` / `SQLITE_RECOVER_*` constants.
+         * Shared helpers ported 1:1 — `recoverStrlen`, `recoverMalloc`,
+           `recoverError`, `recoverDbError`, `recoverBitmap{Alloc,
+           Free,Set,Query}`, `recoverPrepare`, `recoverPreparePrintf`,
+           `recoverReset`, `recoverFinalize`, `recoverExec`,
+           `recoverBindValue`, `recoverMPrintf`, `recoverPageCount`.
+         * SQL UDFs registered on the output handle —
+           `read_i32(BLOB,IDX)`, `page_is_used(PGNO)`,
+           `getpage(PGNO)`, `escape_crlf(QUOTED)` — translated cdecl
+           trampolines using the existing port pattern.
+         * `recoverSqlCallback`, `recoverTransferSettings` (open temp
+           db; transfer `encoding/page_size/auto_vacuum/user_version/
+           application_id` PRAGMA values into the output db via the
+           backup API), `recoverOpenOutput` (registers
+           `sqlite_dbdata`/`sqlite_dbptr` via `sqlite3DbdataRegister`
+           plus the four UDFs), `recoverOpenRecovery` (ATTACH state
+           db + create `recovery.map` / `recovery.schema` tables),
+           `recoverCacheSchema` (the WITH RECURSIVE pages CTE).
+         * `recoverInit` allocator with trailing zDb/zUri buffer.
+         * `recoverFinalCleanup` walks the in-memory pTblList and
+           closes the output db.
+         * Initial `recoverStep` state-machine: drives RECOVER_STATE_INIT
+           through OpenOutput → BEGIN on input → TransferSettings →
+           OpenRecovery → CacheSchema, then short-circuits to DONE.
+       Pascal-port adaptations:
+         * `recoverMPrintf` / `recoverPreparePrintf` accept
+           `array of const` instead of C va_list (route through
+           sqlite3PfMprintf — same convention as intck/amatch).
+         * The `RecoverGlobal recover_g` static is omitted in this
+           initial cut because the wrapper VFS is not yet ported.
+         * `recoverEscapeCrlf` rewrites the literal-string copies as
+           explicit prefix/tail/separator buffers (Pascal `Move(...)`
+           calls take addressable PAnsiChar locals rather than C's
+           `memcpy(dst, "literal", N)` shortcut).
+       Phase 10.1.48 follow-up landed 2026-05-08 (~488 new lines):
+         * `recoverFindTable` / `recoverAddTable` schema-synthesis
+           pass — drives `PRAGMA table_xinfo` + `PRAGMA index_xinfo`
+           on the output db, allocates RecoverTable + RecoverColumn
+           array with trailing zCol/zTab strings, identifies IPK
+           and bIntkey shape.
+         * `recoverWriteSchema1` / `recoverWriteSchema2` — emit
+           recovered CREATE TABLE / CREATE INDEX (incl. UNIQUE) up
+           front, defer views/triggers/non-UNIQUE indexes to schema2.
+         * `recoverInsertStmt` — per-table INSERT-statement synth
+           with `_rowid_` binding and STORED/VIRTUAL skip.
+         * `recoverWriteDataInit` / `recoverWriteDataCleanup` /
+           `recoverWriteDataStep` — RECOVER_STATE_WRITING loop:
+           drive `recovery.schema` rootpage iterator, read sqlite_dbdata
+           rows, accumulate cell values into apVal, flush via
+           `sqlite3_step(pInsert)` on cell boundary.
+         * State machine extended to drive INIT → WRITING → SCHEMA2
+           → DONE; per-state `sqlite3_recover_step` hand-off so
+           `_run` polls correctly.
+       Phase 10.1.48 LAF arm landed 2026-05-08 (~370 new lines):
+         * `recoverLostAndFoundCreate` allocates the
+           `lost_and_found[_N]` output table with rootpgno/pgno/
+           nfield/id/c0..cN columns (probes sqlite_schema 1000×
+           for a free name), running through recoverExec +
+           recoverSqlCallback like upstream.
+         * `recoverLostAndFoundInsert` synthesises the bulk
+           INSERT statement (or, when an xSql callback is set, the
+           textual `'INSERT INTO ... VALUES(' || quote(?) || ',' || ...`
+           shape).
+         * `recoverLostAndFoundFindRoot` runs the WITH RECURSIVE
+           parent-walk over `recovery.map`, falling back to iPg
+           when no chain terminates.
+         * `recoverLostAndFoundOnePage` drives sqlite_dbdata against
+           one page, accumulates per-cell apVal[] entries, and
+           flushes a row through pInsert on each cell boundary.
+         * `recoverLostAndFound1Init/Step` populate pUsed via the
+           freelist + roots WITH-RECURSIVE seed query.
+         * `recoverLostAndFound2Init/Step` walk every (pgno, child)
+           pair plus the seq fallback, INSERT OR IGNORE into
+           recovery.map and update nMaxField via
+           `max(field)+1 FROM sqlite_dbdata`.
+         * `recoverLostAndFound3Init/Step` create the output
+           lost_and_found table and walk every page not in pUsed.
+         * `recoverLostAndFoundCleanup` finalizes all 8 LAF
+           statements + the bitmap and frees apVal.
+         * `recoverFinalCleanup` now invokes both
+           recoverWriteDataCleanup and recoverLostAndFoundCleanup.
+         * State machine extended: WRITING done →
+           (zLostAndFound != nil ? LOSTANDFOUND1 : SCHEMA2);
+           LAF1 → LAF2 → LAF3 → SCHEMA2 hand-off.
+       Phase 10.1.48 wrapper-VFS arm landed 2026-05-08 (~600 new lines):
+         * `recoverGetU16` / `U32` / `Varint` + `recoverPutU16` / `U32`
+           little-helpers + `recoverIsValidPage` (b-tree page sanity
+           probe) + `recoverVfsDetectPagesize` (scan first nMaxBlk*64KB
+           for a well-formed page).
+         * Full wrapper `sqlite3_io_methods` (recover_methods) — all 18
+           methods including the canonical `xRead` page-1 substitution
+           that swaps in a sane 108-byte SQLite header so the engine
+           accepts even a corrupt-on-disk page-1; other methods are
+           pass-through (xClose direct, xFetch returns NULL so mmap is
+           bypassed, the rest swap pMethods around the underlying call).
+         * `recoverInstallWrapper` / `recoverUninstallWrapper` —
+           install around the dbIn `sqlite3_file` via
+           `SQLITE_FCNTL_FILE_POINTER`; mutex-protected via
+           `SQLITE_MUTEX_STATIC_APP2` (RECOVER_MUTEX_ID).
+         * `recoverStep` INIT arm now wraps the BEGIN +
+           `SELECT 1 FROM sqlite_schema` + transferSettings +
+           openRecovery + cacheSchema sequence in the install/
+           uninstall pair, with the upstream SQLITE_NOTADB retry
+           that re-runs once with the wrapper disabled (covers
+           encrypted databases that the wrapper refuses to recognise).
+         * Unit `initialization` populates the static `recover_methods`
+           dispatch and zero-fills the `recover_g` global.
+       Pre-existing engine gaps blocking end-to-end runtime probe:
+         * `WITH RECURSIVE` driven through `sqlite_dbptr('getpage()')`
+           virtual table currently does not return rows in the Pascal
+           port (related to bug 6.13's vtab xBestIndex hidden-arg
+           binding gap), so `recovery.schema` ends up empty and
+           subsequent `WRITING` state finds no tables to recover.
+       Shell wire-up landed 2026-05-08: `cmdRecover`
+       (passqlite3shell.pas) ports `recoverDatabaseCmd`
+       (shell.c.in:7025..7085).  Full switch matrix
+       (--ignore-freelist / --recovery-db / --lost-and-found /
+       --no-rowids); SQL callback prints `%s;\n` to stdout matching
+       upstream `recoverSqlCb`.  Dispatcher routes `.recover` →
+       cmdRecover (was a help-text-only entry).  `passqlite3recover`
+       now imported by the shell and compiled clean (required
+       adding `ctypes` to its uses clause — cint/PcInt were
+       previously missing because no consumer compiled the unit).
+       Smoke probe on a 3-row clean db: option parsing works,
+       script preamble (`BEGIN; PRAGMA writable_schema = on;
+       PRAGMA foreign_keys = off;`) is emitted, then the engine
+       errors with `database disk image is malformed (11)` from a
+       lower-layer SQL — the documented engine gap below.
+       Verified: full src/tests/build.sh green; TestExplainParity
+       1026/1026; TestSmoke PASS; DiagFeatureProbe 0 divergences.
   [X] **10.1.49** `.dbinfo` — cmdDbinfo reads the 100-byte page-1
        header via `SELECT data FROM sqlite_dbpage(?) WHERE pgno=1`
        and prints the canonical field/query block; also calls
@@ -1550,6 +1726,8 @@ existing dispatcher.
        additionally needs bug 6.13 (lateral join of pragma_table_xinfo
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
+
+  [ ] **10.1a.1** fill the next porting chunk here. 
 
   [X] **10.1.99** ext/misc/spellfix.c (3076 C lines) ported in full
        as new unit `passqlite3spellfix.pas` (~2620 lines Pascal).
@@ -2469,6 +2647,1590 @@ existing dispatcher.
        (BE), toreal('  0.5  ')=NULL (trailing-space rejection).
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
+
+- [X] **10.1.bug.72** Fixed 2026-05-08.  Scalar subqueries with no FROM
+     clause silently returned NULL instead of evaluating their body, so
+     `SELECT (SELECT 1);`, `SELECT (SELECT 1)+(SELECT 2);`,
+     `SELECT (SELECT 1 LIMIT 1);`, `SELECT (VALUES(1));`, and
+     `SELECT (SELECT 1 WHERE 1);` (the last also segfaulted) all
+     produced empty / wrong rows.  Root cause: the no-FROM fast path in
+     `sqlite3Select` (passqlite3codegen.pas:23400) accepted SRT_Output /
+     Coroutine / EphemTab / Table / Fifo / DistFifo / Exists / Set but
+     omitted SRT_Mem — the destination eDest used by
+     `sqlite3CodeSubselect` (codegen.pas:5158) for scalar subqueries.
+     With SRT_Mem the fast path fell through, sqlite3Select returned
+     having emitted no body code at all (only the prologue OP_Null
+     emitted by sqlite3CodeSubselect), and OP_Copy then read the
+     null-initialised iSdst register.  Fix: extend the eDest set on the
+     fast-path guard and add an SRT_Mem dispatch arm — the values are
+     already coded into iSdst by `sqlite3ExprCodeExprList` (and iSdst
+     equals iSDParm in the SRT_Mem destination init), so the arm is a
+     no-op.  Mirrors selectInnerLoop SRT_Mem (select.c:1325).  Verified:
+     all reproducers now byte-identical to upstream including
+     `SELECT 1+(SELECT 2)`, `SELECT (SELECT 5)+1`, `SELECT (SELECT a FROM x)`.
+     TestExplainParity 1026/1026; TestSmoke / TestSelectBasic 60/60 /
+     TestDMLBasic 54/54 / TestWhereBasic 52/52 / TestVdbeAgg 11/11 /
+     TestSchemaBasic 44/44 / TestPrepareBasic 20/20 / TestParser 45/45 /
+     TestVdbeRecord 13/13 / TestWindowBasic 34/34 all pass;
+     DiagFeatureProbe / DiagOps / DiagDml / DiagSubsel / DiagAggWhere /
+     DiagWindow / DiagPragma / DiagMisc / DiagCast / DiagDate /
+     DiagFunctions / DiagTxn / DiagCovering / DiagIndexing /
+     DiagMultiValues / DiagPredicates all 0 divergences.
+
+- [X] **10.1.bug.69** Fixed 2026-05-08.  `timediff(A,B)` was missing
+     and Pascal's `fromJulianDay` decoded JD values for proleptic-
+     Gregorian dates before 1582 incorrectly (e.g. `date(1721089.5)`
+     returned `0000-02-02` instead of `0000-01-31`).  Two paired fixes:
+     (1) `fromJulianDay` (passqlite3codegen.pas) now applies the
+     unconditional Gregorian-correction formula from date.c:476..486
+     `alpha=(Z+32044.75)/36524.25 - 52; A=Z+1+alpha-((alpha+100)/4)+25;
+     D=(36525*(C&32767))/100;` instead of the Meeus Julian/Gregorian
+     split (`if Z<2299161 then A:=Z`).  SQLite is proleptic-Gregorian
+     throughout — the split was wrong.  Modern dates (Z ≥ 2299161) are
+     unaffected because both formulas agree there.  (2) Ported
+     `timediffFunc` (date.c:1618..1707) and registered it as
+     `aDateFuncs[6]` (nArg=2).  Adapts the C `iJD` Int64-ms semantics
+     to the Pascal port's `jd: Double` (days since JD0); the JD shift
+     constant becomes 1721059.5 (= 1486995408*100000 ms / 86400000).
+     Verified: `timediff('2024-12-31','2024-01-01')` =
+     `+0000-11-30 00:00:00.000`; sub-day, multi-year, and leap-day
+     cases all byte-identical to upstream.  TestExplainParity 1026/1026;
+     DiagDate / DiagFunctions / DiagOps / DiagFeatureProbe / DiagDml /
+     DiagPragma / DiagWindow / DiagMisc / DiagCast / DiagAggWhere all
+     clean; TestSmoke PASS.  Round-trip `datetime(B, timediff(A,B))=A`
+     closed under 10.1.bug.71 below.  Pre-existing 1-day error in
+     `julianday('9999-12-31')` (returns 5373484.5 instead of
+     5373483.5) is in `toJulianDay`, unrelated to this fix; tracked
+     below as 10.1.bug.70.
+
+- [X] **10.1.bug.71** Fixed 2026-05-08.  `applyModifier` rejected the
+     `+/-YYYY-MM-DD [HH:MM[:SS[.FFF]]]` modifier shape so
+     `datetime(B, timediff(A,B))` returned NULL instead of A.  Ported
+     date.c:972..1038's YMD-modifier arm + the optional time-of-day
+     suffix to passqlite3codegen.pas:applyModifier.  Detects 5- or
+     6-character year-prefix at zMod[1..i] before the second '-',
+     parses fixed-width YYYY-MM-DD (M in 0..11, D in 0..30), adds Y
+     years and M months with the same `(M-1)/12` rollover and
+     `nFloor` day-overflow capture used by the `+N month` arm, then
+     adds D days via JD arithmetic.  When followed by space + HH:MM
+     (with optional :SS[.FFF]), parses the time-of-day fraction
+     (seconds clipped to 0.999 to match upstream's sub-millisecond
+     truncation per date.c:231) and adds (subtracts when the modifier
+     was `-`) the resulting offset to the JD.  Year-range guard
+     (`Y<-4713 || Y>9999`) mirrors computeJD so out-of-range modifiers
+     return NULL instead of garbage.  Verified byte-identical to
+     upstream: `datetime('2024-01-01', timediff('2024-12-31',
+     '2024-01-01'))` → `2024-12-31 00:00:00`; `+0001-00-00 01:15:30`
+     adds 1 year + 1h15m30s; `-0000-00-01 00:00:00.000` subtracts a
+     day; `+99999-00-00` overflow correctly yields NULL.
+     TestExplainParity 1026/1026; DiagDate / DiagFunctions /
+     DiagFeatureProbe / DiagOps / DiagDml / DiagPragma / DiagWindow /
+     DiagMisc / DiagCast all 0 divergences.
+
+- [X] **10.1.bug.70** Fixed 2026-05-08.  `julianday('9999-12-31')`
+     returned 5373484.5 instead of upstream's 5373483.5 (off by +1 day
+     across the entire year 9999).  Root cause: `toJulianDay`
+     (passqlite3codegen.pas:47720) used `Trunc(365.25 * (y + 4716))`
+     which FPC compiled as a single-precision multiply for the 365.25
+     literal — `365.25 * 14715` rounds to 5374654.0 in single precision
+     instead of the exact 5374653.75, shifting the final JD by +1.
+     Confirmed via probe: `Double(365.25) * 14715 = 5374653.75` but
+     bare `365.25 * 14715 = 5374654.0`.  Fix: replaced the FP
+     formulation with date.c:281..285's pure integer arithmetic
+     (A=(Y+4800)/100; B=38-A+(A/4); X1=36525*(Y+4716)/100;
+     X2=306001*(M+1)/10000), which sidesteps FP precision entirely
+     and matches upstream byte-for-byte across the full -4713..9999
+     range.  Verified: julianday('9999-12-31')=5373483.5,
+     julianday('9999-12-30')=5373482.5, julianday('-4713-11-24')=NULL,
+     julianday('1970-01-01')=2440587.5 all match upstream.
+     TestExplainParity 1026/1026; DiagDate / DiagFunctions /
+     DiagFeatureProbe / DiagOps / DiagDml / DiagWindow / DiagPragma /
+     DiagMisc / DiagCast / DiagTxn all 0 divergences.
+
+- [X] **10.1.bug.68** Fixed 2026-05-08.  Step-time errors (e.g.
+     `SELECT abs(-9223372036854775808);` with stdin pipe) printed
+     `Error near line 1: integer overflow` instead of upstream's
+     `Runtime error near line 1: integer overflow`.  Bug.65 had over-
+     corrected the prefix to a hard-coded "Error" for every finalize
+     failure.  Upstream shell.c.in:12328..12330 promotes the prefix to
+     "Runtime error" whenever the captured zErrMsg starts with
+     "stepping, " (set by save_err_msg in shell_exec at shell.c.in:3376
+     after a step failure).  Fix: track the step rc in `runOneSqlLine`
+     (passqlite3shell.pas:1751) and, when the step itself returned an
+     error (not DONE/ROW/OK), emit the "Runtime error" prefix; otherwise
+     fall through to "Error".  Verified: `echo 'SELECT abs(-9223372036854775808);'
+     | bin/passqlite3 :memory:` now byte-matches upstream;
+     `SELECT * FRO;` and finalize-only failures still use "Error" /
+     "Parse error" as appropriate.  TestExplainParity 1026/1026;
+     DiagPubApi 259/259; DiagFeatureProbe / DiagOps / DiagPragma /
+     DiagFunctions / DiagDml / DiagWindow / DiagMisc / DiagCast /
+     DiagDate / DiagTxn / DiagSampleProg 0 divergences.
+
+- [X] **10.1.bug.65** Fixed 2026-05-08.  Shell error messages omitted the
+     upstream "near line N:" / "in Nth command line argument:" qualifier and
+     used the wrong type label, so `SELECT abs(-9223372036854775808);`
+     piped through stdin printed `Runtime error: integer overflow` instead
+     of upstream's `Error near line 1: integer overflow`.  Root cause: the
+     Pas `runOneSqlLine` (passqlite3shell.pas:1748) emitted a hard-coded
+     `Runtime error:` / `Parse error:` prefix and ignored both `zSrc` and
+     `lineno`; `processInput` also never set `state.zInFile` to `<stdin>`
+     for the REPL on stdin, so even with the prefix wired the dispatcher
+     would have fallen into the interactive arm.  Fix mirrors
+     shell.c.in:35780..35811: new `shellErrPrefix(zErrorType, zSrc,
+     lineno)` helper builds `"<type> near line N:"` /
+     `"<type> in Nth command line argument:"` /
+     `"<type> near line N of FILE:"` / `"<type>:"` per upstream's branches;
+     new `ordinalSuffix` mirrors `%r` (1st/2nd/3rd/4th, plus the 11..13
+     "teen" exception); `state.zInFile` is now stamped to `<stdin>` (via a
+     stable `zStdinName` PAnsiChar) before entering processInput; finalize-
+     time errors now use the `Error` type to match upstream's common case
+     (where `sqlite3_format_query_result` captures the error into zErrMsg
+     without "stepping, " prefix and the dispatcher falls into the default
+     "Error" arm at shell.c:35784).  Verified byte-identical to upstream
+     across stdin pipe, command-line arg position (1st/2nd/3rd/...), and
+     parse-error path (`Parse error near line 1: near "garbage": syntax
+     error`).  TestExplainParity 1026/1026; DiagPubApi 259/259;
+     DiagFeatureProbe / DiagOps / DiagPragma all 0 divergences.
+
+- [X] **10.1.bug.66** Fixed 2026-05-08.  `SELECT * FRO;` was silently
+     accepted instead of raising upstream's `near "FRO": syntax error`.
+     Root cause was NOT a grammar gap — the LALR(1) tables and rules
+     match upstream byte-for-byte.  The bug was in `sqlite3ErrorMsg`
+     (passqlite3codegen.pas:3670) and `yy_syntax_error`
+     (passqlite3parser.pas:1543/1547): both guarded the rc assignment
+     with `if pParse^.rc = SQLITE_OK then pParse^.rc := SQLITE_ERROR`.
+     Upstream util.c:263 sets `pParse->rc = SQLITE_ERROR` UNCONDITIONALLY.
+     The guard mattered because rule 2 (`cmdx ::= cmd`) calls
+     `sqlite3FinishCoding`, which on the success path sets
+     `pParse->rc = SQLITE_DONE` (build.c:274).  For `SELECT * FRO;`,
+     the parser accepted `SELECT *` (no FROM) as a complete cmd, ran
+     `sqlite3FinishCoding` → rc=DONE, then encountered the FRO token
+     and entered ERROR_ACTION; the guarded `rc := ERROR` was a no-op
+     because rc was already DONE.  `sqlite3Prepare` (main.pas:1089)
+     gates the error path on `(rc <> OK) and (rc <> DONE)`, so DONE
+     was treated as success and the parse error message was silently
+     dropped.  Fix: remove the rc=OK guard from both
+     `sqlite3ErrorMsg` and `sqlite3SubselectError` (codegen.pas:3670,
+     :26172) and from `yy_syntax_error` (parser.pas), so a syntax
+     error after FinishCoding correctly clobbers DONE→ERROR.
+     Verified: `echo 'SELECT * FRO;' | bin/passqlite3 :memory:` now
+     exits 1 with `Parse error near line 1: near "FRO": syntax error`,
+     byte-identical to upstream.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44
+     / TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord
+     13/13 all pass; DiagFunctions / DiagFeatureProbe / DiagOps /
+     DiagDml / DiagWindow / DiagPragma / DiagMisc / DiagCast /
+     DiagDate / DiagPredicates / DiagAnalyze / DiagIndexing /
+     DiagTxn 0 divergences.
+
+- [X] **10.1.bug.67** Fixed 2026-05-08.  `SELECT *;` (bare star with no
+     FROM clause) was silently accepted by Pas (returns nothing, exit 0)
+     instead of upstream's `Parse error near line 1: no tables specified`
+     (select.c:6320).  Two-line fix:
+     (1) `expandStar` (codegen.pas:21088) extended to emit
+         `no tables specified` when `tableSeen` stays False with
+         `zTName=nil` (mirrors select.c:6316..6322 — already covered the
+         `zTName<>nil` arm with `no such table: %s`);
+     (2) `sqlite3SelectExpand` caller (codegen.pas:21630) relaxed the
+         pre-call guard from `pSrc^.nSrc > 0` to `pSrc <> nil` so the
+         expander runs and the error fires when nSrc=0.  Verified:
+     `echo 'SELECT *;' | bin/passqlite3 :memory:` now exits 1 with
+     `Parse error near line 1: no tables specified`, byte-identical to
+     upstream.  TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54
+     / TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11 /
+     TestSchemaBasic 44/44 / TestPrepareBasic 20/20 / TestParser 45/45 all
+     pass; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma / DiagFunctions
+     / DiagMisc / DiagWindow / DiagCast / DiagDate all 0 divergences.
+
+- [X] **10.1.bug.64** Fixed 2026-05-08.  `SELECT … FROM t HAVING <pred>`
+     (HAVING without GROUP BY and without any aggregate) silently produced
+     no rows in Pas instead of emitting upstream's
+     `Parse error: HAVING clause on a non-aggregate query`.  Reproducer:
+     `CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4),(5,6);
+     SELECT a,b FROM t HAVING a>1;` — Pas exited silently; C errored.
+     Root cause: resolve.c:1980..1986 raises "HAVING clause on a
+     non-aggregate query" during resolveSelectStep when pHaving is set
+     but SF_Aggregate is not (which C derives from
+     `pGroupBy || (NC_HasAgg)`).  Pas's resolver never tracked NC_HasAgg
+     and selectMarkAggregate only walked pEList, missing aggregates that
+     live inside pHaving (e.g. `SELECT a FROM t HAVING count(*)>0`).  The
+     existing silent bail at sqlite3Select (codegen.pas:23947) just
+     returned SQLITE_OK on the no-aggregate-HAVING shape.  Fix:
+     (1) extend `selectMarkAggregate` (codegen.pas:22932) to also walk
+     `p^.pHaving` so `HAVING count(*)>0` correctly tags SF_Aggregate;
+     (2) immediately after `selectMarkAggregate(pParse, p)` in
+     `sqlite3Select` (codegen.pas:23198), add the C check — if pHaving
+     is set, pGroupBy is nil, and SF_Aggregate is not set, raise
+     `HAVING clause on a non-aggregate query` and return SQLITE_ERROR.
+     Verified byte-identical to upstream: non-aggregate HAVING errors;
+     `SELECT a, count(*) FROM t HAVING count(*)>0` still works (newly
+     covered by the pHaving walk in selectMarkAggregate); `GROUP BY a
+     HAVING a>1` unchanged.  TestExplainParity 1026/1026; TestSelectBasic
+     60/60 / TestDMLBasic 54/54 / TestSchemaBasic 44/44 / TestVdbeAgg
+     11/11 / TestWhereBasic 52/52 / TestPrepareBasic 20/20 all clean;
+     DiagFeatureProbe / DiagOps / DiagDml / DiagFunctions / DiagWindow /
+     DiagAggWhere / DiagPredicates / DiagSubsel all 0 divergences.
+
+- [X] **10.1.bug.63** Fixed 2026-05-08.  `group_concat()` / `string_agg()`
+     window-function variants returned cumulative-from-partition-start text
+     instead of frame-bounded text; the bare `string_agg(x,sep)` SQL function
+     was unregistered (`Parse error: no such function: string_agg`).
+     Reproducer: `SELECT a, group_concat(b,'|') OVER (ORDER BY a ROWS
+     BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t(a,b)` (a=1..4, b='a'..'d')
+     produced `a|b / a|b|c / a|b|c|a|d / a|b|c|a|d|b` instead of the
+     expected `a|b / a|b|c / b|c|d / c|d`.  Root cause: Pas registered
+     groupConcatStep/Final via MakeAgg with no `xInverse` and no
+     `xValue`, so OP_AggInverse was a silent no-op (each row leaving the
+     frame did nothing) while OP_AggStep kept appending; xValue defaulted
+     to xFinalize but the prior xFinalize relied on a TMem buffer overlay
+     that had no per-entry separator bookkeeping.  string_agg was missing
+     from aBuiltinAgg entirely.  Fix: ported func.c:2150..2324 1:1 — new
+     `TGroupConcatCtx` record (z/nChar/nAlloc/nAccum/nFirstSepLength/
+     pnSepLengths) replaces the TMem overlay; `groupConcatStep` /
+     `groupConcatInverse` / `groupConcatFinal` / `groupConcatValue` mirror
+     C; `pnSepLengths` per-entry sep array kicks in when separator length
+     varies.  Extended `MakeAgg` with an explicit xValue parameter so
+     finalize (which frees z) is distinct from the windowed value emit.
+     Wired three registrations: group_concat/1, group_concat/2, and
+     `string_agg/2` (alias used by upstream WAGGREGATE at func.c:3362).
+     Verified byte-identical to upstream across plain group_concat,
+     group_concat with custom / NULL separator, ROWS / RANGE windows,
+     string_agg() plain and windowed.  TestExplainParity 1026/1026;
+     DiagWindow / DiagFunctions / DiagOps / DiagDml / DiagFeatureProbe /
+     DiagAggWhere / DiagPragma / DiagMisc all 0 divergences.
+
+- [X] **10.1.bug.62** Fixed 2026-05-08.  `SELECT * FROM (VALUES(1),...) LIMIT n
+     OFFSET k` ignored both LIMIT and OFFSET, returning every row from the
+     coroutine.  Reproducer: `SELECT * FROM (VALUES(1),(2),(3),(4),(5))
+     LIMIT 2 OFFSET 2` returned 1..5 instead of 3,4.  Same shape with any
+     coroutine-materialised sub-FROM (UNION ALL no-FROM ladders, multi-row
+     VALUES, etc.).  Root cause: the viaCoroutine fast-path arm in
+     `sqlite3Select` (passqlite3codegen.pas:24929..) bypasses the regular
+     WhereBegin/selectInnerLoop path and emits its own
+     OP_Yield/Copy/ResultRow/Goto loop, but never called
+     `computeLimitRegisters` or wired in `codeOffset` / OP_DecrJumpZero.
+     C's select.c always invokes computeLimitRegisters before WhereBegin
+     (select.c:8245) and selectInnerLoop applies codeOffset + DecrJumpZero
+     uniformly across all FROM shapes.  Fix: in the viaCoroutine arm,
+     call `computeLimitRegisters(pParse, p, addrEnd)` after addrEnd is
+     allocated and before the OP_Yield top, emit `codeOffset(v, p^.iOffset,
+     addrTopOfLoop)` before pWhere/pEList code, and add `OP_DecrJumpZero
+     p^.iLimit, addrEnd` after the OP_ResultRow.  Verified byte-identical
+     to upstream across LIMIT-only, OFFSET-only, LIMIT+OFFSET, LIMIT 0,
+     and LIMIT -1 OFFSET k forms.  TestExplainParity 1026/1026; TestSmoke
+     / TestDMLBasic 54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52
+     / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 / TestPrepareBasic 20/20
+     / TestParser 45/45 / TestVdbeRecord 13/13 / TestWindowBasic 34/34 /
+     TestBytecodeParity 32/32 / TestWherePlanner 679/679 all clean;
+     DiagFunctions / DiagMoreFunc / DiagFeatureProbe / DiagOps / DiagDml /
+     DiagPragma / DiagWindow / DiagDate / DiagCast / DiagMisc /
+     DiagCovering / DiagAnalyze / DiagCreateIdx / DiagOrderLimitTopN /
+     DiagMultiValues / DiagPredicates / DiagIndexing all 0 divergences.
+
+- [X] **10.1.bug.61** Fixed 2026-05-08.  `DETACH <name>` always reported
+     `no such database: ` (empty name) and could leave the engine in a
+     state that crashed a subsequent statement with EAccessViolation.
+     Reproducer: `DETACH bogus;` returned `Runtime error: no such
+     database: ` instead of `... bogus`; `ATTACH ':memory:' AS aux;
+     ... DETACH aux;` followed by another statement could AV.
+     Root cause: `sqlite3Detach` (passqlite3codegen.pas:40643) called
+     `codeAttach(...,pAuthArg=pDbname, pFilename=nil, pDbname=pDbname,
+     pKey=nil)`.  C upstream (attach.c:445) passes `pKey=pDbname`, not
+     `pDbname=pDbname` — the dbname-expression slot is `pKey` because
+     codeAttach codes `pFilename`, `pDbname`, `pKey` into
+     `regArgs+0..2` and detachFunc has `nArg=1`, so the function call
+     reads `argv[0]` from `regArgs+3-1 = regArgs+2` (the pKey slot).
+     Pas was coding the dbname into the `pDbname` slot (regArgs+1) and
+     leaving regArgs+2 as a NULL Mem, so `detachFunc` saw an empty zName
+     and bailed via the `no such database: ` error path.  Fix: pass
+     `pKey=pDbname` and `pDbname=nil` to match attach.c:445.
+     Verified: `DETACH bogus;` now reports `no such database: bogus`;
+     `ATTACH ':memory:' AS aux; SELECT name FROM pragma_database_list;
+     DETACH aux; SELECT 'ok';` returns `main / aux / ok` byte-identical
+     to upstream.  TestExplainParity 1026/1026; TestSmoke PASS;
+     DiagFunctions / DiagFeatureProbe / DiagOps / DiagDml / DiagWindow
+     / DiagMoreFunc / DiagPragma all 0 divergences.
+
+- [X] **10.1.bug.60** Fixed 2026-05-08.  `log(100)` and `log10(100)`
+     returned `1.9999999999999998` instead of `2.0`; `log2` similarly
+     skewed.  Root cause: `logFunc` (passqlite3codegen.pas:43964)
+     approximated log10 via `Ln(x) * 0.4342944819032517867` and log2 via
+     `Ln(x) * 1.442695040888963456`.  C upstream (func.c:2536..2552)
+     calls libm's `log10()` / `log2()` directly, which give exact
+     results for power-of-base inputs.  Fix: route through FPC's
+     `Math.Log10` / `Math.Log2`, which delegate to libm.  Verified:
+     `SELECT log(100), log10(100), log2(8)` now returns `2.0|2.0|3.0`
+     byte-identical to upstream 3.53.0.  TestExplainParity 1026/1026;
+     DiagFunctions / DiagMoreFunc / DiagFeatureProbe all 0 divergences.
+
+- [X] **10.1.bug.58** Fixed 2026-05-08.  Row-value `IN ((v1,w1),(v2,w2))`
+     and `(a,b) IN (VALUES(...),...)` always returned zero rows; symmetric
+     `NOT IN` always returned all rows.  Reproducer:
+     `CREATE TABLE t(a,b); INSERT INTO t VALUES(1,2),(3,4),(5,6);
+     SELECT * FROM t WHERE (a,b) IN ((1,2),(5,6));` returned nothing instead
+     of `1|2; 5|6`.  Same shape for `(1,2) IN (SELECT 1,2 UNION ALL SELECT 3,4)`.
+     Root cause: two compounding gaps in passqlite3codegen.pas:
+     (1) **Compound-leaf SRT_Set materialisation missing.**  The literal
+         row-value list `((1,2),(3,4))` is rewritten by the parser
+         (sqlite3ExprListToValues, parser.pas:1958) into a UNION ALL of
+         no-FROM SELECTs.  `sqlite3CodeRhsOfIN` Case 1 then dispatches
+         `sqlite3Select(pParse, pCopy, &destSet)` with destSet.eDest=SRT_Set
+         to materialise into the eph table.  But the no-FROM fast path
+         (codegen.pas:23332..23341) gated on a destination set that
+         omitted SRT_Set, so each compound leaf bailed silently — the
+         eph table was opened (line 7 of EXPLAIN) but never populated
+         (no MakeRecord / IdxInsert).  Fix: add SRT_Set to the gate
+         and emit the canonical SRT_Set disposal arm (mirrors
+         selectInnerLoop select.c:1384..1407 — `MakeRecord regResult,
+         nResultCol, r1, zAffSdst` then `IdxInsert iParm, r1, regResult,
+         nResultCol`; Bloom-filter side-write skipped because no-FROM
+         path doesn't allocate iSDParm2).
+     (2) **LHS vector not coded into contiguous registers.**
+         `sqlite3ExprCodeIN` (codegen.pas:52158..) used
+         `sqlite3ExprCodeTemp(pParse, pLeft, @iDummy)` for the LHS,
+         which for a TK_VECTOR returns one Null-initialised register.
+         The downstream `OP_NotFound iTab, ?, rLhs, nVector` then
+         compared garbage and either always-jumped (NULL key) or
+         never-found (binary search of nothing).  Fix: mirror C's
+         exprCodeVector (expr.c:4530..4554) inline — for nVector=1
+         keep ExprCodeTemp; for nVector>1 with TK_SELECT dispatch
+         through sqlite3CodeSubselect; otherwise allocate `nVector`
+         contiguous regs by bumping pParse^.nMem and code each
+         x.pList element via sqlite3ExprCodeFactorable.
+     With both fixes, the bytecode now matches C: every literal RHS row
+     emits its own MakeRecord+IdxInsert into the eph table, and the LHS
+     columns are loaded into the same contiguous register block the
+     NotFound binary search expects.  Verified byte-identical to upstream
+     across `(a,b) IN ((1,2),(5,6))`, `(a,b) NOT IN ((1,2))`,
+     `(a,b) IN (VALUES(3,4),(5,6))`, `(1,2) IN (SELECT 1,2 UNION ALL
+     SELECT 3,4)`, and the `(9,9)` non-match form; scalar `a IN (1,5)`
+     unchanged.  TestExplainParity 1026/1026; TestSmoke / TestDMLBasic
+     54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg
+     11/11 / TestSchemaBasic 44/44 / TestPrepareBasic 20/20 / TestParser
+     45/45 / TestVdbeRecord 13/13 / TestWindowBasic 34/34 /
+     TestBytecodeParity 32/32 / TestWherePlanner 679/679 all clean;
+     DiagOps / DiagDml / DiagFunctions / DiagPragma / DiagFeatureProbe /
+     DiagWindow / DiagMisc / DiagCast / DiagDate / DiagSubsel /
+     DiagIndexing / DiagCovering / DiagPredicates / DiagMoreFunc /
+     DiagAggWhere / DiagInnerJoin / DiagMultiValues / DiagAnalyze
+     all 0 divergences.
+
+- [X] **10.1.bug.59** Fixed 2026-05-08.  `SELECT t.*, x.p FROM t, (SELECT
+     'X' p) x` returned NULL for every `t` column (Pas emitted `|X`
+     twice instead of `1|2|3|X / 4|5|6|X`).  Same shape with CTEs:
+     `WITH c(p) AS (SELECT 'X') SELECT t.*, p FROM t, c;`.  Root cause:
+     Pas `expandStar` (passqlite3codegen.pas:20967) only handled bare
+     `TK_ASTERISK`, not `TK_DOT(zTName, TK_ASTERISK)` (the parser shape
+     for `T.*`).  Unrecognised TK_DOT-star entries were carried into
+     pNew untouched; the resolver later treated them as TK_NULL.  Fix:
+     port the C select.c:6090..6326 detection (TK_DOT with right=TK_
+     ASTERISK) and the qualified-name match arm — only items whose
+     `zAlias` (or `pSTab^.zName` when alias is nil) ICmp-matches zTName
+     contribute columns.  Hidden cols still skipped; NOEXPAND still
+     skipped only when zTName is nil (matches select.c:6241..6246).
+     Also raises `no such table: T` when zTName matches no source.
+     Verified: TestExplainParity 1026/1026; TestSmoke / TestSelectBasic
+     60 / TestDMLBasic 54 / TestWhereBasic 52 / TestVdbeAgg 11 /
+     TestSchemaBasic 44 / TestPrepareBasic 20 / TestParser 45 all
+     clean; DiagOps / DiagDml / DiagFunctions / DiagSubsel /
+     DiagInnerJoin / DiagPredicates 0 divergences.
+
+- [X] **10.1.bug.57** Fixed 2026-05-08.  SQL `printf()` / `format()` diverged
+     from upstream on three rare format-spec arms.  (a) Unknown specifier
+     (`%b`, `%a`, `%n`, …) — Pas emitted the literal `%c` verbatim, while
+     printf.c:1009..1012 hits the `etINVALID` default which `return`s out
+     of the format engine, so the result is whatever was accumulated up
+     to (but not including) the offending `%`.  Reproducer: `printf('%b',5)`
+     now returns `''` (was `'%b'`); `printf('xx%byy',5)` returns `'xx'`.
+     (b) Trailing `%` at end of format — Pas dropped it; printf.c:255..258
+     emits a literal `%`.  Reproducer: `printf('%')` now returns `'%'`.
+     (c) `,` thousand-separator flag (printf.c:476..492) — captured in
+     metaFlags but never applied; now `%,d` / `%,u` insert ',' every 3
+     trailing digits.  Reproducer: `printf('%,d',1234567)` returns
+     `'1,234,567'`.  (d) `!` alt-form-2 flag on `%s` (printf.c:769..776,
+     838..844) — width / precision counted bytes; now they count UTF-8
+     glyphs.  Reproducer: `printf('%!5s','é')` pads to 4 spaces+'é' (was
+     3 spaces).  Fix in `printfFunc` (passqlite3codegen.pas:45147..) —
+     end-of-string `%` arm emits literal, default branch in case statement
+     `Break`s, `InsertThousandSep` helper added and called from `'d'`/`'i'`
+     /`'u'` branches, `'s'` branch grows a `'!'` arm that walks UTF-8 to
+     count glyphs for both truncation and pad.  Verified: 12-case probe
+     sweep against the C library byte-identical; TestExplainParity
+     1026/1026; DiagPrintfFmt / DiagFunctions / DiagMoreFunc / DiagFeatureProbe
+     / DiagOps / DiagDml / DiagPragma / DiagWindow / DiagDate / DiagCast
+     / DiagPredicates / DiagLikeGlob / DiagOrderLimitTopN / DiagIndexing
+     / DiagCovering / DiagAnalyze / DiagDropTable / DiagMisc all 0 divergences.
+
+- [X] **10.1.bug.55** Fixed 2026-05-08.  `DELETE FROM <parent>` on a table
+     referenced by a foreign key crashed the shell with
+     `EAccessViolation: Access violation` whenever `PRAGMA foreign_keys=ON`
+     was active, regardless of action (CASCADE / SET NULL / NO ACTION).
+     Reproducer: `PRAGMA foreign_keys=ON; CREATE TABLE p(id INTEGER PRIMARY
+     KEY); CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES
+     p(id) ON DELETE CASCADE); INSERT INTO p VALUES(1); INSERT INTO c
+     VALUES(10,1); DELETE FROM p WHERE id=1;` — Pas crashed during codegen;
+     C deletes both rows cleanly.  Root cause: `sqlite3DeleteTable`
+     (passqlite3codegen.pas:25862) was a 4-line stub freeing only the
+     Table struct, column names, zName, and zColAff — missing the index
+     list walk + idxHash unlink, the sqlite3FkDelete call, and the pCheck
+     ExprList free that build.c:799..854's `deleteTable` performs.  When
+     CREATE TABLE c was first parsed (init.busy=0), `sqlite3CreateForeignKey`
+     allocated an FKey and inserted it into pSchema^.fkeyHash.  The
+     subsequent OP_ParseSchema reload runs init.busy=1 and re-parses
+     CREATE TABLE c (because tblHash hadn't seen "c" yet — the
+     init.busy=0 path doesn't add to tblHash), creating a SECOND FKey
+     and chaining it onto the same hash bucket via pNextTo.  When the
+     init.busy=0 Parse object's pNewTable was eventually freed, the
+     stub `sqlite3DeleteTable` did NOT call sqlite3FkDelete, so the
+     orphan first FKey stayed live in fkeyHash with a dangling pNextTo
+     pointer to the second FKey.  Later, `sqlite3FkActions`/`sqlite3FkCheck`
+     iterating sqlite3FkReferences(p) walked the orphan chain and
+     dereferenced freed memory inside fkScanChildren on the second
+     iteration.  Fix: ported build.c:799..854 deleteTable verbatim into
+     sqlite3DeleteTable — walks pTab^.pIndex calling
+     sqlite3HashInsert(idxHash, name, nil) + sqlite3FreeIndex per
+     index (skipping the hash unlink for virtual tables); dispatches
+     by eTabType to sqlite3FkDelete (TABTYP_NORM) /
+     passqlite3vtab.sqlite3VtabClear (TABTYP_VTAB) /
+     sqlite3SelectDelete on u.view_pSelect (TABTYP_VIEW); then
+     sqlite3DeleteColumnNames + sqlite3DbFree(zName, zColAff) +
+     sqlite3ExprListDelete(pCheck) + sqlite3DbFree(pTab).  Verified
+     byte-identical to upstream across DELETE CASCADE / SET NULL /
+     NO ACTION; FK-violating INSERT still raises constraint failed.
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11 /
+     TestSchemaBasic 44/44 / TestPrepareBasic 20/20 / TestParser 45/45 /
+     TestVdbeRecord 13/13 / TestWindowBasic 34/34 / TestBytecodeParity
+     32/32 / TestWherePlanner 679/679 / TestUtil all clean;
+     DiagDml / DiagPragma / DiagFeatureProbe / DiagOps / DiagFunctions /
+     DiagWindow / DiagDate / DiagCast / DiagMisc / DiagDropTable /
+     DiagAnalyze / DiagIndexing / DiagCovering / DiagPredicates /
+     DiagCreateIdx / DiagMoreFunc / DiagSampleProg / DiagTxn 0
+     divergences.
+
+- [X] **10.1.bug.56** Fixed 2026-05-08.  `UPDATE <parent> SET <pk-col>=<value>`
+     on a table referenced by an `ON UPDATE CASCADE` (or SET NULL)
+     foreign key crashed the shell with `EAccessViolation` inside
+     `dupedExprStructSize_` (codegen.pas:4133), reached via fkActionTrigger
+     → sqlite3ExprDup(EXPRDUP_REDUCE) on the synthesised trigger AST.
+     Root cause: `exprDup_` recursive children dup at codegen.pas:4274..4275
+     was missing the nil-guards that expr.c:1726..1730 has — when a leaf
+     TK_ID expression (no pLeft / no pRight) was duped under EXPRDUP_REDUCE,
+     `exprDup_(db, p^.pLeft=nil, …)` was invoked and crashed on
+     `dupedExprStructSize_(nil, …)` immediately on `ExprHasProperty(nil, …)`.
+     The TK_DOT(NEW, col)/TK_DOT(OLD, col) tree built inside fkActionTrigger
+     hits this path under any UPDATE-side FK action whose synth trigger
+     duplicates leaf TK_ID nodes; ON DELETE CASCADE didn't fire it because
+     its trigger synth follows a different shape.  Fix: ported the C
+     ternary `p->pLeft ? exprDup(...) : 0` (and the symmetric pRight)
+     into the dupFlags<>0 arm.  Verified byte-identical to upstream:
+     CASCADE updates 10's `pid` to 99; SET NULL nulls it; non-PK column
+     UPDATE still untouched.  TestExplainParity 1026/1026; TestSmoke /
+     TestDMLBasic 54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52 /
+     TestVdbeAgg 11/11 / TestSchemaBasic 44/44 / TestPrepareBasic 20/20 /
+     TestParser 45/45 / TestVdbeRecord 13/13 / TestWindowBasic 34/34 /
+     TestBytecodeParity 32/32 / TestWherePlanner 679/679 all clean;
+     DiagDml / DiagPragma / DiagFeatureProbe / DiagOps / DiagFunctions /
+     DiagWindow / DiagDate / DiagCast / DiagMisc / DiagDropTable /
+     DiagAnalyze / DiagIndexing / DiagCovering / DiagPredicates /
+     DiagCreateIdx / DiagMoreFunc / DiagSampleProg 0 divergences.
+
+- [X] **10.1.bug.54** Fixed 2026-05-08.  Casting / parsing a float literal
+     whose magnitude exceeds the IEEE-754 double range crashed the shell
+     with `EOverflow: Floating point overflow` instead of returning Inf /
+     -Inf as upstream does.  Reproducers: `SELECT cast('1e1000' AS REAL);`,
+     `SELECT cast('1e309' AS REAL);`, `SELECT 1e1000;` all aborted with
+     a libc-level EOverflow trap — system sqlite3 returns `Inf`.  Root
+     cause: `atofViaStrtod` (passqlite3util.pas:1153) calls libc strtod,
+     which on overflow returns HUGE_VAL and sets errno=ERANGE per C99 —
+     a valid IEEE-754 value, not an exception.  FPC compiles with the
+     x87 control word leaving FE_OVERFLOW unmasked by default, so the
+     overflow flag set inside strtod (or on the next FP op that touches
+     the Inf result) is converted into a SIGFPE → Pascal EOverflow
+     exception that the shell does not catch.  The C reference relies
+     on strtod's "set errno, return HUGE_VAL" contract and never sees a
+     trap.  Fix: install `SetExceptionMask([exInvalidOp, exDenormalized,
+     exZeroDivide, exOverflow, exUnderflow, exPrecision])` in
+     passqlite3util's initialization section so FPC's runtime treats FP
+     overflow / NaN / div-by-zero as silent (matching C semantics that
+     the rest of the engine assumes).  Verified byte-identical to
+     upstream: `cast('1e1000' AS REAL)` → `Inf`, `cast('-1e1000' AS
+     REAL)` → `-Inf`, `cast('1e308' AS REAL)` → `1.0e+308`,
+     `cast('1e309' AS REAL)` → `Inf`, `1e1000` literal → `Inf`,
+     `cast('1e1000' AS REAL) * 0` → NaN.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13 /
+     TestWindowBasic 34/34 / TestBytecodeParity 32/32 / TestUtil all
+     clean; DiagDate / DiagFunctions / DiagOps / DiagFeatureProbe /
+     DiagCast / DiagFloatRender all 0 divergences.
+
+- [X] **10.1.bug.53** Fixed 2026-05-08.  Date modifiers `weekday N`,
+     `ceiling`, `floor`, `subsec`/`subsecond` were unrecognised and
+     forced the surrounding date function to return NULL.
+     Reproducers: `SELECT date('2024-06-15','weekday 0');` returned
+     NULL instead of `2024-06-16`; `SELECT date('2024-01-31','+1 month',
+     'floor');` returned NULL instead of `2024-02-29`;
+     `SELECT datetime('2024-01-01 00:00:00.500','subsec');` returned
+     NULL instead of `2024-01-01 00:00:00.500`.  Root cause: the Pascal
+     port's `applyModifier` (passqlite3codegen.pas:47553) only handled
+     `start of {day,month,year}` and `+/-N <unit>`; the four arms above
+     were missing.  Fix: ported the C arms verbatim — `weekday N`
+     mirrors date.c:877..890 (Z = (Trunc(jd+1.5) mod 7); shift forward
+     by `(n-Z)` days, with Z-=7 when Z>n); `ceiling` / `floor` track
+     a new `nFloor` field on TDateTime2 captured in the +month/+year
+     rollover (date.c:computeFloor + 777..782); `subsec`/`subsecond`
+     sets a useSubsec flag consumed by datetime/time renderers to
+     emit `%06.3f` for the seconds field.  Verified byte-identical to
+     the linked libsqlite3 across all four arms plus error cases
+     (`weekday 7`, `weekday 1.5`, `weekday -1` all → NULL).
+     TestExplainParity 1026/1026; DiagDate / DiagFunctions / DiagOps /
+     DiagDml / DiagPragma / DiagMisc / DiagFeatureProbe all 0 divergences.
+
+- [X] **10.1.bug.49** Fixed 2026-05-08.  `strftime()` silently echoed
+     unsupported format tokens for the ISO-week family.  Reproducer:
+     `SELECT strftime('%V','2024-01-15');` returned `%V` (the literal)
+     instead of `03`; same shape for `%U`, `%W`, `%G`, `%g`.  Root
+     cause: the Pascal port's `strftimeFunc`
+     (passqlite3codegen.pas:47687) only had arms for Y/m/d/H/M/S/f/j/J/
+     w/u/s/e/F/k/I/l/p/P/R/T/% — the ISO-week-number /
+     Sunday/Monday-week-number / week-based-year arms documented at
+     date.c:1535..1554 were missing, so the default fall-through
+     (`op^ := '%'; op^ := c;`) emitted the literal token.  Fix: ported
+     all five arms 1:1, reusing the existing toJulianDay / fromJulianDay
+     helpers and the `Trunc(jd+1.5) mod 7` weekday encoder already used
+     by the `%w` arm.  `%U` = `(daysAfterJan01 - daysAfterSunday + 7)/7`;
+     `%W` = same with daysAfterMonday; `%V` / `%G` / `%g` shift to the
+     Thursday in the same week (`thursJD := jd + (3 - daysAfterMonday)`),
+     decompose, then format `daysAfterJan01(thurs)/7 + 1` for `%V` and
+     the Thursday's year for `%G` / `%g`.  Verified byte-identical to
+     the 3.53.0 oracle across 16 cases including the ISO edge years
+     (2021-01-01 → V=53/G=2020, 2023-01-01 → V=52/G=2022, 2024-01-01 →
+     V=01/G=2024, 2024-12-31 → V=01/G=2025).  TestExplainParity
+     1026/1026; DiagDate / DiagOps / DiagDml / DiagFunctions /
+     DiagPragma / DiagWindow / DiagMisc / DiagCast / DiagFeatureProbe /
+     DiagMoreFunc / DiagSampleProg all 0 divergences.
+
+- [X] **10.1.bug.50** Fixed 2026-05-08.  GROUP BY by SELECT-list column
+     alias raised `Parse error: no such column: <alias>`.  Reproducer:
+     `SELECT b%2 g, count(*) FROM t GROUP BY g;` errored.  Root cause:
+     C resolves GROUP BY aliases via lookupName's NC_UEList fallback
+     (resolve.c:658..698), but the Pas port's simplified ResolveExpr
+     does not implement NC_UEList.  ORDER BY aliases were already
+     handled by pre-tagging `iOrderByCol` via `ResolveAliasOrderByCol`
+     before `ResolveExprList`; GROUP BY pre-tagging was missing.
+     Fix: invoke `ResolveAliasOrderByCol(p^.pGroupBy)` before
+     `ResolveExprList(p^.pGroupBy)` in resolveSelectStep
+     (passqlite3codegen.pas:8606..).  `sqlite3ResolveOrderGroupBy`
+     downstream rewrites the tagged term into a copy of the matching
+     result-set expression.  Verified byte-identical to C oracle.
+     TestExplainParity 1026/1026; DiagFeatureProbe / DiagWindow /
+     DiagDml / DiagFunctions / DiagPragma / DiagOps / DiagMisc /
+     DiagCast / DiagAnalyze all 0 divergences;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13 /
+     TestWindowBasic 34/34 all clean.
+
+- [X] **10.1.bug.51** Fixed 2026-05-08.  HAVING by SELECT-list column
+     alias raised `Parse error: no such column: <alias>`.  Reproducer:
+     `SELECT b%2 g, count(*) c FROM t GROUP BY g HAVING c>0;`.  The
+     iOrderByCol pre-tag trick used for ORDER/GROUP BY does not apply
+     to HAVING (a single boolean expression, not a list of terms).
+     Fix: a dedicated pre-walk (`ResolveAliasInHaving`) traverses
+     pHaving's tree before name resolution and, for each bare TK_ID
+     that does not match any FROM column and does match an ENAME_NAME
+     alias in p^.pEList, calls the existing `resolveAlias` swap
+     (resolve.c:68) to replace the node with a copy of the matching
+     result-set expression.  TestExplainParity 1026/1026; main test
+     suite + diag probes all clean.
+
+- [X] **10.1.bug.52** Fixed 2026-05-08.  HAVING in a non-GROUP-BY
+     aggregate query returned no rows even when the predicate was true.
+     Root cause: a top-level early-exit in `sqlite3Select`
+     (codegen.pas:23875) bailed unconditionally to the 3-op stub
+     whenever `p^.pHaving <> nil`, so the aggregate-no-GROUP-BY arm
+     downstream (codegen.pas:24297) never had a chance to run.  Fix
+     across three sites in passqlite3codegen.pas:
+       (1) Top-level pHaving gate restricted to non-aggregate queries
+           (HAVING without an aggregate is meaningless and stays
+           stub-only): `(p^.pHaving<>nil) and ((selFlags and SF_Aggregate)=0)`.
+       (2) Simple-count fast path (codegen.pas:24161) gained an
+           `and (p^.pHaving = nil)` gate so it falls through to the
+           general aggregate arm when HAVING is present (otherwise it
+           would emit OP_Count + OP_ResultRow without testing HAVING).
+       (3) General aggregate-no-GROUP-BY arm (codegen.pas:24297)
+           lifted its `(p^.pHaving = nil)` gate, captures `pHavingLoc`,
+           calls `markAggregateInExpr(pHavingLoc)` after pEList marking
+           and `sqlite3ExprAnalyzeAggregates(@sNCAgg, pHavingLoc)` after
+           pEList analysis (mirrors select.c:8422..8430), then gates
+           the result-row emission with
+           `sqlite3ExprIfFalse(pParse, pHavingLoc, addrSkip, JUMPIFNULL)`
+           after `finalizeAggFunctionsSimple` and resolves `addrSkip`
+           after the OP_ResultRow (mirrors select.c:8897).
+     Verified byte-identical against the upstream `../sqlite3/sqlite3`
+     oracle on the two repros plus six edge cases:
+       SELECT count(*) c FROM t HAVING count(*) > 0       -> 3
+       SELECT count(*) FROM t HAVING 1                    -> 3
+       SELECT count(*) FROM t HAVING 0                    -> ()
+       SELECT count(*) FROM t HAVING count(*) > 100       -> ()
+       SELECT sum(a) FROM t HAVING sum(a) > 5             -> 6
+       SELECT count(*) FROM t WHERE a>1 HAVING count(*)>0 -> 2
+       SELECT count(*) FROM t HAVING NULL                 -> ()
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11 /
+     TestSchemaBasic 44/44 / TestPrepareBasic 20/20 / TestParser 45/45 /
+     TestVdbeRecord 13/13 / TestBytecodeParity 32/32 / TestWindowBasic
+     34/34 all clean; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma /
+     DiagFunctions / DiagWindow / DiagMisc / DiagCovering / DiagIndexing /
+     DiagPredicates all 0 divergences.
+
+- [X] **10.1.bug.48** Fixed 2026-05-08.  Planner missed the IPK fast
+     path when an INTEGER PRIMARY KEY column was referenced by its
+     declared name (rather than by `rowid`).  Reproducer:
+     `CREATE TABLE x(a INTEGER PRIMARY KEY); EXPLAIN SELECT * FROM x
+     WHERE a=2;` emitted a full `Rewind/Rowid/Ne/Next` SCAN of the
+     table; `WHERE rowid=2` (same column, different spelling) emitted
+     the expected `SeekRowid` SEARCH.  Result rows still matched —
+     only the strategy diverged — but every IPK lookup paid O(n)
+     instead of O(log n).  Root cause: the Pas resolver (unlike C
+     resolve.c:466 / :562 lookupName) does not rewrite an IPK alias
+     reference's `iColumn` to `XN_ROWID` (-1).  Downstream callers
+     (sqlite3WhereCodeOneLoopStart, generateUpdateSubroutine, etc.)
+     were carrying ad-hoc `(iCol = pTab^.iPKey)` workarounds, but
+     `whereShortCut`'s rowid-EQ probe at codegen.pas:15913 calls
+     `whereScanInit(scan, pWC, iCur, -1, WO_EQ or WO_IS, nil)` which
+     matches against `pTerm^.u.leftColumn = iColumn` directly — and
+     the term carried `leftColumn=iPKey` (e.g. 0), so the probe
+     missed and the planner fell through to the full-scan fallback.
+     Fix: in `exprMightBeIndexed` (codegen.pas:11103), normalise
+     `aiCurCol[1]` from `iPKey` to `-1` when the cursor's source
+     table has the matching IPK.  This is the same rewrite the C
+     resolver does at name-resolution time, just performed at
+     analysis time so every WhereTerm spawned through exprAnalyze
+     gets a rowid-shaped `leftColumn`.  Verified byte-identical to
+     upstream: `WHERE a=2`, `WHERE a IN (1,3)`, `UPDATE … WHERE a=1`,
+     `DELETE … WHERE a=1`, two-table joins on IPK aliases all use
+     SeekRowid now.  TestExplainParity 1026/1026; TestSmoke /
+     TestDMLBasic 54/54 / TestSelectBasic 60/60 / TestWhereBasic
+     52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord
+     13/13 / TestWindowBasic 34/34 / TestWherePlanner 679/679 /
+     TestBytecodeParity 32/32 all clean; DiagFeatureProbe /
+     DiagWindow / DiagDml / DiagFunctions / DiagPragma / DiagOps /
+     DiagMisc / DiagCast / DiagDate / DiagDropTable /
+     DiagOrderLimitTopN / DiagAnalyze / DiagCovering / DiagIndexing /
+     DiagPredicates / DiagLikeGlob / DiagAggWhere / DiagMultiValues /
+     DiagTxn / DiagAutoIdx / DiagBloom / DiagMoreFunc / DiagSubsel /
+     DiagInnerJoin / DiagSumOverflow / DiagCreateIdx /
+     DiagScalarFunc / DiagArith / DiagFloatRender all 0 divergences.
+
+- [X] **10.1.bug.47** Fixed 2026-05-08.  Multi-source FROM containing
+     sub-SELECT items returned no rows.  Reproducer:
+     `SELECT x.a, y.b FROM (SELECT 1 a) x, (SELECT 2 b) y;` emitted only
+     the 3-op stub (Init/Halt/Goto); same shape for any cross-join /
+     comma-join / explicit JOIN where one or more FROM items is a
+     sub-SELECT (compound or non-compound).  Root cause: the multi-source
+     bail loop in `sqlite3Select` (passqlite3codegen.pas:24988) early-
+     returned SQLITE_OK when ANY source had `SRCITEM_FG_IS_SUBQUERY` set,
+     and again when `TF_Ephemeral` was set on the synthetic pTab built
+     by selectExpander.  The single-source materialise / co-routine arms
+     (codegen.pas:24661/24878) cover the nSrc=1 case but bailed for
+     nSrc>1.  Fix: add a pre-materialisation pass before the multi-source
+     loop that walks every SrcItem with `SRCITEM_FG_IS_SUBQUERY` (and not
+     already viaCoroutine), allocates an iCursor when needed, emits
+     `OP_OpenEphemeral iCsr, pTab^.nCol`, and recursively codes the inner
+     SELECT into it via SRT_EphemTab.  WhereBegin's open prologue
+     (codegen.pas:17077) already skips re-opening cursors with
+     TF_Ephemeral, so no double-open occurs and the standard multi-table
+     scan path then drives Rewind/Next over the populated eph table.
+     The bail check is also relaxed to admit subquery sources (which now
+     have valid iCursor + populated eph backing).  Verified byte-
+     identical to upstream for `(SELECT N) x, (SELECT M) y`,
+     `(SELECT … UNION SELECT …) x, (SELECT … UNION ALL SELECT …) y`,
+     mixed `subq, real-table` cross-join, and 3-way mixes.
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic / TestSelectBasic
+     / TestWhereBasic / TestVdbeAgg / TestSchemaBasic / TestPrepareBasic /
+     TestParser / TestVdbeRecord / TestBytecodeParity / TestWindowBasic
+     all clean; DiagOps / DiagDml / DiagFunctions / DiagFeatureProbe /
+     DiagWindow / DiagPragma / DiagMisc / DiagTxn / DiagCast / DiagDate /
+     DiagAnalyze / DiagDropTable / DiagCovering / DiagIndexing /
+     DiagPredicates / DiagSubsel / DiagAggWhere / DiagInnerJoin /
+     DiagMultiValues / DiagMoreFunc / DiagLikeGlob / DiagOrderLimitTopN /
+     DiagPrintfFmt / DiagSumOverflow / DiagBloom / DiagAutoIdx /
+     DiagJoinTrace / DiagCreateIdx / DiagSampleProg all 0 divergences.
+
+- [X] **10.1.bug.46** Fixed 2026-05-08.  3+ way INNER/LEFT JOINs (and any
+     aggregate over them) silently emitted only the 3-op stub
+     (Init/Halt/Goto), returning no rows.  Reproducer:
+     `SELECT a.y FROM a JOIN b ON a.x=b.x JOIN c ON c.x=b.x` returned
+     no rows; `SELECT count(*) FROM a,b,c WHERE a.x=b.x AND b.x=c.x`
+     same.  Root cause: two `nSrc <= 2` gates in `sqlite3Select`
+     (passqlite3codegen.pas):
+     (1) Plain-SELECT path at codegen.pas:23759 had
+         `if p^.pSrc^.nSrc > 2 then begin Result := SQLITE_OK; Exit; end;`
+         — a leftover from earlier porting that bailed for any 3+ table FROM.
+     (2) Aggregate-no-GROUP-BY path at codegen.pas:24191 had
+         `and (p^.pSrc^.nSrc <= 2)` with the same effect for aggregates.
+     The downstream `sqlite3WhereBegin` already supports arbitrary nLevel
+     (mirrors where.c:6700+ multi-loop driver), and `analyzeAggregate`
+     handles the multi-source AggInfo population, so both gates were just
+     conservative caps.  Fix: lift both gates.  Verified byte-identical
+     to upstream sqlite3 across 3-way / 4-way INNER/LEFT JOINs (IPK +
+     non-IPK), comma-syntax `FROM a,b,c WHERE …`, aggregate-over-3-way
+     (count/sum/avg), and the WHERE-filtered variants.  TestExplainParity
+     1026/1026; TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13 /
+     TestBytecodeParity 32/32 / TestWindowBasic 34/34 all clean;
+     DiagBloom now reports `three-way: OP_Blob=1 OP_FilterAdd=1
+     OP_Filter=1` (the Bloom-filter optimisation actually fires now);
+     all Diag* probes (Aggwhere / Analyze / Arith / AutoIdx / Bloom /
+     Cast / Covering / CreateIdx / Date / Dml / DropTable / FeatureProbe
+     / Functions / GroupOrder / InnerJoin / JoinTrace / LikeGlob / Misc
+     / MoreFunc / MultiValues / Ops / OrderLimitTopN / Pragma /
+     Predicates / PrintfFmt / PubApi / Subsel / SumOverflow / Trig / Txn
+     / Window / SampleProg / Dbdump / Intck / Scrub / Appendvfs / Vfslog
+     / Vfstrace / Tmstmpvfs / DbFileObject / ExplainList) all 0
+     divergences.
+
+- [X] **10.1.bug.43** Fixed 2026-05-08.  Constraint-violation error
+     messages dropped the "<TYPE> constraint failed: " prefix.
+     Reproducer: `CREATE TABLE t(a INT NOT NULL); INSERT INTO t
+     VALUES(NULL);` reported `Runtime error: t.a` (Pas) vs
+     `NOT NULL constraint failed: t.a` (C); same shape for CHECK and
+     UNIQUE.  Two missing pieces in passqlite3vdbe.pas:
+     (1) OP_Halt arm at vdbe.pas:7574..7580 emitted only the prefix
+         when `pOp^.p5<>0` and ignored the `pOp^.p4.z` suffix — vdbe.c:
+         1345..1349 calls `sqlite3MPrintf(db, "%z: %s", p->zErrMsg,
+         pOp->p4.z)` to stitch the column/check tail onto the prefix.
+     (2) OP_HaltIfNull (vdbe.pas:9099..) had a private simplified halt
+         body that emitted only `pOp^.p4.z` (no p5 prefix lookup), so
+         NOT NULL violations — which use OP_HaltIfNull — surfaced just
+         "t.a".  vdbe.c:1257 falls through to OP_Halt, so the Pas arm
+         is rewritten to mirror the same prefix+suffix logic plus
+         sqlite3VdbeLogAbort + sqlite3VdbeHalt sequencing.
+     Fix verified end-to-end: `NOT NULL constraint failed: t.a`,
+     `CHECK constraint failed: a>0`, and `UNIQUE constraint failed: t.a`
+     now match upstream byte-for-byte.  TestExplainParity 1026/1026;
+     TestDMLBasic 54/54; TestSchemaBasic 44/44; DiagFunctions / DiagOps /
+     DiagDml / DiagPragma / DiagFeatureProbe / DiagMisc / DiagCast /
+     DiagWindow / DiagDropTable / DiagTxn / DiagCovering / DiagIndexing /
+     DiagPredicates all 0 divergences.
+
+- [X] **10.1.bug.42** Fixed 2026-05-08.  `1 IN ()` returned the literal
+     text `'false'` (with type text) instead of integer `0`; symmetrically
+     `1 NOT IN ()` returned `'true'` instead of integer `1`.  Root cause:
+     `sqlite3ExprIdToTrueFalse` (passqlite3codegen.pas:6085) gated on
+     `pExpr^.op = TK_ID` only, but the parser's empty-IN reduction
+     (parse.y:1502) constructs the bool literal as a `TK_STRING` node
+     and then asks `sqlite3ExprIdToTrueFalse` to convert it.  In C the
+     function asserts `op==TK_ID || op==TK_STRING`; the Pascal port
+     dropped the TK_STRING arm so the conversion failed and the parser
+     returned a TK_STRING literal verbatim.  Fix: accept both TK_ID and
+     TK_STRING (matching expr.c:2334..2345) and gate on
+     `EP_Quoted | EP_IntValue` to skip already-quoted bareword cases.
+     EXPLAIN now emits `Integer 0 1 0` for `SELECT 1 IN ()` instead of
+     `String8 0 1 0 false`.  TestExplainParity 1026/1026; all Diag*
+     probes 0 divergences; TestDMLBasic / TestSchemaBasic / TestSelectBasic
+     all green.
+
+- [X] **10.1.bug.45** Resolved 2026-05-08 by the cumulative effect of
+     bug.41 (sqlite3GenerateIndexKey uniqNotNull gating) and bug.42
+     (TK_STRING in sqlite3ExprIdToTrueFalse).  Original reproducer
+     `CREATE TABLE t(a INT, b INT, UNIQUE(a,b) ON CONFLICT REPLACE);
+     INSERT INTO t VALUES(1,1); INSERT INTO t VALUES(1,1),(1,2);
+     SELECT * FROM t;` now returns `1|1; 1|2` byte-identical to the C
+     oracle.  Verified across multi-row variations
+     (3-row insert with REPLACE, mixed-types UNIQUE(a,b)).
+
+- [X] **10.1.bug.44** Fixed 2026-05-08.  Registered the SQL functions
+     `sqlite_compileoption_used(X)` / `sqlite_compileoption_get(N)` in
+     `aBuiltinFuncs` (passqlite3codegen.pas), mirroring func.c:3281..3282
+     (DFUNCTION).  Trampolines `compileoptionusedFunc` /
+     `compileoptiongetFunc` reproduce func.c:1042/1066 logic against a
+     local copy of `sqlite3azCompileOpt` (codegen cannot use
+     passqlite3main due to circular dep).  Verified: SELECT
+     sqlite_compileoption_used('THREADSAFE') / 'SQLITE_THREADSAFE' = 1,
+     unknown option = 0; sqlite_compileoption_get(N) returns the Nth
+     option string and NULL past the end.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestSchemaBasic 44/44 / TestVdbeAgg 11/11 clean; DiagFunctions /
+     DiagOps / DiagFeatureProbe / DiagPragma all 0 divergences.
+
+- [X] **10.1.bug.38** Fixed 2026-05-08.  STORED generated columns
+     silently held NULL after INSERT.  Reproducer:
+     `CREATE TABLE q(v INTEGER, c INTEGER GENERATED ALWAYS AS (v*2)
+     VIRTUAL, d INTEGER GENERATED ALWAYS AS (v+1) STORED);
+     INSERT INTO q(v) VALUES(5); SELECT v,c,d FROM q;` returned `5|10|`
+     instead of `5|10|6`.  Root cause: `sqlite3Insert`
+     (passqlite3codegen.pas around 31110) was missing the
+     insert.c:1544..1552 unconditional `sqlite3ComputeGeneratedColumns
+     (pParse, regRowid+1, pTab)` call between autoIncStep and
+     `sqlite3GenerateConstraintChecks`.  The expression was therefore
+     never coded into the row image — only the post-REPLACE-conflict
+     follow-up path inside GenerateConstraintChecks (gated on
+     `nSeenReplace>0`) ever computed it, so VIRTUAL columns worked
+     (they're computed at read time) but STORED ones landed as NULL on
+     the freshly-inserted row.  Fix: add the unconditional call mirroring
+     the C source.  TestExplainParity 1026/1026; DiagFeatureProbe /
+     DiagOps / DiagDml / DiagFunctions / DiagDate / DiagCast / DiagPragma
+     / DiagTxn / DiagMisc / DiagWindow / DiagAnalyze / DiagCovering /
+     DiagIndexing / DiagDropTable all clean; TestSmoke / TestDMLBasic /
+     TestSelectBasic / TestWhereBasic / TestVdbeAgg / TestSchemaBasic /
+     TestPrepareBasic / TestParser all green.
+
+- [X] **10.1.bug.36** Fixed 2026-05-08.  Aggregate `FILTER (WHERE …)`
+     clause silently inherited a sibling unfiltered aggregate's value.
+     Reproducer: `SELECT sum(b) FILTER (WHERE a>2), sum(b) FROM t` —
+     Pas returned `120|120` (the filtered value duplicated) instead of
+     C's `120|150`.  Same shape across `count(*) FILTER (...) , count(*)`
+     and any peer pair where the only difference is the FILTER clause.
+     Root cause: `sqlite3ExprCompare` (passqlite3codegen.pas:48304)
+     omitted the EP_WinFunc / FILTER comparison gate that the C reference
+     carries at expr.c:6584..6594.  With FILTER stored on
+     `Expr.y.pWin->pFilter` and EP_WinFunc set, two
+     `agg(x) FILTER(p1)` and `agg(x) FILTER(p2)` (or one with FILTER and
+     one without) compared equal, so analyzeAggregate's pAggInfo dedup
+     loop merged them into one slot — the unfiltered call inherited the
+     filtered call's pAggInfo.iMem and AggStep wiring.  Fix: add the
+     `(pA->flags^pB->flags)&EP_WinFunc != 0 → 2` divergence check inside
+     the TK_FUNCTION/TK_AGG_FUNCTION arm, plus `EP_WinFunc on both →
+     sqlite3WindowCompare(pParse, pA->y.pWin, pB->y.pWin, /*bFilter*/1)`
+     dispatch.  sqlite3WindowCompare was already ported (codegen.pas
+     :48667) with the bFilter=1 path comparing pFilter expressions.
+     Side effect: also closes bug 6.29's two DiagWindow divergences,
+     which were the same dedup-too-aggressive shape applied to window-
+     function FILTER variants.  Verified: TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic / TestSelectBasic / TestVdbeAgg /
+     TestSchemaBasic all clean; DiagWindow now 0 divergences (was 2);
+     DiagFunctions / DiagFeatureProbe / DiagOps / DiagDml all 0.
+
+- [X] **10.1.bug.41** Fixed 2026-05-08.  `INSERT OR REPLACE` was a
+     silent no-op when the target table had BOTH a `CHECK` constraint
+     AND a non-NOT-NULL `UNIQUE` column.  Root cause: `sqlite3GenerateIndexKey`
+     (passqlite3codegen.pas:28515) ignored `uniqNotNull` when computing
+     the index-key column count.  C delete.c:993 uses
+     `nCol = (prefixOnly && pIdx->uniqNotNull) ? pIdx->nKeyCol : pIdx->nColumn`
+     — Pas was using `nKeyCol` whenever `prefixOnly` was set, regardless
+     of `uniqNotNull`.  For the autoindex on `b TEXT UNIQUE` (no NOT NULL),
+     uniqNotNull=0, so C loads 2 cols (b + rowid) but Pas was loading only
+     1 (just b), then OP_IdxDelete with `nIdxCol=2` (the OUTER caller
+     correctly uses `nColumn`) read uninitialised r[10] as the rowid key
+     half — IdxDelete missed, OR-REPLACE's existing row stayed put, and
+     the new INSERT silently collided.  Fix: gate `nKeyCol` selection on
+     both `prefixOnly` AND `uniqNotNull`, mirroring C exactly.  Verified:
+     reproducer now matches upstream (`2|b2|9.0`); UPSERT variant works;
+     NOT NULL UNIQUE variant unchanged; TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44
+     all clean; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma /
+     DiagFunctions / DiagTxn / DiagMisc / DiagWindow / DiagCast /
+     DiagDate / DiagAnalyze / DiagDropTable / DiagCovering /
+     DiagIndexing all 0 divergences.
+
+- [X] **10.1.bug.40** Fixed 2026-05-08.  `ORDER BY` on the outer
+     SELECT against a recursive CTE was not applied — rows came out in
+     CTE production order rather than sorted.  Root cause: the
+     "Sub-SELECT co-routine arm" in sqlite3Select (codegen.pas:24675)
+     short-circuited a single-source FROM-(SELECT) shape into a hand-
+     rolled `Yield → emit pEList → ResultRow → Goto` loop without ever
+     consulting `p^.pOrderBy`, so the outer ORDER BY was silently
+     dropped (the standard sqlite3WhereBegin path that owns
+     pushOntoSorter / generateSortTail was bypassed).  Fix: add a local
+     pushOntoSorter / generateSortTail wrapper around the Yield loop —
+     when `p^.pOrderBy <> nil` (and no GROUP BY / HAVING / LIMIT, which
+     stay deferred) open a sorter cursor before the Yield, code the
+     ORDER BY keys into a `regSortBase..` block before
+     `translateColumnToCopy` (so the iCsr→regResult rewrite covers them
+     too), `SCopy` the iSdst payload after the keys, and emit
+     `MakeRecord + SorterInsert` in place of `OP_ResultRow`.  After the
+     loop break label, drain the sorter via `OpenPseudo + SorterSort +
+     SorterData + Column*N + ResultRow + SorterNext`.  Mirrors the
+     equivalent slice in the standard sqlite3Select path
+     (codegen.pas:25249 pushOntoSorter, :25461 generateSortTail).
+     Verified: recursive CTE reproducer returns `CEO; CFO; CTO`
+     byte-identical to upstream; plain `SELECT b FROM (SELECT a,b FROM
+     t) ORDER BY b / b DESC / a` all match.  TestExplainParity
+     1026/1026; TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60
+     / TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic
+     44/44 / TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord
+     13/13 all clean; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma
+     / DiagFunctions / DiagWindow / DiagMisc / DiagCast / DiagDate /
+     DiagSubsel / DiagAggWhere / DiagInnerJoin / DiagMultiValues /
+     DiagDropTable / DiagCovering / DiagIndexing / DiagPredicates /
+     DiagOrderLimitTopN / DiagAnalyze all 0 divergences.
+
+- [ ] **10.1.bug.39** `.recover` on a clean (uncorrupted) db reports
+     `database disk image is malformed (11)` after the
+     `BEGIN; PRAGMA writable_schema = on; PRAGMA foreign_keys = off;`
+     preamble has been emitted.  Reproducer: build a 3-row table with
+     `bin/passqlite3 demo.db "CREATE TABLE t(a,b); INSERT ...";`
+     then run `bin/passqlite3 demo.db ".recover"` — Pas exits with the
+     CORRUPT error after the preamble; upstream `sqlite3` emits the
+     full `CREATE TABLE t(...);` + `INSERT INTO t VALUES(...)` script.
+     Suspected upstream of the error: the `WITH RECURSIVE pages(i,...)
+     AS (... SELECT ... FROM sqlite_dbptr('getpage(...)') ...)` query
+     used by `recoverCacheSchema` returns no rows in the Pascal port
+     (same vtab-hidden-arg / xBestIndex pushdown gap tracked under
+     bug 6.13), so `recovery.schema` never populates and
+     `recoverWriteDataStep` walks an empty tree.  The CORRUPT comes
+     from a downstream `sqlite_dbdata` read against the input db, but
+     the engine surface is reachable from the shell now (10.1.48 wire-
+     up).  Fix path: chase 6.13's vtab-arg pushdown first; once
+     sqlite_dbdata / sqlite_dbptr accept hidden-arg values from CTEs,
+     the schema cache should populate and the engine should walk to
+     the WRITING / SCHEMA2 / DONE states cleanly.
+
+- [X] **10.1.bug.37** Fixed (verified 2026-05-08, a4 head).  Confirmed
+     fixed indirectly by Phase 6.29.followup (commit 1f0be03 — restore
+     colUsed propagation across window rewrite).  All previously broken
+     PARTITION BY shapes now match upstream byte-for-byte:
+     `SELECT b, sum(b) OVER (PARTITION BY a%2) FROM t;` returns
+     `20|60, 40|60, 10|90, 30|90, 50|90`; `SELECT b, sum(b) OVER
+     (ORDER BY a) FROM t;` returns the correct running 10/30/60/100/150;
+     multi-window / partition-by-c / lead/lag with 3+ projected cols
+     all match.  Bug surface (window queries projecting non-PARTITION /
+     non-ORDER-BY columns) was repaired when window rewrite started
+     propagating correct colUsed bits to the OpenRead p4 reduction —
+     the misaligned eph row layout described in the original analysis
+     no longer reproduces.  TestExplainParity 1026/1026; DiagWindow
+     0 divergences.
+
+- [X] **10.1.bug.35** Fixed 2026-05-08.  Date/time arithmetic dropped
+     one second on every relative modifier (`+N seconds/minutes/hours`,
+     `-N minutes`, etc.).  Reproducers:
+     `datetime('2024-01-01 00:00:00','+10 hours')` returned
+     `2024-01-01 09:59:59` instead of `10:00:00`;
+     `datetime('2024-01-01 00:00:00','+30 seconds')` returned `00:00:29`
+     instead of `00:00:30`; `strftime('%H:%M:%S', ..., '+10 hours',
+     '-30 minutes')` returned `09:29:59` instead of `09:30:00`.  Root
+     cause: `fromJulianDay` (passqlite3codegen.pas:47084) decomposed a
+     Double Julian Day via `Trunc(F*24.0)` etc.  The C reference
+     (date.c) carries time as `iJD` — integer milliseconds since the
+     JD epoch — so `+10 hours` is exact.  Pascal's chain
+     `dt.jd := dt.jd + r/24.0;  fromJulianDay(dt.jd, ...);` accumulated
+     enough Double error that 86400000 ms × n fractions came out as
+     just-under, and `Trunc` rounded the missing 1 ms down to a missing
+     1 second.  Fix: reroute `fromJulianDay` through integer
+     millisecond arithmetic — `Round((jd+0.5)*86400000.0)` then
+     decompose by `div`/`mod` against 86400000/3600000/60000.  Mirrors
+     C's `iJD = (sqlite3_int64)((... + 0.5)*86400000)` /
+     `computeYMD_HMS`.  Verified: every previously-broken modifier now
+     matches upstream byte-for-byte (datetime/date/strftime/julianday
+     across +/- seconds/minutes/hours, including end-of-month carry
+     '2000-02-28','+1 day' → '2000-02-29').  Residual: `julianday()`
+     printf precision still differs (16 vs 15 digits) — a separate
+     `%g` formatting concern, not a date-math bug.  TestExplainParity
+     1026/1026; TestSmoke / DiagDate / DiagFunctions / DiagMoreFunc /
+     DiagFeatureProbe / DiagWindow / DiagCast / DiagPragma / DiagDml /
+     DiagOps / DiagTxn / DiagMisc / DiagSampleProg all 0 divergences.
+
+- [X] **10.1.bug.34** Fixed 2026-05-08.  DISTINCT aggregate combined
+     with GROUP BY silently produced no rows.  Reproducer:
+     `CREATE TABLE t(a,b); INSERT INTO t VALUES(1,'a'),(1,'b'),(2,'c');
+     SELECT a, count(DISTINCT b) FROM t GROUP BY a;` returned no rows in
+     Pas vs `1|2; 2|1` in C.  Same for `sum(DISTINCT a)`,
+     `group_concat(DISTINCT b)`, etc., when GROUP BY was present.  Plain
+     DISTINCT aggregates (no GROUP BY) worked because they took the
+     simple-agg arm.  Root cause: the GROUP BY agg path in
+     `sqlite3Select` (codegen.pas:23522) gated `canUseAgg := False`
+     whenever any aggregate had `iDistinct >= 0`, falling through to the
+     plain SELECT path which then bailed at the `pGroupBy <> nil` check
+     (codegen.pas:23775) — silently no-op.  The DISTINCT machinery was
+     already wired below: `resetAccumulatorSimple` (codegen.pas:22387)
+     emits OP_OpenEphemeral on the per-Func iDistinct cursor every
+     time addrReset fires (per-group reset), and
+     `updateAccumulatorSimple` (codegen.pas:22548) emits the OP_Found /
+     OP_IdxInsert dedup chain before each AggStep.  Fix: removed the
+     `iDistinct >= 0` arm from the canUseAgg gate.  Verified
+     byte-identical to system sqlite3 across `count(DISTINCT b)`,
+     `sum(DISTINCT a)`, `group_concat(DISTINCT b)`, multiple-DISTINCT
+     in same SELECT, DISTINCT in HAVING, NULL-only group, and the
+     2-arg `DISTINCT aggregates must have exactly one argument` error.
+     TestExplainParity 1026/1026; DiagFeatureProbe / DiagWindow /
+     DiagDml / DiagOps / DiagFunctions / DiagPragma / DiagMisc /
+     DiagAggWhere / DiagCovering / DiagAnalyze / DiagDropTable /
+     DiagIndexing / DiagMoreFunc / DiagOrderLimitTopN / DiagPredicates /
+     DiagLikeGlob / DiagTxn / DiagDate / DiagCast all clean.
+
+- [X] **10.1.bug.26** Fixed 2026-05-08.  Recursive CTE whose recursive
+     arm joins the self-reference against another table corrupted rows
+     when the inner JOIN produced more than one row per iteration.
+     Reproducer: `WITH RECURSIVE tree(id,parent) AS (SELECT id,parent
+     FROM p WHERE parent IS NULL UNION ALL SELECT p.id,p.parent FROM
+     tree JOIN p ON p.parent=tree.id) SELECT * FROM tree;` on a 3-row
+     parent/child table — Pas returned `[1,];[NULL,NULL];[3,1]` instead
+     of `[1,];[2,1];[3,1]`.  Cross-join variants (`SELECT p.id FROM tree,p
+     WHERE tree.x<5`) returned `1, blank, 20` instead of `1, 10, 20`.
+     Two faithful 1:1 omissions vs C:
+     1. **`OP_RowData` skipped Deephemeralize** — vdbe.c:6138
+        `if (!pOp->p3) Deephemeralize(pOut);` calls
+        sqlite3VdbeMemMakeWriteable when MEM_Ephem is set so the row
+        data survives subsequent cursor mutations.  Pas only cleared
+        MEM_Zero (an unrelated flag), leaving the destination register
+        pointing into the btree page payload.  When OP_Delete on the
+        same cursor immediately followed (the recursive-CTE FIFO
+        consumer pattern), the page rearranged its cell area and the
+        ephemeral pointer started reading garbage / overwritten bytes.
+        Restored Deephemeralize: when p3=0 and flags has MEM_Ephem, call
+        sqlite3VdbeMemMakeWriteable to copy into owned memory.
+     2. **selectExpander missed sqlite3SrcListAssignCursors pre-pass** —
+        select.c:5996 assigns iCursor to every FROM item BEFORE the
+        loop that calls resolveFromTermToCte / withExpand.  Without
+        this, a recursive CTE's inner self-reference allocated its
+        cursor index ahead of the outer reference, producing a
+        bytecode-level cursor numbering shift (Pas had pseudo cursor=0
+        instead of cursor=1).  Cursor 0 then collided with aMem[0]
+        cursor-storage.  Added the pre-pass call at the top of the
+        FROM-resolution loop in sqlite3SelectExpand.
+     Verified: 5-row tree-traversal returns full path correctly;
+     cross-join recursive emits all rows.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13
+     all clean; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma /
+     DiagFunctions / DiagTxn / DiagMisc / DiagCast / DiagAnalyze /
+     DiagDate / DiagDropTable / DiagCovering / DiagIndexing all 0
+     divergences; DiagWindow holds at the pre-existing 2 (bug 6.29).
+     Follow-up bug 10.1.bug.27 below tracks the residual implicit-name
+     resolution gap.
+
+- [X] **10.1.bug.27** Fixed 2026-05-08.  Recursive CTE without explicit
+     column-name list lost the recursive arm: `WITH RECURSIVE r AS
+     (SELECT a,b FROM p WHERE b IS NULL UNION ALL SELECT p.a,p.b FROM p
+     JOIN r ON p.b=r.a) SELECT * FROM r;` returned just the anchor row
+     `[1,]`.  Root cause: `resolveFromTermToCte` (passqlite3codegen.pas
+     ~21063) only pre-populated pTab^.aCol from `pCt^.pCols` when the
+     explicit `r(a,b)` list was present; for the inferred form pTab^.aCol
+     was empty during `sqlite3SelectPrep`, so the recursive arm's `r.a`
+     reference could not bind to a column.  Mirrors C select.c:5793..5839
+     where the SETUP-term walk + column derivation happens BEFORE the
+     full-compound walk re-traverses the recursive arm.  Fix: extend the
+     pre-populate arm to fall back to the leftmost SELECT's pEList when
+     `pCt^.pCols` is nil — column names come from `Expr.u.zToken` for the
+     typical TK_ID anchor expressions, which is set during parsing
+     (pre-resolution).  Verified: inferred-column form now returns
+     `[1,];[2,1];[3,1]` byte-identical to upstream.  TestExplainParity
+     1026/1026; TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13
+     all clean; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma /
+     DiagFunctions / DiagTxn / DiagMisc / DiagCast all 0 divergences;
+     DiagWindow holds at the pre-existing 2 (bug 6.29).
+
+- [X] **10.1.bug.24** Fixed 2026-05-08.  `lag()` and `lead()` window
+     functions returned incorrect values (literal `0` for first row, and
+     constant `1` for subsequent rows).  Root cause: in `windowAggStep`
+     (passqlite3codegen.pas ~49115), the upstream `pFunc->xSFunc !=
+     noopStepFunc` guard was ported as
+     `Pointer(@pFunc^.xSFunc) <> Pointer(@noopWindowStepFunc)` — the
+     stray `@` returned the address of the FuncDef field rather than the
+     stored function pointer, so the comparison was always true and Pas
+     emitted `OP_AggStep lag(2)` even though lag/lead's xSFunc is the
+     noop.  AggStep then ran lag's no-op body on the regAccum and
+     subsequent AggValue read garbage.  In OBJFPC `@procVar` is the
+     variable address, not the function pointer; correct form is
+     `Pointer(pFunc^.xSFunc)`.  Companion fix to
+     `selectWindowRewriteExprCb` (passqlite3codegen.pas ~48619): port
+     the missing `int f = pExpr->flags & EP_Collate` save/restore around
+     the `memset` (window.c:808/819) so EP_Collate survives the rewrite.
+     Verified: `SELECT a, lag(a,1) OVER (ORDER BY a) FROM t` now
+     byte-identical to upstream.  TestExplainParity 1026/1026;
+     DiagWindow still shows the same 2 pre-existing divergences (bug
+     6.29); DiagFunctions / TestSmoke / TestVdbeAgg 11/11 clean.
+     Open follow-up tracked as **10.1.bug.25** below.
+
+- [X] **10.1.bug.32** Fixed 2026-05-08.  `INSERT INTO t SELECT <exprs>`
+     (single no-FROM SELECT) silently dropped the row — VDBE shrank to
+     just `Init / Halt / Transaction / Goto`.  Root cause: the
+     SF_Values capture in `sqlite3Insert`
+     (passqlite3codegen.pas:30547..30555) only fired when `SF_Values`
+     was set on the wrapping Select; but bare `SELECT 1` doesn't carry
+     SF_Values (only true `VALUES(…)` syntax does).  So pSelect fell
+     through to the multi-row compound chain at :30666..30702 which
+     bailed via `nRows < 2`, jumping straight to insert_cleanup
+     without emitting any insert body.  Fix: add a sibling capture
+     (else-if) for the `pPrior=nil` + (pSrc=nil OR nSrc=0) + no
+     WHERE/GROUP/HAVING/ORDER/LIMIT/window shape — convert pEList
+     to pList and discard the wrapping Select, letting the existing
+     single-row VALUES emission path handle it.  Verified
+     byte-identical to upstream: `INSERT INTO x SELECT 99`,
+     `INSERT INTO x SELECT 2+3, 'b'||'c'`,
+     `INSERT INTO x SELECT NULL, NULL`,
+     `INSERT INTO x SELECT 99, hex(zeroblob(2))` all round-trip.
+     Open follow-up: `INSERT INTO t SELECT a UNION SELECT b` (UNION
+     dedup, not UNION ALL) still drops rows — needs proper compound-
+     SELECT-of-constants support in the INSERT path.  TestExplainParity
+     1026/1026; TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestSchemaBasic 44/44 / TestVdbeAgg 11/11 / TestPrepareBasic 20/20 /
+     TestParser 45/45 / TestVdbeRecord 13/13 / TestWhereBasic 52/52 /
+     TestBytecodeParity 32/32 all clean; DiagFeatureProbe / DiagDml /
+     DiagOps / DiagPragma / DiagDropTable / DiagMisc / DiagTxn /
+     DiagFunctions / DiagCast / DiagAnalyze / DiagWindow /
+     DiagMultiValues / DiagIndexing / DiagCovering / DiagPredicates /
+     DiagMoreFunc / DiagSumOverflow / DiagLikeGlob / DiagPrintfFmt all
+     0 divergences.
+
+- [X] **10.1.bug.33** Fixed 2026-05-08.  `INSERT INTO t SELECT a UNION
+     SELECT b` (and any compound SELECT-as-source the inline
+     viaCoroutine pattern doesn't cover) now inserts the deduplicated
+     rows.  Root cause: when the isMulti detection fell through (chain
+     contained a non-TK_ALL op such as TK_UNION / TK_EXCEPT /
+     TK_INTERSECT, or the leaves had non-empty FROM), `sqlite3Insert`
+     bailed straight to `insert_cleanup`.  Fix: ported insert.c:1108..
+     1153 branch B (the non-viaCoroutine arm) — emit
+     `OP_InitCoroutine`, drive `sqlite3Select(pSelect, SRT_Coroutine)`
+     with `dest.iSdst := regData` (when bIdListInOrder), then
+     `OP_EndCoroutine` + `JumpHere`.  Sets `useCoroutine := True` so
+     the existing consumer path (Yield loop / SCopy / NewRowid /
+     Insert) handles the rest.  New label `generic_coro_done` skips
+     the isMulti-only block.  Companion fix to the
+     `nColumn := pSubqCoro^.pSelect^.pEList^.nExpr` dispatch — guard
+     on `pSubqCoro <> nil` and reuse the already-set `nColumn` for
+     the new generic path.  Verified byte-identical to upstream:
+     `INSERT INTO x SELECT 1 UNION SELECT 2` = 1, 2;
+     `INSERT INTO x SELECT 1 UNION SELECT 1 UNION SELECT 2` = 1, 2;
+     `INSERT INTO x SELECT 'a' UNION SELECT 'b' ORDER BY 1 DESC` =
+     b, a; UNION ALL regression and single-row no-FROM SELECT both
+     still work.  TestExplainParity 1026/1026; TestSmoke / TestDMLBasic
+     54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg
+     11/11 / TestSchemaBasic 44/44 / TestPrepareBasic 20/20 / TestParser
+     45/45 / TestVdbeRecord 13/13 all clean; DiagFeatureProbe / DiagOps
+     / DiagDml / DiagPragma / DiagFunctions / DiagMisc / DiagCast /
+     DiagTxn / DiagDropTable / DiagMultiValues / DiagWindow /
+     DiagAnalyze all 0 divergences.  Caveat: readsTable / useTempTable
+     check from C is not ported, so `INSERT INTO t SELECT … FROM t`
+     (self-referential) may misbehave — separate work item if surfaced.
+
+- [X] **10.1.bug.31** Fixed 2026-05-08.  `EXISTS(SELECT … with no FROM
+     clause)` always returned 0; `SELECT <expr> WHERE <falsey>` (no FROM)
+     wrongly returned the expression value.  Both bugs lived in the
+     no-FROM fast path in `sqlite3Select`
+     (passqlite3codegen.pas:23229..23339).  (a) The eDest gate did not
+     accept SRT_Exists — `sqlite3CodeSubselect` on an EXISTS subquery
+     with no source fell through past the fast path's emit, so iSDParm
+     was never flipped from its zero init.  Fix: extend the gate to
+     accept SRT_Exists, suppress the result-list ExprCode for it, and
+     emit `OP_Integer 1, iSDParm` in the disposal arm — mirrors
+     selectInnerLoop SRT_Exists (select.c:1412..1416).  (b) The fast
+     path skipped `pWhere` entirely (selectInnerLoop runs through
+     WhereBegin which evaluates the residual).  Fix: when pWhere is
+     non-nil, allocate `addrEndNoFrom` up front and emit
+     `sqlite3ExprIfFalse(pWhere, addrEndNoFrom, JUMPIFNULL)` before the
+     row-emit body.  Verified: `SELECT EXISTS(SELECT 1)` = 1,
+     `SELECT EXISTS(SELECT 1 WHERE 0)` = 0, `SELECT 5 WHERE 0` returns
+     no rows, `SELECT 5 WHERE 1` returns 5 — all byte-identical to
+     upstream.  TestExplainParity 1026/1026; TestSmoke / TestSelectBasic
+     60/60 / TestDMLBasic 54/54 / TestWhereBasic 52/52 / TestSchemaBasic
+     44/44 / TestVdbeAgg 11/11 / TestPrepareBasic 20/20 / TestParser
+     45/45 / TestVdbeRecord 13/13 / TestBytecodeParity 32/32 all clean;
+     DiagFeatureProbe / DiagOps / DiagDml / DiagFunctions / DiagMisc /
+     DiagWindow / DiagTxn / DiagPragma / DiagDropTable / DiagMoreFunc /
+     DiagCast all 0 divergences.
+
+- [X] **10.1.bug.30** Fixed 2026-05-08.  `CREATE TABLE` after `CREATE
+     TRIGGER` raised `database disk image is malformed` because
+     `sqlite3InitCallback` branch (b)'s already-published gate
+     (passqlite3main.pas:2633) only consulted `sqlite3FindTable` and
+     `sqlite3FindIndex`.  Triggers fell through, so every OP_ParseSchema
+     fire after a CREATE TABLE / CREATE INDEX / CREATE TRIGGER triplet
+     re-prepared the trigger's CREATE statement against the already-
+     populated `trigHash`.  `sqlite3FinishTrigger`'s `db^.init.busy <> 0`
+     arm calls `sqlite3HashInsert` which on collision returns the
+     displaced *prior* trigger pointer; the cleanup tail then frees that
+     prior trigger via `sqlite3DeleteTrigger`, while `pTab^.pTrg` was
+     just re-pointed at the *new* trigger whose `pNext` chains into the
+     freed slot — use-after-free corruption surfaces as
+     "database disk image is malformed" on the next btree read.  Same
+     root cause as 7.4b.6 but for triggers (tables and indexes were
+     gated under that close-out).  Fix: extend the gate to also skip
+     when `sqlite3HashFind(pSchema^.trigHash, zArg1)` is non-nil.
+     Verified end-to-end (in-memory and on-disk reopen):
+     `CREATE TABLE t; CREATE TRIGGER trg AFTER INSERT ON t BEGIN SELECT
+     1; END; CREATE TABLE u; SELECT name FROM sqlite_schema;` returns
+     {t, trg, u} byte-identical to upstream.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestSchemaBasic 44/44 clean; DiagFeatureProbe / DiagDml / DiagOps /
+     DiagPragma / DiagDropTable / DiagTrig / DiagMisc / DiagWindow all
+     0 divergences.
+
+- [X] **10.1.bug.25** Fixed (verified 2026-05-08, a4 head).  Confirmed
+     fixed indirectly by Phase 6.29.followup (commit 1f0be03 — colUsed
+     propagation across window rewrite).  All previously broken shapes
+     now match upstream byte-for-byte: `SELECT a, b, lag(a,1) OVER
+     (ORDER BY a) FROM t` returns `[1,a,];[2,b,1];[3,c,2];[4,a,3];
+     [5,b,4]` matching C; partition-by-non-projected-col, window rows
+     with 3+ projected cols, multi-window, and lead/lag/avg combos all
+     match.  TestExplainParity 1026/1026; DiagWindow 0 divergences.
+
+- [X] **10.1.bug.22** Fixed 2026-05-08.  `WITH RECURSIVE c(x) AS (SELECT 1
+     UNION SELECT x+1 FROM c WHERE x<N) SELECT * FROM c;` now returns
+     1..N byte-identical to upstream.  Root cause: `sqlite3VdbeMemExpandBlob`
+     (passqlite3vdbe.pas:11712) ran unconditionally instead of checking
+     `MEM_Zero` first like the upstream `ExpandBlob` macro
+     (vdbeInt.h).  Without the guard the function read garbage from
+     `pMem^.u.nZero` (the union slot is shared with `u.i` for plain
+     blobs) and grew `.n` by that amount, padding the MakeRecord
+     output with stale zero bytes.  In the recursive-CTE path
+     OP_IdxInsert calls ExpandBlob on the dedup-key blob in reg 4,
+     which then wrote a 4-byte payload into the FIFO ephemeral
+     instead of 3 bytes; on the next dequeue iteration OP_Column
+     parsed the trailing zero as off-the-end and raised
+     SQLITE_CORRUPT_BKPT ("database disk image is malformed").  Fix:
+     early-return SQLITE_OK from `sqlite3VdbeMemExpandBlob` when
+     `MEM_Zero` is not set, matching the C macro semantics.  Verified:
+     UNION recursive CTE returns 1..5; UNION ALL still works;
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11 /
+     TestSchemaBasic 44/44 all clean; DiagFeatureProbe / DiagOps /
+     DiagFunctions / DiagDml / DiagPragma / DiagCast / DiagMisc /
+     DiagTxn all 0 divergences.
+
+- [X] **10.1.bug.23** Fixed 2026-05-08.  Recursive CTE / generateOutputSubroutine
+     SRT_DistFifo and SRT_DistQueue arms missed the upstream OP_Found
+     short-circuit (select.c:1334..1338 and select.c:1479..1496).  Pascal
+     emitted IdxInsert + NewRowid + Insert unconditionally so a UNION
+     recursive CTE never deduplicated.  Three call sites fixed:
+     (1) selectInnerLoop's SRT_EphemTab/Fifo/DistFifo arm (codegen.pas
+     ~25217); (2) the no-FROM fast path's SRT_DistFifo arm (~23190);
+     (3) generateOutputSubroutine's SRT_Fifo/DistFifo and SRT_DistQueue
+     arms (~19586, ~19640).  After fix the bytecode for the anchor's
+     MakeRecord includes the `Found 3 12 4 0` short-circuit byte-identical
+     to C reference.  Corruption is a separate runtime issue — tracked
+     under 10.1.bug.22.  TestExplainParity 1026/1026; DiagFeatureProbe /
+     DiagOps / DiagFunctions / TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 all clean.
+
+- [X] **10.1.bug.18** Fixed 2026-05-08.  `hex(zeroblob(N))` (and any
+     blob-consuming SQL function applied to a zeroblob with N>=1) crashed
+     with EAccessViolation.  Root cause: `sqlite3_value_blob`
+     (passqlite3vdbe.pas:4967) returned the raw `pVal^.z` for any
+     MEM_Blob/MEM_Str value without first expanding MEM_Zero.  Zeroblobs
+     have flags=MEM_Blob|MEM_Zero, n=0, z=NULL, u.nZero=N — the function
+     returned NULL but `sqlite3_value_bytes` correctly returned N, so
+     hexFunc walked a NULL pointer for N bytes.  Fix: when MEM_Zero is
+     set, call sqlite3VdbeMemExpandBlob first (mirrors C
+     vdbeapi.c:sqlite3_value_blob's ExpandBlob() prologue).  Verified:
+     hex(zeroblob(5))='0000000000' byte-identical to upstream;
+     TestExplainParity 1026/1026; DiagFunctions / DiagOps clean.
+
+- [X] **10.1.bug.21** Fixed 2026-05-08.  `SELECT … FROM (compound-subquery)
+     WHERE …` returned no rows.  Root cause: both subquery-FROM arms in
+     `sqlite3Select` (the co-routine arm at codegen.pas ~24428 and the
+     materialise arm at ~24539) gated on `p^.pWhere = nil`, so any
+     outer WHERE caused fall-through to the eventual stub
+     (Init/Halt/Goto, 3 ops).  Fix: lift the gate in both arms and emit
+     `sqlite3ExprIfFalse(pWhere, addrSkip, JUMPIFNULL)` between OP_Yield
+     (or OP_Rewind) and the column copies — addrSkip points at OP_Yield
+     in the co-routine arm (re-fetch next row) and at OP_Next in the
+     materialise arm.  In the co-routine arm the WHERE expression sits
+     inside the (r2, currentAddr) range that `translateColumnToCopy`
+     walks, so OP_Column refs to iCsr in the predicate get rewritten
+     to OP_Copy from regResult alongside the result-list ones.
+     Verified: `SELECT * FROM (SELECT 1 a UNION ALL SELECT 2) WHERE a>0`
+     = 1, 2; `…WHERE a>1` = 2; `WITH t(x) AS (SELECT 1 UNION SELECT 2)
+     SELECT * FROM t WHERE x>1` = 2.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 all clean;
+     DiagFeatureProbe / DiagOps / DiagDml / DiagPragma / DiagFunctions /
+     DiagTxn / DiagMisc / DiagCast all 0 divergences.  Bug 10.1.bug.20
+     (row_number OVER on compound subquery FROM) is a separate runtime
+     issue — EXPLAIN now emits a full window pipeline but the result is
+     still empty; tracked separately.
+
+- [X] **10.1.bug.20** Fixed 2026-05-08.  `row_number() OVER (ORDER BY x)
+     FROM (compound)` returned no rows.  Root cause: after
+     sqlite3WindowRewrite, the window arm's outer call is
+     `sqlite3Select(pSub, SRT_EphemTab)` where pSub is a single SELECT
+     (no pPrior) whose only source is a sub-SELECT (the user's original
+     compound).  pSub falls through compound dispatch (no pPrior),
+     skips the no-FROM fast path, then hits both the coroutine arm
+     (codegen.pas:24430) and the materialise arm (codegen.pas:24557)
+     which were gated on `pDest^.eDest = SRT_Output`, so neither fired
+     for SRT_EphemTab.  sqlite3Select returned SQLITE_OK without
+     emitting any population code → cursor 5 was opened by the window
+     arm but never inserted into → outer `Rewind 5` jumped straight
+     to EOF.  Fix: extend the materialise arm gate at codegen.pas:24569
+     to accept SRT_EphemTab in addition to SRT_Output, and branch the
+     disposal (was unconditional `OP_ResultRow`) so SRT_EphemTab emits
+     `MakeRecord + NewRowid + Insert(APPEND)` into pDest^.iSDParm
+     (mirrors selectInnerLoop SRT_EphemTab arm at codegen.pas:25128).
+     Also gate `sqlite3GenerateColumnNames` on SRT_Output only.
+     Verified: `row_number() OVER (ORDER BY a) FROM (compound)` now
+     returns 1,2,3 byte-identical to upstream; same for `OVER ()`,
+     UNION ALL, and `row_number(), a FROM (compound)`.
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11
+     all clean; DiagOps / DiagDml / DiagPragma / DiagFunctions /
+     DiagFeatureProbe / DiagTxn / DiagMisc / DiagCast all 0
+     divergences.  DiagWindow 2 (pre-existing bug 6.29 — bare `sum()
+     OVER ()` / `avg() OVER ()` no-PARTITION-no-ORDER, unrelated).
+
+- [X] **10.1.bug.29** Fixed 2026-05-08.  `RIGHT JOIN` / `FULL OUTER
+     JOIN` now emit the right-side unmatched rows.  Two faithful-to-C
+     omissions in passqlite3codegen.pas:
+     1. **Planner never allocated `pLevel^.pRJ`** — the cursor-open
+        loop in `sqlite3WhereBegin` (codegen.pas ~17144) ran
+        `sqlite3CodeVerifySchema` and stopped, skipping
+        where.c:7392..7422.  Added the JT_RIGHT block: malloc
+        TWhereRightJoin, allocate iMatch / regBloom / regReturn,
+        emit `OP_Blob 65536`, `OP_Null 0`, `OP_OpenEphemeral` (with
+        sqlite3KeyInfoAlloc(1,0) for HasRowid / PK KeyInfo
+        otherwise), clear WHERE_IDX_ONLY on the loop, and force
+        nOBSat=0 / eDistinct=WHERE_DISTINCT_UNORDERED.
+     2. **`sqlite3WhereEnd` never drove the subroutine** — the
+        per-level closure loop now (a) emits the body subroutine end
+        at the top: `ResolveLabel(addrCont) / addrCont = MakeLabel /
+        endSubrtn = CurrentAddr / OP_Return regReturn,addrSubrtn,1`;
+        (b) emits `OP_Return regReturn,0,1` after `addrBrk` resolution
+        so the recording-pass falls through and the replay-pass jumps
+        back; (c) after all levels close, walks forward and calls
+        `sqlite3WhereRightJoinLoop(pWInfo, i, pLevel)` for each pRJ
+        level; (d) decrements `pParse^.withinRJSubrtn` by nRJ at the
+        tail.  Verified byte-identical to system sqlite3 on `a RIGHT
+        JOIN b ON x=y`, `a FULL OUTER JOIN b ON x=y`, `a RIGHT JOIN b
+        ON x=y WHERE y>2`, multi-column right joins, and INNER/LEFT
+        JOIN regression cases.  TestExplainParity 1026/1026;
+        TestSelectBasic 60/60; TestWhereBasic 52/52; TestDMLBasic 54/54;
+        DiagOps / DiagDml / DiagFunctions / DiagFeatureProbe /
+        DiagPragma / DiagWindow / DiagMisc / DiagCast all 0
+        divergences.
+
+- [X] **10.1.bug.28** Fixed 2026-05-08.  `SELECT max(column1) FROM
+     (VALUES(1),(2),(3))` returned `1` instead of `3` (and similarly for
+     min/sum/count and other aggregates).  Same root pattern as bug
+     10.1.bug.19 but in a different code path: the aggregate-on-subquery
+     arm (isSubqueryAgg) in `sqlite3Select` (passqlite3codegen.pas
+     ~24297) opened an eph table via `OP_OpenEphemeral` and then ran
+     `sqlite3Select(pItem^.u4.pSubq^.pSelect, SRT_EphemTab)` to
+     materialise the subquery.  When that subquery is the multi-VALUES
+     wrapper produced by `sqlite3MultiValues`, the recursive call walks
+     into the materialise arm whose own recursion hits the now-detached
+     single-row `pLeft` and produces an eph populated with literal `1`.
+     The pre-emitted coroutine that actually yields 1, 2, 3 is never
+     consumed.  Fix: in the isSubqueryAgg arm, peek at the inner
+     subquery's `pSrc[0]` for the `SRCITEM_FG_VIA_COROUTINE` bit; when
+     set, emit `OP_InitCoroutine` to reset the existing coroutine, drive
+     a Yield/AggStep loop, and use `translateColumnToCopy` to redirect
+     `OP_Column` refs at iCsr to `OP_Copy` from the inner coroutine's
+     `regResult`.  Mirrors C `select.c` viaCoroutine handling at the
+     aggregate consumer site.  Verified: `SELECT max/min/sum/count(*)
+     FROM (VALUES(1),(2),(3),(4),(5))` now returns `5|1|15|5`
+     byte-identical to upstream.  TestExplainParity 1026/1026;
+     DiagOps / DiagDml / DiagFunctions / DiagFeatureProbe / DiagTxn /
+     DiagPragma / DiagWindow / DiagSubsel / DiagMisc / DiagCast /
+     DiagMultiValues all clean; full Diag* sweep clean.
+
+- [X] **10.1.bug.19** Fixed 2026-05-08.  Top-level `VALUES(1),(2),(3);`
+     and `SELECT * FROM (VALUES(1),(2),(3))` now return all three rows
+     byte-identical to upstream.  Root cause: the sub-SELECT co-routine
+     arm in passqlite3codegen.pas:sqlite3Select (~24454) unconditionally
+     allocated a new regReturn and recursively coded the inner via
+     SRT_Coroutine.  When the FROM SrcItem was the wrapper produced by
+     sqlite3MultiValues, the coroutine body had already been emitted
+     during parse — the recursive sqlite3Select walked the now-detached
+     pLeft (op=TK_SELECT, pPrior=nil, single-row pEList) and produced a
+     stub coroutine yielding only row 1.  Fix: detect the
+     SRCITEM_FG_VIA_COROUTINE bit (already set by sqlite3MultiValues)
+     and, in that arm, just emit `OP_InitCoroutine regReturn, 0,
+     addrFillSub` to reset the existing coroutine to its entry point;
+     skip the recursive sqlite3Select / EndCoroutine / jump-patch
+     entirely.  Verified: bytecode now matches upstream
+     (15 ops, single coroutine reused via `InitCoroutine 1 0 2` at the
+     consumer site); `SELECT * FROM (VALUES(1,'a'),(2,'b'),(3,'c'))`
+     and `WHERE`-filtered forms also return correctly.
+     TestExplainParity 1026/1026; TestSmoke / TestDMLBasic 54/54 /
+     TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg 11/11
+     all clean; DiagOps / DiagDml / DiagFeatureProbe / DiagFunctions
+     0 divergences.  Aggregate-over-VALUES follow-up closed under
+     bug 10.1.bug.28.
+
+- [X] **10.1.bug.15** Fixed 2026-05-08.  `SELECT * FROM t` silently
+     dropped VIRTUAL generated columns.  On `CREATE TABLE g(a,b,c INT
+     GENERATED ALWAYS AS (a+b) VIRTUAL)` + INSERT(3,4), the port emitted
+     `3|4` instead of `3|4|7`; explicit `SELECT a,b,c FROM g` worked.
+     Root cause: the wildcard expand in passqlite3codegen.pas:expandStar
+     skipped any column whose colFlags had `COLFLAG_HIDDEN OR
+     COLFLAG_VIRTUAL` set.  Upstream select.c:6232 only excludes hidden
+     columns (`IsHiddenColumn(...)`), then separately drops
+     `COLFLAG_NOEXPAND` columns when no explicit table prefix is present.
+     Fix: split the predicate into two `Continue` arms — drop only
+     COLFLAG_HIDDEN, then COLFLAG_NOEXPAND.  Verified byte-identical to
+     upstream for VIRTUAL and default-VIRTUAL forms.  TestExplainParity
+     1026/1026; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma /
+     DiagFunctions / DiagTxn / DiagMisc / DiagCast / DiagAnalyze /
+     TestDMLBasic 54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52 /
+     TestVdbeAgg 11/11 all clean.
+
+- [X] **10.1.bug.17** Fixed 2026-05-08.  UPSERT with `DO UPDATE` crashed
+     with EAccessViolation.  Four faithful 1:1 omissions vs C:
+     1. **`sqlite3Insert` never wired pUpsert** — the upsert.c:267 head
+        runs `sqlite3UpsertDoUpdate` which calls `sqlite3SrcListDup(db,
+        pTop->pUpsertSrc, 0)`, but `pUpsertSrc` / `regData` / `iDataCur`
+        / `iIdxCur` were left at their zero-init defaults.  Ported the
+        insert.c:1289..1316 setup block (post-`OpenTableAndIndices`)
+        that runs `pTabList->a[0].iCursor = iDataCur`, walks the upsert
+        chain stamping the cursor / regData triple, and routes through
+        `sqlite3UpsertAnalyzeTarget` for each clause with a target.
+     2. **`sqlite3UpsertAnalyzeTarget` IPK acceptance** — the C reference
+        relies on resolve.c:466/562 rewriting `id` (the INTEGER PRIMARY
+        KEY alias) to `iColumn = XN_ROWID` (-1).  The Pas port's
+        lookupName leaves `iColumn = iPKey`, so the target-vs-rowid
+        check failed and emitted "ON CONFLICT clause does not match any
+        PRIMARY KEY or UNIQUE constraint".  Lifted the rowid match to
+        also accept `pTerm^.iColumn = pTab^.iPKey`.
+     3. **`excluded.<col>` resolution missing** — `NC_UUpsert` was set
+        on the NameContext in `sqlite3Update`, but the resolver had no
+        arm for resolve.c:547..587.  Added `resolveUpsertExcludedRefs`
+        (passqlite3codegen.pas) which walks the expression tree and
+        rewrites every `excluded.<col>` `TK_DOT` to `TK_REGISTER`
+        pointing at `pUpsert^.regData + iCol` — collapses straight to
+        the new-row data registers, mirroring the C `eNewExprOp =
+        TK_REGISTER` fold.  Wired into `sqlite3ResolveExprNames`.
+     4. **`sqlite3Update` double-freed pUpsert** — `update_cleanup`
+        called `sqlite3UpsertDelete(db, pUpsert)`, but C update.c:1152
+        does NOT free pUpsert (the outer `sqlite3Insert` owns it via
+        insert.c:1661).  Removed the spurious free.
+     Verification: byte-identical to system `sqlite3` on
+     `INSERT … ON CONFLICT DO UPDATE SET c=99`,
+     `ON CONFLICT(id) DO UPDATE SET c=excluded.c+1`,
+     `ON CONFLICT(name) DO UPDATE SET n=u.n+excluded.n` (UNIQUE
+     constraint), and multi-row VALUES with conflict.  TestExplainParity
+     1026/1026; TestDMLBasic 54/54; TestSelectBasic 60/60; TestWhereBasic
+     52/52; TestVdbeAgg 11/11; DiagOps / DiagDml / DiagFeatureProbe /
+     DiagPragma / DiagFunctions / DiagMisc / DiagCast / DiagDate /
+     DiagAnalyze / DiagDropTable / DiagTxn all 0 divergences.
+
+- [X] **10.1.bug.16** Fixed 2026-05-08.  WITHOUT ROWID tables now
+     accept INSERT / UPDATE / DELETE / SELECT round-trip byte-identical
+     to upstream.  Three faithful-to-C omissions in
+     passqlite3codegen.pas's `convertToWithoutRowidTable`-equivalent
+     arm:
+     1. **OP_NewRowid emitted instead of OP_Null** — sqlite3Insert's
+        non-IPK / non-vtab arm at codegen.pas:30843 unconditionally
+        called `sqlite3VdbeAddOp3(v, OP_NewRowid, ...)`, but C
+        insert.c:1536 emits `OP_Null` when `withoutRowid` is set.
+        NewRowid against an OpenWrite for an INDEX-typed cursor (rather
+        than TABLE) walked into uninitialised b-tree state and surfaced
+        as `database disk image is malformed`.  Added a `withoutRowid`
+        gate that emits `OP_Null 0 regRowid` instead.
+     2. **PK index tnum never propagated on schema reload** — the
+        `pPk2^.tnum := pTab^.tnum` assignment in sqlite3EndTable was
+        nested inside `if db^.init.busy = 0`, so a reconnect left the
+        synthetic PK index pointing at root page 0.  C build.c:2449
+        runs the assignment unconditionally.  Lifted the assignment
+        out of the gate.
+     3. **PK index missing trailing data columns** — sqlite3CreateIndex
+        allocated the PK index with just `nKeyCol + 1` slots (room for
+        a single trailing rowid).  C convertToWithoutRowidTable
+        (build.c:2484..2510) appends every non-PK, non-VIRTUAL column
+        to the PK index so the row record carries every value.  Ported
+        `resizeIndexObject` (build.c:2190) and `hasColumn` (build.c:2252)
+        as standalone helpers; added the column-expansion loop to the
+        `if (tabOpts and TF_WithoutRowid) <> 0` arm in sqlite3EndTable.
+        Also marks `isCovering = 1` and `uniqNotNull = 1` on the PK
+        index per build.c:2431..2433.
+     Verified: `(k TEXT PRIMARY KEY) WITHOUT ROWID` round-trips
+     byte-identical to system sqlite3 across INSERT / SELECT / UPDATE /
+     DELETE; multi-column PK `PRIMARY KEY(b,a)` works; UNIQUE conflict
+     fires on duplicate PK insert.  TestExplainParity 1026/1026;
+     TestSmoke / TestDMLBasic 54/54 / TestSelectBasic 60/60 /
+     TestWhereBasic 52/52 / TestVdbeAgg 11/11 / TestSchemaBasic 44/44
+     all clean; DiagOps / DiagDml / DiagFunctions / DiagFeatureProbe /
+     DiagPragma all 0 divergences.
+
+- [X] **10.1.bug.14** Fixed 2026-05-08.  `SELECT a, sum(a) FROM t`
+     (bare base column alongside an aggregate, no GROUP BY) emitted only
+     the 3-op stub (Init/Halt/Goto) and silently returned zero rows.
+     Same shape with `max(a), b` / `sum(a) FILTER (WHERE …)` / `count(*),
+     a` etc. — anywhere a non-aggregated column appeared in the result
+     list with no GROUP BY.  Root cause: the no-GROUP-BY agg arm in
+     passqlite3codegen.pas:sqlite3Select bailed unconditionally when
+     `pAggI2^.nAccumulator > 0`.  Fix: ported select.c:8836..8848 +
+     8887 — allocate `regAcc` (when at least one accumulator column
+     exists and no NEEDCOLL aggregate), emit `OP_Integer 0, regAcc`
+     before assignAggregateRegisters, pass regAcc into
+     updateAccumulatorSimple as the regHit guard, then emit
+     `OP_Integer 1, regAcc` after updateAccumulator (still inside the
+     scan loop) so the accumulator-column reads fire only on the first
+     row.  Applied uniformly to the base-table, vtab, and subquery arms.
+     Verified byte-equivalent to system sqlite3: `SELECT a, sum(a) FROM
+     t` = `1|6`; `SELECT max(a), b FROM t` = `3|z`; `SELECT a, sum(a)
+     FILTER (WHERE b='y') FROM t` = `1|2`; empty WHERE returns one
+     `|` row.  TestExplainParity 1026/1026; TestSmoke / TestDMLBasic
+     54/54 / TestSelectBasic 60/60 / TestWhereBasic 52/52 / TestVdbeAgg
+     11/11 all clean; DiagFeatureProbe / DiagOps / DiagDml / DiagPragma
+     / DiagFunctions / DiagTxn / DiagMisc / DiagCast / DiagAnalyze /
+     DiagDate / DiagMoreFunc / DiagSumOverflow / DiagOrderLimitTopN /
+     DiagPredicates / DiagIndexing / DiagCovering all green.
+
+- [X] **10.1.bug.13** Fixed 2026-05-08.  `.mode box` (and any other
+     mode that calls sqlite3_column_name) crashed on EXPLAIN output
+     with EAccessViolation in sqlite3VdbeMemStringify → sqlite3DbFreeNN.
+     Root cause: passqlite3vdbe.pas:columnName lacked the upstream
+     vdbeapi.c:1505..1518 EXPLAIN short-circuit, so it walked the
+     SELECT's aColName array (sized for the inner SELECT's nResColumn,
+     e.g. 2) using the EXPLAIN-rewritten nResColumn (8 / 4), reading
+     past the end into uninitialised TMem cells.  Fixed by porting the
+     upstream `if( p->explain ) { ret = azExplainColNames8[...] }` arm:
+     added the static azExplainColNames8 table and a leading explain-
+     mode branch in columnName that returns the canonical
+     addr/opcode/p1..p5/comment (or id/parent/notused/detail) names
+     directly without consulting aColName.  Verified: `.mode box` +
+     `EXPLAIN SELECT …` now renders a properly bordered table; no
+     regression in TestExplainParity (1026/1026).
+
+- [X] **10.1.bug.12** Fixed 2026-05-08.  `SELECT … GROUP BY one ORDER BY <expr>`
+     returned no rows whenever the ORDER BY clause did not structurally
+     match the GROUP BY clause (`ORDER BY two`, `ORDER BY sum(two)`,
+     `ORDER BY 2`, `ORDER BY length(one)` etc.).  Root cause: the
+     GROUP BY codegen arm in passqlite3codegen.pas:sqlite3Select bailed
+     to a 3-op stub (Init/Halt/Goto) whenever sqlite3ExprListCompare
+     between pGroupBy and pOrderBy returned non-zero.  Fix: extend the
+     arm to push per-group output rows into a secondary
+     OP_SorterOpen/OP_SorterInsert keyed by pOrderBy and drain it
+     after addrEnd via OpenPseudo / SorterSort / SorterData /
+     ResultRow / SorterNext.  markAggregateInExprList /
+     sqlite3ExprAnalyzeAggList are now also applied to p^.pOrderBy
+     (before nAccumulator is frozen) so aggregate functions and base
+     column refs in the ORDER BY clause resolve into the same
+     accumulator/func register block as the result list.
+     orderByGrp=1 (structural match) still keeps the inline ResultRow
+     fast-path.  Verified byte-identical to upstream sqlite3 across
+     all six variants (`ORDER BY one`, `two`, `sum(two)`, `2`,
+     `length(one)`, `1 DESC`).  TestExplainParity 1026/1026;
+     TestDMLBasic 54/54; TestSelectBasic 60/60; TestWhereBasic 52/52;
+     TestVdbeAgg 11/11; DiagOps / DiagDml / DiagFeatureProbe /
+     DiagPragma / DiagFunctions / DiagTxn / DiagMisc / DiagCast /
+     DiagAnalyze all clean.
+
+- [X] **10.1.bug.11** Crash fixed 2026-05-08.  `CREATE TABLE x AS
+     SELECT …` raised EAccessViolation in sqlite3ExprDeleteNN.  Root
+     cause: a double-free of the parsed Select tree.  The Lemon arm
+     `create_table_args ::= AS select` calls
+     `sqlite3EndTable(...,S); sqlite3SelectDelete(db, S);` exactly as
+     upstream — the parser owns S — but the Pascal port of
+     `sqlite3EndTable` (passqlite3codegen.pas) called
+     `sqlite3SelectDelete(db, pSelect)` itself on every early-out and
+     also as a tail statement, so by the time the parser ran its
+     SelectDelete, the pEList already pointed at freed memory and the
+     Mem-cell walk crashed.  Removed all internal SelectDelete calls
+     in sqlite3EndTable (the parser is the sole owner per the C
+     source).  Full CTAS body codegen is still deferred to Phase 7.x;
+     to avoid writing a malformed sqlite_schema row (no column list),
+     EndTable now surfaces a clean parse error
+     `CREATE TABLE AS SELECT not yet supported in this build` when
+     pSelect <> nil.  TestExplainParity 1026/1026 unaffected.
+
+- [X] **10.1.bug.10** Verified 2026-05-08: cannot reproduce.
+     `.mode list --colsep "|"` + `.output FILE` + `SELECT …` now
+     writes the expected `hello|10` / `goodbye|20` lines into FILE
+     byte-identical to upstream.  Likely closed by a prior fix in
+     the .output / dup2 plumbing landed under 10.1.25 or the QRF
+     setter chain in 10.1.10.  Probe sweep covered both relative
+     (`test_file_1.txt`) and absolute (`/tmp/...`) paths.
 
 - [X] **10.1.bug.9** json_each / json_tree / jsonb_each / jsonb_tree
   raised `no such table: json_each` because the eponymous-vtab arm in

@@ -799,6 +799,67 @@ begin
   Result := sqlite3VtabFmtMsg1Db(db, fmt, arg);
 end;
 
+{ vtab.c:653..682 — hidden-column scan.  After a successful xCreate /
+  xConnect, walk every column of the freshly-declared schema and look for
+  the keyword "hidden" delimited by whitespace or end-of-string in the
+  type string.  When found, set COLFLAG_HIDDEN on the column, set
+  TF_HasHidden on the table, propagate TF_OOOHidden to subsequent
+  non-hidden columns, and excise the keyword from the in-place type
+  string so subsequent sqlite3ColumnType lookups return the cleaned form. }
+procedure vtabHiddenColumnScan(pTab: passqlite3codegen.PTable2);
+var
+  iCol, nCol, nType, i, j, nDel: i32;
+  pCol: passqlite3codegen.PColumn;
+  zType: PAnsiChar;
+  oooHidden: u32;
+begin
+  if pTab = nil then Exit;
+  nCol := pTab^.nCol;
+  if (nCol <= 0) or (pTab^.aCol = nil) then Exit;
+  oooHidden := 0;
+  for iCol := 0 to nCol - 1 do
+  begin
+    pCol  := passqlite3codegen.PColumn(PByte(pTab^.aCol)
+                                + iCol * SizeOf(passqlite3codegen.TColumn));
+    zType := passqlite3codegen.sqlite3ColumnType(pCol, '');
+    if zType = nil then begin
+      pTab^.tabFlags := pTab^.tabFlags or oooHidden;
+      Continue;
+    end;
+    nType := 0;
+    while zType[nType] <> #0 do Inc(nType);
+    i := 0;
+    while i < nType do
+    begin
+      if (sqlite3_strnicmp(PChar(@zType[i]), 'hidden', 6) = 0)
+         and ((i = 0) or (zType[i - 1] = ' '))
+         and ((zType[i + 6] = #0) or (zType[i + 6] = ' '))
+      then break;
+      Inc(i);
+    end;
+    if i < nType then
+    begin
+      if zType[i + 6] <> #0 then nDel := 7 else nDel := 6;
+      j := i;
+      while (j + nDel) <= nType do
+      begin
+        zType[j] := zType[j + nDel];
+        Inc(j);
+      end;
+      if (zType[i] = #0) and (i > 0) then
+      begin
+        Assert(zType[i - 1] = ' ');
+        zType[i - 1] := #0;
+      end;
+      pCol^.colFlags := pCol^.colFlags or passqlite3codegen.COLFLAG_HIDDEN;
+      pTab^.tabFlags := pTab^.tabFlags or passqlite3codegen.TF_HasHidden;
+      oooHidden := passqlite3codegen.TF_OOOHidden;
+    end
+    else
+      pTab^.tabFlags := pTab^.tabFlags or oooHidden;
+  end;
+end;
+
 { vtab.c:557 — invoke xCreate or xConnect on pTab.  *pzErr is heap-allocated
   on error and the caller must sqlite3DbFree it. }
 function vtabCallConstructor(db: PTsqlite3; pTab: passqlite3codegen.PTable2;
@@ -897,11 +958,10 @@ begin
       { Link the new VTable into pTab^.u.vtab.p (head insertion). }
       pVTbl^.pNext   := pTab^.u.vtab.p;
       pTab^.u.vtab.p   := pVTbl;
-      { vtab.c:653..682 hidden-column scan: skipped here.  pTab^.aCol is
-        normally populated only after sqlite3_declare_vtab() has run; the
-        declare-vtab path lands with 6.bis.1e and re-introduces the scan
-        when the printf machinery is wired.  For non-declared schemas
-        (nCol=0) the upstream loop is a no-op anyway. }
+      { vtab.c:653..682 hidden-column scan.  Walk pTab^.aCol type strings;
+        tokens "hidden" delimited by whitespace or end-of-string mark the
+        column with COLFLAG_HIDDEN and are excised from the type string. }
+      vtabHiddenColumnScan(pTab);
     end;
   end;
 
