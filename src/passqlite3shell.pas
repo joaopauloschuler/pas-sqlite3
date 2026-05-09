@@ -1760,7 +1760,7 @@ function runOneSqlLine(p: PShellState; const zSql: AnsiString;
 var
   pStmt: PVdbe;
   pzTail: PAnsiChar;
-  rc, stepRc: i32;
+  rc: i32;
   pBase, pCursor, pEnd: PAnsiChar;
 begin
   Result := 0;
@@ -1788,27 +1788,24 @@ begin
     end;
     p^.pStmt := pStmt;
     shellBeginTimer(p);
-    stepRc := stepAndRender(p, pStmt);
+    stepAndRender(p, pStmt);
     shellEndTimer(p);
     if p^.statsOn <> 0 then displayStats(p, 0);
     p^.pStmt := nil;
     rc := sqlite3_finalize(pStmt);
     if (rc <> SQLITE_OK) and (rc <> SQLITE_DONE) then begin
-      { Upstream shell_exec (shell.c.in:3376) saves step errors with a
-        "stepping, " prefix into zErrMsg; the dispatcher
-        (shell.c.in:12328..12330) then promotes that to "Runtime error".
-        Mirror that here: when the step rc itself is an error the user
-        sees "Runtime error"; when only finalize fails (no step error)
-        we fall through to the generic "Error" arm. }
-      if (stepRc <> SQLITE_DONE) and (stepRc <> SQLITE_ROW)
-         and (stepRc <> SQLITE_OK) then
-        shellEPutZ(Format('%s %s'#10,
-          [string(shellErrPrefix('Runtime error', zSrc, lineno)),
-           AnsiString(sqlite3_errmsg(p^.db))]))
-      else
-        shellEPutZ(Format('%s %s'#10,
-          [string(shellErrPrefix('Error', zSrc, lineno)),
-           AnsiString(sqlite3_errmsg(p^.db))]));
+      { Upstream shell_exec runs sqlite3_format_query_result (qrf.c)
+        which calls sqlite3_reset on the pStmt before returning, clearing
+        the deferred error code so finalize returns OK and the
+        "stepping, " prefix arm in shell.c.in:3376 / 12328..12330 is
+        skipped.  The dispatcher therefore reports "Error", not
+        "Runtime error", for step-time failures (CHECK / NOT NULL /
+        UNIQUE / FK constraint violations).  Pascal port has no QRF,
+        so reset+finalize would otherwise emit the wrong prefix —
+        always use "Error" here to match upstream byte-output. }
+      shellEPutZ(Format('%s %s'#10,
+        [string(shellErrPrefix('Error', zSrc, lineno)),
+         AnsiString(sqlite3_errmsg(p^.db))]));
       Inc(Result);
     end;
     if (pzTail = nil) or (pzTail = pCursor) then Exit;

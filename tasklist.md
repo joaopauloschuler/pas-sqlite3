@@ -2648,6 +2648,33 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.74** Fixed 2026-05-08.  CLI shell printed
+     `Runtime error near line N: ...` for runtime constraint failures
+     (CHECK / NOT NULL / UNIQUE / PRIMARY KEY / FK) where upstream
+     prints `Error near line N: ...`.  Reproducer:
+     `bin/passqlite3 :memory: "CREATE TABLE t(a CHECK(a>0));
+     INSERT INTO t VALUES(-1);"` was diverging by the prefix word.
+     Root cause: `runOneSqlLine` (passqlite3shell.pas) routed
+     non-DONE/non-ROW step rc through a `'Runtime error'`
+     prefix arm intended to mirror upstream shell.c.in:12328..12330.
+     But upstream's flow is: `shell_exec` → `sqlite3_format_query_result`
+     (ext/qrf/qrf.c:2962) which calls `qrfResetStmt` before returning;
+     `sqlite3_reset` clears the deferred error code on the pStmt, so
+     the subsequent `sqlite3_finalize` returns SQLITE_OK and the
+     `'stepping, '` prefix path in shell_exec:3376 never fires for
+     step-time constraint failures.  The dispatcher therefore sees
+     an unprefixed zErrMsg and routes to the `'Error'` arm.  The
+     Pascal port has no QRF unit, so reset+finalize was wrongly
+     promoting every step error to "Runtime error".  Fix: drop the
+     stepRc-discriminated arm; always emit `'Error'` for the rc != OK
+     path in runOneSqlLine.  Verified byte-identical to upstream for
+     CHECK / NOT NULL / UNIQUE / PRIMARY KEY constraint INSERTs;
+     parse errors still emit `'Parse error'`.  TestExplainParity
+     1026/1026; TestSmoke / TestDMLBasic 54/54 / TestSelectBasic
+     60/60 / TestSchemaBasic 44/44 PASS; DiagOps / DiagDml /
+     DiagFeatureProbe / DiagWindow / DiagDate / DiagFunctions /
+     DiagTxn / DiagPragma / DiagMisc 0 divergences.
+
 - [X] **10.1.bug.73** Fixed 2026-05-08.  Aggregate-without-GROUP-BY plus
      ORDER BY (`SELECT one, sum(two) FROM tbl1 ORDER BY sum(two)` /
      `ORDER BY 2` / `ORDER BY one`) returned zero rows.  Root cause: the
