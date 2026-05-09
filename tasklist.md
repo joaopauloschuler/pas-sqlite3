@@ -2648,6 +2648,39 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.76** Fixed 2026-05-08.  Compound queries (UNION /
+     INTERSECT / EXCEPT — non-ALL forms) silently dropped every row
+     produced by an arm with a real FROM-table.  Reproducer:
+     `CREATE TABLE t(a INT); INSERT INTO t VALUES(1),(2),(3);
+     SELECT a FROM t UNION SELECT a FROM t;` returned no rows in Pas
+     vs (1,2,3) in C; same for INTERSECT / EXCEPT and the dedup arm
+     of any UNION on table sources.  UNION ALL was unaffected; bare
+     literal-only compounds (`SELECT 1 UNION SELECT 2`) also worked.
+     Root cause: `multiSelectByMerge` (passqlite3codegen.pas:19903)
+     synthesises an ORDER BY (column 1) on each arm and dispatches
+     them as SRT_Coroutine producers so the merge driver can compare
+     keys.  Each producer's recursive `sqlite3Select` then took the
+     "ORDER BY bail" arm at codegen.pas:25671 — bSort was zero
+     because the sorter setup at codegen.pas:25571 only enabled
+     sorting for SRT_Output / SRT_EphemTab destinations, not
+     SRT_Coroutine — and exited via WhereEnd without emitting any
+     row body (no Column, no Yield).  The merge driver therefore
+     looped over two empty coroutines.  Fix (3 small edits):
+     (1) extend the bSort precondition at codegen.pas:25571 to
+     include SRT_Coroutine; (2) extend the sort-arm disposal
+     dispatch at codegen.pas:25799 to fire for SRT_Coroutine when
+     bSort is on; (3) add a SRT_Coroutine arm in generateSortTail
+     (codegen.pas:26055) that emits OP_Yield p^.iSDParm in place of
+     OP_ResultRow.  Mirrors C select.c's SRT_Coroutine treatment
+     in selectInnerLoop / generateSortTail.  Verified: probe6.sql
+     (UNION / UNION ALL / INTERSECT / EXCEPT, with and without
+     WHERE / ORDER BY) byte-identical to upstream.  TestExplainParity
+     1026/1026; TestSelectBasic 60/60; TestVdbeAgg 11/11;
+     DiagFeatureProbe / DiagOps / DiagDml / DiagWindow / DiagFunctions /
+     DiagPragma / DiagSubsel / DiagMisc / DiagCovering / DiagIndexing /
+     DiagMultiValues / DiagPredicates / DiagOrderLimitTopN / DiagAggWhere /
+     DiagTxn / DiagDate / DiagCast all 0 divergences.
+
 - [X] **10.1.bug.75** Fixed 2026-05-08.  Eponymous virtual tables that
      gate `idxNum` in `xBestIndex` (json_each, json_tree, jsonb_each,
      jsonb_tree, generate_series and any future module that uses the

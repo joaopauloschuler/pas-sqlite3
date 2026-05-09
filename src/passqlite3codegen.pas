@@ -25568,7 +25568,8 @@ begin
   bUseSorter := 1; bSeqExtra := 0;
   addrSortBrk := 0;  { 0 = unallocated; valid labels are < 0 }
   if (p^.pOrderBy <> nil)
-     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab))
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
+          or (pDest^.eDest = SRT_Coroutine))
      and (not isExists) then
   begin
     bSort := 1;
@@ -25796,7 +25797,8 @@ begin
       sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
                            regSortBase, nResultCol);
     end
-    else if pDest^.eDest = SRT_Output then
+    else if (pDest^.eDest = SRT_Output)
+         or ((pDest^.eDest = SRT_Coroutine) and (bSort <> 0)) then
     begin
       if bSort <> 0 then
       begin
@@ -26063,6 +26065,8 @@ begin
       sqlite3ReleaseTempReg(pParse, r2);
       sqlite3ReleaseTempReg(pParse, r1);
     end
+    else if pDest^.eDest = SRT_Coroutine then
+      sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
     else
       sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
     { LIMIT decrement after each emitted row (post-sort).  Sorter mode
