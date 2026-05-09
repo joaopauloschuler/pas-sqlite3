@@ -2648,6 +2648,54 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.78** Fixed 2026-05-08.  CLI shell `.mode line` / `.mode
+     json` / `.mode tcl` / `.mode html` / `.mode insert <name>` produced
+     output that diverged from upstream byte-for-byte:
+       * `.mode line` emitted ` name = value` (right-padded with leading
+         space, ` = ` separator, trailing blank line after last record);
+         upstream emits `name: value` (flush left, `: ` separator, blank
+         line BETWEEN records only).
+       * `.mode json` framed the array as `[\n{...}\n,\n{...}\n]\n`;
+         upstream uses `[{...},\n{...}]\n` (no newline after `[`, no
+         newline before `]`, `,\n` between rows).
+       * `.mode tcl` quoted integers and floats via outputCString
+         (`"1" "x"` instead of `1 "x"`); upstream emits numerics raw,
+         only text/blob/null are C-quoted.
+       * `.mode html` rendered a single line with closing `</TH>` /
+         `</TD>` tags; upstream emits one element per line and omits
+         closing tags (HTML5).
+       * `.mode insert <table>` dangled the table-name PAnsiChar after
+         cmdMode returned because `args[1]` was a local AnsiString.
+     All five fixes landed in passqlite3shell.pas (emitHeader /
+     emitRowOne / emitFooter MODE_Line/Json/Tcl/Html arms + a unit-level
+     `zUserInsertTab` AnsiString backing for `.mode insert`).  Verified
+     byte-identical to upstream across the 4-mode × headers-on/off
+     matrix.  TestExplainParity 1026/1026; TestSmoke / TestDMLBasic
+     54/54 / TestSelectBasic 60/60 / TestSchemaBasic 44/44 /
+     TestPrepareBasic 20/20 / TestParser 45/45 / TestVdbeRecord 13/13 /
+     TestVdbeAgg 11/11 / TestBytecodeParity 32/32 / TestWhereBasic
+     52/52 / TestVtab 216/216 all clean; DiagFeatureProbe / DiagOps /
+     DiagDml / DiagPragma / DiagFunctions / DiagWindow / DiagCovering /
+     DiagIndexing / DiagMisc / DiagCast / DiagDate / DiagAnalyze /
+     DiagDropTable / DiagPredicates / DiagOrderLimitTopN / DiagMultiValues
+     all 0 divergences.
+
+- [ ] **10.1.bug.79** CLI shell residual mode-render gaps surfaced
+     under bug.78 but left for a follow-up:
+       * `.mode html` should emit `null` (literal) for SQL NULL values
+         even when zNull (eNull=9 → "") is empty — upstream behaviour
+         is hardcoded in the QRF html style; pas currently emits the
+         configured zNull.
+       * `.mode tcl` writes the configured zNull (`""` for the eNull=12
+         default) through `outputCString` which double-quotes the
+         literal — should emit zNull verbatim, like upstream.
+       * `.mode insert` with `.headers on` should emit the column list
+         `(a,b,c)` between table name and `VALUES(...)`; upstream gates
+         this on bTitles=QRF_Yes.
+     Evidence (Pas vs C with `.headers on` then `.mode insert tab`):
+     `INSERT INTO tab VALUES(1,'one',1.5);` vs
+     `INSERT INTO tab(a,b,c) VALUES(1,'one',1.5);`.
+
 - [X] **10.1.bug.77** Fixed 2026-05-08.  NATURAL JOIN silently degenerated
      into a cross join (no rows filtered) and `JOIN ... USING(col)`
      access-violated at codegen time.  Reproducers:

@@ -470,6 +470,10 @@ var
   { Stable backing for state.zInFile when running the REPL on stdin. }
   zStdinName:           PAnsiChar = '<stdin>';
   zUserNull:            AnsiString = '';
+  { Stable backing for `.mode insert <table>` so the table-name
+    PAnsiChar in ShellState.zDestTable does not dangle after cmdMode
+    returns (args[] is a local AnsiString array). }
+  zUserInsertTab:       AnsiString = '';
   { 10.1.3 — backing AnsiString for state.zNonce when -nonce sets it. }
   gNonceBacking:        AnsiString = '';
   { 10.1.36 — track .log destination filename for cmdShow / future logger
@@ -1226,10 +1230,12 @@ begin
         WriteLn;
       end;
     MODE_Html:
+      { Upstream renders HTML one element per line, omitting closing
+        </TH> / </TD> tags (HTML5 permits this and matches shell.c.in). }
       begin
-        Write('<TR>');
+        WriteLn('<TR>');
         for i := 0 to rs.nCol - 1 do begin
-          Write('<TH>'); outputHtmlString(colNameStr(pStmt, i)); Write('</TH>');
+          Write('<TH>'); outputHtmlString(colNameStr(pStmt, i)); WriteLn;
         end;
         WriteLn('</TR>');
       end;
@@ -1248,20 +1254,18 @@ begin
     MODE_Off: Exit;
 
     MODE_Line:
+      { Upstream (shell.c.in aModeInfo[line]): eCSep=13 (": "), one column
+        per line, blank line BETWEEN records (not after the last).  No
+        leading padding — column-name flush left, then ": ", then value. }
       begin
-        if rs.lineMaxNameLen = 0 then begin
-          for i := 0 to rs.nCol - 1 do begin
-            ty := utf8DispWidth(colNameStr(pStmt, i));
-            if ty > rs.lineMaxNameLen then rs.lineMaxNameLen := ty;
-          end;
-        end;
+        if rs.rowsEmitted > 0 then WriteLn;
         for i := 0 to rs.nCol - 1 do begin
           z := colTextStr(pStmt, i, isNull);
-          Write(Format('%*s = ', [rs.lineMaxNameLen + 1, colNameStr(pStmt, i)]));
+          Write(colNameStr(pStmt, i));
+          Write(': ');
           if isNull then Write(rs.zNull) else Write(z);
           WriteLn;
         end;
-        WriteLn;
       end;
 
     MODE_List, MODE_Tabs, MODE_Ascii:
@@ -1329,9 +1333,16 @@ begin
       end;
 
     MODE_Json:
+      { Upstream emits `[{...},\n{...}]` — `[` immediately followed by the
+        first object on the same line, `,\n` between rows, no newline
+        before the closing `]`. }
       begin
-        if rs.rowsEmitted = 0 then Write('[') else Write(',');
-        WriteLn;
+        if rs.rowsEmitted = 0 then
+          Write('[')
+        else begin
+          Write(',');
+          WriteLn;
+        end;
         Write('{');
         for i := 0 to rs.nCol - 1 do begin
           if i > 0 then Write(',');
@@ -1350,23 +1361,33 @@ begin
       end;
 
     MODE_Tcl:
+      { Upstream MODE_Tcl: integers and floats emit raw, NULL/text/blob
+        as C-quoted strings.  Pas previously quoted everything via
+        outputCString which broke integer parity (`"1" "x"` vs `1 "x"`). }
       begin
         for i := 0 to rs.nCol - 1 do begin
           if i > 0 then Write(rs.zColSep);
-          z := colTextStr(pStmt, i, isNull);
-          if isNull then outputCString(rs.zNull) else outputCString(z);
+          ty := sqlite3_column_type(pStmt, i);
+          case ty of
+            SQLITE_NULL:    outputCString(rs.zNull);
+            SQLITE_INTEGER: Write(IntToStr(sqlite3_column_int64(pStmt, i)));
+            SQLITE_FLOAT:   Write(FloatToStr(sqlite3_column_double(pStmt, i)));
+          else
+            z := colTextStr(pStmt, i, isNull);
+            outputCString(z);
+          end;
         end;
         Write(rs.zRowSep);
       end;
 
     MODE_Html:
       begin
-        Write('<TR>');
+        WriteLn('<TR>');
         for i := 0 to rs.nCol - 1 do begin
           Write('<TD>');
           z := colTextStr(pStmt, i, isNull);
           if isNull then outputHtmlString(rs.zNull) else outputHtmlString(z);
-          Write('</TD>');
+          WriteLn;
         end;
         WriteLn('</TR>');
       end;
@@ -1411,7 +1432,7 @@ procedure emitFooter(var rs: TRenderState);
 begin
   case rs.p^.mode.eMode of
     MODE_Json:
-      if rs.rowsEmitted > 0 then begin WriteLn; WriteLn(']'); end;
+      if rs.rowsEmitted > 0 then WriteLn(']');
   end;
 end;
 
@@ -2673,7 +2694,8 @@ begin
   end;
   modeChange(p, u8(n));
   if (nArg >= 2) and (n = MODE_Insert) then begin
-    p^.zDestTable := PAnsiChar(args[1]);
+    zUserInsertTab := args[1];
+    p^.zDestTable := PAnsiChar(zUserInsertTab);
   end;
 end;
 
