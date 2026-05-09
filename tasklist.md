@@ -2648,6 +2648,35 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [ ] **10.1.bug.73**
+  ```
+     sqlite> select * from tbl1;
+     ┌─────────┬─────┐
+     │   one   │ two │
+     ├─────────┼─────┤
+     │ hello!  │ 10  │
+     │ goodbye │ 20  │
+     │ hello!  │ 10  │
+     │ goodbye │ 20  │
+     └─────────┴─────┘
+     sqlite> select sum(two) from tbl1;
+     ┌──────────┐
+     │ sum(two) │
+     ├──────────┤
+     │ 60       │
+     └──────────┘
+     sqlite> select one, sum(two) from tbl1 group by one;
+     ┌─────────┬──────────┐
+     │   one   │ sum(two) │
+     ├─────────┼──────────┤
+     │ goodbye │ 40       │
+     │ hello!  │ 20       │
+     └─────────┴──────────┘
+     sqlite> select one, sum(two) from tbl1 order by sum(two);
+     sqlite> select one, sum(two) from tbl1 order by 2;
+     sqlite> select one, sum(two) from tbl1 order by one;
+  ```
+
 - [X] **10.1.bug.72** Fixed 2026-05-08.  Scalar subqueries with no FROM
      clause silently returned NULL instead of evaluating their body, so
      `SELECT (SELECT 1);`, `SELECT (SELECT 1)+(SELECT 2);`,
