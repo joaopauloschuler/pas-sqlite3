@@ -2648,34 +2648,23 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
-- [ ] **10.1.bug.73**
-  ```
-     sqlite> select * from tbl1;
-     ┌─────────┬─────┐
-     │   one   │ two │
-     ├─────────┼─────┤
-     │ hello!  │ 10  │
-     │ goodbye │ 20  │
-     │ hello!  │ 10  │
-     │ goodbye │ 20  │
-     └─────────┴─────┘
-     sqlite> select sum(two) from tbl1;
-     ┌──────────┐
-     │ sum(two) │
-     ├──────────┤
-     │ 60       │
-     └──────────┘
-     sqlite> select one, sum(two) from tbl1 group by one;
-     ┌─────────┬──────────┐
-     │   one   │ sum(two) │
-     ├─────────┼──────────┤
-     │ goodbye │ 40       │
-     │ hello!  │ 20       │
-     └─────────┴──────────┘
-     sqlite> select one, sum(two) from tbl1 order by sum(two);
-     sqlite> select one, sum(two) from tbl1 order by 2;
-     sqlite> select one, sum(two) from tbl1 order by one;
-  ```
+- [X] **10.1.bug.73** Fixed 2026-05-08.  Aggregate-without-GROUP-BY plus
+     ORDER BY (`SELECT one, sum(two) FROM tbl1 ORDER BY sum(two)` /
+     `ORDER BY 2` / `ORDER BY one`) returned zero rows.  Root cause: the
+     agg-no-GROUP-BY general path in `sqlite3Select`
+     (passqlite3codegen.pas:24398) gated on `p^.pOrderBy = nil`; with an
+     ORDER BY present, the gate failed and execution fell through to the
+     3-op `Init/Halt/Goto` stub.  Fix: drop the `pOrderBy = nil`
+     precondition.  An aggregate without GROUP BY produces exactly one
+     output row, so ORDER BY is a runtime no-op (mirrors upstream — the
+     C oracle EXPLAIN opens a sorter but never inserts/sorts).  Verified:
+     all four reproducers byte-identical to oracle (`hello!|60`).
+     TestExplainParity 1026/1026; full Diag suite (FeatureProbe / Ops /
+     Dml / Subsel / AggWhere / Window / Pragma / Misc / Cast / Date /
+     Functions / Covering / Indexing / MultiValues / Predicates) all 0
+     divergences; TestSmoke / TestSelect / TestDML / TestWhere /
+     TestVdbeAgg / TestSchema / TestPrepare / TestParser / TestVdbeRecord
+     / TestWindowBasic all green.
 
 - [X] **10.1.bug.72** Fixed 2026-05-08.  Scalar subqueries with no FROM
      clause silently returned NULL instead of evaluating their body, so

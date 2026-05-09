@@ -24399,7 +24399,6 @@ begin
      and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
      and (p^.pGroupBy = nil)
      and (p^.pWin     = nil)
-     and (p^.pOrderBy = nil)
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem))
