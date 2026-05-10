@@ -2727,6 +2727,26 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.117** Fixed 2026-05-10.  `min(x)` / `max(x)` over
+     an all-NULL input (or any rowset where every row's argument is
+     NULL) returned the blob "0.0" instead of NULL.  Reproducer:
+     `SELECT typeof(min(x)), min(x) FROM (SELECT NULL as x);` printed
+     `blob|0.0` (Pas) vs `null|` (C).  Root cause:
+     `minMaxFinal` (passqlite3codegen.pas:45986) tested
+     `(pAgg^.flags and MEM_Null) <> 0` to decide whether the
+     accumulator was empty, but `sqlite3_aggregate_context` zero-inits
+     the Mem so flags=0 marks the empty case (MEM_Null was never set).
+     The else-branch then handed the zeroed Mem to
+     `sqlite3_result_value`, which surfaced the type=0 / r=0.0 default
+     as a blob containing "0.0".  Fix: mirror func.c:2128..2137
+     verbatim — only set the result when `pAgg^.flags <> 0`, and call
+     `sqlite3VdbeMemRelease(pAgg)` in the bValue=0 branch (matches
+     `minMaxValueFinalize`).  When flags=0, the result remains the
+     default NULL set by the aggregate context.  Verified:
+     full regression 69/69 binaries pass, 4965/4965 assertions;
+     `min`/`max` over only-NULL rows now return NULL with type=null
+     byte-for-byte against the C oracle.
+
 - [X] **10.1.bug.116** Fixed 2026-05-10.  Correlated subqueries that
      reference an outer-table column with a qualified `outer.col` form
      (or that put the outer reference anywhere other than the inner

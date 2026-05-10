@@ -45988,10 +45988,10 @@ var
   pAgg: PMem;
 begin
   pAgg := PMem(sqlite3_aggregate_context(pCtx, 0));
-  if (pAgg = nil) or ((pAgg^.flags and MEM_Null) <> 0) then begin
-    sqlite3_result_null(pCtx);
-  end else begin
-    sqlite3_result_value(pCtx, Psqlite3_value(pAgg));
+  if pAgg <> nil then begin
+    if pAgg^.flags <> 0 then
+      sqlite3_result_value(pCtx, Psqlite3_value(pAgg));
+    sqlite3VdbeMemRelease(pAgg);
   end;
 end;
 

@@ -182,6 +182,14 @@ begin
   Probe('max2',           'SELECT max(3, 5)');
   Probe('min3 with null', 'SELECT min(3, NULL, 5)');
 
+  // --- min/max aggregate over only-NULL rows (10.1.bug.117 regression) ---
+  Probe('agg min all null',
+    'SELECT typeof(min(x)), min(x) FROM (SELECT NULL AS x)');
+  Probe('agg max all null',
+    'SELECT typeof(max(x)), max(x) FROM (SELECT NULL AS x)');
+  Probe('agg min mix null',
+    'SELECT min(x), max(x) FROM (SELECT NULL AS x UNION ALL SELECT 5)');
+
   // --- arithmetic / coercion ---
   Probe('text+int',       'SELECT ''5''+3');
   Probe('int=real',       'SELECT 1=1.0');
