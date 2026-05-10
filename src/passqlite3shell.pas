@@ -3090,6 +3090,200 @@ begin
   runStatementVerbose(p, 'SELECT name, file FROM pragma_database_list ORDER BY seq');
 end;
 
+function shellFmtIsSpace(c: AnsiChar): Boolean; inline;
+begin
+  Result := (c = ' ') or (c = #9) or (c = #10) or (c = #11) or (c = #12) or (c = #13);
+end;
+
+function shellFmtIsAlnum(c: AnsiChar): Boolean; inline;
+begin
+  Result := ((c >= 'A') and (c <= 'Z'))
+         or ((c >= 'a') and (c <= 'z'))
+         or ((c >= '0') and (c <= '9'));
+end;
+
+function shellFmtWsToEol(const z: AnsiString; iStart: SizeInt): Boolean;
+{ shell.c.in:2348..2357 — true iff z[iStart..] contains only whitespace
+  before the first newline / start-of-comment. }
+var
+  i: SizeInt;
+begin
+  i := iStart;
+  while (i <= Length(z)) do begin
+    if z[i] = #10 then Exit(True);
+    if shellFmtIsSpace(z[i]) then begin Inc(i); Continue; end;
+    if (z[i] = '-') and (i < Length(z)) and (z[i+1] = '-') then Exit(True);
+    Exit(False);
+  end;
+  Result := True;
+end;
+
+function shellFmtStrnicmp(const z: AnsiString; iStart: SizeInt;
+                          const zPat: AnsiString): Boolean;
+var
+  i: SizeInt;
+  ca, cb: AnsiChar;
+begin
+  if iStart + Length(zPat) - 1 > Length(z) then Exit(False);
+  for i := 1 to Length(zPat) do begin
+    ca := z[iStart + i - 1]; cb := zPat[i];
+    if (ca >= 'A') and (ca <= 'Z') then Inc(ca, 32);
+    if (cb >= 'A') and (cb <= 'Z') then Inc(cb, 32);
+    if ca <> cb then Exit(False);
+  end;
+  Result := True;
+end;
+
+function shellFormatSchemaText(const zSql: AnsiString;
+                               bIndent: Boolean): AnsiString;
+{ shell.c.in:2360..2484 — shell_format_schema().  Returns zSql with a
+  trailing ';' when bIndent is False (or for CREATE VIEW / TRIGGER even
+  when bIndent is True).  Otherwise rewrites the CREATE statement so that
+  every column / WHERE-AND clause sits on its own indented line.  The
+  rewrite only triggers when the collapsed form is >= 79 chars wide. }
+var
+  z: array of AnsiChar;
+  zLen: SizeInt;
+  out_: AnsiString;
+  i, j, k, n: SizeInt;
+  c, cEnd: AnsiChar;
+  nParen, nLine: SizeInt;
+  isIndex, isWhere: Boolean;
+
+  procedure FlushPending(extra: AnsiString);
+  begin
+    if j > 0 then begin
+      SetLength(out_, Length(out_) + j);
+      Move(z[0], out_[Length(out_) - j + 1], j);
+    end;
+    out_ := out_ + extra;
+    j := 0;
+  end;
+
+  function PCharAt(pos: SizeInt): AnsiChar; inline;
+  begin if (pos >= 0) and (pos < zLen) then Result := z[pos] else Result := #0; end;
+
+  function StrnicmpAt(pos: SizeInt; const zPat: AnsiString): Boolean;
+  var
+    ii: SizeInt; ca, cb: AnsiChar;
+  begin
+    if pos + Length(zPat) > zLen then Exit(False);
+    for ii := 0 to Length(zPat) - 1 do begin
+      ca := z[pos + ii]; cb := zPat[ii + 1];
+      if (ca >= 'A') and (ca <= 'Z') then Inc(ca, 32);
+      if (cb >= 'A') and (cb <= 'Z') then Inc(cb, 32);
+      if ca <> cb then Exit(False);
+    end;
+    Result := True;
+  end;
+
+  function WsToEolAt(pos: SizeInt): Boolean;
+  var ii: SizeInt;
+  begin
+    ii := pos;
+    while ii < zLen do begin
+      if z[ii] = #10 then Exit(True);
+      if shellFmtIsSpace(z[ii]) then begin Inc(ii); Continue; end;
+      if (z[ii] = '-') and (ii + 1 < zLen) and (z[ii+1] = '-') then Exit(True);
+      Exit(False);
+    end;
+    Result := True;
+  end;
+
+begin
+  if zSql = '' then Exit('');
+  if not bIndent then Exit(zSql + ';');
+  if (sqlite3_strlike('CREATE VIEW%', PAnsiChar(zSql), 0) = 0)
+     or (sqlite3_strlike('CREATE TRIG%', PAnsiChar(zSql), 0) = 0) then
+    Exit(zSql + ';');
+  isIndex := (sqlite3_strlike('CREATE INDEX%', PAnsiChar(zSql), 0) = 0)
+          or (sqlite3_strlike('CREATE UNIQUE INDEX%', PAnsiChar(zSql), 0) = 0);
+
+  { Collapse runs of whitespace, drop padding around '(' / ')'.  Mirrors
+    the first for-loop at shell.c.in:2417..2428.  We work in a 0-based
+    char array because the C uses pointer arithmetic on z[] in place. }
+  n := Length(zSql);
+  SetLength(z, n + 1);
+  if n > 0 then Move(zSql[1], z[0], n);
+  z[n] := #0;
+
+  k := 0;
+  i := 0;
+  while (i < n) and shellFmtIsSpace(z[i]) do Inc(i);
+  while i < n do begin
+    c := z[i];
+    if shellFmtIsSpace(c) then begin
+      if (k > 0) and (z[k-1] = #13) then z[k-1] := #10;
+      if (k > 0) and (shellFmtIsSpace(z[k-1]) or (z[k-1] = '(')) then
+      begin Inc(i); Continue; end;
+    end else if ((c = '(') or (c = ')')) and (k > 0)
+                and shellFmtIsSpace(z[k-1]) then
+      Dec(k);
+    z[k] := c; Inc(k);
+    Inc(i);
+  end;
+  while (k > 0) and shellFmtIsSpace(z[k-1]) do Dec(k);
+  zLen := k;
+
+  if zLen < 79 then begin
+    SetLength(Result, zLen + 1);
+    if zLen > 0 then Move(z[0], Result[1], zLen);
+    Result[zLen + 1] := ';';
+    Exit;
+  end;
+
+  out_    := '';
+  nParen  := 0;
+  nLine   := 0;
+  cEnd    := #0;
+  isWhere := False;
+  i := 0;
+  j := 0;            { z[0..j-1] is the still-pending buffer }
+  while i < zLen do begin
+    c := z[i];
+    if c = cEnd then
+      cEnd := #0
+    else if cEnd <> #0 then
+      { inside string/comment — passthrough }
+    else if (c = '"') or (c = '''') or (c = '`') then
+      cEnd := c
+    else if c = '[' then
+      cEnd := ']'
+    else if (c = '-') and (PCharAt(i+1) = '-') then
+      cEnd := #10
+    else if c = '(' then
+      Inc(nParen)
+    else if c = ')' then begin
+      Dec(nParen);
+      if (nLine > 0) and (nParen = 0) and (j > 0) and (not isWhere) then
+        FlushPending(#10);
+    end else if ((c = 'w') or (c = 'W')) and (nParen = 0) and isIndex
+                and StrnicmpAt(i, 'WHERE')
+                and (not shellFmtIsAlnum(PCharAt(i+5)))
+                and (PCharAt(i+5) <> '_') then
+      isWhere := True
+    else if isWhere and ((c = 'A') or (c = 'a')) and (nParen = 0)
+            and StrnicmpAt(i, 'AND')
+            and (not shellFmtIsAlnum(PCharAt(i+3)))
+            and (PCharAt(i+3) <> '_') then
+      FlushPending(#10'    ');
+    z[j] := c; Inc(j);
+    if (nParen = 1) and (cEnd = #0)
+       and ((c = '(') or (c = #10)
+            or ((c = ',') and (not WsToEolAt(i+1))))
+       and (not isWhere) then
+    begin
+      if c = #10 then Dec(j);
+      FlushPending(#10'  ');
+      Inc(nLine);
+      while (i + 1 < zLen) and shellFmtIsSpace(z[i+1]) do Inc(i);
+    end;
+    Inc(i);
+  end;
+  FlushPending('');
+  Result := out_ + ';';
+end;
+
 procedure cmdSchema(p: PShellState; const args: array of AnsiString;
                     nArg: SizeInt);
 { shell.c.in:10575..10711.  Walk pragma_database_list, build a UNION ALL
@@ -3143,11 +3337,7 @@ begin
       Exit;
     end;
   end;
-  if bIndent then begin
-    { --indent depends on the shell_format_schema/_add_schema UDFs that
-      are not yet ported; quietly ignore the flag rather than error so
-      `.dump`-style scripted gates keep working. }
-  end;
+  { bIndent is honoured by passing it to shellFormatSchemaText below. }
 
   openDb(p, 0);
   if p^.db = nil then Exit;
@@ -3236,7 +3426,8 @@ begin
   end;
   while sqlite3_step(pStmt) = SQLITE_ROW do begin
     zRow := PAnsiChar(sqlite3_column_text(pStmt, 0));
-    if zRow <> nil then WriteLn(AnsiString(zRow) + ';');
+    if zRow <> nil then
+      WriteLn(shellFormatSchemaText(AnsiString(zRow), bIndent));
   end;
   sqlite3_finalize(pStmt);
 end;
@@ -5442,9 +5633,17 @@ var
   zText: PAnsiChar;
   q: AnsiString;
   qList: array[0..2] of AnsiString;
-  i: i32;
+  i, ii: i32;
   haveStat: Boolean;
 begin
+  for ii := 0 to nArg - 1 do begin
+    if (args[ii] = '--indent') or (args[ii] = '-indent') then
+      { upstream accepts and silently ignores --indent (flgs stays 0) }
+    else begin
+      shellEPutZ(Format('Unknown option "%s" on .fullschema'#10, [args[ii]]));
+      Exit;
+    end;
+  end;
   openDb(p, 0);
   if p^.db = nil then Exit;
   qList[0] := zSchemaQ;

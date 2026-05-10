@@ -1035,19 +1035,22 @@ existing dispatcher.
   - [ ] **10.1c.6** `.lint fkey-indexes`, 
   - [ ] **10.1c.7** `.expert` (read-only subset).  
 
-  [~] **10.1.15** `.schema` cmdSchema now mirrors shell.c.in:10575..
-       10711.  Walks pragma_database_list, builds a UNION ALL across
-       every attached database's sqlite_schema (with snum / sname
-       columns), and emits the matching CREATE statements ordered by
-       schema number then rowid.  Wired flags: `--debug` (dumps the
-       composed SQL), `--nosys` (filters via the upstream
-       `name NOT LIKE 'sqlite__%' ESCAPE '_'` after Bug 6.12 close),
-       the literal/glob-pattern split (with `.`
-       qualifying `sname.tbl_name`), and the
+  [X] **10.1.15** `.schema` cmdSchema mirrors shell.c.in:10575..10711.
+       Walks pragma_database_list, builds a UNION ALL across every
+       attached database's sqlite_schema (with snum / sname columns),
+       and emits the matching CREATE statements ordered by schema
+       number then rowid.  Wired flags: `--debug` (dumps the composed
+       SQL), `--nosys` (filters via the upstream
+       `name NOT LIKE 'sqlite__%' ESCAPE '_'`), `--indent` (delegates
+       to the new shellFormatSchemaText helper, ported 1:1 from
+       shell.c.in:2360..2484 shellFormatSchema), the literal/glob-
+       pattern split (with `.` qualifying `sname.tbl_name`), and the
        `sqlite_master`/`sqlite_schema` self-description block.
-       `--indent` accepted but currently a no-op — depends on the
-       shell_format_schema / shell_add_schema UDFs which are not yet
-       ported.
+       Verified `.schema --indent` byte-identical to the 3.53.0 oracle
+       across multi-column tables, indexes with WHERE clauses, and
+       UNIQUE INDEX cases.  shell_add_schema (qualifying CREATE bodies
+       with the attached schema name) still pending — only relevant for
+       multi-database `.schema` runs.
   [X] **10.1.16** `.tables` — cmdTables now mirrors shell.c.in:11341..
        11386: walks pragma_database_list, builds a UNION ALL across
        every attached database's sqlite_schema (qualifying non-main
@@ -1063,8 +1066,15 @@ existing dispatcher.
        `SELECT name, file FROM pragma_database_list ORDER BY seq`.
   [~] **10.1.19** `.fullschema` — cmdFullschema dumps CREATE statements
        (excluding sqlite_stat%) plus sqlite_stat1/sqlite_stat4 INSERTs
-       (when those tables exist).  --indent reformatter still pending
-       with .schema's --indent option.
+       (when those tables exist).  `--indent` is now accepted and
+       silently ignored — matches upstream shell.c.in:9691..9709 where
+       `flgs` is declared but never updated when `--indent` is passed,
+       so shell_format_schema runs with FLAGS=0 (no indent transform).
+       Remaining divergence vs 3.53.0 oracle: (a) sqlite_sequence rows
+       are emitted instead of filtered (need `name NOT LIKE
+       'sqlite__%' ESCAPE '_'`); (b) the `/* No STAT tables available
+       */` banner is not emitted when sqlite_stat1/4 are absent — both
+       are pre-existing cmdFullschema gaps, separate from --indent.
   [~] **10.1.20** `.lint fkey-indexes` cmdLint now mirrors
        shell.c.in:5899..6126: shellFkeyCollateClause registered as the
        `fkey_collate_clause(parent, parentCol, child, childCol)` UDF,
