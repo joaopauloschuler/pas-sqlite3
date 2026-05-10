@@ -2752,24 +2752,34 @@ existing dispatcher.
      on the inner-most coroutine wrapper short-circuits to one row.
      Tracked separately as 10.1.bug.91 below.
 
-- [ ] **10.1.bug.91** Open 2026-05-10.  `count(*) FROM (SELECT * FROM
-     (VALUES…))` returns 1 instead of the actual row count.  Surfaces
-     when running through nested subqueries that re-wrap a
-     coroutine-materialised VALUES source.  Reproducer: `SELECT
-     count(*) FROM (SELECT * FROM (VALUES(1),(1),(2),(3)));` returns
-     `1` where the 3.53.0 oracle returns `4`.  The bare
-     `SELECT * FROM (SELECT * FROM (VALUES…))` walk works (yields
-     `1,1,2,3`) — only the aggregate arm is broken.  Likely the
-     isSubqueryAgg branch at codegen.pas:24908 detects the inner
-     SrcItem's VIA_COROUTINE flag for the OUTER subquery
-     (the SELECT * wrapper), then drains the coroutine that has
-     already been one-shot consumed by the inner Select expansion,
-     yielding only the first row.  Cross-shape: same divergence
-     affects the GROUP BY case (10.1.bug.90 follow-up).  Fix path:
-     when pCoroItem is detected, ensure the inner coroutine is
-     re-entrant (re-init regReturn → addrFillSub) for each outer
-     scan, or fall back to ephemeral materialisation in this
-     particular shape.
+- [X] **10.1.bug.91** Fixed 2026-05-10.  `count(*) FROM (SELECT * FROM
+     (VALUES…))` (and other agg shapes wrapping a multi-VALUES source
+     through one or more `SELECT * FROM (subq)` layers) returned 1
+     instead of the actual row count.  Root cause: the isSubqueryAgg
+     pCoroItem detection at passqlite3codegen.pas:25022 only checked
+     pInnerSel^.pSrc^[0] for SRCITEM_FG_VIA_COROUTINE.  In the bare
+     `count(*) FROM (VALUES…)` shape the multi-VALUES wrapper sits
+     exactly there (10.1.bug.28/19 path).  In the nested shape the
+     multi-VALUES wrapper is one (or more) subquery layers deeper, so
+     the single-level probe missed it; the else-branch then ran
+     OpenEphemeral + recursive sqlite3Select(SRT_EphemTab) on the
+     wrapper, which walked the now-detached single-row pLeft and
+     emitted `Integer 1; MakeRecord; Insert` (one row → count=1).
+     Fix: replace the single-level check with a transparent walk that
+     dives through any number of `SELECT * FROM (subq)` wrappers
+     (gated on no aggregate / DISTINCT / compound / WHERE / HAVING /
+     GROUP BY / LIMIT / pPrior to keep it conservative) until it
+     either finds a viaCoroutine source (then drains it via
+     OP_InitCoroutine + Yield-loop, exactly like the bare case) or
+     falls off (then the existing else-branch fallback runs unchanged).
+     Verified byte-identical to the 3.53.0 oracle for `count(*)`,
+     `sum(column1)`, `max/min(column1)` and combined aggregates over
+     1- and 2-deep `SELECT * FROM (...)` wrappers around `(VALUES…)`.
+     Regression: 68 binaries pass / 1 known fail (TestPagerReadOnly).
+     Follow-up unrelated divergence: the outer agg arm bails when
+     `p^.pWhere <> nil` (24833), so `count(*) FROM (SELECT * FROM
+     (VALUES…)) WHERE 1` falls into a 3-op stub returning empty.
+     Pre-existing — not introduced by this fix.
 
 - [X] **10.1.bug.89** Fixed 2026-05-10.  `datetime(N, 'unixepoch')` (and
      `date()` / `time()` of the same form) returned an empty result for

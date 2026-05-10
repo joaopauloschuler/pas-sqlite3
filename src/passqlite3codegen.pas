@@ -23284,6 +23284,8 @@ var
   isSubqueryAgg: Boolean;
   pInnerSel:   PSelect;
   pCoroItem:   PSrcItem;
+  pCoroProbe:  PSrcItem;
+  pSelWalk:    PSelect;
   jAgg:        i32;
   pAggFunc:    PAggInfoFunc;
   pMinMaxOrderBy: PExprList;
@@ -25021,12 +25023,41 @@ begin
             Mirrors C select.c viaCoroutine handling. }
           pInnerSel := pItem^.u4.pSubq^.pSelect;
           pCoroItem := nil;
-          if (pInnerSel <> nil) and (pInnerSel^.pSrc <> nil)
-             and (pInnerSel^.pSrc^.nSrc = 1) then
+          { Walk through any number of transparent `SELECT * FROM (subq)`
+            wrappers until we either reach a viaCoroutine source (use it
+            to drain the existing coroutine) or fall off (no fix needed).
+            Closes 10.1.bug.91: the bare `count(*) FROM (VALUES...)`
+            shape (10.1.bug.90) sees pInnerSel.pSrc[0] viaCoroutine
+            directly; the nested `count(*) FROM (SELECT * FROM
+            (VALUES...))` shape buries the multi-VALUES wrapper one
+            subquery deeper, so the original single-level check missed
+            it and the else-branch's recursive sqlite3Select with
+            SRT_EphemTab walked the detached single-row pLeft → 1. }
+          pSelWalk := pInnerSel;
+          while (pSelWalk <> nil) and (pSelWalk^.pSrc <> nil)
+                and (pSelWalk^.pSrc^.nSrc = 1)
+                and ((pSelWalk^.selFlags
+                      and (SF_Aggregate or SF_Distinct
+                           or SF_Compound)) = 0)
+                and (pSelWalk^.pWhere = nil)
+                and (pSelWalk^.pHaving = nil)
+                and (pSelWalk^.pGroupBy = nil)
+                and (pSelWalk^.pLimit = nil)
+                and (pSelWalk^.pPrior = nil) do
           begin
-            pCoroItem := SrcListItems(pInnerSel^.pSrc);
-            if (pCoroItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) = 0 then
-              pCoroItem := nil;
+            pCoroProbe := SrcListItems(pSelWalk^.pSrc);
+            if (pCoroProbe^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0 then
+            begin
+              pCoroItem := pCoroProbe;
+              break;
+            end;
+            { Dive one level deeper: pCoroProbe must be a subquery whose
+              pSelect we can walk further. }
+            if ((pCoroProbe^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)
+               or (pCoroProbe^.u4.pSubq = nil)
+               or (pCoroProbe^.u4.pSubq^.pSelect = nil) then
+              break;
+            pSelWalk := pCoroProbe^.u4.pSubq^.pSelect;
           end;
           if pCoroItem <> nil then
           begin
