@@ -25228,19 +25228,88 @@ begin
           Inc(pParse^.nMem); regAgg := pParse^.nMem;
           Inc(pParse^.nMem);
           for iFA := 0 to nFuncArg - 1 do Inc(pParse^.nMem);
-          sqlite3VdbeAddOp2(v, OP_Integer, 0, regAgg);
+
+          { Drive xBestIndex with EQ constraints on the hidden columns
+            (mirrors the non-aggregate fast-arm at codegen.pas:25515).
+            Without this, json_each / json_tree / generate_series called
+            from an aggregate context emit idxNum=0 and xFilter takes
+            the "no JSON arg" branch — yielding zero rows aggregated. }
+          vtabIdxNum   := 0;
+          vtabIdxStr   := nil;
+          vtabNeedFree := 0;
+          SetLength(argMap, nFuncArg);
+          for iFA := 0 to nFuncArg - 1 do argMap[iFA] := iFA;
+          vtabBI_OK := False;
+          pVTab2 := passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab));
+          if (nFuncArg > 0) and (pVTab2 <> nil) and (pVTab2^.pVtab <> nil)
+             and (pVTab2^.pVtab^.pModule <> nil)
+             and (pVTab2^.pVtab^.pModule^.xBestIndex <> nil) then
+          begin
+            SetLength(hiddenIdx, nFuncArg);
+            kHC := 0; jHC := 0;
+            while (jHC < nFuncArg) and (kHC < pTab^.nCol) do
+            begin
+              if (pTab^.aCol[kHC].colFlags and COLFLAG_HIDDEN) <> 0 then
+              begin
+                hiddenIdx[jHC] := kHC; Inc(jHC);
+              end;
+              Inc(kHC);
+            end;
+            if jHC = nFuncArg then
+            begin
+              SetLength(idxConstraints, nFuncArg);
+              SetLength(idxUsage, nFuncArg);
+              for iFA := 0 to nFuncArg - 1 do
+              begin
+                FillChar(idxConstraints[iFA], SizeOf(idxConstraints[iFA]), 0);
+                idxConstraints[iFA].iColumn := hiddenIdx[iFA];
+                idxConstraints[iFA].op      := passqlite3vtab.SQLITE_INDEX_CONSTRAINT_EQ;
+                idxConstraints[iFA].usable  := 1;
+                FillChar(idxUsage[iFA], SizeOf(idxUsage[iFA]), 0);
+              end;
+              FillChar(idxInfo, SizeOf(idxInfo), 0);
+              idxInfo.nConstraint     := nFuncArg;
+              idxInfo.aConstraint     := @idxConstraints[0];
+              idxInfo.aConstraintUsage:= @idxUsage[0];
+              idxInfo.estimatedCost   := 1.0E99;
+              if passqlite3vtab.TxBestIndex(pVTab2^.pVtab^.pModule^.xBestIndex)
+                     (pVTab2^.pVtab, @idxInfo) = SQLITE_OK then
+              begin
+                vtabIdxNum   := idxInfo.idxNum;
+                vtabIdxStr   := idxInfo.idxStr;
+                vtabNeedFree := idxInfo.needToFreeIdxStr;
+                for iFA := 0 to nFuncArg - 1 do argMap[iFA] := -1;
+                for iFA := 0 to nFuncArg - 1 do
+                  if (idxUsage[iFA].argvIndex >= 1) and
+                     (idxUsage[iFA].argvIndex <= nFuncArg) then
+                    argMap[idxUsage[iFA].argvIndex - 1] := iFA;
+                vtabBI_OK := True;
+              end;
+            end;
+          end;
+
+          sqlite3VdbeAddOp2(v, OP_Integer, vtabIdxNum, regAgg);
           sqlite3VdbeAddOp2(v, OP_Integer, nFuncArg, regAgg + 1);
           for iFA := 0 to nFuncArg - 1 do
           begin
+            if vtabBI_OK and (argMap[iFA] < 0) then Continue;
             r1 := sqlite3ExprCodeTarget(pParse,
-                    ExprListItems(pItem^.u1.pFuncArg)[iFA].pExpr,
+                    ExprListItems(pItem^.u1.pFuncArg)[argMap[iFA]].pExpr,
                     regAgg + 2 + iFA);
             if r1 <> regAgg + 2 + iFA then
               sqlite3VdbeAddOp2(v, OP_Copy, r1, regAgg + 2 + iFA);
           end;
           addrEnd := sqlite3VdbeMakeLabel(pParse);
-          addrTopOfLoop := sqlite3VdbeAddOp3(v, OP_VFilter, iCsr,
-                                              addrEnd, regAgg);
+          if vtabIdxStr <> nil then
+          begin
+            if vtabNeedFree <> 0 then r1 := P4_DYNAMIC else r1 := P4_STATIC;
+            addrTopOfLoop := sqlite3VdbeAddOp4(v, OP_VFilter, iCsr,
+                                                addrEnd, regAgg,
+                                                vtabIdxStr, r1);
+          end
+          else
+            addrTopOfLoop := sqlite3VdbeAddOp3(v, OP_VFilter, iCsr,
+                                                addrEnd, regAgg);
           if p^.pWhere <> nil then
           begin
             addrSkip := sqlite3VdbeMakeLabel(pParse);

@@ -2886,6 +2886,46 @@ existing dispatcher.
      TestExplainParity 1026/1026; full regression 69/69; 4963/4963
      assertions clean.
 
+- [X] **10.1.bug.122** Fixed 2026-05-10.  Aggregates over an eponymous-
+     vtab source (e.g. `json_group_array(value) FROM json_each('[1,2,3]')`,
+     `json_group_object(key,value) FROM json_each(...)`, `sum(value) FROM
+     json_each(...)`) returned the empty-aggregate value (`[]`, `{}`, NULL)
+     because the agg path in `sqlite3Select` emitted `OP_Integer 0, regAgg`
+     for `idxNum` instead of consulting `xBestIndex`.  json_each's
+     xBestIndex returns idxNum=1 only when an EQ constraint on the hidden
+     `json` column is present, otherwise xFilter takes the "no JSON arg"
+     branch and yields zero rows.  Root cause: the `isVtabAgg` arm at
+     `passqlite3codegen.pas:25205` emitted `OP_Integer 0, regAgg`
+     hard-coded; the parallel non-aggregate fast-arm at
+     codegen.pas:25515..25585 already drives xBestIndex with EQ
+     constraints on the hidden columns (10.1.bug.75) and was the model
+     to follow.  Fix: port the same xBestIndex driver block into the
+     `isVtabAgg` arm — synthesize a minimal `sqlite3_index_info` with
+     the func args mapped to EQ constraints on the hidden columns, call
+     xBestIndex, then emit `OP_Integer vtabIdxNum, regAgg` and the
+     idxStr-aware `OP_VFilter` with `argMap[]`-driven arg evaluation.
+     Verified byte-identical to the 3.53.0 oracle for json_group_array /
+     json_group_object / sum / avg / min / max / count over json_each,
+     json_tree, generate_series.  TestExplainParity 1026/1026; full
+     regression 69 binaries pass; 4965/4965 assertions clean.
+
+- [ ] **10.1.bug.123** `WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL
+     SELECT i+1 FROM c WHERE i<5 ORDER BY 1 LIMIT 3) SELECT * FROM c;`
+     returns the empty result instead of `1, 2, 3`.  Pas drops the
+     recursive CTE entirely whenever the recursive arm carries an
+     ORDER BY / LIMIT.  Reproducer:
+     `bin/passqlite3 :memory: "WITH RECURSIVE c(i) AS (SELECT 1 UNION
+     ALL SELECT i+1 FROM c WHERE i<5 ORDER BY 1 LIMIT 3) SELECT * FROM c;"`.
+     Suspected: `generateOutputSubroutine` / the recursive-CTE compound
+     dispatch at codegen.pas does not propagate the ORDER BY / LIMIT
+     onto the queue; C reference handles this in select.c
+     `generateWithRecursiveQuery` where `pOrderBy` and `pLimit` from
+     the compound's outer SELECT are folded into the worktable read
+     loop (select.c around the line emitting OP_Yield from the queue
+     row).  Fix path: add the ORDER BY / LIMIT plumbing in
+     `generateWithRecursiveQuery` (or whatever the Pascal port name
+     is).
+
 - [X] **10.1.bug.121** Fixed 2026-05-10.  `LIMIT` / `OFFSET` were
      silently ignored on eponymous-vtab scans (`json_each`, `json_tree`,
      `pragma_*`, `generate_series`, ...): `SELECT * FROM
