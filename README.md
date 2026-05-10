@@ -83,6 +83,46 @@ TestSmoke PASSED.
 
 ---
 
+## Regression testing
+
+The formal regression gate runs every `Test*` binary under `bin/` and treats
+each binary's exit code as its pass/fail signal (exit 0 = pass, non-zero =
+fail).  All `Test*` binaries follow this convention, so the gate auto-discovers
+new tests by construction — adding a `Test*.pas` to `src/tests/build.sh` is
+enough to put it under the gate.
+
+`Diag*` binaries are *differential probes* (port vs. C oracle) rather than
+pass/fail tests, and many legitimately emit non-zero divergence counts while
+the port matures.  They are deliberately **not** part of the binary
+pass/fail gate; their divergence counts are tracked in `tasklist.md`
+instead.
+
+To run the test:
+
+```bash
+src/tests/run_regression.sh    # run every bin/Test* and aggregate results
+```
+
+Each test runs in its own temporary working directory under a per-test
+timeout (default 60s, override with `REGRESSION_TIMEOUT=<seconds>`).
+
+Per-test logs are retained under a temporary directory only when at least
+one binary fails; an all-green run cleans them up.  The script exits
+non-zero if any binary fails, so it can be wired into CI directly.
+
+- **Known failures** (tracked, not regressions introduced by the gate):
+  - `TestPagerReadOnly` — 1 / 10 sub-tests pass; `sqlite3PagerOpen` returns
+    `SQLITE_CANTOPEN` (rc=14) for cases T1–T9.  Phase 3.B.2a fixture work
+    pending.
+  - `TestWhereExpr` — 83 / 84 sub-tests pass; sub-test T13c (no virtual
+    `TK_IN` appended for column-mismatched OR) is the lone failure in the
+    WHERE-clause analyzer.
+
+Failures are deliberately left visible rather than quarantined so they
+cannot be silently ignored.
+
+---
+
 ## Quick start examples
 
 Two ways to drive the Pascal port: link against the `passqlite3*` units

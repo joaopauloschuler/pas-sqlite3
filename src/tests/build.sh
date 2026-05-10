@@ -268,3 +268,22 @@ echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestDMLBasic"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestSchemaBasic"
 echo "  LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestReferenceVectors
   LD_LIBRARY_PATH=$SRC_DIR $BIN_DIR/TestTokenizer"
+
+# ---- Step 4: Run the regression gate (build succeeded if we got here) ----
+# `set -e` aborts before this point on any compile error, so reaching here
+# means every Pascal binary built cleanly.  Set SKIP_REGRESSION=1 to skip
+# (e.g. when iterating on a single test by hand).
+if [ "${SKIP_REGRESSION:-0}" = "1" ]; then
+  echo
+  echo "SKIP_REGRESSION=1 set — skipping regression gate."
+else
+  echo
+  echo "Build succeeded — running regression gate."
+  echo
+  # Don't let a failing test abort the script before we've shown the summary.
+  set +e
+  "$SCRIPT_DIR/run_regression.sh"
+  regression_rc=$?
+  set -e
+  exit "$regression_rc"
+fi
