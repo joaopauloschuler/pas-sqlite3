@@ -8570,6 +8570,27 @@ begin
             Inc(vRow);
         end;
       end;
+      { AUTOINCREMENT — port of vdbe.c:5652..5681.  When P3 is non-zero, it
+        names the register holding the running max ROWID (the regCtr emitted
+        by sqlite3AutoincrementBegin from sqlite_sequence).  Bump the new
+        rowid to at least mem[P3]+1, then store it back into mem[P3] so the
+        autoincrement epilogue writes the updated counter. }
+      if pOp^.p3 <> 0 then begin
+        if v^.pFrame <> nil then begin
+          pFrame := v^.pFrame;
+          while pFrame^.pParent <> nil do pFrame := pFrame^.pParent;
+          pIn3 := @pFrame^.aMem[pOp^.p3];
+        end else
+          pIn3 := @aMem[pOp^.p3];
+        sqlite3VdbeMemIntegerify(pIn3);
+        if (pIn3^.u.i = i64($7FFFFFFFFFFFFFFF))
+           or ((pCur^.cursorFlags and VDBC_RandomRowid) <> 0) then begin
+          rc := SQLITE_FULL;
+          goto abort_due_to_error;
+        end;
+        if vRow < pIn3^.u.i + 1 then vRow := pIn3^.u.i + 1;
+        pIn3^.u.i := vRow;
+      end;
       if (pCur^.cursorFlags and VDBC_RandomRowid) <> 0 then begin
         cntNR := 0;
         repeat

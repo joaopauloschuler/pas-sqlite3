@@ -2727,6 +2727,29 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.111** Fixed 2026-05-10.  AUTOINCREMENT counter was
+     not consulted when allocating new rowids: after `CREATE TABLE
+     ai(id INTEGER PRIMARY KEY AUTOINCREMENT, x); INSERT VALUES(...)`
+     populated `sqlite_sequence` with `ai|3`, then `DELETE FROM ai;
+     INSERT INTO ai(x) VALUES('d');` allocated id=1 instead of
+     upstream's id=4 (so AUTOINCREMENT failed its core promise of
+     never reusing rowids).  Root cause: `OP_NewRowid` (vdbe.pas:8554)
+     omitted the `vdbe.c:5652..5681` arm that bumps the new rowid to
+     at least `mem[P3]+1` and writes it back into mem[P3] (the regCtr
+     loaded from `sqlite_sequence` by sqlite3AutoincrementBegin's
+     prologue).  Without it the regCtr was loaded but never consulted,
+     so `MemMax` in the body always saw the empty-table rowid=1 and
+     inserted that.  Fix: ported the omitted arm — when P3 is non-zero,
+     resolve the cell (with the pFrame walk for trigger sub-frames),
+     integerify, raise SQLITE_FULL on overflow / random-rowid mode,
+     bump v to max(v, pMem^.u.i + 1), and store v back to pMem^.u.i so
+     `sqlite3AutoincrementEnd` writes the updated counter back to
+     sqlite_sequence.  Regression test: insert-after-truncate-DELETE
+     and insert-after-explicit-id (id=100, id=50) sequences now match
+     upstream byte-identical (`ai|4 → 4|d`, `ai|101 → 101|next`).
+     TestExplainParity 1026/1026; full regression 69/69; 4963/4963
+     assertions clean.
+
 - [X] **10.1.bug.110** Fixed 2026-05-10.  `SELECT current_date`,
      `current_time`, `current_timestamp` (and `DEFAULT CURRENT_TIMESTAMP`
      column defaults) reported `no such function: current_*`.  The lexer
