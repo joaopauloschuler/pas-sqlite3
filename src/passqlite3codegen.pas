@@ -25806,7 +25806,8 @@ begin
     when the inner is correlated. }
   if (p^.pSrc^.nSrc = 1)
      and ((p^.selFlags and SF_Distinct) = 0)
-     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab))
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
+          or (pDest^.eDest = SRT_Coroutine))
   then
   begin
     pItem := SrcListItems(p^.pSrc);
@@ -25821,8 +25822,12 @@ begin
          srcitem already carries an emitted coroutine.  Other
          SRT_EphemTab cases (correlated, materialise-needed) must fall
          through to the materialise arm below; we'd otherwise re-emit
-         a coroutine that the parse-time pass never built. }
-       and ((pDest^.eDest = SRT_Output)
+         a coroutine that the parse-time pass never built.
+         10.1.bug.113 — SRT_Coroutine (outer being coded as a coroutine
+         producer, e.g. LEFT/RIGHT MERGE arm) admits FROM-subquery
+         coroutine emission unconditionally, matching C select.c:8043
+         which has no eDest gate. }
+       and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
             or ((pItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0))
     then
     begin
@@ -26012,6 +26017,15 @@ begin
         sqlite3ReleaseTempReg(pParse, r2);
         sqlite3ReleaseTempReg(pParse, r1);
       end
+      else if pDest^.eDest = SRT_Coroutine then
+      begin
+        { 10.1.bug.113 — outer is being coded as a coroutine producer
+          (LEFT/RIGHT MERGE arm).  Emit OP_Yield to send each row to
+          the consumer instead of OP_ResultRow. }
+        sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
+        if (bSort = 0) and (p^.iLimit <> 0) then
+          sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrEnd);
+      end
       else
       begin
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
@@ -26050,7 +26064,12 @@ begin
         for i := 0 to nResultCol - 1 do
           sqlite3VdbeAddOp3(v, OP_Column, iSortTab, sortNKey + i,
                             pDest^.iSdst + i);
-        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        if pDest^.eDest = SRT_Coroutine then
+          { 10.1.bug.113 — sort tail under SRT_Coroutine outer must
+            yield each row to the consumer, not OP_ResultRow. }
+          sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm)
+        else
+          sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
         if p^.iLimit <> 0 then
           sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrSortBrk);
         if addrSortContinue <> 0 then

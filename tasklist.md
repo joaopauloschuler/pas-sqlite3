@@ -3086,25 +3086,31 @@ existing dispatcher.
      ORDER BY / GROUP BY alias resolution unaffected.  TestExplainParity
      1026/1026; full regression 69/69; 4965/4965 assertions clean.
 
-- [ ] **10.1.bug.113** `SELECT * FROM (SELECT 1) UNION SELECT 99` (and
-     symmetric / INTERSECT / EXCEPT forms with a subquery or CTE in
-     either arm) crash with EAccessViolation in `OP_Rewind` (vdbe.pas:7872,
-     `pCur^.uc.pCursor` deref of a nil cursor).  Reduces to: with-CTE
-     forms `WITH t1 AS (SELECT 1) SELECT * FROM t1 UNION SELECT * FROM
-     t1` also crash; UNION ALL of the same shape works (ALL skips the
-     dedup MERGE plan).  Root cause is in the multi-arm MERGE codepath:
-     the LEFT arm's bytecode emits `Rewind 0,…` against cursor 0 with
-     no preceding `OpenRead`/`SorterOpen`/`InitCoroutine` for that
-     cursor — the inner `(SELECT 1)` subquery's coroutine is never
-     instantiated, so cursor 0 is the implicit "(subquery-1)" pseudo
-     that the C oracle materialises with `InitCoroutine` + `Yield` at
-     the top of the merged plan.  See `EXPLAIN SELECT * FROM (SELECT 1)
-     UNION SELECT 99` against `/tmp/oracle` (or `LD_PRELOAD=src/libsqlite3.so`)
-     for a side-by-side: oracle emits `InitCoroutine 7,11,6` … `Yield 7`
-     before SorterOpen; Pas jumps straight to SorterOpen + Rewind on a
-     never-opened cursor.  No trivial workaround pending; touches the
-     compound-merge codegen path that already has a known
-     `multiSelectByMerge` gap (see notes elsewhere in 6.14).
+- [X] **10.1.bug.113** Fixed 2026-05-10.
+     `SELECT * FROM (SELECT 1) UNION SELECT 99` (and symmetric
+     INTERSECT / EXCEPT / CTE-driven shapes) crashed with
+     EAccessViolation at `OP_Rewind` because the LEFT MERGE arm's
+     bytecode tried to `Rewind 0` against an unopened cursor.  Root
+     cause was in `passqlite3codegen.pas` Sub-SELECT co-routine arm
+     (the FROM-subquery emit path that mirrors C select.c
+     tag-select-0482 / select.c:8043): the eDest gate accepted only
+     `SRT_Output` and `SRT_EphemTab` (with bug.95's VIA_COROUTINE
+     guard).  When the outer SELECT was being coded as a coroutine
+     producer (LEFT/RIGHT arms inside `multiSelectByMerge`,
+     `pDest^.eDest = SRT_Coroutine`), the inner `(SELECT 1)` failed
+     this gate, so no inner coroutine was emitted; the fall-through
+     materialise arm also rejected SRT_Coroutine, and the outer scan
+     ended up referencing the unopened cursor.  C `select.c:8043` has
+     no eDest gate at all — `fromClauseTermCanBeCoroutine` makes the
+     decision purely on the SrcItem.  Fix: extend the eDest gate to
+     admit `SRT_Coroutine` and route per-row disposal in the consumer
+     loop (both the non-sort tail and the `generateSortTail` slice in
+     the same arm) through `OP_Yield pDest^.iSDParm` instead of
+     `OP_ResultRow` when the outer dest is `SRT_Coroutine`.  Verified
+     against the C oracle for all seven reproducer shapes (UNION,
+     INTERSECT, EXCEPT, UNION ALL, with CTE, with FROM-subquery on
+     either arm).  TestExplainParity 1026/1026; full regression 69/69
+     binaries / 4965 assertions.
 
 - [X] **10.1.bug.111** Fixed 2026-05-10.  AUTOINCREMENT counter was
      not consulted when allocating new rowids: after `CREATE TABLE
