@@ -6973,24 +6973,29 @@ begin
 end;
 
 { numericType — return numeric flags of pMem without modifying it.
-  Port of vdbe.c:498 (computeNumericType + numericType). }
+  Port of vdbe.c:467..490 (computeNumericType + numericType).
+  The (rc and 2) = 0 guard rejects "has decimal point/exponent" parses
+  from the integer arm — without it a string like '3.14abc' would
+  truncate to integer 3 (C falls through to MEM_Real with rValue=3.14). }
 function numericType(pMem: PMem): u16;
-var r: Double; iVal: i64;
+var r: Double; iVal: i64; rcM: i32;
 begin
   if (pMem^.flags and (MEM_Int or MEM_Real or MEM_IntReal or MEM_Null)) <> 0 then begin
     Result := pMem^.flags and (MEM_Int or MEM_Real or MEM_IntReal or MEM_Null);
     Exit;
   end;
-  { Str or Blob: try numeric parse (conservative — return MEM_Real on failure) }
-  if sqlite3MemRealValueRC(pMem, r) <= 0 then begin
-    if (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) <= 1) then begin
+  rcM := sqlite3MemRealValueRC(pMem, r);
+  if rcM <= 0 then begin
+    if ((rcM and 2) = 0) and
+       (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) <= 1) then begin
       pMem^.u.i := iVal;
       Result := MEM_Int;
     end else begin
       pMem^.u.r := r;
       Result := MEM_Real;
     end;
-  end else if (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) = 0) then begin
+  end else if ((rcM and 2) = 0) and
+              (sqlite3Atoi64(pMem^.z, iVal, pMem^.n, pMem^.enc) = 0) then begin
     pMem^.u.i := iVal;
     Result := MEM_Int;
   end else begin

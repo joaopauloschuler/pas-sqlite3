@@ -274,6 +274,16 @@ begin
   Probe('typeof randomblob',   'SELECT typeof(randomblob(8))');
   Probe('length randomblob',   'SELECT length(randomblob(16))');
 
+  // -- numeric coercion of trailing-junk text (bug 10.1.bug.114) ----
+  // C falls through to MEM_Real when the parsed prefix has '.'/'e'/'E'.
+  Probe('text 3.14abc + 0',    'SELECT ''3.14abc'' + 0');
+  Probe('typeof 3.14abc + 0',  'SELECT typeof(''3.14abc'' + 0)');
+  Probe('text 42abc + 0',      'SELECT ''42abc'' + 0');
+  Probe('typeof 42abc + 0',    'SELECT typeof(''42abc'' + 0)');
+  Probe('text 3e2abc + 0',     'SELECT ''3e2abc'' + 0');
+  Probe('typeof 3e2abc + 0',   'SELECT typeof(''3e2abc'' + 0)');
+  Probe('text 42.5abc * 2',    'SELECT ''42.5abc'' * 2');
+
   WriteLn('---');
   WriteLn('PASS=', passed, ' DIVERGE=', diverged);
 end.

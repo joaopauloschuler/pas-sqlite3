@@ -2748,6 +2748,27 @@ existing dispatcher.
      as separate bug 10.1.bug.113 below; that one is in the
      multiSelectByMerge codepath, not in selectExpander.)
 
+- [X] **10.1.bug.114** Fixed 2026-05-10.  `'3.14abc' + 0`, `'42.5abc' + 0`,
+     `'3e2abc' + 0` (and any text whose numeric prefix carries a
+     decimal point or exponent) coerced to integer in the Pascal port
+     instead of the C oracle's real prefix: `3` vs `3.14`, `42` vs
+     `42.5`, `3` vs `300.0`.  Root cause: `numericType` in
+     `passqlite3vdbe.pas` (port of vdbe.c:467..490 computeNumericType)
+     was missing the `(rc & 2) == 0` guard in BOTH the `rc<=0` and
+     `rc>0` arms.  In C, sqlite3MemRealValueRC's bit 1 of the return
+     code marks "decimal point or exponent seen" — when set, the
+     integer arm must be skipped so the value falls through to MEM_Real.
+     Without the guard, sqlite3Atoi64's `<= 1` (or `= 0`) check
+     succeeded on the integer-prefix bytes (e.g. `3`) and the result
+     was stored as i64 with the fractional/exponent component lost.
+     Fix: re-introduce the `(rcM and 2) = 0` guard in both branches,
+     mirroring vdbe.c byte-for-byte.  Regression test: seven Probe
+     entries added to DiagArith.pas covering the value + typeof of
+     `'3.14abc'+0`, `'42abc'+0`, `'3e2abc'+0`, and `'42.5abc'*2`;
+     DiagArith now PASS=131 / DIVERGE=0 (was 124).
+     TestExplainParity 1026/1026; full regression 69/69; 4963/4963
+     assertions clean.
+
 - [ ] **10.1.bug.113** `SELECT * FROM (SELECT 1) UNION SELECT 99` (and
      symmetric / INTERSECT / EXCEPT forms with a subquery or CTE in
      either arm) crash with EAccessViolation in `OP_Rewind` (vdbe.pas:7872,
