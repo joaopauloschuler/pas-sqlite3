@@ -26184,6 +26184,12 @@ begin
     if addrSorter >= 0 then
       sqlite3VdbeChangeToNoop(v, addrSorter);
     bSort := 0;
+    { 10.1.bug.109 — when the planner satisfies ORDER BY natively, there
+      is no sort tail to read back OMITREF'd columns from the sorter KEY,
+      so the inner loop must emit the result columns directly.  Clear
+      bSortOmitRef / nPrefixReg so the column-emit loop below fires. }
+    bSortOmitRef := 0;
+    nPrefixReg   := 0;
   end;
 
   { ORDER BY bail — destinations / shapes the sorter slice does not

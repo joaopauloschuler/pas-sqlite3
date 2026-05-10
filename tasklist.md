@@ -2777,19 +2777,23 @@ existing dispatcher.
      duplicate + post-create insert duplicate).  TestExplainParity
      1026/1026; full regression 69/69 binaries / 4963 assertions pass.
 
-- [ ] **10.1.bug.109** `SELECT * FROM v ORDER BY a,b` against a table
-     with a covering UNIQUE index on `(a, b)` returns `0.0|0.0` rows in
-     Pas (count is right, values are zeros).  Reproducer:
-     `CREATE TABLE v(a INT, b INT); INSERT INTO v VALUES(1,1),(1,2),(2,3);
-      CREATE UNIQUE INDEX iv ON v(a,b); SELECT * FROM v ORDER BY a,b;`.
-     Without the index (or with `ORDER BY a` only — single column) the
-     SELECT returns the right values, so the planner is using the index
-     as a covering scan but materialising the projected columns from the
-     wrong source.  Likely a codegen gap in the index-only / covering-
-     scan arm of WHERE / sqlite3Select; check whether the projected
-     column lookups resolve to the index cursor's columns or to the
-     (closed) table cursor.  Pre-existing — confirmed against pre-bug.107
-     `a4` head.
+- [X] **10.1.bug.109** Fixed 2026-05-10.  `SELECT * FROM v ORDER BY a,b`
+     against a table with a covering UNIQUE index on `(a, b)` returned
+     three rows of `0.0|0.0` instead of the actual `(a, b)` pairs.  Root
+     cause: when the WHERE planner satisfies ORDER BY natively
+     (`pWInfo^.nOBSat >= sortNKey`), the sorter is demoted to a no-op
+     and `bSort` cleared — but `bSortOmitRef` / `nPrefixReg`, which were
+     set during sort-prep because every `SELECT *` column matches an
+     ORDER BY entry, were left intact.  The inner loop's column-emit
+     skipped because `bSortOmitRef <> 0` (it expected the sort tail to
+     read the values back from the sorter's KEY area), and with no sort
+     tail the `OP_ResultRow` fired against uninitialised registers.
+     Fix in `passqlite3codegen.pas` nOBSat shortcut: when demoting the
+     sorter, also reset `bSortOmitRef := 0; nPrefixReg := 0` so the
+     inner loop emits `OP_Column` for each result column directly.
+     `EXPLAIN SELECT * FROM v ORDER BY a,b` now matches C oracle
+     (`Column 2,0,1; Column 2,1,2; ResultRow 1,2`).  Full regression
+     69/69 binaries, 4963 assertions; TestExplainParity 1026/1026.
 
 - [X] **10.1.bug.106** Fixed 2026-05-10.  `'localtime'` / `'utc'` date
      modifiers were no-ops: `datetime('2024-06-15 12:00:00','utc')` returned
