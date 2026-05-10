@@ -2728,6 +2728,27 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.128** Fixed 2026-05-10.  CLI step-time error reports
+     used the wrong upstream classification.  10.1.bug.125 had switched
+     the finalize-error arm of `runOneSqlLine` to `Runtime error` +
+     `(rc)` suffix; observed against the 3.53.0 oracle this is wrong
+     for every step-time error path the Pascal port can hit (the port
+     never composes the `stepping, ` prefix that would push upstream
+     into the `Runtime error` branch — its `stepAndRender` writes rows
+     directly).  Upstream actually emits `Error near line N:` with no
+     `(rc)` suffix in that case (shell.c.in:12330..12333 else-branch:
+     `zErrorType="Error"; zErrorTail=zErrMsg;`).  Reproducers (all
+     produced `Runtime error … (19)` in Pas, `Error …` in C):
+     `INSERT` violating a `FOREIGN KEY` /`CHECK` /`UNIQUE` constraint;
+     `SELECT abs(-9223372036854775808)` (integer overflow);
+     `SELECT cast(1.0/0 AS INTEGER)`.  Fix: `runOneSqlLine`
+     (passqlite3shell.pas) finalize-error arm now uses `'Error'`
+     prefix and drops the `(rc)` suffix.  errMask stripping in
+     `sqlite3VdbeReset` (the other half of bug 125) is preserved.
+     Verified byte-identical to upstream across the four reproducers
+     and the original FK/CHECK/UNIQUE corpus.  TestExplainParity
+     1026/1026; full regression 69/69; 4965/4965 assertions clean.
+
 - [X] **10.1.bug.127** Fixed 2026-05-10.  `ORDER BY ... LIMIT N` against a
      CTE / VALUES coroutine source silently dropped the sort.  Reproducer:
      `WITH r(n) AS (VALUES(1),(2),(3),(4),(5)) SELECT * FROM r ORDER BY n

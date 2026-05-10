@@ -2378,19 +2378,18 @@ begin
     p^.pStmt := nil;
     rc := sqlite3_finalize(pStmt);
     if (rc <> SQLITE_OK) and (rc <> SQLITE_DONE) then begin
-      { Mirror shell.c.in:3370..3376 + 12328..12349 stepping arm:
-        save_err_msg(db, "stepping", rc, 0) → "Runtime error" prefix
-        with " (rc)" suffix when rc>1.  zSql is NULL in upstream's
-        stepping call, so no error-context caret is appended. }
-      if rc > 1 then
-        shellEPutZ(Format('%s %s (%d)'#10,
-          [string(shellErrPrefix('Runtime error', zSrc, lineno)),
-           AnsiString(sqlite3_errmsg(p^.db)),
-           Integer(rc)]))
-      else
-        shellEPutZ(Format('%s %s'#10,
-          [string(shellErrPrefix('Runtime error', zSrc, lineno)),
-           AnsiString(sqlite3_errmsg(p^.db))]));
+      { Mirror shell.c.in:12330..12333: when shell_exec's per-row
+        QRF formatter returns an error to *pzErrMsg without a
+        "stepping, " or "in prepare, " prefix, runOneSqlLine falls
+        through to the else branch with zErrorType="Error" and no
+        trailing "(rc)" suffix.  In the Pascal port we never compose
+        a "stepping, " prefix (stepAndRender writes rows directly),
+        so every step-time error lands here.  zSql is not appended
+        as caret context — upstream passes zSql=NULL for stepping
+        errors. }
+      shellEPutZ(Format('%s %s'#10,
+        [string(shellErrPrefix('Error', zSrc, lineno)),
+         AnsiString(sqlite3_errmsg(p^.db))]));
       Inc(Result);
     end;
     if (pzTail = nil) or (pzTail = pCursor) then Exit;
