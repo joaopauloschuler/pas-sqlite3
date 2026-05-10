@@ -24831,8 +24831,7 @@ begin
             and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
             and (pItem^.pSTab <> nil)
             and (pItem^.u4.pSubq <> nil)
-            and (pItem^.u4.pSubq^.pSelect <> nil)
-            and (p^.pWhere = nil) then
+            and (pItem^.u4.pSubq^.pSelect <> nil) then
       isSubqueryAgg := True
     else begin
       for jAgg := 0 to p^.pSrc^.nSrc - 1 do
@@ -25072,7 +25071,16 @@ begin
             addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Yield,
                                 pCoroItem^.u4.pSubq^.regReturn, addrEnd);
             r2 := sqlite3VdbeCurrentAddr(v);
-            updateAccumulatorSimple(pParse, pAggI2, regAcc);
+            if p^.pWhere <> nil then
+            begin
+              addrSkip := sqlite3VdbeMakeLabel(pParse);
+              sqlite3ExprIfFalse(pParse, p^.pWhere, addrSkip,
+                                 SQLITE_JUMPIFNULL);
+              updateAccumulatorSimple(pParse, pAggI2, regAcc);
+              sqlite3VdbeResolveLabel(v, addrSkip);
+            end
+            else
+              updateAccumulatorSimple(pParse, pAggI2, regAcc);
             translateColumnToCopy(pParse, r2, iCsr,
                                   pCoroItem^.u4.pSubq^.regResult, 0);
             if regAcc <> 0 then
@@ -25093,7 +25101,16 @@ begin
             end;
             addrEnd := sqlite3VdbeMakeLabel(pParse);
             addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrEnd);
-            updateAccumulatorSimple(pParse, pAggI2, regAcc);
+            if p^.pWhere <> nil then
+            begin
+              addrSkip := sqlite3VdbeMakeLabel(pParse);
+              sqlite3ExprIfFalse(pParse, p^.pWhere, addrSkip,
+                                 SQLITE_JUMPIFNULL);
+              updateAccumulatorSimple(pParse, pAggI2, regAcc);
+              sqlite3VdbeResolveLabel(v, addrSkip);
+            end
+            else
+              updateAccumulatorSimple(pParse, pAggI2, regAcc);
             if regAcc <> 0 then
               sqlite3VdbeAddOp2(v, OP_Integer, 1, regAcc);
             sqlite3VdbeAddOp2(v, OP_Next, iCsr, addrTopOfLoop + 1);

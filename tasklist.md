@@ -2776,10 +2776,27 @@ existing dispatcher.
      `sum(column1)`, `max/min(column1)` and combined aggregates over
      1- and 2-deep `SELECT * FROM (...)` wrappers around `(VALUES…)`.
      Regression: 68 binaries pass / 1 known fail (TestPagerReadOnly).
-     Follow-up unrelated divergence: the outer agg arm bails when
-     `p^.pWhere <> nil` (24833), so `count(*) FROM (SELECT * FROM
-     (VALUES…)) WHERE 1` falls into a 3-op stub returning empty.
-     Pre-existing — not introduced by this fix.
+
+- [X] **10.1.bug.92** Fixed 2026-05-10.  `count(*) FROM (VALUES…) WHERE
+     <pred>` (and the nested `SELECT * FROM (VALUES…)` wrapper variant)
+     returned an empty result instead of the row count.  Root cause:
+     the isSubqueryAgg detection at passqlite3codegen.pas:24835 was
+     gated on `p^.pWhere = nil`, so any outer WHERE on the aggregate
+     fell through to the 3-op fallback stub.  Fix: drop the `p^.pWhere
+     = nil` gate; both sub-arms (viaCoroutine drain + OpenEphemeral
+     recursive scan) now wrap `updateAccumulatorSimple` with an
+     `sqlite3ExprIfFalse(p^.pWhere, addrSkip, JUMPIFNULL)` guard,
+     mirroring the pattern already used in the isVtabAgg arm.  In the
+     viaCoroutine arm the WHERE eval sits between r2 capture and
+     translateColumnToCopy so column refs against iCsr in p^.pWhere
+     are also translated to OP_Copy from the inner coroutine's
+     regResult.  Verified byte-identical to oracle for
+     `count(*) WHERE 1`, `count(*) WHERE 0`, `count(*) WHERE column1>1`,
+     `sum(column1) WHERE column1>=2` over both
+     `(VALUES…)` and `(SELECT * FROM (VALUES…))` sources.
+     Regression: 68 binaries pass / 1 known fail (TestPagerReadOnly);
+     TestExplainParity 1026/1026; DiagOps / DiagFeatureProbe /
+     DiagAggWhere all clean.
 
 - [X] **10.1.bug.89** Fixed 2026-05-10.  `datetime(N, 'unixepoch')` (and
      `date()` / `time()` of the same form) returned an empty result for
