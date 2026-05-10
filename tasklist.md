@@ -2684,6 +2684,30 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.86** Fixed 2026-05-10.  CLI shell rendered raw control
+     bytes (e.g. result of `SELECT x'0102';`) as literal binary instead of
+     the upstream `^X` symbol form.  Reproducer:
+     `echo "SELECT x'0102';" | bin/passqlite3 :memory: | xxd` printed
+     `0102 0a`; upstream prints `5e41 5e42 0a` (`^A^B\n`).  Root cause:
+     passqlite3shell.pas had no analogue of qrf.c's `qrfEscape()` (the
+     `eEsc=QRF_ESC_Ascii` default that ships with 3.53.0), so every
+     plain-text mode (List / Tabs / Ascii / Line / Column / Box / Table /
+     Markdown / Csv) emitted the column text verbatim.  Fix: ported
+     `qrfEscape()` 1:1 as the unit-level helper `qrfEscapeCtrl` (mirrors
+     qrf.c:735..798 — escape `c<=0x1f` to `^` + `Chr(c+0x40)`, exempt
+     `\t`, `\n`, and `\r` only when followed by `\n`).  Wired into
+     emitRowOne (Line / List / Tabs / Ascii arms) and colCellText (which
+     feeds Column / Box / Table / Markdown), and folded into
+     outputCsvField so the CSV "needs-quote" check now also fires on
+     control bytes (matches qrfCsvQuote rows 0..31 / 0x7f+).  Verified
+     byte-identical to the 3.53.0 oracle for `SELECT x'0102';` across
+     `.mode list/csv/line/tabs/markdown` and (modulo the pre-existing
+     glyph + trailing-pad divergences) `.mode column/box`.  Tab- and
+     newline-bearing text strings still pass through unmodified.
+     Regression: 67 binaries pass / 2 known fail (TestPagerReadOnly,
+     TestWhereExpr — pre-existing); DiagFeatureProbe / DiagOps / DiagDml
+     / DiagFunctions / DiagPragma all 0 divergences.
+
 - [X] **10.1.bug.85** Fixed 2026-05-09.  Bare `min()` / `max()` calls
      (zero arguments) silently passed the resolver and produced an empty
      result row instead of erroring with `wrong number of arguments to

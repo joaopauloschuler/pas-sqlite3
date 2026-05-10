@@ -972,6 +972,38 @@ begin
   Result := False;
 end;
 
+function qrfEscapeCtrl(const z: AnsiString): AnsiString;
+{ Mirror qrf.c qrfEscape() with eEsc=QRF_ESC_Ascii: replace control bytes
+  c<=0x1f with ^X (where X=c+0x40), except \t, \n, and \r when followed by
+  \n (the latter to keep CRLF runs intact).  Pass-through otherwise. }
+var
+  i, n: SizeInt;
+  c: Byte;
+  needs: Boolean;
+  sb: AnsiString;
+begin
+  needs := False;
+  n := Length(z);
+  for i := 1 to n do begin
+    c := Byte(z[i]);
+    if (c <= $1f) and (c <> 9) and (c <> 10)
+       and not ((c = 13) and (i < n) and (z[i+1] = #10))
+    then begin needs := True; Break; end;
+  end;
+  if not needs then begin Result := z; Exit; end;
+  sb := '';
+  for i := 1 to n do begin
+    c := Byte(z[i]);
+    if (c <= $1f) and (c <> 9) and (c <> 10)
+       and not ((c = 13) and (i < n) and (z[i+1] = #10))
+    then begin
+      sb := sb + '^' + Chr(c + $40);
+    end else
+      sb := sb + z[i];
+  end;
+  Result := sb;
+end;
+
 procedure outputSqlIdent(const z: AnsiString);
 var i: SizeInt;
 begin
@@ -984,16 +1016,21 @@ begin
 end;
 
 procedure outputCsvField(const z: AnsiString; const sep: AnsiString);
-{ output_csv (shell.c.in pre-QRF era).  Quote with double-quotes if the
-  field contains the column separator, a quote, CR, or LF.  Embedded
-  quotes are doubled. }
+{ Mirror QRF_TEXT_Csv: quote with double-quotes if the field contains any
+  byte from qrfCsvQuote (control bytes, ", and >=0x7f), embeds the column
+  separator, etc.  Embedded quotes are doubled.  Then qrfEscape applies
+  ^X for control bytes (except \t/\n/\r\n).  We fold the two passes:
+  decide quote on raw bytes, then iterate with the same escape rules. }
 var
   needQuote: Boolean;
-  i: SizeInt;
+  i, n: SizeInt;
+  c: Byte;
 begin
   needQuote := False;
-  for i := 1 to Length(z) do begin
-    if (z[i] = '"') or (z[i] = #10) or (z[i] = #13) then begin
+  n := Length(z);
+  for i := 1 to n do begin
+    c := Byte(z[i]);
+    if (c <= $1f) or (c = Byte('"')) or (c >= $7f) then begin
       needQuote := True;
       Break;
     end;
@@ -1001,12 +1038,20 @@ begin
   if not needQuote and (Length(sep) > 0) and (Pos(sep, z) > 0) then
     needQuote := True;
   if not needQuote then begin
-    Write(z);
+    Write(qrfEscapeCtrl(z));
     Exit;
   end;
   Write('"');
-  for i := 1 to Length(z) do begin
-    if z[i] = '"' then Write('""') else Write(z[i]);
+  for i := 1 to n do begin
+    c := Byte(z[i]);
+    if (c <= $1f) and (c <> 9) and (c <> 10)
+       and not ((c = 13) and (i < n) and (z[i+1] = #10))
+    then begin
+      Write('^'); Write(Chr(c + $40));
+    end else if z[i] = '"' then
+      Write('""')
+    else
+      Write(z[i]);
   end;
   Write('"');
 end;
@@ -1295,7 +1340,7 @@ begin
           z := colTextStr(pStmt, i, isNull);
           Write(colNameStr(pStmt, i));
           Write(': ');
-          if isNull then Write(rs.zNull) else Write(z);
+          if isNull then Write(rs.zNull) else Write(qrfEscapeCtrl(z));
           WriteLn;
         end;
       end;
@@ -1305,7 +1350,7 @@ begin
         for i := 0 to rs.nCol - 1 do begin
           if i > 0 then Write(rs.zColSep);
           z := colTextStr(pStmt, i, isNull);
-          if isNull then Write(rs.zNull) else Write(z);
+          if isNull then Write(rs.zNull) else Write(qrfEscapeCtrl(z));
         end;
         Write(rs.zRowSep);
       end;
@@ -1521,7 +1566,7 @@ var
   z: AnsiString;
 begin
   z := colTextStr(pStmt, i, isNull);
-  if isNull then Result := zNull else Result := z;
+  if isNull then Result := zNull else Result := qrfEscapeCtrl(z);
 end;
 
 procedure emitColumnar(var rs: TRenderState; pStmt: PVdbe; firstRow: AnsiString);
