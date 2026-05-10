@@ -2525,8 +2525,9 @@ begin
       i := i + json5Whitespace(zJson + i);
       if zJson[i] <> #0 then
       begin
-        { TODO 6.8.h: sqlite3_result_error(pCtx, 'malformed JSON', -1). }
-        if pCtx <> nil then ;
+        if pCtx <> nil then
+          sqlite3_result_error(Psqlite3_context(pCtx),
+            PAnsiChar('malformed JSON'), -1);
         jsonParseReset(pParse);
         Result := 1;
         Exit;
@@ -2536,8 +2537,14 @@ begin
   end;
   if i <= 0 then
   begin
-    { TODO 6.8.h: surface oom / 'malformed JSON' on pCtx. }
-    if pCtx <> nil then ;
+    if pCtx <> nil then
+    begin
+      if pParse^.oom <> 0 then
+        sqlite3_result_error_nomem(Psqlite3_context(pCtx))
+      else
+        sqlite3_result_error(Psqlite3_context(pCtx),
+          PAnsiChar('malformed JSON'), -1);
+    end;
     jsonParseReset(pParse);
     Result := 1;
     Exit;
@@ -3528,7 +3535,11 @@ rebuild_from_cache:
   p^.nJson := sqlite3_value_bytes(Psqlite3_value(pArg));
   if p^.nJson = 0 then goto json_pfa_malformed;
   if p^.zJson = nil then goto json_pfa_oom;
-  if jsonConvertTextToBlob(p, pCtx) <> 0 then
+  if (flgs and JSON_KEEPERROR) <> 0 then
+    rc := jsonConvertTextToBlob(p, nil)
+  else
+    rc := jsonConvertTextToBlob(p, pCtx);
+  if rc <> 0 then
   begin
     if (flgs and JSON_KEEPERROR) <> 0 then
     begin
@@ -3576,7 +3587,8 @@ json_pfa_malformed:
   else
   begin
     jsonParseFree(p);
-    { sqlite3_result_error("malformed JSON",-1) deferred to 6.8.h. }
+    sqlite3_result_error(Psqlite3_context(pCtx),
+      PAnsiChar('malformed JSON'), -1);
     Result := nil;
     Exit;
   end;
@@ -3584,7 +3596,7 @@ json_pfa_malformed:
 json_pfa_oom:
   jsonParseFree(pCache);
   jsonParseFree(p);
-  { sqlite3_result_error_nomem(ctx) deferred to 6.8.h. }
+  sqlite3_result_error_nomem(Psqlite3_context(pCtx));
   Result := nil;
 end;
 

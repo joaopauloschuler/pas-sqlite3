@@ -2728,6 +2728,31 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.126** Fixed 2026-05-10.  JSON-function malformed-input
+     errors were silently swallowed: `SELECT json_array_length('not json')`,
+     `SELECT json('bad')`, `SELECT json_type('xx')`, etc. returned NULL /
+     no row instead of upstream's `Runtime error: malformed JSON`.  Root
+     cause: three TODO-deferred error sinks in `passqlite3json.pas` —
+     `jsonConvertTextToBlob` (port of json.c:2055..2093) and the
+     `json_pfa_malformed` / `json_pfa_oom` labels of `jsonParseFuncArg`
+     (json.c:3658..3768) had been stubbed pending the 6.8.h pass and
+     never called `sqlite3_result_error` / `sqlite3_result_error_nomem`
+     on the supplied context.  Fix: emit the same error strings as
+     upstream — `jsonConvertTextToBlob` now raises `'malformed JSON'`
+     when residual non-whitespace remains after the JSONB blob, and
+     emits nomem-vs-malformed based on `pParse^.oom` on the i<=0 arm;
+     `jsonParseFuncArg` raises `malformed JSON` on the malformed label
+     and `result_error_nomem` on the oom label, both gated on
+     KEEPERROR like C (json.c:3754..3766).  Also matched C's
+     `jsonConvertTextToBlob(p, KEEPERROR ? 0 : ctx)` call-site so the
+     KEEPERROR caller arms (e.g. `jsonValidFunc`,
+     `jsonErrorFunc`) keep getting NULL/0 results without setting an
+     error on ctx.  Verified: `json_array_length('not json')`,
+     `json_type('xx')`, `json_extract('bad','$.x')`, `json('xx')` now
+     raise `Runtime error: malformed JSON` byte-for-byte with the C
+     oracle.  TestExplainParity 1026/1026; full regression 69/69;
+     4965/4965 assertions clean.
+
 - [X] **10.1.bug.124** Fixed 2026-05-10.  CLI shell `near line N` error
      prefix anchored at the comment line preceding a failing SQL
      statement (off-by-one when comments interleaved with SQL).
