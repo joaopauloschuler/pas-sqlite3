@@ -8273,7 +8273,20 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           end;
         end;
       end;
-      { Unresolved TK_DOT (table not in current FROM) — leave as-is. }
+      { Unresolved TK_DOT — mirror resolve.c lookupName cnt==0 tail:
+        emit "no such column: zTab.zCol" and stamp the offset so the
+        CLI caret marker can anchor under the qualifier. }
+      if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID)
+         and (pE^.pRight <> nil) and (pE^.pRight^.op = TK_ID)
+         and (pE^.pLeft^.u.zToken <> nil)
+         and (pE^.pRight^.u.zToken <> nil) then
+      begin
+        sqlite3ErrorMsg(pParse,
+          PAnsiChar('no such column: '
+                    + AnsiString(pE^.pLeft^.u.zToken) + '.'
+                    + AnsiString(pE^.pRight^.u.zToken)));
+        sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+      end;
       Exit;
     end;
     if (pE^.op = TK_ID) and (p^.pSrc <> nil) then

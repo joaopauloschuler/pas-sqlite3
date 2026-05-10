@@ -2695,34 +2695,28 @@ existing dispatcher.
      TestExplainParity 1026/1026; regression 67 binaries pass / 2 known
      fail; DiagFeatureProbe / DiagOps / DiagFunctions 0 divergences.
 
-- [ ] **10.1.bug.83** Resolver silently accepts unmatched `TK_DOT` column
-     refs whose qualifier table is in FROM but the column is not.
-     Reproducer: `CREATE TABLE t(x); SELECT t.zzz FROM t;` — Pascal
-     returns SQLITE_OK with empty result; upstream raises
-     `no such column: t.zzz`.  Root cause: codegen.pas ResolveExpr
-     TK_DOT arm (around line 8276) "leave as-is" comment — the for-loop
-     finds matching tables but no matching column, then exits without
-     raising.  Fix: mirror resolve.c lookupName tail (cnt==0 → emit
-     "no such column: zDb.zTab.zCol" via sqlite3ErrorMsg + record
-     offset) when the loop completes without binding.
+- [X] **10.1.bug.83** Fixed 2026-05-09.  Resolver silently accepted
+     unmatched `TK_DOT` column refs (`SELECT t.zzz FROM t;` and
+     `SELECT u.zzz FROM t;` both returned SQLITE_OK with empty result).
+     Fix: codegen.pas ResolveExpr TK_DOT tail now mirrors resolve.c
+     lookupName cnt==0: emits `no such column: zTab.zCol` via
+     sqlite3ErrorMsg and stamps the offset via
+     sqlite3RecordErrorOffsetOfExpr so the CLI caret anchors under
+     the qualifier.  Verified byte-identical to oracle.
 
-- [ ] **10.1.bug.84** `shellErrorContext` displays the entire input
-     (including leading whitespace) and computes `pad` from
-     `errByteOffset` directly, producing a caret one column too far
-     right relative to the displayed line when the SQL has leading
-     whitespace.  Reproducer: `   SELECT zzz;` — Pascal shows
-     "     SELECT zzz;\n            ^---"; upstream shows
-     "  SELECT zzz;\n         ^---" (whitespace stripped).  Likely
-     fix: shell.c.in:2603..2635 walks `pBase` past leading whitespace
-     before measuring; replicate in `shellErrorContext`.
+- [X] **10.1.bug.84** Resolved 2026-05-09: cannot reproduce against
+     the 3.53.0 oracle.  Both Pascal and upstream emit the leading
+     whitespace verbatim and pad the caret to the same column
+     (verified `   SELECT zzz;` byte-identical).  The original report
+     compared against a pre-3.53 build that still stripped leading
+     whitespace; current upstream does not.
 
-- [ ] **10.1.bug.82** Tokenizer error message omits the offending token
-     text.  Reproducer: `SELECT 1 FROM 2x;` errors with
-     `unrecognized token` in the Pascal port but
-     `unrecognized token: "2x"` upstream.  Expected to be a small fix
-     in the tokenizer's error-string emission path
-     (passqlite3parser.pas) where the bad-token slice is dropped before
-     reaching `sqlite3ErrorMsg`.
+- [X] **10.1.bug.82** Fixed 2026-05-09.  Tokenizer "unrecognized token"
+     omitted the offending token text.  Fix: passqlite3parser.pas
+     tokenizer error site now composes `unrecognized token: "<n>"`
+     using the bad-token slice and stamps `db^.errByteOffset` so the
+     CLI caret anchors under the bad token.  Verified
+     `SELECT 1 FROM 2x;` byte-identical to oracle.
 
 - [X] **10.1.bug.78** Fixed 2026-05-08.  CLI shell `.mode line` / `.mode
      json` / `.mode tcl` / `.mode html` / `.mode insert <name>` produced

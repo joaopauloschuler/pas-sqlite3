@@ -1281,7 +1281,16 @@ begin
         Inc(zCur, n);
         Continue;
       end else if tokenType <> TK_QNUMBER then begin
-        sqlite3ErrorMsg(pPse, 'unrecognized token');
+        { Mirror tokenize.c: include the offending token text and stamp
+          db^.errByteOffset so the CLI caret marker (10.1.bug.80) anchors
+          under the bad token. }
+        sqlite3ErrorMsg(pPse,
+          PAnsiChar('unrecognized token: "'
+                    + Copy(AnsiString(PAnsiChar(zCur)), 1, n)
+                    + '"'));
+        if db <> nil then
+          db^.errByteOffset :=
+            i32(PtrUInt(zCur) - PtrUInt(pPse^.zTail));
         Break;
       end;
     end;
