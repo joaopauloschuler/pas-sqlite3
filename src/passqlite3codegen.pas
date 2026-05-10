@@ -42582,6 +42582,7 @@ var
   funcMask: u32;
   pModA:    passqlite3vtab.PVtabModule;
   bShowInternal: i32;
+  pPragmaId: PToken;
 const
   azFuncEnc: array[0..3] of PAnsiChar = (nil, 'utf8', 'utf16le', 'utf16be');
   azIdxOrigin: array[0..2] of PAnsiChar = ('c', 'u', 'pk');
@@ -42612,11 +42613,18 @@ begin
   sqlite3VdbeRunOnlyOnce(v);
   pParse^.nMem := 2;
 
-  { Schema prefix not yet honoured — ignore pId2 and use the main db.
-    Sufficient for the bare `PRAGMA name` shape covered by the probes. }
-  iDb := 0;
-
-  SetString(zName, pId1^.z, pId1^.n);
+  { Schema prefix.  Mirror pragma.c:450 sqlite3TwoPartName: when pId2 is
+    non-empty the pragma name is in pId2 and pId1 is the schema; otherwise
+    pId1 carries the pragma name. }
+  pPragmaId := pId1;
+  if (pId2 <> nil) and (pId2^.n > 0) then
+  begin
+    iDb := sqlite3TwoPartName(pParse, pId1, pId2, @pPragmaId);
+    if iDb < 0 then Exit;
+  end
+  else
+    iDb := 0;
+  SetString(zName, pPragmaId^.z, pPragmaId^.n);
   if pValue <> nil then SetString(zRight, pValue^.z, pValue^.n) else zRight := '';
   { Dequote pValue text — mirror C's sqlite3NameFromToken (pragma.c:466).
     `PRAGMA table_info("t")` and `PRAGMA table_info='t'` both arrive with

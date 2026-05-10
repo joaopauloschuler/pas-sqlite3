@@ -2108,14 +2108,21 @@ begin
       WriteLn(glyphVB);
     end else begin
       { MODE_Column data row.  Upstream qrfRTrim trims trailing
-        whitespace on every Column row, so don't pad the rightmost
-        cell. }
+        whitespace on every Column row.  Build the full row into sb,
+        then RTrim spaces before emit so all-NULL rows collapse to an
+        empty line and trailing-NULL cells don't leak inter-column
+        padding (qrf.c:1247 qrfRTrim + 2247). }
+      sb := '';
       for c := 0 to nCol - 1 do begin
-        if c > 0 then Write('  ');
-        if c = nCol - 1 then Write(matrix[rc, c])
-        else padCell(matrix[rc, c], widths[c]);
+        if c > 0 then sb := sb + '  ';
+        sb := sb + matrix[rc, c];
+        w := widths[c] - utf8DispWidth(matrix[rc, c]);
+        if (c < nCol - 1) and (w > 0) then
+          sb := sb + StringOfChar(' ', w);
       end;
-      WriteLn;
+      while (Length(sb) > 0) and (sb[Length(sb)] = ' ') do
+        SetLength(sb, Length(sb) - 1);
+      WriteLn(sb);
     end;
   end;
 
@@ -3382,23 +3389,97 @@ begin
 end;
 
 procedure cmdIndexes(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
-{ shell.c.in ~10989..11020: list all indexes (or just those of the
-  named table) ordered by name. }
-var sql, tab: AnsiString;
+{ shell.c.in:9878..9970 — list indexes, filtering system-generated
+  sqlite_autoindex_* by default; --all / -a includes them.  This Pascal
+  cut also accepts a table-name argument for backwards compatibility
+  (the upstream form treats the trailing arg as a substring index-name
+  pattern, but most call-sites pass a table name). }
+var
+  sql, tab: AnsiString;
+  i: SizeInt;
+  allFlag: Boolean;
 begin
-  if nArg >= 1 then begin
-    tab := StringReplace(args[0], '''', '''''', [rfReplaceAll]);
-    sql := 'SELECT name FROM sqlite_schema WHERE type=''index'' AND tbl_name=''' +
-           tab + ''' ORDER BY 1';
-  end else
-    sql := 'SELECT name FROM sqlite_schema WHERE type=''index'' ORDER BY 1';
+  allFlag := False;
+  tab := '';
+  for i := 0 to nArg - 1 do begin
+    if (args[i] = '--all') or (args[i] = '-a') or (args[i] = '-all') then
+      allFlag := True
+    else if (Length(args[i]) > 0) and (args[i][1] = '-') then begin
+      shellEPutZ(Format('Unknown option: "%s"'#10, [args[i]]));
+      Exit;
+    end else if tab = '' then
+      tab := args[i]
+    else begin
+      shellEPutZ('Usage: .indexes ?-a|--all? ?TABLE?'#10);
+      Exit;
+    end;
+  end;
+  sql := 'SELECT name FROM sqlite_schema WHERE type=''index''';
+  if tab <> '' then
+    sql := sql + ' AND tbl_name='''
+              + StringReplace(tab, '''', '''''', [rfReplaceAll]) + '''';
+  if not allFlag then
+    sql := sql + ' AND name NOT LIKE ''sqlite__%'' ESCAPE ''_''';
+  sql := sql + ' ORDER BY 1';
   runStatementVerbose(p, sql);
 end;
 
 procedure cmdDatabases(p: PShellState);
-{ shell.c.in ~10130: SELECT * FROM pragma_database_list. }
+{ shell.c.in:9242..9276 — list attached databases via PRAGMA database_list,
+  then for each emit `<name>: <file> r/o|r/w[ read-txn|write-txn]`.
+  Mirrors upstream byte-for-byte. }
+var
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc, eTxn, bRdonly: i32;
+  zSchema, zFile, zTxn: AnsiString;
+  zSchemaP, zFileP: PAnsiChar;
+  names: array of AnsiString;
+  files: array of AnsiString;
+  i, n: i32;
 begin
-  runStatementVerbose(p, 'SELECT name, file FROM pragma_database_list ORDER BY seq');
+  openDb(p, 0);
+  if p^.db = nil then Exit;
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(p^.db, 'PRAGMA database_list', -1, @pStmt, @pzTail);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    shellEPutZ(AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
+    Exit;
+  end;
+  n := 0;
+  SetLength(names, 8);
+  SetLength(files, 8);
+  while sqlite3_step(pStmt) = SQLITE_ROW do begin
+    zSchemaP := PAnsiChar(sqlite3_column_text(pStmt, 1));
+    zFileP   := PAnsiChar(sqlite3_column_text(pStmt, 2));
+    if (zSchemaP = nil) or (zFileP = nil) then Continue;
+    if n >= Length(names) then begin
+      SetLength(names, Length(names) * 2);
+      SetLength(files, Length(files) * 2);
+    end;
+    names[n] := AnsiString(zSchemaP);
+    files[n] := AnsiString(zFileP);
+    Inc(n);
+  end;
+  sqlite3_finalize(pStmt);
+  for i := 0 to n - 1 do begin
+    zSchema := names[i];
+    zFile   := files[i];
+    eTxn    := sqlite3_txn_state(p^.db, PAnsiChar(zSchema));
+    bRdonly := sqlite3_db_readonly(p^.db, PAnsiChar(zSchema));
+    case eTxn of
+      0: zTxn := '';                   { SQLITE_TXN_NONE }
+      1: zTxn := ' read-txn';          { SQLITE_TXN_READ }
+    else
+      zTxn := ' write-txn';            { SQLITE_TXN_WRITE }
+    end;
+    if Length(zFile) = 0 then zFile := '""';
+    if bRdonly <> 0 then
+      WriteLn(zSchema, ': ', zFile, ' r/o', zTxn)
+    else
+      WriteLn(zSchema, ': ', zFile, ' r/w', zTxn);
+  end;
 end;
 
 function shellFmtIsSpace(c: AnsiChar): Boolean; inline;
@@ -3688,14 +3769,18 @@ begin
     zDiv := ' UNION ALL ';
     zDb  := AnsiString(zDbName);
     if sqlite3_stricmp(zDbName, 'main') = 0 then
-      sql := sql + 'SELECT sql, type, tbl_name, name, rowid, '
+      sql := sql + 'SELECT shell_add_schema(sql,NULL,name) AS sql,'
+                 + ' type, tbl_name, name, rowid, '
                  + IntToStr(iSchema) + ' AS snum, '
                  + '''' + StringReplace(zDb, '''', '''''', [rfReplaceAll])
                  + ''' AS sname'
                  + ' FROM "' + StringReplace(zDb, '"', '""', [rfReplaceAll])
                  + '".sqlite_schema'
     else
-      sql := sql + 'SELECT sql, type, tbl_name, name, rowid, '
+      sql := sql + 'SELECT shell_add_schema(sql,'
+                 + '''' + StringReplace(zDb, '''', '''''', [rfReplaceAll])
+                 + ''',name) AS sql,'
+                 + ' type, tbl_name, name, rowid, '
                  + IntToStr(iSchema) + ' AS snum, '
                  + '''' + StringReplace(zDb, '''', '''''', [rfReplaceAll])
                  + ''' AS sname'
@@ -5923,19 +6008,22 @@ procedure cmdFullschema(p: PShellState; const args: array of AnsiString;
                         nArg: SizeInt);
 const
   zSchemaQ =
-    'SELECT sql FROM sqlite_schema ' +
-    'WHERE name NOT LIKE ''sqlite\_stat%'' ESCAPE ''\'' ' +
-    'ORDER BY tbl_name, type DESC, name';
+    'SELECT sql FROM (' +
+    '  SELECT sql, type, tbl_name, name, rowid x FROM sqlite_schema' +
+    '  UNION ALL' +
+    '  SELECT sql, type, tbl_name, name, rowid FROM sqlite_temp_schema)' +
+    ' WHERE type<>''meta'' AND sql NOTNULL' +
+    '   AND name NOT LIKE ''sqlite\_%'' ESCAPE ''\''' +
+    ' ORDER BY x';
   zStat1Q  =
-    'SELECT ''ANALYZE sqlite_schema'' || char(10) || ' +
-    '''INSERT INTO "sqlite_stat1" VALUES('' || quote(tbl) || '','' || ' +
-    'quote(idx) || '','' || quote(stat) || '');'' ' +
+    'SELECT ''INSERT INTO "sqlite_stat1" VALUES('' || quote(tbl) || '','' || ' +
+    'quote(idx) || '','' || quote(stat) || '')'' ' +
     'FROM sqlite_stat1';
   zStat4Q  =
     'SELECT ''INSERT INTO "sqlite_stat4" VALUES('' || ' +
     'quote(tbl) || '','' || quote(idx) || '','' || ' +
     'quote(neq) || '','' || quote(nlt) || '','' || ' +
-    'quote(ndlt) || '','' || quote(sample) || '');'' ' +
+    'quote(ndlt) || '','' || quote(sample) || '')'' ' +
     'FROM sqlite_stat4';
 var
   pStmt: PVdbe;
@@ -5960,6 +6048,7 @@ begin
   qList[0] := zSchemaQ;
   qList[1] := zStat1Q;
   qList[2] := zStat4Q;
+  haveStat := False;
   for i := 0 to High(qList) do begin
     if i > 0 then begin
       { Skip stat queries if their tables don't exist. }
@@ -5968,10 +6057,18 @@ begin
         PAnsiChar('SELECT 1 FROM sqlite_schema WHERE name=' +
           QuotedStr(IfThen(i = 1, 'sqlite_stat1', 'sqlite_stat4'))),
         -1, @pStmt, @pzTail);
-      haveStat := (rc = SQLITE_OK) and (pStmt <> nil)
-                  and (sqlite3_step(pStmt) = SQLITE_ROW);
-      if pStmt <> nil then sqlite3_finalize(pStmt);
-      if not haveStat then Continue;
+      if (rc = SQLITE_OK) and (pStmt <> nil)
+         and (sqlite3_step(pStmt) = SQLITE_ROW) then
+      begin
+        if not haveStat then begin
+          WriteLn('ANALYZE sqlite_schema;');
+          haveStat := True;
+        end;
+      end else begin
+        if pStmt <> nil then sqlite3_finalize(pStmt);
+        Continue;
+      end;
+      sqlite3_finalize(pStmt);
     end;
     q := qList[i];
     pStmt := nil;
@@ -5987,6 +6084,8 @@ begin
     end;
     sqlite3_finalize(pStmt);
   end;
+  if not haveStat then
+    WriteLn('/* No STAT tables available */');
 end;
 
 { ----------------------------------------------------------------------

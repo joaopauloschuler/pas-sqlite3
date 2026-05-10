@@ -3987,6 +3987,45 @@ existing dispatcher.
      DiagDropTable / DiagCovering / DiagIndexing / DiagPredicates /
      DiagOrderLimitTopN / DiagAnalyze all 0 divergences.
 
+- [X] **10.1.bug.88** Fixed 2026-05-10.  Five CLI/codegen divergences vs
+     the 3.53.0 oracle, all closed in one sweep:
+     (a) `.mode column` rendered trailing whitespace (all-NULL row →
+     N spaces of inter-column padding; NULL last-cell → trailing pad
+     leak).  Upstream qrf.c:1247 qrfRTrim trims trailing spaces on every
+     Column row before emit.  Fix in passqlite3shell.pas:emitColumnar
+     builds the row into an AnsiString accumulator, then RTrims trailing
+     spaces before WriteLn (mirrors qrf.c:2247).
+     (b) `PRAGMA <schema>.<name>` (e.g. `PRAGMA "main".table_info=v`)
+     returned no rows.  Root cause: `sqlite3Pragma`
+     (passqlite3codegen.pas:42546) ignored pId2 entirely and always
+     interpreted pId1 as the pragma name.  Fix: when pId2 is non-empty,
+     resolve `pId1` as schema via `sqlite3TwoPartName` and use pId2 as
+     the pragma name (mirrors pragma.c:450).
+     (c) `.schema` on VIEW omitted the `/* v(col1,col2,...) */`
+     column-list comment that upstream appends.  Fix: use
+     `shell_add_schema(sql, NULL/zDb, name)` in the composed query
+     (mirrors shell.c.in:10651..10656); `shellAddSchemaUdf` already
+     ported under 10.1.100 now drives the suffix correctly because
+     fix (b) above unblocked its underlying `PRAGMA "<schema>".table_info`
+     call inside `shellFakeSchemaText`.
+     (d) `.databases` output format was `name|file` (pipe).  Upstream
+     prints `<name>: <file> r/w[ read-txn|write-txn]` with the lock /
+     txn state.  Fix: rewrote `cmdDatabases` to mirror
+     shell.c.in:9242..9276; uses `sqlite3_txn_state` /
+     `sqlite3_db_readonly` per attached database.
+     (e) `.indexes` listed `sqlite_autoindex_*` (auto-PK uniques).
+     Upstream filters them by default with
+     `name NOT LIKE 'sqlite__%' ESCAPE '_'`; `--all` / `-a` re-enables.
+     Fix: `cmdIndexes` parses the flag and adds the filter clause.
+     Bonus: `.fullschema` now emits the `/* No STAT tables available */`
+     banner when sqlite_stat1/4 are absent, and excludes sqlite_*
+     internal tables from the schema dump (mirrors shell.c.in:9702..9737).
+     Verified: all six surfaces byte-identical to the 3.53.0 oracle.
+     `.tables` width still drifts by ~3 chars (split-mode QRF
+     auto-screen-width formula not yet ported); deferred to a future
+     QRF chunk.  Build green: 68/69; pre-existing TestPagerReadOnly
+     unchanged.  All Diag* probes 0 divergences.
+
 - [ ] **10.1.bug.39** `.recover` on a clean (uncorrupted) db reports
      `database disk image is malformed (11)` after the
      `BEGIN; PRAGMA writable_schema = on; PRAGMA foreign_keys = off;`
