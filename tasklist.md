@@ -4188,6 +4188,32 @@ existing dispatcher.
      DiagFunctions / DiagMisc / DiagWindow / DiagFeatureProbe /
      DiagMultiValues / DiagIndexing / DiagPragma all 0 divergences.
 
+- [X] **10.1.bug.98** Fixed 2026-05-10.  `DROP TABLE` on a parent that
+     had previously been referenced by an FK from a (now-dropped) child
+     raised a spurious `Parse error: no such table: main.<child>` when
+     `PRAGMA foreign_keys=ON`.  Reproducer:
+     `CREATE TABLE p(id INTEGER PRIMARY KEY);
+      CREATE TABLE q(id INTEGER PRIMARY KEY,
+                     p_id INT REFERENCES p(id) ON DELETE CASCADE);
+      PRAGMA foreign_keys=ON;
+      INSERT INTO p VALUES(1); INSERT INTO q VALUES(10,1);
+      DROP TABLE q; DROP TABLE p;` failed at the second DROP.  Root
+     cause: `sqlite3SrcListDelete` (codegen.pas:4058) omitted the
+     `sqlite3DeleteTable(db, pItem->pSTab)` call from build.c:4994.  As
+     a result, every `INSERT/UPDATE/DELETE INTO q` left q's `nTabRef`
+     elevated by one (the SrcListLookup bump was never released).  When
+     the eventual `DROP TABLE q` ran `OP_DropTable`, q's `nTabRef`
+     dropped to 1 — not 0 — so `sqlite3DeleteTable`'s body short-
+     circuited before reaching `sqlite3FkDelete`, and q's FKey stayed
+     linked in p's `fkeyHash`.  The next `DROP TABLE p` walked that
+     dangling FKey through `sqlite3FkActions` and tried to resolve the
+     freed child table by name.  Fix: add the missing `sqlite3DeleteTable`
+     call in `sqlite3SrcListDelete`, mirroring build.c:4994 verbatim.
+     Verified byte-identical to the 3.53.0 oracle for the original
+     reproducer plus the no-cascade and NULL-fk-value variants.
+     Regression: 69 binaries pass (4963 assertions); TestExplainParity
+     1026/1026.
+
 - [X] **10.1.bug.96** Fixed 2026-05-10.  Foreign-key constraint not
      enforced on INSERT.  Reproducer:
      `PRAGMA foreign_keys=ON; CREATE TABLE p(id INTEGER PRIMARY KEY);

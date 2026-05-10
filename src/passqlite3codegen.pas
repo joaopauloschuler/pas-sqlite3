@@ -4072,6 +4072,12 @@ begin
       sqlite3DbFree(db, pItem^.u1.zIndexedBy)
     else if SrcItemIsTabFunc(pItem^.fg) then
       sqlite3ExprListDelete(db, pItem^.u1.pFuncArg);
+    { build.c:4994 — release the SrcItem's reference to its Table object.
+      Without this, nTabRef on the resolved Table never drops back to its
+      schema baseline, so a later DROP TABLE leaves the Table (and any
+      outgoing FKs in the parent's fkeyHash) leaked, and parent DROP TABLE
+      walks dangling fkeyHash entries (10.1.bug.98). }
+    sqlite3DeleteTable(db, pItem^.pSTab);
     { u3: on/using }
     if (pItem^.fg.fgBits2 and $08) <> 0 then  { isUsing bit }
       sqlite3IdListDelete(db, pItem^.u3.pUsing)
