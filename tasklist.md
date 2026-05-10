@@ -59,6 +59,42 @@ FPC porting traps that recur often enough to call out up-front:
 
 ---
 
+## Known regression-test failures (auto-discovered by `run_regression.sh`)
+
+> These are the binaries that `src/tests/run_regression.sh` currently reports
+> as failing.  They are tracked here — not in the per-phase backlogs — so
+> that the active fail list is greppable in one place and self-updating: each
+> entry carries its current sub-test pass count, which moves as the
+> underlying root cause is chipped away.  Numbering is scoped to the phase
+> that owns the root cause, not to the phase that exposed the failure.
+>
+> When a binary returns to all-green, mark the entry `[X]` and leave it in
+> place as a fixed-bug record (matching the convention used by
+> `10.1.bug.*`).
+
+- [ ] **3.B.regbug.1** `TestPagerReadOnly` — **1 / 10 sub-tests pass**
+     (T1–T9 fail).  `sqlite3PagerOpen` returns `SQLITE_CANTOPEN` (rc=14)
+     for the read-only-fixture cases, so the pager never reaches the
+     read-only-locking assertions the test was written to exercise.  Root
+     cause is in the Phase 3 pager / VFS layer (fixture setup against an
+     existing read-only `.db`), not in Phase 6 codegen — the test was
+     authored to gate Phase 3.B.2a fixture work that has not yet landed.
+     Acceptance: 10 / 10 sub-tests pass with the fixture opened
+     read-only via the same VFS path the C reference uses.
+
+- [ ] **6.regbug.1** `TestWhereExpr` — **83 / 84 sub-tests pass**
+     (T13c is the lone failure).  The WHERE-clause analyzer does not
+     append the virtual `TK_IN` term that upstream synthesises for an
+     OR chain whose arms reference different columns (column-mismatched
+     OR), so the analyzer's expected term count is short by one for
+     that shape.  Root cause sits inside the Phase 6 WHERE-clause
+     analyzer (`exprAnalyzeOrTerm` in passqlite3codegen.pas) — the
+     surrounding 83 sub-tests passing confirms this is an isolated arm,
+     not a structural gap.  Acceptance: 84 / 84 with byte-identical
+     `wherec.c` term-list output for the T13c shape.
+
+---
+
 ## Phase 6 — Code generators (close the EXPLAIN gate)
 
 > **2026-05-06 (a3):** TestExplainParity reports **1026 / 1026 PASS**
