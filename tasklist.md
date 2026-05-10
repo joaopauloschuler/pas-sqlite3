@@ -2648,6 +2648,25 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.85** Fixed 2026-05-09.  Bare `min()` / `max()` calls
+     (zero arguments) silently passed the resolver and produced an empty
+     result row instead of erroring with `wrong number of arguments to
+     function min()`.  Reproducer: `echo "SELECT min();" |
+     bin/passqlite3 :memory:` exited 1 with no output; upstream rejects
+     at prepare time.  Root cause: scalar `min`/`max` were registered
+     with `nArg=-1` (any arity) at passqlite3codegen.pas:46385/46387,
+     so matchQuality scored the variadic scalar even for 0 args.  C's
+     `func.c:3299/3302` registers them with `nArg=-3` so the
+     `nArg<(-2-p->nArg)=1` clamp in matchQuality rejects 0-arg calls;
+     the 1-arg WAGGREGATE entry can't match a 0-arg call either, so
+     the resolver correctly errors.  Fix: change both registrations
+     to `-3`, matching the C source.  Verified: `SELECT min();` /
+     `SELECT max();` now error byte-identically to upstream;
+     `min(1)`/`max(1)` (aggregate path) and `min(1,2,3)`/`max(1,2,3)`
+     (scalar path) still return 1 / 3 unchanged.
+     67 binaries pass / 2 known fail (TestPagerReadOnly, TestWhereExpr —
+     pre-existing).
+
 - [X] **10.1.bug.80** Fixed 2026-05-09.  CLI shell parse-/runtime-error
      output omitted the upstream two-line "code-with-caret" context block
      under each error message.  Reproducer: `echo "SELECT abc;" |

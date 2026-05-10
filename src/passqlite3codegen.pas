@@ -46382,9 +46382,12 @@ begin
     before OP_Function, making MIN_2ARG / MAX_2ARG bytecode byte-identical
     to the C oracle (expr.c:5437..5439).
     pUserData=nil for min; pUserData=Pointer(1) for max. }
-  MakeFD(aBuiltinFuncs[46], -1,
+  { 10.1.bug: nArg=-3 (>=1 arg) matches C func.c:3299/3302; using -1 (any
+    arity) silently accepted bare `min()`/`max()` instead of erroring with
+    "wrong number of arguments to function min()". }
+  MakeFD(aBuiltinFuncs[46], -3,
     FUNC_ENC or SQLITE_FUNC_NEEDCOLL, @minmaxScalarFunc, nil, 'min');
-  MakeFD(aBuiltinFuncs[47], -1,
+  MakeFD(aBuiltinFuncs[47], -3,
     FUNC_ENC or SQLITE_FUNC_NEEDCOLL, @minmaxScalarFunc, nil, 'max');
   aBuiltinFuncs[47].pUserData := Pointer(PtrInt(1));
   { sign(X) — func.c:3427: FUNCTION(sign, 1, 0, 0, signFunc).
