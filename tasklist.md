@@ -2727,6 +2727,26 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.110** Fixed 2026-05-10.  `SELECT current_date`,
+     `current_time`, `current_timestamp` (and `DEFAULT CURRENT_TIMESTAMP`
+     column defaults) reported `no such function: current_*`.  The lexer
+     correctly tagged the keywords as `TK_CTIME_KW` and the grammar's
+     `term ::= CTIME_KW` arm produced the expected `sqlite3ExprFunction(name)`
+     node, but `aDateFuncs[]` in `passqlite3codegen.pas` stopped at
+     `timediff` — the `DFUNCTION` entries from `date.c:1818..1820`
+     (`current_time` / `current_timestamp` / `current_date`, all 0-arg)
+     were never registered, so resolver lookup failed.  Fix: added
+     `ctimeFunc` / `cdateFunc` / `ctimestampFunc` wrappers that delegate
+     to `timeFunc` / `dateFunc` / `datetimeFunc` with `argc=0`, plus a
+     `MakeDFD` helper that mirrors the C `DFUNCTION` macro flags
+     (`SQLITE_FUNC_BUILTIN | SQLITE_FUNC_SLOCHNG | SQLITE_UTF8`, no
+     `SQLITE_FUNC_CONSTANT`).  Verified: bare `SELECT current_*` now
+     prints the same `YYYY-MM-DD` / `HH:MM:SS` / `YYYY-MM-DD HH:MM:SS`
+     trio as the C oracle, and `CREATE TABLE t(a, b TEXT DEFAULT
+     CURRENT_TIMESTAMP); INSERT INTO t(a) VALUES(1)` populates `b` with
+     a 19-char timestamp.  TestExplainParity 1026/1026; full regression
+     69/69, 4963/4963 assertions; DiagDate / DiagFunctions clean.
+
 - [X] **10.1.bug.107** Fixed 2026-05-10.  `CREATE UNIQUE INDEX` on a
      pre-populated column with duplicates silently succeeded, then the
      index would only enforce uniqueness for *new* inserts.  Reproducer:

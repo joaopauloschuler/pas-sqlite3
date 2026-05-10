@@ -49530,8 +49530,29 @@ begin
   sqlite3_result_text(pCtx, buf, -1, SQLITE_TRANSIENT);
 end;
 
+{ current_time / current_date / current_timestamp — date.c:1578..1722.
+  These are SQL functions registered under DFUNCTION (no SQLITE_FUNC_CONSTANT),
+  taking zero arguments and dispatching to time/date/datetime with no input
+  (so currentJD is read).  CTIME_KW grammar arm produces a function-call
+  expression for these tokens — without registration the resolver reports
+  "no such function: current_*". }
+procedure ctimeFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  timeFunc(pCtx, 0, nil);
+end;
+
+procedure cdateFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  dateFunc(pCtx, 0, nil);
+end;
+
+procedure ctimestampFunc(pCtx: Psqlite3_context; argc: i32; argv: PPMem); cdecl;
+begin
+  datetimeFunc(pCtx, 0, nil);
+end;
+
 var
-  aDateFuncs: array[0..6] of TFuncDef;
+  aDateFuncs: array[0..9] of TFuncDef;
 
 procedure InitDateFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; sfunc: TxSFuncProc;
@@ -49540,6 +49561,15 @@ begin
   FillChar(fd, SizeOf(fd), 0);
   fd.nArg      := n;
   fd.funcFlags := SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_CONSTANT;
+  fd.xSFunc    := sfunc;
+  fd.zName     := nm;
+end;
+procedure MakeDFD(var fd: TFuncDef; n: i16; sfunc: TxSFuncProc;
+  nm: PAnsiChar); inline;
+begin
+  FillChar(fd, SizeOf(fd), 0);
+  fd.nArg      := n;
+  fd.funcFlags := SQLITE_UTF8 or SQLITE_FUNC_BUILTIN or SQLITE_FUNC_SLOCHNG;
   fd.xSFunc    := sfunc;
   fd.zName     := nm;
 end;
@@ -49553,6 +49583,10 @@ begin
   MakeFD(aDateFuncs[4], -1, @strftimeFunc,  'strftime');
   MakeFD(aDateFuncs[5], -1, @unixtimeFunc,  'unixepoch');
   MakeFD(aDateFuncs[6],  2, @timediffFunc,  'timediff');
+  { date.c:1818..1820 — DFUNCTION (no CONSTANT, has SLOCHNG). }
+  MakeDFD(aDateFuncs[7],  0, @ctimeFunc,      'current_time');
+  MakeDFD(aDateFuncs[8],  0, @ctimestampFunc, 'current_timestamp');
+  MakeDFD(aDateFuncs[9],  0, @cdateFunc,      'current_date');
 end;
 
 var
