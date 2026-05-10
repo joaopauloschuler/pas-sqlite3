@@ -8117,6 +8117,16 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     begin
       if ExprRefsOuterTable(pW^.pLeft, pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
       if ExprRefsOuterTable(pW^.pRight, pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
+      if (pW^.flags and EP_xIsSelect) = 0 then
+      begin
+        if pW^.x.pList <> nil then
+        begin
+          for j := 0 to pW^.x.pList^.nExpr - 1 do
+            if ExprRefsOuterTable(ExprListItems(pW^.x.pList)[j].pExpr,
+                                  pOuterSrc, pInnerSrc) then
+            begin Result := True; Exit; end;
+        end;
+      end;
     end;
   end;
 
@@ -8200,7 +8210,38 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     begin
       ResolveOuterRefs(pW^.pLeft,  pOuterSrc, pInnerSrc);
       ResolveOuterRefs(pW^.pRight, pOuterSrc, pInnerSrc);
+      if (pW^.flags and EP_xIsSelect) = 0 then
+      begin
+        if pW^.x.pList <> nil then
+        begin
+          for j := 0 to pW^.x.pList^.nExpr - 1 do
+            ResolveOuterRefs(ExprListItems(pW^.x.pList)[j].pExpr,
+                              pOuterSrc, pInnerSrc);
+        end;
+      end;
     end;
+  end;
+
+  function ExprListRefsOuterTable(pList: PExprList; pOuterSrc: PSrcList;
+                                  pInnerSrc: PSrcList): Boolean;
+  var k_: i32;
+  begin
+    Result := False;
+    if pList = nil then Exit;
+    for k_ := 0 to pList^.nExpr - 1 do
+      if ExprRefsOuterTable(ExprListItems(pList)[k_].pExpr,
+                            pOuterSrc, pInnerSrc) then
+      begin Result := True; Exit; end;
+  end;
+
+  procedure ResolveOuterRefsInList(pList: PExprList; pOuterSrc: PSrcList;
+                                   pInnerSrc: PSrcList);
+  var k_: i32;
+  begin
+    if pList = nil then Exit;
+    for k_ := 0 to pList^.nExpr - 1 do
+      ResolveOuterRefs(ExprListItems(pList)[k_].pExpr,
+                       pOuterSrc, pInnerSrc);
   end;
 
   procedure ResolveExpr(pE: PExpr);
@@ -8448,16 +8489,41 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         { Step 1: expand inner pSrc (assign cursors to inner FROM tables). }
         if (pInner^.selFlags and SF_HasTypeInfo) = 0 then
           sqlite3SelectExpand(pParse, pInner);
-        { Step 2: resolve inner WHERE against inner pSrc. }
+        { Step 2: detect outer refs across ALL inner clauses (not just
+          pWhere) — correlation can live in pEList, pHaving, pGroupBy,
+          pOrderBy.  Without this, an inner subquery whose ONLY outer
+          reference is in (e.g.) the projection list would lose the
+          SF_Correlated marker. }
+        if p^.pSrc <> nil then
+        begin
+          if ExprListRefsOuterTable(pInner^.pEList,
+                                    p^.pSrc, pInner^.pSrc) then bCorr := True;
+          if ExprRefsOuterTable(pInner^.pWhere,
+                                p^.pSrc, pInner^.pSrc)   then bCorr := True;
+          if ExprRefsOuterTable(pInner^.pHaving,
+                                p^.pSrc, pInner^.pSrc)   then bCorr := True;
+          if ExprListRefsOuterTable(pInner^.pGroupBy,
+                                    p^.pSrc, pInner^.pSrc) then bCorr := True;
+          if ExprListRefsOuterTable(pInner^.pOrderBy,
+                                    p^.pSrc, pInner^.pSrc) then bCorr := True;
+        end;
+        { Step 3: resolve outer-ref TK_DOT nodes against the outer pSrc
+          BEFORE the inner resolver runs.  Matching nodes become TK_COLUMN
+          bound to the outer cursor; non-matching TK_DOTs stay in place
+          and the inner resolver below will emit the proper "no such
+          column" error if they don't match the inner FROM either.
+          Walks every clause that can contain expressions. }
+        if (p^.pSrc <> nil) and bCorr then
+        begin
+          ResolveOuterRefsInList(pInner^.pEList,   p^.pSrc, pInner^.pSrc);
+          ResolveOuterRefs(pInner^.pWhere,         p^.pSrc, pInner^.pSrc);
+          ResolveOuterRefs(pInner^.pHaving,        p^.pSrc, pInner^.pSrc);
+          ResolveOuterRefsInList(pInner^.pGroupBy, p^.pSrc, pInner^.pSrc);
+          ResolveOuterRefsInList(pInner^.pOrderBy, p^.pSrc, pInner^.pSrc);
+        end;
+        { Step 4: resolve inner clauses against inner pSrc. }
         if (pInner^.selFlags and SF_HasTypeInfo) = 0 then
           sqlite3ResolveSelectNames(pParse, pInner, nil);
-        { Step 3: detect and resolve outer-table refs in inner WHERE. }
-        if (pInner^.pWhere <> nil) and (p^.pSrc <> nil) then
-          bCorr := ExprRefsOuterTable(pInner^.pWhere, p^.pSrc,
-                                      pInner^.pSrc);
-        { Step 4: resolve any outer-ref TK_DOT nodes in inner WHERE. }
-        if bCorr and (p^.pSrc <> nil) then
-          ResolveOuterRefs(pInner^.pWhere, p^.pSrc, pInner^.pSrc);
         { Step 5: Mark as prepared so sqlite3SelectPrep doesn't re-run. }
         sqlite3SelectAddTypeInfo(pParse, pInner);
         if bCorr then

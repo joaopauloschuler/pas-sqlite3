@@ -2727,6 +2727,39 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.116** Fixed 2026-05-10.  Correlated subqueries that
+     reference an outer-table column with a qualified `outer.col` form
+     (or that put the outer reference anywhere other than the inner
+     `pWhere`) raised `Parse error: no such column: outer.col` instead
+     of binding to the outer cursor.  Reproducers: `SELECT (SELECT
+     max(b) FROM t WHERE a=t1.a) FROM t t1`, `SELECT * FROM t WHERE
+     EXISTS (SELECT 1 FROM t t2 WHERE t2.b=t.a+1)`, `SELECT (SELECT
+     t1.b) FROM t t1`, the long-standing TestWhereCorpus EXISTS_SUB /
+     NOT_EXISTS rows.  Root cause in `sqlite3ResolveSelectNames` ➜
+     `ResolveExpr` (passqlite3codegen.pas, subquery arm at the
+     `pE^.x.pSelect <> nil` block): the inner resolver ran BEFORE
+     `ResolveOuterRefs`, so any unresolved `TK_DOT` in the inner WHERE
+     hit the `cnt==0` tail and raised `no such column` immediately,
+     poisoning `pParse^.nErr` before the outer-binding pass had a
+     chance to rewrite it.  Two additional gaps in the same arm:
+     (a) `ExprRefsOuterTable` / `ResolveOuterRefs` only walked the
+     inner `pWhere`, missing outer refs in `pEList` / `pHaving` /
+     `pGroupBy` / `pOrderBy`; (b) neither walker descended into
+     `x.pList` (function args, IN-list, COALESCE args), so a
+     correlated ref inside e.g. `coalesce(t.a,0)` slipped through.
+     Fix: (1) reorder so detection + outer-binding run BEFORE the
+     inner resolver; (2) add `ExprListRefsOuterTable` /
+     `ResolveOuterRefsInList` helpers and call them on every
+     expression-bearing inner clause; (3) extend both walkers to
+     recurse into `x.pList` when `EP_xIsSelect` is clear.  After the
+     reorder the inner resolver still emits `no such column` for
+     genuinely missing names, but only AFTER outer refs have been
+     converted to `TK_COLUMN` against the outer cursor, so legitimate
+     correlation is preserved.  Verified: TestWhereCorpus 92/92 (was
+     90/90 with EXISTS_SUB / NOT_EXISTS as DIVERGE), full regression
+     69/69, 4965/4965 assertions; the seven probe cases above now
+     match the C oracle byte-for-byte.
+
 - [X] **10.1.bug.115** Fixed 2026-05-10.  `WITH RECURSIVE c(x) AS
      (VALUES(1) UNION ALL SELECT x+1 FROM c LIMIT N) SELECT * FROM c`
      ignored the body LIMIT and ran indefinitely (Pas had to be killed
