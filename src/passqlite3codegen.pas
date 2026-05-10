@@ -21895,10 +21895,18 @@ begin
     handling (select.c:830..980).  Replaces a top-level `*` in pEList
     with one TK_COLUMN entry per visible (non-HIDDEN, non-VIRTUAL)
     column of every resolved FROM item.  T.* form is not yet handled. }
-  if (pSelect <> nil) and (pSelect^.pEList <> nil)
-     and (pSelect^.pSrc <> nil)
-  then
-    expandStar(pParse, pSelect);
+  { Walk pPrior chain so every leaf SELECT in a compound has its `*` /
+    `T.*` expanded.  Mirrors C's walker-driven selectExpander, which
+    descends pPrior internally.  Without this, `SELECT * FROM t UNION
+    ALL ...` left the prior arm's pEList holding TK_ASTERISK, which
+    codegen then emitted as OP_Null instead of OP_Column. }
+  pCur := pSelect;
+  while pCur <> nil do
+  begin
+    if (pCur^.pEList <> nil) and (pCur^.pSrc <> nil) then
+      expandStar(pParse, pCur);
+    pCur := pCur^.pPrior;
+  end;
 
   { Tail-call sqlite3SelectPopWith via walker so the parser-supplied
     pWith stack stays balanced.  This was the only behaviour of the

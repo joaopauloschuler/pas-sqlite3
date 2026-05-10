@@ -2727,6 +2727,47 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.112** Fixed 2026-05-10.  Star expansion (`SELECT *`)
+     in the prior arms of a compound (`UNION ALL`, etc.) was skipped:
+     `WITH t1 AS (SELECT 1) SELECT * FROM t1 UNION ALL SELECT 99`
+     returned `99` (one row) instead of `1; 99` because the `*` in the
+     LEFT arm survived to codegen, where it generated `OP_Null` into
+     the result register instead of `OP_Column` from the CTE coroutine.
+     Root cause: `sqlite3SelectExpand`'s star-expansion pass only
+     operated on the topmost `pSelect`, not on the `pPrior` chain.
+     Fix in passqlite3codegen.pas (around the `expandStar(pParse,
+     pSelect)` call): walk `pCur := pSelect; while pCur <> nil do …
+     pCur := pCur^.pPrior;`, matching what the C
+     `sqlite3WalkSelect`-driven selectExpander does implicitly via the
+     walker descending into pPrior.  The earlier FROM-resolution loop
+     and bug 6.14 sub-bug B already use this pattern; the star pass had
+     been missed.  Verified: all UNION ALL forms with `*` in either arm
+     now match the C oracle byte-identical.  TestExplainParity 1026/1026;
+     full regression 69/69; 4963/4963 assertions clean.  (UNION /
+     INTERSECT / EXCEPT with a subquery FROM-item still crash — tracked
+     as separate bug 10.1.bug.113 below; that one is in the
+     multiSelectByMerge codepath, not in selectExpander.)
+
+- [ ] **10.1.bug.113** `SELECT * FROM (SELECT 1) UNION SELECT 99` (and
+     symmetric / INTERSECT / EXCEPT forms with a subquery or CTE in
+     either arm) crash with EAccessViolation in `OP_Rewind` (vdbe.pas:7872,
+     `pCur^.uc.pCursor` deref of a nil cursor).  Reduces to: with-CTE
+     forms `WITH t1 AS (SELECT 1) SELECT * FROM t1 UNION SELECT * FROM
+     t1` also crash; UNION ALL of the same shape works (ALL skips the
+     dedup MERGE plan).  Root cause is in the multi-arm MERGE codepath:
+     the LEFT arm's bytecode emits `Rewind 0,…` against cursor 0 with
+     no preceding `OpenRead`/`SorterOpen`/`InitCoroutine` for that
+     cursor — the inner `(SELECT 1)` subquery's coroutine is never
+     instantiated, so cursor 0 is the implicit "(subquery-1)" pseudo
+     that the C oracle materialises with `InitCoroutine` + `Yield` at
+     the top of the merged plan.  See `EXPLAIN SELECT * FROM (SELECT 1)
+     UNION SELECT 99` against `/tmp/oracle` (or `LD_PRELOAD=src/libsqlite3.so`)
+     for a side-by-side: oracle emits `InitCoroutine 7,11,6` … `Yield 7`
+     before SorterOpen; Pas jumps straight to SorterOpen + Rewind on a
+     never-opened cursor.  No trivial workaround pending; touches the
+     compound-merge codegen path that already has a known
+     `multiSelectByMerge` gap (see notes elsewhere in 6.14).
+
 - [X] **10.1.bug.111** Fixed 2026-05-10.  AUTOINCREMENT counter was
      not consulted when allocating new rowids: after `CREATE TABLE
      ai(id INTEGER PRIMARY KEY AUTOINCREMENT, x); INSERT VALUES(...)`
