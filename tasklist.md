@@ -4177,13 +4177,23 @@ existing dispatcher.
      Likely PRAGMA foreign_keys=ON arm not wiring the dbFlags FK_Enforce
      bit, or sqlite3FkCheck not actually invoked from INSERT codegen.
 
-- [ ] **10.1.bug.97** Ambiguous column reference across two CTEs in a
-     comma-join not detected.  Reproducer:
-     `WITH a(x) AS (VALUES(1)), b(x) AS (VALUES(2)) SELECT x FROM a,b;`
-     returns `1` in Pas vs `Parse error: ambiguous column name: x` in
-     upstream.  Resolver doesn't flag the shared column name across the
-     two ephemeral CTE sources (probably the resolver bails on
-     TF_Ephemeral pTab before the ambiguity check fires).
+- [X] **10.1.bug.97** Fixed 2026-05-10.  Ambiguous bare column refs
+     across multiple FROM sources are now detected, e.g.
+     `SELECT x FROM a,b;` (or two CTEs / two subqueries with the same
+     column name) errors `ambiguous column name: x` byte-identical to
+     upstream.  Root cause was scope, not source kind: the bare-TK_ID
+     arm in `ResolveExpr` (passqlite3codegen.pas:8292) returned on the
+     first matching source instead of counting matches across all
+     sources, so any shared column name silently bound to the left-most
+     source for both regular tables and CTE/subquery sources.  Fix:
+     mirror resolve.c lookupName:438..462 — accumulate `cnt`, track
+     `pMatch`/`matchCol`, skip duplicates that are masked by USING on
+     a non-RIGHT JOIN, and emit `ambiguous column name: <X>` if cnt>1
+     after the loop.  Verified: bare comma-join, two-CTE comma-join,
+     two-subquery comma-join all error correctly; qualified `a.x`/`b.x`,
+     single-source bare refs, USING-masked joins, and NATURAL JOIN keep
+     working.  Regression: 69/69 binaries pass (4963 assertions),
+     TestExplainParity 1026/1026, all Diag* probes 0 divergences.
 
 - [X] **10.1.bug.93** Fixed 2026-05-10.  `WITH t(...) AS (...) SELECT
      DISTINCT ... FROM t` (any CTE — VALUES-based or SELECT-based)

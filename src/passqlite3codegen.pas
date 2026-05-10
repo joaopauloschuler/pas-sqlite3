@@ -8208,6 +8208,9 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     nArg_:  i32;
     pInner: PSelect;
     bCorr:  Boolean;
+    pMatch: PSrcItem;
+    matchCol: i32;
+    cnt:    i32;
   begin
     if pE = nil then Exit;
     { TK_ROW — resolve.c:976..993.  UPDATE…FROM emits TK_ROW pseudo-tokens
@@ -8293,6 +8296,9 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     begin
       pSrc := p^.pSrc;
       base := SrcListItems(pSrc);
+      cnt := 0;
+      pMatch := nil;
+      matchCol := 0;
       for i := 0 to pSrc^.nSrc - 1 do
       begin
         pItem := PSrcItem(PByte(base) + i * SizeOf(TSrcItem));
@@ -8300,17 +8306,42 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         iCol := sqlite3ColumnIndex(pItem^.pSTab, pE^.u.zToken);
         if iCol >= 0 then
         begin
-          pE^.op      := TK_COLUMN;
-          pE^.iTable  := pItem^.iCursor;
-          pE^.iColumn := i16(iCol);
-          pE^.y.pTab  := pItem^.pSTab;
-          if iCol < BMS - 1 then
-            pItem^.colUsed := pItem^.colUsed or (Bitmask(1) shl iCol)
-          else
-            pItem^.colUsed := pItem^.colUsed or
-                              (Bitmask(1) shl (BMS - 1));
-          Exit;
+          { 10.1.bug.97 — count matches across sources to detect ambiguous
+            column refs (resolve.c lookupName:438..462).  USING-masked
+            duplicates of the column on a non-RIGHT JOIN keep the
+            left-most match; otherwise cnt rises and we error below. }
+          if cnt > 0 then
+          begin
+            if ((pItem^.fg.fgBits2 and $08) <> 0)  { isUsing }
+               and (sqlite3IdListIndex(pItem^.u3.pUsing,
+                      PAnsiChar(pE^.u.zToken)) >= 0)
+               and ((pItem^.fg.jointype and JT_RIGHT) = 0) then
+              Continue;
+          end;
+          Inc(cnt);
+          pMatch := pItem;
+          matchCol := iCol;
         end;
+      end;
+      if cnt > 1 then
+      begin
+        sqlite3ErrorMsg(pParse,
+          PAnsiChar('ambiguous column name: ' + AnsiString(pE^.u.zToken)));
+        sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+        Exit;
+      end;
+      if cnt = 1 then
+      begin
+        pE^.op      := TK_COLUMN;
+        pE^.iTable  := pMatch^.iCursor;
+        pE^.iColumn := i16(matchCol);
+        pE^.y.pTab  := pMatch^.pSTab;
+        if matchCol < BMS - 1 then
+          pMatch^.colUsed := pMatch^.colUsed or (Bitmask(1) shl matchCol)
+        else
+          pMatch^.colUsed := pMatch^.colUsed or
+                             (Bitmask(1) shl (BMS - 1));
+        Exit;
       end;
       { Phase 6.9-bis 11g.2.f sub-progress 10 — rowid pseudo-column.
         Mirror lookupName at resolve.c:498..505: when no real column
