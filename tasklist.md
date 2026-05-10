@@ -1068,17 +1068,18 @@ existing dispatcher.
        tbl_name=?] ORDER BY 1`.
   [X] **10.1.18** `.databases` — cmdDatabases runs
        `SELECT name, file FROM pragma_database_list ORDER BY seq`.
-  [~] **10.1.19** `.fullschema` — cmdFullschema dumps CREATE statements
+  [X] **10.1.19** `.fullschema` — cmdFullschema dumps CREATE statements
        (excluding sqlite_stat%) plus sqlite_stat1/sqlite_stat4 INSERTs
        (when those tables exist).  `--indent` is now accepted and
        silently ignored — matches upstream shell.c.in:9691..9709 where
        `flgs` is declared but never updated when `--indent` is passed,
        so shell_format_schema runs with FLAGS=0 (no indent transform).
-       Remaining divergence vs 3.53.0 oracle: (a) sqlite_sequence rows
-       are emitted instead of filtered (need `name NOT LIKE
-       'sqlite__%' ESCAPE '_'`); (b) the `/* No STAT tables available
-       */` banner is not emitted when sqlite_stat1/4 are absent — both
-       are pre-existing cmdFullschema gaps, separate from --indent.
+       Closed 2026-05-10: trailing `ANALYZE sqlite_schema;` now emitted
+       after the stat INSERTs (matches shell.c.in:9748), and the
+       `INSERT INTO sqlite_stat1 …` rows are no longer double-quoted
+       (upstream's MODE_Insert leaves the bare identifier unquoted).
+       Diffed byte-identical to system sqlite3 across clean and
+       post-ANALYZE corpora.
   [~] **10.1.20** `.lint fkey-indexes` cmdLint now mirrors
        shell.c.in:5899..6126: shellFkeyCollateClause registered as the
        `fkey_collate_clause(parent, parentCol, child, childCol)` UDF,

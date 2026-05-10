@@ -6060,11 +6060,11 @@ const
     '   AND name NOT LIKE ''sqlite\_%'' ESCAPE ''\''' +
     ' ORDER BY x';
   zStat1Q  =
-    'SELECT ''INSERT INTO "sqlite_stat1" VALUES('' || quote(tbl) || '','' || ' +
+    'SELECT ''INSERT INTO sqlite_stat1 VALUES('' || quote(tbl) || '','' || ' +
     'quote(idx) || '','' || quote(stat) || '')'' ' +
     'FROM sqlite_stat1';
   zStat4Q  =
-    'SELECT ''INSERT INTO "sqlite_stat4" VALUES('' || ' +
+    'SELECT ''INSERT INTO sqlite_stat4 VALUES('' || ' +
     'quote(tbl) || '','' || quote(idx) || '','' || ' +
     'quote(neq) || '','' || quote(nlt) || '','' || ' +
     'quote(ndlt) || '','' || quote(sample) || '')'' ' +
@@ -6129,7 +6129,9 @@ begin
     sqlite3_finalize(pStmt);
   end;
   if not haveStat then
-    WriteLn('/* No STAT tables available */');
+    WriteLn('/* No STAT tables available */')
+  else
+    WriteLn('ANALYZE sqlite_schema;');
 end;
 
 { ----------------------------------------------------------------------
