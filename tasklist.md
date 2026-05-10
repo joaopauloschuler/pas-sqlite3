@@ -2727,6 +2727,22 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.119** Fixed 2026-05-10.  `replace(s, p, r)` returned
+     the original string `s` when `p` (pattern) or `r` (replacement)
+     was NULL, instead of the C oracle's NULL result.  Reproducer:
+     `SELECT replace('abc', NULL, 'b'), replace('abc', 'a', NULL);`
+     printed `abc|abc` (Pas) vs `|` (C).  Root cause: `replaceFunc`
+     (passqlite3codegen.pas:45407) lumped all three nil-pointer cases
+     into a single arm that called `sqlite3_result_text(pCtx, zStr,
+     ...)` — fine for the empty-pattern arm but wrong for NULL pattern
+     and NULL replacement, which `func.c:1500..1514` short-circuits with
+     a bare `return` (leaving the result as the default NULL).  Fix:
+     match the C structure — bail to NULL on NULL str/pat/rep, and only
+     return zStr unchanged on the `zPattern[0]==0` (empty pattern) arm.
+     Regression: extended `DiagFunctions` with the four NULL/empty
+     replace probes; 69/69 binaries / 4965 assertions; TestExplainParity
+     1026/1026.
+
 - [X] **10.1.bug.118** Fixed 2026-05-10.  CLI shell error messages
      printed via `shellEPutZ` appeared at the END of multi-statement
      batch output instead of inline at the position where the failing

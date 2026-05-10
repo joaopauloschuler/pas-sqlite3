@@ -157,6 +157,10 @@ begin
 
   // --- replace / instr ---
   Probe('replace',        'SELECT replace(''abc'', ''b'', ''XY'')');
+  Probe('replace null pat',  'SELECT replace(''abc'', NULL, ''b'')');
+  Probe('replace null rep',  'SELECT replace(''abc'', ''a'', NULL)');
+  Probe('replace null str',  'SELECT replace(NULL, ''a'', ''b'')');
+  Probe('replace empty pat', 'SELECT replace(''abc'', '''', ''XY'')');
   Probe('instr found',    'SELECT instr(''abcde'', ''cd'')');
   Probe('instr not',      'SELECT instr(''abcde'', ''zz'')');
 

@@ -45409,18 +45409,20 @@ var
   zStr, zPat, zRep, zOut, p: PAnsiChar;
   nStr, nPat, nRep, nOut, i, j: i32;
 begin
-  if sqlite3_value_type(Psqlite3_value(argv^)) = SQLITE_NULL then begin
-    sqlite3_result_null(pCtx); Exit;
-  end;
+  { Mirrors func.c:1476..1517: NULL str/pattern/replacement → NULL result
+    (the default), empty pattern → return str unchanged. }
   zStr := sqlite3_value_text(Psqlite3_value(argv^));
+  if zStr = nil then begin sqlite3_result_null(pCtx); Exit; end;
   nStr := sqlite3_value_bytes(Psqlite3_value(argv^));
   zPat := sqlite3_value_text(Psqlite3_value((argv+1)^));
-  nPat := sqlite3_value_bytes(Psqlite3_value((argv+1)^));
-  zRep := sqlite3_value_text(Psqlite3_value((argv+2)^));
-  nRep := sqlite3_value_bytes(Psqlite3_value((argv+2)^));
-  if (zStr = nil) or (zPat = nil) or (zRep = nil) or (nPat = 0) then begin
+  if zPat = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  if zPat^ = #0 then begin
     sqlite3_result_text(pCtx, zStr, nStr, SQLITE_TRANSIENT); Exit;
   end;
+  nPat := sqlite3_value_bytes(Psqlite3_value((argv+1)^));
+  zRep := sqlite3_value_text(Psqlite3_value((argv+2)^));
+  if zRep = nil then begin sqlite3_result_null(pCtx); Exit; end;
+  nRep := sqlite3_value_bytes(Psqlite3_value((argv+2)^));
   { Conservative output buffer size }
   nOut := nStr * 2 + nRep + 64;
   zOut := sqlite3_malloc(nOut + 1);
