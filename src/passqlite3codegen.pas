@@ -48516,8 +48516,11 @@ var
       Result := Result * 10 + Ord(s[i]) - Ord('0');
     end;
   end;
-  { Parse HH:MM[:SS[.FFF]] starting at position pos. Returns True on success. }
-  function parseHhMmSs(pos: i32; out hh, mm: i32; out ss: Double): Boolean;
+  { Parse HH:MM[:SS[.FFF]] starting at position pos. Returns True on success.
+    On success, endPos is set to the position immediately after the parsed
+    time (1-based), so the caller can resume scanning (e.g. for a timezone). }
+  function parseHhMmSs(pos: i32; out hh, mm: i32; out ss: Double;
+                       out endPos: i32): Boolean;
   var sv, fp: i32; frac: Double;
   begin
     Result := False;
@@ -48525,9 +48528,11 @@ var
     if (pos+2 > Length(s)) or (s[pos+2] <> ':') then Exit;
     mm := getN(pos+3, 2); if mm < 0 then Exit;
     ss := 0.0;
+    endPos := pos + 5;
     if (pos+5 <= Length(s)) and (s[pos+5] = ':') then begin
       sv := getN(pos+6, 2); if sv < 0 then Exit;
       ss := sv;
+      endPos := pos + 8;
       if (pos+8 <= Length(s)) and (s[pos+8] = '.') and
          (pos+9 <= Length(s)) and isdig(s[pos+9]) then begin
         frac := 0.1; fp := pos+9;
@@ -48536,11 +48541,44 @@ var
           frac := frac * 0.1;
           Inc(fp);
         end;
+        endPos := fp;
       end;
     end;
     Result := True;
   end;
-var tpos: i32; rJD: Double;
+  { date.c:parseTimezone — read optional timezone suffix at position pos
+    (1-based) and return its offset in minutes via tzMin.  Accepts
+    `[+-]HH:MM` and `Z` / `z` (zulu).  Sets ok=True if the entire trailing
+    portion of s (after stripping leading/trailing whitespace) is consumed,
+    False otherwise.  Missing timezone (string ends at pos) is treated as
+    ok=True with tzMin=0. }
+  function parseTimezone(pos: i32; out tzMin: i32): Boolean;
+  var sgn, nHr, nMn: i32; c: AnsiChar;
+  begin
+    tzMin := 0;
+    Result := False;
+    while (pos <= Length(s)) and (s[pos] = ' ') do Inc(pos);
+    if pos > Length(s) then begin Result := True; Exit; end;
+    c := s[pos];
+    if c = '-' then sgn := -1
+    else if c = '+' then sgn := 1
+    else if (c = 'Z') or (c = 'z') then begin
+      Inc(pos);
+      while (pos <= Length(s)) and (s[pos] = ' ') do Inc(pos);
+      Result := pos > Length(s);
+      Exit;
+    end
+    else Exit;
+    Inc(pos);
+    nHr := getN(pos, 2); if nHr < 0 then Exit;
+    if (pos+2 > Length(s)) or (s[pos+2] <> ':') then Exit;
+    nMn := getN(pos+3, 2); if nMn < 0 then Exit;
+    pos := pos + 5;
+    tzMin := sgn * (nMn + nHr * 60);
+    while (pos <= Length(s)) and (s[pos] = ' ') do Inc(pos);
+    Result := pos > Length(s);
+  end;
+var tpos, hmsEnd, tzMin: i32; rJD: Double;
 begin
   Result := False;
   if zStr = nil then Exit;
@@ -48590,10 +48628,13 @@ begin
     Result := True;
     Exit;
   end;
+  tzMin := 0;
+  hmsEnd := 0;
   if (Length(s) >= 5) and (s[3] = ':') then begin
     { Time-only form HH:MM... — date defaults to 2000-01-01 (date.c:269). }
-    if not parseHhMmSs(1, h, mn, sec) then Exit;
+    if not parseHhMmSs(1, h, mn, sec, hmsEnd) then Exit;
     y := 2000; m := 1; d := 1;
+    if not parseTimezone(hmsEnd, tzMin) then Exit;
   end else begin
     if Length(s) < 10 then Exit;
     y := getN(1,4); if y < 0 then Exit;
@@ -48606,13 +48647,20 @@ begin
       tpos := 11;
       while (tpos <= Length(s)) and ((s[tpos] = ' ') or (s[tpos] = 'T')) do Inc(tpos);
       if tpos <= Length(s) then begin
-        if not parseHhMmSs(tpos, h, mn, sec) then Exit;
+        if not parseHhMmSs(tpos, h, mn, sec, hmsEnd) then Exit;
+        if not parseTimezone(hmsEnd, tzMin) then Exit;
       end;
     end;
   end;
   dt.yr := y; dt.mo := m; dt.dy := d;
   dt.hr := h; dt.mi := mn; dt.s := sec;
   dt.jd := toJulianDay(y, m, d, h, mn, sec);
+  if tzMin <> 0 then begin
+    { date.c:computeJD — subtract tz minutes from iJD; the YMD/HMS fields
+      are conceptually invalidated and re-derived in UTC. }
+    dt.jd := dt.jd - Double(tzMin) / 1440.0;
+    fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+  end;
   dt.validJD := True;
   Result := True;
 end;

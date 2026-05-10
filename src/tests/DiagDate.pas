@@ -104,6 +104,11 @@ begin
   Probe('strftime %u Mon',  'SELECT strftime(''%u'',''2024-06-17'')');
   Probe('unixepoch',        'SELECT unixepoch(''2024-01-01'')');
   Probe('time HM',          'SELECT time(''13:45'')');
+  Probe('tz +01:30',        'SELECT datetime(''2024-06-15 12:00:00+01:30'')');
+  Probe('tz -05:00',        'SELECT datetime(''2024-06-15 12:00:00-05:00'')');
+  Probe('tz Z',             'SELECT datetime(''2024-06-15T12:00:00Z'')');
+  Probe('tz time-only',     'SELECT time(''12:00:00+02:00'')');
+  Probe('tz date rollover', 'SELECT date(''2024-06-15T23:00:00-05:00'')');
 
   // Numeric / scalar variants
   Probe('round 0',          'SELECT round(3.5)');

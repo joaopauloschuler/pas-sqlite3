@@ -2727,6 +2727,22 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.105** Fixed 2026-05-10.  ISO 8601 timezone suffixes were
+     silently dropped: `datetime('2024-06-15 12:00:00+01:30')` returned
+     `2024-06-15 12:00:00` instead of `2024-06-15 10:30:00`, and the
+     `-HH:MM` / time-only variants likewise.  Root cause: `parseDateTime`
+     in passqlite3codegen.pas accepted only `Z` via the inherited tail
+     check; `[+-]HH:MM` offsets fell off the end of the string and the JD
+     stayed local-time.  Fix: ported `parseTimezone` from
+     `date.c:166..198` and threaded a per-call end position out of
+     `parseHhMmSs` so the timezone arm can resume scanning.  When the
+     offset is non-zero, JD is shifted by `tz_min/1440.0` and the YMD/HMS
+     fields re-derived via `fromJulianDay`, mirroring the C
+     `iJD -= p->tz*60000` branch in `computeJD`.  Regression: DiagDate now
+     probes `+01:30`, `-05:00`, `Z`, time-only `+02:00`, and a
+     date-rollover `-05:00` shape.  TestExplainParity 1026/1026; full
+     regression 69/69 binaries pass.
+
 - [X] **10.1.bug.103** Fixed 2026-05-10.  `strftime('%u', date)` returned
      the wrong ISO weekday: 2024-06-15 (Saturday) gave `5` instead of `6`,
      2024-06-16 (Sunday) gave `6` instead of `7`, etc. — every weekday
