@@ -2727,6 +2727,61 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.107** Fixed 2026-05-10.  `CREATE UNIQUE INDEX` on a
+     pre-populated column with duplicates silently succeeded, then the
+     index would only enforce uniqueness for *new* inserts.  Reproducer:
+     `CREATE TABLE t(a); INSERT INTO t VALUES(1),(2),(1); CREATE UNIQUE
+     INDEX i ON t(a);` returned no error in Pas; upstream raises
+     `UNIQUE constraint failed: t.a`.  Root cause: `sqlite3VdbeSorterCompare`
+     (passqlite3vdbe.pas) had two C-vs-Pas mismatches against
+     vdbesort.c:2762..2796.  (a) The Pascal port called
+     `sqlite3VdbeRecordCompare(nKey, pKey, pUR)` passing the call-arg
+     `nKey` (column count) and `pKey` (a `PMem`) as if they were the
+     record's byte length and bytes — they aren't; in C the comparison
+     uses `pVal->n` and `pVal->z` from the Mem register, where `pVal` *is*
+     the parameter.  (b) `pUR^.nField` was left at whatever value
+     `vdbeSorterCompareRec` (the merge-sort callback) had baked in
+     (= pKeyInfo->nField, typically 2 for `(col, rowid)`), so even if the
+     bytes had been right, the comparison would have included the rowid
+     column and never matched on the indexed column alone.  Fix: rewrite
+     the function to mirror the C reference — accept `pKey` as a `PMem`,
+     reset `pUR^.nField := nKeyCol` after each unpack, add the
+     MEM_Null short-circuit (any-NULL key → -1), and feed
+     `pVal^.n` / `pVal^.z` into `sqlite3VdbeRecordCompare`.  Verified: the
+     original reproducer now raises the constraint error byte-for-byte
+     with upstream.  Full regression 69/69 binaries / 4963 assertions
+     pass.  Follow-ups (separate tasks): bug.108 (`COLLATE NOCASE` unique
+     index still doesn't catch case-insensitive duplicates during refill);
+     bug.109 (`SELECT *` ordered by an index emits `0.0|0.0` rows in some
+     post-CREATE-INDEX shapes — pre-existing, unrelated to this fix).
+
+- [ ] **10.1.bug.108** `CREATE UNIQUE INDEX iu ON u(x COLLATE NOCASE)`
+     against a pre-populated table containing case-insensitive duplicates
+     (e.g. `('A'),('a'),('B')`) silently succeeds in Pas; upstream raises
+     `UNIQUE constraint failed: u.x`.  Bug.107's
+     SorterCompare fix closed the binary-collation case but the NOCASE
+     path still falls through.  Hypothesis: either the sort-time
+     comparator (vdbeSorterCompareRec) ignores per-field collations from
+     `pKeyInfo`, or the unpack path is feeding the NOCASE field with the
+     default BINARY collation pointer.  Investigate
+     `sqlite3VdbeRecordCompare`'s `aColl[]` lookup vs how
+     `sqlite3KeyInfoOfIndex` populates it for an index built with explicit
+     `COLLATE NOCASE`.
+
+- [ ] **10.1.bug.109** `SELECT * FROM v ORDER BY a,b` against a table
+     with a covering UNIQUE index on `(a, b)` returns `0.0|0.0` rows in
+     Pas (count is right, values are zeros).  Reproducer:
+     `CREATE TABLE v(a INT, b INT); INSERT INTO v VALUES(1,1),(1,2),(2,3);
+      CREATE UNIQUE INDEX iv ON v(a,b); SELECT * FROM v ORDER BY a,b;`.
+     Without the index (or with `ORDER BY a` only — single column) the
+     SELECT returns the right values, so the planner is using the index
+     as a covering scan but materialising the projected columns from the
+     wrong source.  Likely a codegen gap in the index-only / covering-
+     scan arm of WHERE / sqlite3Select; check whether the projected
+     column lookups resolve to the index cursor's columns or to the
+     (closed) table cursor.  Pre-existing — confirmed against pre-bug.107
+     `a4` head.
+
 - [X] **10.1.bug.106** Fixed 2026-05-10.  `'localtime'` / `'utc'` date
      modifiers were no-ops: `datetime('2024-06-15 12:00:00','utc')` returned
      the input unchanged instead of `2024-06-15 15:00:00` (UTC-3 host), and

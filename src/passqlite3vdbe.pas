@@ -6404,6 +6404,8 @@ var
   curBytes:Pointer;
   curLen:  i32;
   nKeyCol: i32;
+  pVal:    PMem;
+  i:       i32;
 begin
   pRes := 0;
   if (pCsr = nil) or (pCsr^.uc.pSorter = nil) then begin
@@ -6412,17 +6414,26 @@ begin
   pSorter := pCsr^.uc.pSorter;
   cur := pSorter^.pReader;
   if cur = nil then begin Result := SQLITE_OK; Exit; end;
-  if pSorter^.pUnpacked = nil then
+  pVal := PMem(pKey);
+  nKeyCol := nKey;
+  if bOmitRowid <> 0 then Dec(nKeyCol);
+  if pSorter^.pUnpacked = nil then begin
     pSorter^.pUnpacked := sqlite3VdbeAllocUnpackedRecord(pSorter^.pKeyInfo);
+    if pSorter^.pUnpacked = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+  end;
   pUR := PUnpackedRecord(pSorter^.pUnpacked);
-  if pUR = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
   curLen   := Pi32(PByte(cur) + 8)^;
   curBytes := PByte(cur) + SORTER_REC_HDR;
   sqlite3VdbeRecordUnpack(pSorter^.pKeyInfo, curLen, curBytes, pUR);
-  nKeyCol := i32(Pu16(Pu8(pSorter^.pKeyInfo) + 6)^);
-  if bOmitRowid <> 0 then Dec(nKeyCol);
-  if pUR^.nField > nKeyCol then pUR^.nField := nKeyCol;
-  pRes := sqlite3VdbeRecordCompare(nKey, pKey, pUR);
+  pUR^.nField := nKeyCol;
+  for i := 0 to nKeyCol - 1 do begin
+    if (PMem(pUR^.aMem)[i].flags and MEM_Null) <> 0 then begin
+      pRes := -1;
+      Result := SQLITE_OK;
+      Exit;
+    end;
+  end;
+  pRes := sqlite3VdbeRecordCompare(pVal^.n, pVal^.z, pUR);
   Result := SQLITE_OK;
 end;
 
