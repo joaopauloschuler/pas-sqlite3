@@ -4188,13 +4188,22 @@ existing dispatcher.
      DiagFunctions / DiagMisc / DiagWindow / DiagFeatureProbe /
      DiagMultiValues / DiagIndexing / DiagPragma all 0 divergences.
 
-- [ ] **10.1.bug.96** Foreign-key constraint not enforced.  Reproducer:
+- [X] **10.1.bug.96** Fixed 2026-05-10.  Foreign-key constraint not
+     enforced on INSERT.  Reproducer:
      `PRAGMA foreign_keys=ON; CREATE TABLE p(id INTEGER PRIMARY KEY);
      CREATE TABLE c(id INTEGER, pid REFERENCES p(id));
-     INSERT INTO p VALUES(1); INSERT INTO c VALUES(1,2);` — upstream
-     errors `FOREIGN KEY constraint failed`, Pas inserts the orphan row.
-     Likely PRAGMA foreign_keys=ON arm not wiring the dbFlags FK_Enforce
-     bit, or sqlite3FkCheck not actually invoked from INSERT codegen.
+     INSERT INTO p VALUES(1); INSERT INTO c VALUES(1,2);` now errors
+     `FOREIGN KEY constraint failed` byte-identical to upstream.  Root
+     cause: the Pascal `sqlite3Insert` body omitted the
+     `if( db->flags & SQLITE_ForeignKeys ) sqlite3FkCheck(...)` call
+     between `sqlite3GenerateConstraintChecks` and
+     `sqlite3CompleteInsertion` (insert.c:1572..1574).  Both helpers
+     were already ported and productive — UPDATE and DELETE arms wired
+     them — but the INSERT call site was missing.  Fix: added the
+     guarded call at codegen.pas:32207.  Verified: orphan INSERT
+     errors with the upstream message; valid INSERT (pid=1) succeeds;
+     FK off still inserts the orphan as before.  Regression: 69/69
+     binaries pass (4963 assertions); TestExplainParity 1026/1026.
 
 - [X] **10.1.bug.97** Fixed 2026-05-10.  Ambiguous bare column refs
      across multiple FROM sources are now detected, e.g.

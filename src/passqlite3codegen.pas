@@ -32204,6 +32204,8 @@ generic_coro_done:
       sqlite3GenerateConstraintChecks(pParse, pTab, aRegIdx, iDataCur, iIdxCur,
         regIns, 0, pkChng, u8(onError), endOfLoop,
         @bMayReplace, nil, pUpsert);
+      if (db^.flags and SQLITE_ForeignKeys) <> 0 then
+        sqlite3FkCheck(pParse, pTab, 0, regIns, nil, 0);
       sqlite3CompleteInsertion(pParse, pTab, iDataCur, iIdxCur, regIns,
         aRegIdx, 0, appendBias, ord(not bMayReplace));
     end;
