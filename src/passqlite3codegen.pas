@@ -25760,6 +25760,30 @@ begin
         pParse^.nMem := pParse^.nMem + nResultCol;
       end;
 
+      { 10.1.bug.94 — outer ORDER BY against a materialised subquery
+        source.  Wrap the per-row body in pushOntoSorter (open sorter
+        cursor before the scan loop, MakeRecord+SorterInsert in place
+        of Insert/ResultRow) and emit a generateSortTail (SorterSort +
+        drain loop) after the Close.  Mirrors the co-routine arm at
+        codegen.pas:25567 and select.c:6800..6890.  Without this, the
+        window-rewrite pSub^.pOrderBy ('a DESC') against a CTE/VALUES
+        source is silently dropped when this materialise arm fires. }
+      bSort := 0;
+      iSorterCsr := -1;
+      sortNKey := 0;
+      if (p^.pOrderBy <> nil) and (p^.pHaving = nil)
+         and (p^.pGroupBy = nil) and (p^.pLimit = nil) then
+      begin
+        bSort := 1;
+        iSorterCsr := pParse^.nTab; Inc(pParse^.nTab);
+        sortNKey := p^.pOrderBy^.nExpr;
+        sortKeyInfo := sqlite3KeyInfoFromExprList(pParse, p^.pOrderBy, 0,
+                                                  nResultCol);
+        sqlite3VdbeAddOp4(v, OP_SorterOpen, iSorterCsr,
+                          sortNKey + 1 + nResultCol, 0,
+                          PAnsiChar(sortKeyInfo), P4_KEYINFO);
+      end;
+
       addrEnd       := sqlite3VdbeMakeLabel(pParse);
       addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrEnd);
       addrSkip := sqlite3VdbeMakeLabel(pParse);
@@ -25780,7 +25804,30 @@ begin
         if r1 <> pDest^.iSdst + i then
           sqlite3VdbeAddOp2(v, OP_Copy, r1, pDest^.iSdst + i);
       end;
-      if pDest^.eDest = SRT_EphemTab then
+      if bSort <> 0 then
+      begin
+        { pushOntoSorter — emit ORDER BY keys then SCopy payload after
+          the keys, MakeRecord(keys+payload), SorterInsert. }
+        regSortBase := pParse^.nMem + 1;
+        Inc(pParse^.nMem, sortNKey + nResultCol);
+        for jj := 0 to sortNKey - 1 do
+        begin
+          r1 := sqlite3ExprCodeTarget(pParse,
+                  ExprListItems(p^.pOrderBy)[jj].pExpr,
+                  regSortBase + jj);
+          if r1 <> regSortBase + jj then
+            sqlite3VdbeAddOp2(v, OP_Copy, r1, regSortBase + jj);
+        end;
+        for jj := 0 to nResultCol - 1 do
+          sqlite3VdbeAddOp2(v, OP_SCopy, pDest^.iSdst + jj,
+                            regSortBase + sortNKey + jj);
+        Inc(pParse^.nMem); regSortRec := pParse^.nMem;
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, regSortBase,
+                          sortNKey + nResultCol, regSortRec);
+        sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
+                             regSortBase, nResultCol);
+      end
+      else if pDest^.eDest = SRT_EphemTab then
       begin
         { Disposal mirrors selectInnerLoop SRT_EphemTab arm
           (codegen.pas:25128): MakeRecord + NewRowid + Insert(APPEND)
@@ -25801,6 +25848,40 @@ begin
       sqlite3VdbeAddOp2(v, OP_Next, iCsr, addrTopOfLoop + 1);
       sqlite3VdbeResolveLabel(v, addrEnd);
       sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+
+      if bSort <> 0 then
+      begin
+        { generateSortTail — drain sorter; for SRT_EphemTab disposal
+          re-emit MakeRecord + NewRowid + Insert(APPEND); for SRT_Output
+          emit ResultRow.  Mirrors C select.c:2906..2945 generateSortTail
+          subset (eDest in {Output, EphemTab}). }
+        Inc(pParse^.nMem); regSortOut := pParse^.nMem;
+        iSortTab := pParse^.nTab; Inc(pParse^.nTab);
+        sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortTab, regSortOut,
+                          sortNKey + 1 + nResultCol);
+        addrSortBrk := sqlite3VdbeMakeLabel(pParse);
+        sqlite3VdbeAddOp2(v, OP_SorterSort, iSorterCsr, addrSortBrk);
+        addrSortLoop := sqlite3VdbeCurrentAddr(v);
+        sqlite3VdbeAddOp3(v, OP_SorterData, iSorterCsr, regSortOut, iSortTab);
+        for i := 0 to nResultCol - 1 do
+          sqlite3VdbeAddOp3(v, OP_Column, iSortTab, sortNKey + i,
+                            pDest^.iSdst + i);
+        if pDest^.eDest = SRT_EphemTab then
+        begin
+          r1 := sqlite3GetTempReg(pParse);
+          r2 := sqlite3GetTempReg(pParse);
+          sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+          sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+          sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
+          sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+          sqlite3ReleaseTempReg(pParse, r2);
+          sqlite3ReleaseTempReg(pParse, r1);
+        end
+        else
+          sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterCsr, addrSortLoop);
+        sqlite3VdbeResolveLabel(v, addrSortBrk);
+      end;
 
       if pParse^.nErr <> 0 then Result := SQLITE_ERROR
                           else Result := SQLITE_OK;

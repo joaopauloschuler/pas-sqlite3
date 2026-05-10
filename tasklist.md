@@ -4131,15 +4131,34 @@ existing dispatcher.
      QRF chunk.  Build green: 68/69; pre-existing TestPagerReadOnly
      unchanged.  All Diag* probes 0 divergences.
 
-- [ ] **10.1.bug.94** `row_number() OVER (ORDER BY x DESC)` over a
-     CTE-VALUES source returns rows in source-order with row_number=1,2,3
-     instead of descending-order with row_number=1,2,3.  Reproducer:
+- [X] **10.1.bug.94** Fixed 2026-05-10.  `row_number() OVER (ORDER BY x
+     DESC)` (and any outer ORDER BY DESC against a single-source
+     subquery) over a CTE/VALUES/(SELECT…UNION…) source now returns
+     rows byte-identical to upstream.  Reproducer:
      `WITH t(a) AS (VALUES(1),(2),(3)) SELECT a, row_number() OVER (ORDER BY a DESC) FROM t`
-     returns `1|1; 2|2; 3|3` (Pas) vs `3|1; 2|2; 1|3` (oracle).
-     Likely the window-arm sort key honours ASC even when DESC is
-     requested for a coroutine source — see codegen.pas window-rewrite
-     pSub^.pOrderBy direction propagation (linked to colUsed work
-     in 6.29).
+     now returns `3|1; 2|2; 1|3`.  Root cause was NOT in window-rewrite:
+     pSub^.pOrderBy carried the correct DESC sortFlags via
+     `exprListAppendList(... bIntToNull=1)` (which already propagates
+     fg.sortFlags at codegen.pas:50580).  The drop happened one layer
+     down: when sqlite3WindowCodeInit recursively called
+     `sqlite3Select(pSub, SRT_EphemTab → iCsr)`, pSub matched the
+     materialise arm at codegen.pas:25715 (single subquery source,
+     non-DISTINCT, SRT_EphemTab dest).  That arm emitted a plain
+     Rewind/Column/MakeRecord/Insert outer loop with NO sorter — the
+     `bSort` wrapping that the parallel co-routine arm at :25567 has
+     was missing.  Fix: mirror the co-routine arm's bSort path in the
+     materialise arm — open `OP_SorterOpen` with KeyInfo from
+     p^.pOrderBy before the scan, replace the per-row Insert/ResultRow
+     disposal with `OP_SCopy + MakeRecord(keys+payload) + SorterInsert`,
+     and emit the SorterSort/SorterData/Column drain tail (with both
+     SRT_EphemTab append-disposal and SRT_Output ResultRow disposal
+     branches) after the scan close.  Verified: VALUES-CTE,
+     UNION-CTE, and direct-table window-DESC all return correct rows;
+     plain `ORDER BY a DESC` against `(VALUES…)` also fixed as a
+     bonus.  Regression: 69/69 binaries pass (4963 assertions),
+     TestExplainParity 1026/1026, all Diag* probes 0 divergences
+     (DiagWindow, DiagOps, DiagDml, DiagFunctions, DiagMisc,
+     DiagFeatureProbe, DiagMultiValues, DiagIndexing, DiagPragma).
 
 - [X] **10.1.bug.95** Fixed 2026-05-10.  Cross JOIN of two `(VALUES …)`
      clauses now returns the full Cartesian product byte-identical to
