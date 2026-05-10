@@ -114,9 +114,6 @@ non-zero if any binary fails, so it can be wired into CI directly.
   - `TestPagerReadOnly` — 1 / 10 sub-tests pass; `sqlite3PagerOpen` returns
     `SQLITE_CANTOPEN` (rc=14) for cases T1–T9.  Phase 3.B.2a fixture work
     pending.
-  - `TestWhereExpr` — 83 / 84 sub-tests pass; sub-test T13c (no virtual
-    `TK_IN` appended for column-mismatched OR) is the lone failure in the
-    WHERE-clause analyzer.
 
 Failures are deliberately left visible rather than quarantined so they
 cannot be silently ignored.

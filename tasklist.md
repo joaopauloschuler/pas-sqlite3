@@ -82,16 +82,17 @@ FPC porting traps that recur often enough to call out up-front:
      Acceptance: 10 / 10 sub-tests pass with the fixture opened
      read-only via the same VFS path the C reference uses.
 
-- [ ] **6.regbug.1** `TestWhereExpr` — **83 / 84 sub-tests pass**
-     (T13c is the lone failure).  The WHERE-clause analyzer does not
-     append the virtual `TK_IN` term that upstream synthesises for an
-     OR chain whose arms reference different columns (column-mismatched
-     OR), so the analyzer's expected term count is short by one for
-     that shape.  Root cause sits inside the Phase 6 WHERE-clause
-     analyzer (`exprAnalyzeOrTerm` in passqlite3codegen.pas) — the
-     surrounding 83 sub-tests passing confirms this is an isolated arm,
-     not a structural gap.  Acceptance: 84 / 84 with byte-identical
-     `wherec.c` term-list output for the T13c shape.
+- [X] **6.regbug.1** `TestWhereExpr` — fixed 2026-05-10.  84 / 84
+     sub-tests pass.  Root cause was a test-fixture defect rather than
+     an engine bug: the synthetic `TTable` allocated via
+     `sqlite3DbMallocZero` left `iPKey = 0`, which collides with the
+     "no INTEGER PRIMARY KEY" sentinel `-1` that the C source uses
+     (tableForBuild defaults `iPKey = -1`).  `exprMightBeIndexed`'s IPK-
+     alias normalisation (codegen.pas:11237) then rewrote `iColumn = 0`
+     to `-1`, making the `(c0=1) OR (rowid=2)` shape look like
+     `(rowid=1) OR (rowid=2)` to `exprAnalyzeOrTerm`, which legitimately
+     collapses to a single virtual `TK_IN` term.  Fix: stamp
+     `pTab^.iPKey := -1` after malloc in `TestWhereExpr.pas`.
 
 ---
 

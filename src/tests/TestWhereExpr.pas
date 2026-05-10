@@ -157,6 +157,9 @@ begin
   pTab^.tabFlags := 0;
   pTab^.eTabType := TABTYP_NORM;
   pTab^.pIndex   := nil;
+  pTab^.iPKey    := -1;  { no INTEGER PRIMARY KEY (matches C's tableForBuild
+                           default; without this, malloc-zero leaves iPKey=0
+                           and exprMightBeIndexed mis-aliases col 0 to rowid) }
 
   FillChar(parse, SizeOf(parse), 0);
   parse.db := db;
