@@ -248,6 +248,19 @@ begin
         '',
         'SELECT 1',
         'WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM r WHERE n<5) SELECT count(*) FROM r');
+  // Recursive CTE with LIMIT inside the body — caps the body, not the outer query.
+  // Regression: bug 10.1.bug.115 (generateWithRecursiveQuery zeroed p^.iLimit
+  // before recursiveInnerLoop, so the per-row DecrJumpZero never fired).
+  Probe('CTE recursive LIMIT inside',
+        '',
+        'SELECT 1',
+        'WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c LIMIT 5) SELECT count(*) FROM c');
+  // Recursive CTE with LIMIT + OFFSET inside the body.  Regression for the
+  // same bug — addrCont label also needed resolving (iContinue<>0 vs >=0).
+  Probe('CTE recursive LIMIT OFFSET inside',
+        '',
+        'SELECT 1',
+        'WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c LIMIT 3 OFFSET 2) SELECT group_concat(x) FROM c');
   // ALTER TABLE rename column
   Probe('ALTER TABLE rename column',
         'CREATE TABLE t(a, b)',

@@ -20390,7 +20390,7 @@ end;
   destinations a recursive-CTE caller actually presents: Output,
   Coroutine, Mem, Set, EphemTab/Table, Discard, Exists. }
 procedure recursiveInnerLoop(pParse: PParse; p: PSelect; iCurrent: i32;
-  pDest: PSelectDest; iContinue: i32; iBreak: i32);
+  pDest: PSelectDest; iContinue: i32; iBreak: i32; regLimit: i32 = 0);
 var
   v:           PVdbe;
   nResultCol:  i32;
@@ -20463,11 +20463,18 @@ begin
     Assert(False);
   end;
 
-  { LIMIT bookkeeping. }
-  if p^.iLimit <> 0 then
+  { LIMIT bookkeeping (mirrors select.c:2803..2806).  generateWithRecursive-
+    Query zeroes p^.iLimit before calling so selectInnerLoop won't emit the
+    decrement; the recursive driver passes the saved register through
+    regLimit so the per-row DecrJumpZero still fires. }
+  if regLimit <> 0 then
+    sqlite3VdbeAddOp2(v, OP_DecrJumpZero, regLimit, iBreak)
+  else if p^.iLimit <> 0 then
     sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, iBreak);
 
-  if iContinue >= 0 then
+  { addrCont labels from sqlite3VdbeMakeLabel are negative ids; 0 means
+    "no label" so resolve when the caller passed a real one. }
+  if iContinue <> 0 then
     sqlite3VdbeResolveLabel(v, iContinue);
 end;
 
@@ -20656,7 +20663,8 @@ begin
   { Output the row.  Apply OFFSET first, then run the inner loop. }
   addrCont := sqlite3VdbeMakeLabel(pParse);
   codeOffset(v, regOffset, addrCont);
-  recursiveInnerLoop(pParse, p, iCurrent, pDest, addrCont, addrBreak);
+  recursiveInnerLoop(pParse, p, iCurrent, pDest, addrCont, addrBreak,
+    regLimit);
 
   { Recursive step: re-run p (with anchor terms detached) into Queue.
     Clear SF_Compound on the recursive arm so the Pas single-select gate

@@ -2727,6 +2727,37 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.115** Fixed 2026-05-10.  `WITH RECURSIVE c(x) AS
+     (VALUES(1) UNION ALL SELECT x+1 FROM c LIMIT N) SELECT * FROM c`
+     ignored the body LIMIT and ran indefinitely (Pas had to be killed
+     by `timeout`); body LIMIT+OFFSET returned no rows at all.  Two
+     bugs in `generateWithRecursiveQuery` / `recursiveInnerLoop`
+     (passqlite3codegen.pas):
+       (a) After the C-style `regLimit := p^.iLimit; p^.iLimit := 0`
+       save-and-zero (mirroring select.c:2696..2699), Pas's
+       `recursiveInnerLoop` only emitted `OP_DecrJumpZero` when
+       `p^.iLimit <> 0`.  Since p^.iLimit had just been zeroed, the
+       per-row decrement was never emitted and the dequeue loop ran
+       forever.  C handles this at the call site (select.c:2803..2806):
+       `if(regLimit) DecrJumpZero(regLimit, addrBreak)`.  Fix: extended
+       `recursiveInnerLoop` with an optional `regLimit` parameter and
+       wired the call to pass the saved register.
+       (b) `recursiveInnerLoop` resolved its `iContinue` label only
+       when `iContinue >= 0`, but `sqlite3VdbeMakeLabel` returns
+       monotonically-decreasing negative ids (-1, -2, ...) — so the
+       guard was always false and the addrCont label was never
+       resolved.  Without OFFSET this was harmless (no instruction
+       referenced the label); with OFFSET, `codeOffset` emitted
+       `OP_IfPos` against the unresolved label, which `resolveP2Values`
+       patched to address 0 → the OFFSET skip jumped to `OP_Init` and
+       the outer dequeue scrambled.  Fix: changed the guard to
+       `iContinue <> 0`, matching the convention used elsewhere (0
+       means "no label").  Regression test: two new
+       `DiagFeatureProbe` rows (`CTE recursive LIMIT inside`, `CTE
+       recursive LIMIT OFFSET inside`) reproduce both arms.
+       TestExplainParity 1026/1026; full regression 69/69; 4963/4963
+       assertions clean; DiagFeatureProbe 0 divergences.
+
 - [X] **10.1.bug.112** Fixed 2026-05-10.  Star expansion (`SELECT *`)
      in the prior arms of a compound (`UNION ALL`, etc.) was skipped:
      `WITH t1 AS (SELECT 1) SELECT * FROM t1 UNION ALL SELECT 99`
