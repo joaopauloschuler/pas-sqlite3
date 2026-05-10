@@ -2727,6 +2727,26 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.124** Fixed 2026-05-10.  CLI shell `near line N` error
+     prefix anchored at the comment line preceding a failing SQL
+     statement (off-by-one when comments interleaved with SQL).
+     Reproducer: a script of `SELECT 1;\n-- comment\nSELECT bad FROM
+     nonexistent;` reported `Parse error near line 2:` (the `-- comment`
+     line) instead of upstream's `near line 3:` (the actual SELECT).
+     Root cause: `processInput` (passqlite3shell.pas:8219) only swallowed
+     all-whitespace lines via `isAllWhitespace` when `zSql=''`; comment-
+     only lines (`-- ...` or fully-closed `/* ... */`) fell through and
+     became the first character of zSql, anchoring `startLine` one line
+     too early.  Upstream's `process_input` (shell.c.in:35921) routes
+     this through `quickscan` + `QSS_PLAINWHITE`, which classifies single-
+     line `--` and `/* */` comments as plain-white and skips them when
+     the accumulator is empty.  Fix: added `isPlainWhiteOrComment`
+     (passqlite3shell.pas) — recognises whitespace, `--` to EOL, and
+     fully-closed `/* ... */` runs — and replaced the `isAllWhitespace`
+     gate with it.  Verified `near line N` now matches the C oracle for
+     comment-interleaved scripts; TestExplainParity 1026/1026; full
+     regression 69/69, 4965 assertions clean.
+
 - [X] **10.1.bug.119** Fixed 2026-05-10.  `replace(s, p, r)` returned
      the original string `s` when `p` (pattern) or `r` (replacement)
      was NULL, instead of the C oracle's NULL result.  Reproducer:

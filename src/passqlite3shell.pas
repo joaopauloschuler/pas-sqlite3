@@ -1164,6 +1164,40 @@ begin
   Result := True;
 end;
 
+{ Mirrors upstream quickscan's QSS_PLAINWHITE check for a single line:
+  whitespace, an SQL `--` line comment, or a fully-closed `/* ... */`
+  block comment counts as "plain white".  Used by processInput so that
+  comment-only lines arriving before any SQL accumulator content are
+  swallowed, matching shell.c.in:35921 (and ensuring `near line N` later
+  anchors at the first real SQL line, not the comment that preceded it). }
+function isPlainWhiteOrComment(const s: AnsiString): Boolean;
+var i, n: SizeInt;
+begin
+  Result := False;
+  n := Length(s);
+  i := 1;
+  while i <= n do begin
+    while (i <= n) and (s[i] in [' ', #9, #11, #13]) do Inc(i);
+    if i > n then Break;
+    if (i < n) and (s[i] = '-') and (s[i+1] = '-') then begin
+      { line comment runs to end of line }
+      i := n + 1;
+      Break;
+    end;
+    if (i < n) and (s[i] = '/') and (s[i+1] = '*') then begin
+      Inc(i, 2);
+      while (i < n) and not ((s[i] = '*') and (s[i+1] = '/')) do Inc(i);
+      if (i < n) and (s[i] = '*') and (s[i+1] = '/') then
+        Inc(i, 2)
+      else
+        Exit(False);   { unterminated block comment — needs accumulator }
+      Continue;
+    end;
+    Exit(False);
+  end;
+  Result := True;
+end;
+
 function startsWithDot(const s: AnsiString): Boolean;
 var i: SizeInt;
 begin
@@ -8216,7 +8250,7 @@ begin
     end;
     Inc(p^.lineno);
 
-    if isAllWhitespace(zLine) and (zSql = '') then Continue;
+    if (zSql = '') and isPlainWhiteOrComment(zLine) then Continue;
 
     if (zSql = '') and (startsWithDot(zLine) or startsWithHash(zLine)) then begin
       if startsWithDot(zLine) then begin
