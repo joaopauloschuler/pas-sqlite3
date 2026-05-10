@@ -4106,6 +4106,23 @@ existing dispatcher.
      DiagDropTable / DiagCovering / DiagIndexing / DiagPredicates /
      DiagOrderLimitTopN / DiagAnalyze all 0 divergences.
 
+- [X] **10.1.bug.104** Fixed 2026-05-10.  `hex(NULL)` returned NULL
+     instead of empty text `''`.  Reproducer:
+     `SELECT typeof(hex(NULL)), length(hex(NULL));` — Pas emitted
+     `null|` (NULL, NULL); the 3.53.0 oracle emits `text|0` (empty
+     text).  Root cause: passqlite3codegen.pas hexFunc had an early
+     `sqlite3_result_null` guard for SQLITE_NULL inputs, but C's
+     hexFunc (func.c:1334) takes the same code path for NULL —
+     `sqlite3_value_blob`/`sqlite3_value_bytes` return nil/0, the
+     hex-emit loop runs zero times, and `sqlite3_result_text64` is
+     called with len=0, producing empty text.  Fix: drop the NULL
+     early-return; n=0 case falls through naturally.  Regression
+     coverage added to DiagScalarFunc (`hex null`, `hex empty blob`).
+     TestExplainParity 1026/1026; full regression 69/69 binaries,
+     4965 assertions; DiagFunctions / DiagMoreFunc / DiagScalarFunc /
+     DiagOps / DiagCast / DiagFloatRender / DiagWindow / DiagDate /
+     DiagTxn / DiagMisc / DiagPragma all 0 divergences.
+
 - [X] **10.1.bug.102** Fixed 2026-05-10.  CLI caret marker for parser-
      emitted `near "%T": syntax error` anchored at column 0 instead of
      under the offending token.  Reproducer:

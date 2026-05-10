@@ -44988,9 +44988,6 @@ var
   n, i: i32;
 begin
   pVal := argv^;
-  if sqlite3_value_type(Psqlite3_value(pVal)) = SQLITE_NULL then begin
-    sqlite3_result_null(pCtx); Exit;
-  end;
   z := Pu8(sqlite3_value_blob(Psqlite3_value(pVal)));
   n := sqlite3_value_bytes(Psqlite3_value(pVal));
   zOut := sqlite3_malloc(n * 2 + 1);

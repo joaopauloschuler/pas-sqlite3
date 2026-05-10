@@ -151,6 +151,8 @@ begin
 
   // --- hex / unhex ---
   Probe('hex empty',         'SELECT hex('''')');
+  Probe('hex null',          'SELECT typeof(hex(NULL)) || ''|'' || hex(NULL)');
+  Probe('hex empty blob',    'SELECT typeof(hex(X'''')) || ''|'' || hex(X'''')');
   Probe('unhex 4',           'SELECT hex(unhex(''DEADBEEF''))');
   Probe('unhex odd',         'SELECT typeof(unhex(''DEAD1''))');
   Probe('unhex bad',         'SELECT typeof(unhex(''XX''))');
