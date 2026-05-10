@@ -2727,6 +2727,26 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.106** Fixed 2026-05-10.  `'localtime'` / `'utc'` date
+     modifiers were no-ops: `datetime('2024-06-15 12:00:00','utc')` returned
+     the input unchanged instead of `2024-06-15 15:00:00` (UTC-3 host), and
+     `'localtime'` likewise returned the input.  Root cause: `applyModifier`
+     in passqlite3codegen.pas had no arms for either keyword (they fell
+     through to the unrecognised-modifier exit, propagating NULL via
+     `applyModifiers`).  Fix: ported `toLocaltime` (date.c:608..656) and the
+     `'utc'` iteration loop (date.c:837..865) as `toLocaltimeDT` /
+     `toUtcDT` Pascal helpers backed by a libc `localtime_r` cdecl binding,
+     and dispatched `'localtime'` / `'utc'` from `applyModifier`.  Pitfall
+     during port: `iGuess / 86400000.0` was being compiled at single-
+     precision (FPC float-literal default — same trap as the
+     `feedback_fpc_float_literal_single` memory) so the iter-1 correction
+     rounded back to the iter-0 instant; explicit `Double()` casts on the
+     constants fixed the round-trip.  Regression coverage added in
+     `src/tests/DiagDate.pas` (round-trip + IS NOT NULL probes).
+     TestExplainParity 1026/1026; full regression 69/69, 4963 assertions;
+     DiagDate / DiagFunctions / DiagMoreFunc / DiagFeatureProbe /
+     DiagWindow all 0 divergences.
+
 - [X] **10.1.bug.105** Fixed 2026-05-10.  ISO 8601 timezone suffixes were
      silently dropped: `datetime('2024-06-15 12:00:00+01:30')` returned
      `2024-06-15 12:00:00` instead of `2024-06-15 10:30:00`, and the

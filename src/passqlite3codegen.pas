@@ -3112,7 +3112,7 @@ implementation
 
 uses
   DateUtils,
-  Unix, BaseUnix,
+  Unix, BaseUnix, ctypes,
   Math,
   passqlite3printf,
   passqlite3json,
@@ -48683,6 +48683,113 @@ begin
   Result := Double(iJD) / Double(86400000.0);
 end;
 
+{ libc localtime_r binding for the 'localtime' / 'utc' modifiers.  Mirrors
+  date.c:548..600 osLocaltime / date.c:608..656 toLocaltime, which assume
+  the input DateTime is UTC and replace its YMD/HMS with the localtime
+  equivalent. }
+type
+  PCTime_t = ^cint64;
+  PCTm = ^TCTm;
+  TCTm = record
+    tm_sec, tm_min, tm_hour: cint;
+    tm_mday, tm_mon, tm_year: cint;
+    tm_wday, tm_yday, tm_isdst: cint;
+    tm_gmtoff: clong;
+    tm_zone: PAnsiChar;
+  end;
+
+function libc_localtime_r(t: PCTime_t; tm: PCTm): PCTm;
+  cdecl; external 'c' name 'localtime_r';
+
+{ toLocaltime — port of date.c:608..656.  Assumes dt holds a UTC instant;
+  on return dt holds the corresponding localtime YMD/HMS.  Uses the
+  C-style year-substitution trick when the year is outside 1970..2037
+  so that libc localtime_r() never sees an out-of-range time_t. }
+function toLocaltimeDT(var dt: TDateTime2): Boolean;
+var
+  iMs: Int64;        { ms since unix epoch }
+  t: cint64;
+  tm: TCTm;
+  iYearDiff: i32;
+  yr, mo, dy, hr, mi: i32;
+  ss: Double;
+  jdSub: Double;
+  msPart: Int64;
+begin
+  Result := False;
+  if not dt.validJD then begin
+    dt.jd := toJulianDay(dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+    dt.validJD := True;
+  end;
+  { Convert JD → unix-epoch milliseconds.  JD 2440587.5 = 1970-01-01 00:00 UTC. }
+  iMs := Round((dt.jd - Double(2440587.5)) * Double(86400000.0));
+  { Recompute YMD from JD before the range check, since callers may pass a
+    JD-only DateTime (e.g. the toUtcDT iteration zeroes YMD and only sets jd). }
+  fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+  if (dt.yr < 1970) or (dt.yr > 2037) then begin
+    { year out of range; substitute an equivalent year per date.c:626..634 }
+    yr := dt.yr; mo := dt.mo; dy := dt.dy;
+    hr := dt.hr; mi := dt.mi; ss := dt.s;
+    iYearDiff := (2000 + (yr mod 4)) - yr;
+    yr := yr + iYearDiff;
+    jdSub := toJulianDay(yr, mo, dy, hr, mi, ss);
+    iMs := Round((jdSub - Double(2440587.5)) * Double(86400000.0));
+    t := cint64(iMs div 1000);
+  end else begin
+    iYearDiff := 0;
+    t := cint64(iMs div 1000);
+  end;
+  FillChar(tm, SizeOf(tm), 0);
+  if libc_localtime_r(@t, @tm) = nil then Exit;
+  dt.yr := tm.tm_year + 1900 - iYearDiff;
+  dt.mo := tm.tm_mon + 1;
+  dt.dy := tm.tm_mday;
+  dt.hr := tm.tm_hour;
+  dt.mi := tm.tm_min;
+  msPart := iMs mod Int64(1000);
+  if msPart < 0 then msPart := msPart + 1000;
+  dt.s  := tm.tm_sec + msPart * 0.001;
+  dt.validJD := False;
+  dt.jd := toJulianDay(dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+  dt.validJD := True;
+  dt.rawS := False;
+  Result := True;
+end;
+
+{ toUtcDT — port of date.c:837..865 'utc' arm.  Assumes dt holds a local
+  time; on return dt holds the UTC equivalent. }
+function toUtcDT(var dt: TDateTime2): Boolean;
+var
+  iOrig, iGuess, iErr: Int64;
+  cnt: i32;
+  nx: TDateTime2;
+begin
+  Result := False;
+  if not dt.validJD then begin
+    dt.jd := toJulianDay(dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+    dt.validJD := True;
+  end;
+  { iOrig is unix-epoch ms representation of dt's instant. }
+  iOrig := Round((dt.jd - Double(2440587.5)) * Double(86400000.0));
+  iGuess := iOrig;
+  iErr := 0;
+  cnt := 0;
+  repeat
+    FillChar(nx, SizeOf(nx), 0);
+    iGuess := iGuess - iErr;
+    nx.jd := Double(2440587.5) + Double(iGuess) / Double(86400000.0);
+    nx.validJD := True;
+    if not toLocaltimeDT(nx) then Exit;
+    iErr := Round((nx.jd - Double(2440587.5)) * Double(86400000.0)) - iOrig;
+    Inc(cnt);
+  until (iErr = 0) or (cnt > 3);
+  FillChar(dt, SizeOf(dt), 0);
+  dt.jd := Double(2440587.5) + Double(iGuess) / Double(86400000.0);
+  dt.validJD := True;
+  fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+  Result := True;
+end;
+
 { applyModifier — Phase 6.10 step 11(i): subset port of parseModifier
   (date.c:730..1095).  Supports the most common forms:
     "+N <unit>" / "-N <unit>" where <unit> in
@@ -48806,6 +48913,19 @@ begin
     end;
     dt.rawS := False;
     Result := True; Exit;
+  end;
+
+  { localtime — date.c:803..815.  Treat dt as UTC and shift to local. }
+  if sqlite3StrICmp(zMod, 'localtime') = 0 then begin
+    Result := toLocaltimeDT(dt);
+    Exit;
+  end;
+
+  { utc — date.c:837..865.  Treat dt as local time and shift to UTC by
+    iterating localtime() so that the round-trip lands back on the input. }
+  if sqlite3StrICmp(zMod, 'utc') = 0 then begin
+    Result := toUtcDT(dt);
+    Exit;
   end;
 
   { julianday — date.c:783..801.  Force the prior raw numeric input
