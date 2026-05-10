@@ -2727,6 +2727,23 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.118** Fixed 2026-05-10.  CLI shell error messages
+     printed via `shellEPutZ` appeared at the END of multi-statement
+     batch output instead of inline at the position where the failing
+     statement ran.  Reproducer (script of `SELECT 1; SELECT
+     abs(-9223372036854775808); SELECT 2; SELECT 3;`): Pas printed
+     `1\n2\n3\nError near line 2: integer overflow`; C oracle printed
+     `1\nError near line 2: integer overflow\n2\n3`.  Root cause: FPC's
+     `Output` and `StdErr` streams are independently buffered when
+     redirected (e.g. under `2>&1` or to a pipe), so a single
+     `Write(StdErr, ...)` for an error landed only at process exit when
+     the buffers flushed in order.  Fix: in `shellEPutZ`
+     (passqlite3shell.pas:492) drain `Output` first, then write to
+     `StdErr` and flush, mirroring the C oracle's line-buffered
+     fprintf(stderr) behaviour.  Now error and stdout lines interleave
+     in source order.  Regression: 69/69 binaries / 4965 assertions;
+     TestExplainParity 1026/1026.
+
 - [X] **10.1.bug.117** Fixed 2026-05-10.  `min(x)` / `max(x)` over
      an all-NULL input (or any rowset where every row's argument is
      NULL) returned the blob "0.0" instead of NULL.  Reproducer:

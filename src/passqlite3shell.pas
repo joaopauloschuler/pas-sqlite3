@@ -491,7 +491,17 @@ var
 
 procedure shellEPutZ(const z: AnsiString); inline;
 begin
+  { Flush stdout before writing to stderr so that under 2>&1 (or any merged
+    stream) the error message appears at the position it was emitted, not
+    after all subsequent buffered stdout writes.  The C oracle's stderr is
+    line-buffered (or unbuffered when isatty), so writes there flush
+    immediately — but FPC's StdErr is fully buffered when redirected, and
+    stdout is also buffered, so a plain `Write(StdErr,...)` lands after the
+    stdout backlog when both share a destination.  Mirroring the C
+    behaviour: drain stdout, write, then flush stderr. }
+  Flush(Output);
   Write(StdErr, z);
+  Flush(StdErr);
 end;
 
 procedure shellSPutZ(const z: AnsiString); inline;
