@@ -23325,6 +23325,15 @@ var
   iiGB:        i32;
   sfA, sfB:    u8;
   innerDest:   TSelectDest;
+  { 10.1.bug.90 — GROUP BY over a subquery source.  When pSrc[0] carries
+    SRCITEM_FG_IS_SUBQUERY, materialise the subquery (or drain its
+    coroutine) into pItem^.iCursor instead of routing through WhereBegin
+    (which lacks the viaCoroutine / TF_Ephemeral plumbing). }
+  isGBSubquery:    Boolean;
+  pGBInnerSel:     PSelect;
+  pGBCoroItem:     PSrcItem;
+  addrGBBodyStart: i32;
+  addrGBLoopDone:  i32;
   { ORDER BY sorter locals (select.c pushOntoSorter / generateSortTail —
     minimal slice: SRT_Output only, no nOBSat optimisation, no LIMIT
     pushdown, no SORTFLAG_UseSorter shortcut).  bSort=1 means the inner
@@ -23871,9 +23880,18 @@ begin
     pTab  := pItem^.pSTab;
     if (pTab = nil)
        or (pTab^.eTabType = TABTYP_VTAB)
-       or (pTab^.eTabType = TABTYP_VIEW)
-       or ((pTab^.tabFlags and TF_Ephemeral) <> 0)
-       or ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0)
+    then begin Result := SQLITE_OK; Exit; end;
+    { 10.1.bug.90 — subquery source: route through the coroutine /
+      eph-materialise loop below instead of WhereBegin.  TF_Ephemeral
+      only matters when the source is also flagged a subquery (a CTE
+      or VIEW reference reaches here with TF_Ephemeral set on a real
+      pSchema-bound table — those still flow through the regular path).
+      VIEW entries that are NOT marked subquery still bail until
+      view-codegen lands. }
+    isGBSubquery := (pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0;
+    if (not isGBSubquery)
+       and ((pTab^.eTabType = TABTYP_VIEW)
+            or ((pTab^.tabFlags and TF_Ephemeral) <> 0))
     then begin Result := SQLITE_OK; Exit; end;
 
     pGroupByLoc := p^.pGroupBy;
@@ -23967,8 +23985,11 @@ begin
     if canUseAgg and (pParse^.nErr = 0) then
     begin
       sqlite3GenerateColumnNames(pParse, p);
-      iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
-      sqlite3CodeVerifySchema(pParse, iDb);
+      if not isGBSubquery then
+      begin
+        iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
+        sqlite3CodeVerifySchema(pParse, iDb);
+      end;
 
       { Allocate sorter cursor + KeyInfo from pGroupBy. }
       pAggI2^.sortingIdx := pParse^.nTab; Inc(pParse^.nTab);
@@ -24011,9 +24032,65 @@ begin
 
       { Begin scan in GROUP BY order. }
       sqlite3VdbeAddOp2(v, OP_Gosub, regReset, addrReset);
-      pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere, pGroupByLoc,
-                                  nil, p, WHERE_GROUPBY, 0);
-      if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+
+      pGBInnerSel := nil;
+      pGBCoroItem := nil;
+      pWInfo      := nil;
+      addrGBBodyStart := 0;
+      addrGBLoopDone  := 0;
+      if isGBSubquery then
+      begin
+        addrGBLoopDone := sqlite3VdbeMakeLabel(pParse);
+        { 10.1.bug.90 — subquery source: emit InitCoroutine/Yield drain
+          when the inner query was already coroutine-materialised by
+          the parser (VALUES wrapper), otherwise OP_OpenEphemeral +
+          recursive sqlite3Select(SRT_EphemTab) + Rewind/Next loop.
+          Mirrors the isSubqueryAgg arm at codegen.pas:24908. }
+        if pItem^.iCursor < 0 then
+        begin
+          pItem^.iCursor := pParse^.nTab;
+          Inc(pParse^.nTab);
+        end;
+        iCsr := pItem^.iCursor;
+        if (pItem^.u4.pSubq <> nil) and (pItem^.u4.pSubq^.pSelect <> nil) then
+          pGBInnerSel := pItem^.u4.pSubq^.pSelect;
+        if (pGBInnerSel <> nil) and (pGBInnerSel^.pSrc <> nil)
+           and (pGBInnerSel^.pSrc^.nSrc = 1) then
+        begin
+          pGBCoroItem := SrcListItems(pGBInnerSel^.pSrc);
+          if (pGBCoroItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) = 0 then
+            pGBCoroItem := nil;
+        end;
+        if pGBCoroItem <> nil then
+        begin
+          sqlite3VdbeAddOp3(v, OP_InitCoroutine,
+            pGBCoroItem^.u4.pSubq^.regReturn, 0,
+            pGBCoroItem^.u4.pSubq^.addrFillSub);
+          addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Yield,
+                              pGBCoroItem^.u4.pSubq^.regReturn, addrGBLoopDone);
+        end
+        else if pItem^.u4.pSubq <> nil then
+        begin
+          sqlite3VdbeAddOp2(v, OP_OpenEphemeral, iCsr, pTab^.nCol);
+          sqlite3SelectDestInit(@innerDest, SRT_EphemTab, iCsr);
+          if sqlite3Select(pParse, pItem^.u4.pSubq^.pSelect, @innerDest) <> SQLITE_OK then
+          begin
+            Result := SQLITE_ERROR; Exit;
+          end;
+          addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrGBLoopDone);
+        end
+        else
+        begin
+          Result := SQLITE_OK; Exit;
+        end;
+        addrGBBodyStart := sqlite3VdbeCurrentAddr(v);
+      end
+      else
+      begin
+        pWInfo := sqlite3WhereBegin(pParse, p^.pSrc, p^.pWhere, pGroupByLoc,
+                                    nil, p, WHERE_GROUPBY, 0);
+        if pWInfo = nil then begin Result := SQLITE_ERROR; Exit; end;
+      end;
       assignAggregateRegisters(pParse, pAggI2);
 
       { ExplainQueryPlan2(addrExp, "USE TEMP B-TREE FOR GROUP BY") —
@@ -24064,7 +24141,24 @@ begin
       sqlite3VdbeAddOp2(v, OP_SorterInsert, pAggI2^.sortingIdx, regRecord);
       sqlite3ReleaseTempReg(pParse, regRecord);
       sqlite3ReleaseTempRange(pParse, regBase, nColGB);
-      sqlite3WhereEnd(pWInfo);
+      if isGBSubquery then
+      begin
+        if pGBCoroItem <> nil then
+        begin
+          translateColumnToCopy(pParse, addrGBBodyStart, iCsr,
+                                pGBCoroItem^.u4.pSubq^.regResult, 0);
+          sqlite3VdbeAddOp2(v, OP_Goto, 0, addrTopOfLoop);
+          sqlite3VdbeResolveLabel(v, addrGBLoopDone);
+        end
+        else
+        begin
+          sqlite3VdbeAddOp2(v, OP_Next, iCsr, addrTopOfLoop + 1);
+          sqlite3VdbeResolveLabel(v, addrGBLoopDone);
+          sqlite3VdbeAddOp1(v, OP_Close, iCsr);
+        end;
+      end
+      else
+        sqlite3WhereEnd(pWInfo);
 
       pAggI2^.sortingIdxPTab := pParse^.nTab; Inc(pParse^.nTab);
       sortPTab := pAggI2^.sortingIdxPTab;

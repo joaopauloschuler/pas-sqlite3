@@ -2723,26 +2723,53 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
-- [ ] **10.1.bug.90** Open 2026-05-10.  `GROUP BY` over a subquery
-     source returns no rows.  Reproducer:
-     `SELECT column1, count(*) FROM (VALUES(1),(1),(2)) GROUP BY column1;`
-     yields nothing where the 3.53.0 oracle returns `1|2` and `2|1`.
-     Same gap drives `SELECT column1 FROM (...) GROUP BY column1` and
-     `WITH t(x) AS (VALUES…) SELECT x, count(*) FROM t GROUP BY x;`.
-     Root cause: the GROUP BY arm in `sqlite3Select`
-     (passqlite3codegen.pas:23862..) bails with SQLITE_OK when the
-     source is a subquery (TF_Ephemeral, TABTYP_VIEW, or
-     SRCITEM_FG_IS_SUBQUERY) — the corresponding viaCoroutine/
-     materialise plumbing that the non-GROUP-BY agg arm at
-     codegen.pas:24726 (`isSubqueryAgg`) implements has no analogue
-     in the GROUP BY arm.  Lifting the bail naively triggers an OP_Rewind
-     against a nil cursor at runtime because the SrcItem's viaCoroutine
-     bit is not set yet when sqlite3WhereBegin fires.  Fix path: replicate
-     the isSubqueryAgg pattern — materialise the subquery into an
-     ephemeral cursor (or set viaCoroutine + emit InitCoroutine) before
-     sqlite3WhereBegin, and route the GROUP BY scan against that cursor.
-     Affected scope: at least every `.bench`-style query that does a
-     statistical roll-up over a derived table or CTE.
+- [X] **10.1.bug.90** Fixed 2026-05-10.  `GROUP BY` over a subquery
+     source returned no rows; e.g. `SELECT column1, count(*) FROM
+     (VALUES(1),(1),(2)) GROUP BY column1;` was empty where upstream
+     emits `1|2` / `2|1`.  Same gap drove the bare `SELECT column1
+     FROM (…) GROUP BY column1` and `WITH t(x) AS (VALUES…) SELECT x,
+     count(*) FROM t GROUP BY x;` shapes.  Root cause: the GROUP BY
+     arm in `sqlite3Select` (passqlite3codegen.pas:23862..) bailed
+     with SQLITE_OK when the source carried SRCITEM_FG_IS_SUBQUERY,
+     because sqlite3WhereBegin lacks the viaCoroutine / TF_Ephemeral
+     plumbing.  Fix: mirror the isSubqueryAgg arm at codegen.pas:24908
+     — when the source is a subquery, replace the WhereBegin loop
+     scaffold with either (a) an InitCoroutine + Yield drain plus
+     translateColumnToCopy when the inner pSrc[0] is already
+     coroutine-materialised (the VALUES-wrapper case), or (b) an
+     OP_OpenEphemeral + recursive sqlite3Select(SRT_EphemTab) +
+     Rewind/Next/Close loop otherwise.  A new addrGBLoopDone label
+     bounds the source-side loop so an empty source falls through to
+     the SorterSort/drain code (which then sees an empty sorter and
+     jumps to addrEnd) instead of skipping it.  Verified byte-identical
+     to the 3.53.0 oracle across `(VALUES…) GROUP BY`,
+     `(VALUES…) GROUP BY HAVING count(*) >= 2`, `WITH cte AS (VALUES…)
+     SELECT … GROUP BY` and `(VALUES…) GROUP BY … ORDER BY DESC`.
+     Regression: 68 binaries pass / 1 known fail (TestPagerReadOnly);
+     TestExplainParity 1026/1026.  Follow-up: `count(*) FROM (SELECT
+     * FROM (VALUES…))` (nested subquery wrapping a coroutine-VALUES)
+     still returns 1 instead of the row count — recursive sqlite3Select
+     on the inner-most coroutine wrapper short-circuits to one row.
+     Tracked separately as 10.1.bug.91 below.
+
+- [ ] **10.1.bug.91** Open 2026-05-10.  `count(*) FROM (SELECT * FROM
+     (VALUES…))` returns 1 instead of the actual row count.  Surfaces
+     when running through nested subqueries that re-wrap a
+     coroutine-materialised VALUES source.  Reproducer: `SELECT
+     count(*) FROM (SELECT * FROM (VALUES(1),(1),(2),(3)));` returns
+     `1` where the 3.53.0 oracle returns `4`.  The bare
+     `SELECT * FROM (SELECT * FROM (VALUES…))` walk works (yields
+     `1,1,2,3`) — only the aggregate arm is broken.  Likely the
+     isSubqueryAgg branch at codegen.pas:24908 detects the inner
+     SrcItem's VIA_COROUTINE flag for the OUTER subquery
+     (the SELECT * wrapper), then drains the coroutine that has
+     already been one-shot consumed by the inner Select expansion,
+     yielding only the first row.  Cross-shape: same divergence
+     affects the GROUP BY case (10.1.bug.90 follow-up).  Fix path:
+     when pCoroItem is detected, ensure the inner coroutine is
+     re-entrant (re-init regReturn → addrFillSub) for each outer
+     scan, or fall back to ephemeral materialisation in this
+     particular shape.
 
 - [X] **10.1.bug.89** Fixed 2026-05-10.  `datetime(N, 'unixepoch')` (and
      `date()` / `time()` of the same form) returned an empty result for
