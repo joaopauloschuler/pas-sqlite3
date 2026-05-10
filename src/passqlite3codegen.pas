@@ -25917,7 +25917,7 @@ begin
       iSorterCsr := -1;
       sortNKey := 0;
       if (p^.pOrderBy <> nil) and (p^.pHaving = nil)
-         and (p^.pGroupBy = nil) and (p^.pLimit = nil) then
+         and (p^.pGroupBy = nil) then
       begin
         bSort := 1;
         iSorterCsr := pParse^.nTab; Inc(pParse^.nTab);
@@ -25935,7 +25935,7 @@ begin
         always invokes computeLimitRegisters before scan begin. Without
         this, outer `SELECT ... FROM (VALUES...) LIMIT n OFFSET k` ignored
         both clauses entirely. }
-      if (bSort = 0) and (p^.pLimit <> nil) then
+      if p^.pLimit <> nil then
         computeLimitRegisters(pParse, p, addrEnd);
 
       addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Yield,
@@ -26028,7 +26028,10 @@ begin
 
       if bSort <> 0 then
       begin
-        { generateSortTail — drain sorter and emit ResultRow per row. }
+        { generateSortTail — drain sorter and emit ResultRow per row.
+          OFFSET applied post-sort via IfPos; LIMIT applied via
+          DecrJumpZero after ResultRow.  Mirrors select.c:1673
+          generateSortTail. }
         Inc(pParse^.nMem); regSortOut := pParse^.nMem;
         iSortTab := pParse^.nTab; Inc(pParse^.nTab);
         sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortTab, regSortOut,
@@ -26037,10 +26040,21 @@ begin
         sqlite3VdbeAddOp2(v, OP_SorterSort, iSorterCsr, addrSortBrk);
         addrSortLoop := sqlite3VdbeCurrentAddr(v);
         sqlite3VdbeAddOp3(v, OP_SorterData, iSorterCsr, regSortOut, iSortTab);
+        if p^.iOffset > 0 then
+        begin
+          addrSortContinue := sqlite3VdbeMakeLabel(pParse);
+          sqlite3VdbeAddOp3(v, OP_IfPos, p^.iOffset, addrSortContinue, 1);
+        end
+        else
+          addrSortContinue := 0;
         for i := 0 to nResultCol - 1 do
           sqlite3VdbeAddOp3(v, OP_Column, iSortTab, sortNKey + i,
                             pDest^.iSdst + i);
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        if p^.iLimit <> 0 then
+          sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrSortBrk);
+        if addrSortContinue <> 0 then
+          sqlite3VdbeResolveLabel(v, addrSortContinue);
         sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterCsr, addrSortLoop);
         sqlite3VdbeResolveLabel(v, addrSortBrk);
       end;
@@ -26121,7 +26135,7 @@ begin
       iSorterCsr := -1;
       sortNKey := 0;
       if (p^.pOrderBy <> nil) and (p^.pHaving = nil)
-         and (p^.pGroupBy = nil) and (p^.pLimit = nil) then
+         and (p^.pGroupBy = nil) then
       begin
         bSort := 1;
         iSorterCsr := pParse^.nTab; Inc(pParse^.nTab);
@@ -26134,6 +26148,8 @@ begin
       end;
 
       addrEnd       := sqlite3VdbeMakeLabel(pParse);
+      if (bSort <> 0) and (p^.pLimit <> nil) then
+        computeLimitRegisters(pParse, p, addrEnd);
       addrTopOfLoop := sqlite3VdbeAddOp2(v, OP_Rewind, iCsr, addrEnd);
       addrSkip := sqlite3VdbeMakeLabel(pParse);
 
@@ -26202,8 +26218,9 @@ begin
       begin
         { generateSortTail — drain sorter; for SRT_EphemTab disposal
           re-emit MakeRecord + NewRowid + Insert(APPEND); for SRT_Output
-          emit ResultRow.  Mirrors C select.c:2906..2945 generateSortTail
-          subset (eDest in {Output, EphemTab}). }
+          emit ResultRow.  OFFSET applied post-sort via IfPos; LIMIT via
+          DecrJumpZero after the row.  Mirrors C select.c:2906..2945
+          generateSortTail subset (eDest in {Output, EphemTab}). }
         Inc(pParse^.nMem); regSortOut := pParse^.nMem;
         iSortTab := pParse^.nTab; Inc(pParse^.nTab);
         sqlite3VdbeAddOp3(v, OP_OpenPseudo, iSortTab, regSortOut,
@@ -26212,6 +26229,13 @@ begin
         sqlite3VdbeAddOp2(v, OP_SorterSort, iSorterCsr, addrSortBrk);
         addrSortLoop := sqlite3VdbeCurrentAddr(v);
         sqlite3VdbeAddOp3(v, OP_SorterData, iSorterCsr, regSortOut, iSortTab);
+        if p^.iOffset > 0 then
+        begin
+          addrSortContinue := sqlite3VdbeMakeLabel(pParse);
+          sqlite3VdbeAddOp3(v, OP_IfPos, p^.iOffset, addrSortContinue, 1);
+        end
+        else
+          addrSortContinue := 0;
         for i := 0 to nResultCol - 1 do
           sqlite3VdbeAddOp3(v, OP_Column, iSortTab, sortNKey + i,
                             pDest^.iSdst + i);
@@ -26228,6 +26252,10 @@ begin
         end
         else
           sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        if p^.iLimit <> 0 then
+          sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrSortBrk);
+        if addrSortContinue <> 0 then
+          sqlite3VdbeResolveLabel(v, addrSortContinue);
         sqlite3VdbeAddOp2(v, OP_SorterNext, iSorterCsr, addrSortLoop);
         sqlite3VdbeResolveLabel(v, addrSortBrk);
       end;
@@ -44999,7 +45027,7 @@ var
   res: i32;
 begin
   pVal := argv^;
-  t := sqlite3_value_type(Psqlite3_value(pVal));
+  t := sqlite3_value_numeric_type(Psqlite3_value(pVal));
   if (t <> SQLITE_INTEGER) and (t <> SQLITE_REAL) then Exit;
   r := sqlite3_value_double(Psqlite3_value(pVal));
   if r < 0.0 then res := -1

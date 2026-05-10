@@ -2728,6 +2728,32 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.127** Fixed 2026-05-10.  `ORDER BY ... LIMIT N` against a
+     CTE / VALUES coroutine source silently dropped the sort.  Reproducer:
+     `WITH r(n) AS (VALUES(1),(2),(3),(4),(5)) SELECT * FROM r ORDER BY n
+     DESC LIMIT 3;` returned `1, 2, 3` instead of upstream's `5, 4, 3`;
+     same for `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM
+     r WHERE n<5) SELECT * FROM r ORDER BY n DESC LIMIT 3;`.  Without
+     LIMIT both shapes sorted correctly.  Root cause: the viaCoroutine
+     consumer arm and the materialise arm in `sqlite3Select`
+     (passqlite3codegen.pas:25919 + 26123) both gated `bSort := 1` on
+     `p^.pLimit = nil` — when LIMIT was set the entire sort path was
+     skipped, the coroutine rows fell straight into ResultRow + LIMIT
+     decrement, and ORDER BY DESC silently degraded to "yield in
+     coroutine order".  Fix: drop the `pLimit = nil` clause; always
+     enter the sort path when pOrderBy is set.  Then route LIMIT/OFFSET
+     through the sort tail — `computeLimitRegisters` is now called even
+     when bSort=1, and the sort-drain emits `IfPos` (OFFSET skip)
+     before `Column`/`ResultRow` and `DecrJumpZero` after, mirroring
+     `generateSortTail` (select.c:1673).  Bonus: `sign('5')`,
+     `sign('-3')`, `sign('3.14')` (and any numeric-string input) now
+     return upstream's coerced `1`/`-1`/`1` instead of NULL — `signFunc`
+     was using `sqlite3_value_type` (declared type) rather than
+     `sqlite3_value_numeric_type` (coerces TEXT → numeric), diverging
+     from func.c:2630 `type0 = sqlite3_value_numeric_type(argv[0]);`.
+     TestExplainParity 1026/1026; full regression 69/69; 4965/4965
+     assertions clean; all Diag* probes 0 divergences.
+
 - [X] **10.1.bug.126** Fixed 2026-05-10.  JSON-function malformed-input
      errors were silently swallowed: `SELECT json_array_length('not json')`,
      `SELECT json('bad')`, `SELECT json_type('xx')`, etc. returned NULL /
