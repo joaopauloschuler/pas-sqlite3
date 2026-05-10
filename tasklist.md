@@ -2909,22 +2909,37 @@ existing dispatcher.
      json_tree, generate_series.  TestExplainParity 1026/1026; full
      regression 69 binaries pass; 4965/4965 assertions clean.
 
-- [ ] **10.1.bug.123** `WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL
-     SELECT i+1 FROM c WHERE i<5 ORDER BY 1 LIMIT 3) SELECT * FROM c;`
-     returns the empty result instead of `1, 2, 3`.  Pas drops the
-     recursive CTE entirely whenever the recursive arm carries an
-     ORDER BY / LIMIT.  Reproducer:
-     `bin/passqlite3 :memory: "WITH RECURSIVE c(i) AS (SELECT 1 UNION
-     ALL SELECT i+1 FROM c WHERE i<5 ORDER BY 1 LIMIT 3) SELECT * FROM c;"`.
-     Suspected: `generateOutputSubroutine` / the recursive-CTE compound
-     dispatch at codegen.pas does not propagate the ORDER BY / LIMIT
-     onto the queue; C reference handles this in select.c
-     `generateWithRecursiveQuery` where `pOrderBy` and `pLimit` from
-     the compound's outer SELECT are folded into the worktable read
-     loop (select.c around the line emitting OP_Yield from the queue
-     row).  Fix path: add the ORDER BY / LIMIT plumbing in
-     `generateWithRecursiveQuery` (or whatever the Pascal port name
-     is).
+- [X] **10.1.bug.123** Fixed 2026-05-10.  `WITH RECURSIVE c(i) AS (SELECT
+     1 UNION ALL SELECT i+1 FROM c WHERE i<5 ORDER BY 1 LIMIT 3) SELECT
+     * FROM c;` returned the empty result instead of `1,2,3`.  Pas dropped
+     the entire recursive CTE whenever ORDER BY was present (with or
+     without LIMIT).  Root cause: two missing dispatch arms for
+     `SRT_Queue` / `SRT_DistQueue` in `sqlite3Select`.  When ORDER BY is
+     attached to a recursive CTE, `generateWithRecursiveQuery` opens the
+     Queue ephemeral as a sorted btree and passes `SRT_Queue` (or
+     `SRT_DistQueue` for UNION) as destQueue.eDest.  Both the setup arm
+     `sqlite3Select(pSetup, &destQueue)` and the recursive arm
+     `sqlite3Select(p, &destQueue)` were dropped on the floor:
+     (a) the trivial-gate at codegen.pas:23780 bailed with SQLITE_OK
+     when eDest was anything other than the explicitly-listed set
+     (Output / Set / Mem / EphemTab / Coroutine / Fifo / DistFifo /
+     Upfrom / Exists), so the setup `SELECT 1` emitted zero opcodes;
+     (b) the FROM-having selectInnerLoop disposal block at
+     codegen.pas:26755..26842 had no SRT_Queue/SRT_DistQueue arm, so
+     the recursive arm fell through to the generic SRT_Set fallback
+     (MakeRecord+IdxInsert with affinity P4) which inserts the wrong
+     record shape (missing the [orderby-keys ; sequence ; payload]
+     layout the dequeue side reads).  Fix: add SRT_Queue /
+     SRT_DistQueue to the trivial-gate allow-list, port the
+     selectInnerLoop SRT_Queue dispatch (select.c:1469..1510) into both
+     the no-FROM fast path (codegen.pas:24006) and the FROM-having
+     disposal block (codegen.pas:26808).  Both arms emit MakeRecord
+     payload → SCopy iOrderByCol-1 keys → Sequence → MakeRecord full →
+     IdxInsert iSDParm; SRT_DistQueue also pre-emits Found+IdxInsert
+     against the dedup cursor at iSDParm+1.  Verified byte-identical to
+     the 3.53.0 oracle for ASC / DESC / multi-row ORDER BY / UNION dedup
+     /  LIMIT / no-LIMIT shapes.  TestExplainParity 1026/1026; full
+     regression 69 binaries pass; 4965/4965 assertions clean.
 
 - [X] **10.1.bug.121** Fixed 2026-05-10.  `LIMIT` / `OFFSET` were
      silently ignored on eponymous-vtab scans (`json_each`, `json_tree`,

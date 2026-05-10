@@ -23643,6 +23643,12 @@ var
   vdbeUA:       PVdbe;
   { No-FROM fast-path LIMIT/OFFSET tail label (6.10 step 9(e)). }
   addrEndNoFrom: i32;
+  { No-FROM SRT_Queue / SRT_DistQueue dispatch locals (10.1.bug.123). }
+  nKeyNF:       i32;
+  r3:           i32;
+  addrTestNF:   i32;
+  iiNF:         i32;
+  pSOItemsNF:   PExprListItem;
   { No-ORDER-BY UNION/INTERSECT/EXCEPT invented-ORDER-BY locals
     (multiSelect select.c:2984..2994). }
   pInvOne:      PExpr;
@@ -23773,6 +23779,7 @@ begin
      (pDest^.eDest <> SRT_Mem) and (pDest^.eDest <> SRT_EphemTab) and
      (pDest^.eDest <> SRT_Coroutine)
      and (pDest^.eDest <> SRT_Fifo) and (pDest^.eDest <> SRT_DistFifo)
+     and (pDest^.eDest <> SRT_Queue) and (pDest^.eDest <> SRT_DistQueue)
      and (pDest^.eDest <> SRT_Upfrom)
      and (not isExists)
   then begin Result := SQLITE_OK; Exit; end;
@@ -23907,6 +23914,7 @@ begin
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Coroutine)
           or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table)
           or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo)
+          or (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue)
           or (pDest^.eDest = SRT_Exists) or (pDest^.eDest = SRT_Set)
           or (pDest^.eDest = SRT_Mem))
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
@@ -24009,6 +24017,39 @@ begin
         in sqlite3CodeSubselect's destination init), so no further dispatch
         is needed.  Mirrors selectInnerLoop SRT_Mem arm (select.c:1325) which
         is a no-op when regResult == dest->iSDParm. }
+    end
+    else if (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue) then
+    begin
+      { SRT_Queue / SRT_DistQueue — used by generateWithRecursiveQuery's
+        setup arm when ORDER BY is present (the recursive-CTE Queue is a
+        sorted ephemeral keyed on ORDER BY columns + sequence + payload).
+        Mirrors selectInnerLoop SRT_DistQueue/SRT_Queue arm
+        (select.c:1469..1510, codegen.pas:20146..20179). }
+      Assert(pDest^.pOrderBy <> nil);
+      nKeyNF := pDest^.pOrderBy^.nExpr;
+      r1 := sqlite3GetTempReg(pParse);
+      r2 := sqlite3GetTempRange(pParse, nKeyNF + 2);
+      r3 := r2 + nKeyNF + 1;
+      addrTestNF := 0;
+      if pDest^.eDest = SRT_DistQueue then
+        addrTestNF := sqlite3VdbeAddOp4Int(v, OP_Found, pDest^.iSDParm + 1, 0,
+                                           pDest^.iSdst, nResultCol);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r3);
+      if pDest^.eDest = SRT_DistQueue then
+      begin
+        sqlite3VdbeAddOp2(v, OP_IdxInsert, pDest^.iSDParm + 1, r3);
+        sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+      end;
+      pSOItemsNF := ExprListItems(pDest^.pOrderBy);
+      for iiNF := 0 to nKeyNF - 1 do
+        sqlite3VdbeAddOp2(v, OP_SCopy,
+          pDest^.iSdst + i32(pSOItemsNF[iiNF].u.x.iOrderByCol) - 1, r2 + iiNF);
+      sqlite3VdbeAddOp2(v, OP_Sequence, pDest^.iSDParm, r2 + nKeyNF);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, r2, nKeyNF + 2, r1);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1, r2, nKeyNF + 2);
+      if addrTestNF <> 0 then sqlite3VdbeJumpHere(v, addrTestNF);
+      sqlite3ReleaseTempReg(pParse, r1);
+      sqlite3ReleaseTempRange(pParse, r2, nKeyNF + 2);
     end
     else
     begin
@@ -26763,6 +26804,39 @@ begin
       sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
       sqlite3ReleaseTempReg(pParse, r2);
       sqlite3ReleaseTempReg(pParse, r1);
+    end
+    else if (pDest^.eDest = SRT_Queue) or (pDest^.eDest = SRT_DistQueue) then
+    begin
+      { selectInnerLoop SRT_Queue / SRT_DistQueue arm (select.c:1469..1510).
+        Used by generateWithRecursiveQuery's recursive arm when ORDER BY is
+        present.  Layout in the Queue ephemeral: [ORDER BY keys ; sequence ;
+        payload-record].  See codegen.pas:20146..20179 for the parallel
+        no-FROM path. }
+      Assert(pDest^.pOrderBy <> nil);
+      nKeyNF := pDest^.pOrderBy^.nExpr;
+      r1 := sqlite3GetTempReg(pParse);
+      r2 := sqlite3GetTempRange(pParse, nKeyNF + 2);
+      r3 := r2 + nKeyNF + 1;
+      addrTestNF := 0;
+      if pDest^.eDest = SRT_DistQueue then
+        addrTestNF := sqlite3VdbeAddOp4Int(v, OP_Found, pDest^.iSDParm + 1, 0,
+                                           pDest^.iSdst, nResultCol);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r3);
+      if pDest^.eDest = SRT_DistQueue then
+      begin
+        sqlite3VdbeAddOp2(v, OP_IdxInsert, pDest^.iSDParm + 1, r3);
+        sqlite3VdbeChangeP5(v, OPFLAG_USESEEKRESULT);
+      end;
+      pSOItemsNF := ExprListItems(pDest^.pOrderBy);
+      for iiNF := 0 to nKeyNF - 1 do
+        sqlite3VdbeAddOp2(v, OP_SCopy,
+          pDest^.iSdst + i32(pSOItemsNF[iiNF].u.x.iOrderByCol) - 1, r2 + iiNF);
+      sqlite3VdbeAddOp2(v, OP_Sequence, pDest^.iSDParm, r2 + nKeyNF);
+      sqlite3VdbeAddOp3(v, OP_MakeRecord, r2, nKeyNF + 2, r1);
+      sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1, r2, nKeyNF + 2);
+      if addrTestNF <> 0 then sqlite3VdbeJumpHere(v, addrTestNF);
+      sqlite3ReleaseTempReg(pParse, r1);
+      sqlite3ReleaseTempRange(pParse, r2, nKeyNF + 2);
     end
     else if pDest^.eDest = SRT_Upfrom then
     begin
