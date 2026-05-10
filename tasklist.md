@@ -4092,6 +4092,26 @@ existing dispatcher.
      DiagDropTable / DiagCovering / DiagIndexing / DiagPredicates /
      DiagOrderLimitTopN / DiagAnalyze all 0 divergences.
 
+- [X] **10.1.bug.102** Fixed 2026-05-10.  CLI caret marker for parser-
+     emitted `near "%T": syntax error` anchored at column 0 instead of
+     under the offending token.  Reproducer:
+     `bin/passqlite3 :memory: 'SELECT * FROM (VALUES(1,2)) t(a,b);'`
+     emitted `  ^--- error here` flush against the left margin; the
+     3.53.0 oracle pointed at column 30 (under `(` of `t(a,b)`).  Root
+     cause: `yy_syntax_error` in passqlite3parser.pas:1554 routes around
+     `sqlite3ErrorMsg` (calling `sqlite3MPrintf` directly), so the
+     C-side `errByteOffset = -2` sentinel that lets `%T`'s formatter
+     drop the token offset via `sqlite3RecordErrorByteOffset` was never
+     set, and `sqlite3_error_offset` returned 0 (the initial value).
+     Fix: stamp `db^.errByteOffset := i32(yyminor.z - pPse^.zTail)`
+     immediately after the printf call, mirroring what
+     `sqlite3RecordErrorByteOffset` would have computed in the C path.
+     Verified byte-identical to oracle for the VALUES case plus
+     several additional syntactic-error reproducers (`SELECT FROM`,
+     `INSERT INTO t (a,b VALUES`, `WITH t AS (SELECT) FROM t`,
+     `DROP TABLE;`, etc.).  Regression suite 69/69 binaries /
+     4963/4963 assertions all clean; Diag* probes all 0 divergences.
+
 - [X] **10.1.bug.101** Fixed 2026-05-10.  `degrees(3.14159)` rendered as
      `179.99984796050427` (17 sig digits, last-place off) versus the
      3.53.0 oracle's `179.9998479605043` (16 sig digits).  Root cause:

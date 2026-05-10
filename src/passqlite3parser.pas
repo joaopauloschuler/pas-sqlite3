@@ -1558,6 +1558,14 @@ begin
         if pPse^.zErrMsg <> nil then sqlite3DbFree(db, pPse^.zErrMsg);
         pPse^.zErrMsg := zMsg;
       end;
+      { Stamp db^.errByteOffset so the CLI caret marker (10.1.bug.80)
+        anchors under the offending token.  Mirrors the C path where
+        sqlite3ErrorMsg sets errByteOffset=-2 then %T's formatter calls
+        sqlite3RecordErrorByteOffset(db, pToken->z) to record the offset. }
+      if (db <> nil) and (yyminor.z <> nil) and (pPse^.zTail <> nil)
+         and (PtrUInt(yyminor.z) >= PtrUInt(pPse^.zTail)) then
+        db^.errByteOffset :=
+          i32(PtrUInt(yyminor.z) - PtrUInt(pPse^.zTail));
     end;
   end else
     sqlite3ErrorMsg(pPse, 'incomplete input');
