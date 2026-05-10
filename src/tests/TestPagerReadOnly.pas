@@ -56,15 +56,52 @@ uses
   passqlite3pager;
 
 const
-  VECTORS_DIR = 'src/tests/vectors/';
-  SIMPLE_DB   = VECTORS_DIR + 'simple.db';
-  MULTI_DB    = VECTORS_DIR + 'multipage.db';
-
   SQLITE_MAGIC : array[0..15] of AnsiChar =
     ('S','Q','L','i','t','e',' ','f','o','r','m','a','t',' ','3',#0);
 
 var
   gPass: Boolean = True;
+  VECTORS_DIR: string;
+  SIMPLE_DB:   string;
+  MULTI_DB:    string;
+
+{ Locate src/tests/vectors/ regardless of current working directory.
+  run_regression.sh invokes each Test* binary in its own temp workdir
+  (so the literal `src/tests/vectors/` relative path no longer resolves);
+  walk parents of the binary and the cwd until the directory is found. }
+procedure ResolveVectorsDir;
+var
+  candidates: array[0..7] of string;
+  base, p: string;
+  i: i32;
+begin
+  base := ExtractFilePath(ParamStr(0));
+  if base = '' then base := '.' + DirectorySeparator;
+  candidates[0] := base + 'src/tests/vectors/';
+  candidates[1] := base + '../src/tests/vectors/';
+  candidates[2] := base + '../../src/tests/vectors/';
+  candidates[3] := base + '../../../src/tests/vectors/';
+  candidates[4] := 'src/tests/vectors/';
+  candidates[5] := '../src/tests/vectors/';
+  candidates[6] := '../../src/tests/vectors/';
+  candidates[7] := '../../../src/tests/vectors/';
+  for i := 0 to High(candidates) do
+  begin
+    p := candidates[i];
+    if FileExists(p + 'simple.db') and FileExists(p + 'multipage.db') then
+    begin
+      VECTORS_DIR := p;
+      SIMPLE_DB   := VECTORS_DIR + 'simple.db';
+      MULTI_DB    := VECTORS_DIR + 'multipage.db';
+      Exit;
+    end;
+  end;
+  { Fall back to the original literal so the failure message mirrors
+    the historical behaviour if the fixtures truly are missing. }
+  VECTORS_DIR := 'src/tests/vectors/';
+  SIMPLE_DB   := VECTORS_DIR + 'simple.db';
+  MULTI_DB    := VECTORS_DIR + 'multipage.db';
+end;
 
 procedure Pass(const name: string);
 begin
@@ -362,6 +399,8 @@ end;
 begin
   WriteLn('=== TestPagerReadOnly (Phase 3.B.2a) ===');
   WriteLn;
+
+  ResolveVectorsDir;
 
   sqlite3_os_init;
   sqlite3PcacheInitialize;

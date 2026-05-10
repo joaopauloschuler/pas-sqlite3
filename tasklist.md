@@ -72,15 +72,19 @@ FPC porting traps that recur often enough to call out up-front:
 > place as a fixed-bug record (matching the convention used by
 > `10.1.bug.*`).
 
-- [ ] **3.B.regbug.1** `TestPagerReadOnly` — **1 / 10 sub-tests pass**
-     (T1–T9 fail).  `sqlite3PagerOpen` returns `SQLITE_CANTOPEN` (rc=14)
-     for the read-only-fixture cases, so the pager never reaches the
-     read-only-locking assertions the test was written to exercise.  Root
-     cause is in the Phase 3 pager / VFS layer (fixture setup against an
-     existing read-only `.db`), not in Phase 6 codegen — the test was
-     authored to gate Phase 3.B.2a fixture work that has not yet landed.
-     Acceptance: 10 / 10 sub-tests pass with the fixture opened
-     read-only via the same VFS path the C reference uses.
+- [X] **3.B.regbug.1** `TestPagerReadOnly` — fixed 2026-05-10.
+     **10 / 10 sub-tests pass** under `run_regression.sh`.  Root cause
+     was a test-fixture defect rather than an engine bug: the test used
+     a literal `'src/tests/vectors/'` path which only resolves when the
+     binary is invoked from the repo root.  `run_regression.sh` runs
+     each Test* binary in its own temp workdir, so the fixtures could
+     not be opened — hence the `SQLITE_CANTOPEN (14)` cascade.  Fix:
+     `ResolveVectorsDir` in `TestPagerReadOnly.pas` walks parents of
+     `ParamStr(0)` and the cwd until it finds the vectors directory,
+     then sets `VECTORS_DIR` / `SIMPLE_DB` / `MULTI_DB` accordingly.
+     Engine-level read-only path was already correct (T10 has been
+     green throughout); the regression was strictly a path-resolution
+     defect in the test harness.
 
 - [X] **6.regbug.1** `TestWhereExpr` — fixed 2026-05-10.  84 / 84
      sub-tests pass.  Root cause was a test-fixture defect rather than
