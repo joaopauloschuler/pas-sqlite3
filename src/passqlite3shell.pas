@@ -1242,7 +1242,7 @@ begin
   if p^.zDestTable <> nil then
     rs.insertTab := AnsiString(p^.zDestTable)
   else
-    rs.insertTab := 'table';
+    rs.insertTab := 'tab';
   rs.lastStepRc      := SQLITE_DONE;
   rs.lineMaxNameLen  := 0;
 end;
@@ -1315,6 +1315,26 @@ begin
           Write('<TH>'); outputHtmlString(colNameStr(pStmt, i)); WriteLn;
         end;
         WriteLn('</TR>');
+      end;
+    MODE_Quote:
+      { Upstream qrf.c emits each title cell as a single-quoted SQL
+        literal separated by zColSep, then zRowSep. }
+      begin
+        for i := 0 to rs.nCol - 1 do begin
+          if i > 0 then Write(rs.zColSep);
+          outputSqlQuoted(colNameStr(pStmt, i));
+        end;
+        Write(rs.zRowSep);
+      end;
+    MODE_Tcl:
+      { Upstream MODE_Tcl emits headers through outputCString
+        regardless of type. }
+      begin
+        for i := 0 to rs.nCol - 1 do begin
+          if i > 0 then Write(rs.zColSep);
+          outputCString(colNameStr(pStmt, i));
+        end;
+        Write(rs.zRowSep);
       end;
   end;
 end;
@@ -1584,6 +1604,7 @@ var
   isBox, isTable, isCol, isMd: Boolean;
   glyphTL, glyphTR, glyphBL, glyphBR: AnsiString;
   glyphHB, glyphVB, glyphCx, glyphTU, glyphTD, glyphTL2, glyphTR2: AnsiString;
+  glyphHdrHB, glyphHdrCx: AnsiString;
   rowSep, hdrSep, footSep: AnsiString;
   sb: AnsiString;
   align: i32;
@@ -1642,22 +1663,28 @@ begin
 
   { Glyphs. }
   if isBox then begin
-    glyphTL  := #$E2#$94#$8C; { ┌ }
-    glyphTR  := #$E2#$94#$90; { ┐ }
-    glyphBL  := #$E2#$94#$94; { └ }
-    glyphBR  := #$E2#$94#$98; { ┘ }
+    { Upstream qrf.c: top corners + below-header separator use rounded
+      glyphs (BOX_R23/R34/R12/R14) and the title/data divider switches to
+      doubled lines (DBL_24 / DBL_123 / DBL_1234 / DBL_134). }
+    glyphTL  := #$E2#$95#$AD; { ╭  BOX_R23 }
+    glyphTR  := #$E2#$95#$AE; { ╮  BOX_R34 }
+    glyphBL  := #$E2#$95#$B0; { ╰  BOX_R12 }
+    glyphBR  := #$E2#$95#$AF; { ╯  BOX_R14 }
     glyphHB  := #$E2#$94#$80; { ─ }
     glyphVB  := #$E2#$94#$82; { │ }
     glyphCx  := #$E2#$94#$BC; { ┼ }
     glyphTU  := #$E2#$94#$B4; { ┴ }
     glyphTD  := #$E2#$94#$AC; { ┬ }
-    glyphTL2 := #$E2#$94#$9C; { ├ }
-    glyphTR2 := #$E2#$94#$A4; { ┤ }
+    glyphTL2 := #$E2#$95#$9E; { ╞  DBL_123 }
+    glyphTR2 := #$E2#$95#$A1; { ╡  DBL_134 }
+    glyphHdrHB := #$E2#$95#$90; { ═  DBL_24 }
+    glyphHdrCx := #$E2#$95#$AA; { ╪  DBL_1234 }
   end else if isTable then begin
     glyphTL := '+'; glyphTR := '+'; glyphBL := '+'; glyphBR := '+';
     glyphHB := '-'; glyphVB := '|';
     glyphCx := '+'; glyphTU := '+'; glyphTD := '+';
     glyphTL2 := '+'; glyphTR2 := '+';
+    glyphHdrHB := '-'; glyphHdrCx := '+';
   end else if isMd then begin
     { Markdown — pipe borders, no top/bottom rules; the only horizontal
       rule sits between header and rows and uses '-'. }
@@ -1665,12 +1692,14 @@ begin
     glyphHB := '-'; glyphVB := '|';
     glyphCx := '|'; glyphTU := ''; glyphTD := '';
     glyphTL2 := '|'; glyphTR2 := '|';
+    glyphHdrHB := '-'; glyphHdrCx := '|';
   end else begin
     { Column mode — no borders. }
     glyphTL := ''; glyphTR := ''; glyphBL := ''; glyphBR := '';
     glyphHB := '-'; glyphVB := '';
     glyphCx := ''; glyphTU := ''; glyphTD := '';
     glyphTL2 := ''; glyphTR2 := '';
+    glyphHdrHB := '-'; glyphHdrCx := '';
   end;
 
   { Helper to build the horizontal rule between rows (Box / Table). }
@@ -1688,8 +1717,8 @@ begin
 
     sb := glyphTL2;
     for c := 0 to nCol - 1 do begin
-      if c > 0 then sb := sb + glyphCx;
-      for i := 0 to widths[c] + 1 do sb := sb + glyphHB;
+      if c > 0 then sb := sb + glyphHdrCx;
+      for i := 0 to widths[c] + 1 do sb := sb + glyphHdrHB;
     end;
     sb := sb + glyphTR2;
     hdrSep := sb;
@@ -1736,10 +1765,16 @@ begin
       WriteLn(glyphVB);
       WriteLn(hdrSep);
     end else begin
-      { MODE_Column header row. }
+      { MODE_Column header row.  Upstream qrf.c (~2014) sets eTitleAlign
+        to QRF_ALIGN_Center for the title row, then qrfRTrim strips
+        trailing whitespace before the row separator. }
       for c := 0 to nCol - 1 do begin
         if c > 0 then Write('  ');
-        padCell(headers[c], widths[c]);
+        w := widths[c] - utf8DispWidth(headers[c]);
+        if w > 0 then Write(StringOfChar(' ', w div 2));
+        Write(headers[c]);
+        if (c < nCol - 1) and (w > 0) then
+          Write(StringOfChar(' ', w - (w div 2)));
       end;
       WriteLn;
       for c := 0 to nCol - 1 do begin
@@ -1761,9 +1796,13 @@ begin
       end;
       WriteLn(glyphVB);
     end else begin
+      { MODE_Column data row.  Upstream qrfRTrim trims trailing
+        whitespace on every Column row, so don't pad the rightmost
+        cell. }
       for c := 0 to nCol - 1 do begin
         if c > 0 then Write('  ');
-        padCell(matrix[rc, c], widths[c]);
+        if c = nCol - 1 then Write(matrix[rc, c])
+        else padCell(matrix[rc, c], widths[c]);
       end;
       WriteLn;
     end;

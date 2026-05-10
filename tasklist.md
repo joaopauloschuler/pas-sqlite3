@@ -2685,6 +2685,44 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.87** Fixed 2026-05-10.  CLI shell mode renderers diverged
+     from the 3.53.0 oracle in four places that all surfaced when
+     differential-testing every `.mode` × `.headers` combination:
+     (a) `.mode insert` defaulted the destination table name to `table`
+     instead of upstream's `tab` (qrf.c:2775 `p->spec.zTableName = "tab"`),
+     producing `INSERT INTO table VALUES(...)` rows that re-execute against
+     the wrong destination;
+     (b) `.mode box` still used the legacy square-corner glyphs
+     `┌ ┐ ├ ┼ ┤ └ ┘` and a single-line under-header rule, where 3.53.0's
+     qrf.c (1624..1634, 2089/2223/2260) switched to rounded outer corners
+     `╭ ╮ ╰ ╯` and a doubled-line title/data divider `╞ ═ ╪ ╡`;
+     (c) `.mode column` left-padded the header row, where qrf.c (~2014)
+     center-aligns title cells via QRF_ALIGN_Center, and pas also padded
+     the rightmost column with trailing whitespace where qrf.c
+     (qrfRTrim, qrf.c:2179/2199/2242/2247) strips trailing whitespace on
+     every Column row;
+     (d) `.headers on` with `.mode quote` and `.mode tcl` emitted no
+     header row at all because emitHeader had no arms for those styles.
+     Fixes (passqlite3shell.pas):
+       - `renderInit` defaults `insertTab` to `'tab'` instead of `'table'`.
+       - `emitColumnar` now selects rounded corners for Box top/bottom
+         and a doubled-line glyph pair (DBL_24/DBL_123/DBL_1234/DBL_134)
+         for the under-header rule (split into glyphHdrHB / glyphHdrCx);
+         Table and Markdown keep `+ -- |` and `--- |` respectively.
+       - `emitColumnar` MODE_Column header centers each header cell
+         (left-half then right-half spaces) and skips the trailing pad
+         on the last column; data rows likewise skip the trailing pad on
+         the last column to match qrfRTrim.
+       - `emitHeader` adds MODE_Quote (single-quoted-literal title row
+         joined by zColSep + zRowSep) and MODE_Tcl (each header through
+         outputCString, joined by zColSep + zRowSep).
+     Verified byte-identical against `bin/sqlite3` (3.53.0 oracle) for
+     all 14 modes (list / line / column / csv / tabs / html / insert /
+     quote / json / markdown / table / box / tcl / ascii) × `.headers
+     {on, off}`, both with and without `.headers on`.
+     Regression: 68 binaries pass / 1 known fail (TestPagerReadOnly).
+     TestExplainParity unchanged at 1026/1026.
+
 - [X] **10.1.bug.86** Fixed 2026-05-10.  CLI shell rendered raw control
      bytes (e.g. result of `SELECT x'0102';`) as literal binary instead of
      the upstream `^X` symbol form.  Reproducer:
