@@ -8818,6 +8818,124 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  { ResolveAliasInWhere — mirrors ResolveAliasInHaving but enforces
+    resolve.c:674..683 in the NC_AllowAgg=0 / NC_AllowWin=0 context that
+    applies to WHERE.  Aggregate / window aliases referenced in WHERE
+    are illegal; emit the upstream "misuse of aggregate / window function"
+    error rather than swapping the expression in (which would otherwise
+    confuse the WHERE codegen). }
+  procedure ResolveAliasInWhere(pE: PExpr); forward;
+
+  procedure ResolveAliasInWhereList(pList: PExprList);
+  var
+    i:     i32;
+    items: PExprListItem;
+  begin
+    if pList = nil then Exit;
+    items := ExprListItems(pList);
+    for i := 0 to pList^.nExpr - 1 do
+      ResolveAliasInWhere(items[i].pExpr);
+  end;
+
+  function ExprIsOrContainsAggregate(pX: PExpr): i32;
+    { Returns 1 if pX (or any descendant) is an aggregate function call,
+      2 if it contains a window function, else 0.  The Pas port has not
+      yet rewritten TK_FUNCTION to TK_AGG_FUNCTION at this point in the
+      resolution pipeline (markAggregateInExprList runs later), so the
+      check probes FuncDef^.xFinalize via sqlite3FindFunction. }
+  var
+    pDef: PTFuncDef;
+    db:   PTsqlite3;
+    n:    i32;
+    sub:  i32;
+    items: PExprListItem;
+    i:    i32;
+  begin
+    Result := 0;
+    if pX = nil then Exit;
+    if ExprHasProperty(pX, EP_WinFunc) then begin Result := 2; Exit; end;
+    if pX^.op = TK_AGG_FUNCTION then begin Result := 1; Exit; end;
+    if (pX^.op = TK_FUNCTION) and (pX^.u.zToken <> nil) then
+    begin
+      if ExprUseXList(pX) and (pX^.x.pList <> nil) then
+        n := pX^.x.pList^.nExpr
+      else
+        n := 0;
+      db := pParse^.db;
+      pDef := sqlite3FindFunction(db, pX^.u.zToken, n, db^.enc, 0);
+      if (pDef = nil) and (n <> 0) then
+        pDef := sqlite3FindFunction(db, pX^.u.zToken, -1, db^.enc, 0);
+      if (pDef <> nil) and Assigned(pDef^.xFinalize) then begin Result := 1; Exit; end;
+    end;
+    if not ExprHasProperty(pX, EP_TokenOnly or EP_Leaf) then
+    begin
+      sub := ExprIsOrContainsAggregate(pX^.pLeft);
+      if sub <> 0 then begin Result := sub; Exit; end;
+      sub := ExprIsOrContainsAggregate(pX^.pRight);
+      if sub <> 0 then begin Result := sub; Exit; end;
+      if not ExprHasProperty(pX, EP_xIsSelect) and (pX^.x.pList <> nil) then
+      begin
+        items := ExprListItems(pX^.x.pList);
+        for i := 0 to pX^.x.pList^.nExpr - 1 do
+        begin
+          sub := ExprIsOrContainsAggregate(items[i].pExpr);
+          if sub <> 0 then begin Result := sub; Exit; end;
+        end;
+      end;
+    end;
+  end;
+
+  procedure ResolveAliasInWhere(pE: PExpr);
+  var
+    iCol:    i32;
+    items:   PExprListItem;
+    pOrig:   PExpr;
+    zAs:     PAnsiChar;
+    aggKind: i32;
+  begin
+    if pE = nil then Exit;
+    if pE^.op = TK_DOT then Exit;
+    if (pE^.op = TK_ID)
+       and ((pE^.flags and EP_IntValue) = 0)
+       and (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
+    begin
+      if ColumnInFromClause(pE^.u.zToken) then Exit;
+      if sqlite3IsRowid(pE^.u.zToken) <> 0 then Exit;
+      iCol := ResolveAsName(p^.pEList, pE);
+      if iCol > 0 then
+      begin
+        items := ExprListItems(p^.pEList);
+        pOrig := items[iCol - 1].pExpr;
+        zAs := items[iCol - 1].zEName;
+        aggKind := ExprIsOrContainsAggregate(pOrig);
+        if aggKind = 1 then
+        begin
+          sqlite3ErrorMsg(pParse,
+            PAnsiChar('misuse of aliased aggregate ' + AnsiString(zAs)));
+          Exit;
+        end;
+        if aggKind = 2 then
+        begin
+          sqlite3ErrorMsg(pParse,
+            PAnsiChar('misuse of aliased window function ' + AnsiString(zAs)));
+          Exit;
+        end;
+        resolveAlias(pParse, p^.pEList, iCol - 1, pE, 0);
+      end;
+      Exit;
+    end;
+    ResolveAliasInWhere(pE^.pLeft);
+    ResolveAliasInWhere(pE^.pRight);
+    if not ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then
+    begin
+      if not ExprHasProperty(pE, EP_xIsSelect) then
+        ResolveAliasInWhereList(pE^.x.pList);
+      if ExprHasProperty(pE, EP_WinFunc) and (pE^.y.pWin <> nil)
+         and (pE^.y.pWin^.pFilter <> nil) then
+        ResolveAliasInWhere(pE^.y.pWin^.pFilter);
+    end;
+  end;
+
 var
   pTopSel: PSelect;
 begin
@@ -8830,7 +8948,16 @@ begin
   while p <> nil do
   begin
   ResolveExprList(p^.pEList);
-  ResolveExpr    (p^.pWhere);
+  { resolve.c:1987..1989 — NC_UEList is in effect when resolving WHERE,
+    so a bare TK_ID that does not match a FROM column may bind to a
+    result-set alias.  This port lacks the NC_UEList fallback in its
+    simplified ResolveExpr; reuse the HAVING alias-rewriter, which walks
+    the tree pre-resolution and swaps any alias-matching TK_ID for the
+    underlying pEList expression. }
+  if p^.pWhere <> nil then
+    ResolveAliasInWhere(p^.pWhere);
+  if pParse^.nErr = 0 then
+    ResolveExpr    (p^.pWhere);
   { Pas-port deviation from resolve.c:1797 (which skips alias-tagging for
     GROUP BY because lookupName's NC_UEList fallback handles it during
     sqlite3ResolveExprNames).  This port lacks the NC_UEList fallback in

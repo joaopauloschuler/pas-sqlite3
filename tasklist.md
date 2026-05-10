@@ -2886,6 +2886,34 @@ existing dispatcher.
      TestExplainParity 1026/1026; full regression 69/69; 4963/4963
      assertions clean.
 
+- [X] **10.1.bug.120** Fixed 2026-05-10.  Result-set column aliases were
+     not visible in the WHERE clause: `SELECT a, a*2 AS d FROM t WHERE
+     d>2` returned `no such column: d` while the C oracle returns the
+     filtered rows.  This is the goofy-but-supported SQLite extension
+     documented at resolve.c:640..698 — when a bareword in WHERE/HAVING
+     fails to bind to any FROM column, `lookupName` falls back to the
+     pEList and rewrites the TK_ID into a copy of the matching alias's
+     expression (resolveAlias swap).  The Pascal port's simplified
+     resolver implemented this fallback for HAVING via
+     `ResolveAliasInHaving` but never wired the equivalent for WHERE,
+     so any alias-in-WHERE failed.  Fix in passqlite3codegen.pas
+     `sqlite3ResolveSelectNames`: added a `ResolveAliasInWhere` walker
+     that mirrors the HAVING helper but, in NC_AllowAgg=0/NC_AllowWin=0
+     context (resolve.c:674..683), rejects aliases whose underlying
+     pEList expression is/contains an aggregate or window function with
+     the upstream "misuse of aliased aggregate / window function" error
+     instead of swapping in the offender (which would otherwise produce
+     an aggregate-in-WHERE node that AVs in codegen).  Aggregate
+     detection probes FuncDef^.xFinalize via sqlite3FindFunction because
+     the Pascal resolver has not yet rewritten TK_FUNCTION → TK_AGG_FUNCTION
+     at this point in the pipeline (markAggregateInExprList runs later).
+     Verified: alias-in-WHERE works for arithmetic / IN / BETWEEN / IS
+     NULL / AND-chained predicates; FROM-column shadowing is preserved
+     (FROM `b` wins over `SELECT a AS b`); aggregate aliases now error
+     cleanly instead of crashing; HAVING alias paths and pre-existing
+     ORDER BY / GROUP BY alias resolution unaffected.  TestExplainParity
+     1026/1026; full regression 69/69; 4965/4965 assertions clean.
+
 - [ ] **10.1.bug.113** `SELECT * FROM (SELECT 1) UNION SELECT 99` (and
      symmetric / INTERSECT / EXCEPT forms with a subquery or CTE in
      either arm) crash with EAccessViolation in `OP_Rewind` (vdbe.pas:7872,
