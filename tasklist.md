@@ -2648,6 +2648,54 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.80** Fixed 2026-05-09.  CLI shell parse-/runtime-error
+     output omitted the upstream two-line "code-with-caret" context block
+     under each error message.  Reproducer: `echo "SELECT abc;" |
+     bin/passqlite3 :memory:` printed only `Parse error near line 1: no
+     such column: abc`, where upstream additionally emits
+     `\n  SELECT abc;\n         ^--- error here` so the user can locate
+     the offending token at a glance.  Root cause: `runOneSqlLine`
+     (passqlite3shell.pas) emitted `Format('%s %s'#10, prefix, errmsg)`
+     without ever calling the `shell_error_context` helper that upstream's
+     `save_err_msg` (shell.c.in:2603..2635 / 2695..2716) appends to the
+     errmsg before returning.  Fix: ported `shell_error_context` 1:1 as
+     `shellErrorContext`, including the iOffset>50 forward-walk that
+     skips UTF-8 continuation bytes, the 78-char tail truncation that
+     respects UTF-8 boundaries, the IsSpace→' ' substitution, and the
+     dual `iOffset<25 ? "^--- error here" : "error here ---^"` formatter.
+     Wired into both error sites in `runOneSqlLine` (parse and step).
+     Caveats: (a) for "no such column" / resolver-class errors the
+     Pascal engine does not yet stamp `db^.errByteOffset`, so the caret
+     anchors at column 0 instead of the offending token (engine gap —
+     filed as 10.1.bug.81 below); (b) Pascal's `sqlite3_errmsg` for
+     `unrecognized token` omits the `: "<tokentext>"` tail (engine gap,
+     filed as 10.1.bug.82).  Both are pre-existing parser/resolver
+     issues that this shell-side fix does NOT introduce — it just makes
+     them visible.  TestExplainParity 1026/1026; full regression
+     67 binaries pass / 2 known fail (TestPagerReadOnly,
+     TestWhereExpr — pre-existing); DiagFeatureProbe 0 divergences.
+
+- [ ] **10.1.bug.81** `sqlite3_error_offset` returns -1 (or 0 from
+     uninitialised state) for resolver-class errors such as `no such
+     column: abc`.  Reproducer: `sqlite3_prepare_v2(db,"SELECT abc",...)`
+     leaves the engine reporting `errByteOffset=0` while upstream
+     stamps the offset of the offending TK_ID token (8 in
+     ` SELECT abc;`).  Surface: `bin/passqlite3` caret marker (10.1.bug.80)
+     anchors at column 0 instead of under `abc`.  Fix path: in the
+     resolver (passqlite3codegen.pas resolveAlphaOrAggrOrFnOrCol arms),
+     stamp `db^.errByteOffset := pExpr^.w.iOfst` before raising the
+     `no such column` / `no such table` / `ambiguous column` errors,
+     mirroring the existing arm at codegen.pas:3690 used by other
+     resolver-class diagnostics.
+
+- [ ] **10.1.bug.82** Tokenizer error message omits the offending token
+     text.  Reproducer: `SELECT 1 FROM 2x;` errors with
+     `unrecognized token` in the Pascal port but
+     `unrecognized token: "2x"` upstream.  Expected to be a small fix
+     in the tokenizer's error-string emission path
+     (passqlite3parser.pas) where the bad-token slice is dropped before
+     reaching `sqlite3ErrorMsg`.
+
 - [X] **10.1.bug.78** Fixed 2026-05-08.  CLI shell `.mode line` / `.mode
      json` / `.mode tcl` / `.mode html` / `.mode insert <name>` produced
      output that diverged from upstream byte-for-byte:

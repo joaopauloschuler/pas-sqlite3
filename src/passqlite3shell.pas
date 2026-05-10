@@ -1804,6 +1804,59 @@ begin
   end;
 end;
 
+{ shell_error_context — shell.c.in:2603..2635.  Returns a two-line
+  ASCII context block pointing at the offending token in zSql, using
+  sqlite3_error_offset(db) as the byte offset.  Returns '' if no
+  meaningful offset is available.  The returned string starts with a
+  newline, so callers append it directly after the one-line errmsg. }
+function shellErrorContext(const zSql: AnsiString; db: Psqlite3): AnsiString;
+var
+  iOffset: i32;
+  zCode: AnsiString;
+  pBase: PAnsiChar;
+  remOff, len: Integer;
+  i: Integer;
+  pad: AnsiString;
+begin
+  Result := '';
+  if (db = nil) or (zSql = '') then Exit;
+  iOffset := sqlite3_error_offset(db);
+  if (iOffset < 0) or (iOffset >= Length(zSql)) then Exit;
+  pBase := PAnsiChar(zSql);
+  remOff := iOffset;
+  { Walk forward by single bytes (skipping UTF-8 continuation bytes
+    that follow), keeping iOffset aligned to the visible offset of
+    the token within the displayed window.  Mirrors shell.c:2616..2620. }
+  while remOff > 50 do begin
+    Dec(remOff);
+    Inc(pBase);
+    while (Byte(pBase^) and $C0) = $80 do begin
+      Inc(pBase);
+      Dec(remOff);
+    end;
+  end;
+  len := StrLen(pBase);
+  if len > 78 then begin
+    len := 78;
+    while (len > 0) and ((Byte(pBase[len]) and $C0) = $80) do Dec(len);
+  end;
+  SetLength(zCode, len);
+  if len > 0 then Move(pBase^, zCode[1], len);
+  { Replace whitespace bytes with regular space so the context line is
+    a single visible row.  Mirrors shell.c:2628 IsSpace -> ' '. }
+  for i := 1 to len do
+    if zCode[i] in [#9, #10, #11, #12, #13] then zCode[i] := ' ';
+  if remOff < 25 then begin
+    SetLength(pad, remOff);
+    if remOff > 0 then FillChar(pad[1], remOff, ' ');
+    Result := #10 + '  ' + zCode + #10 + '  ' + pad + '^--- error here';
+  end else begin
+    SetLength(pad, remOff - 14);
+    if (remOff - 14) > 0 then FillChar(pad[1], remOff - 14, ' ');
+    Result := #10 + '  ' + zCode + #10 + '  ' + pad + 'error here ---^';
+  end;
+end;
+
 function shellErrPrefix(const zErrorType, zSrc: AnsiString;
                         lineno: i64): AnsiString;
 begin
@@ -1835,6 +1888,8 @@ var
   pzTail: PAnsiChar;
   rc: i32;
   pBase, pCursor, pEnd: PAnsiChar;
+  zStmtSql: AnsiString;
+  zCtx: AnsiString;
 begin
   Result := 0;
   if p^.db = nil then openDb(p, 0);
@@ -1845,11 +1900,14 @@ begin
   while (pCursor <> nil) and (pCursor < pEnd) and (pCursor^ <> #0) do begin
     pStmt := nil;
     pzTail := nil;
+    zStmtSql := AnsiString(pCursor);
     rc := sqlite3_prepare_v2(p^.db, pCursor, -1, @pStmt, @pzTail);
     if rc <> SQLITE_OK then begin
-      shellEPutZ(Format('%s %s'#10,
+      zCtx := shellErrorContext(zStmtSql, p^.db);
+      shellEPutZ(Format('%s %s%s'#10,
         [string(shellErrPrefix('Parse error', zSrc, lineno)),
-         AnsiString(sqlite3_errmsg(p^.db))]));
+         AnsiString(sqlite3_errmsg(p^.db)),
+         string(zCtx)]));
       Inc(Result);
       Exit;
     end;
@@ -1876,9 +1934,11 @@ begin
         UNIQUE / FK constraint violations).  Pascal port has no QRF,
         so reset+finalize would otherwise emit the wrong prefix —
         always use "Error" here to match upstream byte-output. }
-      shellEPutZ(Format('%s %s'#10,
+      zCtx := shellErrorContext(zStmtSql, p^.db);
+      shellEPutZ(Format('%s %s%s'#10,
         [string(shellErrPrefix('Error', zSrc, lineno)),
-         AnsiString(sqlite3_errmsg(p^.db))]));
+         AnsiString(sqlite3_errmsg(p^.db)),
+         string(zCtx)]));
       Inc(Result);
     end;
     if (pzTail = nil) or (pzTail = pCursor) then Exit;
