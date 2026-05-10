@@ -44759,8 +44759,20 @@ begin
     MATH_TAG_ACOSH:    ans := Math.arccosh(v);
     MATH_TAG_ASINH:    ans := Math.arcsinh(v);
     MATH_TAG_ATANH:    ans := Math.arctanh(v);
-    MATH_TAG_DEGTORAD: ans := v * (System.Pi / 180.0);
-    MATH_TAG_RADTODEG: ans := v * (180.0 / System.Pi);
+    { Mirror C's `static double degToRad/radToDeg(double x){ return x*(M_PI/180.0); }`.
+      System.Pi is Extended on FPC; evaluating the divide in Extended yields a
+      different last-place double than C's pure-double evaluation, so force
+      the constant to round to Double first. }
+    MATH_TAG_DEGTORAD:
+      begin
+        ans := Double(3.141592653589793) / Double(180.0);
+        ans := v * ans;
+      end;
+    MATH_TAG_RADTODEG:
+      begin
+        ans := Double(180.0) / Double(3.141592653589793);
+        ans := v * ans;
+      end;
   else
     ans := v;
   end;

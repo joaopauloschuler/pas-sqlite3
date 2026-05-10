@@ -4092,6 +4092,27 @@ existing dispatcher.
      DiagDropTable / DiagCovering / DiagIndexing / DiagPredicates /
      DiagOrderLimitTopN / DiagAnalyze all 0 divergences.
 
+- [X] **10.1.bug.101** Fixed 2026-05-10.  `degrees(3.14159)` rendered as
+     `179.99984796050427` (17 sig digits, last-place off) versus the
+     3.53.0 oracle's `179.9998479605043` (16 sig digits).  Root cause:
+     `math1Func` in passqlite3codegen.pas:44762..44763 implemented
+     `degrees`/`radians` as `v * (System.Pi / 180.0)` and
+     `v * (180.0 / System.Pi)`.  FPC's `System.Pi` is `Extended`
+     (80-bit), so the constant divide was evaluated in 80-bit and only
+     rounded to Double when stored in `ans`, yielding a slightly
+     different last-place double than C's pure-double
+     `static double radToDeg(double x){ return x*(180.0/M_PI); }` from
+     func.c:2553..2554 (where `M_PI` is the math.h `double` value).  Fix:
+     compute the conversion factor as a Double-typed expression first
+     (`Double(180.0)/Double(3.141592653589793)`) into `ans`, then
+     multiply by `v`.  This matches C's evaluation precision exactly.
+     Verified `degrees(3.14159)`, `degrees(1)`, `degrees(2)`,
+     `degrees(0.5)`, `degrees(3.14160)`, `radians(180.0)` all
+     byte-identical to oracle, including the bit-exact
+     `printf('%!.20e', degrees(3.14159))` →
+     `1.79999847960504297e+02`.  Regression suite 69/69 binaries /
+     4963/4963 assertions all clean.
+
 - [X] **10.1.bug.99** Fixed 2026-05-10.  CLI caret marker for "no such
      function" / "wrong number of arguments to function" anchored at
      column 0 instead of under the failing token.  Reproducer:
