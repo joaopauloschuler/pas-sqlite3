@@ -2886,6 +2886,30 @@ existing dispatcher.
      TestExplainParity 1026/1026; full regression 69/69; 4963/4963
      assertions clean.
 
+- [X] **10.1.bug.121** Fixed 2026-05-10.  `LIMIT` / `OFFSET` were
+     silently ignored on eponymous-vtab scans (`json_each`, `json_tree`,
+     `pragma_*`, `generate_series`, ...): `SELECT * FROM
+     json_tree('[1,2,[3,4]]') LIMIT 2` returned all 6 rows instead of 2;
+     `SELECT value FROM json_each('[10,20,30,40]') LIMIT 2 OFFSET 1`
+     returned all 4 rows.  Root cause: the eponymous-vtab fast-arm in
+     `sqlite3Select` (codegen.pas:25452..25637, ported under Phase
+     6.13(a)) bypasses `sqlite3WhereBegin` and emits `OP_VOpen` /
+     `OP_VFilter` / `OP_VNext` directly, which means `selectInnerLoop`'s
+     LIMIT/OFFSET plumbing never ran — `computeLimitRegisters` was not
+     invoked, so `p^.iLimit` / `p^.iOffset` stayed 0, no
+     `OP_DecrJumpZero` was emitted after `OP_ResultRow`, and no
+     `OP_IfPos` was emitted before it.  Mirrors the C reference path
+     where `whereLoopAddVirtual` flows through `sqlite3WhereBegin` and
+     `selectInnerLoop` (select.c:1939..2003 emits codeOffset; select.c
+     emits OP_DecrJumpZero on iLimit just past OP_ResultRow).  Fix:
+     before emitting `OP_VFilter`, call
+     `computeLimitRegisters(pParse, p, addrEnd)`; allocate `addrSkip`
+     when either `pWhere` or `iOffset` is set; emit
+     `codeOffset(v, p^.iOffset, addrSkip)` after the WHERE check; emit
+     `OP_DecrJumpZero p^.iLimit, addrEnd` after `OP_ResultRow`.
+     TestExplainParity 1026/1026; full regression 69/69; 4965/4965
+     assertions clean.
+
 - [X] **10.1.bug.120** Fixed 2026-05-10.  Result-set column aliases were
      not visible in the WHERE clause: `SELECT a, a*2 AS d FROM t WHERE
      d>2` returned `no such column: d` while the C oracle returns the

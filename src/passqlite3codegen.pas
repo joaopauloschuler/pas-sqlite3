@@ -25588,6 +25588,14 @@ begin
       { OP_VFilter iCsr, addrEof, regQuery — p4 = idxStr returned by
         xBestIndex (or nil).  On EOF jumps to addrEof. }
       addrEnd := sqlite3VdbeMakeLabel(pParse);
+
+      { LIMIT/OFFSET register allocation — mirrors the call site in
+        sqlite3Select before selectInnerLoop.  Without this, LIMIT/OFFSET
+        on an eponymous-vtab scan (json_each, json_tree, generate_series,
+        pragma_*) is silently ignored because the regular WhereBegin
+        path that owns LIMIT plumbing is bypassed in this fast-arm. }
+      computeLimitRegisters(pParse, p, addrEnd);
+
       if vtabIdxStr <> nil then
       begin
         if vtabNeedFree <> 0 then r1 := P4_DYNAMIC else r1 := P4_STATIC;
@@ -25603,14 +25611,16 @@ begin
         eTabType=TABTYP_VTAB routes through OP_VColumn.  When p^.pWhere
         is present, evaluate it before the result emit and jump to the
         VNext on false (skip the row). }
-      if p^.pWhere <> nil then
-      begin
-        addrSkip := sqlite3VdbeMakeLabel(pParse);
-        sqlite3ExprIfFalse(pParse, p^.pWhere, addrSkip,
-                           SQLITE_JUMPIFNULL);
-      end
+      if (p^.pWhere <> nil) or (p^.iOffset <> 0) then
+        addrSkip := sqlite3VdbeMakeLabel(pParse)
       else
         addrSkip := 0;
+      if p^.pWhere <> nil then
+        sqlite3ExprIfFalse(pParse, p^.pWhere, addrSkip,
+                           SQLITE_JUMPIFNULL);
+      { OFFSET — skip the first p^.iOffset rows that satisfy WHERE. }
+      if p^.iOffset <> 0 then
+        codeOffset(v, p^.iOffset, addrSkip);
       items := ExprListItems(pEList);
       for i := 0 to nResultCol - 1 do
       begin
@@ -25621,6 +25631,9 @@ begin
       end;
       if pDest^.eDest = SRT_Output then
         sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+      { LIMIT — decrement the counter; jump out of the loop when zero. }
+      if p^.iLimit <> 0 then
+        sqlite3VdbeAddOp2(v, OP_DecrJumpZero, p^.iLimit, addrEnd);
       if addrSkip <> 0 then
         sqlite3VdbeResolveLabel(v, addrSkip);
 
