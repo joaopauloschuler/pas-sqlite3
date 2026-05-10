@@ -49164,8 +49164,12 @@ begin
                while op^ <> #0 do Inc(op);
              end;
         'u': begin
-               { Day of week 1..7 (1=Monday).  date.c arm. }
-               snpFmt(4, op, '%d', [((Trunc(jd + 0.5) + 6) mod 7) + 1]);
+               { Day of week 1..7 (1=Monday).  date.c:1528..1533:
+                   c = daysAfterSunday + '0'; if c=='0' && cf=='u' c='7'.
+                 daysAfterSunday(x) = (iJD/86400000 + 1.5) mod 7 in C, so
+                 the Pas equivalent is Trunc(jd + 1.5) mod 7 (matches the
+                 'w' case above).  Map 0 -> 7. }
+               snpFmt(4, op, '%d', [((Trunc(jd + 1.5) + 6) mod 7) + 1]);
                while op^ <> #0 do Inc(op);
              end;
         's': begin

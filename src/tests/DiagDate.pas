@@ -99,6 +99,9 @@ begin
   Probe('date minus mo',    'SELECT date(''2024-03-15'',''-1 month'')');
   Probe('date start mo',    'SELECT date(''2024-03-15'',''start of month'')');
   Probe('strftime weekday', 'SELECT strftime(''%w'',''2024-01-15'')');
+  Probe('strftime %u Sat',  'SELECT strftime(''%u'',''2024-06-15'')');
+  Probe('strftime %u Sun',  'SELECT strftime(''%u'',''2024-06-16'')');
+  Probe('strftime %u Mon',  'SELECT strftime(''%u'',''2024-06-17'')');
   Probe('unixepoch',        'SELECT unixepoch(''2024-01-01'')');
   Probe('time HM',          'SELECT time(''13:45'')');
 

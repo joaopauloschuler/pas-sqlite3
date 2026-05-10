@@ -2727,6 +2727,20 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [X] **10.1.bug.103** Fixed 2026-05-10.  `strftime('%u', date)` returned
+     the wrong ISO weekday: 2024-06-15 (Saturday) gave `5` instead of `6`,
+     2024-06-16 (Sunday) gave `6` instead of `7`, etc. — every weekday
+     shifted by one.  Root cause: passqlite3codegen.pas's '%u' arm used
+     `((Trunc(jd + 0.5) + 6) mod 7) + 1` whereas the C reference
+     (date.c:1528..1533) takes `daysAfterSunday` (which in the Pas port
+     equals `Trunc(jd + 1.5) mod 7`, identical to the '%w' arm) and
+     remaps 0 → 7.  Pas's '0.5' offset was off-by-one against the
+     midnight JD convention used elsewhere.  Fix: use
+     `((Trunc(jd + 1.5) + 6) mod 7) + 1` so the formula is symmetric
+     with the '%w' arm modulo the 0→7 remap.  Regression test:
+     DiagDate now probes %u for Sat/Sun/Mon.  TestExplainParity
+     1026/1026; full regression 69/69 binaries pass.
+
 - [X] **10.1.bug.90** Fixed 2026-05-10.  `GROUP BY` over a subquery
      source returned no rows; e.g. `SELECT column1, count(*) FROM
      (VALUES(1),(1),(2)) GROUP BY column1;` was empty where upstream
