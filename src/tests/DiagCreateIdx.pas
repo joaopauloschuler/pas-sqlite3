@@ -48,5 +48,36 @@ begin
             ' on ', AnsiString(PAnsiChar(sqlite3_column_text(pStmt, 1))));
   sqlite3_finalize(pStmt);
 
+  { 10.1.bug.108 regression — UNIQUE INDEX with COLLATE NOCASE must
+    enforce case-insensitive uniqueness both during refill from a
+    pre-populated table and on subsequent inserts.  Pre-fix, the
+    CreateIndex per-column loop dropped TK_COLLATE wrappers, so
+    azColl[i] stayed BINARY and aiColumn[i] resolved to -1 (rowid). }
+  pErr := nil;
+  rc := sqlite3_exec(db,
+    PAnsiChar('CREATE TABLE u(x); INSERT INTO u VALUES(''A''),(''a''),(''B'');'
+              + 'CREATE UNIQUE INDEX iu ON u(x COLLATE NOCASE);'),
+    nil, nil, @pErr);
+  if (rc = SQLITE_CONSTRAINT) or (rc = SQLITE_CONSTRAINT_UNIQUE) then
+    WriteLn('PASS NOCASE refill duplicate detected')
+  else begin
+    WriteLn('FAIL NOCASE refill duplicate undetected rc=', rc, ' err=',
+            AnsiString(PAnsiChar(pErr)));
+    Halt(1);
+  end;
+  pErr := nil;
+
+  rc := sqlite3_exec(db,
+    PAnsiChar('CREATE TABLE u2(x); CREATE UNIQUE INDEX iu2 ON u2(x COLLATE NOCASE);'
+              + 'INSERT INTO u2 VALUES(''A''); INSERT INTO u2 VALUES(''a'');'),
+    nil, nil, @pErr);
+  if (rc = SQLITE_CONSTRAINT) or (rc = SQLITE_CONSTRAINT_UNIQUE) then
+    WriteLn('PASS NOCASE post-create insert duplicate detected')
+  else begin
+    WriteLn('FAIL NOCASE post-create insert duplicate undetected rc=', rc);
+    Halt(1);
+  end;
+  pErr := nil;
+
   sqlite3_close(db);
 end.

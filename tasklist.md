@@ -2755,18 +2755,27 @@ existing dispatcher.
      bug.109 (`SELECT *` ordered by an index emits `0.0|0.0` rows in some
      post-CREATE-INDEX shapes — pre-existing, unrelated to this fix).
 
-- [ ] **10.1.bug.108** `CREATE UNIQUE INDEX iu ON u(x COLLATE NOCASE)`
-     against a pre-populated table containing case-insensitive duplicates
-     (e.g. `('A'),('a'),('B')`) silently succeeds in Pas; upstream raises
-     `UNIQUE constraint failed: u.x`.  Bug.107's
-     SorterCompare fix closed the binary-collation case but the NOCASE
-     path still falls through.  Hypothesis: either the sort-time
-     comparator (vdbeSorterCompareRec) ignores per-field collations from
-     `pKeyInfo`, or the unpack path is feeding the NOCASE field with the
-     default BINARY collation pointer.  Investigate
-     `sqlite3VdbeRecordCompare`'s `aColl[]` lookup vs how
-     `sqlite3KeyInfoOfIndex` populates it for an index built with explicit
-     `COLLATE NOCASE`.
+- [X] **10.1.bug.108** Fixed 2026-05-10.  `CREATE UNIQUE INDEX iu ON
+     u(x COLLATE NOCASE)` ignored the per-column collation entirely:
+     refill from a pre-populated table with case-insensitive duplicates
+     succeeded silently, and even `INSERT ... 'A'; INSERT ... 'a';`
+     against an existing index didn't fire the constraint.  Root cause
+     was *not* in the SorterCompare/RecordCompare path (those honour
+     `pKeyInfo->aColl[]` correctly) but in `sqlite3CreateIndex`
+     (passqlite3codegen.pas:37032..) — the per-column loop never peeled
+     `TK_COLLATE` wrappers from the ExprList.  Effect:
+     `sqlite3ColumnIndex(pTab, pExpr^.u.zToken)` was called with the
+     collation name ('NOCASE') instead of the column name ('x'), so
+     `aiColumn[i] = -1` (XN_ROWID) and `azColl[i] = WhereStrBINARY`.
+     The index ended up indexing rowid under BINARY rather than `x`
+     under NOCASE, so SCAN was used for `WHERE x=?` and uniqueness
+     checks operated on the wrong key.  Fix: peel any `TK_COLLATE`
+     outer wrapper to expose the underlying column expression and look
+     up the wrapper's `zToken` via `sqlite3LocateCollSeq`, storing the
+     canonical collation name in `pIndex^.azColl[i]`.  Mirrors
+     build.c:4253..4276.  Regression added in `DiagCreateIdx` (refill
+     duplicate + post-create insert duplicate).  TestExplainParity
+     1026/1026; full regression 69/69 binaries / 4963 assertions pass.
 
 - [ ] **10.1.bug.109** `SELECT * FROM v ORDER BY a,b` against a table
      with a covering UNIQUE index on `(a, b)` returns `0.0|0.0` rows in

@@ -36875,6 +36875,9 @@ var
   v:           PVdbe;
   pSchemaT:    passqlite3util.PSchema;
   prevColTok:  TToken;
+  pColExpr:    PExpr;
+  pCollSeq:    PTCollSeq;
+  zCollName:   PAnsiChar;
 begin
   pTab    := nil;
   pIndex  := nil;
@@ -37032,14 +37035,20 @@ begin
   for i := 0 to i32(pList^.nExpr) - 1 do
   begin
     n := -1;
-    if (PExprListItem(PByte(ExprListItems(pList))
-         + i * SizeOf(TExprListItem))^.pExpr <> nil) then
+    { 10.1.bug.108: peel any TK_COLLATE wrapper to expose the underlying
+      column expression, and capture the wrapper's zToken as the index
+      column's collation name.  Mirrors build.c:4253..4276 (TK_COLLATE
+      arm of CreateIndex's per-column loop). }
+    pColExpr  := PExprListItem(PByte(ExprListItems(pList))
+                   + i * SizeOf(TExprListItem))^.pExpr;
+    zCollName := nil;
+    if (pColExpr <> nil) and (pColExpr^.op = TK_COLLATE) then
     begin
-      { TK_ID name path: resolve via column-name lookup. }
-      n := sqlite3ColumnIndex(pTab,
-             PExprListItem(PByte(ExprListItems(pList))
-               + i * SizeOf(TExprListItem))^.pExpr^.u.zToken);
+      zCollName := pColExpr^.u.zToken;
+      pColExpr  := pColExpr^.pLeft;
     end;
+    if pColExpr <> nil then
+      n := sqlite3ColumnIndex(pTab, pColExpr^.u.zToken);
     if (n >= 0) and (n = pTab^.iPKey) then n := -1;  { rowid alias }
     { Mirror build.c:4241..4243 — uniqNotNull only stays set when every
       indexed column is declared NOT NULL.  rowid (n<0) is implicitly
@@ -37047,7 +37056,15 @@ begin
     if (n >= 0) and ((PColumn(pTab^.aCol)[n].typeFlags and $0F) = OE_None) then
       pIndex^.idxFlags := pIndex^.idxFlags and not u32($08);
     (pIndex^.aiColumn + i)^ := i16(n);
-    (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY;
+    if zCollName <> nil then
+    begin
+      pCollSeq := PTCollSeq(sqlite3LocateCollSeq(pParse, zCollName));
+      if pCollSeq <> nil then
+        (PPAnsiChar(pIndex^.azColl) + i)^ := pCollSeq^.zName
+      else
+        (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY;
+    end else
+      (PPAnsiChar(pIndex^.azColl) + i)^ := WhereStrBINARY;
     (pIndex^.aSortOrder + i)^ := 0;
   end;
   { Append rowid (or pPk key cols — pPk path deferred) as the implicit tail. }
