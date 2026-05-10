@@ -7789,8 +7789,11 @@ begin
     if sqlite3ExprIdToTrueFalse(pE) = 0 then
     begin
       if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
+      begin
         sqlite3ErrorMsg(pParse,
           PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+        sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+      end;
     end;
     Exit;
   end;
@@ -8325,8 +8328,13 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       if sqlite3ExprIdToTrueFalse(pE) = 0 then
       begin
         if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
+        begin
           sqlite3ErrorMsg(pParse,
             PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+          { resolve.c:796 — record the offending token offset so the CLI
+            caret marker can anchor under the column name. }
+          sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+        end;
       end;
       Exit;
     end;
@@ -8338,8 +8346,11 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
       if sqlite3ExprIdToTrueFalse(pE) = 0 then
       begin
         if (pE^.u.zToken <> nil) and (pE^.u.zToken^ <> #0) then
+        begin
           sqlite3ErrorMsg(pParse,
             PAnsiChar('no such column: ' + AnsiString(pE^.u.zToken)));
+          sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
+        end;
         Exit;
       end;
     end;

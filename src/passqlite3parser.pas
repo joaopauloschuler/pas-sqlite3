@@ -2651,6 +2651,12 @@ var
   temp2_181:   PExpr;
   temp3_182:   PExpr;
   temp4_182:   PExpr;
+  tok_180_z:   PAnsiChar;
+  tok_181_z0:  PAnsiChar;
+  tok_181_z1:  PAnsiChar;
+  tok_182_z0:  PAnsiChar;
+  tok_182_z1:  PAnsiChar;
+  tok_182_z2:  PAnsiChar;
   { Phase 7.2e.5 locals (rules 200..249). }
   pList_206:   PExprList;
   bNot_206:    i32;
@@ -3413,25 +3419,56 @@ begin
     179: { expr ::= LP expr RP }
        yymsp[-2].minor.yy454 := yymsp[-1].minor.yy454;
     180: { expr ::= ID|INDEXED|JOIN_KW }
-       yymsp[0].minor.yy454 := sqlite3ExprAlloc(pPse^.db, TK_ID,
-         @yymsp[0].minor.yy0, 0);
+       begin
+         { parse.y:1159 tokenExpr — stamp w.iOfst so resolver-class errors
+           (resolve.c:796 sqlite3RecordErrorOffsetOfExpr) can anchor the
+           CLI caret marker under the offending identifier.  yymsp[].minor
+           is a union — capture token z BEFORE assigning yy454, otherwise
+           yy0.z is overwritten by the Expr pointer. }
+         tok_180_z := yymsp[0].minor.yy0.z;
+         yymsp[0].minor.yy454 := sqlite3ExprAlloc(pPse^.db, TK_ID,
+           @yymsp[0].minor.yy0, 0);
+         if yymsp[0].minor.yy454 <> nil then
+           PExpr(yymsp[0].minor.yy454)^.w.iOfst :=
+             i32(PtrUInt(tok_180_z) - PtrUInt(pPse^.zTail));
+       end;
     181: { expr ::= nm DOT nm }
        begin
+         tok_181_z0 := yymsp[-2].minor.yy0.z;
+         tok_181_z1 := yymsp[0].minor.yy0.z;
          temp1_181 := sqlite3ExprAlloc(pPse^.db, TK_ID,
            @yymsp[-2].minor.yy0, 0);
+         if temp1_181 <> nil then
+           temp1_181^.w.iOfst :=
+             i32(PtrUInt(tok_181_z0) - PtrUInt(pPse^.zTail));
          temp2_181 := sqlite3ExprAlloc(pPse^.db, TK_ID,
            @yymsp[0].minor.yy0, 0);
+         if temp2_181 <> nil then
+           temp2_181^.w.iOfst :=
+             i32(PtrUInt(tok_181_z1) - PtrUInt(pPse^.zTail));
          yylhsminor.yy454 := sqlite3PExpr(pPse, TK_DOT, temp1_181, temp2_181);
          yymsp[-2].minor.yy454 := yylhsminor.yy454;
        end;
     182: { expr ::= nm DOT nm DOT nm }
        begin
+         tok_182_z0 := yymsp[-4].minor.yy0.z;
+         tok_182_z1 := yymsp[-2].minor.yy0.z;
+         tok_182_z2 := yymsp[0].minor.yy0.z;
          temp1_181 := sqlite3ExprAlloc(pPse^.db, TK_ID,
            @yymsp[-4].minor.yy0, 0);
+         if temp1_181 <> nil then
+           temp1_181^.w.iOfst :=
+             i32(PtrUInt(tok_182_z0) - PtrUInt(pPse^.zTail));
          temp2_181 := sqlite3ExprAlloc(pPse^.db, TK_ID,
            @yymsp[-2].minor.yy0, 0);
+         if temp2_181 <> nil then
+           temp2_181^.w.iOfst :=
+             i32(PtrUInt(tok_182_z1) - PtrUInt(pPse^.zTail));
          temp3_182 := sqlite3ExprAlloc(pPse^.db, TK_ID,
            @yymsp[0].minor.yy0, 0);
+         if temp3_182 <> nil then
+           temp3_182^.w.iOfst :=
+             i32(PtrUInt(tok_182_z2) - PtrUInt(pPse^.zTail));
          temp4_182 := sqlite3PExpr(pPse, TK_DOT, temp2_181, temp3_182);
          if InRenameObject(pPse) then
            sqlite3RenameTokenRemap(pPse, nil, temp1_181);

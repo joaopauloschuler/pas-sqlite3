@@ -2675,18 +2675,46 @@ existing dispatcher.
      67 binaries pass / 2 known fail (TestPagerReadOnly,
      TestWhereExpr — pre-existing); DiagFeatureProbe 0 divergences.
 
-- [ ] **10.1.bug.81** `sqlite3_error_offset` returns -1 (or 0 from
-     uninitialised state) for resolver-class errors such as `no such
-     column: abc`.  Reproducer: `sqlite3_prepare_v2(db,"SELECT abc",...)`
-     leaves the engine reporting `errByteOffset=0` while upstream
-     stamps the offset of the offending TK_ID token (8 in
-     ` SELECT abc;`).  Surface: `bin/passqlite3` caret marker (10.1.bug.80)
-     anchors at column 0 instead of under `abc`.  Fix path: in the
-     resolver (passqlite3codegen.pas resolveAlphaOrAggrOrFnOrCol arms),
-     stamp `db^.errByteOffset := pExpr^.w.iOfst` before raising the
-     `no such column` / `no such table` / `ambiguous column` errors,
-     mirroring the existing arm at codegen.pas:3690 used by other
-     resolver-class diagnostics.
+- [X] **10.1.bug.81** Fixed 2026-05-09.  `sqlite3_error_offset` returned
+     a stale/garbage value for resolver-class errors such as `no such
+     column: abc`, so the CLI caret (10.1.bug.80) anchored at column 0
+     instead of under the offending identifier.  Two root causes:
+     (a) the Pascal Lemon reduce arms for `expr ::= ID|INDEXED|JOIN_KW`
+     (rule 180) and `expr ::= nm DOT nm[ DOT nm]` (rules 181/182) did
+     not port C's `tokenExpr` `w.iOfst` stamp (parse.y:1159) — the
+     resolver had nothing to read; (b) the resolver's "no such column"
+     arms did not call `sqlite3RecordErrorOffsetOfExpr` (resolve.c:796)
+     to copy that stamp into `db^.errByteOffset`.  Fix: rules 180/181/182
+     now capture `yymsp[].minor.yy0.z` BEFORE assigning `yy454` (the
+     `minor` slot is a union — the assignment otherwise overwrites the
+     token pointer) and stamp `pExpr^.w.iOfst := z - pPse^.zTail`; the
+     two unresolved-TK_ID arms in `ResolveExpr` (codegen.pas no-FROM
+     and FROM-but-unmatched paths) plus `flagUnresolvedTKID` now call
+     `sqlite3RecordErrorOffsetOfExpr` after `sqlite3ErrorMsg`.  Verified
+     `SELECT abc;` is byte-identical to the 3.53.0 oracle.
+     TestExplainParity 1026/1026; regression 67 binaries pass / 2 known
+     fail; DiagFeatureProbe / DiagOps / DiagFunctions 0 divergences.
+
+- [ ] **10.1.bug.83** Resolver silently accepts unmatched `TK_DOT` column
+     refs whose qualifier table is in FROM but the column is not.
+     Reproducer: `CREATE TABLE t(x); SELECT t.zzz FROM t;` — Pascal
+     returns SQLITE_OK with empty result; upstream raises
+     `no such column: t.zzz`.  Root cause: codegen.pas ResolveExpr
+     TK_DOT arm (around line 8276) "leave as-is" comment — the for-loop
+     finds matching tables but no matching column, then exits without
+     raising.  Fix: mirror resolve.c lookupName tail (cnt==0 → emit
+     "no such column: zDb.zTab.zCol" via sqlite3ErrorMsg + record
+     offset) when the loop completes without binding.
+
+- [ ] **10.1.bug.84** `shellErrorContext` displays the entire input
+     (including leading whitespace) and computes `pad` from
+     `errByteOffset` directly, producing a caret one column too far
+     right relative to the displayed line when the SQL has leading
+     whitespace.  Reproducer: `   SELECT zzz;` — Pascal shows
+     "     SELECT zzz;\n            ^---"; upstream shows
+     "  SELECT zzz;\n         ^---" (whitespace stripped).  Likely
+     fix: shell.c.in:2603..2635 walks `pBase` past leading whitespace
+     before measuring; replicate in `shellErrorContext`.
 
 - [ ] **10.1.bug.82** Tokenizer error message omits the offending token
      text.  Reproducer: `SELECT 1 FROM 2x;` errors with
