@@ -2723,6 +2723,53 @@ existing dispatcher.
        TestExplainParity 1026/1026; DiagFunctions / DiagFeatureProbe /
        DiagOps / DiagDml / DiagPragma all clean.
 
+- [ ] **10.1.bug.90** Open 2026-05-10.  `GROUP BY` over a subquery
+     source returns no rows.  Reproducer:
+     `SELECT column1, count(*) FROM (VALUES(1),(1),(2)) GROUP BY column1;`
+     yields nothing where the 3.53.0 oracle returns `1|2` and `2|1`.
+     Same gap drives `SELECT column1 FROM (...) GROUP BY column1` and
+     `WITH t(x) AS (VALUES…) SELECT x, count(*) FROM t GROUP BY x;`.
+     Root cause: the GROUP BY arm in `sqlite3Select`
+     (passqlite3codegen.pas:23862..) bails with SQLITE_OK when the
+     source is a subquery (TF_Ephemeral, TABTYP_VIEW, or
+     SRCITEM_FG_IS_SUBQUERY) — the corresponding viaCoroutine/
+     materialise plumbing that the non-GROUP-BY agg arm at
+     codegen.pas:24726 (`isSubqueryAgg`) implements has no analogue
+     in the GROUP BY arm.  Lifting the bail naively triggers an OP_Rewind
+     against a nil cursor at runtime because the SrcItem's viaCoroutine
+     bit is not set yet when sqlite3WhereBegin fires.  Fix path: replicate
+     the isSubqueryAgg pattern — materialise the subquery into an
+     ephemeral cursor (or set viaCoroutine + emit InitCoroutine) before
+     sqlite3WhereBegin, and route the GROUP BY scan against that cursor.
+     Affected scope: at least every `.bench`-style query that does a
+     statistical roll-up over a derived table or CTE.
+
+- [X] **10.1.bug.89** Fixed 2026-05-10.  `datetime(N, 'unixepoch')` (and
+     `date()` / `time()` of the same form) returned an empty result for
+     numeric N — e.g. `datetime(0, 'unixepoch')` was blank where upstream
+     emits `1970-01-01 00:00:00`.  Root cause: the Pascal port's
+     `applyModifier` (passqlite3codegen.pas) had no arms for the
+     `unixepoch`, `auto`, or `julianday` modifiers, and `parseDateTime`
+     did not record the upstream `rawS` flag that those modifiers gate
+     on (date.c:setRawDateNumber + parseDateOrTime numeric branch +
+     parseModifier `case 'u'/'a'/'j'` arms).  Without rawS, even adding
+     the modifier arm could not distinguish a numeric input from a date-
+     string input.  Fix: extended TDateTime2 with `rawS: Boolean` and
+     `rawSec: Double`; parseDateTime numeric branch now sets both
+     (clearing validJD when the value falls outside the julian-day range
+     so `auto` / `unixepoch` can reach further); applyModifier ports the
+     three modifier arms 1:1 (the unixepoch arm uses the upstream
+     `r = s*1000 + 210866760000000` ms-since-julian-day-epoch math and
+     the [0, 464269060800000) range guard; auto delegates to the
+     autoAdjustDate decision tree; julianday is the no-op acceptance
+     when `validJD AND rawS`).  Verified `datetime(0, 'unixepoch')`,
+     `date(0, 'unixepoch')`, `time(0, 'unixepoch')`,
+     `datetime(1700000000, 'unixepoch')`, `datetime(2440587.5, 'auto')`,
+     `datetime(1700000000, 'auto')`, `datetime(2440587.5, 'julianday')`,
+     `datetime(1000000000, 'unixepoch', '+1 hour')` all byte-identical
+     to the 3.53.0 oracle.  Regression: 68 binaries pass / 1 known fail
+     (TestPagerReadOnly); DiagDate 0 divergences.
+
 - [X] **10.1.bug.87** Fixed 2026-05-10.  CLI shell mode renderers diverged
      from the 3.53.0 oracle in four places that all surfaced when
      differential-testing every `.mode` × `.headers` combination:

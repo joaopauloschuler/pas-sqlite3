@@ -48099,6 +48099,11 @@ type
     jd: Double;  { Julian Day Number }
     nFloor: i32; { day-overflow accumulator for "floor" modifier (date.c) }
     useSubsec: Boolean; { "subsec" / "subsecond" modifier flag (date.c) }
+    rawS: Boolean;      { date.c rawS — raw numeric input pending interpretation
+                          (julian day vs unix epoch).  Set by setRawDateNumber
+                          when input is a bare number; cleared by 'unixepoch',
+                          'auto', 'julianday', and any time-shifting modifier. }
+    rawSec: Double;     { the raw input number when rawS=True. }
   end;
 
 function dateIsLeap(y: i32): Boolean; inline;
@@ -48231,6 +48236,8 @@ begin
   h := 0; mn := 0; sec := 0.0;
   dt.nFloor := 0;
   dt.useSubsec := False;
+  dt.rawS := False;
+  dt.rawSec := 0.0;
   { date.c:parseDateOrTime — `now` keyword: setDateTimeToCurrent. }
   if (Length(s) = 3)
      and ((s[1] = 'n') or (s[1] = 'N'))
@@ -48251,9 +48258,23 @@ begin
   if (Length(s) > 0) and ((s[1] in ['0'..'9','+','-','.']))
      and (sqlite3AtoF(zStr, rJD) > 0) then
   begin
-    fromJulianDay(rJD, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
-    dt.jd := rJD;
-    dt.validJD := True;
+    { date.c:setRawDateNumber — record the raw numeric input so the
+      'unixepoch' / 'auto' / 'julianday' modifiers can re-interpret it. }
+    dt.rawS := True;
+    dt.rawSec := rJD;
+    if (rJD >= 0.0) and (rJD < 5373484.5) then
+    begin
+      fromJulianDay(rJD, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+      dt.jd := rJD;
+      dt.validJD := True;
+    end
+    else
+    begin
+      { Out of julian-day range: leave validJD false.  Caller may apply
+        'unixepoch' / 'auto' to land in range. }
+      dt.validJD := False;
+      dt.jd := 0.0;
+    end;
     Result := True;
     Exit;
   end;
@@ -48385,6 +48406,55 @@ begin
   if (sqlite3StrICmp(zMod, 'subsec') = 0) or
      (sqlite3StrICmp(zMod, 'subsecond') = 0) then begin
     dt.useSubsec := True;
+    Result := True; Exit;
+  end;
+
+  { unixepoch — date.c:818..836.  Re-interpret the prior raw numeric
+    input as seconds since 1970-01-01 00:00:00 UTC.  Only valid as the
+    first modifier, and only when rawS is set. }
+  if sqlite3StrICmp(zMod, 'unixepoch') = 0 then begin
+    if not dt.rawS then Exit;
+    r := dt.rawSec * 1000.0 + 210866760000000.0;
+    if (r < 0.0) or (r >= 464269060800000.0) then Exit;
+    dt.jd := r / 86400000.0;
+    fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+    dt.validJD := True;
+    dt.rawS := False;
+    Result := True; Exit;
+  end;
+
+  { auto — date.c:740..751.  If rawS is set and validJD is already set
+    (number falls in JD range), keep the JD interpretation and clear
+    rawS.  Otherwise (number out of JD range but in unix-epoch range),
+    re-interpret as seconds since 1970. }
+  if sqlite3StrICmp(zMod, 'auto') = 0 then begin
+    if not dt.rawS then begin Result := True; Exit; end;
+    if dt.validJD then begin
+      dt.rawS := False;
+      Result := True; Exit;
+    end;
+    { date.c:autoAdjustDate — accept inputs in [-21086676*10000,
+      25340230*10000+799] (rough bounds for julian-day-encodable
+      seconds-since-1970). }
+    if (dt.rawSec >= -21086676 * 10000.0)
+       and (dt.rawSec <= 25340230 * 10000.0 + 799.0) then
+    begin
+      r := dt.rawSec * 1000.0 + 210866760000000.0;
+      dt.jd := r / 86400000.0;
+      fromJulianDay(dt.jd, dt.yr, dt.mo, dt.dy, dt.hr, dt.mi, dt.s);
+      dt.validJD := True;
+    end;
+    dt.rawS := False;
+    Result := True; Exit;
+  end;
+
+  { julianday — date.c:783..801.  Force the prior raw numeric input
+    to be interpreted as a julian day.  Only valid as the first
+    modifier.  Result is NULL when validJD is not set (number out
+    of julian-day range). }
+  if sqlite3StrICmp(zMod, 'julianday') = 0 then begin
+    if not (dt.validJD and dt.rawS) then Exit;
+    dt.rawS := False;
     Result := True; Exit;
   end;
 
