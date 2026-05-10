@@ -1774,7 +1774,35 @@ existing dispatcher.
        against sqlite_schema returns no rows).  TestExplainParity
        1026/1026; DiagFeatureProbe / DiagFunctions / DiagOps clean.
 
-  [ ] **10.1a.1** fill the next porting chunk here. 
+  [X] **10.1.100** Built-in shell SQL UDFs ported from shell.c.in
+       (~280 C lines → ~310 lines Pascal in passqlite3shell.pas).
+       New entries registered on every connection by openDb via
+       `registerShellBuiltins`: `strtod(X)` (1285..1294), `dtostr(X[,N])`
+       (1303..1315), `shell_add_schema(S,X,name)` (1336..1388),
+       `shell_module_schema(X)` (4432..4457), `shell_putsnl(X)`
+       (1764..1773), `usleep(N)` (4415..4424).  Helpers `shellQuoteChar`
+       (1217..1225) and `shellFakeSchemaText` (1234..1276) mirror the
+       upstream identifier-quoting and PRAGMA-table_info column-list
+       synthesis used by both shell_add_schema (VIEW/TRIGGER comment
+       suffix) and shell_module_schema.  AnsiString backing replaces
+       upstream's ShellText struct since the values are short-lived;
+       PfMprintf-allocated payloads passed to sqlite3_result_text use
+       a cdecl `shellSqliteFreeDel` trampoline (mirrors base64FreeDel).
+       The %z auto-free chain in C's shellAddSchemaName is rewritten as
+       an explicit sqlite3_free(zPrev) since Pascal's %z does not free
+       its input (matches the intck/amatch porting convention).
+       editFunc (1864..) intentionally deferred — needs system() spawn
+       + temp-file shuttle.  Verified byte-identical to upstream system
+       sqlite3 across 8 surfaces: dtostr(3.14)=`+3.14000000000000000000000000e+00`,
+       dtostr(3.14159265358979,5)=`+3.14159e+00`, strtod('3.14159')=3.14159,
+       shell_add_schema('CREATE TABLE foo(x)','myattach','foo')=
+       `CREATE TABLE myattach.foo(x)`, shell_add_schema with hyphenated
+       schema 'my-attach' rewrites to `CREATE TABLE "my-attach".foo(x)`,
+       CREATE INDEX form, shell_putsnl, usleep(0).  TestExplainParity
+       1026/1026; full regression gate: 68/69 (only the pre-existing
+       TestPagerReadOnly failure).
+
+  [ ] **10.1a.1** fill the next porting chunk here.
 
   [X] **10.1.99** ext/misc/spellfix.c (3076 C lines) ported in full
        as new unit `passqlite3spellfix.pas` (~2620 lines Pascal).

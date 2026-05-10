@@ -547,6 +547,313 @@ begin
   p^.mode.spec.nMultiInsert := DFLT_MULTI_INSERT;
 end;
 
+{ ----------------------------------------------------------------------
+  Built-in shell SQL UDFs — shell.c.in:1217..1388 / 1764..1773 /
+  1285..1314 / 4415..4457.  Registered on every connection by openDb()
+  so .schema multi-database qualification, edit() / shell_putsnl(),
+  and the floating-point round-trip helpers strtod / dtostr behave
+  identically to upstream.
+
+  editFunc (shell.c.in:1864..) is intentionally deferred — it spawns
+  an external editor via system() and round-trips through a temp file;
+  the surface is small but the Linux/Win arm split is large.
+  ---------------------------------------------------------------------- }
+
+procedure shellSqliteFreeDel(p: Pointer); cdecl;
+{ cdecl trampoline for sqlite3_free, used as destructor for
+  sqlite3_result_text on sqlite3_mprintf'd buffers (mirrors the
+  base64FreeDel pattern in passqlite3base64). }
+begin
+  sqlite3_free(p);
+end;
+
+function shellQuoteChar(z: PAnsiChar): AnsiChar;
+{ shell.c.in:1217..1225 — return '"' if z needs to be quoted as a SQLite
+  identifier (non-alpha lead, any non-alnum/_, or matches a keyword);
+  otherwise #0. }
+var
+  i: SizeInt;
+  c: AnsiChar;
+begin
+  if z = nil then Exit('"');
+  c := z[0];
+  if not (((c >= 'A') and (c <= 'Z'))
+       or ((c >= 'a') and (c <= 'z'))
+       or (c = '_')) then Exit('"');
+  i := 0;
+  while z[i] <> #0 do begin
+    c := z[i];
+    if not (((c >= 'A') and (c <= 'Z'))
+         or ((c >= 'a') and (c <= 'z'))
+         or ((c >= '0') and (c <= '9'))
+         or (c = '_')) then Exit('"');
+    Inc(i);
+  end;
+  if sqlite3_keyword_check(z, i) <> 0 then Exit('"');
+  Result := #0;
+end;
+
+procedure shellAppendQuoted(var s: AnsiString; const z: AnsiString;
+                            quote: AnsiChar);
+{ shell.c.in:1173..1207 — appendText with optional double-the-quote
+  embedding. }
+var
+  i: SizeInt;
+begin
+  if quote = #0 then begin
+    s := s + z;
+    Exit;
+  end;
+  s := s + quote;
+  for i := 1 to Length(z) do begin
+    s := s + z[i];
+    if z[i] = quote then s := s + quote;
+  end;
+  s := s + quote;
+end;
+
+function shellFakeSchemaText(db: Psqlite3; zSchema, zName: PAnsiChar): AnsiString;
+{ shell.c.in:1234..1276 — synthesize a "tablename(col1,col2,...)" string
+  for the view / virtual-table / table-valued function zSchema.zName by
+  running PRAGMA <db>.table_info=<name>.  Returns '' when the object has
+  no columns (matches C's NULL-return contract — caller checks length). }
+var
+  zSql: PAnsiChar;
+  pStmt: PVdbe;
+  pzTail: PAnsiChar;
+  rc: i32;
+  cQuote: AnsiChar;
+  zCol: PAnsiChar;
+  zDiv: AnsiString;
+  nRow: i32;
+  zSchemaStr: AnsiString;
+begin
+  Result := '';
+  if zSchema <> nil then
+    zSchemaStr := AnsiString(zSchema)
+  else
+    zSchemaStr := 'main';
+  zSql := sqlite3PfMprintf('PRAGMA "%w".table_info=%Q;',
+                          [PAnsiChar(zSchemaStr), zName]);
+  if zSql = nil then Exit;
+  pStmt := nil;
+  rc := sqlite3_prepare_v2(db, zSql, -1, @pStmt, @pzTail);
+  sqlite3_free(zSql);
+  if (rc <> SQLITE_OK) or (pStmt = nil) then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    Exit;
+  end;
+  if zSchema <> nil then begin
+    cQuote := shellQuoteChar(zSchema);
+    if (cQuote <> #0) and (sqlite3_stricmp(zSchema, 'temp') = 0) then
+      cQuote := #0;
+    shellAppendQuoted(Result, AnsiString(zSchema), cQuote);
+    Result := Result + '.';
+  end;
+  cQuote := shellQuoteChar(zName);
+  shellAppendQuoted(Result, AnsiString(zName), cQuote);
+  zDiv := '(';
+  nRow := 0;
+  while sqlite3_step(pStmt) = SQLITE_ROW do begin
+    zCol := PAnsiChar(sqlite3_column_text(pStmt, 1));
+    Inc(nRow);
+    Result := Result + zDiv;
+    zDiv := ',';
+    if zCol = nil then zCol := '';
+    cQuote := shellQuoteChar(zCol);
+    shellAppendQuoted(Result, AnsiString(zCol), cQuote);
+  end;
+  Result := Result + ')';
+  sqlite3_finalize(pStmt);
+  if nRow = 0 then Result := '';
+end;
+
+type
+  TShellArgArr3 = array[0..2] of PMem;
+  PShellArgArr3 = ^TShellArgArr3;
+
+procedure shellStrtodUdf(pCtx: Psqlite3_context;
+                         nVal: i32; apVal: PPMem); cdecl;
+{ shell.c.in:1285..1294 — strtod(X) via the C library, for fp parity probes. }
+var
+  pArgs: PShellArgArr3;
+  z: PAnsiChar;
+  d: Double;
+begin
+  if nVal < 1 then Exit;
+  pArgs := PShellArgArr3(apVal);
+  z := PAnsiChar(sqlite3_value_text(pArgs^[0]));
+  if z = nil then Exit;
+  d := 0;
+  try
+    d := StrToFloat(AnsiString(z), DefaultFormatSettings);
+  except
+    on EConvertError do d := 0;
+  end;
+  sqlite3_result_double(pCtx, d);
+end;
+
+procedure shellDtostrUdf(pCtx: Psqlite3_context;
+                         nVal: i32; apVal: PPMem); cdecl;
+{ shell.c.in:1303..1315 — dtostr(X[, n]) via sprintf("%#+.*e",...). }
+var
+  pArgs: PShellArgArr3;
+  r: Double;
+  n: i32;
+  z: PAnsiChar;
+begin
+  pArgs := PShellArgArr3(apVal);
+  r := sqlite3_value_double(pArgs^[0]);
+  if nVal >= 2 then n := sqlite3_value_int(pArgs^[1]) else n := 26;
+  if n < 1 then n := 1;
+  if n > 350 then n := 350;
+  z := sqlite3PfMprintf('%#+.*e', [n, r]);
+  sqlite3_result_text(pCtx, z, -1, @shellSqliteFreeDel);
+end;
+
+procedure shellAddSchemaUdf(pCtx: Psqlite3_context;
+                            nVal: i32; apVal: PPMem); cdecl;
+{ shell.c.in:1336..1388 — shell_add_schema(S, X, name).  When S starts
+  with `CREATE TABLE/INDEX/UNIQUE INDEX/VIEW/TRIGGER/VIRTUAL TABLE` the
+  schema name X (when non-NULL and not 'temp') is spliced in immediately
+  after the kind keyword.  When the kind is VIEW/TRIGGER and shellFakeSchema
+  returns a column-list synthesis, that synthesis is appended as a
+  `/* ... */` comment for .schema rendering aids. }
+const
+  aPrefix: array[0..5] of PAnsiChar = (
+    'TABLE', 'INDEX', 'UNIQUE INDEX', 'VIEW', 'TRIGGER', 'VIRTUAL TABLE');
+var
+  pArgs: PShellArgArr3;
+  i, n, n7: i32;
+  zIn, zSchema, zName: PAnsiChar;
+  db: Psqlite3;
+  z, zFake, zPrev: PAnsiChar;
+  zFakeP: AnsiString;
+  cQuote: AnsiChar;
+  prefixHead: AnsiString;
+begin
+  pArgs   := PShellArgArr3(apVal);
+  zIn     := PAnsiChar(sqlite3_value_text(pArgs^[0]));
+  zSchema := PAnsiChar(sqlite3_value_text(pArgs^[1]));
+  zName   := PAnsiChar(sqlite3_value_text(pArgs^[2]));
+  db      := sqlite3_context_db_handle(pCtx);
+  if (zIn <> nil) and (StrLComp(zIn, 'CREATE ', 7) = 0) then begin
+    for i := 0 to High(aPrefix) do begin
+      n := StrLen(aPrefix[i]);
+      if (StrLComp(zIn + 7, aPrefix[i], n) = 0)
+         and (zIn[n + 7] = ' ') then begin
+        n7 := n + 7;
+        z := nil;
+        zFake := nil;
+        if zSchema <> nil then begin
+          cQuote := shellQuoteChar(zSchema);
+          SetLength(prefixHead, n7);
+          if n7 > 0 then Move(zIn^, prefixHead[1], n7);
+          if (cQuote <> #0) and (sqlite3_stricmp(zSchema, 'temp') <> 0) then
+            z := sqlite3PfMprintf('%s "%w".%s',
+                                 [PAnsiChar(prefixHead), zSchema, zIn + n7 + 1])
+          else
+            z := sqlite3PfMprintf('%s %s.%s',
+                                 [PAnsiChar(prefixHead), zSchema, zIn + n7 + 1]);
+        end;
+        if (zName <> nil) and (aPrefix[i][0] = 'V') then begin
+          zFakeP := shellFakeSchemaText(db, zSchema, zName);
+          if Length(zFakeP) > 0 then zFake := PAnsiChar(zFakeP);
+        end;
+        if zFake <> nil then begin
+          if z = nil then
+            z := sqlite3PfMprintf('%s'#10'/* %s */', [zIn, zFake])
+          else begin
+            zPrev := z;
+            z := sqlite3PfMprintf('%s'#10'/* %s */', [zPrev, zFake]);
+            sqlite3_free(zPrev);
+          end;
+        end;
+        if z <> nil then begin
+          sqlite3_result_text(pCtx, z, -1, @shellSqliteFreeDel);
+          Exit;
+        end;
+      end;
+    end;
+  end;
+  sqlite3_result_value(pCtx, pArgs^[0]);
+end;
+
+procedure shellModuleSchemaUdf(pCtx: Psqlite3_context;
+                               nVal: i32; apVal: PPMem); cdecl;
+{ shell.c.in:4432..4457 — return a /* fake-schema */ comment for the
+  vtab / table-valued function named X.  Used by .schema for module-
+  defined objects whose stored CREATE statement is incomplete. }
+var
+  pArgs: PShellArgArr3;
+  zName: PAnsiChar;
+  zFake: AnsiString;
+  zOut: PAnsiChar;
+begin
+  pArgs := PShellArgArr3(apVal);
+  zName := PAnsiChar(sqlite3_value_text(pArgs^[0]));
+  if zName = nil then Exit;
+  zFake := shellFakeSchemaText(sqlite3_context_db_handle(pCtx), nil, zName);
+  if Length(zFake) = 0 then Exit;
+  zOut := sqlite3PfMprintf('/* %s */', [PAnsiChar(zFake)]);
+  if zOut <> nil then
+    sqlite3_result_text(pCtx, zOut, -1, @shellSqliteFreeDel);
+end;
+
+procedure shellPutsnlUdf(pCtx: Psqlite3_context;
+                         nVal: i32; apVal: PPMem); cdecl;
+{ shell.c.in:1764..1773 — print the argument followed by '\n' to stdout
+  and return the value unchanged.  Used by upstream as an on-the-fly
+  trace helper inside SELECT pipelines. }
+var
+  pArgs: PShellArgArr3;
+  z: PAnsiChar;
+begin
+  pArgs := PShellArgArr3(apVal);
+  z := PAnsiChar(sqlite3_value_text(pArgs^[0]));
+  if z <> nil then WriteLn(z) else WriteLn('');
+  sqlite3_result_value(pCtx, pArgs^[0]);
+end;
+
+procedure shellUSleepUdf(pCtx: Psqlite3_context;
+                         nVal: i32; apVal: PPMem); cdecl;
+{ shell.c.in:4415..4424 — usleep(N).  Sleep N microseconds (rounded down
+  to the nearest millisecond by sqlite3_sleep) and return N. }
+var
+  pArgs: PShellArgArr3;
+  ms: i32;
+begin
+  pArgs := PShellArgArr3(apVal);
+  ms := sqlite3_value_int(pArgs^[0]);
+  sqlite3_sleep(ms div 1000);
+  sqlite3_result_int(pCtx, ms);
+end;
+
+procedure registerShellBuiltins(db: Psqlite3);
+{ shell.c.in:4590..4607 — registration block invoked from open_db().
+  editFunc deferred (system() spawn + temp-file shuttle); everything
+  else is wired so .schema, fp parity probes, and trace pipelines have
+  the upstream UDF surface available. }
+const
+  FFlags = SQLITE_UTF8;
+begin
+  if db = nil then Exit;
+  sqlite3_create_function(db, 'strtod', 1, FFlags, nil,
+                          @shellStrtodUdf, nil, nil);
+  sqlite3_create_function(db, 'dtostr', 1, FFlags, nil,
+                          @shellDtostrUdf, nil, nil);
+  sqlite3_create_function(db, 'dtostr', 2, FFlags, nil,
+                          @shellDtostrUdf, nil, nil);
+  sqlite3_create_function(db, 'shell_add_schema', 3, FFlags, nil,
+                          @shellAddSchemaUdf, nil, nil);
+  sqlite3_create_function(db, 'shell_module_schema', 1, FFlags, nil,
+                          @shellModuleSchemaUdf, nil, nil);
+  sqlite3_create_function(db, 'shell_putsnl', 1, FFlags, nil,
+                          @shellPutsnlUdf, nil, nil);
+  sqlite3_create_function(db, 'usleep', 1, FFlags, nil,
+                          @shellUSleepUdf, nil, nil);
+end;
+
 { Open the database connection backing p^ if not already open.  Mirrors
   open_db (shell.c.in:6745..) at the level needed by the dispatcher
   skeleton: --readonly / --create / default SQLITE_OPEN_READWRITE|
@@ -576,6 +883,10 @@ begin
   end;
   globalDb := p^.db;
   p^.pAuxDb^.db := p^.db;
+  { Built-in shell SQL UDFs — strtod / dtostr / shell_add_schema /
+    shell_module_schema / shell_putsnl / usleep.  Mirrors shell.c.in
+    open_db registration block (4590..4607). }
+  registerShellBuiltins(p^.db);
   { sqlite_dbpage virtual table — needed by .dbinfo / .recover.  Upstream
     auto-registers this on the connection; the Pascal port leaves it
     optional, so we hook it here. }
