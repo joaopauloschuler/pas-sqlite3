@@ -2350,10 +2350,17 @@ begin
     rc := sqlite3_prepare_v2(p^.db, pCursor, -1, @pStmt, @pzTail);
     if rc <> SQLITE_OK then begin
       zCtx := shellErrorContext(zStmtSql, p^.db);
-      shellEPutZ(Format('%s %s%s'#10,
-        [string(shellErrPrefix('Parse error', zSrc, lineno)),
-         AnsiString(sqlite3_errmsg(p^.db)),
-         string(zCtx)]));
+      if rc > 1 then
+        shellEPutZ(Format('%s %s (%d)%s'#10,
+          [string(shellErrPrefix('Parse error', zSrc, lineno)),
+           AnsiString(sqlite3_errmsg(p^.db)),
+           Integer(rc),
+           string(zCtx)]))
+      else
+        shellEPutZ(Format('%s %s%s'#10,
+          [string(shellErrPrefix('Parse error', zSrc, lineno)),
+           AnsiString(sqlite3_errmsg(p^.db)),
+           string(zCtx)]));
       Inc(Result);
       Exit;
     end;
@@ -2371,20 +2378,19 @@ begin
     p^.pStmt := nil;
     rc := sqlite3_finalize(pStmt);
     if (rc <> SQLITE_OK) and (rc <> SQLITE_DONE) then begin
-      { Upstream shell_exec runs sqlite3_format_query_result (qrf.c)
-        which calls sqlite3_reset on the pStmt before returning, clearing
-        the deferred error code so finalize returns OK and the
-        "stepping, " prefix arm in shell.c.in:3376 / 12328..12330 is
-        skipped.  The dispatcher therefore reports "Error", not
-        "Runtime error", for step-time failures (CHECK / NOT NULL /
-        UNIQUE / FK constraint violations).  Pascal port has no QRF,
-        so reset+finalize would otherwise emit the wrong prefix —
-        always use "Error" here to match upstream byte-output. }
-      zCtx := shellErrorContext(zStmtSql, p^.db);
-      shellEPutZ(Format('%s %s%s'#10,
-        [string(shellErrPrefix('Error', zSrc, lineno)),
-         AnsiString(sqlite3_errmsg(p^.db)),
-         string(zCtx)]));
+      { Mirror shell.c.in:3370..3376 + 12328..12349 stepping arm:
+        save_err_msg(db, "stepping", rc, 0) → "Runtime error" prefix
+        with " (rc)" suffix when rc>1.  zSql is NULL in upstream's
+        stepping call, so no error-context caret is appended. }
+      if rc > 1 then
+        shellEPutZ(Format('%s %s (%d)'#10,
+          [string(shellErrPrefix('Runtime error', zSrc, lineno)),
+           AnsiString(sqlite3_errmsg(p^.db)),
+           Integer(rc)]))
+      else
+        shellEPutZ(Format('%s %s'#10,
+          [string(shellErrPrefix('Runtime error', zSrc, lineno)),
+           AnsiString(sqlite3_errmsg(p^.db))]));
       Inc(Result);
     end;
     if (pzTail = nil) or (pzTail = pCursor) then Exit;

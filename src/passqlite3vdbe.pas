@@ -4460,7 +4460,10 @@ begin
       db^.errCode := p^.rc;
   end;
   p^.eVdbeState := VDBE_READY_STATE;
-  Result := p^.rc;
+  if db <> nil then
+    Result := p^.rc and db^.errMask
+  else
+    Result := p^.rc;
 end;
 
 function sqlite3VdbeFinalize(p: PVdbe): i32;

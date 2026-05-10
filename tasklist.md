@@ -2781,6 +2781,27 @@ existing dispatcher.
      in source order.  Regression: 69/69 binaries / 4965 assertions;
      TestExplainParity 1026/1026.
 
+- [X] **10.1.bug.125** Fixed 2026-05-10.  CLI step-error reports
+     diverged from the C oracle in three ways: (a) the prefix was
+     "Error" instead of "Runtime error" because of a stale pre-QRF
+     workaround in `runOneSqlLine`; (b) the trailing " (rc)" suffix
+     emitted by upstream's save_err_msg when rc>1 was missing; and
+     (c) the rc value itself was the extended code (e.g. 787 for
+     SQLITE_CONSTRAINT_FOREIGNKEY) rather than the basic code (19)
+     because `sqlite3VdbeReset` returned `p^.rc` without applying
+     `db^.errMask`.  Fixes: (1) restore upstream "Runtime error"
+     prefix in the finalize-error arm of `runOneSqlLine`
+     (passqlite3shell.pas) and append " (%d)" when rc>1, mirroring
+     shell.c.in:3370..3376 + 12328..12349 + save_err_msg
+     (shell.c.in:2695..2716) — also drops the caret context for
+     stepping errors since upstream passes zSql=NULL there;
+     (2) parse-error arm gains the same " (%d)" suffix when rc>1;
+     (3) `sqlite3VdbeReset` (passqlite3vdbe.pas) returns
+     `p^.rc and db^.errMask` per vdbeaux.c:3670.  Verified: FK /
+     CHECK / UNIQUE constraint failures now produce byte-identical
+     output to the system sqlite3 oracle.  TestExplainParity
+     1026/1026; full regression 69/69; 4965/4965 assertions clean.
+
 - [X] **10.1.bug.117** Fixed 2026-05-10.  `min(x)` / `max(x)` over
      an all-NULL input (or any rowset where every row's argument is
      NULL) returned the blob "0.0" instead of NULL.  Reproducer:
