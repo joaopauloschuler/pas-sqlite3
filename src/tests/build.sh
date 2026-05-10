@@ -141,6 +141,9 @@ compile_test TestAuthBuiltins
 compile_test TestDMLBasic
 compile_test TestSchemaBasic
 compile_test TestWindowBasic
+compile_test TestGroupOrder
+compile_test TestJoinNatural
+compile_test TestDateModifiers
 compile_test TestOpenClose
 compile_test TestPrepareBasic
 compile_test TestInitCallback
