@@ -4141,14 +4141,33 @@ existing dispatcher.
      pSub^.pOrderBy direction propagation (linked to colUsed work
      in 6.29).
 
-- [ ] **10.1.bug.95** Cross JOIN of two `(VALUES …)` clauses returns
-     only the first product row.  Reproducer:
-     `SELECT * FROM (VALUES(1),(2)), (VALUES('a'),('b'))` returns `1|a`
-     in Pas vs four rows `1|a, 1|b, 2|a, 2|b` in upstream.  Multi-source
-     pre-materialise pass at codegen.pas:25762 likely under-iterates one
-     of the inline-VALUES sources because their viaCoroutine bit is
-     already set (gate at :25778 skips them) but the standard scan path
-     downstream doesn't drive the second coroutine.
+- [X] **10.1.bug.95** Fixed 2026-05-10.  Cross JOIN of two `(VALUES …)`
+     clauses now returns the full Cartesian product byte-identical to
+     upstream.  Root cause was deeper than the original analysis: the
+     multi-source pre-materialise pass at codegen.pas:25762 DOES fire
+     (the outer wrapper srcitems are IS_SUBQUERY without viaCoroutine —
+     only the wrappers' INNER srcitems carry viaCoroutine), but the
+     recursive `sqlite3Select(wrapperSelect, SRT_EphemTab)` for each
+     outer source landed in the materialise arm at codegen.pas:25652,
+     which then recursed on `pSubq^.pSelect` (the original
+     `Select{a=1}` left over after sqlite3MultiValues nilified its
+     pPrior chain).  That single-row leaf went through the no-FROM
+     fast path and only emitted one Integer/Insert per source, so each
+     materialised eph held only the first VALUES row.  Fix: in the
+     Sub-SELECT co-routine arm at codegen.pas:25414..25649, lift the
+     SRT_Output gate to also admit SRT_EphemTab when the srcitem
+     already carries SRCITEM_FG_VIA_COROUTINE — that arm's existing
+     viaCoroutine special case at :25463..:25470 emits a reset
+     `OP_InitCoroutine` pointing at the parse-time `addrFillSub` and
+     drives the existing coroutine via the outer Yield loop, so all
+     rows replay correctly.  Added an SRT_EphemTab disposal arm
+     (MakeRecord + NewRowid + Insert APPEND into pDest^.iSDParm)
+     mirroring selectInnerLoop's SRT_EphemTab tail.  Verified:
+     `SELECT * FROM (VALUES(1),(2)), (VALUES('a'),('b'))` returns the
+     four-row Cartesian product; same for 3×2 and 1×2 shapes; all 69
+     regression binaries pass (4963 assertions); DiagOps / DiagDml /
+     DiagFunctions / DiagMisc / DiagWindow / DiagFeatureProbe /
+     DiagMultiValues / DiagIndexing / DiagPragma all 0 divergences.
 
 - [ ] **10.1.bug.96** Foreign-key constraint not enforced.  Reproducer:
      `PRAGMA foreign_keys=ON; CREATE TABLE p(id INTEGER PRIMARY KEY);

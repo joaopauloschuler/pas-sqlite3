@@ -25426,7 +25426,7 @@ begin
     when the inner is correlated. }
   if (p^.pSrc^.nSrc = 1)
      and ((p^.selFlags and SF_Distinct) = 0)
-     and (pDest^.eDest = SRT_Output)
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab))
   then
   begin
     pItem := SrcListItems(p^.pSrc);
@@ -25437,11 +25437,19 @@ begin
        and (pItem^.u4.pSubq^.pSelect <> nil)
        and ((pItem^.u4.pSubq^.pSelect^.selFlags and SF_Correlated) = 0)
        and OptimizationEnabled(pParse^.db, SQLITE_Coroutines)
+       { 10.1.bug.95 — SRT_EphemTab is admitted here ONLY when the
+         srcitem already carries an emitted coroutine.  Other
+         SRT_EphemTab cases (correlated, materialise-needed) must fall
+         through to the materialise arm below; we'd otherwise re-emit
+         a coroutine that the parse-time pass never built. }
+       and ((pDest^.eDest = SRT_Output)
+            or ((pItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) <> 0))
     then
     begin
       v := sqlite3GetVdbe(pParse);
       if v = nil then begin Result := SQLITE_NOMEM; Exit; end;
-      sqlite3GenerateColumnNames(pParse, p);
+      if pDest^.eDest = SRT_Output then
+        sqlite3GenerateColumnNames(pParse, p);
 
       if pItem^.iCursor < 0 then
       begin
@@ -25609,6 +25617,20 @@ begin
                           sortNKey + nResultCol, regSortRec);
         sqlite3VdbeAddOp4Int(v, OP_SorterInsert, iSorterCsr, regSortRec,
                              regSortBase, nResultCol);
+      end
+      else if pDest^.eDest = SRT_EphemTab then
+      begin
+        { 10.1.bug.95 — disposal mirrors selectInnerLoop SRT_EphemTab
+          arm: MakeRecord + NewRowid + Insert(APPEND) into the caller's
+          eph cursor at iSDParm. }
+        r1 := sqlite3GetTempReg(pParse);
+        r2 := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+        sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+        sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
+        sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+        sqlite3ReleaseTempReg(pParse, r2);
+        sqlite3ReleaseTempReg(pParse, r1);
       end
       else
       begin
