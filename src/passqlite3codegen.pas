@@ -8526,6 +8526,11 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
               sqlite3ErrorMsg(pParse, sqlite3MPrintf(pParse^.db,
                 'wrong number of arguments to function %s()',
                 [pE^.u.zToken]));
+            { Mirror C's %#T format spec (printf.c:954..962), which records
+              the start-byte offset of the offending function-call expression
+              on db^.errByteOffset so that the CLI caret marker (10.1.bug.80)
+              points at the failing token rather than column 0. }
+            sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE);
           end;
         end
         else if (pDef_^.funcFlags and SQLITE_FUNC_UNLIKELY) <> 0 then
@@ -8551,6 +8556,12 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
         out.  Mirrors resolve.c:1798..1818 short-circuit. }
       if items[i].u.x.iOrderByCol <> 0 then Continue;
       ResolveExpr(items[i].pExpr);
+      { Mirror resolve.c:1457 — `return pParse->nErr ? WRC_Abort : ...`.
+        Stop on first error so that subsequent siblings cannot overwrite
+        db^.errByteOffset and shift the CLI caret marker off the failing
+        token (e.g. the second `bit_count(0)` in
+        `SELECT bit_count(7), bit_count(0)`). }
+      if pParse^.nErr > 0 then Break;
     end;
   end;
 

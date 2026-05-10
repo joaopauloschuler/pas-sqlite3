@@ -4092,6 +4092,30 @@ existing dispatcher.
      DiagDropTable / DiagCovering / DiagIndexing / DiagPredicates /
      DiagOrderLimitTopN / DiagAnalyze all 0 divergences.
 
+- [X] **10.1.bug.99** Fixed 2026-05-10.  CLI caret marker for "no such
+     function" / "wrong number of arguments to function" anchored at
+     column 0 instead of under the failing token.  Reproducer:
+     `SELECT bit_count(7);` reported `^--- error here` flush against the
+     left margin; oracle pointed at column 9 (under `bit_count`).  Two
+     1:1 omissions vs C:
+     1. The Pascal arm at codegen.pas:8520..8528 emitted the diagnostic
+        with `%s` and `pE^.u.zToken`; C uses `%#T` which calls
+        sqlite3RecordErrorOffsetOfExpr in printf.c:954..962 as a side
+        effect.  Fix: explicit
+        `sqlite3RecordErrorOffsetOfExpr(pParse^.db, pE)` after the
+        ErrorMsg call.
+     2. ResolveExprList iterated every sibling even after nErr was
+        bumped, so the second `bit_count(0)` in
+        `SELECT bit_count(7), bit_count(0)` overwrote db^.errByteOffset
+        with column 22 instead of leaving the column-9 stamp from the
+        first failure.  Fix: break out of ResolveExprList on
+        `pParse^.nErr > 0` to mirror resolve.c:1457
+        `return pParse->nErr ? WRC_Abort : ...`.
+     Verified: bit_count, sum/2-arg, bogus_fn(a), missing_col, and the
+     two-call case all caret-byte-identical to upstream.  TestExplainParity
+     1026/1026; regression suite 69/69 binaries / 4963/4963 assertions;
+     full Diag* probe sweep 0 divergences.
+
 - [X] **10.1.bug.88** Fixed 2026-05-10.  Five CLI/codegen divergences vs
      the 3.53.0 oracle, all closed in one sweep:
      (a) `.mode column` rendered trailing whitespace (all-NULL row →
