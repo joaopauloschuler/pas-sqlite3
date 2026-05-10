@@ -25765,8 +25765,16 @@ begin
     re-opening cursors with TF_Ephemeral so the eph populated here is
     scanned in place.  Mirrors C select.c per-source coroutine/eph fan-out
     inside sqlite3WhereBegin.  Without this pass, SELECT … FROM (SELECT …) x,
-    (SELECT …) y emits the 3-op stub (Init/Halt/Goto). }
-  if pTabList^.nSrc > 1 then
+    (SELECT …) y emits the 3-op stub (Init/Halt/Goto).
+
+    Also runs for nSrc=1 + SF_Distinct: the materialise arm at 25652 and
+    the Sub-SELECT co-routine arm at 25414 are both gated SF_Distinct=0,
+    so DISTINCT-on-CTE / DISTINCT-on-(SELECT …) would otherwise fall
+    through to sqlite3WhereBegin with no opened source cursor, crashing
+    in OP_Rewind on a nil cursor (10.1.bug.93). }
+  if (pTabList^.nSrc > 1)
+     or ((pTabList^.nSrc = 1)
+         and ((p^.selFlags and SF_Distinct) <> 0)) then
   begin
     v := sqlite3GetVdbe(pParse);
     if v <> nil then

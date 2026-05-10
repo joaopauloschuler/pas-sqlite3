@@ -4131,6 +4131,77 @@ existing dispatcher.
      QRF chunk.  Build green: 68/69; pre-existing TestPagerReadOnly
      unchanged.  All Diag* probes 0 divergences.
 
+- [ ] **10.1.bug.94** `row_number() OVER (ORDER BY x DESC)` over a
+     CTE-VALUES source returns rows in source-order with row_number=1,2,3
+     instead of descending-order with row_number=1,2,3.  Reproducer:
+     `WITH t(a) AS (VALUES(1),(2),(3)) SELECT a, row_number() OVER (ORDER BY a DESC) FROM t`
+     returns `1|1; 2|2; 3|3` (Pas) vs `3|1; 2|2; 1|3` (oracle).
+     Likely the window-arm sort key honours ASC even when DESC is
+     requested for a coroutine source — see codegen.pas window-rewrite
+     pSub^.pOrderBy direction propagation (linked to colUsed work
+     in 6.29).
+
+- [ ] **10.1.bug.95** Cross JOIN of two `(VALUES …)` clauses returns
+     only the first product row.  Reproducer:
+     `SELECT * FROM (VALUES(1),(2)), (VALUES('a'),('b'))` returns `1|a`
+     in Pas vs four rows `1|a, 1|b, 2|a, 2|b` in upstream.  Multi-source
+     pre-materialise pass at codegen.pas:25762 likely under-iterates one
+     of the inline-VALUES sources because their viaCoroutine bit is
+     already set (gate at :25778 skips them) but the standard scan path
+     downstream doesn't drive the second coroutine.
+
+- [ ] **10.1.bug.96** Foreign-key constraint not enforced.  Reproducer:
+     `PRAGMA foreign_keys=ON; CREATE TABLE p(id INTEGER PRIMARY KEY);
+     CREATE TABLE c(id INTEGER, pid REFERENCES p(id));
+     INSERT INTO p VALUES(1); INSERT INTO c VALUES(1,2);` — upstream
+     errors `FOREIGN KEY constraint failed`, Pas inserts the orphan row.
+     Likely PRAGMA foreign_keys=ON arm not wiring the dbFlags FK_Enforce
+     bit, or sqlite3FkCheck not actually invoked from INSERT codegen.
+
+- [ ] **10.1.bug.97** Ambiguous column reference across two CTEs in a
+     comma-join not detected.  Reproducer:
+     `WITH a(x) AS (VALUES(1)), b(x) AS (VALUES(2)) SELECT x FROM a,b;`
+     returns `1` in Pas vs `Parse error: ambiguous column name: x` in
+     upstream.  Resolver doesn't flag the shared column name across the
+     two ephemeral CTE sources (probably the resolver bails on
+     TF_Ephemeral pTab before the ambiguity check fires).
+
+- [X] **10.1.bug.93** Fixed 2026-05-10.  `WITH t(...) AS (...) SELECT
+     DISTINCT ... FROM t` (any CTE — VALUES-based or SELECT-based)
+     crashed with `EAccessViolation` at OP_Rewind.  Reproducer:
+     `WITH t(a) AS (VALUES(1),(2),(2),(3)) SELECT DISTINCT a FROM t;` →
+     `Access violation` instead of `1; 2; 3`.  Same crash on
+     `WITH t AS (SELECT 1 a UNION SELECT 2) SELECT DISTINCT a FROM t;`.
+     Root cause: the Sub-SELECT co-routine arm
+     (passqlite3codegen.pas:25414) and the materialise arm (:25652) are
+     both gated `(p^.selFlags and SF_Distinct) = 0`, so any DISTINCT
+     query over a single-source subquery FROM item bypassed both arms.
+     The CTE expansion (`resolveFromTermToCte` at :21306) attaches the
+     subquery body but does NOT set the SRCITEM_FG_VIA_COROUTINE bit on
+     the SrcItem, so sqlite3WhereBegin's dispatch (:17115) didn't force
+     the full-planner path either (`fSingleTabCoroutine` was False).
+     The single-level fast path then emitted `OP_Rewind` on the CTE-
+     reference cursor that no preceding `OP_OpenRead` / `InitCoroutine`
+     had populated — runtime nil-pointer deref in the OP_Rewind handler
+     at passqlite3vdbe.pas:7861 (`pCur^.uc.pCursor` with pCur=nil).
+     Fix: extend the multi-source pre-materialise pass at
+     passqlite3codegen.pas:25762 (originally landed for 10.1.bug.47) to
+     also fire for `nSrc=1 + SF_Distinct`.  The existing per-item
+     guards (SRCITEM_FG_IS_SUBQUERY, not viaCoroutine, pSubq + pSelect
+     populated, pSTab non-nil) cleanly identify the CTE-reference shape
+     and emit `OP_OpenEphemeral + sqlite3Select(SRT_EphemTab)` to
+     populate the eph cursor before sqlite3WhereBegin runs.  WhereBegin
+     then skips re-opening (TF_Ephemeral gate at :17219/:17439) and
+     drives the standard Rewind/Next scan over the populated cursor;
+     the existing DISTINCT-staging open at :25867 layers on top
+     unchanged.  Verification: reproducer returns `1;2;3` byte-identical
+     to upstream; same for `SELECT DISTINCT a FROM t ORDER BY a` and
+     `WITH t AS (SELECT … UNION SELECT …)` shapes.  Regression
+     gate: 69/69 binaries pass, 4963 assertions clean; DiagOps /
+     DiagDml / DiagFunctions / DiagWindow / DiagMisc / DiagPragma /
+     DiagFeatureProbe / DiagDropTable / DiagIndexing / DiagAnalyze /
+     DiagCovering / DiagCreateIdx all 0 divergences.
+
 - [ ] **10.1.bug.39** `.recover` on a clean (uncorrupted) db reports
      `database disk image is malformed (11)` after the
      `BEGIN; PRAGMA writable_schema = on; PRAGMA foreign_keys = off;`
