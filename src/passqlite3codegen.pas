@@ -18639,11 +18639,16 @@ begin
           regFilter / filterPullDown decoration deferred. }
         if (pLoop^.wsFlags and (WHERE_INDEXED or WHERE_IDX_ONLY)) <> 0 then
         begin
-          pLevel^.iIdxCur := pParse^.nTab;
-          Inc(pParse^.nTab);
-          if pLoop^.u.btree.pIndex <> nil then
+          { where.c:7320..7357 — pick the index cursor.  When invoked under
+            WHERE_OR_SUBCLAUSE with a positive iAuxArg, reuse that cursor
+            number and emit OP_ReopenIdx so every OR-disjunct shares the
+            covering-index cursor (bug 6.17.A). }
+          if (iAuxArg <> 0)
+             and ((wctrlFlags and WHERE_OR_SUBCLAUSE) <> 0)
+             and (pLoop^.u.btree.pIndex <> nil) then
           begin
-            sqlite3VdbeAddOp3(v, OP_OpenRead, pLevel^.iIdxCur,
+            pLevel^.iIdxCur := iAuxArg;
+            sqlite3VdbeAddOp3(v, OP_ReopenIdx, pLevel^.iIdxCur,
                               i32(pLoop^.u.btree.pIndex^.tnum), iDb);
             sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pLoop^.u.btree.pIndex));
             if ((pLoop^.wsFlags and WHERE_CONSTRAINT) <> 0)
@@ -18652,6 +18657,23 @@ begin
                           or WHERE_BIGNULL_SORT)) = 0)
                and (pWInfo^.eDistinct <> WHERE_DISTINCT_ORDERED) then
               sqlite3VdbeChangeP5(v, OPFLAG_SEEKEQ);
+          end
+          else
+          begin
+            pLevel^.iIdxCur := pParse^.nTab;
+            Inc(pParse^.nTab);
+            if pLoop^.u.btree.pIndex <> nil then
+            begin
+              sqlite3VdbeAddOp3(v, OP_OpenRead, pLevel^.iIdxCur,
+                                i32(pLoop^.u.btree.pIndex^.tnum), iDb);
+              sqlite3VdbeSetP4KeyInfo(pParse, Pointer(pLoop^.u.btree.pIndex));
+              if ((pLoop^.wsFlags and WHERE_CONSTRAINT) <> 0)
+                 and ((pLoop^.wsFlags
+                       and (WHERE_COLUMN_RANGE or WHERE_SKIPSCAN
+                            or WHERE_BIGNULL_SORT)) = 0)
+                 and (pWInfo^.eDistinct <> WHERE_DISTINCT_ORDERED) then
+                sqlite3VdbeChangeP5(v, OPFLAG_SEEKEQ);
+            end;
           end;
         end;
       end;
@@ -48405,6 +48427,19 @@ const
 var
   aBuiltinFuncs: array[0..81] of TFuncDef;
 
+{ TCompareInfo / globInfo / likeInfoNorm — hoisted from the patternCompare
+  block further down so aBuiltinFuncs[].pUserData (set in InitBuiltinFuncs)
+  can reference them.  Carries the matchAll/matchOne/matchSet wildcards used
+  by the LIKE/GLOB optimisation in sqlite3IsLikeFunction (func.c:2407). }
+type
+  TCompareInfo = record
+    matchAll, matchOne, matchSet, noCase: u8;
+  end;
+
+const
+  globInfo:     TCompareInfo = (matchAll: Ord('*'); matchOne: Ord('?'); matchSet: Ord('['); noCase: 0);
+  likeInfoNorm: TCompareInfo = (matchAll: Ord('%'); matchOne: Ord('_'); matchSet: 0;          noCase: 1);
+
 procedure InitBuiltinFuncs;
 procedure MakeFD(var fd: TFuncDef; n: i16; flgs: u32;
   sfunc: TxSFuncProc; final_: TxFinalProc; nm: PAnsiChar); inline;
@@ -48464,6 +48499,12 @@ begin
   MakeFD(aBuiltinFuncs[37], 3, FUNC_ENC or SQLITE_FUNC_LIKE, @likeFunc, nil, 'like');
   MakeFD(aBuiltinFuncs[38], 2, FUNC_ENC or SQLITE_FUNC_LIKE or SQLITE_FUNC_CASE,
     @globFunc, nil, 'glob');
+  { func.c — pUserData carries the {matchAll,matchOne,matchSet,noCase}
+    compareInfo struct so sqlite3IsLikeFunction can distinguish LIKE
+    (`%`/`_`/no set) from GLOB (`*`/`?`/`[`) for the LIKE optimisation. }
+  aBuiltinFuncs[36].pUserData := @likeInfoNorm;
+  aBuiltinFuncs[37].pUserData := @likeInfoNorm;
+  aBuiltinFuncs[38].pUserData := @globInfo;
   MakeFD(aBuiltinFuncs[39], 0, FUNC_ENC or SQLITE_FUNC_BUILTIN,
     @errlogFunc, nil, 'sqlite_log');
   { Phase 6.9-bis 11g.2.f sub-progress 30 — unlikely()/likely()/likelihood()
@@ -48836,9 +48877,22 @@ begin
   if (pDef = nil) or ((pDef^.funcFlags and SQLITE_FUNC_LIKE) = 0) then begin
     Result := 0; Exit;
   end;
-  aWc[0] := '%';
-  aWc[1] := '_';
-  aWc[2] := '\';
+  { func.c:2407 — copy matchAll/matchOne/matchSet from compareInfo at
+    pDef->pUserData (globInfo for GLOB, likeInfoNorm for LIKE).  Falls back
+    to LIKE defaults when pUserData has not been wired (legacy callers).
+    wc[3] (escape) is set by the caller, or by the 3-arg LIKE ESCAPE arm. }
+  if pDef^.pUserData <> nil then
+  begin
+    aWc[0] := AnsiChar(PByte(pDef^.pUserData)[0]);
+    aWc[1] := AnsiChar(PByte(pDef^.pUserData)[1]);
+    aWc[2] := AnsiChar(PByte(pDef^.pUserData)[2]);
+  end
+  else
+  begin
+    aWc[0] := '%';
+    aWc[1] := '_';
+    aWc[2] := '\';
+  end;
   if pIsNocase <> nil then begin
     if (pDef^.funcFlags and SQLITE_FUNC_CASE) <> 0 then pIsNocase^ := 0
     else pIsNocase^ := 1;
@@ -51382,20 +51436,13 @@ begin
   sqlite3InsertBuiltinFuncs(@aDateFuncs, Length(aDateFuncs));
 end;
 
-{ Phase 6.10 step 11(k): full port of patternCompare (func.c:728..855).
-  Adds GLOB [...] / [^...] / [a-z] char-class support, UTF-8 lookahead for
-  the wildcard tail-search, and SQLITE_NOWILDCARDMATCH semantics. }
-type
-  TCompareInfo = record
-    matchAll, matchOne, matchSet, noCase: u8;
-  end;
-
+{ Phase 6.10 step 11(k): see TCompareInfo / globInfo / likeInfoNorm declared
+  earlier in the unit (hoisted ahead of aBuiltinFuncs registration so pUserData
+  can point at globInfo/likeInfoNorm for the LIKE optimisation). }
 const
   SQLITE_MATCH            = 0;
   SQLITE_NOMATCH          = 1;
   SQLITE_NOWILDCARDMATCH  = 2;
-  globInfo:     TCompareInfo = (matchAll: Ord('*'); matchOne: Ord('?'); matchSet: Ord('['); noCase: 0);
-  likeInfoNorm: TCompareInfo = (matchAll: Ord('%'); matchOne: Ord('_'); matchSet: 0;          noCase: 1);
 
 function utf8ReadByteOrSlow(var p: Pu8): u32; inline;
 var

@@ -95,12 +95,12 @@ FPC porting traps that recur often enough to call out up-front:
       sqlite3 against `/tmp/lint.db`.  Phase 10.1.20 / 10.1.46 /
       10.1.48 unblocked.
 
-- [ ] **6.17** OR-decomposed Case-5 codegen + LIKE/GLOB range-bound
-      prefix truncation — opened 2026-05-11 from `.archive`/`.ar`
-      positional-name filters (see 10.1.46).  Two independent
-      sub-bugs sharing the same gate (the .archive filtered flows):
+- [X] **6.17** OR-decomposed Case-5 codegen + LIKE/GLOB range-bound
+      prefix truncation — opened and closed 2026-05-11.  Both sub-bugs
+      fixed; full regression (5020 assertions) and C-oracle parity on
+      the minimal repros verified.
 
-    - [ ] **6.17.A** OR-decomposed Case-5 codegen references an
+    - [X] **6.17.A** OR-decomposed Case-5 codegen references an
           un-opened table cursor.  Minimal repro outside .archive:
           `CREATE TABLE t(name TEXT PRIMARY KEY);
            INSERT INTO t VALUES('a/b'),('c');
@@ -115,9 +115,37 @@ FPC porting traps that recur often enough to call out up-front:
           the wrong cursor index.  Suspect: the index→table cursor
           rewrite at codegen.pas:19422 (`WHERE_MULTI_OR` arm using
           `pLevel^.u.pCoveringIdx`) does not run / runs with nil.
+          Root cause was actually in `sqlite3WhereBegin`'s cursor-
+          open block (codegen.pas:18640): the WHERE_INDEXED branch
+          always allocated a fresh cursor via `pParse^.nTab++` even
+          when invoked under `WHERE_OR_SUBCLAUSE` with a positive
+          `iAuxArg`.  C `where.c:7343..7345` reuses iAuxArg as
+          `iIndexCur` and emits `OP_ReopenIdx` so every disjunct
+          shares one covering-index cursor.  Fix: honour the
+          WHERE_OR_SUBCLAUSE+iAuxArg branch.  C oracle parity
+          verified on `SELECT name FROM t WHERE name='c' OR
+          name>'a';` — Pascal now emits ReopenIdx 1 / SeekGE 1 /
+          DeferredSeek 1 just like C, and the Column at the body
+          tail (`Column 1 0 6`) reads from the now-opened cursor.
 
-    - [ ] **6.17.B** LIKE/GLOB range-bound prefix truncation never
-          reaches `OP_String8`.  Minimal repro:
+    - [X] **6.17.B** LIKE/GLOB range-bound prefix truncation never
+          reaches `OP_String8`.  Root cause: Pascal
+          `sqlite3IsLikeFunction` hard-coded the LIKE wildcards
+          (`%`/`_`/`\\`) for both LIKE and GLOB; the builtin func
+          registrations also left `pUserData` nil instead of pointing
+          at globInfo/likeInfoNorm.  `isLikeOrGlob` therefore never
+          recognised `*` as a wildcard in a GLOB pattern → `cnt`
+          walked past the end of the string, `c` ended at NUL, and the
+          truncation `zNew[cnt] := #0` wrote one past the buffer
+          tail (no effective truncation).  Fix in codegen.pas: hoist
+          `TCompareInfo` / `globInfo` / `likeInfoNorm` ahead of
+          `InitBuiltinFuncs`, stamp `aBuiltinFuncs[36..38].pUserData`
+          with the right compareInfo, and read `pUserData` in
+          `sqlite3IsLikeFunction` (falling back to LIKE defaults when
+          nil).  C oracle parity verified on `SELECT name FROM sqlar
+          WHERE name GLOB 'src/dir1/*'` — String8 now emits
+          `'src/dir1/'`/`'src/dir10'` and the residual `glob()`
+          Function call disappears (isComplete now correctly true).  Minimal repro:
           `SELECT name FROM sqlar WHERE name GLOB 'src/dir1/*'`
           on an archive that contains `src/dir1/b.txt` returns
           zero rows from our shell but the expected row from C.
