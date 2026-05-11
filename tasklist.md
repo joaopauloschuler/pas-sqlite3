@@ -72,7 +72,7 @@ FPC porting traps that recur often enough to call out up-front:
 
 ### Open Bugs
 
-- [X] **6.13** `pragma_foreign_key_list(s.name)` (and other table-valued PRAGMA functions). **Sub-bug A** (column-list emission) closed 2026-05-08. **Sub-bug B** (lateral join with hidden-arg pushdown) closed 2026-05-11 via B.1..B.9: `whereLoopAddVirtual` + Case-1 codegen + WhereBegin OP_VOpen now push the lateral arg through xBestIndex/xFilter; TABFUNC arg lists are resolved before fitTabFuncArgs; `f.[table]` identifier syntax now dequotes.  `SELECT s.name, f.* FROM sqlite_schema s, pragma_foreign_key_list(s.name) f` returns the canonical row, and `bin/TestVtabLateral` is byte-identical with upstream across generate_series / pragma_foreign_key_list / json_each.  B.10 dependants (.lint fkey-indexes, .archive, .recover) are now blocked on **GROUP BY over multi-source vtab FROM**, not 6.13.
+- [~] **6.13** `pragma_foreign_key_list(s.name)` (and other table-valued PRAGMA functions). **Sub-bug A** (column-list emission) closed 2026-05-08. **Sub-bug B** (lateral join with hidden-arg pushdown) closed 2026-05-11 via B.1..B.9: `whereLoopAddVirtual` + Case-1 codegen + WhereBegin OP_VOpen now push the lateral arg through xBestIndex/xFilter; TABFUNC arg lists are resolved before fitTabFuncArgs; `f.[table]` identifier syntax now dequotes.  `SELECT s.name, f.* FROM sqlite_schema s, pragma_foreign_key_list(s.name) f` returns the canonical row, and `bin/TestVtabLateral` is byte-identical with upstream across generate_series / pragma_foreign_key_list / json_each.  B.10 dependants (.lint fkey-indexes, .archive, .recover) are now blocked on **GROUP BY over multi-source vtab FROM**, not 6.13.
 
     Subtasks (each lands independently; gate names are proposed):
 
@@ -155,7 +155,7 @@ FPC porting traps that recur often enough to call out up-front:
           path can run.  Track under a new bug once a sponsor
           query lands.
 
-- [X] **6.10** TestExplainParity **1026/1026 PASS** as of 2026-05-06 (a3). All sub-steps (6/7/8/9/15/17) closed.
+- [X] **6.10** TestExplainParity closed.
 - [X] **6.11** PRAGMA page_count + DROP TABLE remaining gap closed.
 - [X] **6.12** sqlite3Pragma full port; DiagPragma all PASS.
 - [X] **6.14** Compound `SELECT … FROM sqlite_schema … UNION ALL …` — both sub-bugs closed (compound dispatch + selectExpander/resolveSelectNames walk pPrior).
@@ -179,7 +179,7 @@ FPC porting traps that recur often enough to call out up-front:
 
 ## Phase 8 — Public API
 
-Public-API gap analysis 2026-04-28: `../sqlite3/src/sqlite.h.in` exports
+Public-API gap analysis: `../sqlite3/src/sqlite.h.in` exports
 ~238 `sqlite3_*` symbols; the Pascal port currently exposes ~156.
 Windows-only entry points (`sqlite3_win32_*`) and pure typedefs are excluded.
 
