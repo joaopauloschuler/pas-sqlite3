@@ -169,6 +169,7 @@ compile_test TestUpdateCorrelated
 compile_test TestCteOuterID
 compile_test TestShellSemiComment
 compile_test TestShellEcho
+compile_test TestShellParameter
 compile_test TestExplainParity
 compile_test TestBytecodeParity
 compile_test TestWhereCorpus

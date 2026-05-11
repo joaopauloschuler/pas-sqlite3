@@ -2332,6 +2332,68 @@ begin
     Result := Format('%s:', [string(zErrorType)]);
 end;
 
+{ bindPreparedStmt — shell.c.in:2993..3075 bind_prepared_stmt.
+  Walk pStmt's parameter slots and bind from temp.sqlite_parameters
+  (populated by `.parameter set`).  Falls back to $int_N / $text_X
+  literal-name encoding, and $TIMER → prevTimer.  Slots with no
+  match bind NULL.  No-op if pStmt has no parameters or the
+  parameter table does not exist. }
+procedure bindPreparedStmt(p: PShellState; pStmt: PVdbe);
+var
+  nVar, i, rc: i32;
+  pQ: PVdbe;
+  pzTail: PAnsiChar;
+  zVar: PAnsiChar;
+  zNum: array[0..31] of AnsiChar;
+  zKey: AnsiString;
+  zLit: AnsiString;
+  iVal: i32;
+  szVar: SizeInt;
+begin
+  if pStmt = nil then Exit;
+  nVar := sqlite3_bind_parameter_count(pStmt);
+  if nVar = 0 then Exit;
+  pQ := nil;
+  rc := SQLITE_OK;
+  if sqlite3_table_column_metadata(p^.db, 'TEMP', 'sqlite_parameters',
+       'key', nil, nil, nil, nil, nil) <> SQLITE_OK then
+    rc := SQLITE_NOTFOUND
+  else
+    rc := sqlite3_prepare_v2(p^.db,
+        'SELECT value FROM temp.sqlite_parameters WHERE key=?1',
+        -1, @pQ, @pzTail);
+  for i := 1 to nVar do begin
+    zVar := sqlite3_bind_parameter_name(pStmt, i);
+    if zVar = nil then begin
+      StrPCopy(zNum, '?' + IntToStr(i));
+      zVar := zNum;
+    end;
+    if (rc = SQLITE_OK) and (pQ <> nil) then begin
+      sqlite3_reset(pQ);
+      zKey := AnsiString(zVar);
+      sqlite3_bind_text(pQ, 1, PAnsiChar(zKey), -1, SQLITE_STATIC);
+      if sqlite3_step(pQ) = SQLITE_ROW then begin
+        sqlite3_bind_value(pStmt, i, sqlite3_column_value(pQ, 0));
+        Continue;
+      end;
+    end;
+    szVar := StrLen(zVar);
+    if (szVar > 5) and (StrLComp(zVar, '$int_', 5) = 0) then begin
+      Val(string(AnsiString(zVar + 5)), iVal, rc);
+      if rc <> 0 then iVal := 0;
+      sqlite3_bind_int(pStmt, i, iVal);
+    end else if (szVar > 6) and (StrLComp(zVar, '$text_', 6) = 0) then begin
+      zLit := AnsiString(zVar + 6);
+      sqlite3_bind_text(pStmt, i, PAnsiChar(zLit), -1, SQLITE_TRANSIENT);
+    end else if StrComp(zVar, '$TIMER') = 0 then begin
+      sqlite3_bind_double(pStmt, i, p^.prevTimer);
+    end else begin
+      sqlite3_bind_null(pStmt, i);
+    end;
+  end;
+  if pQ <> nil then sqlite3_finalize(pQ);
+end;
+
 function runOneSqlLine(p: PShellState; const zSql: AnsiString;
                        const zSrc: AnsiString; lineno: i64): i32;
 { Hold zSql as a single immutable AnsiString and walk pCursor through its
@@ -2383,6 +2445,7 @@ begin
       Continue;
     end;
     p^.pStmt := pStmt;
+    bindPreparedStmt(p, pStmt);
     shellBeginTimer(p);
     stepAndRender(p, pStmt);
     shellEndTimer(p);
