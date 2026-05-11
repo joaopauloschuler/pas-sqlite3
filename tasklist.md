@@ -558,7 +558,55 @@ partial landings cannot silently no-op.
         `sCtx.zFile := '<pipe>'`, `xCloser := @pclose`.  Gated behind
         the existing `failIfSafeMode(p, 'cannot run .import in safe
         mode')` already in `cmdImport`.
-- [~] **10.1.27** `.open` — handles `-new`, `-readonly`, `-exclusive`, `-ifexists`, `-nofollow`.  Backing VFS/extension ports for `--zip` (10.1.98) / `--deserialize` (10.1.102) / `--hexdb` (10.1.102) are all `[X]`; only the `cmdOpen` parser arms need wiring — tracked under 10.1d.6.a.
+- [~] **10.1.27** `.open` — `cmdOpen` at passqlite3shell.pas:4977 covers
+      the base flag set (`-new`, `-readonly`, `-exclusive`, `-ifexists`,
+      `-nofollow`).  Backing ports for the VFS/format modes
+      (`--zip`/10.1.98, `--deserialize`+`--hexdb`/10.1.102,
+      appendvfs/10.1.84) are `[X]`; only the dot-command parser arms
+      remain.  Breakdown — each sub-arm is an independent patch to
+      `cmdOpen`:
+  - [ ] **10.1.27.a** Add `-zip` / `-append` flag arms (shell.c.in:10158..10162).
+        Set `openMode := SHELL_OPEN_ZIPFILE` / `SHELL_OPEN_APPENDVFS` and
+        gate `-zip` (and `-append`) on `not p^.bSafeMode` to match the
+        upstream `!p->bSafeMode` guard.  No new helpers — the openDb
+        switch already dispatches on openMode (10.1.102).
+  - [ ] **10.1.27.b** Add `-deserialize` / `-hexdb` / `-normal` flag arms
+        (shell.c.in:10172..10178).  Set `openMode` accordingly.  The
+        `-hexdb` arm must allow zero filename (upstream lets HEXDB open
+        without `zFN` because input comes from the script via
+        `shellReadHexDb`) — the post-flag-loop guard at cmdOpen must
+        become `if (zFN <> '') or (openMode = SHELL_OPEN_HEXDB)` rather
+        than the current `if zFN <> ''`.
+  - [ ] **10.1.27.c** Add `-maxsize N` arm (shell.c.in:10179..10180).
+        Consume the next arg via `shellIntegerValue` and write to
+        `p^.szMax`.  Currently `cmdOpen` sets `p^.szMax := 0`
+        unconditionally — move that zeroing into the no-`-maxsize` path,
+        or just let the explicit assignment overwrite it.  Read by
+        `openDb`'s deserialize arm.
+  - [ ] **10.1.27.d** `-new` URI-aware deletion (shell.c.in:10210..10218).
+        Currently `DeleteFile(string(zFN))` is called unconditionally
+        when `newFlag=1`; upstream uses `shellFilenameFromUri` on
+        `file:` URIs first (so `.open -new file:foo?cache=shared`
+        deletes `foo`, not the literal URI string).  Helper:
+        `shellFilenameFromUri` (port from shell.c.in or wrap
+        `sqlite3_uri_parameter` + filename extraction).
+  - [ ] **10.1.27.e** `bSafeMode` enforcement (shell.c.in:10148 +
+        10221..10227): when `p^.bSafeMode <> 0`, force `openFlags :=
+        SQLITE_OPEN_READONLY` up front, refuse `-zip`/`-append`, and
+        refuse disk-backed `zFN` unless `:memory:` or HEXDB.  Calls into
+        the existing `failIfSafeMode` helper.
+  - [ ] **10.1.27.f** `session_close_all(p, -1)` pre-close hook
+        (shell.c.in:10198).  Stub for now if the session extension is
+        absent — note the divergence at the call site.
+  - [ ] **10.1.27.g** Drive-by: byte-identical `unknown option:` /
+        `extra argument:` error strings against shell.c.in:10186..10193.
+        Required for the 10.1d.G golden-diff gate.  Currently
+        `cmdOpen` already prints `unknown option: %s` / `extra
+        argument: "%s"` but verify the trailing newline and quoting
+        match exactly.
+
+  10.1d.6.a / 10.1d.6.b are the gate-side mirror of this list; once
+  all `.a..g` land and the gate passes, 10.1.27 flips to `[X]`.
 
 ### 10.1e Meta / diagnostic dot-commands
 
