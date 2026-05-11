@@ -15423,28 +15423,142 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
-  Phase 6.9-bis (step 11g.2.d sub-progress) — whereLoopAddVirtual stub.
+  Phase 6.13.B.7 — whereLoopAddVirtual four-pass driver (where.c:4685..4801).
 
-  The full virtual-table planner (where.c:4357..4810: whereLoopAddVirtualOne
-  + whereLoopAddVirtual) drives `xBestIndex` through up to four passes
-  (LIMIT/OFFSET, IN-handled, all-usable, dependency-bounded).  Porting it
-  requires the entire sqlite3_index_info marshalling layer plus the
-  ConstraintCompare / Cleanup glue.  None of the corpus this slice is
-  exercising touches xBestIndex, so the stub returns SQLITE_OK without
-  emitting any candidate loops.  whereLoopAddOr / whereLoopAddAll dispatch
-  here when IsVirtual(pSTab) is true; the parent driver tolerates the
-  zero-loops outcome (the eventual wherePathSolver will simply have no
-  vtab plans to choose from).
+  Adds every plausible virtual-table WhereLoop for the FROM-clause term
+  pointed at by pBuilder^.pNew^.iTab by repeatedly calling xBestIndex
+  through whereLoopAddVirtualOne with different (mUsable, mExclude)
+  combinations:
+
+    1. All terms usable.  If the resulting plan trips the LIMIT-vs-IN
+       conflict, retry with pbRetryLimit=nil to mask out LIMIT/OFFSET.
+    2. If the first plan used IN(...), repeat with WO_IN excluded so the
+       solver can pick a non-IN plan when that's cheaper.
+    3. Walk every distinct value of (term.prereqRight & ~mPrereq) across
+       this vtab's constraints; mask all *other* prereq tables out and
+       re-run xBestIndex so the planner sees a join-friendly subset.
+    4. If no zero-prereq plan was seen, run once with mUsable=mPrereq
+       (all source tables disabled); if no zero-prereq + no-IN plan was
+       seen, run once more with mUsable=mPrereq AND WO_IN excluded.
+
+  All candidate WhereLoops are appended to pBuilder^.pWInfo^.pLoops via
+  whereLoopInsert inside whereLoopAddVirtualOne; this driver only
+  controls *which* xBestIndex invocations happen.  pIdxInfo is allocated
+  once (allocateIndexInfo), reused across all passes, and released via
+  freeIndexInfo on exit.
   =========================================================================== }
 
 function whereLoopAddVirtual(pBuilder: PWhereLoopBuilder;
   mPrereq: Bitmask; mUnusable: Bitmask): i32;
+const
+  ALLBITS: Bitmask = not Bitmask(0);
+var
+  rc:        i32;
+  pWInfo:    PWhereInfo;
+  pPrs:      PParse;
+  pWC:       PWhereClause;
+  pSrc:      PSrcItem;
+  pIdxInfo:  PSqlite3IndexInfo;
+  nConstraint: i32;
+  bIn, bRetry: i32;
+  pNew:      PWhereLoop;
+  mBest, mBestNoIn, mPrev, mNext, mThis: Bitmask;
+  mNoOmit:   u16;
+  seenZero, seenZeroNoIN: i32;
+  i, iTermOff: i32;
+  pTerm:     PWhereTerm;
 begin
-  { Touch the parameters so unused-variable warnings stay quiet.
-    allocateIndexInfo is declared but not yet invoked — wired up in B.6/B.7. }
-  if (pBuilder = nil) or (mPrereq = mPrereq) or (mUnusable = mUnusable) then
-    ; { no-op }
-  Result := SQLITE_OK;
+  pWInfo := pBuilder^.pWInfo;
+  pPrs   := pWInfo^.pParse;
+  pWC    := pBuilder^.pWC;
+  pNew   := pBuilder^.pNew;
+  pSrc   := @SrcListItems(pWInfo^.pTabList)[pNew^.iTab];
+
+  mNoOmit  := 0;
+  pIdxInfo := allocateIndexInfo(pWInfo, pWC, mUnusable, pSrc, mNoOmit);
+  if pIdxInfo = nil then begin Result := SQLITE_NOMEM_BKPT; Exit; end;
+
+  pNew^.rSetup            := 0;
+  pNew^.wsFlags           := WHERE_VIRTUALTABLE;
+  pNew^.nLTerm            := 0;
+  pNew^.u.vtab.bFlags     := pNew^.u.vtab.bFlags and u8(not $01);   { needFree off }
+  nConstraint             := pIdxInfo^.nConstraint;
+  if whereLoopResize(pPrs^.db, pNew, nConstraint) <> SQLITE_OK then
+  begin
+    freeIndexInfo(pPrs^.db, pIdxInfo);
+    Result := SQLITE_NOMEM_BKPT;
+    Exit;
+  end;
+
+  bRetry := 0; bIn := 0;
+  rc := whereLoopAddVirtualOne(pBuilder, mPrereq, ALLBITS, 0,
+                               pIdxInfo, mNoOmit, bIn, @bRetry);
+  if bRetry <> 0 then
+  begin
+    rc := whereLoopAddVirtualOne(pBuilder, mPrereq, ALLBITS, 0,
+                                 pIdxInfo, mNoOmit, bIn, nil);
+  end;
+
+  mBest := pNew^.prereq and (not mPrereq);
+  if (rc = SQLITE_OK) and ((mBest <> 0) or (bIn <> 0)) then
+  begin
+    seenZero     := 0;
+    seenZeroNoIN := 0;
+    mPrev        := 0;
+    mBestNoIn    := 0;
+
+    if bIn <> 0 then
+    begin
+      rc := whereLoopAddVirtualOne(pBuilder, mPrereq, ALLBITS, u16(WO_IN),
+                                   pIdxInfo, mNoOmit, bIn, nil);
+      mBestNoIn := pNew^.prereq and (not mPrereq);
+      if mBestNoIn = 0 then
+      begin
+        seenZero     := 1;
+        seenZeroNoIN := 1;
+      end;
+    end;
+
+    while rc = SQLITE_OK do
+    begin
+      mNext := ALLBITS;
+      for i := 0 to nConstraint - 1 do
+      begin
+        iTermOff := pIdxInfo^.aConstraint[i].iTermOffset;
+        pTerm := termFromWhereClause(pWC, iTermOff);
+        if pTerm = nil then Continue;
+        mThis := pTerm^.prereqRight and (not mPrereq);
+        if (mThis > mPrev) and (mThis < mNext) then mNext := mThis;
+      end;
+      mPrev := mNext;
+      if mNext = ALLBITS then Break;
+      if (mNext = mBest) or (mNext = mBestNoIn) then Continue;
+      rc := whereLoopAddVirtualOne(pBuilder, mPrereq,
+                                   mNext or mPrereq, 0,
+                                   pIdxInfo, mNoOmit, bIn, nil);
+      if pNew^.prereq = mPrereq then
+      begin
+        seenZero := 1;
+        if bIn = 0 then seenZeroNoIN := 1;
+      end;
+    end;
+
+    if (rc = SQLITE_OK) and (seenZero = 0) then
+    begin
+      rc := whereLoopAddVirtualOne(pBuilder, mPrereq, mPrereq, 0,
+                                   pIdxInfo, mNoOmit, bIn, nil);
+      if bIn = 0 then seenZeroNoIN := 1;
+    end;
+
+    if (rc = SQLITE_OK) and (seenZeroNoIN = 0) then
+    begin
+      rc := whereLoopAddVirtualOne(pBuilder, mPrereq, mPrereq, u16(WO_IN),
+                                   pIdxInfo, mNoOmit, bIn, nil);
+    end;
+  end;
+
+  freeIndexInfo(pPrs^.db, pIdxInfo);
+  Result := rc;
 end;
 
 { ---------------------------------------------------------------------------

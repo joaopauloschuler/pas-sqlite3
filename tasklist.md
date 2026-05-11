@@ -127,14 +127,15 @@ FPC porting traps that recur often enough to call out up-front:
           bOmitOffset=bit1, bIdxNumHex=bit2), and commits via
           whereLoopInsert.  SQLITE_CONSTRAINT → SQLITE_OK no-insert;
           LIMIT-vs-IN conflict → *pbRetryLimit signal.  Clean compile.
-    - [ ] **6.13.B.7** Port `whereLoopAddVirtual` four-pass driver
-          (where.c:4548..4803): (1) all-usable, (2) drop IN-handled
-          terms, (3) drop one usable term at a time
-          (dependency-bounded by mUnusable), (4) LIMIT/OFFSET hint
-          fallback.  Replace the stub at codegen.pas:14835.  Wire
-          the existing call sites at codegen.pas:14934 (whereLoopAddOr
-          vtab arm) and codegen.pas:15108 (whereLoopAddAll vtab arm)
-          remain unchanged — they already dispatch here.
+    - [X] **6.13.B.7** `whereLoopAddVirtual` four-pass driver ported
+          at codegen.pas:15461 (replaces the stub).  Pass 1 all-usable
+          + LIMIT/OFFSET retry; pass 2 WO_IN excluded; pass 3 distinct-
+          prereq walk with mUsable = mPrereq | mNext; pass 4 zero-
+          prereq / zero-prereq+noIN fallbacks.  Honours mUnusable via
+          allocateIndexInfo, sizes pNew via whereLoopResize, releases
+          pIdxInfo via freeIndexInfo on exit.  Existing dispatch sites
+          (whereLoopAddOr / whereLoopAddAll vtab arms) need no edits.
+          Clean compile.
     - [ ] **6.13.B.8** Codegen — emit `OP_VFilter` from the chosen
           vtab WhereLoop's `idxNum / idxStr / argvIndex` map inside
           `sqlite3WhereCodeOneLoopStart` (the existing vtab arm
