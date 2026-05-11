@@ -15207,6 +15207,222 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
+  Phase 6.13.B.6 — termFromWhereClause / isLimitTerm / allConstraintsUsed
+                   / whereLoopAddVirtualOne (where.c:4313..4530).
+
+  Three short helpers wrap the planner-internal accessors:
+
+    termFromWhereClause(pWC, iTerm) — walks the pWC -> pWC.pOuter chain
+        to recover the iTerm-th term across the combined clause space.
+    isLimitTerm(pTerm) — true for vtab-handled LIMIT or OFFSET terms
+        (eMatchOp in [SQLITE_INDEX_CONSTRAINT_LIMIT .. _OFFSET]).
+    allConstraintsUsed(pUsage, nCons) — every slot in pUsage[0..nCons-1]
+        has argvIndex > 0.
+
+  whereLoopAddVirtualOne is the single-pass workhorse: it marks the
+  subset of constraints usable under (mUsable, mExclude, pbRetryLimit),
+  zeroes the output struct, drives xBestIndex via vtabBestIndex, then
+  unmarshals aConstraintUsage[] into the candidate WhereLoop's aLTerm /
+  prereq / omitMask / mHandleIn / cost.  The candidate is committed to
+  the builder via whereLoopInsert.  Returns SQLITE_OK with no insert if
+  xBestIndex returns SQLITE_CONSTRAINT, or sets *pbRetryLimit when a
+  LIMIT/OFFSET term cannot coexist with an IN or unused term.
+  =========================================================================== }
+
+function termFromWhereClause(pWC: PWhereClause; iTerm: i32): PWhereTerm;
+var
+  p: PWhereClause;
+begin
+  p := pWC;
+  while p <> nil do
+  begin
+    if iTerm < p^.nTerm then
+    begin
+      Result := PWhereTerm(PByte(p^.a) + SizeInt(iTerm) * SizeOf(TWhereTerm));
+      Exit;
+    end;
+    iTerm := iTerm - p^.nTerm;
+    p := p^.pOuter;
+  end;
+  Result := nil;
+end;
+
+function isLimitTerm(pTerm: PWhereTerm): Boolean; inline;
+begin
+  Result := (pTerm^.eMatchOp >= SQLITE_INDEX_CONSTRAINT_LIMIT)
+        and (pTerm^.eMatchOp <= SQLITE_INDEX_CONSTRAINT_OFFSET);
+end;
+
+function allConstraintsUsed(aUsage: PSqlite3IndexConstraintUsage;
+  nCons: i32): Boolean;
+var
+  i: i32;
+begin
+  for i := 0 to nCons - 1 do
+    if aUsage[i].argvIndex <= 0 then begin Result := False; Exit; end;
+  Result := True;
+end;
+
+function whereLoopAddVirtualOne(
+  pBuilder:     PWhereLoopBuilder;
+  mPrereq:      Bitmask;
+  mUsable:      Bitmask;
+  mExclude:     u16;
+  pIdxInfo:     PSqlite3IndexInfo;
+  mNoOmit:      u16;
+  var pbIn:     i32;
+  pbRetryLimit: Pi32): i32;
+var
+  pWC:         PWhereClause;
+  pHidden:     PHiddenIndexInfo;
+  pIdxCons:    PSqlite3IndexConstraint;
+  pUsage:      PSqlite3IndexConstraintUsage;
+  i, mxTerm:   i32;
+  rc:          i32;
+  pNew:        PWhereLoop;
+  pPrs:        PParse;
+  pSrc:        PSrcItem;
+  nConstraint: i32;
+  pTerm:       PWhereTerm;
+  iTerm, jOff: i32;
+  aLT:         PPWhereTerm;
+begin
+  pWC         := pBuilder^.pWC;
+  pHidden     := PHiddenIndexInfo(PByte(pIdxInfo) + SizeOf(Tsqlite3_index_info));
+  pUsage      := pIdxInfo^.aConstraintUsage;
+  rc          := SQLITE_OK;
+  pNew        := pBuilder^.pNew;
+  pPrs        := pBuilder^.pWInfo^.pParse;
+  pSrc        := @SrcListItems(pBuilder^.pWInfo^.pTabList)[pNew^.iTab];
+  nConstraint := pIdxInfo^.nConstraint;
+
+  pbIn         := 0;
+  pNew^.prereq := mPrereq;
+
+  { Pass A — mark the usable subset of constraints. }
+  pIdxCons := pIdxInfo^.aConstraint;
+  for i := 0 to nConstraint - 1 do
+  begin
+    pTerm := termFromWhereClause(pWC, pIdxCons[i].iTermOffset);
+    pIdxCons[i].usable := 0;
+    if (pTerm <> nil)
+       and ((pTerm^.prereqRight and mUsable) = pTerm^.prereqRight)
+       and ((pTerm^.eOperator and mExclude) = 0)
+       and ((pbRetryLimit <> nil) or (not isLimitTerm(pTerm))) then
+      pIdxCons[i].usable := 1;
+  end;
+
+  { Reset the output side of pIdxInfo before xBestIndex sees it. }
+  FillChar(pUsage[0], SizeInt(nConstraint) * SizeOf(Tsqlite3_index_constraint_usage), 0);
+  pIdxInfo^.idxStr           := nil;
+  pIdxInfo^.idxNum           := 0;
+  pIdxInfo^.orderByConsumed  := 0;
+  pIdxInfo^.estimatedCost    := 1.0E99 / 2.0;
+  pIdxInfo^.estimatedRows    := 25;
+  pIdxInfo^.idxFlags         := 0;
+  pHidden^.mHandleIn         := 0;
+
+  rc := vtabBestIndex(pPrs, pSrc^.pSTab, pIdxInfo);
+  if rc <> SQLITE_OK then
+  begin
+    if rc = SQLITE_CONSTRAINT then
+    begin
+      freeIdxStr(pIdxInfo);
+      Result := SQLITE_OK;
+      Exit;
+    end;
+    Result := rc;
+    Exit;
+  end;
+
+  mxTerm := -1;
+  aLT    := pNew^.aLTerm;
+  FillChar(aLT[0], SizeInt(nConstraint) * SizeOf(PWhereTerm), 0);
+  FillChar(pNew^.u.vtab, SizeOf(pNew^.u.vtab), 0);
+  pIdxCons := pIdxInfo^.aConstraint;
+  for i := 0 to nConstraint - 1 do
+  begin
+    iTerm := pUsage[i].argvIndex - 1;
+    if iTerm < 0 then Continue;
+    jOff  := pIdxCons[i].iTermOffset;
+    pTerm := termFromWhereClause(pWC, jOff);
+    if (iTerm >= nConstraint) or (jOff < 0) or (pTerm = nil)
+       or (aLT[iTerm] <> nil) or (pIdxCons[i].usable = 0) then
+    begin
+      sqlite3ErrorMsg(pPrs, 'xBestIndex malfunction');
+      freeIdxStr(pIdxInfo);
+      Result := SQLITE_ERROR;
+      Exit;
+    end;
+    pNew^.prereq := pNew^.prereq or pTerm^.prereqRight;
+    aLT[iTerm]   := pTerm;
+    if iTerm > mxTerm then mxTerm := iTerm;
+    if pUsage[i].omit <> 0 then
+    begin
+      if (i < 16) and ((u16(1 shl i) and mNoOmit) = 0) then
+        pNew^.u.vtab.omitMask := pNew^.u.vtab.omitMask or u16(1 shl iTerm);
+      if pTerm^.eMatchOp = SQLITE_INDEX_CONSTRAINT_OFFSET then
+        pNew^.u.vtab.bFlags := pNew^.u.vtab.bFlags or u8($02);  { bOmitOffset }
+    end;
+    if (pHidden^.mHandleIn and (u32(1) shl i)) <> 0 then
+      pNew^.u.vtab.mHandleIn := pNew^.u.vtab.mHandleIn or (u32(1) shl iTerm)
+    else if (pTerm^.eOperator and u16(WO_IN)) <> 0 then
+    begin
+      pIdxInfo^.orderByConsumed := 0;
+      pIdxInfo^.idxFlags := pIdxInfo^.idxFlags and (not SQLITE_INDEX_SCAN_UNIQUE);
+      pbIn := 1;
+    end;
+    if isLimitTerm(pTerm) and ((pbIn <> 0) or (not allConstraintsUsed(pUsage, i))) then
+    begin
+      freeIdxStr(pIdxInfo);
+      if pbRetryLimit <> nil then pbRetryLimit^ := 1;
+      Result := SQLITE_OK;
+      Exit;
+    end;
+  end;
+
+  pNew^.nLTerm := u16(mxTerm + 1);
+  for i := 0 to mxTerm do
+  begin
+    if aLT[i] = nil then
+    begin
+      sqlite3ErrorMsg(pPrs, 'xBestIndex malfunction');
+      freeIdxStr(pIdxInfo);
+      Result := SQLITE_ERROR;
+      Exit;
+    end;
+  end;
+
+  pNew^.u.vtab.idxNum    := pIdxInfo^.idxNum;
+  if pIdxInfo^.needToFreeIdxStr <> 0 then
+    pNew^.u.vtab.bFlags  := pNew^.u.vtab.bFlags or u8($01);     { needFree }
+  pIdxInfo^.needToFreeIdxStr := 0;
+  pNew^.u.vtab.idxStr    := pIdxInfo^.idxStr;
+  if pIdxInfo^.orderByConsumed <> 0 then
+    pNew^.u.vtab.isOrdered := i8(pIdxInfo^.nOrderBy)
+  else
+    pNew^.u.vtab.isOrdered := 0;
+  if (pIdxInfo^.idxFlags and SQLITE_INDEX_SCAN_HEX) <> 0 then
+    pNew^.u.vtab.bFlags := pNew^.u.vtab.bFlags or u8($04);      { bIdxNumHex }
+  pNew^.rSetup := 0;
+  pNew^.rRun   := sqlite3LogEstFromDouble(pIdxInfo^.estimatedCost);
+  pNew^.nOut   := sqlite3LogEst(u64(pIdxInfo^.estimatedRows));
+
+  if (pIdxInfo^.idxFlags and SQLITE_INDEX_SCAN_UNIQUE) <> 0 then
+    pNew^.wsFlags := pNew^.wsFlags or WHERE_ONEROW
+  else
+    pNew^.wsFlags := pNew^.wsFlags and (not WHERE_ONEROW);
+
+  rc := whereLoopInsert(pBuilder, pNew);
+  if (pNew^.u.vtab.bFlags and u8($01)) <> 0 then
+  begin
+    sqlite3_free(pNew^.u.vtab.idxStr);
+    pNew^.u.vtab.bFlags := pNew^.u.vtab.bFlags and u8(not $01);
+  end;
+  Result := rc;
+end;
+
+{ ---------------------------------------------------------------------------
   Phase 6.9-bis (step 11g.2.d sub-progress) — whereLoopAddVirtual stub.
 
   The full virtual-table planner (where.c:4357..4810: whereLoopAddVirtualOne

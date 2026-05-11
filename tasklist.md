@@ -118,13 +118,15 @@ FPC porting traps that recur often enough to call out up-front:
           SQLITE_NOMEM→sqlite3OomFault, other-rc→sqlite3ErrorMsg
           (falling back to sqlite3ErrStr when zErrMsg is nil).
           Honours bAllSchemas, releases pVTab^.zErrMsg.  Clean compile.
-    - [ ] **6.13.B.6** Port `whereLoopAddVirtualOne`
-          (where.c:4357..4540).  Marks one constraint subset as
-          `usable=1`, calls `vtabBestIndex`, then unmarshals
-          `aConstraintUsage[].argvIndex / omit` into a candidate
-          `WhereLoop` (aLTerm + nLTerm + prereq + rRun + nOut).
-          Honours `pBuilder^.pNew` reuse and `whereLoopInsert`
-          dedupe.
+    - [X] **6.13.B.6** `whereLoopAddVirtualOne` ported at
+          codegen.pas:15291 (plus `termFromWhereClause`,
+          `isLimitTerm`, `allConstraintsUsed` helpers).  Marks the
+          usable subset, calls vtabBestIndex, unmarshals
+          aConstraintUsage[] into pNew (aLTerm + prereq + omitMask +
+          mHandleIn + cost), wires bFlags packing (needFree=bit0,
+          bOmitOffset=bit1, bIdxNumHex=bit2), and commits via
+          whereLoopInsert.  SQLITE_CONSTRAINT → SQLITE_OK no-insert;
+          LIMIT-vs-IN conflict → *pbRetryLimit signal.  Clean compile.
     - [ ] **6.13.B.7** Port `whereLoopAddVirtual` four-pass driver
           (where.c:4548..4803): (1) all-usable, (2) drop IN-handled
           terms, (3) drop one usable term at a time
