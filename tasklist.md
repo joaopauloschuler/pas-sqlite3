@@ -273,13 +273,16 @@ partial landings cannot silently no-op.
   - [X] **10.1c.3** `.indexes` (with table arg)
   - [X] **10.1c.4** `.databases`
   - [X] **10.1c.5** `.fullschema`
-  - [ ] **10.1c.6** `.lint fkey-indexes` — blocked on bug 6.13 (lateral
-        `pragma_foreign_key_list` join).
+  - [X] **10.1c.6** `.lint fkey-indexes` — closed 2026-05-11 via
+        bugs 6.13.B and 6.16.  TestShellSchema now exercises a
+        mixed-FK script (`parent` + `child` with covering index +
+        `orphan` without) byte-identical with upstream.
   - [ ] **10.1c.7** `.expert` (read-only subset) — stub returns
-        "this build does not support the .expert command".
+        "this build does not support the .expert command".  Blocked
+        on porting `ext/expert/sqlite3expert.c` (~2236 lines).
 
 - [X] **10.1.15..10.1.19, 10.1.21** `.schema --indent`, `.tables`, `.indexes`, `.databases`, `.fullschema`, `.expert` (stub) all landed.
-- [~] **10.1.20** `.lint fkey-indexes` — port complete but emits no suggestions until bug 6.13 (lateral pragma_foreign_key_list join) lands.
+- [X] **10.1.20** `.lint fkey-indexes` — unblocked by bugs 6.13.B and 6.16 (2026-05-11); gated by `bin/TestShellSchema`.
 
 ### 10.1d Data I/O dot-commands
 
@@ -403,6 +406,48 @@ and constraints flow once that lands.
 - [X] **10.1.98** zipfile.c → passqlite3zipfile.pas
 - [X] **10.1.99** spellfix.c → passqlite3spellfix.pas (full module: phonehash, editdist1, scriptcode, translit, editdist3 family, spellfix1 vtab)
 - [X] **10.1.100** Built-in shell SQL UDFs: strtod, dtostr, shell_add_schema, shell_module_schema, shell_putsnl, usleep. editFunc deferred (needs system() spawn + temp-file shuttle).
+
+- [ ] **10.1.102** `.open --zip` / `--deserialize` / `--hexdb` shell
+      glue.  Underlying VFSes/extensions already ported: zipfile vtab
+      (10.1.98), apndvfs (10.1.84), memdb VFS (passqlite3pager.pas
+      3.A.4 block, registered via `sqlite3MemdbInit`).  Two pieces of
+      glue remain:
+        1. Port the C switch at `shell.c.in:4495..4510` into
+           `openDb` (passqlite3shell.pas:872): on
+           `SHELL_OPEN_ZIPFILE` open `:memory:` and let the zipfile
+           vtab carry the file; on `SHELL_OPEN_DESERIALIZE` /
+           `SHELL_OPEN_HEXDB` open `:memory:` then call
+           `sqlite3_deserialize` with the slurped file bytes (see
+           `shell.c.in:4613..4640`).  Today `openDb` always falls
+           through to `sqlite3_open_v2(zDbFilename,...)` regardless
+           of `openMode`.
+        2. Finish `sqlite3_deserialize` at passqlite3main.pas:4501.
+           It is currently a stub returning `SQLITE_ERROR` because
+           the comment block was written before the memdb VFS port
+           landed; faithful port of `memdb.c:839..928` (open a
+           memdb file via `sqlite3_open` on a synthetic name, swap
+           the buffer into the `MemStore` backing the schema's
+           pager, honour `SQLITE_DESERIALIZE_FREEONCLOSE` /
+           `_RESIZEABLE` / `_READONLY`) lights up both
+           `--deserialize` and `--hexdb`.
+      Once both land, lift the `--zip` / `--deserialize` caveat on
+      **10.1.27** and `.open --zip` / `--deserialize` become testable
+      under TestShellSchema or a new TestShellOpen gate.
+
+- [ ] **10.1.101** `ext/expert/sqlite3expert.c` → `passqlite3expert.pas`
+      (~2236 lines + `sqlite3expert.h` ~168 lines).  Powers the
+      `.expert` dot command (10.1c.7).  Surface to port:
+      `sqlite3_expert_new`, `sqlite3_expert_config`,
+      `sqlite3_expert_sql`, `sqlite3_expert_analyze`,
+      `sqlite3_expert_count`, `sqlite3_expert_report`
+      (EXPERT_REPORT_SQL / INDEXES / PLAN / CANDIDATES),
+      `sqlite3_expert_destroy`.  Shell wiring (`shell.c.in:3080..3220`)
+      — `expertHandleSQL` / `expertFinish` / `expertDotCommand` —
+      lands alongside.  Internally exercises a synthetic schema in a
+      side database; depends on PRAGMA + EXPLAIN QUERY PLAN already
+      working in the port.  Once landed, flip 10.1c.7 to [X] and drop
+      the "this build does not support the .expert command" stub at
+      passqlite3shell.pas:6496.
 
 - [ ] **10.1a.1** fill the next porting chunk here.
 

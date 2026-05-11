@@ -13,9 +13,10 @@
       shell_add_schema's prefix match in turn, so .schema for views
       never gained the `/* viewname(col,...) */` annotation either.
 
-  .lint fkey-indexes (10.1c.6) and .expert (10.1c.7) are not exercised
-  here — both are still partial in the port (lint blocks on bug 6.13's
-  lateral pragma_foreign_key_list join, .expert is a stub).
+  .lint fkey-indexes (10.1c.6) is now exercised here — bug 6.16 (and
+  the underlying bug 6.13 sub-bug B family) closed, so the lateral
+  pragma_foreign_key_list join runs byte-identical with upstream.
+  .expert (10.1c.7) is still a stub and stays out of the gate.
 
   Skips cleanly with PASS if the upstream sqlite3 binary is unavailable
   on PATH or at $UPSTREAM_SQLITE3 — keeps build green on stripped CI
@@ -179,6 +180,18 @@ const
     'CREATE INDEX ti ON t(a);'#10 +
     '.fullschema'#10;
 
+  { .lint fkey-indexes — child has an FK to parent and a covering
+    index; orphan has an FK to parent and no covering index.  Upstream
+    emits a CREATE INDEX suggestion for orphan only.  Exercises the
+    lateral `pragma_foreign_key_list(s.name)` join end-to-end (bug 6.13
+    sub-bug B + bug 6.16). }
+  SCRIPT_LintFkeyIndexes =
+    'CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);'#10 +
+    'CREATE TABLE child(aid INTEGER REFERENCES parent(id));'#10 +
+    'CREATE INDEX child_aid ON child(aid);'#10 +
+    'CREATE TABLE orphan(aid INTEGER REFERENCES parent(id));'#10 +
+    '.lint fkey-indexes'#10;
+
   { Empty database edges: .tables / .schema on a fresh DB.  Skip
     .indexes / .databases here — both side-effects from upstream
     temp-schema materialization (port divergence). }
@@ -205,6 +218,7 @@ begin
   DiffCase('.schema --nosys',             SCRIPT_SchemaNoSys,   upstream);
   DiffCase('.fullschema',                 SCRIPT_FullSchema,    upstream);
   DiffCase('.databases',                  SCRIPT_Databases,     upstream);
+  DiffCase('.lint fkey-indexes',          SCRIPT_LintFkeyIndexes, upstream);
   DiffCase('empty database',              SCRIPT_Empty,         upstream);
 
   WriteLn;
