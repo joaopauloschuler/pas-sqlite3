@@ -173,6 +173,8 @@ compile_test TestShellParameter
 compile_test TestShellChanges
 compile_test TestShellModes
 compile_test TestShellSchema
+compile_test TestShellRepl
+compile_test TestShellIO
 compile_test TestVtabLateral
 compile_test TestExplainParity
 compile_test TestBytecodeParity

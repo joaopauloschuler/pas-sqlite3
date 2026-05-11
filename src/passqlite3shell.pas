@@ -481,6 +481,10 @@ var
   zUserInsertTab:       AnsiString = '';
   { 10.1.3 — backing AnsiString for state.zNonce when -nonce sets it. }
   gNonceBacking:        AnsiString = '';
+  { 6.22 — backing storage for ShellState.zErrPrefix during argv-sourced
+    dot-command dispatch.  Mirrors C shell.c.in:13540..13547 (malloc/free of
+    a 64-byte "argv[%i]:" buffer). }
+  gErrPrefixBacking:    AnsiString = '';
   { 10.1.36 — track .log destination filename for cmdShow / future logger
     plumbing.  '' / 'off' both mean disabled, 'stdout' / 'stderr' refer
     to the standard streams; any other value is a regular pathname. }
@@ -4759,11 +4763,17 @@ end;
   the underlying shell via libc system().  Mirrors the upstream
   "System command returns N" stderr breadcrumb on non-zero exit. }
 
-procedure cmdShell(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+procedure failIfSafeMode(p: PShellState; const zMsg: AnsiString); forward;
+
+procedure cmdShell(p: PShellState; const args: array of AnsiString; nArg: SizeInt;
+                   const zCmdName: AnsiString);
 var
   zCmd, tok: AnsiString;
   i, x: i32;
 begin
+  { 10.1.34 — safe-mode gate (shell.c.in:11248):
+      failIfSafeMode(p, "cannot run .%s in safe mode", azArg[0]); }
+  failIfSafeMode(p, 'cannot run .' + zCmdName + ' in safe mode');
   if nArg < 1 then begin
     shellEPutZ('Usage: .system COMMAND'#10);
     Exit;
@@ -4773,6 +4783,11 @@ begin
     if Pos(' ', args[i]) > 0 then tok := '"' + args[i] + '"' else tok := args[i];
     if i = 0 then zCmd := tok else zCmd := zCmd + ' ' + tok;
   end;
+  { 10.1.34 — flush Pascal-side buffers so prior writes land in the
+    currently-redirected sink before the child writes to inherited fd 1.
+    With cmdOutput's fd-level dup2 onto fd 1, child stdout already follows
+    the active .output FILE / .once FILE redirection automatically. }
+  Flush(Output);
   x := fpsystem(zCmd);
   if x <> 0 then shellEPutZ(Format('System command returns %d'#10, [x]));
 end;
@@ -5387,6 +5402,34 @@ begin
   end;
 end;
 
+{ 10.1.27.e — failIfSafeMode helper (shell.c.in:1795..1810).
+  No-op when p^.bSafeMode is clear; otherwise emits the
+  shellErrorLocation-shaped prefix followed by zMsg and halts(1).
+  Mirrors C exactly so call sites stay byte-comparable.  The inlined
+  copy in cmdImport (10.1.24.b) predates this helper and is kept
+  intact to avoid touching that arm. }
+procedure failIfSafeMode(p: PShellState; const zMsg: AnsiString);
+begin
+  if p^.bSafeMode = 0 then Exit;
+  if p^.zErrPrefix <> nil then
+    shellEPutZ(AnsiString(p^.zErrPrefix) + ' ' + zMsg + #10)
+  else if (p^.zInFile = nil) or (StrComp(p^.zInFile, '<stdin>') = 0) then
+    shellEPutZ(Format('line %d: %s'#10, [Int64(p^.lineno), string(zMsg)]))
+  else
+    shellEPutZ(Format('%s:%d: %s'#10,
+      [string(AnsiString(p^.zInFile)), Int64(p^.lineno), string(zMsg)]));
+  Halt(1);
+end;
+
+{ 10.1.27.f — session_close_all pre-close hook stub (shell.c.in:10198,
+  also 11052, 11305).  The session extension is not ported in
+  pas-sqlite3 (tracked at 10.1.47); this stub preserves the C call
+  site so future wiring is a one-line body change. }
+procedure sessionCloseAll(p: PShellState; bArg: i32);
+begin
+  { TODO: session extension not ported — 10.1.47 }
+end;
+
 procedure cmdOpen(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
 var
   j: SizeInt;
@@ -5399,6 +5442,8 @@ begin
   zFN := '';
   newFlag := 0;
   openFlags := SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE;
+  { 10.1.27.e — safe-mode forces read-only up front (shell.c.in:10148). }
+  if p^.bSafeMode <> 0 then openFlags := SQLITE_OPEN_READONLY;
   openMode := SHELL_OPEN_UNSPEC;
   szMax := 0;
   j := 0;
@@ -5435,6 +5480,9 @@ begin
     Inc(j);
   end;
 
+  { 10.1.27.f — session_close_all(p, -1) pre-close hook
+    (shell.c.in:10198).  Stub; see sessionCloseAll above. }
+  sessionCloseAll(p, -1);
   closeDb(p^.db);
   p^.db := nil;
   globalDb := nil;
@@ -5464,6 +5512,14 @@ begin
       end else
         DeleteFile(string(zFN));
     end;
+    { 10.1.27.e — refuse disk-backed databases in safe mode
+      (shell.c.in:10221..10227).  HEXDB pseudo-files and the magic
+      ":memory:" name are still allowed. }
+    if (p^.bSafeMode <> 0)
+       and (p^.openMode <> SHELL_OPEN_HEXDB)
+       and (zFN <> '')
+       and (zFN <> ':memory:') then
+      failIfSafeMode(p, 'cannot open disk-based database files in safe mode');
     if zFN <> '' then begin
       p^.pAuxDb^.zFreeOnClose := StrAlloc(Length(zFN) + 1);
       StrPCopy(p^.pAuxDb^.zFreeOnClose, zFN);
@@ -9377,7 +9433,7 @@ begin
   if zCmd = 'eqp'       then begin cmdEqp(p, args, nArg); Exit; end;
   if zCmd = 'explain'   then begin cmdExplain(p, args, nArg); Exit; end;
   if (zCmd = 'shell') or (zCmd = 'system') then begin
-    cmdShell(p, args, nArg); Exit;
+    cmdShell(p, args, nArg, zCmd); Exit;
   end;
   if zCmd = 'cd'        then begin cmdCd(args, nArg); Exit; end;
   if zCmd = 'log'       then begin cmdLog(args, nArg); Exit; end;
@@ -9969,6 +10025,10 @@ begin
   installInterruptHandler;
   outputInit;
 
+  { shell.c.in:12820 — enable URI filenames so `file:...?mode=rwc` etc. are
+    honored both on the CLI and via `.open`. }
+  sqlite3_config(SQLITE_CONFIG_URI, 1);
+
   n := ParamCount;
   nOptsEnd := n + 1;          { everything is fair game for flags by default }
 
@@ -10022,9 +10082,14 @@ begin
     end else if (z = '-utf8') or (z = '-no-utf8')
              or (z = '-no-rowid-in-view') then
       { accepted, no Pascal-side wiring needed }
+    else if (z = '-memtrace') then
+      { shell.c.in:13196 — no-arg flag; activates memtrace trampoline. }
+      sqlite3MemTraceActivate(shellLibcStderr)
+    else if (z = '-pcachetrace') then
+      { shell.c.in:13198 — no-arg flag; activates pcachetrace trampoline. }
+      sqlite3PcacheTraceActivate(shellLibcStderr)
     else if (z = '-heap') or (z = '-mmap') or (z = '-vfstrace')
-         or (z = '-multiplex') or (z = '-memtrace')
-         or (z = '-pcachetrace') or (z = '-sorterref')
+         or (z = '-multiplex') or (z = '-sorterref')
          or (z = '-vfs') then begin
       Inc(i);
       if not cmdlineOptionValue(n, i, optVal) then Exit(1);
@@ -10034,8 +10099,6 @@ begin
         if szArg = 0 then ;     { wiring deferred — int-shape sqlite3_config
                                   has no MMAP_SIZE arm yet }
       end;
-      if z = '-memtrace' then sqlite3MemTraceActivate(shellLibcStderr);
-      if z = '-pcachetrace' then sqlite3PcacheTraceActivate(shellLibcStderr);
     end else if (z = '-pagecache') or (z = '-lookaside') then begin
       { 2-arg sizing flags — the int-shape sqlite3_config does not
         cover these; consume the args and continue. }
@@ -10241,9 +10304,18 @@ begin
   end;
 
   { ---------------- Run trailing positionals ---------------- }
+  { 6.22 — mirror shell.c.in:13539..13547: before each positional dot-command,
+    set zInFile='<cmdline>' and zErrPrefix='argv[N]:' so shellErrorLocation
+    (and failIfSafeMode) emit the argv-style prefix instead of the stdin
+    "line N:" fallback.  Restored to nil after each dispatch. }
   for k := 0 to High(positional) do begin
     if (Length(positional[k].z) > 0) and (positional[k].z[1] = '.') then begin
+      gErrPrefixBacking := AnsiString(Format('argv[%d]:', [positional[k].iArg]));
+      state.zInFile := PAnsiChar(AnsiString('<cmdline>'));
+      state.zErrPrefix := PAnsiChar(gErrPrefixBacking);
       rc := doMetaCommand(positional[k].z, @state);
+      state.zErrPrefix := nil;
+      gErrPrefixBacking := '';
       if (rc <> 0) and (rc = 2) then Exit(0);
       if (rc <> 0) and (bail_on_error <> 0) then Exit(rc);
     end else begin

@@ -70,13 +70,31 @@ uses
   ============================================================ }
 
 { Direct calls to libc malloc/calloc/free avoid going through FPC's heap
-  so that sqlite3_memory_used() counters (Phase 2) stay accurate.        }
-function  sqlite3_malloc(n: i32): Pointer; external 'c' name 'malloc';
-function  sqlite3_malloc64(n: u64): Pointer; external 'c' name 'malloc';
-function  sqlite3_realloc(p: Pointer; n: i32): Pointer; external 'c' name 'realloc';
-function  sqlite3_realloc64(p: Pointer; n: u64): Pointer; external 'c' name 'realloc';
-procedure sqlite3_free(p: Pointer); external 'c' name 'free';
+  so that sqlite3_memory_used() counters (Phase 2) stay accurate.
+
+  Bug 6.21 (2026-05-11): these are now the LOW-LEVEL libc bindings used
+  by the mem1 backend.  The public API entry points sqlite3_malloc /
+  sqlite3_malloc64 / sqlite3_realloc / sqlite3_realloc64 / sqlite3_free
+  are implemented in passqlite3util.pas and dispatch through
+  sqlite3GlobalConfig.m.xMalloc / xFree / xRealloc / xSize / xRoundup
+  so that shims installed via SQLITE_CONFIG_MALLOC (memtrace, etc.)
+  observe every allocation.  C oracle: malloc.c sqlite3_malloc and
+  friends route through sqlite3GlobalConfig.m.xMalloc.            }
+function  libc_malloc(n: i32): Pointer; external 'c' name 'malloc';
+function  libc_malloc64(n: u64): Pointer; external 'c' name 'malloc';
+function  libc_realloc(p: Pointer; n: i32): Pointer; external 'c' name 'realloc';
+function  libc_realloc64(p: Pointer; n: u64): Pointer; external 'c' name 'realloc';
+procedure libc_free(p: Pointer); external 'c' name 'free';
 function  libc_calloc(nmemb, size: csize_t): Pointer; external 'c' name 'calloc';
+
+{ Public API entry points — forwarded to the util.pas implementations
+  that dispatch through sqlite3GlobalConfig.m.  Declared here so the
+  many existing call sites (~835 in the tree) continue to compile.    }
+function  sqlite3_malloc(n: i32): Pointer; cdecl;
+function  sqlite3_malloc64(n: u64): Pointer; cdecl;
+function  sqlite3_realloc(p: Pointer; n: i32): Pointer; cdecl;
+function  sqlite3_realloc64(p: Pointer; n: u64): Pointer; cdecl;
+procedure sqlite3_free(p: Pointer); cdecl;
 
 function  sqlite3MallocZero(n: csize_t): Pointer;
 function  sqlite3StrDup(z: PChar): PChar;
@@ -655,6 +673,66 @@ type
 const
   { PTHREAD_MUTEX_RECURSIVE on Linux x86_64 = 1 }
   PTHREAD_MUTEX_RECURSIVE_KIND = 1;
+
+{ ----------------------------------------------------------------
+  Bug 6.21 — Public malloc/free/realloc dispatch through
+  sqlite3GlobalConfig.m.  C oracle: malloc.c sqlite3_malloc /
+  sqlite3_malloc64 / sqlite3_realloc / sqlite3_realloc64 /
+  sqlite3_free.  Implementation lives here (os.pas) because that's
+  where the declarations live; the work is delegated to the helpers
+  in passqlite3util.pas which own the accounting and alarm logic.
+  ---------------------------------------------------------------- }
+function sqlite3_malloc(n: i32): Pointer; cdecl;
+begin
+  { malloc.c:316 — n<=0 short-circuit then sqlite3Malloc.
+    (autoinit elided: shell calls sqlite3_initialize before allocating,
+    and this unit cannot reference sqlite3_initialize without a
+    circular dependency on passqlite3main.) }
+  if n <= 0 then Exit(nil);
+  Result := sqlite3Malloc(n);
+end;
+
+function sqlite3_malloc64(n: u64): Pointer; cdecl;
+begin
+  { malloc.c:322 — sqlite3Malloc64. }
+  if (n = 0) or (n > $7FFFFFFF) then Exit(nil);
+  Result := sqlite3Malloc(i32(n));
+end;
+
+function sqlite3_realloc(p: Pointer; n: i32): Pointer; cdecl;
+begin
+  { malloc.c:562 — n<0 -> 0, then sqlite3Realloc. }
+  if n < 0 then n := 0;
+  Result := sqlite3Realloc(p, u64(n));
+end;
+
+function sqlite3_realloc64(p: Pointer; n: u64): Pointer; cdecl;
+begin
+  { malloc.c:569 — sqlite3Realloc. }
+  Result := sqlite3Realloc(p, n);
+end;
+
+procedure sqlite3_free(p: Pointer); cdecl;
+begin
+  { malloc.c:391 — dispatch through xFree, with bMemstat accounting. }
+  if p = nil then Exit;
+  if sqlite3GlobalConfig.bMemstat <> 0 then
+  begin
+    if sqlite3MallocMutex <> nil then sqlite3_mutex_enter(sqlite3MallocMutex);
+    sqlite3StatusDown(SQLITE_STATUS_MEMORY_USED, sqlite3MallocSize(p));
+    sqlite3StatusDown(SQLITE_STATUS_MALLOC_COUNT, 1);
+    if Assigned(sqlite3GlobalConfig.m.xFree) then
+      sqlite3GlobalConfig.m.xFree(p)
+    else
+      libc_free(p);
+    if sqlite3MallocMutex <> nil then sqlite3_mutex_leave(sqlite3MallocMutex);
+  end else begin
+    if Assigned(sqlite3GlobalConfig.m.xFree) then
+      sqlite3GlobalConfig.m.xFree(p)
+    else
+      libc_free(p);
+  end;
+end;
 
 function c_nanosleep(req: Pointer; rem: Pointer): cint; cdecl;
   external 'c' name 'nanosleep';

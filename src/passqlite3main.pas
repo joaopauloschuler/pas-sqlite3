@@ -735,12 +735,17 @@ function createCollation(db: PTsqlite3; zName: PAnsiChar; enc: u8;
 function openDatabase(zFilename: PAnsiChar; ppDb: PPTsqlite3;
                       flags: i32; zVfs: PAnsiChar): i32;
 var
-  db   : PTsqlite3;
-  rc   : i32;
-  i    : i32;
-  pVfs : Psqlite3_vfs;
+  db      : PTsqlite3;
+  rc      : i32;
+  i       : i32;
+  pVfs    : Psqlite3_vfs;
+  zOpen   : PAnsiChar;     { Filename buffer returned by sqlite3ParseUri }
+  zErrMsg : PAnsiChar;     { Error message from sqlite3ParseUri }
+  uFlags  : u32;
   label opendb_out;
 begin
+  zOpen   := nil;
+  zErrMsg := nil;
   if ppDb = nil then begin Result := SQLITE_MISUSE; Exit; end;
   ppDb^ := nil;
 
@@ -811,20 +816,13 @@ begin
   sqlite3HashInit(@db^.aModule);
   sqlite3HashInit(@db^.aFunc);
 
-  { Locate the requested VFS.  Lazily run sqlite3_os_init the first
-    time around — main.c does this via sqlite3_initialize(). }
-  pVfs := sqlite3_vfs_find(zVfs);
-  if pVfs = nil then begin
+  { Lazily run sqlite3_os_init so that VFS registrations exist before
+    sqlite3ParseUri looks them up.  Matches main.c's reliance on
+    sqlite3_initialize having already populated the VFS list. }
+  if sqlite3_vfs_find(nil) = nil then begin
     sqlite3_os_init;
     sqlite3PcacheInitialize;
-    pVfs := sqlite3_vfs_find(zVfs);
   end;
-  if pVfs = nil then begin
-    rc := SQLITE_ERROR;
-    sqlite3ErrorWithMsg(db, rc, 'no such vfs');
-    goto opendb_out;
-  end;
-  db^.pVfs := pVfs;
 
   { Validate flags{0..2} — must be exactly READONLY, READWRITE, or
     READWRITE|CREATE.  Mirrors main.c:3556. }
@@ -836,8 +834,26 @@ begin
   if (zFilename = nil) or (zFilename[0] = #0) then
     zFilename := ':memory:';
 
+  { Port of main.c:3560 — peel URI parameters (mode=, cache=, vfs=, ...)
+    and resolve the VFS.  Bug 6.23. }
+  uFlags := u32(flags);
+  rc := sqlite3ParseUri(zVfs, zFilename, @uFlags, @db^.pVfs,
+                        @zOpen, @zErrMsg);
+  if rc <> SQLITE_OK then begin
+    if (rc and $FF) = SQLITE_NOMEM then sqlite3OomFault(db);
+    if zErrMsg <> nil then
+      sqlite3ErrorWithMsg(db, rc, zErrMsg)
+    else
+      sqlite3ErrorWithMsg(db, rc, nil);
+    sqlite3_free(zErrMsg);
+    zErrMsg := nil;
+    goto opendb_out;
+  end;
+  flags := i32(uFlags);
+  pVfs := db^.pVfs;
+
   { Open the back-end b-tree. }
-  rc := sqlite3BtreeOpen(pVfs, PChar(zFilename), Psqlite3(db),
+  rc := sqlite3BtreeOpen(pVfs, PChar(zOpen), Psqlite3(db),
                          PPBtree(@db^.aDb[0].pBt), 0,
                          flags or SQLITE_OPEN_MAIN_DB);
   if rc <> SQLITE_OK then begin
@@ -898,6 +914,8 @@ opendb_out:
     if db <> nil then db^.eOpenState := SQLITE_STATE_SICK;
   end;
   ppDb^  := db;
+  { main.c:3678 — sqlite3_free_filename(zOpen). }
+  if zOpen <> nil then sqlite3_free_filename(zOpen);
   Result := rc;
 end;
 

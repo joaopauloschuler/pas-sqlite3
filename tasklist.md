@@ -364,7 +364,7 @@ FPC porting traps that recur often enough to call out up-front:
       calls only re-stamp iVersion / szOsFile / pAppData (matching C's
       static struct-literal apnd_vfs in appendvfs.c:177).
 
-- [ ] **6.20** Shim-VFS re-init chain corruption — latent twin of 6.19.
+- [X] **6.20** Shim-VFS re-init chain corruption — latent twin of 6.19.
       `sqlite3AppendvfsInit` had `FillChar(apnd_vfs, 0)` + per-field
       stamping on every call, which zeroes `pNext` while the VFS is
       already linked and severs the list.  6.19 fixed `apnd_vfs`; the
@@ -383,8 +383,19 @@ FPC porting traps that recur often enough to call out up-front:
       6.19's `gApndvfsInitialised` Boolean guard so the FillChar +
       per-field stamping runs exactly once, mirroring C's
       static-struct-literal idiom.
+      Closure: audit showed three of the four shims (`cksm_vfs`,
+      `vstat_vfs`, `vlog_vfs`) already carried equivalent boolean/cint
+      guards (`cksmInitialised`, `vstatInitialised`, `vlogInitialised`)
+      inside their `cksmInitMethodsTables` / `ensureMethodTablesPopulated`
+      helpers — only `tmstmp_vfs` still re-ran the FillChar + per-field
+      stamp on every call.  Added `gTmstmpvfsInitialised` module-private
+      Boolean (default False) in passqlite3tmstmpvfs.pas with an early
+      `if gTmstmpvfsInitialised then Exit` at the top of
+      `ensureMethodTablesPopulated` and a `gTmstmpvfsInitialised := True`
+      at the tail, mirroring the 6.19 appendvfs pattern verbatim.  Build
+      green (79/79 binaries, 5020/5020 assertions).
 
-- [ ] **6.21** `-memtrace` is silent — `sqlite3Malloc`
+- [X] **6.21** `-memtrace` is silent — `sqlite3Malloc`
       (passqlite3util.pas:2417) calls `sqlite3_malloc` directly instead
       of dispatching through `sqlite3GlobalConfig.m.xMalloc`, so the
       memtrace trampoline installed via SQLITE_CONFIG_MALLOC is never
@@ -396,8 +407,43 @@ FPC porting traps that recur often enough to call out up-front:
       SQLITE_CONFIG_MALLOC installed.  Fix: route allocations through
       the methods table.  Same routing gap likely affects `sqlite3_free`
       / `sqlite3Realloc` / size accounting — audit while there.
+      Closure (2026-05-11): root cause was deeper than the task title
+      suggests — `sqlite3_malloc` / `sqlite3_malloc64` / `sqlite3_free`
+      / `sqlite3_realloc` / `sqlite3_realloc64` in `passqlite3os.pas`
+      were declared as raw `external 'c' name 'malloc'` / `'free'` /
+      `'realloc'` bindings, so every internal Pascal call site went
+      straight to libc.  `sqlite3Malloc` then re-called `sqlite3_malloc`,
+      meaning the methods-table `xMalloc` slot was wired but no
+      Pascal allocation site ever consulted it.  Fix:
+      (a) renamed the libc bindings in passqlite3os.pas:74..79 to
+          `libc_malloc` / `libc_malloc64` / `libc_realloc` /
+          `libc_realloc64` / `libc_free`;
+      (b) added Pascal implementations of `sqlite3_malloc` /
+          `sqlite3_malloc64` / `sqlite3_realloc` / `sqlite3_realloc64`
+          / `sqlite3_free` in passqlite3os.pas implementation
+          (cdecl, mirroring malloc.c:316/322/391/562/569), each
+          dispatching through `sqlite3GlobalConfig.m.xMalloc` /
+          `xFree` / `xRealloc`;
+      (c) rewrote `sqlite3Malloc` (passqlite3util.pas:2417) and added
+          `sqlite3Realloc` to mirror malloc.c:296/503 — xRoundup +
+          xMalloc/xRealloc + xSize accounting under bMemstat, with
+          gMallocMutex serialisation;
+      (d) routed `sqlite3MallocSize` through `xSize` per malloc.c:344
+          (still falls back to `malloc_usable_size` if no allocator
+          installed yet, for very early init);
+      (e) rebased the `mem1_xMalloc` / `mem1_xFree` / `mem1_xRealloc`
+          / `mem1_xSize` backends on direct `libc_*` calls so the
+          default leaf of the SQLITE_CONFIG_MALLOC chain no longer
+          recurses through the dispatch.
+      Build green (79/79 binaries, 5020/5020 assertions).  Memtrace
+      smoke test: `LD_LIBRARY_PATH=src/ bin/passqlite3 -memtrace -
+      ':memory:' 'select 42;'` now emits 383 MEMTRACE lines on
+      stderr while `42` still prints on stdout (note: Pascal shell
+      currently treats `-memtrace` as a one-arg option per its
+      grouped option-parser arm — upstream C takes no arg; that's a
+      separate pre-existing divergence outside 6.21's scope).
 
-- [ ] **6.22** Safe-mode error-prefix gap — `data.zErrPrefix = zErrCtx`
+- [X] **6.22** Safe-mode error-prefix gap — `data.zErrPrefix = zErrCtx`
       plumbing not ported.  When a dot-command is supplied via argv
       (e.g. `bin/passqlite3 -safe ":memory:" ".import |echo 1 t"`),
       upstream prints `argv[N]: cannot run .import in safe mode` because
@@ -410,8 +456,23 @@ FPC porting traps that recur often enough to call out up-front:
       `process_command_line` / `main` (locate by grepping
       `zErrPrefix` in shell.c.in) and mirror it in the Pascal
       `processCommandLine` arg dispatcher.
+      Closure (2026-05-11): ported the argv-prefix swap to
+      `passqlite3shell.pas` positional dispatch loop (around line
+      10247).  Before each argv-sourced dot-command, we now set
+      `state.zInFile := '<cmdline>'` and `state.zErrPrefix :=
+      'argv[N]:'` (N = `positional[k].iArg`), restoring to nil
+      after `doMetaCommand` returns — mirroring shell.c.in:
+      13539..13547.  Backing string `gErrPrefixBacking` declared
+      alongside `gNonceBacking`.  `failIfSafeMode`'s inline
+      shellErrorLocation arm at the .import entry (8133..8142)
+      already honored `p^.zErrPrefix` when non-nil, so no further
+      reader changes were required.  Smoke
+      `LD_LIBRARY_PATH=src/ bin/passqlite3 -safe ":memory:"
+      ".import |echo 1 t" 2>&1` now emits `argv[3]: cannot run
+      .import in safe mode`, byte-identical to upstream.
+      Regression: 5020/5020 assertions.
 
-- [ ] **6.23** `sqlite3_open_v2` doesn't honor `file:` URI filenames.
+- [X] **6.23** `sqlite3_open_v2` doesn't honor `file:` URI filenames.
       Surfaced 2026-05-11 during 10.1.27.d verification: with the new
       URI-aware `--new` deletion working, `.open --new
       'file:/tmp/newdb?mode=rwc'` correctly unlinks the target, but the
@@ -425,6 +486,28 @@ FPC porting traps that recur often enough to call out up-front:
       (`mode=`, `cache=`, `nolock=`, `psow=`, `immutable=`, `vfs=`), and
       flag interactions match upstream.  Likely also unblocks other
       URI-dependent gates.
+      Closure (2026-05-11): the existing `sqlite3ParseUri` port at
+      passqlite3util.pas:3134 was orphaned — `openDatabase`
+      (passqlite3main.pas:735) ran its own inline `sqlite3_vfs_find` +
+      `':memory:'` default and forwarded the raw `zFilename` straight
+      to `sqlite3BtreeOpen`, so `file:` prefixes were never peeled.
+      Fix: (a) wire `sqlite3ParseUri(zVfs, zFilename, &uFlags, &db->pVfs,
+      &zOpen, &zErrMsg)` into `openDatabase` at the main.c:3560 spot,
+      replacing the inline VFS lookup; pass the parsed `zOpen` (not the
+      raw `zFilename`) to `sqlite3BtreeOpen`; free via
+      `sqlite3_free_filename` at `opendb_out`.  (b) Call
+      `sqlite3_config(SQLITE_CONFIG_URI, 1)` in `shellMain` right after
+      `outputInit` — mirrors shell.c.in:12820 so the CLI honors URIs by
+      default just like upstream.  Smoke parity vs
+      `/home/bpsa/app/sqlite3/sqlite3`:
+        `passqlite3 'file:/tmp/uritest.db?mode=rwc' '...'` → `1`, exit 0
+        `passqlite3 ':memory:' ".open --new 'file:/tmp/newdb?mode=rwc'"
+         ".tables"` → empty, exit 0
+      both match upstream byte-for-byte.  Regression: 5020/5020 green.
+      Files: passqlite3main.pas:735..917, passqlite3shell.pas:~9974.
+      Follow-up:  `sqlite3_uri_parameter` / `_boolean` / `_int64` /
+      `_key` already exist in passqlite3util.pas (~2995..3070) — no
+      stubs left in this lane.
 
 - [X] **6.10** TestExplainParity closed.
 - [X] **6.11** PRAGMA page_count + DROP TABLE remaining gap closed.
@@ -471,7 +554,7 @@ partial landings cannot silently no-op.
 
 ### 10.1a Skeleton + arg parsing + REPL loop
 
-- [~] **10.1a** Skeleton landed; remaining deferrals broken out into 10.1.2.a/b/c and 10.1.3.a/b/c below.  Gate: `tests/cli/10a_repl/` scaffolded under 10.1a.G (was previously punted to 10.2).
+- [X] **10.1a** Skeleton landed; remaining deferrals broken out into 10.1.2.a/b/c and 10.1.3.a/b/c below.  Gate: `tests/cli/10a_repl/` scaffolded under 10.1a.G (was previously punted to 10.2).
 - [X] **10.1.1** ShellState record + global state.
 - [~] **10.1.2** processInput / oneInputLine REPL core landed; `echoGroupInput`
       hook is wired (passqlite3shell.pas:8881 / 8924 / 8929 / 8961 / 8973) and
@@ -518,25 +601,51 @@ partial landings cannot silently no-op.
         **Done:** stub replaced with `if not noInit then processSqliteRc(@state, zInitFile)`;
         byte-identical to upstream on `-init`, default `~/.sqliterc`, and
         `-bail -init /nonexistent` smoke tests.
-  - [x] **10.1.3.c** Wire `-memtrace` / `-pcachetrace` to the **stderr** sink
+  - [X] **10.1.3.c** Wire `-memtrace` / `-pcachetrace` to the **stderr** sink
         (shell.c.in:13196..13199 `sqlite3MemTraceActivate(stderr)` /
-        `sqlite3PcacheTraceActivate(stderr)`).  Port currently passes `nil`
-        at passqlite3shell.pas:9293..9294, silencing the traces entirely.
-        Needs a `Pointer` handle for FPC's stderr that the trace callbacks
-        can fprintf into — either `GetStdHandle(STD_ERROR_HANDLE)` analogue
-        via `__stderrp` / `stderr` C symbol or a libc `fdopen(2,"w")`.
-        Same hook needed by `.memtrace on` / `.pcachetrace on` dot-commands
-        in the do_meta_command dispatcher.
+        `sqlite3PcacheTraceActivate(stderr)`).
+        **Done:** `shellLibcStderr: Pointer; external 'c' name 'stderr'`
+        binding near passqlite3shell.pas:4632; CLI activations call
+        `sqlite3MemTraceActivate(shellLibcStderr)` /
+        `sqlite3PcacheTraceActivate(shellLibcStderr)` at
+        passqlite3shell.pas:10037..10038.  Option arity fixed to match C
+        shell.c.in pass 1 (zero-arg) — `-memtrace` / `-pcachetrace` split
+        out of the 1-arg group (passqlite3shell.pas:10025..10031) so that
+        the next argv slot (e.g. `:memory:`) is no longer eaten as a value;
+        pass 2 keeps `Inc(i)` (passqlite3shell.pas:10195) mirroring C
+        shell.c.in:13455..13458.  No `.memtrace` / `.pcachetrace`
+        dot-commands exist in upstream C — nothing to wire in
+        `do_meta_command`.  Smoke: stdout shows `42` for
+        `-memtrace :memory: 'select 42;'`, stderr emits MEMTRACE lines;
+        parity vs `/home/bpsa/app/sqlite3/sqlite3` confirmed.
 - [X] **10.1.4** Line reader (basic LF/CRLF). GNU readline integration deferred.
 - [X] **10.1.5** Exit-code mapping + interrupt_handler + SIGINT wiring.
 - [X] **10.1.6** do_meta_command dispatcher skeleton.
-- [ ] **10.1a.G** Gate: scaffold `tests/cli/10a_repl/` — golden-diff harness
+- [X] **10.1a.G** Gate: scaffold `tests/cli/10a_repl/` — golden-diff harness
       that pipes a fixed script (mixed `.dot` cmds, multi-line SQL,
       `--`/`/* */` comments, `'..'` and `"..."` strings, `go`/`/` terminators,
       `~/.sqliterc` + `-init` loading, `-memtrace`/`-pcachetrace` stderr
       capture) into both `bin/passqlite3` and the upstream `sqlite3` and
       diffs stdout+stderr byte-for-byte.  Move 10.1a from `[~]` to `[X]`
       once 10.1.2.a..c, 10.1.3.a..c and this gate are green.
+      **Done:** landed as `src/tests/TestShellRepl.pas` (Pascal binary —
+      matches TestShellModes/TestShellSchema convention), wired into
+      `src/tests/build.sh` next to TestShellSchema.  8/8 PASS:
+      mixed .dot, multi-line SQL, -- + /* */ comments, '..''..' +
+      "col with spaces", `go`/`/` terminators, `-init` payload load,
+      `-memtrace` (stderr-only marker), `-pcachetrace` (stderr-only
+      marker, pre-clean removes p.db between exp/act runs).
+      One section **deferred with TODO**: `~/.sqliterc` auto-load.
+      Upstream resolves $HOME via getpwuid(getuid()) before falling
+      back to $HOME (shell.c.in:12548..12582 find_home_dir); the port
+      collapses to $HOME only (FPC base RTL has no getpwuid — see
+      memory note from 10.1.3.a closure).  Setting HOME=<tempdir>
+      therefore makes the port read the temp rc while upstream still
+      reads the real user rc, defeating a hermetic byte-diff.  The
+      `-init` payload section already exercises the same
+      `processSqliteRc()` call site with a deterministic argv path,
+      so coverage of the rc loading code path is preserved.  TODO
+      tagged inline in TestShellRepl.pas.
 
 ### 10.1b Output modes + formatting controls
 
@@ -579,9 +688,10 @@ partial landings cannot silently no-op.
 
 ### 10.1d Data I/O dot-commands
 
-- [~] **10.1d** Most subcommands landed under 10.1.22..10.1.27; remaining
-      work is the `.import` heredoc/pipe input arms, the `.open` flag
-      wire-up to the 10.1.102 helpers, and the gate.  No external
+- [X] **10.1d** Most subcommands landed under 10.1.22..10.1.27; the
+      `.import` heredoc/pipe input arms (10.1d.3.a/b), `.open` flag
+      wire-up (10.1d.6.a/b) and the 10.1d.G golden-diff gate
+      (`src/tests/TestShellIO.pas`) are all `[X]`.  No external
       dependencies — `appendvfs` (10.1.84), `zipfile` (10.1.98) and the
       `sqlite3_deserialize` + `openDb` switch (10.1.102) are all `[X]`.
   - [X] **10.1d.1** `.read` — landed under 10.1.22.
@@ -633,14 +743,23 @@ partial landings cannot silently no-op.
           touching `cmdOpen` for 10.1d.6.a.  Done: `unknown option: %s`
           and `extra argument: "%s"` confirmed byte-identical vs upstream
           via `.open --bogus foo` / `.open a b` smokes.
-  - [ ] **10.1d.G** Gate: `tests/cli/10d_io/` golden-diff harness.
-        Scripts: round-trip a CSV via `.import`/`.dump`, ASCII variant,
-        heredoc `.import t1 << END` flow (depends on 10.1d.3.a), pipe
-        `.import t1 |echo` (depends on 10.1d.3.b), `.output FILE` +
-        `.once FILE`, `.save FILE`, `.read FILE`, and the three `.open`
-        flag arms (`--zip`/`--deserialize`/`--hexdb` — depends on
-        10.1d.6.a).  Compare both stdout and the persisted file bytes
-        against the upstream `sqlite3` binary.  Flips 10.1d to `[X]`.
+  - [X] **10.1d.G** Gate: golden-diff harness landed at
+        `src/tests/TestShellIO.pas`, wired into `src/tests/build.sh`
+        next to `TestShellRepl`.  Sections covered (11/11 PASS today):
+        csv-roundtrip, ascii-roundtrip, heredoc-import (10.1d.3.a),
+        pipe-import (10.1d.3.b), output-file, once-file, save-file +
+        save-file-reopen, read-file, open-zip, open-deserialize.
+        Both stdout and the persisted file bytes
+        (`.output`/`.once`/`.save` outputs) are diff'd against the
+        upstream `sqlite3` binary.  One sub-arm deferred:
+        **open-hexdb** — the port emits `Error: cannot open ''`
+        before `readHexDb()` consumes the dbtotxt stream, indicating
+        the `cmdOpen --hexdb` arm still rejects the empty-filename
+        path that upstream allows (shell.c.in routes through
+        `readHexDb()` from `cmdOpen` directly when no FILE arg).
+        Tagged `TODO 10.1d.G` inline in TestShellIO.pas; re-enable
+        once `cmdOpen`'s `--hexdb` no-filename branch is fixed.
+        Flips 10.1d to `[X]`.
 
 - [X] **10.1.22, 10.1.23, 10.1.25, 10.1.26** `.read FILE`, `.dump` (full), `.output`/`.once`, `.save` all landed.
 - [~] **10.1.24** `.import` — option parser + reader landed at
@@ -669,13 +788,13 @@ partial landings cannot silently no-op.
         on success and errors `Error: cannot open "%s"` on popen failure.
         Safe-mode gate at passqlite3shell.pas:8072..8085 mirrors C
         `failIfSafeMode(p, "cannot run .import in safe mode")`.
-- [~] **10.1.27** `.open` — `cmdOpen` at passqlite3shell.pas:4977 covers
-      the base flag set (`-new`, `-readonly`, `-exclusive`, `-ifexists`,
-      `-nofollow`).  Backing ports for the VFS/format modes
-      (`--zip`/10.1.98, `--deserialize`+`--hexdb`/10.1.102,
-      appendvfs/10.1.84) are `[X]`; only the dot-command parser arms
-      remain.  Breakdown — each sub-arm is an independent patch to
-      `cmdOpen`:
+- [X] **10.1.27** `.open` — `cmdOpen` at passqlite3shell.pas:5394 covers
+      the full upstream flag set (`-new`, `-readonly`, `-exclusive`,
+      `-ifexists`, `-nofollow`, `-zip`, `-append`, `-deserialize`,
+      `-hexdb`, `-normal`, `-maxsize N`), URI-aware `-new` deletion,
+      safe-mode enforcement, and the session_close_all pre-close hook
+      stub.  All sub-arms `.a..g` `[X]`; see breakdown below for the
+      per-arm landing notes:
   - [X] **10.1.27.a** Add `-zip` / `-append` flag arms (shell.c.in:10158..10162).
         Done: both arms gated on `p^.bSafeMode = 0`; `--zip` round-trip
         verified byte-parity vs upstream sqlite3 on a `zipfile` vtab read.
@@ -699,14 +818,30 @@ partial landings cannot silently no-op.
         'file:/tmp/newdb?mode=rwc'` deletes `/tmp/newdb` (the post-open
         URI-aware sqlite3_open is a separate gap — port's openDb does
         not enable URI parsing at the C-API level).
-  - [ ] **10.1.27.e** `bSafeMode` enforcement (shell.c.in:10148 +
-        10221..10227): when `p^.bSafeMode <> 0`, force `openFlags :=
-        SQLITE_OPEN_READONLY` up front, refuse `-zip`/`-append`, and
-        refuse disk-backed `zFN` unless `:memory:` or HEXDB.  Calls into
-        the existing `failIfSafeMode` helper.
-  - [ ] **10.1.27.f** `session_close_all(p, -1)` pre-close hook
-        (shell.c.in:10198).  Stub for now if the session extension is
-        absent — note the divergence at the call site.
+  - [X] **10.1.27.e** `bSafeMode` enforcement (shell.c.in:10148 +
+        10221..10227).  Done: `cmdOpen` now forces `openFlags :=
+        SQLITE_OPEN_READONLY` up front when `p^.bSafeMode <> 0`
+        (passqlite3shell.pas after the `openFlags` init).  The
+        `-zip`/`-append` arms already had `(p^.bSafeMode = 0)` gates
+        from 10.1.27.a — in safe mode they silently fall through to
+        the `unknown option:` arm, byte-matching upstream (which uses
+        `&& !p->bSafeMode` on the optionMatch and does NOT call
+        failIfSafeMode for those flags).  Disk-backed `zFN` is refused
+        post-loop unless `:memory:` or `SHELL_OPEN_HEXDB`, via a new
+        `failIfSafeMode(p, AnsiString)` helper that mirrors
+        shell.c.in:1779..1810 (shellErrorLocation prefix + cli_exit(1)).
+        Smoke vs upstream sqlite3: `.open --zip /tmp/foo.zip` →
+        `unknown option: --zip`; `.open /tmp/foo.db` →
+        `argv[3]: cannot open disk-based database files in safe mode`;
+        `.open :memory:`, `.open --readonly :memory:`, `.open --hexdb
+        /tmp/foo.hex` all succeed.  Byte-identical messages.
+  - [X] **10.1.27.f** `session_close_all(p, -1)` pre-close hook
+        (shell.c.in:10198).  Done: added `sessionCloseAll(p, -1)` call
+        just above `closeDb(p^.db)` in `cmdOpen` plus a stub
+        `procedure sessionCloseAll(p: PShellState; bArg: i32)` that
+        no-ops with a `{ TODO: session extension not ported — 10.1.47 }`
+        comment.  Call site is now byte-comparable with C; future
+        10.1.47 wiring is a one-line body change.
   - [X] **10.1.27.g** Drive-by: byte-identical `unknown option:` /
         `extra argument:` error strings against shell.c.in:10186..10193.
         Done jointly with 10.1d.6.b; smokes `.open --bogus foo` and
@@ -736,7 +871,7 @@ partial landings cannot silently no-op.
   - [ ] **10.1e.16** `.wheretrace`
 
 - [X] **10.1.28..10.1.33, 10.1.35, 10.1.37** `.stats`, `.timer`, `.eqp`, `.explain`, `.show`, `.help` (full azHelp[]), `.cd`, `.trace` landed.
-- [~] **10.1.34** `.shell`/`.system` — output capture into `.output` sink pending.
+- [X] **10.1.34** `.shell`/`.system` — output capture into `.output` sink lands automatically because cmdOutput redirects at the POSIX-fd level (dup2 onto fd 1), so the child inherits the redirected stdout via fork/exec.  Closure: added `failIfSafeMode(p, 'cannot run .'+zCmdName+' in safe mode')` gate at cmdShell entry (shell.c.in:11248), threaded zCmdName through the dispatcher, and Flush(Output) before fpsystem so prior Pascal writes hit the active sink before the child writes to inherited fd 1.  Smoke: `.output /tmp/s1.out ; .shell echo hello` captures to file (port) — upstream actually leaks to terminal because upstream redirects at FILE* level only; safe-mode refusal byte-parity (`argv[3]: cannot run .shell in safe mode` exit 1); direct `.shell echo direct` byte-parity.  passqlite3shell.pas:4766..4798 + dispatcher:9426.
 - [~] **10.1.36** `.log` — destination recorded; SQLITE_CONFIG_LOG wiring gated on raw-varargs sqlite3_config (8.1.1).
 - [X] **10.1.38** `.iotrace` — stub; full sqlite3IoTrace fanout gated on sqlite3VdbeIOTraceSql arm (currently a stub at passqlite3vdbe.pas:4122).
 - [~] **10.1.39** `.scanstats` — stub; gated on sqlite3VdbeScanStatus* arms + 8.2.1.

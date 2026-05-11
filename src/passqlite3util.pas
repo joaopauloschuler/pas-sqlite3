@@ -704,6 +704,7 @@ function  sqlite3_status(op: i32; pCurrent: Pi32; pHighwater: Pi32;
 { Malloc layer (malloc.c + mem1.c) }
 function  sqlite3MallocSize(p: Pointer): i32;
 function  sqlite3Malloc(n: i32): Pointer;
+function  sqlite3Realloc(p: Pointer; nBytes: u64): Pointer;
 function  sqlite3MallocZero64(n: u64): Pointer;
 function  sqlite3DbMalloc(db: Psqlite3db; n: i32): Pointer;
 function  sqlite3DbMallocZero(db: Psqlite3db; n: u64): Pointer;
@@ -2344,31 +2345,44 @@ var
   gHardLimit:      i64 = 0;
   gNearlyFull:     i32 = 0;
 
-{ mem1.c: size via malloc_usable_size }
+{ malloc.c:344 — sqlite3MallocSize must dispatch through xSize so that
+  shims installed via SQLITE_CONFIG_MALLOC (memtrace, etc.) see the
+  size queries.  Falls back to malloc_usable_size if no allocator is
+  installed yet (very early init). }
 function sqlite3MallocSize(p: Pointer): i32;
 begin
   if p = nil then Exit(0);
-  Result := i32(malloc_usable_size(p));
+  if Assigned(sqlite3GlobalConfig.m.xSize) then
+    Result := sqlite3GlobalConfig.m.xSize(p)
+  else
+    Result := i32(malloc_usable_size(p));
 end;
 
+{ mem1.c backends — these are the LOW-LEVEL libc allocator that sits
+  at the bottom of the SQLITE_CONFIG_MALLOC chain.  They must NOT call
+  back through sqlite3_malloc / sqlite3_free / sqlite3_realloc (those
+  now dispatch through sqlite3GlobalConfig.m, which would recurse).
+  Bug 6.21 (2026-05-11). }
 function mem1_xMalloc(sz: i32): Pointer; cdecl;
 begin
-  Result := sqlite3_malloc(sz);
+  if sz <= 0 then Result := nil
+  else Result := libc_malloc(sz);
 end;
 
 procedure mem1_xFree(p: Pointer); cdecl;
 begin
-  sqlite3_free(p);
+  libc_free(p);
 end;
 
 function mem1_xRealloc(p: Pointer; sz: i32): Pointer; cdecl;
 begin
-  Result := sqlite3_realloc(p, sz);
+  Result := libc_realloc(p, sz);
 end;
 
 function mem1_xSize(p: Pointer): i32; cdecl;
 begin
-  Result := sqlite3MallocSize(p);
+  if p = nil then Result := 0
+  else Result := i32(malloc_usable_size(p));
 end;
 
 function mem1_xRoundup(sz: i32): i32; cdecl;
@@ -2414,18 +2428,63 @@ begin
   gMallocMutex := nil;
 end;
 
+{ malloc.c:296 — sqlite3Malloc.  Dispatch through xMalloc so that
+  SQLITE_CONFIG_MALLOC shims (memtrace, etc.) observe every allocation.
+  Bug 6.21 (2026-05-11). }
 function sqlite3Malloc(n: i32): Pointer;
-var sz: i32;
+var
+  sz, nFull: i32;
 begin
-  if n <= 0 then Exit(nil);
-  Result := sqlite3_malloc(n);
-  if (Result <> nil) and (sqlite3GlobalConfig.bMemstat <> 0) then begin
-    sz := sqlite3MallocSize(Result);
+  if (n <= 0) or (n > $7FFFFFFF) then Exit(nil);
+  if not Assigned(sqlite3GlobalConfig.m.xMalloc) then sqlite3MemSetDefault;
+  if sqlite3GlobalConfig.bMemstat <> 0 then
+  begin
     if gMallocMutex <> nil then sqlite3_mutex_enter(gMallocMutex);
-    sqlite3StatusUp(SQLITE_STATUS_MEMORY_USED, sz);
-    sqlite3StatusUp(SQLITE_STATUS_MALLOC_COUNT, 1);
-    sqlite3StatusHighwater(SQLITE_STATUS_MALLOC_SIZE, sz);
+    nFull := sqlite3GlobalConfig.m.xRoundup(n);
+    sqlite3StatusHighwater(SQLITE_STATUS_MALLOC_SIZE, n);
+    Result := sqlite3GlobalConfig.m.xMalloc(nFull);
+    if Result <> nil then
+    begin
+      sz := sqlite3GlobalConfig.m.xSize(Result);
+      sqlite3StatusUp(SQLITE_STATUS_MEMORY_USED, sz);
+      sqlite3StatusUp(SQLITE_STATUS_MALLOC_COUNT, 1);
+    end;
     if gMallocMutex <> nil then sqlite3_mutex_leave(gMallocMutex);
+  end else begin
+    Result := sqlite3GlobalConfig.m.xMalloc(n);
+  end;
+end;
+
+{ malloc.c:503 — sqlite3Realloc.  Dispatch through xRealloc / xRoundup
+  / xSize so SQLITE_CONFIG_MALLOC shims see resizes too. }
+function sqlite3Realloc(p: Pointer; nBytes: u64): Pointer;
+var
+  nOld, nNew, nDiff: i32;
+begin
+  if p = nil then Exit(sqlite3Malloc(i32(nBytes)));
+  if nBytes = 0 then begin sqlite3_free(p); Exit(nil); end;
+  if nBytes > $7FFFFFFF then Exit(nil);
+  if not Assigned(sqlite3GlobalConfig.m.xRealloc) then sqlite3MemSetDefault;
+  nOld := sqlite3MallocSize(p);
+  nNew := sqlite3GlobalConfig.m.xRoundup(i32(nBytes));
+  if nOld = nNew then
+  begin
+    Result := p;
+  end else if sqlite3GlobalConfig.bMemstat <> 0 then
+  begin
+    if gMallocMutex <> nil then sqlite3_mutex_enter(gMallocMutex);
+    sqlite3StatusHighwater(SQLITE_STATUS_MALLOC_SIZE, i32(nBytes));
+    nDiff := nNew - nOld;
+    Result := sqlite3GlobalConfig.m.xRealloc(p, nNew);
+    if Result <> nil then
+    begin
+      nNew := sqlite3GlobalConfig.m.xSize(Result);
+      sqlite3StatusUp(SQLITE_STATUS_MEMORY_USED, nNew - nOld);
+    end;
+    if gMallocMutex <> nil then sqlite3_mutex_leave(gMallocMutex);
+    if nDiff < 0 then ; { silence unused-var warning if any }
+  end else begin
+    Result := sqlite3GlobalConfig.m.xRealloc(p, nNew);
   end;
 end;
 
