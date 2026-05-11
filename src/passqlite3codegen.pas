@@ -24859,6 +24859,10 @@ var
   pGBCoroItem:     PSrcItem;
   addrGBBodyStart: i32;
   addrGBLoopDone:  i32;
+  { Multi-source GROUP BY support (6.13.B.10) — iterate over pSrc to
+    validate non-driver items and emit schema-verify per item. }
+  iSrcCheck:       i32;
+  pItemCheck:      PSrcItem;
   { ORDER BY sorter locals (select.c pushOntoSorter / generateSortTail —
     minimal slice: SRT_Output only, no nOBSat optimisation, no LIMIT
     pushdown, no SORTFLAG_UseSorter shortcut).  bSort=1 means the inner
@@ -25437,28 +25441,52 @@ begin
   if (p^.pGroupBy <> nil)
      and ((p^.selFlags and (SF_Distinct or SF_Compound)) = 0)
      and (p^.pWin = nil)
-     and (p^.pSrc <> nil) and (p^.pSrc^.nSrc = 1)
+     and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem))
   then
   begin
     pItem := SrcListItems(p^.pSrc);
     pTab  := pItem^.pSTab;
-    if (pTab = nil)
-       or (pTab^.eTabType = TABTYP_VTAB)
-    then begin Result := SQLITE_OK; Exit; end;
-    { 10.1.bug.90 — subquery source: route through the coroutine /
-      eph-materialise loop below instead of WhereBegin.  TF_Ephemeral
-      only matters when the source is also flagged a subquery (a CTE
-      or VIEW reference reaches here with TF_Ephemeral set on a real
-      pSchema-bound table — those still flow through the regular path).
-      VIEW entries that are NOT marked subquery still bail until
-      view-codegen lands. }
-    isGBSubquery := (pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0;
-    if (not isGBSubquery)
-       and ((pTab^.eTabType = TABTYP_VIEW)
-            or ((pTab^.tabFlags and TF_Ephemeral) <> 0))
-    then begin Result := SQLITE_OK; Exit; end;
+    if p^.pSrc^.nSrc = 1 then
+    begin
+      if (pTab = nil)
+         or (pTab^.eTabType = TABTYP_VTAB)
+      then begin Result := SQLITE_OK; Exit; end;
+      { 10.1.bug.90 — subquery source: route through the coroutine /
+        eph-materialise loop below instead of WhereBegin.  TF_Ephemeral
+        only matters when the source is also flagged a subquery (a CTE
+        or VIEW reference reaches here with TF_Ephemeral set on a real
+        pSchema-bound table — those still flow through the regular path).
+        VIEW entries that are NOT marked subquery still bail until
+        view-codegen lands. }
+      isGBSubquery := (pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0;
+      if (not isGBSubquery)
+         and ((pTab^.eTabType = TABTYP_VIEW)
+              or ((pTab^.tabFlags and TF_Ephemeral) <> 0))
+      then begin Result := SQLITE_OK; Exit; end;
+    end
+    else
+    begin
+      { 6.13.B.10 — multi-source GROUP BY.  No subquery / VIEW /
+        TF_Ephemeral source supported here (those need the coroutine /
+        eph-materialise plumbing from the single-source path).  Vtab
+        sources are OK: WhereBegin / whereLoopAddVirtual already drive
+        them as outer or inner loops with lateral-arg pushdown. }
+      isGBSubquery := False;
+      for iSrcCheck := 0 to p^.pSrc^.nSrc - 1 do
+      begin
+        pItemCheck := @SrcListItems(p^.pSrc)[iSrcCheck];
+        if pItemCheck^.pSTab = nil then
+          begin Result := SQLITE_OK; Exit; end;
+        if (pItemCheck^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) <> 0 then
+          begin Result := SQLITE_OK; Exit; end;
+        if pItemCheck^.pSTab^.eTabType = TABTYP_VIEW then
+          begin Result := SQLITE_OK; Exit; end;
+        if (pItemCheck^.pSTab^.tabFlags and TF_Ephemeral) <> 0 then
+          begin Result := SQLITE_OK; Exit; end;
+      end;
+    end;
 
     pGroupByLoc := p^.pGroupBy;
     pHavingLoc  := p^.pHaving;
@@ -25553,8 +25581,20 @@ begin
       sqlite3GenerateColumnNames(pParse, p);
       if not isGBSubquery then
       begin
-        iDb := sqlite3SchemaToIndex(pParse^.db, pTab^.pSchema);
-        sqlite3CodeVerifySchema(pParse, iDb);
+        { 6.13.B.10 — iterate over all source items so multi-source
+          FROM (e.g. `FROM sqlite_schema, pragma_foreign_key_list(...)`)
+          verifies every contributing schema, not just the first.
+          sqlite3CodeVerifySchema is a no-op for already-verified iDbs. }
+        for iSrcCheck := 0 to p^.pSrc^.nSrc - 1 do
+        begin
+          pItemCheck := @SrcListItems(p^.pSrc)[iSrcCheck];
+          if pItemCheck^.pSTab <> nil then
+          begin
+            iDb := sqlite3SchemaToIndex(pParse^.db,
+                                        pItemCheck^.pSTab^.pSchema);
+            sqlite3CodeVerifySchema(pParse, iDb);
+          end;
+        end;
       end;
 
       { Allocate sorter cursor + KeyInfo from pGroupBy. }

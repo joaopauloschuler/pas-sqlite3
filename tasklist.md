@@ -146,14 +146,32 @@ FPC porting traps that recur often enough to call out up-front:
           json_each lateral on a JSON column.  fsdir / wholenumber
           / completion left for a future gate (need extension load
           plumbing or vtab modules not registered by default).
-    - [ ] **6.13.B.10** `.lint fkey-indexes` (10.1c.6 / 10.1.20)
-          and `.archive` / `.recover` (10.1.46 / 10.1.48) — still
-          blocked, but no longer on 6.13.  The lint query relies
-          on **GROUP BY over a multi-source FROM containing vtab
-          sources**; the trivial-gate at codegen.pas:25847 still
-          bails on `pGroupBy <> nil` before the multi-source/vtab
-          path can run.  Track under a new bug once a sponsor
-          query lands.
+    - [X] **6.13.B.10** Multi-source GROUP BY arm extended at
+          codegen.pas:25437 — single-source `pSrc^.nSrc = 1` gate
+          lifted to `>= 1`.  For multi-source the per-item walk
+          rejects subquery / VIEW / TF_Ephemeral sources (those
+          still need the coroutine/eph-materialise plumbing from
+          the single-source path) and accepts vtab sources, which
+          flow through `sqlite3WhereBegin` /
+          `whereLoopAddVirtual` with lateral-arg pushdown already
+          in place from 6.13.B.7/B.8.  Schema-verify iterates the
+          full pSrc instead of just `pSrc->a[0]`.  Sponsor query
+          `SELECT a.x, count(*) FROM a, b GROUP BY a.x` now
+          matches upstream; `SELECT s.name, f.id, f.[from] FROM
+          sqlite_schema, pragma_foreign_key_list(s.name) AS f
+          GROUP BY s.name, f.id` (the vtab-lateral shape behind
+          `.lint fkey-indexes`) lowers and runs.
+          `.lint fkey-indexes` / `.archive` / `.recover` still
+          fail on a **separate pre-existing bug** (multi-vtab
+          LEFT-JOIN with two aggregates whose arg columns span
+          both inner vtabs trips a register-allocation issue in
+          updateAccumulatorSimple — repros without GROUP BY too,
+          via `SELECT f.[from], p.[name] FROM sqlite_schema AS s,
+          pragma_foreign_key_list(s.name) AS f LEFT JOIN
+          pragma_table_info AS p ON (pk-1=seq AND
+          p.arg=f.[table])` when s.name is omitted from the
+          SELECT list).  Track that under a new bug; it is not on
+          the GROUP BY path.
 
 - [X] **6.10** TestExplainParity closed.
 - [X] **6.11** PRAGMA page_count + DROP TABLE remaining gap closed.
