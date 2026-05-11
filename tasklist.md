@@ -179,7 +179,7 @@ partial landings cannot silently no-op.
   - [ ] **10.1d.6** `.open`
 
 - [X] **10.1.22, 10.1.23, 10.1.25, 10.1.26** `.read FILE`, `.dump` (full), `.output`/`.once`, `.save` all landed.
-- [~] **10.1.24** `.import` — auto-create-from-header landed (shellAutoColumnAdd/Finish, shell.c.in:7165..7339); duplicate column renaming gated on bug 10.1.bug.131 (correlated CTE-column visibility in deeply nested EXISTS). Heredoc input and pipe input still deferred.
+- [~] **10.1.24** `.import` — auto-create-from-header landed (shellAutoColumnAdd/Finish, shell.c.in:7165..7339); duplicate column renaming now unblocked (bug 10.1.bug.131 closed). Heredoc input and pipe input still deferred.
 - [~] **10.1.27** `.open` — handles `-new`, `-readonly`, `-exclusive`, `-ifexists`, `-nofollow`. `--zip` and `--deserialize` deferred until those VFSes/extensions are ported.
 
 ### 10.1e Meta / diagnostic dot-commands
@@ -326,7 +326,7 @@ and constraints flow once that lands.
 - [X] **10.1.bug.128** CLI step-error prefix should be `Error near line N:` (no `Runtime error`, no `(rc)` suffix) — upstream's step-time path.
 - [X] **10.1.bug.129** CLI openDb missed `sqlite3_db_config(TRUSTED_SCHEMA=0, DEFENSIVE=1, STMT_SCANSTATUS=0)` from shell.c.in:4530..4537; `PRAGMA trusted_schema;` returned engine default 1 instead of CLI default 0. Regression: bin/TestShellTrustedSchema.
 - [X] **10.1.bug.130** `UPDATE T AS t SET col=(SELECT … WHERE inner.col=t.col)` errored "no such column: t.col". sqlite3ResolveExprNames (the lean resolver entry used by UPDATE / DELETE / triggers) skipped subquery descent, so outer-alias TK_DOTs survived into sqlite3SelectPrep which only sees the inner FROM. Fix: post-resolveExprAgainstSrcList walker (`resolveSubqueryOuterRefs`) expands inner pSrc, pre-resolves outer-ref TK_DOTs in inner clauses, and stamps EP_VarSelect + SF_Correlated so codegen re-evaluates per outer row. Recurses through nested subqueries. Regression: bin/TestUpdateCorrelated.
-- [ ] **10.1.bug.131** WITH RECURSIVE … step references the recursive CTE column from inside an EXISTS subquery nested inside printf/iif: `WITH Lzn(nlz) AS (SELECT 0 UNION SELECT nlz+1 FROM Lzn WHERE EXISTS(SELECT 1 FROM T t WHERE printf('%d',nlz)='1'))` errors with "no such column: nlz". The CTE column should be visible to correlated subqueries inside the recursive step. Surfaces under .import auto-create when the input has duplicate column headers (zRenameRank in shell.c.in:7219..7250). Inserting columns and the CREATE TABLE proceeds with duplicate names — fails with "duplicate column name" until this lands.
+- [X] **10.1.bug.131** Bare-TK_ID outer ref from inside a correlated subquery errored "no such column: X". The SELECT-prep correlation walker handled qualified TK_DOT outer refs but not unqualified TK_ID — so a recursive CTE column referenced inside `EXISTS(...)` (and the .import duplicate-column zRenameRank query) was rejected. Fix: ExprRefsOuterID / ResolveOuterIDs siblings to the existing TK_DOT helpers, wired into the same SELECT-prep block. Inner-scope wins per resolve.c:393..489. Regression: bin/TestCteOuterID.
 
 ---
 

@@ -8487,6 +8487,122 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                        pOuterSrc, pInnerSrc);
   end;
 
+  { 10.1.bug.131 — bare-TK_ID outer refs.  Mirrors lookupName's
+    NameContext.pNext climb (resolve.c:393..489) for unqualified column
+    names: when a bare identifier inside an EXISTS / scalar subquery
+    matches a column in an outer FROM but no column in the inner FROM,
+    rewrite it to a TK_COLUMN bound to the outer cursor BEFORE the inner
+    resolver runs — exactly as ResolveOuterRefs does for TK_DOT. }
+  function ColumnInSrcList(pSrc: PSrcList; zCol: PAnsiChar;
+                           out pMatch: PSrcItem;
+                           out iColOut: i32): Boolean;
+  var
+    base_: PSrcItem;
+    pIt:   PSrcItem;
+    j_, ic: i32;
+  begin
+    Result := False;
+    pMatch := nil; iColOut := -1;
+    if (pSrc = nil) or (zCol = nil) then Exit;
+    base_ := SrcListItems(pSrc);
+    for j_ := 0 to pSrc^.nSrc - 1 do
+    begin
+      pIt := PSrcItem(PByte(base_) + j_ * SizeOf(TSrcItem));
+      if pIt^.pSTab = nil then Continue;
+      ic := sqlite3ColumnIndex(pIt^.pSTab, zCol);
+      if ic >= 0 then
+      begin
+        pMatch := pIt; iColOut := ic; Result := True; Exit;
+      end;
+    end;
+  end;
+
+  function ExprRefsOuterID(pW: PExpr; pOuterSrc: PSrcList;
+                           pInnerSrc: PSrcList): Boolean; forward;
+
+  function ExprListRefsOuterID(pList: PExprList; pOuterSrc: PSrcList;
+                               pInnerSrc: PSrcList): Boolean;
+  var k_: i32;
+  begin
+    Result := False;
+    if pList = nil then Exit;
+    for k_ := 0 to pList^.nExpr - 1 do
+      if ExprRefsOuterID(ExprListItems(pList)[k_].pExpr,
+                         pOuterSrc, pInnerSrc) then
+      begin Result := True; Exit; end;
+  end;
+
+  function ExprRefsOuterID(pW: PExpr; pOuterSrc: PSrcList;
+                           pInnerSrc: PSrcList): Boolean;
+  var
+    pInItem, pOutItem: PSrcItem;
+    iInCol, iOutCol: i32;
+  begin
+    Result := False;
+    if pW = nil then Exit;
+    if pW^.op = TK_ID then
+    begin
+      if (pW^.u.zToken = nil) or (pOuterSrc = nil) then Exit;
+      if ColumnInSrcList(pInnerSrc, pW^.u.zToken, pInItem, iInCol) then Exit;
+      if ColumnInSrcList(pOuterSrc, pW^.u.zToken, pOutItem, iOutCol) then
+      begin Result := True; Exit; end;
+      Exit;
+    end;
+    if pW^.op = TK_DOT then Exit;
+    if ExprHasProperty(pW, EP_TokenOnly or EP_Leaf) then Exit;
+    if ExprRefsOuterID(pW^.pLeft,  pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
+    if ExprRefsOuterID(pW^.pRight, pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
+    if (pW^.flags and EP_xIsSelect) = 0 then
+      if ExprListRefsOuterID(pW^.x.pList, pOuterSrc, pInnerSrc) then
+      begin Result := True; Exit; end;
+  end;
+
+  procedure ResolveOuterIDs(pW: PExpr; pOuterSrc: PSrcList;
+                            pInnerSrc: PSrcList); forward;
+
+  procedure ResolveOuterIDsInList(pList: PExprList; pOuterSrc: PSrcList;
+                                  pInnerSrc: PSrcList);
+  var k_: i32;
+  begin
+    if pList = nil then Exit;
+    for k_ := 0 to pList^.nExpr - 1 do
+      ResolveOuterIDs(ExprListItems(pList)[k_].pExpr,
+                      pOuterSrc, pInnerSrc);
+  end;
+
+  procedure ResolveOuterIDs(pW: PExpr; pOuterSrc: PSrcList;
+                            pInnerSrc: PSrcList);
+  var
+    pInItem, pOutItem: PSrcItem;
+    iInCol, iOutCol: i32;
+  begin
+    if pW = nil then Exit;
+    if pW^.op = TK_ID then
+    begin
+      if (pW^.u.zToken = nil) or (pOuterSrc = nil) then Exit;
+      { Inner scope wins — leave for the inner resolver to bind. }
+      if ColumnInSrcList(pInnerSrc, pW^.u.zToken, pInItem, iInCol) then Exit;
+      if ColumnInSrcList(pOuterSrc, pW^.u.zToken, pOutItem, iOutCol) then
+      begin
+        pW^.op      := TK_COLUMN;
+        pW^.iTable  := pOutItem^.iCursor;
+        pW^.iColumn := i16(iOutCol);
+        pW^.y.pTab  := pOutItem^.pSTab;
+        if iOutCol < BMS - 1 then
+          pOutItem^.colUsed := pOutItem^.colUsed or (Bitmask(1) shl iOutCol)
+        else
+          pOutItem^.colUsed := pOutItem^.colUsed or (Bitmask(1) shl (BMS - 1));
+      end;
+      Exit;
+    end;
+    if pW^.op = TK_DOT then Exit;
+    if ExprHasProperty(pW, EP_TokenOnly or EP_Leaf) then Exit;
+    ResolveOuterIDs(pW^.pLeft,  pOuterSrc, pInnerSrc);
+    ResolveOuterIDs(pW^.pRight, pOuterSrc, pInnerSrc);
+    if (pW^.flags and EP_xIsSelect) = 0 then
+      ResolveOuterIDsInList(pW^.x.pList, pOuterSrc, pInnerSrc);
+  end;
+
   procedure ResolveExpr(pE: PExpr);
   var
     pSrc:   PSrcList;
@@ -8749,6 +8865,17 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
                                     p^.pSrc, pInner^.pSrc) then bCorr := True;
           if ExprListRefsOuterTable(pInner^.pOrderBy,
                                     p^.pSrc, pInner^.pSrc) then bCorr := True;
+          { 10.1.bug.131 — also detect unqualified TK_ID outer refs. }
+          if ExprListRefsOuterID(pInner^.pEList,
+                                 p^.pSrc, pInner^.pSrc) then bCorr := True;
+          if ExprRefsOuterID(pInner^.pWhere,
+                             p^.pSrc, pInner^.pSrc)   then bCorr := True;
+          if ExprRefsOuterID(pInner^.pHaving,
+                             p^.pSrc, pInner^.pSrc)   then bCorr := True;
+          if ExprListRefsOuterID(pInner^.pGroupBy,
+                                 p^.pSrc, pInner^.pSrc) then bCorr := True;
+          if ExprListRefsOuterID(pInner^.pOrderBy,
+                                 p^.pSrc, pInner^.pSrc) then bCorr := True;
         end;
         { Step 3: resolve outer-ref TK_DOT nodes against the outer pSrc
           BEFORE the inner resolver runs.  Matching nodes become TK_COLUMN
@@ -8763,6 +8890,12 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
           ResolveOuterRefs(pInner^.pHaving,        p^.pSrc, pInner^.pSrc);
           ResolveOuterRefsInList(pInner^.pGroupBy, p^.pSrc, pInner^.pSrc);
           ResolveOuterRefsInList(pInner^.pOrderBy, p^.pSrc, pInner^.pSrc);
+          { 10.1.bug.131 — bare-TK_ID outer refs alongside TK_DOT. }
+          ResolveOuterIDsInList(pInner^.pEList,   p^.pSrc, pInner^.pSrc);
+          ResolveOuterIDs(pInner^.pWhere,         p^.pSrc, pInner^.pSrc);
+          ResolveOuterIDs(pInner^.pHaving,        p^.pSrc, pInner^.pSrc);
+          ResolveOuterIDsInList(pInner^.pGroupBy, p^.pSrc, pInner^.pSrc);
+          ResolveOuterIDsInList(pInner^.pOrderBy, p^.pSrc, pInner^.pSrc);
         end;
         { Step 4: resolve inner clauses against inner pSrc. }
         if (pInner^.selFlags and SF_HasTypeInfo) = 0 then
