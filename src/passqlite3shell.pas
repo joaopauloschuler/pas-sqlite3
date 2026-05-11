@@ -544,6 +544,7 @@ begin
   p^.pAuxDb      := @p^.aAuxDb[0];
   { Mode defaults — shell.c.in main() roughly at 13072..13085 }
   p^.mode.eMode  := MODE_List;
+  p^.mode.autoExplain := 1;           { shell.c.in:1697 modeDefault }
   p^.mode.spec.eStyle := 12;          { QRF_STYLE_List }
   p^.mode.spec.bTitles := QRF_No;     { off by default; modeChangeBuiltin
                                         will overwrite from aModeInfo.bHdr
@@ -1578,6 +1579,36 @@ begin
   if z = nil then Result := '' else Result := AnsiString(z);
 end;
 
+function cEscapeStr(const z: AnsiString): AnsiString;
+{ output_c_string body as a string (shell.c.in:2062..2103).  Wraps in
+  double quotes; escapes \t \n \r \f \" \\ ; non-printable bytes as
+  \ooo octal. }
+var
+  i: SizeInt;
+  b: Byte;
+begin
+  Result := '"';
+  for i := 1 to Length(z) do begin
+    b := Byte(z[i]);
+    case z[i] of
+      '"', '\': Result := Result + '\' + z[i];
+      #9:  Result := Result + '\t';
+      #10: Result := Result + '\n';
+      #12: Result := Result + '\f';
+      #13: Result := Result + '\r';
+    else
+      if (b < 32) or (b = 127) then
+        Result := Result + '\' +
+          AnsiChar(Chr(48 + ((b shr 6) and 3))) +
+          AnsiChar(Chr(48 + ((b shr 3) and 7))) +
+          AnsiChar(Chr(48 + (b and 7)))
+      else
+        Result := Result + z[i];
+    end;
+  end;
+  Result := Result + '"';
+end;
+
 function utf8DispWidth(const s: AnsiString): i32;
 { Approximate display width: count non-continuation UTF-8 bytes (one
   glyph per code point, all glyphs treated as width 1).  Good enough
@@ -2467,9 +2498,14 @@ begin
          AnsiString(sqlite3_errmsg(p^.db))]));
       Inc(Result);
     end;
-    if (pzTail = nil) or (pzTail = pCursor) then Exit;
+    if (pzTail = nil) or (pzTail = pCursor) then Break;
     pCursor := pzTail;
   end;
+  { shell.c.in:12356..12361 — emit per-SQL `.changes` summary once at
+    the end of runOneSqlLine if SHFLG_CountChanges set and no error. }
+  if (Result = 0) and ((p^.shellFlgs and SHFLG_CountChanges) <> 0) then
+    shellSPutZ(Format('changes: %d   total_changes: %d'#10,
+      [sqlite3_changes64(p^.db), sqlite3_total_changes64(p^.db)]));
 end;
 
 { ----------------------------------------------------------------------
@@ -3295,9 +3331,13 @@ begin
     shellSPutZ(Format('%12s: %s'#10, ['explain',    'off']));
   shellSPutZ(Format('%12s: %s'#10, ['headers',      onOffStr(p^.mode.spec.bTitles = QRF_Yes)]));
   shellSPutZ(Format('%12s: %s'#10, ['mode',         StrPas(@aModeInfo[p^.mode.eMode].zName[0])]));
-  shellSPutZ(Format('%12s: "%s"'#10, ['nullvalue',  specStr(p^.mode.spec.zNull)]));
-  shellSPutZ(Format('%12s: "%s"'#10, ['colseparator', specStr(p^.mode.spec.zColumnSep)]));
-  shellSPutZ(Format('%12s: "%s"'#10, ['rowseparator', specStr(p^.mode.spec.zRowSep)]));
+  shellSPutZ(Format('%12s: %s'#10, ['nullvalue',    cEscapeStr(specStr(p^.mode.spec.zNull))]));
+  if gOutRedirected then
+    shellSPutZ(Format('%12s: %s'#10, ['output', gOutCurFilename]))
+  else
+    shellSPutZ(Format('%12s: %s'#10, ['output', 'stdout']));
+  shellSPutZ(Format('%12s: %s'#10, ['colseparator', cEscapeStr(specStr(p^.mode.spec.zColumnSep))]));
+  shellSPutZ(Format('%12s: %s'#10, ['rowseparator', cEscapeStr(specStr(p^.mode.spec.zRowSep))]));
   case p^.statsOn of
     0: shellSPutZ(Format('%12s: %s'#10, ['stats', 'off']));
     2: shellSPutZ(Format('%12s: %s'#10, ['stats', 'stmt']));
@@ -3310,10 +3350,6 @@ begin
     widths := widths + IntToStr(p^.mode.spec.aWidth[i]) + ' ';
   shellSPutZ(Format('%12s: %s'#10, ['width', widths]));
   shellSPutZ(Format('%12s: %s'#10, ['filename',     fn]));
-  if gOutRedirected then
-    shellSPutZ(Format('%12s: %s'#10, ['output', gOutCurFilename]))
-  else
-    shellSPutZ(Format('%12s: %s'#10, ['output', 'stdout']));
 end;
 
 procedure cmdMode(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
