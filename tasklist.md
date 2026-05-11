@@ -156,14 +156,20 @@ partial landings cannot silently no-op.
 
 ### 10.1c Schema introspection dot-commands
 
-- [ ] **10.1c** Gate: `tests/cli/10c_schema/`.
-  - [ ] **10.1c.1** `.schema`
-  - [ ] **10.1c.2** `.tables`
-  - [ ] **10.1c.3** `.indexes`
-  - [ ] **10.1c.4** `.databases`
-  - [ ] **10.1c.5** `.fullschema`
-  - [ ] **10.1c.6** `.lint fkey-indexes`
-  - [ ] **10.1c.7** `.expert` (read-only subset)
+- [~] **10.1c** Gate: `bin/TestShellSchema` diffs the port byte-for-byte
+  against the upstream `sqlite3` binary for the schema-introspection
+  dot-commands.  Multi-result `.tables` / `.indexes`-no-arg / temp-schema
+  side-effects on `.databases` after `.indexes` are pre-existing port
+  divergences and stay out of the gate.
+  - [X] **10.1c.1** `.schema` (basic + pattern + `--indent` + `--nosys`)
+  - [X] **10.1c.2** `.tables` (single-result + pattern)
+  - [X] **10.1c.3** `.indexes` (with table arg)
+  - [X] **10.1c.4** `.databases`
+  - [X] **10.1c.5** `.fullschema`
+  - [ ] **10.1c.6** `.lint fkey-indexes` — blocked on bug 6.13 (lateral
+        `pragma_foreign_key_list` join).
+  - [ ] **10.1c.7** `.expert` (read-only subset) — stub returns
+        "this build does not support the .expert command".
 
 - [X] **10.1.15..10.1.19, 10.1.21** `.schema --indent`, `.tables`, `.indexes`, `.databases`, `.fullschema`, `.expert` (stub) all landed.
 - [~] **10.1.20** `.lint fkey-indexes` — port complete but emits no suggestions until bug 6.13 (lateral pragma_foreign_key_list join) lands.

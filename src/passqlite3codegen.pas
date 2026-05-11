@@ -36765,7 +36765,7 @@ begin
       zType2 := PAnsiChar('TABLE');
     end else begin
       zType  := PAnsiChar('view');
-      zType2 := PAnsiChar('view'); { unreachable today: VIEW emits via sqlite3CreateView }
+      zType2 := PAnsiChar('VIEW');
     end;
 
     { Compute the complete text of the CREATE statement (build.c:2886..2896). }

@@ -172,6 +172,7 @@ compile_test TestShellEcho
 compile_test TestShellParameter
 compile_test TestShellChanges
 compile_test TestShellModes
+compile_test TestShellSchema
 compile_test TestExplainParity
 compile_test TestBytecodeParity
 compile_test TestWhereCorpus
