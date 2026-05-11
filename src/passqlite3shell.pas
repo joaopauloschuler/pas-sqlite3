@@ -4430,6 +4430,14 @@ function shellGetRUsage(who: cint; usage: PRUsagePas): cint;
 function shellGetTimeOfDay(tp: Pointer; tzp: Pointer): cint;
   cdecl; external 'c' name 'gettimeofday';
 
+{ libc 'stderr' FILE* — used to wire -memtrace / -pcachetrace to the
+  same sink as shell.c.in:13197 / :13199 (sqlite3{Mem,Pcache}TraceActivate
+  receive stderr).  Declared cvar/external so FPC resolves it against
+  glibc's global FILE*; on Linux this is the canonical handle, matching
+  the C shell exactly. }
+var
+  shellLibcStderr: Pointer; external 'c' name 'stderr';
+
 var
   shellTimerBeginRU: TRUsagePas;
   shellTimerBeginNs: i64;
@@ -9481,8 +9489,8 @@ begin
         if szArg = 0 then ;     { wiring deferred — int-shape sqlite3_config
                                   has no MMAP_SIZE arm yet }
       end;
-      if z = '-memtrace' then sqlite3MemTraceActivate(nil);
-      if z = '-pcachetrace' then sqlite3PcacheTraceActivate(nil);
+      if z = '-memtrace' then sqlite3MemTraceActivate(shellLibcStderr);
+      if z = '-pcachetrace' then sqlite3PcacheTraceActivate(shellLibcStderr);
     end else if (z = '-pagecache') or (z = '-lookaside') then begin
       { 2-arg sizing flags — the int-shape sqlite3_config does not
         cover these; consume the args and continue. }
