@@ -3710,6 +3710,12 @@ begin
 
   { allocate Mem registers (aMem[1..nMem] are user registers; aMem[0] is
     the unused slot held by all VDBE programs).  Phase 6.9-bis. }
+  { Bug 6.16: nMem/aMem must be set unconditionally to avoid stale values
+    from the raw-malloc'd Vdbe surviving when nMem=0. }
+  if vdbeDbMallocFailed(db) or (nMem <= 0) then begin
+    p^.nMem := 0;
+    p^.aMem := nil;
+  end;
   if (not vdbeDbMallocFailed(db)) and (nMem > 0) then begin
     p^.aMem := PMem(sqlite3DbMallocZero(db,
                                        u64(nMem + 1) * SizeOf(TMem)));
@@ -3726,10 +3732,21 @@ begin
       end;
     end;
   end;
-  if (not vdbeDbMallocFailed(db)) and (nCursor > 0) then begin
+  { vdbeaux.c:2731-2742 — apCsr/nCursor must be set unconditionally so
+    closeAllCursors sees a coherent (apCsr=nil, nCursor=0) on the
+    zero-cursor path; otherwise the raw-malloc'd Vdbe retains stale
+    apCsr/nCursor from a previously freed Vdbe at the same address and
+    sqlite3VdbeHalt dereferences a bogus pointer (bug 6.16). }
+  if vdbeDbMallocFailed(db) then begin
+    p^.nCursor := 0;
+    p^.apCsr   := nil;
+  end else if nCursor > 0 then begin
     p^.apCsr := PPVdbeCursor(sqlite3DbMallocZero(db,
                              u64(nCursor) * SizeOf(PVdbeCursor)));
     p^.nCursor := nCursor;
+  end else begin
+    p^.nCursor := 0;
+    p^.apCsr   := nil;
   end;
 
   { Port of vdbeaux.c:2714/2737-2738 — allocate aVar[] and set nVar so
