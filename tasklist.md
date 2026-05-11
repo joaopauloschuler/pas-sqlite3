@@ -407,32 +407,16 @@ and constraints flow once that lands.
 - [X] **10.1.99** spellfix.c → passqlite3spellfix.pas (full module: phonehash, editdist1, scriptcode, translit, editdist3 family, spellfix1 vtab)
 - [X] **10.1.100** Built-in shell SQL UDFs: strtod, dtostr, shell_add_schema, shell_module_schema, shell_putsnl, usleep. editFunc deferred (needs system() spawn + temp-file shuttle).
 
-- [ ] **10.1.102** `.open --zip` / `--deserialize` / `--hexdb` shell
-      glue.  Underlying VFSes/extensions already ported: zipfile vtab
-      (10.1.98), apndvfs (10.1.84), memdb VFS (passqlite3pager.pas
-      3.A.4 block, registered via `sqlite3MemdbInit`).  Two pieces of
-      glue remain:
-        1. Port the C switch at `shell.c.in:4495..4510` into
-           `openDb` (passqlite3shell.pas:872): on
-           `SHELL_OPEN_ZIPFILE` open `:memory:` and let the zipfile
-           vtab carry the file; on `SHELL_OPEN_DESERIALIZE` /
-           `SHELL_OPEN_HEXDB` open `:memory:` then call
-           `sqlite3_deserialize` with the slurped file bytes (see
-           `shell.c.in:4613..4640`).  Today `openDb` always falls
-           through to `sqlite3_open_v2(zDbFilename,...)` regardless
-           of `openMode`.
-        2. Finish `sqlite3_deserialize` at passqlite3main.pas:4501.
-           It is currently a stub returning `SQLITE_ERROR` because
-           the comment block was written before the memdb VFS port
-           landed; faithful port of `memdb.c:839..928` (open a
-           memdb file via `sqlite3_open` on a synthetic name, swap
-           the buffer into the `MemStore` backing the schema's
-           pager, honour `SQLITE_DESERIALIZE_FREEONCLOSE` /
-           `_RESIZEABLE` / `_READONLY`) lights up both
-           `--deserialize` and `--hexdb`.
-      Once both land, lift the `--zip` / `--deserialize` caveat on
-      **10.1.27** and `.open --zip` / `--deserialize` become testable
-      under TestShellSchema or a new TestShellOpen gate.
+- [X] **10.1.102** `.open --zip` / `--deserialize` / `--hexdb` shell
+      glue.  Two pieces landed: (1) faithful port of `memdb.c:839..928`
+      `sqlite3_deserialize` in passqlite3main.pas, including the
+      reopenMemdb branch in attachFunc (codegen.pas) and a tiny
+      `sqlite3MemdbIoMethods` accessor on passqlite3pager.pas so
+      `memdbFromDbSchema` can recognise a MemFile by its vtable; (2)
+      shell.c.in:4491..4510 switch + 4613..4644 post-open block in
+      `openDb` (passqlite3shell.pas), backed by new `shellReadFile`
+      and `shellReadHexDb` helpers.  Smoke: `--deserialize FILE` and
+      `--zip FILE` both round-trip a SELECT through the CLI.
 
 - [ ] **10.1.101** `ext/expert/sqlite3expert.c` → `passqlite3expert.pas`
       (~2236 lines + `sqlite3expert.h` ~168 lines).  Powers the

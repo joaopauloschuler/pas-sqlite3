@@ -102,21 +102,29 @@ begin
     sqlite3_finalize(pStmt);
   end;
 
-  { T5 — sqlite3_deserialize OMIT_DESERIALIZE-equivalent semantics:
-    memdb VFS is unported, so the call must fail with SQLITE_ERROR.
-    Pass nil pData/0 sizes so no FREEONCLOSE bookkeeping is exercised. }
+  { T5 — 10.1.102: sqlite3_deserialize on a non-empty buffer with sane
+    metadata now succeeds (ATTACHes a fresh memdb btree onto 'main' and
+    swaps the bytes in).  Passing nil pData with szDb=0 still returns
+    SQLITE_OK because the ATTACH-and-swap path is valid even with an
+    empty payload — but to keep the assertion non-destructive, drive the
+    happy path with a small valid serialized buffer.  Here we just
+    exercise the deserialize+FREEONCLOSE bookkeeping below in T6 and
+    sanity-check that the call no longer reports the OMIT_DESERIALIZE
+    stub SQLITE_ERROR. }
   ExpectEq(sqlite3_deserialize(db, 'main', nil, 0, 0, 0),
-           SQLITE_ERROR, 'T5 deserialize -> SQLITE_ERROR');
+           SQLITE_OK, 'T5 deserialize empty buffer -> OK');
 
-  { T6 — FREEONCLOSE on failure path: pData must be freed by SQLite even
-    though deserialize fails (memdb.c:903).  Allocate via sqlite3_malloc
-    so the matched free path is exercised; nothing to assert directly,
-    but a leak would surface under valgrind / repeat runs. }
+  { T6 — FREEONCLOSE bookkeeping: the buffer must be reachable by SQLite
+    through the swap (or freed on the failure path).  Reopen db first
+    because T5 left 'main' as an empty memdb. }
+  sqlite3_close(db);
+  ExpectEq(sqlite3_open(':memory:', @db), SQLITE_OK, 'T6 reopen');
   buf := sqlite3_malloc(64);
   Expect(buf <> nil, 'T6 malloc');
+  FillChar(buf^, 64, 0);
   ExpectEq(sqlite3_deserialize(db, 'main', buf, 0, 64,
                                SQLITE_DESERIALIZE_FREEONCLOSE),
-           SQLITE_ERROR, 'T6 deserialize FREEONCLOSE -> SQLITE_ERROR');
+           SQLITE_OK, 'T6 deserialize FREEONCLOSE -> OK');
 
   sqlite3_close(db);
 

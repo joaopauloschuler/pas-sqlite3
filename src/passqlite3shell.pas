@@ -865,22 +865,178 @@ begin
                           @shellUSleepUdf, nil, nil);
 end;
 
+{ shell.c.in:4110 — shellReadFile.  Slurp the entire contents of zName into
+  a fresh sqlite3_malloc64 buffer; returns nil on open / read error.  Used
+  exclusively by openDb's SHELL_OPEN_DESERIALIZE arm (the C source name is
+  just readFile but we prefix it to avoid colliding with the readfile()
+  SQL function exported by passqlite3fileio). }
+function shellReadFile(zName: PAnsiChar; pnByte: Pi32): PAnsiChar;
+var
+  h:      THandle;
+  nIn:    Int64;
+  pBuf:   PAnsiChar;
+  nRead:  PtrInt;
+begin
+  Result := nil;
+  if zName = nil then Exit;
+  h := FileOpen(AnsiString(zName), fmOpenRead or fmShareDenyNone);
+  if h = THandle(-1) then Exit;
+  nIn := FileSeek(h, Int64(0), 2);  { fsFromEnd }
+  if nIn < 0 then begin
+    FileClose(h);
+    shellEPutZ(Format('Error: ''%s'' not seekable'#10, [AnsiString(zName)]));
+    Exit;
+  end;
+  FileSeek(h, Int64(0), 0);  { fsFromBeginning }
+  pBuf := PAnsiChar(sqlite3_malloc64(u64(nIn + 1)));
+  if pBuf = nil then begin
+    FileClose(h);
+    shellEPutZ('Error: out of memory'#10);
+    Exit;
+  end;
+  nRead := FileRead(h, pBuf^, nIn);
+  FileClose(h);
+  if nRead <> nIn then begin
+    sqlite3_free(pBuf);
+    shellEPutZ(Format('Error: cannot read ''%s'''#10, [AnsiString(zName)]));
+    Exit;
+  end;
+  (pBuf + nIn)^ := #0;
+  if pnByte <> nil then pnByte^ := i32(nIn);
+  Result := pBuf;
+end;
+
+{ shell.c.in:4324 — shellReadHexDb.  Parse the textual hex-dump emitted by
+  `.dump --hexdb` back into raw page bytes.  Each input frame has a
+  `| size N pagesize K` header, optional `| page J offset K` per-page
+  resets, hex rows `| OFF: x0 x1 ... x15`, terminated by `| end DB`.
+  Only the file-source path is supported here (open via the filename in
+  p->pAuxDb->zDbFilename); the in-script `.open --hexdb` from a `.read`
+  context routes through the same path since the shell injects the
+  filename on its way in. }
+function shellReadHexDb(p: PShellState; pnData: Pi32): PAnsiChar;
+var
+  h:       THandle;
+  zText:   AnsiString;
+  zLine:   AnsiString;
+  nByte:   Int64;
+  n, pgsz: i32;
+  sz:      Int64;
+  iOffset: Int64;
+  iOff:    Int64;
+  a:       PAnsiChar;
+  pos:     SizeInt;
+  nlPos:   SizeInt;
+  rcSscanf: i32;
+  j, ii:   i32;
+  x:       array[0..15] of u32;
+  errLine: i32;
+  zDbFilename: PAnsiChar;
+  function takeLine: Boolean;
+  begin
+    Result := False;
+    if pos > Length(zText) then Exit;
+    nlPos := PosEx(#10, zText, pos);
+    if nlPos = 0 then nlPos := Length(zText) + 1;
+    zLine := Copy(zText, pos, nlPos - pos);
+    pos := nlPos + 1;
+    Result := True;
+  end;
+  label readHexDb_error;
+begin
+  Result := nil;
+  if pnData <> nil then pnData^ := 0;
+  a := nil;
+  zDbFilename := p^.pAuxDb^.zDbFilename;
+  if zDbFilename = nil then Exit;
+  h := FileOpen(AnsiString(zDbFilename), fmOpenRead or fmShareDenyNone);
+  if h = THandle(-1) then begin
+    shellEPutZ(Format('cannot open "%s" for reading'#10,
+      [AnsiString(zDbFilename)]));
+    Exit;
+  end;
+  nByte := FileSeek(h, Int64(0), 2);
+  FileSeek(h, Int64(0), 0);
+  SetLength(zText, nByte);
+  if nByte > 0 then FileRead(h, zText[1], nByte);
+  FileClose(h);
+  pos := 1;
+  errLine := 1;
+  if not takeLine then goto readHexDb_error;
+  n := 0; pgsz := 0;
+  rcSscanf := SScanf(zLine, '| size %d pagesize %d', [@n, @pgsz]);
+  if rcSscanf < 2 then goto readHexDb_error;
+  if n < 0 then goto readHexDb_error;
+  if (pgsz < 512) or (pgsz > 65536) or ((pgsz and (pgsz - 1)) <> 0) then begin
+    shellEPutZ('invalid pagesize'#10);
+    goto readHexDb_error;
+  end;
+  sz := (Int64(n) + pgsz - 1) and not Int64(pgsz - 1);
+  if sz = 0 then a := PAnsiChar(sqlite3_malloc64(1))
+  else a := PAnsiChar(sqlite3_malloc64(u64(sz)));
+  if a = nil then goto readHexDb_error;
+  FillChar(a^, sz, 0);
+  iOffset := 0;
+  Inc(errLine);
+  while takeLine do begin
+    Inc(errLine);
+    j := 0;
+    rcSscanf := SScanf(zLine, '| page %d offset %d', [@j, @iOffset]);
+    if rcSscanf >= 2 then Continue;
+    if Copy(zLine, 1, 6) = '| end ' then Break;
+    rcSscanf := SScanf(zLine,
+      '| %d: %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x %x',
+      [@j, @x[0], @x[1], @x[2], @x[3], @x[4], @x[5], @x[6], @x[7],
+       @x[8], @x[9], @x[10], @x[11], @x[12], @x[13], @x[14], @x[15]]);
+    if rcSscanf = 17 then begin
+      iOff := iOffset + j;
+      if (iOff + 16 <= sz) and (iOff >= 0) then
+        for ii := 0 to 15 do
+          (a + iOff + ii)^ := AnsiChar(x[ii] and $FF);
+    end;
+  end;
+  if pnData <> nil then pnData^ := i32(sz);
+  Result := a;
+  Exit;
+
+readHexDb_error:
+  if a <> nil then sqlite3_free(a);
+  shellEPutZ(Format('Error on line %d of --hexdb input'#10, [errLine]));
+end;
+
 { Open the database connection backing p^ if not already open.  Mirrors
   open_db (shell.c.in:6745..) at the level needed by the dispatcher
   skeleton: --readonly / --create / default SQLITE_OPEN_READWRITE|
   SQLITE_OPEN_CREATE. }
 procedure openDb(p: PShellState; keepAlive: i32);
 var
-  flags: i32;
-  rc:    i32;
-  zErr:  PAnsiChar;
+  flags:  i32;
+  rc:     i32;
+  zErr:   PAnsiChar;
+  zSql:   PAnsiChar;
+  nData:  i32;
+  aData:  PAnsiChar;
+  szMaxLocal: i64;
 begin
   if p^.db <> nil then Exit;
   if p^.pAuxDb^.zDbFilename = nil then Exit;
   flags := p^.openFlags;
   if (flags and (SQLITE_OPEN_READONLY or SQLITE_OPEN_READWRITE)) = 0 then
     flags := flags or SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE;
-  rc := sqlite3_open_v2(p^.pAuxDb^.zDbFilename, @p^.db, flags, nil);
+  { shell.c.in:4491..4510 — dispatch on openMode.  ZIPFILE opens an in-memory
+    db (the zipfile vtab carries the file); DESERIALIZE/HEXDB also open a
+    private temp db then sqlite3_deserialize() swaps the slurped bytes in.
+    APPENDVFS passes the filename through the apndvfs shim. }
+  case p^.openMode of
+    SHELL_OPEN_APPENDVFS:
+      rc := sqlite3_open_v2(p^.pAuxDb^.zDbFilename, @p^.db, flags, 'apndvfs');
+    SHELL_OPEN_HEXDB, SHELL_OPEN_DESERIALIZE:
+      rc := sqlite3_open(nil, @p^.db);
+    SHELL_OPEN_ZIPFILE:
+      rc := sqlite3_open(':memory:', @p^.db);
+  else
+    rc := sqlite3_open_v2(p^.pAuxDb^.zDbFilename, @p^.db, flags, nil);
+  end;
   if (rc <> SQLITE_OK) or (p^.db = nil) then begin
     zErr := nil;
     if p^.db <> nil then zErr := sqlite3_errmsg(p^.db);
@@ -1088,6 +1244,41 @@ begin
     from ext/recover/dbdata.c (1023 C lines).  Reads raw b-tree page bytes
     via sqlite_dbpage; backing storage for the upcoming .recover dot-cmd. }
   sqlite3DbdataRegister(p^.db);
+  { 10.1.102 — shell.c.in:4613..4644 post-open block for ZIPFILE / DESERIALIZE
+    / HEXDB modes.  ZIPFILE attaches a `zip` vtab over the filename;
+    DESERIALIZE/HEXDB slurp the file (or hex dump) and hand the buffer to
+    sqlite3_deserialize() with FREEONCLOSE|RESIZEABLE. }
+  case p^.openMode of
+    SHELL_OPEN_ZIPFILE: begin
+      zSql := sqlite3PfMprintf(
+        PAnsiChar('CREATE VIRTUAL TABLE zip USING zipfile(%Q);'),
+        [p^.pAuxDb^.zDbFilename]);
+      if zSql <> nil then begin
+        sqlite3_exec(p^.db, zSql, nil, nil, nil);
+        sqlite3_free(zSql);
+      end;
+    end;
+    SHELL_OPEN_DESERIALIZE, SHELL_OPEN_HEXDB: begin
+      nData := 0;
+      if p^.openMode = SHELL_OPEN_DESERIALIZE then
+        aData := shellReadFile(p^.pAuxDb^.zDbFilename, @nData)
+      else
+        aData := shellReadHexDb(p, @nData);
+      if aData <> nil then begin
+        rc := sqlite3_deserialize(p^.db, 'main', Pu8(aData),
+                i64(nData), i64(nData),
+                u32(SQLITE_DESERIALIZE_RESIZEABLE
+                    or SQLITE_DESERIALIZE_FREEONCLOSE));
+        if rc <> 0 then
+          shellEPutZ(Format('Error: sqlite3_deserialize() returns %d'#10, [rc]));
+        if p^.szMax > 0 then begin
+          szMaxLocal := p^.szMax;
+          sqlite3_file_control(p^.db, 'main', SQLITE_FCNTL_SIZE_LIMIT,
+                               @szMaxLocal);
+        end;
+      end;
+    end;
+  end;
 end;
 
 procedure closeDb(db: PTsqlite3);

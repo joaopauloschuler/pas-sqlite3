@@ -4491,15 +4491,42 @@ begin
   Result := pOut;
 end;
 
-{ memdb.c:839 — sqlite3_deserialize.  In the upstream build this would
-  ATTACH a fresh memdb VFS file and swap pData into its MemStore backing
-  buffer.  The memdb VFS is not yet ported here, so the operation cannot
-  succeed; mirror the SQLITE_OMIT_DESERIALIZE-equivalent semantics by
-  reporting SQLITE_ERROR.  The FREEONCLOSE flag still has to be honoured
-  on the failure path (memdb.c:903) so the caller's "we hand over the
-  buffer" contract remains intact. }
+{ memdb.c:734 — Translate (db, zSchema) to its backing MemFile, or nil if
+  the slot is not memdb-backed (or is a shared/named store).  Uses
+  sqlite3_file_control(FCNTL_FILE_POINTER) to grab the sqlite3_file*, then
+  matches its pMethods against the memdb_io_methods vtable. }
+function memdbFromDbSchema(db: PTsqlite3; zSchema: PAnsiChar): PMemFile;
+var
+  pFile:  Psqlite3_file;
+  rc:     i32;
+  pStore: PMemStore;
+begin
+  Result := nil;
+  pFile  := nil;
+  rc := sqlite3_file_control(db, zSchema, SQLITE_FCNTL_FILE_POINTER, @pFile);
+  if (rc <> SQLITE_OK) or (pFile = nil) then Exit;
+  if pFile^.pMethods <> Psqlite3_io_methods(sqlite3MemdbIoMethods) then Exit;
+  Result := PMemFile(pFile);
+  pStore := Result^.pStore;
+  sqlite3_mutex_enter(pStore^.pMutex);
+  if pStore^.zFName <> nil then Result := nil;
+  sqlite3_mutex_leave(pStore^.pMutex);
+end;
+
+{ memdb.c:839 — sqlite3_deserialize.  Faithful port: ATTACHes a fresh memdb
+  btree onto schema iDb (via the reopenMemdb flag honoured by attachFunc),
+  then swaps pData into the MemStore backing the new slot.  Honours
+  SQLITE_DESERIALIZE_FREEONCLOSE on the failure path. }
 function sqlite3_deserialize(db: PTsqlite3; zSchema: PAnsiChar;
   pData: Pu8; szDb, szBuf: i64; mFlags: u32): i32; cdecl;
+var
+  p:      PMemFile;
+  zSql:   PAnsiChar;
+  pStmt:  Pointer;
+  rc:     i32;
+  iDb:    i32;
+  pStore: PMemStore;
+  label end_deserialize;
 begin
 {$IFDEF SQLITE_ENABLE_API_ARMOR}
   if sqlite3SafetyCheckOk(db) = 0 then begin
@@ -4509,10 +4536,55 @@ begin
     Result := SQLITE_MISUSE; Exit;
   end;
 {$ENDIF}
+  pStmt := nil;
+  sqlite3_mutex_enter(db^.mutex);
+  if zSchema = nil then zSchema := db^.aDb[0].zDbSName;
+  iDb := sqlite3FindDbName(db, zSchema);
+  if (iDb < 2) and (iDb <> 0) then begin
+    rc := SQLITE_ERROR;
+    goto end_deserialize;
+  end;
+  zSql := sqlite3MPrintf(db, 'ATTACH x AS %Q', [zSchema]);
+  if zSql = nil then begin
+    rc := SQLITE_NOMEM;
+  end else begin
+    rc := sqlite3_prepare_v2(db, zSql, -1, @pStmt, nil);
+    sqlite3DbFree(db, zSql);
+  end;
+  if rc <> SQLITE_OK then goto end_deserialize;
+  db^.init.iDb := u8(iDb);
+  { Set reopenMemdb bit (Tsqlite3InitInfo.flags bit 2 = $04).  attachFunc
+    branches on this to replace the existing slot's pBt with a memdb btree
+    rather than growing aDb[]. }
+  db^.init.flags := db^.init.flags or u8($04);
+  rc := sqlite3_step(PVdbe(pStmt));
+  db^.init.flags := db^.init.flags and not u8($04);
+  if rc <> SQLITE_DONE then begin
+    rc := SQLITE_ERROR;
+    goto end_deserialize;
+  end;
+  p := memdbFromDbSchema(db, zSchema);
+  if p = nil then begin
+    rc := SQLITE_ERROR;
+  end else begin
+    pStore := p^.pStore;
+    pStore^.aData    := pData;
+    pData            := nil;
+    pStore^.sz       := szDb;
+    pStore^.szAlloc  := szBuf;
+    pStore^.szMax    := szBuf;
+    if pStore^.szMax < sqlite3GlobalConfig.mxMemdbSize then
+      pStore^.szMax := sqlite3GlobalConfig.mxMemdbSize;
+    pStore^.mFlags   := mFlags;
+    rc := SQLITE_OK;
+  end;
+end_deserialize:
+  if pStmt <> nil then sqlite3_finalize(PVdbe(pStmt));
   if (pData <> nil)
      and ((mFlags and SQLITE_DESERIALIZE_FREEONCLOSE) <> 0) then
     sqlite3_free(pData);
-  Result := SQLITE_ERROR;
+  sqlite3_mutex_leave(db^.mutex);
+  Result := rc;
 end;
 
 { ----------------------------------------------------------------------

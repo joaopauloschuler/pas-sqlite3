@@ -139,6 +139,10 @@ type
 function  sqlite3MemdbInit: i32;
 function  sqlite3IsMemdb(pVfs: Psqlite3_vfs): i32;
 
+{ Expose the memdb I/O methods vtable address so memdbFromDbSchema (defined
+  in passqlite3main.pas) can recognise a MemFile by its pMethods pointer. }
+function  sqlite3MemdbIoMethods: Pointer;
+
 { SQLITE_DESERIALIZE_* flags (sqlite3.h) }
 const
   SQLITE_DESERIALIZE_FREEONCLOSE = 1;
@@ -1422,6 +1426,11 @@ function sqlite3IsMemdb(pVfs: Psqlite3_vfs): i32;
 begin
   if pVfs = @memdb_vfs then Result := 1
   else Result := 0;
+end;
+
+function sqlite3MemdbIoMethods: Pointer;
+begin
+  Result := @memdb_io_methods;
 end;
 
 { memdb.c ~765: sqlite3MemdbInit -- register the memdb VFS }

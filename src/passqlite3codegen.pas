@@ -43229,6 +43229,47 @@ begin
   if zFile = nil then zFile := '';
   if zName = nil then zName := '';
 
+  { REOPEN_AS_MEMDB — attach.c:104..127.  When sqlite3_deserialize() sets
+    db->init.reopenMemdb=1, this routine does not ATTACH a new slot; it
+    closes the existing btree at db->init.iDb and replaces it with a fresh
+    memdb btree carrying an empty MemStore (which sqlite3_deserialize()
+    will then populate by swapping pData into pStore->aData). }
+  if (db^.init.flags and u8($04)) <> 0 then
+  begin
+    pVfs := sqlite3_vfs_find('memdb');
+    if pVfs = nil then
+    begin
+      rc := SQLITE_ERROR;
+      goto attach_error;
+    end;
+    pSlot := @db^.aDb[db^.init.iDb];
+    { sqlite3BtreeOpen filename "x"#0 — anonymous memdb (zFName=nil; the
+      VFS xOpen recognises ":memory:"-equivalent unnamed buffers). }
+    rc := sqlite3BtreeOpen(pVfs, 'x'#0, Psqlite3(db),
+      PPBtree(@pSlot^.pBt), 0, SQLITE_OPEN_MAIN_DB);
+    if rc = SQLITE_OK then
+    begin
+      pSlot^.pSchema := sqlite3SchemaGet(db, pSlot^.pBt);
+      if pSlot^.pSchema = nil then
+      begin
+        sqlite3BtreeClose(PBtree(pSlot^.pBt));
+        pSlot^.pBt := nil;
+        rc := SQLITE_NOMEM;
+      end;
+    end;
+    if rc <> SQLITE_OK then goto attach_error;
+    { Mirror the convergent block (attach.c:226..240) — clear
+      DBFLAG_SchemaKnownOk so the freshly-allocated empty Schema is
+      re-parsed on next use (after sqlite3_deserialize swaps the buffer
+      in).  Crucially: do NOT call sqlite3Init here — attach.c gates
+      that on !REOPEN_AS_MEMDB. }
+    sqlite3BtreeEnterAll(db);
+    db^.init.iDb := 0;
+    db^.mDbFlags := db^.mDbFlags and not u32(DBFLAG_SchemaKnownOk);
+    sqlite3BtreeLeaveAll(db);
+    Exit;
+  end;
+
   { Ceiling check: SQLite caps attached DBs at SQLITE_LIMIT_ATTACHED+2. }
   if db^.nDb >= db^.aLimit[SQLITE_LIMIT_ATTACHED] + 2 then
   begin
