@@ -27486,7 +27486,8 @@ begin
   if (p^.pSrc^.nSrc = 1)
      and ((p^.selFlags and SF_Distinct) = 0)
      and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
-          or (pDest^.eDest = SRT_Set))
+          or (pDest^.eDest = SRT_Set)
+          or (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo))
   then
   begin
     pItem := SrcListItems(p^.pSrc);
@@ -27632,6 +27633,31 @@ begin
         if pDest^.iSDParm2 > 0 then
           sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pDest^.iSDParm2, 0,
                                pDest^.iSdst, nResultCol);
+        sqlite3ReleaseTempReg(pParse, r1);
+      end
+      else if (pDest^.eDest = SRT_Fifo) or (pDest^.eDest = SRT_DistFifo) then
+      begin
+        { 10.1.48.c — disposal mirrors selectInnerLoop SRT_Fifo / SRT_DistFifo
+          arm (codegen.pas:21388..21410, select.c:1307..1352).  Fires when a
+          recursive-CTE setup query whose FROM clause is itself a (recursive)
+          CTE routes through this materialise arm — without it, the inner
+          CTE's eph cursor is never opened and OP_Rewind AVs.  Exercised by
+          recoverLostAndFound1Init's `used(page) AS (SELECT r FROM roots ...)`
+          shape. }
+        r1 := sqlite3GetTempReg(pParse);
+        r2 := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+        if pDest^.eDest = SRT_DistFifo then
+        begin
+          sqlite3VdbeAddOp4Int(v, OP_Found, pDest^.iSDParm + 1,
+                               sqlite3VdbeCurrentAddr(v) + 4, r1, 0);
+          sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm + 1, r1,
+                               pDest^.iSdst, nResultCol);
+        end;
+        sqlite3VdbeAddOp2(v, OP_NewRowid, pDest^.iSDParm, r2);
+        sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
+        sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+        sqlite3ReleaseTempReg(pParse, r2);
         sqlite3ReleaseTempReg(pParse, r1);
       end
       else
