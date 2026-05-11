@@ -76,16 +76,71 @@ FPC porting traps that recur often enough to call out up-front:
     **Sub-bug B (lateral join with hidden-arg pushdown) still open**:
     `SELECT s.name, f.* FROM sqlite_schema s, pragma_foreign_key_list(s.name) f`
     yields zero rows because `whereLoopAddVirtual`
-    (passqlite3codegen.pas:14094) is still a stub — the planner does
+    (passqlite3codegen.pas:14835) is still a stub — the planner does
     not call `xBestIndex` to push the lateral arg through to xFilter.
     Same gap also caps `generate_series(1,3)`, `json_each(blob)`,
     `fsdir(...)`, `zipfile(file)`, `wholenumber WHERE value<6`,
-    `completion('SE')`, etc.  Fix path: port where.c:1413..1701
-    (allocateIndexInfo / freeIdxStr / freeIndexInfo / vtabBestIndex)
-    plus the four-pass driver where.c:4357..4803
-    (whereLoopAddVirtualOne / whereLoopAddVirtual) and the
-    HiddenIndexInfo trailing struct.  Surfaces under
-    `.lint fkey-indexes` and bug 10.1.bug.39 `.recover`.
+    `completion('SE')`, etc.  Surfaces under `.lint fkey-indexes` and
+    bug 10.1.bug.39 `.recover`.
+
+    Subtasks (each lands independently; gate names are proposed):
+
+    - [ ] **6.13.B.1** Scout pass — confirm `TWhereLoop.u.vtab` already
+          carries `idxNum / idxStr / needFree / isOrdered / omitMask /
+          mHandleIn` slots (where.c:WhereLoop) and that
+          `TWhereLevel.p1/p2` plumbing for vtab is in place.  File a
+          short diff list of struct fields still missing.
+    - [ ] **6.13.B.2** Port `HiddenIndexInfo` trailing record
+          (where.c:31..47).  Owns the `pParse / pWC / eDistinct /
+          mIn / aRhs[]` payload appended after `sqlite3_index_info`.
+          Add the `WHEREINFO_HIDDENINDEXINFO_SIZE(N)` size helper.
+    - [ ] **6.13.B.3** Port `allocateIndexInfo` (where.c:1413..1539).
+          Walks the WhereClause, counts usable EQ/RANGE/LIKE/MATCH
+          terms against this cursor, allocates the contiguous
+          `sqlite3_index_info` + `HiddenIndexInfo` block, fills
+          `aConstraint[] / aOrderBy[] / mPrereq`.  Also handles the
+          colUsed and `idxFlags` defaults.
+    - [ ] **6.13.B.4** Port `freeIdxStr` + `freeIndexInfo`
+          (where.c:1604..1640).  Release `needToFreeIdxStr` and any
+          `aRhs[]` sqlite3_value handles owned by the trailing
+          HiddenIndexInfo.
+    - [ ] **6.13.B.5** Port `vtabBestIndex` (where.c:1648..1701).
+          Single xBestIndex dispatch with the right error-code
+          mapping (SQLITE_CONSTRAINT → no-plan; SQLITE_NOMEM bubble;
+          unknown rc → `sqlite3ErrorMsg`).  Returns the cost-bearing
+          IndexInfo so the caller can build a WhereLoop.
+    - [ ] **6.13.B.6** Port `whereLoopAddVirtualOne`
+          (where.c:4357..4540).  Marks one constraint subset as
+          `usable=1`, calls `vtabBestIndex`, then unmarshals
+          `aConstraintUsage[].argvIndex / omit` into a candidate
+          `WhereLoop` (aLTerm + nLTerm + prereq + rRun + nOut).
+          Honours `pBuilder^.pNew` reuse and `whereLoopInsert`
+          dedupe.
+    - [ ] **6.13.B.7** Port `whereLoopAddVirtual` four-pass driver
+          (where.c:4548..4803): (1) all-usable, (2) drop IN-handled
+          terms, (3) drop one usable term at a time
+          (dependency-bounded by mUnusable), (4) LIMIT/OFFSET hint
+          fallback.  Replace the stub at codegen.pas:14835.  Wire
+          the existing call sites at codegen.pas:14934 (whereLoopAddOr
+          vtab arm) and codegen.pas:15108 (whereLoopAddAll vtab arm)
+          remain unchanged — they already dispatch here.
+    - [ ] **6.13.B.8** Codegen — emit `OP_VFilter` from the chosen
+          vtab WhereLoop's `idxNum / idxStr / argvIndex` map inside
+          `sqlite3WhereCodeOneLoopStart` (the existing vtab arm
+          there currently runs blind because no plan ever lands).
+          Cross-check against the fast-arm at codegen.pas:26006 so
+          single-source eponymous-vtab queries stay byte-identical.
+    - [ ] **6.13.B.9** Gate — new differential test
+          `bin/TestVtabLateral` covering: `pragma_foreign_key_list`
+          lateral, `generate_series(1,3)` standalone + `WHERE
+          value<6`, `json_each(blob)` lateral, `fsdir(...)`,
+          `wholenumber WHERE value<6`, `completion('SE')`.  Diff
+          rows byte-for-byte against upstream `sqlite3`.
+    - [ ] **6.13.B.10** Close the dependants: flip
+          **10.1c.6** / **10.1.20** `.lint fkey-indexes` to `[X]`
+          once TestShellSchema picks up the new fkey-index hints,
+          and re-test the `.archive` / `.recover` arms tracked
+          under **10.1.46** / **10.1.48**.
 
 - [X] **6.10** TestExplainParity **1026/1026 PASS** as of 2026-05-06 (a3). All sub-steps (6/7/8/9/15/17) closed.
 - [X] **6.11** PRAGMA page_count + DROP TABLE remaining gap closed.
