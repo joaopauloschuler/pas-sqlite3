@@ -12868,9 +12868,16 @@ begin
     if (flags and MEM_Term) <> 0 then begin
       if enc = SQLITE_UTF8 then Inc(nAlloc) else Inc(nAlloc, 2);
     end;
-    if nAlloc < 32 then nAlloc := 32;
-    if sqlite3VdbeMemClearAndResize(pMem, i32(nAlloc)) <> 0 then begin
-      Result := SQLITE_NOMEM_BKPT; Exit;
+    { Mirror vdbemem.c:1338 — MAX(nAlloc,32) is the resize floor; the
+      memcpy still copies just nAlloc bytes (z is only that large). }
+    if nAlloc < 32 then begin
+      if sqlite3VdbeMemClearAndResize(pMem, 32) <> 0 then begin
+        Result := SQLITE_NOMEM_BKPT; Exit;
+      end;
+    end else begin
+      if sqlite3VdbeMemClearAndResize(pMem, i32(nAlloc)) <> 0 then begin
+        Result := SQLITE_NOMEM_BKPT; Exit;
+      end;
     end;
     Move(z^, pMem^.z^, nAlloc);
   end else begin

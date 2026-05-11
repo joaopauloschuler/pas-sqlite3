@@ -490,18 +490,13 @@ begin
     if SQLITE_ROW = sqlite3_step(pStmt) then begin
       aPg  := sqlite3_column_blob(pStmt, 0);
       nPgB := sqlite3_column_bytes(pStmt, 0);
-      { 10.1.48.c partial — recoverInstallWrapper rewrites page 1's
-        header bytes via recoverVfsRead's sanitization pass.  C
-        sqlite3recover.c:723 swaps the sanitized bytes for the cached
-        on-disk bytes (pPage1Disk) before returning, so subsequent
-        sqlite_dbdata/dbptr scans see the real b-tree header.  Pas:
-        adding that swap unblocks recoverCacheSchema (nCell populates,
-        recovery.schema lands two rows) but uncovers a use-after-free
-        further down the writeData pipeline (glibc `free(): invalid
-        pointer` after the first emitted INSERT).  Tracked as a
-        follow-up in tasklist; for now the un-swapped raw blob keeps
-        .recover stable on the lost_and_found fallback, which is what
-        DiagRecover gates today. }
+      { Mirror sqlite3recover.c:723 — when the wrapper-VFS sanitized
+        page 1 matches the cached recovered copy, swap in the
+        original on-disk bytes so sqlite_dbdata/dbptr see the real
+        b-tree header. }
+      if (pgno = 1) and (nPgB = p^.pgsz) and (p^.pPage1Cache <> nil)
+        and (CompareByte(p^.pPage1Cache^, aPg^, nPgB) = 0) then
+        aPg := p^.pPage1Disk;
       sqlite3_result_blob(pCtx, aPg, nPgB - p^.nReserve, SQLITE_TRANSIENT);
     end;
     recoverReset(p, pStmt);
@@ -768,8 +763,9 @@ begin
   pTab := p^.pTblList;
   while pTab <> nil do begin
     pNext := pTab^.pNext;
-    if pTab^.zTab <> nil then sqlite3_free(pTab^.zTab);
-    if pTab^.aCol <> nil then sqlite3_free(pTab^.aCol);
+    { aCol/zTab point inside the single pTab allocation (recoverAddTable
+      lays them out as &pTab[1] and after the aCol array) — don't free
+      them separately.  Mirrors sqlite3recover.c:2031..2034. }
     sqlite3_free(pTab);
     pTab := pNext;
   end;

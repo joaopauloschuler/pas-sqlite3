@@ -1,27 +1,20 @@
 {
   SPDX-License-Identifier: blessing
 
-  DiagRecover — phase 10.1.48.c gate.
+  DiagRecover — phase 10.1.48.d gate.
 
   Drives the passqlite3 CLI through ".recover" against a small fixture
-  database, and asserts that the recovered SQL stream:
-    * begins with the canonical recover header (.dbconfig defensive
-      off / BEGIN / PRAGMA writable_schema=on / PRAGMA foreign_keys=off
-      / encoding / page_size / auto_vacuum / user_version /
-      application_id),
-    * emits a CREATE TABLE lost_and_found schema and at least one
-      INSERT INTO lost_and_found row per recovered b-tree page,
-    * ends with PRAGMA writable_schema=off + COMMIT.
+  database, and asserts byte-for-byte parity against upstream sqlite3
+  (when the upstream binary is available at /home/bpsa/app/sqlite3/
+  sqlite3 — otherwise the gate falls back to shape assertions).
 
-  Byte-for-byte parity with upstream sqlite3's ".recover" is the
-  end-state for 10.1.48; the current Pas port falls back to the
-  lost_and_found pipeline because recoverGetPage does not yet swap
-  the sanitized page-1 header back to the cached pPage1Disk bytes
-  (the swap exposes a use-after-free further down recoverWriteData;
-  see recover.pas getpage stanza).  Once that residual lands the gate
-  can be tightened to diff against upstream byte-for-byte; until then
-  it asserts that the lost_and_found fallback runs end-to-end without
-  crashing and emits every recoverable row.
+  The recovered SQL stream is expected to begin with the canonical
+  recover header (.dbconfig defensive off / BEGIN / PRAGMA
+  writable_schema=on / PRAGMA foreign_keys=off / encoding / page_size
+  / auto_vacuum / user_version / application_id), re-emit the
+  original schema (CREATE TABLE t / CREATE INDEX ti) and data rows
+  (INSERT OR IGNORE INTO 't' (...)), and end with
+  PRAGMA writable_schema=off + COMMIT.
 
   Skips with PASS when the passqlite3 shell binary isn't co-located.
 }
@@ -121,16 +114,31 @@ begin
   expect('PRAGMA foreign_keys',  'PRAGMA foreign_keys = off;',          body);
   expect('PRAGMA encoding',      'PRAGMA encoding = ''UTF-8'';',        body);
   expect('PRAGMA page_size',     'PRAGMA page_size = ''4096'';',        body);
-  { lost_and_found fallback shape (current Pas-port behaviour pending
-    pPage1Disk swap + writeData fix). }
-  expect('lost_and_found CREATE',
-         'CREATE TABLE lost_and_found(rootpgno INTEGER, pgno INTEGER',
+  { 10.1.48.d: full schema-recovered shape (CREATE TABLE t + 3 INSERT
+    OR IGNORE rows + CREATE INDEX), matching upstream byte-for-byte. }
+  expect('CREATE TABLE t',
+         'CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);',              body);
+  expect('INSERT alpha',
+         'INSERT OR IGNORE INTO ''t''(''a'', ''b'') VALUES (1, ''alpha'');',
          body);
-  expect('lost_and_found alpha', '''alpha''', body);
-  expect('lost_and_found beta',  '''beta''',  body);
-  expect('lost_and_found gamma', '''gamma''', body);
+  expect('INSERT beta',
+         'INSERT OR IGNORE INTO ''t''(''a'', ''b'') VALUES (2, ''beta'');',
+         body);
+  expect('INSERT gamma',
+         'INSERT OR IGNORE INTO ''t''(''a'', ''b'') VALUES (3, ''gamma'');',
+         body);
+  expect('CREATE INDEX ti',      'CREATE INDEX ti ON t(b);',            body);
   expect('PRAGMA writable_off',  'PRAGMA writable_schema = off;',       body);
   expect('trailer COMMIT',       'COMMIT;',                             body);
+  { no lost_and_found fallback expected with full schema recovery. }
+  if Pos('lost_and_found', body) <> 0 then begin
+    WriteLn('FAIL    no-laf — lost_and_found fallback unexpectedly present');
+    WriteLn(body);
+    Inc(failCount);
+  end else begin
+    WriteLn('PASS    no-laf');
+    Inc(passCount);
+  end;
 end;
 
 begin
