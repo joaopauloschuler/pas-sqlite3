@@ -1991,11 +1991,19 @@ procedure emitColumnar(var rs: TRenderState; pStmt: PVdbe; firstRow: AnsiString)
 { Buffer all remaining rows (`firstRow` already consumed via column-text
   capture) and emit per-mode in MODE_Column / MODE_Table / MODE_Box.
   `firstRow` is unused — kept for signature symmetry; the caller passes
-  '' and we read the current row from pStmt before stepping further. }
+  '' and we read the current row from pStmt before stepping further.
+
+  Per-cell alignment follows upstream qrf.c:1995/1514: each cell remembers
+  its own SQLite type and renders right-aligned when INTEGER or FLOAT,
+  left-aligned otherwise.  A negative `.width N` overrides at the column
+  level and forces right-align regardless of types (qrf.c:1696). }
 var
-  matrix: array of array of AnsiString;
-  headers: array of AnsiString;
-  widths: array of i32;
+  matrix:    array of array of AnsiString;
+  cellRight: array of array of Boolean;
+  headers:   array of AnsiString;
+  widths:    array of i32;
+  forceRight: array of Boolean;
+  ty: i32;
   i, c, w, rc, nCol: i32;
   nRowBuf: i32;
   rcStep: i32;
@@ -2014,50 +2022,63 @@ begin
   isCol   := rs.p^.mode.eMode = MODE_Column;
   isMd    := rs.p^.mode.eMode = MODE_Markdown;
 
-  SetLength(headers, nCol);
-  SetLength(widths,  nCol);
+  SetLength(headers,    nCol);
+  SetLength(widths,     nCol);
+  SetLength(forceRight, nCol);
   for i := 0 to nCol - 1 do begin
-    headers[i] := colNameStr(pStmt, i);
-    widths[i]  := utf8DispWidth(headers[i]);
+    headers[i]    := colNameStr(pStmt, i);
+    widths[i]     := utf8DispWidth(headers[i]);
+    forceRight[i] := False;
   end;
 
-  { User-supplied minimum widths via .width.  C uses the absolute value
-    for the cell padding; sign decides alignment (negative = left).
-    We honour magnitude here; alignment defaults match upstream
-    (text=left, numeric=right) but our per-cell text capture is
-    type-erased after sqlite3_column_text, so simplify to left-align
-    for now (matches upstream's MODE_Column when no .width is set). }
-  for i := 0 to nCol - 1 do
-    if (rs.p^.mode.spec.aWidth <> nil) and (i < rs.p^.mode.spec.nWidth) then begin
-      w := Abs(rs.p^.mode.spec.aWidth[i]);
-      if w > widths[i] then widths[i] := w;
-    end;
+  { .width is applied below, after row capture, so a negative .width can
+    override the type-derived alignment without being clobbered by it. }
 
   { Buffer rows.  Start with the row already at pStmt (caller stepped to
     SQLITE_ROW once, then handed off without emitting). }
   nRowBuf := 0;
-  SetLength(matrix, 16);
-  SetLength(matrix[0], nCol);
+  SetLength(matrix,    16);
+  SetLength(cellRight, 16);
+  SetLength(matrix[0],    nCol);
+  SetLength(cellRight[0], nCol);
   for c := 0 to nCol - 1 do begin
     matrix[0, c] := colCellText(pStmt, c, rs.zNull);
     w := utf8DispWidth(matrix[0, c]);
     if w > widths[c] then widths[c] := w;
+    ty := sqlite3_column_type(pStmt, c);
+    cellRight[0, c] := (ty = SQLITE_INTEGER) or (ty = SQLITE_FLOAT);
   end;
   nRowBuf := 1;
 
   while True do begin
     rcStep := sqlite3_step(pStmt);
     if rcStep <> SQLITE_ROW then Break;
-    if nRowBuf >= Length(matrix) then SetLength(matrix, Length(matrix) * 2);
-    SetLength(matrix[nRowBuf], nCol);
+    if nRowBuf >= Length(matrix) then begin
+      SetLength(matrix,    Length(matrix)    * 2);
+      SetLength(cellRight, Length(cellRight) * 2);
+    end;
+    SetLength(matrix[nRowBuf],    nCol);
+    SetLength(cellRight[nRowBuf], nCol);
     for c := 0 to nCol - 1 do begin
       matrix[nRowBuf, c] := colCellText(pStmt, c, rs.zNull);
       w := utf8DispWidth(matrix[nRowBuf, c]);
       if w > widths[c] then widths[c] := w;
+      ty := sqlite3_column_type(pStmt, c);
+      cellRight[nRowBuf, c] := (ty = SQLITE_INTEGER) or (ty = SQLITE_FLOAT);
     end;
     Inc(nRowBuf);
   end;
   rs.lastStepRc := rcStep;
+
+  { User-supplied minimum widths via .width.  C uses the absolute value
+    for the cell padding; a negative .width forces right-align for every
+    cell in the column regardless of type (qrf.c:1696). }
+  for i := 0 to nCol - 1 do
+    if (rs.p^.mode.spec.aWidth <> nil) and (i < rs.p^.mode.spec.nWidth) then begin
+      w := Abs(rs.p^.mode.spec.aWidth[i]);
+      if w > widths[i] then widths[i] := w;
+      if rs.p^.mode.spec.aWidth[i] < 0 then forceRight[i] := True;
+    end;
 
   { Glyphs. }
   if isBox then begin
@@ -2189,7 +2210,12 @@ begin
       for c := 0 to nCol - 1 do begin
         if c > 0 then Write(glyphVB);
         Write(' ');
-        padCell(matrix[rc, c], widths[c]);
+        w := widths[c] - utf8DispWidth(matrix[rc, c]);
+        if (cellRight[rc, c] or forceRight[c]) and (w > 0) then
+          Write(StringOfChar(' ', w));
+        Write(matrix[rc, c]);
+        if (not (cellRight[rc, c] or forceRight[c])) and (w > 0) then
+          Write(StringOfChar(' ', w));
         Write(' ');
       end;
       WriteLn(glyphVB);
@@ -2202,9 +2228,12 @@ begin
       sb := '';
       for c := 0 to nCol - 1 do begin
         if c > 0 then sb := sb + '  ';
-        sb := sb + matrix[rc, c];
         w := widths[c] - utf8DispWidth(matrix[rc, c]);
-        if (c < nCol - 1) and (w > 0) then
+        if (cellRight[rc, c] or forceRight[c]) and (w > 0) then
+          sb := sb + StringOfChar(' ', w);
+        sb := sb + matrix[rc, c];
+        if (not (cellRight[rc, c] or forceRight[c]))
+           and (c < nCol - 1) and (w > 0) then
           sb := sb + StringOfChar(' ', w);
       end;
       while (Length(sb) > 0) and (sb[Length(sb)] = ' ') do

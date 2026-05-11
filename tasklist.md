@@ -142,17 +142,17 @@ partial landings cannot silently no-op.
 
 ### 10.1b Output modes + formatting controls
 
-- [ ] **10.1b** Output modes + formatting controls. Gate: `tests/cli/10b_modes/`.
-  - [ ] **10.1b.1** `.mode` (list, line, column, csv, tabs, html, insert, quote, json, markdown, table, box, tcl, ascii)
-  - [ ] **10.1b.2** `.headers`
-  - [ ] **10.1b.3** `.separator`
-  - [ ] **10.1b.4** `.nullvalue`
-  - [ ] **10.1b.5** `.width`
-  - [ ] **10.1b.6** `.echo`
-  - [ ] **10.1b.7** `.changes`
-  - [ ] **10.1b.8** `.print` / `.parameter` (formatting-only subset), Unicode-width helpers, box-drawing renderer
+- [X] **10.1b** Output modes + formatting controls. Gate: `bin/TestShellModes` diffs the port byte-for-byte against the upstream `sqlite3` binary across every `.mode` plus `.headers/.separator/.nullvalue/.width/.print`.
+  - [X] **10.1b.1** `.mode` (list, line, column, csv, tabs, html, insert, quote, json, markdown, table, box, tcl, ascii)
+  - [X] **10.1b.2** `.headers`
+  - [X] **10.1b.3** `.separator`
+  - [X] **10.1b.4** `.nullvalue`
+  - [X] **10.1b.5** `.width`
+  - [X] **10.1b.6** `.echo`
+  - [X] **10.1b.7** `.changes`
+  - [X] **10.1b.8** `.print` / `.parameter` (formatting-only subset), Unicode-width helpers, box-drawing renderer
 
-- [X] **10.1.7..10.1.14** `.mode` dispatcher, shell_callback row dispatcher, columnar renderers (Column/Table/Markdown/Box), `.headers/.separator/.nullvalue/.echo/.changes/.width` setters, `.print/.parameter`, CSV/JSON/HTML writer helpers all landed. Gate work for 10.1b still TODO.
+- [X] **10.1.7..10.1.14** `.mode` dispatcher, shell_callback row dispatcher, columnar renderers (Column/Table/Markdown/Box), `.headers/.separator/.nullvalue/.echo/.changes/.width` setters, `.print/.parameter`, CSV/JSON/HTML writer helpers all landed.
 
 ### 10.1c Schema introspection dot-commands
 
