@@ -32,20 +32,20 @@
       Tsqlite3_module from passqlite3vtab) so trampoline cdecl entries
       can be assigned without casts.
 
-  Known limitation (NOT a defect in this unit):
+  (closed by 6.13.B.11)
 
-    The expert engine relies on virtual-table xBestIndex pushdown to
-    capture WHERE/ORDER-BY references against the synthetic schema
-    mirror in dbv.  In the current Pascal port, eTabType for a vtab
-    re-published through OP_ParseSchema after CREATE VIRTUAL TABLE
-    surfaces as TABTYP_TABLE (=0) in the WHERE planner, so
-    whereLoopAddAll routes through whereLoopAddBtree instead of
-    whereLoopAddVirtual — xBestIndex is never invoked and pScan stays
-    empty.  Consequence: sqlite3_expert_analyze runs end-to-end but
-    proposes no candidate indexes ("(no new indexes)").  Closing this
-    requires fixing the vtab/eTabType reload path in
-    passqlite3main.execParseSchemaImpl + sqlite3InitCallback; once
-    that lands the unit becomes useful without further changes.
+    Earlier bisects pointed at an eTabType-after-OP_ParseSchema reload
+    bug.  Tracing showed eTabType for the re-published vtab is in fact
+    TABTYP_VTAB at hash-insert time; the actual surface was the
+    eponymous-vtab fast arm in sqlite3Select firing unconditionally for
+    every single-source vtab SELECT.  That arm has no WHERE/ORDER BY
+    pushdown — it emits OP_VOpen + OP_VFilter(idxNum=0, argc=0) and
+    relies on post-filter — so xBestIndex never saw the constraints and
+    pScan stayed empty.  The fix in passqlite3codegen.sqlite3Select
+    restricts the fast arm to the simple "SELECT ... FROM <vtab>" shape
+    (no pWhere/pOrderBy/pGroupBy/pHaving/pLimit) and lets every other
+    shape fall through to sqlite3WhereBegin → whereLoopAddVirtual
+    (Phase 6.13.B.7), which drives vtabBestIndex productively.
 }
 {$I passqlite3.inc}
 unit passqlite3expert;

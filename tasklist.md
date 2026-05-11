@@ -194,10 +194,18 @@ FPC porting traps that recur often enough to call out up-front:
           SELECT list).  Track that under a new bug; it is not on
           the GROUP BY path.
 
-    - [ ] **6.13.B.11** Preserve `eTabType=TABTYP_VTAB` across the
-          `CREATE VIRTUAL TABLE` → `OP_ParseSchema` round-trip so
-          subsequent prepares on the same connection route through
-          `whereLoopAddVirtual` instead of `whereLoopAddBtree`.
+    - [X] **6.13.B.11** Eponymous-vtab fast arm in sqlite3Select was
+          firing for every single-source vtab SELECT, bypassing
+          sqlite3WhereBegin → whereLoopAddVirtual.  Restricted the arm
+          to the bare "SELECT ... FROM <vtab>" shape (no
+          pWhere/pOrderBy/pGroupBy/pHaving/pLimit); everything else now
+          falls through to the productive planner and drives
+          vtabBestIndex.  `.expert` produces the expected
+          `CREATE INDEX t1_idx_033e95fe ON t1(a, b, c)` plus the
+          `SEARCH t1 USING INDEX ...` plan, byte-identical with
+          upstream.  (The eTabType-after-reload hypothesis in the
+          original entry was a red herring — eTabType is correctly
+          TABTYP_VTAB at hash-insert time.)
 
           Repro (smallest):
 

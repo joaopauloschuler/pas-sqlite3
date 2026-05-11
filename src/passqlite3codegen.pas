@@ -26891,6 +26891,20 @@ begin
     pTab  := pItem^.pSTab;
     if (pTab <> nil) and (pTab^.eTabType = TABTYP_VTAB)
        and ((pItem^.fg.fgBits and SRCITEM_FG_IS_SUBQUERY) = 0)
+       { Phase 6.13.B.11 — leave WHERE/ORDER BY/GROUP BY/HAVING/LIMIT
+         shapes to the full sqlite3WhereBegin → whereLoopAddVirtual path
+         so xBestIndex sees the constraints.  This eponymous arm only
+         handles the simple "SELECT ... FROM <vtab>" / TVF-args shape
+         and does NOT push WHERE constraints into xBestIndex; falling
+         through here was silently degrading every WHERE-bearing query
+         (the `.expert` pipeline, fts MATCH, rtree range scans, ...) to
+         "scan everything in xFilter, post-filter".  whereLoopAddVirtual
+         (Phase 6.13.B.7) now drives the productive bestIndex pushdown. }
+       and (p^.pWhere = nil)
+       and (p^.pOrderBy = nil)
+       and (p^.pGroupBy = nil)
+       and (p^.pHaving = nil)
+       and (p^.pLimit = nil)
     then
     begin
       v := sqlite3GetVdbe(pParse);
