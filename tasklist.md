@@ -364,6 +364,68 @@ FPC porting traps that recur often enough to call out up-front:
       calls only re-stamp iVersion / szOsFile / pAppData (matching C's
       static struct-literal apnd_vfs in appendvfs.c:177).
 
+- [ ] **6.20** Shim-VFS re-init chain corruption — latent twin of 6.19.
+      `sqlite3AppendvfsInit` had `FillChar(apnd_vfs, 0)` + per-field
+      stamping on every call, which zeroes `pNext` while the VFS is
+      already linked and severs the list.  6.19 fixed `apnd_vfs`; the
+      same pattern still ships in four sibling shims and will corrupt
+      the VFS chain if any of their init functions is invoked a second
+      time while already registered:
+      - `cksm_vfs` — passqlite3cksumvfs.pas:687
+      - `vstat_vfs` — passqlite3vfsstat.pas:714
+      - `tmstmp_vfs` — passqlite3tmstmpvfs.pas:776
+      - `vlog_vfs` — passqlite3vfslog.pas:848
+      None surface in the current regression suite (each shim only
+      registers once today).  Repro path is the same shape as 6.19:
+      anything that re-invokes one of these initialisers after the VFS
+      is in the chain (e.g. an extension `.load` that re-runs the
+      activator) would drop every VFS after it.  Fix per shim: copy
+      6.19's `gApndvfsInitialised` Boolean guard so the FillChar +
+      per-field stamping runs exactly once, mirroring C's
+      static-struct-literal idiom.
+
+- [ ] **6.21** `-memtrace` is silent — `sqlite3Malloc`
+      (passqlite3util.pas:2417) calls `sqlite3_malloc` directly instead
+      of dispatching through `sqlite3GlobalConfig.m.xMalloc`, so the
+      memtrace trampoline installed via SQLITE_CONFIG_MALLOC is never
+      reached.  6.18 made the trampoline plumbing safe (no more AV) but
+      no MEMTRACE lines are emitted.  C oracle: `sqlite3Malloc` in
+      `../sqlite3/src/malloc.c` routes every allocation through
+      `mem0.alloc(nByte)` / the installed `xMalloc` slot.  The Pascal
+      port short-circuits to its own allocator regardless of what
+      SQLITE_CONFIG_MALLOC installed.  Fix: route allocations through
+      the methods table.  Same routing gap likely affects `sqlite3_free`
+      / `sqlite3Realloc` / size accounting — audit while there.
+
+- [ ] **6.22** Safe-mode error-prefix gap — `data.zErrPrefix = zErrCtx`
+      plumbing not ported.  When a dot-command is supplied via argv
+      (e.g. `bin/passqlite3 -safe ":memory:" ".import |echo 1 t"`),
+      upstream prints `argv[N]: cannot run .import in safe mode` because
+      shell.c.in:13544 sets `data.zErrPrefix = zErrCtx` before
+      dispatching the argv-sourced command.  The Pascal port emits the
+      stdin-style `line N:` / `<file>:N:` prefix even for argv input.
+      Error-message text itself is byte-identical; only the location
+      prefix diverges.  Surfaced 2026-05-11 during 10.1.24.b
+      verification.  Fix: port the argv-prefix swap in
+      `process_command_line` / `main` (locate by grepping
+      `zErrPrefix` in shell.c.in) and mirror it in the Pascal
+      `processCommandLine` arg dispatcher.
+
+- [ ] **6.23** `sqlite3_open_v2` doesn't honor `file:` URI filenames.
+      Surfaced 2026-05-11 during 10.1.27.d verification: with the new
+      URI-aware `--new` deletion working, `.open --new
+      'file:/tmp/newdb?mode=rwc'` correctly unlinks the target, but the
+      subsequent `openDb` fails with `unable to open database file`
+      because the Pascal `sqlite3_open_v2` doesn't peel URIs.  Same
+      failure when passing a `file:` URI as the top-level filename on
+      the command line.  C oracle: `sqlite3_open_v2` in
+      `../sqlite3/src/main.c` (search for `SQLITE_OPEN_URI` and
+      `sqlite3ParseUri`).  Fix: port `sqlite3ParseUri` (if missing) and
+      wire it into the open path so URI filenames, query parameters
+      (`mode=`, `cache=`, `nolock=`, `psow=`, `immutable=`, `vfs=`), and
+      flag interactions match upstream.  Likely also unblocks other
+      URI-dependent gates.
+
 - [X] **6.10** TestExplainParity closed.
 - [X] **6.11** PRAGMA page_count + DROP TABLE remaining gap closed.
 - [X] **6.12** sqlite3Pragma full port; DiagPragma all PASS.
