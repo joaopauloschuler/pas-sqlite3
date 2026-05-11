@@ -351,32 +351,18 @@ FPC porting traps that recur often enough to call out up-front:
       configured `sqlite3GlobalConfig.m.x*` vtable — a separate porting
       gap, not part of 6.18.
 
-- [ ] **6.19** `sqlite3_deserialize` returns `SQLITE_ERROR` from the
-      `openDb` post-open switch.  Surfaced 2026-05-11 by **10.1.27.b**
-      (the new `.open --deserialize FILE` flag arm in `cmdOpen`).
-      Repro:
-      ```
-      /home/bpsa/app/sqlite3/sqlite3 /tmp/d.db \
-        "CREATE TABLE t(x); INSERT INTO t VALUES(42);"
-      bin/passqlite3 ":memory:" ".open --deserialize /tmp/d.db" \
-                                "SELECT x FROM t;"
-      ```
-      → `Error: sqlite3_deserialize() returns 1`.  Failure is in the
-      existing 10.1.102 post-open switch arm at
-      `src/passqlite3shell.pas:1266..1284`, not in the parser code
-      touched by 10.1.27.b — the parser correctly sets
-      `openMode = SHELL_OPEN_DESERIALIZE` and reaches that arm.
-      Suspect chain (verify in order): (1) `shellReadFile` is returning
-      bytes in a flag/length combination that `sqlite3_deserialize`
-      rejects (the `SQLITE_DESERIALIZE_*` flag bits are sensitive to
-      `FREEONCLOSE` + buffer ownership); (2) the in-memory pager isn't
-      switching schemas before the SELECT runs (compare against
-      memdb.c:839..928 — the `reopenMemdb` arm in attachFunc ported
-      under 10.1.102 may not be firing for the *main* db handle when
-      `.open --deserialize` reuses an existing connection rather than
-      attaching).  C oracle: `shell.c.in:4496..4510` (the corresponding
-      `case SHELL_OPEN_DESERIALIZE:` arm) and `memdb.c:839..928`.
-      Blocks closing 10.1.27.
+- [X] **6.19** `.open --deserialize` now works (repro prints `42`).  Root
+      cause: `sqlite3AppendvfsInit` (passqlite3appendvfs.pas) did
+      `FillChar(apnd_vfs, 0)` + per-field reinit on *every* call.  When
+      apnd_vfs was already linked in the VFS list, FillChar zeroed its
+      `pNext` field BEFORE vfs_register's vfsUnlink walked the chain,
+      severing the list after apnd_vfs and dropping every subsequent
+      VFS — notably `memdb`.  attachFunc's reopen-as-memdb arm then
+      could not `sqlite3_vfs_find("memdb")` and aborted; OP_VTab returned
+      SQLITE_ERROR, deserialize bubbled it out.  Fix: gate the one-time
+      vtable init behind a `gApndvfsInitialised` Boolean so subsequent
+      calls only re-stamp iVersion / szOsFile / pAppData (matching C's
+      static struct-literal apnd_vfs in appendvfs.c:177).
 
 - [X] **6.10** TestExplainParity closed.
 - [X] **6.11** PRAGMA page_count + DROP TABLE remaining gap closed.
