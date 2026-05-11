@@ -484,17 +484,61 @@ partial landings cannot silently no-op.
 
 ### 10.1d Data I/O dot-commands
 
-- [ ] **10.1d** Gate: `tests/cli/10d_io/`.
-  - [ ] **10.1d.1** `.read` (CSV/ASCII)
-  - [ ] **10.1d.2** `.dump` (CSV/ASCII)
-  - [ ] **10.1d.3** `.import` (CSV/ASCII)
-  - [ ] **10.1d.4** `.output` / `.once`
-  - [ ] **10.1d.5** `.save`
-  - [ ] **10.1d.6** `.open`
+- [~] **10.1d** Most subcommands landed under 10.1.22..10.1.27; remaining
+      work is the `.import` heredoc/pipe input arms, the `.open` flag
+      wire-up to the 10.1.102 helpers, and the gate.  No external
+      dependencies — `appendvfs` (10.1.84), `zipfile` (10.1.98) and the
+      `sqlite3_deserialize` + `openDb` switch (10.1.102) are all `[X]`.
+  - [X] **10.1d.1** `.read` — landed under 10.1.22.
+  - [X] **10.1d.2** `.dump` — landed under 10.1.23.
+  - [~] **10.1d.3** `.import` — auto-create-from-header + duplicate-column
+        renaming closed under 10.1.24.  Two sub-arms remain:
+    - [ ] **10.1d.3.a** Heredoc input — `FILE` of the form `<<EOF` reads
+          subsequent lines from `p^.in` into an `sqlite3_str` until a
+          line begins with the end-mark, then feeds the buffered text to
+          the CSV reader via `sCtx.zIn` (shell.c.in:7601..7637).  Needs
+          a `Psqlite3_str` (already in passqlite3.pas) plus the
+          `import_cleanup` "Content terminator not found" error path.
+          Touch site: the `else if … '<' '<'` arm inside the existing
+          `.import` body in passqlite3shell.pas.
+    - [ ] **10.1d.3.b** Pipe input — `FILE` of the form `|cmd` does
+          `sqlite3_popen(zFile+1,"r")` and sets `xCloser = pclose`
+          (shell.c.in:7593..7600).  FPC has `popen`/`pclose` via the
+          `BaseUnix` unit; mirror upstream's safe-mode guard
+          (`failIfSafeMode(p, "cannot run .import in safe mode")`) and
+          the `"<pipe>"` filename swap.  Independent of 10.1d.3.a.
+  - [X] **10.1d.4** `.output` / `.once` — landed under 10.1.25.
+        Editor / spreadsheet / web-browser (`-e`/`-x`/`-w`) variants and
+        pipe targets (`|cmd`) intentionally not gated here; tracked as a
+        future xdg-open / TProcess follow-up.
+  - [X] **10.1d.5** `.save` — landed under 10.1.26.
+  - [~] **10.1d.6** `.open` — base flag set landed under 10.1.27.
+        `cmdOpen` at passqlite3shell.pas:4977 still ignores the three
+        VFS/format flags whose backing code shipped under 10.1.102:
+    - [ ] **10.1d.6.a** Wire `--zip` / `--deserialize` / `--hexdb` in
+          `cmdOpen` so they set `p^.openMode` to `SHELL_OPEN_ZIPFILE` /
+          `SHELL_OPEN_DESERIALIZE` / `SHELL_OPEN_HEXDB` before calling
+          `openDb(p, 1)` (the post-open switch in `openDb` is already
+          present from 10.1.102 — only the dot-command parser needs the
+          three extra arms).  Also wire `--maxsize N` → `p^.szMax`,
+          which `openDb`'s deserialize arm reads.
+    - [ ] **10.1d.6.b** Bring the upstream `--readonly`/`--new`/
+          `--ifexists`/`--nofollow`/`--exclusive` error messages
+          byte-identical with shell.c.in (`unknown option:` ordering and
+          punctuation) so the 10.1d gate diffs clean.  Drive-by while
+          touching `cmdOpen` for 10.1d.6.a.
+  - [ ] **10.1d.G** Gate: `tests/cli/10d_io/` golden-diff harness.
+        Scripts: round-trip a CSV via `.import`/`.dump`, ASCII variant,
+        heredoc `.import t1 << END` flow (depends on 10.1d.3.a), pipe
+        `.import t1 |echo` (depends on 10.1d.3.b), `.output FILE` +
+        `.once FILE`, `.save FILE`, `.read FILE`, and the three `.open`
+        flag arms (`--zip`/`--deserialize`/`--hexdb` — depends on
+        10.1d.6.a).  Compare both stdout and the persisted file bytes
+        against the upstream `sqlite3` binary.  Flips 10.1d to `[X]`.
 
 - [X] **10.1.22, 10.1.23, 10.1.25, 10.1.26** `.read FILE`, `.dump` (full), `.output`/`.once`, `.save` all landed.
 - [~] **10.1.24** `.import` — auto-create-from-header landed (shellAutoColumnAdd/Finish, shell.c.in:7165..7339); duplicate column renaming now unblocked (bug 10.1.bug.131 closed). Heredoc input and pipe input still deferred.
-- [~] **10.1.27** `.open` — handles `-new`, `-readonly`, `-exclusive`, `-ifexists`, `-nofollow`. `--zip` and `--deserialize` deferred until those VFSes/extensions are ported.
+- [~] **10.1.27** `.open` — handles `-new`, `-readonly`, `-exclusive`, `-ifexists`, `-nofollow`.  Backing VFS/extension ports for `--zip` (10.1.98) / `--deserialize` (10.1.102) / `--hexdb` (10.1.102) are all `[X]`; only the `cmdOpen` parser arms need wiring — tracked under 10.1d.6.a.
 
 ### 10.1e Meta / diagnostic dot-commands
 
