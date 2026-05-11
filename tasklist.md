@@ -565,24 +565,19 @@ partial landings cannot silently no-op.
       appendvfs/10.1.84) are `[X]`; only the dot-command parser arms
       remain.  Breakdown — each sub-arm is an independent patch to
       `cmdOpen`:
-  - [ ] **10.1.27.a** Add `-zip` / `-append` flag arms (shell.c.in:10158..10162).
-        Set `openMode := SHELL_OPEN_ZIPFILE` / `SHELL_OPEN_APPENDVFS` and
-        gate `-zip` (and `-append`) on `not p^.bSafeMode` to match the
-        upstream `!p->bSafeMode` guard.  No new helpers — the openDb
-        switch already dispatches on openMode (10.1.102).
-  - [ ] **10.1.27.b** Add `-deserialize` / `-hexdb` / `-normal` flag arms
-        (shell.c.in:10172..10178).  Set `openMode` accordingly.  The
-        `-hexdb` arm must allow zero filename (upstream lets HEXDB open
-        without `zFN` because input comes from the script via
-        `shellReadHexDb`) — the post-flag-loop guard at cmdOpen must
-        become `if (zFN <> '') or (openMode = SHELL_OPEN_HEXDB)` rather
-        than the current `if zFN <> ''`.
-  - [ ] **10.1.27.c** Add `-maxsize N` arm (shell.c.in:10179..10180).
-        Consume the next arg via `shellIntegerValue` and write to
-        `p^.szMax`.  Currently `cmdOpen` sets `p^.szMax := 0`
-        unconditionally — move that zeroing into the no-`-maxsize` path,
-        or just let the explicit assignment overwrite it.  Read by
-        `openDb`'s deserialize arm.
+  - [X] **10.1.27.a** Add `-zip` / `-append` flag arms (shell.c.in:10158..10162).
+        Done: both arms gated on `p^.bSafeMode = 0`; `--zip` round-trip
+        verified byte-parity vs upstream sqlite3 on a `zipfile` vtab read.
+  - [X] **10.1.27.b** Add `-deserialize` / `-hexdb` / `-normal` flag arms
+        (shell.c.in:10172..10178).  Done: post-flag guard relaxed to
+        `(zFN <> '') or (p^.openMode = SHELL_OPEN_HEXDB)` and filename
+        allocation skipped when zFN is empty (matches shell.c.in:10231
+        zNewFilename=NULL).  `--deserialize` flag now flows to openDb;
+        any residual sqlite3_deserialize failure is a 10.1.102 issue.
+  - [X] **10.1.27.c** Add `-maxsize N` arm (shell.c.in:10179..10180).
+        Done: szMax tracked in a local, assigned to `p^.szMax` after the
+        loop so it survives.  Verified byte-parity with upstream on a
+        `.open --maxsize N FILE` + SELECT round-trip.
   - [ ] **10.1.27.d** `-new` URI-aware deletion (shell.c.in:10210..10218).
         Currently `DeleteFile(string(zFN))` is called unconditionally
         when `newFlag=1`; upstream uses `shellFilenameFromUri` on
