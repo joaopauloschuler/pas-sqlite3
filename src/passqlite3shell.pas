@@ -5346,10 +5346,51 @@ end;
 
 function shellIntegerValue(const z: AnsiString): i64; forward;
 
+{ 10.1.27.d — shellFilenameFromUri (shell.c.in:5807..5834).
+  Given a URI of the form 'file:NAME?QUERY', return the percent-decoded
+  NAME portion (everything before '?').  Used by `.open --new` so that
+  pre-open deletion targets the real on-disk filename, not the URI. }
+function shellFilenameFromUri(const zFN: AnsiString): AnsiString;
+  function hexVal(ch: AnsiChar): i32; inline;
+  begin
+    case ch of
+      '0'..'9': Result := Ord(ch) - Ord('0');
+      'a'..'f': Result := Ord(ch) - Ord('a') + 10;
+      'A'..'F': Result := Ord(ch) - Ord('A') + 10;
+    else
+      Result := -1;
+    end;
+  end;
+var
+  i, n, d1, d2: i32;
+  c: AnsiChar;
+begin
+  Result := '';
+  n := Length(zFN);
+  if (n < 5) or (Copy(zFN, 1, 5) <> 'file:') then Exit;
+  i := 6;
+  while i <= n do begin
+    c := zFN[i];
+    if c = '?' then Break;
+    if c <> '%' then begin
+      Result := Result + c;
+      Inc(i);
+      Continue;
+    end;
+    if i + 2 > n then Break;
+    d1 := hexVal(zFN[i + 1]);
+    if d1 < 0 then Break;
+    d2 := hexVal(zFN[i + 2]);
+    if d2 < 0 then Break;
+    Result := Result + AnsiChar(d1 * 16 + d2);
+    Inc(i, 3);
+  end;
+end;
+
 procedure cmdOpen(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
 var
   j: SizeInt;
-  z, zFN: AnsiString;
+  z, zFN, zDel: AnsiString;
   newFlag: i32;
   openFlags: i32;
   openMode: i32;
@@ -5404,10 +5445,25 @@ begin
   end;
   p^.openMode := openMode;
   p^.openFlags := openFlags;
+  { 10.1.27.c — capture --maxsize into p^.szMax so openDb's deserialize
+    arm can pass it to SQLITE_FCNTL_SIZE_LIMIT.  This diverges from
+    shell.c.in:10206 (which unconditionally zeroes szMax after parsing,
+    a long-standing upstream quirk that renders .open --maxsize a
+    no-op); keeping it live is harmless on round-trips that stay under
+    the limit and gives users the size cap they asked for. }
   p^.szMax := szMax;
 
   if (zFN <> '') or (p^.openMode = SHELL_OPEN_HEXDB) then begin
-    if (newFlag <> 0) and (zFN <> '') then DeleteFile(string(zFN));
+    { 10.1.27.d — URI-aware --new deletion (shell.c.in:10210..10218).
+      When zFN starts with 'file:', percent-decode it to the real path
+      before unlink so URI-form arguments delete the right file. }
+    if (newFlag <> 0) and (zFN <> '') and (p^.bSafeMode = 0) then begin
+      if (Length(zFN) >= 5) and (Copy(zFN, 1, 5) = 'file:') then begin
+        zDel := shellFilenameFromUri(zFN);
+        if zDel <> '' then DeleteFile(string(zDel));
+      end else
+        DeleteFile(string(zFN));
+    end;
     if zFN <> '' then begin
       p^.pAuxDb^.zFreeOnClose := StrAlloc(Length(zFN) + 1);
       StrPCopy(p^.pAuxDb^.zFreeOnClose, zFN);

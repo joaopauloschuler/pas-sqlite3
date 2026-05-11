@@ -551,20 +551,26 @@ partial landings cannot silently no-op.
         future xdg-open / TProcess follow-up.
   - [X] **10.1d.5** `.save` — landed under 10.1.26.
   - [~] **10.1d.6** `.open` — base flag set landed under 10.1.27.
-        `cmdOpen` at passqlite3shell.pas:4977 still ignores the three
-        VFS/format flags whose backing code shipped under 10.1.102:
-    - [ ] **10.1d.6.a** Wire `--zip` / `--deserialize` / `--hexdb` in
+        `cmdOpen` at passqlite3shell.pas:5349 carries the full upstream
+        flag set; remaining work is the 10.1d.G gate harness.
+    - [X] **10.1d.6.a** Wire `--zip` / `--deserialize` / `--hexdb` in
           `cmdOpen` so they set `p^.openMode` to `SHELL_OPEN_ZIPFILE` /
           `SHELL_OPEN_DESERIALIZE` / `SHELL_OPEN_HEXDB` before calling
           `openDb(p, 1)` (the post-open switch in `openDb` is already
           present from 10.1.102 — only the dot-command parser needs the
           three extra arms).  Also wire `--maxsize N` → `p^.szMax`,
-          which `openDb`'s deserialize arm reads.
-    - [ ] **10.1d.6.b** Bring the upstream `--readonly`/`--new`/
+          which `openDb`'s deserialize arm reads.  Done: arms live at
+          passqlite3shell.pas:5369..5384.  Verified `.open --deserialize
+          /tmp/d.db` byte-matches upstream on a SELECT round-trip;
+          `--maxsize N` survives into `p^.szMax` (intentional divergence
+          from shell.c.in:10206 which zeroes szMax — see 10.1.27.c).
+    - [X] **10.1d.6.b** Bring the upstream `--readonly`/`--new`/
           `--ifexists`/`--nofollow`/`--exclusive` error messages
           byte-identical with shell.c.in (`unknown option:` ordering and
           punctuation) so the 10.1d gate diffs clean.  Drive-by while
-          touching `cmdOpen` for 10.1d.6.a.
+          touching `cmdOpen` for 10.1d.6.a.  Done: `unknown option: %s`
+          and `extra argument: "%s"` confirmed byte-identical vs upstream
+          via `.open --bogus foo` / `.open a b` smokes.
   - [ ] **10.1d.G** Gate: `tests/cli/10d_io/` golden-diff harness.
         Scripts: round-trip a CSV via `.import`/`.dump`, ASCII variant,
         heredoc `.import t1 << END` flow (depends on 10.1d.3.a), pipe
@@ -621,13 +627,16 @@ partial landings cannot silently no-op.
         Done: szMax tracked in a local, assigned to `p^.szMax` after the
         loop so it survives.  Verified byte-parity with upstream on a
         `.open --maxsize N FILE` + SELECT round-trip.
-  - [ ] **10.1.27.d** `-new` URI-aware deletion (shell.c.in:10210..10218).
-        Currently `DeleteFile(string(zFN))` is called unconditionally
-        when `newFlag=1`; upstream uses `shellFilenameFromUri` on
-        `file:` URIs first (so `.open -new file:foo?cache=shared`
-        deletes `foo`, not the literal URI string).  Helper:
-        `shellFilenameFromUri` (port from shell.c.in or wrap
-        `sqlite3_uri_parameter` + filename extraction).
+  - [X] **10.1.27.d** `-new` URI-aware deletion (shell.c.in:10210..10218).
+        Done: ported `shellFilenameFromUri` (shell.c.in:5807..5834) at
+        passqlite3shell.pas just above `cmdOpen` — percent-decodes
+        everything between `file:` and `?`.  `-new` arm at
+        passqlite3shell.pas:5413..5419 now branches on `file:` prefix
+        and unlinks the decoded path; also gated on `p^.bSafeMode = 0`
+        per shell.c.in:10210.  Verified: `.open --new
+        'file:/tmp/newdb?mode=rwc'` deletes `/tmp/newdb` (the post-open
+        URI-aware sqlite3_open is a separate gap — port's openDb does
+        not enable URI parsing at the C-API level).
   - [ ] **10.1.27.e** `bSafeMode` enforcement (shell.c.in:10148 +
         10221..10227): when `p^.bSafeMode <> 0`, force `openFlags :=
         SQLITE_OPEN_READONLY` up front, refuse `-zip`/`-append`, and
@@ -636,12 +645,10 @@ partial landings cannot silently no-op.
   - [ ] **10.1.27.f** `session_close_all(p, -1)` pre-close hook
         (shell.c.in:10198).  Stub for now if the session extension is
         absent — note the divergence at the call site.
-  - [ ] **10.1.27.g** Drive-by: byte-identical `unknown option:` /
+  - [X] **10.1.27.g** Drive-by: byte-identical `unknown option:` /
         `extra argument:` error strings against shell.c.in:10186..10193.
-        Required for the 10.1d.G golden-diff gate.  Currently
-        `cmdOpen` already prints `unknown option: %s` / `extra
-        argument: "%s"` but verify the trailing newline and quoting
-        match exactly.
+        Done jointly with 10.1d.6.b; smokes `.open --bogus foo` and
+        `.open a b` produce identical bytes vs upstream.
 
   10.1d.6.a / 10.1d.6.b are the gate-side mirror of this list; once
   all `.a..g` land and the gate passes, 10.1.27 flips to `[X]`.
