@@ -8326,21 +8326,21 @@ begin
   if (z1 = nil) or (z2 = nil) then begin
     rc := SQLITE_NOMEM;
   end else begin
+    { shell.c.in:6581 — single template, the second %s closes the
+      IN(..) list in the non-glob branch and is empty in the glob
+      branch.  z1 is left without its trailing ')' so the close paren
+      is inserted here. }
     if pAr^.bGlob = 0 then
       zNew := sqlite3PfMprintf(
-        PAnsiChar('(%s) OR (name GLOB ''*/*'' AND (%s)) '),
-        [AnsiString(z1), AnsiString(z2)])
+        PAnsiChar('(%s%s OR (name GLOB ''*/*'' AND (%s))) '),
+        [AnsiString(z1), AnsiString(')'), AnsiString(z2)])
     else
       zNew := sqlite3PfMprintf(
-        PAnsiChar('(%s OR (name GLOB ''*/*'' AND (%s))) '),
-        [AnsiString(z1), AnsiString(z2)]);
+        PAnsiChar('(%s%s OR (name GLOB ''*/*'' AND (%s))) '),
+        [AnsiString(z1), AnsiString(''), AnsiString(z2)]);
     if zNew = nil then begin
       rc := SQLITE_NOMEM;
     end else begin
-      { Match upstream wrapping: see shell.c.in:6581 — the bare-name
-        branch closes the IN(..) inside the prefix and the wrap is
-        "(<z1>) OR ..." while the glob branch wraps "(<z1> OR ...)".
-        We've folded the close-paren into the prefix branches above. }
       zWhere := AnsiString(zNew);
       sqlite3_free(zNew);
     end;
@@ -8535,11 +8535,11 @@ label end_ar_transaction;
 const
   zCreate =
     'CREATE TABLE IF NOT EXISTS sqlar('#10 +
-    '  name TEXT PRIMARY KEY,'#10 +
-    '  mode INT,'#10 +
-    '  mtime INT,'#10 +
-    '  sz INT,'#10 +
-    '  data BLOB'#10 +
+    '  name TEXT PRIMARY KEY,  -- name of the file'#10 +
+    '  mode INT,               -- access permissions'#10 +
+    '  mtime INT,              -- last modification time'#10 +
+    '  sz INT,                 -- original file size'#10 +
+    '  data BLOB               -- compressed content'#10 +
     ')';
   zDrop = 'DROP TABLE IF EXISTS sqlar';
   zInsertSqlar =
