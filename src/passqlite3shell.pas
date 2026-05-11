@@ -1407,6 +1407,158 @@ begin
   Result := True;
 end;
 
+{ ----------------------------------------------------------------------
+  10.1.2.a  quickScan — port of shell.c.in:12077..12175.
+
+  Resumable line classifier.  The low byte of the state holds `cWait` (the
+  pending close delimiter inside a string/comment, or 0 in PlainScan); two
+  flag bits above sit in the high byte:
+    QSS_HasDark    — a non-space, non-comment character has been seen
+    QSS_EndingSemi — the last dark character was an unquoted `;`
+  After each line, processInput inspects:
+    QSS_SEMITERM   — exactly EndingSemi (optionally with HasDark), no cWait,
+                     i.e. line ended on a logical `;`
+    QSS_PLAINWHITE — neither HasDark nor cWait set
+  The C is two labelled loops joined by goto; the Pascal mirrors that with
+  two procedures driven by a `state` flag so the structure remains
+  diff-friendly against upstream.  The CONTINUE_PROMPT_* / paren tracker
+  hooks belong to 10.1.2.c — omitted here. }
+type
+  TQuickScanState = i32;   { upstream uses a bitfield enum; an int suffices }
+const
+  QSS_Start_C    : TQuickScanState = 0;
+  QSS_HasDark    : TQuickScanState = $0100;     { 1 << CHAR_BIT }
+  QSS_EndingSemi : TQuickScanState = $0200;     { 2 << CHAR_BIT }
+  QSS_CharMask   : TQuickScanState = $00FF;
+  QSS_ScanMask   : TQuickScanState = $0300;
+
+function QSS_SETV(qss, newst: TQuickScanState): TQuickScanState; inline;
+begin
+  Result := newst or (qss and QSS_ScanMask);
+end;
+
+function QSS_PLAINWHITE(qss: TQuickScanState): Boolean; inline;
+begin
+  Result := (qss and (not QSS_EndingSemi)) = 0;
+end;
+
+function QSS_SEMITERM(qss: TQuickScanState): Boolean; inline;
+begin
+  Result := (qss and (not QSS_HasDark)) = QSS_EndingSemi;
+end;
+
+function quickScan(zLine: PAnsiChar; qss: TQuickScanState): TQuickScanState;
+var
+  cin, cWait: AnsiChar;
+  state: i32;     { 0 = PlainScan, 1 = TermScan; mirrors C's two goto labels }
+begin
+  cWait := AnsiChar(qss and QSS_CharMask);     { shell.c.in:12101 }
+  if cWait = #0 then state := 0 else state := 1;
+  while True do begin
+    if state = 0 then begin
+      { PlainScan — shell.c.in:12103..12145 }
+      while zLine^ <> #0 do begin
+        cin := zLine^;
+        Inc(zLine);
+        if cin in [' ', #9, #10, #11, #12, #13] then Continue;   { IsSpace }
+        case cin of
+          '-':
+            begin
+              if zLine^ <> '-' then begin
+                { fall through to dark-char accounting below }
+              end else begin
+                { `--` line comment — scan to '\n' or EOL.  shell.c.in:12108..12114. }
+                while True do begin
+                  Inc(zLine);
+                  cin := zLine^;
+                  if cin = #0 then begin Result := qss; Exit; end;
+                  if cin = #10 then Break;   { resume PlainScan past LF }
+                end;
+                Continue;
+              end;
+            end;
+          ';':
+            begin
+              qss := qss or QSS_EndingSemi;
+              Continue;
+            end;
+          '/':
+            begin
+              if zLine^ = '*' then begin
+                Inc(zLine);
+                cWait := '*';
+                qss := QSS_SETV(qss, Ord(cWait));
+                state := 1;
+                Break;                       { goto TermScan }
+              end;
+              { lone '/' — dark char accounting below }
+            end;
+          '[':
+            begin
+              cWait := ']';
+              qss := QSS_HasDark or Ord(cWait);
+              state := 1;
+              Break;
+            end;
+          '`', '''', '"':
+            begin
+              cWait := cin;
+              qss := QSS_HasDark or Ord(cWait);
+              state := 1;
+              Break;
+            end;
+          '(', ')':
+            begin
+              { paren depth tracking deferred to 10.1.2.c — treat as dark. }
+            end;
+        end;
+        { Default dark-char tail: clear EndingSemi, set HasDark.
+          shell.c.in:12144. }
+        qss := (qss and (not QSS_EndingSemi)) or QSS_HasDark;
+      end;
+      if state = 0 then begin Result := qss; Exit; end;
+    end else begin
+      { TermScan — shell.c.in:12147..12172 }
+      while zLine^ <> #0 do begin
+        cin := zLine^;
+        Inc(zLine);
+        if cin = cWait then begin
+          case cWait of
+            '*':
+              begin
+                if zLine^ <> '/' then Continue;
+                Inc(zLine);
+                qss := QSS_SETV(qss, 0);
+                cWait := #0;
+                state := 0;
+                Break;                       { goto PlainScan }
+              end;
+            '`', '''', '"':
+              begin
+                if zLine^ = cWait then begin
+                  Inc(zLine);                { swallow doubled delimiter }
+                  Continue;
+                end;
+                qss := QSS_SETV(qss, 0);
+                cWait := #0;
+                state := 0;
+                Break;
+              end;
+            ']':
+              begin
+                qss := QSS_SETV(qss, 0);
+                cWait := #0;
+                state := 0;
+                Break;
+              end;
+          end;
+        end;
+      end;
+      if state = 1 then begin Result := qss; Exit; end;
+    end;
+  end;
+end;
+
 function startsWithDot(const s: AnsiString): Boolean;
 var i: SizeInt;
 begin
@@ -8921,10 +9073,12 @@ var
   startLine: i64;
   rc: i32;
   isCont: Boolean;
+  qss: TQuickScanState;
 begin
   errCnt := 0;
   startLine := 0;
   zSql := '';
+  qss := 0;     { QSS_Start — shell.c.in:12436 }
   if p^.inputNesting = MAX_INPUT_NESTING then begin
     shellEPutZ(Format('%s: Input nesting limit (%d) reached at line %d.'#10,
       [string(AnsiString(p^.zInFile)), MAX_INPUT_NESTING, p^.lineno]));
@@ -8947,8 +9101,14 @@ begin
     end;
     Inc(p^.lineno);
 
-    if (zSql = '') and isPlainWhiteOrComment(zLine) then begin
+    { shell.c.in:12458 — advance quickscan state for this line. }
+    qss := quickScan(PAnsiChar(zLine), qss);
+
+    { shell.c.in:12459..12463 — swallow plain-white / comment-only lines
+      while the accumulator is empty. }
+    if QSS_PLAINWHITE(qss) and (zSql = '') then begin
       echoGroupInput(p, zLine);
+      qss := 0;
       Continue;
     end;
 
@@ -8966,6 +9126,7 @@ begin
           if p^.nPopOutput = 0 then outputReset(p);
         end;
       end;
+      qss := 0;
       Continue;                    { '#' lines are silent comments }
     end;
 
@@ -8975,25 +9136,28 @@ begin
     end else
       zSql := zSql + #10 + zLine;
 
-    { shell.c.in:12507 — gate is QSS_SEMITERM(qss) && sqlite3_complete(zSql).
-      Upstream's quickscan tracks "logical semicolon at end of line" so that
-      a trailing `--` line comment after `;` still trips the cut.  The lean
-      port skips the quickscan fast-path and relies on sqlite3_complete alone;
-      requiring zSql[end]=';' was wrong because lines like
-        SELECT 1; -- trailer
-      end in 'r' / whitespace and would never cut, so the buffer kept
-      accumulating subsequent statements into one over-long prepare. }
-    if (zSql <> '') and (sqlite3_complete(PAnsiChar(zSql)) <> 0) then
+    { shell.c.in:12507 — QSS_SEMITERM(qss) && sqlite3_complete(zSql).
+      quickscan supplies the "logical semicolon at end of line" predicate
+      so trailing `-- comment` after `;` still trips the cut. }
+    if (zSql <> '') and QSS_SEMITERM(qss)
+       and (sqlite3_complete(PAnsiChar(zSql)) <> 0) then
     begin
       echoGroupInput(p, zSql);
       Inc(errCnt, runOneSqlLine(p, zSql, AnsiString(p^.zInFile), startLine));
       zSql := '';
+      qss := 0;     { shell.c.in:12523 }
       { shell.c.in:12512..12517 — at end of each SQL line, immediately
         revert any active .once redirect. }
       if p^.nPopOutput > 0 then begin
         outputReset(p);
         p^.nPopOutput := 0;
       end;
+    end else if (zSql <> '') and QSS_PLAINWHITE(qss) then begin
+      { shell.c.in:12524..12528 — accumulator went all-whitespace after
+        comments stripped; discard without running. }
+      echoGroupInput(p, zSql);
+      zSql := '';
+      qss := 0;
     end;
   end;
   if zSql <> '' then begin
