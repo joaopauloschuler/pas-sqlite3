@@ -4456,6 +4456,18 @@ begin
     else
       pNewItem^.u1.nRow := pOldItem^.u1.nRow;
     pNewItem^.u2 := pOldItem^.u2;
+    { 10.1.48.b — isCte (fgBits2 bit 1): bump pCteUse->nUse so the
+      duplicated SrcItem keeps the recursive-CTE materialisation alive
+      when the IN-RHS sqlite3Select recompiles `SELECT p FROM pages`.
+      Mirrors C expr.c sqlite3SrcListDup pCteUse->nUse++.  Without the
+      bump, the second sqlite3Select on the duplicate dereferences a
+      freed pCteUse (the original consumes the last reference, the
+      duplicate then AVs on pCteUse^.addrM9e). }
+    if (pOldItem^.fg.fgBits2 and u8($02)) <> 0 then  { isCte }
+    begin
+      if pNewItem^.u2.pCteUse <> nil then
+        Inc(pNewItem^.u2.pCteUse^.nUse);
+    end;
     { Carry the resolved Table* across — selectExpander runs once on the
       original AST; the duplicate inherits pSTab so a recursive
       sqlite3Select on the dup (sub-progress 23 IN-RHS subselect path)
@@ -25465,7 +25477,9 @@ begin
      and (p^.pWin = nil)
      and (p^.pSrc <> nil) and (p^.pSrc^.nSrc >= 1)
      and (p^.pEList <> nil) and (p^.pEList^.nExpr >= 1)
-     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem))
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_Mem)
+          or (pDest^.eDest = SRT_Coroutine)
+          or (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table))
   then
   begin
     pItem := SrcListItems(p^.pSrc);
@@ -25582,11 +25596,16 @@ begin
     pAggI2^.nAccumulator := pAggI2^.nColumn;
     analyzeAggFuncArgs(pAggI2, @sNCAgg);
 
-    { Bail on iOBTab/EP_WinFunc/NEEDCOLL aggregates — those need
+    { Bail on iOBTab / EP_WinFunc (non-FILTER) aggregates — those need
       additional plumbing not in scope here.  DISTINCT aggregates are
       handled: resetAccumulatorSimple re-opens the per-Func iDistinct
       ephemeral on every addrReset (per-group), and updateAccumulatorSimple
-      emits OP_Found / OP_IdxInsert dedup before each AggStep. }
+      emits OP_Found / OP_IdxInsert dedup before each AggStep.  NEEDCOLL
+      aggregates (min/max) are also handled — updateAccumulatorSimple
+      emits OP_CollSeq before OP_AggStep when SQLITE_FUNC_NEEDCOLL is
+      set on the FuncDef (codegen.pas:24494..24509).  Lifted 2026-05-11
+      under 10.1.48.a so `INSERT INTO ... SELECT max(...) FROM ... GROUP
+      BY ...` (the .recover `recoverCacheSchema` shape) reaches codegen. }
     canUseAgg := True;
     for jAgg := 0 to pAggI2^.nFunc - 1 do
     begin
@@ -25594,9 +25613,6 @@ begin
       if ((pAggFunc^.pFExpr^.flags and EP_WinFunc) <> 0)
          and ((pAggFunc^.pFExpr^.y.pWin = nil)
               or (pAggFunc^.pFExpr^.y.pWin^.eFrmType <> TK_FILTER))
-      then begin canUseAgg := False; break; end;
-      if (pAggFunc^.pFunc <> nil)
-         and ((PTFuncDef(pAggFunc^.pFunc)^.funcFlags and SQLITE_FUNC_NEEDCOLL) <> 0)
       then begin canUseAgg := False; break; end;
     end;
 
@@ -25882,7 +25898,31 @@ begin
                                 nOrderByOB + nResultCol);
       end
       else if pDest^.eDest = SRT_Output then
-        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol);
+        sqlite3VdbeAddOp2(v, OP_ResultRow, pDest^.iSdst, nResultCol)
+      else if pDest^.eDest = SRT_Coroutine then
+      begin
+        { 10.1.48.a — yield each grouped row to the consumer coroutine.
+          Mirrors selectInnerLoop SRT_Coroutine arm (select.c:1410).  The
+          C GROUP BY arm reaches this through selectInnerLoop(... pDest ...)
+          at select.c:8736; the Pascal port emits the per-row dispatch
+          inline since the addrOutputRow subroutine already evaluates the
+          result columns into pDest^.iSdst. }
+        sqlite3VdbeAddOp1(v, OP_Yield, pDest^.iSDParm);
+      end
+      else if (pDest^.eDest = SRT_EphemTab) or (pDest^.eDest = SRT_Table) then
+      begin
+        { 10.1.48.a — MakeRecord + NewRowid + Insert(APPEND) into the
+          rowid-keyed eph table.  Mirrors selectInnerLoop SRT_Table arm
+          (select.c:1349..1370). }
+        r1 := sqlite3GetTempReg(pParse);
+        r2 := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp3(v, OP_MakeRecord, pDest^.iSdst, nResultCol, r1);
+        sqlite3VdbeAddOp2(v, OP_NewRowid,   pDest^.iSDParm, r2);
+        sqlite3VdbeAddOp3(v, OP_Insert,     pDest^.iSDParm, r1, r2);
+        sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
+        sqlite3ReleaseTempReg(pParse, r2);
+        sqlite3ReleaseTempReg(pParse, r1);
+      end;
       sqlite3VdbeAddOp1(v, OP_Return, regOutputRow);
 
       { Subroutine: addrReset. }
