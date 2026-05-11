@@ -194,6 +194,68 @@ FPC porting traps that recur often enough to call out up-front:
           SELECT list).  Track that under a new bug; it is not on
           the GROUP BY path.
 
+    - [ ] **6.13.B.11** Preserve `eTabType=TABTYP_VTAB` across the
+          `CREATE VIRTUAL TABLE` → `OP_ParseSchema` round-trip so
+          subsequent prepares on the same connection route through
+          `whereLoopAddVirtual` instead of `whereLoopAddBtree`.
+
+          Repro (smallest):
+
+              sqlite3 :memory:
+              .load <module>          -- or built-in 'expert' via .expert
+              CREATE VIRTUAL TABLE t USING expert('CREATE TABLE x(a,b)');
+              -- WhereBegin sees eTabType=0 here:
+              EXPLAIN QUERY PLAN SELECT * FROM t WHERE a=1;
+
+          Symptom: the planner takes the btree branch at
+          `whereLoopAddAll` (codegen.pas:15841) and **never calls
+          `vtabBestIndex`** (codegen.pas:15217), so any module that
+          relies on xBestIndex pushdown to translate WHERE / ORDER
+          BY clauses (expert, fts, rtree, dbpage, ...) silently
+          degrades to "scan everything in xFilter".
+
+          Surfaced by **10.1.101** (passqlite3expert.pas): `.expert`
+          runs the full pipeline (sql → analyze → report) but
+          `pScan` is always empty, so the report is locked at
+          `(no new indexes)`.  Stderr instrumentation in
+          `sqlite3WhereBegin` confirms eTabType=0 for the
+          re-published vtab even though `sqlite3VtabBeginParse`
+          (parser.pas:2403) writes `TABTYP_VTAB` unconditionally.
+
+          Suspect chain (verify in order):
+
+            1. After `CREATE VIRTUAL TABLE`, `sqlite3VtabFinishCreateOps`
+               (codegen.pas:56697) emits UPDATE sqlite_schema +
+               OP_Expire + OP_ParseSchema + OP_VCreate.
+            2. `OP_ParseSchema` → `vdbeParseSchemaExec` →
+               `execParseSchemaImpl` (main.pas:2707) iterates every
+               row and dispatches to `sqlite3InitCallback`
+               (main.pas:2570).
+            3. The "already in tblHash" shortcut at main.pas:2633..2642
+               may fire on the freshly inserted (init.busy=0) pTab
+               that still has `TABTYP_VTAB`, **or** the re-prepare
+               at main.pas:2659 may parse the sql column as a plain
+               CREATE TABLE (parser dispatch wired at
+               parser.pas:4114 for rule 304 — confirm yymsp slot
+               indices when init.busy=1).
+            4. `sqlite3VtabFinishParse` init.busy branch
+               (parser.pas:2458..2475) hashes the pTab into
+               tblHash; assert pTab^.eTabType is still
+               `TABTYP_VTAB` at that point.
+
+          Acceptance: with this closed, the existing
+          passqlite3expert.pas unit produces a non-empty zCandidates
+          buffer for
+
+              CREATE TABLE t1(a,b,c,d);
+              .expert
+              SELECT * FROM t1 WHERE a=1 AND b=2 ORDER BY c;
+
+          and the resulting CREATE INDEX statement is byte-identical
+          with upstream sqlite3's output.  No code change required
+          inside passqlite3expert.pas; flip the "Known limitation"
+          paragraph at the top of that unit to "(closed by 6.13.B.11)".
+
 - [X] **6.10** TestExplainParity closed.
 - [X] **6.11** PRAGMA page_count + DROP TABLE remaining gap closed.
 - [X] **6.12** sqlite3Pragma full port; DiagPragma all PASS.
@@ -281,7 +343,7 @@ partial landings cannot silently no-op.
         10.1.101; `cmdExpert` parses `-verbose` / `-sample N` and
         routes the next SQL through `expertHandleSQL` / `expertFinish`.
         Index recommendations are degenerate today (always
-        "(no new indexes)") pending the open vtab/eTabType schema-reload gap (see 10.1.101 banner).
+        "(no new indexes)") pending 6.13.B.11.
 
 - [X] **10.1.15..10.1.19, 10.1.21** `.schema --indent`, `.tables`, `.indexes`, `.databases`, `.fullschema`, `.expert` (stub) all landed.
 - [X] **10.1.20** `.lint fkey-indexes` — unblocked by bugs 6.13.B and 6.16 (2026-05-11); gated by `bin/TestShellSchema`.
@@ -448,7 +510,7 @@ and constraints flow once that lands.
       is purely upstream of this unit (vtab/eTabType preservation
       in execParseSchemaImpl + sqlite3InitCallback); landing it
       promotes the existing engine to producing real recommendations
-      with no changes here.  See the open vtab/eTabType schema-reload gap (see 10.1.101 banner) below.
+      with no changes here.  See 6.13.B.11.
 
 - [X] **10.1c.7** `.expert` dot-command — wired to the ported engine.
       The disabled stub at passqlite3shell.pas:6685 was replaced
@@ -456,7 +518,7 @@ and constraints flow once that lands.
       `expertHandleSQL`, and `expertFinish` helpers from shell.c.in
       §3088..3208.  Output shape and option parsing mirror upstream
       verbatim; the only divergence is the empty index recommendation
-      caused by the open vtab/eTabType schema-reload gap (see 10.1.101 banner).
+      caused by 6.13.B.11.
 
 - [ ] **10.1a.1** fill the next porting chunk here.
 
