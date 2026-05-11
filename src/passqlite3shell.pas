@@ -4968,11 +4968,16 @@ end;
 { ----------------------------------------------------------------------
   10.1.27  `.open ?-options? ?FILENAME?`  — shell.c.in:10141..10251
 
-  Closes the currently-open db, parses the option subset we ship today
-  (--readonly, --new, --nofollow, --exclusive, --ifexists), then
-  reopens against the supplied filename (or :memory: when omitted).  On
-  failure, falls back to a TEMP database to keep the REPL alive.
+  Closes the currently-open db, parses the option set we ship today
+  (--readonly, --new, --nofollow, --exclusive, --ifexists, --zip,
+  --append, --deserialize, --hexdb, --normal, --maxsize N), then
+  reopens against the supplied filename (or :memory: when omitted).
+  --hexdb is allowed to proceed with no filename because input comes
+  from the script (matches shell.c.in:10209).  On failure, falls back
+  to a TEMP database to keep the REPL alive.
   ---------------------------------------------------------------------- }
+
+function shellIntegerValue(const z: AnsiString): i64; forward;
 
 procedure cmdOpen(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
 var
@@ -4980,15 +4985,22 @@ var
   z, zFN: AnsiString;
   newFlag: i32;
   openFlags: i32;
+  openMode: i32;
+  szMax: i64;
 begin
   zFN := '';
   newFlag := 0;
   openFlags := SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE;
-  for j := 0 to nArg - 1 do begin
+  openMode := SHELL_OPEN_UNSPEC;
+  szMax := 0;
+  j := 0;
+  while j < nArg do begin
     z := args[j];
     if (Length(z) > 0) and (z[1] = '-') then begin
       if (Length(z) > 1) and (z[2] = '-') then Delete(z, 1, 1);
       if z = '-new' then newFlag := 1
+      else if (z = '-zip') and (p^.bSafeMode = 0) then openMode := SHELL_OPEN_ZIPFILE
+      else if (z = '-append') and (p^.bSafeMode = 0) then openMode := SHELL_OPEN_APPENDVFS
       else if z = '-readonly' then begin
         openFlags := openFlags and not (SQLITE_OPEN_READWRITE or SQLITE_OPEN_CREATE);
         openFlags := openFlags or SQLITE_OPEN_READONLY;
@@ -4996,6 +5008,13 @@ begin
       else if z = '-exclusive' then openFlags := openFlags or SQLITE_OPEN_EXCLUSIVE
       else if z = '-ifexists' then openFlags := openFlags and not SQLITE_OPEN_CREATE
       else if z = '-nofollow' then openFlags := openFlags or SQLITE_OPEN_NOFOLLOW
+      else if z = '-deserialize' then openMode := SHELL_OPEN_DESERIALIZE
+      else if z = '-hexdb' then openMode := SHELL_OPEN_HEXDB
+      else if z = '-normal' then openMode := SHELL_OPEN_NORMAL
+      else if (z = '-maxsize') and (j + 1 < nArg) then begin
+        Inc(j);
+        szMax := shellIntegerValue(args[j]);
+      end
       else begin
         shellEPutZ(Format('unknown option: %s'#10, [args[j]]));
         Exit;
@@ -5005,6 +5024,7 @@ begin
       shellEPutZ(Format('extra argument: "%s"'#10, [z]));
       Exit;
     end;
+    Inc(j);
   end;
 
   closeDb(p^.db);
@@ -5015,20 +5035,27 @@ begin
     StrDispose(p^.pAuxDb^.zFreeOnClose);
     p^.pAuxDb^.zFreeOnClose := nil;
   end;
-  p^.openMode := SHELL_OPEN_UNSPEC;
+  p^.openMode := openMode;
   p^.openFlags := openFlags;
-  p^.szMax := 0;
+  p^.szMax := szMax;
 
-  if zFN <> '' then begin
-    if newFlag <> 0 then DeleteFile(string(zFN));
-    p^.pAuxDb^.zFreeOnClose := StrAlloc(Length(zFN) + 1);
-    StrPCopy(p^.pAuxDb^.zFreeOnClose, zFN);
-    p^.pAuxDb^.zDbFilename := p^.pAuxDb^.zFreeOnClose;
+  if (zFN <> '') or (p^.openMode = SHELL_OPEN_HEXDB) then begin
+    if (newFlag <> 0) and (zFN <> '') then DeleteFile(string(zFN));
+    if zFN <> '' then begin
+      p^.pAuxDb^.zFreeOnClose := StrAlloc(Length(zFN) + 1);
+      StrPCopy(p^.pAuxDb^.zFreeOnClose, zFN);
+      p^.pAuxDb^.zDbFilename := p^.pAuxDb^.zFreeOnClose;
+    end else begin
+      p^.pAuxDb^.zFreeOnClose := nil;
+      p^.pAuxDb^.zDbFilename := nil;
+    end;
     openDb(p, 1);
     if p^.db = nil then begin
       shellEPutZ(Format('Error: cannot open ''%s'''#10, [zFN]));
-      StrDispose(p^.pAuxDb^.zFreeOnClose);
-      p^.pAuxDb^.zFreeOnClose := nil;
+      if p^.pAuxDb^.zFreeOnClose <> nil then begin
+        StrDispose(p^.pAuxDb^.zFreeOnClose);
+        p^.pAuxDb^.zFreeOnClose := nil;
+      end;
       p^.pAuxDb^.zDbFilename := nil;
     end;
   end;
