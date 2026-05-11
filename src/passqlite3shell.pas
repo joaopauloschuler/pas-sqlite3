@@ -8489,9 +8489,15 @@ begin
     end else
       zSql := zSql + #10 + zLine;
 
-    if (zSql <> '') and (Length(zSql) > 0)
-       and (zSql[Length(zSql)] = ';')
-       and (sqlite3_complete(PAnsiChar(zSql)) <> 0) then
+    { shell.c.in:12507 — gate is QSS_SEMITERM(qss) && sqlite3_complete(zSql).
+      Upstream's quickscan tracks "logical semicolon at end of line" so that
+      a trailing `--` line comment after `;` still trips the cut.  The lean
+      port skips the quickscan fast-path and relies on sqlite3_complete alone;
+      requiring zSql[end]=';' was wrong because lines like
+        SELECT 1; -- trailer
+      end in 'r' / whitespace and would never cut, so the buffer kept
+      accumulating subsequent statements into one over-long prepare. }
+    if (zSql <> '') and (sqlite3_complete(PAnsiChar(zSql)) <> 0) then
     begin
       Inc(errCnt, runOneSqlLine(p, zSql, AnsiString(p^.zInFile), startLine));
       zSql := '';

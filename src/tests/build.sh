@@ -167,6 +167,7 @@ compile_test TestRowidIn
 compile_test TestShellTrustedSchema
 compile_test TestUpdateCorrelated
 compile_test TestCteOuterID
+compile_test TestShellSemiComment
 compile_test TestExplainParity
 compile_test TestBytecodeParity
 compile_test TestWhereCorpus
