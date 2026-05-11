@@ -72,7 +72,28 @@ FPC porting traps that recur often enough to call out up-front:
 
 ### Open Bugs
 
-- [~] **6.13** `pragma_foreign_key_list(s.name)` (and other table-valued PRAGMA functions). **Sub-bug A** (column-list emission) closed 2026-05-08. **Sub-bug B** (lateral join with hidden-arg pushdown) closed 2026-05-11 via B.1..B.9: `whereLoopAddVirtual` + Case-1 codegen + WhereBegin OP_VOpen now push the lateral arg through xBestIndex/xFilter; TABFUNC arg lists are resolved before fitTabFuncArgs; `f.[table]` identifier syntax now dequotes.  `SELECT s.name, f.* FROM sqlite_schema s, pragma_foreign_key_list(s.name) f` returns the canonical row, and `bin/TestVtabLateral` is byte-identical with upstream across generate_series / pragma_foreign_key_list / json_each.  B.10 dependants (.lint fkey-indexes, .archive, .recover) are now blocked on **GROUP BY over multi-source vtab FROM**, not 6.13.
+- [~] **6.13** `pragma_foreign_key_list(s.name)` (and other table-valued PRAGMA functions). **Sub-bug A** (column-list emission) closed 2026-05-08. **Sub-bug B** (lateral join with hidden-arg pushdown) closed 2026-05-11 via B.1..B.9: `whereLoopAddVirtual` + Case-1 codegen + WhereBegin OP_VOpen now push the lateral arg through xBestIndex/xFilter; TABFUNC arg lists are resolved before fitTabFuncArgs; `f.[table]` identifier syntax now dequotes.  `SELECT s.name, f.* FROM sqlite_schema s, pragma_foreign_key_list(s.name) f` returns the canonical row, and `bin/TestVtabLateral` is byte-identical with upstream across generate_series / pragma_foreign_key_list / json_each.  B.10 closed 2026-05-11: multi-source GROUP BY arm now drives the full pSrc through sqlite3WhereBegin / lateral pushdown.  Residual `.lint fkey-indexes` / `.archive` / `.recover` failure tracked separately under **bug 6.16** below.
+
+- [ ] **6.16** Multi-vtab LEFT-JOIN + multi-aggregate AV.  `SELECT
+      group_concat(f.[from]), group_concat(COALESCE(f.[to], p.[name]))
+      FROM sqlite_schema AS s, pragma_foreign_key_list(s.name) AS f
+      LEFT JOIN pragma_table_info AS p ON (pk-1=seq AND
+      p.arg=f.[table]) GROUP BY s.name, f.id` raises EAccessViolation
+      at OP_Halt-time cursor cleanup (passqlite3vdbe.pas:4250,
+      `pC := v^.apCsr[i]`).  Repros independently of GROUP BY: same
+      LEFT-JOIN-to-vtab shape with `SELECT f.[from], p.[name]` (no
+      s.name in select list) hits the same AV — so the bug lives in
+      the multi-vtab LEFT-JOIN scan / register-allocation path, not
+      in the GROUP BY arm fixed by 6.13.B.10.  Reordering the
+      aggregates (p.[name] first, f.[from] second) makes the GROUP
+      BY shape pass, which points at AggInfo aCol/iSorterColumn
+      allocation order × LEFT-JOIN NullRow interaction in
+      updateAccumulatorSimple.  Blocks `.lint fkey-indexes`
+      (10.1c.6 / 10.1.20), `.archive` (10.1.46), and `.recover`
+      (10.1.48).  Repro: `bin/passqlite3 /tmp/lint.db ".lint
+      fkey-indexes"` on any schema with FK constraints prints
+      "EAccessViolation: Access violation"; upstream prints one
+      `CREATE INDEX …` line per uncovered FK.
 
     Subtasks (each lands independently; gate names are proposed):
 
