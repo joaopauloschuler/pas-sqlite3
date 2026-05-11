@@ -798,6 +798,12 @@ function  sqlite3Pcache1Mutex: Psqlite3_mutex;
 var
   gPcache1Mutex: Psqlite3_mutex = nil;  { set by pcache1Init — interface-visible }
 
+  { Hook installed by passqlite3pcache.initialization so sqlite3_config can
+    populate sqlite3GlobalConfig.pcache2 with defaults from SQLITE_CONFIG_GETPCACHE2
+    without a circular uses-clause (passqlite3pcache already uses passqlite3util).
+    Mirrors C main.c:564..574 — call SetDefault when xInit==0 before copying. }
+  gPCacheSetDefaultHook: procedure = nil;
+
 { printf hook — installed by passqlite3printf.initialization to break the
   uses cycle (passqlite3printf already imports passqlite3util).  When set,
   sqlite3_mprintf / sqlite3_snprintf route their format strings through
@@ -2249,14 +2255,24 @@ begin
       if pArg <> nil then
         sqlite3GlobalConfig.m := PTsqlite3_mem_methods(pArg)^;
     SQLITE_CONFIG_GETMALLOC:     { 5 }
-      if pArg <> nil then
+      if pArg <> nil then begin
+        { C main.c:503..511 — install defaults if not yet configured. }
+        if not Assigned(sqlite3GlobalConfig.m.xMalloc) then
+          sqlite3MemSetDefault;
         PTsqlite3_mem_methods(pArg)^ := sqlite3GlobalConfig.m;
+      end;
     SQLITE_CONFIG_PCACHE2:       { 14 }
       if pArg <> nil then
         sqlite3GlobalConfig.pcache2 := PTsqlite3_pcache_methods2(pArg)^;
     SQLITE_CONFIG_GETPCACHE2:    { 19 }
-      if pArg <> nil then
+      if pArg <> nil then begin
+        { C main.c:564..574 — install pcache1 defaults if not yet configured.
+          Hook is wired by passqlite3pcache.initialization. }
+        if (not Assigned(sqlite3GlobalConfig.pcache2.xInit))
+           and Assigned(gPCacheSetDefaultHook) then
+          gPCacheSetDefaultHook();
         PTsqlite3_pcache_methods2(pArg)^ := sqlite3GlobalConfig.pcache2;
+      end;
     { All other ops silently accepted for now }
   end;
 end;
