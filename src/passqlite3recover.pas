@@ -1974,9 +1974,9 @@ begin
       aHdr[60] := $FF; aHdr[61] := $FF; aHdr[62] := $FF; aHdr[63] := $FF;
       aHdr[64] := $FF; aHdr[65] := $FF; aHdr[66] := $FF; aHdr[67] := $FF;
       aHdr[68] := $FF; aHdr[69] := $FF; aHdr[70] := $FF; aHdr[71] := $FF;
-      aHdr[101] := $2e; aHdr[102] := $5b; aHdr[103] := $30;
-      aHdr[104] := $0D; aHdr[105] := $00; aHdr[106] := $00; aHdr[107] := $00;
-      { (the sentinel 0xFF/0xFF at 105/106 is overwritten below.) }
+      aHdr[97]  := $2e; aHdr[98]  := $5b; aHdr[99]  := $30;
+      aHdr[100] := $0D;
+      { aHdr[105/106] = 0xFF/0xFF is overwritten below by recoverPutU16. }
 
       a := PByte(aBuf);
       pgsz     := recoverGetU16(a + 16);

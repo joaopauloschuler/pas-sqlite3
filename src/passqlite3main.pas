@@ -2751,14 +2751,19 @@ begin
     (A qualified "<dbname>.<table>" form still trips the codegen's
     silent-bail on qualified lookups; revisit when that gate is
     closed.) }
+  { vdbe.c:7152..7154 — qualify the schema name with the per-db zDbSName
+    so OP_ParseSchema reads from the correct attached database's
+    sqlite_master.  Without the qualifier, every iDb>0 fell through to
+    main's sqlite_master and CREATE TABLE in attached dbs never appeared
+    in the cache. }
   if iDb = 1 then
     zSql := sqlite3MPrintf(db,
               'SELECT type,name,tbl_name,rootpage,sql FROM %s',
               [LEGACY_TEMP_SCHEMA_TABLE])
   else
     zSql := sqlite3MPrintf(db,
-              'SELECT type,name,tbl_name,rootpage,sql FROM %s',
-              [LEGACY_SCHEMA_TABLE]);
+              'SELECT type,name,tbl_name,rootpage,sql FROM "%w".%s',
+              [db^.aDb[iDb].zDbSName, LEGACY_SCHEMA_TABLE]);
   if zSql = nil then begin
     Result := SQLITE_NOMEM;
     Exit;

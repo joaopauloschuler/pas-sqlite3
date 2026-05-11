@@ -25472,8 +25472,10 @@ begin
     pTab  := pItem^.pSTab;
     if p^.pSrc^.nSrc = 1 then
     begin
-      if (pTab = nil)
-         or (pTab^.eTabType = TABTYP_VTAB)
+      { Single-source GROUP BY.  Match select.c:8456 — no special bail
+        for vtab sources; WhereBegin / whereLoopAddVirtual handle them
+        with lateral-arg pushdown (bug 6.13.B closed). }
+      if pTab = nil
       then begin Result := SQLITE_OK; Exit; end;
       { 10.1.bug.90 — subquery source: route through the coroutine /
         eph-materialise loop below instead of WhereBegin.  TF_Ephemeral
