@@ -8431,6 +8431,17 @@ end;
     * Otherwise append to zSql; once sqlite3_complete returns true on
       a semicolon-terminated buffer, hand off to runOneSqlLine.
   ---------------------------------------------------------------------- }
+{ shell.c.in:12365..12371 — echo_group_input.  When `.echo on`, the next
+  SQL statement or dot-command line is echoed to the current output sink
+  immediately before it runs.  Mirrors upstream cli_printf+fflush. }
+procedure echoGroupInput(p: PShellState; const zDo: AnsiString);
+begin
+  if (p^.mode.mFlags and MFLG_ECHO) <> 0 then begin
+    WriteLn(zDo);
+    Flush(Output);
+  end;
+end;
+
 function processInput(p: PShellState): i32;
 var
   zLine, zSql: AnsiString;
@@ -8465,9 +8476,13 @@ begin
     end;
     Inc(p^.lineno);
 
-    if (zSql = '') and isPlainWhiteOrComment(zLine) then Continue;
+    if (zSql = '') and isPlainWhiteOrComment(zLine) then begin
+      echoGroupInput(p, zLine);
+      Continue;
+    end;
 
     if (zSql = '') and (startsWithDot(zLine) or startsWithHash(zLine)) then begin
+      echoGroupInput(p, zLine);
       if startsWithDot(zLine) then begin
         rc := doMetaCommand(zLine, p);
         if rc = 2 then Break       { .quit / .exit }
@@ -8499,6 +8514,7 @@ begin
       accumulating subsequent statements into one over-long prepare. }
     if (zSql <> '') and (sqlite3_complete(PAnsiChar(zSql)) <> 0) then
     begin
+      echoGroupInput(p, zSql);
       Inc(errCnt, runOneSqlLine(p, zSql, AnsiString(p^.zInFile), startLine));
       zSql := '';
       { shell.c.in:12512..12517 — at end of each SQL line, immediately
@@ -8509,8 +8525,10 @@ begin
       end;
     end;
   end;
-  if zSql <> '' then
+  if zSql <> '' then begin
+    echoGroupInput(p, zSql);
     Inc(errCnt, runOneSqlLine(p, zSql, AnsiString(p^.zInFile), startLine));
+  end;
   Dec(p^.inputNesting);
   if errCnt > 0 then Result := 1 else Result := 0;
 end;
