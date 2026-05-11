@@ -24591,10 +24591,15 @@ begin
     end;
   end;
 
-  if p^.pSrc = nil then begin Result := SQLITE_OK; Exit; end;
+  { No-FROM SELECT with windows still needs the window arm below; the
+    rewrite synthesises a single-item pSrc.  Skip the no-FROM short-circuit
+    when pWin is set so control reaches sqlite3WindowRewrite. }
+  if (p^.pSrc = nil) and (p^.pWin = nil) then
+    begin Result := SQLITE_OK; Exit; end;
   { Multi-table join gate: nSrc>=1.  3+ table gate lifted 2026-05-08;
     sqlite3WhereBegin handles arbitrary nLevel via the multi-loop driver. }
-  if p^.pSrc^.nSrc < 1 then begin Result := SQLITE_OK; Exit; end;
+  if (p^.pSrc <> nil) and (p^.pSrc^.nSrc < 1) and (p^.pWin = nil) then
+    begin Result := SQLITE_OK; Exit; end;
   if p^.pEList = nil then begin Result := SQLITE_OK; Exit; end;
   if p^.pEList^.nExpr < 1 then begin Result := SQLITE_OK; Exit; end;
   { p^.pWhere <> nil gate lifted in sub-progress 9 — sqlite3WhereBegin
