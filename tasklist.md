@@ -95,6 +95,49 @@ FPC porting traps that recur often enough to call out up-front:
       sqlite3 against `/tmp/lint.db`.  Phase 10.1.20 / 10.1.46 /
       10.1.48 unblocked.
 
+- [ ] **6.17** OR-decomposed Case-5 codegen + LIKE/GLOB range-bound
+      prefix truncation — opened 2026-05-11 from `.archive`/`.ar`
+      positional-name filters (see 10.1.46).  Two independent
+      sub-bugs sharing the same gate (the .archive filtered flows):
+
+    - [ ] **6.17.A** OR-decomposed Case-5 codegen references an
+          un-opened table cursor.  Minimal repro outside .archive:
+          `CREATE TABLE t(name TEXT PRIMARY KEY);
+           INSERT INTO t VALUES('a/b'),('c');
+           SELECT name FROM t WHERE name='c' OR name>'a';`
+          → EAccessViolation at `OP_Column` reading `pCol^.nField`
+          on a nil cursor (passqlite3vdbe.pas:8180).  EXPLAIN shows
+          two index searches joined via OP_RowSetTest + Gosub to a
+          subroutine that emits `Column|1` after OpenRead only
+          allocates cursors 0,2,3.  C oracle on same schema/query
+          picks a single full-scan plan instead; ours takes the
+          OR-decomposition path but emits a Case-5 body that uses
+          the wrong cursor index.  Suspect: the index→table cursor
+          rewrite at codegen.pas:19422 (`WHERE_MULTI_OR` arm using
+          `pLevel^.u.pCoveringIdx`) does not run / runs with nil.
+
+    - [ ] **6.17.B** LIKE/GLOB range-bound prefix truncation never
+          reaches `OP_String8`.  Minimal repro:
+          `SELECT name FROM sqlar WHERE name GLOB 'src/dir1/*'`
+          on an archive that contains `src/dir1/b.txt` returns
+          zero rows from our shell but the expected row from C.
+          EXPLAIN shows `String8 'src/dir1/*'` / `String8
+          'src/dir1/+'` as the SeekGE / IdxGE keys — both still
+          carry the trailing `*`, where C emits the truncated
+          prefix `'src/dir1/'` / `'src/dir10'` (last byte of
+          the prefix incremented).  `isLikeOrGlob` does write the
+          null terminator (`zNew[cnt] := #0` at
+          codegen.pas:11021) and the iFrom/iTo dequote loop ends
+          with `zNew[iTo] := #0`, but the OP_String8 emission
+          still picks up the original 10-byte token.  Suspect:
+          either sqlite3ExprDup at codegen.pas:12223 is copying
+          the raw allocation rather than respecting the new
+          strlen, or the caller wraps pStr1 in a TK_GE term that
+          re-reads the original RHS pattern instead of pStr1.
+          Both branches (lower bound from pStr1 and upper from
+          pStr2) emit the un-truncated string, so the dup is the
+          most likely culprit.
+
     Subtasks (each lands independently; gate names are proposed):
 
     - [X] **6.13.B.1** Scout pass — `TWhereLoopVtab` (codegen.pas:1336)
