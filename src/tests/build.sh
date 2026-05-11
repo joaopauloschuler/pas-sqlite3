@@ -164,6 +164,7 @@ compile_test TestSerialize
 compile_test TestUnlockNotify
 compile_test TestLoadExt
 compile_test TestRowidIn
+compile_test TestShellTrustedSchema
 compile_test TestExplainParity
 compile_test TestBytecodeParity
 compile_test TestWhereCorpus

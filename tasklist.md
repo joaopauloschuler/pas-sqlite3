@@ -324,6 +324,7 @@ and constraints flow once that lands.
 - [X] **10.1.bug.126** JSON-function malformed-input errors silently swallowed (jsonConvertTextToBlob + jsonParseFuncArg sinks).
 - [X] **10.1.bug.127** ORDER BY+LIMIT silently dropped sort on coroutine FROM (drop pLimit=nil gate; route LIMIT/OFFSET through sort tail). Bonus: signFunc must use numeric_type, not value_type.
 - [X] **10.1.bug.128** CLI step-error prefix should be `Error near line N:` (no `Runtime error`, no `(rc)` suffix) — upstream's step-time path.
+- [X] **10.1.bug.129** CLI openDb missed `sqlite3_db_config(TRUSTED_SCHEMA=0, DEFENSIVE=1, STMT_SCANSTATUS=0)` from shell.c.in:4530..4537; `PRAGMA trusted_schema;` returned engine default 1 instead of CLI default 0. Regression: bin/TestShellTrustedSchema.
 
 ---
 

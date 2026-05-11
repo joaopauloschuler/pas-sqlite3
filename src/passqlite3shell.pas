@@ -893,6 +893,18 @@ begin
   end;
   globalDb := p^.db;
   p^.pAuxDb^.db := p^.db;
+  { Mirror shell.c.in:4530..4537 — reset scan-status, reflect --unsafe-testing
+    on TRUSTED_SCHEMA / DEFENSIVE.  Without this the connection defaults
+    leave TrustedSchema on, which diverges from the C oracle CLI on the
+    `PRAGMA trusted_schema;` / `PRAGMA defensive;` round-trip. }
+  sqlite3_db_config_int(p^.db, SQLITE_DBCONFIG_STMT_SCANSTATUS, 0, nil);
+  if (p^.shellFlgs and SHFLG_TestingMode) <> 0 then begin
+    sqlite3_db_config_int(p^.db, SQLITE_DBCONFIG_TRUSTED_SCHEMA, 1, nil);
+    sqlite3_db_config_int(p^.db, SQLITE_DBCONFIG_DEFENSIVE,      0, nil);
+  end else begin
+    sqlite3_db_config_int(p^.db, SQLITE_DBCONFIG_TRUSTED_SCHEMA, 0, nil);
+    sqlite3_db_config_int(p^.db, SQLITE_DBCONFIG_DEFENSIVE,      1, nil);
+  end;
   { Built-in shell SQL UDFs — strtod / dtostr / shell_add_schema /
     shell_module_schema / shell_putsnl / usleep.  Mirrors shell.c.in
     open_db registration block (4590..4607). }
