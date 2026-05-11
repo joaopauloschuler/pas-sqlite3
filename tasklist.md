@@ -532,12 +532,19 @@ partial landings cannot silently no-op.
           the CSV reader via `sCtx.zIn` (shell.c.in:7601..7637).  Landed
           via `TImportCtx.zIn`/`zInCur` + `importGetc` heredoc arm; error
           path mirrors `shellErrorLocation` "line N:" / "<file>:N:" prefix.
-    - [ ] **10.1d.3.b** Pipe input — `FILE` of the form `|cmd` does
+    - [X] **10.1d.3.b** Pipe input — `FILE` of the form `|cmd` does
           `sqlite3_popen(zFile+1,"r")` and sets `xCloser = pclose`
-          (shell.c.in:7593..7600).  FPC has `popen`/`pclose` via the
-          `BaseUnix` unit; mirror upstream's safe-mode guard
-          (`failIfSafeMode(p, "cannot run .import in safe mode")`) and
-          the `"<pipe>"` filename swap.  Independent of 10.1d.3.a.
+          (shell.c.in:7593..7600).  Landed via libc-bound
+          `shellLibcPOpen`/`shellLibcPClose`/`shellLibcFRead`
+          (passqlite3shell.pas:4639..4647), `TImportCtx.pipeFile`/
+          `pipeOpen` (passqlite3shell.pas:7665..7669), `importGetc`
+          pipe-`fread` arm (passqlite3shell.pas:7729..7733) and the pipe
+          branch in `cmdImport` (passqlite3shell.pas:8185..8202) with
+          `sCtx.zFile := '<pipe>'` swap.  Safe-mode gate landed inline
+          at function entry (passqlite3shell.pas:8072..8085) — emits
+          `cannot run .import in safe mode` via the
+          `shellErrorLocation` "line N:" / "<file>:N:" prefix and
+          `Halt(1)`s (matching C `failIfSafeMode`).
   - [X] **10.1d.4** `.output` / `.once` — landed under 10.1.25.
         Editor / spreadsheet / web-browser (`-e`/`-x`/`-w`) variants and
         pipe targets (`|cmd`) intentionally not gated here; tracked as a
@@ -585,11 +592,15 @@ partial landings cannot silently no-op.
         through the existing CSV/ASCII reader via `sCtx.zIn` / `zInCur`
         (importGetc heredoc arm).  Error: `Content terminator "%s" not
         found.` (shell.c.in:7634) with `line N:` / `<file>:N:` prefix.
-  - [ ] **10.1.24.b** Pipe input (`FILE` = `|cmd`) — see
-        [10.1d.3.b](#10.1d).  `popen(zFile+1,"r")` via FPC `BaseUnix`,
-        `sCtx.zFile := '<pipe>'`, `xCloser := @pclose`.  Gated behind
-        the existing `failIfSafeMode(p, 'cannot run .import in safe
-        mode')` already in `cmdImport`.
+  - [X] **10.1.24.b** Pipe input (`FILE` = `|cmd`) — landed jointly
+        with [10.1d.3.b](#10.1d).  Uses libc-bound popen/pclose/fread
+        (passqlite3shell.pas:4639..4647), wired through
+        `TImportCtx.pipeFile`/`pipeOpen` and `importGetc`'s pipe-fread
+        arm (passqlite3shell.pas:7665..7733); pipe arm at
+        passqlite3shell.pas:8185..8202 swaps `sCtx.zFile := '<pipe>'`
+        on success and errors `Error: cannot open "%s"` on popen failure.
+        Safe-mode gate at passqlite3shell.pas:8072..8085 mirrors C
+        `failIfSafeMode(p, "cannot run .import in safe mode")`.
 - [~] **10.1.27** `.open` — `cmdOpen` at passqlite3shell.pas:4977 covers
       the base flag set (`-new`, `-readonly`, `-exclusive`, `-ifexists`,
       `-nofollow`).  Backing ports for the VFS/format modes

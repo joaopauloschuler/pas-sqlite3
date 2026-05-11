@@ -4631,6 +4631,20 @@ function shellGetTimeOfDay(tp: Pointer; tzp: Pointer): cint;
 var
   shellLibcStderr: Pointer; external 'c' name 'stderr';
 
+{ 10.1.24.b — libc popen/pclose/fread/fclose for the .import "|cmd" arm.
+  Bound directly because FPC's Unix.POpen returns a pid bound to a
+  Text/file variable, which doesn't compose with importGetc's byte-at-a-
+  time read loop.  Mirrors C shell.c.in:7593..7600 which calls
+  sqlite3_popen / pclose against a FILE*. }
+function shellLibcPOpen(cmd, mode: PAnsiChar): Pointer;
+  cdecl; external 'c' name 'popen';
+function shellLibcPClose(stream: Pointer): cint;
+  cdecl; external 'c' name 'pclose';
+function shellLibcFRead(buf: Pointer; size, n: PtrUInt; stream: Pointer): PtrUInt;
+  cdecl; external 'c' name 'fread';
+function shellLibcFClose(stream: Pointer): cint;
+  cdecl; external 'c' name 'fclose';
+
 var
   shellTimerBeginRU: TRUsagePas;
   shellTimerBeginNs: i64;
@@ -7648,6 +7662,12 @@ type
       Mirrors C ImportCtx.zIn (shell.c.in:6788..6789). }
     zIn:       PAnsiChar;
     zInCur:    PAnsiChar;
+    { 10.1.24.b — pipe input arm.  When pipeOpen=True importGetc reads
+      from pipeFile (a libc FILE* returned by popen); importCleanup
+      pcloses it.  Mirrors C ImportCtx.in + xCloser=pclose
+      (shell.c.in:7593..7600). }
+    pipeFile:  Pointer;
+    pipeOpen:  Boolean;
     z:         AnsiString;       { Accumulated text for one field }
     nLine:     i32;              { Current line number }
     nRow:      i32;              { Number of rows imported }
@@ -7672,6 +7692,13 @@ begin
     FpClose(p.inHandle);
     p.inOpen := False;
     p.inHandle := THandle(-1);
+  end;
+  { 10.1.24.b — pclose() the popen()'d pipe.  Mirrors C xCloser=pclose
+    invocation in import_cleanup (shell.c.in:6810..6814). }
+  if p.pipeOpen then begin
+    shellLibcPClose(p.pipeFile);
+    p.pipeOpen := False;
+    p.pipeFile := nil;
   end;
   if p.zIn <> nil then begin
     sqlite3_free(p.zIn);
@@ -7699,7 +7726,13 @@ begin
   end;
   if p.bufPos >= p.bufLen then begin
     if p.atEof then begin Result := IMPORT_EOF; Exit; end;
-    n := FpRead(p.inHandle, p.buf, SizeOf(p.buf));
+    { 10.1.24.b — pipe arm reads via libc fread() against the popen'd
+      FILE*; everything else still uses the FpRead/inHandle path. }
+    if p.pipeOpen then
+      n := SizeInt(shellLibcFRead(@p.buf[0], 1, PtrUInt(SizeOf(p.buf)),
+                                  p.pipeFile))
+    else
+      n := FpRead(p.inHandle, p.buf, SizeOf(p.buf));
     if n <= 0 then begin
       p.atEof := True;
       Result := IMPORT_EOF;
@@ -8036,6 +8069,22 @@ var
   iStart, savedLn: i64;
   atEof: Boolean;
 begin
+  { 10.1.24.b — failIfSafeMode gate at .import entry.  Mirrors C
+    failIfSafeMode(p, "cannot run .import in safe mode") at
+    shell.c.in:7502 (which formats via shellErrorLocation, writes to
+    stderr, and cli_exit(1)).  Replicate shellErrorLocation inline
+    (shell.c.in:1779..1789). }
+  if p^.bSafeMode <> 0 then begin
+    if p^.zErrPrefix <> nil then
+      shellEPutZ(AnsiString(p^.zErrPrefix) + ' cannot run .import in safe mode'#10)
+    else if (p^.zInFile = nil) or (StrComp(p^.zInFile, '<stdin>') = 0) then
+      shellEPutZ(Format('line %d: cannot run .import in safe mode'#10,
+        [Int64(p^.lineno)]))
+    else
+      shellEPutZ(Format('%s:%d: cannot run .import in safe mode'#10,
+        [string(AnsiString(p^.zInFile)), Int64(p^.lineno)]));
+    Halt(1);
+  end;
   importInit(sCtx);
   if p^.mode.eMode = MODE_Ascii then
     xRead := @asciiReadOneField
@@ -8134,9 +8183,25 @@ begin
   sCtx.nLine := 1;
 
   if (Length(zFile) > 0) and (zFile[1] = '|') then begin
-    shellEPutZ('Error: pipes are not supported in this build'#10);
-    Exit;
-  end;
+    { 10.1.24.b — pipe arm.  Mirrors C shell.c.in:7593..7600:
+        sCtx.in     = popen(zFile+1, "r");
+        sCtx.zFile  = "<pipe>";
+        sCtx.xCloser = pclose;
+      We bind libc popen/pclose directly (see shellLibcPOpen) and route
+      reads through importGetc's pipeFile branch. }
+    sCtx.pipeFile := shellLibcPOpen(PAnsiChar(Copy(zFile, 2, Length(zFile) - 1)),
+                                    PAnsiChar('r'));
+    if sCtx.pipeFile = nil then begin
+      { Mirror C dotCmdError(p, 0, 0, "cannot open \"%s\"", zFile) which
+        keeps the original "|cmd" string in the message — sCtx.zFile is
+        only swapped to "<pipe>" on success.  shell.c.in:7644. }
+      shellEPutZ(Format('Error: cannot open "%s"'#10, [zFile]));
+      importCleanup(sCtx);
+      Exit;
+    end;
+    sCtx.pipeOpen := True;
+    sCtx.zFile := '<pipe>';
+  end else
   if (Length(zFile) > 2) and (zFile[1] = '<') and (zFile[2] = '<') then begin
     { 10.1.24.a — heredoc arm.  shell.c.in:7601..7637.
       zFile = '<<MARK': read subsequent script lines into an sqlite3_str
