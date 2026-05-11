@@ -380,13 +380,68 @@ partial landings cannot silently no-op.
 
 ### 10.1a Skeleton + arg parsing + REPL loop
 
-- [~] **10.1a** Skeleton landed; full arg-parser coverage pending under 10.1.3. Gate: `tests/cli/10a_repl/` (not yet created — 10.2 will scaffold it).
+- [~] **10.1a** Skeleton landed; remaining deferrals broken out into 10.1.2.a/b/c and 10.1.3.a/b/c below.  Gate: `tests/cli/10a_repl/` scaffolded under 10.1a.G (was previously punted to 10.2).
 - [X] **10.1.1** ShellState record + global state.
-- [~] **10.1.2** processInput / oneInputLine REPL core landed; `.echo` plumbing and the upstream `quickscan` state machine deferred.
-- [~] **10.1.3** main + process_command_line argument parser — full two-pass parser; process_sqliterc / -init contents loading + memtrace/pcachetrace FILE* sinks still deferred.
+- [~] **10.1.2** processInput / oneInputLine REPL core landed; `echoGroupInput`
+      hook is wired (passqlite3shell.pas:8881 / 8924 / 8929 / 8961 / 8973) and
+      `.echo` toggles MFLG_ECHO (passqlite3shell.pas:3672).  Upstream
+      `quickscan` state machine still stubbed — broken out below.
+  - [ ] **10.1.2.a** Port `QuickScanState` + `quickscan()` (shell.c.in:12086..12175).
+        Two-state walker (PlainScan / TermScan) tracking
+        `QSS_HasDark | QSS_EndingSemi | cWait` for `--` line comments,
+        `/* … */` block comments, `[..]` / `'..'` / `"..."` / `` `..` ``
+        quoted runs, and `(..)` depth.  Land as `quickScan(zLine: PAnsiChar;
+        qss: TQuickScanState; pst: PContinuePromptState): TQuickScanState`
+        beside the existing `isPlainWhiteOrComment` helper at
+        passqlite3shell.pas:1382.  Replace the `sqlite3_complete`-only gate at
+        passqlite3shell.pas:8959 with `QSS_SEMITERM(qss) and
+        sqlite3_complete(...)` to fix the trailing `-- comment` after `;`
+        case noted in the inline comment at 8951..8958.
+  - [ ] **10.1.2.b** Port `line_is_command_terminator` (shell.c.in:12182..12191)
+        so SQL Server `go` and Oracle `/` line terminators rewrite to `;` per
+        upstream's `memcpy(zLine,";",2)` at shell.c.in:12456.  Depends on
+        10.1.2.a (calls `quickscan` on the trailing tail).
+  - [ ] **10.1.2.c** Wire `CONTINUE_PROMPT_PSTATE` continuation-prompt tracker
+        (shell.c.in: `CONTINUE_PROMPT_AWAITS` / `_AWAITC` /
+        `_PAREN_INCR` / `_RESET`).  Currently `oneInputLine` always emits the
+        plain continuation prompt `   ...> `; upstream switches to the
+        delimiter-aware prompt `   /*` / `   '` / `   (x2` when nested.
+        Touches the prompt sink at passqlite3shell.pas:1355 plus the
+        `CONTINUE_PROMPT_RESET` call sites in `processInput`.
+- [~] **10.1.3** main + process_command_line two-pass arg parser landed.
+      Three deferrals broken out:
+  - [ ] **10.1.3.a** Port `find_home_dir` + `find_xdg_file` +
+        `process_sqliterc` (shell.c.in:12548..12714).  Sequence: lookup
+        `XDG_CONFIG_HOME/sqlite3/sqliterc` (fall back to `~/.config/...`
+        then `~/.sqliterc`).  Call `process_input(p, sqliterc)` with `p^.in`
+        swapped to the rc handle, save/restore `zInFile` + `lineno`.  Honour
+        `bail_on_error` on a user-supplied `-init` path miss.  Stub at
+        passqlite3shell.pas:9374..9378 (`if noInit then ; if zInitFile <> '' then ;`)
+        becomes the call site.
+  - [ ] **10.1.3.b** `-init <file>` payload loading — once 10.1.3.a lands,
+        `noInit=False` with `zInitFile=''` reads the default rc, and
+        `zInitFile<>''` forwards to `processSqliteRc(state, zInitFile)`
+        (mirrors shell.c.in:13309 `process_sqliterc(&data,zInitFile)`).
+        Independent test surface from 10.1.3.a — separate gate.
+  - [ ] **10.1.3.c** Wire `-memtrace` / `-pcachetrace` to the **stderr** sink
+        (shell.c.in:13196..13199 `sqlite3MemTraceActivate(stderr)` /
+        `sqlite3PcacheTraceActivate(stderr)`).  Port currently passes `nil`
+        at passqlite3shell.pas:9293..9294, silencing the traces entirely.
+        Needs a `Pointer` handle for FPC's stderr that the trace callbacks
+        can fprintf into — either `GetStdHandle(STD_ERROR_HANDLE)` analogue
+        via `__stderrp` / `stderr` C symbol or a libc `fdopen(2,"w")`.
+        Same hook needed by `.memtrace on` / `.pcachetrace on` dot-commands
+        in the do_meta_command dispatcher.
 - [X] **10.1.4** Line reader (basic LF/CRLF). GNU readline integration deferred.
 - [X] **10.1.5** Exit-code mapping + interrupt_handler + SIGINT wiring.
 - [X] **10.1.6** do_meta_command dispatcher skeleton.
+- [ ] **10.1a.G** Gate: scaffold `tests/cli/10a_repl/` — golden-diff harness
+      that pipes a fixed script (mixed `.dot` cmds, multi-line SQL,
+      `--`/`/* */` comments, `'..'` and `"..."` strings, `go`/`/` terminators,
+      `~/.sqliterc` + `-init` loading, `-memtrace`/`-pcachetrace` stderr
+      capture) into both `bin/passqlite3` and the upstream `sqlite3` and
+      diffs stdout+stderr byte-for-byte.  Move 10.1a from `[~]` to `[X]`
+      once 10.1.2.a..c, 10.1.3.a..c and this gate are green.
 
 ### 10.1b Output modes + formatting controls
 
