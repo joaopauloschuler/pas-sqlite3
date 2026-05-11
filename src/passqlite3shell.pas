@@ -120,6 +120,7 @@ uses
   passqlite3memtrace,
   passqlite3pcachetrace,
   passqlite3recover,
+  passqlite3expert,
   passqlite3main;
 
 { ----------------------------------------------------------------------
@@ -388,6 +389,10 @@ type
     pAuxDb:           PAuxDb;
     zNonce:           PAnsiChar;
     dot:              TDotCmdLine;
+    { shell.c.in:334..336 ExpertInfo — populated by .expert dot command,
+      consumed by runOneSqlLine to route the next SQL through expert. }
+    expertPtr:        Psqlite3expert;
+    expertVerbose:    i32;
   end;
   PShellState = ^TShellState;
 
@@ -2645,6 +2650,13 @@ begin
   if pQ <> nil then sqlite3_finalize(pQ);
 end;
 
+{ Forward declarations for expert routing inside runOneSqlLine.  Bodies
+  live with cmdExpert further down (~line 6735). }
+function expertHandleSQL(p: PShellState; zSql: PAnsiChar;
+                         pzErr: PPAnsiChar): i32; forward;
+function expertFinish(p: PShellState; bCancel: i32;
+                      pzErr: PPAnsiChar): i32; forward;
+
 function runOneSqlLine(p: PShellState; const zSql: AnsiString;
                        const zSrc: AnsiString; lineno: i64): i32;
 { Hold zSql as a single immutable AnsiString and walk pCursor through its
@@ -2661,10 +2673,28 @@ var
   pBase, pCursor, pEnd: PAnsiChar;
   zStmtSql: AnsiString;
   zCtx: AnsiString;
+var
+  rcExp, rcExp2: i32;
+  zExpErr: PAnsiChar;
 begin
   Result := 0;
   if p^.db = nil then openDb(p, 0);
   if Length(zSql) = 0 then Exit;
+  { shell.c.in:3268 — when .expert is active, route the current SQL
+    through the expert engine and immediately finalize/report. }
+  if p^.expertPtr <> nil then begin
+    zExpErr := nil;
+    rcExp := expertHandleSQL(p, PAnsiChar(zSql), @zExpErr);
+    if rcExp <> SQLITE_OK then rcExp2 := 1 else rcExp2 := 0;
+    rcExp := expertFinish(p, rcExp2, @zExpErr);
+    if (rcExp <> SQLITE_OK) or (rcExp2 <> 0) then begin
+      if zExpErr <> nil then
+        shellEPutZ('Error: ' + AnsiString(zExpErr) + sLineBreak);
+      Inc(Result);
+    end;
+    if zExpErr <> nil then sqlite3_free(zExpErr);
+    Exit;
+  end;
   pBase := PAnsiChar(zSql);
   pEnd := pBase + Length(zSql);
   pCursor := pBase;
@@ -6676,15 +6706,110 @@ begin
 end;
 
 { ----------------------------------------------------------------------
-  10.1.21  `.expert ?OPTS?`  — disabled stub  (shell.c.in 9442..9469)
+  10.1.21  `.expert ?OPTS?`  — shell.c.in:3088..3208 + 9518..9536
 
-  The upstream implementation wraps sqlite3_expert.c which we have not
-  yet ported; emit the same disabled message until that lands.
+  Activates the sqlite3_expert engine on the current database.  The
+  subsequent SQL statement (consumed by runOneSqlLine) is forwarded to
+  sqlite3_expert_sql() and then immediately reported via
+  sqlite3_expert_analyze() / _report().
   ---------------------------------------------------------------------- }
 
-procedure cmdExpert;
+procedure expertReport(p: PShellState);
+var
+  pE: Psqlite3expert;
+  i, nQuery, bVerbose: i32;
+  zCand, zSql, zIdx, zEQP: PAnsiChar;
 begin
-  shellEPutZ('Error: this build does not support the .expert command'#10);
+  pE := p^.expertPtr;
+  bVerbose := p^.expertVerbose;
+  nQuery := sqlite3_expert_count(pE);
+  if bVerbose <> 0 then begin
+    zCand := sqlite3_expert_report(pE, 0, EXPERT_REPORT_CANDIDATES);
+    shellSPutZ('-- Candidates -----------------------------'#10);
+    if zCand <> nil then shellSPutZ(AnsiString(zCand) + #10);
+  end;
+  for i := 0 to nQuery-1 do begin
+    zSql := sqlite3_expert_report(pE, i, EXPERT_REPORT_SQL);
+    zIdx := sqlite3_expert_report(pE, i, EXPERT_REPORT_INDEXES);
+    zEQP := sqlite3_expert_report(pE, i, EXPERT_REPORT_PLAN);
+    if zIdx = nil then zIdx := '(no new indexes)'#10;
+    if bVerbose <> 0 then
+      shellSPutZ(Format('-- Query %d --------------------------------'#10
+                       + '%s'#10#10,
+                       [i+1, AnsiString(zSql)]));
+    shellSPutZ(AnsiString(zIdx) + #10);
+    if zEQP <> nil then shellSPutZ(AnsiString(zEQP) + #10);
+  end;
+end;
+
+function expertFinish(p: PShellState; bCancel: i32;
+                      pzErr: PPAnsiChar): i32;
+var rc: i32; pE: Psqlite3expert;
+begin
+  rc := SQLITE_OK;
+  pE := p^.expertPtr;
+  if bCancel = 0 then begin
+    rc := sqlite3_expert_analyze(pE, pzErr);
+    if rc = SQLITE_OK then expertReport(p);
+  end;
+  sqlite3_expert_destroy(pE);
+  p^.expertPtr := nil;
+  Result := rc;
+end;
+
+function expertHandleSQL(p: PShellState; zSql: PAnsiChar;
+                         pzErr: PPAnsiChar): i32;
+begin
+  Result := sqlite3_expert_sql(p^.expertPtr, zSql, pzErr);
+end;
+
+procedure cmdExpert(p: PShellState; const args: array of AnsiString;
+                    nArg: SizeInt);
+var
+  i, n, iSample: i32;
+  zErr: PAnsiChar;
+  z: AnsiString;
+begin
+  Assert(p^.expertPtr = nil);
+  p^.expertVerbose := 0;
+  iSample := 0;
+  zErr := nil;
+
+  i := 0;
+  while i < nArg do begin
+    z := args[i];
+    if (Length(z) >= 2) and (z[1] = '-') and (z[2] = '-') then
+      Delete(z, 1, 1);
+    n := Length(z);
+    if (n >= 2) and (LeftStr(z, n) = LeftStr('-verbose', n)) then
+      p^.expertVerbose := 1
+    else if (n >= 2) and (LeftStr(z, n) = LeftStr('-sample', n)) then begin
+      if i = nArg-1 then begin
+        shellEPutZ('option requires an argument: ' + z + sLineBreak); Exit;
+      end;
+      Inc(i);
+      iSample := StrToIntDef(string(args[i]), 0);
+      if (iSample < 0) or (iSample > 100) then begin
+        shellEPutZ('value out of range: ' + args[i] + sLineBreak); Exit;
+      end;
+    end else begin
+      shellEPutZ('unknown option: ' + z + sLineBreak); Exit;
+    end;
+    Inc(i);
+  end;
+
+  openDb(p, 0);
+  p^.expertPtr := sqlite3_expert_new(p^.db, @zErr);
+  if p^.expertPtr = nil then begin
+    if zErr <> nil then begin
+      shellEPutZ('sqlite3_expert_new: ' + AnsiString(zErr) + sLineBreak);
+      sqlite3_free(zErr);
+    end else
+      shellEPutZ('sqlite3_expert_new: out of memory'#10);
+    Exit;
+  end;
+  sqlite3_expert_config(p^.expertPtr, EXPERT_CONFIG_SAMPLE, iSample);
+  if zErr <> nil then sqlite3_free(zErr);
 end;
 
 { ----------------------------------------------------------------------
@@ -8703,7 +8828,7 @@ begin
   if zCmd = 'testctrl'  then begin cmdTestctrl(p, args, nArg); Exit; end;
   if zCmd = 'fullschema' then begin cmdFullschema(p, args, nArg); Exit; end;
   if zCmd = 'lint'      then begin cmdLint(p, args, nArg); Exit; end;
-  if zCmd = 'expert'    then begin cmdExpert; Result := 1; Exit; end;
+  if zCmd = 'expert'    then begin cmdExpert(p, args, nArg); Result := 1; Exit; end;
   if zCmd = 'recover'   then begin cmdRecover(p, args, nArg); Exit; end;
   if zCmd = 'session'   then begin cmdSession(p, args, nArg); Exit; end;
   if zCmd = 'iotrace'   then begin cmdIotrace(p, args, nArg); Exit; end;
@@ -9391,6 +9516,7 @@ begin
   end else
     Result := 0;
 
+  if state.expertPtr <> nil then expertFinish(@state, 1, nil);
   if state.db <> nil then begin
     closeDb(state.db);
     state.db := nil;

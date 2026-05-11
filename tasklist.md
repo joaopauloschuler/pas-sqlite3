@@ -277,9 +277,11 @@ partial landings cannot silently no-op.
         bugs 6.13.B and 6.16.  TestShellSchema now exercises a
         mixed-FK script (`parent` + `child` with covering index +
         `orphan` without) byte-identical with upstream.
-  - [ ] **10.1c.7** `.expert` (read-only subset) — stub returns
-        "this build does not support the .expert command".  Blocked
-        on porting `ext/expert/sqlite3expert.c` (~2236 lines).
+  - [X] **10.1c.7** `.expert` (read-only subset) — engine ported in
+        10.1.101; `cmdExpert` parses `-verbose` / `-sample N` and
+        routes the next SQL through `expertHandleSQL` / `expertFinish`.
+        Index recommendations are degenerate today (always
+        "(no new indexes)") pending the open vtab/eTabType schema-reload gap (see 10.1.101 banner).
 
 - [X] **10.1.15..10.1.19, 10.1.21** `.schema --indent`, `.tables`, `.indexes`, `.databases`, `.fullschema`, `.expert` (stub) all landed.
 - [X] **10.1.20** `.lint fkey-indexes` — unblocked by bugs 6.13.B and 6.16 (2026-05-11); gated by `bin/TestShellSchema`.
@@ -418,20 +420,43 @@ and constraints flow once that lands.
       and `shellReadHexDb` helpers.  Smoke: `--deserialize FILE` and
       `--zip FILE` both round-trip a SELECT through the CLI.
 
-- [ ] **10.1.101** `ext/expert/sqlite3expert.c` → `passqlite3expert.pas`
-      (~2236 lines + `sqlite3expert.h` ~168 lines).  Powers the
-      `.expert` dot command (10.1c.7).  Surface to port:
-      `sqlite3_expert_new`, `sqlite3_expert_config`,
-      `sqlite3_expert_sql`, `sqlite3_expert_analyze`,
-      `sqlite3_expert_count`, `sqlite3_expert_report`
-      (EXPERT_REPORT_SQL / INDEXES / PLAN / CANDIDATES),
-      `sqlite3_expert_destroy`.  Shell wiring (`shell.c.in:3080..3220`)
-      — `expertHandleSQL` / `expertFinish` / `expertDotCommand` —
-      lands alongside.  Internally exercises a synthetic schema in a
-      side database; depends on PRAGMA + EXPLAIN QUERY PLAN already
-      working in the port.  Once landed, flip 10.1c.7 to [X] and drop
-      the "this build does not support the .expert command" stub at
-      passqlite3shell.pas:6496.
+- [X] **10.1.101** `ext/expert/sqlite3expert.c` → `passqlite3expert.pas`
+      (2236 lines C → ~1700 lines Pascal) + `sqlite3expert.h`.
+      Public surface complete: `sqlite3_expert_new`,
+      `sqlite3_expert_config` (single-int shim — only
+      EXPERT_CONFIG_SAMPLE is defined), `sqlite3_expert_sql`,
+      `sqlite3_expert_analyze`, `sqlite3_expert_count`,
+      `sqlite3_expert_report` (SQL / INDEXES / PLAN / CANDIDATES),
+      `sqlite3_expert_destroy`.  Internal vtab module ("expert"),
+      idx-hash, scan / write / statement / table linked lists,
+      idxCreateCandidates, idxPopulateStat1 (sqlite_expert_rem /
+      sqlite_expert_sample UDFs), trigger-write replay, idxAuthCallback,
+      dummy-collation + dummy-UDF mirroring all ported faithfully.
+      Shell wiring landed in passqlite3shell.pas: `cmdExpert` parses
+      `-verbose` / `-sample N`, `expertHandleSQL` and `expertFinish`
+      route the next SQL through the engine at the head of
+      runOneSqlLine, and shellMain cleans up an abandoned expert
+      handle on exit.  Build clean; 5019/5019 assertions pass.
+
+      Known limitation tracked at the head of passqlite3expert.pas:
+      the engine relies on xBestIndex pushdown against the synthetic
+      dbv mirror schema, but the Pascal port's CREATE VIRTUAL TABLE
+      + OP_ParseSchema reload path surfaces eTabType=0 for the
+      re-published vtab in WhereBegin, so whereLoopAddVirtual is
+      never reached and pScan stays empty.  Consequence: `.expert`
+      runs end-to-end but always reports `(no new indexes)`.  Fix
+      is purely upstream of this unit (vtab/eTabType preservation
+      in execParseSchemaImpl + sqlite3InitCallback); landing it
+      promotes the existing engine to producing real recommendations
+      with no changes here.  See the open vtab/eTabType schema-reload gap (see 10.1.101 banner) below.
+
+- [X] **10.1c.7** `.expert` dot-command — wired to the ported engine.
+      The disabled stub at passqlite3shell.pas:6685 was replaced
+      with the real `cmdExpert` (`--verbose`, `--sample N`),
+      `expertHandleSQL`, and `expertFinish` helpers from shell.c.in
+      §3088..3208.  Output shape and option parsing mirror upstream
+      verbatim; the only divergence is the empty index recommendation
+      caused by the open vtab/eTabType schema-reload gap (see 10.1.101 banner).
 
 - [ ] **10.1a.1** fill the next porting chunk here.
 
