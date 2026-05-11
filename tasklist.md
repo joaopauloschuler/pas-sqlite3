@@ -436,7 +436,7 @@ partial landings cannot silently no-op.
         `(x1...>`, and `/* ...>` continuation prompts.
 - [~] **10.1.3** main + process_command_line two-pass arg parser landed.
       Three deferrals broken out:
-  - [ ] **10.1.3.a** Port `find_home_dir` + `find_xdg_file` +
+  - [X] **10.1.3.a** Port `find_home_dir` + `find_xdg_file` +
         `process_sqliterc` (shell.c.in:12548..12714).  Sequence: lookup
         `XDG_CONFIG_HOME/sqlite3/sqliterc` (fall back to `~/.config/...`
         then `~/.sqliterc`).  Call `process_input(p, sqliterc)` with `p^.in`
@@ -444,11 +444,18 @@ partial landings cannot silently no-op.
         `bail_on_error` on a user-supplied `-init` path miss.  Stub at
         passqlite3shell.pas:9374..9378 (`if noInit then ; if zInitFile <> '' then ;`)
         becomes the call site.
-  - [ ] **10.1.3.b** `-init <file>` payload loading — once 10.1.3.a lands,
+        **Done:** findHomeDir/findXdgFile/processSqliteRc landed; Linux-only
+        port skips Windows arms; getpwuid arm collapsed to $HOME (FPC base
+        RTL has no getpwuid).  Routes line reads through curInputText with
+        inFile sentinel marker for stdin-only guards.
+  - [X] **10.1.3.b** `-init <file>` payload loading — once 10.1.3.a lands,
         `noInit=False` with `zInitFile=''` reads the default rc, and
         `zInitFile<>''` forwards to `processSqliteRc(state, zInitFile)`
         (mirrors shell.c.in:13309 `process_sqliterc(&data,zInitFile)`).
         Independent test surface from 10.1.3.a — separate gate.
+        **Done:** stub replaced with `if not noInit then processSqliteRc(@state, zInitFile)`;
+        byte-identical to upstream on `-init`, default `~/.sqliterc`, and
+        `-bail -init /nonexistent` smoke tests.
   - [x] **10.1.3.c** Wire `-memtrace` / `-pcachetrace` to the **stderr** sink
         (shell.c.in:13196..13199 `sqlite3MemTraceActivate(stderr)` /
         `sqlite3PcacheTraceActivate(stderr)`).  Port currently passes `nil`

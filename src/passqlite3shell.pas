@@ -9499,6 +9499,147 @@ end;
   the Pascal port.  Pass-1 / pass-2 split is preserved as in C.
   ---------------------------------------------------------------------- }
 
+{ ----------------------------------------------------------------------
+  10.1.3.a  find_home_dir + find_xdg_file + process_sqliterc
+            — shell.c.in:12548..12714
+
+  Linux-only port: the WIN32/_WRS_KERNEL/__RTP__ arms in C are skipped
+  outright (passqlite3 README pins the supported targets to Linux), so
+  find_home_dir collapses to the getpwuid()/HOME lookup and
+  find_xdg_file is unconditional (no early `return 0` on Windows).
+
+  find_home_dir caches the result in a unit-scope AnsiString.  The C
+  function returns a malloc'd char* and the cached pointer remains
+  valid for the lifetime of the process; mirroring with a static
+  AnsiString and returning PAnsiChar(cached) is byte-equivalent.
+  ---------------------------------------------------------------------- }
+
+var
+  cachedHomeDir: AnsiString = '';
+
+function findHomeDir(clearFlag: Boolean): AnsiString;
+var
+  zEnv: PAnsiChar;
+begin
+  if clearFlag then begin
+    cachedHomeDir := '';
+    Result := '';
+    Exit;
+  end;
+  if cachedHomeDir <> '' then begin
+    Result := cachedHomeDir;
+    Exit;
+  end;
+
+  { Deviation: C tries getpwuid(getuid()) first, then falls back to
+    $HOME (shell.c.in:12564..12588).  FPC's BaseUnix does not expose a
+    getpwuid binding (lives in the optional `users` package), and the
+    fallback is the dominant arm on every modern Linux session.  We
+    skip the getpwuid arm and rely on $HOME directly — semantically
+    identical whenever $HOME is set, which is the case for any
+    interactive or systemd-service user. }
+  Result := '';
+  zEnv := fpGetenv('HOME');
+  if zEnv <> nil then Result := AnsiString(zEnv);
+
+  if Result <> '' then cachedHomeDir := Result;
+end;
+
+function findXdgFile(const zEnvVar, zSubdir, zBaseName: AnsiString): AnsiString;
+var
+  zXdgDir: PAnsiChar;
+  zHome, zPath: AnsiString;
+begin
+  Result := '';
+  zXdgDir := nil;
+  if zEnvVar <> '' then zXdgDir := fpGetenv(PAnsiChar(zEnvVar));
+  if zXdgDir <> nil then begin
+    zPath := AnsiString(zXdgDir) + '/' + zBaseName;
+  end else begin
+    zHome := findHomeDir(False);
+    if zHome = '' then Exit;
+    if zSubdir <> '' then
+      zPath := zHome + '/' + zSubdir + '/' + zBaseName
+    else
+      zPath := zHome + '/' + zBaseName;
+  end;
+  if FileExists(string(zPath)) then Result := zPath;
+end;
+
+{ process_sqliterc — shell.c.in:12659..12714.
+
+  Mirrors the C control flow: optional override, otherwise XDG lookup,
+  otherwise ~/.sqliterc.  Routes line reads through curInputText (same
+  idiom as cmdRead), saves/restores p^.inFile sentinel + zInFile +
+  lineno across the nested processInput call. }
+
+procedure processSqliteRc(p: PShellState; const sqlitercOverride: AnsiString);
+var
+  sqliterc: AnsiString;
+  f: Text;
+  savedIn: ^Text;
+  savedInFile: PFILE;
+  savedLineno: i64;
+  savedZIn: PAnsiChar;
+  ioErr: Word;
+  homeDir: AnsiString;
+  opened: Boolean;
+begin
+  sqliterc := sqlitercOverride;
+
+  if sqliterc = '' then
+    sqliterc := findXdgFile('XDG_CONFIG_HOME', '.config', 'sqlite3/sqliterc');
+
+  if sqliterc = '' then begin
+    homeDir := findHomeDir(False);
+    if homeDir = '' then begin
+      shellEPutZ('-- warning: cannot find home directory;'
+        + ' cannot read ~/.sqliterc'#10);
+      Exit;
+    end;
+    sqliterc := homeDir + '/.sqliterc';
+  end;
+
+  opened := False;
+  AssignFile(f, string(sqliterc));
+  {$I-} Reset(f); {$I+}
+  ioErr := IOResult;
+  if ioErr = 0 then opened := True;
+
+  if opened then begin
+    if stdin_is_interactive <> 0 then
+      shellEPutZ(Format('-- Loading resources from %s'#10, [sqliterc]));
+    savedIn      := curInputText;
+    savedInFile  := p^.inFile;
+    savedLineno  := p^.lineno;
+    savedZIn     := p^.zInFile;
+    curInputText := @f;
+    { Mark inFile non-nil so processInput's stdin-only guards (e.g.
+      "while errCnt=0 OR bail OR (inFile=nil and interactive)") behave
+      as if reading from a real FILE*.  The sentinel is what matters;
+      the value itself is not dereferenced for curInputText reads. }
+    p^.inFile    := PFILE(Pointer(1));
+    p^.lineno    := 0;
+    p^.zInFile   := PAnsiChar(sqliterc);
+    if (processInput(p) <> 0) and (bail_on_error <> 0) then begin
+      CloseFile(f);
+      curInputText := savedIn;
+      p^.inFile    := savedInFile;
+      p^.lineno    := savedLineno;
+      p^.zInFile   := savedZIn;
+      Halt(1);
+    end;
+    CloseFile(f);
+    curInputText := savedIn;
+    p^.inFile    := savedInFile;
+    p^.lineno    := savedLineno;
+    p^.zInFile   := savedZIn;
+  end else if sqlitercOverride <> '' then begin
+    shellEPutZ(Format('cannot open: "%s"'#10, [sqliterc]));
+    if bail_on_error <> 0 then Halt(1);
+  end;
+end;
+
 procedure printUsage(toErr: Boolean);
 const
   zUsage =
@@ -9853,11 +9994,11 @@ begin
   state.outFile := nil;
   openDb(@state, 0);
 
-  { sqliterc / -init processing is deferred — process_sqliterc has not
-    been ported.  -init / -noinit are accepted but their contents are
-    not loaded yet; tracked under 10.1.3 follow-up. }
-  if noInit then ;
-  if zInitFile <> '' then ;
+  { 10.1.3.b — -init <file> payload load.  Mirrors shell.c.in:13309
+    `if( !noInit ) process_sqliterc(&data, zInitFile)`.  An empty
+    zInitFile is treated as NULL by processSqliteRc, triggering the
+    XDG / ~/.sqliterc default lookup. }
+  if not noInit then processSqliteRc(@state, zInitFile);
 
   { ---------------- Pass 2: settings overrides ---------------- }
   i := 1;
