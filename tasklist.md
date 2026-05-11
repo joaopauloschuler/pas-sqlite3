@@ -85,15 +85,22 @@ FPC porting traps that recur often enough to call out up-front:
 
     Subtasks (each lands independently; gate names are proposed):
 
-    - [ ] **6.13.B.1** Scout pass — confirm `TWhereLoop.u.vtab` already
-          carries `idxNum / idxStr / needFree / isOrdered / omitMask /
-          mHandleIn` slots (where.c:WhereLoop) and that
-          `TWhereLevel.p1/p2` plumbing for vtab is in place.  File a
-          short diff list of struct fields still missing.
-    - [ ] **6.13.B.2** Port `HiddenIndexInfo` trailing record
-          (where.c:31..47).  Owns the `pParse / pWC / eDistinct /
-          mIn / aRhs[]` payload appended after `sqlite3_index_info`.
-          Add the `WHEREINFO_HIDDENINDEXINFO_SIZE(N)` size helper.
+    - [X] **6.13.B.1** Scout pass — `TWhereLoopVtab` (codegen.pas:1336)
+          already carries `idxNum / bFlags(needFree+bOmitOffset+
+          bIdxNumHex) / isOrdered / omitMask / idxStr / mHandleIn`;
+          `TWhereLevel.p1/p2/regFilter/op` (codegen.pas:1375) carry
+          the vtab loop plumbing; `Tsqlite3_index_info` and the
+          constraint/orderby/usage trio are complete in
+          passqlite3vtab.pas:122..142.  Only the `HiddenIndexInfo`
+          trailing record is missing — covered by B.2.  No struct
+          surgery needed before B.2.
+    - [X] **6.13.B.2** Port `HiddenIndexInfo` trailing record
+          (where.c:31..47) — `THiddenIndexInfo` declared at
+          codegen.pas:1446, `SZ_HIDDENINDEXINFO` and
+          `HiddenIndexInfoRhs` accessors implemented at
+          codegen.pas:3306..3319.  Owns `pWC / pParse / eDistinct /
+          mIn / mHandleIn` + trailing `aRhs[]` of `Psqlite3_value`.
+          codegen.pas builds clean.
     - [ ] **6.13.B.3** Port `allocateIndexInfo` (where.c:1413..1539).
           Walks the WhereClause, counts usable EQ/RANGE/LIKE/MATCH
           terms against this cursor, allocates the contiguous

@@ -1445,6 +1445,24 @@ type
     { a[FLEXARRAY] of TWhereLevel follows @ 856 }
   end;
 
+  { --- HiddenIndexInfo (where.c:32..42) -----------------------------
+    Trailing payload allocated in the same block as Tsqlite3_index_info.
+    The header (input/output for xBestIndex) is followed immediately
+    by this record; aRhs[] is a flex-array of sqlite3_value* holding
+    constant RHS values that vtab modules can recover via
+    sqlite3_vtab_rhs_value().  See WHEREINFO_HIDDENINDEXINFO_SIZE.
+    --------------------------------------------------------------- }
+  PHiddenIndexInfo = ^THiddenIndexInfo;
+  THiddenIndexInfo = record
+    pWC       : PWhereClause;  { 8 bytes @ 0  - WHERE clause being analyzed }
+    pParse    : PParse;        { 8 bytes @ 8  - parsing context }
+    eDistinct : i32;           { 4 bytes @ 16 - sqlite3_vtab_distinct() return }
+    mIn       : u32;           { 4 bytes @ 20 - terms that are <col> IN (...) }
+    mHandleIn : u32;           { 4 bytes @ 24 - terms vtab handles as IN }
+    _pad      : u32;           { 4 bytes @ 28 - pad to 8-byte for aRhs ptrs }
+    { aRhs[FLEXARRAY] of Psqlite3_value follows @ 32 }
+  end;
+
 // ---------------------------------------------------------------------------
 // Flexible-array accessor helpers (outside type block)
 // ---------------------------------------------------------------------------
@@ -1454,6 +1472,11 @@ function SrcListItems(p: PSrcList): PSrcItem; inline;
 function IdListItems(p: PIdList): PIdListItem; inline;
 function whereInfoLevels(p: PWhereInfo): PWhereLevel; inline;
 function SZ_WHEREINFO(nLevel: i32): SizeInt; inline;
+{ where.c:46 — SZ_HIDDENINDEXINFO(N):
+  offsetof(HiddenIndexInfo,aRhs) + N * sizeof(sqlite3_value*) }
+function SZ_HIDDENINDEXINFO(nTerm: i32): SizeInt; inline;
+{ Pointer to aRhs[] flex-array following the THiddenIndexInfo header. }
+function HiddenIndexInfoRhs(p: PHiddenIndexInfo): PPointer; inline;
 
 // ---------------------------------------------------------------------------
 // Parse field bitflag constants (parseFlags at offset 40)
@@ -3273,6 +3296,22 @@ end;
 function SZ_WHEREINFO(nLevel: i32): SizeInt; inline;
 begin
   Result := ROUND8(SizeOf(TWhereInfo) + SizeInt(nLevel) * SizeOf(TWhereLevel));
+end;
+
+{ SZ_HIDDENINDEXINFO — bytes needed for a THiddenIndexInfo header plus
+  nTerm sqlite3_value* slots in the trailing aRhs[] flex-array.
+  Mirrors C macro SZ_HIDDENINDEXINFO(N) in where.c:46. }
+function SZ_HIDDENINDEXINFO(nTerm: i32): SizeInt; inline;
+begin
+  Result := SizeOf(THiddenIndexInfo) + SizeInt(nTerm) * SizeOf(Pointer);
+end;
+
+{ Pointer to the trailing aRhs[] array of THiddenIndexInfo.  Each slot
+  is a Psqlite3_value (sqlite3_value*).  Allocated/freed by the planner
+  via sqlite3ValueNew / sqlite3ValueFree. }
+function HiddenIndexInfoRhs(p: PHiddenIndexInfo): PPointer; inline;
+begin
+  Result := PPointer(PByte(p) + SizeOf(THiddenIndexInfo));
 end;
 
 function ExprHasProperty(pExpr: PExpr; prop: u32): Boolean; inline;
