@@ -6994,6 +6994,174 @@ end;
 type
   TImportReader = function(var ctx: TImportCtx): Boolean;
 
+{ ----------------------------------------------------------------------
+  Faithful port of shell.c.in:7165..7339 zAutoColumn.  Maintains a
+  scratch :memory: database holding incoming column-name strings, then
+  emits a deduplicated parenthesised column list ("col1" ANY, "col2"
+  ANY, ...) for CREATE TABLE.  Two operating modes:
+
+    pDb=nil + zColNew non-empty → init scratch db, insert column.
+    pDb<>nil + zColNew='' (collect) → emit column spec, close db.
+
+  The SQL bodies match upstream verbatim (RENAME_MINIMAL_ONE_PASS arm;
+  SHELL_COLUMN_RENAME_CLEAN is not defined in upstream's default build).
+  zRenamed receives the human-readable list of renames done (empty when
+  no duplicates were resolved).
+  ====================================================================== }
+function shellAutoColumnAdd(var pDb: PTsqlite3;
+  const zColNew: AnsiString): i32;
+const
+  zTabMake: PAnsiChar =
+    'CREATE TABLE ColNames(' +
+    ' cpos INTEGER PRIMARY KEY,' +
+    ' name TEXT, nlen INT, chop INT, reps INT, suff TEXT);' +
+    'CREATE VIEW RepeatedNames AS' +
+    ' SELECT DISTINCT t.name FROM ColNames t' +
+    ' WHERE t.name COLLATE NOCASE IN (' +
+    '  SELECT o.name FROM ColNames o WHERE o.cpos<>t.cpos);';
+  zTabFill: PAnsiChar =
+    'INSERT INTO ColNames(name,nlen,chop,reps,suff)' +
+    ' VALUES(iif(length(?1)>0,?1,''?''),max(length(?1),1),0,0,'''')';
+var
+  rc:    i32;
+  pStmt: PVdbe;
+  pTail: PAnsiChar;
+begin
+  pStmt := nil; pTail := nil;
+  if pDb = nil then begin
+    rc := sqlite3_open(':memory:', @pDb);
+    if rc <> SQLITE_OK then begin
+      if pDb <> nil then sqlite3_close(pDb);
+      pDb := nil;
+      Exit(rc);
+    end;
+    rc := sqlite3_exec(pDb, zTabMake, nil, nil, nil);
+    if rc <> SQLITE_OK then Exit(rc);
+  end;
+  rc := sqlite3_prepare_v2(pDb, zTabFill, -1, @pStmt, @pTail);
+  if rc <> SQLITE_OK then begin
+    if pStmt <> nil then sqlite3_finalize(pStmt);
+    Exit(rc);
+  end;
+  sqlite3_bind_text(pStmt, 1, PAnsiChar(zColNew), Length(zColNew),
+                    SQLITE_TRANSIENT);
+  sqlite3_step(pStmt);
+  sqlite3_finalize(pStmt);
+  Result := SQLITE_OK;
+end;
+
+function shellAutoColumnFinish(var pDb: PTsqlite3;
+  out zRenamed: AnsiString): AnsiString;
+const
+  zHasDupes: PAnsiChar =
+    'SELECT count(DISTINCT (substring(name,1,nlen-chop)||suff)' +
+    ' COLLATE NOCASE)<count(name) FROM ColNames';
+  zColDigits: PAnsiChar =
+    'SELECT CAST(ceil(log(count(*)+0.5)) AS INT) FROM ColNames';
+  zSetReps: PAnsiChar =
+    'UPDATE ColNames AS t SET reps=' +
+    '(SELECT count(*) FROM ColNames d' +
+    ' WHERE substring(t.name,1,t.nlen-t.chop)' +
+    '=substring(d.name,1,d.nlen-d.chop) COLLATE NOCASE)';
+  zRenameRank: PAnsiChar =
+    'WITH Lzn(nlz) AS (' +
+    '  SELECT 0 AS nlz UNION' +
+    '  SELECT nlz+1 AS nlz FROM Lzn WHERE EXISTS(' +
+    '   SELECT 1 FROM ColNames t, ColNames o WHERE' +
+    '    iif(t.name IN (SELECT * FROM RepeatedNames),' +
+    '     printf(''%s_%s'',t.name,' +
+    '      substring(printf(''%.*c%0.*d'',nlz+1,''0'',?1,t.cpos),2)),' +
+    '     t.name)' +
+    '    =' +
+    '    iif(o.name IN (SELECT * FROM RepeatedNames),' +
+    '     printf(''%s_%s'',o.name,' +
+    '      substring(printf(''%.*c%0.*d'',nlz+1,''0'',?1,o.cpos),2)),' +
+    '     o.name)' +
+    '    COLLATE NOCASE AND o.cpos<>t.cpos GROUP BY t.cpos))' +
+    ' UPDATE ColNames AS t SET' +
+    '  chop = 0,' +
+    '  suff = iif(name IN (SELECT * FROM RepeatedNames),' +
+    '   printf(''_%s'', substring(' +
+    '    printf(''%.*c%0.*d'',(SELECT max(nlz) FROM Lzn)+1,''0'',1,t.cpos),' +
+    '    2)),'' '')';
+  zCollectVar: PAnsiChar =
+    'SELECT ''(''||x''0a''' +
+    ' || group_concat(' +
+    '  cname||'' ANY'',' +
+    '  '',''||iif((cpos-1)%4>0, '' '', x''0a''||'' ''))' +
+    ' ||'')'' AS ColsSpec FROM (' +
+    ' SELECT cpos, printf(''"%w"'',printf(''%!.*s%s'',nlen-chop,name,suff))' +
+    ' AS cname FROM ColNames ORDER BY cpos)';
+  zRenamesDone: PAnsiChar =
+    'SELECT group_concat(' +
+    ' printf(''"%w" to "%w"'',name,printf(''%!.*s%s'',nlen-chop,name,suff)),' +
+    ' '',''||x''0a'')' +
+    'FROM ColNames WHERE suff<>'''' OR chop!=0';
+var
+  pStmt:    PVdbe;
+  pTail:    PAnsiChar;
+  rc, nDig: i32;
+  hasDup:   i32;
+  z:        PAnsiChar;
+begin
+  Result := '';
+  zRenamed := '';
+  if pDb = nil then Exit;
+
+  hasDup := 0; nDig := 0;
+  pStmt := nil; pTail := nil;
+  if sqlite3_prepare_v2(pDb, zHasDupes, -1, @pStmt, @pTail) = SQLITE_OK then
+  begin
+    if sqlite3_step(pStmt) = SQLITE_ROW then
+      hasDup := sqlite3_column_int(pStmt, 0);
+    sqlite3_finalize(pStmt);
+  end;
+  if hasDup <> 0 then begin
+    pStmt := nil;
+    if sqlite3_prepare_v2(pDb, zColDigits, -1, @pStmt, @pTail) = SQLITE_OK then
+    begin
+      if sqlite3_step(pStmt) = SQLITE_ROW then
+        nDig := sqlite3_column_int(pStmt, 0);
+      sqlite3_finalize(pStmt);
+    end;
+    rc := sqlite3_exec(pDb, zSetReps, nil, nil, nil);
+    if rc = SQLITE_OK then begin
+      pStmt := nil;
+      if sqlite3_prepare_v2(pDb, zRenameRank, -1, @pStmt, @pTail) = SQLITE_OK
+      then begin
+        sqlite3_bind_int(pStmt, 1, nDig);
+        sqlite3_step(pStmt);
+        sqlite3_finalize(pStmt);
+      end;
+    end;
+  end;
+
+  pStmt := nil;
+  if sqlite3_prepare_v2(pDb, zCollectVar, -1, @pStmt, @pTail) = SQLITE_OK then
+  begin
+    if sqlite3_step(pStmt) = SQLITE_ROW then begin
+      z := sqlite3_column_text(pStmt, 0);
+      if z <> nil then Result := AnsiString(z);
+    end;
+    sqlite3_finalize(pStmt);
+  end;
+
+  if hasDup <> 0 then begin
+    pStmt := nil;
+    if sqlite3_prepare_v2(pDb, zRenamesDone, -1, @pStmt, @pTail) = SQLITE_OK
+    then begin
+      if sqlite3_step(pStmt) = SQLITE_ROW then begin
+        z := sqlite3_column_text(pStmt, 0);
+        if z <> nil then zRenamed := AnsiString(z);
+      end;
+      sqlite3_finalize(pStmt);
+    end;
+  end;
+
+  sqlite3_close(pDb);
+  pDb := nil;
+end;
+
 procedure cmdImport(p: PShellState; const args: array of AnsiString;
                    nArg: SizeInt);
 var
@@ -7013,6 +7181,8 @@ var
   needCommit: i32;
   exists: i32;
   zArg: AnsiString;
+  autoDb: PTsqlite3;
+  autoRenamed, zColDefs, zCreate: AnsiString;
 begin
   importInit(sCtx);
   if p^.mode.eMode = MODE_Ascii then
@@ -7141,10 +7311,9 @@ begin
     while xRead(sCtx) and (sCtx.cTerm = sCtx.cColSep) do ;
   end;
 
-  { The Pascal port currently requires the destination table to already
-    exist; the auto-create-from-header path (zAutoColumn) is deferred.
-    Probe via sqlite_schema rather than sqlite3_table_column_metadata so
-    we sidestep any port quirks in the latter when the schema is unset. }
+  { Probe whether the destination table already exists.  If not, derive
+    its column list from the first row of the input via zAutoColumn —
+    matching shell.c.in:7670..7717. }
   if zSchema <> '' then
     zSql := 'SELECT count(*) FROM "' +
       StringReplace(zSchema, '"', '""', [rfReplaceAll]) +
@@ -7161,11 +7330,38 @@ begin
     exists := sqlite3_column_int(pStmt, 0);
   if pStmt <> nil then sqlite3_finalize(pStmt);
   if exists = 0 then begin
-    shellEPutZ(Format('Error: no such table: %s' +
-      ' (auto-create not supported in this build; CREATE TABLE first)'#10,
-      [zTable]));
-    importCleanup(sCtx);
-    Exit;
+    { Auto-create the table from the first row of input. }
+    importAppendChar(sCtx, 0);
+    autoDb := nil;
+    autoRenamed := '';
+    while xRead(sCtx) do begin
+      shellAutoColumnAdd(autoDb, sCtx.z);
+      if sCtx.cTerm <> sCtx.cColSep then Break;
+    end;
+    zColDefs := shellAutoColumnFinish(autoDb, autoRenamed);
+    if autoRenamed <> '' then
+      shellEPutZ('Columns renamed during .import ' + sCtx.zFile +
+                 ' due to duplicates:'#10 + autoRenamed + #10);
+    if zColDefs = '' then begin
+      shellEPutZ(sCtx.zFile + ': empty file'#10);
+      importCleanup(sCtx);
+      Exit;
+    end;
+    if zSchema <> '' then
+      zCreate := 'CREATE TABLE "' +
+        StringReplace(zSchema, '"', '""', [rfReplaceAll]) + '"."' +
+        StringReplace(zTable, '"', '""', [rfReplaceAll]) + '"' + zColDefs
+    else
+      zCreate := 'CREATE TABLE "' +
+        StringReplace(zTable, '"', '""', [rfReplaceAll]) + '"' + zColDefs;
+    if eVerbose >= 1 then shellSPutZ(zCreate + #10);
+    rc := sqlite3_exec(p^.db, PAnsiChar(zCreate), nil, nil, nil);
+    if rc <> SQLITE_OK then begin
+      shellEPutZ(zCreate + ' failed:'#10 +
+                 AnsiString(sqlite3_errmsg(p^.db)) + #10);
+      importCleanup(sCtx);
+      Exit;
+    end;
   end;
 
   { Discover column count via pragma_table_info. }

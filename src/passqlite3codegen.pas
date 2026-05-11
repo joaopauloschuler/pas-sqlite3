@@ -7925,6 +7925,247 @@ begin
   end;
 end;
 
+{ resolveOuterDotInExpr — single-expression walker that converts any
+  TK_DOT whose table-part matches pOuterSrc (by alias or zName) and is
+  NOT found in pInnerSrc into a TK_COLUMN bound to the matching outer
+  cursor.  Used by sqlite3ResolveExprNames to handle subqueries inside
+  e.g. UPDATE SET expressions, where the outer NameContext is not on a
+  chain that the inner sqlite3SelectPrep walker can reach. }
+procedure resolveOuterDotInExpr(pW: PExpr; pOuterSrc: PSrcList;
+  pInnerSrc: PSrcList); forward;
+
+procedure resolveOuterDotInList(pList: PExprList; pOuterSrc: PSrcList;
+  pInnerSrc: PSrcList);
+var i: i32;
+begin
+  if pList = nil then Exit;
+  for i := 0 to pList^.nExpr - 1 do
+    resolveOuterDotInExpr(ExprListItems(pList)[i].pExpr,
+                          pOuterSrc, pInnerSrc);
+end;
+
+procedure resolveOuterDotInExpr(pW: PExpr; pOuterSrc: PSrcList;
+  pInnerSrc: PSrcList);
+var
+  base, pIt: PSrcItem;
+  j, iCol: i32;
+  zTab, zCol: PAnsiChar;
+  foundInner: Boolean;
+begin
+  if pW = nil then Exit;
+  if pW^.op = TK_DOT then
+  begin
+    if (pW^.pLeft <> nil) and (pW^.pLeft^.op = TK_ID)
+       and (pW^.pRight <> nil) and (pW^.pRight^.op = TK_ID)
+       and (pOuterSrc <> nil) then
+    begin
+      zTab := pW^.pLeft^.u.zToken;
+      zCol := pW^.pRight^.u.zToken;
+      foundInner := False;
+      if pInnerSrc <> nil then
+      begin
+        base := SrcListItems(pInnerSrc);
+        for j := 0 to pInnerSrc^.nSrc - 1 do
+        begin
+          pIt := PSrcItem(PByte(base) + j * SizeOf(TSrcItem));
+          if pIt^.pSTab = nil then Continue;
+          if pIt^.zAlias <> nil then begin
+            if sqlite3StrICmp(pIt^.zAlias, zTab) = 0 then begin foundInner := True; Break; end;
+          end else begin
+            if sqlite3StrICmp(pIt^.pSTab^.zName, zTab) = 0 then begin foundInner := True; Break; end;
+          end;
+        end;
+      end;
+      if not foundInner then
+      begin
+        base := SrcListItems(pOuterSrc);
+        for j := 0 to pOuterSrc^.nSrc - 1 do
+        begin
+          pIt := PSrcItem(PByte(base) + j * SizeOf(TSrcItem));
+          if pIt^.pSTab = nil then Continue;
+          if pIt^.zAlias <> nil then begin
+            if sqlite3StrICmp(pIt^.zAlias, zTab) <> 0 then Continue;
+          end else begin
+            if sqlite3StrICmp(pIt^.pSTab^.zName, zTab) <> 0 then Continue;
+          end;
+          iCol := sqlite3ColumnIndex(pIt^.pSTab, zCol);
+          if iCol >= 0 then
+          begin
+            pW^.op      := TK_COLUMN;
+            pW^.iTable  := pIt^.iCursor;
+            pW^.iColumn := i16(iCol);
+            pW^.y.pTab  := pIt^.pSTab;
+            pW^.pLeft   := nil;
+            pW^.pRight  := nil;
+            if iCol < BMS - 1 then
+              pIt^.colUsed := pIt^.colUsed or (Bitmask(1) shl iCol)
+            else
+              pIt^.colUsed := pIt^.colUsed or (Bitmask(1) shl (BMS - 1));
+          end;
+          Break;
+        end;
+      end;
+    end;
+    Exit; { Don't recurse into TK_DOT children. }
+  end;
+  if ExprHasProperty(pW, EP_TokenOnly or EP_Leaf) then Exit;
+  resolveOuterDotInExpr(pW^.pLeft,  pOuterSrc, pInnerSrc);
+  resolveOuterDotInExpr(pW^.pRight, pOuterSrc, pInnerSrc);
+  if (pW^.flags and EP_xIsSelect) = 0 then
+  begin
+    if pW^.x.pList <> nil then
+      resolveOuterDotInList(pW^.x.pList, pOuterSrc, pInnerSrc);
+  end;
+end;
+
+{ exprHasOuterDot — returns True if any TK_DOT inside pE matches
+  pOuterSrc but not pInnerSrc.  Used by resolveSubqueryOuterRefs to
+  decide whether the subquery is correlated and must be marked with
+  EP_VarSelect / SF_Correlated so the codegen evaluates it per outer
+  row instead of caching the result. }
+function exprHasOuterDot(pE: PExpr; pOuterSrc: PSrcList;
+  pInnerSrc: PSrcList): Boolean; forward;
+
+function exprListHasOuterDot(pList: PExprList; pOuterSrc: PSrcList;
+  pInnerSrc: PSrcList): Boolean;
+var i: i32;
+begin
+  Result := False;
+  if pList = nil then Exit;
+  for i := 0 to pList^.nExpr - 1 do
+    if exprHasOuterDot(ExprListItems(pList)[i].pExpr, pOuterSrc, pInnerSrc)
+    then begin Result := True; Exit; end;
+end;
+
+function exprHasOuterDot(pE: PExpr; pOuterSrc: PSrcList;
+  pInnerSrc: PSrcList): Boolean;
+var
+  base, pIt: PSrcItem;
+  j: i32;
+  zTab: PAnsiChar;
+  foundInner: Boolean;
+begin
+  Result := False;
+  if pE = nil then Exit;
+  if pE^.op = TK_DOT then
+  begin
+    if (pE^.pLeft <> nil) and (pE^.pLeft^.op = TK_ID) then
+    begin
+      zTab := pE^.pLeft^.u.zToken;
+      foundInner := False;
+      if pInnerSrc <> nil then
+      begin
+        base := SrcListItems(pInnerSrc);
+        for j := 0 to pInnerSrc^.nSrc - 1 do
+        begin
+          pIt := PSrcItem(PByte(base) + j * SizeOf(TSrcItem));
+          if pIt^.pSTab = nil then Continue;
+          if pIt^.zAlias <> nil then begin
+            if sqlite3StrICmp(pIt^.zAlias, zTab) = 0 then begin foundInner := True; Break; end;
+          end else begin
+            if sqlite3StrICmp(pIt^.pSTab^.zName, zTab) = 0 then begin foundInner := True; Break; end;
+          end;
+        end;
+      end;
+      if not foundInner and (pOuterSrc <> nil) then
+      begin
+        base := SrcListItems(pOuterSrc);
+        for j := 0 to pOuterSrc^.nSrc - 1 do
+        begin
+          pIt := PSrcItem(PByte(base) + j * SizeOf(TSrcItem));
+          if pIt^.pSTab = nil then Continue;
+          if pIt^.zAlias <> nil then begin
+            if sqlite3StrICmp(pIt^.zAlias, zTab) = 0 then begin Result := True; Exit; end;
+          end else begin
+            if sqlite3StrICmp(pIt^.pSTab^.zName, zTab) = 0 then begin Result := True; Exit; end;
+          end;
+        end;
+      end;
+    end;
+    Exit;
+  end;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  if exprHasOuterDot(pE^.pLeft,  pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
+  if exprHasOuterDot(pE^.pRight, pOuterSrc, pInnerSrc) then begin Result := True; Exit; end;
+  if (pE^.flags and EP_xIsSelect) = 0 then
+  begin
+    if exprListHasOuterDot(pE^.x.pList, pOuterSrc, pInnerSrc) then
+    begin Result := True; Exit; end;
+  end;
+end;
+
+{ resolveSubqueryOuterRefs — walk pE, and for each subquery (TK_SELECT /
+  TK_EXISTS / TK_IN with a SELECT operand) expand its inner pSrc and
+  pre-resolve TK_DOTs in inner clauses that reference the outer pSrc.
+  Mirrors the bCorr / ResolveOuterRefs pre-pass that the SELECT-prep
+  walker performs at resolve.c:1378..1390; calling it from
+  sqlite3ResolveExprNames lets UPDATE SET expressions (and other lean
+  resolver entry points) see correlated outer-alias references the same
+  way SELECT does.  Without this, `UPDATE T AS t SET b=(SELECT … FROM T
+  d WHERE d.a=t.a)` would parse-error with "no such column: t.a"
+  because the inner SelectPrep runs against `T d` only. }
+procedure resolveSubqueryOuterRefs(pParse: PParse; pOuterSrc: PSrcList;
+  pE: PExpr);
+var
+  i:      i32;
+  pInner: PSelect;
+  bCorr:  Boolean;
+
+  procedure WalkInnerList(pList: PExprList);
+  var k: i32;
+  begin
+    if pList = nil then Exit;
+    for k := 0 to pList^.nExpr - 1 do
+      resolveSubqueryOuterRefs(pParse, pOuterSrc,
+                               ExprListItems(pList)[k].pExpr);
+  end;
+
+begin
+  if pE = nil then Exit;
+  if ExprHasProperty(pE, EP_TokenOnly or EP_Leaf) then Exit;
+  if (pE^.flags and EP_xIsSelect) <> 0 then
+  begin
+    pInner := pE^.x.pSelect;
+    if (pInner <> nil) and (pOuterSrc <> nil) then
+    begin
+      if (pInner^.selFlags and SF_HasTypeInfo) = 0 then
+        sqlite3SelectExpand(pParse, pInner);
+      bCorr :=
+        exprListHasOuterDot(pInner^.pEList,   pOuterSrc, pInner^.pSrc) or
+        exprHasOuterDot   (pInner^.pWhere,    pOuterSrc, pInner^.pSrc) or
+        exprHasOuterDot   (pInner^.pHaving,   pOuterSrc, pInner^.pSrc) or
+        exprListHasOuterDot(pInner^.pGroupBy, pOuterSrc, pInner^.pSrc) or
+        exprListHasOuterDot(pInner^.pOrderBy, pOuterSrc, pInner^.pSrc);
+      if bCorr then
+      begin
+        resolveOuterDotInList(pInner^.pEList,   pOuterSrc, pInner^.pSrc);
+        resolveOuterDotInExpr(pInner^.pWhere,   pOuterSrc, pInner^.pSrc);
+        resolveOuterDotInExpr(pInner^.pHaving,  pOuterSrc, pInner^.pSrc);
+        resolveOuterDotInList(pInner^.pGroupBy, pOuterSrc, pInner^.pSrc);
+        resolveOuterDotInList(pInner^.pOrderBy, pOuterSrc, pInner^.pSrc);
+        { Mark as correlated so codegen re-evaluates per outer row instead
+          of treating it as an invariant scalar.  Without this, the inner
+          OP_Once short-circuit caches a stale value. }
+        ExprSetProperty(pE, EP_VarSelect);
+        pInner^.selFlags := pInner^.selFlags or SF_Correlated;
+      end;
+      { Recurse into inner clause expressions to handle deeper nested
+        subqueries (e.g. UPDATE t SET b=(SELECT (SELECT … t.a …) FROM …)). }
+      WalkInnerList(pInner^.pEList);
+      resolveSubqueryOuterRefs(pParse, pOuterSrc, pInner^.pWhere);
+      resolveSubqueryOuterRefs(pParse, pOuterSrc, pInner^.pHaving);
+      WalkInnerList(pInner^.pGroupBy);
+      WalkInnerList(pInner^.pOrderBy);
+    end;
+  end
+  else if pE^.x.pList <> nil then
+    for i := 0 to pE^.x.pList^.nExpr - 1 do
+      resolveSubqueryOuterRefs(pParse, pOuterSrc,
+                               ExprListItems(pE^.x.pList)[i].pExpr);
+  resolveSubqueryOuterRefs(pParse, pOuterSrc, pE^.pLeft);
+  resolveSubqueryOuterRefs(pParse, pOuterSrc, pE^.pRight);
+end;
+
 function sqlite3ResolveExprNames(pNC: PNameContext; pExpr: PExpr): i32;
 begin
   if (pNC <> nil) and (pExpr <> nil) then
@@ -7936,6 +8177,8 @@ begin
     if ((pNC^.ncFlags and NC_UUpsert) <> 0) and (pNC^.uNC.pUpsert <> nil) then
       resolveUpsertExcludedRefs(pNC^.uNC.pUpsert, pExpr);
     resolveExprAgainstSrcList(pNC^.pSrcList, pExpr);
+    if (pNC^.pParse <> nil) and (pNC^.pSrcList <> nil) then
+      resolveSubqueryOuterRefs(pNC^.pParse, pNC^.pSrcList, pExpr);
     if pNC^.pParse <> nil then
     begin
       flagUnresolvedTKID(pNC^.pParse, pExpr);
