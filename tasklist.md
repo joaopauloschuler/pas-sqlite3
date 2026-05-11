@@ -487,14 +487,12 @@ partial landings cannot silently no-op.
   - [X] **10.1d.2** `.dump` — landed under 10.1.23.
   - [~] **10.1d.3** `.import` — auto-create-from-header + duplicate-column
         renaming closed under 10.1.24.  Two sub-arms remain:
-    - [ ] **10.1d.3.a** Heredoc input — `FILE` of the form `<<EOF` reads
+    - [X] **10.1d.3.a** Heredoc input — `FILE` of the form `<<EOF` reads
           subsequent lines from `p^.in` into an `sqlite3_str` until a
           line begins with the end-mark, then feeds the buffered text to
-          the CSV reader via `sCtx.zIn` (shell.c.in:7601..7637).  Needs
-          a `Psqlite3_str` (already in passqlite3.pas) plus the
-          `import_cleanup` "Content terminator not found" error path.
-          Touch site: the `else if … '<' '<'` arm inside the existing
-          `.import` body in passqlite3shell.pas.
+          the CSV reader via `sCtx.zIn` (shell.c.in:7601..7637).  Landed
+          via `TImportCtx.zIn`/`zInCur` + `importGetc` heredoc arm; error
+          path mirrors `shellErrorLocation` "line N:" / "<file>:N:" prefix.
     - [ ] **10.1d.3.b** Pipe input — `FILE` of the form `|cmd` does
           `sqlite3_popen(zFile+1,"r")` and sets `xCloser = pclose`
           (shell.c.in:7593..7600).  FPC has `popen`/`pclose` via the
@@ -540,13 +538,14 @@ partial landings cannot silently no-op.
       shell.c.in:7165..7339); duplicate-column renaming via 10.1.bug.131
       (now `[X]`).  Remaining sub-arms — broken out under 10.1d so the
       gate sits next to the other I/O dot-commands:
-  - [ ] **10.1.24.a** Heredoc input (`FILE` = `<<END`) — see
-        [10.1d.3.a](#10.1d).  Touches the `else if (Length(zFile) >= 3)
-        and (zFile[1]='<') and (zFile[2]='<')` arm inside `cmdImport`;
-        accumulates lines from `p^.in` into a `Psqlite3_str` until the
-        end-mark, then routes through the existing CSV/ASCII reader via
-        `sCtx.zIn`.  Error: `Content terminator "%s" not found.`
-        (shell.c.in:7634).
+  - [X] **10.1.24.a** Heredoc input (`FILE` = `<<END`) — see
+        [10.1d.3.a](#10.1d).  Landed: `else if (Length(zFile) > 2) and
+        (zFile[1]='<') and (zFile[2]='<')` arm inside `cmdImport`
+        accumulates lines from `p^.in` (via `oneInputLine`) into a
+        `Psqlite3_str` until a line begins with the end-mark, then routes
+        through the existing CSV/ASCII reader via `sCtx.zIn` / `zInCur`
+        (importGetc heredoc arm).  Error: `Content terminator "%s" not
+        found.` (shell.c.in:7634) with `line N:` / `<file>:N:` prefix.
   - [ ] **10.1.24.b** Pipe input (`FILE` = `|cmd`) — see
         [10.1d.3.b](#10.1d).  `popen(zFile+1,"r")` via FPC `BaseUnix`,
         `sCtx.zFile := '<pipe>'`, `xCloser := @pclose`.  Gated behind
