@@ -417,7 +417,7 @@ partial landings cannot silently no-op.
         `zInitFile<>''` forwards to `processSqliteRc(state, zInitFile)`
         (mirrors shell.c.in:13309 `process_sqliterc(&data,zInitFile)`).
         Independent test surface from 10.1.3.a — separate gate.
-  - [ ] **10.1.3.c** Wire `-memtrace` / `-pcachetrace` to the **stderr** sink
+  - [x] **10.1.3.c** Wire `-memtrace` / `-pcachetrace` to the **stderr** sink
         (shell.c.in:13196..13199 `sqlite3MemTraceActivate(stderr)` /
         `sqlite3PcacheTraceActivate(stderr)`).  Port currently passes `nil`
         at passqlite3shell.pas:9293..9294, silencing the traces entirely.
