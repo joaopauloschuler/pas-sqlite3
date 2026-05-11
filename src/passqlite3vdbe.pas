@@ -6227,17 +6227,25 @@ end;
 const
   SORTER_REC_HDR = 16;   { offset of payload bytes after pNext+nVal+pad }
 
+function vdbeSorterCountRecords(pSorter: PVdbeSorter): i32; forward;
+
 procedure vdbeSorterListToArray(pSorter: PVdbeSorter;
   out aRec: array of Pointer; out nRec: i32);
 var
   p, pNxt: Pointer;
-  i: i32;
+  i, n: i32;
 begin
+  { sqlite3VdbeSorterWrite inserts at the list head, so head→tail walks
+    records in REVERSE insertion order.  Pre-count and fill from the back
+    so aRec ends up in INSERTION order; the stable merge sort then keeps
+    tied keys in the order rows arrived (matches upstream PMA semantics). }
+  n := vdbeSorterCountRecords(pSorter);
+  if n > High(aRec) + 1 then n := High(aRec) + 1;
   nRec := 0;
   p := pSorter^.list.pList;
   i := 0;
-  while (p <> nil) and (i <= High(aRec)) do begin
-    aRec[i] := p;
+  while (p <> nil) and (i < n) do begin
+    aRec[n - 1 - i] := p;
     pNxt := PPointer(p)^;
     p := pNxt;
     Inc(i);
@@ -6273,6 +6281,11 @@ begin
     pSorter^.pUnpacked := sqlite3VdbeAllocUnpackedRecord(pSorter^.pKeyInfo);
   pUR := PUnpackedRecord(pSorter^.pUnpacked);
   if pUR = nil then begin Result := 0; Exit; end;
+  { default_rc must be 0 so that equal keys compare equal — the raw
+    DbMallocRaw in sqlite3VdbeAllocUnpackedRecord leaves it indeterminate.
+    Without this, tied records sort to a random side and group_concat /
+    aggregate row order becomes heap-layout-dependent (bug 6.13 residual). }
+  pUR^.default_rc := 0;
   aLen   := Pi32(PByte(pA) + 8)^;
   bLen   := Pi32(PByte(pB) + 8)^;
   aBytes := PByte(pA) + SORTER_REC_HDR;

@@ -192,6 +192,17 @@ const
     'CREATE TABLE orphan(aid INTEGER REFERENCES parent(id));'#10 +
     '.lint fkey-indexes'#10;
 
+  { Multi-column FK locks in the sorter tie-stability fix (bug 6.13
+    residual): with two FK columns sharing identical (s.name, f.id) sort
+    keys, group_concat must emit them in seq order (x, y) — the
+    pre-fix port reversed them to (y, x) because vdbeSorterCompareRec
+    left UnpackedRecord.default_rc uninitialized and the in-memory list
+    walked head→tail in reverse insertion order. }
+  SCRIPT_LintFkeyIndexesMulti =
+    'CREATE TABLE parent(a PRIMARY KEY, b);'#10 +
+    'CREATE TABLE child(x, y, FOREIGN KEY(x,y) REFERENCES parent);'#10 +
+    '.lint fkey-indexes'#10;
+
   { Empty database edges: .tables / .schema on a fresh DB.  Skip
     .indexes / .databases here — both side-effects from upstream
     temp-schema materialization (port divergence). }
@@ -219,6 +230,7 @@ begin
   DiffCase('.fullschema',                 SCRIPT_FullSchema,    upstream);
   DiffCase('.databases',                  SCRIPT_Databases,     upstream);
   DiffCase('.lint fkey-indexes',          SCRIPT_LintFkeyIndexes, upstream);
+  DiffCase('.lint fkey-indexes multi-col',SCRIPT_LintFkeyIndexesMulti, upstream);
   DiffCase('empty database',              SCRIPT_Empty,         upstream);
 
   WriteLn;
