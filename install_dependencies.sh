@@ -90,6 +90,15 @@ else
   ok "tclsh installed"
 fi
 
+# ---- tcl-dev (headers + libs for building testfixture) ----
+if dpkg -s tcl-dev &>/dev/null; then
+  ok "tcl-dev is already installed"
+else
+  warn "tcl-dev not found — installing via apt ..."
+  sudo apt-get install -y tcl-dev
+  ok "tcl-dev installed"
+fi
+
 # ---- ../sqlite3/ ----
 echo
 echo "Checking for upstream SQLite split source tree ..."
