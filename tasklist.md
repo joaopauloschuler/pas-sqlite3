@@ -335,6 +335,55 @@ FPC porting traps that recur often enough to call out up-front:
           inside passqlite3expert.pas; flip the "Known limitation"
           paragraph at the top of that unit to "(closed by 6.13.B.11)".
 
+- [ ] **6.18** pcachetrace / memtrace trampoline AV when sink is non-nil.
+      Surfaced 2026-05-11 by **10.1.3.c** (routing `-pcachetrace` /
+      `-memtrace` to libc `stderr`).  Repro:
+      `bin/passqlite3 -pcachetrace ":memory:" "SELECT 1;" 2>&1`
+      → emits one line (`PCACHETRACE: xInit((nil))`) then
+      `EAccessViolation` inside the trampoline.  Same happens with
+      `-memtrace`.  Verified pre-existing — the crash reproduces on the
+      pre-10.1.3.c binary too (just silently, because the previous `nil`
+      sink suppressed the first `fprintf` that triggered it).  Not a
+      regression of 10.1.3.c.
+      Root cause is in the trace-trampoline plumbing in
+      `src/passqlite3pcachetrace.pas` / `src/passqlite3memtrace.pas`,
+      not in the activator wiring touched by 10.1.3.c.  Likely one of:
+      (a) the wrapped vtable's `xInit`/`xMalloc` slots are read from an
+      uninitialised methods record, or (b) the trampoline calls
+      `fprintf(stderr, …)` through a cdecl mismatch and corrupts the
+      stack.  C oracle: `ext/misc/pcachetrace.c` /
+      `ext/misc/memtrace.c` (~150 lines each — small surface).  Next
+      step: stderr-instrument the trampoline entry, compare the
+      `sqlite3_pcache_methods2` struct laid out by the Pas port vs. the
+      C original byte-for-byte.
+
+- [ ] **6.19** `sqlite3_deserialize` returns `SQLITE_ERROR` from the
+      `openDb` post-open switch.  Surfaced 2026-05-11 by **10.1.27.b**
+      (the new `.open --deserialize FILE` flag arm in `cmdOpen`).
+      Repro:
+      ```
+      /home/bpsa/app/sqlite3/sqlite3 /tmp/d.db \
+        "CREATE TABLE t(x); INSERT INTO t VALUES(42);"
+      bin/passqlite3 ":memory:" ".open --deserialize /tmp/d.db" \
+                                "SELECT x FROM t;"
+      ```
+      → `Error: sqlite3_deserialize() returns 1`.  Failure is in the
+      existing 10.1.102 post-open switch arm at
+      `src/passqlite3shell.pas:1266..1284`, not in the parser code
+      touched by 10.1.27.b — the parser correctly sets
+      `openMode = SHELL_OPEN_DESERIALIZE` and reaches that arm.
+      Suspect chain (verify in order): (1) `shellReadFile` is returning
+      bytes in a flag/length combination that `sqlite3_deserialize`
+      rejects (the `SQLITE_DESERIALIZE_*` flag bits are sensitive to
+      `FREEONCLOSE` + buffer ownership); (2) the in-memory pager isn't
+      switching schemas before the SELECT runs (compare against
+      memdb.c:839..928 — the `reopenMemdb` arm in attachFunc ported
+      under 10.1.102 may not be firing for the *main* db handle when
+      `.open --deserialize` reuses an existing connection rather than
+      attaching).  C oracle: `shell.c.in:4496..4510` (the corresponding
+      `case SHELL_OPEN_DESERIALIZE:` arm) and `memdb.c:839..928`.
+      Blocks closing 10.1.27.
+
 - [X] **6.10** TestExplainParity closed.
 - [X] **6.11** PRAGMA page_count + DROP TABLE remaining gap closed.
 - [X] **6.12** sqlite3Pragma full port; DiagPragma all PASS.
