@@ -1344,6 +1344,140 @@ end;
 var
   curInputText: ^Text = nil;
 
+{ ----------------------------------------------------------------------
+  10.1.2.c  DynaPrompt — dynamic continuation prompt tracker.
+  Port of shell.c.in:849..906 (struct DynaPrompt + trackParenLevel +
+  setLexemeOpen + dynamicContinuePrompt) plus the four CONTINUE_PROMPT_*
+  macros at shell.c.in:839..847.
+
+  Tracks open-string / open-comment / paren depth across input lines so
+  the shell can render `   /*` / `   '` / `   "` / `   (x2` style
+  continuation prompts.  Mutated from quickScan via continuePrompt*
+  helpers below and reset from processInput at statement boundaries.
+  ---------------------------------------------------------------------- }
+type
+  TDynaPrompt = record
+    dynamicPrompt:    array[0..PROMPT_LEN_MAX-1] of AnsiChar;
+    acAwait:          array[0..1] of AnsiChar;
+    inParenLevel:     i32;
+    zScannerAwaits:   PAnsiChar;     { nil when not awaiting a lexeme close }
+  end;
+  PDynaPrompt = ^TDynaPrompt;
+
+var
+  dynPrompt: TDynaPrompt;       { zero-initialised at unit load }
+
+{ Record parenthesis nesting level change, or force level to 0.
+  shell.c.in:860..864. }
+procedure trackParenLevel(p: PDynaPrompt; ni: i32);
+begin
+  if p = nil then Exit;
+  p^.inParenLevel := p^.inParenLevel + ni;
+  if ni = 0 then p^.inParenLevel := 0;
+  p^.zScannerAwaits := nil;
+end;
+
+{ Record that a lexeme is opened (s<>nil or c<>0), or both==0 to clear.
+  shell.c.in:867..876.  Note the C: if(s!=0 || c==0) clear-and-store-s,
+  else store the single char c.  We follow byte-for-byte. }
+procedure setLexemeOpen(p: PDynaPrompt; s: PAnsiChar; c: AnsiChar);
+begin
+  if p = nil then Exit;
+  if (s <> nil) or (c = #0) then begin
+    p^.zScannerAwaits := s;
+    p^.acAwait[0] := #0;
+  end else begin
+    p^.acAwait[0] := c;
+    p^.zScannerAwaits := @p^.acAwait[0];
+  end;
+end;
+
+{ Macro helpers — gated on stdin_is_interactive like upstream. }
+procedure continuePromptReset; inline;
+begin
+  setLexemeOpen(@dynPrompt, nil, #0);
+  trackParenLevel(@dynPrompt, 0);
+end;
+
+procedure continuePromptAwaitS(p: PDynaPrompt; s: PAnsiChar); inline;
+begin
+  if (p <> nil) and (stdin_is_interactive <> 0) then setLexemeOpen(p, s, #0);
+end;
+
+procedure continuePromptAwaitC(p: PDynaPrompt; c: AnsiChar); inline;
+begin
+  if (p <> nil) and (stdin_is_interactive <> 0) then setLexemeOpen(p, nil, c);
+end;
+
+procedure continueParenIncr(p: PDynaPrompt; n: i32); inline;
+begin
+  if (p <> nil) and (stdin_is_interactive <> 0) then trackParenLevel(p, n);
+end;
+
+{ shell.c.in:878..905 — derive the continuation prompt for display.
+  Returns a NUL-terminated pointer into dynPrompt.dynamicPrompt when an
+  open lexeme / paren level rewrites the first 3 chars; otherwise
+  returns continuePromptStr unchanged. }
+function dynamicContinuePromptStr: AnsiString;
+var
+  ncp, ndp, i: SizeInt;
+  zAwait: PAnsiChar;
+begin
+  if (Length(continuePromptStr) = 0)
+     or ((dynPrompt.zScannerAwaits = nil) and (dynPrompt.inParenLevel = 0)) then
+  begin
+    Result := continuePromptStr;
+    Exit;
+  end;
+  if dynPrompt.zScannerAwaits <> nil then begin
+    zAwait := dynPrompt.zScannerAwaits;
+    ncp := Length(continuePromptStr);
+    ndp := 0;
+    while zAwait[ndp] <> #0 do Inc(ndp);
+    if ndp > ncp - 3 then begin
+      Result := continuePromptStr;
+      Exit;
+    end;
+    FillChar(dynPrompt.dynamicPrompt, SizeOf(dynPrompt.dynamicPrompt), 0);
+    for i := 0 to ndp-1 do dynPrompt.dynamicPrompt[i] := zAwait[i];
+    while ndp < 3 do begin
+      dynPrompt.dynamicPrompt[ndp] := ' ';
+      Inc(ndp);
+    end;
+    { Copy continuePromptStr[3..] into dynamicPrompt[3..] }
+    i := 4;
+    while (i <= Length(continuePromptStr))
+          and (3 + (i-4) < PROMPT_LEN_MAX-1) do
+    begin
+      dynPrompt.dynamicPrompt[3 + (i-4)] := AnsiChar(continuePromptStr[i]);
+      Inc(i);
+    end;
+  end else begin
+    FillChar(dynPrompt.dynamicPrompt, SizeOf(dynPrompt.dynamicPrompt), 0);
+    if dynPrompt.inParenLevel > 9 then begin
+      dynPrompt.dynamicPrompt[0] := '(';
+      dynPrompt.dynamicPrompt[1] := '.';
+      dynPrompt.dynamicPrompt[2] := '.';
+    end else if dynPrompt.inParenLevel < 0 then begin
+      dynPrompt.dynamicPrompt[0] := ')';
+      dynPrompt.dynamicPrompt[1] := 'x';
+      dynPrompt.dynamicPrompt[2] := '!';
+    end else begin
+      dynPrompt.dynamicPrompt[0] := '(';
+      dynPrompt.dynamicPrompt[1] := 'x';
+      dynPrompt.dynamicPrompt[2] := AnsiChar(Ord('0') + dynPrompt.inParenLevel);
+    end;
+    i := 4;
+    while (i <= Length(continuePromptStr))
+          and (3 + (i-4) < PROMPT_LEN_MAX-1) do
+    begin
+      dynPrompt.dynamicPrompt[3 + (i-4)] := AnsiChar(continuePromptStr[i]);
+      Inc(i);
+    end;
+  end;
+  Result := AnsiString(PAnsiChar(@dynPrompt.dynamicPrompt[0]));
+end;
+
 function oneInputLine(p: PShellState; isContinuation: Boolean;
                       out atEof: Boolean): AnsiString;
 begin
@@ -1352,7 +1486,8 @@ begin
     Exit;
   end;
   if (p^.inFile = nil) and (stdin_is_interactive <> 0) then begin
-    if isContinuation then Write(continuePromptStr) else Write(mainPromptStr);
+    if isContinuation then Write(dynamicContinuePromptStr)
+    else Write(mainPromptStr);
     Flush(Output);
   end;
   Result := localGetLine(Input, atEof);
@@ -1447,7 +1582,18 @@ begin
   Result := (qss and (not QSS_HasDark)) = QSS_EndingSemi;
 end;
 
-function quickScan(zLine: PAnsiChar; qss: TQuickScanState): TQuickScanState;
+function QSS_INPLAIN(qss: TQuickScanState): Boolean; inline;
+begin
+  Result := (qss and QSS_CharMask) = 0;
+end;
+
+{ String-literal pool for CONTINUE_PROMPT_AWAITS — must be stable pointers
+  since DynaPrompt.zScannerAwaits holds them across calls. }
+const
+  zAwaitBlockComment: PAnsiChar = '/*';
+
+function quickScan(zLine: PAnsiChar; qss: TQuickScanState;
+                   pst: PDynaPrompt): TQuickScanState;
 var
   cin, cWait: AnsiChar;
   state: i32;     { 0 = PlainScan, 1 = TermScan; mirrors C's two goto labels }
@@ -1487,6 +1633,7 @@ begin
               if zLine^ = '*' then begin
                 Inc(zLine);
                 cWait := '*';
+                continuePromptAwaitS(pst, zAwaitBlockComment);
                 qss := QSS_SETV(qss, Ord(cWait));
                 state := 1;
                 Break;                       { goto TermScan }
@@ -1497,6 +1644,7 @@ begin
             begin
               cWait := ']';
               qss := QSS_HasDark or Ord(cWait);
+              continuePromptAwaitC(pst, '[');  { shell.c.in:12131..12134 }
               state := 1;
               Break;
             end;
@@ -1504,12 +1652,17 @@ begin
             begin
               cWait := cin;
               qss := QSS_HasDark or Ord(cWait);
+              continuePromptAwaitC(pst, cin);
               state := 1;
               Break;
             end;
-          '(', ')':
+          '(':
             begin
-              { paren depth tracking deferred to 10.1.2.c — treat as dark. }
+              continueParenIncr(pst, 1);
+            end;
+          ')':
+            begin
+              continueParenIncr(pst, -1);
             end;
         end;
         { Default dark-char tail: clear EndingSemi, set HasDark.
@@ -1528,6 +1681,7 @@ begin
               begin
                 if zLine^ <> '/' then Continue;
                 Inc(zLine);
+                continuePromptAwaitC(pst, #0);
                 qss := QSS_SETV(qss, 0);
                 cWait := #0;
                 state := 0;
@@ -1539,6 +1693,7 @@ begin
                   Inc(zLine);                { swallow doubled delimiter }
                   Continue;
                 end;
+                continuePromptAwaitC(pst, #0);
                 qss := QSS_SETV(qss, 0);
                 cWait := #0;
                 state := 0;
@@ -1546,6 +1701,7 @@ begin
               end;
             ']':
               begin
+                continuePromptAwaitC(pst, #0);
                 qss := QSS_SETV(qss, 0);
                 cWait := #0;
                 state := 0;
@@ -1557,6 +1713,43 @@ begin
       if state = 1 then begin Result := qss; Exit; end;
     end;
   end;
+end;
+
+{ ----------------------------------------------------------------------
+  10.1.2.b  lineIsCommandTerminator — port of shell.c.in:12182..12191.
+
+  Returns True if the trimmed line is bare `/` (Oracle) or bare `go`
+  (SQL Server, case-insensitive) — both of which the shell rewrites to
+  `;` so the SQL statement completes.  Hands the post-token tail to
+  quickScan to ensure there's nothing dark trailing (only whitespace /
+  comments are allowed). }
+function lineIsCommandTerminator(zLine: PAnsiChar): Boolean;
+begin
+  Result := False;
+  while (zLine^ <> #0) and (zLine^ in [' ', #9, #10, #11, #12, #13]) do
+    Inc(zLine);
+  if zLine^ = '/' then
+    Inc(zLine)
+  else if ((zLine^ = 'g') or (zLine^ = 'G'))
+       and ((PAnsiChar(zLine + 1)^ = 'o') or (PAnsiChar(zLine + 1)^ = 'O')) then
+    Inc(zLine, 2)
+  else
+    Exit;
+  { Trailing tail must remain at QSS_Start — i.e. nothing dark.  We pass
+    nil for pst since this scan is throwaway and must not perturb the
+    real continuation-prompt tracker. }
+  Result := quickScan(zLine, 0, nil) = 0;
+end;
+
+{ shell.c.in:12205..12217 — return True if zSql is a complete statement
+  *if* a trailing `;` were appended.  In C the buffer is poked in place;
+  in Pascal we append to a local copy. }
+function lineIsComplete(const zSql: AnsiString): Boolean;
+var z: AnsiString;
+begin
+  if zSql = '' then begin Result := True; Exit; end;
+  z := zSql + ';';
+  Result := sqlite3_complete(PAnsiChar(z)) <> 0;
 end;
 
 function startsWithDot(const s: AnsiString): Boolean;
@@ -9169,6 +9362,7 @@ begin
     Exit;
   end;
   Inc(p^.inputNesting);
+  continuePromptReset;     { shell.c.in:12439 }
   while (errCnt = 0) or (bail_on_error = 0)
         or ((p^.inFile = nil) and (stdin_is_interactive <> 0)) do
   begin
@@ -9184,8 +9378,19 @@ begin
     end;
     Inc(p^.lineno);
 
+    { 10.1.2.b — shell.c.in:12451..12455.  When we're not inside an open
+      string/comment AND this line is a bare `go` or `/` terminator AND
+      the buffered SQL would be complete with a trailing `;`, rewrite
+      the line to `;` so the accumulator below cuts the statement. }
+    if QSS_INPLAIN(qss)
+       and lineIsCommandTerminator(PAnsiChar(zLine))
+       and lineIsComplete(zSql) then
+    begin
+      zLine := ';';
+    end;
+
     { shell.c.in:12458 — advance quickscan state for this line. }
-    qss := quickScan(PAnsiChar(zLine), qss);
+    qss := quickScan(PAnsiChar(zLine), qss, @dynPrompt);
 
     { shell.c.in:12459..12463 — swallow plain-white / comment-only lines
       while the accumulator is empty. }
@@ -9196,6 +9401,7 @@ begin
     end;
 
     if (zSql = '') and (startsWithDot(zLine) or startsWithHash(zLine)) then begin
+      continuePromptReset;       { shell.c.in:12466 }
       echoGroupInput(p, zLine);
       if startsWithDot(zLine) then begin
         rc := doMetaCommand(zLine, p);
@@ -9227,6 +9433,7 @@ begin
     begin
       echoGroupInput(p, zSql);
       Inc(errCnt, runOneSqlLine(p, zSql, AnsiString(p^.zInFile), startLine));
+      continuePromptReset;       { shell.c.in:12510 }
       zSql := '';
       qss := 0;     { shell.c.in:12523 }
       { shell.c.in:12512..12517 — at end of each SQL line, immediately
@@ -9246,6 +9453,7 @@ begin
   if zSql <> '' then begin
     echoGroupInput(p, zSql);
     Inc(errCnt, runOneSqlLine(p, zSql, AnsiString(p^.zInFile), startLine));
+    continuePromptReset;       { shell.c.in:12534 }
   end;
   Dec(p^.inputNesting);
   if errCnt > 0 then Result := 1 else Result := 0;

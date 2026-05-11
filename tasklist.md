@@ -420,17 +420,20 @@ partial landings cannot silently no-op.
         gate now reads `QSS_SEMITERM(qss) and sqlite3_complete(...)` and
         resets `qss := 0` after each cut.  Continue-prompt/paren tracker
         deferred to 10.1.2.c.
-  - [ ] **10.1.2.b** Port `line_is_command_terminator` (shell.c.in:12182..12191)
-        so SQL Server `go` and Oracle `/` line terminators rewrite to `;` per
-        upstream's `memcpy(zLine,";",2)` at shell.c.in:12456.  Depends on
-        10.1.2.a (calls `quickscan` on the trailing tail).
-  - [ ] **10.1.2.c** Wire `CONTINUE_PROMPT_PSTATE` continuation-prompt tracker
-        (shell.c.in: `CONTINUE_PROMPT_AWAITS` / `_AWAITC` /
-        `_PAREN_INCR` / `_RESET`).  Currently `oneInputLine` always emits the
-        plain continuation prompt `   ...> `; upstream switches to the
-        delimiter-aware prompt `   /*` / `   '` / `   (x2` when nested.
-        Touches the prompt sink at passqlite3shell.pas:1355 plus the
-        `CONTINUE_PROMPT_RESET` call sites in `processInput`.
+  - [X] **10.1.2.b** Port `line_is_command_terminator` (shell.c.in:12182..12191) —
+        landed as `lineIsCommandTerminator` + `lineIsComplete` near
+        passqlite3shell.pas:1620; `processInput` rewrites the line to `;`
+        when QSS_INPLAIN and the accumulator is complete (mirrors
+        shell.c.in:12451..12455).  Verified byte-identical against upstream
+        for `go`, `GO`, and bare `/` smokes.
+  - [X] **10.1.2.c** Wire `CONTINUE_PROMPT_PSTATE` continuation-prompt tracker —
+        landed `TDynaPrompt` + `trackParenLevel` + `setLexemeOpen` +
+        `dynamicContinuePromptStr` near passqlite3shell.pas:1350, plus
+        `continuePromptReset` / `AwaitS` / `AwaitC` / `ParenIncr` helpers.
+        `quickScan` now takes a `pst: PDynaPrompt` and calls the hooks at
+        every C call site; `oneInputLine` renders via
+        `dynamicContinuePromptStr`.  Interactive smokes show `'  ...>`,
+        `(x1...>`, and `/* ...>` continuation prompts.
 - [~] **10.1.3** main + process_command_line two-pass arg parser landed.
       Three deferrals broken out:
   - [ ] **10.1.3.a** Port `find_home_dir` + `find_xdg_file` +
