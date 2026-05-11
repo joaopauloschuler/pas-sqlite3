@@ -109,15 +109,15 @@ FPC porting traps that recur often enough to call out up-front:
           mIn` plus the vector LT/GT→LE/GE relax + `mNoOmit` mask.
           Case-collision rename: pParse→pPrs, pExpr→pE, p→pWcCur.
           Clean compile.
-    - [ ] **6.13.B.4** Port `freeIdxStr` + `freeIndexInfo`
-          (where.c:1604..1640).  Release `needToFreeIdxStr` and any
-          `aRhs[]` sqlite3_value handles owned by the trailing
-          HiddenIndexInfo.
-    - [ ] **6.13.B.5** Port `vtabBestIndex` (where.c:1648..1701).
-          Single xBestIndex dispatch with the right error-code
-          mapping (SQLITE_CONSTRAINT → no-plan; SQLITE_NOMEM bubble;
-          unknown rc → `sqlite3ErrorMsg`).  Returns the cost-bearing
-          IndexInfo so the caller can build a WhereLoop.
+    - [X] **6.13.B.4** `freeIdxStr` + `freeIndexInfo` ported at
+          codegen.pas:15120 / 15131.  Releases `needToFreeIdxStr` +
+          all aRhs[] sqlite3_value slots before sqlite3DbFree-ing the
+          contiguous block.
+    - [X] **6.13.B.5** `vtabBestIndex` ported at codegen.pas:15166.
+          Single xBestIndex dispatch with SQLITE_CONSTRAINT→no-plan,
+          SQLITE_NOMEM→sqlite3OomFault, other-rc→sqlite3ErrorMsg
+          (falling back to sqlite3ErrStr when zErrMsg is nil).
+          Honours bAllSchemas, releases pVTab^.zErrMsg.  Clean compile.
     - [ ] **6.13.B.6** Port `whereLoopAddVirtualOne`
           (where.c:4357..4540).  Marks one constraint subset as
           `usable=1`, calls `vtabBestIndex`, then unmarshals

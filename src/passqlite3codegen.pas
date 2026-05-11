@@ -15114,6 +15114,99 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
+  Phase 6.13.B.4 — freeIdxStr / freeIndexInfo (where.c:1631..1647).
+
+  freeIdxStr releases the idxStr buffer if xBestIndex flagged it with
+  needToFreeIdxStr (allocated via sqlite3_malloc inside the module's
+  xBestIndex implementation, so released via sqlite3_free).
+
+  freeIndexInfo releases the contiguous block allocated by
+  allocateIndexInfo, after first freeing each sqlite3_value* slot in
+  the trailing aRhs[] (these are set by sqlite3_vtab_rhs_value when a
+  vtab calls into it).
+  =========================================================================== }
+
+procedure freeIdxStr(pIdxInfo: PSqlite3IndexInfo);
+begin
+  if pIdxInfo^.needToFreeIdxStr <> 0 then
+  begin
+    sqlite3_free(pIdxInfo^.idxStr);
+    pIdxInfo^.idxStr           := nil;
+    pIdxInfo^.needToFreeIdxStr := 0;
+  end;
+end;
+
+procedure freeIndexInfo(db: PTsqlite3; pIdxInfo: PSqlite3IndexInfo);
+var
+  pHidden: PHiddenIndexInfo;
+  pRhs:    PPointer;
+  i:       i32;
+begin
+  if pIdxInfo = nil then Exit;
+  pHidden := PHiddenIndexInfo(PByte(pIdxInfo) + SizeOf(Tsqlite3_index_info));
+  pRhs    := HiddenIndexInfoRhs(pHidden);
+  for i := 0 to pIdxInfo^.nConstraint - 1 do
+  begin
+    sqlite3ValueFree(Psqlite3_value(pRhs[i]));
+    pRhs[i] := nil;
+  end;
+  freeIdxStr(pIdxInfo);
+  sqlite3DbFree(db, pIdxInfo);
+end;
+
+{ ---------------------------------------------------------------------------
+  Phase 6.13.B.5 — vtabBestIndex (where.c:1651..1701).
+
+  Invokes the vtab module's xBestIndex with the sqlite3_index_info
+  prepared by allocateIndexInfo.  Returns the xBestIndex rc:
+    SQLITE_OK         — pIdxInfo holds the chosen plan.
+    SQLITE_CONSTRAINT — module rejects this constraint subset (not
+                        an error; caller treats it as no-plan).
+    SQLITE_NOMEM      — OOM bubble; sqlite3OomFault on the db.
+    other rc          — propagate the module's zErrMsg (or
+                        sqlite3ErrStr(rc) if it never set one) into
+                        pParse and let the caller bail.
+  Note: needToFreeIdxStr / idxStr ownership stays with the caller
+  regardless of rc — the docs are explicit on this.
+  =========================================================================== }
+
+function vtabBestIndex(pParseCtx: PParse; pTab: PTable2;
+  pIdxInfo: PSqlite3IndexInfo): i32;
+var
+  rc:    i32;
+  pVTab: PSqlite3Vtab;
+  pVT:   passqlite3vtab.PVTable;
+begin
+  pVT := passqlite3vtab.sqlite3GetVTable(pParseCtx^.db, Pointer(pTab));
+  if (pVT = nil) or (pVT^.pVtab = nil)
+     or (pVT^.pVtab^.pModule = nil)
+     or (pVT^.pVtab^.pModule^.xBestIndex = nil) then
+  begin
+    Result := SQLITE_CONSTRAINT;
+    Exit;
+  end;
+  pVTab := pVT^.pVtab;
+  Inc(pParseCtx^.db^.nSchemaLock);
+  rc := passqlite3vtab.TxBestIndex(pVTab^.pModule^.xBestIndex)(pVTab, pIdxInfo);
+  Dec(pParseCtx^.db^.nSchemaLock);
+
+  if (rc <> SQLITE_OK) and (rc <> SQLITE_CONSTRAINT) then
+  begin
+    if rc = SQLITE_NOMEM then
+      sqlite3OomFault(pParseCtx^.db)
+    else if pVTab^.zErrMsg = nil then
+      sqlite3ErrorMsg(pParseCtx, sqlite3ErrStr(rc))
+    else
+      sqlite3ErrorMsg(pParseCtx, pVTab^.zErrMsg);
+  end;
+  if (pVT^.bAllSchemas <> 0) then
+    sqlite3VtabUsesAllSchemas(pParseCtx);
+  sqlite3_free(pVTab^.zErrMsg);
+  pVTab^.zErrMsg := nil;
+  Result := rc;
+end;
+
+{ ---------------------------------------------------------------------------
   Phase 6.9-bis (step 11g.2.d sub-progress) — whereLoopAddVirtual stub.
 
   The full virtual-table planner (where.c:4357..4810: whereLoopAddVirtualOne
