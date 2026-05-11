@@ -386,17 +386,11 @@ partial landings cannot silently no-op.
       hook is wired (passqlite3shell.pas:8881 / 8924 / 8929 / 8961 / 8973) and
       `.echo` toggles MFLG_ECHO (passqlite3shell.pas:3672).  Upstream
       `quickscan` state machine still stubbed — broken out below.
-  - [ ] **10.1.2.a** Port `QuickScanState` + `quickscan()` (shell.c.in:12086..12175).
-        Two-state walker (PlainScan / TermScan) tracking
-        `QSS_HasDark | QSS_EndingSemi | cWait` for `--` line comments,
-        `/* … */` block comments, `[..]` / `'..'` / `"..."` / `` `..` ``
-        quoted runs, and `(..)` depth.  Land as `quickScan(zLine: PAnsiChar;
-        qss: TQuickScanState; pst: PContinuePromptState): TQuickScanState`
-        beside the existing `isPlainWhiteOrComment` helper at
-        passqlite3shell.pas:1382.  Replace the `sqlite3_complete`-only gate at
-        passqlite3shell.pas:8959 with `QSS_SEMITERM(qss) and
-        sqlite3_complete(...)` to fix the trailing `-- comment` after `;`
-        case noted in the inline comment at 8951..8958.
+  - [X] **10.1.2.a** Ported `QuickScanState` + `quickScan()` beside
+        `isPlainWhiteOrComment` (passqlite3shell.pas:1410); processInput cut
+        gate now reads `QSS_SEMITERM(qss) and sqlite3_complete(...)` and
+        resets `qss := 0` after each cut.  Continue-prompt/paren tracker
+        deferred to 10.1.2.c.
   - [ ] **10.1.2.b** Port `line_is_command_terminator` (shell.c.in:12182..12191)
         so SQL Server `go` and Oracle `/` line terminators rewrite to `;` per
         upstream's `memcpy(zLine,";",2)` at shell.c.in:12456.  Depends on
