@@ -14857,6 +14857,263 @@ begin
 end;
 
 { ---------------------------------------------------------------------------
+  Phase 6.13.B.3 — allocateIndexInfo (where.c:1413..1626).
+
+  Marshalls a WhereClause into the sqlite3_index_info object that drives
+  xBestIndex.  Walks pWC + pWC->pOuter chain, marks each term referring
+  to pSrc->iCursor (and not depending on any cursor in mUnusable) with
+  TERM_OK, then allocates one contiguous block laid out as:
+
+      [ sqlite3_index_info | HiddenIndexInfo + aRhs[nTerm]
+        | aConstraint[nTerm] | aOrderBy[nOrderBy] | aConstraintUsage[nTerm] ]
+
+  matching upstream C's pIdxInfo[1], &pHidden->aRhs[nTerm], etc., so
+  sqlite3_vtab_rhs_value() / sqlite3_vtab_distinct() can later recover
+  the trailing payload via pointer arithmetic.
+
+  WO_IN/WO_AUX/WO_ISNULL/WO_IS map to SQLITE_INDEX_CONSTRAINT_* per
+  upstream's "direct assignment" identity (asserted in C).  Vector
+  LT/LE/GT/GE on RHS gets the LE/GE relax + the bit-i mNoOmit signal.
+
+  Returns the populated sqlite3_index_info, or nil on OOM (with
+  sqlite3ErrorMsg already invoked on pParse).
+  =========================================================================== }
+
+function allocateIndexInfo(
+  pWInfo:    PWhereInfo;
+  pWC:       PWhereClause;
+  mUnusable: Bitmask;
+  pSrc:      PSrcItem;
+  var mNoOmitOut: u16): PSqlite3IndexInfo;
+var
+  i, j, n, nLast: i32;
+  nTerm, nOrderBy: i32;
+  pPrs:        PParse;
+  pIdxCons:    PSqlite3IndexConstraint;
+  pIdxOrderBy: PSqlite3IndexOrderBy;
+  pUsage:      PSqlite3IndexConstraintUsage;
+  pHidden:     PHiddenIndexInfo;
+  pTerm:       PWhereTerm;
+  pIdxInfo:    PSqlite3IndexInfo;
+  mNoOmit:     u16;
+  pTab:        PTable2;
+  eDistinct:   i32;
+  pOrderBy:    PExprList;
+  pWcCur:      PWhereClause;
+  nByte:       SizeInt;
+  pBlock:      PByte;
+  pPk:         PIndex2;
+  iCol:        i32;
+  pE, pE2:     PExpr;
+  zColl:       PAnsiChar;
+  bSortByGroup: i32;
+  op:          u16;
+  obItems:     PExprListItem;
+begin
+  mNoOmit   := 0;
+  eDistinct := 0;
+  pPrs    := pWInfo^.pParse;
+  pTab      := pSrc^.pSTab;
+  pOrderBy  := pWInfo^.pOrderBy;
+
+  { Pass 1 (where.c:1442..1467): mark every WHERE term that references
+    this vtab cursor and is usable under mUnusable with TERM_OK; count
+    them in nTerm.  Walks the pWC -> pWC.pOuter chain. }
+  pWcCur := pWC; nTerm := 0;
+  while pWcCur <> nil do
+  begin
+    pTerm := pWcCur^.a;
+    for i := 0 to pWcCur^.nTerm - 1 do
+    begin
+      pTerm^.wtFlags := pTerm^.wtFlags and (not u16(TERM_OK));
+      if pTerm^.leftCursor <> pSrc^.iCursor then begin Inc(pTerm); Continue; end;
+      if (pTerm^.prereqRight and mUnusable) <> 0 then begin Inc(pTerm); Continue; end;
+      if (pTerm^.eOperator and u16(not WO_EQUIV)) = 0 then
+        begin Inc(pTerm); Continue; end;
+      if (pTerm^.wtFlags and TERM_VNULL) <> 0 then begin Inc(pTerm); Continue; end;
+      if ((pSrc^.fg.jointype and (JT_LEFT or JT_LTORJ or JT_RIGHT)) <> 0)
+         and (constraintCompatibleWithOuterJoin(pTerm, pSrc) = 0) then
+        begin Inc(pTerm); Continue; end;
+      Inc(nTerm);
+      pTerm^.wtFlags := pTerm^.wtFlags or u16(TERM_OK);
+      Inc(pTerm);
+    end;
+    pWcCur := pWcCur^.pOuter;
+  end;
+
+  { Pass 2 (where.c:1473..1530): set nOrderBy only if every non-constant
+    ORDER BY term resolves to a direct column ref (or matching COLLATE)
+    on this cursor, and no NULLS-FIRST sort.  eDistinct is then derived
+    from wctrlFlags + the rowidUsed bit. }
+  nOrderBy := 0;
+  if pOrderBy <> nil then
+  begin
+    n := pOrderBy^.nExpr;
+    obItems := ExprListItems(pOrderBy);
+    i := 0;
+    while i < n do
+    begin
+      pE := obItems[i].pExpr;
+      if sqlite3ExprIsConstant(nil, pE) <> 0 then
+        begin Inc(i); Continue; end;
+      if (obItems[i].fg.sortFlags and KEYINFO_ORDER_BIGNULL) <> 0 then Break;
+      if (pE^.op = TK_COLUMN) and (pE^.iTable = pSrc^.iCursor) then
+        begin Inc(i); Continue; end;
+      if pE^.op = TK_COLLATE then
+      begin
+        pE2 := pE^.pLeft;
+        if (pE2 <> nil) and (pE2^.op = TK_COLUMN)
+           and (pE2^.iTable = pSrc^.iCursor) then
+        begin
+          pE^.iColumn := pE2^.iColumn;
+          if pE2^.iColumn < 0 then begin Inc(i); Continue; end;
+          zColl := sqlite3ColumnColl(@pTab^.aCol[pE2^.iColumn]);
+          if zColl = nil then zColl := WhereStrBINARY;
+          if sqlite3_stricmp(pE^.u.zToken, zColl) = 0 then
+            begin Inc(i); Continue; end;
+        end;
+      end;
+      Break;
+    end;
+    if i = n then
+    begin
+      if (pWInfo^.wctrlFlags and WHERE_SORTBYGROUP) <> 0 then bSortByGroup := 1
+      else bSortByGroup := 0;
+      nOrderBy := n;
+      if ((pWInfo^.wctrlFlags and WHERE_DISTINCTBY) <> 0)
+         and ((pSrc^.fg.fgBits2 and u8($80)) = 0) then   { rowidUsed == 0 }
+        eDistinct := 2 + bSortByGroup
+      else if (pWInfo^.wctrlFlags and WHERE_GROUPBY) <> 0 then
+        eDistinct := 1 - bSortByGroup
+      else if (pWInfo^.wctrlFlags and WHERE_WANT_DISTINCT) <> 0 then
+        eDistinct := 3;
+    end;
+  end;
+
+  { Allocate contiguous block — matches the upstream layout exactly so
+    sqlite3_vtab_rhs_value / sqlite3_vtab_distinct can recover trailing
+    arrays via &pIdxInfo[1] / &pHidden->aRhs[nTerm] arithmetic. }
+  nByte := SizeOf(Tsqlite3_index_info)
+         + SZ_HIDDENINDEXINFO(nTerm)
+         + SizeInt(nTerm)    * SizeOf(Tsqlite3_index_constraint)
+         + SizeInt(nOrderBy) * SizeOf(Tsqlite3_index_orderby)
+         + SizeInt(nTerm)    * SizeOf(Tsqlite3_index_constraint_usage);
+  pIdxInfo := PSqlite3IndexInfo(sqlite3DbMallocZero(pPrs^.db, nByte));
+  if pIdxInfo = nil then
+  begin
+    sqlite3ErrorMsg(pPrs, 'out of memory');
+    Result := nil;
+    Exit;
+  end;
+  pBlock  := PByte(pIdxInfo) + SizeOf(Tsqlite3_index_info);
+  pHidden := PHiddenIndexInfo(pBlock);
+  Inc(pBlock, SZ_HIDDENINDEXINFO(nTerm));
+  pIdxCons := PSqlite3IndexConstraint(pBlock);
+  Inc(pBlock, SizeInt(nTerm) * SizeOf(Tsqlite3_index_constraint));
+  pIdxOrderBy := PSqlite3IndexOrderBy(pBlock);
+  Inc(pBlock, SizeInt(nOrderBy) * SizeOf(Tsqlite3_index_orderby));
+  pUsage := PSqlite3IndexConstraintUsage(pBlock);
+
+  pIdxInfo^.aConstraint      := pIdxCons;
+  pIdxInfo^.aOrderBy         := pIdxOrderBy;
+  pIdxInfo^.aConstraintUsage := pUsage;
+  pIdxInfo^.colUsed          := pSrc^.colUsed;
+  if not HasRowid(pTab) then
+  begin
+    pPk := sqlite3PrimaryKeyIndex(pTab);
+    if pPk <> nil then
+    begin
+      for i := 0 to pPk^.nKeyCol - 1 do
+      begin
+        iCol := Pi16(PByte(pPk^.aiColumn) + i * SizeOf(i16))^;
+        if iCol >= BMS - 1 then iCol := BMS - 1;
+        pIdxInfo^.colUsed := pIdxInfo^.colUsed or (Bitmask(1) shl iCol);
+      end;
+    end;
+  end;
+  pHidden^.pWC       := pWC;
+  pHidden^.pParse   := pPrs;
+  pHidden^.eDistinct := eDistinct;
+  pHidden^.mIn       := 0;
+  pHidden^.mHandleIn := 0;
+
+  { Pass 3 (where.c:1561..1604): emit a constraint slot for each TERM_OK
+    term.  WO_IN collapses to WO_EQ with the mIn bit set; WO_AUX uses
+    the term's eMatchOp; vector LT/GT relax to LE/GE and set mNoOmit. }
+  pWcCur := pWC; i := 0; j := 0;
+  while pWcCur <> nil do
+  begin
+    nLast := i + pWcCur^.nTerm;
+    pTerm := pWcCur^.a;
+    while i < nLast do
+    begin
+      if (pTerm^.wtFlags and TERM_OK) = 0 then
+      begin Inc(pTerm); Inc(i); Continue; end;
+      pIdxCons[j].iColumn     := pTerm^.u.leftColumn;
+      pIdxCons[j].iTermOffset := i;
+      op := pTerm^.eOperator and u16(WO_ALL);
+      if op = u16(WO_IN) then
+      begin
+        if (pTerm^.wtFlags and TERM_SLICE) = 0 then
+          pHidden^.mIn := pHidden^.mIn or (u32(1) shl j);
+        op := u16(WO_EQ);
+      end;
+      if op = u16(WO_AUX) then
+        pIdxCons[j].op := pTerm^.eMatchOp
+      else if (op and u16(WO_ISNULL or WO_IS)) <> 0 then
+      begin
+        if op = u16(WO_ISNULL) then
+          pIdxCons[j].op := SQLITE_INDEX_CONSTRAINT_ISNULL
+        else
+          pIdxCons[j].op := SQLITE_INDEX_CONSTRAINT_IS;
+      end
+      else
+      begin
+        pIdxCons[j].op := u8(op);
+        if ((op and u16(WO_LT or WO_LE or WO_GT_WO or WO_GE)) <> 0)
+           and (sqlite3ExprIsVector(pTerm^.pExpr^.pRight) <> 0) then
+        begin
+          if j < 16 then mNoOmit := mNoOmit or u16(1 shl j);
+          if op = u16(WO_LT) then pIdxCons[j].op := u8(WO_LE);
+          if op = u16(WO_GT_WO) then pIdxCons[j].op := u8(WO_GE);
+        end;
+      end;
+      pIdxCons[j].usable := 0;
+      Inc(j); Inc(pTerm); Inc(i);
+    end;
+    pWcCur := pWcCur^.pOuter;
+  end;
+  pIdxInfo^.nConstraint := j;
+
+  { Pass 4 (where.c:1612..1623): copy the validated ORDER BY column
+    refs into aOrderBy[].  Constants are skipped (matches Pass 2). }
+  if pOrderBy <> nil then
+  begin
+    obItems := ExprListItems(pOrderBy);
+    j := 0;
+    for i := 0 to nOrderBy - 1 do
+    begin
+      pE := obItems[i].pExpr;
+      if sqlite3ExprIsConstant(nil, pE) <> 0 then Continue;
+      pIdxOrderBy[j].iColumn := pE^.iColumn;
+      if (obItems[i].fg.sortFlags and KEYINFO_ORDER_DESC) <> 0 then
+        pIdxOrderBy[j].desc := 1
+      else
+        pIdxOrderBy[j].desc := 0;
+      Inc(j);
+    end;
+    pIdxInfo^.nOrderBy := j;
+  end;
+
+  { Silence unused-pUsage warning — the slot is wired through the
+    pIdxInfo^.aConstraintUsage pointer above and is filled by xBestIndex. }
+  if pUsage = nil then ;
+
+  mNoOmitOut := mNoOmit;
+  Result     := pIdxInfo;
+end;
+
+{ ---------------------------------------------------------------------------
   Phase 6.9-bis (step 11g.2.d sub-progress) — whereLoopAddVirtual stub.
 
   The full virtual-table planner (where.c:4357..4810: whereLoopAddVirtualOne
@@ -14874,7 +15131,8 @@ end;
 function whereLoopAddVirtual(pBuilder: PWhereLoopBuilder;
   mPrereq: Bitmask; mUnusable: Bitmask): i32;
 begin
-  { Touch the parameters so unused-variable warnings stay quiet. }
+  { Touch the parameters so unused-variable warnings stay quiet.
+    allocateIndexInfo is declared but not yet invoked — wired up in B.6/B.7. }
   if (pBuilder = nil) or (mPrereq = mPrereq) or (mUnusable = mUnusable) then
     ; { no-op }
   Result := SQLITE_OK;

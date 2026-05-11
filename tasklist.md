@@ -101,12 +101,14 @@ FPC porting traps that recur often enough to call out up-front:
           codegen.pas:3306..3319.  Owns `pWC / pParse / eDistinct /
           mIn / mHandleIn` + trailing `aRhs[]` of `Psqlite3_value`.
           codegen.pas builds clean.
-    - [ ] **6.13.B.3** Port `allocateIndexInfo` (where.c:1413..1539).
-          Walks the WhereClause, counts usable EQ/RANGE/LIKE/MATCH
-          terms against this cursor, allocates the contiguous
-          `sqlite3_index_info` + `HiddenIndexInfo` block, fills
-          `aConstraint[] / aOrderBy[] / mPrereq`.  Also handles the
-          colUsed and `idxFlags` defaults.
+    - [X] **6.13.B.3** Port `allocateIndexInfo` (where.c:1413..1626)
+          landed at codegen.pas:14882.  Walks the WhereClause +
+          pOuter chain marking TERM_OK terms, allocates the
+          contiguous `sqlite3_index_info` + HiddenIndexInfo block,
+          fills `aConstraint[] / aOrderBy[] / colUsed / eDistinct /
+          mIn` plus the vector LT/GT→LE/GE relax + `mNoOmit` mask.
+          Case-collision rename: pParse→pPrs, pExpr→pE, p→pWcCur.
+          Clean compile.
     - [ ] **6.13.B.4** Port `freeIdxStr` + `freeIndexInfo`
           (where.c:1604..1640).  Release `needToFreeIdxStr` and any
           `aRhs[]` sqlite3_value handles owned by the trailing
