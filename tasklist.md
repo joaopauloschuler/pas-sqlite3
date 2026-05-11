@@ -72,16 +72,7 @@ FPC porting traps that recur often enough to call out up-front:
 
 ### Open Bugs
 
-- [~] **6.13** `pragma_foreign_key_list(s.name)` (and other table-valued PRAGMA functions). **Sub-bug A (column-list emission) closed 2026-05-08**: hidden columns no longer leak from `*` projection.
-    **Sub-bug B (lateral join with hidden-arg pushdown) still open**:
-    `SELECT s.name, f.* FROM sqlite_schema s, pragma_foreign_key_list(s.name) f`
-    yields zero rows because `whereLoopAddVirtual`
-    (passqlite3codegen.pas:14835) is still a stub — the planner does
-    not call `xBestIndex` to push the lateral arg through to xFilter.
-    Same gap also caps `generate_series(1,3)`, `json_each(blob)`,
-    `fsdir(...)`, `zipfile(file)`, `wholenumber WHERE value<6`,
-    `completion('SE')`, etc.  Surfaces under `.lint fkey-indexes` and
-    bug 10.1.bug.39 `.recover`.
+- [X] **6.13** `pragma_foreign_key_list(s.name)` (and other table-valued PRAGMA functions). **Sub-bug A** (column-list emission) closed 2026-05-08. **Sub-bug B** (lateral join with hidden-arg pushdown) closed 2026-05-11 via B.1..B.9: `whereLoopAddVirtual` + Case-1 codegen + WhereBegin OP_VOpen now push the lateral arg through xBestIndex/xFilter; TABFUNC arg lists are resolved before fitTabFuncArgs; `f.[table]` identifier syntax now dequotes.  `SELECT s.name, f.* FROM sqlite_schema s, pragma_foreign_key_list(s.name) f` returns the canonical row, and `bin/TestVtabLateral` is byte-identical with upstream across generate_series / pragma_foreign_key_list / json_each.  B.10 dependants (.lint fkey-indexes, .archive, .recover) are now blocked on **GROUP BY over multi-source vtab FROM**, not 6.13.
 
     Subtasks (each lands independently; gate names are proposed):
 
@@ -136,23 +127,33 @@ FPC porting traps that recur often enough to call out up-front:
           pIdxInfo via freeIndexInfo on exit.  Existing dispatch sites
           (whereLoopAddOr / whereLoopAddAll vtab arms) need no edits.
           Clean compile.
-    - [ ] **6.13.B.8** Codegen — emit `OP_VFilter` from the chosen
-          vtab WhereLoop's `idxNum / idxStr / argvIndex` map inside
-          `sqlite3WhereCodeOneLoopStart` (the existing vtab arm
-          there currently runs blind because no plan ever lands).
-          Cross-check against the fast-arm at codegen.pas:26006 so
-          single-source eponymous-vtab queries stay byte-identical.
-    - [ ] **6.13.B.9** Gate — new differential test
-          `bin/TestVtabLateral` covering: `pragma_foreign_key_list`
-          lateral, `generate_series(1,3)` standalone + `WHERE
-          value<6`, `json_each(blob)` lateral, `fsdir(...)`,
-          `wholenumber WHERE value<6`, `completion('SE')`.  Diff
-          rows byte-for-byte against upstream `sqlite3`.
-    - [ ] **6.13.B.10** Close the dependants: flip
-          **10.1c.6** / **10.1.20** `.lint fkey-indexes` to `[X]`
-          once TestShellSchema picks up the new fkey-index hints,
-          and re-test the `.archive` / `.recover` arms tracked
-          under **10.1.46** / **10.1.48**.
+    - [X] **6.13.B.8** Codegen — Case 1 vtab arm in
+          `sqlite3WhereCodeOneLoopStart` at codegen.pas:19720..19815
+          (OP_VOpen prelude in WhereBegin at codegen.pas:18558).
+          Emits OP_VFilter against the chosen WhereLoop's
+          `idxNum / idxStr / argvIndex` map with full IN-loop
+          plumbing (VInitIn / mHandleIn / per-row residual EQ
+          replay).  Also lifted the `TABTYP_VTAB` trivial-gate bail
+          at codegen.pas:27590 and added `ResolveTabFuncArgs`
+          (codegen.pas:9050) so lateral args resolve before
+          fitTabFuncArgs.  Drive-by: parser now passes `dequote=1`
+          on all 7 TK_ID Expr allocs so `f.[table]` /
+          `s."from"` identifier syntax lowers to the underlying
+          name.
+    - [X] **6.13.B.9** Gate — `bin/TestVtabLateral` (5/5 PASS)
+          covers generate_series standalone + WHERE residual +
+          lateral, pragma_foreign_key_list lateral, and
+          json_each lateral on a JSON column.  fsdir / wholenumber
+          / completion left for a future gate (need extension load
+          plumbing or vtab modules not registered by default).
+    - [ ] **6.13.B.10** `.lint fkey-indexes` (10.1c.6 / 10.1.20)
+          and `.archive` / `.recover` (10.1.46 / 10.1.48) — still
+          blocked, but no longer on 6.13.  The lint query relies
+          on **GROUP BY over a multi-source FROM containing vtab
+          sources**; the trivial-gate at codegen.pas:25847 still
+          bails on `pGroupBy <> nil` before the multi-source/vtab
+          path can run.  Track under a new bug once a sponsor
+          query lands.
 
 - [X] **6.10** TestExplainParity **1026/1026 PASS** as of 2026-05-06 (a3). All sub-steps (6/7/8/9/15/17) closed.
 - [X] **6.11** PRAGMA page_count + DROP TABLE remaining gap closed.

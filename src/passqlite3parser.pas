@@ -3061,8 +3061,8 @@ begin
          pRight_104 := sqlite3PExpr(pPse, TK_ASTERISK, nil, nil);
          sqlite3ExprSetErrorOffset(pRight_104,
            i32(PtrUInt(yymsp[0].minor.yy0.z) - PtrUInt(pPse^.zTail)));
-         pLeft_104 := sqlite3ExprAlloc(pPse^.db, TK_ID,
-           @yymsp[-2].minor.yy0, 0);
+         pLeft_104 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
+           @yymsp[-2].minor.yy0, 1);
          pDot_104  := sqlite3PExpr(pPse, TK_DOT, pLeft_104, pRight_104);
          yymsp[-4].minor.yy14 := sqlite3ExprListAppend(pPse,
            PExprList(yymsp[-4].minor.yy14), pDot_104);
@@ -3443,8 +3443,8 @@ begin
            is a union — capture token z BEFORE assigning yy454, otherwise
            yy0.z is overwritten by the Expr pointer. }
          tok_180_z := yymsp[0].minor.yy0.z;
-         yymsp[0].minor.yy454 := sqlite3ExprAlloc(pPse^.db, TK_ID,
-           @yymsp[0].minor.yy0, 0);
+         yymsp[0].minor.yy454 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
+           @yymsp[0].minor.yy0, 1);
          if yymsp[0].minor.yy454 <> nil then
            PExpr(yymsp[0].minor.yy454)^.w.iOfst :=
              i32(PtrUInt(tok_180_z) - PtrUInt(pPse^.zTail));
@@ -3453,13 +3453,13 @@ begin
        begin
          tok_181_z0 := yymsp[-2].minor.yy0.z;
          tok_181_z1 := yymsp[0].minor.yy0.z;
-         temp1_181 := sqlite3ExprAlloc(pPse^.db, TK_ID,
-           @yymsp[-2].minor.yy0, 0);
+         temp1_181 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
+           @yymsp[-2].minor.yy0, 1);
          if temp1_181 <> nil then
            temp1_181^.w.iOfst :=
              i32(PtrUInt(tok_181_z0) - PtrUInt(pPse^.zTail));
-         temp2_181 := sqlite3ExprAlloc(pPse^.db, TK_ID,
-           @yymsp[0].minor.yy0, 0);
+         temp2_181 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
+           @yymsp[0].minor.yy0, 1);
          if temp2_181 <> nil then
            temp2_181^.w.iOfst :=
              i32(PtrUInt(tok_181_z1) - PtrUInt(pPse^.zTail));
@@ -3471,18 +3471,18 @@ begin
          tok_182_z0 := yymsp[-4].minor.yy0.z;
          tok_182_z1 := yymsp[-2].minor.yy0.z;
          tok_182_z2 := yymsp[0].minor.yy0.z;
-         temp1_181 := sqlite3ExprAlloc(pPse^.db, TK_ID,
-           @yymsp[-4].minor.yy0, 0);
+         temp1_181 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
+           @yymsp[-4].minor.yy0, 1);
          if temp1_181 <> nil then
            temp1_181^.w.iOfst :=
              i32(PtrUInt(tok_182_z0) - PtrUInt(pPse^.zTail));
-         temp2_181 := sqlite3ExprAlloc(pPse^.db, TK_ID,
-           @yymsp[-2].minor.yy0, 0);
+         temp2_181 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
+           @yymsp[-2].minor.yy0, 1);
          if temp2_181 <> nil then
            temp2_181^.w.iOfst :=
              i32(PtrUInt(tok_182_z1) - PtrUInt(pPse^.zTail));
-         temp3_182 := sqlite3ExprAlloc(pPse^.db, TK_ID,
-           @yymsp[0].minor.yy0, 0);
+         temp3_182 := sqlite3ExprAlloc(pPse^.db, TK_ID, { dequote=1 for [name]/"name" }
+           @yymsp[0].minor.yy0, 1);
          if temp3_182 <> nil then
            temp3_182^.w.iOfst :=
              i32(PtrUInt(tok_182_z2) - PtrUInt(pPse^.zTail));

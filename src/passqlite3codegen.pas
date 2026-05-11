@@ -8317,6 +8317,7 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
   pOuterNC: PNameContext);
 
   procedure ResolveExprList(pList: PExprList); forward;
+  procedure ResolveTabFuncArgs(pSrcL: PSrcList); forward;
 
   { TableNameInOuterSrc — read-only check: does any outer FROM table match
     zTab?  Used for correlated-subquery detection without modifying the expr
@@ -9046,6 +9047,25 @@ procedure sqlite3ResolveSelectNames(pParse: PParse; p: PSelect;
     end;
   end;
 
+  { Phase 6.13.B.8 — walk pSrc and run ResolveExprList over each TABFUNC
+    arg list so generate_series(1,t.x), pragma_foreign_key_list(s.name),
+    json_each(blob), etc. see fully bound argument expressions before
+    fitTabFuncArgs builds the constraint terms. }
+  procedure ResolveTabFuncArgs(pSrcL: PSrcList);
+  var
+    iTF: i32;
+    items: PSrcItem;
+  begin
+    if (pSrcL = nil) or (pSrcL^.nSrc = 0) then Exit;
+    items := SrcListItems(pSrcL);
+    for iTF := 0 to pSrcL^.nSrc - 1 do
+    begin
+      if ((items[iTF].fg.fgBits and SRCITEM_FG_IS_TABFUNC) <> 0)
+         and (items[iTF].u1.pFuncArg <> nil) then
+        ResolveExprList(items[iTF].u1.pFuncArg);
+    end;
+  end;
+
   { resolve.c:1472 — resolveAsName.  When pE is a bare TK_ID, scan
     pEList for a result-set item whose ENAME_NAME alias matches the
     token (case-insensitive).  Returns iCol+1 on hit, 0 otherwise. }
@@ -9363,6 +9383,13 @@ begin
   while p <> nil do
   begin
   ResolveExprList(p^.pEList);
+  { Phase 6.13.B.8 — resolve TABFUNC argument lists in pSrc so
+    fitTabFuncArgs (called later inside sqlite3WhereBegin) sees fully
+    bound TK_COLUMN references rather than raw TK_DOT/TK_ID.  C does
+    this via resolve.c's walker descending into SrcItem.u1.pFuncArg
+    (see also the analogous walker pas-port at codegen.pas:9736). }
+  if p^.pSrc <> nil then
+    ResolveTabFuncArgs(p^.pSrc);
   { resolve.c:1987..1989 — NC_UEList is in effect when resolving WHERE,
     so a bare TK_ID that does not match a FROM column may bind to a
     result-set alias.  This port lacks the NC_UEList fallback in its
@@ -18555,6 +18582,19 @@ begin
       if ((pTab^.tabFlags and TF_Ephemeral) = 0) and (not IsView(pTab))
          and ((pTabItem^.fg.fgBits and SRCITEM_FG_VIA_COROUTINE) = 0) then
       begin
+        if (pLoop^.wsFlags and WHERE_VIRTUALTABLE) <> 0 then
+        begin
+          { Phase 6.13.B.8 — virtual-table cursor open (where.c:7263..7268).
+            VFilter / VNext live in sqlite3WhereCodeOneLoopStart Case 1. }
+          sqlite3VdbeAddOp4(v, OP_VOpen, pTabItem^.iCursor, 0, 0,
+            PAnsiChar(passqlite3vtab.sqlite3GetVTable(pParse^.db, Pointer(pTab))),
+            P4_VTAB);
+        end
+        else if pTab^.eTabType = TABTYP_VTAB then
+        begin
+          { IsVirtual(pTab) without WHERE_VIRTUALTABLE — no cursor needed. }
+        end
+        else
         if (pLoop^.wsFlags and WHERE_IDX_ONLY) = 0 then
         begin
           sqlite3OpenTable(pParse, pTabItem^.iCursor, iDb, pTab, OP_OpenRead);
@@ -19533,6 +19573,22 @@ var
   pLoop:       PWhereLoop;
   pTerm:       PWhereTerm;
   pTabItem:    PSrcItem;
+  { ---- Case 1 (virtual table) locals ---- }
+  iRegV1:           i32;
+  nConstraintV1:    i32;
+  addrNotFoundV1:   i32;
+  jV1:              i32;
+  iTargetV1:        i32;
+  iTabV1, iCacheV1: i32;
+  pRightV1:         PExpr;
+  pCompareV1:       PExpr;
+  pRegExprV1:       PExpr;
+  pLeftV1:          PExpr;
+  iFldV1:           i32;
+  iInV1:            i32;
+  pOpV1:            PVdbeOp;
+  pVTabStrV1:       PAnsiChar;
+  pVTabP4V1:        i32;
   { ---- Case 3 (IPK range-scan) locals ---- }
   pStart:      PWhereTerm;
   pEnd:        PWhereTerm;
@@ -19681,6 +19737,120 @@ begin
     pLevel^.p2 := sqlite3VdbeAddOp2(v, OP_Yield,
                                     pTabItem^.u4.pSubq^.regReturn, addrBrk);
     pLevel^.op := OP_Goto;
+  end
+  else
+  if (pLoop^.wsFlags and WHERE_VIRTUALTABLE) <> 0 then
+  begin
+    { Phase 6.13.B.8 — Case 1 virtual-table xFilter driver
+      (wherecode.c:1561..1681).  Emits OP_VFilter against the idxNum /
+      idxStr / argvIndex map chosen by xBestIndex (recorded on the
+      WhereLoop's u.vtab fields).  pLevel^.op becomes OP_VNext so the
+      per-iteration tail in sqlite3WhereEnd advances the vtab cursor. }
+    nConstraintV1 := pLoop^.nLTerm;
+    iRegV1 := sqlite3GetTempRange(pParse, nConstraintV1 + 2);
+    addrNotFoundV1 := pLevel^.addrBrk;
+    for jV1 := 0 to nConstraintV1 - 1 do
+    begin
+      iTargetV1 := iRegV1 + jV1 + 2;
+      pTerm := pLoop^.aLTerm[jV1];
+      if pTerm = nil then continue;
+      if (pTerm^.eOperator and WO_IN) <> 0 then
+      begin
+        if (jV1 < 32) and (((u32(1) shl jV1) and pLoop^.u.vtab.mHandleIn) <> 0) then
+        begin
+          iTabV1 := pParse^.nTab; Inc(pParse^.nTab);
+          Inc(pParse^.nMem); iCacheV1 := pParse^.nMem;
+          sqlite3CodeRhsOfIN(pParse, pTerm^.pExpr, iTabV1, 0);
+          sqlite3VdbeAddOp3(v, OP_VInitIn, iTabV1, iTargetV1, iCacheV1);
+        end
+        else
+        begin
+          codeEqualityTerm(pParse, pTerm, pLevel, jV1, bRev, iTargetV1);
+          addrNotFoundV1 := pLevel^.addrNxt;
+        end;
+      end
+      else
+      begin
+        pRightV1 := pTerm^.pExpr^.pRight;
+        codeExprOrVector(pParse, pRightV1, iTargetV1, 1);
+        if (pTerm^.eMatchOp = u8(SQLITE_INDEX_CONSTRAINT_OFFSET))
+           and ((pLoop^.u.vtab.bFlags and u8($02)) <> 0)  { bOmitOffset }
+           and (pWInfo^.pSelect <> nil)
+           and (pWInfo^.pSelect^.iOffset > 0) then
+          sqlite3VdbeAddOp2(v, OP_Integer, 0, pWInfo^.pSelect^.iOffset);
+      end;
+    end;
+    sqlite3VdbeAddOp2(v, OP_Integer, pLoop^.u.vtab.idxNum, iRegV1);
+    sqlite3VdbeAddOp2(v, OP_Integer, nConstraintV1, iRegV1 + 1);
+    pVTabStrV1 := pLoop^.u.vtab.idxStr;
+    if (pLoop^.u.vtab.bFlags and u8($01)) <> 0 then  { needFree }
+      pVTabP4V1 := P4_DYNAMIC
+    else
+      pVTabP4V1 := P4_STATIC;
+    sqlite3VdbeAddOp4(v, OP_VFilter, iCur, addrNotFoundV1, iRegV1,
+                      pVTabStrV1, pVTabP4V1);
+    { needFree ownership transfers into the VDBE (it now frees the
+      string when the program is deleted).  Clear our bit so the
+      planner's freeIdxStr doesn't double-free, and NULL out idxStr
+      so a malloc-failed AddOp4 cannot leave a dangling pointer. }
+    pLoop^.u.vtab.bFlags := pLoop^.u.vtab.bFlags and not u8($01);
+    if pParse^.db^.mallocFailed <> 0 then pLoop^.u.vtab.idxStr := nil;
+    pLevel^.p1 := iCur;
+    if pWInfo^.eOnePass <> ONEPASS_OFF then
+      pLevel^.op := OP_Noop
+    else
+      pLevel^.op := OP_VNext;
+    pLevel^.p2 := sqlite3VdbeCurrentAddr(v);
+    Assert((pLoop^.wsFlags and WHERE_MULTI_OR) = 0);
+
+    for jV1 := 0 to nConstraintV1 - 1 do
+    begin
+      pTerm := pLoop^.aLTerm[jV1];
+      if pTerm = nil then continue;
+      if (jV1 < 16) and (((pLoop^.u.vtab.omitMask shr jV1) and u16(1)) <> 0) then
+      begin
+        disableTerm(pLevel, pTerm);
+        continue;
+      end;
+      if ((pTerm^.eOperator and WO_IN) <> 0)
+         and ((jV1 >= 32) or (((u32(1) shl jV1) and pLoop^.u.vtab.mHandleIn) = 0))
+         and (pParse^.db^.mallocFailed = 0) then
+      begin
+        { Reload the constraint value into reg[iReg+j+2] and emit the
+          per-row residual EQ check so the xFilter argument matches the
+          current IN-loop value (wherecode.c:1615..1670). }
+        for iInV1 := 0 to pLevel^.u.in_nIn - 1 do
+        begin
+          pOpV1 := sqlite3VdbeGetOp(v, pLevel^.u.in_aInLoop[iInV1].addrInTop);
+          if ((pOpV1^.opcode = OP_Column) and (pOpV1^.p3 = iRegV1 + jV1 + 2))
+             or ((pOpV1^.opcode = OP_Rowid) and (pOpV1^.p2 = iRegV1 + jV1 + 2)) then
+          begin
+            sqlite3VdbeAddOp3(v, i32(pOpV1^.opcode), pOpV1^.p1, pOpV1^.p2, pOpV1^.p3);
+            break;
+          end;
+        end;
+        pCompareV1 := sqlite3PExpr(pParse, TK_EQ, nil, nil);
+        if pParse^.db^.mallocFailed = 0 then
+        begin
+          iFldV1 := pTerm^.u.iField;
+          pLeftV1 := pTerm^.pExpr^.pLeft;
+          if iFldV1 > 0 then
+            pCompareV1^.pLeft := ExprListItems(pLeftV1^.x.pList)[iFldV1 - 1].pExpr
+          else
+            pCompareV1^.pLeft := pLeftV1;
+          pRegExprV1 := sqlite3Expr(pParse^.db, TK_REGISTER, nil);
+          pCompareV1^.pRight := pRegExprV1;
+          if pRegExprV1 <> nil then
+          begin
+            pRegExprV1^.iTable := iRegV1 + jV1 + 2;
+            sqlite3ExprIfFalse(pParse, pCompareV1, pLevel^.addrCont,
+                               SQLITE_JUMPIFNULL);
+          end;
+          pCompareV1^.pLeft := nil;
+        end;
+        sqlite3ExprDelete(pParse^.db, pCompareV1);
+      end;
+    end;
   end
   else
   { Case 2 — wherecode.c:1684..1711.  IPK rowid-EQ or rowid-IN.  Emits
@@ -27438,14 +27608,16 @@ begin
     pTab  := pItem^.pSTab;
   end;
 
-  { All source items must be real, non-virtual base tables — no vtabs,
-    no view expansion in this slice.  Subquery sources are allowed when
-    the pre-materialisation pass above has populated their eph cursor.  }
+  { All source items must be real or virtual base tables — view expansion
+    is not in scope.  Subquery sources are allowed when the pre-
+    materialisation pass above has populated their eph cursor.
+    Phase 6.13.B.8: vtab sources are admitted; sqlite3WhereBegin's vtab
+    arm emits OP_VOpen + OP_VFilter via the new whereLoopAddVirtual /
+    Case-1 codegen pair. }
   for i := 0 to pTabList^.nSrc - 1 do
   begin
     pTab := SrcListItems(pTabList)[i].pSTab;
     if pTab = nil then begin Result := SQLITE_OK; Exit; end;
-    if pTab^.eTabType = TABTYP_VTAB then begin Result := SQLITE_OK; Exit; end;
     { 6.10 step 9(f) — allow TF_Ephemeral source items that are recursive-CTE
       pseudo-cursors (fgBits bit 7 set), or post-materialisation subquery
       sources (SRCITEM_FG_IS_SUBQUERY set, materialised by the pre-pass
