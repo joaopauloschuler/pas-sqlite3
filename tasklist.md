@@ -537,7 +537,27 @@ partial landings cannot silently no-op.
         against the upstream `sqlite3` binary.  Flips 10.1d to `[X]`.
 
 - [X] **10.1.22, 10.1.23, 10.1.25, 10.1.26** `.read FILE`, `.dump` (full), `.output`/`.once`, `.save` all landed.
-- [~] **10.1.24** `.import` — auto-create-from-header landed (shellAutoColumnAdd/Finish, shell.c.in:7165..7339); duplicate column renaming now unblocked (bug 10.1.bug.131 closed). Heredoc input and pipe input still deferred.
+- [~] **10.1.24** `.import` — option parser + reader landed at
+      passqlite3shell.pas:7609 (`cmdImport`).  Done:
+      `--csv` / `--ascii` / `--colsep` / `--rowsep` / `--esc` / `--qesc` /
+      `-v` / `--schema` / `--skip` flag arms; CSV (`csv_read_one_field`) +
+      ASCII (`ascii_read_one_field`) readers at passqlite3shell.pas:7274..7397;
+      auto-create-from-header (`shellAutoColumnAdd`/`shellAutoColumnFinish`,
+      shell.c.in:7165..7339); duplicate-column renaming via 10.1.bug.131
+      (now `[X]`).  Remaining sub-arms — broken out under 10.1d so the
+      gate sits next to the other I/O dot-commands:
+  - [ ] **10.1.24.a** Heredoc input (`FILE` = `<<END`) — see
+        [10.1d.3.a](#10.1d).  Touches the `else if (Length(zFile) >= 3)
+        and (zFile[1]='<') and (zFile[2]='<')` arm inside `cmdImport`;
+        accumulates lines from `p^.in` into a `Psqlite3_str` until the
+        end-mark, then routes through the existing CSV/ASCII reader via
+        `sCtx.zIn`.  Error: `Content terminator "%s" not found.`
+        (shell.c.in:7634).
+  - [ ] **10.1.24.b** Pipe input (`FILE` = `|cmd`) — see
+        [10.1d.3.b](#10.1d).  `popen(zFile+1,"r")` via FPC `BaseUnix`,
+        `sCtx.zFile := '<pipe>'`, `xCloser := @pclose`.  Gated behind
+        the existing `failIfSafeMode(p, 'cannot run .import in safe
+        mode')` already in `cmdImport`.
 - [~] **10.1.27** `.open` — handles `-new`, `-readonly`, `-exclusive`, `-ifexists`, `-nofollow`.  Backing VFS/extension ports for `--zip` (10.1.98) / `--deserialize` (10.1.102) / `--hexdb` (10.1.102) are all `[X]`; only the `cmdOpen` parser arms need wiring — tracked under 10.1d.6.a.
 
 ### 10.1e Meta / diagnostic dot-commands
