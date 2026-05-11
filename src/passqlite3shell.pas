@@ -7450,6 +7450,11 @@ type
     bufPos:    SizeInt;
     bufLen:    SizeInt;
     atEof:     Boolean;
+    { 10.1.24.a — heredoc input buffer.  When zIn<>nil importGetc reads
+      from it instead of inHandle; sqlite3_free()'d by importCleanup.
+      Mirrors C ImportCtx.zIn (shell.c.in:6788..6789). }
+    zIn:       PAnsiChar;
+    zInCur:    PAnsiChar;
     z:         AnsiString;       { Accumulated text for one field }
     nLine:     i32;              { Current line number }
     nRow:      i32;              { Number of rows imported }
@@ -7475,14 +7480,30 @@ begin
     p.inOpen := False;
     p.inHandle := THandle(-1);
   end;
+  if p.zIn <> nil then begin
+    sqlite3_free(p.zIn);
+    p.zIn    := nil;
+    p.zInCur := nil;
+  end;
   p.z := '';
   p.bufPos := 0;
   p.bufLen := 0;
 end;
 
 function importGetc(var p: TImportCtx): i32;
-var n: SizeInt;
+var n: SizeInt; c: Byte;
 begin
+  { 10.1.24.a — heredoc arm: drain the in-memory buffer first. }
+  if p.zInCur <> nil then begin
+    c := Byte(p.zInCur^);
+    if c = 0 then begin
+      Result := IMPORT_EOF;
+      Exit;
+    end;
+    Inc(p.zInCur);
+    Result := i32(c);
+    Exit;
+  end;
   if p.bufPos >= p.bufLen then begin
     if p.atEof then begin Result := IMPORT_EOF; Exit; end;
     n := FpRead(p.inHandle, p.buf, SizeOf(p.buf));
@@ -7814,6 +7835,13 @@ var
   zArg: AnsiString;
   autoDb: PTsqlite3;
   autoRenamed, zColDefs, zCreate: AnsiString;
+  { 10.1.24.a — heredoc arm locals (shell.c.in:7601..7637). }
+  pContent: PSqlite3Str;
+  zEndMark, zLine: AnsiString;
+  nEndMark: i32;
+  ckEnd: i32;
+  iStart, savedLn: i64;
+  atEof: Boolean;
 begin
   importInit(sCtx);
   if p^.mode.eMode = MODE_Ascii then
@@ -7917,15 +7945,62 @@ begin
     Exit;
   end;
   if (Length(zFile) > 2) and (zFile[1] = '<') and (zFile[2] = '<') then begin
-    shellEPutZ('Error: heredoc input (<<MARK) is not supported in this build'#10);
-    Exit;
+    { 10.1.24.a — heredoc arm.  shell.c.in:7601..7637.
+      zFile = '<<MARK': read subsequent script lines into an sqlite3_str
+      until a line starts with MARK; route through the existing CSV/ASCII
+      reader via sCtx.zIn. }
+    nEndMark := Length(zFile) - 2;
+    zEndMark := Copy(zFile, 3, nEndMark);
+    pContent := sqlite3_str_new(p^.db);
+    ckEnd := 1;
+    iStart := p^.lineno;
+    sCtx.zFile := AnsiString(p^.zInFile);
+    sCtx.nLine := i32(p^.lineno + 1);
+    atEof := False;
+    while True do begin
+      zLine := oneInputLine(p, False, atEof);
+      if atEof then Break;
+      if (ckEnd <> 0)
+         and (Length(zLine) >= nEndMark)
+         and (StrLComp(PAnsiChar(zLine), PAnsiChar(zEndMark), nEndMark) = 0)
+      then begin
+        ckEnd := 2;
+        Inc(p^.lineno);  { oneInputLine consumed a '\n' terminator }
+        Break;
+      end;
+      Inc(p^.lineno);
+      ckEnd := 1;
+      sqlite3_str_appendall(pContent, PAnsiChar(zLine));
+      sqlite3_str_append(pContent, PAnsiChar(#10), 1);
+    end;
+    sCtx.zIn := sqlite3_str_finish(pContent);
+    if sCtx.zIn = nil then
+      sCtx.zIn := sqlite3_mprintf(PAnsiChar(''));
+    if ckEnd < 2 then begin
+      savedLn := p^.lineno;
+      p^.lineno := iStart;
+      { Mirror C dotCmdError → shellErrorLocation: prints
+        "line %lld:" when zInFile is "<stdin>" (or NULL), else
+        "<file>:%lld:".  shell.c.in:1779..1789, 1834..1842. }
+      if (p^.zInFile = nil) or (StrComp(p^.zInFile, '<stdin>') = 0) then
+        shellEPutZ(Format('line %d: Content terminator "%s" not found.'#10,
+          [Int64(p^.lineno), string(zEndMark)]))
+      else
+        shellEPutZ(Format('%s:%d: Content terminator "%s" not found.'#10,
+          [string(AnsiString(p^.zInFile)), Int64(p^.lineno), string(zEndMark)]));
+      p^.lineno := savedLn;
+      importCleanup(sCtx);
+      Exit;
+    end;
+    sCtx.zInCur := sCtx.zIn;
+  end else begin
+    sCtx.inHandle := FpOpen(string(zFile), O_RDONLY);
+    if sCtx.inHandle = THandle(-1) then begin
+      shellEPutZ(Format('Error: cannot open "%s"'#10, [zFile]));
+      Exit;
+    end;
+    sCtx.inOpen := True;
   end;
-  sCtx.inHandle := FpOpen(string(zFile), O_RDONLY);
-  if sCtx.inHandle = THandle(-1) then begin
-    shellEPutZ(Format('Error: cannot open "%s"'#10, [zFile]));
-    Exit;
-  end;
-  sCtx.inOpen := True;
 
   if eVerbose >= 1 then begin
     ch := AnsiChar(Byte(sCtx.cColSep));
