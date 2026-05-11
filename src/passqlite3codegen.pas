@@ -27485,7 +27485,8 @@ begin
     subquery hook already ran sqlite3ExpandSubquery on this item. }
   if (p^.pSrc^.nSrc = 1)
      and ((p^.selFlags and SF_Distinct) = 0)
-     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab))
+     and ((pDest^.eDest = SRT_Output) or (pDest^.eDest = SRT_EphemTab)
+          or (pDest^.eDest = SRT_Set))
   then
   begin
     pItem := SrcListItems(p^.pSrc);
@@ -27612,6 +27613,25 @@ begin
         sqlite3VdbeAddOp3(v, OP_Insert, pDest^.iSDParm, r1, r2);
         sqlite3VdbeChangeP5(v, OPFLAG_APPEND);
         sqlite3ReleaseTempReg(pParse, r2);
+        sqlite3ReleaseTempReg(pParse, r1);
+      end
+      else if pDest^.eDest = SRT_Set then
+      begin
+        { 10.1.48.b — disposal mirrors selectInnerLoop SRT_Set arm
+          (codegen.pas:21417..21428).  IN-RHS Case-1 routes through
+          this materialise arm when the inner FROM-clause subquery
+          is a (recursive) CTE — without this branch we'd fall back
+          to ResultRow and never populate the IN-RHS eph cursor at
+          pDest^.iSDParm.  Bloom-filter side-channel at iSDParm2
+          deferred (not needed for the recoverCacheSchema shape). }
+        r1 := sqlite3GetTempReg(pParse);
+        sqlite3VdbeAddOp4(v, OP_MakeRecord, pDest^.iSdst, nResultCol,
+                          r1, pDest^.zAffSdst, nResultCol);
+        sqlite3VdbeAddOp4Int(v, OP_IdxInsert, pDest^.iSDParm, r1,
+                             pDest^.iSdst, nResultCol);
+        if pDest^.iSDParm2 > 0 then
+          sqlite3VdbeAddOp4Int(v, OP_FilterAdd, pDest^.iSDParm2, 0,
+                               pDest^.iSdst, nResultCol);
         sqlite3ReleaseTempReg(pParse, r1);
       end
       else
