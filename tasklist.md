@@ -912,8 +912,8 @@ partial landings cannot silently no-op.
   - [X] **10.1f.3** `.archive`/`.ar` — gated by `src/tests/TestShellArchive.pas` (byte-parity vs upstream: create/list-verbose/glob-filter/extract-roundtrip/--dryrun/--help).
   - [X] **10.1f.4** `.session` — gated by `src/tests/TestShellArchive.pas` shape arm (port emits friendly "session extension not compiled in" stub per 10.1.47; upstream falls through to unknown-command — deliberate divergence).
   - [X] **10.1f.5** `.recover` — gated by `src/tests/TestShellArchive.pas` (byte-parity vs upstream over 3-row+index fixture; complements DiagRecover.pas shape gate).
-  - [ ] **10.1f.6** `.dbinfo`
-  - [ ] **10.1f.7** `.dbconfig`
+  - [X] **10.1f.6** `.dbinfo` — gated by `src/tests/TestShellDbinfo.pas` (byte-parity vs upstream over 3-row+index fixture: default/`main`/`temp` arms, with rc=1 propagation on "unable to read database header"). Side-fix: route positional dot-cmd rc through process exit (shell.c.in:13548 unconditional propagation).
+  - [X] **10.1f.7** `.dbconfig` — gated by `src/tests/TestShellDbinfo.pas` (bare-list + per-op read + toggle, 11 subtests). Side-fixes: aDbConfig table now mirrors shell.c.in:9280 (names + order + FP_DIGITS); openDatabase default flags now include SQLITE_EnableView/LoadExtension per main.c:3430,3473. Counter/pointer-style DBCONFIG_* ops still gated on Phase 8.1.1.
   - [ ] **10.1f.8** `.filectrl`
   - [ ] **10.1f.9** `.sha3sum`
   - [ ] **10.1f.10** `.crnl`
@@ -945,7 +945,7 @@ partial landings cannot silently no-op.
         3. **DiagRecover gate (src/tests/DiagRecover.pas)**: creates a small 3-row table + index fixture via the passqlite3 shell itself, runs `.recover` against it, and asserts 12 invariants on the recovered SQL stream (header PRAGMAs, lost_and_found CREATE + data rows for alpha/beta/gamma, COMMIT trailer).  Wired into `src/tests/build.sh`.
         Remaining (post-10.1.48 follow-up): the C oracle re-creates `t` and re-emits the original `INSERT OR IGNORE` rows; the Pas port falls back to `lost_and_found` because `recoverGetPage` does not yet do the `pPage1Cache == aPg → aPg = pPage1Disk` swap (sqlite3recover.c:723).  Adding the swap unblocks `recoverCacheSchema` (recovery.schema lands two rows: type=table/index, sqlLen=45/23) but uncovers a `free(): invalid pointer` further down `recoverWriteData` after the first emitted INSERT — separate port bug, tracked as 10.1.48.d.
 - [X] **10.1.49** `.dbinfo`.
-- [~] **10.1.50** `.dbconfig` — boolean DBCONFIG_* dispatched. Counter-style and pointer-style ops gated on raw-varargs sqlite3_db_config (8.1.1).
+- [X] **10.1.50** `.dbconfig` — boolean DBCONFIG_* + FP_DIGITS dispatched and byte-parity gated by `src/tests/TestShellDbinfo.pas`. Counter/pointer-style ops (LOOKASIDE, MAINDBNAME, MAX_*) remain gated on raw-varargs sqlite3_db_config (8.1.1); upstream's `.dbconfig` arm itself does not surface those.
 - [X] **10.1.51..10.1.59** `.filectrl`, `.sha3sum`, `.crnl`, `.binary`, `.connection`, `.unmodule`, `.vfsinfo`/`.vfslist`/`.vfsname`, `.dbtotxt`, `.breakpoint` all landed.
 
 ### 10.1.60..10.1.100 — ext/misc and ext/* extension ports (all landed)

@@ -4849,7 +4849,7 @@ end;
   page-1 header via sqlite_dbpage(?), prints the named integer fields,
   then runs the small set of count queries against sqlite_schema. }
 
-procedure cmdDbinfo(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+function cmdDbinfo(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
 const
   fieldName: array[0..11] of AnsiString = (
     'file change counter:', 'database page count:', 'freelist page count:',
@@ -4876,9 +4876,10 @@ var
   pBlob, pHdr: PByte;
   aHdr: array[0..99] of Byte;
 begin
+  Result := 0;
   if nArg >= 1 then zDb := args[0] else zDb := 'main';
   openDb(p, 0);
-  if p^.db = nil then Exit;
+  if p^.db = nil then begin Result := 1; Exit; end;
   pStmt := nil;
   rc := sqlite3_prepare_v2(p^.db,
         'SELECT data FROM sqlite_dbpage(?1) WHERE pgno=1',
@@ -4886,6 +4887,7 @@ begin
   if (rc <> SQLITE_OK) or (pStmt = nil) then begin
     shellEPutZ(Format('error: %s'#10, [AnsiString(sqlite3_errmsg(p^.db))]));
     if pStmt <> nil then sqlite3_finalize(pStmt);
+    Result := 1;
     Exit;
   end;
   sqlite3_bind_text(pStmt, 1, PAnsiChar(zDb), -1, SQLITE_STATIC);
@@ -4898,6 +4900,7 @@ begin
   end else begin
     shellEPutZ('unable to read database header'#10);
     sqlite3_finalize(pStmt);
+    Result := 1;
     Exit;
   end;
   pageSz := (i32(aHdr[16]) shl 8) or i32(aHdr[17]);
@@ -7551,59 +7554,73 @@ type
     op: i32;
   end;
 const
-  aDbConfig: array[0..14] of TDbcfgEntry = (
-    (zName: 'defensive';                  op: SQLITE_DBCONFIG_DEFENSIVE),
-    (zName: 'dqs_ddl';                    op: SQLITE_DBCONFIG_DQS_DDL),
-    (zName: 'dqs_dml';                    op: SQLITE_DBCONFIG_DQS_DML),
-    (zName: 'enable_fkey';                op: SQLITE_DBCONFIG_ENABLE_FKEY),
-    (zName: 'enable_qpsg';                op: SQLITE_DBCONFIG_ENABLE_QPSG),
-    (zName: 'enable_trigger';             op: SQLITE_DBCONFIG_ENABLE_TRIGGER),
-    (zName: 'enable_view';                op: SQLITE_DBCONFIG_ENABLE_VIEW),
-    (zName: 'enable_attach_create';       op: SQLITE_DBCONFIG_ENABLE_ATTACH_CREATE),
-    (zName: 'enable_attach_write';        op: SQLITE_DBCONFIG_ENABLE_ATTACH_WRITE),
-    (zName: 'enable_comments';            op: SQLITE_DBCONFIG_ENABLE_COMMENTS),
-    (zName: 'legacy_alter_table';         op: SQLITE_DBCONFIG_LEGACY_ALTER_TABLE),
-    (zName: 'legacy_file_format';         op: SQLITE_DBCONFIG_LEGACY_FILE_FORMAT),
-    (zName: 'no_ckpt_on_close';           op: SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE),
-    (zName: 'reset_database';             op: SQLITE_DBCONFIG_RESET_DATABASE),
-    (zName: 'trusted_schema';             op: SQLITE_DBCONFIG_TRUSTED_SCHEMA)
+  { Mirrors aDbConfig[] in shell.c.in:9280 exactly: same names, same order,
+    same opcodes.  All boolean ops route through sqlite3_db_config_int's
+    dbConfigFlagOp dispatcher; FP_DIGITS routes through the counter path in
+    sqlite3_db_config_int (passqlite3main.pas:1846).  Counter/pointer-style
+    ops (LOOKASIDE, MAINDBNAME, MAX_*) remain gated on Phase 8.1.1's raw
+    varargs and are not exposed here. }
+  aDbConfig: array[0..21] of TDbcfgEntry = (
+    (zName: 'attach_create';      op: SQLITE_DBCONFIG_ENABLE_ATTACH_CREATE),
+    (zName: 'attach_write';       op: SQLITE_DBCONFIG_ENABLE_ATTACH_WRITE),
+    (zName: 'comments';           op: SQLITE_DBCONFIG_ENABLE_COMMENTS),
+    (zName: 'defensive';          op: SQLITE_DBCONFIG_DEFENSIVE),
+    (zName: 'dqs_ddl';            op: SQLITE_DBCONFIG_DQS_DDL),
+    (zName: 'dqs_dml';            op: SQLITE_DBCONFIG_DQS_DML),
+    (zName: 'enable_fkey';        op: SQLITE_DBCONFIG_ENABLE_FKEY),
+    (zName: 'enable_qpsg';        op: SQLITE_DBCONFIG_ENABLE_QPSG),
+    (zName: 'enable_trigger';     op: SQLITE_DBCONFIG_ENABLE_TRIGGER),
+    (zName: 'enable_view';        op: SQLITE_DBCONFIG_ENABLE_VIEW),
+    (zName: 'fts3_tokenizer';     op: SQLITE_DBCONFIG_ENABLE_FTS3_TOKENIZER),
+    (zName: 'fp_digits';          op: SQLITE_DBCONFIG_FP_DIGITS),
+    (zName: 'legacy_alter_table'; op: SQLITE_DBCONFIG_LEGACY_ALTER_TABLE),
+    (zName: 'legacy_file_format'; op: SQLITE_DBCONFIG_LEGACY_FILE_FORMAT),
+    (zName: 'load_extension';     op: SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION),
+    (zName: 'no_ckpt_on_close';   op: SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE),
+    (zName: 'reset_database';     op: SQLITE_DBCONFIG_RESET_DATABASE),
+    (zName: 'reverse_scanorder';  op: SQLITE_DBCONFIG_REVERSE_SCANORDER),
+    (zName: 'stmt_scanstatus';    op: SQLITE_DBCONFIG_STMT_SCANSTATUS),
+    (zName: 'trigger_eqp';        op: SQLITE_DBCONFIG_TRIGGER_EQP),
+    (zName: 'trusted_schema';     op: SQLITE_DBCONFIG_TRUSTED_SCHEMA),
+    (zName: 'writable_schema';    op: SQLITE_DBCONFIG_WRITABLE_SCHEMA)
   );
 
 procedure cmdDbconfig(p: PShellState; const args: array of AnsiString;
                       nArg: SizeInt);
 var
   i: SizeInt;
-  v: i32;
+  v, setVal: i32;
+  err: i32;
   matched: Boolean;
 begin
   openDb(p, 0);
   if p^.db = nil then Exit;
-  if nArg = 0 then begin
-    for i := 0 to High(aDbConfig) do begin
-      v := -1;
-      sqlite3_db_config_int(p^.db, aDbConfig[i].op, -1, @v);
-      WriteLn(Format('%19s %s', [aDbConfig[i].zName,
-                                 IfThen(v <> 0, 'on', 'off')]));
-    end;
-    Exit;
-  end;
   matched := False;
   for i := 0 to High(aDbConfig) do begin
-    if args[0] = aDbConfig[i].zName then begin
-      matched := True;
-      v := -1;
-      if nArg >= 2 then
+    if (nArg >= 1) and (args[0] <> aDbConfig[i].zName) then Continue;
+    matched := True;
+    if nArg >= 2 then begin
+      if aDbConfig[i].op = SQLITE_DBCONFIG_FP_DIGITS then begin
+        Val(args[1], setVal, err);
+        if err <> 0 then setVal := 0;
+        sqlite3_db_config_int(p^.db, aDbConfig[i].op, setVal, nil);
+      end else
         sqlite3_db_config_int(p^.db, aDbConfig[i].op,
-                              parseOnOff(args[1], 0), @v)
-      else
-        sqlite3_db_config_int(p^.db, aDbConfig[i].op, -1, @v);
+                              parseOnOff(args[1], 0), nil);
+    end;
+    v := -1;
+    sqlite3_db_config_int(p^.db, aDbConfig[i].op, -1, @v);
+    if aDbConfig[i].op = SQLITE_DBCONFIG_FP_DIGITS then
+      WriteLn(Format('%19s %d', [aDbConfig[i].zName, v]))
+    else
       WriteLn(Format('%19s %s', [aDbConfig[i].zName,
                                  IfThen(v <> 0, 'on', 'off')]));
-      Break;
-    end;
+    if nArg >= 1 then Break;
   end;
-  if not matched then
-    shellEPutZ(Format('Error: unknown dbconfig "%s"'#10, [args[0]]));
+  if (nArg >= 1) and (not matched) then
+    shellEPutZ(Format('Error: unknown dbconfig "%s"'#10 +
+                      'Enter ".dbconfig" with no arguments for a list'#10,
+                      [args[0]]));
 end;
 
 { ----------------------------------------------------------------------
@@ -9483,7 +9500,7 @@ begin
   end;
   if zCmd = 'cd'        then begin Result := cmdCd(p, args, nArg); Exit; end;
   if zCmd = 'log'       then begin Result := cmdLog(args, nArg); Exit; end;
-  if zCmd = 'dbinfo'    then begin cmdDbinfo(p, args, nArg); Exit; end;
+  if zCmd = 'dbinfo'    then begin Result := cmdDbinfo(p, args, nArg); Exit; end;
   if (zCmd = 'crlf') or (zCmd = 'crnl') then begin cmdCrnl(p, args, nArg); Exit; end;
   if zCmd = 'binary'    then begin cmdBinary; Result := 1; Exit; end;
   if zCmd = 'breakpoint' then begin cmdBreakpoint; Exit; end;
@@ -10365,8 +10382,12 @@ begin
       rc := doMetaCommand(positional[k].z, @state);
       state.zErrPrefix := nil;
       gErrPrefixBacking := '';
-      if (rc <> 0) and (rc = 2) then Exit(0);
-      if (rc <> 0) and (bail_on_error <> 0) then Exit(rc);
+      { shell.c.in:13548 — positional dot-cmd errors always exit (no
+        bail_on_error gate); rc==2 is the .exit/.quit signal. }
+      if rc <> 0 then begin
+        if rc = 2 then Exit(0);
+        Exit(rc);
+      end;
     end else begin
       rc := runOneSqlLine(@state, positional[k].z, 'cmdline',
                           positional[k].iArg);

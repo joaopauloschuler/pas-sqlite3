@@ -178,6 +178,7 @@ compile_test TestShellIO
 compile_test TestShellMeta
 compile_test TestShellBackup
 compile_test TestShellArchive
+compile_test TestShellDbinfo
 compile_test TestVtabLateral
 compile_test TestExplainParity
 compile_test TestBytecodeParity
