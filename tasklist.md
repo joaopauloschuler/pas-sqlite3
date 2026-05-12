@@ -906,9 +906,9 @@ partial landings cannot silently no-op.
 ### 10.1f Long-tail / specialised dot-commands
 
 - [ ] **10.1f** Out-of-scope dependencies (session, archive, recover) may stub with the upstream `SQLITE_OMIT_*` "feature not compiled in" message. Gate: `tests/cli/10f_misc/`.
-  - [ ] **10.1f.0** `.backup`
-  - [ ] **10.1f.1** `.restore`
-  - [ ] **10.1f.2** `.clone`
+  - [X] **10.1f.0** `.backup` — gated by `src/tests/TestShellBackup.pas` (byte-parity vs upstream).
+  - [X] **10.1f.1** `.restore` — gated by `src/tests/TestShellBackup.pas` (round-trip + byte-parity).
+  - [X] **10.1f.2** `.clone` — gated by `src/tests/TestShellBackup.pas` (byte-parity + content diff).
   - [ ] **10.1f.3** `.archive`/`.ar`
   - [ ] **10.1f.4** `.session`
   - [ ] **10.1f.5** `.recover`

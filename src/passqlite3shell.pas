@@ -5025,8 +5025,8 @@ end;
   silently no-ops since apndvfs is not registered in the Pascal port.
   ---------------------------------------------------------------------- }
 
-procedure cmdBackup(p: PShellState; const args: array of AnsiString; nArg: SizeInt;
-                    const cmdName: AnsiString);
+function cmdBackup(p: PShellState; const args: array of AnsiString; nArg: SizeInt;
+                   const cmdName: AnsiString): i32;
 var
   pDest: PTsqlite3;
   pBackup: PSqlite3Backup;
@@ -5036,6 +5036,7 @@ var
   rc: i32;
   z: AnsiString;
 begin
+  Result := 0;
   zDb := '';
   zDestFile := '';
   zVfs := '';
@@ -5050,18 +5051,18 @@ begin
       else if z = '-async' then bAsync := 1
       else begin
         shellEPutZ(Format('Error: unknown option: "%s"'#10, [args[j]]));
-        Exit;
+        Result := 1; Exit;
       end;
     end else if zDestFile = '' then zDestFile := z
     else if zDb = '' then begin zDb := zDestFile; zDestFile := z; end
     else begin
       shellEPutZ(Format('Usage: .%s ?DB? ?OPTIONS? FILENAME'#10, [cmdName]));
-      Exit;
+      Result := 1; Exit;
     end;
   end;
   if zDestFile = '' then begin
     shellEPutZ(Format('missing FILENAME argument on .%s'#10, [cmdName]));
-    Exit;
+    Result := 1; Exit;
   end;
   if zDb = '' then zDb := 'main';
   if zVfs <> '' then begin
@@ -5074,7 +5075,7 @@ begin
   if rc <> SQLITE_OK then begin
     shellEPutZ(Format('Error: cannot open "%s"'#10, [zDestFile]));
     if pDest <> nil then sqlite3_close(pDest);
-    Exit;
+    Result := 1; Exit;
   end;
   if bAsync <> 0 then
     sqlite3_exec(pDest, 'PRAGMA synchronous=OFF; PRAGMA journal_mode=OFF;',
@@ -5084,14 +5085,16 @@ begin
   if pBackup = nil then begin
     shellEPutZ('Error: ' + AnsiString(sqlite3_errmsg(pDest)) + sLineBreak);
     sqlite3_close(pDest);
-    Exit;
+    Result := 1; Exit;
   end;
   repeat
     rc := sqlite3_backup_step(pBackup, 100);
   until rc <> SQLITE_OK;
   sqlite3_backup_finish(pBackup);
-  if rc <> SQLITE_DONE then
+  if rc <> SQLITE_DONE then begin
     shellEPutZ('Error: ' + AnsiString(sqlite3_errmsg(pDest)) + sLineBreak);
+    Result := 1;
+  end;
   sqlite3_close(pDest);
 end;
 
@@ -5283,16 +5286,17 @@ done:
   if pInsert <> nil then sqlite3_finalize(pInsert);
 end;
 
-procedure cmdClone(p: PShellState; const args: array of AnsiString;
-                   nArg: SizeInt);
+function cmdClone(p: PShellState; const args: array of AnsiString;
+                  nArg: SizeInt): i32;
 var
   zNewDb: AnsiString;
   newDb: PTsqlite3;
   rc: i32;
 begin
+  Result := 0;
   if nArg <> 1 then begin
     shellEPutZ('Usage: .clone FILENAME'#10);
-    Exit;
+    Result := 1; Exit;
   end;
   zNewDb := args[0];
   if FileExists(string(zNewDb)) then begin
@@ -5306,7 +5310,7 @@ begin
     shellEPutZ('Cannot create output database: ' +
                AnsiString(sqlite3_errmsg(newDb)) + sLineBreak);
     if newDb <> nil then sqlite3_close(newDb);
-    Exit;
+    Result := 1; Exit;
   end;
   sqlite3_exec(p^.db, 'PRAGMA writable_schema=ON;', nil, nil, nil);
   sqlite3_exec(newDb, 'BEGIN EXCLUSIVE;', nil, nil, nil);
@@ -5325,32 +5329,33 @@ end;
   it here.
   ---------------------------------------------------------------------- }
 
-procedure cmdRestore(p: PShellState; const args: array of AnsiString; nArg: SizeInt);
+function cmdRestore(p: PShellState; const args: array of AnsiString; nArg: SizeInt): i32;
 var
   pSrc: PTsqlite3;
   pBackup: PSqlite3Backup;
   zDb, zSrcFile: AnsiString;
   rc, nTimeout: i32;
 begin
+  Result := 0;
   if nArg = 1 then begin zSrcFile := args[0]; zDb := 'main'; end
   else if nArg = 2 then begin zDb := args[0]; zSrcFile := args[1]; end
   else begin
     shellEPutZ('Usage: .restore ?DB? FILE'#10);
-    Exit;
+    Result := 1; Exit;
   end;
   pSrc := nil;
   rc := sqlite3_open(PAnsiChar(zSrcFile), @pSrc);
   if rc <> SQLITE_OK then begin
     shellEPutZ(Format('Error: cannot open "%s"'#10, [zSrcFile]));
     if pSrc <> nil then sqlite3_close(pSrc);
-    Exit;
+    Result := 1; Exit;
   end;
   openDb(p, 0);
   pBackup := sqlite3_backup_init(p^.db, PAnsiChar(zDb), pSrc, 'main');
   if pBackup = nil then begin
     shellEPutZ('Error: ' + AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
     sqlite3_close(pSrc);
-    Exit;
+    Result := 1; Exit;
   end;
   nTimeout := 0;
   repeat
@@ -5363,10 +5368,13 @@ begin
   until (rc <> SQLITE_OK) and (rc <> SQLITE_BUSY);
   sqlite3_backup_finish(pBackup);
   if rc = SQLITE_DONE then { ok }
-  else if (rc = SQLITE_BUSY) or (rc = SQLITE_LOCKED) then
-    shellEPutZ('Error: source database is busy'#10)
-  else
+  else if (rc = SQLITE_BUSY) or (rc = SQLITE_LOCKED) then begin
+    shellEPutZ('Error: source database is busy'#10);
+    Result := 1;
+  end else begin
     shellEPutZ('Error: ' + AnsiString(sqlite3_errmsg(p^.db)) + sLineBreak);
+    Result := 1;
+  end;
   sqlite3_close(pSrc);
 end;
 
@@ -9484,10 +9492,10 @@ begin
   if zCmd = 'read'      then begin cmdRead(p, args, nArg); Exit; end;
   if zCmd = 'import'    then begin cmdImport(p, args, nArg); Exit; end;
   if (zCmd = 'backup') or (zCmd = 'save') then begin
-    cmdBackup(p, args, nArg, zCmd); Exit;
+    Result := cmdBackup(p, args, nArg, zCmd); Exit;
   end;
-  if zCmd = 'restore'   then begin cmdRestore(p, args, nArg); Exit; end;
-  if zCmd = 'clone'     then begin cmdClone(p, args, nArg); Exit; end;
+  if zCmd = 'restore'   then begin Result := cmdRestore(p, args, nArg); Exit; end;
+  if zCmd = 'clone'     then begin Result := cmdClone(p, args, nArg); Exit; end;
   if zCmd = 'open'      then begin cmdOpen(p, args, nArg); Exit; end;
   if zCmd = 'connection' then begin cmdConnection(p, args, nArg); Exit; end;
   if zCmd = 'unmodule'  then begin cmdUnmodule(p, args, nArg); Exit; end;
